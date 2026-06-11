@@ -333,6 +333,13 @@ fn emit_function(
     // expiration on last_use < i; alloc pops from
     // bool_free, expire pushes back.
     let mut bools: HashMap<ValueId, asm::Wreg> = HashMap::new();
+    // Bool Phi dests that overflowed the W pool into S-regs
+    // (V-class). Bools are written at phi-move edges
+    // (`fmov s, w` / `fmov s, s`) and read at only a handful
+    // of consumer sites, which materialise them into the W9
+    // scratch via `fmov w, s` — no memory traffic, and the
+    // contended W pool stays for ints (32 V-regs vs 15 W).
+    let mut bool_in_v: HashMap<ValueId, asm::Vreg> = HashMap::new();
     let mut bool_owners: HashMap<u8, ValueId> = HashMap::new();
     let mut bool_free: Vec<u8> = vec![12, 11, 10]; // pop hands out W10 first
     // Set by a comparison whose result feeds only the
@@ -413,7 +420,7 @@ fn emit_function(
     }
 
     // ── Pre-pass: live-range analysis on the flat stream ───
-    let (last_use, use_counts) = compute_last_use_flat(
+    let (mut last_use, use_counts) = compute_last_use_flat(
         &flat_insts, &block_term_idx, &block_flat_start);
 
     // Flat index of each result value's defining inst —
@@ -804,6 +811,28 @@ fn emit_function(
     //     ARM reads operands before writing the dest, so
     //     `add D,D,#1` is fine — but nothing later may).
     let mut coalesce_into: HashMap<ValueId, PhiDest> = HashMap::new();
+
+    // ── Interval-based Phi-dest allocation ────────────────────
+    //
+    // A Phi dest is loop-carried: every predecessor edge's
+    // phi-move WRITES it (the back-edge write is the latest
+    // event in flat order) and the loop body reads it. Its
+    // live interval is therefore
+    //   [min over arms of from-block's terminator,
+    //    max(arm terminators, last_use of the result)].
+    // Phis of DISJOINT intervals (sequential loops) share
+    // registers — without this, every loop in the function
+    // permanently pins its own dest regs and big kernels
+    // exhaust the 15-reg W pool (seen with Orbis's terrain
+    // path tracer: 3+ sequential march loops).
+    //
+    // Within its interval a dest is pinned (never expired);
+    // after it, ownership is registered with the regular
+    // linear scan (owner = last phi on the reg, last_use
+    // extended to the interval-union end), so the reg also
+    // returns to the general pool for non-phi values.
+    let mut phi_recs: Vec<(usize, usize, BlockId, &atrium_spv_ir::Inst)> =
+        Vec::new();
     for bid in &block_order {
         let block = func.blocks.get(bid).unwrap();
         for inst in &block.insts {
@@ -813,28 +842,75 @@ fn emit_function(
             };
             let result = inst.result.as_ref().ok_or_else(||
                 BackendError::Internal("Phi without result".into()))?;
-            // Phi destination registers are loop-carried:
-            // a loop back-edge writes them via the phi-
-            // move just before re-entering the header.
-            // They must therefore live for the *entire*
-            // function — NOT be subject to linear-scan
-            // expiry — so we pop them straight off the
-            // free pool without registering an owner
-            // (expire only reclaims owned regs).
-            let dest = match &result.ty {
+            let mut start = usize::MAX;
+            let mut end = 0usize;
+            for arm in arms {
+                let t = block_term_idx.get(&arm.from).copied().unwrap_or(0);
+                start = start.min(t);
+                end = end.max(t);
+            }
+            end = end.max(last_use.get(&result.id).copied().unwrap_or(0));
+            phi_recs.push((start, end, *bid, inst));
+        }
+    }
+    phi_recs.sort_by_key(|r| r.0);
+
+    // (end, regs) of in-interval phis; class 0 = V, 1 = W.
+    let mut phi_active: Vec<(usize, Vec<(u8, u8)>)> = Vec::new();
+    let mut phi_avail_v: Vec<u8> = Vec::new();
+    let mut phi_avail_w: Vec<u8> = Vec::new();
+    // reg -> (last owner value, union end) for the post-pass
+    // ownership handoff to the regular linear scan.
+    let mut phi_meta_v: HashMap<u8, (ValueId, usize)> = HashMap::new();
+    let mut phi_meta_w: HashMap<u8, (ValueId, usize)> = HashMap::new();
+
+    for (start, end, bid, inst) in &phi_recs {
+        let (start, end) = (*start, *end);
+        let arms = match &inst.op {
+            Op::Phi(arms) => arms,
+            _ => unreachable!("phi_recs holds only Op::Phi"),
+        };
+        let result = inst.result.as_ref().expect("checked in collection");
+        let bid = bid; // &BlockId, body below uses *bid
+
+        // Release actives whose interval ended before this
+        // phi starts — their regs become preferred slots.
+        phi_active.retain(|(aend, regs)| {
+            if *aend < start {
+                for (class, n) in regs {
+                    if *class == 0 { phi_avail_v.push(*n); }
+                    else { phi_avail_w.push(*n); }
+                }
+                false
+            } else {
+                true
+            }
+        });
+        let mut regs_this: Vec<(u8, u8)> = Vec::new();
+
+        let dest = match &result.ty {
                 Type::F32 => {
-                    let n = free_pool.pop().ok_or_else(||
-                        BackendError::Unsupported(
+                    let n = phi_avail_v.pop()
+                        .or_else(|| free_pool.pop())
+                        .ok_or_else(|| BackendError::Unsupported(
                             "out of V-regs allocating Phi dest".into()))?;
                     if n < 16 { used_callee_saved_v = true; }
+                    let m = phi_meta_v.entry(n).or_insert((result.id, end));
+                    *m = (result.id, m.1.max(end));
+                    regs_this.push((0, n));
                     let v = asm::Vreg(n);
                     scalars.insert(result.id, v);
                     PhiDest::Float(v)
                 }
                 Type::I32 | Type::U32 => {
-                    let n = int_pool.free.pop().ok_or_else(||
-                        BackendError::Unsupported(
+                    let n = phi_avail_w.pop()
+                        .or_else(|| int_pool.free.pop())
+                        .ok_or_else(|| BackendError::Unsupported(
                             "out of int W-regs allocating Phi dest".into()))?;
+                    if n >= 19 { int_pool.used_callee_saved = true; }
+                    let m = phi_meta_w.entry(n).or_insert((result.id, end));
+                    *m = (result.id, m.1.max(end));
+                    regs_this.push((1, n));
                     let w = asm::Wreg(n);
                     ints.insert(result.id, w);
                     PhiDest::Int(w)
@@ -844,12 +920,32 @@ fn emit_function(
                 // dest lives in the `bools` map — that's where
                 // Select / BranchCond resolve their conditions.
                 Type::Bool => {
-                    let n = int_pool.free.pop().ok_or_else(||
-                        BackendError::Unsupported(
-                            "out of int W-regs allocating Bool Phi dest".into()))?;
-                    let w = asm::Wreg(n);
-                    bools.insert(result.id, w);
-                    PhiDest::Bool(w)
+                    if let Some(n) = phi_avail_w.pop()
+                        .or_else(|| int_pool.free.pop())
+                    {
+                        if n >= 19 { int_pool.used_callee_saved = true; }
+                        let m = phi_meta_w.entry(n).or_insert((result.id, end));
+                        *m = (result.id, m.1.max(end));
+                        regs_this.push((1, n));
+                        let w = asm::Wreg(n);
+                        bools.insert(result.id, w);
+                        PhiDest::Bool(w)
+                    } else {
+                        // W pool exhausted: overflow this bool
+                        // into the V-class (SIMD-reg spill —
+                        // fmov w<->s, no memory traffic).
+                        let n = phi_avail_v.pop()
+                            .or_else(|| free_pool.pop())
+                            .ok_or_else(|| BackendError::Unsupported(
+                                "out of W- AND V-regs allocating                                  Bool Phi dest".into()))?;
+                        if n < 16 { used_callee_saved_v = true; }
+                        let m = phi_meta_v.entry(n).or_insert((result.id, end));
+                        *m = (result.id, m.1.max(end));
+                        regs_this.push((0, n));
+                        let v = asm::Vreg(n);
+                        bool_in_v.insert(result.id, v);
+                        PhiDest::BoolV(v)
+                    }
                 }
                 // A vecN-f32 Phi is N per-lane scalar Phis
                 // travelling together. Allocate one V-reg
@@ -885,13 +981,18 @@ fn emit_function(
                     let mut lane_regs = Vec::with_capacity(lane_count);
                     let mut lane_vals = Vec::with_capacity(lane_count);
                     for _ in 0..lane_count {
-                        let n = free_pool.pop().ok_or_else(||
-                            BackendError::Unsupported(
+                        let n = phi_avail_v.pop()
+                            .or_else(|| free_pool.pop())
+                            .ok_or_else(|| BackendError::Unsupported(
                                 "out of V-regs allocating vec Phi dest".into()))?;
                         if n < 16 { used_callee_saved_v = true; }
                         let v = asm::Vreg(n);
                         let synth = ValueId(next_synth_id);
                         next_synth_id += 1;
+                        let m = phi_meta_v.entry(n).or_insert((synth, end));
+                        *m = (synth, m.1.max(end));
+                        last_use.insert(synth, end);
+                        regs_this.push((0, n));
                         scalars.insert(synth, v);
                         lane_regs.push(v);
                         lane_vals.push(Value { id: synth, ty: Type::F32 });
@@ -973,7 +1074,7 @@ fn emit_function(
                         | Op::FMul(..) | Op::FDiv(..)),
                     // Bool producers are compares/logic, not the
                     // coalesce-aware binop emitters: never coalesce.
-                    PhiDest::Bool(_) => false,
+                    PhiDest::Bool(_) | PhiDest::BoolV(_) => false,
                 };
                 if !op_ok { continue; }
                 // `src` single-use (only the phi-move reads it).
@@ -997,7 +1098,24 @@ fn emit_function(
                 if read_between { continue; }
                 coalesce_into.insert(src, dest.clone());
             }
-        }
+            phi_active.push((end, regs_this));
+    }
+
+    // Hand expired-interval phi regs to the regular linear
+    // scan: owner = the last phi that used the reg, with its
+    // last_use extended to the union end, so `expire` returns
+    // the reg to the free pool exactly when the last interval
+    // on it closes. (Packed Q-reg phi dests stay pinned for
+    // the function — rare, and the packed map has no expiry.)
+    for (n, (owner, end)) in &phi_meta_v {
+        owners.insert(*n, *owner);
+        let e = last_use.entry(*owner).or_insert(*end);
+        *e = (*e).max(*end);
+    }
+    for (n, (owner, end)) in &phi_meta_w {
+        int_pool.owners.insert(*n, *owner);
+        let e = last_use.entry(*owner).or_insert(*end);
+        *e = (*e).max(*end);
     }
 
     // Record where each block starts in the asm byte
@@ -1609,10 +1727,22 @@ fn emit_function(
                 // lowerings like FSign / FStep which feed
                 // float-compare results into FConvert.
                 let from_bools = bools.get(&s.id).copied();
+                let from_bool_v = if ints.get(&s.id).is_none()
+                    && from_bools.is_none()
+                {
+                    bool_in_v.get(&s.id).copied()
+                } else {
+                    None
+                };
+                if let Some(v) = from_bool_v {
+                    a.emit(asm::fmov_w_from_s(w_tmp, v));
+                }
                 let s_w = ints.get(&s.id).copied()
                     .or(from_bools)
+                    .or(from_bool_v.map(|_| w_tmp))
                     .ok_or_else(|| BackendError::Internal(format!(
-                        "ConvertUToF operand {:?} not in ints or bools",
+                        "ConvertUToF operand {:?} not in ints, bools, \
+                         or bool_in_v",
                         s.id)))?;
                 let d_v = alloc_vreg(&mut free_pool, &mut owners, &mut used_callee_saved_v,result.id)?;
                 a.emit(asm::ucvtf_s_from_w(d_v, s_w));
@@ -2892,9 +3022,21 @@ fn emit_function(
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
                         "Select without result".into()))?;
-                let w_cond = *bools.get(&cond.id).ok_or_else(||
-                    BackendError::Internal(format!(
-                        "Select cond {:?} not in bools", cond.id)))?;
+                let w_cond = match bools.get(&cond.id) {
+                    Some(w) => *w,
+                    None => match bool_in_v.get(&cond.id) {
+                        // V-overflowed bool: materialise into
+                        // the W9 scratch (consumed immediately
+                        // by the cmp below).
+                        Some(v) => {
+                            a.emit(asm::fmov_w_from_s(w_tmp, *v));
+                            w_tmp
+                        }
+                        None => return Err(BackendError::Internal(format!(
+                            "Select cond {:?} not in bools/bool_in_v",
+                            cond.id))),
+                    },
+                };
                 // Set NZCV once; both scalar and vec paths
                 // reuse the same cmp+fcsel sequence per
                 // lane / per scalar.
@@ -3029,13 +3171,39 @@ fn emit_function(
                                 }
                             }
                             PhiDest::Bool(dw) => {
-                                let src = *bools.get(src_id)
+                                if let Some(src) = bools.get(src_id)
                                     .or_else(|| ints.get(src_id))
-                                    .ok_or_else(||
-                                    BackendError::Internal(format!(
-                                        "Phi bool source {:?} not in                                          bools/ints", src_id)))?;
-                                if dw.0 != src.0 {
-                                    a.emit(asm::mov_w(*dw, src));
+                                {
+                                    if dw.0 != src.0 {
+                                        a.emit(asm::mov_w(*dw, *src));
+                                    }
+                                } else if let Some(sv) =
+                                    bool_in_v.get(src_id)
+                                {
+                                    a.emit(asm::fmov_w_from_s(*dw, *sv));
+                                } else {
+                                    return Err(BackendError::Internal(
+                                        format!("Phi bool source {:?} not \
+                                                 in bools/ints/bool_in_v",
+                                                src_id)));
+                                }
+                            }
+                            PhiDest::BoolV(dv) => {
+                                if let Some(sw) = bools.get(src_id)
+                                    .or_else(|| ints.get(src_id))
+                                {
+                                    a.emit(asm::fmov_s_from_w(*dv, *sw));
+                                } else if let Some(sv) =
+                                    bool_in_v.get(src_id)
+                                {
+                                    if dv.0 != sv.0 {
+                                        a.emit(asm::fmov_s(*dv, *sv));
+                                    }
+                                } else {
+                                    return Err(BackendError::Internal(
+                                        format!("Phi boolV source {:?} not \
+                                                 in bools/ints/bool_in_v",
+                                                src_id)));
                                 }
                             }
                             PhiDest::Packed(dq) => {
@@ -3165,10 +3333,18 @@ fn emit_function(
                         (patch_t, fcond)
                     }
                     None => {
-                        let w_bool = *bools.get(&cond.id).ok_or_else(||
-                            BackendError::Unsupported(format!(
-                                "BranchCond cond {:?} is not a known Bool W-reg",
-                                cond.id)))?;
+                        let w_bool = match bools.get(&cond.id) {
+                            Some(w) => *w,
+                            None => match bool_in_v.get(&cond.id) {
+                                Some(v) => {
+                                    a.emit(asm::fmov_w_from_s(w_tmp, *v));
+                                    w_tmp
+                                }
+                                None => return Err(BackendError::Unsupported(
+                                    format!("BranchCond cond {:?} is not a \
+                                             known Bool W-reg", cond.id))),
+                            },
+                        };
                         // cmp w_bool, #0  → flags reflect zero-ness
                         a.emit(asm::cmp_imm_w(w_bool, 0));
                         // b.ne t_block (taken if w_bool != 0).
@@ -4547,6 +4723,11 @@ enum PhiDest {
     /// dest registered in the `bools` map so Select/BranchCond
     /// consumers resolve it.
     Bool(asm::Wreg),
+    /// Bool Phi overflowed to an S-reg (W pool exhausted):
+    /// 0/1 carried in the low 32 bits of a V-reg. Written by
+    /// `fmov s, w` phi-moves; consumers materialise through
+    /// the W9 scratch.
+    BoolV(asm::Vreg),
     Vec(Vec<asm::Vreg>),
     /// NEON-packed vec4 Phi: the whole vector in a single
     /// Q-register. Phi-move is one `mov v.16b`; a packed
