@@ -1623,6 +1623,70 @@ test_display(int fd)
 	return (0);
 }
 
+/*
+ * §8 link referee through the kmod: re-cable the simulated monitor and watch
+ * SET_MODE's fault change. A 4K monitor on an HDMI 1.4 cable can't be driven
+ * (ModeExceedsLink); re-cabled to DisplayPort 1.4 the link carries it (so the
+ * fault moves on to the FB-size check) — proving the referee is cable-dependent.
+ */
+static int
+test_display_link(int fd)
+{
+	struct atrium_gpu_display_config cfg;
+	struct atrium_gpu_display_setmode sm;
+	struct atrium_gpu_bo_alloc fb;
+	int rc = 0;
+
+	/* a small VRAM FB suffices: the link check precedes the FB-size check. */
+	memset(&fb, 0, sizeof(fb));
+	fb.size = 640 * 480 * 4;
+	fb.flags = ATRIUM_GPU_BO_VRAM;
+	if (ioctl(fd, ATRIUM_GPU_IOC_BO_ALLOC, &fb) != 0) {
+		perror("BO_ALLOC");
+		return (1);
+	}
+
+	/* 4K monitor on an HDMI 1.4 cable → the link can't carry it. */
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.connector_type = 1; /* HDMI 1.4 */
+	cfg.plug_mode = 2;	/* 4K */
+	if (ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_CONFIG, &cfg) != 0) {
+		perror("DISPLAY_CONFIG");
+		close(fb.bo_fd);
+		return (1);
+	}
+	memset(&sm, 0, sizeof(sm));
+	sm.fb_fd = fb.bo_fd;
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_SET_MODE, &sm);
+	if (sm.fault != 5) { /* ModeExceedsLink */
+		printf("display_link FAILED: 4K/HDMI1.4 fault=%u (want 5)\n", sm.fault);
+		rc = 1;
+	}
+
+	/* re-cable to DisplayPort 1.4: the link now fits, so SET_MODE gets past it
+	 * to the FB-size check (the 640x480 FB is too small for 4K → fault 4). */
+	cfg.connector_type = 3; /* DP 1.4 */
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_CONFIG, &cfg);
+	memset(&sm, 0, sizeof(sm));
+	sm.fb_fd = fb.bo_fd;
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_SET_MODE, &sm);
+	if (sm.fault != 4) { /* FbTooSmall — i.e. the link check passed */
+		printf("display_link FAILED: 4K/DP1.4 fault=%u (want 4, link OK)\n", sm.fault);
+		rc = 1;
+	}
+
+	/* restore the default monitor (HDMI 2.1 / VGA) so re-runs start clean. */
+	cfg.connector_type = 2;
+	cfg.plug_mode = 0;
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_CONFIG, &cfg);
+
+	if (rc == 0)
+		printf("display_link OK: 4K faults ModeExceedsLink on HDMI 1.4, "
+		    "passes the link on DP 1.4\n");
+	close(fb.bo_fd);
+	return (rc);
+}
+
 int
 main(void)
 {
@@ -1660,6 +1724,7 @@ main(void)
 	rc |= test_doorbell_pages(fd, vm);
 	rc |= test_vram(fd, vm);
 	rc |= test_display(fd);
+	rc |= test_display_link(fd);
 	close(vm);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");

@@ -127,6 +127,8 @@
 #define regDISP_SET_MODE	0x30018	/* w 1: program the connector's EDID mode */
 #define regDISP_FLIP		0x3001c	/* w: bit0 = vsync; the write triggers a flip */
 #define regDISP_CONNECTOR_TYPE	0x30034	/* r: §8 interface type code */
+#define regDISP_CFG_CONNECTOR_TYPE 0x30038 /* w: set connector type (test/bring-up) */
+#define regDISP_CFG_PLUG_MODE	0x3003c	/* w: re-plug advertising a built-in mode */
 #define regDISP_VBLANK_COUNT	0x30020	/* r: vblanks elapsed */
 #define regDISP_DROPPED_FLIPS	0x30024	/* r: flips dropped by the depth-1 queue */
 #define regDISP_FAULT		0x30028	/* r: last DisplayFault code (0 = none) */
@@ -383,6 +385,8 @@ int	 amd_display_flip(struct atrium_amd_softc *sc, struct thread *td,
 	    int fb_fd, uint32_t vsync, uint32_t *fault);
 void	 amd_display_status(struct atrium_amd_softc *sc,
 	    struct atrium_gpu_display_status *st);
+void	 amd_display_config(struct atrium_amd_softc *sc, uint32_t ctype,
+	    uint32_t plug_mode);
 
 /*
  * mmap offset (passed to mmap() on the device fd) that maps the BAR2 doorbell

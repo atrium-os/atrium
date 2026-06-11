@@ -101,3 +101,11 @@ amd_display_status(struct atrium_amd_softc *sc,
 	st->dropped_flips = amd_mmio_read32(sc, regDISP_DROPPED_FLIPS);
 	st->tear_line = amd_mmio_read32(sc, regDISP_TEAR_LINE);
 }
+
+/* CONFIG: re-cable / re-plug the simulated monitor (bring-up / test). */
+void
+amd_display_config(struct atrium_amd_softc *sc, uint32_t ctype, uint32_t plug_mode)
+{
+	amd_mmio_write32(sc, regDISP_CFG_CONNECTOR_TYPE, ctype);
+	amd_mmio_write32(sc, regDISP_CFG_PLUG_MODE, plug_mode);
+}

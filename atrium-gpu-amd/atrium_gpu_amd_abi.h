@@ -199,9 +199,21 @@ struct atrium_gpu_display_status {
 	uint32_t tear_line;	/* out: first tear scanline (0xffffffff = none) */
 };
 
+/*
+ * Reconfigure the simulated monitor (bring-up / test): re-cable the connector to
+ * a different interface type and/or re-plug it advertising a different built-in
+ * mode. Lets a test drive the §8 link-bandwidth referee (e.g. a 4K monitor on an
+ * HDMI 1.4 cable -> ModeExceedsLink).
+ */
+struct atrium_gpu_display_config {
+	uint32_t connector_type; /* in: type code (1=HDMI1.4 2=HDMI2.1 3=DP1.4 ...) */
+	uint32_t plug_mode;	/* in: re-plug advertising mode (0=VGA 1=1080p 2=4K) */
+};
+
 #define ATRIUM_GPU_IOC_DISPLAY_QUERY	_IOWR('A', 17, struct atrium_gpu_display_query)
 #define ATRIUM_GPU_IOC_DISPLAY_SET_MODE	_IOWR('A', 18, struct atrium_gpu_display_setmode)
 #define ATRIUM_GPU_IOC_DISPLAY_FLIP	_IOWR('A', 19, struct atrium_gpu_display_flip)
 #define ATRIUM_GPU_IOC_DISPLAY_STATUS	_IOR('A', 20, struct atrium_gpu_display_status)
+#define ATRIUM_GPU_IOC_DISPLAY_CONFIG	_IOW('A', 21, struct atrium_gpu_display_config)
 
 #endif /* _ATRIUM_GPU_AMD_ABI_H_ */
