@@ -1883,6 +1883,57 @@ test_display_dptrain(int fd)
 	return (rc);
 }
 
+/*
+ * Firmware energy-fair scheduler through the kmod (gpu-scheduler §9): the kernel
+ * programs per-queue weights + kernels and reads back the Joule counters; the
+ * device runs the energy-fair selection. Two equal-weight queues with
+ * different-power kernels share JOULES, not run counts — the energy-fair thesis.
+ */
+static int
+test_sched(int fd)
+{
+	struct atrium_gpu_sched s;
+	uint32_t e0, e1, r0, r1, diff;
+	int rc = 0;
+
+	/* queue 0: VRAM-bandwidth kernel (high power); queue 1: host (lower power). */
+	memset(&s, 0, sizeof(s));
+	s.op = 0; s.arg = 1; s.ops = 1; s.bytes = 1000000000u; s.level = 3;
+	ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
+	s.op = 0; s.arg = 1; s.ops = 1; s.bytes = 1000000000u; s.level = 4;
+	ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
+	if (s.count != 2) {
+		printf("sched FAILED: count=%u (want 2)\n", s.count);
+		rc = 1;
+	}
+
+	s.op = 1; s.arg = 2000; /* run 2000 energy-fair rounds */
+	ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
+
+	s.op = 2; s.arg = 0; ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
+	e0 = s.energy_uj; r0 = s.runs;
+	s.op = 2; s.arg = 1; ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
+	e1 = s.energy_uj; r1 = s.runs;
+
+	/* energy-fair: the two queues drew ~equal Joules (within 10%). */
+	diff = e0 > e1 ? e0 - e1 : e1 - e0;
+	if (e0 == 0 || diff * 100u / e0 > 10u) {
+		printf("sched FAILED: energy %u vs %u uJ (not equal)\n", e0, e1);
+		rc = 1;
+	}
+	/* NOT run-fair: the cheaper-per-run (VRAM) queue ran far more. */
+	if (r0 <= r1) {
+		printf("sched FAILED: runs %u vs %u (want q0 > q1)\n", r0, r1);
+		rc = 1;
+	}
+
+	if (rc == 0)
+		printf("sched OK: equal-weight queues share Joules (%u~%u uJ) "
+		    "not runs (%u vs %u) — energy-fair, firmware-enforced\n",
+		    e0, e1, r0, r1);
+	return (rc);
+}
+
 int
 main(void)
 {
@@ -1924,6 +1975,7 @@ main(void)
 	rc |= test_display_usbc(fd);
 	rc |= test_display_mst(fd);
 	rc |= test_display_dptrain(fd);
+	rc |= test_sched(fd);
 	close(vm);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");

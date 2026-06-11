@@ -147,6 +147,21 @@
 #define regDISP_TEAR_LINE	0x3002c	/* r: first tear scanline (0xffffffff = none) */
 #define ATRIUM_AMD_EDID_LEN	128
 
+/*
+ * Firmware energy-fair scheduler block (APER_SCHED = 0x4_0000; model:
+ * engine/src/sched_regs.rs). The kernel programs weights, the device enforces.
+ */
+#define regSCHED_WEIGHT		0x40000	/* w: staged queue weight */
+#define regSCHED_KERNEL_OPS	0x40004	/* w: staged per-dispatch ops */
+#define regSCHED_KERNEL_BYTES	0x40008	/* w: staged per-dispatch bytes */
+#define regSCHED_KERNEL_LEVEL	0x4000c	/* w: staged memory level (0..4) */
+#define regSCHED_ADD_QUEUE	0x40010	/* w1: append a queue with the staged config */
+#define regSCHED_RUN_ROUNDS	0x40014	/* w: run N energy-fair rounds */
+#define regSCHED_SELECT		0x40018	/* w: select a queue for readback */
+#define regSCHED_ENERGY_UJ	0x4001c	/* r: selected queue energy (uJ) */
+#define regSCHED_RUNS		0x40020	/* r: selected queue run count */
+#define regSCHED_QUEUE_COUNT	0x40024	/* r: number of queues */
+
 /* CP firmware: minimum ucode version the model accepts (CP_FW_MIN_VERSION). */
 #define ATRIUM_AMD_CP_FW_VERSION 0x40
 /* Reset poll: model latches synchronously; poll-with-timeout is the HW shape. */
@@ -385,6 +400,10 @@ int	 amd_submit(struct atrium_amd_softc *sc, struct atrium_amd_bo *ring,
 	    uint32_t n_dwords, uint32_t engine, uint16_t vmid);
 int	 amd_queue_program(struct atrium_amd_softc *sc, uint64_t ring_va,
 	    uint32_t engine, uint16_t vmid, uint32_t *doorbell_off);
+
+/* cp.c — firmware energy-fair scheduler (the kernel programs weights) */
+struct atrium_gpu_sched;
+void	 amd_sched(struct atrium_amd_softc *sc, struct atrium_gpu_sched *s);
 
 /* display.c — the D-display-1 scanout path (one connector / one CRTC) */
 struct atrium_gpu_display_query;

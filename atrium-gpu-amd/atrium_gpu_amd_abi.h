@@ -169,6 +169,24 @@ struct atrium_gpu_syncobj_wait {
 #define ATRIUM_GPU_IOC_GPU_RESET	_IO('A', 16)
 
 /*
+ * Firmware energy-fair scheduler (gpu-scheduler §9): the kernel sets per-queue
+ * weights, the device (firmware) enforces energy-fair scheduling. op 0 = add a
+ * queue with `arg`=weight and the `ops`/`bytes`/`level` per-dispatch kernel; op 1
+ * = run `arg` scheduling rounds; op 2 = query queue `arg` (energy_uj / runs out).
+ */
+struct atrium_gpu_sched {
+	uint32_t op;
+	uint32_t arg;
+	uint32_t ops;		/* in (add): per-dispatch compute ops */
+	uint32_t bytes;		/* in (add): per-dispatch bytes */
+	uint32_t level;		/* in (add): memory level (0=Reg..4=Host) */
+	uint32_t energy_uj;	/* out (query): accumulated energy, µJ */
+	uint32_t runs;		/* out (query): run count */
+	uint32_t count;		/* out: number of queues */
+};
+#define ATRIUM_GPU_IOC_SCHED		_IOWR('A', 25, struct atrium_gpu_sched)
+
+/*
  * Display (D-display-1): one connector / one CRTC. The display block is
  * architecturally independent of the GFX/compute engine (its own registers);
  * these ioctls drive QUERY -> SET_MODE -> FLIP -> STATUS. Scanout FBs are VRAM

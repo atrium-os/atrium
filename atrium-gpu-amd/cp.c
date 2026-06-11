@@ -79,3 +79,33 @@ amd_submit(struct atrium_amd_softc *sc, struct atrium_amd_bo *ring,
  * submit of ABI-v2). The kernel is register-agnostic for the command stream;
  * userspace<->firmware owns the register layout.
  */
+
+/*
+ * Firmware energy-fair scheduler: the kernel sets per-queue weights + kernels;
+ * the device (firmware) runs the energy-fair selection and exposes the per-queue
+ * Joule counters. The kernel does NOT run the scheduling loop — it programs
+ * weights and reads counters (gpu-scheduler §9: kernel sets weights, firmware
+ * enforces). A register driver over the model's SCHED block.
+ */
+void
+amd_sched(struct atrium_amd_softc *sc, struct atrium_gpu_sched *s)
+{
+	switch (s->op) {
+	case 0:	/* add a queue with the staged weight + kernel */
+		amd_mmio_write32(sc, regSCHED_WEIGHT, s->arg);
+		amd_mmio_write32(sc, regSCHED_KERNEL_OPS, s->ops);
+		amd_mmio_write32(sc, regSCHED_KERNEL_BYTES, s->bytes);
+		amd_mmio_write32(sc, regSCHED_KERNEL_LEVEL, s->level);
+		amd_mmio_write32(sc, regSCHED_ADD_QUEUE, 1);
+		break;
+	case 1:	/* run `arg` energy-fair scheduling rounds */
+		amd_mmio_write32(sc, regSCHED_RUN_ROUNDS, s->arg);
+		break;
+	case 2:	/* query queue `arg`: read its Joule counter + run count */
+		amd_mmio_write32(sc, regSCHED_SELECT, s->arg);
+		s->energy_uj = amd_mmio_read32(sc, regSCHED_ENERGY_UJ);
+		s->runs = amd_mmio_read32(sc, regSCHED_RUNS);
+		break;
+	}
+	s->count = amd_mmio_read32(sc, regSCHED_QUEUE_COUNT);
+}

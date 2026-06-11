@@ -366,6 +366,13 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		return (err);
 	}
 
+	case ATRIUM_GPU_IOC_SCHED: {
+		struct atrium_gpu_sched *s = (struct atrium_gpu_sched *)data;
+
+		amd_sched(sc, s);
+		return (0);
+	}
+
 	case ATRIUM_GPU_IOC_DISPLAY_QUERY: {
 		struct atrium_gpu_display_query *q =
 		    (struct atrium_gpu_display_query *)data;
