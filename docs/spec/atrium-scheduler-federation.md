@@ -325,6 +325,12 @@ opponent's benchmark cedes the design ground that is Atrium's actual advantage.
 
 ## 8. Open questions / still to pressure-test
 
+> **Resolved → [`atrium-scheduler-implementation-plan.md`](atrium-scheduler-implementation-plan.md)**
+> (2026-06-11): every item below is worked to a decision in the plan's
+> decisions register (D1–D12) with structural choices (S1–S4), an
+> 8-phase build sequence (P0–P7) gated model-first, and named risks. The list is
+> kept here as the record of *what had to be decided*.
+
 - **Per-class fairness currency: retracted.** All classes are progress-fair WFQ;
   classes differ only in **latency priority** (foreground preempts) and **budget
   exposure** (background squeezed first under thermal/battery pressure). Confirm no
