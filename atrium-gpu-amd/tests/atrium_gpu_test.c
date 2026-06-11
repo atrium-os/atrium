@@ -1516,6 +1516,106 @@ test_vram(int fd, int vm)
 	return (0);
 }
 
+/*
+ * D-display-1: the scanout path end to end. Discovery (HPD + EDID over DDC),
+ * modeset on a VRAM FB, a vsync flip, vblank advancing under the host-timer
+ * refresh, and the referee rejecting a too-small FB. (The exact-tear-line proof
+ * is the deterministic engine test; in-VM this is the functional drive.)
+ */
+static int
+test_display(int fd)
+{
+	struct atrium_gpu_display_query q;
+	struct atrium_gpu_display_setmode sm;
+	struct atrium_gpu_display_flip fl;
+	struct atrium_gpu_display_status st0, st1;
+	struct atrium_gpu_bo_alloc fb, fb2, small;
+	uint64_t before;
+
+	/* 1. QUERY: connector attached, EDID readable with a valid header. */
+	memset(&q, 0, sizeof(q));
+	if (ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_QUERY, &q) != 0) {
+		perror("DISPLAY_QUERY");
+		return (1);
+	}
+	if (!q.connected || q.edid_len != 128 || q.edid[0] != 0x00 ||
+	    q.edid[1] != 0xff || q.edid[7] != 0x00) {
+		printf("display FAILED: connector/EDID (connected=%u len=%u "
+		    "hdr=%02x%02x..%02x)\n", q.connected, q.edid_len,
+		    q.edid[0], q.edid[1], q.edid[7]);
+		return (1);
+	}
+
+	/* 2. Two VRAM scanout framebuffers (640x480 XRGB8888). */
+	memset(&fb, 0, sizeof(fb));
+	fb.size = 640u * 480u * 4u;
+	fb.flags = ATRIUM_GPU_BO_VRAM;
+	memset(&fb2, 0, sizeof(fb2));
+	fb2.size = 640u * 480u * 4u;
+	fb2.flags = ATRIUM_GPU_BO_VRAM;
+	if (ioctl(fd, ATRIUM_GPU_IOC_BO_ALLOC, &fb) != 0 ||
+	    ioctl(fd, ATRIUM_GPU_IOC_BO_ALLOC, &fb2) != 0) {
+		perror("BO_ALLOC vram fb");
+		return (1);
+	}
+
+	/* 3. SET_MODE on FB — no referee fault. */
+	memset(&sm, 0, sizeof(sm));
+	sm.fb_fd = fb.bo_fd;
+	if (ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_SET_MODE, &sm) != 0 || sm.fault != 0) {
+		printf("display FAILED: SET_MODE fault=%u\n", sm.fault);
+		return (1);
+	}
+
+	/* 4. Vsync FLIP to FB2 — no fault. */
+	memset(&fl, 0, sizeof(fl));
+	fl.fb_fd = fb2.bo_fd;
+	fl.vsync = 1;
+	if (ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_FLIP, &fl) != 0 || fl.fault != 0) {
+		printf("display FAILED: FLIP fault=%u\n", fl.fault);
+		return (1);
+	}
+
+	/* 5. Vblank advances under the host-timer refresh (~60 Hz). */
+	memset(&st0, 0, sizeof(st0));
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_STATUS, &st0);
+	before = st0.vblank_count;
+	usleep(120 * 1000); /* ~7 refreshes */
+	memset(&st1, 0, sizeof(st1));
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_STATUS, &st1);
+	if (st1.vblank_count <= before) {
+		printf("display FAILED: vblank did not advance (%llu -> %llu)\n",
+		    (unsigned long long)before,
+		    (unsigned long long)st1.vblank_count);
+		return (1);
+	}
+
+	/* 6. Referee: a too-small FB faults FbTooSmall (code 4). */
+	memset(&small, 0, sizeof(small));
+	small.size = 4096;
+	small.flags = ATRIUM_GPU_BO_VRAM;
+	if (ioctl(fd, ATRIUM_GPU_IOC_BO_ALLOC, &small) != 0) {
+		perror("BO_ALLOC small");
+		return (1);
+	}
+	memset(&fl, 0, sizeof(fl));
+	fl.fb_fd = small.bo_fd;
+	fl.vsync = 0;
+	if (ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_FLIP, &fl) != 0 || fl.fault != 4) {
+		printf("display FAILED: too-small FB fault=%u (want 4)\n",
+		    fl.fault);
+		return (1);
+	}
+
+	printf("display OK: connector+EDID, SET_MODE, vsync FLIP, vblank "
+	    "advanced %llu, too-small FB refereed\n",
+	    (unsigned long long)(st1.vblank_count - before));
+	close(small.bo_fd);
+	close(fb2.bo_fd);
+	close(fb.bo_fd);
+	return (0);
+}
+
 int
 main(void)
 {
@@ -1552,6 +1652,7 @@ main(void)
 	rc |= test_multipage(fd, vm);
 	rc |= test_doorbell_pages(fd, vm);
 	rc |= test_vram(fd, vm);
+	rc |= test_display(fd);
 	close(vm);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");

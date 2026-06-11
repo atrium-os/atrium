@@ -225,7 +225,9 @@ struct atrium_amd_vm {
  * refcount; the BO owns its own page and holds a reference (vm_fp) on the VM it
  * is mapped in, so fo_close can unmap from that VM.
  */
-#define ATRIUM_AMD_BO_MAX_PAGES	16	/* largest BO = 64 KiB (16 PTEs) */
+#define ATRIUM_AMD_BO_MAX_PAGES	512	/* largest BO = 2 MiB; a 640x480x4 scanout
+					 * FB is 300 pages, so a display FB must
+					 * fit (small GPU BOs use a handful). */
 
 struct atrium_amd_bo {
 	struct atrium_amd_softc *sc;
