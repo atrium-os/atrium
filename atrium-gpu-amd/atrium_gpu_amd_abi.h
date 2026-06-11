@@ -176,6 +176,8 @@ struct atrium_gpu_syncobj_wait {
  */
 struct atrium_gpu_display_query {
 	uint32_t connected;	/* out: 1 = monitor attached (HPD) */
+	uint32_t connector_type; /* out: §8 interface type code (1=HDMI1.4 2=HDMI2.1
+				  * 3=DP1.4 4=USB-C-DP-alt 5=eDP) */
 	uint32_t edid_len;	/* out: EDID bytes returned (128) */
 	uint8_t  edid[128];	/* out: EDID base block read over DDC */
 };

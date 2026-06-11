@@ -126,6 +126,7 @@
 #define regDISP_FB_SIZE		0x30014	/* w: FB size in bytes */
 #define regDISP_SET_MODE	0x30018	/* w 1: program the connector's EDID mode */
 #define regDISP_FLIP		0x3001c	/* w: bit0 = vsync; the write triggers a flip */
+#define regDISP_CONNECTOR_TYPE	0x30034	/* r: §8 interface type code */
 #define regDISP_VBLANK_COUNT	0x30020	/* r: vblanks elapsed */
 #define regDISP_DROPPED_FLIPS	0x30024	/* r: flips dropped by the depth-1 queue */
 #define regDISP_FAULT		0x30028	/* r: last DisplayFault code (0 = none) */

@@ -1545,6 +1545,13 @@ test_display(int fd)
 		    q.edid[0], q.edid[1], q.edid[7]);
 		return (1);
 	}
+	/* §8: the connector reports its interface type (2 = HDMI 2.1, the
+	 * D-display-1 HDMI-shaped baseline). */
+	if (q.connector_type != 2) {
+		printf("display FAILED: connector_type=%u (want 2=HDMI2.1)\n",
+		    q.connector_type);
+		return (1);
+	}
 
 	/* 2. Two VRAM scanout framebuffers (640x480 XRGB8888). */
 	memset(&fb, 0, sizeof(fb));

@@ -25,6 +25,7 @@ amd_display_query(struct atrium_amd_softc *sc, struct atrium_gpu_display_query *
 	uint32_t i;
 
 	q->connected = amd_mmio_read32(sc, regDISP_CONNECTOR_STATUS) & 1u;
+	q->connector_type = amd_mmio_read32(sc, regDISP_CONNECTOR_TYPE);
 	for (i = 0; i < ATRIUM_AMD_EDID_LEN; i++) {
 		amd_mmio_write32(sc, regDISP_DDC_OFFSET, i);
 		q->edid[i] = (uint8_t)amd_mmio_read32(sc, regDISP_DDC_DATA);
