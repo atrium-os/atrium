@@ -99,6 +99,31 @@ path stays exactly as it is.
    generalized to deadlines) and **across Aqueduct IPC** (a server runs a request
    under the caller's deadline), since the audio chain (app callback → lyrad mix
    → driver ring) crosses both and is killed by classic inversion otherwise.
+
+   **"Known deadline" — a three-way taxonomy, and the admission rule.** Lane
+   clients are not uniformly "known"; they divide into: **(a) hardware-anchored
+   periodic** (audio, capture) — the device dictates period *and* phase (DMA
+   drain at `buffer/rate`, sensor cadence); the deadline is a physical fact,
+   exact at stream-open. **(b) hardware-anchored sporadic** (frames) — the
+   vblank *grid* is exact, but frames are event-triggered (an idle app has no
+   deadline) and *which* vblank a frame targets (next vs next+1) is broker
+   policy; sporadic CBS admission (budget / min-inter-arrival). **(c)
+   derived/assigned** (input; brokered IPC work) — no intrinsic hardware
+   instant; the broker *assigns* a deadline anchored to (a)/(b) (input inherits
+   the frame it must influence), and inheritance propagates it. Crucially,
+   **deadline-known ≠ work-known**: audio has both (≈constant DSP per period →
+   near-guarantee); graphics has a known deadline but unknown WCET → the lane
+   grants *priority to meet*, never a guarantee, and **this is why CBS rather
+   than raw EDF** — budget exhaustion demotes an overrunning frame thread for
+   the period, so a greedy renderer cannot eat the audio deadline. The boundary
+   rule that keeps the lane honest: **admit only *declared* deadlines anchored
+   to a hardware timing fact or explicitly inherited from one — never inferred
+   ones.** If no anchor exists, the thread belongs in WFQ; inferring deadlines
+   would be ULE's interactivity guess / EEVDF's synthetic deadline returning
+   through the side door. (Edges: VRR makes the vblank grid elastic — the
+   deadline becomes a window, deferred with the display doc's VRR work; network
+   real-time is locally audio-shaped (jitter-buffer drain) but only the local
+   leg is ours to schedule.)
 2. **WFQ for everything undeclared** — current Laminar (min-vruntime + the
    bounded-lag clamp): shells, builds, daemons, legacy apps. The right tool where
    no deadline exists. EEVDF's per-task *slice* may later be adopted **here** as
