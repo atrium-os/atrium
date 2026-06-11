@@ -158,9 +158,10 @@
 #define regSCHED_ADD_QUEUE	0x40010	/* w1: append a queue with the staged config */
 #define regSCHED_RUN_ROUNDS	0x40014	/* w: run N energy-fair rounds */
 #define regSCHED_SELECT		0x40018	/* w: select a queue for readback */
-#define regSCHED_ENERGY_UJ	0x4001c	/* r: selected queue energy (uJ) */
+#define regSCHED_ENERGY_UJ	0x4001c	/* r: selected queue energy (uJ, telemetry) */
 #define regSCHED_RUNS		0x40020	/* r: selected queue run count */
 #define regSCHED_QUEUE_COUNT	0x40024	/* r: number of queues */
+#define regSCHED_BUSY_US	0x40028	/* r: selected queue engine time (us, fairness) */
 
 /* CP firmware: minimum ucode version the model accepts (CP_FW_MIN_VERSION). */
 #define ATRIUM_AMD_CP_FW_VERSION 0x40

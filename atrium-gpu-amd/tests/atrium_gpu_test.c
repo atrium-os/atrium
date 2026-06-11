@@ -1884,19 +1884,21 @@ test_display_dptrain(int fd)
 }
 
 /*
- * Firmware energy-fair scheduler through the kmod (gpu-scheduler §9): the kernel
- * programs per-queue weights + kernels and reads back the Joule counters; the
- * device runs the energy-fair selection. Two equal-weight queues with
- * different-power kernels share JOULES, not run counts — the energy-fair thesis.
+ * Firmware progress-fair scheduler through the kmod (gpu-scheduler §9, as
+ * corrected by the scheduler-federation doc): the kernel programs per-queue
+ * weights + kernels; the device runs TIME-charged WFQ and exposes engine time
+ * (fairness) plus Joule counters (telemetry for the budget layer). Two
+ * equal-weight queues with different-power kernels share ENGINE TIME — not run
+ * counts, not Joules.
  */
 static int
 test_sched(int fd)
 {
 	struct atrium_gpu_sched s;
-	uint32_t e0, e1, r0, r1, diff;
+	uint32_t t0, t1, e0, e1, r0, r1, diff;
 	int rc = 0;
 
-	/* queue 0: VRAM-bandwidth kernel (high power); queue 1: host (lower power). */
+	/* queue 0: VRAM kernel (fast, power-dense); queue 1: host (slow). */
 	memset(&s, 0, sizeof(s));
 	s.op = 0; s.arg = 1; s.ops = 1; s.bytes = 1000000000u; s.level = 3;
 	ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
@@ -1907,30 +1909,35 @@ test_sched(int fd)
 		rc = 1;
 	}
 
-	s.op = 1; s.arg = 2000; /* run 2000 energy-fair rounds */
+	s.op = 1; s.arg = 2000; /* run 2000 progress-fair rounds */
 	ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
 
 	s.op = 2; s.arg = 0; ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
-	e0 = s.energy_uj; r0 = s.runs;
+	t0 = s.busy_us; e0 = s.energy_uj; r0 = s.runs;
 	s.op = 2; s.arg = 1; ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
-	e1 = s.energy_uj; r1 = s.runs;
+	t1 = s.busy_us; e1 = s.energy_uj; r1 = s.runs;
 
-	/* energy-fair: the two queues drew ~equal Joules (within 10%). */
-	diff = e0 > e1 ? e0 - e1 : e1 - e0;
-	if (e0 == 0 || diff * 100u / e0 > 10u) {
-		printf("sched FAILED: energy %u vs %u uJ (not equal)\n", e0, e1);
+	/* progress-fair: the two queues got ~equal engine time (within 10%). */
+	diff = t0 > t1 ? t0 - t1 : t1 - t0;
+	if (t0 == 0 || diff * 100u / t0 > 10u) {
+		printf("sched FAILED: time %u vs %u us (not equal)\n", t0, t1);
 		rc = 1;
 	}
-	/* NOT run-fair: the cheaper-per-run (VRAM) queue ran far more. */
+	/* the short-per-run (VRAM) queue ran far more to fill its share. */
 	if (r0 <= r1) {
 		printf("sched FAILED: runs %u vs %u (want q0 > q1)\n", r0, r1);
 		rc = 1;
 	}
+	/* Joules are telemetry, NOT equalized (VRAM is power-denser at eq. time). */
+	if (e0 == e1) {
+		printf("sched FAILED: energy %u == %u uJ (should differ)\n", e0, e1);
+		rc = 1;
+	}
 
 	if (rc == 0)
-		printf("sched OK: equal-weight queues share Joules (%u~%u uJ) "
-		    "not runs (%u vs %u) — energy-fair, firmware-enforced\n",
-		    e0, e1, r0, r1);
+		printf("sched OK: equal-weight queues share TIME (%u~%u us), "
+		    "runs %u vs %u, Joules %u vs %u are telemetry — "
+		    "progress-fair, firmware-enforced\n", t0, t1, r0, r1, e0, e1);
 	return (rc);
 }
 

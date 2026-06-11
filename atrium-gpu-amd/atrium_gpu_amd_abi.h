@@ -169,10 +169,13 @@ struct atrium_gpu_syncobj_wait {
 #define ATRIUM_GPU_IOC_GPU_RESET	_IO('A', 16)
 
 /*
- * Firmware energy-fair scheduler (gpu-scheduler §9): the kernel sets per-queue
- * weights, the device (firmware) enforces energy-fair scheduling. op 0 = add a
- * queue with `arg`=weight and the `ops`/`bytes`/`level` per-dispatch kernel; op 1
- * = run `arg` scheduling rounds; op 2 = query queue `arg` (energy_uj / runs out).
+ * Firmware progress-fair scheduler (gpu-scheduler §9, corrected per the
+ * scheduler-federation doc): the kernel sets per-queue weights, the device
+ * (firmware) enforces TIME-charged weighted fair queueing. Energy is telemetry
+ * for the budget layer, never the charge. op 0 = add a queue with `arg`=weight
+ * and the `ops`/`bytes`/`level` per-dispatch kernel; op 1 = run `arg` rounds;
+ * op 2 = query queue `arg` (busy_us = the fairness readback; energy_uj = the
+ * Joule telemetry; runs).
  */
 struct atrium_gpu_sched {
 	uint32_t op;
@@ -180,8 +183,9 @@ struct atrium_gpu_sched {
 	uint32_t ops;		/* in (add): per-dispatch compute ops */
 	uint32_t bytes;		/* in (add): per-dispatch bytes */
 	uint32_t level;		/* in (add): memory level (0=Reg..4=Host) */
-	uint32_t energy_uj;	/* out (query): accumulated energy, µJ */
+	uint32_t energy_uj;	/* out (query): accumulated energy, µJ (telemetry) */
 	uint32_t runs;		/* out (query): run count */
+	uint32_t busy_us;	/* out (query): engine time, µs (fairness) */
 	uint32_t count;		/* out: number of queues */
 };
 #define ATRIUM_GPU_IOC_SCHED		_IOWR('A', 25, struct atrium_gpu_sched)

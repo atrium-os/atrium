@@ -98,11 +98,12 @@ amd_sched(struct atrium_amd_softc *sc, struct atrium_gpu_sched *s)
 		amd_mmio_write32(sc, regSCHED_KERNEL_LEVEL, s->level);
 		amd_mmio_write32(sc, regSCHED_ADD_QUEUE, 1);
 		break;
-	case 1:	/* run `arg` energy-fair scheduling rounds */
+	case 1:	/* run `arg` progress-fair scheduling rounds */
 		amd_mmio_write32(sc, regSCHED_RUN_ROUNDS, s->arg);
 		break;
-	case 2:	/* query queue `arg`: read its Joule counter + run count */
+	case 2:	/* query queue `arg`: engine time (fairness) + Joules (telemetry) */
 		amd_mmio_write32(sc, regSCHED_SELECT, s->arg);
+		s->busy_us = amd_mmio_read32(sc, regSCHED_BUSY_US);
 		s->energy_uj = amd_mmio_read32(sc, regSCHED_ENERGY_UJ);
 		s->runs = amd_mmio_read32(sc, regSCHED_RUNS);
 		break;
