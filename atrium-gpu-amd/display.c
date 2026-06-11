@@ -117,3 +117,22 @@ amd_display_usbc(struct atrium_amd_softc *sc, uint32_t lanes)
 {
 	amd_mmio_write32(sc, regDISP_CFG_USBC, lanes);
 }
+
+/* MST: drive the DP multi-stream hub (op 0 enable, 1 add sink, 2 query). */
+void
+amd_display_mst(struct atrium_amd_softc *sc, struct atrium_gpu_display_mst *m)
+{
+	switch (m->op) {
+	case 0:	/* enable / reset the hub */
+		amd_mmio_write32(sc, regDISP_MST_ENABLE, 1);
+		break;
+	case 1:	/* add a sink advertising mode `arg` */
+		amd_mmio_write32(sc, regDISP_MST_ADD_SINK, m->arg);
+		break;
+	case 2:	/* query sink `arg` */
+		amd_mmio_write32(sc, regDISP_MST_SELECT, m->arg);
+		m->starved = amd_mmio_read32(sc, regDISP_MST_SINK_STARVED);
+		break;
+	}
+	m->count = amd_mmio_read32(sc, regDISP_MST_SINK_COUNT);
+}

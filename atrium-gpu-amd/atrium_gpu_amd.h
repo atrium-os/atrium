@@ -131,6 +131,11 @@
 #define regDISP_CFG_PLUG_MODE	0x3003c	/* w: re-plug advertising a built-in mode */
 #define regDISP_CFG_USBC	0x30040	/* w: USB-C alt-mode (0=USB, 2|4=enter N lanes) */
 #define regDISP_USBC_LANES	0x30044	/* r: negotiated USB-C lane count */
+#define regDISP_MST_ENABLE	0x30048	/* w1: (re)build a DP MST hub */
+#define regDISP_MST_ADD_SINK	0x3004c	/* w: hot-plug an MST sink (mode code) */
+#define regDISP_MST_SELECT	0x30050	/* w: select sink index for the MST queries */
+#define regDISP_MST_SINK_COUNT	0x30054	/* r: number of MST sinks */
+#define regDISP_MST_SINK_STARVED 0x30058 /* r: selected sink bandwidth-starved? */
 #define regDISP_VBLANK_COUNT	0x30020	/* r: vblanks elapsed */
 #define regDISP_DROPPED_FLIPS	0x30024	/* r: flips dropped by the depth-1 queue */
 #define regDISP_FAULT		0x30028	/* r: last DisplayFault code (0 = none) */
@@ -379,6 +384,7 @@ int	 amd_queue_program(struct atrium_amd_softc *sc, uint64_t ring_va,
 /* display.c — the D-display-1 scanout path (one connector / one CRTC) */
 struct atrium_gpu_display_query;
 struct atrium_gpu_display_status;
+struct atrium_gpu_display_mst;
 int	 amd_display_query(struct atrium_amd_softc *sc,
 	    struct atrium_gpu_display_query *q);
 int	 amd_display_set_mode(struct atrium_amd_softc *sc, struct thread *td,
@@ -390,6 +396,8 @@ void	 amd_display_status(struct atrium_amd_softc *sc,
 void	 amd_display_config(struct atrium_amd_softc *sc, uint32_t ctype,
 	    uint32_t plug_mode);
 void	 amd_display_usbc(struct atrium_amd_softc *sc, uint32_t lanes);
+void	 amd_display_mst(struct atrium_amd_softc *sc,
+	    struct atrium_gpu_display_mst *m);
 
 /*
  * mmap offset (passed to mmap() on the device fd) that maps the BAR2 doorbell

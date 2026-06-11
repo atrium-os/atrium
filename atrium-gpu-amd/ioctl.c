@@ -411,6 +411,14 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		return (0);
 	}
 
+	case ATRIUM_GPU_IOC_DISPLAY_MST: {
+		struct atrium_gpu_display_mst *m =
+		    (struct atrium_gpu_display_mst *)data;
+
+		amd_display_mst(sc, m);
+		return (0);
+	}
+
 	default:
 		return (ENOTTY);
 	}

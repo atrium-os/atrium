@@ -1784,6 +1784,59 @@ test_display_usbc(int fd)
 	return (rc);
 }
 
+/*
+ * §8 DisplayPort MST through the kmod: one DP link fans out to a dynamic set of
+ * sinks sharing its bandwidth (the same max-min fair split the energy federation
+ * uses). Two 1080p sinks fit; three 4K sinks oversubscribe and starve.
+ */
+static int
+test_display_mst(int fd)
+{
+	struct atrium_gpu_display_mst m;
+	int rc = 0, i, any;
+
+	/* two 1080p sinks on a DP 1.4 link → neither starves. */
+	memset(&m, 0, sizeof(m));
+	m.op = 0; /* enable / reset */
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_MST, &m);
+	m.op = 1; m.arg = 1; ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_MST, &m); /* 1080p */
+	m.op = 1; m.arg = 1; ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_MST, &m);
+	any = 0;
+	for (i = 0; i < 2; i++) {
+		m.op = 2; m.arg = i;
+		ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_MST, &m);
+		if (m.starved)
+			any = 1;
+	}
+	if (m.count != 2 || any) {
+		printf("display_mst FAILED: 2x1080p count=%u any_starved=%d\n", m.count, any);
+		rc = 1;
+	}
+
+	/* three 4K sinks → oversubscribed, starvation appears. */
+	m.op = 0; ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_MST, &m); /* reset */
+	for (i = 0; i < 3; i++) {
+		m.op = 1; m.arg = 2; /* 4K */
+		ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_MST, &m);
+	}
+	any = 0;
+	for (i = 0; i < 3; i++) {
+		m.op = 2; m.arg = i;
+		ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_MST, &m);
+		if (m.starved)
+			any = 1;
+	}
+	if (m.count != 3 || !any) {
+		printf("display_mst FAILED: 3x4K count=%u any_starved=%d\n", m.count, any);
+		rc = 1;
+	}
+
+	if (rc == 0)
+		printf("display_mst OK: two 1080p share a DP link; three 4K "
+		    "oversubscribe (starvation)\n");
+	return (rc);
+}
+
 int
 main(void)
 {
@@ -1823,6 +1876,7 @@ main(void)
 	rc |= test_display(fd);
 	rc |= test_display_link(fd);
 	rc |= test_display_usbc(fd);
+	rc |= test_display_mst(fd);
 	close(vm);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");

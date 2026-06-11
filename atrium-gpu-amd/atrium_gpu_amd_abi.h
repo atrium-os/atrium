@@ -221,11 +221,24 @@ struct atrium_gpu_display_usbc {
 	uint32_t lanes;
 };
 
+/*
+ * DisplayPort MST (§8): one link fans out to a dynamic set of sinks sharing its
+ * bandwidth. op 0 = enable/reset the hub; op 1 = add a sink advertising mode
+ * `arg` (0=VGA 1=1080p 2=4K); op 2 = query sink `arg`. `count`/`starved` are out.
+ */
+struct atrium_gpu_display_mst {
+	uint32_t op;
+	uint32_t arg;
+	uint32_t count;		/* out: number of sinks */
+	uint32_t starved;	/* out: (op 2) selected sink bandwidth-starved? */
+};
+
 #define ATRIUM_GPU_IOC_DISPLAY_QUERY	_IOWR('A', 17, struct atrium_gpu_display_query)
 #define ATRIUM_GPU_IOC_DISPLAY_SET_MODE	_IOWR('A', 18, struct atrium_gpu_display_setmode)
 #define ATRIUM_GPU_IOC_DISPLAY_FLIP	_IOWR('A', 19, struct atrium_gpu_display_flip)
 #define ATRIUM_GPU_IOC_DISPLAY_STATUS	_IOR('A', 20, struct atrium_gpu_display_status)
 #define ATRIUM_GPU_IOC_DISPLAY_CONFIG	_IOW('A', 21, struct atrium_gpu_display_config)
 #define ATRIUM_GPU_IOC_DISPLAY_USBC	_IOW('A', 22, struct atrium_gpu_display_usbc)
+#define ATRIUM_GPU_IOC_DISPLAY_MST	_IOWR('A', 23, struct atrium_gpu_display_mst)
 
 #endif /* _ATRIUM_GPU_AMD_ABI_H_ */
