@@ -10,6 +10,16 @@ model (separate repo). Energy stance:
 
 ## 0. Thesis (lead with the payoff)
 
+> **⚠ Partially superseded (2026-06-11) by
+> [`atrium-scheduler-federation.md`](atrium-scheduler-federation.md).** The
+> "energy-*denominated vruntime* / energy-fairness as the universal currency"
+> framing below is **corrected**: energy is the common currency *across* members
+> (the shared power budget), **not** the fairness denominator *within* a member —
+> on a CPU it negates per-task fairness (energy ≈ work is a GPU coincidence). The
+> mechanism (RLC + modulate-`L` + DVFS + thermal + `water_fill` + the portable
+> reduction) all stand; read "energy-fair" below as the GPU's *efficiency-weighted,
+> progress-charged* WFQ. See the federation doc for the corrected two-layer model.
+
 The GPU scheduler and the energy router are **the same object**. Fair
 time-sharing, preemption, and frame deadlines are not three mechanisms bolted
 together — they are one **RLC closed-loop controller denominated in Joules**.
@@ -213,6 +223,13 @@ when the frame becomes worth more than the work you'd waste — a continuous,
 tunable function.
 
 ## 7. Energy as the common currency → scheduler *is* the energy router
+
+> **⚠ Corrected — see [`atrium-scheduler-federation.md`](atrium-scheduler-federation.md)
+> §2–§5.** Energy is the common currency *across* members (the `water_fill` power
+> budget), not the within-member fairness *vruntime*. Within a member, fairness is
+> charged in the progress unit (time/work); the GPU's "energy-fairness" is really
+> *efficiency-weighted* progress-fair WFQ. The reactive/dissipative `L`/`R`/`C` and
+> the rest of this section stand at the *budget* and *preemption* layers.
 
 The deadline trick was already an energy statement. `L` (sunk work) and `R`
 (save/restore) are both Joules; ramping `L` down near the deadline is exactly the
