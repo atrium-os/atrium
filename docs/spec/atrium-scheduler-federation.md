@@ -36,8 +36,9 @@ ULE/EEVDF on plain workloads?* If no, nothing else is heard. Honest scorecard:
 
 - **vs ULE** (FreeBSD incumbent — per-CPU queues + interactivity *heuristic*):
   Laminar wins on model cleanliness (principled WFQ vs a tuned sleep/run ratio),
-  on the control-theoretic load balancer, and on integrated DVFS; it has been
-  benched against ULE favorably. ULE's only edge is **maturity**.
+  on the control-theoretic load balancer, and on integrated DVFS; benched against
+  ULE it is **competitive, with wins** (most gaps closed, leads in several — not a
+  clean sweep). ULE's remaining edge is **maturity**.
 - **vs EEVDF** (Linux 6.6 SOTA — lag-gated *eligibility* + earliest *virtual
   deadline* + per-task *slice*): on the **single-runqueue ordering model, plain
   min-vruntime Laminar is CFS-class, and EEVDF strictly dominates CFS.** EEVDF's
@@ -60,7 +61,12 @@ With EEVDF ordering in place, Laminar keeps **three differentiators EEVDF lacks*
    preemptions = cache/TLB thrash. modulate-`L` is an explicit gate — *don't tear
    down expensive in-flight work to honour a slack deadline* — layered on EEVDF
    selection. Latency where the deadline is tight; no thrash where it is loose.
-   Complementary to EEVDF, not redundant.
+   *Anticipated objection:* "isn't that just dynamic slice extension / adaptive
+   `RUN_TO_PARITY`?" No — the slice is a **static per-task** latency parameter;
+   `L` is **state-dependent**: it prices the *running* work's actual teardown
+   cost (occupancy, cache footprint, save/restore size) at this instant. EEVDF
+   knows what the waiter is owed; modulate-`L` also knows what the switch
+   *destroys*. Complementary, not redundant.
 2. **Control-theoretic placement.** Lead-compensated control loop vs PELT +
    periodic heuristic balancing — plausibly better on NUMA / heterogeneous
    (big.LITTLE). *Plausibly*: the post-fork placement bimodality is still
@@ -82,13 +88,16 @@ The isolation gate is therefore a precondition, not a distraction.
 
 Two corollaries fix the whole design:
 
-- **Within a member** (CPU threads; GPU clients) there *is* a fine common progress
-  unit — **time** on a CPU, **work/time** on a GPU. Fair-divide *that*. Energy is
-  the wrong unit here because it decouples from progress.
-- **Across members** (CPU vs GPU vs memory vs display) there is **no** common
-  progress unit — CPU-seconds and GPU-frames are incommensurable. The *only* shared
-  currency is **watts**. So energy is not a *choice* at the federation level; it is
-  the unique commensurable unit, and fair-dividing it is correct.
+- **Within a member** (CPU threads; GPU clients) the claimants contend for one
+  pool — the member's execution time — and a fine progress-faithful unit for it
+  exists: **time on the engine**. Fair-divide *that*. Energy is the wrong unit
+  here because it decouples from progress.
+- **Across members** (CPU vs GPU vs memory vs display) the members do *not*
+  contend for each other's time — CPU-time and GPU-time are separate pools, so
+  there is nothing to fair-divide in those units. What they **jointly contend
+  for** is the power/thermal envelope. Fairness divides the *shared contended
+  thing*, and across members that thing is **watts** — so energy is not a
+  *choice* at the federation level; it is what is actually being divided.
 
 The GPU doc's error was a **layer-violation**: it took the across-member currency
 (energy, correct *there*) and applied it to within-member fairness (where a finer,
@@ -96,30 +105,39 @@ progress-faithful unit exists). Two layers, two currencies — each correct.
 
 ## 3. Within-member layer (fine timescale, µs)
 
-Weighted fair queueing, EEVDF-keyed:
+Weighted fair queueing, EEVDF-keyed — and **identical on CPU and GPU**:
 
-- **Charge** = the member's **progress unit** (time-on-core for CPU; work / time-
-  on-engine for GPU). *Never energy.*
+- **Charge** = **time on the engine** (time-on-core / time-on-GPU). *Never
+  energy* — and not "work" either: work is not measurable on an opaque command
+  stream, while engine-time is. One charge unit for every member.
 - **Selection** = earliest-virtual-deadline-among-eligible, computed by the
   portable sharded reduction.
-- **Weight function** — the *only* per-member difference:
-  - **CPU:** `weight = priority(nice)` only. **No efficiency term** — memory-bound
-    is *legitimate* (a DB query is not "wasteful"), so efficiency-weighting a CPU
-    thread would re-introduce the inversion.
-  - **GPU:** `weight = priority × efficiency`. A VRAM-thrasher (low arithmetic
-    intensity, high energy, *low useful work*) gets low weight → its virtual time
-    advances fast per unit GPU-time → it is throttled. This is **strictly better
-    than energy-in-the-charge**: it throttles by *inefficiency* (genuine wasters /
-    bandwidth hogs), sparing the efficient-but-power-dense kernel that energy-
-    fairness wrongly hit. Energy enters only as an *input to the weight*, not as the
-    charge.
+- **Weight** = `priority` — on **both** members, with **no efficiency term**.
+  Memory-bound is *legitimate* on both: a DB query on the CPU and a texture-heavy
+  or blit-bound pass on the GPU are low-arithmetic-intensity *honest* workloads,
+  and the scheduler cannot distinguish them from "wasters." Any efficiency term —
+  in the charge *or* the weight — re-introduces the inversion (penalizing the
+  legitimately memory-bound), just less directly. The earlier draft gave the GPU
+  `priority × efficiency`; that was the same mistake at one remove, and it is
+  withdrawn.
+- **Bandwidth hogging is an externality, handled at the budget layer.** The
+  shared resource a "VRAM-thrasher" over-consumes is **memory bandwidth** — which
+  is itself a federation *member* with its own budget allocation (§4;
+  `federation.rs` already models `memory-bw`). A client that saturates the memory
+  member gets squeezed by *that member's* allocation, not by a fairness-weight
+  judgment inside the GPU's queue. Throughput-per-Joule bias on the GPU remains
+  available as an explicit **operator policy** (a deliberate weight adjustment for
+  a throughput-tenant device) — but it is policy, not a fairness principle, and it
+  carries exactly the inversion risk documented here.
 - **Preemption** = modulate-`L` (`atrium-gpu-scheduler.md` §6): near a deadline,
   ramp the inductance `L` (the reluctance to discard in-flight work) smoothly to
   zero — faster *and* more damped at once — for a clean switch; far from one, keep
   `L` high and resist costly preemption. Same overlay on CPU and GPU.
 
-Energy does not appear in selection, charge, or preemption ordering anywhere in
-this layer.
+Energy does not appear in selection, charge, weight, or preemption ordering
+anywhere in this layer. With charge and weight now identical across members,
+"same kernel, retargeted" is exact: the members differ only in their `L`/`R`
+constants (preemption cost physics) and their budget exposure.
 
 ## 4. Across-member layer — the federation budget (slow timescale, s)
 
@@ -158,17 +176,27 @@ The shared power cap, divided in **watts** (the only commensurable currency):
 
 | piece | gpusim | layer |
 |---|---|---|
-| cost model (duration + energy) | `cost.rs` | budget input + GPU efficiency-weight input |
+| cost model (duration + energy) | `cost.rs` | budget input (per-member power demand + Joule telemetry) |
 | deadline-modulates-`L` preemption | `rlc.rs` | within-member preemption (both CPU & GPU) |
 | energy-optimal DVFS / race-to-idle | `dvfs.rs` | budget actuator |
 | thermal RC outer loop | `thermal.rs` | budget source + burst headroom |
 | `water_fill` budget allocation | `federation.rs` | across-member budget (watts) |
 | portable min-(deadline) reduction | `reduce.rs` | within-member selection (EEVDF-keyed) |
 
-The energy-fair `EnergyScheduler`/`SchedRegs` demonstrations remain *valid as the
-GPU's efficiency-weighted WFQ* once re-read as "time-charged, efficiency-weighted"
-rather than "energy-charged" — the in-VM result (equal-weight different-power
-queues) is then the *efficiency-weighting* story, not an energy-fairness one.
+**What the in-VM `EnergyScheduler`/`SchedRegs` demo does and does not prove.** Be
+precise here, because the algebra bites: the implementation charges
+`vruntime += energy/weight`, and a "time-charged, efficiency-weighted" scheduler
+(`vruntime += time/(priority × efficiency)`) coincides with it **only if
+`efficiency ≡ 1/power`** — i.e. "low-power = efficient," which is *precisely the
+retracted inversion*. So the demo's *behavior* (equal Joules across
+different-power queues) is the retracted policy and cannot be re-read as anything
+else. What the demo **does** validate — and the corrected design still needs all
+of it — is the **mechanism**: programmable per-queue weights from the kernel,
+firmware-enforced WFQ selection through the register protocol, and readable
+per-queue Joule counters (which the budget layer consumes as its demand/telemetry
+input). Bringing the implementation in line with this doc is a one-line policy
+change: charge **time**, not energy; keep the Joule counters as *observability*,
+not as the charge.
 
 ## 6. Unifying Laminar (concrete sequence)
 
@@ -183,10 +211,11 @@ queues) is then the *efficiency-weighting* story, not an energy-fairness one.
    from the shared cap, signals urgency for latency bursts, and is throttled by the
    shared thermal loop (proportionally, shares intact).
 
-The result is one mechanism (EEVDF WFQ + modulate-`L`) across CPU and GPU,
-differing only in the **weight function** and **per-class budget exposure** —
-"same kernel, retargeted" in the literal sense — federated by a shared **watt**
-budget. Which is exactly what *coordinated, not coupled — share intent, independent
+The result is one mechanism (EEVDF WFQ + modulate-`L`) across CPU and GPU — same
+charge (engine-time), same weight rule (priority), differing only in the
+**`L`/`R` preemption-cost constants** and **per-class budget exposure** — "same
+kernel, retargeted" in the literal sense — federated by a shared **watt** budget.
+Which is exactly what *coordinated, not coupled — share intent, independent
 mechanisms* always said.
 
 ## 7. Framing (doc & pitch order)
@@ -204,12 +233,18 @@ would be. Pass the gate first.
   exposure** (background squeezed first under thermal/battery pressure). Confirm no
   residual case needs a per-class *charge*.
 - **GPU objective:** multi-client Atrium GPU needs a starvation floor, so it is
-  WFQ-with-efficiency-weights, not greedy throughput-max. Confirm there is no
-  single-tenant regime that wants pure greedy max (and if so, it is an *overlay*,
-  not a currency change).
-- **Efficiency weight on CPU:** decided *out* (memory-bound is legitimate). Revisit
-  only if a measured externality (cache/BW pollution) justifies a *mild* term — and
-  if so, as a weight nudge, never a charge.
+  priority-weighted WFQ, not greedy throughput-max. Confirm there is no
+  single-tenant regime that wants pure greedy max (and if so, it is an *overlay* /
+  operator policy, not a currency or weight-rule change).
+- **Efficiency weight: decided *out* on both members** (memory-bound is
+  legitimate on CPU *and* GPU; the bandwidth externality belongs to the memory-BW
+  member's budget). Revisit only if a *measured* externality the budget layer
+  cannot express justifies a mild term — and if so, as an explicit operator-policy
+  weight nudge, never a charge, with the inversion risk documented.
+- **Memory-BW member granularity:** the budget layer squeezes the memory member as
+  a whole; does attributing bandwidth back to the *offending GPU client* need a
+  finer mechanism (per-client BW accounting feeding its priority), or is
+  member-level pressure sufficient in practice? Measure before adding machinery.
 - **EEVDF + modulate-`L` interaction:** does the cost-gate measurably cut EEVDF's
   small-slice preemption thrash without hurting its latency bound? This is the
   headline isolation win to *measure*, not just argue.
