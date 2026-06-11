@@ -178,6 +178,7 @@ struct atrium_gpu_display_query {
 	uint32_t connected;	/* out: 1 = monitor attached (HPD) */
 	uint32_t connector_type; /* out: §8 interface type code (1=HDMI1.4 2=HDMI2.1
 				  * 3=DP1.4 4=USB-C-DP-alt 5=eDP) */
+	uint32_t usbc_lanes;	/* out: USB-C alt-mode lane count (0 = not USB-C) */
 	uint32_t edid_len;	/* out: EDID bytes returned (128) */
 	uint8_t  edid[128];	/* out: EDID base block read over DDC */
 };
@@ -210,10 +211,21 @@ struct atrium_gpu_display_config {
 	uint32_t plug_mode;	/* in: re-plug advertising mode (0=VGA 1=1080p 2=4K) */
 };
 
+/*
+ * USB-C DisplayPort Alt Mode (§8 cross-subsystem): the display connector is
+ * virtual until PD negotiates alt-mode. `lanes` = 0 puts the port in USB mode (no
+ * display); 2 or 4 enters DP Alt Mode with that lane count (4 = full bandwidth,
+ * 2 = half — USB takes the other pair).
+ */
+struct atrium_gpu_display_usbc {
+	uint32_t lanes;
+};
+
 #define ATRIUM_GPU_IOC_DISPLAY_QUERY	_IOWR('A', 17, struct atrium_gpu_display_query)
 #define ATRIUM_GPU_IOC_DISPLAY_SET_MODE	_IOWR('A', 18, struct atrium_gpu_display_setmode)
 #define ATRIUM_GPU_IOC_DISPLAY_FLIP	_IOWR('A', 19, struct atrium_gpu_display_flip)
 #define ATRIUM_GPU_IOC_DISPLAY_STATUS	_IOR('A', 20, struct atrium_gpu_display_status)
 #define ATRIUM_GPU_IOC_DISPLAY_CONFIG	_IOW('A', 21, struct atrium_gpu_display_config)
+#define ATRIUM_GPU_IOC_DISPLAY_USBC	_IOW('A', 22, struct atrium_gpu_display_usbc)
 
 #endif /* _ATRIUM_GPU_AMD_ABI_H_ */

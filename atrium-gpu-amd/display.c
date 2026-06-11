@@ -26,6 +26,7 @@ amd_display_query(struct atrium_amd_softc *sc, struct atrium_gpu_display_query *
 
 	q->connected = amd_mmio_read32(sc, regDISP_CONNECTOR_STATUS) & 1u;
 	q->connector_type = amd_mmio_read32(sc, regDISP_CONNECTOR_TYPE);
+	q->usbc_lanes = amd_mmio_read32(sc, regDISP_USBC_LANES);
 	for (i = 0; i < ATRIUM_AMD_EDID_LEN; i++) {
 		amd_mmio_write32(sc, regDISP_DDC_OFFSET, i);
 		q->edid[i] = (uint8_t)amd_mmio_read32(sc, regDISP_DDC_DATA);
@@ -108,4 +109,11 @@ amd_display_config(struct atrium_amd_softc *sc, uint32_t ctype, uint32_t plug_mo
 {
 	amd_mmio_write32(sc, regDISP_CFG_CONNECTOR_TYPE, ctype);
 	amd_mmio_write32(sc, regDISP_CFG_PLUG_MODE, plug_mode);
+}
+
+/* USB-C: enter/exit DP Alt Mode (lanes 0 = USB/virtual, 2|4 = alt-mode). */
+void
+amd_display_usbc(struct atrium_amd_softc *sc, uint32_t lanes)
+{
+	amd_mmio_write32(sc, regDISP_CFG_USBC, lanes);
 }

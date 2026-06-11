@@ -1687,6 +1687,103 @@ test_display_link(int fd)
 	return (rc);
 }
 
+/*
+ * §8 USB-C DP Alt Mode through the kmod: the display connector is virtual until
+ * PD negotiates alt-mode, and the negotiated lane count gates bandwidth (4 lanes
+ * carry 4K, 2 do not — USB takes the other pair).
+ */
+static int
+test_display_usbc(int fd)
+{
+	struct atrium_gpu_display_query q;
+	struct atrium_gpu_display_config cfg;
+	struct atrium_gpu_display_usbc uc;
+	struct atrium_gpu_display_setmode sm;
+	struct atrium_gpu_bo_alloc fb;
+	int rc = 0;
+
+	memset(&fb, 0, sizeof(fb));
+	fb.size = 640 * 480 * 4;
+	fb.flags = ATRIUM_GPU_BO_VRAM;
+	if (ioctl(fd, ATRIUM_GPU_IOC_BO_ALLOC, &fb) != 0) {
+		perror("BO_ALLOC");
+		return (1);
+	}
+
+	/* USB mode: the DP sink is virtual — no display connector. */
+	memset(&uc, 0, sizeof(uc));
+	uc.lanes = 0;
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_USBC, &uc);
+	memset(&q, 0, sizeof(q));
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_QUERY, &q);
+	memset(&sm, 0, sizeof(sm));
+	sm.fb_fd = fb.bo_fd;
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_SET_MODE, &sm);
+	if (q.connected != 0 || sm.fault != 2 /* NoConnector */) {
+		printf("display_usbc FAILED: USB mode connected=%u fault=%u "
+		    "(want 0, 2)\n", q.connected, sm.fault);
+		rc = 1;
+	}
+
+	/* PD enters DP Alt Mode, 4 lanes, advertising VGA → connector materializes. */
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.connector_type = 4;
+	cfg.plug_mode = 0; /* VGA */
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_CONFIG, &cfg);
+	uc.lanes = 4;
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_USBC, &uc);
+	memset(&q, 0, sizeof(q));
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_QUERY, &q);
+	if (!q.connected || q.connector_type != 4 || q.usbc_lanes != 4) {
+		printf("display_usbc FAILED: alt-mode connected=%u type=%u lanes=%u\n",
+		    q.connected, q.connector_type, q.usbc_lanes);
+		rc = 1;
+	}
+	memset(&sm, 0, sizeof(sm));
+	sm.fb_fd = fb.bo_fd;
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_SET_MODE, &sm);
+	if (sm.fault != 0) {
+		printf("display_usbc FAILED: VGA/4-lane fault=%u (want 0)\n", sm.fault);
+		rc = 1;
+	}
+
+	/* a 4K monitor fits 4 lanes (link OK -> FB too small) but not 2. */
+	cfg.plug_mode = 2; /* 4K */
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_CONFIG, &cfg);
+	uc.lanes = 4;
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_USBC, &uc);
+	memset(&sm, 0, sizeof(sm));
+	sm.fb_fd = fb.bo_fd;
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_SET_MODE, &sm);
+	if (sm.fault != 4 /* FbTooSmall: link passed at 4 lanes */) {
+		printf("display_usbc FAILED: 4K/4-lane fault=%u (want 4)\n", sm.fault);
+		rc = 1;
+	}
+	uc.lanes = 2;
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_USBC, &uc);
+	memset(&sm, 0, sizeof(sm));
+	sm.fb_fd = fb.bo_fd;
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_SET_MODE, &sm);
+	if (sm.fault != 5 /* ModeExceedsLink: 2 lanes can't */) {
+		printf("display_usbc FAILED: 4K/2-lane fault=%u (want 5)\n", sm.fault);
+		rc = 1;
+	}
+
+	/* restore the default monitor (HDMI 2.1 / VGA, not USB-C). */
+	uc.lanes = 0;
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_USBC, &uc);
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.connector_type = 2;
+	cfg.plug_mode = 0;
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_CONFIG, &cfg);
+
+	if (rc == 0)
+		printf("display_usbc OK: connector virtual until alt-mode; "
+		    "4 lanes carry 4K, 2 don't\n");
+	close(fb.bo_fd);
+	return (rc);
+}
+
 int
 main(void)
 {
@@ -1725,6 +1822,7 @@ main(void)
 	rc |= test_vram(fd, vm);
 	rc |= test_display(fd);
 	rc |= test_display_link(fd);
+	rc |= test_display_usbc(fd);
 	close(vm);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");
