@@ -32,6 +32,10 @@ fn empty_fragment_module() -> Module {
             ssbo_bindings: std::collections::HashMap::new(),
             workgroup_size: 0,
             workgroup_var_offset: std::collections::HashMap::new(),
+            output_varying_byte_offset: std::collections::HashMap::new(),
+            input_varying_byte_offset: std::collections::HashMap::new(),
+            frag_depth_output: None,
+            varying_output_bytes: 0,
         }],
         entry_points: vec![EntryPoint {
             stage: ShaderStage::Fragment,
@@ -119,11 +123,24 @@ fn compile_blob_emits_parseable_flat_blob() {
 
     // The blob's code is the same bytes the object path
     // wraps — sanity-check they agree on the body.
+    // The blob's code is the function body the object path
+    // also emits, PLUS the P2.2b batched-fragment span thunk
+    // appended after it (blob-only: the dlopen path never
+    // uses the thunk). So the object's .text must contain
+    // the body — everything before the thunk — not the whole
+    // blob.
+    let body_len = blob
+        .entries
+        .fs_span
+        .map(|off| off as usize)
+        .unwrap_or(blob.code.len());
     let obj_out = compile(&module, Target::host()).expect("compile");
     assert!(
-        obj_out.object.windows(blob.code.len())
-            .any(|w| w == blob.code.as_slice()),
-        "object's .text should contain exactly the blob's code",
+        obj_out.object.windows(body_len)
+            .any(|w| w == &blob.code[..body_len]),
+        "object's .text should contain the blob's fs body          (body_len={body_len}, blob={}, obj={})",
+        blob.code.len(),
+        obj_out.object.len(),
     );
 }
 
@@ -166,6 +183,10 @@ fn unsupported_op_falls_back_with_unsupported_error() {
             ssbo_bindings: std::collections::HashMap::new(),
             workgroup_size: 0,
             workgroup_var_offset: std::collections::HashMap::new(),
+            output_varying_byte_offset: std::collections::HashMap::new(),
+            input_varying_byte_offset: std::collections::HashMap::new(),
+            frag_depth_output: None,
+            varying_output_bytes: 0,
         }],
         entry_points: vec![EntryPoint {
             stage: ShaderStage::Fragment,

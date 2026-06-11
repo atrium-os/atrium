@@ -839,6 +839,18 @@ fn emit_function(
                     ints.insert(result.id, w);
                     PhiDest::Int(w)
                 }
+                // Bool Phi: same W-reg discipline as Int (bools
+                // are 0/1-valued i32s per constraint B4), but the
+                // dest lives in the `bools` map — that's where
+                // Select / BranchCond resolve their conditions.
+                Type::Bool => {
+                    let n = int_pool.free.pop().ok_or_else(||
+                        BackendError::Unsupported(
+                            "out of int W-regs allocating Bool Phi dest".into()))?;
+                    let w = asm::Wreg(n);
+                    bools.insert(result.id, w);
+                    PhiDest::Bool(w)
+                }
                 // A vecN-f32 Phi is N per-lane scalar Phis
                 // travelling together. Allocate one V-reg
                 // per lane (never expired, like a scalar
@@ -959,6 +971,9 @@ fn emit_function(
                     PhiDest::Packed(_) => matches!(&p.op,
                         Op::FAdd(..) | Op::FSub(..)
                         | Op::FMul(..) | Op::FDiv(..)),
+                    // Bool producers are compares/logic, not the
+                    // coalesce-aware binop emitters: never coalesce.
+                    PhiDest::Bool(_) => false,
                 };
                 if !op_ok { continue; }
                 // `src` single-use (only the phi-move reads it).
@@ -3013,6 +3028,16 @@ fn emit_function(
                                     a.emit(asm::mov_w(*dw, src));
                                 }
                             }
+                            PhiDest::Bool(dw) => {
+                                let src = *bools.get(src_id)
+                                    .or_else(|| ints.get(src_id))
+                                    .ok_or_else(||
+                                    BackendError::Internal(format!(
+                                        "Phi bool source {:?} not in                                          bools/ints", src_id)))?;
+                                if dw.0 != src.0 {
+                                    a.emit(asm::mov_w(*dw, src));
+                                }
+                            }
                             PhiDest::Packed(dq) => {
                                 // NEON-packed vec4 Phi: the
                                 // source value's whole vector
@@ -4518,6 +4543,10 @@ fn emit_load_f32_offset(
 enum PhiDest {
     Float(asm::Vreg),
     Int(asm::Wreg),
+    /// Bool Phi: i32-backed (constraint B4) in a W-reg, with the
+    /// dest registered in the `bools` map so Select/BranchCond
+    /// consumers resolve it.
+    Bool(asm::Wreg),
     Vec(Vec<asm::Vreg>),
     /// NEON-packed vec4 Phi: the whole vector in a single
     /// Q-register. Phi-move is one `mov v.16b`; a packed

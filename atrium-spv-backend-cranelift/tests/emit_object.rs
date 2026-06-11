@@ -53,6 +53,10 @@ fn build_minimal_fragment_module() -> Module {
         ssbo_bindings: std::collections::HashMap::new(),
         workgroup_size: 0,
         workgroup_var_offset: std::collections::HashMap::new(),
+            output_varying_byte_offset: std::collections::HashMap::new(),
+            input_varying_byte_offset: std::collections::HashMap::new(),
+            frag_depth_output: None,
+            varying_output_bytes: 0,
     };
     Module {
         functions: vec![func],

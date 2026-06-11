@@ -1177,6 +1177,51 @@ impl FnTranslator {
                 Err(BackendError::Unsupported(
                     "F64 constants not supported in phase 2 v2".to_string()))
             }
+            Op::ConstNull => {
+                // Typed zero (OpConstantNull, or OpUndef folded to
+                // Null by the frontend — zero is a legal refinement
+                // of undef). Scalars get a zero of their backing
+                // type; vectors get zero lanes.
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "ConstNull without result Value".to_string()))?;
+                use atrium_spv_ir::Type;
+                match &result.ty {
+                    Type::Bool | Type::I32 | Type::U32 => {
+                        let v = builder.ins().iconst(clif_types::I32, 0);
+                        self.scalars.insert(result.id, v);
+                    }
+                    Type::I64 | Type::U64 => {
+                        let v = builder.ins().iconst(clif_types::I64, 0);
+                        self.scalars.insert(result.id, v);
+                    }
+                    Type::F32 => {
+                        let v = builder.ins().f32const(0.0);
+                        self.scalars.insert(result.id, v);
+                    }
+                    Type::Vec2(e) | Type::Vec3(e) | Type::Vec4(e) => {
+                        let n = match &result.ty {
+                            Type::Vec2(_) => 2,
+                            Type::Vec3(_) => 3,
+                            _ => 4,
+                        };
+                        use atrium_spv_ir::VecElement;
+                        let lanes: Vec<_> = (0..n)
+                            .map(|_| match e {
+                                VecElement::F32 => builder.ins().f32const(0.0),
+                                _ => builder.ins().iconst(clif_types::I32, 0),
+                            })
+                            .collect();
+                        self.vectors.insert(result.id, lanes);
+                    }
+                    other => {
+                        return Err(BackendError::Unsupported(format!(
+                            "ConstNull of type {other:?} not supported",
+                        )));
+                    }
+                }
+                Ok(())
+            }
             Op::ConstVec(elements) => {
                 // SPIR-V OpCompositeConstruct flattens any vector
                 // operand into its component lanes — e.g.
@@ -1553,11 +1598,24 @@ impl FnTranslator {
                             clif_types::I32, MemFlags::new(), param, off);
                         self.scalars.insert(result.id, v);
                     }
-                    Type::Vec2(_) | Type::Vec3(_) | Type::Vec4(_) => {
-                        let (lane_ty, lane_count) = match &pointee {
-                            Type::Vec2(_) => (clif_types::F32, 2usize),
-                            Type::Vec3(_) => (clif_types::F32, 3usize),
-                            Type::Vec4(_) => (clif_types::F32, 4usize),
+                    Type::Vec2(e) | Type::Vec3(e) | Type::Vec4(e) => {
+                        // Lane type from the vector's ELEMENT type —
+                        // uint4/int4 vectors (e.g. push-constant
+                        // `dims`) must load as I32 lanes, not F32:
+                        // a mistyped lane poisons every downstream
+                        // int op (icmp/isub on f32 = verifier error).
+                        use atrium_spv_ir::VecElement;
+                        let lane_ty = match e {
+                            VecElement::F32 => clif_types::F32,
+                            VecElement::I32 | VecElement::U32 => clif_types::I32,
+                            other => return Err(BackendError::Unsupported(format!(
+                                "vector load with {other:?} lanes not supported",
+                            ))),
+                        };
+                        let lane_count = match &pointee {
+                            Type::Vec2(_) => 2usize,
+                            Type::Vec3(_) => 3usize,
+                            Type::Vec4(_) => 4usize,
                             _ => unreachable!(),
                         };
                         let mut lanes = Vec::with_capacity(lane_count);

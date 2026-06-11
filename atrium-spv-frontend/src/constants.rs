@@ -152,6 +152,16 @@ impl ConstantContext {
                         "ConstantNull without result type".to_string()))?,
                     kind: ConstantKind::Null,
                 },
+                // OpUndef at module scope: any value of the type
+                // is a legal refinement — pick zero (= Null).
+                // spirv-opt's ssa-rewrite emits these for phi
+                // inputs on paths where the value was never
+                // assigned, so SSA-legalized shaders need it.
+                SpvOp::Undef => StoredConstant {
+                    type_id: inst.result_type.ok_or_else(|| FrontendError::Malformed(
+                        "Undef without result type".to_string()))?,
+                    kind: ConstantKind::Null,
+                },
                 SpvOp::ConstantComposite | SpvOp::SpecConstantComposite =>
                     translate_constant_composite(inst, &ctx)?,
                 // OpSpecConstantOp: constant expression on

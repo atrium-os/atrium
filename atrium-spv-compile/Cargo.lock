@@ -66,6 +66,7 @@ dependencies = [
  "atrium-spv-backend-bespoke",
  "atrium-spv-backend-cranelift",
  "atrium-spv-frontend",
+ "atrium-spv-ir",
  "libloading",
  "rspirv",
  "sha2",

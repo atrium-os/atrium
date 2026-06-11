@@ -2571,7 +2571,7 @@ fn translate_inst(
             // `site` id (the lane's result ValueId) keys the
             // quad operand store, so each lane records/reads
             // its own operand.
-            let mut emit_lane = |lane_val: Value,
+            let emit_lane = |lane_val: Value,
                                  next_value_id: &mut u32,
                                  insts: &mut Vec<Inst>| -> Value {
                 let id = ValueId(*next_value_id);
