@@ -79,13 +79,26 @@ path stays exactly as it is.
 
 **The Atrium-native within-member design — three lanes:**
 
-1. **Declared real-deadline lane.** Frame-pipeline threads receive *actual*
-   deadlines via the Fresco handshake (frescod already knows vblank timing).
-   Admission-controlled, CBS-style: the **manifest caps a jail's deadline-lane
-   utilization**, so deadlines are *capabilities*, not a gameable boost — the
-   Portcullis shape. modulate-`L` consumes **real slack** here — the *same*
-   deadline-dissolves-inertia mechanism, driven by the same kind of real
-   deadline, on CPU (frame thread vs vblank) and GPU (dispatch vs vblank).
+1. **Declared real-deadline lane** — really a *media-pipeline lane*, fed by
+   **deadline brokers**: trusted, manifest-capability daemons that sponsor
+   deadlines for their client threads. **frescod** (vblank → frame deadlines) and
+   **lyrad** (audio buffer/rate → period deadlines) are instances of one API, not
+   special cases; camera/capture joins later with the same shape. Admission is
+   CBS-style: the **manifest caps a jail's deadline-lane utilization**, so
+   deadlines are *capabilities*, not a gameable boost — the Portcullis shape.
+   Within the lane, earliest-*real*-deadline ordering handles mixed periods
+   (2.7–10 ms audio + 16.7 ms frames + 33 ms capture) without static tiers.
+   modulate-`L` consumes **real slack** — the *same* deadline-dissolves-inertia
+   mechanism on CPU (frame/audio thread vs its deadline) and GPU (dispatch vs
+   vblank). Note **audio is the lane's best-posed client** — tighter period than
+   vblank, worse miss consequence (an underrun is universally audible; a dropped
+   frame is tolerable judder), and near-constant per-period work (the textbook
+   CBS workload) — so the admission math is proven against audio even though
+   graphics motivated the lane. Audio also surfaces the mechanism graphics let us
+   miss: **deadline inheritance** — across locks (turnstile priority-PI
+   generalized to deadlines) and **across Aqueduct IPC** (a server runs a request
+   under the caller's deadline), since the audio chain (app callback → lyrad mix
+   → driver ring) crosses both and is killed by classic inversion otherwise.
 2. **WFQ for everything undeclared** — current Laminar (min-vruntime + the
    bounded-lag clamp): shells, builds, daemons, legacy apps. The right tool where
    no deadline exists. EEVDF's per-task *slice* may later be adopted **here** as
@@ -112,13 +125,16 @@ Laminar's standing differentiators are unchanged and now sharper:
 **Verdict & the honest A/B.** On *undeclared* workloads Laminar must be — and,
 with the clamp, plausibly is — **competitive** with EEVDF on the pathologies that
 matter (validate with the latency-tail suite; that A/B is run as *validation*,
-not as the design driver). On the desktop's actual job — **frames on glass under
-load** — Atrium is **categorically** better positioned, because deadlines are
-real and end-to-end (CPU deadline lane + GPU modulate-`L` + display timing),
-which Linux structurally cannot have without owning the compositor. The headline
-benchmark is **frame-time variance under load**, and the gpusim arc
-(frame-pacing, deadline-meets, display timing) already built its instrumentation.
-*EEVDF is the best scheduler for an OS that can't know; Atrium knows.*
+not as the design driver). On the desktop's actual job — **frames on glass and
+sound in the air, under load** — Atrium is **categorically** better positioned,
+because deadlines are real and end-to-end (CPU deadline lane + GPU modulate-`L` +
+display timing; audio callback → lyrad → DMA ring), which Linux structurally
+cannot have without owning the compositor and the audio server. Two headline
+benchmarks: **frame-time variance under load** (the gpusim frame-pacing arc
+already built its instrumentation) and — crisper, because it is binary and
+countable — **underrun count / minimum reliable audio buffer size under load**
+(the number the Linux pro-audio world fights PREEMPT_RT for). *EEVDF is the best
+scheduler for an OS that can't know; Atrium knows.*
 
 ## 2. The governing principle
 
@@ -306,8 +322,20 @@ opponent's benchmark cedes the design ground that is Atrium's actual advantage.
   slice knob in the WFQ lane (paper-clean) — *measure before adopting*.
 - **Deadline-lane admission design:** CBS-style replenishment vs simpler
   utilization cap; per-jail budget accounting in the manifest/rctl shape; what a
-  deadline-miss does (demote to WFQ for the period? signal frescod?). Also: how
-  non-Fresco deadline sources (audio buffer deadlines) declare.
+  deadline-miss does (demote to WFQ for the period? signal the broker?). Design
+  the **broker API** (frescod/lyrad sponsor deadlines for clients) once, against
+  both brokers — audio's tight, regular periods are the proving case.
+- **Deadline inheritance:** generalize turnstile priority-PI to deadlines (a
+  lane thread blocked on a WFQ-held lock lends its deadline), and **propagate
+  deadlines as context across Aqueduct calls** (lyrad/frescod run a request under
+  the caller's deadline). Without this the audio chain dies of classic inversion;
+  it is the genuinely new kernel mechanism the lane requires.
+- **Audio timing model (gpusim):** a small audio device model on the existing
+  Timeline substrate — a ring consumed at sample rate in virtual time, **underrun
+  = the referee fault** (the audio analog of the tear) — gives deterministic
+  underrun-iff-deadline-missed tests mirroring D-display-1, and the
+  instrumentation for the minimum-reliable-buffer benchmark. Matches Lyra's
+  slot/ring transport plan.
 - **Two-lane starvation interplay:** the declared lane must not starve the WFQ
   lane under full admission — the admission cap *is* the guarantee; pick the cap
   and prove it (the gpusim deterministic harness can).
