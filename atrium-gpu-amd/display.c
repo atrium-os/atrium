@@ -136,3 +136,14 @@ amd_display_mst(struct atrium_amd_softc *sc, struct atrium_gpu_display_mst *m)
 	}
 	m->count = amd_mmio_read32(sc, regDISP_MST_SINK_COUNT);
 }
+
+/* DPTRAIN: train the DP link against a cable, read back the negotiated outcome. */
+void
+amd_display_dptrain(struct atrium_amd_softc *sc, struct atrium_gpu_display_dptrain *t)
+{
+	amd_mmio_write32(sc, regDISP_DPTRAIN_CABLE_RATE, t->cable_rate);
+	amd_mmio_write32(sc, regDISP_DPTRAIN_CABLE_LANES, t->cable_lanes);
+	amd_mmio_write32(sc, regDISP_DPTRAIN_RUN, 1);
+	t->bw_mbps = amd_mmio_read32(sc, regDISP_DPTRAIN_BW_MBPS);
+	t->trained = amd_mmio_read32(sc, regDISP_DPTRAIN_TRAINED);
+}

@@ -233,6 +233,17 @@ struct atrium_gpu_display_mst {
 	uint32_t starved;	/* out: (op 2) selected sink bandwidth-starved? */
 };
 
+/*
+ * DisplayPort link training (§8): negotiate against a physical cable. Usable
+ * bandwidth is an outcome — a marginal cable falls back to a lower rate.
+ */
+struct atrium_gpu_display_dptrain {
+	uint32_t cable_rate;	/* in: cable's max rate (0=RBR 1=HBR 2=HBR2 3=HBR3) */
+	uint32_t cable_lanes;	/* in: cable's wired lane count */
+	uint32_t bw_mbps;	/* out: trained bandwidth, MB/s */
+	uint32_t trained;	/* out: 1 = a link trained (0 = dead cable) */
+};
+
 #define ATRIUM_GPU_IOC_DISPLAY_QUERY	_IOWR('A', 17, struct atrium_gpu_display_query)
 #define ATRIUM_GPU_IOC_DISPLAY_SET_MODE	_IOWR('A', 18, struct atrium_gpu_display_setmode)
 #define ATRIUM_GPU_IOC_DISPLAY_FLIP	_IOWR('A', 19, struct atrium_gpu_display_flip)
@@ -240,5 +251,6 @@ struct atrium_gpu_display_mst {
 #define ATRIUM_GPU_IOC_DISPLAY_CONFIG	_IOW('A', 21, struct atrium_gpu_display_config)
 #define ATRIUM_GPU_IOC_DISPLAY_USBC	_IOW('A', 22, struct atrium_gpu_display_usbc)
 #define ATRIUM_GPU_IOC_DISPLAY_MST	_IOWR('A', 23, struct atrium_gpu_display_mst)
+#define ATRIUM_GPU_IOC_DISPLAY_DPTRAIN	_IOWR('A', 24, struct atrium_gpu_display_dptrain)
 
 #endif /* _ATRIUM_GPU_AMD_ABI_H_ */

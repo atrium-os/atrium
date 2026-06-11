@@ -1837,6 +1837,52 @@ test_display_mst(int fd)
 	return (rc);
 }
 
+/*
+ * §8 DisplayPort link training through the kmod: usable bandwidth is a negotiated
+ * outcome. A full cable trains HBR3 x4 (carries 4K); a marginal cable falls back
+ * to HBR2 (can't); a dead cable trains nothing.
+ */
+static int
+test_display_dptrain(int fd)
+{
+	struct atrium_gpu_display_dptrain t;
+	uint32_t uhd_mbps = 594u * 4u; /* 594 MHz x 4 bpp = 2376 MB/s */
+	int rc = 0;
+
+	/* full cable: HBR3 x4 -> carries 4K. */
+	memset(&t, 0, sizeof(t));
+	t.cable_rate = 3; /* HBR3 */
+	t.cable_lanes = 4;
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_DPTRAIN, &t);
+	if (!t.trained || t.bw_mbps <= uhd_mbps) {
+		printf("display_dptrain FAILED: HBR3x4 trained=%u bw=%u\n", t.trained, t.bw_mbps);
+		rc = 1;
+	}
+
+	/* marginal cable: falls back to HBR2 -> can't carry 4K. */
+	t.cable_rate = 2; /* HBR2 */
+	t.cable_lanes = 4;
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_DPTRAIN, &t);
+	if (!t.trained || t.bw_mbps >= uhd_mbps) {
+		printf("display_dptrain FAILED: HBR2 trained=%u bw=%u\n", t.trained, t.bw_mbps);
+		rc = 1;
+	}
+
+	/* dead cable: trains nothing. */
+	t.cable_rate = 3;
+	t.cable_lanes = 0;
+	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_DPTRAIN, &t);
+	if (t.trained) {
+		printf("display_dptrain FAILED: dead cable trained=%u\n", t.trained);
+		rc = 1;
+	}
+
+	if (rc == 0)
+		printf("display_dptrain OK: HBR3 x4 carries 4K, HBR2 falls back "
+		    "below it, dead cable no link\n");
+	return (rc);
+}
+
 int
 main(void)
 {
@@ -1877,6 +1923,7 @@ main(void)
 	rc |= test_display_link(fd);
 	rc |= test_display_usbc(fd);
 	rc |= test_display_mst(fd);
+	rc |= test_display_dptrain(fd);
 	close(vm);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");

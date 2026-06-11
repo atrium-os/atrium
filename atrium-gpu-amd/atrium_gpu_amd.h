@@ -136,6 +136,11 @@
 #define regDISP_MST_SELECT	0x30050	/* w: select sink index for the MST queries */
 #define regDISP_MST_SINK_COUNT	0x30054	/* r: number of MST sinks */
 #define regDISP_MST_SINK_STARVED 0x30058 /* r: selected sink bandwidth-starved? */
+#define regDISP_DPTRAIN_CABLE_RATE 0x3005c /* w: cable max rate (0=RBR..3=HBR3) */
+#define regDISP_DPTRAIN_CABLE_LANES 0x30060 /* w: cable wired lanes */
+#define regDISP_DPTRAIN_RUN	0x30064	/* w1: run link training */
+#define regDISP_DPTRAIN_BW_MBPS	0x30068	/* r: trained bandwidth (MB/s) */
+#define regDISP_DPTRAIN_TRAINED	0x3006c	/* r: 1 = a link trained */
 #define regDISP_VBLANK_COUNT	0x30020	/* r: vblanks elapsed */
 #define regDISP_DROPPED_FLIPS	0x30024	/* r: flips dropped by the depth-1 queue */
 #define regDISP_FAULT		0x30028	/* r: last DisplayFault code (0 = none) */
@@ -385,6 +390,7 @@ int	 amd_queue_program(struct atrium_amd_softc *sc, uint64_t ring_va,
 struct atrium_gpu_display_query;
 struct atrium_gpu_display_status;
 struct atrium_gpu_display_mst;
+struct atrium_gpu_display_dptrain;
 int	 amd_display_query(struct atrium_amd_softc *sc,
 	    struct atrium_gpu_display_query *q);
 int	 amd_display_set_mode(struct atrium_amd_softc *sc, struct thread *td,
@@ -398,6 +404,8 @@ void	 amd_display_config(struct atrium_amd_softc *sc, uint32_t ctype,
 void	 amd_display_usbc(struct atrium_amd_softc *sc, uint32_t lanes);
 void	 amd_display_mst(struct atrium_amd_softc *sc,
 	    struct atrium_gpu_display_mst *m);
+void	 amd_display_dptrain(struct atrium_amd_softc *sc,
+	    struct atrium_gpu_display_dptrain *t);
 
 /*
  * mmap offset (passed to mmap() on the device fd) that maps the BAR2 doorbell

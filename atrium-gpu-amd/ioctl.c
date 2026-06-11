@@ -419,6 +419,14 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		return (0);
 	}
 
+	case ATRIUM_GPU_IOC_DISPLAY_DPTRAIN: {
+		struct atrium_gpu_display_dptrain *t =
+		    (struct atrium_gpu_display_dptrain *)data;
+
+		amd_display_dptrain(sc, t);
+		return (0);
+	}
+
 	default:
 		return (ENOTTY);
 	}
