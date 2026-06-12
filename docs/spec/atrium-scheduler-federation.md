@@ -161,6 +161,42 @@ countable — **underrun count / minimum reliable audio buffer size under load**
 (the number the Linux pro-audio world fights PREEMPT_RT for). *EEVDF is the best
 scheduler for an OS that can't know; Atrium knows.*
 
+### 1.1 The service contract — who gets what, spelled out
+
+The 2026-06-12 A/B (bench `LAMINAR-vs-ULE-2026-06-12-waketails.md`) makes the
+classes concrete. Every thread on Atrium is in exactly one of four classes,
+and each class has an explicit contract — nothing is implicitly "interactive":
+
+| class | who is in it | mechanism | latency contract (measured, 4 vCPU saturated) |
+|---|---|---|---|
+| **kernel / POSIX RT** | ithreads, root `rtprio` | strict priority, preempts everything | µs-grade wakes (p99 ≈ 15–25 µs); **no admission, no isolation** — a runaway starves the box; root-only |
+| **declared deadline lane** | broker-sponsored threads: frescod clients (vblank), lyrad clients (audio), + deadline *inheritors* (turnstile locks, Aqueduct calls) | CBS (Q,T) admission ≤ 75 %/CPU, EDF within lane, immediate wake-preempt of timeshare, overrun → throttled to WFQ for the period, miss → `EVFILT_DEADLINE` to the broker | period-grid wakes, **0/10000 misses, ≤ 139 µs worst replenish on a quiet system**; unprivileged but capability-gated; *accountable* (per-entity stats) |
+| **undeclared WFQ** | shells, builds, daemons, batch, anything that never declared | min-vruntime WFQ + bounded-lag wakeup clamp; optional R-band / per-task slice as *global, honest* knobs | p50 ≈ 2.6 µs when CPUs have room; under saturation **p99 ≈ one slice (2.8–15.4 ms) by design**; extreme tail *bounded* (max ≈ 78 ms vs ULE's 315–402 ms); never starved |
+| **idle** | scavengers | runs only on idle CPUs | none |
+
+The p99 story vs ULE, stated plainly: **ULE's 25 µs undeclared p99 is bought
+with a guess** (the interactivity heuristic promotes whoever sleeps/wakes the
+right way), and the same guess produces its 5×-worse extreme tail and is
+ungovernable — any process can shape itself into the boost, and nothing caps
+the class. Laminar deliberately refuses the guess: an undeclared thread under
+saturation waits its fair slice, full stop. **The slice plateau is not a gap
+to be closed by a heuristic; it is the honest cost of fairness — and the exit
+from it is to *declare*.**
+
+What makes this livable on a desktop is that the latency-critical chains are
+*structurally* declared, not voluntarily: input and frames ride frescod's
+sponsorship, audio rides lyrad's, locks held against a lane thread inherit
+its deadline (K-a), and an Aqueduct request from a deadline-holder runs under
+the caller's deadline with charge-back (K-b). After those, what remains
+undeclared — compilers, shells, daemons — is work for which a 3–15 ms p99
+under full saturation is the *correct* answer. The residual exposure is the
+unported app doing latency-sensitive work outside any broker chain; its
+remedies, in order, are: port to the brokered path, buy tails globally with
+the R-band/slice knobs (throughput trade, no per-thread guessing), or rtprio
+with root. There is no fourth option, and that is a feature: every µs-grade
+contract on the system is visible in a manifest, a broker table, or root's
+hands.
+
 ## 2. The governing principle
 
 > **Fairness is over the finest *progress-faithful, commensurable* unit available
