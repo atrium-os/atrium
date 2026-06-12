@@ -189,7 +189,12 @@ sponsorship, audio rides lyrad's, locks held against a lane thread inherit
 its deadline (K-a), and an Aqueduct request from a deadline-holder runs under
 the caller's deadline with charge-back (K-b). After those, what remains
 undeclared — compilers, shells, daemons — is work for which a 3–15 ms p99
-under full saturation is the *correct* answer. The residual exposure is the
+under full saturation is the *correct* answer. (For third-party apps this
+table is surfaced through Insula's lifecycle classes — `insula.md` §11.1
+maps foreground-media / foreground / resident-background / triggered onto
+these scheduler classes 1:1; the manifest's deadline-utilization cap and
+background budgets are the app-facing form of the same contracts.) The
+residual exposure is the
 unported app doing latency-sensitive work outside any broker chain; its
 remedies, in order, are: port to the brokered path, buy tails globally with
 the R-band/slice knobs (throughput trade, no per-thread guessing), or rtprio

@@ -1506,6 +1506,26 @@ A single app can declare any subset. All three use the same
 primitive (`exec` in a jail); only scheduling discipline
 differs.
 
+**Kernel enforcement.** These classes are not framework
+policy — they map 1:1 onto the Laminar scheduler's service
+contract (`atrium-scheduler-federation.md` §1.1), which is
+what makes each promise enforceable rather than aspirational:
+
+| Insula class | Scheduler class |
+|---|---|
+| Foreground, media pipeline | **declared deadline lane** — frescod (vblank) / lyrad (audio) sponsor the app's frame/audio threads; CBS-admitted, manifest-capped |
+| Foreground, other | **undeclared WFQ** — fair slice, bounded-lag clamp |
+| Resident background (`priority = "low"`) | **WFQ at low weight** (or idle class for scavengers) |
+| Triggered background | **WFQ** + the manifest's `max-runtime` / invocation budgets |
+
+The across-member layer of the same spec (watt budgets,
+water-fill under a shared power cap) is what turns per-app
+*energy* quotas — the thing mobile OSes approximate with
+opaque standby buckets — into an enforceable, inspectable
+number. Deadlines themselves are Portcullis capabilities: a
+jail's manifest caps its deadline-lane utilization, so
+"smooth media" is a grant, not a heuristic an app can game.
+
 ### 11.2 Manifest declaration
 
 ```toml
