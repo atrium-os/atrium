@@ -24,6 +24,7 @@
 //! single-window apps render correctly.
 
 mod input_reader;
+mod laminar;
 mod pointer_reader;
 mod socket_server;
 
@@ -104,7 +105,7 @@ fn main() -> std::io::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp/frescod.sock"));
     let event_subs = socket_server::spawn(
-        socket_server::Shared { frontend: frontend.clone() },
+        socket_server::Shared { frontend: frontend.clone(), lane: None },
         &sock_path,
     )?;
     socket_server::spawn_event_fanout(ev_rx, event_subs);

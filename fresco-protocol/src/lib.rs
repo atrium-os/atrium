@@ -112,6 +112,16 @@ pub mod control {
     /// existing whole-surface present clients.
     pub const OP_WINDOW_PRESENT_DAMAGE: u16 = 0x0506;
 
+    /// Deadline-lane sponsorship request (scheduler federation §1.1,
+    /// Laminar phase J): the client asks frescod — the vblank deadline
+    /// BROKER — to sponsor its frame thread into the kernel's declared-
+    /// deadline lane with budget `q_us` per frame period. The period T
+    /// and the grid anchor are the broker's (connector refresh + last
+    /// vblank timestamp); clients never pick deadlines, only budgets.
+    /// Server replies `OP_LANE_REQUEST | IS_RESPONSE` with
+    /// `LaneReplyPayload`.
+    pub const OP_LANE_REQUEST:          u16 = 0x0510;
+
     // Async events (server → client). Sent with envelope flag
     // ASYNC_EVENT (aqueduct::envelope::flags::ASYNC_EVENT).
     pub const EV_WINDOW_RESIZED:         u16 = 0x0580;
@@ -128,6 +138,30 @@ pub mod control {
     pub const EV_INPUT_POINTER_MOTION:  u16 = 0x0701;
     pub const EV_INPUT_POINTER_BUTTON:  u16 = 0x0702;
     pub const EV_INPUT_POINTER_SCROLL:  u16 = 0x0703;
+}
+
+// ── Deadline-lane payloads ───────────────────────────────────────────
+
+/// `OP_LANE_REQUEST` — sponsor the calling client's frame thread.
+/// `pid` must match the connection's peer credential (the server
+/// verifies via LOCAL_PEERCRED); `tid` is the frame thread to sponsor;
+/// `q_us` is the requested per-frame CPU budget in microseconds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LaneRequestPayload {
+    pub pid: i32,
+    pub tid: i32,
+    pub q_us: u64,
+}
+
+/// Reply to `OP_LANE_REQUEST`. `ok == false` cases: no lane on this
+/// system (`err = "nolane"`-class), admission full, bad pid/tid, peer
+/// credential mismatch. `t_us` reports the frame period the entity was
+/// admitted with (the connector's refresh interval).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LaneReplyPayload {
+    pub ok: bool,
+    pub err: String,
+    pub t_us: u64,
 }
 
 // ── Slot payloads ────────────────────────────────────────────────────

@@ -30,6 +30,10 @@ path = "src/bin/aqueduct_smoke.rs"
 name = "frescod-aqueduct"
 path = "src/bin/frescod_aqueduct.rs"
 
+[[bin]]
+name = "lane-client"
+path = "src/bin/lane_client.rs"
+
 [dependencies]
 atrium-gpu-rs       = { path = "../atrium-gpu-rs" }
 atrium-devevents    = { path = "../atrium-devevents" }

@@ -74,6 +74,8 @@
 mod input_reader;
 #[path = "../pointer_reader.rs"]
 mod pointer_reader;
+#[path = "../laminar.rs"]
+mod laminar;
 #[path = "../socket_server.rs"]
 mod socket_server;
 
@@ -289,8 +291,27 @@ fn main() -> std::io::Result<()> {
     let sock_path = std::env::var("FRESCOD_SOCK")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp/frescod.sock"));
+    // ── Deadline broker (Laminar phase J): frescod owns the vblank,
+    // so frescod sponsors client frame threads into the kernel's
+    // declared-deadline lane. Absent /dev/laminar (non-Laminar boot,
+    // deadline_enable=0) we run without one.
+    let t_us = 1_000_000_000u64 / (mode.refresh_mhz.max(1) as u64);
+    let lane = match laminar::LaneBroker::open(t_us) {
+        Ok(b) => {
+            eprintln!("frescod: deadline broker up (T = {t_us} us/frame)");
+            Some(Arc::new(b))
+        }
+        Err(e) => {
+            eprintln!("frescod: no deadline lane ({e}); running without");
+            None
+        }
+    };
+
     let event_subs = socket_server::spawn(
-        socket_server::Shared { frontend: frontend.clone() },
+        socket_server::Shared {
+            frontend: frontend.clone(),
+            lane: lane.clone(),
+        },
         &sock_path,
     )?;
     socket_server::spawn_event_fanout(ev_rx, event_subs);
@@ -511,6 +532,16 @@ fn main() -> std::io::Result<()> {
             // Replaces wall-clock thread::sleep — see file header
             // and aqueduct-gpu.md §6.5.5.b.
             let _ = dpy.wait_vblank(conn.id);
+            if let Some(l) = &lane {
+                /* The vblank instant anchors new sponsorship grids. */
+                l.set_anchor_now();
+                for m in l.drain_misses() {
+                    eprintln!(
+                        "frescod: lane MISS: pid {} tid {} period {} (total {})",
+                        m.pid, m.tid, m.periods, m.misses
+                    );
+                }
+            }
         }
     }
 }

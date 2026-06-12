@@ -39,6 +39,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
+use crate::laminar::LaneBroker;
+
 /// Set of per-writer mpsc senders. A producer (event fan-out) holding
 /// this can broadcast an `Outbound` to every connected client. Senders
 /// disconnect when their writer thread exits; the broadcaster prunes
@@ -47,6 +49,9 @@ pub type EventSubs = Arc<Mutex<Vec<Sender<Outbound>>>>;
 
 pub struct Shared {
     pub frontend: Arc<Mutex<EnvelopeFrontend>>,
+    /// Deadline broker (Laminar phase J); None when /dev/laminar is
+    /// absent or the scheduler is not Laminar.
+    pub lane: Option<Arc<LaneBroker>>,
 }
 
 pub fn spawn(shared: Shared, sock_path: &Path) -> io::Result<EventSubs> {
@@ -130,11 +135,18 @@ fn accept_loop(listener: UnixListener, shared: Shared, event_subs: EventSubs) {
 
                 /* Reader thread. */
                 let frontend = shared.frontend.clone();
+                let lane = shared.lane.clone();
                 std::thread::Builder::new()
                     .name(format!("frescod-reader-{client_id}"))
                     .spawn(move || {
-                        if let Err(e) = reader_loop(stream, frontend.clone(), client_id, tx) {
+                        if let Err(e) = reader_loop(
+                            stream, frontend.clone(), client_id, tx,
+                            lane.clone(),
+                        ) {
                             eprintln!("frescod: reader {client_id}: {e}");
+                        }
+                        if let Some(l) = &lane {
+                            l.client_gone(client_id);
                         }
                         cleanup_client(&frontend, client_id);
                     })
@@ -153,7 +165,9 @@ fn reader_loop(
     frontend: Arc<Mutex<EnvelopeFrontend>>,
     client_id: u8,
     out: Sender<Outbound>,
+    lane: Option<Arc<LaneBroker>>,
 ) -> io::Result<()> {
+    let peer_pid = peer_cred_pid(&stream);
     let mut conn = AqConn::wrap(stream)?;
     loop {
         let msg = match conn.recv_message() {
@@ -182,6 +196,22 @@ fn reader_loop(
                                 connection cache; upload dropped");
                 }
             }
+        }
+
+        /* Deadline-lane sponsorship (phase J): broker concern, not a
+         * scene op — handled here, never reaches the frontend. */
+        if msg.op == fresco_protocol::control::OP_LANE_REQUEST {
+            let reply = handle_lane_request(
+                lane.as_deref(), &msg.payload, client_id, peer_pid,
+            );
+            let payload = fresco_protocol::encode(&reply)
+                .unwrap_or_default();
+            let _ = out.send(Outbound {
+                op: fresco_protocol::control::OP_LANE_REQUEST,
+                flags: flag::IS_RESPONSE,
+                payload,
+            });
+            continue;
         }
 
         let outs = match frontend.lock().unwrap().dispatch(&msg, client_id) {
@@ -240,4 +270,88 @@ fn cleanup_client(frontend: &Arc<Mutex<EnvelopeFrontend>>, client_id: u8) {
      * but the disconnecting client's nodes + slot bindings on it must
      * be purged or they leak as ghost content under the next client. */
     fe.forget_client_writes(client_id);
+}
+
+/// Peer pid of a UDS connection via LOCAL_PEERCRED (struct xucred).
+/// Defined by hand: libc's xucred lags the cr_pid union member.
+fn peer_cred_pid(stream: &UnixStream) -> Option<i32> {
+    use std::os::fd::AsRawFd;
+
+    const XU_NGROUPS: usize = 16;
+    #[repr(C)]
+    struct Xucred {
+        cr_version: u32,
+        cr_uid: u32,
+        cr_ngroups: i16,
+        /* 2 bytes implicit padding before cr_groups */
+        cr_groups: [u32; XU_NGROUPS],
+        /* the trailing union { void *; pid_t } is 8-aligned: groups
+         * end at offset 76, the union starts at 80 */
+        _pad0: u32,
+        cr_pid: i32, /* low word of the union (little-endian) */
+        _pad1: i32,
+    }
+    let mut xu: Xucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<Xucred>() as libc::socklen_t;
+    let r = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            0, /* SOL_LOCAL */
+            1, /* LOCAL_PEERCRED */
+            &mut xu as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if r == 0 && xu.cr_version == 0 /* XUCRED_VERSION */ {
+        Some(xu.cr_pid)
+    } else if r == 0 {
+        Some(xu.cr_pid)
+    } else {
+        None
+    }
+}
+
+fn handle_lane_request(
+    lane: Option<&LaneBroker>,
+    payload: &[u8],
+    client_id: u8,
+    peer_pid: Option<i32>,
+) -> fresco_protocol::LaneReplyPayload {
+    use fresco_protocol::{LaneReplyPayload, LaneRequestPayload};
+
+    let fail = |err: &str, t_us: u64| LaneReplyPayload {
+        ok: false,
+        err: err.to_string(),
+        t_us,
+    };
+    let Some(broker) = lane else {
+        return fail("no deadline lane on this system", 0);
+    };
+    let req: LaneRequestPayload = match fresco_protocol::decode(payload) {
+        Ok(r) => r,
+        Err(_) => return fail("bad payload", broker.t_us()),
+    };
+    /* The pid must be the connection's own peer — a client may only
+     * ask for ITS threads, never another process's. */
+    match peer_pid {
+        Some(p) if p == req.pid => {}
+        Some(p) => {
+            eprintln!(
+                "frescod: lane: client {client_id} pid claim {} != peer {p}",
+                req.pid
+            );
+            return fail("pid does not match peer credential", broker.t_us());
+        }
+        None => return fail("no peer credential", broker.t_us()),
+    }
+    match broker.sponsor(client_id, req.pid, req.tid, req.q_us) {
+        Ok(()) => {
+            eprintln!(
+                "frescod: lane: sponsored client {client_id} pid {} tid {} q {}us T {}us",
+                req.pid, req.tid, req.q_us, broker.t_us()
+            );
+            LaneReplyPayload { ok: true, err: String::new(), t_us: broker.t_us() }
+        }
+        Err(e) => fail(&format!("sponsor: {e}"), broker.t_us()),
+    }
 }
