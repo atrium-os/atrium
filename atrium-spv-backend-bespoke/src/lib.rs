@@ -2082,9 +2082,13 @@ fn emit_function(
                 &mut a, &mut ints, &mut int_pool, coalesce_w, inst, l, r, asm::sdiv_w)?,
             Op::UDiv(l, r) => emit_int_binop(
                 &mut a, &mut ints, &mut int_pool, coalesce_w, inst, l, r, asm::udiv_w)?,
-            // Integer remainder: div into the W9 scratch, then
+            // Unsigned remainder: udiv into the W9 scratch, then
             // msub (dst = l - (l/r)*r) — the standard ARM64 pair.
-            Op::UMod(l, r) | Op::SMod(l, r) => {
+            // UNSIGNED ONLY: the frontend decomposes OpSRem and
+            // OpSMod itself (truncated vs floored sign semantics
+            // — sdiv+msub would silently give SRem where SMod is
+            // asked), so Op::SMod deliberately stays unhandled.
+            Op::UMod(l, r) => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("mod without result".into()))?;
                 let wl = *ints.get(&l.id).ok_or_else(||
@@ -2094,11 +2098,7 @@ fn emit_function(
                     BackendError::Internal(format!(
                         "mod rhs {:?} not in ints", r.id)))?;
                 let w9 = asm::Wreg(9);
-                if matches!(&inst.op, Op::UMod(..)) {
-                    a.emit(asm::udiv_w(w9, wl, wr));
-                } else {
-                    a.emit(asm::sdiv_w(w9, wl, wr));
-                }
+                a.emit(asm::udiv_w(w9, wl, wr));
                 let d = match coalesce_w {
                     Some(d) => d,
                     None => alloc_int_w(&mut int_pool, result.id)?,

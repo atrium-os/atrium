@@ -8523,3 +8523,83 @@ fn differential_local_scratch_array() {
         assert_eq!(read(i), 40.0, "clamped read {i}");
     }
 }
+
+/// Unsigned remainder (OpUMod -> udiv + msub): pins the msub
+/// operand order, which compiles fine in any order and computes
+/// garbage in the wrong one.
+fn build_umod_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let v3u = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_arr = b.type_runtime_array(u32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt_arr]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_u = b.type_pointer(None, StorageClass::StorageBuffer, u32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_in_v3 = b.type_pointer(None, StorageClass::Input, v3u);
+    let gid_var = b.variable(ptr_in_v3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c3 = b.constant_bit32(u32_ty, 3);
+    let c17 = b.constant_bit32(u32_ty, 1700);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn)
+        .unwrap();
+    b.begin_block(None).unwrap();
+    let gid_v = b.load(v3u, None, gid_var, None, vec![]).unwrap();
+    let gid = b.composite_extract(u32_ty, None, gid_v, vec![0]).unwrap();
+    // out[gid] = (gid + 1700) % 3  (1700 % 3 = 2 -> phase-shifted)
+    let biased = b.i_add(u32_ty, None, gid, c17).unwrap();
+    let m = b.u_mod(u32_ty, None, biased, c3).unwrap();
+    let dst = b.access_chain(ptr_u, None, ssbo, vec![c_zero, gid]).unwrap();
+    b.store(dst, m, None, vec![]).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main",
+        vec![ssbo, gid_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words {
+        bytes.extend_from_slice(&w.to_le_bytes());
+    }
+    bytes
+}
+
+#[test]
+fn differential_op_umod() {
+    let spv = build_umod_cs();
+    let dir = TempDir::new().unwrap();
+    let gids: Vec<(u32, u32, u32)> = (0..6).map(|i| (i, 0, 0)).collect();
+    let mut b_buf = vec![0u8; 24];
+    let mut c_buf = vec![0u8; 24];
+    invoke_with_gids(&spv, true, dir.path(), "b", b_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    assert_eq!(b_buf, c_buf, "bespoke vs cranelift diverge on UMod");
+    let read = |i: usize| -> u32 {
+        u32::from_le_bytes(b_buf[i * 4..i * 4 + 4].try_into().unwrap())
+    };
+    for gid in 0..6u32 {
+        assert_eq!(read(gid as usize), (gid + 1700) % 3,
+            "(({gid} + 1700) % 3)");
+    }
+}
