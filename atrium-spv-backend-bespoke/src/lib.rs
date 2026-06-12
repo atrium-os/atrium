@@ -1694,9 +1694,6 @@ fn emit_function(
                     .collect();
                 dead_slots.sort_unstable_by_key(|(_, slot)| *slot);
                 for (sid, slot) in dead_slots {
-                    if slot == 4 && std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok() {
-                        eprintln!("SLOT4 SWEEP-FREE {sid:?} at i={i}");
-                    }
                     spill_slot.remove(&sid);
                     spilled.remove(&sid);
                     spilled_w.remove(&sid);
@@ -1745,9 +1742,6 @@ fn emit_function(
                                 sl
                             })
                         });
-                    if slot == 4 && std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok() {
-                        eprintln!("SLOT4 ASSIGN/STORE {sid:?} at i={i}");
-                    }
                     if slot >= SPILL_SLOT_CAP {
                         return Err(BackendError::Unsupported(
                             "spill area exhausted (1000 slots)".into()));
@@ -1778,11 +1772,6 @@ fn emit_function(
         // need bit-identical codegen).
         dead.sort_unstable();
         for n in dead {
-            if n == 30 && std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok() {
-                eprintln!("V30 EXPIRED at i={i} owner={:?} lu={:?}",
-                    owners.get(&n), owners.get(&n)
-                        .and_then(|id| last_use.get(id)));
-            }
             owners.remove(&n);
             free_pool.push(n);
         }
@@ -1933,7 +1922,6 @@ fn emit_function(
                 let mut need: Vec<ValueId> = spilled_w.iter()
                     .filter(|id| op_reads(&inst.op, **id))
                     .copied().collect();
-                need.sort_by_key(|v| v.0);
                 for (vid, lanes) in &vectors {
                     if op_reads(&inst.op, *vid) {
                         need.extend(lanes.iter()
@@ -1951,6 +1939,10 @@ fn emit_function(
                         need.push(*idx_id);
                     }
                 }
+                // Sort after ALL expansions (HashMap iteration
+                // order must not leak into machine code).
+                need.sort_unstable_by_key(|v| v.0);
+                need.dedup();
                 for id in need {
                     let slot = *spill_slot.get(&id).ok_or_else(||
                         BackendError::Internal(format!(
@@ -1977,21 +1969,6 @@ fn emit_function(
                     &mut spilled_w, &spill_slot, &vectors, &deferred_ptr,
                     &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, &inst.op)
                 {
-                    if std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok()
-                        && int_pool.free.len() < 8
-                    {
-                        let mut d = String::new();
-                        for (n, oid) in &int_pool.owners {
-                            d.push_str(&format!(
-                                "W{n}:{:?}p{}s{}i{}r{}; ", oid,
-                                phi_pinned.contains(oid) as u8,
-                                spill_slot.contains_key(oid) as u8,
-                                (ints.get(oid) == Some(&asm::Wreg(*n))) as u8,
-                                op_reads(&inst.op, *oid) as u8));
-                        }
-                        eprintln!("W-STALL i={i} free={} op={:?} [{d}]",
-                            int_pool.free.len(), inst.op);
-                    }
                     break; // nothing evictable; arms may still fit
                 }
             }
@@ -2019,7 +1996,6 @@ fn emit_function(
                 .filter(|id| op_reads(&inst.op, **id))
                 .copied()
                 .collect();
-            need.sort_by_key(|v| v.0);
             for (vid, lanes) in &vectors {
                 if op_reads(&inst.op, *vid) {
                     need.extend(lanes.iter()
@@ -2027,6 +2003,11 @@ fn emit_function(
                         .filter(|lid| spilled.contains(lid)));
                 }
             }
+            // Sort AFTER every expansion: the vectors map is a
+            // HashMap and its iteration order must not pick the
+            // reload order (and with it the reg/slot pairing).
+            need.sort_unstable_by_key(|v| v.0);
+            need.dedup();
             for id in need {
                 vread_impl(&mut a, &mut free_pool, &mut owners,
                     &mut used_callee_saved_v, &mut scalars,
@@ -2463,12 +2444,6 @@ fn emit_function(
             Op::ConstFloat { value, kind: FloatKind::F32 } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("ConstFloat without result".into()))?;
-                if std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok() {
-                    eprintln!("CF {:?} v={} dead={} uc={:?}",
-                        result.id, value,
-                        dead_const_floats.contains(&result.id),
-                        use_counts.get(&result.id));
-                }
                 // Dead — only used by pool-eligible ConstVecs,
                 // which read the literal pool instead. Skip
                 // the materialise to drop the prologue cost.
@@ -6164,9 +6139,6 @@ fn valloc_impl(
 ) -> Result<asm::Vreg, BackendError> {
     if let Some(n) = free_pool.pop() {
         if n < 16 { *used_callee_saved_v = true; }
-        if n == 30 && std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok() {
-            eprintln!("V30 ALLOC -> {owner:?}");
-        }
         owners.insert(n, owner);
         return Ok(asm::Vreg(n));
     }
@@ -6194,11 +6166,6 @@ fn valloc_impl(
                 (last_use.get(id).copied().unwrap_or(0), id.0, **n))
             .map(|(n, id)| (*n, *id));
         if let Some((n, victim_id)) = victim {
-            if std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok()
-                && (n == 30 || victim_id.0 == 118 || owner.0 == 118)
-            {
-                eprintln!("VEVICT V{n}: victim={victim_id:?} -> {owner:?}");
-            }
             owners.remove(&n);
             scalars.remove(&victim_id);
             spilled.insert(victim_id);
@@ -6326,7 +6293,8 @@ fn vevict_one(
                 && !read_now(**id)
                 && loop_safe(**id)
         })
-        .max_by_key(|(_, id)| last_use.get(id).copied().unwrap_or(0))
+        .max_by_key(|(n, id)|
+            (last_use.get(id).copied().unwrap_or(0), id.0, **n))
         .map(|(n, id)| (*n, *id));
     if let Some((n, victim_id)) = victim {
         owners.remove(&n);
@@ -6372,11 +6340,6 @@ fn vread_impl(
         scalars, spilled, spill_slot, vectors, last_use,
         phi_pinned, loop_spans, value_def_flat_idx, read_pos, cur_i,
         spill_mode, cur_op, id)?;
-    if std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok()
-        && (v.0 == 30 || id.0 == 118)
-    {
-        eprintln!("VREAD {id:?} -> V{} (slot {slot})", v.0);
-    }
     a.emit(asm::ldr_d_offset(v, asm::Xreg(31), (slot as u16) * 8));
     scalars.insert(id, v);
     spilled.remove(&id);
@@ -6968,29 +6931,6 @@ fn compute_last_use_flat(
         }
     }
 
-    if std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok() {
-        let probe = ValueId(210);
-        eprintln!("LU-DUMP lu(210)={:?} uc={:?}",
-            last_use.get(&probe), use_counts.get(&probe));
-        for (vid, ms) in &members {
-            if ms.contains(&probe) {
-                eprintln!("LU-DUMP vec {vid:?} contains 210; lu(vec)={:?}",
-                    last_use.get(vid));
-            }
-        }
-        // who reads 170 (the col ConstVec), with op detail
-        let vec170 = ValueId(170);
-        for (i, inst) in insts.iter().enumerate() {
-            if op_reads(&inst.op, vec170) {
-                eprintln!("LU-DUMP 170 read at i={i}: {:?}", inst.op);
-            }
-            if let Some(r) = inst.result.as_ref() {
-                if r.id == vec170 {
-                    eprintln!("LU-DUMP 170 DEF at i={i}: {:?}", inst.op);
-                }
-            }
-        }
-    }
     (last_use, use_counts)
 }
 
@@ -7128,11 +7068,6 @@ fn emit_fp_binop_poly(
                 Some(d) => d,
                 None => alloc_vreg(free_pool, owners, used_callee_saved_v,result.id)?,
             };
-            if std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok() {
-                eprintln!("FPBIN {:?}: l={:?}@V{} r={:?}@V{} -> {:?}@V{}",
-                    std::mem::discriminant(&inst.op),
-                    lhs.id, l.0, rhs.id, r.0, result.id, d.0);
-            }
             a.emit(make_inst(d, l, r));
             scalars.insert(result.id, d);
         }
@@ -7161,10 +7096,6 @@ fn emit_fp_binop_poly(
                     Some(lr) => lr[li],
                     None => alloc_vreg(free_pool, owners, used_callee_saved_v,synth)?,
                 };
-                if std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok() {
-                    eprintln!("VECLANE {li}: l={:?}@V{} r={:?}@V{} -> V{}",
-                        ll.id, l.0, rl.id, r.0, d.0);
-                }
                 a.emit(make_inst(d, l, r));
                 scalars.insert(synth, d);
                 out_lanes.push(Value {
