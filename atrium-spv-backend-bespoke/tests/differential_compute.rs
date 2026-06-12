@@ -8296,3 +8296,106 @@ fn differential_six_binding_constant_store() {
     let (b, c) = diff(&spv, 6);
     assert_equal("six-binding (max bespoke cap)", &b, &c);
 }
+
+/// Vector (vec3) transcendentals through the GLSL.std.450 path:
+/// Exp, Log2, Sin (one-operand) and Pow (two-operand). These
+/// synthesize as scalar f32 chains, so vector operands must
+/// expand component-wise in the frontend — this was the
+/// "FRINT* source not in scalars" hole the Orbis sky kernel hit
+/// (vector exp() had never been exercised).
+fn build_glsl_vec_transcendental_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let std_450 = b.ext_inst_import("GLSL.std.450");
+    let void   = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let v3_ty  = b.type_vector(f32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_arr = b.type_runtime_array(f32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt_arr]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_f = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let xl: Vec<u32> = [0.5f32, -1.25, 2.0].iter()
+        .map(|v| b.constant_bit32(f32_ty, v.to_bits())).collect();
+    let yl: Vec<u32> = [0.75f32, 2.5, 8.0].iter()
+        .map(|v| b.constant_bit32(f32_ty, v.to_bits())).collect();
+    let cx = b.constant_composite(v3_ty, xl);
+    let cy = b.constant_composite(v3_ty, yl);
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn).unwrap();
+    b.begin_block(None).unwrap();
+    let exp_x  = b.ext_inst(v3_ty, None, std_450, 27,
+        vec![rspirv::dr::Operand::IdRef(cx)]).unwrap();
+    let log2_y = b.ext_inst(v3_ty, None, std_450, 30,
+        vec![rspirv::dr::Operand::IdRef(cy)]).unwrap();
+    let sin_x  = b.ext_inst(v3_ty, None, std_450, 13,
+        vec![rspirv::dr::Operand::IdRef(cx)]).unwrap();
+    let pow_yx = b.ext_inst(v3_ty, None, std_450, 26,
+        vec![rspirv::dr::Operand::IdRef(cy), rspirv::dr::Operand::IdRef(cx)]).unwrap();
+    let vecs = [exp_x, log2_y, sin_x, pow_yx];
+    for (vi, v) in vecs.iter().enumerate() {
+        for lane in 0..3u32 {
+            let l = b.composite_extract(f32_ty, None, *v, vec![lane]).unwrap();
+            let c_i = b.constant_bit32(u32_ty, vi as u32 * 3 + lane);
+            let dst = b.access_chain(ptr_f, None, ssbo, vec![c_zero, c_i]).unwrap();
+            b.store(dst, l, None, vec![]).unwrap();
+        }
+    }
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main", vec![ssbo]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words { bytes.extend_from_slice(&w.to_le_bytes()); }
+    bytes
+}
+
+#[test]
+fn differential_glsl_vec_transcendentals() {
+    let spv = build_glsl_vec_transcendental_cs();
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 48];
+    let mut c_buf = vec![0u8; 48];
+    invoke_with_gids(&spv, true,  dir.path(), "b", b_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &[(0, 0, 0)]);
+    // exp(0.5, -1.25, 2.0); log2(0.75, 2.5, 8.0); sin(x); pow(y, x).
+    let expect: [f32; 12] = [
+        1.6487213, 0.2865048, 7.3890561,
+        -0.4150375, 1.3219281, 3.0,
+        0.4794255, -0.9489846, 0.9092974,
+        0.8660254, 0.3181980, 64.0,
+    ];
+    let read = |buf: &[u8], i: usize| -> f32 {
+        f32::from_le_bytes(buf[i*4..i*4+4].try_into().unwrap())
+    };
+    for i in 0..12 {
+        let bv = read(&b_buf, i);
+        let cv = read(&c_buf, i);
+        // Synth chains are polynomial approximations (log2 ~4e-4
+        // rel) and bespoke fuses FMA, so tolerance not bit-equality.
+        let tol = expect[i].abs() * 2e-3 + 1e-4;
+        assert!((bv - expect[i]).abs() < tol,
+            "bespoke lane {i}: {bv} vs {}", expect[i]);
+        assert!((cv - expect[i]).abs() < tol,
+            "cranelift lane {i}: {cv} vs {}", expect[i]);
+    }
+}

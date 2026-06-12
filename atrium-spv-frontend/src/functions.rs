@@ -3741,222 +3741,75 @@ fn translate_inst(
                         next_value_id, insts, source_spirv_offset)?;
                     Op::FTrunc(x)
                 }
-                13 => {
-                    // Sin(x): range-reduce to [-π/2, π/2] then
-                    // evaluate 4-term Horner Taylor polynomial
-                    // and apply parity sign.  See
-                    // synth_trig_reduce / synth_sin_poly.
-                    let x_id = expect_id(&spv_inst.operands, 2)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
+                // GLSL transcendentals (Sin..Log2, enums 13..=30):
+                // synthesized as scalar f32 chains by the synth_*
+                // helpers (see synth_transcendental). All of them
+                // are component-wise per the GLSL.std.450 spec, so
+                // vector operands expand per lane: extract each
+                // lane, run the scalar synthesis, recombine with
+                // ConstVec.
+                13..=30 => {
+                    let two_arg = matches!(inst_enum, 25 | 26);
+                    let a_id = expect_id(&spv_inst.operands, 2)?;
+                    let a = resolve_value(a_id, types, constants, id_map,
                         next_value_id, insts, source_spirv_offset)?;
-                    let (x_red, sign) = synth_trig_reduce(
-                        x, source_spirv_offset, insts, next_value_id);
-                    let sin = synth_sin_poly(
-                        x_red, source_spirv_offset, insts, next_value_id);
-                    Op::FMul(sin, sign)
-                }
-                15 => {
-                    // Tan(x) ≡ sin(x_red) / cos(x_red).  Parity
-                    // signs cancel in the quotient, so the
-                    // reduction's sign output is discarded.
-                    let x_id = expect_id(&spv_inst.operands, 2)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let (x_red, _sign) = synth_trig_reduce(
-                        x, source_spirv_offset, insts, next_value_id);
-                    let sin = synth_sin_poly(
-                        x_red.clone(), source_spirv_offset, insts, next_value_id);
-                    let cos = synth_cos_poly(
-                        x_red, source_spirv_offset, insts, next_value_id);
-                    Op::FDiv(sin, cos)
-                }
-                14 => {
-                    // Cos(x): range-reduce + 5-term Horner Taylor
-                    // polynomial + parity sign.
-                    let x_id = expect_id(&spv_inst.operands, 2)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let (x_red, sign) = synth_trig_reduce(
-                        x, source_spirv_offset, insts, next_value_id);
-                    let cos = synth_cos_poly(
-                        x_red, source_spirv_offset, insts, next_value_id);
-                    Op::FMul(cos, sign)
+                    let b = if two_arg {
+                        let b_id = expect_id(&spv_inst.operands, 3)?;
+                        Some(resolve_value(b_id, types, constants, id_map,
+                            next_value_id, insts, source_spirv_offset)?)
+                    } else {
+                        None
+                    };
+                    let n_lanes = match &result_ty {
+                        Type::Vec2(VecElement::F32) => Some(2u32),
+                        Type::Vec3(VecElement::F32) => Some(3u32),
+                        Type::Vec4(VecElement::F32) => Some(4u32),
+                        _ => None,
+                    };
+                    if let Some(n) = n_lanes {
+                        let extract = |v: &Value, k: u32,
+                                           insts: &mut Vec<Inst>,
+                                           next_value_id: &mut u32|
+                                           -> Value {
+                            let id = ValueId(*next_value_id);
+                            *next_value_id += 1;
+                            let lane = Value { id, ty: Type::F32 };
+                            insts.push(Inst {
+                                op: Op::VectorExtract {
+                                    vector: v.clone(), index: k,
+                                },
+                                result: Some(lane.clone()),
+                                source_spirv_offset,
+                            });
+                            lane
+                        };
+                        let mut lanes: Vec<Value> =
+                            Vec::with_capacity(n as usize);
+                        for k in 0..n {
+                            let ax = extract(&a, k, insts, next_value_id);
+                            let bx = b.as_ref().map(|bv|
+                                extract(bv, k, insts, next_value_id));
+                            let op = synth_transcendental(
+                                inst_enum, ax, bx,
+                                source_spirv_offset, insts,
+                                next_value_id)?;
+                            let lane = push_f32(op,
+                                source_spirv_offset, insts,
+                                next_value_id);
+                            lanes.push(lane);
+                        }
+                        Op::ConstVec(lanes)
+                    } else {
+                        synth_transcendental(inst_enum, a, b,
+                            source_spirv_offset, insts,
+                            next_value_id)?
+                    }
                 }
                 31 => {
                     let x_id = expect_id(&spv_inst.operands, 2)?;
                     let x = resolve_value(x_id, types, constants, id_map,
                         next_value_id, insts, source_spirv_offset)?;
                     Op::FSqrt(x)
-                }
-                29 => {
-                    // Exp2(x): synth via Horner Taylor + IEEE-754
-                    // exponent reconstruction.  See synth_exp2.
-                    // Returns the final value; we wrap as a
-                    // no-op FMul by 1.0 to fit the arm-returns-Op
-                    // shape (cheap; constant-folded by codegen).
-                    let x_id = expect_id(&spv_inst.operands, 2)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let e = synth_exp2(x, source_spirv_offset, insts, next_value_id);
-                    let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
-                    Op::FMul(e, c_one)
-                }
-                27 => {
-                    // Exp(x) = Exp2(x * log2(e)).
-                    let x_id = expect_id(&spv_inst.operands, 2)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let c_log2e = push_cf(std::f64::consts::LOG2_E,
-                        source_spirv_offset, insts, next_value_id);
-                    let x_scaled = push_f32(Op::FMul(x, c_log2e),
-                        source_spirv_offset, insts, next_value_id);
-                    let e = synth_exp2(x_scaled, source_spirv_offset, insts, next_value_id);
-                    let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
-                    Op::FMul(e, c_one)
-                }
-                30 => {
-                    // Log2(x): mantissa-split + rational approx.
-                    let x_id = expect_id(&spv_inst.operands, 2)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let l = synth_log2(x, source_spirv_offset, insts, next_value_id);
-                    let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
-                    Op::FMul(l, c_one)
-                }
-                28 => {
-                    // Log(x) = Log2(x) * ln(2).
-                    let x_id = expect_id(&spv_inst.operands, 2)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let l = synth_log2(x, source_spirv_offset, insts, next_value_id);
-                    let c_ln2 = push_cf(std::f64::consts::LN_2,
-                        source_spirv_offset, insts, next_value_id);
-                    Op::FMul(l, c_ln2)
-                }
-                18 => {
-                    // Atan(x): full real line via reciprocal range reduction.
-                    let x_id = expect_id(&spv_inst.operands, 2)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let a = synth_atan(x, source_spirv_offset, insts, next_value_id);
-                    let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
-                    Op::FMul(a, c_one)
-                }
-                19 => {
-                    // Sinh(x) = (Exp(x) - Exp(-x)) / 2
-                    let x_id = expect_id(&spv_inst.operands, 2)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let c_log2e = push_cf(std::f64::consts::LOG2_E,
-                        source_spirv_offset, insts, next_value_id);
-                    let xl = push_f32(Op::FMul(x.clone(), c_log2e.clone()),
-                        source_spirv_offset, insts, next_value_id);
-                    let neg_xl = push_f32(Op::FMul(x, push_cf(-std::f64::consts::LOG2_E,
-                        source_spirv_offset, insts, next_value_id)),
-                        source_spirv_offset, insts, next_value_id);
-                    let ex = synth_exp2(xl, source_spirv_offset, insts, next_value_id);
-                    let enx = synth_exp2(neg_xl, source_spirv_offset, insts, next_value_id);
-                    let diff = push_f32(Op::FSub(ex, enx),
-                        source_spirv_offset, insts, next_value_id);
-                    let c_half = push_cf(0.5, source_spirv_offset, insts, next_value_id);
-                    let _ = c_log2e;
-                    Op::FMul(diff, c_half)
-                }
-                20 => {
-                    // Cosh(x) = (Exp(x) + Exp(-x)) / 2
-                    let x_id = expect_id(&spv_inst.operands, 2)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let c_log2e = push_cf(std::f64::consts::LOG2_E,
-                        source_spirv_offset, insts, next_value_id);
-                    let xl = push_f32(Op::FMul(x.clone(), c_log2e),
-                        source_spirv_offset, insts, next_value_id);
-                    let c_neg_log2e = push_cf(-std::f64::consts::LOG2_E,
-                        source_spirv_offset, insts, next_value_id);
-                    let neg_xl = push_f32(Op::FMul(x, c_neg_log2e),
-                        source_spirv_offset, insts, next_value_id);
-                    let ex = synth_exp2(xl, source_spirv_offset, insts, next_value_id);
-                    let enx = synth_exp2(neg_xl, source_spirv_offset, insts, next_value_id);
-                    let sum = push_f32(Op::FAdd(ex, enx),
-                        source_spirv_offset, insts, next_value_id);
-                    let c_half = push_cf(0.5, source_spirv_offset, insts, next_value_id);
-                    Op::FMul(sum, c_half)
-                }
-                21 => {
-                    // Tanh(x) = (Exp(x) - Exp(-x)) / (Exp(x) + Exp(-x))
-                    let x_id = expect_id(&spv_inst.operands, 2)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let c_log2e = push_cf(std::f64::consts::LOG2_E,
-                        source_spirv_offset, insts, next_value_id);
-                    let xl = push_f32(Op::FMul(x.clone(), c_log2e),
-                        source_spirv_offset, insts, next_value_id);
-                    let c_neg_log2e = push_cf(-std::f64::consts::LOG2_E,
-                        source_spirv_offset, insts, next_value_id);
-                    let neg_xl = push_f32(Op::FMul(x, c_neg_log2e),
-                        source_spirv_offset, insts, next_value_id);
-                    let ex = synth_exp2(xl, source_spirv_offset, insts, next_value_id);
-                    let enx = synth_exp2(neg_xl, source_spirv_offset, insts, next_value_id);
-                    let num = push_f32(Op::FSub(ex.clone(), enx.clone()),
-                        source_spirv_offset, insts, next_value_id);
-                    let den = push_f32(Op::FAdd(ex, enx),
-                        source_spirv_offset, insts, next_value_id);
-                    Op::FDiv(num, den)
-                }
-                22 => {
-                    // Asinh(x) = Log(x + sqrt(x² + 1)).
-                    let x_id = expect_id(&spv_inst.operands, 2)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let x2 = push_f32(Op::FMul(x.clone(), x.clone()),
-                        source_spirv_offset, insts, next_value_id);
-                    let one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
-                    let x2p1 = push_f32(Op::FAdd(x2, one),
-                        source_spirv_offset, insts, next_value_id);
-                    let s = push_f32(Op::FSqrt(x2p1),
-                        source_spirv_offset, insts, next_value_id);
-                    let arg = push_f32(Op::FAdd(x, s),
-                        source_spirv_offset, insts, next_value_id);
-                    let l = synth_log2(arg, source_spirv_offset, insts, next_value_id);
-                    let c_ln2 = push_cf(std::f64::consts::LN_2,
-                        source_spirv_offset, insts, next_value_id);
-                    Op::FMul(l, c_ln2)
-                }
-                23 => {
-                    // Acosh(x) = Log(x + sqrt(x² - 1)), x ≥ 1.
-                    let x_id = expect_id(&spv_inst.operands, 2)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let x2 = push_f32(Op::FMul(x.clone(), x.clone()),
-                        source_spirv_offset, insts, next_value_id);
-                    let one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
-                    let x2m1 = push_f32(Op::FSub(x2, one),
-                        source_spirv_offset, insts, next_value_id);
-                    let s = push_f32(Op::FSqrt(x2m1),
-                        source_spirv_offset, insts, next_value_id);
-                    let arg = push_f32(Op::FAdd(x, s),
-                        source_spirv_offset, insts, next_value_id);
-                    let l = synth_log2(arg, source_spirv_offset, insts, next_value_id);
-                    let c_ln2 = push_cf(std::f64::consts::LN_2,
-                        source_spirv_offset, insts, next_value_id);
-                    Op::FMul(l, c_ln2)
-                }
-                24 => {
-                    // Atanh(x) = 0.5 * Log((1+x)/(1-x)),  x ∈ (-1, 1).
-                    let x_id = expect_id(&spv_inst.operands, 2)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
-                    let num = push_f32(Op::FAdd(one.clone(), x.clone()),
-                        source_spirv_offset, insts, next_value_id);
-                    let den = push_f32(Op::FSub(one, x),
-                        source_spirv_offset, insts, next_value_id);
-                    let ratio = push_f32(Op::FDiv(num, den),
-                        source_spirv_offset, insts, next_value_id);
-                    let l = synth_log2(ratio, source_spirv_offset, insts, next_value_id);
-                    let c_half_ln2 = push_cf(0.5 * std::f64::consts::LN_2,
-                        source_spirv_offset, insts, next_value_id);
-                    Op::FMul(l, c_half_ln2)
                 }
                 2 => {
                     // RoundEven(x): round-half-to-even (banker's
@@ -5010,74 +4863,6 @@ fn translate_inst(
                     let x = resolve_value(x_id, types, constants, id_map,
                         next_value_id, insts, source_spirv_offset)?;
                     Op::UnpackHalf2x16(x)
-                }
-                25 => {
-                    // Atan2(y, x): four-quadrant arctangent.
-                    //   base = atan(y / x)   (atan handles ±Inf
-                    //                         when x=0 via its
-                    //                         reciprocal branch)
-                    //   bias = x<0 ? (y<0 ? -π : π) : 0
-                    //   result = base + bias
-                    let y_id = expect_id(&spv_inst.operands, 2)?;
-                    let x_id = expect_id(&spv_inst.operands, 3)?;
-                    let y = resolve_value(y_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let ratio = push_f32(Op::FDiv(y.clone(), x.clone()),
-                        source_spirv_offset, insts, next_value_id);
-                    let base = synth_atan(ratio,
-                        source_spirv_offset, insts, next_value_id);
-                    let zero = push_cf(0.0, source_spirv_offset, insts, next_value_id);
-                    let is_x_neg = push_bool(Op::FOrdLt(x, zero.clone()),
-                        source_spirv_offset, insts, next_value_id);
-                    let is_y_neg = push_bool(Op::FOrdLt(y, zero.clone()),
-                        source_spirv_offset, insts, next_value_id);
-                    let c_pi = push_cf( std::f64::consts::PI,
-                        source_spirv_offset, insts, next_value_id);
-                    let c_neg_pi = push_cf(-std::f64::consts::PI,
-                        source_spirv_offset, insts, next_value_id);
-                    let bias_neg = push_f32(Op::Select {
-                        cond: is_y_neg, t_val: c_neg_pi, f_val: c_pi,
-                    }, source_spirv_offset, insts, next_value_id);
-                    let bias = push_f32(Op::Select {
-                        cond: is_x_neg, t_val: bias_neg, f_val: zero,
-                    }, source_spirv_offset, insts, next_value_id);
-                    Op::FAdd(base, bias)
-                }
-                16 => {
-                    // Asin(x) = Atan(x / sqrt(1 - x²)).
-                    let x_id = expect_id(&spv_inst.operands, 2)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let a = synth_asin(x, source_spirv_offset, insts, next_value_id);
-                    let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
-                    Op::FMul(a, c_one)
-                }
-                17 => {
-                    // Acos(x) = π/2 - Asin(x).
-                    let x_id = expect_id(&spv_inst.operands, 2)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let a = synth_asin(x, source_spirv_offset, insts, next_value_id);
-                    let c_half_pi = push_cf(std::f64::consts::FRAC_PI_2,
-                        source_spirv_offset, insts, next_value_id);
-                    Op::FSub(c_half_pi, a)
-                }
-                26 => {
-                    // Pow(x, y) = Exp2(y * Log2(x)).
-                    let x_id = expect_id(&spv_inst.operands, 2)?;
-                    let y_id = expect_id(&spv_inst.operands, 3)?;
-                    let x = resolve_value(x_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let y = resolve_value(y_id, types, constants, id_map,
-                        next_value_id, insts, source_spirv_offset)?;
-                    let lx = synth_log2(x, source_spirv_offset, insts, next_value_id);
-                    let ylx = push_f32(Op::FMul(y, lx),
-                        source_spirv_offset, insts, next_value_id);
-                    let e = synth_exp2(ylx, source_spirv_offset, insts, next_value_id);
-                    let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
-                    Op::FMul(e, c_one)
                 }
                 32 => {
                     // InverseSqrt(x) ≡ 1.0 / sqrt(x).  Real
@@ -6790,4 +6575,245 @@ pub fn patch_entry_point_indices(
         }
     }
     out
+}
+
+/// Synthesize one GLSL.std.450 transcendental (enums 13..=30)
+/// on SCALAR f32 operands, returning the final (unpushed) Op.
+/// `a` is the first GLSL operand, `b` the second for the two-arg
+/// forms (25 = Atan2(y=a, x=b), 26 = Pow(x=a, y=b)). The ExtInst
+/// dispatcher handles component-wise vector expansion; everything
+/// here is scalar — the synth_* helpers build f32 chains.
+fn synth_transcendental(
+    inst_enum: u32,
+    a: Value,
+    b: Option<Value>,
+    source_spirv_offset: u32,
+    insts: &mut Vec<Inst>,
+    next_value_id: &mut u32,
+) -> Result<Op, FrontendError> {
+    Ok(match inst_enum {
+        13 => {
+        // Sin(a): range-reduce to [-π/2, π/2] then
+        // evaluate 4-term Horner Taylor polynomial
+        // and apply parity sign.  See
+        // synth_trig_reduce / synth_sin_poly.
+        let (x_red, sign) = synth_trig_reduce(
+            a, source_spirv_offset, insts, next_value_id);
+        let sin = synth_sin_poly(
+            x_red, source_spirv_offset, insts, next_value_id);
+        Op::FMul(sin, sign)
+        }
+        14 => {
+        // Cos(a): range-reduce + 5-term Horner Taylor
+        // polynomial + parity sign.
+        let (x_red, sign) = synth_trig_reduce(
+            a, source_spirv_offset, insts, next_value_id);
+        let cos = synth_cos_poly(
+            x_red, source_spirv_offset, insts, next_value_id);
+        Op::FMul(cos, sign)
+        }
+        15 => {
+        // Tan(a) ≡ sin(x_red) / cos(x_red).  Parity
+        // signs cancel in the quotient, so the
+        // reduction's sign output is discarded.
+        let (x_red, _sign) = synth_trig_reduce(
+            a, source_spirv_offset, insts, next_value_id);
+        let sin = synth_sin_poly(
+            x_red.clone(), source_spirv_offset, insts, next_value_id);
+        let cos = synth_cos_poly(
+            x_red, source_spirv_offset, insts, next_value_id);
+        Op::FDiv(sin, cos)
+        }
+        16 => {
+        // Asin(a) = Atan(a / sqrt(1 - x²)).
+        let a = synth_asin(a, source_spirv_offset, insts, next_value_id);
+        let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+        Op::FMul(a, c_one)
+        }
+        17 => {
+        // Acos(a) = π/2 - Asin(a).
+        let a = synth_asin(a, source_spirv_offset, insts, next_value_id);
+        let c_half_pi = push_cf(std::f64::consts::FRAC_PI_2,
+            source_spirv_offset, insts, next_value_id);
+        Op::FSub(c_half_pi, a)
+        }
+        18 => {
+        // Atan(a): full real line via reciprocal range reduction.
+        let a = synth_atan(a, source_spirv_offset, insts, next_value_id);
+        let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+        Op::FMul(a, c_one)
+        }
+        19 => {
+        // Sinh(a) = (Exp(a) - Exp(-a)) / 2
+        let c_log2e = push_cf(std::f64::consts::LOG2_E,
+            source_spirv_offset, insts, next_value_id);
+        let xl = push_f32(Op::FMul(a.clone(), c_log2e.clone()),
+            source_spirv_offset, insts, next_value_id);
+        let neg_xl = push_f32(Op::FMul(a, push_cf(-std::f64::consts::LOG2_E,
+            source_spirv_offset, insts, next_value_id)),
+            source_spirv_offset, insts, next_value_id);
+        let ex = synth_exp2(xl, source_spirv_offset, insts, next_value_id);
+        let enx = synth_exp2(neg_xl, source_spirv_offset, insts, next_value_id);
+        let diff = push_f32(Op::FSub(ex, enx),
+            source_spirv_offset, insts, next_value_id);
+        let c_half = push_cf(0.5, source_spirv_offset, insts, next_value_id);
+        let _ = c_log2e;
+        Op::FMul(diff, c_half)
+        }
+        20 => {
+        // Cosh(a) = (Exp(a) + Exp(-a)) / 2
+        let c_log2e = push_cf(std::f64::consts::LOG2_E,
+            source_spirv_offset, insts, next_value_id);
+        let xl = push_f32(Op::FMul(a.clone(), c_log2e),
+            source_spirv_offset, insts, next_value_id);
+        let c_neg_log2e = push_cf(-std::f64::consts::LOG2_E,
+            source_spirv_offset, insts, next_value_id);
+        let neg_xl = push_f32(Op::FMul(a, c_neg_log2e),
+            source_spirv_offset, insts, next_value_id);
+        let ex = synth_exp2(xl, source_spirv_offset, insts, next_value_id);
+        let enx = synth_exp2(neg_xl, source_spirv_offset, insts, next_value_id);
+        let sum = push_f32(Op::FAdd(ex, enx),
+            source_spirv_offset, insts, next_value_id);
+        let c_half = push_cf(0.5, source_spirv_offset, insts, next_value_id);
+        Op::FMul(sum, c_half)
+        }
+        21 => {
+        // Tanh(a) = (Exp(a) - Exp(-a)) / (Exp(a) + Exp(-a))
+        let c_log2e = push_cf(std::f64::consts::LOG2_E,
+            source_spirv_offset, insts, next_value_id);
+        let xl = push_f32(Op::FMul(a.clone(), c_log2e),
+            source_spirv_offset, insts, next_value_id);
+        let c_neg_log2e = push_cf(-std::f64::consts::LOG2_E,
+            source_spirv_offset, insts, next_value_id);
+        let neg_xl = push_f32(Op::FMul(a, c_neg_log2e),
+            source_spirv_offset, insts, next_value_id);
+        let ex = synth_exp2(xl, source_spirv_offset, insts, next_value_id);
+        let enx = synth_exp2(neg_xl, source_spirv_offset, insts, next_value_id);
+        let num = push_f32(Op::FSub(ex.clone(), enx.clone()),
+            source_spirv_offset, insts, next_value_id);
+        let den = push_f32(Op::FAdd(ex, enx),
+            source_spirv_offset, insts, next_value_id);
+        Op::FDiv(num, den)
+        }
+        22 => {
+        // Asinh(a) = Log(a + sqrt(x² + 1)).
+        let x2 = push_f32(Op::FMul(a.clone(), a.clone()),
+            source_spirv_offset, insts, next_value_id);
+        let one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+        let x2p1 = push_f32(Op::FAdd(x2, one),
+            source_spirv_offset, insts, next_value_id);
+        let s = push_f32(Op::FSqrt(x2p1),
+            source_spirv_offset, insts, next_value_id);
+        let arg = push_f32(Op::FAdd(a, s),
+            source_spirv_offset, insts, next_value_id);
+        let l = synth_log2(arg, source_spirv_offset, insts, next_value_id);
+        let c_ln2 = push_cf(std::f64::consts::LN_2,
+            source_spirv_offset, insts, next_value_id);
+        Op::FMul(l, c_ln2)
+        }
+        23 => {
+        // Acosh(a) = Log(a + sqrt(x² - 1)), a ≥ 1.
+        let x2 = push_f32(Op::FMul(a.clone(), a.clone()),
+            source_spirv_offset, insts, next_value_id);
+        let one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+        let x2m1 = push_f32(Op::FSub(x2, one),
+            source_spirv_offset, insts, next_value_id);
+        let s = push_f32(Op::FSqrt(x2m1),
+            source_spirv_offset, insts, next_value_id);
+        let arg = push_f32(Op::FAdd(a, s),
+            source_spirv_offset, insts, next_value_id);
+        let l = synth_log2(arg, source_spirv_offset, insts, next_value_id);
+        let c_ln2 = push_cf(std::f64::consts::LN_2,
+            source_spirv_offset, insts, next_value_id);
+        Op::FMul(l, c_ln2)
+        }
+        24 => {
+        // Atanh(a) = 0.5 * Log((1+a)/(1-a)),  a ∈ (-1, 1).
+        let one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+        let num = push_f32(Op::FAdd(one.clone(), a.clone()),
+            source_spirv_offset, insts, next_value_id);
+        let den = push_f32(Op::FSub(one, a),
+            source_spirv_offset, insts, next_value_id);
+        let ratio = push_f32(Op::FDiv(num, den),
+            source_spirv_offset, insts, next_value_id);
+        let l = synth_log2(ratio, source_spirv_offset, insts, next_value_id);
+        let c_half_ln2 = push_cf(0.5 * std::f64::consts::LN_2,
+            source_spirv_offset, insts, next_value_id);
+        Op::FMul(l, c_half_ln2)
+        }
+        25 => {
+        let b_v = b.expect("Atan2 needs two operands");
+        // Atan2(a, b_v): four-quadrant arctangent.
+        //   base = atan(a / b_v)   (atan handles ±Inf
+        //                         when b_v=0 via its
+        //                         reciprocal branch)
+        //   bias = b_v<0 ? (a<0 ? -π : π) : 0
+        //   result = base + bias
+        let ratio = push_f32(Op::FDiv(a.clone(), b_v.clone()),
+            source_spirv_offset, insts, next_value_id);
+        let base = synth_atan(ratio,
+            source_spirv_offset, insts, next_value_id);
+        let zero = push_cf(0.0, source_spirv_offset, insts, next_value_id);
+        let is_x_neg = push_bool(Op::FOrdLt(b_v, zero.clone()),
+            source_spirv_offset, insts, next_value_id);
+        let is_y_neg = push_bool(Op::FOrdLt(a, zero.clone()),
+            source_spirv_offset, insts, next_value_id);
+        let c_pi = push_cf( std::f64::consts::PI,
+            source_spirv_offset, insts, next_value_id);
+        let c_neg_pi = push_cf(-std::f64::consts::PI,
+            source_spirv_offset, insts, next_value_id);
+        let bias_neg = push_f32(Op::Select {
+            cond: is_y_neg, t_val: c_neg_pi, f_val: c_pi,
+        }, source_spirv_offset, insts, next_value_id);
+        let bias = push_f32(Op::Select {
+            cond: is_x_neg, t_val: bias_neg, f_val: zero,
+        }, source_spirv_offset, insts, next_value_id);
+        Op::FAdd(base, bias)
+        }
+        26 => {
+        let b_v = b.expect("Pow needs two operands");
+        // Pow(a, b_v) = Exp2(b_v * Log2(a)).
+        let lx = synth_log2(a, source_spirv_offset, insts, next_value_id);
+        let ylx = push_f32(Op::FMul(b_v, lx),
+            source_spirv_offset, insts, next_value_id);
+        let e = synth_exp2(ylx, source_spirv_offset, insts, next_value_id);
+        let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+        Op::FMul(e, c_one)
+        }
+        27 => {
+        // Exp(a) = Exp2(a * log2(e)).
+        let c_log2e = push_cf(std::f64::consts::LOG2_E,
+            source_spirv_offset, insts, next_value_id);
+        let x_scaled = push_f32(Op::FMul(a, c_log2e),
+            source_spirv_offset, insts, next_value_id);
+        let e = synth_exp2(x_scaled, source_spirv_offset, insts, next_value_id);
+        let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+        Op::FMul(e, c_one)
+        }
+        28 => {
+        // Log(a) = Log2(a) * ln(2).
+        let l = synth_log2(a, source_spirv_offset, insts, next_value_id);
+        let c_ln2 = push_cf(std::f64::consts::LN_2,
+            source_spirv_offset, insts, next_value_id);
+        Op::FMul(l, c_ln2)
+        }
+        29 => {
+        // Exp2(a): synth via Horner Taylor + IEEE-754
+        // exponent reconstruction.  See synth_exp2.
+        // Returns the final value; we wrap as a
+        // no-op FMul by 1.0 to fit the arm-returns-Op
+        // shape (cheap; constant-folded by codegen).
+        let e = synth_exp2(a, source_spirv_offset, insts, next_value_id);
+        let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+        Op::FMul(e, c_one)
+        }
+        30 => {
+        // Log2(a): mantissa-split + rational approx.
+        let l = synth_log2(a, source_spirv_offset, insts, next_value_id);
+        let c_one = push_cf(1.0, source_spirv_offset, insts, next_value_id);
+        Op::FMul(l, c_one)
+        }
+        other => return Err(FrontendError::Unsupported(format!(
+            "synth_transcendental: enum {other} out of range"))),
+    })
 }
