@@ -99,6 +99,12 @@ struct MvkComputePipeline {
     dset_layout: vk::DescriptorSetLayout,
     module:      vk::ShaderModule,
     push_size:   u32,
+    /// Storage-buffer bindings in the dset layout. Descriptor
+    /// writes clip to this: in-stream bindings PERSIST across
+    /// dispatches by design, so a stale binding 7 from an
+    /// 8-binding pass must not be written into a 4-binding
+    /// pipeline's set (invalid update -> poisoned descriptors).
+    ssbo_count:  u32,
 }
 
 /// The realised Vulkan objects for an `MvkPipeline` at a specific
@@ -171,7 +177,7 @@ pub struct MoltenVkBackend {
     compute_binds: Mutex<HashMap<u32, u32>>,
     /// Descriptor pool for per-dispatch sets; reset at the top of
     /// every `record_and_submit`.
-    desc_pool: vk::DescriptorPool,
+    desc_pool: std::sync::Mutex<(vk::DescriptorPool, u32)>,
     /// Serialises command-buffer record + submit (one graphics queue).
     submit_lock: Mutex<()>,
 
@@ -418,8 +424,11 @@ impl MoltenVkBackend {
         let dp_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(64)
             .pool_sizes(&pool_sizes);
-        let desc_pool = unsafe { device.create_descriptor_pool(&dp_info, None) }
-            .unwrap_or(vk::DescriptorPool::null());
+        let desc_pool = std::sync::Mutex::new((
+            unsafe { device.create_descriptor_pool(&dp_info, None) }
+                .unwrap_or(vk::DescriptorPool::null()),
+            64,
+        ));
 
         Ok(Self {
             submissions: AtomicU64::new(0),
@@ -512,6 +521,7 @@ impl MoltenVkBackend {
                 pipeline_id.raw(),
                 MvkComputePipeline {
                     pipeline, layout, dset_layout, module, push_size,
+                    ssbo_count,
                 });
         }
         Ok(())
@@ -651,8 +661,9 @@ impl Drop for MoltenVkBackend {
                 self.device.destroy_descriptor_set_layout(cp.dset_layout, None);
                 self.device.destroy_shader_module(cp.module, None);
             }
-            if self.desc_pool != vk::DescriptorPool::null() {
-                self.device.destroy_descriptor_pool(self.desc_pool, None);
+            let pool = self.desc_pool.lock().unwrap().0;
+            if pool != vk::DescriptorPool::null() {
+                self.device.destroy_descriptor_pool(pool, None);
             }
             for (_, img) in self.images.lock().unwrap().drain() {
                 if let Some(h) = img.image { self.device.destroy_image(h, None); }
@@ -881,12 +892,44 @@ impl MoltenVkBackend {
         let buffers = self.buffers.lock().unwrap();
         let mut pipelines = self.pipelines.lock().unwrap();
         let compute_pipelines = self.compute_pipelines.lock().unwrap();
-        if self.desc_pool != vk::DescriptorPool::null() {
-            unsafe {
-                let _ = dev.reset_descriptor_pool(
-                    self.desc_pool, vk::DescriptorPoolResetFlags::empty());
+        // Per-dispatch descriptor sets: size the pool to THIS
+        // frame's dispatch count (a multi-step compute frame can
+        // record thousands of dispatches; the old fixed 64-set
+        // pool silently skipped every dispatch past it). The
+        // previous submission has completed by the time we are
+        // re-entered, so recreating the pool is safe.
+        let n_dispatch = {
+            let mut dec = FrameDecoder::new(frame_buf);
+            let mut n = 0u32;
+            while let Ok(Some((op, _))) = dec.next() {
+                if matches!(op, FrameOp::Dispatch) {
+                    n += 1;
+                }
             }
-        }
+            n.max(64)
+        };
+        let desc_pool = {
+            let mut pool = self.desc_pool.lock().unwrap();
+            if n_dispatch > pool.1 && pool.0 != vk::DescriptorPool::null() {
+                unsafe { dev.destroy_descriptor_pool(pool.0, None) };
+                let pool_sizes = [vk::DescriptorPoolSize::default()
+                    .ty(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_count(n_dispatch * 8)];
+                let dp_info = vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(n_dispatch)
+                    .pool_sizes(&pool_sizes);
+                pool.0 = unsafe { dev.create_descriptor_pool(&dp_info, None) }
+                    .unwrap_or(vk::DescriptorPool::null());
+                pool.1 = n_dispatch;
+            }
+            if pool.0 != vk::DescriptorPool::null() {
+                unsafe {
+                    let _ = dev.reset_descriptor_pool(
+                        pool.0, vk::DescriptorPoolResetFlags::empty());
+                }
+            }
+            pool.0
+        };
         // Compute state for this frame stream.
         let mut cur_compute: Option<u32> = None;
         let mut push_bytes: Vec<u8> = Vec::new();
@@ -1062,7 +1105,7 @@ impl MoltenVkBackend {
                     let gz = u32::from_le_bytes(body[8..12].try_into().unwrap());
                     let Some(pid) = cur_compute else { continue; };
                     let Some(cp) = compute_pipelines.get(&pid) else { continue; };
-                    if self.desc_pool == vk::DescriptorPool::null() { continue; }
+                    if desc_pool == vk::DescriptorPool::null() { continue; }
                     // Merge the legacy out-of-band stash, then build
                     // the descriptor set from the stream bindings.
                     {
@@ -1074,11 +1117,12 @@ impl MoltenVkBackend {
                     let binds: Vec<(u32, u32)> = stream_binds
                         .iter()
                         .map(|(b, id)| (*b, *id))
+                        .filter(|(b, _)| *b < cp.ssbo_count)
                         .collect();
                     let set_layouts = [cp.dset_layout];
                     let dset = match unsafe { dev.allocate_descriptor_sets(
                         &vk::DescriptorSetAllocateInfo::default()
-                            .descriptor_pool(self.desc_pool)
+                            .descriptor_pool(desc_pool)
                             .set_layouts(&set_layouts)) }
                     {
                         Ok(d) => d[0],
