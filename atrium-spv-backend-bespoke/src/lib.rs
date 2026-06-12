@@ -519,6 +519,49 @@ fn emit_function(
         }
     }
 
+    // Loop spans (flat-index ranges), from back edges — the
+    // eviction safety rule needs them: emission order equals
+    // runtime order ONLY within an iteration; a value defined
+    // BEFORE a loop must not be evicted INSIDE it (its earlier
+    // in-body reads re-execute next iteration against the
+    // original register, which eviction hands to someone else).
+    // Values defined IN the loop are safe: their def re-executes
+    // and rewrites their register every iteration.
+    let mut loop_spans: Vec<(usize, usize)> = Vec::new();
+    for (i, inst) in flat_insts.iter().enumerate() {
+        if let Op::Branch(target) = &inst.op {
+            if let Some(&start) = block_flat_start.get(target) {
+                if start <= i {
+                    loop_spans.push((start, i));
+                }
+            }
+        }
+    }
+
+    // Read-position index: for each value id, the sorted flat
+    // positions of instructions that read it. Powers the refined
+    // loop-eviction rule: a pre-loop value IS evictable inside a
+    // loop when it has no read earlier in the loop (every later
+    // read goes through a reload; earlier reads re-executing on
+    // the next iteration are what see stale registers).
+    let read_pos: HashMap<ValueId, Vec<usize>> = {
+        let mut ids: Vec<ValueId> = Vec::new();
+        for inst in &flat_insts {
+            if let Some(r) = inst.result.as_ref() {
+                ids.push(r.id);
+            }
+        }
+        let mut m: HashMap<ValueId, Vec<usize>> = HashMap::new();
+        for (i, inst) in flat_insts.iter().enumerate() {
+            for id in &ids {
+                if op_reads(&inst.op, *id) {
+                    m.entry(*id).or_default().push(i);
+                }
+            }
+        }
+        m
+    };
+
     // Predecessor map: which blocks branch into each block.
     // Phi-move coalescing uses it to recognise the
     // body→continue shape — a Phi arm's value is produced
@@ -1517,6 +1560,13 @@ fn emit_function(
     // nothing, so a def is always followed by another inst in
     // the same block (stores stay dominated by the def).
     let mut prev_def_inst: Option<&atrium_spv_ir::Inst> = None;
+    // Values brought back from slots by reloads. Their register
+    // binding is only runtime-valid until the end of the current
+    // block: a back edge (or any re-entry) can interleave a
+    // later-emitted reuse of the register before the reload
+    // re-executes. Invalidated at every block start.
+    let mut reload_cached_v: Vec<ValueId> = Vec::new();
+    let mut reload_cached_w: Vec<ValueId> = Vec::new();
     let mut flat_i: usize = 0;
     for (block_pos, bid) in block_order.iter().enumerate() {
         let block = func.blocks.get(bid).unwrap();
@@ -1532,6 +1582,78 @@ fn emit_function(
                     spilled.insert(*pid);
                 }
             }
+        }
+        // Reload caches are block-scoped (see decl): drop them so
+        // re-entered blocks re-reload from the always-valid slot.
+        if spill_mode {
+            for id in reload_cached_v.drain(..) {
+                if let Some(&v) = scalars.get(&id) {
+                    if owners.get(&v.0) == Some(&id) {
+                        owners.remove(&v.0);
+                        free_pool.push(v.0);
+                        scalars.remove(&id);
+                        spilled.insert(id);
+                    }
+                }
+            }
+            for id in reload_cached_w.drain(..) {
+                if let Some(&w) = ints.get(&id) {
+                    if int_pool.owners.get(&w.0) == Some(&id) {
+                        int_pool.owners.remove(&w.0);
+                        int_pool.free.push(w.0);
+                        ints.remove(&id);
+                        spilled_w.insert(id);
+                    }
+                }
+            }
+            // LOOP HEADERS: evict every slot-valid binding of a
+            // value defined BEFORE the loop. In-loop reads then
+            // always go through block-scoped reloads, so any
+            // later in-loop eviction is unconditionally safe —
+            // the back edge can never resurrect a stale binding.
+            // (Slotless pre-loop values keep their binding and
+            // are never eviction victims, so they stay stable.)
+            let bs = block_flat_start.get(bid).copied().unwrap_or(0);
+            if loop_spans.iter().any(|(st, _)| *st == bs) {
+                let mut evict_v: Vec<(u8, ValueId)> = owners.iter()
+                    .filter(|(n, id)| {
+                        scalars.get(id) == Some(&asm::Vreg(**n))
+                            && spill_slot.contains_key(id)
+                            && !phi_pinned.contains(id)
+                            && value_def_flat_idx.get(id)
+                                .is_none_or(|&d| d < bs)
+                    })
+                    .map(|(n, id)| (*n, *id))
+                    .collect();
+                evict_v.sort_unstable_by_key(|(n, id)| (*n, id.0));
+                for (n, id) in evict_v {
+                    owners.remove(&n);
+                    free_pool.push(n);
+                    scalars.remove(&id);
+                    spilled.insert(id);
+                }
+                let mut evict_w: Vec<(u8, ValueId)> =
+                    int_pool.owners.iter()
+                    .filter(|(n, id)| {
+                        ints.get(id) == Some(&asm::Wreg(**n))
+                            && spill_slot.contains_key(id)
+                            && !phi_pinned.contains(id)
+                            && value_def_flat_idx.get(id)
+                                .is_none_or(|&d| d < bs)
+                    })
+                    .map(|(n, id)| (*n, *id))
+                    .collect();
+                evict_w.sort_unstable_by_key(|(n, id)| (*n, id.0));
+                for (n, id) in evict_w {
+                    int_pool.owners.remove(&n);
+                    int_pool.free.push(n);
+                    ints.remove(&id);
+                    spilled_w.insert(id);
+                }
+            }
+            // Keep pool order deterministic after the pushes.
+            free_pool.sort_unstable_by_key(|n| std::cmp::Reverse(*n));
+            int_pool.free.sort_unstable_by_key(|n| std::cmp::Reverse(*n));
         }
         // The block emitted immediately after this one, if
         // any — branch-to-next-block elision drops an
@@ -1572,6 +1694,9 @@ fn emit_function(
                     .collect();
                 dead_slots.sort_unstable_by_key(|(_, slot)| *slot);
                 for (sid, slot) in dead_slots {
+                    if slot == 4 && std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok() {
+                        eprintln!("SLOT4 SWEEP-FREE {sid:?} at i={i}");
+                    }
                     spill_slot.remove(&sid);
                     spilled.remove(&sid);
                     spilled_w.remove(&sid);
@@ -1620,6 +1745,9 @@ fn emit_function(
                                 sl
                             })
                         });
+                    if slot == 4 && std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok() {
+                        eprintln!("SLOT4 ASSIGN/STORE {sid:?} at i={i}");
+                    }
                     if slot >= SPILL_SLOT_CAP {
                         return Err(BackendError::Unsupported(
                             "spill area exhausted (1000 slots)".into()));
@@ -1830,7 +1958,7 @@ fn emit_function(
                     if int_pool.free.is_empty()
                         && !wevict_one(&mut int_pool, &mut ints,
                             &mut spilled_w, &spill_slot, &vectors, &deferred_ptr,
-                            &last_use, &phi_pinned, &inst.op)
+                            &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, &inst.op)
                     {
                         return Err(BackendError::Unsupported(
                             "W pressure with no spillable victim".into()));
@@ -1840,13 +1968,14 @@ fn emit_function(
                         w, asm::Xreg(31), (slot as u16) * 8));
                     ints.insert(id, w);
                     spilled_w.remove(&id);
+                    reload_cached_w.push(id);
                 }
             }
             const W_HEADROOM: usize = 8;
             while int_pool.free.len() < W_HEADROOM {
                 if !wevict_one(&mut int_pool, &mut ints,
                     &mut spilled_w, &spill_slot, &vectors, &deferred_ptr,
-                    &last_use, &phi_pinned, &inst.op)
+                    &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, &inst.op)
                 {
                     if std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok()
                         && int_pool.free.len() < 8
@@ -1873,7 +2002,8 @@ fn emit_function(
             while free_pool.len() < V_HEADROOM {
                 if !vevict_one(&mut free_pool, &mut owners,
                     &mut scalars, &mut spilled, &spill_slot,
-                    &vectors, &last_use, &phi_pinned, &inst.op)
+                    &vectors, &last_use, &phi_pinned, &loop_spans,
+                    &value_def_flat_idx, &read_pos, i, &inst.op)
                 {
                     break;
                 }
@@ -1901,7 +2031,9 @@ fn emit_function(
                 vread_impl(&mut a, &mut free_pool, &mut owners,
                     &mut used_callee_saved_v, &mut scalars,
                     &mut spilled, &spill_slot, &vectors, &last_use,
-                    &phi_pinned, spill_mode, &inst.op, id)?;
+                    &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i,
+                    spill_mode, &inst.op, id)?;
+                reload_cached_v.push(id);
             }
         }
 
@@ -2023,7 +2155,7 @@ fn emit_function(
                     BackendError::Internal("PackHalf2x16 lane 1 missing".into()))?;
                 let synth = ValueId(next_synth_id);
                 next_synth_id += 1;
-                let tv = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth)?;
+                let tv = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, synth)?;
                 let d_w = alloc_int_w(&mut int_pool, result.id)?;
                 // lane 0 -> d_w (fcvt zeroes the upper 16).
                 a.emit(asm::fcvt_h_from_s(tv, s0));
@@ -2046,11 +2178,11 @@ fn emit_function(
                     BackendError::Internal(format!(
                         "UnpackHalf2x16 operand {:?} not in ints", v.id)))?;
                 let synth0 = ValueId(next_synth_id); next_synth_id += 1;
-                let v0 = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth0)?;
+                let v0 = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, synth0)?;
                 let synth1 = ValueId(next_synth_id); next_synth_id += 1;
-                let v1 = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth1)?;
+                let v1 = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, synth1)?;
                 let synth_t = ValueId(next_synth_id); next_synth_id += 1;
-                let tv = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth_t)?;
+                let tv = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, synth_t)?;
                 // lane 0: fcvt reads the low 16 of the bridge.
                 a.emit(asm::fmov_s_from_w(tv, s_w));
                 a.emit(asm::fcvt_s_from_h(v0, tv));
@@ -2176,7 +2308,7 @@ fn emit_function(
                 let s_w = *ints.get(&s.id).ok_or_else(||
                     BackendError::Internal(format!(
                         "ConvertSToF operand {:?} not in ints", s.id)))?;
-                let d_v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
+                let d_v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, result.id)?;
                 a.emit(asm::scvtf_s_from_w(d_v, s_w));
                 scalars.insert(result.id, d_v);
             }
@@ -2219,7 +2351,7 @@ fn emit_function(
                         "ConvertUToF operand {:?} not in ints, bools, \
                          bool_in_v, or bool_in_slot",
                         s.id)))?;
-                let d_v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
+                let d_v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, result.id)?;
                 a.emit(asm::ucvtf_s_from_w(d_v, s_w));
                 scalars.insert(result.id, d_v);
                 // Eager-free the bool W-reg if the bool was
@@ -2288,7 +2420,7 @@ fn emit_function(
                 match (to_float, src_in_ints, src_in_scalars) {
                     (true, true, _) => {
                         let s_w = *ints.get(&s.id).unwrap();
-                        let d_v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
+                        let d_v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, result.id)?;
                         a.emit(asm::fmov_s_from_w(d_v, s_w));
                         scalars.insert(result.id, d_v);
                     }
@@ -2319,7 +2451,7 @@ fn emit_function(
                         // copy via fmov rather than alias for
                         // the same liveness-correctness reason.
                         let s_v = *scalars.get(&s.id).unwrap();
-                        let d_v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
+                        let d_v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, result.id)?;
                         a.emit(asm::fmov_s(d_v, s_v));
                         scalars.insert(result.id, d_v);
                     }
@@ -2351,7 +2483,7 @@ fn emit_function(
                     continue;
                 }
                 let bits = (*value as f32).to_bits();
-                let v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
+                let v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, result.id)?;
                 materialise_u32_into_w(&mut a, w_tmp, bits);
                 a.emit(asm::fmov_s_from_w(v, w_tmp));
                 scalars.insert(result.id, v);
@@ -2360,7 +2492,7 @@ fn emit_function(
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("ConstVec without result".into()))?;
                 if packed_ids.contains(&result.id) {
-                    let q = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
+                    let q = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, result.id)?;
                     if let Some(&slot) = constvec_pool_slot.get(&result.id) {
                         // Literal-pool path: one `ldr q,
                         // [pc-rel]` placeholder; imm19 gets
@@ -2497,7 +2629,7 @@ fn emit_function(
                         // definedness.
                         let synth = ValueId(next_synth_id);
                         next_synth_id += 1;
-                        let v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth)?;
+                        let v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, synth)?;
                         a.emit(asm::movz_w(w_tmp, 0, 0));
                         a.emit(asm::fmov_s_from_w(v, w_tmp));
                         scalars.insert(synth, v);
@@ -2574,7 +2706,7 @@ fn emit_function(
                         "VectorExtract index {index} out of range \
                          ({} lanes)", lanes.len())))?;
                 if let Some(s) = scalars.get(&lane.id).copied() {
-                    let d = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
+                    let d = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, result.id)?;
                     a.emit(asm::mov_v_16b(d, s));
                     scalars.insert(result.id, d);
                 } else if let Some(w) = ints.get(&lane.id).copied() {
@@ -2614,7 +2746,7 @@ fn emit_function(
                         l_lanes.len(), r_lanes.len())));
                 }
                 // Accumulator V-reg owned by the final result id.
-                let acc = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
+                let acc = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, result.id)?;
                 // First lane: acc = l[0] * r[0].
                 let l0 = *scalars.get(&l_lanes[0].id).ok_or_else(||
                     BackendError::Internal(format!(
@@ -2633,7 +2765,7 @@ fn emit_function(
                             "Dot lane {i} rhs missing")))?;
                     let tmp_synth = ValueId(next_synth_id);
                     next_synth_id += 1;
-                    let tmp = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, tmp_synth)?;
+                    let tmp = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, tmp_synth)?;
                     a.emit(asm::fmul_s(tmp, li, ri));
                     a.emit(asm::fadd_s(acc, acc, tmp));
                     // tmp dies immediately; manually return
@@ -2714,7 +2846,7 @@ fn emit_function(
                 for i in 0..n_lanes {
                     let acc_id = ValueId(next_synth_id);
                     next_synth_id += 1;
-                    let acc = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, acc_id)?;
+                    let acc = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, acc_id)?;
                     let (mat_v, mat_n) = load_mat_lane(
                         &mut a, &mut free_pool, &mut owners,
                         &mut used_callee_saved_v, &mut next_synth_id,
@@ -2745,7 +2877,7 @@ fn emit_function(
                         // tmp = mat_v * vj; acc += tmp.
                         let tmp_synth = ValueId(next_synth_id);
                         next_synth_id += 1;
-                        let tmp = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, tmp_synth)?;
+                        let tmp = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, tmp_synth)?;
                         a.emit(asm::fmul_s(tmp, mat_v, vj));
                         a.emit(asm::fadd_s(acc, acc, tmp));
                         // Free both temps.
@@ -2848,14 +2980,14 @@ fn emit_function(
                     let v_src = *packed.get(&x.id).ok_or_else(||
                         BackendError::Internal(format!(
                             "FRINT* packed source {:?} not packed", x.id)))?;
-                    let v_dst = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
+                    let v_dst = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, result.id)?;
                     a.emit(pick_v4s(&inst.op, v_dst, v_src));
                     packed.insert(result.id, v_dst);
                 } else if matches!(result.ty, Type::F32) {
                     let v_src = *scalars.get(&x.id).ok_or_else(||
                         BackendError::Internal(format!(
                             "FRINT* source {:?} not in scalars", x.id)))?;
-                    let v_dst = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
+                    let v_dst = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, result.id)?;
                     a.emit(pick_s(&inst.op, v_dst, v_src));
                     scalars.insert(result.id, v_dst);
                 } else if let Some(lanes) = vectors.get(&x.id).cloned() {
@@ -2867,7 +2999,7 @@ fn emit_function(
                                 lane.id)))?;
                         let synth = ValueId(next_synth_id);
                         next_synth_id += 1;
-                        let v_dst = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth)?;
+                        let v_dst = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, synth)?;
                         a.emit(pick_s(&inst.op, v_dst, src));
                         scalars.insert(synth, v_dst);
                         out_lanes.push(Value { id: synth, ty: lane.ty.clone() });
@@ -2887,7 +3019,7 @@ fn emit_function(
                     let v_src = *packed.get(&x.id).ok_or_else(||
                         BackendError::Internal(format!(
                             "F-unary packed source {:?} not packed", x.id)))?;
-                    let v_dst = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
+                    let v_dst = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, result.id)?;
                     let enc = match &inst.op {
                         Op::FAbs(_)  => asm::fabs_v_4s(v_dst, v_src),
                         Op::FSqrt(_) => asm::fsqrt_v_4s(v_dst, v_src),
@@ -2900,7 +3032,7 @@ fn emit_function(
                     let v_src = *scalars.get(&x.id).ok_or_else(||
                         BackendError::Internal(format!(
                             "F-unary source {:?} not in scalars", x.id)))?;
-                    let v_dst = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
+                    let v_dst = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, result.id)?;
                     let enc = match &inst.op {
                         Op::FAbs(_)  => asm::fabs_s(v_dst, v_src),
                         Op::FSqrt(_) => asm::fsqrt_s(v_dst, v_src),
@@ -2922,7 +3054,7 @@ fn emit_function(
                                 lane.id)))?;
                         let synth = ValueId(next_synth_id);
                         next_synth_id += 1;
-                        let v_dst = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth)?;
+                        let v_dst = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, synth)?;
                         let enc = match &inst.op {
                             Op::FAbs(_)  => asm::fabs_s(v_dst, src),
                             Op::FSqrt(_) => asm::fsqrt_s(v_dst, src),
@@ -3540,7 +3672,7 @@ fn emit_function(
                 };
                 match &pointee {
                     Type::F32 => {
-                        let v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
+                        let v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, result.id)?;
                         emit_load_f32_offset(&mut a, w_tmp, param, off, v)?;
                         scalars.insert(result.id, v);
                     }
@@ -3593,7 +3725,7 @@ fn emit_function(
                                 // ValueId the frontend assigns.
                                 let synthetic_id = ValueId(next_synth_id);
                                 next_synth_id += 1;
-                                let v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synthetic_id)?;
+                                let v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, synthetic_id)?;
                                 emit_load_f32_offset(&mut a, w_tmp, param, lane_off, v)?;
                                 scalars.insert(synthetic_id, v);
                                 lanes.push(Value {
@@ -3656,7 +3788,7 @@ fn emit_function(
                         let s_f = *scalars.get(&f_val.id).ok_or_else(||
                             BackendError::Internal(format!(
                                 "Select f {:?} not in scalars", f_val.id)))?;
-                        let s_d = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
+                        let s_d = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, result.id)?;
                         a.emit(asm::fcsel_s(s_d, s_t, s_f, asm::Cond::Ne));
                         scalars.insert(result.id, s_d);
                     }
@@ -3693,7 +3825,7 @@ fn emit_function(
                                     "vec Select f lane {li} {:?} missing", fl.id)))?;
                             let synth = ValueId(next_synth_id);
                             next_synth_id += 1;
-                            let sd = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth)?;
+                            let sd = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, synth)?;
                             a.emit(asm::fcsel_s(sd, st, sf, asm::Cond::Ne));
                             scalars.insert(synth, sd);
                             out_lanes.push(Value { id: synth, ty: tl.ty.clone() });
@@ -3758,7 +3890,7 @@ fn emit_function(
                                 && !wevict_one(&mut int_pool,
                                     &mut ints, &mut spilled_w,
                                     &spill_slot, &vectors, &deferred_ptr, &last_use,
-                                    &phi_pinned, &inst.op)
+                                    &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, &inst.op)
                             {
                                 return Err(BackendError::Unsupported(
                                     "W pressure with no spillable \
@@ -3769,14 +3901,18 @@ fn emit_function(
                                 w, asm::Xreg(31), (slot as u16) * 8));
                             ints.insert(id, w);
                             spilled_w.remove(&id);
+                            reload_cached_w.push(id);
                         }
                         for id in needed {
                             vread_impl(&mut a, &mut free_pool,
                                 &mut owners, &mut used_callee_saved_v,
                                 &mut scalars, &mut spilled,
                                 &spill_slot, &vectors, &last_use,
-                                &phi_pinned, spill_mode, &inst.op,
+                                &phi_pinned, &loop_spans,
+                                &value_def_flat_idx, &read_pos, i,
+                                spill_mode, &inst.op,
                                 id)?;
+                            reload_cached_v.push(id);
                         }
                     }
                     for (dest, src_id) in moves {
@@ -4281,7 +4417,7 @@ fn emit_function(
                 for _ in 0..4 {
                     let synth = ValueId(next_synth_id);
                     next_synth_id += 1;
-                    let r = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth)?;
+                    let r = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, synth)?;
                     scalars.insert(synth, r);
                     lane_regs.push(r);
                     lane_vals.push(Value { id: synth, ty: Type::F32 });
@@ -4480,7 +4616,7 @@ fn emit_function(
                 for _ in 0..4 {
                     let synth = ValueId(next_synth_id);
                     next_synth_id += 1;
-                    let r = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth)?;
+                    let r = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, synth)?;
                     scalars.insert(synth, r);
                     lane_regs.push(r);
                     lane_vals.push(Value { id: synth, ty: Type::F32 });
@@ -4591,7 +4727,7 @@ fn emit_function(
                 for _ in 0..4 {
                     let synth = ValueId(next_synth_id);
                     next_synth_id += 1;
-                    let r = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth)?;
+                    let r = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, synth)?;
                     scalars.insert(synth, r);
                     lane_regs.push(r);
                     lane_vals.push(Value { id: synth, ty: Type::F32 });
@@ -4943,7 +5079,7 @@ fn emit_function(
                     for _ in 0..4 {
                         let synth = ValueId(next_synth_id);
                         next_synth_id += 1;
-                        let r = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth)?;
+                        let r = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, &loop_spans, &value_def_flat_idx, &read_pos, i, spill_mode, &inst.op, synth)?;
                         scalars.insert(synth, r);
                         lane_regs.push(r);
                         lane_vals.push(Value { id: synth, ty: Type::F32 });
@@ -6018,6 +6154,10 @@ fn valloc_impl(
     vectors: &HashMap<ValueId, Vec<Value>>,
     last_use: &HashMap<ValueId, usize>,
     phi_pinned: &std::collections::HashSet<ValueId>,
+    loop_spans: &[(usize, usize)],
+    value_def_flat_idx: &HashMap<ValueId, usize>,
+    read_pos: &HashMap<ValueId, Vec<usize>>,
+    cur_i: usize,
     spill_mode: bool,
     cur_op: &Op,
     owner: ValueId,
@@ -6037,6 +6177,8 @@ fn valloc_impl(
                 op_reads(cur_op, *vid)
                     && lanes.iter().any(|l| l.id == id))
         };
+        let _ = (loop_spans, value_def_flat_idx, read_pos, cur_i);
+        let loop_safe = |_id: ValueId| -> bool { true };
         // Deterministic choice: tie-break by id then reg, so
         // identical SPIR-V always yields identical machine code
         // (HashMap iteration order must never leak into output).
@@ -6046,6 +6188,7 @@ fn valloc_impl(
                     && spill_slot.contains_key(id)
                     && !phi_pinned.contains(id)
                     && !read_now(**id)
+                    && loop_safe(**id)
             })
             .max_by_key(|(n, id)|
                 (last_use.get(id).copied().unwrap_or(0), id.0, **n))
@@ -6075,6 +6218,7 @@ fn valloc_impl(
 /// current inst reads. Emits no code (slots are write-once at
 /// def). Returns false when nothing is evictable.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn wevict_one(
     int_pool: &mut IntPool,
     ints: &mut HashMap<ValueId, asm::Wreg>,
@@ -6084,6 +6228,10 @@ fn wevict_one(
     deferred_ptr: &HashMap<ValueId, (asm::Xreg, i32, ValueId, u8)>,
     last_use: &HashMap<ValueId, usize>,
     phi_pinned: &std::collections::HashSet<ValueId>,
+    loop_spans: &[(usize, usize)],
+    value_def_flat_idx: &HashMap<ValueId, usize>,
+    read_pos: &HashMap<ValueId, Vec<usize>>,
+    cur_i: usize,
     cur_op: &Op,
 ) -> bool {
     // Exclusions beyond direct reads: (a) int lanes read THROUGH
@@ -6101,12 +6249,20 @@ fn wevict_one(
         deferred_ptr.iter().any(|(pid, (_, _, idx, _))|
             *idx == id && op_reads(cur_op, *pid))
     };
+    // All evictions are loop-safe by construction: loop-header
+    // entry evicts every slot-valid pre-loop binding, so in-loop
+    // reads of pre-loop values are ALWAYS reload-served, and
+    // reload caches are block-scoped (re-executed each
+    // iteration). In-loop-defined values re-define per iteration.
+    let _ = (loop_spans, value_def_flat_idx, read_pos, cur_i);
+    let loop_safe = |_id: ValueId| -> bool { true };
     let victim = int_pool.owners.iter()
         .filter(|(n, id)| {
             ints.get(id) == Some(&asm::Wreg(**n))
                 && spill_slot.contains_key(id)
                 && !phi_pinned.contains(id)
                 && !read_now(**id)
+                && loop_safe(**id)
         })
         .max_by_key(|(n, id)|
             (last_use.get(id).copied().unwrap_or(0), id.0, **n))
@@ -6127,6 +6283,7 @@ fn wevict_one(
 /// (directly or as a lane of a read vector), not a pinned phi.
 /// Emits no code.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn vevict_one(
     free_pool: &mut Vec<u8>,
     owners: &mut HashMap<u8, ValueId>,
@@ -6136,6 +6293,10 @@ fn vevict_one(
     vectors: &HashMap<ValueId, Vec<Value>>,
     last_use: &HashMap<ValueId, usize>,
     phi_pinned: &std::collections::HashSet<ValueId>,
+    loop_spans: &[(usize, usize)],
+    value_def_flat_idx: &HashMap<ValueId, usize>,
+    read_pos: &HashMap<ValueId, Vec<usize>>,
+    cur_i: usize,
     cur_op: &Op,
 ) -> bool {
     let read_now = |id: ValueId| -> bool {
@@ -6144,12 +6305,26 @@ fn vevict_one(
             op_reads(cur_op, *vid)
                 && lanes.iter().any(|l| l.id == id))
     };
+    // Loop-eviction safety: inside a loop, only values DEFINED
+    // inside the innermost containing loop are evictable (their
+    // def re-executes per iteration; earlier-emitted reads of a
+    // PRE-loop value would see the register's new owner on the
+    // next pass). Synthetic ids (no recorded def) are treated
+    // as pre-loop = unevictable here.
+    // All evictions are loop-safe by construction: loop-header
+    // entry evicts every slot-valid pre-loop binding, so in-loop
+    // reads of pre-loop values are ALWAYS reload-served, and
+    // reload caches are block-scoped (re-executed each
+    // iteration). In-loop-defined values re-define per iteration.
+    let _ = (loop_spans, value_def_flat_idx, read_pos, cur_i);
+    let loop_safe = |_id: ValueId| -> bool { true };
     let victim = owners.iter()
         .filter(|(n, id)| {
             scalars.get(id) == Some(&asm::Vreg(**n))
                 && spill_slot.contains_key(id)
                 && !phi_pinned.contains(id)
                 && !read_now(**id)
+                && loop_safe(**id)
         })
         .max_by_key(|(_, id)| last_use.get(id).copied().unwrap_or(0))
         .map(|(n, id)| (*n, *id));
@@ -6179,6 +6354,10 @@ fn vread_impl(
     vectors: &HashMap<ValueId, Vec<Value>>,
     last_use: &HashMap<ValueId, usize>,
     phi_pinned: &std::collections::HashSet<ValueId>,
+    loop_spans: &[(usize, usize)],
+    value_def_flat_idx: &HashMap<ValueId, usize>,
+    read_pos: &HashMap<ValueId, Vec<usize>>,
+    cur_i: usize,
     spill_mode: bool,
     cur_op: &Op,
     id: ValueId,
@@ -6191,7 +6370,8 @@ fn vread_impl(
             "reload of {id:?} without a spill slot")))?;
     let v = valloc_impl(free_pool, owners, used_callee_saved_v,
         scalars, spilled, spill_slot, vectors, last_use,
-        phi_pinned, spill_mode, cur_op, id)?;
+        phi_pinned, loop_spans, value_def_flat_idx, read_pos, cur_i,
+        spill_mode, cur_op, id)?;
     if std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok()
         && (v.0 == 30 || id.0 == 118)
     {
@@ -6788,6 +6968,29 @@ fn compute_last_use_flat(
         }
     }
 
+    if std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok() {
+        let probe = ValueId(210);
+        eprintln!("LU-DUMP lu(210)={:?} uc={:?}",
+            last_use.get(&probe), use_counts.get(&probe));
+        for (vid, ms) in &members {
+            if ms.contains(&probe) {
+                eprintln!("LU-DUMP vec {vid:?} contains 210; lu(vec)={:?}",
+                    last_use.get(vid));
+            }
+        }
+        // who reads 170 (the col ConstVec), with op detail
+        let vec170 = ValueId(170);
+        for (i, inst) in insts.iter().enumerate() {
+            if op_reads(&inst.op, vec170) {
+                eprintln!("LU-DUMP 170 read at i={i}: {:?}", inst.op);
+            }
+            if let Some(r) = inst.result.as_ref() {
+                if r.id == vec170 {
+                    eprintln!("LU-DUMP 170 DEF at i={i}: {:?}", inst.op);
+                }
+            }
+        }
+    }
     (last_use, use_counts)
 }
 
