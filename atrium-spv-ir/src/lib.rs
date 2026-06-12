@@ -514,6 +514,20 @@ pub enum Op {
         /// (general case).
         stride: u32,
     },
+    /// Function-local scratch allocation (a function-scope
+    /// `OpVariable`, StorageClass Function): `offset` bytes into
+    /// the function's scratch area (frontend-assigned, 16-aligned),
+    /// `bytes` long. The result is a Function-storage pointer;
+    /// backends place the scratch area in the machine stack frame
+    /// and resolve this to (frame base, offset) — no code emitted.
+    /// Dynamic indices into these allocations are CLAMPED by the
+    /// frontend (sandbox bounds safety is uniform across backends).
+    LocalAlloc {
+        /// Byte offset inside the function scratch area.
+        offset: u32,
+        /// Allocation size in bytes.
+        bytes: u32,
+    },
 
     // ── Type conversions ───────────────────────────────────────
 
@@ -940,7 +954,7 @@ impl Op {
         use Op::*;
         match self {
             ConstInt { .. } | ConstFloat { .. } | ConstNull
-            | LoadBuiltin(_) | ImageHandle { .. }
+            | LoadBuiltin(_) | ImageHandle { .. } | LocalAlloc { .. }
             | Branch(_) | Return | Discard | Barrier => {}
 
             INeg(a) | FNeg(a) | BitNot(a) | PackHalf2x16(a) | UnpackHalf2x16(a)
@@ -1228,6 +1242,10 @@ pub struct Function {
     /// passes its base pointer as the `workgroup_buf` ABI
     /// slot (10th cs_main argument, at SP+8).
     pub workgroup_size: u32,
+    /// Total function-local scratch bytes (sum of `LocalAlloc`
+    /// sizes, 16-aligned). Backends reserve this in the stack
+    /// frame. Capped by the frontend at 4096 (sandbox).
+    pub scratch_bytes: u32,
     /// Per-variable byte offsets inside the workgroup
     /// scratch buffer.  Indexed by the variable's IR
     /// ValueId; codegen resolves Workgroup-storage OpVariable

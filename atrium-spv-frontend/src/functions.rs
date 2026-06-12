@@ -109,6 +109,9 @@ fn translate_one(
     // `instances[slot].member`) recover where its base points
     // so it can keep walking struct members.
     let mut ptr_pointee: HashMap<Word, Word> = HashMap::new();
+    // Function-local scratch cursor (LocalAlloc offsets) — see
+    // the SpvOp::Variable arm. Capped at 4 KiB (sandbox).
+    let mut scratch_bytes: u32 = 0;
 
     let mut label_to_block_id: HashMap<Word, BlockId> = HashMap::new();
     for (i, spv_block) in spv.blocks.iter().enumerate() {
@@ -209,6 +212,7 @@ fn translate_one(
                 &mut next_value_id,
                 &mut insts,
                 &mut ptr_pointee,
+                &mut scratch_bytes,
                 source_offset,
             )?;
             spv_inst_index += 1;
@@ -278,6 +282,7 @@ fn translate_one(
     let workgroup_size = iface.workgroup_size;
 
     Ok(Function {
+        scratch_bytes,
         name,
         stage,
         params: Vec::new(), // no params in v1 narrow scope
@@ -310,6 +315,7 @@ fn translate_inst_with_cfg(
     next_value_id: &mut u32,
     insts: &mut Vec<Inst>,
     ptr_pointee: &mut HashMap<Word, Word>,
+    scratch_bytes: &mut u32,
     source_spirv_offset: u32,
 ) -> Result<(), FrontendError> {
     match spv_inst.class.opcode {
@@ -401,7 +407,8 @@ fn translate_inst_with_cfg(
         }
         _ => translate_inst(
             spv_inst, types, constants, iface, label_to_block_id,
-            id_map, next_value_id, insts, ptr_pointee, source_spirv_offset,
+            id_map, next_value_id, insts, ptr_pointee, scratch_bytes,
+            source_spirv_offset,
         ),
     }
 }
@@ -424,12 +431,78 @@ fn translate_inst(
     next_value_id: &mut u32,
     insts: &mut Vec<Inst>,
     ptr_pointee: &mut HashMap<Word, Word>,
+    scratch_bytes: &mut u32,
     source_spirv_offset: u32,
 ) -> Result<(), FrontendError> {
 
     match spv_inst.class.opcode {
         // Block label — handled by block-walking, no IR emit.
         SpvOp::Label | SpvOp::Nop => Ok(()),
+
+        // Function-scope OpVariable: a stack-scratch allocation.
+        // This is the dynamically-indexed-local-array escape hatch
+        // the SSA legalizer cannot provide (SROA cannot split an
+        // array indexed at runtime). The frontend assigns a
+        // 16-aligned offset in the function's scratch area; the
+        // backends place that area in the machine stack frame.
+        SpvOp::Variable => {
+            let result_id = spv_inst.result_id.ok_or_else(||
+                FrontendError::Malformed(
+                    "OpVariable without result id".to_string()))?;
+            let ptr_ty_id = spv_inst.result_type.ok_or_else(||
+                FrontendError::Malformed(
+                    "OpVariable without result type".to_string()))?;
+            let storage = match spv_inst.operands.first() {
+                Some(Operand::StorageClass(sc)) => *sc,
+                other => return Err(FrontendError::Malformed(format!(
+                    "OpVariable: expected StorageClass, got {other:?}",
+                ))),
+            };
+            if storage != rspirv::spirv::StorageClass::Function {
+                return Err(FrontendError::Unsupported(format!(
+                    "function-body OpVariable with storage {storage:?}                      (only Function supported)",
+                )));
+            }
+            if spv_inst.operands.len() > 1 {
+                return Err(FrontendError::Unsupported(
+                    "OpVariable initializer not supported (store                      explicitly)".to_string(),
+                ));
+            }
+            // Pointee type + size.
+            let ptr_raw = types.get_raw(ptr_ty_id)?;
+            let pointee_id = match (ptr_raw.class.opcode,
+                                    ptr_raw.operands.get(1)) {
+                (SpvOp::TypePointer, Some(Operand::IdRef(id))) => *id,
+                _ => return Err(FrontendError::Malformed(
+                    "OpVariable result type is not a pointer".to_string())),
+            };
+            let bytes = local_type_size(types, constants, pointee_id)
+                .ok_or_else(|| FrontendError::Unsupported(format!(
+                    "OpVariable pointee type {pointee_id} is not sizeable                      for Function scratch",
+                )))?;
+            let offset = *scratch_bytes;
+            *scratch_bytes = (*scratch_bytes + bytes + 15) & !15;
+            if *scratch_bytes > 4096 {
+                return Err(FrontendError::Unsupported(format!(
+                    "function scratch exceeds 4096 bytes                      ({} requested)", *scratch_bytes,
+                )));
+            }
+            let ty = types.get(ptr_ty_id)?.clone();
+            let value = id_map.get(&result_id).cloned().unwrap_or_else(|| {
+                let id = ValueId(*next_value_id);
+                *next_value_id += 1;
+                Value { id, ty: ty.clone() }
+            });
+            let value = Value { id: value.id, ty };
+            id_map.insert(result_id, value.clone());
+            ptr_pointee.insert(result_id, pointee_id);
+            insts.push(Inst {
+                op: Op::LocalAlloc { offset, bytes },
+                result: Some(value),
+                source_spirv_offset,
+            });
+            Ok(())
+        }
 
         SpvOp::Store => {
             let ptr_id = expect_id(&spv_inst.operands, 0)?;
@@ -2033,7 +2106,7 @@ fn translate_inst(
             // canonical `ssbo.data[i]` shape; richer dynamic
             // chains land as needed.
             let mut byte_offset: u32 = 0;
-            let mut dynamic_step: Option<(Word, u32)> = None;
+            let mut dynamic_step: Option<(Word, u32, Option<u32>)> = None;
             let operands: Vec<&Operand> = spv_inst.operands.iter().skip(1).collect();
             for (step_i, op) in operands.iter().enumerate() {
                 let is_last = step_i == operands.len() - 1;
@@ -2083,7 +2156,24 @@ fn translate_inst(
                              has no IR size and no ArrayStride decoration",
                         )));
                     }
-                    dynamic_step = Some((idx_id, stride));
+                    // Sized array: capture the length for the
+                    // Function-scratch bounds clamp.
+                    let arr_len: Option<u32> =
+                        if raw.class.opcode == rspirv::spirv::Op::TypeArray {
+                            raw.operands.get(1).and_then(|op| match op {
+                                Operand::IdRef(id) => constants.get(*id)
+                                    .and_then(|c| match &c.kind {
+                                        ConstantKind::Scalar(
+                                            Op::ConstInt { value, .. }) =>
+                                            Some(*value as u32),
+                                        _ => None,
+                                    }),
+                                _ => None,
+                            })
+                        } else {
+                            None
+                        };
+                    dynamic_step = Some((idx_id, stride, arr_len));
                     // The chain now points at the array element;
                     // record it so a chained AccessChain into a
                     // struct element can keep walking members.
@@ -2157,7 +2247,7 @@ fn translate_inst(
 
             let result = alloc_or_get_result(result_id, result_ty.clone(),
                 id_map, next_value_id);
-            if let Some((dyn_idx_id, stride)) = dynamic_step {
+            if let Some((dyn_idx_id, stride, arr_len)) = dynamic_step {
                 // Two-step emission: constant prefix
                 // AccessChain produces an intermediate
                 // pointer Value with the same result type;
@@ -2176,6 +2266,56 @@ fn translate_inst(
                     dyn_idx_id, types, constants, id_map,
                     next_value_id, insts, source_spirv_offset,
                 )?;
+                // Function-scratch bounds safety: a dynamic index
+                // into a stack-local array is CLAMPED to the array
+                // (GLSL robustness semantics) — no shader can
+                // address outside its own scratch. SSBO indices
+                // stay as-is: the descriptor range is the sandbox
+                // there.
+                let is_function = matches!(
+                    &prefix_value.ty, Type::Pointer(
+                        atrium_spv_ir::StorageClass::Function, _));
+                let dyn_idx_val = if let (true, Some(len)) =
+                    (is_function, arr_len)
+                {
+                    let push_v = |op: Op, ty: Type,
+                                  insts: &mut Vec<Inst>,
+                                  next_value_id: &mut u32| -> Value {
+                        let id = ValueId(*next_value_id);
+                        *next_value_id += 1;
+                        let v = Value { id, ty };
+                        insts.push(Inst {
+                            op,
+                            result: Some(v.clone()),
+                            source_spirv_offset,
+                        });
+                        v
+                    };
+                    let len_c = push_v(
+                        Op::ConstInt {
+                            value: len as i64,
+                            kind: atrium_spv_ir::IntKind::U32,
+                        },
+                        Type::U32, insts, next_value_id);
+                    let max_c = push_v(
+                        Op::ConstInt {
+                            value: (len.saturating_sub(1)) as i64,
+                            kind: atrium_spv_ir::IntKind::U32,
+                        },
+                        Type::U32, insts, next_value_id);
+                    let in_range = push_v(
+                        Op::ULt(dyn_idx_val.clone(), len_c),
+                        Type::Bool, insts, next_value_id);
+                    push_v(
+                        Op::Select {
+                            cond: in_range,
+                            t_val: dyn_idx_val,
+                            f_val: max_c,
+                        },
+                        Type::U32, insts, next_value_id)
+                } else {
+                    dyn_idx_val
+                };
                 insts.push(Inst {
                     op: Op::PtrOffsetDynamic {
                         base: prefix_value,
@@ -6816,4 +6956,54 @@ fn synth_transcendental(
         other => return Err(FrontendError::Unsupported(format!(
             "synth_transcendental: enum {other} out of range"))),
     })
+}
+
+
+/// Byte size of a type for Function-scratch layout: scalars,
+/// vectors, sized arrays, nested structs. None for unsized /
+/// opaque types (those cannot live in function scratch).
+fn local_type_size(
+    types: &TypeContext,
+    constants: &ConstantContext,
+    type_id: Word,
+) -> Option<u32> {
+    if let Ok(t) = types.get(type_id) {
+        use atrium_spv_ir::Type;
+        match t {
+            Type::Bool | Type::I32 | Type::U32 | Type::F32 => return Some(4),
+            Type::I64 | Type::U64 | Type::F64 => return Some(8),
+            Type::Vec2(_) => return Some(8),
+            Type::Vec3(_) => return Some(12),
+            Type::Vec4(_) => return Some(16),
+            _ => {}
+        }
+    }
+    let raw = types.get_raw(type_id).ok()?;
+    match raw.class.opcode {
+        SpvOp::TypeArray => {
+            let elem = match raw.operands.first() {
+                Some(Operand::IdRef(id)) => *id,
+                _ => return None,
+            };
+            let len_id = match raw.operands.get(1) {
+                Some(Operand::IdRef(id)) => *id,
+                _ => return None,
+            };
+            let len = match &constants.get(len_id)?.kind {
+                crate::constants::ConstantKind::Scalar(
+                    atrium_spv_ir::Op::ConstInt { value, .. }) => *value as u32,
+                _ => return None,
+            };
+            Some(local_type_size(types, constants, elem)? * len)
+        }
+        SpvOp::TypeStruct => {
+            let mut total = 0u32;
+            for op in &raw.operands {
+                let Operand::IdRef(id) = op else { return None };
+                total += local_type_size(types, constants, *id)?;
+            }
+            Some(total)
+        }
+        _ => None,
+    }
 }

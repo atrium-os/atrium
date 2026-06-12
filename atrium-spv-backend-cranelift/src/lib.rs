@@ -1373,6 +1373,23 @@ impl FnTranslator {
                 self.scalars.insert(result.id, old);
                 Ok(())
             }
+            Op::LocalAlloc { offset, bytes } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "LocalAlloc without result".to_string()))?;
+                // One cranelift stack slot per allocation (the
+                // frontend's offsets partition a shared scratch
+                // area; per-slot here is equivalent and lets
+                // cranelift do its own frame layout).
+                let _ = offset;
+                let slot = builder.func.create_sized_stack_slot(
+                    StackSlotData::new(
+                        StackSlotKind::ExplicitSlot, *bytes, 4));
+                let addr = builder.ins().stack_addr(
+                    clif_types::I64, slot, 0);
+                self.pointers.insert(result.id, (addr, 0));
+                Ok(())
+            }
             Op::PtrOffsetDynamic { base, index, stride } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(

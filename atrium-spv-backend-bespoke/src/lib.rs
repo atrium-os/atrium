@@ -503,6 +503,14 @@ fn emit_function(
         std::collections::HashSet::new();
     let mut spill_slot: HashMap<ValueId, u32> = HashMap::new();
     let mut spill_next: u32 = 0;
+    // Function-local scratch (LocalAlloc): RESERVE it as the
+    // first spill slots — scratch lives at [sp, 0..scratch) and
+    // spills allocate after, so every existing spill-slot access,
+    // cap check, sub-sp sizing, and frame-shift patch works
+    // unchanged in both fast and spill modes.
+    if func.scratch_bytes > 0 {
+        spill_next = func.scratch_bytes.div_ceil(8);
+    }
     // Dead values' slots recycle through a free list — the live-
     // slot peak is what bounds the frame, not total defs.
     let mut spill_free: Vec<u32> = Vec::new();
@@ -2074,6 +2082,30 @@ fn emit_function(
                 &mut a, &mut ints, &mut int_pool, coalesce_w, inst, l, r, asm::sdiv_w)?,
             Op::UDiv(l, r) => emit_int_binop(
                 &mut a, &mut ints, &mut int_pool, coalesce_w, inst, l, r, asm::udiv_w)?,
+            // Integer remainder: div into the W9 scratch, then
+            // msub (dst = l - (l/r)*r) — the standard ARM64 pair.
+            Op::UMod(l, r) | Op::SMod(l, r) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("mod without result".into()))?;
+                let wl = *ints.get(&l.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "mod lhs {:?} not in ints", l.id)))?;
+                let wr = *ints.get(&r.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "mod rhs {:?} not in ints", r.id)))?;
+                let w9 = asm::Wreg(9);
+                if matches!(&inst.op, Op::UMod(..)) {
+                    a.emit(asm::udiv_w(w9, wl, wr));
+                } else {
+                    a.emit(asm::sdiv_w(w9, wl, wr));
+                }
+                let d = match coalesce_w {
+                    Some(d) => d,
+                    None => alloc_int_w(&mut int_pool, result.id)?,
+                };
+                a.emit(asm::msub_w(d, w9, wr, wl));
+                ints.insert(result.id, d);
+            }
             // Bitwise + shifts.
             Op::BitAnd(l, r) => emit_int_binop(
                 &mut a, &mut ints, &mut int_pool, coalesce_w, inst, l, r, asm::and_w)?,
@@ -3238,6 +3270,18 @@ fn emit_function(
                 }
                 ints.insert(result.id, w_old);
             }
+            Op::LocalAlloc { offset, .. } => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal(
+                        "LocalAlloc without result".into()))?;
+                // Pure bookkeeping: the scratch area is the head
+                // of the spill region at [sp, 0..scratch); the
+                // pointer is (SP, offset). Imm-offset loads and
+                // stores encode register 31 as SP; the dynamic-
+                // pointer paths special-case SP (reg-reg ADD
+                // would read XZR).
+                pointers.insert(result.id, (asm::Xreg(31), *offset as i32));
+            }
             Op::PtrOffsetDynamic { base, index, stride } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
@@ -3291,19 +3335,37 @@ fn emit_function(
                 let dst_w = int_pool.alloc(result.id)?;
                 let dst_x = asm::Xreg(dst_w.0);
                 let idx_x = asm::Xreg(w_index.0);
+                // SP base (function scratch): reg-reg ADD reads
+                // register 31 as XZR, so materialise SP+offset
+                // via the imm form first (which DOES mean SP).
+                let (eff_base, eff_off) = if x_base.0 == 31 {
+                    a.emit(asm::add_imm_x(dst_x, x_base,
+                        base_off.max(0) as u16));
+                    (dst_x, 0)
+                } else {
+                    (x_base, base_off)
+                };
                 if log2 == 0 {
                     // stride == 1: just add.
-                    a.emit(asm::add_x(dst_x, x_base, idx_x));
+                    a.emit(asm::add_x(dst_x, eff_base, idx_x));
                 } else {
                     // stride == 2^log2: shift then add.
-                    a.emit(asm::lsl_imm_x(dst_x, idx_x, log2));
-                    a.emit(asm::add_x(dst_x, x_base, dst_x));
+                    if eff_base.0 == dst_x.0 {
+                        // base already in dst (SP path): shift
+                        // the index into X9 scratch instead.
+                        let x9 = asm::Xreg(9);
+                        a.emit(asm::lsl_imm_x(x9, idx_x, log2));
+                        a.emit(asm::add_x(dst_x, dst_x, x9));
+                    } else {
+                        a.emit(asm::lsl_imm_x(dst_x, idx_x, log2));
+                        a.emit(asm::add_x(dst_x, eff_base, dst_x));
+                    }
                 }
                 // Result pointer: base = dst_x, byte_off
                 // carries the constant prefix the
                 // AccessChain accumulated (the load/store
                 // imm12 will fold it).
-                pointers.insert(result.id, (dst_x, base_off));
+                pointers.insert(result.id, (dst_x, eff_off));
             }
             Op::LoadBuiltin(kind) => {
                 use atrium_spv_ir::BuiltinKind as BK;
@@ -5574,6 +5636,15 @@ fn resolve_ptr_spill(
                 "deferred ptr index {index_id:?} not in ints \
                  or constants; consumer={cur_op:?} ptr={:?}", v.id)));
         };
+        if x_base.0 == 31 {
+            // SP base (function scratch): imm-form ADD means SP
+            // (reg-reg would read XZR). Fold the constant offset,
+            // then add the shifted index via the shifted-register
+            // ADD — no second scratch register needed.
+            a.emit(asm::add_imm_x(x9, x_base, base_off.max(0) as u16));
+            a.emit(asm::add_x_lsl(x9, x9, idx_x, log2));
+            return Ok((x9, 0));
+        }
         if log2 == 0 {
             a.emit(asm::add_x(x9, x_base, idx_x));
         } else {

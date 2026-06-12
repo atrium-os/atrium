@@ -8399,3 +8399,127 @@ fn differential_glsl_vec_transcendentals() {
             "cranelift lane {i}: {cv} vs {}", expect[i]);
     }
 }
+
+/// Function-local scratch arrays (LocalAlloc): the dynamically-
+/// indexed local array that SSA legalization cannot remove — the
+/// "phase-1 takes no OpVariable" gap, closed. Constant-index
+/// stores fill a float[4]; each invocation reads back arr[gid]
+/// AND arr[gid + 7], whose index the frontend CLAMPS to the array
+/// (sandbox bounds), so the second read must yield arr[3].
+fn build_local_array_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let f32_ty = b.type_float(32, None);
+    let v3u = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+
+    // Output SSBO: runtime array of f32.
+    let rt_arr = b.type_runtime_array(f32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt_arr]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_sb_f = b.type_pointer(None, StorageClass::StorageBuffer, f32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+
+    // gl_GlobalInvocationID.
+    let ptr_in_v3 = b.type_pointer(None, StorageClass::Input, v3u);
+    let gid_var = b.variable(ptr_in_v3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+
+    // Local float[4].
+    let c4 = b.constant_bit32(u32_ty, 4);
+    let arr4 = b.type_array(f32_ty, c4);
+    let ptr_fn_arr = b.type_pointer(None, StorageClass::Function, arr4);
+    let ptr_fn_f = b.type_pointer(None, StorageClass::Function, f32_ty);
+
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    let c7 = b.constant_bit32(u32_ty, 7);
+    let c2u = b.constant_bit32(u32_ty, 2);
+    let idx_c: Vec<u32> = (0..4).map(|i| b.constant_bit32(u32_ty, i)).collect();
+    let val_c: Vec<u32> = [10.0f32, 20.0, 30.0, 40.0]
+        .iter()
+        .map(|v| b.constant_bit32(f32_ty, v.to_bits()))
+        .collect();
+
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn)
+        .unwrap();
+    b.begin_block(None).unwrap();
+    let arr = b.variable(ptr_fn_arr, None, StorageClass::Function, None);
+    // Fill via constant-index access chains.
+    for k in 0..4 {
+        let p = b.access_chain(ptr_fn_f, None, arr, vec![idx_c[k]]).unwrap();
+        b.store(p, val_c[k], None, vec![]).unwrap();
+    }
+    let gid_v = b.load(v3u, None, gid_var, None, vec![]).unwrap();
+    let gid = b.composite_extract(u32_ty, None, gid_v, vec![0]).unwrap();
+
+    // In-bounds dynamic read: arr[gid].
+    let p_in = b.access_chain(ptr_fn_f, None, arr, vec![gid]).unwrap();
+    let v_in = b.load(f32_ty, None, p_in, None, vec![]).unwrap();
+    // Out-of-bounds dynamic read: arr[gid + 7] — must clamp to 3.
+    let idx_oob = b.i_add(u32_ty, None, gid, c7).unwrap();
+    let p_oob = b.access_chain(ptr_fn_f, None, arr, vec![idx_oob]).unwrap();
+    let v_oob = b.load(f32_ty, None, p_oob, None, vec![]).unwrap();
+
+    // out[gid] = v_in; out[gid + 4] = v_oob.
+    let d1 = b.access_chain(ptr_sb_f, None, ssbo, vec![c_zero, gid]).unwrap();
+    b.store(d1, v_in, None, vec![]).unwrap();
+    let c4b = b.constant_bit32(u32_ty, 4);
+    let gid4 = b.i_add(u32_ty, None, gid, c4b).unwrap();
+    let d2 = b.access_chain(ptr_sb_f, None, ssbo, vec![c_zero, gid4]).unwrap();
+    b.store(d2, v_oob, None, vec![]).unwrap();
+    let _ = c2u;
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main",
+        vec![ssbo, gid_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words {
+        bytes.extend_from_slice(&w.to_le_bytes());
+    }
+    bytes
+}
+
+#[test]
+fn differential_local_scratch_array() {
+    let spv = build_local_array_cs();
+    let dir = TempDir::new().unwrap();
+    let gids: Vec<(u32, u32, u32)> =
+        (0..4).map(|i| (i, 0, 0)).collect();
+    let mut b_buf = vec![0u8; 32];
+    let mut c_buf = vec![0u8; 32];
+    invoke_with_gids(&spv, true, dir.path(), "b", b_buf.as_mut_ptr(), &gids);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(), &gids);
+    assert_eq!(b_buf, c_buf, "bespoke vs cranelift diverge on local arrays");
+    let read = |i: usize| -> f32 {
+        f32::from_le_bytes(b_buf[i * 4..i * 4 + 4].try_into().unwrap())
+    };
+    // arr = [10, 20, 30, 40]; out[0..4] = arr[gid].
+    for i in 0..4 {
+        assert_eq!(read(i), (i as f32 + 1.0) * 10.0, "arr[{i}]");
+    }
+    // out[4..8] = arr[gid + 7] -> clamped to arr[3] = 40 for all.
+    for i in 4..8 {
+        assert_eq!(read(i), 40.0, "clamped read {i}");
+    }
+}
