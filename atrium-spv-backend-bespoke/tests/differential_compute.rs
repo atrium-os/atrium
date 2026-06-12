@@ -8603,3 +8603,97 @@ fn differential_op_umod() {
             "(({gid} + 1700) % 3)");
     }
 }
+
+/// Signed floored remainder (OpSMod): the sign cases are where
+/// SRem and SMod differ — SMod takes the DIVISOR's sign. Pins
+/// the bespoke branchless adjust and cranelift's select path
+/// against each other and against hand-computed values.
+fn build_smod_cs() -> Vec<u8> {
+    use rspirv::binary::Assemble;
+    use rspirv::spirv::{
+        AddressingModel, BuiltIn, Capability, Decoration, ExecutionMode,
+        ExecutionModel, FunctionControl, MemoryModel, StorageClass,
+    };
+    let mut b = rspirv::dr::Builder::new();
+    b.set_version(1, 3);
+    b.capability(Capability::Shader);
+    b.memory_model(AddressingModel::Logical, MemoryModel::GLSL450);
+    let void = b.type_void();
+    let u32_ty = b.type_int(32, 0);
+    let i32_ty = b.type_int(32, 1);
+    let v3u = b.type_vector(u32_ty, 3);
+    let void_fn = b.type_function(void, vec![]);
+    let rt_arr = b.type_runtime_array(i32_ty);
+    b.decorate(rt_arr, Decoration::ArrayStride,
+        vec![rspirv::dr::Operand::LiteralBit32(4)]);
+    let s = b.type_struct(vec![rt_arr]);
+    b.decorate(s, Decoration::Block, vec![]);
+    b.member_decorate(s, 0, Decoration::Offset,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_s = b.type_pointer(None, StorageClass::StorageBuffer, s);
+    let ptr_i = b.type_pointer(None, StorageClass::StorageBuffer, i32_ty);
+    let ssbo = b.variable(ptr_s, None, StorageClass::StorageBuffer, None);
+    b.decorate(ssbo, Decoration::DescriptorSet,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    b.decorate(ssbo, Decoration::Binding,
+        vec![rspirv::dr::Operand::LiteralBit32(0)]);
+    let ptr_in_v3 = b.type_pointer(None, StorageClass::Input, v3u);
+    let gid_var = b.variable(ptr_in_v3, None, StorageClass::Input, None);
+    b.decorate(gid_var, Decoration::BuiltIn,
+        vec![rspirv::dr::Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+    let c_zero = b.constant_bit32(u32_ty, 0);
+    // (x, y) pairs covering all sign combinations + zero remainder.
+    let cases: [(i32, i32); 6] =
+        [(7, 3), (-7, 3), (7, -3), (-7, -3), (6, 3), (-6, 3)];
+    let xc: Vec<u32> = cases.iter()
+        .map(|(x, _)| b.constant_bit32(i32_ty, *x as u32)).collect();
+    let yc: Vec<u32> = cases.iter()
+        .map(|(_, y)| b.constant_bit32(i32_ty, *y as u32)).collect();
+    let idx_c: Vec<u32> = (0..6).map(|i| b.constant_bit32(u32_ty, i)).collect();
+    let main = b.begin_function(void, None, FunctionControl::NONE, void_fn)
+        .unwrap();
+    b.begin_block(None).unwrap();
+    let gid_v = b.load(v3u, None, gid_var, None, vec![]).unwrap();
+    let _gid = b.composite_extract(u32_ty, None, gid_v, vec![0]).unwrap();
+    for k in 0..6 {
+        let m = b.s_mod(i32_ty, None, xc[k], yc[k]).unwrap();
+        let dst = b.access_chain(ptr_i, None, ssbo,
+            vec![c_zero, idx_c[k]]).unwrap();
+        b.store(dst, m, None, vec![]).unwrap();
+    }
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, main, "main",
+        vec![ssbo, gid_var]);
+    b.execution_mode(main, ExecutionMode::LocalSize, [1u32, 1, 1]);
+    let words: Vec<u32> = b.module().assemble();
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words {
+        bytes.extend_from_slice(&w.to_le_bytes());
+    }
+    bytes
+}
+
+#[test]
+fn differential_op_smod_floored() {
+    let spv = build_smod_cs();
+    let dir = TempDir::new().unwrap();
+    let mut b_buf = vec![0u8; 24];
+    let mut c_buf = vec![0u8; 24];
+    invoke_with_gids(&spv, true, dir.path(), "b", b_buf.as_mut_ptr(),
+        &[(0, 0, 0)]);
+    invoke_with_gids(&spv, false, dir.path(), "c", c_buf.as_mut_ptr(),
+        &[(0, 0, 0)]);
+    assert_eq!(b_buf, c_buf, "bespoke vs cranelift diverge on SMod");
+    let read = |i: usize| -> i32 {
+        i32::from_le_bytes(b_buf[i * 4..i * 4 + 4].try_into().unwrap())
+    };
+    // Floored remainder: sign of the DIVISOR.
+    //  7 smod  3 =  1   | -7 smod  3 =  2
+    //  7 smod -3 = -2   | -7 smod -3 = -1
+    //  6 smod  3 =  0   | -6 smod  3 =  0
+    let expect = [1, 2, -2, -1, 0, 0];
+    for (i, e) in expect.iter().enumerate() {
+        assert_eq!(read(i), *e, "case {i}");
+    }
+}

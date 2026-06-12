@@ -677,68 +677,15 @@ fn translate_inst(
         //   r = x - y * (x sdiv y)                  -- SRem
         //   adjust = (sign(r) != sign(y)) && (r != 0)
         //   SMod = adjust ? r + y : r
-        SpvOp::SMod => {
-            let result_id = spv_inst.result_id.ok_or_else(||
-                FrontendError::Malformed("SMod without result id".into()))?;
-            let result_ty_id = spv_inst.result_type.ok_or_else(||
-                FrontendError::Malformed("SMod without result type".into()))?;
-            let result_ty = types.get(result_ty_id)?.clone();
-            let x_id = expect_id(&spv_inst.operands, 0)?;
-            let y_id = expect_id(&spv_inst.operands, 1)?;
-            let x = resolve_value(x_id, types, constants, id_map,
-                next_value_id, insts, source_spirv_offset)?;
-            let y = resolve_value(y_id, types, constants, id_map,
-                next_value_id, insts, source_spirv_offset)?;
-            // r = x - y * (x sdiv y)
-            let q = push_i32(Op::SDiv(x.clone(), y.clone()),
-                source_spirv_offset, insts, next_value_id);
-            let prod = push_i32(Op::IMul(y.clone(), q),
-                source_spirv_offset, insts, next_value_id);
-            let r = push_i32(Op::ISub(x, prod),
-                source_spirv_offset, insts, next_value_id);
-            // Compute the adjust condition via bit-tricks
-            // (avoids producing Bool intermediates that the
-            // bespoke `bools` map / `ints` map would split):
-            //
-            //   sign_xor   = r ^ y                 -- top bit set iff signs differ
-            //   diff_bit   = sign_xor >> 31 (LShr) -- 0 or 1
-            //   neg_r      = -r
-            //   nonzero_or = r | neg_r             -- top bit set iff r != 0
-            //   nz_bit     = nonzero_or >> 31      -- 0 or 1
-            //   cond_int   = diff_bit & nz_bit     -- 0 or 1
-            //   cond       = (cond_int != 0)       -- Bool, lands in `bools`
-            let c31 = push_ci(31, atrium_spv_ir::IntKind::U32,
-                source_spirv_offset, insts, next_value_id);
-            let sign_xor = push_i32(Op::BitXor(r.clone(), y.clone()),
-                source_spirv_offset, insts, next_value_id);
-            let diff_bit = push_i32(Op::LShr(sign_xor, c31.clone()),
-                source_spirv_offset, insts, next_value_id);
-            let neg_r = push_i32(Op::INeg(r.clone()),
-                source_spirv_offset, insts, next_value_id);
-            let nonzero_or = push_i32(Op::BitOr(r.clone(), neg_r),
-                source_spirv_offset, insts, next_value_id);
-            let nz_bit = push_i32(Op::LShr(nonzero_or, c31),
-                source_spirv_offset, insts, next_value_id);
-            let cond_int = push_i32(Op::BitAnd(diff_bit, nz_bit),
-                source_spirv_offset, insts, next_value_id);
-            let zero = push_ci(0, atrium_spv_ir::IntKind::U32,
-                source_spirv_offset, insts, next_value_id);
-            let cond = push_bool(Op::INe(cond_int, zero),
-                source_spirv_offset, insts, next_value_id);
-            // adjusted = r + y; result = cond ? adjusted : r.
-            let adjusted = push_i32(Op::IAdd(r.clone(), y),
-                source_spirv_offset, insts, next_value_id);
-            let result = alloc_or_get_result(
-                result_id, result_ty, id_map, next_value_id);
-            insts.push(Inst {
-                op: Op::Select {
-                    cond, t_val: adjusted, f_val: r,
-                },
-                result: Some(result),
-                source_spirv_offset,
-            });
-            Ok(())
-        }
+        // OpSMod: signed FLOORED remainder. Both backends now
+        // implement Op::SMod natively with the divisor-sign adjust
+        // (bespoke: sdiv+msub+branchless adjust; cranelift:
+        // srem+select) — the old frontend decomposition retired.
+        SpvOp::SMod => emit_binop_int(
+            spv_inst, types, constants, iface,
+            id_map, next_value_id, insts, source_spirv_offset,
+            |a, b| Op::SMod(a, b),
+        ),
         SpvOp::UMod => emit_binop_int(
             spv_inst, types, constants, iface,
             id_map, next_value_id, insts, source_spirv_offset,

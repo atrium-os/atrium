@@ -2084,10 +2084,6 @@ fn emit_function(
                 &mut a, &mut ints, &mut int_pool, coalesce_w, inst, l, r, asm::udiv_w)?,
             // Unsigned remainder: udiv into the W9 scratch, then
             // msub (dst = l - (l/r)*r) — the standard ARM64 pair.
-            // UNSIGNED ONLY: the frontend decomposes OpSRem and
-            // OpSMod itself (truncated vs floored sign semantics
-            // — sdiv+msub would silently give SRem where SMod is
-            // asked), so Op::SMod deliberately stays unhandled.
             Op::UMod(l, r) => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("mod without result".into()))?;
@@ -2104,6 +2100,38 @@ fn emit_function(
                     None => alloc_int_w(&mut int_pool, result.id)?,
                 };
                 a.emit(asm::msub_w(d, w9, wr, wl));
+                ints.insert(result.id, d);
+            }
+            // Signed FLOORED remainder (SPIR-V OpSMod: result has
+            // the sign of the DIVISOR). sdiv+msub gives truncated
+            // SRem; the branchless adjust adds y exactly when the
+            // remainder is non-zero and its sign differs from y:
+            //   d  = l - (l sdiv r)*r          (SRem)
+            //   w9 = ((d ^ r) >> 31) & r       (y if signs differ)
+            //   w9 = (d == 0) ? 0 : w9
+            //   d  = d + w9
+            Op::SMod(l, r) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("smod without result".into()))?;
+                let wl = *ints.get(&l.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "smod lhs {:?} not in ints", l.id)))?;
+                let wr = *ints.get(&r.id).ok_or_else(||
+                    BackendError::Internal(format!(
+                        "smod rhs {:?} not in ints", r.id)))?;
+                let w9 = asm::Wreg(9);
+                a.emit(asm::sdiv_w(w9, wl, wr));
+                let d = match coalesce_w {
+                    Some(d) => d,
+                    None => alloc_int_w(&mut int_pool, result.id)?,
+                };
+                a.emit(asm::msub_w(d, w9, wr, wl));
+                a.emit(asm::eor_w(w9, d, wr));
+                a.emit(asm::asr_imm_w(w9, w9, 31));
+                a.emit(asm::and_w(w9, w9, wr));
+                a.emit(asm::cmp_imm_w(d, 0));
+                a.emit(asm::csel_w(w9, asm::WZR, w9, asm::Cond::Eq));
+                a.emit(asm::add_w(d, d, w9));
                 ints.insert(result.id, d);
             }
             // Bitwise + shifts.
