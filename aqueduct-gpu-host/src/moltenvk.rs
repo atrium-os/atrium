@@ -890,6 +890,14 @@ impl MoltenVkBackend {
         // Compute state for this frame stream.
         let mut cur_compute: Option<u32> = None;
         let mut push_bytes: Vec<u8> = Vec::new();
+        // In-stream storage-buffer bindings (FrameOp::BindDescriptors,
+        // dtype 7): binding -> buffer id. Persist across dispatches
+        // within the frame, Vulkan-style, until rebound. The legacy
+        // out-of-band bind_compute_buffer stash is merged in at each
+        // Dispatch (it cannot express per-dispatch sets: a HashMap
+        // staged before submit collapses multi-pass frames).
+        let mut stream_binds: std::collections::BTreeMap<u32, u32> =
+            std::collections::BTreeMap::new();
 
         // Open render pass + the transient objects to destroy post-submit.
         struct Active { rp: vk::RenderPass, fb: vk::Framebuffer,
@@ -1022,6 +1030,30 @@ impl MoltenVkBackend {
                         push_bytes.extend_from_slice(&body[4..]);
                     }
                 }
+                FrameOp::BindDescriptors => {
+                    // Storage-buffer descriptor writes carried in
+                    // the frame stream (the multi-dispatch path:
+                    // each pass binds before its Dispatch). Body:
+                    // { set u32, count u32 } + count x 36-byte
+                    // writes { binding, dtype, buffer, image,
+                    // sampler, offset u64, range u64 }.
+                    if body.len() < 8 { continue; }
+                    let count = u32::from_le_bytes(
+                        body[4..8].try_into().unwrap()) as usize;
+                    for w in 0..count {
+                        let off = 8 + w * 36;
+                        if off + 36 > body.len() { break; }
+                        let at = |o: usize| u32::from_le_bytes(
+                            body[off + o..off + o + 4].try_into().unwrap());
+                        let binding = at(0);
+                        let dtype = at(4);
+                        let buffer_id = at(8);
+                        // 7 = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER.
+                        if dtype == 7 && buffer_id != 0 {
+                            stream_binds.insert(binding, buffer_id);
+                        }
+                    }
+                }
                 FrameOp::Dispatch => {
                     end_rp!();
                     if body.len() < 12 { continue; }
@@ -1031,14 +1063,18 @@ impl MoltenVkBackend {
                     let Some(pid) = cur_compute else { continue; };
                     let Some(cp) = compute_pipelines.get(&pid) else { continue; };
                     if self.desc_pool == vk::DescriptorPool::null() { continue; }
-                    // Allocate + write the descriptor set from the
-                    // staged buffer bindings.
-                    let binds: Vec<(u32, u32)> = {
+                    // Merge the legacy out-of-band stash, then build
+                    // the descriptor set from the stream bindings.
+                    {
                         let mut m = self.compute_binds.lock().unwrap();
-                        let mut v: Vec<(u32, u32)> = m.drain().collect();
-                        v.sort_unstable();
-                        v
-                    };
+                        for (b, id) in m.drain() {
+                            stream_binds.insert(b, id);
+                        }
+                    }
+                    let binds: Vec<(u32, u32)> = stream_binds
+                        .iter()
+                        .map(|(b, id)| (*b, *id))
+                        .collect();
                     let set_layouts = [cp.dset_layout];
                     let dset = match unsafe { dev.allocate_descriptor_sets(
                         &vk::DescriptorSetAllocateInfo::default()
@@ -1094,13 +1130,21 @@ impl MoltenVkBackend {
                         }
                         dev.cmd_dispatch(cb, gx, gy, gz);
                         // Make the writes visible to host readback
-                        // (HOST_COHERENT memory + queue-wait below).
+                        // (HOST_COHERENT memory + queue-wait below)
+                        // AND to any chained compute dispatch in
+                        // the same frame (multi-kernel pipelines:
+                        // G-buffer pass -> resolve pass).
                         let barrier = vk::MemoryBarrier::default()
                             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                            .dst_access_mask(vk::AccessFlags::HOST_READ);
+                            .dst_access_mask(
+                                vk::AccessFlags::HOST_READ
+                                    | vk::AccessFlags::SHADER_READ
+                                    | vk::AccessFlags::SHADER_WRITE,
+                            );
                         dev.cmd_pipeline_barrier(cb,
                             vk::PipelineStageFlags::COMPUTE_SHADER,
-                            vk::PipelineStageFlags::HOST,
+                            vk::PipelineStageFlags::HOST
+                                | vk::PipelineStageFlags::COMPUTE_SHADER,
                             vk::DependencyFlags::empty(),
                             &[barrier], &[], &[]);
                     }

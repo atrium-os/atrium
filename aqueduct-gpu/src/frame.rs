@@ -675,6 +675,34 @@ impl FrameBuilder {
         self.push(FrameOp::Dispatch, &cmd.to_bytes())
     }
 
+    /// Encode and append a [`FrameOp::BindDescriptors`] record
+    /// binding storage buffers (descriptor type 7) on set 0 —
+    /// the compute-pass shape: each `(binding, buffer_id)` pair
+    /// applies to every subsequent [`FrameOp::Dispatch`] until
+    /// rebound. Bindings travel IN the frame stream so a
+    /// multi-pass frame (G-buffer pass then resolve pass) can
+    /// give each dispatch its own set.
+    pub fn push_bind_storage_buffers(&mut self, binds: &[(u32, u32)])
+        -> Result<(), FrameDecodeError>
+    {
+        // Body: { set u32, write_count u32 } then per write
+        // { binding u32, dtype u32, buffer u32, image u32,
+        //   sampler u32, offset u64, range u64 } = 36 bytes.
+        let mut body = Vec::with_capacity(8 + 36 * binds.len());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&(binds.len() as u32).to_le_bytes());
+        for (binding, buffer_id) in binds {
+            body.extend_from_slice(&binding.to_le_bytes());
+            body.extend_from_slice(&7u32.to_le_bytes()); // STORAGE_BUFFER
+            body.extend_from_slice(&buffer_id.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes()); // image
+            body.extend_from_slice(&0u32.to_le_bytes()); // sampler
+            body.extend_from_slice(&0u64.to_le_bytes()); // offset
+            body.extend_from_slice(&0u64.to_le_bytes()); // range (whole)
+        }
+        self.push(FrameOp::BindDescriptors, &body)
+    }
+
     /// Encode and append a [`FrameOp::BindDepthAttachment`] record.
     pub fn push_bind_depth_attachment(&mut self, cmd: BindDepthAttachmentCmd)
         -> Result<(), FrameDecodeError>
