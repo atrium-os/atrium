@@ -130,7 +130,7 @@ pub fn compile(module: &Module, target: Target) -> Result<CompileOutput, Backend
     let mut pcmap = atrium_spv_pcmap::Builder::new();
 
     for func in &module.functions {
-        let (body, pc_entries) = emit_function(func)?;
+        let (body, pc_entries) = emit_function_auto(func)?;
         let symbol_name = exported_symbol_name(func);
 
         let sym = obj.add_symbol(object::write::Symbol {
@@ -207,7 +207,7 @@ pub fn compile_blob(module: &Module, target: Target)
     let mut entries = atrium_spv_blob::EntryOffsets::default();
 
     for func in &module.functions {
-        let (body, pc_entries) = emit_function(func)?;
+        let (body, pc_entries) = emit_function_auto(func)?;
         // Each body is a whole number of 4-byte ARM64
         // instructions, so concatenating keeps every
         // function — and therefore every entry offset —
@@ -276,9 +276,47 @@ pub fn compile_blob(module: &Module, target: Target)
 /// one per lowered IR instruction, recorded in codegen-
 /// walk order so their host offsets are already monotone
 /// non-decreasing.
-fn emit_function(
+/// Fast path first; on V-reg exhaustion retry with scalar
+/// spilling. SSA immutability makes slots write-once (stored at
+/// definition), so EVICTION emits no code — only reloads (`ldr d`)
+/// and def-stores (`str d`) cost instructions, and only shaders
+/// that actually exhaust the file pay them.
+fn emit_function_auto(
     func: &Function,
 ) -> Result<(Vec<u8>, Vec<(u32, u32)>), BackendError> {
+    // Testing lever: force spill mode so SMALL kernels (the
+    // whole differential suite) exercise the spill machinery.
+    if std::env::var("ATRIUM_SPV_FORCE_SPILL").is_ok() {
+        return emit_function(func, true);
+    }
+    match emit_function(func, false) {
+        Err(BackendError::Unsupported(m))
+            if m.contains("ran out of V-regs")
+                || m.contains("ran out of W-regs")
+                || m.contains("Bool W-regs")
+                || m.contains("allocating Phi dest")
+                || m.contains("allocating Bool Phi dest") =>
+            emit_function(func, true),
+        r => r,
+    }
+}
+
+fn emit_function(
+    func: &Function,
+    spill_mode: bool,
+) -> Result<(Vec<u8>, Vec<(u32, u32)>), BackendError> {
+    // Split conditional edges into Phi-bearing blocks first; the
+    // rest of codegen then only ever places phi-moves on
+    // unconditional edges.
+    let split;
+    let (func, stub_placements): (&Function, Vec<(BlockId, BlockId)>) =
+        match split_critical_edges(func) {
+            Some((f, p)) => {
+                split = f;
+                (&split, p)
+            }
+            None => (func, Vec::new()),
+        };
     // Compute is enabled with the AAPCS64 9-param signature
     // (uniforms@X0, push_constants@X1, out_buffer@X2,
     // wg_id[xyz]@W3..W5, local_id[xy]@W6..W7, local_id[z]
@@ -312,6 +350,27 @@ fn emit_function(
     // accumulator V-regs + 1 temp V-reg = 5 V-regs
     // simultaneous, comfortably under the budget.
     let mut matrices_ptr: HashMap<ValueId, (asm::Xreg, i32)> = HashMap::new();
+    // Int-element vector Loads (e.g. a push-constant uint4) are
+    // DEFERRED like Mat4: record (base reg, byte offset) and let
+    // each VectorExtract `ldr w` its lane directly — zero W-regs
+    // held between load and use (materialised lanes pinned the
+    // 15-reg W file; measured on Orbis's terrain kernel).
+    let mut int_vec_ptr: HashMap<ValueId, (asm::Xreg, i32)> = HashMap::new();
+    // Deferred dynamic pointers (spill mode): PtrOffsetDynamic
+    // emits NOTHING; consumers materialise base+index<<k into the
+    // X9 scratch at the access. Addresses are one shift+add —
+    // cheaper to recompute than to keep resident (they pinned
+    // most of the W file on big kernels, and as X-views in the
+    // `pointers` map they were invisible to int eviction).
+    let mut deferred_ptr: HashMap<ValueId, (asm::Xreg, i32, ValueId, u8)> =
+        HashMap::new();
+    // Compute uvec3 builtins, lowered once per KIND: spirv-opt
+    // emits a LoadBuiltin per use site, and each lowering kept 3
+    // immortal W-lanes (synth ids have no last_use) — several
+    // uses exhausted the 15-reg W file. Cache the lane Values;
+    // repeat loads alias the same registers. (Also a fast-path
+    // win: no recompute.)
+    let mut builtin_lane_cache: HashMap<u8, Vec<Value>> = HashMap::new();
     // NEON-packed vec4 values: the whole vector in one
     // Q-register, driven with `.4s` ops. A vec4 ValueId is
     // in *either* `vectors` (per-lane) or `packed`, never
@@ -340,6 +399,8 @@ fn emit_function(
     // scratch via `fmov w, s` — no memory traffic, and the
     // contended W pool stays for ints (32 V-regs vs 15 W).
     let mut bool_in_v: HashMap<ValueId, asm::Vreg> = HashMap::new();
+    // Spill-resident bool Phi dests: ValueId -> slot index.
+    let mut bool_in_slot: HashMap<ValueId, u32> = HashMap::new();
     let mut bool_owners: HashMap<u8, ValueId> = HashMap::new();
     let mut bool_free: Vec<u8> = vec![12, 11, 10]; // pop hands out W10 first
     // Set by a comparison whose result feeds only the
@@ -397,6 +458,15 @@ fn emit_function(
     let mut block_order: Vec<BlockId> =
         func.blocks.keys().copied().collect();
     block_order.sort_by_key(|b| b.0);
+    // Edge stubs sit right AFTER their from-block in flat order —
+    // sorted-by-id would dump them at the end and extend every
+    // phi-move source's flat live range to the whole function.
+    for (stub, from) in &stub_placements {
+        block_order.retain(|b| b != stub);
+        if let Some(pos) = block_order.iter().position(|b| b == from) {
+            block_order.insert(pos + 1, *stub);
+        }
+    }
 
     // Flat-index → (BlockId, intra-block-index). Inverse
     // map: per-block-start flat index. Also the flat
@@ -422,6 +492,22 @@ fn emit_function(
     // ── Pre-pass: live-range analysis on the flat stream ───
     let (mut last_use, use_counts) = compute_last_use_flat(
         &flat_insts, &block_term_idx, &block_flat_start);
+
+    // ── Scalar spill state (active only in spill_mode) ────────
+    // spilled    = values currently slot-only (not in a reg).
+    // spill_slot = ValueId → slot index (8 bytes/slot, write-
+    //              once at def: SSA values never change).
+    let mut spilled: std::collections::HashSet<ValueId> =
+        std::collections::HashSet::new();
+    let mut spilled_w: std::collections::HashSet<ValueId> =
+        std::collections::HashSet::new();
+    let mut spill_slot: HashMap<ValueId, u32> = HashMap::new();
+    let mut spill_next: u32 = 0;
+    // Dead values' slots recycle through a free list — the live-
+    // slot peak is what bounds the frame, not total defs.
+    let mut spill_free: Vec<u32> = Vec::new();
+
+    const SPILL_SLOT_CAP: u32 = 1000; // 8000 B / two sub-imm12 insts
 
     // Flat index of each result value's defining inst —
     // Phi-move coalescing uses it to locate a Phi arm's
@@ -864,6 +950,10 @@ fn emit_function(
     let mut phi_meta_v: HashMap<u8, (ValueId, usize)> = HashMap::new();
     let mut phi_meta_w: HashMap<u8, (ValueId, usize)> = HashMap::new();
 
+    // Spill-mode phi caps: leave the working set evictable regs.
+    const PHI_V_CAP: usize = 9999;
+    let mut phi_v_resident: usize = 0;
+    let mut phi_slot_floats: Vec<ValueId> = Vec::new();
     for (start, end, bid, inst) in &phi_recs {
         let (start, end) = (*start, *end);
         let arms = match &inst.op {
@@ -875,8 +965,10 @@ fn emit_function(
 
         // Release actives whose interval ended before this
         // phi starts — their regs become preferred slots.
+        let share_disabled =
+            std::env::var("ATRIUM_SPV_NO_PHI_SHARE").is_ok();
         phi_active.retain(|(aend, regs)| {
-            if *aend < start {
+            if *aend < start && !share_disabled {
                 for (class, n) in regs {
                     if *class == 0 { phi_avail_v.push(*n); }
                     else { phi_avail_w.push(*n); }
@@ -890,17 +982,39 @@ fn emit_function(
 
         let dest = match &result.ty {
                 Type::F32 => {
-                    let n = phi_avail_v.pop()
-                        .or_else(|| free_pool.pop())
-                        .ok_or_else(|| BackendError::Unsupported(
-                            "out of V-regs allocating Phi dest".into()))?;
-                    if n < 16 { used_callee_saved_v = true; }
-                    let m = phi_meta_v.entry(n).or_insert((result.id, end));
-                    *m = (result.id, m.1.max(end));
-                    regs_this.push((0, n));
-                    let v = asm::Vreg(n);
-                    scalars.insert(result.id, v);
-                    PhiDest::Float(v)
+                    // Cap reg-resident phi dests in spill mode so
+                    // the working set keeps evictable registers;
+                    // overflow goes to spill-resident slots.
+                    let reg = if !spill_mode
+                        || phi_v_resident < PHI_V_CAP
+                    {
+                        phi_avail_v.pop().or_else(|| free_pool.pop())
+                    } else { None };
+                    if let Some(n) = reg {
+                        if n < 16 { used_callee_saved_v = true; }
+                        phi_v_resident += 1;
+                        let m = phi_meta_v.entry(n)
+                            .or_insert((result.id, end));
+                        *m = (result.id, m.1.max(end));
+                        regs_this.push((0, n));
+                        let v = asm::Vreg(n);
+                        scalars.insert(result.id, v);
+                        PhiDest::Float(v)
+                    } else if spill_mode {
+                        let slot = spill_next;
+                        spill_next += 1;
+                        if slot >= SPILL_SLOT_CAP {
+                            return Err(BackendError::Unsupported(
+                                "spill area exhausted (phi)".into()));
+                        }
+                        spill_slot.insert(result.id, slot);
+                        spilled.insert(result.id);
+                        phi_slot_floats.push(result.id);
+                        PhiDest::FloatSpill(slot)
+                    } else {
+                        return Err(BackendError::Unsupported(
+                            "out of V-regs allocating Phi dest".into()));
+                    }
                 }
                 Type::I32 | Type::U32 => {
                     let n = phi_avail_w.pop()
@@ -920,9 +1034,21 @@ fn emit_function(
                 // dest lives in the `bools` map — that's where
                 // Select / BranchCond resolve their conditions.
                 Type::Bool => {
-                    if let Some(n) = phi_avail_w.pop()
-                        .or_else(|| int_pool.free.pop())
-                    {
+                    // In spill mode, prefer the V side outright:
+                    // bool phi dests are PINNED (regs baked into
+                    // the move tables, unevictable), and the
+                    // 15-reg W file can't afford ~20 pinned bools
+                    // once ints also need eviction headroom. The
+                    // 32-reg V file + scalar spilling absorbs
+                    // them; fast path keeps W-first (no spilling,
+                    // W pressure is the cheaper move there).
+                    let w_first = if spill_mode {
+                        None
+                    } else {
+                        phi_avail_w.pop()
+                            .or_else(|| int_pool.free.pop())
+                    };
+                    if let Some(n) = w_first {
                         if n >= 19 { int_pool.used_callee_saved = true; }
                         let m = phi_meta_w.entry(n).or_insert((result.id, end));
                         *m = (result.id, m.1.max(end));
@@ -931,20 +1057,39 @@ fn emit_function(
                         bools.insert(result.id, w);
                         PhiDest::Bool(w)
                     } else {
-                        // W pool exhausted: overflow this bool
-                        // into the V-class (SIMD-reg spill —
-                        // fmov w<->s, no memory traffic).
-                        let n = phi_avail_v.pop()
-                            .or_else(|| free_pool.pop())
-                            .ok_or_else(|| BackendError::Unsupported(
-                                "out of W- AND V-regs allocating                                  Bool Phi dest".into()))?;
-                        if n < 16 { used_callee_saved_v = true; }
-                        let m = phi_meta_v.entry(n).or_insert((result.id, end));
-                        *m = (result.id, m.1.max(end));
-                        regs_this.push((0, n));
-                        let v = asm::Vreg(n);
-                        bool_in_v.insert(result.id, v);
-                        PhiDest::BoolV(v)
+                        // W exhausted: V-class next (fmov w<->s,
+                        // no memory), then spill-resident slots
+                        // once the V cap is hit too.
+                        let reg = if !spill_mode
+                            || phi_v_resident < PHI_V_CAP
+                        {
+                            phi_avail_v.pop().or_else(|| free_pool.pop())
+                        } else { None };
+                        if let Some(n) = reg {
+                            if n < 16 { used_callee_saved_v = true; }
+                            phi_v_resident += 1;
+                            let m = phi_meta_v.entry(n)
+                                .or_insert((result.id, end));
+                            *m = (result.id, m.1.max(end));
+                            regs_this.push((0, n));
+                            let v = asm::Vreg(n);
+                            bool_in_v.insert(result.id, v);
+                            PhiDest::BoolV(v)
+                        } else if spill_mode {
+                            let slot = spill_next;
+                            spill_next += 1;
+                            if slot >= SPILL_SLOT_CAP {
+                                return Err(BackendError::Unsupported(
+                                    "spill area exhausted (phi)".into()));
+                            }
+                            spill_slot.insert(result.id, slot);
+                            bool_in_slot.insert(result.id, slot);
+                            PhiDest::BoolSpill(slot)
+                        } else {
+                            return Err(BackendError::Unsupported(
+                                "out of W- AND V-regs allocating \
+                                 Bool Phi dest".into()));
+                        }
                     }
                 }
                 // A vecN-f32 Phi is N per-lane scalar Phis
@@ -1074,7 +1219,8 @@ fn emit_function(
                         | Op::FMul(..) | Op::FDiv(..)),
                     // Bool producers are compares/logic, not the
                     // coalesce-aware binop emitters: never coalesce.
-                    PhiDest::Bool(_) | PhiDest::BoolV(_) => false,
+                    PhiDest::Bool(_) | PhiDest::BoolV(_)
+                    | PhiDest::FloatSpill(_) | PhiDest::BoolSpill(_) => false,
                 };
                 if !op_ok { continue; }
                 // `src` single-use (only the phi-move reads it).
@@ -1117,6 +1263,11 @@ fn emit_function(
         let e = last_use.entry(*owner).or_insert(*end);
         *e = (*e).max(*end);
     }
+    // Phi dest regs are baked into phi_moves — never evict a
+    // value owned by a phi (covers float/vec-lane/boolV dests).
+    let phi_pinned: std::collections::HashSet<ValueId> =
+        phi_meta_v.values().chain(phi_meta_w.values())
+            .map(|(o, _)| *o).collect();
 
     // Record where each block starts in the asm byte
     // stream so branches can be patched after the full
@@ -1151,7 +1302,12 @@ fn emit_function(
     // both, or neither may be real; unused slots stay NOPs.
     const PROLOGUE_INT_INSTS: usize = 5;
     const PROLOGUE_FP_INSTS: usize = 4;
-    const PROLOGUE_INSTS: usize = PROLOGUE_INT_INSTS + PROLOGUE_FP_INSTS;
+    /// Two slots for the spill-area `sub sp` / `add sp` pair
+    /// (each imm12 <= 4095; two cover 8190 B = 1023 slots; NOPs
+    /// when unused).
+    const PROLOGUE_SPILL_INSTS: usize = 2;
+    const PROLOGUE_INSTS: usize =
+        PROLOGUE_INT_INSTS + PROLOGUE_FP_INSTS + PROLOGUE_SPILL_INSTS;
     let prologue_off = a.len();
     for _ in 0..PROLOGUE_INSTS { a.emit(asm::nop()); }
     // Epilogue placeholder offsets — one per `ret`. Each is
@@ -1335,10 +1491,48 @@ fn emit_function(
         a.emit(asm::mov_x(asm::Xreg(19), asm::Xreg(0)));
     }
 
+    // Constant values by id — phi-move source fallback: constant
+    // arms (incl. OpUndef folded to ConstNull by the frontend)
+    // are never materialised into pool registers; the move
+    // materialises the immediate at the edge instead.
+    let mut phi_const_val: HashMap<ValueId, u32> = HashMap::new();
+    for inst in &flat_insts {
+        if let Some(r) = inst.result.as_ref() {
+            match &inst.op {
+                Op::ConstInt { value, .. } =>
+                    { phi_const_val.insert(r.id, *value as u32); }
+                Op::ConstNull =>
+                    { phi_const_val.insert(r.id, 0); }
+                Op::ConstFloat { value, kind: FloatKind::F32 } =>
+                    { phi_const_val.insert(r.id,
+                        (*value as f32).to_bits()); }
+                _ => {}
+            }
+        }
+    }
+
+    // Deferred def-store (spill_mode): the PREVIOUS inst's f32
+    // results are stored to their slots at the head of the NEXT
+    // iteration — arms `continue` freely, and terminators define
+    // nothing, so a def is always followed by another inst in
+    // the same block (stores stay dominated by the def).
+    let mut prev_def_inst: Option<&atrium_spv_ir::Inst> = None;
     let mut flat_i: usize = 0;
     for (block_pos, bid) in block_order.iter().enumerate() {
         let block = func.blocks.get(bid).unwrap();
         block_asm_offset.insert(*bid, a.len());
+        // Spill-resident float phis: any reg-cached copy goes
+        // stale at block boundaries (the slot is rewritten by
+        // predecessor terminators' phi-moves) — drop the cache.
+        if spill_mode && !phi_slot_floats.is_empty() {
+            for pid in &phi_slot_floats {
+                if let Some(v) = scalars.remove(pid) {
+                    owners.remove(&v.0);
+                    free_pool.push(v.0);
+                    spilled.insert(*pid);
+                }
+            }
+        }
         // The block emitted immediately after this one, if
         // any — branch-to-next-block elision drops an
         // unconditional `b` whose target is this block.
@@ -1356,17 +1550,111 @@ fn emit_function(
         // native bytes (Phi, ConstVec, VectorShuffle …)
         // share the next inst's offset — a duplicate
         // host_offset, which the pcmap format allows.
+        if spill_mode {
+            // Recycle slots of values that died (skip ids with no
+            // last_use entry — synthetic lanes — they'd read as
+            // immortal-dead).
+            {
+                let mut dead_slots: Vec<(ValueId, u32)> = spill_slot
+                    .iter()
+                    .filter(|(sid, _)| match last_use.get(sid) {
+                        Some(&lu) => lu < i,
+                        // Synthetic lane: alive while ANY
+                        // containing vector is (lanes alias
+                        // across shuffles/composites).
+                        None => !vectors.iter().any(|(vid, lanes)| {
+                            lanes.iter().any(|l| l.id == **sid)
+                                && last_use.get(vid)
+                                    .is_some_and(|&v| v >= i)
+                        }),
+                    })
+                    .map(|(sid, slot)| (*sid, *slot))
+                    .collect();
+                dead_slots.sort_unstable_by_key(|(_, slot)| *slot);
+                for (sid, slot) in dead_slots {
+                    spill_slot.remove(&sid);
+                    spilled.remove(&sid);
+                    spilled_w.remove(&sid);
+                    spill_free.push(slot);
+                }
+            }
+            if let Some(prev) = prev_def_inst.take() {
+                // (sid, effective last_use): synthetic lane ids
+                // are absent from last_use — they inherit the
+                // parent vector's liveness, else they'd be
+                // skipped as dead and stay unevictable forever.
+                let mut to_store: Vec<(ValueId, usize)> = Vec::new();
+                if let Some(r) = prev.result.as_ref() {
+                    let r_lu = last_use.get(&r.id).copied().unwrap_or(0);
+                    match &r.ty {
+                        Type::F32 | Type::I32 | Type::U32 =>
+                            to_store.push((r.id, r_lu)),
+                        Type::Vec2(_) | Type::Vec3(_) | Type::Vec4(_) => {
+                            if let Some(lanes) = vectors.get(&r.id) {
+                                to_store.extend(lanes.iter().map(|l| (
+                                    l.id,
+                                    last_use.get(&l.id).copied()
+                                        .unwrap_or(r_lu),
+                                )));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for (sid, eff_lu) in to_store {
+                    // Already-dead defs don't need a slot.
+                    if eff_lu < i {
+                        continue;
+                    }
+                    let in_v = scalars.get(&sid).copied();
+                    let in_w = if in_v.is_none() {
+                        ints.get(&sid).copied()
+                    } else { None };
+                    if in_v.is_none() && in_w.is_none() { continue; }
+
+                    let slot = *spill_slot.entry(sid)
+                        .or_insert_with(|| {
+                            spill_free.pop().unwrap_or_else(|| {
+                                let sl = spill_next;
+                                spill_next += 1;
+                                sl
+                            })
+                        });
+                    if slot >= SPILL_SLOT_CAP {
+                        return Err(BackendError::Unsupported(
+                            "spill area exhausted (1000 slots)".into()));
+                    }
+                    if let Some(v) = in_v {
+                        a.emit(asm::str_d_offset(
+                            v, asm::Xreg(31), (slot as u16) * 8));
+                    } else if let Some(w) = in_w {
+                        a.emit(asm::str_w_offset(
+                            w, asm::Xreg(31), (slot as u16) * 8));
+                    }
+                }
+            }
+            prev_def_inst = Some(inst);
+        }
         pcmap_entries.push((a.len() as u32, inst.source_spirv_offset));
         // Expire scalars whose last_use < i. Their V-regs
         // return to the free pool. Drain into a temp Vec
         // first to dodge the borrow checker.
-        let dead: Vec<u8> = owners.iter()
+        let mut dead: Vec<u8> = owners.iter()
             .filter_map(|(n, id)|
                 if last_use.get(id).copied().unwrap_or(usize::MAX) < i {
                     Some(*n)
                 } else { None })
             .collect();
+        // Deterministic pool order: HashMap iteration must not
+        // leak into allocation order (content-addressed shaders
+        // need bit-identical codegen).
+        dead.sort_unstable();
         for n in dead {
+            if n == 30 && std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok() {
+                eprintln!("V30 EXPIRED at i={i} owner={:?} lu={:?}",
+                    owners.get(&n), owners.get(&n)
+                        .and_then(|id| last_use.get(id)));
+            }
             owners.remove(&n);
             free_pool.push(n);
         }
@@ -1391,12 +1679,13 @@ fn emit_function(
         // result that aliased the same V-reg (the matrix
         // tests were the canary -- pre-copy, this expire
         // corrupted MatrixTimesVector accumulators).
-        let dead_vecs: Vec<ValueId> = vectors.iter()
+        let mut dead_vecs: Vec<ValueId> = vectors.iter()
             .filter_map(|(top, _)|
                 if last_use.get(top).copied().unwrap_or(usize::MAX) < i {
                     Some(*top)
                 } else { None })
             .collect();
+        dead_vecs.sort_unstable_by_key(|v| v.0);
         for top in dead_vecs {
             if let Some(lanes) = vectors.remove(&top) {
                 for lane in lanes {
@@ -1422,9 +1711,16 @@ fn emit_function(
                             //       `vectors`).
                             let still_referenced = vectors.values()
                                 .any(|ls| ls.iter().any(|v| v.id == lane.id));
+                            // Missing last_use = SYNTHETIC lane:
+                            // reachable only through `vectors`,
+                            // which guard (1) just checked — treat
+                            // as dead, not immortal. (unwrap_or
+                            // MAX pinned every dead chain's lane
+                            // regs forever; the 24-V-reg example
+                            // in the comment above was never
+                            // actually fixed for synth ids.)
                             let lane_alive = last_use.get(&lane.id)
-                                .copied()
-                                .unwrap_or(usize::MAX) >= i;
+                                .is_some_and(|&lu| lu >= i);
                             if !(still_referenced || lane_alive) {
                                 owners.remove(&vreg.0);
                                 free_pool.push(vreg.0);
@@ -1439,12 +1735,13 @@ fn emit_function(
         int_pool.expire(i, &last_use);
         // And for the bool W-pool: free slots whose owner's
         // last_use is in the past.
-        let dead_bools: Vec<u8> = bool_owners.iter()
+        let mut dead_bools: Vec<u8> = bool_owners.iter()
             .filter_map(|(n, id)|
                 if last_use.get(id).copied().unwrap_or(usize::MAX) < i {
                     Some(*n)
                 } else { None })
             .collect();
+        dead_bools.sort_unstable();
         for n in dead_bools {
             if let Some(id) = bool_owners.remove(&n) {
                 bools.remove(&id);
@@ -1497,6 +1794,116 @@ fn emit_function(
             Some(PhiDest::Int(w)) => Some(*w),
             _ => None,
         };
+
+        // ── spill mode: int reloads + W-pool headroom relief ──
+        // Reload spilled ints this inst reads, then evict
+        // far-future slot-valid ints until the pool has enough
+        // headroom for any arm's internal allocations (the int
+        // emit helpers allocate without spill awareness).
+        if spill_mode {
+            if !spilled_w.is_empty() {
+                let mut need: Vec<ValueId> = spilled_w.iter()
+                    .filter(|id| op_reads(&inst.op, **id))
+                    .copied().collect();
+                need.sort_by_key(|v| v.0);
+                for (vid, lanes) in &vectors {
+                    if op_reads(&inst.op, *vid) {
+                        need.extend(lanes.iter()
+                            .map(|l| l.id)
+                            .filter(|lid| spilled_w.contains(lid)));
+                    }
+                }
+                // A deferred pointer's index is read wherever the
+                // POINTER is read (the consumer re-materialises
+                // the address from it).
+                for (pid, (_, _, idx_id, _)) in &deferred_ptr {
+                    if op_reads(&inst.op, *pid)
+                        && spilled_w.contains(idx_id)
+                    {
+                        need.push(*idx_id);
+                    }
+                }
+                for id in need {
+                    let slot = *spill_slot.get(&id).ok_or_else(||
+                        BackendError::Internal(format!(
+                            "int reload of {id:?} without slot")))?;
+                    if int_pool.free.is_empty()
+                        && !wevict_one(&mut int_pool, &mut ints,
+                            &mut spilled_w, &spill_slot, &vectors, &deferred_ptr,
+                            &last_use, &phi_pinned, &inst.op)
+                    {
+                        return Err(BackendError::Unsupported(
+                            "W pressure with no spillable victim".into()));
+                    }
+                    let w = int_pool.alloc(id)?;
+                    a.emit(asm::ldr_w_offset(
+                        w, asm::Xreg(31), (slot as u16) * 8));
+                    ints.insert(id, w);
+                    spilled_w.remove(&id);
+                }
+            }
+            const W_HEADROOM: usize = 8;
+            while int_pool.free.len() < W_HEADROOM {
+                if !wevict_one(&mut int_pool, &mut ints,
+                    &mut spilled_w, &spill_slot, &vectors, &deferred_ptr,
+                    &last_use, &phi_pinned, &inst.op)
+                {
+                    if std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok()
+                        && int_pool.free.len() < 8
+                    {
+                        let mut d = String::new();
+                        for (n, oid) in &int_pool.owners {
+                            d.push_str(&format!(
+                                "W{n}:{:?}p{}s{}i{}r{}; ", oid,
+                                phi_pinned.contains(oid) as u8,
+                                spill_slot.contains_key(oid) as u8,
+                                (ints.get(oid) == Some(&asm::Wreg(*n))) as u8,
+                                op_reads(&inst.op, *oid) as u8));
+                        }
+                        eprintln!("W-STALL i={i} free={} op={:?} [{d}]",
+                            int_pool.free.len(), inst.op);
+                    }
+                    break; // nothing evictable; arms may still fit
+                }
+            }
+            // Same for the V file: the FP emit helpers allocate
+            // internally without spill awareness, so keep enough
+            // headroom for any arm (vec ops want up to 8 lanes).
+            const V_HEADROOM: usize = 10;
+            while free_pool.len() < V_HEADROOM {
+                if !vevict_one(&mut free_pool, &mut owners,
+                    &mut scalars, &mut spilled, &spill_slot,
+                    &vectors, &last_use, &phi_pinned, &inst.op)
+                {
+                    break;
+                }
+            }
+        }
+
+        // ── spill mode: reload this inst's spilled operands ──
+        // (directly read values + lanes of read vectors). Runs
+        // after expire so freed regs are preferred; `ldr`
+        // preserves NZCV, so compare→branch fusion is safe.
+        if spill_mode && !spilled.is_empty() {
+            let mut need: Vec<ValueId> = spilled.iter()
+                .filter(|id| op_reads(&inst.op, **id))
+                .copied()
+                .collect();
+            need.sort_by_key(|v| v.0);
+            for (vid, lanes) in &vectors {
+                if op_reads(&inst.op, *vid) {
+                    need.extend(lanes.iter()
+                        .map(|l| l.id)
+                        .filter(|lid| spilled.contains(lid)));
+                }
+            }
+            for id in need {
+                vread_impl(&mut a, &mut free_pool, &mut owners,
+                    &mut used_callee_saved_v, &mut scalars,
+                    &mut spilled, &spill_slot, &vectors, &last_use,
+                    &phi_pinned, spill_mode, &inst.op, id)?;
+            }
+        }
 
         match &inst.op {
             Op::ConstInt { value, kind: _ } => {
@@ -1616,8 +2023,7 @@ fn emit_function(
                     BackendError::Internal("PackHalf2x16 lane 1 missing".into()))?;
                 let synth = ValueId(next_synth_id);
                 next_synth_id += 1;
-                let tv = alloc_vreg(&mut free_pool, &mut owners,
-                    &mut used_callee_saved_v, synth)?;
+                let tv = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth)?;
                 let d_w = alloc_int_w(&mut int_pool, result.id)?;
                 // lane 0 -> d_w (fcvt zeroes the upper 16).
                 a.emit(asm::fcvt_h_from_s(tv, s0));
@@ -1640,14 +2046,11 @@ fn emit_function(
                     BackendError::Internal(format!(
                         "UnpackHalf2x16 operand {:?} not in ints", v.id)))?;
                 let synth0 = ValueId(next_synth_id); next_synth_id += 1;
-                let v0 = alloc_vreg(&mut free_pool, &mut owners,
-                    &mut used_callee_saved_v, synth0)?;
+                let v0 = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth0)?;
                 let synth1 = ValueId(next_synth_id); next_synth_id += 1;
-                let v1 = alloc_vreg(&mut free_pool, &mut owners,
-                    &mut used_callee_saved_v, synth1)?;
+                let v1 = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth1)?;
                 let synth_t = ValueId(next_synth_id); next_synth_id += 1;
-                let tv = alloc_vreg(&mut free_pool, &mut owners,
-                    &mut used_callee_saved_v, synth_t)?;
+                let tv = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth_t)?;
                 // lane 0: fcvt reads the low 16 of the bridge.
                 a.emit(asm::fmov_s_from_w(tv, s_w));
                 a.emit(asm::fcvt_s_from_h(v0, tv));
@@ -1666,34 +2069,95 @@ fn emit_function(
             }
             // Integer comparisons → Bool W-reg.
             Op::IEq(l, r) => emit_icmp_to_bool(
-                &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
-                &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Eq)?,
+                &mut a,
+                &mut BoolOverflow {
+                    bool_in_slot: &mut bool_in_slot,
+                    spill_next: &mut spill_next,
+                    spill_free: &mut spill_free,
+                    spill_mode,
+                }, &ints, &mut bools, &mut bool_owners, &mut bool_free,
+                &mut fused_branch, fuse_eligible, inst, l, r,
+                asm::Cond::Eq)?,
             Op::INe(l, r) => emit_icmp_to_bool(
-                &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
+                &mut a,
+                &mut BoolOverflow {
+                    bool_in_slot: &mut bool_in_slot,
+                    spill_next: &mut spill_next,
+                    spill_free: &mut spill_free,
+                    spill_mode,
+                }, &ints, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Ne)?,
             Op::SLt(l, r) => emit_icmp_to_bool(
-                &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
+                &mut a,
+                &mut BoolOverflow {
+                    bool_in_slot: &mut bool_in_slot,
+                    spill_next: &mut spill_next,
+                    spill_free: &mut spill_free,
+                    spill_mode,
+                }, &ints, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Lt)?,
             Op::SLe(l, r) => emit_icmp_to_bool(
-                &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
+                &mut a,
+                &mut BoolOverflow {
+                    bool_in_slot: &mut bool_in_slot,
+                    spill_next: &mut spill_next,
+                    spill_free: &mut spill_free,
+                    spill_mode,
+                }, &ints, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Le)?,
             Op::SGt(l, r) => emit_icmp_to_bool(
-                &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
+                &mut a,
+                &mut BoolOverflow {
+                    bool_in_slot: &mut bool_in_slot,
+                    spill_next: &mut spill_next,
+                    spill_free: &mut spill_free,
+                    spill_mode,
+                }, &ints, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Gt)?,
             Op::SGe(l, r) => emit_icmp_to_bool(
-                &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
+                &mut a,
+                &mut BoolOverflow {
+                    bool_in_slot: &mut bool_in_slot,
+                    spill_next: &mut spill_next,
+                    spill_free: &mut spill_free,
+                    spill_mode,
+                }, &ints, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Ge)?,
             Op::ULt(l, r) => emit_icmp_to_bool(
-                &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
+                &mut a,
+                &mut BoolOverflow {
+                    bool_in_slot: &mut bool_in_slot,
+                    spill_next: &mut spill_next,
+                    spill_free: &mut spill_free,
+                    spill_mode,
+                }, &ints, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Cc)?,
             Op::ULe(l, r) => emit_icmp_to_bool(
-                &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
+                &mut a,
+                &mut BoolOverflow {
+                    bool_in_slot: &mut bool_in_slot,
+                    spill_next: &mut spill_next,
+                    spill_free: &mut spill_free,
+                    spill_mode,
+                }, &ints, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Ls)?,
             Op::UGt(l, r) => emit_icmp_to_bool(
-                &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
+                &mut a,
+                &mut BoolOverflow {
+                    bool_in_slot: &mut bool_in_slot,
+                    spill_next: &mut spill_next,
+                    spill_free: &mut spill_free,
+                    spill_mode,
+                }, &ints, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Hi)?,
             Op::UGe(l, r) => emit_icmp_to_bool(
-                &mut a, &ints, &mut bools, &mut bool_owners, &mut bool_free,
+                &mut a,
+                &mut BoolOverflow {
+                    bool_in_slot: &mut bool_in_slot,
+                    spill_next: &mut spill_next,
+                    spill_free: &mut spill_free,
+                    spill_mode,
+                }, &ints, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, l, r, asm::Cond::Cs)?,
             Op::INeg(s) => {
                 let result = inst.result.as_ref().ok_or_else(||
@@ -1712,7 +2176,7 @@ fn emit_function(
                 let s_w = *ints.get(&s.id).ok_or_else(||
                     BackendError::Internal(format!(
                         "ConvertSToF operand {:?} not in ints", s.id)))?;
-                let d_v = alloc_vreg(&mut free_pool, &mut owners, &mut used_callee_saved_v,result.id)?;
+                let d_v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
                 a.emit(asm::scvtf_s_from_w(d_v, s_w));
                 scalars.insert(result.id, d_v);
             }
@@ -1734,17 +2198,28 @@ fn emit_function(
                 } else {
                     None
                 };
+                let from_bool_slot = if ints.get(&s.id).is_none()
+                    && from_bools.is_none() && from_bool_v.is_none()
+                {
+                    bool_in_slot.get(&s.id).copied()
+                } else {
+                    None
+                };
                 if let Some(v) = from_bool_v {
                     a.emit(asm::fmov_w_from_s(w_tmp, v));
+                } else if let Some(slot) = from_bool_slot {
+                    a.emit(asm::ldr_w_offset(w_tmp,
+                        asm::Xreg(31), (slot as u16) * 8));
                 }
                 let s_w = ints.get(&s.id).copied()
                     .or(from_bools)
                     .or(from_bool_v.map(|_| w_tmp))
+                    .or(from_bool_slot.map(|_| w_tmp))
                     .ok_or_else(|| BackendError::Internal(format!(
                         "ConvertUToF operand {:?} not in ints, bools, \
-                         or bool_in_v",
+                         bool_in_v, or bool_in_slot",
                         s.id)))?;
-                let d_v = alloc_vreg(&mut free_pool, &mut owners, &mut used_callee_saved_v,result.id)?;
+                let d_v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
                 a.emit(asm::ucvtf_s_from_w(d_v, s_w));
                 scalars.insert(result.id, d_v);
                 // Eager-free the bool W-reg if the bool was
@@ -1756,7 +2231,14 @@ fn emit_function(
                 // (e.g. 2 sign + 2 step = 6 bools, but only
                 // 3 slots).  Return the slot to bool_free
                 // so subsequent allocs reuse it.
-                if from_bools.is_some() {
+                // Free the bool's W-pool reg only when this
+                // conversion is its SOLE consumer — the bool may
+                // also feed a phi arm or a later Select (latent
+                // bug exposed by spill-mode shaders: the phi-move
+                // found its source freed).
+                if from_bools.is_some()
+                    && use_counts.get(&s.id).copied() == Some(1)
+                {
                     if let Some(w_freed) = bools.remove(&s.id) {
                         bool_owners.remove(&w_freed.0);
                         bool_free.push(w_freed.0);
@@ -1806,8 +2288,7 @@ fn emit_function(
                 match (to_float, src_in_ints, src_in_scalars) {
                     (true, true, _) => {
                         let s_w = *ints.get(&s.id).unwrap();
-                        let d_v = alloc_vreg(&mut free_pool, &mut owners,
-                            &mut used_callee_saved_v, result.id)?;
+                        let d_v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
                         a.emit(asm::fmov_s_from_w(d_v, s_w));
                         scalars.insert(result.id, d_v);
                     }
@@ -1838,8 +2319,7 @@ fn emit_function(
                         // copy via fmov rather than alias for
                         // the same liveness-correctness reason.
                         let s_v = *scalars.get(&s.id).unwrap();
-                        let d_v = alloc_vreg(&mut free_pool, &mut owners,
-                            &mut used_callee_saved_v, result.id)?;
+                        let d_v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
                         a.emit(asm::fmov_s(d_v, s_v));
                         scalars.insert(result.id, d_v);
                     }
@@ -1851,6 +2331,12 @@ fn emit_function(
             Op::ConstFloat { value, kind: FloatKind::F32 } => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("ConstFloat without result".into()))?;
+                if std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok() {
+                    eprintln!("CF {:?} v={} dead={} uc={:?}",
+                        result.id, value,
+                        dead_const_floats.contains(&result.id),
+                        use_counts.get(&result.id));
+                }
                 // Dead — only used by pool-eligible ConstVecs,
                 // which read the literal pool instead. Skip
                 // the materialise to drop the prologue cost.
@@ -1865,7 +2351,7 @@ fn emit_function(
                     continue;
                 }
                 let bits = (*value as f32).to_bits();
-                let v = alloc_vreg(&mut free_pool, &mut owners, &mut used_callee_saved_v,result.id)?;
+                let v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
                 materialise_u32_into_w(&mut a, w_tmp, bits);
                 a.emit(asm::fmov_s_from_w(v, w_tmp));
                 scalars.insert(result.id, v);
@@ -1874,8 +2360,7 @@ fn emit_function(
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("ConstVec without result".into()))?;
                 if packed_ids.contains(&result.id) {
-                    let q = alloc_vreg(&mut free_pool, &mut owners,
-                        &mut used_callee_saved_v, result.id)?;
+                    let q = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
                     if let Some(&slot) = constvec_pool_slot.get(&result.id) {
                         // Literal-pool path: one `ldr q,
                         // [pc-rel]` placeholder; imm19 gets
@@ -1919,22 +2404,58 @@ fn emit_function(
             }
             // Float compares → Bool (i32 0/1 in a W-reg).
             Op::FOrdEq(a_v, b_v) => emit_fcmp_to_bool(
-                &mut a, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
+                &mut a,
+                &mut BoolOverflow {
+                    bool_in_slot: &mut bool_in_slot,
+                    spill_next: &mut spill_next,
+                    spill_free: &mut spill_free,
+                    spill_mode,
+                }, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Eq)?,
             Op::FOrdNe(a_v, b_v) => emit_fcmp_to_bool(
-                &mut a, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
+                &mut a,
+                &mut BoolOverflow {
+                    bool_in_slot: &mut bool_in_slot,
+                    spill_next: &mut spill_next,
+                    spill_free: &mut spill_free,
+                    spill_mode,
+                }, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Ne)?,
             Op::FOrdLt(a_v, b_v) => emit_fcmp_to_bool(
-                &mut a, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
+                &mut a,
+                &mut BoolOverflow {
+                    bool_in_slot: &mut bool_in_slot,
+                    spill_next: &mut spill_next,
+                    spill_free: &mut spill_free,
+                    spill_mode,
+                }, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Mi)?,
             Op::FOrdLe(a_v, b_v) => emit_fcmp_to_bool(
-                &mut a, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
+                &mut a,
+                &mut BoolOverflow {
+                    bool_in_slot: &mut bool_in_slot,
+                    spill_next: &mut spill_next,
+                    spill_free: &mut spill_free,
+                    spill_mode,
+                }, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Ls)?,
             Op::FOrdGt(a_v, b_v) => emit_fcmp_to_bool(
-                &mut a, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
+                &mut a,
+                &mut BoolOverflow {
+                    bool_in_slot: &mut bool_in_slot,
+                    spill_next: &mut spill_next,
+                    spill_free: &mut spill_free,
+                    spill_mode,
+                }, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Gt)?,
             Op::FOrdGe(a_v, b_v) => emit_fcmp_to_bool(
-                &mut a, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
+                &mut a,
+                &mut BoolOverflow {
+                    bool_in_slot: &mut bool_in_slot,
+                    spill_next: &mut spill_next,
+                    spill_free: &mut spill_free,
+                    spill_mode,
+                }, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Ge)?,
             // FUnordNe (a != b, true when either is NaN):
             // after `fcmp`, Z is set only on an ordered-equal
@@ -1942,7 +2463,13 @@ fn emit_function(
             // not-equal".  This is the lowering OpIsNan rides
             // (IsNan(x) == FUnordNe(x, x)).
             Op::FUnordNe(a_v, b_v) => emit_fcmp_to_bool(
-                &mut a, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
+                &mut a,
+                &mut BoolOverflow {
+                    bool_in_slot: &mut bool_in_slot,
+                    spill_next: &mut spill_next,
+                    spill_free: &mut spill_free,
+                    spill_mode,
+                }, &scalars, &mut bools, &mut bool_owners, &mut bool_free,
                 &mut fused_branch, fuse_eligible, inst, a_v, b_v, asm::Cond::Ne)?,
             // OpVectorShuffle: produce a new vector by
             // picking per-output-lane indices into
@@ -1970,7 +2497,7 @@ fn emit_function(
                         // definedness.
                         let synth = ValueId(next_synth_id);
                         next_synth_id += 1;
-                        let v = alloc_vreg(&mut free_pool, &mut owners, &mut used_callee_saved_v,synth)?;
+                        let v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth)?;
                         a.emit(asm::movz_w(w_tmp, 0, 0));
                         a.emit(asm::fmov_s_from_w(v, w_tmp));
                         scalars.insert(synth, v);
@@ -2022,6 +2549,23 @@ fn emit_function(
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal(
                         "VectorExtract without result".into()))?;
+                if let Some(&(param, base_off)) =
+                    int_vec_ptr.get(&vector.id)
+                {
+                    // Deferred int-vector load: `ldr w` the lane
+                    // straight from its home (push constants /
+                    // uniforms are immutable for the dispatch).
+                    let lane_off = base_off
+                        .saturating_add((*index as usize * 4) as i32);
+                    if lane_off < 0 || lane_off > u16::MAX as i32 {
+                        return Err(BackendError::Unsupported(format!(
+                            "int vec lane offset {lane_off} out of range")));
+                    }
+                    let d = int_pool.alloc(result.id)?;
+                    a.emit(asm::ldr_w_offset(d, param, lane_off as u16));
+                    ints.insert(result.id, d);
+                    continue;
+                }
                 let lanes = vectors.get(&vector.id).cloned().ok_or_else(||
                     BackendError::Unsupported(format!(
                         "VectorExtract source {:?} not a vec", vector.id)))?;
@@ -2030,8 +2574,7 @@ fn emit_function(
                         "VectorExtract index {index} out of range \
                          ({} lanes)", lanes.len())))?;
                 if let Some(s) = scalars.get(&lane.id).copied() {
-                    let d = alloc_vreg(&mut free_pool, &mut owners,
-                        &mut used_callee_saved_v, result.id)?;
+                    let d = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
                     a.emit(asm::mov_v_16b(d, s));
                     scalars.insert(result.id, d);
                 } else if let Some(w) = ints.get(&lane.id).copied() {
@@ -2040,8 +2583,17 @@ fn emit_function(
                     ints.insert(result.id, d);
                 } else {
                     return Err(BackendError::Internal(format!(
-                        "VectorExtract lane {:?} not in scalars or ints",
-                        lane.id)));
+                        "VectorExtract lane {:?} not in scalars or ints; \
+                         spw={} spv={} slot={:?} vec={:?} parents={:?}",
+                        lane.id,
+                        spilled_w.contains(&lane.id),
+                        spilled.contains(&lane.id),
+                        spill_slot.get(&lane.id),
+                        vector.id,
+                        vectors.iter().filter(|(_, ls)| ls.iter()
+                            .any(|l| l.id == lane.id))
+                            .map(|(v, _)| *v).collect::<Vec<_>>())
+                        + &format!(" i={i} curop={:?}", inst.op)));
                 }
             }
             // OpDot: scalar = Σ a_i * b_i. Lowers to one
@@ -2062,7 +2614,7 @@ fn emit_function(
                         l_lanes.len(), r_lanes.len())));
                 }
                 // Accumulator V-reg owned by the final result id.
-                let acc = alloc_vreg(&mut free_pool, &mut owners, &mut used_callee_saved_v,result.id)?;
+                let acc = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
                 // First lane: acc = l[0] * r[0].
                 let l0 = *scalars.get(&l_lanes[0].id).ok_or_else(||
                     BackendError::Internal(format!(
@@ -2081,7 +2633,7 @@ fn emit_function(
                             "Dot lane {i} rhs missing")))?;
                     let tmp_synth = ValueId(next_synth_id);
                     next_synth_id += 1;
-                    let tmp = alloc_vreg(&mut free_pool, &mut owners, &mut used_callee_saved_v,tmp_synth)?;
+                    let tmp = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, tmp_synth)?;
                     a.emit(asm::fmul_s(tmp, li, ri));
                     a.emit(asm::fadd_s(acc, acc, tmp));
                     // tmp dies immediately; manually return
@@ -2162,9 +2714,7 @@ fn emit_function(
                 for i in 0..n_lanes {
                     let acc_id = ValueId(next_synth_id);
                     next_synth_id += 1;
-                    let acc = alloc_vreg(
-                        &mut free_pool, &mut owners,
-                        &mut used_callee_saved_v, acc_id)?;
+                    let acc = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, acc_id)?;
                     let (mat_v, mat_n) = load_mat_lane(
                         &mut a, &mut free_pool, &mut owners,
                         &mut used_callee_saved_v, &mut next_synth_id,
@@ -2195,9 +2745,7 @@ fn emit_function(
                         // tmp = mat_v * vj; acc += tmp.
                         let tmp_synth = ValueId(next_synth_id);
                         next_synth_id += 1;
-                        let tmp = alloc_vreg(
-                            &mut free_pool, &mut owners,
-                            &mut used_callee_saved_v, tmp_synth)?;
+                        let tmp = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, tmp_synth)?;
                         a.emit(asm::fmul_s(tmp, mat_v, vj));
                         a.emit(asm::fadd_s(acc, acc, tmp));
                         // Free both temps.
@@ -2237,7 +2785,7 @@ fn emit_function(
                 // (compute SSBO writes flow through this
                 // path, as do fragment/vertex Output stores).
                 let (ptr_param, base_off) =
-                    resolve_or_make_pointer(ptr, &mut pointers, func.stage)?;
+                    resolve_ptr_spill(&mut a, &deferred_ptr, &ints, &phi_const_val, &inst.op, ptr, &mut pointers, func.stage)?;
                 let base_off_u16: u16 = u16::try_from(base_off)
                     .map_err(|_| BackendError::Unsupported(format!(
                         "Op::Store byte offset {base_off} out of u16 range")))?;
@@ -2256,9 +2804,12 @@ fn emit_function(
                         let sreg = *scalars.get(&lane.id).ok_or_else(||
                             BackendError::Internal(format!(
                                 "lane {:?} not in scalars", lane.id)))?;
-                        a.emit(asm::fmov_w_from_s(w_tmp, sreg));
+                        // Direct FP store — NO W9 staging: when
+                        // ptr_param is the X9 deferred-pointer
+                        // scratch, `fmov w9, s` destroyed the
+                        // base after the first lane.
                         let offset_bytes = base_off_u16 + (lane_i as u16) * 4;
-                        a.emit(asm::str_w_offset(w_tmp, ptr_param, offset_bytes));
+                        a.emit(asm::str_s_offset(sreg, ptr_param, offset_bytes));
                     }
                     continue;
                 }
@@ -2267,10 +2818,10 @@ fn emit_function(
                     a.emit(asm::str_w_offset(w, ptr_param, base_off_u16));
                     continue;
                 }
-                // Scalar f32 store.
+                // Scalar f32 store (direct FP store — see the
+                // lane-store comment re the X9 scratch).
                 if let Some(&sreg) = scalars.get(&value.id) {
-                    a.emit(asm::fmov_w_from_s(w_tmp, sreg));
-                    a.emit(asm::str_w_offset(w_tmp, ptr_param, base_off_u16));
+                    a.emit(asm::str_s_offset(sreg, ptr_param, base_off_u16));
                     continue;
                 }
                 return Err(BackendError::Unsupported(format!(
@@ -2297,18 +2848,14 @@ fn emit_function(
                     let v_src = *packed.get(&x.id).ok_or_else(||
                         BackendError::Internal(format!(
                             "FRINT* packed source {:?} not packed", x.id)))?;
-                    let v_dst = alloc_vreg(
-                        &mut free_pool, &mut owners,
-                        &mut used_callee_saved_v, result.id)?;
+                    let v_dst = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
                     a.emit(pick_v4s(&inst.op, v_dst, v_src));
                     packed.insert(result.id, v_dst);
                 } else if matches!(result.ty, Type::F32) {
                     let v_src = *scalars.get(&x.id).ok_or_else(||
                         BackendError::Internal(format!(
                             "FRINT* source {:?} not in scalars", x.id)))?;
-                    let v_dst = alloc_vreg(
-                        &mut free_pool, &mut owners,
-                        &mut used_callee_saved_v, result.id)?;
+                    let v_dst = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
                     a.emit(pick_s(&inst.op, v_dst, v_src));
                     scalars.insert(result.id, v_dst);
                 } else if let Some(lanes) = vectors.get(&x.id).cloned() {
@@ -2320,9 +2867,7 @@ fn emit_function(
                                 lane.id)))?;
                         let synth = ValueId(next_synth_id);
                         next_synth_id += 1;
-                        let v_dst = alloc_vreg(
-                            &mut free_pool, &mut owners,
-                            &mut used_callee_saved_v, synth)?;
+                        let v_dst = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth)?;
                         a.emit(pick_s(&inst.op, v_dst, src));
                         scalars.insert(synth, v_dst);
                         out_lanes.push(Value { id: synth, ty: lane.ty.clone() });
@@ -2334,7 +2879,7 @@ fn emit_function(
                         result.ty)));
                 }
             }
-            Op::FAbs(x) | Op::FSqrt(x) => {
+            Op::FAbs(x) | Op::FSqrt(x) | Op::FNeg(x) => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("F-unary without result".into()))?;
                 // Packed vec4 (single Q-reg) path.
@@ -2342,12 +2887,11 @@ fn emit_function(
                     let v_src = *packed.get(&x.id).ok_or_else(||
                         BackendError::Internal(format!(
                             "F-unary packed source {:?} not packed", x.id)))?;
-                    let v_dst = alloc_vreg(
-                        &mut free_pool, &mut owners,
-                        &mut used_callee_saved_v, result.id)?;
+                    let v_dst = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
                     let enc = match &inst.op {
                         Op::FAbs(_)  => asm::fabs_v_4s(v_dst, v_src),
                         Op::FSqrt(_) => asm::fsqrt_v_4s(v_dst, v_src),
+                        Op::FNeg(_)  => asm::fneg_v_4s(v_dst, v_src),
                         _ => unreachable!(),
                     };
                     a.emit(enc);
@@ -2356,12 +2900,11 @@ fn emit_function(
                     let v_src = *scalars.get(&x.id).ok_or_else(||
                         BackendError::Internal(format!(
                             "F-unary source {:?} not in scalars", x.id)))?;
-                    let v_dst = alloc_vreg(
-                        &mut free_pool, &mut owners,
-                        &mut used_callee_saved_v, result.id)?;
+                    let v_dst = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
                     let enc = match &inst.op {
                         Op::FAbs(_)  => asm::fabs_s(v_dst, v_src),
                         Op::FSqrt(_) => asm::fsqrt_s(v_dst, v_src),
+                        Op::FNeg(_)  => asm::fneg_s(v_dst, v_src),
                         _ => unreachable!(),
                     };
                     a.emit(enc);
@@ -2379,12 +2922,11 @@ fn emit_function(
                                 lane.id)))?;
                         let synth = ValueId(next_synth_id);
                         next_synth_id += 1;
-                        let v_dst = alloc_vreg(
-                            &mut free_pool, &mut owners,
-                            &mut used_callee_saved_v, synth)?;
+                        let v_dst = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth)?;
                         let enc = match &inst.op {
                             Op::FAbs(_)  => asm::fabs_s(v_dst, src),
                             Op::FSqrt(_) => asm::fsqrt_s(v_dst, src),
+                            Op::FNeg(_)  => asm::fneg_s(v_dst, src),
                             _ => unreachable!(),
                         };
                         a.emit(enc);
@@ -2413,7 +2955,7 @@ fn emit_function(
                     BackendError::Internal(
                         "AccessChain without result".into()))?;
                 let (param, base_off) =
-                    resolve_or_make_pointer(base, &mut pointers, func.stage)?;
+                    resolve_ptr_spill(&mut a, &deferred_ptr, &ints, &phi_const_val, &inst.op, base, &mut pointers, func.stage)?;
                 let new_off = base_off.saturating_add(*byte_offset as i32);
                 pointers.insert(result.id, (param, new_off));
             }
@@ -2422,7 +2964,7 @@ fn emit_function(
                     BackendError::Internal(
                         "AtomicLoad without result".into()))?;
                 let (x_base, base_off) =
-                    resolve_or_make_pointer(ptr, &mut pointers, func.stage)?;
+                    resolve_ptr_spill(&mut a, &deferred_ptr, &ints, &phi_const_val, &inst.op, ptr, &mut pointers, func.stage)?;
                 if base_off < 0 || base_off > u16::MAX as i32 {
                     return Err(BackendError::Unsupported(format!(
                         "AtomicLoad ptr offset {base_off} outside imm12 range")));
@@ -2433,7 +2975,7 @@ fn emit_function(
             }
             Op::AtomicStore { ptr, value } => {
                 let (x_base, base_off) =
-                    resolve_or_make_pointer(ptr, &mut pointers, func.stage)?;
+                    resolve_ptr_spill(&mut a, &deferred_ptr, &ints, &phi_const_val, &inst.op, ptr, &mut pointers, func.stage)?;
                 if base_off < 0 || base_off > u16::MAX as i32 {
                     return Err(BackendError::Unsupported(format!(
                         "AtomicStore ptr offset {base_off} outside imm12 range")));
@@ -2448,7 +2990,7 @@ fn emit_function(
                     BackendError::Internal(
                         "AtomicCompareExchange without result".into()))?;
                 let (x_base, base_off) =
-                    resolve_or_make_pointer(ptr, &mut pointers, func.stage)?;
+                    resolve_ptr_spill(&mut a, &deferred_ptr, &ints, &phi_const_val, &inst.op, ptr, &mut pointers, func.stage)?;
                 if base_off < 0 {
                     return Err(BackendError::Unsupported(format!(
                         "AtomicCompareExchange ptr offset {base_off} negative")));
@@ -2508,7 +3050,7 @@ fn emit_function(
                     BackendError::Internal(
                         "Atomic op without result".into()))?;
                 let (x_base, base_off) =
-                    resolve_or_make_pointer(ptr, &mut pointers, func.stage)?;
+                    resolve_ptr_spill(&mut a, &deferred_ptr, &ints, &phi_const_val, &inst.op, ptr, &mut pointers, func.stage)?;
                 if base_off < 0 {
                     return Err(BackendError::Unsupported(format!(
                         "Atomic ptr offset {base_off} negative")));
@@ -2594,7 +3136,7 @@ fn emit_function(
                     BackendError::Internal(
                         "PtrOffsetDynamic without result".into()))?;
                 let (x_base, base_off) =
-                    resolve_or_make_pointer(base, &mut pointers, func.stage)?;
+                    resolve_ptr_spill(&mut a, &deferred_ptr, &ints, &phi_const_val, &inst.op, base, &mut pointers, func.stage)?;
                 let w_index = *ints.get(&index.id).ok_or_else(||
                     BackendError::Internal(format!(
                         "PtrOffsetDynamic index {:?} not in ints",
@@ -2612,6 +3154,29 @@ fn emit_function(
                 if log2 > 63 {
                     return Err(BackendError::Unsupported(format!(
                         "PtrOffsetDynamic stride 2^{log2} too large")));
+                }
+                if spill_mode {
+                    // Defer: record the recipe; consumers emit
+                    // lsl+add into X9 at the access. Keep the
+                    // index alive (and reloadable) until the
+                    // pointer's LAST READER — pointers are
+                    // deliberately absent from last_use (they
+                    // held no registers pre-spilling), so scan
+                    // for the last consumer explicitly. Without
+                    // this the index expired at this inst and
+                    // its stale `ints` entry aliased whatever
+                    // value the register was re-handed to
+                    // (observed: out_pixels stored AT the pixel
+                    // VALUE as an address — SIGSEGV).
+                    deferred_ptr.insert(result.id,
+                        (x_base, base_off, index.id, log2));
+                    let ptr_lu = flat_insts.iter().enumerate().rev()
+                        .find(|(_, fi)| op_reads(&fi.op, result.id))
+                        .map(|(j, _)| j)
+                        .unwrap_or(i);
+                    let e = last_use.entry(index.id).or_insert(ptr_lu);
+                    *e = (*e).max(ptr_lu);
+                    continue;
                 }
                 // Allocate a fresh int reg for the resulting
                 // address.  Use the IntPool so the lifetime
@@ -2655,6 +3220,19 @@ fn emit_function(
                     (ShaderStage::Fragment, BK::PrimitiveId) => Some(Some(7)),
                     _ => None,
                 };
+                let bk_key: u8 = match kind {
+                    BK::WorkgroupId => 0,
+                    BK::LocalInvocationId => 1,
+                    BK::GlobalInvocationId => 2,
+                    BK::WorkgroupSize => 3,
+                    _ => 255,
+                };
+                if bk_key != 255 {
+                    if let Some(lanes) = builtin_lane_cache.get(&bk_key) {
+                        vectors.insert(result.id, lanes.clone());
+                        continue;
+                    }
+                }
                 let run_compute_match = if let Some(src) = vs_fs_int {
                     let w = int_pool.alloc(result.id)?;
                     match src {
@@ -2944,12 +3522,17 @@ fn emit_function(
                          bespoke path"))),
                 }
                 } // run_compute_match
+                if bk_key != 255 {
+                    if let Some(lanes) = vectors.get(&result.id) {
+                        builtin_lane_cache.insert(bk_key, lanes.clone());
+                    }
+                }
             }
             Op::Load(ptr) => {
                 let result = inst.result.as_ref().ok_or_else(||
                     BackendError::Internal("Load without result".into()))?;
                 let (param, off) =
-                    resolve_or_make_pointer(ptr, &mut pointers, func.stage)?;
+                    resolve_ptr_spill(&mut a, &deferred_ptr, &ints, &phi_const_val, &inst.op, ptr, &mut pointers, func.stage)?;
                 let pointee = match &ptr.ty {
                     Type::Pointer(_, inner) => (**inner).clone(),
                     other => return Err(BackendError::Unsupported(format!(
@@ -2957,8 +3540,7 @@ fn emit_function(
                 };
                 match &pointee {
                     Type::F32 => {
-                        let v = alloc_vreg(
-                            &mut free_pool, &mut owners, &mut used_callee_saved_v,result.id)?;
+                        let v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
                         emit_load_f32_offset(&mut a, w_tmp, param, off, v)?;
                         scalars.insert(result.id, v);
                     }
@@ -2982,26 +3564,44 @@ fn emit_function(
                             _ => unreachable!(),
                         };
                         // Synthesise lane Values + collect
-                        // into vectors[result.id]. Each lane
-                        // gets a fresh S-reg + ldr+fmov.
-                        let mut lanes = Vec::with_capacity(lane_count);
-                        for lane_i in 0..lane_count {
-                            let lane_off = off.saturating_add((lane_i * 4) as i32);
-                            // Synthetic ValueId from the
-                            // dedicated high-range counter
-                            // — collision-free with any IR
-                            // ValueId the frontend assigns.
-                            let synthetic_id = ValueId(next_synth_id);
-                            next_synth_id += 1;
-                            let v = alloc_vreg(
-                                &mut free_pool, &mut owners, &mut used_callee_saved_v,synthetic_id)?;
-                            emit_load_f32_offset(&mut a, w_tmp, param, lane_off, v)?;
-                            scalars.insert(synthetic_id, v);
-                            lanes.push(Value {
-                                id: synthetic_id, ty: Type::F32,
-                            });
+                        // into vectors[result.id]. Lane class
+                        // follows the ELEMENT type: f32 lanes
+                        // ride S-regs; i32/u32 lanes (e.g. a
+                        // push-constant uint4) ride W-regs so
+                        // int consumers (compares/arith via
+                        // VectorExtract) resolve them — the
+                        // same poison the Cranelift backend
+                        // had with F32-hardcoded lanes.
+                        let elem = match &pointee {
+                            Type::Vec2(e) | Type::Vec3(e)
+                            | Type::Vec4(e) => *e,
+                            _ => unreachable!(),
+                        };
+                        let int_lanes = matches!(
+                            elem,
+                            atrium_spv_ir::VecElement::I32
+                                | atrium_spv_ir::VecElement::U32);
+                        if int_lanes {
+                            int_vec_ptr.insert(result.id, (param, off));
+                        } else {
+                            let mut lanes = Vec::with_capacity(lane_count);
+                            for lane_i in 0..lane_count {
+                                let lane_off = off.saturating_add((lane_i * 4) as i32);
+                                // Synthetic ValueId from the
+                                // dedicated high-range counter
+                                // — collision-free with any IR
+                                // ValueId the frontend assigns.
+                                let synthetic_id = ValueId(next_synth_id);
+                                next_synth_id += 1;
+                                let v = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synthetic_id)?;
+                                emit_load_f32_offset(&mut a, w_tmp, param, lane_off, v)?;
+                                scalars.insert(synthetic_id, v);
+                                lanes.push(Value {
+                                    id: synthetic_id, ty: Type::F32,
+                                });
+                            }
+                            vectors.insert(result.id, lanes);
                         }
-                        vectors.insert(result.id, lanes);
                     }
                     Type::Mat4(_) => {
                         // Deferred: just record (param, off);
@@ -3032,9 +3632,16 @@ fn emit_function(
                             a.emit(asm::fmov_w_from_s(w_tmp, *v));
                             w_tmp
                         }
-                        None => return Err(BackendError::Internal(format!(
-                            "Select cond {:?} not in bools/bool_in_v",
-                            cond.id))),
+                        None => match bool_in_slot.get(&cond.id) {
+                            Some(slot) => {
+                                a.emit(asm::ldr_w_offset(w_tmp,
+                                    asm::Xreg(31), (*slot as u16) * 8));
+                                w_tmp
+                            }
+                            None => return Err(BackendError::Internal(
+                                format!("Select cond {:?} not in \
+                                         bools/bool_in_v/slot", cond.id))),
+                        },
                     },
                 };
                 // Set NZCV once; both scalar and vec paths
@@ -3049,8 +3656,7 @@ fn emit_function(
                         let s_f = *scalars.get(&f_val.id).ok_or_else(||
                             BackendError::Internal(format!(
                                 "Select f {:?} not in scalars", f_val.id)))?;
-                        let s_d = alloc_vreg(
-                            &mut free_pool, &mut owners, &mut used_callee_saved_v,result.id)?;
+                        let s_d = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, result.id)?;
                         a.emit(asm::fcsel_s(s_d, s_t, s_f, asm::Cond::Ne));
                         scalars.insert(result.id, s_d);
                     }
@@ -3087,8 +3693,7 @@ fn emit_function(
                                     "vec Select f lane {li} {:?} missing", fl.id)))?;
                             let synth = ValueId(next_synth_id);
                             next_synth_id += 1;
-                            let sd = alloc_vreg(
-                                &mut free_pool, &mut owners, &mut used_callee_saved_v,synth)?;
+                            let sd = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth)?;
                             a.emit(asm::fcsel_s(sd, st, sf, asm::Cond::Ne));
                             scalars.insert(synth, sd);
                             out_lanes.push(Value { id: synth, ty: tl.ty.clone() });
@@ -3118,6 +3723,62 @@ fn emit_function(
                 // (fmov_s for f32, mov_w for i32/u32) for
                 // each, just before the branch.
                 if let Some(moves) = phi_moves.get(&(*bid, *target)) {
+                    if spill_mode {
+                        // Reload spilled phi-move sources first
+                        // (the move emission reads regs).
+                        let needed: Vec<ValueId> = moves.iter()
+                            .flat_map(|(dest, src_id)| match dest {
+                                PhiDest::Float(_)
+                                | PhiDest::FloatSpill(_) => vec![*src_id],
+                                PhiDest::Vec(_) => vectors
+                                    .get(src_id)
+                                    .map(|ls| ls.iter()
+                                        .map(|l| l.id).collect())
+                                    .unwrap_or_default(),
+                                _ => Vec::new(),
+                            })
+                            .filter(|id| spilled.contains(id))
+                            .collect();
+                        // Int/Bool move sources from the W side.
+                        let needed_w: Vec<ValueId> = moves.iter()
+                            .filter_map(|(dest, src_id)| match dest {
+                                PhiDest::Int(_)
+                                | PhiDest::Bool(_)
+                                | PhiDest::BoolV(_) => Some(*src_id),
+                                _ => None,
+                            })
+                            .filter(|id| spilled_w.contains(id))
+                            .collect();
+                        for id in needed_w {
+                            let slot = *spill_slot.get(&id)
+                                .ok_or_else(|| BackendError::Internal(
+                                    format!("int reload of {id:?} \
+                                             without slot")))?;
+                            if int_pool.free.is_empty()
+                                && !wevict_one(&mut int_pool,
+                                    &mut ints, &mut spilled_w,
+                                    &spill_slot, &vectors, &deferred_ptr, &last_use,
+                                    &phi_pinned, &inst.op)
+                            {
+                                return Err(BackendError::Unsupported(
+                                    "W pressure with no spillable \
+                                     victim".into()));
+                            }
+                            let w = int_pool.alloc(id)?;
+                            a.emit(asm::ldr_w_offset(
+                                w, asm::Xreg(31), (slot as u16) * 8));
+                            ints.insert(id, w);
+                            spilled_w.remove(&id);
+                        }
+                        for id in needed {
+                            vread_impl(&mut a, &mut free_pool,
+                                &mut owners, &mut used_callee_saved_v,
+                                &mut scalars, &mut spilled,
+                                &spill_slot, &vectors, &last_use,
+                                &phi_pinned, spill_mode, &inst.op,
+                                id)?;
+                        }
+                    }
                     for (dest, src_id) in moves {
                         // Coalesced arm: the producing binop
                         // already wrote straight into `dest`,
@@ -3128,6 +3789,15 @@ fn emit_function(
                         }
                         match dest {
                             PhiDest::Float(dv) => {
+                                if scalars.get(src_id).is_none() {
+                                    if let Some(c) = phi_const_val.get(src_id) {
+                                        materialise_u32_into_w(
+                                            &mut a, w_tmp, *c);
+                                        a.emit(asm::fmov_s_from_w(
+                                            *dv, w_tmp));
+                                        continue;
+                                    }
+                                }
                                 let src = *scalars.get(src_id).ok_or_else(||
                                     BackendError::Internal(format!(
                                         "Phi f32 source {:?} not in scalars",
@@ -3162,12 +3832,18 @@ fn emit_function(
                                 }
                             }
                             PhiDest::Int(dw) => {
-                                let src = *ints.get(src_id).ok_or_else(||
-                                    BackendError::Internal(format!(
-                                        "Phi int source {:?} not in ints",
-                                        src_id)))?;
-                                if dw.0 != src.0 {
-                                    a.emit(asm::mov_w(*dw, src));
+                                if let Some(src) = ints.get(src_id) {
+                                    if dw.0 != src.0 {
+                                        a.emit(asm::mov_w(*dw, *src));
+                                    }
+                                } else if let Some(c) =
+                                    phi_const_val.get(src_id)
+                                {
+                                    materialise_u32_into_w(&mut a, *dw, *c);
+                                } else {
+                                    return Err(BackendError::Internal(
+                                        format!("Phi int source {:?} not \
+                                                 in ints", src_id)));
                                 }
                             }
                             PhiDest::Bool(dw) => {
@@ -3181,11 +3857,69 @@ fn emit_function(
                                     bool_in_v.get(src_id)
                                 {
                                     a.emit(asm::fmov_w_from_s(*dw, *sv));
+                                } else if let Some(ss) =
+                                    bool_in_slot.get(src_id)
+                                {
+                                    a.emit(asm::ldr_w_offset(*dw,
+                                        asm::Xreg(31), (*ss as u16) * 8));
+                                } else if let Some(c) =
+                                    phi_const_val.get(src_id)
+                                {
+                                    materialise_u32_into_w(&mut a, *dw, *c);
                                 } else {
                                     return Err(BackendError::Internal(
                                         format!("Phi bool source {:?} not \
                                                  in bools/ints/bool_in_v",
                                                 src_id)));
+                                }
+                            }
+                            PhiDest::FloatSpill(slot) => {
+                                if scalars.get(src_id).is_none() {
+                                    if let Some(c) = phi_const_val.get(src_id) {
+                                        materialise_u32_into_w(
+                                            &mut a, w_tmp, *c);
+                                        a.emit(asm::str_w_offset(w_tmp,
+                                            asm::Xreg(31),
+                                            (*slot as u16) * 8));
+                                        continue;
+                                    }
+                                }
+                                let src = *scalars.get(src_id).ok_or_else(||
+                                    BackendError::Internal(format!(
+                                        "Phi f32-spill source {:?} not in \
+                                         scalars", src_id)))?;
+                                a.emit(asm::str_d_offset(
+                                    src, asm::Xreg(31), (*slot as u16) * 8));
+                            }
+                            PhiDest::BoolSpill(slot) => {
+                                if let Some(sw) = bools.get(src_id)
+                                    .or_else(|| ints.get(src_id))
+                                {
+                                    a.emit(asm::str_w_offset(*sw,
+                                        asm::Xreg(31), (*slot as u16) * 8));
+                                } else if let Some(sv) =
+                                    bool_in_v.get(src_id)
+                                {
+                                    a.emit(asm::fmov_w_from_s(w_tmp, *sv));
+                                    a.emit(asm::str_w_offset(w_tmp,
+                                        asm::Xreg(31), (*slot as u16) * 8));
+                                } else if let Some(ss) =
+                                    bool_in_slot.get(src_id)
+                                {
+                                    a.emit(asm::ldr_w_offset(w_tmp,
+                                        asm::Xreg(31), (*ss as u16) * 8));
+                                    a.emit(asm::str_w_offset(w_tmp,
+                                        asm::Xreg(31), (*slot as u16) * 8));
+                                } else if let Some(c) =
+                                    phi_const_val.get(src_id)
+                                {
+                                    materialise_u32_into_w(&mut a, w_tmp, *c);
+                                    a.emit(asm::str_w_offset(w_tmp,
+                                        asm::Xreg(31), (*slot as u16) * 8));
+                                } else {
+                                    return Err(BackendError::Internal(
+                                        format!("Phi bool-spill source \
+                                                 {:?} unresolved", src_id)));
                                 }
                             }
                             PhiDest::BoolV(dv) => {
@@ -3199,6 +3933,17 @@ fn emit_function(
                                     if dv.0 != sv.0 {
                                         a.emit(asm::fmov_s(*dv, *sv));
                                     }
+                                } else if let Some(ss) =
+                                    bool_in_slot.get(src_id)
+                                {
+                                    a.emit(asm::ldr_w_offset(w_tmp,
+                                        asm::Xreg(31), (*ss as u16) * 8));
+                                    a.emit(asm::fmov_s_from_w(*dv, w_tmp));
+                                } else if let Some(c) =
+                                    phi_const_val.get(src_id)
+                                {
+                                    materialise_u32_into_w(&mut a, w_tmp, *c);
+                                    a.emit(asm::fmov_s_from_w(*dv, w_tmp));
                                 } else {
                                     return Err(BackendError::Internal(
                                         format!("Phi boolV source {:?} not \
@@ -3340,9 +4085,18 @@ fn emit_function(
                                     a.emit(asm::fmov_w_from_s(w_tmp, *v));
                                     w_tmp
                                 }
-                                None => return Err(BackendError::Unsupported(
-                                    format!("BranchCond cond {:?} is not a \
-                                             known Bool W-reg", cond.id))),
+                                None => match bool_in_slot.get(&cond.id) {
+                                    Some(slot) => {
+                                        a.emit(asm::ldr_w_offset(w_tmp,
+                                            asm::Xreg(31),
+                                            (*slot as u16) * 8));
+                                        w_tmp
+                                    }
+                                    None => return Err(
+                                        BackendError::Unsupported(format!(
+                                            "BranchCond cond {:?} is not \
+                                             a known Bool W-reg", cond.id))),
+                                },
                             },
                         };
                         // cmp w_bool, #0  → flags reflect zero-ness
@@ -3527,8 +4281,7 @@ fn emit_function(
                 for _ in 0..4 {
                     let synth = ValueId(next_synth_id);
                     next_synth_id += 1;
-                    let r = alloc_vreg(&mut free_pool, &mut owners,
-                        &mut used_callee_saved_v, synth)?;
+                    let r = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth)?;
                     scalars.insert(synth, r);
                     lane_regs.push(r);
                     lane_vals.push(Value { id: synth, ty: Type::F32 });
@@ -3727,8 +4480,7 @@ fn emit_function(
                 for _ in 0..4 {
                     let synth = ValueId(next_synth_id);
                     next_synth_id += 1;
-                    let r = alloc_vreg(&mut free_pool, &mut owners,
-                        &mut used_callee_saved_v, synth)?;
+                    let r = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth)?;
                     scalars.insert(synth, r);
                     lane_regs.push(r);
                     lane_vals.push(Value { id: synth, ty: Type::F32 });
@@ -3839,8 +4591,7 @@ fn emit_function(
                 for _ in 0..4 {
                     let synth = ValueId(next_synth_id);
                     next_synth_id += 1;
-                    let r = alloc_vreg(&mut free_pool, &mut owners,
-                        &mut used_callee_saved_v, synth)?;
+                    let r = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth)?;
                     scalars.insert(synth, r);
                     lane_regs.push(r);
                     lane_vals.push(Value { id: synth, ty: Type::F32 });
@@ -4192,8 +4943,7 @@ fn emit_function(
                     for _ in 0..4 {
                         let synth = ValueId(next_synth_id);
                         next_synth_id += 1;
-                        let r = alloc_vreg(&mut free_pool, &mut owners,
-                            &mut used_callee_saved_v, synth)?;
+                        let r = valloc_impl(&mut free_pool, &mut owners, &mut used_callee_saved_v, &mut scalars, &mut spilled, &spill_slot, &vectors, &last_use, &phi_pinned, spill_mode, &inst.op, synth)?;
                         scalars.insert(synth, r);
                         lane_regs.push(r);
                         lane_vals.push(Value { id: synth, ty: Type::F32 });
@@ -4514,8 +5264,9 @@ fn emit_function(
         // Epilogue int slots: 4..9, reverse pair order.
         for &ep in &epilogue_offs {
             for (i, (a_reg, b_reg)) in int_pairs.iter().rev().enumerate() {
-                a.patch(ep + (PROLOGUE_FP_INSTS + i) * 4,
-                        asm::ldp_x_post(*a_reg, *b_reg, asm::Xreg(31), 16));
+                a.patch(
+                    ep + (PROLOGUE_SPILL_INSTS + PROLOGUE_FP_INSTS + i) * 4,
+                    asm::ldp_x_post(*a_reg, *b_reg, asm::Xreg(31), 16));
             }
         }
     }
@@ -4528,9 +5279,36 @@ fn emit_function(
         // Epilogue FP slots: 0..4, reverse pair order.
         for &ep in &epilogue_offs {
             for (i, (a_reg, b_reg)) in fp_pairs.iter().rev().enumerate() {
-                a.patch(ep + i * 4,
+                a.patch(ep + (PROLOGUE_SPILL_INSTS + i) * 4,
                         asm::ldp_d_post(*a_reg, *b_reg, asm::Xreg(31), 16));
             }
+        }
+    }
+
+    // Spill area: one `sub sp` at the prologue tail / `add sp`
+    // at each epilogue head (NOPs when no slots were used).
+    let spill_bytes_total: u16 =
+        (((spill_next as usize) * 8 + 15) & !15) as u16;
+    if spill_bytes_total > 0 {
+        // Split across the two prologue slots (each imm12 <= 4095,
+        // and 16-aligned halves keep SP aligned at every step).
+        let hi = (spill_bytes_total / 2) & !15;
+        let lo = spill_bytes_total - hi;
+        let base = prologue_off
+            + (PROLOGUE_INT_INSTS + PROLOGUE_FP_INSTS) * 4;
+        if hi > 0 {
+            a.patch(base, asm::sub_imm_x(
+                asm::Xreg(31), asm::Xreg(31), hi));
+        }
+        a.patch(base + 4, asm::sub_imm_x(
+            asm::Xreg(31), asm::Xreg(31), lo));
+        for &ep in &epilogue_offs {
+            if hi > 0 {
+                a.patch(ep, asm::add_imm_x(
+                    asm::Xreg(31), asm::Xreg(31), hi));
+            }
+            a.patch(ep + 4, asm::add_imm_x(
+                asm::Xreg(31), asm::Xreg(31), lo));
         }
     }
 
@@ -4546,7 +5324,8 @@ fn emit_function(
         let fp_pairs_count = if used_callee_saved_v {
             PROLOGUE_FP_INSTS
         } else { 0 };
-        let frame_bytes = (int_pairs_count + fp_pairs_count) as u16 * 16;
+        let frame_bytes = (int_pairs_count + fp_pairs_count) as u16 * 16
+            + spill_bytes_total;
         for (off, wreg) in &lid_z_load_patches {
             a.patch(*off, asm::ldr_w_offset(*wreg, asm::Xreg(31), frame_bytes));
         }
@@ -4585,8 +5364,14 @@ fn emit_function(
         !used_callee_saved_v && PROLOGUE_FP_INSTS > 0;
     let drop_int_prologue =
         !int_pool.used_callee_saved && PROLOGUE_INT_INSTS > 0;
-    if drop_fp_prologue || drop_int_prologue {
+    let drop_spill_prologue =
+        spill_bytes_total == 0 && PROLOGUE_SPILL_INSTS > 0;
+    if drop_fp_prologue || drop_int_prologue || drop_spill_prologue {
         let mut bytes = a.into_bytes();
+        let spill_range = (
+            prologue_off + (PROLOGUE_INT_INSTS + PROLOGUE_FP_INSTS) * 4,
+            prologue_off + PROLOGUE_INSTS * 4,
+        );
         let fp_range = (
             prologue_off + PROLOGUE_INT_INSTS * 4,
             prologue_off + (PROLOGUE_INT_INSTS + PROLOGUE_FP_INSTS) * 4,
@@ -4597,6 +5382,9 @@ fn emit_function(
         );
         // Drain higher range first so the lower range's
         // coordinates stay valid.
+        if drop_spill_prologue {
+            bytes.drain(spill_range.0..spill_range.1);
+        }
         if drop_fp_prologue {
             bytes.drain(fp_range.0..fp_range.1);
         }
@@ -4609,7 +5397,8 @@ fn emit_function(
         // range's end.
         let total_drop =
             (if drop_fp_prologue { PROLOGUE_FP_INSTS } else { 0 }
-             + if drop_int_prologue { PROLOGUE_INT_INSTS } else { 0 })
+             + if drop_int_prologue { PROLOGUE_INT_INSTS } else { 0 }
+             + if drop_spill_prologue { PROLOGUE_SPILL_INSTS } else { 0 })
             * 4;
         for (off, _) in pcmap_entries.iter_mut() {
             *off -= total_drop as u32;
@@ -4641,6 +5430,50 @@ fn emit_function(
 /// assumption the shader only writes gl_Position; mirrors
 /// the Cranelift backend's v1 mapping. Richer dispatch
 /// (BuiltIn vs Location) lands in a later phase.
+/// Spill-aware pointer resolution: deferred dynamic pointers
+/// materialise into the X9 scratch here (one lsl+add); everything
+/// else falls through to [`resolve_or_make_pointer`]. The X9
+/// result must be consumed before the next deferred resolve.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+fn resolve_ptr_spill(
+    a: &mut asm::Asm,
+    deferred_ptr: &HashMap<ValueId, (asm::Xreg, i32, ValueId, u8)>,
+    ints: &HashMap<ValueId, asm::Wreg>,
+    const_vals: &HashMap<ValueId, u32>,
+    cur_op: &Op,
+    v: &Value,
+    pointers: &mut HashMap<ValueId, (asm::Xreg, i32)>,
+    stage: ShaderStage,
+) -> Result<(asm::Xreg, i32), BackendError> {
+    if let Some(&(x_base, base_off, index_id, log2)) =
+        deferred_ptr.get(&v.id)
+    {
+        let x9 = asm::Xreg(9);
+        let idx_x = if let Some(w_index) = ints.get(&index_id) {
+            asm::Xreg(w_index.0)
+        } else if let Some(c) = const_vals.get(&index_id) {
+            // Folded/orphan constant index: materialise into
+            // the W9 scratch (= X9's W view) — the lsl/add
+            // below consumes it immediately.
+            materialise_u32_into_w(a, asm::Wreg(9), *c);
+            x9
+        } else {
+            return Err(BackendError::Internal(format!(
+                "deferred ptr index {index_id:?} not in ints \
+                 or constants; consumer={cur_op:?} ptr={:?}", v.id)));
+        };
+        if log2 == 0 {
+            a.emit(asm::add_x(x9, x_base, idx_x));
+        } else {
+            a.emit(asm::lsl_imm_x(x9, idx_x, log2));
+            a.emit(asm::add_x(x9, x_base, x9));
+        }
+        return Ok((x9, base_off));
+    }
+    resolve_or_make_pointer(v, pointers, stage)
+}
+
 fn resolve_or_make_pointer(
     v: &Value,
     pointers: &mut HashMap<ValueId, (asm::Xreg, i32)>,
@@ -4698,8 +5531,13 @@ fn emit_load_f32_offset(
             "load offset {off} exceeds u16 — large offsets need
              a different addressing mode")));
     }
-    a.emit(asm::ldr_w_offset(w_tmp, param, off as u16));
-    a.emit(asm::fmov_s_from_w(dst, w_tmp));
+    let _ = w_tmp;
+    // Direct FP load: one inst, and crucially NO W9 staging —
+    // when `param` is the X9 deferred-pointer scratch, `ldr w9,
+    // [x9, ...]` destroyed the base after the first lane of a
+    // vec load (observed as a wild address = the loaded float's
+    // bit pattern).
+    a.emit(asm::ldr_s_offset(dst, param, off as u16));
     Ok(())
 }
 
@@ -4728,6 +5566,16 @@ enum PhiDest {
     /// `fmov s, w` phi-moves; consumers materialise through
     /// the W9 scratch.
     BoolV(asm::Vreg),
+    /// Spill-resident float Phi (spill mode, reg caps hit): the
+    /// dest IS a stack slot. Phi-moves `str d` into it; reads
+    /// reload via the regular spill machinery, with the cached
+    /// copy invalidated at block boundaries (slots only mutate
+    /// at predecessor terminators).
+    FloatSpill(u32),
+    /// Spill-resident bool Phi: phi-moves `str w` the 0/1 into
+    /// the slot; the bool consumer sites `ldr w` through the W9
+    /// scratch (never cached).
+    BoolSpill(u32),
     Vec(Vec<asm::Vreg>),
     /// NEON-packed vec4 Phi: the whole vector in a single
     /// Q-register. Phi-move is one `mov v.16b`; a packed
@@ -4768,7 +5616,7 @@ impl IntPool {
     fn alloc(&mut self, owner: ValueId) -> Result<asm::Wreg, BackendError> {
         let n = self.free.pop().ok_or_else(|| BackendError::Unsupported(
             "int linear-scan RA ran out of W-regs (W13..W17 + W19..W28); \
-             spilling lands in a later widening".into()))?;
+             retried with scalar spilling by compile()".into()))?;
         if n >= 19 { self.used_callee_saved = true; }
         self.owners.insert(n, owner);
         Ok(asm::Wreg(n))
@@ -4787,12 +5635,13 @@ impl IntPool {
     /// Return W-regs whose owner's last_use < `before`.
     fn expire(&mut self, before: usize,
               last_use: &HashMap<ValueId, usize>) {
-        let dead: Vec<u8> = self.owners.iter()
+        let mut dead: Vec<u8> = self.owners.iter()
             .filter_map(|(n, id)|
                 if last_use.get(id).copied().unwrap_or(usize::MAX) < before {
                     Some(*n)
                 } else { None })
             .collect();
+        dead.sort_unstable();
         for n in dead {
             self.owners.remove(&n);
             self.free.push(n);
@@ -4905,6 +5754,17 @@ fn emit_int_addsub(
     Ok(())
 }
 
+/// Bool-pool overflow context (spill mode): when W10..W12 are all
+/// live, a materialised compare result lands in a stack slot via
+/// the W9 scratch; every bool consumer site has a `bool_in_slot`
+/// fallback.
+struct BoolOverflow<'a> {
+    bool_in_slot: &'a mut HashMap<ValueId, u32>,
+    spill_next: &'a mut u32,
+    spill_free: &'a mut Vec<u32>,
+    spill_mode: bool,
+}
+
 /// Emit an integer comparison.
 ///
 /// Two lowerings:
@@ -4922,6 +5782,7 @@ fn emit_int_addsub(
 #[allow(clippy::too_many_arguments)]
 fn emit_icmp_to_bool(
     a: &mut asm::Asm,
+    ov: &mut BoolOverflow,
     ints: &HashMap<ValueId, asm::Wreg>,
     bools: &mut HashMap<ValueId, asm::Wreg>,
     bool_owners: &mut HashMap<u8, ValueId>,
@@ -4937,13 +5798,29 @@ fn emit_icmp_to_bool(
         BackendError::Internal("icmp without result".into()))?;
     let l = *ints.get(&lhs.id).ok_or_else(||
         BackendError::Internal(format!(
-            "icmp lhs {:?} not in ints", lhs.id)))?;
+            "icmp lhs {:?} (ty {:?}) not in ints; op={:?}",
+            lhs.id, lhs.ty, inst.op)))?;
     let r = *ints.get(&rhs.id).ok_or_else(||
         BackendError::Internal(format!(
-            "icmp rhs {:?} not in ints", rhs.id)))?;
+            "icmp rhs {:?} (ty {:?}) not in ints; op={:?}",
+            rhs.id, rhs.ty, inst.op)))?;
     if fuse_eligible {
         a.emit(asm::cmp_w(l, r));
         *fused_branch = Some((result.id, cond));
+        return Ok(());
+    }
+    if bool_free.is_empty() && ov.spill_mode {
+        // Slot-resident bool: cset through the W9 scratch.
+        let slot = ov.spill_free.pop().unwrap_or_else(|| {
+            let sl = *ov.spill_next;
+            *ov.spill_next += 1;
+            sl
+        });
+        a.emit(asm::cmp_w(l, r));
+        a.emit(asm::cset_w(asm::Wreg(9), cond));
+        a.emit(asm::str_w_offset(
+            asm::Wreg(9), asm::Xreg(31), (slot as u16) * 8));
+        ov.bool_in_slot.insert(result.id, slot);
         return Ok(());
     }
     let n = bool_free.pop().ok_or_else(|| BackendError::Unsupported(
@@ -4963,6 +5840,7 @@ fn emit_icmp_to_bool(
 #[allow(clippy::too_many_arguments)]
 fn emit_fcmp_to_bool(
     a: &mut asm::Asm,
+    ov: &mut BoolOverflow,
     scalars: &HashMap<ValueId, asm::Vreg>,
     bools: &mut HashMap<ValueId, asm::Wreg>,
     bool_owners: &mut HashMap<u8, ValueId>,
@@ -4983,6 +5861,19 @@ fn emit_fcmp_to_bool(
     if fuse_eligible {
         a.emit(asm::fcmp_s(l, r));
         *fused_branch = Some((result.id, cond));
+        return Ok(());
+    }
+    if bool_free.is_empty() && ov.spill_mode {
+        let slot = ov.spill_free.pop().unwrap_or_else(|| {
+            let sl = *ov.spill_next;
+            *ov.spill_next += 1;
+            sl
+        });
+        a.emit(asm::fcmp_s(l, r));
+        a.emit(asm::cset_w(asm::Wreg(9), cond));
+        a.emit(asm::str_w_offset(
+            asm::Wreg(9), asm::Xreg(31), (slot as u16) * 8));
+        ov.bool_in_slot.insert(result.id, slot);
         return Ok(());
     }
     let n = bool_free.pop().ok_or_else(|| BackendError::Unsupported(
@@ -5013,6 +5904,303 @@ fn alloc_vreg(
     if n < 16 { *used_callee_saved_v = true; }
     owners.insert(n, owner);
     Ok(asm::Vreg(n))
+}
+
+/// Critical-edge splitting: a conditional terminator edge into a
+/// Phi-bearing block can't carry phi-moves (they'd execute on the
+/// OTHER edge too). Insert a stub block on each such edge — the
+/// stub's lone `Branch(target)` is where the moves land. Returns
+/// the transformed function + (stub, from) placement pairs so the
+/// caller can keep stubs ADJACENT to their from-block in flat
+/// order (a stub at the end would balloon every phi source's
+/// live range to the whole function).
+fn split_critical_edges(
+    func: &Function,
+) -> Option<(Function, Vec<(BlockId, BlockId)>)> {
+    let has_phis = |b: &atrium_spv_ir::Block| {
+        b.insts.first().is_some_and(|i| matches!(&i.op, Op::Phi(_)))
+    };
+    let mut next_id = func.blocks.keys().map(|b| b.0).max().unwrap_or(0) + 1;
+    let mut f = func.clone();
+    let mut placements: Vec<(BlockId, BlockId)> = Vec::new();
+    let mut new_blocks: Vec<atrium_spv_ir::Block> = Vec::new();
+    // (target, original_from, stub) phi-arm rewrites to apply.
+    let mut arm_rewrites: Vec<(BlockId, BlockId, BlockId)> = Vec::new();
+
+    let from_ids: Vec<BlockId> = f.blocks.keys().copied().collect();
+    for from in from_ids {
+        // Collect this terminator's conditional-edge targets.
+        let (term_off, targets): (u32, Vec<BlockId>) = {
+            let b = f.blocks.get(&from).unwrap();
+            match b.insts.last().map(|i| (&i.op, i.source_spirv_offset)) {
+                Some((Op::BranchCond { t_block, f_block, .. }, off)) =>
+                    (off, vec![*t_block, *f_block]),
+                Some((Op::Switch { cases, default, .. }, off)) => {
+                    let mut v: Vec<BlockId> =
+                        cases.iter().map(|(_, t)| *t).collect();
+                    v.push(*default);
+                    (off, v)
+                }
+                _ => continue,
+            }
+        };
+        let mut stub_for: HashMap<BlockId, BlockId> = HashMap::new();
+        for target in targets {
+            if stub_for.contains_key(&target) { continue; }
+            let needs = f.blocks.get(&target).is_some_and(has_phis);
+            if !needs { continue; }
+            let stub = BlockId(next_id);
+            next_id += 1;
+            new_blocks.push(atrium_spv_ir::Block {
+                id: stub,
+                kind: atrium_spv_ir::BlockKind::Linear,
+                insts: vec![atrium_spv_ir::Inst {
+                    op: Op::Branch(target),
+                    result: None,
+                    source_spirv_offset: term_off,
+                }],
+            });
+            stub_for.insert(target, stub);
+            placements.push((stub, from));
+            arm_rewrites.push((target, from, stub));
+        }
+        if stub_for.is_empty() { continue; }
+        // Rewrite the terminator's edges to the stubs.
+        let b = f.blocks.get_mut(&from).unwrap();
+        match &mut b.insts.last_mut().unwrap().op {
+            Op::BranchCond { t_block, f_block, .. } => {
+                if let Some(st) = stub_for.get(t_block) { *t_block = *st; }
+                if let Some(st) = stub_for.get(f_block) { *f_block = *st; }
+            }
+            Op::Switch { cases, default, .. } => {
+                for (_, t) in cases.iter_mut() {
+                    if let Some(st) = stub_for.get(t) { *t = *st; }
+                }
+                if let Some(st) = stub_for.get(default) { *default = *st; }
+            }
+            _ => unreachable!(),
+        }
+    }
+    if new_blocks.is_empty() {
+        return None;
+    }
+    for (target, from, stub) in arm_rewrites {
+        let tb = f.blocks.get_mut(&target).unwrap();
+        for inst in tb.insts.iter_mut() {
+            let Op::Phi(arms) = &mut inst.op else { break };
+            for arm in arms.iter_mut() {
+                if arm.from == from {
+                    arm.from = stub;
+                }
+            }
+        }
+    }
+    for nb in new_blocks {
+        f.blocks.insert(nb.id, nb);
+    }
+    Some((f, placements))
+}
+
+/// Spill-aware V-reg allocation. Fast path = alloc_vreg; on an
+/// empty pool in spill mode, EVICT the in-register scalar with
+/// the farthest last_use whose slot is already valid (write-once
+/// at def), excluding values the current inst reads (directly or
+/// through a read vector's lanes) and pinned phi dests. Eviction
+/// emits no code.
+#[allow(clippy::too_many_arguments)]
+fn valloc_impl(
+    free_pool: &mut Vec<u8>,
+    owners: &mut HashMap<u8, ValueId>,
+    used_callee_saved_v: &mut bool,
+    scalars: &mut HashMap<ValueId, asm::Vreg>,
+    spilled: &mut std::collections::HashSet<ValueId>,
+    spill_slot: &HashMap<ValueId, u32>,
+    vectors: &HashMap<ValueId, Vec<Value>>,
+    last_use: &HashMap<ValueId, usize>,
+    phi_pinned: &std::collections::HashSet<ValueId>,
+    spill_mode: bool,
+    cur_op: &Op,
+    owner: ValueId,
+) -> Result<asm::Vreg, BackendError> {
+    if let Some(n) = free_pool.pop() {
+        if n < 16 { *used_callee_saved_v = true; }
+        if n == 30 && std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok() {
+            eprintln!("V30 ALLOC -> {owner:?}");
+        }
+        owners.insert(n, owner);
+        return Ok(asm::Vreg(n));
+    }
+    if spill_mode {
+        let read_now = |id: ValueId| -> bool {
+            if op_reads(cur_op, id) { return true; }
+            vectors.iter().any(|(vid, lanes)|
+                op_reads(cur_op, *vid)
+                    && lanes.iter().any(|l| l.id == id))
+        };
+        // Deterministic choice: tie-break by id then reg, so
+        // identical SPIR-V always yields identical machine code
+        // (HashMap iteration order must never leak into output).
+        let victim = owners.iter()
+            .filter(|(n, id)| {
+                scalars.get(id) == Some(&asm::Vreg(**n))
+                    && spill_slot.contains_key(id)
+                    && !phi_pinned.contains(id)
+                    && !read_now(**id)
+            })
+            .max_by_key(|(n, id)|
+                (last_use.get(id).copied().unwrap_or(0), id.0, **n))
+            .map(|(n, id)| (*n, *id));
+        if let Some((n, victim_id)) = victim {
+            if std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok()
+                && (n == 30 || victim_id.0 == 118 || owner.0 == 118)
+            {
+                eprintln!("VEVICT V{n}: victim={victim_id:?} -> {owner:?}");
+            }
+            owners.remove(&n);
+            scalars.remove(&victim_id);
+            spilled.insert(victim_id);
+            owners.insert(n, owner);
+            return Ok(asm::Vreg(n));
+        }
+        return Err(BackendError::Unsupported(
+            "V pressure with no spillable victim".into()));
+    }
+    Err(BackendError::Unsupported(
+        "linear-scan RA ran out of V-regs (V16..V31 + V8..V15); \
+         compile() retries with scalar spilling".into()))
+}
+
+/// Evict ONE in-register int: the slot-valid value with the
+/// farthest last_use, excluding pinned phi dests and values the
+/// current inst reads. Emits no code (slots are write-once at
+/// def). Returns false when nothing is evictable.
+#[allow(clippy::too_many_arguments)]
+fn wevict_one(
+    int_pool: &mut IntPool,
+    ints: &mut HashMap<ValueId, asm::Wreg>,
+    spilled_w: &mut std::collections::HashSet<ValueId>,
+    spill_slot: &HashMap<ValueId, u32>,
+    vectors: &HashMap<ValueId, Vec<Value>>,
+    deferred_ptr: &HashMap<ValueId, (asm::Xreg, i32, ValueId, u8)>,
+    last_use: &HashMap<ValueId, usize>,
+    phi_pinned: &std::collections::HashSet<ValueId>,
+    cur_op: &Op,
+) -> bool {
+    // Exclusions beyond direct reads: (a) int lanes read THROUGH
+    // their vector's id (uvec3 builtins keep W-reg lanes); (b) a
+    // deferred pointer's INDEX is read wherever the POINTER is —
+    // the consumer re-materialises base+index<<k from it.
+    let read_now = |id: ValueId| -> bool {
+        if op_reads(cur_op, id) { return true; }
+        if vectors.iter().any(|(vid, lanes)|
+            op_reads(cur_op, *vid)
+                && lanes.iter().any(|l| l.id == id))
+        {
+            return true;
+        }
+        deferred_ptr.iter().any(|(pid, (_, _, idx, _))|
+            *idx == id && op_reads(cur_op, *pid))
+    };
+    let victim = int_pool.owners.iter()
+        .filter(|(n, id)| {
+            ints.get(id) == Some(&asm::Wreg(**n))
+                && spill_slot.contains_key(id)
+                && !phi_pinned.contains(id)
+                && !read_now(**id)
+        })
+        .max_by_key(|(n, id)|
+            (last_use.get(id).copied().unwrap_or(0), id.0, **n))
+        .map(|(n, id)| (*n, *id));
+    if let Some((n, victim_id)) = victim {
+        int_pool.owners.remove(&n);
+        int_pool.free.push(n);
+        ints.remove(&victim_id);
+        spilled_w.insert(victim_id);
+        true
+    } else {
+        false
+    }
+}
+
+/// Evict ONE in-register f32 scalar (mirror of [`wevict_one`]):
+/// slot-valid, farthest last_use, not read by the current inst
+/// (directly or as a lane of a read vector), not a pinned phi.
+/// Emits no code.
+#[allow(clippy::too_many_arguments)]
+fn vevict_one(
+    free_pool: &mut Vec<u8>,
+    owners: &mut HashMap<u8, ValueId>,
+    scalars: &mut HashMap<ValueId, asm::Vreg>,
+    spilled: &mut std::collections::HashSet<ValueId>,
+    spill_slot: &HashMap<ValueId, u32>,
+    vectors: &HashMap<ValueId, Vec<Value>>,
+    last_use: &HashMap<ValueId, usize>,
+    phi_pinned: &std::collections::HashSet<ValueId>,
+    cur_op: &Op,
+) -> bool {
+    let read_now = |id: ValueId| -> bool {
+        if op_reads(cur_op, id) { return true; }
+        vectors.iter().any(|(vid, lanes)|
+            op_reads(cur_op, *vid)
+                && lanes.iter().any(|l| l.id == id))
+    };
+    let victim = owners.iter()
+        .filter(|(n, id)| {
+            scalars.get(id) == Some(&asm::Vreg(**n))
+                && spill_slot.contains_key(id)
+                && !phi_pinned.contains(id)
+                && !read_now(**id)
+        })
+        .max_by_key(|(_, id)| last_use.get(id).copied().unwrap_or(0))
+        .map(|(n, id)| (*n, *id));
+    if let Some((n, victim_id)) = victim {
+        owners.remove(&n);
+        scalars.remove(&victim_id);
+        spilled.insert(victim_id);
+        free_pool.push(n);
+        true
+    } else {
+        false
+    }
+}
+
+/// Resolve a value to a V-reg, reloading from its spill slot if
+/// evicted (`ldr d` — preserves NZCV, safe between a compare and
+/// its fused branch).
+#[allow(clippy::too_many_arguments)]
+fn vread_impl(
+    a: &mut asm::Asm,
+    free_pool: &mut Vec<u8>,
+    owners: &mut HashMap<u8, ValueId>,
+    used_callee_saved_v: &mut bool,
+    scalars: &mut HashMap<ValueId, asm::Vreg>,
+    spilled: &mut std::collections::HashSet<ValueId>,
+    spill_slot: &HashMap<ValueId, u32>,
+    vectors: &HashMap<ValueId, Vec<Value>>,
+    last_use: &HashMap<ValueId, usize>,
+    phi_pinned: &std::collections::HashSet<ValueId>,
+    spill_mode: bool,
+    cur_op: &Op,
+    id: ValueId,
+) -> Result<asm::Vreg, BackendError> {
+    if let Some(v) = scalars.get(&id) {
+        return Ok(*v);
+    }
+    let slot = *spill_slot.get(&id).ok_or_else(||
+        BackendError::Internal(format!(
+            "reload of {id:?} without a spill slot")))?;
+    let v = valloc_impl(free_pool, owners, used_callee_saved_v,
+        scalars, spilled, spill_slot, vectors, last_use,
+        phi_pinned, spill_mode, cur_op, id)?;
+    if std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok()
+        && (v.0 == 30 || id.0 == 118)
+    {
+        eprintln!("VREAD {id:?} -> V{} (slot {slot})", v.0);
+    }
+    a.emit(asm::ldr_d_offset(v, asm::Xreg(31), (slot as u16) * 8));
+    scalars.insert(id, v);
+    spilled.remove(&id);
+    Ok(v)
 }
 
 /// Compute, per scalar ValueId: the highest inst index
@@ -5077,7 +6265,51 @@ fn op_reads(op: &Op, id: ValueId) -> bool {
         BranchCond { cond, .. } => cond.id == id,
         Switch { selector, .. } => selector.id == id,
         Phi(arms) => arms.iter().any(|a| a.value.id == id),
-        // Atomics, image ops, and anything else: conservative.
+        // Reads nothing (builtins ride ABI registers; handles
+        // carry literal set/binding; Barrier is pure sync).
+        LoadBuiltin(_) | ImageHandle { .. } | Barrier => false,
+        FFloor(s) | FCeil(s) | FTrunc(s) | FAbs(s) | FSqrt(s)
+        | PackHalf2x16(s) | UnpackHalf2x16(s)
+        | AtomicLoad(s) | ImageQuerySize(s)
+        | Derivative { value: s, .. } =>
+            s.id == id,
+        FMin(l, r) | FMax(l, r) => l.id == id || r.id == id,
+        Fma(x, y, z) => x.id == id || y.id == id || z.id == id,
+        PtrOffsetDynamic { base, index, .. } =>
+            base.id == id || index.id == id,
+        AtomicStore { ptr, value } | AtomicIAdd { ptr, value }
+        | AtomicAnd { ptr, value } | AtomicOr { ptr, value }
+        | AtomicXor { ptr, value } | AtomicSMin { ptr, value }
+        | AtomicSMax { ptr, value } | AtomicUMin { ptr, value }
+        | AtomicUMax { ptr, value } | AtomicExchange { ptr, value } =>
+            ptr.id == id || value.id == id,
+        AtomicCompareExchange { ptr, expected, desired } =>
+            ptr.id == id || expected.id == id || desired.id == id,
+        CombineSampledImage { image, sampler } =>
+            image.id == id || sampler.id == id,
+        ImageRead { image, coord } =>
+            image.id == id || coord.id == id,
+        ImageWrite { image, coord, texel } =>
+            image.id == id || coord.id == id || texel.id == id,
+        ImageReadLod { image, coord, lod } =>
+            image.id == id || coord.id == id || lod.id == id,
+        ImageWriteLod { image, coord, texel, lod } =>
+            image.id == id || coord.id == id
+                || texel.id == id || lod.id == id,
+        ImageSampleImplicitLod { sampled_image, coord } =>
+            sampled_image.id == id || coord.id == id,
+        ImageSampleExplicitLod { sampled_image, coord, lod } =>
+            sampled_image.id == id || coord.id == id || lod.id == id,
+        ImageSampleDref { sampled_image, coord, dref } =>
+            sampled_image.id == id || coord.id == id || dref.id == id,
+        ImageGather { sampled_image, coord, component } =>
+            sampled_image.id == id || coord.id == id
+                || component.id == id,
+        SampledImageQuerySizeLod { image, lod } =>
+            image.id == id || lod.id == id,
+        // Future variants: conservative (safe for coalescing —
+        // pessimistic for spill eviction, which then just finds
+        // fewer victims at that inst).
         _ => true,
     }
 }
@@ -5511,6 +6743,51 @@ fn compute_last_use_flat(
         if !changed { break; }
     }
 
+    // ── Vector-membership liveness ────────────────────────────
+    //
+    // A lane value is READ wherever any vector containing it is
+    // read: codegen lane-walks resolve the lane's own register at
+    // the consuming inst. The per-inst sweep above marks lanes at
+    // the VECTOR-BUILDING inst only — a vector consumed later
+    // than the build left its lanes under-live (observed: a
+    // saturate's 0-splat lane expired between the splat and the
+    // FMax lane-walk; the stale register read whatever value
+    // took it). Propagate vec last_use down to members in
+    // reverse def order (handles chains); two passes for safety.
+    let mut members: HashMap<ValueId, Vec<ValueId>> = HashMap::new();
+    for inst in insts.iter() {
+        let Some(r) = inst.result.as_ref() else { continue };
+        match &inst.op {
+            Op::ConstVec(els) =>
+                { members.insert(r.id, els.iter().map(|v| v.id).collect()); }
+            Op::VectorShuffle { src1, src2, .. } =>
+                { members.insert(r.id, vec![src1.id, src2.id]); }
+            Op::VectorInsert { vector, scalar, .. } =>
+                { members.insert(r.id, vec![vector.id, scalar.id]); }
+            Op::Select { cond: _, t_val, f_val }
+                if matches!(r.ty,
+                    Type::Vec2(_) | Type::Vec3(_) | Type::Vec4(_)) =>
+                { members.insert(r.id, vec![t_val.id, f_val.id]); }
+            Op::Phi(arms)
+                if matches!(r.ty,
+                    Type::Vec2(_) | Type::Vec3(_) | Type::Vec4(_)) =>
+                { members.insert(r.id,
+                    arms.iter().map(|a| a.value.id).collect()); }
+            _ => {}
+        }
+    }
+    for _ in 0..2 {
+        for inst in insts.iter().rev() {
+            let Some(r) = inst.result.as_ref() else { continue };
+            let Some(ms) = members.get(&r.id) else { continue };
+            let Some(&vl) = last_use.get(&r.id) else { continue };
+            for m in ms {
+                let e = last_use.entry(*m).or_insert(vl);
+                *e = (*e).max(vl);
+            }
+        }
+    }
+
     (last_use, use_counts)
 }
 
@@ -5648,6 +6925,11 @@ fn emit_fp_binop_poly(
                 Some(d) => d,
                 None => alloc_vreg(free_pool, owners, used_callee_saved_v,result.id)?,
             };
+            if std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok() {
+                eprintln!("FPBIN {:?}: l={:?}@V{} r={:?}@V{} -> {:?}@V{}",
+                    std::mem::discriminant(&inst.op),
+                    lhs.id, l.0, rhs.id, r.0, result.id, d.0);
+            }
             a.emit(make_inst(d, l, r));
             scalars.insert(result.id, d);
         }
@@ -5676,6 +6958,10 @@ fn emit_fp_binop_poly(
                     Some(lr) => lr[li],
                     None => alloc_vreg(free_pool, owners, used_callee_saved_v,synth)?,
                 };
+                if std::env::var("ATRIUM_SPV_RA_DEBUG").is_ok() {
+                    eprintln!("VECLANE {li}: l={:?}@V{} r={:?}@V{} -> V{}",
+                        ll.id, l.0, rl.id, r.0, d.0);
+                }
                 a.emit(make_inst(d, l, r));
                 scalars.insert(synth, d);
                 out_lanes.push(Value {

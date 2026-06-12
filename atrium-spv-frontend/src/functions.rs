@@ -154,7 +154,13 @@ fn translate_one(
     {
         // Collect ids first to avoid borrowing `constants`
         // while we recurse into resolve_value.
-        let const_ids: Vec<Word> = constants.iter().map(|(id, _)| *id).collect();
+        let mut const_ids: Vec<Word> =
+            constants.iter().map(|(id, _)| *id).collect();
+        // Sorted: the constants table is a HashMap, and its
+        // iteration order must not leak into IR (and from there
+        // into machine code) — identical SPIR-V must translate
+        // to identical IR, bit for bit.
+        const_ids.sort_unstable();
         for cid in const_ids {
             // Use offset 0 — these instructions don't map
             // to any specific source SPIR-V byte. (The
