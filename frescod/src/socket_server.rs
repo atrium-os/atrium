@@ -128,9 +128,12 @@ fn accept_loop(listener: UnixListener, shared: Shared, event_subs: EventSubs) {
                 };
 
                 /* Writer thread. */
+                let wlane = shared.lane.clone();
                 std::thread::Builder::new()
                     .name(format!("frescod-writer-{client_id}"))
-                    .spawn(move || writer_loop(writer_stream, rx, client_id))
+                    .spawn(move || {
+                        writer_loop(writer_stream, rx, client_id, wlane);
+                    })
                     .ok();
 
                 /* Reader thread. */
@@ -146,6 +149,7 @@ fn accept_loop(listener: UnixListener, shared: Shared, event_subs: EventSubs) {
                             eprintln!("frescod: reader {client_id}: {e}");
                         }
                         if let Some(l) = &lane {
+                            l.drop_self();
                             l.client_gone(client_id);
                         }
                         cleanup_client(&frontend, client_id);
@@ -204,6 +208,28 @@ fn reader_loop(
             let reply = handle_lane_request(
                 lane.as_deref(), &msg.payload, client_id, peer_pid,
             );
+            /*
+             * K-b deadline lending: this thread is the client's READER —
+             * from here on, its request handling runs at band priority
+             * on the client's CBS budget (charged back; a heavy client
+             * throttles itself, not frescod).
+             */
+            if reply.ok {
+                if let (Some(l), Some((pid, tid))) = (
+                    lane.as_deref(),
+                    lane.as_deref()
+                        .and_then(|l| l.sponsored_for(client_id)),
+                ) {
+                    match l.adopt_self(pid, tid) {
+                        Ok(()) => eprintln!(
+                            "frescod: lane: reader {client_id} adopted                              client entity (pid {pid} tid {tid})"
+                        ),
+                        Err(e) => eprintln!(
+                            "frescod: lane: reader adopt failed: {e}"
+                        ),
+                    }
+                }
+            }
             let payload = fresco_protocol::encode(&reply)
                 .unwrap_or_default();
             let _ = out.send(Outbound {
@@ -230,7 +256,12 @@ fn reader_loop(
     }
 }
 
-fn writer_loop(stream: UnixStream, rx: Receiver<Outbound>, client_id: u8) {
+fn writer_loop(
+    stream: UnixStream,
+    rx: Receiver<Outbound>,
+    client_id: u8,
+    lane: Option<Arc<LaneBroker>>,
+) {
     let mut conn = match AqConn::wrap(stream) {
         Ok(c) => c,
         Err(e) => {
@@ -238,10 +269,25 @@ fn writer_loop(stream: UnixStream, rx: Receiver<Outbound>, client_id: u8) {
             return;
         }
     };
+    /* K-b: once this client is sponsored, deliver its events (frame
+     * callbacks, input) on its reservation — adopt lazily. */
+    let mut adopted = false;
     while let Ok(o) = rx.recv() {
+        if !adopted {
+            if let Some(l) = &lane {
+                if let Some((pid, tid)) = l.sponsored_for(client_id) {
+                    adopted = l.adopt_self(pid, tid).is_ok();
+                }
+            }
+        }
         if let Err(e) = conn.send_message(CLASS_DISPLAY, o.op, o.flags, &o.payload) {
             log::debug!("frescod: writer {client_id} send: {e}");
             break;
+        }
+    }
+    if adopted {
+        if let Some(l) = &lane {
+            l.drop_self();
         }
     }
 }

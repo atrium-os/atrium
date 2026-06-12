@@ -49,6 +49,9 @@ const LAMIOC_SPONSOR_FOR: u64 =
     iow(b'L', 5, std::mem::size_of::<LamLaneReqFor>());
 const LAMIOC_WITHDRAW_FOR: u64 =
     iow(b'L', 6, std::mem::size_of::<LamLaneReqFor>());
+const LAMIOC_ADOPT: u64 = iow(b'L', 7, std::mem::size_of::<LamLaneReqFor>());
+const IOC_VOID: u64 = 0x2000_0000;
+const LAMIOC_DROP: u64 = IOC_VOID | (b'L' as u64) << 8 | 8;
 
 pub struct LaneBroker {
     fd: OwnedFd,
@@ -145,6 +148,38 @@ impl LaneBroker {
                 );
             }
         }
+    }
+
+    /// First sponsored (pid, tid) for a client, if any — the entity a
+    /// server thread serving this client should adopt.
+    pub fn sponsored_for(&self, client_id: u8) -> Option<(i32, i32)> {
+        self.clients
+            .lock()
+            .unwrap()
+            .get(&client_id)
+            .and_then(|v| v.first().copied())
+    }
+
+    /// K-b deadline lending: the CALLING thread adopts the client's
+    /// entity — band priority for selection, runtime charged to the
+    /// client's CBS budget. The per-client reader/writer threads call
+    /// this when their client is sponsored, so request handling and
+    /// event delivery run on the client's reservation (self-regulating:
+    /// a heavy client throttles itself, not frescod).
+    pub fn adopt_self(&self, pid: i32, tid: i32) -> io::Result<()> {
+        let req = LamLaneReqFor { pid, tid, ..Default::default() };
+        let r = unsafe {
+            libc::ioctl(self.fd.as_raw_fd(), LAMIOC_ADOPT, &req)
+        };
+        if r != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Undo `adopt_self` for the calling thread.
+    pub fn drop_self(&self) {
+        unsafe { libc::ioctl(self.fd.as_raw_fd(), LAMIOC_DROP) };
     }
 
     /// Drain pending miss events (fd is O_NONBLOCK). Called once per
