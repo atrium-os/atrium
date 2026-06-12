@@ -91,6 +91,16 @@ struct MvkPipeline {
     materialized: Option<MvkPipelineVk>,
 }
 
+/// A compute pipeline: realised eagerly at create time (no
+/// render-pass/format dependency, unlike graphics pipelines).
+struct MvkComputePipeline {
+    pipeline:    vk::Pipeline,
+    layout:      vk::PipelineLayout,
+    dset_layout: vk::DescriptorSetLayout,
+    module:      vk::ShaderModule,
+    push_size:   u32,
+}
+
 /// The realised Vulkan objects for an `MvkPipeline` at a specific
 /// colour format.
 struct MvkPipelineVk {
@@ -152,6 +162,16 @@ pub struct MoltenVkBackend {
     buffers: Mutex<HashMap<u32, MvkBuffer>>,
     /// Guest pipeline id → materialised graphics pipeline.
     pipelines: Mutex<HashMap<u32, MvkPipeline>>,
+    /// Guest pipeline id → compute pipeline (the engine-bundle
+    /// path: SPIR-V compute kernels dispatched via FrameOp::Dispatch).
+    compute_pipelines: Mutex<HashMap<u32, MvkComputePipeline>>,
+    /// Storage-buffer bindings staged for the next Dispatch
+    /// (binding → guest buffer id), like Tier-2's
+    /// `bind_compute_storage_buffer`. Drained per dispatch.
+    compute_binds: Mutex<HashMap<u32, u32>>,
+    /// Descriptor pool for per-dispatch sets; reset at the top of
+    /// every `record_and_submit`.
+    desc_pool: vk::DescriptorPool,
     /// Serialises command-buffer record + submit (one graphics queue).
     submit_lock: Mutex<()>,
 
@@ -232,8 +252,17 @@ impl MoltenVkBackend {
         // ── Load Vulkan loader ────────────────────────────────────
         // SAFETY: ash's Entry::load is unsafe because the loader is
         // dynamically resolved. We trust the system Vulkan ICD.
-        let entry = unsafe { Entry::load() }
-            .map_err(MoltenVkError::LoaderUnavailable)?;
+        // dlopen's default search misses Homebrew on Apple Silicon
+        // (/opt/homebrew/lib isn't in the fallback path), so try the
+        // standard load first and the brew loader explicitly second.
+        let entry = unsafe { Entry::load() }.or_else(|first_err| {
+            const BREW: &str = "/opt/homebrew/lib/libvulkan.dylib";
+            if std::path::Path::new(BREW).exists() {
+                unsafe { Entry::load_from(BREW) }.map_err(|_| first_err)
+            } else {
+                Err(first_err)
+            }
+        }).map_err(MoltenVkError::LoaderUnavailable)?;
         let entry = Box::new(entry);
 
         // ── Create instance ───────────────────────────────────────
@@ -381,6 +410,17 @@ impl MoltenVkBackend {
             log::info!("MoltenVk: GPU timestamps unavailable; measured exec time disabled");
         }
 
+        // Descriptor pool for per-dispatch sets (compute path).
+        // Reset wholesale at each record_and_submit.
+        let pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(256)];
+        let dp_info = vk::DescriptorPoolCreateInfo::default()
+            .max_sets(64)
+            .pool_sizes(&pool_sizes);
+        let desc_pool = unsafe { device.create_descriptor_pool(&dp_info, None) }
+            .unwrap_or(vk::DescriptorPool::null());
+
         Ok(Self {
             submissions: AtomicU64::new(0),
             physical,
@@ -396,12 +436,113 @@ impl MoltenVkBackend {
             images: Mutex::new(HashMap::new()),
             buffers: Mutex::new(HashMap::new()),
             pipelines: Mutex::new(HashMap::new()),
+            compute_pipelines: Mutex::new(HashMap::new()),
+            compute_binds: Mutex::new(HashMap::new()),
+            desc_pool,
             submit_lock: Mutex::new(()),
             query_pool,
             timestamp_period_ns,
             last_gpu_ns: AtomicU64::new(0),
             total_gpu_ns: AtomicU64::new(0),
         })
+    }
+
+    /// Create a compute pipeline from SPIR-V (the engine-bundle
+    /// path). Descriptor interface: `ssbo_count` storage buffers at
+    /// set 0, bindings 0..N; `push_size` bytes of push constants.
+    /// Eager (no format dependency, unlike graphics pipelines).
+    pub fn create_compute_pipeline(
+        &self,
+        pipeline_id: ResourceId,
+        cs_spirv: &[u8],
+        ssbo_count: u32,
+        push_size: u32,
+    ) -> Result<(), String> {
+        if cs_spirv.len() % 4 != 0 {
+            return Err("SPIR-V length not word-aligned".into());
+        }
+        let words: Vec<u32> = cs_spirv.chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let dev = &self.device;
+        unsafe {
+            let module = dev.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&words), None)
+                .map_err(|e| format!("shader module: {e:?}"))?;
+            let bindings: Vec<vk::DescriptorSetLayoutBinding> =
+                (0..ssbo_count).map(|b| {
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(b)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                }).collect();
+            let dset_layout = dev.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default()
+                    .bindings(&bindings), None)
+                .map_err(|e| format!("dset layout: {e:?}"))?;
+            let pc_ranges = [vk::PushConstantRange::default()
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                .offset(0)
+                .size(push_size.max(4))];
+            let set_layouts = [dset_layout];
+            let mut li = vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&set_layouts);
+            if push_size > 0 {
+                li = li.push_constant_ranges(&pc_ranges);
+            }
+            let layout = dev.create_pipeline_layout(&li, None)
+                .map_err(|e| format!("pipeline layout: {e:?}"))?;
+            // slangc names the SPIR-V entry "main" regardless of
+            // the source function name (the -entry flag selects
+            // WHICH function, not its exported name).
+            let entry = std::ffi::CStr::from_bytes_with_nul(b"main\0")
+                .unwrap();
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(module)
+                .name(entry);
+            let ci = vk::ComputePipelineCreateInfo::default()
+                .stage(stage)
+                .layout(layout);
+            let pipeline = dev.create_compute_pipelines(
+                    vk::PipelineCache::null(), &[ci], None)
+                .map_err(|(_, e)| format!("compute pipeline: {e:?}"))?[0];
+            self.compute_pipelines.lock().unwrap().insert(
+                pipeline_id.raw(),
+                MvkComputePipeline {
+                    pipeline, layout, dset_layout, module, push_size,
+                });
+        }
+        Ok(())
+    }
+
+    /// Stage a storage-buffer binding for the next `Dispatch`
+    /// (mirror of Tier-2's `bind_compute_storage_image` shape).
+    pub fn bind_compute_buffer(&self, binding: u32, buffer_id: ResourceId) {
+        self.compute_binds.lock().unwrap()
+            .insert(binding, buffer_id.raw());
+    }
+
+    /// Write bytes into a (host-visible, coherent) guest buffer.
+    pub fn buffer_write(&self, buffer_id: ResourceId, offset: u64, data: &[u8])
+        -> Result<(), String>
+    {
+        let buffers = self.buffers.lock().unwrap();
+        let b = buffers.get(&buffer_id.raw())
+            .ok_or_else(|| format!("buffer {buffer_id} not registered"))?;
+        let end = offset + data.len() as u64;
+        if end > b.size {
+            return Err(format!("write end {end} exceeds size {}", b.size));
+        }
+        if b.mapped.is_null() {
+            return Err("buffer memory not mapped".to_string());
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(), b.mapped.add(offset as usize), data.len());
+        }
+        Ok(())
     }
 
     /// Last measured GPU exec time in seconds (0.0 if timestamps are
@@ -504,6 +645,15 @@ impl Drop for MoltenVkBackend {
         // before the device, and the device before the instance.
         unsafe {
             let _ = self.device.device_wait_idle();
+            for (_, cp) in self.compute_pipelines.lock().unwrap().drain() {
+                self.device.destroy_pipeline(cp.pipeline, None);
+                self.device.destroy_pipeline_layout(cp.layout, None);
+                self.device.destroy_descriptor_set_layout(cp.dset_layout, None);
+                self.device.destroy_shader_module(cp.module, None);
+            }
+            if self.desc_pool != vk::DescriptorPool::null() {
+                self.device.destroy_descriptor_pool(self.desc_pool, None);
+            }
             for (_, img) in self.images.lock().unwrap().drain() {
                 if let Some(h) = img.image { self.device.destroy_image(h, None); }
                 if let Some(m) = img.memory { self.device.free_memory(m, None); }
@@ -600,7 +750,8 @@ impl Backend for MoltenVkBackend {
         let info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(vk::BufferUsageFlags::TRANSFER_DST
-                | vk::BufferUsageFlags::TRANSFER_SRC)
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::STORAGE_BUFFER)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = match unsafe { self.device.create_buffer(&info, None) } {
             Ok(b) => b,
@@ -729,6 +880,16 @@ impl MoltenVkBackend {
         let mut images = self.images.lock().unwrap();
         let buffers = self.buffers.lock().unwrap();
         let mut pipelines = self.pipelines.lock().unwrap();
+        let compute_pipelines = self.compute_pipelines.lock().unwrap();
+        if self.desc_pool != vk::DescriptorPool::null() {
+            unsafe {
+                let _ = dev.reset_descriptor_pool(
+                    self.desc_pool, vk::DescriptorPoolResetFlags::empty());
+            }
+        }
+        // Compute state for this frame stream.
+        let mut cur_compute: Option<u32> = None;
+        let mut push_bytes: Vec<u8> = Vec::new();
 
         // Open render pass + the transient objects to destroy post-submit.
         struct Active { rp: vk::RenderPass, fb: vk::Framebuffer,
@@ -803,6 +964,14 @@ impl MoltenVkBackend {
                     }
                 }
                 FrameOp::BindPipeline => {
+                    if body.len() >= 4 {
+                        let pid = u32::from_le_bytes(
+                            body[0..4].try_into().unwrap());
+                        if compute_pipelines.contains_key(&pid) {
+                            cur_compute = Some(pid);
+                            continue;
+                        }
+                    }
                     if body.len() < 4 { continue; }
                     let pid = u32::from_le_bytes(body[0..4].try_into().unwrap());
                     bound_pipeline = Some(pid);
@@ -846,6 +1015,96 @@ impl MoltenVkBackend {
                     unsafe { dev.cmd_draw(cb, vcount, icount, fvert, finst); }
                 }
                 FrameOp::EndRenderPass => { end_rp!(); }
+                FrameOp::PushConstants => {
+                    // 4-byte header (stage/offset/reserved) + payload.
+                    if body.len() >= 4 {
+                        push_bytes.clear();
+                        push_bytes.extend_from_slice(&body[4..]);
+                    }
+                }
+                FrameOp::Dispatch => {
+                    end_rp!();
+                    if body.len() < 12 { continue; }
+                    let gx = u32::from_le_bytes(body[0..4].try_into().unwrap());
+                    let gy = u32::from_le_bytes(body[4..8].try_into().unwrap());
+                    let gz = u32::from_le_bytes(body[8..12].try_into().unwrap());
+                    let Some(pid) = cur_compute else { continue; };
+                    let Some(cp) = compute_pipelines.get(&pid) else { continue; };
+                    if self.desc_pool == vk::DescriptorPool::null() { continue; }
+                    // Allocate + write the descriptor set from the
+                    // staged buffer bindings.
+                    let binds: Vec<(u32, u32)> = {
+                        let mut m = self.compute_binds.lock().unwrap();
+                        let mut v: Vec<(u32, u32)> = m.drain().collect();
+                        v.sort_unstable();
+                        v
+                    };
+                    let set_layouts = [cp.dset_layout];
+                    let dset = match unsafe { dev.allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::default()
+                            .descriptor_pool(self.desc_pool)
+                            .set_layouts(&set_layouts)) }
+                    {
+                        Ok(d) => d[0],
+                        Err(e) => {
+                            log::warn!("MoltenVk Dispatch: dset alloc {e:?}");
+                            continue;
+                        }
+                    };
+                    // Resolve (binding, VkBuffer) pairs first so the
+                    // info/write arrays stay aligned even when a
+                    // binding references an unknown buffer.
+                    let resolved: Vec<(u32, vk::Buffer, u64)> = binds
+                        .iter()
+                        .filter_map(|(binding, buf_id)| {
+                            buffers.get(buf_id).map(|b|
+                                (*binding, b.buffer, b.size))
+                        })
+                        .collect();
+                    let infos: Vec<vk::DescriptorBufferInfo> = resolved
+                        .iter()
+                        .map(|(_, buf, size)|
+                            vk::DescriptorBufferInfo::default()
+                                .buffer(*buf).offset(0).range(*size))
+                        .collect();
+                    let writes: Vec<vk::WriteDescriptorSet> = resolved
+                        .iter()
+                        .zip(infos.iter())
+                        .map(|((binding, _, _), info)|
+                            vk::WriteDescriptorSet::default()
+                                .dst_set(dset)
+                                .dst_binding(*binding)
+                                .descriptor_type(
+                                    vk::DescriptorType::STORAGE_BUFFER)
+                                .buffer_info(std::slice::from_ref(info)))
+                        .collect();
+                    unsafe {
+                        dev.update_descriptor_sets(&writes, &[]);
+                        dev.cmd_bind_pipeline(cb,
+                            vk::PipelineBindPoint::COMPUTE, cp.pipeline);
+                        dev.cmd_bind_descriptor_sets(cb,
+                            vk::PipelineBindPoint::COMPUTE, cp.layout,
+                            0, &[dset], &[]);
+                        if cp.push_size > 0 && !push_bytes.is_empty() {
+                            let n = push_bytes.len()
+                                .min(cp.push_size as usize);
+                            dev.cmd_push_constants(cb, cp.layout,
+                                vk::ShaderStageFlags::COMPUTE, 0,
+                                &push_bytes[..n]);
+                        }
+                        dev.cmd_dispatch(cb, gx, gy, gz);
+                        // Make the writes visible to host readback
+                        // (HOST_COHERENT memory + queue-wait below).
+                        let barrier = vk::MemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                            .dst_access_mask(vk::AccessFlags::HOST_READ);
+                        dev.cmd_pipeline_barrier(cb,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::HOST,
+                            vk::DependencyFlags::empty(),
+                            &[barrier], &[], &[]);
+                    }
+                }
                 FrameOp::CopyImgToBuf => {
                     end_rp!(); // image left in TRANSFER_SRC by the render pass
                     if body.len() < 16 + 56 { continue; }
