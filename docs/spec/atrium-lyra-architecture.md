@@ -174,6 +174,47 @@ driven by exact drift.
 rates, a resampler node between, the referee asserting no underrun and bounded
 drift error over a long run — the audio analogue of the display tear test.
 
+### 4.1 The device interface — OSS bring-up, native endpoint
+
+§3 anchors the sink deadline to "the exact instant the DMA engine consumes" a
+frame, and §4 reads "each device's true consumed-frame count… because Atrium
+owns the driver." That is the *endpoint*. The *bring-up* path is more pragmatic,
+and the two must be reconciled honestly.
+
+On FreeBSD the audio stack **is** OSS: `sound(4)` exposes `/dev/dsp*` directly
+through OSS v4 ioctls (`<sys/soundcard.h>`) — there is no separate ALSA-like
+layer, so "go through OSS" and "talk to the driver" are the *same thing*. The
+HDA driver is `snd_hda` (matching QEMU's `intel-hda`; `snd_ich`/`snd_es137x` for
+the AC97/ES1370 fallbacks). It is charter-clean — native FreeBSD, not a Linux
+shim. But `sound(4)` interposes **vchans** (in-kernel software mixing) and
+**feeder chains** (in-kernel rate/format conversion), and routing Lyra through
+those would *double-mix and double-resample* — the precise failure §1 designs
+against.
+
+**Two paths, sequenced like the GPU driver (bring-up on what works → converge to
+native):**
+
+- **A — OSS `/dev/dsp` in bit-perfect mode (bring-up).** Disable vchans
+  (`dev.pcm.N.bitperfect=1` / `hw.snd.maxautovchans=0`) and open at the exact
+  hardware rate/format so no feeder fires; the kernel then just DMAs Lyra's
+  already-mixed buffer to the codec. Lyra still owns the mix and resamples once.
+  The lane anchor (§3) comes from `SNDCTL_DSP_GETODELAY`/`GETOPTR` — an
+  *approximation* of the DMA play position, good enough to drive the daemon. For
+  deterministic, headless gating the QEMU `wav` backend captures output to a
+  file; `coreaudio` plays it live on the macOS host.
+- **B — an Atrium-native HDA driver (endpoint).** As with the GPU, Lyra
+  eventually talks the HDA DMA ring directly, with zero in-kernel mixer/feeder.
+  This is what §3/§4 actually want: the *exact* DMA position **and the
+  frame-interrupt timestamp** — the audio analogue of frescod's vblank anchor,
+  which the measured-drift resampler (§4) and the sink deadline (§3) are sharper
+  for. Justified precisely when the `GETODELAY` approximation becomes the
+  limiting error.
+
+So §3/§4's "Atrium owns the driver" is the **target invariant**; path A is the
+bring-up that approximates it through OSS without violating the single-resample
+or own-the-mix rules. The deterministic model (§10) is anchor-source-agnostic —
+it proves the algorithm against an exact clock, and either path feeds it.
+
 ## 5. Transport
 
 ### 5.1 Control plane — Aqueduct class 5
