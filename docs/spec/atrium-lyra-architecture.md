@@ -601,11 +601,8 @@ calls).
    audio. The split is deliberate and defensible — audio rings are tiny, GPU
    buffers are huge, and both are members of the **same energy federation**
    ("coordinated, not coupled") sharing one timing substrate (the deadline lane,
-   virtual time). But the **A/V sync contract** — how Lyra's audio presentation
-   timestamp aligns with Fresco's vblank/frame presentation — is unspecified.
-   **Disposition: record the architectural decision (two graphs, one federation,
-   *not* PipeWire's one graph); specify the cross-member A/V sync timestamp
-   contract (cross-cuts §3, the display doc).**
+   virtual time). **Contract SETTLED 2026-06-14 (model: `gpusim
+   engine/src/avsync.rs`), see §12.1 below.**
 
 4. **Glitch-free dynamic reconfiguration.** PipeWire's hallmark: re-wire/re-admit
    the graph (add a node, change rate, plug a device) *while playing*, no
@@ -656,6 +653,59 @@ control-plane state + an edge type). Priority order for the post-baseline phases
 passthrough/DSD (1) and channel/spatial (2) and A/V sync (3) and glitch-free
 reconfig (4) first; offload (5) with the mobile profile; transport (6) and MIDI
 (7) with the pro milestone; rate policy (8) and network (9) as they come.
+
+### 12.1 The A/V sync contract — Lyra ⟷ Fresco (settled 2026-06-14)
+
+The decision and the contract for gap 3. Two graphs, **one federation** — Lyra and
+Fresco stay independent graphs with independent mechanisms (explicitly *not*
+PipeWire's single merged graph); the federation is a **shared time reference**,
+and the *player* — not either subsystem — reconciles them.
+
+- **Shared clock = `CLOCK_MONOTONIC`** (the engine's picosecond virtual time in
+  the model). Both subsystems *already* anchor to it: Lyra's deadline-lane
+  `anchor_ns` is the DMA-interrupt timestamp; Fresco's vblank events are
+  monotonic. So presentation events are directly comparable with no new clock —
+  the contract just *states* that both timestamp against it. This is "coordinated,
+  not coupled" applied to time: read-only shared reference, independent mechanisms.
+- **Audio is the master clock.** Audio plays out the DAC at a fixed (drifting)
+  rate and cannot be stretched without artefacts; video repeats/drops a frame
+  near-invisibly. So audio free-runs and **video chases**.
+- **Lyra exposes an audio presentation clock**: stream-frame ↔ the monotonic
+  instant it reaches the speaker, built from `played_frames` (GETOPTR, ground
+  truth — the consumed-frame hardware clock), the DMA anchor, and the reported
+  output latency (GETODELAY buffered frames **+** the fixed codec/analog group
+  delay). The native HDA path makes the anchor exact. (The audio analog of
+  Wayland `wp_presentation` / Vulkan `VK_GOOGLE_display_timing`.)
+- **Fresco exposes present-feedback + target-present-time**: the actual vblank
+  instant a committed frame became visible, and (where supported) "present this
+  frame at-or-after monotonic time T". It already has vblank/flip-done on kqueue
+  and the scanline-accurate timing model; this surfaces what the engine computes,
+  reporting the pipeline+panel latency too.
+- **The player owns the policy.** It holds both PTSs, reads Lyra's audio clock to
+  learn stream-time at the speaker, computes each video frame's ideal present
+  instant, and lands it on the Fresco vblank nearest that instant. Neither
+  subsystem references the other.
+
+**VRR-aware from the start:** on a variable-refresh display Fresco can present a
+frame at the *exact* target instant within the refresh range (no fixed grid),
+which drives skew to ~0; fixed-refresh is the ±½-refresh fallback. The contract
+carries a target-present-time so a VRR panel uses it and a fixed panel snaps.
+
+**Latency honesty is the load-bearing requirement.** Bounded skew needs each side
+to report its *output* latency (audio buffer + codec; display pipeline + panel —
+an HDMI sink can add tens of ms); the player subtracts both to align "heard now"
+with "seen now". Report what the driver/EDID give; expose the residual as a knob.
+
+**Proven (gpusim `engine/src/avsync.rs`, 5 tests)** by composing the two real
+engine clocks (Lyra DAC `DeviceClock` @48 kHz, Fresco refresh `DeviceClock`
+@refresh) in one virtual-time reference: audio-master + nearest-vblank holds
+lip-sync within ±½ refresh (~8.3 ms @60 Hz) **forever** under DAC drift; a naïve
+wall-clock player (never reads the hw clock) drifts unbounded past the perceptual
+window (EBU R37 ≈ +40/−60 ms) — the cross-modal twin of the §4 measured-vs-assumed
+result; **independent** drift in *both* domains is absorbed (the federation
+point); VRR drives skew to ~0; latency compensation re-centres a standing offset.
+The wire-level query/feedback ABI on each side is the implementation follow-up
+(with the L4 session layer / the native display present-feedback path).
 
 ## 13. Spatial acoustics / audio ray-tracing (future direction)
 
