@@ -53,16 +53,28 @@ fn main() {
     // the hardware clock (played_frames) advancing. This is the device feed the
     // sink node will run on; the lane-sponsored per-period loop is the next step.
     if tone {
-        match OssSink::open(RATE, 2, FRAMES_PER_PERIOD) {
+        match OssSink::open(RATE, 2, FRAMES_PER_PERIOD, 8) {
             Ok(sink) => {
                 eprintln!("lyrad: OSS sink open ({} Hz, {} ch)", sink.rate_hz(), sink.channels());
                 let mut buf = vec![0i16; (FRAMES_PER_PERIOD * 2) as usize];
                 let periods = RATE / FRAMES_PER_PERIOD; // ~1 s
                 let mut phase = 0.0f32;
                 let step = 2.0 * std::f32::consts::PI * 440.0 / RATE as f32;
-                for _ in 0..periods {
+                // a short raised-cosine fade in/out kills the start/stop clicks.
+                let fade = (FRAMES_PER_PERIOD * 2) as usize; // ~5 ms ramp
+                for p in 0..periods {
+                    let base = (p * FRAMES_PER_PERIOD) as usize;
                     for f in 0..FRAMES_PER_PERIOD as usize {
-                        let s = (phase.sin() * 8000.0) as i16; // ~ -12 dBFS
+                        let i = base + f;
+                        let total = (periods * FRAMES_PER_PERIOD) as usize;
+                        let g = if i < fade {
+                            i as f32 / fade as f32
+                        } else if i >= total - fade {
+                            (total - i) as f32 / fade as f32
+                        } else {
+                            1.0
+                        };
+                        let s = (phase.sin() * 8000.0 * g) as i16; // ~ -12 dBFS
                         buf[f * 2] = s;
                         buf[f * 2 + 1] = s;
                         phase += step;
@@ -72,6 +84,7 @@ fn main() {
                         break;
                     }
                 }
+                let _ = sink.drain(); // play the buffer out before closing
                 match sink.played_frames() {
                     Ok(n) => eprintln!("lyrad: tone done; hw clock = {n} frames consumed"),
                     Err(e) => eprintln!("lyrad: played_frames: {e}"),
@@ -96,7 +109,44 @@ fn feed_mode(args: &[String]) {
     let spinners: usize = args.iter().position(|a| a == "--feed").and_then(|i| args.get(i + 2)).and_then(|s| s.parse().ok()).unwrap_or(16);
     let use_lane = args.iter().any(|a| a == "lane");
 
-    // fork spinner load.
+    // Order matters: open the sink, take the band, and PRIME the buffer BEFORE
+    // any load exists — otherwise the feed thread fights the spinners with an
+    // empty buffer and an un-banded priority, which is the start-time crackle.
+    let nfrags: u32 = std::env::var("LYRA_NFRAGS").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
+    let sink = match OssSink::open(RATE, 2, FRAMES_PER_PERIOD, nfrags) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("lyrad: no OSS sink ({e})");
+            std::process::exit(1);
+        }
+    };
+    let _lane = if use_lane {
+        match lyra::lane::self_sponsor(1000, period_us_for_feed()) {
+            Ok(fd) => { eprintln!("lyrad: feed thread sponsored on the lane"); Some(fd) }
+            Err(e) => { eprintln!("lyrad: self_sponsor failed ({e}); feeding without lane"); None }
+        }
+    } else {
+        None
+    };
+
+    let mut buf = vec![0i16; (FRAMES_PER_PERIOD * 2) as usize];
+    let mut phase = 0.0f32;
+    let step = 2.0 * std::f32::consts::PI * 440.0 / RATE as f32;
+    let fill = |buf: &mut [i16], phase: &mut f32| {
+        for f in 0..FRAMES_PER_PERIOD as usize {
+            let s = (phase.sin() * 8000.0) as i16;
+            buf[f * 2] = s;
+            buf[f * 2 + 1] = s;
+            *phase += step;
+        }
+    };
+    // prime the (small) buffer while there is no contention.
+    for _ in 0..nfrags {
+        fill(&mut buf, &mut phase);
+        let _ = sink.write_i16(&buf);
+    }
+
+    // NOW start the load — buffer primed, thread banded.
     let mut kids = Vec::new();
     for _ in 0..spinners {
         match unsafe { libc::fork() } {
@@ -112,43 +162,28 @@ fn feed_mode(args: &[String]) {
         }
     }
 
-    let sink = match OssSink::open(RATE, 2, FRAMES_PER_PERIOD) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("lyrad: no OSS sink ({e})");
-            for pid in kids { unsafe { libc::kill(pid, libc::SIGKILL); } }
-            std::process::exit(1);
-        }
-    };
-
-    // self-sponsor the feed thread (this thread) for band-priority prompt wakes.
-    let _lane = if use_lane {
-        match lyra::lane::self_sponsor(1000, period_us_for_feed()) {
-            Ok(fd) => { eprintln!("lyrad: feed thread sponsored on the lane"); Some(fd) }
-            Err(e) => { eprintln!("lyrad: self_sponsor failed ({e}); feeding without lane"); None }
-        }
-    } else {
-        None
-    };
-
-    let mut buf = vec![0i16; (FRAMES_PER_PERIOD * 2) as usize];
-    let mut phase = 0.0f32;
-    let step = 2.0 * std::f32::consts::PI * 440.0 / RATE as f32;
-    let _ = sink.play_underruns(); // clear the counter
+    let _ = sink.play_underruns(); // clear the counter; measure steady state
     let periods = (secs * RATE as u64) / FRAMES_PER_PERIOD as u64;
     for _ in 0..periods {
-        for f in 0..FRAMES_PER_PERIOD as usize {
-            let s = (phase.sin() * 8000.0) as i16;
-            buf[f * 2] = s;
-            buf[f * 2 + 1] = s;
-            phase += step;
-        }
+        fill(&mut buf, &mut phase);
         if sink.write_i16(&buf).is_err() {
             break;
         }
     }
 
+    // fade the last fragment to zero so the tone stops at silence (no end click),
+    // then drain so closing the fd does not truncate the buffer.
+    for f in 0..FRAMES_PER_PERIOD as usize {
+        let g = 1.0 - (f as f32 / FRAMES_PER_PERIOD as f32);
+        let s = (phase.sin() * 8000.0 * g) as i16;
+        buf[f * 2] = s;
+        buf[f * 2 + 1] = s;
+        phase += step;
+    }
+    let _ = sink.write_i16(&buf);
+
     let underruns = sink.play_underruns().unwrap_or(u32::MAX);
+    let _ = sink.drain();
     for pid in kids {
         unsafe { libc::kill(pid, libc::SIGKILL); libc::waitpid(pid, std::ptr::null_mut(), 0); }
     }

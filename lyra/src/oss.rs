@@ -39,6 +39,7 @@ const SNDCTL_DSP_SETFRAGMENT: u64 = iowr(10, 4);
 const SNDCTL_DSP_GETOPTR: u64 = ior(18, std::mem::size_of::<CountInfo>());
 const SNDCTL_DSP_GETODELAY: u64 = ior(23, 4);
 const SNDCTL_DSP_GETERROR: u64 = ior(25, std::mem::size_of::<AudioErrInfo>());
+const SNDCTL_DSP_SYNC: u64 = 0x2000_0000 | ((b'P' as u64) << 8) | 1; // _IO('P', 1)
 
 /// Mirror of `audio_errinfo` (sys/soundcard.h): 8 ints, 2 longs, filler[16].
 #[repr(C)]
@@ -76,10 +77,13 @@ pub struct OssSink {
 }
 
 impl OssSink {
-    /// Open `/dev/dsp` for playback at the exact `rate_hz`/`channels`, with a
-    /// fragment size near `frag_frames` (the latency knob → the lane period).
-    /// Bit-perfect mode is a bring-up sysctl, set outside this call.
-    pub fn open(rate_hz: u32, channels: u32, frag_frames: u32) -> io::Result<Self> {
+    /// Open `/dev/dsp` for playback at the exact `rate_hz`/`channels`, with
+    /// `nfrags` fragments of `frag_frames` each. `nfrags` is the **latency knob**:
+    /// total buffer = `nfrags · frag_frames` frames. A small buffer is low
+    /// latency but only survives load if the feed thread is punctual — which is
+    /// what the deadline lane provides; a large buffer hides scheduling jitter at
+    /// the cost of latency (why consumer stacks default high).
+    pub fn open(rate_hz: u32, channels: u32, frag_frames: u32, nfrags: u32) -> io::Result<Self> {
         let fd = unsafe { libc::open(c"/dev/dsp".as_ptr(), libc::O_WRONLY) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -94,9 +98,10 @@ impl OssSink {
         // writes back the granted value; we require the device accept ours
         // exactly (bit-perfect — no silent feeder conversion).
         let frag_bytes = (frag_frames * channels * 2).max(64);
-        // SETFRAGMENT arg: (count << 16) | log2(bytes). 0x7fff = "as many as fit".
+        // SETFRAGMENT arg: (max_count << 16) | log2(bytes). max_count bounds the
+        // total buffer = the latency; the device may grant fewer.
         let sz_sel = (31 - (frag_bytes.max(1)).leading_zeros()) as i32;
-        sink.set(SNDCTL_DSP_SETFRAGMENT, (0x7fff << 16) | sz_sel)?;
+        sink.set(SNDCTL_DSP_SETFRAGMENT, ((nfrags as i32 & 0x7fff) << 16) | sz_sel)?;
         sink.require(SNDCTL_DSP_SETFMT, AFMT_S16_NE, "format")?;
         sink.require(SNDCTL_DSP_CHANNELS, channels as i32, "channels")?;
         sink.require(SNDCTL_DSP_SPEED, rate_hz as i32, "rate")?;
@@ -179,6 +184,17 @@ impl OssSink {
         Ok(ei.play_underruns as u32)
     }
 
+    /// Block until every queued frame has played, then reset (`SNDCTL_DSP_SYNC`).
+    /// Called at shutdown so closing the fd does not abort the buffer mid-play
+    /// (the source of the stop-time crackle).
+    pub fn drain(&self) -> io::Result<()> {
+        let rc = unsafe { libc::ioctl(self.fd.as_raw_fd(), SNDCTL_DSP_SYNC) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Frames still queued in the DMA pipeline ahead of the codec
     /// (`SNDCTL_DSP_GETODELAY`) — the headroom before underrun.
     pub fn delay_frames(&self) -> io::Result<u64> {
@@ -211,6 +227,6 @@ mod tests {
     fn open_degrades_cleanly_without_a_device() {
         // off FreeBSD (or with no /dev/dsp) open fails cleanly — lyrad then runs
         // without a hardware sink, exactly like the lane shim.
-        assert!(OssSink::open(48_000, 2, 128).is_err());
+        assert!(OssSink::open(48_000, 2, 128, 3).is_err());
     }
 }
