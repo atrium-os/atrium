@@ -453,6 +453,26 @@ WirePlumber) and PulseAudio got wrong (policy hard-coded):
   what is even possible. Policy is data the user and manifests own, enforced by a
   non-RT component, never baked into the engine.
 
+**Why audio needs this when video seems not to — the "audio window manager".**
+Video has a policy layer too; it is the **window manager** (Pergola / WM), and it
+sits to **Fresco** (composite + scanout, mechanism only) exactly as this layer
+sits to lyrad. The reason it does not *look* like a separate need is one physical
+fact: **audio is a single additive channel; video is a partitioned spatial
+canvas.** Every app's audio *sums* into one stream to one output — the streams
+collide in the same air — so *relative level* must be arbitrated continuously
+(that is what ducking and per-app volume are). Video windows do not sum; the
+compositor *places* them in space, so "who is prominent" is solved by layout and
+focus, not by level. There is no video analog to ducking because windows do not
+add. But every other audio-policy concern *does* have a video twin, already owned
+by the WM: route-to-sink ↔ place-on-monitor; ducking/volume ↔ focus/dim/DND;
+default-device-follow-on-hotplug ↔ window migration when a monitor is plugged;
+bit-perfect/passthrough **exclusive** ↔ **fullscreen direct-scanout**. So audio
+did not acquire a *new* kind of component — it needs its own policy layer only
+because audio's arbitration cannot hide inside "placement" (there is no space to
+place into; it all sums to one output), where video's can. The layer is, in
+effect, the audio window manager — a first-class policy sibling of lyrad, not a
+subthread of it.
+
 **Modeled (gpusim `engine/src/lyra_policy.rs`, 7 tests).** `Session::resolve()` is
 **pure** — given the streams, devices, and rules it computes the desired
 `(sink, gain)` per stream with no scheduling, mixing, or audio-path side effect;
