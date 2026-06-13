@@ -531,6 +531,17 @@ monitor are distinct (a conferencing app needs the mic, not the system tap). All
 three appear in the manifest and at the user-facing grant surface — privacy by
 construction, not by a config the user never sees.
 
+**Modeled (gpusim `engine/src/choragus.rs`, 4 tests).** Portcullis grants the
+capability; **Choragus enforces** what audio access it permits, default-deny.
+`required(access)` maps each access to its one capability and `check()` refuses an
+absent one. Proven: `audio` plays and sees its own streams but *cannot* tap the
+mix or the mic (the anti-PulseAudio-leak property — the global mix is never
+implied by `audio`); `microphone` and `audio_monitor` are distinct each way (a
+conferencing app with the mic cannot record the system output); `audio_monitor`
+is the *only* path to the mix or another stream, structurally; the empty grant
+denies everything. The wire format (the capability token Portcullis hands Choragus
+over Aqueduct) is the L4/L5 implementation follow-up.
+
 ## 10. The deterministic model (audio.rs lineage)
 
 Like display-timing and the scheduler, Lyra is **proven in a deterministic
