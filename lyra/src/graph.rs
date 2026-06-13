@@ -131,19 +131,31 @@ impl Graph {
     }
 }
 
-/// Build the canonical consumer graph: `source → mix → sink`. The simplest case
-/// of the full substrate (the foundation-app baseline). `client_q_us` is the
-/// client stream's budget; the mix and sink are lyrad's own.
+/// Build the canonical single-stream consumer graph: `source → mix → sink`. The
+/// simplest case of the full substrate. `client_q_us` is the client stream's
+/// budget; the mix and sink are lyrad's own.
 pub fn consumer_graph(period_us: u64, client_q_us: u64) -> Graph {
-    Graph {
-        nodes: vec![
-            Node::new(NodeKind::Source, client_q_us, &[]),
-            Node::new(NodeKind::Mix, period_us / 20, &[0]), // ~5% of period
-            Node::new(NodeKind::Sink, period_us / 20, &[1]),
-        ],
-        period_us,
-        u_lane_permille: 750,
-    }
+    mixer_graph(period_us, &[client_q_us])
+}
+
+/// Build the real consumer baseline: **N client streams → one mix → sink** — the
+/// foundation-app case where several apps play at once. Each source's budget is
+/// its declared per-period work; the mix fans them in (its budget grows a little
+/// with the stream count, the per-stream sum cost); the sink feeds the device.
+/// Admission across *all* streams is the cap that bounds how many can play at the
+/// chosen latency — `U_lane` is the guarantee, surfaced as `OverSubscribed`.
+pub fn mixer_graph(period_us: u64, client_q_us: &[u64]) -> Graph {
+    let n = client_q_us.len();
+    let mut nodes: Vec<Node> = client_q_us
+        .iter()
+        .map(|&q| Node::new(NodeKind::Source, q, &[]))
+        .collect();
+    let sources: Vec<NodeId> = (0..n).collect();
+    // mix budget: a small fixed cost plus a per-stream summing cost.
+    let mix_us = period_us / 40 + (n as u64) * (period_us / 200);
+    nodes.push(Node::new(NodeKind::Mix, mix_us, &sources)); // node n
+    nodes.push(Node::new(NodeKind::Sink, period_us / 20, &[n])); // node n+1
+    Graph { nodes, period_us, u_lane_permille: 750 }
 }
 
 #[cfg(test)]
@@ -195,6 +207,35 @@ mod tests {
             Err(AdmitError::OverSubscribed { needed_us, available_us }) => {
                 assert!(needed_us > available_us);
                 assert_eq!(available_us, PERIOD * 750 / 1000);
+            }
+            other => panic!("expected oversubscription: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn many_streams_mix_into_one_sink() {
+        // four apps playing at once → one mix → sink. All four sources feed the
+        // mix; the mix feeds the sink; cascading deadlines order them.
+        let g = mixer_graph(PERIOD, &[400, 400, 400, 400]);
+        let res = g.admit().expect("four 0.4ms streams fit");
+        assert_eq!(res.len(), 6); // 4 sources + mix + sink
+        // the mix node depends on all four sources; it is scheduled after them.
+        let mix = res.iter().find(|r| r.node == 4).unwrap();
+        let sink = res.iter().find(|r| r.node == 5).unwrap();
+        let last_source = res.iter().filter(|r| r.node < 4).map(|r| r.deadline_offset_us).max().unwrap();
+        assert!(mix.deadline_offset_us > last_source, "mix runs after every source");
+        assert!(sink.deadline_offset_us > mix.deadline_offset_us, "sink runs last");
+        assert!(sink.deadline_offset_us < PERIOD);
+    }
+
+    #[test]
+    fn too_many_streams_exceed_the_admission_cap() {
+        // enough concurrent streams to blow U·T (= 2000 µs): the cap bounds how
+        // many can play at this latency — the guarantee, surfaced honestly.
+        let many: Vec<u64> = vec![400; 8]; // 8 × 0.4 ms = 3.2 ms of sources alone
+        match mixer_graph(PERIOD, &many).admit() {
+            Err(AdmitError::OverSubscribed { needed_us, available_us }) => {
+                assert!(needed_us > available_us);
             }
             other => panic!("expected oversubscription: {other:?}"),
         }
