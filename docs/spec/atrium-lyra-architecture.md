@@ -443,7 +443,9 @@ WirePlumber) and PulseAudio got wrong (policy hard-coded):
 
 - **lyrad** is the RT graph **engine** — admit, schedule, mix, resample. Mechanism
   only. No routing opinions.
-- The **session/policy layer** decides *which app → which sink*, default-device
+- **Choragus** (`choragusd`) is the **session/policy layer** — named for the
+  citizen who arranged and directed the chorus in classical theatre (*Lyra plays;
+  the Choragus arranges who plays*; NAMING.md). It decides *which app → which sink*, default-device
   follow, **ducking** (lower media when a communication stream opens), per-app
   volume, and device-hotplug response. It is **not** a Lua config (PipeWire's
   choice) and **not** hard-coded (PulseAudio's): it is **capability- and
@@ -487,9 +489,10 @@ refuses a second stream on the device; and policy emits *only* those
 mechanism-agnostic changes — never a schedule or a mixed buffer. The
 purity of `resolve()` is what lets the layer sit outside the RT engine.
 
-(The session layer's exact packaging — a non-RT thread in lyrad vs a sibling
-daemon — and its Latin name remain open, §11; the pure separation modeled here
-permits either.)
+(**Name settled 2026-06-14: Choragus.** Its exact packaging — a non-RT thread in
+lyrad vs the sibling `choragusd` daemon — remains open, §11; the pure separation
+modeled here permits either, though the "audio window manager" framing favours a
+first-class component over a lyrad subthread.)
 
 ## 8. Energy — the (floor, elastic) federation member
 

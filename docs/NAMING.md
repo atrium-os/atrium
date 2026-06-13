@@ -22,6 +22,7 @@ Canonical vocabulary for the Atrium platform. Every component in this table has 
 | **System IPC bus** | **Castellum** | aqueduct distribution junction | message bus between system services and apps; capability-gated, per-slot ring shape |
 | **Display manager** | **Vestibulum** | entry hall | login screen + session handoff |
 | **Audio server** | **Lyra** | stringed instrument | per-stream submission, content-addressed sample buffers |
+| **Audio policy / session layer** | **Choragus** | the citizen who organised, arranged & directed the chorus in Greek theatre | the "audio window manager" — routing, ducking, per-app volume, hotplug-follow, exclusive-claim; mechanism/policy split from lyrad (the RT engine). *Lyra plays; the Choragus arranges who plays.* |
 | **Clipboard** | **Tabula** | wax tablet | clipboard service; entries are CAS blobs, multi-format |
 | **Notifications** | **Praeco** | town crier / herald | toast notifications + history |
 | **Package manager** | **Opifex** | craftsman / maker | fetch + verify + install + rollback of jail trees |
@@ -70,7 +71,7 @@ These are tagged in the system-services table above; the Latin name signals thei
 | `/dev/atrium-gpu-compute0` | future, capability-gated | per-jail compute access |
 | `/var/run/atrium/portcullisd.sock` | Portcullis | jail-management IPC |
 | `/var/run/atrium/castellumd.sock` | Castellum | bus admin |
-| `/var/run/atrium/{lyrad,tabulad,praecod,opifexd,curiad,scriniumd,vestibulumd,stoad}.sock` | respective services | service-specific |
+| `/var/run/atrium/{lyrad,choragusd,tabulad,praecod,opifexd,curiad,scriniumd,vestibulumd,stoad}.sock` | respective services | service-specific |
 | `/var/run/atrium/{limend,tabellariusd,loculusd,concursusd,nomenclatord}.sock` | Insula services | service-specific (planned) |
 | `/var/db/atrium/stoa/<user>/<sess>/` | Stoa | per-session metadata + WAL pointers (blobs live in Tessera) |
 | `~/.local/share/atrium/apps/*.toml` | user | installed-app manifests |
@@ -114,6 +115,7 @@ GitHub org: **`atrium-os`**. Repo names mirror service names where applicable.
 | `atrium-os/castellum` | IPC bus |
 | `atrium-os/vestibulum` | display manager / login |
 | `atrium-os/lyra` | audio server |
+| `atrium-os/choragus` | audio policy / session layer |
 | `atrium-os/tabula` | clipboard |
 | `atrium-os/praeco` | notifications |
 | `atrium-os/opifex` | package manager |
@@ -133,7 +135,7 @@ GitHub org: **`atrium-os`**. Repo names mirror service names where applicable.
 - **User-facing apps use plain descriptive names with `atrium-` prefix.** Avoids PATH collisions, doesn't burden users with vocabulary.
 - **Cdevs and ioctls use `atrium-` / `ATRIUM_*` prefix.** They're platform-level, not protocol-level.
 - **Fresco stays "Fresco" — it's the protocol, not the OS.** When in doubt, ask: is this about how apps render, or how the platform is configured? Rendering = Fresco, platform = Atrium.
-- **Daemons end in `d`.** `portcullisd`, `castellumd`, `lyrad`, `tabulad`, `praecod`, `opifexd`, `curiad`, `scriniumd`, `vestibulumd`, `stoad`, `limend`, `tabellariusd`, `loculusd`, `concursusd`, `nomenclatord`. The dock is a UI app, no `d` suffix needed for `forum`.
+- **Daemons end in `d`.** `portcullisd`, `castellumd`, `lyrad`, `choragusd`, `tabulad`, `praecod`, `opifexd`, `curiad`, `scriniumd`, `vestibulumd`, `stoad`, `limend`, `tabellariusd`, `loculusd`, `concursusd`, `nomenclatord`. The dock is a UI app, no `d` suffix needed for `forum`.
 
 ## How this reads to a user
 
