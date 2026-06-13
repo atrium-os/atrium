@@ -56,9 +56,15 @@ fn main() {
     let plugin: Option<PathBuf> = args.iter().position(|a| a == "--plugin")
         .and_then(|i| args.get(i + 1)).map(PathBuf::from);
     let want_jail = args.iter().any(|a| a == "--jail");
+    // --adopt <pid> <tid>: the client entity to run on (K-b, charge-back).
+    let adopt_target: Option<(i32, i32)> = args.iter().position(|a| a == "--adopt")
+        .and_then(|i| Some((args.get(i + 1)?.parse().ok()?, args.get(i + 2)?.parse().ok()?)));
 
     let inr = Ring::open(in_name, false).expect("open in ring");
     let outr = Ring::open(out_name, true).expect("open out ring");
+    // K-b: open /dev/laminar BEFORE the jail (cap_enter blocks new opens). The
+    // adopt ioctl runs on this held fd, inside the jail.
+    let lane_fd = adopt_target.and_then(|_| lyra::lane::open_lane().ok());
 
     let rate = 48_000.0f32;
 
@@ -96,12 +102,25 @@ fn main() {
 
     let mut buf = vec![0.0f32; 256 * CH];
     let mut processed: u64 = 0;
+    let mut adopted = false;
     loop {
         let n = inr.read(&mut buf) as usize;
         if n == 0 {
             std::hint::spin_loop();
             unsafe { libc::usleep(200) };
             continue;
+        }
+        // K-b: adopt the client's entity on the FIRST buffer (by now lyrad is
+        // sponsored, so the entity exists). From here this node's CPU charges the
+        // client's CBS budget — a heavy plugin throttles the client, not lyrad.
+        if !adopted {
+            adopted = true; // attempt once; processing proceeds regardless.
+            if let (Some(fd), Some((pid, tid))) = (lane_fd.as_ref(), adopt_target) {
+                match lyra::lane::adopt(fd, pid, tid) {
+                    Ok(()) => eprintln!("lyra-effect: adopted client entity (pid {pid} tid {tid}); charged to its budget"),
+                    Err(e) => eprintln!("lyra-effect: adopt failed: {e}"),
+                }
+            }
         }
         if let Some(node) = node.as_mut() {
             // the hosted C node processes the buffer in place.

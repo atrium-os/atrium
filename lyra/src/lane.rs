@@ -53,7 +53,57 @@ struct LamLaneReq {
     t_us: u64,
 }
 const LAMIOC_SPONSOR: u64 = iow(b'L', 1, std::mem::size_of::<LamLaneReq>());
-const LAMIOC_WITHDRAW: u64 = 0x2000_0000 | ((b'L' as u64) << 8) | 2; // _IO('L', 2)
+const IOC_VOID: u64 = 0x2000_0000;
+const LAMIOC_WITHDRAW: u64 = IOC_VOID | ((b'L' as u64) << 8) | 2; // _IO('L', 2)
+
+/* K-b deadline adoption (Laminar phase K-b, kernel LAMIOC_ADOPT/DROP). A thread
+ * ADOPTs another entity: it gains the lane band for SELECTION but its runtime is
+ * charged to the ADOPTED entity's CBS budget. */
+const LAMIOC_ADOPT: u64 = iow(b'L', 7, std::mem::size_of::<LamLaneReqFor>());
+const LAMIOC_DROP: u64 = IOC_VOID | ((b'L' as u64) << 8) | 8; // _IO('L', 8)
+
+/// The calling thread's lwpid — the `tid` half of its lane-entity identity, so
+/// another thread or process can [`adopt`] it. FreeBSD-only; 0 elsewhere.
+#[cfg(target_os = "freebsd")]
+pub fn current_tid() -> i32 {
+    unsafe { libc::pthread_getthreadid_np() as i32 }
+}
+#[cfg(not(target_os = "freebsd"))]
+pub fn current_tid() -> i32 {
+    0
+}
+
+/// Open `/dev/laminar` for K-b adoption. A jailed effect MUST call this before
+/// entering the Capsicum jail (`cap_enter` blocks new opens); the returned fd is
+/// held for the node's life and the adopt/drop ioctls run on it inside the jail.
+pub fn open_lane() -> io::Result<OwnedFd> {
+    let fd = unsafe { libc::open(c"/dev/laminar".as_ptr(), libc::O_RDWR) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// K-b adoption: the CALLING thread adopts client entity `(pid, tid)`. It gains
+/// the lane band for SELECTION, but its runtime is charged to the CLIENT's CBS
+/// budget — charge-back, so a heavy effect throttles the client's reservation
+/// and can never steal extra time (the gaming hole frescod's K-b closed). The
+/// audio analog of frescod's reader/writer adopting their client: a graph node
+/// processes on the budget of whoever asked for the effect, self-regulating.
+pub fn adopt(fd: &OwnedFd, pid: i32, tid: i32) -> io::Result<()> {
+    let req = LamLaneReqFor { pid, tid, ..Default::default() };
+    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), LAMIOC_ADOPT, &req) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Undo [`adopt`] for the calling thread. Also implicit when the adopted
+/// entity is torn down — the kernel invalidates stale adopters by generation.
+pub fn drop_adopt(fd: &OwnedFd) {
+    unsafe { libc::ioctl(fd.as_raw_fd(), LAMIOC_DROP) };
+}
 
 /// Sponsor the CALLING thread as a lane entity `(q_us, t_us)`. lyrad uses this
 /// for its own device-feed thread: band priority so it is scheduled promptly on

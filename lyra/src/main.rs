@@ -220,6 +220,29 @@ fn effect_mode(args: &[String]) {
     let dry = Ring::create(&dry_name, 4096, 2).expect("dry ring");
     let wet = Ring::create(&wet_name, 4096, 2).expect("wet ring");
 
+    // K-b: with LYRA_ADOPT, lyrad sponsors its OWN (this) thread as the graph
+    // entity, then hands its (pid, tid) to the effect, which adopts it — so the
+    // whole chain (generate -> effect -> output) runs on ONE reservation, charged
+    // back. A heavy plugin eats lyrad's budget, not extra band. Sponsor BEFORE
+    // spawning so the entity exists when the effect's first buffer triggers adopt.
+    // Hold _lane_fd for lyrad's lifetime (closing it withdraws the sponsorship).
+    let mut adopt_args: Option<(i32, i32)> = None;
+    let _lane_fd = if std::env::var("LYRA_ADOPT").is_ok() {
+        let t_us = (FRAMES_PER_PERIOD as u64 * 1_000_000) / RATE as u64;
+        // budget = half the period (50% util, under deadline_util_max). One
+        // reservation covers BOTH lyrad's feed and the adopted effect's DSP.
+        match lyra::lane::self_sponsor(t_us / 2, t_us) {
+            Ok(fd) => {
+                adopt_args = Some((pid, lyra::lane::current_tid()));
+                eprintln!("lyrad: graph entity sponsored (pid {pid} tid {})", lyra::lane::current_tid());
+                Some(fd)
+            }
+            Err(e) => { eprintln!("lyrad: self_sponsor failed ({e}); effect runs un-adopted"); None }
+        }
+    } else {
+        None
+    };
+
     // spawn the effect node (sibling binary next to lyrad).
     let me = std::env::current_exe().expect("current_exe");
     let effect_bin = me.with_file_name("lyra-effect");
@@ -236,6 +259,9 @@ fn effect_mode(args: &[String]) {
     }
     if std::env::var("LYRA_JAIL").is_ok() {
         cmd.arg("--jail");
+    }
+    if let Some((p, t)) = adopt_args {
+        cmd.arg("--adopt").arg(p.to_string()).arg(t.to_string());
     }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
