@@ -51,7 +51,9 @@ fn main() {
             continue;
         }
         for f in 0..n {
-            let g = 0.5 + 0.5 * lfo.sin();
+            // tremolo when trem_hz > 0; otherwise passthrough (unity gain) so
+            // the output is bit-exactly the input — a clean pipeline check.
+            let g = if trem_hz > 0.0 { 0.5 + 0.5 * lfo.sin() } else { 1.0 };
             buf[f * CH] *= g;
             buf[f * CH + 1] *= g;
             lfo += lfo_step;
