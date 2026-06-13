@@ -453,8 +453,23 @@ WirePlumber) and PulseAudio got wrong (policy hard-coded):
   what is even possible. Policy is data the user and manifests own, enforced by a
   non-RT component, never baked into the engine.
 
-(The session layer's exact packaging — a thread in lyrad vs a sibling daemon —
-and its Latin name are open, §11.)
+**Modeled (gpusim `engine/src/lyra_policy.rs`, 7 tests).** `Session::resolve()` is
+**pure** — given the streams, devices, and rules it computes the desired
+`(sink, gain)` per stream with no scheduling, mixing, or audio-path side effect;
+`diff()` turns a desired-state change into mechanism-agnostic `Change`s — a
+`GainRamp` (the zipper-free smoother) or a `Reroute` (applied by the §12.2
+glitch-free atomic-commit reconfiguration). Proven: Communication ducks Media/Game
+and restores; Pro/Notification are never ducked; user volume is the base the duck
+stacks on; Communication prefers a headset by role while an explicit user route
+overrides; a hotplugged headset becomes default and streams follow (emitting a
+single `Reroute`); an **exclusive claim** (bit-perfect / passthrough, §4.3)
+refuses a second stream on the device; and policy emits *only* those
+mechanism-agnostic changes — never a schedule or a mixed buffer. The
+purity of `resolve()` is what lets the layer sit outside the RT engine.
+
+(The session layer's exact packaging — a non-RT thread in lyrad vs a sibling
+daemon — and its Latin name remain open, §11; the pure separation modeled here
+permits either.)
 
 ## 8. Energy — the (floor, elastic) federation member
 
