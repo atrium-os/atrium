@@ -45,6 +45,41 @@ const fn iow(group: u8, num: u8, len: usize) -> u64 {
 const LAMIOC_SPONSOR_FOR: u64 = iow(b'L', 5, std::mem::size_of::<LamLaneReqFor>());
 const LAMIOC_WITHDRAW_FOR: u64 = iow(b'L', 6, std::mem::size_of::<LamLaneReqFor>());
 
+/* Self-sponsorship for lyrad's OWN threads (e.g. the device-feed thread):
+ * LAMIOC_SPONSOR _IOW('L', 1, lam_lane_req{q_us, t_us}). */
+#[repr(C)]
+struct LamLaneReq {
+    q_us: u64,
+    t_us: u64,
+}
+const LAMIOC_SPONSOR: u64 = iow(b'L', 1, std::mem::size_of::<LamLaneReq>());
+const LAMIOC_WITHDRAW: u64 = 0x2000_0000 | ((b'L' as u64) << 8) | 2; // _IO('L', 2)
+
+/// Sponsor the CALLING thread as a lane entity `(q_us, t_us)`. lyrad uses this
+/// for its own device-feed thread: band priority so it is scheduled promptly on
+/// every device wakeup, the property that keeps OSS from underrunning under load
+/// (the metronome result, now driving real hardware). Open `/dev/laminar` here
+/// rather than via [`LaneBroker`] so the fd's lifetime matches the feed thread.
+pub fn self_sponsor(q_us: u64, t_us: u64) -> io::Result<OwnedFd> {
+    let fd = unsafe { libc::open(c"/dev/laminar".as_ptr(), libc::O_RDWR) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let req = LamLaneReq { q_us, t_us };
+    let rc = unsafe { libc::ioctl(fd, LAMIOC_SPONSOR, &req) };
+    if rc != 0 {
+        let e = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Withdraw the calling thread's self-sponsorship (closing the fd also does it).
+pub fn self_withdraw(fd: &OwnedFd) {
+    unsafe { libc::ioctl(fd.as_raw_fd(), LAMIOC_WITHDRAW) };
+}
+
 /// The lane broker: one `/dev/laminar` fd owning all of lyrad's sponsorships.
 pub struct LaneBroker {
     fd: OwnedFd,

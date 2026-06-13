@@ -38,6 +38,24 @@ const SNDCTL_DSP_CHANNELS: u64 = iowr(6, 4);
 const SNDCTL_DSP_SETFRAGMENT: u64 = iowr(10, 4);
 const SNDCTL_DSP_GETOPTR: u64 = ior(18, std::mem::size_of::<CountInfo>());
 const SNDCTL_DSP_GETODELAY: u64 = ior(23, 4);
+const SNDCTL_DSP_GETERROR: u64 = ior(25, std::mem::size_of::<AudioErrInfo>());
+
+/// Mirror of `audio_errinfo` (sys/soundcard.h): 8 ints, 2 longs, filler[16].
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct AudioErrInfo {
+    play_underruns: i32,
+    rec_overruns: i32,
+    play_ptradjust: u32,
+    rec_ptradjust: u32,
+    play_errorcount: i32,
+    rec_errorcount: i32,
+    play_lasterror: i32,
+    rec_lasterror: i32,
+    play_errorparm: i64,
+    rec_errorparm: i64,
+    filler: [i32; 16],
+}
 
 const AFMT_S16_NE: i32 = 0x0000_0010; // AFMT_S16_LE on little-endian (aarch64)
 
@@ -145,6 +163,20 @@ impl OssSink {
             return Err(io::Error::last_os_error());
         }
         Ok(ci.bytes as u64 / self.frame_bytes as u64)
+    }
+
+    /// Total play underruns since the last call (`SNDCTL_DSP_GETERROR`) — the
+    /// device's own count of times it ran dry. The objective glitch metric: a
+    /// lane-sponsored feed thread holds this at 0 under load; a plain timeshare
+    /// one does not. (GETERROR is consume-on-read in OSS v4.)
+    pub fn play_underruns(&self) -> io::Result<u32> {
+        let mut ei = AudioErrInfo::default();
+        let rc =
+            unsafe { libc::ioctl(self.fd.as_raw_fd(), SNDCTL_DSP_GETERROR, &mut ei) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(ei.play_underruns as u32)
     }
 
     /// Frames still queued in the DMA pipeline ahead of the codec
