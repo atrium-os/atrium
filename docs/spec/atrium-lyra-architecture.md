@@ -387,9 +387,54 @@ int lyra_node_process(void *state, struct lyra_node_io *io);  /* RT, no syscalls
   phase-coherent — the thing DAWs need and consumer stacks ignore.
 
 System/trusted DSP (the core mixer, the domain resamplers) is built in to lyrad
-for latency; *third-party* plugins are always jailed. (This is the hybrid the
+for latency; *third-party* plugins are always sandboxed. (This is the hybrid the
 "capability-jailed nodes" choice still permits — the boundary is trust, and
 trusted code is part of the engine, not a separate plugin.)
+
+### 6.1 Two confinement layers, and who creates the jail (settled 2026-06-14)
+
+"Sandboxed" above is **two distinct mechanisms**, and conflating them was an
+error worth nailing down:
+
+- **Capsicum** — *opt-in self-confinement*: the node process calls `cap_enter()`
+  on **itself**, after it has opened its rings + lane fd and `dlopen`'d the
+  plugin, and before the untrusted `.so` runs. From then it holds only those fds:
+  no `open`, no network, no new fds. This is **built** (`lyra-effect --capsicum`),
+  and because the untrusted code is loaded *after* `cap_enter`, the plugin never
+  runs un-confined.
+- **The Portcullis jail** — *forced confinement*: `jaild` (the TCB, the sole
+  caller of `jail_set`) creates a jail and `execve`s the node **inside** it; the
+  node gets no say. This is the [[project_scheduler_federation_corrected]]/
+  Portcullis mechanism (`docs/spec/portcullis.md`). This is **not yet built** for
+  audio nodes.
+
+They are complementary defence-in-depth, not alternatives. Capsicum already
+delivers the core property (an untrusted `.so` cannot escape its process). The
+jail adds what Capsicum cannot: it does not depend on lyra-effect being correct,
+and — the real prize — it makes a plugin a **first-class Portcullis citizen**
+(`atrium.toml` manifest, user-granted capabilities, `rctl` caps, unified
+lifecycle). The privacy capabilities of §4.3 (`audio` / `microphone` /
+`audio_monitor`) live in *that* grant path; a Capsicum-only plugin is invisible
+to it.
+
+**Responsibility split (settled):** Lyra never creates jails and never owns
+policy. When the forced layer lands, **lyrad requests a node from `portcullisd`**
+("launch `org.foo.reverb` as a graph node"); portcullisd does the
+manifest/capability/grant policy and asks `jaild` to create the jail; the plugin
+process is `execve`'d inside it by jaild and **connects back to lyrad over an
+Aqueduct socket**, over which lyrad passes the ring + lane fds via `SCM_RIGHTS`
+(POSIX shm is jail-scoped, so the by-name ring of §5.2 becomes fd-passed across a
+jail boundary — the Carillon pattern). Capsicum still applies *inside* the jail.
+Rejected: lyrad talking to `jaild` directly — it would fragment policy into the
+RT audio daemon and widen jaild's trusted client set for no gain over routing
+through portcullisd. Each component does its trust-rank's job: lyrad drives the
+graph, portcullisd owns policy, jaild owns jail creation.
+
+**Sequencing (committed):** the fd-passing transport + the portcullisd
+"launch-a-node" request are the *same* machinery the §7 policy/session layer (and
+the privacy capabilities) need, so the forced jail is built **with the L4/L5
+session/policy layer**, not as a one-off. Until then, Capsicum is the baseline
+and this is recorded as the deferred hardening it is — not a silent gap.
 
 ## 7. Policy and the session layer — separate from the engine
 
