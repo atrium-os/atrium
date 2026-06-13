@@ -134,6 +134,32 @@ Laminar continues its letter-phase discipline (…H = DVFS). New phases:
   lineage) framed per federation doc §7: Atrium axis first, never "EEVDF done
   better."
 
+## 2.5 Status as built (2026-06-13)
+
+Branch `atrium/scheduler-phase-A` (freebsd-src), `frescod`/`atrium-gpu-amd`
+(bsd), gpusim. Running results: `tools/test/sched-laminar/bench/results/
+LAMINAR-vs-ULE-2026-06-12-waketails.md`.
+
+| Phase | Status | Where / lessons not anticipated by the plan |
+|---|---|---|
+| P0 | ✅ | SchedRegs time-charge fix (`02ac26a`); wake-tail bench + the **RT-blind placement** discovery (`rt_occupied_cost`, ~500×) — the first cut gated on `is_timeshare` did nothing because pipe wakers run at kernel sleep priority pre-userret; bimodality dispositioned as the host/HVF stall class (see P7 blocker). |
+| P1 | ✅ | `lane.rs` 5 proofs + `audio.rs` underrun referee (`637c4d5`). The inversion proof itself surfaced the broker-API consequence: **Q must be sized ≥ exec+hold**. |
+| P2 (phase I) | ✅ | `90b417537fab`. Three fixes the plan didn't foresee: replenish callout must be **`C_DIRECT_EXEC`** (8–227 ms lateness was softclock-swi *scheduling*, not eventtimer drift); the wake-preempt gate must **not** test `le_yielded` (YIELD backstop + replenish expire same-instant); entity teardown must be the **cdevpriv dtor** (UAF panic otherwise). Statclock budget-charge mis-throttled 15% idle → precise sbinuptime charge at the switch boundary. |
+| ULE A/B | ✅ | `f066fc4a252e`. Lane = the only *unprivileged* near-RT path. ULE wins undeclared p99 (interactivity guess); Laminar's bounded-lag clamp wins the extreme tail ~5×. Doc claim "competitive on undeclared tails" holds at p99.9/max, not p99. |
+| P3 (phase J) | ✅ | `SPONSOR_FOR` + vblank-anchored grids (`245df76f`); kqueue **miss feed** (`5e053425`) — two interrupt-context locking lessons: no `taskqueue_enqueue` under the tdq lock (the swi wake re-enters `sched_add`), only `taskqueue_fast` from a direct-exec callout. frescod is the real broker, end to end (bsd `af1912d`): `OP_LANE_REQUEST` + `LOCAL_PEERCRED` + live miss feed; `xucred`'s pid union is 8-aligned. |
+| P4 K-a | ✅ | `f39bf7f7`. **Key lesson:** lent priority is *invisible* in the WFQ tier (vruntime-ordered), so the band must sit **below** `PRI_MIN_TIMESHARE` to route a boosted holder onto the rt-path bucket where it wins *selection* — the first cut at `==PRI_MIN_TIMESHARE` measured PI *worse* than the plain-mutex control. lane-pi: 10.65% → 0.00% misses. |
+| D9 | ✅ | `58b58da2`. `deadline_broker` = `kern.sched.deadline_brokers` (host-root-only grant on the phase-E jail table; self-grant EPERM; `p_cansee`-filtered targets). Deadlines are Portcullis capabilities end to end. |
+| P4 K-b | ✅ | `22da0f3e` (kernel) + bsd `925c8e9` (frescod). `ADOPT`/`DROP`: a server adopts the client's entity, band for selection + **charge-back to the client's CBS budget**. Gate-found: charge must stamp at ADOPT (a band burn may never switch); lane wakes must preempt **band** incumbents (a 53% miss storm otherwise). frescod reader/writer adopt = first real Aqueduct deadline-context, no wire change. `thread0_storage` reserve 10→14 u64s. |
+| P6-M | ✅ | `8160db8d`. Energy-optimal DVFS floor `f*` = argmin (P−idle)/f over the cpufreq table (no model constants); powersave settles AT the floor. |
+| P6-N | ✅ | `a9848ab0` (kernel + `sys/sys/energy_budget.h`) + bsd `c9e7e2b` (GPU member). In-kernel `water_fill` splits `kern.sched.energy_cap_mw` by weight across the CPU member (DVFS ceiling) and the GPU member (gpusim power regs). Two fixes: the budget ceiling must **hard-override** the load-driven controller (a cap beats what load wants); the release path must push budget=0 when the cap clears (else a member stays throttled). cap 1500 → cpu 224 + gpu 1276, work-conserving; cap beats perf-policy+load. |
+| P5 | ⏸ deferred | The lane already meets deadlines via immediate band preemption; the CPU value of slack-aware deferral is the marginal CSW-rate cut the plan itself hedges ("if the gate shows nothing on CPU, say so"). The gpusim `rlc.rs` math stands and is load-bearing on the GPU. Revisit when a clean rig can measure involuntary-CSW deltas. |
+| P7 | ⏸ blocked | Frame-variance + audio-underrun headline metrics need (a) a **clean timing window** — both VM profiles hit the episodic host/HVF stall class (gapdet sentinel: 7–280 ms gaps) that confounds any in-VM timing A/B, and (b) **lyrad** for the audio half. Re-run when a clean window holds; gate both kernels *inside* the window (the ULE A/B was time-confounded once already). |
+
+The within-member arc (declared lane → brokered → inversion-proof →
+capability-gated → lending) and the across-member arc (watt federation)
+are both complete and in-VM-verified. What remains (P5, P7) is either
+low-ROI-on-CPU or blocked on VM timing fidelity + lyrad.
+
 ## 3. Dependency graph & sizing
 
 ```
