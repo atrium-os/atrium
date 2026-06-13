@@ -505,3 +505,109 @@ The within-substrate ambition (pro-native, multi-domain, jailed nodes) is presen
 from L0 in the *model* and lands incrementally L2→L4 in the daemon, so the pro
 path is never a retrofit — it is the substrate the consumer path is the simplest
 case of.
+
+## 12. Comparison with existing systems, and the gaps not yet closed
+
+A design audit against OSS, ALSA, JACK, PulseAudio, PipeWire, CoreAudio,
+WASAPI/ASIO, AAudio, and sndio (2026-06-13). Lyra's distinctive wins are argued
+above; this section records the **gaps the audit surfaced** — features and
+lessons these systems have that the design must still close — so they are not
+lost before L4–L6.
+
+**Lessons already absorbed** (do not re-litigate): PulseAudio's timer/rewind
+latency (Lyra pulls, no rewind, §3); JACK's one-xrun-kills-everyone (per-node CBS
+isolation, §3, proven L0/L3); ALSA's config-file plugin-chain hell (capability +
+manifest policy, §7); CoreAudio's resample-once-at-the-HAL (§4); PipeWire's
+policy/engine split (§7) and one-graph-for-pro-and-consumer (§2); sndio's small,
+sandboxed client API (Capsicum-clean by charter; keep the client surface ~6
+calls).
+
+**Gaps to close**, each with a disposition and the layer it lands in:
+
+1. **Passthrough / untouchable formats — encoded bitstream *and* DSD.** Lyra
+   assumes PCM end to end. Two real non-PCM cases: (a) **encoded bitstream**
+   (AC3/DTS/Dolby) sent untouched over HDMI/SPDIF to an AV receiver that decodes
+   it; (b) **DSD** (SACD: 1-bit sigma-delta at 2.8224 MHz+ — DSD64/128/256),
+   which audiophile DACs play natively. Both are **untouchable**: they cannot be
+   mixed, resampled, or volume-scaled without defeating their purpose (mixing DSD
+   means PCM-converting and re-modulating, which no one wants). The clean model:
+   a passthrough stream is a **degenerate graph — source → sink, exclusive,
+   bit-perfect, no mix/DSP node** — and the §4.3 sole-ownership rule already does
+   the work (lyrad grants the device to one exclusive passthrough client and
+   denies others for the duration). Transport: **DoP (DSD-over-PCM)** packs the
+   1-bit stream into 24-bit PCM frames with a marker (DSD64 → 24/176.4k), so it
+   rides the *existing* bit-perfect OSS path with **no driver change** (the DAC
+   unpacks DoP); **native DSD** and HDMI bitstream need a driver format
+   (`snd_uaudio` / the native UAC + HDA drivers — a path-B, §4.4 item). The
+   missing pieces are small: a per-stream "untouchable format" flag, the
+   exclusive-claim policy, and DoP packing. **Disposition: real gap; model as a
+   passthrough format class (L4/L5).**
+
+2. **Channel layouts / surround / spatial audio.** Lyra's channel handling is a
+   bare `frame_floats` count. CoreAudio/PipeWire/Pulse carry rich *channel maps*
+   (FL/FR/C/LFE/…), surround configs (5.1/7.1), and object/scene spatial audio
+   (Atmos, ambisonics). "Stereo float frames" cannot express surround or
+   spatialisation. **Disposition: real gap; a first-class channel-map type + a
+   spatialiser node kind (L4).**
+
+3. **A/V sync, and the unified-vs-split media-graph decision.** PipeWire's
+   defining bet was **one graph for audio *and* video** (camera, screen-share,
+   audio). Atrium splits: Fresco/GPU/Carillon own visual buffers, Lyra owns
+   audio. The split is deliberate and defensible — audio rings are tiny, GPU
+   buffers are huge, and both are members of the **same energy federation**
+   ("coordinated, not coupled") sharing one timing substrate (the deadline lane,
+   virtual time). But the **A/V sync contract** — how Lyra's audio presentation
+   timestamp aligns with Fresco's vblank/frame presentation — is unspecified.
+   **Disposition: record the architectural decision (two graphs, one federation,
+   *not* PipeWire's one graph); specify the cross-member A/V sync timestamp
+   contract (cross-cuts §3, the display doc).**
+
+4. **Glitch-free dynamic reconfiguration.** PipeWire's hallmark: re-wire/re-admit
+   the graph (add a node, change rate, plug a device) *while playing*, no
+   dropout. Lyra's admission is per-change; a glitch-free re-admit/crossfade path
+   is unspecified. **Disposition: real requirement; a re-admit-without-dropout
+   protocol over the lane (L4).**
+
+5. **Audio offload / low-power compressed playback.** A hardware codec plays
+   compressed audio directly so the CPU sleeps — the mobile battery feature
+   (AAudio offload). Ties to the **(floor, elastic) energy member (§8)** and the
+   Insula mobile profile. **Disposition: real gap, high value for the mobile
+   story; an offload sink node + the energy member's deep-idle path.**
+
+6. **JACK transport.** A shared, sample-accurate transport/timeline (play / stop
+   / locate, tempo, bars-beats-ticks, a transport master) that DAWs and
+   sequencers sync to. We chose pro-native, so it matters. **Disposition: real
+   gap; shared transport state on the control plane (§5.1), a pro milestone.**
+
+7. **MIDI as first-class.** §6 has timestamped control/MIDI events on audio
+   nodes, but the full story — a MIDI graph, hardware MIDI ports, sample-accurate
+   MIDI routing independent of audio (sndio `mio`, JACK MIDI, CoreMIDI) — is
+   thin. **Disposition: gap for the pro story; a MIDI edge type + ports (pro
+   milestone).**
+
+8. **Device rate-selection policy.** Choose the device's hardware rate
+   (44.1/48/96) to *avoid resampling the dominant stream* ("follow the content").
+   Lyra resamples clients to the device rate but does not pick it. **Disposition:
+   policy gap (§7 session layer).**
+
+9. **Network / remote audio.** Send audio to another Atrium box or a network sink
+   (Pulse/PipeWire RTP, AirPlay-shape). Aqueduct *can* carry it (it is the
+   transport) but it is not designed. **Disposition: scope decision; deferred,
+   rides Aqueduct when it lands.**
+
+**Not gaps** (covered or correct scope): per-app volume / routing / ducking /
+default-follow (§7); shared/exclusive + loopback + monitor (§9 + bit-perfect);
+module system (graph nodes *are* it); decode (MP3→PCM) is app-level or an
+asset-player node — Lyra plays PCM (or passthrough, gap 1); freewheel/offline
+render (the deterministic model already *is* freewheeling — the daemon just needs
+the mode).
+
+**Read:** the audit found **feature gaps, not foundation gaps** — every item
+above is absorbed by the existing graph + lane + federation substrate (passthrough
+= an exclusive degenerate graph + an untouchable-format flag; spatial = a node +
+a channel-map type; A/V sync = a cross-member timing contract; reconfig = a
+glitch-free re-admit; offload = a sink node + the energy member; transport/MIDI =
+control-plane state + an edge type). Priority order for the post-baseline phases:
+passthrough/DSD (1) and channel/spatial (2) and A/V sync (3) and glitch-free
+reconfig (4) first; offload (5) with the mobile profile; transport (6) and MIDI
+(7) with the pro milestone; rate policy (8) and network (9) as they come.
