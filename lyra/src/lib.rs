@@ -14,3 +14,4 @@ pub mod lane;
 pub mod oss;
 pub mod ring;
 pub mod passthrough;
+pub mod channels;
