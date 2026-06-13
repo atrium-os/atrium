@@ -1,0 +1,18 @@
+[package]
+name = "lyra"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Lyra — Atrium's audio subsystem: the kernel-scheduled deadline graph. lyrad admits a processing graph into the Laminar deadline lane and runs it in topological-deadline order."
+
+[lib]
+name = "lyra"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lyrad"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
