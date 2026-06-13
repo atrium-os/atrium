@@ -20,3 +20,5 @@ pub mod convolve;
 pub mod biquad;
 pub mod gain;
 pub mod resampler;
+pub mod binaural;
+pub mod reverb;
