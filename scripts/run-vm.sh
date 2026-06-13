@@ -220,6 +220,17 @@ for arg in "$@"; do
             # kernel.full (with debug symbols).
             WANT_KGDB=1
             ;;
+        --audio)
+            # Intel HD Audio (PCI, attaches on the virt machine) → coreaudio
+            # host backend, so guest sound plays live on the Mac. FreeBSD's
+            # snd_hda driver matches intel-hda. For headless/deterministic
+            # capture set AUDIO_BACKEND=wav,path=/tmp/lyra.wav (no live sound;
+            # inspect the file). Lyra (docs/spec/atrium-lyra-architecture.md).
+            AUDIO_BACKEND="${AUDIO_BACKEND:-coreaudio}"
+            AUDIO_ARGS="-audiodev ${AUDIO_BACKEND},id=snd0 \
+                        -device intel-hda \
+                        -device hda-output,audiodev=snd0"
+            ;;
         *)
             echo "error: unknown arg $arg" >&2
             exit 1
@@ -290,4 +301,5 @@ exec "$QEMU" \
     $GPU_ARGS \
     $VIRTIO_GPU_ARGS \
     $GPUSIM_ARGS \
+    $AUDIO_ARGS \
     $KGDB_ARGS
