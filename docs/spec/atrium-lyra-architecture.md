@@ -606,9 +606,8 @@ calls).
 
 4. **Glitch-free dynamic reconfiguration.** PipeWire's hallmark: re-wire/re-admit
    the graph (add a node, change rate, plug a device) *while playing*, no
-   dropout. Lyra's admission is per-change; a glitch-free re-admit/crossfade path
-   is unspecified. **Disposition: real requirement; a re-admit-without-dropout
-   protocol over the lane (L4).**
+   dropout. **Protocol SETTLED + MODELED 2026-06-14 (`gpusim
+   engine/src/lyra_reconfig.rs`), see §12.2 below.**
 
 5. **Audio offload / low-power compressed playback.** A hardware codec plays
    compressed audio directly so the CPU sleeps — the mobile battery feature
@@ -706,6 +705,46 @@ result; **independent** drift in *both* domains is absorbed (the federation
 point); VRR drives skew to ~0; latency compensation re-centres a standing offset.
 The wire-level query/feedback ABI on each side is the implementation follow-up
 (with the L4 session layer / the native display present-feedback path).
+
+### 12.2 Glitch-free reconfiguration — atomic commit at a period boundary (settled 2026-06-14)
+
+The protocol for gap 4, and a second instance of the same federation move as the
+display: **reconfigure by atomic commit at a timing boundary.** Fresco commits a
+new framebuffer config atomically at vblank; Lyra commits a new *graph* atomically
+at a period boundary. Build + admit the new topology in the **control plane**
+(off the audio path), then flip it in between periods — the RT thread only ever
+does a pointer swap.
+
+- **Prepare-then-flip.** Allocate the new node rings, carry over persistent nodes'
+  streaming state, and run [`Graph::admit`] on the new topology — all in the
+  control plane. Then arm the swap; at the next period boundary the active
+  `(graph, schedule)` pointer flips. The audio thread never blocks on reconfig
+  work, so the ring never starves. (Doing the rebuild *on* the audio thread —
+  the anti-pattern — stalls a period past the double-buffer slack and underruns.)
+- **Admission is the safety gate.** The new graph must pass `Σ Q ≤ U_lane·T`
+  *before* the swap is armed. If it doesn't fit, the reconfiguration is
+  **rejected** and the old graph plays on — zero dropout either way. A change that
+  would overrun the lane fails cleanly instead of glitching. (Force-swapping past
+  the gate to an over-budget graph starves — the counter-proof of why the gate
+  exists.)
+- **Atomic at the boundary.** Every period runs wholly the old or wholly the new
+  topology — never a half-old/half-new period.
+- **Continuity / crossfade.** Where the swap is bit-continuous (insert a node
+  whose dry path is unchanged; ramp a gain via the zipper-free smoother) it is a
+  hard cut at the boundary. Where the output genuinely differs (re-route to a
+  different device/clock domain, remove a sounding node) a short **equal-power
+  crossfade** over the seam bounds the adjacent-sample step — no click. A latency
+  change re-aligns PDC (§6) at the swap, absorbed by the crossfade.
+
+**Proven (gpusim `engine/src/lyra_reconfig.rs`, 6 tests)** against the real
+admission ([`Graph::admit`]) and the real underrun referee (`AudioRing`):
+prepare-then-flip adds an effect mid-stream with **zero** underruns; inline rebuild
+on the audio path starves (why prep is off-path); an over-budget reconfiguration
+is rejected and the old graph plays on with zero dropout; force-swapping past the
+gate starves; the swap is a single atomic transition at a boundary; an equal-power
+crossfade more than halves the worst-case step of a hard re-route cut. The
+control-plane re-admit + state-carry-over wire protocol (over §5.1) is the L4
+implementation follow-up.
 
 ## 13. Spatial acoustics / audio ray-tracing (future direction)
 
