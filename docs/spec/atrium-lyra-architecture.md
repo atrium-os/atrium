@@ -264,6 +264,64 @@ kernel GPU mechanism, **Lyra owns mixing/resampling/routing/effects/policy in a
 sandboxed, deadline-scheduled userspace, and leaves the kernel only the
 hardware-touching mechanism** — the in-kernel DSP layer is subsumed, not shared.
 
+### 4.3 Default means exclusive — and why
+
+"Lyra is the default audio subsystem" is the wrong framing if it allows a
+co-equal raw path. Lyra's three load-bearing guarantees are *bypassable* unless
+Lyra is the **sole** owner of the device:
+
+- **Privacy enforcement** (§9). The `audio`/`microphone`/`audio_monitor`
+  capability split only means anything if Lyra is the only thing that can touch
+  the codec. If an app jail can `open("/dev/dsp")` itself, it captures the mic or
+  taps the output with *no* capability check — the model is decorative. The
+  enforcement *is* "only lyrad holds the device; apps get audio through a Lyra
+  capability."
+- **Glitch-protection** (§3). The deadline lane keeps audio clean under load only
+  for streams that go through Lyra; a direct `/dev/dsp` writer is back to plain
+  timeshare (the 272-underruns case).
+- **Single-resample / own-the-mix** (§1). Lyra *and* a live kernel `vchan` mixer
+  is the double-mix this design exists to avoid.
+
+So **app jails are not granted raw device access** (no `/dev/dsp`, no codec node)
+— only lyrad is. The OSS *API* survives as a **Lyra-backed compat shim**: a
+legacy app opening `/dev/dsp` gets a lyrad-provided **`cuse(3)`** device (the
+userspace-cdev framework webcamd uses — present in base) that enters it as an
+ordinary, capability-gated Lyra client. Keep the contract, replace the guts. The
+ASIO-style "give me the raw device for low latency" case is moot: Lyra's
+bit-perfect + deadline-lane path already *is* the exclusive low-latency path, so
+there is nothing to bypass *to*.
+
+### 4.4 Any device, no driver change (path A); native where it earns it
+
+Device diversity is solved by path A for free. Every FreeBSD audio driver —
+`snd_hda` (HDA codecs), `snd_uaudio` (USB Audio Class, i.e. most external
+DACs/interfaces), `snd_ich` (AC'97), and the rest — exposes the **same** OSS
+`/dev/dspN`. So Lyra's bit-perfect backend is device-agnostic *by construction*:
+open the device's `/dev/dsp`, set the exact format, write, and the driver DMAs
+Lyra's buffer regardless of whether it is onboard HDA or a USB interface
+(D-display-1 brought up HDA; a USB DAC is identical code). Several devices at
+once is exactly the §4 clock-domain case — the USB DAC drifts against onboard,
+reconciled by measured-drift resampling at the seam.
+
+Lyra's device backend is therefore an abstraction — **a ring + a clock + a
+format** — with two implementations:
+
+- **bit-perfect OSS** (path A): the entire FreeBSD-supported device universe
+  *today*, zero driver code, approximate clock (`GETOPTR`).
+- **native Atrium driver** (path B): only for the high-value classes — HDA and
+  USB-UAC together cover ~all real hardware; Bluetooth A2DP is userspace
+  regardless — giving the exact DMA-position/interrupt timestamp. Written per
+  class, over time, where it earns its keep (the GPU pattern).
+
+**No driver change is needed for path A** — only configuration (bit-perfect) and
+the exclusivity policy (§4.3). One cheap, optional middle path closes the §4.1
+clock-approximation gap broadly without any native driver: a single generic
+`sound(4)` ioctl exposing the exact DMA-position-at-interrupt timestamp would
+give Lyra the exact clock across *all* existing `snd_*` drivers at once — a
+minor, device-independent enhancement, not a rewrite. So the sequencing is:
+exact-clock-everywhere via that ioctl is cheap and broad; full native ownership
+is reserved for HDA and USB-UAC where the last increment of control matters.
+
 ## 5. Transport
 
 ### 5.1 Control plane — Aqueduct class 5
