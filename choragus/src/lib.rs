@@ -12,4 +12,5 @@
 //! ramp, a re-route applied by the glitch-free reconfiguration), nothing more.
 
 pub mod capability;
+pub mod control;
 pub mod policy;

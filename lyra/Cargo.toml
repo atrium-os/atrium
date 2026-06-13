@@ -20,3 +20,4 @@ path = "src/bin/lyra_effect.rs"
 
 [dependencies]
 libc = "0.2"
+lyra-protocol = { path = "../lyra-protocol" }

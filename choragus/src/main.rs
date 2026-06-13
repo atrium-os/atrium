@@ -11,12 +11,41 @@
 //! usage: choragusd --demo
 
 use choragus::capability::{check, Access, Capability, Grant};
-use choragus::policy::{Device, DeviceKind, Role, Session, Stream, diff};
+use choragus::control;
+use choragus::policy::{diff, Device, DeviceKind, Role, Session, Stream};
 
 fn main() {
-    let demo = std::env::args().any(|a| a == "--demo");
+    let args: Vec<String> = std::env::args().collect();
+
+    // --apply <socket>: resolve the ducking scenario and SEND the resulting
+    // changes to a running lyrad over its control socket (the choragusd↔lyrad
+    // wire). Pair with `lyrad --control <socket>`.
+    if let Some(i) = args.iter().position(|a| a == "--apply") {
+        let socket = args.get(i + 1).map(String::as_str).unwrap_or("/tmp/lyrad.ctl");
+        // a media stream (id 0) is playing on lyrad; a call arrives -> media ducks.
+        let spk = Device { id: 0, kind: DeviceKind::Speakers };
+        let mut s = Session::new(vec![spk], spk.id);
+        s.open(Stream::new(0, Role::Media)).unwrap();
+        let before = s.resolve();
+        s.open(Stream::new(1, Role::Communication)).unwrap();
+        let changes = diff(&before, &s.resolve());
+        eprintln!("choragusd: a call arrived; sending {} change(s) to lyrad at {socket}", changes.len());
+        for c in &changes {
+            eprintln!("  {c:?}");
+        }
+        match control::send(socket, &changes) {
+            Ok(()) => eprintln!("choragusd: applied."),
+            Err(e) => {
+                eprintln!("choragusd: send failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    let demo = args.iter().any(|a| a == "--demo");
     if !demo {
-        eprintln!("choragusd: policy/session layer (skeleton). try --demo");
+        eprintln!("choragusd: policy/session layer (skeleton). try --demo or --apply <sock>");
         eprintln!("  (the RT engine is lyrad; choragusd decides routing/ducking/");
         eprintln!("   volume/exclusivity and enforces audio/mic/monitor privacy.)");
         return;

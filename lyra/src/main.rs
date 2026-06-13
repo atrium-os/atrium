@@ -24,6 +24,10 @@ fn main() {
         effect_mode(&args);
         return;
     }
+    if args.iter().any(|a| a == "--control") {
+        control_mode(&args);
+        return;
+    }
     let tone = args.iter().any(|a| a == "--tone");
 
     // 48 kHz, 128-frame buffer ≈ 2667 µs period; a 1 ms client budget.
@@ -375,4 +379,82 @@ fn effect_mode(args: &[String]) {
         "lyrad effect: {secs}s through a separate node{} => play_underruns={underruns}",
         if crash_at > 0 { format!(", node crashed at {crash_at} frames -> bypassed") } else { String::new() }
     );
+}
+
+/// `lyrad --control <socket> [secs]` — play a 440 Hz tone and apply live control
+/// changes (Aqueduct class 5) from choragusd over a Unix socket: a `SetGainDb`
+/// ramps the tone's gain through the zipper-free smoother. The choragusd↔lyrad
+/// wire — the policy layer decides, the engine applies.
+fn control_mode(args: &[String]) {
+    use lyra::gain::Gain;
+    use lyra_protocol::Ctl;
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    let idx = args.iter().position(|a| a == "--control").unwrap();
+    let socket = args.get(idx + 1).cloned().unwrap_or_else(|| "/tmp/lyrad.ctl".into());
+    let secs: u64 = args.get(idx + 2).and_then(|s| s.parse().ok()).unwrap_or(8);
+
+    // shared linear-gain target (f32 bits), updated by the control thread.
+    let target = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+
+    let _ = std::fs::remove_file(&socket);
+    let listener = match UnixListener::bind(&socket) {
+        Ok(l) => l,
+        Err(e) => { eprintln!("lyrad: bind {socket}: {e}"); std::process::exit(1); }
+    };
+    eprintln!("lyrad: control socket at {socket}");
+
+    // control thread: accept connections, decode Ctl frames, update the target.
+    {
+        let target = Arc::clone(&target);
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let mut conn = match conn { Ok(c) => c, Err(_) => continue };
+                let mut frame = [0u8; lyra_protocol::FRAME_LEN];
+                while conn.read_exact(&mut frame).is_ok() {
+                    match Ctl::decode(&frame) {
+                        Some(Ctl::SetGainDb { stream, db }) => {
+                            let lin = 10f32.powf(db / 20.0);
+                            target.store(lin.to_bits(), Ordering::Relaxed);
+                            eprintln!("lyrad: ctl SetGainDb stream={stream} {db:+.1} dB (gain {lin:.3})");
+                        }
+                        Some(Ctl::Reroute { stream, sink }) => {
+                            eprintln!("lyrad: ctl Reroute stream={stream} -> sink {sink} (noted; single-sink build)");
+                        }
+                        None => eprintln!("lyrad: bad control frame"),
+                    }
+                }
+            }
+        });
+    }
+
+    let sink = match OssSink::open(RATE, 2, FRAMES_PER_PERIOD, 8) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("lyrad: no OSS sink ({e})"); let _ = std::fs::remove_file(&socket); std::process::exit(1); }
+    };
+    let mut gain = Gain::new(1.0, RATE as f32, 20.0); // 20 ms ramp = zipper-free
+    let mut phase = 0.0f32;
+    let step = 2.0 * std::f32::consts::PI * 440.0 / RATE as f32;
+    let mut buf = vec![0.0f32; (FRAMES_PER_PERIOD * 2) as usize];
+    let mut out = vec![0i16; (FRAMES_PER_PERIOD * 2) as usize];
+    let periods = (secs * RATE as u64) / FRAMES_PER_PERIOD as u64;
+    for _ in 0..periods {
+        gain.set_target(f32::from_bits(target.load(Ordering::Relaxed)));
+        for f in 0..FRAMES_PER_PERIOD as usize {
+            let s = phase.sin() * 0.25;
+            buf[f * 2] = s;
+            buf[f * 2 + 1] = s;
+            phase += step;
+            if phase > 2.0 * std::f32::consts::PI { phase -= 2.0 * std::f32::consts::PI; }
+        }
+        gain.process(&mut buf);
+        for i in 0..buf.len() { out[i] = (buf[i] * 32767.0) as i16; }
+        if sink.write_i16(&out).is_err() { break; }
+    }
+    let _ = sink.drain();
+    let _ = std::fs::remove_file(&socket);
+    eprintln!("lyrad: control session done ({secs}s)");
 }

@@ -10,6 +10,9 @@ description = "Choragus — Atrium's audio policy/session layer (the 'audio wind
 name = "choragus"
 path = "src/lib.rs"
 
+[dependencies]
+lyra-protocol = { path = "../lyra-protocol" }
+
 [[bin]]
 name = "choragusd"
 path = "src/main.rs"
