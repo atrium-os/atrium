@@ -277,6 +277,15 @@ if [ "$WANT_KGDB" = 1 ]; then
     ) &
 fi
 
+# HVF latency: clear background/throttled QoS on this process so macOS does
+# not park the vCPU threads on the E-cores (or deschedule them) under
+# contention — the source of the episodic ~100 ms host stalls that confound
+# in-VM latency/audio measurement (gapdet: ~60x fewer gaps un-throttled;
+# Lyra --feed at 8 ms: lane underruns 21 -> 2). exec inherits this into QEMU.
+# A priority boost (nice < 0) needs root — for the tightest path also run:
+#   sudo renice -10 -p $(pgrep -n qemu-system-aarch64)
+taskpolicy -B -p $$ 2>/dev/null || true
+
 exec "$QEMU" \
     -L "$QEMU_DIR/pc-bios" \
     ${ATRIUM_QEMU_TRACE:+-trace events=$ATRIUM_QEMU_TRACE} \
