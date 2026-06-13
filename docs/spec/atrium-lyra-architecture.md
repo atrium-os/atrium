@@ -215,6 +215,55 @@ bring-up that approximates it through OSS without violating the single-resample
 or own-the-mix rules. The deterministic model (§10) is anchor-source-agnostic —
 it proves the algorithm against an exact clock, and either path feeds it.
 
+### 4.2 What Lyra subsumes — `sound(4)` is three layers, not one
+
+"OSS" is loosely used for the whole FreeBSD audio stack, but `sound(4)` is three
+distinct layers, and Lyra's relationship to each is different:
+
+1. **Hardware drivers** (`snd_hda`, `snd_ich`, `snd_uaudio`) — the part that
+   touches silicon: the DMA ring (HDA's BDL), the codec/widget graph, the
+   fragment-consumed interrupt, jack detection. Irreplaceable in principle
+   (something must drive the device).
+2. **The `pcm` core** (`sys/dev/sound/pcm/`) — the device-independent middle,
+   and it is, item for item, a **rigid in-kernel unsandboxed version of Lyra's
+   graph**: `vchan.c` (software mixing), `feeder_rate.c` (a resampler),
+   `feeder_eq.c` (an EQ), `feeder_volume.c` (per-stream volume),
+   `feeder_matrix.c` (channel matrixing), `feeder_format.c` (format conversion),
+   `mixer.c`/`feeder_mixer.c` (the mixer).
+3. **`dsp.c`** — the `/dev/dsp` cdev + OSS v4 ioctls: the *interface* only; the
+   machinery is all in layer 2.
+
+The positioning, then, is neither "replace OSS" nor "coexist with it":
+
+- **Lyra subsumes layer 2.** The kernel's mix/resample/EQ/volume/matrix is
+  exactly what the graph does, and Lyra does it *better* on every axis this
+  document argues: sandboxed (a jailed reverb cannot crash the mixer — there is a
+  literal `feeder_eq.c` in the kernel today that Lyra makes a jailed plugin
+  node), deadline-scheduled (the kernel mixer runs blind at interrupt time with
+  no admission or overrun isolation), single-resample (§1; kernel feeders can
+  resample twice), and *arbitrary* (graphs/effects/routing a fixed kernel mixer
+  structurally cannot express). The kernel mixing the audio is the thing Lyra is
+  designed to obsolete.
+- **Lyra keeps layer 1**, and converges it to a **native Atrium HDA driver**
+  (path B, §4.1) — the audio analog of the native GPU driver — which hands Lyra
+  the raw DMA ring + the exact play-position/interrupt timestamp and nothing
+  else. Until then, bit-perfect `/dev/dsp` *neuters* layer 2 (vchans/feeders
+  off), which is why path A is already a near-pass-through.
+- **Lyra demotes layer 3 to a compatibility shim.** `/dev/dsp` does not
+  disappear; it stops being *the audio system* and becomes a thin lyrad-backed
+  surface for legacy/ported apps, while native apps use Aqueduct audio-control
+  (§5). This is the PipeWire move (keep the hardware drivers, replace userspace
+  dmix/plug + PulseAudio + JACK with one userspace graph, expose compatibility) —
+  with the charter twist that Atrium's compat surface is **OSS**, native FreeBSD
+  rather than a Linux shim, so it is the *right* compat layer for a BSD-native
+  OS, and Atrium ultimately owns the driver too.
+
+This mirrors the rest of the platform exactly: as Fresco owns composition above a
+minimal kernel scanout and atrium-gpu owns the submit path above a minimal
+kernel GPU mechanism, **Lyra owns mixing/resampling/routing/effects/policy in a
+sandboxed, deadline-scheduled userspace, and leaves the kernel only the
+hardware-touching mechanism** — the in-kernel DSP layer is subsumed, not shared.
+
 ## 5. Transport
 
 ### 5.1 Control plane — Aqueduct class 5
