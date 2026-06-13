@@ -138,6 +138,22 @@ pub fn consumer_graph(period_us: u64, client_q_us: u64) -> Graph {
     mixer_graph(period_us, &[client_q_us])
 }
 
+/// Build the **passthrough** graph: `source → sink`, no mix node — the
+/// degenerate exclusive graph an untouchable format (DSD/bitstream, §12 gap 1 /
+/// `passthrough.rs`) runs as. The source's bytes reach the device bit-exactly;
+/// the device is claimed exclusively (admission of any second stream is the
+/// session layer's job to refuse while this is live).
+pub fn passthrough_graph(period_us: u64, client_q_us: u64) -> Graph {
+    Graph {
+        nodes: vec![
+            Node::new(NodeKind::Source, client_q_us, &[]),
+            Node::new(NodeKind::Sink, period_us / 20, &[0]),
+        ],
+        period_us,
+        u_lane_permille: 750,
+    }
+}
+
 /// Build the real consumer baseline: **N client streams → one mix → sink** — the
 /// foundation-app case where several apps play at once. Each source's budget is
 /// its declared per-period work; the mix fans them in (its budget grows a little
@@ -239,6 +255,17 @@ mod tests {
             }
             other => panic!("expected oversubscription: {other:?}"),
         }
+    }
+
+    #[test]
+    fn passthrough_is_a_two_node_source_to_sink_graph() {
+        // DSD/bitstream: no mix node — bytes reach the device untouched.
+        let g = passthrough_graph(PERIOD, 1000);
+        let res = g.admit().expect("passthrough admits");
+        assert_eq!(res.len(), 2, "source -> sink only, no mix/DSP");
+        assert!(g.nodes.iter().all(|n| n.kind != NodeKind::Mix), "no mixing");
+        assert_eq!(res[0].node, 0); // source first
+        assert!(res[1].deadline_offset_us < PERIOD);
     }
 
     #[test]

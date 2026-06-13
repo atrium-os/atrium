@@ -13,3 +13,4 @@ pub mod graph;
 pub mod lane;
 pub mod oss;
 pub mod ring;
+pub mod passthrough;
