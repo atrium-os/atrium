@@ -2069,9 +2069,15 @@ vssh "cp /mnt/host/lyra/target/aarch64-unknown-freebsd/release/lyrad \
 vssh "/root/lyrad --tone"
 ```
 
-**Glitch-free-under-load** — the deadline-lane thesis on real hardware. `--feed
-<secs> <spinners> [lane]`; with the lane, codec underruns stay 0 under N CPU
-hogs (without, hundreds). A/B:
+**Glitch-free-under-load** — the deadline-lane thesis on real hardware. The lane
+is gated behind a tunable (default off); enable it once per boot:
+
+```sh
+vssh "sysctl kern.sched.deadline_enable=1"   # required for any lane/sponsor/adopt
+```
+
+`--feed <secs> <spinners> [lane]`; with the lane, codec underruns stay 0 under N
+CPU hogs (without, hundreds). A/B:
 
 ```sh
 vssh "/root/lyrad --feed 5 16"        # NO lane  -> play_underruns in the hundreds
@@ -2094,6 +2100,14 @@ vssh "cc -shared -fPIC -O2 -I/mnt/host/lyra/include \
 #   hosting C node 'tremolo' / jailed (Capsicum capability mode) / play_underruns=0
 vssh "cd /root && LYRA_PLUGIN=/root/tremolo.so LYRA_JAIL=1 LYRA_TREMOLO=0 \
          LYRA_DUMP=/root/dump.raw /root/lyrad --effect 3"
+
+# K-b adoption (needs deadline_enable=1): LYRA_ADOPT=1 makes lyrad self-sponsor a
+# graph entity and the effect ADOPT it -- the jailed C node runs on lyrad's CBS
+# budget, charged back (a heavy plugin throttles the client, not lyrad). Adds two
+# stderr lines: "graph entity sponsored (pid tid)" + "adopted client entity ...
+# charged to its budget". All four L3 mechanisms compose in one run:
+vssh "cd /root && LYRA_ADOPT=1 LYRA_PLUGIN=/root/tremolo.so LYRA_JAIL=1 \
+         LYRA_TREMOLO=0 /root/lyrad --effect 3"
 
 # Crash-isolation: the 2nd positional after --effect is the crash frame. The
 # jailed node aborts mid-stream; lyrad detects the gone child and BYPASSES to
