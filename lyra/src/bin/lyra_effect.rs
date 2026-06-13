@@ -9,14 +9,19 @@
 //! underruns (the property a kernel mixer or an in-process plugin cannot give).
 //!
 //! This binary is the *node*; lyrad creates the rings, spawns it, and connects
-//! it into the graph. A real plugin would (a) run in a Portcullis jail with the
-//! `deadline_broker`-granted reservation and (b) implement the C node ABI; this
-//! is the process-isolation skeleton those layer onto.
+//! it into the graph. With `--plugin <path.so>` it hosts a real C node
+//! (`node_abi`, the `lyra_node.h` ABI) instead of the built-in tremolo — so the
+//! crash-isolation demo runs *actual third-party DSP*: a fault inside the C
+//! plugin's process() takes down only this jailed process, and lyrad bypasses
+//! it. The remaining layer is (a) a Portcullis jail + the
+//! `deadline_broker`-granted reservation around this process.
 //!
-//! usage: lyra-effect <in_ring> <out_ring> [tremolo_hz]
+//! usage: lyra-effect <in_ring> <out_ring> [tremolo_hz] [--plugin <path.so>]
 //! `--crash-after <n>` exits after processing n buffers (the isolation gate).
 
+use lyra::node_abi::HostedNode;
 use lyra::ring::Ring;
+use std::path::PathBuf;
 
 const CH: usize = 2;
 
@@ -31,13 +36,30 @@ fn main() {
     let trem_hz: f32 = args.get(3).filter(|s| !s.starts_with("--")).and_then(|s| s.parse().ok()).unwrap_or(6.0);
     let crash_after: u64 = args.iter().position(|a| a == "--crash-after")
         .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(u64::MAX);
+    let plugin: Option<PathBuf> = args.iter().position(|a| a == "--plugin")
+        .and_then(|i| args.get(i + 1)).map(PathBuf::from);
 
     let inr = Ring::open(in_name, false).expect("open in ring");
     let outr = Ring::open(out_name, true).expect("open out ring");
 
-    // a tremolo: amplitude modulation by a slow LFO — audibly obvious that the
-    // node is in the path, and that bypass (dry) is different from processed.
     let rate = 48_000.0f32;
+
+    // Hosted C node, if a plugin was given (the real third-party path); else the
+    // built-in tremolo. The C node is dlopen'd HERE, inside the isolated
+    // process, so its fault is contained exactly like the built-in crash gate.
+    // SAFETY: this process is the isolation boundary — a fault is contained.
+    let mut node = plugin.as_ref().map(|p| {
+        let n = unsafe { HostedNode::load(p, rate as u32, CH as u32) }
+            .unwrap_or_else(|e| {
+                eprintln!("lyra-effect: plugin load failed: {e:?}");
+                std::process::exit(3);
+            });
+        eprintln!("lyra-effect: hosting C node '{}' (latency {} frames)", n.name(), n.latency_frames());
+        n
+    });
+
+    // the built-in tremolo: amplitude modulation by a slow LFO — audibly obvious
+    // that the node is in the path, and that bypass (dry) differs from processed.
     let mut lfo = 0.0f32;
     let lfo_step = 2.0 * std::f32::consts::PI * trem_hz / rate;
 
@@ -50,13 +72,18 @@ fn main() {
             unsafe { libc::usleep(200) };
             continue;
         }
-        for f in 0..n {
-            // tremolo when trem_hz > 0; otherwise passthrough (unity gain) so
-            // the output is bit-exactly the input — a clean pipeline check.
-            let g = if trem_hz > 0.0 { 0.5 + 0.5 * lfo.sin() } else { 1.0 };
-            buf[f * CH] *= g;
-            buf[f * CH + 1] *= g;
-            lfo += lfo_step;
+        if let Some(node) = node.as_mut() {
+            // the hosted C node processes the buffer in place.
+            node.process(processed, &mut buf[..n * CH]);
+        } else {
+            for f in 0..n {
+                // tremolo when trem_hz > 0; otherwise passthrough (unity gain) so
+                // the output is bit-exactly the input — a clean pipeline check.
+                let g = if trem_hz > 0.0 { 0.5 + 0.5 * lfo.sin() } else { 1.0 };
+                buf[f * CH] *= g;
+                buf[f * CH + 1] *= g;
+                lfo += lfo_step;
+            }
         }
         // write the processed buffer out, waiting for space.
         let mut off = 0usize;

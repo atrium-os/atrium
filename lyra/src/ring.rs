@@ -107,21 +107,20 @@ impl Ring {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        // read the header to size the mapping.
-        let mut h = Header {
-            capacity_frames: 0,
-            frame_floats: 0,
-            head: AtomicU64::new(0),
-            tail: AtomicU64::new(0),
-        };
-        let n = unsafe {
-            libc::read(fd, &mut h as *mut _ as *mut libc::c_void, std::mem::size_of::<Header>())
-        };
-        if n != std::mem::size_of::<Header>() as isize {
+        // size the mapping from the segment length (ftruncate'd by the creator).
+        // fstat works on a POSIX shm fd everywhere; read() does NOT (macOS forbids
+        // it), so probe via fstat and read the header out of the mapping itself.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            let e = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        let len = st.st_size as usize;
+        if len < std::mem::size_of::<Header>() {
             unsafe { libc::close(fd) };
             return Err(io::Error::new(io::ErrorKind::InvalidData, "short header"));
         }
-        let len = Self::bytes_for(h.capacity_frames, h.frame_floats);
         let map = unsafe {
             libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0)
         };
