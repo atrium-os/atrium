@@ -2037,6 +2037,84 @@ kgdb /boot/laminar/kernel /var/crash/vmcore.0
 
 ---
 
+## 10. Lyra audio (in-VM)
+
+The `lyra/` crate is **lyrad** (the deadline-broker audio daemon) + **lyra-effect**
+(an effect node as a separate, jailable process). Design doc:
+`docs/spec/atrium-lyra-architecture.md`; the deterministic model lives in the
+gpusim repo. Audio reaches the host through `-device intel-hda` → coreaudio (live)
+or `-audiodev wav` (headless capture, lossy — use `LYRA_DUMP` for ground truth).
+
+```sh
+# Host: boot with audio (coreaudio = you hear it; AUDIO_BACKEND=wav = capture).
+scripts/run-vm.sh --audio
+
+# Host: cross-compile lyrad + lyra-effect (NEVER --release in the VM; see §4).
+cd ~/src/bsd/lyra && cargo build --release --target aarch64-unknown-freebsd
+
+# VM: snd_hda attaches under HVF with no MSI fuss. Bit-perfect is the sysctl
+# that matters (hw.snd.maxautovchans doesn't exist on this build).
+vssh "kldload snd_hda 2>/dev/null; sysctl dev.pcm.0.bitperfect=1; ls /dev/dsp*"
+
+# VM: lyrad + lyra-effect must be SIBLINGS (lyrad finds lyra-effect via
+# current_exe().with_file_name). Copy both to /root.
+vssh "cp /mnt/host/lyra/target/aarch64-unknown-freebsd/release/lyrad \
+         /mnt/host/lyra/target/aarch64-unknown-freebsd/release/lyra-effect /root/"
+```
+
+**First sound** — a bit-perfect 440 Hz tone (the hardware clock advances exactly
+48000 frames/sec consumed):
+
+```sh
+vssh "/root/lyrad --tone"
+```
+
+**Glitch-free-under-load** — the deadline-lane thesis on real hardware. `--feed
+<secs> <spinners> [lane]`; with the lane, codec underruns stay 0 under N CPU
+hogs (without, hundreds). A/B:
+
+```sh
+vssh "/root/lyrad --feed 5 16"        # NO lane  -> play_underruns in the hundreds
+vssh "/root/lyrad --feed 5 16 lane"   # deadline lane -> 0 (clean window)
+```
+
+**The full L3 path — a jailed C plugin processes live audio, and survives its own
+crash.** Compile the reference C node (the `lyra_node.h` ABI) in-VM, then route
+the tone through it. `LYRA_TREMOLO=0` makes the *built-in* path passthrough, so
+any modulation is unambiguously the C plugin; `LYRA_JAIL=1` confines it with
+Capsicum; `LYRA_DUMP` writes the exact emitted i16 stereo bytes for offline
+verification.
+
+```sh
+# VM: build the plugin (C builds in the VM are fine; cc targets FreeBSD natively).
+vssh "cc -shared -fPIC -O2 -I/mnt/host/lyra/include \
+         /mnt/host/lyra/plugins/tremolo.c -o /root/tremolo.so -lm"
+
+# VM: tone -> jailed C tremolo node -> OSS. Expect, in order on stderr:
+#   hosting C node 'tremolo' / jailed (Capsicum capability mode) / play_underruns=0
+vssh "cd /root && LYRA_PLUGIN=/root/tremolo.so LYRA_JAIL=1 LYRA_TREMOLO=0 \
+         LYRA_DUMP=/root/dump.raw /root/lyrad --effect 3"
+
+# Crash-isolation: the 2nd positional after --effect is the crash frame. The
+# jailed node aborts mid-stream; lyrad detects the gone child and BYPASSES to
+# dry — audio continues, play_underruns stays 0.
+vssh "cd /root && LYRA_PLUGIN=/root/tremolo.so LYRA_JAIL=1 LYRA_TREMOLO=0 \
+         /root/lyrad --effect 3 48000"
+
+# Verify the dump (ground truth, independent of the lossy wav capture): pull it
+# over 9p and check carrier + tremolo envelope.
+vssh "cp /root/dump.raw /mnt/host/scratch/lyra-dump.raw"
+# host: 144000 frames/3s, carrier ~440 Hz, envelope depth ~0.50, LFO ~5 Hz
+#       == tremolo.so's defaults -> the C node ran.
+```
+
+> **Cleanup after a run:** lyrad's `--effect` doesn't drain like `--tone`. If you
+> hear stale-buffer crackle, write a little silence and let the device close
+> cleanly: `vssh "dd if=/dev/zero of=/dev/dsp0 bs=4096 count=8"`. Never `kill -9`
+> lyrad and leave the HDA buffer mid-write.
+
+---
+
 ## 11. Dev VM rebuild — ZFS root (2026-05-09)
 
 The dev VM was rebuilt onto **ZFS root** to eliminate UFS-softdep-flush
