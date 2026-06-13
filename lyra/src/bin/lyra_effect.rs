@@ -25,6 +25,23 @@ use std::path::PathBuf;
 
 const CH: usize = 2;
 
+/// Enter Capsicum capability mode — the Portcullis jail for a node (ambition 3).
+/// After this, the process keeps only the fds it already holds (the rings via
+/// their mmap, stderr) and can make NO global-namespace syscall: no open(), no
+/// connect(), no new files or sockets. A buggy or hostile plugin's process()
+/// can still scribble its own buffers or crash (contained by the separate
+/// process), but it cannot exfiltrate, phone home, or touch the filesystem.
+/// Must be called AFTER every open (rings + dlopen). FreeBSD-only; a no-op
+/// elsewhere (the host build), where the proof is the cross-build + in-VM run.
+#[cfg(target_os = "freebsd")]
+fn enter_jail() -> bool {
+    unsafe { libc::cap_enter() == 0 }
+}
+#[cfg(not(target_os = "freebsd"))]
+fn enter_jail() -> bool {
+    false
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
@@ -38,6 +55,7 @@ fn main() {
         .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(u64::MAX);
     let plugin: Option<PathBuf> = args.iter().position(|a| a == "--plugin")
         .and_then(|i| args.get(i + 1)).map(PathBuf::from);
+    let want_jail = args.iter().any(|a| a == "--jail");
 
     let inr = Ring::open(in_name, false).expect("open in ring");
     let outr = Ring::open(out_name, true).expect("open out ring");
@@ -57,6 +75,19 @@ fn main() {
         eprintln!("lyra-effect: hosting C node '{}' (latency {} frames)", n.name(), n.latency_frames());
         n
     });
+
+    // ENTER THE JAIL: every open is done (rings + dlopen), so drop into Capsicum
+    // capability mode. From here the node is confined to the fds it holds — a
+    // hostile plugin cannot reach the filesystem or network.
+    if want_jail {
+        if enter_jail() {
+            eprintln!("lyra-effect: jailed (Capsicum capability mode)");
+        } else {
+            // refuse to run unconfined when confinement was explicitly asked for.
+            eprintln!("lyra-effect: cap_enter unavailable on this platform; refusing --jail");
+            std::process::exit(4);
+        }
+    }
 
     // the built-in tremolo: amplitude modulation by a slow LFO — audibly obvious
     // that the node is in the path, and that bypass (dry) differs from processed.

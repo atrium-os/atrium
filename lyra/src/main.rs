@@ -229,6 +229,14 @@ fn effect_mode(args: &[String]) {
     if crash_at > 0 {
         cmd.arg("--crash-after").arg(crash_at.to_string());
     }
+    // LYRA_PLUGIN=<path.so> hosts a real C node (node ABI) in the effect process;
+    // LYRA_JAIL=1 confines it with Capsicum (the full ambition-1+3 in-VM path).
+    if let Ok(p) = std::env::var("LYRA_PLUGIN") {
+        cmd.arg("--plugin").arg(p);
+    }
+    if std::env::var("LYRA_JAIL").is_ok() {
+        cmd.arg("--jail");
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
