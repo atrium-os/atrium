@@ -611,3 +611,73 @@ control-plane state + an edge type). Priority order for the post-baseline phases
 passthrough/DSD (1) and channel/spatial (2) and A/V sync (3) and glitch-free
 reconfig (4) first; offload (5) with the mobile profile; transport (6) and MIDI
 (7) with the pro milestone; rate policy (8) and network (9) as they come.
+
+## 13. Spatial acoustics / audio ray-tracing (future direction)
+
+A future, ambitious capability, recorded for scope — it ties §12's spatial
+extension, the energy member (§8), the GPU scheduler, and Tessera CAS into one
+feature, and Atrium is unusually well-positioned for it because it owns the GPU,
+the audio graph, and a *shared* compute budget at once (the three things usually
+owned by three different teams). Far beyond the current L-phases; here so the
+idea is durable and correctly scoped.
+
+**What it is.** Simulate how sound propagates through a 3D scene — occlusion,
+early reflections, late reverberation, and arrival *directions* — rather than
+bolting on a generic reverb (the Steam Audio / Project Acoustics / VRWorks Audio
+problem). Every real-time system splits it the same way, and that split is what
+makes it tractable: **ray-trace the room occasionally, render the audio
+continuously.**
+
+- **The slow solver** — ray/path tracing over scene geometry → *acoustic
+  parameters*: a set of arrival paths (direction, delay, gain, filter) plus a
+  reverb tail, updated at ~10–60 Hz as source/listener/geometry move. A **GPU
+  compute workload**, not per-sample.
+- **The fast renderer** — applies those parameters every audio period: per-path
+  delay/filter, **spatial panning of each arrival** (`spatial.rs::pan` — each
+  ray-traced direction is exactly a `pan(azimuth, layout)`), and convolution with
+  the reverb impulse response. Hard real-time, on the deadline lane.
+
+**Why the Atrium substrate fits (four points):**
+
+1. **One budget for acoustics and graphics.** The solver is a GPU compute job in
+   the *same energy federation* as the audio (§8, P6). "Spend more GPU on better
+   acoustics" vs "on graphics" is **one `water_fill` decision**, not two
+   subsystems fighting — no other stack unifies the acoustics-compute and
+   graphics-compute budget.
+2. **The renderer is already-built graph nodes.** A per-path delay/filter node,
+   a (partitioned-FFT) convolution node, and the **spatial panner this session
+   built** — the directional-rendering primitive audio ray-tracing feeds into
+   exists today.
+3. **Graceful degradation falls out of the (floor, elastic) member.** Ray-traced
+   reverb is the textbook *elastic* load: under power/thermal pressure, degrade
+   full path-traced acoustics → fewer rays → a cheaper parametric reverb →
+   eventually dry + basic panning (the floor). The DAC never starves; the
+   acoustics simplify. Exactly the member shape §8 proved, and the right
+   behaviour (lose reflection detail, never glitch).
+4. **CAS-cached impulse responses.** A computed IR for a given room + listener
+   position is a Tessera CAS blob — deduplicated and cached by hash; return to a
+   spot and the IR is a cache hit.
+
+It is also **deterministically modelable** in virtual time (the solver + renderer
+prove out pre-silicon, like the rest of the substrate).
+
+**Honest hard parts:** real-time convolution of long IRs is expensive but a known
+technique (uniformly-partitioned overlap-add FFT — the bespoke FMA-fused compute
+backend is the right tool); **diffraction** (UTD/BTM edge bending) is the
+genuinely hard acoustic problem, approximated everywhere including here; **HRTF**
+for binaural needs head-related transfer functions (generic works, personalised
+is open research); solver **accuracy vs ray budget** is a real dial — which is
+precisely why the elastic energy member is its home.
+
+**Scoping:** **app-opt-in, not a system default.** Ray-tracing means something
+only when there is a 3D scene with positioned sources (games, VR, spatial-audio
+apps); the app submits geometry + object/listener positions, Lyra + the GPU
+render it. A notification ping or music has no scene and uses the ordinary graph
+(plus `spatial.rs` panning if it wants placement). Anticipated by the
+wire-format's reserved "audio ray-tracing" autonomous task (`0x0200`).
+
+**Decomposition (when it is built):** a GPU acoustic-solver job (a federation
+compute member, elastic) → acoustic parameters → Lyra renderer nodes (per-path
+delay/filter + convolution + `spatial.rs` panning + optional HRTF) on the
+deadline lane. Nothing about it threatens the design — another node kind plus a
+compute job on the proven substrate.
