@@ -55,6 +55,8 @@
  * memory/command/bring-up blocks — each is now a coherent unit worth its own
  * file. (The split earned its keep; through M4 one file read better.)
  */
+#include <sys/energy_budget.h>
+
 #include "atrium_gpu_amd.h"
 #include "atrium_gpu_amd_abi.h"
 
@@ -107,6 +109,23 @@ atrium_amd_probe(device_t dev)
 	return (ENXIO);
 }
 
+static uint64_t
+amd_energy_demand_mw(void *arg)
+{
+	struct atrium_amd_softc *sc = arg;
+
+	return (amd_mmio_read32(sc, regSCHED_POWER_DEMAND_MW));
+}
+
+static void
+amd_energy_budget_mw(void *arg, uint64_t mw)
+{
+	struct atrium_amd_softc *sc = arg;
+
+	amd_mmio_write32(sc, regSCHED_POWER_BUDGET_MW,
+	    mw > UINT32_MAX ? UINT32_MAX : (uint32_t)mw);
+}
+
 static int
 atrium_amd_attach(device_t dev)
 {
@@ -115,6 +134,7 @@ atrium_amd_attach(device_t dev)
 	int err;
 
 	sc->dev = dev;
+	sc->energy_member = -1;
 	mtx_init(&sc->lock, "atrium-gpu", NULL, MTX_DEF);
 	sc->lock_inited = 1;
 
@@ -200,6 +220,15 @@ atrium_amd_attach(device_t dev)
 		return (ENXIO);
 	}
 	sc->cdev->si_drv1 = sc;
+
+	/*
+	 * Energy-budget federation member (P6): the kernel water_fills
+	 * the shared power cap; this device OBEYS its budget (the model
+	 * throttles execution to it) and exposes demand telemetry.
+	 */
+	sc->energy_member = energy_member_register("gpu0",
+	    amd_energy_demand_mw, amd_energy_budget_mw, sc, 1);
+
 	device_printf(dev, "ready: /dev/atrium-gpu%d\n", device_get_unit(dev));
 	return (0);
 }
@@ -219,6 +248,8 @@ atrium_amd_detach(device_t dev)
 	if (sc->bo_count > 0 || sc->vm_count > 0)
 		return (EBUSY);
 
+	if (sc->energy_member >= 0)
+		energy_member_unregister(sc->energy_member);
 	amd_teardown(sc);
 	return (0);
 }

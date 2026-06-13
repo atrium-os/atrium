@@ -162,6 +162,9 @@
 #define regSCHED_RUNS		0x40020	/* r: selected queue run count */
 #define regSCHED_QUEUE_COUNT	0x40024	/* r: number of queues */
 #define regSCHED_BUSY_US	0x40028	/* r: selected queue engine time (us, fairness) */
+#define regSCHED_POWER_BUDGET_MW 0x4002c /* w: federation budget (0 = uncapped) */
+#define regSCHED_POWER_DEMAND_MW 0x40030 /* r: average power demand (mW) */
+#define regSCHED_ROUNDS_EXEC	0x40034	/* r: cumulative rounds executed */
 
 /* CP firmware: minimum ucode version the model accepts (CP_FW_MIN_VERSION). */
 #define ATRIUM_AMD_CP_FW_VERSION 0x40
@@ -313,6 +316,7 @@ struct atrium_amd_softc {
 	struct resource	*doorbell;	/* BAR2 doorbell page */
 	int		 doorbell_rid;
 	struct cdev	*cdev;		/* /dev/atrium-gpu0 */
+	int		energy_member;	/* energy federation id, -1 = none */
 
 	struct resource	*msix_table;	/* BAR holding the MSI-X table (BAR4) */
 	int		 msix_table_rid;
