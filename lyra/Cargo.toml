@@ -14,5 +14,9 @@ path = "src/lib.rs"
 name = "lyrad"
 path = "src/main.rs"
 
+[[bin]]
+name = "lyra-effect"
+path = "src/bin/lyra_effect.rs"
+
 [dependencies]
 libc = "0.2"

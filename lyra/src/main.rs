@@ -20,6 +20,10 @@ fn main() {
         feed_mode(&args);
         return;
     }
+    if args.iter().any(|a| a == "--effect") {
+        effect_mode(&args);
+        return;
+    }
     let tone = args.iter().any(|a| a == "--tone");
 
     // 48 kHz, 128-frame buffer ≈ 2667 µs period; a 1 ms client budget.
@@ -196,4 +200,110 @@ fn feed_mode(args: &[String]) {
 
 fn period_us_for_feed() -> u64 {
     (FRAMES_PER_PERIOD as u64 * 1_000_000) / RATE as u64
+}
+
+/// `lyrad --effect <secs> [crash_at_frame]` — the L3 gate. Route a tone THROUGH
+/// a separate effect process (lyra-effect, applying tremolo) via shared-memory
+/// rings, out to OSS. With `crash_at_frame`, the effect aborts mid-stream; lyrad
+/// detects the stall, **bypasses** the dead node, and the device keeps playing —
+/// fault isolation a kernel mixer or in-process plugin cannot give (JACK's
+/// one-xrun-kills-everyone, inverted).
+fn effect_mode(args: &[String]) {
+    use lyra::ring::Ring;
+    let secs: u64 = args.iter().position(|a| a == "--effect").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(8);
+    let crash_at: u64 = args.iter().position(|a| a == "--effect").and_then(|i| args.get(i + 2)).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    let pid = unsafe { libc::getpid() };
+    let dry_name = format!("/lyra_dry_{pid}");
+    let wet_name = format!("/lyra_wet_{pid}");
+    // 4096-frame rings (~85 ms) — generous headroom for the cross-process hop.
+    let dry = Ring::create(&dry_name, 4096, 2).expect("dry ring");
+    let wet = Ring::create(&wet_name, 4096, 2).expect("wet ring");
+
+    // spawn the effect node (sibling binary next to lyrad).
+    let me = std::env::current_exe().expect("current_exe");
+    let effect_bin = me.with_file_name("lyra-effect");
+    let mut cmd = std::process::Command::new(&effect_bin);
+    cmd.arg(&dry_name).arg(&wet_name).arg("6"); // 6 Hz tremolo
+    if crash_at > 0 {
+        cmd.arg("--crash-after").arg(crash_at.to_string());
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("lyrad: spawn {effect_bin:?}: {e}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!("lyrad: effect node spawned (pid {})", child.id());
+
+    let sink = match OssSink::open(RATE, 2, FRAMES_PER_PERIOD, 8) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("lyrad: no OSS sink ({e})"); let _ = child.kill(); std::process::exit(1); }
+    };
+
+    let mut phase = 0.0f32;
+    let step = 2.0 * std::f32::consts::PI * 440.0 / RATE as f32;
+    let mut dry_buf = vec![0i16; (FRAMES_PER_PERIOD * 2) as usize];
+    let mut dry_f = vec![0.0f32; (FRAMES_PER_PERIOD * 2) as usize];
+    let mut wet_f = vec![0.0f32; (FRAMES_PER_PERIOD * 2) as usize];
+    let gen = |phase: &mut f32, df: &mut [f32]| {
+        for f in 0..FRAMES_PER_PERIOD as usize {
+            let s = phase.sin() * 0.25; // ~ -12 dBFS as float
+            df[f * 2] = s; df[f * 2 + 1] = s;
+            *phase += step;
+        }
+    };
+
+    // prime the dry ring so the effect has input before we read its output.
+    for _ in 0..16 {
+        gen(&mut phase, &mut dry_f);
+        dry.write(&dry_f);
+    }
+
+    let _ = sink.play_underruns();
+    let periods = (secs * RATE as u64) / FRAMES_PER_PERIOD as u64;
+    let mut bypassed = false;
+    let mut bypass_announced = false;
+    for _ in 0..periods {
+        // keep the dry ring fed.
+        gen(&mut phase, &mut dry_f);
+        dry.write(&dry_f);
+
+        // is the effect still alive?
+        if !bypassed {
+            if let Ok(Some(status)) = child.try_wait() {
+                bypassed = true;
+                if !bypass_announced {
+                    eprintln!("lyrad: effect node exited ({status}); BYPASSING -> dry to device");
+                    bypass_announced = true;
+                }
+            }
+        }
+
+        if !bypassed {
+            // read the processed (wet) buffer; if it briefly starves, hold.
+            let got = wet.read(&mut wet_f);
+            if got == FRAMES_PER_PERIOD as u64 {
+                for i in 0..wet_f.len() { dry_buf[i] = (wet_f[i] * 32767.0) as i16; }
+            } else {
+                // not enough wet yet — emit the dry buffer to keep the device fed.
+                for i in 0..dry_f.len() { dry_buf[i] = (dry_f[i] * 32767.0) as i16; }
+            }
+        } else {
+            // bypass: dry straight to the device (the node is gone, audio lives).
+            for i in 0..dry_f.len() { dry_buf[i] = (dry_f[i] * 32767.0) as i16; }
+        }
+        if sink.write_i16(&dry_buf).is_err() { break; }
+    }
+
+    let underruns = sink.play_underruns().unwrap_or(u32::MAX);
+    let _ = sink.drain();
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(dry); drop(wet);
+    println!(
+        "lyrad effect: {secs}s through a separate node{} => play_underruns={underruns}",
+        if crash_at > 0 { format!(", node crashed at {crash_at} frames -> bypassed") } else { String::new() }
+    );
 }
