@@ -12,9 +12,16 @@
 //! it into the graph. With `--plugin <path.so>` it hosts a real C node
 //! (`node_abi`, the `lyra_node.h` ABI) instead of the built-in tremolo — so the
 //! crash-isolation demo runs *actual third-party DSP*: a fault inside the C
-//! plugin's process() takes down only this jailed process, and lyrad bypasses
-//! it. The remaining layer is (a) a Portcullis jail + the
-//! `deadline_broker`-granted reservation around this process.
+//! plugin's process() takes down only this confined process, and lyrad bypasses
+//! it.
+//!
+//! Confinement here is **Capsicum** (`--capsicum`): the process sandboxes
+//! *itself* by calling `cap_enter()`. That is distinct from a **FreeBSD jail**
+//! (Portcullis), which lyrad would impose from the *outside* before exec — a
+//! forced container the node cannot opt out of. The two are complementary
+//! defence-in-depth: the trusted shim Capsicum-confines itself before dlopening
+//! the untrusted plugin, and (still to come) runs inside a Portcullis jail so
+//! the confinement does not depend on the shim cooperating.
 //!
 //! usage: lyra-effect <in_ring> <out_ring> [tremolo_hz] [--plugin <path.so>]
 //! `--crash-after <n>` exits after processing n buffers (the isolation gate).
@@ -25,20 +32,22 @@ use std::path::PathBuf;
 
 const CH: usize = 2;
 
-/// Enter Capsicum capability mode — the Portcullis jail for a node (ambition 3).
-/// After this, the process keeps only the fds it already holds (the rings via
-/// their mmap, stderr) and can make NO global-namespace syscall: no open(), no
-/// connect(), no new files or sockets. A buggy or hostile plugin's process()
-/// can still scribble its own buffers or crash (contained by the separate
-/// process), but it cannot exfiltrate, phone home, or touch the filesystem.
-/// Must be called AFTER every open (rings + dlopen). FreeBSD-only; a no-op
-/// elsewhere (the host build), where the proof is the cross-build + in-VM run.
+/// Enter **Capsicum** capability mode — the node sandboxes *itself* (opt-in;
+/// not to be confused with a FreeBSD jail, which is forced from outside). After
+/// this, the process keeps only the fds it already holds (the rings via their
+/// mmap, the lane fd, stderr) and can make NO global-namespace syscall: no
+/// open(), no connect(), no new files or sockets. A buggy or hostile plugin's
+/// process() can still scribble its own buffers or crash (contained by the
+/// separate process), but it cannot exfiltrate, phone home, or touch the
+/// filesystem. Must be called AFTER every open (rings + lane + dlopen).
+/// FreeBSD-only; a no-op elsewhere (the host build), where the proof is the
+/// cross-build + in-VM run.
 #[cfg(target_os = "freebsd")]
-fn enter_jail() -> bool {
+fn enter_capsicum() -> bool {
     unsafe { libc::cap_enter() == 0 }
 }
 #[cfg(not(target_os = "freebsd"))]
-fn enter_jail() -> bool {
+fn enter_capsicum() -> bool {
     false
 }
 
@@ -55,15 +64,15 @@ fn main() {
         .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(u64::MAX);
     let plugin: Option<PathBuf> = args.iter().position(|a| a == "--plugin")
         .and_then(|i| args.get(i + 1)).map(PathBuf::from);
-    let want_jail = args.iter().any(|a| a == "--jail");
+    let want_capsicum = args.iter().any(|a| a == "--capsicum");
     // --adopt <pid> <tid>: the client entity to run on (K-b, charge-back).
     let adopt_target: Option<(i32, i32)> = args.iter().position(|a| a == "--adopt")
         .and_then(|i| Some((args.get(i + 1)?.parse().ok()?, args.get(i + 2)?.parse().ok()?)));
 
     let inr = Ring::open(in_name, false).expect("open in ring");
     let outr = Ring::open(out_name, true).expect("open out ring");
-    // K-b: open /dev/laminar BEFORE the jail (cap_enter blocks new opens). The
-    // adopt ioctl runs on this held fd, inside the jail.
+    // K-b: open /dev/laminar BEFORE cap_enter (Capsicum blocks new opens). The
+    // adopt ioctl runs on this held fd, after self-confinement.
     let lane_fd = adopt_target.and_then(|_| lyra::lane::open_lane().ok());
 
     let rate = 48_000.0f32;
@@ -82,15 +91,16 @@ fn main() {
         n
     });
 
-    // ENTER THE JAIL: every open is done (rings + dlopen), so drop into Capsicum
-    // capability mode. From here the node is confined to the fds it holds — a
-    // hostile plugin cannot reach the filesystem or network.
-    if want_jail {
-        if enter_jail() {
-            eprintln!("lyra-effect: jailed (Capsicum capability mode)");
+    // CAPSICUM SELF-CONFINEMENT: every open is done (rings + lane + dlopen), so
+    // drop into capability mode. From here the node is confined to the fds it
+    // holds — a hostile plugin cannot reach the filesystem or network. (Opt-in,
+    // by us, the trusted shim — before we dlopen the untrusted plugin.)
+    if want_capsicum {
+        if enter_capsicum() {
+            eprintln!("lyra-effect: confined (Capsicum capability mode)");
         } else {
             // refuse to run unconfined when confinement was explicitly asked for.
-            eprintln!("lyra-effect: cap_enter unavailable on this platform; refusing --jail");
+            eprintln!("lyra-effect: cap_enter unavailable on this platform; refusing --capsicum");
             std::process::exit(4);
         }
     }

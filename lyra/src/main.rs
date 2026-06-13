@@ -253,12 +253,13 @@ fn effect_mode(args: &[String]) {
         cmd.arg("--crash-after").arg(crash_at.to_string());
     }
     // LYRA_PLUGIN=<path.so> hosts a real C node (node ABI) in the effect process;
-    // LYRA_JAIL=1 confines it with Capsicum (the full ambition-1+3 in-VM path).
+    // LYRA_CAPSICUM=1 makes it Capsicum-self-confine (opt-in, distinct from a
+    // forced FreeBSD/Portcullis jail).
     if let Ok(p) = std::env::var("LYRA_PLUGIN") {
         cmd.arg("--plugin").arg(p);
     }
-    if std::env::var("LYRA_JAIL").is_ok() {
-        cmd.arg("--jail");
+    if std::env::var("LYRA_CAPSICUM").is_ok() {
+        cmd.arg("--capsicum");
     }
     if let Some((p, t)) = adopt_args {
         cmd.arg("--adopt").arg(p.to_string()).arg(t.to_string());

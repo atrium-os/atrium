@@ -73,9 +73,9 @@ pub fn current_tid() -> i32 {
     0
 }
 
-/// Open `/dev/laminar` for K-b adoption. A jailed effect MUST call this before
-/// entering the Capsicum jail (`cap_enter` blocks new opens); the returned fd is
-/// held for the node's life and the adopt/drop ioctls run on it inside the jail.
+/// Open `/dev/laminar` for K-b adoption. A self-confining effect MUST call this
+/// before `cap_enter` (Capsicum blocks new opens); the returned fd is held for
+/// the node's life and the adopt/drop ioctls run on it after confinement.
 pub fn open_lane() -> io::Result<OwnedFd> {
     let fd = unsafe { libc::open(c"/dev/laminar".as_ptr(), libc::O_RDWR) };
     if fd < 0 {

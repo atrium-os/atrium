@@ -2084,11 +2084,13 @@ vssh "/root/lyrad --feed 5 16"        # NO lane  -> play_underruns in the hundre
 vssh "/root/lyrad --feed 5 16 lane"   # deadline lane -> 0 (clean window)
 ```
 
-**The full L3 path — a jailed C plugin processes live audio, and survives its own
-crash.** Compile the reference C node (the `lyra_node.h` ABI) in-VM, then route
-the tone through it. `LYRA_TREMOLO=0` makes the *built-in* path passthrough, so
-any modulation is unambiguously the C plugin; `LYRA_JAIL=1` confines it with
-Capsicum; `LYRA_DUMP` writes the exact emitted i16 stereo bytes for offline
+**The full L3 path — a Capsicum-confined C plugin processes live audio, and
+survives its own crash.** Compile the reference C node (the `lyra_node.h` ABI)
+in-VM, then route the tone through it. `LYRA_TREMOLO=0` makes the *built-in* path
+passthrough, so any modulation is unambiguously the C plugin; `LYRA_CAPSICUM=1`
+makes the node `cap_enter()`-self-confine (opt-in Capsicum — NOT a forced FreeBSD
+/Portcullis jail, which would be imposed from outside and is a separate, still-TO-
+BUILD layer); `LYRA_DUMP` writes the exact emitted i16 stereo bytes for offline
 verification.
 
 ```sh
@@ -2096,23 +2098,23 @@ verification.
 vssh "cc -shared -fPIC -O2 -I/mnt/host/lyra/include \
          /mnt/host/lyra/plugins/tremolo.c -o /root/tremolo.so -lm"
 
-# VM: tone -> jailed C tremolo node -> OSS. Expect, in order on stderr:
-#   hosting C node 'tremolo' / jailed (Capsicum capability mode) / play_underruns=0
-vssh "cd /root && LYRA_PLUGIN=/root/tremolo.so LYRA_JAIL=1 LYRA_TREMOLO=0 \
+# VM: tone -> confined C tremolo node -> OSS. Expect, in order on stderr:
+#   hosting C node 'tremolo' / confined (Capsicum capability mode) / play_underruns=0
+vssh "cd /root && LYRA_PLUGIN=/root/tremolo.so LYRA_CAPSICUM=1 LYRA_TREMOLO=0 \
          LYRA_DUMP=/root/dump.raw /root/lyrad --effect 3"
 
 # K-b adoption (needs deadline_enable=1): LYRA_ADOPT=1 makes lyrad self-sponsor a
-# graph entity and the effect ADOPT it -- the jailed C node runs on lyrad's CBS
+# graph entity and the effect ADOPT it -- the confined C node runs on lyrad's CBS
 # budget, charged back (a heavy plugin throttles the client, not lyrad). Adds two
 # stderr lines: "graph entity sponsored (pid tid)" + "adopted client entity ...
 # charged to its budget". All four L3 mechanisms compose in one run:
-vssh "cd /root && LYRA_ADOPT=1 LYRA_PLUGIN=/root/tremolo.so LYRA_JAIL=1 \
+vssh "cd /root && LYRA_ADOPT=1 LYRA_PLUGIN=/root/tremolo.so LYRA_CAPSICUM=1 \
          LYRA_TREMOLO=0 /root/lyrad --effect 3"
 
 # Crash-isolation: the 2nd positional after --effect is the crash frame. The
-# jailed node aborts mid-stream; lyrad detects the gone child and BYPASSES to
+# confined node aborts mid-stream; lyrad detects the gone child and BYPASSES to
 # dry — audio continues, play_underruns stays 0.
-vssh "cd /root && LYRA_PLUGIN=/root/tremolo.so LYRA_JAIL=1 LYRA_TREMOLO=0 \
+vssh "cd /root && LYRA_PLUGIN=/root/tremolo.so LYRA_CAPSICUM=1 LYRA_TREMOLO=0 \
          /root/lyrad --effect 3 48000"
 
 # Verify the dump (ground truth, independent of the lossy wav capture): pull it
