@@ -1,0 +1,15 @@
+[package]
+name = "choragus"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Choragus — Atrium's audio policy/session layer (the 'audio window manager'). Decides routing, ducking, per-app volume, hotplug-follow, and exclusive-claim, and enforces the audio/microphone/audio_monitor privacy capabilities. Mechanism/policy split from lyrad (the RT engine): Lyra plays; the Choragus arranges who plays."
+
+[lib]
+name = "choragus"
+path = "src/lib.rs"
+
+[[bin]]
+name = "choragusd"
+path = "src/main.rs"
