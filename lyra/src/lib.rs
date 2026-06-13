@@ -15,3 +15,4 @@ pub mod oss;
 pub mod ring;
 pub mod passthrough;
 pub mod channels;
+pub mod spatial;
