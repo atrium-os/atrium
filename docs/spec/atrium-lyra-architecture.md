@@ -356,6 +356,45 @@ Live streams are ephemeral and not usefully CAS'd frame-by-frame; the mixed
 output *can* be checkpointed to CAS for deterministic replay/debugging (the model
 discipline the rest of Atrium has).
 
+### 5.4 Built: the running control + data planes (2026-06-14)
+
+Both planes exist as running FreeBSD daemons, every layer verified in-VM (and
+spectrally measured); the wire is the `lyra-protocol` crate, shared by `lyrad`
+(engine) and `choragusd` (Choragus, the policy layer) so neither depends on the
+other.
+
+- **Control plane (§5.1) — `lyra-protocol::Ctl`** over a Unix socket: a fixed
+  12-byte little-endian frame, `OpenStream` / `CloseStream` / `SetGainDb` /
+  `Reroute`. choragusd resolves policy → emits these; lyrad applies them at a
+  **period boundary** (the glitch-free-reconfig shape): a gain change ramps
+  through the zipper-free smoother, a stream opens/closes a mixer slot. *Proven:*
+  a call arriving ducks media by exactly −18 dB while comms plays untouched
+  (per-stream mix isolation, Goertzel-verified).
+- **App registration** — apps connect to **choragusd** (one front door), announce
+  identity (a hello), and `Register { role, caps }`; choragusd assigns a stream
+  id, applies policy (ducking others by role), and commands lyrad. On disconnect
+  it closes the app's streams (crash safety). *Proven:* four processes (lyrad +
+  choragusd + two apps) — an app ducks media just by registering as
+  Communication.
+- **Privacy (§9)** is enforced *here*, default-deny, from the per-app **grant
+  store** (`etc/choragus.grants`; Portcullis writes it in production): a recorder
+  requesting `audio_monitor` is refused at the door unless granted.
+- **Data plane (§5.2) — fd-passed anonymous-shm rings.** lyrad creates an
+  anonymous segment (`SHM_ANON`, *no name* → no name-reuse race) and hands its fd
+  to the source over `SCM_RIGHTS` — the fd **is** the capability to feed that
+  stream (the audio analog of Carillon's doorbell-fd grant). The source maps the
+  producer end and writes, paced by ring backpressure. *Proven:* two sources feed
+  distinct tones (550/770 Hz) into two streams; lyrad mixes the real audio and
+  the policy gain ducks the right one. (The in-process `lyra-effect` path keeps
+  the named-ring `open` for its own use.)
+
+**Not yet wired (the honest remainder):** choragusd *brokering* the data-plane fd
+(today the source attaches to lyrad's data socket directly — the policy-gated
+version relays the fd through choragusd, the single-front-door refactor); the
+real Portcullis grant writer + verified (jail/peer) app identity (today the grant
+store is hand-written and identity is self-declared); multi-sink `Reroute` apply.
+All three are the L4/L5 Portcullis-integration work (§6.1).
+
 ## 6. Nodes and the plugin ABI (pro-native, sandboxed)
 
 Pro-native means **sample-accurate** processing and **external plugin hosting**,

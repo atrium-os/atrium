@@ -2129,6 +2129,43 @@ vssh "cp /root/dump.raw /mnt/host/scratch/lyra-dump.raw"
 > cleanly: `vssh "dd if=/dev/zero of=/dev/dsp0 bs=4096 count=8"`. Never `kill -9`
 > lyrad and leave the HDA buffer mid-write.
 
+**Choragus (`choragusd`) — the policy/session layer + the full control/data
+plane.** lyrad is the RT engine (mixer); choragusd decides routing/ducking/
+volume/privacy and drives lyrad over `lyra-protocol` (Aqueduct class 5). Cross-
+compile all three crates (`lyra`, `choragus`, `lyra-protocol`) from the host.
+
+```sh
+# lyrad as a DYNAMIC MIXER + control plane: a control socket (Ctl frames from
+# choragusd) and a data socket (<ctl>.data, fd-passes anon-shm rings to sources).
+vssh "cp /mnt/host/lyra/target/aarch64-unknown-freebsd/release/{lyrad,lyra-feed} \
+         /mnt/host/choragus/target/aarch64-unknown-freebsd/release/choragusd /root/"
+vssh "/root/lyrad --control /tmp/lyrad.ctl 8 &"     # plays the mix to OSS for 8s
+
+# choragusd as the SESSION DAEMON: apps register, policy drives lyrad. --grants
+# points at the capability store (etc/choragus.grants.example is the format).
+vssh "/root/choragusd --daemon /tmp/choragus.sock /tmp/lyrad.ctl --grants /root/choragus.grants &"
+
+# an app: register under a role -> choragusd opens the slot + applies policy.
+# A second app registering as 'comms' ducks the media app automatically.
+vssh "/root/choragusd --app /tmp/choragus.sock media 6 --id org.atrium.player &"
+vssh "/root/choragusd --app /tmp/choragus.sock comms 2 --id org.atrium.meet"
+
+# privacy: a recorder requesting the system monitor is DENIED unless its app-id is
+# granted audio_monitor in the store (default-deny).
+vssh "/root/choragusd --app /tmp/choragus.sock media 1 monitor --id org.evil.spyware"  # DENIED
+
+# data plane: a source feeds REAL audio into a stream's fd-passed ring. lyra-feed
+# connects to lyrad's DATA socket, receives the ring fd (SCM_RIGHTS), writes a
+# tone; lyrad mixes it (vs the synth fallback). id 0 = the first stream.
+vssh "/root/lyra-feed 0 550 7 /tmp/lyrad.ctl.data &"   # 550 Hz into stream 0
+```
+
+> **Verify the mix spectrally** (the wav capture is lossy): `LYRA_DUMP=/root/x.raw`
+> on lyrad writes the exact mixed i16 stereo; pull it over 9p and Goertzel at the
+> fed/synth frequencies. Ducking shows as a −18 dB drop on the targeted stream
+> only. **Don't `kill -9` `lyra-feed`** — the named-ring path leaks shm; the
+> fd-passed path (anon shm) is race-free but still prefer clean exit.
+
 ---
 
 ## 11. Dev VM rebuild — ZFS root (2026-05-09)
