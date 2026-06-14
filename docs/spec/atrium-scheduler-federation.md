@@ -159,7 +159,10 @@ benchmarks: **frame-time variance under load** (the gpusim frame-pacing arc
 already built its instrumentation) and — crisper, because it is binary and
 countable — **underrun count / minimum reliable audio buffer size under load**
 (the number the Linux pro-audio world fights PREEMPT_RT for). *EEVDF is the best
-scheduler for an OS that can't know; Atrium knows.*
+scheduler for an OS that can't know; Atrium knows.* **Both headlines are now
+measured on real hardware — see [`atrium-scheduler-results.md`](atrium-scheduler-results.md):
+lane holds 0 audio underruns at a 24×-smaller buffer, and 0% dropped frames where
+timeshare drops 42–88%.**
 
 ### 1.1 The service contract — who gets what, spelled out
 
