@@ -326,6 +326,46 @@ painted frame`.
 **userspace test:** the path above end to end, asserting an exact tear line with
 vsync off and none with vsync on.
 
+## 12.5 The policy layer above the engine — the WM/shell is a privileged Insula app (settled 2026-06-15)
+
+The display has the same engine/policy split as audio, and the same answer for
+who the policy layer *is*. Mapping (the audio side is settled in
+`atrium-lyra-architecture.md` §7/§7.1/§9):
+
+| | Audio | Display |
+|---|---|---|
+| **Engine** — seat-shared, owns the hardware, **not** an Insula app | lyrad | **Fresco** (composition + window placement / z-order *mechanism*) |
+| **Per-session policy** — an **Insula app** with an elevated capability | Choragus | **Forum** (the WM/shell: dock, switcher, focus, session UI) |
+| **Normal app** — default-denied the elevated cap | `audio` (own streams) | `graphics = "fresco"` (own windows only) |
+
+The decision: **the Insula app framework applies to everything, the WM/shell
+included.** Forum is a normal Insula app — signed manifest (Sigstore), libatrium,
+the jail + dedicated-uid + Portcullis trust chain, the per-session lifecycle. It
+is *not* special infrastructure. Its privilege is one declared, granted, verified
+**capability**, not an escape from the model:
+
+- **`window_management`** — the display analog of `audio_monitor`: default-deny,
+  grants **cross-app window enumeration/control + input routing**, held only by
+  the trusted session shell. A normal app is structurally isolated — it sees only
+  its own windows (`graphics`); Forum is the one component granted the whole-system
+  view, exactly as the recorder is the one component granted `audio_monitor`. The
+  cap is auditable end to end: declared in Forum's manifest, granted by user/policy,
+  verified via `getpeereid` → the launch registry (`portcullis-peer`).
+- The **engine** (Fresco) stays out of the app model — it is the seat-shared
+  display engine (lyrad's sibling), owning scanout. Fresco executes the placement
+  *mechanism*; Forum decides the cross-app *policy* (which surface is focused, the
+  overview, the dock) and invokes it — the same mechanism/policy line Choragus/lyrad
+  draw for sound.
+
+Consistency notes: this matches `pergola.md` (Pergola the toolkit owns neither
+multi-app composition nor placement — "the scene server's WM role"); the
+`window_management` capability is **not yet in the `portcullis-toml` schema** (the
+concrete follow-on, mirroring how `audio_monitor` was added). Precedent: Wayland
+keeps the WM as privileged compositor core; Android makes the shell a
+platform-signed privileged *app* — Atrium takes the second and makes the privilege
+one auditable capability rather than "the shell is special". See
+[[project_atrium_multiuser_seats]], `portcullis.md`.
+
 ## 13. Open questions (deferred, not blocking D-display-1)
 
 - **kmod structure** — the §4.1 three-kmod split (pci / gpu / display) is now
