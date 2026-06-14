@@ -12,8 +12,9 @@
 pub mod graph;
 pub mod lane;
 pub mod oss;
-pub mod ring;
-pub mod fdpass;
+// The data-plane ring and fd-passing live in lyra-protocol (shared with apps +
+// choragusd); re-export so `lyra::ring` / `lyra::fdpass` keep working in-tree.
+pub use lyra_protocol::{fdpass, ring};
 pub mod passthrough;
 pub mod channels;
 pub mod spatial;

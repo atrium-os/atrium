@@ -4,8 +4,11 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 publish = false
-description = "Lyra audio control protocol (Aqueduct class 5, audio-control). The wire dictionary choragusd speaks to lyrad: routing/level changes the policy layer asks the RT engine to apply. Shared by both so neither daemon crate depends on the other."
+description = "Lyra audio IPC: the wire dictionaries (control, app registration) plus the shared cross-process primitives (the SPSC data-plane ring, fd-passing, and the high-level client API). Shared by lyrad (engine), choragusd (policy), and audio apps so none depends on another."
 
 [lib]
 name = "lyra_protocol"
 path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"

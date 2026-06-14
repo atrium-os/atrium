@@ -8,16 +8,28 @@
 //! control edge, not a data edge (audio samples ride the shmem rings, never
 //! this socket).
 //!
-//! Both daemon crates depend on this one, so neither depends on the other — the
-//! mechanism/policy split holds at the crate graph too.
+//! All three — lyrad (engine), choragusd (policy), and audio apps — depend on
+//! this one crate and not on each other: the mechanism/policy split holds at the
+//! crate graph too. Beyond the control wire (this file's `Ctl`), it also hosts
+//! the shared cross-process primitives so an *app* can speak the whole system
+//! without pulling in the engine or the policy crate:
+//! - [`ring`]  — the SPSC data-plane ring (named + anonymous/fd-passed).
+//! - [`fdpass`] — `SCM_RIGHTS` fd passing.
+//! - [`app`]   — the app→choragusd registration wire (role byte + caps + hello).
+//! - [`client`] — the high-level app API (register → receive a ring → play).
 //!
-//! Frame: a fixed **12 bytes**, little-endian.
+//! Control frame: a fixed **12 bytes**, little-endian.
 //! ```text
-//!   byte 0      : tag (1 = SetGainDb, 2 = Reroute)
+//!   byte 0      : tag (1 = SetGainDb, 2 = Reroute, 3 = Open, 4 = Close)
 //!   bytes 1..4  : reserved (0)
 //!   bytes 4..8  : stream id        (u32)
 //!   bytes 8..12 : payload          (f32 dB bits for SetGainDb; u32 sink for Reroute)
 //! ```
+
+pub mod app;
+pub mod client;
+pub mod fdpass;
+pub mod ring;
 
 pub const FRAME_LEN: usize = 12;
 

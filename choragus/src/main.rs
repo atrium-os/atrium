@@ -175,6 +175,20 @@ struct DState {
     conn: choragus::control::Conn,
     next_id: u32,
     grants: choragus::grant::GrantStore,
+    /// lyrad's data socket — where choragusd fetches a stream's ring fd to broker
+    /// to the app (so the app talks only to choragusd, one front door).
+    lyrad_data_sock: String,
+}
+
+/// Fetch the data-plane ring fd for `stream` from lyrad (connect, send the id,
+/// receive the fd). The broker half of the single-front-door data path.
+fn fetch_ring_fd(data_sock: &str, stream: u32) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+    let mut s = UnixStream::connect(data_sock)?;
+    s.write_all(&stream.to_le_bytes())?;
+    lyra_protocol::fdpass::recv_fd(s.as_raw_fd())
 }
 
 /// Close a stream and apply the resulting policy change (e.g. un-duck media).
@@ -211,6 +225,7 @@ fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std
     while app.read_exact(&mut frame).is_ok() {
         match AppMsg::decode(&frame) {
             Some(AppMsg::Register { role, caps }) => {
+                let role = choragus::app::role_from_u8(role).unwrap_or(Role::Media);
                 // §9 enforcement: requested caps must be within the app's grant
                 // (read from the store; in production Portcullis + user approval
                 // populate it). Default-deny — anything beyond the grant (the mic,
@@ -223,10 +238,12 @@ fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std
                 }
                 let id;
                 let nchanges;
+                let data_sock;
                 {
                     let mut st = state.lock().unwrap();
                     id = st.next_id;
                     st.next_id += 1;
+                    data_sock = st.lyrad_data_sock.clone();
                     let before = st.sess.resolve();
                     let _ = st.sess.open(Stream::new(id, role));
                     let after = st.sess.resolve();
@@ -237,7 +254,16 @@ fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std
                 }
                 opened.push(id);
                 let _ = app.write_all(&id.to_le_bytes());
-                eprintln!("choragusd: {role:?} registered -> stream {id} ({nchanges} policy change(s))");
+                // broker the data-plane ring: fetch its fd from lyrad and pass it
+                // on to the app (SCM_RIGHTS). The app talks only to choragusd.
+                match fetch_ring_fd(&data_sock, id) {
+                    Ok(fd) => {
+                        use std::os::fd::AsRawFd;
+                        let _ = lyra_protocol::fdpass::send_fd(app.as_raw_fd(), fd.as_raw_fd());
+                    }
+                    Err(e) => eprintln!("choragusd: broker ring for stream {id}: {e}"),
+                }
+                eprintln!("choragusd: {role:?} registered -> stream {id} ({nchanges} policy change(s), ring brokered)");
             }
             Some(AppMsg::Close { stream }) => {
                 close_stream(&state, stream);
@@ -275,7 +301,13 @@ fn daemon(app_sock: &str, lyrad_sock: &str, grants_path: Option<&str>) {
         None => GrantStore::default(),
     };
     let spk = Device { id: 0, kind: DeviceKind::Speakers };
-    let state = Arc::new(Mutex::new(DState { sess: Session::new(vec![spk], spk.id), conn, next_id: 0, grants }));
+    let state = Arc::new(Mutex::new(DState {
+        sess: Session::new(vec![spk], spk.id),
+        conn,
+        next_id: 0,
+        grants,
+        lyrad_data_sock: format!("{lyrad_sock}.data"),
+    }));
 
     let _ = std::fs::remove_file(app_sock);
     let listener = match UnixListener::bind(app_sock) {
@@ -302,7 +334,7 @@ fn app_client(app_sock: &str, app_id: &str, role: Role, secs: u64, caps: u8) {
         Err(e) => { eprintln!("app: connect {app_sock}: {e} (is choragusd --daemon up?)"); std::process::exit(1); }
     };
     let _ = write_hello(&mut s, app_id);
-    let _ = s.write_all(&AppMsg::Register { role, caps }.encode());
+    let _ = s.write_all(&AppMsg::Register { role: choragus::app::role_to_u8(role), caps }.encode());
     let mut idb = [0u8; 4];
     if s.read_exact(&mut idb).is_err() {
         eprintln!("app: no id from choragusd");
