@@ -589,11 +589,22 @@ Portcullis capability schema for exactly this.) Identity is the kernel's
 **`getpeereid(2)`**, not the app's word — the same pattern jaild/portcullisd use —
 so the grant is scoped to the verified user. *Proven in-VM:* a Portcullis policy
 granting one app `audio-monitor` and another only `audio` → the first's tap
-request is allowed, the second's denied, the connecting user verified by uid. The
-last remaining nuance — distinct per-*app* uids so `getpeereid` distinguishes apps
-within a user — comes from Portcullis launching each app in its own jail (that
-jail/exec mechanism is itself proven in-VM); per-app-uid assignment is deployment
-wiring, not a design gap.
+request is allowed, the second's denied, the connecting user verified by uid.
+
+**Verified app identity (`choragus` c76a01a).** A *shared* uid (the human's, or
+root) is a weak boundary twice over: same-uid processes can `ptrace`/signal each
+other (no isolation), and the uid can't say *which* app is connecting (back to
+trusting the app's word). So Portcullis gives each app its **own dedicated uid** —
+the isolation boundary *and* the unforgeable identity. At launch it records `uid →
+(owning user, app-id)`; `choragusd` resolves `getpeereid`'s uid against that
+registry, so the app-id is the kernel's via the binding, never the app's hello
+(now advisory — a mismatch is logged as a spoof and the verified id wins; an
+unregistered uid is default-deny). *Proven in-VM:* with two real per-app uids, a
+spoofing app at the *player's* uid that **claims** to be the recorder is caught
+and gets only the player's grant — its `audio_monitor` request denied. The sole
+remaining piece is deployment: Portcullis writing that registry as it launches
+each app at a dedicated uid (the jail/exec + uid-drop mechanism is itself proven
+in-VM).
 
 ## 10. The deterministic model (audio.rs lineage)
 
