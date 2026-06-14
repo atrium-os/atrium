@@ -1,0 +1,19 @@
+[package]
+name = "portcullis-sig"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Manifest signature verification — the trust root under Atrium's capability chain. Keyed Sigstore (cosign-compatible ECDSA P-256 over the manifest blob), verified against pinned trusted-publisher keys. Portcullis honours a manifest's capabilities only if it is signed by a trusted publisher."
+
+[lib]
+name = "portcullis_sig"
+path = "src/lib.rs"
+
+[[bin]]
+name = "atrium-verify-manifest"
+path = "src/bin/verify.rs"
+
+[dependencies]
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
+base64 = "0.22"
