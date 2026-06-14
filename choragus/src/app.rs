@@ -41,6 +41,26 @@ pub fn cap_names(bits: u8) -> Vec<&'static str> {
 /// Sentinel stream id in the registration reply meaning "denied".
 pub const DENIED: u32 = u32::MAX;
 
+/// At connect, an app announces its identity (its manifest app-id) once: a
+/// `u16` length-prefixed UTF-8 string. choragusd uses it to look up the app's
+/// grant. (In production the identity is the verified jail/peer, not spoofable;
+/// here the app declares it.)
+pub fn write_hello<W: std::io::Write>(w: &mut W, app_id: &str) -> std::io::Result<()> {
+    let b = app_id.as_bytes();
+    let len = b.len().min(255) as u16;
+    w.write_all(&len.to_le_bytes())?;
+    w.write_all(&b[..len as usize])
+}
+
+pub fn read_hello<R: std::io::Read>(r: &mut R) -> std::io::Result<String> {
+    let mut l = [0u8; 2];
+    r.read_exact(&mut l)?;
+    let len = u16::from_le_bytes(l) as usize;
+    let mut buf = vec![0u8; len.min(256)];
+    r.read_exact(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 pub fn role_to_u8(r: Role) -> u8 {
     match r {
         Role::Media => 0,

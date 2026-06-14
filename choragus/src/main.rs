@@ -58,7 +58,8 @@ fn main() {
     if let Some(i) = args.iter().position(|a| a == "--daemon") {
         let app_sock = args.get(i + 1).map(String::as_str).unwrap_or("/tmp/choragus.sock");
         let lyrad_sock = args.get(i + 2).map(String::as_str).unwrap_or("/tmp/lyrad.ctl");
-        daemon(app_sock, lyrad_sock);
+        let grants = args.iter().position(|a| a == "--grants").and_then(|j| args.get(j + 1)).map(String::as_str);
+        daemon(app_sock, lyrad_sock, grants);
         return;
     }
 
@@ -69,11 +70,13 @@ fn main() {
         let app_sock = args.get(i + 1).map(String::as_str).unwrap_or("/tmp/choragus.sock");
         let role = args.get(i + 2).and_then(|s| choragus::app::role_from_str(s)).unwrap_or(Role::Media);
         let secs: u64 = args.get(i + 3).and_then(|s| s.parse().ok()).unwrap_or(4);
+        let app_id = args.iter().position(|a| a == "--id").and_then(|j| args.get(j + 1))
+            .map(String::as_str).unwrap_or("org.atrium.player");
         // every player needs `audio`; "monitor"/"mic" request the privileged ones.
         let mut caps = CAP_AUDIO;
         if args.iter().any(|a| a == "monitor") { caps |= CAP_MONITOR; }
         if args.iter().any(|a| a == "mic") { caps |= CAP_MICROPHONE; }
-        app_client(app_sock, role, secs, caps);
+        app_client(app_sock, app_id, role, secs, caps);
         return;
     }
 
@@ -171,6 +174,7 @@ struct DState {
     sess: Session,
     conn: choragus::control::Conn,
     next_id: u32,
+    grants: choragus::grant::GrantStore,
 }
 
 /// Close a stream and apply the resulting policy change (e.g. un-duck media).
@@ -189,21 +193,28 @@ fn close_stream(state: &std::sync::Mutex<DState>, stream: u32) {
 /// Handle one app connection: register/close streams; on disconnect, close any
 /// the app left open (crash safety — an app dying un-ducks everyone else).
 fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std::sync::Mutex<DState>>) {
-    use choragus::app::{cap_names, AppMsg, APP_FRAME_LEN, CAP_AUDIO, DENIED};
+    use choragus::app::{cap_names, AppMsg, APP_FRAME_LEN, DENIED};
     use choragus::control::Ctl;
     use choragus::policy::{diff, Stream};
     use std::io::{Read, Write};
+
+    // the app announces its identity once; its grant is looked up from the store.
+    let app_id = match choragus::app::read_hello(&mut app) {
+        Ok(id) => id,
+        Err(_) => return,
+    };
+    let granted: u8 = state.lock().unwrap().grants.granted(&app_id);
+    eprintln!("choragusd: app '{app_id}' connected (granted {:?})", choragus::app::cap_names(granted));
 
     let mut opened: Vec<u32> = Vec::new();
     let mut frame = [0u8; APP_FRAME_LEN];
     while app.read_exact(&mut frame).is_ok() {
         match AppMsg::decode(&frame) {
             Some(AppMsg::Register { role, caps }) => {
-                // §9 enforcement: the app's Portcullis grant. STUBBED to {audio}
-                // until the Portcullis capability token is wired (L4/L5) — but the
-                // default-deny posture is real: anything beyond `audio` (the mic,
+                // §9 enforcement: requested caps must be within the app's grant
+                // (read from the store; in production Portcullis + user approval
+                // populate it). Default-deny — anything beyond the grant (the mic,
                 // the system monitor/tap) is refused at the door.
-                let granted: u8 = CAP_AUDIO;
                 let denied = caps & !granted;
                 if denied != 0 {
                     eprintln!("choragusd: {role:?} DENIED — requested {:?}, not granted (default-deny)", cap_names(denied));
@@ -242,8 +253,9 @@ fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std
     }
 }
 
-fn daemon(app_sock: &str, lyrad_sock: &str) {
+fn daemon(app_sock: &str, lyrad_sock: &str, grants_path: Option<&str>) {
     use choragus::control::Conn;
+    use choragus::grant::GrantStore;
     use std::os::unix::net::UnixListener;
     use std::sync::{Arc, Mutex};
 
@@ -254,8 +266,16 @@ fn daemon(app_sock: &str, lyrad_sock: &str) {
             std::process::exit(1);
         }
     };
+    // load the capability grant store (Portcullis writes it in production).
+    let grants = match grants_path {
+        Some(p) => match GrantStore::load(p) {
+            Ok(g) => { eprintln!("choragusd: loaded grants from {p}"); g }
+            Err(e) => { eprintln!("choragusd: no grants file {p} ({e}); default-deny all"); GrantStore::default() }
+        },
+        None => GrantStore::default(),
+    };
     let spk = Device { id: 0, kind: DeviceKind::Speakers };
-    let state = Arc::new(Mutex::new(DState { sess: Session::new(vec![spk], spk.id), conn, next_id: 0 }));
+    let state = Arc::new(Mutex::new(DState { sess: Session::new(vec![spk], spk.id), conn, next_id: 0, grants }));
 
     let _ = std::fs::remove_file(app_sock);
     let listener = match UnixListener::bind(app_sock) {
@@ -270,9 +290,10 @@ fn daemon(app_sock: &str, lyrad_sock: &str) {
     }
 }
 
-/// A stand-in audio app: register under a role (requesting `caps`), hold, close.
-fn app_client(app_sock: &str, role: Role, secs: u64, caps: u8) {
-    use choragus::app::{cap_names, AppMsg, DENIED};
+/// A stand-in audio app: announce identity, register under a role (requesting
+/// `caps`), hold, close.
+fn app_client(app_sock: &str, app_id: &str, role: Role, secs: u64, caps: u8) {
+    use choragus::app::{cap_names, write_hello, AppMsg, DENIED};
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
@@ -280,6 +301,7 @@ fn app_client(app_sock: &str, role: Role, secs: u64, caps: u8) {
         Ok(s) => s,
         Err(e) => { eprintln!("app: connect {app_sock}: {e} (is choragusd --daemon up?)"); std::process::exit(1); }
     };
+    let _ = write_hello(&mut s, app_id);
     let _ = s.write_all(&AppMsg::Register { role, caps }.encode());
     let mut idb = [0u8; 4];
     if s.read_exact(&mut idb).is_err() {

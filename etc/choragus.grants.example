@@ -1,0 +1,18 @@
+# Choragus audio capability grants (§9) — example.
+#
+# Maps an app's manifest app-id to the audio capabilities it holds. choragusd
+# reads this and enforces it (default-deny: an app gets only what is listed; an
+# unlisted app gets nothing). In production this file is populated by Portcullis
+# from each app's manifest declarations PLUS the user's approval at the grant
+# surface — it is not hand-edited on a real system; this example documents the
+# format and the posture.
+#
+# Format: one app per line, `app-id  cap[,cap...]`. Capabilities:
+#   audio          play to your own routed sink, see your own streams (the norm)
+#   microphone     capture from a mic device                  (user-visible)
+#   audio_monitor  tap the system output / another stream     (the audio
+#                  screen-record — prominently surfaced, rarely granted)
+
+org.atrium.player      audio
+org.atrium.meet        audio,microphone
+org.atrium.recorder    audio,audio_monitor

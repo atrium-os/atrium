@@ -14,4 +14,5 @@
 pub mod app;
 pub mod capability;
 pub mod control;
+pub mod grant;
 pub mod policy;
