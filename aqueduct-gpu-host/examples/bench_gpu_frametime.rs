@@ -83,8 +83,10 @@ fn main() {
     }
 
     println!("\n  60Hz budget = {budget60:.2} ms   120Hz = {budget120:.2} ms");
-    println!("  (gpu-ms = on-GPU render+resolve via timestamp queries; 0.000 = timestamps");
-    println!("   unsupported, read wall-ms instead. Heavy anchor: Orbis ~11 ms @720p, real 3D.)");
+    println!("  (gpu-ms = on-GPU render time via timestamp queries, clear+draw only;");
+    println!("   wall-ms = full submit+copy+readback round-trip, CPU-overhead-dominated.");
+    println!("   0.000 gpu-ms = timestamps unavailable on this config -> read wall-ms.");
+    println!("   Heavy anchor: Orbis ~11 ms @720p, real 3D — the regime that taxes the GPU.)");
 }
 
 // ── SPIR-V: a full-screen triangle from gl_VertexIndex (no vertex buffer). ──

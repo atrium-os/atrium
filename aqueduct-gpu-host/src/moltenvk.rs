@@ -401,9 +401,9 @@ impl MoltenVkBackend {
         let timestamp_period_ns = props.limits.timestamp_period;
         let qf_props =
             unsafe { instance.get_physical_device_queue_family_properties(physical) };
-        let timestamps_ok = timestamp_period_ns > 0.0
-            && qf_props.get(queue_family as usize)
-                .map(|q| q.timestamp_valid_bits > 0).unwrap_or(false);
+        let valid_bits = qf_props.get(queue_family as usize)
+            .map(|q| q.timestamp_valid_bits).unwrap_or(0);
+        let timestamps_ok = timestamp_period_ns > 0.0 && valid_bits > 0;
         let query_pool = if timestamps_ok {
             let qpi = vk::QueryPoolCreateInfo::default()
                 .query_type(vk::QueryType::TIMESTAMP).query_count(2);
@@ -413,7 +413,10 @@ impl MoltenVkBackend {
             vk::QueryPool::null()
         };
         if query_pool == vk::QueryPool::null() {
-            log::info!("MoltenVk: GPU timestamps unavailable; measured exec time disabled");
+            // log::* is swallowed without a logger (the frescod gotcha) — use
+            // eprintln so the reason is visible to benches/diagnostics.
+            eprintln!("MoltenVk: GPU timestamps unavailable (timestamp_period_ns={timestamp_period_ns}, \
+                       queue_family={queue_family} timestamp_valid_bits={valid_bits}); measured exec time disabled");
         }
 
         // Descriptor pool for per-dispatch sets (compute path).
@@ -1625,6 +1628,15 @@ impl MoltenVkBackend {
             let cb = dev.allocate_command_buffers(&alloc)?[0];
             dev.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+            // Measured GPU render time: stamp the top of the pipe before any
+            // work; the bottom is stamped right after the render pass (below),
+            // so the span is clear+draw only — not the readback copy.
+            let timing = self.query_pool != vk::QueryPool::null();
+            if timing {
+                dev.cmd_reset_query_pool(cb, self.query_pool, 0, 2);
+                dev.cmd_write_timestamp(
+                    cb, vk::PipelineStageFlags::TOP_OF_PIPE, self.query_pool, 0);
+            }
             // Texture upload: staging → image, UNDEFINED → TRANSFER_DST →
             // SHADER_READ_ONLY, recorded before the render pass.
             if let Some((timg, _, _, _, sbuf, _, tw, th)) = tex_res {
@@ -1681,6 +1693,10 @@ impl MoltenVkBackend {
             }
             dev.cmd_draw(cb, vertex_count, 1, 0, 0);
             dev.cmd_end_render_pass(cb);
+            if timing {
+                dev.cmd_write_timestamp(
+                    cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.query_pool, 1);
+            }
             // Image is now TRANSFER_SRC_OPTIMAL (render pass finalLayout).
             let copy = vk::BufferImageCopy::default()
                 .image_subresource(vk::ImageSubresourceLayers::default()
@@ -1697,6 +1713,20 @@ impl MoltenVkBackend {
             let submit = vk::SubmitInfo::default().command_buffers(&cbs);
             let res = dev.queue_submit(self._queue, &[submit], fence)
                 .and_then(|_| dev.wait_for_fences(&[fence], true, u64::MAX));
+
+            // Read the render-span timestamps back (the fence guarantees the
+            // GPU is done) → measured silicon render time for cost calibration.
+            if timing && res.is_ok() {
+                let mut ts = [0u64; 2];
+                if dev.get_query_pool_results(
+                    self.query_pool, 0, &mut ts, vk::QueryResultFlags::TYPE_64).is_ok()
+                {
+                    let delta = ts[1].saturating_sub(ts[0]);
+                    let ns = (delta as f64 * self.timestamp_period_ns as f64) as u64;
+                    self.last_gpu_ns.store(ns, Ordering::Relaxed);
+                    self.total_gpu_ns.fetch_add(ns, Ordering::Relaxed);
+                }
+            }
 
             // ── Teardown (transient) ──────────────────────────────
             dev.destroy_fence(fence, None);
