@@ -381,10 +381,14 @@ fn effect_mode(args: &[String]) {
     );
 }
 
-/// `lyrad --control <socket> [secs]` — play a 440 Hz tone and apply live control
-/// changes (Aqueduct class 5) from choragusd over a Unix socket: a `SetGainDb`
-/// ramps the tone's gain through the zipper-free smoother. The choragusd↔lyrad
-/// wire — the policy layer decides, the engine applies.
+const MAX_STREAMS: usize = 8;
+
+/// `lyrad --control <socket> [secs]` — a real multi-stream **mixer** with a live
+/// control plane (Aqueduct class 5). It hosts two streams — id 0 "media" (440 Hz)
+/// and id 1 "comms" (660 Hz) — sums them per period, and applies per-stream
+/// `SetGainDb` from choragusd by ramping *that stream's* gain through the
+/// zipper-free smoother. So a duck targeted at stream 0 lowers media while comms
+/// keeps playing — the policy layer decides, the engine applies, per stream.
 fn control_mode(args: &[String]) {
     use lyra::gain::Gain;
     use lyra_protocol::Ctl;
@@ -397,8 +401,10 @@ fn control_mode(args: &[String]) {
     let socket = args.get(idx + 1).cloned().unwrap_or_else(|| "/tmp/lyrad.ctl".into());
     let secs: u64 = args.get(idx + 2).and_then(|s| s.parse().ok()).unwrap_or(8);
 
-    // shared linear-gain target (f32 bits), updated by the control thread.
-    let target = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+    // per-stream linear-gain targets (f32 bits), updated by the control thread,
+    // read by the mix loop. Index = stream id.
+    let targets: Arc<Vec<AtomicU32>> =
+        Arc::new((0..MAX_STREAMS).map(|_| AtomicU32::new(1.0f32.to_bits())).collect());
 
     let _ = std::fs::remove_file(&socket);
     let listener = match UnixListener::bind(&socket) {
@@ -407,9 +413,10 @@ fn control_mode(args: &[String]) {
     };
     eprintln!("lyrad: control socket at {socket}");
 
-    // control thread: accept connections, decode Ctl frames, update the target.
+    // control thread: accept connections, decode Ctl frames, update the per-stream
+    // target. A SetGainDb touches only its own stream — the mix isolation policy.
     {
-        let target = Arc::clone(&target);
+        let targets = Arc::clone(&targets);
         std::thread::spawn(move || {
             for conn in listener.incoming() {
                 let mut conn = match conn { Ok(c) => c, Err(_) => continue };
@@ -417,9 +424,11 @@ fn control_mode(args: &[String]) {
                 while conn.read_exact(&mut frame).is_ok() {
                     match Ctl::decode(&frame) {
                         Some(Ctl::SetGainDb { stream, db }) => {
-                            let lin = 10f32.powf(db / 20.0);
-                            target.store(lin.to_bits(), Ordering::Relaxed);
-                            eprintln!("lyrad: ctl SetGainDb stream={stream} {db:+.1} dB (gain {lin:.3})");
+                            if (stream as usize) < MAX_STREAMS {
+                                let lin = 10f32.powf(db / 20.0);
+                                targets[stream as usize].store(lin.to_bits(), Ordering::Relaxed);
+                                eprintln!("lyrad: ctl SetGainDb stream={stream} {db:+.1} dB (gain {lin:.3})");
+                            }
                         }
                         Some(Ctl::Reroute { stream, sink }) => {
                             eprintln!("lyrad: ctl Reroute stream={stream} -> sink {sink} (noted; single-sink build)");
@@ -435,23 +444,45 @@ fn control_mode(args: &[String]) {
         Ok(s) => s,
         Err(e) => { eprintln!("lyrad: no OSS sink ({e})"); let _ = std::fs::remove_file(&socket); std::process::exit(1); }
     };
-    let mut gain = Gain::new(1.0, RATE as f32, 20.0); // 20 ms ramp = zipper-free
-    let mut phase = 0.0f32;
-    let step = 2.0 * std::f32::consts::PI * 440.0 / RATE as f32;
-    let mut buf = vec![0.0f32; (FRAMES_PER_PERIOD * 2) as usize];
-    let mut out = vec![0i16; (FRAMES_PER_PERIOD * 2) as usize];
+
+    // the runtime stream table: (name, frequency, phase, per-stream gain ramp).
+    struct St { name: &'static str, step: f32, phase: f32, gain: Gain }
+    let mk = |freq: f32| St {
+        name: "", step: 2.0 * std::f32::consts::PI * freq / RATE as f32, phase: 0.0,
+        gain: Gain::new(1.0, RATE as f32, 20.0), // 20 ms ramp = zipper-free
+    };
+    let mut streams = [St { name: "media", ..mk(440.0) }, St { name: "comms", ..mk(660.0) }];
+    eprintln!("lyrad: mixing {} streams: {}", streams.len(),
+        streams.iter().enumerate().map(|(i, s)| format!("{i}={}", s.name)).collect::<Vec<_>>().join(" "));
+
+    // optional ground-truth capture of the exact mixed output (LYRA_DUMP=path).
+    use std::io::Write;
+    let mut dump = std::env::var("LYRA_DUMP").ok().and_then(|p| std::fs::File::create(p).ok());
+
+    let n = (FRAMES_PER_PERIOD * 2) as usize;
+    let mut mix = vec![0.0f32; n];
+    let mut tmp = vec![0.0f32; n];
+    let mut out = vec![0i16; n];
     let periods = (secs * RATE as u64) / FRAMES_PER_PERIOD as u64;
     for _ in 0..periods {
-        gain.set_target(f32::from_bits(target.load(Ordering::Relaxed)));
-        for f in 0..FRAMES_PER_PERIOD as usize {
-            let s = phase.sin() * 0.25;
-            buf[f * 2] = s;
-            buf[f * 2 + 1] = s;
-            phase += step;
-            if phase > 2.0 * std::f32::consts::PI { phase -= 2.0 * std::f32::consts::PI; }
+        for v in mix.iter_mut() { *v = 0.0; }
+        for (id, st) in streams.iter_mut().enumerate() {
+            st.gain.set_target(f32::from_bits(targets[id].load(Ordering::Relaxed)));
+            for f in 0..FRAMES_PER_PERIOD as usize {
+                let s = st.phase.sin() * 0.25;
+                tmp[f * 2] = s;
+                tmp[f * 2 + 1] = s;
+                st.phase += st.step;
+                if st.phase > 2.0 * std::f32::consts::PI { st.phase -= 2.0 * std::f32::consts::PI; }
+            }
+            st.gain.process(&mut tmp);
+            for (m, t) in mix.iter_mut().zip(&tmp) { *m += *t; }
         }
-        gain.process(&mut buf);
-        for i in 0..buf.len() { out[i] = (buf[i] * 32767.0) as i16; }
+        for (o, m) in out.iter_mut().zip(&mix) { *o = (m.clamp(-1.0, 1.0) * 32767.0) as i16; }
+        if let Some(f) = dump.as_mut() {
+            let bytes = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u8, out.len() * 2) };
+            let _ = f.write_all(bytes);
+        }
         if sink.write_i16(&out).is_err() { break; }
     }
     let _ = sink.drain();
