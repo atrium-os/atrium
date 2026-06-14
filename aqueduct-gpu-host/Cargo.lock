@@ -111,9 +111,11 @@ dependencies = [
  "aqueduct-gpu",
  "aqueduct-gpu-client",
  "ash",
+ "atrium-spv-frontend",
  "atrium-spv-ir",
  "atrium-spv-loader",
  "atrium-spv-runtime",
+ "atrium-spv-tests",
  "carillon-transport",
  "env_logger",
  "libc",
@@ -165,6 +167,14 @@ name = "atrium-spv-blob"
 version = "0.1.0"
 
 [[package]]
+name = "atrium-spv-frontend"
+version = "0.1.0"
+dependencies = [
+ "atrium-spv-ir",
+ "rspirv",
+]
+
+[[package]]
 name = "atrium-spv-ir"
 version = "0.1.0"
 
@@ -187,6 +197,14 @@ version = "0.1.0"
 [[package]]
 name = "atrium-spv-runtime"
 version = "0.1.0"
+
+[[package]]
+name = "atrium-spv-tests"
+version = "0.1.0"
+dependencies = [
+ "atrium-spv-runtime",
+ "rspirv",
+]
 
 [[package]]
 name = "bitflags"
