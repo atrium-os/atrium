@@ -30,11 +30,16 @@ path = "src/bin/daemon.rs"
 name = "atrium-portcullisd-aq"
 path = "src/bin/aq_client.rs"
 
+[[bin]]
+name = "atrium-launch"
+path = "src/bin/launch_app.rs"
+
 [dependencies]
 portcullis-toml     = { path = "../portcullis-toml" }
 portcullis-jail     = { path = "../portcullis-jail" }
 portcullis-policy   = { path = "../portcullis-policy" }
 portcullis-sig      = { path = "../portcullis-sig" }
+portcullis-peer     = { path = "../portcullis-peer" }
 portcullis-ipc      = { path = "../portcullis-ipc" }
 portcullis-protocol = { path = "../portcullis-protocol" }
 jaild               = { path = "../jaild" }

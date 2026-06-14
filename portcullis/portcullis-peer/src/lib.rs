@@ -19,6 +19,24 @@ use std::os::fd::RawFd;
 /// The platform launch registry's default path (Portcullis writes it).
 pub const DEFAULT_REGISTRY: &str = "/var/run/atrium/app-registry";
 
+/// The base of the reserved per-app uid range. Each app launch gets a dedicated
+/// uid at or above this — never the human's (those are low), never shared. The
+/// range sits inside jaild's policy uid window (`1000..=65000`); 50000+ is the
+/// reserved app sub-range, well above typical human uids.
+pub const APP_UID_BASE: u32 = 50_000;
+
+/// Allocate a dedicated uid for a new app launch: the lowest free uid ≥
+/// [`APP_UID_BASE`] not already bound in the registry. Portcullis calls this,
+/// then [`register`]s the binding.
+pub fn allocate(registry_path: &str) -> u32 {
+    let reg = AppRegistry::load(registry_path).unwrap_or_default();
+    let mut uid = APP_UID_BASE;
+    while reg.map.contains_key(&uid) {
+        uid += 1;
+    }
+    uid
+}
+
 // ── getpeereid: the unforgeable handle ────────────────────────────────────────
 
 /// The connected peer's `(uid, gid)` — the kernel's authenticated answer.
