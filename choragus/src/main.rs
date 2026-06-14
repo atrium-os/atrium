@@ -62,7 +62,10 @@ fn main() {
         // --portcullis-grants <base>: read real per-user Portcullis grants from
         // <base>/<user>/policy.toml (the authoritative source).
         let pcull = args.iter().position(|a| a == "--portcullis-grants").and_then(|j| args.get(j + 1)).map(String::as_str);
-        daemon(app_sock, lyrad_sock, grants, pcull);
+        // --app-registry <file>: the Portcullis uid→app launch registry (verified
+        // identity); without it, the app's hello id is trusted (legacy/test).
+        let reg = args.iter().position(|a| a == "--app-registry").and_then(|j| args.get(j + 1)).map(String::as_str);
+        daemon(app_sock, lyrad_sock, grants, pcull, reg);
         return;
     }
 
@@ -182,6 +185,9 @@ struct DState {
     /// base dir (`<base>/<user>/policy.toml`), resolved by the getpeereid'd user
     /// per connection — instead of the single hand-written `grants` file.
     portcullis_base: Option<String>,
+    /// If set, the Portcullis launch registry (`uid → (user, app-id)`): the app's
+    /// identity is its dedicated uid via this binding, not its self-declared id.
+    app_registry: Option<String>,
     /// lyrad's data socket — where choragusd fetches a stream's ring fd to broker
     /// to the app (so the app talks only to choragusd, one front door).
     lyrad_data_sock: String,
@@ -219,23 +225,57 @@ fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std
     use choragus::policy::{diff, Stream};
     use std::io::{Read, Write};
 
-    // VERIFIED identity: the kernel's getpeereid, not the app's word.
+    use choragus::grant::GrantStore;
+    use choragus::identity::AppRegistry;
     use std::os::fd::AsRawFd;
+
+    // the unforgeable handle: the kernel's getpeereid uid.
     let (uid, _gid) = choragus::peer::uid_gid(app.as_raw_fd()).unwrap_or((u32::MAX, u32::MAX));
-    let user = choragus::peer::username(uid).unwrap_or_else(|| format!("uid{uid}"));
-    // the app still names itself (its manifest app-id); the grant is scoped to
-    // the verified user, mirroring how portcullisd resolves a grant.
-    let app_id = match choragus::app::read_hello(&mut app) {
+    // the app's CLAIM (advisory once a registry is in play).
+    let claimed = match choragus::app::read_hello(&mut app) {
         Ok(id) => id,
         Err(_) => return,
     };
-    // resolve the grant: the REAL Portcullis per-user store if configured, else
-    // the hand-written file.
-    let granted: u8 = {
+
+    // pull what we need from the daemon state, then do the IO unlocked.
+    let (reg_path, pcull_base) = {
         let st = state.lock().unwrap();
-        match &st.portcullis_base {
-            Some(base) => choragus::grant::GrantStore::load_portcullis(base, &user).granted(&app_id),
-            None => st.grants.granted(&app_id),
+        (st.app_registry.clone(), st.portcullis_base.clone())
+    };
+
+    // Resolve the VERIFIED identity. With a Portcullis launch registry, the uid
+    // IS the identity: an app cannot get another app's grant by claiming its id.
+    let (app_id, user, granted): (String, String, u8) = match &reg_path {
+        Some(rp) => {
+            let reg = AppRegistry::load(rp).unwrap_or_default();
+            match reg.resolve(uid) {
+                Some((owner, verified)) => {
+                    if verified != claimed {
+                        eprintln!("choragusd: SPOOF? uid {uid} claimed '{claimed}' but Portcullis launched '{verified}' — using the verified id");
+                    }
+                    let g = match &pcull_base {
+                        Some(base) => GrantStore::load_portcullis(base, owner).granted(verified),
+                        None => state.lock().unwrap().grants.granted(verified),
+                    };
+                    (verified.to_string(), owner.to_string(), g)
+                }
+                None => {
+                    // not launched by Portcullis at a known uid → no verified
+                    // identity → default-deny everything.
+                    eprintln!("choragusd: uid {uid} not in the launch registry (claimed '{claimed}') — denying");
+                    (claimed.clone(), format!("uid{uid}"), 0)
+                }
+            }
+        }
+        None => {
+            // legacy: no registry, trust the hello; grant scoped to the
+            // getpeereid'd user.
+            let user = choragus::peer::username(uid).unwrap_or_else(|| format!("uid{uid}"));
+            let g = match &pcull_base {
+                Some(base) => GrantStore::load_portcullis(base, &user).granted(&claimed),
+                None => state.lock().unwrap().grants.granted(&claimed),
+            };
+            (claimed.clone(), user, g)
         }
     };
     eprintln!("choragusd: app '{app_id}' connected (peer uid={uid} user={user}, granted {:?})",
@@ -300,7 +340,7 @@ fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std
     }
 }
 
-fn daemon(app_sock: &str, lyrad_sock: &str, grants_path: Option<&str>, portcullis_base: Option<&str>) {
+fn daemon(app_sock: &str, lyrad_sock: &str, grants_path: Option<&str>, portcullis_base: Option<&str>, app_registry: Option<&str>) {
     use choragus::control::Conn;
     use choragus::grant::GrantStore;
     use std::os::unix::net::UnixListener;
@@ -317,6 +357,9 @@ fn daemon(app_sock: &str, lyrad_sock: &str, grants_path: Option<&str>, portculli
     if let Some(b) = portcullis_base {
         eprintln!("choragusd: grants from Portcullis per-user store under {b} (getpeereid-resolved)");
     }
+    if let Some(r) = app_registry {
+        eprintln!("choragusd: verified app identity from the Portcullis launch registry {r} (uid→app)");
+    }
     let grants = match grants_path {
         Some(p) => match GrantStore::load(p) {
             Ok(g) => { eprintln!("choragusd: loaded grants from {p}"); g }
@@ -331,6 +374,7 @@ fn daemon(app_sock: &str, lyrad_sock: &str, grants_path: Option<&str>, portculli
         next_id: 0,
         grants,
         portcullis_base: portcullis_base.map(String::from),
+        app_registry: app_registry.map(String::from),
         lyrad_data_sock: format!("{lyrad_sock}.data"),
     }));
 
