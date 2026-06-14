@@ -52,6 +52,26 @@ fn main() {
         return;
     }
 
+    // --daemon <app_sock> <lyrad_sock>: the real session daemon. Listens for app
+    // registrations, applies policy, and drives lyrad. Apps cause ducking just by
+    // registering as Communication — no scripting.
+    if let Some(i) = args.iter().position(|a| a == "--daemon") {
+        let app_sock = args.get(i + 1).map(String::as_str).unwrap_or("/tmp/choragus.sock");
+        let lyrad_sock = args.get(i + 2).map(String::as_str).unwrap_or("/tmp/lyrad.ctl");
+        daemon(app_sock, lyrad_sock);
+        return;
+    }
+
+    // --app <app_sock> <role> <secs>: a stand-in audio app — register with the
+    // daemon under a role, hold, then close. Separate process from choragusd.
+    if let Some(i) = args.iter().position(|a| a == "--app") {
+        let app_sock = args.get(i + 1).map(String::as_str).unwrap_or("/tmp/choragus.sock");
+        let role = args.get(i + 2).and_then(|s| choragus::app::role_from_str(s)).unwrap_or(Role::Media);
+        let secs: u64 = args.get(i + 3).and_then(|s| s.parse().ok()).unwrap_or(4);
+        app_client(app_sock, role, secs);
+        return;
+    }
+
     let demo = args.iter().any(|a| a == "--demo");
     if !demo {
         eprintln!("choragusd: policy/session layer (skeleton). try --demo, --apply <sock>, or --session <sock>");
@@ -138,4 +158,121 @@ fn session_demo(socket: &str) {
     thread::sleep(Duration::from_secs(1));
 
     eprintln!("choragusd: session done");
+}
+
+// ── The real session daemon ──
+
+struct DState {
+    sess: Session,
+    conn: choragus::control::Conn,
+    next_id: u32,
+}
+
+/// Close a stream and apply the resulting policy change (e.g. un-duck media).
+fn close_stream(state: &std::sync::Mutex<DState>, stream: u32) {
+    use choragus::control::Ctl;
+    use choragus::policy::diff;
+    let mut st = state.lock().unwrap();
+    let before = st.sess.resolve();
+    st.sess.close(stream);
+    let after = st.sess.resolve();
+    let _ = st.conn.send(Ctl::CloseStream { stream });
+    let changes = diff(&before, &after);
+    let _ = st.conn.apply(&changes);
+}
+
+/// Handle one app connection: register/close streams; on disconnect, close any
+/// the app left open (crash safety — an app dying un-ducks everyone else).
+fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std::sync::Mutex<DState>>) {
+    use choragus::app::{AppMsg, APP_FRAME_LEN};
+    use choragus::control::Ctl;
+    use choragus::policy::{diff, Stream};
+    use std::io::{Read, Write};
+
+    let mut opened: Vec<u32> = Vec::new();
+    let mut frame = [0u8; APP_FRAME_LEN];
+    while app.read_exact(&mut frame).is_ok() {
+        match AppMsg::decode(&frame) {
+            Some(AppMsg::Register { role }) => {
+                let id;
+                let nchanges;
+                {
+                    let mut st = state.lock().unwrap();
+                    id = st.next_id;
+                    st.next_id += 1;
+                    let before = st.sess.resolve();
+                    let _ = st.sess.open(Stream::new(id, role));
+                    let after = st.sess.resolve();
+                    let _ = st.conn.send(Ctl::OpenStream { stream: id });
+                    let changes = diff(&before, &after);
+                    nchanges = changes.len();
+                    let _ = st.conn.apply(&changes);
+                }
+                opened.push(id);
+                let _ = app.write_all(&id.to_le_bytes());
+                eprintln!("choragusd: {role:?} registered -> stream {id} ({nchanges} policy change(s))");
+            }
+            Some(AppMsg::Close { stream }) => {
+                close_stream(&state, stream);
+                opened.retain(|&x| x != stream);
+                eprintln!("choragusd: app closed stream {stream}");
+            }
+            None => {}
+        }
+    }
+    for id in opened {
+        close_stream(&state, id);
+        eprintln!("choragusd: app gone -> stream {id} closed");
+    }
+}
+
+fn daemon(app_sock: &str, lyrad_sock: &str) {
+    use choragus::control::Conn;
+    use std::os::unix::net::UnixListener;
+    use std::sync::{Arc, Mutex};
+
+    let conn = match Conn::connect(lyrad_sock) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("choragusd: connect lyrad {lyrad_sock}: {e} (is `lyrad --control {lyrad_sock}` up?)");
+            std::process::exit(1);
+        }
+    };
+    let spk = Device { id: 0, kind: DeviceKind::Speakers };
+    let state = Arc::new(Mutex::new(DState { sess: Session::new(vec![spk], spk.id), conn, next_id: 0 }));
+
+    let _ = std::fs::remove_file(app_sock);
+    let listener = match UnixListener::bind(app_sock) {
+        Ok(l) => l,
+        Err(e) => { eprintln!("choragusd: bind {app_sock}: {e}"); std::process::exit(1); }
+    };
+    eprintln!("choragusd: session daemon up — apps at {app_sock}, driving lyrad at {lyrad_sock}");
+    for app in listener.incoming() {
+        let app = match app { Ok(a) => a, Err(_) => continue };
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || handle_app(app, state));
+    }
+}
+
+/// A stand-in audio app: register under a role, hold, then close.
+fn app_client(app_sock: &str, role: Role, secs: u64) {
+    use choragus::app::AppMsg;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let mut s = match UnixStream::connect(app_sock) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("app: connect {app_sock}: {e} (is choragusd --daemon up?)"); std::process::exit(1); }
+    };
+    let _ = s.write_all(&AppMsg::Register { role }.encode());
+    let mut idb = [0u8; 4];
+    if s.read_exact(&mut idb).is_err() {
+        eprintln!("app: no id from choragusd");
+        std::process::exit(1);
+    }
+    let id = u32::from_le_bytes(idb);
+    eprintln!("app: registered as {role:?} -> stream {id}; playing {secs}s");
+    std::thread::sleep(std::time::Duration::from_secs(secs));
+    let _ = s.write_all(&AppMsg::Close { stream: id }.encode());
+    eprintln!("app: closed stream {id}");
 }

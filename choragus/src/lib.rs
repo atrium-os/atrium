@@ -11,6 +11,7 @@
 //! consumes the mechanism-agnostic [`policy::Change`]s this layer emits (a gain
 //! ramp, a re-route applied by the glitch-free reconfiguration), nothing more.
 
+pub mod app;
 pub mod capability;
 pub mod control;
 pub mod policy;
