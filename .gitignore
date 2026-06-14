@@ -73,3 +73,7 @@ docs/spec/*.slides.pptx
 # External clones (atrium-related repos vendored as siblings; each is
 # its own git working tree with its own remote — see RUNBOOK §11).
 external/
+
+# VM debug screenshots — dev-iteration captures accumulate here. Milestone /
+# showcase frames that are worth keeping are committed explicitly (git add -f).
+vm/*.png
