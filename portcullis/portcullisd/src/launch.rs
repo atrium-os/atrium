@@ -69,6 +69,11 @@ pub fn launch_with_stdio(
     let text = fs::read_to_string(&manifest_path)
         .map_err(|e| LaunchError::Failed("manifest",
                  format!("{}: {e}", manifest_path.display())))?;
+    /* manifest TRUST gate — the SAME shared check as the Launch path, so a
+     * session/stdio-launched app is signature-verified identically (any
+     * user-app launch vector goes through one gate, not a per-path copy). */
+    crate::manifest_trust::verify(&tree, &text)
+        .map_err(|m| LaunchError::Failed("signature", m))?;
     let manifest = Manifest::from_str(&text)
         .map_err(|e| LaunchError::Failed("manifest",
                  format!("parse error: {e}")))?;

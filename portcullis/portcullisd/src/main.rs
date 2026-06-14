@@ -32,6 +32,7 @@ use portcullis_ipc::{
 use portcullis_policy::{compute_delta, hash_manifest, now_iso8601, Grant, Policy};
 
 mod launch;
+mod manifest_trust;
 
 fn usage() -> ! {
     eprintln!("\
@@ -228,36 +229,6 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
 /// Launch handler with SCM_RIGHTS fd handoff (see Phase 4.4 step 2).
 /// Adds per-user policy lookup and `exec.jail_user = <user>` so the
 /// app runs as the connecting user inside its per-app jail.
-/// Load every trusted-publisher public key (`*.pem`) from `dir`. The set is
-/// Atrium policy — which publishers' manifests Portcullis will honour. Empty
-/// (missing dir or no keys) = trust not yet configured.
-fn load_trusted_publishers(dir: &str) -> Vec<String> {
-    let mut keys = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for entry in rd.flatten() {
-            let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) == Some("pem") {
-                if let Ok(pem) = std::fs::read_to_string(&p) {
-                    keys.push(pem);
-                }
-            }
-        }
-    }
-    keys
-}
-
-/// Read the manifest signature, accepting a DER signature (openssl/cosign) or
-/// base64 text (cosign's on-disk form), auto-detected.
-fn manifest_signature(sig_path: &std::path::Path) -> Vec<u8> {
-    let raw = std::fs::read(sig_path).unwrap_or_default();
-    if let Ok(s) = std::str::from_utf8(&raw) {
-        if let Ok(der) = portcullis_sig::sig_from_base64(s) {
-            return der;
-        }
-    }
-    raw
-}
-
 fn handle_launch(
     app_id:        String,
     bypass_policy: bool,
@@ -279,23 +250,14 @@ fn handle_launch(
                 });
             }
         };
-        /* manifest TRUST gate (Sigstore Option A, keyed): honour the manifest's
-         * capabilities only if a trusted publisher signed it. Enforced once
-         * /etc/atrium/publishers holds any key; before that, an explicit warning
-         * (so the gate's absence is auditable, never silent). */
-        let publishers = load_trusted_publishers("/etc/atrium/publishers");
-        if publishers.is_empty() {
-            eprintln!("portcullisd: WARNING manifest trust not configured (/etc/atrium/publishers empty); allowing UNSIGNED {app_id}");
-        } else {
-            let sig = manifest_signature(&tree.join("atrium.toml.sig"));
-            if let Err(e) = portcullis_sig::verify_trusted(text.as_bytes(), &sig, &publishers) {
-                eprintln!("portcullisd: REFUSED {app_id} — manifest not signed by a trusted publisher ({e:?})");
-                return write_response(writer, &Response::LaunchFailed {
-                    stage: "signature".into(),
-                    message: format!("manifest not signed by a trusted publisher ({e:?})"),
-                });
-            }
-            eprintln!("portcullisd: {app_id} manifest signature verified (trusted publisher)");
+        /* manifest TRUST gate (Sigstore Option A, keyed) — the shared check used
+         * by every user-app launch vector. */
+        if let Err(msg) = manifest_trust::verify(&tree, &text) {
+            eprintln!("portcullisd: REFUSED {app_id} — {msg}");
+            return write_response(writer, &Response::LaunchFailed {
+                stage: "signature".into(),
+                message: msg,
+            });
         }
 
         let manifest = match portcullis_toml::Manifest::from_str(&text) {
