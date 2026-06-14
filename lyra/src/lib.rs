@@ -13,6 +13,7 @@ pub mod graph;
 pub mod lane;
 pub mod oss;
 pub mod ring;
+pub mod fdpass;
 pub mod passthrough;
 pub mod channels;
 pub mod spatial;

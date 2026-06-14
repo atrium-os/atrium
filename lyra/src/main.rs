@@ -399,12 +399,17 @@ fn control_mode(args: &[String]) {
     use lyra::gain::Gain;
     use lyra_protocol::Ctl;
     use std::io::Read;
+    use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;
     use std::sync::mpsc;
 
     let idx = args.iter().position(|a| a == "--control").unwrap();
     let socket = args.get(idx + 1).cloned().unwrap_or_else(|| "/tmp/lyrad.ctl".into());
     let secs: u64 = args.get(idx + 2).and_then(|s| s.parse().ok()).unwrap_or(8);
+    let data_socket = format!("{socket}.data");
+
+    // mix-loop commands: a control change, or a fresh data-plane ring for a stream.
+    enum Cmd { Ctl(Ctl), Attach(u32, lyra::ring::Ring) }
 
     let _ = std::fs::remove_file(&socket);
     let listener = match UnixListener::bind(&socket) {
@@ -412,20 +417,54 @@ fn control_mode(args: &[String]) {
         Err(e) => { eprintln!("lyrad: bind {socket}: {e}"); std::process::exit(1); }
     };
     eprintln!("lyrad: control socket at {socket} (dynamic mixer, 0 streams)");
+    let (tx, rx) = mpsc::channel::<Cmd>();
 
-    // control thread: decode Ctl frames, forward to the mix loop over a channel.
-    let (tx, rx) = mpsc::channel::<Ctl>();
-    std::thread::spawn(move || {
-        for conn in listener.incoming() {
-            let mut conn = match conn { Ok(c) => c, Err(_) => continue };
-            let mut frame = [0u8; lyra_protocol::FRAME_LEN];
-            while conn.read_exact(&mut frame).is_ok() {
-                if let Some(c) = Ctl::decode(&frame) {
-                    let _ = tx.send(c);
+    // control thread: decode Ctl frames, forward to the mix loop.
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let mut conn = match conn { Ok(c) => c, Err(_) => continue };
+                let mut frame = [0u8; lyra_protocol::FRAME_LEN];
+                while conn.read_exact(&mut frame).is_ok() {
+                    if let Some(c) = Ctl::decode(&frame) {
+                        let _ = tx.send(Cmd::Ctl(c));
+                    }
                 }
             }
+        });
+    }
+
+    // data thread: a source connects, sends a 4-byte stream id; lyrad creates an
+    // ANONYMOUS ring (no name → no race) and fd-passes it back, then hands the
+    // consumer end to the mix loop. The fd IS the capability to feed that stream.
+    {
+        let _ = std::fs::remove_file(&data_socket);
+        match UnixListener::bind(&data_socket) {
+            Ok(dl) => {
+                eprintln!("lyrad: data socket at {data_socket}");
+                std::thread::spawn(move || {
+                    for conn in dl.incoming() {
+                        let mut conn = match conn { Ok(c) => c, Err(_) => continue };
+                        let mut idb = [0u8; 4];
+                        if conn.read_exact(&mut idb).is_err() { continue; }
+                        let id = u32::from_le_bytes(idb);
+                        // lyrad is the CONSUMER; the source maps the producer end.
+                        match lyra::ring::Ring::create_anon(4096, 2, false) {
+                            Ok((ring, fd)) => {
+                                if lyra::fdpass::send_fd(conn.as_raw_fd(), fd.as_raw_fd()).is_ok() {
+                                    eprintln!("lyrad: source attached to stream {id} (fd-passed ring)");
+                                    let _ = tx.send(Cmd::Attach(id, ring));
+                                }
+                            }
+                            Err(e) => eprintln!("lyrad: create_anon: {e}"),
+                        }
+                    }
+                });
+            }
+            Err(e) => eprintln!("lyrad: no data socket ({e}); sources unavailable"),
         }
-    });
+    }
 
     let sink = match OssSink::open(RATE, 2, FRAMES_PER_PERIOD, 8) {
         Ok(s) => s,
@@ -448,10 +487,10 @@ fn control_mode(args: &[String]) {
     let mut out = vec![0i16; n];
     let periods = (secs * RATE as u64) / FRAMES_PER_PERIOD as u64;
     for _ in 0..periods {
-        // apply all pending control commands at this period boundary (atomic).
+        // apply all pending commands at this period boundary (atomic).
         while let Ok(c) = rx.try_recv() {
             match c {
-                Ctl::OpenStream { stream } => {
+                Cmd::Ctl(Ctl::OpenStream { stream }) => {
                     if !streams.iter().any(|s| s.id == stream) {
                         streams.push(St {
                             id: stream,
@@ -463,28 +502,39 @@ fn control_mode(args: &[String]) {
                         eprintln!("lyrad: ctl OpenStream stream={stream}; {} active", streams.len());
                     }
                 }
-                Ctl::CloseStream { stream } => {
+                Cmd::Ctl(Ctl::CloseStream { stream }) => {
                     streams.retain(|s| s.id != stream);
                     eprintln!("lyrad: ctl CloseStream stream={stream}; {} active", streams.len());
                 }
-                Ctl::SetGainDb { stream, db } => {
+                Cmd::Ctl(Ctl::SetGainDb { stream, db }) => {
                     if let Some(st) = streams.iter_mut().find(|s| s.id == stream) {
                         st.gain.set_target(10f32.powf(db / 20.0));
-                        eprintln!("lyrad: ctl SetGainDb stream={stream} {db:+.1} dB", );
+                        eprintln!("lyrad: ctl SetGainDb stream={stream} {db:+.1} dB");
                     }
                 }
-                Ctl::Reroute { stream, sink } => {
+                Cmd::Ctl(Ctl::Reroute { stream, sink }) => {
                     eprintln!("lyrad: ctl Reroute stream={stream} -> sink {sink} (noted; single-sink build)");
+                }
+                Cmd::Attach(stream, ring) => {
+                    // the fd-passed data-plane ring for this stream (no name).
+                    // create the slot if the source beat the control-plane open.
+                    if let Some(st) = streams.iter_mut().find(|s| s.id == stream) {
+                        st.ring = Some(ring);
+                    } else {
+                        streams.push(St {
+                            id: stream,
+                            step: 2.0 * std::f32::consts::PI * demo_freq(stream) / RATE as f32,
+                            phase: 0.0,
+                            gain: Gain::new(1.0, RATE as f32, 20.0),
+                            ring: Some(ring),
+                        });
+                    }
                 }
             }
         }
 
         for v in mix.iter_mut() { *v = 0.0; }
         for st in streams.iter_mut() {
-            // attach to the data-plane ring lazily (the source may start late).
-            if st.ring.is_none() {
-                st.ring = lyra::ring::Ring::open(&format!("/lyra_pcm_{}", st.id), false).ok();
-            }
             if let Some(ring) = st.ring.as_ref() {
                 // real audio from the source; zero-fill any underrun tail.
                 let got = ring.read(&mut tmp) as usize;
