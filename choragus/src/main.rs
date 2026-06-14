@@ -65,10 +65,15 @@ fn main() {
     // --app <app_sock> <role> <secs>: a stand-in audio app — register with the
     // daemon under a role, hold, then close. Separate process from choragusd.
     if let Some(i) = args.iter().position(|a| a == "--app") {
+        use choragus::app::{CAP_AUDIO, CAP_MICROPHONE, CAP_MONITOR};
         let app_sock = args.get(i + 1).map(String::as_str).unwrap_or("/tmp/choragus.sock");
         let role = args.get(i + 2).and_then(|s| choragus::app::role_from_str(s)).unwrap_or(Role::Media);
         let secs: u64 = args.get(i + 3).and_then(|s| s.parse().ok()).unwrap_or(4);
-        app_client(app_sock, role, secs);
+        // every player needs `audio`; "monitor"/"mic" request the privileged ones.
+        let mut caps = CAP_AUDIO;
+        if args.iter().any(|a| a == "monitor") { caps |= CAP_MONITOR; }
+        if args.iter().any(|a| a == "mic") { caps |= CAP_MICROPHONE; }
+        app_client(app_sock, role, secs, caps);
         return;
     }
 
@@ -184,7 +189,7 @@ fn close_stream(state: &std::sync::Mutex<DState>, stream: u32) {
 /// Handle one app connection: register/close streams; on disconnect, close any
 /// the app left open (crash safety — an app dying un-ducks everyone else).
 fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std::sync::Mutex<DState>>) {
-    use choragus::app::{AppMsg, APP_FRAME_LEN};
+    use choragus::app::{cap_names, AppMsg, APP_FRAME_LEN, CAP_AUDIO, DENIED};
     use choragus::control::Ctl;
     use choragus::policy::{diff, Stream};
     use std::io::{Read, Write};
@@ -193,7 +198,18 @@ fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std
     let mut frame = [0u8; APP_FRAME_LEN];
     while app.read_exact(&mut frame).is_ok() {
         match AppMsg::decode(&frame) {
-            Some(AppMsg::Register { role }) => {
+            Some(AppMsg::Register { role, caps }) => {
+                // §9 enforcement: the app's Portcullis grant. STUBBED to {audio}
+                // until the Portcullis capability token is wired (L4/L5) — but the
+                // default-deny posture is real: anything beyond `audio` (the mic,
+                // the system monitor/tap) is refused at the door.
+                let granted: u8 = CAP_AUDIO;
+                let denied = caps & !granted;
+                if denied != 0 {
+                    eprintln!("choragusd: {role:?} DENIED — requested {:?}, not granted (default-deny)", cap_names(denied));
+                    let _ = app.write_all(&DENIED.to_le_bytes());
+                    continue;
+                }
                 let id;
                 let nchanges;
                 {
@@ -254,9 +270,9 @@ fn daemon(app_sock: &str, lyrad_sock: &str) {
     }
 }
 
-/// A stand-in audio app: register under a role, hold, then close.
-fn app_client(app_sock: &str, role: Role, secs: u64) {
-    use choragus::app::AppMsg;
+/// A stand-in audio app: register under a role (requesting `caps`), hold, close.
+fn app_client(app_sock: &str, role: Role, secs: u64, caps: u8) {
+    use choragus::app::{cap_names, AppMsg, DENIED};
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
@@ -264,13 +280,17 @@ fn app_client(app_sock: &str, role: Role, secs: u64) {
         Ok(s) => s,
         Err(e) => { eprintln!("app: connect {app_sock}: {e} (is choragusd --daemon up?)"); std::process::exit(1); }
     };
-    let _ = s.write_all(&AppMsg::Register { role }.encode());
+    let _ = s.write_all(&AppMsg::Register { role, caps }.encode());
     let mut idb = [0u8; 4];
     if s.read_exact(&mut idb).is_err() {
         eprintln!("app: no id from choragusd");
         std::process::exit(1);
     }
     let id = u32::from_le_bytes(idb);
+    if id == DENIED {
+        eprintln!("app: registration DENIED by choragusd (requested {:?})", cap_names(caps));
+        std::process::exit(2);
+    }
     eprintln!("app: registered as {role:?} -> stream {id}; playing {secs}s");
     std::thread::sleep(std::time::Duration::from_secs(secs));
     let _ = s.write_all(&AppMsg::Close { stream: id }.encode());

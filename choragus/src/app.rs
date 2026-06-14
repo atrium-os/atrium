@@ -23,6 +23,24 @@ pub const APP_FRAME_LEN: usize = 8;
 const TAG_REGISTER: u8 = 1;
 const TAG_CLOSE: u8 = 2;
 
+/// Requested-capability bits an app sends with `Register` (§9). choragusd checks
+/// these against the app's Portcullis grant and refuses the ones not held.
+pub const CAP_AUDIO: u8 = 1;
+pub const CAP_MICROPHONE: u8 = 2;
+pub const CAP_MONITOR: u8 = 4;
+
+/// Human-readable names of the set bits, for logging a denial.
+pub fn cap_names(bits: u8) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    if bits & CAP_AUDIO != 0 { v.push("audio"); }
+    if bits & CAP_MICROPHONE != 0 { v.push("microphone"); }
+    if bits & CAP_MONITOR != 0 { v.push("audio_monitor"); }
+    v
+}
+
+/// Sentinel stream id in the registration reply meaning "denied".
+pub const DENIED: u32 = u32::MAX;
+
 pub fn role_to_u8(r: Role) -> u8 {
     match r {
         Role::Media => 0,
@@ -58,8 +76,9 @@ pub fn role_from_str(s: &str) -> Option<Role> {
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum AppMsg {
-    /// "I want to play, as this role." choragusd replies with the assigned id.
-    Register { role: Role },
+    /// "I want to play, as this role, requesting these capability bits."
+    /// choragusd replies with the assigned id, or [`DENIED`].
+    Register { role: Role, caps: u8 },
     /// "I am done with this stream."
     Close { stream: u32 },
 }
@@ -68,9 +87,10 @@ impl AppMsg {
     pub fn encode(&self) -> [u8; APP_FRAME_LEN] {
         let mut f = [0u8; APP_FRAME_LEN];
         match *self {
-            AppMsg::Register { role } => {
+            AppMsg::Register { role, caps } => {
                 f[0] = TAG_REGISTER;
                 f[1] = role_to_u8(role);
+                f[2] = caps;
             }
             AppMsg::Close { stream } => {
                 f[0] = TAG_CLOSE;
@@ -85,7 +105,7 @@ impl AppMsg {
             return None;
         }
         match b[0] {
-            TAG_REGISTER => Some(AppMsg::Register { role: role_from_u8(b[1])? }),
+            TAG_REGISTER => Some(AppMsg::Register { role: role_from_u8(b[1])?, caps: b[2] }),
             TAG_CLOSE => {
                 Some(AppMsg::Close { stream: u32::from_le_bytes(b[4..8].try_into().ok()?) })
             }
@@ -101,11 +121,17 @@ mod tests {
     #[test]
     fn register_and_close_round_trip() {
         for m in [
-            AppMsg::Register { role: Role::Communication },
+            AppMsg::Register { role: Role::Communication, caps: CAP_AUDIO },
+            AppMsg::Register { role: Role::Media, caps: CAP_AUDIO | CAP_MONITOR },
             AppMsg::Close { stream: 9 },
         ] {
             assert_eq!(AppMsg::decode(&m.encode()), Some(m));
         }
+    }
+
+    #[test]
+    fn cap_names_lists_set_bits() {
+        assert_eq!(cap_names(CAP_AUDIO | CAP_MONITOR), vec!["audio", "audio_monitor"]);
     }
 
     #[test]
