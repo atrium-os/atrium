@@ -1858,6 +1858,40 @@ multi-tenancy fixes in the next commit):
 - App jails inherit no /etc, no /sbin — apps must bring their own
   binaries (or a curated etc); intentional sealed-app behaviour.
 
+### jaild — the privileged jail broker (bring-up, first run 2026-06-14)
+
+`jaild` (`atrium-jaild`) is the Portcullis TCB: the sole caller of
+`jail_set`/`pdfork`/`execve`, validating every request against a static policy.
+Cross-compiles like the rest (`cargo build --release --target
+aarch64-unknown-freebsd -p jaild`). First in-VM bring-up:
+
+```sh
+vssh "cp /mnt/host/portcullis/target/aarch64-unknown-freebsd/release/atrium-jaild /root/ &&
+      mkdir -p /etc/atrium /var/run/atrium /var/log/atrium &&
+      cp /mnt/host/etc/jaild.policy.toml /etc/atrium/"
+vssh "/root/atrium-jaild check-policy --policy /etc/atrium/jaild.policy.toml"   # ok: schema_version=1 services=4
+vssh "/root/atrium-jaild serve --policy /etc/atrium/jaild.policy.toml \
+        --socket /var/run/atrium/jaild.sock --state /var/run/atrium/jaild.state.toml &"
+# socket is srw------- root (mode 0600); jaild refuses any non-root peer.
+```
+
+Drive it with the test client `atrium-portcullisd-jclient <socket> <cmd>` —
+`ping` / `create <name> <path>` / `exec <name> <path> <bin> [args]` / `remove
+<jid>`. **jaild enforces the policy strictly**: a `create` is refused unless the
+jail *name* matches an allowed prefix (`atrium-`/`app-`/`system-`/`user-`) AND
+the *path* is in the policy's `mount_sources` allow-list — so a compliant jail
+needs a real app exec_root under `allowed_exec_root`
+(`/usr/local/share/atrium/apps`), not an arbitrary path. The rc.d service is
+`atrium_jaild_enable=YES` (`portcullis/jaild/etc/atrium-jaild`).
+
+> **Lyra/Choragus integration (the remaining chain):** the audio capability
+> grants (`audio` / `microphone` / `audio_monitor`, all now in the Portcullis
+> manifest schema) flow manifest → portcullisd (user approval) → the per-user
+> grant store. For Choragus to read a *real* grant (vs its hand-written
+> `choragus.grants`), the Lyra app must be **launched by Portcullis** in a jail
+> with a distinct uid, so choragusd's `getpeereid(2)` resolves the uid → the
+> app's grant. That app-launch path is the next integration step.
+
 ### FreeBSD source fork (for kernel patches)
 
 We maintain a downstream fork of FreeBSD src for kernel-side patches
