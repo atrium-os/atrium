@@ -112,8 +112,15 @@ wall-clock is CPU submit/copy overhead. Heavy anchor: Orbis 3D, ~11 ms @720p.)
   lane (for the common 2–4 ms interactive frame) plus damage tracking (to keep
   most frames light). This is the regime the §3 measurement lives in.
 - **Heavy 3D** (games, Orbis): GPU render at ~11 ms against a 16.7 ms budget has
-  thin headroom → GPU render-timing is the lever (a slower target GPU slips past
-  vblank; `gpusim framepace.rs` models the slip).
+  thin headroom → GPU render-timing is the lever. `gpusim framepace.rs` models
+  this, now **anchored on the measured costs**: desktop never slips, Orbis @720p
+  holds 60 fps, and only a ~2× slower target GPU slips — where a **render-timing-
+  aware** compositor (`pace_frames_resync`) keeps the dropped-frame count *bounded*
+  instead of cascading like a naive queue-ahead pacer (the GPU analog of §3's
+  resync-vs-cascade). The model + anchors are ready; the real-silicon GPU-queue
+  priority is gated on the native GPU driver (the host MoltenVK/Metal path does
+  not expose it), not a design gap — the GPU is a first-class federation member
+  (GPU `modulate-L`, the watt budget) by construction.
 
 So three complementary legs — damage tracking, the deadline lane, GPU
 render-timing — and the lane is necessary for the interactive middle regime (the
