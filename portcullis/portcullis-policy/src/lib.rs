@@ -152,6 +152,7 @@ pub struct CapabilityDelta {
     pub usb_hid:         bool,
     pub camera:          bool,
     pub microphone:      bool,
+    pub audio_monitor:   bool,
     pub tessera_cas_read: bool,
     /// Filesystem paths in manifest but not in granted list.
     pub filesystem_added: Vec<String>,
@@ -174,6 +175,7 @@ impl CapabilityDelta {
             && !self.usb_hid
             && !self.camera
             && !self.microphone
+            && !self.audio_monitor
             && !self.tessera_cas_read
             && self.filesystem_added.is_empty()
             && self.fonts_added.is_empty()
@@ -197,6 +199,7 @@ impl CapabilityDelta {
         if self.usb_hid         { out.push("Read raw USB HID input devices".into()); }
         if self.camera          { out.push("Access the camera".into()); }
         if self.microphone      { out.push("Access the microphone".into()); }
+        if self.audio_monitor   { out.push("Record the system audio output (everything you hear)".into()); }
         if self.tessera_cas_read{ out.push("Read the global Tessera CAS (privileged)".into()); }
         for p in &self.filesystem_added {
             out.push(format!("Read and write {p}"));
@@ -271,6 +274,7 @@ pub fn compute_delta(
     bool_cap!(usb_hid);
     bool_cap!(camera);
     bool_cap!(microphone);
+    bool_cap!(audio_monitor);
     bool_cap!(tessera_cas_read);
 
     if let Some(req_paths) = &requested.filesystem {
@@ -327,6 +331,7 @@ mod tests {
             usb_hid:    None,
             camera:     None,
             microphone: None,
+            audio_monitor: None,
             extra:      Default::default(),
         }
     }

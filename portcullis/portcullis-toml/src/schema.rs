@@ -57,6 +57,11 @@ pub struct Capabilities {
     pub usb_hid:    Option<bool>,               /* restricted */
     pub camera:     Option<bool>,
     pub microphone: Option<bool>,
+    /// Tap the system audio output or another app's stream (the audio
+    /// screen-record). Restricted + prominently surfaced — designed against
+    /// the PulseAudio monitor-source leak (Lyra §9, enforced by Choragus).
+    #[serde(rename = "audio-monitor")]
+    pub audio_monitor: Option<bool>,
     /// Unknown / future keys. Validator warns; doesn't reject.
     #[serde(flatten)]
     pub extra:      BTreeMap<String, toml::Value>,
@@ -145,6 +150,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         usb_hid:          ovr.usb_hid.or(base.usb_hid),
         camera:           ovr.camera.or(base.camera),
         microphone:       ovr.microphone.or(base.microphone),
+        audio_monitor:    ovr.audio_monitor.or(base.audio_monitor),
         extra:            {
             let mut e = base.extra.clone();
             for (k, v) in &ovr.extra { e.insert(k.clone(), v.clone()); }
