@@ -275,4 +275,21 @@ struct atrium_gpu_display_dptrain {
 #define ATRIUM_GPU_IOC_DISPLAY_MST	_IOWR('A', 23, struct atrium_gpu_display_mst)
 #define ATRIUM_GPU_IOC_DISPLAY_DPTRAIN	_IOWR('A', 24, struct atrium_gpu_display_dptrain)
 
+/*
+ * Power gating: gate idle IP blocks. The caller passes which blocks the current
+ * workload uses (busy_mask) and, optionally, which the NEXT workload will need
+ * (next_busy, from Fresco/Lyra/GPU-sched foreknowledge). The driver gates every
+ * idle block, pre-waking the foreknown ones, and reports the draw before/after
+ * plus the wake stall the next workload would face (0 once pre-woken).
+ */
+struct atrium_gpu_powergate {
+	uint32_t busy_mask;		/* in: blocks the current workload uses */
+	uint32_t next_busy;		/* in: blocks the next workload needs (0 = none) */
+	uint32_t gate_mask;		/* out: blocks the driver power-gated */
+	uint32_t power_before_mw;	/* out: draw with idle blocks ungated */
+	uint32_t power_after_mw;	/* out: draw after gating idle blocks */
+	uint32_t wake_stall_us;		/* out: next workload's wake stall (0 = pre-woken) */
+};
+#define ATRIUM_GPU_IOC_POWERGATE	_IOWR('A', 26, struct atrium_gpu_powergate)
+
 #endif /* _ATRIUM_GPU_AMD_ABI_H_ */

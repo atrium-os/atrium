@@ -166,6 +166,26 @@
 #define regSCHED_POWER_DEMAND_MW 0x40030 /* r: average power demand (mW) */
 #define regSCHED_ROUNDS_EXEC	0x40034	/* r: cumulative rounds executed */
 
+/*
+ * Power-gating block (APER_PGATE = 0x5_0000; model: engine/src/pgate_regs.rs).
+ * The driver reads which IP blocks are idle, power-gates them, and reads back the
+ * power/energy. Exposes POWER gating (the driver-controlled lever); clock gating
+ * is hardware-automatic, no register.
+ */
+#define regPGATE_NUM_BLOCKS	0x50000	/* r: number of gateable IP blocks */
+#define regPGATE_BLOCK_BUSY	0x50004	/* r: bitmask of blocks with work in flight */
+#define regPGATE_BLOCK_GATE	0x50008	/* rw: bitmask of blocks to power-gate */
+#define regPGATE_SET_BUSY	0x5000c	/* w: set the busy bitmask (engine stand-in) */
+#define regPGATE_POWER_MW	0x50010	/* r: current draw, milliwatts */
+#define regPGATE_ENERGY_UJ	0x50014	/* r: accumulated energy, microjoules */
+#define regPGATE_TICK_US	0x50018	/* w: advance N us, accruing energy */
+#define regPGATE_SELECT		0x5001c	/* w: select a block for readbacks */
+#define regPGATE_SEL_ACTIVE_MW	0x50020	/* r: selected block powered leakage (mW) */
+#define regPGATE_SEL_GATED_MW	0x50024	/* r: selected block gated leakage (mW) */
+#define regPGATE_SEL_EXIT_US	0x50028	/* r: selected block wake latency (us) */
+#define regPGATE_NEXT_BUSY	0x5002c	/* w: foreknowledge - blocks the next job needs */
+#define regPGATE_WAKE_STALL_US	0x50030	/* r: stall if NEXT_BUSY blocks aren't pre-woken */
+
 /* CP firmware: minimum ucode version the model accepts (CP_FW_MIN_VERSION). */
 #define ATRIUM_AMD_CP_FW_VERSION 0x40
 /* Reset poll: model latches synchronously; poll-with-timeout is the HW shape. */
@@ -409,6 +429,10 @@ int	 amd_queue_program(struct atrium_amd_softc *sc, uint64_t ring_va,
 /* cp.c — firmware energy-fair scheduler (the kernel programs weights) */
 struct atrium_gpu_sched;
 void	 amd_sched(struct atrium_amd_softc *sc, struct atrium_gpu_sched *s);
+
+/* pgate.c — power-gate idle IP blocks (the driver-controlled lever) */
+struct atrium_gpu_powergate;
+int	 amd_powergate(struct atrium_amd_softc *sc, struct atrium_gpu_powergate *p);
 
 /* display.c — the D-display-1 scanout path (one connector / one CRTC) */
 struct atrium_gpu_display_query;

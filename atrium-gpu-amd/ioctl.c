@@ -373,6 +373,13 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		return (0);
 	}
 
+	case ATRIUM_GPU_IOC_POWERGATE: {
+		struct atrium_gpu_powergate *p =
+		    (struct atrium_gpu_powergate *)data;
+
+		return (amd_powergate(sc, p));
+	}
+
 	case ATRIUM_GPU_IOC_DISPLAY_QUERY: {
 		struct atrium_gpu_display_query *q =
 		    (struct atrium_gpu_display_query *)data;
