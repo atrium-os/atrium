@@ -6,7 +6,7 @@
 //! gain ramp, a glitch-free re-route. Samples never touch this socket.
 
 use crate::policy::Change;
-use lyra_protocol::Ctl;
+pub use lyra_protocol::Ctl;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 
@@ -25,6 +25,28 @@ pub fn send(socket: &str, changes: &[Change]) -> std::io::Result<()> {
         s.write_all(&change_to_ctl(*c).encode())?;
     }
     s.flush()
+}
+
+/// A persistent control connection to lyrad — for a session that drives stream
+/// lifecycle (open/close) and level changes over time.
+pub struct Conn(UnixStream);
+
+impl Conn {
+    pub fn connect(socket: &str) -> std::io::Result<Conn> {
+        Ok(Conn(UnixStream::connect(socket)?))
+    }
+    /// Send one control message.
+    pub fn send(&mut self, c: Ctl) -> std::io::Result<()> {
+        self.0.write_all(&c.encode())?;
+        self.0.flush()
+    }
+    /// Send the changes from a desired-state diff (gains/routes).
+    pub fn apply(&mut self, changes: &[Change]) -> std::io::Result<()> {
+        for c in changes {
+            self.send(change_to_ctl(*c))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -381,81 +381,61 @@ fn effect_mode(args: &[String]) {
     );
 }
 
-const MAX_STREAMS: usize = 8;
+/// The demo synth frequency for a stream id (real streams are ring-fed; the
+/// control-plane demo synthesises a distinct tone per id so the mix is audible
+/// and spectrally measurable). id 0 → 440 Hz, id 1 → 660 Hz, id 2 → 880 Hz, …
+fn demo_freq(id: u32) -> f32 {
+    220.0 * (id as f32 + 2.0)
+}
 
-/// `lyrad --control <socket> [secs]` — a real multi-stream **mixer** with a live
-/// control plane (Aqueduct class 5). It hosts two streams — id 0 "media" (440 Hz)
-/// and id 1 "comms" (660 Hz) — sums them per period, and applies per-stream
-/// `SetGainDb` from choragusd by ramping *that stream's* gain through the
-/// zipper-free smoother. So a duck targeted at stream 0 lowers media while comms
-/// keeps playing — the policy layer decides, the engine applies, per stream.
+/// `lyrad --control <socket> [secs]` — a real **dynamic mixer** with a live
+/// control plane (Aqueduct class 5). It starts with NO streams; choragusd
+/// commands the lifecycle: `OpenStream`/`CloseStream` create and tear down mixer
+/// slots, `SetGainDb` ramps a slot's gain through the zipper-free smoother. The
+/// engine holds no policy — it just realises the session the policy layer drives.
+/// Control frames cross a channel to the mix loop, applied at the period boundary
+/// (the glitch-free-reconfiguration shape).
 fn control_mode(args: &[String]) {
     use lyra::gain::Gain;
     use lyra_protocol::Ctl;
     use std::io::Read;
     use std::os::unix::net::UnixListener;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::Arc;
+    use std::sync::mpsc;
 
     let idx = args.iter().position(|a| a == "--control").unwrap();
     let socket = args.get(idx + 1).cloned().unwrap_or_else(|| "/tmp/lyrad.ctl".into());
     let secs: u64 = args.get(idx + 2).and_then(|s| s.parse().ok()).unwrap_or(8);
-
-    // per-stream linear-gain targets (f32 bits), updated by the control thread,
-    // read by the mix loop. Index = stream id.
-    let targets: Arc<Vec<AtomicU32>> =
-        Arc::new((0..MAX_STREAMS).map(|_| AtomicU32::new(1.0f32.to_bits())).collect());
 
     let _ = std::fs::remove_file(&socket);
     let listener = match UnixListener::bind(&socket) {
         Ok(l) => l,
         Err(e) => { eprintln!("lyrad: bind {socket}: {e}"); std::process::exit(1); }
     };
-    eprintln!("lyrad: control socket at {socket}");
+    eprintln!("lyrad: control socket at {socket} (dynamic mixer, 0 streams)");
 
-    // control thread: accept connections, decode Ctl frames, update the per-stream
-    // target. A SetGainDb touches only its own stream — the mix isolation policy.
-    {
-        let targets = Arc::clone(&targets);
-        std::thread::spawn(move || {
-            for conn in listener.incoming() {
-                let mut conn = match conn { Ok(c) => c, Err(_) => continue };
-                let mut frame = [0u8; lyra_protocol::FRAME_LEN];
-                while conn.read_exact(&mut frame).is_ok() {
-                    match Ctl::decode(&frame) {
-                        Some(Ctl::SetGainDb { stream, db }) => {
-                            if (stream as usize) < MAX_STREAMS {
-                                let lin = 10f32.powf(db / 20.0);
-                                targets[stream as usize].store(lin.to_bits(), Ordering::Relaxed);
-                                eprintln!("lyrad: ctl SetGainDb stream={stream} {db:+.1} dB (gain {lin:.3})");
-                            }
-                        }
-                        Some(Ctl::Reroute { stream, sink }) => {
-                            eprintln!("lyrad: ctl Reroute stream={stream} -> sink {sink} (noted; single-sink build)");
-                        }
-                        None => eprintln!("lyrad: bad control frame"),
-                    }
+    // control thread: decode Ctl frames, forward to the mix loop over a channel.
+    let (tx, rx) = mpsc::channel::<Ctl>();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let mut conn = match conn { Ok(c) => c, Err(_) => continue };
+            let mut frame = [0u8; lyra_protocol::FRAME_LEN];
+            while conn.read_exact(&mut frame).is_ok() {
+                if let Some(c) = Ctl::decode(&frame) {
+                    let _ = tx.send(c);
                 }
             }
-        });
-    }
+        }
+    });
 
     let sink = match OssSink::open(RATE, 2, FRAMES_PER_PERIOD, 8) {
         Ok(s) => s,
         Err(e) => { eprintln!("lyrad: no OSS sink ({e})"); let _ = std::fs::remove_file(&socket); std::process::exit(1); }
     };
 
-    // the runtime stream table: (name, frequency, phase, per-stream gain ramp).
-    struct St { name: &'static str, step: f32, phase: f32, gain: Gain }
-    let mk = |freq: f32| St {
-        name: "", step: 2.0 * std::f32::consts::PI * freq / RATE as f32, phase: 0.0,
-        gain: Gain::new(1.0, RATE as f32, 20.0), // 20 ms ramp = zipper-free
-    };
-    let mut streams = [St { name: "media", ..mk(440.0) }, St { name: "comms", ..mk(660.0) }];
-    eprintln!("lyrad: mixing {} streams: {}", streams.len(),
-        streams.iter().enumerate().map(|(i, s)| format!("{i}={}", s.name)).collect::<Vec<_>>().join(" "));
+    // the runtime stream table — created/destroyed by control commands.
+    struct St { id: u32, step: f32, phase: f32, gain: Gain }
+    let mut streams: Vec<St> = Vec::new();
 
-    // optional ground-truth capture of the exact mixed output (LYRA_DUMP=path).
     use std::io::Write;
     let mut dump = std::env::var("LYRA_DUMP").ok().and_then(|p| std::fs::File::create(p).ok());
 
@@ -465,9 +445,38 @@ fn control_mode(args: &[String]) {
     let mut out = vec![0i16; n];
     let periods = (secs * RATE as u64) / FRAMES_PER_PERIOD as u64;
     for _ in 0..periods {
+        // apply all pending control commands at this period boundary (atomic).
+        while let Ok(c) = rx.try_recv() {
+            match c {
+                Ctl::OpenStream { stream } => {
+                    if !streams.iter().any(|s| s.id == stream) {
+                        streams.push(St {
+                            id: stream,
+                            step: 2.0 * std::f32::consts::PI * demo_freq(stream) / RATE as f32,
+                            phase: 0.0,
+                            gain: Gain::new(1.0, RATE as f32, 20.0),
+                        });
+                        eprintln!("lyrad: ctl OpenStream stream={stream} ({:.0} Hz); {} active", demo_freq(stream), streams.len());
+                    }
+                }
+                Ctl::CloseStream { stream } => {
+                    streams.retain(|s| s.id != stream);
+                    eprintln!("lyrad: ctl CloseStream stream={stream}; {} active", streams.len());
+                }
+                Ctl::SetGainDb { stream, db } => {
+                    if let Some(st) = streams.iter_mut().find(|s| s.id == stream) {
+                        st.gain.set_target(10f32.powf(db / 20.0));
+                        eprintln!("lyrad: ctl SetGainDb stream={stream} {db:+.1} dB", );
+                    }
+                }
+                Ctl::Reroute { stream, sink } => {
+                    eprintln!("lyrad: ctl Reroute stream={stream} -> sink {sink} (noted; single-sink build)");
+                }
+            }
+        }
+
         for v in mix.iter_mut() { *v = 0.0; }
-        for (id, st) in streams.iter_mut().enumerate() {
-            st.gain.set_target(f32::from_bits(targets[id].load(Ordering::Relaxed)));
+        for st in streams.iter_mut() {
             for f in 0..FRAMES_PER_PERIOD as usize {
                 let s = st.phase.sin() * 0.25;
                 tmp[f * 2] = s;

@@ -43,9 +43,18 @@ fn main() {
         return;
     }
 
+    // --session <socket>: drive a full stream lifecycle against a running lyrad,
+    // commanding open/close + the policy-resolved levels over time. The session
+    // layer as the source of truth for streams; lyrad realises what it's told.
+    if let Some(i) = args.iter().position(|a| a == "--session") {
+        let socket = args.get(i + 1).map(String::as_str).unwrap_or("/tmp/lyrad.ctl");
+        session_demo(socket);
+        return;
+    }
+
     let demo = args.iter().any(|a| a == "--demo");
     if !demo {
-        eprintln!("choragusd: policy/session layer (skeleton). try --demo or --apply <sock>");
+        eprintln!("choragusd: policy/session layer (skeleton). try --demo, --apply <sock>, or --session <sock>");
         eprintln!("  (the RT engine is lyrad; choragusd decides routing/ducking/");
         eprintln!("   volume/exclusivity and enforces audio/mic/monitor privacy.)");
         return;
@@ -84,4 +93,49 @@ fn main() {
     assert!(tap.is_err(), "the global mix must never be visible without audio_monitor");
 
     println!("choragusd demo OK");
+}
+
+/// Drive a stream lifecycle against a running `lyrad --control`: open media, then
+/// a call arrives (open comms + media ducks), then the call ends (close comms +
+/// media restores). Choragus owns the stream set + the policy; lyrad is told.
+fn session_demo(socket: &str) {
+    use choragus::control::{Conn, Ctl};
+    use choragus::policy::diff;
+    use std::{thread, time::Duration};
+
+    let mut conn = match Conn::connect(socket) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("choragusd: connect {socket}: {e} (is `lyrad --control {socket}` running?)");
+            std::process::exit(1);
+        }
+    };
+    let spk = Device { id: 0, kind: DeviceKind::Speakers };
+    let mut sess = Session::new(vec![spk], spk.id);
+
+    // 1. media opens and plays.
+    sess.open(Stream::new(0, Role::Media)).unwrap();
+    conn.send(Ctl::OpenStream { stream: 0 }).unwrap();
+    eprintln!("choragusd: media (stream 0) playing");
+    thread::sleep(Duration::from_secs(2));
+
+    // 2. a call arrives: open comms, and media ducks (the policy diff).
+    let before = sess.resolve();
+    sess.open(Stream::new(1, Role::Communication)).unwrap();
+    let after = sess.resolve();
+    conn.send(Ctl::OpenStream { stream: 1 }).unwrap();
+    conn.apply(&diff(&before, &after)).unwrap();
+    eprintln!("choragusd: a call arrived -> comms (stream 1) opened, media ducks");
+    thread::sleep(Duration::from_secs(2));
+
+    // 3. the call ends: close comms, and media restores.
+    let before = sess.resolve();
+    sess.close(1);
+    let after = sess.resolve();
+    conn.send(Ctl::CloseStream { stream: 1 }).unwrap();
+    conn.apply(&diff(&before, &after)).unwrap();
+    eprintln!("choragusd: call ended -> comms closed, media restored");
+    thread::sleep(Duration::from_secs(1));
+
+    eprintln!("choragusd: session done");
 }

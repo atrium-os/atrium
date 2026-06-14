@@ -23,10 +23,18 @@ pub const FRAME_LEN: usize = 12;
 
 const TAG_SET_GAIN: u8 = 1;
 const TAG_REROUTE: u8 = 2;
+const TAG_OPEN: u8 = 3;
+const TAG_CLOSE: u8 = 4;
 
-/// A control message: a level or routing change for one stream.
+/// A control message from the session layer to the engine — a stream's lifecycle
+/// (open / close) or a level / routing change.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Ctl {
+    /// Instantiate a mixer slot for `stream` (its audio source is its ring; the
+    /// demo engine synthesises a tone keyed by id). Opens at unity gain.
+    OpenStream { stream: u32 },
+    /// Tear down `stream`'s mixer slot.
+    CloseStream { stream: u32 },
     /// Ramp `stream`'s output gain to `db` (the zipper-free smoother applies it).
     SetGainDb { stream: u32, db: f32 },
     /// Move `stream` to `sink` (the glitch-free atomic-commit reconfig applies it).
@@ -36,7 +44,10 @@ pub enum Ctl {
 impl Ctl {
     pub fn stream(&self) -> u32 {
         match *self {
-            Ctl::SetGainDb { stream, .. } | Ctl::Reroute { stream, .. } => stream,
+            Ctl::OpenStream { stream }
+            | Ctl::CloseStream { stream }
+            | Ctl::SetGainDb { stream, .. }
+            | Ctl::Reroute { stream, .. } => stream,
         }
     }
 
@@ -44,6 +55,8 @@ impl Ctl {
     pub fn encode(&self) -> [u8; FRAME_LEN] {
         let mut f = [0u8; FRAME_LEN];
         let (tag, stream, payload) = match *self {
+            Ctl::OpenStream { stream } => (TAG_OPEN, stream, 0),
+            Ctl::CloseStream { stream } => (TAG_CLOSE, stream, 0),
             Ctl::SetGainDb { stream, db } => (TAG_SET_GAIN, stream, db.to_bits()),
             Ctl::Reroute { stream, sink } => (TAG_REROUTE, stream, sink),
         };
@@ -61,6 +74,8 @@ impl Ctl {
         let stream = u32::from_le_bytes(b[4..8].try_into().ok()?);
         let payload = u32::from_le_bytes(b[8..12].try_into().ok()?);
         match b[0] {
+            TAG_OPEN => Some(Ctl::OpenStream { stream }),
+            TAG_CLOSE => Some(Ctl::CloseStream { stream }),
             TAG_SET_GAIN => Some(Ctl::SetGainDb { stream, db: f32::from_bits(payload) }),
             TAG_REROUTE => Some(Ctl::Reroute { stream, sink: payload }),
             _ => None,
@@ -101,6 +116,13 @@ mod tests {
     fn negative_and_zero_gain_survive() {
         for db in [0.0f32, -6.0, -18.0, -60.0, 3.5] {
             let c = Ctl::SetGainDb { stream: 0, db };
+            assert_eq!(Ctl::decode(&c.encode()), Some(c));
+        }
+    }
+
+    #[test]
+    fn open_and_close_round_trip() {
+        for c in [Ctl::OpenStream { stream: 2 }, Ctl::CloseStream { stream: 5 }] {
             assert_eq!(Ctl::decode(&c.encode()), Some(c));
         }
     }
