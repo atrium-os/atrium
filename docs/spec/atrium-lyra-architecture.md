@@ -606,6 +606,16 @@ remaining piece is deployment: Portcullis writing that registry as it launches
 each app at a dedicated uid (the jail/exec + uid-drop mechanism is itself proven
 in-VM).
 
+**Rooted in manifest trust (2026-06-14, `portcullis-sig` 841f450).** The whole
+chain trusts the *manifest* that declared the caps, so the root is **Sigstore**:
+the publisher signs `atrium.toml` and Portcullis verifies it (keyed/cosign-shape
+ECDSA P-256 against pinned trusted-publisher keys; `portcullisd` refuses an
+unsigned/tampered/untrusted manifest before granting any cap). *Proven in-VM:* a
+manifest tampered after signing (caps escalated) is rejected. So: **verified
+publisher → signed manifest (caps) → Portcullis launches at a dedicated uid →
+uid→app registry → Choragus enforces** — every link real and measured, the audio
+privacy grant ultimately as trustworthy as the manifest's signature.
+
 ## 10. The deterministic model (audio.rs lineage)
 
 Like display-timing and the scheduler, Lyra is **proven in a deterministic
