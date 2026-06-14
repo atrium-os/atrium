@@ -63,6 +63,41 @@ impl GrantStore {
     pub fn granted(&self, app_id: &str) -> u8 {
         self.map.get(app_id).copied().unwrap_or(0)
     }
+
+    /// Build the store from a **real Portcullis** per-user policy — the grant
+    /// portcullisd writes after the user approves a manifest. Each app's approved
+    /// audio capabilities map to Choragus's bits, so what Choragus enforces IS
+    /// the platform's grant (not a hand-written file). This is the integration
+    /// that closes the grant fiction.
+    pub fn from_portcullis(policy: &portcullis_policy::Policy) -> GrantStore {
+        let mut map = HashMap::new();
+        for (app_id, grant) in &policy.grants {
+            let c = &grant.capabilities;
+            let mut bits = 0u8;
+            if c.audio == Some(true) {
+                bits |= CAP_AUDIO;
+            }
+            if c.microphone == Some(true) {
+                bits |= CAP_MICROPHONE;
+            }
+            if c.audio_monitor == Some(true) {
+                bits |= CAP_MONITOR;
+            }
+            map.insert(app_id.clone(), bits);
+        }
+        GrantStore { map }
+    }
+
+    /// Load the Portcullis grant store for `user` from
+    /// `<base>/<user>/policy.toml` (portcullisd's per-user layout). Unknown user
+    /// or no file → an empty store (default-deny).
+    pub fn load_portcullis(base: &str, user: &str) -> GrantStore {
+        let path = format!("{base}/{user}/policy.toml");
+        match portcullis_policy::Policy::load(std::path::Path::new(&path)) {
+            Ok(p) => GrantStore::from_portcullis(&p),
+            Err(_) => GrantStore::default(),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -59,7 +59,10 @@ fn main() {
         let app_sock = args.get(i + 1).map(String::as_str).unwrap_or("/tmp/choragus.sock");
         let lyrad_sock = args.get(i + 2).map(String::as_str).unwrap_or("/tmp/lyrad.ctl");
         let grants = args.iter().position(|a| a == "--grants").and_then(|j| args.get(j + 1)).map(String::as_str);
-        daemon(app_sock, lyrad_sock, grants);
+        // --portcullis-grants <base>: read real per-user Portcullis grants from
+        // <base>/<user>/policy.toml (the authoritative source).
+        let pcull = args.iter().position(|a| a == "--portcullis-grants").and_then(|j| args.get(j + 1)).map(String::as_str);
+        daemon(app_sock, lyrad_sock, grants, pcull);
         return;
     }
 
@@ -175,6 +178,10 @@ struct DState {
     conn: choragus::control::Conn,
     next_id: u32,
     grants: choragus::grant::GrantStore,
+    /// If set, grants come from the REAL Portcullis per-user store under this
+    /// base dir (`<base>/<user>/policy.toml`), resolved by the getpeereid'd user
+    /// per connection — instead of the single hand-written `grants` file.
+    portcullis_base: Option<String>,
     /// lyrad's data socket — where choragusd fetches a stream's ring fd to broker
     /// to the app (so the app talks only to choragusd, one front door).
     lyrad_data_sock: String,
@@ -212,13 +219,27 @@ fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std
     use choragus::policy::{diff, Stream};
     use std::io::{Read, Write};
 
-    // the app announces its identity once; its grant is looked up from the store.
+    // VERIFIED identity: the kernel's getpeereid, not the app's word.
+    use std::os::fd::AsRawFd;
+    let (uid, _gid) = choragus::peer::uid_gid(app.as_raw_fd()).unwrap_or((u32::MAX, u32::MAX));
+    let user = choragus::peer::username(uid).unwrap_or_else(|| format!("uid{uid}"));
+    // the app still names itself (its manifest app-id); the grant is scoped to
+    // the verified user, mirroring how portcullisd resolves a grant.
     let app_id = match choragus::app::read_hello(&mut app) {
         Ok(id) => id,
         Err(_) => return,
     };
-    let granted: u8 = state.lock().unwrap().grants.granted(&app_id);
-    eprintln!("choragusd: app '{app_id}' connected (granted {:?})", choragus::app::cap_names(granted));
+    // resolve the grant: the REAL Portcullis per-user store if configured, else
+    // the hand-written file.
+    let granted: u8 = {
+        let st = state.lock().unwrap();
+        match &st.portcullis_base {
+            Some(base) => choragus::grant::GrantStore::load_portcullis(base, &user).granted(&app_id),
+            None => st.grants.granted(&app_id),
+        }
+    };
+    eprintln!("choragusd: app '{app_id}' connected (peer uid={uid} user={user}, granted {:?})",
+        choragus::app::cap_names(granted));
 
     let mut opened: Vec<u32> = Vec::new();
     let mut frame = [0u8; APP_FRAME_LEN];
@@ -279,7 +300,7 @@ fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std
     }
 }
 
-fn daemon(app_sock: &str, lyrad_sock: &str, grants_path: Option<&str>) {
+fn daemon(app_sock: &str, lyrad_sock: &str, grants_path: Option<&str>, portcullis_base: Option<&str>) {
     use choragus::control::Conn;
     use choragus::grant::GrantStore;
     use std::os::unix::net::UnixListener;
@@ -292,7 +313,10 @@ fn daemon(app_sock: &str, lyrad_sock: &str, grants_path: Option<&str>) {
             std::process::exit(1);
         }
     };
-    // load the capability grant store (Portcullis writes it in production).
+    // grants: the REAL per-user Portcullis store (preferred), else the simple file.
+    if let Some(b) = portcullis_base {
+        eprintln!("choragusd: grants from Portcullis per-user store under {b} (getpeereid-resolved)");
+    }
     let grants = match grants_path {
         Some(p) => match GrantStore::load(p) {
             Ok(g) => { eprintln!("choragusd: loaded grants from {p}"); g }
@@ -306,6 +330,7 @@ fn daemon(app_sock: &str, lyrad_sock: &str, grants_path: Option<&str>) {
         conn,
         next_id: 0,
         grants,
+        portcullis_base: portcullis_base.map(String::from),
         lyrad_data_sock: format!("{lyrad_sock}.data"),
     }));
 
