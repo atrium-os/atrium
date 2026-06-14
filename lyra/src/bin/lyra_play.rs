@@ -27,8 +27,12 @@ fn main() {
     if args.iter().any(|a| a == "monitor") { caps |= CAP_MONITOR; }
     if args.iter().any(|a| a == "mic") { caps |= CAP_MICROPHONE; }
     // distinct tone per role, and distinct from lyrad's synth fallback (440/660)
-    // so the spectral proof shows the REAL fed audio.
-    let freq = 500.0 + 90.0 * role as f32;
+    // so the spectral proof shows the REAL fed audio. LYRA_PLAY_FREQ overrides it
+    // (the multi-session demo gives two same-role streams distinct tones).
+    let freq = std::env::var("LYRA_PLAY_FREQ")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(500.0 + 90.0 * role as f32);
 
     let stream = match client::play(sock, app_id, role, caps) {
         Ok(s) => s,

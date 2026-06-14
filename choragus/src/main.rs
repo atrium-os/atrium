@@ -65,7 +65,10 @@ fn main() {
         // --app-registry <file>: the Portcullis uid→app launch registry (verified
         // identity); without it, the app's hello id is trusted (legacy/test).
         let reg = args.iter().position(|a| a == "--app-registry").and_then(|j| args.get(j + 1)).map(String::as_str);
-        daemon(app_sock, lyrad_sock, grants, pcull, reg);
+        // --seat: session-aware — only the active session's audio reaches the
+        // engine; a seat switch (active-session change) makes the audio follow.
+        let seat = args.iter().any(|a| a == "--seat");
+        daemon(app_sock, lyrad_sock, grants, pcull, reg, seat);
         return;
     }
 
@@ -191,7 +194,15 @@ struct DState {
     /// lyrad's data socket — where choragusd fetches a stream's ring fd to broker
     /// to the app (so the app talks only to choragusd, one front door).
     lyrad_data_sock: String,
+    /// Session-aware: only the ACTIVE session's audio reaches the engine. When on,
+    /// a stream owned by a non-active session is muted; a seat switch follows.
+    seat_aware: bool,
+    /// stream id → the owning human session (for seat gating on a switch).
+    stream_owner: std::collections::HashMap<u32, String>,
 }
+
+/// The gain (dB) for a stream muted because its session isn't the active one.
+const SEAT_MUTE_DB: f32 = -120.0;
 
 /// Fetch the data-plane ring fd for `stream` from lyrad (connect, send the id,
 /// receive the fd). The broker half of the single-front-door data path.
@@ -215,6 +226,22 @@ fn close_stream(state: &std::sync::Mutex<DState>, stream: u32) {
     let _ = st.conn.send(Ctl::CloseStream { stream });
     let changes = diff(&before, &after);
     let _ = st.conn.apply(&changes);
+    st.stream_owner.remove(&stream);
+}
+
+/// Re-apply seat gating after the active session may have changed: each stream
+/// owned by the active session plays (0 dB); every other session's stream is
+/// muted. This is what makes a seat switch *follow* — the previous session's
+/// audio detaches and the new session's attaches. Called by the seat poll loop.
+fn apply_seat(state: &std::sync::Mutex<DState>) {
+    use choragus::control::Ctl;
+    let mut st = state.lock().unwrap();
+    let owners: Vec<(u32, String)> =
+        st.stream_owner.iter().map(|(s, u)| (*s, u.clone())).collect();
+    for (stream, owner) in owners {
+        let db = if portcullis_peer::seat::is_active(&owner) { 0.0 } else { SEAT_MUTE_DB };
+        let _ = st.conn.send(Ctl::SetGainDb { stream, db });
+    }
 }
 
 /// Handle one app connection: register/close streams; on disconnect, close any
@@ -312,6 +339,14 @@ fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std
                     let changes = diff(&before, &after);
                     nchanges = changes.len();
                     let _ = st.conn.apply(&changes);
+                    // Seat gating: remember which human session owns this stream,
+                    // and if that session isn't the active one, mute it — its audio
+                    // does not reach the engine until its session is bound.
+                    st.stream_owner.insert(id, user.clone());
+                    if st.seat_aware && !portcullis_peer::seat::is_active(&user) {
+                        let _ = st.conn.send(Ctl::SetGainDb { stream: id, db: SEAT_MUTE_DB });
+                        eprintln!("choragusd: stream {id} (session '{user}') not active — muted");
+                    }
                 }
                 opened.push(id);
                 let _ = app.write_all(&id.to_le_bytes());
@@ -340,7 +375,7 @@ fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std
     }
 }
 
-fn daemon(app_sock: &str, lyrad_sock: &str, grants_path: Option<&str>, portcullis_base: Option<&str>, app_registry: Option<&str>) {
+fn daemon(app_sock: &str, lyrad_sock: &str, grants_path: Option<&str>, portcullis_base: Option<&str>, app_registry: Option<&str>, seat_aware: bool) {
     use choragus::control::Conn;
     use choragus::grant::GrantStore;
     use std::os::unix::net::UnixListener;
@@ -376,13 +411,45 @@ fn daemon(app_sock: &str, lyrad_sock: &str, grants_path: Option<&str>, portculli
         portcullis_base: portcullis_base.map(String::from),
         app_registry: app_registry.map(String::from),
         lyrad_data_sock: format!("{lyrad_sock}.data"),
+        seat_aware,
+        stream_owner: std::collections::HashMap::new(),
     }));
+
+    // Seat awareness: watch the active session and, on a switch, re-gate streams
+    // so only the bound session's audio reaches the engine (a switch follows).
+    if seat_aware {
+        match portcullis_peer::seat::active() {
+            Some(s) => eprintln!("choragusd: seat-aware — active session is '{s}'"),
+            None => eprintln!("choragusd: seat-aware — no active session yet ({})",
+                portcullis_peer::seat::ACTIVE_SESSION),
+        }
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || {
+            let mut last = portcullis_peer::seat::active();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let now = portcullis_peer::seat::active();
+                if now != last {
+                    eprintln!("choragusd: active session {:?} -> {:?} — re-gating audio", last, now);
+                    apply_seat(&state);
+                    last = now;
+                }
+            }
+        });
+    }
 
     let _ = std::fs::remove_file(app_sock);
     let listener = match UnixListener::bind(app_sock) {
         Ok(l) => l,
         Err(e) => { eprintln!("choragusd: bind {app_sock}: {e}"); std::process::exit(1); }
     };
+    // The front door must be reachable by every app's dedicated uid (each app
+    // runs as its own 50000+ uid). Connecting is not what authorizes — the peer's
+    // getpeereid identity + its grant are — so the socket itself is open to all.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(app_sock, std::fs::Permissions::from_mode(0o666));
+    }
     eprintln!("choragusd: session daemon up — apps at {app_sock}, driving lyrad at {lyrad_sock}");
     for app in listener.incoming() {
         let app = match app { Ok(a) => a, Err(_) => continue };

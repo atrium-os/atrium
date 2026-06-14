@@ -135,6 +135,49 @@ pub fn resolve(fd: RawFd, registry: &AppRegistry) -> io::Result<Peer> {
     Ok(Peer { uid, user, app_id })
 }
 
+// ── Seat: which human session owns the shared engines RIGHT NOW ───────────────
+//
+// The desktop is per-session (each human's WM, Choragus, shell, data), but the
+// engines (lyrad/DAC, Fresco/scanout, input) are shared — one device. The seat
+// says which session is bound to them now. COMMON case: the boot-time login
+// (vestibulum) sets the active session; it owns the hardware until logout — one
+// active session, so this is just set-at-login / clear-at-logout. Fast-user-
+// switching (uncommon) flips it. A service asks `is_active(owner)` to decide
+// whether to drive the engine for that session's apps.
+pub mod seat {
+    use std::io;
+
+    /// The active session = the human user currently bound to the shared engines.
+    pub const ACTIVE_SESSION: &str = "/var/run/atrium/active-session";
+
+    /// Bind a session to the engines (login calls this; FUS re-calls it).
+    pub fn set_active(user: &str) -> io::Result<()> {
+        set_active_at(ACTIVE_SESSION, user)
+    }
+
+    /// The currently-active human session, if any.
+    pub fn active() -> Option<String> {
+        active_at(ACTIVE_SESSION)
+    }
+
+    /// Is `user`'s session the one bound to the engines now?
+    pub fn is_active(user: &str) -> bool {
+        active().as_deref() == Some(user)
+    }
+
+    // path-parameterized cores (the fixed-path API above delegates here; tests
+    // drive these against a temp file).
+    pub fn set_active_at(path: &str, user: &str) -> io::Result<()> {
+        std::fs::write(path, format!("{user}\n"))
+    }
+    pub fn active_at(path: &str) -> Option<String> {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +199,18 @@ mod tests {
     fn unregistered_uid_is_unknown() {
         let r = AppRegistry::parse(REG);
         assert_eq!(r.resolve(0), None, "a non-Portcullis-launched uid is unknown");
+    }
+
+    #[test]
+    fn seat_binds_and_reads_back_the_active_session() {
+        let p = format!("/tmp/atrium-seat-test-{}", std::process::id());
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(seat::active_at(&p), None, "no file → no active session");
+        seat::set_active_at(&p, "alice").unwrap();
+        assert_eq!(seat::active_at(&p).as_deref(), Some("alice"));
+        seat::set_active_at(&p, "bob").unwrap(); // a switch (FUS)
+        assert_eq!(seat::active_at(&p).as_deref(), Some("bob"));
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

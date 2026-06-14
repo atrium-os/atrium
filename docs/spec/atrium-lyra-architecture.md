@@ -533,6 +533,47 @@ lyrad vs the sibling `choragusd` daemon — remains open, §11; the pure separat
 modeled here permits either, though the "audio window manager" framing favours a
 first-class component over a lyrad subthread.)
 
+### 7.1 The seat — which session owns the engine (settled 2026-06-14)
+
+A desktop is **multi-human**: each person has their own apps, grants, and policy
+layer (their Choragus, their WM). The engine underneath — lyrad and the DAC — is
+**one device, seat-shared**. The *seat* binds exactly one session's policy layer
+to that engine at a time. This is the audio face of one platform concept that
+also governs the display compositor (Fresco) and input: the active session's
+policy layer drives the shared engines; everyone else's is live but **detached**.
+
+The mechanism is small and reuses the identity chain. Each stream already carries
+its **owning human** — the Portcullis launch registry binds `uid → (owner,
+app-id)` and Choragus resolves a connecting peer's `getpeereid` uid through it
+(§9, `portcullis-peer`). The active session is one piece of state — the human
+bound to the engines now — published at `/var/run/atrium/active-session` and
+read/written through `portcullis_peer::seat` (CLI: `atrium-seat`). **Login binds
+it; logout unbinds.** Fast-user-switching is the same `set_active` applied again
+and is the *uncommon* case — it does not shape the core. A **session-aware
+Choragus** (`choragusd --daemon … --seat`) forwards only the active session's
+streams to lyrad: a non-active session's stream is held at `−∞` gain (a
+zipper-free ramp), so a seat switch is a pair of ramps — out on the old session,
+in on the new — and **the audio follows**. A non-active stream is not *filtered
+out at the mix*; structurally it contributes nothing to the bus.
+
+**Proven in-VM (2026-06-14, `lyra/scripts/seat-demo.sh`).** Two apps run as their
+own dedicated uids (50000/50001), owned by two sessions (alice/bob), each feeding
+a distinct tone (500 Hz / 700 Hz) through the one front door into the one engine.
+With `active=alice`, a spectral split of lyrad's mix shows **500 Hz at full scale
+and 700 Hz at zero** (250000×); `atrium-seat set bob` and the next window inverts
+exactly — 700 Hz full, 500 Hz zero — while both apps fed continuously throughout.
+Only the bound session's audio ever reached the DAC.
+
+**Modeled** (gpusim `engine/src/seat.rs`, 5 tests): a seat-shared `SeatMixer`
+where only the active session's streams are audible, a switch reports which
+streams detached/attached and moves the bus, logout silences the engine, and a
+non-active session's eight loud streams add *exactly nothing* to the bus
+(structural isolation). The scope deliberately stops at the engine seat + audio:
+the per-session *instance* model (one Choragus, one WM per session) and the
+multi-human WM/display/input are a later desktop-environment arc — the trust,
+identity, grant, and data layers are **already** multi-human (per-user policy,
+per-user jails, dedicated per-app uids, `/var/lib/atrium/<user>`).
+
 ## 8. Energy — the (floor, elastic) federation member
 
 Audio joins the P6 energy federation (`atrium-scheduler-federation.md` §4) as a

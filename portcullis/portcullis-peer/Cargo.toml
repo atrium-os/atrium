@@ -10,5 +10,10 @@ description = "Platform peer identity — how ANY Atrium service resolves which 
 name = "portcullis_peer"
 path = "src/lib.rs"
 
+# The seat CLI: login binds the active session; services/tools query it.
+[[bin]]
+name = "atrium-seat"
+path = "src/bin/seat.rs"
+
 [dependencies]
 libc = "0.2"
