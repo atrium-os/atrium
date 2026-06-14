@@ -432,8 +432,11 @@ fn control_mode(args: &[String]) {
         Err(e) => { eprintln!("lyrad: no OSS sink ({e})"); let _ = std::fs::remove_file(&socket); std::process::exit(1); }
     };
 
-    // the runtime stream table — created/destroyed by control commands.
-    struct St { id: u32, step: f32, phase: f32, gain: Gain }
+    // the runtime stream table — created/destroyed by control commands. Each
+    // stream's audio comes from its data-plane ring `/lyra_pcm_<id>` when a
+    // source is feeding it; until then (or after it stops) the engine synthesises
+    // a demo tone keyed by id, so the mix is always audible/measurable.
+    struct St { id: u32, step: f32, phase: f32, gain: Gain, ring: Option<lyra::ring::Ring> }
     let mut streams: Vec<St> = Vec::new();
 
     use std::io::Write;
@@ -455,8 +458,9 @@ fn control_mode(args: &[String]) {
                             step: 2.0 * std::f32::consts::PI * demo_freq(stream) / RATE as f32,
                             phase: 0.0,
                             gain: Gain::new(1.0, RATE as f32, 20.0),
+                            ring: None,
                         });
-                        eprintln!("lyrad: ctl OpenStream stream={stream} ({:.0} Hz); {} active", demo_freq(stream), streams.len());
+                        eprintln!("lyrad: ctl OpenStream stream={stream}; {} active", streams.len());
                     }
                 }
                 Ctl::CloseStream { stream } => {
@@ -477,12 +481,23 @@ fn control_mode(args: &[String]) {
 
         for v in mix.iter_mut() { *v = 0.0; }
         for st in streams.iter_mut() {
-            for f in 0..FRAMES_PER_PERIOD as usize {
-                let s = st.phase.sin() * 0.25;
-                tmp[f * 2] = s;
-                tmp[f * 2 + 1] = s;
-                st.phase += st.step;
-                if st.phase > 2.0 * std::f32::consts::PI { st.phase -= 2.0 * std::f32::consts::PI; }
+            // attach to the data-plane ring lazily (the source may start late).
+            if st.ring.is_none() {
+                st.ring = lyra::ring::Ring::open(&format!("/lyra_pcm_{}", st.id), false).ok();
+            }
+            if let Some(ring) = st.ring.as_ref() {
+                // real audio from the source; zero-fill any underrun tail.
+                let got = ring.read(&mut tmp) as usize;
+                for v in tmp[got * 2..].iter_mut() { *v = 0.0; }
+            } else {
+                // no source yet: synthesise the demo tone keyed by id.
+                for f in 0..FRAMES_PER_PERIOD as usize {
+                    let s = st.phase.sin() * 0.25;
+                    tmp[f * 2] = s;
+                    tmp[f * 2 + 1] = s;
+                    st.phase += st.step;
+                    if st.phase > 2.0 * std::f32::consts::PI { st.phase -= 2.0 * std::f32::consts::PI; }
+                }
             }
             st.gain.process(&mut tmp);
             for (m, t) in mix.iter_mut().zip(&tmp) { *m += *t; }

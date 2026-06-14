@@ -18,6 +18,10 @@ path = "src/main.rs"
 name = "lyra-effect"
 path = "src/bin/lyra_effect.rs"
 
+[[bin]]
+name = "lyra-feed"
+path = "src/bin/lyra_feed.rs"
+
 [dependencies]
 libc = "0.2"
 lyra-protocol = { path = "../lyra-protocol" }
