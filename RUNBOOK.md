@@ -1877,12 +1877,25 @@ vssh "/root/atrium-jaild serve --policy /etc/atrium/jaild.policy.toml \
 
 Drive it with the test client `atrium-portcullisd-jclient <socket> <cmd>` —
 `ping` / `create <name> <path>` / `exec <name> <path> <bin> [args]` / `remove
-<jid>`. **jaild enforces the policy strictly**: a `create` is refused unless the
-jail *name* matches an allowed prefix (`atrium-`/`app-`/`system-`/`user-`) AND
-the *path* is in the policy's `mount_sources` allow-list — so a compliant jail
-needs a real app exec_root under `allowed_exec_root`
-(`/usr/local/share/atrium/apps`), not an arbitrary path. The rc.d service is
-`atrium_jaild_enable=YES` (`portcullis/jaild/etc/atrium-jaild`).
+<jid>`. **jaild enforces the policy strictly** — every layer of the allow-list:
+
+- *name* must match an allowed prefix (`atrium-`/`app-`/`system-`/`user-`);
+- *jail path* must be in `mount_sources` (or `/`, special-cased for smoke tests);
+- *exec binary* must be under `exec_paths.allowed_prefixes`
+  (`/usr/local/bin/atrium-`, `/usr/local/share/atrium/apps/`, …).
+
+A full **jailed exec** (the `pdfork`+`jail_set`+`execve` path) — proven in-VM:
+
+```sh
+# put a binary under the allowed exec prefix
+vssh "mkdir -p /usr/local/share/atrium/apps/app-hello && cp /rescue/sh /usr/local/share/atrium/apps/app-hello/sh"
+# launch it confined; jaild forks, jails, execs, and returns a procdesc fd
+vssh "/root/atrium-portcullisd-jclient /var/run/atrium/jaild.sock \
+        exec app-hello / /usr/local/share/atrium/apps/app-hello/sh -c 'echo JAILED_OK > /tmp/jp.txt'"
+# -> {kind: jail_created, pid: N, procdesc_attached: true}; the process runs (marker written).
+```
+
+The rc.d service is `atrium_jaild_enable=YES` (`portcullis/jaild/etc/atrium-jaild`).
 
 > **Lyra/Choragus integration (the remaining chain):** the audio capability
 > grants (`audio` / `microphone` / `audio_monitor`, all now in the Portcullis
