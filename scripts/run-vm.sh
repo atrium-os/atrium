@@ -81,6 +81,7 @@ truncate -s 67108864 "$EFI_VARS"
 GPU_ARGS=""
 VIRTIO_GPU_ARGS=""
 GPUSIM_ARGS=""
+AUDIO_ARGS=""   # set by --audio; default empty so `set -u` is happy without it
 DISPLAY_FRONTEND=""
 WANT_DISPLAY=0
 WANT_TABLET=0
