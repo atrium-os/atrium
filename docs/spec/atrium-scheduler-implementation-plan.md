@@ -153,12 +153,13 @@ LAMINAR-vs-ULE-2026-06-12-waketails.md`.
 | P6-M | ✅ | `8160db8d`. Energy-optimal DVFS floor `f*` = argmin (P−idle)/f over the cpufreq table (no model constants); powersave settles AT the floor. |
 | P6-N | ✅ | `a9848ab0` (kernel + `sys/sys/energy_budget.h`) + bsd `c9e7e2b` (GPU member). In-kernel `water_fill` splits `kern.sched.energy_cap_mw` by weight across the CPU member (DVFS ceiling) and the GPU member (gpusim power regs). Two fixes: the budget ceiling must **hard-override** the load-driven controller (a cap beats what load wants); the release path must push budget=0 when the cap clears (else a member stays throttled). cap 1500 → cpu 224 + gpu 1276, work-conserving; cap beats perf-policy+load. |
 | P5 | ⏸ deferred | The lane already meets deadlines via immediate band preemption; the CPU value of slack-aware deferral is the marginal CSW-rate cut the plan itself hedges ("if the gate shows nothing on CPU, say so"). The gpusim `rlc.rs` math stands and is load-bearing on the GPU. Revisit when a clean rig can measure involuntary-CSW deltas. |
-| P7 | ⏸ blocked | Frame-variance + audio-underrun headline metrics need (a) a **clean timing window** — both VM profiles hit the episodic host/HVF stall class (gapdet sentinel: 7–280 ms gaps) that confounds any in-VM timing A/B, and (b) **lyrad** for the audio half. Re-run when a clean window holds; gate both kernels *inside* the window (the ULE A/B was time-confounded once already). |
+| P7 | ✅ both headlines landed | **Audio underrun / min reliable buffer** (`lyra/scripts/L6-RESULTS.md`, 2026-06-14): lane holds 0 underruns at the 5.3 ms hardware-min buffer where timeshare needs 128 ms = 24×. **Frame-pacing / dropped frames** (`tools/test/sched-laminar/bench/PACE-RESULTS.md`, 2026-06-14, `metronome` + `pace-sweep.sh`): under 16 spinners the lane drops 0% of frames at every depth while timeshare drops 42–88% once a frame costs ≳ 4 ms — the lane refuses past the 75% admission duty (won't promise what it can't keep). The host/HVF stall blocker (a) is **sidestepped by methodology**: both metrics are **kernel/device-counted** (OSS `play_underruns`, `LAMIOC_STATS` misses), which the episodic stalls can only *inflate*, so min/median over reps recovers the true floor — the L6 honesty trick. Blocker (b) cleared: lyrad shipped. Remaining: cross-OS reference + pro-path end-to-end latency. |
 
 The within-member arc (declared lane → brokered → inversion-proof →
-capability-gated → lending) and the across-member arc (watt federation)
-are both complete and in-VM-verified. What remains (P5, P7) is either
-low-ROI-on-CPU or blocked on VM timing fidelity + lyrad.
+capability-gated → lending), the across-member arc (watt federation), and
+**both P7 headline measurements** (audio underrun + frame pacing, lane vs
+timeshare) are complete and in-VM-verified. What remains is P5 (low-ROI on CPU)
+and the cross-OS reference comparison + pro-path latency tails.
 
 ## 3. Dependency graph & sizing
 
