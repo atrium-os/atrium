@@ -706,9 +706,19 @@ baseline as its first slice.
 - **L5 — assets + capture + monitor.** CAS asset players (zero-copy); the
   `microphone` / `audio_monitor` capability split; per-app privacy. *Gate:*
   privacy enforced; asset dedup/zero-copy demonstrated.
-- **L6 — the measurement story.** The second headline metric the scheduler doc
-  promised: **underrun count / minimum reliable buffer under load**, Lyra vs a
-  reference, plus pro-path latency. Ties back to P7.
+- **L6 — the measurement story. FIRST RESULT LANDED (2026-06-14,
+  `lyra/scripts/l6-sweep.sh` + `L6-RESULTS.md`).** The headline metric the
+  scheduler doc promised: **minimum reliable buffer / underrun count under load**,
+  measured in-VM on real `intel-hda` → OSS, apples-to-apples — the *same* engine
+  with the deadline lane on vs off (the honest BSD-native "reference"; the lane is
+  the variable). Under 8 spinners on a 4-vCPU guest, the **lane holds 0 underruns
+  at the 5.3 ms hardware-minimum buffer at every depth; plain timeshare needs a
+  128 ms buffer to reach glitch-free — 24× the buffer/latency.** This makes the L0
+  formula (min reliable buffer = jitter × rate) empirical: the CBS reservation
+  bounds the feed thread's scheduling jitter to ~one period, so a 2-fragment
+  buffer suffices; timeshare's jitter under contention is unbounded. The latency
+  `PREEMPT_RT` claws back on Linux is **structural** here. Remaining: pro-path
+  end-to-end latency + a cross-OS reference. Ties back to P7.
 
 The within-substrate ambition (pro-native, multi-domain, jailed nodes) is present
 from L0 in the *model* and lands incrementally L2→L4 in the daemon, so the pro
