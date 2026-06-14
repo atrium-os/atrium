@@ -578,8 +578,22 @@ mix or the mic (the anti-PulseAudio-leak property — the global mix is never
 implied by `audio`); `microphone` and `audio_monitor` are distinct each way (a
 conferencing app with the mic cannot record the system output); `audio_monitor`
 is the *only* path to the mix or another stream, structurally; the empty grant
-denies everything. The wire format (the capability token Portcullis hands Choragus
-over Aqueduct) is the L4/L5 implementation follow-up.
+denies everything.
+
+**Wired to real Portcullis (2026-06-14, `choragus` f392768).** The grant is no
+longer a Choragus file: `choragusd` reads the **actual Portcullis per-user policy**
+(`/var/db/atrium/<user>/policy.toml` — what `portcullisd` writes after the user
+approves a manifest), mapping each app's approved `audio` / `microphone` /
+`audio_monitor` capabilities to the bits above. (`audio_monitor` was added to the
+Portcullis capability schema for exactly this.) Identity is the kernel's
+**`getpeereid(2)`**, not the app's word — the same pattern jaild/portcullisd use —
+so the grant is scoped to the verified user. *Proven in-VM:* a Portcullis policy
+granting one app `audio-monitor` and another only `audio` → the first's tap
+request is allowed, the second's denied, the connecting user verified by uid. The
+last remaining nuance — distinct per-*app* uids so `getpeereid` distinguishes apps
+within a user — comes from Portcullis launching each app in its own jail (that
+jail/exec mechanism is itself proven in-VM); per-app-uid assignment is deployment
+wiring, not a design gap.
 
 ## 10. The deterministic model (audio.rs lineage)
 
