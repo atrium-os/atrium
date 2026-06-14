@@ -62,6 +62,13 @@ pub struct Capabilities {
     /// the PulseAudio monitor-source leak (Lyra §9, enforced by Choragus).
     #[serde(rename = "audio-monitor")]
     pub audio_monitor: Option<bool>,
+    /// Manage other apps' windows + route input across the whole session (the
+    /// display analog of `audio-monitor`): cross-app window enumeration/control +
+    /// input routing. Restricted — held only by the trusted session shell (Forum);
+    /// normal apps get `graphics` (their own windows only). Enforced by the WM the
+    /// way Choragus enforces the audio caps (display §12.5).
+    #[serde(rename = "window-management")]
+    pub window_management: Option<bool>,
     /// Unknown / future keys. Validator warns; doesn't reject.
     #[serde(flatten)]
     pub extra:      BTreeMap<String, toml::Value>,
@@ -151,6 +158,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         camera:           ovr.camera.or(base.camera),
         microphone:       ovr.microphone.or(base.microphone),
         audio_monitor:    ovr.audio_monitor.or(base.audio_monitor),
+        window_management: ovr.window_management.or(base.window_management),
         extra:            {
             let mut e = base.extra.clone();
             for (k, v) in &ovr.extra { e.insert(k.clone(), v.clone()); }
