@@ -17,6 +17,9 @@ libc = "0.2"
 # writes after user approval) — the capability authority for the platform.
 portcullis-policy = { path = "../portcullis/portcullis-policy" }
 portcullis-toml = { path = "../portcullis/portcullis-toml" }
+# Platform peer identity (getpeereid + the Portcullis launch registry). Shared by
+# every capability-enforcing service; Choragus is one consumer, not the owner.
+portcullis-peer = { path = "../portcullis/portcullis-peer" }
 
 [[bin]]
 name = "choragusd"

@@ -15,6 +15,4 @@ pub mod app;
 pub mod capability;
 pub mod control;
 pub mod grant;
-pub mod identity;
-pub mod peer;
 pub mod policy;

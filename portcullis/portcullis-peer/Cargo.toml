@@ -1,0 +1,14 @@
+[package]
+name = "portcullis-peer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Platform peer identity — how ANY Atrium service resolves which app a connecting peer is: getpeereid + the Portcullis launch registry (uid -> app). Portcullis (the launcher) WRITES the binding at a dedicated uid; every capability-enforcing service (Choragus audio, Fresco graphics, Tabula clipboard, ...) READS it the same way. Not service-specific."
+
+[lib]
+name = "portcullis_peer"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"

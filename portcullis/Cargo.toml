@@ -12,6 +12,7 @@ members = [
     "jaild-policy",
     "jaild",
     "portcullis-sig",
+    "portcullis-peer",
     "atrium-volumes",
 ]
 

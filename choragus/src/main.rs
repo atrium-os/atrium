@@ -226,11 +226,11 @@ fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std
     use std::io::{Read, Write};
 
     use choragus::grant::GrantStore;
-    use choragus::identity::AppRegistry;
+    use portcullis_peer::AppRegistry;
     use std::os::fd::AsRawFd;
 
-    // the unforgeable handle: the kernel's getpeereid uid.
-    let (uid, _gid) = choragus::peer::uid_gid(app.as_raw_fd()).unwrap_or((u32::MAX, u32::MAX));
+    // the unforgeable handle: the kernel's getpeereid uid (platform primitive).
+    let (uid, _gid) = portcullis_peer::uid_gid(app.as_raw_fd()).unwrap_or((u32::MAX, u32::MAX));
     // the app's CLAIM (advisory once a registry is in play).
     let claimed = match choragus::app::read_hello(&mut app) {
         Ok(id) => id,
@@ -270,7 +270,7 @@ fn handle_app(mut app: std::os::unix::net::UnixStream, state: std::sync::Arc<std
         None => {
             // legacy: no registry, trust the hello; grant scoped to the
             // getpeereid'd user.
-            let user = choragus::peer::username(uid).unwrap_or_else(|| format!("uid{uid}"));
+            let user = portcullis_peer::username(uid).unwrap_or_else(|| format!("uid{uid}"));
             let g = match &pcull_base {
                 Some(base) => GrantStore::load_portcullis(base, &user).granted(&claimed),
                 None => state.lock().unwrap().grants.granted(&claimed),
