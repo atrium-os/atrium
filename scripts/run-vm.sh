@@ -141,6 +141,13 @@ for arg in "$@"; do
             GPUSIM_ARGS="-device gpusim,socket=$GPUSIM_SOCK"
             ;;
         --venus)
+            # ⚠ SUPERSEDED — venus (guest Vulkan proxied to host MoltenVK over the
+            # virtio-gpu venus capset) was the original GPU-VM transport. It is
+            # replaced by --carillon (the ivshmem-doorbell paravirt path to
+            # aqueduct-gpu-host → MoltenVK → Metal). Kept only for historical
+            # comparison; new work uses --carillon for the host GPU, or the Tier-2
+            # software Vulkan ICD (atrium-vk-icd) for pure in-VM CPU rendering.
+            #
             # virgl_render_server (spawned by virglrenderer when venus is
             # active) needs to find MoltenVK on macOS. brew installs the
             # ICD JSON at $(brew --prefix)/etc/vulkan/icd.d/, outside the
@@ -176,9 +183,9 @@ for arg in "$@"; do
             #    atrium-bootfb pick up an early-boot framebuffer for
             #    splash screen. Boots without it but loses splash.
             #
-            #  virtio-gpu-gl-pci,venus=on: the production GPU, driven
-            #    by frescod via the venus capset after kernel handoff.
-            #    blob+hostmem are required by venus.
+            #  virtio-gpu-gl-pci,venus=on: the (superseded) venus GPU —
+            #    guest Vulkan proxied to host MoltenVK via the venus capset.
+            #    blob+hostmem are required by venus. Carillon replaced this.
             #
             # Requires the Atrium-patched QEMU + virglrenderer (-Dvenus=true)
             # plus the Atrium-patched EDK2 that drops VirtioGpuDxe (so the

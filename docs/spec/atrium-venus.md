@@ -8,7 +8,10 @@
 > format and host endpoint, dropping venus, virglrenderer, and the
 > virtio-gpu protocol from the stack entirely.
 >
-> **The forward-looking design is `docs/spec/aqueduct-gpu.md`.**
+> **The forward-looking design is `docs/spec/aqueduct-gpu.md`, implemented as
+> Carillon (`docs/spec/carillon.md`) — the ivshmem-doorbell paravirt transport that
+> replaced venus. For pure in-VM CPU rendering there is also the Tier-2 software
+> Vulkan ICD (`atrium-vk-icd`).**
 >
 > This document is preserved for historical context — the chassis
 > work it tracked (atrium-mesa fork mechanics, the libdrm-removal

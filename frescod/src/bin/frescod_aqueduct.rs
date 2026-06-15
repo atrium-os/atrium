@@ -14,11 +14,16 @@
 //!   └─────────────────────────────────────────────────────────┘
 //!
 //!   ┌─ different ─────────────────────────────────────────────┐
-//!   │  HeadlessRenderer (venus / fresco-vulkan)              │
+//!   │  HeadlessRenderer (fresco-vulkan; the server-side       │
+//!   │  retained-scenegraph renderer)                          │
 //!   │     becomes                                             │
 //!   │  in-process aqueduct-gpu-host SoftwareBackend +        │
 //!   │  GpuClient + fresco-aqueduct-bridge                    │
 //!   └─────────────────────────────────────────────────────────┘
+//!
+//! (Under QEMU the server-side renderer's Vulkan is backed by the Tier-2 software
+//! ICD or, for the real Mac GPU, Carillon paravirt — NOT venus, which Carillon
+//! superseded.)
 //! ```
 //!
 //! Run inside the FreeBSD VM:
@@ -131,7 +136,7 @@ const VRR_KEEPALIVE_INTERVALS: u32 = 60;
 fn main() -> std::io::Result<()> {
     let _ = env_logger::try_init();
 
-    // ── Display + scanout BO (same as venus path) ────────────────
+    // ── Display + scanout BO (same as the standalone frescod) ────────────────
     let gpu = Gpu::open()?;
     let dpy = Display::open()?;
     dpy.bind(&gpu)?;
@@ -276,7 +281,7 @@ fn main() -> std::io::Result<()> {
     // Populated lazily on the first UploadRequest::Texture for a slot.
     let mut slot_images: HashMap<u32, SlotImage> = HashMap::new();
 
-    // ── Shared scene-server state (same as venus path) ───────────
+    // ── Shared scene-server state (same as the standalone frescod) ───────────
     let cas   = Arc::new(Mutex::new(CasStore::new()));
     let scene = Arc::new(Mutex::new(SceneGraph::new()));
     let slots = Arc::new(Mutex::new(SlotTable::new()));
@@ -287,7 +292,7 @@ fn main() -> std::io::Result<()> {
 
     let frontend = Arc::new(Mutex::new(EnvelopeFrontend::new(cas, comp.clone())));
 
-    // ── Fresco-protocol socket server (same as venus path) ───────
+    // ── Fresco-protocol socket server (same as the standalone frescod) ───────
     let sock_path = std::env::var("FRESCOD_SOCK")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp/frescod.sock"));
@@ -316,7 +321,7 @@ fn main() -> std::io::Result<()> {
     )?;
     socket_server::spawn_event_fanout(ev_rx, event_subs);
 
-    // Input readers (same as venus path).
+    // Input readers (same as the standalone frescod).
     input_reader::spawn(ev_tx.clone(), comp.clone());
     pointer_reader::spawn(ev_tx, comp.clone(), mode.width, mode.height);
 

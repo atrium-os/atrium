@@ -448,7 +448,15 @@ To see scanout output: boot with `--virtio-gpu --display` (Cocoa window appears 
 
 D0 step 2d (async fence retirement) and step 3.5 (vblank events, hardware cursor) remain — neither blocks D1.
 
-#### Booting with the venus paravirt Vulkan stack (D1.x V5+)
+#### Booting with the venus paravirt Vulkan stack (D1.x V5+) — ⚠ SUPERSEDED
+
+> **venus is no longer the GPU path.** It was the early paravirt Vulkan transport
+> (guest Vulkan → virtio-gpu venus capset → host MoltenVK). It is replaced by
+> **Carillon** (`run-vm.sh --carillon`, `docs/spec/carillon.md`): the ivshmem-doorbell
+> paravirt path to `aqueduct-gpu-host` → MoltenVK → Metal. For pure in-VM CPU
+> rendering use the **Tier-2 software Vulkan ICD** (`atrium-vk-icd`). The section
+> below is kept for historical context (the V5/V6/V7 milestones, the MoltenVK fix,
+> the perf characterization) — not as current operating instructions.
 
 ```sh
 ~/src/bsd/scripts/run-vm.sh --venus       # headless, serial on TCP:4444, monitor on /tmp/qmp.sock
