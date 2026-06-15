@@ -34,6 +34,12 @@ path = "src/bin/frescod_aqueduct.rs"
 name = "lane-client"
 path = "src/bin/lane_client.rs"
 
+# Headless WM harness — the socket server + EnvelopeFrontend without the GPU,
+# for exercising the F0 window-management path over a real socket in-VM.
+[[bin]]
+name = "frescod-wm-harness"
+path = "src/bin/frescod_wm_harness.rs"
+
 [dependencies]
 atrium-gpu-rs       = { path = "../atrium-gpu-rs" }
 atrium-devevents    = { path = "../atrium-devevents" }
