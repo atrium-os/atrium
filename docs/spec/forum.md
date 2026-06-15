@@ -254,7 +254,11 @@ layer, the display sibling of seat-aware Choragus.
 - **F2 — roles + intent.** Role-based default placement; group/split/zoom/snap/
   stash intents; the `hud`/`dialog` reserved layers (overlay-attack-proof).
 - **F3 — the chrome apps.** forum-dock (launch via Portcullis) + forum-bar +
-  forum-shelf + forum-overview over `forum-ctl`, least-privilege.
+  forum-shelf + forum-overview over `forum-ctl`, least-privilege. *(Started: the
+  `forum-ctl` wire (`Intent`/`Reply`, postcard, length-framed) + the core's
+  `handle_intent` + `forum-overview` (list/focus) land and are proven in-VM —
+  chrome → forum-ctl → core → Fresco. Remaining: forum-dock/bar/shelf; the
+  `forum-control` capability gate; drawn chrome surfaces in the reserved layers.)*
 - **F4 — layouts as objects.** Tessera-backed save/restore; Stoa-roamed layouts.
 
 ## 9. Out of scope (whose job it is)
@@ -272,6 +276,10 @@ layer, the display sibling of seat-aware Choragus.
   group/zoom/snap/stash) — UX work, F2.
 - Whether `dialog` focus-grab is policy-fixed or app-requestable-within-its-own-
   surface-tree (overlay-safety must hold either way).
-- `forum-ctl` wire shape (likely Aqueduct class, capability-gated) — F3.
+- ~~`forum-ctl` wire shape (likely Aqueduct class, capability-gated) — F3.~~
+  **Decided (F3):** a small UDS, postcard `Intent`/`Reply` with u32 length-framing,
+  one intent per connection. Gated today by same-session peer-uid; the principled
+  gate is a `forum-control` capability via `portcullis-peer` (the
+  `window-management` pattern), still TODO.
 - Multi-monitor: each output a placement region forum-wm declares into; the §8
   output-topology crossbar is Fresco's, the region policy is Forum's. Deferred.
