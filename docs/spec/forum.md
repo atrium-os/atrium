@@ -28,10 +28,12 @@ That one inversion is the whole design. It buys three things no ambient WM can:
    routing, a surface that is not the focused/visible one simply does not receive
    input or screen capture — occlusion is a capability gate, not a z-order hint.
    The display sibling of the §9 audio-monitor property.
-3. **Focus is a policy signal, not a pixel state.** Forum knows which surface the
-   human is using. It feeds that to the engine: the focused surface's render gets
-   the **deadline lane** (frame-pacing priority, `atrium-scheduler-results.md`);
-   occluded surfaces are render-gated, so the **GPU power-gates** their idle work
+3. **Focus + visibility are policy signals, not pixel state.** Forum knows which
+   surface the human uses and each surface's occlusion. It feeds that to the engine
+   along a *gradient* (§2.5): the focused surface's render gets the **deadline lane**
+   (frame-pacing, `atrium-scheduler-results.md`); partially-occluded/unfocused
+   surfaces render best-effort and are composited clipped; only *fully* occluded
+   ones are render-gated, so the **GPU power-gates** their idle work
    (`project_gpu_powergate`). The WM is the thing that connects *user intent* to
    *scheduling + energy*.
 
@@ -116,25 +118,46 @@ layout can follow you to another machine. Reconnecting a roamed session
 re-materializes the surfaces (re-requesting launches via Portcullis as needed) into
 the saved layout. "Your desktop" becomes a portable artifact, not host state.
 
-### 2.5 Focus → deadline lane + power gating (the engine tie)
+### 2.5 Visibility → scheduling + power (the engine tie)
 
-This is the load-bearing distinctive piece. Forum is the *only* component that
-knows the focused surface, so it is the natural policy input to the engine:
+This is the load-bearing distinctive piece. Forum is the only component that knows
+each surface's **focus** and **visibility** (it declared the layout, so it knows
+every surface's occlusion), so it is the natural policy input to the engine.
+Visibility is a **gradient, not a binary**, and it drives the engine two separate
+ways:
 
-- **Focused surface → the deadline lane.** Forum tells the scheduler (via the
-  frescod broker path, `atrium-scheduler-results.md`) that the focused surface's
-  render thread is the one that must hit vblank — frame-pacing priority where the
-  human is looking.
-- **Occluded surfaces → render-gated → GPU power-gates.** A fully-occluded or
-  stashed surface is not composited; Forum marks it non-rendering, so its GPU work
-  stops and the idle blocks power-gate (`powergate.rs`). Focus and occlusion are
-  the *signal*; the deadline lane and power gating are the *mechanism*. "Coordinated
-  not coupled": Forum publishes focus/occlusion intent (read-only); the scheduler
-  and the GPU driver act within their own budgets.
+**(a) The compositor always clips to the visible region.** Fresco composites only
+the unoccluded part of each surface — a 40%-covered surface costs ~60% of the
+blend/sample/bandwidth. This is automatic from `WM_DECLARE_LAYOUT` (Fresco knows
+each surface's visible rect); no app cooperation, and it handles *any* partial
+occlusion. The compositor always saves proportional to coverage.
 
-No mainstream WM drives the CPU deadline scheduler *and* GPU power gating directly
-from focus; this is the synthesis of the whole stack — and it's only possible
-because Atrium owns the WM, the scheduler, and the GPU power policy.
+**(b) Render rate + scheduling priority scale with focus and visibility:**
+
+| State | Render | Scheduling |
+|---|---|---|
+| focused, visible | full | **deadline lane** — vblank-perfect pacing |
+| visible, unfocused (incl. *partially* occluded) | full, compositor-clipped | best-effort / content-rate, **not** the lane — may drop frames under load (you're not looking) |
+| fully occluded / stashed | **render-gated** — not composited, last frame retained | the only hard gate → GPU idle blocks power-gate (`powergate.rs`) |
+
+So **focus drives the *lane* (the pacing guarantee), visibility drives *whether/how
+much* to render, and only *full* occlusion is a hard gate.** A partially-occluded
+surface still renders (its visible part is visible) but loses the lane guarantee and
+is composited clipped — graceful degradation, not gating. Power is saved *across*
+the gradient: less compositing (clip), lower priority/rate (best-effort), and the
+GPU power-gate reserved for the full-occlusion extreme.
+
+Two honesties: (i) render-gating a fully-occluded surface gates only its *visual*
+render — the app's non-visual CPU/audio work continues; it's a window-render
+decision, not an app suspend, and the last frame is retained so un-occluding is
+instant. (ii) An app that supports visible-region damage (occlusion-aware partial
+render) can *additionally* skip the covered region — an opt-in win, never required.
+
+"Coordinated not coupled": Forum publishes focus + per-surface visibility
+(read-only); Fresco clips, the scheduler lanes, and the GPU driver gates, each
+within its own budget. No mainstream WM drives the CPU deadline scheduler *and* GPU
+power gating from visibility like this — only possible because Atrium owns the WM,
+the scheduler, and the GPU power policy.
 
 ## 3. Decomposed, least-privilege structure
 
