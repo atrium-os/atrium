@@ -109,11 +109,21 @@ Key: `~/.ssh/fresco_bsd_ed25519`. Root password (for serial console fallback): `
 
 ### Copy files to/from VM
 Two channels:
-- **9p share** — host's `~/src/bsd/` is the guest's `/mnt/host/`. Easiest: cross-compile binaries into `~/src/bsd/<crate>/target/...` on host, run them in the VM at `/mnt/host/<crate>/target/...`.
+- **9p share** — host's `~/src/bsd/` is the guest's `/mnt/host/`. Cross-compile binaries into `~/src/bsd/<crate>/target/...` on host; they appear in the VM at `/mnt/host/<crate>/target/...`.
 - **scp over the SSH forward** —
   ```sh
   scp -i ~/.ssh/fresco_bsd_ed25519 -P 2222 some-file root@localhost:/root/
   ```
+
+> ⚠️ **Do NOT `execve` a binary directly off the 9p mount — it panics p9fs.**
+> Running (especially several concurrent) binaries from `/mnt/host/.../target/...`
+> demand-pages them over 9p; `kern_execve → namei → p9fs_lookup → p9fs_vget_common
+> → vfs_hash_insert → vput_final → freevnode` hits a vnode double-free and the
+> kernel panics into ddb (`freevnode: ...`). Recovery: `python3 scripts/ddb_session.py
+> "reset"` (ZFS root reboots clean). **Copy binaries to local ZFS first, then run
+> them there:** `cp /mnt/host/<crate>/target/.../<bin> /root/wmtest/ && /root/wmtest/<bin>`.
+> Prefer `--release` cross-builds (≈5 MB vs ≈100 MB debug) — a single sequential
+> `cp` is far gentler on p9fs than concurrent execve mmap faults.
 
 ### Shutdown
 **Always use `~/src/bsd/scripts/vshutdown`.** It issues `shutdown -p now`, waits for QEMU to exit on its own (up to 60 s), and only escalates to SIGKILL if genuinely stuck.
@@ -517,6 +527,34 @@ vssh "/mnt/host/atrium-test-client/target/aarch64-unknown-freebsd/release/atrium
 # host: pull the PNG back
 vssh "cp /tmp/frescod-smoke-frame-0000.png /mnt/host/vm/frescod-smoke-frame-0000.png"
 open ~/src/bsd/vm/frescod-smoke-frame-0000.png
+```
+
+#### Forum WM F0 in-VM (cross-app window management over a real socket)
+
+Proves the F0 window-management loop end-to-end: the headless `frescod-wm-harness`
+(real socket_server + EnvelopeFrontend, no GPU — runs in a gpusim-only VM) + the
+`forum-wm` shell client + `wm-app-stub` app stand-ins. The harness grants the
+`window-management` cap iff the connecting peer's `LOCAL_PEERCRED` uid == `FORUM_WM_UID`.
+
+```sh
+# host: release cross-builds (small → safe to cp over 9p)
+( cd ~/src/bsd/frescod  && cargo build --release --target aarch64-unknown-freebsd --bin frescod-wm-harness )
+( cd ~/src/bsd/forum-wm && cargo build --release --target aarch64-unknown-freebsd --bins )
+
+# VM: copy to local ZFS (NEVER execve off 9p — panics p9fs, see §2)
+vssh 'R=/root/wmtest; mkdir -p $R
+  cp /mnt/host/frescod/target/aarch64-unknown-freebsd/release/frescod-wm-harness $R/
+  cp /mnt/host/forum-wm/target/aarch64-unknown-freebsd/release/{forum-wm,wm-app-stub} $R/'
+
+# VM: harness (FORUM_WM_UID=0 grants root) + two apps + the shell
+vssh 'R=/root/wmtest; rm -f /tmp/frescod.sock
+  FRESCOD_SOCK=/tmp/frescod.sock FORUM_WM_UID=0 RUST_LOG=info nohup $R/frescod-wm-harness >/tmp/h.log 2>&1 & sleep 2
+  FRESCO_SOCKET=/tmp/frescod.sock APP_TITLE=editor   nohup $R/wm-app-stub >/dev/null 2>&1 &
+  FRESCO_SOCKET=/tmp/frescod.sock APP_TITLE=terminal nohup $R/wm-app-stub >/dev/null 2>&1 & sleep 2
+  FRESCO_SOCKET=/tmp/frescod.sock $R/forum-wm; cat /tmp/h.log'
+# → "forum-wm: declared layout — 2 surface(s), focus=1"; harness logs "granted window-management ... (uid 0)"
+# Negative (deny): restart harness with FORUM_WM_UID=9999 → forum-wm fails fast in 5s
+#   (harness logs "client N op=0x520: Forbidden"; op 0x520 = OP_WM_ENUMERATE).
 ```
 
 Other test clients exercise the bundle's other ops through the same smoke harness:
