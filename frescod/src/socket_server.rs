@@ -172,6 +172,23 @@ fn reader_loop(
     lane: Option<Arc<LaneBroker>>,
 ) -> io::Result<()> {
     let peer_pid = peer_cred_pid(&stream);
+
+    /* Capability admission: the cross-app window-management ops are
+     * default-deny. Grant the cap iff the kernel-attested peer uid is the
+     * configured shell identity (FORUM_WM_UID). This is the seam where the
+     * full check lands — getpeereid → portcullis registry → the app's
+     * manifest `window-management` flag (the audio_monitor pattern). Until
+     * the registry dependency is wired in, the shell's dedicated uid is the
+     * verified signal. No env set → no client is granted (closed by default). */
+    if let (Some(uid), Ok(want)) =
+        (peer_cred_uid(&stream), std::env::var("FORUM_WM_UID"))
+    {
+        if want.trim().parse::<u32>().ok() == Some(uid) {
+            frontend.lock().unwrap().grant_window_management(client_id);
+            log::info!("frescod: granted window-management to client {client_id} (uid {uid})");
+        }
+    }
+
     let mut conn = AqConn::wrap(stream)?;
     loop {
         let msg = match conn.recv_message() {
@@ -297,6 +314,7 @@ fn writer_loop(
 /// pointing at the dead client's last frame indefinitely.
 fn cleanup_client(frontend: &Arc<Mutex<EnvelopeFrontend>>, client_id: u8) {
     let mut fe = frontend.lock().unwrap();
+    fe.revoke_client_caps(client_id);
     let comp_arc = fe.compositor_arc().clone();
     let owned: Vec<u32> = {
         let comp = comp_arc.lock().unwrap();
@@ -321,6 +339,17 @@ fn cleanup_client(frontend: &Arc<Mutex<EnvelopeFrontend>>, client_id: u8) {
 /// Peer pid of a UDS connection via LOCAL_PEERCRED (struct xucred).
 /// Defined by hand: libc's xucred lags the cr_pid union member.
 fn peer_cred_pid(stream: &UnixStream) -> Option<i32> {
+    peer_xucred(stream).map(|(pid, _uid)| pid)
+}
+
+/// The peer's verified uid over the UDS — the kernel-attested identity
+/// (`LOCAL_PEERCRED`). Used to decide whether the connecting client is the
+/// privileged shell that may hold `window-management`.
+fn peer_cred_uid(stream: &UnixStream) -> Option<u32> {
+    peer_xucred(stream).map(|(_pid, uid)| uid)
+}
+
+fn peer_xucred(stream: &UnixStream) -> Option<(i32, u32)> {
     use std::os::fd::AsRawFd;
 
     const XU_NGROUPS: usize = 16;
@@ -348,10 +377,8 @@ fn peer_cred_pid(stream: &UnixStream) -> Option<i32> {
             &mut len,
         )
     };
-    if r == 0 && xu.cr_version == 0 /* XUCRED_VERSION */ {
-        Some(xu.cr_pid)
-    } else if r == 0 {
-        Some(xu.cr_pid)
+    if r == 0 {
+        Some((xu.cr_pid, xu.cr_uid))
     } else {
         None
     }
