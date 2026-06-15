@@ -1,0 +1,14 @@
+[package]
+name = "forum-wm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Forum's WM core — the privileged window-management component (the only holder of the window-management capability). Given the session's surfaces (OP_WM_ENUMERATE), it places them by role and produces the atomic layout (OP_WM_DECLARE_LAYOUT) + occlusion-driven rendering decisions (OP_WM_SET_RENDERING). The production impl of the policy modeled in gpusim forum_layout.rs + forum_engine.rs. See docs/spec/forum.md."
+
+[lib]
+name = "forum_wm"
+path = "src/lib.rs"
+
+[dependencies]
+fresco-protocol = { path = "../fresco-protocol" }
