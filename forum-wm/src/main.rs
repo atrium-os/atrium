@@ -88,19 +88,23 @@ fn main() -> io::Result<()> {
 }
 
 /// Serve forum-ctl: accept chrome connections, carry out one intent each against
-/// Fresco. Same-session gate — only peers with our own uid are accepted (the
-/// chrome runs as the same human); the principled gate is a `forum-control`
-/// capability checked via portcullis-peer, like window-management. TODO(forum-control).
+/// Fresco. Admission (default-deny) mirrors frescod's window-management gate:
+///   1. production — getpeereid → app-registry → the owning user's `forum-control`
+///      grant (the chrome apps hold it; ordinary apps don't).
+///   2. dev override — FORUM_CTL_DEV set → accept a same-session peer (own uid),
+///      for in-VM runs before a populated registry/policy.
 fn serve_forum_ctl(path: &str, wm: &mut Wm, conn: &mut ClientConn) -> io::Result<()> {
     use std::os::unix::net::UnixListener;
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
     let me = unsafe { libc::geteuid() };
+    let dev = std::env::var("FORUM_CTL_DEV").is_ok();
     eprintln!("forum-wm: serving forum-ctl on {path}");
     for stream in listener.incoming() {
         let mut s = match stream { Ok(s) => s, Err(_) => continue };
-        if peer_uid(&s) != Some(me) {
-            eprintln!("forum-wm: forum-ctl: rejecting peer (not same session)");
+        let admitted = peer_has_forum_control(&s) || (dev && peer_uid(&s) == Some(me));
+        if !admitted {
+            eprintln!("forum-wm: forum-ctl: rejecting peer (no forum-control grant)");
             continue;
         }
         let intent = match forum_ctl::read_frame(&mut s)
@@ -124,4 +128,20 @@ fn peer_uid(s: &std::os::unix::net::UnixStream) -> Option<u32> {
     let (mut uid, mut gid) = (0u32, 0u32);
     let rc = unsafe { libc::getpeereid(s.as_raw_fd(), &mut uid, &mut gid) };
     (rc == 0).then_some(uid)
+}
+
+/// Whether the connecting chrome peer holds the `forum-control` capability:
+/// getpeereid → app-registry (the app id the TCB registered for this uid) → the
+/// owning user's policy grant. Fails closed (missing registry/policy → false).
+fn peer_has_forum_control(s: &std::os::unix::net::UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(registry) = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+    else { return false };
+    let Ok(peer) = portcullis_peer::resolve(s.as_raw_fd(), &registry) else { return false };
+    let Some(app_id) = peer.app_id else { return false };
+    let Ok(policy) = portcullis_policy::Policy::load(
+        &portcullis_policy::Policy::user_path(&peer.user)) else { return false };
+    policy.grants.get(&app_id)
+        .and_then(|g| g.capabilities.forum_control)
+        .unwrap_or(false)
 }

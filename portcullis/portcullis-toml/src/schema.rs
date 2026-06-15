@@ -69,6 +69,13 @@ pub struct Capabilities {
     /// way Choragus enforces the audio caps (display §12.5).
     #[serde(rename = "window-management")]
     pub window_management: Option<bool>,
+    /// Drive the session's window manager over `forum-ctl` — the chrome apps
+    /// (dock/bar/shelf/overview) that ask the WM core to list/focus surfaces. Held
+    /// only by Forum's own chrome; ordinary apps get `graphics` (their own windows).
+    /// Strictly weaker than `window-management` (the core mediates every intent),
+    /// but still restricted so a random app can't drive the shell.
+    #[serde(rename = "forum-control")]
+    pub forum_control: Option<bool>,
     /// Unknown / future keys. Validator warns; doesn't reject.
     #[serde(flatten)]
     pub extra:      BTreeMap<String, toml::Value>,
@@ -159,6 +166,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         microphone:       ovr.microphone.or(base.microphone),
         audio_monitor:    ovr.audio_monitor.or(base.audio_monitor),
         window_management: ovr.window_management.or(base.window_management),
+        forum_control:    ovr.forum_control.or(base.forum_control),
         extra:            {
             let mut e = base.extra.clone();
             for (k, v) in &ovr.extra { e.insert(k.clone(), v.clone()); }
