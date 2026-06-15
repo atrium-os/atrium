@@ -115,8 +115,22 @@ impl<L: Launcher> Ostiarius<L> {
 
     /// Authenticate a credential → the human user. STUBBED (the pam FFI seam):
     /// today any non-empty user+password succeeds, matching vestibulum's D2 stub.
-    /// Production: `pam_authenticate` via libpam (a C-ABI lib) in the privileged
-    /// backend — the one place that reads shadow, privsep'd from the UI.
+    /// Production: `pam_authenticate` via libpam (a C-ABI lib) in this privileged
+    /// backend — the one place that reads `master.passwd`, privsep'd from the UI.
+    ///
+    /// SETTLED — we use **only PAM's `auth` + `account` facilities** (verify *who*
+    /// the human is and *whether* they may log in — both model-agnostic). We do
+    /// **not** use the PAM `session` facility: it is built for the traditional
+    /// "one login = one process tree running as the human's uid" model and
+    /// decorates *that* process (env, limits, home, lastlog, the seat). Atrium has
+    /// no such process — a session is the seat-bound set of the human's apps, each
+    /// launched by jaild in its own jail under a *dedicated* uid (the human is the
+    /// owner, not the uid; authorization is by capability). So session
+    /// establishment is Atrium's own: the **seat** primitive + the **jaild**-
+    /// launched, capability-gated components; per-component env/limits/jail/uid come
+    /// from the **manifest + Portcullis**, not `pam_open_session`; login audit is
+    /// native (insula-logd / Tessera). PAM says *who walked in*; jaild + the seat +
+    /// capabilities decide what running as them means.
     pub fn authenticate(&self, user: &str, password: &str) -> Result<String, String> {
         if user.is_empty() || password.is_empty() {
             return Err("authentication failed".into());
