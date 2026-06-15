@@ -19,6 +19,7 @@
 //! `window-management`; every session app runs as the human; ostiarius only ever
 //! *requests* (no exec path here).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 pub use portcullis_peer::seat;
@@ -99,7 +100,11 @@ pub struct Ostiarius<L: Launcher> {
     /// PAM service to authenticate against (`/etc/pam.d/<service>`). `None` → the
     /// dev/test stub (any non-empty credential).
     pam_service: Option<String>,
-    running: Vec<String>,
+    /// All live sessions: human → the app-ids launched for them. Fast-user-
+    /// switching keeps every session here ALIVE; the seat selects which one is
+    /// active (only the active session's audio/windows are live — the seat-aware
+    /// Choragus/Forum gate on it).
+    sessions: HashMap<String, Vec<String>>,
 }
 
 impl<L: Launcher> Ostiarius<L> {
@@ -108,7 +113,7 @@ impl<L: Launcher> Ostiarius<L> {
             launcher,
             seat_path: seat::ACTIVE_SESSION.to_string(),
             pam_service: None,
-            running: Vec::new(),
+            sessions: HashMap::new(),
         }
     }
 
@@ -168,25 +173,42 @@ impl<L: Launcher> Ostiarius<L> {
         Ok(user.to_string())
     }
 
-    /// Post-auth: bind the seat to the human and launch the session layer. Every
-    /// component is launched via the TCB as the human; only Forum gets
-    /// `window-management`.
+    /// Post-auth: make `human` the active session. Binds the seat to them; if they
+    /// have no live session yet, launch their layer (via the TCB, as the human;
+    /// only Forum gets `window-management`). If they already have one — a
+    /// fast-user-switch — just rebind: their session is reactivated, and whoever was
+    /// active stays ALIVE but detached (the seat now points elsewhere). So a second
+    /// `login` does not tear the first session down — that is FUS.
     pub fn login(&mut self, human: &str, frontend: Frontend) -> Result<(), String> {
         seat::set_active_at(&self.seat_path, human).map_err(|e| format!("bind seat: {e}"))?;
-        for s in session_layer(human, frontend) {
-            self.launcher.launch(&s)?;
-            self.running.push(s.app_id);
+        if !self.sessions.contains_key(human) {
+            let mut ids = Vec::new();
+            for s in session_layer(human, frontend) {
+                self.launcher.launch(&s)?;
+                ids.push(s.app_id);
+            }
+            self.sessions.insert(human.to_string(), ids);
         }
         Ok(())
     }
 
-    /// Logout: tear down the session and unbind the seat → back to vestibulum.
+    /// Logout the *active* session: tear it down + remove it; the seat unbinds
+    /// (back to the login screen). Other humans' sessions stay alive (detached).
     pub fn logout(&mut self) -> Result<(), String> {
-        for app in std::mem::take(&mut self.running) {
-            let _ = self.launcher.teardown(&app);
+        if let Some(active) = self.active_human() {
+            if let Some(ids) = self.sessions.remove(&active) {
+                for id in ids {
+                    let _ = self.launcher.teardown(&id);
+                }
+            }
         }
         seat::set_active_at(&self.seat_path, "").map_err(|e| format!("unbind seat: {e}"))?;
         Ok(())
+    }
+
+    /// The humans with a live session right now (active + any detached).
+    pub fn live_sessions(&self) -> Vec<&str> {
+        self.sessions.keys().map(|s| s.as_str()).collect()
     }
 
     /// The active human session, if any (the seat's bound user).
@@ -472,6 +494,41 @@ mod tests {
         o.logout().unwrap();
         assert!(o.active_human().is_none(), "seat unbound → back to login");
         assert!(o.launcher.torn_down.contains(&"org.atrium.forum".to_string()), "Forum torn down");
+    }
+
+    #[test]
+    fn fus_keeps_both_sessions_alive_and_the_seat_selects_the_active_one() {
+        let mut o = Ostiarius::new(MockLauncher::default()).with_seat_path(seat_file("fus"));
+        o.login("alice", Frontend::Gui).unwrap();
+        let after_alice = o.launcher.launched.len();
+        o.login("bob", Frontend::Gui).unwrap(); // fast-user-switch to bob
+        assert_eq!(o.active_human().as_deref(), Some("bob"), "seat now points at bob");
+        let mut live = o.live_sessions();
+        live.sort();
+        assert_eq!(live, vec!["alice", "bob"], "BOTH sessions alive — alice not torn down");
+        assert!(o.launcher.torn_down.is_empty(), "FUS tears nothing down");
+        assert!(o.launcher.launched.len() > after_alice, "bob's layer was launched");
+    }
+
+    #[test]
+    fn switching_back_to_a_live_session_relaunches_nothing() {
+        let mut o = Ostiarius::new(MockLauncher::default()).with_seat_path(seat_file("fus2"));
+        o.login("alice", Frontend::Gui).unwrap();
+        o.login("bob", Frontend::Gui).unwrap();
+        let n = o.launcher.launched.len();
+        o.login("alice", Frontend::Gui).unwrap(); // switch back to alice's live session
+        assert_eq!(o.active_human().as_deref(), Some("alice"));
+        assert_eq!(o.launcher.launched.len(), n, "alice's session already live → no relaunch");
+    }
+
+    #[test]
+    fn logout_drops_only_the_active_session() {
+        let mut o = Ostiarius::new(MockLauncher::default()).with_seat_path(seat_file("fus3"));
+        o.login("alice", Frontend::Gui).unwrap();
+        o.login("bob", Frontend::Gui).unwrap(); // bob active
+        o.logout().unwrap(); // logs bob out
+        assert!(o.active_human().is_none(), "seat unbound → login screen");
+        assert_eq!(o.live_sessions(), vec!["alice"], "alice's detached session survives");
     }
 
     #[test]
