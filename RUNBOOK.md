@@ -553,8 +553,21 @@ vssh 'R=/root/wmtest; rm -f /tmp/frescod.sock
   FRESCO_SOCKET=/tmp/frescod.sock APP_TITLE=terminal nohup $R/wm-app-stub >/dev/null 2>&1 & sleep 2
   FRESCO_SOCKET=/tmp/frescod.sock $R/forum-wm; cat /tmp/h.log'
 # → "forum-wm: declared layout — 2 surface(s), focus=1"; harness logs "granted window-management ... (uid 0)"
-# Negative (deny): restart harness with FORUM_WM_UID=9999 → forum-wm fails fast in 5s
-#   (harness logs "client N op=0x520: Forbidden"; op 0x520 = OP_WM_ENUMERATE).
+# Negative (deny): restart harness with FORUM_WM_UID=9999 → forum-wm fails fast (the
+#   server now sends an IS_ERROR reply: "WM_ENUMERATE refused: Forbidden (code 1)";
+#   op 0x520 = OP_WM_ENUMERATE).
+
+# Production admission path (no FORUM_WM_UID) — getpeereid → app-registry → the
+# owning user's policy grant for window-management (Choragus/audio_monitor pattern):
+vssh 'mkdir -p /var/run/atrium /var/db/atrium/root
+  printf "0 root org.atrium.forum\n" > /var/run/atrium/app-registry
+  { printf "[grants.\"org.atrium.forum\"]\n";
+    printf "manifest_hash = \"sha256:dev\"\n"; printf "granted_at = \"2026-06-15T00:00:00Z\"\n";
+    printf "[grants.\"org.atrium.forum\".capabilities]\n"; printf "window-management = true\n";
+  } > /var/db/atrium/root/policy.toml'
+# Then run the harness WITHOUT FORUM_WM_UID → grant log shows
+# "granted ... (app org.atrium.forum (registry+policy))". Flip the policy to
+# window-management = false → denied (proves the grant is consulted, not app-id presence).
 ```
 
 Other test clients exercise the bundle's other ops through the same smoke harness:
