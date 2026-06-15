@@ -48,6 +48,7 @@ use fresco_protocol::{
     WindowPresentDamagePayload, DamageRect,
     FontOpenPayload, FontOpenResponse, FontClosePayload, TextRunInstallPayload,
     TextMeasurePayload, TextMeasureResponse,
+    WmSurfaceInfo, WmEnumerateReply, WmRole, WmRect,
 };
 use aqueduct::envelope::flag;
 use fresco_vulkan::UploadRequest;
@@ -212,6 +213,10 @@ pub enum DispatchError {
     /// Op-id outside the CLASS_DISPLAY dictionary. Caller should
     /// either dispatch to a different class handler or bounce.
     UnknownOp(u16),
+    /// The dispatching client lacks the capability the op requires
+    /// (e.g. a cross-app window-management op from a client that does
+    /// not hold the `window-management` capability). Default-deny.
+    Forbidden,
 }
 
 /// One outbound message produced by dispatch — either a response to a
@@ -264,6 +269,16 @@ pub struct EnvelopeFrontend {
     /// across all clients so DejaVuSansMono-16 atlas is built once and
     /// reused regardless of which client first asked.
     text: SharedTextEngine,
+
+    /// Clients granted the `window-management` capability — the
+    /// privileged shell (Forum), and only it. The connection-accept
+    /// layer verifies the peer's manifest (getpeereid → registry →
+    /// caps, the Choragus/`audio_monitor` pattern) and calls
+    /// `grant_window_management` for a qualifying client. The cross-app
+    /// `OP_WM_*` ops are default-deny: a client not in this set gets
+    /// `Forbidden`, so an ordinary app can never enumerate or place
+    /// another app's surfaces.
+    wm_capable: std::collections::HashSet<u8>,
 }
 
 impl EnvelopeFrontend {
@@ -286,7 +301,22 @@ impl EnvelopeFrontend {
             pending_slot_clears: Vec::new(),
             pending_atlas_uploads: Vec::new(),
             pending_region_uploads: Vec::new(),
+            wm_capable: std::collections::HashSet::new(),
         }
+    }
+
+    /// Grant a client the `window-management` capability. Called by the
+    /// connection-accept layer after it verifies the peer's manifest
+    /// holds `window-management` (getpeereid → registry → caps). Until
+    /// that plumbing lands, frescod's launcher can grant the known
+    /// shell client here. Default state is ungranted (deny).
+    pub fn grant_window_management(&mut self, client_id: u8) {
+        self.wm_capable.insert(client_id);
+    }
+
+    /// Drop a client's grants (on disconnect). Cheap no-op if absent.
+    pub fn revoke_client_caps(&mut self, client_id: u8) {
+        self.wm_capable.remove(&client_id);
     }
 
     /// Stash a blob into the scene-server CasStore. The aqueduct
@@ -408,6 +438,9 @@ impl EnvelopeFrontend {
             control::OP_WINDOW_REQUEST_CLOSE => self.handle_window_request_close(msg),
             control::OP_WINDOW_PRESENT       => self.handle_window_present(msg),
             control::OP_WINDOW_PRESENT_DAMAGE => self.handle_window_present_damage(msg),
+
+            // ── Cross-app window management (gated by window-management) ──
+            control::OP_WM_ENUMERATE         => self.handle_wm_enumerate(msg),
 
             op => Err(DispatchError::UnknownOp(op)),
         }
@@ -774,6 +807,55 @@ impl EnvelopeFrontend {
         }])
     }
 
+    // ── Cross-app window management (the privileged shell side) ──────────
+
+    /// `OP_WM_ENUMERATE` — report every surface in this session to the WM.
+    ///
+    /// Default-deny: only a client holding `window-management` (in
+    /// `wm_capable`) may see across app boundaries; everyone else gets
+    /// `Forbidden`. frescod is per-session, so "every window in the
+    /// compositor" *is* exactly this seat's surfaces — cross-user
+    /// isolation is structural (bob's windows live in bob's frescod).
+    ///
+    /// F0 stubs two fields the server doesn't track yet: `role` defaults
+    /// to `Document` (role declaration is later WM plumbing) and
+    /// `owner_app` is synthesised from the owning client id (the real
+    /// app-id arrives with the peer-cred → registry binding). The shell
+    /// gets the geometry it needs to arrange now; richer classification
+    /// layers in without a wire change.
+    fn handle_wm_enumerate(&mut self, _msg: &Message)
+        -> Result<Vec<Outbound>, DispatchError>
+    {
+        if !self.wm_capable.contains(&self.current_client) {
+            return Err(DispatchError::Forbidden);
+        }
+        let comp = self.compositor.lock().unwrap();
+        let mut surfaces: Vec<WmSurfaceInfo> = comp.windows.values()
+            .filter(|w| w.id != 0) // window 0 is the implicit screen, not an app surface
+            .map(|w| WmSurfaceInfo {
+                surface_id: w.id as u32,
+                owner_app:  format!("client:{}", w.owner),
+                role:       WmRole::Document,
+                rect: WmRect {
+                    x: w.pos.0 as i32,
+                    y: w.pos.1 as i32,
+                    w: w.size.0 as i32,
+                    h: w.size.1 as i32,
+                },
+            })
+            .collect();
+        // Stable order (by surface id) so the WM sees a deterministic set.
+        surfaces.sort_by_key(|s| s.surface_id);
+
+        let reply_payload = encode(&WmEnumerateReply { surfaces })
+            .map_err(|_| DispatchError::BadPayload)?;
+        Ok(vec![Outbound {
+            op:      control::OP_WM_ENUMERATE,
+            flags:   aqueduct::envelope::flag::IS_RESPONSE,
+            payload: reply_payload,
+        }])
+    }
+
     fn handle_window_destroy(&mut self, msg: &Message)
         -> Result<Vec<Outbound>, DispatchError>
     {
@@ -1102,6 +1184,44 @@ mod tests {
          * is the screen). */
         let new_id: u32 = decode(&out[0].payload).expect("decode reply");
         assert!(new_id > 0);
+    }
+
+    #[test]
+    fn wm_enumerate_is_default_deny() {
+        let mut f = fixture();
+        // An ordinary app (client 1) creates a surface...
+        let p = WindowCreatePayload {
+            width: 800, height: 600, title: "app".into(),
+            hints: WindowHints::default(), parent_window_id: 0,
+        };
+        f.dispatch(&msg(control::OP_WINDOW_CREATE, 0, encode(&p).unwrap()), 1)
+            .expect("create");
+        // ...and is refused the cross-app enumerate (no window-management cap).
+        let r = f.dispatch(&msg(control::OP_WM_ENUMERATE, 0, Vec::new()), 1);
+        assert!(matches!(r, Err(DispatchError::Forbidden)),
+            "an app without the cap cannot see across app boundaries");
+    }
+
+    #[test]
+    fn wm_enumerate_reports_session_surfaces_for_the_shell() {
+        let mut f = fixture();
+        let p = WindowCreatePayload {
+            width: 800, height: 600, title: "app".into(),
+            hints: WindowHints::default(), parent_window_id: 0,
+        };
+        let out = f.dispatch(&msg(control::OP_WINDOW_CREATE, 0, encode(&p).unwrap()), 1)
+            .expect("create");
+        let app_win: u32 = decode(&out[0].payload).unwrap();
+
+        // The shell (client 9) holds window-management → it enumerates.
+        f.grant_window_management(9);
+        let out = f.dispatch(&msg(control::OP_WM_ENUMERATE, 0, Vec::new()), 9)
+            .expect("enumerate");
+        let reply: WmEnumerateReply = decode(&out[0].payload).unwrap();
+        assert!(reply.surfaces.iter().any(|s| s.surface_id == app_win),
+            "the shell sees the app's surface");
+        assert!(!reply.surfaces.iter().any(|s| s.surface_id == 0),
+            "window 0 (the screen) is not an app surface");
     }
 
     #[test]
