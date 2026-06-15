@@ -254,11 +254,13 @@ layer, the display sibling of seat-aware Choragus.
 - **F2 — roles + intent.** Role-based default placement; group/split/zoom/snap/
   stash intents; the `hud`/`dialog` reserved layers (overlay-attack-proof).
 - **F3 — the chrome apps.** forum-dock (launch via Portcullis) + forum-bar +
-  forum-shelf + forum-overview over `forum-ctl`, least-privilege. *(Started: the
-  `forum-ctl` wire (`Intent`/`Reply`, postcard, length-framed) + the core's
-  `handle_intent` + `forum-overview` (list/focus) land and are proven in-VM —
-  chrome → forum-ctl → core → Fresco. Remaining: forum-dock/bar/shelf; the
-  `forum-control` capability gate; drawn chrome surfaces in the reserved layers.)*
+  forum-shelf + forum-overview over `forum-ctl`, least-privilege. *(Landed &
+  proven in-VM: the `forum-ctl` wire (`Intent`/`Reply`, postcard, length-framed) +
+  the core's `handle_intent`; `forum-overview` (list/focus surfaces); the
+  `forum-control` capability gating forum-ctl (grant/deny verified); `forum-dock`
+  (app catalog + unprivileged launch request to portcullisd). Remaining: forum-bar/
+  forum-shelf; the chrome apps DRAWING into their reserved-layer surfaces via
+  Pergola, vs only driving intents today.)*
 - **F4 — layouts as objects.** Tessera-backed save/restore; Stoa-roamed layouts.
 
 ## 9. Out of scope (whose job it is)
