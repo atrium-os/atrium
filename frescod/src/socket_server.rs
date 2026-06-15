@@ -190,19 +190,24 @@ fn reader_loop(
     let peer_pid = peer_cred_pid(&stream);
 
     /* Capability admission: the cross-app window-management ops are
-     * default-deny. Grant the cap iff the kernel-attested peer uid is the
-     * configured shell identity (FORUM_WM_UID). This is the seam where the
-     * full check lands — getpeereid → portcullis registry → the app's
-     * manifest `window-management` flag (the audio_monitor pattern). Until
-     * the registry dependency is wired in, the shell's dedicated uid is the
-     * verified signal. No env set → no client is granted (closed by default). */
-    if let (Some(uid), Ok(want)) =
-        (peer_cred_uid(&stream), std::env::var("FORUM_WM_UID"))
-    {
-        if want.trim().parse::<u32>().ok() == Some(uid) {
-            frontend.lock().unwrap().grant_window_management(client_id);
-            log::info!("frescod: granted window-management to client {client_id} (uid {uid})");
-        }
+     * default-deny. Two verified signals can grant the cap:
+     *   1. Production — getpeereid → app-registry → the app id the TCB
+     *      registered for this uid → the owning user's policy grant for
+     *      `window-management` (the Choragus/audio_monitor pattern).
+     *   2. Dev/test override — FORUM_WM_UID matches the peer uid (used by
+     *      the in-VM harness before a populated registry/policy exists).
+     * Either way the uid is kernel-attested; the registry + policy are
+     * TCB-written. No match → not granted (closed by default). */
+    let grant_reason = registry_grants_window_management(&stream)
+        .map(|app| format!("app {app} (registry+policy)"))
+        .or_else(|| match (peer_cred_uid(&stream), std::env::var("FORUM_WM_UID")) {
+            (Some(uid), Ok(want)) if want.trim().parse::<u32>().ok() == Some(uid) =>
+                Some(format!("uid {uid} (FORUM_WM_UID override)")),
+            _ => None,
+        });
+    if let Some(reason) = grant_reason {
+        frontend.lock().unwrap().grant_window_management(client_id);
+        log::info!("frescod: granted window-management to client {client_id} ({reason})");
     }
 
     let mut conn = AqConn::wrap(stream)?;
@@ -357,6 +362,24 @@ fn cleanup_client(frontend: &Arc<Mutex<EnvelopeFrontend>>, client_id: u8) {
 
 /// Peer pid of a UDS connection via LOCAL_PEERCRED (struct xucred).
 /// Defined by hand: libc's xucred lags the cr_pid union member.
+/// Production capability admission: resolve the connecting peer to the app id the
+/// TCB registered for its uid (getpeereid → app-registry), then check whether the
+/// owning user granted that app the `window-management` capability. Returns the app
+/// id when granted (for logging), `None` otherwise — including when the registry or
+/// policy files don't exist yet (a fresh system), so it fails closed.
+fn registry_grants_window_management(stream: &UnixStream) -> Option<String> {
+    use std::os::fd::AsRawFd;
+    let registry = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).ok()?;
+    let peer = portcullis_peer::resolve(stream.as_raw_fd(), &registry).ok()?;
+    let app_id = peer.app_id?;
+    let policy = portcullis_policy::Policy::load(
+        &portcullis_policy::Policy::user_path(&peer.user)).ok()?;
+    let granted = policy.grants.get(&app_id)
+        .and_then(|g| g.capabilities.window_management)
+        .unwrap_or(false);
+    granted.then_some(app_id)
+}
+
 fn peer_cred_pid(stream: &UnixStream) -> Option<i32> {
     peer_xucred(stream).map(|(pid, _uid)| pid)
 }
