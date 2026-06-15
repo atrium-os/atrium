@@ -211,7 +211,11 @@ pub fn update_node_field(
 
     let child_list = read_hash(&root_data, 8);
     let camera = read_hash(&root_data, 40);
-    let environment = read_hash(&root_data, 72);
+    // The canonical SceneRoot (0x0001) is 72 bytes: header(8) + child_list(8) +
+    // camera(40). There is no environment field — `serialize_scene_root` takes the
+    // arg but discards it, and `extract_refs` walks only children + camera. Reading
+    // offset 72 here ran off the end of the blob (the bug these tests caught).
+    let environment = NULL_HASH;
 
     let new_child_list = replace_in_tree(cas, &child_list, target_node_hash, new_node_hash)?;
 
@@ -315,7 +319,7 @@ pub fn add_node_to_parent(
             read_u32_le(&root_data, 10),
             &new_child_list,
             &read_hash(&root_data, 40),
-            &read_hash(&root_data, 72),
+            &NULL_HASH, // SceneRoot has no environment field (72-byte blob)
         );
         return Some(cas.store(&new_root));
     }
@@ -370,7 +374,7 @@ pub fn remove_node_from_parent(
             read_u32_le(&root_data, 10),
             &new_child_list,
             &read_hash(&root_data, 40),
-            &read_hash(&root_data, 72),
+            &NULL_HASH, // SceneRoot has no environment field (72-byte blob)
         );
         return Some(cas.store(&new_root));
     }
@@ -617,22 +621,20 @@ mod tests {
         material[2..6].copy_from_slice(&0xFF0000FFu32.to_le_bytes());
         let mat_hash = cas.store(&material);
 
-        // renderable (128 bytes)
-        let mut renderable = vec![0u8; 128];
-        renderable[0] = 0x04;
-        renderable[32..64].copy_from_slice(&mesh_hash);
-        renderable[64..96].copy_from_slice(&mat_hash);
+        // renderable (Renderable 0x0005: header(8) + mesh(8) + material(40))
+        let mut renderable = vec![0u8; 72];
+        renderable[0..2].copy_from_slice(&0x0005u16.to_le_bytes());
+        renderable[2..4].copy_from_slice(&1u16.to_le_bytes());
+        renderable[8..40].copy_from_slice(&mesh_hash);
+        renderable[40..72].copy_from_slice(&mat_hash);
         let rend_hash = cas.store(&renderable);
 
-        // scene node (128 bytes, flags=0x01 VISIBLE)
+        // scene node (flags=0x01 VISIBLE)
         let node = serialize_scene_node(0x01, 0, 1.0, &xform_hash, &rend_hash, &NULL_HASH);
         let node_hash = cas.store(&node);
 
-        // node list (4KB)
-        let mut list = vec![0u8; 4096];
-        list[0] = 0x10;
-        list[1] = 1; // count
-        list[36..68].copy_from_slice(&node_hash);
+        // node list (canonical v1 NodeList 0x0009)
+        let list = serialize_node_list(&[node_hash], &NULL_HASH);
         let list_hash = cas.store(&list);
 
         // camera
@@ -684,7 +686,7 @@ mod tests {
             0.0, 0.0, 1.0, 0.0,
             0.0, 0.0, 0.0, 1.0,
         ]);
-        assert_eq!(xform.len(), 128);
+        assert_eq!(xform.len(), 72); // v1 Transform: 8 header + 64 payload
 
         // client computes hash
         let client_hash = CasStore::hash(&xform);

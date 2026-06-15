@@ -302,36 +302,48 @@ fn read_hash(data: &[u8], offset: usize) -> Hash256 {
 mod tests {
     use super::*;
 
+    // These build blobs in the canonical v1 format that `extract_refs` parses
+    // and `scene::sharing::serialize_*` writes: a u16 type-id at [0..2], a u16
+    // version at [2..4], an 8-byte header, then the payload. (The earlier
+    // fixtures used a stale ad-hoc layout that `extract_refs` never matched, so
+    // the ref-tree walk never reached the children — the bug these tests caught.)
+
     fn make_transform() -> Vec<u8> {
-        let mut b = vec![0u8; 128];
-        b[0] = 0x03;
+        let mut b = vec![0u8; 72]; // 8 header + 64 payload (Transform 0x0004)
+        b[0..2].copy_from_slice(&0x0004u16.to_le_bytes());
+        b[2..4].copy_from_slice(&1u16.to_le_bytes());
         b
     }
 
     fn make_node(xform: &Hash256, rend: &Hash256) -> Vec<u8> {
-        let mut b = vec![0u8; 128];
-        b[0] = 0x02;
-        b[1] = 0x01;
-        b[32..64].copy_from_slice(xform);
-        b[64..96].copy_from_slice(rend);
+        let mut b = vec![0u8; 104]; // 8 header + 96 payload (SceneNode 0x0002)
+        b[0..2].copy_from_slice(&0x0002u16.to_le_bytes());
+        b[2..4].copy_from_slice(&1u16.to_le_bytes());
+        b[8..40].copy_from_slice(xform);   // transform  (payload offset 0)
+        b[40..72].copy_from_slice(rend);   // renderable (payload offset 32)
+        // children (payload offset 64 = byte 72) left NULL
         b
     }
 
     fn make_list(entries: &[Hash256]) -> Vec<u8> {
-        let mut b = vec![0u8; 4096];
-        b[0] = 0x10;
-        b[1] = entries.len() as u8;
+        // NodeList 0x0009: count (u32) at payload offset 0, then N×hash.
+        let mut b = vec![0u8; 8 + 4 + entries.len() * 32];
+        b[0..2].copy_from_slice(&0x0009u16.to_le_bytes());
+        b[2..4].copy_from_slice(&1u16.to_le_bytes());
+        b[8..12].copy_from_slice(&(entries.len() as u32).to_le_bytes());
         for (i, h) in entries.iter().enumerate() {
-            let off = 36 + i * 32;
+            let off = 12 + i * 32;
             b[off..off+32].copy_from_slice(h);
         }
         b
     }
 
     fn make_root(list: &Hash256) -> Vec<u8> {
-        let mut b = vec![0u8; 128];
-        b[0] = 0x01;
-        b[32..64].copy_from_slice(list);
+        let mut b = vec![0u8; 72]; // 8 header + 64 payload (SceneRoot 0x0001)
+        b[0..2].copy_from_slice(&0x0001u16.to_le_bytes());
+        b[2..4].copy_from_slice(&1u16.to_le_bytes());
+        b[8..40].copy_from_slice(list); // child_list (payload offset 0)
+        // camera (payload offset 32 = byte 40) left NULL
         b
     }
 
