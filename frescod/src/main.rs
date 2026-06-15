@@ -164,6 +164,10 @@ fn render_one_frame(
         for &id in &g.z_order {
             if id == 0 { continue; }
             if let Some(w) = g.windows.get(&id) {
+                /* Skip surfaces the WM gated (OP_WM_SET_RENDERING): a
+                 * fully-occluded surface contributes nothing, so don't
+                 * compose it — its GPU work for this frame is elided. */
+                if !w.rendering { continue; }
                 out.push((id as u32, (w.pos.0, w.pos.1)));
             }
         }

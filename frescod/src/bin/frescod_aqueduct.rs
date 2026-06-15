@@ -870,6 +870,8 @@ fn render_one_frame_multipass(
         for &id in &g.z_order {
             if id == 0 { continue; }
             if let Some(w) = g.windows.get(&id) {
+                /* WM-gated (OP_WM_SET_RENDERING) surfaces aren't composed. */
+                if !w.rendering { continue; }
                 let sw = (w.size.0.max(1.0) as u32).min(screen_w);
                 let sh = (w.size.1.max(1.0) as u32).min(screen_h);
                 out.push((id as u32, (w.pos.0, w.pos.1), (sw, sh)));
