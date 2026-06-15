@@ -25,7 +25,8 @@ pub use portcullis_peer::seat;
 
 /// Which vestibulum frontend authenticated — GUI (on Fresco) or CLI (a tty/serial
 /// console, the display-down fallback). Same trusted flow either way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Frontend {
     Gui,
     Cli,
@@ -147,6 +148,106 @@ impl<L: Launcher> Ostiarius<L> {
     /// The active human session, if any (the seat's bound user).
     pub fn active_human(&self) -> Option<String> {
         seat::active_at(&self.seat_path)
+    }
+}
+
+/// The control wire: vestibulum hands an authenticated login to ostiarius, and
+/// asks for logout. Newline-delimited JSON over a Unix socket (the workspace IPC
+/// shape), peer-gated by `getpeereid` — only the trusted login UI may drive it.
+pub mod control {
+    use super::{Frontend, Launcher, Ostiarius};
+    use serde::{Deserialize, Serialize};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(tag = "op", rename_all = "snake_case")]
+    pub enum Request {
+        /// vestibulum forwards a credential + which frontend it is.
+        Login { user: String, password: String, frontend: Frontend },
+        /// End the active session.
+        Logout,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(tag = "status", rename_all = "snake_case")]
+    pub enum Response {
+        Ok { active: Option<String> },
+        Err { message: String },
+    }
+
+    /// Handle one request against the orchestrator. Pure of the socket — the unit
+    /// of behavior the daemon loop wraps. Login authenticates then establishes the
+    /// session; logout tears it down.
+    pub fn handle<L: Launcher>(ost: &mut Ostiarius<L>, req: Request) -> Response {
+        let r = match req {
+            Request::Login { user, password, frontend } => ost
+                .authenticate(&user, &password)
+                .and_then(|human| ost.login(&human, frontend)),
+            Request::Logout => ost.logout(),
+        };
+        match r {
+            Ok(()) => Response::Ok { active: ost.active_human() },
+            Err(message) => Response::Err { message },
+        }
+    }
+
+    /// The connecting peer's app-id, via `getpeereid` → the launch registry. The
+    /// daemon admits only the trusted login UI (`org.atrium.vestibulum`).
+    fn peer_is_vestibulum(stream: &UnixStream) -> bool {
+        use std::os::fd::AsRawFd;
+        let reg = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+            .unwrap_or_default();
+        match portcullis_peer::resolve(stream.as_raw_fd(), &reg) {
+            Ok(p) => p.app_id.as_deref() == Some("org.atrium.vestibulum"),
+            Err(_) => false,
+        }
+    }
+
+    /// The daemon service loop: listen on `sock_path`, and for each connection from
+    /// the trusted login UI, handle newline-delimited JSON requests. `gate` lets a
+    /// test bypass the `getpeereid` peer check; production passes
+    /// `peer_is_vestibulum`.
+    pub fn serve<L: Launcher>(
+        ost: &mut Ostiarius<L>,
+        sock_path: &str,
+        gate: impl Fn(&UnixStream) -> bool,
+    ) -> std::io::Result<()> {
+        let _ = std::fs::remove_file(sock_path);
+        let listener = UnixListener::bind(sock_path)?;
+        for conn in listener.incoming() {
+            let stream = match conn {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if !gate(&stream) {
+                eprintln!("ostiarius: refused a non-vestibulum peer");
+                continue;
+            }
+            let mut writer = stream.try_clone()?;
+            let reader = BufReader::new(stream);
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) if !l.trim().is_empty() => l,
+                    _ => continue,
+                };
+                let resp = match serde_json::from_str::<Request>(&line) {
+                    Ok(req) => handle(ost, req),
+                    Err(e) => Response::Err { message: format!("bad request: {e}") },
+                };
+                let mut body = serde_json::to_vec(&resp).unwrap_or_default();
+                body.push(b'\n');
+                if writer.write_all(&body).is_err() {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The production peer gate (re-exported for the daemon binary).
+    pub fn vestibulum_gate(stream: &UnixStream) -> bool {
+        peer_is_vestibulum(stream)
     }
 }
 
@@ -327,5 +428,34 @@ mod tests {
         o.logout().unwrap();
         assert!(o.active_human().is_none(), "seat unbound → back to login");
         assert!(o.launcher.torn_down.contains(&"org.atrium.forum".to_string()), "Forum torn down");
+    }
+
+    #[test]
+    fn control_handle_login_then_logout() {
+        use crate::control::{handle, Request, Response};
+        let mut o = Ostiarius::new(MockLauncher::default()).with_seat_path(seat_file("ctl"));
+        let login = Request::Login { user: "alice".into(), password: "pw".into(), frontend: Frontend::Gui };
+        assert_eq!(handle(&mut o, login), Response::Ok { active: Some("alice".into()) });
+        assert!(o.launcher.launched.iter().any(|s| s.app_id == "org.atrium.forum"));
+        assert_eq!(handle(&mut o, Request::Logout), Response::Ok { active: None });
+    }
+
+    #[test]
+    fn control_handle_rejects_bad_credentials() {
+        use crate::control::{handle, Request, Response};
+        let mut o = Ostiarius::new(MockLauncher::default()).with_seat_path(seat_file("ctlbad"));
+        let bad = Request::Login { user: "alice".into(), password: "".into(), frontend: Frontend::Gui };
+        assert!(matches!(handle(&mut o, bad), Response::Err { .. }));
+        assert!(o.active_human().is_none(), "no session on failed auth");
+    }
+
+    #[test]
+    fn control_request_round_trips_as_json() {
+        use crate::control::Request;
+        let r = Request::Login { user: "alice".into(), password: "pw".into(), frontend: Frontend::Cli };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("\"op\":\"login\"") && s.contains("\"frontend\":\"cli\""));
+        let back: Request = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, Request::Login { frontend: Frontend::Cli, .. }));
     }
 }

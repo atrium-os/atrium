@@ -19,3 +19,6 @@ portcullis-peer = { path = "../portcullis-peer" }
 portcullis-sig  = { path = "../portcullis-sig" }
 portcullisd     = { path = "../portcullisd" }
 jaild           = { path = "../jaild" }
+serde           = { version = "1", features = ["derive"] }
+serde_json      = "1"
+libc            = "0.2"

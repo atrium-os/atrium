@@ -48,9 +48,16 @@ fn main() {
         return;
     }
 
-    // Daemon mode: the real launcher. The boot→login service loop (listen for the
-    // login backend's authenticated handoff, handle logout/FUS) lands next.
-    let _ = JaildLauncher::default();
-    eprintln!("ostiarius: daemon loop not yet wired — run `ostiarius --demo [gui|cli]`");
-    std::process::exit(2);
+    // Daemon mode: listen on the control socket for vestibulum's authenticated
+    // logins, peer-gated by getpeereid. Boot launches the login UI first.
+    const SOCK: &str = "/var/run/atrium/ostiarius.sock";
+    let mut o = Ostiarius::new(JaildLauncher::default());
+    if let Err(e) = o.boot() {
+        eprintln!("ostiarius: boot (launch vestibulum): {e}");
+    }
+    eprintln!("ostiarius: serving on {SOCK} (vestibulum-only)");
+    if let Err(e) = ostiarius::control::serve(&mut o, SOCK, ostiarius::control::vestibulum_gate) {
+        eprintln!("ostiarius: serve {SOCK}: {e}");
+        std::process::exit(1);
+    }
 }
