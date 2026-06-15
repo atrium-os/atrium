@@ -537,6 +537,33 @@ vssh "cp /tmp/frescod-smoke-frame-0000.png /mnt/host/vm/frescod-smoke-frame-0000
 open ~/src/bsd/vm/frescod-smoke-frame-0000.png
 ```
 
+#### UI render pipe-clean — Pergola app → frescod → PNG (lavapipe SW path)
+
+Proves the full UI render path with real pixels, no GPU/venus: a Pergola app draws
+a scene graph → frescod renders it via the **lavapipe** software Vulkan ICD (already
+installed at `/usr/local/share/vulkan/icd.d/lvp_icd.aarch64.json`) → PNG readback.
+(lavapipe = Mesa reference SW renderer, kept for comparison; the bespoke Tier-2
+`atrium-vk-icd` is the eventual swap-in.)
+
+```sh
+# host: cross-build the readback renderer + a Pergola app
+( cd ~/src/bsd/frescod    && cargo build --release --target aarch64-unknown-freebsd --bin frescod-vulkan-smoke )
+( cd ~/src/bsd/forum-demo && cargo build --release --target aarch64-unknown-freebsd )
+
+# VM: copy to local ZFS (never execve off 9p), start the renderer on lavapipe
+vssh 'R=/root/wmtest; mkdir -p $R
+  cp /mnt/host/frescod/target/aarch64-unknown-freebsd/release/frescod-vulkan-smoke $R/
+  cp /mnt/host/forum-demo/target/aarch64-unknown-freebsd/release/forum-demo $R/
+  LVP=/usr/local/share/vulkan/icd.d/lvp_icd.aarch64.json
+  FRESCOD_SOCK=/tmp/frescod-smoke.sock VK_ICD_FILENAMES=$LVP VK_DRIVER_FILES=$LVP \
+    FRESCOD_BUNDLES_ROOT=/mnt/host/bundles nohup $R/frescod-vulkan-smoke >/tmp/smoke.log 2>&1 & sleep 4
+  FRESCO_SOCKET=/tmp/frescod-smoke.sock nohup $R/forum-demo >/tmp/demo.log 2>&1 & sleep 5
+  cp /tmp/frescod-smoke-frame-0000.png /mnt/host/vm/forum-demo-frame.png'
+open ~/src/bsd/vm/forum-demo-frame.png   # host: view the rendered frame
+# → dark window + teal title strip + 3 colored squares + accent strip.
+# Notes: FrescoSurface drops corner radius; Pergola text/glyph-run wire path is TODO (use rects).
+```
+
 #### Forum WM F0 in-VM (cross-app window management over a real socket)
 
 Proves the F0 window-management loop end-to-end: the headless `frescod-wm-harness`
