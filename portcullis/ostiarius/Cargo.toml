@@ -1,0 +1,21 @@
+[package]
+name = "ostiarius"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ostiarius — the doorkeeper: the privileged session-manager / display-manager. Pairs with vestibulum (the entrance hall / login UI): vestibulum authenticates, ostiarius binds the seat and drives Portcullis -> jaild to launch the session (Forum + Choragus + the human's apps for GUI; a zsh console-shell for the CLI fallback). It never execs itself -- jaild is the sole launcher."
+
+[lib]
+name = "ostiarius"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ostiarius"
+path = "src/main.rs"
+
+[dependencies]
+portcullis-peer = { path = "../portcullis-peer" }
+portcullis-sig  = { path = "../portcullis-sig" }
+portcullisd     = { path = "../portcullisd" }
+jaild           = { path = "../jaild" }
