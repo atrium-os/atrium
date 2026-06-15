@@ -357,7 +357,7 @@ impl Launcher for JaildLauncher {
 
         // 4. ask jaild to jail + drop-to-uid + exec.
         let req = Request::CreateJail(CreateJailRequest {
-            name: format!("app-{}", s.app_id.replace(['.', '/'], "-")),
+            name: jail_name(&s.app_id),
             path: s.jail_path.clone(),
             children_max: 0,
             mounts: vec![],
@@ -379,11 +379,25 @@ impl Launcher for JaildLauncher {
         }
     }
 
-    fn teardown(&mut self, _app_id: &str) -> Result<(), String> {
-        // Real teardown (DestroyJail) lands with the daemon loop; the session jails
-        // also fall when their owning fds close. Best-effort no-op for now.
-        Ok(())
+    fn teardown(&mut self, app_id: &str) -> Result<(), String> {
+        use jaild::protocol::{Request, Response};
+        use portcullisd::jaild_client::Client;
+        // RemoveJail by name (the exec'd-jail case): idempotent — a jail already
+        // gone returns success. The component's session-jail is named on launch.
+        let req = Request::RemoveJail { jid: None, name: Some(jail_name(app_id)) };
+        let mut c = Client::connect(&self.jaild_sock).map_err(|e| format!("connect jaild: {e}"))?;
+        match c.send(&req) {
+            Ok((Response::SyscallFailed { msg, .. }, _)) => Err(format!("jaild teardown: {msg}")),
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("jaild teardown send: {e}")),
+        }
     }
+}
+
+/// The jail name for a component — shared by launch + teardown so RemoveJail
+/// targets exactly what CreateJail made.
+fn jail_name(app_id: &str) -> String {
+    format!("app-{}", app_id.replace(['.', '/'], "-"))
 }
 
 fn read_sig(p: &std::path::Path) -> Vec<u8> {
