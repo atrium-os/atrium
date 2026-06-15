@@ -20,7 +20,8 @@ Canonical vocabulary for the Atrium platform. Every component in this table has 
 |---|---|---|---|
 | **Jail launcher** | **Portcullis** | (medieval English) heavy iron gate | reads `atrium.toml` manifest, builds the jail, enforces capability gating |
 | **System IPC bus** | **Castellum** | aqueduct distribution junction | message bus between system services and apps; capability-gated, per-slot ring shape |
-| **Display manager** | **Vestibulum** | entry hall | login screen + session handoff |
+| **Login screen** | **Vestibulum** | entry hall | the login UI (Insula app): collects credentials. GUI on Fresco + a CLI frontend (tty/serial, the display-down fallback) |
+| **Session manager** | **Ostiarius** | the Roman doorkeeper who guarded the entrance & controlled who came in | the privileged display-manager / orchestrator (a trusted system service, NOT an Insula app): on auth, binds the seat + requests Portcullis→jaild to launch the session (Forum + Choragus + apps for GUI; a zsh console-shell for CLI). Never execs — jaild is the sole launcher. *Vestibulum is the entrance hall; the Ostiarius admits you and sets up your stay.* |
 | **Audio server** | **Lyra** | stringed instrument | per-stream submission, content-addressed sample buffers |
 | **Audio policy / session layer** | **Choragus** | the citizen who organised, arranged & directed the chorus in Greek theatre | the "audio window manager" — routing, ducking, per-app volume, hotplug-follow, exclusive-claim; mechanism/policy split from lyrad (the RT engine). *Lyra plays; the Choragus arranges who plays.* |
 | **Clipboard** | **Tabula** | wax tablet | clipboard service; entries are CAS blobs, multi-format |
