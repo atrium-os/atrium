@@ -122,6 +122,17 @@ pub mod control {
     /// `LaneReplyPayload`.
     pub const OP_LANE_REQUEST:          u16 = 0x0510;
 
+    // ── Cross-app window management (privileged; forum.md) ──
+    // Unlike OP_WINDOW_* (the caller's OWN window), these act on EVERY surface in
+    // the session. They are gated by the `window-management` capability: frescod
+    // resolves the peer (getpeereid → the launch registry) and refuses a peer that
+    // doesn't hold it — the same way Choragus gates audio. Only the session shell
+    // (Forum) holds it. Forum decides POLICY (which surface where, focus,
+    // occlusion); frescod executes the MECHANISM (compositing the declared layout).
+    pub const OP_WM_ENUMERATE:          u16 = 0x0520; // → WmEnumerateReply
+    pub const OP_WM_DECLARE_LAYOUT:     u16 = 0x0521; // atomic placement of all surfaces
+    pub const OP_WM_SET_RENDERING:      u16 = 0x0522; // mark a surface (non-)rendering
+
     // Async events (server → client). Sent with envelope flag
     // ASYNC_EVENT (aqueduct::envelope::flags::ASYNC_EVENT).
     pub const EV_WINDOW_RESIZED:         u16 = 0x0580;
@@ -162,6 +173,72 @@ pub struct LaneReplyPayload {
     pub ok: bool,
     pub err: String,
     pub t_us: u64,
+}
+
+// ── Cross-app window management payloads (privileged; forum.md) ──────
+
+/// A geometry rect, pixels. `x`/`y` top-left, `w`/`h` size.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WmRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+/// A surface's declared role (`forum.md` §2.2). Forum places by role; the reserved
+/// roles (`Hud`/`Chrome`) may only be declared by system/shell surfaces — a normal
+/// app claiming one is refused (overlay-safety).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WmRole {
+    Background,
+    Document,
+    Panel,
+    Dialog,
+    Hud,
+    Chrome,
+}
+
+/// One surface, as reported by `OP_WM_ENUMERATE`. `owner_app` is the verified
+/// launch-registry app-id (getpeereid → registry), never the app's self-claim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WmSurfaceInfo {
+    pub surface_id: u32,
+    pub owner_app: String,
+    pub role: WmRole,
+    pub rect: WmRect,
+}
+
+/// Reply to `OP_WM_ENUMERATE` — every surface in the caller's session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WmEnumerateReply {
+    pub surfaces: Vec<WmSurfaceInfo>,
+}
+
+/// One placement slot in a declared layout. `layer` is front-to-back (lower =
+/// closer to the viewer).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WmSlot {
+    pub surface_id: u32,
+    pub rect: WmRect,
+    pub layer: i32,
+}
+
+/// `OP_WM_DECLARE_LAYOUT` — the atomic, declarative placement of all surfaces plus
+/// which is focused. Forum declares; frescod composites the result (committed at a
+/// frame boundary — glitch-free reconfig). Not a stream of imperative moves.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WmDeclareLayoutPayload {
+    pub slots: Vec<WmSlot>,
+    pub focus: u32,
+}
+
+/// `OP_WM_SET_RENDERING` — mark a fully-occluded surface non-rendering so its GPU
+/// work stops and the idle blocks power-gate; or rendering again on un-occlude.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WmSetRenderingPayload {
+    pub surface_id: u32,
+    pub rendering: bool,
 }
 
 // ── Slot payloads ────────────────────────────────────────────────────
@@ -985,10 +1062,37 @@ mod tests {
             control::EV_WINDOW_FOCUS_CHANGED,
             control::EV_WINDOW_CLOSE_REQUESTED,
             control::EV_WINDOW_DPI_CHANGED,
+            control::OP_LANE_REQUEST,
+            control::OP_WM_ENUMERATE,
+            control::OP_WM_DECLARE_LAYOUT,
+            control::OP_WM_SET_RENDERING,
         ];
         let mut sorted = ops.to_vec();
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), ops.len(), "duplicate op-id detected");
+    }
+
+    #[test]
+    fn wm_payloads_round_trip() {
+        let layout = WmDeclareLayoutPayload {
+            slots: vec![
+                WmSlot { surface_id: 1, rect: WmRect { x: 0, y: 24, w: 1920, h: 1008 }, layer: 4 },
+                WmSlot { surface_id: 2, rect: WmRect { x: 720, y: 380, w: 480, h: 320 }, layer: 0 },
+            ],
+            focus: 2,
+        };
+        let back: WmDeclareLayoutPayload = decode(&encode(&layout).unwrap()).unwrap();
+        assert_eq!(back, layout);
+
+        let en = WmEnumerateReply {
+            surfaces: vec![WmSurfaceInfo {
+                surface_id: 1,
+                owner_app: "org.atrium.editor".into(),
+                role: WmRole::Document,
+                rect: WmRect { x: 0, y: 24, w: 1920, h: 1008 },
+            }],
+        };
+        assert_eq!(decode::<WmEnumerateReply>(&encode(&en).unwrap()).unwrap(), en);
     }
 }
