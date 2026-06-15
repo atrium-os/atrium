@@ -105,6 +105,15 @@ fn serve_forum_ctl(path: &str, wm: &mut Wm, conn: &mut ClientConn) -> io::Result
         let admitted = peer_has_forum_control(&s) || (dev && peer_uid(&s) == Some(me));
         if !admitted {
             eprintln!("forum-wm: forum-ctl: rejecting peer (no forum-control grant)");
+            // Drain the intent and answer with a clean error, so the chrome fails
+            // with a reason instead of an abrupt EOF (symmetric with frescod's
+            // IS_ERROR reply on a refused WM op).
+            let _ = forum_ctl::read_frame(&mut s);
+            if let Ok(bytes) = forum_ctl::encode(&forum_ctl::Reply::Err {
+                message: "forbidden: forum-control capability required".into(),
+            }) {
+                let _ = forum_ctl::write_frame(&mut s, &bytes);
+            }
             continue;
         }
         let intent = match forum_ctl::read_frame(&mut s)

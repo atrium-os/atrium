@@ -217,7 +217,13 @@ pub mod control {
     pub fn handle_intent(wm: &mut Wm, conn: &mut impl FrescoConn, intent: Intent) -> Reply {
         match intent {
             Intent::ListSurfaces => match conn.enumerate() {
-                Ok(surfaces) => Reply::Surfaces { surfaces, focus: wm.focus_intent.unwrap_or(0) },
+                Ok(surfaces) => {
+                    // Report the focus the WM actually resolves for this surface set
+                    // (a dialog grabs it; else the intent; else the topmost
+                    // document) — not the raw intent, which is None until a focus.
+                    let focus = super::arrange(&wm.screen, &surfaces, wm.focus_intent).focus;
+                    Reply::Surfaces { surfaces, focus }
+                }
                 Err(e) => Reply::Err { message: e.to_string() },
             },
             Intent::Focus { surface_id } => {

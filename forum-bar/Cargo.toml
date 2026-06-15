@@ -1,0 +1,21 @@
+[package]
+name = "forum-bar"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "forum-bar — Forum's statusbar / indicators. An ordinary graphics-only Insula app holding no window-management capability: it asks the WM core (forum-wm) over forum-ctl for the session's surfaces and renders a status summary (focused app + window count). See docs/spec/forum.md §3."
+
+[lib]
+name = "forum_bar"
+path = "src/lib.rs"
+
+[[bin]]
+name = "forum-bar"
+path = "src/main.rs"
+
+[dependencies]
+forum-ctl = { path = "../forum-ctl" }
+
+[dev-dependencies]
+fresco-protocol = { path = "../fresco-protocol" }
