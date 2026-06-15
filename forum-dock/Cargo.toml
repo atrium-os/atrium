@@ -1,0 +1,19 @@
+[package]
+name = "forum-dock"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "forum-dock — Forum's app launcher. An ordinary graphics-only Insula app holding no special capability: it lists installed apps (their manifests) and, on the human's activate, REQUESTS a launch from the TCB (portcullisd → jaild, the atrium-launch path). The dock never launches anything itself. See docs/spec/forum.md §6."
+
+[lib]
+name = "forum_dock"
+path = "src/lib.rs"
+
+[[bin]]
+name = "forum-dock"
+path = "src/main.rs"
+
+[dependencies]
+portcullis-toml = { path = "../portcullis/portcullis-toml" }
+portcullis-ipc = { path = "../portcullis/portcullis-ipc" }
