@@ -48,6 +48,38 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, postcard::Er
     postcard::from_bytes(bytes)
 }
 
+// ── framing + the request/serve helpers (the actual socket I/O) ──────────────
+
+use std::io::{self, Read, Write};
+
+/// Write one length-prefixed (u32 LE) frame. postcard isn't self-delimiting over a
+/// stream, so each message carries its length.
+pub fn write_frame<W: Write>(w: &mut W, bytes: &[u8]) -> io::Result<()> {
+    w.write_all(&(bytes.len() as u32).to_le_bytes())?;
+    w.write_all(bytes)?;
+    w.flush()
+}
+
+/// Read one length-prefixed frame.
+pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
+    let mut len = [0u8; 4];
+    r.read_exact(&mut len)?;
+    let n = u32::from_le_bytes(len) as usize;
+    let mut buf = vec![0u8; n];
+    r.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Chrome side: connect to the core's forum-ctl socket, send one `Intent`, read the
+/// `Reply`. One intent per connection keeps the wire trivially framed and stateless.
+pub fn request<P: AsRef<std::path::Path>>(socket: P, intent: &Intent) -> io::Result<Reply> {
+    let mut s = std::os::unix::net::UnixStream::connect(socket)?;
+    let bytes = encode(intent).map_err(io::Error::other)?;
+    write_frame(&mut s, &bytes)?;
+    let reply_bytes = read_frame(&mut s)?;
+    decode(&reply_bytes).map_err(io::Error::other)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

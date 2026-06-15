@@ -1,0 +1,14 @@
+[package]
+name = "forum-overview"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "forum-overview — Forum's window switcher / workspace overview. An ordinary graphics-only Insula app: it holds no window-management capability. It lists the session's surfaces and asks the WM core (forum-wm) to focus one, over the forum-ctl intent wire. See docs/spec/forum.md §3."
+
+[[bin]]
+name = "forum-overview"
+path = "src/main.rs"
+
+[dependencies]
+forum-ctl = { path = "../forum-ctl" }

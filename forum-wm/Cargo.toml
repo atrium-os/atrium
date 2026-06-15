@@ -26,3 +26,4 @@ path = "src/bin/wm_app_stub.rs"
 fresco-protocol = { path = "../fresco-protocol" }
 fresco-client = { path = "../fresco-client" }
 forum-ctl = { path = "../forum-ctl" }
+libc = "0.2"
