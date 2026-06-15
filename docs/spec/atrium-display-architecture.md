@@ -364,7 +364,9 @@ concrete follow-on, mirroring how `audio_monitor` was added). Precedent: Wayland
 keeps the WM as privileged compositor core; Android makes the shell a
 platform-signed privileged *app* — Atrium takes the second and makes the privilege
 one auditable capability rather than "the shell is special". See
-[[project_atrium_multiuser_seats]], `portcullis.md`.
+[[project_atrium_multiuser_seats]], `portcullis.md`, and **`forum.md`** (Forum's
+full design — the Atrium-native, apps-have-no-ambient-screen-authority WM model +
+the decomposed least-privilege structure).
 
 ## 13. Open questions (deferred, not blocking D-display-1)
 
