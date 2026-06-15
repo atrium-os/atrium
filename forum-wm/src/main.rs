@@ -63,11 +63,10 @@ fn main() -> io::Result<()> {
     let path = socket_path();
     eprintln!("forum-wm: connecting to frescod at {path}");
     let conn = Connection::connect(&path)?;
-    // A request-reply op (WM_ENUMERATE) that frescod refuses (no window-management
-    // cap) is dropped server-side with no reply — without a deadline the reconcile
-    // would block forever. Fail fast instead so a mis-granted shell surfaces the
-    // authorization error rather than hanging. (The principled fix is a server-side
-    // error response; this is the client-side safety net.)
+    // frescod now replies to a refused WM op with an IS_ERROR response, so a
+    // denied enumerate surfaces a PermissionDenied immediately. This read timeout
+    // is the secondary safety net for a genuinely unresponsive server (crash /
+    // stall), so the reconcile can't block forever.
     conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     let mut io_conn = ClientConn { conn };
 

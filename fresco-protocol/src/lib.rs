@@ -241,6 +241,30 @@ pub struct WmSetRenderingPayload {
     pub rendering: bool,
 }
 
+// ── Error reply ──────────────────────────────────────────────────────
+
+/// Error codes carried by an `ErrorReply` (envelope flag `IS_ERROR`).
+pub mod error_code {
+    /// Generic / unspecified server-side failure.
+    pub const GENERIC:   u16 = 0;
+    /// The client lacks the capability the op requires (default-deny).
+    pub const FORBIDDEN: u16 = 1;
+    /// The op's payload failed to decode.
+    pub const BAD_PAYLOAD: u16 = 2;
+    /// The op referenced an unknown window / surface.
+    pub const UNKNOWN_WINDOW: u16 = 3;
+}
+
+/// The payload of a response carrying the `IS_ERROR` flag: a request-reply op
+/// the server refused or could not complete. Sent in place of the op's normal
+/// reply so the client fails with a reason instead of blocking on a reply that
+/// never arrives.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ErrorReply {
+    pub code: u16,
+    pub message: String,
+}
+
 // ── Slot payloads ────────────────────────────────────────────────────
 
 /// `OP_SLOT_SET` — bind a CAS hash to a per-connection slot ID,

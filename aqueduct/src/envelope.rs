@@ -48,6 +48,11 @@ pub mod flag {
     pub const IS_RESPONSE:      u16 = 1 << 2;
     /// Async event — never expects a response.
     pub const ASYNC_EVENT:      u16 = 1 << 3;
+    /// This response reports a failure: set together with `IS_RESPONSE`,
+    /// the payload is an `ErrorReply` (code + message) rather than the
+    /// op's normal reply. Lets a server refuse a request-reply op without
+    /// leaving the client blocked on a reply that never comes.
+    pub const IS_ERROR:         u16 = 1 << 4;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

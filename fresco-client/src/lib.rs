@@ -48,6 +48,7 @@ use fresco_protocol::{
     FontOpenPayload, FontOpenResponse, FontClosePayload, TextRunInstallPayload,
     TextMeasurePayload, TextMeasureResponse,
     WmEnumerateReply, WmDeclareLayoutPayload, WmSetRenderingPayload,
+    ErrorReply,
     scene_ops,
 };
 pub use fresco_protocol::{WmSurfaceInfo, WmRole, WmRect, WmSlot};
@@ -376,6 +377,21 @@ impl Connection {
                && m.op == control::OP_WM_ENUMERATE
                && m.flags & flag::IS_RESPONSE != 0
             {
+                // The server can refuse the op (no window-management cap) with an
+                // IS_ERROR response so we fail with a reason instead of hanging.
+                if m.flags & flag::IS_ERROR != 0 {
+                    let err: ErrorReply = decode(&m.payload).unwrap_or(ErrorReply {
+                        code: fresco_protocol::error_code::GENERIC,
+                        message: "WM_ENUMERATE refused".into(),
+                    });
+                    let kind = if err.code == fresco_protocol::error_code::FORBIDDEN {
+                        io::ErrorKind::PermissionDenied
+                    } else {
+                        io::ErrorKind::Other
+                    };
+                    return Err(io::Error::new(kind,
+                        format!("WM_ENUMERATE refused: {} (code {})", err.message, err.code)));
+                }
                 let reply: WmEnumerateReply = decode(&m.payload)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
                         format!("decode WM_ENUMERATE reply: {e}")))?;

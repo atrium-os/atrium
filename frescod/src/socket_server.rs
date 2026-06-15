@@ -28,7 +28,7 @@
 use aqueduct::{Connection as AqConn, CLASS_DISPLAY};
 use aqueduct::envelope::flag;
 use fresco_scene_server::command::envelope_frontend::{
-    EnvelopeFrontend, Outbound,
+    DispatchError, EnvelopeFrontend, Outbound,
 };
 use fresco_scene_server::window::{DisplayEvent, encode_event};
 
@@ -106,6 +106,22 @@ pub fn spawn_event_fanout(
 
 fn out_clone(o: &Outbound) -> Outbound {
     Outbound { op: o.op, flags: o.flags, payload: o.payload.clone() }
+}
+
+/// Build the `IS_ERROR` response for a dispatch failure on op `op`.
+fn error_reply(op: u16, e: &DispatchError) -> Outbound {
+    use fresco_protocol::error_code as ec;
+    let code = match e {
+        DispatchError::Forbidden     => ec::FORBIDDEN,
+        DispatchError::BadPayload    => ec::BAD_PAYLOAD,
+        DispatchError::UnknownWindow => ec::UNKNOWN_WINDOW,
+        _                            => ec::GENERIC,
+    };
+    let payload = fresco_protocol::encode(&fresco_protocol::ErrorReply {
+        code,
+        message: format!("{e:?}"),
+    }).unwrap_or_default();
+    Outbound { op, flags: flag::IS_RESPONSE | flag::IS_ERROR, payload }
 }
 
 fn accept_loop(listener: UnixListener, shared: Shared, event_subs: EventSubs) {
@@ -261,7 +277,10 @@ fn reader_loop(
             Ok(v)  => v,
             Err(e) => {
                 eprintln!("frescod: client {client_id} op={:#x}: {e:?}", msg.op);
-                Vec::new()
+                // Reply with an error so a client awaiting a response on this op
+                // fails fast with a reason instead of blocking forever. Harmless
+                // for fire-and-forget ops (the client buffers unmatched responses).
+                vec![error_reply(msg.op, &e)]
             }
         };
         for o in outs {
