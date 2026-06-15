@@ -1389,6 +1389,82 @@ mod tests {
         assert!(matches!(r, Err(DispatchError::Forbidden)));
     }
 
+    // ── F0 end-to-end: the REAL forum_wm daemon loop vs the REAL handlers ──────
+    //
+    // The forum-wm binary talks to frescod over a socket via fresco-client; here we
+    // splice the same `forum_wm::daemon::Wm::reconcile` loop directly onto the
+    // frontend's dispatch (the shell client), so the policy crate and the server
+    // handlers are exercised together without a VM or socket. Only the wire
+    // transport + the uid gate are left for the in-VM run.
+
+    use forum_wm::daemon::{FrescoConn, Wm};
+    use forum_wm::Screen;
+
+    struct FrontendConn<'a> {
+        fe: &'a mut EnvelopeFrontend,
+        shell: u8,
+    }
+    impl FrontendConn<'_> {
+        fn dispatch(&mut self, op: u16, payload: Vec<u8>) -> std::io::Result<Vec<Outbound>> {
+            self.fe.dispatch(&msg(op, 0, payload), self.shell)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}")))
+        }
+    }
+    impl FrescoConn for FrontendConn<'_> {
+        fn enumerate(&mut self) -> std::io::Result<Vec<WmSurfaceInfo>> {
+            let out = self.dispatch(control::OP_WM_ENUMERATE, Vec::new())?;
+            let reply: WmEnumerateReply = decode(&out[0].payload).unwrap();
+            Ok(reply.surfaces)
+        }
+        fn declare_layout(&mut self, layout: &WmDeclareLayoutPayload) -> std::io::Result<()> {
+            self.dispatch(control::OP_WM_DECLARE_LAYOUT, encode(layout).unwrap())?;
+            Ok(())
+        }
+        fn set_rendering(&mut self, decisions: &[WmSetRenderingPayload]) -> std::io::Result<()> {
+            for d in decisions {
+                self.dispatch(control::OP_WM_SET_RENDERING, encode(d).unwrap())?;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn f0_forum_wm_reconcile_against_frescod() {
+        let mut f = fixture();
+        // two apps create surfaces; the shell (client 9) holds the cap.
+        let a = make_window(&mut f, 1, 400, 300);
+        let b = make_window(&mut f, 2, 400, 300);
+        f.grant_window_management(9);
+
+        // run the REAL forum-wm daemon loop against the REAL handlers.
+        let wm = Wm::new(Screen {
+            rect: WmRect { x: 0, y: 0, w: 1920, h: 1080 },
+            bar_h: 24, dock_h: 48,
+        });
+        {
+            let mut conn = FrontendConn { fe: &mut f, shell: 9 };
+            let layout = wm.reconcile(&mut conn).expect("reconcile");
+            assert_eq!(layout.slots.len(), 2, "both surfaces placed");
+        }
+
+        // the compositor now reflects the WM's declared layout.
+        let comp = f.compositor_arc().lock().unwrap();
+        // both app windows were repositioned to fill the work area (below the bar).
+        for id in [a, b] {
+            let w = comp.windows.get(&(id as u16)).unwrap();
+            assert_eq!(w.pos.1, 24.0, "placed below the 24px bar");
+            assert_eq!(w.size, (1920.0, 1008.0), "document fills the work area (1080-24-48)");
+        }
+        // a focus was chosen; the screen (window 0) stays at the bottom of z-order.
+        assert!(comp.focus.is_some(), "the WM picked a focus");
+        assert_eq!(comp.z_order.first(), Some(&0u16), "screen pinned at the bottom");
+        // two identical full-area documents → the lower is fully occluded → gated.
+        let gated = [a, b].iter()
+            .filter(|&&id| !comp.windows.get(&(id as u16)).unwrap().rendering)
+            .count();
+        assert_eq!(gated, 1, "one of two stacked documents is occluded → render-gated");
+    }
+
     #[test]
     fn window_create_honors_initial_position() {
         let mut f = fixture();

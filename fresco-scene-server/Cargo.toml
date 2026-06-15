@@ -25,3 +25,9 @@ fresco-protocol = { path = "../fresco-protocol" }
 fresco-vulkan   = { path = "../fresco-vulkan" }
 fresco-text     = { path = "../fresco-text" }
 ash             = "0.38"
+
+[dev-dependencies]
+# The WM policy crate, so the F0 integration test can drive the real
+# forum_wm::arrange against the real frescod handlers (enumerate → arrange →
+# declare) in one host test — proving the loop end-to-end without a VM.
+forum-wm = { path = "../forum-wm" }
