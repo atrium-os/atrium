@@ -51,7 +51,9 @@ fn main() {
     // Daemon mode: listen on the control socket for vestibulum's authenticated
     // logins, peer-gated by getpeereid. Boot launches the login UI first.
     const SOCK: &str = "/var/run/atrium/ostiarius.sock";
-    let mut o = Ostiarius::new(JaildLauncher::default());
+    // Real PAM (/etc/pam.d/atrium-login) when built --features pam; the stub
+    // otherwise (which refuses, so the production daemon must be a pam build).
+    let mut o = Ostiarius::new(JaildLauncher::default()).with_pam("atrium-login");
     if let Err(e) = o.boot() {
         eprintln!("ostiarius: boot (launch vestibulum): {e}");
     }

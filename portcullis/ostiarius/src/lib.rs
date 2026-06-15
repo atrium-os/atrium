@@ -23,6 +23,9 @@ use std::path::PathBuf;
 
 pub use portcullis_peer::seat;
 
+#[cfg(feature = "pam")]
+pub mod pam;
+
 /// Which vestibulum frontend authenticated — GUI (on Fresco) or CLI (a tty/serial
 /// console, the display-down fallback). Same trusted flow either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -93,17 +96,31 @@ pub struct Ostiarius<L: Launcher> {
     launcher: L,
     /// Path to the seat's active-session file (default `seat::ACTIVE_SESSION`).
     seat_path: String,
+    /// PAM service to authenticate against (`/etc/pam.d/<service>`). `None` → the
+    /// dev/test stub (any non-empty credential).
+    pam_service: Option<String>,
     running: Vec<String>,
 }
 
 impl<L: Launcher> Ostiarius<L> {
     pub fn new(launcher: L) -> Self {
-        Ostiarius { launcher, seat_path: seat::ACTIVE_SESSION.to_string(), running: Vec::new() }
+        Ostiarius {
+            launcher,
+            seat_path: seat::ACTIVE_SESSION.to_string(),
+            pam_service: None,
+            running: Vec::new(),
+        }
     }
 
     /// Use a non-default seat file (tests).
     pub fn with_seat_path(mut self, path: impl Into<String>) -> Self {
         self.seat_path = path.into();
+        self
+    }
+
+    /// Authenticate against this PAM service instead of the stub (production).
+    pub fn with_pam(mut self, service: impl Into<String>) -> Self {
+        self.pam_service = Some(service.into());
         self
     }
 
@@ -135,6 +152,19 @@ impl<L: Launcher> Ostiarius<L> {
         if user.is_empty() || password.is_empty() {
             return Err("authentication failed".into());
         }
+        if let Some(service) = &self.pam_service {
+            #[cfg(feature = "pam")]
+            {
+                pam::authenticate(service, user, password)?;
+                return Ok(user.to_string());
+            }
+            #[cfg(not(feature = "pam"))]
+            {
+                let _ = service;
+                return Err("pam requested but not compiled (build --features pam)".into());
+            }
+        }
+        // dev/test stub: any non-empty credential succeeds (matches vestibulum D2).
         Ok(user.to_string())
     }
 
