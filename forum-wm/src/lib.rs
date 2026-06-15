@@ -157,6 +157,52 @@ fn subtract(r: &WmRect, cut: &WmRect) -> Vec<WmRect> {
     out
 }
 
+/// The daemon reconcile loop. The WM core's job each time the surface set or focus
+/// changes: enumerate → arrange → declare the layout + the rendering decisions.
+pub mod daemon {
+    use super::{arrange, rendering_decisions, Screen};
+    use fresco_protocol::{WmDeclareLayoutPayload, WmSetRenderingPayload, WmSurfaceInfo};
+    use std::io;
+
+    /// The frescod connection seam — the only I/O. Production wraps a
+    /// `fresco_client::Connection` (OP_WM_ENUMERATE → reply, OP_WM_DECLARE_LAYOUT,
+    /// OP_WM_SET_RENDERING); tests use a recorder. Splitting it keeps the reconcile
+    /// loop pure and testable without a live frescod.
+    pub trait FrescoConn {
+        fn enumerate(&mut self) -> io::Result<Vec<WmSurfaceInfo>>;
+        fn declare_layout(&mut self, layout: &WmDeclareLayoutPayload) -> io::Result<()>;
+        fn set_rendering(&mut self, decisions: &[WmSetRenderingPayload]) -> io::Result<()>;
+    }
+
+    /// The WM core state: the output geometry + the human's focus intent.
+    pub struct Wm {
+        pub screen: Screen,
+        pub focus_intent: Option<u32>,
+    }
+
+    impl Wm {
+        pub fn new(screen: Screen) -> Self {
+            Wm { screen, focus_intent: None }
+        }
+
+        /// The human focuses a surface (an intent); the next reconcile applies it.
+        pub fn focus(&mut self, surface_id: u32) {
+            self.focus_intent = Some(surface_id);
+        }
+
+        /// Re-derive and push the layout: enumerate the session's surfaces, arrange
+        /// them by role, declare the atomic layout, and gate the fully-occluded
+        /// ones. Returns the layout it declared (so the caller can track focus).
+        pub fn reconcile(&self, conn: &mut impl FrescoConn) -> io::Result<WmDeclareLayoutPayload> {
+            let surfaces = conn.enumerate()?;
+            let layout = arrange(&self.screen, &surfaces, self.focus_intent);
+            conn.declare_layout(&layout)?;
+            conn.set_rendering(&rendering_decisions(&layout))?;
+            Ok(layout)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +258,62 @@ mod tests {
         };
         let r = rendering_decisions(&layout);
         assert!(r.iter().find(|x| x.surface_id == 1).unwrap().rendering, "partial occlusion still renders (Fresco clips)");
+    }
+
+    // ── the daemon reconcile loop ────────────────────────────────────────────
+
+    use crate::daemon::{FrescoConn, Wm};
+    use std::io;
+
+    /// A recorder standing in for the live frescod connection.
+    #[derive(Default)]
+    struct MockConn {
+        surfaces: Vec<WmSurfaceInfo>,
+        declared: Option<WmDeclareLayoutPayload>,
+        rendering: Vec<WmSetRenderingPayload>,
+    }
+    impl FrescoConn for MockConn {
+        fn enumerate(&mut self) -> io::Result<Vec<WmSurfaceInfo>> {
+            Ok(self.surfaces.clone())
+        }
+        fn declare_layout(&mut self, layout: &WmDeclareLayoutPayload) -> io::Result<()> {
+            self.declared = Some(layout.clone());
+            Ok(())
+        }
+        fn set_rendering(&mut self, decisions: &[WmSetRenderingPayload]) -> io::Result<()> {
+            self.rendering = decisions.to_vec();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reconcile_enumerates_arranges_and_declares() {
+        let mut conn = MockConn {
+            surfaces: vec![surf(1, WmRole::Document), surf(2, WmRole::Dialog)],
+            ..Default::default()
+        };
+        let wm = Wm::new(screen());
+        let layout = wm.reconcile(&mut conn).unwrap();
+
+        // it declared exactly what arrange produced, and pushed rendering decisions.
+        assert_eq!(conn.declared.as_ref().unwrap().focus, 2, "dialog focused");
+        assert_eq!(layout.slots.len(), 2);
+        assert_eq!(conn.rendering.len(), 2, "a rendering decision per surface");
+    }
+
+    #[test]
+    fn focus_intent_steers_the_next_reconcile() {
+        // two documents; the human focuses the second.
+        let mut conn = MockConn {
+            surfaces: vec![surf(1, WmRole::Document), surf(2, WmRole::Document)],
+            ..Default::default()
+        };
+        let mut wm = Wm::new(screen());
+        wm.reconcile(&mut conn).unwrap(); // focus falls to the first document
+        assert_eq!(conn.declared.as_ref().unwrap().focus, 1);
+
+        wm.focus(2);
+        wm.reconcile(&mut conn).unwrap();
+        assert_eq!(conn.declared.as_ref().unwrap().focus, 2, "focus intent honored");
     }
 }

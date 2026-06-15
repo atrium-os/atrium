@@ -10,5 +10,12 @@ description = "Forum's WM core — the privileged window-management component (t
 name = "forum_wm"
 path = "src/lib.rs"
 
+# The daemon: the real fresco-client binding + the reconcile loop driver. The lib
+# stays pure policy (no I/O); the binary owns the connection.
+[[bin]]
+name = "forum-wm"
+path = "src/main.rs"
+
 [dependencies]
 fresco-protocol = { path = "../fresco-protocol" }
+fresco-client = { path = "../fresco-client" }

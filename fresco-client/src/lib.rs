@@ -47,8 +47,10 @@ use fresco_protocol::{
     InputPointerButtonEvent, InputPointerScrollEvent,
     FontOpenPayload, FontOpenResponse, FontClosePayload, TextRunInstallPayload,
     TextMeasurePayload, TextMeasureResponse,
+    WmEnumerateReply, WmDeclareLayoutPayload, WmSetRenderingPayload,
     scene_ops,
 };
+pub use fresco_protocol::{WmSurfaceInfo, WmRole, WmRect, WmSlot};
 pub use fresco_protocol::DamageRect;
 pub use fresco_protocol::FontOpenResponse as RemoteFontMetrics;
 pub use fresco_protocol::TextMeasureResponse as TextMetrics;
@@ -357,6 +359,42 @@ impl Connection {
     pub fn window_request_close(&mut self, window_id: u32) -> io::Result<()> {
         self.send_window_managed(control::OP_WINDOW_REQUEST_CLOSE,
             &WindowRequestClosePayload { window_id })
+    }
+
+    // ── window-management (cross-app; gated by the `window-management` cap) ──
+    // The privileged shell (Forum) side of the protocol: enumerate every surface
+    // in the session, then declare the whole layout + per-surface rendering.
+
+    /// Enumerate every surface in the caller's session (cross-app). Requires the
+    /// `window-management` capability — frescod rejects the op otherwise. Sends
+    /// `OP_WM_ENUMERATE` and waits for its `IS_RESPONSE` reply.
+    pub fn wm_enumerate(&mut self) -> io::Result<Vec<WmSurfaceInfo>> {
+        self.send_window_managed(control::OP_WM_ENUMERATE, &())?;
+        loop {
+            let m = self.inner.recv_message()?;
+            if m.opcode_class == CLASS_DISPLAY
+               && m.op == control::OP_WM_ENUMERATE
+               && m.flags & flag::IS_RESPONSE != 0
+            {
+                let reply: WmEnumerateReply = decode(&m.payload)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
+                        format!("decode WM_ENUMERATE reply: {e}")))?;
+                return Ok(reply.surfaces);
+            }
+            log::debug!("wm_enumerate: skipping unrelated message op={:#x}", m.op);
+        }
+    }
+
+    /// Declare the atomic placement of every surface (+ the focused one). The whole
+    /// layout lands as one message so the screen never shows a half-applied state.
+    pub fn wm_declare_layout(&mut self, layout: &WmDeclareLayoutPayload) -> io::Result<()> {
+        self.send_window_managed(control::OP_WM_DECLARE_LAYOUT, layout)
+    }
+
+    /// Mark a surface (non-)rendering. A fully-occluded surface set non-rendering has
+    /// its GPU work stopped so the idle blocks power-gate.
+    pub fn wm_set_rendering(&mut self, decision: &WmSetRenderingPayload) -> io::Result<()> {
+        self.send_window_managed(control::OP_WM_SET_RENDERING, decision)
     }
 
     pub fn window_present(&mut self, window_id: u32) -> io::Result<()> {
