@@ -1,0 +1,16 @@
+[package]
+name = "forum-demo"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "forum-demo — a minimal Pergola app that draws a rect composition, to pipe-clean the full UI render path: Pergola (widget/scene model) → fresco-protocol scene ops → frescod renders → pixels. Models exactly what a Forum chrome app is (a Pergola app). See docs/spec/forum.md."
+
+[[bin]]
+name = "forum-demo"
+path = "src/main.rs"
+
+[dependencies]
+pergola = { path = "../pergola" }
+fresco-client = { path = "../fresco-client" }
+fresco-protocol = { path = "../fresco-protocol" }
