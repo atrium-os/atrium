@@ -14,8 +14,9 @@ use fresco_client::Connection;
 use fresco_protocol::WindowHints;
 use pergola::color::Color;
 use pergola::geom::Rect;
+use pergola::theme::{font, type_size, Weight};
 use pergola::view::{Ctx, View};
-use pergola::{commit, App, FrescoSurface, Node, Surface};
+use pergola::{commit, App, FrescoSurface, Node, Surface, TextStyle};
 
 const W: f32 = 480.0;
 const H: f32 = 320.0;
@@ -55,11 +56,32 @@ impl View for DockPanel {
             fill: Color::rgba(0.30, 0.55, 0.95, 1.0),
             radius: 16.0,
         });
-        // Accent strip near the bottom.
+        // Title text (in the teal strip) — exercises the glyph-run render path.
+        ctx.add(Node::Text {
+            rect: Rect::new(16.0, 10.0, 0.0, 0.0),
+            content: "Atrium Forum".into(),
+            style: TextStyle {
+                family: font::SANS.into(),
+                size: type_size::LG,
+                weight: Weight::Semibold,
+                color: Color::rgba(1.0, 1.0, 1.0, 1.0),
+            },
+        });
+        // Accent strip near the bottom + a label on it.
         ctx.add(Node::Rect {
             rect: Rect::new(24.0, 240.0, W - 48.0, 32.0),
             fill: ctx.theme.bg_elevated(),
             radius: 8.0,
+        });
+        ctx.add(Node::Text {
+            rect: Rect::new(36.0, 246.0, 0.0, 0.0),
+            content: "glyph fill test — the quick brown fox".into(),
+            style: TextStyle {
+                family: font::SANS.into(),
+                size: type_size::SM,
+                weight: Weight::Regular,
+                color: ctx.theme.text_primary(),
+            },
         });
         ctx.pop();
     }
