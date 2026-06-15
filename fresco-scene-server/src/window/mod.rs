@@ -164,6 +164,12 @@ pub struct Window {
     pub scene:  Arc<Mutex<SceneGraph>>,
     pub focus:  bool,
     pub z:      u32,        // z-order; higher = on top
+    /// Whether this surface is currently rendering. Set false by the WM
+    /// (`OP_WM_SET_RENDERING`) when the surface is fully occluded so its
+    /// GPU work can stop and the idle blocks power-gate. Default true.
+    /// The renderer honoring this (skip-compose) + the power-gate signal
+    /// are the follow-up; for now it records the WM's decision.
+    pub rendering: bool,
     /// Cached title-text glyphs: PathHeader hash + (x, y) baseline
     /// position in pixels relative to the title origin. Regenerated
     /// when title or theme changes; per-frame compose just translates
@@ -183,6 +189,7 @@ impl Window {
             scene: Arc::new(Mutex::new(SceneGraph::new())),
             focus: false,
             z:     0,
+            rendering: true,
             title_glyphs: Vec::new(),
         }
     }
@@ -195,6 +202,7 @@ impl Window {
             title: String::new(),
             slots, scene,
             focus: false, z: 0,
+            rendering: true,
             title_glyphs: Vec::new(),
         }
     }
@@ -859,6 +867,25 @@ impl Compositor {
     /// Returns `Some(FocusChange)` only if focus actually moved;
     /// caller emits FOCUS completions for `prev` (blurred) and `new`
     /// (focused). Window 0 (screen) is treated as a normal id here.
+    /// Set focus to `id` (or `None`) **without** touching the z-order —
+    /// the WM's declarative layout (`OP_WM_DECLARE_LAYOUT`) declares z from
+    /// roles separately from which surface holds focus, so focus must not
+    /// imply raise here (a focused document can sit under a HUD). Updates
+    /// the per-window focus flags and emits the focus-change events.
+    pub fn set_focus_no_raise(&mut self, id: Option<WindowId>) {
+        if self.focus == id { return; }
+        let prev = self.focus;
+        if let Some(p) = prev { if let Some(w) = self.windows.get_mut(&p) { w.focus = false; } }
+        if let Some(n) = id  { if let Some(w) = self.windows.get_mut(&n) { w.focus = true; } }
+        self.focus = id;
+        if let Some(p) = prev {
+            self.emit(DisplayEvent::WindowFocusChanged { window_id: p as u32, gained: false });
+        }
+        if let Some(n) = id {
+            self.emit(DisplayEvent::WindowFocusChanged { window_id: n as u32, gained: true });
+        }
+    }
+
     pub fn raise(&mut self, id: WindowId) -> Option<FocusChange> {
         if !self.z_order.iter().any(|&w| w == id) {
             return None;

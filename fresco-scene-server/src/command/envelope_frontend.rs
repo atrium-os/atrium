@@ -49,6 +49,7 @@ use fresco_protocol::{
     FontOpenPayload, FontOpenResponse, FontClosePayload, TextRunInstallPayload,
     TextMeasurePayload, TextMeasureResponse,
     WmSurfaceInfo, WmEnumerateReply, WmRole, WmRect,
+    WmDeclareLayoutPayload, WmSetRenderingPayload,
 };
 use aqueduct::envelope::flag;
 use fresco_vulkan::UploadRequest;
@@ -441,6 +442,8 @@ impl EnvelopeFrontend {
 
             // ── Cross-app window management (gated by window-management) ──
             control::OP_WM_ENUMERATE         => self.handle_wm_enumerate(msg),
+            control::OP_WM_DECLARE_LAYOUT    => self.handle_wm_declare_layout(msg),
+            control::OP_WM_SET_RENDERING     => self.handle_wm_set_rendering(msg),
 
             op => Err(DispatchError::UnknownOp(op)),
         }
@@ -856,6 +859,93 @@ impl EnvelopeFrontend {
         }])
     }
 
+    /// `OP_WM_DECLARE_LAYOUT` — apply the WM's atomic placement of every
+    /// surface: per-surface rect (pos + size), the z-order implied by the
+    /// declared layers, and which surface holds focus. This is the state
+    /// the WM owns; the renderer reads pos/size/z_order to compose.
+    ///
+    /// Layer convention follows forum-wm: a *lower* layer is closer to the
+    /// viewer (topmost). frescod's `z_order` is bottom→top (last = top), so
+    /// we lay the declared surfaces highest-layer-first. The screen window
+    /// (id 0) stays pinned at the bottom; any surface created in the race
+    /// between enumerate and declare (not named in the layout) is kept on
+    /// top so a brand-new window is never silently hidden.
+    fn handle_wm_declare_layout(&mut self, msg: &Message)
+        -> Result<Vec<Outbound>, DispatchError>
+    {
+        if !self.wm_capable.contains(&self.current_client) {
+            return Err(DispatchError::Forbidden);
+        }
+        let layout: WmDeclareLayoutPayload = decode(&msg.payload)
+            .map_err(|_| DispatchError::BadPayload)?;
+        let mut comp = self.compositor.lock().unwrap();
+
+        // 1. geometry — apply each declared rect to the surface it names.
+        for slot in &layout.slots {
+            if let Some(w) = comp.windows.get_mut(&(slot.surface_id as u16)) {
+                w.pos  = (slot.rect.x as f32, slot.rect.y as f32);
+                w.size = (slot.rect.w as f32, slot.rect.h as f32);
+            }
+        }
+
+        // 2. z-order — screen at the bottom, then declared surfaces
+        //    highest-layer-first (so the lowest layer lands on top), then
+        //    any unnamed surviving surface on top of all.
+        let mut named: Vec<&fresco_protocol::WmSlot> = layout.slots.iter()
+            .filter(|s| comp.windows.contains_key(&(s.surface_id as u16)))
+            .collect();
+        named.sort_by(|a, b| b.layer.cmp(&a.layer)); // highest layer = bottom
+        let named_ids: std::collections::HashSet<u16> =
+            named.iter().map(|s| s.surface_id as u16).collect();
+
+        let mut new_z: Vec<u16> = Vec::with_capacity(comp.windows.len());
+        if comp.windows.contains_key(&0) { new_z.push(0); }
+        for s in &named { new_z.push(s.surface_id as u16); }
+        // unnamed survivors (excluding screen + already-placed) on top.
+        let mut unnamed: Vec<u16> = comp.windows.keys().copied()
+            .filter(|&id| id != 0 && !named_ids.contains(&id))
+            .collect();
+        unnamed.sort();
+        new_z.extend(unnamed);
+
+        // write the new order + keep each Window.z consistent with it.
+        for (i, &id) in new_z.iter().enumerate() {
+            if let Some(w) = comp.windows.get_mut(&id) { w.z = i as u32; }
+        }
+        comp.z_order = new_z;
+
+        // 3. focus — set the declared focus (0 = leave unfocused). z is set
+        //    above from roles, so focus here must not raise.
+        let new_focus = (layout.focus != 0
+            && comp.windows.contains_key(&(layout.focus as u16)))
+            .then_some(layout.focus as u16);
+        comp.set_focus_no_raise(new_focus);
+
+        Ok(Vec::new()) // atomic apply; no reply
+    }
+
+    /// `OP_WM_SET_RENDERING` — record that a surface is (not) rendering. The
+    /// WM sets this false for a fully-occluded surface so its GPU work can
+    /// stop and the idle blocks power-gate. For now it records the decision
+    /// on the surface; the renderer honoring it (skip-compose) and the
+    /// power-gate signal are the follow-up.
+    fn handle_wm_set_rendering(&mut self, msg: &Message)
+        -> Result<Vec<Outbound>, DispatchError>
+    {
+        if !self.wm_capable.contains(&self.current_client) {
+            return Err(DispatchError::Forbidden);
+        }
+        let p: WmSetRenderingPayload = decode(&msg.payload)
+            .map_err(|_| DispatchError::BadPayload)?;
+        let mut comp = self.compositor.lock().unwrap();
+        if let Some(w) = comp.windows.get_mut(&(p.surface_id as u16)) {
+            w.rendering = p.rendering;
+            Ok(Vec::new())
+        } else {
+            Err(DispatchError::UnknownWindow)
+        }
+    }
+
     fn handle_window_destroy(&mut self, msg: &Message)
         -> Result<Vec<Outbound>, DispatchError>
     {
@@ -1222,6 +1312,81 @@ mod tests {
             "the shell sees the app's surface");
         assert!(!reply.surfaces.iter().any(|s| s.surface_id == 0),
             "window 0 (the screen) is not an app surface");
+    }
+
+    fn make_window(f: &mut EnvelopeFrontend, client: u8, w: u32, h: u32) -> u32 {
+        let p = WindowCreatePayload {
+            width: w, height: h, title: "app".into(),
+            hints: WindowHints::default(), parent_window_id: 0,
+        };
+        let out = f.dispatch(&msg(control::OP_WINDOW_CREATE, 0, encode(&p).unwrap()), client)
+            .expect("create");
+        decode(&out[0].payload).unwrap()
+    }
+
+    #[test]
+    fn wm_declare_layout_applies_geometry_z_and_focus() {
+        use fresco_protocol::{WmSlot, WmRect};
+        let mut f = fixture();
+        let a = make_window(&mut f, 1, 100, 100); // a document
+        let b = make_window(&mut f, 2, 100, 100); // a dialog (lower layer = on top)
+
+        f.grant_window_management(9);
+        let layout = WmDeclareLayoutPayload {
+            slots: vec![
+                WmSlot { surface_id: a, rect: WmRect { x: 0, y: 24, w: 1920, h: 1000 }, layer: 4 },
+                WmSlot { surface_id: b, rect: WmRect { x: 720, y: 380, w: 480, h: 320 }, layer: 0 },
+            ],
+            focus: b,
+        };
+        f.dispatch(&msg(control::OP_WM_DECLARE_LAYOUT, 0, encode(&layout).unwrap()), 9)
+            .expect("declare layout");
+
+        let comp = f.compositor_arc().lock().unwrap();
+        // geometry applied.
+        let wa = comp.windows.get(&(a as u16)).unwrap();
+        assert_eq!((wa.pos, wa.size), ((0.0, 24.0), (1920.0, 1000.0)));
+        // z-order: screen at bottom, then the higher-layer doc, then the dialog on top.
+        assert_eq!(comp.z_order.first(), Some(&0u16), "screen pinned at the bottom");
+        assert_eq!(comp.z_order.last(), Some(&(b as u16)), "lowest layer (dialog) on top");
+        // focus on the dialog, without it being raised by a separate raise().
+        assert_eq!(comp.focus, Some(b as u16));
+        assert!(comp.windows.get(&(b as u16)).unwrap().focus);
+        assert!(!comp.windows.get(&(a as u16)).unwrap().focus);
+    }
+
+    #[test]
+    fn wm_declare_layout_is_gated() {
+        use fresco_protocol::{WmSlot, WmRect};
+        let mut f = fixture();
+        let a = make_window(&mut f, 1, 100, 100);
+        let layout = WmDeclareLayoutPayload {
+            slots: vec![WmSlot { surface_id: a, rect: WmRect { x: 0, y: 0, w: 10, h: 10 }, layer: 4 }],
+            focus: a,
+        };
+        // client 1 (not the shell) cannot declare a layout.
+        let r = f.dispatch(&msg(control::OP_WM_DECLARE_LAYOUT, 0, encode(&layout).unwrap()), 1);
+        assert!(matches!(r, Err(DispatchError::Forbidden)));
+    }
+
+    #[test]
+    fn wm_set_rendering_records_the_decision() {
+        let mut f = fixture();
+        let a = make_window(&mut f, 1, 100, 100);
+        f.grant_window_management(9);
+
+        // default: rendering.
+        assert!(f.compositor_arc().lock().unwrap().windows.get(&(a as u16)).unwrap().rendering);
+
+        let p = WmSetRenderingPayload { surface_id: a, rendering: false };
+        f.dispatch(&msg(control::OP_WM_SET_RENDERING, 0, encode(&p).unwrap()), 9)
+            .expect("set rendering");
+        assert!(!f.compositor_arc().lock().unwrap().windows.get(&(a as u16)).unwrap().rendering,
+            "the WM gated the fully-occluded surface");
+
+        // ungranted client is refused.
+        let r = f.dispatch(&msg(control::OP_WM_SET_RENDERING, 0, encode(&p).unwrap()), 1);
+        assert!(matches!(r, Err(DispatchError::Forbidden)));
     }
 
     #[test]
