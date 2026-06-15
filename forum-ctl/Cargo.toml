@@ -1,0 +1,16 @@
+[package]
+name = "forum-ctl"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "forum-ctl — the capability-gated intent wire between Forum's chrome apps (dock/bar/shelf/overview) and the privileged WM core (forum-wm). Chrome apps hold only `graphics`; they request intents (list surfaces, focus) of the core, which holds `window-management` and authorizes each. See docs/spec/forum.md §3-4."
+
+[lib]
+name = "forum_ctl"
+path = "src/lib.rs"
+
+[dependencies]
+fresco-protocol = { path = "../fresco-protocol" }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"], default-features = false }

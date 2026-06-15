@@ -203,6 +203,39 @@ pub mod daemon {
     }
 }
 
+/// The forum-ctl side: the WM core answering chrome apps' intents
+/// (`docs/spec/forum.md` §3-4). The chrome apps (dock/bar/shelf/overview) hold no
+/// window-management cap; they ask the core, which holds it, to act on their behalf.
+pub mod control {
+    use super::daemon::{FrescoConn, Wm};
+    use forum_ctl::{Intent, Reply};
+
+    /// Carry out one chrome intent against Fresco. The core is the authority: a
+    /// read intent (`ListSurfaces`) answers from the Fresco enumerate; an action
+    /// intent (`Focus`) updates the focus and re-declares the layout. Errors talking
+    /// to Fresco become `Reply::Err` rather than tearing down the control session.
+    pub fn handle_intent(wm: &mut Wm, conn: &mut impl FrescoConn, intent: Intent) -> Reply {
+        match intent {
+            Intent::ListSurfaces => match conn.enumerate() {
+                Ok(surfaces) => Reply::Surfaces { surfaces, focus: wm.focus_intent.unwrap_or(0) },
+                Err(e) => Reply::Err { message: e.to_string() },
+            },
+            Intent::Focus { surface_id } => {
+                wm.focus(surface_id);
+                match wm.reconcile(conn) {
+                    Ok(layout) => {
+                        // Report what actually got focus (a dialog can override the
+                        // request), so the chrome's highlight matches the screen.
+                        if layout.focus == surface_id { Reply::Ack }
+                        else { Reply::Surfaces { surfaces: Vec::new(), focus: layout.focus } }
+                    }
+                    Err(e) => Reply::Err { message: e.to_string() },
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +348,37 @@ mod tests {
         wm.focus(2);
         wm.reconcile(&mut conn).unwrap();
         assert_eq!(conn.declared.as_ref().unwrap().focus, 2, "focus intent honored");
+    }
+
+    // ── forum-ctl intents (the chrome-app side) ──────────────────────────────
+
+    use crate::control::handle_intent;
+    use forum_ctl::{Intent, Reply};
+
+    #[test]
+    fn list_surfaces_intent_returns_the_session_surfaces() {
+        let mut conn = MockConn {
+            surfaces: vec![surf(1, WmRole::Document), surf(2, WmRole::Panel)],
+            ..Default::default()
+        };
+        let mut wm = Wm::new(screen());
+        match handle_intent(&mut wm, &mut conn, Intent::ListSurfaces) {
+            Reply::Surfaces { surfaces, .. } => assert_eq!(surfaces.len(), 2),
+            other => panic!("expected Surfaces, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn focus_intent_from_chrome_refocuses_and_redeclares() {
+        // two documents; the dock asks the core to focus #2.
+        let mut conn = MockConn {
+            surfaces: vec![surf(1, WmRole::Document), surf(2, WmRole::Document)],
+            ..Default::default()
+        };
+        let mut wm = Wm::new(screen());
+        let reply = handle_intent(&mut wm, &mut conn, Intent::Focus { surface_id: 2 });
+        assert_eq!(reply, Reply::Ack, "the requested surface got focus");
+        // the core re-declared the layout to Fresco with #2 focused.
+        assert_eq!(conn.declared.as_ref().unwrap().focus, 2);
     }
 }

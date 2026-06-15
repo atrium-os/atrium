@@ -25,3 +25,4 @@ path = "src/bin/wm_app_stub.rs"
 [dependencies]
 fresco-protocol = { path = "../fresco-protocol" }
 fresco-client = { path = "../fresco-client" }
+forum-ctl = { path = "../forum-ctl" }
