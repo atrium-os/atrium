@@ -19,6 +19,7 @@
 struct InstanceRecord {
     float4 model;      // x, y, w, h
     float4 color;
+    float4 params;     // .x = corner radius (px); .yzw reserved
 };
 
 [[vk::binding(0, 0)]]
@@ -40,17 +41,20 @@ void comp_main(uint3 tid : SV_DispatchThreadID)
         return;
     }
 
-    /* nodes[id] starts at byte 16 + 32*id. First 16 bytes =
-     * position.xy + size.xy as a float4; next 16 bytes = color. */
-    uint base   = 16u + 32u * id;
-    float4 ps   = asfloat(scene.Load4(base));         // (px, py, sx, sy)
-    float4 col  = asfloat(scene.Load4(base + 16u));
+    /* nodes[id] starts at byte 16 + 48*id. First 16 bytes =
+     * position.xy + size.xy as a float4; next 16 bytes = color;
+     * then float radius + 12 bytes pad. */
+    uint base    = 16u + 48u * id;
+    float4 ps    = asfloat(scene.Load4(base));         // (px, py, sx, sy)
+    float4 col   = asfloat(scene.Load4(base + 16u));
+    float  radius = asfloat(scene.Load(base + 32u));
 
     uint slot;
     InterlockedAdd(counter[0], 1u, slot);
 
     InstanceRecord rec;
-    rec.model = ps;
-    rec.color = col;
+    rec.model  = ps;
+    rec.color  = col;
+    rec.params = float4(radius, 0.0, 0.0, 0.0);
     instances[slot] = rec;
 }

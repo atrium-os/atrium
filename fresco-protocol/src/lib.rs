@@ -742,6 +742,9 @@ pub struct RectParams {
     pub g: f32,
     pub b: f32,
     pub a: f32,
+    /// Corner radius in logical pixels (0 = square). Clamped to half the
+    /// shorter side by the renderer. Part of the Atrium shape language.
+    pub radius: f32,
 }
 
 /// Params for `scene_ops::ATRIUM_CORE_TEXTURE`. Slot is established
@@ -887,7 +890,7 @@ mod tests {
     fn roundtrip_node_set_with_rect_params() {
         let inner = RectParams {
             x: 100.0, y: 200.0, w: 64.0, h: 48.0,
-            r: 0.5, g: 0.25, b: 1.0, a: 1.0,
+            r: 0.5, g: 0.25, b: 1.0, a: 1.0, radius: 0.0,
         };
         let inner_bytes = encode(&inner).expect("encode rect params");
         let outer = SceneNodeSetPayload {

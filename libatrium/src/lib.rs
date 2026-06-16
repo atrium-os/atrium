@@ -1242,7 +1242,7 @@ pub extern "C" fn atrium_window_fill_rect(
         Err(_) => return ATRIUM_ERR_FRESCO_RPC,
     };
     let rect_bytes = match postcard::to_stdvec(&fresco_protocol::RectParams {
-        x, y, w, h, r, g, b, a,
+        x, y, w, h, r, g, b, a, radius: 0.0,
     }) {
         Ok(v) => v,
         Err(_) => return ATRIUM_ERR_FRESCO_RPC,
@@ -1378,7 +1378,7 @@ pub extern "C" fn atrium_window_frame_rect(
     };
     let flags = window_id as u16;
     let rect_bytes = match postcard::to_stdvec(&fresco_protocol::RectParams {
-        x, y, w, h, r, g, b, a,
+        x, y, w, h, r, g, b, a, radius: 0.0,
     }) {
         Ok(v) => v,
         Err(_) => return ATRIUM_ERR_FRESCO_RPC,

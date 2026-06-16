@@ -16,6 +16,7 @@
 struct InstanceRecord {
     float4 model;   // x, y, w, h in screen pixels
     float4 color;
+    float4 params;  // .x = corner radius (px)
 };
 
 [[vk::binding(0, 0)]]
@@ -29,7 +30,17 @@ cbuffer Screen {
 struct VSOutput {
     float4 position : SV_Position;
     float4 color    : COLOR0;
+    float2 local    : TEXCOORD0;  // pixel offset within the rect (0..size)
+    float3 shape    : TEXCOORD1;  // (w, h, radius) in pixels
 };
+
+/* Signed distance to a rounded box centred at the origin, half-extents `b`,
+ * corner radius `r`. Negative inside, positive outside. */
+float sd_round_box(float2 p, float2 b, float r)
+{
+    float2 q = abs(p) - b + r;
+    return min(max(q.x, q.y), 0.0) + length(max(q, float2(0.0, 0.0))) - r;
+}
 
 [shader("vertex")]
 VSOutput vert_main(uint vertex_index   : SV_VertexID,
@@ -60,11 +71,27 @@ VSOutput vert_main(uint vertex_index   : SV_VertexID,
     VSOutput o;
     o.position = float4(clip, 0.0, 1.0);
     o.color    = inst.color;
+    o.local    = corner * inst.model.zw;                 // 0..(w,h)
+    o.shape    = float3(inst.model.zw, inst.params.x);   // w, h, radius
     return o;
 }
 
 [shader("fragment")]
-float4 frag_main(float4 color : COLOR0) : SV_Target
+float4 frag_main(VSOutput i) : SV_Target
 {
-    return color;
+    float radius = i.shape.z;
+    if (radius <= 0.0) {
+        return i.color;   // square — no SDF, no AA cost
+    }
+
+    float2 half_ext = i.shape.xy * 0.5;
+    float  r        = min(radius, min(half_ext.x, half_ext.y));
+    float2 p        = i.local - half_ext;                 // centred pixel coord
+    float  d        = sd_round_box(p, half_ext, r);
+
+    /* 1px-ish anti-aliased coverage from the signed distance (pixels). */
+    float aa    = max(fwidth(d), 1e-5);
+    float alpha = saturate(0.5 - d / aa);
+
+    return float4(i.color.rgb, i.color.a * alpha);
 }

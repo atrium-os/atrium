@@ -166,10 +166,11 @@ impl Surface for FrescoSurface {
 
     fn set_node(&mut self, id: NodeId, node: &Node) -> io::Result<()> {
         match node {
-            Node::Rect { rect, fill, .. } => {
+            Node::Rect { rect, fill, radius } => {
                 let params = fresco_protocol::RectParams {
                     x: rect.x(), y: rect.y(), w: rect.w(), h: rect.h(),
                     r: fill.r, g: fill.g, b: fill.b, a: fill.a,
+                    radius: *radius,
                 };
                 self.conn.scene_node_rect(id.0, params)
             }

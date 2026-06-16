@@ -22,14 +22,18 @@ use ash::vk;
 
 use crate::pipeline::OpKind;
 
-/// One scene node for the rect op. Mirrors `SceneNode` in
-/// `bundles/atrium-core/compute/op_rectangle.comp` (32 bytes).
+/// One scene node for the rect op. Mirrors the node layout read by
+/// `bundles/atrium-core/compute/op_rectangle.slang` (48 bytes: 8 pos + 8 size +
+/// 16 color + 4 radius + 12 pad, kept 16-aligned for clean ByteAddressBuffer reads).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SceneNode {
     pub position: [f32; 2],
     pub size:     [f32; 2],
     pub color:    [f32; 4],
+    /// Corner radius in pixels (0 = square).
+    pub radius:   f32,
+    pub _pad:     [f32; 3],
 }
 
 /// One scene node for the texture op. Mirrors `SceneNode` in

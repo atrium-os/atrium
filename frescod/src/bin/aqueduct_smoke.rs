@@ -115,11 +115,11 @@ fn main() -> io::Result<()> {
     let h = mode.height as f32;
     let bg = fp::RectParams {
         x: 0.0, y: 0.0, w, h,
-        r: 0.07, g: 0.10, b: 0.22, a: 1.0,
+        r: 0.07, g: 0.10, b: 0.22, a: 1.0, radius: 0.0,
     };
     let card = fp::RectParams {
         x: w * 0.20, y: h * 0.25, w: w * 0.60, h: h * 0.50,
-        r: 0.85, g: 0.20, b: 0.20, a: 1.0,
+        r: 0.85, g: 0.20, b: 0.20, a: 1.0, radius: 24.0,
     };
     let rotated = fp::PathParams {
         cx: w * 0.5, cy: h * 0.5,
@@ -129,7 +129,7 @@ fn main() -> io::Result<()> {
     };
     let stripe = fp::RectParams {
         x: 0.0, y: h - 8.0, w, h: 6.0,
-        r: 0.20, g: 0.80, b: 0.40, a: 1.0,
+        r: 0.20, g: 0.80, b: 0.40, a: 1.0, radius: 0.0,
     };
 
     // ── Shape + rasterize text via fresco-text + upload atlas ────

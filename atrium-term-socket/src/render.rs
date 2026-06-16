@@ -34,7 +34,7 @@ impl Renderer {
         let cur_y = self.pad_y + (grid.cursor_row as f32) * self.line_h;
         f.rect(RectParams {
             x: cur_x, y: cur_y, w: self.cell_w, h: self.line_h,
-            r: 1.0, g: 0.80, b: 0.20, a: 0.5,
+            r: 1.0, g: 0.80, b: 0.20, a: 0.5, radius: 0.0,
         })?;
 
         let cells = grid.cells();
