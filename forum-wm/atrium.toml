@@ -1,0 +1,22 @@
+# Forum window manager — the session shell. The sole holder of
+# `window-management`: it talks to Fresco for its own surfaces AND serves the
+# forum-ctl control socket the chrome apps drive it through. Launched jailed
+# through Portcullis like any other app (docs/spec/forum.md §6).
+[app]
+id          = "org.atrium.forum-wm"
+name        = "Forum"
+version     = "0.1.0"
+entry       = "bin/forum-wm"
+description = "The Atrium session shell — window management and input routing."
+icon        = "settings"
+
+[capabilities]
+graphics           = "fresco"
+window-management  = true
+notify             = true
+network            = "none"
+
+[supervision]
+restart    = "on-crash"
+keep-alive = true
+instances  = "single"

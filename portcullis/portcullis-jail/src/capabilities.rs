@@ -61,6 +61,12 @@ pub fn apply_all(
     if caps.microphone == Some(true) {
         apply_microphone(jc);
     }
+    if caps.window_management == Some(true) {
+        apply_window_management(jc, opts);
+    }
+    if caps.forum_control == Some(true) {
+        apply_forum_control(jc, opts);
+    }
     Ok(())
 }
 
@@ -74,6 +80,24 @@ pub fn apply_graphics(value: &str, jc: &mut JailConfig, opts: &BuildOpts) -> Res
     /* Fresco needs the GPU cdev too. */
     jc.add_devfs_action("path 'fresco0' unhide");
     Ok(())
+}
+
+/// `window-management` — the session shell (forum-wm). It connects to Fresco for
+/// its own surfaces (declared separately via `graphics = "fresco"`) and, crucially,
+/// *serves* the forum-ctl control socket that the chrome apps drive it through. The
+/// jail role is to give it that socket path under the shared sockets dir; the actual
+/// authority (mediating other apps' windows) is enforced service-side by frescod's
+/// peer-cred → app-registry → policy check, not by the jail. See docs/spec/forum.md.
+pub fn apply_window_management(jc: &mut JailConfig, opts: &BuildOpts) {
+    apply_socket("forum-ctl.sock", jc, opts);
+}
+
+/// `forum-control` — a Forum chrome app (bar/dock/overview). It *connects* to the
+/// forum-ctl socket forum-wm serves, to drive layout/focus. Same socket, client end.
+/// Holding this cap never lets it touch another app's windows directly: it can only
+/// ask forum-wm, which is the sole `window-management` holder.
+pub fn apply_forum_control(jc: &mut JailConfig, opts: &BuildOpts) {
+    apply_socket("forum-ctl.sock", jc, opts);
 }
 
 pub fn apply_socket(name: &str, jc: &mut JailConfig, opts: &BuildOpts) {
@@ -201,6 +225,24 @@ mod tests {
         let mut j = jc();
         let err = apply_graphics("vulkan", &mut j, &opts()).unwrap_err();
         assert!(matches!(err, BuildError::UnsupportedGraphics(_)));
+    }
+
+    #[test]
+    fn window_management_mounts_forum_ctl_socket() {
+        let mut j = jc();
+        apply_window_management(&mut j, &opts());
+        assert_eq!(j.mounts.len(), 1);
+        assert_eq!(j.mounts[0].src, PathBuf::from("/atrium/sockets/forum-ctl.sock"));
+        assert_eq!(j.mounts[0].dst,
+            PathBuf::from("/var/lib/atrium/jails/test/atrium/sockets/forum-ctl.sock"));
+    }
+
+    #[test]
+    fn forum_control_mounts_forum_ctl_socket() {
+        let mut j = jc();
+        apply_forum_control(&mut j, &opts());
+        assert_eq!(j.mounts.len(), 1);
+        assert_eq!(j.mounts[0].src, PathBuf::from("/atrium/sockets/forum-ctl.sock"));
     }
 
     #[test]

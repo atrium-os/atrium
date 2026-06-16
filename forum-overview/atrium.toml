@@ -1,0 +1,20 @@
+# Forum overview — the window switcher (Expose-style). A Forum chrome app:
+# renders via Fresco and drives the WM over forum-ctl (`forum-control`) to list
+# and focus surfaces. It holds no `window-management`.
+[app]
+id          = "org.atrium.forum-overview"
+name        = "Forum Overview"
+version     = "0.1.0"
+entry       = "bin/forum-overview"
+description = "The Forum overview — the open-windows switcher."
+icon        = "files"
+
+[capabilities]
+graphics      = "fresco"
+forum-control = true
+network       = "none"
+
+[supervision]
+restart    = "on-crash"
+keep-alive = false
+instances  = "single"

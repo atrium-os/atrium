@@ -1,0 +1,21 @@
+# Forum dock — the app launcher. A Forum chrome app: renders via Fresco and
+# drives the WM over forum-ctl (`forum-control`). On the human's activate it asks
+# portcullisd to launch an app (it is only the requester; the TCB does the verify
+# → uid → jail). It holds no `window-management`.
+[app]
+id          = "org.atrium.forum-dock"
+name        = "Forum Dock"
+version     = "0.1.0"
+entry       = "bin/forum-dock"
+description = "The Forum dock — the app launcher."
+icon        = "files"
+
+[capabilities]
+graphics      = "fresco"
+forum-control = true
+network       = "none"
+
+[supervision]
+restart    = "on-crash"
+keep-alive = true
+instances  = "single"

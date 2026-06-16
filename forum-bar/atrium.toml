@@ -1,0 +1,20 @@
+# Forum bar — the top status strip. A Forum chrome app: it renders via Fresco
+# (its own surface) and drives the WM over forum-ctl (`forum-control`). It holds
+# no `window-management` — it can only ASK forum-wm, never touch windows itself.
+[app]
+id          = "org.atrium.forum-bar"
+name        = "Forum Bar"
+version     = "0.1.0"
+entry       = "bin/forum-bar"
+description = "The Forum top bar — wordmark, focused app, clock."
+icon        = "settings"
+
+[capabilities]
+graphics      = "fresco"
+forum-control = true
+network       = "none"
+
+[supervision]
+restart    = "on-crash"
+keep-alive = true
+instances  = "single"
