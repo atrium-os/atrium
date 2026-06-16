@@ -30,7 +30,7 @@ and capability-declared (the manifest is the contract).
 |--------|-----------|-------|
 | **the unit** | an **Insula bundle** | the term; one app = one bundle |
 | **manifest file** | **`atrium.toml`** | the NAMING-canonical name (NAMING.md, Portcullis, Opifex). `manifest.toml` is the legacy insula-manifest name and is **deprecated** → migrate to `atrium.toml`. |
-| **archive (wire form)** | **`.insula`**, magic `INSB`, v1 | `insula-bundle/archive.rs`; the single-file transport form before a bundle is resolved into CAS |
+| **archive (wire form)** | **`.insula`**, magic `INSB`, v1 (§8) | the single-file transport form before a bundle is resolved into CAS |
 | **at-rest store** | **Tessera CAS**, content-addressed by root hash | byte-identical on every device |
 | **naming / resolution** | `atrium-app://…` → root hash via **Nomenclator** | publisher manifests map names → hashes |
 | **trust** | one publisher signature over manifest+contents | `portcullis-sig` (ed25519) / Sigstore root; `/etc/atrium/publishers` |
@@ -148,24 +148,57 @@ device: fetch .insula → verify sig (portcullis-sig + /etc/atrium/publishers)
 Updates are content-addressed + atomic (Opifex): a new root hash, verified, swapped
 in, old one retained for rollback. No per-launch download.
 
-## 7. Current state vs the canonical (the reconciliation migration)
+## 7. How this got reconciled (the macOS experiment retired)
 
-Two schemas exist; this spec makes them one. Staged so neither subsystem breaks:
+Originally two manifest schemas existed: `insula-manifest` (`manifest.toml`, the
+macOS Insula-host experiment) and `portcullis-toml` (`atrium.toml`, the Atrium
+runtime). The macOS host adapter was always **bootstrap scaffolding** — a way to
+start Insula app development before Atrium's own subsystems existed. With Pergola,
+the graphics stack, Portcullis jails, and Opifex now in place, that scaffolding was
+**retired** (2026-06-16): the entire macOS cluster — `insula-host-macos`,
+`insula-cli`, `insula-manifest`, `insula-bundle`, `atrium-mon`, `insula-hello`,
+`atrium-fetch`, `atrium-netd-macos` — was removed. Nothing on the Atrium/FreeBSD
+side depended on it.
 
-1. **Settle (this doc).** Canonical = `atrium.toml`, one typed schema, `[bundle].entry`,
-   closure-in-bundle. `insula.md` §3.1 updated to point here.
-2. **Unify the schema crate.** Grow `portcullis-toml` into the canonical manifest:
-   add the optional insula-manifest sections (`[bundle]`, `[storage]`, `[ipc]`,
-   `[peer]`, `[entry-points]`, `[background]`, `sdk-version`) alongside its typed
-   `[capabilities]`. Keep `portcullis_toml::Manifest` the one type.
-3. **Migrate the consent diff.** Port `insula-manifest::diff` onto the typed schema
-   (it already keys off `[capabilities]`/`[storage]`/`[network]`/peer/entry-points).
-4. **Migrate the macOS side.** `insula-bundle` reads `atrium.toml` (with a
-   `manifest.toml` deprecation fallback); `insula-cli` + `insula-host-macos` consume
-   `portcullis_toml::Manifest`; retire `insula-manifest`.
-5. **Build the bundle-assembly tool** (closure-shipping packer + signer) so install
-   is pure verify+register and `opifex`'s `ldd` pass becomes the documented fallback.
+So the reconciliation is not a migration — it's a deletion. **`atrium.toml`
+(`portcullis-toml`) is now the sole manifest; there is no second schema.** The
+`portcullis-toml` superset already absorbed the useful `manifest.toml` fields
+(`[bundle]` form/arches/entry, `sdk-version`; see §4) so nothing of value was lost.
 
-Until step 2 lands, `opifex`/Portcullis read `atrium.toml` and the macOS path reads
-`manifest.toml`; they share the *capability semantics* but not yet the *type*. That
-is the remaining gap this spec exists to close.
+Remaining build-out (Atrium-native, no macOS coupling):
+- **Bundle-assembly tool** — the closure-shipping packer + signer (the publisher
+  side; the counterpart to Opifex-the-installer) that writes a self-contained,
+  signed `.insula` (§8) with `lib/`+`libexec/` resolved deterministically at build
+  time, so install is pure verify+register and `opifex`'s install-time `ldd`
+  (`resolve_runtime`) reverts to the documented fallback (§5).
+- **insula (the source/ports tool)** — the compile-from-source, jail-aware path
+  (the Homebrew/ports counterpart to Opifex), to be (re)built Atrium-native.
+- **Consent diff** — re-grown on `portcullis_toml::Capabilities` when the
+  install-time consent UX lands (the retired `insula-manifest::diff` is the
+  reference shape).
+
+## 8. The `.insula` archive format (INSB v1)
+
+The single-file transport form (deterministic, self-describing). Preserved here
+from the retired `insula-bundle/archive.rs` so the Atrium-native packer can
+reimplement it verbatim:
+
+```text
+  bytes [0..4)   magic "INSB"
+  byte  [4]      version = 1
+  bytes [5..8)   reserved (zero)
+  bytes [8..16)  n_entries (u64 LE)
+  per entry:
+    [..2)  path_len (u16 LE)
+    [..L)  path  (UTF-8, forward-slash, bundle-relative)
+    [..4)  mode  (u32 LE, low 9 bits)
+    [..8)  size  (u64 LE)
+    [..N)  data
+```
+
+Properties: **deterministic** (entries sorted lexicographically by path; no
+mtimes/uids — two packs of the same tree are byte-identical), **self-describing**
+(the 4-byte magic suffices; no extension heuristics), single-pass pack/unpack (no
+central directory). Extension: `.insula`. Out of scope for v1: per-entry
+compression (zstd planned) and per-entry checksums (the bundle's detached publisher
+signature + the Tessera CAS root hash cover integrity).

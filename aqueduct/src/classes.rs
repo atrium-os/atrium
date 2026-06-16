@@ -65,7 +65,7 @@ pub const CLASS_STOA:      u8 = 8;
 pub const CLASS_GPU:       u8 = 9;
 
 /// Insula log forwarding — libatrium clients (every Insula app)
-/// send `atrium_log()` calls over this class to the insula-logd
+/// send `atrium_log()` calls over this class to the platform log
 /// daemon. Op 0 carries `[level_u8 | utf8 message bytes]`.
 /// Future ops will carry structured-field log records once an
 /// observability schema is settled.

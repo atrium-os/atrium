@@ -1,7 +1,21 @@
 # Insula — third-party application platform
 
 Status: design sketch (pre-D-phase). Not yet on the roadmap.
-Last updated: 2026-05-21.
+Last updated: 2026-06-16.
+
+> **macOS host-adapter experiment RETIRED (2026-06-16).** The macOS Insula host
+> (`insula-host-macos`, `insula-cli`, `insula-manifest`, `insula-bundle`, plus the
+> `atrium-mon`/`insula-hello`/`atrium-fetch`/`atrium-netd-macos` demos) was bootstrap
+> scaffolding — a way to start Insula app development *before* Atrium's own subsystems
+> existed. Now that Pergola, the graphics stack (Fresco), Portcullis jails, per-app
+> uids, and Opifex are real and apps run jailed end-to-end, that scaffolding has been
+> removed. The **Atrium-native (FreeBSD) path is the path**: native Pergola apps,
+> jailed via Portcullis, installed by Opifex, in `atrium.toml`/`.insula` bundles (see
+> [`atrium-bundle-format.md`](atrium-bundle-format.md)). The multi-OS "host adapter"
+> abstraction described below (macOS/Linux/Windows App Sandbox / Landlock / AppContainer)
+> is now a *possible future*, not a current implementation — read the per-OS adapter
+> passages as design intent, not shipped code. `manifest.toml` is gone; the sole
+> manifest is `atrium.toml` (`portcullis-toml`).
 
 **Insula** is Atrium's app-platform layer: the contract,
 manifest conventions, and supporting services that third-
