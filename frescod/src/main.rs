@@ -53,6 +53,13 @@ const FRAME_NS:   u64 = 1_000_000_000 / TARGET_FPS;
 fn main() -> std::io::Result<()> {
     let _ = env_logger::try_init();
 
+    // Headless compositor mode: same multi-window pipeline, but read the composited
+    // frame back to a PNG instead of scanning out — captures the assembled (jailed)
+    // desktop with no GPU/display device. Used for the end-to-end jailed-desktop run.
+    if let Ok(png) = std::env::var("FRESCOD_HEADLESS_PNG") {
+        return run_headless(&png);
+    }
+
     /* ── Display + scanout BO ─────────────────────────────────────── */
     let gpu = Gpu::open()?;
     let dpy = Display::open()?;
@@ -141,6 +148,53 @@ fn main() -> std::io::Result<()> {
             std::thread::sleep(next - now);
         }
         next += Duration::from_nanos(FRAME_NS);
+    }
+}
+
+/// Headless compositor: the same multi-window socket-server + compositing pipeline
+/// as the display path, but reads the composited screen back to a PNG each frame
+/// instead of scanning out. No GPU/display device needed — so the full jailed
+/// desktop (forum-wm + jailed chrome) can be composited and captured anywhere.
+fn run_headless(png: &str) -> std::io::Result<()> {
+    const W: u32 = 1280;
+    const H: u32 = 720;
+
+    let mut renderer = HeadlessRenderer::new(W, H)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other,
+            format!("HeadlessRenderer::new: {e}")))?;
+    for bp in bundle_paths()? {
+        renderer.load_bundle(&bp).map_err(io_other)?;
+        eprintln!("frescod-headless: bundle {}", bp.display());
+    }
+
+    let cas   = Arc::new(Mutex::new(CasStore::new()));
+    let scene = Arc::new(Mutex::new(SceneGraph::new()));
+    let slots = Arc::new(Mutex::new(SlotTable::new()));
+    let comp  = Arc::new(Mutex::new(Compositor::new_with_window0(scene, slots)));
+    let (ev_tx, ev_rx) = mpsc::channel();
+    comp.lock().unwrap().set_event_sink(ev_tx.clone());
+    let frontend = Arc::new(Mutex::new(EnvelopeFrontend::new(cas, comp.clone())));
+
+    let sock = std::env::var("FRESCOD_SOCK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/frescod.sock"));
+    let subs = socket_server::spawn(
+        socket_server::Shared { frontend: frontend.clone(), lane: None }, &sock)?;
+    socket_server::spawn_event_fanout(ev_rx, subs);
+    eprintln!("frescod-headless: {W}x{H} on {} → {png}.png", sock.display());
+
+    let out = format!("{png}.png");
+    loop {
+        render_one_frame(&mut renderer, &frontend, &comp, W, H).map_err(io_other)?;
+        let mut rgba = renderer.read_pixels_vec().map_err(io_other)?;
+        for px in rgba.chunks_exact_mut(4) { px.swap(0, 2); } // BGRA → RGBA
+        if let Some(img) = image::RgbaImage::from_raw(W, H, rgba) {
+            let tmp = format!("{out}.new");
+            if img.save_with_format(&tmp, image::ImageFormat::Png).is_ok() {
+                let _ = std::fs::rename(&tmp, &out);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
