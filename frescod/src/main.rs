@@ -111,9 +111,11 @@ fn main() -> std::io::Result<()> {
     let sock_path = std::env::var("FRESCOD_SOCK")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp/frescod.sock"));
+    let wm_sock = std::env::var("FRESCOD_WM_SOCK").ok().map(PathBuf::from);
     let event_subs = socket_server::spawn(
         socket_server::Shared { frontend: frontend.clone(), lane: None },
         &sock_path,
+        wm_sock.as_deref(),
     )?;
     socket_server::spawn_event_fanout(ev_rx, event_subs);
 
@@ -178,8 +180,10 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     let sock = std::env::var("FRESCOD_SOCK")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp/frescod.sock"));
+    let wm_sock = std::env::var("FRESCOD_WM_SOCK").ok().map(PathBuf::from);
     let subs = socket_server::spawn(
-        socket_server::Shared { frontend: frontend.clone(), lane: None }, &sock)?;
+        socket_server::Shared { frontend: frontend.clone(), lane: None },
+        &sock, wm_sock.as_deref())?;
     socket_server::spawn_event_fanout(ev_rx, subs);
     eprintln!("frescod-headless: {W}x{H} on {} → {png}.png", sock.display());
 

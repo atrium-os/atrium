@@ -43,6 +43,7 @@ fn main() -> std::io::Result<()> {
     let _subs = socket_server::spawn(
         socket_server::Shared { frontend, lane: None },
         &sock,
+        None,
     )?;
 
     eprintln!(

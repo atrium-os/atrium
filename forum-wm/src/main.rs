@@ -56,8 +56,11 @@ fn screen() -> Screen {
 }
 
 fn main() -> io::Result<()> {
-    let path = fresco_client::default_socket_path();
-    eprintln!("forum-wm: connecting to frescod at {}", path.display());
+    // The WM drives its cross-app ops over the DEDICATED window-management socket
+    // (reachability = the window-management grant; frescod reads no policy), not
+    // the shared client socket. See fresco_client::default_wm_socket_path.
+    let path = fresco_client::default_wm_socket_path();
+    eprintln!("forum-wm: connecting to frescod window-management socket at {}", path.display());
     let conn = Connection::connect(&path)?;
     // frescod now replies to a refused WM op with an IS_ERROR response, so a
     // denied enumerate surfaces a PermissionDenied immediately. This read timeout

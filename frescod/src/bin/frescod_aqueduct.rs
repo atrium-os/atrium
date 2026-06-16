@@ -318,6 +318,7 @@ fn main() -> std::io::Result<()> {
             lane: lane.clone(),
         },
         &sock_path,
+        None,
     )?;
     socket_server::spawn_event_fanout(ev_rx, event_subs);
 

@@ -47,6 +47,7 @@ use crate::laminar::LaneBroker;
 /// failed sends on each pass.
 pub type EventSubs = Arc<Mutex<Vec<Sender<Outbound>>>>;
 
+#[derive(Clone)]
 pub struct Shared {
     pub frontend: Arc<Mutex<EnvelopeFrontend>>,
     /// Deadline broker (Laminar phase J); None when /dev/laminar is
@@ -54,22 +55,44 @@ pub struct Shared {
     pub lane: Option<Arc<LaneBroker>>,
 }
 
-pub fn spawn(shared: Shared, sock_path: &Path) -> io::Result<EventSubs> {
+/// Bring up frescod's connection acceptor(s).
+///
+/// `sock_path` is the normal client socket: connections there draw their OWN
+/// surfaces (graphics) and are NEVER granted window-management.
+///
+/// `wm_sock_path`, if given, is the DEDICATED window-management socket. The TCB
+/// mounts it into a jail only when that app holds `window-management`
+/// (apply_window_management), so REACHING it IS the capability — every connection
+/// there is granted window-management by reachability, with no registry/policy
+/// read (the forum-control / object-capability model, applied to the WM). Keeping
+/// the cross-app ops on a separate socket is what makes reachability == grant:
+/// the shared client socket can't distinguish a WM from an ordinary app, this one
+/// doesn't have to.
+pub fn spawn(shared: Shared, sock_path: &Path, wm_sock_path: Option<&Path>)
+    -> io::Result<EventSubs>
+{
+    let event_subs: EventSubs = Arc::new(Mutex::new(Vec::new()));
+    start_listener(sock_path, shared.clone(), event_subs.clone(), false)?;
+    if let Some(wm) = wm_sock_path {
+        start_listener(wm, shared, event_subs.clone(), true)?;
+    }
+    Ok(event_subs)
+}
+
+fn start_listener(sock_path: &Path, shared: Shared, event_subs: EventSubs, wm_grant: bool)
+    -> io::Result<()>
+{
     if sock_path.exists() {
         let _ = std::fs::remove_file(sock_path);
     }
     let listener = UnixListener::bind(sock_path)?;
-    eprintln!("frescod: listening on {}", sock_path.display());
-
-    let event_subs: EventSubs = Arc::new(Mutex::new(Vec::new()));
-    let subs_for_loop = event_subs.clone();
+    eprintln!("frescod: listening on {} (window-management={wm_grant})", sock_path.display());
 
     std::thread::Builder::new()
-        .name("frescod-accept".into())
-        .spawn(move || accept_loop(listener, shared, subs_for_loop))
+        .name(if wm_grant { "frescod-accept-wm".into() } else { "frescod-accept".into() })
+        .spawn(move || accept_loop(listener, shared, event_subs, wm_grant))
         .map(|_| ())?;
-
-    Ok(event_subs)
+    Ok(())
 }
 
 /// Spawn the event fan-out thread. Receives `DisplayEvent` from the
@@ -124,7 +147,7 @@ fn error_reply(op: u16, e: &DispatchError) -> Outbound {
     Outbound { op, flags: flag::IS_RESPONSE | flag::IS_ERROR, payload }
 }
 
-fn accept_loop(listener: UnixListener, shared: Shared, event_subs: EventSubs) {
+fn accept_loop(listener: UnixListener, shared: Shared, event_subs: EventSubs, wm_grant: bool) {
     static NEXT_CLIENT_ID: AtomicU8 = AtomicU8::new(1);
     for conn in listener.incoming() {
         match conn {
@@ -160,7 +183,7 @@ fn accept_loop(listener: UnixListener, shared: Shared, event_subs: EventSubs) {
                     .spawn(move || {
                         if let Err(e) = reader_loop(
                             stream, frontend.clone(), client_id, tx,
-                            lane.clone(),
+                            lane.clone(), wm_grant,
                         ) {
                             eprintln!("frescod: reader {client_id}: {e}");
                         }
@@ -186,28 +209,20 @@ fn reader_loop(
     client_id: u8,
     out: Sender<Outbound>,
     lane: Option<Arc<LaneBroker>>,
+    wm_grant: bool,
 ) -> io::Result<()> {
     let peer_pid = peer_cred_pid(&stream);
 
-    /* Capability admission: the cross-app window-management ops are
-     * default-deny. Two verified signals can grant the cap:
-     *   1. Production — getpeereid → app-registry → the app id the TCB
-     *      registered for this uid → the owning user's policy grant for
-     *      `window-management` (the Choragus/audio_monitor pattern).
-     *   2. Dev/test override — FORUM_WM_UID matches the peer uid (used by
-     *      the in-VM harness before a populated registry/policy exists).
-     * Either way the uid is kernel-attested; the registry + policy are
-     * TCB-written. No match → not granted (closed by default). */
-    let grant_reason = registry_grants_window_management(&stream)
-        .map(|app| format!("app {app} (registry+policy)"))
-        .or_else(|| match (peer_cred_uid(&stream), std::env::var("FORUM_WM_UID")) {
-            (Some(uid), Ok(want)) if want.trim().parse::<u32>().ok() == Some(uid) =>
-                Some(format!("uid {uid} (FORUM_WM_UID override)")),
-            _ => None,
-        });
-    if let Some(reason) = grant_reason {
+    /* Capability admission for the cross-app window-management ops = REACHABILITY.
+     * The connection arrived on the DEDICATED window-management socket, which the
+     * TCB mounts into a jail only when that app holds `window-management`
+     * (apply_window_management). So reaching this socket IS the grant — possession
+     * of the channel, not a registry/policy lookup (the object-capability model;
+     * same as forum-control over forum-ctl). The normal client socket
+     * (wm_grant=false) never grants it. See docs/spec/portcullis.md §9.0. */
+    if wm_grant {
         frontend.lock().unwrap().grant_window_management(client_id);
-        log::info!("frescod: granted window-management to client {client_id} ({reason})");
+        log::info!("frescod: granted window-management to client {client_id} (wm socket — reachability)");
     }
 
     let mut conn = AqConn::wrap(stream)?;
@@ -362,33 +377,8 @@ fn cleanup_client(frontend: &Arc<Mutex<EnvelopeFrontend>>, client_id: u8) {
 
 /// Peer pid of a UDS connection via LOCAL_PEERCRED (struct xucred).
 /// Defined by hand: libc's xucred lags the cr_pid union member.
-/// Production capability admission: resolve the connecting peer to the app id the
-/// TCB registered for its uid (getpeereid → app-registry), then check whether the
-/// owning user granted that app the `window-management` capability. Returns the app
-/// id when granted (for logging), `None` otherwise — including when the registry or
-/// policy files don't exist yet (a fresh system), so it fails closed.
-fn registry_grants_window_management(stream: &UnixStream) -> Option<String> {
-    use std::os::fd::AsRawFd;
-    let registry = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY).ok()?;
-    let peer = portcullis_peer::resolve(stream.as_raw_fd(), &registry).ok()?;
-    let app_id = peer.app_id?;
-    let policy = portcullis_policy::Policy::load(
-        &portcullis_policy::Policy::user_path(&peer.user)).ok()?;
-    let granted = policy.grants.get(&app_id)
-        .and_then(|g| g.capabilities.window_management)
-        .unwrap_or(false);
-    granted.then_some(app_id)
-}
-
 fn peer_cred_pid(stream: &UnixStream) -> Option<i32> {
     peer_xucred(stream).map(|(pid, _uid)| pid)
-}
-
-/// The peer's verified uid over the UDS — the kernel-attested identity
-/// (`LOCAL_PEERCRED`). Used to decide whether the connecting client is the
-/// privileged shell that may hold `window-management`.
-fn peer_cred_uid(stream: &UnixStream) -> Option<u32> {
-    peer_xucred(stream).map(|(_pid, uid)| uid)
 }
 
 fn peer_xucred(stream: &UnixStream) -> Option<(i32, u32)> {

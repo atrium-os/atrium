@@ -53,10 +53,9 @@ aqueduct-gpu-host   = { path = "../aqueduct-gpu-host" }
 fresco-aqueduct-bridge = { path = "../fresco-aqueduct-bridge" }
 fresco-text         = { path = "../fresco-text" }
 atrium-trace        = { path = "../atrium-trace/rust" }
-# Capability admission: resolve a peer's app id (getpeereid → app-registry) and
-# check the owning user's granted window-management capability.
-portcullis-peer     = { path = "../portcullis/portcullis-peer" }
-portcullis-policy   = { path = "../portcullis/portcullis-policy" }
+# Note: frescod no longer depends on portcullis-peer/policy. window-management is
+# granted by REACHABILITY of the dedicated wm socket (the TCB mounts it only for
+# cap holders), so frescod reads no registry/policy. See socket_server::spawn.
 image               = { version = "0.25", default-features = false, features = ["png"] }
 libc       = "0.2"
 env_logger = "0.11"

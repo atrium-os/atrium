@@ -133,6 +133,29 @@ pub fn default_socket_path() -> std::path::PathBuf {
     std::path::PathBuf::from(DEV_FRESCO_SOCKET)
 }
 
+/// The DEDICATED window-management socket inside a jail. frescod grants
+/// window-management to any connection here by REACHABILITY — Portcullis mounts
+/// `/atrium/sockets/fresco-wm/` into a jail only when it holds `window-management`
+/// (apply_window_management). The session shell (forum-wm) drives its cross-app
+/// ops (enumerate/declare-layout/set-rendering) over this socket, NOT the shared
+/// client socket. Ordinary `graphics` apps never get this mount, so they can't
+/// reach it — reachability IS the capability. See docs/spec/portcullis.md §9.0.
+pub const JAILED_WM_SOCKET: &str = "/atrium/sockets/fresco-wm/fresco-wm.sock";
+/// Dev fallback for the window-management socket when running bare.
+pub const DEV_WM_SOCKET: &str = "/tmp/frescod-wm.sock";
+
+/// Resolve the window-management socket: `$FRESCO_WM_SOCKET` → the in-jail path
+/// (if its mount is present) → the dev fallback.
+pub fn default_wm_socket_path() -> std::path::PathBuf {
+    if let Ok(s) = std::env::var("FRESCO_WM_SOCKET") {
+        return std::path::PathBuf::from(s);
+    }
+    if std::path::Path::new("/atrium/sockets/fresco-wm").is_dir() {
+        return std::path::PathBuf::from(JAILED_WM_SOCKET);
+    }
+    std::path::PathBuf::from(DEV_WM_SOCKET)
+}
+
 impl Connection {
     /// Open a fresh UDS connection to `path` (typically
     /// `/tmp/frescod.sock` or whatever `FRESCOD_SOCK` points at).
