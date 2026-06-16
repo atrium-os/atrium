@@ -59,6 +59,17 @@ stack to its first-principles shape:
 - API: a frozen C-ABI platform library + Aqueduct services.
 - UI: native toolkit (Pergola), not a DOM.
 
+**Privilege invariant: an Insula app NEVER runs as root.** Every app — native
+or otherwise, "system-blessed" chrome (Forum's WM included) or third-party —
+executes inside its jail under a *dedicated, non-root per-app uid*. Root is
+reserved for the trusted computing base alone (`jaild` and the privileged launch
+step, which exist precisely to create the jail and drop privilege before
+`execve`; see `portcullis.md` §9.0 and `jaild-policy.md`). The human user
+*authorizes* a launch through their policy; the app does not run *as* the human,
+and it certainly never runs as uid 0. An app observing itself running as root is
+a launcher bug, never the intended contract — the kernel/MMU/jail isolation an
+Insula app relies on assumes the code inside has no host privilege to begin with.
+
 WASM does not appear in this design. The browser needed it
 because the sandbox was in-process; Atrium does not have that
 problem. WASM may still be useful as a *distribution format*

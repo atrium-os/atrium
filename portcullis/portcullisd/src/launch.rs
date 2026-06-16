@@ -86,10 +86,14 @@ pub fn launch_with_stdio(
     let overlay_dir = PathBuf::from(OVERLAYS_DIR).join(app_id);
     let jail_path   = PathBuf::from(JAILS_DIR).join(app_id);
 
-    /* The connecting user becomes the in-jail uid via exec.jail_user
-     * (set by portcullis-jail::build from opts.user_name). $HOME is
-     * the user's actual home on the host, used by ~/-prefixed
-     * filesystem capabilities. */
+    /* PRIVILEGE INVARIANT (portcullis.md §9.0): no app runs as root — apps run
+     * under a dedicated, non-root per-app uid; root is the TCB's alone.
+     * DEVIATION (bring-up): we currently set exec.jail_user to the *connecting
+     * user* (opts.user_name, via portcullis-jail::build), so a root-driven
+     * launch runs the app as root — wrong. TODO: allocate a per-app uid
+     * (portcullis_peer, APP_UID_BASE) + register uid→(user,app_id) + route exec
+     * through jaild's uid-range validation. $HOME below is the user's actual
+     * home on the host, used by ~/-prefixed filesystem capabilities. */
     let user_home = match std::ffi::CString::new(user).ok().and_then(|cuser| {
         let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
         let mut buf = vec![0u8 as libc::c_char; 4096];

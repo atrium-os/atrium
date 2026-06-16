@@ -8,8 +8,13 @@
 //! `/var/db/atrium/<user>/policy.toml`. Per-user policy state is
 //! cached lazily in-process.
 //!
-//! Launched apps run as the connecting user inside their per-app
-//! jail (via jail.conf `exec.jail_user`).
+//! PRIVILEGE INVARIANT (see portcullis.md §9.0, insula.md): no app runs as
+//! root — every app runs under a dedicated, non-root per-app uid inside its
+//! jail. Root is the TCB's alone (jaild + the privileged launch step).
+//! KNOWN DEVIATION (bring-up): this path currently sets `exec.jail_user` to the
+//! *connecting user*, so a root-driven launch wrongly runs the app as root. The
+//! fix is to allocate a per-app uid (portcullis_peer) and route exec through
+//! jaild's uid-range validation. Until then the privilege boundary is NOT proven.
 //!
 //! Concurrency: one thread per accepted connection. Per-tenant
 //! policy state lives behind `Arc<Mutex<Tenants>>`; lock is held

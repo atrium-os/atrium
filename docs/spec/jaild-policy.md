@@ -41,6 +41,13 @@ allowed_prefixes = [...]              # prefix match (e.g. "ATRIUM_")
 min_user_uid   = 1000
 max_user_uid   = 65000
 allowed_system_uids = [...]           # specific non-user uids (e.g. _frescod)
+# INVARIANT: no app runs as root. An exec's uid must be within
+# min_user_uid..max_user_uid (per-app / per-user uids) OR an explicitly listed
+# allowed_system_uid (a blessed system service). uid 0 (root) is NEVER a valid
+# exec target — jaild refuses it even if a caller requests it, and 0 must never
+# appear in allowed_system_uids. Root is the TCB's alone; jaild holds it only to
+# create the jail and setuid down to the validated non-root uid before execve.
+# (See portcullis.md §9.0, insula.md privilege invariant.)
 
 [gid]
 allowed_system_gids = [...]

@@ -1056,6 +1056,44 @@ pre-grants for headless deployments.
 
 ## 9. Security model
 
+### 9.0 Privilege invariant — only the TCB runs as root
+
+**No application ever runs as root. Root (uid 0) is reserved for the TCB:
+`jaild` (and its policy file) at TCB rank 1, and the privileged side of the
+launch path. Everything else — every system service AND every user app — runs
+unprivileged inside a jail under a *dedicated, non-root uid*.**
+
+Concretely:
+- **The TCB** (`jaild`, the root of trust; the mount/`jail -c`/`setuid` step) is
+  the *only* code that holds root, and it holds it precisely so it can drop it:
+  jaild creates the jail and `setuid`s the target to a non-root uid before
+  `execve`. This is the whole point of the OpenSSH/qmail-style privsep (§0.5).
+- **Every app** runs under a per-app uid in the user range (jaild policy
+  `[uid].min_user_uid..max_user_uid`, 1000–65000; see `jaild-policy.md`). jaild
+  *refuses* an app launch with `uid = root` — root is permitted only for the
+  specific blessed system uids in `[uid].allowed_system_uids`, never for a
+  third-party app. A per-app uid (distinct from the human user and from every
+  other app) is what gives §9.1's app-to-app isolation its identity dimension:
+  it bounds jail-escape blast radius, owns the app's shared-resource access, and
+  is what services peer-cred (`getpeereid`) back to an app id. See the app-
+  isolation model (jail + dedicated uid as complementary layers).
+- **The human user authorizes; the app does not run *as* the human.** The
+  connecting user's policy (`/var/db/atrium/<user>/policy.toml`) decides *whether*
+  to launch and with which caps; the launched process then runs as its own
+  per-app uid, not the human's uid and never root.
+
+> ⚠️ **Known deviation (bring-up, 2026-06-16).** The current `portcullisd`
+> launch path (`launch.rs`, the legacy `jail(8)` subprocess route — NOT yet the
+> jaild route) sets the jail's `exec.jail_user` to the *connecting user* rather
+> than allocating a per-app uid. When the launch is driven by a root caller (e.g.
+> the dev CLI run as root, or a system-initiated launch), the app therefore
+> inherits **root** inside the jail — a direct violation of this invariant. This
+> is a bring-up shortcut, not the design. The fix: allocate a per-app uid
+> (`portcullis_peer`, `APP_UID_BASE` = 50000), ensure a host passwd entry for
+> `exec.jail_user`, register `uid → (user, app_id)`, and route the exec through
+> jaild so its uid-range validation is the enforcement point. Until then, do not
+> treat the jailed-desktop bring-up as evidence that the privilege boundary holds.
+
 ### 9.1 In scope
 
 - **App-to-app isolation.** A compromised app cannot read another
