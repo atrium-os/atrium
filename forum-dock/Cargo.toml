@@ -17,3 +17,7 @@ path = "src/main.rs"
 [dependencies]
 portcullis-toml = { path = "../portcullis/portcullis-toml" }
 portcullis-ipc = { path = "../portcullis/portcullis-ipc" }
+# The dock draws itself via Pergola → frescod (the catalog is the data; this is the UI).
+pergola = { path = "../pergola" }
+fresco-client = { path = "../fresco-client" }
+fresco-protocol = { path = "../fresco-protocol" }
