@@ -15,6 +15,7 @@ members = [
     "portcullis-peer",
     "atrium-volumes",
     "ostiarius",
+    "opifex",
 ]
 
 [workspace.package]

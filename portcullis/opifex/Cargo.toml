@@ -1,0 +1,18 @@
+[package]
+name    = "opifex"
+version = "0.1.0"
+edition = "2021"
+
+# opifex — Atrium's BINARY app installer for FreeBSD (the pkg-style counterpart to
+# insula, which is the ports/Homebrew-style compile-from-source path). It places a
+# pre-built, signed Insula bundle into the Portcullis app tree the jail launcher
+# (portcullisd) reads. Jail-aware: it resolves the entry binary's shared-library
+# closure into the app tree, because a Portcullis jail's rootfs IS only that tree.
+
+[[bin]]
+name = "opifex"
+path = "src/main.rs"
+
+[dependencies]
+portcullis-toml = { path = "../portcullis-toml" }
+portcullis-sig  = { path = "../portcullis-sig" }
