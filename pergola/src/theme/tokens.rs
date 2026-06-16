@@ -31,11 +31,10 @@ pub mod space {
 // ────────────────────────────────────────────────────────────────────────────
 
 pub mod font {
-    /// Family name passed to `font_open`. The visual-language doc
-    /// commits to IBM Plex Sans/Mono; the system shell currently
-    /// ships with DejaVu via fresco-server's "system-*" aliases.
-    /// Bundling Plex is a follow-up — the *value* changes here when
-    /// fonts are bundled, so widgets always reference the token.
+    /// Family name passed to `font_open`. The visual-language doc commits to IBM
+    /// Plex Sans/Mono, and the shell now ships them: fresco-server's "system-*"
+    /// aliases resolve to IBM Plex (DejaVu kept only as a fallback). Widgets always
+    /// reference the token, so the face is centralized here.
     pub const SANS: &str = "system-sans";
     pub const MONO: &str = "system-mono";
 }
