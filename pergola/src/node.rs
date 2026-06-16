@@ -65,6 +65,15 @@ pub enum Node {
         axis: Axis,
         spacing: f32,
     },
+    /// A single stroked line segment (a thick rotated quad at the GPU layer).
+    /// Absolutely positioned — layout doesn't touch it. Vector icons are built from
+    /// many of these (see `icon::parse_icon`).
+    Path {
+        p0: (f32, f32),
+        p1: (f32, f32),
+        width: f32,
+        color: Color,
+    },
 }
 
 impl Node {
@@ -74,12 +83,17 @@ impl Node {
     pub fn rect(&self) -> Rect {
         match self {
             Node::Rect { rect, .. } | Node::Text { rect, .. } | Node::Stack { rect, .. } => *rect,
+            Node::Path { p0, p1, .. } => {
+                let (x, y) = (p0.0.min(p1.0), p0.1.min(p1.1));
+                Rect::new(x, y, (p0.0 - p1.0).abs(), (p0.1 - p1.1).abs())
+            }
         }
     }
 
     pub fn set_rect(&mut self, r: Rect) {
         match self {
             Node::Rect { rect, .. } | Node::Text { rect, .. } | Node::Stack { rect, .. } => *rect = r,
+            Node::Path { .. } => {} // absolutely positioned — layout doesn't move it
         }
     }
 
@@ -91,6 +105,7 @@ impl Node {
         match self {
             Node::Rect { rect, .. } | Node::Stack { rect, .. } => rect.size,
             Node::Text { content, style, .. } => Self::measure_text(content, style),
+            Node::Path { .. } => self.rect().size,
         }
     }
 

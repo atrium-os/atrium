@@ -25,9 +25,9 @@ use portcullis_ipc::{
 use fresco_client::Connection;
 use fresco_protocol::WindowHints;
 use pergola::geom::Rect;
-use pergola::theme::{font, palette, radius, type_size, Semantic, Weight};
+use pergola::theme::{palette, radius, Semantic};
 use pergola::view::{Ctx, View};
-use pergola::{commit, App, FrescoSurface, Node, Surface, TextStyle};
+use pergola::{commit, App, FrescoSurface, Node, Surface};
 
 fn apps_dir() -> PathBuf {
     std::env::var("FORUM_APPS_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(APPS_DIR))
@@ -39,11 +39,50 @@ const TILE: f32 = 60.0;
 const GAP: f32 = 16.0;
 const PAD: f32 = 16.0;
 
+// Lucide vector icons (ISC), embedded + parsed once into polylines. Drawn as stroked
+// segments — resolution-independent, like everything in the vector scene graph.
+const SVG_EDITOR: &str = include_str!("../../assets/icons/lucide/editor.svg");
+const SVG_TERMINAL: &str = include_str!("../../assets/icons/lucide/terminal.svg");
+const SVG_FILES: &str = include_str!("../../assets/icons/lucide/files.svg");
+const SVG_SETTINGS: &str = include_str!("../../assets/icons/lucide/settings.svg");
+const SVG_BROWSER: &str = include_str!("../../assets/icons/lucide/browser.svg");
+
+struct Icons {
+    editor: Vec<pergola::icon::Polyline>,
+    terminal: Vec<pergola::icon::Polyline>,
+    files: Vec<pergola::icon::Polyline>,
+    settings: Vec<pergola::icon::Polyline>,
+    browser: Vec<pergola::icon::Polyline>,
+}
+
+impl Icons {
+    fn load() -> Self {
+        use pergola::icon::parse_icon;
+        Icons {
+            editor: parse_icon(SVG_EDITOR),
+            terminal: parse_icon(SVG_TERMINAL),
+            files: parse_icon(SVG_FILES),
+            settings: parse_icon(SVG_SETTINGS),
+            browser: parse_icon(SVG_BROWSER),
+        }
+    }
+    /// Pick an icon by keyword in the app id/name (until manifests declare an icon).
+    fn for_app(&self, app: &AppEntry) -> &[pergola::icon::Polyline] {
+        let s = format!("{} {}", app.id, app.name).to_lowercase();
+        if s.contains("term") { &self.terminal }
+        else if s.contains("file") || s.contains("folder") { &self.files }
+        else if s.contains("setting") || s.contains("config") || s.contains("pref") { &self.settings }
+        else if s.contains("brows") || s.contains("web") || s.contains("net") { &self.browser }
+        else { &self.editor }
+    }
+}
+
 /// The dock: the signature teal desktop with a rounded dock panel of app tiles
-/// centred at the bottom. Each tile is a rounded square with the app's initial — an
-/// icon placeholder until real icon assets ship. All from theme tokens.
+/// centred at the bottom. Each tile carries the app's Lucide vector icon. All from
+/// theme tokens.
 struct DockView {
     apps: Vec<AppEntry>,
+    icons: Icons,
 }
 
 impl View for DockView {
@@ -80,23 +119,22 @@ impl View for DockView {
                 fill,
                 radius: radius::MD,
             });
-            // The app's initial, centred-ish in the tile.
-            let initial = app.name.chars().next().unwrap_or('?').to_uppercase().to_string();
-            let label_color = if i == 0 {
+            // The app's vector icon, centred in the tile. White on the accent tile,
+            // primary-ink on the neutral tiles.
+            let icon_color = if i == 0 {
                 pergola::color::Color::rgba(1.0, 1.0, 1.0, 1.0)
             } else {
                 t.text_primary()
             };
-            ctx.add(Node::Text {
-                rect: Rect::new(tx + TILE * 0.5 - 8.0, ty + TILE * 0.5 - 14.0, 0.0, 0.0),
-                content: initial,
-                style: TextStyle {
-                    family: font::SANS.into(),
-                    size: type_size::XL,
-                    weight: Weight::Semibold,
-                    color: label_color,
-                },
-            });
+            let icon_size = 30.0;
+            let inset = (TILE - icon_size) * 0.5;
+            pergola::icon::draw_icon(
+                ctx,
+                self.icons.for_app(app),
+                tx + inset, ty + inset, icon_size,
+                2.0,
+                icon_color,
+            );
         }
 
         ctx.pop();
@@ -125,7 +163,7 @@ fn render_dock() -> io::Result<()> {
     let win = conn.window_create(SCREEN_W as u32, SCREEN_H as u32, "forum-dock", WindowHints::default())?;
     let mut surface = FrescoSurface::new(conn, win);
 
-    let mut app = App::new(DockView { apps }).with_theme(mode);
+    let mut app = App::new(DockView { apps, icons: Icons::load() }).with_theme(mode);
     let deltas = app.tick();
     eprintln!("forum-dock: drawing the dock ({} node deltas)", deltas.len());
     commit(&mut surface, &deltas)?;

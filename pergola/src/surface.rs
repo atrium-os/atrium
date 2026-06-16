@@ -93,6 +93,10 @@ impl Surface for LogSurface {
                 "  set  id={:>3}  Text ({:>4.0},{:>4.0} {:>4.0}×{:>4.0}) {:?}px {:?}  {:?}  [glyph-run TODO]",
                 id.0, rect.x(), rect.y(), rect.w(), rect.h(), style.size, style.weight, content,
             ),
+            Node::Path { p0, p1, width, .. } => println!(
+                "  set  id={:>3}  Path ({:>4.1},{:>4.1})→({:>4.1},{:>4.1}) w={:.1}",
+                id.0, p0.0, p0.1, p1.0, p1.1, width,
+            ),
             Node::Stack { .. } => unreachable!("commit() filters Stack"),
         }
         Ok(())
@@ -189,6 +193,20 @@ impl Surface for FrescoSurface {
                     content.clone(),
                     style.weight as u16,
                 )
+            }
+            Node::Path { p0, p1, width, color } => {
+                // A stroked segment → the rotated-quad path op (cx,cy,length,angle).
+                let dx = p1.0 - p0.0;
+                let dy = p1.1 - p0.1;
+                let params = fresco_protocol::PathParams {
+                    cx: (p0.0 + p1.0) * 0.5,
+                    cy: (p0.1 + p1.1) * 0.5,
+                    length: (dx * dx + dy * dy).sqrt(),
+                    width: *width,
+                    angle: dy.atan2(dx),
+                    r: color.r, g: color.g, b: color.b, a: color.a,
+                };
+                self.conn.scene_node_path(id.0, params)
             }
             Node::Stack { .. } => Ok(()),  // pure layout, no wire op
         }

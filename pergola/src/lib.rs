@@ -26,6 +26,7 @@ pub mod app;
 pub mod color;
 pub mod event;
 pub mod geom;
+pub mod icon;
 pub mod input;
 pub mod interaction;
 pub mod layout;
