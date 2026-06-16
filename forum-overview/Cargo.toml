@@ -12,3 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 forum-ctl = { path = "../forum-ctl" }
+# The overview draws itself (cards + vector icons) via Pergola → frescod.
+pergola = { path = "../pergola" }
+fresco-client = { path = "../fresco-client" }
+fresco-protocol = { path = "../fresco-protocol" }
