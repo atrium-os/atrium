@@ -250,6 +250,8 @@ fn translate_rect(p: &RectParams, ox: f32, oy: f32) -> SceneNode {
         position: [p.x + ox, p.y + oy],
         size:     [p.w, p.h],
         color:    [p.r, p.g, p.b, p.a],
+        radius:   p.radius,
+        _pad:     [0.0; 3],
     }
 }
 
