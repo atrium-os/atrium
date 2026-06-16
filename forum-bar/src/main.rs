@@ -127,9 +127,7 @@ fn main() -> std::io::Result<()> {
         _ => Semantic::LIGHT,
     };
     let (focus_app, windows) = status();
-    let sock = std::env::var("FRESCO_SOCKET").unwrap_or_else(|_| "/tmp/frescod.sock".into());
-
-    let mut conn = Connection::connect(&sock)?;
+    let mut conn = Connection::connect_default()?;
     let win = conn.window_create(W as u32, BAR_H as u32, "forum-bar", WindowHints::default())?;
     let mut surface = FrescoSurface::new(conn, win);
 

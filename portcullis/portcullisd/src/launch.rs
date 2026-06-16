@@ -190,6 +190,8 @@ pub fn launch_with_stdio(
                     LaunchError::Failed("build",
                         format!("setup-jail build: {e}"))
                 })?;
+            ensure_mountpoints(&setup_jc)
+                .map_err(|e| { full_teardown(&jail_path, None); e })?;
             let setup_exit = run_one_jail(&setup_jc, &jail_path, /* stdio
                          inherits daemon intentionally — Phase 4.5
                          step-1 simplification. Step-2 will pipe setup
@@ -224,6 +226,10 @@ pub fn launch_with_stdio(
             full_teardown(&jail_path, None);
             LaunchError::Failed("build", e.to_string())
         })?;
+    if let Err(e) = ensure_mountpoints(&jc) {
+        full_teardown(&jail_path, None);
+        return Err(e);
+    }
     let outcome = run_one_jail(&jc, &jail_path, stdio);
 
     full_teardown(&jail_path, Some(&jc.name));
@@ -253,6 +259,32 @@ fn clone_manifest_with(
         resources:    None,
         supervision:  None,
     }
+}
+
+/// Create every capability mount's destination (the mountpoint) before jail(8)
+/// runs. jail(8) does not create mountpoints, and the read-only app tree can't
+/// carry them, so without this each `mount +=` (fresco.sock, forum-ctl.sock,
+/// clipboard.sock, a filesystem dir, …) fails and the jail never starts. We stat
+/// the source to pick the mountpoint type: a directory source → a directory
+/// mountpoint; anything else (a unix socket or file, e.g. the compositor socket)
+/// → a regular-file mountpoint. Writes land in the unionfs overlay, leaving the
+/// read-only app tree untouched. Mirrors the existing dev/ + home/ creation above.
+fn ensure_mountpoints(jc: &JailConfig) -> Result<(), LaunchError> {
+    for m in &jc.mounts {
+        if let Some(parent) = m.dst.parent() {
+            fs::create_dir_all(parent).map_err(|e| LaunchError::Failed(
+                "mount", format!("mkdir mountpoint parent {}: {e}", parent.display())))?;
+        }
+        let src_is_dir = fs::metadata(&m.src).map(|md| md.is_dir()).unwrap_or(false);
+        if src_is_dir {
+            fs::create_dir_all(&m.dst).map_err(|e| LaunchError::Failed(
+                "mount", format!("mkdir mountpoint {}: {e}", m.dst.display())))?;
+        } else if !m.dst.exists() {
+            fs::File::create(&m.dst).map_err(|e| LaunchError::Failed(
+                "mount", format!("touch mountpoint {}: {e}", m.dst.display())))?;
+        }
+    }
+    Ok(())
 }
 
 /// Run one jail-c against `jail_path`, capture exit, jail -r before

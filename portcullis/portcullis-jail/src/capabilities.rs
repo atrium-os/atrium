@@ -100,9 +100,23 @@ pub fn apply_forum_control(jc: &mut JailConfig, opts: &BuildOpts) {
     apply_socket("forum-ctl.sock", jc, opts);
 }
 
+/// Grant a service socket into the jail.
+///
+/// FreeBSD's `mount_nullfs` refuses to mount a unix-socket node directly ("must be
+/// either a file or directory"), so we cannot nullfs-mount the socket *file*.
+/// Instead each service owns a DIRECTORY under the shared sockets root — e.g.
+/// `/atrium/sockets/fresco/` holding `fresco.sock` — and we nullfs-mount that
+/// per-service directory. This stays nullfs-legal AND preserves capability
+/// granularity: an app gets only the directories for the caps it holds (a
+/// `graphics`-only app never sees `audio/` or `forum-ctl/`). The socket itself,
+/// visible through the mounted dir, is connectable from inside the jail (the
+/// standard FreeBSD way a jail reaches a host service socket). The canonical
+/// in-jail path is `/atrium/sockets/<service>/<service>.sock`
+/// (see fresco-client's `default_socket_path`).
 pub fn apply_socket(name: &str, jc: &mut JailConfig, opts: &BuildOpts) {
-    let src = opts.host_sockets.join(name);
-    let dst_in_jail = jc.root_path.join("atrium/sockets").join(name);
+    let service = name.strip_suffix(".sock").unwrap_or(name);
+    let src = opts.host_sockets.join(service);
+    let dst_in_jail = jc.root_path.join("atrium/sockets").join(service);
     jc.add_mount(&src, &dst_in_jail, "nullfs", &["rw"]);
 }
 
@@ -212,10 +226,11 @@ mod tests {
         let mut j = jc();
         apply_graphics("fresco", &mut j, &opts()).unwrap();
         assert_eq!(j.mounts.len(), 1);
+        // Per-service DIRECTORY mount (nullfs can't mount the socket node itself).
         assert_eq!(j.mounts[0].src,
-            PathBuf::from("/atrium/sockets/fresco.sock"));
+            PathBuf::from("/atrium/sockets/fresco"));
         assert_eq!(j.mounts[0].dst,
-            PathBuf::from("/var/lib/atrium/jails/test/atrium/sockets/fresco.sock"));
+            PathBuf::from("/var/lib/atrium/jails/test/atrium/sockets/fresco"));
         assert_eq!(j.devfs_actions.len(), 1);
         assert!(j.devfs_actions[0].line.contains("fresco0"));
     }
@@ -232,9 +247,9 @@ mod tests {
         let mut j = jc();
         apply_window_management(&mut j, &opts());
         assert_eq!(j.mounts.len(), 1);
-        assert_eq!(j.mounts[0].src, PathBuf::from("/atrium/sockets/forum-ctl.sock"));
+        assert_eq!(j.mounts[0].src, PathBuf::from("/atrium/sockets/forum-ctl"));
         assert_eq!(j.mounts[0].dst,
-            PathBuf::from("/var/lib/atrium/jails/test/atrium/sockets/forum-ctl.sock"));
+            PathBuf::from("/var/lib/atrium/jails/test/atrium/sockets/forum-ctl"));
     }
 
     #[test]
@@ -242,7 +257,7 @@ mod tests {
         let mut j = jc();
         apply_forum_control(&mut j, &opts());
         assert_eq!(j.mounts.len(), 1);
-        assert_eq!(j.mounts[0].src, PathBuf::from("/atrium/sockets/forum-ctl.sock"));
+        assert_eq!(j.mounts[0].src, PathBuf::from("/atrium/sockets/forum-ctl"));
     }
 
     #[test]
@@ -250,7 +265,7 @@ mod tests {
         let mut j = jc();
         apply_socket("clipboard.sock", &mut j, &opts());
         assert_eq!(j.mounts.len(), 1);
-        assert_eq!(j.mounts[0].src, PathBuf::from("/atrium/sockets/clipboard.sock"));
+        assert_eq!(j.mounts[0].src, PathBuf::from("/atrium/sockets/clipboard"));
     }
 
     #[test]

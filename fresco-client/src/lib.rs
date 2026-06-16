@@ -113,6 +113,26 @@ pub struct Connection {
     seq_max_id:     u32,
 }
 
+/// The canonical Fresco socket location inside a Portcullis jail. Portcullis
+/// nullfs-mounts the per-service DIRECTORY `/atrium/sockets/fresco/` (the socket
+/// node itself can't be nullfs-mounted), so the socket lands at this path.
+pub const JAILED_FRESCO_SOCKET: &str = "/atrium/sockets/fresco/fresco.sock";
+/// The dev fallback when running bare (outside a jail).
+pub const DEV_FRESCO_SOCKET: &str = "/tmp/frescod.sock";
+
+/// Resolve the Fresco socket path: `$FRESCO_SOCKET` → the in-jail canonical path
+/// (if present) → the dev fallback. See [`Connection::connect_default`].
+pub fn default_socket_path() -> std::path::PathBuf {
+    if let Ok(s) = std::env::var("FRESCO_SOCKET") {
+        return std::path::PathBuf::from(s);
+    }
+    let jailed = std::path::Path::new(JAILED_FRESCO_SOCKET);
+    if jailed.exists() {
+        return jailed.to_path_buf();
+    }
+    std::path::PathBuf::from(DEV_FRESCO_SOCKET)
+}
+
 impl Connection {
     /// Open a fresh UDS connection to `path` (typically
     /// `/tmp/frescod.sock` or whatever `FRESCOD_SOCK` points at).
@@ -122,6 +142,18 @@ impl Connection {
             default_window: 0,
             seq_max_id:     0,
         })
+    }
+
+    /// Resolve the Fresco socket the way every Atrium client should, then connect.
+    ///
+    /// Order: `$FRESCO_SOCKET` if set → the canonical in-jail path
+    /// `/atrium/sockets/fresco.sock` (where Portcullis nullfs-mounts the compositor
+    /// socket for any app holding `graphics`) if it exists → the dev fallback
+    /// `/tmp/frescod.sock`. This is what lets the SAME binary run jailed (finds the
+    /// mounted socket) and bare on a dev box (finds the /tmp one) with no env wiring —
+    /// which matters because the jail runs `exec.clean`, so env can't be threaded in.
+    pub fn connect_default() -> io::Result<Self> {
+        Self::connect(default_socket_path())
     }
 
     /// Wrap an already-connected `UnixStream`. Used by tests.
