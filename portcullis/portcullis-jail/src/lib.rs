@@ -39,7 +39,8 @@ pub struct BuildOpts {
     pub host_sockets: PathBuf,
     /// User home directory (for ~/-prefixed filesystem caps).
     pub user_home:    PathBuf,
-    /// User name (for /home/<user> destination paths inside the jail).
+    /// The name the app process RUNS AS — the dedicated, non-root per-app uid's
+    /// account (not the human; see portcullis.md §9.0). Drives `exec.jail_user`.
     pub user_name:    String,
     /// devfs ruleset id assigned to this jail. Caller manages
     /// allocation across all jails on the host.

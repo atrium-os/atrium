@@ -89,6 +89,13 @@ pub fn apply_graphics(value: &str, jc: &mut JailConfig, opts: &BuildOpts) -> Res
 /// authority (mediating other apps' windows) is enforced service-side by frescod's
 /// peer-cred → app-registry → policy check, not by the jail. See docs/spec/forum.md.
 pub fn apply_window_management(jc: &mut JailConfig, opts: &BuildOpts) {
+    // forum-wm SERVES the forum-ctl socket the chrome apps drive it through; this
+    // mounts the per-service dir so it can bind there. The WM does NOT read any
+    // policy to admit chrome: a chrome app can only REACH forum-ctl because the
+    // TCB mounted this same dir into ITS jail (apply_forum_control, gated by the
+    // manifest cap + the owner's launch-time policy grant). Reaching the socket IS
+    // the forum-control capability — possession, not a lookup. See docs/spec/
+    // portcullis.md §9.0 / forum.md and forum-wm's serve_forum_ctl.
     apply_socket("forum-ctl.sock", jc, opts);
 }
 

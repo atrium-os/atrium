@@ -90,33 +90,28 @@ fn main() -> io::Result<()> {
 }
 
 /// Serve forum-ctl: accept chrome connections, carry out one intent each against
-/// Fresco. Admission (default-deny) mirrors frescod's window-management gate:
-///   1. production — getpeereid → app-registry → the owning user's `forum-control`
-///      grant (the chrome apps hold it; ordinary apps don't).
-///   2. dev override — FORUM_CTL_DEV set → accept a same-session peer (own uid),
-///      for in-VM runs before a populated registry/policy.
+/// Fresco.
+///
+/// ADMISSION = REACHABILITY (object-capability; minimal trust). We do NOT read
+/// the owner's policy or the registry to authorize a peer. `forum-control` is
+/// enforced by the TCB at the JAIL BOUNDARY: a chrome app can only see + connect
+/// to this socket because Portcullis mounted `/atrium/sockets/forum-ctl/` into
+/// its jail (`apply_forum_control`, gated by the manifest cap + the owner's
+/// launch-time policy grant). An app without the grant has no mount → cannot
+/// reach us. So a connection on this socket IS the capability — possession of the
+/// channel, not a lookup. forum-wm re-checking a policy would only duplicate (and
+/// widen the trust of) a decision the TCB already made + enforced. See docs/spec/
+/// portcullis.md §9.0. (Dev `--no-prompt` launches skip the launch-time policy
+/// gate — an explicit operator trust decision, not a hole here.)
 fn serve_forum_ctl(path: &str, wm: &mut Wm, conn: &mut ClientConn) -> io::Result<()> {
     use std::os::unix::net::UnixListener;
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
-    let me = unsafe { libc::geteuid() };
-    let dev = std::env::var("FORUM_CTL_DEV").is_ok();
     eprintln!("forum-wm: serving forum-ctl on {path}");
     for stream in listener.incoming() {
         let mut s = match stream { Ok(s) => s, Err(_) => continue };
-        let admitted = peer_has_forum_control(&s) || (dev && peer_uid(&s) == Some(me));
-        if !admitted {
-            eprintln!("forum-wm: forum-ctl: rejecting peer (no forum-control grant)");
-            // Drain the intent and answer with a clean error, so the chrome fails
-            // with a reason instead of an abrupt EOF (symmetric with frescod's
-            // IS_ERROR reply on a refused WM op).
-            let _ = forum_ctl::read_frame(&mut s);
-            if let Ok(bytes) = forum_ctl::encode(&forum_ctl::Reply::Err {
-                message: "forbidden: forum-control capability required".into(),
-            }) {
-                let _ = forum_ctl::write_frame(&mut s, &bytes);
-            }
-            continue;
+        if let Some(uid) = peer_uid(&s) {
+            eprintln!("forum-wm: forum-ctl: chrome connected (uid {uid})");
         }
         let intent = match forum_ctl::read_frame(&mut s)
             .ok()
@@ -133,26 +128,11 @@ fn serve_forum_ctl(path: &str, wm: &mut Wm, conn: &mut ClientConn) -> io::Result
     Ok(())
 }
 
-/// The connecting peer's uid (getpeereid over the UDS).
+/// The connecting peer's uid (getpeereid over the UDS) — for the log line only;
+/// admission does not depend on it (see `serve_forum_ctl`).
 fn peer_uid(s: &std::os::unix::net::UnixStream) -> Option<u32> {
     use std::os::fd::AsRawFd;
     let (mut uid, mut gid) = (0u32, 0u32);
     let rc = unsafe { libc::getpeereid(s.as_raw_fd(), &mut uid, &mut gid) };
     (rc == 0).then_some(uid)
-}
-
-/// Whether the connecting chrome peer holds the `forum-control` capability:
-/// getpeereid → app-registry (the app id the TCB registered for this uid) → the
-/// owning user's policy grant. Fails closed (missing registry/policy → false).
-fn peer_has_forum_control(s: &std::os::unix::net::UnixStream) -> bool {
-    use std::os::fd::AsRawFd;
-    let Ok(registry) = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
-    else { return false };
-    let Ok(peer) = portcullis_peer::resolve(s.as_raw_fd(), &registry) else { return false };
-    let Some(app_id) = peer.app_id else { return false };
-    let Ok(policy) = portcullis_policy::Policy::load(
-        &portcullis_policy::Policy::user_path(&peer.user)) else { return false };
-    policy.grants.get(&app_id)
-        .and_then(|g| g.capabilities.forum_control)
-        .unwrap_or(false)
 }
