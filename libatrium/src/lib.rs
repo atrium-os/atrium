@@ -35,7 +35,7 @@ use std::os::raw::{c_char, c_int, c_uint};
 use std::sync::Mutex;
 
 use aqueduct::Connection;
-use aqueduct::classes::{CLASS_DISPLAY, CLASS_LOG, CLASS_NET, CLASS_NOTIFY, CLASS_TABELLARIUS, CLASS_VESTIBULUM};
+use aqueduct::classes::{CLASS_LOG, CLASS_NET, CLASS_NOTIFY, CLASS_TABELLARIUS, CLASS_VESTIBULUM};
 use aqueduct::envelope::{flag, Header};
 
 /// Lazily-initialized platform connection. None until
@@ -1105,7 +1105,7 @@ pub const ATRIUM_ERR_FRESCO_RPC: c_int = -51;
 ///
 /// Lazy: opens on first use; reset to `None` if any
 /// op fails so the next call retries.
-static FRESCO_CONN: Mutex<Option<Connection>> = Mutex::new(None);
+static FRESCO_CONN: Mutex<Option<fresco_client::Connection>> = Mutex::new(None);
 
 fn fresco_ensure_open() -> bool {
     let mut g = FRESCO_CONN.lock().unwrap();
@@ -1113,7 +1113,7 @@ fn fresco_ensure_open() -> bool {
     let Some(path) = std::env::var_os("ATRIUM_FRESCO_SOCKET") else {
         return false;
     };
-    if let Ok(c) = Connection::connect(std::path::Path::new(&path)) {
+    if let Ok(c) = fresco_client::Connection::connect(std::path::Path::new(&path)) {
         *g = Some(c);
         true
     } else {
@@ -1125,12 +1125,12 @@ fn fresco_drop() {
     *FRESCO_CONN.lock().unwrap() = None;
 }
 
-/// Run `body` with the persistent Fresco connection.
-/// Returns the body's value or the
+/// Run `body` with the persistent Fresco connection (a `fresco_client::Connection`
+/// — the one canonical scene-graph client). Returns the body's value or the
 /// "no fresco socket" sentinel.
 fn with_fresco_conn<F>(body: F) -> c_int
 where
-    F: FnOnce(&mut Connection) -> c_int,
+    F: FnOnce(&mut fresco_client::Connection) -> c_int,
 {
     if !fresco_ensure_open() {
         return ATRIUM_ERR_NO_FRESCO;
@@ -1171,43 +1171,14 @@ pub unsafe extern "C" fn atrium_window_open(
         Ok(s) => s.to_string(),
         Err(_) => return ATRIUM_ERR_INVALID_PATH,
     };
-    let payload = fresco_protocol::WindowCreatePayload {
-        width,
-        height,
-        title: title_s,
-        hints: fresco_protocol::WindowHints::default(),
-        parent_window_id: 0,
-    };
-    let bytes = match postcard::to_stdvec(&payload) {
-        Ok(b) => b,
-        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-    };
     with_fresco_conn(|conn| {
-        if conn.send_message(
-            CLASS_DISPLAY,
-            fresco_protocol::control::OP_WINDOW_CREATE,
-            flag::RESPONSE_EXPECTED,
-            &bytes,
-        ).is_err() {
-            return ATRIUM_ERR_FRESCO_RPC;
-        }
-        loop {
-            let msg = match conn.recv_message() {
-                Ok(m) => m,
-                Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-            };
-            if msg.opcode_class == CLASS_DISPLAY
-                && msg.op == fresco_protocol::control::OP_WINDOW_CREATE
-                && (msg.flags & flag::IS_RESPONSE) != 0
-            {
-                let id: u32 = match postcard::from_bytes(&msg.payload) {
-                    Ok(v) => v,
-                    Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-                };
-                return id as c_int;
-            }
-            // Other messages (async events) — drop, this
-            // op is request-response.
+        // window_create blocks for the IS_RESPONSE and sets the conn's default
+        // window to the new id (so subsequent frame ops route there).
+        match conn.window_create(
+            width, height, title_s, fresco_protocol::WindowHints::default(),
+        ) {
+            Ok(id) => id as c_int,
+            Err(_) => ATRIUM_ERR_FRESCO_RPC,
         }
     })
 }
@@ -1236,45 +1207,13 @@ pub extern "C" fn atrium_window_fill_rect(
     x: f32, y: f32, w: f32, h: f32,
     r: f32, g: f32, b: f32, a: f32,
 ) -> c_int {
-    let flags = window_id as u16;
-    let begin = match postcard::to_stdvec(&fresco_protocol::SceneFrameBeginPayload::default()) {
-        Ok(b) => b,
-        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-    };
-    let rect_bytes = match postcard::to_stdvec(&fresco_protocol::RectParams {
-        x, y, w, h, r, g, b, a, radius: 0.0,
-    }) {
-        Ok(v) => v,
-        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-    };
-    let node = match postcard::to_stdvec(&fresco_protocol::SceneNodeSetPayload {
-        node_id: 1,
-        op_id: fresco_protocol::scene_ops::ATRIUM_CORE_RECT,
-        params: rect_bytes,
-    }) {
-        Ok(v) => v,
-        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-    };
-    let end = match postcard::to_stdvec(&fresco_protocol::SceneFrameEndPayload::default()) {
-        Ok(b) => b,
-        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-    };
     with_fresco_conn(|conn| {
-        if conn.send_message(
-            CLASS_DISPLAY,
-            fresco_protocol::control::OP_SCENE_FRAME_BEGIN,
-            flags, &begin,
-        ).is_err() { return ATRIUM_ERR_FRESCO_RPC; }
-        if conn.send_message(
-            CLASS_DISPLAY,
-            fresco_protocol::control::OP_SCENE_NODE_SET,
-            flags, &node,
-        ).is_err() { return ATRIUM_ERR_FRESCO_RPC; }
-        if conn.send_message(
-            CLASS_DISPLAY,
-            fresco_protocol::control::OP_SCENE_FRAME_END,
-            flags, &end,
-        ).is_err() { return ATRIUM_ERR_FRESCO_RPC; }
+        conn.set_default_window(window_id as u16);
+        if conn.scene_frame_begin().is_err() { return ATRIUM_ERR_FRESCO_RPC; }
+        if conn.scene_node_rect(1, fresco_protocol::RectParams {
+            x, y, w, h, r, g, b, a, radius: 0.0,
+        }).is_err() { return ATRIUM_ERR_FRESCO_RPC; }
+        if conn.scene_frame_end().is_err() { return ATRIUM_ERR_FRESCO_RPC; }
         0
     })
 }
@@ -1287,17 +1226,8 @@ pub extern "C" fn atrium_window_fill_rect(
 /// server.
 #[no_mangle]
 pub extern "C" fn atrium_window_destroy(window_id: u32) -> c_int {
-    let payload = fresco_protocol::WindowDestroyPayload { window_id };
-    let bytes = match postcard::to_stdvec(&payload) {
-        Ok(b) => b,
-        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-    };
     with_fresco_conn(|conn| {
-        if conn.send_message(
-            CLASS_DISPLAY,
-            fresco_protocol::control::OP_WINDOW_DESTROY,
-            0, &bytes,
-        ).is_err() {
+        if conn.window_destroy(window_id).is_err() {
             return ATRIUM_ERR_FRESCO_RPC;
         }
         0
@@ -1338,17 +1268,9 @@ pub extern "C" fn atrium_window_frame_begin(window_id: u32) -> c_int {
     if guard.is_some() {
         return ATRIUM_ERR_FRESCO_RPC;
     }
-    let begin = match postcard::to_stdvec(&fresco_protocol::SceneFrameBeginPayload::default()) {
-        Ok(b) => b,
-        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-    };
-    let flags = window_id as u16;
     let rc = with_fresco_conn(|conn| {
-        if conn.send_message(
-            CLASS_DISPLAY,
-            fresco_protocol::control::OP_SCENE_FRAME_BEGIN,
-            flags, &begin,
-        ).is_err() {
+        conn.set_default_window(window_id as u16);
+        if conn.scene_frame_begin().is_err() {
             return ATRIUM_ERR_FRESCO_RPC;
         }
         0
@@ -1376,27 +1298,11 @@ pub extern "C" fn atrium_window_frame_rect(
         Some(w) => w,
         None => return ATRIUM_ERR_FRESCO_RPC,
     };
-    let flags = window_id as u16;
-    let rect_bytes = match postcard::to_stdvec(&fresco_protocol::RectParams {
-        x, y, w, h, r, g, b, a, radius: 0.0,
-    }) {
-        Ok(v) => v,
-        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-    };
-    let node = match postcard::to_stdvec(&fresco_protocol::SceneNodeSetPayload {
-        node_id,
-        op_id: fresco_protocol::scene_ops::ATRIUM_CORE_RECT,
-        params: rect_bytes,
-    }) {
-        Ok(v) => v,
-        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-    };
     with_fresco_conn(|conn| {
-        if conn.send_message(
-            CLASS_DISPLAY,
-            fresco_protocol::control::OP_SCENE_NODE_SET,
-            flags, &node,
-        ).is_err() {
+        conn.set_default_window(window_id as u16);
+        if conn.scene_node_rect(node_id, fresco_protocol::RectParams {
+            x, y, w, h, r, g, b, a, radius: 0.0,
+        }).is_err() {
             return ATRIUM_ERR_FRESCO_RPC;
         }
         0
@@ -1447,28 +1353,13 @@ pub unsafe extern "C" fn atrium_window_upload_texture(
         _ => return ATRIUM_ERR_INVALID_PATH,
     };
     let buf = std::slice::from_raw_parts(bytes, len);
-    let flags = window_id as u16;
     with_fresco_conn(|conn| {
+        conn.set_default_window(window_id as u16);
         let hash = match conn.upload_blob(buf) {
             Ok(h) => h,
             Err(_) => return ATRIUM_ERR_FRESCO_RPC,
         };
-        let payload = fresco_protocol::SlotSetPayload {
-            slot_id,
-            hash,
-            kind: fresco_protocol::SlotKind::Texture(
-                fresco_protocol::TextureDesc { width, height, format },
-            ),
-        };
-        let encoded = match postcard::to_stdvec(&payload) {
-            Ok(v) => v,
-            Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-        };
-        if conn.send_message(
-            CLASS_DISPLAY,
-            fresco_protocol::control::OP_SLOT_SET,
-            flags, &encoded,
-        ).is_err() {
+        if conn.slot_set_texture(slot_id, hash, width, height, format).is_err() {
             return ATRIUM_ERR_FRESCO_RPC;
         }
         0
@@ -1490,27 +1381,11 @@ pub extern "C" fn atrium_window_frame_texture(
         Some(w) => w,
         None => return ATRIUM_ERR_FRESCO_RPC,
     };
-    let flags = window_id as u16;
-    let tex_bytes = match postcard::to_stdvec(&fresco_protocol::TextureParams {
-        x, y, w, h, slot_id,
-    }) {
-        Ok(v) => v,
-        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-    };
-    let node = match postcard::to_stdvec(&fresco_protocol::SceneNodeSetPayload {
-        node_id,
-        op_id: fresco_protocol::scene_ops::ATRIUM_CORE_TEXTURE,
-        params: tex_bytes,
-    }) {
-        Ok(v) => v,
-        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-    };
     with_fresco_conn(|conn| {
-        if conn.send_message(
-            CLASS_DISPLAY,
-            fresco_protocol::control::OP_SCENE_NODE_SET,
-            flags, &node,
-        ).is_err() {
+        conn.set_default_window(window_id as u16);
+        if conn.scene_node_texture(node_id, fresco_protocol::TextureParams {
+            x, y, w, h, slot_id,
+        }).is_err() {
             return ATRIUM_ERR_FRESCO_RPC;
         }
         0
@@ -1535,27 +1410,11 @@ pub extern "C" fn atrium_window_frame_path(
         Some(w) => w,
         None => return ATRIUM_ERR_FRESCO_RPC,
     };
-    let flags = window_id as u16;
-    let path_bytes = match postcard::to_stdvec(&fresco_protocol::PathParams {
-        cx, cy, length, width, angle, r, g, b, a,
-    }) {
-        Ok(v) => v,
-        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-    };
-    let node = match postcard::to_stdvec(&fresco_protocol::SceneNodeSetPayload {
-        node_id,
-        op_id: fresco_protocol::scene_ops::ATRIUM_CORE_PATH,
-        params: path_bytes,
-    }) {
-        Ok(v) => v,
-        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-    };
     with_fresco_conn(|conn| {
-        if conn.send_message(
-            CLASS_DISPLAY,
-            fresco_protocol::control::OP_SCENE_NODE_SET,
-            flags, &node,
-        ).is_err() {
+        conn.set_default_window(window_id as u16);
+        if conn.scene_node_path(node_id, fresco_protocol::PathParams {
+            cx, cy, length, width, angle, r, g, b, a,
+        }).is_err() {
             return ATRIUM_ERR_FRESCO_RPC;
         }
         0
@@ -1633,30 +1492,14 @@ pub unsafe extern "C" fn atrium_window_frame_glyph_run(
             bearing_x: g.bearing_x, bearing_y: g.bearing_y,
         }
     }).collect();
-    let flags = window_id as u16;
-    let run_bytes = match postcard::to_stdvec(&fresco_protocol::GlyphRunParams {
-        x, y,
-        atlas_slot_id, atlas_width, atlas_height,
-        r, g, b, a,
-        glyphs: glyph_vec,
-    }) {
-        Ok(v) => v,
-        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-    };
-    let node = match postcard::to_stdvec(&fresco_protocol::SceneNodeSetPayload {
-        node_id,
-        op_id: fresco_protocol::scene_ops::ATRIUM_TEXT_GLYPH_RUN,
-        params: run_bytes,
-    }) {
-        Ok(v) => v,
-        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-    };
     with_fresco_conn(|conn| {
-        if conn.send_message(
-            CLASS_DISPLAY,
-            fresco_protocol::control::OP_SCENE_NODE_SET,
-            flags, &node,
-        ).is_err() {
+        conn.set_default_window(window_id as u16);
+        if conn.scene_node_glyph_run(node_id, fresco_protocol::GlyphRunParams {
+            x, y,
+            atlas_slot_id, atlas_width, atlas_height,
+            r, g, b, a,
+            glyphs: glyph_vec,
+        }).is_err() {
             return ATRIUM_ERR_FRESCO_RPC;
         }
         0
@@ -1675,17 +1518,9 @@ pub extern "C" fn atrium_window_frame_end() -> c_int {
         Some(w) => w,
         None => return ATRIUM_ERR_FRESCO_RPC,
     };
-    let end = match postcard::to_stdvec(&fresco_protocol::SceneFrameEndPayload::default()) {
-        Ok(b) => b,
-        Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-    };
-    let flags = window_id as u16;
     with_fresco_conn(|conn| {
-        if conn.send_message(
-            CLASS_DISPLAY,
-            fresco_protocol::control::OP_SCENE_FRAME_END,
-            flags, &end,
-        ).is_err() {
+        conn.set_default_window(window_id as u16);
+        if conn.scene_frame_end().is_err() {
             return ATRIUM_ERR_FRESCO_RPC;
         }
         0
@@ -1749,78 +1584,33 @@ pub unsafe extern "C" fn atrium_window_poll_event(
     let Some(conn) = g.as_mut() else {
         return ATRIUM_ERR_NO_FRESCO;
     };
-    if conn.set_nonblocking(true).is_err() {
-        return ATRIUM_ERR_FRESCO_RPC;
-    }
-    let result = match conn.recv_message() {
-        Ok(msg) => {
-            // Restore blocking before returning so the
-            // next blocking op (e.g. window_open
-            // waiting on its response) doesn't spin.
-            let _ = conn.set_nonblocking(false);
-            if msg.opcode_class != CLASS_DISPLAY {
-                // Not for us — drop. Could come from
-                // log routing on this connection in
-                // future, but today nothing else uses
-                // the fresco conn.
-                return 0;
-            }
-            let ev = match msg.op {
-                fresco_protocol::control::EV_WINDOW_RESIZED => {
-                    let p: fresco_protocol::WindowResizedEvent =
-                        match postcard::from_bytes(&msg.payload) {
-                            Ok(p) => p,
-                            Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-                        };
-                    AtriumWindowEvent {
-                        kind: ATRIUM_EV_WINDOW_RESIZED, _pad: 0,
-                        window_id: p.window_id,
-                        arg1: p.width, arg2: p.height,
-                    }
-                }
-                fresco_protocol::control::EV_WINDOW_FOCUS_CHANGED => {
-                    let p: fresco_protocol::WindowFocusChangedEvent =
-                        match postcard::from_bytes(&msg.payload) {
-                            Ok(p) => p,
-                            Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-                        };
-                    AtriumWindowEvent {
-                        kind: ATRIUM_EV_WINDOW_FOCUS_CHANGED, _pad: 0,
-                        window_id: p.window_id,
-                        arg1: if p.gained { 1 } else { 0 }, arg2: 0,
-                    }
-                }
-                fresco_protocol::control::EV_WINDOW_CLOSE_REQUESTED => {
-                    let p: fresco_protocol::WindowCloseRequestedEvent =
-                        match postcard::from_bytes(&msg.payload) {
-                            Ok(p) => p,
-                            Err(_) => return ATRIUM_ERR_FRESCO_RPC,
-                        };
-                    AtriumWindowEvent {
-                        kind: ATRIUM_EV_WINDOW_CLOSE_REQUESTED, _pad: 0,
-                        window_id: p.window_id,
-                        arg1: 0, arg2: 0,
-                    }
-                }
-                _ => {
-                    // Unknown event op — drop silently.
-                    // Caller polls again.
-                    return 0;
-                }
+    // fresco-client's poll_event is non-blocking and decodes the wire event for
+    // us; we just map its typed Event onto the C-ABI AtriumWindowEvent.
+    match conn.poll_event() {
+        Ok(Some(ev)) => {
+            let aev = match ev {
+                fresco_client::Event::Resized { window_id, width, height } => AtriumWindowEvent {
+                    kind: ATRIUM_EV_WINDOW_RESIZED, _pad: 0,
+                    window_id, arg1: width, arg2: height,
+                },
+                fresco_client::Event::FocusChanged { window_id, gained } => AtriumWindowEvent {
+                    kind: ATRIUM_EV_WINDOW_FOCUS_CHANGED, _pad: 0,
+                    window_id, arg1: if gained { 1 } else { 0 }, arg2: 0,
+                },
+                fresco_client::Event::CloseRequested { window_id } => AtriumWindowEvent {
+                    kind: ATRIUM_EV_WINDOW_CLOSE_REQUESTED, _pad: 0,
+                    window_id, arg1: 0, arg2: 0,
+                },
+                // DPI / key / pointer / unknown aren't part of this v0 window-event
+                // surface — drop; the caller polls again.
+                _ => return 0,
             };
-            std::ptr::write(out, ev);
+            std::ptr::write(out, aev);
             1
         }
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            let _ = conn.set_nonblocking(false);
-            0
-        }
-        Err(_) => {
-            let _ = conn.set_nonblocking(false);
-            ATRIUM_ERR_FRESCO_RPC
-        }
-    };
-    result
+        Ok(None) => 0,
+        Err(_) => ATRIUM_ERR_FRESCO_RPC,
+    }
 }
 
 /// Drop the persistent Fresco connection. Useful for

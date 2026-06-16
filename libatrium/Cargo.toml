@@ -18,6 +18,9 @@ crate-type = ["cdylib", "rlib", "staticlib"]
 [dependencies]
 aqueduct        = { path = "../aqueduct" }
 fresco-protocol = { path = "../fresco-protocol" }
+# The display C-ABI rides the one canonical Rust scene-graph client (fresco-client),
+# the same one Pergola uses — not a parallel hand-rolled CLASS_DISPLAY impl.
+fresco-client   = { path = "../fresco-client" }
 postcard        = { version = "1", features = ["use-std"] }
 
 [dev-dependencies]
