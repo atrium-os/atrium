@@ -1,107 +1,135 @@
-//! forum-demo — pipe-clean the full UI render path with a real Pergola app.
+//! forum-demo — render a genuinely Atrium-styled surface, to validate the locked
+//! visual language (docs/design/atrium-visual-language.md) as actual pixels.
 //!
-//! This is what a Forum chrome app *is*: a program that links Pergola (the UI
-//! library), describes its UI, and lets Pergola translate that into the fresco
-//! retained scene graph and drive the connection. We send a small rect composition
-//! (a mock dock panel — text is a follow-up, glyph runs are still TODO in Pergola's
-//! wire path) and frescod renders it. No Vulkan/Tier-2/Tier-3 in this app — it's all
-//! scenegraph, exactly per the UI render model.
+//! This is the doc's hero example — a "Sign in to Atrium" card — built entirely from
+//! Pergola theme TOKENS (cool-neutral ramp, the single amber-bronze accent, moderate
+//! radii, the IBM Plex type scale), not hardcoded colors. It's what a Forum chrome
+//! app is: a Pergola app; Pergola translates it to the fresco scene graph.
 //!
-//! Run against frescod-vulkan-smoke (which renders each frame to a PNG via the
-//! lavapipe software Vulkan ICD): FRESCO_SOCKET=/tmp/frescod-smoke.sock forum-demo
+//! Run against frescod-vulkan-smoke (renders each frame to a PNG via lavapipe):
+//!   FRESCO_SOCKET=/tmp/frescod-smoke.sock forum-demo [light|dark]
 
 use fresco_client::Connection;
 use fresco_protocol::WindowHints;
-use pergola::color::Color;
 use pergola::geom::Rect;
-use pergola::theme::{font, type_size, Weight};
+use pergola::theme::{font, radius, space, type_size, Semantic, Weight};
 use pergola::view::{Ctx, View};
 use pergola::{commit, App, FrescoSurface, Node, Surface, TextStyle};
 
-const W: f32 = 480.0;
-const H: f32 = 320.0;
+const W: f32 = 440.0;
+const H: f32 = 380.0;
 
-/// A mock dock panel: a dark window, a teal title strip, three rounded "app icon"
-/// squares, and an accent strip — all solid-fill rects, so it exercises the
-/// Pergola → scene_node_rect → frescod render path end to end.
-struct DockPanel;
+/// The login card, all from theme tokens — so it reads as Atrium, and flips cleanly
+/// between light and dark via the same token names.
+struct LoginCard;
 
-impl View for DockPanel {
+impl View for LoginCard {
     fn render(&self, ctx: &mut Ctx) {
-        // Window background (dark), with the rest as its children.
+        let t = ctx.theme;
+        // Page background (the window fill) — recessed canvas neutral.
         ctx.push(Node::Rect {
             rect: Rect::new(0.0, 0.0, W, H),
-            fill: Color::rgba(0.10, 0.11, 0.13, 1.0),
+            fill: t.bg_canvas(),
             radius: 0.0,
         });
-        // Title strip (teal).
+
+        // The card — an elevated surface (lighter on light, darker on dark; no shadow
+        // by the doc's policy), radius-lg.
+        let (cx, cy, cw, ch) = (space::XL, space::XL, W - 2.0 * space::XL, H - 2.0 * space::XL);
         ctx.add(Node::Rect {
-            rect: Rect::new(0.0, 0.0, W, 44.0),
-            fill: Color::rgba(0.12, 0.45, 0.50, 1.0),
-            radius: 0.0,
+            rect: Rect::new(cx, cy, cw, ch),
+            fill: t.bg_elevated(),
+            radius: radius::LG,
         });
-        // Three app-icon squares.
-        ctx.add(Node::Rect {
-            rect: Rect::new(24.0, 88.0, 96.0, 96.0),
-            fill: Color::rgba(0.90, 0.30, 0.35, 1.0),
-            radius: 16.0,
-        });
-        ctx.add(Node::Rect {
-            rect: Rect::new(192.0, 88.0, 96.0, 96.0),
-            fill: Color::rgba(0.35, 0.75, 0.45, 1.0),
-            radius: 16.0,
-        });
-        ctx.add(Node::Rect {
-            rect: Rect::new(360.0, 88.0, 96.0, 96.0),
-            fill: Color::rgba(0.30, 0.55, 0.95, 1.0),
-            radius: 16.0,
-        });
-        // Title text (in the teal strip) — exercises the glyph-run render path.
+
+        let pad = space::LG;
+        let ix = cx + pad; // inner x
+        let iw = cw - 2.0 * pad; // inner width
+
+        // Heading (3xl-ish, semibold) — type does the work.
         ctx.add(Node::Text {
-            rect: Rect::new(16.0, 10.0, 0.0, 0.0),
-            content: "Atrium Forum".into(),
+            rect: Rect::new(ix, cy + pad, 0.0, 0.0),
+            content: "Sign in to Atrium".into(),
             style: TextStyle {
                 family: font::SANS.into(),
-                size: type_size::LG,
+                size: type_size::XXL,
                 weight: Weight::Semibold,
-                color: Color::rgba(1.0, 1.0, 1.0, 1.0),
+                color: t.text_primary(),
             },
         });
-        // Accent strip near the bottom + a label on it.
-        ctx.add(Node::Rect {
-            rect: Rect::new(24.0, 240.0, W - 48.0, 32.0),
-            fill: ctx.theme.bg_elevated(),
-            radius: 8.0,
-        });
+        // Subhead (sm, secondary).
         ctx.add(Node::Text {
-            rect: Rect::new(36.0, 246.0, 0.0, 0.0),
-            content: "glyph fill test — the quick brown fox".into(),
+            rect: Rect::new(ix, cy + pad + 40.0, 0.0, 0.0),
+            content: "Use your local account password.".into(),
             style: TextStyle {
                 family: font::SANS.into(),
                 size: type_size::SM,
                 weight: Weight::Regular,
-                color: ctx.theme.text_primary(),
+                color: t.text_secondary(),
             },
         });
+
+        // Two input fields — recessed surface tone, radius-sm, with placeholder text.
+        let field_y0 = cy + pad + 78.0;
+        for (i, ph) in ["username", "password"].iter().enumerate() {
+            let fy = field_y0 + i as f32 * (36.0 + space::SM);
+            ctx.add(Node::Rect {
+                rect: Rect::new(ix, fy, iw, 36.0),
+                fill: t.bg_surface(),
+                radius: radius::SM,
+            });
+            ctx.add(Node::Text {
+                rect: Rect::new(ix + space::SM, fy + 9.0, 0.0, 0.0),
+                content: (*ph).into(),
+                style: TextStyle {
+                    family: font::SANS.into(),
+                    size: type_size::MD,
+                    weight: Weight::Regular,
+                    color: t.text_tertiary(),
+                },
+            });
+        }
+
+        // Primary action — the single amber-bronze accent, radius-sm, white label.
+        let by = field_y0 + 2.0 * (36.0 + space::SM) + space::XS;
+        ctx.add(Node::Rect {
+            rect: Rect::new(ix, by, iw, 40.0),
+            fill: t.accent_fg(),
+            radius: radius::SM,
+        });
+        ctx.add(Node::Text {
+            rect: Rect::new(ix + iw * 0.5 - 28.0, by + 11.0, 0.0, 0.0),
+            content: "Sign in".into(),
+            style: TextStyle {
+                family: font::SANS.into(),
+                size: type_size::MD,
+                weight: Weight::Medium,
+                color: pergola::color::Color::rgba(1.0, 1.0, 1.0, 1.0),
+            },
+        });
+
         ctx.pop();
     }
 }
 
 fn main() -> std::io::Result<()> {
+    let mode = match std::env::args().nth(1).as_deref() {
+        Some("dark") => Semantic::DARK,
+        _ => Semantic::LIGHT,
+    };
     let sock = std::env::var("FRESCO_SOCKET").unwrap_or_else(|_| "/tmp/frescod.sock".into());
-    eprintln!("forum-demo: connecting to {sock}");
+    eprintln!("forum-demo: connecting to {sock} ({:?})", mode);
     let mut conn = Connection::connect(&sock)?;
-    let win = conn.window_create(W as u32, H as u32, "forum-demo", WindowHints::default())?;
+    let win = conn.window_create(W as u32, H as u32, "Atrium", WindowHints::default())?;
 
     let mut surface = FrescoSurface::new(conn, win);
-    let mut app = App::new(DockPanel);
+    let mut app = App::new(LoginCard).with_theme(mode);
     let deltas = app.tick();
-    eprintln!("forum-demo: committing {} node delta(s) to window {win}", deltas.len());
+    eprintln!("forum-demo: committing {} node delta(s)", deltas.len());
     commit(&mut surface, &deltas)?;
     surface.present()?;
-    eprintln!("forum-demo: presented — holding the connection so the server can render.");
+    eprintln!("forum-demo: presented.");
 
-    // Keep the connection open: frescod drops a client's surface on disconnect.
     std::thread::sleep(std::time::Duration::from_secs(30));
     Ok(())
 }

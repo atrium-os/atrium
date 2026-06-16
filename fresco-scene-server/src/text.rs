@@ -354,6 +354,7 @@ impl TextEngine {
     pub fn new() -> Self {
         let mut paths: Vec<PathBuf> = vec![
             PathBuf::from("/usr/local/share/fonts"),
+            PathBuf::from("/usr/local/share/fonts/ibm-plex"),
             PathBuf::from("/usr/local/share/fonts/dejavu"),
             PathBuf::from("/mnt/host/test-assets"),
         ];
@@ -601,10 +602,12 @@ impl TextEngine {
     fn read_font(&self, name: &str) -> Option<Vec<u8>> {
         /* Built-in name aliases first. */
         let candidates: &[&str] = match name {
-            "DejaVuSansMono" | "system-mono" =>
-                &["DejaVuSansMono.ttf", "DejaVuSansMono-Bold.ttf"],
-            "DejaVuSans" | "system-sans" =>
-                &["DejaVuSans.ttf"],
+            // Atrium system faces = IBM Plex (visual-language §2); DejaVu kept as a
+            // fallback so a system without Plex installed still renders text.
+            "IBMPlexMono" | "DejaVuSansMono" | "system-mono" =>
+                &["IBMPlexMono-Regular.ttf", "DejaVuSansMono.ttf", "DejaVuSansMono-Bold.ttf"],
+            "IBMPlexSans" | "DejaVuSans" | "system-sans" =>
+                &["IBMPlexSans.ttf", "DejaVuSans.ttf"],
             "DejaVuSerif" | "system-serif" =>
                 &["DejaVuSerif.ttf"],
             other => {
