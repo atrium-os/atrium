@@ -187,6 +187,7 @@ impl Surface for FrescoSurface {
                     rect.x(), rect.y(),
                     color,
                     content.clone(),
+                    style.weight as u16,
                 )
             }
             Node::Stack { .. } => Ok(()),  // pure layout, no wire op

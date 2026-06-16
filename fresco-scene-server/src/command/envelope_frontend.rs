@@ -758,7 +758,7 @@ impl EnvelopeFrontend {
             let mut text = self.text.write().unwrap();
             text.shape_text_run(
                 p.font_id, p.size_px, p.x, p.y,
-                [p.r, p.g, p.b, p.a], &p.text,
+                [p.r, p.g, p.b, p.a], &p.text, p.weight,
             ).ok_or(DispatchError::BadPayload)?
         };
         if let Some(up) = pending {

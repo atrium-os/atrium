@@ -557,6 +557,9 @@ pub struct TextRunInstallPayload {
     /// in the bundle's frag shader.
     pub r: f32, pub g: f32, pub b: f32, pub a: f32,
     pub text:    String,
+    /// Numeric font weight (100–900; 400 = Regular). Applied as the `wght`
+    /// variation axis when the face is variable; ignored for static faces.
+    pub weight:  u16,
 }
 
 /// `OP_TEXT_MEASURE` — synchronous query: how wide is this string

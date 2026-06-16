@@ -497,12 +497,14 @@ impl Connection {
         node_id: u32, font_id: u32, size_px: f32,
         x: f32, y: f32, color: [f32; 4],
         text: impl Into<String>,
+        weight: u16,
     ) -> io::Result<()> {
         self.send_routable(control::OP_TEXT_RUN_INSTALL,
             &TextRunInstallPayload {
                 node_id, font_id, size_px, x, y,
                 r: color[0], g: color[1], b: color[2], a: color[3],
                 text: text.into(),
+                weight,
             })
     }
 
@@ -653,7 +655,7 @@ impl<'a> FrameBuilder<'a> {
         text: impl Into<String>,
     ) -> io::Result<u32> {
         let id = self.next_id;
-        self.conn.text_run_install(id, font_id, size_px, x, y, color, text)?;
+        self.conn.text_run_install(id, font_id, size_px, x, y, color, text, 400)?;
         self.next_id += 1;
         Ok(id)
     }

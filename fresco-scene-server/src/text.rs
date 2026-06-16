@@ -85,7 +85,7 @@ struct AtlasPage {
     shelf_h: u32,
     /// `(font_id, size_round, codepoint) → entry`. Keyed by integer
     /// size (px*100 rounded) to dedupe near-equal float sizes.
-    glyphs:  HashMap<(u32, u32, u32), GlyphCacheEntry>,
+    glyphs:  HashMap<(u32, u32, u32, u32), GlyphCacheEntry>,  // (font, size, weight, cp)
     /// Server slot id this page is bound to.
     slot_id: u32,
     /// Whether the slot's GPU image has been allocated yet. False
@@ -123,7 +123,7 @@ impl AtlasPage {
     /// Marks the page as needing a Full upload on next drain (every
     /// glyph moved on the GPU side too).
     fn evict_and_compact(&mut self, evict_pct: u32) {
-        type GKey = (u32, u32, u32);
+        type GKey = (u32, u32, u32, u32);  // (font_id, size_key, weight, codepoint)
         let mut by_lru: Vec<(&GKey, &GlyphCacheEntry)> =
             self.glyphs.iter().collect();
         by_lru.sort_by(|a, b| b.1.last_used.cmp(&a.1.last_used)); /* newest first */
@@ -218,19 +218,19 @@ impl AtlasPage {
     /// re-rasterizing.
     fn ensure(
         &mut self,
-        font_id: u32, size_px: f32, codepoint: u32,
+        font_id: u32, size_px: f32, weight: u16, codepoint: u32,
         font_bytes: &[u8],
         clock: u64,
     ) -> Option<GlyphCacheEntry> {
         let size_key = (size_px * 100.0) as u32;
-        let key = (font_id, size_key, codepoint);
+        let key = (font_id, size_key, weight as u32, codepoint);
         if let Some(e) = self.glyphs.get_mut(&key) {
             e.last_used = clock;
             return Some(*e);
         }
 
         let s = char::from_u32(codepoint)?.to_string();
-        let atlas: GlyphAtlas = shape_and_rasterize(font_bytes, &s, size_px).ok()?;
+        let atlas: GlyphAtlas = shape_and_rasterize(font_bytes, &s, size_px, weight as f32).ok()?;
         /* Whitespace (space, tab) shapes to a positive advance with no
          * rasterized glyph — `atlas.glyphs` is empty. Still cache the
          * advance so the layout loop progresses correctly. */
@@ -453,6 +453,7 @@ impl TextEngine {
         x: f32, y: f32,
         color: [f32; 4],
         text: &str,
+        weight: u16,
     ) -> Option<(GlyphRunParams, Option<PendingAtlasUpload>)> {
         /* Wire convention: `y` is the top of the text em-box (so apps
          * compute it as e.g. `field_y + (field_h - text_h)/2` for
@@ -499,7 +500,7 @@ impl TextEngine {
              * than let the shaper emit a `.notdef` box. */
             if cp < 0x20 || cp == 0x7f { continue; }
             clock += 1;
-            let entry = match page.ensure(font_id, size_px, cp, &font_bytes, clock) {
+            let entry = match page.ensure(font_id, size_px, weight, cp, &font_bytes, clock) {
                 Some(e) => e,
                 None    => continue,
             };
@@ -589,7 +590,9 @@ impl TextEngine {
             let cp = ch as u32;
             if cp < 0x20 || cp == 0x7f { continue; }
             clock += 1;
-            let entry = match page.ensure(font_id, size_px, cp, &font_bytes, clock) {
+            // measure defaults to Regular; weight-aware measurement (for correct
+            // semibold layout) would thread weight through TextMeasurePayload — TODO.
+            let entry = match page.ensure(font_id, size_px, 400, cp, &font_bytes, clock) {
                 Some(e) => e,
                 None    => continue,
             };

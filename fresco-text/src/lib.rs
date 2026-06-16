@@ -84,14 +84,21 @@ pub fn shape_and_rasterize(
     font_data: &[u8],
     text: &str,
     pixel_size: f32,
+    weight: f32,
 ) -> Result<GlyphAtlas, TextError> {
     if text.is_empty() {
         return Err(TextError::Empty);
     }
 
     // ── Shaping (rustybuzz) ──────────────────────────────────────
-    let face = rustybuzz::Face::from_slice(font_data, 0)
+    let mut face = rustybuzz::Face::from_slice(font_data, 0)
         .ok_or_else(|| TextError::FontParse("rustybuzz: not a TTF/OTF".into()))?;
+    // Set the weight axis for shaping advances. No-op on a static (non-variable)
+    // font — set_variations just ignores an absent axis.
+    face.set_variations(&[rustybuzz::Variation {
+        tag: rustybuzz::ttf_parser::Tag::from_bytes(b"wght"),
+        value: weight,
+    }]);
     let units_per_em = face.units_per_em() as f32;
     let scale = pixel_size / units_per_em;
 
@@ -110,6 +117,7 @@ pub fn shape_and_rasterize(
         .builder(swash_font)
         .size(pixel_size)
         .hint(true)
+        .variations(&[("wght", weight)])
         .build();
 
     // ── Atlas: shelf-pack each rasterized glyph ──────────────────

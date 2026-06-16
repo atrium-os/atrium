@@ -57,7 +57,7 @@ impl MonoAtlas {
         size_px:    f32,
         atlas_slot: u32,
     ) -> io::Result<Self> {
-        let probe = shape_and_rasterize(font_data, "M", size_px)
+        let probe = shape_and_rasterize(font_data, "M", size_px, 400.0)
             .map_err(|e| io::Error::new(io::ErrorKind::Other,
                 format!("shape probe: {e}")))?;
         let line_height = probe.ascent + probe.descent + 2.0;
@@ -73,7 +73,7 @@ impl MonoAtlas {
 
         for byte in 0x21u8..=0x7e {
             let ch = byte as char;
-            let a = match shape_and_rasterize(font_data, &ch.to_string(), size_px) {
+            let a = match shape_and_rasterize(font_data, &ch.to_string(), size_px, 400.0) {
                 Ok(a)  => a,
                 Err(_) => continue,
             };
