@@ -12,30 +12,37 @@
 use fresco_client::Connection;
 use fresco_protocol::WindowHints;
 use pergola::geom::Rect;
-use pergola::theme::{font, radius, space, type_size, Semantic, Weight};
+use pergola::theme::{font, palette, radius, space, type_size, Semantic, Weight};
 use pergola::view::{Ctx, View};
 use pergola::{commit, App, FrescoSurface, Node, Surface, TextStyle};
 
-const W: f32 = 440.0;
-const H: f32 = 380.0;
+// Full-screen login surface (the smoke render target). The card is centred on it —
+// it's the only thing on screen until the human signs in.
+const W: f32 = 1280.0;
+const H: f32 = 720.0;
+const CARD_W: f32 = 420.0;
+const CARD_H: f32 = 360.0;
 
-/// The login card, all from theme tokens — so it reads as Atrium, and flips cleanly
-/// between light and dark via the same token names.
+/// The login screen: the signature deep-teal wallpaper filling the screen, with a
+/// single rounded card centred on it. Card contents are all theme tokens, so it
+/// reads as Atrium and flips cleanly light↔dark.
 struct LoginCard;
 
 impl View for LoginCard {
     fn render(&self, ctx: &mut Ctx) {
         let t = ctx.theme;
-        // Page background (the window fill) — recessed canvas neutral.
+        // Full-screen wallpaper — the Atrium signature deep teal (square; the screen
+        // edge isn't rounded, so neither is this).
         ctx.push(Node::Rect {
             rect: Rect::new(0.0, 0.0, W, H),
-            fill: t.bg_canvas(),
+            fill: palette::deep_teal(),
             radius: 0.0,
         });
 
-        // The card — an elevated surface (lighter on light, darker on dark; no shadow
-        // by the doc's policy), radius-lg.
-        let (cx, cy, cw, ch) = (space::XL, space::XL, W - 2.0 * space::XL, H - 2.0 * space::XL);
+        // The card — an elevated surface, centred, rounded (radius-lg), no shadow.
+        let cx = (W - CARD_W) * 0.5;
+        let cy = (H - CARD_H) * 0.5;
+        let (cw, ch) = (CARD_W, CARD_H);
         ctx.add(Node::Rect {
             rect: Rect::new(cx, cy, cw, ch),
             fill: t.bg_elevated(),
