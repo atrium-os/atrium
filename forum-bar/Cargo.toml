@@ -16,6 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 forum-ctl = { path = "../forum-ctl" }
-
-[dev-dependencies]
+# forum-bar draws its bar via Pergola (the UI toolkit) → frescod, the same way any
+# Atrium UI renders. It holds no window-management cap; it just draws + asks forum-ctl.
+pergola = { path = "../pergola" }
+fresco-client = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }
