@@ -59,16 +59,23 @@ stack to its first-principles shape:
 - API: a frozen C-ABI platform library + Aqueduct services.
 - UI: native toolkit (Pergola), not a DOM.
 
-**Privilege invariant: an Insula app NEVER runs as root.** Every app — native
-or otherwise, "system-blessed" chrome (Forum's WM included) or third-party —
-executes inside its jail under a *dedicated, non-root per-app uid*. Root is
-reserved for the trusted computing base alone (`jaild` and the privileged launch
-step, which exist precisely to create the jail and drop privilege before
-`execve`; see `portcullis.md` §9.0 and `jaild-policy.md`). The human user
-*authorizes* a launch through their policy; the app does not run *as* the human,
-and it certainly never runs as uid 0. An app observing itself running as root is
-a launcher bug, never the intended contract — the kernel/MMU/jail isolation an
-Insula app relies on assumes the code inside has no host privilege to begin with.
+**Privilege invariant: an Insula app NEVER runs as root, and never as a human's
+uid either.** Atrium splits what Unix fuses into one uid — identity, execution,
+authorization — into three: **identity/ownership** is a *human uid* (the person
+who authenticates and owns data; a principal, not a runner); **execution** is a
+*dedicated, non-human per-app uid* (the 50000+ range — what the app process
+actually runs as: unprivileged, one per app, owning nothing on its own); and
+**authorization** is the capability set. So every app — native or otherwise,
+"system-blessed" chrome (Forum's WM included) or third-party — executes inside
+its jail under its own non-human per-app uid. Root is reserved for the trusted
+computing base alone (`jaild` and the privileged launch step, which exist
+precisely to create the jail and drop privilege before `execve`; see
+`portcullis.md` §9.0 and `jaild-policy.md`). The human *authorizes* a launch
+through their policy; the app does not run *as* the human, and it certainly never
+runs as uid 0. An app observing itself running as root — or as a human's uid — is
+a launcher bug, never the intended contract: the kernel/MMU/jail isolation an
+Insula app relies on assumes the code inside has no host privilege and no human's
+ambient ownership to begin with.
 
 WASM does not appear in this design. The browser needed it
 because the sandbox was in-process; Atrium does not have that

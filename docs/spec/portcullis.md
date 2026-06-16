@@ -1063,6 +1063,33 @@ pre-grants for headless deployments.
 launch path. Everything else — every system service AND every user app — runs
 unprivileged inside a jail under a *dedicated, non-root uid*.**
 
+This rests on a deeper split. Traditional Unix **fuses** identity, execution,
+and authorization into one uid (you log in *as* uid N, your processes *run as*
+uid N, and N's permissions *authorize* them). Atrium **splits** the three:
+
+- **identity / ownership = the human uid** (a real login user). The human
+  *authenticates* (PAM auth/account) and *owns* data + the policy file. A human
+  uid is a principal, **not** something processes run as — "PAM says who walked
+  in; jaild + seat + capabilities decide what running as them means."
+- **execution = a non-human, per-app uid** (the dedicated 50000+ range). This is
+  what app processes actually run as: unprivileged, distinct per app, a "nobody"
+  that owns nothing on its own.
+- **authorization = capabilities** (the manifest grants), not uid permissions.
+
+So there are four uid classes, and only one runs apps:
+
+| class | range | role | runs app processes? |
+|-------|-------|------|---------------------|
+| root | 0 | the TCB (jaild + privileged launch step) | no — TCB only |
+| human / owner | real login range (e.g. 1000–49999) | identity, ownership, policy | **no** — owner, not runner |
+| per-app | 50000+ (dedicated, one per app) | **execution** | **yes** |
+| system service | specific `allowed_system_uids` (e.g. `_frescod`) | blessed engines | yes |
+
+The consequence that bites: an app must run as a **per-app (non-human) uid** —
+not root **and not the human's own uid**. jaild's range check (1000–65000)
+refuses root but would happily accept a *human's* uid; running as a dedicated
+50000+ app uid is the additional discipline the launch path must apply.
+
 Concretely:
 - **The TCB** (`jaild`, the root of trust; the mount/`jail -c`/`setuid` step) is
   the *only* code that holds root, and it holds it precisely so it can drop it:
