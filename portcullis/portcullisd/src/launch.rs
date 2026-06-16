@@ -86,15 +86,15 @@ pub fn launch_with_stdio(
     let overlay_dir = PathBuf::from(OVERLAYS_DIR).join(app_id);
     let jail_path   = PathBuf::from(JAILS_DIR).join(app_id);
 
-    /* PRIVILEGE INVARIANT (portcullis.md §9.0): no app runs as root — apps run
-     * under a dedicated, non-root per-app uid; root is the TCB's alone.
-     * DEVIATION (bring-up): we currently set exec.jail_user to the *connecting
-     * user* (opts.user_name, via portcullis-jail::build), so a root-driven
-     * launch runs the app as root — wrong. TODO: allocate a per-app uid
-     * (portcullis_peer, APP_UID_BASE) + register uid→(user,app_id) + route exec
-     * through jaild's uid-range validation. $HOME below is the user's actual
-     * home on the host, used by ~/-prefixed filesystem capabilities. */
-    let user_home = match std::ffi::CString::new(user).ok().and_then(|cuser| {
+    /* PRIVILEGE INVARIANT (portcullis.md §9.0): the app runs under a dedicated,
+     * non-root, non-human per-app uid (50000+) — NEVER root, NEVER the connecting
+     * human's uid. The connecting human (`user`) is recorded as the OWNER in the
+     * launch registry; the process executes as the per-app uid that services
+     * peer-cred back to (owner, app_id). $HOME is the app uid's own (nologin)
+     * home, not the human's. */
+    let (app_uid, run_as_user) = resolve_app_uid(user, app_id)?;
+    eprintln!("portcullisd: launching {app_id} as uid {app_uid} ({run_as_user}); owner={user}");
+    let user_home = match std::ffi::CString::new(run_as_user.as_str()).ok().and_then(|cuser| {
         let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
         let mut buf = vec![0u8 as libc::c_char; 4096];
         let mut result: *mut libc::passwd = std::ptr::null_mut();
@@ -109,13 +109,13 @@ pub fn launch_with_stdio(
         }
     }) {
         Some(h) => h,
-        None    => PathBuf::from(format!("/home/{user}")),
+        None    => PathBuf::from("/nonexistent"),
     };
     let opts = BuildOpts {
         root_path:    jail_path.clone(),
         host_sockets: PathBuf::from("/atrium/sockets"),
         user_home:    user_home.clone(),
-        user_name:    user.to_string(),
+        user_name:    run_as_user.clone(),
         devfs_ruleset: 99,
     };
 
@@ -345,6 +345,47 @@ fn full_teardown(jail_path: &Path, jail_name: Option<&str>) {
     let _ = umount(&jail_path.join("dev"));   /* belt-and-braces */
     let _ = umount(jail_path);                 /* unionfs */
     let _ = umount(jail_path);                 /* nullfs */
+}
+
+/// Resolve the dedicated per-app uid the app executes as (PRIVILEGE INVARIANT,
+/// portcullis.md §9.0). The connecting human is the OWNER (recorded in the launch
+/// registry so services can peer-cred a connection back to `(owner, app_id)`); the
+/// app itself runs as a 50000+ nologin "nobody" uid — never root, never the human.
+///
+/// Re-launches REUSE the app's existing uid (stable identity, no registry/passwd
+/// leak); otherwise a fresh uid is allocated, given a nologin passwd entry, and
+/// registered. Returns `(uid, run-as username)`.
+///
+/// NOTE: creating the passwd entry here mirrors the launch path already shelling
+/// out (mount/jail/umount). Longer-term this privileged mutation belongs in jaild
+/// (the audited broker) or at app-install time, not in portcullisd per-launch.
+fn resolve_app_uid(owner: &str, app_id: &str) -> Result<(u32, String), LaunchError> {
+    let reg = portcullis_peer::DEFAULT_REGISTRY;
+    let fail = |s: String| LaunchError::Failed("uid", s);
+    if let Some(dir) = Path::new(reg).parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let uid = match portcullis_peer::uid_for_app(reg, owner, app_id) {
+        Some(uid) => uid,
+        None => {
+            let uid = portcullis_peer::allocate(reg);
+            portcullis_peer::register(reg, uid, owner, app_id)
+                .map_err(|e| fail(format!("register uid {uid}: {e}")))?;
+            uid
+        }
+    };
+    // Ensure a host passwd entry exists (jail(8) resolves exec.jail_user via it).
+    let run_as = match portcullis_peer::username(uid) {
+        Some(name) => name,
+        None => {
+            let name = portcullis_peer::app_username(uid);
+            run("pw", &["useradd", &name, "-u", &uid.to_string(),
+                        "-d", "/nonexistent", "-s", "/usr/sbin/nologin"])
+                .map_err(|e| fail(format!("create passwd {name} (uid {uid}): {e}")))?;
+            name
+        }
+    };
+    Ok((uid, run_as))
 }
 
 fn run(cmd: &str, args: &[&str]) -> std::io::Result<()> {

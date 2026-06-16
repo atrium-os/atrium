@@ -96,6 +96,28 @@ impl AppRegistry {
     pub fn resolve(&self, uid: u32) -> Option<(&str, &str)> {
         self.map.get(&uid).map(|(u, a)| (u.as_str(), a.as_str()))
     }
+
+    /// The uid already bound to `(user, app_id)`, if any. Lets a re-launch REUSE
+    /// the app's existing dedicated uid (stable identity for services that
+    /// peer-cred it) instead of leaking a fresh uid + passwd entry every time.
+    pub fn uid_for(&self, user: &str, app_id: &str) -> Option<u32> {
+        self.map.iter()
+            .find(|(_, (u, a))| u == user && a == app_id)
+            .map(|(uid, _)| *uid)
+    }
+}
+
+/// As [`AppRegistry::uid_for`], reading the registry file (missing file → `None`).
+pub fn uid_for_app(path: &str, user: &str, app_id: &str) -> Option<u32> {
+    AppRegistry::load(path).ok().and_then(|r| r.uid_for(user, app_id))
+}
+
+/// The conventional host username for a dedicated per-app uid. A nologin
+/// "nobody"-class account (`pw useradd <name> -u <uid> -d /nonexistent -s
+/// /usr/sbin/nologin`) whose only job is to be the unprivileged identity an app
+/// runs as — never root, never a human's account.
+pub fn app_username(uid: u32) -> String {
+    format!("atrium-app-{uid}")
 }
 
 /// Append a binding to the registry file (the **write** side — Portcullis calls
