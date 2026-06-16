@@ -641,6 +641,63 @@ the VM — **never `cargo --release` inside the VM**
 
 ---
 
+## 12a. Graphics coverage: what runs through to Metal today (and the gap to a game)
+
+Audited 2026-06-16. The transport and the *wire grammar* are the strong
+part; the gap to "an arbitrary game's Vulkan runs on Metal" is two bounded
+implementation pieces, not a design unknown. Be precise about which.
+
+**Already solid (do not re-investigate):**
+- **Transport — DONE & verified.** The green-triangle round-trip
+  (`aqueduct-gpu-host/tests/carillon_wire.rs::real_frame_through_carillon_bridge_to_metal`)
+  is real: VM → Carillon ring/doorbell → host `MoltenVkBackend` → Metal →
+  pixels back through the ring (`[51,217,77,255]`).
+- **Wire vocabulary — COMPLETE, and NOT venus-style.** `aqueduct-gpu/src/opcodes.rs`
+  `FrameOp` is a *closed, high-level* graphics grammar that already names
+  the full surface: `BeginRenderPass`, `BindPipeline`, `BindVertexBuf`,
+  `BindIndexBuf`, `Draw`/`DrawIndexed`/`DrawIndirect`, all the
+  `SetCullMode`/depth/stencil dynamic state, `Dispatch`, `CopyBufToImg`,
+  `Blit`. The "venus-class serialization layer" worry does **not** apply —
+  the protocol is designed and smaller than per-`vkCmd` serialization.
+
+**Gap 1 — host backend translation is PARTIAL.** `MoltenVkBackend::record_and_submit`
+(`aqueduct-gpu-host/src/moltenvk.rs`) wires render pass + graphics pipeline
++ `vkCmdDraw` + the full **compute** path (dispatch/descriptors/push-constants/
+barriers) — all tested. But the ops a real game needs are *parsed and then
+silently dropped* by the catch-all `_ => { /* not yet modelled on tier-3 */ }`
+at **moltenvk.rs:1235**: vertex/index buffer binding, `DrawIndexed`, **texture
+sampling** (sampled-image descriptors + `SHADER_READ_OPTIMAL` layout),
+`CopyBufToImg`, and most `SetXxx` dynamic state. A game doing
+`vkCmdBindVertexBuffers`/`vkCmdDrawIndexed` renders **black with no error** —
+geometry never reaches the rasterizer. The verified triangle dodged this by
+being a *procedural* fullscreen tri (VS synthesizes positions from
+`gl_VertexIndex`; no vertex buffer). Closing it is match-arm codegen (~2wk),
+not architecture. **moltenvk.rs:1235 is the literal line where "renders a
+triangle" becomes "renders a game."** (Note: the Tier-2 SW/CPU backend,
+`tier2_backend.rs`, already implements all of these — it's only the Metal
+backend that's partial.)
+
+**Gap 2 — the guest-side ICD is a STUB.** `atrium-vk-icd/src/lib.rs` is
+skeleton-only: loader negotiation succeeds, then every `vkGetInstanceProcAddr`
+returns NULL. The verified triangle **bypassed it** — the test hand-builds the
+`FrameOp` stream via a `GpuClient` emitter. So an off-the-shelf game going
+through the normal Vulkan loader → `atrium-vk-icd` → `FrameOp` has no working
+translator yet. Larger than Gap 1, but bounded: it targets the high-level
+closed grammar above, not full Vulkan reflection. (This is T6's `atrium-vk-icd`
+route, made concrete.)
+
+**UI vs games — the split this enables:**
+- **Frescod-on-Metal (the desktop) needs NEITHER gap fully closed.** frescod is
+  its own renderer: it can emit `FrameOp`s directly (the `GpuClient`/Tier-2
+  style), **bypassing the stub ICD**, using only the *already-verified* subset
+  (render pass + pipeline + `Draw`). So host-side compositing on Metal is
+  reachable on proven code — no ICD, no vertex-buffer work. This is the route
+  to delete the per-frame guest↔host readback for the desktop.
+- **An arbitrary game on Metal needs BOTH gaps** — it links the real loader
+  (Gap 2) and uses vertex/index buffers + textures (Gap 1).
+
+---
+
 ## 13. Open questions
 
 - **One device or fold into atrium-gpu kmod?** The transport cdev and
