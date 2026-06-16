@@ -576,10 +576,11 @@ hash:
 
 ```
 my-app/
-  manifest.toml         # see §5
-  signature             # publisher signature over manifest+contents
+  atrium.toml           # the manifest (see §5) — the capability contract
+  atrium.toml.sig       # publisher signature over manifest+contents
   bin/
     my-app              # native ELF, or IR artifact (§3.3)
+  lib/  libexec/        # the runtime closure — shipped, not resolved at install
   assets/
     ...
 ```
@@ -587,6 +588,14 @@ my-app/
 Install = verify signature, resolve through Tessera CAS,
 register manifest with Portcullis. The same bundle is byte-
 identical on every device that has it.
+
+> **Canonical format spec: [`atrium-bundle-format.md`](atrium-bundle-format.md).**
+> The manifest is **`atrium.toml`** (the NAMING-canonical name; the older
+> `manifest.toml` is deprecated), there is **one** manifest schema that both host
+> adapters translate (Portcullis → `jail.conf`, macOS → SBPL), and the bundle
+> **ships its runtime closure** (§5 there) so install stays pure verify+register.
+> Because a jail's rootfs *is* the bundle tree, the bundle — not scattered FHS
+> files — is the unit of distribution, execution, addressing, and trust.
 
 ### 3.2 Native distribution (default)
 

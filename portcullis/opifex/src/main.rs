@@ -98,7 +98,7 @@ fn cmd_install(args: &[String]) -> Result<(), String> {
         return Err(format!("invalid manifest: {}", report.errors.join("; ")));
     }
     let id = &manifest.app.id;
-    let entry = &manifest.app.entry; // e.g. "bin/forum-wm"
+    let entry = manifest.entry(); // canonical: [bundle].entry → [app].entry
 
     // 2. Trust gate — the SAME check portcullisd applies at launch, so install and
     //    launch agree. --allow-unsigned is the explicit dev escape hatch.

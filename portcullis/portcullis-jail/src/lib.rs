@@ -93,7 +93,7 @@ pub fn build(manifest: &Manifest, opts: &BuildOpts) -> Result<JailConfig, BuildE
      * don't force /etc/rc on every jail — minimal app trees with
      * no /etc/rc would fail to launch. (Spec §3.5 documents the
      * patterns.) */
-    jc.set("exec.start", Value::String(format!("/{}", manifest.app.entry)));
+    jc.set("exec.start", Value::String(format!("/{}", manifest.entry())));
 
     /* Apply each declared capability. */
     capabilities::apply_all(&manifest.capabilities, &mut jc, opts)?;

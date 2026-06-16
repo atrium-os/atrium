@@ -17,11 +17,41 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub app:          AppSection,
+    /// Bundle/distribution facts: form (native|ir) + target arches + the entry's
+    /// canonical home. Optional for back-compat; see atrium-bundle-format.md §4.
+    /// Folded in from the former insula-manifest `[bundle]` section as part of
+    /// unifying the two manifest schemas onto one `atrium.toml`.
+    pub bundle:       Option<BundleSection>,
     #[serde(default)]
     pub capabilities: Capabilities,
     pub setup:        Option<SetupSection>,
     pub resources:    Option<ResourcesSection>,
     pub supervision:  Option<SupervisionSection>,
+}
+
+/// `[bundle]` — distribution facts (atrium-bundle-format.md §4). Carried in the
+/// one canonical `atrium.toml` so a bundle can declare its form + target arches +
+/// canonical entry, which the legacy `portcullis-toml` schema couldn't express.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BundleSection {
+    #[serde(default)]
+    pub form:   BundleForm,
+    #[serde(default)]
+    pub arches: Vec<String>,
+    /// Canonical home for the entry path. When absent the loader falls back to
+    /// `[app].entry` (the legacy location) — see [`Manifest::entry`].
+    pub entry:  Option<String>,
+}
+
+/// How the entry artifact is shipped: a native ELF per arch, or a portable IR
+/// (WASM) that install-time AOT compiles (insula.md §3.2–3.3).
+#[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BundleForm {
+    #[default]
+    Native,
+    Ir,
 }
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +61,9 @@ pub struct AppSection {
     pub name:        String,
     pub version:     String,
     pub entry:       String,
+    /// SDK/ABI generation the app targets (folded in from insula-manifest). Optional.
+    #[serde(rename = "sdk-version")]
+    pub sdk_version: Option<String>,
     pub description: Option<String>,
     /// Icon the shell shows for this app — a named icon (e.g. "terminal", resolved
     /// against the system icon set) or a path to an SVG the app bundles. `None` →
@@ -146,6 +179,15 @@ impl Manifest {
     pub fn from_str(s: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(s)
     }
+
+    /// The entry path, resolved canonically: `[bundle].entry` if present, else the
+    /// legacy `[app].entry`. Consumers should call this rather than reading either
+    /// field directly (atrium-bundle-format.md §4).
+    pub fn entry(&self) -> &str {
+        self.bundle.as_ref()
+            .and_then(|b| b.entry.as_deref())
+            .unwrap_or(&self.app.entry)
+    }
 }
 
 /// Merge `override_caps` over `base`, field by field. Any field set
@@ -176,6 +218,46 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
             for (k, v) in &ovr.extra { e.insert(k.clone(), v.clone()); }
             e
         },
+    }
+}
+
+#[cfg(test)]
+mod bundle_tests {
+    use super::*;
+
+    const WITH_BUNDLE: &str = r#"
+[app]
+id = "org.atrium.edit"
+name = "Edit"
+version = "1.0.0"
+entry = "bin/legacy"
+sdk-version = "1.x"
+[bundle]
+form = "native"
+arches = ["aarch64-freebsd", "aarch64-darwin"]
+entry = "bin/atrium-edit"
+[capabilities]
+graphics = "fresco"
+"#;
+
+    #[test]
+    fn bundle_section_parses_and_entry_resolves_canonically() {
+        let m = Manifest::from_str(WITH_BUNDLE).expect("parse");
+        let b = m.bundle.as_ref().expect("bundle");
+        assert_eq!(b.form, BundleForm::Native);
+        assert_eq!(b.arches, ["aarch64-freebsd", "aarch64-darwin"]);
+        assert_eq!(m.app.sdk_version.as_deref(), Some("1.x"));
+        // [bundle].entry wins over the legacy [app].entry.
+        assert_eq!(m.entry(), "bin/atrium-edit");
+    }
+
+    #[test]
+    fn entry_falls_back_to_app_entry_without_bundle() {
+        // A manifest with no [bundle] (the forum apps' shape) resolves [app].entry.
+        let m = Manifest::from_str(
+            "[app]\nid=\"x\"\nname=\"X\"\nversion=\"1\"\nentry=\"bin/x\"\n").expect("parse");
+        assert!(m.bundle.is_none());
+        assert_eq!(m.entry(), "bin/x");
     }
 }
 

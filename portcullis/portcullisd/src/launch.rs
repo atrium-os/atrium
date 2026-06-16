@@ -255,9 +255,13 @@ fn clone_manifest_with(
             name:        base.app.name.clone(),
             version:     base.app.version.clone(),
             entry,
+            sdk_version: base.app.sdk_version.clone(),
             description: base.app.description.clone(),
             icon:        base.app.icon.clone(),
         },
+        /* The setup phase runs a script entry, not the bundled app — bundle/arch
+         * facts don't apply, so it carries no [bundle] section. */
+        bundle:       None,
         capabilities: caps,
         setup:        None,           /* setup never recurses */
         resources:    None,
