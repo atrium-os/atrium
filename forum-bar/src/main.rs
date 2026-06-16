@@ -104,14 +104,12 @@ impl View for BarView {
 
 /// Live status from the WM core, or a sample if forum-ctl isn't reachable.
 fn status() -> (String, usize) {
-    let sock = std::env::var("FORUM_CTL_SOCKET").unwrap_or_default();
-    if !sock.is_empty() {
-        if let Ok(Reply::Surfaces { surfaces, focus }) = forum_ctl::request(&sock, &Intent::ListSurfaces) {
-            let app = surfaces.iter().find(|s| s.surface_id == focus)
-                .map(|s| s.owner_app.clone())
-                .unwrap_or_else(|| "—".into());
-            return (app, surfaces.len());
-        }
+    let sock = forum_ctl::default_socket_path();
+    if let Ok(Reply::Surfaces { surfaces, focus }) = forum_ctl::request(&sock, &Intent::ListSurfaces) {
+        let app = surfaces.iter().find(|s| s.surface_id == focus)
+            .map(|s| s.owner_app.clone())
+            .unwrap_or_else(|| "—".into());
+        return (app, surfaces.len());
     }
     ("atrium-edit".into(), 3) // sample for standalone render
 }

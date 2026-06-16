@@ -40,10 +40,6 @@ impl FrescoConn for ClientConn {
     }
 }
 
-/// The display socket frescod listens on. Overridable for tests / nonstandard runs.
-fn socket_path() -> String {
-    std::env::var("FRESCO_SOCKET").unwrap_or_else(|_| "/var/run/atrium/fresco.sock".into())
-}
 
 /// The output geometry. Until frescod exposes a mode query over the WM channel we
 /// take it from the environment (FORUM_SCREEN="WxH"), defaulting to 1080p. The
@@ -60,8 +56,8 @@ fn screen() -> Screen {
 }
 
 fn main() -> io::Result<()> {
-    let path = socket_path();
-    eprintln!("forum-wm: connecting to frescod at {path}");
+    let path = fresco_client::default_socket_path();
+    eprintln!("forum-wm: connecting to frescod at {}", path.display());
     let conn = Connection::connect(&path)?;
     // frescod now replies to a refused WM op with an IS_ERROR response, so a
     // denied enumerate surfaces a PermissionDenied immediately. This read timeout
@@ -78,10 +74,16 @@ fn main() -> io::Result<()> {
         layout.focus
     );
 
-    // If a forum-ctl socket is configured, become the WM core daemon: serve the
-    // chrome apps' intents (dock/bar/overview) over forum-ctl, each re-driving
-    // Fresco through the same reconcile. Without it, this is the F0 one-shot.
-    if let Ok(ctl) = std::env::var("FORUM_CTL_SOCKET") {
+    // Become the WM core daemon: serve the chrome apps' intents (dock/bar/overview)
+    // over forum-ctl, each re-driving Fresco through the same reconcile. The path
+    // resolves to the canonical in-jail location (or $FORUM_CTL_SOCKET / a dev
+    // fallback), so a jailed forum-wm serves the same socket the jailed chrome
+    // apps connect to through their shared /atrium/sockets/forum-ctl/ mount. Set
+    // FORUM_WM_ONESHOT=1 to keep the old F0 reconcile-once-and-exit behaviour.
+    if std::env::var("FORUM_WM_ONESHOT").is_err() {
+        let ctl = forum_ctl::default_socket_path();
+        let ctl = ctl.to_string_lossy();
+        eprintln!("forum-wm: serving forum-ctl at {ctl}");
         serve_forum_ctl(&ctl, &mut wm, &mut io_conn)?;
     }
     Ok(())

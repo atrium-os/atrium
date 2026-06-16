@@ -14,6 +14,29 @@ use serde::{Deserialize, Serialize};
 
 pub use fresco_protocol::WmSurfaceInfo;
 
+/// The canonical forum-ctl socket inside a Portcullis jail. Portcullis nullfs-mounts
+/// the per-service directory `/atrium/sockets/forum-ctl/` (for both `window-management`,
+/// which forum-wm serves it through, and `forum-control`, which chrome connects
+/// through), so the socket lands here. Mirrors fresco-client's scheme.
+pub const JAILED_FORUM_CTL_SOCKET: &str = "/atrium/sockets/forum-ctl/forum-ctl.sock";
+/// Dev fallback when running bare (outside a jail).
+pub const DEV_FORUM_CTL_SOCKET: &str = "/tmp/forum-ctl.sock";
+
+/// Resolve the forum-ctl socket path: `$FORUM_CTL_SOCKET` → the in-jail directory
+/// (if its mount is present) → the dev fallback. The same binary then works jailed
+/// and bare with no env wiring (the jail runs `exec.clean`, stripping env). forum-wm
+/// binds this; chrome connects to it.
+pub fn default_socket_path() -> std::path::PathBuf {
+    if let Ok(s) = std::env::var("FORUM_CTL_SOCKET") {
+        return std::path::PathBuf::from(s);
+    }
+    // The per-service dir is the mounted unit; if it exists we're jailed-or-staged.
+    if std::path::Path::new("/atrium/sockets/forum-ctl").is_dir() {
+        return std::path::PathBuf::from(JAILED_FORUM_CTL_SOCKET);
+    }
+    std::path::PathBuf::from(DEV_FORUM_CTL_SOCKET)
+}
+
 /// A chrome app's request to the WM core. The core authorizes each before acting.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Intent {

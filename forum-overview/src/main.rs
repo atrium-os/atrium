@@ -21,8 +21,8 @@ use pergola::{commit, App, FrescoSurface, Node, Surface, TextStyle};
 const W: f32 = 1280.0;
 const H: f32 = 720.0;
 
-fn socket() -> String {
-    std::env::var("FORUM_CTL_SOCKET").unwrap_or_else(|_| "/tmp/forum-ctl.sock".into())
+fn socket() -> std::path::PathBuf {
+    forum_ctl::default_socket_path()
 }
 
 // Lucide icons, shared with the dock (ISC). Embedded + parsed once.
@@ -135,8 +135,7 @@ fn render_overview() -> std::io::Result<()> {
     let mode = match std::env::var("FORUM_THEME").as_deref() {
         Ok("dark") => Semantic::DARK, _ => Semantic::LIGHT,
     };
-    let sock = std::env::var("FRESCO_SOCKET").unwrap_or_else(|_| "/tmp/frescod.sock".into());
-    let mut conn = Connection::connect(&sock)?;
+    let mut conn = Connection::connect_default()?;
     let win = conn.window_create(W as u32, H as u32, "forum-overview", WindowHints::default())?;
     let mut surface = FrescoSurface::new(conn, win);
 

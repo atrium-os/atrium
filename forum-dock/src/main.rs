@@ -169,8 +169,7 @@ fn render_dock() -> io::Result<()> {
     if apps.is_empty() {
         apps = sample_apps();
     }
-    let sock = std::env::var("FRESCO_SOCKET").unwrap_or_else(|_| "/tmp/frescod.sock".into());
-    let mut conn = Connection::connect(&sock)?;
+    let mut conn = Connection::connect_default()?;
     let win = conn.window_create(SCREEN_W as u32, SCREEN_H as u32, "forum-dock", WindowHints::default())?;
     let mut surface = FrescoSurface::new(conn, win);
 
