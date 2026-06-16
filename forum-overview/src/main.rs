@@ -32,7 +32,7 @@ const SVG_FILES: &str = include_str!("../../assets/icons/lucide/files.svg");
 const SVG_SETTINGS: &str = include_str!("../../assets/icons/lucide/settings.svg");
 const SVG_BROWSER: &str = include_str!("../../assets/icons/lucide/browser.svg");
 
-struct Icons([Vec<pergola::icon::Polyline>; 5]);
+struct Icons([pergola::icon::IconGeometry; 5]);
 impl Icons {
     fn load() -> Self {
         use pergola::icon::parse_icon;
@@ -41,7 +41,7 @@ impl Icons {
             parse_icon(SVG_SETTINGS), parse_icon(SVG_BROWSER),
         ])
     }
-    fn for_app(&self, key: &str) -> &[pergola::icon::Polyline] {
+    fn for_app(&self, key: &str) -> &pergola::icon::IconGeometry {
         let s = key.to_lowercase();
         if s.contains("term") { &self.0[1] }
         else if s.contains("file") || s.contains("folder") { &self.0[2] }

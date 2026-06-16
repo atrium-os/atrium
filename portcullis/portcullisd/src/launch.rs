@@ -246,6 +246,7 @@ fn clone_manifest_with(
             version:     base.app.version.clone(),
             entry,
             description: base.app.description.clone(),
+            icon:        base.app.icon.clone(),
         },
         capabilities: caps,
         setup:        None,           /* setup never recurses */

@@ -32,6 +32,10 @@ pub struct AppSection {
     pub version:     String,
     pub entry:       String,
     pub description: Option<String>,
+    /// Icon the shell shows for this app — a named icon (e.g. "terminal", resolved
+    /// against the system icon set) or a path to an SVG the app bundles. `None` →
+    /// the shell falls back to a default.
+    pub icon:        Option<String>,
 }
 
 /// Capability set. Used in two places: top-level `[capabilities]`

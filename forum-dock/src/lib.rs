@@ -19,6 +19,8 @@ pub struct AppEntry {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
+    /// Icon name/path the app declared in its manifest (`[app] icon = ...`).
+    pub icon: Option<String>,
 }
 
 /// Parse one manifest's text into a catalog entry. `None` if it doesn't parse —
@@ -29,6 +31,7 @@ pub fn entry_from_manifest(text: &str) -> Option<AppEntry> {
         id: m.app.id,
         name: m.app.name,
         description: m.app.description,
+        icon: m.app.icon,
     })
 }
 

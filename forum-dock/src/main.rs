@@ -48,11 +48,11 @@ const SVG_SETTINGS: &str = include_str!("../../assets/icons/lucide/settings.svg"
 const SVG_BROWSER: &str = include_str!("../../assets/icons/lucide/browser.svg");
 
 struct Icons {
-    editor: Vec<pergola::icon::Polyline>,
-    terminal: Vec<pergola::icon::Polyline>,
-    files: Vec<pergola::icon::Polyline>,
-    settings: Vec<pergola::icon::Polyline>,
-    browser: Vec<pergola::icon::Polyline>,
+    editor: pergola::icon::IconGeometry,
+    terminal: pergola::icon::IconGeometry,
+    files: pergola::icon::IconGeometry,
+    settings: pergola::icon::IconGeometry,
+    browser: pergola::icon::IconGeometry,
 }
 
 impl Icons {
@@ -66,9 +66,14 @@ impl Icons {
             browser: parse_icon(SVG_BROWSER),
         }
     }
-    /// Pick an icon by keyword in the app id/name (until manifests declare an icon).
-    fn for_app(&self, app: &AppEntry) -> &[pergola::icon::Polyline] {
-        let s = format!("{} {}", app.id, app.name).to_lowercase();
+    /// Pick the app's icon: the manifest's declared `[app] icon` if present, else a
+    /// keyword match on the id/name as a fallback. (A full system would resolve the
+    /// declared name against the whole icon set / the app's bundled SVG; for now it
+    /// maps onto the embedded dock set.)
+    fn for_app(&self, app: &AppEntry) -> &pergola::icon::IconGeometry {
+        let s = app.icon.clone()
+            .unwrap_or_else(|| format!("{} {}", app.id, app.name))
+            .to_lowercase();
         if s.contains("term") { &self.terminal }
         else if s.contains("file") || s.contains("folder") { &self.files }
         else if s.contains("setting") || s.contains("config") || s.contains("pref") { &self.settings }
@@ -143,9 +148,15 @@ impl View for DockView {
 
 /// Sample apps when no real catalog is installed (so the dock renders standalone).
 fn sample_apps() -> Vec<AppEntry> {
-    ["Edit", "Terminal", "Files", "Settings", "Browser"]
+    [("Edit", "editor"), ("Terminal", "terminal"), ("Files", "files"),
+     ("Settings", "settings"), ("Browser", "browser")]
         .iter()
-        .map(|n| AppEntry { id: format!("org.atrium.{}", n.to_lowercase()), name: (*n).into(), description: None })
+        .map(|(n, icon)| AppEntry {
+            id: format!("org.atrium.{}", n.to_lowercase()),
+            name: (*n).into(),
+            description: None,
+            icon: Some((*icon).into()), // as if declared in the manifest
+        })
         .collect()
 }
 
