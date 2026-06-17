@@ -12,8 +12,12 @@ use ostiarius::{Frontend, JaildLauncher, Launcher, LaunchSpec, Ostiarius};
 struct LogLauncher;
 impl Launcher for LogLauncher {
     fn launch(&mut self, s: &LaunchSpec) -> Result<i32, String> {
+        // `owner` is the human identity the app belongs to — NOT its run uid. The
+        // real JaildLauncher allocates a dedicated per-app uid (≥50000) and execs
+        // under it; no app runs as root. We log a placeholder uid to make that
+        // explicit (the demo doesn't actually allocate one).
         eprintln!(
-            "  → request jaild: launch {} as {} ({}{}) caps={:?}",
+            "  → request jaild: launch {} (owner={}, exec as per-app uid ~50000) ({}{}) caps={:?}",
             s.app_id, s.owner, s.bin,
             if s.argv.is_empty() { String::new() } else { format!(" {}", s.argv.join(" ")) },
             s.caps
