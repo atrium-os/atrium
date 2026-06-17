@@ -61,9 +61,25 @@ pattern (insula.md §0.5.3) gives frictionless onboarding *without* the web's
 "accidentally accumulate trust" failure mode — apps get an explicit (light) consent
 moment because they receive capabilities; documents never do.
 
-## 3. Client-side vs server-side native — and the JS-free-client invariant
+## 3. Execution model — native binaries, jailed, location-transparent
 
-A navigated app runs in one of two places, both already supported by Atrium pieces:
+**The primary app is a native Atrium binary in a jail.** Compiled native code
+(Rust/Pergola/C against libatrium/fresco-client), contained by a Portcullis jail.
+The jail is the invariant; *where* the jail runs is a deployment knob, not an app
+rewrite — because the jail boundary and the Fresco protocol are identical on either
+side. This is **location transparency**: the *same* binary, unmodified, runs either
+place (§3.1). (Contrast the web, which forces SSR-vs-SPA app-architecture choices
+and ships code to every client.)
+
+**WASM-IR → AOT → native is a *secondary* on-ramp**, not the center: a portability /
+language-reach lane (cross-arch distribution per insula.md §3.3, plus non-native
+languages — JS among them, §3.2) whose **output is still a primary-model artifact** —
+a native jailed binary. It converges on the primary model; it doesn't replace it.
+
+### 3.1 The two placements of one jailed binary
+
+A navigated app runs in one of two places, both already supported by Atrium pieces —
+*the same native jailed binary*, just placed differently:
 
 - **Client-side native (default).** An ephemeral *local* jailed native app. Best
   latency, offline, privacy, performance. "Web app" → local jailed binary.
@@ -79,6 +95,37 @@ A navigated app runs in one of two places, both already supported by Atrium piec
 > "vendor-hosted web access") and streaming the resulting Fresco scene graph. The JS is
 > *relocated to the server*, not run on your machine. The client stays a pure native
 > Fresco renderer + jail, for everything.
+
+### 3.2 JS and dynamic languages as Atrium apps (the secondary lane)
+
+When we *do* want JavaScript (or any non-native language), the answer is **not** to
+embed V8 and not to port a browser engine. Two goals must stay separate:
+
+- **Run the *existing* web** → impossible to escape the web platform (DOM, JS-as-
+  specced, fetch/CSSOM); every site + framework targets it. So legacy web = **Servo,
+  server-side** (§6), per the JS-free-client invariant. AOT/no-DOM does *not* serve
+  this goal — don't try.
+- **Let JS/TS developers write *Atrium* apps** → the secondary on-ramp (§3): the
+  language compiles to **WASM-IR → AOT (Cranelift) → native jailed binary** (insula.md
+  §3.3), binding to the **scene graph / Pergola, not a DOM**. The result is a
+  primary-model native jailed app whose source happened to be JS.
+
+Two properties make this only-possible-on-Atrium, and they're the point:
+
+1. **Strip the in-engine sandbox.** V8's heap sandbox, isolates, JIT hardening,
+   Spectre mitigations, and RWX JIT pages all exist to run untrusted code
+   *in-process*. The jail makes them redundant. An Atrium JS runtime is a fraction of
+   the size, and **AOT (no JIT) → W^X holds → Capsicum-clean → tiny TCB**.
+2. **No DOM.** The DOM is the web's retained-tree+CSS artifact; Atrium has a better
+   native one (Fresco scene graph + Pergola). New apps bind to it directly.
+
+Honest caveat: JS is the *hard* AOT case (dynamically typed, prototypes, `eval`) —
+unlike the typed/structured SPIR-V and WASM that Tier-2/Cranelift AOT cleanly. What
+ships is a *baseline* AOT (boxed, dynamic-dispatch) — fine for UI code, not JIT-grade
+peak speed — traded for the simplicity + security wins above. Fully-dynamic JS rides
+QuickJS-on-WASM; TypeScript-subset / AssemblyScript / cleanly-compiled languages AOT
+well. The real primitive is the WASM-IR→AOT road (§3.3 of insula.md); JS is just one
+(awkward) source language on it — never a from-scratch engine.
 
 ## 4. Delivery, naming, distribution
 
