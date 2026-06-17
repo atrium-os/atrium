@@ -109,6 +109,11 @@ fn main() -> io::Result<()> {
     wm.workspaces = cfg.workspaces;
     wm.names = cfg.names;
     wm.assign_rules = cfg.assign;
+    // Overlay the learned placements (persisted manual moves) — they win over the
+    // config defaults so "where I last put this app" survives reboot.
+    for (app, ws) in config::load_state() {
+        wm.assign_rules.insert(app, ws);
+    }
     // The launch registry (uid → app-id) resolves a surface's owner_uid to its
     // app-id so per-app workspace rules apply. Reloaded on each new window
     // (it's append-only) to pick up apps launched after startup.
@@ -254,7 +259,11 @@ fn spawn_input_poller(core: Core) {
                 let mut g = core.lock().unwrap();
                 let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
                 match wm.move_focused_to_workspace(conn, ws) {
-                    Ok(Some(s)) => eprintln!("forum-wm: moved surface {s} to {}", wm.workspace_label(ws)),
+                    Ok(Some(s)) => {
+                        eprintln!("forum-wm: moved surface {s} to {}", wm.workspace_label(ws));
+                        // Persist the learned per-app placement (survives reboot).
+                        config::save_state(&wm.assign_rules);
+                    }
                     Ok(None) => {}               // nothing focused / out of range
                     Err(e) => eprintln!("forum-wm: move_focused_to_workspace error: {e}"),
                 }

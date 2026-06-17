@@ -21,7 +21,7 @@
 //! "org.atrium.term" = 0
 //! ```
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Hard ceiling on workspace count — a sanity clamp, not a design limit.
@@ -102,6 +102,55 @@ fn config_path() -> String {
     format!("/var/db/atrium/{user}/forum.toml")
 }
 
+// ── Runtime state: learned per-app placements (persisted manual moves) ─────────
+//
+// Distinct from the hand-authored config: when the human *moves* a window to a
+// workspace, the WM remembers that app's placement here so it survives relaunch
+// and reboot. Config `[assign]` seeds the placement; the state file overlays it
+// (a move wins over a config default). Delete the state file to forget moves.
+
+/// `$FORUM_STATE` → `/var/db/atrium/<user>/forum-workspaces.state`.
+fn state_path() -> String {
+    if let Ok(p) = std::env::var("FORUM_STATE") {
+        return p;
+    }
+    let user = std::env::var("USER").unwrap_or_else(|_| "root".into());
+    format!("/var/db/atrium/{user}/forum-workspaces.state")
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct State {
+    #[serde(default)]
+    assign: HashMap<String, usize>,
+}
+
+/// Load the learned app-id → workspace placements (empty if no state yet).
+pub fn load_state() -> HashMap<String, usize> {
+    std::fs::read_to_string(state_path())
+        .ok()
+        .and_then(|t| toml::from_str::<State>(&t).ok())
+        .map(|s| s.assign)
+        .unwrap_or_default()
+}
+
+/// Persist the effective app-id → workspace map (best-effort; logs on failure).
+pub fn save_state(assign: &HashMap<String, usize>) {
+    let path = state_path();
+    let text = match toml::to_string(&State { assign: assign.clone() }) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("forum-wm: serialize state: {e}");
+            return;
+        }
+    };
+    if let Some(dir) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(&path, text) {
+        eprintln!("forum-wm: save state {path}: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +170,15 @@ mod tests {
         assert_eq!(cfg.workspaces, 3);
         assert_eq!(cfg.name(1), Some("web"));
         assert_eq!(cfg.assign.get("org.atrium.navigator"), Some(&1));
+    }
+
+    #[test]
+    fn state_serializes_round_trip() {
+        let mut m = HashMap::new();
+        m.insert("org.atrium.term".to_string(), 2usize);
+        let text = toml::to_string(&State { assign: m.clone() }).unwrap();
+        let back: State = toml::from_str(&text).unwrap();
+        assert_eq!(back.assign, m);
     }
 
     #[test]

@@ -407,6 +407,16 @@ pub mod daemon {
                 return Ok(None); // nothing to move
             }
             self.assignment.insert(focus, ws);
+            // Remember the placement by app-id so it persists: future launches of
+            // this app (and the next reboot) land it here. The binary writes
+            // `assign_rules` out to the state file after the move.
+            if let Some((_user, app)) = active
+                .iter()
+                .find(|s| s.surface_id == focus)
+                .and_then(|s| self.registry.resolve(s.owner_uid))
+            {
+                self.assign_rules.insert(app.to_string(), ws);
+            }
             self.zoomed = self.zoomed.filter(|z| *z != focus); // a moved window can't stay zoomed here
             self.focus_intent = None; // it left this workspace; re-resolve focus among the rest
             self.declare(conn, &surfaces)?;
@@ -1036,5 +1046,31 @@ mod tests {
         let declared: Vec<u32> =
             conn.declared.as_ref().unwrap().slots.iter().map(|s| s.surface_id).collect();
         assert_eq!(declared, vec![2], "doc 2 is on workspace 1");
+    }
+
+    #[test]
+    fn moving_a_known_app_records_a_persistent_rule() {
+        use portcullis_peer::AppRegistry;
+        let mut conn = MockConn {
+            surfaces: vec![WmSurfaceInfo {
+                surface_id: 5,
+                owner_app: "client:1".into(),
+                owner_uid: 1001,
+                role: WmRole::Document,
+                rect: WmRect { x: 0, y: 0, w: 0, h: 0 },
+            }],
+            ..Default::default()
+        };
+        let mut wm = Wm::new(screen());
+        wm.assign_to_active(5);
+        wm.registry = AppRegistry::parse("1001 alice org.atrium.term");
+        wm.focus_intent = Some(5);
+        wm.move_focused_to_workspace(&mut conn, 2).unwrap();
+        // The binary persists assign_rules to the state file → survives reboot.
+        assert_eq!(
+            wm.assign_rules.get("org.atrium.term"),
+            Some(&2),
+            "moving a known app records its placement for future launches + persistence",
+        );
     }
 }
