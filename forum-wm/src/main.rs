@@ -33,6 +33,9 @@ type Core = Arc<Mutex<(Wm, ClientConn)>>;
 /// 0x08 | right 0x80). Super rather than Alt so it doesn't collide with app Tab.
 const KEY_TAB: u16 = 0x2B;
 const MOD_GUI: u8 = 0x08 | 0x80;
+/// Super+1..Super+N switches workspace. HID usages 0x1E..=0x27 are the digit
+/// row '1'..'9','0'; we map '1'.. to workspace 0.. up to the workspace count.
+const KEY_1: u16 = 0x1E;
 
 /// The live frescod connection — the production implementation of the seam the
 /// reconcile loop drives. Each method is one window-management protocol op.
@@ -151,6 +154,7 @@ fn spawn_input_poller(core: Core) {
             let mut surfaces_changed = false;
             let mut created: Option<u32> = None;
             let mut cycle = false;
+            let mut switch_ws: Option<usize> = None;
             {
                 let mut g = core.lock().unwrap();
                 loop {
@@ -168,6 +172,10 @@ fn spawn_input_poller(core: Core) {
                         // a window-management gesture, not app text input.
                         Ok(Some(Event::Key { hid_usage: KEY_TAB, pressed: true, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 => cycle = true,
+                        // Super+1..N: switch the active workspace.
+                        Ok(Some(Event::Key { hid_usage, pressed: true, modifiers, .. }))
+                            if modifiers & MOD_GUI != 0 && hid_usage >= KEY_1 && hid_usage < KEY_1 + 9 =>
+                            switch_ws = Some((hid_usage - KEY_1) as usize),
                         Ok(Some(_)) => {}        // other event — ignore
                         Ok(None) => break,       // backlog drained
                         Err(e) => {
@@ -181,20 +189,34 @@ fn spawn_input_poller(core: Core) {
             // A surface came or went → re-derive the whole layout so the new
             // window is placed (or the gone one's slot reclaimed). Do this
             // before applying any click, so focus-follows-click sees the
-            // up-to-date surface set. A newly-created document opens focused.
+            // up-to-date surface set. A newly-created document opens focused on
+            // the active workspace.
             if surfaces_changed {
                 let mut g = core.lock().unwrap();
                 let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
                 let r = match created {
-                    Some(id) => wm.focus_new(conn, id),
+                    Some(id) => {
+                        wm.assign_to_active(id); // new window lands on the current workspace
+                        wm.focus_new(conn, id)
+                    }
                     None => wm.reconcile(conn),
                 };
                 match r {
                     Ok(l) => eprintln!(
-                        "forum-wm: reconciled on surface change — {} surface(s), focus={}",
+                        "forum-wm: reconciled on surface change — {} active surface(s), focus={}",
                         l.slots.len(), l.focus,
                     ),
                     Err(e) => eprintln!("forum-wm: reconcile error: {e}"),
+                }
+            }
+
+            if let Some(ws) = switch_ws {
+                let mut g = core.lock().unwrap();
+                let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
+                match wm.switch_workspace(conn, ws) {
+                    Ok(Some(w)) => eprintln!("forum-wm: switched to workspace {w}"),
+                    Ok(None) => {}               // out of range or already active
+                    Err(e) => eprintln!("forum-wm: switch_workspace error: {e}"),
                 }
             }
 

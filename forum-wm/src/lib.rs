@@ -199,7 +199,25 @@ fn subtract(r: &WmRect, cut: &WmRect) -> Vec<WmRect> {
 pub mod daemon {
     use super::{arrange, rendering_decisions, Screen};
     use fresco_protocol::{WmDeclareLayoutPayload, WmRole, WmSetRenderingPayload, WmSurfaceInfo};
+    use std::collections::HashMap;
     use std::io;
+
+    /// Default number of workspaces (virtual desktops) when no per-user config
+    /// overrides it. App surfaces live on one workspace each; the user switches
+    /// the active workspace (Super+1..N). Chrome + background are global.
+    pub const DEFAULT_WORKSPACES: usize = 4;
+
+    /// Whether surface `s` is visible on workspace `active`. Chrome, background,
+    /// and hud are *global* — Forum's shell + wallpaper show on every workspace.
+    /// App surfaces (document/panel/dialog) show only on the workspace they're
+    /// assigned to; an unassigned surface is treated as the active one (a
+    /// just-appeared surface is visible until it's explicitly placed elsewhere).
+    pub fn shown_in_workspace(
+        s: &WmSurfaceInfo, assignment: &HashMap<u32, usize>, active: usize,
+    ) -> bool {
+        matches!(s.role, WmRole::Chrome | WmRole::Background | WmRole::Hud)
+            || assignment.get(&s.surface_id).copied().unwrap_or(active) == active
+    }
 
     /// Roles a pointer click moves keyboard focus to. Clicking chrome (bar /
     /// dock / hud) or the wallpaper must NOT steal focus from the document the
@@ -236,15 +254,30 @@ pub mod daemon {
         fn set_rendering(&mut self, decisions: &[WmSetRenderingPayload]) -> io::Result<()>;
     }
 
-    /// The WM core state: the output geometry + the human's focus intent.
+    /// The WM core state: output geometry, the human's focus intent, and the
+    /// workspace model (N virtual desktops + which is active + each app
+    /// surface's workspace assignment).
     pub struct Wm {
         pub screen: Screen,
         pub focus_intent: Option<u32>,
+        /// Number of workspaces (virtual desktops).
+        pub workspaces: usize,
+        /// The currently-visible workspace (0-based).
+        pub active: usize,
+        /// surface_id → workspace. Unlisted surfaces default to the active
+        /// workspace (see [`shown_in_workspace`]); chrome/background ignore this.
+        pub assignment: HashMap<u32, usize>,
     }
 
     impl Wm {
         pub fn new(screen: Screen) -> Self {
-            Wm { screen, focus_intent: None }
+            Wm {
+                screen,
+                focus_intent: None,
+                workspaces: DEFAULT_WORKSPACES,
+                active: 0,
+                assignment: HashMap::new(),
+            }
         }
 
         /// The human focuses a surface (an intent); the next reconcile applies it.
@@ -252,15 +285,62 @@ pub mod daemon {
             self.focus_intent = Some(surface_id);
         }
 
-        /// Re-derive and push the layout: enumerate the session's surfaces, arrange
-        /// them by role, declare the atomic layout, and gate the fully-occluded
-        /// ones. Returns the layout it declared (so the caller can track focus).
+        /// Assign a (new) surface to the active workspace — the default landing
+        /// rule: a window opens on the workspace you're looking at.
+        pub fn assign_to_active(&mut self, surface_id: u32) {
+            self.assignment.insert(surface_id, self.active);
+        }
+
+        /// Switch the active workspace. The previous workspace's app surfaces
+        /// fall out of the active set → render-gated (a whole desktop stops
+        /// compositing); the new workspace's surfaces are arranged + composited.
+        /// Focus resets so `arrange` picks the topmost document there. No-op
+        /// (returns `None`) for an out-of-range or already-active workspace.
+        pub fn switch_workspace(&mut self, conn: &mut impl FrescoConn, ws: usize)
+            -> io::Result<Option<usize>>
+        {
+            if ws >= self.workspaces || ws == self.active {
+                return Ok(None);
+            }
+            self.active = ws;
+            self.focus_intent = None; // resolve focus within the newly-active workspace
+            let surfaces = conn.enumerate()?;
+            self.declare(conn, &surfaces)?;
+            Ok(Some(ws))
+        }
+
+        /// The workspace-aware placement step shared by every reconcile path:
+        /// arrange the surfaces *visible on the active workspace*, declare that
+        /// layout, then mark every other surface (apps on inactive workspaces)
+        /// non-rendering — so an inactive workspace fully stops compositing.
+        fn declare(&self, conn: &mut impl FrescoConn, surfaces: &[WmSurfaceInfo])
+            -> io::Result<WmDeclareLayoutPayload>
+        {
+            let active: Vec<WmSurfaceInfo> = surfaces
+                .iter()
+                .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
+                .cloned()
+                .collect();
+            let layout = arrange(&self.screen, &active, self.focus_intent);
+            conn.declare_layout(&layout)?;
+            let mut decisions = rendering_decisions(&layout);
+            for s in surfaces
+                .iter()
+                .filter(|s| !shown_in_workspace(s, &self.assignment, self.active))
+            {
+                decisions.push(WmSetRenderingPayload { surface_id: s.surface_id, rendering: false });
+            }
+            conn.set_rendering(&decisions)?;
+            Ok(layout)
+        }
+
+        /// Re-derive and push the layout for the active workspace: enumerate,
+        /// arrange the visible surfaces, declare the atomic layout, gate the
+        /// occluded ones + every inactive-workspace surface. Returns the
+        /// declared (active-workspace) layout.
         pub fn reconcile(&self, conn: &mut impl FrescoConn) -> io::Result<WmDeclareLayoutPayload> {
             let surfaces = conn.enumerate()?;
-            let layout = arrange(&self.screen, &surfaces, self.focus_intent);
-            conn.declare_layout(&layout)?;
-            conn.set_rendering(&rendering_decisions(&layout))?;
-            Ok(layout)
+            self.declare(conn, &surfaces)
         }
 
         /// Focus-follows-click: react to a pointer-button press frescod reported
@@ -277,13 +357,16 @@ pub mod daemon {
             -> io::Result<Option<u32>>
         {
             let surfaces = conn.enumerate()?;
-            let resolved = arrange(&self.screen, &surfaces, self.focus_intent).focus;
-            match resolve_click_focus(&surfaces, clicked, Some(resolved)) {
+            let active: Vec<WmSurfaceInfo> = surfaces
+                .iter()
+                .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
+                .cloned()
+                .collect();
+            let resolved = arrange(&self.screen, &active, self.focus_intent).focus;
+            match resolve_click_focus(&active, clicked, Some(resolved)) {
                 Some(id) => {
                     self.focus_intent = Some(id);
-                    let layout = arrange(&self.screen, &surfaces, self.focus_intent);
-                    conn.declare_layout(&layout)?;
-                    conn.set_rendering(&rendering_decisions(&layout))?;
+                    let layout = self.declare(conn, &surfaces)?;
                     Ok(Some(layout.focus))
                 }
                 None => Ok(None),
@@ -301,10 +384,7 @@ pub mod daemon {
             if surfaces.iter().any(|s| s.surface_id == new_id && s.role == WmRole::Document) {
                 self.focus_intent = Some(new_id);
             }
-            let layout = arrange(&self.screen, &surfaces, self.focus_intent);
-            conn.declare_layout(&layout)?;
-            conn.set_rendering(&rendering_decisions(&layout))?;
-            Ok(layout)
+            self.declare(conn, &surfaces)
         }
 
         /// The switcher (forum.md §2.3): cycle keyboard focus to the next
@@ -315,19 +395,22 @@ pub mod daemon {
             -> io::Result<Option<u32>>
         {
             let surfaces = conn.enumerate()?;
-            let mut docs: Vec<u32> = surfaces
+            let active: Vec<WmSurfaceInfo> = surfaces
+                .iter()
+                .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
+                .cloned()
+                .collect();
+            let mut docs: Vec<u32> = active
                 .iter()
                 .filter(|s| s.role == WmRole::Document)
                 .map(|s| s.surface_id)
                 .collect();
             docs.sort_unstable();
-            let current = arrange(&self.screen, &surfaces, self.focus_intent).focus;
+            let current = arrange(&self.screen, &active, self.focus_intent).focus;
             match next_document(&docs, current) {
                 Some(next) if next != current => {
                     self.focus_intent = Some(next);
-                    let layout = arrange(&self.screen, &surfaces, self.focus_intent);
-                    conn.declare_layout(&layout)?;
-                    conn.set_rendering(&rendering_decisions(&layout))?;
+                    let layout = self.declare(conn, &surfaces)?;
                     Ok(Some(layout.focus))
                 }
                 _ => Ok(None),
@@ -501,6 +584,26 @@ mod tests {
     }
 
     #[test]
+    fn workspaces_partition_apps_but_chrome_is_global() {
+        use super::daemon::shown_in_workspace;
+        use std::collections::HashMap;
+        let mut a = HashMap::new();
+        a.insert(1u32, 0usize); // doc 1 on workspace 0
+        a.insert(2u32, 1usize); // doc 2 on workspace 1
+        let (doc1, doc2, bar) = (surf(1, WmRole::Document), surf(2, WmRole::Document), surf(9, WmRole::Chrome));
+        // active = 0: doc1 shown, doc2 hidden, chrome global.
+        assert!(shown_in_workspace(&doc1, &a, 0));
+        assert!(!shown_in_workspace(&doc2, &a, 0));
+        assert!(shown_in_workspace(&bar, &a, 0));
+        // active = 1: doc2 shown, doc1 hidden, chrome still global.
+        assert!(!shown_in_workspace(&doc1, &a, 1));
+        assert!(shown_in_workspace(&doc2, &a, 1));
+        assert!(shown_in_workspace(&bar, &a, 1));
+        // an unassigned app surface defaults to the active workspace (visible).
+        assert!(shown_in_workspace(&surf(5, WmRole::Document), &a, 0));
+    }
+
+    #[test]
     fn a_panel_docks_beside_the_document_so_both_render() {
         // A panel gets the right-quarter dock (not the full work area), so it
         // doesn't cover the document — both stay visible + rendering.
@@ -602,5 +705,40 @@ mod tests {
         assert_eq!(reply, Reply::Ack, "the requested surface got focus");
         // the core re-declared the layout to Fresco with #2 focused.
         assert_eq!(conn.declared.as_ref().unwrap().focus, 2);
+    }
+
+    #[test]
+    fn switching_workspace_gates_the_other_apps_but_keeps_chrome() {
+        let mut conn = MockConn {
+            surfaces: vec![
+                surf(1, WmRole::Document),
+                surf(2, WmRole::Document),
+                surf(9, WmRole::Chrome),
+            ],
+            ..Default::default()
+        };
+        let mut wm = Wm::new(screen());
+        wm.assign_to_active(1);                       // doc 1 → workspace 0
+        wm.switch_workspace(&mut conn, 1).unwrap();   // go to workspace 1
+        wm.assign_to_active(2);                        // doc 2 → workspace 1
+        wm.reconcile(&mut conn).unwrap();
+
+        // On workspace 1: doc 2 + chrome are declared (active); doc 1 is gated.
+        let declared: Vec<u32> =
+            conn.declared.as_ref().unwrap().slots.iter().map(|s| s.surface_id).collect();
+        assert!(declared.contains(&2) && declared.contains(&9), "active doc + chrome placed");
+        assert!(!declared.contains(&1), "the other workspace's doc isn't in the active layout");
+        let gated: Vec<u32> =
+            conn.rendering.iter().filter(|r| !r.rendering).map(|r| r.surface_id).collect();
+        assert_eq!(gated, vec![1], "the inactive workspace's app is render-gated");
+
+        // Switch back to workspace 0 → doc 1 visible, doc 2 now gated, chrome stays.
+        wm.switch_workspace(&mut conn, 0).unwrap();
+        let gated: Vec<u32> =
+            conn.rendering.iter().filter(|r| !r.rendering).map(|r| r.surface_id).collect();
+        assert_eq!(gated, vec![2], "switching flips which workspace's apps are gated");
+        let declared: Vec<u32> =
+            conn.declared.as_ref().unwrap().slots.iter().map(|s| s.surface_id).collect();
+        assert!(declared.contains(&9), "chrome is global — present on every workspace");
     }
 }
