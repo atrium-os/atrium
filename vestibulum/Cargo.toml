@@ -16,3 +16,5 @@ fresco-client   = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }
 log             = "0.4"
 env_logger      = "0.11"
+# Login handoff to ostiarius (newline-delimited JSON over its control socket).
+serde_json      = "1"

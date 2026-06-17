@@ -48,6 +48,32 @@ fn main() {
         return;
     }
 
+    // Demo daemon: serve the control socket with the LogLauncher (no jaild, no
+    // PAM → the stub auth accepts any non-empty credential), so the
+    // vestibulum→ostiarius→session-launch handoff can be exercised in-VM without
+    // the full TCB. `OSTIARIUS_SOCK` sets the socket; `OSTIARIUS_OPEN=1` bypasses
+    // the vestibulum peer gate (else the caller must be registered as
+    // org.atrium.vestibulum). The launches are logged, not really jailed.
+    if args.iter().any(|a| a == "--serve-demo") {
+        let sock = std::env::var("OSTIARIUS_SOCK")
+            .unwrap_or_else(|_| "/var/run/atrium/ostiarius.sock".into());
+        let seat = std::env::var("OSTIARIUS_SEAT")
+            .unwrap_or_else(|_| format!("/tmp/ostiarius-seat-{}", std::process::id()));
+        let _ = std::fs::remove_file(&seat);
+        let mut o = Ostiarius::new(LogLauncher).with_seat_path(seat);
+        eprintln!("ostiarius(demo): serving {sock} with LogLauncher");
+        let r = if std::env::var("OSTIARIUS_OPEN").is_ok() {
+            ostiarius::control::serve(&mut o, &sock, |_| true)
+        } else {
+            ostiarius::control::serve(&mut o, &sock, ostiarius::control::vestibulum_gate)
+        };
+        if let Err(e) = r {
+            eprintln!("ostiarius(demo): serve {sock}: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // Daemon mode: listen on the control socket for vestibulum's authenticated
     // logins, peer-gated by getpeereid. Boot launches the login UI first.
     const SOCK: &str = "/var/run/atrium/ostiarius.sock";

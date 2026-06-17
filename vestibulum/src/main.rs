@@ -129,12 +129,59 @@ impl View for LoginView {
                     status.set("enter both fields".into());
                     return;
                 }
-                println!("vestibulum: submit user={u:?} (password elided)");
-                let _ = p; // would be passed to pam_local
-                status.set(format!("welcome, {u}"));
-                done.set(true);
+                // Hand the credential to ostiarius (the doorkeeper): it
+                // authenticates and launches the human's jailed session
+                // (Forum + chrome). On success vestibulum hands over the seat
+                // and exits; on failure it shows the error and stays.
+                match session_handoff(&u, &p) {
+                    Ok(active) => {
+                        status.set(format!("welcome, {active}"));
+                        done.set(true);
+                    }
+                    Err(e) => status.set(e),
+                }
             })
             .render(ctx);
+    }
+}
+
+/// Hand the authenticated credential to ostiarius over its control socket
+/// (`$OSTIARIUS_SOCK`, default `/var/run/atrium/ostiarius.sock`) — one
+/// newline-delimited JSON `login` request, one reply. ostiarius authenticates +
+/// launches the human's jailed session (Forum + chrome). Returns the active
+/// human on success, or a human-readable error (which the form shows).
+fn session_handoff(user: &str, password: &str) -> Result<String, String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let sock = std::env::var("OSTIARIUS_SOCK")
+        .unwrap_or_else(|_| "/var/run/atrium/ostiarius.sock".to_string());
+    let stream = UnixStream::connect(&sock)
+        .map_err(|e| format!("session manager unavailable: {e}"))?;
+    let mut writer = stream.try_clone().map_err(|e| e.to_string())?;
+
+    let req = serde_json::json!({
+        "op": "login", "user": user, "password": password, "frontend": "gui",
+    });
+    let mut line = req.to_string();
+    line.push('\n');
+    writer.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+
+    let mut resp = String::new();
+    BufReader::new(stream).read_line(&mut resp).map_err(|e| e.to_string())?;
+    let v: serde_json::Value =
+        serde_json::from_str(resp.trim()).map_err(|e| format!("bad reply: {e}"))?;
+    match v.get("status").and_then(|s| s.as_str()) {
+        Some("ok") => Ok(v
+            .get("active")
+            .and_then(|a| a.as_str())
+            .unwrap_or(user)
+            .to_string()),
+        _ => Err(v
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("login failed")
+            .to_string()),
     }
 }
 
