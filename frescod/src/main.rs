@@ -259,17 +259,34 @@ fn render_one_frame(
         let fe = frontend.lock().unwrap();
         for (win_id, (ox, oy)) in &layers {
             let Some(state) = fe.window_state(*win_id) else { continue; };
-            for p in state.rect_nodes.values() {
-                rects.push(translate_rect(p, *ox, *oy));
+            /* Paint in node_id order (lower id → drawn first → bottom).
+             * The per-window node maps are HashMaps, whose iteration
+             * order is seeded per-process; iterating `.values()` directly
+             * would make the painter's-algorithm z-order nondeterministic
+             * across runs (e.g. a full-screen background Rect sometimes
+             * painting over the widgets on top of it). Sort by node_id to
+             * match the within-type z-order the `extract_*` helpers use. */
+            let mut rect_ids: Vec<&u32> = state.rect_nodes.keys().collect();
+            rect_ids.sort_unstable();
+            for id in rect_ids {
+                rects.push(translate_rect(&state.rect_nodes[id], *ox, *oy));
             }
-            for p in state.path_nodes.values() {
-                paths.push(translate_path(p, *ox, *oy));
+            let mut path_ids: Vec<&u32> = state.path_nodes.keys().collect();
+            path_ids.sort_unstable();
+            for id in path_ids {
+                paths.push(translate_path(&state.path_nodes[id], *ox, *oy));
             }
-            for p in state.texture_nodes.values() {
+            let mut tex_ids: Vec<&u32> = state.texture_nodes.keys().collect();
+            tex_ids.sort_unstable();
+            for id in tex_ids {
+                let p = &state.texture_nodes[id];
                 tex_by_slot.entry(p.slot_id).or_default()
                     .push(translate_texture(p, *ox, *oy));
             }
-            for p in state.glyph_run_nodes.values() {
+            let mut glyph_ids: Vec<&u32> = state.glyph_run_nodes.keys().collect();
+            glyph_ids.sort_unstable();
+            for id in glyph_ids {
+                let p = &state.glyph_run_nodes[id];
                 let entry = glyph_by_slot
                     .entry(p.atlas_slot_id)
                     .or_insert_with(|| GlyphRunBatch {
