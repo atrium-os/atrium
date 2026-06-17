@@ -241,7 +241,7 @@ fn subtract(r: &WmRect, cut: &WmRect) -> Vec<WmRect> {
 /// changes: enumerate → arrange → declare the layout + the rendering decisions.
 pub mod daemon {
     use super::{arrange, arrange_for, rendering_decisions, Screen};
-    use fresco_protocol::{WmDeclareLayoutPayload, WmRole, WmSetRenderingPayload, WmSurfaceInfo};
+    use fresco_protocol::{WmDeclareLayoutPayload, WmRole, WmSetRenderingPayload, WmSlot, WmSurfaceInfo};
     use portcullis_peer::AppRegistry;
     use std::collections::{HashMap, HashSet};
     use std::io;
@@ -326,6 +326,10 @@ pub mod daemon {
         /// columns (all visible); a non-tiled one stacks them (one focused +
         /// fills, the rest render-gated — the default).
         pub tiled_workspaces: HashSet<usize>,
+        /// The surface currently *zoomed* to fill the whole screen (the zoom
+        /// intent, forum.md §2.3) — a true fullscreen that even covers chrome;
+        /// everything else render-gates. `None` = the normal arrangement.
+        pub zoomed: Option<u32>,
     }
 
     impl Wm {
@@ -340,6 +344,7 @@ pub mod daemon {
                 names: Vec::new(),
                 registry: AppRegistry::default(),
                 tiled_workspaces: HashSet::new(),
+                zoomed: None,
             }
         }
 
@@ -373,6 +378,7 @@ pub mod daemon {
             }
             self.active = ws;
             self.focus_intent = None; // resolve focus within the newly-active workspace
+            self.zoomed = None;       // a zoom belonged to the workspace we left
             let surfaces = conn.enumerate()?;
             self.declare(conn, &surfaces)?;
             Ok(Some(ws))
@@ -394,6 +400,31 @@ pub mod daemon {
             Ok(now_tiled)
         }
 
+        /// Toggle *zoom* (fullscreen) for the focused surface and re-declare
+        /// (forum.md §2.3). Zoom on → that surface fills the screen, all else
+        /// gates; zoom off → back to the arrangement. Returns the new zoom state.
+        /// No-op (returns `false`) when there's no focusable surface.
+        pub fn toggle_zoom(&mut self, conn: &mut impl FrescoConn) -> io::Result<bool> {
+            let surfaces = conn.enumerate()?;
+            let active: Vec<WmSurfaceInfo> = surfaces
+                .iter()
+                .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
+                .cloned()
+                .collect();
+            let focus = arrange(&self.screen, &active, self.focus_intent).focus;
+            let now_zoomed = if self.zoomed == Some(focus) {
+                self.zoomed = None;
+                false
+            } else if focus != 0 {
+                self.zoomed = Some(focus);
+                true
+            } else {
+                false // nothing to zoom
+            };
+            self.declare(conn, &surfaces)?;
+            Ok(now_zoomed)
+        }
+
         /// The workspace-aware placement step shared by every reconcile path:
         /// arrange the surfaces *visible on the active workspace*, declare that
         /// layout, then mark every other surface (apps on inactive workspaces)
@@ -406,6 +437,24 @@ pub mod daemon {
                 .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
                 .cloned()
                 .collect();
+
+            // Zoom (fullscreen) short-circuits the normal layout: if a surface on
+            // the active workspace is zoomed, it alone fills the whole screen
+            // (covering chrome) and everything else render-gates.
+            if let Some(zid) = self.zoomed.filter(|z| active.iter().any(|s| s.surface_id == *z)) {
+                let layout = WmDeclareLayoutPayload {
+                    slots: vec![WmSlot { surface_id: zid, rect: self.screen.rect, layer: 0 }],
+                    focus: zid,
+                };
+                conn.declare_layout(&layout)?;
+                let decisions: Vec<WmSetRenderingPayload> = surfaces
+                    .iter()
+                    .map(|s| WmSetRenderingPayload { surface_id: s.surface_id, rendering: s.surface_id == zid })
+                    .collect();
+                conn.set_rendering(&decisions)?;
+                return Ok(layout);
+            }
+
             let tiled = self.tiled_workspaces.contains(&self.active);
             let layout = arrange_for(&self.screen, &active, self.focus_intent, tiled);
             conn.declare_layout(&layout)?;
@@ -907,5 +956,31 @@ mod tests {
         // Split OFF → back to stacked (1 gated again).
         assert!(!wm.toggle_split(&mut conn).unwrap(), "back to stacked");
         assert_eq!(conn.rendering.iter().filter(|r| !r.rendering).count(), 1, "stacked again");
+    }
+
+    #[test]
+    fn zoom_fills_the_screen_and_gates_everything_else() {
+        let mut conn = MockConn {
+            surfaces: vec![
+                surf(1, WmRole::Document),
+                surf(2, WmRole::Document),
+                surf(9, WmRole::Chrome),
+            ],
+            ..Default::default()
+        };
+        let mut wm = Wm::new(screen());
+        wm.focus_intent = Some(1);
+        // Zoom the focused document.
+        assert!(wm.toggle_zoom(&mut conn).unwrap(), "zoomed on");
+        let layout = conn.declared.as_ref().unwrap();
+        assert_eq!(layout.slots.len(), 1, "only the zoomed surface is laid out");
+        assert_eq!(layout.slots[0].surface_id, 1);
+        assert_eq!(layout.slots[0].rect, screen().rect, "fills the whole screen (covers chrome)");
+        // Everything except the zoomed surface is gated — even global chrome.
+        let rendered: Vec<u32> = conn.rendering.iter().filter(|r| r.rendering).map(|r| r.surface_id).collect();
+        assert_eq!(rendered, vec![1], "only the zoomed surface renders");
+        // Toggle off → back to the normal arrangement (chrome + a doc render again).
+        assert!(!wm.toggle_zoom(&mut conn).unwrap(), "zoomed off");
+        assert!(conn.declared.as_ref().unwrap().slots.len() > 1, "normal arrangement restored");
     }
 }

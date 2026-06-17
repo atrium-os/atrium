@@ -40,6 +40,8 @@ const MOD_GUI: u8 = 0x08 | 0x80;
 const KEY_1: u16 = 0x1E;
 /// Super+S toggles the split (tiled) layout for the active workspace. HID 0x16 = 'S'.
 const KEY_S: u16 = 0x16;
+/// Super+F toggles zoom (fullscreen) for the focused surface. HID 0x09 = 'F'.
+const KEY_F: u16 = 0x09;
 
 /// The live frescod connection — the production implementation of the seam the
 /// reconcile loop drives. Each method is one window-management protocol op.
@@ -170,6 +172,7 @@ fn spawn_input_poller(core: Core) {
             let mut cycle = false;
             let mut switch_ws: Option<usize> = None;
             let mut split = false;
+            let mut zoom = false;
             {
                 let mut g = core.lock().unwrap();
                 loop {
@@ -190,6 +193,9 @@ fn spawn_input_poller(core: Core) {
                         // Super+S: toggle split (tiled) layout for the active workspace.
                         Ok(Some(Event::Key { hid_usage: KEY_S, pressed: true, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 => split = true,
+                        // Super+F: toggle zoom (fullscreen) for the focused surface.
+                        Ok(Some(Event::Key { hid_usage: KEY_F, pressed: true, modifiers, .. }))
+                            if modifiers & MOD_GUI != 0 => zoom = true,
                         // Super+1..N: switch the active workspace.
                         Ok(Some(Event::Key { hid_usage, pressed: true, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 && hid_usage >= KEY_1 && hid_usage < KEY_1 + 9 =>
@@ -249,6 +255,15 @@ fn spawn_input_poller(core: Core) {
                 match wm.toggle_split(conn) {
                     Ok(t) => eprintln!("forum-wm: split {} for active workspace", if t { "ON (tiled)" } else { "OFF (stacked)" }),
                     Err(e) => eprintln!("forum-wm: toggle_split error: {e}"),
+                }
+            }
+
+            if zoom {
+                let mut g = core.lock().unwrap();
+                let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
+                match wm.toggle_zoom(conn) {
+                    Ok(z) => eprintln!("forum-wm: zoom {}", if z { "ON (fullscreen)" } else { "OFF" }),
+                    Err(e) => eprintln!("forum-wm: toggle_zoom error: {e}"),
                 }
             }
 
