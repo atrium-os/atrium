@@ -183,6 +183,10 @@ legacy commitments — would look like across every layer, and to let
 those design choices flow back into other ecosystems by example. The
 goal is influence-by-demonstration, not market share.
 
+How that "flow back" happens without diluting the clean-cut — port the
+*architecture* (open protocols + a portable userspace behind a thin OS seam),
+**not** the OS — is the **portability doctrine**: [`spec/portability.md`](spec/portability.md).
+
 This framing matters because it changes what "success" looks like.
 A platform aiming to replace Linux fails until it has 100M users. A
 platform aiming to be a coherent next-generation demonstrator
