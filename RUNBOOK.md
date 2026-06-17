@@ -765,6 +765,11 @@ vssh 'export FRESCOD_BUNDLE=/root/wmtest/bundles/atrium-core
 #   apps (chrome + background stay global). Digit HID usages: '1'=0x1E .. so Super+2:
 #       printf 'KEY 0x1f 1 0x08\nKEY 0x1f 0 0x08\n' | nc -N -U /tmp/fzin.sock
 #     → "switched to <name|workspace N>"; the prior workspace's docs log "render-gating".
+#   Move a window to a workspace: Super+Shift+N (Shift adds 0x02 → mods 0x0a). Super+Shift+3:
+#       printf 'KEY 0x20 1 0x0a\nKEY 0x20 0 0x0a\n' | nc -N -U /tmp/fzin.sock
+#     → "moved surface N to <ws>". The move PERSISTS: it resolves the app-id and writes
+#     the placement to the state file (FORUM_STATE or /var/db/atrium/<user>/forum-
+#     workspaces.state), loaded at startup so a relaunch/reboot lands the app there.
 #   Persistent config (optional): FORUM_CONFIG=/path/forum.toml (else /var/db/atrium/
 #     <user>/forum.toml). Sample at etc/forum.toml.example: workspaces=N, names=[...],
 #     [assign] app-id→ws.
