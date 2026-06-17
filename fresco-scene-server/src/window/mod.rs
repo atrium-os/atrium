@@ -193,6 +193,10 @@ pub struct Window {
     /// (`WindowHints.role`), defaulting to `Document`. The WM reads this
     /// over `WM_ENUMERATE` to place + layer the surface (`forum.md` §2.2).
     pub role: WmRole,
+    /// The owning client's uid (`getpeereid`) — the stable kernel identity of
+    /// the app, reported over `WM_ENUMERATE` so the WM can resolve it to an
+    /// app-id (launch registry) for workspace assignment. 0 = unresolved.
+    pub owner_uid: u32,
 }
 
 impl Window {
@@ -210,6 +214,7 @@ impl Window {
             rendering: true,
             title_glyphs: Vec::new(),
             role:  WmRole::Document,
+            owner_uid: 0,
         }
     }
 
@@ -224,6 +229,7 @@ impl Window {
             rendering: true,
             title_glyphs: Vec::new(),
             role:  WmRole::Document,
+            owner_uid: 0,
         }
     }
 }

@@ -213,6 +213,15 @@ fn reader_loop(
 ) -> io::Result<()> {
     let peer_pid = peer_cred_pid(&stream);
 
+    /* Record the peer's uid (getpeereid) so surfaces this client creates carry
+     * their app's stable kernel identity over WM_ENUMERATE — the WM resolves it
+     * to an app-id (launch registry) for workspace assignment. Identity only,
+     * not a capability decision (window-management stays reachability-gated), so
+     * frescod needs no registry/portcullis-peer dependency here. */
+    if let Some((_, uid)) = peer_xucred(&stream) {
+        frontend.lock().unwrap().register_client_uid(client_id, uid);
+    }
+
     /* Capability admission for the cross-app window-management ops = REACHABILITY.
      * The connection arrived on the DEDICATED window-management socket, which the
      * TCB mounts into a jail only when that app holds `window-management`

@@ -29,6 +29,7 @@ mod tests {
         WmSurfaceInfo {
             surface_id: id,
             owner_app: app.into(),
+            owner_uid: 0,
             role: WmRole::Document,
             rect: WmRect { x: 0, y: 0, w: 0, h: 0 },
         }

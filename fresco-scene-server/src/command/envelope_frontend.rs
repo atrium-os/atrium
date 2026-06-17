@@ -282,6 +282,12 @@ pub struct EnvelopeFrontend {
     /// `Forbidden`, so an ordinary app can never enumerate or place
     /// another app's surfaces.
     wm_capable: std::collections::HashSet<u8>,
+
+    /// client_id → owning uid (`getpeereid`), recorded by the connection-accept
+    /// layer. Stamped onto each `Window` at create time so `WM_ENUMERATE` can
+    /// report the stable kernel identity (the WM resolves it to an app-id for
+    /// workspace assignment). Absent → 0 (unresolved, e.g. a test harness).
+    client_uids: HashMap<u8, u32>,
 }
 
 impl EnvelopeFrontend {
@@ -305,6 +311,7 @@ impl EnvelopeFrontend {
             pending_atlas_uploads: Vec::new(),
             pending_region_uploads: Vec::new(),
             wm_capable: std::collections::HashSet::new(),
+            client_uids: HashMap::new(),
         }
     }
 
@@ -320,6 +327,14 @@ impl EnvelopeFrontend {
     /// Drop a client's grants (on disconnect). Cheap no-op if absent.
     pub fn revoke_client_caps(&mut self, client_id: u8) {
         self.wm_capable.remove(&client_id);
+        self.client_uids.remove(&client_id);
+    }
+
+    /// Record the connecting client's uid (`getpeereid`), called by the accept
+    /// layer. Surfaces this client creates are stamped with it so the WM learns
+    /// the app's stable identity over `WM_ENUMERATE`.
+    pub fn register_client_uid(&mut self, client_id: u8, uid: u32) {
+        self.client_uids.insert(client_id, uid);
     }
 
     /// Stash a blob into the scene-server CasStore. The aqueduct
@@ -807,6 +822,9 @@ impl EnvelopeFrontend {
                 Some(fresco_protocol::WmRole::Hud) | None => fresco_protocol::WmRole::Document,
                 Some(r) => r,
             };
+            // Stamp the owning uid (resolved at connect) so WM_ENUMERATE carries
+            // the surface's stable app identity for workspace assignment.
+            win.owner_uid = self.client_uids.get(&self.current_client).copied().unwrap_or(0);
             let _ = p.parent_window_id;
         }
 
@@ -849,6 +867,7 @@ impl EnvelopeFrontend {
             .map(|w| WmSurfaceInfo {
                 surface_id: w.id as u32,
                 owner_app:  format!("client:{}", w.owner),
+                owner_uid:  w.owner_uid,
                 role:       w.role,
                 rect: WmRect {
                     x: w.pos.0 as i32,

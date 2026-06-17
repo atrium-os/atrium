@@ -199,6 +199,7 @@ fn subtract(r: &WmRect, cut: &WmRect) -> Vec<WmRect> {
 pub mod daemon {
     use super::{arrange, rendering_decisions, Screen};
     use fresco_protocol::{WmDeclareLayoutPayload, WmRole, WmSetRenderingPayload, WmSurfaceInfo};
+    use portcullis_peer::AppRegistry;
     use std::collections::HashMap;
     use std::io;
 
@@ -273,6 +274,10 @@ pub mod daemon {
         pub assign_rules: HashMap<String, usize>,
         /// Optional workspace names (cosmetic; from config). Indexed by workspace.
         pub names: Vec<String>,
+        /// The launch registry (uid → app-id), loaded by the binary from
+        /// portcullis-peer. Used to resolve a surface's `owner_uid` to its
+        /// app-id so [`assign_rules`](Self::assign_rules) (keyed by app-id) apply.
+        pub registry: AppRegistry,
     }
 
     impl Wm {
@@ -285,6 +290,7 @@ pub mod daemon {
                 assignment: HashMap::new(),
                 assign_rules: HashMap::new(),
                 names: Vec::new(),
+                registry: AppRegistry::default(),
             }
         }
 
@@ -396,12 +402,13 @@ pub mod daemon {
         {
             let surfaces = conn.enumerate()?;
             if let Some(s) = surfaces.iter().find(|s| s.surface_id == new_id) {
-                // Land the newcomer: a configured per-app rule (keyed by app-id)
-                // wins, else the active workspace (the default flow).
+                // Land the newcomer: resolve its owning uid → app-id via the
+                // launch registry, and if config has a rule for that app-id use
+                // its workspace; else the active workspace (the default flow).
                 let ws = self
-                    .assign_rules
-                    .get(&s.owner_app)
-                    .copied()
+                    .registry
+                    .resolve(s.owner_uid)
+                    .and_then(|(_user, app)| self.assign_rules.get(app).copied())
                     .filter(|w| *w < self.workspaces)
                     .unwrap_or(self.active);
                 self.assignment.insert(new_id, ws);
@@ -506,7 +513,7 @@ mod tests {
         Screen { rect: WmRect { x: 0, y: 0, w: 1920, h: 1080 }, bar_h: 24, dock_h: 48 }
     }
     fn surf(id: u32, role: WmRole) -> WmSurfaceInfo {
-        WmSurfaceInfo { surface_id: id, owner_app: format!("org.atrium.app{id}"), role, rect: WmRect { x: 0, y: 0, w: 0, h: 0 } }
+        WmSurfaceInfo { surface_id: id, owner_app: format!("org.atrium.app{id}"), owner_uid: 0, role, rect: WmRect { x: 0, y: 0, w: 0, h: 0 } }
     }
 
     #[test]
@@ -767,5 +774,37 @@ mod tests {
         let declared: Vec<u32> =
             conn.declared.as_ref().unwrap().slots.iter().map(|s| s.surface_id).collect();
         assert!(declared.contains(&9), "chrome is global — present on every workspace");
+    }
+
+    #[test]
+    fn config_rule_lands_a_known_app_on_its_workspace() {
+        use portcullis_peer::AppRegistry;
+        // A surface owned by uid 1001, which the launch registry maps to the
+        // navigator app; config assigns that app to workspace 1.
+        let mut conn = MockConn {
+            surfaces: vec![WmSurfaceInfo {
+                surface_id: 7,
+                owner_app: "client:1".into(),
+                owner_uid: 1001,
+                role: WmRole::Document,
+                rect: WmRect { x: 0, y: 0, w: 0, h: 0 },
+            }],
+            ..Default::default()
+        };
+        let mut wm = Wm::new(screen()); // active workspace is 0
+        wm.registry = AppRegistry::parse("1001 alice org.atrium.navigator");
+        wm.assign_rules.insert("org.atrium.navigator".into(), 1);
+
+        wm.focus_new(&mut conn, 7).unwrap();
+        assert_eq!(wm.assignment.get(&7), Some(&1), "the app lands on its configured workspace");
+        // It didn't open on the active workspace, so it isn't auto-focused.
+        assert_ne!(wm.focus_intent, Some(7));
+        // An unknown uid (no registry entry / no rule) falls back to active.
+        let mut conn2 = MockConn {
+            surfaces: vec![surf(8, WmRole::Document)], // owner_uid 0
+            ..Default::default()
+        };
+        wm.focus_new(&mut conn2, 8).unwrap();
+        assert_eq!(wm.assignment.get(&8), Some(&0), "unconfigured app opens on the active workspace");
     }
 }

@@ -39,6 +39,9 @@ pub fn translate(ev: &fresco_client::Event) -> Option<Event> {
         | fresco_client::Event::CloseRequested { .. }
         | fresco_client::Event::DpiChanged { .. }
         | fresco_client::Event::PointerScroll { .. }
+        // Window lifecycle (create/destroy) is a WM concern, not app input.
+        | fresco_client::Event::WindowCreated { .. }
+        | fresco_client::Event::WindowDestroyed { .. }
         | fresco_client::Event::Unknown { .. } => None,
     }
 }

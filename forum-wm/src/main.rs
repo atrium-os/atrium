@@ -102,6 +102,11 @@ fn main() -> io::Result<()> {
     wm.workspaces = cfg.workspaces;
     wm.names = cfg.names;
     wm.assign_rules = cfg.assign;
+    // The launch registry (uid → app-id) resolves a surface's owner_uid to its
+    // app-id so per-app workspace rules apply. Reloaded on each new window
+    // (it's append-only) to pick up apps launched after startup.
+    wm.registry = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+        .unwrap_or_default();
     let layout = wm.reconcile(&mut io_conn)?;
     eprintln!(
         "forum-wm: declared layout — {} surface(s), focus={}",
@@ -203,8 +208,13 @@ fn spawn_input_poller(core: Core) {
                 let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
                 let r = match created {
                     Some(id) => {
-                        wm.assign_to_active(id); // new window lands on the current workspace
-                        wm.focus_new(conn, id)
+                        // Refresh the registry so an app launched since startup
+                        // resolves to its app-id (→ its configured workspace).
+                        wm.registry = portcullis_peer::AppRegistry::load(
+                            portcullis_peer::DEFAULT_REGISTRY,
+                        )
+                        .unwrap_or_default();
+                        wm.focus_new(conn, id) // assigns by app rule, else active
                     }
                     None => wm.reconcile(conn),
                 };

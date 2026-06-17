@@ -212,6 +212,11 @@ pub enum WmRole {
 pub struct WmSurfaceInfo {
     pub surface_id: u32,
     pub owner_app: String,
+    /// The owning client's uid (`getpeereid`), the authoritative, stable kernel
+    /// identity of the surface's app. The WM resolves it to a human app-id via
+    /// the launch registry (portcullis-peer) for workspace assignment etc.; 0 =
+    /// unresolved (not a peer-credentialed connection, e.g. a dev/test harness).
+    pub owner_uid: u32,
     pub role: WmRole,
     pub rect: WmRect,
 }
@@ -1151,6 +1156,7 @@ mod tests {
             surfaces: vec![WmSurfaceInfo {
                 surface_id: 1,
                 owner_app: "org.atrium.editor".into(),
+                owner_uid: 1001,
                 role: WmRole::Document,
                 rect: WmRect { x: 0, y: 24, w: 1920, h: 1008 },
             }],
