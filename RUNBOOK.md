@@ -772,6 +772,10 @@ vssh 'export FRESCOD_BUNDLE=/root/wmtest/bundles/atrium-core
 #   stacked (one focused fills, rest gated) and tiled (docs side-by-side, all render):
 #       printf 'KEY 0x16 1 0x08\nKEY 0x16 0 0x08\n' | nc -N -U /tmp/fzin.sock
 #     → "split ON (tiled)/OFF (stacked)".
+# Zoom (fullscreen): Super+F (0x09) toggles the focused surface to fill the whole
+#   screen (covering chrome), everything else gated:
+#       printf 'KEY 0x09 1 0x08\nKEY 0x09 0 0x08\n' | nc -N -U /tmp/fzin.sock
+#     → "zoom ON (fullscreen)/OFF".
 # Per-app placement (app-id): frescod stamps owner_uid (getpeereid) in WM_ENUMERATE;
 #   forum-wm resolves it via the launch registry /var/run/atrium/app-registry
 #   ("<uid> <user> <app-id>" lines) → [assign] rule. To exercise as root (uid 0):
