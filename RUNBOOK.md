@@ -665,6 +665,92 @@ Post-fix per-frame timings (`frescod-vulkan-smoke` log):
 
 Trace data + writeup: `scratch/venus-perf/2026-05-08-trace*/`.
 
+#### Headless interactive harness — real `frescod` + injected input + event-driven WM (2026-06-17)
+
+The newest harness drives the **real `frescod`** (its `run_headless` path, not the
+old `frescod-wm-harness`) on lavapipe: a continuous compositor that writes a PNG
+every frame and accepts **scripted input over a UNIX socket** — so input → hit-test →
+focus → WM → render can be exercised end-to-end with no `/dev/hidraw` or display
+cdev. Three sockets, all opt-in via env:
+
+- `FRESCOD_SOCK` — client socket (apps draw here; never granted window-management)
+- `FRESCOD_WM_SOCK` — dedicated window-management socket (reaching it = the grant;
+  this is what `forum-wm` connects to, via `FRESCO_WM_SOCKET`)
+- `FRESCOD_INPUT_SOCK` — the injector. Line protocol (`frescod/src/injector_reader.rs`):
+  `MOVE x y` / `BTN button 0|1` / `KEY hid_usage 0|1 [mods]` / `SCROLL dy`. Feeds the
+  same `DisplayEvent` sink + cursor/hit-test/focus as the real HID readers.
+- `FRESCOD_HEADLESS_PNG=<base>` → writes `<base>.png` (1280×720) every frame.
+- `FRESCOD_BUNDLE=<dir>` → atrium-core bundle (compute SPVs + fonts); atrium-text is
+  picked up as a sibling. Staged bundles live at `/root/wmtest/bundles/{atrium-core,atrium-text}`.
+
+**Inject from the shell with `nc -N -U`** — the injector never closes the connection,
+so plain `nc -U` HANGS. The `-N` (shutdown on EOF) is mandatory.
+
+PNGs are written to the **9p-mounted host path** (`/mnt/host/...` == `~/src/bsd/...`,
+`security_model=none` so writes land on the host fs) → then `Read`/`open` them on the
+host. Data files over 9p are fine; only **execve off 9p panics p9fs** (copy binaries to
+local ZFS first, see §2).
+
+```sh
+# host: cross-build (the frescod bin builds even though frescod-aqueduct-smoke is
+# currently broken — build just the bin you need)
+( cd ~/src/bsd/frescod  && cargo build --release --target aarch64-unknown-freebsd --bin frescod )
+( cd ~/src/bsd/forum-wm && cargo build --release --target aarch64-unknown-freebsd --bins )
+
+# VM: stage binaries to local ZFS (NEVER execve off 9p)
+vssh 'cp /mnt/host/frescod/target/aarch64-unknown-freebsd/release/frescod /root/frescod-z
+  cp /mnt/host/forum-wm/target/aarch64-unknown-freebsd/release/forum-wm /root/forum-wm-z
+  chmod +x /root/frescod-z /root/forum-wm-z'
+```
+
+**(A) z-order determinism check** — the regression guard for the
+"sometimes background box present, sometimes not" bug (`render_one_frame` used to
+iterate per-window node maps via `HashMap::values()`, whose order is per-process
+seeded → nondeterministic painter z-order). Render the same Pergola app in N *fresh*
+frescod processes; the PNGs must be **byte-identical** and show every box:
+
+```sh
+vssh 'export FRESCOD_BUNDLE=/root/wmtest/bundles/atrium-core
+  for run in 1 2 3; do
+    rm -f /tmp/fz$run.sock
+    FRESCOD_HEADLESS_PNG=/mnt/host/scratch/ztest/z$run FRESCOD_SOCK=/tmp/fz$run.sock \
+      /root/frescod-z >/tmp/fz$run.log 2>&1 & FP=$!
+    sleep 3
+    FRESCO_SOCK=/tmp/fz$run.sock /root/forumtest/vestibulum >/dev/null 2>&1 & VP=$!
+    sleep 3; kill $VP $FP 2>/dev/null; sleep 1
+  done'
+md5 ~/src/bsd/scratch/ztest/z{1,2,3}.png   # host: all three hashes must match
+open ~/src/bsd/scratch/ztest/z1.png        # → teal bg + both field boxes + amber "Sign in" button
+# NOTE: vestibulum reads FRESCO_SOCK (not FRESCO_SOCKET); wm-app-stub reads FRESCO_SOCKET.
+```
+
+**(B) event-driven WM — create/destroy → auto-reconcile.** `frescod` broadcasts
+`EV_WINDOW_CREATED`/`EV_WINDOW_DESTROYED` (0x0584/0x0585) to every connection;
+`forum-wm`'s input poller reconciles when the surface set changes (and applies
+focus-follows-click on a primary press over a focusable app surface):
+
+```sh
+vssh 'export FRESCOD_BUNDLE=/root/wmtest/bundles/atrium-core
+  rm -f /tmp/fz.sock /tmp/fzwm.sock /tmp/fzin.sock /tmp/fzctl.sock
+  FRESCOD_HEADLESS_PNG=/mnt/host/scratch/ztest/wm FRESCOD_SOCK=/tmp/fz.sock \
+    FRESCOD_WM_SOCK=/tmp/fzwm.sock FRESCOD_INPUT_SOCK=/tmp/fzin.sock \
+    /root/frescod-z >/tmp/fzf.log 2>&1 & sleep 3
+  FRESCO_WM_SOCKET=/tmp/fzwm.sock FORUM_CTL_SOCKET=/tmp/fzctl.sock FORUM_SCREEN=1280x720 \
+    /root/forum-wm-z >/tmp/fzwm.log 2>&1 & sleep 2
+  FRESCO_SOCKET=/tmp/fz.sock APP_TITLE=alpha /root/wmtest/wm-app-stub >/dev/null 2>&1 & A=$!; sleep 1.5
+  FRESCO_SOCKET=/tmp/fz.sock APP_TITLE=beta  /root/wmtest/wm-app-stub >/dev/null 2>&1 & B=$!; sleep 1.5
+  kill $B; sleep 1.5
+  cat /tmp/fzwm.log; pkill -f frescod-z; pkill -f wm-app-stub; pkill -f forum-wm-z'
+# → "declared layout — 0 surface(s)" then three "reconciled on surface change":
+#   1 surface (create alpha) → 2 surfaces (create beta) → 1 surface (destroy beta).
+# Inject a click over a window: printf 'MOVE 640 360\nBTN 1 1\nBTN 1 0\n' | nc -N -U /tmp/fzin.sock
+#   → forum-wm logs "focus-follows-click → surface N" IF the click hits a non-focused
+#     focusable surface. CAVEAT: the WM_ENUMERATE stub tags every surface Document, so
+#     multiple stubs share the work-area rect and fully overlap — click-to-focus between
+#     them isn't geometrically distinguishable yet (needs tiling / real role declaration).
+#     The focus-follows-click policy itself is unit-tested (forum-wm resolve_click_focus).
+```
+
 #### Build cycle: rebuilding the patched MoltenVK
 
 The atrium venus stack depends on `atrium-os/MoltenVK` (one-line fix vs upstream). After `git pull` on the fork:
