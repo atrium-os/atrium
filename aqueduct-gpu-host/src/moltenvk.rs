@@ -775,6 +775,14 @@ impl MoltenVkBackend {
                 asd.cmd_build_acceleration_structures(cb, &[tbi], &[&[trange]]);
             })?;
 
+            let as_mb = (bsz.acceleration_structure_size + bsz.build_scratch_size
+                + tsz.acceleration_structure_size + tsz.build_scratch_size
+                + inst_bytes.len() as u64 + vbytes) as f64 / 1e6;
+            eprintln!("build_prefab_tlas: {} instances, AS+scratch+inst+verts = {:.1} MB \
+                       (BLAS {:.2} / TLAS {:.2} MB)", instances.len(), as_mb,
+                      bsz.acceleration_structure_size as f64 / 1e6,
+                      tsz.acceleration_structure_size as f64 / 1e6);
+
             self.accels.lock().unwrap().insert(tlas_id.raw(),
                 MvkAccel { tlas, blas, owned });
         }
