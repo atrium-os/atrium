@@ -797,6 +797,16 @@ impl EnvelopeFrontend {
             if let Some((x, y)) = p.hints.initial_position {
                 win.pos = (x as f32, y as f32);
             }
+            /* Record the declared role so WM_ENUMERATE reports it and the
+             * WM can place/layer by role (forum.md §2.2). `hud` is a
+             * Forum-reserved layer no app may claim (overlay-safety): clamp
+             * it to Document. Capability-gating the other privileged roles
+             * (e.g. chrome only for shell apps) is future work — today the
+             * hint is trusted for everything except hud. */
+            win.role = match p.hints.role {
+                Some(fresco_protocol::WmRole::Hud) | None => fresco_protocol::WmRole::Document,
+                Some(r) => r,
+            };
             let _ = p.parent_window_id;
         }
 
@@ -822,12 +832,11 @@ impl EnvelopeFrontend {
     /// compositor" *is* exactly this seat's surfaces — cross-user
     /// isolation is structural (bob's windows live in bob's frescod).
     ///
-    /// F0 stubs two fields the server doesn't track yet: `role` defaults
-    /// to `Document` (role declaration is later WM plumbing) and
-    /// `owner_app` is synthesised from the owning client id (the real
-    /// app-id arrives with the peer-cred → registry binding). The shell
-    /// gets the geometry it needs to arrange now; richer classification
-    /// layers in without a wire change.
+    /// `role` is the role the client declared at create time
+    /// (`WindowHints.role`, defaulting to `Document`); `owner_app` is
+    /// still synthesised from the owning client id (the real app-id
+    /// arrives with the peer-cred → registry binding). The shell gets the
+    /// geometry + role it needs to place + layer surfaces.
     fn handle_wm_enumerate(&mut self, _msg: &Message)
         -> Result<Vec<Outbound>, DispatchError>
     {
@@ -840,7 +849,7 @@ impl EnvelopeFrontend {
             .map(|w| WmSurfaceInfo {
                 surface_id: w.id as u32,
                 owner_app:  format!("client:{}", w.owner),
-                role:       WmRole::Document,
+                role:       w.role,
                 rect: WmRect {
                     x: w.pos.0 as i32,
                     y: w.pos.1 as i32,

@@ -448,6 +448,12 @@ pub struct WindowHints {
     pub max_size: Option<(u32, u32)>,
     /// Initial position hint. `None` = compositor decides.
     pub initial_position: Option<(i32, i32)>,
+    /// Declared window-management role (`forum.md` §2.2). `None` = the
+    /// WM treats the surface as a `Document`. Apps that are dialogs,
+    /// panels, or chrome declare it so Forum places + layers them by
+    /// role instead of as an ordinary document. An app cannot request a
+    /// privileged layer (`hud`) — that's refused; the hint only informs.
+    pub role: Option<WmRole>,
 }
 
 /// `OP_WINDOW_REQUEST_CLOSE` — toolkit-initiated close. Server
@@ -989,6 +995,7 @@ mod tests {
                 min_size: Some((400, 300)),
                 max_size: None,
                 initial_position: None,
+                role: None,
             },
             parent_window_id: 0,
         };

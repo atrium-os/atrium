@@ -38,15 +38,48 @@ impl Screen {
 
 /// Lower layer = closer to the viewer (drawn on top). Reserved roles sit above app
 /// content so the shell/system is never coverable by an app.
+///
+/// Documents split into two layers by focus (see [`slot_layer`]): the *focused*
+/// document sits at [`DOC_FOCUSED`] on top of its peers at [`DOC_UNFOCUSED`], so
+/// the occlusion pass ([`rendering_decisions`]) render-gates the unfocused ones
+/// (they share the work area, fully covered by the focused document). This is the
+/// F1 "occluded surface render-gated" tie — the default arrangement is one focused
+/// document filling the work area, the rest stacked + gated (forum.md §2.3), not
+/// tiled (that's an F2 split/group intent).
+const DOC_FOCUSED: i32 = 4;
+const DOC_UNFOCUSED: i32 = 5;
+
 fn layer(role: WmRole) -> i32 {
     match role {
         WmRole::Dialog => 0,
         WmRole::Hud => 1,
         WmRole::Chrome => 2,
         WmRole::Panel => 3,
-        WmRole::Document => 4,
-        WmRole::Background => 5,
+        WmRole::Document => DOC_FOCUSED,
+        WmRole::Background => 6,
     }
+}
+
+/// The layer a surface occupies given the resolved focus. Identical to [`layer`]
+/// except a *document that isn't the focused surface* drops behind the focused
+/// one ([`DOC_UNFOCUSED`]) so it gets occluded + render-gated.
+fn slot_layer(s: &WmSurfaceInfo, focus: u32) -> i32 {
+    match s.role {
+        WmRole::Document if s.surface_id != focus => DOC_UNFOCUSED,
+        r => layer(r),
+    }
+}
+
+/// Resolve which surface holds focus: a dialog grabs it; else the caller's intent
+/// (if that surface still exists); else the topmost document; else nothing (0).
+fn resolve_focus(surfaces: &[WmSurfaceInfo], focus_intent: Option<u32>) -> u32 {
+    surfaces
+        .iter()
+        .find(|s| s.role == WmRole::Dialog)
+        .map(|s| s.surface_id)
+        .or_else(|| focus_intent.filter(|f| surfaces.iter().any(|s| s.surface_id == *f)))
+        .or_else(|| surfaces.iter().find(|s| s.role == WmRole::Document).map(|s| s.surface_id))
+        .unwrap_or(0)
 }
 
 fn rect_for(screen: &Screen, role: WmRole) -> WmRect {
@@ -70,25 +103,29 @@ fn rect_for(screen: &Screen, role: WmRole) -> WmRect {
 
 /// Place the session's surfaces by role → the atomic layout + focus. A dialog
 /// grabs focus; else `focus_intent` (if still present); else the topmost document.
+///
+/// Focus-aware layering: the focused document sits on top ([`DOC_FOCUSED`]) and any
+/// other documents drop behind it ([`DOC_UNFOCUSED`]), so [`rendering_decisions`]
+/// render-gates the ones the focused document fully covers. The default is one
+/// focused document filling the work area with the rest stacked + gated — the
+/// intent-managed default (forum.md §2.3), not tiling.
 pub fn arrange(
     screen: &Screen,
     surfaces: &[WmSurfaceInfo],
     focus_intent: Option<u32>,
 ) -> WmDeclareLayoutPayload {
+    let focus = resolve_focus(surfaces, focus_intent);
+
     let mut ordered: Vec<&WmSurfaceInfo> = surfaces.iter().collect();
-    ordered.sort_by_key(|s| layer(s.role));
+    ordered.sort_by_key(|s| slot_layer(s, focus));
     let slots: Vec<WmSlot> = ordered
         .iter()
-        .map(|s| WmSlot { surface_id: s.surface_id, rect: rect_for(screen, s.role), layer: layer(s.role) })
+        .map(|s| WmSlot {
+            surface_id: s.surface_id,
+            rect: rect_for(screen, s.role),
+            layer: slot_layer(s, focus),
+        })
         .collect();
-
-    let focus = surfaces
-        .iter()
-        .find(|s| s.role == WmRole::Dialog)
-        .map(|s| s.surface_id)
-        .or_else(|| focus_intent.filter(|f| surfaces.iter().any(|s| s.surface_id == *f)))
-        .or_else(|| surfaces.iter().find(|s| s.role == WmRole::Document).map(|s| s.surface_id))
-        .unwrap_or(0);
 
     WmDeclareLayoutPayload { slots, focus }
 }
@@ -367,6 +404,46 @@ mod tests {
         };
         let r = rendering_decisions(&layout);
         assert!(r.iter().find(|x| x.surface_id == 1).unwrap().rendering, "partial occlusion still renders (Fresco clips)");
+    }
+
+    #[test]
+    fn focused_document_renders_and_gates_its_peers() {
+        // The F1 default: two documents share the work area; only the focused one
+        // is on top + rendering, the other is fully occluded → render-gated.
+        let surfaces = [surf(1, WmRole::Document), surf(2, WmRole::Document)];
+        let l = arrange(&screen(), &surfaces, Some(2));
+        assert_eq!(l.focus, 2);
+        let d1 = l.slots.iter().find(|s| s.surface_id == 1).unwrap();
+        let d2 = l.slots.iter().find(|s| s.surface_id == 2).unwrap();
+        assert!(d2.layer < d1.layer, "focused document sits on top of its peers");
+        let r = rendering_decisions(&l);
+        assert!(r.iter().find(|x| x.surface_id == 2).unwrap().rendering, "focused document renders");
+        assert!(!r.iter().find(|x| x.surface_id == 1).unwrap().rendering, "occluded peer is render-gated");
+    }
+
+    #[test]
+    fn switching_focus_flips_which_document_is_gated() {
+        let surfaces = [surf(1, WmRole::Document), surf(2, WmRole::Document)];
+        for (focus, gated) in [(1u32, 2u32), (2, 1)] {
+            let r = rendering_decisions(&arrange(&screen(), &surfaces, Some(focus)));
+            assert!(r.iter().find(|x| x.surface_id == focus).unwrap().rendering, "focus={focus} renders");
+            assert!(!r.iter().find(|x| x.surface_id == gated).unwrap().rendering, "focus={focus}: {gated} gated");
+        }
+    }
+
+    #[test]
+    fn a_panel_docks_beside_the_document_so_both_render() {
+        // A panel gets the right-quarter dock (not the full work area), so it
+        // doesn't cover the document — both stay visible + rendering.
+        let surfaces = [surf(1, WmRole::Document), surf(2, WmRole::Panel)];
+        let l = arrange(&screen(), &surfaces, Some(1));
+        let wa = screen().work_area();
+        let panel = l.slots.iter().find(|s| s.surface_id == 2).unwrap();
+        assert!(panel.rect.w < wa.w, "panel is narrower than the work area");
+        assert_eq!(panel.rect.x + panel.rect.w, wa.x + wa.w, "panel docked at the right edge");
+        let r = rendering_decisions(&l);
+        assert!(r.iter().find(|x| x.surface_id == 1).unwrap().rendering, "document still visible beside the panel");
+        assert!(r.iter().find(|x| x.surface_id == 2).unwrap().rendering, "panel renders");
     }
 
     // ── the daemon reconcile loop ────────────────────────────────────────────

@@ -16,6 +16,7 @@ use crate::command::protocol::{Hash256, NULL_HASH};
 use crate::render::font::FontData;
 use crate::scene::graph::SceneGraph;
 use crate::scene::slots::SlotTable;
+use fresco_protocol::WmRole;
 use std::sync::{Arc, Mutex, mpsc};
 
 /// Server-driven async events emitted by the compositor when its
@@ -188,6 +189,10 @@ pub struct Window {
     /// when title or theme changes; per-frame compose just translates
     /// each glyph by its (x, y) under a shared title_origin.
     pub title_glyphs: Vec<(Hash256, f32, f32)>,
+    /// Window-management role the client declared at create time
+    /// (`WindowHints.role`), defaulting to `Document`. The WM reads this
+    /// over `WM_ENUMERATE` to place + layer the surface (`forum.md` §2.2).
+    pub role: WmRole,
 }
 
 impl Window {
@@ -204,6 +209,7 @@ impl Window {
             z:     0,
             rendering: true,
             title_glyphs: Vec::new(),
+            role:  WmRole::Document,
         }
     }
 
@@ -217,6 +223,7 @@ impl Window {
             focus: false, z: 0,
             rendering: true,
             title_glyphs: Vec::new(),
+            role:  WmRole::Document,
         }
     }
 }

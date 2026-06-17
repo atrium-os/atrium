@@ -43,7 +43,13 @@ impl FrescoConn for ClientConn {
     }
     fn set_rendering(&mut self, decisions: &[WmSetRenderingPayload]) -> io::Result<()> {
         // The protocol marks one surface at a time; the WM batches the set.
+        // Log the gated surfaces — this is the F1 engine tie made visible: a
+        // fully-occluded surface stops compositing, its GPU work idles, and the
+        // idle blocks let the GPU power-gate (forum.md §2.5).
         for d in decisions {
+            if !d.rendering {
+                eprintln!("forum-wm: render-gating surface {} (fully occluded)", d.surface_id);
+            }
             self.conn.wm_set_rendering(d)?;
         }
         Ok(())
