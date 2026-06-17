@@ -785,6 +785,23 @@ vssh 'export FRESCOD_BUNDLE=/root/wmtest/bundles/atrium-core
 #   Super+Up (0x52) un-snaps. Snap two docs to opposite halves for side-by-side;
 #   unsnapped docs gate. printf 'KEY 0x50 1 0x08\nKEY 0x50 0 0x08\n' | nc -N -U ... →
 #   "snapped surface N Left".
+
+# Login → desktop handoff (vestibulum → ostiarius → session launch). Demo without
+#   the full TCB: ostiarius --serve-demo uses the LogLauncher + stub auth.
+#   ost=/root/portcullis-target/.../ostiarius (workspace: portcullis/target/...)
+vssh 'OSTIARIUS_SOCK=/tmp/ost.sock OSTIARIUS_OPEN=1 OSTIARIUS_SEAT=/tmp/ost-seat \
+        /root/ostiarius-z --serve-demo >/tmp/ost.log 2>&1 &
+  FRESCOD_BUNDLE=/root/wmtest/bundles/atrium-core FRESCOD_SOCK=/tmp/fz.sock \
+    FRESCOD_INPUT_SOCK=/tmp/fzin.sock FRESCOD_HEADLESS_PNG=/mnt/host/scratch/login \
+    /root/frescod-z >/tmp/fzf.log 2>&1 & sleep 3
+  FRESCO_SOCK=/tmp/fz.sock OSTIARIUS_SOCK=/tmp/ost.sock /root/vestibulum-z >/tmp/vest.log 2>&1 & sleep 2
+  # drive the form (username field 640,256; password 640,304; Sign in 640,368):
+  printf "MOVE 640 256\nBTN 1 1\nBTN 1 0\n" | nc -N -U /tmp/fzin.sock
+  printf "KEY 0x15 1\nKEY 0x15 0\n" | nc -N -U /tmp/fzin.sock   # r ... (o=0x12,o,t=0x17)
+  printf "MOVE 640 368\nBTN 1 1\nBTN 1 0\n" | nc -N -U /tmp/fzin.sock; sleep 1
+  cat /tmp/ost.log'  # → "launch org.atrium.forum ... choragus ... dock" = the desktop comes up
+# Production: ostiarius (no --serve-demo) = JaildLauncher + PAM (build --features pam),
+#   needs jaild running; vestibulum must be registered org.atrium.vestibulum (peer gate).
 # Per-app placement (app-id): frescod stamps owner_uid (getpeereid) in WM_ENUMERATE;
 #   forum-wm resolves it via the launch registry /var/run/atrium/app-registry
 #   ("<uid> <user> <app-id>" lines) → [assign] rule. To exercise as root (uid 0):
