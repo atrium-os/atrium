@@ -749,6 +749,16 @@ vssh 'export FRESCOD_BUNDLE=/root/wmtest/bundles/atrium-core
 #     multiple stubs share the work-area rect and fully overlap — click-to-focus between
 #     them isn't geometrically distinguishable yet (needs tiling / real role declaration).
 #     The focus-follows-click policy itself is unit-tested (forum-wm resolve_click_focus).
+
+# F1 roles + render-gating + F2 switcher (stubs declare a role via APP_ROLE):
+#   FRESCO_SOCKET=/tmp/fz.sock APP_TITLE=docA APP_ROLE=document /root/wm-app-stub & (etc.)
+#   - a newly-created document grabs focus ("focus=N"); peers it fully covers log
+#     "render-gating surface N (fully occluded)"; a panel (APP_ROLE=panel) docks beside
+#     (right quarter) and is NOT gated.
+#   - the switcher (Super+Tab) cycles document focus. The HID modifier byte is HEX:
+#       printf 'KEY 0x2b 1 0x08\nKEY 0x2b 0 0x08\n' | nc -N -U /tmp/fzin.sock
+#     → forum-wm logs "switcher → focus surface N" and render-gating follows the new
+#     focus. (0x2b=Tab, 0x08=left-GUI/Super. The KEY mods field accepts decimal or 0x hex.)
 ```
 
 #### Build cycle: rebuilding the patched MoltenVK
