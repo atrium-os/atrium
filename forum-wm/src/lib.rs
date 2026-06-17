@@ -173,6 +173,51 @@ pub fn arrange_for(
     WmDeclareLayoutPayload { slots, focus }
 }
 
+/// A snap target — a half of the work area (the snap intent, forum.md §2.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Snap {
+    Left,
+    Right,
+}
+
+/// The rect a [`Snap`] occupies within the work area (left/right half; the right
+/// half absorbs the rounding remainder).
+pub fn snap_region(wa: WmRect, snap: Snap) -> WmRect {
+    let half = wa.w / 2;
+    match snap {
+        Snap::Left => WmRect { x: wa.x, y: wa.y, w: half, h: wa.h },
+        Snap::Right => WmRect { x: wa.x + half, y: wa.y, w: wa.w - half, h: wa.h },
+    }
+}
+
+/// Snap-mode layout: when any document is snapped, the workspace becomes a manual
+/// tile — each snapped document occupies its half (all rendering); unsnapped
+/// documents are omitted (the caller render-gates anything not placed). Non-
+/// document roles (chrome/panel/dialog/background) place as usual. This is the
+/// "float-with-snap, without floating" assist (forum.md §2.3).
+pub fn arrange_snapped(
+    screen: &Screen,
+    surfaces: &[WmSurfaceInfo],
+    focus_intent: Option<u32>,
+    snapped: &std::collections::HashMap<u32, Snap>,
+) -> WmDeclareLayoutPayload {
+    let focus = resolve_focus(surfaces, focus_intent);
+    let wa = screen.work_area();
+    let mut slots: Vec<WmSlot> = Vec::new();
+    for s in surfaces {
+        match s.role {
+            WmRole::Document => {
+                if let Some(snap) = snapped.get(&s.surface_id) {
+                    slots.push(WmSlot { surface_id: s.surface_id, rect: snap_region(wa, *snap), layer: DOC_FOCUSED });
+                }
+                // unsnapped documents are omitted → render-gated by the caller.
+            }
+            r => slots.push(WmSlot { surface_id: s.surface_id, rect: rect_for(screen, r), layer: layer(r) }),
+        }
+    }
+    WmDeclareLayoutPayload { slots, focus }
+}
+
 /// From a declared layout, the occlusion-driven rendering decisions: a surface
 /// fully covered by those above it renders nothing → mark it non-rendering so its
 /// GPU work stops and the idle blocks power-gate. Partially-visible surfaces stay
@@ -240,7 +285,7 @@ fn subtract(r: &WmRect, cut: &WmRect) -> Vec<WmRect> {
 /// The daemon reconcile loop. The WM core's job each time the surface set or focus
 /// changes: enumerate → arrange → declare the layout + the rendering decisions.
 pub mod daemon {
-    use super::{arrange, arrange_for, rendering_decisions, Screen};
+    use super::{arrange, arrange_for, arrange_snapped, rendering_decisions, Screen, Snap};
     use fresco_protocol::{WmDeclareLayoutPayload, WmRole, WmSetRenderingPayload, WmSlot, WmSurfaceInfo};
     use portcullis_peer::AppRegistry;
     use std::collections::{HashMap, HashSet};
@@ -330,6 +375,10 @@ pub mod daemon {
         /// intent, forum.md §2.3) — a true fullscreen that even covers chrome;
         /// everything else render-gates. `None` = the normal arrangement.
         pub zoomed: Option<u32>,
+        /// Documents snapped to a half of the work area (the snap intent). When
+        /// any document on the active workspace is snapped, it enters snap mode
+        /// (manual tile: snapped docs show in their halves, the rest gate).
+        pub snapped: HashMap<u32, Snap>,
     }
 
     impl Wm {
@@ -345,6 +394,7 @@ pub mod daemon {
                 registry: AppRegistry::default(),
                 tiled_workspaces: HashSet::new(),
                 zoomed: None,
+                snapped: HashMap::new(),
             }
         }
 
@@ -464,10 +514,71 @@ pub mod daemon {
             Ok(now_zoomed)
         }
 
+        /// Snap the focused document to a half of the work area (the snap intent,
+        /// forum.md §2.3) and re-declare. Entering snap mode manually tiles the
+        /// snapped docs; unsnapped docs render-gate. Only documents snap (chrome /
+        /// dialogs aren't snap targets). No-op (`None`) otherwise. Returns the
+        /// snapped surface.
+        pub fn snap_focused(&mut self, conn: &mut impl FrescoConn, snap: Snap)
+            -> io::Result<Option<u32>>
+        {
+            let surfaces = conn.enumerate()?;
+            let active: Vec<WmSurfaceInfo> = surfaces
+                .iter()
+                .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
+                .cloned()
+                .collect();
+            let focus = arrange(&self.screen, &active, self.focus_intent).focus;
+            let is_doc = active.iter().any(|s| s.surface_id == focus && s.role == WmRole::Document);
+            if focus == 0 || !is_doc {
+                return Ok(None);
+            }
+            self.snapped.insert(focus, snap);
+            self.zoomed = self.zoomed.filter(|z| *z != focus); // snap supersedes zoom for this surface
+            self.declare(conn, &surfaces)?;
+            Ok(Some(focus))
+        }
+
+        /// Un-snap the focused document (back toward the normal arrangement) and
+        /// re-declare. Returns the surface if it had been snapped.
+        pub fn unsnap_focused(&mut self, conn: &mut impl FrescoConn) -> io::Result<Option<u32>> {
+            let surfaces = conn.enumerate()?;
+            let active: Vec<WmSurfaceInfo> = surfaces
+                .iter()
+                .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
+                .cloned()
+                .collect();
+            let focus = arrange(&self.screen, &active, self.focus_intent).focus;
+            let removed = self.snapped.remove(&focus).is_some();
+            self.declare(conn, &surfaces)?;
+            Ok(removed.then_some(focus))
+        }
+
+        /// Pick the layout for the active workspace's visible surfaces, applying
+        /// the active intent: zoom (one surface fills the screen) > snap (manual
+        /// tile of the snapped docs) > the workspace's split/stacked arrangement.
+        fn layout_active(&self, active: &[WmSurfaceInfo]) -> WmDeclareLayoutPayload {
+            // Zoom wins: the zoomed surface alone fills the whole screen.
+            if let Some(zid) = self.zoomed.filter(|z| active.iter().any(|s| s.surface_id == *z)) {
+                return WmDeclareLayoutPayload {
+                    slots: vec![WmSlot { surface_id: zid, rect: self.screen.rect, layer: 0 }],
+                    focus: zid,
+                };
+            }
+            // Snap: if any visible document is snapped, enter snap mode.
+            if active.iter().any(|s| s.role == WmRole::Document && self.snapped.contains_key(&s.surface_id)) {
+                return arrange_snapped(&self.screen, active, self.focus_intent, &self.snapped);
+            }
+            // Otherwise the workspace's split (tiled) or stacked arrangement.
+            let tiled = self.tiled_workspaces.contains(&self.active);
+            arrange_for(&self.screen, active, self.focus_intent, tiled)
+        }
+
         /// The workspace-aware placement step shared by every reconcile path:
-        /// arrange the surfaces *visible on the active workspace*, declare that
-        /// layout, then mark every other surface (apps on inactive workspaces)
-        /// non-rendering — so an inactive workspace fully stops compositing.
+        /// choose the active-workspace layout, declare it, then render-gate every
+        /// surface NOT placed in it — apps on inactive workspaces, and (in zoom /
+        /// snap mode) the active-workspace surfaces the intent excluded. So an
+        /// inactive workspace, or a hidden window, fully stops compositing.
         fn declare(&self, conn: &mut impl FrescoConn, surfaces: &[WmSurfaceInfo])
             -> io::Result<WmDeclareLayoutPayload>
         {
@@ -476,32 +587,12 @@ pub mod daemon {
                 .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
                 .cloned()
                 .collect();
-
-            // Zoom (fullscreen) short-circuits the normal layout: if a surface on
-            // the active workspace is zoomed, it alone fills the whole screen
-            // (covering chrome) and everything else render-gates.
-            if let Some(zid) = self.zoomed.filter(|z| active.iter().any(|s| s.surface_id == *z)) {
-                let layout = WmDeclareLayoutPayload {
-                    slots: vec![WmSlot { surface_id: zid, rect: self.screen.rect, layer: 0 }],
-                    focus: zid,
-                };
-                conn.declare_layout(&layout)?;
-                let decisions: Vec<WmSetRenderingPayload> = surfaces
-                    .iter()
-                    .map(|s| WmSetRenderingPayload { surface_id: s.surface_id, rendering: s.surface_id == zid })
-                    .collect();
-                conn.set_rendering(&decisions)?;
-                return Ok(layout);
-            }
-
-            let tiled = self.tiled_workspaces.contains(&self.active);
-            let layout = arrange_for(&self.screen, &active, self.focus_intent, tiled);
+            let layout = self.layout_active(&active);
             conn.declare_layout(&layout)?;
-            let mut decisions = rendering_decisions(&layout);
-            for s in surfaces
-                .iter()
-                .filter(|s| !shown_in_workspace(s, &self.assignment, self.active))
-            {
+
+            let placed: HashSet<u32> = layout.slots.iter().map(|s| s.surface_id).collect();
+            let mut decisions = rendering_decisions(&layout); // occlusion among placed
+            for s in surfaces.iter().filter(|s| !placed.contains(&s.surface_id)) {
                 decisions.push(WmSetRenderingPayload { surface_id: s.surface_id, rendering: false });
             }
             conn.set_rendering(&decisions)?;
@@ -1046,6 +1137,38 @@ mod tests {
         let declared: Vec<u32> =
             conn.declared.as_ref().unwrap().slots.iter().map(|s| s.surface_id).collect();
         assert_eq!(declared, vec![2], "doc 2 is on workspace 1");
+    }
+
+    #[test]
+    fn snap_tiles_two_docs_to_halves_and_gates_the_rest() {
+        let mut conn = MockConn {
+            surfaces: vec![
+                surf(1, WmRole::Document),
+                surf(2, WmRole::Document),
+                surf(3, WmRole::Document),
+            ],
+            ..Default::default()
+        };
+        let mut wm = Wm::new(screen());
+        let wa = screen().work_area();
+        // Snap doc 1 left, doc 2 right.
+        wm.focus_intent = Some(1);
+        wm.snap_focused(&mut conn, Snap::Left).unwrap();
+        wm.focus_intent = Some(2);
+        wm.snap_focused(&mut conn, Snap::Right).unwrap();
+        let layout = conn.declared.as_ref().unwrap();
+        let d1 = layout.slots.iter().find(|s| s.surface_id == 1).unwrap();
+        let d2 = layout.slots.iter().find(|s| s.surface_id == 2).unwrap();
+        assert_eq!(d1.rect.x, wa.x);
+        assert_eq!(d2.rect.x, wa.x + wa.w / 2, "right-snapped at the half line");
+        assert!(layout.slots.iter().all(|s| s.surface_id != 3), "the un-snapped doc isn't placed");
+        // Doc 3 (un-snapped) is render-gated; 1 and 2 render.
+        let gated: Vec<u32> = conn.rendering.iter().filter(|r| !r.rendering).map(|r| r.surface_id).collect();
+        assert_eq!(gated, vec![3]);
+        // Un-snapping doc 2 leaves only doc 1 snapped (still snap mode).
+        wm.unsnap_focused(&mut conn).unwrap(); // focus is doc 2
+        assert!(!wm.snapped.contains_key(&2));
+        assert!(wm.snapped.contains_key(&1));
     }
 
     #[test]

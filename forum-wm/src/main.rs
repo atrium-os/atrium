@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use forum_wm::daemon::{FrescoConn, Wm};
-use forum_wm::Screen;
+use forum_wm::{Screen, Snap};
 use fresco_client::{Connection, Event};
 use fresco_protocol::{WmDeclareLayoutPayload, WmRect, WmSetRenderingPayload, WmSurfaceInfo};
 
@@ -45,6 +45,11 @@ const MOD_SHIFT: u8 = 0x02 | 0x20;
 const KEY_S: u16 = 0x16;
 /// Super+F toggles zoom (fullscreen) for the focused surface. HID 0x09 = 'F'.
 const KEY_F: u16 = 0x09;
+/// Snap the focused document: Super+Left/Right snap to a half, Super+Up un-snaps.
+/// HID arrow usages: Right 0x4F, Left 0x50, Up 0x52.
+const KEY_RIGHT: u16 = 0x4F;
+const KEY_LEFT: u16 = 0x50;
+const KEY_UP: u16 = 0x52;
 
 /// The live frescod connection — the production implementation of the seam the
 /// reconcile loop drives. Each method is one window-management protocol op.
@@ -182,6 +187,8 @@ fn spawn_input_poller(core: Core) {
             let mut move_ws: Option<usize> = None;
             let mut split = false;
             let mut zoom = false;
+            let mut snap_dir: Option<Snap> = None;
+            let mut unsnap = false;
             {
                 let mut g = core.lock().unwrap();
                 loop {
@@ -205,6 +212,14 @@ fn spawn_input_poller(core: Core) {
                         // Super+F: toggle zoom (fullscreen) for the focused surface.
                         Ok(Some(Event::Key { hid_usage: KEY_F, pressed: true, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 => zoom = true,
+                        // Super+Left / Right: snap the focused document to a half.
+                        Ok(Some(Event::Key { hid_usage: KEY_LEFT, pressed: true, modifiers, .. }))
+                            if modifiers & MOD_GUI != 0 => snap_dir = Some(Snap::Left),
+                        Ok(Some(Event::Key { hid_usage: KEY_RIGHT, pressed: true, modifiers, .. }))
+                            if modifiers & MOD_GUI != 0 => snap_dir = Some(Snap::Right),
+                        // Super+Up: un-snap the focused document.
+                        Ok(Some(Event::Key { hid_usage: KEY_UP, pressed: true, modifiers, .. }))
+                            if modifiers & MOD_GUI != 0 => unsnap = true,
                         // Super+Shift+1..N: MOVE the focused window to workspace N
                         // (must precede the plain Super+N arm, which it also matches).
                         Ok(Some(Event::Key { hid_usage, pressed: true, modifiers, .. }))
@@ -294,6 +309,26 @@ fn spawn_input_poller(core: Core) {
                 match wm.toggle_zoom(conn) {
                     Ok(z) => eprintln!("forum-wm: zoom {}", if z { "ON (fullscreen)" } else { "OFF" }),
                     Err(e) => eprintln!("forum-wm: toggle_zoom error: {e}"),
+                }
+            }
+
+            if let Some(d) = snap_dir {
+                let mut g = core.lock().unwrap();
+                let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
+                match wm.snap_focused(conn, d) {
+                    Ok(Some(s)) => eprintln!("forum-wm: snapped surface {s} {d:?}"),
+                    Ok(None) => {}               // nothing focusable to snap
+                    Err(e) => eprintln!("forum-wm: snap_focused error: {e}"),
+                }
+            }
+
+            if unsnap {
+                let mut g = core.lock().unwrap();
+                let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
+                match wm.unsnap_focused(conn) {
+                    Ok(Some(s)) => eprintln!("forum-wm: un-snapped surface {s}"),
+                    Ok(None) => {}               // wasn't snapped
+                    Err(e) => eprintln!("forum-wm: unsnap_focused error: {e}"),
                 }
             }
 
