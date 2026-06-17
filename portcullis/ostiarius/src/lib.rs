@@ -11,7 +11,8 @@
 //!   boot()        → request jaild to launch vestibulum (the login UI), full-screen
 //!   authenticate  → (pam; stubbed here) credential → human uid
 //!   login(human)  → bind the seat (`portcullis_peer::seat`) + launch the session
-//!                   layer (Forum+Choragus+dock for GUI; a zsh console-shell for CLI)
+//!                   layer (forum-wm + forum-bar + forum-dock + choragus for GUI;
+//!                   a zsh console-shell for CLI)
 //!   logout()      → tear the session down + unbind the seat → back to vestibulum
 //!
 //! The launch is behind a [`Launcher`] seam: the real [`JaildLauncher`] drives the
@@ -79,10 +80,15 @@ fn spec(app_id: &str, owner: &str, bin: &str, argv: &[&str], caps: Vec<&'static 
 /// The session layer to launch for a frontend, owned by `human`.
 fn session_layer(human: &str, frontend: Frontend) -> Vec<LaunchSpec> {
     match frontend {
+        // The Forum desktop, each component its own jailed app (forum.md §3): the
+        // WM core (sole window-management) + the chrome (graphics + forum-control,
+        // never window-management) + audio. App-ids/caps match each component's
+        // atrium.toml. The overview is launched on-demand, not at session start.
         Frontend::Gui => vec![
-            spec("org.atrium.forum", human, "/usr/local/bin/forum", &[], vec!["graphics", "window-management"]),
+            spec("org.atrium.forum-wm", human, "/usr/local/bin/forum-wm", &[], vec!["graphics", "window-management", "notify"]),
+            spec("org.atrium.forum-bar", human, "/usr/local/bin/forum-bar", &[], vec!["graphics", "forum-control"]),
+            spec("org.atrium.forum-dock", human, "/usr/local/bin/forum-dock", &[], vec!["graphics", "forum-control"]),
             spec("org.atrium.choragus", human, "/usr/local/bin/choragusd", &[], vec!["audio"]),
-            spec("org.atrium.dock", human, "/usr/local/bin/dock", &[], vec!["graphics"]),
         ],
         // Display-down fallback: a login zsh in the human's session jail (the
         // decided shell; the jail is the boundary, not a custom shell). No Forum.
@@ -467,7 +473,7 @@ mod tests {
         o.login("alice", Frontend::Gui).unwrap();
         assert_eq!(o.active_human().as_deref(), Some("alice"), "seat bound to the human");
         let apps: Vec<_> = o.launcher.launched.iter().map(|s| s.app_id.as_str()).collect();
-        assert!(apps.contains(&"org.atrium.forum") && apps.contains(&"org.atrium.choragus"));
+        assert!(apps.contains(&"org.atrium.forum-wm") && apps.contains(&"org.atrium.choragus"));
         assert!(o.launcher.launched.iter().all(|s| s.owner == "alice"), "all run as the human");
     }
 
@@ -477,7 +483,7 @@ mod tests {
         o.login("alice", Frontend::Gui).unwrap();
         let wm: Vec<_> = o.launcher.launched.iter().filter(|s| s.caps.contains(&"window-management")).collect();
         assert_eq!(wm.len(), 1);
-        assert_eq!(wm[0].app_id, "org.atrium.forum");
+        assert_eq!(wm[0].app_id, "org.atrium.forum-wm");
     }
 
     #[test]
@@ -490,7 +496,7 @@ mod tests {
         assert_eq!(sh.app_id, "org.atrium.console-shell");
         assert_eq!(sh.bin, "/usr/local/bin/zsh", "the decided shell");
         assert_eq!(sh.owner, "alice", "in the human's session jail, not root");
-        assert!(!o.launcher.launched.iter().any(|s| s.app_id == "org.atrium.forum"), "no graphics on the CLI path");
+        assert!(!o.launcher.launched.iter().any(|s| s.app_id == "org.atrium.forum-wm"), "no graphics on the CLI path");
     }
 
     #[test]
@@ -507,7 +513,7 @@ mod tests {
         o.login("alice", Frontend::Gui).unwrap();
         o.logout().unwrap();
         assert!(o.active_human().is_none(), "seat unbound → back to login");
-        assert!(o.launcher.torn_down.contains(&"org.atrium.forum".to_string()), "Forum torn down");
+        assert!(o.launcher.torn_down.contains(&"org.atrium.forum-wm".to_string()), "Forum torn down");
     }
 
     #[test]
@@ -551,7 +557,7 @@ mod tests {
         let mut o = Ostiarius::new(MockLauncher::default()).with_seat_path(seat_file("ctl"));
         let login = Request::Login { user: "alice".into(), password: "pw".into(), frontend: Frontend::Gui };
         assert_eq!(handle(&mut o, login), Response::Ok { active: Some("alice".into()) });
-        assert!(o.launcher.launched.iter().any(|s| s.app_id == "org.atrium.forum"));
+        assert!(o.launcher.launched.iter().any(|s| s.app_id == "org.atrium.forum-wm"));
         assert_eq!(handle(&mut o, Request::Logout), Response::Ok { active: None });
     }
 
