@@ -387,12 +387,18 @@ fn forbidden_capabilities() -> &'static [(u32, &'static str)] {
         (5347, "buffer-device-address (PhysicalStorageBufferAddresses) \
                 bypasses descriptor-bounded isolation"),
 
-        // RayTracingKHR (4479) — full ray-tracing pipeline support.
-        // Deferred until Phase 2.2 has audited acceleration-structure
-        // memory layout for sandbox-compatibility.
-        (4479, "ray-tracing capability deferred to Phase 2.2"),
-        // RayQueryKHR (4477) — inline ray-tracing. Same reasoning.
-        (4477, "ray-query capability deferred to Phase 2.2"),
+        // RayTracingKHR (4479) — full ray-tracing PIPELINE support (raygen/
+        // closest-hit/miss stages + shader binding table). Still deferred: the
+        // SBT and the extra pipeline stages are a much larger surface than the
+        // wire's closed vocabulary exposes.
+        (4479, "ray-tracing-pipeline capability not supported by aqueduct-gpu wire"),
+        // RayQueryKHR (4477) — inline ray-tracing in a compute shader. ALLOWED:
+        // the acceleration structure is a descriptor-bound resource (VK_DESCRIPTOR
+        // _TYPE_ACCELERATION_STRUCTURE_KHR), traversal is fixed-function HW, and
+        // the shader only sees committed-hit scalars (t, primitiveIndex,
+        // instanceId, barycentrics) — no raw device pointers, so it stays inside
+        // the descriptor-bounded model. (buffer-device-address / 5347 remains
+        // forbidden; ray_query does not require it in-shader.)
         // RayTracingNV (5340) — vendor extension predecessor.
         (5340, "ray-tracing-NV vendor extension not supported"),
 
@@ -428,9 +434,8 @@ fn forbidden_extensions() -> &'static [(&'static str, &'static str)] {
         ("SPV_EXT_physical_storage_buffer",
          "physical-storage-buffer (EXT) implies buffer-device-address"),
         ("SPV_KHR_ray_tracing",
-         "ray-tracing extension deferred to Phase 2.2"),
-        ("SPV_KHR_ray_query",
-         "ray-query extension deferred to Phase 2.2"),
+         "ray-tracing-pipeline extension not supported by aqueduct-gpu wire"),
+        // SPV_KHR_ray_query ALLOWED — see the RayQueryKHR (4477) note above.
         ("SPV_NV_ray_tracing",
          "ray-tracing-NV extension not supported"),
         ("SPV_NV_mesh_shader",

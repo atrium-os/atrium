@@ -194,6 +194,9 @@ pub struct MoltenVkBackend {
     last_gpu_ns: AtomicU64,
     /// Cumulative measured GPU exec time across all timed frames, ns.
     total_gpu_ns: AtomicU64,
+    /// Whether VK_KHR_acceleration_structure + VK_KHR_ray_query were enabled at
+    /// device creation (HW ray-tracing for the instanced-mesh path available).
+    ray_query: bool,
 }
 
 /// Construction errors for [`MoltenVkBackend::new`]. Each variant
@@ -355,16 +358,55 @@ impl MoltenVkBackend {
         // it. The portability-subset device extension is documented
         // in the spec as "MUST be enabled if reported."
         let portability_subset = khr::portability_subset::NAME;
-        let device_exts = match
+        let mut device_exts = match
             host_supports_portability_subset(&instance, physical)
         {
             true  => vec![portability_subset.as_ptr()],
             false => vec![],
         };
 
-        let device_create = vk::DeviceCreateInfo::default()
+        // Hardware ray-query (VK_KHR_acceleration_structure + VK_KHR_ray_query)
+        // for the instanced-mesh path. Detect support via the FEATURE query, not
+        // device-extension enumeration: the Vulkan loader omits AS/ray_query from
+        // enumeration for the MoltenVK portability driver (a cosmetic loader
+        // filter — see external/MoltenVK/MoltenVK/ray_query_test/README.md §5),
+        // yet rayQuery is reported correctly through GetPhysicalDeviceFeatures2 and
+        // the extensions are accepted at device creation. So we ask the feature
+        // chain and, when present, request the extensions unconditionally.
+        let mut as_query = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
+        let mut rq_query = vk::PhysicalDeviceRayQueryFeaturesKHR::default();
+        let mut feat_query = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut as_query)
+            .push_next(&mut rq_query);
+        unsafe { instance.get_physical_device_features2(physical, &mut feat_query) };
+        let ray_query = as_query.acceleration_structure == vk::TRUE
+            && rq_query.ray_query == vk::TRUE;
+
+        if ray_query {
+            device_exts.push(khr::acceleration_structure::NAME.as_ptr());
+            device_exts.push(khr::ray_query::NAME.as_ptr());
+            device_exts.push(khr::deferred_host_operations::NAME.as_ptr());
+        }
+
+        // Feature chain enabled at device creation. AS requires bufferDeviceAddress
+        // + descriptorIndexing (core 1.2). Kept alive until create_device returns.
+        let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
+            .buffer_device_address(ray_query)
+            .descriptor_indexing(ray_query);
+        let mut as_feat = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
+            .acceleration_structure(ray_query);
+        let mut rq_feat = vk::PhysicalDeviceRayQueryFeaturesKHR::default()
+            .ray_query(ray_query);
+
+        let mut device_create = vk::DeviceCreateInfo::default()
             .queue_create_infos(&q_creates)
             .enabled_extension_names(&device_exts);
+        if ray_query {
+            device_create = device_create
+                .push_next(&mut v12)
+                .push_next(&mut as_feat)
+                .push_next(&mut rq_feat);
+        }
 
         let device = unsafe { instance.create_device(physical, &device_create, None) };
         let device = match device {
@@ -456,8 +498,15 @@ impl MoltenVkBackend {
             timestamp_period_ns,
             last_gpu_ns: AtomicU64::new(0),
             total_gpu_ns: AtomicU64::new(0),
+            ray_query,
         })
     }
+
+    /// Whether HW ray-query (VK_KHR_acceleration_structure + VK_KHR_ray_query)
+    /// is available on this device. The instanced-mesh path checks this and
+    /// falls back (no objects) when false — e.g. against a stock MoltenVK that
+    /// lacks the acceleration-structure port.
+    pub fn has_ray_query(&self) -> bool { self.ray_query }
 
     /// Create a compute pipeline from SPIR-V (the engine-bundle
     /// path). Descriptor interface: `ssbo_count` storage buffers at

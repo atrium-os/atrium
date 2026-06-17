@@ -371,7 +371,7 @@ fn capability_name(c: u32) -> &'static str {
         48   => "StorageImageReadWithoutFormat",
         49   => "StorageImageWriteWithoutFormat",
         50   => "MultiViewport",
-        4477 => "RayQueryKHR (forbidden)",
+        4477 => "RayQueryKHR (inline ray-tracing)",
         4479 => "RayTracingKHR (forbidden)",
         5266 => "MeshShadingNV (forbidden)",
         5283 => "MeshShadingEXT (forbidden)",
