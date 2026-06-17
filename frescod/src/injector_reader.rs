@@ -79,7 +79,7 @@ fn handle(sink: &Sender<DisplayEvent>, comp: &Arc<Mutex<Compositor>>, sw: f32, s
         "KEY" => {
             let usage = it.next().and_then(parse_u16);
             let pressed = next_bool(&mut it);
-            let mods = it.next().and_then(|s| s.parse::<u8>().ok()).unwrap_or(0);
+            let mods = it.next().and_then(parse_u8).unwrap_or(0);
             if let (Some(hid_usage), Some(pressed)) = (usage, pressed) {
                 let target = focused_window(comp);
                 eprintln!("frescod: inject KEY {hid_usage} {} -> window {target}", pressed as u8);
@@ -141,5 +141,13 @@ fn next_bool<'a>(it: &mut impl Iterator<Item = &'a str>) -> Option<bool> {
 fn parse_u16(s: &str) -> Option<u16> {
     s.strip_prefix("0x")
         .map(|h| u16::from_str_radix(h, 16).ok())
+        .unwrap_or_else(|| s.parse().ok())
+}
+
+/// Parse a `u8` accepting either decimal or `0x`-prefixed hex (the HID
+/// modifier byte is naturally written in hex, e.g. `0x08` = left-GUI).
+fn parse_u8(s: &str) -> Option<u8> {
+    s.strip_prefix("0x")
+        .map(|h| u8::from_str_radix(h, 16).ok())
         .unwrap_or_else(|| s.parse().ok())
 }

@@ -28,6 +28,12 @@ use fresco_protocol::{WmDeclareLayoutPayload, WmRect, WmSetRenderingPayload, WmS
 /// stream, and the one subscriber is drained by the poller every tick.
 type Core = Arc<Mutex<(Wm, ClientConn)>>;
 
+/// The switcher hotkey: Super(GUI)+Tab cycles document focus. HID usage 0x2B =
+/// Tab (USB HID Usage Page 0x07); MOD_GUI = either GUI/Super modifier bit (left
+/// 0x08 | right 0x80). Super rather than Alt so it doesn't collide with app Tab.
+const KEY_TAB: u16 = 0x2B;
+const MOD_GUI: u8 = 0x08 | 0x80;
+
 /// The live frescod connection — the production implementation of the seam the
 /// reconcile loop drives. Each method is one window-management protocol op.
 struct ClientConn {
@@ -143,6 +149,8 @@ fn spawn_input_poller(core: Core) {
             // disappeared — the WM must re-place the survivors).
             let mut clicked: Option<u32> = None;
             let mut surfaces_changed = false;
+            let mut created: Option<u32> = None;
+            let mut cycle = false;
             {
                 let mut g = core.lock().unwrap();
                 loop {
@@ -150,8 +158,16 @@ fn spawn_input_poller(core: Core) {
                         Ok(Some(Event::PointerButton {
                             window_id, pressed: true, button: 1, ..
                         })) if window_id != 0 => clicked = Some(window_id),
-                        Ok(Some(Event::WindowCreated { .. }))
-                        | Ok(Some(Event::WindowDestroyed { .. })) => surfaces_changed = true,
+                        Ok(Some(Event::WindowCreated { window_id })) => {
+                            surfaces_changed = true;
+                            created = Some(window_id); // a new doc opens focused
+                        }
+                        Ok(Some(Event::WindowDestroyed { .. })) => surfaces_changed = true,
+                        // The switcher hotkey (Super+Tab): cycle document focus.
+                        // The WM sees every key (it's a subscriber); this one is
+                        // a window-management gesture, not app text input.
+                        Ok(Some(Event::Key { hid_usage: KEY_TAB, pressed: true, modifiers, .. }))
+                            if modifiers & MOD_GUI != 0 => cycle = true,
                         Ok(Some(_)) => {}        // other event — ignore
                         Ok(None) => break,       // backlog drained
                         Err(e) => {
@@ -165,16 +181,30 @@ fn spawn_input_poller(core: Core) {
             // A surface came or went → re-derive the whole layout so the new
             // window is placed (or the gone one's slot reclaimed). Do this
             // before applying any click, so focus-follows-click sees the
-            // up-to-date surface set.
+            // up-to-date surface set. A newly-created document opens focused.
             if surfaces_changed {
                 let mut g = core.lock().unwrap();
                 let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
-                match wm.reconcile(conn) {
+                let r = match created {
+                    Some(id) => wm.focus_new(conn, id),
+                    None => wm.reconcile(conn),
+                };
+                match r {
                     Ok(l) => eprintln!(
                         "forum-wm: reconciled on surface change — {} surface(s), focus={}",
                         l.slots.len(), l.focus,
                     ),
                     Err(e) => eprintln!("forum-wm: reconcile error: {e}"),
+                }
+            }
+
+            if cycle {
+                let mut g = core.lock().unwrap();
+                let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
+                match wm.cycle_focus(conn) {
+                    Ok(Some(f)) => eprintln!("forum-wm: switcher → focus surface {f}"),
+                    Ok(None) => {}               // <2 documents — nothing to cycle
+                    Err(e) => eprintln!("forum-wm: cycle_focus error: {e}"),
                 }
             }
 

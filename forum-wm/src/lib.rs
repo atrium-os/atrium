@@ -289,6 +289,63 @@ pub mod daemon {
                 None => Ok(None),
             }
         }
+
+        /// A newly-created surface. Per forum.md §2.3 a new *document* opens
+        /// focused; other roles don't steal focus (a dialog grabs it via
+        /// `arrange` already; panels/chrome/background never do). Reconciles
+        /// either way to place the newcomer. Returns the declared layout.
+        pub fn focus_new(&mut self, conn: &mut impl FrescoConn, new_id: u32)
+            -> io::Result<WmDeclareLayoutPayload>
+        {
+            let surfaces = conn.enumerate()?;
+            if surfaces.iter().any(|s| s.surface_id == new_id && s.role == WmRole::Document) {
+                self.focus_intent = Some(new_id);
+            }
+            let layout = arrange(&self.screen, &surfaces, self.focus_intent);
+            conn.declare_layout(&layout)?;
+            conn.set_rendering(&rendering_decisions(&layout))?;
+            Ok(layout)
+        }
+
+        /// The switcher (forum.md §2.3): cycle keyboard focus to the next
+        /// document. Re-declares the layout so render-gating follows — the
+        /// newly-focused document composites, the prior one drops behind and
+        /// gates. No-op (returns `None`) with fewer than two documents.
+        pub fn cycle_focus(&mut self, conn: &mut impl FrescoConn)
+            -> io::Result<Option<u32>>
+        {
+            let surfaces = conn.enumerate()?;
+            let mut docs: Vec<u32> = surfaces
+                .iter()
+                .filter(|s| s.role == WmRole::Document)
+                .map(|s| s.surface_id)
+                .collect();
+            docs.sort_unstable();
+            let current = arrange(&self.screen, &surfaces, self.focus_intent).focus;
+            match next_document(&docs, current) {
+                Some(next) if next != current => {
+                    self.focus_intent = Some(next);
+                    let layout = arrange(&self.screen, &surfaces, self.focus_intent);
+                    conn.declare_layout(&layout)?;
+                    conn.set_rendering(&rendering_decisions(&layout))?;
+                    Ok(Some(layout.focus))
+                }
+                _ => Ok(None),
+            }
+        }
+    }
+
+    /// The document focused after `current` in a forward cycle through `docs`
+    /// (ascending surface_id). Wraps around; `None` if there are no documents;
+    /// starts at the first if `current` isn't itself a document.
+    pub fn next_document(docs: &[u32], current: u32) -> Option<u32> {
+        if docs.is_empty() {
+            return None;
+        }
+        match docs.iter().position(|&d| d == current) {
+            Some(i) => Some(docs[(i + 1) % docs.len()]),
+            None => Some(docs[0]),
+        }
     }
 }
 
@@ -429,6 +486,18 @@ mod tests {
             assert!(r.iter().find(|x| x.surface_id == focus).unwrap().rendering, "focus={focus} renders");
             assert!(!r.iter().find(|x| x.surface_id == gated).unwrap().rendering, "focus={focus}: {gated} gated");
         }
+    }
+
+    #[test]
+    fn next_document_cycles_and_wraps() {
+        use super::daemon::next_document;
+        let docs = [1u32, 2, 3];
+        assert_eq!(next_document(&docs, 1), Some(2));
+        assert_eq!(next_document(&docs, 2), Some(3));
+        assert_eq!(next_document(&docs, 3), Some(1)); // wrap
+        assert_eq!(next_document(&docs, 9), Some(1)); // current not a document → first
+        assert_eq!(next_document(&[], 1), None);      // nothing to cycle
+        assert_eq!(next_document(&[5], 5), Some(5));   // single doc → itself (caller no-ops)
     }
 
     #[test]
