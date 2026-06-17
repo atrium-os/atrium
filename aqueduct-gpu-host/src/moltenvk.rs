@@ -745,12 +745,15 @@ impl MoltenVkBackend {
                 });
             let tgeos = [tgeo];
             let inst_count = instances.len() as u32;
-            // PREFER_FAST_BUILD for the TLAS (not FAST_TRACE): the instance-level
-            // build is O(N) and FAST_TRACE's SAH optimization over many instances
-            // runs long enough to trip the Metal GPU watchdog (command-buffer
-            // Hang) at ~50k+. Instance traversal is already near-free, so we don't
-            // need the trace-optimized TLAS — fast build keeps it well under the
-            // watchdog. (The BLAS stays FAST_TRACE: tiny prefab, cheap either way.)
+            // PREFER_FAST_BUILD for the TLAS (not FAST_TRACE). Two distinct hang
+            // causes were found and separated: (1) the deterministic ~32k-65k band
+            // hang was a buffer-overflow BUG (UserID instance-descriptor stride,
+            // fixed in MoltenVK MVKCmdAccelerationStructure) — flag-independent;
+            // (2) an INTERMITTENT hang at extreme counts (1M ~1/3) is the FAST_TRACE
+            // optimization itself — its heavier SAH build (~50 ms vs ~30 ms at 1M)
+            // stays marginal against the GPU watchdog. FAST_BUILD is reliable across
+            // 33k..1M (5/5 at 1M) and, since instance traversal is already near-free,
+            // costs nothing at render time. So FAST_BUILD is the default.
             let mut tbi = vk::AccelerationStructureBuildGeometryInfoKHR::default()
                 .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
                 .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_BUILD)
