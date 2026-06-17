@@ -1,0 +1,23 @@
+# Forum (Atrium window manager) per-user config — OPTIONAL.
+#
+# Install to /var/db/atrium/<user>/forum.toml (or point $FORUM_CONFIG at it).
+# With no config, Forum uses 4 unnamed workspaces and every window opens on the
+# active one — the default flow. Everything below is opt-in.
+
+# Number of workspaces (virtual desktops). 1..32. Default 4.
+workspaces = 4
+
+# Optional workspace names (cosmetic — shown in logs / the overview), indexed
+# from 0. Switch with Super+1 (= workspace 0) .. Super+N.
+names = ["main", "web", "comms", "media"]
+
+# Per-app landing rules: app-id -> workspace index (0-based). A window from a
+# listed app opens on its assigned workspace instead of the active one.
+#
+# NOTE: these activate once frescod reports real app-ids in WM_ENUMERATE
+# (currently owner_app is a per-connection id, so rules stay inert and windows
+# open on the active workspace). The rule plumbing is live and forward-compatible
+# — only the key isn't populated yet.
+[assign]
+"org.atrium.navigator" = 1   # browser -> "web"
+"org.atrium.term"      = 0   # terminal -> "main"

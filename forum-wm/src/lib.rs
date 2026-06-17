@@ -267,6 +267,12 @@ pub mod daemon {
         /// surface_id → workspace. Unlisted surfaces default to the active
         /// workspace (see [`shown_in_workspace`]); chrome/background ignore this.
         pub assignment: HashMap<u32, usize>,
+        /// Per-app landing rules from config: app-id → workspace. Applied to a
+        /// new surface by its `owner_app` (inert until frescod reports real
+        /// app-ids; then a configured app opens on its assigned workspace).
+        pub assign_rules: HashMap<String, usize>,
+        /// Optional workspace names (cosmetic; from config). Indexed by workspace.
+        pub names: Vec<String>,
     }
 
     impl Wm {
@@ -277,7 +283,15 @@ pub mod daemon {
                 workspaces: DEFAULT_WORKSPACES,
                 active: 0,
                 assignment: HashMap::new(),
+                assign_rules: HashMap::new(),
+                names: Vec::new(),
             }
+        }
+
+        /// A human-facing label for workspace `i`: its configured name, else
+        /// `"workspace N"`.
+        pub fn workspace_label(&self, i: usize) -> String {
+            self.names.get(i).cloned().unwrap_or_else(|| format!("workspace {i}"))
         }
 
         /// The human focuses a surface (an intent); the next reconcile applies it.
@@ -381,8 +395,21 @@ pub mod daemon {
             -> io::Result<WmDeclareLayoutPayload>
         {
             let surfaces = conn.enumerate()?;
-            if surfaces.iter().any(|s| s.surface_id == new_id && s.role == WmRole::Document) {
-                self.focus_intent = Some(new_id);
+            if let Some(s) = surfaces.iter().find(|s| s.surface_id == new_id) {
+                // Land the newcomer: a configured per-app rule (keyed by app-id)
+                // wins, else the active workspace (the default flow).
+                let ws = self
+                    .assign_rules
+                    .get(&s.owner_app)
+                    .copied()
+                    .filter(|w| *w < self.workspaces)
+                    .unwrap_or(self.active);
+                self.assignment.insert(new_id, ws);
+                // A new document opens focused — but only if it landed on the
+                // workspace you're looking at (a rule may send it elsewhere).
+                if s.role == WmRole::Document && ws == self.active {
+                    self.focus_intent = Some(new_id);
+                }
             }
             self.declare(conn, &surfaces)
         }

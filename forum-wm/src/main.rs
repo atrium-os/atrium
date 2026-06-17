@@ -20,6 +20,8 @@ use forum_wm::Screen;
 use fresco_client::{Connection, Event};
 use fresco_protocol::{WmDeclareLayoutPayload, WmRect, WmSetRenderingPayload, WmSurfaceInfo};
 
+mod config;
+
 /// The WM's shared mutable core: the policy state + the live frescod connection.
 /// Two threads touch it — the forum-ctl server (chrome intents) and the input
 /// poller (focus-follows-click) — so they serialize on this lock. The single
@@ -94,7 +96,12 @@ fn main() -> io::Result<()> {
     conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     let mut io_conn = ClientConn { conn };
 
-    let wm = Wm::new(screen());
+    // Per-user workspace config (count / names / app rules); defaults if absent.
+    let cfg = config::ForumConfig::load();
+    let mut wm = Wm::new(screen());
+    wm.workspaces = cfg.workspaces;
+    wm.names = cfg.names;
+    wm.assign_rules = cfg.assign;
     let layout = wm.reconcile(&mut io_conn)?;
     eprintln!(
         "forum-wm: declared layout — {} surface(s), focus={}",
@@ -214,7 +221,7 @@ fn spawn_input_poller(core: Core) {
                 let mut g = core.lock().unwrap();
                 let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
                 match wm.switch_workspace(conn, ws) {
-                    Ok(Some(w)) => eprintln!("forum-wm: switched to workspace {w}"),
+                    Ok(Some(w)) => eprintln!("forum-wm: switched to {}", wm.workspace_label(w)),
                     Ok(None) => {}               // out of range or already active
                     Err(e) => eprintln!("forum-wm: switch_workspace error: {e}"),
                 }

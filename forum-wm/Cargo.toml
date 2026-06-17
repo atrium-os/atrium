@@ -23,6 +23,9 @@ name = "wm-app-stub"
 path = "src/bin/wm_app_stub.rs"
 
 [dependencies]
+# Per-user workspace config (forum.toml): workspace count/names + app rules.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 fresco-protocol = { path = "../fresco-protocol" }
 fresco-client = { path = "../fresco-client" }
 forum-ctl = { path = "../forum-ctl" }
