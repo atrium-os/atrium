@@ -30,6 +30,30 @@ impl Launcher for LogLauncher {
     }
 }
 
+/// A demo launcher that runs the *real* uid path minus jaild: it allocates a
+/// dedicated per-app uid and registers `uid → (owner, app-id)` exactly as the
+/// production `JaildLauncher` does, then logs (instead of asking jaild to
+/// jail+exec). This makes the privilege separation visible in the trace — each
+/// app gets its own non-root uid, owned by the human — without needing the TCB.
+struct AllocLauncher;
+impl Launcher for AllocLauncher {
+    fn launch(&mut self, s: &LaunchSpec) -> Result<i32, String> {
+        let reg = portcullis_peer::DEFAULT_REGISTRY;
+        let uid = portcullis_peer::allocate(reg);
+        portcullis_peer::register(reg, uid, &s.owner, &s.app_id)
+            .map_err(|e| format!("register uid {uid}: {e}"))?;
+        eprintln!(
+            "  → jaild: jail {} owner={} exec-uid={} ({}) caps={:?}",
+            s.app_id, s.owner, uid, s.bin, s.caps,
+        );
+        Ok(uid as i32)
+    }
+    fn teardown(&mut self, app: &str) -> Result<(), String> {
+        eprintln!("  → jaild: teardown {app}");
+        Ok(())
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--demo") {
@@ -64,8 +88,10 @@ fn main() {
         let seat = std::env::var("OSTIARIUS_SEAT")
             .unwrap_or_else(|_| format!("/tmp/ostiarius-seat-{}", std::process::id()));
         let _ = std::fs::remove_file(&seat);
-        let mut o = Ostiarius::new(LogLauncher).with_seat_path(seat);
-        eprintln!("ostiarius(demo): serving {sock} with LogLauncher");
+        // AllocLauncher = the real allocate-uid + register path, minus jaild, so
+        // the trace shows each app's dedicated per-app uid + human owner.
+        let mut o = Ostiarius::new(AllocLauncher).with_seat_path(seat);
+        eprintln!("ostiarius(demo): serving {sock} (allocates per-app uids, no jaild)");
         let r = if std::env::var("OSTIARIUS_OPEN").is_ok() {
             ostiarius::control::serve(&mut o, &sock, |_| true)
         } else {
