@@ -384,6 +384,35 @@ pub mod daemon {
             Ok(Some(ws))
         }
 
+        /// Move the focused surface to another workspace (the "send to desktop"
+        /// intent) and re-declare, staying on the current workspace. The moved
+        /// surface leaves the active set → render-gates; focus re-resolves among
+        /// what remains. No-op (returns `None`) for an out-of-range / current
+        /// workspace or when nothing focusable is on screen. Returns the moved
+        /// surface id.
+        pub fn move_focused_to_workspace(&mut self, conn: &mut impl FrescoConn, ws: usize)
+            -> io::Result<Option<u32>>
+        {
+            if ws >= self.workspaces || ws == self.active {
+                return Ok(None);
+            }
+            let surfaces = conn.enumerate()?;
+            let active: Vec<WmSurfaceInfo> = surfaces
+                .iter()
+                .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
+                .cloned()
+                .collect();
+            let focus = arrange(&self.screen, &active, self.focus_intent).focus;
+            if focus == 0 {
+                return Ok(None); // nothing to move
+            }
+            self.assignment.insert(focus, ws);
+            self.zoomed = self.zoomed.filter(|z| *z != focus); // a moved window can't stay zoomed here
+            self.focus_intent = None; // it left this workspace; re-resolve focus among the rest
+            self.declare(conn, &surfaces)?;
+            Ok(Some(focus))
+        }
+
         /// Toggle the split (tiled) intent for the active workspace and re-declare
         /// (forum.md §2.3). Tiled → documents side-by-side in columns, all
         /// visible; un-tiled → back to the stacked default (one focused fills,
@@ -982,5 +1011,30 @@ mod tests {
         // Toggle off → back to the normal arrangement (chrome + a doc render again).
         assert!(!wm.toggle_zoom(&mut conn).unwrap(), "zoomed off");
         assert!(conn.declared.as_ref().unwrap().slots.len() > 1, "normal arrangement restored");
+    }
+
+    #[test]
+    fn move_sends_the_focused_window_to_another_workspace() {
+        let mut conn = MockConn {
+            surfaces: vec![surf(1, WmRole::Document), surf(2, WmRole::Document)],
+            ..Default::default()
+        };
+        let mut wm = Wm::new(screen());
+        wm.assign_to_active(1); // both docs created on workspace 0
+        wm.assign_to_active(2);
+        wm.focus_intent = Some(2); // focus doc 2 on workspace 0
+        let moved = wm.move_focused_to_workspace(&mut conn, 1).unwrap();
+        assert_eq!(moved, Some(2), "the focused doc moved");
+        assert_eq!(wm.assignment.get(&2), Some(&1), "doc 2 now belongs to workspace 1");
+        assert_eq!(wm.active, 0, "we stay on the current workspace");
+        // Doc 2 left workspace 0 → gated; only doc 1 is active.
+        let declared: Vec<u32> =
+            conn.declared.as_ref().unwrap().slots.iter().map(|s| s.surface_id).collect();
+        assert_eq!(declared, vec![1], "only doc 1 remains on the active workspace");
+        // Following it to workspace 1 shows doc 2.
+        wm.switch_workspace(&mut conn, 1).unwrap();
+        let declared: Vec<u32> =
+            conn.declared.as_ref().unwrap().slots.iter().map(|s| s.surface_id).collect();
+        assert_eq!(declared, vec![2], "doc 2 is on workspace 1");
     }
 }

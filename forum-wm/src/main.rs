@@ -38,6 +38,9 @@ const MOD_GUI: u8 = 0x08 | 0x80;
 /// Super+1..Super+N switches workspace. HID usages 0x1E..=0x27 are the digit
 /// row '1'..'9','0'; we map '1'.. to workspace 0.. up to the workspace count.
 const KEY_1: u16 = 0x1E;
+/// Either Shift modifier bit (left 0x02 | right 0x20). Super+Shift+N moves the
+/// focused window to workspace N (vs plain Super+N which switches to it).
+const MOD_SHIFT: u8 = 0x02 | 0x20;
 /// Super+S toggles the split (tiled) layout for the active workspace. HID 0x16 = 'S'.
 const KEY_S: u16 = 0x16;
 /// Super+F toggles zoom (fullscreen) for the focused surface. HID 0x09 = 'F'.
@@ -171,6 +174,7 @@ fn spawn_input_poller(core: Core) {
             let mut created: Option<u32> = None;
             let mut cycle = false;
             let mut switch_ws: Option<usize> = None;
+            let mut move_ws: Option<usize> = None;
             let mut split = false;
             let mut zoom = false;
             {
@@ -196,9 +200,16 @@ fn spawn_input_poller(core: Core) {
                         // Super+F: toggle zoom (fullscreen) for the focused surface.
                         Ok(Some(Event::Key { hid_usage: KEY_F, pressed: true, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 => zoom = true,
+                        // Super+Shift+1..N: MOVE the focused window to workspace N
+                        // (must precede the plain Super+N arm, which it also matches).
+                        Ok(Some(Event::Key { hid_usage, pressed: true, modifiers, .. }))
+                            if modifiers & MOD_GUI != 0 && modifiers & MOD_SHIFT != 0
+                                && hid_usage >= KEY_1 && hid_usage < KEY_1 + 9 =>
+                            move_ws = Some((hid_usage - KEY_1) as usize),
                         // Super+1..N: switch the active workspace.
                         Ok(Some(Event::Key { hid_usage, pressed: true, modifiers, .. }))
-                            if modifiers & MOD_GUI != 0 && hid_usage >= KEY_1 && hid_usage < KEY_1 + 9 =>
+                            if modifiers & MOD_GUI != 0 && modifiers & MOD_SHIFT == 0
+                                && hid_usage >= KEY_1 && hid_usage < KEY_1 + 9 =>
                             switch_ws = Some((hid_usage - KEY_1) as usize),
                         Ok(Some(_)) => {}        // other event — ignore
                         Ok(None) => break,       // backlog drained
@@ -236,6 +247,16 @@ fn spawn_input_poller(core: Core) {
                         l.slots.len(), l.focus,
                     ),
                     Err(e) => eprintln!("forum-wm: reconcile error: {e}"),
+                }
+            }
+
+            if let Some(ws) = move_ws {
+                let mut g = core.lock().unwrap();
+                let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
+                match wm.move_focused_to_workspace(conn, ws) {
+                    Ok(Some(s)) => eprintln!("forum-wm: moved surface {s} to {}", wm.workspace_label(ws)),
+                    Ok(None) => {}               // nothing focused / out of range
+                    Err(e) => eprintln!("forum-wm: move_focused_to_workspace error: {e}"),
                 }
             }
 
