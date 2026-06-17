@@ -60,14 +60,28 @@ fn layer(role: WmRole) -> i32 {
     }
 }
 
-/// The layer a surface occupies given the resolved focus. Identical to [`layer`]
-/// except a *document that isn't the focused surface* drops behind the focused
-/// one ([`DOC_UNFOCUSED`]) so it gets occluded + render-gated.
-fn slot_layer(s: &WmSurfaceInfo, focus: u32) -> i32 {
+/// The layer a surface occupies given the resolved focus and tiling mode.
+/// Stacked (default): a *document that isn't the focused surface* drops behind
+/// the focused one ([`DOC_UNFOCUSED`]) so it gets occluded + render-gated. Tiled
+/// (split intent): all documents sit at [`DOC_FOCUSED`] — they're laid out
+/// side-by-side (non-overlapping), so none should gate the others.
+fn slot_layer(s: &WmSurfaceInfo, focus: u32, tiled: bool) -> i32 {
     match s.role {
-        WmRole::Document if s.surface_id != focus => DOC_UNFOCUSED,
+        WmRole::Document if !tiled && s.surface_id != focus => DOC_UNFOCUSED,
         r => layer(r),
     }
+}
+
+/// The i-th of `n` equal columns across the work area (the split-intent tiling).
+/// The last column absorbs any rounding remainder so there's no gap.
+fn tile_column(wa: WmRect, i: usize, n: usize) -> WmRect {
+    if n <= 1 {
+        return wa;
+    }
+    let w = wa.w / n as i32;
+    let x = wa.x + i as i32 * w;
+    let width = if i == n - 1 { wa.x + wa.w - x } else { w };
+    WmRect { x, y: wa.y, w: width, h: wa.h }
 }
 
 /// Resolve which surface holds focus: a dialog grabs it; else the caller's intent
@@ -114,16 +128,45 @@ pub fn arrange(
     surfaces: &[WmSurfaceInfo],
     focus_intent: Option<u32>,
 ) -> WmDeclareLayoutPayload {
+    arrange_for(screen, surfaces, focus_intent, false)
+}
+
+/// `arrange` with an explicit tiling mode. `tiled = true` is the split intent
+/// (forum.md §2.3): the workspace's documents are laid out side-by-side in equal
+/// columns of the work area, all visible. `tiled = false` is the stacked default
+/// (one focused document fills the work area, the rest render-gated). Non-document
+/// roles (chrome/panel/dialog/background) place identically either way.
+pub fn arrange_for(
+    screen: &Screen,
+    surfaces: &[WmSurfaceInfo],
+    focus_intent: Option<u32>,
+    tiled: bool,
+) -> WmDeclareLayoutPayload {
     let focus = resolve_focus(surfaces, focus_intent);
 
+    // In tiled mode, assign each document a column (stable order by surface_id).
+    let mut doc_rect: std::collections::HashMap<u32, WmRect> = std::collections::HashMap::new();
+    if tiled {
+        let mut doc_ids: Vec<u32> = surfaces
+            .iter()
+            .filter(|s| s.role == WmRole::Document)
+            .map(|s| s.surface_id)
+            .collect();
+        doc_ids.sort_unstable();
+        let n = doc_ids.len();
+        for (i, id) in doc_ids.iter().enumerate() {
+            doc_rect.insert(*id, tile_column(screen.work_area(), i, n));
+        }
+    }
+
     let mut ordered: Vec<&WmSurfaceInfo> = surfaces.iter().collect();
-    ordered.sort_by_key(|s| slot_layer(s, focus));
+    ordered.sort_by_key(|s| slot_layer(s, focus, tiled));
     let slots: Vec<WmSlot> = ordered
         .iter()
         .map(|s| WmSlot {
             surface_id: s.surface_id,
-            rect: rect_for(screen, s.role),
-            layer: slot_layer(s, focus),
+            rect: doc_rect.get(&s.surface_id).copied().unwrap_or_else(|| rect_for(screen, s.role)),
+            layer: slot_layer(s, focus, tiled),
         })
         .collect();
 
@@ -197,10 +240,10 @@ fn subtract(r: &WmRect, cut: &WmRect) -> Vec<WmRect> {
 /// The daemon reconcile loop. The WM core's job each time the surface set or focus
 /// changes: enumerate → arrange → declare the layout + the rendering decisions.
 pub mod daemon {
-    use super::{arrange, rendering_decisions, Screen};
+    use super::{arrange, arrange_for, rendering_decisions, Screen};
     use fresco_protocol::{WmDeclareLayoutPayload, WmRole, WmSetRenderingPayload, WmSurfaceInfo};
     use portcullis_peer::AppRegistry;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::io;
 
     /// Default number of workspaces (virtual desktops) when no per-user config
@@ -278,6 +321,11 @@ pub mod daemon {
         /// portcullis-peer. Used to resolve a surface's `owner_uid` to its
         /// app-id so [`assign_rules`](Self::assign_rules) (keyed by app-id) apply.
         pub registry: AppRegistry,
+        /// Workspaces currently in *split* (tiled) mode — the split intent
+        /// (forum.md §2.3). A tiled workspace lays its documents side-by-side in
+        /// columns (all visible); a non-tiled one stacks them (one focused +
+        /// fills, the rest render-gated — the default).
+        pub tiled_workspaces: HashSet<usize>,
     }
 
     impl Wm {
@@ -291,6 +339,7 @@ pub mod daemon {
                 assign_rules: HashMap::new(),
                 names: Vec::new(),
                 registry: AppRegistry::default(),
+                tiled_workspaces: HashSet::new(),
             }
         }
 
@@ -329,6 +378,22 @@ pub mod daemon {
             Ok(Some(ws))
         }
 
+        /// Toggle the split (tiled) intent for the active workspace and re-declare
+        /// (forum.md §2.3). Tiled → documents side-by-side in columns, all
+        /// visible; un-tiled → back to the stacked default (one focused fills,
+        /// the rest render-gated). Returns the new tiled state.
+        pub fn toggle_split(&mut self, conn: &mut impl FrescoConn) -> io::Result<bool> {
+            let now_tiled = if self.tiled_workspaces.remove(&self.active) {
+                false
+            } else {
+                self.tiled_workspaces.insert(self.active);
+                true
+            };
+            let surfaces = conn.enumerate()?;
+            self.declare(conn, &surfaces)?;
+            Ok(now_tiled)
+        }
+
         /// The workspace-aware placement step shared by every reconcile path:
         /// arrange the surfaces *visible on the active workspace*, declare that
         /// layout, then mark every other surface (apps on inactive workspaces)
@@ -341,7 +406,8 @@ pub mod daemon {
                 .filter(|s| shown_in_workspace(s, &self.assignment, self.active))
                 .cloned()
                 .collect();
-            let layout = arrange(&self.screen, &active, self.focus_intent);
+            let tiled = self.tiled_workspaces.contains(&self.active);
+            let layout = arrange_for(&self.screen, &active, self.focus_intent, tiled);
             conn.declare_layout(&layout)?;
             let mut decisions = rendering_decisions(&layout);
             for s in surfaces
@@ -652,6 +718,23 @@ mod tests {
         assert!(r.iter().find(|x| x.surface_id == 2).unwrap().rendering, "panel renders");
     }
 
+    #[test]
+    fn split_tiles_documents_side_by_side_all_rendering() {
+        // The split intent: two documents become two columns of the work area,
+        // both visible (nothing gated) — vs the stacked default.
+        let surfaces = [surf(1, WmRole::Document), surf(2, WmRole::Document)];
+        let l = arrange_for(&screen(), &surfaces, Some(1), true);
+        let wa = screen().work_area();
+        let d1 = l.slots.iter().find(|s| s.surface_id == 1).unwrap();
+        let d2 = l.slots.iter().find(|s| s.surface_id == 2).unwrap();
+        assert_eq!(d1.rect.x, wa.x);
+        assert_eq!(d2.rect.x, wa.x + wa.w / 2);
+        assert_eq!(d1.rect.x + d1.rect.w, d2.rect.x, "columns abut — no overlap");
+        assert_eq!(d1.layer, d2.layer, "tiled docs share a layer (no occlusion)");
+        let r = rendering_decisions(&l);
+        assert!(r.iter().all(|x| x.rendering), "every tiled document renders");
+    }
+
     // ── the daemon reconcile loop ────────────────────────────────────────────
 
     use crate::daemon::{FrescoConn, Wm};
@@ -806,5 +889,23 @@ mod tests {
         };
         wm.focus_new(&mut conn2, 8).unwrap();
         assert_eq!(wm.assignment.get(&8), Some(&0), "unconfigured app opens on the active workspace");
+    }
+
+    #[test]
+    fn toggle_split_switches_between_stacked_and_tiled() {
+        let mut conn = MockConn {
+            surfaces: vec![surf(1, WmRole::Document), surf(2, WmRole::Document)],
+            ..Default::default()
+        };
+        let mut wm = Wm::new(screen());
+        // Stacked default: the unfocused document is render-gated.
+        wm.reconcile(&mut conn).unwrap();
+        assert_eq!(conn.rendering.iter().filter(|r| !r.rendering).count(), 1, "stacked: 1 gated");
+        // Split ON → both documents tile + render.
+        assert!(wm.toggle_split(&mut conn).unwrap(), "now tiled");
+        assert_eq!(conn.rendering.iter().filter(|r| !r.rendering).count(), 0, "tiled: none gated");
+        // Split OFF → back to stacked (1 gated again).
+        assert!(!wm.toggle_split(&mut conn).unwrap(), "back to stacked");
+        assert_eq!(conn.rendering.iter().filter(|r| !r.rendering).count(), 1, "stacked again");
     }
 }

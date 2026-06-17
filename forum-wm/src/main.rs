@@ -38,6 +38,8 @@ const MOD_GUI: u8 = 0x08 | 0x80;
 /// Super+1..Super+N switches workspace. HID usages 0x1E..=0x27 are the digit
 /// row '1'..'9','0'; we map '1'.. to workspace 0.. up to the workspace count.
 const KEY_1: u16 = 0x1E;
+/// Super+S toggles the split (tiled) layout for the active workspace. HID 0x16 = 'S'.
+const KEY_S: u16 = 0x16;
 
 /// The live frescod connection — the production implementation of the seam the
 /// reconcile loop drives. Each method is one window-management protocol op.
@@ -167,6 +169,7 @@ fn spawn_input_poller(core: Core) {
             let mut created: Option<u32> = None;
             let mut cycle = false;
             let mut switch_ws: Option<usize> = None;
+            let mut split = false;
             {
                 let mut g = core.lock().unwrap();
                 loop {
@@ -184,6 +187,9 @@ fn spawn_input_poller(core: Core) {
                         // a window-management gesture, not app text input.
                         Ok(Some(Event::Key { hid_usage: KEY_TAB, pressed: true, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 => cycle = true,
+                        // Super+S: toggle split (tiled) layout for the active workspace.
+                        Ok(Some(Event::Key { hid_usage: KEY_S, pressed: true, modifiers, .. }))
+                            if modifiers & MOD_GUI != 0 => split = true,
                         // Super+1..N: switch the active workspace.
                         Ok(Some(Event::Key { hid_usage, pressed: true, modifiers, .. }))
                             if modifiers & MOD_GUI != 0 && hid_usage >= KEY_1 && hid_usage < KEY_1 + 9 =>
@@ -234,6 +240,15 @@ fn spawn_input_poller(core: Core) {
                     Ok(Some(w)) => eprintln!("forum-wm: switched to {}", wm.workspace_label(w)),
                     Ok(None) => {}               // out of range or already active
                     Err(e) => eprintln!("forum-wm: switch_workspace error: {e}"),
+                }
+            }
+
+            if split {
+                let mut g = core.lock().unwrap();
+                let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
+                match wm.toggle_split(conn) {
+                    Ok(t) => eprintln!("forum-wm: split {} for active workspace", if t { "ON (tiled)" } else { "OFF (stacked)" }),
+                    Err(e) => eprintln!("forum-wm: toggle_split error: {e}"),
                 }
             }
 
