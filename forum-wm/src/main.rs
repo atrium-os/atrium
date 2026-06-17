@@ -12,11 +12,21 @@
 //! the lib and is unit-tested without a live frescod; here we just drive it.
 
 use std::io;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use forum_wm::daemon::{FrescoConn, Wm};
 use forum_wm::Screen;
-use fresco_client::Connection;
+use fresco_client::{Connection, Event};
 use fresco_protocol::{WmDeclareLayoutPayload, WmRect, WmSetRenderingPayload, WmSurfaceInfo};
+
+/// The WM's shared mutable core: the policy state + the live frescod connection.
+/// Two threads touch it — the forum-ctl server (chrome intents) and the input
+/// poller (focus-follows-click) — so they serialize on this lock. The single
+/// connection is fine: every reader (`wait_event`/`poll_event`) and request
+/// (`enumerate`/`declare`) happens under the lock, so they never race on the
+/// stream, and the one subscriber is drained by the poller every tick.
+type Core = Arc<Mutex<(Wm, ClientConn)>>;
 
 /// The live frescod connection — the production implementation of the seam the
 /// reconcile loop drives. Each method is one window-management protocol op.
@@ -69,7 +79,7 @@ fn main() -> io::Result<()> {
     conn.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     let mut io_conn = ClientConn { conn };
 
-    let mut wm = Wm::new(screen());
+    let wm = Wm::new(screen());
     let layout = wm.reconcile(&mut io_conn)?;
     eprintln!(
         "forum-wm: declared layout — {} surface(s), focus={}",
@@ -77,19 +87,83 @@ fn main() -> io::Result<()> {
         layout.focus
     );
 
-    // Become the WM core daemon: serve the chrome apps' intents (dock/bar/overview)
-    // over forum-ctl, each re-driving Fresco through the same reconcile. The path
-    // resolves to the canonical in-jail location (or $FORUM_CTL_SOCKET / a dev
-    // fallback), so a jailed forum-wm serves the same socket the jailed chrome
-    // apps connect to through their shared /atrium/sockets/forum-ctl/ mount. Set
-    // FORUM_WM_ONESHOT=1 to keep the old F0 reconcile-once-and-exit behaviour.
-    if std::env::var("FORUM_WM_ONESHOT").is_err() {
-        let ctl = forum_ctl::default_socket_path();
-        let ctl = ctl.to_string_lossy();
-        eprintln!("forum-wm: serving forum-ctl at {ctl}");
-        serve_forum_ctl(&ctl, &mut wm, &mut io_conn)?;
+    if std::env::var("FORUM_WM_ONESHOT").is_ok() {
+        // F0 behaviour: reconcile once and exit. No event loop, no daemon.
+        return Ok(());
     }
+
+    // Become the WM core daemon. Two concurrent drivers share the core:
+    //
+    //   - the INPUT POLLER reads frescod's event stream (the WM connection is a
+    //     subscriber like any client) and applies focus-follows-click — a
+    //     pointer press over an app surface moves keyboard focus there;
+    //   - the FORUM-CTL SERVER answers the chrome apps' intents (dock/bar/
+    //     overview) over forum-ctl, each re-driving Fresco through reconcile.
+    //
+    // Both re-derive the layout through the same `Wm`, so they must not run
+    // concurrently against the one connection — `Core` (Arc<Mutex>) serializes
+    // them. forum-ctl's path resolves to the canonical in-jail location (or
+    // $FORUM_CTL_SOCKET / a dev fallback), so a jailed forum-wm serves the same
+    // socket the jailed chrome apps reach through their shared
+    // /atrium/sockets/forum-ctl/ mount.
+    let core: Core = Arc::new(Mutex::new((wm, io_conn)));
+
+    spawn_input_poller(Arc::clone(&core));
+
+    let ctl = forum_ctl::default_socket_path();
+    let ctl = ctl.to_string_lossy();
+    eprintln!("forum-wm: serving forum-ctl at {ctl}");
+    serve_forum_ctl(&ctl, &core)?;
     Ok(())
+}
+
+/// The input poller — focus-follows-click. frescod broadcasts every input event
+/// to every connection (no ownership filter), and tags each pointer-button event
+/// with the hit-test target (the surface under the cursor), so the WM learns
+/// which surface the human clicked just by reading its own event stream.
+///
+/// A short non-blocking poll keeps the core lock free almost all the time: we
+/// grab it, drain whatever events are queued (so a burst of motion events can't
+/// back up the socket), note the last primary-button press, release the lock,
+/// then act on that press under a fresh lock. The forum-ctl server therefore
+/// sees the lock contended only for the brief drain + an actual focus change.
+fn spawn_input_poller(core: Core) {
+    std::thread::Builder::new()
+        .name("forum-wm-input".into())
+        .spawn(move || loop {
+            // Drain the event backlog under one short lock; keep the last
+            // primary press (a later click supersedes an earlier one this tick).
+            let mut clicked: Option<u32> = None;
+            {
+                let mut g = core.lock().unwrap();
+                loop {
+                    match g.1.conn.poll_event() {
+                        Ok(Some(Event::PointerButton {
+                            window_id, pressed: true, button: 1, ..
+                        })) if window_id != 0 => clicked = Some(window_id),
+                        Ok(Some(_)) => {}        // other event — ignore
+                        Ok(None) => break,       // backlog drained
+                        Err(e) => {
+                            eprintln!("forum-wm: input poll error: {e}");
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some(w) = clicked {
+                let mut g = core.lock().unwrap();
+                let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
+                match wm.focus_click(conn, w) {
+                    Ok(Some(f)) => eprintln!("forum-wm: focus-follows-click → surface {f}"),
+                    Ok(None) => {}               // click didn't change focus
+                    Err(e) => eprintln!("forum-wm: focus_click error: {e}"),
+                }
+            }
+
+            std::thread::sleep(Duration::from_millis(16)); // ~60 Hz, lock released
+        })
+        .expect("spawn forum-wm input poller");
 }
 
 /// Serve forum-ctl: accept chrome connections, carry out one intent each against
@@ -106,7 +180,7 @@ fn main() -> io::Result<()> {
 /// widen the trust of) a decision the TCB already made + enforced. See docs/spec/
 /// portcullis.md §9.0. (Dev `--no-prompt` launches skip the launch-time policy
 /// gate — an explicit operator trust decision, not a hole here.)
-fn serve_forum_ctl(path: &str, wm: &mut Wm, conn: &mut ClientConn) -> io::Result<()> {
+fn serve_forum_ctl(path: &str, core: &Core) -> io::Result<()> {
     use std::os::unix::net::UnixListener;
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
@@ -123,7 +197,14 @@ fn serve_forum_ctl(path: &str, wm: &mut Wm, conn: &mut ClientConn) -> io::Result
             Some(i) => i,
             None => continue,
         };
-        let reply = forum_wm::control::handle_intent(wm, conn, intent);
+        // Carry out the intent under the core lock — serialized against the
+        // input poller's focus-follows-click so the two never drive the one
+        // connection at once.
+        let reply = {
+            let mut g = core.lock().unwrap();
+            let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
+            forum_wm::control::handle_intent(wm, conn, intent)
+        };
         if let Ok(bytes) = forum_ctl::encode(&reply) {
             let _ = forum_ctl::write_frame(&mut s, &bytes);
         }

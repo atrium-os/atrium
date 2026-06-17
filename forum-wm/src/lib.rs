@@ -161,8 +161,33 @@ fn subtract(r: &WmRect, cut: &WmRect) -> Vec<WmRect> {
 /// changes: enumerate → arrange → declare the layout + the rendering decisions.
 pub mod daemon {
     use super::{arrange, rendering_decisions, Screen};
-    use fresco_protocol::{WmDeclareLayoutPayload, WmSetRenderingPayload, WmSurfaceInfo};
+    use fresco_protocol::{WmDeclareLayoutPayload, WmRole, WmSetRenderingPayload, WmSurfaceInfo};
     use std::io;
+
+    /// Roles a pointer click moves keyboard focus to. Clicking chrome (bar /
+    /// dock / hud) or the wallpaper must NOT steal focus from the document the
+    /// human is working in — only app surfaces (a document, a dialog, a side
+    /// panel) are focus targets.
+    fn click_focusable(role: WmRole) -> bool {
+        matches!(role, WmRole::Document | WmRole::Dialog | WmRole::Panel)
+    }
+
+    /// Resolve a pointer click on surface `clicked` to a focus change, if any.
+    /// Returns `Some(id)` when the click should move focus there — the clicked
+    /// surface is a focusable app surface, present in the set, and not already
+    /// the resolved focus — else `None` (chrome/background, an unknown id, or a
+    /// click on the already-focused surface, all of which are no-ops).
+    pub fn resolve_click_focus(
+        surfaces: &[WmSurfaceInfo], clicked: u32, current_focus: Option<u32>,
+    ) -> Option<u32> {
+        if Some(clicked) == current_focus {
+            return None;
+        }
+        surfaces
+            .iter()
+            .find(|s| s.surface_id == clicked && click_focusable(s.role))
+            .map(|s| s.surface_id)
+    }
 
     /// The frescod connection seam — the only I/O. Production wraps a
     /// `fresco_client::Connection` (OP_WM_ENUMERATE → reply, OP_WM_DECLARE_LAYOUT,
@@ -199,6 +224,33 @@ pub mod daemon {
             conn.declare_layout(&layout)?;
             conn.set_rendering(&rendering_decisions(&layout))?;
             Ok(layout)
+        }
+
+        /// Focus-follows-click: react to a pointer-button press frescod reported
+        /// over surface `clicked` (the compositor tags the event with the
+        /// hit-test target, so it's the surface *under the cursor*, not the
+        /// currently-focused one). If that surface is a focusable app surface
+        /// that isn't already focused, move focus to it and re-declare the
+        /// layout. Returns the new focus when it changed, `None` otherwise.
+        ///
+        /// One enumerate serves both the current-focus check and the re-arrange,
+        /// so a click that doesn't change focus costs a single round-trip and no
+        /// layout push.
+        pub fn focus_click(&mut self, conn: &mut impl FrescoConn, clicked: u32)
+            -> io::Result<Option<u32>>
+        {
+            let surfaces = conn.enumerate()?;
+            let resolved = arrange(&self.screen, &surfaces, self.focus_intent).focus;
+            match resolve_click_focus(&surfaces, clicked, Some(resolved)) {
+                Some(id) => {
+                    self.focus_intent = Some(id);
+                    let layout = arrange(&self.screen, &surfaces, self.focus_intent);
+                    conn.declare_layout(&layout)?;
+                    conn.set_rendering(&rendering_decisions(&layout))?;
+                    Ok(Some(layout.focus))
+                }
+                None => Ok(None),
+            }
         }
     }
 }
@@ -251,6 +303,24 @@ mod tests {
     }
     fn surf(id: u32, role: WmRole) -> WmSurfaceInfo {
         WmSurfaceInfo { surface_id: id, owner_app: format!("org.atrium.app{id}"), role, rect: WmRect { x: 0, y: 0, w: 0, h: 0 } }
+    }
+
+    #[test]
+    fn click_focuses_an_app_surface_but_not_chrome_or_the_focused_one() {
+        use super::daemon::resolve_click_focus;
+        let surfaces = [
+            surf(1, WmRole::Document),
+            surf(2, WmRole::Document),
+            surf(9, WmRole::Chrome),     // the bar/dock — never a focus target
+        ];
+        // Clicking the unfocused document moves focus there.
+        assert_eq!(resolve_click_focus(&surfaces, 2, Some(1)), Some(2));
+        // Clicking chrome is a no-op (focus stays on the document).
+        assert_eq!(resolve_click_focus(&surfaces, 9, Some(1)), None);
+        // Clicking the already-focused surface is a no-op (no redundant push).
+        assert_eq!(resolve_click_focus(&surfaces, 1, Some(1)), None);
+        // Clicking an unknown surface id is a no-op.
+        assert_eq!(resolve_click_focus(&surfaces, 99, Some(1)), None);
     }
 
     #[test]
