@@ -330,9 +330,20 @@ This is the moment the platform becomes structurally self-sufficient: no Linux D
 
 **Estimate:** 6–9 months focused. Multiple parallel tracks (Pergola crates can develop independently of the Mesa fork).
 
-## D6 — Browser (Servo + Fresco backend)
+## D6 — Navigator (the browser, reimagined; Servo last + server-side)
 
-**Deliverable:** a working web browser on Atrium. Single biggest credibility test.
+**Deliverable:** the web, reimagined for a jailed OS — a *navigator + document
+viewer + native-app launcher*, NOT a JavaScript runtime. See
+[`spec/atrium-navigator.md`](spec/atrium-navigator.md). The jail is the sandbox the
+web only simulated in-process, so the client runs native jailed apps (local or
+server-streamed) and renders documents as inert content — **the client never runs
+JS**. Servo (HTML+JS engine) is the heaviest piece and slots in **last**, ideally
+server-side (so the client stays JS-free), only for the legacy-web-content tail; the
+`atrium-doc` content path (static HTML/CSS/MD/PDF, no script) covers most browsing.
+Build order: navigator+atrium-doc → app-launch (Nomenclator→Opifex→jail) → Limen
+composition → server-side Fresco streaming → Servo.
+
+**Deliverable (legacy framing):** a working web browser on Atrium. Single biggest credibility test.
 
 **Prerequisites:** D5 (helps but not strictly required).
 

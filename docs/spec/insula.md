@@ -102,6 +102,10 @@ A direct consequence of the design that is worth making
 explicit, because readers from a web background will look
 for distinctions that no longer exist.
 
+> The browser-reimagined view that follows from this section — a *navigator +
+> document viewer + native-app launcher* with a JS-free client — is specified in
+> [`atrium-navigator.md`](atrium-navigator.md) (the D6 plan).
+
 ### 0.5.1 What goes away
 
 The web's three-way split — **native app / PWA / website** —
