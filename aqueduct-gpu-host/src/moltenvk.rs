@@ -79,6 +79,21 @@ struct MvkBuffer {
 unsafe impl Send for MvkBuffer {}
 unsafe impl Sync for MvkBuffer {}
 
+/// A built scene acceleration structure: one BLAS (a baked prefab mesh) +
+/// a TLAS instancing it. The shader binds `tlas` as a
+/// VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR descriptor and ray-queries
+/// it. `owned` holds every backing buffer (vertices, BLAS/TLAS storage,
+/// instances, scratch) so they live as long as the structure is bound.
+struct MvkAccel {
+    tlas:  vk::AccelerationStructureKHR,
+    // The BLAS and backing buffers are not read after construction, but the TLAS
+    // references them on the GPU, so they must be retained for its lifetime.
+    #[allow(dead_code)] blas:  vk::AccelerationStructureKHR,
+    #[allow(dead_code)] owned: Vec<(vk::Buffer, vk::DeviceMemory)>,
+}
+unsafe impl Send for MvkAccel {}
+unsafe impl Sync for MvkAccel {}
+
 /// A guest graphics pipeline. The VS+FS SPIR-V is stashed at create
 /// time, but the real `VkPipeline` is materialised **lazily** on first
 /// draw — the colour-attachment format (needed for the pipeline's
@@ -105,6 +120,10 @@ struct MvkComputePipeline {
     /// 8-binding pass must not be written into a 4-binding
     /// pipeline's set (invalid update -> poisoned descriptors).
     ssbo_count:  u32,
+    /// Binding indices whose descriptor type is
+    /// VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR (the rest are storage
+    /// buffers). Written from the accel map, not the buffer map, at dispatch.
+    as_bindings: Vec<u32>,
 }
 
 /// The realised Vulkan objects for an `MvkPipeline` at a specific
@@ -197,6 +216,15 @@ pub struct MoltenVkBackend {
     /// Whether VK_KHR_acceleration_structure + VK_KHR_ray_query were enabled at
     /// device creation (HW ray-tracing for the instanced-mesh path available).
     ray_query: bool,
+    /// VK_KHR_acceleration_structure device function loader (BLAS/TLAS build +
+    /// device-address queries). `Some` iff `ray_query`.
+    as_device: Option<khr::acceleration_structure::Device>,
+    /// Built scene acceleration structures, keyed by ResourceId. A dispatch
+    /// binding that resolves here is written as an AS descriptor, not a buffer.
+    accels: Mutex<HashMap<u32, MvkAccel>>,
+    /// Per-binding acceleration-structure stash for the next Dispatch (mirror
+    /// of `compute_binds` for the AS descriptor type).
+    compute_accel_binds: Mutex<HashMap<u32, u32>>,
 }
 
 /// Construction errors for [`MoltenVkBackend::new`]. Each variant
@@ -475,6 +503,14 @@ impl MoltenVkBackend {
             64,
         ));
 
+        // VK_KHR_acceleration_structure device functions (build/query). Only
+        // meaningful when ray-query was enabled above.
+        let as_device = if ray_query {
+            Some(khr::acceleration_structure::Device::new(&instance, &device))
+        } else {
+            None
+        };
+
         Ok(Self {
             submissions: AtomicU64::new(0),
             physical,
@@ -499,6 +535,9 @@ impl MoltenVkBackend {
             last_gpu_ns: AtomicU64::new(0),
             total_gpu_ns: AtomicU64::new(0),
             ray_query,
+            as_device,
+            accels: Mutex::new(HashMap::new()),
+            compute_accel_binds: Mutex::new(HashMap::new()),
         })
     }
 
@@ -507,6 +546,245 @@ impl MoltenVkBackend {
     /// falls back (no objects) when false — e.g. against a stock MoltenVK that
     /// lacks the acceleration-structure port.
     pub fn has_ray_query(&self) -> bool { self.ray_query }
+
+    /// Pick a memory type index satisfying `want` (and, when `exclude` is set,
+    /// lacking those flags — used to force device-local *private* AS storage).
+    fn find_mem_type(&self, type_bits: u32, want: vk::MemoryPropertyFlags,
+                     exclude: vk::MemoryPropertyFlags) -> Option<u32> {
+        (0..self.mem_props.memory_type_count).find(|&i| {
+            let f = self.mem_props.memory_types[i as usize].property_flags;
+            (type_bits & (1 << i)) != 0 && f.contains(want) && !f.intersects(exclude)
+        })
+    }
+
+    /// Create a device-address-enabled buffer + memory. `host_visible` ⇒
+    /// mappable/coherent (geometry, instances, scratch); otherwise device-local
+    /// PRIVATE (acceleration-structure storage must be Private on Metal).
+    /// Returns (buffer, memory, mapped-ptr-or-null).
+    unsafe fn make_as_buffer(&self, size: u64, usage: vk::BufferUsageFlags,
+                             host_visible: bool)
+        -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), String>
+    {
+        let dev = &self.device;
+        let bci = vk::BufferCreateInfo::default()
+            .size(size.max(4))
+            .usage(usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buf = dev.create_buffer(&bci, None)
+            .map_err(|e| format!("AS buffer create: {e:?}"))?;
+        let req = dev.get_buffer_memory_requirements(buf);
+        let mt = if host_visible {
+            self.find_mem_type(req.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                vk::MemoryPropertyFlags::empty())
+        } else {
+            self.find_mem_type(req.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                vk::MemoryPropertyFlags::HOST_VISIBLE)
+        }.ok_or_else(|| "AS buffer: no suitable memory type".to_string())?;
+        let mut flags = vk::MemoryAllocateFlagsInfo::default()
+            .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let ai = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(mt)
+            .push_next(&mut flags);
+        let mem = dev.allocate_memory(&ai, None)
+            .map_err(|e| format!("AS memory alloc: {e:?}"))?;
+        dev.bind_buffer_memory(buf, mem, 0)
+            .map_err(|e| format!("AS bind: {e:?}"))?;
+        let mapped = if host_visible {
+            dev.map_memory(mem, 0, req.size, vk::MemoryMapFlags::empty())
+                .map_err(|e| format!("AS map: {e:?}"))? as *mut u8
+        } else {
+            std::ptr::null_mut()
+        };
+        Ok((buf, mem, mapped))
+    }
+
+    unsafe fn buffer_address(&self, buf: vk::Buffer) -> u64 {
+        self.device.get_buffer_device_address(
+            &vk::BufferDeviceAddressInfo::default().buffer(buf))
+    }
+
+    /// Run a one-time command buffer to completion on the backend queue.
+    unsafe fn one_time_submit<F: FnOnce(vk::CommandBuffer)>(&self, rec: F)
+        -> Result<(), String>
+    {
+        let dev = &self.device;
+        let cb = dev.allocate_command_buffers(
+            &vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.cmd_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1))
+            .map_err(|e| format!("AS cmd alloc: {e:?}"))?[0];
+        dev.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))
+            .map_err(|e| format!("AS cmd begin: {e:?}"))?;
+        rec(cb);
+        dev.end_command_buffer(cb).map_err(|e| format!("AS cmd end: {e:?}"))?;
+        let cbs = [cb];
+        let si = vk::SubmitInfo::default().command_buffers(&cbs);
+        let _guard = self.submit_lock.lock().unwrap();
+        dev.queue_submit(self._queue, &[si], vk::Fence::null())
+            .map_err(|e| format!("AS submit: {e:?}"))?;
+        dev.queue_wait_idle(self._queue)
+            .map_err(|e| format!("AS wait: {e:?}"))?;
+        dev.free_command_buffers(self.cmd_pool, &cbs);
+        Ok(())
+    }
+
+    /// Build a scene acceleration structure: one BLAS from a triangle-list
+    /// prefab (`vertices` = flat xyz, 3 verts per triangle, non-indexed) and a
+    /// TLAS instancing it once per entry in `instances` (each a row-major 3×4
+    /// transform). Stored under `tlas_id`; bind it to a dispatch with
+    /// [`bind_compute_accel`]. Mirrors the verified ray_query_test/host.c flow.
+    pub fn build_prefab_tlas(&self, tlas_id: ResourceId, vertices: &[f32],
+                             instances: &[[f32; 12]]) -> Result<(), String> {
+        let asd = self.as_device.as_ref()
+            .ok_or_else(|| "ray-query not available on this device".to_string())?;
+        if vertices.len() % 9 != 0 || vertices.is_empty() {
+            return Err("vertices must be a non-empty multiple of 9 floats (3 verts/tri)".into());
+        }
+        let tri_count = (vertices.len() / 9) as u32;
+        let vert_count = (vertices.len() / 3) as u32;
+        let mut owned: Vec<(vk::Buffer, vk::DeviceMemory)> = Vec::new();
+
+        // Scratch alignment from the AS properties.
+        let mut as_props = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
+        let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut as_props);
+        unsafe { self.instance.get_physical_device_properties2(self.physical, &mut p2) };
+        let scratch_align =
+            as_props.min_acceleration_structure_scratch_offset_alignment.max(256) as u64;
+        let align_up = |a: u64, al: u64| (a + al - 1) & !(al - 1);
+
+        unsafe {
+            // ---- vertices (host-visible, AS build input) ----
+            let vbytes = (vertices.len() * 4) as u64;
+            let (vbuf, vmem, vmap) = self.make_as_buffer(vbytes,
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+                true)?;
+            owned.push((vbuf, vmem));
+            std::ptr::copy_nonoverlapping(vertices.as_ptr() as *const u8, vmap, vbytes as usize);
+            let vaddr = self.buffer_address(vbuf);
+
+            // ---- BLAS sizes ----
+            let tri = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
+                .vertex_format(vk::Format::R32G32B32_SFLOAT)
+                .vertex_data(vk::DeviceOrHostAddressConstKHR { device_address: vaddr })
+                .vertex_stride(12)
+                .max_vertex(vert_count - 1)
+                .index_type(vk::IndexType::NONE_KHR);
+            let bgeo = vk::AccelerationStructureGeometryKHR::default()
+                .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
+                .flags(vk::GeometryFlagsKHR::OPAQUE)
+                .geometry(vk::AccelerationStructureGeometryDataKHR { triangles: tri });
+            let bgeos = [bgeo];
+            let mut bbi = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+                .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+                .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+                .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+                .geometries(&bgeos);
+            let mut bsz = vk::AccelerationStructureBuildSizesInfoKHR::default();
+            asd.get_acceleration_structure_build_sizes(
+                vk::AccelerationStructureBuildTypeKHR::DEVICE, &bbi, &[tri_count], &mut bsz);
+
+            // ---- BLAS storage + scratch + create ----
+            let (blas_buf, blas_mem, _) = self.make_as_buffer(bsz.acceleration_structure_size,
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR, false)?;
+            owned.push((blas_buf, blas_mem));
+            let (bscratch, bscratch_mem, _) = self.make_as_buffer(
+                bsz.build_scratch_size + scratch_align,
+                vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
+            owned.push((bscratch, bscratch_mem));
+            let blas = asd.create_acceleration_structure(
+                &vk::AccelerationStructureCreateInfoKHR::default()
+                    .buffer(blas_buf).size(bsz.acceleration_structure_size)
+                    .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL), None)
+                .map_err(|e| format!("create BLAS: {e:?}"))?;
+            bbi = bbi.dst_acceleration_structure(blas)
+                .scratch_data(vk::DeviceOrHostAddressKHR {
+                    device_address: align_up(self.buffer_address(bscratch), scratch_align),
+                });
+            let brange = vk::AccelerationStructureBuildRangeInfoKHR::default()
+                .primitive_count(tri_count);
+            self.one_time_submit(|cb| {
+                asd.cmd_build_acceleration_structures(cb, &[bbi], &[&[brange]]);
+            })?;
+
+            // ---- instances ----
+            let blas_addr = asd.get_acceleration_structure_device_address(
+                &vk::AccelerationStructureDeviceAddressInfoKHR::default()
+                    .acceleration_structure(blas));
+            let mut inst_bytes = vec![0u8; instances.len() * 64];
+            for (i, m) in instances.iter().enumerate() {
+                let o = i * 64;
+                // transform: 12 f32 row-major 3x4
+                std::ptr::copy_nonoverlapping(m.as_ptr() as *const u8,
+                    inst_bytes[o..].as_mut_ptr(), 48);
+                // instanceCustomIndex(24) | mask(8=0xFF)
+                inst_bytes[o + 48..o + 52]
+                    .copy_from_slice(&((i as u32 & 0xFFFFFF) | (0xFFu32 << 24)).to_le_bytes());
+                // sbtOffset(24)=0 | flags(8)=0
+                inst_bytes[o + 52..o + 56].copy_from_slice(&0u32.to_le_bytes());
+                // BLAS device address
+                inst_bytes[o + 56..o + 64].copy_from_slice(&blas_addr.to_le_bytes());
+            }
+            let (ibuf, imem, imap) = self.make_as_buffer(inst_bytes.len() as u64,
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR, true)?;
+            owned.push((ibuf, imem));
+            std::ptr::copy_nonoverlapping(inst_bytes.as_ptr(), imap, inst_bytes.len());
+            let iaddr = self.buffer_address(ibuf);
+
+            // ---- TLAS sizes + storage + build ----
+            let tgeo = vk::AccelerationStructureGeometryKHR::default()
+                .geometry_type(vk::GeometryTypeKHR::INSTANCES)
+                .flags(vk::GeometryFlagsKHR::OPAQUE)
+                .geometry(vk::AccelerationStructureGeometryDataKHR {
+                    instances: vk::AccelerationStructureGeometryInstancesDataKHR::default()
+                        .data(vk::DeviceOrHostAddressConstKHR { device_address: iaddr }),
+                });
+            let tgeos = [tgeo];
+            let inst_count = instances.len() as u32;
+            let mut tbi = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+                .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
+                .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+                .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+                .geometries(&tgeos);
+            let mut tsz = vk::AccelerationStructureBuildSizesInfoKHR::default();
+            asd.get_acceleration_structure_build_sizes(
+                vk::AccelerationStructureBuildTypeKHR::DEVICE, &tbi, &[inst_count], &mut tsz);
+            let (tlas_buf, tlas_mem, _) = self.make_as_buffer(tsz.acceleration_structure_size,
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR, false)?;
+            owned.push((tlas_buf, tlas_mem));
+            let (tscratch, tscratch_mem, _) = self.make_as_buffer(
+                tsz.build_scratch_size + scratch_align,
+                vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
+            owned.push((tscratch, tscratch_mem));
+            let tlas = asd.create_acceleration_structure(
+                &vk::AccelerationStructureCreateInfoKHR::default()
+                    .buffer(tlas_buf).size(tsz.acceleration_structure_size)
+                    .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL), None)
+                .map_err(|e| format!("create TLAS: {e:?}"))?;
+            tbi = tbi.dst_acceleration_structure(tlas)
+                .scratch_data(vk::DeviceOrHostAddressKHR {
+                    device_address: align_up(self.buffer_address(tscratch), scratch_align),
+                });
+            let trange = vk::AccelerationStructureBuildRangeInfoKHR::default()
+                .primitive_count(inst_count);
+            self.one_time_submit(|cb| {
+                asd.cmd_build_acceleration_structures(cb, &[tbi], &[&[trange]]);
+            })?;
+
+            self.accels.lock().unwrap().insert(tlas_id.raw(),
+                MvkAccel { tlas, blas, owned });
+        }
+        Ok(())
+    }
+
+    /// Stage an acceleration-structure binding for the next `Dispatch`.
+    pub fn bind_compute_accel(&self, binding: u32, accel_id: ResourceId) {
+        self.compute_accel_binds.lock().unwrap().insert(binding, accel_id.raw());
+    }
 
     /// Create a compute pipeline from SPIR-V (the engine-bundle
     /// path). Descriptor interface: `ssbo_count` storage buffers at
@@ -518,6 +796,21 @@ impl MoltenVkBackend {
         cs_spirv: &[u8],
         ssbo_count: u32,
         push_size: u32,
+    ) -> Result<(), String> {
+        self.create_compute_pipeline_rt(pipeline_id, cs_spirv, ssbo_count, push_size, &[])
+    }
+
+    /// Like [`create_compute_pipeline`] but `as_bindings` lists the binding
+    /// indices (within `0..ssbo_count`) that are acceleration structures
+    /// (VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) for an inline-ray_query
+    /// kernel; the rest stay storage buffers.
+    pub fn create_compute_pipeline_rt(
+        &self,
+        pipeline_id: ResourceId,
+        cs_spirv: &[u8],
+        ssbo_count: u32,
+        push_size: u32,
+        as_bindings: &[u32],
     ) -> Result<(), String> {
         if cs_spirv.len() % 4 != 0 {
             return Err("SPIR-V length not word-aligned".into());
@@ -532,9 +825,14 @@ impl MoltenVkBackend {
                 .map_err(|e| format!("shader module: {e:?}"))?;
             let bindings: Vec<vk::DescriptorSetLayoutBinding> =
                 (0..ssbo_count).map(|b| {
+                    let ty = if as_bindings.contains(&b) {
+                        vk::DescriptorType::ACCELERATION_STRUCTURE_KHR
+                    } else {
+                        vk::DescriptorType::STORAGE_BUFFER
+                    };
                     vk::DescriptorSetLayoutBinding::default()
                         .binding(b)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_type(ty)
                         .descriptor_count(1)
                         .stage_flags(vk::ShaderStageFlags::COMPUTE)
                 }).collect();
@@ -574,6 +872,7 @@ impl MoltenVkBackend {
                 MvkComputePipeline {
                     pipeline, layout, dset_layout, module, push_size,
                     ssbo_count,
+                    as_bindings: as_bindings.to_vec(),
                 });
         }
         Ok(())
@@ -964,9 +1263,17 @@ impl MoltenVkBackend {
             let mut pool = self.desc_pool.lock().unwrap();
             if n_dispatch > pool.1 && pool.0 != vk::DescriptorPool::null() {
                 unsafe { dev.destroy_descriptor_pool(pool.0, None) };
-                let pool_sizes = [vk::DescriptorPoolSize::default()
+                // Storage buffers for every binding; plus acceleration-structure
+                // descriptors (one per dispatch is plenty for the mesh path) when
+                // the device supports ray-query.
+                let mut pool_sizes = vec![vk::DescriptorPoolSize::default()
                     .ty(vk::DescriptorType::STORAGE_BUFFER)
                     .descriptor_count(n_dispatch * 8)];
+                if self.ray_query {
+                    pool_sizes.push(vk::DescriptorPoolSize::default()
+                        .ty(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                        .descriptor_count(n_dispatch));
+                }
                 let dp_info = vk::DescriptorPoolCreateInfo::default()
                     .max_sets(n_dispatch)
                     .pool_sizes(&pool_sizes);
@@ -992,6 +1299,10 @@ impl MoltenVkBackend {
         // Dispatch (it cannot express per-dispatch sets: a HashMap
         // staged before submit collapses multi-pass frames).
         let mut stream_binds: std::collections::BTreeMap<u32, u32> =
+            std::collections::BTreeMap::new();
+        // Acceleration-structure bindings persist across dispatches in the frame,
+        // mirroring stream_binds (the inline-ray_query TLAS for the mesh path).
+        let mut stream_accel_binds: std::collections::BTreeMap<u32, u32> =
             std::collections::BTreeMap::new();
 
         // Open render pass + the transient objects to destroy post-submit.
@@ -1212,6 +1523,39 @@ impl MoltenVkBackend {
                         .collect();
                     unsafe {
                         dev.update_descriptor_sets(&writes, &[]);
+                    }
+                    // Acceleration-structure descriptors (inline ray_query). The
+                    // accel-bind stash is merged + drained like the buffer binds;
+                    // each is written with a chained
+                    // VkWriteDescriptorSetAccelerationStructureKHR. N is tiny
+                    // (one TLAS per kernel), so one update per binding is fine and
+                    // sidesteps push_next aliasing across a write batch.
+                    {
+                        {
+                            let mut am = self.compute_accel_binds.lock().unwrap();
+                            for (b, id) in am.drain() { stream_accel_binds.insert(b, id); }
+                        }
+                        let accels = self.accels.lock().unwrap();
+                        for (binding, accel_id) in stream_accel_binds.iter() {
+                            if *binding >= cp.ssbo_count
+                                || !cp.as_bindings.contains(binding) { continue; }
+                            if let Some(acc) = accels.get(accel_id) {
+                                let as_handles = [acc.tlas];
+                                let mut was =
+                                    vk::WriteDescriptorSetAccelerationStructureKHR::default()
+                                        .acceleration_structures(&as_handles);
+                                let mut w = vk::WriteDescriptorSet::default()
+                                    .dst_set(dset)
+                                    .dst_binding(*binding)
+                                    .descriptor_type(
+                                        vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                                    .push_next(&mut was);
+                                w.descriptor_count = 1;
+                                unsafe { dev.update_descriptor_sets(&[w], &[]); }
+                            }
+                        }
+                    }
+                    unsafe {
                         dev.cmd_bind_pipeline(cb,
                             vk::PipelineBindPoint::COMPUTE, cp.pipeline);
                         dev.cmd_bind_descriptor_sets(cb,
@@ -1997,6 +2341,65 @@ mod tests {
         assert!(c & H::CAPS_SPIRV_UPLOAD != 0);
         assert!(c & H::CAPS_COMPOSITION != 0);
         assert!(c & H::CAPS_SHARE_SURFACE != 0);
+    }
+
+    /// Inline ray_query through the FULL aqueduct-gpu-host stack: build a
+    /// 1-triangle BLAS + 1-instance TLAS, dispatch a ray_query compute kernel
+    /// that binds the TLAS as an acceleration-structure descriptor, read back
+    /// the committed hit. This is the Rust mirror of the verified
+    /// external/MoltenVK ray_query_test/host.c (which links MoltenVK directly):
+    /// here the SAME result (hit=1, t≈1) is produced through MoltenVkBackend —
+    /// device RT enablement, build_prefab_tlas, the AS descriptor binding, and
+    /// the FrameOp::Dispatch path. Requires the khr-ray-query MoltenVK fork; on
+    /// stock MoltenVK has_ray_query() is false and the test skips.
+    /// (Run with VK_DRIVER_FILES=<fork ICD> DYLD_LIBRARY_PATH=/opt/homebrew/lib.)
+    #[test]
+    fn ray_query_hit_through_stack() {
+        use aqueduct_gpu::frame::FrameBuilder;
+        use aqueduct_gpu::ids::IdNamespace;
+        let Some(be) = try_init() else { return; };
+        if !be.has_ray_query() {
+            eprintln!("ray_query test skipped: device lacks VK_KHR_ray_query \
+                       (stock MoltenVK — needs the khr-ray-query fork)");
+            return;
+        }
+
+        // One triangle in the z=0 plane (matches host.c — the kernel fires a ray
+        // straight down the -z axis from z=+1 and expects a hit at t=1).
+        let verts: [f32; 9] = [-0.5, -0.5, 0.0,  0.5, -0.5, 0.0,  0.0, 0.5, 0.0];
+        // One identity instance (row-major 3x4).
+        let identity: [f32; 12] = [1.0, 0.0, 0.0, 0.0,
+                                   0.0, 1.0, 0.0, 0.0,
+                                   0.0, 0.0, 1.0, 0.0];
+        let tlas = ResourceId::new(IdNamespace::IcdRuntime, 0xA0);
+        be.build_prefab_tlas(tlas, &verts, &[identity]).expect("build TLAS");
+
+        // Pipeline: binding 0 = TLAS (acceleration structure), binding 1 = result
+        // SSBO. The SPIR-V is the same kernel host.c validated.
+        const RQ_SPV: &[u8] = include_bytes!("test_ray_query.comp.spv");
+        let pipe = ResourceId::new(IdNamespace::IcdRuntime, 0xA1);
+        be.create_compute_pipeline_rt(pipe, RQ_SPV, 2, 0, &[0]).expect("rt pipeline");
+
+        let res = ResourceId::new(IdNamespace::IcdRuntime, 0xA2);
+        be.buffer_created(res, 16);
+        be.buffer_write(res, 0, &[0u8; 16]).expect("zero result");
+
+        let mut fb = FrameBuilder::new(4096);
+        fb.push(FrameOp::BindPipeline, &pipe.raw().to_le_bytes()).unwrap();
+        fb.push_bind_storage_buffers(&[(1, res.raw())]).unwrap();
+        be.bind_compute_accel(0, tlas);
+        fb.push_dispatch(aqueduct_gpu::frame::DispatchCmd {
+            group_count_x: 1, group_count_y: 1, group_count_z: 1,
+        }).unwrap();
+        let fence = ResourceId::new(IdNamespace::IcdRuntime, 0xA3);
+        assert!(be.submit_frame(fence, 1, fb.as_bytes()));
+
+        let out = be.buffer_read_bytes(res, 0, 16).expect("readback");
+        let hit = u32::from_le_bytes(out[0..4].try_into().unwrap());
+        let t = f32::from_le_bytes(out[4..8].try_into().unwrap());
+        eprintln!("ray_query through stack: hit={hit} t={t:.4}");
+        assert_eq!(hit, 1, "expected committed hit through the aqueduct stack");
+        assert!((t - 1.0).abs() < 0.5, "t={t} not ~1.0");
     }
 
     /// Tier-3 level-1: a render-pass clear + image→buffer readback runs
