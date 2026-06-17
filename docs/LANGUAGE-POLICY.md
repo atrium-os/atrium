@@ -17,14 +17,14 @@ Last revised: 2026-05-07. Revisions are themselves rare and require a written ca
 | Rust binding crates (`fresco-rs`, `atrium-gpu-rs`, ...) | Rust | Ergonomic safe wrappers over the C ABIs |
 | Display server (`fresco-server`) | **Rust** | Multi-client, multi-threaded, performance-critical, security-critical |
 | Privileged userspace daemons (`portcullisd`, `castellumd`, `vestibulumd`, `lyrad`, `tabulad`, `praecod`, `opifexd`, `curiad`, `scriniumd`) | **Rust** | Same reasons as the server, doubly so for jail launcher / IPC bus |
-| Shell + foundation apps (`forum`, `atrium-edit`, `atrium-term`, `atrium-files`, `atrium-image`, `atrium-pdf`, `atrium-clock`) | **Rust** | Already built; ecosystem alignment with Slint / Servo |
+| Shell + foundation apps (`forum`, `atrium-edit`, `atrium-term`, `atrium-files`, `atrium-image`, `atrium-pdf`, `atrium-clock`) | **Rust** | Already built; ecosystem alignment with the permissive Rust toolkit/engine world (winit/wgpu, egui, iced, Bevy) / Servo |
 | Wire-format and ABI specifications | **Language-agnostic** | A conformant C, Go, Zig, or Swift impl is welcome |
 
 ## Why Rust for userspace
 
 1. **Memory safety in a 1000-jailed-app world.** Atrium's thesis is "every app is its own jail." That model requires the privileged daemons to be unimpeachable — UAF, double-free, and buffer overflow in `portcullisd` or `fresco-server` would defeat the whole architecture. The bug classes Rust eliminates are exactly the classes that have plagued X servers and Wayland compositors for decades.
 2. **Concurrency without data races.** The display server has per-slot rings, multi-client fan-in, per-window FBOs, and shared content-addressed stores. `Send`/`Sync` enforcement is a real correctness tool, not a luxury — it's how we get away with doing the right thing rather than the cheap thing.
-3. **Ecosystem alignment.** Slint (D5) and Servo + WebRender (D6) are Rust. Modern text and graphics tooling — `lyon`, `rustybuzz`, `swash`, `tiny-skia`, `cosmic-text` — is Rust-first. Asahi-style GPU reverse engineering is Rust-first. Picking C means re-implementing that stack ourselves.
+3. **Ecosystem alignment.** The permissive Rust toolkit/engine ecosystem we import via the backend-multiplier (winit/wgpu, egui, iced, Bevy; D5 — see `spec/toolkit-backends.md`) and Servo + WebRender (D6) are Rust. Modern text and graphics tooling — `lyon`, `rustybuzz`, `swash`, `tiny-skia`, `cosmic-text` — is Rust-first. Asahi-style GPU reverse engineering is Rust-first. Picking C means re-implementing that stack ourselves.
 4. **Already shipped.** `fresco-server`, the four foundation apps, `fresco-rs`, `fresco-text`, and `atrium-gpu-rs` are Rust. Switching is enormous cost for arguable gain.
 5. **Industry direction.** The Linux kernel accepts Rust. Microsoft is shipping Rust in Windows. Google ships Rust in Android. Betting on Rust as a systems language in 2026 is no longer speculative.
 

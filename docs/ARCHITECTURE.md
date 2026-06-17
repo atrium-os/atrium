@@ -330,7 +330,7 @@ This is a **multi-year program**. Not a single sprint. Honest scale:
 
 - Year 0–1: validate native kernel GPU ABI on virtio-gpu + Raspberry Pi / Mali (small GPUs); ship D0..D3 (boot, login, shell, foundation apps).
 - Year 1–2: add Tessera, Portcullis, capability manifest. First real "Atrium desktop" demo.
-- Year 2–3: Slint backend (D5). Ecosystem inflection.
+- Year 2–3: Pergola native toolkit + permissive toolkit-backend *imports* (D5) — winit+wgpu (egui/iced/Bevy), SDL, Dear ImGui — the backend-multiplier (see `spec/toolkit-backends.md`). Ecosystem inflection. (Slint dropped — GPL/commercial/royalty-free, not permissive; D5 toolkit is Pergola, per ROADMAP.)
 - Year 3–5: Servo-based browser (D6). One desktop-class GPU (AMD likely) via partnership.
 - Year 5+: Standardization, more vendor partnerships, Apple Silicon (via Asahi-style RE), eventually Intel & NVIDIA.
 
@@ -342,7 +342,7 @@ This isn't just a graphics-stack project. It's an OS-platform project. Conversat
 
 - **FreeBSD foundation + core team** — they've wanted a way out of the linuxkpi position for years. A credible native alternative is a real story.
 - **Jail / Capsicum people** — capability-based desktop is the natural extension.
-- **Slint, Servo, embedded GPU vendors (Imagination, ARM Mali, Adreno)** — early ecosystem allies.
+- **Permissive toolkit + engine communities (winit/wgpu, SDL, Dear ImGui, Bevy), Servo, embedded GPU vendors (Imagination, ARM Mali, Adreno)** — early ecosystem allies.
 - **Cloud-desktop / VDI vendors (Frame, Cameyo, Nutanix)** — natural fit for the protocol-over-network property.
 - **Khronos / FreeDesktop.org** — eventually for standardization.
 - **Asahi Linux** — model for reverse-engineered driver approaches; potential cross-pollination on Apple Silicon.

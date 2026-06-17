@@ -360,7 +360,7 @@ This is the moment the platform becomes structurally self-sufficient: no Linux D
 2. Reference implementation = our server. Conformance test suite.
 3. Spec for the kernel/userspace GPU ABI (companion to wire-format).
 4. Submit to a standards body. Most natural home is FreeDesktop.org for the windowing/protocol piece, possibly Khronos for the GPU-IO piece. Probably both.
-5. Find allies: Slint team (likely receptive), Servo team, embedded GPU vendor (Imagination?, ARM?), cloud-desktop vendor (Frame, Cameyo, Citrix).
+5. Find allies: permissive toolkit/engine communities (winit/wgpu, SDL, Dear ImGui, Bevy), Servo team, embedded GPU vendor (Imagination?, ARM?), cloud-desktop vendor (Frame, Cameyo, Citrix).
 6. Paper / writeup for academic visibility.
 
 **Risks:**
