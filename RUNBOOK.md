@@ -759,6 +759,16 @@ vssh 'export FRESCOD_BUNDLE=/root/wmtest/bundles/atrium-core
 #       printf 'KEY 0x2b 1 0x08\nKEY 0x2b 0 0x08\n' | nc -N -U /tmp/fzin.sock
 #     → forum-wm logs "switcher → focus surface N" and render-gating follows the new
 #     focus. (0x2b=Tab, 0x08=left-GUI/Super. The KEY mods field accepts decimal or 0x hex.)
+
+# Workspaces (virtual desktops): Super+1..N switches the active workspace; a new
+#   window opens on the active one; switching away render-gates a whole workspace's
+#   apps (chrome + background stay global). Digit HID usages: '1'=0x1E .. so Super+2:
+#       printf 'KEY 0x1f 1 0x08\nKEY 0x1f 0 0x08\n' | nc -N -U /tmp/fzin.sock
+#     → "switched to <name|workspace N>"; the prior workspace's docs log "render-gating".
+#   Persistent config (optional): FORUM_CONFIG=/path/forum.toml (else /var/db/atrium/
+#     <user>/forum.toml). Sample at etc/forum.toml.example: workspaces=N, names=[...],
+#     [assign] app-id→ws. (Per-app [assign] rules are inert until frescod reports real
+#     app-ids in WM_ENUMERATE; count+names work today.)
 ```
 
 #### Build cycle: rebuilding the patched MoltenVK
