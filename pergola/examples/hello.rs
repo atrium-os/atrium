@@ -116,6 +116,10 @@ fn print_subtree(tree: &pergola::NodeTree, id: NodeId, depth: usize) {
                 "{indent}[{:>2}] Stack ({:>3.0},{:>3.0} {:>3.0}×{:>3.0}) axis={:?} sp={:.0}",
                 id.0, rect.x(), rect.y(), rect.w(), rect.h(), axis, spacing,
             ),
+            Node::Path { p0, p1, width, .. } => println!(
+                "{indent}[{:>2}] Path ({:>3.0},{:>3.0})->({:>3.0},{:>3.0}) w={:.0}",
+                id.0, p0.0, p0.1, p1.0, p1.1, width,
+            ),
         }
     }
     for child in tree.children_of(id) {

@@ -106,9 +106,10 @@ impl View for LoginView {
             .width(FORM_W)
             .render(ctx);
 
-        // Password field.
+        // Password field — masked.
         TextField::new(self.password.clone())
             .placeholder("password")
+            .secret(true)
             .at(FORM_X, FORM_Y + 60.0 + 48.0)
             .width(FORM_W)
             .render(ctx);

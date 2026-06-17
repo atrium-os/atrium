@@ -25,6 +25,8 @@ pub struct TextField {
     pub content: Mutable<String>,
     pub placeholder: String,
     pub rect: Rect,
+    /// Password mode: render the content as bullets, never the characters.
+    pub secret: bool,
 }
 
 impl TextField {
@@ -33,7 +35,14 @@ impl TextField {
             content,
             placeholder: String::new(),
             rect: Rect::new(0.0, 0.0, 0.0, size::INPUT_HEIGHT_DEFAULT),
+            secret: false,
         }
+    }
+
+    /// Mask the content (password field) — the entered text is shown as bullets.
+    pub fn secret(mut self, on: bool) -> Self {
+        self.secret = on;
+        self
     }
 
     pub fn placeholder(mut self, p: impl Into<String>) -> Self {
@@ -72,6 +81,9 @@ impl View for TextField {
         // Text content or placeholder.
         let (display, color) = if value.is_empty() {
             (self.placeholder.clone(), theme.text_tertiary())
+        } else if self.secret {
+            // Mask: one bullet per character — never the characters themselves.
+            ("\u{2022}".repeat(value.chars().count()), theme.text_primary())
         } else {
             (value, theme.text_primary())
         };

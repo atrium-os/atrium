@@ -127,21 +127,36 @@ impl<V: View> App<V> {
     /// the current tree; matching handlers fire on `PointerUp` when
     /// the up matches the same node as the prior `PointerDown`. Key
     /// events go to the currently-focused node's `on_key` handler.
+    /// Walk from `id` up the parent chain (including `id` itself) to the nearest
+    /// node whose `Handlers` satisfy `pred`. This is event bubbling: a pointer hit
+    /// on a non-interactive child resolves to the interactive ancestor that owns
+    /// the handler (a button's label → the button; a field's text → the field).
+    fn bubble_to<P: Fn(&crate::interaction::Handlers) -> bool>(
+        &self, mut id: NodeId, pred: P,
+    ) -> Option<NodeId> {
+        loop {
+            if let Some(h) = self.interactions.get(id) {
+                if pred(h) { return Some(id); }
+            }
+            id = self.prev_tree.parent_of(id)?;
+        }
+    }
+
     pub fn handle_event(&mut self, event: Event) {
         match &event {
             Event::PointerDown { at } => {
                 let hit = hit_test(&self.prev_tree, *at);
-                self.pending_press = hit;
-                // Pointer-down on a focusable node sets focus; on
-                // anything else, drops focus. Matches every desktop
-                // text-field-loses-focus-on-outside-click semantics.
-                let focusable_hit = hit.and_then(|id| {
-                    self.interactions.get(id).filter(|h| h.focusable).map(|_| id)
-                });
-                self.focused = focusable_hit;
+                // Bubble from the hit node up to the nearest interactive ancestor:
+                // a click landing on a child (e.g. a button's centered label, or a
+                // field's text) must still target the interactive parent that holds
+                // the handler. Press-tracking uses the nearest on_click ancestor;
+                // focus uses the nearest focusable ancestor.
+                self.pending_press = hit.and_then(|id| self.bubble_to(id, |h| h.on_click.is_some()));
+                self.focused = hit.and_then(|id| self.bubble_to(id, |h| h.focusable));
             }
             Event::PointerUp { at } => {
-                let target = hit_test(&self.prev_tree, *at);
+                let target = hit_test(&self.prev_tree, *at)
+                    .and_then(|id| self.bubble_to(id, |h| h.on_click.is_some()));
                 if let (Some(pressed), Some(up)) = (self.pending_press, target) {
                     if pressed == up {
                         if let Some(h) = self.interactions.get(pressed) {
@@ -187,6 +202,38 @@ mod tests {
                 radius: 0.0,
             });
         }
+    }
+
+    /// A clickable parent whose interactive handler sits on the outer node, with
+    /// a non-interactive child covering the center — the button/label shape.
+    struct ClickParent { fired: std::sync::Arc<AtomicBool> }
+    impl View for ClickParent {
+        fn render(&self, ctx: &mut Ctx) {
+            let bg = ctx.tree.insert(None, Node::Rect {
+                rect: Rect::new(0.0, 0.0, 100.0, 40.0),
+                fill: Color::rgba(0.0, 0.0, 0.0, 1.0), radius: 0.0,
+            });
+            // Child label covering the center — a naive hit-test returns THIS.
+            ctx.tree.insert(Some(bg), Node::Rect {
+                rect: Rect::new(30.0, 12.0, 40.0, 16.0),
+                fill: Color::rgba(1.0, 1.0, 1.0, 1.0), radius: 0.0,
+            });
+            let fired = self.fired.clone();
+            ctx.on_click(bg, move || fired.store(true, Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn click_on_child_bubbles_to_parent_on_click() {
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let mut app = App::new(ClickParent { fired: fired.clone() });
+        app.tick(); // render → prev_tree + interactions
+        // (50,20) is inside the child rect (30..70, 12..28) — which has no handler;
+        // the press must bubble to the parent's on_click. Regression: previously
+        // hit_test returned the child and the click was silently dropped.
+        app.handle_event(Event::PointerDown { at: crate::geom::Point::new(50.0, 20.0) });
+        app.handle_event(Event::PointerUp { at: crate::geom::Point::new(50.0, 20.0) });
+        assert!(fired.load(Ordering::SeqCst), "on_click must fire via bubbling from a child hit");
     }
 
     #[test]
