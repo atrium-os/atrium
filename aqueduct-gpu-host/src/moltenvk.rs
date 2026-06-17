@@ -745,9 +745,15 @@ impl MoltenVkBackend {
                 });
             let tgeos = [tgeo];
             let inst_count = instances.len() as u32;
+            // PREFER_FAST_BUILD for the TLAS (not FAST_TRACE): the instance-level
+            // build is O(N) and FAST_TRACE's SAH optimization over many instances
+            // runs long enough to trip the Metal GPU watchdog (command-buffer
+            // Hang) at ~50k+. Instance traversal is already near-free, so we don't
+            // need the trace-optimized TLAS — fast build keeps it well under the
+            // watchdog. (The BLAS stays FAST_TRACE: tiny prefab, cheap either way.)
             let mut tbi = vk::AccelerationStructureBuildGeometryInfoKHR::default()
                 .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
-                .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+                .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_BUILD)
                 .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
                 .geometries(&tgeos);
             let mut tsz = vk::AccelerationStructureBuildSizesInfoKHR::default();
