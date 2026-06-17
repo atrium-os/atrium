@@ -43,6 +43,7 @@ use fresco_protocol::{
     WindowPresentDamagePayload, WindowHints,
     WindowResizedEvent, WindowFocusChangedEvent,
     WindowCloseRequestedEvent, WindowDpiChangedEvent,
+    WindowCreatedEvent, WindowDestroyedEvent,
     InputKeyEvent, InputPointerMotionEvent,
     InputPointerButtonEvent, InputPointerScrollEvent,
     FontOpenPayload, FontOpenResponse, FontClosePayload, TextRunInstallPayload,
@@ -68,6 +69,11 @@ pub enum Event {
     FocusChanged   { window_id: u32, gained: bool },
     CloseRequested { window_id: u32 },
     DpiChanged     { window_id: u32, scale_factor: f32 },
+    /// A surface was created in this session. Window managers reconcile on
+    /// this; ordinary clients ignore it (it's about other surfaces).
+    WindowCreated  { window_id: u32 },
+    /// A surface was destroyed in this session.
+    WindowDestroyed { window_id: u32 },
     /// Keyboard press/release. `window_id == 0` indicates broadcast
     /// (no focused window).
     Key {
@@ -769,6 +775,14 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
             Ok(p) => Event::DpiChanged {
                 window_id: p.window_id, scale_factor: p.scale_factor,
             },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        EV_WINDOW_CREATED => match decode::<WindowCreatedEvent>(payload) {
+            Ok(p) => Event::WindowCreated { window_id: p.window_id },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        EV_WINDOW_DESTROYED => match decode::<WindowDestroyedEvent>(payload) {
+            Ok(p) => Event::WindowDestroyed { window_id: p.window_id },
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
         EV_INPUT_KEY => match decode::<InputKeyEvent>(payload) {

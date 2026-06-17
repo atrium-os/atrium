@@ -139,6 +139,13 @@ pub mod control {
     pub const EV_WINDOW_FOCUS_CHANGED:   u16 = 0x0581;
     pub const EV_WINDOW_CLOSE_REQUESTED: u16 = 0x0582;
     pub const EV_WINDOW_DPI_CHANGED:     u16 = 0x0583;
+    /// A surface appeared / disappeared. Unlike the other window events
+    /// (addressed to the surface's own client), these are the signal the
+    /// window manager reconciles on — a newly-created surface needs
+    /// placing, a destroyed one needs its slot reclaimed. Broadcast like
+    /// every event; the WM is the consumer that cares.
+    pub const EV_WINDOW_CREATED:         u16 = 0x0584;
+    pub const EV_WINDOW_DESTROYED:       u16 = 0x0585;
 
     // ── Input events (§3.8.x) ──
     // Server reads HID devices natively, fans events out to clients
@@ -619,6 +626,22 @@ pub struct WindowCloseRequestedEvent {
     pub window_id: u32,
 }
 
+/// `EV_WINDOW_CREATED` — a new surface was created in this session.
+/// The window manager reconciles on this: it enumerates, places the new
+/// surface by role, and re-declares the layout. Ordinary clients ignore
+/// it (it's about other surfaces, not their own).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowCreatedEvent {
+    pub window_id: u32,
+}
+
+/// `EV_WINDOW_DESTROYED` — a surface was destroyed. The window manager
+/// reconciles to reclaim its slot and re-arrange the survivors.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowDestroyedEvent {
+    pub window_id: u32,
+}
+
 /// `EV_WINDOW_DPI_CHANGED` — output DPI changed (window moved to a
 /// different display, monitor reconfiguration, etc.). `scale_factor`
 /// is multiplicative: 1.0 = standard 96 DPI, 2.0 = HiDPI, 1.5 =
@@ -1092,6 +1115,8 @@ mod tests {
             control::EV_WINDOW_FOCUS_CHANGED,
             control::EV_WINDOW_CLOSE_REQUESTED,
             control::EV_WINDOW_DPI_CHANGED,
+            control::EV_WINDOW_CREATED,
+            control::EV_WINDOW_DESTROYED,
             control::OP_LANE_REQUEST,
             control::OP_WM_ENUMERATE,
             control::OP_WM_DECLARE_LAYOUT,

@@ -132,8 +132,11 @@ fn spawn_input_poller(core: Core) {
         .name("forum-wm-input".into())
         .spawn(move || loop {
             // Drain the event backlog under one short lock; keep the last
-            // primary press (a later click supersedes an earlier one this tick).
+            // primary press (a later click supersedes an earlier one this tick)
+            // and note whether the surface set changed (a window appeared or
+            // disappeared — the WM must re-place the survivors).
             let mut clicked: Option<u32> = None;
+            let mut surfaces_changed = false;
             {
                 let mut g = core.lock().unwrap();
                 loop {
@@ -141,6 +144,8 @@ fn spawn_input_poller(core: Core) {
                         Ok(Some(Event::PointerButton {
                             window_id, pressed: true, button: 1, ..
                         })) if window_id != 0 => clicked = Some(window_id),
+                        Ok(Some(Event::WindowCreated { .. }))
+                        | Ok(Some(Event::WindowDestroyed { .. })) => surfaces_changed = true,
                         Ok(Some(_)) => {}        // other event — ignore
                         Ok(None) => break,       // backlog drained
                         Err(e) => {
@@ -148,6 +153,22 @@ fn spawn_input_poller(core: Core) {
                             break;
                         }
                     }
+                }
+            }
+
+            // A surface came or went → re-derive the whole layout so the new
+            // window is placed (or the gone one's slot reclaimed). Do this
+            // before applying any click, so focus-follows-click sees the
+            // up-to-date surface set.
+            if surfaces_changed {
+                let mut g = core.lock().unwrap();
+                let (wm, conn) = { let c = &mut *g; (&mut c.0, &mut c.1) };
+                match wm.reconcile(conn) {
+                    Ok(l) => eprintln!(
+                        "forum-wm: reconciled on surface change — {} surface(s), focus={}",
+                        l.slots.len(), l.focus,
+                    ),
+                    Err(e) => eprintln!("forum-wm: reconcile error: {e}"),
                 }
             }
 

@@ -41,6 +41,11 @@ pub enum DisplayEvent {
     /// Output DPI changed (window moved to different display, etc.).
     /// `scale_factor`: 1.0 = standard 96 DPI, 2.0 = HiDPI.
     WindowDpiChanged     { window_id: u32, scale_factor: f32 },
+    /// A surface was created. The signal the WM reconciles on to place
+    /// the newcomer (every client receives it; only the WM acts).
+    WindowCreated        { window_id: u32 },
+    /// A surface was destroyed. The WM reconciles to reclaim its slot.
+    WindowDestroyed      { window_id: u32 },
 
     /// Keyboard press/release routed to the focused window's owner.
     /// `window_id == 0` = no focus, broadcast to all clients. See
@@ -96,6 +101,14 @@ pub fn encode_event(ev: &DisplayEvent)
                 window_id: *window_id, scale_factor: *scale_factor,
             };
             Ok((control::EV_WINDOW_DPI_CHANGED, encode(&p)?))
+        }
+        DisplayEvent::WindowCreated { window_id } => {
+            let p = WindowCreatedEvent { window_id: *window_id };
+            Ok((control::EV_WINDOW_CREATED, encode(&p)?))
+        }
+        DisplayEvent::WindowDestroyed { window_id } => {
+            let p = WindowDestroyedEvent { window_id: *window_id };
+            Ok((control::EV_WINDOW_DESTROYED, encode(&p)?))
         }
         DisplayEvent::InputKey { window_id, hid_usage, pressed, modifiers } => {
             let p = InputKeyEvent {
@@ -583,6 +596,10 @@ impl Compositor {
         w.z = self.z_order.len() as u32;
         self.windows.insert(id, w);
         self.z_order.push(id);
+        /* Tell the session a surface appeared. The WM reconciles on this
+         * to place the newcomer; everyone else ignores it. (next_id starts
+         * at 1, so this is never the implicit screen window 0.) */
+        self.emit(DisplayEvent::WindowCreated { window_id: id as u32 });
         id
     }
 
@@ -650,6 +667,7 @@ impl Compositor {
                 window_id: fc.new as u32, gained: true,
             });
         }
+        self.emit(DisplayEvent::WindowDestroyed { window_id: id as u32 });
         (true, shift)
     }
 
@@ -661,6 +679,7 @@ impl Compositor {
         self.windows.remove(&id);
         self.z_order.retain(|&w| w != id);
         if self.focus == Some(id) { self.focus = self.z_order.last().copied(); }
+        self.emit(DisplayEvent::WindowDestroyed { window_id: id as u32 });
         true
     }
 
@@ -1036,6 +1055,12 @@ mod event_tests {
             .expect("expected DisplayEvent within 100ms")
     }
 
+    /// Drain queued events — notably the `WindowCreated` that `create()`
+    /// now emits — so a test can assert on the event under test alone.
+    fn drain(rx: &mpsc::Receiver<DisplayEvent>) {
+        while rx.try_recv().is_ok() {}
+    }
+
     #[test]
     fn no_sink_silently_drops() {
         let mut c = Compositor::new();
@@ -1048,6 +1073,7 @@ mod event_tests {
     fn resize_emits_event() {
         let (mut c, rx) = comp_with_sink();
         let id = c.create(7, (100, 100));
+        drain(&rx); // discard the WindowCreated from create()
         assert!(c.resize_window(id, 320, 240));
         match expect_event(&rx) {
             DisplayEvent::WindowResized { window_id, width, height } => {
@@ -1062,6 +1088,7 @@ mod event_tests {
     fn resize_no_op_emits_nothing() {
         let (mut c, rx) = comp_with_sink();
         let id = c.create(7, (100, 100));
+        drain(&rx); // discard the WindowCreated from create()
         /* Same dimensions — must not emit. */
         assert!(!c.resize_window(id, 100, 100));
         assert!(rx.try_recv().is_err());
@@ -1072,6 +1099,7 @@ mod event_tests {
         let (mut c, rx) = comp_with_sink();
         let a = c.create(7, (100, 100));
         let b = c.create(7, (100, 100));
+        drain(&rx); // discard the WindowCreated events from create()
         /* Initial focus is window 0; raise a → focus shifts. */
         let fc = c.raise(a).expect("focus moved");
         assert_eq!(fc.new, a);
@@ -1118,6 +1146,7 @@ mod event_tests {
     fn close_request_emits() {
         let (mut c, rx) = comp_with_sink();
         let id = c.create(7, (100, 100));
+        drain(&rx); // discard the WindowCreated from create()
         assert!(c.request_close(id));
         match expect_event(&rx) {
             DisplayEvent::WindowCloseRequested { window_id } => {
@@ -1131,6 +1160,7 @@ mod event_tests {
     fn dpi_change_emits() {
         let (mut c, rx) = comp_with_sink();
         let id = c.create(7, (100, 100));
+        drain(&rx); // discard the WindowCreated from create()
         assert!(c.set_window_dpi(id, 2.0));
         match expect_event(&rx) {
             DisplayEvent::WindowDpiChanged { window_id, scale_factor } => {
@@ -1138,6 +1168,28 @@ mod event_tests {
                 assert_eq!(scale_factor, 2.0);
             }
             other => panic!("expected DPI event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_emits_window_created() {
+        let (mut c, rx) = comp_with_sink();
+        let id = c.create(7, (100, 100));
+        match expect_event(&rx) {
+            DisplayEvent::WindowCreated { window_id } => assert_eq!(window_id, id as u32),
+            other => panic!("expected WindowCreated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn destroy_emits_window_destroyed() {
+        let (mut c, rx) = comp_with_sink();
+        let id = c.create(7, (100, 100));
+        drain(&rx); // discard WindowCreated
+        assert!(c.destroy(id, 7));
+        match expect_event(&rx) {
+            DisplayEvent::WindowDestroyed { window_id } => assert_eq!(window_id, id as u32),
+            other => panic!("expected WindowDestroyed, got {other:?}"),
         }
     }
 

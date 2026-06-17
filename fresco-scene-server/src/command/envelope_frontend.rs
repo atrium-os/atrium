@@ -1101,7 +1101,7 @@ mod tests {
         /* Set node 7 = a rect. */
         let inner = RectParams {
             x: 100.0, y: 200.0, w: 64.0, h: 48.0,
-            r: 0.5, g: 0.25, b: 1.0, a: 1.0,
+            r: 0.5, g: 0.25, b: 1.0, a: 1.0, radius: 0.0,
         };
         let inner_bytes = encode(&inner).unwrap();
         let outer = SceneNodeSetPayload {
@@ -1154,7 +1154,7 @@ mod tests {
     #[test]
     fn scene_node_clear_removes() {
         let mut f = fixture();
-        let inner = RectParams { x: 0.0, y: 0.0, w: 1.0, h: 1.0, r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+        let inner = RectParams { x: 0.0, y: 0.0, w: 1.0, h: 1.0, r: 0.0, g: 0.0, b: 0.0, a: 1.0, radius: 0.0 };
         let outer = SceneNodeSetPayload {
             node_id: 5,
             op_id:   scene_ops::ATRIUM_CORE_RECT,
