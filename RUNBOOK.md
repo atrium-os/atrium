@@ -767,8 +767,16 @@ vssh 'export FRESCOD_BUNDLE=/root/wmtest/bundles/atrium-core
 #     → "switched to <name|workspace N>"; the prior workspace's docs log "render-gating".
 #   Persistent config (optional): FORUM_CONFIG=/path/forum.toml (else /var/db/atrium/
 #     <user>/forum.toml). Sample at etc/forum.toml.example: workspaces=N, names=[...],
-#     [assign] app-id→ws. (Per-app [assign] rules are inert until frescod reports real
-#     app-ids in WM_ENUMERATE; count+names work today.)
+#     [assign] app-id→ws.
+# Split/group (on-demand tiling): Super+S (0x16) toggles the active workspace between
+#   stacked (one focused fills, rest gated) and tiled (docs side-by-side, all render):
+#       printf 'KEY 0x16 1 0x08\nKEY 0x16 0 0x08\n' | nc -N -U /tmp/fzin.sock
+#     → "split ON (tiled)/OFF (stacked)".
+# Per-app placement (app-id): frescod stamps owner_uid (getpeereid) in WM_ENUMERATE;
+#   forum-wm resolves it via the launch registry /var/run/atrium/app-registry
+#   ("<uid> <user> <app-id>" lines) → [assign] rule. To exercise as root (uid 0):
+#       printf '0 root org.atrium.navigator\n' > /var/run/atrium/app-registry
+#     + forum.toml [assign] "org.atrium.navigator" = 1 → that app opens on workspace 1.
 ```
 
 #### Build cycle: rebuilding the patched MoltenVK
