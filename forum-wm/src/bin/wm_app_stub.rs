@@ -17,8 +17,15 @@ fn main() -> std::io::Result<()> {
     let id = conn.window_create(w, h, title.clone(), Default::default())?;
     eprintln!("wm-app-stub: created window {id} ({title}, {w}x{h}) on {sock}");
 
-    // Stay connected — the compositor drops a client's windows on disconnect.
+    // Stay connected (the compositor drops a client's windows on disconnect) and
+    // log every async event we receive — so injected/real input is observable
+    // end-to-end during interactive bring-up.
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
+        match conn.poll_event() {
+            Ok(Some(ev)) => eprintln!("wm-app-stub[{title}] event: {ev:?}"),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(e) => { eprintln!("wm-app-stub[{title}]: poll error: {e}"); break; }
+        }
     }
+    Ok(())
 }

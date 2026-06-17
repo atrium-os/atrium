@@ -23,6 +23,7 @@
 //! collisions across windows are not yet handled (M3+); typical
 //! single-window apps render correctly.
 
+mod injector_reader;
 mod input_reader;
 mod laminar;
 mod pointer_reader;
@@ -124,7 +125,13 @@ fn main() -> std::io::Result<()> {
      * and push DisplayEvents through the shared event sink. Fail-soft:
      * frescod runs without input if no matching /dev/hidraw* is found. */
     input_reader::spawn(ev_tx.clone(), comp.clone());
-    pointer_reader::spawn(ev_tx, comp.clone(), mode.width, mode.height);
+    pointer_reader::spawn(ev_tx.clone(), comp.clone(), mode.width, mode.height);
+    /* Synthetic input injection (dev/test harness): feeds the same event sink as
+     * the HID readers, so scripted input routes through hit-test/focus identically.
+     * Lets us drive the input loop without an HID device. */
+    if let Ok(sock) = std::env::var("FRESCOD_INPUT_SOCK") {
+        injector_reader::spawn(ev_tx, comp.clone(), mode.width, mode.height, sock);
+    }
 
     /* ── Frame loop ─────────────────────────────────────────────── */
     let mut frame: u64 = 0;
@@ -175,6 +182,12 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     let comp  = Arc::new(Mutex::new(Compositor::new_with_window0(scene, slots)));
     let (ev_tx, ev_rx) = mpsc::channel();
     comp.lock().unwrap().set_event_sink(ev_tx.clone());
+    /* Synthetic input injection — the headless interactive harness. No HID device
+     * needed: scripted input over a socket feeds the same event sink + hit-test as
+     * real /dev/hidraw input, so we can drive + debug the input→WM→render loop. */
+    if let Ok(isock) = std::env::var("FRESCOD_INPUT_SOCK") {
+        injector_reader::spawn(ev_tx.clone(), comp.clone(), W, H, isock);
+    }
     let frontend = Arc::new(Mutex::new(EnvelopeFrontend::new(cas, comp.clone())));
 
     let sock = std::env::var("FRESCOD_SOCK")
