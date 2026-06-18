@@ -830,6 +830,21 @@ vssh '
 # so the launcher must HOLD the procdesc fd (ATRIUM_LAUNCH_SUPERVISE) or the kernel SIGKILLs the child;
 # frescod socket is 0666 (per-app uids connect; the jail mount is the cap gate); env FRESCO_SOCKET isn't
 # in jaild's env allowlist so rely on connect_default → /atrium/sockets/fresco/fresco.sock.
+
+#### Full jailed desktop via login (ostiarius → jaild → wm+bar+dock, VERIFIED 2026-06-18)
+# Install all 3 components as signed bundles (inst() helper: cp manifest+binary, openssl-sign with one
+# dev-key.pem — sig is over the manifest, so swapping the binary needs no re-sign):
+#   inst org.atrium.forum-wm  forum-wm/atrium.toml  <forum-wm bin>  forum-wm   (+ forum-bar, forum-dock)
+# Canonical socket dirs: mkdir -p /atrium/sockets/{fresco,fresco-wm,forum-ctl,notify}
+# frescod with BOTH sockets at the canonical paths:
+#   FRESCOD_SOCK=/atrium/sockets/fresco/fresco.sock FRESCOD_WM_SOCK=/atrium/sockets/fresco-wm/fresco-wm.sock
+# jaild serve; then ostiarius --serve-prod (real JaildLauncher + stub auth, holds procdescs):
+#   OSTIARIUS_SOCK=/tmp/ost.sock OSTIARIUS_OPEN=1 JAILD_SOCK=... ATRIUM_PUBLISHERS=/etc/atrium/publishers \
+#     ostiarius --serve-prod &
+#   printf '{"op":"login","user":"alice","password":"x","frontend":"gui"}\n' | nc -N -U /tmp/ost.sock
+# → jls shows 3 jails (uids 50000/50001/50002); the PNG composites the desktop (top bar + wallpaper + dock).
+# forum-bar declares role=Chrome, forum-dock role=Background so the WM doesn't gate them; forum-wm's forum-ctl
+# socket is 0666 for the chrome's cross-uid connect (bar shows live "0 windows" = it queried forum-ctl).
 # Per-app placement (app-id): frescod stamps owner_uid (getpeereid) in WM_ENUMERATE;
 #   forum-wm resolves it via the launch registry /var/run/atrium/app-registry
 #   ("<uid> <user> <app-id>" lines) → [assign] rule. To exercise as root (uid 0):
