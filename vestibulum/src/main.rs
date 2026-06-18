@@ -193,24 +193,31 @@ fn main() -> std::io::Result<()> {
     // (/atrium/sockets/fresco/fresco.sock) the graphics-cap mount provides, then
     // the dev fallback. (jaild doesn't pass FRESCO_SOCK into the jail, so the
     // booted-jailed vestibulum relies on this path.)
-    // Connect with retry: at boot ostiarius may launch us a beat before frescod
-    // has bound its socket (renderer init takes a moment), so a login UI must
-    // wait for the display server rather than give up. ~10s budget.
+    // Connect to frescod. ostiarius gates our launch on frescod being ready
+    // (its connect-probe), so the first attempt normally succeeds; the couple of
+    // retries here only absorb a brief jitter window. We deliberately FAIL FAST
+    // (3 tries, then die) rather than spin forever — vestibulum is a supervised
+    // service (restart=on-crash), so a persistent failure is the supervisor's to
+    // recover, not ours to mask.
     let connect = || match std::env::var("FRESCO_SOCK") {
         Ok(s) => Connection::connect(&s),
         Err(_) => Connection::connect_default(),
     };
+    const TRIES: u32 = 3;
     let mut conn = {
-        let mut attempt = 0;
+        let mut attempt = 1;
         loop {
             match connect() {
                 Ok(c) => break c,
-                Err(e) if attempt < 50 => {
-                    if attempt == 0 { log::info!("vestibulum: waiting for frescod…"); }
+                Err(_) if attempt < TRIES => {
+                    log::info!("vestibulum: frescod not ready (try {attempt}/{TRIES}), retrying…");
                     attempt += 1;
-                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    std::thread::sleep(std::time::Duration::from_millis(300));
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    log::error!("vestibulum: frescod unreachable after {TRIES} tries: {e}");
+                    return Err(e);
+                }
             }
         }
     };
