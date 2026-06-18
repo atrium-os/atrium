@@ -56,6 +56,13 @@ atrium_frescod_start() {
     _hp=""
     [ -n "${atrium_frescod_headless_png}" ] && _hp="FRESCOD_HEADLESS_PNG=${atrium_frescod_headless_png}"
 
+    # Clear any stale socket from a prior boot so a dependent's readiness probe
+    # can't connect-then-fail on a dead file (frescod also unlinks+rebinds, but
+    # removing it here closes the window). Readiness itself is gated downstream:
+    # ostiarius connect-probes frescod before it launches the login UI (a socket
+    # *existing* isn't *connectable*, so a stat-style wait here wouldn't suffice).
+    rm -f "${atrium_frescod_sock}" "${atrium_frescod_wm_sock}"
+
     echo "Starting ${name}."
     /usr/sbin/daemon -f -p "${pidfile}" -o "${atrium_frescod_logfile}" -t "${name}" \
         env RUST_LOG="${atrium_frescod_log_level}" \
@@ -64,16 +71,6 @@ atrium_frescod_start() {
             FRESCOD_BUNDLE="${atrium_frescod_bundle}" \
             ${_hp} \
             "${command}"
-
-    # Wait for the socket to be BOUND before returning. frescod binds it only
-    # after the (multi-second) renderer init, so a dependent service started by
-    # rcorder REQUIRE would otherwise race it and get ECONNREFUSED. Bounded poll.
-    _n=0
-    while [ ! -S "${atrium_frescod_sock}" ]; do
-        _n=$((_n + 1))
-        [ ${_n} -gt 150 ] && { warn "frescod socket ${atrium_frescod_sock} not up after 30s"; break; }
-        sleep 0.2
-    done
 }
 
 run_rc_command "$1"

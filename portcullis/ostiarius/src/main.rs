@@ -54,6 +54,23 @@ impl Launcher for AllocLauncher {
     }
 }
 
+/// Wait (bounded) for frescod to be *connectable* before booting vestibulum.
+/// A connect (not a stat) is the readiness signal: a socket file can exist while
+/// stale or mid-bind and still refuse. $FRESCO_SOCK overrides; else the canonical
+/// in-jail path. Best-effort — logs + proceeds after the timeout.
+fn wait_for_frescod() {
+    let path = std::env::var("FRESCO_SOCK")
+        .unwrap_or_else(|_| "/atrium/sockets/fresco/fresco.sock".into());
+    for _ in 0..50 {
+        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+            eprintln!("ostiarius: frescod ready at {path}");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    eprintln!("ostiarius: frescod not reachable at {path} after 10s; booting vestibulum anyway");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--demo") {
@@ -120,6 +137,12 @@ fn main() {
         if let Ok(j) = std::env::var("JAILD_SOCK") { launcher.jaild_sock = j; }
         if let Ok(p) = std::env::var("ATRIUM_PUBLISHERS") { launcher.publishers = p; }
         let mut o = Ostiarius::new(launcher).with_seat_path(seat); // stub auth (no with_pam)
+        // Gate on the display server being READY before booting the login UI: as
+        // the supervisor, ostiarius sequences startup rather than launching a
+        // doomed vestibulum into a not-yet-up frescod. NB: a socket *existing* is
+        // not enough (a stale/ mid-bind socket file still refuses) — only a
+        // successful connect proves frescod is accepting, so we probe by connecting.
+        wait_for_frescod();
         // Boot the login UI (vestibulum) first, like the real daemon — so this is
         // a complete boot-to-vestibulum path (jailed), minus PAM. OSTIARIUS_NO_BOOT
         // skips it (e.g. driving login by hand against an already-running UI).
