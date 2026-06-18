@@ -862,9 +862,12 @@ vssh '
 #   - sshd on :2222 (vssh) — base FreeBSD, enabled.
 #   - serial console getty on :4444 (ttyu0 "3wire" onifconsole) — root login out-of-band.
 #   Both come up regardless of the atrium services, so enabling boot-to-vestibulum can't lock you out.
-# Gotcha: vestibulum connect-retries frescod (~10s) — at boot ostiarius may launch it before frescod's
-#   socket is bound; without the retry it died with ECONNREFUSED. 9p doesn't auto-remount post-reboot:
-#   `kldload p9fs; mount -t p9fs -o trans=virtio bsd_share /mnt/host`.
+# Readiness: ostiarius connect-PROBES frescod (wait_for_frescod, not a stat — a socket file can exist while
+#   stale/mid-bind) before booting vestibulum; vestibulum then connects fail-fast (3 tries) and, being a
+#   supervised service, lets the supervisor recover a persistent failure.
+# Gotchas: (1) `cp` over a RUNNING binary fails silently with "Text file busy" → install updated service
+#   binaries with cp-to-.new + `mv -f` (rename is atomic + allowed while in use). Cost several confusing
+#   reboots. (2) 9p doesn't auto-remount post-reboot: `kldload p9fs; mount -t p9fs -o trans=virtio bsd_share /mnt/host`.
 # Per-app placement (app-id): frescod stamps owner_uid (getpeereid) in WM_ENUMERATE;
 #   forum-wm resolves it via the launch registry /var/run/atrium/app-registry
 #   ("<uid> <user> <app-id>" lines) → [assign] rule. To exercise as root (uid 0):
