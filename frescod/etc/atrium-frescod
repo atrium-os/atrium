@@ -1,0 +1,79 @@
+#!/bin/sh
+# PROVIDE: atrium_frescod
+# REQUIRE: FILESYSTEMS atrium_jaild
+# KEYWORD: shutdown
+#
+# atrium-frescod — the Fresco display / scene server (a system service:
+# the seat-shared compositor every session app connects to). Listens on the
+# canonical in-jail socket paths so jailed apps (with the graphics cap mount)
+# reach it.
+#
+# Spec: docs/spec/forum.md, docs/spec/login-handoff.md.
+#
+# Add to /etc/rc.conf:
+#   atrium_frescod_enable="YES"
+#
+# Optional:
+#   atrium_frescod_sock="/atrium/sockets/fresco/fresco.sock"
+#   atrium_frescod_wm_sock="/atrium/sockets/fresco-wm/fresco-wm.sock"
+#   atrium_frescod_bundle="/usr/local/share/atrium/bundles/atrium-core"
+#   atrium_frescod_headless_png="<base>"   # set on a host with NO display
+#                                          # device (frescod then renders to
+#                                          # <base>.png instead of scanout)
+#   atrium_frescod_logfile="/var/log/atrium/frescod.log"
+#   atrium_frescod_log_level="info"
+
+. /etc/rc.subr
+
+name="atrium_frescod"
+desc="Atrium Fresco display server"
+rcvar="${name}_enable"
+
+load_rc_config "$name"
+
+: ${atrium_frescod_enable:="NO"}
+: ${atrium_frescod_sock:="/atrium/sockets/fresco/fresco.sock"}
+: ${atrium_frescod_wm_sock:="/atrium/sockets/fresco-wm/fresco-wm.sock"}
+: ${atrium_frescod_bundle:="/usr/local/share/atrium/bundles/atrium-core"}
+: ${atrium_frescod_headless_png:=""}
+: ${atrium_frescod_logfile:="/var/log/atrium/frescod.log"}
+: ${atrium_frescod_log_level:="info"}
+
+command="/usr/local/bin/frescod"
+pidfile="/var/run/atrium/frescod.pid"
+start_cmd="atrium_frescod_start"
+
+atrium_frescod_start() {
+    install -d -m 0755 -o root -g wheel /var/run/atrium /var/log/atrium
+    # The canonical per-service socket dirs the jail mounts (and forum-wm /
+    # the chrome) expect.
+    install -d -m 0755 -o root -g wheel \
+        /atrium/sockets/fresco /atrium/sockets/fresco-wm \
+        /atrium/sockets/forum-ctl /atrium/sockets/notify
+    [ -x "${command}" ] || err 1 "${command} not installed"
+
+    # FRESCOD_HEADLESS_PNG, only if configured (a host with no display device).
+    _hp=""
+    [ -n "${atrium_frescod_headless_png}" ] && _hp="FRESCOD_HEADLESS_PNG=${atrium_frescod_headless_png}"
+
+    echo "Starting ${name}."
+    /usr/sbin/daemon -f -p "${pidfile}" -o "${atrium_frescod_logfile}" -t "${name}" \
+        env RUST_LOG="${atrium_frescod_log_level}" \
+            FRESCOD_SOCK="${atrium_frescod_sock}" \
+            FRESCOD_WM_SOCK="${atrium_frescod_wm_sock}" \
+            FRESCOD_BUNDLE="${atrium_frescod_bundle}" \
+            ${_hp} \
+            "${command}"
+
+    # Wait for the socket to be BOUND before returning. frescod binds it only
+    # after the (multi-second) renderer init, so a dependent service started by
+    # rcorder REQUIRE would otherwise race it and get ECONNREFUSED. Bounded poll.
+    _n=0
+    while [ ! -S "${atrium_frescod_sock}" ]; do
+        _n=$((_n + 1))
+        [ ${_n} -gt 150 ] && { warn "frescod socket ${atrium_frescod_sock} not up after 30s"; break; }
+        sleep 0.2
+    done
+}
+
+run_rc_command "$1"

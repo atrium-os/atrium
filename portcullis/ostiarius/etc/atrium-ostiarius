@@ -1,0 +1,63 @@
+#!/bin/sh
+# PROVIDE: atrium_ostiarius
+# REQUIRE: FILESYSTEMS atrium_jaild atrium_frescod
+# KEYWORD: shutdown
+#
+# atrium-ostiarius — the doorkeeper / session manager (the display-manager
+# role). Brought up by the boot service manager: it boot()s the login UI
+# (vestibulum) and then serves the control socket vestibulum forwards the
+# authenticated login to, launching the human's jailed session.
+#
+# Spec: docs/spec/login-handoff.md, docs/spec/forum.md.
+#
+# Add to /etc/rc.conf:
+#   atrium_ostiarius_enable="YES"
+#
+# Optional:
+#   atrium_ostiarius_flags="--serve-prod"  # VM/dev: stub auth, no PAM. The
+#                                          # production daemon builds ostiarius
+#                                          # --features pam and uses NO flag
+#                                          # (real PAM auth).
+#   atrium_ostiarius_sock="/var/run/atrium/ostiarius.sock"
+#   atrium_ostiarius_jaild_sock="/var/run/atrium/jaild.sock"
+#   atrium_ostiarius_publishers="/etc/atrium/publishers"
+#   atrium_ostiarius_seat="/var/run/atrium/active-session"
+#   atrium_ostiarius_logfile="/var/log/atrium/ostiarius.log"
+#   atrium_ostiarius_log_level="info"
+
+. /etc/rc.subr
+
+name="atrium_ostiarius"
+desc="Atrium doorkeeper / session manager"
+rcvar="${name}_enable"
+
+load_rc_config "$name"
+
+: ${atrium_ostiarius_enable:="NO"}
+: ${atrium_ostiarius_flags:="--serve-prod"}
+: ${atrium_ostiarius_sock:="/var/run/atrium/ostiarius.sock"}
+: ${atrium_ostiarius_jaild_sock:="/var/run/atrium/jaild.sock"}
+: ${atrium_ostiarius_publishers:="/etc/atrium/publishers"}
+: ${atrium_ostiarius_seat:="/var/run/atrium/active-session"}
+: ${atrium_ostiarius_logfile:="/var/log/atrium/ostiarius.log"}
+: ${atrium_ostiarius_log_level:="info"}
+
+command="/usr/local/bin/ostiarius"
+pidfile="/var/run/atrium/ostiarius.pid"
+start_cmd="atrium_ostiarius_start"
+
+atrium_ostiarius_start() {
+    install -d -m 0755 -o root -g wheel /var/run/atrium /var/log/atrium
+    [ -x "${command}" ] || err 1 "${command} not installed"
+
+    echo "Starting ${name}."
+    /usr/sbin/daemon -f -p "${pidfile}" -o "${atrium_ostiarius_logfile}" -t "${name}" \
+        env RUST_LOG="${atrium_ostiarius_log_level}" \
+            OSTIARIUS_SOCK="${atrium_ostiarius_sock}" \
+            JAILD_SOCK="${atrium_ostiarius_jaild_sock}" \
+            ATRIUM_PUBLISHERS="${atrium_ostiarius_publishers}" \
+            OSTIARIUS_SEAT="${atrium_ostiarius_seat}" \
+            "${command}" ${atrium_ostiarius_flags}
+}
+
+run_rc_command "$1"

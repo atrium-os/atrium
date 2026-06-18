@@ -188,10 +188,32 @@ fn session_handoff(user: &str, password: &str) -> Result<String, String> {
 fn main() -> std::io::Result<()> {
     env_logger::init();
 
-    let socket_path = std::env::var("FRESCO_SOCK")
-        .unwrap_or_else(|_| "/tmp/frescod.sock".to_string());
-    log::info!("vestibulum: connecting to {socket_path}");
-    let mut conn = Connection::connect(&socket_path)?;
+    // $FRESCO_SOCK overrides (dev/harness); otherwise resolve like every other
+    // client — connect_default() finds the canonical in-jail socket
+    // (/atrium/sockets/fresco/fresco.sock) the graphics-cap mount provides, then
+    // the dev fallback. (jaild doesn't pass FRESCO_SOCK into the jail, so the
+    // booted-jailed vestibulum relies on this path.)
+    // Connect with retry: at boot ostiarius may launch us a beat before frescod
+    // has bound its socket (renderer init takes a moment), so a login UI must
+    // wait for the display server rather than give up. ~10s budget.
+    let connect = || match std::env::var("FRESCO_SOCK") {
+        Ok(s) => Connection::connect(&s),
+        Err(_) => Connection::connect_default(),
+    };
+    let mut conn = {
+        let mut attempt = 0;
+        loop {
+            match connect() {
+                Ok(c) => break c,
+                Err(e) if attempt < 50 => {
+                    if attempt == 0 { log::info!("vestibulum: waiting for frescod…"); }
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
 
     // Create a window.
     let window_id = conn.window_create(WIN_W, WIN_H, "Atrium", WindowHints::default())?;

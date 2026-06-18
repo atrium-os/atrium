@@ -1,0 +1,20 @@
+# Vestibulum — the Atrium login screen. The pre-auth UI: it renders via Fresco
+# and forwards the captured credential to ostiarius (the doorkeeper) over its
+# control socket, which authenticates + launches the human's jailed session.
+# Launched (jailed) by ostiarius at boot via Portcullis/jaild like any app.
+[app]
+id          = "org.atrium.vestibulum"
+name        = "Vestibulum"
+version     = "0.1.0"
+entry       = "bin/vestibulum"
+description = "The Atrium login screen."
+icon        = "settings"
+
+[capabilities]
+graphics = "fresco"
+network  = "none"
+
+[supervision]
+restart    = "on-crash"
+keep-alive = true
+instances  = "single"

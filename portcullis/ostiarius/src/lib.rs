@@ -300,6 +300,14 @@ pub mod control {
     ) -> std::io::Result<()> {
         let _ = std::fs::remove_file(sock_path);
         let listener = UnixListener::bind(sock_path)?;
+        // 0666 so the (jailed, per-app uid) vestibulum can connect to this
+        // root-owned socket; `gate` (the org.atrium.vestibulum peer check) is the
+        // real authorization, the mode just permits the connection. Same pattern
+        // as the fresco / forum-ctl / portcullisd sockets.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o666));
+        }
         for conn in listener.incoming() {
             let stream = match conn {
                 Ok(s) => s,

@@ -120,6 +120,15 @@ fn main() {
         if let Ok(j) = std::env::var("JAILD_SOCK") { launcher.jaild_sock = j; }
         if let Ok(p) = std::env::var("ATRIUM_PUBLISHERS") { launcher.publishers = p; }
         let mut o = Ostiarius::new(launcher).with_seat_path(seat); // stub auth (no with_pam)
+        // Boot the login UI (vestibulum) first, like the real daemon — so this is
+        // a complete boot-to-vestibulum path (jailed), minus PAM. OSTIARIUS_NO_BOOT
+        // skips it (e.g. driving login by hand against an already-running UI).
+        if std::env::var_os("OSTIARIUS_NO_BOOT").is_none() {
+            match o.boot() {
+                Ok(pid) => eprintln!("ostiarius(prod-test): booted vestibulum (pid {pid})"),
+                Err(e) => eprintln!("ostiarius(prod-test): boot vestibulum failed: {e}"),
+            }
+        }
         eprintln!("ostiarius(prod-test): serving {sock} with JaildLauncher (real jails)");
         let r = if std::env::var("OSTIARIUS_OPEN").is_ok() {
             ostiarius::control::serve(&mut o, &sock, |_| true)
