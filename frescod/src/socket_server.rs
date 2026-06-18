@@ -86,6 +86,18 @@ fn start_listener(sock_path: &Path, shared: Shared, event_subs: EventSubs, wm_gr
         let _ = std::fs::remove_file(sock_path);
     }
     let listener = UnixListener::bind(sock_path)?;
+    /* 0666 so the (non-root, per-app uid) apps that reach this socket can connect
+     * — same pattern as portcullisd's control socket. Reachability IS the
+     * capability gate: only an app holding `graphics` gets this socket's
+     * per-service dir nullfs-mounted into its jail (apply_socket/apply_graphics),
+     * so an app without the cap can't see the path at all; the mount, not the
+     * file mode, is the boundary. Every app has its own dynamic uid and they all
+     * share one frescod, so the socket must be multi-uid-connectable. Without
+     * this a jailed app at uid 50000 gets EACCES on a root-owned 0755 socket. */
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o666));
+    }
     eprintln!("frescod: listening on {} (window-management={wm_grant})", sock_path.display());
 
     std::thread::Builder::new()

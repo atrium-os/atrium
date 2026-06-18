@@ -78,8 +78,26 @@ fn main() {
         Err(e) => { eprintln!("launch: connect jaild {JAILD_SOCK}: {e} (is jaild up?)"); exit(1); }
     };
     match c.send(&req) {
-        Ok((Response::JailCreated(r), _)) => {
+        Ok((Response::JailCreated(r), pdfd)) => {
             eprintln!("launch: jaild launched {app_id} jailed at uid {uid} (pid {})", r.pid);
+            // jaild pdfork()s without PD_DAEMON and hands us the procdesc fd over
+            // SCM_RIGHTS; the kernel keeps the jailed process alive only while
+            // someone holds that fd. A one-shot launcher that drops it gets the
+            // child SIGKILLed. With ATRIUM_LAUNCH_SUPERVISE set, retain the fd and
+            // park — a minimal supervisor (the real one, ostiarius, holds these
+            // fds per session + uses EVFILT_PROCDESC for exit-notify/restart).
+            if std::env::var_os("ATRIUM_LAUNCH_SUPERVISE").is_some() {
+                match pdfd {
+                    Some(fd) => {
+                        use std::os::unix::io::{FromRawFd, OwnedFd};
+                        // SAFETY: `fd` is the procdesc jaild passed via SCM_RIGHTS.
+                        let _held = unsafe { OwnedFd::from_raw_fd(fd) };
+                        eprintln!("launch: supervising {app_id} (holding procdesc {fd})");
+                        loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
+                    }
+                    None => eprintln!("launch: no procdesc fd returned; cannot supervise {app_id}"),
+                }
+            }
         }
         Ok((resp, _)) => { eprintln!("launch: jaild refused: {resp:?}"); exit(1); }
         Err(e) => { eprintln!("launch: jaild send: {e}"); exit(1); }
