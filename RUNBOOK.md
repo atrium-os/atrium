@@ -258,6 +258,39 @@ Gotchas (each one cost a kernel panic + qcow2 restore — preserved here so the 
 
 If the kernel panics during a kmod experiment: `pkill -9 qemu-system-aarch64`, then re-extract baseline if needed (`xz -dk vm.qcow2.xz`). With ZFS root the next boot imports cleanly without fsck; the `xz -dk` step is only needed if you want to roll back to the post-first-boot baseline (e.g. after testing destructive changes inside the VM). Don't `cargo build --release` in the VM — see `~/.claude/projects/.../memory/feedback_no_vm_cargo_release.md`.
 
+### Custom kernel (`buildkernel`/`installkernel`) — the `/boot/laminar` gotcha
+
+For changes to code compiled **into** the kernel (e.g. `vt(4)` in `sys/dev/vt/`, scheduler, any `options`), a loadable kmod is not enough — you must rebuild + install the whole kernel and reboot into it. The VM already has a full `/usr/src` + a warm `/usr/obj` (it built the running `LAMINAR-DEV`), so incremental rebuilds are fast (~90 s) once one file changes.
+
+```sh
+# In the VM (kernel builds are make-based C — fine in-VM, unlike `cargo --release`):
+cd /usr/src
+make -j$(sysctl -n hw.ncpu) buildkernel KERNCONF=LAMINAR-DEV
+make installkernel KERNCONF=LAMINAR-DEV INSTKERNNAME=laminar     # <-- INSTKERNNAME!
+```
+
+**THE GOTCHA (cost most of a session): the loader boots `/boot/laminar/kernel`, not `/boot/kernel/kernel`.** `/boot/loader.conf` has `kernel="laminar"`, and `sysctl -n kern.bootfile` confirms `/boot/laminar/kernel`. A plain `make installkernel` writes to the default `/boot/kernel/` — which the loader never boots — so your rebuilt kernel is **silently ignored** and the VM keeps running the old one. Symptoms: `uname -v` build number/date doesn't change after install, and `strings -a /boot/laminar/kernel | grep <your-new-symbol>` returns 0. Always pass `INSTKERNNAME=laminar` so it installs to `/boot/laminar`, and verify before rebooting:
+
+```sh
+strings -a /boot/laminar/kernel | grep -c <a string from your change>   # expect > 0
+stat -f "%Sm %N" /boot/laminar/kernel                                   # expect today
+```
+
+Other notes:
+- **`buildkernel` aborts on the first `-Werror`** (e.g. a `printf("%d", x)` where `x` is `long` — `KERNEL_PANICKED()` returns `long`, cast to `(int)`). If `buildkernel` "finishes" suspiciously fast (~25 s, ~1 s CPU) it failed early; a real incremental build is ~90 s with tens of seconds of CPU. Guard the build: `make buildkernel … && make installkernel …` (don't let a failed build's stale obj get installed). Find the error with `grep -iE error /tmp/bk.log`.
+- **Editing the VM's `/usr/src` vs the host `freebsd-src` tree:** they have **diverged** — the VM's `/usr/src` is newer (e.g. it has a `KERNEL_PANICKED()` guard in `vtterm_splash` the host tree lacks). The VM `/usr/src` is the real build tree. To patch safely, copy the VM's pristine file to the host (`cp <file> /mnt/host/scratch/`), edit it against *its* exact content, copy it back — don't blindly overwrite the VM file with the host copy (regresses newer changes).
+- **Reboot reliability:** a guest `reboot` can **hang on shutdown** when the jailed desktop services (jaild/frescod/ostiarius hold procdescs + live jails) don't tear down cleanly, freezing the console and degrading sshd. If that happens, do a clean QEMU restart instead of `kill -9`: `echo quit | nc -U /tmp/qmp.sock` then relaunch `scripts/run-vm.sh …`. (`system_reset` via the monitor also resets the guest but may not re-init the ramfb GOP → black screen; prefer quit+relaunch for a clean firmware boot.) 9p does **not** auto-mount after a fresh boot: `kldload p9fs; mount -t p9fs -o trans=virtio bsd_share /mnt/host`.
+
+### Boot splash (vt(4) `DEV_SPLASH`) — kernel-side, loader-fed
+
+The Atrium boot splash is a **kernel** feature, not userland: a userland splash runs far too late (init/rc is hundreds of console lines in) and `vt(4)` owns the framebuffer + keyboard, so it would overdraw anything userland paints — and even after the GPU driver attaches, `vt` just moves its text onto the new fb. The one component that sees every console write and owns every fb backend is `vt(4)` itself, which already has the `DEV_SPLASH` framework:
+
+- **Kernel:** `options DEV_SPLASH` in `arm64/conf/{LAMINAR-DEV,ATRIUM}`. `vtterm_splash()` draws a loader-preloaded image (or the built-in logo) and sets `VDF_SPLASH`, which makes `vt_flush()` skip all text drawing. Patched (`sys/dev/vt/vt_core.c`) so a **preloaded image enables it without `RB_MUTE`** — hiding only the *video* console (via `VDF_SPLASH`) while the serial console stays verbose for debugging.
+- **Loader:** the EFI loader (`stand/common/gfx_fb.c:build_splash_module`) decodes a **32-bit RGBA PNG** named by `splash="..."` in `loader.conf` and preloads it as `MODINFOMD_SPLASH`. Serial shows `Loading splash ok` when it succeeds. (`png_get_bpp` returns 4 for 8-bit RGBA → passes vt's `si_depth != 4` guard.)
+- **Asset:** `atrium-splash --gen-png /boot/atrium-splash.png 800x600` (the `atrium-splash` crate, run on host or in-VM) renders the wordmark to the PNG the loader wants.
+- **Dismissal:** any keypress dismisses it (`vt_kbdevent` clears `VDF_SPLASH`), **and so does opening a vt terminal** (`vtterm_opened`) — i.e. **getty on `ttyv0` clears the splash at multiuser**. For Atrium the video console becomes the GUI, so set `ttyv0` to `off` in `/etc/ttys` (CLI fallback stays on serial `ttyu0` + ssh) or the splash vanishes the instant getty starts.
+- **Verify the patched kernel is actually running** before concluding the splash "doesn't work" — see the `/boot/laminar` gotcha above; the entire splash bring-up was chased on the wrong (unpatched) kernel for a while because `installkernel` had gone to `/boot/kernel`.
+
 #### ddb over QEMU TCP serial (added 2026-05-01)
 
 The historical claim "kdb isn't reachable" no longer holds. `scripts/run-vm.sh` now exposes the serial console on `tcp:127.0.0.1:4444` and the QEMU monitor on `unix:/tmp/qmp.sock`. The stock GENERIC kernel running in the VM has `KDB`, `DDB`, `INVARIANTS`, `WITNESS`, `GDB`, and `KDB_TRACE` compiled in — no rebuild needed.

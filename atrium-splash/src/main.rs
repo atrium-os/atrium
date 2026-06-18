@@ -28,6 +28,30 @@ const FRAME_NS: u64 = 1_000_000_000 / TARGET_FPS;
 const HANDOFF_PATH: &str = "/dev/atrium-display0";
 
 fn main() -> std::io::Result<()> {
+    // Offline mode: render the splash artwork to an RGBA PNG for the
+    // KERNEL boot splash. vt(4)'s DEV_SPLASH framework draws a
+    // loader-preloaded PNG (loader `splash="..."` → MODINFOMD_SPLASH)
+    // and suppresses video console text until a keypress — the proper
+    // place for a boot splash (a userland splash runs far too late and
+    // vt would overdraw it anyway). This reuses the very same
+    // `draw_splash` we verified on the live framebuffer, so the boot
+    // splash is pixel-identical to the userland prototype.
+    //
+    //   atrium-splash --gen-png <path> [WIDTHxHEIGHT]   (default 800x600)
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--gen-png") {
+        let path = args
+            .get(i + 1)
+            .cloned()
+            .unwrap_or_else(|| "atrium-splash.png".into());
+        let (w, h) = args
+            .get(i + 2)
+            .and_then(|s| s.split_once('x'))
+            .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
+            .unwrap_or((800u32, 600u32));
+        return gen_png(&path, w, h);
+    }
+
     let mut fb = match BootFb::open() {
         Ok(f) => f,
         Err(e) => {
@@ -72,7 +96,28 @@ fn main() -> std::io::Result<()> {
     }
 }
 
-fn draw_splash(pixmap: &mut Pixmap, w: u32, h: u32, t: f32) {
+/// Render one static frame of the splash to an RGBA PNG. The kernel
+/// splash is a still image, so we draw at t=0. The loader's `png_open`
+/// wants 32-bit RGBA (it sets `splash_info.si_depth = bpp` = 4 bytes,
+/// which vt's `vtterm_splash` requires); tiny-skia's `encode_png`
+/// produces exactly that.
+fn gen_png(path: &str, w: u32, h: u32) -> std::io::Result<()> {
+    let mut pixmap = Pixmap::new(w, h)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "pixmap allocate"))?;
+    draw_static(&mut pixmap, w, h);
+    let png = pixmap
+        .encode_png()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("encode png: {e}")))?;
+    std::fs::write(path, &png)?;
+    eprintln!("atrium-splash: wrote {w}x{h} RGBA splash PNG to {path} ({} bytes)", png.len());
+    Ok(())
+}
+
+/// The static splash artwork — background, stage panel, wordmark. This
+/// is the base image both for the kernel boot splash (a still PNG; the
+/// animated indicator is drawn over it by vt(4) each frame) and for the
+/// animated live-framebuffer path below.
+fn draw_static(pixmap: &mut Pixmap, w: u32, h: u32) {
     pixmap.fill(Color::from_rgba8(0x10, 0x12, 0x1a, 0xff));
 
     let cx = w as f32 / 2.0;
@@ -117,6 +162,19 @@ fn draw_splash(pixmap: &mut Pixmap, w: u32, h: u32, t: f32) {
         draw_letter(pixmap, &white, letter, x, y, cell_w, lh, stroke);
         x += cell_w + gap;
     }
+}
+
+/// Animated splash for the live-framebuffer path: the static artwork plus
+/// an orbiting "still-alive" indicator dot. The KERNEL boot splash is a
+/// still image (it omits the dot — a frozen spinner reads as a stray
+/// pixel) and gets its motion from vt(4) drawing an animated ball instead.
+fn draw_splash(pixmap: &mut Pixmap, w: u32, h: u32, t: f32) {
+    draw_static(pixmap, w, h);
+
+    let cx = w as f32 / 2.0;
+    let cy = h as f32 / 2.0;
+    let pw = (w as f32 * 0.55).min(720.0);
+    let ph = pw * 0.30;
 
     // Orbiting indicator dot just below the wordmark.
     let orbit_r = ph * 0.25;
@@ -172,15 +230,22 @@ fn draw_letter(pixmap: &mut Pixmap, paint: &Paint, ch: u8, x: f32, y: f32, w: f3
     let mut r = |px, py, pw, ph| rect_fill(pixmap, paint, x + px, y + py, pw, ph);
     match ch {
         b'a' => {
+            // Canonical single-story 'a': full top bar + full-height right
+            // wall + a closed bowl in the lower half, with the left wall ONLY
+            // in that lower half — so the UPPER-LEFT is open. That open
+            // upper-left is exactly what distinguishes 'a' from 'o' (closed
+            // box) and 'b'/'d' (full-height side wall).
+            r(0.0, h * 0.45, w, s);             // top bar (full)
+            r(w - s, h * 0.45, s, h * 0.55);    // right wall (full x-height)
+            r(0.0, h * 0.70, w, s);             // mid bar (bowl top)
+            r(0.0, h * 0.70, s, h * 0.30);      // left wall (lower half only)
             r(0.0, h - s, w, s);                // bottom
-            r(0.0, h * 0.55, w, s);             // mid
-            r(0.0, h * 0.55, s, h * 0.45);      // left
-            r(w - s, h * 0.55, s, h * 0.45);    // right
-            r(0.0, h - s * 2.0, s, s);          // tail
         }
         b't' => {
-            r(0.0, 0.0, w, s);                  // top
-            r(w * 0.5 - s * 0.5, 0.0, s, h);    // stem
+            // lowercase t: a short ascender stem with the crossbar at the
+            // x-height line — not a full-height capital-T bar.
+            r(w * 0.5 - s * 0.5, h * 0.25, s, h * 0.75);   // stem (ascender → bottom)
+            r(w * 0.15, h * 0.45, w * 0.6, s);             // crossbar at x-height
         }
         b'r' => {
             r(0.0, h * 0.45, s, h * 0.55);      // stem
