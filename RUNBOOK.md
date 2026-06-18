@@ -802,6 +802,34 @@ vssh 'OSTIARIUS_SOCK=/tmp/ost.sock OSTIARIUS_OPEN=1 OSTIARIUS_SEAT=/tmp/ost-seat
   cat /tmp/ost.log'  # → "launch org.atrium.forum ... choragus ... dock" = the desktop comes up
 # Production: ostiarius (no --serve-demo) = JaildLauncher + PAM (build --features pam),
 #   needs jaild running; vestibulum must be registered org.atrium.vestibulum (peer gate).
+
+#### Production jailed launch (atrium-launch → jaild → real jail, VERIFIED 2026-06-18)
+# A signed Forum component launched into a real jail under its per-app uid, drawing.
+# Bins (portcullis workspace target): atrium-jaild, atrium-launch.
+vssh '
+  APP=/usr/local/share/atrium/apps/org.atrium.forum-bar; mkdir -p $APP/bin /etc/atrium/publishers
+  cp /mnt/host/forum-bar/atrium.toml $APP/atrium.toml
+  cp /mnt/host/forum-bar/target/aarch64-unknown-freebsd/release/forum-bar $APP/bin/forum-bar; chmod +x $APP/bin/forum-bar
+  cp /mnt/host/etc/jaild.policy.toml /etc/atrium/jaild.policy.toml
+  # sign the manifest (P-256, cosign-style): base64 DER → .sig; SPKI pubkey → publishers
+  openssl ecparam -name prime256v1 -genkey -noout -out /root/dev-key.pem
+  openssl ec -in /root/dev-key.pem -pubout -out /etc/atrium/publishers/dev.pem
+  openssl dgst -sha256 -sign /root/dev-key.pem -out /root/s.der $APP/atrium.toml
+  openssl base64 -A -in /root/s.der -out $APP/atrium.toml.sig
+  : > /var/run/atrium/app-registry; rm -f /var/run/atrium/jaild.sock /atrium/sockets/fresco/fresco.sock
+  mkdir -p /atrium/sockets/fresco
+  # frescod at the CANONICAL jailed socket path (connect_default prefers it; the graphics cap mounts it)
+  FRESCOD_BUNDLE=/root/wmtest/bundles/atrium-core FRESCOD_SOCK=/atrium/sockets/fresco/fresco.sock \
+    FRESCOD_HEADLESS_PNG=/mnt/host/scratch/jailed /root/frescod-z >/tmp/fzf.log 2>&1 & sleep 3
+  /root/jaild-z serve --policy /etc/atrium/jaild.policy.toml --socket /var/run/atrium/jaild.sock >/tmp/jaild.log 2>&1 & sleep 1
+  ATRIUM_LAUNCH_SUPERVISE=1 /root/launch-z org.atrium.forum-bar alice \
+    $APP/atrium.toml $APP/atrium.toml.sig / $APP/bin/forum-bar >/tmp/launch.log 2>&1 & sleep 3
+  ps -axo user,uid,pid,jid,command | grep bin/forum-bar | grep -v grep   # → app-a 50000 ... jid N
+  jls'                                                                    # → the live jail
+# Gotchas: jaild exec_paths.allowed_prefixes must cover the bin (apps/ ✓); jaild pdfork has no PD_DAEMON
+# so the launcher must HOLD the procdesc fd (ATRIUM_LAUNCH_SUPERVISE) or the kernel SIGKILLs the child;
+# frescod socket is 0666 (per-app uids connect; the jail mount is the cap gate); env FRESCO_SOCKET isn't
+# in jaild's env allowlist so rely on connect_default → /atrium/sockets/fresco/fresco.sock.
 # Per-app placement (app-id): frescod stamps owner_uid (getpeereid) in WM_ENUMERATE;
 #   forum-wm resolves it via the launch registry /var/run/atrium/app-registry
 #   ("<uid> <user> <app-id>" lines) → [assign] rule. To exercise as root (uid 0):
