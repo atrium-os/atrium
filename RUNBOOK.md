@@ -845,6 +845,26 @@ vssh '
 # → jls shows 3 jails (uids 50000/50001/50002); the PNG composites the desktop (top bar + wallpaper + dock).
 # forum-bar declares role=Chrome, forum-dock role=Background so the WM doesn't gate them; forum-wm's forum-ctl
 # socket is 0666 for the chrome's cross-uid connect (bar shows live "0 windows" = it queried forum-ctl).
+
+#### Boot directly to vestibulum (rc services, VERIFIED 2026-06-18)
+# rc.d: atrium-jaild (portcullis/jaild/etc) + atrium-frescod (frescod/etc) + atrium-ostiarius
+# (portcullis/ostiarius/etc) → /usr/local/etc/rc.d/ (chmod +x). Binaries → /usr/local/bin/
+# {atrium-jaild,frescod,ostiarius}. atrium-core bundle → /usr/local/share/atrium/bundles/atrium-core.
+# App bundles (vestibulum + forum-*) signed under /usr/local/share/atrium/apps/ (see the recipe above).
+# rc.conf:
+#   sysrc atrium_jaild_enable=YES
+#   sysrc atrium_frescod_enable=YES
+#   sysrc atrium_frescod_headless_png=/var/run/atrium/frescod   # headless: no display device in this VM
+#   sysrc atrium_ostiarius_enable=YES
+# Then `reboot`: jaild → frescod (waits for its socket to bind) → ostiarius (--serve-prod boots vestibulum)
+# → a jailed vestibulum (uid 50000, JID 1) renders the login (cp /var/run/atrium/frescod.png to view).
+# CLI FALLBACK / anti-lockout (independent of the Atrium stack, survive any GUI failure):
+#   - sshd on :2222 (vssh) — base FreeBSD, enabled.
+#   - serial console getty on :4444 (ttyu0 "3wire" onifconsole) — root login out-of-band.
+#   Both come up regardless of the atrium services, so enabling boot-to-vestibulum can't lock you out.
+# Gotcha: vestibulum connect-retries frescod (~10s) — at boot ostiarius may launch it before frescod's
+#   socket is bound; without the retry it died with ECONNREFUSED. 9p doesn't auto-remount post-reboot:
+#   `kldload p9fs; mount -t p9fs -o trans=virtio bsd_share /mnt/host`.
 # Per-app placement (app-id): frescod stamps owner_uid (getpeereid) in WM_ENUMERATE;
 #   forum-wm resolves it via the launch registry /var/run/atrium/app-registry
 #   ("<uid> <user> <app-id>" lines) → [assign] rule. To exercise as root (uid 0):
