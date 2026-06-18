@@ -104,6 +104,35 @@ fn main() {
         return;
     }
 
+    // Production-launch test mode: the REAL JaildLauncher (verify → uid → jaild
+    // jail+exec, retaining procdesc fds) but the stub auth (no PAM) + optional
+    // OSTIARIUS_OPEN gate — so the full login→jailed-session path is exercisable
+    // in-VM without a PAM stack. Unlike --serve-demo (which logs/allocs without
+    // jaild), this puts apps in real jails. $OSTIARIUS_SOCK / $JAILD_SOCK /
+    // $ATRIUM_PUBLISHERS configure it.
+    if args.iter().any(|a| a == "--serve-prod") {
+        let sock = std::env::var("OSTIARIUS_SOCK")
+            .unwrap_or_else(|_| "/var/run/atrium/ostiarius.sock".into());
+        let seat = std::env::var("OSTIARIUS_SEAT")
+            .unwrap_or_else(|_| format!("/tmp/ostiarius-seat-{}", std::process::id()));
+        let _ = std::fs::remove_file(&seat);
+        let mut launcher = JaildLauncher::default();
+        if let Ok(j) = std::env::var("JAILD_SOCK") { launcher.jaild_sock = j; }
+        if let Ok(p) = std::env::var("ATRIUM_PUBLISHERS") { launcher.publishers = p; }
+        let mut o = Ostiarius::new(launcher).with_seat_path(seat); // stub auth (no with_pam)
+        eprintln!("ostiarius(prod-test): serving {sock} with JaildLauncher (real jails)");
+        let r = if std::env::var("OSTIARIUS_OPEN").is_ok() {
+            ostiarius::control::serve(&mut o, &sock, |_| true)
+        } else {
+            ostiarius::control::serve(&mut o, &sock, ostiarius::control::vestibulum_gate)
+        };
+        if let Err(e) = r {
+            eprintln!("ostiarius(prod-test): serve {sock}: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // Daemon mode: listen on the control socket for vestibulum's authenticated
     // logins, peer-gated by getpeereid. Boot launches the login UI first.
     const SOCK: &str = "/var/run/atrium/ostiarius.sock";

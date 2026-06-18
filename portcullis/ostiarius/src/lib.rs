@@ -70,8 +70,16 @@ fn spec(app_id: &str, owner: &str, bin: &str, argv: &[&str], caps: Vec<&'static 
         owner: owner.to_string(),
         manifest: format!("{dir}/atrium.toml").into(),
         sig: format!("{dir}/atrium.toml.sig").into(),
-        jail_path: format!("{dir}/jail"),
-        bin: bin.to_string(),
+        // V1 stand-in: jail at "/" (the app sees the host rootfs — libs + the
+        // capability-mounted service sockets). Per-jail rootfs trees (a real
+        // `{dir}/jail`) land in D5; jaild's policy only allows the host root for
+        // now (see portcullis.md "deferred V1"). Using a per-app dir here gets a
+        // `path.not_in_allowlist` refusal.
+        jail_path: "/".to_string(),
+        // A leading-"/" bin is an absolute system path (the CLI console shell);
+        // otherwise it's the component's bundle binary, apps/<id>/bin/<name> —
+        // which is what jaild's exec allow-list permits (the apps/ prefix).
+        bin: if bin.starts_with('/') { bin.to_string() } else { format!("{dir}/bin/{bin}") },
         argv: argv.iter().map(|s| s.to_string()).collect(),
         caps,
     }
@@ -85,10 +93,10 @@ fn session_layer(human: &str, frontend: Frontend) -> Vec<LaunchSpec> {
         // never window-management) + audio. App-ids/caps match each component's
         // atrium.toml. The overview is launched on-demand, not at session start.
         Frontend::Gui => vec![
-            spec("org.atrium.forum-wm", human, "/usr/local/bin/forum-wm", &[], vec!["graphics", "window-management", "notify"]),
-            spec("org.atrium.forum-bar", human, "/usr/local/bin/forum-bar", &[], vec!["graphics", "forum-control"]),
-            spec("org.atrium.forum-dock", human, "/usr/local/bin/forum-dock", &[], vec!["graphics", "forum-control"]),
-            spec("org.atrium.choragus", human, "/usr/local/bin/choragusd", &[], vec!["audio"]),
+            spec("org.atrium.forum-wm", human, "forum-wm", &[], vec!["graphics", "window-management", "notify"]),
+            spec("org.atrium.forum-bar", human, "forum-bar", &[], vec!["graphics", "forum-control"]),
+            spec("org.atrium.forum-dock", human, "forum-dock", &[], vec!["graphics", "forum-control"]),
+            spec("org.atrium.choragus", human, "choragusd", &[], vec!["audio"]),
         ],
         // Display-down fallback: a login zsh in the human's session jail (the
         // decided shell; the jail is the boundary, not a custom shell). No Forum.
@@ -137,7 +145,7 @@ impl<L: Launcher> Ostiarius<L> {
 
     /// Boot: request jaild to launch the login UI (vestibulum). No session yet.
     pub fn boot(&mut self) -> Result<i32, String> {
-        let v = spec("org.atrium.vestibulum", "_login", "/usr/local/bin/vestibulum", &[], vec!["graphics"]);
+        let v = spec("org.atrium.vestibulum", "_login", "vestibulum", &[], vec!["graphics"]);
         self.launcher.launch(&v)
     }
 
@@ -189,9 +197,14 @@ impl<L: Launcher> Ostiarius<L> {
         seat::set_active_at(&self.seat_path, human).map_err(|e| format!("bind seat: {e}"))?;
         if !self.sessions.contains_key(human) {
             let mut ids = Vec::new();
+            // Launch each session component; a single one failing (e.g. audio with
+            // no device) must not abort the whole desktop — log it and carry on,
+            // recording only what actually launched (so teardown matches).
             for s in session_layer(human, frontend) {
-                self.launcher.launch(&s)?;
-                ids.push(s.app_id);
+                match self.launcher.launch(&s) {
+                    Ok(_) => ids.push(s.app_id),
+                    Err(e) => eprintln!("ostiarius: session component {} failed: {e}", s.app_id),
+                }
             }
             self.sessions.insert(human.to_string(), ids);
         }
@@ -379,7 +392,9 @@ impl Launcher for JaildLauncher {
             network: NetworkConfig::Disable,
             exec: Some(ExecSpec {
                 path: s.bin.clone(),
-                argv: s.argv.clone(),
+                // argv[0] is the program itself (jaild requires a non-empty argv),
+                // followed by any declared args.
+                argv: std::iter::once(s.bin.clone()).chain(s.argv.iter().cloned()).collect(),
                 env: vec![EnvPair { key: "PATH".into(), value: "/bin:/usr/bin:/usr/local/bin".into() }],
                 uid,
                 gid: uid,
