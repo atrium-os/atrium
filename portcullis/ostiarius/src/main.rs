@@ -54,21 +54,25 @@ impl Launcher for AllocLauncher {
     }
 }
 
-/// Wait (bounded) for frescod to be *connectable* before booting vestibulum.
-/// A connect (not a stat) is the readiness signal: a socket file can exist while
-/// stale or mid-bind and still refuse. $FRESCO_SOCK overrides; else the canonical
-/// in-jail path. Best-effort — logs + proceeds after the timeout.
-fn wait_for_frescod() {
+/// Wait (bounded) for frescod to become *connectable* — a connect, not a stat
+/// (a socket file can exist while stale or mid-bind and still refuse). Returns
+/// `true` once it's accepting, `false` if it never came up within the budget.
+/// $FRESCO_SOCK overrides the path; default is the canonical in-jail socket.
+fn wait_for_frescod() -> bool {
+    // ~15s budget: enough for frescod's cold-boot renderer init, bounded so a
+    // broken/never-starting frescod doesn't make us spin forever.
+    const TRIES: u32 = 30;
     let path = std::env::var("FRESCO_SOCK")
         .unwrap_or_else(|_| "/atrium/sockets/fresco/fresco.sock".into());
-    for _ in 0..50 {
+    for n in 1..=TRIES {
         if std::os::unix::net::UnixStream::connect(&path).is_ok() {
             eprintln!("ostiarius: frescod ready at {path}");
-            return;
+            return true;
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        if n == 1 { eprintln!("ostiarius: waiting for frescod at {path}…"); }
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    eprintln!("ostiarius: frescod not reachable at {path} after 10s; booting vestibulum anyway");
+    false
 }
 
 fn main() {
@@ -139,10 +143,17 @@ fn main() {
         let mut o = Ostiarius::new(launcher).with_seat_path(seat); // stub auth (no with_pam)
         // Gate on the display server being READY before booting the login UI: as
         // the supervisor, ostiarius sequences startup rather than launching a
-        // doomed vestibulum into a not-yet-up frescod. NB: a socket *existing* is
-        // not enough (a stale/ mid-bind socket file still refuses) — only a
-        // successful connect proves frescod is accepting, so we probe by connecting.
-        wait_for_frescod();
+        // doomed vestibulum into a not-yet-up frescod. If frescod never comes up
+        // within the bounded window, GIVE UP cleanly (exit) — there's no useful
+        // GUI session without it, and spinning forever helps no one; the operator
+        // investigates via the serial/ssh console (the CLI fallback) and restarts.
+        if !wait_for_frescod() {
+            eprintln!(
+                "ostiarius: frescod did not come up; giving up. \
+                 Investigate via the serial/ssh console and restart atrium-frescod + atrium-ostiarius."
+            );
+            std::process::exit(1);
+        }
         // Boot the login UI (vestibulum) first, like the real daemon — so this is
         // a complete boot-to-vestibulum path (jailed), minus PAM. OSTIARIUS_NO_BOOT
         // skips it (e.g. driving login by hand against an already-running UI).
