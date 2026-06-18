@@ -23,7 +23,7 @@ use portcullis_ipc::{
 };
 
 use fresco_client::Connection;
-use fresco_protocol::WindowHints;
+use fresco_protocol::{WindowHints, WmRole};
 use pergola::geom::Rect;
 use pergola::theme::{palette, radius, Semantic};
 use pergola::view::{Ctx, View};
@@ -170,7 +170,11 @@ fn render_dock() -> io::Result<()> {
         apps = sample_apps();
     }
     let mut conn = Connection::connect_default()?;
-    let win = conn.window_create(SCREEN_W as u32, SCREEN_H as u32, "forum-dock", WindowHints::default())?;
+    // The dock draws the full-screen wallpaper + the dock panel, so it's the
+    // back/background surface — the WM places it behind everything; the dock
+    // panel it paints in the bottom strip stays visible under documents.
+    let hints = WindowHints { role: Some(WmRole::Background), ..Default::default() };
+    let win = conn.window_create(SCREEN_W as u32, SCREEN_H as u32, "forum-dock", hints)?;
     let mut surface = FrescoSurface::new(conn, win);
 
     let mut app = App::new(DockView { apps, icons: Icons::load() }).with_theme(mode);

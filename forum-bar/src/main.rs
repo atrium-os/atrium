@@ -11,7 +11,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fresco_client::Connection;
-use fresco_protocol::WindowHints;
+use fresco_protocol::{WindowHints, WmRole};
 use forum_ctl::{Intent, Reply};
 use pergola::geom::Rect;
 use pergola::theme::{font, type_size, Semantic, Weight};
@@ -126,7 +126,10 @@ fn main() -> std::io::Result<()> {
     };
     let (focus_app, windows) = status();
     let mut conn = Connection::connect_default()?;
-    let win = conn.window_create(W as u32, BAR_H as u32, "forum-bar", WindowHints::default())?;
+    // Declare the chrome role so the WM reserves the top edge for the bar
+    // (rather than treating it as an ordinary document).
+    let hints = WindowHints { role: Some(WmRole::Chrome), ..Default::default() };
+    let win = conn.window_create(W as u32, BAR_H as u32, "forum-bar", hints)?;
     let mut surface = FrescoSurface::new(conn, win);
 
     let view = BarView { focus_app, windows, clock: clock_hhmm() };

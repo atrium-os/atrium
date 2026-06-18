@@ -375,6 +375,16 @@ fn serve_forum_ctl(path: &str, core: &Core) -> io::Result<()> {
     use std::os::unix::net::UnixListener;
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
+    // 0666 so the chrome apps (each its own per-app uid) can connect to this
+    // socket served by forum-wm (yet another uid). Reachability is the gate: the
+    // TCB only mounts /atrium/sockets/forum-ctl/ into a jail holding the
+    // `forum-control` cap, so an app without it can't see this socket at all —
+    // same pattern as frescod's / portcullisd's sockets. Without it a uid-50001
+    // chrome app gets EACCES on forum-wm's uid-50000 socket.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
+    }
     eprintln!("forum-wm: serving forum-ctl on {path}");
     for stream in listener.incoming() {
         let mut s = match stream { Ok(s) => s, Err(_) => continue };
