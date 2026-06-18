@@ -198,14 +198,20 @@ for arg in "$@"; do
             VIRTIO_GPU_ARGS="-device virtio-gpu-gl-pci,venus=on,blob=on,hostmem=512M,id=atrium-gpu"
             ;;
         --bochs)
-            # bochs-display has BochsDisplayDxe support in the
-            # prebuilt EDK2 we use, so EDK2 publishes a working GOP
-            # at boot and FreeBSD's loader.efi captures the
-            # framebuffer info into MODINFOMD_EFI_FB. Used to
-            # exercise the atrium-bootfb / atrium-splash boot path
-            # (the prebuilt EDK2 lacks VirtioGpuDxe so virtio-gpu
-            # alone produces no GOP metadata).
+            # bochs-display *should* expose BochsDisplayDxe → GOP, but in
+            # practice this EDK2 build often boots it with "Guest has not
+            # initialized the display" (no GOP metadata, vt has no efifb).
+            # Prefer --ramfb, which is the VERIFIED scfb surface for this VM
+            # (efifb 800x600 → atrium-bootfb → atrium-splash, confirmed).
             VIRTIO_GPU_ARGS="-device bochs-display"
+            ;;
+        --ramfb)
+            # ramfb — QEMU's purpose-built simple framebuffer for EFI/early
+            # boot. EDK2's QemuRamfbDxe publishes a GOP from it (no mode
+            # programming; the fb lives in guest RAM, QEMU scans it out), which
+            # loader.efi captures into MODINFOMD_EFI_FB → FreeBSD vt_efifb →
+            # atrium-bootfb. The cleanest "scfb" surface for the VM.
+            VIRTIO_GPU_ARGS="-device ramfb"
             ;;
         --display)
             # Cocoa window so virtio-gpu scanout is actually visible.
