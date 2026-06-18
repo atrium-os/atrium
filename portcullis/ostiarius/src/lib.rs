@@ -330,6 +330,13 @@ pub mod control {
 pub struct JaildLauncher {
     pub jaild_sock: String,
     pub publishers: String,
+    /// Held procdesc fds, per app-id. jaild `pdfork`s without `PD_DAEMON` and
+    /// passes the procdesc back over SCM_RIGHTS; the kernel keeps the jailed
+    /// process alive only while someone holds that fd. As the session
+    /// supervisor, ostiarius holds them here for the session's lifetime —
+    /// dropping one (on `teardown`/logout) lets the kernel reap that app. This
+    /// is THE reason supervision lives in ostiarius, not the one-shot launcher.
+    held: std::collections::HashMap<String, std::os::fd::OwnedFd>,
 }
 
 impl Default for JaildLauncher {
@@ -337,6 +344,7 @@ impl Default for JaildLauncher {
         JaildLauncher {
             jaild_sock: "/var/run/atrium/jaild.sock".into(),
             publishers: "/etc/atrium/publishers".into(),
+            held: std::collections::HashMap::new(),
         }
     }
 }
@@ -379,7 +387,19 @@ impl Launcher for JaildLauncher {
         });
         let mut c = Client::connect(&self.jaild_sock).map_err(|e| format!("connect jaild: {e}"))?;
         match c.send(&req) {
-            Ok((Response::JailCreated(r), _)) => Ok(r.pid),
+            Ok((Response::JailCreated(r), pdfd)) => {
+                // Retain the procdesc fd for the session's lifetime — without
+                // this the kernel SIGKILLs the jailed app the moment the last fd
+                // closes. (A later refinement: kqueue EVFILT_PROCDESC on these
+                // for exit-notification + the manifest's restart policy.)
+                if let Some(fd) = pdfd {
+                    use std::os::fd::FromRawFd;
+                    // SAFETY: `fd` is the procdesc jaild passed via SCM_RIGHTS.
+                    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+                    self.held.insert(s.app_id.clone(), owned);
+                }
+                Ok(r.pid)
+            }
             Ok((resp, _)) => Err(format!("jaild refused: {resp:?}")),
             Err(e) => Err(format!("jaild send: {e}")),
         }
@@ -388,6 +408,9 @@ impl Launcher for JaildLauncher {
     fn teardown(&mut self, app_id: &str) -> Result<(), String> {
         use jaild::protocol::{Request, Response};
         use portcullisd::jaild_client::Client;
+        // Drop the held procdesc (closing it lets the kernel reap the jailed
+        // process), then RemoveJail to clear the jail entry.
+        self.held.remove(app_id);
         // RemoveJail by name (the exec'd-jail case): idempotent — a jail already
         // gone returns success. The component's session-jail is named on launch.
         let req = Request::RemoveJail { jid: None, name: Some(jail_name(app_id)) };
