@@ -4,8 +4,8 @@
  * Owns the newbus PCI attach to the real `pci` bus (vendor 0x1002 / device
  * 0x7550 = the gpusim functional model): enables bus-mastering, maps the
  * register (BAR5) and doorbell (BAR2) BARs into the SHARED softc, then creates
- * two child devices — "atrium_gpu" and "atrium_display" — that the GPU and
- * display modules attach to. Both children reach the shared softc (and thus the
+ * two child devices — "atrium_gpu_amd" and "atrium_gpu_amd_display" — that the
+ * GPU and display modules attach to. Both children reach the shared softc (and thus the
  * mapped BARs + inline MMIO accessors) via device_get_softc(device_get_parent()).
  *
  * This is the §4.1 three-module split: the display module loads independently of

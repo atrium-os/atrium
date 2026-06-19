@@ -190,6 +190,30 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		return (err);
 	}
 
+	case ATRIUM_GPU_IOC_BO_EXPORT_SCANOUT: {
+		struct atrium_gpu_bo_export_scanout *e =
+		    (struct atrium_gpu_bo_export_scanout *)data;
+		struct file *fp;
+
+		/*
+		 * Export a VRAM BO as a scanout handle for the display module
+		 * (a separate driver with no BO table): the absolute VRAM offset
+		 * + size, the dma-buf-equivalent it imports. Only VRAM is
+		 * scannable — System/GTT BOs have no contiguous VRAM offset.
+		 */
+		err = amd_bo_fget(td, e->bo_fd, &fp, &bo);
+		if (err != 0)
+			return (err);
+		if (!bo->vram) {
+			fdrop(fp, td);
+			return (EINVAL);
+		}
+		e->vram_offset = bo->pages[0];
+		e->size = bo->size;
+		fdrop(fp, td);
+		return (0);
+	}
+
 	case ATRIUM_GPU_IOC_SYNCOBJ_CREATE: {
 		struct atrium_gpu_syncobj_create *c =
 		    (struct atrium_gpu_syncobj_create *)data;
@@ -380,66 +404,12 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		return (amd_powergate(sc, p));
 	}
 
-	case ATRIUM_GPU_IOC_DISPLAY_QUERY: {
-		struct atrium_gpu_display_query *q =
-		    (struct atrium_gpu_display_query *)data;
-
-		return (amd_display_query(sc, q));
-	}
-
-	case ATRIUM_GPU_IOC_DISPLAY_SET_MODE: {
-		struct atrium_gpu_display_setmode *m =
-		    (struct atrium_gpu_display_setmode *)data;
-
-		return (amd_display_set_mode(sc, td, m->fb_fd, &m->fault));
-	}
-
-	case ATRIUM_GPU_IOC_DISPLAY_FLIP: {
-		struct atrium_gpu_display_flip *f =
-		    (struct atrium_gpu_display_flip *)data;
-
-		return (amd_display_flip(sc, td, f->fb_fd, f->vsync, &f->fault));
-	}
-
-	case ATRIUM_GPU_IOC_DISPLAY_STATUS: {
-		struct atrium_gpu_display_status *st =
-		    (struct atrium_gpu_display_status *)data;
-
-		amd_display_status(sc, st);
-		return (0);
-	}
-
-	case ATRIUM_GPU_IOC_DISPLAY_CONFIG: {
-		struct atrium_gpu_display_config *c =
-		    (struct atrium_gpu_display_config *)data;
-
-		amd_display_config(sc, c->connector_type, c->plug_mode);
-		return (0);
-	}
-
-	case ATRIUM_GPU_IOC_DISPLAY_USBC: {
-		struct atrium_gpu_display_usbc *u =
-		    (struct atrium_gpu_display_usbc *)data;
-
-		amd_display_usbc(sc, u->lanes);
-		return (0);
-	}
-
-	case ATRIUM_GPU_IOC_DISPLAY_MST: {
-		struct atrium_gpu_display_mst *m =
-		    (struct atrium_gpu_display_mst *)data;
-
-		amd_display_mst(sc, m);
-		return (0);
-	}
-
-	case ATRIUM_GPU_IOC_DISPLAY_DPTRAIN: {
-		struct atrium_gpu_display_dptrain *t =
-		    (struct atrium_gpu_display_dptrain *)data;
-
-		amd_display_dptrain(sc, t);
-		return (0);
-	}
+	/*
+	 * Display ioctls moved to /dev/atrium-display0 (atrium_gpu_amd_display.ko,
+	 * §4.1): the display engine is a separate driver, and the scanout FB is
+	 * handed across by the dma-buf-style BO_EXPORT_SCANOUT above rather than a
+	 * BO fd consumed here.
+	 */
 
 	default:
 		return (ENOTTY);

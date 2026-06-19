@@ -11,6 +11,7 @@
  *   /tmp/atrium_gpu_test
  */
 #include "atrium_gpu_amd_abi.h"
+#include "atrium_display_abi.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -1517,25 +1518,61 @@ test_vram(int fd, int vm)
 }
 
 /*
- * D-display-1: the scanout path end to end. Discovery (HPD + EDID over DDC),
- * modeset on a VRAM FB, a vsync flip, vblank advancing under the host-timer
- * refresh, and the referee rejecting a too-small FB. (The exact-tear-line proof
- * is the deterministic engine test; in-VM this is the functional drive.)
+ * Allocate a VRAM BO on the GPU device and export it as a dma-buf-style scanout
+ * handle {vram_offset, size} the display device can import. This is the §4.1
+ * cross-device handoff: the GPU owns the BO table, the display only ever sees an
+ * absolute VRAM offset. Returns the bo_fd (caller closes) or -1.
  */
 static int
-test_display(int fd)
+export_scanout(int fd, uint64_t size, uint64_t *off, uint64_t *out_size)
 {
-	struct atrium_gpu_display_query q;
-	struct atrium_gpu_display_setmode sm;
-	struct atrium_gpu_display_flip fl;
-	struct atrium_gpu_display_status st0, st1;
-	struct atrium_gpu_bo_alloc fb, fb2, small;
-	uint64_t before;
+	struct atrium_gpu_bo_alloc a;
+	struct atrium_gpu_bo_export_scanout e;
 
-	/* 1. QUERY: connector attached, EDID readable with a valid header. */
+	memset(&a, 0, sizeof(a));
+	a.size = size;
+	a.flags = ATRIUM_GPU_BO_VRAM;
+	if (ioctl(fd, ATRIUM_GPU_IOC_BO_ALLOC, &a) != 0) {
+		perror("BO_ALLOC vram");
+		return (-1);
+	}
+	memset(&e, 0, sizeof(e));
+	e.bo_fd = a.bo_fd;
+	if (ioctl(fd, ATRIUM_GPU_IOC_BO_EXPORT_SCANOUT, &e) != 0) {
+		perror("BO_EXPORT_SCANOUT");
+		close(a.bo_fd);
+		return (-1);
+	}
+	*off = e.vram_offset;
+	*out_size = e.size;
+	return (a.bo_fd);
+}
+
+/*
+ * D-display-1 through the SEPARATE display device (/dev/atrium-display0,
+ * atrium_gpu_amd_display.ko). The scanout path end to end: discovery (HPD + EDID
+ * over DDC), mode enumeration (EDID DTD decode), modeset on a VRAM FB exported
+ * from the GPU, a vsync flip, vblank advancing under the host-timer refresh, and
+ * the referee rejecting a too-small FB. The FB crosses the GPU→display boundary
+ * as a plain {vram_offset,size} (export_scanout), never a BO fd. (The
+ * exact-tear-line proof is the deterministic engine test; this is the functional
+ * drive.)
+ */
+static int
+test_display(int fd, int dfd)
+{
+	struct atrium_display_connector q;
+	struct atrium_display_modes md;
+	struct atrium_display_setmode sm;
+	struct atrium_display_flip fl;
+	struct atrium_display_status st0, st1;
+	uint64_t off, sz, off2, sz2, soff, ssz, before;
+	int fb_fd, fb2_fd, small_fd;
+
+	/* 1. ENUM: connector attached, EDID readable with a valid header. */
 	memset(&q, 0, sizeof(q));
-	if (ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_QUERY, &q) != 0) {
-		perror("DISPLAY_QUERY");
+	if (ioctl(dfd, ATRIUM_DISPLAY_IOC_ENUM, &q) != 0) {
+		perror("DISPLAY_ENUM");
 		return (1);
 	}
 	if (!q.connected || q.edid_len != 128 || q.edid[0] != 0x00 ||
@@ -1553,43 +1590,52 @@ test_display(int fd)
 		return (1);
 	}
 
-	/* 2. Two VRAM scanout framebuffers (640x480 XRGB8888). */
-	memset(&fb, 0, sizeof(fb));
-	fb.size = 640u * 480u * 4u;
-	fb.flags = ATRIUM_GPU_BO_VRAM;
-	memset(&fb2, 0, sizeof(fb2));
-	fb2.size = 640u * 480u * 4u;
-	fb2.flags = ATRIUM_GPU_BO_VRAM;
-	if (ioctl(fd, ATRIUM_GPU_IOC_BO_ALLOC, &fb) != 0 ||
-	    ioctl(fd, ATRIUM_GPU_IOC_BO_ALLOC, &fb2) != 0) {
-		perror("BO_ALLOC vram fb");
+	/* 1b. MODES: the driver decodes the EDID's preferred DTD into a mode. The
+	 * D-display-1 monitor advertises VGA 640x480@60 (refresh in milli-Hz). */
+	memset(&md, 0, sizeof(md));
+	if (ioctl(dfd, ATRIUM_DISPLAY_IOC_MODES, &md) != 0) {
+		perror("DISPLAY_MODES");
+		return (1);
+	}
+	if (md.count < 1 || md.modes[0].width != 640 || md.modes[0].height != 480 ||
+	    md.modes[0].refresh_mhz < 59000 || md.modes[0].refresh_mhz > 61000) {
+		printf("display FAILED: MODES count=%u [0]=%ux%u@%umHz\n", md.count,
+		    md.modes[0].width, md.modes[0].height, md.modes[0].refresh_mhz);
 		return (1);
 	}
 
+	/* 2. Two VRAM scanout framebuffers (640x480 XRGB8888), exported. */
+	fb_fd = export_scanout(fd, 640u * 480u * 4u, &off, &sz);
+	fb2_fd = export_scanout(fd, 640u * 480u * 4u, &off2, &sz2);
+	if (fb_fd < 0 || fb2_fd < 0)
+		return (1);
+
 	/* 3. SET_MODE on FB — no referee fault. */
 	memset(&sm, 0, sizeof(sm));
-	sm.fb_fd = fb.bo_fd;
-	if (ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_SET_MODE, &sm) != 0 || sm.fault != 0) {
+	sm.vram_offset = off;
+	sm.size = sz;
+	if (ioctl(dfd, ATRIUM_DISPLAY_IOC_SET_MODE, &sm) != 0 || sm.fault != 0) {
 		printf("display FAILED: SET_MODE fault=%u\n", sm.fault);
 		return (1);
 	}
 
 	/* 4. Vsync FLIP to FB2 — no fault. */
 	memset(&fl, 0, sizeof(fl));
-	fl.fb_fd = fb2.bo_fd;
+	fl.vram_offset = off2;
+	fl.size = sz2;
 	fl.vsync = 1;
-	if (ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_FLIP, &fl) != 0 || fl.fault != 0) {
+	if (ioctl(dfd, ATRIUM_DISPLAY_IOC_PAGE_FLIP, &fl) != 0 || fl.fault != 0) {
 		printf("display FAILED: FLIP fault=%u\n", fl.fault);
 		return (1);
 	}
 
 	/* 5. Vblank advances under the host-timer refresh (~60 Hz). */
 	memset(&st0, 0, sizeof(st0));
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_STATUS, &st0);
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_STATUS, &st0);
 	before = st0.vblank_count;
 	usleep(120 * 1000); /* ~7 refreshes */
 	memset(&st1, 0, sizeof(st1));
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_STATUS, &st1);
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_STATUS, &st1);
 	if (st1.vblank_count <= before) {
 		printf("display FAILED: vblank did not advance (%llu -> %llu)\n",
 		    (unsigned long long)before,
@@ -1598,28 +1644,26 @@ test_display(int fd)
 	}
 
 	/* 6. Referee: a too-small FB faults FbTooSmall (code 4). */
-	memset(&small, 0, sizeof(small));
-	small.size = 4096;
-	small.flags = ATRIUM_GPU_BO_VRAM;
-	if (ioctl(fd, ATRIUM_GPU_IOC_BO_ALLOC, &small) != 0) {
-		perror("BO_ALLOC small");
+	small_fd = export_scanout(fd, 4096, &soff, &ssz);
+	if (small_fd < 0)
 		return (1);
-	}
 	memset(&fl, 0, sizeof(fl));
-	fl.fb_fd = small.bo_fd;
+	fl.vram_offset = soff;
+	fl.size = ssz;
 	fl.vsync = 0;
-	if (ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_FLIP, &fl) != 0 || fl.fault != 4) {
+	if (ioctl(dfd, ATRIUM_DISPLAY_IOC_PAGE_FLIP, &fl) != 0 || fl.fault != 4) {
 		printf("display FAILED: too-small FB fault=%u (want 4)\n",
 		    fl.fault);
 		return (1);
 	}
 
-	printf("display OK: connector+EDID, SET_MODE, vsync FLIP, vblank "
-	    "advanced %llu, too-small FB refereed\n",
+	printf("display OK: connector+EDID, MODES %ux%u@%umHz, SET_MODE, vsync "
+	    "FLIP, vblank advanced %llu, too-small FB refereed\n",
+	    md.modes[0].width, md.modes[0].height, md.modes[0].refresh_mhz,
 	    (unsigned long long)(st1.vblank_count - before));
-	close(small.bo_fd);
-	close(fb2.bo_fd);
-	close(fb.bo_fd);
+	close(small_fd);
+	close(fb2_fd);
+	close(fb_fd);
 	return (0);
 }
 
@@ -1630,34 +1674,31 @@ test_display(int fd)
  * fault moves on to the FB-size check) — proving the referee is cable-dependent.
  */
 static int
-test_display_link(int fd)
+test_display_link(int fd, int dfd)
 {
-	struct atrium_gpu_display_config cfg;
-	struct atrium_gpu_display_setmode sm;
-	struct atrium_gpu_bo_alloc fb;
-	int rc = 0;
+	struct atrium_display_config cfg;
+	struct atrium_display_setmode sm;
+	uint64_t off, sz;
+	int fb_fd, rc = 0;
 
 	/* a small VRAM FB suffices: the link check precedes the FB-size check. */
-	memset(&fb, 0, sizeof(fb));
-	fb.size = 640 * 480 * 4;
-	fb.flags = ATRIUM_GPU_BO_VRAM;
-	if (ioctl(fd, ATRIUM_GPU_IOC_BO_ALLOC, &fb) != 0) {
-		perror("BO_ALLOC");
+	fb_fd = export_scanout(fd, 640 * 480 * 4, &off, &sz);
+	if (fb_fd < 0)
 		return (1);
-	}
 
 	/* 4K monitor on an HDMI 1.4 cable → the link can't carry it. */
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.connector_type = 1; /* HDMI 1.4 */
 	cfg.plug_mode = 2;	/* 4K */
-	if (ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_CONFIG, &cfg) != 0) {
+	if (ioctl(dfd, ATRIUM_DISPLAY_IOC_CONFIG, &cfg) != 0) {
 		perror("DISPLAY_CONFIG");
-		close(fb.bo_fd);
+		close(fb_fd);
 		return (1);
 	}
 	memset(&sm, 0, sizeof(sm));
-	sm.fb_fd = fb.bo_fd;
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_SET_MODE, &sm);
+	sm.vram_offset = off;
+	sm.size = sz;
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_SET_MODE, &sm);
 	if (sm.fault != 5) { /* ModeExceedsLink */
 		printf("display_link FAILED: 4K/HDMI1.4 fault=%u (want 5)\n", sm.fault);
 		rc = 1;
@@ -1666,10 +1707,11 @@ test_display_link(int fd)
 	/* re-cable to DisplayPort 1.4: the link now fits, so SET_MODE gets past it
 	 * to the FB-size check (the 640x480 FB is too small for 4K → fault 4). */
 	cfg.connector_type = 3; /* DP 1.4 */
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_CONFIG, &cfg);
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_CONFIG, &cfg);
 	memset(&sm, 0, sizeof(sm));
-	sm.fb_fd = fb.bo_fd;
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_SET_MODE, &sm);
+	sm.vram_offset = off;
+	sm.size = sz;
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_SET_MODE, &sm);
 	if (sm.fault != 4) { /* FbTooSmall — i.e. the link check passed */
 		printf("display_link FAILED: 4K/DP1.4 fault=%u (want 4, link OK)\n", sm.fault);
 		rc = 1;
@@ -1678,12 +1720,12 @@ test_display_link(int fd)
 	/* restore the default monitor (HDMI 2.1 / VGA) so re-runs start clean. */
 	cfg.connector_type = 2;
 	cfg.plug_mode = 0;
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_CONFIG, &cfg);
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_CONFIG, &cfg);
 
 	if (rc == 0)
 		printf("display_link OK: 4K faults ModeExceedsLink on HDMI 1.4, "
 		    "passes the link on DP 1.4\n");
-	close(fb.bo_fd);
+	close(fb_fd);
 	return (rc);
 }
 
@@ -1693,32 +1735,29 @@ test_display_link(int fd)
  * carry 4K, 2 do not — USB takes the other pair).
  */
 static int
-test_display_usbc(int fd)
+test_display_usbc(int fd, int dfd)
 {
-	struct atrium_gpu_display_query q;
-	struct atrium_gpu_display_config cfg;
-	struct atrium_gpu_display_usbc uc;
-	struct atrium_gpu_display_setmode sm;
-	struct atrium_gpu_bo_alloc fb;
-	int rc = 0;
+	struct atrium_display_connector q;
+	struct atrium_display_config cfg;
+	struct atrium_display_usbc uc;
+	struct atrium_display_setmode sm;
+	uint64_t off, sz;
+	int fb_fd, rc = 0;
 
-	memset(&fb, 0, sizeof(fb));
-	fb.size = 640 * 480 * 4;
-	fb.flags = ATRIUM_GPU_BO_VRAM;
-	if (ioctl(fd, ATRIUM_GPU_IOC_BO_ALLOC, &fb) != 0) {
-		perror("BO_ALLOC");
+	fb_fd = export_scanout(fd, 640 * 480 * 4, &off, &sz);
+	if (fb_fd < 0)
 		return (1);
-	}
 
 	/* USB mode: the DP sink is virtual — no display connector. */
 	memset(&uc, 0, sizeof(uc));
 	uc.lanes = 0;
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_USBC, &uc);
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_USBC, &uc);
 	memset(&q, 0, sizeof(q));
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_QUERY, &q);
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_ENUM, &q);
 	memset(&sm, 0, sizeof(sm));
-	sm.fb_fd = fb.bo_fd;
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_SET_MODE, &sm);
+	sm.vram_offset = off;
+	sm.size = sz;
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_SET_MODE, &sm);
 	if (q.connected != 0 || sm.fault != 2 /* NoConnector */) {
 		printf("display_usbc FAILED: USB mode connected=%u fault=%u "
 		    "(want 0, 2)\n", q.connected, sm.fault);
@@ -1729,19 +1768,20 @@ test_display_usbc(int fd)
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.connector_type = 4;
 	cfg.plug_mode = 0; /* VGA */
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_CONFIG, &cfg);
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_CONFIG, &cfg);
 	uc.lanes = 4;
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_USBC, &uc);
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_USBC, &uc);
 	memset(&q, 0, sizeof(q));
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_QUERY, &q);
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_ENUM, &q);
 	if (!q.connected || q.connector_type != 4 || q.usbc_lanes != 4) {
 		printf("display_usbc FAILED: alt-mode connected=%u type=%u lanes=%u\n",
 		    q.connected, q.connector_type, q.usbc_lanes);
 		rc = 1;
 	}
 	memset(&sm, 0, sizeof(sm));
-	sm.fb_fd = fb.bo_fd;
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_SET_MODE, &sm);
+	sm.vram_offset = off;
+	sm.size = sz;
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_SET_MODE, &sm);
 	if (sm.fault != 0) {
 		printf("display_usbc FAILED: VGA/4-lane fault=%u (want 0)\n", sm.fault);
 		rc = 1;
@@ -1749,21 +1789,23 @@ test_display_usbc(int fd)
 
 	/* a 4K monitor fits 4 lanes (link OK -> FB too small) but not 2. */
 	cfg.plug_mode = 2; /* 4K */
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_CONFIG, &cfg);
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_CONFIG, &cfg);
 	uc.lanes = 4;
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_USBC, &uc);
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_USBC, &uc);
 	memset(&sm, 0, sizeof(sm));
-	sm.fb_fd = fb.bo_fd;
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_SET_MODE, &sm);
+	sm.vram_offset = off;
+	sm.size = sz;
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_SET_MODE, &sm);
 	if (sm.fault != 4 /* FbTooSmall: link passed at 4 lanes */) {
 		printf("display_usbc FAILED: 4K/4-lane fault=%u (want 4)\n", sm.fault);
 		rc = 1;
 	}
 	uc.lanes = 2;
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_USBC, &uc);
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_USBC, &uc);
 	memset(&sm, 0, sizeof(sm));
-	sm.fb_fd = fb.bo_fd;
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_SET_MODE, &sm);
+	sm.vram_offset = off;
+	sm.size = sz;
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_SET_MODE, &sm);
 	if (sm.fault != 5 /* ModeExceedsLink: 2 lanes can't */) {
 		printf("display_usbc FAILED: 4K/2-lane fault=%u (want 5)\n", sm.fault);
 		rc = 1;
@@ -1771,16 +1813,16 @@ test_display_usbc(int fd)
 
 	/* restore the default monitor (HDMI 2.1 / VGA, not USB-C). */
 	uc.lanes = 0;
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_USBC, &uc);
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_USBC, &uc);
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.connector_type = 2;
 	cfg.plug_mode = 0;
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_CONFIG, &cfg);
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_CONFIG, &cfg);
 
 	if (rc == 0)
 		printf("display_usbc OK: connector virtual until alt-mode; "
 		    "4 lanes carry 4K, 2 don't\n");
-	close(fb.bo_fd);
+	close(fb_fd);
 	return (rc);
 }
 
@@ -1790,21 +1832,21 @@ test_display_usbc(int fd)
  * uses). Two 1080p sinks fit; three 4K sinks oversubscribe and starve.
  */
 static int
-test_display_mst(int fd)
+test_display_mst(int dfd)
 {
-	struct atrium_gpu_display_mst m;
+	struct atrium_display_mst m;
 	int rc = 0, i, any;
 
 	/* two 1080p sinks on a DP 1.4 link → neither starves. */
 	memset(&m, 0, sizeof(m));
 	m.op = 0; /* enable / reset */
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_MST, &m);
-	m.op = 1; m.arg = 1; ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_MST, &m); /* 1080p */
-	m.op = 1; m.arg = 1; ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_MST, &m);
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_MST, &m);
+	m.op = 1; m.arg = 1; ioctl(dfd, ATRIUM_DISPLAY_IOC_MST, &m); /* 1080p */
+	m.op = 1; m.arg = 1; ioctl(dfd, ATRIUM_DISPLAY_IOC_MST, &m);
 	any = 0;
 	for (i = 0; i < 2; i++) {
 		m.op = 2; m.arg = i;
-		ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_MST, &m);
+		ioctl(dfd, ATRIUM_DISPLAY_IOC_MST, &m);
 		if (m.starved)
 			any = 1;
 	}
@@ -1814,15 +1856,15 @@ test_display_mst(int fd)
 	}
 
 	/* three 4K sinks → oversubscribed, starvation appears. */
-	m.op = 0; ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_MST, &m); /* reset */
+	m.op = 0; ioctl(dfd, ATRIUM_DISPLAY_IOC_MST, &m); /* reset */
 	for (i = 0; i < 3; i++) {
 		m.op = 1; m.arg = 2; /* 4K */
-		ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_MST, &m);
+		ioctl(dfd, ATRIUM_DISPLAY_IOC_MST, &m);
 	}
 	any = 0;
 	for (i = 0; i < 3; i++) {
 		m.op = 2; m.arg = i;
-		ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_MST, &m);
+		ioctl(dfd, ATRIUM_DISPLAY_IOC_MST, &m);
 		if (m.starved)
 			any = 1;
 	}
@@ -1843,9 +1885,9 @@ test_display_mst(int fd)
  * to HBR2 (can't); a dead cable trains nothing.
  */
 static int
-test_display_dptrain(int fd)
+test_display_dptrain(int dfd)
 {
-	struct atrium_gpu_display_dptrain t;
+	struct atrium_display_dptrain t;
 	uint32_t uhd_mbps = 594u * 4u; /* 594 MHz x 4 bpp = 2376 MB/s */
 	int rc = 0;
 
@@ -1853,7 +1895,7 @@ test_display_dptrain(int fd)
 	memset(&t, 0, sizeof(t));
 	t.cable_rate = 3; /* HBR3 */
 	t.cable_lanes = 4;
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_DPTRAIN, &t);
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_DPTRAIN, &t);
 	if (!t.trained || t.bw_mbps <= uhd_mbps) {
 		printf("display_dptrain FAILED: HBR3x4 trained=%u bw=%u\n", t.trained, t.bw_mbps);
 		rc = 1;
@@ -1862,7 +1904,7 @@ test_display_dptrain(int fd)
 	/* marginal cable: falls back to HBR2 -> can't carry 4K. */
 	t.cable_rate = 2; /* HBR2 */
 	t.cable_lanes = 4;
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_DPTRAIN, &t);
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_DPTRAIN, &t);
 	if (!t.trained || t.bw_mbps >= uhd_mbps) {
 		printf("display_dptrain FAILED: HBR2 trained=%u bw=%u\n", t.trained, t.bw_mbps);
 		rc = 1;
@@ -1871,7 +1913,7 @@ test_display_dptrain(int fd)
 	/* dead cable: trains nothing. */
 	t.cable_rate = 3;
 	t.cable_lanes = 0;
-	ioctl(fd, ATRIUM_GPU_IOC_DISPLAY_DPTRAIN, &t);
+	ioctl(dfd, ATRIUM_DISPLAY_IOC_DPTRAIN, &t);
 	if (t.trained) {
 		printf("display_dptrain FAILED: dead cable trained=%u\n", t.trained);
 		rc = 1;
@@ -1944,11 +1986,18 @@ test_sched(int fd)
 int
 main(void)
 {
-	int fd, vm, rc;
+	int fd, dfd, vm, rc;
 
 	fd = open("/dev/atrium-gpu0", O_RDWR);
 	if (fd < 0) {
 		perror("open /dev/atrium-gpu0");
+		return (1);
+	}
+	/* The display engine is a separate device (atrium_gpu_amd_display.ko). */
+	dfd = open("/dev/atrium-display0", O_RDWR);
+	if (dfd < 0) {
+		perror("open /dev/atrium-display0");
+		close(fd);
 		return (1);
 	}
 	vm = vm_create(fd);
@@ -1977,13 +2026,14 @@ main(void)
 	rc |= test_multipage(fd, vm);
 	rc |= test_doorbell_pages(fd, vm);
 	rc |= test_vram(fd, vm);
-	rc |= test_display(fd);
-	rc |= test_display_link(fd);
-	rc |= test_display_usbc(fd);
-	rc |= test_display_mst(fd);
-	rc |= test_display_dptrain(fd);
+	rc |= test_display(fd, dfd);
+	rc |= test_display_link(fd, dfd);
+	rc |= test_display_usbc(fd, dfd);
+	rc |= test_display_mst(dfd);
+	rc |= test_display_dptrain(dfd);
 	rc |= test_sched(fd);
 	close(vm);
+	close(dfd);
 	close(fd);
 	printf(rc == 0 ? "ALL OK\n" : "FAILURES\n");
 	return (rc);

@@ -71,6 +71,22 @@ struct atrium_gpu_bo_alloc {
 					 * System staging BO, and re-upload after a
 					 * GPU reset (reset loses VRAM). */
 
+/*
+ * Export a VRAM BO as a scanout handle: returns the BO's absolute VRAM offset
+ * and size — the dma-buf-equivalent the display engine imports. The display
+ * module (atrium_gpu_amd_display.ko) is a SEPARATE driver with no access to the
+ * GPU module's BO table; it scans out VRAM by offset, so the compositor hands it
+ * this plain (offset,size) rather than a BO fd. The offset is absolute against
+ * the shared VRAM aperture, so it is meaningful to the display without any
+ * cross-module bind. Rejects non-VRAM (System/GTT) BOs — only VRAM is scannable.
+ */
+struct atrium_gpu_bo_export_scanout {
+	uint32_t	bo_fd;		/* in:  VRAM BO to export */
+	uint32_t	pad;
+	uint64_t	vram_offset;	/* out: absolute VRAM offset (scanout base) */
+	uint64_t	size;		/* out: BO size in bytes */
+};
+
 /* Map a BO into a VM at a GPU virtual address (0 = let the kernel pick one). */
 struct atrium_gpu_vm_bind {
 	uint64_t	va;		/* in: GPU-VA (0 = auto); out: actual VA */
@@ -147,6 +163,8 @@ struct atrium_gpu_syncobj_wait {
 #define ATRIUM_GPU_IOC_BO_ALLOC		_IOWR('A', 0, struct atrium_gpu_bo_alloc)
 #define ATRIUM_GPU_IOC_BO_WRITE		_IOW('A', 1, struct atrium_gpu_bo_xfer)
 #define ATRIUM_GPU_IOC_BO_READ		_IOW('A', 2, struct atrium_gpu_bo_xfer)
+#define ATRIUM_GPU_IOC_BO_EXPORT_SCANOUT \
+	_IOWR('A', 27, struct atrium_gpu_bo_export_scanout)
 /* 'A',3 (SET_COMPUTE) and 'A',5 (SET_DRAW) retired: compute/draw state now
  * travels in the ring as SET_SH_REG packets (opaque-blob submit, ABI-v2). */
 #define ATRIUM_GPU_IOC_SUBMIT		_IOW('A', 4, struct atrium_gpu_submit)
@@ -191,89 +209,13 @@ struct atrium_gpu_sched {
 #define ATRIUM_GPU_IOC_SCHED		_IOWR('A', 25, struct atrium_gpu_sched)
 
 /*
- * Display (D-display-1): one connector / one CRTC. The display block is
- * architecturally independent of the GFX/compute engine (its own registers);
- * these ioctls drive QUERY -> SET_MODE -> FLIP -> STATUS. Scanout FBs are VRAM
- * BOs (fd-as-handle), read by the display by VRAM offset.
+ * The display engine (connector discovery, modeset, page-flip, the §8 output
+ * topology) is a SEPARATE driver — /dev/atrium-display0 (atrium_gpu_amd_display.ko),
+ * with its own ABI in atrium_display_abi.h. The scanout buffer crosses from the
+ * GPU to the display as a plain {vram_offset,size} via BO_EXPORT_SCANOUT above
+ * (dma-buf-style), so the two devices share no handle namespace. The display
+ * 'A',17-24 ioctls that used to live here were retired in the §4.1 split.
  */
-struct atrium_gpu_display_query {
-	uint32_t connected;	/* out: 1 = monitor attached (HPD) */
-	uint32_t connector_type; /* out: §8 interface type code (1=HDMI1.4 2=HDMI2.1
-				  * 3=DP1.4 4=USB-C-DP-alt 5=eDP) */
-	uint32_t usbc_lanes;	/* out: USB-C alt-mode lane count (0 = not USB-C) */
-	uint32_t edid_len;	/* out: EDID bytes returned (128) */
-	uint8_t  edid[128];	/* out: EDID base block read over DDC */
-};
-
-struct atrium_gpu_display_setmode {
-	int32_t  fb_fd;		/* in: VRAM BO to scan out */
-	uint32_t fault;		/* out: DisplayFault code (0 = ok) */
-};
-
-struct atrium_gpu_display_flip {
-	int32_t  fb_fd;		/* in: VRAM BO to flip to */
-	uint32_t vsync;		/* in: 1 = latch at vblank (no tear) */
-	uint32_t fault;		/* out: DisplayFault code (0 = ok) */
-};
-
-struct atrium_gpu_display_status {
-	uint64_t vblank_count;	/* out: vblanks elapsed */
-	uint32_t dropped_flips;	/* out: flips dropped by the depth-1 queue */
-	uint32_t tear_line;	/* out: first tear scanline (0xffffffff = none) */
-};
-
-/*
- * Reconfigure the simulated monitor (bring-up / test): re-cable the connector to
- * a different interface type and/or re-plug it advertising a different built-in
- * mode. Lets a test drive the §8 link-bandwidth referee (e.g. a 4K monitor on an
- * HDMI 1.4 cable -> ModeExceedsLink).
- */
-struct atrium_gpu_display_config {
-	uint32_t connector_type; /* in: type code (1=HDMI1.4 2=HDMI2.1 3=DP1.4 ...) */
-	uint32_t plug_mode;	/* in: re-plug advertising mode (0=VGA 1=1080p 2=4K) */
-};
-
-/*
- * USB-C DisplayPort Alt Mode (§8 cross-subsystem): the display connector is
- * virtual until PD negotiates alt-mode. `lanes` = 0 puts the port in USB mode (no
- * display); 2 or 4 enters DP Alt Mode with that lane count (4 = full bandwidth,
- * 2 = half — USB takes the other pair).
- */
-struct atrium_gpu_display_usbc {
-	uint32_t lanes;
-};
-
-/*
- * DisplayPort MST (§8): one link fans out to a dynamic set of sinks sharing its
- * bandwidth. op 0 = enable/reset the hub; op 1 = add a sink advertising mode
- * `arg` (0=VGA 1=1080p 2=4K); op 2 = query sink `arg`. `count`/`starved` are out.
- */
-struct atrium_gpu_display_mst {
-	uint32_t op;
-	uint32_t arg;
-	uint32_t count;		/* out: number of sinks */
-	uint32_t starved;	/* out: (op 2) selected sink bandwidth-starved? */
-};
-
-/*
- * DisplayPort link training (§8): negotiate against a physical cable. Usable
- * bandwidth is an outcome — a marginal cable falls back to a lower rate.
- */
-struct atrium_gpu_display_dptrain {
-	uint32_t cable_rate;	/* in: cable's max rate (0=RBR 1=HBR 2=HBR2 3=HBR3) */
-	uint32_t cable_lanes;	/* in: cable's wired lane count */
-	uint32_t bw_mbps;	/* out: trained bandwidth, MB/s */
-	uint32_t trained;	/* out: 1 = a link trained (0 = dead cable) */
-};
-
-#define ATRIUM_GPU_IOC_DISPLAY_QUERY	_IOWR('A', 17, struct atrium_gpu_display_query)
-#define ATRIUM_GPU_IOC_DISPLAY_SET_MODE	_IOWR('A', 18, struct atrium_gpu_display_setmode)
-#define ATRIUM_GPU_IOC_DISPLAY_FLIP	_IOWR('A', 19, struct atrium_gpu_display_flip)
-#define ATRIUM_GPU_IOC_DISPLAY_STATUS	_IOR('A', 20, struct atrium_gpu_display_status)
-#define ATRIUM_GPU_IOC_DISPLAY_CONFIG	_IOW('A', 21, struct atrium_gpu_display_config)
-#define ATRIUM_GPU_IOC_DISPLAY_USBC	_IOW('A', 22, struct atrium_gpu_display_usbc)
-#define ATRIUM_GPU_IOC_DISPLAY_MST	_IOWR('A', 23, struct atrium_gpu_display_mst)
-#define ATRIUM_GPU_IOC_DISPLAY_DPTRAIN	_IOWR('A', 24, struct atrium_gpu_display_dptrain)
 
 /*
  * Power gating: gate idle IP blocks. The caller passes which blocks the current

@@ -335,7 +335,8 @@ struct atrium_amd_softc {
 	int		 regs_rid;
 	struct resource	*doorbell;	/* BAR2 doorbell page */
 	int		 doorbell_rid;
-	struct cdev	*cdev;		/* /dev/atrium-gpu0 */
+	struct cdev	*cdev;		/* /dev/atrium-gpu0 (gpu module) */
+	struct cdev	*display_cdev;	/* /dev/atrium-display0 (display module) */
 	int		energy_member;	/* energy federation id, -1 = none */
 
 	struct resource	*msix_table;	/* BAR holding the MSI-X table (BAR4) */
@@ -434,26 +435,13 @@ void	 amd_sched(struct atrium_amd_softc *sc, struct atrium_gpu_sched *s);
 struct atrium_gpu_powergate;
 int	 amd_powergate(struct atrium_amd_softc *sc, struct atrium_gpu_powergate *p);
 
-/* display.c — the D-display-1 scanout path (one connector / one CRTC) */
-struct atrium_gpu_display_query;
-struct atrium_gpu_display_status;
-struct atrium_gpu_display_mst;
-struct atrium_gpu_display_dptrain;
-int	 amd_display_query(struct atrium_amd_softc *sc,
-	    struct atrium_gpu_display_query *q);
-int	 amd_display_set_mode(struct atrium_amd_softc *sc, struct thread *td,
-	    int fb_fd, uint32_t *fault);
-int	 amd_display_flip(struct atrium_amd_softc *sc, struct thread *td,
-	    int fb_fd, uint32_t vsync, uint32_t *fault);
-void	 amd_display_status(struct atrium_amd_softc *sc,
-	    struct atrium_gpu_display_status *st);
-void	 amd_display_config(struct atrium_amd_softc *sc, uint32_t ctype,
-	    uint32_t plug_mode);
-void	 amd_display_usbc(struct atrium_amd_softc *sc, uint32_t lanes);
-void	 amd_display_mst(struct atrium_amd_softc *sc,
-	    struct atrium_gpu_display_mst *m);
-void	 amd_display_dptrain(struct atrium_amd_softc *sc,
-	    struct atrium_gpu_display_dptrain *t);
+/*
+ * The display block (APER_DISP register helpers + the /dev/atrium-display0
+ * cdev) lives in a SEPARATE module, atrium_gpu_amd_display.ko (display/), which
+ * shares this softc + the regDISP_* defs + the mmio accessors above but has its
+ * own newbus child and ABI (atrium_display_abi.h). The GPU module does not
+ * reference it.
+ */
 
 /*
  * mmap offset (passed to mmap() on the device fd) that maps the BAR2 doorbell

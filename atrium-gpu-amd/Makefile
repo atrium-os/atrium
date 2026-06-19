@@ -12,6 +12,6 @@
 #
 # Requires the device present: boot the VM with `run-vm.sh --gpusim`.
 
-SUBDIR=	base gpu
+SUBDIR=	base gpu display
 
 .include <bsd.subdir.mk>
