@@ -287,11 +287,15 @@ main(void)
 	    "(vblank %llu -> %llu) — look at the QEMU window\n",
 	    (unsigned long long)st0.vblank_count, (unsigned long long)st1.vblank_count);
 
-	/* Hold it: re-flip on a cadence so the frame stays latched and the scanout
-	 * BO stays resident (closing fds would free the VRAM). Ctrl-C to stop. */
+	/* Hold it: re-flip at a gentle 4 Hz. This keeps the scanout BO's fds alive
+	 * (closing them frees the VRAM) and re-asserts FB_BASE/FB_SIZE each tick —
+	 * which self-heals the gpusim harness's occasional lost initial register
+	 * write (a residual socket race) so the frame reliably appears. The cadence
+	 * is slow enough not to load the device (a tight loop starved sshd). Ctrl-C
+	 * to stop. */
 	for (;;) {
 		ioctl(dfd, ATRIUM_DISPLAY_IOC_PAGE_FLIP, &fl);
-		usleep(100 * 1000);
+		usleep(250 * 1000);
 	}
 	return (0);
 }
