@@ -11,6 +11,11 @@
 > vblank/flip-done + syncobj fences. The *transport* content here is unaffected. See
 > [`gpu-abi-reconciliation.md`](gpu-abi-reconciliation.md).
 >
+> **Tier-2 framing SUPERSEDED (2026-06-19).** §6.5.1 here frames Tier-2 as a deferred
+> llvmpipe/lavapipe vendoring. That was rejected; the canonical Tier-2 is the bespoke
+> AOT software-Vulkan path in [`tier2-renderer.md`](tier2-renderer.md) (`atrium-spv-*`).
+> See [`gpu-abi-reconciliation.md`](gpu-abi-reconciliation.md) §8.
+>
 > **Companion docs.** Read `aqueduct.md` first (envelope transport, CAS),
 > then `atrium-gpu-abi-v2.md` (kmod cdev/ioctl conventions). This doc
 > defines the GPU-dispatch opcode class layered on top of aqueduct.

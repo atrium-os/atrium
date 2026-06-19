@@ -54,6 +54,9 @@ move every component onto one ABI.
 | `atrium-kmod/atrium_gpu.h` (`'G'`, handle BOs) | **LEGACY** — migrate to `'A'` (§5) |
 | `atrium-gpu-amd/*_abi.h` (`'A'`/`'D'`) | **REFERENCE** — finish v2 deltas (§5) |
 | `atrium-gpu-rs` (mirrors `'G'`) | **MIGRATE** to v2 `'A'` (§5) |
+| `tier2-renderer.md` (AOT software Vulkan) | **CANONICAL** for Tier-2 (§8) |
+| `aqueduct-gpu.md` §6.5.1 — *"Tier-2 = deferred llvmpipe"* | **SUPERSEDED** by `tier2-renderer.md` (§8) |
+| `fresco-rendering-stack.md` (tier model) | live — the Tier-1/2/3 + router model (§8) |
 
 ## 3. The unified GPU ABI (group `'A'`)
 
@@ -174,3 +177,49 @@ virtio port; step 5 makes the ABI truly backend-agnostic.
   caller (`frescod_aqueduct` smoke) moves to kqueue or is dropped.
 - **D-4: does Carillon implement `'A'` directly, or front a backend that does?** Defer;
   Carillon is a transport — it should present the `'A'` cdev surface like the others.
+
+## 8. The rendering tiers (orthogonal to this ABI)
+
+The render *tiers* are a separate axis from the kmod ABI and were drifting too, so
+they're reconciled here for one mental model. **A tier is how a GPU-dispatch endpoint
+turns dispatch commands into pixels; the ABI (§3–§4) is the kmod↔userspace boundary
+those pixels' buffers cross.** They are orthogonal: any tier feeds a scanout buffer,
+and the display ABI scans it out.
+
+**The tier model** (`fresco-rendering-stack.md`):
+
+- **Tier-1** — tiny-skia CPU rasteriser of *Atrium's own* bundle ops (rect/path/text).
+  `aqueduct-gpu-host/src/software/`. Battery/no-GPU/CI/bring-up.
+- **Tier-2** — **AOT software Vulkan** for third-party SPIR-V: SPIR-V → `atrium-spv-ir`
+  → a bespoke ARM64/x86_64 backend (+ Cranelift fallback) → native `.so`, dlopen'd; no
+  JIT/interpreter in the hot path. Spec: **`tier2-renderer.md`** (the `atrium-spv-*`
+  crates). This is full Vulkan executed on the CPU — *not* a tiny-skia compositor.
+- **Tier-3** — hardware GPU: MoltenVK→Metal on macOS bring-up, native Vulkan on Linux
+  dev, the native `atrium-gpu` driver on real HW (`carillon.md`).
+- The **router** (`aqueduct-gpu-host/src/router.rs`) picks Tier-2 vs Tier-3 on a cost
+  model (the energy axis); Tier-1 is the no-GPU floor.
+
+**Tier-2 reconciliation:** `tier2-renderer.md` ("Design v2," AOT software Vulkan, code
+in `atrium-spv-*`) is canonical. It supersedes `aqueduct-gpu.md` §6.5.1's framing of
+Tier-2 as a deferred llvmpipe/lavapipe vendoring — that approach was rejected (it would
+break "Mesa only at build time"); the bespoke AOT path is the live design.
+
+**Two-phase endpoint model** (where the tiers run, and which path uses the display ABI):
+
+- **Bring-up (today):** a guest app → Carillon wire → the `aqueduct-gpu-host` daemon
+  **on the macOS host** → Tier-1/Tier-2/Tier-3(Metal) → presented on the host. The
+  `/dev/atrium-display0` ABI is **not** on this path.
+- **Native (D5+):** the `atrium-gpu` kmod **is** the endpoint — same dispatch protocol,
+  no host daemon. Rendering lands in a VRAM scanout BO and `/dev/atrium-display0` scans
+  it out. **The gpusim + `atrium-gpu-amd` work is this path, brought up against a
+  functional model instead of silicon.** `tests/firstlight.c` proves it end to end: the
+  GPU renders a frame into a VRAM BO, `BO_EXPORT_SCANOUT` lowers it to `{vram_offset,
+  size}`, and the display ABI flips it.
+
+**Consequence for "run a Vulkan app on the native display":** a Vulkan app (incl.
+frescod's `HeadlessRenderer`, a direct Vulkan client) reaches the native path through a
+Vulkan driver that targets the `'A'` submit ABI — that is the **Tier-3 native** driver
+(a from-scratch ICD / atrium-mesa fork), a large arc of its own. Tier-2 (software Vulkan)
+is a backend on the *daemon* endpoint, not a driver for the `atrium-gpu-amd` kmod, so it
+does not by itself put a Vulkan app on `/dev/atrium-display0`. Until that driver exists,
+the native display is driven by direct GPU dispatch (as `firstlight` does).
