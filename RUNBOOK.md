@@ -293,6 +293,40 @@ The Atrium boot splash is a **kernel** feature, not userland: a userland splash 
 - **Minimizing the pre-splash flash:** the splash appears once the *kernel* starts, so before it you briefly see (a) the UEFI/TianoCore firmware logo — pre-loader, not removable without reconfiguring EDK2; and (b) the loader's beastie menu — suppress with `beastie_disable="YES"` in `/boot/loader.conf` (the splash preload is independent of the menu). **Keep `autoboot_delay="1"`, not `"0"`:** the delay is the window to press a key and drop to the loader `OK` prompt (on video *and* serial) for recovery — booting an alternate kernel, setting tunables, single-user. `"0"` shaves ~1 s off the pre-splash flash but removes that escape hatch (anti-lockout cost); 1 s is worth it. A couple of console lines still flash before the splash; harmless.
 - **Verify the patched kernel is actually running** before concluding the splash "doesn't work" — see the `/boot/laminar` gotcha above; the entire splash bring-up was chased on the wrong (unpatched) kernel for a while because `installkernel` had gone to `/boot/kernel`.
 
+### atrium-gpu-amd (gpusim GPU/display driver) — §4.1 three-module split
+
+The AMD GPU driver (developed against the gpusim model, `run-vm.sh --gpusim`) follows the `atrium-gpu-amd-design.md` §4.1 split into **three kmods**, built from `atrium-gpu-amd/` via a `SUBDIR` Makefile (sources stay in the dir; each subdir Makefile `.PATH`s back):
+
+- `base/atrium_gpu_amd_pci.ko` — the newbus `pci` driver: matches `0x1002:0x7550`, enables busmaster, maps BAR5/BAR2 into the **shared softc**, and `device_add_child`s two children named after the driver-modules that claim them (`atrium_gpu_amd`, `atrium_gpu_amd_display`). Loaded first.
+- `gpu/atrium_gpu_amd.ko` — attaches to the `atrium_gpu_amd` child; `sc = device_get_softc(device_get_parent(dev))`; owns `/dev/atrium-gpu0`. `MODULE_DEPEND` on the base.
+- `display/atrium_gpu_amd_display.ko` — (in progress) attaches to the `atrium_gpu_amd_display` child; owns `/dev/atrium-display0` (decoupled ABI). `MODULE_DEPEND` on the base, loadable independently of the gpu module.
+
+**The base is per-vendor, not generic:** it does the vendor-specific PCI bring-up (ID match, BAR layout, MSI-X, softc shape). A different vendor gets its own `atrium-gpu-<vendor>-{pci,,-display}` trio; what's shared across vendors is the *userspace ABI* (`/dev/atrium-gpu0` + `/dev/atrium-display0`), not the kmod.
+
+```sh
+cd /mnt/host/atrium-gpu-amd && make        # builds base/ + gpu/ (+ display/)
+```
+
+**Binding: force-bind is only needed when you `kldload` AFTER boot.** The generic `vgapci` driver claims the VGA-class device at boot, so a post-boot `kldload` requires a manual takeover:
+
+```sh
+kldload base/atrium_gpu_amd_pci.ko
+devctl set driver -f vgapci0 atrium_gpu_amd_pci   # ONLY needed post-boot
+kldload gpu/atrium_gpu_amd.ko                      # auto-attaches to the child
+```
+
+**In production / for auto-bind, preload at boot — no force needed.** Our probe returns `BUS_PROBE_DEFAULT` (-20), which beats generic `vgapci`'s `BUS_PROBE_GENERIC` (-100), so if the module is present at PCI enumeration it wins and binds `vgapci0` automatically. Put the `.ko`s in `/boot/modules/` and:
+
+```
+# /boot/loader.conf
+atrium_gpu_amd_pci_load="YES"
+atrium_gpu_amd_load="YES"
+```
+
+(The loader honors `MODULE_DEPEND`, loading the base before the gpu module.) After boot the device tree is `atrium_gpu_amd_pci0 → atrium_gpu_amd0` with `/dev/atrium-gpu0` present and no `devctl` — exactly how a shipped vendor driver binds. (A `MODULE_PNP_INFO` PCI table would also let `devmatch`/`devd` auto-load it, but that only helps *unattached* devices — preloading is what wins the boot competition with `vgapci`.)
+
+**Known open issue (2026-06-19):** post-split, the synchronous GPU path works but **MSI-X interrupt delivery fails** (`atrium_gpu_test`: `irq … no delivery`, cascading to syncobj/cross_queue/display-vblank). Suspect: `amd_irq_setup` runs from the gpu child on the PCI-base device (now a *bus*); the fix is likely to move MSI-X allocation + vector routing into the base module (§4.1's "MSI-X allocation, IRQ vector routing" in pci). Attribute split-vs-pre-existing by A/B against the monolith (`git stash` the split, rebuild). The display vblank (host-timer) needs this for frescod page-flip.
+
 #### ddb over QEMU TCP serial (added 2026-05-01)
 
 The historical claim "kdb isn't reachable" no longer holds. `scripts/run-vm.sh` now exposes the serial console on `tcp:127.0.0.1:4444` and the QEMU monitor on `unix:/tmp/qmp.sock`. The stock GENERIC kernel running in the VM has `KDB`, `DDB`, `INVARIANTS`, `WITNESS`, `GDB`, and `KDB_TRACE` compiled in — no rebuild needed.
