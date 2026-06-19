@@ -299,7 +299,7 @@ The AMD GPU driver (developed against the gpusim model, `run-vm.sh --gpusim`) fo
 
 - `base/atrium_gpu_amd_pci.ko` — the newbus `pci` driver: matches `0x1002:0x7550`, enables busmaster, maps BAR5/BAR2 into the **shared softc**, and `device_add_child`s two children named after the driver-modules that claim them (`atrium_gpu_amd`, `atrium_gpu_amd_display`). Loaded first.
 - `gpu/atrium_gpu_amd.ko` — attaches to the `atrium_gpu_amd` child; `sc = device_get_softc(device_get_parent(dev))`; owns `/dev/atrium-gpu0`. `MODULE_DEPEND` on the base.
-- `display/atrium_gpu_amd_display.ko` — (in progress) attaches to the `atrium_gpu_amd_display` child; owns `/dev/atrium-display0` (decoupled ABI). `MODULE_DEPEND` on the base, loadable independently of the gpu module.
+- `display/atrium_gpu_amd_display.ko` — attaches to the `atrium_gpu_amd_display` child; owns `/dev/atrium-display0` with its own decoupled ABI (`atrium_display_abi.h`, `'D'` ioctl namespace: ENUM/MODES/SET_MODE/PAGE_FLIP/STATUS + CONFIG/USBC/MST/DPTRAIN). `MODULE_DEPEND` on the base, loadable independently of the gpu module. The scanout buffer crosses from the GPU dma-buf-style: the GPU's `BO_EXPORT_SCANOUT` turns a VRAM BO into a plain `{vram_offset,size}`, which the compositor hands to the display's SET_MODE/PAGE_FLIP — the display imports VRAM by absolute offset and never touches the GPU's BO table (no cross-module bind). MODES decodes the EDID's Detailed Timing Descriptors (mirrors the model's `edid.rs`).
 
 **The base is per-vendor, not generic:** it does the vendor-specific PCI bring-up (ID match, BAR layout, MSI-X, softc shape). A different vendor gets its own `atrium-gpu-<vendor>-{pci,,-display}` trio; what's shared across vendors is the *userspace ABI* (`/dev/atrium-gpu0` + `/dev/atrium-display0`), not the kmod.
 
@@ -312,7 +312,8 @@ cd /mnt/host/atrium-gpu-amd && make        # builds base/ + gpu/ (+ display/)
 ```sh
 kldload base/atrium_gpu_amd_pci.ko
 devctl set driver -f vgapci0 atrium_gpu_amd_pci   # ONLY needed post-boot
-kldload gpu/atrium_gpu_amd.ko                      # auto-attaches to the child
+kldload gpu/atrium_gpu_amd.ko                      # auto-attaches to its child
+kldload display/atrium_gpu_amd_display.ko          # auto-attaches to its child
 ```
 
 **In production / for auto-bind, preload at boot — no force needed.** Our probe returns `BUS_PROBE_DEFAULT` (-20), which beats generic `vgapci`'s `BUS_PROBE_GENERIC` (-100), so if the module is present at PCI enumeration it wins and binds `vgapci0` automatically. Put the `.ko`s in `/boot/modules/` and:
@@ -321,11 +322,14 @@ kldload gpu/atrium_gpu_amd.ko                      # auto-attaches to the child
 # /boot/loader.conf
 atrium_gpu_amd_pci_load="YES"
 atrium_gpu_amd_load="YES"
+atrium_gpu_amd_display_load="YES"
 ```
 
-(The loader honors `MODULE_DEPEND`, loading the base before the gpu module.) After boot the device tree is `atrium_gpu_amd_pci0 → atrium_gpu_amd0` with `/dev/atrium-gpu0` present and no `devctl` — exactly how a shipped vendor driver binds. (A `MODULE_PNP_INFO` PCI table would also let `devmatch`/`devd` auto-load it, but that only helps *unattached* devices — preloading is what wins the boot competition with `vgapci`.)
+(The loader honors `MODULE_DEPEND`, loading the base before the gpu + display modules.) After boot the device tree is `atrium_gpu_amd_pci0 → {atrium_gpu_amd0, atrium_gpu_amd_display0}` with `/dev/atrium-gpu0` + `/dev/atrium-display0` present and no `devctl` — exactly how a shipped vendor driver binds. (A `MODULE_PNP_INFO` PCI table would also let `devmatch`/`devd` auto-load it, but that only helps *unattached* devices — preloading is what wins the boot competition with `vgapci`.)
 
-**Known open issue (2026-06-19):** post-split, the synchronous GPU path works but **MSI-X interrupt delivery fails** (`atrium_gpu_test`: `irq … no delivery`, cascading to syncobj/cross_queue/display-vblank). Suspect: `amd_irq_setup` runs from the gpu child on the PCI-base device (now a *bus*); the fix is likely to move MSI-X allocation + vector routing into the base module (§4.1's "MSI-X allocation, IRQ vector routing" in pci). Attribute split-vs-pre-existing by A/B against the monolith (`git stash` the split, rebuild). The display vblank (host-timer) needs this for frescod page-flip.
+**MSI-X delivery (resolved):** the earlier post-split "MSI-X no delivery" was because `pci_alloc_msix` was called from the non-owning gpu child; MSI-X allocation + vector routing now lives in the **base** module (the device owner), and the gpu child only `bus_alloc`s vector 0 + hooks its ISR. `atrium_gpu_test` reports `irq OK: MSI-X delivered` and the host-timer display vblank advances (`display OK: … vblank advanced N`) on a **fresh-boot first run**.
+
+**Stateful re-run artifact (not a bug):** the gpusim *model* keeps per-device counters across `atrium_gpu_test` invocations within one boot (irq count, sched queue count, …), so a 2nd run in the same boot shows spurious `irq … no delivery` / `sched count=4`. Re-verify after a clean restart (`echo quit|nc -U /tmp/qmp.sock`, restart `gpusim-server`, `run-vm.sh --gpusim`), running the test once. The genuinely pre-existing model failures (independent of the split) are `compute [0 0 0 0]`, `syncobj` kqueue, `isolation`, `cross_queue`.
 
 #### ddb over QEMU TCP serial (added 2026-05-01)
 
