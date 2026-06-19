@@ -1,5 +1,14 @@
 # Atrium GPU ABI v2 — Draft for Review
 
+> **CANONICAL (2026-06-19).** This is the canonical GPU ABI. All backends
+> (`atrium-gpu-amd`, `atrium-virtio-gpu`, Carillon) and `atrium-gpu-rs` converge
+> to it — see [`gpu-abi-reconciliation.md`](gpu-abi-reconciliation.md) for the
+> decision, lineage, and migration plan. **Amendments adopted there** (the working
+> `atrium-gpu-amd` implementation refined the draft): the syncobj fd is itself
+> `EVFILT_READ`-able (no separate `SYNCOBJ_EVENTFD`); `BO_CREATE` is on `device_fd`
+> (VM-agnostic until `VM_BIND`); ioctl group is `'A'`; display vblank is kqueue-only
+> (`WAIT_VBLANK` retired). Display lives in [`atrium-display-architecture.md`](atrium-display-architecture.md).
+
 > **Status.** Draft. Intended audience: FreeBSD-CURRENT contributors, OpenBSD/NetBSD/DragonFly graphics maintainers, Mesa userspace authors familiar with the libdrm vendor backends. Not yet implemented end-to-end; v0.1 (the virtio-gpu skeleton at `atrium-kmod/atrium_virtio_gpu.c`) is the only consumer of an earlier, much smaller version of this surface today. Separately, a from-scratch AMD bring-up driver (`atrium-gpu-amd`, developed against the gpusim functional model) implements a smaller intermediate ABI — integer handles, kernel-mediated submit, blocking fence-wait, MSI-X completion — that is expected to converge to this surface; that work is what grounds the user-mode-queue (§5.9) and energy-telemetry (§5.10) additions in this revision. The intent of v2 is to lock in the long-term shape *before* a second vendor ports.
 >
 > **Companion.** Read `drm-research-findings.md` first if you want the source-grounded background. This document is the design that falls out of those findings. See `atrium-gpu-driver-architecture.md` for the driver-architecture stance and the rationale behind the user-mode-queue (§5.9) and energy-telemetry (§5.10) additions folded into this revision.

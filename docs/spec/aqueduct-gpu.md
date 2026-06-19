@@ -4,6 +4,13 @@
 > path; atrium-gpu-abi-v2.md remains the kernel ABI for both this transport
 > and the future native-HW drivers.
 >
+> **Display sections SUPERSEDED (2026-06-19).** The display/scanout model in §6.5.x
+> here (`BIND_GPU`, `scanout_handle`, blocking `WAIT_VBLANK`) is superseded by
+> [`atrium-display-architecture.md`](atrium-display-architecture.md): the canonical
+> display ABI is the decoupled offset/`share_fd` import with atomic-commit + kqueue
+> vblank/flip-done + syncobj fences. The *transport* content here is unaffected. See
+> [`gpu-abi-reconciliation.md`](gpu-abi-reconciliation.md).
+>
 > **Companion docs.** Read `aqueduct.md` first (envelope transport, CAS),
 > then `atrium-gpu-abi-v2.md` (kmod cdev/ioctl conventions). This doc
 > defines the GPU-dispatch opcode class layered on top of aqueduct.

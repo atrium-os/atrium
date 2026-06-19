@@ -1,5 +1,10 @@
 # Atrium GPU ABI Specification
 
+> **SUPERSEDED (2026-06-19).** This v0.1 surface is the bring-up GPU ABI; the
+> canonical GPU ABI is now [`atrium-gpu-abi-v2.md`](atrium-gpu-abi-v2.md). See
+> [`gpu-abi-reconciliation.md`](gpu-abi-reconciliation.md) for the decision, the
+> supersession lineage, and the per-component convergence plan. Kept for history.
+
 **Version:** 0.1.0 (draft)
 **Status:** Pre-implementation. The first concrete driver targeting this ABI is `atrium-virtio-gpu` (D0); the first real-hardware driver is `atrium-gpu-amd` (D5.2). Per-vendor architecture is a vendor choice — see [`atrium-gpu-amd-design.md`](atrium-gpu-amd-design.md) for the binding spec for the AMD module and the articulated principles offered as a non-binding reference for any future vendor module.
 
