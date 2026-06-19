@@ -112,42 +112,24 @@ amd_pending_scrub(struct atrium_amd_softc *sc, struct atrium_amd_syncobj *so)
 int
 amd_irq_setup(struct atrium_amd_softc *sc)
 {
-	int count = 1;
-
 	/*
-	 * pci(9) requires the memory resource holding the MSI-X table to be
-	 * allocated before pci_alloc_msix() — otherwise it returns ENXIO. The
-	 * table lives in a dedicated BAR (BAR4 for this device); ask the PCI
-	 * layer which one rather than hardcoding it.
+	 * The base (pci) module owns MSI-X: it allocated the table BAR and called
+	 * pci_alloc_msix() as the device owner (§4.1). We just grab vector 0's IRQ
+	 * resource and hook the ISR. If the base couldn't enable MSI-X, fall back
+	 * to the synchronous-drain (poll) path.
 	 */
-	sc->msix_table_rid = pci_msix_table_bar(sc->dev);
-	sc->msix_table = bus_alloc_resource_any(sc->dev, SYS_RES_MEMORY,
-	    &sc->msix_table_rid, RF_ACTIVE);
 	if (sc->msix_table == NULL)
 		return (ENXIO);
-
-	if (pci_alloc_msix(sc->dev, &count) != 0 || count < 1) {
-		bus_release_resource(sc->dev, SYS_RES_MEMORY,
-		    sc->msix_table_rid, sc->msix_table);
-		sc->msix_table = NULL;
-		return (ENXIO);
-	}
 
 	sc->irq_rid = 1;	/* MSI-X vector 0 is resource id 1 */
 	sc->irq = bus_alloc_resource_any(sc->dev, SYS_RES_IRQ, &sc->irq_rid,
 	    RF_ACTIVE);
-	if (sc->irq == NULL) {
-		pci_release_msi(sc->dev);
-		bus_release_resource(sc->dev, SYS_RES_MEMORY,
-		    sc->msix_table_rid, sc->msix_table);
-		sc->msix_table = NULL;
+	if (sc->irq == NULL)
 		return (ENXIO);
-	}
 	if (bus_setup_intr(sc->dev, sc->irq, INTR_TYPE_MISC | INTR_MPSAFE,
 	    NULL, amd_intr, sc, &sc->intr_cookie) != 0) {
 		bus_release_resource(sc->dev, SYS_RES_IRQ, sc->irq_rid, sc->irq);
 		sc->irq = NULL;
-		pci_release_msi(sc->dev);
 		return (ENXIO);
 	}
 	sc->msix_enabled = 1;
@@ -165,12 +147,7 @@ amd_irq_teardown(struct atrium_amd_softc *sc)
 	if (sc->irq != NULL) {
 		bus_release_resource(sc->dev, SYS_RES_IRQ, sc->irq_rid, sc->irq);
 		sc->irq = NULL;
-		pci_release_msi(sc->dev);
 	}
-	if (sc->msix_table != NULL) {
-		bus_release_resource(sc->dev, SYS_RES_MEMORY, sc->msix_table_rid,
-		    sc->msix_table);
-		sc->msix_table = NULL;
-	}
+	/* The MSI-X table BAR + pci_release_msi belong to the base (pci) module. */
 	sc->msix_enabled = 0;
 }

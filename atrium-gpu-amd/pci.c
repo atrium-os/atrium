@@ -1,0 +1,180 @@
+/*
+ * pci.c — atrium_gpu_amd_pci.ko, the §4.1 base module.
+ *
+ * Owns the newbus PCI attach to the real `pci` bus (vendor 0x1002 / device
+ * 0x7550 = the gpusim functional model): enables bus-mastering, maps the
+ * register (BAR5) and doorbell (BAR2) BARs into the SHARED softc, then creates
+ * two child devices — "atrium_gpu" and "atrium_display" — that the GPU and
+ * display modules attach to. Both children reach the shared softc (and thus the
+ * mapped BARs + inline MMIO accessors) via device_get_softc(device_get_parent()).
+ *
+ * This is the §4.1 three-module split: the display module loads independently of
+ * the GPU module, both depend on this base. The shared softc is THIS module's
+ * softc (sizeof(struct atrium_amd_softc)); sc->dev is this PCI device, so every
+ * existing helper that takes `sc` and uses sc->dev (reset, gmc, firmware, MSI-X,
+ * display registers) works unchanged from either child.
+ */
+#include "atrium_gpu_amd.h"
+#include "atrium_gpu_amd_abi.h"
+
+#include <sys/module.h>
+#include <sys/kernel.h>
+
+static int
+atrium_amd_pci_probe(device_t dev)
+{
+	if (pci_get_vendor(dev) == ATRIUM_AMD_VENDOR &&
+	    pci_get_device(dev) == ATRIUM_AMD_DEVICE) {
+		device_set_desc(dev, "Atrium AMD RDNA4 GPU (gpusim) — PCI base");
+		return (BUS_PROBE_DEFAULT);
+	}
+	return (ENXIO);
+}
+
+static void
+atrium_amd_pci_teardown(struct atrium_amd_softc *sc)
+{
+	if (sc->msix_table != NULL) {
+		pci_release_msi(sc->dev);
+		bus_release_resource(sc->dev, SYS_RES_MEMORY, sc->msix_table_rid,
+		    sc->msix_table);
+		sc->msix_table = NULL;
+	}
+	if (sc->doorbell != NULL) {
+		bus_release_resource(sc->dev, SYS_RES_MEMORY, sc->doorbell_rid,
+		    sc->doorbell);
+		sc->doorbell = NULL;
+	}
+	if (sc->regs != NULL) {
+		bus_release_resource(sc->dev, SYS_RES_MEMORY, sc->regs_rid,
+		    sc->regs);
+		sc->regs = NULL;
+	}
+	if (sc->lock_inited) {
+		mtx_destroy(&sc->lock);
+		sc->lock_inited = 0;
+	}
+}
+
+static int
+atrium_amd_pci_attach(device_t dev)
+{
+	struct atrium_amd_softc *sc = device_get_softc(dev);
+	device_t child;
+
+	sc->dev = dev;
+	sc->energy_member = -1;
+	mtx_init(&sc->lock, "atrium-gpu", NULL, MTX_DEF);
+	sc->lock_inited = 1;
+
+	/*
+	 * PCI bring-up gate (referee INV-PCI-0001/0002): the device faults DMA
+	 * before Bus-Master-Enable and BAR access before Memory-Space-Enable.
+	 * pci_enable_busmaster sets BME; RF_ACTIVE BAR alloc enables MSE.
+	 */
+	pci_enable_busmaster(dev);
+
+	sc->regs_rid = ATRIUM_AMD_REGS_BAR;
+	sc->regs = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &sc->regs_rid,
+	    RF_ACTIVE);
+	if (sc->regs == NULL) {
+		device_printf(dev, "failed to map BAR5 (MMIO register file)\n");
+		atrium_amd_pci_teardown(sc);
+		return (ENXIO);
+	}
+	sc->doorbell_rid = ATRIUM_AMD_DOORBELL_BAR;
+	sc->doorbell = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
+	    &sc->doorbell_rid, RF_ACTIVE);
+	if (sc->doorbell == NULL) {
+		device_printf(dev, "failed to map BAR2 (doorbell)\n");
+		atrium_amd_pci_teardown(sc);
+		return (ENXIO);
+	}
+
+	/*
+	 * MSI-X allocation is the device OWNER's job (§4.1: "MSI-X allocation,
+	 * IRQ vector routing" lives in the base). pci(9) needs the MSI-X table
+	 * BAR resident before pci_alloc_msix(); we enable the vectors here, and a
+	 * child (gpu) bus_alloc's vector 0 + hooks its own ISR. Doing this from a
+	 * non-owning child is what silently broke interrupt delivery. Non-fatal:
+	 * children fall back to the synchronous-drain (poll) path.
+	 */
+	sc->msix_table_rid = pci_msix_table_bar(dev);
+	sc->msix_table = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
+	    &sc->msix_table_rid, RF_ACTIVE);
+	if (sc->msix_table != NULL) {
+		int count = 1;	/* the model signals vector 0 */
+		if (pci_alloc_msix(dev, &count) != 0 || count < 1) {
+			bus_release_resource(dev, SYS_RES_MEMORY,
+			    sc->msix_table_rid, sc->msix_table);
+			sc->msix_table = NULL;
+			device_printf(dev, "MSI-X unavailable — children poll\n");
+		}
+	}
+
+	/*
+	 * The GPU (compute/render) and display engine are distinct IP blocks on
+	 * the one device (GFX + DCN). Expose each as a child so its driver is a
+	 * separate, independently-loadable kmod (§4.1). bus_generic_attach probes
+	 * them against whichever of atrium_gpu_amd.ko / atrium_gpu_amd_display.ko
+	 * are loaded.
+	 */
+	/*
+	 * Name each child after the driver that claims it: device_add_child sets
+	 * the child's devclass to this name, so only the driver of the same name
+	 * attaches (atrium_gpu_amd.ko → the gpu child, atrium_gpu_amd_display.ko →
+	 * the display child). A mismatched name = the child never attaches.
+	 */
+	child = device_add_child(dev, "atrium_gpu_amd", DEVICE_UNIT_ANY);
+	if (child == NULL)
+		device_printf(dev, "could not add atrium_gpu_amd child\n");
+	child = device_add_child(dev, "atrium_gpu_amd_display", DEVICE_UNIT_ANY);
+	if (child == NULL)
+		device_printf(dev, "could not add atrium_gpu_amd_display child\n");
+
+	bus_attach_children(dev);
+
+	device_printf(dev, "PCI base ready (BARs mapped; gpu/display children added)\n");
+	return (0);
+}
+
+static int
+atrium_amd_pci_detach(device_t dev)
+{
+	struct atrium_amd_softc *sc = device_get_softc(dev);
+	int err;
+
+	/* Children (gpu/display) detach first; they refuse if busy (open fds). */
+	err = bus_detach_children(dev);
+	if (err != 0)
+		return (err);
+	device_delete_children(dev);
+	atrium_amd_pci_teardown(sc);
+	return (0);
+}
+
+static device_method_t atrium_amd_pci_methods[] = {
+	DEVMETHOD(device_probe,		atrium_amd_pci_probe),
+	DEVMETHOD(device_attach,	atrium_amd_pci_attach),
+	DEVMETHOD(device_detach,	atrium_amd_pci_detach),
+
+	/* Bus passthrough so children can route resource/interrupt requests
+	 * (e.g. the GPU child's MSI-X) up to the real PCI bus. */
+	DEVMETHOD(bus_alloc_resource,	bus_generic_alloc_resource),
+	DEVMETHOD(bus_release_resource,	bus_generic_release_resource),
+	DEVMETHOD(bus_activate_resource, bus_generic_activate_resource),
+	DEVMETHOD(bus_deactivate_resource, bus_generic_deactivate_resource),
+	DEVMETHOD(bus_setup_intr,	bus_generic_setup_intr),
+	DEVMETHOD(bus_teardown_intr,	bus_generic_teardown_intr),
+	DEVMETHOD_END
+};
+
+static driver_t atrium_amd_pci_driver = {
+	"atrium_gpu_amd_pci",
+	atrium_amd_pci_methods,
+	sizeof(struct atrium_amd_softc),	/* the SHARED softc */
+};
+
+DRIVER_MODULE(atrium_gpu_amd_pci, pci, atrium_amd_pci_driver, NULL, NULL);
+MODULE_DEPEND(atrium_gpu_amd_pci, pci, 1, 1, 1);
+MODULE_VERSION(atrium_gpu_amd_pci, 1);

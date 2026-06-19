@@ -82,27 +82,21 @@ amd_teardown(struct atrium_amd_softc *sc)
 	for (i = 0; i < sc->n_dma; i++)
 		amd_dma_page_free(&sc->dma[i]);
 	sc->n_dma = 0;
-	if (sc->doorbell != NULL) {
-		bus_release_resource(sc->dev, SYS_RES_MEMORY,
-		    sc->doorbell_rid, sc->doorbell);
-		sc->doorbell = NULL;
-	}
-	if (sc->regs != NULL) {
-		bus_release_resource(sc->dev, SYS_RES_MEMORY, sc->regs_rid,
-		    sc->regs);
-		sc->regs = NULL;
-	}
-	if (sc->lock_inited) {
-		mtx_destroy(&sc->lock);
-		sc->lock_inited = 0;
-	}
+	/*
+	 * The BAR resources and the softc mutex belong to the base (pci) module
+	 * (it mapped them into the shared softc); it releases them on its own
+	 * detach. This GPU module only tears down what it set up.
+	 */
 }
 
 static int
 atrium_amd_probe(device_t dev)
 {
-	if (pci_get_vendor(dev) == ATRIUM_AMD_VENDOR &&
-	    pci_get_device(dev) == ATRIUM_AMD_DEVICE) {
+	const char *name = device_get_name(dev);
+
+	/* The base module names our child "atrium_gpu_amd" (our driver name), so
+	 * only we probe it; confirm + claim it. */
+	if (name != NULL && strcmp(name, "atrium_gpu_amd") == 0) {
 		device_set_desc(dev, "Atrium AMD RDNA4 GPU (gpusim)");
 		return (BUS_PROBE_DEFAULT);
 	}
@@ -129,39 +123,16 @@ amd_energy_budget_mw(void *arg, uint64_t mw)
 static int
 atrium_amd_attach(device_t dev)
 {
-	struct atrium_amd_softc *sc = device_get_softc(dev);
+	/*
+	 * The base (pci) module owns the device: it mapped the BARs into the
+	 * SHARED softc and set sc->dev to the PCI device. We attach to its
+	 * "atrium_gpu" child and do the GPU compute/render bring-up against that
+	 * shared softc (every helper takes `sc` and uses sc->dev, so they work
+	 * unchanged). BAR mapping + the softc mutex are the base module's.
+	 */
+	struct atrium_amd_softc *sc = device_get_softc(device_get_parent(dev));
 	uint32_t id, grbm;
 	int err;
-
-	sc->dev = dev;
-	sc->energy_member = -1;
-	mtx_init(&sc->lock, "atrium-gpu", NULL, MTX_DEF);
-	sc->lock_inited = 1;
-
-	/*
-	 * PCI bring-up gate (device-reference §2, §4; referee INV-PCI-0001/
-	 * 0002): the device faults DMA before Bus-Master-Enable and BAR access
-	 * before Memory-Space-Enable. pci_enable_busmaster() sets BME; allocating
-	 * a BAR with RF_ACTIVE enables memory-space decoding (MSE). This ordering
-	 * is load-bearing — the model unlocks the BARs only once COMMAND lands.
-	 */
-	pci_enable_busmaster(dev);
-
-	sc->regs_rid = ATRIUM_AMD_REGS_BAR;
-	sc->regs = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &sc->regs_rid,
-	    RF_ACTIVE);
-	if (sc->regs == NULL) {
-		device_printf(dev, "failed to map BAR5 (MMIO register file)\n");
-		return (ENXIO);
-	}
-	sc->doorbell_rid = ATRIUM_AMD_DOORBELL_BAR;
-	sc->doorbell = bus_alloc_resource_any(dev, SYS_RES_MEMORY,
-	    &sc->doorbell_rid, RF_ACTIVE);
-	if (sc->doorbell == NULL) {
-		device_printf(dev, "failed to map BAR2 (doorbell)\n");
-		amd_teardown(sc);
-		return (ENXIO);
-	}
 
 	/*
 	 * Identity probe: the SIM-aperture ID reads 'GPUS'. Before MSE took
@@ -267,6 +238,7 @@ static driver_t atrium_amd_driver = {
 	sizeof(struct atrium_amd_softc),
 };
 
-DRIVER_MODULE(atrium_gpu_amd, pci, atrium_amd_driver, NULL, NULL);
-MODULE_DEPEND(atrium_gpu_amd, pci, 1, 1, 1);
+/* Attach to the "atrium_gpu" child of the base (pci) module, not `pci`. */
+DRIVER_MODULE(atrium_gpu_amd, atrium_gpu_amd_pci, atrium_amd_driver, NULL, NULL);
+MODULE_DEPEND(atrium_gpu_amd, atrium_gpu_amd_pci, 1, 1, 1);
 MODULE_VERSION(atrium_gpu_amd, 1);
