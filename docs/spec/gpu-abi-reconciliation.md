@@ -155,10 +155,16 @@ the ABI reconciliation does not address what renders the frame.)
 ## 6. Phased migration plan
 
 1. **Lock the doc** (this file) + add supersession headers to the superseded specs.
-2. **`atrium-gpu-rs` → v2 `'A'`** (GPU side: fd BOs, VM, syncobj, submit, caps) against
-   the `atrium-gpu-amd` reference, verified by `atrium_gpu_test` parity in-VM.
-3. **`atrium-gpu-rs` display → offset model** (`Bo::export_scanout` + offset
-   `set_mode`/`page_flip`; `connector_id` kept). frescod drops `bind`.
+2. ✅ **`atrium-gpu-rs` → v2 `'A'`** (GPU side: fd BOs, VM, syncobj, submit, caps) against
+   the `atrium-gpu-amd` reference — DONE, verified in-VM by `amd_smoke` (caps TLV, compute
+   INC, syncobj-via-kqueue, display enum) against the real driver.
+3. ✅ **`atrium-gpu-rs` display → offset model** (`Bo::export_scanout` + offset
+   `set_mode`/`page_flip`) — DONE. Added `amd::Scanout` (System staging BO → CP `DMA_DATA`
+   → VRAM scanout BO → `{vram_offset,size}`); needed a multi-PT-page VM in the kmod
+   (`ATRIUM_AMD_VM_NUM_PT`=16, 32 MiB VA) so a full-screen staging+scanout pair fits.
+   Verified in-VM by `display_flip`. frescod's main path migrated (drops `bind`); the
+   `frescod_aqueduct`/`aqueduct_smoke` bins stay on `'G'` until D-3 (kqueue), so the legacy
+   `'G'` Display can't be retired yet.
 4. **`atrium-gpu-amd` v2 finish** (`BO_CREATE`/`QUEUE_CREATE`/share + caps-TLV align).
 5. **`atrium-virtio-gpu` → `'A'`** (the large port; gated on a virtio test target).
 6. **Display target evolution** (atomic-commit + kqueue vblank/flip-done + syncobj
