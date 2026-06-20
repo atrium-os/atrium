@@ -17,6 +17,10 @@
 
 pub mod abi;
 pub mod virtio_gpu;
+/// Canonical v2 GPU/display ABI binding (ioctl group `'A'`/`'D'`), the surface
+/// the from-scratch atrium-gpu-amd driver speaks. See `docs/spec/gpu-abi-reconciliation.md`.
+/// The handle-based `'G'` binding above is being migrated onto this.
+pub mod amd;
 
 use std::ffi::CString;
 use std::io;
