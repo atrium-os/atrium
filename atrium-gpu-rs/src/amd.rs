@@ -57,6 +57,14 @@ pub const BO_VRAM: u32 = 0x1;
 pub const ENGINE_GFX: u32 = 0;
 pub const ENGINE_COMPUTE: u32 = 1;
 
+// PM4 type-3 header + the one opcode the offset-model scanout path needs:
+// IT_DMA_DATA (CP DMA copy, memory<->memory) to blit a System staging BO into
+// the VRAM scanout BO (VRAM is GPU-only; only VRAM is scannable).
+const IT_DMA_DATA: u32 = 0x50;
+fn pm4_type3(opcode: u32, body_dwords: u32) -> u32 {
+    (3 << 30) | (((body_dwords - 1) & 0x3fff) << 16) | (opcode << 8)
+}
+
 #[repr(C)]
 #[derive(Default)]
 struct BoAlloc { size: u64, bo_fd: u32, flags: u32 }
@@ -301,6 +309,67 @@ impl<'a> Bo<'a> {
 }
 
 impl Drop for Bo<'_> { fn drop(&mut self) { unsafe { libc::close(self.fd) }; } }
+
+// ---------------------------------------------------------------------------
+// Scanout — the offset-model "CPU pixels -> onscreen" surface
+// ---------------------------------------------------------------------------
+
+/// A presentable framebuffer for the offset-model display (`'D'`).
+///
+/// CPU-rendered pixels can't be written into the scannable VRAM BO directly
+/// (VRAM is GPU-only), so a `Scanout` owns three BOs: a System **staging** BO
+/// (CPU-writable via `BO_WRITE`), a VRAM **scanout** BO (the only kind the
+/// display can scan), and a small **ring** BO. [`Scanout::update`] copies
+/// pixels into staging then issues a CP `DMA_DATA` blit into VRAM; the display
+/// is then driven by the exported `{vram_offset, size}` from [`Scanout::export`]
+/// — a dma-buf-style handle, never a BO handle.
+pub struct Scanout<'a> {
+    vm: &'a Vm<'a>,
+    staging: Bo<'a>,
+    vram: Bo<'a>,
+    ring: Bo<'a>,
+    vram_offset: u64,
+    size: u64,
+}
+
+impl<'a> Scanout<'a> {
+    /// Allocate the staging/VRAM/ring BOs for a `size`-byte framebuffer and
+    /// export the VRAM BO's scanout offset (stable for the surface's life).
+    pub fn new(vm: &'a Vm<'a>, size: u64) -> io::Result<Self> {
+        let staging = vm.alloc(size, 0)?; // System: CPU-writable
+        let vram = vm.alloc(size, BO_VRAM)?; // VRAM: scannable
+        let ring = vm.alloc(4096, 0)?;
+        let (vram_offset, exported) = vram.export_scanout()?;
+        Ok(Self { vm, staging, vram, ring, vram_offset, size: exported })
+    }
+
+    /// The `{vram_offset, size}` to hand to [`Display::set_mode`] / [`Display::page_flip`].
+    pub fn export(&self) -> (u64, u64) { (self.vram_offset, self.size) }
+
+    /// Upload CPU `pixels` (full framebuffer) into the VRAM scanout BO via a CP
+    /// DMA copy. `submit` runs the ring synchronously, so on return VRAM holds
+    /// the new frame and a subsequent `page_flip` is safe.
+    pub fn update(&self, pixels: &[u8]) -> io::Result<()> {
+        self.staging.write(0, pixels)?;
+        let src = self.staging.gpu_va();
+        let dst = self.vram.gpu_va();
+        let words: [u32; 7] = [
+            pm4_type3(IT_DMA_DATA, 6),
+            0,
+            (src & 0xffff_ffff) as u32,
+            (src >> 32) as u32,
+            (dst & 0xffff_ffff) as u32,
+            (dst >> 32) as u32,
+            pixels.len() as u32,
+        ];
+        let mut bytes = Vec::with_capacity(words.len() * 4);
+        for w in words {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        self.ring.write(0, &bytes)?;
+        self.vm.submit(&self.ring, words.len() as u32, ENGINE_GFX, None)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Syncobj — a timeline (its fd is kqueue-able)

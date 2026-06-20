@@ -76,11 +76,14 @@ amd_vm_destroy(struct atrium_amd_vm *vm)
 {
 	struct atrium_amd_softc *sc = vm->sc;
 
+	int i;
+
 	mtx_lock(&sc->lock);
 	sc->vmid_bitmap &= ~(1u << vm->vmid);
 	sc->vm_count--;
 	mtx_unlock(&sc->lock);
-	amd_dma_page_free(&vm->pt);
+	for (i = 0; i < ATRIUM_AMD_VM_NUM_PT; i++)
+		amd_dma_page_free(&vm->pt[i]);
 	amd_dma_page_free(&vm->pdb);
 	free(vm, M_DEVBUF);
 }
@@ -108,12 +111,14 @@ amd_vm_map(struct atrium_amd_vm *vm, uint64_t va, vm_paddr_t phys, int vram)
 	struct atrium_amd_softc *sc = vm->sc;
 	uint64_t pte;
 	uint64_t *pt;
-	uint32_t pt_i;
+	uint32_t pt_i, pd_i;
 
-	if (((va >> ATRIUM_AMD_PD_SHIFT) & ATRIUM_AMD_PT_MASK) != AMD_VM_PD_INDEX)
+	pd_i = (va >> ATRIUM_AMD_PD_SHIFT) & ATRIUM_AMD_PT_MASK;
+	if (pd_i < AMD_VM_PD_INDEX ||
+	    pd_i >= AMD_VM_PD_INDEX + ATRIUM_AMD_VM_NUM_PT)
 		return (EINVAL);
 	pt_i = (va >> ATRIUM_AMD_PT_SHIFT) & ATRIUM_AMD_PT_MASK;
-	pt = (uint64_t *)vm->pt.kva;
+	pt = (uint64_t *)vm->pt[pd_i - AMD_VM_PD_INDEX].kva;
 	/* phys is a guest-physical (System) addr or a VRAM offset; the PTE_VRAM
 	 * bit tells the GMC which backing to walk. */
 	pte = ((uint64_t)phys & ~0xfffULL) | ATRIUM_AMD_PTE_VALID;
@@ -131,12 +136,14 @@ amd_vm_unmap(struct atrium_amd_vm *vm, uint64_t va)
 {
 	struct atrium_amd_softc *sc = vm->sc;
 	uint64_t *pt;
-	uint32_t pt_i;
+	uint32_t pt_i, pd_i;
 
-	if (((va >> ATRIUM_AMD_PD_SHIFT) & ATRIUM_AMD_PT_MASK) != AMD_VM_PD_INDEX)
+	pd_i = (va >> ATRIUM_AMD_PD_SHIFT) & ATRIUM_AMD_PT_MASK;
+	if (pd_i < AMD_VM_PD_INDEX ||
+	    pd_i >= AMD_VM_PD_INDEX + ATRIUM_AMD_VM_NUM_PT)
 		return;
 	pt_i = (va >> ATRIUM_AMD_PT_SHIFT) & ATRIUM_AMD_PT_MASK;
-	pt = (uint64_t *)vm->pt.kva;
+	pt = (uint64_t *)vm->pt[pd_i - AMD_VM_PD_INDEX].kva;
 	mtx_lock(&sc->lock);
 	pt[pt_i] = 0;
 	amd_mmio_write32(sc, regTLB_INVALIDATE, 1);
@@ -155,7 +162,7 @@ amd_vm_create_fd(struct atrium_amd_softc *sc, struct thread *td, int *out_fd)
 	struct file *fp;
 	uint64_t *pde;
 	uint16_t vmid;
-	int fd, err;
+	int fd, err, i;
 
 	err = amd_vmid_alloc(sc, &vmid);
 	if (err != 0)
@@ -164,13 +171,22 @@ amd_vm_create_fd(struct atrium_amd_softc *sc, struct thread *td, int *out_fd)
 	vm = malloc(sizeof(*vm), M_DEVBUF, M_WAITOK | M_ZERO);
 	vm->sc = sc;
 	vm->vmid = vmid;
-	if (amd_dma_page_alloc(sc, &vm->pdb) != 0 ||
-	    amd_dma_page_alloc(sc, &vm->pt) != 0) {
+	if (amd_dma_page_alloc(sc, &vm->pdb) != 0) {
 		amd_vm_destroy(vm);
 		return (ENOMEM);
 	}
-	pde = (uint64_t *)((char *)vm->pdb.kva + AMD_VM_PD_INDEX * 8);
-	*pde = (vm->pt.gpa & ~0xfffULL) | ATRIUM_AMD_PTE_VALID;
+	/* A contiguous run of NUM_PT page-table pages, each wired into its own
+	 * page-directory entry (PD indices AMD_VM_PD_INDEX .. +NUM_PT-1), so the
+	 * bump allocator spans NUM_PT * 2 MiB of VA. */
+	for (i = 0; i < ATRIUM_AMD_VM_NUM_PT; i++) {
+		if (amd_dma_page_alloc(sc, &vm->pt[i]) != 0) {
+			amd_vm_destroy(vm);
+			return (ENOMEM);
+		}
+		pde = (uint64_t *)((char *)vm->pdb.kva +
+		    (AMD_VM_PD_INDEX + i) * 8);
+		*pde = (vm->pt[i].gpa & ~0xfffULL) | ATRIUM_AMD_PTE_VALID;
+	}
 	vm->next_va = ATRIUM_AMD_BO_VA_BASE;
 
 	/* Program this VMID's page-directory base into the device. */

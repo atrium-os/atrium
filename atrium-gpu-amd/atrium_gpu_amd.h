@@ -224,12 +224,16 @@
 
 /*
  * Per-VM GPU-VA bump allocator: each address space places BOs at BO_VA_BASE,
- * BO_VA_BASE+page, ... within one page-directory entry's 2 MiB span (512
- * pages = one pre-allocated page-table page). Two VMs both start at BO_VA_BASE,
- * so the same VA in different VMs resolves to different memory — isolation.
+ * BO_VA_BASE+page, ... across a contiguous run of NUM_PT page-directory
+ * entries (NUM_PT * 512 pages, NUM_PT pre-allocated page-table pages). Two VMs
+ * both start at BO_VA_BASE, so the same VA in different VMs resolves to
+ * different memory — isolation. NUM_PT is sized so a full-screen offset-model
+ * scanout (System staging BO + VRAM scanout BO, both framebuffer-sized) fits:
+ * 16 PT pages = 8192 pages = 32 MiB of VA, room for a 1080p staging/scanout pair.
  */
 #define ATRIUM_AMD_BO_VA_BASE	0x10000000ULL
-#define ATRIUM_AMD_VM_MAX_BO	512	/* BOs per VM (one PT page) */
+#define ATRIUM_AMD_VM_NUM_PT	16	/* page-table pages per VM */
+#define ATRIUM_AMD_VM_MAX_BO	(512 * ATRIUM_AMD_VM_NUM_PT) /* VA pages per VM */
 #define ATRIUM_AMD_MAX_VMID	16	/* hardware contexts; 1..15 for user VMs */
 
 /* Internal DMA-page registry (the IH ring; page tables are now per-VM). */
@@ -269,7 +273,7 @@ struct atrium_amd_vm {
 	struct file	*fp;		/* our own file (for KASSERT/debug) */
 	uint16_t	 vmid;		/* 1..15 */
 	struct atrium_amd_dma_page pdb;	/* page-directory page */
-	struct atrium_amd_dma_page pt;	/* the single pre-allocated page-table page */
+	struct atrium_amd_dma_page pt[ATRIUM_AMD_VM_NUM_PT]; /* page-table pages */
 	uint64_t	 next_va;	/* bump allocator within this VM */
 };
 
