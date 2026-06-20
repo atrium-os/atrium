@@ -331,6 +331,21 @@ atrium_gpu_amd_display_load="YES"
 
 Note: the gpusim *model* keeps per-device counters across `atrium_gpu_test` invocations within one boot (irq count, sched queue count, …), so re-running in the same boot inflates `irq`/`sched` counts; re-verify after a clean restart (`echo quit|nc -U /tmp/qmp.sock`, restart `gpusim-server`, `run-vm.sh --gpusim`).
 
+#### In-VM build/load gotchas (learned the hard way 2026-06-20)
+
+Iterating on this kmod hit four traps, each costing a long detour. Avoid them:
+
+- **Stale 9p builds — `make` over `/mnt/host` can silently NOT rebuild.** A `cd /mnt/host/atrium-gpu-amd && make clean && make` can leave the OLD `.ko` (stale `.o`/`.depend`, host/guest clock skew over 9p), and `make` prints nothing so it looks fine. Symptom that bit us: the loaded gpu driver kept an *old* `DRIVER_MODULE(atrium_gpu_amd, **pci**, …)` even though current source says parent `atrium_gpu_amd_pci`. **Reliable build = copy source to a VM-local dir over SSH (not 9p) and clean-build there:**
+  ```sh
+  tar -C ~/src/bsd/atrium-gpu-amd -cf - . | \
+    ssh -p 2222 root@localhost 'rm -rf /root/agpu-build && mkdir /root/agpu-build && tar -C /root/agpu-build -xf -'
+  vssh 'cd /root/agpu-build/gpu && rm -f *.o && make clean && make'   # then cp .ko to /boot/modules
+  ```
+  Always confirm the new `.ko` mtime/size actually changed.
+- **The "boot race" where only one of `/dev/atrium-gpu0` / `/dev/atrium-display0` appears was NOT a real race** — it was a stale build: the old gpu driver registered on parent bus `pci`, so it and `atrium_gpu_amd_pci` *both* probed the raw `0x1002:0x7550` device, and whichever won decided which child went missing. **Diagnose with `kldstat -v | grep atrium`:** the gpu line must read `atrium_gpu_amd_pci/atrium_gpu_amd` (parentbus/driver). If it reads `pci/atrium_gpu_amd`, you're running a stale build — rebuild as above. With a correct build both nodes attach on every boot.
+- **`kldunload atrium_gpu_amd; kldload …` breaks device open.** After a live reload, opening `/dev/atrium-gpu0` faults in-kernel (softc not re-established on re-attach) — even the known-good `amd_smoke`/`atrium_gpu_test` then fail at `open()`. To test a new `.ko`, install it to `/boot/modules/atrium_gpu_amd.ko` and **`reboot`** (fresh load); don't reload live.
+- **p9fs panics under heavy concurrent 9p I/O** (`p9fs_pbuf_zone` in `VOP_OPEN` → `vm_fault` → panic → `db>`). Build+`cp` over 9p at once can trip it. Prefer `scp -P 2222` for binaries over `cp /mnt/host/...`; if the VM goes unreachable, check for a wedged debugger via the serial console (`nc 127.0.0.1 4444`, then `bt` / `show pcpu`).
+
 #### ddb over QEMU TCP serial (added 2026-05-01)
 
 The historical claim "kdb isn't reachable" no longer holds. `scripts/run-vm.sh` now exposes the serial console on `tcp:127.0.0.1:4444` and the QEMU monitor on `unix:/tmp/qmp.sock`. The stock GENERIC kernel running in the VM has `KDB`, `DDB`, `INVARIANTS`, `WITNESS`, `GDB`, and `KDB_TRACE` compiled in — no rebuild needed.
