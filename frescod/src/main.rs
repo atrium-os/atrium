@@ -8,9 +8,9 @@
 //!   ↓ (extract_rect_nodes / extract_texture_batches, merged in z-order)
 //!   fresco_vulkan::HeadlessRenderer (compute + indirect draw)
 //!   ↓ (read_pixels, BGRA8)
-//!   atrium_gpu::Bo (scanout BO mapped CPU-visible)
-//!   ↓
-//!   atrium_gpu::Display::page_flip
+//!   atrium_gpu::amd::Scanout (CPU staging BO -> CP DMA -> VRAM scanout BO)
+//!   ↓ ({vram_offset, size})
+//!   atrium_gpu::amd::Display::page_flip
 //!
 //! The legacy tiny-skia / 128-byte / CommandFrontend path was removed
 //! at the M2.7 cutover. Today this binary is single-display, runs at
@@ -29,8 +29,7 @@ mod laminar;
 mod pointer_reader;
 mod socket_server;
 
-use atrium_gpu::abi::*;
-use atrium_gpu::{Display, Gpu};
+use atrium_gpu::amd::{Display, Gpu, Scanout};
 
 use fresco_protocol::{PathParams, RectParams, TextureParams};
 use fresco_scene_server::cas::store::CasStore;
@@ -61,25 +60,28 @@ fn main() -> std::io::Result<()> {
         return run_headless(&png);
     }
 
-    /* ── Display + scanout BO ─────────────────────────────────────── */
+    /* ── Display + scanout (canonical v2 'A'/'D', offset model) ──────
+     * No bind: the GPU and display are decoupled. The compositor renders
+     * into a Scanout (System staging BO -> CP DMA copy -> VRAM scanout BO),
+     * then drives the display by the exported {vram_offset, size}. */
     let gpu = Gpu::open()?;
+    let vm = gpu.create_vm()?;
     let dpy = Display::open()?;
-    dpy.bind(&gpu)?;
 
-    let connectors = dpy.connectors()?;
-    let conn = connectors.first().expect("at least one connector").clone();
-    let mode = dpy.preferred_mode(conn.id)?;
+    let conn = dpy.connector()?;
+    let modes = dpy.modes()?;
+    let mode = *modes.first().expect("at least one mode");
     eprintln!(
-        "frescod: connector {} {}x{} @ {} mHz, target {} fps",
-        conn.id, mode.width, mode.height, mode.refresh_mhz, TARGET_FPS,
+        "frescod: connector type {} {}x{} @ {} mHz, target {} fps",
+        conn.connector_type, mode.width, mode.height, mode.refresh_mhz, TARGET_FPS,
     );
 
     let bytes = u64::from(mode.width) * u64::from(mode.height) * 4;
-    let flags = ATRIUM_GPU_BO_GPU_VISIBLE
-        | ATRIUM_GPU_BO_CPU_VISIBLE
-        | ATRIUM_GPU_BO_COHERENT
-        | ATRIUM_GPU_BO_SCANOUT;
-    let mut bo = gpu.alloc(bytes, flags)?;
+    let scan = Scanout::new(&vm, bytes)?;
+    let (scan_off, scan_size) = scan.export();
+    /* Reusable CPU framebuffer the renderer paints into each frame, then
+     * uploaded into the VRAM scanout via scan.update (DMA copy). */
+    let mut framebuffer = vec![0u8; bytes as usize];
 
     /* ── Vulkan renderer ─────────────────────────────────────────── */
     let mut renderer = HeadlessRenderer::new(mode.width, mode.height)
@@ -138,17 +140,19 @@ fn main() -> std::io::Result<()> {
     /* First frame: render once + SET_MODE before flipping. */
     render_one_frame(&mut renderer, &frontend, &comp, mode.width, mode.height)
         .map_err(io_other)?;
-    copy_renderer_to_bo(&renderer, &mut bo).map_err(io_other)?;
-    dpy.set_mode(conn.id, &bo, mode)?;
-    dpy.page_flip(conn.id, &bo)?;
+    fill_framebuffer(&renderer, &mut framebuffer).map_err(io_other)?;
+    scan.update(&framebuffer).map_err(io_other)?;
+    check_fault("set_mode", dpy.set_mode(scan_off, scan_size)?)?;
+    check_fault("page_flip", dpy.page_flip(scan_off, scan_size, true)?)?;
     frame += 1;
 
     let mut next = Instant::now() + Duration::from_nanos(FRAME_NS);
     loop {
         render_one_frame(&mut renderer, &frontend, &comp, mode.width, mode.height)
             .map_err(io_other)?;
-        copy_renderer_to_bo(&renderer, &mut bo).map_err(io_other)?;
-        dpy.page_flip(conn.id, &bo)?;
+        fill_framebuffer(&renderer, &mut framebuffer).map_err(io_other)?;
+        scan.update(&framebuffer).map_err(io_other)?;
+        check_fault("page_flip", dpy.page_flip(scan_off, scan_size, true)?)?;
         frame = frame.wrapping_add(1);
         let _ = frame;
 
@@ -355,16 +359,25 @@ fn translate_path(p: &PathParams, ox: f32, oy: f32) -> PathNode {
     }
 }
 
-/// Pull the rendered framebuffer out of `renderer` (BGRA8) and copy
-/// directly into the scanout BO. The kmod's scanout format is BGRA8 —
-/// matching HeadlessRenderer's color attachment — so this is a memcpy.
-fn copy_renderer_to_bo(
+/// Pull the rendered framebuffer out of `renderer` (BGRA8) into the CPU
+/// staging buffer. The display's scanout format is BGRA8 — matching
+/// HeadlessRenderer's color attachment — so this is a straight read. The
+/// buffer is then DMA-copied into the VRAM scanout BO by `Scanout::update`.
+fn fill_framebuffer(
     renderer: &HeadlessRenderer,
-    bo:       &mut atrium_gpu::Bo,
+    dst:      &mut [u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let dst = bo.as_mut_slice();
     renderer.read_pixels(dst)?;
     Ok(())
+}
+
+/// A non-zero display fault code (from SET_MODE / PAGE_FLIP) is an error.
+fn check_fault(op: &str, fault: u32) -> std::io::Result<()> {
+    if fault != 0 {
+        Err(io_other(format!("display {op} fault={fault}")))
+    } else {
+        Ok(())
+    }
 }
 
 /// Discover bundles to load. atrium-core is mandatory; atrium-text is
