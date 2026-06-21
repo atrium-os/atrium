@@ -120,13 +120,18 @@ static void
 amd_bo_destroy(struct atrium_amd_bo *bo, struct thread *td)
 {
 	struct atrium_amd_softc *sc = bo->sc;
-	int i;
+	int b, i;
 
-	if (bo->vm != NULL)
+	/* Tear down every VM this BO is bound into: clear its PTEs there (so no VM
+	 * is left with a translation to about-to-be-freed pages) and drop the held
+	 * reference that kept that VM alive. */
+	for (b = 0; b < bo->n_bindings; b++) {
+		struct atrium_amd_bo_binding *bd = &bo->bindings[b];
+
 		for (i = 0; i < bo->npages; i++)
-			amd_vm_unmap(bo->vm, bo->gpu_va + (uint64_t)i * PAGE_SIZE);
-	if (bo->vm_fp != NULL)
-		fdrop(bo->vm_fp, td);
+			amd_vm_unmap(bd->vm, bd->gpu_va + (uint64_t)i * PAGE_SIZE);
+		fdrop(bd->vm_fp, td);
+	}
 	mtx_lock(&sc->lock);
 	sc->bo_count--;
 	mtx_unlock(&sc->lock);
@@ -259,7 +264,7 @@ amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, uint64_t size,
 	bo->dmat = dmat;
 	bo->dmamap = dmamap;
 	bo->size = size;
-	/* bo->vm / vm_fp / gpu_va stay NULL/0 until bound. */
+	/* bo->bindings / n_bindings stay zeroed (M_ZERO) until the BO is bound. */
 
 	load.pages = bo->pages;
 	load.npages = 0;
@@ -295,10 +300,22 @@ install:
 }
 
 /*
- * Map an unbound BO into `vm` at *va (0 = pick the VM's next bump VA). On
- * success the BO records the mapping and takes over `vm_fp` (released when the
- * BO is freed, so the VM outlives it); on error the caller keeps vm_fp.
+ * Bind a BO into `vm` at *va (0 = pick the VM's next bump VA), adding one more
+ * binding (a BO may be bound into up to ATRIUM_AMD_BO_MAX_BIND VMs at once — the
+ * sharing path). On success the new binding takes over `vm_fp` (released when
+ * the BO is freed, so every bound VM outlives it); on error the caller keeps it.
  */
+uint64_t
+amd_bo_gpu_va(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm)
+{
+	int b;
+
+	for (b = 0; b < bo->n_bindings; b++)
+		if (bo->bindings[b].vm == vm)
+			return (bo->bindings[b].gpu_va);
+	return (0);	/* not bound in this vm */
+}
+
 int
 amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
     struct file *vm_fp, uint64_t *va)
@@ -310,8 +327,8 @@ amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
 	uint64_t addr;
 	int i, err;
 
-	if (bo->vm != NULL)
-		return (EBUSY);	/* already bound (one binding per BO for now) */
+	if (bo->n_bindings >= ATRIUM_AMD_BO_MAX_BIND)
+		return (ENOSPC);	/* shared into too many VMs */
 
 	mtx_lock(&sc->lock);
 	if (*va != 0) {
@@ -326,7 +343,8 @@ amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
 	mtx_unlock(&sc->lock);
 
 	/* One PTE per page — the GPUVM gathers the BO's (possibly scattered) pages
-	 * into a contiguous GPU-VA range. */
+	 * into a contiguous GPU-VA range. Each VM has its own page tables, so the
+	 * same pages can map at independent VAs in different VMs. */
 	for (i = 0; i < bo->npages; i++) {
 		err = amd_vm_map(vm, addr + (uint64_t)i * PAGE_SIZE, bo->pages[i],
 		    bo->vram);
@@ -337,9 +355,10 @@ amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
 		}
 	}
 
-	bo->vm = vm;
-	bo->vm_fp = vm_fp;
-	bo->gpu_va = addr;
+	bo->bindings[bo->n_bindings].vm = vm;
+	bo->bindings[bo->n_bindings].vm_fp = vm_fp;
+	bo->bindings[bo->n_bindings].gpu_va = addr;
+	bo->n_bindings++;
 	*va = addr;
 	return (0);
 }

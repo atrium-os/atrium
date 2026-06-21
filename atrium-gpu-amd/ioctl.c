@@ -140,10 +140,12 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 			fdrop(vmfp, td);
 			return (err);
 		}
-		if (bo->vm == NULL)	/* ring must be bound to have a GPU-VA */
+		uint64_t ring_va = amd_bo_gpu_va(bo, vm);
+
+		if (ring_va == 0)	/* ring must be bound in THIS vm for a GPU-VA */
 			err = EINVAL;
 		else
-			err = amd_queue_program(sc, bo->gpu_va, m->engine,
+			err = amd_queue_program(sc, ring_va, m->engine,
 			    vm->vmid, &doorbell_off);
 		fdrop(bofp, td);
 		fdrop(vmfp, td);
@@ -327,7 +329,7 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 			}
 			if (err == 0)
 				err = amd_submit(sc, bo, s->n_dwords,
-				    s->engine, vm->vmid);
+				    s->engine, vm);
 			/* Submit never reached the GPU -> reclaim the entry. */
 			if (err != 0 && so != NULL)
 				amd_pending_scrub(sc, so);

@@ -60,12 +60,16 @@ amd_queue_program(struct atrium_amd_softc *sc, uint64_t ring_va,
 
 int
 amd_submit(struct atrium_amd_softc *sc, struct atrium_amd_bo *ring,
-    uint32_t n_dwords, uint32_t engine, uint16_t vmid)
+    uint32_t n_dwords, uint32_t engine, struct atrium_amd_vm *vm)
 {
 	uint32_t doorbell_off;
+	uint64_t ring_va;
 	int err;
 
-	err = amd_queue_program(sc, ring->gpu_va, engine, vmid, &doorbell_off);
+	ring_va = amd_bo_gpu_va(ring, vm);	/* the ring's VA in the submit VM */
+	if (ring_va == 0)
+		return (EINVAL);		/* ring not bound in this VM */
+	err = amd_queue_program(sc, ring_va, engine, vm->vmid, &doorbell_off);
 	if (err != 0)
 		return (err);
 	bus_write_4(sc->doorbell, doorbell_off, n_dwords);

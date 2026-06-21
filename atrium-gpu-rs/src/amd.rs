@@ -240,6 +240,18 @@ impl<'a> Vm<'a> {
         Ok(Bo { gpu: self.gpu, fd: a.bo_fd as RawFd, gpu_va: b.va, size })
     }
 
+    /// Bind a BO obtained from elsewhere — a `bo_fd` passed in via SCM_RIGHTS
+    /// (BOs are `DFLAG_PASSABLE`) or `dup`'d locally — into this VM, sharing the
+    /// same underlying memory. This is the cross-address-space sharing path
+    /// (e.g. a compositor importing a client's buffer): the BO is independent of
+    /// any VM (ABI-v2), so the same object maps into many VMs at independent
+    /// GPU-VAs. Takes ownership of `bo_fd` (closed on drop).
+    pub fn import(&self, bo_fd: RawFd, size: u64) -> io::Result<Bo<'a>> {
+        let mut b = VmBind { va: 0, vm_fd: self.fd as u32, bo_fd: bo_fd as u32 };
+        unsafe { call(self.gpu.fd, iowr(G, 13, std::mem::size_of::<VmBind>()), &mut b)? };
+        Ok(Bo { gpu: self.gpu, fd: bo_fd, gpu_va: b.va, size })
+    }
+
     /// Submit a PM4 ring (already laid into `ring`) on an engine, optionally
     /// signalling `signal` (a syncobj + value) on completion.
     pub fn submit(
@@ -274,6 +286,11 @@ pub struct Bo<'a> { gpu: &'a Gpu, fd: RawFd, gpu_va: u64, size: u64 }
 impl<'a> Bo<'a> {
     pub fn gpu_va(&self) -> u64 { self.gpu_va }
     pub fn size(&self) -> u64 { self.size }
+
+    /// The BO's fd — pass it via SCM_RIGHTS (or `dup`) to share this buffer with
+    /// another VM/process, which binds it with [`Vm::import`]. Borrowed: this Bo
+    /// keeps ownership.
+    pub fn as_raw_fd(&self) -> RawFd { self.fd }
 
     /// Copy `data` into the BO at `offset` (System BOs; VRAM BOs are GPU-only).
     pub fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {

@@ -280,17 +280,29 @@ struct atrium_amd_vm {
 /*
  * A buffer object: a DMA page mapped into a VM's GPUVM and exposed to userspace
  * as a file descriptor (fd-as-handle — ABI-v2 principle 2). Lifetime is the fd
- * refcount; the BO owns its own page and holds a reference (vm_fp) on the VM it
- * is mapped in, so fo_close can unmap from that VM.
+ * refcount; the BO owns its own pages and is independent of any VM (ABI-v2
+ * principle 4), so the SAME object can be bound into several VMs at once — the
+ * cross-address-space sharing path (a compositor importing a client's buffer).
+ * Each binding holds a reference (vm_fp) on its VM, so every VM the BO is mapped
+ * into outlives the BO and fo_close can unmap from all of them.
  */
 #define ATRIUM_AMD_BO_MAX_PAGES	512	/* largest BO = 2 MiB; a 640x480x4 scanout
 					 * FB is 300 pages, so a display FB must
 					 * fit (small GPU BOs use a handful). */
+#define ATRIUM_AMD_BO_MAX_BIND	8	/* VMs a BO can be shared into at once */
+
+/* One mapping of a BO into a VM: its address space, a held ref on it, and the
+ * base GPU-VA the BO occupies there (each VM assigns its own VA). */
+struct atrium_amd_bo_binding {
+	struct atrium_amd_vm *vm;
+	struct file	*vm_fp;		/* held reference keeping that vm alive */
+	uint64_t	 gpu_va;	/* base GPU-VA of the BO in that vm */
+};
 
 struct atrium_amd_bo {
 	struct atrium_amd_softc *sc;
-	struct atrium_amd_vm *vm;	/* the address space this BO is mapped in */
-	struct file	*vm_fp;		/* held reference keeping vm alive */
+	struct atrium_amd_bo_binding bindings[ATRIUM_AMD_BO_MAX_BIND];
+	int		 n_bindings;	/* VMs this BO is currently bound into */
 	void		*kva;		/* CPU mapping (bus_dmamem, page-contiguous) */
 	bus_dma_tag_t	 dmat;		/* per-BO DMA tag */
 	bus_dmamap_t	 dmamap;	/* the BO's DMA mapping */
@@ -298,7 +310,6 @@ struct atrium_amd_bo {
 	int		 vram;		/* 1 = VRAM-resident (pages[] are VRAM offsets,
 					 * no kva/dmat); 0 = System/GTT (bus_dma) */
 	bus_addr_t	 pages[ATRIUM_AMD_BO_MAX_PAGES]; /* per-page bus addrs / VRAM offsets */
-	uint64_t	 gpu_va;
 	uint64_t	 size;
 };
 
@@ -401,10 +412,13 @@ int	 amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td,
 	    uint64_t size, uint32_t flags, int *out_fd);
 int	 amd_bo_fget(struct thread *td, int fd, struct file **out_fp,
 	    struct atrium_amd_bo **out_bo);
-/* Map an unbound BO into `vm` at *va (0 = auto). On success the BO takes over
- * vm_fp; on error the caller keeps it. */
+/* Bind a BO into `vm` at *va (0 = auto), adding a binding (a BO may be bound
+ * into several VMs — sharing). On success the binding takes over vm_fp; on error
+ * the caller keeps it. */
 int	 amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
 	    struct file *vm_fp, uint64_t *va);
+/* The BO's base GPU-VA in `vm`, or 0 if it is not bound there. */
+uint64_t amd_bo_gpu_va(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm);
 extern const struct fileops atrium_amd_bo_fileops;
 
 /* vm.c — per-process GPU address spaces (fd-backed) + GPUVM page tables */
@@ -427,7 +441,7 @@ void	 amd_mes_init(struct atrium_amd_softc *sc);
 
 /* cp.c — submission (under a VM's VMID) */
 int	 amd_submit(struct atrium_amd_softc *sc, struct atrium_amd_bo *ring,
-	    uint32_t n_dwords, uint32_t engine, uint16_t vmid);
+	    uint32_t n_dwords, uint32_t engine, struct atrium_amd_vm *vm);
 int	 amd_queue_program(struct atrium_amd_softc *sc, uint64_t ring_va,
 	    uint32_t engine, uint16_t vmid, uint32_t *doorbell_off);
 
