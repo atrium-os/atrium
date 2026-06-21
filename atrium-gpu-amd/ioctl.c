@@ -349,7 +349,17 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		uint32_t feat = ATRIUM_GPU_FEAT_GRAPHICS |
 		    ATRIUM_GPU_FEAT_COMPUTE | ATRIUM_GPU_FEAT_USER_QUEUES |
 		    ATRIUM_GPU_FEAT_SYNCOBJ | ATRIUM_GPU_FEAT_VM_BIND;
-		uint8_t buf[128];
+		struct atrium_gpu_cap_address_space as = {
+			.va_base = ATRIUM_AMD_BO_VA_BASE,
+			.va_size = (uint64_t)ATRIUM_AMD_VM_MAX_BO * PAGE_SIZE,
+			.va_align = PAGE_SIZE,
+		};
+		struct atrium_gpu_heap_info heaps[2] = {
+			{ .kind = ATRIUM_GPU_HEAP_DEVICE, .flags = 0,
+			  .size = ATRIUM_AMD_VRAM_BYTES },
+			{ .kind = ATRIUM_GPU_HEAP_SYSTEM, .flags = 0, .size = 0 },
+		};
+		uint8_t buf[256];
 		size_t off = 0;
 
 		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_ABI_VERSION, ver,
@@ -358,6 +368,10 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		    sizeof(vendor));
 		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_FEATURES, &feat,
 		    sizeof(feat));
+		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_ADDRESS_SPACE, &as,
+		    sizeof(as));
+		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_HEAPS, heaps,
+		    sizeof(heaps));
 
 		if (q->caps_size < off) {
 			q->caps_size = off;	/* tell userspace the size needed */

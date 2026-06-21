@@ -52,6 +52,16 @@ fn run() -> io::Result<()> {
         "caps OK: \"{}\" abi {}.{} features {:#x}",
         caps.vendor, caps.abi_major, caps.abi_minor, caps.features
     );
+    eprintln!(
+        "  address-space: va_base={:#x} va_size={} MiB va_align={}; vram={} MiB",
+        caps.va_base,
+        caps.va_size / (1 << 20),
+        caps.va_align,
+        caps.vram_bytes / (1 << 20),
+    );
+    if caps.va_size == 0 || caps.vram_bytes == 0 {
+        return Err(io::Error::other("caps: missing address-space/heap records"));
+    }
 
     let vm = gpu.create_vm()?;
 

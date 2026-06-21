@@ -161,6 +161,14 @@ pub struct Caps {
     pub abi_minor: u32,
     pub vendor: String,
     pub features: u32,
+    /// Per-VM GPU virtual-address window (CAP_ADDRESS_SPACE): bind VAs live in
+    /// `va_base .. va_base+va_size`, `va_align`-aligned. Size allocations to this
+    /// rather than discovering the limit via ENOSPC.
+    pub va_base: u64,
+    pub va_size: u64,
+    pub va_align: u64,
+    /// Device-local VRAM heap size in bytes (CAP_HEAPS, the DEVICE heap).
+    pub vram_bytes: u64,
 }
 
 impl Gpu {
@@ -195,6 +203,21 @@ impl Gpu {
                 }
                 3 if data.len() >= 4 => {
                     caps.features = u32::from_le_bytes(data[0..4].try_into().unwrap());
+                }
+                4 if data.len() >= 24 => {
+                    caps.va_base = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                    caps.va_size = u64::from_le_bytes(data[8..16].try_into().unwrap());
+                    caps.va_align = u64::from_le_bytes(data[16..24].try_into().unwrap());
+                }
+                5 => {
+                    // array of heap_info { u32 kind, u32 flags, u64 size }; take
+                    // the DEVICE (VRAM) heap's size.
+                    for h in data.chunks_exact(16) {
+                        let kind = u32::from_le_bytes(h[0..4].try_into().unwrap());
+                        if kind == 0 {
+                            caps.vram_bytes = u64::from_le_bytes(h[8..16].try_into().unwrap());
+                        }
+                    }
                 }
                 _ => {}
             }

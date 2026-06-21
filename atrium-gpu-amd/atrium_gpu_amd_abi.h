@@ -42,6 +42,28 @@ struct atrium_gpu_cap_record {
 #define ATRIUM_GPU_CAP_ABI_VERSION	1	/* data: u32 major, u32 minor */
 #define ATRIUM_GPU_CAP_VENDOR		2	/* data: NUL-terminated string */
 #define ATRIUM_GPU_CAP_FEATURES		3	/* data: u32 ATRIUM_GPU_FEAT_* bitmap */
+#define ATRIUM_GPU_CAP_ADDRESS_SPACE	4	/* data: struct atrium_gpu_cap_address_space */
+#define ATRIUM_GPU_CAP_HEAPS		5	/* data: struct atrium_gpu_heap_info[] */
+
+/*
+ * ADDRESS_SPACE — the per-VM GPU virtual-address window a BO can be bound into,
+ * so userspace sizes allocations to it instead of discovering the limit by
+ * ENOSPC. va_base..va_base+va_size is biddable; bind VAs are va_align-aligned.
+ */
+struct atrium_gpu_cap_address_space {
+	uint64_t	va_base;
+	uint64_t	va_size;
+	uint64_t	va_align;
+};
+
+/* HEAPS — one record per memory pool the device exposes. */
+#define ATRIUM_GPU_HEAP_DEVICE	0	/* device-local VRAM */
+#define ATRIUM_GPU_HEAP_SYSTEM	1	/* host/System (GTT) memory */
+struct atrium_gpu_heap_info {
+	uint32_t	kind;	/* ATRIUM_GPU_HEAP_* */
+	uint32_t	flags;	/* reserved (0) */
+	uint64_t	size;	/* bytes; 0 = host-bounded (System) */
+};
 
 #define ATRIUM_GPU_FEAT_GRAPHICS	(1u << 0)
 #define ATRIUM_GPU_FEAT_COMPUTE		(1u << 1)
