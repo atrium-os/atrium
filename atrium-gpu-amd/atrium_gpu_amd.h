@@ -141,6 +141,7 @@
 #define regDISP_DPTRAIN_RUN	0x30064	/* w1: run link training */
 #define regDISP_DPTRAIN_BW_MBPS	0x30068	/* r: trained bandwidth (MB/s) */
 #define regDISP_DPTRAIN_TRAINED	0x3006c	/* r: 1 = a link trained */
+#define regDISP_VBLANK_IRQ_EN	0x30070	/* w: 1 = raise an IH interrupt each vblank (DCN-like) */
 #define regDISP_VBLANK_COUNT	0x30020	/* r: vblanks elapsed */
 #define regDISP_DROPPED_FLIPS	0x30024	/* r: flips dropped by the depth-1 queue */
 #define regDISP_FAULT		0x30028	/* r: last DisplayFault code (0 = none) */
@@ -420,6 +421,7 @@ struct atrium_amd_pending {
 };
 #define ATRIUM_AMD_MAX_PENDING	16
 #define ATRIUM_AMD_IH_CAUSE_EOP	1	/* IH cookie cause: end-of-pipe (device.rs) */
+#define ATRIUM_AMD_IH_CAUSE_VBLANK 2	/* IH cookie cause: DCN vertical blank */
 
 struct atrium_amd_softc {
 	device_t	 dev;

@@ -34,6 +34,12 @@ amd_intr(void *arg)
 		    idx * ATRIUM_AMD_IH_COOKIE);
 		if (cookie[0] == ATRIUM_AMD_IH_CAUSE_EOP)
 			eops++;		/* each end-of-pipe cookie = one completion */
+		/*
+		 * ATRIUM_AMD_IH_CAUSE_VBLANK (DCN vertical blank, display-armed) is
+		 * recognized and acknowledged by draining it here; it retires no
+		 * syncobj. Its arrival is observable via irq_count (GET_IRQS) — the
+		 * per-vblank kqueue knote on /dev/atrium-display0 is a later milestone.
+		 */
 		sc->ih_rptr++;
 	}
 	atomic_add_int(&sc->irq_count, 1);

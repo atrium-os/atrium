@@ -176,6 +176,14 @@ display_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		display_program_fb(sc, s->vram_offset, s->size);
 		amd_mmio_write32(sc, regDISP_SET_MODE, 1);
 		s->fault = amd_mmio_read32(sc, regDISP_FAULT);
+		/*
+		 * Arm the DCN-like vblank interrupt now the CRTC is live: the device
+		 * raises an IH interrupt each vertical blank (cause VBLANK), which the
+		 * GPU module's IH ISR services — interrupt-driven like real silicon,
+		 * not a polled VBLANK_COUNT. (A later milestone arms/disarms per kqueue
+		 * registration; for now an active mode means vblank events flow.)
+		 */
+		amd_mmio_write32(sc, regDISP_VBLANK_IRQ_EN, 1);
 		return (0);
 	}
 

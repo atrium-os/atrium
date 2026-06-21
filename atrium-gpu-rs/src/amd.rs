@@ -96,6 +96,9 @@ struct Submit {
 struct SyncobjCreate { out_fd: u32, pad: u32 }
 #[repr(C)]
 #[derive(Default)]
+struct Irqs { count: u64, msix_enabled: u32, pad: u32 }
+#[repr(C)]
+#[derive(Default)]
 struct SyncobjOp { value: u64, syncobj_fd: u32, pad: u32 }
 #[repr(C)]
 #[derive(Default)]
@@ -238,6 +241,15 @@ impl Gpu {
         let mut c = SyncobjCreate::default();
         unsafe { call(self.fd, iowr(G, 8, std::mem::size_of::<SyncobjCreate>()), &mut c)? };
         Ok(Syncobj { gpu: self, fd: c.out_fd as RawFd })
+    }
+
+    /// Total interrupts the device's IH ISR has serviced (GET_IRQS). The ISR
+    /// bumps this on every interrupt, so with no submits in flight it rises only
+    /// on vblank IRQs — the observable that the DCN-like vblank interrupt fires.
+    pub fn irq_count(&self) -> io::Result<u64> {
+        let mut q = Irqs::default();
+        unsafe { call(self.fd, ior(G, 6, std::mem::size_of::<Irqs>()), &mut q)? };
+        Ok(q.count)
     }
 }
 
