@@ -127,6 +127,16 @@ atrium_amd_pci_attach(device_t dev)
 	}
 
 	/*
+	 * Cold device reset: a full FLR is device-wide (it resets GFX *and* DCN),
+	 * so the device owner does it ONCE here, before any child attaches — the
+	 * children then bring up their own block onto a clean device. (This is why
+	 * the gpu module no longer FLRs; it would reset the display behind its back.)
+	 * Non-fatal: if the reset doesn't latch we log and press on.
+	 */
+	if (amd_flr(sc) != 0)
+		device_printf(dev, "cold FLR failed — continuing\n");
+
+	/*
 	 * Stand up the device-global IH ring + hook the single ISR HERE, in the
 	 * device owner — before any child attaches. The IH ring is a device
 	 * resource (GFX end-of-pipe AND DCN vblank ride it to one ISR), so it

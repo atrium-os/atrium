@@ -1,47 +1,29 @@
 /*
- * firmware.c — PSP/MES bring-up: reset, CP microcode load, MES init.
+ * firmware.c — GFX-block bring-up: the gpu-scoped soft reset, CP microcode load,
+ * MES init.
  *
- * The handshake that turns a cold device "alive" (device-reference §4). Order
- * is load-bearing and the model's referee enforces it: a full reset tears down
- * the CP, so firmware reloads after it; the MES rides on the CP microcode, so
- * it comes up only once firmware is loaded. The caller (attach) sequences
- * reset -> GMC/IH -> firmware -> MES.
+ * The handshake that turns the GFX/compute block "alive" (device-reference §4).
+ * Order is load-bearing and the model's referee enforces it: the MES rides on
+ * the CP microcode, so it comes up only once firmware is loaded. The caller
+ * (attach) sequences soft-reset -> GMC -> firmware -> MES.
+ *
+ * The device-wide FLR is NOT here — it is a device event the base owns (reset.c,
+ * amd_flr). This module only ever resets its OWN block, via GRBM_SOFT_RESET.
  */
 #include "atrium_gpu_amd.h"
 
 /*
- * Reset to a known state. A from-scratch driver inherits the device in
- * whatever state firmware/a prior driver left it; reset to a defined baseline
- * before programming. RESET_STATUS is the one bring-up status the model
- * exposes readably, so it doubles as our verification that SIM-aperture writes
- * land and read back. The model latches synchronously (STATUS reads 1 on the
- * first poll); the poll-with-timeout keeps the shape real silicon needs.
+ * GPU-scoped soft reset: recover the GFX/compute engine (clears a hung pipe so
+ * submissions are accepted again) WITHOUT touching device-local VRAM or the
+ * display block — the gpu module has no business resetting those. Used at attach
+ * (a cheap no-op on an already-clean device) and as the gpu's half of a
+ * coordinated device reset. GRBM_SOFT_RESET is write-only; its effect shows when
+ * a previously wedged engine honors the next submit.
  */
-int
-amd_reset(struct atrium_amd_softc *sc)
+void
+amd_grbm_soft_reset(struct atrium_amd_softc *sc)
 {
-	int i;
-
-	amd_mmio_write32(sc, regRESET_REQ, 1);
-	for (i = 0; i < ATRIUM_AMD_RESET_POLLS; i++) {
-		if (amd_mmio_read32(sc, regRESET_STATUS) != 0)
-			break;
-		DELAY(ATRIUM_AMD_RESET_DELAY);
-	}
-	if (i == ATRIUM_AMD_RESET_POLLS) {
-		device_printf(sc->dev, "reset did not latch (RESET_STATUS "
-		    "stuck at 0)\n");
-		return (ENXIO);
-	}
-	amd_mmio_write32(sc, regRESET_ACK, 1);
-	if (amd_mmio_read32(sc, regRESET_STATUS) != 0) {
-		device_printf(sc->dev, "reset window did not close after ACK "
-		    "(RESET_STATUS still 1)\n");
-		return (ENXIO);
-	}
-	device_printf(sc->dev, "GPU reset complete (REQ -> STATUS=1 -> ACK -> "
-	    "STATUS=0)\n");
-	return (0);
+	amd_mmio_write32(sc, regGPU_RESET, 1);
 }
 
 /*

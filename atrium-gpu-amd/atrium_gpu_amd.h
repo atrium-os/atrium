@@ -61,6 +61,10 @@
 #define regSIM_ID		0x00	/* identity probe: reads GPUSIM_MAGIC */
 #define SIM_ID_MAGIC		0x47505553u /* 'G','P','U','S' */
 #define regGRBM_STATUS		0x3690	/* GC: gpusim models as 0 (functional) */
+#define regGPU_RESET		0x36a0	/* GC: GRBM_SOFT_RESET — per-block GFX soft
+					 * reset (gpu-scoped: recovers a hung engine,
+					 * leaves VRAM + the display block intact).
+					 * Distinct from the device-wide FLR below. */
 
 #define regFW_CP_VERSION	0x20050	/* SIM: staged CP ucode version (w) */
 #define regFW_CP_LOAD		0x20054	/* SIM: w 1 = validate + activate CP */
@@ -432,6 +436,30 @@ struct atrium_amd_pending {
  */
 typedef void (*atrium_amd_ih_handler)(struct atrium_amd_softc *sc, int count);
 
+/*
+ * Device-reset coordination. A full FLR (mode-1 reset) is a DEVICE-global event:
+ * on real silicon it resets every IP block — GFX *and* DCN (display) — so it
+ * cannot be a thing one IP module does behind the others' backs. The base owns
+ * the FLR (amd_flr) and the coordinator (amd_device_reset); each IP module
+ * registers a prepare/restore pair so a device-lost recovery quiesces every
+ * block before the FLR and re-initialises it after (amdgpu's pre_reset/post_reset
+ * across IP blocks). prepare/restore run under sc->lock is NOT assumed — they may
+ * sleep (firmware reload), so the coordinator calls them unlocked.
+ *
+ * Cold bring-up takes a different path: the base FLRs ONCE at device attach,
+ * before any child exists, so no hooks are needed there — the children then
+ * attach onto an already-clean device.
+ */
+enum {
+	ATRIUM_AMD_IP_GPU = 0,		/* GFX/compute (gpu module) */
+	ATRIUM_AMD_IP_DISPLAY,		/* DCN (display module) */
+	ATRIUM_AMD_IP_COUNT
+};
+struct atrium_amd_reset_hooks {
+	void (*prepare)(struct atrium_amd_softc *sc);	/* quiesce before FLR */
+	void (*restore)(struct atrium_amd_softc *sc);	/* re-init after FLR */
+};
+
 struct atrium_amd_softc {
 	device_t	 dev;
 	const struct atrium_gpu_backend_ops *backend; /* hardware seam (gpu module) */
@@ -458,6 +486,13 @@ struct atrium_amd_softc {
 	int		 irq_rid;
 	void		*intr_cookie;
 	int		 msix_enabled;	/* 1 = interrupt mode, 0 = poll mode */
+
+	/*
+	 * Device-reset coordination (owned by the base): each IP module registers a
+	 * prepare/restore pair so a device-wide FLR quiesces + re-inits every block.
+	 */
+	struct atrium_amd_reset_hooks reset_hooks[ATRIUM_AMD_IP_COUNT];
+	int		 display_vblank_armed;	/* display module: mode set + vblank IRQ on */
 
 	/*
 	 * Device-global IH (interrupt-handler) ring + dispatch, owned by the BASE
@@ -577,13 +612,42 @@ int	 amd_vm_setup(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm);
 void	 amd_vm_teardown(struct atrium_amd_vm *vm);
 extern const struct fileops atrium_amd_vm_fileops;
 
-/* gmc.c — GMC/IH bring-up */
+/* gmc.c — GMC bring-up (GPUVM paging enable) */
 int	 amd_gmc_init(struct atrium_amd_softc *sc);
 
-/* firmware.c — bring-up */
-int	 amd_reset(struct atrium_amd_softc *sc);
+/* firmware.c (GPU module) — GFX-block bring-up + the gpu-scoped soft reset */
+void	 amd_grbm_soft_reset(struct atrium_amd_softc *sc);
 void	 amd_firmware_load(struct atrium_amd_softc *sc);
 void	 amd_mes_init(struct atrium_amd_softc *sc);
+
+/*
+ * reset.c (BASE module) — the device-wide FLR + its coordinator. amd_flr drives
+ * the raw REQ/poll/ACK handshake (used directly for the cold reset at device
+ * attach). amd_device_reset is the recovery path: it runs every registered IP's
+ * prepare hook, FLRs, then runs every restore hook — so a device-lost reset
+ * doesn't corrupt a block (e.g. the display) that didn't ask for it.
+ */
+int	 amd_flr(struct atrium_amd_softc *sc);
+int	 amd_device_reset(struct atrium_amd_softc *sc);
+
+/*
+ * Register an IP module's reset prepare/restore hooks (NULL to clear on detach).
+ * Stored in the shared softc under sc->lock; the coordinator snapshots them, so
+ * a module clears its hooks on detach with no race against a concurrent reset.
+ * Inline → no cross-module symbol (the hooks point at the registering module).
+ */
+static inline void
+amd_reset_register(struct atrium_amd_softc *sc, int ip,
+    void (*prepare)(struct atrium_amd_softc *),
+    void (*restore)(struct atrium_amd_softc *))
+{
+	mtx_lock(&sc->lock);
+	if (ip >= 0 && ip < ATRIUM_AMD_IP_COUNT) {
+		sc->reset_hooks[ip].prepare = prepare;
+		sc->reset_hooks[ip].restore = restore;
+	}
+	mtx_unlock(&sc->lock);
+}
 
 /* cp.c — submission (under a VM's VMID) */
 int	 amd_submit(struct atrium_amd_softc *sc, struct atrium_amd_bo *ring,

@@ -32,6 +32,7 @@ use libc::{c_int, c_void, ioctl};
 // ioctl encoding (FreeBSD <sys/ioccom.h>)
 // ---------------------------------------------------------------------------
 
+const IOC_VOID: u64 = 0x2000_0000;
 const IOC_OUT: u64 = 0x4000_0000;
 const IOC_IN: u64 = 0x8000_0000;
 const IOC_INOUT: u64 = IOC_OUT | IOC_IN;
@@ -42,7 +43,9 @@ const fn ioc(dir: u64, group: u8, num: u64, size: usize) -> u64 {
 const fn iow(group: u8, num: u64, size: usize) -> u64 { ioc(IOC_IN, group, num, size) }
 const fn ior(group: u8, num: u64, size: usize) -> u64 { ioc(IOC_OUT, group, num, size) }
 const fn iowr(group: u8, num: u64, size: usize) -> u64 { ioc(IOC_INOUT, group, num, size) }
-const fn io(group: u8, num: u64) -> u64 { ((group as u64) << 8) | num } /* _IO: void */
+/* _IO: void — must carry IOC_VOID like the kernel's _IO(), else the encoded
+ * command never matches the handler (ENOTTY). */
+const fn io(group: u8, num: u64) -> u64 { IOC_VOID | ((group as u64) << 8) | num }
 
 const G: u8 = b'A'; // GPU ioctl group
 const D: u8 = b'D'; // display ioctl group

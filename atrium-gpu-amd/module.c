@@ -85,17 +85,31 @@ amd_get_caps(struct atrium_amd_softc *sc, struct atrium_gpu_backend_caps *c)
 	c->vram_bytes = ATRIUM_AMD_VRAM_BYTES;
 }
 
-/* amd backend: full engine reset — reset, reload CP firmware, re-init MES. */
+/*
+ * The GPU's restore hook for a coordinated device reset: a device FLR wipes the
+ * CP firmware + MES (and VRAM), so re-init the GFX block — re-enable GPUVM
+ * paging, reload firmware, bring the MES back up. (No prepare hook: there is no
+ * GFX state to save across the FLR in this model; the restore rebuilds it.)
+ */
+static void
+amd_gpu_reset_restore(struct atrium_amd_softc *sc)
+{
+	(void)amd_gmc_init(sc);
+	amd_firmware_load(sc);
+	amd_mes_init(sc);
+}
+
+/*
+ * amd backend gpu_reset (the userspace recovery ioctl): a device-lost GPU reset
+ * is a DEVICE-wide FLR, so route it through the base coordinator — it quiesces
+ * every IP block (the display disarms its scanout), FLRs once, then restores
+ * every block (amd_gpu_reset_restore re-inits GFX; the display re-arms vblank).
+ * The gpu module no longer FLRs the device by itself.
+ */
 static int
 amd_gpu_reset(struct atrium_amd_softc *sc)
 {
-	int err = amd_reset(sc);
-
-	if (err == 0) {
-		amd_firmware_load(sc);
-		amd_mes_init(sc);
-	}
-	return (err);
+	return (amd_device_reset(sc));
 }
 
 static const struct atrium_gpu_backend_ops amd_backend = {
@@ -132,6 +146,7 @@ amd_teardown(struct atrium_amd_softc *sc)
 	 * this module's text, about to be unloaded).
 	 */
 	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_EOP, NULL);
+	amd_reset_register(sc, ATRIUM_AMD_IP_GPU, NULL, NULL);
 	if (sc->cdev != NULL) {
 		destroy_dev(sc->cdev);
 		sc->cdev = NULL;
@@ -215,16 +230,15 @@ atrium_amd_attach(device_t dev)
 	    grbm);
 
 	/*
-	 * Cold -> alive bring-up (device-reference §4): reset to a known state,
-	 * enable GMC paging, then load CP firmware and init the MES. Order is
-	 * load-bearing; the model's referee faults a doorbell before firmware or a
-	 * queue map before MES. (The IH ring + ISR are the base module's — already
-	 * up before this child attached.)
+	 * GFX-block bring-up (device-reference §4): soft-reset our OWN block (the
+	 * base already FLR'd the whole device at attach, so this is a cheap no-op on
+	 * a cold boot; on a gpu hot-swap it clears any hung GFX engine), enable GMC
+	 * paging, then load CP firmware and init the MES. Order is load-bearing; the
+	 * model's referee faults a doorbell before firmware or a queue map before
+	 * MES. (The IH ring + ISR are the base module's — already up before this
+	 * child attached. This module never FLRs the device.)
 	 */
-	if ((err = amd_reset(sc)) != 0) {
-		amd_teardown(sc);
-		return (err);
-	}
+	amd_grbm_soft_reset(sc);
 	if ((err = amd_gmc_init(sc)) != 0) {
 		amd_teardown(sc);
 		return (err);
@@ -239,6 +253,12 @@ atrium_amd_attach(device_t dev)
 	 * the display module's — the GPU has no part in it.
 	 */
 	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_EOP, amd_eop_handler);
+
+	/*
+	 * Register the GFX block's reset hooks so a coordinated device reset re-inits
+	 * it (no prepare; restore reloads firmware/MES after the FLR).
+	 */
+	amd_reset_register(sc, ATRIUM_AMD_IP_GPU, NULL, amd_gpu_reset_restore);
 
 	/*
 	 * Publish the userspace interface. From here a user-mode driver (or the

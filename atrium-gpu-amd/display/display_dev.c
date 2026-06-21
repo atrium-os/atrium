@@ -191,6 +191,33 @@ amd_display_vblank_handler(struct atrium_amd_softc *sc, int count)
 	KNOTE_LOCKED(&sc->display_sel.si_note, count);
 }
 
+/* --- device-reset coordination: the display's prepare/restore hooks --------- */
+
+/*
+ * Prepare: a device-wide FLR is about to reset the display block (DCN), so
+ * disarm the vblank IRQ — no stale interrupt should fire mid-reset. Called by
+ * the base reset coordinator (unlocked).
+ */
+static void
+amd_display_reset_prepare(struct atrium_amd_softc *sc)
+{
+	amd_mmio_write32(sc, regDISP_VBLANK_IRQ_EN, 0);
+}
+
+/*
+ * Restore: the FLR is done. If a mode was active before it, re-arm the vblank
+ * IRQ so the display keeps pacing. The scanout framebuffer itself was in the
+ * VRAM the FLR wiped — the compositor re-flips it (its own recovery); the
+ * display's job is only to bring its interrupt back. This is what stops a
+ * device-lost GPU reset from silently killing the display.
+ */
+static void
+amd_display_reset_restore(struct atrium_amd_softc *sc)
+{
+	if (sc->display_vblank_armed)
+		amd_mmio_write32(sc, regDISP_VBLANK_IRQ_EN, 1);
+}
+
 static const struct filterops display_vblank_filtops = {
 	.f_isfd = 1,
 	.f_detach = display_filt_detach,
@@ -251,6 +278,7 @@ display_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		 * registration; for now an active mode means vblank events flow.)
 		 */
 		amd_mmio_write32(sc, regDISP_VBLANK_IRQ_EN, 1);
+		sc->display_vblank_armed = 1;	/* remembered across a device reset */
 		return (0);
 	}
 
@@ -379,6 +407,14 @@ atrium_display_attach(device_t dev)
 	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_VBLANK,
 	    amd_display_vblank_handler);
 
+	/*
+	 * Register the display's reset hooks so a coordinated device reset (a
+	 * userspace GPU reset routed through the base) quiesces + re-arms the display
+	 * block instead of leaving it dead.
+	 */
+	amd_reset_register(sc, ATRIUM_AMD_IP_DISPLAY, amd_display_reset_prepare,
+	    amd_display_reset_restore);
+
 	device_printf(dev, "ready: /dev/atrium-display%d\n", device_get_unit(dev));
 	return (0);
 }
@@ -394,7 +430,9 @@ atrium_display_detach(device_t dev)
 	 * this module's text after it unloads.
 	 */
 	amd_mmio_write32(sc, regDISP_VBLANK_IRQ_EN, 0);
+	sc->display_vblank_armed = 0;
 	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_VBLANK, NULL);
+	amd_reset_register(sc, ATRIUM_AMD_IP_DISPLAY, NULL, NULL);
 	if (sc->display_cdev != NULL) {
 		destroy_dev(sc->display_cdev);
 		sc->display_cdev = NULL;
