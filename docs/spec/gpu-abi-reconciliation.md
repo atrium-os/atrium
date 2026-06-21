@@ -169,8 +169,10 @@ the ABI reconciliation does not address what renders the frame.)
    **share — DONE:** a BO binds into multiple VMs (per-VM bindings list), so one
    buffer is shared across address spaces (compositor imports a client buffer);
    BOs are `DFLAG_PASSABLE` for SCM_RIGHTS transport + `amd::Vm::import`. Verified
-   by `bo_share` (CPU + GPU cross-VM). `BO_CREATE`/`QUEUE_CREATE` naming + caps-TLV
-   alignment remain.
+   by `bo_share` (CPU + GPU cross-VM). **caps-TLV — DONE:** `QUERY_CAPS` now also
+   emits `ADDRESS_SPACE` (per-VM VA window — the real 32 MiB) + `HEAPS` (VRAM size),
+   decoded by `amd::Caps` (TLV-forward-compatible). `BO_CREATE`/`QUEUE_CREATE`
+   renames are cosmetic-only (semantics already match v2 — see D-1/D-2).
 5. **`atrium-virtio-gpu` → `'A'`** (the large port; gated on a virtio test target).
 6. **Display target evolution** (atomic-commit + kqueue vblank/flip-done + syncobj
    fences) across kmod + `atrium-gpu-rs`, once steps 2–5 are stable.
@@ -181,11 +183,18 @@ virtio port; step 5 makes the ABI truly backend-agnostic.
 ## 7. Open decisions (flag before they bite)
 
 - **D-1: keep amd's directly-kqueue-able syncobj fd over v2's separate `SYNCOBJ_EVENTFD`?**
-  Recommended yes (simpler, proven). Amend v2.
-- **D-2: `BO_CREATE` on `device_fd` (VM-agnostic) vs `vm_fd` (v2 draft)?** Recommended
-  device_fd. Amend v2 §5.3.
-- **D-3: display vblank — kqueue-only, retiring `WAIT_VBLANK`?** Recommended yes; the only
-  caller (`frescod_aqueduct` smoke) moves to kqueue or is dropped.
+  ✅ **RESOLVED — yes.** Implemented + verified: a submit's `RELEASE_MEM` signals the
+  syncobj, and `amd_smoke` waits on it with `EVFILT_READ` directly on the syncobj fd (no
+  separate eventfd). v2 to drop `SYNCOBJ_EVENTFD`.
+- **D-2: `BO_CREATE` on `device_fd` (VM-agnostic) vs `vm_fd` (v2 draft)?** ✅ **RESOLVED —
+  device_fd.** amd creates BOs on the device fd, independent of any VM; `VM_BIND` maps them
+  (into *many* VMs — the sharing work). v2 §5.3 to follow. (Name stays `BO_ALLOC`; a
+  `BO_CREATE` rename is cosmetic, not done.)
+- **D-3: display vblank — kqueue-only, retiring `WAIT_VBLANK`?** ⏳ **OPEN — deferred to
+  Phase 6.** Today vblank is *polled* via the display STATUS register (the live tier's
+  QEMU host-timer pulses the count). Making the display fd `EVFILT_READ`-able on vblank
+  needs a device vblank *interrupt* (gpusim model + a display MSI-X vector → kmod ISR +
+  `d_kqfilter`), which is the Phase-6 display-timing work.
 - **D-4: does Carillon implement `'A'` directly, or front a backend that does?** Defer;
   Carillon is a transport — it should present the `'A'` cdev surface like the others.
 
