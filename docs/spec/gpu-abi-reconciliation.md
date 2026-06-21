@@ -190,11 +190,13 @@ virtio port; step 5 makes the ABI truly backend-agnostic.
   device_fd.** amd creates BOs on the device fd, independent of any VM; `VM_BIND` maps them
   (into *many* VMs — the sharing work). v2 §5.3 to follow. (Name stays `BO_ALLOC`; a
   `BO_CREATE` rename is cosmetic, not done.)
-- **D-3: display vblank — kqueue-only, retiring `WAIT_VBLANK`?** ⏳ **OPEN — deferred to
-  Phase 6.** Today vblank is *polled* via the display STATUS register (the live tier's
-  QEMU host-timer pulses the count). Making the display fd `EVFILT_READ`-able on vblank
-  needs a device vblank *interrupt* (gpusim model + a display MSI-X vector → kmod ISR +
-  `d_kqfilter`), which is the Phase-6 display-timing work.
+- **D-3: display vblank — kqueue-only, retiring `WAIT_VBLANK`?** 🔶 **IN PROGRESS.** The
+  device vblank *interrupt* now exists and is HW-faithful: gpusim raises a DCN-like vblank
+  IRQ each vertical blank through the IH ring (cause `IH_CAUSE_VBLANK`, gpusim 942d96b),
+  the driver arms it on `SET_MODE` (`regDISP_VBLANK_IRQ_EN`) and the IH ISR services it —
+  verified interrupt-driven (~50/s, no submits), no longer polled-only. **Remaining:** the
+  per-vblank `d_kqfilter` on `/dev/atrium-display0` so userspace `EVFILT_READ`-waits on
+  vblank (and `WAIT_VBLANK` retires). That's the final Phase-6 display-timing piece.
 - **D-4: does Carillon implement `'A'` directly, or front a backend that does?** Defer;
   Carillon is a transport — it should present the `'A'` cdev surface like the others.
 
