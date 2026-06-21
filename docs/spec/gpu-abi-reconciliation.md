@@ -166,6 +166,11 @@ the ABI reconciliation does not address what renders the frame.)
    `frescod_aqueduct`/`aqueduct_smoke` bins stay on `'G'` until D-3 (kqueue), so the legacy
    `'G'` Display can't be retired yet.
 4. **`atrium-gpu-amd` v2 finish** (`BO_CREATE`/`QUEUE_CREATE`/share + caps-TLV align).
+   **share — DONE:** a BO binds into multiple VMs (per-VM bindings list), so one
+   buffer is shared across address spaces (compositor imports a client buffer);
+   BOs are `DFLAG_PASSABLE` for SCM_RIGHTS transport + `amd::Vm::import`. Verified
+   by `bo_share` (CPU + GPU cross-VM). `BO_CREATE`/`QUEUE_CREATE` naming + caps-TLV
+   alignment remain.
 5. **`atrium-virtio-gpu` → `'A'`** (the large port; gated on a virtio test target).
 6. **Display target evolution** (atomic-commit + kqueue vblank/flip-done + syncobj
    fences) across kmod + `atrium-gpu-rs`, once steps 2–5 are stable.
