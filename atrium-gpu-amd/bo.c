@@ -265,6 +265,22 @@ amd_bo_backing_alloc(struct atrium_amd_softc *sc, struct atrium_amd_bo *bo,
 	return (0);
 }
 
+/*
+ * amd backend: export a BO as a scanout handle — the absolute VRAM offset +
+ * size the display module imports (dma-buf-equivalent). Only VRAM is scannable;
+ * System/GTT BOs have no contiguous VRAM offset.
+ */
+int
+amd_export_scanout(struct atrium_amd_bo *bo, uint64_t *vram_offset,
+    uint64_t *size)
+{
+	if (!bo->vram)
+		return (EINVAL);
+	*vram_offset = bo->pages[0];
+	*size = bo->size;
+	return (0);
+}
+
 /* amd backend: release a BO's backing store (the bus_dma System path; VRAM is a
  * bump with no per-BO free) and drop the device's BO count. */
 void

@@ -70,6 +70,21 @@
  * later, unchanged from the front-end's view. A virtio backend is a sibling
  * table over CTX_INIT / SUBMIT_3D (docs/spec/atrium-gpu-driver-architecture.md §6).
  */
+/* amd backend: device capability values for the QUERY_CAPS TLV. */
+static void
+amd_get_caps(struct atrium_amd_softc *sc, struct atrium_gpu_backend_caps *c)
+{
+	(void)sc;
+	c->vendor = "Atrium AMD RDNA4 (gpusim)";
+	c->features = ATRIUM_GPU_FEAT_GRAPHICS | ATRIUM_GPU_FEAT_COMPUTE |
+	    ATRIUM_GPU_FEAT_USER_QUEUES | ATRIUM_GPU_FEAT_SYNCOBJ |
+	    ATRIUM_GPU_FEAT_VM_BIND;
+	c->va_base = ATRIUM_AMD_BO_VA_BASE;
+	c->va_size = (uint64_t)ATRIUM_AMD_VM_MAX_BO * PAGE_SIZE;
+	c->va_align = PAGE_SIZE;
+	c->vram_bytes = ATRIUM_AMD_VRAM_BYTES;
+}
+
 static const struct atrium_gpu_backend_ops amd_backend = {
 	.name = "amd",
 	.vm_setup = amd_vm_setup,
@@ -79,6 +94,9 @@ static const struct atrium_gpu_backend_ops amd_backend = {
 	.map_page = amd_vm_map,
 	.unmap_page = amd_vm_unmap,
 	.submit = amd_submit,
+	.export_scanout = amd_export_scanout,
+	.mmap = amd_doorbell_mmap,
+	.get_caps = amd_get_caps,
 };
 
 /*

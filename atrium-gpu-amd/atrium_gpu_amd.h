@@ -263,6 +263,19 @@ struct atrium_amd_vm;
 struct atrium_amd_bo;
 
 /*
+ * Backend-supplied device capability values; the front-end assembles these into
+ * the QUERY_CAPS TLV (the ABI version is the front-end's, the rest is backend).
+ */
+struct atrium_gpu_backend_caps {
+	const char *vendor;	/* CAP_VENDOR */
+	uint32_t    features;	/* CAP_FEATURES bitmap */
+	uint64_t    va_base;	/* CAP_ADDRESS_SPACE */
+	uint64_t    va_size;
+	uint64_t    va_align;
+	uint64_t    vram_bytes;	/* CAP_HEAPS device heap size */
+};
+
+/*
  * Backend ops — the per-transport hardware seam under the shared 'A' front-end
  * (docs/spec/atrium-gpu-driver-architecture.md §6). The cdev + ioctl dispatch,
  * the BO/VM/syncobj fd-objects, the bindings list, the syncobj timeline and the
@@ -293,6 +306,17 @@ struct atrium_gpu_backend_ops {
 	/* Submit a prepared ring on an engine in a VM (amd: PM4 ring + doorbell). */
 	int	(*submit)(struct atrium_amd_softc *sc, struct atrium_amd_bo *ring,
 		    uint32_t n_dwords, uint32_t engine, struct atrium_amd_vm *vm);
+	/* Export a BO as a scanout handle (amd: absolute VRAM offset + size; only
+	 * VRAM is scannable). EINVAL if the BO can't be scanned out. */
+	int	(*export_scanout)(struct atrium_amd_bo *bo, uint64_t *vram_offset,
+		    uint64_t *size);
+	/* mmap a device aperture into userspace (amd: the per-queue doorbell page
+	 * = a capability grant). Returns the physical addr + memattr for `offset`. */
+	int	(*mmap)(struct atrium_amd_softc *sc, vm_ooffset_t offset,
+		    vm_paddr_t *paddr, vm_memattr_t *memattr);
+	/* Fill in the backend's device capability values (vendor, heaps, VA window). */
+	void	(*get_caps)(struct atrium_amd_softc *sc,
+		    struct atrium_gpu_backend_caps *caps);
 };
 
 /*
@@ -459,6 +483,12 @@ uint64_t amd_bo_gpu_va(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm);
 int	 amd_bo_backing_alloc(struct atrium_amd_softc *sc,
 	    struct atrium_amd_bo *bo, uint64_t size, uint32_t flags);
 void	 amd_bo_backing_free(struct atrium_amd_bo *bo);
+/* amd backend: export a VRAM BO as a {vram_offset, size} scanout handle. */
+int	 amd_export_scanout(struct atrium_amd_bo *bo, uint64_t *vram_offset,
+	    uint64_t *size);
+/* amd backend: mmap the per-queue doorbell page (the capability grant). */
+int	 amd_doorbell_mmap(struct atrium_amd_softc *sc, vm_ooffset_t offset,
+	    vm_paddr_t *paddr, vm_memattr_t *memattr);
 extern const struct fileops atrium_amd_bo_fileops;
 
 /* vm.c — per-process GPU address spaces (fd-backed) + GPUVM page tables */

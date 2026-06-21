@@ -30,11 +30,7 @@ atrium_amd_mmap(struct cdev *cdev, vm_ooffset_t offset, vm_paddr_t *paddr,
 {
 	struct atrium_amd_softc *sc = cdev->si_drv1;
 
-	if (offset < 0 || offset >= rman_get_size(sc->doorbell))
-		return (EINVAL);
-	*paddr = rman_get_start(sc->doorbell) + offset;
-	*memattr = VM_MEMATTR_DEVICE;
-	return (0);
+	return (sc->backend->mmap(sc, offset, paddr, memattr));
 }
 
 /* Append a TLV cap record (header + data, padded to 4 bytes) to a buffer. */
@@ -206,14 +202,9 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		err = amd_bo_fget(td, e->bo_fd, &fp, &bo);
 		if (err != 0)
 			return (err);
-		if (!bo->vram) {
-			fdrop(fp, td);
-			return (EINVAL);
-		}
-		e->vram_offset = bo->pages[0];
-		e->size = bo->size;
+		err = sc->backend->export_scanout(bo, &e->vram_offset, &e->size);
 		fdrop(fp, td);
-		return (0);
+		return (err);
 	}
 
 	case ATRIUM_GPU_IOC_SYNCOBJ_CREATE: {
@@ -344,30 +335,32 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 	case ATRIUM_GPU_IOC_QUERY_CAPS: {
 		struct atrium_gpu_caps_query *q =
 		    (struct atrium_gpu_caps_query *)data;
-		static const char vendor[] = "Atrium AMD RDNA4 (gpusim)";
-		uint32_t ver[2] = { 1, 0 };	/* ABI major.minor */
-		uint32_t feat = ATRIUM_GPU_FEAT_GRAPHICS |
-		    ATRIUM_GPU_FEAT_COMPUTE | ATRIUM_GPU_FEAT_USER_QUEUES |
-		    ATRIUM_GPU_FEAT_SYNCOBJ | ATRIUM_GPU_FEAT_VM_BIND;
-		struct atrium_gpu_cap_address_space as = {
-			.va_base = ATRIUM_AMD_BO_VA_BASE,
-			.va_size = (uint64_t)ATRIUM_AMD_VM_MAX_BO * PAGE_SIZE,
-			.va_align = PAGE_SIZE,
-		};
-		struct atrium_gpu_heap_info heaps[2] = {
-			{ .kind = ATRIUM_GPU_HEAP_DEVICE, .flags = 0,
-			  .size = ATRIUM_AMD_VRAM_BYTES },
-			{ .kind = ATRIUM_GPU_HEAP_SYSTEM, .flags = 0, .size = 0 },
-		};
+		uint32_t ver[2] = { 1, 0 };	/* ABI major.minor (front-end's) */
+		struct atrium_gpu_backend_caps bc;
+		struct atrium_gpu_cap_address_space as;
+		struct atrium_gpu_heap_info heaps[2];
 		uint8_t buf[256];
 		size_t off = 0;
 
+		/* The backend supplies the device-specific values; the front-end
+		 * assembles the (forward-compatible) TLV. */
+		sc->backend->get_caps(sc, &bc);
+		as.va_base = bc.va_base;
+		as.va_size = bc.va_size;
+		as.va_align = bc.va_align;
+		heaps[0].kind = ATRIUM_GPU_HEAP_DEVICE;
+		heaps[0].flags = 0;
+		heaps[0].size = bc.vram_bytes;
+		heaps[1].kind = ATRIUM_GPU_HEAP_SYSTEM;
+		heaps[1].flags = 0;
+		heaps[1].size = 0;
+
 		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_ABI_VERSION, ver,
 		    sizeof(ver));
-		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_VENDOR, vendor,
-		    sizeof(vendor));
-		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_FEATURES, &feat,
-		    sizeof(feat));
+		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_VENDOR, bc.vendor,
+		    strlen(bc.vendor) + 1);
+		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_FEATURES, &bc.features,
+		    sizeof(bc.features));
 		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_ADDRESS_SPACE, &as,
 		    sizeof(as));
 		off = amd_put_cap(buf, off, ATRIUM_GPU_CAP_HEAPS, heaps,

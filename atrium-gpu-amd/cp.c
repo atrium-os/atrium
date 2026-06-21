@@ -58,6 +58,22 @@ amd_queue_program(struct atrium_amd_softc *sc, uint64_t ring_va,
 	}
 }
 
+/*
+ * amd backend: map a doorbell page into userspace. The doorbell BAR is the
+ * per-queue submit aperture — mapping `offset` into a process is the capability
+ * grant that lets it kick exactly that queue (ABI-v2 user-mode queues).
+ */
+int
+amd_doorbell_mmap(struct atrium_amd_softc *sc, vm_ooffset_t offset,
+    vm_paddr_t *paddr, vm_memattr_t *memattr)
+{
+	if (offset < 0 || offset >= rman_get_size(sc->doorbell))
+		return (EINVAL);
+	*paddr = rman_get_start(sc->doorbell) + offset;
+	*memattr = VM_MEMATTR_DEVICE;
+	return (0);
+}
+
 int
 amd_submit(struct atrium_amd_softc *sc, struct atrium_amd_bo *ring,
     uint32_t n_dwords, uint32_t engine, struct atrium_amd_vm *vm)
