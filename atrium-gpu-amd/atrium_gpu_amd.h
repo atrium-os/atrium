@@ -279,6 +279,13 @@ struct atrium_gpu_backend_ops {
 	 * self-cleans on failure; vm_teardown undoes a successful setup. */
 	int	(*vm_setup)(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm);
 	void	(*vm_teardown)(struct atrium_amd_vm *vm);
+	/* Allocate / free a BO's backing store (amd: bus_dma System pages or a VRAM
+	 * bump; virtio: a blob resource). Fills the BO's page list + size; the
+	 * front-end owns the struct + fd + the cross-VM bindings. bo_alloc
+	 * self-cleans on failure. */
+	int	(*bo_alloc)(struct atrium_amd_softc *sc, struct atrium_amd_bo *bo,
+		    uint64_t size, uint32_t flags);
+	void	(*bo_free)(struct atrium_amd_bo *bo);
 	/* Map / unmap one page of a BO into a VM at a GPU-VA (amd: a GPUVM PTE). */
 	int	(*map_page)(struct atrium_amd_vm *vm, uint64_t va,
 		    vm_paddr_t phys, int vram);
@@ -447,6 +454,11 @@ int	 amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
 	    struct file *vm_fp, uint64_t *va);
 /* The BO's base GPU-VA in `vm`, or 0 if it is not bound there. */
 uint64_t amd_bo_gpu_va(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm);
+/* amd backend: allocate/free a BO's backing (bus_dma System pages or a VRAM
+ * bump); the front-end owns the struct/fd/bindings. */
+int	 amd_bo_backing_alloc(struct atrium_amd_softc *sc,
+	    struct atrium_amd_bo *bo, uint64_t size, uint32_t flags);
+void	 amd_bo_backing_free(struct atrium_amd_bo *bo);
 extern const struct fileops atrium_amd_bo_fileops;
 
 /* vm.c — per-process GPU address spaces (fd-backed) + GPUVM page tables */

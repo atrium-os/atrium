@@ -133,15 +133,7 @@ amd_bo_destroy(struct atrium_amd_bo *bo, struct thread *td)
 			    bd->gpu_va + (uint64_t)i * PAGE_SIZE);
 		fdrop(bd->vm_fp, td);
 	}
-	mtx_lock(&sc->lock);
-	sc->bo_count--;
-	mtx_unlock(&sc->lock);
-	if (bo->kva != NULL) {
-		bus_dmamap_unload(bo->dmat, bo->dmamap);
-		bus_dmamem_free(bo->dmat, bo->kva, bo->dmamap);
-	}
-	if (bo->dmat != NULL)
-		bus_dma_tag_destroy(bo->dmat);
+	sc->backend->bo_free(bo);	/* backing store + bo_count-- */
 	free(bo, M_DEVBUF);
 }
 
@@ -190,22 +182,24 @@ const struct fileops atrium_amd_bo_fileops = {
 };
 
 /*
- * Allocate a buffer object: just a page of memory, not yet in any address
- * space (ABI-v2 principle 4). VM_BIND maps it later. The page is allocated
- * before any lock (M_WAITOK may sleep).
+ * amd backend: allocate a BO's backing store into a (front-end-owned) bo.
+ * VRAM-resident BOs bump-allocate device-local pages (no bus_dma / no CPU map —
+ * VRAM is GPU-only; userspace populates it with a GPU copy from a System staging
+ * BO; pages[] hold VRAM offsets). System BOs go through bus_dma(9) — the real-
+ * silicon path (proper bus addresses, IOMMU-ready), one page-granular segment
+ * per page for the GPUVM to map. Self-cleaning on failure; fills pages/size and
+ * bumps bo_count on success.
  */
 int
-amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, uint64_t size,
-    uint32_t flags, int *out_fd)
+amd_bo_backing_alloc(struct atrium_amd_softc *sc, struct atrium_amd_bo *bo,
+    uint64_t size, uint32_t flags)
 {
-	struct atrium_amd_bo *bo;
 	struct amd_bo_load load;
-	struct file *fp;
 	bus_dma_tag_t dmat;
 	bus_dmamap_t dmamap;
 	void *kva;
 	uint64_t rounded;
-	int fd, err, npages;
+	int err, npages;
 
 	if (size == 0 || size > (uint64_t)ATRIUM_AMD_BO_MAX_PAGES * PAGE_SIZE)
 		return (EINVAL);
@@ -216,11 +210,6 @@ amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, uint64_t size,
 		uint64_t vram_off;
 		int i;
 
-		/*
-		 * VRAM-resident: bump-allocate device-local pages. No bus_dma and
-		 * no CPU mapping — VRAM is GPU-only; userspace populates it with a
-		 * GPU copy from a System staging BO. pages[] hold VRAM offsets.
-		 */
 		mtx_lock(&sc->lock);
 		if (sc->vram_next + rounded > ATRIUM_AMD_VRAM_BYTES) {
 			mtx_unlock(&sc->lock);
@@ -230,22 +219,14 @@ amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, uint64_t size,
 		sc->vram_next += rounded;
 		sc->bo_count++;
 		mtx_unlock(&sc->lock);
-		bo = malloc(sizeof(*bo), M_DEVBUF, M_WAITOK | M_ZERO);
-		bo->sc = sc;
 		bo->vram = 1;
 		bo->npages = npages;
 		bo->size = size;
 		for (i = 0; i < npages; i++)
 			bo->pages[i] = vram_off + (uint64_t)i * PAGE_SIZE;
-		goto install;
+		return (0);
 	}
 
-	/*
-	 * DMA-allocate the BO through bus_dma(9) — the real-silicon path (proper
-	 * bus addresses, IOMMU-ready), not vtophys. A per-BO tag sized to this BO
-	 * with page-granular segments (maxsegsz == PAGE_SIZE) so the loader reports
-	 * one bus address per page for the GPUVM to map.
-	 */
 	err = bus_dma_tag_create(bus_get_dma_tag(sc->dev),
 	    PAGE_SIZE, 0,			/* alignment, boundary */
 	    BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR, NULL, NULL,
@@ -259,13 +240,10 @@ amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, uint64_t size,
 		bus_dma_tag_destroy(dmat);
 		return (ENOMEM);
 	}
-	bo = malloc(sizeof(*bo), M_DEVBUF, M_WAITOK | M_ZERO);
-	bo->sc = sc;
 	bo->kva = kva;
 	bo->dmat = dmat;
 	bo->dmamap = dmamap;
 	bo->size = size;
-	/* bo->bindings / n_bindings stay zeroed (M_ZERO) until the BO is bound. */
 
 	load.pages = bo->pages;
 	load.npages = 0;
@@ -275,7 +253,8 @@ amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, uint64_t size,
 	if (err != 0 || load.error != 0 || load.npages != npages) {
 		bus_dmamem_free(dmat, kva, dmamap);
 		bus_dma_tag_destroy(dmat);
-		free(bo, M_DEVBUF);
+		bo->kva = NULL;
+		bo->dmat = NULL;
 		return (err != 0 ? err : EIO);
 	}
 	bo->npages = load.npages;
@@ -283,8 +262,51 @@ amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, uint64_t size,
 	mtx_lock(&sc->lock);
 	sc->bo_count++;
 	mtx_unlock(&sc->lock);
+	return (0);
+}
 
-install:
+/* amd backend: release a BO's backing store (the bus_dma System path; VRAM is a
+ * bump with no per-BO free) and drop the device's BO count. */
+void
+amd_bo_backing_free(struct atrium_amd_bo *bo)
+{
+	struct atrium_amd_softc *sc = bo->sc;
+
+	mtx_lock(&sc->lock);
+	sc->bo_count--;
+	mtx_unlock(&sc->lock);
+	if (bo->kva != NULL) {
+		bus_dmamap_unload(bo->dmat, bo->dmamap);
+		bus_dmamem_free(bo->dmat, bo->kva, bo->dmamap);
+		bo->kva = NULL;
+	}
+	if (bo->dmat != NULL) {
+		bus_dma_tag_destroy(bo->dmat);
+		bo->dmat = NULL;
+	}
+}
+
+/*
+ * Create a buffer object and return it as an fd. Transport-neutral front-end:
+ * owns the struct + fd object (and later the cross-VM bindings, ABI-v2 principle
+ * 4 — a BO is independent of any VM); the backing store comes from the backend.
+ */
+int
+amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td, uint64_t size,
+    uint32_t flags, int *out_fd)
+{
+	struct atrium_amd_bo *bo;
+	struct file *fp;
+	int fd, err;
+
+	bo = malloc(sizeof(*bo), M_DEVBUF, M_WAITOK | M_ZERO);
+	bo->sc = sc;
+	err = sc->backend->bo_alloc(sc, bo, size, flags);
+	if (err != 0) {
+		free(bo, M_DEVBUF);	/* bo_alloc unwound its own backing */
+		return (err);
+	}
+
 	err = falloc_noinstall(td, &fp);
 	if (err != 0) {
 		amd_bo_destroy(bo, td);
