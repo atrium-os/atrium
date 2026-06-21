@@ -190,13 +190,15 @@ virtio port; step 5 makes the ABI truly backend-agnostic.
   device_fd.** amd creates BOs on the device fd, independent of any VM; `VM_BIND` maps them
   (into *many* VMs — the sharing work). v2 §5.3 to follow. (Name stays `BO_ALLOC`; a
   `BO_CREATE` rename is cosmetic, not done.)
-- **D-3: display vblank — kqueue-only, retiring `WAIT_VBLANK`?** 🔶 **IN PROGRESS.** The
-  device vblank *interrupt* now exists and is HW-faithful: gpusim raises a DCN-like vblank
-  IRQ each vertical blank through the IH ring (cause `IH_CAUSE_VBLANK`, gpusim 942d96b),
-  the driver arms it on `SET_MODE` (`regDISP_VBLANK_IRQ_EN`) and the IH ISR services it —
-  verified interrupt-driven (~50/s, no submits), no longer polled-only. **Remaining:** the
-  per-vblank `d_kqfilter` on `/dev/atrium-display0` so userspace `EVFILT_READ`-waits on
-  vblank (and `WAIT_VBLANK` retires). That's the final Phase-6 display-timing piece.
+- **D-3: display vblank — kqueue-only, retiring `WAIT_VBLANK`?** ✅ **RESOLVED — kqueue,
+  no `WAIT_VBLANK`.** Full path landed: gpusim raises a DCN-like vblank IRQ each vertical
+  blank through the IH ring (cause `IH_CAUSE_VBLANK`, gpusim 942d96b); the driver arms it on
+  `SET_MODE` (`regDISP_VBLANK_IRQ_EN`); the GPU module's IH ISR counts the vblank cookies it
+  drains and fires a `KNOTE_LOCKED` (hint = count) on a knlist in the *shared* softc; the
+  display cdev exposes it as `EVFILT_READ` on `/dev/atrium-display0` with `EV_CLEAR` edge
+  semantics. Userspace `kevent()` blocks until the next vblank and gets the count elapsed —
+  no polling, no `WAIT_VBLANK` ioctl. Verified in-VM (`vblank_kq`: blocks, wakes ~52 Hz;
+  amd_smoke/display_flip/vblank_irq/bo_share still green).
 - **D-4: does Carillon implement `'A'` directly, or front a backend that does?** Defer;
   Carillon is a transport — it should present the `'A'` cdev surface like the others.
 
