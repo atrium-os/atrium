@@ -83,6 +83,16 @@ amd_teardown(struct atrium_amd_softc *sc)
 		amd_dma_page_free(&sc->dma[i]);
 	sc->n_dma = 0;
 	/*
+	 * Reset the rest of the gpu module's footprint in the SHARED softc back to
+	 * the pristine state the base left it in, so a re-attach (driver hot-swap,
+	 * docs/spec/gpu-driver-hotswap.md Protocol A) starts clean: the IH ring is
+	 * freed above, so drop its pointer + read cursor, and forget any
+	 * completions the ISR still owed (their syncobjs are gone with the fds).
+	 */
+	sc->ih_kva = NULL;
+	sc->ih_rptr = 0;
+	sc->n_pending = 0;
+	/*
 	 * The BAR resources and the softc mutex belong to the base (pci) module
 	 * (it mapped them into the shared softc); it releases them on its own
 	 * detach. This GPU module only tears down what it set up.
@@ -182,13 +192,19 @@ atrium_amd_attach(device_t dev)
 	 * in-tree test) allocates BOs, lays PM4 rings, and submits — the M3/M4
 	 * proofs now run from userspace rather than as attach self-tests.
 	 */
-	sc->cdev = make_dev(&atrium_amd_cdevsw, device_get_unit(dev), UID_ROOT,
-	    GID_WHEEL, 0600, "atrium-gpu%d", device_get_unit(dev));
-	if (sc->cdev == NULL) {
-		device_printf(dev, "failed to create /dev/atrium-gpu%d\n",
-		    device_get_unit(dev));
+	/*
+	 * MAKEDEV_CHECKNAME so a name collision returns EEXIST instead of
+	 * panicking: a clean detach destroys the cdev, but on the hot-swap path we
+	 * never want a stale node to take down the kernel — fail the attach loudly
+	 * instead.
+	 */
+	err = make_dev_p(MAKEDEV_CHECKNAME, &sc->cdev, &atrium_amd_cdevsw, NULL,
+	    UID_ROOT, GID_WHEEL, 0600, "atrium-gpu%d", device_get_unit(dev));
+	if (err != 0) {
+		device_printf(dev, "failed to create /dev/atrium-gpu%d: %d\n",
+		    device_get_unit(dev), err);
 		amd_teardown(sc);
-		return (ENXIO);
+		return (err);
 	}
 	sc->cdev->si_drv1 = sc;
 
@@ -207,7 +223,14 @@ atrium_amd_attach(device_t dev)
 static int
 atrium_amd_detach(device_t dev)
 {
-	struct atrium_amd_softc *sc = device_get_softc(dev);
+	/*
+	 * Operate on the SHARED softc owned by the base (pci) module — the same
+	 * one attach used (device_get_softc(parent)). This child's own softc is
+	 * unused (the driver_t declares zero softc); reading it here instead would
+	 * tear down a zeroed struct (leaking the real cdev/IH ring and wrongly
+	 * unregistering energy slot 0). detach mirrors attach exactly.
+	 */
+	struct atrium_amd_softc *sc = device_get_softc(device_get_parent(dev));
 
 	/*
 	 * BOs are fd-backed objects that outlive any single ioctl and hold a
@@ -219,8 +242,10 @@ atrium_amd_detach(device_t dev)
 	if (sc->bo_count > 0 || sc->vm_count > 0)
 		return (EBUSY);
 
-	if (sc->energy_member >= 0)
+	if (sc->energy_member >= 0) {
 		energy_member_unregister(sc->energy_member);
+		sc->energy_member = -1;
+	}
 	amd_teardown(sc);
 	return (0);
 }
@@ -235,7 +260,9 @@ static device_method_t atrium_amd_methods[] = {
 static driver_t atrium_amd_driver = {
 	"atrium_gpu_amd",
 	atrium_amd_methods,
-	sizeof(struct atrium_amd_softc),
+	0,	/* no per-child softc: all state lives in the base's SHARED softc,
+		 * reached via device_get_softc(device_get_parent(dev)). Declaring a
+		 * child softc here is the trap that made detach use the wrong struct. */
 };
 
 /* Attach to the "atrium_gpu" child of the base (pci) module, not `pci`. */

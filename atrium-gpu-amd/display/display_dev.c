@@ -320,7 +320,8 @@ static device_method_t atrium_display_methods[] = {
 static driver_t atrium_display_driver = {
 	"atrium_gpu_amd_display",
 	atrium_display_methods,
-	sizeof(struct atrium_amd_softc),	/* the SHARED softc (base's) */
+	0,	/* no per-child softc: state lives in the base's SHARED softc, reached
+		 * via device_get_softc(device_get_parent(dev)) — never this child's. */
 };
 
 /* Attach to the "atrium_gpu_amd_display" child of the base (pci) module. */
