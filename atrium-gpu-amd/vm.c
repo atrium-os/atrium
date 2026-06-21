@@ -71,11 +71,16 @@ amd_vmid_alloc(struct atrium_amd_softc *sc, uint16_t *vmid_out)
 	return (err);
 }
 
-static void
-amd_vm_destroy(struct atrium_amd_vm *vm)
+/*
+ * amd backend: release a VM's hardware (VMID + the page-directory/table pages).
+ * Idempotent over the page array (NULL-safe). Does NOT free the struct — that
+ * is the front-end's (amd_vm_destroy). Undoes a successful amd_vm_setup; also
+ * called by amd_vm_setup to unwind its own partial failure.
+ */
+void
+amd_vm_teardown(struct atrium_amd_vm *vm)
 {
 	struct atrium_amd_softc *sc = vm->sc;
-
 	int i;
 
 	mtx_lock(&sc->lock);
@@ -85,7 +90,59 @@ amd_vm_destroy(struct atrium_amd_vm *vm)
 	for (i = 0; i < ATRIUM_AMD_VM_NUM_PT; i++)
 		amd_dma_page_free(&vm->pt[i]);
 	amd_dma_page_free(&vm->pdb);
+}
+
+/* Front-end: tear down the hardware (via the backend) and free the struct. */
+static void
+amd_vm_destroy(struct atrium_amd_vm *vm)
+{
+	vm->sc->backend->vm_teardown(vm);
 	free(vm, M_DEVBUF);
+}
+
+/*
+ * amd backend: stand up a VM's GPUVM — allocate a VMID, its page-directory and
+ * NUM_PT page-table pages (wiring a contiguous run of PDEs), and program the
+ * device's per-context PT base. Self-cleaning: on any failure it unwinds what
+ * it allocated and returns an error, leaving the struct for the caller to free.
+ */
+int
+amd_vm_setup(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm)
+{
+	uint64_t *pde;
+	uint16_t vmid;
+	int err, i;
+
+	err = amd_vmid_alloc(sc, &vmid);
+	if (err != 0)
+		return (err);
+	vm->vmid = vmid;
+	if (amd_dma_page_alloc(sc, &vm->pdb) != 0) {
+		amd_vm_teardown(vm);
+		return (ENOMEM);
+	}
+	/* A contiguous run of NUM_PT page-table pages, each wired into its own
+	 * page-directory entry (PD indices AMD_VM_PD_INDEX .. +NUM_PT-1), so the
+	 * bump allocator spans NUM_PT * 2 MiB of VA. */
+	for (i = 0; i < ATRIUM_AMD_VM_NUM_PT; i++) {
+		if (amd_dma_page_alloc(sc, &vm->pt[i]) != 0) {
+			amd_vm_teardown(vm);
+			return (ENOMEM);
+		}
+		pde = (uint64_t *)((char *)vm->pdb.kva +
+		    (AMD_VM_PD_INDEX + i) * 8);
+		*pde = (vm->pt[i].gpa & ~0xfffULL) | ATRIUM_AMD_PTE_VALID;
+	}
+	vm->next_va = ATRIUM_AMD_BO_VA_BASE;
+
+	/* Program this VMID's page-directory base into the device. */
+	mtx_lock(&sc->lock);
+	amd_mmio_write32(sc, regVM_CTX_SELECT, vmid);
+	amd_mmio_write32(sc, regVM_CTX_PT_BASE_LO,
+	    (uint32_t)(vm->pdb.gpa & 0xffffffff));
+	amd_mmio_write32(sc, regVM_CTX_PT_BASE_HI, (uint32_t)(vm->pdb.gpa >> 32));
+	mtx_unlock(&sc->lock);
+	return (0);
 }
 
 static int
@@ -151,51 +208,24 @@ amd_vm_unmap(struct atrium_amd_vm *vm, uint64_t va)
 }
 
 /*
- * Create a VM: allocate a VMID + its page-directory and one page-table page,
- * wire the PDE, program the device's per-context base for this VMID, and
- * return it as an fd.
+ * Create a VM and return it as an fd. This is the transport-neutral front-end:
+ * it owns the struct + the fd object and stands the hardware up via the backend
+ * (amd: VMID + GPUVM page tables; virtio: a 3D context).
  */
 int
 amd_vm_create_fd(struct atrium_amd_softc *sc, struct thread *td, int *out_fd)
 {
 	struct atrium_amd_vm *vm;
 	struct file *fp;
-	uint64_t *pde;
-	uint16_t vmid;
-	int fd, err, i;
-
-	err = amd_vmid_alloc(sc, &vmid);
-	if (err != 0)
-		return (err);
+	int fd, err;
 
 	vm = malloc(sizeof(*vm), M_DEVBUF, M_WAITOK | M_ZERO);
 	vm->sc = sc;
-	vm->vmid = vmid;
-	if (amd_dma_page_alloc(sc, &vm->pdb) != 0) {
-		amd_vm_destroy(vm);
-		return (ENOMEM);
+	err = sc->backend->vm_setup(sc, vm);	/* hardware address space */
+	if (err != 0) {
+		free(vm, M_DEVBUF);	/* vm_setup unwound its own partial state */
+		return (err);
 	}
-	/* A contiguous run of NUM_PT page-table pages, each wired into its own
-	 * page-directory entry (PD indices AMD_VM_PD_INDEX .. +NUM_PT-1), so the
-	 * bump allocator spans NUM_PT * 2 MiB of VA. */
-	for (i = 0; i < ATRIUM_AMD_VM_NUM_PT; i++) {
-		if (amd_dma_page_alloc(sc, &vm->pt[i]) != 0) {
-			amd_vm_destroy(vm);
-			return (ENOMEM);
-		}
-		pde = (uint64_t *)((char *)vm->pdb.kva +
-		    (AMD_VM_PD_INDEX + i) * 8);
-		*pde = (vm->pt[i].gpa & ~0xfffULL) | ATRIUM_AMD_PTE_VALID;
-	}
-	vm->next_va = ATRIUM_AMD_BO_VA_BASE;
-
-	/* Program this VMID's page-directory base into the device. */
-	mtx_lock(&sc->lock);
-	amd_mmio_write32(sc, regVM_CTX_SELECT, vmid);
-	amd_mmio_write32(sc, regVM_CTX_PT_BASE_LO,
-	    (uint32_t)(vm->pdb.gpa & 0xffffffff));
-	amd_mmio_write32(sc, regVM_CTX_PT_BASE_HI, (uint32_t)(vm->pdb.gpa >> 32));
-	mtx_unlock(&sc->lock);
 
 	err = falloc_noinstall(td, &fp);
 	if (err != 0) {

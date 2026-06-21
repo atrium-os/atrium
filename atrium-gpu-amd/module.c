@@ -72,6 +72,8 @@
  */
 static const struct atrium_gpu_backend_ops amd_backend = {
 	.name = "amd",
+	.vm_setup = amd_vm_setup,
+	.vm_teardown = amd_vm_teardown,
 	.map_page = amd_vm_map,
 	.unmap_page = amd_vm_unmap,
 	.submit = amd_submit,

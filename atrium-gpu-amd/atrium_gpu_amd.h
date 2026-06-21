@@ -273,6 +273,12 @@ struct atrium_amd_bo;
  */
 struct atrium_gpu_backend_ops {
 	const char *name;
+	/* Stand up / tear down a VM's hardware address space (amd: VMID + GPUVM
+	 * page tables + per-context PT base; virtio: a 3D context). The front-end
+	 * owns the fd object + struct; the backend owns the hardware. vm_setup
+	 * self-cleans on failure; vm_teardown undoes a successful setup. */
+	int	(*vm_setup)(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm);
+	void	(*vm_teardown)(struct atrium_amd_vm *vm);
 	/* Map / unmap one page of a BO into a VM at a GPU-VA (amd: a GPUVM PTE). */
 	int	(*map_page)(struct atrium_amd_vm *vm, uint64_t va,
 		    vm_paddr_t phys, int vram);
@@ -451,6 +457,10 @@ int	 amd_vm_fget(struct thread *td, int fd, struct file **out_fp,
 int	 amd_vm_map(struct atrium_amd_vm *vm, uint64_t va, vm_paddr_t phys,
 	    int vram);
 void	 amd_vm_unmap(struct atrium_amd_vm *vm, uint64_t va);
+/* amd backend hardware setup/teardown of a VM's GPUVM (the front-end owns the
+ * struct + fd; these own the VMID + page tables + PT base). */
+int	 amd_vm_setup(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm);
+void	 amd_vm_teardown(struct atrium_amd_vm *vm);
 extern const struct fileops atrium_amd_vm_fileops;
 
 /* gmc.c — GMC/IH bring-up */
