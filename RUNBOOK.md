@@ -341,6 +341,37 @@ For a display-class GPU the splash and the GPU-driver bind live on *different* f
 
 Note: the gpusim *model* keeps per-device counters across `atrium_gpu_test` invocations within one boot (irq count, sched queue count, …), so re-running in the same boot inflates `irq`/`sched` counts; re-verify after a clean restart (`echo quit|nc -U /tmp/qmp.sock`, restart `gpusim-server`, `run-vm.sh --gpusim`).
 
+#### Shared-softc change → rebuild ALL THREE modules (else boot panic)
+
+The base/gpu/display modules share ONE `struct atrium_amd_softc` (the base
+allocates it via its `driver_t` softc size; gpu+display reach it through
+`device_get_softc(parent)`). **Any change to that struct in `atrium_gpu_amd.h`
+— adding/moving a field — changes its size and field offsets, so all three
+modules must be rebuilt together.** Rebuilding only one (e.g. gpu) leaves the
+base allocating the old size / mapping `regs` at the old offset while gpu reads
+the new offsets → garbage `sc->regs` → panic in `atrium_amd_attach`'s identity
+probe at boot (preload), which **bricks normal boot** (panics before
+multi-user). Always `make` base + gpu + display after a header struct change.
+
+**Recovery if you bricked boot this way** (panicking module preloaded, no SSH):
+the loader has a 1 s autoboot window on the serial console (`-display none`, so
+tcp:4444 is the only console). Catch it and reload the kernel WITHOUT the bad
+module — the atrium modules aren't needed to reach multi-user, but ZFS root is:
+
+```
+# at the loader "Hit [Enter]..." prompt (send any key during the 1 s window):
+OK unload
+OK load /boot/laminar/kernel
+OK load /boot/laminar/zfs.ko
+OK boot
+```
+
+Reactive timing is reliable via a tiny socket script (connect to 127.0.0.1:4444,
+watch for `Hit [Enter]`, send a space, then the `unload`/`load`/`boot` lines at
+`OK`). `unset <mod>_load` is too LATE — the loader already loaded the module by
+the prompt; you must `unload` (all) then reload only kernel + zfs.ko. Then SSH
+in, rebuild all three, install to `/boot/modules`, `kldxref`, reboot.
+
 #### In-VM build/load gotchas (learned the hard way 2026-06-20)
 
 Iterating on this kmod hit four traps, each costing a long detour. Avoid them:
