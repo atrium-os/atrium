@@ -138,10 +138,12 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		}
 		uint64_t ring_va = amd_bo_gpu_va(bo, vm);
 
-		if (ring_va == 0)	/* ring must be bound in THIS vm for a GPU-VA */
+		if (sc->backend->queue_program == NULL)
+			err = EOPNOTSUPP;	/* no user-mode queues on this backend */
+		else if (ring_va == 0)	/* ring must be bound in THIS vm for a GPU-VA */
 			err = EINVAL;
 		else
-			err = amd_queue_program(sc, ring_va, m->engine,
+			err = sc->backend->queue_program(sc, ring_va, m->engine,
 			    vm->vmid, &doorbell_off);
 		fdrop(bofp, td);
 		fdrop(vmfp, td);
@@ -388,10 +390,12 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		 * abandoned the work that would have signalled them, so they must
 		 * not be mis-attributed to a later interrupt.
 		 */
-		err = amd_reset(sc);
+		if (sc->backend->gpu_reset == NULL)
+			return (EOPNOTSUPP);
+		err = sc->backend->gpu_reset(sc);
 		if (err == 0) {
-			amd_firmware_load(sc);
-			amd_mes_init(sc);
+			/* The reset abandoned in-flight work; drop the completions
+			 * the ISR still owed so a later interrupt isn't misattributed. */
 			mtx_lock(&sc->lock);
 			sc->n_pending = 0;
 			mtx_unlock(&sc->lock);
@@ -402,7 +406,9 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 	case ATRIUM_GPU_IOC_SCHED: {
 		struct atrium_gpu_sched *s = (struct atrium_gpu_sched *)data;
 
-		amd_sched(sc, s);
+		if (sc->backend->sched == NULL)
+			return (EOPNOTSUPP);
+		sc->backend->sched(sc, s);
 		return (0);
 	}
 
@@ -410,7 +416,9 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		struct atrium_gpu_powergate *p =
 		    (struct atrium_gpu_powergate *)data;
 
-		return (amd_powergate(sc, p));
+		if (sc->backend->powergate == NULL)
+			return (EOPNOTSUPP);
+		return (sc->backend->powergate(sc, p));
 	}
 
 	/*

@@ -261,6 +261,8 @@ struct atrium_amd_dma_page {
 struct atrium_amd_softc;
 struct atrium_amd_vm;
 struct atrium_amd_bo;
+struct atrium_gpu_sched;	/* 'A' ABI structs (defined in atrium_gpu_amd_abi.h) */
+struct atrium_gpu_powergate;
 
 /*
  * Backend-supplied device capability values; the front-end assembles these into
@@ -317,6 +319,23 @@ struct atrium_gpu_backend_ops {
 	/* Fill in the backend's device capability values (vendor, heaps, VA window). */
 	void	(*get_caps)(struct atrium_amd_softc *sc,
 		    struct atrium_gpu_backend_caps *caps);
+
+	/*
+	 * Optional ops — a backend that doesn't implement one leaves it NULL and
+	 * the front-end returns ENOTSUP (capability-gated per v2). These are the
+	 * advanced/vendor-specific surfaces beyond the common path.
+	 */
+	/* Map a queue's doorbell for user-mode submission (amd: program the MEC/CP
+	 * queue at ring_va, return the doorbell page offset). */
+	int	(*queue_program)(struct atrium_amd_softc *sc, uint64_t ring_va,
+		    uint32_t engine, uint16_t vmid, uint32_t *doorbell_off);
+	/* Recover a wedged engine (amd: reset + reload firmware + re-init MES). */
+	int	(*gpu_reset)(struct atrium_amd_softc *sc);
+	/* Energy-aware scheduler hint (amd: SCHED registers). */
+	void	(*sched)(struct atrium_amd_softc *sc, struct atrium_gpu_sched *s);
+	/* Power-gating policy (amd: GFXOFF / per-IP PG). */
+	int	(*powergate)(struct atrium_amd_softc *sc,
+		    struct atrium_gpu_powergate *p);
 };
 
 /*

@@ -85,6 +85,19 @@ amd_get_caps(struct atrium_amd_softc *sc, struct atrium_gpu_backend_caps *c)
 	c->vram_bytes = ATRIUM_AMD_VRAM_BYTES;
 }
 
+/* amd backend: full engine reset — reset, reload CP firmware, re-init MES. */
+static int
+amd_gpu_reset(struct atrium_amd_softc *sc)
+{
+	int err = amd_reset(sc);
+
+	if (err == 0) {
+		amd_firmware_load(sc);
+		amd_mes_init(sc);
+	}
+	return (err);
+}
+
 static const struct atrium_gpu_backend_ops amd_backend = {
 	.name = "amd",
 	.vm_setup = amd_vm_setup,
@@ -97,6 +110,10 @@ static const struct atrium_gpu_backend_ops amd_backend = {
 	.export_scanout = amd_export_scanout,
 	.mmap = amd_doorbell_mmap,
 	.get_caps = amd_get_caps,
+	.queue_program = amd_queue_program,
+	.gpu_reset = amd_gpu_reset,
+	.sched = amd_sched,
+	.powergate = amd_powergate,
 };
 
 /*
