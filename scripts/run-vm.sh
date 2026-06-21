@@ -138,7 +138,7 @@ for arg in "$@"; do
                 # wait briefly for the socket
                 i=0; while [ ! -S "$GPUSIM_SOCK" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
             fi
-            GPUSIM_ARGS="-device gpusim,socket=$GPUSIM_SOCK"
+            GPUSIM_ARGS="-device gpusim,socket=$GPUSIM_SOCK,id=gpusim0"
             ;;
         --venus)
             # ⚠ SUPERSEDED — venus (guest Vulkan proxied to host MoltenVK over the
