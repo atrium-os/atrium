@@ -146,6 +146,8 @@
 #define regDISP_DPTRAIN_BW_MBPS	0x30068	/* r: trained bandwidth (MB/s) */
 #define regDISP_DPTRAIN_TRAINED	0x3006c	/* r: 1 = a link trained */
 #define regDISP_VBLANK_IRQ_EN	0x30070	/* w: 1 = raise an IH interrupt each vblank (DCN-like) */
+#define regDISP_POWER_DEMAND_MW	0x30074	/* r: modeled display power demand, mW (energy federation) */
+#define regDISP_POWER_BUDGET_MW	0x30078	/* w/r: granted power cap, mW (0 = uncapped) */
 #define regDISP_VBLANK_COUNT	0x30020	/* r: vblanks elapsed */
 #define regDISP_DROPPED_FLIPS	0x30024	/* r: flips dropped by the depth-1 queue */
 #define regDISP_FAULT		0x30028	/* r: last DisplayFault code (0 = none) */
@@ -469,7 +471,8 @@ struct atrium_amd_softc {
 	int		 doorbell_rid;
 	struct cdev	*cdev;		/* /dev/atrium-gpu0 (gpu module) */
 	struct cdev	*display_cdev;	/* /dev/atrium-display0 (display module) */
-	int		energy_member;	/* energy federation id, -1 = none */
+	int		energy_member;	/* gpu energy-federation id, -1 = none */
+	int		display_energy_member; /* display energy-federation id, -1 = none */
 
 	/*
 	 * Vblank knote list: EVFILT_READ knotes registered on /dev/atrium-display0
@@ -515,7 +518,7 @@ struct atrium_amd_softc {
 	int		 vm_count;	/* live vm_fds */
 
 	int		 bo_count;	/* live bo_fds; detach refuses if > 0 */
-	uint64_t	 vram_next;	/* VRAM bump allocator (offset into BAR0) */
+	uint64_t	 vram_next;	/* VRAM bump allocator cursor (base-managed) */
 };
 
 /*
@@ -629,6 +632,14 @@ void	 amd_mes_init(struct atrium_amd_softc *sc);
  */
 int	 amd_flr(struct atrium_amd_softc *sc);
 int	 amd_device_reset(struct atrium_amd_softc *sc);
+
+/*
+ * vram.c (BASE module) — the device VRAM bump allocator. VRAM is a *device*
+ * resource (any IP block may carve from it — the gpu's BOs today, a display
+ * cursor/overlay plane tomorrow), so the base owns the cursor. Bumps under
+ * sc->lock; *out_off is a byte offset into the VRAM aperture. ENOMEM when full.
+ */
+int	 amd_vram_alloc(struct atrium_amd_softc *sc, uint64_t size, uint64_t *out_off);
 
 /*
  * Register an IP module's reset prepare/restore hooks (NULL to clear on detach).

@@ -71,6 +71,7 @@ atrium_amd_pci_attach(device_t dev)
 
 	sc->dev = dev;
 	sc->energy_member = -1;
+	sc->display_energy_member = -1;
 	mtx_init(&sc->lock, "atrium-gpu", NULL, MTX_DEF);
 	sc->lock_inited = 1;
 	/*

@@ -192,13 +192,10 @@ amd_bo_backing_alloc(struct atrium_amd_softc *sc, struct atrium_amd_bo *bo,
 		uint64_t vram_off;
 		int i;
 
-		mtx_lock(&sc->lock);
-		if (sc->vram_next + rounded > ATRIUM_AMD_VRAM_BYTES) {
-			mtx_unlock(&sc->lock);
+		/* Carve from the device VRAM pool (base-owned — see vram.c). */
+		if (amd_vram_alloc(sc, rounded, &vram_off) != 0)
 			return (ENOMEM);
-		}
-		vram_off = sc->vram_next;
-		sc->vram_next += rounded;
+		mtx_lock(&sc->lock);
 		sc->bo_count++;
 		mtx_unlock(&sc->lock);
 		bo->vram = 1;

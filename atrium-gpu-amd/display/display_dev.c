@@ -23,6 +23,7 @@
 
 #include <sys/module.h>
 #include <sys/kernel.h>
+#include <sys/energy_budget.h>		/* the display's energy-federation member */
 
 /*
  * The display block hangs off the shared softc (the base module's). Reach it the
@@ -216,6 +217,32 @@ amd_display_reset_restore(struct atrium_amd_softc *sc)
 {
 	if (sc->display_vblank_armed)
 		amd_mmio_write32(sc, regDISP_VBLANK_IRQ_EN, 1);
+}
+
+/* --- energy federation: the display is its own power member ----------------- */
+
+/*
+ * The display draws real power independent of the GPU — backlight + scanout, with
+ * Panel Self-Refresh the dominant lever — so it federates as its own member
+ * ("display0") alongside the gpu ("gpu0"). demand reads the model's modeled
+ * display power; the budget actuator writes the granted cap, which the device
+ * obeys by engaging PSR/VRR when tight (modeled in gpusim's display.rs).
+ */
+static uint64_t
+amd_display_energy_demand_mw(void *arg)
+{
+	struct atrium_amd_softc *sc = arg;
+
+	return (amd_mmio_read32(sc, regDISP_POWER_DEMAND_MW));
+}
+
+static void
+amd_display_energy_budget_mw(void *arg, uint64_t mw)
+{
+	struct atrium_amd_softc *sc = arg;
+
+	amd_mmio_write32(sc, regDISP_POWER_BUDGET_MW,
+	    mw > UINT32_MAX ? UINT32_MAX : (uint32_t)mw);
 }
 
 static const struct filterops display_vblank_filtops = {
@@ -415,7 +442,16 @@ atrium_display_attach(device_t dev)
 	amd_reset_register(sc, ATRIUM_AMD_IP_DISPLAY, amd_display_reset_prepare,
 	    amd_display_reset_restore);
 
-	device_printf(dev, "ready: /dev/atrium-display%d\n", device_get_unit(dev));
+	/*
+	 * Federate the display's energy: it draws power independently of the gpu
+	 * (backlight + scanout), so it joins the Laminar energy allocator as its own
+	 * member, "display0", alongside the gpu's "gpu0".
+	 */
+	sc->display_energy_member = energy_member_register("display0",
+	    amd_display_energy_demand_mw, amd_display_energy_budget_mw, sc, 1);
+
+	device_printf(dev, "ready: /dev/atrium-display%d (energy member %d)\n",
+	    device_get_unit(dev), sc->display_energy_member);
 	return (0);
 }
 
@@ -429,6 +465,10 @@ atrium_display_detach(device_t dev)
 	 * sc->lock (serializes against a firing ISR) so the base never routes into
 	 * this module's text after it unloads.
 	 */
+	if (sc->display_energy_member >= 0) {
+		energy_member_unregister(sc->display_energy_member);
+		sc->display_energy_member = -1;
+	}
 	amd_mmio_write32(sc, regDISP_VBLANK_IRQ_EN, 0);
 	sc->display_vblank_armed = 0;
 	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_VBLANK, NULL);
