@@ -509,6 +509,8 @@ impl Display {
     }
 }
 
+impl AsRawFd for Display { fn as_raw_fd(&self) -> RawFd { self.fd } }
+
 impl Drop for Display { fn drop(&mut self) { unsafe { libc::close(self.fd) }; } }
 
 /// GPU reset (`_IO('A',16)`) — exposed for harness/recovery paths.

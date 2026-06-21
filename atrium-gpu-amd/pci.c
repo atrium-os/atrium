@@ -51,6 +51,10 @@ atrium_amd_pci_teardown(struct atrium_amd_softc *sc)
 		sc->regs = NULL;
 	}
 	if (sc->lock_inited) {
+		/* Detach any lingering vblank knotes, then free the knlist (both tied
+		 * to lock_inited), before destroying the lock they share. */
+		seldrain(&sc->display_sel);
+		knlist_destroy(&sc->display_sel.si_note);
 		mtx_destroy(&sc->lock);
 		sc->lock_inited = 0;
 	}
@@ -66,6 +70,13 @@ atrium_amd_pci_attach(device_t dev)
 	sc->energy_member = -1;
 	mtx_init(&sc->lock, "atrium-gpu", NULL, MTX_DEF);
 	sc->lock_inited = 1;
+	/*
+	 * The vblank knote list shares sc->lock and lives as long as the lock does
+	 * (tied to lock_inited). The GPU module's IH ISR fires it from inside the
+	 * sc->lock-held retire path; the display cdev registers EVFILT_READ knotes
+	 * on it. Init here so the ISR's KNOTE_LOCKED is always valid.
+	 */
+	knlist_init_mtx(&sc->display_sel.si_note, &sc->lock);
 
 	/*
 	 * PCI bring-up gate (referee INV-PCI-0001/0002): the device faults DMA

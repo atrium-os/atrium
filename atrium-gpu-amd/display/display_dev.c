@@ -146,6 +146,59 @@ display_open(struct cdev *cdev, int oflags, int devtype, struct thread *td)
 	return (0);
 }
 
+/* --- kqueue: EVFILT_READ on /dev/atrium-display0 fires once per vblank ----- */
+
+/*
+ * The knote list lives in the shared softc (sc->display_sel) and is fired by the
+ * GPU module's IH ISR — the block that actually sees the vblank interrupt. We
+ * just register/remove knotes on it here; sc->lock (the knlist's lock) guards
+ * the list. f_event mirrors EVFILT_TIMER: each vblank the ISR delivers bumps
+ * kn_data, and the filter is ready while kn_data != 0. EV_CLEAR (forced below)
+ * makes each kevent() return the vblanks elapsed since the last and reset — the
+ * natural "wait for the next vblank(s)" edge semantics, retiring WAIT_VBLANK.
+ */
+static void
+display_filt_detach(struct knote *kn)
+{
+	struct atrium_amd_softc *sc = kn->kn_hook;
+
+	mtx_lock(&sc->lock);
+	knlist_remove(&sc->display_sel.si_note, kn, 1);
+	mtx_unlock(&sc->lock);
+}
+
+static int
+display_filt_vblank(struct knote *kn, long hint)
+{
+	/* Called under sc->lock (the knlist lock) by KNOTE_LOCKED / the kqueue
+	 * scan. hint = vblanks this interrupt drained (0 on a bare readiness scan). */
+	if (hint != 0)
+		kn->kn_data += hint;
+	return (kn->kn_data != 0);
+}
+
+static const struct filterops display_vblank_filtops = {
+	.f_isfd = 1,
+	.f_detach = display_filt_detach,
+	.f_event = display_filt_vblank,
+};
+
+static int
+display_kqfilter(struct cdev *cdev, struct knote *kn)
+{
+	struct atrium_amd_softc *sc = display_softc(cdev);
+
+	if (kn->kn_filter != EVFILT_READ)
+		return (EINVAL);
+	kn->kn_fop = &display_vblank_filtops;
+	kn->kn_hook = sc;
+	kn->kn_flags |= EV_CLEAR;	/* edge: report vblanks-since-last, then reset */
+	mtx_lock(&sc->lock);
+	knlist_add(&sc->display_sel.si_note, kn, 1);
+	mtx_unlock(&sc->lock);
+	return (0);
+}
+
 static int
 display_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
     struct thread *td)
@@ -265,6 +318,7 @@ static struct cdevsw atrium_display_cdevsw = {
 	.d_name =	"atrium-display",
 	.d_open =	display_open,
 	.d_ioctl =	display_ioctl,
+	.d_kqfilter =	display_kqfilter,
 };
 
 /* --- newbus child driver -------------------------------------------------- */

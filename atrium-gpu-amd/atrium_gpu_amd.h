@@ -434,6 +434,15 @@ struct atrium_amd_softc {
 	struct cdev	*display_cdev;	/* /dev/atrium-display0 (display module) */
 	int		energy_member;	/* energy federation id, -1 = none */
 
+	/*
+	 * Vblank knote list: EVFILT_READ knotes registered on /dev/atrium-display0
+	 * (display module) hang here, but the GPU module's IH ISR is what fires them
+	 * (it sees the vblank interrupt). It lives in the SHARED softc, inited by the
+	 * base (pci) module under sc->lock, so the ISR's KNOTE_LOCKED is valid whether
+	 * or not the display module is loaded (empty list = harmless no-op walk).
+	 */
+	struct selinfo	 display_sel;
+
 	struct resource	*msix_table;	/* BAR holding the MSI-X table (BAR4) */
 	int		 msix_table_rid;
 	struct resource	*irq;		/* MSI-X vector 0 */

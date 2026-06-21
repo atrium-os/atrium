@@ -26,6 +26,7 @@ amd_intr(void *arg)
 	uint32_t wptr, idx;
 	const uint32_t *cookie;
 	int eops = 0;
+	int vbls = 0;
 
 	wptr = amd_mmio_read32(sc, regIH_WPTR);
 	while (sc->ih_rptr != wptr) {
@@ -34,12 +35,8 @@ amd_intr(void *arg)
 		    idx * ATRIUM_AMD_IH_COOKIE);
 		if (cookie[0] == ATRIUM_AMD_IH_CAUSE_EOP)
 			eops++;		/* each end-of-pipe cookie = one completion */
-		/*
-		 * ATRIUM_AMD_IH_CAUSE_VBLANK (DCN vertical blank, display-armed) is
-		 * recognized and acknowledged by draining it here; it retires no
-		 * syncobj. Its arrival is observable via irq_count (GET_IRQS) — the
-		 * per-vblank kqueue knote on /dev/atrium-display0 is a later milestone.
-		 */
+		else if (cookie[0] == ATRIUM_AMD_IH_CAUSE_VBLANK)
+			vbls++;		/* DCN vertical blank (display-armed) */
 		sc->ih_rptr++;
 	}
 	atomic_add_int(&sc->irq_count, 1);
@@ -65,6 +62,15 @@ amd_intr(void *arg)
 		amd_syncobj_signal(so, val);
 		eops--;
 	}
+	/*
+	 * Wake any kqueue waiter parked on /dev/atrium-display0 (EVFILT_READ). The
+	 * hint carries how many vblanks this interrupt drained so a coalesced ISR
+	 * (two refreshes, one IRQ) is reported as two. The knote list lives in the
+	 * shared softc and is locked by sc->lock, held here — exactly what
+	 * KNOTE_LOCKED requires.
+	 */
+	if (vbls > 0)
+		KNOTE_LOCKED(&sc->display_sel.si_note, vbls);
 	wakeup(&sc->irq_count);
 	mtx_unlock(&sc->lock);
 }
