@@ -1,11 +1,12 @@
 /*
- * bo.c — internal DMA pages + fd-backed buffer objects.
+ * bo.c — DMA pages + fd-backed buffer objects.
  *
- * `amd_dma_alloc` backs the driver's one remaining internal page (the IH ring;
- * page tables are now per-VM, vm.c). Buffer *objects* are the resources
- * userspace owns: each is a `struct file` (fd-as-handle), owns its own page,
- * is mapped into a VM's GPUVM at allocation, and holds a reference on that VM
- * so it can unmap on close. The integer handle table is gone.
+ * `amd_dma_page_alloc`/`_free` are the per-page bus_dma(9) primitive the GPUVM
+ * page tables are built from (vm.c). (The device-global IH ring has its own
+ * page, allocated by the base module in ih.c.) Buffer *objects* are the
+ * resources userspace owns: each is a `struct file` (fd-as-handle), owns its own
+ * page, is mapped into a VM's GPUVM at allocation, and holds a reference on that
+ * VM so it can unmap on close. The integer handle table is gone.
  */
 #include "atrium_gpu_amd.h"
 #include "atrium_gpu_amd_abi.h"	/* ATRIUM_GPU_BO_VRAM placement flag */
@@ -88,25 +89,6 @@ amd_dma_page_free(struct atrium_amd_dma_page *p)
 		bus_dma_tag_destroy(p->tag);
 		p->tag = NULL;
 	}
-}
-
-/*
- * Allocate + register an internal DMA page (the IH ring). Returns the kernel VA
- * and, via *gpa_out, the bus address the device DMA-walks.
- */
-void *
-amd_dma_alloc(struct atrium_amd_softc *sc, vm_paddr_t *gpa_out)
-{
-	struct atrium_amd_dma_page *p;
-
-	if (sc->n_dma >= ATRIUM_AMD_MAX_DMA)
-		return (NULL);
-	p = &sc->dma[sc->n_dma];
-	if (amd_dma_page_alloc(sc, p) != 0)
-		return (NULL);
-	*gpa_out = p->gpa;
-	sc->n_dma++;
-	return (p->kva);
 }
 
 /* --- buffer objects: fd-backed, mapped into a VM --- */

@@ -177,6 +177,20 @@ display_filt_vblank(struct knote *kn, long hint)
 	return (kn->kn_data != 0);
 }
 
+/*
+ * The IH VBLANK cause handler — registered with the base ISR (amd_ih_set_handler
+ * in attach). The base ISR drains the device-global IH ring, and for every
+ * vblank cookie it routes here, with sc->lock HELD and `count` = how many vblanks
+ * this interrupt drained. That is exactly KNOTE_LOCKED's contract (the knlist
+ * lock IS sc->lock), so we wake the EVFILT_READ waiters on /dev/atrium-display0
+ * directly. The GPU module plays no part — vblank is the display's own signal.
+ */
+static void
+amd_display_vblank_handler(struct atrium_amd_softc *sc, int count)
+{
+	KNOTE_LOCKED(&sc->display_sel.si_note, count);
+}
+
 static const struct filterops display_vblank_filtops = {
 	.f_isfd = 1,
 	.f_detach = display_filt_detach,
@@ -356,6 +370,15 @@ atrium_display_attach(device_t dev)
 	}
 	sc->display_cdev->si_drv1 = sc;
 
+	/*
+	 * Register our IH cause handler so the base ISR routes DCN vblank interrupts
+	 * here (→ the EVFILT_READ knote). This is all the display needs from the
+	 * interrupt path — no MSI-X or ISR of its own — and it works whether or not
+	 * the gpu (render) module is loaded.
+	 */
+	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_VBLANK,
+	    amd_display_vblank_handler);
+
 	device_printf(dev, "ready: /dev/atrium-display%d\n", device_get_unit(dev));
 	return (0);
 }
@@ -365,6 +388,13 @@ atrium_display_detach(device_t dev)
 {
 	struct atrium_amd_softc *sc = device_get_softc(device_get_parent(dev));
 
+	/*
+	 * Stop vblank interrupts at the device, then clear our handler under
+	 * sc->lock (serializes against a firing ISR) so the base never routes into
+	 * this module's text after it unloads.
+	 */
+	amd_mmio_write32(sc, regDISP_VBLANK_IRQ_EN, 0);
+	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_VBLANK, NULL);
 	if (sc->display_cdev != NULL) {
 		destroy_dev(sc->display_cdev);
 		sc->display_cdev = NULL;

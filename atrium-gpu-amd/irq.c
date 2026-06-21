@@ -1,57 +1,30 @@
 /*
- * irq.c — MSI-X interrupt setup + the ISR that drains the IH ring.
+ * irq.c — the GPU module's IH cause handler for end-of-pipe completions, plus
+ * the pending-completion FIFO it drains.
  *
- * Where the earlier milestones relied on the model draining a ring
- * synchronously inside the doorbell write (a model convenience), real silicon
- * completes asynchronously and signals an interrupt. This wires that up: a
- * RELEASE_MEM end-of-pipe event makes the device write a cookie into the IH
- * ring and raise MSI-X vector 0; our ISR drains the new cookies and counts the
- * completion. (Fence-wait/retire built on this is the next step; for now the
- * count is the observable that the interrupt actually reached the guest.)
+ * The device-global IH ring + ISR live in the BASE module (ih.c): real silicon
+ * carries GFX end-of-pipe, SDMA, and DCN vblank on ONE ring to ONE ISR. The base
+ * drains that ring and routes each cookie by cause to whoever registered. This
+ * module registers amd_eop_handler for IH_CAUSE_EOP (in atrium_amd_attach) and
+ * owns the fence-retire half of submission — it has NO role in vblank, which is
+ * a display signal the display module handles directly.
  */
 #include "atrium_gpu_amd.h"
 
-#include <machine/atomic.h>
-
 /*
- * The ISR. Read the device's IH write pointer, drain every cookie from our
- * read pointer up to it (each names the interrupt cause), and record that we
- * serviced an interrupt. MSI-X is message-signaled (edge), so there is no
- * level to acknowledge — reading the new cookies is the whole handshake.
+ * EOP cause handler — called by the base ISR with sc->lock HELD, `count` = how
+ * many end-of-pipe cookies this interrupt drained. Retire that many completions:
+ * signal one pending syncobj per event. This is the asynchronous half of
+ * submission — a submission whose ring parked on a cross-queue WAIT registered
+ * its syncobj here and is signalled now, on the *later* doorbell sweep that
+ * unblocked it (not inline at submit). amd_syncobj_signal takes so->lock nested
+ * under sc->lock; the syncobj's fo_close scrubs the list under sc->lock first,
+ * so the so is always live here. Also wakes any IOC_WAIT_FENCE poller.
  */
-static void
-amd_intr(void *arg)
+void
+amd_eop_handler(struct atrium_amd_softc *sc, int count)
 {
-	struct atrium_amd_softc *sc = arg;
-	uint32_t wptr, idx;
-	const uint32_t *cookie;
-	int eops = 0;
-	int vbls = 0;
-
-	wptr = amd_mmio_read32(sc, regIH_WPTR);
-	while (sc->ih_rptr != wptr) {
-		idx = sc->ih_rptr % ATRIUM_AMD_IH_ENTRIES;
-		cookie = (const uint32_t *)((const char *)sc->ih_kva +
-		    idx * ATRIUM_AMD_IH_COOKIE);
-		if (cookie[0] == ATRIUM_AMD_IH_CAUSE_EOP)
-			eops++;		/* each end-of-pipe cookie = one completion */
-		else if (cookie[0] == ATRIUM_AMD_IH_CAUSE_VBLANK)
-			vbls++;		/* DCN vertical blank (display-armed) */
-		sc->ih_rptr++;
-	}
-	atomic_add_int(&sc->irq_count, 1);
-
-	/*
-	 * Retire completions: signal one pending syncobj per end-of-pipe event.
-	 * This is the asynchronous half of submission — a submission whose ring
-	 * parked on a cross-queue WAIT registered its syncobj here and is signalled
-	 * now, on the *later* doorbell sweep that unblocked it (not inline at
-	 * submit). amd_syncobj_signal takes so->lock nested under sc->lock; the
-	 * syncobj's fo_close scrubs the list under sc->lock first, so the so is
-	 * always live here. Also wakes any IOC_WAIT_FENCE poller.
-	 */
-	mtx_lock(&sc->lock);
-	while (eops > 0 && sc->n_pending > 0) {
+	while (count > 0 && sc->n_pending > 0) {
 		struct atrium_amd_syncobj *so = sc->pending[0].so;
 		uint64_t val = sc->pending[0].value;
 		int i;
@@ -60,19 +33,9 @@ amd_intr(void *arg)
 			sc->pending[i - 1] = sc->pending[i];
 		sc->n_pending--;
 		amd_syncobj_signal(so, val);
-		eops--;
+		count--;
 	}
-	/*
-	 * Wake any kqueue waiter parked on /dev/atrium-display0 (EVFILT_READ). The
-	 * hint carries how many vblanks this interrupt drained so a coalesced ISR
-	 * (two refreshes, one IRQ) is reported as two. The knote list lives in the
-	 * shared softc and is locked by sc->lock, held here — exactly what
-	 * KNOTE_LOCKED requires.
-	 */
-	if (vbls > 0)
-		KNOTE_LOCKED(&sc->display_sel.si_note, vbls);
 	wakeup(&sc->irq_count);
-	mtx_unlock(&sc->lock);
 }
 
 /*
@@ -114,52 +77,4 @@ amd_pending_scrub(struct atrium_amd_softc *sc, struct atrium_amd_syncobj *so)
 	}
 	sc->n_pending = j;
 	mtx_unlock(&sc->lock);
-}
-
-/*
- * Allocate one MSI-X vector (the model signals vector 0) and hook the ISR.
- * Non-fatal on failure: the device still works via the synchronous-drain path,
- * so the caller logs and continues in poll mode rather than failing attach.
- */
-int
-amd_irq_setup(struct atrium_amd_softc *sc)
-{
-	/*
-	 * The base (pci) module owns MSI-X: it allocated the table BAR and called
-	 * pci_alloc_msix() as the device owner (§4.1). We just grab vector 0's IRQ
-	 * resource and hook the ISR. If the base couldn't enable MSI-X, fall back
-	 * to the synchronous-drain (poll) path.
-	 */
-	if (sc->msix_table == NULL)
-		return (ENXIO);
-
-	sc->irq_rid = 1;	/* MSI-X vector 0 is resource id 1 */
-	sc->irq = bus_alloc_resource_any(sc->dev, SYS_RES_IRQ, &sc->irq_rid,
-	    RF_ACTIVE);
-	if (sc->irq == NULL)
-		return (ENXIO);
-	if (bus_setup_intr(sc->dev, sc->irq, INTR_TYPE_MISC | INTR_MPSAFE,
-	    NULL, amd_intr, sc, &sc->intr_cookie) != 0) {
-		bus_release_resource(sc->dev, SYS_RES_IRQ, sc->irq_rid, sc->irq);
-		sc->irq = NULL;
-		return (ENXIO);
-	}
-	sc->msix_enabled = 1;
-	return (0);
-}
-
-/* Tear down the interrupt hookup (safe whether or not setup succeeded). */
-void
-amd_irq_teardown(struct atrium_amd_softc *sc)
-{
-	if (sc->intr_cookie != NULL) {
-		bus_teardown_intr(sc->dev, sc->irq, sc->intr_cookie);
-		sc->intr_cookie = NULL;
-	}
-	if (sc->irq != NULL) {
-		bus_release_resource(sc->dev, SYS_RES_IRQ, sc->irq_rid, sc->irq);
-		sc->irq = NULL;
-	}
-	/* The MSI-X table BAR + pci_release_msi belong to the base (pci) module. */
-	sc->msix_enabled = 0;
 }

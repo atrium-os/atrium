@@ -237,9 +237,6 @@
 #define ATRIUM_AMD_VM_MAX_BO	(512 * ATRIUM_AMD_VM_NUM_PT) /* VA pages per VM */
 #define ATRIUM_AMD_MAX_VMID	16	/* hardware contexts; 1..15 for user VMs */
 
-/* Internal DMA-page registry (the IH ring; page tables are now per-VM). */
-#define ATRIUM_AMD_MAX_DMA	8
-
 /*
  * A page of DMA-able guest memory: kernel VA (CPU side) + guest-physical
  * address (what the device DMA-walks). In a VM with no IOMMU on this device,
@@ -422,6 +419,18 @@ struct atrium_amd_pending {
 #define ATRIUM_AMD_MAX_PENDING	16
 #define ATRIUM_AMD_IH_CAUSE_EOP	1	/* IH cookie cause: end-of-pipe (device.rs) */
 #define ATRIUM_AMD_IH_CAUSE_VBLANK 2	/* IH cookie cause: DCN vertical blank */
+#define ATRIUM_AMD_IH_NCAUSE	4	/* dispatch-table size (causes 0..N-1) */
+
+/*
+ * IH cause handler: the device-global interrupt ring is owned by the BASE
+ * module, which drains it and demuxes by cookie cause (exactly as real silicon's
+ * one IH ring carries GFX end-of-pipe AND DCN vblank to a single ISR). Each IP
+ * module registers a handler for its own cause(s) — gpu for EOP, display for
+ * VBLANK — so neither needs the other: the base routes the cause to whoever
+ * registered. The handler is called with sc->lock HELD and `count` = how many of
+ * that cause this interrupt drained (coalesced events report > 1).
+ */
+typedef void (*atrium_amd_ih_handler)(struct atrium_amd_softc *sc, int count);
 
 struct atrium_amd_softc {
 	device_t	 dev;
@@ -449,8 +458,18 @@ struct atrium_amd_softc {
 	int		 irq_rid;
 	void		*intr_cookie;
 	int		 msix_enabled;	/* 1 = interrupt mode, 0 = poll mode */
+
+	/*
+	 * Device-global IH (interrupt-handler) ring + dispatch, owned by the BASE
+	 * module. The ring is one coherent DMA page the device write-walks; the base
+	 * ISR drains it and routes each cookie by cause to ih_handler[cause] (set by
+	 * the gpu/display modules under sc->lock). ih_kva/tag/map back the page.
+	 */
 	void		*ih_kva;	/* interrupt-handler ring (CPU side) */
+	bus_dma_tag_t	 ih_tag;	/* bus_dma tag for the ring page */
+	bus_dmamap_t	 ih_map;	/* bus_dma map for the ring page */
 	uint32_t	 ih_rptr;	/* our read pointer into the IH ring */
+	atrium_amd_ih_handler ih_handler[ATRIUM_AMD_IH_NCAUSE]; /* cause -> handler */
 	u_int		 irq_count;	/* interrupts serviced (atomic vs reader) */
 	struct mtx	 lock;		/* guards fence-wait sleep/wakeup + pending */
 	int		 lock_inited;
@@ -460,8 +479,6 @@ struct atrium_amd_softc {
 	uint32_t	 vmid_bitmap;	/* allocated VMIDs (bit N = VMID N in use) */
 	int		 vm_count;	/* live vm_fds */
 
-	struct atrium_amd_dma_page dma[ATRIUM_AMD_MAX_DMA];
-	int		 n_dma;
 	int		 bo_count;	/* live bo_fds; detach refuses if > 0 */
 	uint64_t	 vram_next;	/* VRAM bump allocator (offset into BAR0) */
 };
@@ -492,11 +509,36 @@ amd_pm4_type3_header(uint32_t opcode, uint32_t body_dwords)
 	    (opcode << 8));
 }
 
-/* bo.c — internal DMA pages + fd-backed buffer objects */
-void	*amd_dma_alloc(struct atrium_amd_softc *sc, vm_paddr_t *gpa_out);
+/* bo.c — DMA pages (the GPUVM page tables) + fd-backed buffer objects */
 int	 amd_dma_page_alloc(struct atrium_amd_softc *sc,
 	    struct atrium_amd_dma_page *p);
 void	 amd_dma_page_free(struct atrium_amd_dma_page *p);
+
+/*
+ * IH ring + dispatch — owned by the BASE (pci) module (ih.c). amd_ih_init stands
+ * up the device-global interrupt ring; amd_irq_setup hooks the ISR that drains
+ * it and routes by cause. The gpu/display modules don't call these — they only
+ * register a handler for their cause via amd_ih_set_handler (below).
+ */
+int	 amd_ih_init(struct atrium_amd_softc *sc);
+void	 amd_ih_fini(struct atrium_amd_softc *sc);
+
+/*
+ * Register/clear the handler for an IH cause. Stored in the shared softc under
+ * sc->lock (the ISR reads + calls it under that same lock), so a module sets its
+ * handler on attach and clears it (NULL) on detach with no races against a
+ * firing interrupt. Inline in the header → no cross-module symbol, each module
+ * compiles its own copy (the function it points at is its own).
+ */
+static inline void
+amd_ih_set_handler(struct atrium_amd_softc *sc, int cause,
+    atrium_amd_ih_handler fn)
+{
+	mtx_lock(&sc->lock);
+	if (cause >= 0 && cause < ATRIUM_AMD_IH_NCAUSE)
+		sc->ih_handler[cause] = fn;
+	mtx_unlock(&sc->lock);
+}
 int	 amd_bo_create_fd(struct atrium_amd_softc *sc, struct thread *td,
 	    uint64_t size, uint32_t flags, int *out_fd);
 int	 amd_bo_fget(struct thread *td, int fd, struct file **out_fp,
@@ -580,9 +622,18 @@ int	 amd_syncobj_fget(struct thread *td, int fd, struct file **out_fp,
 void	 amd_syncobj_signal(struct atrium_amd_syncobj *so, uint64_t value);
 extern const struct fileops atrium_amd_syncobj_fileops;
 
-/* irq.c — MSI-X interrupt setup, the ISR, and the pending-completion list */
+/* ih.c (BASE module) — MSI-X interrupt setup + the device-global IH ring ISR */
 int	 amd_irq_setup(struct atrium_amd_softc *sc);
 void	 amd_irq_teardown(struct atrium_amd_softc *sc);
+
+/*
+ * irq.c (GPU module) — the EOP cause handler + its pending-completion list. The
+ * base ISR routes IH_CAUSE_EOP here (registered via amd_ih_set_handler). Called
+ * with sc->lock HELD: retires `count` end-of-pipe completions onto their
+ * syncobjs and wakes fence waiters. The pending FIFO is pushed before a submit's
+ * doorbell and scrubbed by a syncobj's fo_close.
+ */
+void	 amd_eop_handler(struct atrium_amd_softc *sc, int count);
 void	 amd_pending_push(struct atrium_amd_softc *sc,
 	    struct atrium_amd_syncobj *so, uint64_t value);
 void	 amd_pending_scrub(struct atrium_amd_softc *sc,

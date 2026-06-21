@@ -34,6 +34,9 @@ atrium_amd_pci_probe(device_t dev)
 static void
 atrium_amd_pci_teardown(struct atrium_amd_softc *sc)
 {
+	/* Unhook the ISR + free the IH ring before the MSI-X vectors it used. */
+	amd_irq_teardown(sc);
+	amd_ih_fini(sc);
 	if (sc->msix_table != NULL) {
 		pci_release_msi(sc->dev);
 		bus_release_resource(sc->dev, SYS_RES_MEMORY, sc->msix_table_rid,
@@ -122,6 +125,21 @@ atrium_amd_pci_attach(device_t dev)
 			device_printf(dev, "MSI-X unavailable — children poll\n");
 		}
 	}
+
+	/*
+	 * Stand up the device-global IH ring + hook the single ISR HERE, in the
+	 * device owner — before any child attaches. The IH ring is a device
+	 * resource (GFX end-of-pipe AND DCN vblank ride it to one ISR), so it
+	 * belongs to the base, not the gpu module; each IP child later registers a
+	 * handler for its own cause (amd_ih_set_handler). Both non-fatal: without
+	 * the ring/ISR the device still works via the synchronous-drain poll path.
+	 */
+	if (amd_ih_init(sc) != 0)
+		device_printf(dev, "IH ring unavailable — children poll\n");
+	else if (amd_irq_setup(sc) == 0)
+		device_printf(dev, "IH ring + MSI-X up (interrupt-driven)\n");
+	else
+		device_printf(dev, "MSI-X unavailable — children poll\n");
 
 	/*
 	 * The GPU (compute/render) and display engine are distinct IP blocks on

@@ -125,31 +125,29 @@ static const struct atrium_gpu_backend_ops amd_backend = {
 static void
 amd_teardown(struct atrium_amd_softc *sc)
 {
-	int i;
-
-	amd_irq_teardown(sc);
+	/*
+	 * Stop the base ISR routing end-of-pipe interrupts into this module FIRST:
+	 * amd_ih_set_handler clears the slot under sc->lock, which serializes against
+	 * a firing ISR, so once it returns no interrupt can call amd_eop_handler (in
+	 * this module's text, about to be unloaded).
+	 */
+	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_EOP, NULL);
 	if (sc->cdev != NULL) {
 		destroy_dev(sc->cdev);
 		sc->cdev = NULL;
 	}
-	for (i = 0; i < sc->n_dma; i++)
-		amd_dma_page_free(&sc->dma[i]);
-	sc->n_dma = 0;
 	/*
-	 * Reset the rest of the gpu module's footprint in the SHARED softc back to
-	 * the pristine state the base left it in, so a re-attach (driver hot-swap,
-	 * docs/spec/gpu-driver-hotswap.md Protocol A) starts clean: the IH ring is
-	 * freed above, so drop its pointer + read cursor, and forget any
+	 * Reset this module's footprint in the SHARED softc back to the pristine
+	 * state the base left it in, so a re-attach (driver hot-swap,
+	 * docs/spec/gpu-driver-hotswap.md Protocol A) starts clean: forget any
 	 * completions the ISR still owed (their syncobjs are gone with the fds).
 	 */
-	sc->ih_kva = NULL;
-	sc->ih_rptr = 0;
 	sc->n_pending = 0;
 	sc->backend = NULL;	/* points into this module; gone after kldunload */
 	/*
-	 * The BAR resources and the softc mutex belong to the base (pci) module
-	 * (it mapped them into the shared softc); it releases them on its own
-	 * detach. This GPU module only tears down what it set up.
+	 * The IH ring + ISR, the BAR resources, and the softc mutex all belong to
+	 * the base (pci) module; it releases them on its own detach. This GPU module
+	 * only tears down what it set up (the cdev + its IH handler registration).
 	 */
 }
 
@@ -218,9 +216,10 @@ atrium_amd_attach(device_t dev)
 
 	/*
 	 * Cold -> alive bring-up (device-reference §4): reset to a known state,
-	 * stand up GMC/IH so the CP has page tables + an interrupt ring, then
-	 * load CP firmware and init the MES. Order is load-bearing; the model's
-	 * referee faults a doorbell before firmware or a queue map before MES.
+	 * enable GMC paging, then load CP firmware and init the MES. Order is
+	 * load-bearing; the model's referee faults a doorbell before firmware or a
+	 * queue map before MES. (The IH ring + ISR are the base module's — already
+	 * up before this child attached.)
 	 */
 	if ((err = amd_reset(sc)) != 0) {
 		amd_teardown(sc);
@@ -234,15 +233,12 @@ atrium_amd_attach(device_t dev)
 	amd_mes_init(sc);
 
 	/*
-	 * Hook MSI-X for interrupt-driven completion (the device raises an
-	 * end-of-pipe IRQ on a RELEASE_MEM fence). Non-fatal: if MSI-X can't be
-	 * set up, the device still works via the synchronous-drain path, so we
-	 * log and run in poll mode rather than failing attach.
+	 * Register this module's IH cause handler: the base ISR routes every
+	 * end-of-pipe completion (IH_CAUSE_EOP, raised on a RELEASE_MEM fence) to
+	 * amd_eop_handler, which retires it onto its syncobj. The vblank cause is
+	 * the display module's — the GPU has no part in it.
 	 */
-	if (amd_irq_setup(sc) == 0)
-		device_printf(dev, "MSI-X enabled (interrupt-driven completion)\n");
-	else
-		device_printf(dev, "MSI-X unavailable — poll mode\n");
+	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_EOP, amd_eop_handler);
 
 	/*
 	 * Publish the userspace interface. From here a user-mode driver (or the
