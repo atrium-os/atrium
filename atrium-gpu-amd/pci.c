@@ -178,3 +178,22 @@ static driver_t atrium_amd_pci_driver = {
 DRIVER_MODULE(atrium_gpu_amd_pci, pci, atrium_amd_pci_driver, NULL, NULL);
 MODULE_DEPEND(atrium_gpu_amd_pci, pci, 1, 1, 1);
 MODULE_VERSION(atrium_gpu_amd_pci, 1);
+
+/*
+ * PnP table — lets devmatch(8)/devd identify and autoload this driver from the
+ * device's PCI vendor:device. This is the discovery half of selective (non-
+ * preload) loading: rather than carrying every vendor's base in loader.conf,
+ * devmatch matches the GPU present against each base's MODULE_PNP_INFO and
+ * loads only the one that fits. NB: a VGA-class GPU is still claimed by the
+ * built-in vgapci at enumeration, so devmatch's load alone won't *bind* it —
+ * the bind happens by preloading (win the probe) or a forced handoff at
+ * display bring-up (devctl set driver -f). devmatch supplies the identity;
+ * the bind policy is separate. The kld build's kldxref folds this into
+ * /boot/.../linker.hints so devmatch can read it without loading the module.
+ */
+struct atrium_amd_pci_id { uint16_t vendor; uint16_t device; };
+static const struct atrium_amd_pci_id atrium_amd_pci_ids[] = {
+	{ ATRIUM_AMD_VENDOR, ATRIUM_AMD_DEVICE },
+};
+MODULE_PNP_INFO("U16:vendor;U16:device", pci, atrium_gpu_amd_pci,
+    atrium_amd_pci_ids, nitems(atrium_amd_pci_ids));
