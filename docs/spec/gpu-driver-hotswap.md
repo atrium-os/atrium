@@ -176,6 +176,39 @@ certification) already exists and is verified; the display-side
 (`pci.ko`/`display.ko` independence, CRTC adopt-without-modeset) is the
 `atrium-gpu-amd` D5+ bring-up's concern.
 
+### Foundational mechanism: re-entrant child kmod lifecycle (verified)
+
+Both protocols reduce, at the kernel level, to **`kldunload`/`kldload` of a
+child driver (`gpu.ko` or `display.ko`) while the base (`pci.ko`) and the
+sibling stay loaded.** That requires the child's `detach`/`attach` to be
+re-entrant against the *base-owned shared `softc`*. The contract:
+
+- **One softc, owned by the base.** The gpu and display children carry **no
+  per-child `softc`** (their `driver_t` size is 0); all state lives in the
+  base's `struct atrium_amd_softc`, reached *only* via
+  `device_get_softc(device_get_parent(dev))`. A child that declares its own
+  softc invites `detach` to operate on the wrong (zeroed) struct — the exact
+  bug that made the first reload attempt panic (`detach` leaked the real cdev
+  and unregistered energy slot 0; the next `attach`'s `make_dev` then hit the
+  stale node and panicked).
+- **`detach` mirrors `attach`, exactly.** Everything a child sets in the shared
+  softc it returns to the base's pristine state: destroy the cdev, free the IH
+  ring and NULL its pointer/cursor, drop owed completions, unregister the
+  energy member and reset its sentinel. The base's fields (BARs, MSI-X table,
+  `lock`) are never touched.
+- **`attach` tolerates a dirty world.** `make_dev_p(MAKEDEV_CHECKNAME)` so a
+  stale node fails the attach with `EEXIST` rather than panicking — a hot-swap
+  step must never be able to take down the kernel.
+- **The `EBUSY` guard is the drain gate.** `detach` refuses while any BO/VM fd
+  is open, so Protocol A's "drain to Tier-2 + release the Tier-3 backend's
+  handles" (step 1–2) is precisely what makes the swap legal.
+
+**Status: verified in-VM (gpusim, 2026-06-21).** `gpu.ko` hot-swapped 3× and
+`display.ko` 2× — node destroyed on unload, recreated on load, base + sibling
+stay loaded throughout — with `atrium_gpu_test`/`amd_smoke` green after. This
+is Protocol A/B's kernel substrate; the router-side drain/re-cert/resume
+(above) layers on top.
+
 ## Status
 
 Design recorded; **not implemented.** The composing pieces (energy router,
