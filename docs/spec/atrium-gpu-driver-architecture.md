@@ -142,13 +142,24 @@ kqueue-able syncobjs (no blocking `WAIT_FENCE`/eventfd), opaque PM4-blob submit
 `/dev/atrium-gpu0` already *is* the v2 `'A'` surface, validated against the gpusim
 model of real AMD silicon.
 
-**The point of the virtio driver is to prove that surface is transport-neutral —
-not to be a second driver with its own ABI.** `gpusim`+`atrium-gpu-amd` is the
-real-AMD path (a functional model standing in for silicon); `atrium-virtio-gpu`
-is the *same `'A'` front-end* over a virtio-gpu transport. Both are **backends**;
-the kernel↔userspace contract is identical. When real AMD silicon arrives it
-swaps the gpusim backend for a hardware one **behind the same front-end** — which
-is exactly why virtio is a stepping stone toward real drivers, not a fork.
+**The backend seam's primary purpose is the gpusim → real-silicon swap, NOT
+virtio.** `gpusim`+`atrium-gpu-amd` already *is* the full hardware-driver path
+end to end: the real `'A'`/`'D'` driver drives gpusim (a functional RDNA model),
+and gpusim's QEMU device registers a graphic console (`graphic_console_init` +
+`gpusim_gfx_update`, which bulk-reads the VRAM scanout and blits it), so with
+`run-vm.sh --display` the driver produces a **visible** display with no guest
+paravirt driver anywhere. That is the whole reason gpusim exists — stock QEMU
+has no gpusim, so virtio/vmwgfx were only ever needed in its absence. When real
+AMD silicon arrives, you replace the gpusim backend (the `amd_*` ops driving the
+model socket) with a hardware one **behind the same front-end** — same ABI, same
+`amd_smoke`. That is the convergence the seam serves.
+
+**A virtio backend is therefore OPTIONAL — a parallel/backup transport, not a
+required deliverable.** It happens to fit the same vtable for free (a second ops
+table over `CTX_INIT`/blob/`SUBMIT_3D`), so it can be added if we ever want to
+run on a stock hypervisor without gpusim, or as a fallback. But the main path is
+the real driver over gpusim (today) / real silicon (later); we do not need to
+build virtio to have a full hardware driver end to end.
 
 ### 6.1 The seam — shared front-end over a backend-ops vtable
 
@@ -185,13 +196,19 @@ attaches).
 
 ### 6.2 Extraction plan (incremental, each step verifiable)
 
-1. **Define `atrium_gpu_backend_ops`** + move the gpusim/PM4/GPUVM hardware paths
-   in `atrium-gpu-amd` behind it (amd = the first backend). Front-end code
-   (`ioctl.c`, the fd objects, bindings, syncobj, caps) calls only the vtable.
-   Verify: `amd_smoke`/`bo_share`/`display_flip` unchanged.
-2. **Split the front-end into a shared source set** both kmods build.
-3. **Write the virtio backend** (`vm_create`→`CTX_INIT`, `bo_alloc`→blob, etc.),
-   retiring `atrium_virtio_gpu.c`'s `'G'` ioctls. Verify: `amd_smoke` runs
-   unmodified against `/dev/atrium-gpu0` *on the virtio transport*.
+1. ✅ **DONE** — **`atrium_gpu_backend_ops`** defined and the gpusim/PM4/GPUVM
+   hardware paths moved behind it (amd = the first backend): `vm_setup`/teardown,
+   `bo_alloc`/free, `map`/`unmap_page`, `submit`, `export_scanout`, `mmap`,
+   `get_caps`, + optional `queue_program`/`gpu_reset`/`sched`/`powergate`. The
+   front-end (`ioctl.c` + cdevsw, the fd objects, bindings, syncobj, caps) calls
+   ONLY the vtable. Verified by `amd_smoke`/`bo_share`/`display_flip` throughout.
+2. (optional, good hygiene) **Split the front-end into a shared source set** so a
+   second backend kmod can build it — only worth doing if/when a second backend
+   is actually built.
+3. **(OPTIONAL — a virtio backend is a backup transport, not required; see §6
+   above.)** Write it as a second ops table (`vm_create`→`CTX_INIT`,
+   `bo_alloc`→blob, …) only if we want to run without gpusim. The *required* next
+   step is instead the **gpusim → real-silicon** backend swap when hardware
+   exists — same front-end, a hardware ops table replacing the model-socket one.
 4. Retire the legacy `'G'` surface once no caller remains (the aqueduct smokes,
    per the reconciliation doc D-3).
