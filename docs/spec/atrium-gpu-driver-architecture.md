@@ -132,3 +132,66 @@ delete at the model→silicon / v1→v2 boundary, not an ABI to preserve.
   `event_fd`, VM_BIND, opaque-blob submit).
 - Differentiate where amdgpu structurally cannot: **kqueue-native sync**
   (already in v2) and **energy-router telemetry** (delta §3b).
+
+## 6. Backends behind the shared ABI — virtio is a stepping stone, not a separate driver
+
+§4's convergence has **landed** in `atrium-gpu-amd`: fd-as-handle BOs/VMs/syncobjs
+(SCM_RIGHTS-passable), explicit `VM_BIND` (now into *multiple* VMs — sharing),
+kqueue-able syncobjs (no blocking `WAIT_FENCE`/eventfd), opaque PM4-blob submit
+(`SET_COMPUTE`/`SET_DRAW` deleted), and a caps TLV (`ADDRESS_SPACE`/`HEAPS`). So
+`/dev/atrium-gpu0` already *is* the v2 `'A'` surface, validated against the gpusim
+model of real AMD silicon.
+
+**The point of the virtio driver is to prove that surface is transport-neutral —
+not to be a second driver with its own ABI.** `gpusim`+`atrium-gpu-amd` is the
+real-AMD path (a functional model standing in for silicon); `atrium-virtio-gpu`
+is the *same `'A'` front-end* over a virtio-gpu transport. Both are **backends**;
+the kernel↔userspace contract is identical. When real AMD silicon arrives it
+swaps the gpusim backend for a hardware one **behind the same front-end** — which
+is exactly why virtio is a stepping stone toward real drivers, not a fork.
+
+### 6.1 The seam — shared front-end over a backend-ops vtable
+
+What is **transport-neutral** (the shared `'A'` front-end — today this code lives
+in `atrium-gpu-amd` and is extracted for reuse):
+
+- the cdev + `d_ioctl` dispatch (`/dev/atrium-gpu0`, the `'A'` switch);
+- the fd-object lifecycle — `BO`/`VM`/`Syncobj` as `struct file`s, `DFLAG_PASSABLE`,
+  the `*_fget` helpers, refcount/teardown;
+- the per-BO **bindings list** bookkeeping (a BO bound into N VMs);
+- the **syncobj timeline** + `knlist` (kqueue delivery);
+- `BO_WRITE`/`BO_READ` CPU copies; the **caps TLV** assembly.
+
+What is **per-backend** (the `atrium_gpu_backend_ops` vtable — the *only* thing a
+new transport/vendor implements):
+
+| op | amd (gpusim → real AMD) | virtio-gpu |
+| --- | --- | --- |
+| `vm_create` / `vm_destroy` | alloc VMID + GPUVM page tables | `CTX_INIT` (a 3D context) |
+| `bo_alloc(size, flags)` | `bus_dma` System / VRAM pages | `RESOURCE_CREATE_BLOB` (guest pages) |
+| `bo_map(bo, vm, *va)` | write PTEs into the VM's page table | attach resource to context, host assigns VA |
+| `bo_unmap(bo, vm)` | clear PTEs | detach resource |
+| `submit(vm, blob, len, engine, signal)` | lay PM4 ring + ring doorbell | `SUBMIT_3D` on the ctrl virtqueue |
+| `syncobj_signal` / fence retire | `RELEASE_MEM` fence + IH IRQ | virtio-gpu fence retirement |
+| `scanout(fb)` | display module `FB_BASE` | `SET_SCANOUT` |
+| caps values | RDNA/gpusim heaps, 32 MiB VA | virtio-gpu blob heaps, host VA |
+
+The two facts that make this hold: the **submit blob is opaque** (amd packs PM4;
+virtio/venus packs a Vulkan command stream — the ABI never inspects it), and the
+**GPU-VA is backend-assigned** (amd from its page-table allocator; virtio from the
+host's device-address space). `VM_BIND`-into-many-VMs is a front-end concept;
+each backend realizes it its own way (amd: extra PTE sets; virtio: extra context
+attaches).
+
+### 6.2 Extraction plan (incremental, each step verifiable)
+
+1. **Define `atrium_gpu_backend_ops`** + move the gpusim/PM4/GPUVM hardware paths
+   in `atrium-gpu-amd` behind it (amd = the first backend). Front-end code
+   (`ioctl.c`, the fd objects, bindings, syncobj, caps) calls only the vtable.
+   Verify: `amd_smoke`/`bo_share`/`display_flip` unchanged.
+2. **Split the front-end into a shared source set** both kmods build.
+3. **Write the virtio backend** (`vm_create`→`CTX_INIT`, `bo_alloc`→blob, etc.),
+   retiring `atrium_virtio_gpu.c`'s `'G'` ioctls. Verify: `amd_smoke` runs
+   unmodified against `/dev/atrium-gpu0` *on the virtio transport*.
+4. Retire the legacy `'G'` surface once no caller remains (the aqueduct smokes,
+   per the reconciliation doc D-3).
