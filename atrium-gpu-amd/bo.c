@@ -129,7 +129,8 @@ amd_bo_destroy(struct atrium_amd_bo *bo, struct thread *td)
 		struct atrium_amd_bo_binding *bd = &bo->bindings[b];
 
 		for (i = 0; i < bo->npages; i++)
-			amd_vm_unmap(bd->vm, bd->gpu_va + (uint64_t)i * PAGE_SIZE);
+			sc->backend->unmap_page(bd->vm,
+			    bd->gpu_va + (uint64_t)i * PAGE_SIZE);
 		fdrop(bd->vm_fp, td);
 	}
 	mtx_lock(&sc->lock);
@@ -346,11 +347,12 @@ amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
 	 * into a contiguous GPU-VA range. Each VM has its own page tables, so the
 	 * same pages can map at independent VAs in different VMs. */
 	for (i = 0; i < bo->npages; i++) {
-		err = amd_vm_map(vm, addr + (uint64_t)i * PAGE_SIZE, bo->pages[i],
-		    bo->vram);
+		err = sc->backend->map_page(vm, addr + (uint64_t)i * PAGE_SIZE,
+		    bo->pages[i], bo->vram);
 		if (err != 0) {
 			while (i-- > 0)
-				amd_vm_unmap(vm, addr + (uint64_t)i * PAGE_SIZE);
+				sc->backend->unmap_page(vm,
+				    addr + (uint64_t)i * PAGE_SIZE);
 			return (err);
 		}
 	}

@@ -328,7 +328,7 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 					    s->signal_value);
 			}
 			if (err == 0)
-				err = amd_submit(sc, bo, s->n_dwords,
+				err = sc->backend->submit(sc, bo, s->n_dwords,
 				    s->engine, vm);
 			/* Submit never reached the GPU -> reclaim the entry. */
 			if (err != 0 && so != NULL)

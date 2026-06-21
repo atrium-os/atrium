@@ -64,6 +64,20 @@
 #include <sys/kernel.h>
 
 /*
+ * The amd backend: the GPUVM page-table + PM4-ring/doorbell hardware paths that
+ * sit under the shared 'A' front-end (the front-end reaches them only via
+ * sc->backend — see atrium_gpu_backend_ops). gpusim today, real AMD silicon
+ * later, unchanged from the front-end's view. A virtio backend is a sibling
+ * table over CTX_INIT / SUBMIT_3D (docs/spec/atrium-gpu-driver-architecture.md §6).
+ */
+static const struct atrium_gpu_backend_ops amd_backend = {
+	.name = "amd",
+	.map_page = amd_vm_map,
+	.unmap_page = amd_vm_unmap,
+	.submit = amd_submit,
+};
+
+/*
  * Release everything attach acquired: the cdev, the DMA pages (page tables,
  * IH, BOs), and the two BAR resources. Safe to call partway through a failed
  * attach — every field is NULL/zero until its step runs (sc->dev is set
@@ -92,6 +106,7 @@ amd_teardown(struct atrium_amd_softc *sc)
 	sc->ih_kva = NULL;
 	sc->ih_rptr = 0;
 	sc->n_pending = 0;
+	sc->backend = NULL;	/* points into this module; gone after kldunload */
 	/*
 	 * The BAR resources and the softc mutex belong to the base (pci) module
 	 * (it mapped them into the shared softc); it releases them on its own
@@ -143,6 +158,9 @@ atrium_amd_attach(device_t dev)
 	struct atrium_amd_softc *sc = device_get_softc(device_get_parent(dev));
 	uint32_t id, grbm;
 	int err;
+
+	/* This module is the amd hardware backend under the shared front-end. */
+	sc->backend = &amd_backend;
 
 	/*
 	 * Identity probe: the SIM-aperture ID reads 'GPUS'. Before MSE took

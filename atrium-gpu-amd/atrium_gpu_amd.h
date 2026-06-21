@@ -260,6 +260,27 @@ struct atrium_amd_dma_page {
  */
 struct atrium_amd_softc;
 struct atrium_amd_vm;
+struct atrium_amd_bo;
+
+/*
+ * Backend ops — the per-transport hardware seam under the shared 'A' front-end
+ * (docs/spec/atrium-gpu-driver-architecture.md §6). The cdev + ioctl dispatch,
+ * the BO/VM/syncobj fd-objects, the bindings list, the syncobj timeline and the
+ * caps TLV are transport-neutral and call ONLY through this vtable; a backend
+ * (amd = GPUVM + PM4 over gpusim/real silicon; virtio = context + SUBMIT_3D)
+ * supplies the hardware. The submit blob is opaque and the GPU-VA is backend-
+ * assigned, which is what keeps the front-end neutral.
+ */
+struct atrium_gpu_backend_ops {
+	const char *name;
+	/* Map / unmap one page of a BO into a VM at a GPU-VA (amd: a GPUVM PTE). */
+	int	(*map_page)(struct atrium_amd_vm *vm, uint64_t va,
+		    vm_paddr_t phys, int vram);
+	void	(*unmap_page)(struct atrium_amd_vm *vm, uint64_t va);
+	/* Submit a prepared ring on an engine in a VM (amd: PM4 ring + doorbell). */
+	int	(*submit)(struct atrium_amd_softc *sc, struct atrium_amd_bo *ring,
+		    uint32_t n_dwords, uint32_t engine, struct atrium_amd_vm *vm);
+};
 
 /*
  * A per-process GPU address space (ABI-v2 §5.2): its own VMID and 2-level page
@@ -346,6 +367,7 @@ struct atrium_amd_pending {
 
 struct atrium_amd_softc {
 	device_t	 dev;
+	const struct atrium_gpu_backend_ops *backend; /* hardware seam (gpu module) */
 	struct resource	*regs;		/* BAR5 MMIO register file */
 	int		 regs_rid;
 	struct resource	*doorbell;	/* BAR2 doorbell page */
