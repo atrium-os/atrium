@@ -82,6 +82,50 @@ to size its ask; `actuate(grant, P)` applies the levers, clamped to the grant.
 The GPU's **deadline-aware pre-wake stays on at every posture** — it hides gating
 exit latency for free, so it is not a posture lever.
 
+## 4.1 Calibration boundary — generic above the line, per-device below
+
+There are two layers, and only the lower one is ever part-specific:
+
+```
+            posture 0..10  (one system value)
+                  │
+  ┌───────────────┴───────────────┐   GENERIC — device-independent, never calibrated
+  │  posture → lever tables (§4)   │   per part: dimensionless % / patience / a gate-
+  │  dimensionless aggressiveness  │   depth ordinal / a PSR frame-count.
+  └───────────────┬───────────────┘
+                  │ picks an operating POINT on each device's own curve
+  ┌───────────────┴───────────────┐   PER-DEVICE — a small parameter set; defaults +
+  │  DevicePowerProfile            │   hardware-read refinement (NOT a control rewrite).
+  │  → absolute demand (mW), f*    │
+  └───────────────┬───────────────┘
+                  │ independent per device — no CPU×GPU matrix
+        water_fill(cap, demand, WEIGHTS)   ← the ONLY place the combination is resolved
+```
+
+The control decisions (the cap split, the posture, the energy-optimal `f*`) key off
+**ratios and each device's own curve**, not absolute Watts — so a *generic* power
+profile gets the decisions right even when the absolute mW is only "feel". Each
+device's profile is **independent** (the GPU profile never references the CPU), so
+*any* CPU+GPU+display pairing composes at `water_fill` with no combination matrix.
+
+**Generic default profiles (what ships first — we have ~90% already):**
+
+- **CPU** — self-calibrating from the hardware: the real cpufreq table (ACPI `_PSS`,
+  always readable) gives the curve and `f*` (P6-M computes it, no constants); RAPL
+  where present gives real power, else a generic V²f estimate. No default to ship —
+  it reads the part it boots on.
+- **GPU** — a `DevicePowerProfile { peak_ops_s, vram_bw, host_bw, static_watts }`
+  over the ratio-faithful roofline (`gpusim cost.rs`). The shape is universal across
+  a class; only ~4 numbers move. Default = the RDNA-class profile we have; optionally
+  refined by the device's advertised caps (CU count, memory width×speed → BW) or a
+  tiny per-PCI-ID table. Absolute mW flagged "feel" (the shaping caveat).
+- **Display** — the existing `PANEL_STATIC + scanout(pixel_clock)` + PSR model
+  (`display.rs`); the only real variable (resolution×refresh = pixel clock) comes
+  from the mode. Generic across panels.
+
+Per-device calibration later is **constant-tuning behind this interface** — swap the
+`DevicePowerProfile` (or sharpen the CPU power estimate), nothing in §3/§4 changes.
+
 ## 5. Plumbing
 
 - Posture is one system value (`power_policy` sysctl, already present; its writer
@@ -127,6 +171,11 @@ exit latency for free, so it is not a posture lever.
 
 ## 8. Implementation phases (when approved)
 
+0. **Generic default `DevicePowerProfile` (§4.1):** parameterize the GPU power model
+   (`{peak_ops_s, vram_bw, host_bw, static_watts}` over the existing roofline) with
+   the RDNA-class default + optional caps/PCI-ID refinement; confirm the CPU reads
+   its real cpufreq table + `f*` and the display model is mode-driven. No control
+   change — just the profile seam, so per-device calibration is later constant-tuning.
 1. **Engine tier (gpusim, deterministic):** posture tables for GPU (`powergate.rs`
    gating thresholds + DVFS headroom) and display (`display.rs` PSR/VRR); unit tests
    that posture moves the operating point and the cap still clamps.
