@@ -1,0 +1,14 @@
+[package]
+name = "memoryd"
+version = "0.1.0"
+edition = "2021"
+description = "Atrium lifecycle-aware memory-pressure daemon — the controller (gpusim controller.rs) on the live kern.pressure.memory signal"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "memoryd"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
