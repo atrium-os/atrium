@@ -242,8 +242,17 @@ the two ideas unify.
    it SIGKILLed the tier-0 hog while the tier-9 foreground survived and free RAM
    recovered — memoryd rescued the VM by killing the right process**, the opposite of
    `vm_pageout_oom`. Thrash = sustained `avg10` gated by a free-memory floor (the
-   live signal is PSI `some`; `full` is a later kernel refinement). Refinements: a
-   reap-in-flight guard; per-jail members once 1c lands; RSS-aware tie-break.
+   live signal is PSI `some`; `full` is a later kernel refinement).
+   - **Built since the first cut:** a three-tier app-cooperative cascade
+     **TRIM(SIGINFO)→EXIT(SIGTERM)→KILL(SIGKILL)** with a reap-in-flight guard and a
+     SPARE-on-relief path (finding: cooperative trim is best-effort — a thrashing
+     target is starved and can't respond, so the kill is the guarantee); RSS-aware
+     tie-break within a tier with a quantified lmkd-vs-OOM decision log; and **posture
+     wiring DONE** — with no `--posture` flag, memoryd FOLLOWS `kern.sched.power_policy`
+     live (re-read each tick), so the one posture knob spans CPU + GPU + display +
+     memory reclaim. Verified in-VM: flipping `power_policy` 5→0→10 moved memoryd's
+     tolerance in step.
+   - Remaining: per-jail members once 1c lands; consume kernel `full` when it exists.
 
 ## 10. Non-goals / deferred
 
