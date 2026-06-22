@@ -69,6 +69,22 @@ fn alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// Resident set size in KiB (via ps; the daemon polls at 1 Hz so this is cheap).
+/// Used only to tie-break within a tier and to quantify the lmkd-vs-RSS contrast.
+fn rss_kb(pid: i32) -> u64 {
+    std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn mib(kb: u64) -> u64 {
+    kb / 1024
+}
+
 fn read_members(path: &str) -> Vec<Member> {
     let mut v = Vec::new();
     if let Ok(s) = fs::read_to_string(path) {
@@ -191,12 +207,20 @@ fn main() {
                 eprintln!("avg10={:.1}% free={}MB nstalled={} members={} thrash_run={}{}",
                     avg10, free, nstalled, members.len(), thrash_run, if thrash { " [THRASH]" } else { "" });
                 if thrash_run >= tolerance {
-                    if let Some(v) = members.iter().min_by_key(|m| m.tier) {
-                        let hi = members.iter().max_by_key(|m| m.tier)
-                            .map(|m| format!(" (sparing highest tier: {} t{})", m.name, m.tier)).unwrap_or_default();
+                    if !members.is_empty() {
+                        // Victim = lowest lifecycle tier; within that tier, the
+                        // largest RSS (frees the most, fastest — relief speed matters
+                        // under thrash). NOT the largest RSS overall (that's the
+                        // kernel's blunt vm_pageout_oom, which would hit the foreground).
+                        let min_tier = members.iter().map(|m| m.tier).min().unwrap();
+                        let v = members.iter().filter(|m| m.tier == min_tier)
+                            .max_by_key(|m| rss_kb(m.pid)).unwrap().clone();
+                        let oom = members.iter().max_by_key(|m| rss_kb(m.pid)).unwrap();
+                        eprintln!("DECISION lmkd-tier vs largest-RSS-OOM: kernel OOM would kill {}(t{}, {}MB); memoryd sheds {}(t{}, {}MB) — sparing the foreground",
+                            oom.name, oom.tier, mib(rss_kb(oom.pid)), v.name, v.tier, mib(rss_kb(v.pid)));
                         let r = signal(v.pid, libc::SIGINFO);
-                        eprintln!("REAP pid={} tier={} name={} -> TRIM(SIGINFO, shed-not-die){}{}",
-                            v.pid, v.tier, v.name, hi, dry(&format!("rc={}", r)));
+                        eprintln!("REAP pid={} tier={} name={} -> TRIM(SIGINFO, shed-not-die){}",
+                            v.pid, v.tier, v.name, dry(&format!("rc={}", r)));
                         pending = Some(Pending { pid: v.pid, tier: v.tier, name: v.name.clone(), stage: Stage::Trim, since: Instant::now() });
                         thrash_run = 0;
                     } else {
