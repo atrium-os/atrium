@@ -320,9 +320,17 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 					amd_pending_push(sc, so,
 					    s->signal_value);
 			}
-			if (err == 0)
+			if (err == 0) {
+				/* Stage this submit's frame deadline before the
+				 * doorbell (frame-pacing): the firmware scheduler
+				 * drains queues earliest-deadline-first. */
+				if (sc->regs != NULL)
+					amd_mmio_write32(sc,
+					    regCP_SUBMIT_DEADLINE_NS,
+					    s->deadline_ns);
 				err = sc->backend->submit(sc, bo, s->n_dwords,
 				    s->engine, vm);
+			}
 			/* Submit never reached the GPU -> reclaim the entry. */
 			if (err != 0 && so != NULL)
 				amd_pending_scrub(sc, so);

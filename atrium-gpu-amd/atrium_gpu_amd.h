@@ -92,6 +92,7 @@
 #define regCP_ME_CNTL		0x200c	/* GC: w 0 = clear ME halt -> run */
 
 #define regHQD_SELECT		0x20080	/* SIM: which HQD the CP_HQD regs program */
+#define regCP_SUBMIT_DEADLINE_NS 0x20084 /* SIM: frame deadline (ns) the next doorbell stamps on its queue */
 #define regCP_HQD_PQ_BASE	0x7ec4	/* GC: HQD ring base (holds base>>8) */
 #define regCP_HQD_PQ_CONTROL	0x7ee8	/* GC: HQD ring size */
 #define regCP_HQD_PQ_DOORBELL_CONTROL 0x7ee0 /* GC: HQD doorbell offset (BAR2) */

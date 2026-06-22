@@ -152,7 +152,9 @@ struct atrium_gpu_submit {
 	uint32_t	n_dwords;	/* in: ring length in dwords (the wptr) */
 	uint32_t	engine;		/* in: ATRIUM_GPU_ENGINE_* */
 	int32_t		signal_syncobj_fd; /* in: syncobj to signal (-1 = none) */
-	uint32_t	pad;
+	uint32_t	deadline_ns;	/* in: frame deadline (ns) for this submit's queue,
+					 * 0 = none. The firmware scheduler drains
+					 * earliest-deadline-first (frame-pacing). */
 };
 
 /* Query interrupt state: how many completions the ISR has serviced. */

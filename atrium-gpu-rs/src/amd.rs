@@ -92,7 +92,7 @@ struct Submit {
     n_dwords: u32,
     engine: u32,
     signal_syncobj_fd: i32,
-    pad: u32,
+    deadline_ns: u32,
 }
 #[repr(C)]
 #[derive(Default)]
@@ -334,6 +334,20 @@ impl<'a> Vm<'a> {
         engine: u32,
         signal: Option<(&Syncobj<'_>, u64)>,
     ) -> io::Result<()> {
+        self.submit_deadline(ring, n_dwords, engine, signal, 0)
+    }
+
+    /// Submit, stamping this submit's queue with a frame `deadline_ns` (ns; 0 =
+    /// none). The firmware scheduler drains queues earliest-deadline-first, so a
+    /// compositor's frame beats a background hog under contention (frame-pacing).
+    pub fn submit_deadline(
+        &self,
+        ring: &Bo<'_>,
+        n_dwords: u32,
+        engine: u32,
+        signal: Option<(&Syncobj<'_>, u64)>,
+        deadline_ns: u32,
+    ) -> io::Result<()> {
         let (sfd, sval) = signal.map_or((-1i32, 0u64), |(s, v)| (s.fd, v));
         let mut s = Submit {
             signal_value: sval,
@@ -342,7 +356,7 @@ impl<'a> Vm<'a> {
             n_dwords,
             engine,
             signal_syncobj_fd: sfd,
-            pad: 0,
+            deadline_ns,
         };
         unsafe { call(self.gpu.fd, iow(G, 4, std::mem::size_of::<Submit>()), &mut s) }
     }
