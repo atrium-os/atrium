@@ -79,6 +79,17 @@ fn main() -> std::io::Result<()> {
     let bytes = u64::from(mode.width) * u64::from(mode.height) * 4;
     let scan = Scanout::new(&vm, bytes)?;
     let (scan_off, scan_size) = scan.export();
+
+    /* Frame deadline = one vblank interval (refresh is milli-Hz, so the period in
+     * ns is 1e12 / refresh_mHz). The compositor stamps its scanout copy with this
+     * so the GPU scheduler serves it ahead of background work — it makes its
+     * vblank under contention (the GPU side of the frame-pacing deadline, matching
+     * the CPU-side vblank deadline frescod already sponsors). */
+    let frame_deadline_ns: u32 = if mode.refresh_mhz > 0 {
+        (1_000_000_000_000u64 / u64::from(mode.refresh_mhz)).min(u32::MAX as u64) as u32
+    } else {
+        16_000_000 // ~60 Hz fallback
+    };
     /* Reusable CPU framebuffer the renderer paints into each frame, then
      * uploaded into the VRAM scanout via scan.update (DMA copy). */
     let mut framebuffer = vec![0u8; bytes as usize];
@@ -141,7 +152,7 @@ fn main() -> std::io::Result<()> {
     render_one_frame(&mut renderer, &frontend, &comp, mode.width, mode.height)
         .map_err(io_other)?;
     fill_framebuffer(&renderer, &mut framebuffer).map_err(io_other)?;
-    scan.update(&framebuffer).map_err(io_other)?;
+    scan.update_deadline(&framebuffer, frame_deadline_ns).map_err(io_other)?;
     check_fault("set_mode", dpy.set_mode(scan_off, scan_size)?)?;
     check_fault("page_flip", dpy.page_flip(scan_off, scan_size, true)?)?;
     frame += 1;
@@ -151,7 +162,7 @@ fn main() -> std::io::Result<()> {
         render_one_frame(&mut renderer, &frontend, &comp, mode.width, mode.height)
             .map_err(io_other)?;
         fill_framebuffer(&renderer, &mut framebuffer).map_err(io_other)?;
-        scan.update(&framebuffer).map_err(io_other)?;
+        scan.update_deadline(&framebuffer, frame_deadline_ns).map_err(io_other)?;
         check_fault("page_flip", dpy.page_flip(scan_off, scan_size, true)?)?;
         frame = frame.wrapping_add(1);
         let _ = frame;

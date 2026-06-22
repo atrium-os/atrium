@@ -454,6 +454,13 @@ impl<'a> Scanout<'a> {
     /// DMA copy. `submit` runs the ring synchronously, so on return VRAM holds
     /// the new frame and a subsequent `page_flip` is safe.
     pub fn update(&self, pixels: &[u8]) -> io::Result<()> {
+        self.update_deadline(pixels, 0)
+    }
+
+    /// Like [`Scanout::update`], but stamps the copy with a frame `deadline_ns`
+    /// (the compositor's target vblank) so the firmware scheduler prioritizes it
+    /// over background GPU work — the compositor's frame-pacing path.
+    pub fn update_deadline(&self, pixels: &[u8], deadline_ns: u32) -> io::Result<()> {
         self.staging.write(0, pixels)?;
         let src = self.staging.gpu_va();
         let dst = self.vram.gpu_va();
@@ -471,7 +478,7 @@ impl<'a> Scanout<'a> {
             bytes.extend_from_slice(&w.to_le_bytes());
         }
         self.ring.write(0, &bytes)?;
-        self.vm.submit(&self.ring, words.len() as u32, ENGINE_GFX, None)
+        self.vm.submit_deadline(&self.ring, words.len() as u32, ENGINE_GFX, None, deadline_ns)
     }
 }
 
