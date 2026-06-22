@@ -50,7 +50,40 @@ protected* and *what is reclaimed last*, never as a fair byte-split.
 - **Memory's *power*** (DRAM refresh + bandwidth energy) already belongs to the
   **watts** energy federation — that is where memory contends with CPU/GPU/display.
 - **Memory's *capacity*** (bytes) is **this** controller. Bytes never enter the
-  watts split; watts never enter the byte budget. They meet only at the posture.
+  watts split; watts never enter the byte budget.
+
+### 2.1 What the posture does — and does NOT — do for memory (correction)
+
+An earlier draft over-applied the CPU/GPU posture semantics ("powersave → be
+aggressive") to memory reclaim. That is a **category error**, because gating
+*removes* work (saves power) whereas **reclaim *is* work** (costs power: compress
+burns CPU, swap burns flash, a refault pays twice). So:
+
+- **The cascade tier choice is an ENERGY decision, not a posture knob.** Each tier
+  (drop-clean / compress / swap / kill) has a per-page energy
+  (`gpusim compress.rs::tier_energy_pj`, the same currency as the watts federation),
+  and the controller picks the cheapest tier that relieves the pressure, bounded by
+  the CPU-power budget. Compression is the lowest-energy response to pressure (it
+  beats swap *and* kill on energy *and* stall), with **no posture input** — "powersave
+  compresses more" is wrong. Codec choice (lz4 vs zstd) is also an energy trade, set
+  by the CPU-power budget, not the posture.
+- **Eager reaping does not save power** — a cached app is idle (≈0 W); killing it
+  saves ≈0 and makes its later *cold restart* cost *more*. The reaping-tolerance knob
+  is a **responsiveness / footprint** (user-intent) preference, not a power lever, and
+  for battery may even warrant the *opposite* (keep caches, avoid cold-restart churn).
+- **So the posture's honest role in memory is thin** — footprint-vs-responsiveness
+  pacing — and `memoryd` follows `power_policy` for *user-intent alignment*, not
+  because memory reclaim is a power lever like gating.
+- **Where capacity genuinely meets watts** is **rank power-down via compaction** (pack
+  the working set into fewer ranks, self-refresh the rest) — modelled in
+  `gpusim compaction.rs`, which finds it a *narrow, fragile* win: it pays only for a
+  sparse rank idle past break-even (≈0.5 s for a near-empty LPDDR rank, ~22 s for a
+  full one), is blocked outright by a single pinned page (fragmentation), and saves
+  far more on server DDR than on mobile LPDDR. Not in scope here; the bigger mobile
+  memory-power win stays "keep the SoC idle."
+
+So §3's cascade and its energies are the federation's; the posture meets memory only
+at this thin pacing seam, never as the driver of the reclaim mechanics.
 
 ## 3. Model: floors, an elastic remainder, and a reclaim cascade
 
@@ -177,8 +210,11 @@ the two ideas unify.
 - **Mobile, foreground app grows past comfort:** its soft cap binds → its *own*
   elastic is reclaimed first; only then are background floors triaged by `water_fill`;
   OOM fires only if even the foreground floor cannot fit.
-- **Powersave vs performance at the same RAM:** powersave holds free headroom (eager
-  compress/shed); performance holds everything resident. Same knob as CPU/GPU/display.
+- **Powersave vs performance at the same RAM:** powersave keeps a leaner footprint
+  (smaller resting caches, sooner cold-page reclaim), performance holds more resident
+  for snappier response — a *responsiveness-vs-footprint* preference (user intent),
+  **not** a power saving (reclaim costs energy; see §2.1). The reclaim *mechanics* are
+  energy-driven by the federation, independent of the posture.
 
 ## 9. Implementation phases (when approved)
 
