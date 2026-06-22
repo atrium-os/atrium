@@ -221,6 +221,17 @@ the two ideas unify.
    - Remaining: the kernel reclaim-member interface (parallels `energy_budget.h`),
      RCTL enforcement, the cached-jail pool (Portcullis/Choragus).
 3. **Compressed-RAM reclaim tier** (zram/zswap analog).
+   - **Model tier — DONE** (`gpusim engine/src/compress.rs`, 7 tests / 282 total).
+     The principled fix for the memoryd v3 finding (cooperative trim is unreliable
+     under pressure): a kernel, **non-destructive, cooperation-free** reclaim tier.
+     `compress(cold)` frees `cold×(1−1/ratio)`; the store holds `logical/ratio`
+     physical. Proven: compressed refault (decompress ~1 µs) is ≥25× cheaper than a
+     flash read (the PSI-stall reduction over swap); cascade orders
+     compress < drop-clean < swap-flash < kill; effective capacity =
+     `(ram−pool)+pool×ratio`; falls through to swap/kill once the cold pool is spent
+     (a tier, not a panacea); CPU budget bounds the reclaim rate.
+   - Remaining: the kernel implementation — a compressing swap pager (a substantial
+     focused effort), specified + de-risked by the model.
 4. **Pergola `trim_memory` cooperative channel.**
 5. **`memoryd` policy loop + posture wiring.** **FIRST CUT DONE + verified in-VM
    (#172).** `memoryd/` (cross-compiled `aarch64-unknown-freebsd`) reads the live
