@@ -210,6 +210,15 @@ the two ideas unify.
      waits on instead of polling. Deferred until there is a consumer (an event source
      with no sink rots).
 2. **Reclaim member interface + RCTL enforcement + the cached-jail pool.**
+   - **Controller model tier — DONE.** `gpusim engine/src/controller.rs`
+     (`MemController`): watches the pressure signal and under *sustained* thrash
+     reaps the lowest-lifecycle-tier member early (before the kernel's largest-RSS
+     OOM); posture sets reaping patience; cache-only pressure never reaps. 4 tests
+     (275 engine total) — converges by reaping cheapest-first, lifecycle-tier not
+     largest-RSS, posture tolerance, no-reap-on-cache-churn. The `memoryd` brain,
+     proven before the daemon (it kills processes).
+   - Remaining: the kernel reclaim-member interface (parallels `energy_budget.h`),
+     RCTL enforcement, the cached-jail pool (Portcullis/Choragus).
 3. **Compressed-RAM reclaim tier** (zram/zswap analog).
 4. **Pergola `trim_memory` cooperative channel.**
 5. **`memoryd` policy loop + posture wiring;** verify the §8 cases (model tier
