@@ -1,8 +1,9 @@
 # Atrium memory pressure — budgeting RAM under the unified posture
 
-> **Status:** design + Phases 0–1b built/verified 2026-06-22 (model tier
-> deterministic; the kernel PSI-`some` signal + decaying avg10/60/300 live in-VM on
-> #172). Applies the federation *machinery*
+> **Status:** design + signal→brain→daemon built/verified 2026-06-22. Kernel
+> PSI-`some` + avg10/60/300 live in-VM (#172, Phase 1a/1b); controller model tier
+> (Phase 2) deterministic; `memoryd` first cut (Phase 5) reaps the right tier live —
+> the loop is closed end to end. Applies the federation *machinery*
 > ([`atrium-scheduler-federation.md`](atrium-scheduler-federation.md),
 > [`atrium-power-posture.md`](atrium-power-posture.md)) to physical-memory
 > **capacity** — but, per the federation doc's governing principle, as a
@@ -221,8 +222,17 @@ the two ideas unify.
      RCTL enforcement, the cached-jail pool (Portcullis/Choragus).
 3. **Compressed-RAM reclaim tier** (zram/zswap analog).
 4. **Pergola `trim_memory` cooperative channel.**
-5. **`memoryd` policy loop + posture wiring;** verify the §8 cases (model tier
-   deterministic, live tier as a does-it-move check, per the two-tier design).
+5. **`memoryd` policy loop + posture wiring.** **FIRST CUT DONE + verified in-VM
+   (#172).** `memoryd/` (cross-compiled `aarch64-unknown-freebsd`) reads the live
+   `kern.pressure.memory.avg10` + free RAM, members register `(pid, tier)` in a file
+   (the Portcullis stand-in), and under sustained thrash it reaps the lowest tier
+   (posture-paced; `--arm` to SIGKILL, default dry-run). Verified: dry-run logged the
+   correct lifecycle pick (`WOULD REAP … tier=0 … sparing foreground t9`); **armed,
+   it SIGKILLed the tier-0 hog while the tier-9 foreground survived and free RAM
+   recovered — memoryd rescued the VM by killing the right process**, the opposite of
+   `vm_pageout_oom`. Thrash = sustained `avg10` gated by a free-memory floor (the
+   live signal is PSI `some`; `full` is a later kernel refinement). Refinements: a
+   reap-in-flight guard; per-jail members once 1c lands; RSS-aware tie-break.
 
 ## 10. Non-goals / deferred
 
