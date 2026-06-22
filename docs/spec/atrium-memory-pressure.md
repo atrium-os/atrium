@@ -1,8 +1,8 @@
 # Atrium memory pressure — budgeting RAM under the unified posture
 
-> **Status:** design + Phases 0–1a built/verified 2026-06-22 (model tier
-> deterministic; the kernel PSI-`some` signal live in-VM on #171). Applies the
-> federation *machinery*
+> **Status:** design + Phases 0–1b built/verified 2026-06-22 (model tier
+> deterministic; the kernel PSI-`some` signal + decaying avg10/60/300 live in-VM on
+> #172). Applies the federation *machinery*
 > ([`atrium-scheduler-federation.md`](atrium-scheduler-federation.md),
 > [`atrium-power-posture.md`](atrium-power-posture.md)) to physical-memory
 > **capacity** — but, per the federation doc's governing principle, as a
@@ -199,9 +199,16 @@ the two ideas unify.
      at **0** while free RAM fell 11→2 GB (allocation-into-free ≠ stall — why
      free-pages is the wrong signal), then climbing ~1 s-stall/s once paging began
      with `nstalled=1`.
-   - **1b — per-jail attribution + the kqueue edge-trigger** (NEXT): prison-keyed
-     storage via `pr_osd` (no KBI break); a `EVFILT_VM` note `memoryd` waits on; the
-     decaying 10/60/300 s averages.
+   - **1b — decaying PSI averages: DONE + verified in-VM (#172).** A 1 s callout
+     folds the `some_ns` delta into three fixed-point EWMAs (no kernel FPU);
+     `kern.pressure.memory.avg{10,60,300}` as fraction ×10000, mirroring Linux
+     `/proc/pressure/memory`. Verified: under a paging pulse `avg10` fast-rose and
+     saturated ~100% while `avg60`/`avg300` lagged; after it `avg10` decayed fast
+     (74→9% in 24 s) while the longer windows held — the PSI multi-window signature.
+   - **1c — per-jail attribution + the kqueue edge-trigger** (with `memoryd`):
+     prison-keyed storage via `pr_osd` (no KBI break); a `EVFILT_VM` note `memoryd`
+     waits on instead of polling. Deferred until there is a consumer (an event source
+     with no sink rots).
 2. **Reclaim member interface + RCTL enforcement + the cached-jail pool.**
 3. **Compressed-RAM reclaim tier** (zram/zswap analog).
 4. **Pergola `trim_memory` cooperative channel.**
