@@ -1,6 +1,8 @@
 # Atrium unified power posture — one knob across CPU / GPU / display
 
-> **Status:** design, 2026-06-22 (for review). Unifies the CPU power-posture knob
+> **Status:** Phases 0–3 implemented 2026-06-22 (engine tier deterministic + tested,
+> kernel federation interface + driver ABI in place); live in-VM verify (Phase 4)
+> pending a kernel + 3-kmod rebuild. Unifies the CPU power-posture knob
 > (`kern.sched.laminar.power_policy`) and the cross-device energy cap
 > (`kern.sched.energy_cap_mw` + `water_fill`) into one coherent control across the
 > three federated members (`cpu`, `gpu0`, `display0`). Builds on
@@ -176,17 +178,30 @@ Per-device calibration later is **constant-tuning behind this interface** — sw
    the RDNA-class default + optional caps/PCI-ID refinement; confirm the CPU reads
    its real cpufreq table + `f*` and the display model is mode-driven. No control
    change — just the profile seam, so per-device calibration is later constant-tuning.
+   **DONE** — the GPU `DeviceCost` is the profile; CPU reads its cpufreq table; the
+   display model is mode-driven.
 1. **Engine tier (gpusim, deterministic):** posture tables for GPU (`powergate.rs`
    gating thresholds + DVFS headroom) and display (`display.rs` PSR/VRR); unit tests
-   that posture moves the operating point and the cap still clamps.
+   that posture moves the operating point and the cap still clamps. **DONE** —
+   `engine/src/posture.rs` (`Posture` 0..10 + generic dimensionless levers);
+   `GatePolicy::for_posture` (depth cap + idle-threshold scale); `DisplayRegs`
+   posture-driven PSR threshold; tests prove posture moves the point AND the
+   `water_fill` cap / `power_budget_mw` still clamp at performance.
 2. **Federation interface:** `actuate_fn(arg, grant, posture)`; fold the CPU
-   `power_policy` application into it (invariant #2).
+   `power_policy` application into it (invariant #2). **DONE** —
+   `sys/energy_budget.h` `energy_actuate_fn(arg, mw, posture)` + posture-taking
+   `energy_demand_fn`; `sched_laminar.c` threads `laminar_power_policy` through the
+   federation tick (and keeps posture live when the cap is off, invariant #4); the
+   CPU actuator `laminar_cpu_actuate` folds in `laminar_apply_power_policy`.
 3. **Driver ABI:** `regSCHED_POWER_POSTURE` + `regDISP_POSTURE`; the kmod energy
-   members map posture → their levers.
+   members map posture → their levers. **DONE** — header regs (`0x40044` / `0x3007c`);
+   `amd_energy_actuate` / `amd_display_energy_actuate` write posture then budget; the
+   gpusim model (`sched_regs.rs::POWER_POSTURE`, `display.rs::POSTURE`) applies them.
 4. **Verify:** the four §7 cases — posture moves all three devices' operating points
    under slack; the cap clamps under pressure; `power_policy` by name drives the GPU
    gating + display PSR observably (engine tier deterministic; live tier as a
-   does-it-move check, per the two-tier design).
+   does-it-move check, per the two-tier design). **Engine tier DONE; live in-VM
+   check pending a kernel + 3-kmod rebuild.**
 
 ## 9. Deferred (not in scope of the first cut)
 

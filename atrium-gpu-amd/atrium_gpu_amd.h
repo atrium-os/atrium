@@ -149,6 +149,7 @@
 #define regDISP_VBLANK_IRQ_EN	0x30070	/* w: 1 = raise an IH interrupt each vblank (DCN-like) */
 #define regDISP_POWER_DEMAND_MW	0x30074	/* r: modeled display power demand, mW (energy federation) */
 #define regDISP_POWER_BUDGET_MW	0x30078	/* w/r: granted power cap, mW (0 = uncapped) */
+#define regDISP_POSTURE		0x3007c	/* w/r: power posture 0..10 (0 powersave..10 perf) */
 #define regDISP_VBLANK_COUNT	0x30020	/* r: vblanks elapsed */
 #define regDISP_DROPPED_FLIPS	0x30024	/* r: flips dropped by the depth-1 queue */
 #define regDISP_FAULT		0x30028	/* r: last DisplayFault code (0 = none) */
@@ -176,6 +177,7 @@
 #define regSCHED_DEADLINE	0x40038	/* w: selected queue's deadline, ns from now (0=clear) */
 #define regSCHED_DEADLINE_WINDOW 0x4003c /* w: deadline window, ns (0=deadline-blind) */
 #define regSCHED_NOW_NS		0x40040	/* r: scheduler virtual clock, ns */
+#define regSCHED_POWER_POSTURE	0x40044	/* w/r: power posture 0..10 (0 powersave..10 perf) */
 
 /*
  * Power-gating block (APER_PGATE = 0x5_0000; model: engine/src/pgate_regs.rs).

@@ -181,7 +181,7 @@ atrium_amd_probe(device_t dev)
 }
 
 static uint64_t
-amd_energy_demand_mw(void *arg)
+amd_energy_demand_mw(void *arg, int posture __unused)
 {
 	struct atrium_amd_softc *sc = arg;
 
@@ -189,10 +189,17 @@ amd_energy_demand_mw(void *arg)
 }
 
 static void
-amd_energy_budget_mw(void *arg, uint64_t mw)
+amd_energy_actuate(void *arg, uint64_t mw, int posture)
 {
 	struct atrium_amd_softc *sc = arg;
 
+	/*
+	 * Posture set-point first (the GPU maps it to gating depth + DVFS
+	 * headroom in the model), then the granted budget ceiling — one
+	 * actuator, posture then cap (atrium-power-posture.md §5).
+	 */
+	amd_mmio_write32(sc, regSCHED_POWER_POSTURE,
+	    posture < 0 ? 0 : (posture > 10 ? 10 : (uint32_t)posture));
 	amd_mmio_write32(sc, regSCHED_POWER_BUDGET_MW,
 	    mw > UINT32_MAX ? UINT32_MAX : (uint32_t)mw);
 }
@@ -287,7 +294,7 @@ atrium_amd_attach(device_t dev)
 	 * throttles execution to it) and exposes demand telemetry.
 	 */
 	sc->energy_member = energy_member_register("gpu0",
-	    amd_energy_demand_mw, amd_energy_budget_mw, sc, 1);
+	    amd_energy_demand_mw, amd_energy_actuate, sc, 1);
 
 	device_printf(dev, "ready: /dev/atrium-gpu%d\n", device_get_unit(dev));
 	return (0);

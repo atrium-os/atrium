@@ -229,7 +229,7 @@ amd_display_reset_restore(struct atrium_amd_softc *sc)
  * obeys by engaging PSR/VRR when tight (modeled in gpusim's display.rs).
  */
 static uint64_t
-amd_display_energy_demand_mw(void *arg)
+amd_display_energy_demand_mw(void *arg, int posture __unused)
 {
 	struct atrium_amd_softc *sc = arg;
 
@@ -237,10 +237,17 @@ amd_display_energy_demand_mw(void *arg)
 }
 
 static void
-amd_display_energy_budget_mw(void *arg, uint64_t mw)
+amd_display_energy_actuate(void *arg, uint64_t mw, int posture)
 {
 	struct atrium_amd_softc *sc = arg;
 
+	/*
+	 * Posture set-point (the display maps it to the PSR idle-frame
+	 * threshold), then the granted power budget — which still forces PSR
+	 * when tight regardless of posture (cap hard, posture soft).
+	 */
+	amd_mmio_write32(sc, regDISP_POSTURE,
+	    posture < 0 ? 0 : (posture > 10 ? 10 : (uint32_t)posture));
 	amd_mmio_write32(sc, regDISP_POWER_BUDGET_MW,
 	    mw > UINT32_MAX ? UINT32_MAX : (uint32_t)mw);
 }
@@ -448,7 +455,7 @@ atrium_display_attach(device_t dev)
 	 * member, "display0", alongside the gpu's "gpu0".
 	 */
 	sc->display_energy_member = energy_member_register("display0",
-	    amd_display_energy_demand_mw, amd_display_energy_budget_mw, sc, 1);
+	    amd_display_energy_demand_mw, amd_display_energy_actuate, sc, 1);
 
 	device_printf(dev, "ready: /dev/atrium-display%d (energy member %d)\n",
 	    device_get_unit(dev), sc->display_energy_member);
