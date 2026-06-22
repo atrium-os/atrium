@@ -242,6 +242,17 @@ the two ideas unify.
      `/proc/pressure/memory`. Verified: under a paging pulse `avg10` fast-rose and
      saturated ~100% while `avg60`/`avg300` lagged; after it `avg10` decayed fast
      (74→9% in 24 s) while the longer windows held — the PSI multi-window signature.
+   - **PSI `full` — attempted, REVERTED (negative finding, 2026-06-22).** Built
+     `full` = wall-time with a stall pending and zero non-stalled runnable work
+     (`total_load == 0` from the Laminar control loop, no new hot-path hook). In-VM
+     it read **0 even while `some` showed 92% stall** — because the **pagedaemon is
+     itself runnable throughout thrash** (it is the thread doing the reclaim), so
+     `total_load` is never 0. A coarse load proxy cannot tell "CPU running the
+     reclaim daemon" from "CPU running productive work." Faithful `full` needs
+     **per-task mem-stall accounting in the scheduler** (Linux PSI's design: mark
+     tasks in-stall, compare `nr_running` to `nr_memstall`) — a real scheduler
+     change, deferred. `some` (which works) stands; `memoryd`'s free-floor gate
+     remains the thrash proxy.
    - **1c — per-jail attribution + the kqueue edge-trigger** (with `memoryd`):
      prison-keyed storage via `pr_osd` (no KBI break); a `EVFILT_VM` note `memoryd`
      waits on instead of polling. Deferred until there is a consumer (an event source
