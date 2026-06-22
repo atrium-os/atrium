@@ -58,6 +58,14 @@ fn avg10_pct() -> f64 {
     sysctl_i32("kern.pressure.memory.avg10").unwrap_or(0) as f64 / 100.0
 }
 
+/// The live system power posture (0..10) — the SAME knob that drives CPU parking,
+/// GPU gating and display PSR (atrium-power-posture.md). Following it here makes the
+/// one posture span memory reclaim too: powersave reaps eagerly, performance
+/// patiently. Falls back to balanced if the sysctl is absent (no Laminar kernel).
+fn live_posture() -> u32 {
+    sysctl_i32("kern.sched.power_policy").unwrap_or(5).clamp(0, 10) as u32
+}
+
 #[derive(Clone)]
 struct Member {
     pid: i32,
@@ -139,14 +147,20 @@ fn main() {
     let armed = has("--arm");
     let trip = arg("--trip", "80").parse::<f64>().unwrap_or(80.0);
     let free_floor = arg("--free-floor", "256").parse::<u64>().unwrap_or(256);
-    let posture = arg("--posture", "5").parse::<u32>().unwrap_or(5).min(10);
     let registry = arg("--registry", "/var/run/memoryd/members");
-    let tolerance = 1 + posture; // sustained thrash seconds before acting
-    let grace = Duration::from_secs((1 + posture / 2) as u64); // per-tier escalation window
+    // Posture: an explicit --posture pins it; otherwise FOLLOW the live system
+    // power posture (kern.sched.power_policy) so the one knob spans memory too.
+    let fixed_posture: Option<u32> = if has("--posture") {
+        Some(arg("--posture", "5").parse::<u32>().unwrap_or(5).min(10))
+    } else {
+        None
+    };
 
     eprintln!(
-        "memoryd: {} | trip avg10>={:.0}% & free<={}MB | posture {} (tolerate {}s, grace {}s/tier) | cascade TRIM->EXIT->KILL | registry {}",
-        if armed { "ARMED" } else { "dry-run" }, trip, free_floor, posture, tolerance, grace.as_secs(), registry
+        "memoryd: {} | trip avg10>={:.0}% & free<={}MB | posture {} | cascade TRIM->EXIT->KILL | registry {}",
+        if armed { "ARMED" } else { "dry-run" }, trip, free_floor,
+        match fixed_posture { Some(p) => format!("pinned {}", p), None => "FOLLOW kern.sched.power_policy".into() },
+        registry
     );
 
     let signal = |pid: i32, sig: i32| -> i32 {
@@ -162,6 +176,11 @@ fn main() {
         let nstalled = sysctl_i32("kern.pressure.memory.nstalled").unwrap_or(0);
         let members = read_members(&registry);
         let thrash = avg10 >= trip && free <= free_floor;
+        // Re-read the posture each tick so a runtime change to kern.sched.power_policy
+        // adapts memory reclaim live, in lock-step with CPU/GPU/display.
+        let posture = fixed_posture.unwrap_or_else(live_posture);
+        let tolerance = 1 + posture; // sustained thrash seconds before acting
+        let grace = Duration::from_secs((1 + posture / 2) as u64); // per-tier escalation window
 
         match pending.take() {
             Some(mut p) => {
@@ -204,8 +223,8 @@ fn main() {
             }
             None => {
                 if thrash { thrash_run += 1 } else { thrash_run = 0 }
-                eprintln!("avg10={:.1}% free={}MB nstalled={} members={} thrash_run={}{}",
-                    avg10, free, nstalled, members.len(), thrash_run, if thrash { " [THRASH]" } else { "" });
+                eprintln!("avg10={:.1}% free={}MB nstalled={} members={} posture={}(tol {}s) thrash_run={}{}",
+                    avg10, free, nstalled, members.len(), posture, tolerance, thrash_run, if thrash { " [THRASH]" } else { "" });
                 if thrash_run >= tolerance {
                     if !members.is_empty() {
                         // Victim = lowest lifecycle tier; within that tier, the
