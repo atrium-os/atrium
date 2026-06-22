@@ -227,7 +227,15 @@ struct atrium_gpu_sched {
 	uint32_t runs;		/* out (query): run count */
 	uint32_t busy_us;	/* out (query): engine time, µs (fairness) */
 	uint32_t count;		/* out: number of queues */
+	uint32_t deadline_ns;	/* in (set-deadline, op 4): ns from now (0 = clear) */
 };
+/*
+ * sched ops (s->op): 0 add-queue, 1 run-rounds, 2 query-queue, 3 set deadline
+ * WINDOW (s->arg ns; 0 = deadline-blind/fair), 4 set queue s->arg's DEADLINE
+ * (s->deadline_ns from now). 3+4 are the frame-pacing path: a broker (frescod)
+ * stamps the compositor's queue with its target vblank so the scheduler serves
+ * it decisively as the deadline nears (atrium-gpu-scheduler §6).
+ */
 #define ATRIUM_GPU_IOC_SCHED		_IOWR('A', 25, struct atrium_gpu_sched)
 
 /*

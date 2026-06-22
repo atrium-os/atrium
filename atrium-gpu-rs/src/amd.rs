@@ -102,6 +102,12 @@ struct SyncobjCreate { out_fd: u32, pad: u32 }
 struct Irqs { count: u64, msix_enabled: u32, pad: u32 }
 #[repr(C)]
 #[derive(Default)]
+struct Sched {
+    op: u32, arg: u32, ops: u32, bytes: u32, level: u32,
+    energy_uj: u32, runs: u32, busy_us: u32, count: u32, deadline_ns: u32,
+}
+#[repr(C)]
+#[derive(Default)]
 struct SyncobjOp { value: u64, syncobj_fd: u32, pad: u32 }
 #[repr(C)]
 #[derive(Default)]
@@ -253,6 +259,35 @@ impl Gpu {
         let mut q = Irqs::default();
         unsafe { call(self.fd, ior(G, 6, std::mem::size_of::<Irqs>()), &mut q)? };
         Ok(q.count)
+    }
+
+    // --- firmware scheduler (regSCHED via the 'A' SCHED ioctl) ---
+
+    fn sched(&self, mut s: Sched) -> io::Result<Sched> {
+        unsafe { call(self.fd, iowr(G, 25, std::mem::size_of::<Sched>()), &mut s)? };
+        Ok(s)
+    }
+    /// Register a queue with a weight + per-round kernel; returns the queue count.
+    pub fn sched_add_queue(&self, weight: u32, ops: u32, bytes: u32, level: u32) -> io::Result<u32> {
+        Ok(self.sched(Sched { op: 0, arg: weight, ops, bytes, level, ..Default::default() })?.count)
+    }
+    /// Run `rounds` scheduling rounds (deadline-aware iff a window is set).
+    pub fn sched_run(&self, rounds: u32) -> io::Result<()> {
+        self.sched(Sched { op: 1, arg: rounds, ..Default::default() }).map(|_| ())
+    }
+    /// Query queue `q`: (runs, engine-time µs, energy µJ).
+    pub fn sched_query(&self, q: u32) -> io::Result<(u32, u32, u32)> {
+        let r = self.sched(Sched { op: 2, arg: q, ..Default::default() })?;
+        Ok((r.runs, r.busy_us, r.energy_uj))
+    }
+    /// Set the deadline window (ns); 0 = deadline-blind (fair).
+    pub fn sched_set_window(&self, window_ns: u32) -> io::Result<()> {
+        self.sched(Sched { op: 3, arg: window_ns, ..Default::default() }).map(|_| ())
+    }
+    /// Stamp queue `q` with a deadline `deadline_ns` from now (0 = clear) — the
+    /// frame-pacing path (a compositor's target vblank).
+    pub fn sched_set_deadline(&self, q: u32, deadline_ns: u32) -> io::Result<()> {
+        self.sched(Sched { op: 4, arg: q, deadline_ns, ..Default::default() }).map(|_| ())
     }
 }
 

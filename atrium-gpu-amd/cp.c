@@ -127,6 +127,13 @@ amd_sched(struct atrium_amd_softc *sc, struct atrium_gpu_sched *s)
 		s->energy_uj = amd_mmio_read32(sc, regSCHED_ENERGY_UJ);
 		s->runs = amd_mmio_read32(sc, regSCHED_RUNS);
 		break;
+	case 3:	/* set the deadline window (ns); 0 = deadline-blind/fair rounds */
+		amd_mmio_write32(sc, regSCHED_DEADLINE_WINDOW, s->arg);
+		break;
+	case 4:	/* stamp queue `arg` with a deadline `deadline_ns` from now (0=clear) */
+		amd_mmio_write32(sc, regSCHED_SELECT, s->arg);
+		amd_mmio_write32(sc, regSCHED_DEADLINE, s->deadline_ns);
+		break;
 	}
 	s->count = amd_mmio_read32(sc, regSCHED_QUEUE_COUNT);
 }

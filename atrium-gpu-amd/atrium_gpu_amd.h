@@ -172,6 +172,9 @@
 #define regSCHED_POWER_BUDGET_MW 0x4002c /* w: federation budget (0 = uncapped) */
 #define regSCHED_POWER_DEMAND_MW 0x40030 /* r: average power demand (mW) */
 #define regSCHED_ROUNDS_EXEC	0x40034	/* r: cumulative rounds executed */
+#define regSCHED_DEADLINE	0x40038	/* w: selected queue's deadline, ns from now (0=clear) */
+#define regSCHED_DEADLINE_WINDOW 0x4003c /* w: deadline window, ns (0=deadline-blind) */
+#define regSCHED_NOW_NS		0x40040	/* r: scheduler virtual clock, ns */
 
 /*
  * Power-gating block (APER_PGATE = 0x5_0000; model: engine/src/pgate_regs.rs).
