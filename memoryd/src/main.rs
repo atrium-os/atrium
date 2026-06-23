@@ -53,9 +53,17 @@ fn free_mib() -> u64 {
     pages * pgsz / (1024 * 1024)
 }
 
-/// PSI avg10 as a percentage (the kernel exposes fraction ×10000).
+/// PSI `some` avg10 as a percentage (the kernel exposes fraction ×10000).
 fn avg10_pct() -> f64 {
     sysctl_i32("kern.pressure.memory.avg10").unwrap_or(0) as f64 / 100.0
+}
+
+/// PSI `full` avg10 as a percentage, or None if the kernel lacks the signal (an
+/// older kernel without the per-task `full` accounting). `full` is the true thrash
+/// signal — the % of recent time NOTHING progressed because the workload was all
+/// blocked on memory — so when present it replaces the some+free-floor heuristic.
+fn full_avg10_pct() -> Option<f64> {
+    sysctl_i32("kern.pressure.memory.full_avg10").map(|v| v as f64 / 100.0)
 }
 
 /// The live system power posture (0..10) — the SAME knob that drives CPU parking,
@@ -147,6 +155,10 @@ fn main() {
     let armed = has("--arm");
     let trip = arg("--trip", "80").parse::<f64>().unwrap_or(80.0);
     let free_floor = arg("--free-floor", "256").parse::<u64>().unwrap_or(256);
+    // `full` avg10 % above which the system is thrashing (the primary gate when the
+    // kernel exposes PSI `full`). full = nothing progressing because the workload is
+    // blocked on memory — a true thrash signal, no free-floor heuristic needed.
+    let full_trip = arg("--full-trip", "40").parse::<f64>().unwrap_or(40.0);
     let registry = arg("--registry", "/var/run/memoryd/members");
     // Posture: an explicit --posture pins it; otherwise FOLLOW the live system
     // power posture (kern.sched.power_policy) so the one knob spans memory too.
@@ -156,9 +168,12 @@ fn main() {
         None
     };
 
+    let have_full = full_avg10_pct().is_some();
     eprintln!(
-        "memoryd: {} | trip avg10>={:.0}% & free<={}MB | posture {} | cascade TRIM->EXIT->KILL | registry {}",
-        if armed { "ARMED" } else { "dry-run" }, trip, free_floor,
+        "memoryd: {} | thrash = {} | posture {} | cascade TRIM->EXIT->KILL | registry {}",
+        if armed { "ARMED" } else { "dry-run" },
+        if have_full { format!("full_avg10>={:.0}% (PSI full)", full_trip) }
+        else { format!("avg10>={:.0}% & free<={}MB (some+free fallback)", trip, free_floor) },
         match fixed_posture { Some(p) => format!("pinned {}", p), None => "FOLLOW kern.sched.power_policy".into() },
         registry
     );
@@ -172,10 +187,20 @@ fn main() {
     let mut pending: Option<Pending> = None;
     loop {
         let avg10 = avg10_pct();
+        let full = full_avg10_pct();
         let free = free_mib();
         let nstalled = sysctl_i32("kern.pressure.memory.nstalled").unwrap_or(0);
         let members = read_members(&registry);
-        let thrash = avg10 >= trip && free <= free_floor;
+        // Thrash gate = sustained-thrash confirmation AND still-stalled-right-now.
+        // PSI `full` (when present) is the sustained signal — but it's a 10s decaying
+        // average that LAGS, so on its own it keeps firing after pressure clears and
+        // would reap innocents during the decay tail. Gate it with `nstalled > 0`
+        // (instantaneous: zero the moment nobody is blocked) so reaping stops the
+        // instant a kill relieves the pressure. Fallback (no `full`) = some+free-floor.
+        let thrash = match full {
+            Some(f) => f >= full_trip && nstalled > 0,
+            None => avg10 >= trip && free <= free_floor,
+        };
         // Re-read the posture each tick so a runtime change to kern.sched.power_policy
         // adapts memory reclaim live, in lock-step with CPU/GPU/display.
         let posture = fixed_posture.unwrap_or_else(live_posture);
@@ -223,8 +248,9 @@ fn main() {
             }
             None => {
                 if thrash { thrash_run += 1 } else { thrash_run = 0 }
-                eprintln!("avg10={:.1}% free={}MB nstalled={} members={} posture={}(tol {}s) thrash_run={}{}",
-                    avg10, free, nstalled, members.len(), posture, tolerance, thrash_run, if thrash { " [THRASH]" } else { "" });
+                let fulls = full.map(|f| format!("{:.1}%", f)).unwrap_or_else(|| "n/a".into());
+                eprintln!("full={} some={:.1}% free={}MB nstalled={} members={} posture={}(tol {}s) thrash_run={}{}",
+                    fulls, avg10, free, nstalled, members.len(), posture, tolerance, thrash_run, if thrash { " [THRASH]" } else { "" });
                 if thrash_run >= tolerance {
                     if !members.is_empty() {
                         // Victim = lowest lifecycle tier; within that tier, the
