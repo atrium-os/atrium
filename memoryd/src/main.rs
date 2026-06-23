@@ -151,6 +151,62 @@ struct Pending {
     since: Instant,
 }
 
+/// kqueue edge-trigger on `/dev/pressure` (the kernel's PSI poll/trigger,
+/// kern_pressure.c): register an EVFILT_READ knote whose `data` carries the `full`
+/// threshold in basis points (fraction ×10000 — 40% = 4000). The kernel KNOTEs it
+/// each aggregation tick, so we sleep in `kevent` with ZERO wakeups until pressure
+/// crosses the threshold — no 1 Hz poll while idle ([[feedback_kqueue_native]]).
+struct PressureKq {
+    kq: i32,
+    fd: i32,
+}
+
+impl PressureKq {
+    fn new(trip_bp: i64) -> Option<Self> {
+        let path = CString::new("/dev/pressure").ok()?;
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
+        if fd < 0 {
+            return None; // older kernel without the trigger → caller falls back to polling
+        }
+        let kq = unsafe { libc::kqueue() };
+        if kq < 0 {
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        let mut kev: libc::kevent = unsafe { std::mem::zeroed() };
+        kev.ident = fd as usize;
+        kev.filter = libc::EVFILT_READ;
+        kev.flags = (libc::EV_ADD | libc::EV_CLEAR) as u16;
+        kev.data = trip_bp; // threshold delivered to the knote as kn_sdata
+        let r = unsafe {
+            libc::kevent(kq, &kev, 1, std::ptr::null_mut(), 0, std::ptr::null())
+        };
+        if r < 0 {
+            unsafe { libc::close(kq); libc::close(fd) };
+            return None;
+        }
+        Some(PressureKq { kq, fd })
+    }
+
+    /// Block until a pressure edge (or `timeout`, if given). `None` = sleep
+    /// indefinitely — the zero-wakeup idle path.
+    fn wait(&self, timeout: Option<Duration>) {
+        let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
+        let ts = timeout.map(|d| libc::timespec {
+            tv_sec: d.as_secs() as libc::time_t,
+            tv_nsec: d.subsec_nanos() as libc::c_long,
+        });
+        let tsp = ts.as_ref().map_or(std::ptr::null(), |t| t as *const _);
+        unsafe { libc::kevent(self.kq, std::ptr::null(), 0, &mut ev, 1, tsp) };
+    }
+}
+
+impl Drop for PressureKq {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.kq); libc::close(self.fd) };
+    }
+}
+
 fn main() {
     let armed = has("--arm");
     let trip = arg("--trip", "80").parse::<f64>().unwrap_or(80.0);
@@ -169,11 +225,16 @@ fn main() {
     };
 
     let have_full = full_avg10_pct().is_some();
+    // Edge-trigger when the kernel exposes `full` (the trip is on full_avg10, which
+    // is exactly what /dev/pressure fires on). Without `full` the gate is some+free,
+    // which the trigger does not track, so fall back to the 1 s poll.
+    let pkq = if have_full { PressureKq::new((full_trip * 100.0) as i64) } else { None };
     eprintln!(
-        "memoryd: {} | thrash = {} | posture {} | cascade TRIM->EXIT->KILL | registry {}",
+        "memoryd: {} | thrash = {} | wakeup = {} | posture {} | cascade TRIM->EXIT->KILL | registry {}",
         if armed { "ARMED" } else { "dry-run" },
         if have_full { format!("full_avg10>={:.0}% (PSI full)", full_trip) }
         else { format!("avg10>={:.0}% & free<={}MB (some+free fallback)", trip, free_floor) },
+        if pkq.is_some() { "kqueue edge (/dev/pressure, 0-wakeup idle)" } else { "1s poll" },
         match fixed_posture { Some(p) => format!("pinned {}", p), None => "FOLLOW kern.sched.power_policy".into() },
         registry
     );
@@ -274,6 +335,15 @@ fn main() {
                 }
             }
         }
-        sleep(Duration::from_secs(1));
+        // Next tick. When idle (nothing in flight, no thrash accumulating), block on
+        // the kernel pressure edge — zero wakeups until pressure crosses the trip.
+        // While managing a victim or counting toward tolerance, keep the 1 s cadence
+        // (the kernel re-KNOTEs each second of sustained pressure anyway, but the
+        // timeout also covers a victim that dies while `full` has dipped below trip).
+        match &pkq {
+            Some(kq) if pending.is_none() && thrash_run == 0 => kq.wait(None),
+            Some(kq) => kq.wait(Some(Duration::from_secs(1))),
+            None => sleep(Duration::from_secs(1)),
+        }
     }
 }
