@@ -270,10 +270,16 @@ the two ideas unify.
      the free-floor proxy. (A per-task `sched_switch`-tracked version would be more
      precise + scalable, but the sampled version is correct and far lower-risk; that
      remains a future refinement.)
-   - **1c — per-jail attribution + the kqueue edge-trigger** (with `memoryd`):
-     prison-keyed storage via `pr_osd` (no KBI break); a `EVFILT_VM` note `memoryd`
-     waits on instead of polling. Deferred until there is a consumer (an event source
-     with no sink rots).
+   - **1c — per-jail attribution: `some` DONE + verified in-VM (#178).** Jails are
+     the federation-member unit, so pressure is attributed per jail. Realized
+     low-risk via a fixed 16-entry table (the `energy_members` pattern — no `pr_osd`
+     lifecycle, no malloc in the stall path): each `vm_wait` stall is charged to the
+     stalling thread's prison (`cr_prison->pr_id`), exposed at
+     `kern.pressure.memory.jails` as `jail <jid> some_ns=<ns>`. Verified: a hog run
+     via `jexec` in jail 2 attributed ~31.8 s to "jail 2" while the host (jid 0) did
+     not appear. Limits (noted): bounded to 16; slots not reclaimed on jail destroy
+     (a production version sweeps). Remaining: per-jail `full`; the **`EVFILT_VM`
+     kqueue edge-trigger** so `memoryd` waits on an edge instead of polling.
 2. **Reclaim member interface + RCTL enforcement + the cached-jail pool.**
    - **Controller model tier — DONE.** `gpusim engine/src/controller.rs`
      (`MemController`): watches the pressure signal and under *sustained* thrash
