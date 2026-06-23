@@ -253,20 +253,23 @@ the two ideas unify.
      tasks in-stall, compare `nr_running` to `nr_memstall`) — a real scheduler
      change, deferred. `some` (which works) stands; `memoryd`'s free-floor gate
      remains the thrash proxy.
-   - **Production PSI rewrite (b) — design DONE + model-tier proven; kernel work
-     specified, not yet built.** The prototype (bracket the `vm_wait` sleep with a
-     global counter) gives correct-but-coarse `some` only and a global lock on the
-     stall path. The production design tracks **per-task stall state** and derives
-     both signals from per-CPU counts — which fixes scalability, granularity, AND the
-     `full` confound at once. Model: `gpusim engine/src/psi.rs` (6 tests, incl. the
-     proof that classifying reclaim as memstall makes `full` fire where the proxy
-     gave 0). Kernel plan: (1) a `td_flags` **memstall bit**, set at `vm_wait`/refault
-     AND around the reclaim paths (so the pagedaemon counts as stall); (2) per-CPU
-     `{nr_memstall, nr_productive}` updated at **`sched_switch`** (the hot path —
-     productive = running, not idle, not memstall) and at memstall enter/leave; (3)
-     per-CPU some/full time accounting, summed on read (no global lock). This is the
-     riskiest single change in the effort (a `sched_switch` hook) and warrants its own
-     focused build; the model de-risks the design.
+   - **PSI `full` — BUILT + verified in-VM (#177).** The confound (the prototype's
+     `total_load` proxy counted the running pagedaemon as productive → full stuck at
+     0) is fixed by the key classification from the model (`gpusim psi.rs`): a CPU is
+     "productive" only if it runs a **USER** thread; the idle thread and any **kernel**
+     thread (`P_KPROC`: pagedaemon, laundry, swap-I/O) are reclaim/IO infrastructure,
+     not workload progress. Realized **low-risk** — no scheduler hot-path hook, no
+     `struct thread` change: `pressure_sample_cpus()` samples each CPU's `pc_curthread`
+     from the Laminar control loop (~100 ms), and Riemann-sum-integrates the elapsed
+     period into `full_ns` iff (a thread is blocked on memory) AND (no productive
+     user thread runs) — so `full_ns` can never exceed wall-clock. `full` =
+     `(nstalled > 0 && productive == 0)`. Exposed at
+     `kern.pressure.memory.{full_ns,full_avg10,full_avg60,full_avg300}`. Verified
+     under a 38 s thrash: `some` 94.6%, `full` 88.7% — `full ≤ some ≤` wall, the gap
+     being the hog running between faults. `memoryd` can now key on `full` instead of
+     the free-floor proxy. (A per-task `sched_switch`-tracked version would be more
+     precise + scalable, but the sampled version is correct and far lower-risk; that
+     remains a future refinement.)
    - **1c — per-jail attribution + the kqueue edge-trigger** (with `memoryd`):
      prison-keyed storage via `pr_osd` (no KBI break); a `EVFILT_VM` note `memoryd`
      waits on instead of polling. Deferred until there is a consumer (an event source
