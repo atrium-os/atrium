@@ -28,10 +28,12 @@ Atrium already has the hard parts of the Android answer:
   ([[project_fresco_recovery]]); the GPU BO/residency pool is fd-addressed
   ([[reference_render_paths]]).
 
-What's missing for mobile: a **pressure signal** (FreeBSD has no mature PSI), a
-**compressed-RAM tier** (no zram/zswap in base), a **cooperative trim channel +
-cached-jail pool** (no `onTrimMemory` analog), and treating the CAS cache as a
-member that *yields* RAM under pressure rather than sitting outside the loop.
+What was missing for mobile, and now built: a **pressure signal** (FreeBSD has no
+mature PSI → `kern.pressure.memory` some/full/per-jail), a **compressed-RAM tier**
+(no zram/zswap in base → `atrium-zram` `/dev/zram0`, verified as live compressed
+swap), a **cooperative trim channel + cached-jail pool** (no `onTrimMemory` analog
+→ `memoryd` TRIM/EXIT/KILL cascade), and treating the CAS cache as a member that
+*yields* RAM under pressure rather than sitting outside the loop.
 
 ## 2. Doctrine: memory capacity is budgeted, not fair-divided
 
@@ -326,20 +328,29 @@ the two ideas unify.
      compress < drop-clean < swap-flash < kill; effective capacity =
      `(ram−pool)+pool×ratio`; falls through to swap/kill once the cold pool is spent
      (a tier, not a panacea); CPU budget bounds the reclaim rate.
-   - **Codec core — DONE + verified in-VM (#178).** `atrium-zram/` (`atrium_zram.ko`):
-     `zram_compress_page`/`zram_decompress_page` over the kernel's in-tree zstd, with
-     an incompressible-page fallback. This resolved the hardest unknown — a leaf
-     module *can* link the symmetric codec: the running kernel exports
-     `ZSTD_compress`/`ZSTD_decompress` as global symbols (ZSTDIO compiled in), so no
-     kernel rebuild, no zfs dependency. `kern.zram.selftest` → `OK: 4096 -> 55 bytes`
-     round-trip. No swap-path risk.
-   - Remaining kernel increments (specified, de-risked): (1) **pre-allocated per-CPU
-     `ZSTD_CCtx`** (`ZSTD_compressCCtx`) — the one-shot `ZSTD_compress` mallocs per
-     call, fatal on the reclaim path; (2) the **compressed page store**
-     (offset→buffer, with zero/same-filled-page detection — a big fraction of the win
-     and codec-free); (3) the **block device** (geom_disk / cdev `d_strategy`); (4)
-     **swapon**. Build it as a RAM-backed compressed swap device, verified first as a
-     plain block device before `swapon` (swap-path bugs corrupt swap / panic).
+   - **DONE — built end to end + verified live as compressed swap in-VM (#178).**
+     `atrium-zram/` (`atrium_zram.ko`), four increments, each verified before the next:
+     - **Codec core** — `zram_*_page` over the kernel's in-tree zstd with an
+       incompressible-page fallback. Resolved the hardest unknown: a leaf module *can*
+       link the symmetric codec — the running kernel exports `ZSTD_compress`/
+       `ZSTD_decompress` as global symbols (ZSTDIO compiled in), so no kernel rebuild,
+       no zfs dependency. `kern.zram.selftest` → `OK: 4096 -> 55 bytes`.
+     - **Pre-allocated `ZSTD_CCtx`/`DCtx`** (`ZSTD_compressCCtx`) — the one-shot
+       `ZSTD_compress` mallocs per call, fatal on the reclaim path; contexts are
+       allocated at module load and reused under a mutex.
+     - **Compressed page store** — per-slot state machine SAME/COMP/RAW with
+       zero/same-filled-page detection (a big fraction of the win, codec-free) and a
+       RAW verbatim fallback when a page won't shrink below a page.
+     - **Block device + swapon** — `disk(9)` `d_strategy` maps each page of a BIO to a
+       store slot; verified first as a plain block device (`dd` round-trip of 200
+       random pages MATCHED, unwritten blocks read zeros), *then* `swapon /dev/zram0`.
+       Under a 12 GB hog with zram the only swap: **~1.42 GB of swapped pages held in
+       ~8 MB physical** (~175×, the hog's pages mostly zero/same-filled), the hog
+       round-tripped without crashing, and free RAM *recovered* as pages compressed —
+       zram gave the system effective extra memory. No panic; clean `swapoff`.
+     - Refinements (own efforts): per-CPU contexts (vs the single mutex'd one);
+       dynamic device sizing; writeback of incompressible pages to real swap; wire the
+       tier into the federation (memoryd/memfed) so reclaim *prefers* compress.
 4. **Pergola `trim_memory` cooperative channel.**
 5. **`memoryd` policy loop + posture wiring.** **FIRST CUT DONE + verified in-VM
    (#172).** `memoryd/` (cross-compiled `aarch64-unknown-freebsd`) reads the live
