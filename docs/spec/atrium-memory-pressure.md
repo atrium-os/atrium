@@ -227,6 +227,18 @@ the two ideas unify.
 5. **Slack = inert.** At desktop RAM with a lazy posture the cap never binds, no
    reclaim runs, members keep their caches — mirrors the energy federation at
    `cap = 0`.
+6. **Tiers couple through the signal, not through wiring.** The compress tier (zram)
+   and the destructive tier (memoryd) have no direct dependency: PSI-`full` measures
+   stall *after* all reclaim, so a tier that absorbs pressure lowers `full` and the
+   next tier stays dormant — coordination without coupling. Verified in-VM (#178): a
+   12 GB compressible overcommit with zram swap on absorbed ~1.3 GB into ~7 MB
+   (~185×) and both registry members survived. `full` *did* spike to ~63% during the
+   fill — but the spike was transient (`thrash_run` reached 5 of the 6 s window, then
+   `nstalled→0` reset it) and the `nstalled` gate suppressed the decaying-average
+   tail (`full=62.9%` with `nstalled=0` is *not* thrash). zram's role in the coupling
+   is to keep the workload alive (no OOM) and the stall *brief* (RAM-speed compressed
+   I/O), so the residual `full` stays under the sustained-thrash window that slow
+   flash swap would blow past.
 
 ## 8. Worked cases
 
