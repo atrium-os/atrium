@@ -188,9 +188,14 @@ the two ideas unify.
   - **`memoryd` cascade** = the RESIDUAL reactive layer — for **uncapped** jails,
     genuine **over-commit** (Σ caps > RAM), and **cross-jail lifecycle-tier**
     prioritization that per-jail RCTL rules don't see.
-  - **The federation's real job** = setting those RCTL caps **dynamically**
-    (`water_fill` the shared RAM by weight, push per-jail `memoryuse` via the runtime
-    rctl API) — not static admin rules. *Coordinated, not coupled.*
+  - **The federation's real job = setting those RCTL caps DYNAMICALLY — BUILT +
+    verified (`memfed`, #178).** `water_fill` the shared RAM by weight (floor +
+    weighted elastic share, Σ ≤ budget) and push each jail's `memoryuse` cap via the
+    rctl API; the cap is never set below current RSS (would kill), so an over-budget
+    jail is frozen-not-killed. Verified: budgeted 8 GB over web(w3)+cache(w1) → caps
+    6176/2016 MB; the SAME 4 GB hog was killed in cache but survived in web, PSI
+    stayed 0. *Coordinated, not coupled* — `memfed` runs periodically to track
+    demand/jail churn. (Not static admin rules.)
   Caveat: RCTL is cruder than cgroup-v2 `memory.max` (deny/sig, not
   reclaim-then-kill-within-the-cgroup).
 - **A reclaim member interface** paralleling `sys/energy_budget.h`:
