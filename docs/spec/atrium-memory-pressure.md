@@ -253,6 +253,20 @@ the two ideas unify.
      tasks in-stall, compare `nr_running` to `nr_memstall`) — a real scheduler
      change, deferred. `some` (which works) stands; `memoryd`'s free-floor gate
      remains the thrash proxy.
+   - **Production PSI rewrite (b) — design DONE + model-tier proven; kernel work
+     specified, not yet built.** The prototype (bracket the `vm_wait` sleep with a
+     global counter) gives correct-but-coarse `some` only and a global lock on the
+     stall path. The production design tracks **per-task stall state** and derives
+     both signals from per-CPU counts — which fixes scalability, granularity, AND the
+     `full` confound at once. Model: `gpusim engine/src/psi.rs` (6 tests, incl. the
+     proof that classifying reclaim as memstall makes `full` fire where the proxy
+     gave 0). Kernel plan: (1) a `td_flags` **memstall bit**, set at `vm_wait`/refault
+     AND around the reclaim paths (so the pagedaemon counts as stall); (2) per-CPU
+     `{nr_memstall, nr_productive}` updated at **`sched_switch`** (the hot path —
+     productive = running, not idle, not memstall) and at memstall enter/leave; (3)
+     per-CPU some/full time accounting, summed on read (no global lock). This is the
+     riskiest single change in the effort (a `sched_switch` hook) and warrants its own
+     focused build; the model de-risks the design.
    - **1c — per-jail attribution + the kqueue edge-trigger** (with `memoryd`):
      prison-keyed storage via `pr_osd` (no KBI break); a `EVFILT_VM` note `memoryd`
      waits on instead of polling. Deferred until there is a consumer (an event source
