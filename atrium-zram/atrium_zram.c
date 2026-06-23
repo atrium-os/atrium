@@ -18,6 +18,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/bio.h>
 #include <sys/kernel.h>
 #include <sys/libkern.h>
 #include <sys/lock.h>
@@ -25,6 +26,7 @@
 #include <sys/module.h>
 #include <sys/mutex.h>
 #include <sys/sysctl.h>
+#include <geom/geom_disk.h>
 
 /* In-kernel zstd context API (resolved at load against the kernel's globals). */
 typedef struct ZSTD_CCtx_s ZSTD_CCtx;
@@ -59,6 +61,7 @@ static ZSTD_CCtx	*zram_cctx;	/* pre-allocated — no malloc on the hot path */
 static ZSTD_DCtx	*zram_dctx;
 static struct mtx	 zram_mtx;	/* serializes the shared contexts (per-CPU = refinement) */
 static uint64_t		 zram_phys_bytes;	/* total physical bytes the store holds */
+static struct disk	*zram_disk;	/* /dev/zram0 — the swap block device */
 
 /* Is the page all one byte (zero or same-filled)? Returns the fill byte if so. */
 static bool
@@ -148,10 +151,45 @@ zram_load(uint32_t idx, void *page)
 			err = EIO;
 		break;
 	default:
-		err = ENOENT;
+		/* never-written block reads as zeros (standard block-device / swap). */
+		memset(page, 0, ZRAM_PAGE);
 	}
 	mtx_unlock(&zram_mtx);
 	return (err);
+}
+
+/*
+ * Block-device strategy: map each page of a BIO to a store slot. Swap (and dd
+ * bs=4096) do page-aligned I/O; reject anything else. This is /dev/zram0's hot
+ * path — store on write, load on read.
+ */
+static void
+zram_strategy(struct bio *bp)
+{
+	uint8_t *data;
+	off_t off;
+	uint32_t idx;
+	int err = 0;
+
+	if (bp->bio_cmd != BIO_READ && bp->bio_cmd != BIO_WRITE) {
+		biofinish(bp, NULL, EOPNOTSUPP);
+		return;
+	}
+	if ((bp->bio_offset % ZRAM_PAGE) != 0 || (bp->bio_length % ZRAM_PAGE) != 0) {
+		biofinish(bp, NULL, EINVAL);
+		return;
+	}
+	data = bp->bio_data;
+	for (off = 0; off < bp->bio_length; off += ZRAM_PAGE) {
+		idx = (uint32_t)((bp->bio_offset + off) / ZRAM_PAGE);
+		if (idx >= ZRAM_NSLOTS) { err = EINVAL; break; }
+		err = (bp->bio_cmd == BIO_READ) ?
+		    zram_load(idx, data + off) : zram_store(idx, data + off);
+		if (err != 0)
+			break;
+	}
+	bp->bio_resid = (err != 0) ? bp->bio_length : 0;
+	biofinish(bp, NULL, err);
 }
 
 /* Self-test: store a zero page, a compressible page, and an incompressible
@@ -221,10 +259,20 @@ zram_modevent(module_t mod __unused, int type, void *data __unused)
 		zram_slots = malloc(sizeof(struct zram_slot) * ZRAM_NSLOTS, M_ZRAM,
 		    M_WAITOK | M_ZERO);
 		mtx_init(&zram_mtx, "zram", NULL, MTX_DEF);
-		printf("atrium_zram: store ready (%d slots, pre-allocated zstd contexts)\n",
-		    ZRAM_NSLOTS);
+		/* /dev/zram0 — a compressed RAM block device (page-sized sectors). */
+		zram_disk = disk_alloc();
+		zram_disk->d_strategy = zram_strategy;
+		zram_disk->d_name = "zram";
+		zram_disk->d_unit = 0;
+		zram_disk->d_sectorsize = ZRAM_PAGE;
+		zram_disk->d_mediasize = (off_t)ZRAM_NSLOTS * ZRAM_PAGE;
+		zram_disk->d_maxsize = ZRAM_PAGE * 16;
+		disk_create(zram_disk, DISK_VERSION);
+		printf("atrium_zram: /dev/zram0 ready (%d pages = %juMB, pre-allocated zstd)\n",
+		    ZRAM_NSLOTS, (uintmax_t)((off_t)ZRAM_NSLOTS * ZRAM_PAGE >> 20));
 		return (0);
 	case MOD_UNLOAD:
+		disk_destroy(zram_disk);
 		for (i = 0; i < ZRAM_NSLOTS; i++)
 			zram_free_slot(&zram_slots[i]);
 		free(zram_slots, M_ZRAM);
