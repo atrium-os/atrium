@@ -318,8 +318,22 @@ the two ideas unify.
      `kern.pressure.memory.jails` as `jail <jid> some_ns=<ns>`. Verified: a hog run
      via `jexec` in jail 2 attributed ~31.8 s to "jail 2" while the host (jid 0) did
      not appear. Limits (noted): bounded to 16; slots not reclaimed on jail destroy
-     (a production version sweeps). Remaining: per-jail `full`; the **`EVFILT_VM`
-     kqueue edge-trigger** so `memoryd` waits on an edge instead of polling.
+     (a production version sweeps). Remaining: per-jail `full`.
+   - **1c — kqueue edge-trigger: DONE + verified in-VM (#179).** The BSD-native
+     realization of PSI's poll/trigger (Linux: `poll()` on `/proc/pressure/memory`
+     with a written threshold). A `/dev/pressure` cdev with a `d_kqfilter` lets a
+     controller register an `EVFILT_READ` knote whose `data` carries a `full`
+     threshold in basis points (the sysctl unit — 40% = 4000); the existing 1 s
+     aggregation callout `KNOTE`s the list, so a knote is active while
+     `full_avg10 ≥` its threshold. The controller sleeps in `kevent()` with **zero
+     wakeups** until the kernel pushes a pressure edge — no 1 Hz poll, no idle CPU.
+     Low-risk: no scheduler hot-path hook, own leaf mutex, `KNOTE_UNLOCKED` after
+     `pressure_mtx` drops (no lock-order coupling). memoryd uses it when the kernel
+     exposes `full`, falling back to the poll otherwise. Verified: a standalone
+     kevent test timed out idle (threshold 90%, zero spurious wakeups) and woke at
+     `full=11.3%` under a hog (threshold 10%); memoryd stayed silent 5 s idle (2 log
+     lines vs ~5 for a poller) then woke on the edge the instant `full` crossed 30%
+     and ran the reap cascade, sparing the foreground. Remaining: per-jail `full`.
 2. **Reclaim member interface + RCTL enforcement + the cached-jail pool.**
    - **Controller model tier — DONE.** `gpusim engine/src/controller.rs`
      (`MemController`): watches the pressure signal and under *sustained* thrash
