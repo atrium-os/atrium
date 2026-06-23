@@ -42,7 +42,7 @@ unsigned ZSTD_isError(size_t code);
 
 #define	ZRAM_PAGE	4096
 #define	ZRAM_LEVEL	3
-#define	ZRAM_NSLOTS	1024	/* test store capacity (pages) */
+#define	ZRAM_NSLOTS	524288	/* store capacity in pages (524288 = 2 GiB device) */
 
 static MALLOC_DEFINE(M_ZRAM, "zram", "atrium zram store");
 
