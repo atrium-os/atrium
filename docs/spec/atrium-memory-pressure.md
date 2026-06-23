@@ -170,8 +170,29 @@ the two ideas unify.
   missing kernel *mechanism*. Policy stays in a userspace daemon — the lmkd lesson
   (Android moved its killer out of the kernel) and Atrium's own doctrine
   (portcullisd/lyrad: mechanism in kernel, policy in a daemon).
-- **Enforcement = RCTL** — per-jail `memoryuse`/`swapuse` caps + actions are the
-  cap/floor actuator that already exists.
+- **The per-jail HARD CAP = RCTL — the PROACTIVE containment layer (verified #178).**
+  FreeBSD RACCT/RCTL already provides per-jail memory accounting (`memoryuse`=RSS,
+  `vmemoryuse`, `swapuse`) and enforceable limits with actions (`deny` for
+  virtual/swap; `sigkill`/`sigterm` for RSS — you cannot cleanly fail a page fault,
+  so RSS is enforced by killing the offending process). So a jail's hard memory
+  boundary already exists — and it is *better* than reactive reaping for
+  containment: a runaway jail is stopped **at its own cap before it can pressure the
+  system**, so the machine never thrashes and `memoryd`/PSI never has to engage.
+  Verified in-VM: `jail:x:memoryuse:sigkill=3g` killed a 5 GB hog at the 3 GB
+  boundary while system free RAM held at 11.4 GB and PSI `some` stayed **0**; the
+  same hog uncapped ran to 5 GB resident. **The layering this fixes:**
+  - **RCTL per-jail cap** = proactive hard limit (containment). Present in our kernel
+    (needs `kern.racct.enable=1`).
+  - **PSI per-jail `some`/`full`** = the signal (which jail suffers). *Complementary,
+    not redundant:* RCTL reports per-jail *usage*; PSI reports per-jail *stall*.
+  - **`memoryd` cascade** = the RESIDUAL reactive layer — for **uncapped** jails,
+    genuine **over-commit** (Σ caps > RAM), and **cross-jail lifecycle-tier**
+    prioritization that per-jail RCTL rules don't see.
+  - **The federation's real job** = setting those RCTL caps **dynamically**
+    (`water_fill` the shared RAM by weight, push per-jail `memoryuse` via the runtime
+    rctl API) — not static admin rules. *Coordinated, not coupled.*
+  Caveat: RCTL is cruder than cgroup-v2 `memory.max` (deny/sig, not
+  reclaim-then-kill-within-the-cgroup).
 - **A reclaim member interface** paralleling `sys/energy_budget.h`:
   `memory_member_register(name, probe_fn, reclaim_fn, weight)` where `probe_fn`
   returns `{min, current, reclaimable[]}` and `reclaim_fn(target, posture)` =
