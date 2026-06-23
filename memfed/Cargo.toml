@@ -1,0 +1,14 @@
+[package]
+name = "memfed"
+version = "0.1.0"
+edition = "2021"
+description = "Atrium memory federation — water-fill shared RAM across jails by weight, enforced as per-jail RCTL memoryuse caps (the proactive containment layer)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "memfed"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
