@@ -326,8 +326,20 @@ the two ideas unify.
      compress < drop-clean < swap-flash < kill; effective capacity =
      `(ram−pool)+pool×ratio`; falls through to swap/kill once the cold pool is spent
      (a tier, not a panacea); CPU budget bounds the reclaim rate.
-   - Remaining: the kernel implementation — a compressing swap pager (a substantial
-     focused effort), specified + de-risked by the model.
+   - **Codec core — DONE + verified in-VM (#178).** `atrium-zram/` (`atrium_zram.ko`):
+     `zram_compress_page`/`zram_decompress_page` over the kernel's in-tree zstd, with
+     an incompressible-page fallback. This resolved the hardest unknown — a leaf
+     module *can* link the symmetric codec: the running kernel exports
+     `ZSTD_compress`/`ZSTD_decompress` as global symbols (ZSTDIO compiled in), so no
+     kernel rebuild, no zfs dependency. `kern.zram.selftest` → `OK: 4096 -> 55 bytes`
+     round-trip. No swap-path risk.
+   - Remaining kernel increments (specified, de-risked): (1) **pre-allocated per-CPU
+     `ZSTD_CCtx`** (`ZSTD_compressCCtx`) — the one-shot `ZSTD_compress` mallocs per
+     call, fatal on the reclaim path; (2) the **compressed page store**
+     (offset→buffer, with zero/same-filled-page detection — a big fraction of the win
+     and codec-free); (3) the **block device** (geom_disk / cdev `d_strategy`); (4)
+     **swapon**. Build it as a RAM-backed compressed swap device, verified first as a
+     plain block device before `swapon` (swap-path bugs corrupt swap / panic).
 4. **Pergola `trim_memory` cooperative channel.**
 5. **`memoryd` policy loop + posture wiring.** **FIRST CUT DONE + verified in-VM
    (#172).** `memoryd/` (cross-compiled `aarch64-unknown-freebsd`) reads the live
