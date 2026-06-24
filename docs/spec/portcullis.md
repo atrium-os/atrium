@@ -1121,7 +1121,21 @@ Concretely:
 > jaild so its uid-range validation is the enforcement point. Until then, do not
 > treat the jailed-desktop bring-up as evidence that the privilege boundary holds.
 
-### 9.1 In scope
+> ⚠️ **KNOWN GAP — filesystem & device isolation NOT yet enforced (found 2026-06-24).**
+> The two claims below are the DESIGN; the current bring-up does **not** meet
+> them. Every jail today is created with `path = "/"` (the documented placeholder
+> "until D5 atrium-rootfs") **and** jaild only passes the `devfs_ruleset`
+> *parameter* — it never *mounts* a per-jail devfs. Consequence, verified on the
+> real `app-org-atrium-vestibulum` jail (`devfs_ruleset=0`, single `devfs on /dev`
+> mount): a jailed app sees the **entire host filesystem** and the **full host
+> `/dev`** — `kmem`, `mem`, `pci`, every device. With `path = "/"` the jail's
+> `/dev` *is* the host `/dev`, so any `devfs_ruleset` is inert (there is no
+> separate devfs for it to restrict). PID/process isolation holds; filesystem and
+> device isolation do **not**. Fix (the jail-isolation foundation): per-jail root
+> (bundle tree / minimal root, not `/`) + jaild mounts a per-jail devfs at
+> `<root>/dev` with the ruleset (jaild has the `nmount` pattern from
+> `nullfs_mount`; add a `devfs_mount(target, ruleset)` and call it at create when
+> `devfs_ruleset != 0`). Until then, treat the jail boundary as process-only.
 
 - **App-to-app isolation.** A compromised app cannot read another
   app's files (no shared mount), cannot talk to services it
@@ -1130,7 +1144,8 @@ Concretely:
 - **App-to-host isolation.** Standard FreeBSD jail protections —
   no access to host filesystem outside declared mounts, no raw
   sockets, no kernel modules, no dev nodes outside the devfs
-  ruleset.
+  ruleset. *(See the KNOWN GAP above — not enforced in the current
+  `path = "/"` bring-up; this is the target, not today's reality.)*
 - **Capability auditability.** The grant list is a human-readable
   text file. Users can revoke anytime by editing or via UI.
 - **Manifest-tampering detection.** The grant record includes the
