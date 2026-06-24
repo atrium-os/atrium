@@ -702,6 +702,14 @@ fn handle_create(
         }
         info!("jaild: mounted per-jail devfs at {devdir} ruleset {}",
             req.devfs_ruleset);
+    } else if req.path == "/" {
+        /* Operational visibility for the §9.1 KNOWN GAP: a path="/" jail shares
+         * the host root + host /dev (no fs/device isolation — PID isolation only).
+         * Still the bring-up reality for ostiarius-launched session apps; logged
+         * so the unisolated jails are visible until the per-jail-root migration. */
+        warn!("jaild: jail {} created with path=\"/\" — NO filesystem/device \
+               isolation (shares host root + /dev); §9.1 KNOWN GAP, migrate to a \
+               per-jail root", req.name);
     }
 
     if let Some(exec) = &req.exec {
