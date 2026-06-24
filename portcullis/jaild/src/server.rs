@@ -17,7 +17,8 @@ use log::{error, info, warn};
 use crate::ffi::{self, JailCreateSpec};
 use crate::protocol::{
     self, AttachMountRequest, CreateJailRequest, CreateJailResponse,
-    DetachMountRequest, ExecSpec, MountKind, NetworkConfig, Request, Response,
+    DetachMountRequest, ExecSpec, MountKind, NetworkConfig, ReapRequest, Request,
+    Response, SetRctlRequest,
 };
 use crate::state::PersistentState;
 use crate::validator;
@@ -198,6 +199,92 @@ fn dispatch(
         Request::DetachMount(req) => {
             (handle_detach_mount(req, dry_run, state, state_path), None)
         }
+
+        Request::Reap(req) => (handle_reap(req, policy, dry_run, state), None),
+
+        Request::SetRctl(req) => (handle_set_rctl(req, policy, dry_run, state), None),
+    }
+}
+
+/// Signal a jaild-created jail's processes — the memory governor's reclaim
+/// cascade. Two independent gates: (1) the jail must be in jaild's own state, so
+/// jaild can never signal the TCB or a jail it didn't create; (2)
+/// `policy.resource_control.allow_reap` (the outer ceiling; the inner grant is
+/// the governor's portcullisd capability). The signal set is already bounded by
+/// `ReapSignal`. State is not mutated.
+fn handle_reap(
+    req:     ReapRequest,
+    policy:  &Policy,
+    dry_run: bool,
+    state:   &PersistentState,
+) -> Response {
+    if !policy.resource_control.allow_reap {
+        return Response::PolicyDenied {
+            rule:   "reap.disabled".into(),
+            detail: "policy.resource_control.allow_reap = false".into(),
+        };
+    }
+    let jail = match state.jails.iter().find(|j| j.name == req.jail_name) {
+        Some(j) => j.clone(),
+        None => return Response::PolicyDenied {
+            rule:   "reap.unknown_jail".into(),
+            detail: format!("no jail named {:?} in jaild state — refusing to \
+                             signal a jail jaild did not create", req.jail_name),
+        },
+    };
+    if dry_run {
+        info!("[dry-run] reap jail {} (jid {}) signal {:?}",
+            jail.name, jail.jid, req.signal);
+        return Response::Ok;
+    }
+    match ffi::reap_jail(jail.jid, req.signal.signum()) {
+        Ok(()) => {
+            info!("reaped jail {} (jid {}) with {:?}", jail.name, jail.jid, req.signal);
+            Response::Ok
+        }
+        Err(e) => Response::SyscallFailed {
+            name:  "reap_jail".into(),
+            errno: e.raw_os_error().unwrap_or(0),
+            msg:   format!("{e}"),
+        },
+    }
+}
+
+/// Set a jaild-created jail's RCTL `memoryuse` cap — the memory federation
+/// budgeter. Same two gates as Reap (`allow_rctl`). State is not mutated.
+fn handle_set_rctl(
+    req:     SetRctlRequest,
+    policy:  &Policy,
+    dry_run: bool,
+    state:   &PersistentState,
+) -> Response {
+    if !policy.resource_control.allow_rctl {
+        return Response::PolicyDenied {
+            rule:   "rctl.disabled".into(),
+            detail: "policy.resource_control.allow_rctl = false".into(),
+        };
+    }
+    let jail = match state.jails.iter().find(|j| j.name == req.jail_name) {
+        Some(j) => j.clone(),
+        None => return Response::PolicyDenied {
+            rule:   "rctl.unknown_jail".into(),
+            detail: format!("no jail named {:?} in jaild state", req.jail_name),
+        },
+    };
+    if dry_run {
+        info!("[dry-run] set rctl jail {} memoryuse={}M", jail.name, req.memoryuse_mb);
+        return Response::Ok;
+    }
+    match ffi::set_jail_rctl(&jail.name, req.memoryuse_mb) {
+        Ok(()) => {
+            info!("set rctl jail {} memoryuse={}M (sigkill)", jail.name, req.memoryuse_mb);
+            Response::Ok
+        }
+        Err(e) => Response::SyscallFailed {
+            name:  "set_jail_rctl".into(),
+            errno: e.raw_os_error().unwrap_or(0),
+            msg:   format!("{e}"),
+        },
     }
 }
 

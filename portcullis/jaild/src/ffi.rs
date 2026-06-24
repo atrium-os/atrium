@@ -584,6 +584,78 @@ pub fn child_exit(code: i32) -> ! {
 }
 
 // ====================================================================
+// Memory-governor broker mechanism: signal a jail's processes (Reap)
+// and set a jail's RCTL memoryuse cap (SetRctl). The caller (dispatch)
+// has already confirmed the jid/name is one jaild itself created and
+// that policy permits the action.
+// ====================================================================
+
+/// Conservative jail-name check for shellout safety: the rctl rule embeds the
+/// name, so refuse anything outside `[A-Za-z0-9._-]` (Atrium jail names are
+/// `app-org-...`-shaped). The caller's state lookup already restricts to
+/// jaild-created names; this is belt-and-braces against metacharacter injection.
+fn is_safe_jail_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 256
+        && name.bytes().all(|b| b.is_ascii_alphanumeric()
+            || b == b'.' || b == b'-' || b == b'_')
+}
+
+/// Signal every process in jail `jid` with `sig`. jail_attach(2) is one-way, so
+/// we fork a child that attaches and `kill(-1, sig)`s (which, inside the jail,
+/// reaches exactly that jail's processes — the kernel excludes the caller and
+/// init). The parent waits for the child. This is how the governor's cascade
+/// (SIGINFO -> SIGTERM -> SIGKILL) reaches a jailed app from outside its jail.
+#[cfg(target_os = "freebsd")]
+pub fn reap_jail(jid: i32, sig: i32) -> io::Result<()> {
+    // SAFETY: fork(); the child calls only async-signal-safe libc functions
+    // (jail_attach, kill, _exit) before exiting.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if pid == 0 {
+        if unsafe { libc::jail_attach(jid) } != 0 {
+            unsafe { libc::_exit(127) };
+        }
+        let _ = unsafe { libc::kill(-1, sig) };
+        unsafe { libc::_exit(0) };
+    }
+    let mut status: libc::c_int = 0;
+    // SAFETY: waiting on our own child pid.
+    if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 127 {
+        return Err(io::Error::new(io::ErrorKind::Other,
+            format!("jail_attach({jid}) failed in reap child")));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn reap_jail(_jid: i32, _sig: i32) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "reap_jail: FreeBSD only"))
+}
+
+/// Set jail `name`'s RCTL `memoryuse` cap to `mb` MiB with a sigkill action, via
+/// rctl(8) — a shellout in the audited ifconfig style (rctl(8) is stable and the
+/// call rate is ~1 per jail per federation tick). Requires `kern.racct.enable=1`.
+pub fn set_jail_rctl(name: &str, mb: u64) -> io::Result<()> {
+    if !is_safe_jail_name(name) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            format!("jail name {name:?} contains unsafe characters")));
+    }
+    let rule = format!("jail:{name}:memoryuse:sigkill={mb}M");
+    let out = std::process::Command::new("rctl").arg("-a").arg(&rule).output()?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    Err(io::Error::new(io::ErrorKind::Other, format!("rctl -a {rule}: {stderr}")))
+}
+
+// ====================================================================
 // Network: lo0 alias add/remove via ifconfig(8) shellout.
 //
 // V0 uses Command shellout for simplicity. The alternative —

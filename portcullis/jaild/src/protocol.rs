@@ -66,6 +66,18 @@ pub enum Request {
     /// success. `force = true` adds MNT_FORCE.
     DetachMount(DetachMountRequest),
 
+    /// Signal a jaild-created jail's processes — the memory-governor reclaim
+    /// cascade (Trim=SIGINFO, Exit=SIGTERM, Kill=SIGKILL). jaild refuses any
+    /// jail it did not itself create (protects the TCB and non-jaild jails),
+    /// and the signal set is bounded by `ReapSignal`. Gated by
+    /// `policy.resource_control.allow_reap`. See `atrium-memory-pressure.md` §9.5.
+    Reap(ReapRequest),
+
+    /// Set a jaild-created jail's RCTL `memoryuse` cap (sigkill action) — the
+    /// memory-federation budgeter. Same jaild-created-only protection. Gated by
+    /// `policy.resource_control.allow_rctl`.
+    SetRctl(SetRctlRequest),
+
     /// Health check. Returns `Response::Ok` if jaild is alive.
     Ping,
 }
@@ -93,6 +105,42 @@ pub struct DetachMountRequest {
     pub dest:      String,
     #[serde(default)]
     pub force:     bool,
+}
+
+/// The bounded signal set the Reap broker accepts — no raw signal numbers, so a
+/// governor can never ask jaild to deliver an arbitrary signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum ReapSignal {
+    /// SIGINFO — "shed caches but keep running" (the onTrimMemory analog).
+    Trim,
+    /// SIGTERM — "exit gracefully" (onDestroy).
+    Exit,
+    /// SIGKILL — force.
+    Kill,
+}
+
+impl ReapSignal {
+    /// The libc signal number this maps to.
+    pub fn signum(self) -> i32 {
+        match self {
+            ReapSignal::Trim => libc::SIGINFO,
+            ReapSignal::Exit => libc::SIGTERM,
+            ReapSignal::Kill => libc::SIGKILL,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReapRequest {
+    pub jail_name: String,
+    pub signal:    ReapSignal,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SetRctlRequest {
+    pub jail_name:    String,
+    /// `memoryuse` cap in MiB; the enforced action is sigkill.
+    pub memoryuse_mb: u64,
 }
 
 /// Create-jail spec.
@@ -318,6 +366,38 @@ pub fn write_frame<W: Write>(mut w: W, body: &[u8]) -> Result<(), JaildError> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// Lock the wire format of the governor-broker verbs (the portcullisd client
+    /// depends on it): the bounded ReapSignal round-trips and tags are stable.
+    #[test]
+    fn reap_and_setrctl_serde() {
+        let r = Request::Reap(ReapRequest {
+            jail_name: "app-org-atrium-web".into(),
+            signal: ReapSignal::Exit,
+        });
+        let back: Request = serde_json::from_slice(&serde_json::to_vec(&r).unwrap()).unwrap();
+        match back {
+            Request::Reap(rr) => {
+                assert_eq!(rr.jail_name, "app-org-atrium-web");
+                assert_eq!(rr.signal, ReapSignal::Exit);
+                assert_eq!(rr.signal.signum(), libc::SIGTERM);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let s = Request::SetRctl(SetRctlRequest {
+            jail_name: "app-org-atrium-web".into(),
+            memoryuse_mb: 2048,
+        });
+        let back: Request = serde_json::from_slice(&serde_json::to_vec(&s).unwrap()).unwrap();
+        match back {
+            Request::SetRctl(sr) => {
+                assert_eq!(sr.jail_name, "app-org-atrium-web");
+                assert_eq!(sr.memoryuse_mb, 2048);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
 
     #[test]
     fn frame_round_trip() {

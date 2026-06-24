@@ -46,6 +46,25 @@ pub struct Policy {
     #[serde(default)]
     pub services:       BTreeMap<String, ServiceProfile>,
     pub apps:           AppsPolicy,
+    /// Outer ceiling for the memory-governor broker (Reap / SetRctl). Optional —
+    /// absent (or all-false) means jaild brokers neither, the conservative default.
+    /// Per-service authorization is the *inner* grant (the portcullisd capability);
+    /// both must allow. See `atrium-memory-pressure.md` §9.5.
+    #[serde(default)]
+    pub resource_control: ResourceControl,
+}
+
+/// What the memory-governor broker may do. jaild only ever acts on jails it itself
+/// created (the dispatch enforces that independently), so this gates the *kind* of
+/// action, not the target set.
+#[derive(Debug, Default, Deserialize, Serialize)]
+pub struct ResourceControl {
+    /// Allow `Reap` — signalling a jaild-created jail's processes (the cascade).
+    #[serde(default)]
+    pub allow_reap: bool,
+    /// Allow `SetRctl` — setting a jaild-created jail's `memoryuse` cap.
+    #[serde(default)]
+    pub allow_rctl: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -259,6 +278,29 @@ mod tests {
             .expect("attested atrium-virtio-gpu missing");
         assert_eq!(virtio.status, GpuDriverStatus::Production);
         assert!(virtio.isolation_test_passed);
+    }
+
+    /// The resource-control broker ceiling is optional and defaults OFF: an
+    /// existing schema-v1 policy file (the shipped sample has no
+    /// `[resource_control]` section) still parses, and jaild brokers neither
+    /// Reap nor SetRctl until an operator explicitly enables them.
+    #[test]
+    fn resource_control_defaults_off_and_is_optional() {
+        let crate_dir = env!("CARGO_MANIFEST_DIR");
+        let sample = std::path::Path::new(crate_dir)
+            .parent().unwrap().parent().unwrap()
+            .join("etc/jaild.policy.toml");
+        let p = Policy::load(&sample).unwrap();
+        assert!(!p.resource_control.allow_reap, "allow_reap must default off");
+        assert!(!p.resource_control.allow_rctl, "allow_rctl must default off");
+    }
+
+    /// When present, the flags parse.
+    #[test]
+    fn resource_control_section_parses() {
+        let rc: ResourceControl =
+            toml::from_str("allow_reap = true\nallow_rctl = true").unwrap();
+        assert!(rc.allow_reap && rc.allow_rctl);
     }
 
     /// Schema version mismatch must fail.
