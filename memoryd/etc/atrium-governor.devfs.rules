@@ -1,0 +1,17 @@
+# Append to /etc/devfs.rules, then `service devfs restart`.
+#
+# The devfs ruleset for a jailed memory governor (atrium-memoryd / atrium-memfed).
+# Hides the entire host /dev, unhides only the basics + /dev/pressure, and makes
+# /dev/pressure world-readable *within the jail's devfs* (0644) so the non-root
+# governor uid can open it for the PRESSURE_GET ioctl + the kqueue edge. The host
+# /dev/pressure stays 0640 root:wheel; this only affects the per-jail devfs mount.
+#
+# jaild mounts this at <jail-root>/dev (handle_create, for path != "/" jails) and
+# unmounts it on RemoveJail. The numeric id (20) must be in jaild.policy.toml
+# [devfs_rulesets].allowed_ids.
+
+[atrium_governor=20]
+add include $devfsrules_hide_all
+add include $devfsrules_unhide_basic
+add path pressure unhide
+add path pressure mode 0644

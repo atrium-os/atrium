@@ -1,0 +1,77 @@
+# /etc/atrium/services.d/50-atrium-memoryd.toml
+#
+# The v2 JAILED launch of the memory-pressure governor — portcullisd's
+# atrium-portcullisd-bootstrap reads this, asks jaild to create the jail, and
+# kqueue-supervises memoryd inside it. This is "loaded like fresco" the RIGHT way
+# (jailed system service), NOT the host-root rc.d script (memoryd/etc/atrium-memoryd,
+# which is the v1 bring-up). See docs/spec/atrium-memory-pressure.md §9.5.
+#
+# memoryd here is fully isolated + jailed + verified in-VM (#183):
+#   - own minimal rootfs (path below) — sees NO host filesystem
+#   - per-jail devfs (devfs_ruleset) — sees only /dev/pressure + basics, NOT
+#     kmem/mem/pci/gpu (the §9.1 device-isolation fix; jaild mounts the devfs)
+#   - runs as the non-root _memoryd uid
+#   - reads /dev/pressure via the PRESSURE_GET ioctl (the ruleset makes it 0644)
+#   - reaps via --broker -> portcullisd -> jaild (no cross-jail kill of its own)
+#
+# REQUIRES this supporting infra (commission once per host):
+#   1. _memoryd system uid (e.g. `pw useradd _memoryd -u 50090 -d /nonexistent
+#      -s /usr/sbin/nologin`), and that uid in jaild.policy.toml
+#      [uid].allowed_system_uids.
+#   2. The governor devfs ruleset (etc/atrium-governor.devfs.rules -> /etc/devfs.rules,
+#      `service devfs restart`), and its id in jaild.policy.toml
+#      [devfs_rulesets].allowed_ids.
+#   3. jaild.policy.toml mount_sources: a rw_pattern "/var/lib/atrium/jails/*" for
+#      the jail root, and ro_paths for the rootfs nullfs sources
+#      (/usr/local/bin /lib /usr/lib /libexec /atrium/sockets; /usr/local/lib
+#      already present).
+#   4. jaild.policy.toml [resource_control] allow_reap = true (the outer gate).
+#   5. The portcullisd serve daemon running (for the runtime GovernReap), and the
+#      governor binary installed as /usr/local/bin/atrium-memoryd (the atrium-
+#      prefix satisfies [exec_paths]).
+#   6. The rootfs mountpoint dirs created: <path>/{dev,libexec,lib,usr/lib,
+#      usr/local/lib,usr/local/bin,atrium/sockets,var/run/atrium/memoryd}.
+
+enabled      = true
+name         = "atrium-memoryd"
+path         = "/var/lib/atrium/jails/memoryd"   # a REAL root, not "/" (isolation)
+children_max = 0
+devfs_ruleset = 20                                # governor ruleset: pressure + basics only
+
+# Read-only library/binary nullfs mounts (the minimal rootfs). FreeBSD shares the
+# mount namespace; jaild applies these in its pdfork-exec child before execve.
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/lib"
+dest   = "usr/local/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/atrium/sockets"
+dest   = "atrium/sockets"
+kind   = "ro_nullfs"
+
+[exec]
+path = "/usr/local/bin/atrium-memoryd"
+argv = ["atrium-memoryd", "--arm", "--broker", "/atrium/sockets/portcullis.sock",
+        "--full-trip", "40", "--registry", "/var/run/atrium/memoryd/members"]
+uid  = 50090   # _memoryd
+gid  = 50090
+
+[capabilities]
+memory_govern = true   # the inner grant: portcullisd forwards this jail's
+                       # GovernReap/GovernSetRctl to jaild (jaild policy is the outer gate)
