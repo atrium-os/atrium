@@ -635,6 +635,50 @@ pub fn child_exit(code: i32) -> ! {
     unsafe { libc::_exit(code); }
 }
 
+/// Give the pdfork-child VALID stdin/stdout/stderr before it execve's the
+/// service. jaild runs daemonized (its own fd 1/2 are closed), and the
+/// child inherits those: a service that writes to stdout/stderr then dies
+/// at startup — a Rust binary's first `println!`/`eprintln!` PANICS on the
+/// EBADF and aborts with exit 101 (this is exactly what wedged the jailed
+/// memoryd governor and would wedge every other Rust service the moment it
+/// logged). stdin -> /dev/null; stdout+stderr -> `log_path` (a per-service
+/// log, for operability) with a /dev/null fallback so the fds are ALWAYS
+/// valid. Best-effort and async-signal-safe-ish: only open/dup2/close.
+/// Call FIRST in the child (as root, before jail_attach) so the host log
+/// path is reachable and the child's own diagnostics land somewhere.
+pub fn redirect_child_stdio(log_path: &str) {
+    use std::ffi::CString;
+    let devnull = match CString::new("/dev/null") {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    // SAFETY: plain fd syscalls on CStrings that outlive the calls.
+    unsafe {
+        let nullfd = libc::open(devnull.as_ptr(), libc::O_RDWR);
+        if nullfd >= 0 {
+            libc::dup2(nullfd, 0);
+        }
+        let outfd = CString::new(log_path).ok()
+            .map(|p| libc::open(
+                p.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+                0o644,
+            ))
+            .filter(|&fd| fd >= 0)
+            .unwrap_or(nullfd);
+        if outfd >= 0 {
+            libc::dup2(outfd, 1);
+            libc::dup2(outfd, 2);
+        }
+        if outfd != nullfd && outfd >= 0 {
+            libc::close(outfd);
+        }
+        if nullfd > 2 {
+            libc::close(nullfd);
+        }
+    }
+}
+
 // ====================================================================
 // Memory-governor broker mechanism: signal a jail's processes (Reap)
 // and set a jail's RCTL memoryuse cap (SetRctl). The caller (dispatch)

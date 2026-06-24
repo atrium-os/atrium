@@ -787,6 +787,14 @@ fn handle_create_with_exec(
 
     if pdf.pid == 0 {
         /* ====== child ====== */
+        /* Give the child VALID stdio before ANYTHING writes to it.
+         * jaild is daemonized (fd 1/2 closed); a service inheriting
+         * closed stdout/stderr panics on its first write — a Rust
+         * println!/eprintln! aborts with exit 101 on EBADF. Route
+         * stdout+stderr to a per-service log (/dev/null fallback);
+         * this also rescues the child's own diagnostics below. */
+        ffi::redirect_child_stdio(&format!("/var/log/atrium/{}.log", req.name));
+
         for (src, dst, kind) in &resolved_mounts {
             /* nullfs / tmpfs need the destination dir to exist —
              * otherwise mount(2) returns ENOENT. We create it

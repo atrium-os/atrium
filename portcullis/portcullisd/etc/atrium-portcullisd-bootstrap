@@ -41,8 +41,9 @@ load_rc_config "$name"
 : ${atrium_portcullisd_bootstrap_log_level:="info"}
 
 command="/usr/local/bin/atrium-portcullisd-bootstrap"
+# --volumes-socket is appended in start_cmd: storage is optional,
+# so the value is resolved at start time (see autodetect below).
 command_args="--socket ${atrium_portcullisd_bootstrap_jaild_socket} \
-              --volumes-socket ${atrium_portcullisd_bootstrap_volumes_socket} \
               --services-dir ${atrium_portcullisd_bootstrap_services_dir}"
 pidfile="/var/run/atrium/portcullisd-bootstrap.pid"
 
@@ -62,16 +63,31 @@ atrium_portcullisd_bootstrap_start() {
     if [ ! -S "${atrium_portcullisd_bootstrap_jaild_socket}" ]; then
         err 1 "jaild socket missing; is atrium_jaild running?"
     fi
-    if [ ! -S "${atrium_portcullisd_bootstrap_volumes_socket}" ]; then
-        err 1 "atrium-volumes socket missing; is atrium_volumes running?"
-    fi
+
+    # Storage (atrium-volumes) is OPTIONAL. The memory governors and
+    # session apps don't need it; only services that declare volumes
+    # do. If the socket is configured empty/NO/none, or the configured
+    # path doesn't exist, run without storage (pass an empty
+    # --volumes-socket, which the bootstrap binary treats as "no
+    # volume backend"). Only services that actually request a volume
+    # will then fail — by design.
+    _vol="${atrium_portcullisd_bootstrap_volumes_socket}"
+    case "${_vol}" in
+        ""|NO|no|none|NONE)
+            _vol="" ;;
+        *)
+            if [ ! -S "${_vol}" ]; then
+                warn "atrium-volumes socket ${_vol} missing; starting without storage"
+                _vol=""
+            fi ;;
+    esac
 
     echo "Starting ${name}."
     /usr/sbin/daemon -f -p "${pidfile}" \
         -o "${atrium_portcullisd_bootstrap_logfile}" \
         -t "${name}" \
         env RUST_LOG="${atrium_portcullisd_bootstrap_log_level}" \
-        "${command}" ${command_args}
+        "${command}" ${command_args} --volumes-socket "${_vol}"
 }
 
 atrium_portcullisd_bootstrap_stop() {
