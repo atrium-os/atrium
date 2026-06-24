@@ -659,6 +659,31 @@ fn handle_create(
     };
     let ip4_addr_no_cidr = lo0_alias.as_ref().map(|a| ffi::strip_cidr_suffix(a));
 
+    /* Per-jail DEVICE isolation (§9.1 KNOWN GAP). Mount a fresh devfs at the
+     * jail's own <root>/dev with the ruleset, so the jail sees only the granted
+     * nodes instead of the full host /dev. FreeBSD shares the mount namespace,
+     * so the parent mounting <root>/dev is visible to the jail (rooted at
+     * <root>); do it before jail creation/exec so /dev is ready. ONLY for jails
+     * with a REAL root — with path="/" the jail's /dev IS the host's, and
+     * mounting devfs there would clobber it, so those stay on the host devfs
+     * (the documented bring-up exposure) until the per-jail-root migration. */
+    if req.path != "/" && req.devfs_ruleset != 0 {
+        let devdir = format!("{}/dev", req.path.trim_end_matches('/'));
+        let _ = std::fs::create_dir_all(&devdir);
+        if let Err(e) = ffi::devfs_mount(&devdir, req.devfs_ruleset) {
+            if let Some(addr) = &lo0_alias {
+                let _ = ffi::ifconfig_lo0_alias_del(addr);
+            }
+            return Err(JaildError::Syscall {
+                name:  "devfs_mount",
+                errno: e.raw_os_error().unwrap_or(-1),
+                msg:   format!("{e}"),
+            });
+        }
+        info!("jaild: mounted per-jail devfs at {devdir} ruleset {}",
+            req.devfs_ruleset);
+    }
+
     if let Some(exec) = &req.exec {
         return handle_create_with_exec(
             req, exec, lo0_alias, ip4_addr_no_cidr, state, state_path,
