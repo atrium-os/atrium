@@ -194,11 +194,54 @@ struct Pending {
     since: Instant,
 }
 
+/// One per-jail entry in a PRESSURE_GET snapshot. Layout MUST match
+/// `struct pressure_jail_stat` in <sys/pressure.h> (averages in basis points).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PressureJailStat {
+    jid: i32,
+    full_avg10: u32,
+    full_avg60: u32,
+    full_avg300: u32,
+    some_ns: u64,
+    full_ns: u64,
+}
+
+const PRESSURE_MAX_JAILS: usize = 16;
+
+/// The complete pressure state, read in one PRESSURE_GET ioctl on /dev/pressure —
+/// the jailed-governor read path (sysctls aren't reachable from inside a jail).
+/// Layout MUST match `struct pressure_snapshot` in <sys/pressure.h>.
+#[repr(C)]
+struct PressureSnapshot {
+    some_ns: u64,
+    full_ns: u64,
+    some_avg10: u32,
+    some_avg60: u32,
+    some_avg300: u32,
+    full_avg10: u32,
+    full_avg60: u32,
+    full_avg300: u32,
+    nstalled: i32,
+    njails: u32,
+    jails: [PressureJailStat; PRESSURE_MAX_JAILS],
+}
+
+/// `_IOR('P', 1, struct pressure_snapshot)`, computed from the FreeBSD ioctl
+/// encoding so it tracks the struct size automatically.
+const fn pressure_get_ioctl() -> libc::c_ulong {
+    const IOC_OUT: libc::c_ulong = 0x4000_0000;
+    const IOCPARM_MASK: libc::c_ulong = 0x1fff;
+    let size = std::mem::size_of::<PressureSnapshot>() as libc::c_ulong;
+    IOC_OUT | ((size & IOCPARM_MASK) << 16) | ((b'P' as libc::c_ulong) << 8) | 1
+}
+
 /// kqueue edge-trigger on `/dev/pressure` (the kernel's PSI poll/trigger,
 /// kern_pressure.c): register an EVFILT_READ knote whose `data` carries the `full`
 /// threshold in basis points (fraction ×10000 — 40% = 4000). The kernel KNOTEs it
 /// each aggregation tick, so we sleep in `kevent` with ZERO wakeups until pressure
 /// crosses the threshold — no 1 Hz poll while idle ([[feedback_kqueue_native]]).
+/// The same fd serves PRESSURE_GET (the full snapshot) — one granted device.
 struct PressureKq {
     kq: i32,
     fd: i32,
@@ -241,6 +284,17 @@ impl PressureKq {
         });
         let tsp = ts.as_ref().map_or(std::ptr::null(), |t| t as *const _);
         unsafe { libc::kevent(self.kq, std::ptr::null(), 0, &mut ev, 1, tsp) };
+    }
+
+    /// Read the full pressure snapshot via PRESSURE_GET. This is the jailed read
+    /// path: everything (global + per-jail) from this one granted device, no host
+    /// sysctl. `None` if the ioctl fails (caller falls back to sysctls).
+    fn snapshot(&self) -> Option<PressureSnapshot> {
+        let mut s: PressureSnapshot = unsafe { std::mem::zeroed() };
+        let r = unsafe {
+            libc::ioctl(self.fd, pressure_get_ioctl(), &mut s as *mut PressureSnapshot)
+        };
+        if r < 0 { None } else { Some(s) }
     }
 }
 
@@ -291,15 +345,29 @@ fn main() {
     let mut pending: Option<Pending> = None;
     let mut prev_jail_full: std::collections::HashMap<i32, u64> = std::collections::HashMap::new();
     loop {
-        let avg10 = avg10_pct();
-        let full = full_avg10_pct();
-        let free = free_mib();
-        let nstalled = sysctl_i32("kern.pressure.memory.nstalled").unwrap_or(0);
+        // Primary read path: one PRESSURE_GET ioctl on /dev/pressure delivers the
+        // whole state (global + per-jail) — the jailed governor never touches a host
+        // sysctl. Fall back to the sysctls when the device snapshot is unavailable
+        // (older kernel, or /dev/pressure not in the ruleset).
+        let snap = pkq.as_ref().and_then(|kq| kq.snapshot());
+        let avg10 = snap.as_ref().map_or_else(avg10_pct, |s| s.some_avg10 as f64 / 100.0);
+        let full = match &snap {
+            Some(s) => Some(s.full_avg10 as f64 / 100.0),
+            None => full_avg10_pct(),
+        };
+        let free = free_mib(); // not pressure data — always a vm stat
+        let nstalled = snap.as_ref().map_or_else(
+            || sysctl_i32("kern.pressure.memory.nstalled").unwrap_or(0),
+            |s| s.nstalled);
         let members = read_members(&registry);
         // The culprit jail = the one whose per-jail `full` climbed most since the
         // last tick (locally stalled, not merely RAM-hungry). Used only to bias the
         // within-tier tie-break — tier still dominates. None if no jail is thrashing.
-        let cur_jail_full = jail_full_ns();
+        let cur_jail_full = match &snap {
+            Some(s) => s.jails[..s.njails as usize].iter()
+                .map(|j| (j.jid, j.full_ns)).collect(),
+            None => jail_full_ns(),
+        };
         let culprit: Option<i32> = cur_jail_full.iter()
             .map(|(&jid, &f)| (jid, f.saturating_sub(*prev_jail_full.get(&jid).unwrap_or(&0))))
             .filter(|&(_, delta)| delta > 0)
