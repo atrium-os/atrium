@@ -47,6 +47,50 @@ fn jail_rss_mib(name: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// A jail's numeric id, via `jls -j <name> jid`. None if the jail isn't running.
+fn jail_jid(name: &str) -> Option<i32> {
+    Command::new("jls").args(["-j", name, "jid"]).output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Per-jail PSI `full` stall (ns) keyed by jid, from `kern.pressure.memory.jails`
+/// (kern_pressure.c). A rising `full` means the jail is locally thrashing — its
+/// pages keep getting reclaimed, so its true demand exceeds its measured RSS. memfed
+/// uses the delta as a HIDDEN-DEMAND correction: boost a thrashing jail's demand so
+/// the weighted water-fill gives it more budget *if its weight earns it* (a low-
+/// weight thrasher still loses the competition and stays contained).
+fn jail_full_ns() -> std::collections::HashMap<i32, u64> {
+    let mut m = std::collections::HashMap::new();
+    let name = std::ffi::CString::new("kern.pressure.memory.jails").unwrap();
+    let mut len: libc::size_t = 0;
+    unsafe {
+        if libc::sysctlbyname(name.as_ptr(), std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0) != 0 || len == 0 {
+            return m;
+        }
+        let mut buf = vec![0u8; len];
+        if libc::sysctlbyname(name.as_ptr(), buf.as_mut_ptr() as *mut std::os::raw::c_void, &mut len, std::ptr::null_mut(), 0) != 0 {
+            return m;
+        }
+        buf.truncate(len.saturating_sub(1));
+        if let Ok(s) = String::from_utf8(buf) {
+            for line in s.lines() {
+                // "jail <jid> some_ns=<n> full_ns=<n>"
+                let f: Vec<&str> = line.split_whitespace().collect();
+                if f.len() >= 4 && f[0] == "jail" {
+                    if let (Ok(jid), Some(full)) = (
+                        f[1].parse::<i32>(),
+                        f[3].strip_prefix("full_ns=").and_then(|v| v.parse().ok()),
+                    ) {
+                        m.insert(jid, full);
+                    }
+                }
+            }
+        }
+    }
+    m
+}
+
 #[derive(Clone)]
 struct Jail {
     name: String,
@@ -101,12 +145,27 @@ fn water_fill(budget: u64, demands: &[u64], floors: &[u64], weights: &[f64]) -> 
     (0..n).map(|i| floors[i] + grant[i] as u64).collect()
 }
 
-/// One federation tick: read each jail's RSS (its demand = RSS + headroom),
-/// demand-aware water-fill the budget, and (if armed) set the per-jail RCTL caps.
-fn rebudget(jails: &[Jail], budget: u64, headroom: u64, armed: bool) {
+/// One federation tick: read each jail's RSS and per-jail `full`, demand-aware
+/// water-fill the budget (a thrashing jail's demand is boosted), and (if armed) set
+/// the per-jail RCTL caps. Returns the per-jail `full` snapshot to use as the next
+/// tick's baseline for the thrash delta.
+fn rebudget(jails: &[Jail], budget: u64, headroom: u64, thrash_boost: u64,
+            prev_full: &std::collections::HashMap<i32, u64>, armed: bool)
+    -> std::collections::HashMap<i32, u64>
+{
     let rss: Vec<u64> = jails.iter().map(|j| jail_rss_mib(&j.name)).collect();
-    // Demand = what the jail uses now + room to grow before the next tick.
-    let demands: Vec<u64> = jails.iter().zip(&rss).map(|(j, &r)| r.max(j.floor) + headroom).collect();
+    let cur_full = jail_full_ns();
+    // A jail is thrashing iff its per-jail `full` climbed since the last tick.
+    let thrashing: Vec<bool> = jails.iter().map(|j| jail_jid(&j.name).is_some_and(|jid| {
+        cur_full.get(&jid).copied().unwrap_or(0) > prev_full.get(&jid).copied().unwrap_or(0)
+    })).collect();
+    // Demand = RSS (or floor) + headroom, PLUS a thrash boost = the hidden demand a
+    // stalling jail can't show in RSS (its pages keep getting reclaimed). The
+    // water-fill grants the boost only if the jail's weight wins it — high-weight
+    // thrashers grow and stop stalling; low-weight thrashers stay contained.
+    let demands: Vec<u64> = jails.iter().zip(&rss).zip(&thrashing)
+        .map(|((j, &r), &t)| r.max(j.floor) + headroom + if t { thrash_boost } else { 0 })
+        .collect();
     let floors: Vec<u64> = jails.iter().map(|j| j.floor).collect();
     let weights: Vec<f64> = jails.iter().map(|j| j.weight).collect();
     let grants = water_fill(budget, &demands, &floors, &weights);
@@ -115,8 +174,9 @@ fn rebudget(jails: &[Jail], budget: u64, headroom: u64, armed: bool) {
         // Never below current RSS — RCTL sigkill would kill it; freeze, don't kill.
         let cap = grants[i].max(rss[i]);
         let note = if cap > grants[i] { " (over budget → frozen at RSS)" } else { "" };
-        eprintln!("  jail {:<10} w={:<4} rss={}MB demand={}MB -> grant {}MB cap={}MB{}",
-            j.name, j.weight, rss[i], demands[i], grants[i], cap, note);
+        let tnote = if thrashing[i] { " [THRASH +boost]" } else { "" };
+        eprintln!("  jail {:<10} w={:<4} rss={}MB demand={}MB{} -> grant {}MB cap={}MB{}",
+            j.name, j.weight, rss[i], demands[i], tnote, grants[i], cap, note);
         if armed {
             let _ = Command::new("rctl")
                 .args(["-a", &format!("jail:{}:memoryuse:sigkill={}M", j.name, cap)])
@@ -126,6 +186,7 @@ fn rebudget(jails: &[Jail], budget: u64, headroom: u64, armed: bool) {
     let total: u64 = grants.iter().sum();
     eprintln!("  Σ grants = {}MB / {}MB budget{}", total, budget,
         if total <= budget { "" } else { " (floors exceed budget!)" });
+    cur_full
 }
 
 fn main() {
@@ -134,6 +195,9 @@ fn main() {
     let budget_arg = arg("--budget", "0").parse::<u64>().unwrap_or(0);
     let budget = if budget_arg > 0 { budget_arg } else { physmem_mib() * pct / 100 };
     let headroom = arg("--headroom", "512").parse::<u64>().unwrap_or(512); // MiB room to grow/tick
+    // Extra demand granted to a jail that is locally thrashing (per-jail PSI `full`
+    // climbing) — its hidden demand above RSS. Granted by weight via the water-fill.
+    let thrash_boost = arg("--thrash-boost", "1024").parse::<u64>().unwrap_or(1024);
     // --interval N → run as a daemon re-budgeting every N s (tracks demand + churn);
     // default = one shot.
     let interval = arg("--interval", "0").parse::<u64>().unwrap_or(0);
@@ -152,12 +216,13 @@ fn main() {
         std::process::exit(1);
     }
 
-    eprintln!("memfed: {} | budget {}MB, headroom {}MB/tick over {} jails | {}",
-        if armed { "ARMED" } else { "plan-only" }, budget, headroom, jails.len(),
+    eprintln!("memfed: {} | budget {}MB, headroom {}MB/tick, thrash-boost {}MB over {} jails | {}",
+        if armed { "ARMED" } else { "plan-only" }, budget, headroom, thrash_boost, jails.len(),
         if interval > 0 { format!("daemon, re-budget every {}s", interval) } else { "one-shot".into() });
 
+    let mut prev_full = std::collections::HashMap::new();
     loop {
-        rebudget(&jails, budget, headroom, armed);
+        prev_full = rebudget(&jails, budget, headroom, thrash_boost, &prev_full, armed);
         if interval == 0 {
             break;
         }
@@ -196,5 +261,38 @@ mod tests {
         let g = water_fill(4096, &[99999, 99999], &[256, 128], &[1000.0, 0.01]);
         assert!(g[1] >= 128, "low-weight jail keeps its floor");
         assert!(g.iter().sum::<u64>() <= 4096);
+    }
+
+    // The thrash boost is applied to a thrashing jail's DEMAND, then the same
+    // water-fill allocates by weight. These pin the two ends of that behaviour.
+
+    #[test]
+    fn thrash_boost_grows_high_weight_jail_when_budget_allows() {
+        // web (w3) thrashing → demand boosted 1000→2024; ample budget. The boost
+        // flows straight through: the high-weight jail grows to relieve its stall.
+        let floors = [256u64, 128];
+        let weights = [3.0, 1.0];
+        let idle = water_fill(4096, &[1000, 200], &floors, &weights);
+        let boosted = water_fill(4096, &[2024, 200], &floors, &weights);
+        assert_eq!(idle[0], 1000);
+        assert_eq!(boosted[0], 2024, "high-weight thrasher gets the full boost");
+        assert!(boosted[0] > idle[0]);
+        assert!(boosted.iter().sum::<u64>() <= 4096);
+    }
+
+    #[test]
+    fn thrash_boost_is_contained_for_a_low_weight_jail() {
+        // cache (w1) thrashing → demand boosted 200→1224, under a TIGHT budget with a
+        // high-weight idle web (w3). cache gets *some* relief but nowhere near its
+        // boosted demand — its weight loses the competition, so it stays contained
+        // and cannot starve web.
+        let floors = [256u64, 128];
+        let weights = [3.0, 1.0]; // web heavy, cache light
+        let unboosted = water_fill(1024, &[600, 200], &floors, &weights);
+        let boosted = water_fill(1024, &[600, 1224], &floors, &weights);
+        assert_eq!(boosted[0], 600, "the high-weight idle jail is unaffected");
+        assert!(boosted[1] > unboosted[1], "the low-weight thrasher gets some relief");
+        assert!(boosted[1] < 1224, "but is contained well below its boosted demand");
+        assert!(boosted.iter().sum::<u64>() <= 1024);
     }
 }
