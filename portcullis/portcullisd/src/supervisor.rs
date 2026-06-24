@@ -408,9 +408,10 @@ impl Supervisor {
             /* Unmount this service's create-time mounts (the
              * runtime AttachMount-applied ones are jaild-side
              * and get cleaned by RemoveJail below). */
+            let jail_path = self.services[idx].create_req.path.clone();
             let mounts = self.services[idx].create_req.mounts.clone();
             for m in &mounts {
-                if let Err(e) = host_mount::unmount(&m.dest) {
+                if let Err(e) = host_mount::unmount_jail_dest(&jail_path, &m.dest) {
                     warn!("{}: shutdown unmount {:?} {}: {e}", name, m.kind, m.dest);
                 }
             }
@@ -477,7 +478,7 @@ impl Supervisor {
          * EDEADLK. */
         let svc = &self.services[idx];
         for m in &svc.create_req.mounts {
-            if let Err(e) = host_mount::unmount(&m.dest) {
+            if let Err(e) = host_mount::unmount_jail_dest(&svc.create_req.path, &m.dest) {
                 warn!("{}: post-exit unmount {:?} {}: {e}",
                     svc.manifest.name, m.kind, m.dest);
             }

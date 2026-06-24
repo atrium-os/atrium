@@ -49,3 +49,56 @@ pub fn unmount(target: &str) -> io::Result<()> {
 pub fn unmount(_target: &str) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "FreeBSD only"))
 }
+
+/// Unmount a jail mount given the jail root and the mount's `dest`
+/// field as it appears in the CreateJailRequest. The `dest` is what
+/// the manifest wrote — usually RELATIVE ("libexec"), occasionally
+/// absolute. jaild's child resolves it against the jail path before
+/// mounting (server.rs `resolved_mounts`: absolute if it starts with
+/// '/', else `jail_path.join(dest)`), so the live mountpoint is at
+/// `<jail_path>/<dest>`, NOT `<dest>`. Callers MUST unmount that
+/// resolved path: `unmount("libexec")` is a relative path that
+/// `libc::unmount` rejects with EINVAL, which we treat as "already
+/// gone" — so the REAL mount leaks and the next launch nullfs-mounts
+/// on top of it → EDEADLK ("Resource deadlock avoided") → the service
+/// crash-loops to a permanent fail. This helper is the single place
+/// that resolution lives; it MUST match jaild's `resolved_mounts`.
+pub fn unmount_jail_dest(jail_path: &str, dest: &str) -> io::Result<()> {
+    unmount(&resolve_jail_dest(jail_path, dest))
+}
+
+/// The resolution shared with jaild's `resolved_mounts`. Split out so
+/// it can be unit-tested without a live mount.
+fn resolve_jail_dest(jail_path: &str, dest: &str) -> String {
+    let target = if dest.starts_with('/') {
+        std::path::PathBuf::from(dest)
+    } else {
+        std::path::Path::new(jail_path).join(dest)
+    };
+    target.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_jail_dest;
+
+    #[test]
+    fn relative_dest_resolves_under_the_jail_root() {
+        // The bug: unmounting the raw relative "libexec" no-ops (EINVAL),
+        // leaking the real mount at <root>/libexec → next launch EDEADLKs.
+        assert_eq!(
+            resolve_jail_dest("/var/lib/atrium/jails/memoryd", "libexec"),
+            "/var/lib/atrium/jails/memoryd/libexec"
+        );
+        assert_eq!(
+            resolve_jail_dest("/var/lib/atrium/jails/memoryd", "usr/local/bin"),
+            "/var/lib/atrium/jails/memoryd/usr/local/bin"
+        );
+    }
+
+    #[test]
+    fn absolute_dest_is_used_verbatim() {
+        // Matches jaild: a dest beginning with '/' is NOT re-rooted.
+        assert_eq!(resolve_jail_dest("/var/lib/atrium/jails/x", "/dev"), "/dev");
+    }
+}

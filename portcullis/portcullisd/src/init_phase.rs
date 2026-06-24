@@ -164,7 +164,7 @@ pub fn run_init(
      * survive the jailed process's exit and would EDEADLK any
      * subsequent identical mount. Errors are logged, not fatal. */
     for (dest, kind) in &mount_dests {
-        if let Err(e) = crate::host_mount::unmount(dest) {
+        if let Err(e) = crate::host_mount::unmount_jail_dest(path, dest) {
             warn!("{}: post-init unmount {kind:?} {dest}: {e}",
                 service_name);
         }

@@ -182,7 +182,7 @@ fn main() -> ExitCode {
      * persist=0 jail dies. We also remember the jail's mount
      * destinations + name so we can RemoveJail and unmount the
      * leaked host-namespace mounts before exiting. */
-    struct HeldJail { fd: i32, name: String, mount_dests: Vec<(String, MountKind)> }
+    struct HeldJail { fd: i32, name: String, jail_path: String, mount_dests: Vec<(String, MountKind)> }
     let mut held: Vec<HeldJail> = Vec::new();
     let mut launch_failures = 0;
 
@@ -279,6 +279,7 @@ fn main() -> ExitCode {
             .map(|x| (x.dest.clone(), x.kind))
             .collect();
         let jail_name_for_held = saved_req.name.clone();
+        let jail_path_for_held = saved_req.path.clone();
 
         let req = Request::CreateJail(create_req);
         let send_result = match &mut driver {
@@ -297,7 +298,7 @@ fn main() -> ExitCode {
                         }
                     }
                     (Some(fd), Driver::Once(_)) => held.push(HeldJail {
-                        fd, name: jail_name_for_held, mount_dests,
+                        fd, name: jail_name_for_held, jail_path: jail_path_for_held, mount_dests,
                     }),
                     (None, _) => { /* persistent jail, no fd */ }
                 }
@@ -366,7 +367,7 @@ fn main() -> ExitCode {
                     warn!("RemoveJail({}) on cleanup: {e}", h.name);
                 }
                 for (dest, kind) in &h.mount_dests {
-                    if let Err(e) = host_mount::unmount(dest) {
+                    if let Err(e) = host_mount::unmount_jail_dest(&h.jail_path, dest) {
                         warn!("cleanup unmount {kind:?} {dest}: {e}");
                     }
                 }
