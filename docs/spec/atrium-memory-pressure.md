@@ -418,8 +418,17 @@ the two ideas unify.
      not an innocent. Verified: two equal-tier-0 members (host vs jailed), a hog
      driving the jail → `culprit=jail 2`, memoryd shed the jail's member and spared
      the host's. Falls back to largest-RSS when no member maps to the culprit.
-   - Remaining: the proactive dual — `memfed` consuming per-jail `full` to tighten a
-     thrashing jail's RCTL cap (close the loop on the budgeter side too).
+   - **The proactive dual — `memfed` consumes per-jail `full` — DONE + verified
+     in-VM (#181).** A jail whose RSS is suppressed by reclaim (it keeps thrashing)
+     has a *true* demand above its measured RSS, so `memfed` reads
+     `kern.pressure.memory.jails`, tracks each jail's `full_ns` delta, and boosts a
+     thrashing jail's demand by `--thrash-boost` (default 1024 MB). The same weighted
+     water-fill grants it only if the jail's weight earns it — a high-weight thrasher
+     grows and stops stalling; a low-weight thrasher is contained (unit tests pin
+     both ends). Verified live: a hog thrashing jail `web` flagged it `[THRASH
+     +boost]`, demand jumped +1024 MB, and `web` claimed 7552/8192 MB of the budget
+     by weight while idle `cache` held 640 MB. So per-jail `full` now drives **both**
+     the reactive (memoryd) and proactive (memfed) layers.
 
 ## 10. Non-goals / deferred
 
