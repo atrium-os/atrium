@@ -318,7 +318,19 @@ the two ideas unify.
      `kern.pressure.memory.jails` as `jail <jid> some_ns=<ns>`. Verified: a hog run
      via `jexec` in jail 2 attributed ~31.8 s to "jail 2" while the host (jid 0) did
      not appear. Limits (noted): bounded to 16; slots not reclaimed on jail destroy
-     (a production version sweeps). Remaining: per-jail `full`.
+     (a production version sweeps).
+   - **1c — per-jail `full`: DONE + verified in-VM (#181).** A jail is fully stalled
+     when it has a thread blocked on memory AND none of *its own* threads ran this
+     sample — so a jail can be locally thrashing while the system overall progresses
+     via a different jail (global `full` ⊆ every jail's `full`). Folded into the
+     `pressure_sample_cpus()` walk: each running user thread marks its jail
+     productive; a stalled jail with no productive thread of its own integrates the
+     sample period into its `full_ns`. `full` is a subset of `some` but is sampled
+     (vs `some` measured at the stall transitions), so it is clamped `≤ some` at the
+     sysctl. Verified: a 12 GB hog in jail `ptest` accrued ~5.9 s `some` and `full`
+     (equal — fully stalled whenever stalled), while the host running a busy loop
+     showed `some=0.67 s` but `full=0` (degraded but never stalled). Textbook
+     `some`-vs-`full`, per member.
    - **1c — kqueue edge-trigger: DONE + verified in-VM (#179).** The BSD-native
      realization of PSI's poll/trigger (Linux: `poll()` on `/proc/pressure/memory`
      with a written threshold). A `/dev/pressure` cdev with a `d_kqfilter` lets a
