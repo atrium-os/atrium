@@ -34,6 +34,20 @@ pub const SOCKET_PATH: &str = "/atrium/sockets/portcullis.sock";
 /// get `Response::ProtoMismatch` and the daemon closes the connection.
 pub const PROTO_VERSION: u32 = 1;
 
+/// The bounded reclaim signal a memory governor may request — mirrors jaild's
+/// `ReapSignal` but keeps this app-protocol crate free of a jaild dependency
+/// (portcullisd maps one to the other). No raw signal numbers cross the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovSignal {
+    /// SIGINFO — shed caches, keep running.
+    Trim,
+    /// SIGTERM — exit gracefully.
+    Exit,
+    /// SIGKILL — force.
+    Kill,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -76,6 +90,25 @@ pub enum Request {
     Launch {
         app_id:        String,
         bypass_policy: bool,
+    },
+
+    /// A memory governor (atrium-memoryd) asks portcullisd to signal a
+    /// jaild-created jail's processes — the reclaim cascade. portcullisd checks
+    /// the caller is a `memory_govern` service (its services.d manifest's
+    /// exec.uid == the peer uid) and forwards to jaild as `Reap`; jaild applies
+    /// its own jaild-created-only + `[resource_control]` gates. See
+    /// `atrium-memory-pressure.md` §9.5.
+    GovernReap {
+        jail_name: String,
+        signal:    GovSignal,
+    },
+
+    /// A memory governor (atrium-memfed) asks portcullisd to set a
+    /// jaild-created jail's RCTL `memoryuse` cap (forwarded to jaild as
+    /// `SetRctl`). Same `memory_govern` capability gate.
+    GovernSetRctl {
+        jail_name:    String,
+        memoryuse_mb: u64,
     },
 }
 
@@ -189,6 +222,37 @@ mod tests {
         let back: Request = serde_json::from_str(&s).unwrap();
         match back {
             Request::Authorize { app_id, .. } => assert_eq!(app_id, "org.atrium.edit"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// Lock the governor-broker wire format (portcullisd + the daemons depend on
+    /// it): the `op` tags and the bounded GovSignal round-trip.
+    #[test]
+    fn roundtrip_govern_requests() {
+        let r = Request::GovernReap {
+            jail_name: "app-org-atrium-web".into(),
+            signal: GovSignal::Exit,
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("\"op\":\"govern_reap\""));
+        assert!(s.contains("\"signal\":\"exit\""));
+        match serde_json::from_str::<Request>(&s).unwrap() {
+            Request::GovernReap { jail_name, signal } => {
+                assert_eq!(jail_name, "app-org-atrium-web");
+                assert_eq!(signal, GovSignal::Exit);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let r = Request::GovernSetRctl {
+            jail_name: "app-org-atrium-web".into(),
+            memoryuse_mb: 2048,
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("\"op\":\"govern_set_rctl\""));
+        match serde_json::from_str::<Request>(&s).unwrap() {
+            Request::GovernSetRctl { memoryuse_mb, .. } => assert_eq!(memoryuse_mb, 2048),
             _ => panic!("wrong variant"),
         }
     }

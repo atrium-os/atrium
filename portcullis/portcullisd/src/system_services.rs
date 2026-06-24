@@ -134,12 +134,9 @@ pub struct Capabilities {
     /// cross-jail authority (kept off every user app).
     /// See `atrium-memory-pressure.md` §9.5.
     ///
-    /// Read by the stage-3b forwarding handler (the GovernReap/GovernSetRctl
-    /// path that maps a caller uid -> this manifest -> jaild Reap/SetRctl); the
-    /// allow keeps the extension point in tree without a dead-code warning until
-    /// that handler lands.
+    /// Consumed by `main.rs::handle_govern`, which maps a GovernReap/
+    /// GovernSetRctl caller's peer uid -> this manifest -> a jaild Reap/SetRctl.
     #[serde(default)]
-    #[allow(dead_code)]
     pub memory_govern: bool,
 }
 

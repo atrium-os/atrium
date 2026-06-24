@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use portcullis_ipc::{
-    read_request, write_response, Request, Response, PROTO_VERSION, SOCKET_PATH,
+    read_request, write_response, GovSignal, Request, Response, PROTO_VERSION, SOCKET_PATH,
 };
 use portcullis_policy::{compute_delta, hash_manifest, now_iso8601, Grant, Policy};
 
@@ -226,6 +226,15 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
                           &mut writer, &reader)?;
             continue;
         }
+        /* Memory-governor broker verbs are gated on the PEER UID (the caller must
+         * be a memory_govern service), not the per-tenant policy `handle` uses —
+         * so they're routed here, where serve() has the uid, rather than into
+         * handle(). */
+        if matches!(req, Request::GovernReap { .. } | Request::GovernSetRctl { .. }) {
+            let resp = handle_govern(uid, req);
+            write_response(&mut writer, &resp)?;
+            continue;
+        }
         let resp = handle(req, &user, &shared);
         write_response(&mut writer, &resp)?;
     }
@@ -338,6 +347,67 @@ fn handle_launch(
     write_response(writer, &resp)
 }
 
+/// Service-manifest dir + jaild socket for the governor broker path.
+const SERVICES_DIR: &str = "/etc/atrium/services.d";
+const JAILD_SOCK:   &str = "/var/run/atrium/jaild.sock";
+
+/// Broker a memory-governor request. The caller is a jailed governor running as a
+/// non-root system uid, so it cannot reach jaild's root-only socket — portcullisd
+/// forwards. INNER gate (here): the peer uid must own a services.d manifest that
+/// grants `memory_govern`. OUTER gate (jaild, on forward): the jail must be one
+/// jaild created and `[resource_control]` must allow. Both are required.
+fn handle_govern(uid: u32, req: Request) -> Response {
+    use portcullisd::jaild_client::Client;
+    use portcullisd::system_services;
+
+    // 1. inner capability gate: the peer uid must be a memory_govern service.
+    let authorized = match system_services::load_dir(std::path::Path::new(SERVICES_DIR)) {
+        Ok(outcome) => outcome.manifests.iter().any(|m| {
+            m.capabilities.memory_govern
+                && m.exec.as_ref().map_or(false, |e| e.uid == uid)
+        }),
+        Err(e) => return Response::Error { message: format!("services.d load: {e}") },
+    };
+    if !authorized {
+        return Response::Error {
+            message: format!(
+                "cap.memory_govern.denied: uid {uid} is not a memory_govern service"),
+        };
+    }
+
+    // 2. translate to the jaild request (the bounded GovSignal -> ReapSignal).
+    let jreq = match req {
+        Request::GovernReap { jail_name, signal } =>
+            jaild::protocol::Request::Reap(jaild::protocol::ReapRequest {
+                jail_name,
+                signal: match signal {
+                    GovSignal::Trim => jaild::protocol::ReapSignal::Trim,
+                    GovSignal::Exit => jaild::protocol::ReapSignal::Exit,
+                    GovSignal::Kill => jaild::protocol::ReapSignal::Kill,
+                },
+            }),
+        Request::GovernSetRctl { jail_name, memoryuse_mb } =>
+            jaild::protocol::Request::SetRctl(jaild::protocol::SetRctlRequest {
+                jail_name,
+                memoryuse_mb,
+            }),
+        _ => return Response::Error { message: "not a govern request".into() },
+    };
+
+    // 3. forward to jaild; translate the reply into the app protocol.
+    let mut client = match Client::connect(JAILD_SOCK) {
+        Ok(c) => c,
+        Err(e) => return Response::Error { message: format!("jaild connect: {e}") },
+    };
+    match client.send(&jreq) {
+        Ok((jaild::protocol::Response::Ok, _)) => Response::Ok,
+        Ok((jaild::protocol::Response::PolicyDenied { rule, detail }, _)) =>
+            Response::Error { message: format!("jaild denied [{rule}]: {detail}") },
+        Ok((other, _)) => Response::Error { message: format!("jaild: {other:?}") },
+        Err(e) => Response::Error { message: format!("jaild send: {e}") },
+    }
+}
+
 fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
     match req {
         Request::Hello { .. } => Response::Error {
@@ -412,6 +482,10 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::Launch { .. } => Response::Error {
             /* Caught by serve() before reaching here. */
             message: "internal: Launch must go through handle_launch".into(),
+        },
+        Request::GovernReap { .. } | Request::GovernSetRctl { .. } => Response::Error {
+            /* Caught by serve() before reaching here (routed to handle_govern). */
+            message: "internal: governor verbs must go through handle_govern".into(),
         },
     }
 }
