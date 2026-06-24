@@ -331,6 +331,13 @@ the two ideas unify.
      (equal — fully stalled whenever stalled), while the host running a busy loop
      showed `some=0.67 s` but `full=0` (degraded but never stalled). Textbook
      `some`-vs-`full`, per member.
+   - **Per-jail `full` decaying averages — DONE + verified in-VM (#182).** Each jail
+     slot carries `full_avg10/60/300` EWMAs, folded by the same 1 s callout as the
+     global ones (clamped `≤ some` before differencing), exposed in the jails sysctl
+     as basis points — a directly-consumable per-member rate (the Linux PSI
+     per-cgroup analog). Verified the fast/medium/slow signature per jail: a hog
+     drove `full_avg10` to ~54% while `avg60`/`avg300` lagged, and after it `avg10`
+     decayed fast while `avg60`/`avg300` held.
    - **1c — kqueue edge-trigger: DONE + verified in-VM (#179).** The BSD-native
      realization of PSI's poll/trigger (Linux: `poll()` on `/proc/pressure/memory`
      with a written threshold). A `/dev/pressure` cdev with a `d_kqfilter` lets a
