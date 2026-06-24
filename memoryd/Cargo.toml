@@ -12,3 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
+# The portcullisd app protocol — used in --broker mode to send GovernReap to
+# portcullisd (which forwards to jaild) instead of signalling pids directly, so a
+# *jailed* memoryd can reap across jail boundaries. atrium-memory-pressure.md §9.5.
+portcullis-ipc = { path = "../portcullis/portcullis-ipc" }

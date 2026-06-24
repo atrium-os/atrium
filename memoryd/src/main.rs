@@ -96,7 +96,8 @@ struct Member {
     pid: i32,
     tier: i32,
     name: String,
-    jid: Option<i32>, // the jail the member runs in (4th registry field), if known
+    jid: Option<i32>,       // the jail the member runs in (4th registry field)
+    jail: Option<String>,   // the jail's NAME (5th field) — the GovernReap target in --broker mode
 }
 
 /// Per-jail `full` stall (ns) from `kern.pressure.memory.jails`, keyed by jid. The
@@ -149,10 +150,12 @@ fn read_members(path: &str) -> Vec<Member> {
             if f.len() >= 2 {
                 if let (Ok(pid), Ok(tier)) = (f[0].parse(), f[1].parse()) {
                     if alive(pid) {
-                        // optional 4th field = the member's jail id (Portcullis
-                        // would supply it); absent for bare-process members.
+                        // optional 4th field = the member's jail id, 5th = the
+                        // jail NAME (Portcullis supplies both); absent for bare
+                        // host-process members (then --broker can't reap them).
                         let jid = f.get(3).and_then(|s| s.parse().ok());
-                        v.push(Member { pid, tier, name: f.get(2).unwrap_or(&"?").to_string(), jid });
+                        let jail = f.get(4).map(|s| s.to_string());
+                        v.push(Member { pid, tier, name: f.get(2).unwrap_or(&"?").to_string(), jid, jail });
                     }
                 }
             }
@@ -190,8 +193,41 @@ struct Pending {
     pid: i32,
     tier: i32,
     name: String,
+    jail: Option<String>,   // the victim's jail name, for --broker escalation
     stage: Stage,
     since: Instant,
+}
+
+/// Reap a jail through portcullisd (which capability-checks us, then forwards to
+/// jaild) — the jailed-governor act path. Connect, Hello, GovernReap. Returns 0 on
+/// Ok, nonzero on any failure (logged). atrium-memory-pressure.md §9.5.
+fn broker_reap(sock: &str, jail: &str, sig: portcullis_ipc::GovSignal) -> i32 {
+    use portcullis_ipc::{round_trip, Request, Response, PROTO_VERSION};
+    use std::os::unix::net::UnixStream;
+    let mut s = match UnixStream::connect(sock) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("broker connect {sock}: {e}"); return 1; }
+    };
+    match round_trip(&mut s, &Request::Hello { version: PROTO_VERSION }) {
+        Ok(Response::Hello { .. }) => {}
+        other => { eprintln!("broker handshake: {other:?}"); return 2; }
+    }
+    let req = Request::GovernReap { jail_name: jail.to_string(), signal: sig };
+    match round_trip(&mut s, &req) {
+        Ok(Response::Ok) => 0,
+        Ok(Response::Error { message }) => { eprintln!("broker reap rejected: {message}"); 3 }
+        Ok(other) => { eprintln!("broker reap unexpected: {other:?}"); 4 }
+        Err(e) => { eprintln!("broker reap io: {e}"); 5 }
+    }
+}
+
+/// Map a cascade signal number to the bounded GovSignal the broker accepts.
+fn gov_signal(sig: i32) -> portcullis_ipc::GovSignal {
+    match sig {
+        libc::SIGINFO => portcullis_ipc::GovSignal::Trim,
+        libc::SIGTERM => portcullis_ipc::GovSignal::Exit,
+        _ => portcullis_ipc::GovSignal::Kill,
+    }
 }
 
 /// One per-jail entry in a PRESSURE_GET snapshot. Layout MUST match
@@ -336,8 +372,24 @@ fn main() {
         registry
     );
 
-    let signal = |pid: i32, sig: i32| -> i32 {
-        if armed { unsafe { libc::kill(pid, sig) } } else { 0 }
+    // --broker <sock>: reap through portcullisd -> jaild (the jailed governor can't
+    // signal across jail PID namespaces, so it brokers). Default = direct kill (the
+    // v1 host-side bring-up). A victim without a jail name falls back to direct kill.
+    let broker: Option<String> = has("--broker")
+        .then(|| arg("--broker", "/atrium/sockets/portcullis.sock"));
+    eprintln!("memoryd: act = {}",
+        match &broker {
+            Some(s) => format!("broker via portcullisd {s} (jailed-governor path)"),
+            None => "direct kill(2) (v1 host-side)".into(),
+        });
+    let signal = |pid: i32, jail: Option<&str>, sig: i32| -> i32 {
+        if !armed {
+            return 0;
+        }
+        match (&broker, jail) {
+            (Some(sock), Some(j)) => broker_reap(sock, j, gov_signal(sig)),
+            _ => unsafe { libc::kill(pid, sig) },
+        }
     };
     let dry = |s: &str| if armed { format!(" {}", s) } else { format!(" [dry-run:{}]", s) };
 
@@ -408,13 +460,13 @@ fn main() {
                 } else if p.since.elapsed() >= grace {
                     match p.stage {
                         Stage::Trim => {
-                            let r = signal(p.pid, libc::SIGTERM);
+                            let r = signal(p.pid, p.jail.as_deref(), libc::SIGTERM);
                             eprintln!("ESCALATE pid={} tier={} name={} trim insufficient -> EXIT(SIGTERM){}",
                                 p.pid, p.tier, p.name, dry(&format!("rc={}", r)));
                             p.stage = Stage::Exit;
                         }
                         Stage::Exit => {
-                            let r = signal(p.pid, libc::SIGKILL);
+                            let r = signal(p.pid, p.jail.as_deref(), libc::SIGKILL);
                             eprintln!("ESCALATE pid={} tier={} name={} ignored SIGTERM -> KILL(SIGKILL){}",
                                 p.pid, p.tier, p.name, dry(&format!("rc={}", r)));
                             p.stage = Stage::Kill;
@@ -456,10 +508,10 @@ fn main() {
                         let oom = members.iter().max_by_key(|m| rss_kb(m.pid)).unwrap();
                         eprintln!("DECISION lmkd-tier vs largest-RSS-OOM: kernel OOM would kill {}(t{}, {}MB); memoryd sheds {}(t{}, {}MB) — sparing the foreground",
                             oom.name, oom.tier, mib(rss_kb(oom.pid)), v.name, v.tier, mib(rss_kb(v.pid)));
-                        let r = signal(v.pid, libc::SIGINFO);
+                        let r = signal(v.pid, v.jail.as_deref(), libc::SIGINFO);
                         eprintln!("REAP pid={} tier={} name={} -> TRIM(SIGINFO, shed-not-die){}",
                             v.pid, v.tier, v.name, dry(&format!("rc={}", r)));
-                        pending = Some(Pending { pid: v.pid, tier: v.tier, name: v.name.clone(), stage: Stage::Trim, since: Instant::now() });
+                        pending = Some(Pending { pid: v.pid, tier: v.tier, name: v.name.clone(), jail: v.jail.clone(), stage: Stage::Trim, since: Instant::now() });
                         thrash_run = 0;
                     } else {
                         eprintln!("thrash but no registered members to shed");
