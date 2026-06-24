@@ -47,6 +47,23 @@ fn sysctl_i32(name: &str) -> Option<i32> {
     }
 }
 
+/// Read a string sysctl (two-call: size, then fill).
+fn sysctl_string(name: &str) -> Result<String, ()> {
+    let c = CString::new(name).map_err(|_| ())?;
+    let mut len: libc::size_t = 0;
+    unsafe {
+        if libc::sysctlbyname(c.as_ptr(), std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0) != 0 || len == 0 {
+            return Err(());
+        }
+        let mut buf = vec![0u8; len];
+        if libc::sysctlbyname(c.as_ptr(), buf.as_mut_ptr() as *mut c_void, &mut len, std::ptr::null_mut(), 0) != 0 {
+            return Err(());
+        }
+        buf.truncate(len.saturating_sub(1)); // drop the trailing NUL
+        String::from_utf8(buf).map_err(|_| ())
+    }
+}
+
 fn free_mib() -> u64 {
     let pages = sysctl_i32("vm.stats.vm.v_free_count").unwrap_or(0) as u32 as u64;
     let pgsz = sysctl_i32("hw.pagesize").unwrap_or(4096) as u64;
@@ -79,6 +96,29 @@ struct Member {
     pid: i32,
     tier: i32,
     name: String,
+    jid: Option<i32>, // the jail the member runs in (4th registry field), if known
+}
+
+/// Per-jail `full` stall (ns) from `kern.pressure.memory.jails`, keyed by jid. The
+/// thrash CULPRIT is the jail whose `full_ns` is climbing fastest — the one that is
+/// locally stalled, not merely the one using the most RAM. Used to bias the
+/// within-tier tie-break toward the jail actually causing the pressure.
+fn jail_full_ns() -> std::collections::HashMap<i32, u64> {
+    let mut m = std::collections::HashMap::new();
+    if let Ok(s) = sysctl_string("kern.pressure.memory.jails") {
+        for line in s.lines() {
+            // "jail <jid> some_ns=<n> full_ns=<n>"
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() >= 4 && f[0] == "jail" {
+                if let Ok(jid) = f[1].parse::<i32>() {
+                    if let Some(full) = f[3].strip_prefix("full_ns=").and_then(|v| v.parse().ok()) {
+                        m.insert(jid, full);
+                    }
+                }
+            }
+        }
+    }
+    m
 }
 
 fn alive(pid: i32) -> bool {
@@ -109,7 +149,10 @@ fn read_members(path: &str) -> Vec<Member> {
             if f.len() >= 2 {
                 if let (Ok(pid), Ok(tier)) = (f[0].parse(), f[1].parse()) {
                     if alive(pid) {
-                        v.push(Member { pid, tier, name: f.get(2).unwrap_or(&"?").to_string() });
+                        // optional 4th field = the member's jail id (Portcullis
+                        // would supply it); absent for bare-process members.
+                        let jid = f.get(3).and_then(|s| s.parse().ok());
+                        v.push(Member { pid, tier, name: f.get(2).unwrap_or(&"?").to_string(), jid });
                     }
                 }
             }
@@ -246,12 +289,23 @@ fn main() {
 
     let mut thrash_run = 0u32;
     let mut pending: Option<Pending> = None;
+    let mut prev_jail_full: std::collections::HashMap<i32, u64> = std::collections::HashMap::new();
     loop {
         let avg10 = avg10_pct();
         let full = full_avg10_pct();
         let free = free_mib();
         let nstalled = sysctl_i32("kern.pressure.memory.nstalled").unwrap_or(0);
         let members = read_members(&registry);
+        // The culprit jail = the one whose per-jail `full` climbed most since the
+        // last tick (locally stalled, not merely RAM-hungry). Used only to bias the
+        // within-tier tie-break — tier still dominates. None if no jail is thrashing.
+        let cur_jail_full = jail_full_ns();
+        let culprit: Option<i32> = cur_jail_full.iter()
+            .map(|(&jid, &f)| (jid, f.saturating_sub(*prev_jail_full.get(&jid).unwrap_or(&0))))
+            .filter(|&(_, delta)| delta > 0)
+            .max_by_key(|&(_, delta)| delta)
+            .map(|(jid, _)| jid);
+        prev_jail_full = cur_jail_full;
         // Thrash gate = sustained-thrash confirmation AND still-stalled-right-now.
         // PSI `full` (when present) is the sustained signal — but it's a 10s decaying
         // average that LAGS, so on its own it keeps firing after pressure clears and
@@ -310,17 +364,27 @@ fn main() {
             None => {
                 if thrash { thrash_run += 1 } else { thrash_run = 0 }
                 let fulls = full.map(|f| format!("{:.1}%", f)).unwrap_or_else(|| "n/a".into());
-                eprintln!("full={} some={:.1}% free={}MB nstalled={} members={} posture={}(tol {}s) thrash_run={}{}",
-                    fulls, avg10, free, nstalled, members.len(), posture, tolerance, thrash_run, if thrash { " [THRASH]" } else { "" });
+                eprintln!("full={} some={:.1}% free={}MB nstalled={} members={} culprit={:?} posture={}(tol {}s) thrash_run={}{}",
+                    fulls, avg10, free, nstalled, members.len(), culprit, posture, tolerance, thrash_run, if thrash { " [THRASH]" } else { "" });
                 if thrash_run >= tolerance {
                     if !members.is_empty() {
-                        // Victim = lowest lifecycle tier; within that tier, the
-                        // largest RSS (frees the most, fastest — relief speed matters
-                        // under thrash). NOT the largest RSS overall (that's the
-                        // kernel's blunt vm_pageout_oom, which would hit the foreground).
+                        // Victim = lowest lifecycle tier (tier dominates — never shed
+                        // a higher-tier app to spare a lower one). Within that tier,
+                        // bias toward a member of the CULPRIT jail (the one actually
+                        // thrashing, per per-jail `full`) — shedding it addresses the
+                        // cause, not an innocent member of a healthy jail. Failing
+                        // that, the largest RSS (frees the most, fastest). NEVER the
+                        // largest RSS overall (the kernel's blunt vm_pageout_oom).
                         let min_tier = members.iter().map(|m| m.tier).min().unwrap();
-                        let v = members.iter().filter(|m| m.tier == min_tier)
+                        let culprit_in_tier = culprit.is_some()
+                            && members.iter().any(|m| m.tier == min_tier && m.jid == culprit);
+                        let v = members.iter()
+                            .filter(|m| m.tier == min_tier && (!culprit_in_tier || m.jid == culprit))
                             .max_by_key(|m| rss_kb(m.pid)).unwrap().clone();
+                        if culprit_in_tier {
+                            eprintln!("ATTRIBUTION culprit jail {} (highest per-jail full delta); biasing the tier-{} tie-break toward it",
+                                culprit.unwrap(), min_tier);
+                        }
                         let oom = members.iter().max_by_key(|m| rss_kb(m.pid)).unwrap();
                         eprintln!("DECISION lmkd-tier vs largest-RSS-OOM: kernel OOM would kill {}(t{}, {}MB); memoryd sheds {}(t{}, {}MB) — sparing the foreground",
                             oom.name, oom.tier, mib(rss_kb(oom.pid)), v.name, v.tier, mib(rss_kb(v.pid)));
