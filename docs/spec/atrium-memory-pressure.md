@@ -409,7 +409,17 @@ the two ideas unify.
      live (re-read each tick), so the one posture knob spans CPU + GPU + display +
      memory reclaim. Verified in-VM: flipping `power_policy` 5→0→10 moved memoryd's
      tolerance in step.
-   - Remaining: per-jail members once 1c lands; consume kernel `full` when it exists.
+   - **Jail-aware tie-break (per-jail `full` consumer) — DONE + verified in-VM (#181).**
+     memoryd reads `kern.pressure.memory.jails`, tracks each jail's `full_ns` delta,
+     and names the *culprit* jail (the one whose `full` climbs fastest — locally
+     stalled, not merely RAM-hungry). Members carry an optional jid. Tier still
+     dominates, but within the lowest tier the tie-break prefers a member of the
+     culprit jail over the largest-RSS member of a healthy jail — shedding the cause,
+     not an innocent. Verified: two equal-tier-0 members (host vs jailed), a hog
+     driving the jail → `culprit=jail 2`, memoryd shed the jail's member and spared
+     the host's. Falls back to largest-RSS when no member maps to the culprit.
+   - Remaining: the proactive dual — `memfed` consuming per-jail `full` to tighten a
+     thrashing jail's RCTL cap (close the loop on the budgeter side too).
 
 ## 10. Non-goals / deferred
 
