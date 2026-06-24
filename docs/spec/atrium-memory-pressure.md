@@ -463,19 +463,32 @@ jail set.
   namespaces (structurally needs host root); memfed sets rctl on jails. This is
   the bring-up shape — the same one frescod's rc script has today, and analogous
   to portcullisd's documented known-deviation root launch path.
-- **v2 (target).** The OpenSSH/qmail privsep (portcullis §0.5), split exactly as
-  ostiarius/portcullisd↔jaild already are:
-  - **POLICY = jailed userspace** (`_memoryd`/`_memfed`, rank 3, like frescod):
-    reads the global pressure telemetry as a *granted capability* (cross-jail
-    stall is TCB-sensitive — a side channel — so the reader is a blessed service,
-    same posture as frescod seeing all pixels), computes the decision. This is the
-    "userspace in jails" half.
-  - **MECHANISM = jaild** (rank 1, the sole privileged broker): grows
-    `set_rctl(jail, …)` and `reap(jail, app, sig)`, policy-gated so it can only
-    act on jails it created, never the TCB. This is the minimal "TCB outside."
-  - For clean jailing, fold the per-jail pressure *detail* into `/dev/pressure`
-    (read/ioctl) so the governor needs only that one device in its devfs ruleset
-    (like frescod's GPU node) — no host sysctl. **TODO.**
+- **v2 (BUILT + verified e2e, in-VM #183).** The OpenSSH/qmail privsep
+  (portcullis §0.5), split exactly as ostiarius/portcullisd↔jaild already are:
+  - **POLICY = jailed userspace** (`_memoryd`, rank 3, like frescod): reads the
+    pressure telemetry as a *granted capability*, computes the decision. **DONE:**
+    memoryd runs fully jailed — own minimal rootfs, restricted `/dev`, non-root
+    `_memoryd` uid, reading `/dev/pressure` via the `PRESSURE_GET` ioctl, reaping
+    via `--broker`. Launched by the v2 supervisor (`atrium-portcullisd-bootstrap`)
+    from `services.d`, NOT root rc.d. Reproducible artifacts: `memoryd/etc/
+    services.d/50-atrium-memoryd.toml` + `memoryd/etc/atrium-governor.devfs.rules`.
+  - **MECHANISM = jaild** (rank 1, the sole privileged broker): grew
+    `Reap(jail, ReapSignal)` and `SetRctl(jail, memoryuse_mb)`, double-gated
+    (jaild-created-only + `[resource_control]` policy). **DONE + verified:** a
+    cooperative victim in a jail was reaped through the whole chain (memoryd →
+    portcullisd capability check → jaild → kernel `fork`+`jail_attach`+`kill(-1)`).
+  - The per-jail pressure detail IS on `/dev/pressure` now (the `PRESSURE_GET`
+    ioctl), so the governor needs only that one device in its devfs ruleset. **DONE.**
+  - **Jail isolation FIX (the bonus).** Found that all jails shared the host fs +
+    `/dev` (path=`/`, no per-jail devfs — §9.1 KNOWN GAP). Fixed: jaild now mounts
+    a per-jail devfs at `<root>/dev` with the ruleset (real roots only), so the
+    governor sees only `/dev/pressure` + basics, not `kmem`/`mem`/`pci`.
+  - **Remaining (productionization):** boot-enable the v2 supervisor + serve daemon
+    (rc services); port `GovernReap` from the bring-up `portcullisd`/main.rs serve
+    into the production aqueduct daemon `atrium-portcullisd-daemon`; `memfed` v2
+    (needs a portcullisd `GovernedJails` query for per-jail RSS/weight); migrate the
+    *other* jails (vestibulum, user apps) off path=`/` to per-jail roots (D5 bundle
+    work — the project-wide completion of the isolation fix).
 
 **Registry & weights from the lifecycle owner.** The member registry (`pid tier
 name [jid]`) and weights/floors come from portcullisd's session table + the app
