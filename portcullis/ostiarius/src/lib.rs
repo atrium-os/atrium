@@ -62,6 +62,11 @@ pub trait Launcher {
 }
 
 const APPS_DIR: &str = "/usr/local/share/atrium/apps";
+/// Per-jail root directory for session apps (closes the §9.1 isolation gap — a
+/// real root instead of the old `path="/"`). The `JaildLauncher` populates it
+/// (nullfs lib/bundle/socket mounts) and jaild mounts a per-jail devfs. The
+/// policy allows `/var/lib/atrium/jails/*` (rw_pattern).
+const JAILS_DIR: &str = "/var/lib/atrium/jails";
 
 fn spec(app_id: &str, owner: &str, bin: &str, argv: &[&str], caps: Vec<&'static str>) -> LaunchSpec {
     let dir = format!("{APPS_DIR}/{app_id}");
@@ -70,12 +75,12 @@ fn spec(app_id: &str, owner: &str, bin: &str, argv: &[&str], caps: Vec<&'static 
         owner: owner.to_string(),
         manifest: format!("{dir}/atrium.toml").into(),
         sig: format!("{dir}/atrium.toml.sig").into(),
-        // V1 stand-in: jail at "/" (the app sees the host rootfs — libs + the
-        // capability-mounted service sockets). Per-jail rootfs trees (a real
-        // `{dir}/jail`) land in D5; jaild's policy only allows the host root for
-        // now (see portcullis.md "deferred V1"). Using a per-app dir here gets a
-        // `path.not_in_allowlist` refusal.
-        jail_path: "/".to_string(),
+        // A REAL per-jail root (not "/"), so the app sees only its rootfs + the
+        // ruleset-restricted /dev — the §9.1 isolation fix. The JaildLauncher
+        // builds the standard nullfs mounts (libs + the apps/<id> bundle + the
+        // service sockets) into it and asks jaild for the per-jail devfs. The
+        // non-jaild demo launchers ignore the path (they only log).
+        jail_path: format!("{JAILS_DIR}/{app_id}"),
         // A leading-"/" bin is an absolute system path (the CLI console shell);
         // otherwise it's the component's bundle binary, apps/<id>/bin/<name> —
         // which is what jaild's exec allow-list permits (the apps/ prefix).
@@ -348,6 +353,42 @@ pub mod control {
 /// verify the manifest (trusted publisher) → allocate a dedicated uid → register
 /// the binding → ask jaild to jail + drop-to-uid + exec. Only connects to jaild at
 /// runtime; constructing it is free.
+/// The standard rootfs nullfs mounts a session app's per-jail root needs: the
+/// dynamic linker + libs, the Atrium runtime/bundle tree (which holds the app's
+/// `apps/<id>/bin/<bin>`), and the service sockets (whole-dir for now; per-cap
+/// scoping is a refinement). All read-only; sources must be on the jaild policy's
+/// `mount_sources.ro_paths`; dests are relative to the jail root.
+///
+/// NOTE: this is a first-cut set proven sufficient for the governor's Rust
+/// binary. Each session app must be launch-tested on deploy — a missing mount is
+/// a failed exec (a broken login). `/bin`, `/usr/bin`, `/etc` may be needed by
+/// shells/subprocesses (the CLI console-shell); add per app as testing shows.
+fn session_rootfs_mounts() -> Vec<jaild::protocol::MountSpec> {
+    use jaild::protocol::{MountKind, MountSpec};
+    let ro = |src: &str, dst: &str| MountSpec {
+        source: src.to_string(), dest: dst.to_string(), kind: MountKind::RoNullfs,
+    };
+    vec![
+        ro("/libexec", "libexec"),                               // ld-elf.so.1
+        ro("/lib", "lib"),                                       // libc, libthr
+        ro("/usr/lib", "usr/lib"),
+        ro("/usr/local/lib", "usr/local/lib"),
+        ro("/usr/local/share/atrium", "usr/local/share/atrium"), // runtime + apps/<id> bundle
+        ro("/atrium/sockets", "atrium/sockets"),                 // service sockets
+    ]
+}
+
+/// Mountpoint dirs to create inside a jail root before jaild mounts onto them
+/// (jaild applies the nullfs + the per-jail devfs, but each dest dir must exist).
+const SESSION_MOUNTPOINTS: &[&str] = &[
+    "dev", "libexec", "lib", "usr/lib", "usr/local/lib",
+    "usr/local/share/atrium", "atrium/sockets",
+];
+
+/// devfsrules_jail (the FreeBSD-standard jail /dev: null/zero/random/tty, NO
+/// kmem/mem/pci/gpu). Must be in the jaild policy's `devfs_rulesets.allowed_ids`.
+const SESSION_DEVFS_RULESET: u32 = 4;
+
 pub struct JaildLauncher {
     pub jaild_sock: String,
     pub publishers: String,
@@ -390,13 +431,25 @@ impl Launcher for JaildLauncher {
         portcullis_peer::register(portcullis_peer::DEFAULT_REGISTRY, uid, &s.owner, &s.app_id)
             .map_err(|e| format!("register uid {uid}: {e}"))?;
 
+        // 3b. Build the per-jail rootfs (the §9.1 isolation fix): create the
+        // mountpoint dirs, then ask jaild for the standard nullfs mounts + a
+        // per-jail devfs. Only for a REAL root; a "/" path (a fallback) stays bare.
+        let (mounts, devfs_ruleset) = if s.jail_path != "/" {
+            for d in SESSION_MOUNTPOINTS {
+                let _ = std::fs::create_dir_all(format!("{}/{d}", s.jail_path));
+            }
+            (session_rootfs_mounts(), SESSION_DEVFS_RULESET)
+        } else {
+            (Vec::new(), 0)
+        };
+
         // 4. ask jaild to jail + drop-to-uid + exec.
         let req = Request::CreateJail(CreateJailRequest {
             name: jail_name(&s.app_id),
             path: s.jail_path.clone(),
             children_max: 0,
-            mounts: vec![],
-            devfs_ruleset: 0,
+            mounts,
+            devfs_ruleset,
             network: NetworkConfig::Disable,
             exec: Some(ExecSpec {
                 path: s.bin.clone(),
@@ -479,6 +532,27 @@ fn load_publishers(dir: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Session apps get a REAL per-jail root (the §9.1 isolation fix), not "/".
+    #[test]
+    fn session_apps_get_a_real_jail_root() {
+        let s = spec("org.atrium.vestibulum", "_login", "vestibulum", &[], vec!["graphics"]);
+        assert_ne!(s.jail_path, "/", "no more path=/ — must be a real root");
+        assert!(s.jail_path.starts_with(JAILS_DIR));
+        assert!(s.jail_path.ends_with("org.atrium.vestibulum"));
+    }
+
+    /// The rootfs mount set carries the dynamic linker, libs, the bundle tree,
+    /// and the service sockets — all read-only.
+    #[test]
+    fn rootfs_mounts_are_complete_and_readonly() {
+        use jaild::protocol::MountKind;
+        let m = session_rootfs_mounts();
+        assert!(m.iter().all(|x| matches!(x.kind, MountKind::RoNullfs)), "all ro");
+        for src in ["/libexec", "/lib", "/usr/lib", "/usr/local/share/atrium", "/atrium/sockets"] {
+            assert!(m.iter().any(|x| x.source == src), "missing mount source {src}");
+        }
+    }
 
     /// A recording launcher — proves the orchestration without a live jaild.
     #[derive(Default)]

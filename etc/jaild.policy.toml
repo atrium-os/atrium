@@ -17,6 +17,16 @@ schema_version = 1
 # ---------------------------------------------------------------
 [mount_sources]
 ro_paths = [
+    # Base system libs + the dynamic linker — the minimal rootfs a
+    # per-jail-root app needs to exec (the §9.1 isolation fix; see
+    # ostiarius session_rootfs_mounts).
+    "/libexec",
+    "/lib",
+    "/usr/lib",
+    # The service-socket directory, mounted whole into a session
+    # app's per-jail root (per-cap scoping is a later refinement).
+    "/atrium/sockets",
+
     # Atrium runtime libs, bundles, fonts (read by every jailed
     # process).
     "/usr/local/lib",
@@ -54,6 +64,11 @@ rw_paths = [
     "/var/run/atrium",
 ]
 rw_patterns = [
+    # Per-jail root directories — the per-jail-root isolation fix
+    # (§9.1). ostiarius/JaildLauncher creates <id> under here and
+    # uses it as the session app's jail path (single-segment glob).
+    "/var/lib/atrium/jails/*",
+
     # Per-user home — mounted only into that user's supervisor
     # jail and into apps the user grants the `home` capability to.
     "/usr/home/*",
@@ -91,7 +106,12 @@ allowed = [
 # operator has actual ruleset blocks defined; sample numbering:
 #   5 = atrium-baseline    6 = atrium-gpu
 #   7 = atrium-input       8 = atrium-tty
-allowed_ids = []
+#
+# 4 = devfsrules_jail (FreeBSD-standard jail /dev: null/zero/random/
+#     tty, NO kmem/mem/pci/gpu) — session apps' per-jail devfs (the
+#     §9.1 isolation fix; ostiarius SESSION_DEVFS_RULESET). 20 = the
+#     memory-governor ruleset (basics + /dev/pressure).
+allowed_ids = [4, 20]
 
 
 # ---------------------------------------------------------------
