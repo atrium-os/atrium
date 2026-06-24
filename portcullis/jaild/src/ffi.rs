@@ -450,12 +450,64 @@ pub fn tmpfs_mount(target: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Mount a fresh devfs at `target` with `ruleset` applied — the per-jail device
+/// view that closes the device-isolation half of the jail boundary (§9.1 KNOWN
+/// GAP). Without this, a jail with `path != "/"` has no `/dev`; with it the jail
+/// sees only the ruleset's nodes (e.g. the governor sees `/dev/pressure` + basics,
+/// with the ruleset's perms). MUST only be called for jails whose root is NOT "/"
+/// — mounting devfs at the host's own /dev would clobber it. devfs's `ruleset`
+/// mount option takes the numeric ruleset id; if a kernel needs it applied
+/// post-mount instead, follow with a `devfs -m <target> rule -s N applyset`.
+#[cfg(target_os = "freebsd")]
+pub fn devfs_mount(target: &str, ruleset: u32) -> io::Result<()> {
+    let c_fstype  = c_string("devfs")?;
+    let c_fspath  = c_string(target)?;
+    let c_ruleset = c_string(&ruleset.to_string())?;
+
+    let key_fstype  = c_string("fstype")?;
+    let key_fspath  = c_string("fspath")?;
+    let key_ruleset = c_string("ruleset")?;
+
+    let mut iov: [libc::iovec; 6] = [libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len:  0,
+    }; 6];
+
+    // SAFETY: each iov_base points into a CString that outlives nmount.
+    unsafe {
+        iov[0].iov_base = key_fstype.as_ptr() as *mut _;
+        iov[0].iov_len  = key_fstype.as_bytes_with_nul().len();
+        iov[1].iov_base = c_fstype.as_ptr() as *mut _;
+        iov[1].iov_len  = c_fstype.as_bytes_with_nul().len();
+
+        iov[2].iov_base = key_fspath.as_ptr() as *mut _;
+        iov[2].iov_len  = key_fspath.as_bytes_with_nul().len();
+        iov[3].iov_base = c_fspath.as_ptr() as *mut _;
+        iov[3].iov_len  = c_fspath.as_bytes_with_nul().len();
+
+        iov[4].iov_base = key_ruleset.as_ptr() as *mut _;
+        iov[4].iov_len  = key_ruleset.as_bytes_with_nul().len();
+        iov[5].iov_base = c_ruleset.as_ptr() as *mut _;
+        iov[5].iov_len  = c_ruleset.as_bytes_with_nul().len();
+
+        let rc = libc::nmount(iov.as_mut_ptr(), iov.len() as u32, 0);
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(not(target_os = "freebsd"))]
 pub fn nullfs_mount(_s: &str, _t: &str, _ro: bool) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "nmount: FreeBSD only"))
 }
 #[cfg(not(target_os = "freebsd"))]
 pub fn tmpfs_mount(_t: &str) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "nmount: FreeBSD only"))
+}
+#[cfg(not(target_os = "freebsd"))]
+pub fn devfs_mount(_t: &str, _r: u32) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "nmount: FreeBSD only"))
 }
 
