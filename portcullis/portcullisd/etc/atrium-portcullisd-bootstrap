@@ -1,6 +1,6 @@
 #!/bin/sh
 # PROVIDE: atrium_portcullisd_bootstrap
-# REQUIRE: FILESYSTEMS atrium_jaild atrium_volumes atrium_portcullisd_daemon
+# REQUIRE: FILESYSTEMS atrium_jaild atrium_volumes portcullisd
 # KEYWORD: shutdown
 #
 # atrium-portcullisd-bootstrap — system-service launcher and
