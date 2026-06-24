@@ -122,6 +122,25 @@ pub struct Capabilities {
     /// allowing detach-only.
     #[serde(default)]
     pub attach_mount_sources: Vec<String>,
+
+    /// If true, portcullisd forwards this jailed service's Reap /
+    /// SetRctl requests to jaild — the inner grant for a memory
+    /// governor (atrium-memoryd / atrium-memfed). The jaild policy
+    /// file's `[resource_control]` is the *outer* ceiling; both must
+    /// allow (mirrors `attach_mount`). Default false → portcullisd
+    /// refuses with `cap.memory_govern.denied` before reaching jaild.
+    /// Grant this ONLY to the blessed governor services — it lets the
+    /// holder ask jaild to signal/cap any jaild-created jail, so it is
+    /// cross-jail authority (kept off every user app).
+    /// See `atrium-memory-pressure.md` §9.5.
+    ///
+    /// Read by the stage-3b forwarding handler (the GovernReap/GovernSetRctl
+    /// path that maps a caller uid -> this manifest -> jaild Reap/SetRctl); the
+    /// allow keeps the extension point in tree without a dead-code warning until
+    /// that handler lands.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub memory_govern: bool,
 }
 
 fn default_true() -> bool { true }
