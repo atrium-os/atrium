@@ -437,6 +437,52 @@ the two ideas unify.
      by weight while idle `cache` held 640 MB. So per-jail `full` now drives **both**
      the reactive (memoryd) and proactive (memfed) layers.
 
+## 9.5 Deployment, startup & jail placement
+
+Where the pieces live in the Atrium service architecture (`service-management.md`
+§4.7 resolves to this; `portcullis.md` §9 is the privilege model).
+
+**Kernel (rank 0, TCB-loaded).** PSI (`kern_pressure.c`: `some`/`full`, per-jail
+both, decaying averages, `/dev/pressure` kqueue), RCTL enforcement, and the
+`atrium-zram` compressed-swap kmod. zram *must* be TCB-loaded — apps can never
+`kldload` (§9.1 of portcullis). Brought up by rc.d, deferred past sshd so a kmod
+bug can't brick boot before the diagnostic channel (the `atrium_virtio_gpu`
+lesson); not preloaded.
+
+**Userspace governors = dedicated daemons, not a mega-daemon.** Per the
+decomposition principle, memory pressure (a reactive control loop, not static
+config) gets its own daemons — `atrium-memfed` (proactive budgeter) and
+`atrium-memoryd` (reactive cascade) — siblings of `atrium-log`/`atrium-timer`,
+started by rc.d gated like frescod (`atrium_*_enable` in rc.conf). **Verified:
+the full stack auto-starts at boot** — kmod load + `swapon /dev/zram0`,
+`/dev/pressure` present, memoryd watching the edge, memfed budgeting the live
+jail set.
+
+**Privilege — the v1/v2 split (the "TCB outside if necessary").**
+- **v1 (now).** Host-side privileged daemons. memoryd must signal across jail PID
+  namespaces (structurally needs host root); memfed sets rctl on jails. This is
+  the bring-up shape — the same one frescod's rc script has today, and analogous
+  to portcullisd's documented known-deviation root launch path.
+- **v2 (target).** The OpenSSH/qmail privsep (portcullis §0.5), split exactly as
+  ostiarius/portcullisd↔jaild already are:
+  - **POLICY = jailed userspace** (`_memoryd`/`_memfed`, rank 3, like frescod):
+    reads the global pressure telemetry as a *granted capability* (cross-jail
+    stall is TCB-sensitive — a side channel — so the reader is a blessed service,
+    same posture as frescod seeing all pixels), computes the decision. This is the
+    "userspace in jails" half.
+  - **MECHANISM = jaild** (rank 1, the sole privileged broker): grows
+    `set_rctl(jail, …)` and `reap(jail, app, sig)`, policy-gated so it can only
+    act on jails it created, never the TCB. This is the minimal "TCB outside."
+  - For clean jailing, fold the per-jail pressure *detail* into `/dev/pressure`
+    (read/ioctl) so the governor needs only that one device in its devfs ruleset
+    (like frescod's GPU node) — no host sysctl. **TODO.**
+
+**Registry & weights from the lifecycle owner.** The member registry (`pid tier
+name [jid]`) and weights/floors come from portcullisd's session table + the app
+manifest `[resources]` (weight = lifecycle tier = lmkd tier; floor =
+`memory_min`) — not the hand-edited file the bring-up uses. portcullisd *feeds*
+the governors; it does not become them.
+
 ## 10. Non-goals / deferred
 
 - **Memory-denominated fairness** — the governing principle forbids it (§2).

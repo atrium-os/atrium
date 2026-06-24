@@ -199,24 +199,46 @@ log daemon crashes, restart it 3 times then back off."
 - No new daemon. Doesn't break the principle — portcullisd
   *already* tracks lifecycle; this is the obvious extension.
 
-### 4.7 Resource control (CPUWeight, MemoryMax) — (P) portcullisd, (P/S) rctl path
+### 4.7 Resource control (CPUWeight, MemoryMax) — (S) dedicated daemons + rctl
 
 systemd has cgroup-backed resource controls in unit files. Atrium
 has rctl(8) per jail / login class / user.
 
-**Decision: portcullisd applies rctl rules; jaild path is open
-question for v2.**
+**Resolved (2026-06-24, when the memory path was implemented).** The
+*static* per-jail caps still come from the manifest
+(`[resources] cpu_share = 50, memory_max = "2GiB"`), translated to
+rctl(8). But **memory pressure** turned out to be a reactive control
+loop — a PSI signal, a reclaim cascade, a weighted water-fill — not a
+set of static rules. By the binding rule (§1, "a dedicated daemon when
+a new domain warrants one"), it gets **dedicated single-purpose
+daemons, not portcullisd**: `atrium-memfed` (proactive — water-fills
+RAM across jails by weight, sets each jail's `memoryuse` cap, boosts a
+thrashing jail by per-jail PSI `full`) and `atrium-memoryd` (reactive —
+PSI-`full`-gated cascade that sheds the lowest lifecycle tier, sparing
+the foreground). The kernel side is rank-0 (PSI in `kern_pressure.c`,
+RCTL, the `atrium-zram` compressed-swap kmod, the `/dev/pressure`
+kqueue edge). Spec: `atrium-memory-pressure.md`.
 
-- Manifest field: `[resources] cpu_share = 50, memory_max = "2GiB"`
-  etc. portcullisd translates these to rctl(8) rules and applies
-  them at jail-create time.
-- v1: portcullisd shells out to `rctl(8)` directly (root, simple).
-- v2 question: should jaild grow an rctl FFI so it's the only
-  privileged broker? Open. Slight pro: tighter privilege story.
-  Slight con: jaild grows in scope; rctl rules are
-  capability-related but not "jail creation."
-- Defer the v1/v2 split to when we actually wire resources;
-  mark this as **TODO: revisit when implementing rctl**.
+- **Placement.** Siblings of `atrium-log`/`atrium-timer` in the jaild
+  tree; started by rc.d (`atrium-zram` → `atrium-memoryd` /
+  `atrium-memfed`), gated like frescod.
+- **Privilege (the v1/v2 split that was deferred here).** v1 bring-up
+  = host-side privileged daemons (memoryd must signal across jail PID
+  namespaces; memfed sets rctl on jails) — the same shape frescod's rc
+  script has today. v2 = the OpenSSH/qmail privsep this document
+  favours: **jailed policy** (`_memoryd`/`_memfed`, rank 3, reading the
+  global pressure telemetry as a granted capability — cross-jail stall
+  is TCB-sensitive, same trust posture as frescod seeing all pixels) +
+  **jaild-brokered mechanism** (jaild grows `set_rctl(jail, …)` and
+  `reap(jail, app, sig)`, policy-gated — so it stays the *only*
+  privileged broker, the "tighter privilege story" pro). For clean
+  jailing, the per-jail pressure detail should move onto `/dev/pressure`
+  (read/ioctl) so the governor needs only that one device in its devfs
+  ruleset, no host sysctl. See `atrium-memory-pressure.md` §9.
+- **Source of weights/registry.** The manifest `[resources]` (weight =
+  lifecycle tier = lmkd tier; floor = `memory_min`) and portcullisd's
+  session table (which app, which jail, which tier) — not a hand-edited
+  file. portcullisd feeds the governors; it does not *be* them.
 
 ### 4.8 Programmatic API / D-Bus equivalent — (N) aqueduct as-is
 
