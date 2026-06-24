@@ -521,8 +521,9 @@ fn handle_remove(
         return (Response::Ok, None);
     }
 
-    /* Capture alias info before we drop the record. */
+    /* Capture alias + path info before we drop the record. */
     let alias_addr = record_idx.and_then(|i| state.jails[i].lo0_alias.clone());
+    let jail_path = record_idx.map(|i| state.jails[i].path.clone());
 
     /* Resolve the jid for the actual jail_remove syscall. If we
      * have a name but no jid, use the state record's jid (which
@@ -542,6 +543,25 @@ fn handle_remove(
                 errno: e.raw_os_error().unwrap_or(-1),
                 msg:   format!("{e}"),
             }, None);
+        }
+    }
+
+    /* Unmount the per-jail devfs mounted at create (handle_create) for real-root
+     * jails — the jail is gone, but the host mount at <root>/dev would otherwise
+     * leak. Best-effort; EINVAL (= not mounted) is the idempotent no-op. */
+    if let Some(p) = jail_path.as_deref() {
+        if p != "/" && !p.is_empty() {
+            let devdir = format!("{}/dev", p.trim_end_matches('/'));
+            if let Ok(c) = std::ffi::CString::new(devdir.as_str()) {
+                #[allow(unsafe_code)]
+                let rc = unsafe { libc::unmount(c.as_ptr(), 0) };
+                if rc < 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.raw_os_error() != Some(libc::EINVAL) {
+                        warn!("jaild: RemoveJail devfs unmount {devdir}: {e}");
+                    }
+                }
+            }
         }
     }
 
