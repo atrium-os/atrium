@@ -1,0 +1,79 @@
+#!/bin/sh
+#
+# atrium-zram — compressed-RAM swap device (atrium_zram.ko -> /dev/zram0),
+# the non-destructive reclaim tier of the Atrium memory stack
+# (docs/spec/atrium-memory-pressure.md). A kernel module (rank 0, TCB-loaded:
+# apps can never kldload, §9.1) that the kernel pages cold anon into — so the
+# system compresses before the controller (memoryd) has to kill anything.
+#
+# DEFERRED past sshd on purpose (the atrium_virtio_gpu lesson): a kmod bug must
+# not brick boot before our only diagnostic channel is up. NOT preloaded.
+#
+# Install: cp to /usr/local/etc/rc.d/atrium-zram ; the .ko to /boot/modules/.
+# Enable in /etc/rc.conf:
+#   atrium_zram_enable="YES"
+# Optional:
+#   atrium_zram_swap="YES"                          # swapon after load
+#   atrium_zram_module="/boot/modules/atrium_zram.ko"
+#   atrium_zram_dev="/dev/zram0"
+
+# PROVIDE: atrium_zram
+# REQUIRE: sshd
+# KEYWORD: nojail shutdown
+
+. /etc/rc.subr
+
+name="atrium_zram"
+desc="Atrium compressed-RAM swap device"
+rcvar="${name}_enable"
+
+load_rc_config "$name"
+
+: ${atrium_zram_enable:="NO"}
+: ${atrium_zram_swap:="YES"}
+: ${atrium_zram_module:="/boot/modules/atrium_zram.ko"}
+: ${atrium_zram_dev:="/dev/zram0"}
+
+start_cmd="atrium_zram_start"
+stop_cmd="atrium_zram_stop"
+
+atrium_zram_start()
+{
+	if ! kldstat -q -m atrium_zram; then
+		if [ ! -f "${atrium_zram_module}" ]; then
+			echo "atrium_zram: ${atrium_zram_module} not found, skipping"
+			return 0
+		fi
+		echo "atrium_zram: loading kmod"
+		kldload "${atrium_zram_module}" || {
+			echo "atrium_zram: kldload failed"
+			return 1
+		}
+	fi
+	# The module creates the device at MOD_LOAD (disk_create); it should be
+	# present immediately after kldload.
+	if [ ! -c "${atrium_zram_dev}" ]; then
+		echo "atrium_zram: WARNING ${atrium_zram_dev} not present after load"
+		return 1
+	fi
+	if checkyesno atrium_zram_swap; then
+		# Idempotent — only swapon if it is not already a swap device.
+		if ! swapinfo | grep -q "${atrium_zram_dev}"; then
+			echo "atrium_zram: swapon ${atrium_zram_dev}"
+			swapon "${atrium_zram_dev}" || echo "atrium_zram: swapon failed"
+		fi
+	fi
+	echo "atrium_zram: ${atrium_zram_dev} ready"
+}
+
+atrium_zram_stop()
+{
+	if swapinfo | grep -q "${atrium_zram_dev}"; then
+		swapoff "${atrium_zram_dev}" || true
+	fi
+	if kldstat -q -m atrium_zram; then
+		kldunload atrium_zram || true
+	fi
+}
+
+run_rc_command "$1"

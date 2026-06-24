@@ -1,0 +1,64 @@
+#!/bin/sh
+#
+# atrium-memoryd — the lifecycle-aware memory-pressure controller
+# (docs/spec/atrium-memory-pressure.md). Sleeps on the /dev/pressure kqueue
+# edge and, under sustained PSI-full thrash, sheds the lowest lifecycle-tier
+# member (TRIM->EXIT->KILL), sparing the foreground — the reactive residual
+# beneath the proactive RCTL budgeter (memfed) and the kernel reclaim tiers
+# (zram). Posture-following (kern.sched.power_policy) and jail-aware (it sheds
+# the culprit jail's member, using per-jail PSI full).
+#
+# v1 bring-up (this script): a host-side privileged daemon — it must signal
+# across jail PID namespaces, which structurally needs host root. The v2 form
+# is the privsep split: jailed policy + jaild-brokered reap
+# (service-management.md §4.7). See docs/spec/atrium-memory-pressure.md §9.
+#
+# Install: cp to /usr/local/etc/rc.d/atrium-memoryd ; memoryd to /usr/local/bin.
+# Enable in /etc/rc.conf:
+#   atrium_memoryd_enable="YES"
+# Optional:
+#   atrium_memoryd_full_trip="40"     # PSI-full avg10 % thrash gate
+#   atrium_memoryd_registry="/var/run/atrium/memoryd/members"
+#   atrium_memoryd_args=""            # extra flags, e.g. "--posture 3"
+#   atrium_memoryd_logfile="/var/log/atrium/memoryd.log"
+
+# PROVIDE: atrium_memoryd
+# REQUIRE: atrium_jaild atrium_zram
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="atrium_memoryd"
+desc="Atrium memory-pressure controller"
+rcvar="${name}_enable"
+
+load_rc_config "$name"
+
+: ${atrium_memoryd_enable:="NO"}
+: ${atrium_memoryd_full_trip:="40"}
+: ${atrium_memoryd_registry:="/var/run/atrium/memoryd/members"}
+: ${atrium_memoryd_args:=""}
+: ${atrium_memoryd_logfile:="/var/log/atrium/memoryd.log"}
+
+command="/usr/local/bin/memoryd"
+pidfile="/var/run/atrium/memoryd.pid"
+start_cmd="atrium_memoryd_start"
+
+atrium_memoryd_start()
+{
+	install -d -m 0755 -o root -g wheel /var/run/atrium /var/log/atrium
+	install -d -m 0755 -o root -g wheel "$(dirname "${atrium_memoryd_registry}")"
+	# The registry is the Portcullis stand-in (pid tier name [jid]); the
+	# launcher populates it. Ensure it exists so memoryd starts cleanly.
+	[ -f "${atrium_memoryd_registry}" ] || : > "${atrium_memoryd_registry}"
+	[ -x "${command}" ] || err 1 "${command} not installed"
+
+	echo "Starting ${name}."
+	/usr/sbin/daemon -f -p "${pidfile}" -o "${atrium_memoryd_logfile}" -t "${name}" \
+		"${command}" --arm \
+			--full-trip "${atrium_memoryd_full_trip}" \
+			--registry "${atrium_memoryd_registry}" \
+			${atrium_memoryd_args}
+}
+
+run_rc_command "$1"

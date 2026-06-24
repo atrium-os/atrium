@@ -1,0 +1,74 @@
+#!/bin/sh
+#
+# atrium-memfed — the proactive memory federation
+# (docs/spec/atrium-memory-pressure.md). Water-fills RAM across jails by weight
+# and sets each jail's RCTL memoryuse cap, boosting a thrashing jail's demand
+# (per-jail PSI full) so a high-weight jail grows while a low-weight one stays
+# contained. The proactive bound that keeps the machine from thrashing — so the
+# reactive controller (memoryd) rarely has to engage.
+#
+# Requires kern.racct.enable=1 (a /boot/loader.conf boot tunable) for the caps
+# to enforce; without it memfed still computes + logs the plan.
+#
+# v1 bring-up (this script): a host-side privileged daemon (it sets RCTL on
+# jails). The v2 form routes the rctl mechanism through jaild (the privsep
+# split, service-management.md §4.7). See atrium-memory-pressure.md §9.
+#
+# Install: cp to /usr/local/etc/rc.d/atrium-memfed ; memfed to /usr/local/bin.
+# Enable in /etc/rc.conf:
+#   atrium_memfed_enable="YES"
+#   atrium_memfed_jails="web:3:256 cache:1:128"   # name:weight:floorMiB ...
+# Optional:
+#   atrium_memfed_interval="5"        # daemon re-budget cadence (s)
+#   atrium_memfed_budget_pct="70"     # share of physmem to federate
+#   atrium_memfed_args=""             # extra flags, e.g. "--thrash-boost 2048"
+#   atrium_memfed_logfile="/var/log/atrium/memfed.log"
+
+# PROVIDE: atrium_memfed
+# REQUIRE: atrium_jaild
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="atrium_memfed"
+desc="Atrium memory federation (per-jail RCTL budgeter)"
+rcvar="${name}_enable"
+
+load_rc_config "$name"
+
+: ${atrium_memfed_enable:="NO"}
+: ${atrium_memfed_jails:=""}
+: ${atrium_memfed_interval:="5"}
+: ${atrium_memfed_budget_pct:="70"}
+: ${atrium_memfed_args:=""}
+: ${atrium_memfed_logfile:="/var/log/atrium/memfed.log"}
+
+command="/usr/local/bin/memfed"
+pidfile="/var/run/atrium/memfed.pid"
+start_cmd="atrium_memfed_start"
+
+atrium_memfed_start()
+{
+	install -d -m 0755 -o root -g wheel /var/run/atrium /var/log/atrium
+	[ -x "${command}" ] || err 1 "${command} not installed"
+
+	if [ "$(sysctl -n kern.racct.enable 2>/dev/null)" != "1" ]; then
+		warn "kern.racct.enable != 1 — set it in /boot/loader.conf; caps will compute but not enforce"
+	fi
+	# memfed needs the jail set to budget (name:weight:floor). Until the
+	# launcher (portcullisd/manifest [resources]) feeds it, take it from rc.conf.
+	if [ -z "${atrium_memfed_jails}" ]; then
+		echo "atrium_memfed: no jails configured (atrium_memfed_jails); not starting"
+		return 0
+	fi
+
+	echo "Starting ${name}."
+	/usr/sbin/daemon -f -p "${pidfile}" -o "${atrium_memfed_logfile}" -t "${name}" \
+		"${command}" --arm \
+			--interval "${atrium_memfed_interval}" \
+			--budget-pct "${atrium_memfed_budget_pct}" \
+			${atrium_memfed_args} \
+			${atrium_memfed_jails}
+}
+
+run_rc_command "$1"
