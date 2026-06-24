@@ -1131,11 +1131,25 @@ Concretely:
 > `/dev`** — `kmem`, `mem`, `pci`, every device. With `path = "/"` the jail's
 > `/dev` *is* the host `/dev`, so any `devfs_ruleset` is inert (there is no
 > separate devfs for it to restrict). PID/process isolation holds; filesystem and
-> device isolation do **not**. Fix (the jail-isolation foundation): per-jail root
-> (bundle tree / minimal root, not `/`) + jaild mounts a per-jail devfs at
-> `<root>/dev` with the ruleset (jaild has the `nmount` pattern from
-> `nullfs_mount`; add a `devfs_mount(target, ruleset)` and call it at create when
-> `devfs_ruleset != 0`). Until then, treat the jail boundary as process-only.
+> device isolation do **not**. PROGRESS (2026-06-24): the jaild HALF of the fix is
+> DONE + verified — `ffi::devfs_mount(target, ruleset)` + `handle_create` mounts a
+> per-jail devfs at `<root>/dev` (gated on `path != "/"`, unmounted on RemoveJail),
+> so a jail with a REAL root now sees only the ruleset's nodes (verified: 5 nodes
+> vs the host's 66, no `kmem`/`mem`/`pci`). The memory governor proves the whole
+> pattern (a real root + nullfs lib/binary mounts + the per-jail devfs — see
+> `memoryd/etc/services.d/50-atrium-memoryd.toml`). jaild now also `warn!`s on
+> every `path="/"` create so the remaining unisolated jails are visible.
+>
+> REMAINING (the per-jail-ROOT migration — D5; high-risk, touches the LIVE session
+> launch): give the ostiarius-launched session apps real roots. Concrete change
+> points: `ostiarius/src/lib.rs` `spec()` hardcodes `jail_path: "/"` (→ a real root,
+> e.g. `/var/lib/atrium/jails/<app_id>`); `JaildLauncher::launch()` sends
+> `mounts: vec![], devfs_ruleset: 0` (→ the standard rootfs nullfs mounts — libs +
+> the `apps/<id>` bundle + the caps→socket mounts — plus a session-app devfs
+> ruleset). Needs each app's rootfs populated + the caps→mount mapping + full
+> ostiarius→frescod→session-path testing (a broken launch = no login). user-app
+> jails (`launch.rs`) ALREADY use real roots (`JAILS_DIR/<app_id>` + nullfs/unionfs)
+> — the gap is the SYSTEM/session jails on `path="/"`.
 
 - **App-to-app isolation.** A compromised app cannot read another
   app's files (no shared mount), cannot talk to services it
