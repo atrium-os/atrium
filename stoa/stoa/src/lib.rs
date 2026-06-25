@@ -150,6 +150,14 @@ impl Control {
     }
 }
 
+/// True if `seq` reveals a lost server→client datagram: the highest seq seen
+/// so far is `hi`, and `seq` jumps past `hi + 1`. Used by a grid-sync client
+/// to detect a gap and request a full repaint (resync). `None` (first packet)
+/// is never a gap; a seq at/below `hi` (reorder/replay) is not a forward gap.
+pub fn seq_gap(hi: Option<u32>, seq: u32) -> bool {
+    matches!(hi, Some(h) if seq > h.wrapping_add(1))
+}
+
 /// Build one wire datagram: stamp `seq`, MAC with `key`.
 pub fn seal(key: &[u8], seq: u32, msg_type: MsgType, payload: &[u8]) -> Vec<u8> {
     stoa_proto::Envelope::new(msg_type, seq, payload.to_vec()).encode(key)
@@ -218,6 +226,17 @@ mod tests {
         assert_eq!(Control::decode(&[99]), None);
         assert_eq!(Control::decode(&[5, 0]), None); // truncated Resize
         assert_eq!(Control::decode(&[8]), None); // truncated SwitchWindow
+    }
+
+    #[test]
+    fn seq_gap_detection() {
+        assert!(!seq_gap(None, 0)); // first packet: no baseline, no gap
+        assert!(!seq_gap(None, 99));
+        assert!(!seq_gap(Some(5), 6)); // in-order: hi+1
+        assert!(!seq_gap(Some(5), 5)); // duplicate / same
+        assert!(!seq_gap(Some(5), 3)); // reorder / old: not a forward gap
+        assert!(seq_gap(Some(5), 7)); // skipped 6 → gap
+        assert!(seq_gap(Some(5), 100)); // big jump → gap
     }
 
     #[test]

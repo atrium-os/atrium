@@ -312,6 +312,9 @@ fn attach(name: &str, host: Option<&str>, jail: Option<&str>) {
     let mut rx = ReplayWindow::new();
     let mut buf = [0u8; 65536];
     let stdout = libc::STDOUT_FILENO;
+    // Highest server seq seen — a forward jump means a lost datagram. In sync
+    // mode that's recoverable: ask for a full repaint (resync).
+    let mut hi_seq: Option<u32> = None;
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -323,6 +326,18 @@ fn attach(name: &str, host: Option<&str>, jail: Option<&str>) {
                 if !rx.accept(env.seq) {
                     continue;
                 }
+                // Lost-datagram recovery: a gap in the server's seq means we
+                // missed an update the server believes we have (it diffs
+                // against last_sent). Request a full repaint to resync.
+                if sync && stoa::seq_gap(hi_seq, env.seq) {
+                    let _ = sock.send(&seal(
+                        &key,
+                        tx_seq.fetch_add(1, Ordering::SeqCst),
+                        CONTROL,
+                        &Control::Redraw.encode(),
+                    ));
+                }
+                hi_seq = Some(hi_seq.map_or(env.seq, |h| h.max(env.seq)));
                 if env.msg_type == OUTPUT && sync {
                     // Grid-sync: payload is an encoded StateDiff. Paint the
                     // changed runs; a decode failure (corrupt datagram) is
