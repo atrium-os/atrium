@@ -56,22 +56,36 @@ pub const CONTROL: MsgType = MsgType::Control;
 /// lazily spawns the shell) before any output is produced.
 pub const KEEPALIVE: MsgType = MsgType::Keepalive;
 
-/// Control-channel messages. At S1 the only one is server→client.
+/// Control-channel messages (carried in a [`CONTROL`] datagram).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Control {
     /// Server → client: the session's shell exited; nothing to resume.
     Bye,
+    /// Client → server: the client's terminal size. Sent as the first
+    /// datagram (so the shell spawns at the right size) and again on every
+    /// SIGWINCH. stoad applies it to the pty (TIOCSWINSZ → SIGWINCH inside).
+    Resize { cols: u16, rows: u16 },
 }
 
 impl Control {
     pub fn encode(&self) -> Vec<u8> {
         match self {
             Control::Bye => vec![4],
+            Control::Resize { cols, rows } => {
+                let mut v = vec![5];
+                v.extend_from_slice(&cols.to_be_bytes());
+                v.extend_from_slice(&rows.to_be_bytes());
+                v
+            }
         }
     }
     pub fn decode(payload: &[u8]) -> Option<Control> {
         match payload.first()? {
             4 => Some(Control::Bye),
+            5 if payload.len() >= 5 => Some(Control::Resize {
+                cols: u16::from_be_bytes([payload[1], payload[2]]),
+                rows: u16::from_be_bytes([payload[3], payload[4]]),
+            }),
             _ => None,
         }
     }
@@ -124,8 +138,11 @@ mod tests {
     #[test]
     fn control_round_trips() {
         assert_eq!(Control::decode(&Control::Bye.encode()), Some(Control::Bye));
+        let r = Control::Resize { cols: 203, rows: 51 };
+        assert_eq!(Control::decode(&r.encode()), Some(r));
         assert_eq!(Control::decode(&[]), None);
         assert_eq!(Control::decode(&[99]), None);
+        assert_eq!(Control::decode(&[5, 0]), None); // truncated Resize
     }
 
     #[test]

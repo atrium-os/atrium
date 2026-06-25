@@ -16,14 +16,12 @@ use std::io::Read;
 use std::net::UdpSocket;
 use std::os::unix::net::UnixStream;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use stoa::{
-    default_ctl, from_hex, seal, Control, CONTROL, DETACH_BYTE, INPUT, KEEPALIVE, OUTPUT,
-};
+use stoa::{default_ctl, from_hex, seal, Control, CONTROL, DETACH_BYTE, INPUT, OUTPUT};
 use stoa_proto::{Envelope, ReplayWindow};
 
 fn main() {
@@ -160,18 +158,37 @@ fn attach(name: &str, host: Option<&str>, jail: Option<&str>) {
         }
     };
 
-    // Register our address (and lazily spawn the shell) with a keepalive at
-    // seq 0; the stdin thread continues the tx stream from seq 1.
-    let _ = sock.send(&seal(&key, 0, KEEPALIVE, &[]));
-
     let _raw = RawMode::enable(libc::STDIN_FILENO);
     let stop = Arc::new(AtomicBool::new(false));
+    // One monotonic tx seq shared by every client→server datagram (the
+    // initial Resize, stdin Input, and resize-poll Resize).
+    let tx_seq = Arc::new(AtomicU32::new(0));
 
+    // Initial Resize: registers our address + lazily spawns the shell at the
+    // client's ACTUAL terminal size (80×24 if stdout isn't a tty, e.g. piped).
+    let (c0, r0) = winsize(libc::STDOUT_FILENO).unwrap_or((80, 24));
+    let _ = sock.send(&seal(
+        &key,
+        tx_seq.fetch_add(1, Ordering::SeqCst),
+        CONTROL,
+        &Control::Resize { cols: c0, rows: r0 }.encode(),
+    ));
+
+    // stdin → Input datagrams.
     {
         let ssock = sock.try_clone().expect("clone socket");
         let skey = key.clone();
         let sstop = stop.clone();
-        thread::spawn(move || stdin_loop(ssock, skey, sstop));
+        let sseq = tx_seq.clone();
+        thread::spawn(move || stdin_loop(ssock, skey, sseq, sstop));
+    }
+    // resize poller → a Resize datagram whenever the terminal size changes.
+    {
+        let ssock = sock.try_clone().expect("clone socket");
+        let skey = key.clone();
+        let sseq = tx_seq.clone();
+        let sstop = stop.clone();
+        thread::spawn(move || resize_loop(ssock, skey, sseq, sstop, (c0, r0)));
     }
 
     sock.set_read_timeout(Some(Duration::from_millis(150))).ok();
@@ -206,8 +223,7 @@ fn attach(name: &str, host: Option<&str>, jail: Option<&str>) {
     // `_raw` drops here → terminal restored.
 }
 
-fn stdin_loop(sock: UdpSocket, key: Vec<u8>, stop: Arc<AtomicBool>) {
-    let mut seq: u32 = 1;
+fn stdin_loop(sock: UdpSocket, key: Vec<u8>, seq: Arc<AtomicU32>, stop: Arc<AtomicBool>) {
     let mut chunk = [0u8; 4096];
     loop {
         let n = match std::io::stdin().lock().read(&mut chunk) {
@@ -217,13 +233,49 @@ fn stdin_loop(sock: UdpSocket, key: Vec<u8>, stop: Arc<AtomicBool>) {
         let data = &chunk[..n];
         if let Some(i) = data.iter().position(|&b| b == DETACH_BYTE) {
             if i > 0 {
-                let _ = sock.send(&seal(&key, seq, INPUT, &data[..i]));
+                let _ = sock.send(&seal(&key, seq.fetch_add(1, Ordering::SeqCst), INPUT, &data[..i]));
             }
             stop.store(true, Ordering::SeqCst);
             return;
         }
-        let _ = sock.send(&seal(&key, seq, INPUT, data));
-        seq = seq.wrapping_add(1);
+        let _ = sock.send(&seal(&key, seq.fetch_add(1, Ordering::SeqCst), INPUT, data));
+    }
+}
+
+/// Poll the terminal size; send a Resize datagram whenever it changes. A
+/// poll (vs a SIGWINCH handler) keeps this async-signal-safe and simple —
+/// resize isn't latency-critical. Exits when the session stops.
+fn resize_loop(sock: UdpSocket, key: Vec<u8>, seq: Arc<AtomicU32>, stop: Arc<AtomicBool>, initial: (u16, u16)) {
+    let mut last = initial;
+    loop {
+        thread::sleep(Duration::from_millis(400));
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Some(sz) = winsize(libc::STDOUT_FILENO) {
+            if sz != last {
+                last = sz;
+                let _ = sock.send(&seal(
+                    &key,
+                    seq.fetch_add(1, Ordering::SeqCst),
+                    CONTROL,
+                    &Control::Resize { cols: sz.0, rows: sz.1 }.encode(),
+                ));
+            }
+        }
+    }
+}
+
+/// Current terminal size of `fd` (cols, rows) via TIOCGWINSZ. `None` if not
+/// a tty (e.g. piped) or zero-sized.
+fn winsize(fd: i32) -> Option<(u16, u16)> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: TIOCGWINSZ writes the winsize struct for a tty fd.
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+    if rc == 0 && ws.ws_col > 0 {
+        Some((ws.ws_col, ws.ws_row))
+    } else {
+        None
     }
 }
 

@@ -49,6 +49,11 @@ struct Inner {
     pty_fd: Option<i32>,
     shell: Option<PtyShell>,
     started: bool,
+    /// Last terminal size the client reported (Control::Resize); the shell
+    /// spawns at this size and the live pty is resized to it. Default 80×24
+    /// until the client's first Resize.
+    cols: u16,
+    rows: u16,
 }
 
 struct SessionState {
@@ -151,6 +156,8 @@ fn mint(reg: &Reg, name: &str, target: &str) -> (u16, [u8; KEY_LEN]) {
             pty_fd: None,
             shell: None,
             started: false,
+            cols: 80,
+            rows: 24,
         }),
     });
     map.insert(name.to_string(), state.clone());
@@ -188,6 +195,20 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
                         None
                     } else {
                         inner.last_addr = Some(src);
+                        // Resize: record the size (used at spawn) and apply it
+                        // to a live pty. Handled before the lazy spawn so the
+                        // shell starts at the client's actual size.
+                        if env.msg_type == MsgType::Control {
+                            if let Some(Control::Resize { cols, rows }) =
+                                Control::decode(&env.payload)
+                            {
+                                inner.cols = cols;
+                                inner.rows = rows;
+                                if let Some(sh) = &inner.shell {
+                                    let _ = sh.resize(cols, rows);
+                                }
+                            }
+                        }
                         if !inner.started {
                             spawn_shell(&name, &state, &mut inner, &udp, &reg);
                         }
@@ -274,7 +295,7 @@ fn stoad_is_jailed() -> bool {
 /// `BrokerSpawner` (FreeBSD); `SessionJail` via [`resolve_session_target`]
 /// (DirectSpawner when unjailed, broker when a session jail is configured,
 /// error on a jailed stoad with none).
-fn spawn_for(target: &Target) -> std::io::Result<PtyShell> {
+fn spawn_for(target: &Target, cols: u16, rows: u16) -> std::io::Result<PtyShell> {
     let resolved = match target {
         Target::SessionJail => resolve_session_target()?,
         Target::Jail(_) => target.clone(),
@@ -282,8 +303,8 @@ fn spawn_for(target: &Target) -> std::io::Result<PtyShell> {
     let spec = SpawnSpec {
         target: resolved.clone(),
         cmd: Vec::new(),
-        cols: 80,
-        rows: 24,
+        cols,
+        rows,
         cwd: None,
         env: Vec::new(),
     };
@@ -309,7 +330,7 @@ fn spawn_broker(_spec: &SpawnSpec) -> std::io::Result<PtyShell> {
 /// Lazily spawn the session's shell on the first client datagram and start
 /// its reader thread. Caller holds `inner`.
 fn spawn_shell(name: &str, state: &Arc<SessionState>, inner: &mut Inner, udp: &UdpSocket, reg: &Reg) {
-    match spawn_for(&parse_target(&state.target)) {
+    match spawn_for(&parse_target(&state.target), inner.cols, inner.rows) {
         Ok(shell) => {
             let fd = shell.master_fd();
             inner.pty_fd = Some(fd);
