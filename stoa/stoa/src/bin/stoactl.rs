@@ -17,10 +17,11 @@ use std::net::UdpSocket;
 use std::os::unix::net::UnixStream;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use stoa::predict::Predictor;
 use stoa::{default_ctl, from_hex, seal, Control, CONTROL, DETACH_BYTE, INPUT, OUTPUT, PREFIX_BYTE};
 use stoa_proto::{Envelope, ReplayWindow};
 
@@ -230,6 +231,11 @@ fn attach(name: &str, host: Option<&str>, jail: Option<&str>) {
     // One monotonic tx seq shared by every client→server datagram (the
     // initial Resize, stdin Input, and resize-poll Resize).
     let tx_seq = Arc::new(AtomicU32::new(0));
+    // Predictive echo (opt-in via $STOA_PREDICT) — hides round-trip latency.
+    // Shared between the stdin thread (predicts) and this loop (reconciles).
+    // Holding it also serializes stdout writes between the two.
+    let predictor: Option<Arc<Mutex<Predictor>>> = std::env::var_os("STOA_PREDICT")
+        .map(|_| Arc::new(Mutex::new(Predictor::new())));
 
     // Initial Resize: registers our address + lazily spawns the shell at the
     // client's ACTUAL terminal size (80×24 if stdout isn't a tty, e.g. piped).
@@ -247,7 +253,8 @@ fn attach(name: &str, host: Option<&str>, jail: Option<&str>) {
         let skey = key.clone();
         let sstop = stop.clone();
         let sseq = tx_seq.clone();
-        thread::spawn(move || stdin_loop(ssock, skey, sseq, sstop));
+        let spred = predictor.clone();
+        thread::spawn(move || stdin_loop(ssock, skey, sseq, sstop, spred));
     }
     // resize poller → a Resize datagram whenever the terminal size changes.
     {
@@ -274,7 +281,30 @@ fn attach(name: &str, host: Option<&str>, jail: Option<&str>) {
                     continue;
                 }
                 if env.msg_type == OUTPUT {
-                    write_all_fd(stdout, &env.payload);
+                    match &predictor {
+                        // Reconcile server output against predictions: write
+                        // the result + suppress confirmed echoes; on divergence
+                        // request a repaint from the server's grid mirror. The
+                        // write happens under the lock to serialize with the
+                        // stdin thread's local echo.
+                        Some(p) => {
+                            let redraw = {
+                                let mut g = p.lock().unwrap();
+                                let (bytes, redraw) = g.on_output(&env.payload);
+                                write_all_fd(stdout, &bytes);
+                                redraw
+                            };
+                            if redraw {
+                                let _ = sock.send(&seal(
+                                    &key,
+                                    tx_seq.fetch_add(1, Ordering::SeqCst),
+                                    CONTROL,
+                                    &Control::Redraw.encode(),
+                                ));
+                            }
+                        }
+                        None => write_all_fd(stdout, &env.payload),
+                    }
                 } else if env.msg_type == CONTROL {
                     if let Some(Control::Bye) = Control::decode(&env.payload) {
                         break;
@@ -290,7 +320,13 @@ fn attach(name: &str, host: Option<&str>, jail: Option<&str>) {
     // `_raw` drops here → terminal restored.
 }
 
-fn stdin_loop(sock: UdpSocket, key: Vec<u8>, seq: Arc<AtomicU32>, stop: Arc<AtomicBool>) {
+fn stdin_loop(
+    sock: UdpSocket,
+    key: Vec<u8>,
+    seq: Arc<AtomicU32>,
+    stop: Arc<AtomicBool>,
+    pred: Option<Arc<Mutex<Predictor>>>,
+) {
     // Flush accumulated keystrokes as one Input datagram (preserving order
     // relative to commands).
     let flush = |pending: &mut Vec<u8>| {
@@ -342,6 +378,17 @@ fn stdin_loop(sock: UdpSocket, key: Vec<u8>, seq: Arc<AtomicU32>, stop: Arc<Atom
                 stop.store(true, Ordering::SeqCst);
                 return;
             } else {
+                // Predictive echo: show the keystroke locally now (under the
+                // predictor lock, serializing with the recv loop's output).
+                if let Some(p) = &pred {
+                    let mut g = p.lock().unwrap();
+                    if let Some(echo) = g.on_input(b) {
+                        // SAFETY: write one byte to stdout.
+                        unsafe {
+                            libc::write(libc::STDOUT_FILENO, [echo].as_ptr() as *const libc::c_void, 1);
+                        }
+                    }
+                }
                 pending.push(b);
             }
         }

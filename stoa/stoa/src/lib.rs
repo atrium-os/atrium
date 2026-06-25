@@ -24,6 +24,8 @@
 
 use stoa_proto::MsgType;
 
+pub mod predict;
+
 /// Default `stoad` local control socket (where mints happen). Overridable
 /// via `$STOA_CTL`. Production uses `/var/run/atrium/stoad.sock`; the dev
 /// build uses a per-uid path under the temp dir.
