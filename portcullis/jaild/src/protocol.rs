@@ -321,8 +321,9 @@ pub enum Response {
 
     /// ExecInJail succeeded; the process is running inside the jail on a
     /// pty. Two fds ride SCM_RIGHTS alongside this body, in order:
-    /// `[procdesc, pty_master]`.
-    JailExecStarted { pid: i32 },
+    /// `[procdesc, pty_master]`. `uid` is what it actually runs as inside
+    /// the jail (the jail's app-uid, or 0 if `want_root`).
+    JailExecStarted { pid: i32, uid: u32 },
 
     /// Request was structurally valid but rejected by jaild's
     /// policy (mount source not allowed, name pattern bad, …).

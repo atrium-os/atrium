@@ -257,6 +257,13 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             write_response(&mut writer, &resp)?;
             continue;
         }
+        /* ExecInJail relays fds (procdesc + pty master) back to the caller,
+         * so — like Launch — it needs the writer directly, not the plain
+         * write_response path. Peer-uid + jail_exec cap gated. */
+        if matches!(req, Request::ExecInJail { .. }) {
+            handle_exec_in_jail(uid, req, &mut writer)?;
+            continue;
+        }
         let resp = handle(req, &user, &shared);
         write_response(&mut writer, &resp)?;
     }
@@ -428,6 +435,126 @@ fn handle_govern(uid: u32, req: Request) -> Response {
         Ok((other, _)) => Response::Error { message: format!("jaild: {other:?}") },
         Err(e) => Response::Error { message: format!("jaild send: {e}") },
     }
+}
+
+/// Broker an `ExecInJail` request from a jailed, non-root broker client
+/// (`_stoad`): exec a shell inside an EXISTING jaild-created jail on a pty
+/// (Stoa's jail-target sessions, stoa.md §4.5).
+///
+/// INNER gate (here): the peer uid must own a services.d manifest granting
+/// `jail_exec` (mirrors `handle_govern`'s `memory_govern`); a `want_root`
+/// request additionally needs `jail_exec_root`. OUTER bound (jaild, on
+/// forward): the target must be a jail jaild itself created, and the shell
+/// runs as the jail's own app-uid unless root was granted.
+///
+/// On success: forwards to jaild, receives `[procdesc, pty_master]`, writes
+/// `JailExecStarted`, and relays both fds to the caller over SCM_RIGHTS.
+///
+/// NOTE (v1): gated on the `jail_exec` capability alone. A per-human
+/// ownership check (does *this* user own jail X — via the launch registry)
+/// is a documented follow-up; today `_stoad` holds `jail_exec` for the seat.
+fn handle_exec_in_jail(uid: u32, req: Request, writer: &mut UnixStream) -> std::io::Result<()> {
+    use portcullisd::jaild_client::Client;
+    use portcullisd::system_services;
+
+    let (jail_name, path, argv, want_root, cols, rows) = match req {
+        Request::ExecInJail { jail_name, path, argv, want_root, cols, rows } => {
+            (jail_name, path, argv, want_root, cols, rows)
+        }
+        _ => {
+            return write_response(writer, &Response::Error {
+                message: "internal: not an ExecInJail request".into(),
+            })
+        }
+    };
+
+    // 1. capability gate on the peer uid's services.d manifest.
+    let manifests = match system_services::load_dir(std::path::Path::new(SERVICES_DIR)) {
+        Ok(o) => o.manifests,
+        Err(e) => {
+            return write_response(writer, &Response::Error {
+                message: format!("services.d load: {e}"),
+            })
+        }
+    };
+    let svc = manifests
+        .iter()
+        .find(|m| m.exec.as_ref().map_or(false, |e| e.uid == uid));
+    if !svc.map_or(false, |m| m.capabilities.jail_exec) {
+        return write_response(writer, &Response::Error {
+            message: format!("cap.jail_exec.denied: uid {uid} is not a jail_exec service"),
+        });
+    }
+    if want_root && !svc.map_or(false, |m| m.capabilities.jail_exec_root) {
+        return write_response(writer, &Response::Error {
+            message: format!("cap.jail_exec_root.denied: uid {uid} may not request a root shell"),
+        });
+    }
+
+    // 2. forward to jaild (the sole jail_attach caller).
+    let jreq = jaild::protocol::Request::ExecInJail(jaild::protocol::ExecInJailRequest {
+        name: jail_name.clone(),
+        path,
+        argv,
+        env: Vec::new(),
+        want_root,
+        cols,
+        rows,
+    });
+    let mut client = match Client::connect(JAILD_SOCK) {
+        Ok(c) => c,
+        Err(e) => {
+            return write_response(writer, &Response::Error {
+                message: format!("jaild connect: {e}"),
+            })
+        }
+    };
+    let (jresp, fds) = match client.send_recv_fds(&jreq, 2) {
+        Ok(v) => v,
+        Err(e) => {
+            return write_response(writer, &Response::Error {
+                message: format!("jaild send: {e}"),
+            })
+        }
+    };
+
+    let close_all = |fds: &[i32]| {
+        for &fd in fds {
+            // SAFETY: closing fds we received and won't relay.
+            unsafe { libc::close(fd) };
+        }
+    };
+    let (pid, juid) = match jresp {
+        jaild::protocol::Response::JailExecStarted { pid, uid } => (pid, uid),
+        jaild::protocol::Response::PolicyDenied { rule, detail } => {
+            close_all(&fds);
+            return write_response(writer, &Response::Error {
+                message: format!("jaild denied [{rule}]: {detail}"),
+            });
+        }
+        other => {
+            close_all(&fds);
+            return write_response(writer, &Response::Error {
+                message: format!("jaild: {other:?}"),
+            });
+        }
+    };
+    if fds.len() != 2 {
+        close_all(&fds);
+        return write_response(writer, &Response::Error {
+            message: format!("jaild returned {} fds, expected 2", fds.len()),
+        });
+    }
+
+    // 3. relay to the caller: response line, then [procdesc, pty_master].
+    write_response(writer, &Response::JailExecStarted { pid, uid: juid })?;
+    let res = portcullis_ipc::send_fds(writer, &fds);
+    close_all(&fds); // the caller has its own copies now
+    res?;
+    eprintln!(
+        "portcullisd: ExecInJail {jail_name} pid={pid} uid={juid} → relayed [procdesc,master] to peer uid {uid}"
+    );
+    Ok(())
 }
 
 /// Broker a session-launcher request from the jailed, non-root `_ostiarius`.
@@ -667,12 +794,9 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
             message: "internal: session verbs must go through handle_session".into(),
         },
         Request::ExecInJail { .. } => Response::Error {
-            /* Protocol + caps (jail_exec / jail_exec_root) are in place and the
-             * jaild ExecInJail primitive is ready; the portcullisd fd-relay
-             * handler (forward to jaild, relay [procdesc, pty_master] to the
-             * caller over SCM_RIGHTS) is the next step. See stoa.md §4.5. */
-            message: "ExecInJail broker not yet wired (jaild primitive ready; \
-                      portcullisd fd-relay handler pending)".into(),
+            /* Caught by serve() before reaching here (routed to
+             * handle_exec_in_jail, which relays fds). */
+            message: "internal: ExecInJail must go through handle_exec_in_jail".into(),
         },
     }
 }

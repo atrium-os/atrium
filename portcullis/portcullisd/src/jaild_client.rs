@@ -55,17 +55,24 @@ impl Client {
     /// attached via SCM_RIGHTS is returned in the second slot;
     /// caller takes ownership and is responsible for closing.
     pub fn send(&mut self, req: &Request) -> io::Result<(Response, Option<i32>)> {
+        let (resp, fds) = self.send_recv_fds(req, 1)?;
+        Ok((resp, fds.into_iter().next()))
+    }
+
+    /// Like [`send`](Self::send) but returns up to `max_fds` SCM_RIGHTS fds
+    /// in order. ExecInJail uses `max_fds = 2` for `[procdesc, pty_master]`.
+    pub fn send_recv_fds(&mut self, req: &Request, max_fds: usize) -> io::Result<(Response, Vec<i32>)> {
         let body = serde_json::to_vec(req)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
                 format!("serialize request: {e}")))?;
         write_frame(&mut self.stream, &body)?;
         self.stream.flush()?;
 
-        let (frame, fd) = recvmsg_frame(self.stream.as_raw_fd())?;
+        let (frame, fds) = recvmsg_frame(self.stream.as_raw_fd(), max_fds)?;
         let resp: Response = serde_json::from_slice(&frame)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
                 format!("parse response: {e}")))?;
-        Ok((resp, fd))
+        Ok((resp, fds))
     }
 }
 
@@ -83,13 +90,13 @@ fn write_frame<W: Write>(mut w: W, body: &[u8]) -> io::Result<()> {
 /// Read one length-prefixed frame plus optional SCM_RIGHTS fd
 /// in a single `recvmsg(2)`. The body and the cmsg arrive
 /// atomically because jaild sends them in the same `sendmsg`.
-fn recvmsg_frame(socket_fd: i32) -> io::Result<(Vec<u8>, Option<i32>)> {
+fn recvmsg_frame(socket_fd: i32, max_fds: usize) -> io::Result<(Vec<u8>, Vec<i32>)> {
     /* Read the 4-byte length prefix in a recvmsg call so any
      * SCM_RIGHTS cmsg (which is associated with the FIRST
      * recv on the socket since the server's sendmsg) arrives
      * here. Subsequent body reads are plain `read`. */
     let mut len_buf = [0u8; 4];
-    let fd = recvmsg_with_one_fd(socket_fd, &mut len_buf)?;
+    let fds = recvmsg_with_fds(socket_fd, &mut len_buf, max_fds)?;
     let len = u32::from_le_bytes(len_buf);
     if len > MAX_FRAME_BYTES {
         return Err(io::Error::new(io::ErrorKind::InvalidData,
@@ -100,7 +107,7 @@ fn recvmsg_frame(socket_fd: i32) -> io::Result<(Vec<u8>, Option<i32>)> {
      * stream — it's already a unix socket, regular read works. */
     let mut tmp = unsafe_socket_reader(socket_fd);
     tmp.read_exact(&mut body)?;
-    Ok((body, fd))
+    Ok((body, fds))
 }
 
 /* The unsafe is localised to two small helpers below: the cmsg
@@ -116,20 +123,19 @@ mod ffi {
     use std::os::unix::net::UnixStream;
     use std::os::unix::io::FromRawFd;
 
-    /// recvmsg on `socket_fd` to read up to `out.len()` bytes
-    /// AND any SCM_RIGHTS cmsg attached. Returns the fd if one
-    /// was attached. `out` is filled exactly (caller passes
-    /// the right size).
-    pub fn recvmsg_with_one_fd(socket_fd: i32, out: &mut [u8]) -> io::Result<Option<i32>> {
+    /// recvmsg on `socket_fd` to read up to `out.len()` bytes AND up to
+    /// `max_fds` SCM_RIGHTS fds attached. Returns every fd in the cmsg's
+    /// SCM_RIGHTS array (CreateJail sends 1 = [procdesc]; ExecInJail sends
+    /// 2 = [procdesc, pty_master]). `out` is filled exactly.
+    pub fn recvmsg_with_fds(socket_fd: i32, out: &mut [u8], max_fds: usize) -> io::Result<Vec<i32>> {
         let mut iov = libc::iovec {
             iov_base: out.as_mut_ptr() as *mut _,
             iov_len:  out.len(),
         };
 
-        // SAFETY: CMSG_SPACE is a libc inline; safe.
-        let cmsg_space = unsafe {
-            libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32)
-        };
+        let intsz = std::mem::size_of::<libc::c_int>();
+        // SAFETY: CMSG_SPACE is a libc inline; safe. Size for max_fds ints.
+        let cmsg_space = unsafe { libc::CMSG_SPACE((max_fds * intsz) as u32) };
         let mut cmsg_buf: Vec<u8> = vec![0u8; cmsg_space as usize];
 
         let mut msg = libc::msghdr {
@@ -142,10 +148,9 @@ mod ffi {
             msg_flags:       0,
         };
 
-        // SAFETY: msg fields all initialised; iov + cmsg buffers
-        // outlive the recvmsg call. Output bytes are written into
-        // `out` (caller-owned), and any fd in the cmsg becomes a
-        // value we read out and return — no aliasing.
+        // SAFETY: msg fields all initialised; iov + cmsg buffers outlive
+        // the recvmsg call. Output bytes go into `out` (caller-owned); fds
+        // in the cmsg are read out as values — no aliasing.
         let n = unsafe { libc::recvmsg(socket_fd, &mut msg, 0) };
         if n < 0 {
             return Err(io::Error::last_os_error());
@@ -155,25 +160,30 @@ mod ffi {
                 format!("short recvmsg: got {} of {}", n, out.len())));
         }
 
-        // Walk cmsg list looking for SOL_SOCKET / SCM_RIGHTS.
-        let mut fd: Option<i32> = None;
-        // SAFETY: cmsg_buf is valid + correctly sized; CMSG_FIRSTHDR
-        // returns null on empty cmsg, which we handle.
+        // Collect every fd across SCM_RIGHTS cmsgs (one cmsg can carry an
+        // array of fds; count = payload_len / sizeof(int)).
+        let mut fds: Vec<i32> = Vec::new();
+        // SAFETY: cmsg_buf is valid + correctly sized; CMSG_FIRSTHDR returns
+        // null on empty cmsg, which we handle.
         unsafe {
+            let cmsg_len0 = libc::CMSG_LEN(0) as usize;
             let mut cmsg_ptr = libc::CMSG_FIRSTHDR(&msg);
             while !cmsg_ptr.is_null() {
                 let cmsg = &*cmsg_ptr;
                 if cmsg.cmsg_level == libc::SOL_SOCKET
                     && cmsg.cmsg_type == libc::SCM_RIGHTS
                 {
+                    let payload = (cmsg.cmsg_len as usize).saturating_sub(cmsg_len0);
+                    let count = payload / intsz;
                     let data = libc::CMSG_DATA(cmsg_ptr) as *const libc::c_int;
-                    fd = Some(data.read_unaligned());
-                    break;
+                    for i in 0..count {
+                        fds.push(data.add(i).read_unaligned());
+                    }
                 }
                 cmsg_ptr = libc::CMSG_NXTHDR(&msg, cmsg_ptr);
             }
         }
-        Ok(fd)
+        Ok(fds)
     }
 
     /// Duplicate `socket_fd` into a `UnixStream` for later reads.
@@ -192,8 +202,8 @@ mod ffi {
     }
 }
 
-fn recvmsg_with_one_fd(socket_fd: i32, out: &mut [u8]) -> io::Result<Option<i32>> {
-    ffi::recvmsg_with_one_fd(socket_fd, out)
+fn recvmsg_with_fds(socket_fd: i32, out: &mut [u8], max_fds: usize) -> io::Result<Vec<i32>> {
+    ffi::recvmsg_with_fds(socket_fd, out, max_fds)
 }
 
 fn unsafe_socket_reader(socket_fd: i32) -> std::os::unix::net::UnixStream {

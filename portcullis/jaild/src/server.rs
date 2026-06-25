@@ -953,7 +953,7 @@ fn handle_exec_in_jail(
             "[dry-run] exec-in-jail {} (jid {}) path={} uid={} (want_root={})",
             jail.name, jid, req.path, uid, req.want_root
         );
-        return Ok((Response::JailExecStarted { pid: 0 }, Vec::new()));
+        return Ok((Response::JailExecStarted { pid: 0, uid }, Vec::new()));
     }
 
     /* Allocate the pty in the PARENT: we keep `master` to hand back over
@@ -1010,7 +1010,7 @@ fn handle_exec_in_jail(
         "jaild: exec-in-jail {} (jid {}) pid={} pdfd={} master={}",
         jail.name, jid, pdf.pid, pdf.procdesc_fd, master
     );
-    Ok((Response::JailExecStarted { pid: pdf.pid }, vec![pdf.procdesc_fd, master]))
+    Ok((Response::JailExecStarted { pid: pdf.pid, uid }, vec![pdf.procdesc_fd, master]))
 }
 
 fn send_response(
