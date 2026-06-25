@@ -110,6 +110,29 @@ pub enum Request {
         jail_name:    String,
         memoryuse_mb: u64,
     },
+
+    /// The jailed, non-root session launcher (`_ostiarius`) asks portcullisd to
+    /// launch a DECLARED session component (vestibulum, forum-wm, …). portcullisd
+    /// checks the caller holds `session_launch` (its services.d manifest cap),
+    /// looks `component_id` up in the session-component registry — an UNKNOWN id
+    /// is refused, so `_ostiarius` can launch only the declared session set, never
+    /// an arbitrary jail — fills the per-session owner, and forwards `CreateJail`
+    /// to jaild. The procdesc is held by the TCB, not ostiarius. See
+    /// docs/spec/ostiarius-privsep.md.
+    LaunchSessionComponent {
+        component_id: String,
+        owner_uid:    u32,
+        owner_name:   String,
+    },
+
+    /// `_ostiarius` forwards a credential received from vestibulum for portcullisd
+    /// to verify against PAM/shadow — which it can read as root; the hashes never
+    /// leave portcullisd. Same `session_launch` gate. Returns only yes/no + the
+    /// canonical username.
+    VerifyCredential {
+        user:     String,
+        password: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +175,12 @@ pub enum Response {
     /// bypass_policy=true (Allow Once) or call Grant first then
     /// re-issue (Allow Always).
     LaunchNeedsApproval { delta: Vec<String> },
+
+    /// LaunchSessionComponent → the session jail was created. The procdesc is
+    /// held by the TCB; ostiarius gets the identifiers for status/teardown.
+    SessionComponentLaunched { pid: i32, jid: i32, jail_name: String },
+    /// VerifyCredential → the credential is valid; the canonical username.
+    CredentialVerified { user: String },
 }
 
 /// Send one request and read one response over a connected stream.

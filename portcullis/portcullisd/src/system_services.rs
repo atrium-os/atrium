@@ -138,6 +138,16 @@ pub struct Capabilities {
     /// GovernSetRctl caller's peer uid -> this manifest -> a jaild Reap/SetRctl.
     #[serde(default)]
     pub memory_govern: bool,
+
+    /// If true, portcullisd serves this jailed service's session-launcher
+    /// verbs — LaunchSessionComponent (registry-bounded jail creation) and
+    /// VerifyCredential (shadow/PAM check). The inner grant for the jailed,
+    /// non-root session launcher (_ostiarius); granted ONLY to it. The
+    /// session-component registry is the *outer* bound on what it can launch.
+    /// See `docs/spec/ostiarius-privsep.md`. Consumed by
+    /// `main.rs::handle_session`.
+    #[serde(default)]
+    pub session_launch: bool,
 }
 
 fn default_true() -> bool { true }

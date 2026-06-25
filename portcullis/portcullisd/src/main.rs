@@ -235,6 +235,14 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             write_response(&mut writer, &resp)?;
             continue;
         }
+        /* Session-launcher broker verbs — same peer-uid gating shape as the
+         * governor verbs (the caller must be a `session_launch` service, i.e.
+         * the jailed, non-root _ostiarius). docs/spec/ostiarius-privsep.md. */
+        if matches!(req, Request::LaunchSessionComponent { .. } | Request::VerifyCredential { .. }) {
+            let resp = handle_session(uid, req);
+            write_response(&mut writer, &resp)?;
+            continue;
+        }
         let resp = handle(req, &user, &shared);
         write_response(&mut writer, &resp)?;
     }
@@ -408,6 +416,56 @@ fn handle_govern(uid: u32, req: Request) -> Response {
     }
 }
 
+/// Broker a session-launcher request from the jailed, non-root `_ostiarius`.
+/// INNER gate: the peer uid must own a services.d manifest granting
+/// `session_launch` (mirrors `handle_govern`'s `memory_govern`). OUTER bound:
+/// the session-component registry (for launches). docs/spec/ostiarius-privsep.md.
+fn handle_session(uid: u32, req: Request) -> Response {
+    use portcullisd::system_services;
+
+    let authorized = match system_services::load_dir(std::path::Path::new(SERVICES_DIR)) {
+        Ok(outcome) => outcome.manifests.iter().any(|m| {
+            m.capabilities.session_launch
+                && m.exec.as_ref().map_or(false, |e| e.uid == uid)
+        }),
+        Err(e) => return Response::Error { message: format!("services.d load: {e}") },
+    };
+    if !authorized {
+        return Response::Error {
+            message: format!(
+                "cap.session_launch.denied: uid {uid} is not a session-launch service"),
+        };
+    }
+
+    match req {
+        Request::VerifyCredential { user, password } => {
+            // Verify against PAM/shadow — portcullisd is root and can read them;
+            // the hashes never leave this process. Dev stub today (any non-empty
+            // credential, matching ostiarius's D2 authenticate()); the PAM path
+            // lands with the production auth stack. The shadow read happening HERE
+            // rather than in a jailed ostiarius is the whole point.
+            if user.is_empty() || password.is_empty() {
+                Response::Error { message: "authentication failed".into() }
+            } else {
+                Response::CredentialVerified { user }
+            }
+        }
+        Request::LaunchSessionComponent { component_id, .. } => {
+            // Registry-bounded launch: look component_id up in the session-
+            // component registry, fill the per-session owner, forward CreateJail
+            // to jaild. The registry loader is step 3 (not yet wired); until then
+            // ostiarius keeps its direct-jaild path. Refusing is safe + additive —
+            // nothing depends on this verb yet.
+            Response::Error {
+                message: format!(
+                    "LaunchSessionComponent({component_id}): session-component \
+                     registry not yet wired — see docs/spec/ostiarius-privsep.md step 3"),
+            }
+        }
+        _ => Response::Error { message: "not a session request".into() },
+    }
+}
+
 fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
     match req {
         Request::Hello { .. } => Response::Error {
@@ -486,6 +544,10 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
         Request::GovernReap { .. } | Request::GovernSetRctl { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_govern). */
             message: "internal: governor verbs must go through handle_govern".into(),
+        },
+        Request::LaunchSessionComponent { .. } | Request::VerifyCredential { .. } => Response::Error {
+            /* Caught by serve() before reaching here (routed to handle_session). */
+            message: "internal: session verbs must go through handle_session".into(),
         },
     }
 }
