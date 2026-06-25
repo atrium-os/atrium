@@ -13,7 +13,7 @@
 # per-cap mounts are needed; the app's caps are audit metadata, not mounts.
 
 enabled       = true
-name          = "org.atrium.vestibulum"
+name          = "app-org-atrium-vestibulum"
 path          = "/var/lib/atrium/jails/org.atrium.vestibulum"
 children_max  = 0
 devfs_ruleset = 4

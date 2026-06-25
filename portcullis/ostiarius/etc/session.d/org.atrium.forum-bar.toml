@@ -13,7 +13,7 @@
 # per-cap mounts are needed; the app's caps are audit metadata, not mounts.
 
 enabled       = true
-name          = "org.atrium.forum-bar"
+name          = "app-org-atrium-forum-bar"
 path          = "/var/lib/atrium/jails/org.atrium.forum-bar"
 children_max  = 0
 devfs_ruleset = 4

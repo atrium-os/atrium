@@ -138,8 +138,8 @@ fn main() {
             .unwrap_or_else(|_| format!("/tmp/ostiarius-seat-{}", std::process::id()));
         let _ = std::fs::remove_file(&seat);
         let mut launcher = JaildLauncher::default();
-        if let Ok(j) = std::env::var("JAILD_SOCK") { launcher.jaild_sock = j; }
-        if let Ok(p) = std::env::var("ATRIUM_PUBLISHERS") { launcher.publishers = p; }
+        // De-rooted: ostiarius launches via the portcullisd broker, not jaild.
+        if let Ok(b) = std::env::var("BROKER_SOCK") { launcher.broker_sock = b; }
         let mut o = Ostiarius::new(launcher).with_seat_path(seat); // stub auth (no with_pam)
         // Gate on the display server being READY before booting the login UI: as
         // the supervisor, ostiarius sequences startup rather than launching a

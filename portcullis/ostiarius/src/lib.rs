@@ -389,113 +389,71 @@ const SESSION_MOUNTPOINTS: &[&str] = &[
 /// kmem/mem/pci/gpu). Must be in the jaild policy's `devfs_rulesets.allowed_ids`.
 const SESSION_DEVFS_RULESET: u32 = 4;
 
+/// Launches session components through the portcullisd BROKER (no longer jaild
+/// directly — that needs root). ostiarius runs jailed + non-root as _ostiarius;
+/// the broker holds the session-component registry (trust), allocates+registers
+/// the per-session uid, forwards CreateJail to jaild, and HOLDS the procdesc.
+/// So ostiarius keeps zero of the sig/uid/mount/procdesc machinery it used to.
+/// See docs/spec/ostiarius-privsep.md.
 pub struct JaildLauncher {
-    pub jaild_sock: String,
-    pub publishers: String,
-    /// Held procdesc fds, per app-id. jaild `pdfork`s without `PD_DAEMON` and
-    /// passes the procdesc back over SCM_RIGHTS; the kernel keeps the jailed
-    /// process alive only while someone holds that fd. As the session
-    /// supervisor, ostiarius holds them here for the session's lifetime —
-    /// dropping one (on `teardown`/logout) lets the kernel reap that app. This
-    /// is THE reason supervision lives in ostiarius, not the one-shot launcher.
-    held: std::collections::HashMap<String, std::os::fd::OwnedFd>,
+    /// The portcullisd broker socket (the per-cap path mounted into ostiarius's
+    /// jail). $BROKER_SOCK overrides; default is the canonical service path.
+    pub broker_sock: String,
 }
 
 impl Default for JaildLauncher {
     fn default() -> Self {
         JaildLauncher {
-            jaild_sock: "/var/run/atrium/jaild.sock".into(),
-            publishers: "/etc/atrium/publishers".into(),
-            held: std::collections::HashMap::new(),
+            broker_sock: "/atrium/sockets/portcullis.sock".into(),
         }
     }
 }
 
 impl Launcher for JaildLauncher {
     fn launch(&mut self, s: &LaunchSpec) -> Result<i32, String> {
-        use jaild::protocol::{CreateJailRequest, EnvPair, ExecSpec, NetworkConfig, Request, Response};
-        use portcullisd::jaild_client::Client;
-
-        // 1. verify the manifest is signed by a trusted publisher.
-        let manifest = std::fs::read(&s.manifest).map_err(|e| format!("read {:?}: {e}", s.manifest))?;
-        let sig = read_sig(&s.sig);
-        let keys = load_publishers(&self.publishers);
-        if keys.is_empty() {
-            return Err(format!("no trusted publishers in {}", self.publishers));
-        }
-        portcullis_sig::verify_trusted(&manifest, &sig, &keys)
-            .map_err(|e| format!("{} not signed by a trusted publisher: {e:?}", s.app_id))?;
-
-        // 2. allocate a dedicated uid; 3. register uid → (owner, app-id).
-        let uid = portcullis_peer::allocate(portcullis_peer::DEFAULT_REGISTRY);
-        portcullis_peer::register(portcullis_peer::DEFAULT_REGISTRY, uid, &s.owner, &s.app_id)
-            .map_err(|e| format!("register uid {uid}: {e}"))?;
-
-        // 3b. Build the per-jail rootfs (the §9.1 isolation fix): create the
-        // mountpoint dirs, then ask jaild for the standard nullfs mounts + a
-        // per-jail devfs. Only for a REAL root; a "/" path (a fallback) stays bare.
-        let (mounts, devfs_ruleset) = if s.jail_path != "/" {
-            for d in SESSION_MOUNTPOINTS {
-                let _ = std::fs::create_dir_all(format!("{}/{d}", s.jail_path));
-            }
-            (session_rootfs_mounts(), SESSION_DEVFS_RULESET)
-        } else {
-            (Vec::new(), 0)
-        };
-
-        // 4. ask jaild to jail + drop-to-uid + exec.
-        let req = Request::CreateJail(CreateJailRequest {
-            name: jail_name(&s.app_id),
-            path: s.jail_path.clone(),
-            children_max: 0,
-            mounts,
-            devfs_ruleset,
-            network: NetworkConfig::Disable,
-            exec: Some(ExecSpec {
-                path: s.bin.clone(),
-                // argv[0] is the program itself (jaild requires a non-empty argv),
-                // followed by any declared args.
-                argv: std::iter::once(s.bin.clone()).chain(s.argv.iter().cloned()).collect(),
-                env: vec![EnvPair { key: "PATH".into(), value: "/bin:/usr/bin:/usr/local/bin".into() }],
-                uid,
-                gid: uid,
-            }),
-        });
-        let mut c = Client::connect(&self.jaild_sock).map_err(|e| format!("connect jaild: {e}"))?;
-        match c.send(&req) {
-            Ok((Response::JailCreated(r), pdfd)) => {
-                // Retain the procdesc fd for the session's lifetime — without
-                // this the kernel SIGKILLs the jailed app the moment the last fd
-                // closes. (A later refinement: kqueue EVFILT_PROCDESC on these
-                // for exit-notification + the manifest's restart policy.)
-                if let Some(fd) = pdfd {
-                    use std::os::fd::FromRawFd;
-                    // SAFETY: `fd` is the procdesc jaild passed via SCM_RIGHTS.
-                    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-                    self.held.insert(s.app_id.clone(), owned);
-                }
-                Ok(r.pid)
-            }
-            Ok((resp, _)) => Err(format!("jaild refused: {resp:?}")),
-            Err(e) => Err(format!("jaild send: {e}")),
+        // De-rooted launch: ask the portcullisd broker to create the session jail.
+        // The broker (root TCB) owns the trust (the session.d registry, keyed by
+        // the jail name), the uid allocate+register, the CreateJail->jaild forward,
+        // and the procdesc hold — so ostiarius, jailed + non-root, sends only the
+        // component_id and the owner. The publisher-sig + per-jail-rootfs machinery
+        // that lived here is gone (replaced by the operator-curated registry +
+        // root-installed component binaries). See docs/spec/ostiarius-privsep.md.
+        let resp = self.broker(Request::LaunchSessionComponent {
+            component_id: jail_name(&s.app_id),
+            owner_name:   s.owner.clone(),
+        })?;
+        match resp {
+            Response::SessionComponentLaunched { pid, .. } => Ok(pid),
+            Response::Error { message } => Err(format!("broker launch: {message}")),
+            other => Err(format!("broker launch: {other:?}")),
         }
     }
 
     fn teardown(&mut self, app_id: &str) -> Result<(), String> {
-        use jaild::protocol::{Request, Response};
-        use portcullisd::jaild_client::Client;
-        // Drop the held procdesc (closing it lets the kernel reap the jailed
-        // process), then RemoveJail to clear the jail entry.
-        self.held.remove(app_id);
-        // RemoveJail by name (the exec'd-jail case): idempotent — a jail already
-        // gone returns success. The component's session-jail is named on launch.
-        let req = Request::RemoveJail { jid: None, name: Some(jail_name(app_id)) };
-        let mut c = Client::connect(&self.jaild_sock).map_err(|e| format!("connect jaild: {e}"))?;
-        match c.send(&req) {
-            Ok((Response::SyscallFailed { msg, .. }, _)) => Err(format!("jaild teardown: {msg}")),
-            Ok(_) => Ok(()),
-            Err(e) => Err(format!("jaild teardown send: {e}")),
+        match self.broker(Request::TeardownSessionComponent { jail_name: jail_name(app_id) })? {
+            Response::Ok => Ok(()),
+            Response::Error { message } => Err(format!("broker teardown: {message}")),
+            other => Err(format!("broker teardown: {other:?}")),
         }
+    }
+}
+
+use portcullis_ipc::{Request, Response};
+
+impl JaildLauncher {
+    /// One broker round-trip: connect, Hello-handshake, send `req`, return the
+    /// reply. portcullisd getpeereids the caller — only `_ostiarius` (holding the
+    /// `session_launch` cap) is served the session verbs.
+    fn broker(&self, req: Request) -> Result<Response, String> {
+        use portcullis_ipc::{round_trip, PROTO_VERSION};
+        use std::os::unix::net::UnixStream;
+        let mut c = UnixStream::connect(&self.broker_sock)
+            .map_err(|e| format!("connect broker {}: {e}", self.broker_sock))?;
+        match round_trip(&mut c, &Request::Hello { version: PROTO_VERSION }) {
+            Ok(Response::Hello { .. }) => {}
+            other => return Err(format!("broker handshake: {other:?}")),
+        }
+        round_trip(&mut c, &req).map_err(|e| format!("broker send: {e}"))
     }
 }
 

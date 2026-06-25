@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 portcullis-peer = { path = "../portcullis-peer" }
 portcullis-sig  = { path = "../portcullis-sig" }
+portcullis-ipc  = { path = "../portcullis-ipc" }
 portcullisd     = { path = "../portcullisd" }
 jaild           = { path = "../jaild" }
 serde           = { version = "1", features = ["derive"] }
