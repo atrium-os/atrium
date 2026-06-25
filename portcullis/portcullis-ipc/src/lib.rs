@@ -121,7 +121,6 @@ pub enum Request {
     /// docs/spec/ostiarius-privsep.md.
     LaunchSessionComponent {
         component_id: String,
-        owner_uid:    u32,
         owner_name:   String,
     },
 

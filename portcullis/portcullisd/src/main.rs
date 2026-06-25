@@ -463,8 +463,8 @@ fn handle_session(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
                 Response::CredentialVerified { user }
             }
         }
-        Request::LaunchSessionComponent { component_id, owner_uid, .. } =>
-            launch_session_component(&component_id, owner_uid, shared),
+        Request::LaunchSessionComponent { component_id, owner_name } =>
+            launch_session_component(&component_id, &owner_name, shared),
         Request::TeardownSessionComponent { jail_name } =>
             teardown_session_component(&jail_name, shared),
         _ => Response::Error { message: "not a session request".into() },
@@ -475,7 +475,7 @@ fn handle_session(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
 /// registry (unknown → refused, so `_ostiarius` is confined to the declared set),
 /// fill the per-session owner uid, forward `CreateJail` to jaild, and HOLD the
 /// returned procdesc in daemon state so the persist=0 jail stays alive.
-fn launch_session_component(component_id: &str, owner_uid: u32,
+fn launch_session_component(component_id: &str, owner_name: &str,
                             shared: &Mutex<Tenants>) -> Response {
     use portcullisd::{jaild_client::Client, system_services};
     use std::os::fd::FromRawFd;
@@ -490,8 +490,17 @@ fn launch_session_component(component_id: &str, owner_uid: u32,
             "session-component.unknown: {component_id:?} not declared in {SESSION_DIR}") },
     };
     let mut create = manifest.to_create_request();
-    // The only ostiarius-supplied input: the allocated per-session uid overrides
-    // the manifest placeholder. Validated by jaild against its uid policy.
+    // Allocate + register the per-session uid HERE (in the TCB): the registry
+    // write to root-owned /var/run/atrium/app-registry stays out of jailed
+    // _ostiarius, which only supplied owner_name. Reuse the existing binding for
+    // this (owner, component) if any, else allocate a fresh 50000+ uid.
+    let reg = portcullis_peer::DEFAULT_REGISTRY;
+    let owner_uid = portcullis_peer::uid_for_app(reg, owner_name, component_id)
+        .unwrap_or_else(|| {
+            let u = portcullis_peer::allocate(reg);
+            let _ = portcullis_peer::register(reg, u, owner_name, component_id);
+            u
+        });
     if let Some(exec) = create.exec.as_mut() {
         exec.uid = owner_uid;
         exec.gid = owner_uid;
