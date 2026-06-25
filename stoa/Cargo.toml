@@ -4,6 +4,7 @@ members = [
     "stoa-proto",
     "stoa-net",
     "stoa-spawn",
+    "stoa-term",
     "stoa",
 ]
 

@@ -1,0 +1,17 @@
+[package]
+name        = "stoa-term"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+description = "Server-side terminal grid model for Stoa (S2): a VT/ANSI emulator that turns pty output into an authoritative screen grid (cells + cursor + attributes). The substrate for StateDiff (§3.3), multi-client coherence, and the SSP predictor. OS-agnostic."
+
+[lib]
+name = "stoa_term"
+path = "src/lib.rs"
+
+[dependencies]
+# Permissive (Apache-2.0/MIT), pure-Rust VT parser state machine (Alacritty's).
+# We build the grid/cursor/attributes on top via its Perform trait; it has no
+# OS deps and does no I/O — an algorithm crate, like sha2.
+vte = "0.13"
