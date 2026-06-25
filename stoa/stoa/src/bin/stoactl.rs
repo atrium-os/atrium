@@ -41,6 +41,14 @@ fn main() {
             }
             attach(&name, host.as_deref(), jail.as_deref());
         }
+        Some("list") => list_sessions(),
+        Some("kill") => match argv.get(1) {
+            Some(name) => kill_session(name),
+            None => {
+                eprintln!("usage: stoactl kill <name>");
+                std::process::exit(2);
+            }
+        },
         Some("-h") | Some("--help") | Some("help") => usage(),
         Some(other) => {
             eprintln!("stoactl: unknown command {other:?}");
@@ -50,16 +58,65 @@ fn main() {
     }
 }
 
+/// One control-socket request/reply against the local stoad. Returns the
+/// reply body (lines).
+fn ctl_request(line: &str) -> Result<String, String> {
+    use std::io::{Read, Write};
+    let ctl = default_ctl();
+    let mut stream = UnixStream::connect(&ctl)
+        .map_err(|e| format!("connect {ctl}: {e} (is stoad running?)"))?;
+    stream
+        .write_all(format!("{line}\n").as_bytes())
+        .map_err(|e| format!("send: {e}"))?;
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).map_err(|e| format!("read: {e}"))?;
+    Ok(reply)
+}
+
+fn list_sessions() {
+    match ctl_request("LIST") {
+        Ok(body) => {
+            let names: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+            if names.is_empty() {
+                println!("(no sessions)");
+            } else {
+                for n in names {
+                    println!("{n}");
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("stoactl: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn kill_session(name: &str) {
+    match ctl_request(&format!("KILL {name}")) {
+        Ok(body) if body.trim_start().starts_with("OK") => println!("killed {name}"),
+        Ok(body) => {
+            eprintln!("stoactl: kill {name}: {}", body.trim());
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("stoactl: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn usage() {
     eprintln!(
-        "usage: stoactl attach <name> [--host user@host]\n\
+        "usage:\n\
+         \x20 stoactl attach <name> [--host user@host] [--jail <id>]\n\
+         \x20 stoactl list                 list sessions on the local stoad\n\
+         \x20 stoactl kill <name>          kill a session\n\
          \n\
-         Mint/resume the named stoad session and bridge the terminal over UDP.\n\
-         Without --host, mints against the local stoad ($STOA_CTL). With\n\
-         --host, runs `ssh user@host stoa-shell <name>` and connects to the\n\
-         minted UDP port on that host.\n\
-         \n\
-         Ctrl-] detaches (shell keeps running); the shell exiting ends the client."
+         attach mints/resumes the session and bridges the terminal over UDP.\n\
+         Without --host, talks to the local stoad ($STOA_CTL); with --host,\n\
+         runs `ssh user@host stoa-shell <name>`. --jail <id> jexecs into a\n\
+         running jail. Ctrl-B d / Ctrl-] detaches; Ctrl-B r redraws."
     );
 }
 

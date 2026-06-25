@@ -100,12 +100,15 @@ fn main() {
     }
 }
 
-/// Serve one `MINT <name>` request, then close. Reply: `<port> <keyhex>`.
+/// Serve one control-socket command, then close. Commands:
+/// - `MINT <name> [target]` → `<port> <keyhex>` (mint/resume a session)
+/// - `LIST`                 → one live session name per line
+/// - `KILL <name>`          → `OK` / `ERR not found`
 fn handle_mint(stream: UnixStream, reg: Reg) {
     let (mut uid, mut gid): (libc::uid_t, libc::gid_t) = (0, 0);
     // SAFETY: getpeereid on a connected unix-socket fd.
     if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
-        eprintln!("stoad: getpeereid failed; refusing mint");
+        eprintln!("stoad: getpeereid failed; refusing request");
         return;
     }
 
@@ -114,18 +117,62 @@ fn handle_mint(stream: UnixStream, reg: Reg) {
     if reader.read_line(&mut line).is_err() {
         return;
     }
-    // `MINT <name> [target]` — target is "session" (default) or "jail:<id>".
     let mut parts = line.split_whitespace();
-    if parts.next() != Some("MINT") {
-        let _ = (&stream).write_all(b"ERR expected MINT\n");
-        return;
+    match parts.next() {
+        Some("MINT") => {
+            // `MINT <name> [target]` — target "session" (default) or "jail:<id>".
+            let name = parts.next().unwrap_or("default").to_string();
+            let target = parts.next().unwrap_or("session").to_string();
+            let (port, key) = mint(&reg, &name, &target);
+            eprintln!("stoad: mint {name:?} target={target} → port {port} for uid {uid}");
+            let _ = (&stream).write_all(format!("{port} {}\n", to_hex(&key)).as_bytes());
+        }
+        Some("LIST") => {
+            let names = list_sessions(&reg);
+            let body = if names.is_empty() { String::new() } else { format!("{}\n", names.join("\n")) };
+            let _ = (&stream).write_all(body.as_bytes());
+        }
+        Some("KILL") => {
+            let ok = match parts.next() {
+                Some(name) => kill_session(&reg, name),
+                None => false,
+            };
+            let _ = (&stream).write_all(if ok { b"OK\n" } else { b"ERR not found\n" });
+        }
+        _ => {
+            let _ = (&stream).write_all(b"ERR unknown command\n");
+        }
     }
-    let name = parts.next().unwrap_or("default").to_string();
-    let target = parts.next().unwrap_or("session").to_string();
+}
 
-    let (port, key) = mint(&reg, &name, &target);
-    eprintln!("stoad: mint {name:?} target={target} → port {port} for uid {uid}");
-    let _ = (&stream).write_all(format!("{port} {}\n", to_hex(&key)).as_bytes());
+/// Names of all live (not-dead) sessions.
+fn list_sessions(reg: &Reg) -> Vec<String> {
+    let map = reg.lock().unwrap();
+    let mut names: Vec<String> = map
+        .iter()
+        .filter(|(_, s)| !s.dead.load(Ordering::SeqCst))
+        .map(|(n, _)| n.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Kill a session: HUP its shell (the pty EOF leads the reader to clean up
+/// + send Bye) and mark it dead. Returns false if no such live session.
+fn kill_session(reg: &Reg, name: &str) -> bool {
+    let map = reg.lock().unwrap();
+    match map.get(name) {
+        Some(s) if !s.dead.load(Ordering::SeqCst) => {
+            let inner = s.inner.lock().unwrap();
+            if let Some(sh) = &inner.shell {
+                let _ = sh.kill(libc::SIGHUP);
+            }
+            s.dead.store(true, Ordering::SeqCst);
+            eprintln!("stoad: killed session {name:?}");
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Find-and-rekey or create the session; return its `{port, key}`.
