@@ -94,12 +94,26 @@ pub enum Request {
 }
 
 /// Request body for [`Request::ExecInJail`].
+///
+/// The uid is NOT caller-supplied: jaild runs the process as the jail's
+/// own recorded app-uid (non-root) by default, or as root iff `want_root`
+/// — which portcullisd only sets after the `jail_exec_root` capability
+/// check. This keeps "non-root by default, root is a gated escalation"
+/// enforced at the kernel boundary, not just in the broker.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ExecInJailRequest {
     /// Name of the EXISTING jaild-created jail to attach into.
     pub name: String,
-    /// What to run (path, argv, env, and the uid/gid to drop to).
-    pub exec: ExecSpec,
+    /// Binary to exec inside the jail (e.g. `/bin/sh`).
+    pub path: String,
+    /// argv for the exec'd process.
+    pub argv: Vec<String>,
+    /// Environment for the exec'd process.
+    #[serde(default)]
+    pub env: Vec<EnvPair>,
+    /// Run as root inside the jail instead of the jail's app-uid.
+    #[serde(default)]
+    pub want_root: bool,
     /// Initial pty window size.
     pub cols: u16,
     pub rows: u16,

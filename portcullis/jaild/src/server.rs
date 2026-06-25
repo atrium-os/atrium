@@ -880,7 +880,7 @@ fn handle_create_with_exec(
      * (looks up the jail's chroot path) and for lo0-alias
      * cleanup at RemoveJail. Exec'd jails use jid sentinel 0;
      * handle_remove special-cases this. */
-    state.add(&req.name, 0, lo0_alias, &req.path);
+    state.add_exec(&req.name, 0, lo0_alias, &req.path, exec.uid, exec.gid);
     if let Err(e) = state.save(state_path) {
         warn!("jaild: state save after exec'd-jail create: {e}");
     }
@@ -943,10 +943,15 @@ fn handle_exec_in_jail(
         }
     };
 
+    /* uid/gid: the jail's own app-uid (non-root) by default, or root iff
+     * the caller (portcullisd, post-jail_exec_root) asked. NOT from the
+     * request's uid — there isn't one. */
+    let (uid, gid) = if req.want_root { (0, 0) } else { (jail.uid, jail.gid) };
+
     if dry_run {
         info!(
-            "[dry-run] exec-in-jail {} (jid {}) path={} uid={}",
-            jail.name, jid, req.exec.path, req.exec.uid
+            "[dry-run] exec-in-jail {} (jid {}) path={} uid={} (want_root={})",
+            jail.name, jid, req.path, uid, req.want_root
         );
         return Ok((Response::JailExecStarted { pid: 0 }, Vec::new()));
     }
@@ -984,20 +989,16 @@ fn handle_exec_in_jail(
             eprintln!("jaild-child: jail_attach({jid}): {e}");
             ffi::child_exit(102);
         }
-        if let Err(e) = ffi::drop_privileges(req.exec.uid, req.exec.gid) {
-            eprintln!("jaild-child: drop_privileges({}, {}): {e}", req.exec.uid, req.exec.gid);
+        if let Err(e) = ffi::drop_privileges(uid, gid) {
+            eprintln!("jaild-child: drop_privileges({uid}, {gid}): {e}");
             ffi::child_exit(103);
         }
-        let env_pairs: Vec<(String, String)> = req
-            .exec
-            .env
-            .iter()
-            .map(|p| (p.key.clone(), p.value.clone()))
-            .collect();
-        match ffi::execve(&req.exec.path, &req.exec.argv, &env_pairs) {
+        let env_pairs: Vec<(String, String)> =
+            req.env.iter().map(|p| (p.key.clone(), p.value.clone())).collect();
+        match ffi::execve(&req.path, &req.argv, &env_pairs) {
             Ok(_) => unreachable!("execve returned Ok on success"),
             Err(e) => {
-                eprintln!("jaild-child: execve {}: {e}", req.exec.path);
+                eprintln!("jaild-child: execve {}: {e}", req.path);
                 ffi::child_exit(104);
             }
         }

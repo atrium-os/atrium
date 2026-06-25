@@ -140,6 +140,24 @@ pub enum Request {
     TeardownSessionComponent {
         jail_name: String,
     },
+
+    /// A jailed, non-root broker client (e.g. `_stoad`) asks portcullisd to
+    /// exec a shell INSIDE an existing jaild-created jail on a pty — Stoa's
+    /// jail-target sessions / `jexec` reimagined (stoa.md §4.5). portcullisd
+    /// gates on the `jail_exec` capability (and `jail_exec_root` if
+    /// `want_root`), forwards `ExecInJail` to jaild, and relays the two fds
+    /// jaild returns — `[procdesc, pty_master]` — back to the caller over
+    /// SCM_RIGHTS. The shell runs as the jail's own app-uid (non-root)
+    /// unless `want_root`. Reply: `JailExecStarted` then the fds.
+    ExecInJail {
+        jail_name: String,
+        path:      String,
+        argv:      Vec<String>,
+        #[serde(default)]
+        want_root: bool,
+        cols:      u16,
+        rows:      u16,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +206,12 @@ pub enum Response {
     SessionComponentLaunched { pid: i32, jid: i32, jail_name: String },
     /// VerifyCredential → the credential is valid; the canonical username.
     CredentialVerified { user: String },
+
+    /// ExecInJail → the shell is running inside the jail on a pty. Two fds
+    /// follow over SCM_RIGHTS, in order: `[procdesc, pty_master]`. `uid` is
+    /// the uid the shell actually runs as inside the jail (the jail's
+    /// app-uid, or 0 if `want_root` was granted) — for the caller's logs.
+    JailExecStarted { pid: i32, uid: u32 },
 }
 
 /// Send one request and read one response over a connected stream.

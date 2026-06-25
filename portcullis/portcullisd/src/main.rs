@@ -666,6 +666,14 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
             /* Caught by serve() before reaching here (routed to handle_session). */
             message: "internal: session verbs must go through handle_session".into(),
         },
+        Request::ExecInJail { .. } => Response::Error {
+            /* Protocol + caps (jail_exec / jail_exec_root) are in place and the
+             * jaild ExecInJail primitive is ready; the portcullisd fd-relay
+             * handler (forward to jaild, relay [procdesc, pty_master] to the
+             * caller over SCM_RIGHTS) is the next step. See stoa.md §4.5. */
+            message: "ExecInJail broker not yet wired (jaild primitive ready; \
+                      portcullisd fd-relay handler pending)".into(),
+        },
     }
 }
 

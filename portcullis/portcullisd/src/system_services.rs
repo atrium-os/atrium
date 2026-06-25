@@ -148,6 +148,22 @@ pub struct Capabilities {
     /// `main.rs::handle_session`.
     #[serde(default)]
     pub session_launch: bool,
+
+    /// If true, portcullisd serves this jailed service's `ExecInJail` verb —
+    /// exec a shell inside an EXISTING jaild-created jail on a pty (Stoa's
+    /// jail-target sessions; stoa.md §4.5). Granted to the jailed, non-root
+    /// session broker (`_stoad`). The shell runs as the jail's own app-uid
+    /// (non-root); `jail_exec_root` is required additionally to run as root
+    /// inside the jail. Consumed by `main.rs`.
+    #[serde(default)]
+    pub jail_exec: bool,
+
+    /// If true, this service may request `want_root` on `ExecInJail` — a
+    /// root shell inside the target jail. A strictly higher grant than
+    /// `jail_exec`; default-deny. Without it, `want_root` requests are
+    /// refused even from a `jail_exec` holder.
+    #[serde(default)]
+    pub jail_exec_root: bool,
 }
 
 fn default_true() -> bool { true }

@@ -68,6 +68,14 @@ pub struct JailRecord {
     /// in that case.
     #[serde(default)]
     pub path:            String,
+    /// The uid/gid the jail's exec'd process runs as (its dedicated
+    /// app-uid). 0 for create-without-exec jails and pre-existing
+    /// records. `ExecInJail` defaults to this so a jexec shell runs as
+    /// the jail's own (non-root) uid — the app's exact view (stoa.md §4.5).
+    #[serde(default)]
+    pub uid:             u32,
+    #[serde(default)]
+    pub gid:             u32,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -148,12 +156,29 @@ impl PersistentState {
     }
 
     pub fn add(&mut self, name: &str, jid: i32, lo0_alias: Option<String>, path: &str) {
+        self.add_exec(name, jid, lo0_alias, path, 0, 0);
+    }
+
+    /// Like [`add`](Self::add) but records the exec'd process's app
+    /// uid/gid, so [`crate::protocol::Request::ExecInJail`] can run a
+    /// jexec shell as the jail's own (non-root) uid.
+    pub fn add_exec(
+        &mut self,
+        name: &str,
+        jid: i32,
+        lo0_alias: Option<String>,
+        path: &str,
+        uid: u32,
+        gid: u32,
+    ) {
         self.jails.push(JailRecord {
             name: name.to_string(),
             jid,
             created_at_unix: now_unix(),
             lo0_alias,
             path: path.to_string(),
+            uid,
+            gid,
         });
         self.written_at_unix = now_unix();
     }
