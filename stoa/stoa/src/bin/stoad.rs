@@ -212,18 +212,82 @@ fn parse_target(target: &str) -> Target {
     }
 }
 
-/// Spawn the shell for a session target: SessionJail via DirectSpawner;
-/// Jail(id) via the portcullisd BrokerSpawner (FreeBSD only).
+/// Resolve a [`Target::SessionJail`] to its concrete spawn target.
+///
+/// Three cases, in order:
+/// 1. `$STOA_SESSION_JAIL` names a jail → route the session through the
+///    broker into that jail (broker-routed, correct on a jailed stoad).
+/// 2. stoad is itself **jailed** but no session jail is configured → ERROR.
+///    A jailed stoad must never `forkpty` a session shell in its OWN jail
+///    (`atrium-stoad`, the wrong jail) — refuse instead of doing the wrong
+///    thing. The operator sets `STOA_SESSION_JAIL`, or the client uses
+///    `--jail`.
+/// 3. stoad is **not** jailed (dev/macOS) → `Target::SessionJail`, i.e.
+///    `DirectSpawner` `forkpty`s as the current user, no jail.
+///
+/// NOTE: one configured jail serves all sessions for now — operator-scoped,
+/// not yet per-user. The seam generalizes: when the session model wires
+/// per-user session jails, it sets this per session (stoa.md §4.5, §17).
+fn resolve_session_target() -> std::io::Result<Target> {
+    if let Ok(j) = std::env::var("STOA_SESSION_JAIL") {
+        if !j.is_empty() {
+            return Ok(Target::Jail(j));
+        }
+    }
+    if stoad_is_jailed() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session target on a jailed stoad: set STOA_SESSION_JAIL or attach with --jail \
+             (a jailed stoad will not run a session shell in its own jail)",
+        ));
+    }
+    Ok(Target::SessionJail)
+}
+
+/// Is this stoad process itself running inside a jail? (`security.jail.jailed`
+/// = 1 in a jail.) On non-FreeBSD (the macOS dev host) we're never jailed.
+fn stoad_is_jailed() -> bool {
+    #[cfg(target_os = "freebsd")]
+    {
+        let mut jailed: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>();
+        let name = c"security.jail.jailed";
+        // SAFETY: sysctlbyname reads the int into `jailed`/`len`.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                &mut jailed as *mut _ as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        rc == 0 && jailed != 0
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        false
+    }
+}
+
+/// Spawn the shell for a session target: `Jail(id)` via the portcullisd
+/// `BrokerSpawner` (FreeBSD); `SessionJail` via [`resolve_session_target`]
+/// (DirectSpawner when unjailed, broker when a session jail is configured,
+/// error on a jailed stoad with none).
 fn spawn_for(target: &Target) -> std::io::Result<PtyShell> {
+    let resolved = match target {
+        Target::SessionJail => resolve_session_target()?,
+        Target::Jail(_) => target.clone(),
+    };
     let spec = SpawnSpec {
-        target: target.clone(),
+        target: resolved.clone(),
         cmd: Vec::new(),
         cols: 80,
         rows: 24,
         cwd: None,
         env: Vec::new(),
     };
-    match target {
+    match resolved {
         Target::SessionJail => DirectSpawner::new().spawn(&spec),
         Target::Jail(_) => spawn_broker(&spec),
     }

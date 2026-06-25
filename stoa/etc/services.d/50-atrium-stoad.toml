@@ -57,6 +57,11 @@ gid  = 50094
 [[exec.env]]
 key   = "STOA_CTL"                                 # ctl socket in the shared dir (reachable by stoa-shell)
 value = "/atrium/sockets/stoad/stoad.ctl"          # STOA_BROKER defaults to /atrium/sockets/portcullis.sock
+# Optional: STOA_SESSION_JAIL = <jail name> routes a plain `attach <name>`
+# (no --jail) through the broker into that jail. Unset (as here): a jailed
+# stoad REFUSES the session target rather than forkpty-ing a shell in its
+# OWN jail — clients use `--jail <id>` until a real per-user session jail is
+# wired (stoa.md §4.5). Add another [[exec.env]] block to set it.
 
 [capabilities]
 jail_exec = true   # portcullisd serves this jail's ExecInJail verb (stoactl --jail)

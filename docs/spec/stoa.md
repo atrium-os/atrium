@@ -19,12 +19,14 @@ Last updated: 2026-06-25.
 > mint key rides the SSH channel mosh-style, not yet KDF'd from the SSH
 > session id), S2 multiplexer (§4 — today one window, raw-byte payloads),
 > S3 Tessera scrollback (§5 — survives client disconnect, not yet `stoad`
-> restart). **Caveat for the jailed deployment:** the `SessionJail` target
-> (plain `attach <name>`) still uses `DirectSpawner`, which `forkpty`s
-> inside *stoad's own* jail — wrong for a real user session. A jailed stoad
-> must route `SessionJail` through the broker too (LaunchSessionComponent /
-> the user's session jail), like `--jail` does; only the jail-target path
-> is broker-routed today.
+> restart). **Jailed `SessionJail` handling (fixed 2026-06-25, verified
+> live):** a jailed stoad must not `forkpty` a session shell in its *own*
+> jail. `resolve_session_target` now: routes `SessionJail` through the
+> broker into `$STOA_SESSION_JAIL` if set; else, if stoad is itself jailed
+> (`security.jail.jailed`), **refuses** with a clear message (use `--jail`,
+> or configure a session jail); else (dev/unjailed) `DirectSpawner` as the
+> user. `$STOA_SESSION_JAIL` is one operator-scoped jail for now — the seam
+> generalizes to a per-user session jail when the session model wires it.
 
 The piece of Atrium that turns "ssh in and run tmux" into a single
 coherent service. **Stoa owns long-lived shell sessions on the
