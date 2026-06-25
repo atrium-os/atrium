@@ -194,6 +194,52 @@ pub fn render_composite(
     out.into_bytes()
 }
 
+/// Composite several panes into one authoritative [`Grid`] — the same blit
+/// as [`render_composite`] but producing grid state instead of bytes. This
+/// is what the server diffs ([`crate::StateDiff::between`]) to stream a
+/// window to the client: one Grid per window whether it has one pane or
+/// many, so the sync path never special-cases panes.
+pub fn compose_grid(
+    cols: u16,
+    rows: u16,
+    panes: &[PaneView],
+    vdivs: &[u16],
+    hdivs: &[u16],
+    cursor: (u16, u16),
+) -> Grid {
+    let mut g = Grid::new(cols, rows);
+    for p in panes {
+        let pg = p.grid;
+        for r in 0..pg.rows() {
+            let wr = p.top + r;
+            if wr >= rows {
+                break;
+            }
+            let avail = cols.saturating_sub(p.left);
+            let n = pg.cols().min(avail);
+            if n > 0 {
+                g.write_run(wr, p.left, &pg.row(r)[..n as usize]);
+            }
+        }
+    }
+    let vdiv = Cell { c: '\u{2502}', ..Cell::default() }; // │
+    for &dc in vdivs {
+        if dc < cols {
+            for r in 0..rows {
+                g.write_run(r, dc, &[vdiv]);
+            }
+        }
+    }
+    let hrow = vec![Cell { c: '\u{2500}', ..Cell::default() }; cols as usize]; // ─
+    for &dr in hdivs {
+        if dr < rows {
+            g.write_run(dr, 0, &hrow);
+        }
+    }
+    g.set_cursor(cursor.0, cursor.1);
+    g
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +305,47 @@ mod tests {
         assert_eq!(win.grid().cell(0, 4).c, 'R');
         assert_eq!(win.grid().cell(1, 4).c, 'R');
         assert_eq!(win.grid().cell(1, 5).c, '1');
+    }
+
+    #[test]
+    fn compose_grid_matches_render_composite() {
+        // The Grid path and the byte path must agree: feeding render_composite
+        // into a fresh terminal reproduces compose_grid's grid exactly.
+        let mut left = Terminal::new(3, 2);
+        left.feed(b"L0\r\n\x1b[31mL1\x1b[0m");
+        let mut right = Terminal::new(3, 2);
+        right.feed(b"R0\r\nR1");
+        let panes = [
+            PaneView { top: 0, left: 0, grid: left.grid() },
+            PaneView { top: 0, left: 4, grid: right.grid() },
+        ];
+        let g = compose_grid(7, 2, &panes, &[3], &[], (1, 5));
+        let bytes = render_composite(7, 2, &panes, &[3], &[], (1, 5));
+        let mut win = Terminal::new(7, 2);
+        win.feed(&bytes);
+        assert_eq!(win.grid(), &g, "compose_grid must equal the re-emulated byte composite");
+        // The composited grid is also a valid snapshot source (round-trips).
+        let mut win2 = Terminal::new(7, 2);
+        win2.feed(&render_snapshot(&g));
+        assert_eq!(win2.grid(), &g);
+    }
+
+    #[test]
+    fn compose_grid_horizontal_divider() {
+        let mut top = Terminal::new(5, 1);
+        top.feed(b"TOP");
+        let mut bot = Terminal::new(5, 1);
+        bot.feed(b"BOT");
+        let panes = [
+            PaneView { top: 0, left: 0, grid: top.grid() },
+            PaneView { top: 2, left: 0, grid: bot.grid() },
+        ];
+        let g = compose_grid(5, 3, &panes, &[], &[1], (2, 0));
+        assert_eq!(g.cell(0, 0).c, 'T');
+        assert_eq!(g.cell(1, 0).c, '\u{2500}'); // ─ divider row
+        assert_eq!(g.cell(1, 4).c, '\u{2500}');
+        assert_eq!(g.cell(2, 0).c, 'B');
+        assert_eq!(g.cursor(), (2, 0));
     }
 
     #[test]
