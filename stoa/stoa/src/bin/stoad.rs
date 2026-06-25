@@ -39,17 +39,126 @@ use stoa::{default_ctl, gen_key, seal, to_hex, Control, CONTROL, KEY_LEN, OUTPUT
 use stoa_proto::{Envelope, MsgType, ReplayWindow};
 use stoa_spawn::{DirectSpawner, PtyShell, ShellSpawner, SpawnSpec, Target};
 
-/// One window of a session: a shell on a pty + a server-side grid mirror.
-/// A session has 1..N windows; only the *active* window's output reaches the
-/// client. Closed windows become tombstones (`alive = false`) so live window
-/// indices stay stable (Ctrl-B `<n>` selects by index).
-struct Window {
+/// One pane: a shell on a pty + a server-side grid mirror + the region it
+/// occupies in the window. A window has 1 pane normally; Ctrl-B % / " split
+/// it into 2 (v1).
+struct Pane {
     pty_fd: i32,
     shell: Option<PtyShell>,
-    /// Mirror of this window's screen — fed every byte, rendered as a
-    /// snapshot on (re)attach and on window switch.
+    /// Mirror of this pane's screen — fed every byte; rendered (alone or
+    /// composited) on (re)attach, switch, and split.
     term: stoa_term::Terminal,
     alive: bool,
+    top: u16,
+    left: u16,
+    prows: u16,
+    pcols: u16,
+}
+
+/// How a 2-pane window is divided.
+#[derive(Clone, Copy)]
+enum Divider {
+    Vertical(u16),   // a │ column at this index
+    Horizontal(u16), // a ─ row at this index
+}
+
+/// One window of a session: 1..2 panes + the active pane. A session has
+/// 1..N windows; only the *active* window's output reaches the client.
+/// Closed windows become tombstones (`alive = false`) so live window indices
+/// stay stable (Ctrl-B `<n>` selects by index).
+struct Window {
+    panes: Vec<Pane>,
+    active_pane: usize,
+    alive: bool,
+    divider: Option<Divider>,
+}
+
+impl Window {
+    fn active(&self) -> Option<&Pane> {
+        self.panes.get(self.active_pane).filter(|p| p.alive)
+    }
+    fn live_panes(&self) -> usize {
+        self.panes.iter().filter(|p| p.alive).count()
+    }
+    /// Render the window for the client: a single pane is a plain snapshot;
+    /// 2 panes are composited with the divider + the active pane's cursor.
+    fn render(&self, cols: u16, rows: u16) -> Vec<u8> {
+        if self.live_panes() <= 1 || self.divider.is_none() {
+            return match self.active() {
+                Some(p) => stoa_term::render_snapshot(p.term.grid()),
+                None => Vec::new(),
+            };
+        }
+        let views: Vec<stoa_term::PaneView> = self
+            .panes
+            .iter()
+            .filter(|p| p.alive)
+            .map(|p| stoa_term::PaneView { top: p.top, left: p.left, grid: p.term.grid() })
+            .collect();
+        let (vdivs, hdivs): (Vec<u16>, Vec<u16>) = match self.divider {
+            Some(Divider::Vertical(c)) => (vec![c], vec![]),
+            Some(Divider::Horizontal(r)) => (vec![], vec![r]),
+            None => (vec![], vec![]),
+        };
+        let cursor = self
+            .active()
+            .map(|p| {
+                let (cr, cc) = p.term.grid().cursor();
+                (p.top + cr, p.left + cc)
+            })
+            .unwrap_or((0, 0));
+        stoa_term::render_composite(cols, rows, &views, &vdivs, &hdivs, cursor)
+    }
+
+    /// Recompute pane regions for a `cols`×`rows` window and resize each
+    /// pane's pty + mirror. Re-derives the split halves; falls back to a
+    /// single full-window pane when there isn't an active split.
+    fn relayout(&mut self, cols: u16, rows: u16) {
+        let live: Vec<usize> = self
+            .panes
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.alive)
+            .map(|(i, _)| i)
+            .collect();
+        match (self.divider, live.as_slice()) {
+            (Some(Divider::Vertical(_)), &[a0, b0]) => {
+                let leftw = cols.saturating_sub(1) / 2;
+                let rightw = cols.saturating_sub(leftw + 1);
+                let (a, b) = if self.panes[a0].left <= self.panes[b0].left { (a0, b0) } else { (b0, a0) };
+                set_pane_region(&mut self.panes[a], 0, 0, rows, leftw);
+                set_pane_region(&mut self.panes[b], 0, leftw + 1, rows, rightw);
+                self.divider = Some(Divider::Vertical(leftw));
+            }
+            (Some(Divider::Horizontal(_)), &[a0, b0]) => {
+                let toph = rows.saturating_sub(1) / 2;
+                let both = rows.saturating_sub(toph + 1);
+                let (a, b) = if self.panes[a0].top <= self.panes[b0].top { (a0, b0) } else { (b0, a0) };
+                set_pane_region(&mut self.panes[a], 0, 0, toph, cols);
+                set_pane_region(&mut self.panes[b], toph + 1, 0, both, cols);
+                self.divider = Some(Divider::Horizontal(toph));
+            }
+            _ => {
+                if let Some(&i) = live.first() {
+                    set_pane_region(&mut self.panes[i], 0, 0, rows, cols);
+                }
+                self.divider = None;
+            }
+        }
+    }
+}
+
+/// Set a pane's region + resize its pty (TIOCSWINSZ → SIGWINCH inside) + its
+/// grid mirror.
+fn set_pane_region(p: &mut Pane, top: u16, left: u16, prows: u16, pcols: u16) {
+    p.top = top;
+    p.left = left;
+    p.prows = prows;
+    p.pcols = pcols;
+    if let Some(sh) = &p.shell {
+        let _ = sh.resize(pcols.max(1), prows.max(1));
+    }
+    p.term.resize(pcols.max(1), prows.max(1));
 }
 
 /// Mutable per-session state, behind one lock (low-rate access). The key is
@@ -80,39 +189,47 @@ struct Inner {
 }
 
 impl Inner {
+    /// The active window's active pane's pty fd (where input goes).
     fn active_pty(&self) -> Option<i32> {
-        self.windows.get(self.active).filter(|w| w.alive).map(|w| w.pty_fd)
+        self.windows
+            .get(self.active)
+            .filter(|w| w.alive)
+            .and_then(|w| w.active())
+            .map(|p| p.pty_fd)
     }
-    /// Render the active window's mirror + seal it as an OUTPUT datagram for
-    /// the current client. Computes the snapshot bytes first (dropping the
-    /// window borrow) so `tx_seq` can be bumped after.
+    /// Render the active window (single-pane snapshot or composite) + seal it
+    /// as an OUTPUT datagram. Bytes computed first (dropping the window
+    /// borrow) so `tx_seq` can be bumped after.
     fn seal_active_snapshot(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
         let addr = self.last_addr?;
+        let (cols, rows) = (self.cols, self.rows);
         let bytes = {
             let w = self.windows.get(self.active).filter(|w| w.alive)?;
-            stoa_term::render_snapshot(w.term.grid())
+            w.render(cols, rows)
         };
         let wire = seal(&self.key, self.tx_seq, OUTPUT, &bytes);
         self.tx_seq = self.tx_seq.wrapping_add(1);
         Some((addr, wire))
     }
-    /// Render the active window's scrollback at the current `scroll` offset.
+    /// Render the active pane's scrollback at the current `scroll` offset.
+    /// (Scrollback follows the active pane; other panes aren't shown.)
     fn seal_scrollback(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
         let addr = self.last_addr?;
         let off = self.scroll;
         let bytes = {
-            let w = self.windows.get(self.active).filter(|w| w.alive)?;
-            stoa_term::render_scrollback(w.term.grid(), off)
+            let p = self.windows.get(self.active).filter(|w| w.alive)?.active()?;
+            stoa_term::render_scrollback(p.term.grid(), off)
         };
         let wire = seal(&self.key, self.tx_seq, OUTPUT, &bytes);
         self.tx_seq = self.tx_seq.wrapping_add(1);
         Some((addr, wire))
     }
-    /// History length of the active window (max scroll offset).
+    /// History length of the active pane (max scroll offset).
     fn active_history_len(&self) -> usize {
         self.windows
             .get(self.active)
-            .map(|w| w.term.grid().history().len())
+            .and_then(|w| w.active())
+            .map(|p| p.term.grid().history().len())
             .unwrap_or(0)
     }
     /// First live window index at/after `from` (wrapping forward); `None` if none.
@@ -233,7 +350,8 @@ fn list_sessions(reg: &Reg) -> Vec<(String, usize, String)> {
             let title = inner
                 .windows
                 .get(inner.active)
-                .map(|w| w.term.title().replace(['\t', '\n'], " "))
+                .and_then(|w| w.active())
+                .map(|p| p.term.title().replace(['\t', '\n'], " "))
                 .unwrap_or_default();
             (n.clone(), nwin, title)
         })
@@ -250,8 +368,10 @@ fn kill_session(reg: &Reg, name: &str) -> bool {
         Some(s) if !s.dead.load(Ordering::SeqCst) => {
             let inner = s.inner.lock().unwrap();
             for w in inner.windows.iter().filter(|w| w.alive) {
-                if let Some(sh) = &w.shell {
-                    let _ = sh.kill(libc::SIGHUP);
+                for p in w.panes.iter().filter(|p| p.alive) {
+                    if let Some(sh) = &p.shell {
+                        let _ = sh.kill(libc::SIGHUP);
+                    }
                 }
             }
             s.dead.store(true, Ordering::SeqCst);
@@ -352,10 +472,7 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
                                     inner.cols = cols;
                                     inner.rows = rows;
                                     for w in inner.windows.iter_mut().filter(|w| w.alive) {
-                                        if let Some(sh) = &w.shell {
-                                            let _ = sh.resize(cols, rows);
-                                        }
-                                        w.term.resize(cols, rows);
+                                        w.relayout(cols, rows);
                                     }
                                 }
                                 // Redraw → repaint the active window from its
@@ -396,6 +513,19 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
                                     let la = inner.last_active;
                                     inner.set_active(la);
                                 }
+                                // Ctrl-B % / " — split the active window.
+                                Some(Control::SplitVertical) => {
+                                    if inner.started {
+                                        split_active(&name, &state, &mut inner, &udp, &reg, true);
+                                    }
+                                }
+                                Some(Control::SplitHorizontal) => {
+                                    if inner.started {
+                                        split_active(&name, &state, &mut inner, &udp, &reg, false);
+                                    }
+                                }
+                                // Ctrl-B o — switch pane.
+                                Some(Control::PaneSwitch) => pane_switch(&mut inner),
                                 // Ctrl-B [ / ] — page the scrollback view.
                                 Some(Control::ScrollUp) => {
                                     if inner.started {
@@ -586,23 +716,29 @@ fn spawn_window(
     udp: &UdpSocket,
     reg: &Reg,
 ) -> Option<usize> {
-    match spawn_for(&parse_target(&state.target), inner.cols, inner.rows) {
+    let (cols, rows) = (inner.cols, inner.rows);
+    match spawn_for(&parse_target(&state.target), cols, rows) {
         Ok(shell) => {
             let fd = shell.master_fd();
-            let idx = inner.windows.len();
+            let widx = inner.windows.len();
             inner.windows.push(Window {
-                pty_fd: fd,
-                shell: Some(shell),
-                term: stoa_term::Terminal::new(inner.cols, inner.rows),
+                panes: vec![Pane {
+                    pty_fd: fd,
+                    shell: Some(shell),
+                    term: stoa_term::Terminal::new(cols, rows),
+                    alive: true,
+                    top: 0,
+                    left: 0,
+                    prows: rows,
+                    pcols: cols,
+                }],
+                active_pane: 0,
                 alive: true,
+                divider: None,
             });
-            let rstate = state.clone();
-            let rudp = udp.try_clone().expect("clone udp");
-            let rname = name.to_string();
-            let rreg = reg.clone();
-            thread::spawn(move || reader(rname, idx, fd, rstate, rudp, rreg));
-            eprintln!("stoad: session {name:?} window {idx} spawned on port {}", state.port);
-            Some(idx)
+            spawn_reader(name, widx, 0, fd, state, udp, reg);
+            eprintln!("stoad: session {name:?} window {widx} spawned on port {}", state.port);
+            Some(widx)
         }
         Err(e) => {
             eprintln!("stoad: session {name:?} window spawn failed: {e}");
@@ -611,46 +747,198 @@ fn spawn_window(
     }
 }
 
-/// What a window's reader does after its shell exits.
+/// Spawn a new pane into an existing window at `(top,left,prows,pcols)` and
+/// start its reader. Returns the new pane index. Caller holds `inner`.
+fn spawn_pane(
+    name: &str,
+    state: &Arc<SessionState>,
+    inner: &mut Inner,
+    win_idx: usize,
+    region: (u16, u16, u16, u16),
+    udp: &UdpSocket,
+    reg: &Reg,
+) -> Option<usize> {
+    let (top, left, prows, pcols) = region;
+    match spawn_for(&parse_target(&state.target), pcols, prows) {
+        Ok(shell) => {
+            let fd = shell.master_fd();
+            let w = inner.windows.get_mut(win_idx)?;
+            let pidx = w.panes.len();
+            w.panes.push(Pane {
+                pty_fd: fd,
+                shell: Some(shell),
+                term: stoa_term::Terminal::new(pcols, prows),
+                alive: true,
+                top,
+                left,
+                prows,
+                pcols,
+            });
+            spawn_reader(name, win_idx, pidx, fd, state, udp, reg);
+            Some(pidx)
+        }
+        Err(e) => {
+            eprintln!("stoad: session {name:?} pane spawn failed: {e}");
+            None
+        }
+    }
+}
+
+/// Split the active window into two panes (v1: only a single-pane window).
+/// The active pane keeps the first half; a new pane fills the second.
+fn split_active(
+    name: &str,
+    state: &Arc<SessionState>,
+    inner: &mut Inner,
+    udp: &UdpSocket,
+    reg: &Reg,
+    vertical: bool,
+) {
+    let widx = inner.active;
+    let (cols, rows) = (inner.cols, inner.rows);
+    match inner.windows.get(widx) {
+        Some(w) if w.live_panes() == 1 && w.divider.is_none() => {}
+        _ => return, // already split, or nothing to split
+    }
+    let apane = inner.windows[widx].active_pane;
+    let (a_region, b_region, divider) = if vertical {
+        let leftw = cols.saturating_sub(1) / 2;
+        let rightw = cols.saturating_sub(leftw + 1);
+        if leftw < 2 || rightw < 2 {
+            return; // too narrow to split
+        }
+        ((0, 0, rows, leftw), (0, leftw + 1, rows, rightw), Divider::Vertical(leftw))
+    } else {
+        let toph = rows.saturating_sub(1) / 2;
+        let both = rows.saturating_sub(toph + 1);
+        if toph < 2 || both < 2 {
+            return; // too short to split
+        }
+        ((0, 0, toph, cols), (toph + 1, 0, both, cols), Divider::Horizontal(toph))
+    };
+    // Shrink the existing pane to the first half, set the divider.
+    let (at, al, ar, ac) = a_region;
+    set_pane_region(&mut inner.windows[widx].panes[apane], at, al, ar, ac);
+    inner.windows[widx].divider = Some(divider);
+    // Spawn the new pane in the second half and focus it.
+    if let Some(pidx) = spawn_pane(name, state, inner, widx, b_region, udp, reg) {
+        inner.windows[widx].active_pane = pidx;
+        inner.need_snapshot = true;
+        eprintln!("stoad: session {name:?} window {widx} split ({} panes)", inner.windows[widx].live_panes());
+    }
+}
+
+/// Switch to the next live pane in the active window.
+fn pane_switch(inner: &mut Inner) {
+    let widx = inner.active;
+    let changed = if let Some(w) = inner.windows.get_mut(widx) {
+        let n = w.panes.len();
+        match (1..=n).map(|k| (w.active_pane + k) % n).find(|&i| w.panes[i].alive) {
+            Some(next) if next != w.active_pane => {
+                w.active_pane = next;
+                true
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+    if changed {
+        inner.need_snapshot = true;
+    }
+}
+
+/// Start a reader thread for window `win_idx`'s pane `pane_idx`.
+fn spawn_reader(
+    name: &str,
+    win_idx: usize,
+    pane_idx: usize,
+    fd: i32,
+    state: &Arc<SessionState>,
+    udp: &UdpSocket,
+    reg: &Reg,
+) {
+    let rstate = state.clone();
+    let rudp = udp.try_clone().expect("clone udp");
+    let rname = name.to_string();
+    let rreg = reg.clone();
+    thread::spawn(move || reader(rname, win_idx, pane_idx, fd, rstate, rudp, rreg));
+}
+
+/// What a pane's reader does after its shell exits.
 enum CloseOutcome {
     /// No live windows left → session ends; carries an optional Bye datagram.
     EndSession(Option<(SocketAddr, Vec<u8>)>),
-    /// The active window closed → switched to another; carries its snapshot.
-    Switched(Option<(SocketAddr, Vec<u8>)>),
-    /// A background window closed → nothing to send.
+    /// The active window's view changed (active window closed → switched, or a
+    /// pane closed → un-split) → repaint; carries the snapshot.
+    Repaint(Option<(SocketAddr, Vec<u8>)>),
+    /// A background change → nothing to send.
     Nothing,
 }
 
-/// Per-window pty reader: feed this window's mirror; if it's the active
-/// window, stream its output to the client. On shell exit, close the window.
-fn reader(name: String, win_idx: usize, pty_fd: i32, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
+/// Per-pane pty reader: feed this pane's mirror; if its window is active,
+/// stream (single pane) or re-composite (multi-pane) to the client. On shell
+/// exit, close the pane (un-split if a sibling survives, else close window).
+fn reader(name: String, win_idx: usize, pane_idx: usize, pty_fd: i32, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
     let mut buf = [0u8; 8192];
     loop {
-        // SAFETY: read this window's pty master into our buffer.
+        // SAFETY: read this pane's pty master into our buffer.
         let n = unsafe { libc::read(pty_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n <= 0 {
-            // The window's shell exited. Decide the outcome under `inner`
-            // (released before touching `reg`, to keep the reg→inner order).
+            // Shell exited. Decide the outcome under `inner` (released before
+            // touching `reg`, to keep the reg→inner lock order).
             let outcome = {
                 let mut inner = state.inner.lock().unwrap();
+                let (cols, rows) = (inner.cols, inner.rows);
+                let mut window_died = false;
                 if let Some(w) = inner.windows.get_mut(win_idx) {
-                    w.alive = false;
-                    if let Some(sh) = w.shell.take() {
-                        let _ = sh.wait();
+                    if let Some(p) = w.panes.get_mut(pane_idx) {
+                        p.alive = false;
+                        if let Some(sh) = p.shell.take() {
+                            let _ = sh.wait();
+                        }
+                    }
+                    let live = w.live_panes();
+                    if live == 0 {
+                        w.alive = false;
+                        window_died = true;
+                    } else if w.divider.is_some() {
+                        // A pane of a split closed → the survivor takes the
+                        // whole window (un-split).
+                        if let Some(surv) = w.panes.iter().position(|p| p.alive) {
+                            w.divider = None;
+                            w.active_pane = surv;
+                            let p = &mut w.panes[surv];
+                            p.top = 0;
+                            p.left = 0;
+                            p.prows = rows;
+                            p.pcols = cols;
+                            if let Some(sh) = &p.shell {
+                                let _ = sh.resize(cols, rows);
+                            }
+                            p.term.resize(cols, rows);
+                        }
                     }
                 }
-                if !inner.windows.iter().any(|w| w.alive) {
-                    let bye = inner.last_addr.map(|a| {
-                        let wire = seal(&inner.key, inner.tx_seq, CONTROL, &Control::Bye.encode());
-                        inner.tx_seq = inner.tx_seq.wrapping_add(1);
-                        (a, wire)
-                    });
-                    CloseOutcome::EndSession(bye)
-                } else if inner.active == win_idx {
-                    if let Some(idx) = inner.next_live(0) {
-                        inner.active = idx;
+                if window_died {
+                    if !inner.windows.iter().any(|w| w.alive) {
+                        let bye = inner.last_addr.map(|a| {
+                            let wire = seal(&inner.key, inner.tx_seq, CONTROL, &Control::Bye.encode());
+                            inner.tx_seq = inner.tx_seq.wrapping_add(1);
+                            (a, wire)
+                        });
+                        CloseOutcome::EndSession(bye)
+                    } else if inner.active == win_idx {
+                        if let Some(idx) = inner.next_live(0) {
+                            inner.active = idx;
+                        }
+                        CloseOutcome::Repaint(inner.seal_active_snapshot())
+                    } else {
+                        CloseOutcome::Nothing
                     }
-                    CloseOutcome::Switched(inner.seal_active_snapshot())
+                } else if inner.active == win_idx {
+                    // pane closed, window un-split → repaint the survivor
+                    CloseOutcome::Repaint(inner.seal_active_snapshot())
                 } else {
                     CloseOutcome::Nothing
                 }
@@ -664,35 +952,46 @@ fn reader(name: String, win_idx: usize, pty_fd: i32, state: Arc<SessionState>, u
                     }
                     eprintln!("stoad: session {name:?} ended (last window closed)");
                 }
-                CloseOutcome::Switched(snap) => {
+                CloseOutcome::Repaint(snap) => {
                     if let Some((addr, wire)) = snap {
                         let _ = udp.send_to(&wire, addr);
                     }
-                    eprintln!("stoad: session {name:?} window {win_idx} closed; switched active");
+                    eprintln!("stoad: session {name:?} window {win_idx} pane {pane_idx} closed");
                 }
-                CloseOutcome::Nothing => {
-                    eprintln!("stoad: session {name:?} window {win_idx} closed");
-                }
+                CloseOutcome::Nothing => {}
             }
             return;
         }
         let bytes = &buf[..n as usize];
         let out = {
             let mut inner = state.inner.lock().unwrap();
-            // Mirror every byte into THIS window's grid (even when it's not
-            // active), so a switch can paint its current screen.
+            let (cols, rows) = (inner.cols, inner.rows);
+            // Mirror every byte into THIS pane's grid (even when not active),
+            // so a switch/split can paint its current screen.
             if let Some(w) = inner.windows.get_mut(win_idx) {
-                w.term.feed(bytes);
+                if let Some(p) = w.panes.get_mut(pane_idx) {
+                    p.term.feed(bytes);
+                }
             }
-            // Only the active window streams to the client, and only when not
-            // scrolled back (while viewing history, output is held — it still
-            // lands in the mirror/history and shows on return-to-live).
+            // Stream only when this pane's window is active and not scrolled.
             if inner.active == win_idx && inner.scroll == 0 {
-                inner.last_addr.map(|a| {
-                    let w = seal(&inner.key, inner.tx_seq, OUTPUT, bytes);
-                    inner.tx_seq = inner.tx_seq.wrapping_add(1);
-                    (a, w)
-                })
+                let multi = inner.windows.get(win_idx).map_or(false, |w| w.live_panes() > 1);
+                if multi {
+                    // Re-composite the whole window (both panes are visible).
+                    let bytes = inner.windows[win_idx].render(cols, rows);
+                    inner.last_addr.map(|a| {
+                        let w = seal(&inner.key, inner.tx_seq, OUTPUT, &bytes);
+                        inner.tx_seq = inner.tx_seq.wrapping_add(1);
+                        (a, w)
+                    })
+                } else {
+                    // Single pane: stream raw (cheap, low-latency).
+                    inner.last_addr.map(|a| {
+                        let w = seal(&inner.key, inner.tx_seq, OUTPUT, bytes);
+                        inner.tx_seq = inner.tx_seq.wrapping_add(1);
+                        (a, w)
+                    })
+                }
             } else {
                 None
             }

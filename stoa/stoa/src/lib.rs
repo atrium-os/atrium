@@ -90,6 +90,12 @@ pub enum Control {
     PrevWindow,
     /// Client → server (Ctrl-B l): the previously-active window (toggle).
     LastWindow,
+    /// Client → server (Ctrl-B %): split the active window into two panes
+    /// side by side. (Ctrl-B ") splits top/bottom.
+    SplitVertical,
+    SplitHorizontal,
+    /// Client → server (Ctrl-B o): switch to the next pane.
+    PaneSwitch,
 }
 
 impl Control {
@@ -110,6 +116,9 @@ impl Control {
             Control::ScrollDown => vec![11],
             Control::PrevWindow => vec![12],
             Control::LastWindow => vec![13],
+            Control::SplitVertical => vec![14],
+            Control::SplitHorizontal => vec![15],
+            Control::PaneSwitch => vec![16],
         }
     }
     pub fn decode(payload: &[u8]) -> Option<Control> {
@@ -127,6 +136,9 @@ impl Control {
             11 => Some(Control::ScrollDown),
             12 => Some(Control::PrevWindow),
             13 => Some(Control::LastWindow),
+            14 => Some(Control::SplitVertical),
+            15 => Some(Control::SplitHorizontal),
+            16 => Some(Control::PaneSwitch),
             _ => None,
         }
     }
@@ -185,6 +197,13 @@ mod tests {
             Control::NewWindow,
             Control::SwitchWindow(7),
             Control::NextWindow,
+            Control::PrevWindow,
+            Control::LastWindow,
+            Control::ScrollUp,
+            Control::ScrollDown,
+            Control::SplitVertical,
+            Control::SplitHorizontal,
+            Control::PaneSwitch,
         ] {
             assert_eq!(Control::decode(&c.encode()), Some(c));
         }

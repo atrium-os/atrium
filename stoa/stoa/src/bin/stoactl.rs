@@ -395,6 +395,9 @@ fn stdin_loop(
                     b'0'..=b'9' => send_ctl(Control::SwitchWindow(b - b'0')), // window n
                     b'[' => send_ctl(Control::ScrollUp), // scrollback page up
                     b']' => send_ctl(Control::ScrollDown), // scrollback page down
+                    b'%' => send_ctl(Control::SplitVertical), // split left|right
+                    b'"' => send_ctl(Control::SplitHorizontal), // split top/bottom
+                    b'o' => send_ctl(Control::PaneSwitch), // next pane
                     x if x == prefix => pending.push(prefix), // literal prefix
                     _ => {} // unknown command: ignored
                 }
