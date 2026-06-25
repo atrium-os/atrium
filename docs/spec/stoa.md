@@ -1,7 +1,9 @@
 # Stoa — persistent session service
 
-Status: **S0–S2 + jail-login BUILT & verified live** (D2.7); S3 (Tessera
-scrollback) + ack-based retransmit + multi-client pending.
+Status: **S0–S2 + jail-login BUILT & verified live** (D2.7). S3a (history-only
+persistence — survives `stoad` restart + host reboot via respawn) IN PROGRESS;
+S3b (live-process survival via the broker, §5.5), ack-based retransmit, and
+multi-client are aspirational TODOs.
 Last updated: 2026-06-25.
 
 > **Implementation status (2026-06-25).** Built in `stoa/` (macOS-first
@@ -464,6 +466,33 @@ Per-session retention policy (default: keep all unique blobs up to
 500 MB per window, drop oldest blobs first when over). Configurable.
 Tessera's GC handles the actual reclamation when the last reference
 to a blob is dropped — Stoa does not need to know about it.
+
+### 5.5 Live-process survival across `stoad` restart (S3b — aspirational TODO)
+
+§5.1–5.3 is **history-only**: a `stoad` restart (crash/upgrade) or host
+reboot loses the live shells; on reattach they **respawn** at the last-known
+cwd with scrollback restored. This is the foundation (S3a) — and the *only*
+thing that can survive a host reboot, since no process survives losing RAM.
+
+A second, aspirational layer (**S3b**) would keep the live shells running
+across a `stoad` restart *without a host reboot* (so an in-flight `vim` /
+`cargo build` continues through a `stoad` upgrade or crash). This is **beyond
+tmux** (whose sessions die with their server) and must **not** be built by
+making `stoad` a fat tmux-style process holder — that fights the thin,
+jailed, restartable `stoad` design. The Atrium-native vehicle is the
+**broker as session-holder**: the portcullisd→jaild `ExecInJail` chain
+already produces a **procdesc + pty master over SCM_RIGHTS**. Have the broker
+(the durable TCB) **retain** the procdesc + a pty master (buffering output
+while `stoad` is down) keyed by a session handle, and expose a
+`ReacquireSession(handle)` verb; a restarted `stoad` re-acquires the master
+and resumes. The shell never sees EOF because the broker's master stays open.
+
+Scope/known wrinkles for S3b when built: only **broker-backed (jailed)**
+sessions survive — dev `DirectSpawner` sessions have no broker and don't
+(acceptable asymmetry); the broker must bound its output buffer + GC orphaned
+handles; reacquire must re-key the session's UDP/`K_sess` (clients re-mint).
+**Not scheduled — recorded so the procdesc/SCM_RIGHTS hooks aren't designed
+out.**
 
 ## 6. Multi-client coherence
 
