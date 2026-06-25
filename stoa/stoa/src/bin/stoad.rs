@@ -161,8 +161,11 @@ fn handle_mint(stream: UnixStream, reg: Reg) {
             let _ = (&stream).write_all(format!("{port} {}\n", to_hex(&key)).as_bytes());
         }
         Some("LIST") => {
-            let names = list_sessions(&reg);
-            let body = if names.is_empty() { String::new() } else { format!("{}\n", names.join("\n")) };
+            // One session per line: `<name>\t<nwindows>\t<active title>`.
+            let body: String = list_sessions(&reg)
+                .into_iter()
+                .map(|(n, nw, title)| format!("{n}\t{nw}\t{title}\n"))
+                .collect();
             let _ = (&stream).write_all(body.as_bytes());
         }
         Some("KILL") => {
@@ -178,16 +181,26 @@ fn handle_mint(stream: UnixStream, reg: Reg) {
     }
 }
 
-/// Names of all live (not-dead) sessions.
-fn list_sessions(reg: &Reg) -> Vec<String> {
+/// All live sessions as `(name, live_window_count, active_window_title)`,
+/// sorted by name. Holds `reg` then each `inner` (the reg→inner order).
+fn list_sessions(reg: &Reg) -> Vec<(String, usize, String)> {
     let map = reg.lock().unwrap();
-    let mut names: Vec<String> = map
+    let mut out: Vec<(String, usize, String)> = map
         .iter()
         .filter(|(_, s)| !s.dead.load(Ordering::SeqCst))
-        .map(|(n, _)| n.clone())
+        .map(|(n, s)| {
+            let inner = s.inner.lock().unwrap();
+            let nwin = inner.windows.iter().filter(|w| w.alive).count().max(1);
+            let title = inner
+                .windows
+                .get(inner.active)
+                .map(|w| w.term.title().replace(['\t', '\n'], " "))
+                .unwrap_or_default();
+            (n.clone(), nwin, title)
+        })
         .collect();
-    names.sort();
-    names
+    out.sort();
+    out
 }
 
 /// Kill a session: HUP its shell (the pty EOF leads the reader to clean up

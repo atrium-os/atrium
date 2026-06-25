@@ -76,12 +76,22 @@ fn ctl_request(line: &str) -> Result<String, String> {
 fn list_sessions() {
     match ctl_request("LIST") {
         Ok(body) => {
-            let names: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
-            if names.is_empty() {
+            let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+            if lines.is_empty() {
                 println!("(no sessions)");
-            } else {
-                for n in names {
-                    println!("{n}");
+                return;
+            }
+            for l in lines {
+                // `<name>\t<nwindows>\t<active title>`
+                let mut f = l.split('\t');
+                let name = f.next().unwrap_or("?");
+                let nw = f.next().unwrap_or("?");
+                let title = f.next().unwrap_or("").trim();
+                let w = if nw == "1" { "window" } else { "windows" };
+                if title.is_empty() {
+                    println!("{name}  ({nw} {w})");
+                } else {
+                    println!("{name}  ({nw} {w})  {title}");
                 }
             }
         }

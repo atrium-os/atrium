@@ -22,6 +22,9 @@ use vte::{Params, Parser, Perform};
 mod diff;
 pub use diff::{CellRun, StateDiff};
 
+mod render;
+pub use render::render_snapshot;
+
 /// A terminal colour. `Default` = the terminal's default fg/bg; `Indexed`
 /// covers the 16 ANSI + 256-colour palette; `Rgb` is 24-bit truecolour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -84,6 +87,8 @@ pub struct Grid {
     /// Deferred line wrap: set after printing the last column, so writing
     /// exactly `cols` chars doesn't scroll until the next char arrives.
     pending_wrap: bool,
+    /// Window title set via OSC 0/2 (shells/programs report cwd or command).
+    title: String,
 }
 
 impl Grid {
@@ -97,12 +102,15 @@ impl Grid {
             cur_col: 0,
             pen: Cell::default(),
             pending_wrap: false,
+            title: String::new(),
         }
     }
 
     pub fn cols(&self) -> u16 { self.cols }
     pub fn rows(&self) -> u16 { self.rows }
     pub fn cursor(&self) -> (u16, u16) { (self.cur_row, self.cur_col) }
+    /// The window title (OSC 0/2), empty if none set.
+    pub fn title(&self) -> &str { &self.title }
 
     /// Overwrite a horizontal run of cells starting at `(row, col)` —
     /// used by [`StateDiff::apply`]. Out-of-bounds cells are skipped.
@@ -353,7 +361,16 @@ impl Perform for Grid {
             _ => {} // unhandled CSI ignored in v1
         }
     }
-    // esc_dispatch / osc_dispatch / hook / put / unhook: ignored in v1.
+
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        // OSC 0 (icon name + title) / 2 (title) → window title.
+        if let [kind, title, ..] = params {
+            if matches!(*kind, b"0" | b"2") {
+                self.title = String::from_utf8_lossy(title).into_owned();
+            }
+        }
+    }
+    // esc_dispatch / hook / put / unhook: ignored in v1.
 }
 
 /// A terminal: the `vte` parser + the [`Grid`] it drives. (`vte::Parser`
@@ -377,6 +394,9 @@ impl Terminal {
     }
 
     pub fn grid(&self) -> &Grid { &self.grid }
+
+    /// The window title (OSC 0/2), empty if none.
+    pub fn title(&self) -> &str { self.grid.title() }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.grid.resize(cols, rows);
@@ -482,6 +502,17 @@ mod tests {
         let mut t2 = term();
         t2.feed(b"x\r\ny\r\nz\x1b[2J"); // erase whole display
         assert!(t2.rows_text().iter().all(|r| r.is_empty()));
+    }
+
+    #[test]
+    fn osc_sets_window_title() {
+        let mut t = term();
+        t.feed(b"\x1b]2;my-shell: ~/src\x07text");
+        assert_eq!(t.title(), "my-shell: ~/src");
+        assert_eq!(t.grid().cell(0, 0).c, 't'); // the text after still prints
+        // OSC 0 (icon+title) also sets it; bell- or ST-terminated.
+        t.feed(b"\x1b]0;other\x1b\\");
+        assert_eq!(t.title(), "other");
     }
 
     #[test]
