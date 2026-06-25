@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "stoa-proto",
+    "stoa-net",
     "stoa-spawn",
     "stoa",
 ]

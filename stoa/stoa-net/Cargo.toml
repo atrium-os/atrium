@@ -1,0 +1,14 @@
+[package]
+name        = "stoa-net"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+description = "Stoa's datagram transport: a per-direction Session (seq + anti-replay over stoa-proto envelopes) and a thin UDP carrier. The connectionless layer that survives drops/reorder/reattach (stoa.md §3). OS-agnostic."
+
+[lib]
+name = "stoa_net"
+path = "src/lib.rs"
+
+[dependencies]
+stoa-proto = { path = "../stoa-proto" }

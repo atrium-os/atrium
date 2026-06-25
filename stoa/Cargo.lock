@@ -92,6 +92,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "stoa-net"
+version = "0.1.0"
+dependencies = [
+ "stoa-proto",
+]
+
+[[package]]
 name = "stoa-proto"
 version = "0.1.0"
 dependencies = [
