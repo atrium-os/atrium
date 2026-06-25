@@ -35,9 +35,11 @@ name = "atrium-launch"
 path = "src/bin/launch_app.rs"
 
 [features]
-# Real PAM auth in VerifyCredential (links -lpam). Off by default so the default
-# build + tests need no libpam; the PRODUCTION portcullisd is a `--features pam`
-# build (without it VerifyCredential is the dev stub). See ostiarius-privsep.md.
+# Real PAM auth in VerifyCredential (links -lpam, available in FreeBSD/macOS
+# base). ON BY DEFAULT so a production build can't silently ship the dev stub
+# (any-password auth bypass). Build `--no-default-features` only for a host with
+# no libpam, which gets the stub + a loud startup warning. See ostiarius-privsep.md.
+default = ["pam"]
 pam = []
 
 [dependencies]

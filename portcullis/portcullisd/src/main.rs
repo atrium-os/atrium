@@ -102,6 +102,9 @@ fn main() -> ExitCode {
     }
     eprintln!("portcullisd: listening on {} (multi-tenant)",
         socket_path.display());
+    #[cfg(not(feature = "pam"))]
+    eprintln!("portcullisd: WARNING — built WITHOUT --features pam: VerifyCredential \
+        is the DEV STUB (accepts ANY password). NOT FOR PRODUCTION.");
 
     let shared = Arc::new(Mutex::new(Tenants { cache: HashMap::new(), session_procdescs: HashMap::new() }));
 
@@ -542,17 +545,37 @@ fn launch_session_component(component_id: &str, owner_name: &str,
 }
 
 /// Tear down a session component: drop the held procdesc (the kernel kills the
-/// jailed process + reaps the persist=0 jail) and RemoveJail by name to clear
-/// jaild state. NB: the create-time host mounts are cleaned the same way the
-/// supervisor does it (host_mount::unmount_jail_dest) — TODO wire here too; until
-/// then a stale-mount sweep before relaunch covers it (same as the governors).
+/// jailed process + reaps the persist=0 jail), RemoveJail to clear jaild state,
+/// then unmount the create-time host-namespace mounts.
 fn teardown_session_component(jail_name: &str, shared: &Mutex<Tenants>) -> Response {
-    use portcullisd::jaild_client::Client;
+    use portcullisd::{jaild_client::Client, system_services, host_mount};
+
+    // 1. Drop the held procdesc → the kernel SIGKILLs the jailed process.
     shared.lock().unwrap().session_procdescs.remove(jail_name);
+
+    // 2. RemoveJail (synchronous: kills any survivor + clears jaild's state record).
     let req = jaild::protocol::Request::RemoveJail {
         jid: None, name: Some(jail_name.to_string()),
     };
-    match Client::connect(JAILD_SOCK).and_then(|mut c| c.send(&req)) {
+    let rm = Client::connect(JAILD_SOCK).and_then(|mut c| c.send(&req));
+
+    // 3. Unmount the create-time mounts. jaild's exec path doesn't record them in
+    // state, so RemoveJail can't — they'd leak and the next launch of this
+    // component would EDEADLK on the identical nullfs (the same bug fixed in the
+    // supervisor's handle_exit). Re-derive from the session.d registry and unmount
+    // via the shared host_mount::unmount_jail_dest. After RemoveJail so the jail's
+    // procs are gone (no EBUSY).
+    if let Ok(o) = system_services::load_dir(std::path::Path::new(SESSION_DIR)) {
+        if let Some(m) = o.manifests.into_iter().find(|m| m.name == jail_name) {
+            let create = m.to_create_request();
+            for mt in &create.mounts {
+                if let Err(e) = host_mount::unmount_jail_dest(&create.path, &mt.dest) {
+                    eprintln!("portcullisd: teardown unmount {} {}: {e}", create.path, mt.dest);
+                }
+            }
+        }
+    }
+    match rm {
         Ok(_) => Response::Ok,
         Err(e) => Response::Error { message: format!("teardown RemoveJail: {e}") },
     }
