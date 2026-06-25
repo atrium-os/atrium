@@ -83,17 +83,26 @@ fn mint(name: &str, host: Option<&str>) -> Result<(String, u16, Vec<u8>), String
             Ok(("127.0.0.1".to_string(), port, key))
         }
         Some(hostspec) => {
-            // Remote: ssh runs stoa-shell; its stdout returns over the channel.
-            let out = Command::new("ssh")
-                .arg("-T")
+            // Remote: a transport (ssh by default) runs stoa-shell; its
+            // stdout returns over the channel. $STOA_SSH overrides the
+            // transport prefix (e.g. "ssh -p 2222 -T", or a mosh-style
+            // launcher); we append <hostspec> stoa-shell <name>.
+            let transport = std::env::var("STOA_SSH").unwrap_or_else(|_| "ssh -T".into());
+            let mut toks = transport.split_whitespace();
+            let prog = toks.next().unwrap_or("ssh");
+            let mut cmd = Command::new(prog);
+            for t in toks {
+                cmd.arg(t);
+            }
+            let out = cmd
                 .arg(hostspec)
                 .arg("stoa-shell")
                 .arg(name)
                 .output()
-                .map_err(|e| format!("spawn ssh: {e}"))?;
+                .map_err(|e| format!("spawn transport {prog:?}: {e}"))?;
             if !out.status.success() {
                 return Err(format!(
-                    "ssh stoa-shell failed: {}",
+                    "{prog} stoa-shell failed: {}",
                     String::from_utf8_lossy(&out.stderr).trim()
                 ));
             }
