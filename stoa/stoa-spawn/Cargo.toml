@@ -1,0 +1,14 @@
+[package]
+name        = "stoa-spawn"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+description = "Stoa's shell-spawn seam: the ShellSpawner trait + DirectSpawner (openpty/forkpty, no jail) for macOS/dev. The FreeBSD BrokerSpawner (portcullisd → jaild) implements the same trait. See docs/spec/stoa.md §4.5, §11.1."
+
+[lib]
+name = "stoa_spawn"
+path = "src/lib.rs"
+
+[dependencies]
+libc = { workspace = true }
