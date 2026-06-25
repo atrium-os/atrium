@@ -23,7 +23,7 @@ mod diff;
 pub use diff::{CellRun, StateDiff};
 
 mod render;
-pub use render::render_snapshot;
+pub use render::{render_scrollback, render_snapshot};
 
 /// A terminal colour. `Default` = the terminal's default fg/bg; `Indexed`
 /// covers the 16 ANSI + 256-colour palette; `Rgb` is 24-bit truecolour.
@@ -89,7 +89,13 @@ pub struct Grid {
     pending_wrap: bool,
     /// Window title set via OSC 0/2 (shells/programs report cwd or command).
     title: String,
+    /// Lines that have scrolled off the top, oldest first (capped). The
+    /// scrollback the client can page up into.
+    history: Vec<Vec<Cell>>,
 }
+
+/// Max scrollback lines retained per window.
+pub const HISTORY_MAX: usize = 2000;
 
 impl Grid {
     pub fn new(cols: u16, rows: u16) -> Self {
@@ -103,6 +109,7 @@ impl Grid {
             pen: Cell::default(),
             pending_wrap: false,
             title: String::new(),
+            history: Vec::new(),
         }
     }
 
@@ -111,6 +118,8 @@ impl Grid {
     pub fn cursor(&self) -> (u16, u16) { (self.cur_row, self.cur_col) }
     /// The window title (OSC 0/2), empty if none set.
     pub fn title(&self) -> &str { &self.title }
+    /// Scrolled-off lines, oldest first (the scrollback).
+    pub fn history(&self) -> &[Vec<Cell>] { &self.history }
 
     /// Overwrite a horizontal run of cells starting at `(row, col)` —
     /// used by [`StateDiff::apply`]. Out-of-bounds cells are skipped.
@@ -177,7 +186,15 @@ impl Grid {
     fn scroll_up(&mut self, n: u16) {
         let n = n.min(self.rows);
         let w = self.cols as usize;
-        // Drop the top n rows, append n blank rows at the bottom.
+        // Push the rows about to scroll off into history (capped), then drop
+        // them and append n blank rows at the bottom.
+        for r in 0..n as usize {
+            self.history.push(self.cells[r * w..(r + 1) * w].to_vec());
+        }
+        let overflow = self.history.len().saturating_sub(HISTORY_MAX);
+        if overflow > 0 {
+            self.history.drain(0..overflow);
+        }
         self.cells.drain(0..n as usize * w);
         let blank = self.blank();
         self.cells.resize(self.rows as usize * w, blank);

@@ -71,6 +71,10 @@ struct Inner {
     /// Set on reattach / window-switch: the next client datagram triggers a
     /// snapshot of the active window.
     need_snapshot: bool,
+    /// Scrollback view offset (lines above the live bottom); 0 = live. While
+    /// >0, the active window's live output is held (the client is viewing
+    /// history); any keystroke returns to 0.
+    scroll: usize,
 }
 
 impl Inner {
@@ -89,6 +93,25 @@ impl Inner {
         let wire = seal(&self.key, self.tx_seq, OUTPUT, &bytes);
         self.tx_seq = self.tx_seq.wrapping_add(1);
         Some((addr, wire))
+    }
+    /// Render the active window's scrollback at the current `scroll` offset.
+    fn seal_scrollback(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
+        let addr = self.last_addr?;
+        let off = self.scroll;
+        let bytes = {
+            let w = self.windows.get(self.active).filter(|w| w.alive)?;
+            stoa_term::render_scrollback(w.term.grid(), off)
+        };
+        let wire = seal(&self.key, self.tx_seq, OUTPUT, &bytes);
+        self.tx_seq = self.tx_seq.wrapping_add(1);
+        Some((addr, wire))
+    }
+    /// History length of the active window (max scroll offset).
+    fn active_history_len(&self) -> usize {
+        self.windows
+            .get(self.active)
+            .map(|w| w.term.grid().history().len())
+            .unwrap_or(0)
     }
     /// First live window index at/after `from` (wrapping); `None` if none.
     fn next_live(&self, from: usize) -> Option<usize> {
@@ -264,6 +287,7 @@ fn mint(reg: &Reg, name: &str, target: &str) -> (u16, [u8; KEY_LEN]) {
             windows: Vec::new(),
             active: 0,
             need_snapshot: false,
+            scroll: 0,
         }),
     });
     map.insert(name.to_string(), state.clone());
@@ -352,8 +376,33 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
                                         }
                                     }
                                 }
+                                // Ctrl-B [ / ] — page the scrollback view.
+                                Some(Control::ScrollUp) => {
+                                    if inner.started {
+                                        let page = (inner.rows.saturating_sub(1)).max(1) as usize;
+                                        let maxoff = inner.active_history_len();
+                                        inner.scroll = (inner.scroll + page).min(maxoff);
+                                        snapshot = inner.seal_scrollback();
+                                    }
+                                }
+                                Some(Control::ScrollDown) => {
+                                    if inner.started && inner.scroll > 0 {
+                                        let page = (inner.rows.saturating_sub(1)).max(1) as usize;
+                                        inner.scroll = inner.scroll.saturating_sub(page);
+                                        snapshot = if inner.scroll == 0 {
+                                            inner.seal_active_snapshot() // back to live
+                                        } else {
+                                            inner.seal_scrollback()
+                                        };
+                                    }
+                                }
                                 _ => {}
                             }
+                        }
+                        // A keystroke while scrolled returns to the live screen.
+                        if env.msg_type == MsgType::Input && inner.scroll > 0 {
+                            inner.scroll = 0;
+                            inner.need_snapshot = true;
                         }
                         // Lazy spawn of window 0 on the first datagram.
                         if !inner.started {
@@ -380,9 +429,11 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
                             }
                         }
                         // Snapshot the active window when requested (reattach,
-                        // redraw, window switch/new).
+                        // redraw, window switch/new, return-to-live). Any live
+                        // snapshot is at the bottom, so clear the scroll offset.
                         if inner.need_snapshot && inner.started {
                             inner.need_snapshot = false;
+                            inner.scroll = 0;
                             snapshot = inner.seal_active_snapshot();
                         }
                         let pty = inner.active_pty();
@@ -613,8 +664,10 @@ fn reader(name: String, win_idx: usize, pty_fd: i32, state: Arc<SessionState>, u
             if let Some(w) = inner.windows.get_mut(win_idx) {
                 w.term.feed(bytes);
             }
-            // Only the active window streams to the client.
-            if inner.active == win_idx {
+            // Only the active window streams to the client, and only when not
+            // scrolled back (while viewing history, output is held — it still
+            // lands in the mirror/history and shows on return-to-live).
+            if inner.active == win_idx && inner.scroll == 0 {
                 inner.last_addr.map(|a| {
                     let w = seal(&inner.key, inner.tx_seq, OUTPUT, bytes);
                     inner.tx_seq = inner.tx_seq.wrapping_add(1);

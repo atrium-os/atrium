@@ -80,6 +80,10 @@ pub enum Control {
     SwitchWindow(u8),
     /// Client → server (Ctrl-B n): switch to the next live window.
     NextWindow,
+    /// Client → server (Ctrl-B `[`/`]`): page the scrollback view up/down.
+    /// Any keystroke (Input) returns to the live screen.
+    ScrollUp,
+    ScrollDown,
 }
 
 impl Control {
@@ -96,6 +100,8 @@ impl Control {
             Control::NewWindow => vec![7],
             Control::SwitchWindow(n) => vec![8, *n],
             Control::NextWindow => vec![9],
+            Control::ScrollUp => vec![10],
+            Control::ScrollDown => vec![11],
         }
     }
     pub fn decode(payload: &[u8]) -> Option<Control> {
@@ -109,6 +115,8 @@ impl Control {
             7 => Some(Control::NewWindow),
             8 if payload.len() >= 2 => Some(Control::SwitchWindow(payload[1])),
             9 => Some(Control::NextWindow),
+            10 => Some(Control::ScrollUp),
+            11 => Some(Control::ScrollDown),
             _ => None,
         }
     }

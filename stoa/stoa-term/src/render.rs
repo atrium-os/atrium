@@ -11,7 +11,23 @@
 
 use std::fmt::Write as _;
 
-use crate::{flags, Color, Grid};
+use crate::{flags, Cell, Color, Grid};
+
+/// Emit one cell, writing an SGR sequence only when its attributes differ
+/// from the last emitted (`cur`). Shared by snapshot + scrollback render.
+fn emit_cell(out: &mut String, cell: &Cell, cur: &mut Option<(Color, Color, u8)>) {
+    let want = (cell.fg, cell.bg, cell.flags);
+    let is_default = want == (Color::Default, Color::Default, 0);
+    let need = match cur {
+        Some(p) => *p != want,
+        None => !is_default,
+    };
+    if need {
+        out.push_str(&sgr_for(cell.fg, cell.bg, cell.flags));
+        *cur = Some(want);
+    }
+    out.push(cell.c);
+}
 
 /// Render the whole grid as a self-contained repaint: reset, clear, paint
 /// every cell with its attributes, then place the cursor. Suitable to send
@@ -32,24 +48,49 @@ pub fn render_snapshot(grid: &Grid) -> Vec<u8> {
         // misplace the next row).
         let _ = write!(out, "\x1b[{};1H", r + 1);
         for c in 0..grid.cols() {
-            let cell = grid.cell(r, c);
-            let want = (cell.fg, cell.bg, cell.flags);
-            let is_default = want == (Color::Default, Color::Default, 0);
-            let need = match cur {
-                Some(p) => p != want,
-                None => !is_default,
-            };
-            if need {
-                out.push_str(&sgr_for(cell.fg, cell.bg, cell.flags));
-                cur = Some(want);
-            }
-            out.push(cell.c);
+            emit_cell(&mut out, grid.cell(r, c), &mut cur);
         }
     }
 
     out.push_str("\x1b[0m");
     let (cr, cc) = grid.cursor();
     let _ = write!(out, "\x1b[{};{}H", cr + 1, cc + 1);
+    out.into_bytes()
+}
+
+/// Render a scrollback viewport: `rows` lines ending `offset` lines above
+/// the live bottom. `offset == 0` is the live screen (== `render_snapshot`
+/// minus the cursor). The combined buffer is history (oldest→newest) then
+/// the live screen rows. The cursor is hidden in scrollback.
+pub fn render_scrollback(grid: &Grid, offset: usize) -> Vec<u8> {
+    let rows = grid.rows() as usize;
+    let cols = grid.cols() as usize;
+    let hist = grid.history();
+    let total = hist.len() + rows;
+    let offset = offset.min(hist.len()); // can't page past the oldest line
+    let bottom = total - 1 - offset;
+    let top = (bottom + 1).saturating_sub(rows);
+
+    let mut out = String::new();
+    if !grid.title().is_empty() {
+        let _ = write!(out, "\x1b]2;{}\x07", grid.title());
+    }
+    out.push_str("\x1b[0m\x1b[2J\x1b[H");
+
+    let blank = Cell::default();
+    let mut cur: Option<(Color, Color, u8)> = None;
+    for (disp, i) in (top..=bottom).enumerate() {
+        let _ = write!(out, "\x1b[{};1H", disp + 1);
+        for c in 0..cols {
+            let cell = if i < hist.len() {
+                hist[i].get(c).copied().unwrap_or(blank)
+            } else {
+                *grid.cell((i - hist.len()) as u16, c as u16)
+            };
+            emit_cell(&mut out, &cell, &mut cur);
+        }
+    }
+    out.push_str("\x1b[0m");
     out.into_bytes()
 }
 
@@ -131,5 +172,28 @@ mod tests {
     #[test]
     fn snapshot_after_scroll() {
         assert_snapshot_round_trip(8, 2, b"l1\r\nl2\r\nl3\r\nl4");
+    }
+
+    #[test]
+    fn scrollback_pages_into_history() {
+        // 2-row screen; feed 4 lines → 2 scrolled into history.
+        let mut t = Terminal::new(8, 2);
+        t.feed(b"l1\r\nl2\r\nl3\r\nl4");
+        assert_eq!(t.grid().history().len(), 2); // l1, l2 scrolled off
+
+        // offset 0 = live screen (l3, l4).
+        let mut live = Terminal::new(8, 2);
+        live.feed(&render_scrollback(t.grid(), 0));
+        assert_eq!(live.rows_text(), vec!["l3".to_string(), "l4".to_string()]);
+
+        // offset 2 = paged all the way up (l1, l2).
+        let mut up = Terminal::new(8, 2);
+        up.feed(&render_scrollback(t.grid(), 2));
+        assert_eq!(up.rows_text(), vec!["l1".to_string(), "l2".to_string()]);
+
+        // offset 1 = one line up (l2, l3).
+        let mut mid = Terminal::new(8, 2);
+        mid.feed(&render_scrollback(t.grid(), 1));
+        assert_eq!(mid.rows_text(), vec!["l2".to_string(), "l3".to_string()]);
     }
 }
