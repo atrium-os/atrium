@@ -232,8 +232,10 @@ fn gov_signal(sig: i32) -> portcullis_ipc::GovSignal {
 
 /// One per-jail entry in a PRESSURE_GET snapshot. Layout MUST match
 /// `struct pressure_jail_stat` in <sys/pressure.h> (averages in basis points).
+const PRESSURE_JAIL_NAME: usize = 64;
+
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct PressureJailStat {
     jid: i32,
     full_avg10: u32,
@@ -241,6 +243,12 @@ struct PressureJailStat {
     full_avg300: u32,
     some_ns: u64,
     full_ns: u64,
+    /// Per-jail RSS bytes (RACCT_RSS); 0 if racct disabled. memfed reads
+    /// its budgeting RSS here instead of host `rctl -u`.
+    memoryuse: u64,
+    /// Jail name (NUL-terminated, truncated) so a jailed governor can match
+    /// snapshot entries to by-name config without resolving sibling jids.
+    name: [u8; PRESSURE_JAIL_NAME],
 }
 
 const PRESSURE_MAX_JAILS: usize = 16;
@@ -340,7 +348,32 @@ impl Drop for PressureKq {
     }
 }
 
+/// `--dump`: read one PRESSURE_GET snapshot and print every jail (jid, name,
+/// RSS, full PSI), then exit. Verifies the kernel's per-jail telemetry and is
+/// the operator's window onto what memfed/memoryd see. Run as root on the host
+/// (or jailed with /dev/pressure granted).
+fn dump_snapshot() {
+    let pkq = match PressureKq::new(4000) {
+        Some(k) => k,
+        None => { eprintln!("memoryd --dump: cannot open /dev/pressure"); std::process::exit(1); }
+    };
+    let snap = match pkq.snapshot() {
+        Some(s) => s,
+        None => { eprintln!("memoryd --dump: PRESSURE_GET failed (kernel/struct mismatch?)"); std::process::exit(2); }
+    };
+    println!("global: some_avg10={}bp full_avg10={}bp nstalled={} njails={}",
+        snap.some_avg10, snap.full_avg10, snap.nstalled, snap.njails);
+    for i in 0..(snap.njails as usize).min(PRESSURE_MAX_JAILS) {
+        let j = &snap.jails[i];
+        let end = j.name.iter().position(|&b| b == 0).unwrap_or(j.name.len());
+        let name = String::from_utf8_lossy(&j.name[..end]);
+        println!("  jid={:<4} name={:<26} rss={}MB full_avg10={}bp full_ns={}",
+            j.jid, name, j.memoryuse / (1024 * 1024), j.full_avg10, j.full_ns);
+    }
+}
+
 fn main() {
+    if has("--dump") { dump_snapshot(); return; }
     let armed = has("--arm");
     let trip = arg("--trip", "80").parse::<f64>().unwrap_or(80.0);
     let free_floor = arg("--free-floor", "256").parse::<u64>().unwrap_or(256);
