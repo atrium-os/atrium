@@ -127,7 +127,11 @@ fn usage() {
          attach mints/resumes the session and bridges the terminal over UDP.\n\
          Without --host, talks to the local stoad ($STOA_CTL); with --host,\n\
          runs `ssh user@host stoa-shell <name>`. --jail <id> jexecs into a\n\
-         running jail. Ctrl-B d / Ctrl-] detaches; Ctrl-B r redraws."
+         running jail.\n\
+         \n\
+         Prefix (Ctrl-B; $STOA_PREFIX, e.g. C-a): c new / n,p next,prev /\n\
+         l last / 0-9 window / [ ] scrollback / r redraw / d detach.\n\
+         $STOA_PREDICT=1 enables predictive echo (hides latency)."
     );
 }
 
@@ -206,6 +210,28 @@ fn parse_mint(s: &str) -> Result<(u16, Vec<u8>), String> {
     Ok((port, key))
 }
 
+/// The command prefix byte. `$STOA_PREFIX` overrides the default Ctrl-B:
+/// accepts `C-a`..`C-z` (control-letter), a decimal byte, or a single
+/// printable char's control form. Defaults to [`PREFIX_BYTE`] (Ctrl-B).
+fn prefix_byte() -> u8 {
+    match std::env::var("STOA_PREFIX") {
+        Ok(s) => {
+            let s = s.trim();
+            if let Some(rest) = s.strip_prefix("C-").or_else(|| s.strip_prefix("^")) {
+                // C-a → 0x01 … C-z → 0x1a
+                if let Some(c) = rest.bytes().next() {
+                    let lc = c.to_ascii_lowercase();
+                    if lc.is_ascii_lowercase() {
+                        return lc - b'a' + 1;
+                    }
+                }
+            }
+            s.parse::<u8>().unwrap_or(PREFIX_BYTE)
+        }
+        Err(_) => PREFIX_BYTE,
+    }
+}
+
 fn attach(name: &str, host: Option<&str>, jail: Option<&str>) {
     let (udp_host, port, key) = match mint(name, host, jail) {
         Ok(v) => v,
@@ -214,6 +240,7 @@ fn attach(name: &str, host: Option<&str>, jail: Option<&str>) {
             std::process::exit(1);
         }
     };
+    let prefix = prefix_byte();
 
     let sock = match UdpSocket::bind("0.0.0.0:0").and_then(|s| {
         s.connect((udp_host.as_str(), port))?;
@@ -254,7 +281,7 @@ fn attach(name: &str, host: Option<&str>, jail: Option<&str>) {
         let sstop = stop.clone();
         let sseq = tx_seq.clone();
         let spred = predictor.clone();
-        thread::spawn(move || stdin_loop(ssock, skey, sseq, sstop, spred));
+        thread::spawn(move || stdin_loop(ssock, skey, sseq, sstop, spred, prefix));
     }
     // resize poller → a Resize datagram whenever the terminal size changes.
     {
@@ -326,6 +353,7 @@ fn stdin_loop(
     seq: Arc<AtomicU32>,
     stop: Arc<AtomicBool>,
     pred: Option<Arc<Mutex<Predictor>>>,
+    prefix: u8,
 ) {
     // Flush accumulated keystrokes as one Input datagram (preserving order
     // relative to commands).
@@ -340,7 +368,7 @@ fn stdin_loop(
     };
 
     let mut chunk = [0u8; 4096];
-    let mut prefix = false; // saw Ctrl-B; next byte is a command
+    let mut in_prefix = false; // saw the prefix; next byte is a command
     let mut pending: Vec<u8> = Vec::new();
     loop {
         let n = match std::io::stdin().lock().read(&mut chunk) {
@@ -351,8 +379,8 @@ fn stdin_loop(
             Ok(n) => n,
         };
         for &b in &chunk[..n] {
-            if prefix {
-                prefix = false;
+            if in_prefix {
+                in_prefix = false;
                 flush(&mut pending); // commands run after queued input
                 match b {
                     b'd' | DETACH_BYTE => {
@@ -367,12 +395,12 @@ fn stdin_loop(
                     b'0'..=b'9' => send_ctl(Control::SwitchWindow(b - b'0')), // window n
                     b'[' => send_ctl(Control::ScrollUp), // scrollback page up
                     b']' => send_ctl(Control::ScrollDown), // scrollback page down
-                    PREFIX_BYTE => pending.push(PREFIX_BYTE), // literal Ctrl-B
+                    x if x == prefix => pending.push(prefix), // literal prefix
                     _ => {} // unknown command: ignored
                 }
-            } else if b == PREFIX_BYTE {
+            } else if b == prefix {
                 flush(&mut pending); // keep input before the prefix in order
-                prefix = true;
+                in_prefix = true;
             } else if b == DETACH_BYTE {
                 flush(&mut pending);
                 stop.store(true, Ordering::SeqCst);
