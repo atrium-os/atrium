@@ -71,8 +71,12 @@ Three binaries:
 
 - **`stoad`** — system-wide daemon (one per host, like sshd).
   Owns sockets, ptys, multiplexer state, scrollback, MAC keys.
-  Runs as `_atrium`; spawns user shells via `jaild` into the
-  user's Portcullis session jail.
+  Runs **jailed + non-root** (a dedicated `_stoad` uid, like
+  `_frescod`/`_ostiarius`); it never calls `jail_set`/`jail_attach`
+  itself. Shells are spawned through the **portcullisd broker**
+  (§4.5, §11) — the sole path to `jaild` after the TCB de-rooting —
+  behind a `ShellSpawner` seam so a dev/macOS build can spawn
+  directly, no jail, for testing (§11.1).
 - **`stoactl`** — the client. CLI (`stoactl attach work-build`) +
   TUI rendering. Phase 4 adds a Fresco-protocol GUI variant that
   renders into Atrium's compositor.
@@ -244,6 +248,90 @@ full command grammar — just the bindings that map to our
 Layout state (tree shape, splits, focused pane) is part of session
 state; it persists.
 
+## 4.5 Session targets and jail exec (jexec, reimagined)
+
+> Added 2026-06-25, reconciling Stoa with the TCB de-rooting
+> (jid-0-root is now exactly jaild + portcullisd + bootstrap; every
+> jail launch brokers through portcullisd). The original spec
+> (2026-05-10) predates this and had `stoad` talk to jaild directly.
+
+A Stoa session has a **target** — *which* jail its shells attach to:
+
+```rust
+enum Target {
+    SessionJail,        // the user's per-user session jail (default)
+    Jail(String),       // a specific running jail, by name
+}
+```
+
+`SessionJail` is the common case (§17 used to call it the *only*
+case): a normal login, shells in the user's own session jail.
+`Jail(name)` is the new capability — **a persistent, flaky-tolerant
+shell *inside a specific running jail*.** This is `jexec(8)`
+reimagined: `ssh host jexec app-foo sh` dies on every drop and keeps
+no scrollback; a Stoa jail-target session survives drops, roams, and
+persists its history like any other Stoa session.
+
+```
+stoactl attach --jail org.atrium.editor        # jexec, persistent
+stoactl new dbg --jail app-foo -- /bin/sh
+```
+
+Over the network this is just the aqueduct-remote session scope
+([aqueduct-remote.md](aqueduct-remote.md) §4) pointed at a jail:
+`aqueduct-shell mint stoa --jail org.atrium.editor` mints a token
+whose `scope = "app:org.atrium.editor"`. No new subsystem — the
+session-capability machinery already carries it.
+
+### 4.5.1 Two spawn paths, two lifetimes
+
+`stoad` never calls `jail_set`/`jail_attach` itself (it is jailed +
+non-root). It asks the **portcullisd broker**, the sole path to
+jaild after the de-rooting. There are two broker verbs, and the
+lifetime distinction between them is the crux:
+
+| | create a session jail | exec into an existing jail |
+|---|---|---|
+| broker verb | `LaunchSessionComponent` (exists) | **`ExecInJail`** (new) |
+| target | `SessionJail` | `Jail(name)` |
+| action | `jail_set` + exec a fresh jail | `jail_attach` an already-running jail |
+| jail lifetime | Stoa/portcullisd owns it (holds the procdesc) | belongs to **whoever launched it** — Stoa is a *guest* |
+| Stoa teardown | kills the jail | kills **only the exec'd shell**; the jail keeps running |
+
+Tearing down a debug session must never take the target app down
+with it.
+
+### 4.5.2 The new jaild primitive
+
+`ExecInJail { jid_or_name, exec, uid }` — jaild `pdfork`s a child
+that `jail_attach`es the *existing* jid (no `jail_set`), drops to
+`uid`, and execs. It is `CreateJail`'s child path minus the
+`jail_set`. Gated **jaild-created-only** — the same protection
+`Reap`/`SetRctl` already enforce ("refuses any jail it did not
+itself create") — so a jail-exec can never attach into the TCB or
+jid 0. Returns a procdesc for the exec'd shell so the broker (and
+through it, Stoa) reaps exactly that process, never the jail.
+
+### 4.5.3 The capability gate
+
+Jail-exec is jail-escape-adjacent, so portcullisd mediates it,
+default-deny, reusing identity already on hand:
+
+- **Who may target jail X?** The launch registry already records
+  `uid → (owner, app-id)` for every jaild-created jail
+  (`portcullis-peer`). Requester **owns** X → allowed (debug your
+  own app). Requester holds an **operator `jail_exec` capability**
+  → allowed into any jaild-created jail (admin). Neither → denied.
+- **Which uid inside?** Default = the jail's **app-uid (non-root)**:
+  you get the app's exact view (the debugging case), and the
+  de-rooting invariant holds — a jexec shell is non-root by
+  default. **Root-inside-the-jail is a separate, higher cap**
+  (`jail_exec_root`): an explicit, gated escalation, never implied.
+
+**Blast radius** is correct by construction: a shell attached into
+jail X runs *inside* X, bounded by X's chroot root, devfs ruleset,
+and network. You gain the jail's authority — not the host's.
+
 ## 5. Persistence and Tessera-backed scrollback
 
 Scrollback is **the** distinguishing property. tmux's scrollback is
@@ -402,9 +490,15 @@ or tmux-hacks.
 
 ## 11. Security
 
-- `stoad` runs as `_atrium`. Spawning a shell as `<user>` requires
-  asking `jaild` (Portcullis's privileged broker; spec/portcullis.md
-  §0.5) to do it.
+- `stoad` runs **jailed + non-root** (a dedicated `_stoad` uid). It
+  holds no privilege of its own: every shell spawn — creating the
+  user's session jail (`LaunchSessionComponent`) or exec'ing into an
+  existing jail (`ExecInJail`, §4.5) — goes through the
+  **portcullisd broker**, the sole caller of `jaild` (itself the
+  sole `jail_set`/`jail_attach` caller) after the TCB de-rooting.
+  portcullisd capability-checks each request (ownership /
+  `jail_exec` / `jail_exec_root`); granting `stoad` jaild-socket
+  access directly would be escape-equivalent, so it never gets it.
 - Each session's MAC key is derived from a per-session nonce ⊕
   SSH session id; not stored across daemon restarts (re-handshake
   is required after restart, even if the underlying session
@@ -417,6 +511,27 @@ or tmux-hacks.
 - `stoactl` shows the active session's MAC key fingerprint (`stoactl
   status`) so a user can verify they're attached to the right
   session, not a spoofed one.
+
+### 11.1 The `ShellSpawner` seam (dev + portability)
+
+The privileged spawn sits behind a `ShellSpawner` trait, mirroring
+ostiarius's `Launcher` seam (the de-rooting pattern):
+
+- **`BrokerSpawner`** (FreeBSD, production) — brokers through
+  portcullisd (`LaunchSessionComponent` for `SessionJail`,
+  `ExecInJail` for `Jail(name)`). The real, jailed,
+  capability-checked path.
+- **`DirectSpawner`** (macOS + FreeBSD dev) — `openpty` + `fork` +
+  `execve` a shell as the current user, no jail. Errors on a
+  `Jail(name)` target (no jails off-Atrium). This is how the
+  transport / SSP predictor / multiplexer — the bulk of the code,
+  and the flaky-connection behavior that motivates Stoa — are
+  testable on the macOS host with no VM in the loop.
+
+A macOS `stoactl` is a **shipping** client (TUI; the Fresco-GUI
+variant of §13 is Atrium-only). A macOS `stoad` is a **dev harness**
+— invaluable for fast protocol iteration, not a product (Atrium is
+FreeBSD). The wire is identical; only the far-end spawner differs.
 
 ## 12. Aqueduct integration
 
@@ -483,8 +598,8 @@ emulator + remote-shell client) into one.
 ## 14. CLI surface
 
 ```
-stoactl new <name> [-- <cmd>]      Create a session, optionally with a command
-stoactl attach <name>              Attach to a session (creates if not exists)
+stoactl new <name> [--jail <id>] [-- <cmd>]   Create a session; --jail targets a specific jail (§4.5)
+stoactl attach <name> [--jail <id>]           Attach (creates if not exists); --jail = jexec into that jail
 stoactl list                       List my sessions on this host
 stoactl detach                     Detach the active client (session continues)
 stoactl kill <name>                Kill a session and its processes
@@ -517,17 +632,21 @@ detects "I'm being run via stoa-shell" and switches modes.
 
 | Slice | Scope                                                         | LoC est | Time |
 |-------|---------------------------------------------------------------|---------|------|
-| S0    | Skeleton: stoad + stoactl + sshd handoff + 1 window, TCP, no prediction | 2k      | 1–2 wk |
-| S1    | UDP envelope + MAC + replay window + clean-room SSP predictor | 2k      | 2 wk |
+| S0    | Skeleton: stoad + stoactl + sshd handoff + 1 window, TCP, no prediction. `ShellSpawner` seam with `DirectSpawner` — **fully testable on the macOS host, no VM** (§11.1) | 2k      | 1–2 wk |
+| S1    | UDP envelope + MAC + replay window + clean-room SSP predictor (macOS host, injected loss/reorder) | 2k      | 2 wk |
 | S2    | Multi-window/pane + tmux-compat keymap + layout serialization | 1.5k    | 2 wk |
+| Sj    | **Jail awareness** (§4.5): `BrokerSpawner` (portcullisd `LaunchSessionComponent`); `ExecInJail` broker verb + jaild primitive + the ownership/`jail_exec`/`jail_exec_root` cap gate; session `Target` + `--jail`. **First VM-only slice.** | 1.5k | 2 wk |
 | S3    | Tessera-backed scrollback + WAL + restart replay              | 1k      | 1 wk |
 | S4    | Multi-client mirror + `stoactl push/pull` + clipboard         | 1k      | 1 wk |
 | S5    | UDP-over-TCP fallback + corporate-NAT story                   | 0.5k    | 1 wk |
 | S6    | `stoactl-gui` (Fresco surface renderer) + atrium-term wrapper | 1.5k    | 2 wk |
 
-Total: ~9.5k LoC, 10–12 weeks focused. Independent of D-track work
+Total: ~11k LoC, 12–14 weeks focused. Independent of D-track work
 above it (D2.7 sits between Portcullis D2.5 and Forum D3); doesn't
-block any current milestone.
+block any current milestone. **S0–S2 build + test entirely on the
+macOS host** (transport, predictor, multiplexer — the bulk and the
+flaky-connection win); **Sj is the first slice that needs the VM**
+(the jailed broker path).
 
 ## 16. Clean-room SSP — license note
 
@@ -553,9 +672,11 @@ constrained to match it; our envelope (§3.1) is our own.
   CAS makes this cheap (the blobs are deduped), but the index is
   per-session for now. v1 ships per-session search; cross-session
   is a follow-up.
-- **Per-jail vs per-user sessions**: a user's sessions all share a
-  single Portcullis session jail (matches current Forum/D3
-  behavior). Could change if we ever want per-session jails.
+- **Per-jail vs per-user sessions** — RESOLVED (§4.5): a session's
+  *default* target is the user's single per-user session jail
+  (matches Forum/D3); a session may instead **target a specific
+  jail** (`--jail`, the jexec case). Per-user-session-jail is the
+  default, not the only option.
 - **Logging**: `stoad` logs (connect/disconnect events, errors)
   go where? Lean: `/var/log/atrium/stoad.log`, rotated by
   `atrium-log` (D3 service-management).
@@ -574,9 +695,9 @@ constrained to match it; our envelope (§3.1) is our own.
 
 | Component       | Relationship                                                        |
 |-----------------|---------------------------------------------------------------------|
-| **Aqueduct**    | local control plane (`stoactl list`); CLASS_STOA=9                  |
+| **Aqueduct**    | local control plane (`stoactl list`); CLASS_STOA=8                  |
 | **Tessera**     | scrollback persistence + dedup                                      |
-| **Portcullis**  | session shells run in user's session jail; jaild spawns them        |
+| **Portcullis**  | shells spawned via the **portcullisd broker** (sole jaild caller): `LaunchSessionComponent` for the session jail, `ExecInJail` for jail-target sessions (§4.5); `stoad` is jailed + non-root |
 | **sshd**        | one-time userauth handshake; otherwise uninvolved                   |
 | **Vestibulum**  | the desktop login also triggers a stoa session for that seat        |
 | **Forum (D3)**  | "Sessions" panel; atrium-term is `stoactl-gui` underneath           |

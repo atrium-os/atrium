@@ -143,6 +143,14 @@ clipboard = true            # existing capability names as services need them
 - A `window:<id>`-scoped session is remote Limen in embryo —
   role-typed single-surface sharing across the network. When
   screen-share lands, it is a token mint, not a new subsystem.
+- A `scope = "app:<id>"`-scoped session is **Stoa's jail-target
+  shape** ([stoa.md](stoa.md) §4.5): the remote session attaches a
+  shell *into that one jail* (`ExecInJail`), not the user's whole
+  session — `jexec(8)` reimagined as a persistent, flaky-tolerant
+  Stoa session. The capability scope and the jail target are the
+  same concept seen from the two specs; portcullisd gates it by
+  ownership or an operator `jail_exec` cap, shell non-root in the
+  jail by default.
 
 Mid-session capability *upgrades* are out of scope: reconnect with
 a new token (cheap — recovery and reattach already make reconnect
