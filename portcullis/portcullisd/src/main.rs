@@ -101,7 +101,7 @@ fn main() -> ExitCode {
     eprintln!("portcullisd: listening on {} (multi-tenant)",
         socket_path.display());
 
-    let shared = Arc::new(Mutex::new(Tenants { cache: HashMap::new() }));
+    let shared = Arc::new(Mutex::new(Tenants { cache: HashMap::new(), session_procdescs: HashMap::new() }));
 
     for conn in listener.incoming() {
         match conn {
@@ -130,6 +130,11 @@ struct TenantPolicy {
 
 struct Tenants {
     cache: HashMap<String, TenantPolicy>,
+    /// Session-component procdescs portcullisd holds on ostiarius's behalf,
+    /// keyed by jail name. Holding the fd here (the long-lived root TCB daemon)
+    /// keeps each persist=0 session jail alive; dropping it on teardown kills the
+    /// jail. See docs/spec/ostiarius-privsep.md §2.1.
+    session_procdescs: HashMap<String, std::os::fd::OwnedFd>,
 }
 
 impl Tenants {
@@ -238,8 +243,12 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
         /* Session-launcher broker verbs — same peer-uid gating shape as the
          * governor verbs (the caller must be a `session_launch` service, i.e.
          * the jailed, non-root _ostiarius). docs/spec/ostiarius-privsep.md. */
-        if matches!(req, Request::LaunchSessionComponent { .. } | Request::VerifyCredential { .. }) {
-            let resp = handle_session(uid, req);
+        if matches!(req,
+            Request::LaunchSessionComponent { .. }
+            | Request::VerifyCredential { .. }
+            | Request::TeardownSessionComponent { .. })
+        {
+            let resp = handle_session(uid, req, &shared);
             write_response(&mut writer, &resp)?;
             continue;
         }
@@ -420,7 +429,11 @@ fn handle_govern(uid: u32, req: Request) -> Response {
 /// INNER gate: the peer uid must own a services.d manifest granting
 /// `session_launch` (mirrors `handle_govern`'s `memory_govern`). OUTER bound:
 /// the session-component registry (for launches). docs/spec/ostiarius-privsep.md.
-fn handle_session(uid: u32, req: Request) -> Response {
+/// Declared session components live here (services.d manifest format, but
+/// session-scoped: the exec.uid is a placeholder overridden per-session).
+const SESSION_DIR: &str = "/etc/atrium/session.d";
+
+fn handle_session(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
     use portcullisd::system_services;
 
     let authorized = match system_services::load_dir(std::path::Path::new(SERVICES_DIR)) {
@@ -450,19 +463,77 @@ fn handle_session(uid: u32, req: Request) -> Response {
                 Response::CredentialVerified { user }
             }
         }
-        Request::LaunchSessionComponent { component_id, .. } => {
-            // Registry-bounded launch: look component_id up in the session-
-            // component registry, fill the per-session owner, forward CreateJail
-            // to jaild. The registry loader is step 3 (not yet wired); until then
-            // ostiarius keeps its direct-jaild path. Refusing is safe + additive —
-            // nothing depends on this verb yet.
-            Response::Error {
-                message: format!(
-                    "LaunchSessionComponent({component_id}): session-component \
-                     registry not yet wired — see docs/spec/ostiarius-privsep.md step 3"),
-            }
-        }
+        Request::LaunchSessionComponent { component_id, owner_uid, .. } =>
+            launch_session_component(&component_id, owner_uid, shared),
+        Request::TeardownSessionComponent { jail_name } =>
+            teardown_session_component(&jail_name, shared),
         _ => Response::Error { message: "not a session request".into() },
+    }
+}
+
+/// Registry-bounded session launch. Find `component_id` in the session-component
+/// registry (unknown → refused, so `_ostiarius` is confined to the declared set),
+/// fill the per-session owner uid, forward `CreateJail` to jaild, and HOLD the
+/// returned procdesc in daemon state so the persist=0 jail stays alive.
+fn launch_session_component(component_id: &str, owner_uid: u32,
+                            shared: &Mutex<Tenants>) -> Response {
+    use portcullisd::{jaild_client::Client, system_services};
+    use std::os::fd::FromRawFd;
+
+    let manifests = match system_services::load_dir(std::path::Path::new(SESSION_DIR)) {
+        Ok(o) => o.manifests,
+        Err(e) => return Response::Error { message: format!("session.d load: {e}") },
+    };
+    let manifest = match manifests.into_iter().find(|m| m.name == component_id) {
+        Some(m) => m,
+        None => return Response::Error { message: format!(
+            "session-component.unknown: {component_id:?} not declared in {SESSION_DIR}") },
+    };
+    let mut create = manifest.to_create_request();
+    // The only ostiarius-supplied input: the allocated per-session uid overrides
+    // the manifest placeholder. Validated by jaild against its uid policy.
+    if let Some(exec) = create.exec.as_mut() {
+        exec.uid = owner_uid;
+        exec.gid = owner_uid;
+    }
+    let jail_name = create.name.clone();
+
+    let mut client = match Client::connect(JAILD_SOCK) {
+        Ok(c) => c,
+        Err(e) => return Response::Error { message: format!("jaild connect: {e}") },
+    };
+    match client.send(&jaild::protocol::Request::CreateJail(create)) {
+        Ok((jaild::protocol::Response::JailCreated(r), fd)) => {
+            if let Some(raw) = fd {
+                // SAFETY: jaild_client just received this procdesc fd via SCM_RIGHTS
+                // and handed us ownership. Holding the OwnedFd in daemon state keeps
+                // the persist=0 jail alive until teardown drops it.
+                let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+                shared.lock().unwrap().session_procdescs.insert(jail_name.clone(), owned);
+            }
+            Response::SessionComponentLaunched { pid: r.pid, jid: r.jid, jail_name }
+        }
+        Ok((jaild::protocol::Response::PolicyDenied { rule, detail }, _)) =>
+            Response::Error { message: format!("jaild denied [{rule}]: {detail}") },
+        Ok((other, _)) => Response::Error { message: format!("jaild: {other:?}") },
+        Err(e) => Response::Error { message: format!("jaild send: {e}") },
+    }
+}
+
+/// Tear down a session component: drop the held procdesc (the kernel kills the
+/// jailed process + reaps the persist=0 jail) and RemoveJail by name to clear
+/// jaild state. NB: the create-time host mounts are cleaned the same way the
+/// supervisor does it (host_mount::unmount_jail_dest) — TODO wire here too; until
+/// then a stale-mount sweep before relaunch covers it (same as the governors).
+fn teardown_session_component(jail_name: &str, shared: &Mutex<Tenants>) -> Response {
+    use portcullisd::jaild_client::Client;
+    shared.lock().unwrap().session_procdescs.remove(jail_name);
+    let req = jaild::protocol::Request::RemoveJail {
+        jid: None, name: Some(jail_name.to_string()),
+    };
+    match Client::connect(JAILD_SOCK).and_then(|mut c| c.send(&req)) {
+        Ok(_) => Response::Ok,
+        Err(e) => Response::Error { message: format!("teardown RemoveJail: {e}") },
     }
 }
 
@@ -545,7 +616,9 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
             /* Caught by serve() before reaching here (routed to handle_govern). */
             message: "internal: governor verbs must go through handle_govern".into(),
         },
-        Request::LaunchSessionComponent { .. } | Request::VerifyCredential { .. } => Response::Error {
+        Request::LaunchSessionComponent { .. }
+        | Request::VerifyCredential { .. }
+        | Request::TeardownSessionComponent { .. } => Response::Error {
             /* Caught by serve() before reaching here (routed to handle_session). */
             message: "internal: session verbs must go through handle_session".into(),
         },
@@ -577,7 +650,7 @@ mod tests {
             let listener = UnixListener::bind(&socket).unwrap();
             std::fs::set_permissions(&socket,
                 std::fs::Permissions::from_mode(0o666)).unwrap();
-            let shared = Arc::new(Mutex::new(Tenants { cache: HashMap::new() }));
+            let shared = Arc::new(Mutex::new(Tenants { cache: HashMap::new(), session_procdescs: HashMap::new() }));
             for conn in listener.incoming() {
                 let stream = conn.unwrap();
                 let s = Arc::clone(&shared);

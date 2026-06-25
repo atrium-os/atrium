@@ -65,9 +65,15 @@ portcullisd:
 4. Forwards the fully-formed `CreateJail` to jaild and returns the
    pid/procdesc handle (or the launch error) to ostiarius.
 
-The procdesc is held by **bootstrap/portcullisd**, not ostiarius — so the
-session jail's lifetime is owned by the TCB, and a crashed/compromised
-`_ostiarius` cannot silently leak or orphan session jails.
+jaild returns the session jail's procdesc fd to portcullisd (`Client::send` ->
+`(Response, Option<fd>)`). **portcullisd holds that fd in daemon state**, keyed
+by jail name (it is the long-lived root TCB daemon, already `Arc<Mutex>`-stated)
+— so the procdesc, and thus the session jail's lifetime, lives in the TCB, not
+in ostiarius. A `TeardownSessionComponent { jail_name }` verb (logout, or the
+component exiting) closes the fd, killing the persist=0 jail, and is gated on the
+same `session_launch` grant. This preserves the die-with-holder safety inside the
+TCB and means a crashed/compromised `_ostiarius` can neither leak nor silently
+keep session jails alive.
 
 ### 2.2 Capability: `VerifyCredential`
 

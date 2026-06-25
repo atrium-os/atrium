@@ -133,6 +133,14 @@ pub enum Request {
         user:     String,
         password: String,
     },
+
+    /// `_ostiarius` asks portcullisd to tear down a session component it launched
+    /// (logout, or the component exited). portcullisd closes the procdesc it holds
+    /// for `jail_name` — killing the persist=0 jail — and RemoveJails it. Same
+    /// `session_launch` gate.
+    TeardownSessionComponent {
+        jail_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

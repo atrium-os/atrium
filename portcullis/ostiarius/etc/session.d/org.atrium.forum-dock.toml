@@ -1,0 +1,53 @@
+# /etc/atrium/session.d/org.atrium.forum-dock.toml
+#
+# A DECLARED session component (Forum session component). portcullisd's handle_session loads
+# this registry; a LaunchSessionComponent{component_id="org.atrium.forum-dock"}
+# from the jailed _ostiarius launches exactly this — an UNDECLARED id is refused,
+# which is what bounds _ostiarius to the session set (never an arbitrary jail).
+# See docs/spec/ostiarius-privsep.md. Same shape as the ostiarius spec() it
+# replaces (the standard session rootfs + a real per-jail root + devfsrules_jail).
+#
+# `uid`/`gid` are PLACEHOLDERS — portcullisd overrides them with the per-session
+# owner uid ostiarius supplies (here the reserved login identity). The standard
+# /atrium/sockets mount carries frescod + ostiarius + portcullisd sockets, so no
+# per-cap mounts are needed; the app's caps are audit metadata, not mounts.
+
+enabled       = true
+name          = "org.atrium.forum-dock"
+path          = "/var/lib/atrium/jails/org.atrium.forum-dock"
+children_max  = 0
+devfs_ruleset = 4
+
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/lib"
+dest   = "usr/local/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/share/atrium"
+dest   = "usr/local/share/atrium"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/atrium/sockets"
+dest   = "atrium/sockets"
+kind   = "ro_nullfs"
+
+[exec]
+path = "/usr/local/share/atrium/apps/org.atrium.forum-dock/bin/forum-dock"
+argv = ["forum-dock"]
+uid  = 50000   # placeholder — overridden by the per-session owner uid
+gid  = 50000
+[[exec.env]]
+key   = "PATH"
+value = "/bin:/usr/bin:/usr/local/bin"
