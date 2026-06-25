@@ -281,6 +281,7 @@ mod ffi {
 mod ffi {
     use std::io;
     use std::time::Duration;
+    #[allow(dead_code)] // host stub: mirrors the FreeBSD KqEvent for parity
     pub struct KqEvent { pub udata: usize, pub fflags: u32, pub data: isize }
     pub fn kqueue() -> io::Result<i32> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "EVFILT_PROCDESC: FreeBSD only"))

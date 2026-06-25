@@ -25,9 +25,6 @@ use std::path::PathBuf;
 
 pub use portcullis_peer::seat;
 
-#[cfg(feature = "pam")]
-pub mod pam;
-
 /// Which vestibulum frontend authenticated — GUI (on Fresco) or CLI (a tty/serial
 /// console, the display-down fallback). Same trusted flow either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -127,9 +124,6 @@ pub struct Ostiarius<L: Launcher> {
     launcher: L,
     /// Path to the seat's active-session file (default `seat::ACTIVE_SESSION`).
     seat_path: String,
-    /// PAM service to authenticate against (`/etc/pam.d/<service>`). `None` → the
-    /// dev/test stub (any non-empty credential).
-    pam_service: Option<String>,
     /// All live sessions: human → the app-ids launched for them. Fast-user-
     /// switching keeps every session here ALIVE; the seat selects which one is
     /// active (only the active session's audio/windows are live — the seat-aware
@@ -142,7 +136,6 @@ impl<L: Launcher> Ostiarius<L> {
         Ostiarius {
             launcher,
             seat_path: seat::ACTIVE_SESSION.to_string(),
-            pam_service: None,
             sessions: HashMap::new(),
         }
     }
@@ -150,12 +143,6 @@ impl<L: Launcher> Ostiarius<L> {
     /// Use a non-default seat file (tests).
     pub fn with_seat_path(mut self, path: impl Into<String>) -> Self {
         self.seat_path = path.into();
-        self
-    }
-
-    /// Authenticate against this PAM service instead of the stub (production).
-    pub fn with_pam(mut self, service: impl Into<String>) -> Self {
-        self.pam_service = Some(service.into());
         self
     }
 
@@ -187,8 +174,7 @@ impl<L: Launcher> Ostiarius<L> {
         // Auth runs through the launcher seam: the production JaildLauncher
         // forwards to the portcullisd broker, which runs PAM as root and reads
         // shadow — this jailed, non-root ostiarius never can. Demo launchers use
-        // the trait's default stub. (pam_service / with_pam below are now
-        // vestigial — PAM lives in portcullisd; see docs/spec/ostiarius-privsep.md.)
+        // the trait's default stub. See docs/spec/ostiarius-privsep.md.
         self.launcher.verify_credential(user, password)
     }
 
@@ -349,46 +335,6 @@ pub mod control {
     }
 }
 
-/// The production launcher: drives the TCB exactly as `atrium-launch` does —
-/// verify the manifest (trusted publisher) → allocate a dedicated uid → register
-/// the binding → ask jaild to jail + drop-to-uid + exec. Only connects to jaild at
-/// runtime; constructing it is free.
-/// The standard rootfs nullfs mounts a session app's per-jail root needs: the
-/// dynamic linker + libs, the Atrium runtime/bundle tree (which holds the app's
-/// `apps/<id>/bin/<bin>`), and the service sockets (whole-dir for now; per-cap
-/// scoping is a refinement). All read-only; sources must be on the jaild policy's
-/// `mount_sources.ro_paths`; dests are relative to the jail root.
-///
-/// NOTE: this is a first-cut set proven sufficient for the governor's Rust
-/// binary. Each session app must be launch-tested on deploy — a missing mount is
-/// a failed exec (a broken login). `/bin`, `/usr/bin`, `/etc` may be needed by
-/// shells/subprocesses (the CLI console-shell); add per app as testing shows.
-fn session_rootfs_mounts() -> Vec<jaild::protocol::MountSpec> {
-    use jaild::protocol::{MountKind, MountSpec};
-    let ro = |src: &str, dst: &str| MountSpec {
-        source: src.to_string(), dest: dst.to_string(), kind: MountKind::RoNullfs,
-    };
-    vec![
-        ro("/libexec", "libexec"),                               // ld-elf.so.1
-        ro("/lib", "lib"),                                       // libc, libthr
-        ro("/usr/lib", "usr/lib"),
-        ro("/usr/local/lib", "usr/local/lib"),
-        ro("/usr/local/share/atrium", "usr/local/share/atrium"), // runtime + apps/<id> bundle
-        ro("/atrium/sockets", "atrium/sockets"),                 // service sockets
-    ]
-}
-
-/// Mountpoint dirs to create inside a jail root before jaild mounts onto them
-/// (jaild applies the nullfs + the per-jail devfs, but each dest dir must exist).
-const SESSION_MOUNTPOINTS: &[&str] = &[
-    "dev", "libexec", "lib", "usr/lib", "usr/local/lib",
-    "usr/local/share/atrium", "atrium/sockets",
-];
-
-/// devfsrules_jail (the FreeBSD-standard jail /dev: null/zero/random/tty, NO
-/// kmem/mem/pci/gpu). Must be in the jaild policy's `devfs_rulesets.allowed_ids`.
-const SESSION_DEVFS_RULESET: u32 = 4;
-
 /// Launches session components through the portcullisd BROKER (no longer jaild
 /// directly — that needs root). ostiarius runs jailed + non-root as _ostiarius;
 /// the broker holds the session-component registry (trust), allocates+registers
@@ -478,30 +424,6 @@ fn jail_name(app_id: &str) -> String {
     format!("app-{}", app_id.replace(['.', '/'], "-"))
 }
 
-fn read_sig(p: &std::path::Path) -> Vec<u8> {
-    let raw = std::fs::read(p).unwrap_or_default();
-    if let Ok(s) = std::str::from_utf8(&raw) {
-        if let Ok(der) = portcullis_sig::sig_from_base64(s) {
-            return der;
-        }
-    }
-    raw
-}
-
-fn load_publishers(dir: &str) -> Vec<String> {
-    let mut v = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            if e.path().extension().and_then(|x| x.to_str()) == Some("pem") {
-                if let Ok(p) = std::fs::read_to_string(e.path()) {
-                    v.push(p);
-                }
-            }
-        }
-    }
-    v
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,18 +435,6 @@ mod tests {
         assert_ne!(s.jail_path, "/", "no more path=/ — must be a real root");
         assert!(s.jail_path.starts_with(JAILS_DIR));
         assert!(s.jail_path.ends_with("org.atrium.vestibulum"));
-    }
-
-    /// The rootfs mount set carries the dynamic linker, libs, the bundle tree,
-    /// and the service sockets — all read-only.
-    #[test]
-    fn rootfs_mounts_are_complete_and_readonly() {
-        use jaild::protocol::MountKind;
-        let m = session_rootfs_mounts();
-        assert!(m.iter().all(|x| matches!(x.kind, MountKind::RoNullfs)), "all ro");
-        for src in ["/libexec", "/lib", "/usr/lib", "/usr/local/share/atrium", "/atrium/sockets"] {
-            assert!(m.iter().any(|x| x.source == src), "missing mount source {src}");
-        }
     }
 
     /// A recording launcher — proves the orchestration without a live jaild.

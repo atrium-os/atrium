@@ -179,9 +179,11 @@ fn main() {
     // Daemon mode: listen on the control socket for vestibulum's authenticated
     // logins, peer-gated by getpeereid. Boot launches the login UI first.
     const SOCK: &str = "/atrium/sockets/ostiarius/ostiarius.sock";
-    // Real PAM (/etc/pam.d/atrium-login) when built --features pam; the stub
-    // otherwise (which refuses, so the production daemon must be a pam build).
-    let mut o = Ostiarius::new(JaildLauncher::default()).with_pam("atrium-login");
+    // Auth + launch both go through the portcullisd broker (PAM runs there, as
+    // root; this jailed ostiarius never reads shadow). $BROKER_SOCK overrides.
+    let mut launcher = JaildLauncher::default();
+    if let Ok(b) = std::env::var("BROKER_SOCK") { launcher.broker_sock = b; }
+    let mut o = Ostiarius::new(launcher);
     if let Err(e) = o.boot() {
         eprintln!("ostiarius: boot (launch vestibulum): {e}");
     }
