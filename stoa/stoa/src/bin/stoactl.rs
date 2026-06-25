@@ -130,8 +130,10 @@ fn usage() {
          running jail.\n\
          \n\
          Prefix (Ctrl-B; $STOA_PREFIX, e.g. C-a): c new / n,p next,prev /\n\
-         l last / 0-9 window / [ ] scrollback / r redraw / d detach.\n\
-         $STOA_PREDICT=1 enables predictive echo (hides latency)."
+         l last / 0-9 window / %,\" split V,H / o pane / [ ] scrollback /\n\
+         r redraw / d detach (also Ctrl-]).\n\
+         $STOA_PREDICT=1 predictive echo (raw mode); $STOA_SYNC=1 grid-sync\n\
+         streaming (self-healing on a flaky link; supersedes predict)."
     );
 }
 
