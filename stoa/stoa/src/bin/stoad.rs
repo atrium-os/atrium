@@ -54,6 +54,14 @@ struct Inner {
     /// until the client's first Resize.
     cols: u16,
     rows: u16,
+    /// Server-side mirror of the screen — every byte sent to the client is
+    /// also fed here. On reattach we render it as a snapshot so the new
+    /// client sees the current screen instead of a blank. `None` until the
+    /// shell spawns.
+    term: Option<stoa_term::Terminal>,
+    /// Set on reattach (mint of an existing session): the next client
+    /// datagram triggers a snapshot send.
+    need_snapshot: bool,
 }
 
 struct SessionState {
@@ -133,6 +141,8 @@ fn mint(reg: &Reg, name: &str, target: &str) -> (u16, [u8; KEY_LEN]) {
             inner.tx_seq = 0;
             inner.rx = ReplayWindow::new();
             inner.last_addr = None;
+            // The reattaching client should see the current screen.
+            inner.need_snapshot = inner.started;
             return (s.port, key);
         }
         // A dead session (shell exited, or spawn failed) — drop it and make
@@ -158,6 +168,8 @@ fn mint(reg: &Reg, name: &str, target: &str) -> (u16, [u8; KEY_LEN]) {
             started: false,
             cols: 80,
             rows: 24,
+            term: None,
+            need_snapshot: false,
         }),
     });
     map.insert(name.to_string(), state.clone());
@@ -185,7 +197,8 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
         };
 
         // Decode + admit under the lock (the key may be rekeyed by a
-        // concurrent mint). Produce the post-unlock action, if any.
+        // concurrent mint). Produce the post-unlock action + any snapshot.
+        let mut snapshot: Option<(SocketAddr, Vec<u8>)> = None;
         let action: Option<(MsgType, Option<i32>, Vec<u8>)> = {
             let mut inner = state.inner.lock().unwrap();
             match Envelope::decode(&inner.key, &buf[..n]) {
@@ -196,8 +209,8 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
                     } else {
                         inner.last_addr = Some(src);
                         // Resize: record the size (used at spawn) and apply it
-                        // to a live pty. Handled before the lazy spawn so the
-                        // shell starts at the client's actual size.
+                        // to a live pty + the server-side mirror. Handled
+                        // before the lazy spawn so the shell starts at size.
                         if env.msg_type == MsgType::Control {
                             if let Some(Control::Resize { cols, rows }) =
                                 Control::decode(&env.payload)
@@ -207,10 +220,27 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
                                 if let Some(sh) = &inner.shell {
                                     let _ = sh.resize(cols, rows);
                                 }
+                                if let Some(t) = inner.term.as_mut() {
+                                    t.resize(cols, rows);
+                                }
                             }
                         }
                         if !inner.started {
                             spawn_shell(&name, &state, &mut inner, &udp, &reg);
+                        }
+                        // Reattach snapshot: paint the current screen for the
+                        // newly-attached client (set by mint on reattach).
+                        if inner.need_snapshot && inner.started {
+                            inner.need_snapshot = false;
+                            let bytes = inner
+                                .term
+                                .as_ref()
+                                .map(|t| stoa_term::render_snapshot(t.grid()));
+                            if let Some(b) = bytes {
+                                let w = seal(&inner.key, inner.tx_seq, OUTPUT, &b);
+                                inner.tx_seq = inner.tx_seq.wrapping_add(1);
+                                snapshot = Some((src, w));
+                            }
                         }
                         Some((env.msg_type, inner.pty_fd, env.payload))
                     }
@@ -218,6 +248,9 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
             }
         };
 
+        if let Some((addr, wire)) = snapshot {
+            let _ = udp.send_to(&wire, addr);
+        }
         if let Some((MsgType::Input, Some(fd), payload)) = action {
             write_all_fd(fd, &payload);
         }
@@ -336,6 +369,7 @@ fn spawn_shell(name: &str, state: &Arc<SessionState>, inner: &mut Inner, udp: &U
             inner.pty_fd = Some(fd);
             inner.shell = Some(shell);
             inner.started = true;
+            inner.term = Some(stoa_term::Terminal::new(inner.cols, inner.rows));
             let rstate = state.clone();
             let rudp = udp.try_clone().expect("clone udp");
             let rname = name.to_string();
@@ -392,6 +426,11 @@ fn reader(name: String, pty_fd: i32, state: Arc<SessionState>, udp: UdpSocket, r
         let bytes = &buf[..n as usize];
         let out = {
             let mut inner = state.inner.lock().unwrap();
+            // Mirror every byte the client sees into the server-side grid,
+            // so a reattach can render the current screen.
+            if let Some(t) = inner.term.as_mut() {
+                t.feed(bytes);
+            }
             inner.last_addr.map(|a| {
                 let w = seal(&inner.key, inner.tx_seq, OUTPUT, bytes);
                 inner.tx_seq = inner.tx_seq.wrapping_add(1);

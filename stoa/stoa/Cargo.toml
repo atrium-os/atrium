@@ -25,4 +25,5 @@ path = "src/bin/stoa-shell.rs"
 [dependencies]
 stoa-spawn = { path = "../stoa-spawn" }
 stoa-proto = { path = "../stoa-proto" }
+stoa-term  = { path = "../stoa-term" }
 libc       = { workspace = true }
