@@ -96,6 +96,10 @@ pub enum Control {
     SplitHorizontal,
     /// Client → server (Ctrl-B o): switch to the next pane.
     PaneSwitch,
+    /// Client → server (sent once at attach when `$STOA_SYNC` is set): switch
+    /// this session's OUTPUT datagrams from raw bytes to encoded `StateDiff`
+    /// grid updates (self-healing on a flaky link). Triggers a full repaint.
+    SyncMode,
 }
 
 impl Control {
@@ -119,6 +123,7 @@ impl Control {
             Control::SplitVertical => vec![14],
             Control::SplitHorizontal => vec![15],
             Control::PaneSwitch => vec![16],
+            Control::SyncMode => vec![17],
         }
     }
     pub fn decode(payload: &[u8]) -> Option<Control> {
@@ -139,6 +144,7 @@ impl Control {
             14 => Some(Control::SplitVertical),
             15 => Some(Control::SplitHorizontal),
             16 => Some(Control::PaneSwitch),
+            17 => Some(Control::SyncMode),
             _ => None,
         }
     }
@@ -204,6 +210,7 @@ mod tests {
             Control::SplitVertical,
             Control::SplitHorizontal,
             Control::PaneSwitch,
+            Control::SyncMode,
         ] {
             assert_eq!(Control::decode(&c.encode()), Some(c));
         }

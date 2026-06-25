@@ -258,10 +258,17 @@ fn attach(name: &str, host: Option<&str>, jail: Option<&str>) {
     // One monotonic tx seq shared by every client→server datagram (the
     // initial Resize, stdin Input, and resize-poll Resize).
     let tx_seq = Arc::new(AtomicU32::new(0));
+    // Grid-sync (opt-in via $STOA_SYNC): OUTPUT carries encoded StateDiffs we
+    // paint with render_diff — self-healing on a flaky link. It supersedes the
+    // byte-stream predictor (which reconciles raw echoes), so they're mutually
+    // exclusive.
+    let sync = std::env::var_os("STOA_SYNC").is_some();
+
     // Predictive echo (opt-in via $STOA_PREDICT) — hides round-trip latency.
     // Shared between the stdin thread (predicts) and this loop (reconciles).
     // Holding it also serializes stdout writes between the two.
     let predictor: Option<Arc<Mutex<Predictor>>> = std::env::var_os("STOA_PREDICT")
+        .filter(|_| !sync)
         .map(|_| Arc::new(Mutex::new(Predictor::new())));
 
     // Initial Resize: registers our address + lazily spawns the shell at the
@@ -273,6 +280,15 @@ fn attach(name: &str, host: Option<&str>, jail: Option<&str>) {
         CONTROL,
         &Control::Resize { cols: c0, rows: r0 }.encode(),
     ));
+    // Opt into grid-sync right after the size is known (server full-repaints).
+    if sync {
+        let _ = sock.send(&seal(
+            &key,
+            tx_seq.fetch_add(1, Ordering::SeqCst),
+            CONTROL,
+            &Control::SyncMode.encode(),
+        ));
+    }
 
     // stdin → Input datagrams.
     {
@@ -307,7 +323,23 @@ fn attach(name: &str, host: Option<&str>, jail: Option<&str>) {
                 if !rx.accept(env.seq) {
                     continue;
                 }
-                if env.msg_type == OUTPUT {
+                if env.msg_type == OUTPUT && sync {
+                    // Grid-sync: payload is an encoded StateDiff. Paint the
+                    // changed runs; a decode failure (corrupt datagram) is
+                    // dropped and we ask the server to resend a full repaint —
+                    // the self-healing the raw byte stream can't do.
+                    match stoa_term::StateDiff::decode(&env.payload) {
+                        Some(diff) => write_all_fd(stdout, &stoa_term::render_diff(&diff)),
+                        None => {
+                            let _ = sock.send(&seal(
+                                &key,
+                                tx_seq.fetch_add(1, Ordering::SeqCst),
+                                CONTROL,
+                                &Control::Redraw.encode(),
+                            ));
+                        }
+                    }
+                } else if env.msg_type == OUTPUT {
                     match &predictor {
                         // Reconcile server output against predictions: write
                         // the result + suppress confirmed echoes; on divergence

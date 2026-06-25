@@ -110,6 +110,35 @@ impl Window {
         stoa_term::render_composite(cols, rows, &views, &vdivs, &hdivs, cursor)
     }
 
+    /// The window's composited grid (the diff source for grid-sync mode): a
+    /// single pane fills the window; 2 panes blit with the divider. The cursor
+    /// is the active pane's, in window coordinates.
+    fn grid(&self, cols: u16, rows: u16) -> stoa_term::Grid {
+        let views: Vec<stoa_term::PaneView> = self
+            .panes
+            .iter()
+            .filter(|p| p.alive)
+            .map(|p| stoa_term::PaneView { top: p.top, left: p.left, grid: p.term.grid() })
+            .collect();
+        let (vdivs, hdivs): (Vec<u16>, Vec<u16>) = if self.live_panes() > 1 {
+            match self.divider {
+                Some(Divider::Vertical(c)) => (vec![c], vec![]),
+                Some(Divider::Horizontal(r)) => (vec![], vec![r]),
+                None => (vec![], vec![]),
+            }
+        } else {
+            (vec![], vec![])
+        };
+        let cursor = self
+            .active()
+            .map(|p| {
+                let (cr, cc) = p.term.grid().cursor();
+                (p.top + cr, p.left + cc)
+            })
+            .unwrap_or((0, 0));
+        stoa_term::compose_grid(cols, rows, &views, &vdivs, &hdivs, cursor)
+    }
+
     /// Recompute pane regions for a `cols`×`rows` window and resize each
     /// pane's pty + mirror. Re-derives the split halves; falls back to a
     /// single full-window pane when there isn't an active split.
@@ -186,6 +215,14 @@ struct Inner {
     /// >0, the active window's live output is held (the client is viewing
     /// history); any keystroke returns to 0.
     scroll: usize,
+    /// Grid-sync mode: OUTPUT datagrams carry encoded `StateDiff`s instead of
+    /// raw bytes (self-healing on loss/corruption). Set when the client sends
+    /// `Control::SyncMode` at attach.
+    sync: bool,
+    /// In sync mode, the grid the client is believed to hold; the next update
+    /// is `StateDiff::between(last_sent, current)`. Reset to blanks to force a
+    /// full repaint (attach / redraw).
+    last_sent: stoa_term::Grid,
 }
 
 impl Inner {
@@ -197,12 +234,18 @@ impl Inner {
             .and_then(|w| w.active())
             .map(|p| p.pty_fd)
     }
-    /// Render the active window (single-pane snapshot or composite) + seal it
-    /// as an OUTPUT datagram. Bytes computed first (dropping the window
-    /// borrow) so `tx_seq` can be bumped after.
+    /// Seal an OUTPUT datagram for the active window. In raw mode that's a
+    /// full snapshot (single-pane snapshot or composite); in sync mode it's a
+    /// **full** StateDiff (last_sent reset to blanks → repaints everything).
+    /// Used on attach / redraw / window-switch.
     fn seal_active_snapshot(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
-        let addr = self.last_addr?;
         let (cols, rows) = (self.cols, self.rows);
+        if self.sync {
+            // Force a full repaint: diff the current window against blanks.
+            self.last_sent = stoa_term::Grid::new(cols, rows);
+            return self.seal_sync_update();
+        }
+        let addr = self.last_addr?;
         let bytes = {
             let w = self.windows.get(self.active).filter(|w| w.alive)?;
             w.render(cols, rows)
@@ -211,15 +254,45 @@ impl Inner {
         self.tx_seq = self.tx_seq.wrapping_add(1);
         Some((addr, wire))
     }
+
+    /// Sync mode: diff the active window's composited grid against `last_sent`,
+    /// and if anything changed (cells, resize, or cursor) seal the encoded
+    /// `StateDiff` as an OUTPUT datagram and advance `last_sent`. `None` if
+    /// nothing changed or there's no client address yet.
+    fn seal_sync_update(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
+        let addr = self.last_addr?;
+        let (cols, rows) = (self.cols, self.rows);
+        let grid = self.windows.get(self.active).filter(|w| w.alive)?.grid(cols, rows);
+        let diff = stoa_term::StateDiff::between(&self.last_sent, &grid);
+        if diff.is_empty() && grid.cursor() == self.last_sent.cursor() {
+            return None; // nothing to send
+        }
+        let wire = seal(&self.key, self.tx_seq, OUTPUT, &diff.encode());
+        self.tx_seq = self.tx_seq.wrapping_add(1);
+        self.last_sent = grid;
+        Some((addr, wire))
+    }
     /// Render the active pane's scrollback at the current `scroll` offset.
     /// (Scrollback follows the active pane; other panes aren't shown.)
     fn seal_scrollback(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
         let addr = self.last_addr?;
         let off = self.scroll;
+        let (cols, rows) = (self.cols, self.rows);
         let bytes = {
             let p = self.windows.get(self.active).filter(|w| w.alive)?.active()?;
             stoa_term::render_scrollback(p.term.grid(), off)
         };
+        if self.sync {
+            // The scrollback viewport is a screen too: re-emulate it into a
+            // grid and ship it as a diff like any other update.
+            let mut t = stoa_term::Terminal::new(cols, rows);
+            t.feed(&bytes);
+            let diff = stoa_term::StateDiff::between(&self.last_sent, t.grid());
+            let wire = seal(&self.key, self.tx_seq, OUTPUT, &diff.encode());
+            self.tx_seq = self.tx_seq.wrapping_add(1);
+            self.last_sent = t.grid().clone();
+            return Some((addr, wire));
+        }
         let wire = seal(&self.key, self.tx_seq, OUTPUT, &bytes);
         self.tx_seq = self.tx_seq.wrapping_add(1);
         Some((addr, wire))
@@ -425,6 +498,8 @@ fn mint(reg: &Reg, name: &str, target: &str) -> (u16, [u8; KEY_LEN]) {
             last_active: 0,
             need_snapshot: false,
             scroll: 0,
+            sync: false,
+            last_sent: stoa_term::Grid::new(80, 24),
         }),
     });
     map.insert(name.to_string(), state.clone());
@@ -473,6 +548,12 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
                                     inner.rows = rows;
                                     for w in inner.windows.iter_mut().filter(|w| w.alive) {
                                         w.relayout(cols, rows);
+                                    }
+                                    // In sync mode, repaint at the new size so
+                                    // the client isn't left waiting for the
+                                    // shell to redraw on its own.
+                                    if inner.sync && inner.started {
+                                        inner.need_snapshot = true;
                                     }
                                 }
                                 // Redraw → repaint the active window from its
@@ -526,6 +607,16 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
                                 }
                                 // Ctrl-B o — switch pane.
                                 Some(Control::PaneSwitch) => pane_switch(&mut inner),
+                                // Client opts into grid-sync: OUTPUT becomes
+                                // encoded StateDiffs. Force a full repaint.
+                                Some(Control::SyncMode) => {
+                                    inner.sync = true;
+                                    inner.last_sent =
+                                        stoa_term::Grid::new(inner.cols, inner.rows);
+                                    if inner.started {
+                                        inner.need_snapshot = true;
+                                    }
+                                }
                                 // Ctrl-B [ / ] — page the scrollback view.
                                 Some(Control::ScrollUp) => {
                                     if inner.started {
@@ -975,6 +1066,10 @@ fn reader(name: String, win_idx: usize, pane_idx: usize, pty_fd: i32, state: Arc
             }
             // Stream only when this pane's window is active and not scrolled.
             if inner.active == win_idx && inner.scroll == 0 {
+                if inner.sync {
+                    // Grid-sync: send the minimal StateDiff for the window.
+                    inner.seal_sync_update()
+                } else {
                 let multi = inner.windows.get(win_idx).map_or(false, |w| w.live_panes() > 1);
                 if multi {
                     // Re-composite the whole window (both panes are visible).
@@ -991,6 +1086,7 @@ fn reader(name: String, win_idx: usize, pane_idx: usize, pty_fd: i32, state: Arc
                         inner.tx_seq = inner.tx_seq.wrapping_add(1);
                         (a, w)
                     })
+                }
                 }
             } else {
                 None
