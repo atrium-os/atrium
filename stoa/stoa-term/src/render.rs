@@ -194,6 +194,29 @@ pub fn render_composite(
     out.into_bytes()
 }
 
+/// Paint a [`StateDiff`](crate::StateDiff) to the real terminal: emit only
+/// the changed cell runs (each preceded by a cursor move), then place the
+/// cursor. A `resized` diff first clears the screen (the server reset the
+/// client's grid to blanks at the new size). This is the client's whole job
+/// in grid-sync mode — it stays a thin renderer, no local grid needed.
+pub fn render_diff(diff: &crate::StateDiff) -> Vec<u8> {
+    let mut out = String::new();
+    if diff.resized.is_some() {
+        out.push_str("\x1b[0m\x1b[2J\x1b[H");
+    }
+    let mut cur: Option<(Color, Color, u8)> = None;
+    for run in &diff.runs {
+        let _ = write!(out, "\x1b[{};{}H", run.row + 1, run.col + 1);
+        for cell in &run.cells {
+            emit_cell(&mut out, cell, &mut cur);
+        }
+    }
+    out.push_str("\x1b[0m");
+    let (cr, cc) = diff.cursor;
+    let _ = write!(out, "\x1b[{};{}H", cr + 1, cc + 1);
+    out.into_bytes()
+}
+
 /// Composite several panes into one authoritative [`Grid`] — the same blit
 /// as [`render_composite`] but producing grid state instead of bytes. This
 /// is what the server diffs ([`crate::StateDiff::between`]) to stream a
@@ -305,6 +328,48 @@ mod tests {
         assert_eq!(win.grid().cell(0, 4).c, 'R');
         assert_eq!(win.grid().cell(1, 4).c, 'R');
         assert_eq!(win.grid().cell(1, 5).c, '1');
+    }
+
+    /// The client loop: a terminal showing `old`, fed render_diff(old→new),
+    /// must end up showing `new` — for arbitrary content changes.
+    fn assert_diff_paint_converges(old_feed: &[u8], new_extra: &[u8]) {
+        let mut old = Terminal::new(20, 5);
+        old.feed(old_feed);
+        let mut new = Terminal::new(20, 5);
+        new.feed(old_feed);
+        new.feed(new_extra);
+        let diff = crate::StateDiff::between(old.grid(), new.grid());
+        // Client starts at `old` (painted), then applies the diff bytes.
+        let mut client = Terminal::new(20, 5);
+        client.feed(&render_snapshot(old.grid()));
+        client.feed(&render_diff(&diff));
+        assert_eq!(client.grid(), new.grid(), "render_diff must converge old→new");
+    }
+
+    #[test]
+    fn diff_paint_text() {
+        assert_diff_paint_converges(b"hello world", b"\r\x1b[5Cthere");
+    }
+
+    #[test]
+    fn diff_paint_colors() {
+        assert_diff_paint_converges(b"plain row", b"\r\x1b[1;31mRED\x1b[0m");
+    }
+
+    #[test]
+    fn diff_paint_resize_clears() {
+        let mut old = Terminal::new(20, 5);
+        old.feed(b"old big screen full of text");
+        let mut newt = Terminal::new(20, 5);
+        newt.feed(b"old big screen full of text");
+        newt.resize(10, 3);
+        newt.feed(b"\x1b[Hsmall");
+        let diff = crate::StateDiff::between(old.grid(), newt.grid());
+        let mut client = Terminal::new(20, 5);
+        client.feed(&render_snapshot(old.grid()));
+        client.resize(10, 3); // client resizes its real terminal too
+        client.feed(&render_diff(&diff));
+        assert_eq!(client.grid(), newt.grid());
     }
 
     #[test]

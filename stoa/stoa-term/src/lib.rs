@@ -23,7 +23,7 @@ mod diff;
 pub use diff::{CellRun, StateDiff};
 
 mod render;
-pub use render::{compose_grid, render_composite, render_scrollback, render_snapshot, PaneView};
+pub use render::{compose_grid, render_composite, render_diff, render_scrollback, render_snapshot, PaneView};
 
 /// A terminal colour. `Default` = the terminal's default fg/bg; `Indexed`
 /// covers the 16 ANSI + 256-colour palette; `Rgb` is 24-bit truecolour.
