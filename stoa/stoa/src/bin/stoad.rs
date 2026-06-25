@@ -212,17 +212,25 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
                         // to a live pty + the server-side mirror. Handled
                         // before the lazy spawn so the shell starts at size.
                         if env.msg_type == MsgType::Control {
-                            if let Some(Control::Resize { cols, rows }) =
-                                Control::decode(&env.payload)
-                            {
-                                inner.cols = cols;
-                                inner.rows = rows;
-                                if let Some(sh) = &inner.shell {
-                                    let _ = sh.resize(cols, rows);
+                            match Control::decode(&env.payload) {
+                                Some(Control::Resize { cols, rows }) => {
+                                    inner.cols = cols;
+                                    inner.rows = rows;
+                                    if let Some(sh) = &inner.shell {
+                                        let _ = sh.resize(cols, rows);
+                                    }
+                                    if let Some(t) = inner.term.as_mut() {
+                                        t.resize(cols, rows);
+                                    }
                                 }
-                                if let Some(t) = inner.term.as_mut() {
-                                    t.resize(cols, rows);
+                                // Redraw → repaint from the mirror (the
+                                // snapshot block below fires on need_snapshot).
+                                Some(Control::Redraw) => {
+                                    if inner.started {
+                                        inner.need_snapshot = true;
+                                    }
                                 }
+                                _ => {}
                             }
                         }
                         if !inner.started {

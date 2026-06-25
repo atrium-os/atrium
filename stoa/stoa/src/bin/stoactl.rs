@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use stoa::{default_ctl, from_hex, seal, Control, CONTROL, DETACH_BYTE, INPUT, OUTPUT};
+use stoa::{default_ctl, from_hex, seal, Control, CONTROL, DETACH_BYTE, INPUT, OUTPUT, PREFIX_BYTE};
 use stoa_proto::{Envelope, ReplayWindow};
 
 fn main() {
@@ -224,21 +224,59 @@ fn attach(name: &str, host: Option<&str>, jail: Option<&str>) {
 }
 
 fn stdin_loop(sock: UdpSocket, key: Vec<u8>, seq: Arc<AtomicU32>, stop: Arc<AtomicBool>) {
+    // Flush accumulated keystrokes as one Input datagram (preserving order
+    // relative to commands).
+    let flush = |pending: &mut Vec<u8>| {
+        if !pending.is_empty() {
+            let _ = sock.send(&seal(&key, seq.fetch_add(1, Ordering::SeqCst), INPUT, pending));
+            pending.clear();
+        }
+    };
+
     let mut chunk = [0u8; 4096];
+    let mut prefix = false; // saw Ctrl-B; next byte is a command
+    let mut pending: Vec<u8> = Vec::new();
     loop {
         let n = match std::io::stdin().lock().read(&mut chunk) {
-            Ok(0) | Err(_) => return, // EOF: stop sending, let main render until Bye
+            Ok(0) | Err(_) => {
+                flush(&mut pending);
+                return; // EOF: stop sending, let main render until Bye
+            }
             Ok(n) => n,
         };
-        let data = &chunk[..n];
-        if let Some(i) = data.iter().position(|&b| b == DETACH_BYTE) {
-            if i > 0 {
-                let _ = sock.send(&seal(&key, seq.fetch_add(1, Ordering::SeqCst), INPUT, &data[..i]));
+        for &b in &chunk[..n] {
+            if prefix {
+                prefix = false;
+                flush(&mut pending); // commands run after queued input
+                match b {
+                    b'd' | DETACH_BYTE => {
+                        stop.store(true, Ordering::SeqCst);
+                        return; // Ctrl-B d = detach
+                    }
+                    b'r' => {
+                        // Ctrl-B r = redraw (repaint from the server mirror)
+                        let _ = sock.send(&seal(
+                            &key,
+                            seq.fetch_add(1, Ordering::SeqCst),
+                            CONTROL,
+                            &Control::Redraw.encode(),
+                        ));
+                    }
+                    PREFIX_BYTE => pending.push(PREFIX_BYTE), // literal Ctrl-B
+                    _ => {} // unknown command: ignored (window/pane keys land with the mux)
+                }
+            } else if b == PREFIX_BYTE {
+                flush(&mut pending); // keep input before the prefix in order
+                prefix = true;
+            } else if b == DETACH_BYTE {
+                flush(&mut pending);
+                stop.store(true, Ordering::SeqCst);
+                return;
+            } else {
+                pending.push(b);
             }
-            stop.store(true, Ordering::SeqCst);
-            return;
         }
-        let _ = sock.send(&seal(&key, seq.fetch_add(1, Ordering::SeqCst), INPUT, data));
+        flush(&mut pending);
     }
 }
 

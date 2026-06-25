@@ -38,10 +38,16 @@ pub fn default_ctl() -> String {
 }
 
 /// The detach key in the raw input stream: Ctrl-] (0x1d, telnet-style).
-/// Detach is purely client-side now — the client just exits; `stoad` keeps
-/// the shell running and routes output to wherever the client next speaks
-/// from (roaming is automatic). A real client uses `Ctrl-B d` (S2).
+/// Detach is purely client-side — the client just exits; `stoad` keeps the
+/// shell running and routes output to wherever the client next speaks from
+/// (roaming is automatic). The tmux-style `Ctrl-B d` also detaches.
 pub const DETACH_BYTE: u8 = 0x1d;
+
+/// The tmux-style command prefix: Ctrl-B (0x02). A key pressed right after
+/// the prefix is a command, not input (`d` detach, `r` redraw, a second
+/// Ctrl-B sends a literal Ctrl-B). The window/pane bindings (`c`, `"`, `%`,
+/// `0`-`9`, …) land with the multiplexer.
+pub const PREFIX_BYTE: u8 = 0x02;
 
 /// Length of a session key in bytes.
 pub const KEY_LEN: usize = 32;
@@ -65,6 +71,9 @@ pub enum Control {
     /// datagram (so the shell spawns at the right size) and again on every
     /// SIGWINCH. stoad applies it to the pty (TIOCSWINSZ → SIGWINCH inside).
     Resize { cols: u16, rows: u16 },
+    /// Client → server (Ctrl-B r): re-send the current screen. stoad renders
+    /// its grid mirror as a snapshot — repaints a garbled/cleared client.
+    Redraw,
 }
 
 impl Control {
@@ -77,6 +86,7 @@ impl Control {
                 v.extend_from_slice(&rows.to_be_bytes());
                 v
             }
+            Control::Redraw => vec![6],
         }
     }
     pub fn decode(payload: &[u8]) -> Option<Control> {
@@ -86,6 +96,7 @@ impl Control {
                 cols: u16::from_be_bytes([payload[1], payload[2]]),
                 rows: u16::from_be_bytes([payload[3], payload[4]]),
             }),
+            6 => Some(Control::Redraw),
             _ => None,
         }
     }
