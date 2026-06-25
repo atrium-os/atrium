@@ -39,18 +39,43 @@ use stoa::{default_ctl, gen_key, seal, to_hex, Control, CONTROL, KEY_LEN, OUTPUT
 use stoa_proto::{Envelope, MsgType, ReplayWindow};
 use stoa_spawn::{DirectSpawner, PtyShell, ShellSpawner, SpawnSpec, Target};
 
-/// Send an OUTPUT datagram, with **test-only** loss injection: if
-/// `$STOA_DROP=N` (N>0), drop 1 in every N OUTPUT datagrams to simulate a
-/// lossy link (exercises the client's seq-gap resync). Off by default — the
-/// real path is just `send_to`.
+/// Send an OUTPUT datagram, with **test-only** fault injection (off by
+/// default — the real path is just `send_to`):
+/// - `$STOA_DROP=N` (N>0): drop 1 in every N datagrams (lossy link → exercises
+///   the client's seq-gap resync).
+/// - `$STOA_REORDER=N` (N>0): hold every Nth datagram back and release it
+///   *after* the next one (adjacent swap → the client sees a stale older diff
+///   arrive late, exercising its drop-non-advancing rule).
 fn send_output(udp: &UdpSocket, buf: &[u8], addr: SocketAddr) {
     static DROP_N: OnceLock<u64> = OnceLock::new();
+    static REORDER_N: OnceLock<u64> = OnceLock::new();
     static COUNT: AtomicU64 = AtomicU64::new(0);
-    let n = *DROP_N
+    static RCOUNT: AtomicU64 = AtomicU64::new(0);
+    static PENDING: OnceLock<Mutex<Option<(Vec<u8>, SocketAddr)>>> = OnceLock::new();
+
+    let drop_n = *DROP_N
         .get_or_init(|| std::env::var("STOA_DROP").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
-    if n > 0 && (COUNT.fetch_add(1, Ordering::Relaxed) + 1) % n == 0 {
+    if drop_n > 0 && (COUNT.fetch_add(1, Ordering::Relaxed) + 1) % drop_n == 0 {
         return; // simulate a dropped datagram
     }
+
+    let reorder_n = *REORDER_N.get_or_init(|| {
+        std::env::var("STOA_REORDER").ok().and_then(|s| s.parse().ok()).unwrap_or(0)
+    });
+    if reorder_n > 0 {
+        let slot = PENDING.get_or_init(|| Mutex::new(None));
+        let mut pend = slot.lock().unwrap();
+        if (RCOUNT.fetch_add(1, Ordering::Relaxed) + 1) % reorder_n == 0 {
+            *pend = Some((buf.to_vec(), addr)); // hold this one back
+            return;
+        }
+        let _ = udp.send_to(buf, addr);
+        if let Some((b, a)) = pend.take() {
+            let _ = udp.send_to(&b, a); // release the held one late → reordered
+        }
+        return;
+    }
+
     let _ = udp.send_to(buf, addr);
 }
 

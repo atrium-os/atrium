@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Injected-loss recovery test for Stoa grid-sync (stoa.md §3.3).
+"""Injected loss/reorder recovery test for Stoa grid-sync (stoa.md §3.3).
 
 The project's S2 host plan calls for testing "with injected loss/reorder".
-This drives a real stoad+stoactl over loopback UDP with stoad dropping
-1-in-N OUTPUT datagrams ($STOA_DROP), and asserts a grid-sync client
+This drives a real stoad+stoactl over loopback UDP with stoad injecting
+faults into OUTPUT datagrams ($STOA_DROP = drop 1-in-N; $STOA_REORDER =
+swap every Nth with its successor), and asserts a grid-sync client
 ($STOA_SYNC) still CONVERGES on the correct screen: every marker typed is
-present in the final repaint, because the client's seq-gap detection asks
-the server to resync whatever loss dropped. A raw byte-stream client has no
-such recovery — this is what grid-sync buys on a flaky link.
+present in the final repaint. Loss is recovered by the client's seq-gap
+resync; reordering by dropping the stale older (non-advancing) diff. A raw
+byte-stream client has no such recovery — this is what grid-sync buys on a
+flaky link.
 
 Usage: build the debug binaries first (`cargo build`), then
     python3 stoa/scripts/loss_recovery_test.py
@@ -36,9 +38,9 @@ def drain(fd, secs=0.8):
     return buf
 
 
-def run(drop_n=3):
+def run(fault_env):
     ctl = tempfile.mktemp(suffix=".ctl")
-    base = dict(os.environ, STOA_CTL=ctl, STOA_DROP=str(drop_n))
+    base = dict(os.environ, STOA_CTL=ctl, **fault_env)
     stoad = subprocess.Popen([os.path.join(BIN, "stoad")], env=base,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(0.7)
@@ -73,14 +75,20 @@ def run(drop_n=3):
 
 def main():
     markers = [b"LOSSMARK_AAA"] + [b"settle%d" % i for i in range(8)]
+    faults = [
+        ("1/3 loss", {"STOA_DROP": "3"}),
+        ("1/3 reorder", {"STOA_REORDER": "3"}),
+        ("1/4 loss + 1/4 reorder", {"STOA_DROP": "4", "STOA_REORDER": "4"}),
+    ]
     allok = True
-    for r in range(3):
-        out = run()
-        present = [m for m in markers if m in out]
-        ok = len(present) == len(markers)
-        allok = allok and ok
-        print(f"run {r+1}: sync under 1/3 loss converged "
-              f"({len(present)}/{len(markers)} markers): {ok}")
+    for label, env in faults:
+        for r in range(2):
+            out = run(env)
+            present = [m for m in markers if m in out]
+            ok = len(present) == len(markers)
+            allok = allok and ok
+            print(f"{label} run {r+1}: sync converged "
+                  f"({len(present)}/{len(markers)} markers): {ok}")
     print("\nRESULT:", "PASS" if allok else "FAIL")
     sys.exit(0 if allok else 1)
 

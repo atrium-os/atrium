@@ -337,7 +337,16 @@ fn attach(name: &str, host: Option<&str>, jail: Option<&str>) {
                         &Control::Redraw.encode(),
                     ));
                 }
+                // Did this datagram advance the sequence? A reordered OLDER one
+                // (seq below the high-water mark) carries a stale cumulative
+                // diff — applying it would paint stale cells over fresh ones,
+                // so in sync mode we drop it (the gap it left already triggered
+                // a resync). Raw mode has no such notion.
+                let advanced = hi_seq.map_or(true, |h| env.seq > h);
                 hi_seq = Some(hi_seq.map_or(env.seq, |h| h.max(env.seq)));
+                if env.msg_type == OUTPUT && sync && !advanced {
+                    continue; // stale reordered diff — skip
+                }
                 if env.msg_type == OUTPUT && sync {
                     // Grid-sync: payload is an encoded StateDiff. Paint the
                     // changed runs; a decode failure (corrupt datagram) is
