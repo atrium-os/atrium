@@ -228,6 +228,69 @@ pub fn jail_create_and_attach(spec: &JailCreateSpec) -> io::Result<i32> {
     iob.run(JAIL_CREATE | JAIL_ATTACH, &errmsg)
 }
 
+/// Attach the calling process to an EXISTING jail by jid (`jail_attach(2)`).
+/// Used by the ExecInJail child — no `jail_set`, so it can only join a jail
+/// that already exists; the caller resolves `jid` via [`jail_id_by_name`]
+/// and verifies the jail is jaild-created first.
+#[cfg(target_os = "freebsd")]
+pub fn jail_attach(jid: i32) -> io::Result<()> {
+    // SAFETY: jail_attach is a leaf syscall taking the jid.
+    let rc = unsafe { libc::jail_attach(jid) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+#[cfg(not(target_os = "freebsd"))]
+pub fn jail_attach(_jid: i32) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "jail_attach: FreeBSD only"))
+}
+
+/// Allocate a pty pair sized to `cols`×`rows`. Returns `(master, slave)`.
+/// jaild opens the pty in the PARENT (pre-pdfork) so it keeps the master to
+/// hand back over SCM_RIGHTS while the child `login_tty`s the slave.
+#[cfg(target_os = "freebsd")]
+pub fn openpty_pair(cols: u16, rows: u16) -> io::Result<(i32, i32)> {
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let mut ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: openpty writes the two fds; name=NULL, termp=NULL (defaults).
+    // termp/winp are `*mut` on FreeBSD though openpty only reads winp.
+    let rc = unsafe {
+        libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), &mut ws)
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((master, slave))
+}
+#[cfg(not(target_os = "freebsd"))]
+pub fn openpty_pair(_cols: u16, _rows: u16) -> io::Result<(i32, i32)> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "openpty: FreeBSD only"))
+}
+
+/// Make `slave` the controlling terminal of the calling (child) process:
+/// `setsid` + `TIOCSCTTY` + dup onto fd 0/1/2, then close the extra fd.
+/// Async-signal-safe (a single libc call) — safe to call post-pdfork.
+#[cfg(target_os = "freebsd")]
+pub fn login_tty(slave: i32) -> io::Result<()> {
+    // SAFETY: login_tty takes ownership of the slave fd in this process.
+    let rc = unsafe { libc::login_tty(slave) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+#[cfg(not(target_os = "freebsd"))]
+pub fn login_tty(_slave: i32) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "login_tty: FreeBSD only"))
+}
+
 /// Tiny builder for the iovec array `jail_set` consumes. Owns
 /// the CStrings (so their pointers stay valid until `run`).
 /// Conditional pairs are easier with this shape than with fixed
@@ -603,6 +666,62 @@ pub fn execve(
 /// Send a frame (length-prefixed body) over `socket_fd`, optionally
 /// attaching one fd via SCM_RIGHTS. Single `sendmsg` so the body
 /// and ancillary cmsg arrive atomically.
+/// Send a framed body plus zero or more fds over SCM_RIGHTS in a single
+/// control message. Used for ExecInJail's `[procdesc, pty_master]` pair;
+/// the single-fd CreateJail path goes through
+/// [`send_frame_with_optional_fd`].
+pub fn send_frame_with_fds(socket_fd: i32, body: &[u8], fds: &[i32]) -> io::Result<()> {
+    let mut framed = Vec::with_capacity(4 + body.len());
+    framed.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    framed.extend_from_slice(body);
+
+    let mut iov = libc::iovec {
+        iov_base: framed.as_mut_ptr() as *mut _,
+        iov_len:  framed.len(),
+    };
+
+    let fdbytes = std::mem::size_of_val(fds) as u32;
+    // SAFETY: CMSG_SPACE is a libc inline; safe to invoke.
+    let cmsg_space = if fds.is_empty() { 0 } else { unsafe { libc::CMSG_SPACE(fdbytes) } };
+    let mut cmsg_buf: Vec<u8> = vec![0u8; cmsg_space as usize];
+
+    let mut msg = libc::msghdr {
+        msg_name:       std::ptr::null_mut(),
+        msg_namelen:    0,
+        msg_iov:        &mut iov,
+        msg_iovlen:     1,
+        msg_control:    std::ptr::null_mut(),
+        msg_controllen: 0,
+        msg_flags:      0,
+    };
+
+    if !fds.is_empty() {
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut _;
+        msg.msg_controllen = cmsg_space as _;
+        // SAFETY: cmsg_buf is sized for exactly fds.len() ints.
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            if cmsg.is_null() {
+                return Err(io::Error::new(io::ErrorKind::Other, "CMSG_FIRSTHDR null"));
+            }
+            (*cmsg).cmsg_len = libc::CMSG_LEN(fdbytes) as _;
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            let data = libc::CMSG_DATA(cmsg) as *mut libc::c_int;
+            for (i, &fd) in fds.iter().enumerate() {
+                data.add(i).write_unaligned(fd);
+            }
+        }
+    }
+
+    // SAFETY: msg fields initialised above; iov points into `framed`.
+    let rc = unsafe { libc::sendmsg(socket_fd, &msg, 0) };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 pub fn send_frame_with_optional_fd(
     socket_fd: i32,
     body:      &[u8],

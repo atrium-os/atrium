@@ -78,8 +78,31 @@ pub enum Request {
     /// `policy.resource_control.allow_rctl`.
     SetRctl(SetRctlRequest),
 
+    /// Exec a process inside an EXISTING jaild-created jail, on a pty —
+    /// `jexec(2)` reimagined for Stoa's jail-target sessions (stoa.md §4.5).
+    /// jaild allocates the pty, `jail_attach`es the running jid (NO
+    /// `jail_set` — this never creates a jail), `login_tty`s the slave,
+    /// drops to `exec.uid/gid`, and execs. Same jaild-created-only
+    /// protection as Reap/SetRctl (the target name must be in jaild's
+    /// state) — so an exec can never attach into the TCB or a non-jaild
+    /// jail. On success returns `JailExecStarted` plus TWO fds over
+    /// SCM_RIGHTS: `[procdesc, pty_master]`.
+    ExecInJail(ExecInJailRequest),
+
     /// Health check. Returns `Response::Ok` if jaild is alive.
     Ping,
+}
+
+/// Request body for [`Request::ExecInJail`].
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExecInJailRequest {
+    /// Name of the EXISTING jaild-created jail to attach into.
+    pub name: String,
+    /// What to run (path, argv, env, and the uid/gid to drop to).
+    pub exec: ExecSpec,
+    /// Initial pty window size.
+    pub cols: u16,
+    pub rows: u16,
 }
 
 /// Runtime-mount attachment. See `docs/spec/storage.md` §6.2.
@@ -281,6 +304,11 @@ pub enum Response {
 
     /// CreateJail succeeded; jail is alive in the kernel.
     JailCreated(CreateJailResponse),
+
+    /// ExecInJail succeeded; the process is running inside the jail on a
+    /// pty. Two fds ride SCM_RIGHTS alongside this body, in order:
+    /// `[procdesc, pty_master]`.
+    JailExecStarted { pid: i32 },
 
     /// Request was structurally valid but rejected by jaild's
     /// policy (mount source not allowed, name pattern bad, …).

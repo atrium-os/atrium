@@ -142,22 +142,20 @@ fn handle_connection(
                 let resp = Response::Error {
                     detail: format!("malformed request: {e}"),
                 };
-                send_response(socket_fd, &resp, None)?;
+                send_response(socket_fd, &resp, &[])?;
                 continue;
             }
         };
 
-        /* For CreateJail-with-exec, dispatch returns the fd to
-         * attach via SCM_RIGHTS; everything else returns None.
-         * This branch keeps the raw send for the fd path while
-         * everything else goes through the same single-call path. */
-        let (resp, fd_to_attach) = dispatch(req, policy, dry_run, state, state_path);
-        send_response(socket_fd, &resp, fd_to_attach)?;
+        /* dispatch returns any fds to pass via SCM_RIGHTS:
+         * CreateJail-with-exec → [procdesc]; ExecInJail →
+         * [procdesc, pty_master]; everything else → []. */
+        let (resp, fds_to_attach) = dispatch(req, policy, dry_run, state, state_path);
+        send_response(socket_fd, &resp, &fds_to_attach)?;
 
-        /* If we sent an fd over SCM_RIGHTS, our copy is no longer
-         * needed (kernel keeps the procdesc alive while the
-         * receiver holds it). */
-        if let Some(fd) = fd_to_attach {
+        /* Our copies are no longer needed once sent — the kernel keeps
+         * the procdesc / pty alive while the receiver holds its copy. */
+        for fd in fds_to_attach {
             let _ = ffi::close_fd(fd);
         }
     }
@@ -169,40 +167,52 @@ fn dispatch(
     dry_run:    bool,
     state:      &mut PersistentState,
     state_path: &Path,
-) -> (Response, Option<i32>) {
+) -> (Response, Vec<i32>) {
     match req {
-        Request::Ping => (Response::Ok, None),
+        Request::Ping => (Response::Ok, Vec::new()),
 
         Request::CreateJail(spec) => {
             match handle_create(&spec, policy, dry_run, state, state_path) {
                 Ok(CreateOutcome { resp, procdesc_fd }) => {
-                    (Response::JailCreated(resp), procdesc_fd)
+                    (Response::JailCreated(resp), procdesc_fd.into_iter().collect())
                 }
                 Err(JaildError::PolicyViolation { rule, detail }) => {
-                    (Response::PolicyDenied { rule: rule.into(), detail }, None)
+                    (Response::PolicyDenied { rule: rule.into(), detail }, Vec::new())
                 }
                 Err(JaildError::Syscall { name, errno, msg }) => {
-                    (Response::SyscallFailed { name: name.into(), errno, msg }, None)
+                    (Response::SyscallFailed { name: name.into(), errno, msg }, Vec::new())
                 }
-                Err(other) => (Response::Error { detail: format!("{other}") }, None),
+                Err(other) => (Response::Error { detail: format!("{other}") }, Vec::new()),
             }
         }
 
+        Request::ExecInJail(req) => match handle_exec_in_jail(&req, dry_run, state) {
+            Ok((resp, fds)) => (resp, fds),
+            Err(JaildError::PolicyViolation { rule, detail }) => {
+                (Response::PolicyDenied { rule: rule.into(), detail }, Vec::new())
+            }
+            Err(JaildError::Syscall { name, errno, msg }) => {
+                (Response::SyscallFailed { name: name.into(), errno, msg }, Vec::new())
+            }
+            Err(other) => (Response::Error { detail: format!("{other}") }, Vec::new()),
+        },
+
         Request::RemoveJail { jid, name } => {
-            handle_remove(jid, name, dry_run, state, state_path)
+            let (resp, fd) = handle_remove(jid, name, dry_run, state, state_path);
+            (resp, fd.into_iter().collect())
         }
 
         Request::AttachMount(req) => {
-            (handle_attach_mount(req, policy, dry_run, state, state_path), None)
+            (handle_attach_mount(req, policy, dry_run, state, state_path), Vec::new())
         }
 
         Request::DetachMount(req) => {
-            (handle_detach_mount(req, dry_run, state, state_path), None)
+            (handle_detach_mount(req, dry_run, state, state_path), Vec::new())
         }
 
-        Request::Reap(req) => (handle_reap(req, policy, dry_run, state), None),
+        Request::Reap(req) => (handle_reap(req, policy, dry_run, state), Vec::new()),
 
-        Request::SetRctl(req) => (handle_set_rctl(req, policy, dry_run, state), None),
+        Request::SetRctl(req) => (handle_set_rctl(req, policy, dry_run, state), Vec::new()),
     }
 }
 
@@ -888,13 +898,127 @@ fn handle_create_with_exec(
     })
 }
 
+/// Exec a process inside an EXISTING jaild-created jail on a pty (the
+/// `ExecInJail` primitive; stoa.md §4.5). jaild allocates the pty in the
+/// parent (keeping the master), then pdforks a child that `login_tty`s the
+/// slave, `jail_attach`es the running jid (NO jail_set — never creates a
+/// jail), drops privileges, and execs. On success returns
+/// `[procdesc, pty_master]` for the caller to drive + reap.
+fn handle_exec_in_jail(
+    req:     &protocol::ExecInJailRequest,
+    dry_run: bool,
+    state:   &PersistentState,
+) -> Result<(Response, Vec<i32>), JaildError> {
+    /* jaild-created-only gate (same protection as Reap/SetRctl): the
+     * target name MUST be in jaild's own state, so an exec can never
+     * attach into the TCB or a jail jaild did not create. */
+    let jail = match state.jails.iter().find(|j| j.name == req.name) {
+        Some(j) => j.clone(),
+        None => {
+            return Ok((
+                Response::PolicyDenied {
+                    rule: "exec.unknown_jail".into(),
+                    detail: format!(
+                        "no jail named {:?} in jaild state — refusing to attach \
+                         into a jail jaild did not create",
+                        req.name
+                    ),
+                },
+                Vec::new(),
+            ))
+        }
+    };
+    /* Resolve the LIVE jid (exec'd jails carry sentinel 0 in state). */
+    let jid = match ffi::jail_id_by_name(&jail.name) {
+        Some(j) => j,
+        None => {
+            return Ok((
+                Response::SyscallFailed {
+                    name: "jail_id_by_name".into(),
+                    errno: 0,
+                    msg: format!("jail {:?} is not currently running", jail.name),
+                },
+                Vec::new(),
+            ))
+        }
+    };
+
+    if dry_run {
+        info!(
+            "[dry-run] exec-in-jail {} (jid {}) path={} uid={}",
+            jail.name, jid, req.exec.path, req.exec.uid
+        );
+        return Ok((Response::JailExecStarted { pid: 0 }, Vec::new()));
+    }
+
+    /* Allocate the pty in the PARENT: we keep `master` to hand back over
+     * SCM_RIGHTS; the child turns `slave` into its controlling tty. */
+    let (master, slave) = ffi::openpty_pair(req.cols, req.rows).map_err(|e| {
+        JaildError::Syscall {
+            name: "openpty",
+            errno: e.raw_os_error().unwrap_or(-1),
+            msg: format!("{e}"),
+        }
+    })?;
+
+    let pdf = ffi::pdfork().map_err(|e| {
+        let _ = ffi::close_fd(master);
+        let _ = ffi::close_fd(slave);
+        JaildError::Syscall {
+            name: "pdfork",
+            errno: e.raw_os_error().unwrap_or(-1),
+            msg: format!("{e}"),
+        }
+    })?;
+
+    if pdf.pid == 0 {
+        /* ====== child ====== */
+        let _ = ffi::close_fd(master);
+        /* login_tty sets fd 0/1/2 to a valid tty BEFORE jail_attach, so
+         * the child has working stdio inside the jail. */
+        if let Err(e) = ffi::login_tty(slave) {
+            eprintln!("jaild-child: login_tty: {e}");
+            ffi::child_exit(101);
+        }
+        if let Err(e) = ffi::jail_attach(jid) {
+            eprintln!("jaild-child: jail_attach({jid}): {e}");
+            ffi::child_exit(102);
+        }
+        if let Err(e) = ffi::drop_privileges(req.exec.uid, req.exec.gid) {
+            eprintln!("jaild-child: drop_privileges({}, {}): {e}", req.exec.uid, req.exec.gid);
+            ffi::child_exit(103);
+        }
+        let env_pairs: Vec<(String, String)> = req
+            .exec
+            .env
+            .iter()
+            .map(|p| (p.key.clone(), p.value.clone()))
+            .collect();
+        match ffi::execve(&req.exec.path, &req.exec.argv, &env_pairs) {
+            Ok(_) => unreachable!("execve returned Ok on success"),
+            Err(e) => {
+                eprintln!("jaild-child: execve {}: {e}", req.exec.path);
+                ffi::child_exit(104);
+            }
+        }
+    }
+
+    /* ====== parent ====== */
+    let _ = ffi::close_fd(slave); // the child owns it now
+    info!(
+        "jaild: exec-in-jail {} (jid {}) pid={} pdfd={} master={}",
+        jail.name, jid, pdf.pid, pdf.procdesc_fd, master
+    );
+    Ok((Response::JailExecStarted { pid: pdf.pid }, vec![pdf.procdesc_fd, master]))
+}
+
 fn send_response(
     socket_fd: i32,
     resp:      &Response,
-    fd:        Option<i32>,
+    fds:       &[i32],
 ) -> Result<(), JaildError> {
     let body = serde_json::to_vec(resp)?;
-    ffi::send_frame_with_optional_fd(socket_fd, &body, fd)?;
+    ffi::send_frame_with_fds(socket_fd, &body, fds)?;
     Ok(())
 }
 
