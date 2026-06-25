@@ -124,8 +124,9 @@ fn main() -> std::io::Result<()> {
     /* ── Socket server ───────────────────────────────────────────── */
     let sock_path = std::env::var("FRESCOD_SOCK")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp/frescod.sock"));
-    let wm_sock = std::env::var("FRESCOD_WM_SOCK").ok().map(PathBuf::from);
+        .unwrap_or_else(|_| PathBuf::from("/atrium/sockets/fresco/fresco.sock"));
+    let wm_sock = Some(std::env::var("FRESCOD_WM_SOCK").map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/atrium/sockets/fresco-wm/fresco-wm.sock")));
     let event_subs = socket_server::spawn(
         socket_server::Shared { frontend: frontend.clone(), lane: None },
         &sock_path,
@@ -207,8 +208,9 @@ fn run_headless(png: &str) -> std::io::Result<()> {
 
     let sock = std::env::var("FRESCOD_SOCK")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp/frescod.sock"));
-    let wm_sock = std::env::var("FRESCOD_WM_SOCK").ok().map(PathBuf::from);
+        .unwrap_or_else(|_| PathBuf::from("/atrium/sockets/fresco/fresco.sock"));
+    let wm_sock = Some(std::env::var("FRESCOD_WM_SOCK").map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/atrium/sockets/fresco-wm/fresco-wm.sock")));
     let subs = socket_server::spawn(
         socket_server::Shared { frontend: frontend.clone(), lane: None },
         &sock, wm_sock.as_deref())?;
