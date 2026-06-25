@@ -32,14 +32,16 @@ fn main() {
         Some("attach") | None => {
             let mut name = "default".to_string();
             let mut host: Option<String> = None;
+            let mut jail: Option<String> = None;
             let mut it = argv.iter().skip(1);
             while let Some(a) = it.next() {
                 match a.as_str() {
                     "--host" => host = it.next().cloned(),
+                    "--jail" => jail = it.next().cloned(),
                     other => name = other.to_string(),
                 }
             }
-            attach(&name, host.as_deref());
+            attach(&name, host.as_deref(), jail.as_deref());
         }
         Some("-h") | Some("--help") | Some("help") => usage(),
         Some(other) => {
@@ -63,8 +65,13 @@ fn usage() {
     );
 }
 
-/// (udp_host, udp_port, key)
-fn mint(name: &str, host: Option<&str>) -> Result<(String, u16, Vec<u8>), String> {
+/// (udp_host, udp_port, key). `jail` selects the session target: `None` →
+/// the user's session jail; `Some(id)` → jexec into that running jail.
+fn mint(name: &str, host: Option<&str>, jail: Option<&str>) -> Result<(String, u16, Vec<u8>), String> {
+    let target = match jail {
+        Some(id) => format!("jail:{id}"),
+        None => "session".to_string(),
+    };
     match host {
         None => {
             // Local: talk to the control socket directly.
@@ -73,7 +80,7 @@ fn mint(name: &str, host: Option<&str>) -> Result<(String, u16, Vec<u8>), String
                 .map_err(|e| format!("connect {ctl}: {e} (is stoad running?)"))?;
             use std::io::{BufRead, BufReader, Write};
             (&stream)
-                .write_all(format!("MINT {name}\n").as_bytes())
+                .write_all(format!("MINT {name} {target}\n").as_bytes())
                 .map_err(|e| format!("mint request: {e}"))?;
             let mut reply = String::new();
             BufReader::new(&stream)
@@ -94,10 +101,11 @@ fn mint(name: &str, host: Option<&str>) -> Result<(String, u16, Vec<u8>), String
             for t in toks {
                 cmd.arg(t);
             }
+            cmd.arg(hostspec).arg("stoa-shell").arg(name);
+            if let Some(id) = jail {
+                cmd.arg("--jail").arg(id);
+            }
             let out = cmd
-                .arg(hostspec)
-                .arg("stoa-shell")
-                .arg(name)
                 .output()
                 .map_err(|e| format!("spawn transport {prog:?}: {e}"))?;
             if !out.status.success() {
@@ -132,8 +140,8 @@ fn parse_mint(s: &str) -> Result<(u16, Vec<u8>), String> {
     Ok((port, key))
 }
 
-fn attach(name: &str, host: Option<&str>) {
-    let (udp_host, port, key) = match mint(name, host) {
+fn attach(name: &str, host: Option<&str>, jail: Option<&str>) {
+    let (udp_host, port, key) = match mint(name, host, jail) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("stoactl: {e}");

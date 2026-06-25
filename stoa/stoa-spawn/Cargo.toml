@@ -12,3 +12,10 @@ path = "src/lib.rs"
 
 [dependencies]
 libc = { workspace = true }
+
+# The BrokerSpawner (Target::Jail → portcullisd ExecInJail) only exists on
+# FreeBSD — it speaks portcullis-ipc to the broker. The macOS dev build
+# (DirectSpawner only) pulls neither, so S0–S2 host work stays decoupled.
+[target.'cfg(target_os = "freebsd")'.dependencies]
+portcullis-ipc = { path = "../../portcullis/portcullis-ipc" }
+serde_json     = "1"

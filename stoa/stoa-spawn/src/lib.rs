@@ -28,6 +28,11 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 mod direct;
 pub use direct::DirectSpawner;
 
+#[cfg(target_os = "freebsd")]
+mod broker;
+#[cfg(target_os = "freebsd")]
+pub use broker::BrokerSpawner;
+
 /// Which jail a session's shells attach to (stoa.md §4.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
@@ -72,18 +77,37 @@ pub trait ShellSpawner {
     fn spawn(&self, spec: &SpawnSpec) -> io::Result<PtyShell>;
 }
 
+/// How a [`PtyShell`]'s process is signalled and reaped — the one thing
+/// that differs between the two spawners.
+#[derive(Debug)]
+// `Procdesc` is constructed only by the FreeBSD BrokerSpawner; on the
+// macOS dev host it's unused but the match arms still reference it.
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+enum Reaper {
+    /// We `forkpty`'d it ([`DirectSpawner`]): it's our child, so reap with
+    /// `waitpid` and signal by pid.
+    Child(libc::pid_t),
+    /// jaild `pdfork`'d it (BrokerSpawner): we hold the procdesc, not a
+    /// parent relationship. Signal with `pdkill`; closing the procdesc (on
+    /// drop) reaps; observe exit via kqueue `EVFILT_PROCDESC`. FreeBSD only.
+    Procdesc { fd: OwnedFd, pid: libc::pid_t },
+}
+
 /// A live shell on a pty. Owns the master fd; dropping it closes the
-/// master, which HUPs the slave and (normally) ends the shell.
+/// master (HUPs the slave) and, for the broker case, the procdesc (reaps).
 #[derive(Debug)]
 pub struct PtyShell {
     master: OwnedFd,
-    pid: libc::pid_t,
+    reaper: Reaper,
 }
 
 impl PtyShell {
     /// The child shell's pid.
     pub fn pid(&self) -> libc::pid_t {
-        self.pid
+        match &self.reaper {
+            Reaper::Child(pid) => *pid,
+            Reaper::Procdesc { pid, .. } => *pid,
+        }
     }
 
     /// Raw master fd (for poll/kqueue registration).
@@ -108,41 +132,104 @@ impl PtyShell {
         Ok(())
     }
 
-    /// Signal the child (e.g. `SIGHUP`/`SIGTERM` to end a jexec session).
+    /// Signal the shell (e.g. `SIGHUP`/`SIGTERM` to end a jexec session).
     pub fn kill(&self, sig: i32) -> io::Result<()> {
-        // SAFETY: kill(2) on the recorded child pid.
-        let rc = unsafe { libc::kill(self.pid, sig) };
+        let rc = match &self.reaper {
+            // SAFETY: kill(2) on the recorded child pid.
+            Reaper::Child(pid) => unsafe { libc::kill(*pid, sig) },
+            Reaper::Procdesc { fd, .. } => pdkill(fd.as_raw_fd(), sig)?,
+        };
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
     }
 
-    /// Block until the child exits; returns its exit code (or the signal
-    /// number negated, mirroring shell `$?` convention for signals).
+    /// Block until the shell exits; returns its exit code (or the negated
+    /// signal number, mirroring shell `$?` for signal exits).
     pub fn wait(&self) -> io::Result<i32> {
-        let mut status: libc::c_int = 0;
-        // SAFETY: waitpid on our own child.
-        let rc = unsafe { libc::waitpid(self.pid, &mut status, 0) };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
+        match &self.reaper {
+            Reaper::Child(pid) => {
+                let mut status: libc::c_int = 0;
+                // SAFETY: waitpid on our own child.
+                let rc = unsafe { libc::waitpid(*pid, &mut status, 0) };
+                if rc < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(decode_status(status))
+            }
+            Reaper::Procdesc { fd, .. } => {
+                procdesc_wait(fd.as_raw_fd(), false).map(|o| o.unwrap_or(-1))
+            }
         }
-        Ok(decode_status(status))
     }
 
     /// Non-blocking reap. `Ok(None)` ⇒ still running.
     pub fn try_wait(&self) -> io::Result<Option<i32>> {
-        let mut status: libc::c_int = 0;
-        // SAFETY: waitpid with WNOHANG on our own child.
-        let rc = unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
+        match &self.reaper {
+            Reaper::Child(pid) => {
+                let mut status: libc::c_int = 0;
+                // SAFETY: waitpid with WNOHANG on our own child.
+                let rc = unsafe { libc::waitpid(*pid, &mut status, libc::WNOHANG) };
+                if rc < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if rc == 0 { Ok(None) } else { Ok(Some(decode_status(status))) }
+            }
+            Reaper::Procdesc { fd, .. } => procdesc_wait(fd.as_raw_fd(), true),
         }
-        if rc == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(decode_status(status)))
+    }
+}
+
+/// `pdkill` the process referenced by a procdesc fd. FreeBSD only.
+fn pdkill(_pd: i32, _sig: i32) -> io::Result<libc::c_int> {
+    #[cfg(target_os = "freebsd")]
+    {
+        // SAFETY: pdkill on a procdesc fd we own.
+        Ok(unsafe { libc::pdkill(_pd, _sig) })
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "pdkill: FreeBSD only"))
+    }
+}
+
+/// Wait for a procdesc'd process to exit via kqueue `EVFILT_PROCDESC`.
+/// `nonblock` ⇒ return `Ok(None)` if it hasn't exited. Returns the decoded
+/// exit code on exit. FreeBSD only.
+fn procdesc_wait(_pd: i32, _nonblock: bool) -> io::Result<Option<i32>> {
+    #[cfg(target_os = "freebsd")]
+    {
+        // SAFETY: kqueue + a single EVFILT_PROCDESC|NOTE_EXIT registration;
+        // the returned kevent's `data` carries the wait-status.
+        unsafe {
+            let kq = libc::kqueue();
+            if kq < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut chg: libc::kevent = std::mem::zeroed();
+            chg.ident = _pd as libc::uintptr_t;
+            chg.filter = libc::EVFILT_PROCDESC;
+            chg.flags = libc::EV_ADD | libc::EV_ONESHOT;
+            chg.fflags = libc::NOTE_EXIT;
+            let mut out: libc::kevent = std::mem::zeroed();
+            let ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            let tsp = if _nonblock { &ts as *const _ } else { std::ptr::null() };
+            let n = libc::kevent(kq, &chg, 1, &mut out, 1, tsp);
+            libc::close(kq);
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if n == 0 {
+                return Ok(None); // nonblock: not exited yet
+            }
+            Ok(Some(decode_status(out.data as libc::c_int)))
         }
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        let _ = _nonblock;
+        Err(io::Error::new(io::ErrorKind::Unsupported, "procdesc_wait: FreeBSD only"))
     }
 }
 
@@ -200,12 +287,19 @@ impl io::Write for PtyShell {
     }
 }
 
-/// Construct a `PtyShell` from a raw master fd + pid. Internal to the
-/// crate's spawners.
+/// Construct a `PtyShell` from a raw `forkpty` master fd + pid. The process
+/// is our own child (reaped with `waitpid`). Internal to [`DirectSpawner`].
 pub(crate) fn pty_shell_from_raw(master: i32, pid: libc::pid_t) -> PtyShell {
     // SAFETY: `master` is a freshly-returned forkpty master fd we own.
     let master = unsafe { OwnedFd::from_raw_fd(master) };
-    PtyShell { master, pid }
+    PtyShell { master, reaper: Reaper::Child(pid) }
+}
+
+/// Construct a `PtyShell` from a pty master + a procdesc received over the
+/// broker (the process is jaild's pdfork child). Internal to BrokerSpawner.
+#[cfg(target_os = "freebsd")]
+pub(crate) fn pty_shell_from_broker(master: OwnedFd, procdesc: OwnedFd, pid: libc::pid_t) -> PtyShell {
+    PtyShell { master, reaper: Reaper::Procdesc { fd: procdesc, pid } }
 }
 
 /// Resolve a command name to an absolute executable path, searching `$PATH`

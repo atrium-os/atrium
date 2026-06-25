@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use stoa::{default_ctl, gen_key, seal, to_hex, Control, CONTROL, KEY_LEN, OUTPUT};
 use stoa_proto::{Envelope, MsgType, ReplayWindow};
-use stoa_spawn::{DirectSpawner, PtyShell, ShellSpawner, SpawnSpec};
+use stoa_spawn::{DirectSpawner, PtyShell, ShellSpawner, SpawnSpec, Target};
 
 /// Mutable per-session state, behind one lock (low-rate access). The key is
 /// here (not in `SessionState`) because reattach rekeys it live.
@@ -53,6 +53,10 @@ struct Inner {
 
 struct SessionState {
     port: u16,
+    /// Where this session's shell runs: `"session"` (the user's session
+    /// jail, via DirectSpawner on dev) or `"jail:<id>"` (jexec into a
+    /// running jail, via the portcullisd broker — stoa.md §4.5).
+    target: String,
     dead: AtomicBool,
     inner: Mutex<Inner>,
 }
@@ -97,31 +101,38 @@ fn handle_mint(stream: UnixStream, reg: Reg) {
     if reader.read_line(&mut line).is_err() {
         return;
     }
+    // `MINT <name> [target]` — target is "session" (default) or "jail:<id>".
     let mut parts = line.split_whitespace();
     if parts.next() != Some("MINT") {
         let _ = (&stream).write_all(b"ERR expected MINT\n");
         return;
     }
     let name = parts.next().unwrap_or("default").to_string();
+    let target = parts.next().unwrap_or("session").to_string();
 
-    let (port, key) = mint(&reg, &name);
-    eprintln!("stoad: mint {name:?} → port {port} for uid {uid}");
+    let (port, key) = mint(&reg, &name, &target);
+    eprintln!("stoad: mint {name:?} target={target} → port {port} for uid {uid}");
     let _ = (&stream).write_all(format!("{port} {}\n", to_hex(&key)).as_bytes());
 }
 
 /// Find-and-rekey or create the session; return its `{port, key}`.
-fn mint(reg: &Reg, name: &str) -> (u16, [u8; KEY_LEN]) {
+fn mint(reg: &Reg, name: &str, target: &str) -> (u16, [u8; KEY_LEN]) {
     let mut map = reg.lock().unwrap();
     if let Some(s) = map.get(name) {
-        // Resume: keep the shell + port; rekey + reset the transport window
-        // (a fresh path is a fresh transport session over the same shell).
-        let mut inner = s.inner.lock().unwrap();
-        let key = gen_key();
-        inner.key = key;
-        inner.tx_seq = 0;
-        inner.rx = ReplayWindow::new();
-        inner.last_addr = None;
-        return (s.port, key);
+        if !s.dead.load(Ordering::SeqCst) {
+            // Resume: keep the shell + port; rekey + reset the transport
+            // window (a fresh path is a fresh transport session, same shell).
+            let mut inner = s.inner.lock().unwrap();
+            let key = gen_key();
+            inner.key = key;
+            inner.tx_seq = 0;
+            inner.rx = ReplayWindow::new();
+            inner.last_addr = None;
+            return (s.port, key);
+        }
+        // A dead session (shell exited, or spawn failed) — drop it and make
+        // a fresh one below so the name is reusable.
+        map.remove(name);
     }
     // New session: its own UDP port + key; the shell spawns lazily on the
     // first datagram (so its prompt has somewhere to go).
@@ -130,6 +141,7 @@ fn mint(reg: &Reg, name: &str) -> (u16, [u8; KEY_LEN]) {
     let key = gen_key();
     let state = Arc::new(SessionState {
         port,
+        target: target.to_string(),
         dead: AtomicBool::new(false),
         inner: Mutex::new(Inner {
             key,
@@ -191,10 +203,49 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
     }
 }
 
+/// Parse a session target string → a spawner [`Target`]. `"jail:<id>"` →
+/// `Target::Jail(id)`; anything else → `Target::SessionJail`.
+fn parse_target(target: &str) -> Target {
+    match target.strip_prefix("jail:") {
+        Some(id) if !id.is_empty() => Target::Jail(id.to_string()),
+        _ => Target::SessionJail,
+    }
+}
+
+/// Spawn the shell for a session target: SessionJail via DirectSpawner;
+/// Jail(id) via the portcullisd BrokerSpawner (FreeBSD only).
+fn spawn_for(target: &Target) -> std::io::Result<PtyShell> {
+    let spec = SpawnSpec {
+        target: target.clone(),
+        cmd: Vec::new(),
+        cols: 80,
+        rows: 24,
+        cwd: None,
+        env: Vec::new(),
+    };
+    match target {
+        Target::SessionJail => DirectSpawner::new().spawn(&spec),
+        Target::Jail(_) => spawn_broker(&spec),
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+fn spawn_broker(spec: &SpawnSpec) -> std::io::Result<PtyShell> {
+    use stoa_spawn::BrokerSpawner;
+    BrokerSpawner::new().spawn(spec)
+}
+#[cfg(not(target_os = "freebsd"))]
+fn spawn_broker(_spec: &SpawnSpec) -> std::io::Result<PtyShell> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "jail target needs the FreeBSD portcullisd broker (BrokerSpawner)",
+    ))
+}
+
 /// Lazily spawn the session's shell on the first client datagram and start
 /// its reader thread. Caller holds `inner`.
 fn spawn_shell(name: &str, state: &Arc<SessionState>, inner: &mut Inner, udp: &UdpSocket, reg: &Reg) {
-    match DirectSpawner::new().spawn(&SpawnSpec::login_shell(80, 24)) {
+    match spawn_for(&parse_target(&state.target)) {
         Ok(shell) => {
             let fd = shell.master_fd();
             inner.pty_fd = Some(fd);
@@ -207,7 +258,20 @@ fn spawn_shell(name: &str, state: &Arc<SessionState>, inner: &mut Inner, udp: &U
             thread::spawn(move || reader(rname, fd, rstate, rudp, rreg));
             eprintln!("stoad: session {name:?} shell spawned on port {}", state.port);
         }
-        Err(e) => eprintln!("stoad: session {name:?} spawn failed: {e}"),
+        Err(e) => {
+            eprintln!("stoad: session {name:?} spawn failed: {e}");
+            // Tell the client there's nothing to attach to so it doesn't
+            // hang waiting for output/Bye. Mark dead (recv_loop exits next
+            // iteration; a re-mint recreates — see `mint`). Don't touch the
+            // registry here: we hold `inner`, and mint takes reg→inner, so
+            // locking reg here would invert the order.
+            if let Some(addr) = inner.last_addr {
+                let wire = seal(&inner.key, inner.tx_seq, CONTROL, &Control::Bye.encode());
+                inner.tx_seq = inner.tx_seq.wrapping_add(1);
+                let _ = udp.send_to(&wire, addr);
+            }
+            state.dead.store(true, Ordering::SeqCst);
+        }
     }
 }
 
