@@ -130,6 +130,70 @@ fn push_color(p: &mut Vec<String>, color: Color, fg: bool) {
     }
 }
 
+/// One pane placed at `(top, left)` in the window, showing `grid`.
+pub struct PaneView<'a> {
+    pub top: u16,
+    pub left: u16,
+    pub grid: &'a Grid,
+}
+
+/// Composite several panes into one `cols`×`rows` screen: blit each pane's
+/// grid at its position, draw vertical (`vdivs` columns) and horizontal
+/// (`hdivs` rows) dividers, and place the cursor (the active pane's, in
+/// window coordinates). Lets a multi-pane window be sent as one repaint —
+/// the client stays a plain renderer.
+pub fn render_composite(
+    cols: u16,
+    rows: u16,
+    panes: &[PaneView],
+    vdivs: &[u16],
+    hdivs: &[u16],
+    cursor: (u16, u16),
+) -> Vec<u8> {
+    let mut out = String::new();
+    out.push_str("\x1b[0m\x1b[2J\x1b[H");
+
+    let mut cur: Option<(Color, Color, u8)> = None;
+    for p in panes {
+        let g = p.grid;
+        for r in 0..g.rows() {
+            let wr = p.top + r;
+            if wr >= rows {
+                break;
+            }
+            let _ = write!(out, "\x1b[{};{}H", wr + 1, p.left + 1);
+            for c in 0..g.cols() {
+                if p.left + c >= cols {
+                    break;
+                }
+                emit_cell(&mut out, g.cell(r, c), &mut cur);
+            }
+        }
+    }
+
+    // Dividers in default attributes.
+    out.push_str("\x1b[0m");
+    for &dc in vdivs {
+        if dc < cols {
+            for r in 0..rows {
+                let _ = write!(out, "\x1b[{};{}H\u{2502}", r + 1, dc + 1); // │
+            }
+        }
+    }
+    for &dr in hdivs {
+        if dr < rows {
+            let _ = write!(out, "\x1b[{};1H", dr + 1);
+            for _ in 0..cols {
+                out.push('\u{2500}'); // ─
+            }
+        }
+    }
+
+    let (cr, cc) = cursor;
+    let _ = write!(out, "\x1b[{};{}H", cr + 1, cc + 1);
+    out.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +236,29 @@ mod tests {
     #[test]
     fn snapshot_after_scroll() {
         assert_snapshot_round_trip(8, 2, b"l1\r\nl2\r\nl3\r\nl4");
+    }
+
+    #[test]
+    fn composite_places_panes_side_by_side() {
+        // Two 3-col panes split vertically in an 7-col window (divider col 3).
+        let mut left = Terminal::new(3, 2);
+        left.feed(b"L0\r\nL1");
+        let mut right = Terminal::new(3, 2);
+        right.feed(b"R0\r\nR1");
+        let panes = [
+            PaneView { top: 0, left: 0, grid: left.grid() },
+            PaneView { top: 0, left: 4, grid: right.grid() },
+        ];
+        let bytes = render_composite(7, 2, &panes, &[3], &[], (0, 0));
+        let mut win = Terminal::new(7, 2);
+        win.feed(&bytes);
+        // row 0: "L0 │ R0", row 1: "L1 │ R1"
+        assert_eq!(win.grid().cell(0, 0).c, 'L');
+        assert_eq!(win.grid().cell(0, 1).c, '0');
+        assert_eq!(win.grid().cell(0, 3).c, '\u{2502}'); // divider
+        assert_eq!(win.grid().cell(0, 4).c, 'R');
+        assert_eq!(win.grid().cell(1, 4).c, 'R');
+        assert_eq!(win.grid().cell(1, 5).c, '1');
     }
 
     #[test]
