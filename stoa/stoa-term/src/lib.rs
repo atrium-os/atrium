@@ -19,6 +19,9 @@
 
 use vte::{Params, Parser, Perform};
 
+mod diff;
+pub use diff::{CellRun, StateDiff};
+
 /// A terminal colour. `Default` = the terminal's default fg/bg; `Indexed`
 /// covers the 16 ANSI + 256-colour palette; `Rgb` is 24-bit truecolour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -53,6 +56,21 @@ impl Default for Cell {
     }
 }
 
+/// Two grids are equal on their **visible** state — dimensions, cursor, and
+/// cells — which is exactly what a [`StateDiff`] transmits. Internal
+/// emulator state (the pen's pending SGR, the deferred-wrap flag) is not
+/// compared, so `apply(old, between(old, new)) == new` holds.
+impl PartialEq for Grid {
+    fn eq(&self, o: &Self) -> bool {
+        self.cols == o.cols
+            && self.rows == o.rows
+            && self.cur_row == o.cur_row
+            && self.cur_col == o.cur_col
+            && self.cells == o.cells
+    }
+}
+impl Eq for Grid {}
+
 /// The screen grid + cursor + pen. Implements [`Perform`] so the `vte`
 /// parser drives it directly.
 #[derive(Debug, Clone)]
@@ -85,6 +103,28 @@ impl Grid {
     pub fn cols(&self) -> u16 { self.cols }
     pub fn rows(&self) -> u16 { self.rows }
     pub fn cursor(&self) -> (u16, u16) { (self.cur_row, self.cur_col) }
+
+    /// Overwrite a horizontal run of cells starting at `(row, col)` —
+    /// used by [`StateDiff::apply`]. Out-of-bounds cells are skipped.
+    pub fn write_run(&mut self, row: u16, col: u16, cells: &[Cell]) {
+        if row >= self.rows {
+            return;
+        }
+        for (k, &cell) in cells.iter().enumerate() {
+            let c = col as usize + k;
+            if c < self.cols as usize {
+                let i = self.idx(row, c as u16);
+                self.cells[i] = cell;
+            }
+        }
+    }
+
+    /// Move the cursor (clamped) — used by [`StateDiff::apply`].
+    pub fn set_cursor(&mut self, row: u16, col: u16) {
+        self.cur_row = row.min(self.rows - 1);
+        self.cur_col = col.min(self.cols - 1);
+        self.pending_wrap = false;
+    }
 
     /// The cell at `(row, col)` (0-based). Panics out of bounds.
     pub fn cell(&self, row: u16, col: u16) -> &Cell {
