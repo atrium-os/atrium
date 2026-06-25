@@ -170,7 +170,14 @@ pub mod seat {
     use std::io;
 
     /// The active session = the human user currently bound to the shared engines.
-    pub const ACTIVE_SESSION: &str = "/var/run/atrium/active-session";
+    ///
+    /// Lives in ostiarius's federated runtime dir, NOT `/var/run/atrium` — the
+    /// seat WRITER (ostiarius) is jailed + non-root, so the seat must live where
+    /// `_ostiarius` can write it. `/var/run/atrium` holds root-only state
+    /// (jaild.sock, the launch registry) and is never mounted into a non-TCB
+    /// jail. Seat-aware readers (Choragus/Fresco, in their own jails) mount this
+    /// subdir read-only — the same per-cap-dir pattern as the IPC sockets.
+    pub const ACTIVE_SESSION: &str = "/atrium/sockets/ostiarius/active-session";
 
     /// Bind a session to the engines (login calls this; FUS re-calls it).
     pub fn set_active(user: &str) -> io::Result<()> {

@@ -6,7 +6,7 @@
 //!   ostiarius                    the daemon (drives the real JaildLauncher) —
 //!                                the boot→login loop lands incrementally.
 
-use ostiarius::{Frontend, JaildLauncher, Launcher, LaunchSpec, Ostiarius};
+use ostiarius::{seat, Frontend, JaildLauncher, Launcher, LaunchSpec, Ostiarius};
 
 /// A launcher that logs instead of contacting jaild — for the demo.
 struct LogLauncher;
@@ -107,7 +107,7 @@ fn main() {
         let sock = std::env::var("OSTIARIUS_SOCK")
             .unwrap_or_else(|_| "/atrium/sockets/ostiarius/ostiarius.sock".into());
         let seat = std::env::var("OSTIARIUS_SEAT")
-            .unwrap_or_else(|_| format!("/tmp/ostiarius-seat-{}", std::process::id()));
+            .unwrap_or_else(|_| seat::ACTIVE_SESSION.to_string());
         let _ = std::fs::remove_file(&seat);
         // AllocLauncher = the real allocate-uid + register path, minus jaild, so
         // the trace shows each app's dedicated per-app uid + human owner.
@@ -135,7 +135,7 @@ fn main() {
         let sock = std::env::var("OSTIARIUS_SOCK")
             .unwrap_or_else(|_| "/atrium/sockets/ostiarius/ostiarius.sock".into());
         let seat = std::env::var("OSTIARIUS_SEAT")
-            .unwrap_or_else(|_| format!("/tmp/ostiarius-seat-{}", std::process::id()));
+            .unwrap_or_else(|_| seat::ACTIVE_SESSION.to_string());
         let _ = std::fs::remove_file(&seat);
         let mut launcher = JaildLauncher::default();
         // De-rooted: ostiarius launches via the portcullisd broker, not jaild.
