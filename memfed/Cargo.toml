@@ -12,3 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
+# The portcullisd app protocol — used in --broker mode to send GovernSetRctl to
+# portcullisd (which forwards to jaild) instead of running rctl(8) directly, so a
+# *jailed* memfed can set per-jail caps across jail boundaries. §9.5.
+portcullis-ipc = { path = "../portcullis/portcullis-ipc" }

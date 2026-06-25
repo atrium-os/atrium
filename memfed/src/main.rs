@@ -91,6 +91,109 @@ fn jail_full_ns() -> std::collections::HashMap<i32, u64> {
     m
 }
 
+// ── /dev/pressure: the jailed sensing path ──────────────────────────────────
+// PRESSURE_GET delivers every jail's RSS + PSI in one ioctl, keyed by NAME, so a
+// jailed memfed (which can't run host `rctl -u`/`jls`, nor resolve sibling jids)
+// reads all its budgeting inputs from this one granted device. Layout MUST match
+// `struct pressure_jail_stat` / `struct pressure_snapshot` in <sys/pressure.h>.
+const PRESSURE_MAX_JAILS: usize = 16;
+const PRESSURE_JAIL_NAME: usize = 64;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PressureJailStat {
+    jid: i32,
+    full_avg10: u32,
+    full_avg60: u32,
+    full_avg300: u32,
+    some_ns: u64,
+    full_ns: u64,
+    memoryuse: u64,
+    name: [u8; PRESSURE_JAIL_NAME],
+}
+
+#[repr(C)]
+struct PressureSnapshot {
+    some_ns: u64,
+    full_ns: u64,
+    some_avg10: u32,
+    some_avg60: u32,
+    some_avg300: u32,
+    full_avg10: u32,
+    full_avg60: u32,
+    full_avg300: u32,
+    nstalled: i32,
+    njails: u32,
+    jails: [PressureJailStat; PRESSURE_MAX_JAILS],
+}
+
+const fn pressure_get_ioctl() -> libc::c_ulong {
+    const IOC_OUT: libc::c_ulong = 0x4000_0000;
+    const IOCPARM_MASK: libc::c_ulong = 0x1fff;
+    let size = std::mem::size_of::<PressureSnapshot>() as libc::c_ulong;
+    IOC_OUT | ((size & IOCPARM_MASK) << 16) | ((b'P' as libc::c_ulong) << 8) | 1
+}
+
+/// Open /dev/pressure once; `read()` returns name -> (rss_mib, full_ns) for every
+/// jail. None if the device isn't reachable (older kernel / not in the ruleset) —
+/// the caller falls back to host `rctl -u`/sysctl.
+struct Pressure {
+    fd: i32,
+}
+impl Pressure {
+    fn open() -> Option<Self> {
+        let path = std::ffi::CString::new("/dev/pressure").ok()?;
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
+        if fd < 0 { None } else { Some(Pressure { fd }) }
+    }
+    fn read(&self) -> Option<std::collections::HashMap<String, (u64, u64)>> {
+        let mut s: PressureSnapshot = unsafe { std::mem::zeroed() };
+        let r = unsafe {
+            libc::ioctl(self.fd, pressure_get_ioctl(), &mut s as *mut PressureSnapshot)
+        };
+        if r < 0 {
+            return None;
+        }
+        let mut map = std::collections::HashMap::new();
+        for i in 0..(s.njails as usize).min(PRESSURE_MAX_JAILS) {
+            let j = &s.jails[i];
+            let end = j.name.iter().position(|&b| b == 0).unwrap_or(j.name.len());
+            let name = String::from_utf8_lossy(&j.name[..end]).into_owned();
+            map.insert(name, (j.memoryuse / (1024 * 1024), j.full_ns));
+        }
+        Some(map)
+    }
+}
+impl Drop for Pressure {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.fd); }
+    }
+}
+
+/// Set a jail's `memoryuse` cap (MiB) through the portcullisd broker — the jailed
+/// act path. Connect, Hello, GovernSetRctl; portcullisd cap-checks the peer's
+/// memory_govern grant and forwards to jaild (which sets the rule by NAME). 0 on
+/// Ok, nonzero on any failure (logged). Mirrors memoryd::broker_reap.
+fn broker_set_rctl(sock: &str, jail: &str, memoryuse_mb: u64) -> i32 {
+    use portcullis_ipc::{round_trip, Request, Response, PROTO_VERSION};
+    use std::os::unix::net::UnixStream;
+    let mut s = match UnixStream::connect(sock) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("broker connect {sock}: {e}"); return 1; }
+    };
+    match round_trip(&mut s, &Request::Hello { version: PROTO_VERSION }) {
+        Ok(Response::Hello { .. }) => {}
+        other => { eprintln!("broker handshake: {other:?}"); return 2; }
+    }
+    let req = Request::GovernSetRctl { jail_name: jail.to_string(), memoryuse_mb };
+    match round_trip(&mut s, &req) {
+        Ok(Response::Ok) => 0,
+        Ok(Response::Error { message }) => { eprintln!("broker setrctl rejected: {message}"); 3 }
+        Ok(other) => { eprintln!("broker setrctl unexpected: {other:?}"); 4 }
+        Err(e) => { eprintln!("broker setrctl io: {e}"); 5 }
+    }
+}
+
 #[derive(Clone)]
 struct Jail {
     name: String,
@@ -150,15 +253,28 @@ fn water_fill(budget: u64, demands: &[u64], floors: &[u64], weights: &[f64]) -> 
 /// the per-jail RCTL caps. Returns the per-jail `full` snapshot to use as the next
 /// tick's baseline for the thrash delta.
 fn rebudget(jails: &[Jail], budget: u64, headroom: u64, thrash_boost: u64,
-            prev_full: &std::collections::HashMap<i32, u64>, armed: bool)
-    -> std::collections::HashMap<i32, u64>
+            prev_full: &std::collections::HashMap<String, u64>, armed: bool,
+            broker: Option<&str>, pressure: Option<&Pressure>)
+    -> std::collections::HashMap<String, u64>
 {
-    let rss: Vec<u64> = jails.iter().map(|j| jail_rss_mib(&j.name)).collect();
-    let cur_full = jail_full_ns();
+    // Sense RSS + per-jail `full` keyed by NAME. Primary path = one PRESSURE_GET on
+    // /dev/pressure (the jailed governor read: no host rctl/jls, no sibling-jid
+    // resolution). Fallback (no device) = host `rctl -u` + the per-jail sysctl.
+    let sensed = pressure.and_then(|p| p.read());
+    let (rss, cur_full): (Vec<u64>, std::collections::HashMap<String, u64>) =
+        if let Some(ref m) = sensed {
+            (jails.iter().map(|j| m.get(&j.name).map(|&(r, _)| r).unwrap_or(0)).collect(),
+             jails.iter().filter_map(|j| m.get(&j.name).map(|&(_, f)| (j.name.clone(), f))).collect())
+        } else {
+            let fns = jail_full_ns();
+            (jails.iter().map(|j| jail_rss_mib(&j.name)).collect(),
+             jails.iter().filter_map(|j|
+                 jail_jid(&j.name).and_then(|jid| fns.get(&jid).map(|&f| (j.name.clone(), f)))).collect())
+        };
     // A jail is thrashing iff its per-jail `full` climbed since the last tick.
-    let thrashing: Vec<bool> = jails.iter().map(|j| jail_jid(&j.name).is_some_and(|jid| {
-        cur_full.get(&jid).copied().unwrap_or(0) > prev_full.get(&jid).copied().unwrap_or(0)
-    })).collect();
+    let thrashing: Vec<bool> = jails.iter().map(|j|
+        cur_full.get(&j.name).copied().unwrap_or(0) > prev_full.get(&j.name).copied().unwrap_or(0)
+    ).collect();
     // Demand = RSS (or floor) + headroom, PLUS a thrash boost = the hidden demand a
     // stalling jail can't show in RSS (its pages keep getting reclaimed). The
     // water-fill grants the boost only if the jail's weight wins it — high-weight
@@ -178,9 +294,14 @@ fn rebudget(jails: &[Jail], budget: u64, headroom: u64, thrash_boost: u64,
         eprintln!("  jail {:<10} w={:<4} rss={}MB demand={}MB{} -> grant {}MB cap={}MB{}",
             j.name, j.weight, rss[i], demands[i], tnote, grants[i], cap, note);
         if armed {
-            let _ = Command::new("rctl")
-                .args(["-a", &format!("jail:{}:memoryuse:sigkill={}M", j.name, cap)])
-                .status();
+            match broker {
+                // Jailed act path: portcullisd cap-checks + jaild sets the rule.
+                Some(sock) => { broker_set_rctl(sock, &j.name, cap); }
+                // v1 host-side: rctl(8) directly.
+                None => { let _ = Command::new("rctl")
+                    .args(["-a", &format!("jail:{}:memoryuse:sigkill={}M", j.name, cap)])
+                    .status(); }
+            }
         }
     }
     let total: u64 = grants.iter().sum();
@@ -212,17 +333,29 @@ fn main() {
     }).collect();
 
     if jails.is_empty() {
-        eprintln!("usage: memfed [--arm] [--budget MB|--budget-pct N] [--headroom MB] [--interval S] name:weight:floor ...");
+        eprintln!("usage: memfed [--arm] [--broker <sock>] [--budget MB|--budget-pct N] [--headroom MB] [--interval S] name:weight:floor ...");
         std::process::exit(1);
     }
 
-    eprintln!("memfed: {} | budget {}MB, headroom {}MB/tick, thrash-boost {}MB over {} jails | {}",
-        if armed { "ARMED" } else { "plan-only" }, budget, headroom, thrash_boost, jails.len(),
+    // --broker <sock>: set caps through portcullisd -> jaild (the jailed act path)
+    // instead of rctl(8). Default = direct rctl (v1 host-side bring-up).
+    let broker: Option<String> = has("--broker")
+        .then(|| arg("--broker", "/atrium/sockets/portcullis.sock"));
+    // Sense from /dev/pressure when present (the jailed read); else fall back to
+    // host rctl/sysctl. Opened once and held for the daemon's lifetime.
+    let pressure = Pressure::open();
+
+    eprintln!("memfed: {} | sense {} | act {} | budget {}MB, headroom {}MB/tick, thrash-boost {}MB over {} jails | {}",
+        if armed { "ARMED" } else { "plan-only" },
+        if pressure.is_some() { "/dev/pressure (PRESSURE_GET)" } else { "rctl -u + sysctl (fallback)" },
+        match &broker { Some(s) => format!("broker {s}"), None => "rctl(8) direct".into() },
+        budget, headroom, thrash_boost, jails.len(),
         if interval > 0 { format!("daemon, re-budget every {}s", interval) } else { "one-shot".into() });
 
     let mut prev_full = std::collections::HashMap::new();
     loop {
-        prev_full = rebudget(&jails, budget, headroom, thrash_boost, &prev_full, armed);
+        prev_full = rebudget(&jails, budget, headroom, thrash_boost, &prev_full, armed,
+            broker.as_deref(), pressure.as_ref());
         if interval == 0 {
             break;
         }
