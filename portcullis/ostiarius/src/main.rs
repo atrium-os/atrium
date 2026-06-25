@@ -105,7 +105,7 @@ fn main() {
     // org.atrium.vestibulum). The launches are logged, not really jailed.
     if args.iter().any(|a| a == "--serve-demo") {
         let sock = std::env::var("OSTIARIUS_SOCK")
-            .unwrap_or_else(|_| "/var/run/atrium/ostiarius.sock".into());
+            .unwrap_or_else(|_| "/atrium/sockets/ostiarius.sock".into());
         let seat = std::env::var("OSTIARIUS_SEAT")
             .unwrap_or_else(|_| format!("/tmp/ostiarius-seat-{}", std::process::id()));
         let _ = std::fs::remove_file(&seat);
@@ -133,7 +133,7 @@ fn main() {
     // $ATRIUM_PUBLISHERS configure it.
     if args.iter().any(|a| a == "--serve-prod") {
         let sock = std::env::var("OSTIARIUS_SOCK")
-            .unwrap_or_else(|_| "/var/run/atrium/ostiarius.sock".into());
+            .unwrap_or_else(|_| "/atrium/sockets/ostiarius.sock".into());
         let seat = std::env::var("OSTIARIUS_SEAT")
             .unwrap_or_else(|_| format!("/tmp/ostiarius-seat-{}", std::process::id()));
         let _ = std::fs::remove_file(&seat);
@@ -178,7 +178,7 @@ fn main() {
 
     // Daemon mode: listen on the control socket for vestibulum's authenticated
     // logins, peer-gated by getpeereid. Boot launches the login UI first.
-    const SOCK: &str = "/var/run/atrium/ostiarius.sock";
+    const SOCK: &str = "/atrium/sockets/ostiarius.sock";
     // Real PAM (/etc/pam.d/atrium-login) when built --features pam; the stub
     // otherwise (which refuses, so the production daemon must be a pam build).
     let mut o = Ostiarius::new(JaildLauncher::default()).with_pam("atrium-login");
