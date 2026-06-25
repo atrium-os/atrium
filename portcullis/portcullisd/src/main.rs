@@ -38,6 +38,8 @@ use portcullis_policy::{compute_delta, hash_manifest, now_iso8601, Grant, Policy
 
 mod launch;
 mod manifest_trust;
+#[cfg(feature = "pam")]
+mod pam;
 
 fn usage() -> ! {
     eprintln!("\
@@ -453,13 +455,23 @@ fn handle_session(uid: u32, req: Request, shared: &Mutex<Tenants>) -> Response {
     match req {
         Request::VerifyCredential { user, password } => {
             // Verify against PAM/shadow — portcullisd is root and can read them;
-            // the hashes never leave this process. Dev stub today (any non-empty
-            // credential, matching ostiarius's D2 authenticate()); the PAM path
-            // lands with the production auth stack. The shadow read happening HERE
-            // rather than in a jailed ostiarius is the whole point.
+            // the hashes never leave this process (the jailed ostiarius forwards
+            // the credential, can't read master.passwd itself). With --features
+            // pam this runs the real /etc/pam.d/atrium-login stack; without it,
+            // the dev stub (any non-empty credential).
             if user.is_empty() || password.is_empty() {
-                Response::Error { message: "authentication failed".into() }
-            } else {
+                return Response::Error { message: "authentication failed".into() };
+            }
+            #[cfg(feature = "pam")]
+            {
+                match pam::authenticate("atrium-login", &user, &password) {
+                    Ok(()) => Response::CredentialVerified { user },
+                    Err(e) => Response::Error { message: e },
+                }
+            }
+            #[cfg(not(feature = "pam"))]
+            {
+                let _ = &password;
                 Response::CredentialVerified { user }
             }
         }

@@ -1,0 +1,9 @@
+# /etc/pam.d/atrium-login — the PAM service portcullisd runs for VerifyCredential
+# (the jailed ostiarius forwards the credential; portcullisd, as root, runs this
+# stack so the shadow read stays in the TCB). See docs/spec/ostiarius-privsep.md.
+#
+# Minimal local-password stack: pam_unix crypt-compares against master.passwd.
+# Add pam_login_access / time / nologin etc. here as policy grows.
+
+auth		required	pam_unix.so	no_warn try_first_pass nullok
+account		required	pam_unix.so

@@ -34,6 +34,12 @@ path = "src/bin/aq_client.rs"
 name = "atrium-launch"
 path = "src/bin/launch_app.rs"
 
+[features]
+# Real PAM auth in VerifyCredential (links -lpam). Off by default so the default
+# build + tests need no libpam; the PRODUCTION portcullisd is a `--features pam`
+# build (without it VerifyCredential is the dev stub). See ostiarius-privsep.md.
+pam = []
+
 [dependencies]
 portcullis-toml     = { path = "../portcullis-toml" }
 portcullis-jail     = { path = "../portcullis-jail" }

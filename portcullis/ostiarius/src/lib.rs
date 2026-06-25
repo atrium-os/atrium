@@ -59,6 +59,17 @@ pub trait Launcher {
     fn launch(&mut self, spec: &LaunchSpec) -> Result<i32, String>;
     /// Tear a previously-launched app down (best-effort).
     fn teardown(&mut self, app_id: &str) -> Result<(), String>;
+    /// Verify a credential, returning the canonical username. The default is the
+    /// dev stub (any non-empty credential); the production [`JaildLauncher`]
+    /// forwards it to the portcullisd broker, which runs PAM as root — the jailed
+    /// ostiarius never reads shadow. See docs/spec/ostiarius-privsep.md §2.2.
+    fn verify_credential(&self, user: &str, password: &str) -> Result<String, String> {
+        if user.is_empty() || password.is_empty() {
+            Err("authentication failed".into())
+        } else {
+            Ok(user.to_string())
+        }
+    }
 }
 
 const APPS_DIR: &str = "/usr/local/share/atrium/apps";
@@ -173,23 +184,12 @@ impl<L: Launcher> Ostiarius<L> {
     /// native (insula-logd / Tessera). PAM says *who walked in*; jaild + the seat +
     /// capabilities decide what running as them means.
     pub fn authenticate(&self, user: &str, password: &str) -> Result<String, String> {
-        if user.is_empty() || password.is_empty() {
-            return Err("authentication failed".into());
-        }
-        if let Some(service) = &self.pam_service {
-            #[cfg(feature = "pam")]
-            {
-                pam::authenticate(service, user, password)?;
-                return Ok(user.to_string());
-            }
-            #[cfg(not(feature = "pam"))]
-            {
-                let _ = service;
-                return Err("pam requested but not compiled (build --features pam)".into());
-            }
-        }
-        // dev/test stub: any non-empty credential succeeds (matches vestibulum D2).
-        Ok(user.to_string())
+        // Auth runs through the launcher seam: the production JaildLauncher
+        // forwards to the portcullisd broker, which runs PAM as root and reads
+        // shadow — this jailed, non-root ostiarius never can. Demo launchers use
+        // the trait's default stub. (pam_service / with_pam below are now
+        // vestigial — PAM lives in portcullisd; see docs/spec/ostiarius-privsep.md.)
+        self.launcher.verify_credential(user, password)
     }
 
     /// Post-auth: make `human` the active session. Binds the seat to them; if they
@@ -434,6 +434,21 @@ impl Launcher for JaildLauncher {
             Response::Ok => Ok(()),
             Response::Error { message } => Err(format!("broker teardown: {message}")),
             other => Err(format!("broker teardown: {other:?}")),
+        }
+    }
+
+    fn verify_credential(&self, user: &str, password: &str) -> Result<String, String> {
+        // Forward to the broker: portcullisd (root) runs PAM and reads shadow;
+        // this jailed ostiarius never can. Empty-check first to avoid a round-trip.
+        if user.is_empty() || password.is_empty() {
+            return Err("authentication failed".into());
+        }
+        match self.broker(Request::VerifyCredential {
+            user: user.to_string(), password: password.to_string(),
+        })? {
+            Response::CredentialVerified { user } => Ok(user),
+            Response::Error { message } => Err(message),
+            other => Err(format!("broker verify: {other:?}")),
         }
     }
 }
