@@ -79,6 +79,11 @@ def main():
         ("1/3 loss", {"STOA_DROP": "3"}),
         ("1/3 reorder", {"STOA_REORDER": "3"}),
         ("1/4 loss + 1/4 reorder", {"STOA_DROP": "4", "STOA_REORDER": "4"}),
+        # Extremes — well past any realistic link. Resync-on-gap still
+        # converges (it doesn't storm), proving correctness without ack-based
+        # retransmit; the cost there is only bandwidth (full repaint per gap).
+        ("1/2 loss", {"STOA_DROP": "2"}),
+        ("1/2 loss + 1/2 reorder", {"STOA_DROP": "2", "STOA_REORDER": "2"}),
     ]
     allok = True
     for label, env in faults:
