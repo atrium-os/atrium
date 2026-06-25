@@ -1,0 +1,76 @@
+# /etc/atrium/services.d/51-atrium-memfed.toml
+#
+# The v2 JAILED launch of the memory-federation budgeter (the PROACTIVE
+# containment layer; memoryd is the reactive residual). atrium-portcullisd-
+# bootstrap reads this, asks jaild to create the jail, and kqueue-supervises
+# memfed inside it. Loaded like fresco the RIGHT way (jailed system service),
+# NOT a host-root rc.d. See docs/spec/atrium-memory-pressure.md §6, §9.5.
+#
+# memfed here is fully isolated + jailed, exactly like memoryd (50-...):
+#   - own minimal rootfs (path below) — sees NO host filesystem
+#   - per-jail devfs (devfs_ruleset 20) — sees only /dev/pressure + basics
+#   - runs as the non-root _memfed uid
+#   - SENSES every jail's RSS + PSI by NAME via the /dev/pressure PRESSURE_GET
+#     ioctl (the jailed read; no host rctl/jls, no sibling-jid resolution)
+#   - ACTS via --broker -> portcullisd -> jaild SetRctl (sets each jail's
+#     memoryuse cap by name; no host rctl(8))
+#
+# REQUIRES this supporting infra (commission once per host), same shape as
+# 50-atrium-memoryd.toml:
+#   1. _memfed system uid (e.g. `pw useradd _memfed -u 50091 -d /nonexistent
+#      -s /usr/sbin/nologin`); 50091 is in jaild.policy's user-uid range.
+#   2. The governor devfs ruleset 20 (etc/atrium-governor.devfs.rules ->
+#      /etc/devfs.rules, `service devfs restart`) — grants /dev/pressure;
+#      already commissioned for memoryd, and id 20 is in jaild.policy
+#      [devfs_rulesets].allowed_ids.
+#   3. The portcullisd serve daemon running (for the runtime GovernSetRctl)
+#      and jaild [resource_control] allow_rctl = true (the outer gate).
+#   4. The rootfs mountpoint dirs created: <path>/{dev,libexec,lib,usr/lib,
+#      usr/local/lib,usr/local/bin,atrium/sockets}.
+#
+# The jail list + weights (name:weight:floor) below is OPERATOR CONFIG — the
+# set of jails to budget and their lifecycle-tier weights. Tune per host.
+# (memfed sees every jail in the snapshot, but weights are a policy input.)
+
+enabled       = true
+name          = "atrium-memfed"
+path          = "/var/lib/atrium/jails/memfed"   # a REAL root, not "/"
+children_max  = 0
+devfs_ruleset = 20                               # governor ruleset: pressure + basics
+
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/lib"
+dest   = "usr/local/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/atrium/sockets"
+dest   = "atrium/sockets"
+kind   = "ro_nullfs"
+
+[exec]
+path = "/usr/local/bin/atrium-memfed"
+argv = ["atrium-memfed", "--arm", "--broker", "/atrium/sockets/portcullis.sock",
+        "--budget-pct", "70", "--interval", "10",
+        # operator-tuned jail list (name:weight:floor MiB):
+        "app-org-atrium-vestibulum:5:128"]
+uid  = 50091   # _memfed
+gid  = 50091
+
+[capabilities]
+memory_govern = true   # portcullisd forwards this jail's GovernSetRctl to jaild
