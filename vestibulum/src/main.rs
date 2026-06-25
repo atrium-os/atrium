@@ -146,7 +146,7 @@ impl View for LoginView {
 }
 
 /// Hand the authenticated credential to ostiarius over its control socket
-/// (`$OSTIARIUS_SOCK`, default `/atrium/sockets/ostiarius.sock`) — one
+/// (`$OSTIARIUS_SOCK`, default `/atrium/sockets/ostiarius/ostiarius.sock`) — one
 /// newline-delimited JSON `login` request, one reply. ostiarius authenticates +
 /// launches the human's jailed session (Forum + chrome). Returns the active
 /// human on success, or a human-readable error (which the form shows).
@@ -158,7 +158,7 @@ fn session_handoff(user: &str, password: &str) -> Result<String, String> {
     use std::os::unix::net::UnixStream;
 
     let sock = std::env::var("OSTIARIUS_SOCK")
-        .unwrap_or_else(|_| "/atrium/sockets/ostiarius.sock".to_string());
+        .unwrap_or_else(|_| "/atrium/sockets/ostiarius/ostiarius.sock".to_string());
     let stream = UnixStream::connect(&sock)
         .map_err(|e| format!("session manager unavailable: {e}"))?;
     let mut writer = stream.try_clone().map_err(|e| e.to_string())?;

@@ -35,7 +35,7 @@ load_rc_config "$name"
 
 : ${atrium_ostiarius_enable:="NO"}
 : ${atrium_ostiarius_flags:="--serve-prod"}
-: ${atrium_ostiarius_sock:="/atrium/sockets/ostiarius.sock"}
+: ${atrium_ostiarius_sock:="/atrium/sockets/ostiarius/ostiarius.sock"}
 : ${atrium_ostiarius_jaild_sock:="/var/run/atrium/jaild.sock"}
 : ${atrium_ostiarius_publishers:="/etc/atrium/publishers"}
 : ${atrium_ostiarius_seat:="/var/run/atrium/active-session"}
