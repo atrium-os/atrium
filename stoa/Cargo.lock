@@ -84,6 +84,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "stoa"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "stoa-spawn",
+]
+
+[[package]]
 name = "stoa-proto"
 version = "0.1.0"
 dependencies = [

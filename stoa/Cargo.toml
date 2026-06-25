@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "stoa-proto",
     "stoa-spawn",
+    "stoa",
 ]
 
 [workspace.package]

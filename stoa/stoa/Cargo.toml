@@ -1,0 +1,23 @@
+[package]
+name        = "stoa"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+description = "Stoa S0 skeleton: stoad (daemon) + stoactl (client). Minimal end-to-end attach over a local Unix socket — one window, raw bytes, no envelope/predictor yet (those are S1). See docs/spec/stoa.md §15."
+
+[lib]
+name = "stoa"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stoad"
+path = "src/bin/stoad.rs"
+
+[[bin]]
+name = "stoactl"
+path = "src/bin/stoactl.rs"
+
+[dependencies]
+stoa-spawn = { path = "../stoa-spawn" }
+libc       = { workspace = true }
