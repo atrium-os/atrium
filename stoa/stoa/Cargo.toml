@@ -18,8 +18,11 @@ path = "src/bin/stoad.rs"
 name = "stoactl"
 path = "src/bin/stoactl.rs"
 
+[[bin]]
+name = "stoa-shell"
+path = "src/bin/stoa-shell.rs"
+
 [dependencies]
 stoa-spawn = { path = "../stoa-spawn" }
 stoa-proto = { path = "../stoa-proto" }
-stoa-net   = { path = "../stoa-net" }
 libc       = { workspace = true }

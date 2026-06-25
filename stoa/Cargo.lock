@@ -88,7 +88,6 @@ name = "stoa"
 version = "0.1.0"
 dependencies = [
  "libc",
- "stoa-net",
  "stoa-proto",
  "stoa-spawn",
 ]

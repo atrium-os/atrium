@@ -1,37 +1,45 @@
-//! `stoactl` — S1 client: attach to a named `stoad` session over UDP.
+//! `stoactl` — client: mint a session, then bridge the terminal over UDP.
 //!
-//! `stoactl attach <name>` connects to `stoad`, sends `Attach{name}`, and
+//! ```text
+//! stoactl attach <name>                 # local stoad (mint over the control socket)
+//! stoactl attach <name> --host user@host # remote: ssh user@host stoa-shell <name>
+//! ```
+//!
+//! Mint yields `{udp_host, port, K_sess}`; the client then sends a
+//! keepalive (registering its address + lazily spawning the shell), and
 //! bridges the terminal: a stdin thread seals keystrokes into `Input`
-//! datagrams; the main thread admits inbound `StateDiff` datagrams to
-//! stdout. Two escapes end the client:
-//!
-//! - **Ctrl-]** (the [`DETACH_BYTE`]) in the input stream → send `Detach`
-//!   and exit, leaving the shell running in `stoad` (reattach resumes it).
-//! - **stdin EOF** (a piped client) → stop sending but keep rendering until
-//!   the shell exits (`Bye`).
-//! - **`Bye`** from `stoad` (the shell exited) → exit.
-//!
-//! Send and receive run on separate threads, so the client keeps the
-//! transport's two directions as independent halves (a tx seq counter; an
-//! rx replay window) rather than one `Session`.
+//! datagrams; the main thread renders inbound `StateDiff` to stdout.
+//! Ctrl-] detaches (the shell keeps running in `stoad`); the shell exiting
+//! (`Bye`) ends the client.
 
+use std::io::Read;
 use std::net::UdpSocket;
+use std::os::unix::net::UnixStream;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use stoa::{
-    default_addr, seal, Control, CONTROL, DETACH_BYTE, DEV_KEY, INPUT, OUTPUT,
+    default_ctl, from_hex, seal, Control, CONTROL, DETACH_BYTE, INPUT, KEEPALIVE, OUTPUT,
 };
 use stoa_proto::{Envelope, ReplayWindow};
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    match argv.first().map(String::as_str) {
         Some("attach") | None => {
-            let name = args.get(1).cloned().unwrap_or_else(|| "default".into());
-            attach(&name);
+            let mut name = "default".to_string();
+            let mut host: Option<String> = None;
+            let mut it = argv.iter().skip(1);
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--host" => host = it.next().cloned(),
+                    other => name = other.to_string(),
+                }
+            }
+            attach(&name, host.as_deref());
         }
         Some("-h") | Some("--help") | Some("help") => usage(),
         Some(other) => {
@@ -44,47 +52,111 @@ fn main() {
 
 fn usage() {
     eprintln!(
-        "usage: stoactl attach [name]\n\
+        "usage: stoactl attach <name> [--host user@host]\n\
          \n\
-         Attach to (creating if absent) the named stoad session over UDP\n\
-         ($STOA_ADDR, default 127.0.0.1:7654). Ctrl-] detaches (shell keeps\n\
-         running); the shell exiting ends the client.\n\
+         Mint/resume the named stoad session and bridge the terminal over UDP.\n\
+         Without --host, mints against the local stoad ($STOA_CTL). With\n\
+         --host, runs `ssh user@host stoa-shell <name>` and connects to the\n\
+         minted UDP port on that host.\n\
          \n\
-         S1: one window, raw bytes in the payload, no prediction (stoa.md §15)."
+         Ctrl-] detaches (shell keeps running); the shell exiting ends the client."
     );
 }
 
-fn attach(name: &str) {
-    let stoad = default_addr();
-    let sock = match UdpSocket::bind("127.0.0.1:0").and_then(|s| {
-        s.connect(&stoad)?;
-        Ok(s)
-    }) {
-        Ok(s) => s,
+/// (udp_host, udp_port, key)
+fn mint(name: &str, host: Option<&str>) -> Result<(String, u16, Vec<u8>), String> {
+    match host {
+        None => {
+            // Local: talk to the control socket directly.
+            let ctl = default_ctl();
+            let stream = UnixStream::connect(&ctl)
+                .map_err(|e| format!("connect {ctl}: {e} (is stoad running?)"))?;
+            use std::io::{BufRead, BufReader, Write};
+            (&stream)
+                .write_all(format!("MINT {name}\n").as_bytes())
+                .map_err(|e| format!("mint request: {e}"))?;
+            let mut reply = String::new();
+            BufReader::new(&stream)
+                .read_line(&mut reply)
+                .map_err(|e| format!("mint reply: {e}"))?;
+            let (port, key) = parse_mint(reply.trim())?;
+            Ok(("127.0.0.1".to_string(), port, key))
+        }
+        Some(hostspec) => {
+            // Remote: ssh runs stoa-shell; its stdout returns over the channel.
+            let out = Command::new("ssh")
+                .arg("-T")
+                .arg(hostspec)
+                .arg("stoa-shell")
+                .arg(name)
+                .output()
+                .map_err(|e| format!("spawn ssh: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "ssh stoa-shell failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let line = stdout
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("STOA_SESSION "))
+                .ok_or_else(|| format!("no STOA_SESSION line in ssh output:\n{stdout}"))?;
+            let (port, key) = parse_mint(line)?;
+            // UDP host = the host part of user@host.
+            let udp_host = hostspec.rsplit('@').next().unwrap_or(hostspec).to_string();
+            Ok((udp_host, port, key))
+        }
+    }
+}
+
+fn parse_mint(s: &str) -> Result<(u16, Vec<u8>), String> {
+    let mut p = s.split_whitespace();
+    let port = p
+        .next()
+        .and_then(|x| x.parse::<u16>().ok())
+        .ok_or_else(|| format!("bad mint reply: {s:?}"))?;
+    let key = p
+        .next()
+        .and_then(from_hex)
+        .ok_or_else(|| format!("bad key in mint reply: {s:?}"))?;
+    Ok((port, key))
+}
+
+fn attach(name: &str, host: Option<&str>) {
+    let (udp_host, port, key) = match mint(name, host) {
+        Ok(v) => v,
         Err(e) => {
-            eprintln!("stoactl: connect {stoad}: {e}");
+            eprintln!("stoactl: {e}");
             std::process::exit(1);
         }
     };
 
-    // Attach is seq 0; the stdin thread continues the tx stream from 1.
-    if let Err(e) = sock.send(&seal(DEV_KEY, 0, CONTROL, &Control::Attach { name: name.into() }.encode())) {
-        eprintln!("stoactl: send attach: {e}");
-        std::process::exit(1);
-    }
+    let sock = match UdpSocket::bind("0.0.0.0:0").and_then(|s| {
+        s.connect((udp_host.as_str(), port))?;
+        Ok(s)
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("stoactl: udp connect {udp_host}:{port}: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Register our address (and lazily spawn the shell) with a keepalive at
+    // seq 0; the stdin thread continues the tx stream from seq 1.
+    let _ = sock.send(&seal(&key, 0, KEEPALIVE, &[]));
 
     let _raw = RawMode::enable(libc::STDIN_FILENO);
     let stop = Arc::new(AtomicBool::new(false));
 
-    // stdin → Input datagrams (background).
     {
         let ssock = sock.try_clone().expect("clone socket");
+        let skey = key.clone();
         let sstop = stop.clone();
-        thread::spawn(move || stdin_loop(ssock, sstop));
+        thread::spawn(move || stdin_loop(ssock, skey, sstop));
     }
 
-    // Inbound: StateDiff → stdout, Bye → done. A short read timeout lets us
-    // notice a detach requested by the stdin thread.
     sock.set_read_timeout(Some(Duration::from_millis(150))).ok();
     let mut rx = ReplayWindow::new();
     let mut buf = [0u8; 65536];
@@ -96,7 +168,7 @@ fn attach(name: &str) {
         }
         match sock.recv(&mut buf) {
             Ok(n) => {
-                let Ok(env) = Envelope::decode(DEV_KEY, &buf[..n]) else { continue };
+                let Ok(env) = Envelope::decode(&key, &buf[..n]) else { continue };
                 if !rx.accept(env.seq) {
                     continue;
                 }
@@ -117,29 +189,23 @@ fn attach(name: &str) {
     // `_raw` drops here → terminal restored.
 }
 
-/// Forward stdin to `stoad` as `Input` datagrams until EOF or a detach byte.
-fn stdin_loop(sock: UdpSocket, stop: Arc<AtomicBool>) {
+fn stdin_loop(sock: UdpSocket, key: Vec<u8>, stop: Arc<AtomicBool>) {
     let mut seq: u32 = 1;
-    let mut buf = [0u8; 4096];
+    let mut chunk = [0u8; 4096];
     loop {
-        // SAFETY: read from stdin into our buffer.
-        let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n <= 0 {
-            // EOF: stop forwarding, but let the main loop keep rendering
-            // until the shell exits. (A real tty never EOFs in raw mode.)
-            return;
-        }
-        let chunk = &buf[..n as usize];
-        if let Some(i) = chunk.iter().position(|&b| b == DETACH_BYTE) {
+        let n = match std::io::stdin().lock().read(&mut chunk) {
+            Ok(0) | Err(_) => return, // EOF: stop sending, let main render until Bye
+            Ok(n) => n,
+        };
+        let data = &chunk[..n];
+        if let Some(i) = data.iter().position(|&b| b == DETACH_BYTE) {
             if i > 0 {
-                let _ = sock.send(&seal(DEV_KEY, seq, INPUT, &chunk[..i]));
-                seq = seq.wrapping_add(1);
+                let _ = sock.send(&seal(&key, seq, INPUT, &data[..i]));
             }
-            let _ = sock.send(&seal(DEV_KEY, seq, CONTROL, &Control::Detach.encode()));
             stop.store(true, Ordering::SeqCst);
             return;
         }
-        let _ = sock.send(&seal(DEV_KEY, seq, INPUT, chunk));
+        let _ = sock.send(&seal(&key, seq, INPUT, data));
         seq = seq.wrapping_add(1);
     }
 }

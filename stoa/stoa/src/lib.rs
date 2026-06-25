@@ -1,50 +1,64 @@
 //! # stoa — daemon + client shared bits
 //!
-//! At S1 the bridge moves onto the [`stoa_net`] datagram transport and
-//! `stoad` grows a **session table**: the shell lives in `stoad`,
-//! independent of any client connection, so a dropped client (flaky wifi,
-//! closed laptop) leaves the session running and a later attach resumes
-//! the *same* shell. That is the property `ssh + tmux` can't give you —
-//! ssh owns the shell's lifetime, so a dropped ssh connection kills it.
+//! At S1 the shell lives in `stoad`'s session table, independent of any
+//! client, so a dropped client leaves the session running and a later
+//! attach resumes the *same* shell — the property `ssh + tmux` can't give
+//! (ssh owns the shell's lifetime). The **mint handshake** makes that real
+//! over the network:
 //!
-//! What S1 still omits: real terminal-grid `StateDiff`s (§3.3) — the pty
-//! byte stream is carried raw inside `StateDiff`/`Input` payloads for now;
-//! scrollback/persistence across `stoad` restarts (S3); the SSP predictor
-//! (§3.4); and the real `K_sess` from the SSH handshake — until that
-//! lands, client and daemon share [`DEV_KEY`].
+//! - Each session has its **own UDP port + its own `K_sess`** (a random
+//!   32-byte key). The arriving port identifies the session, so `stoad`
+//!   knows which key to authenticate with before decoding (the structural
+//!   reason the spec gives each session a port, stoa.md §2).
+//! - A client obtains `{port, K_sess}` by **minting** over `stoad`'s local
+//!   control socket. Run locally that is a direct connect; run as
+//!   `ssh host stoa-shell <name>` the mint reply travels back inside the
+//!   confidential SSH channel (the mosh handoff, generalized in
+//!   aqueduct-remote.md §2). The SSH connection may then drop; the UDP
+//!   session is independent.
+//!
+//! Deferred (spec, not yet here): anchoring `K_sess` in the SSH session id
+//! (aqueduct-remote.md §8 open question — needs sshd plumbing we have not
+//! verified); the SSP predictor (§3.4); real terminal-grid `StateDiff`
+//! (§3.3 — the byte stream is carried raw for now); scrollback (S3).
 
 use stoa_proto::MsgType;
 
-/// Default `stoad` UDP address for the dev build. Overridable via
-/// `$STOA_ADDR`. (Production binds per-session ports announced at the SSH
-/// handoff; one fixed port is the single-key dev simplification.)
-pub fn default_addr() -> String {
-    std::env::var("STOA_ADDR").unwrap_or_else(|_| "127.0.0.1:7654".into())
+/// Default `stoad` local control socket (where mints happen). Overridable
+/// via `$STOA_CTL`. Production uses `/var/run/atrium/stoad.sock`; the dev
+/// build uses a per-uid path under the temp dir.
+pub fn default_ctl() -> String {
+    if let Ok(s) = std::env::var("STOA_CTL") {
+        return s;
+    }
+    // SAFETY: getuid never fails.
+    let uid = unsafe { libc::getuid() };
+    let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
+    format!("{}/stoad-{uid}.ctl", tmp.trim_end_matches('/'))
 }
 
-/// Shared dev `K_sess`. **Placeholder.** Real sessions derive a per-session
-/// key from the SSH session id at handoff (stoa.md §2); until that path
-/// exists, client and daemon agree on this constant so the envelope MAC is
-/// exercised end-to-end. Not a secret; never ship it.
-pub const DEV_KEY: &[u8] = b"stoa-dev-shared-K_sess-NOT-FOR-PRODUCTION";
-
 /// The detach key in the raw input stream: Ctrl-] (0x1d, telnet-style).
-/// A real client uses the tmux-compatible `Ctrl-B d` prefix map (S2); for
-/// S1 a single escape byte keeps the client tiny. Detach leaves the shell
-/// running in `stoad`; reattach resumes it.
+/// Detach is purely client-side now — the client just exits; `stoad` keeps
+/// the shell running and routes output to wherever the client next speaks
+/// from (roaming is automatic). A real client uses `Ctrl-B d` (S2).
 pub const DETACH_BYTE: u8 = 0x1d;
 
-/// Control-channel messages (carried as the payload of a
-/// [`MsgType::Control`] datagram). A hand-rolled 1-byte-tag encoding —
-/// small and dependency-free; the richer `DaemonCmd` set (§3.2) is S2.
+/// Length of a session key in bytes.
+pub const KEY_LEN: usize = 32;
+
+/// Datagram carrying raw client→shell keystrokes.
+pub const INPUT: MsgType = MsgType::Input;
+/// Datagram carrying raw shell→client output (real grid diffs are S2).
+pub const OUTPUT: MsgType = MsgType::StateDiff;
+/// Datagram carrying a [`Control`] message.
+pub const CONTROL: MsgType = MsgType::Control;
+/// Empty datagram a client sends first so `stoad` learns its address (and
+/// lazily spawns the shell) before any output is produced.
+pub const KEEPALIVE: MsgType = MsgType::Keepalive;
+
+/// Control-channel messages. At S1 the only one is server→client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Control {
-    /// Client → server: attach to (creating if absent) the named session.
-    Attach { name: String },
-    /// Client → server: detach; leave the shell running.
-    Detach,
-    /// Server → client: attach acknowledged.
-    Attached,
     /// Server → client: the session's shell exited; nothing to resume.
     Bye,
 }
@@ -52,44 +66,56 @@ pub enum Control {
 impl Control {
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Control::Attach { name } => {
-                let mut v = vec![1u8];
-                v.extend_from_slice(name.as_bytes());
-                v
-            }
-            Control::Detach => vec![2],
-            Control::Attached => vec![3],
             Control::Bye => vec![4],
         }
     }
-
     pub fn decode(payload: &[u8]) -> Option<Control> {
-        let (&tag, rest) = payload.split_first()?;
-        Some(match tag {
-            1 => Control::Attach {
-                name: String::from_utf8_lossy(rest).into_owned(),
-            },
-            2 => Control::Detach,
-            3 => Control::Attached,
-            4 => Control::Bye,
-            _ => return None,
-        })
+        match payload.first()? {
+            4 => Some(Control::Bye),
+            _ => None,
+        }
     }
 }
 
-/// Build one wire datagram: stamp `seq`, MAC with `key`. The client's
-/// split tx/rx halves use this directly (rather than a full `Session`)
-/// because its send and receive run on separate threads.
+/// Build one wire datagram: stamp `seq`, MAC with `key`.
 pub fn seal(key: &[u8], seq: u32, msg_type: MsgType, payload: &[u8]) -> Vec<u8> {
     stoa_proto::Envelope::new(msg_type, seq, payload.to_vec()).encode(key)
 }
 
-/// The datagram type carrying raw client→shell keystrokes.
-pub const INPUT: MsgType = MsgType::Input;
-/// The datagram type carrying raw shell→client output (real grid diffs S2).
-pub const OUTPUT: MsgType = MsgType::StateDiff;
-/// The datagram type carrying [`Control`] messages.
-pub const CONTROL: MsgType = MsgType::Control;
+/// A fresh random session key from the OS CSPRNG (`arc4random_buf`, present
+/// in libc on both macOS and FreeBSD; never blocks, always seeded).
+pub fn gen_key() -> [u8; KEY_LEN] {
+    let mut k = [0u8; KEY_LEN];
+    // SAFETY: fills our buffer of KEY_LEN bytes.
+    unsafe { libc::arc4random_buf(k.as_mut_ptr() as *mut libc::c_void, k.len()) };
+    k
+}
+
+/// Lowercase-hex encode.
+pub fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
+    }
+    s
+}
+
+/// Decode lowercase/uppercase hex; `None` on odd length or a non-hex digit.
+pub fn from_hex(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for pair in bytes.chunks(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
+}
 
 #[cfg(test)]
 mod tests {
@@ -97,20 +123,27 @@ mod tests {
 
     #[test]
     fn control_round_trips() {
-        for c in [
-            Control::Attach { name: "work-build".into() },
-            Control::Attach { name: String::new() },
-            Control::Detach,
-            Control::Attached,
-            Control::Bye,
-        ] {
-            assert_eq!(Control::decode(&c.encode()), Some(c));
-        }
+        assert_eq!(Control::decode(&Control::Bye.encode()), Some(Control::Bye));
+        assert_eq!(Control::decode(&[]), None);
+        assert_eq!(Control::decode(&[99]), None);
     }
 
     #[test]
-    fn empty_payload_is_none() {
-        assert_eq!(Control::decode(&[]), None);
-        assert_eq!(Control::decode(&[99]), None);
+    fn hex_round_trips() {
+        let k = gen_key();
+        let h = to_hex(&k);
+        assert_eq!(h.len(), KEY_LEN * 2);
+        assert_eq!(from_hex(&h).as_deref(), Some(&k[..]));
+    }
+
+    #[test]
+    fn hex_rejects_bad() {
+        assert_eq!(from_hex("abc"), None); // odd
+        assert_eq!(from_hex("zz"), None); // non-hex
+    }
+
+    #[test]
+    fn keys_differ() {
+        assert_ne!(gen_key(), gen_key());
     }
 }
