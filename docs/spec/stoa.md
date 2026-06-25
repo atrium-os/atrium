@@ -1,6 +1,7 @@
 # Stoa — persistent session service
 
-Status: **S0–S1 + jail-login BUILT & verified live** (D2.7); S2/S3/predictor pending.
+Status: **S0–S2 + jail-login BUILT & verified live** (D2.7); S3 (Tessera
+scrollback) + ack-based retransmit + multi-client pending.
 Last updated: 2026-06-25.
 
 > **Implementation status (2026-06-25).** Built in `stoa/` (macOS-first
@@ -15,11 +16,29 @@ Last updated: 2026-06-25.
 > non-root app-uid (`cap.jail_exec.denied` for an unauthorized caller).
 > **stoad itself runs jailed + non-root** (`_stoad`, own root, `ip4=inherit`
 > — the gated network model for a network-facing daemon; see §1). Pending:
-> the SSP predictor (§3.4), the real SSH-anchored handshake (§2 — today the
-> mint key rides the SSH channel mosh-style, not yet KDF'd from the SSH
-> session id), S2 multiplexer (§4 — today one window, raw-byte payloads),
+> the real SSH-anchored handshake (§2 — today the mint key rides the SSH
+> channel mosh-style, not yet KDF'd from the SSH session id) and
 > S3 Tessera scrollback (§5 — survives client disconnect, not yet `stoad`
-> restart). **Jailed `SessionJail` handling (fixed 2026-06-25, verified
+> restart).
+>
+> **S2 multiplexer BUILT & verified live (2026-06-25).** Multi-window
+> (`Ctrl-B c`/`n`/`p`/`l`/`0`-`9`) with per-window titles; **panes**
+> (`Ctrl-B %`/`"` split, `Ctrl-B o` switch — v1 is a flat 2-pane split per
+> window, not yet the full §4 layout tree); in-memory scrollback
+> (`Ctrl-B [`/`]`); the clean-room SSP **predictor** (§3.4, opt-in
+> `$STOA_PREDICT`); and **grid-sync streaming** (§3.3, opt-in `$STOA_SYNC`):
+> OUTPUT carries an encoded `StateDiff` (compact cell-run codec) the client
+> paints with `render_diff`, instead of raw bytes. It is **self-healing on a
+> flaky link** — a corrupt datagram (decode fails) or a lost/reordered one
+> (seq gap / non-advancing seq) triggers a resync, where raw bytes
+> permanently desync. Proven on macOS *and* FreeBSD with injected loss +
+> reorder (1/3 each): the screen always converges. **Deltas from this spec's
+> design:** the diff is a flat cell-run format (not the per-pane §3.3 struct);
+> recovery is **resync-on-gap (full repaint)**, not the ack-based
+> last-acked diffing of §3.3/§3.4 (a future bandwidth refinement); sync and
+> the byte-stream predictor are mutually exclusive today.
+>
+> **Jailed `SessionJail` handling (fixed 2026-06-25, verified
 > live):** a jailed stoad must not `forkpty` a session shell in its *own*
 > jail. `resolve_session_target` now: routes `SessionJail` through the
 > broker into `$STOA_SESSION_JAIL` if set; else, if stoad is itself jailed
@@ -226,6 +245,21 @@ A client can request a full snapshot by sending `CONTROL{
 ResyncWindow(window_id) }` — used after long disconnects or
 reattach.
 
+> **Implemented (S2, opt-in `$STOA_SYNC`).** The built `StateDiff`
+> (`stoa-term`) is a flatter form than the struct above: `{ resized:
+> Option<(cols,rows)>, runs: Vec<CellRun{row,col,cells}>, cursor }`, with
+> the **window already composited** server-side (`compose_grid` blits all
+> panes + dividers into one grid) so there is no `window_id`/per-pane split
+> on the wire — one diff repaints the whole active window. `title` rides
+> inside the grid (re-emitted by the snapshot). The wire codec is a compact
+> bounds-checked big-endian encoding (`StateDiff::encode`/`decode`); a
+> decode failure is dropped, never mis-applied. Recovery is **resync-on-gap**
+> (the client tracks the high-water seq; a forward gap → `CONTROL{Redraw}`
+> → full repaint; a non-advancing reordered diff is dropped) rather than the
+> `base_seq` last-acked diffing above — equivalent convergence, simpler, at
+> the cost of a full repaint per gap (ack-based minimal-resend is the future
+> refinement). `bell`/`scrollback_advance` not yet on the wire.
+
 ### 3.4 Predictive echo (clean-room SSP)
 
 The mosh predictor's behavior, reimplemented in Rust under a
@@ -272,6 +306,18 @@ full command grammar — just the bindings that map to our
 
 Layout state (tree shape, splits, focused pane) is part of session
 state; it persists.
+
+> **Implemented (S2).** Windows are a `Vec<Window>` (closed = tombstone so
+> `Ctrl-B <n>` indices stay stable); nav `c`/`n`/`p`/`l`/`0`-`9` + titles
+> are live. **Panes are v1 = a flat 2-pane split per window** (`Window` holds
+> `Vec<Pane>` + an `Option<Divider>` of `Vertical(col)`/`Horizontal(row)`),
+> not yet the arbitrary layout tree above — `Ctrl-B %`/`"` split the active
+> single-pane window into two halves, `Ctrl-B o` switches pane, and a pane
+> exit un-splits (the survivor takes the full window). The renderer already
+> supports N panes + multiple dividers (`compose_grid` takes vdiv/hdiv
+> lists), so extending to the tree is a layout-management change, not a
+> rendering one. Layout is in-memory (not yet persisted across `stoad`
+> restart — that rides S3).
 
 ## 4.5 Session targets and jail exec (jexec, reimagined)
 
