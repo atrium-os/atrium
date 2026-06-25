@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "stoa-proto",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/atrium-os/atrium"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Crypto: same RustCrypto family the rest of the tree standardizes on
+# (aqueduct, portcullis-* all use sha2 = "0.10"). HMAC-SHA256 truncated
+# to 16 bytes is the datagram MAC (stoa.md §3.1).
+sha2 = "0.10"
+hmac = "0.12"
+libc = "0.2"
+
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+opt-level     = 3

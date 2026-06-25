@@ -1,0 +1,15 @@
+[package]
+name        = "stoa-proto"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+description = "Stoa wire protocol: the MAC'd, sequence-numbered datagram envelope + anti-replay window + typed-disposition messages. OS-agnostic (builds + tests on macOS and FreeBSD). See docs/spec/stoa.md §3."
+
+[lib]
+name = "stoa_proto"
+path = "src/lib.rs"
+
+[dependencies]
+sha2 = { workspace = true }
+hmac = { workspace = true }
