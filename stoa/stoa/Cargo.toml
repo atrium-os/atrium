@@ -20,4 +20,6 @@ path = "src/bin/stoactl.rs"
 
 [dependencies]
 stoa-spawn = { path = "../stoa-spawn" }
+stoa-proto = { path = "../stoa-proto" }
+stoa-net   = { path = "../stoa-net" }
 libc       = { workspace = true }

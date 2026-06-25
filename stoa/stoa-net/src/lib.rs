@@ -75,6 +75,14 @@ impl Session {
         env.encode(&self.key)
     }
 
+    /// Run just the anti-replay window for an already-authenticated `seq`.
+    /// For carriers that authenticate separately (e.g. a multiplexed
+    /// `stoad` port that decodes once with a shared key, then dedups
+    /// per-session). Returns `true` iff `seq` is fresh.
+    pub fn admit_seq(&mut self, seq: u32) -> bool {
+        self.rx.accept(seq)
+    }
+
     /// Admit an inbound datagram: authenticate, then anti-replay. See
     /// [`Inbound`]. Never panics; every failure mode maps to a drop.
     pub fn open(&mut self, wire: &[u8]) -> Inbound {
