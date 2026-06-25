@@ -84,6 +84,10 @@ pub enum Control {
     /// Any keystroke (Input) returns to the live screen.
     ScrollUp,
     ScrollDown,
+    /// Client → server (Ctrl-B p): previous live window.
+    PrevWindow,
+    /// Client → server (Ctrl-B l): the previously-active window (toggle).
+    LastWindow,
 }
 
 impl Control {
@@ -102,6 +106,8 @@ impl Control {
             Control::NextWindow => vec![9],
             Control::ScrollUp => vec![10],
             Control::ScrollDown => vec![11],
+            Control::PrevWindow => vec![12],
+            Control::LastWindow => vec![13],
         }
     }
     pub fn decode(payload: &[u8]) -> Option<Control> {
@@ -117,6 +123,8 @@ impl Control {
             9 => Some(Control::NextWindow),
             10 => Some(Control::ScrollUp),
             11 => Some(Control::ScrollDown),
+            12 => Some(Control::PrevWindow),
+            13 => Some(Control::LastWindow),
             _ => None,
         }
     }

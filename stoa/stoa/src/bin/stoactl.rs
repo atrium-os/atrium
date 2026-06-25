@@ -326,6 +326,8 @@ fn stdin_loop(sock: UdpSocket, key: Vec<u8>, seq: Arc<AtomicU32>, stop: Arc<Atom
                     b'r' => send_ctl(Control::Redraw), // repaint from the mirror
                     b'c' => send_ctl(Control::NewWindow), // new window
                     b'n' => send_ctl(Control::NextWindow), // next window
+                    b'p' => send_ctl(Control::PrevWindow), // previous window
+                    b'l' => send_ctl(Control::LastWindow), // last (toggle) window
                     b'0'..=b'9' => send_ctl(Control::SwitchWindow(b - b'0')), // window n
                     b'[' => send_ctl(Control::ScrollUp), // scrollback page up
                     b']' => send_ctl(Control::ScrollDown), // scrollback page down

@@ -68,6 +68,8 @@ struct Inner {
     /// live window once `started`.
     windows: Vec<Window>,
     active: usize,
+    /// The window active before the current one — for Ctrl-B l (last window).
+    last_active: usize,
     /// Set on reattach / window-switch: the next client datagram triggers a
     /// snapshot of the active window.
     need_snapshot: bool,
@@ -113,10 +115,24 @@ impl Inner {
             .map(|w| w.term.grid().history().len())
             .unwrap_or(0)
     }
-    /// First live window index at/after `from` (wrapping); `None` if none.
+    /// First live window index at/after `from` (wrapping forward); `None` if none.
     fn next_live(&self, from: usize) -> Option<usize> {
         let n = self.windows.len();
         (0..n).map(|k| (from + k) % n).find(|&i| self.windows[i].alive)
+    }
+    /// First live window index at/before `from` (wrapping backward).
+    fn prev_live(&self, from: usize) -> Option<usize> {
+        let n = self.windows.len();
+        (0..n).map(|k| (from + n - k) % n).find(|&i| self.windows[i].alive)
+    }
+    /// Make `idx` active, remembering the prior active for Ctrl-B l. Sets
+    /// `need_snapshot` to repaint. No-op if already active.
+    fn set_active(&mut self, idx: usize) {
+        if idx != self.active && self.windows.get(idx).is_some_and(|w| w.alive) {
+            self.last_active = self.active;
+            self.active = idx;
+            self.need_snapshot = true;
+        }
     }
 }
 
@@ -286,6 +302,7 @@ fn mint(reg: &Reg, name: &str, target: &str) -> (u16, [u8; KEY_LEN]) {
             rows: 24,
             windows: Vec::new(),
             active: 0,
+            last_active: 0,
             need_snapshot: false,
             scroll: 0,
         }),
@@ -354,27 +371,30 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
                                         if let Some(idx) =
                                             spawn_window(&name, &state, &mut inner, &udp, &reg)
                                         {
-                                            inner.active = idx;
-                                            inner.need_snapshot = true;
+                                            inner.set_active(idx);
                                         }
                                     }
                                 }
                                 // Ctrl-B <n> — switch to window n if it's live.
-                                Some(Control::SwitchWindow(n)) => {
-                                    let n = n as usize;
-                                    if inner.windows.get(n).is_some_and(|w| w.alive) {
-                                        inner.active = n;
-                                        inner.need_snapshot = true;
-                                    }
-                                }
-                                // Ctrl-B n — next live window.
+                                Some(Control::SwitchWindow(n)) => inner.set_active(n as usize),
+                                // Ctrl-B n / p — next / previous live window.
                                 Some(Control::NextWindow) => {
                                     if let Some(idx) = inner.next_live(inner.active + 1) {
-                                        if idx != inner.active {
-                                            inner.active = idx;
-                                            inner.need_snapshot = true;
+                                        inner.set_active(idx);
+                                    }
+                                }
+                                Some(Control::PrevWindow) => {
+                                    let n = inner.windows.len();
+                                    if n > 0 {
+                                        if let Some(idx) = inner.prev_live((inner.active + n - 1) % n) {
+                                            inner.set_active(idx);
                                         }
                                     }
+                                }
+                                // Ctrl-B l — last (previously-active) window.
+                                Some(Control::LastWindow) => {
+                                    let la = inner.last_active;
+                                    inner.set_active(la);
                                 }
                                 // Ctrl-B [ / ] — page the scrollback view.
                                 Some(Control::ScrollUp) => {
