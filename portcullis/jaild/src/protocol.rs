@@ -297,6 +297,13 @@ pub enum NetworkConfig {
     /// match (CIDR-contained-in) one of
     /// `policy.network.allowed_addrs_on_lo0`.
     Lo0Alias { addr: String },
+    /// Inherit the host's IPv4 addresses (`ip4=JAIL_SYS_INHERIT`): the
+    /// jail shares the host's network stack and may bind any host address.
+    /// For network-facing system daemons (stoad) that must be reachable
+    /// on/off-host; filesystem + process isolation still apply. Powerful —
+    /// gated by `policy.network.allow_inherit_jails` (an allowlist of jail
+    /// names), NOT handed out generally. See docs/spec/network.md.
+    Inherit,
     /// Reserved for V1.
     Vnet     { bridge: String, addr: String, gateway: Option<String> },
     /// Reserved for V1.

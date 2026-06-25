@@ -145,6 +145,11 @@ pub struct NetworkPolicy {
     pub allow_host:    bool,
     #[serde(default)]
     pub allowed_addrs_on_lo0: Vec<String>,
+    /// Jail names permitted to use `ip4=inherit` (share the host's network
+    /// stack). Empty = none; inherit is powerful (the jail may bind any host
+    /// address), so it is an explicit per-jail allowlist, not a global flag.
+    #[serde(default)]
+    pub allow_inherit_jails: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

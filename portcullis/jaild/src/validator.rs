@@ -28,7 +28,7 @@ pub fn validate_create(
     validate_path(&req.path, policy)?;
     validate_children_max(req.children_max, policy)?;
     validate_devfs_ruleset(req.devfs_ruleset, policy)?;
-    validate_network(&req.network, policy)?;
+    validate_network(&req.network, &req.name, policy)?;
     for m in &req.mounts {
         validate_mount(m, policy)?;
     }
@@ -38,8 +38,22 @@ pub fn validate_create(
     Ok(())
 }
 
-fn validate_network(net: &NetworkConfig, policy: &Policy) -> Result<(), JaildError> {
+fn validate_network(net: &NetworkConfig, name: &str, policy: &Policy) -> Result<(), JaildError> {
     match net {
+        NetworkConfig::Inherit => {
+            /* ip4=inherit (share the host stack) is powerful — gate on a
+             * per-jail allowlist, not a global flag. */
+            if policy.network.allow_inherit_jails.iter().any(|n| n == name) {
+                Ok(())
+            } else {
+                Err(JaildError::PolicyViolation {
+                    rule:   "network.inherit.not_allowed",
+                    detail: format!(
+                        "jail {name:?} not in policy.network.allow_inherit_jails — \
+                         ip4=inherit is allowlisted per-jail"),
+                })
+            }
+        }
         NetworkConfig::Disable => {
             /* Always permitted. policy.network.allow_disable is
              * documented as "always true" in the policy schema;
@@ -651,7 +665,7 @@ mod tests {
     #[test]
     fn network_disable_always_ok() {
         let p = load_sample_policy();
-        validate_network(&NetworkConfig::Disable, &p).unwrap();
+        validate_network(&NetworkConfig::Disable, "test-jail", &p).unwrap();
     }
 
     #[test]
@@ -660,6 +674,7 @@ mod tests {
         // sample policy has 127.10.0.0/16 in allowed_addrs_on_lo0
         validate_network(
             &NetworkConfig::Lo0Alias { addr: "127.10.0.5/32".into() },
+            "test-jail",
             &p,
         ).unwrap();
     }
@@ -669,6 +684,7 @@ mod tests {
         let p = load_sample_policy();
         let err = validate_network(
             &NetworkConfig::Lo0Alias { addr: "10.0.0.5/32".into() },
+            "test-jail",
             &p,
         ).unwrap_err();
         assert!(matches!(err,
@@ -680,6 +696,7 @@ mod tests {
         let p = load_sample_policy();
         let err = validate_network(
             &NetworkConfig::Lo0Alias { addr: "127.10.0.5".into() },  // no CIDR
+            "test-jail",
             &p,
         ).unwrap_err();
         assert!(matches!(err,
@@ -691,10 +708,24 @@ mod tests {
         let p = load_sample_policy();
         let err = validate_network(
             &NetworkConfig::Vnet { bridge: "br0".into(), addr: "192.168.1.1/24".into(), gateway: None },
+            "test-jail",
             &p,
         ).unwrap_err();
         assert!(matches!(err,
             JaildError::PolicyViolation { rule: "network.vnet.unimplemented_v0", .. }));
+    }
+
+    #[test]
+    fn network_inherit_requires_allowlist() {
+        let mut p = load_sample_policy();
+        // not in the allowlist → rejected
+        let err = validate_network(&NetworkConfig::Inherit, "atrium-stoad", &p).unwrap_err();
+        assert!(matches!(err,
+            JaildError::PolicyViolation { rule: "network.inherit.not_allowed", .. }));
+        // allowlisted by name → ok; a different name stays rejected
+        p.network.allow_inherit_jails.push("atrium-stoad".into());
+        validate_network(&NetworkConfig::Inherit, "atrium-stoad", &p).unwrap();
+        assert!(validate_network(&NetworkConfig::Inherit, "atrium-other", &p).is_err());
     }
 
     #[test]

@@ -703,6 +703,9 @@ fn handle_create(
         _ => None,
     };
     let ip4_addr_no_cidr = lo0_alias.as_ref().map(|a| ffi::strip_cidr_suffix(a));
+    /* ip4=inherit (validated against the allowlist already): share the host
+     * stack. Mutually exclusive with lo0_alias above. */
+    let ip4_inherit = matches!(req.network, NetworkConfig::Inherit);
 
     /* Per-jail DEVICE isolation (§9.1 KNOWN GAP). Mount a fresh devfs at the
      * jail's own <root>/dev with the ruleset, so the jail sees only the granted
@@ -739,7 +742,7 @@ fn handle_create(
 
     if let Some(exec) = &req.exec {
         return handle_create_with_exec(
-            req, exec, lo0_alias, ip4_addr_no_cidr, state, state_path,
+            req, exec, lo0_alias, ip4_addr_no_cidr, ip4_inherit, state, state_path,
         );
     }
 
@@ -750,6 +753,7 @@ fn handle_create(
         children_max:   req.children_max as i32,
         devfs_ruleset:  req.devfs_ruleset,
         ip4_addr:       ip4_addr_no_cidr.as_deref(),
+        ip4_inherit,
     };
     let created = ffi::create_persistent_jail(&spec).map_err(|e| {
         /* Roll back the lo0 alias if jail_set failed. */
@@ -783,12 +787,13 @@ fn handle_create(
 }
 
 fn handle_create_with_exec(
-    req:        &CreateJailRequest,
-    exec:       &ExecSpec,
-    lo0_alias:  Option<String>,
-    ip4_addr:   Option<String>,
-    state:      &mut PersistentState,
-    state_path: &Path,
+    req:         &CreateJailRequest,
+    exec:        &ExecSpec,
+    lo0_alias:   Option<String>,
+    ip4_addr:    Option<String>,
+    ip4_inherit: bool,
+    state:       &mut PersistentState,
+    state_path:  &Path,
 ) -> Result<CreateOutcome, JaildError> {
     /* Pre-resolve mount targets into absolute paths under the jail
      * root so the child can apply them with a single nmount per
@@ -850,6 +855,7 @@ fn handle_create_with_exec(
             children_max:   req.children_max as i32,
             devfs_ruleset:  req.devfs_ruleset,
             ip4_addr:       ip4_addr.as_deref(),
+            ip4_inherit,
         };
         if let Err(e) = ffi::jail_create_and_attach(&spec) {
             eprintln!("jaild-child: jail_create_and_attach: {e}");

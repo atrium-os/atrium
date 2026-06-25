@@ -114,6 +114,9 @@ pub struct JailCreateSpec<'a> {
     /// pass `ip4.addr=<addr>`. The host-side alias must already
     /// be present; this is just the jail_set parameter.
     pub ip4_addr:       Option<&'a str>,
+    /// `true` = pass `ip4=JAIL_SYS_INHERIT` (share the host's addresses),
+    /// overriding `ip4_addr`. Validator-gated to the inherit allowlist.
+    pub ip4_inherit:    bool,
 }
 
 /// Result of a successful `jail_set(JAIL_CREATE)`. The `jid` is
@@ -133,7 +136,7 @@ pub fn create_persistent_jail(spec: &JailCreateSpec) -> io::Result<CreatedJail> 
     if spec.devfs_ruleset != 0 {
         iob.add_u32("devfs_ruleset", spec.devfs_ruleset);
     }
-    iob.add_network(spec.ip4_addr)?;
+    iob.add_network(spec.ip4_addr, spec.ip4_inherit)?;
     let mut errmsg = vec![0u8; 256];
     iob.add_buf("errmsg", &mut errmsg);
     let jid = iob.run(JAIL_CREATE, &errmsg)?;
@@ -222,7 +225,7 @@ pub fn jail_create_and_attach(spec: &JailCreateSpec) -> io::Result<i32> {
     if spec.devfs_ruleset != 0 {
         iob.add_u32("devfs_ruleset", spec.devfs_ruleset);
     }
-    iob.add_network(spec.ip4_addr)?;
+    iob.add_network(spec.ip4_addr, spec.ip4_inherit)?;
     let mut errmsg = vec![0u8; 256];
     iob.add_buf("errmsg", &mut errmsg);
     iob.run(JAIL_CREATE | JAIL_ATTACH, &errmsg)
@@ -380,9 +383,15 @@ impl IovBuilder {
         });
     }
 
-    /// Add the network configuration to the iovec. Either
-    /// `ip4=disable` (no addr) or `ip4.addr=<struct in_addr>`.
-    fn add_network(&mut self, ip4_addr: Option<&str>) -> io::Result<()> {
+    /// Add the network configuration to the iovec: `ip4=inherit`,
+    /// `ip4=disable`, or `ip4.addr=<struct in_addr>`.
+    fn add_network(&mut self, ip4_addr: Option<&str>, inherit: bool) -> io::Result<()> {
+        if inherit {
+            /* `ip4=inherit`: JAIL_SYS_INHERIT = 1 (per <sys/jail.h>). The
+             * jail shares the host's IPv4 addresses. */
+            self.add_i32("ip4", 1);
+            return Ok(());
+        }
         match ip4_addr {
             None => {
                 /* `ip4=disable`. Value is the integer constant
