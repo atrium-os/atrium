@@ -50,7 +50,7 @@ ruleset — the trusted, operator-curated definition.
 
 ostiarius (as `_ostiarius`) sends portcullisd:
 
-    LaunchSessionComponent { component_id, owner_uid, owner_name }
+    LaunchSessionComponent { component_id, owner_name }
 
 portcullisd:
 1. Confirms the peer is `_ostiarius` (getpeereid) and holds the
@@ -58,12 +58,19 @@ portcullisd:
 2. Looks up `component_id` in the session-component registry. **Unknown id →
    refused.** This is what bounds `_ostiarius`: it can launch only the declared
    session set, never an arbitrary jail.
-3. Fills the per-session parameters (the `owner_uid` for the human's session
-   apps; `_login` for vestibulum) into the registered spec — the only
-   ostiarius-supplied input, and it is validated (a real allocated session uid
-   in range, or the reserved login identity).
-4. Forwards the fully-formed `CreateJail` to jaild and returns the
-   pid/procdesc handle (or the launch error) to ostiarius.
+3. **Allocates + registers** the per-session uid itself — `owner_name` is the
+   only ostiarius-supplied parameter. `portcullis_peer::allocate` picks a free
+   uid from the 50000+ range AND writes the launch registry
+   (`/var/run/atrium/app-registry`, root-owned), so the registry write stays in
+   the TCB and a jailed `_ostiarius` never touches it. (vestibulum uses the
+   reserved `_login` identity.) The allocated uid replaces the registry spec's
+   placeholder `exec.uid`.
+4. Forwards the fully-formed `CreateJail` to jaild and returns the pid/jid to
+   ostiarius, holding the procdesc (below).
+
+Note: the step-3 implementation (commit 5dccaea) currently takes `owner_uid`
+from ostiarius — the move to portcullisd-side allocate+register is the small
+refinement step 4 makes when ostiarius is switched onto the broker.
 
 jaild returns the session jail's procdesc fd to portcullisd (`Client::send` ->
 `(Response, Option<fd>)`). **portcullisd holds that fd in daemon state**, keyed
