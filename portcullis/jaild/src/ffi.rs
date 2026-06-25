@@ -41,6 +41,9 @@ extern "C" {
 
     /// `int jail_remove(int jid);`
     fn jail_remove(jid: i32) -> i32;
+
+    /// `int jail_get(struct iovec *iov, unsigned int niov, int flags);`
+    fn jail_get(iov: *mut libc::iovec, niov: u32, flags: i32) -> i32;
 }
 
 /* Stubs on non-FreeBSD (macOS host build for `cargo test` of
@@ -56,6 +59,42 @@ unsafe fn jail_set(_iov: *mut libc::iovec, _niov: u32, _flags: i32) -> i32 {
 unsafe fn jail_remove(_jid: i32) -> i32 {
     libc::__error().write(libc::ENOSYS);
     -1
+}
+
+/// Resolve a jail's LIVE jid from its name via `jail_get(2)`, mirroring
+/// libjail's `jail_getid`. This is REQUIRED for the reap path: exec'd
+/// (persist=0) jails — every v2-governor-managed app jail — are recorded
+/// in jaild state with sentinel jid 0 (the real jid is assigned by
+/// `jail_set` inside the pdfork-child and never captured back by the
+/// parent), so reaping by the stored jid hits `jail_attach(0)`. Looking
+/// the running jid up by name sidesteps that. Returns None if no jail by
+/// that name is currently running (already exited, or never created).
+#[cfg(target_os = "freebsd")]
+pub fn jail_id_by_name(name: &str) -> Option<i32> {
+    let cname = CString::new(name).ok()?;
+    let cname = cname.as_bytes_with_nul();
+    // iov[0] = key "name", iov[1] = the name value. flags=0 = exact
+    // match; the kernel returns the matching jail's jid (or -1).
+    let key = b"name\0";
+    let mut iov = [
+        libc::iovec {
+            iov_base: key.as_ptr() as *mut libc::c_void,
+            iov_len:  key.len(),
+        },
+        libc::iovec {
+            iov_base: cname.as_ptr() as *mut libc::c_void,
+            iov_len:  cname.len(),
+        },
+    ];
+    // SAFETY: both iov entries point into buffers (`key` static, `cname`
+    // owned) that outlive the call; jail_get with flags=0 reads them.
+    let jid = unsafe { jail_get(iov.as_mut_ptr(), iov.len() as u32, 0) };
+    if jid > 0 { Some(jid) } else { None }
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn jail_id_by_name(_name: &str) -> Option<i32> {
+    None
 }
 
 /// Spec for the V0 `jail_set` call. Mirrors the fields supported

@@ -232,14 +232,29 @@ fn handle_reap(
                              signal a jail jaild did not create", req.jail_name),
         },
     };
+    /* Resolve the LIVE jid by name. Exec'd (persist=0) jails — every
+     * governor-managed app jail — are recorded with sentinel jid 0
+     * (the real jid is assigned in the pdfork-child, never returned to
+     * the parent), so reaping by `jail.jid` would hit jail_attach(0).
+     * The state lookup above is the authorization gate ("jaild created
+     * this name"); this is the actual attach target. None = the jail
+     * isn't running, so there is nothing to signal. */
+    let live_jid = match ffi::jail_id_by_name(&jail.name) {
+        Some(j) => j,
+        None => return Response::SyscallFailed {
+            name:  "jail_id_by_name".into(),
+            errno: 0,
+            msg:   format!("jail {:?} is not currently running", jail.name),
+        },
+    };
     if dry_run {
         info!("[dry-run] reap jail {} (jid {}) signal {:?}",
-            jail.name, jail.jid, req.signal);
+            jail.name, live_jid, req.signal);
         return Response::Ok;
     }
-    match ffi::reap_jail(jail.jid, req.signal.signum()) {
+    match ffi::reap_jail(live_jid, req.signal.signum()) {
         Ok(()) => {
-            info!("reaped jail {} (jid {}) with {:?}", jail.name, jail.jid, req.signal);
+            info!("reaped jail {} (jid {}) with {:?}", jail.name, live_jid, req.signal);
             Response::Ok
         }
         Err(e) => Response::SyscallFailed {
