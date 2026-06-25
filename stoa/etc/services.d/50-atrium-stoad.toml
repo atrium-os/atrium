@@ -1,0 +1,62 @@
+# /etc/atrium/services.d/50-atrium-stoad.toml
+#
+# Jailed, NON-ROOT stoad — the persistent session service / Stoa broker.
+#
+# Unlike the socket-only de-rooted services (frescod/ostiarius/memoryd),
+# stoad is NETWORK-FACING: after the SSH handoff it binds per-session UDP
+# ports that on- and off-host clients talk to directly. So its jail uses
+# `network = inherit` (share the host's network stack — allowlisted in
+# jaild.policy `network.allow_inherit_jails`) while KEEPING filesystem +
+# process isolation. A future mysqld-class jail would use VNET instead (own
+# stack + per-jail firewall); inherit is the right model for a daemon that
+# must be reachable on the host's own addresses.
+#
+# It holds `jail_exec` so portcullisd serves its ExecInJail verb — that is
+# what makes `stoactl attach --jail <jail>` (a shell inside a running jail)
+# work. `_stoad` never touches jaild directly. Numbered 50, after the
+# session services it may broker into.
+enabled = true
+name = "atrium-stoad"
+path = "/var/lib/atrium/jails/atrium-stoad"
+children_max = 0
+devfs_ruleset = 4
+
+[network]
+mode = "inherit"                                   # ip4=inherit (see header)
+
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/lib"
+dest   = "usr/local/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"                          # the stoad binary
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/atrium/sockets"                         # rw: bind its ctl socket + reach the broker
+dest   = "atrium/sockets"
+kind   = "rw_nullfs"
+
+[exec]
+path = "/usr/local/bin/atrium-stoad"   # atrium- prefix required by policy.exec_paths
+argv = ["atrium-stoad"]
+uid  = 50094   # _stoad
+gid  = 50094
+[[exec.env]]
+key   = "STOA_CTL"                                 # ctl socket in the shared dir (reachable by stoa-shell)
+value = "/atrium/sockets/stoad/stoad.ctl"          # STOA_BROKER defaults to /atrium/sockets/portcullis.sock
+
+[capabilities]
+jail_exec = true   # portcullisd serves this jail's ExecInJail verb (stoactl --jail)

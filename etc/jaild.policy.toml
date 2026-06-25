@@ -161,6 +161,9 @@ allowed_keys = [
     # A jail can only point this at its own ro, operator-curated mounts,
     # so it adds no library-injection surface.
     "LD_LIBRARY_PATH",
+    # stoad's control-socket path (points into its own /atrium/sockets
+    # mount). STOA_BROKER defaults correctly so it needs no env.
+    "STOA_CTL",
 ]
 allowed_prefixes = [
     "ATRIUM_",        # all Atrium-namespaced vars
@@ -200,6 +203,14 @@ allow_disable = true       # ip4=disable always permitted
 allow_host    = false      # cannot share host stack (use VNET or disable)
 allowed_addrs_on_lo0 = [
     "127.10.0.0/16",       # loopback range reserved for atrium services
+]
+# Jails permitted to use ip4=inherit (share the host's network stack). Only
+# network-facing system daemons that must bind on/off-host addresses belong
+# here; the jail still gets filesystem + process isolation. stoad needs it
+# (per-session UDP for remote clients). A future mysqld-class jail would use
+# VNET instead (own stack + per-jail firewall).
+allow_inherit_jails = [
+    "atrium-stoad",
 ]
 
 

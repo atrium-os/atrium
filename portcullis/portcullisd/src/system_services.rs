@@ -385,6 +385,9 @@ pub enum ManifestNetwork {
     #[default]
     Disable,
     Lo0Alias { addr: String },
+    /// Share the host's network stack (`ip4=inherit`) — for network-facing
+    /// daemons like stoad. jaild gates this on its per-jail allowlist.
+    Inherit,
 }
 
 impl From<&ManifestNetwork> for NetworkConfig {
@@ -394,6 +397,7 @@ impl From<&ManifestNetwork> for NetworkConfig {
             ManifestNetwork::Lo0Alias { addr } => NetworkConfig::Lo0Alias {
                 addr: addr.clone(),
             },
+            ManifestNetwork::Inherit           => NetworkConfig::Inherit,
         }
     }
 }
