@@ -1,0 +1,91 @@
+# /etc/atrium/services.d/40-atrium-frescod.toml
+#
+# The v2 JAILED launch of frescod (the compositor / display server), replacing
+# the unjailed-root atrium-frescod rc.d. atrium-portcullisd-bootstrap reads this,
+# asks jaild to create the jail, and kqueue-supervises frescod inside it. Numbered
+# 40 so it launches before the governors (50/51) and the session — ostiarius
+# connect-probes frescod's socket before booting vestibulum.
+#
+# frescod runs NON-ROOT (_frescod). A compositor needs no root: client buffers
+# cross the jail boundary as fds passed over its socket (SCM_RIGHTS / dma-buf-
+# equiv), and the only privileged thing it touches is the GPU device — granted to
+# _frescod via the atrium_gpu devfs ruleset (21), since the atrium-gpu-amd kmod
+# gates only on device-node perms (no priv_check). Isolated: own rootfs (sees no
+# host fs), per-jail devfs (only basics + gpu0/display0/hidraw*).
+#
+# REQUIRES (commission once per host):
+#   1. _frescod system uid (e.g. `pw useradd _frescod -u 50092 -d /nonexistent
+#      -s /usr/sbin/nologin`); 50092 is in jaild.policy's user-uid range.
+#   2. The atrium_gpu devfs ruleset (etc/atrium-frescod.devfs.rules ->
+#      /etc/devfs.rules, `service devfs restart`); id 21 in jaild.policy
+#      [devfs_rulesets].allowed_ids.
+#   3. The per-cap socket dirs owned by _frescod so it can bind:
+#      `mkdir -p /atrium/sockets/fresco /atrium/sockets/fresco-wm &&
+#       chown _frescod:_frescod /atrium/sockets/fresco /atrium/sockets/fresco-wm`.
+#   4. The rootfs mountpoint dirs: <path>/{dev,libexec,lib,usr/lib,usr/local/lib,
+#      usr/local/bin,usr/local/share/atrium,atrium/sockets}.
+#   5. Disable the old root rc.d: `sysrc atrium_frescod_enable=NO`.
+
+enabled       = true
+name          = "atrium-frescod"
+path          = "/var/lib/atrium/jails/frescod"
+children_max  = 0
+devfs_ruleset = 21                               # atrium_gpu: basics + gpu/display/hidraw
+
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/lib"
+dest   = "usr/local/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/share/atrium"               # the atrium-core bundle lives here
+dest   = "usr/local/share/atrium"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/share/fonts"                # system-sans etc. (text.rs font search path)
+dest   = "usr/local/share/fonts"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/share/vulkan"               # vulkan ICD manifests (icd.d/*.json)
+dest   = "usr/local/share/vulkan"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/llvm19/lib"                  # libLLVM.so.19.1 — the lvp/radeon ICDs need it
+dest   = "usr/local/llvm19/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/atrium/sockets"                        # rw: frescod BINDS its sockets here
+dest   = "atrium/sockets"
+kind   = "rw_nullfs"
+
+[exec]
+# Installed as atrium-frescod (the atrium- prefix the exec_paths allow-list
+# permits, consistent with atrium-memoryd/atrium-memfed). sockets + bundle
+# resolve to defaults (/atrium/sockets/fresco*, /usr/local/share/atrium/bundles).
+path = "/usr/local/bin/atrium-frescod"
+argv = ["atrium-frescod"]
+uid  = 50092   # _frescod
+gid  = 50092
+# The vulkan loader is dlopen'd at runtime (ash::Entry::load); the jail's
+# linker resolves LINKED libs from the mounted /usr/local/lib, but runtime
+# dlopen needs it on the search path (the host finds it via ld-hints we don't
+# carry into the jail). Points only at the ro-mounted, operator-trusted lib
+# dir, so no injection surface. ICDs self-discover from the vulkan mount above.
+[[exec.env]]
+key   = "LD_LIBRARY_PATH"
+value = "/usr/local/lib:/usr/local/llvm19/lib"

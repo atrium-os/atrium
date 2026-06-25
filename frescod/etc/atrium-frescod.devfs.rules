@@ -1,0 +1,24 @@
+# Append to /etc/devfs.rules, then `service devfs restart`.
+#
+# The devfs ruleset for a jailed, NON-ROOT frescod (the compositor). Hides the
+# whole host /dev, unhides the basics, and exposes the GPU + display + HID input
+# devices to frescod — made openable within the jail's devfs (mode 0666) so the
+# non-root _frescod uid can use them. The atrium-gpu-amd kmod gates only on the
+# device-node permissions (no priv_check), so this grant alone lets frescod run
+# without root: a compositor never needs root, only device access + client buffer
+# fds passed over its socket.
+#
+# The host nodes stay 0600 root:wheel; these directives only affect frescod's
+# per-jail devfs instance. jaild mounts this at <jail-root>/dev (path != "/")
+# and unmounts it on teardown. The numeric id (21) must be in jaild.policy.toml
+# [devfs_rulesets].allowed_ids.
+
+[atrium_gpu=21]
+add include $devfsrules_hide_all
+add include $devfsrules_unhide_basic
+add path 'atrium-gpu0' unhide
+add path 'atrium-gpu0' mode 0666
+add path 'atrium-display0' unhide
+add path 'atrium-display0' mode 0666
+add path 'hidraw*' unhide
+add path 'hidraw*' mode 0666

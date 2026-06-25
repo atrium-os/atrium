@@ -32,6 +32,20 @@ ro_paths = [
     "/usr/local/lib",
     "/usr/local/share/atrium",
     "/usr/local/etc/fonts",
+    "/usr/local/share/fonts",
+
+    # Installed Atrium service/app binaries — every jailed service
+    # ro-mounts this so its exec target (atrium-memoryd / atrium-memfed
+    # / atrium-frescod / ...) is reachable in the jail.
+    "/usr/local/bin",
+
+    # Vulkan ICD manifests — the jailed compositor (frescod) reads
+    # icd.d/*.json here to find its software/GPU vulkan drivers.
+    "/usr/local/share/vulkan",
+
+    # libLLVM.so.19.1 — the lavapipe/radeon vulkan ICDs frescod loads
+    # are linked against it (FreeBSD llvm19 port installs it here).
+    "/usr/local/llvm19/lib",
 
     # Auth state — only mounted into vestibulum, but the source
     # must be on the allow-list to be eligible.
@@ -55,6 +69,14 @@ rw_paths = [
     # frescod / portcullisd / etc. mount this rw to bind/connect
     # their respective sockets).
     "/var/run/aqueduct",
+
+    # The live service-socket tree. A jailed SERVICE rw-mounts this to
+    # BIND its socket under its per-cap subdir (frescod -> fresco/ +
+    # fresco-wm/, owned by _frescod); clients ro-mount it to connect.
+    # The top dir is root:wheel 0755 so a non-root service can only
+    # write its own (pre-chowned) subdir — the rw mount is scoped by
+    # those dir perms, not by the mount.
+    "/atrium/sockets",
 
     # Atrium logs.
     "/var/log/atrium",
@@ -110,8 +132,9 @@ allowed = [
 # 4 = devfsrules_jail (FreeBSD-standard jail /dev: null/zero/random/
 #     tty, NO kmem/mem/pci/gpu) — session apps' per-jail devfs (the
 #     §9.1 isolation fix; ostiarius SESSION_DEVFS_RULESET). 20 = the
-#     memory-governor ruleset (basics + /dev/pressure).
-allowed_ids = [4, 20]
+#     memory-governor ruleset (basics + /dev/pressure). 21 = atrium_gpu
+#     (basics + gpu0/display0/hidraw*) — the jailed non-root frescod.
+allowed_ids = [4, 20, 21]
 
 
 # ---------------------------------------------------------------
@@ -133,6 +156,11 @@ allowed_prefixes = [
 allowed_keys = [
     "USER", "HOME", "LOGNAME", "PATH", "SHELL",
     "TERM", "LANG", "LC_ALL", "TZ",
+    # Runtime lib search path for services that dlopen libs from the
+    # mounted /usr/local/lib (e.g. frescod loading the vulkan loader).
+    # A jail can only point this at its own ro, operator-curated mounts,
+    # so it adds no library-injection surface.
+    "LD_LIBRARY_PATH",
 ]
 allowed_prefixes = [
     "ATRIUM_",        # all Atrium-namespaced vars
