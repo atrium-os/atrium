@@ -30,14 +30,29 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
 use stoa::{default_ctl, gen_key, seal, to_hex, Control, CONTROL, KEY_LEN, OUTPUT};
 use stoa_proto::{Envelope, MsgType, ReplayWindow};
 use stoa_spawn::{DirectSpawner, PtyShell, ShellSpawner, SpawnSpec, Target};
+
+/// Send an OUTPUT datagram, with **test-only** loss injection: if
+/// `$STOA_DROP=N` (N>0), drop 1 in every N OUTPUT datagrams to simulate a
+/// lossy link (exercises the client's seq-gap resync). Off by default — the
+/// real path is just `send_to`.
+fn send_output(udp: &UdpSocket, buf: &[u8], addr: SocketAddr) {
+    static DROP_N: OnceLock<u64> = OnceLock::new();
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = *DROP_N
+        .get_or_init(|| std::env::var("STOA_DROP").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
+    if n > 0 && (COUNT.fetch_add(1, Ordering::Relaxed) + 1) % n == 0 {
+        return; // simulate a dropped datagram
+    }
+    let _ = udp.send_to(buf, addr);
+}
 
 /// One pane: a shell on a pty + a server-side grid mirror + the region it
 /// occupies in the window. A window has 1 pane normally; Ctrl-B % / " split
@@ -685,7 +700,7 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
         };
 
         if let Some((addr, wire)) = snapshot {
-            let _ = udp.send_to(&wire, addr);
+            send_output(&udp, &wire, addr);
         }
         if let Some((MsgType::Input, Some(fd), payload)) = action {
             write_all_fd(fd, &payload);
@@ -1093,7 +1108,7 @@ fn reader(name: String, win_idx: usize, pane_idx: usize, pty_fd: i32, state: Arc
             }
         };
         if let Some((addr, wire)) = out {
-            let _ = udp.send_to(&wire, addr);
+            send_output(&udp, &wire, addr);
         }
     }
 }
