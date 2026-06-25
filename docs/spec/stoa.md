@@ -1,7 +1,30 @@
 # Stoa — persistent session service
 
-Status: design (D2.7).
-Last updated: 2026-05-10.
+Status: **S0–S1 + jail-login BUILT & verified live** (D2.7); S2/S3/predictor pending.
+Last updated: 2026-06-25.
+
+> **Implementation status (2026-06-25).** Built in `stoa/` (macOS-first
+> behind a `ShellSpawner` seam): the wire protocol (`stoa-proto`: MAC'd
+> envelope + anti-replay), the datagram transport (`stoa-net`), and
+> `stoad`/`stoactl` with a per-session **mint handshake** (each session its
+> own UDP port + random `K_sess`) and a session table — so the **shell
+> survives client disconnect** (proven). **Jail-login (§4.5)** is built and
+> **verified live in the VM**: `stoactl attach --jail <jail>` runs a shell
+> *inside* a running jail through jaild `ExecInJail` → the portcullisd
+> `jail_exec`-gated broker → `BrokerSpawner`, with the shell as the jail's
+> non-root app-uid (`cap.jail_exec.denied` for an unauthorized caller).
+> **stoad itself runs jailed + non-root** (`_stoad`, own root, `ip4=inherit`
+> — the gated network model for a network-facing daemon; see §1). Pending:
+> the SSP predictor (§3.4), the real SSH-anchored handshake (§2 — today the
+> mint key rides the SSH channel mosh-style, not yet KDF'd from the SSH
+> session id), S2 multiplexer (§4 — today one window, raw-byte payloads),
+> S3 Tessera scrollback (§5 — survives client disconnect, not yet `stoad`
+> restart). **Caveat for the jailed deployment:** the `SessionJail` target
+> (plain `attach <name>`) still uses `DirectSpawner`, which `forkpty`s
+> inside *stoad's own* jail — wrong for a real user session. A jailed stoad
+> must route `SessionJail` through the broker too (LaunchSessionComponent /
+> the user's session jail), like `--jail` does; only the jail-target path
+> is broker-routed today.
 
 The piece of Atrium that turns "ssh in and run tmux" into a single
 coherent service. **Stoa owns long-lived shell sessions on the
