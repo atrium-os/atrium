@@ -1,0 +1,68 @@
+# /etc/atrium/services.d/45-atrium-ostiarius.toml
+#
+# The v2 JAILED launch of ostiarius (the doorkeeper / session launcher),
+# replacing the unjailed-ROOT atrium-ostiarius rc.d — the last non-TCB root
+# service. Numbered 45 so it starts after frescod (40) and before the governors;
+# ostiarius itself connect-probes frescod, then boots vestibulum via the broker.
+#
+# ostiarius runs NON-ROOT (_ostiarius). It needs no root: it asks the portcullisd
+# BROKER to launch/teardown session components (registry-bounded — it can launch
+# only the declared session.d set, never an arbitrary jail) and the broker does
+# the privileged uid-alloc + CreateJail + procdesc-hold. Auth is the dev stub
+# (no privilege); the VerifyCredential broker path is ready for when PAM lands.
+# See docs/spec/ostiarius-privsep.md.
+#
+# REQUIRES (commission once):
+#   1. _ostiarius system uid (e.g. `pw useradd _ostiarius -u 50093 -d /nonexistent
+#      -s /usr/sbin/nologin`); 50093 is in jaild.policy's user-uid range.
+#   2. The control-socket subdir owned by _ostiarius so it can bind:
+#      `mkdir -p /atrium/sockets/ostiarius && chown _ostiarius:_ostiarius
+#       /atrium/sockets/ostiarius`.
+#   3. The rootfs mountpoint dirs under <path>.
+#   4. Disable the old root rc.d: `sysrc atrium_ostiarius_enable=NO`.
+#   5. ostiarius installed as /usr/local/bin/atrium-ostiarius (the atrium- prefix
+#      the exec_paths allow-list permits).
+
+enabled       = true
+name          = "atrium-ostiarius"
+path          = "/var/lib/atrium/jails/ostiarius"
+children_max  = 0
+devfs_ruleset = 4
+
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/lib"
+dest   = "usr/local/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/share/atrium"
+dest   = "usr/local/share/atrium"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/atrium/sockets"                        # rw: bind its control socket + reach broker/frescod
+dest   = "atrium/sockets"
+kind   = "rw_nullfs"
+
+[exec]
+path = "/usr/local/bin/atrium-ostiarius"
+argv = ["atrium-ostiarius", "--serve-prod"]        # broker/fresco/socket paths all resolve to defaults
+uid  = 50093   # _ostiarius
+gid  = 50093
+
+[capabilities]
+session_launch = true   # portcullisd serves this jail's session-launch verbs
