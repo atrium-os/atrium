@@ -74,6 +74,12 @@ pub enum Control {
     /// Client → server (Ctrl-B r): re-send the current screen. stoad renders
     /// its grid mirror as a snapshot — repaints a garbled/cleared client.
     Redraw,
+    /// Client → server (Ctrl-B c): create a new window, make it active.
+    NewWindow,
+    /// Client → server (Ctrl-B `<n>`): switch to window `n` (0-based).
+    SwitchWindow(u8),
+    /// Client → server (Ctrl-B n): switch to the next live window.
+    NextWindow,
 }
 
 impl Control {
@@ -87,6 +93,9 @@ impl Control {
                 v
             }
             Control::Redraw => vec![6],
+            Control::NewWindow => vec![7],
+            Control::SwitchWindow(n) => vec![8, *n],
+            Control::NextWindow => vec![9],
         }
     }
     pub fn decode(payload: &[u8]) -> Option<Control> {
@@ -97,6 +106,9 @@ impl Control {
                 rows: u16::from_be_bytes([payload[3], payload[4]]),
             }),
             6 => Some(Control::Redraw),
+            7 => Some(Control::NewWindow),
+            8 if payload.len() >= 2 => Some(Control::SwitchWindow(payload[1])),
+            9 => Some(Control::NextWindow),
             _ => None,
         }
     }
@@ -148,12 +160,20 @@ mod tests {
 
     #[test]
     fn control_round_trips() {
-        assert_eq!(Control::decode(&Control::Bye.encode()), Some(Control::Bye));
-        let r = Control::Resize { cols: 203, rows: 51 };
-        assert_eq!(Control::decode(&r.encode()), Some(r));
+        for c in [
+            Control::Bye,
+            Control::Resize { cols: 203, rows: 51 },
+            Control::Redraw,
+            Control::NewWindow,
+            Control::SwitchWindow(7),
+            Control::NextWindow,
+        ] {
+            assert_eq!(Control::decode(&c.encode()), Some(c));
+        }
         assert_eq!(Control::decode(&[]), None);
         assert_eq!(Control::decode(&[99]), None);
         assert_eq!(Control::decode(&[5, 0]), None); // truncated Resize
+        assert_eq!(Control::decode(&[8]), None); // truncated SwitchWindow
     }
 
     #[test]

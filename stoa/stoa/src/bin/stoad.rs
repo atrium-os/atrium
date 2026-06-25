@@ -39,6 +39,19 @@ use stoa::{default_ctl, gen_key, seal, to_hex, Control, CONTROL, KEY_LEN, OUTPUT
 use stoa_proto::{Envelope, MsgType, ReplayWindow};
 use stoa_spawn::{DirectSpawner, PtyShell, ShellSpawner, SpawnSpec, Target};
 
+/// One window of a session: a shell on a pty + a server-side grid mirror.
+/// A session has 1..N windows; only the *active* window's output reaches the
+/// client. Closed windows become tombstones (`alive = false`) so live window
+/// indices stay stable (Ctrl-B `<n>` selects by index).
+struct Window {
+    pty_fd: i32,
+    shell: Option<PtyShell>,
+    /// Mirror of this window's screen — fed every byte, rendered as a
+    /// snapshot on (re)attach and on window switch.
+    term: stoa_term::Terminal,
+    alive: bool,
+}
+
 /// Mutable per-session state, behind one lock (low-rate access). The key is
 /// here (not in `SessionState`) because reattach rekeys it live.
 struct Inner {
@@ -46,22 +59,42 @@ struct Inner {
     tx_seq: u32,
     rx: ReplayWindow,
     last_addr: Option<SocketAddr>,
-    pty_fd: Option<i32>,
-    shell: Option<PtyShell>,
-    started: bool,
-    /// Last terminal size the client reported (Control::Resize); the shell
-    /// spawns at this size and the live pty is resized to it. Default 80×24
-    /// until the client's first Resize.
+    started: bool, // window 0 has been spawned
+    /// Last terminal size the client reported (Control::Resize); windows
+    /// spawn at this size and live ptys are resized to it. Default 80×24.
     cols: u16,
     rows: u16,
-    /// Server-side mirror of the screen — every byte sent to the client is
-    /// also fed here. On reattach we render it as a snapshot so the new
-    /// client sees the current screen instead of a blank. `None` until the
-    /// shell spawns.
-    term: Option<stoa_term::Terminal>,
-    /// Set on reattach (mint of an existing session): the next client
-    /// datagram triggers a snapshot send.
+    /// The session's windows + the active index. `active` always refers to a
+    /// live window once `started`.
+    windows: Vec<Window>,
+    active: usize,
+    /// Set on reattach / window-switch: the next client datagram triggers a
+    /// snapshot of the active window.
     need_snapshot: bool,
+}
+
+impl Inner {
+    fn active_pty(&self) -> Option<i32> {
+        self.windows.get(self.active).filter(|w| w.alive).map(|w| w.pty_fd)
+    }
+    /// Render the active window's mirror + seal it as an OUTPUT datagram for
+    /// the current client. Computes the snapshot bytes first (dropping the
+    /// window borrow) so `tx_seq` can be bumped after.
+    fn seal_active_snapshot(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
+        let addr = self.last_addr?;
+        let bytes = {
+            let w = self.windows.get(self.active).filter(|w| w.alive)?;
+            stoa_term::render_snapshot(w.term.grid())
+        };
+        let wire = seal(&self.key, self.tx_seq, OUTPUT, &bytes);
+        self.tx_seq = self.tx_seq.wrapping_add(1);
+        Some((addr, wire))
+    }
+    /// First live window index at/after `from` (wrapping); `None` if none.
+    fn next_live(&self, from: usize) -> Option<usize> {
+        let n = self.windows.len();
+        (0..n).map(|k| (from + k) % n).find(|&i| self.windows[i].alive)
+    }
 }
 
 struct SessionState {
@@ -164,8 +197,10 @@ fn kill_session(reg: &Reg, name: &str) -> bool {
     match map.get(name) {
         Some(s) if !s.dead.load(Ordering::SeqCst) => {
             let inner = s.inner.lock().unwrap();
-            if let Some(sh) = &inner.shell {
-                let _ = sh.kill(libc::SIGHUP);
+            for w in inner.windows.iter().filter(|w| w.alive) {
+                if let Some(sh) = &w.shell {
+                    let _ = sh.kill(libc::SIGHUP);
+                }
             }
             s.dead.store(true, Ordering::SeqCst);
             eprintln!("stoad: killed session {name:?}");
@@ -210,12 +245,11 @@ fn mint(reg: &Reg, name: &str, target: &str) -> (u16, [u8; KEY_LEN]) {
             tx_seq: 0,
             rx: ReplayWindow::new(),
             last_addr: None,
-            pty_fd: None,
-            shell: None,
             started: false,
             cols: 80,
             rows: 24,
-            term: None,
+            windows: Vec::new(),
+            active: 0,
             need_snapshot: false,
         }),
     });
@@ -255,49 +289,91 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
                         None
                     } else {
                         inner.last_addr = Some(src);
-                        // Resize: record the size (used at spawn) and apply it
-                        // to a live pty + the server-side mirror. Handled
-                        // before the lazy spawn so the shell starts at size.
                         if env.msg_type == MsgType::Control {
                             match Control::decode(&env.payload) {
+                                // Resize: record + apply to every live window's
+                                // pty + mirror. Before lazy-spawn so window 0
+                                // starts at the client's size.
                                 Some(Control::Resize { cols, rows }) => {
                                     inner.cols = cols;
                                     inner.rows = rows;
-                                    if let Some(sh) = &inner.shell {
-                                        let _ = sh.resize(cols, rows);
-                                    }
-                                    if let Some(t) = inner.term.as_mut() {
-                                        t.resize(cols, rows);
+                                    for w in inner.windows.iter_mut().filter(|w| w.alive) {
+                                        if let Some(sh) = &w.shell {
+                                            let _ = sh.resize(cols, rows);
+                                        }
+                                        w.term.resize(cols, rows);
                                     }
                                 }
-                                // Redraw → repaint from the mirror (the
-                                // snapshot block below fires on need_snapshot).
+                                // Redraw → repaint the active window from its
+                                // mirror (the snapshot block fires below).
                                 Some(Control::Redraw) => {
                                     if inner.started {
                                         inner.need_snapshot = true;
                                     }
                                 }
+                                // Ctrl-B c — new window, make it active.
+                                Some(Control::NewWindow) => {
+                                    if inner.started {
+                                        if let Some(idx) =
+                                            spawn_window(&name, &state, &mut inner, &udp, &reg)
+                                        {
+                                            inner.active = idx;
+                                            inner.need_snapshot = true;
+                                        }
+                                    }
+                                }
+                                // Ctrl-B <n> — switch to window n if it's live.
+                                Some(Control::SwitchWindow(n)) => {
+                                    let n = n as usize;
+                                    if inner.windows.get(n).is_some_and(|w| w.alive) {
+                                        inner.active = n;
+                                        inner.need_snapshot = true;
+                                    }
+                                }
+                                // Ctrl-B n — next live window.
+                                Some(Control::NextWindow) => {
+                                    if let Some(idx) = inner.next_live(inner.active + 1) {
+                                        if idx != inner.active {
+                                            inner.active = idx;
+                                            inner.need_snapshot = true;
+                                        }
+                                    }
+                                }
                                 _ => {}
                             }
                         }
+                        // Lazy spawn of window 0 on the first datagram.
                         if !inner.started {
-                            spawn_shell(&name, &state, &mut inner, &udp, &reg);
-                        }
-                        // Reattach snapshot: paint the current screen for the
-                        // newly-attached client (set by mint on reattach).
-                        if inner.need_snapshot && inner.started {
-                            inner.need_snapshot = false;
-                            let bytes = inner
-                                .term
-                                .as_ref()
-                                .map(|t| stoa_term::render_snapshot(t.grid()));
-                            if let Some(b) = bytes {
-                                let w = seal(&inner.key, inner.tx_seq, OUTPUT, &b);
-                                inner.tx_seq = inner.tx_seq.wrapping_add(1);
-                                snapshot = Some((src, w));
+                            match spawn_window(&name, &state, &mut inner, &udp, &reg) {
+                                Some(idx) => {
+                                    inner.active = idx;
+                                    inner.started = true;
+                                }
+                                None => {
+                                    // window 0 failed → end the session (so the
+                                    // client doesn't hang). See `spawn_for`.
+                                    if let Some(addr) = inner.last_addr {
+                                        let w = seal(
+                                            &inner.key,
+                                            inner.tx_seq,
+                                            CONTROL,
+                                            &Control::Bye.encode(),
+                                        );
+                                        inner.tx_seq = inner.tx_seq.wrapping_add(1);
+                                        let _ = udp.send_to(&w, addr);
+                                    }
+                                    state.dead.store(true, Ordering::SeqCst);
+                                }
                             }
                         }
-                        Some((env.msg_type, inner.pty_fd, env.payload))
+                        // Snapshot the active window when requested (reattach,
+                        // redraw, window switch/new).
+                        if inner.need_snapshot && inner.started {
+                            inner.need_snapshot = false;
+                            snapshot = inner.seal_active_snapshot();
+                        }
+                        let pty = inner.active_pty();
+                        Some((env.msg_type, pty, env.payload))
                     }
                 }
             }
@@ -415,82 +491,125 @@ fn spawn_broker(_spec: &SpawnSpec) -> std::io::Result<PtyShell> {
     ))
 }
 
-/// Lazily spawn the session's shell on the first client datagram and start
-/// its reader thread. Caller holds `inner`.
-fn spawn_shell(name: &str, state: &Arc<SessionState>, inner: &mut Inner, udp: &UdpSocket, reg: &Reg) {
+/// Spawn one window (shell + pty + grid mirror) and start its reader thread.
+/// Appends to `inner.windows`; returns the new window's index, or `None` on
+/// spawn failure. Caller holds `inner` and decides the failure policy
+/// (window 0 → end the session; a Ctrl-B-c window → ignore).
+fn spawn_window(
+    name: &str,
+    state: &Arc<SessionState>,
+    inner: &mut Inner,
+    udp: &UdpSocket,
+    reg: &Reg,
+) -> Option<usize> {
     match spawn_for(&parse_target(&state.target), inner.cols, inner.rows) {
         Ok(shell) => {
             let fd = shell.master_fd();
-            inner.pty_fd = Some(fd);
-            inner.shell = Some(shell);
-            inner.started = true;
-            inner.term = Some(stoa_term::Terminal::new(inner.cols, inner.rows));
+            let idx = inner.windows.len();
+            inner.windows.push(Window {
+                pty_fd: fd,
+                shell: Some(shell),
+                term: stoa_term::Terminal::new(inner.cols, inner.rows),
+                alive: true,
+            });
             let rstate = state.clone();
             let rudp = udp.try_clone().expect("clone udp");
             let rname = name.to_string();
             let rreg = reg.clone();
-            thread::spawn(move || reader(rname, fd, rstate, rudp, rreg));
-            eprintln!("stoad: session {name:?} shell spawned on port {}", state.port);
+            thread::spawn(move || reader(rname, idx, fd, rstate, rudp, rreg));
+            eprintln!("stoad: session {name:?} window {idx} spawned on port {}", state.port);
+            Some(idx)
         }
         Err(e) => {
-            eprintln!("stoad: session {name:?} spawn failed: {e}");
-            // Tell the client there's nothing to attach to so it doesn't
-            // hang waiting for output/Bye. Mark dead (recv_loop exits next
-            // iteration; a re-mint recreates — see `mint`). Don't touch the
-            // registry here: we hold `inner`, and mint takes reg→inner, so
-            // locking reg here would invert the order.
-            if let Some(addr) = inner.last_addr {
-                let wire = seal(&inner.key, inner.tx_seq, CONTROL, &Control::Bye.encode());
-                inner.tx_seq = inner.tx_seq.wrapping_add(1);
-                let _ = udp.send_to(&wire, addr);
-            }
-            state.dead.store(true, Ordering::SeqCst);
+            eprintln!("stoad: session {name:?} window spawn failed: {e}");
+            None
         }
     }
 }
 
-/// Per-session pty reader: shell output → the last-known client address.
-fn reader(name: String, pty_fd: i32, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
+/// What a window's reader does after its shell exits.
+enum CloseOutcome {
+    /// No live windows left → session ends; carries an optional Bye datagram.
+    EndSession(Option<(SocketAddr, Vec<u8>)>),
+    /// The active window closed → switched to another; carries its snapshot.
+    Switched(Option<(SocketAddr, Vec<u8>)>),
+    /// A background window closed → nothing to send.
+    Nothing,
+}
+
+/// Per-window pty reader: feed this window's mirror; if it's the active
+/// window, stream its output to the client. On shell exit, close the window.
+fn reader(name: String, win_idx: usize, pty_fd: i32, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
     let mut buf = [0u8; 8192];
     loop {
-        // SAFETY: read the session's pty master into our buffer.
+        // SAFETY: read this window's pty master into our buffer.
         let n = unsafe { libc::read(pty_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n <= 0 {
-            // Shell exited: mark dead (stops recv_loop), drop from the
-            // registry (so a re-mint makes a fresh session), say Bye, reap.
-            state.dead.store(true, Ordering::SeqCst);
-            reg.lock().unwrap().remove(&name);
-            let bye = {
+            // The window's shell exited. Decide the outcome under `inner`
+            // (released before touching `reg`, to keep the reg→inner order).
+            let outcome = {
                 let mut inner = state.inner.lock().unwrap();
-                let out = inner.last_addr.map(|a| {
-                    let w = seal(&inner.key, inner.tx_seq, CONTROL, &Control::Bye.encode());
-                    inner.tx_seq = inner.tx_seq.wrapping_add(1);
-                    (a, w)
-                });
-                if let Some(sh) = inner.shell.take() {
-                    let _ = sh.wait();
+                if let Some(w) = inner.windows.get_mut(win_idx) {
+                    w.alive = false;
+                    if let Some(sh) = w.shell.take() {
+                        let _ = sh.wait();
+                    }
                 }
-                out
+                if !inner.windows.iter().any(|w| w.alive) {
+                    let bye = inner.last_addr.map(|a| {
+                        let wire = seal(&inner.key, inner.tx_seq, CONTROL, &Control::Bye.encode());
+                        inner.tx_seq = inner.tx_seq.wrapping_add(1);
+                        (a, wire)
+                    });
+                    CloseOutcome::EndSession(bye)
+                } else if inner.active == win_idx {
+                    if let Some(idx) = inner.next_live(0) {
+                        inner.active = idx;
+                    }
+                    CloseOutcome::Switched(inner.seal_active_snapshot())
+                } else {
+                    CloseOutcome::Nothing
+                }
             };
-            if let Some((addr, wire)) = bye {
-                let _ = udp.send_to(&wire, addr);
+            match outcome {
+                CloseOutcome::EndSession(bye) => {
+                    state.dead.store(true, Ordering::SeqCst);
+                    reg.lock().unwrap().remove(&name);
+                    if let Some((addr, wire)) = bye {
+                        let _ = udp.send_to(&wire, addr);
+                    }
+                    eprintln!("stoad: session {name:?} ended (last window closed)");
+                }
+                CloseOutcome::Switched(snap) => {
+                    if let Some((addr, wire)) = snap {
+                        let _ = udp.send_to(&wire, addr);
+                    }
+                    eprintln!("stoad: session {name:?} window {win_idx} closed; switched active");
+                }
+                CloseOutcome::Nothing => {
+                    eprintln!("stoad: session {name:?} window {win_idx} closed");
+                }
             }
-            eprintln!("stoad: session {name:?} ended (shell exited)");
             return;
         }
         let bytes = &buf[..n as usize];
         let out = {
             let mut inner = state.inner.lock().unwrap();
-            // Mirror every byte the client sees into the server-side grid,
-            // so a reattach can render the current screen.
-            if let Some(t) = inner.term.as_mut() {
-                t.feed(bytes);
+            // Mirror every byte into THIS window's grid (even when it's not
+            // active), so a switch can paint its current screen.
+            if let Some(w) = inner.windows.get_mut(win_idx) {
+                w.term.feed(bytes);
             }
-            inner.last_addr.map(|a| {
-                let w = seal(&inner.key, inner.tx_seq, OUTPUT, bytes);
-                inner.tx_seq = inner.tx_seq.wrapping_add(1);
-                (a, w)
-            })
+            // Only the active window streams to the client.
+            if inner.active == win_idx {
+                inner.last_addr.map(|a| {
+                    let w = seal(&inner.key, inner.tx_seq, OUTPUT, bytes);
+                    inner.tx_seq = inner.tx_seq.wrapping_add(1);
+                    (a, w)
+                })
+            } else {
+                None
+            }
         };
         if let Some((addr, wire)) = out {
             let _ = udp.send_to(&wire, addr);

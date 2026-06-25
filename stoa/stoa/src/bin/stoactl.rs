@@ -289,6 +289,9 @@ fn stdin_loop(sock: UdpSocket, key: Vec<u8>, seq: Arc<AtomicU32>, stop: Arc<Atom
             pending.clear();
         }
     };
+    let send_ctl = |c: Control| {
+        let _ = sock.send(&seal(&key, seq.fetch_add(1, Ordering::SeqCst), CONTROL, &c.encode()));
+    };
 
     let mut chunk = [0u8; 4096];
     let mut prefix = false; // saw Ctrl-B; next byte is a command
@@ -310,17 +313,12 @@ fn stdin_loop(sock: UdpSocket, key: Vec<u8>, seq: Arc<AtomicU32>, stop: Arc<Atom
                         stop.store(true, Ordering::SeqCst);
                         return; // Ctrl-B d = detach
                     }
-                    b'r' => {
-                        // Ctrl-B r = redraw (repaint from the server mirror)
-                        let _ = sock.send(&seal(
-                            &key,
-                            seq.fetch_add(1, Ordering::SeqCst),
-                            CONTROL,
-                            &Control::Redraw.encode(),
-                        ));
-                    }
+                    b'r' => send_ctl(Control::Redraw), // repaint from the mirror
+                    b'c' => send_ctl(Control::NewWindow), // new window
+                    b'n' => send_ctl(Control::NextWindow), // next window
+                    b'0'..=b'9' => send_ctl(Control::SwitchWindow(b - b'0')), // window n
                     PREFIX_BYTE => pending.push(PREFIX_BYTE), // literal Ctrl-B
-                    _ => {} // unknown command: ignored (window/pane keys land with the mux)
+                    _ => {} // unknown command: ignored
                 }
             } else if b == PREFIX_BYTE {
                 flush(&mut pending); // keep input before the prefix in order
