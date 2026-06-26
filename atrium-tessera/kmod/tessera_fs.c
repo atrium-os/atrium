@@ -6207,6 +6207,61 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	return (r);
 }
 
+/*
+ * On-demand data-zone GC (drives TESSERA_IOC_GC).
+ *
+ * Mount-time GC and the tombstone-flush GC already reclaim deleted-file
+ * packs. This entry point lets userspace force a sweep WITHOUT a remount,
+ * which is the only way to reclaim orphans from in-place rewrites and
+ * xattr churn: when a file is rewritten (or an xattr changes) the inode
+ * repoints to a fresh single-blob pack and the old one becomes an orphan,
+ * but there's no tombstone, so the flush-path GC never fires for it. Today
+ * those orphans wait for the next mount; this closes that gap.
+ *
+ * No new walk logic — it reuses the exact gc_data_zone the flush path
+ * runs, inside the same flush_in_progress bracket flush uses to keep
+ * writers and concurrent flushes from COWing the live trees underfoot.
+ *
+ * Returns 0 and the reclaimed pack count in *out_reclaimed, or an errno.
+ */
+static int
+tessera_fs_gc_now(struct tessera_mount *tmp_, uint64_t *out_reclaimed)
+{
+	if (out_reclaimed != NULL) *out_reclaimed = 0;
+	if (tmp_->inode_tree == NULL || tmp_->pack_registry_tree == NULL)
+		return (EROFS);
+	if (tmp_->readonly_snapshot)
+		return (EROFS);
+	if (!tmp_->flush_mtx_init)
+		return (0);
+
+	/* Drain pending writes first: rewrite-orphaned content packs must be
+	 * fully on disk (and out of the pending set) and the inode tree must
+	 * reflect the current post-rewrite hashes before pass 1 collects the
+	 * live set — otherwise a still-pending new manifest looks orphaned. */
+	(void)tessera_fs_flush(tmp_);
+
+	/* Acquire the flush gate exactly as tessera_fs_flush does. */
+	mtx_lock(&tmp_->flush_mtx);
+	while (tmp_->flush_in_progress) {
+		(void)msleep(&tmp_->flush_in_progress, &tmp_->flush_mtx,
+		    PRIBIO, "tessgc", 0);
+	}
+	tmp_->flush_in_progress = 1;
+	mtx_unlock(&tmp_->flush_mtx);
+
+	int n = tessera_fs_gc_data_zone(tmp_);
+
+	mtx_lock(&tmp_->flush_mtx);
+	tmp_->flush_in_progress = 0;
+	wakeup(&tmp_->flush_in_progress);
+	mtx_unlock(&tmp_->flush_mtx);
+
+	if (n > 0 && out_reclaimed != NULL)
+		*out_reclaimed = (uint64_t)n;
+	return (0);
+}
+
 /* Visitor used at mount time to mark which meta-reserve sectors are
  * still referenced by a live tree. ctx is `struct meta_mark_ctx`
  * (forward-declared above). */
@@ -13254,6 +13309,11 @@ tessera_vop_pathconf(struct vop_pathconf_args *ap)
  * &limit). 'T' family; keep in sync with the tessera-quota tool. */
 #define TESSERA_IOC_QUOTA_SET   _IOW('T', 1, uint64_t)
 
+/* Force an on-demand data-zone GC sweep (no remount). Returns the reclaimed
+ * pack count via the uint64_t out-arg. Userspace: ioctl(fd, TESSERA_IOC_GC,
+ * &count). Any vnode on the mount works as the fd. */
+#define TESSERA_IOC_GC          _IOR('T', 2, uint64_t)
+
 static int
 tessera_vop_ioctl(struct vop_ioctl_args *ap)
 {
@@ -13308,6 +13368,13 @@ tessera_vop_ioctl(struct vop_ioctl_args *ap)
 		    (uintmax_t)new_id, (unsigned)tn->inode_no,
 		    (uintmax_t)limit);
 		return (0);
+	}
+	case TESSERA_IOC_GC: {
+		uint64_t reclaimed = 0;
+		int e = tessera_fs_gc_now(tmp_, &reclaimed);
+		if (e == 0 && ap->a_data != NULL)
+			*(uint64_t *)ap->a_data = reclaimed;
+		return (e);
 	}
 	default:
 		return (ENOTTY);
