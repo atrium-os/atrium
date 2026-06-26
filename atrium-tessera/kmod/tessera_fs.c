@@ -49,6 +49,8 @@
 #include <sys/taskqueue.h>
 #include <sys/unistd.h>
 #include <sys/limits.h>
+#include <sys/resource.h>
+#include <sys/resourcevar.h>
 #include <sys/bio.h>
 #include <geom/geom.h>
 #include <geom/geom_vfs.h>
@@ -366,6 +368,14 @@ static unsigned long tessera_stat_fsync_group_wait = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, fsync_group_wait,
     CTLFLAG_RD, &tessera_stat_fsync_group_wait, 0,
     "fsync calls coalesced onto an already-in-flight commit");
+
+/* copy_file_range requests served by the O(1) CAS reflink fast path
+ * (whole-file copy = manifest share); the rest fall back to the kernel's
+ * generic byte-copy. */
+static unsigned long tessera_stat_copy_reflink = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, copy_reflink,
+    CTLFLAG_RD, &tessera_stat_copy_reflink, 0,
+    "copy_file_range calls served by the O(1) manifest-share reflink");
 
 /* v2 step-2b: total dirty inodes drained since module load.
  * High value vs sb_commits = effective batching. */
@@ -13678,6 +13688,127 @@ tessera_vop_listextattr(struct vop_listextattr_args *ap)
 	return (ret);
 }
 
+/* ── vop_copy_file_range: O(1) CAS reflink ─────────────────────────
+ *
+ * copy_file_range(2) on a content-addressed store is nearly free: a
+ * whole-file copy is just pointing the destination inode at the source's
+ * manifest_hash — the content packs are shared, GC keeps them alive via
+ * reachability (both inodes are walked), and no data moves. We optimise
+ * exactly the common `cp` shape — a full-file copy from offset 0 into a
+ * fresh empty target at offset 0 — and return ENOSYS for everything else,
+ * which makes the kernel fall back to vn_generic_copy_file_range (the
+ * proven byte-copy) for partial / offset / non-empty-target cases.
+ *
+ * Both vnodes arrive UNLOCKED (vnode_if.src: "invp U U U", "outvp U U U").
+ */
+static int
+tessera_vop_copy_file_range(struct vop_copy_file_range_args *ap)
+{
+	struct vnode *invp = ap->a_invp;
+	struct vnode *outvp = ap->a_outvp;
+
+	/* Cheap gates first, before any lock or flush. */
+	if (invp->v_type != VREG || outvp->v_type != VREG)
+		return (ENOSYS);
+	if (invp == outvp)
+		return (ENOSYS);              /* same file → let generic handle */
+	if (ap->a_flags != 0)
+		return (ENOSYS);
+	if (*ap->a_inoffp != 0 || *ap->a_outoffp != 0)
+		return (ENOSYS);              /* only whole-file-from-start */
+
+	struct tessera_mount *tmp_ = VFSTOTESSERA(outvp->v_mount);
+	if (tmp_ == NULL || tmp_->inode_tree == NULL || tmp_->readonly_snapshot)
+		return (ENOSYS);
+	/* Cross-mount is filtered by the caller (it only invokes the vop when
+	 * the two mounts share a vfc); assert same mount to be safe. */
+	if (invp->v_mount != outvp->v_mount)
+		return (ENOSYS);
+
+	const size_t req_len = *ap->a_lenp;
+
+	/* Drain pending writes so the source's manifest_hash reflects its
+	 * current content (a freshly-written, unflushed source still carries
+	 * a stale manifest_hash; flush publishes it). Done before locking —
+	 * flush takes only flush_mtx, never the vnode locks. */
+	(void)tessera_fs_flush(tmp_);
+
+	/* Lock both: source shared (read), dest exclusive (mutate). vn_lock_pair
+	 * orders the acquisition to avoid the reverse-direction deadlock. */
+	vn_lock_pair(invp, false, LK_SHARED, outvp, false, LK_EXCLUSIVE);
+
+	struct tessera_node *itn = VTOTNODE(invp);
+	struct tessera_node *otn = VTOTNODE(outvp);
+	tessera_inode_record_t sino, dino;
+	int err = ENOSYS;
+
+	if (tessera_fs_inode_get(tmp_, (uint32_t)itn->inode_no, &sino)
+	    != TESSERA_OK ||
+	    tessera_fs_inode_get(tmp_, (uint32_t)otn->inode_no, &dino)
+	    != TESSERA_OK)
+		goto out;                     /* ENOSYS → generic retry */
+
+	/* Fast path only for a non-empty source fully covered by the request,
+	 * copied into a still-empty destination. Anything else → generic. */
+	if (sino.size == 0 || (uint64_t)req_len < sino.size)
+		goto out;
+	if (dino.size != 0 || tessera_hash_is_null(sino.manifest_hash))
+		goto out;
+
+	/* Respect RLIMIT_FSIZE: if the result would exceed it, defer to the
+	 * generic path, which raises SIGXFSZ with the right semantics. */
+	if (ap->a_fsizetd != NULL) {
+		off_t lim = lim_cur(ap->a_fsizetd, RLIMIT_FSIZE);
+		if (lim != RLIM_INFINITY && (off_t)sino.size > lim)
+			goto out;
+	}
+
+	/* Quota: the destination gains sino.size logical bytes. All-or-nothing
+	 * against its domain's limit, mirroring vop_write. */
+	tessera_quota_domain_t *qd = tessera_quota_for_inode(tmp_, &dino);
+	if (qd != NULL) {
+		if (tessera_quota_reserve(qd, sino.size) != TESSERA_OK) {
+			err = EDQUOT;             /* real error — do NOT fall back */
+			goto out;
+		}
+		tmp_->quota_dirty = 1;
+	}
+
+	/* The reflink: share the source's content manifest. xattrs are NOT
+	 * copied (copy_file_range covers data, not metadata). */
+	memcpy(dino.manifest_hash, sino.manifest_hash, TESSERA_HASH_SIZE);
+	dino.size = sino.size;
+	dino.gen++;
+	struct timeval tv;
+	getmicrotime(&tv);
+	uint64_t now_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
+	    (uint64_t)tv.tv_usec * 1000ULL;
+	dino.mtime_ns = dino.ctime_ns = now_ns;
+
+	if (tessera_fs_inode_put(tmp_, (uint32_t)otn->inode_no, &dino)
+	    != TESSERA_OK) {
+		if (qd != NULL)
+			tessera_quota_release(qd, sino.size);
+		err = EIO;
+		goto out;
+	}
+	vnode_pager_setsize(outvp, sino.size);
+	tessera_fs_mark_dirty(tmp_);
+
+	/* Advance per the copy_file_range contract: *lenp is the remaining
+	 * (uncopied) count; the syscall reports copied = req_len - *lenp. */
+	*ap->a_inoffp  += (off_t)sino.size;
+	*ap->a_outoffp += (off_t)sino.size;
+	*ap->a_lenp     = req_len - (size_t)sino.size;
+	tessera_stat_copy_reflink++;
+	err = 0;
+
+out:
+	VOP_UNLOCK(invp);
+	VOP_UNLOCK(outvp);
+	return (err);
+}
+
 struct vop_vector tessera_vnodeops = {
 	.vop_default  = &default_vnodeops,
 	.vop_ioctl    = tessera_vop_ioctl,
@@ -13705,6 +13836,7 @@ struct vop_vector tessera_vnodeops = {
 	.vop_close    = tessera_vop_close,
 	.vop_getpages = tessera_vop_getpages,
 	.vop_putpages = tessera_vop_putpages,
+	.vop_copy_file_range = tessera_vop_copy_file_range,
 	.vop_fsync    = tessera_vop_fsync,
 	.vop_reclaim  = tessera_vop_reclaim,
 };
