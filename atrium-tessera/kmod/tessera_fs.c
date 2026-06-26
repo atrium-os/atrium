@@ -27,6 +27,7 @@
 #include <sys/mount.h>
 #include <sys/vnode.h>
 #include <sys/dirent.h>
+#include <sys/extattr.h>
 #include <sys/stat.h>
 #include <sys/lockmgr.h>
 #include <sys/namei.h>
@@ -6701,6 +6702,10 @@ tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
 			memcpy(_stack[_sp++], _ino.manifest_hash,         \
 			    TESSERA_HASH_SIZE);                           \
 		}                                                         \
+		if (!tessera_hash_is_null(_ino.xattr_hash)) {             \
+			memcpy(_stack[_sp++], _ino.xattr_hash,            \
+			    TESSERA_HASH_SIZE);                           \
+		}                                                         \
 		while (_sp > 0 && _sp < 64) {                             \
 			tessera_hash_t _h;                                \
 			memcpy(_h, _stack[--_sp], TESSERA_HASH_SIZE);     \
@@ -13309,9 +13314,310 @@ tessera_vop_ioctl(struct vop_ioctl_args *ap)
 	}
 }
 
+/* ── vop_*extattr: POSIX extended attributes (tessera-vfs §6) ───────
+ *
+ * An inode's xattrs live in an XATTR_STORE manifest at ino.xattr_hash
+ * (null = none). Reads fetch+parse it; writes rebuild it, publish a new
+ * blob, and repoint xattr_hash via inode_put — so crash-consistency is
+ * inherited from the existing INODE_WRITE journaling + durable-blob
+ * publish (xattr_hash is a normal inode field; no special journaling).
+ * The FreeBSD (namespace, name) pair maps to a namespace-prefixed stored
+ * name ("user."/"system." + name). Values inline (≤4096) in v1. */
+
+static const char *
+tessera_xattr_ns_prefix(int ns)
+{
+	switch (ns) {
+	case EXTATTR_NAMESPACE_USER:   return ("user.");
+	case EXTATTR_NAMESPACE_SYSTEM: return ("system.");
+	default:                       return (NULL);
+	}
+}
+
+static int
+tessera_xattr_store_name(int ns, const char *name, char *buf, size_t cap)
+{
+	const char *pfx = tessera_xattr_ns_prefix(ns);
+	if (pfx == NULL || name == NULL) return (-1);
+	size_t pl = strlen(pfx), nl = strlen(name);
+	if (nl == 0 || pl + nl > TESSERA_XATTR_NAME_MAX || pl + nl + 1 > cap)
+		return (-1);
+	memcpy(buf, pfx, pl);
+	memcpy(buf + pl, name, nl);
+	buf[pl + nl] = '\0';
+	return ((int)(pl + nl));
+}
+
+/* SYSTEM namespace requires privilege; USER is governed by file access. */
+static int
+tessera_xattr_cred(struct vnode *vp, int ns, struct ucred *cred,
+    struct thread *td, accmode_t accmode)
+{
+	if (ns == EXTATTR_NAMESPACE_SYSTEM)
+		return (priv_check_cred(cred, PRIV_VFS_EXTATTR_SYSTEM));
+	return (VOP_ACCESS(vp, accmode, cred, td));
+}
+
+/* Rebuild ino's XATTR_STORE = existing entries, then set (sname,val) or
+ * (del=1) drop sname. Publishes the new manifest + repoints ino->xattr_hash
+ * in RAM; caller does inode_put. del with no match → ENOATTR. */
+static int
+tessera_xattr_rebuild(struct tessera_mount *tmp_, uint32_t inode_no,
+    tessera_inode_record_t *ino, const char *sname, size_t snl,
+    const uint8_t *val, size_t vlen, int del)
+{
+	tessera_manifest_builder_t *b =
+	    tessera_manifest_begin(TESSERA_MFT_XATTR_STORE);
+	if (b == NULL) return (ENOMEM);
+
+	int found = 0;
+	if (!tessera_hash_is_null(ino->xattr_hash)) {
+		uint8_t *old = NULL;
+		uint32_t old_len = 0;
+		if (tessera_fs_fetch_blob(tmp_, ino->xattr_hash, &old, &old_len)
+		    == 0) {
+			tessera_manifest_parser_t *p =
+			    tessera_manifest_parse(old, old_len);
+			for (uint32_t i = 0; p != NULL; i++) {
+				const char *nm;
+				uint16_t nl;
+				const uint8_t *vv;
+				uint16_t vl;
+				if (tessera_manifest_xattr_at(p, i, &nm, &nl,
+				    &vv, &vl) != TESSERA_OK)
+					break;
+				if (nl == snl && memcmp(nm, sname, snl) == 0) {
+					found = 1;   /* drop the old copy */
+					continue;
+				}
+				(void)tessera_manifest_add_xattr(b, nm, nl, vv,
+				    vl);
+			}
+			if (p != NULL) tessera_manifest_parser_free(p);
+			free(old, M_TESSERA);
+		}
+	}
+	if (del && !found) {
+		tessera_manifest_free(b);
+		return (ENOATTR);
+	}
+	if (!del) {
+		int ar = tessera_manifest_add_xattr(b, sname, snl, val, vlen);
+		if (ar != TESSERA_OK) {
+			tessera_manifest_free(b);
+			return (ar == TESSERA_ETOOBIG ? E2BIG : EINVAL);
+		}
+	}
+
+	size_t need = 0;
+	(void)tessera_manifest_finalize(b, NULL, 0, &need, NULL);
+	uint8_t *mbuf = malloc(need, M_TESSERA, M_WAITOK);
+	tessera_hash_t mhash;
+	int fr = tessera_manifest_finalize(b, mbuf, need, &need, mhash);
+	tessera_manifest_free(b);
+	if (fr != TESSERA_OK) {
+		free(mbuf, M_TESSERA);
+		return (EIO);
+	}
+	/* owner 0 (NOT the inode): the per-inode supersession in
+	 * pending_manifest_put assumes one manifest per inode (the content
+	 * one). An inode legitimately owns BOTH a content manifest and this
+	 * xattr manifest, so tagging it with the inode would let the content
+	 * publish at flush supersede + drop this one before it hits disk.
+	 * xattr manifests aren't shared, so they need no owner tracking; a
+	 * superseded old one is just an orphan GC reclaims. */
+	int pr = tessera_fs_publish_manifest_owned(tmp_, mbuf, need, mhash,
+	    /*owner=*/0);
+	free(mbuf, M_TESSERA);
+	if (pr != 0) return (pr);
+	memcpy(ino->xattr_hash, mhash, sizeof(tessera_hash_t));
+	return (0);
+}
+
+static int
+tessera_vop_setextattr(struct vop_setextattr_args *ap)
+{
+	struct vnode *vp = ap->a_vp;
+	struct tessera_node *tn = VTOTNODE(vp);
+	struct tessera_mount *tmp_ = VFSTOTESSERA(vp->v_mount);
+	if (tmp_->inode_tree == NULL) return (EROFS);
+
+	int e = tessera_xattr_cred(vp, ap->a_attrnamespace, ap->a_cred,
+	    ap->a_td, VWRITE);
+	if (e != 0) return (e);
+
+	char sname[TESSERA_XATTR_NAME_MAX + 1];
+	int snl = tessera_xattr_store_name(ap->a_attrnamespace, ap->a_name,
+	    sname, sizeof sname);
+	if (snl < 0) return (EINVAL);
+
+	size_t vlen = (ap->a_uio != NULL) ? (size_t)ap->a_uio->uio_resid : 0;
+	if (vlen > 4096) return (E2BIG);
+	uint8_t *vbuf = NULL;
+	if (vlen > 0) {
+		vbuf = malloc(vlen, M_TESSERA, M_WAITOK);
+		e = uiomove(vbuf, (int)vlen, ap->a_uio);
+		if (e != 0) { free(vbuf, M_TESSERA); return (e); }
+	}
+
+	tessera_inode_record_t ino;
+	if (tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no, &ino)
+	    != TESSERA_OK) {
+		if (vbuf) free(vbuf, M_TESSERA);
+		return (EIO);
+	}
+	int rr = tessera_xattr_rebuild(tmp_, (uint32_t)tn->inode_no, &ino,
+	    sname, (size_t)snl, vbuf, vlen, /*del=*/0);
+	if (vbuf) free(vbuf, M_TESSERA);
+	if (rr != 0) return (rr);
+	if (tessera_fs_inode_put(tmp_, (uint32_t)tn->inode_no, &ino)
+	    != TESSERA_OK)
+		return (EIO);
+	tessera_fs_mark_dirty(tmp_);
+	return (0);
+}
+
+static int
+tessera_vop_deleteextattr(struct vop_deleteextattr_args *ap)
+{
+	struct vnode *vp = ap->a_vp;
+	struct tessera_node *tn = VTOTNODE(vp);
+	struct tessera_mount *tmp_ = VFSTOTESSERA(vp->v_mount);
+	if (tmp_->inode_tree == NULL) return (EROFS);
+
+	int e = tessera_xattr_cred(vp, ap->a_attrnamespace, ap->a_cred,
+	    ap->a_td, VWRITE);
+	if (e != 0) return (e);
+
+	char sname[TESSERA_XATTR_NAME_MAX + 1];
+	int snl = tessera_xattr_store_name(ap->a_attrnamespace, ap->a_name,
+	    sname, sizeof sname);
+	if (snl < 0) return (EINVAL);
+
+	tessera_inode_record_t ino;
+	if (tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no, &ino)
+	    != TESSERA_OK)
+		return (EIO);
+	int rr = tessera_xattr_rebuild(tmp_, (uint32_t)tn->inode_no, &ino,
+	    sname, (size_t)snl, NULL, 0, /*del=*/1);
+	if (rr != 0) return (rr);   /* ENOATTR if not present */
+	if (tessera_fs_inode_put(tmp_, (uint32_t)tn->inode_no, &ino)
+	    != TESSERA_OK)
+		return (EIO);
+	tessera_fs_mark_dirty(tmp_);
+	return (0);
+}
+
+static int
+tessera_vop_getextattr(struct vop_getextattr_args *ap)
+{
+	struct vnode *vp = ap->a_vp;
+	struct tessera_node *tn = VTOTNODE(vp);
+	struct tessera_mount *tmp_ = VFSTOTESSERA(vp->v_mount);
+
+	int e = tessera_xattr_cred(vp, ap->a_attrnamespace, ap->a_cred,
+	    ap->a_td, VREAD);
+	if (e != 0) return (e);
+
+	char sname[TESSERA_XATTR_NAME_MAX + 1];
+	int snl = tessera_xattr_store_name(ap->a_attrnamespace, ap->a_name,
+	    sname, sizeof sname);
+	if (snl < 0) return (EINVAL);
+
+	tessera_inode_record_t ino;
+	if (tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no, &ino)
+	    != TESSERA_OK)
+		return (EIO);
+	if (tessera_hash_is_null(ino.xattr_hash)) return (ENOATTR);
+
+	uint8_t *blob = NULL;
+	uint32_t blen = 0;
+	if (tessera_fs_fetch_blob(tmp_, ino.xattr_hash, &blob, &blen) != 0)
+		return (EIO);
+	tessera_manifest_parser_t *p = tessera_manifest_parse(blob, blen);
+	int ret = ENOATTR;
+	for (uint32_t i = 0; p != NULL; i++) {
+		const char *nm;
+		uint16_t nl;
+		const uint8_t *vv;
+		uint16_t vl;
+		if (tessera_manifest_xattr_at(p, i, &nm, &nl, &vv, &vl)
+		    != TESSERA_OK)
+			break;
+		if (nl == snl && memcmp(nm, sname, snl) == 0) {
+			if (ap->a_size != NULL) *ap->a_size = vl;
+			if (ap->a_uio != NULL)
+				ret = uiomove(__DECONST(void *, vv), (int)vl,
+				    ap->a_uio);
+			else
+				ret = 0;
+			break;
+		}
+	}
+	if (p != NULL) tessera_manifest_parser_free(p);
+	free(blob, M_TESSERA);
+	return (ret);
+}
+
+static int
+tessera_vop_listextattr(struct vop_listextattr_args *ap)
+{
+	struct vnode *vp = ap->a_vp;
+	struct tessera_node *tn = VTOTNODE(vp);
+	struct tessera_mount *tmp_ = VFSTOTESSERA(vp->v_mount);
+
+	int e = tessera_xattr_cred(vp, ap->a_attrnamespace, ap->a_cred,
+	    ap->a_td, VREAD);
+	if (e != 0) return (e);
+	const char *pfx = tessera_xattr_ns_prefix(ap->a_attrnamespace);
+	if (pfx == NULL) return (EINVAL);
+	size_t pl = strlen(pfx);
+
+	tessera_inode_record_t ino;
+	if (tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no, &ino)
+	    != TESSERA_OK)
+		return (EIO);
+	if (ap->a_size != NULL) *ap->a_size = 0;
+	if (tessera_hash_is_null(ino.xattr_hash)) return (0);
+
+	uint8_t *blob = NULL;
+	uint32_t blen = 0;
+	if (tessera_fs_fetch_blob(tmp_, ino.xattr_hash, &blob, &blen) != 0)
+		return (EIO);
+	tessera_manifest_parser_t *p = tessera_manifest_parse(blob, blen);
+	int ret = 0;
+	for (uint32_t i = 0; p != NULL; i++) {
+		const char *nm;
+		uint16_t nl;
+		const uint8_t *vv;
+		uint16_t vl;
+		if (tessera_manifest_xattr_at(p, i, &nm, &nl, &vv, &vl)
+		    != TESSERA_OK)
+			break;
+		if (nl <= pl || memcmp(nm, pfx, pl) != 0) continue;
+		/* extattr list format: [u8 namelen][name] (no prefix, no NUL). */
+		uint8_t outlen = (uint8_t)(nl - pl);
+		if (ap->a_size != NULL) *ap->a_size += 1 + (size_t)outlen;
+		if (ap->a_uio != NULL) {
+			ret = uiomove(&outlen, 1, ap->a_uio);
+			if (ret != 0) break;
+			ret = uiomove(__DECONST(void *, nm + pl), outlen,
+			    ap->a_uio);
+			if (ret != 0) break;
+		}
+	}
+	if (p != NULL) tessera_manifest_parser_free(p);
+	free(blob, M_TESSERA);
+	return (ret);
+}
+
 struct vop_vector tessera_vnodeops = {
 	.vop_default  = &default_vnodeops,
 	.vop_ioctl    = tessera_vop_ioctl,
+	.vop_getextattr    = tessera_vop_getextattr,
+	.vop_setextattr    = tessera_vop_setextattr,
+	.vop_listextattr   = tessera_vop_listextattr,
+	.vop_deleteextattr = tessera_vop_deleteextattr,
 	.vop_pathconf = tessera_vop_pathconf,
 	.vop_access   = tessera_vop_access,
 	.vop_getattr  = tessera_vop_getattr,
