@@ -4022,10 +4022,24 @@ tessera_vop_putpages(struct vop_putpages_args *ap)
 	}
 
 	off_t  base_off  = (off_t)ma[0]->pindex << PAGE_SHIFT;
-	size_t pages_len = (size_t)npages * PAGE_SIZE;
-	size_t new_size  = (size_t)base_off + pages_len;
-	if ((uint64_t)new_size < ino.size) new_size = (size_t)ino.size;
 
+	/* putpages flushes dirty pages of an ALREADY-SIZED file; it must
+	 * never change the file size. ino.size is authoritative (set by
+	 * ftruncate / write → vnode_pager_setsize). Deriving the size from
+	 * the page-aligned end of the dirty run instead would round a
+	 * non-page-aligned EOF up to the next page (fsx caught exactly this:
+	 * a mapwrite ending at 0x35471 grew the file to 0x36000). The VM
+	 * maps in whole pages, so the last page legitimately carries bytes
+	 * past EOF — those are not file content and must not be persisted. */
+	size_t new_size = (size_t)ino.size;
+
+	if (new_size == 0) {
+		/* Nothing to persist (mmap can't extend a 0-length file —
+		 * that needs an ftruncate/write first). Report the pages
+		 * clean so the pager doesn't keep re-queuing them. */
+		for (int i = 0; i < npages; i++) rtvals[i] = VM_PAGER_OK;
+		return (VM_PAGER_OK);
+	}
 	if (new_size > (64u * 1024u * 1024u)) {
 		/* Match TESSERA_WRITE_MAX_BYTES — defined later in file. */
 		for (int i = 0; i < npages; i++) rtvals[i] = VM_PAGER_FAIL;
@@ -4046,13 +4060,23 @@ tessera_vop_putpages(struct vop_putpages_args *ap)
 	}
 
 	for (int i = 0; i < npages; i++) {
+		size_t poff = (size_t)base_off + (size_t)i * PAGE_SIZE;
+		/* Page entirely beyond EOF (the VM's whole-page tail) — clean,
+		 * but contributes no file content. */
+		if (poff >= new_size) {
+			rtvals[i] = VM_PAGER_OK;
+			continue;
+		}
 		struct sf_buf *sf = sf_buf_alloc(ma[i], 0);
 		if (sf == NULL) {
 			rtvals[i] = VM_PAGER_FAIL;
 			continue;
 		}
-		size_t poff = (size_t)base_off + (size_t)i * PAGE_SIZE;
-		memcpy(full + poff, (void *)sf_buf_kva(sf), PAGE_SIZE);
+		/* Clamp the copy so the partial last page doesn't drag in
+		 * bytes past EOF. */
+		size_t pcopy = PAGE_SIZE;
+		if (poff + pcopy > new_size) pcopy = new_size - poff;
+		memcpy(full + poff, (void *)sf_buf_kva(sf), pcopy);
 		sf_buf_free(sf);
 		rtvals[i] = VM_PAGER_OK;
 	}
