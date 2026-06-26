@@ -2456,6 +2456,25 @@ tessera_statfs_impl(struct mount *mp, struct statfs *sbp)
 	    : tmp_->sb.pack_zone_length;
 	sbp->f_bfree  = free_data;
 	sbp->f_bavail = free_data;
+	/* Quota-scoped statfs (tessera-quotas.md §3.6): inside a quota'd
+	 * mount, df reports the DOMAIN's logical numbers, not the physical
+	 * pool. This is load-bearing for security as well as df sanity — the
+	 * global physical free-space counter is a dedup existence oracle, so
+	 * a jail-visible mount must never expose it. Available is clamped to
+	 * the physical pool free so the limit can't promise bytes the pool
+	 * can't deliver. */
+	if (tmp_->quota_active) {
+		uint64_t bs        = TESSERA_SECTOR_SIZE;
+		uint64_t limit_blk = tmp_->quota_dom.limit_bytes / bs;
+		uint64_t used_blk  = (tmp_->quota_dom.used_bytes + bs - 1) / bs;
+		uint64_t avail_blk = (limit_blk > used_blk)
+		    ? (limit_blk - used_blk) : 0;
+		if (avail_blk > free_data)
+			avail_blk = free_data;
+		sbp->f_blocks = limit_blk;
+		sbp->f_bfree  = avail_blk;
+		sbp->f_bavail = avail_blk;
+	}
 	/* Inode count. v2.5 BTREE directory makes per-op O(log N), so
 	 * we no longer need the previous 2K hard floor on f_ffree. But
 	 * tessera's per-op fixed overhead (publish_manifest +
