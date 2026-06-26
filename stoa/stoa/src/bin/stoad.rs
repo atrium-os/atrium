@@ -38,7 +38,8 @@ use std::time::Duration;
 use std::path::{Path, PathBuf};
 
 use stoa::persist::{
-    default_state_path, PersistDivider, PersistPane, PersistSession, PersistState, PersistWindow,
+    default_state_dir, load_scrollback, remove_scrollback, save_scrollback, PersistDivider,
+    PersistPane, PersistSession, PersistState, PersistWindow,
 };
 use stoa::{default_ctl, gen_key, seal, to_hex, Control, CONTROL, KEY_LEN, OUTPUT};
 use stoa_proto::{Envelope, MsgType, ReplayWindow};
@@ -84,9 +85,9 @@ fn send_output(udp: &UdpSocket, buf: &[u8], addr: SocketAddr) {
     let _ = udp.send_to(buf, addr);
 }
 
-/// Where the session table is persisted (S3a). Set once in `main`; `None`
-/// before that or if persistence is disabled.
-static STATE_PATH: OnceLock<PathBuf> = OnceLock::new();
+/// Directory where session state is persisted (S3a): `meta.json` + per-window
+/// `scrollback/`. Set once in `main`; `None` before that or if disabled.
+static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// A pane's shell cwd for respawn-after-restart, captured in-band from the
 /// shell's OSC 7 reports (uniform across macOS/FreeBSD, no syscall). `None`
@@ -149,13 +150,31 @@ fn snapshot_state(reg: &Reg) -> PersistState {
     PersistState { version: stoa::persist::VERSION, sessions }
 }
 
-/// Persist the session table now (no-op if `$STOA_STATE` disabled it). Call
-/// after a structural change, with no session lock held.
+/// Persist the session table + each started session's per-window scrollback
+/// (no-op if `$STOA_STATE` disabled it). Scrollback is best-effort — a write
+/// failure is logged but never propagates. Call after a structural or cwd
+/// change, with no session lock held.
 fn persist(reg: &Reg) {
-    let Some(path) = STATE_PATH.get() else { return };
+    let Some(dir) = STATE_DIR.get() else { return };
     let st = snapshot_state(reg);
-    if let Err(e) = st.save_atomic(path) {
-        eprintln!("stoad: persist to {path:?} failed: {e}");
+    if let Err(e) = st.save_atomic(dir) {
+        eprintln!("stoad: persist meta to {dir:?} failed: {e}");
+    }
+    // Scrollback: dump each live window's history+screen as text.
+    let map = reg.lock().unwrap();
+    for (name, s) in map.iter() {
+        if s.dead.load(Ordering::SeqCst) {
+            continue;
+        }
+        let inner = s.inner.lock().unwrap();
+        if !inner.started {
+            continue;
+        }
+        for (widx, w) in inner.windows.iter().enumerate() {
+            if let Some(p) = w.active() {
+                let _ = save_scrollback(dir, name, widx, &p.term.scrollback_text());
+            }
+        }
     }
 }
 
@@ -230,7 +249,7 @@ fn rebuild_from_restore(
     reg: &Reg,
     ps: PersistSession,
 ) {
-    for pw in &ps.windows {
+    for (pidx, pw) in ps.windows.iter().enumerate() {
         if !pw.alive {
             inner.windows.push(Window {
                 panes: Vec::new(),
@@ -244,6 +263,16 @@ fn rebuild_from_restore(
         let cwd = pw.panes.first().and_then(|p| p.cwd.as_deref());
         let Some(widx) = spawn_window(name, state, inner, udp, reg, cwd) else { continue };
         inner.active = widx;
+        // Restore the persisted scrollback into the primary pane (best-effort:
+        // an empty/missing file just leaves a fresh history).
+        if let Some(dir) = STATE_DIR.get() {
+            let lines = load_scrollback(dir, name, pidx);
+            if !lines.is_empty() {
+                if let Some(p) = inner.windows[widx].panes.first_mut() {
+                    p.term.restore_scrollback(&lines);
+                }
+            }
+        }
         // Recreate a 2-pane split, if any.
         if let Some(div) = pw.divider {
             let vertical = matches!(div, PersistDivider::Vertical(_));
@@ -589,14 +618,14 @@ fn main() {
     let reg: Reg = Arc::new(Mutex::new(HashMap::new()));
 
     // Session-state persistence (S3a): restore dormant sessions from the last
-    // snapshot, then remember the path for future saves. $STOA_STATE=off (or
-    // empty) disables persistence entirely.
-    let state_path = default_state_path();
-    if state_path.as_os_str().is_empty() || state_path == Path::new("off") {
+    // snapshot, then remember the directory for future saves. $STOA_STATE=off
+    // (or empty) disables persistence entirely.
+    let state_dir = default_state_dir();
+    if state_dir.as_os_str().is_empty() || state_dir == Path::new("off") {
         eprintln!("stoad: session persistence disabled");
     } else {
-        restore_sessions(&reg, &state_path);
-        let _ = STATE_PATH.set(state_path);
+        restore_sessions(&reg, &state_dir);
+        let _ = STATE_DIR.set(state_dir);
     }
 
     for conn in listener.incoming() {
@@ -651,7 +680,11 @@ fn handle_mint(stream: UnixStream, reg: Reg) {
                 None => false,
             };
             if ok {
-                persist(&reg); // drop the killed session from the snapshot
+                // Drop the killed session from the snapshot + its scrollback.
+                if let (Some(dir), Some(name)) = (STATE_DIR.get(), line.split_whitespace().nth(1)) {
+                    remove_scrollback(dir, name);
+                }
+                persist(&reg);
             }
             let _ = (&stream).write_all(if ok { b"OK\n" } else { b"ERR not found\n" });
         }

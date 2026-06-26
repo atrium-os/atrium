@@ -128,6 +128,36 @@ impl Grid {
     /// Scrolled-off lines, oldest first (the scrollback).
     pub fn history(&self) -> &[Vec<Cell>] { &self.history }
 
+    /// The whole scrollback as plain text (oldest first): the history rows
+    /// followed by the current screen rows, trailing blank lines trimmed.
+    /// Used to persist a window's scrollback (S3a); attributes are dropped —
+    /// content over colour for restored history.
+    pub fn scrollback_text(&self) -> Vec<String> {
+        let row_text = |cells: &[Cell]| {
+            let s: String = cells.iter().map(|c| c.c).collect();
+            s.trim_end().to_string()
+        };
+        let mut out: Vec<String> = self.history.iter().map(|r| row_text(r)).collect();
+        for r in 0..self.rows {
+            out.push(row_text(self.row(r)));
+        }
+        while out.last().is_some_and(|l| l.is_empty()) {
+            out.pop();
+        }
+        out
+    }
+
+    /// Replace the scrollback history with these text lines (default
+    /// attributes), keeping at most [`HISTORY_MAX`]. Used to restore a
+    /// respawned window's scrollback after a `stoad` restart (S3a).
+    pub fn restore_scrollback(&mut self, lines: &[String]) {
+        let start = lines.len().saturating_sub(HISTORY_MAX);
+        self.history = lines[start..]
+            .iter()
+            .map(|l| l.chars().map(|c| Cell { c, ..Cell::default() }).collect())
+            .collect();
+    }
+
     /// Overwrite a horizontal run of cells starting at `(row, col)` —
     /// used by [`StateDiff::apply`]. Out-of-bounds cells are skipped.
     pub fn write_run(&mut self, row: u16, col: u16, cells: &[Cell]) {
@@ -467,6 +497,16 @@ impl Terminal {
         self.grid.resize(cols, rows);
     }
 
+    /// The window's scrollback as text (history + screen), for persistence.
+    pub fn scrollback_text(&self) -> Vec<String> {
+        self.grid.scrollback_text()
+    }
+
+    /// Restore a persisted scrollback into this terminal's history.
+    pub fn restore_scrollback(&mut self, lines: &[String]) {
+        self.grid.restore_scrollback(lines);
+    }
+
     /// The visible screen as text, one `String` per row (trailing blanks
     /// trimmed). Convenience for tests/snapshots.
     pub fn rows_text(&self) -> Vec<String> {
@@ -484,6 +524,31 @@ mod tests {
     use super::*;
 
     fn term() -> Terminal { Terminal::new(20, 5) }
+
+    #[test]
+    fn scrollback_text_includes_history_and_screen() {
+        // 2-row screen; feed 4 lines → 2 scroll into history.
+        let mut t = Terminal::new(8, 2);
+        t.feed(b"l1\r\nl2\r\nl3\r\nl4");
+        let text = t.grid().scrollback_text();
+        assert_eq!(text, vec!["l1", "l2", "l3", "l4"]); // history (l1,l2) + screen (l3,l4)
+    }
+
+    #[test]
+    fn scrollback_restore_round_trip() {
+        let mut src = Terminal::new(8, 2);
+        src.feed(b"a\r\nb\r\nc\r\nd\r\ne");
+        let saved = src.grid().scrollback_text();
+        // A fresh terminal gets the scrollback restored into history.
+        let mut dst = Terminal::new(8, 2);
+        dst.restore_scrollback(&saved);
+        // Paging up shows the oldest restored lines.
+        let mut view = Terminal::new(8, 2);
+        view.feed(&render_scrollback(dst.grid(), dst.grid().history().len()));
+        assert_eq!(view.rows_text()[0], "a");
+        // All saved lines are present in history (capped at HISTORY_MAX).
+        assert_eq!(dst.grid().history().len(), saved.len());
+    }
 
     #[test]
     fn osc7_captures_cwd() {
