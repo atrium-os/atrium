@@ -182,6 +182,54 @@ operator on a single-disk laptop can run everything on a `plain`
 backend on UFS; an operator with a ZFS pool can run with `zfs`;
 the canonical Atrium install has `tessera`.
 
+### 4.1 Choosing a backend — the unit-cost rationale
+
+The backends differ sharply in **what one volume costs**, which
+should drive routing:
+
+- A **ZFS** volume is a `zfs create` **dataset** — a real
+  filesystem object (own mountpoint, property set, ARC metadata,
+  boot-time mount). One pool holds many datasets, so it is *not*
+  pool-per-app — but each dataset carries real per-volume overhead,
+  and for a volume holding a few KiB of config that unit is
+  heavyweight. Block-level dedup needs a large in-RAM DDT and is
+  usually left off.
+- A **Tessera** volume is a **directory** — provisioning is
+  `mkdir + chown` under one shared Tessera mount (the "pool"
+  equivalent is the single CAS filesystem). There is *no* per-volume
+  kernel object beyond an inode; create/destroy is `mkdir`/`rm`.
+  CAS dedup is free and **cross-volume**, so a hundred apps with
+  similar small configs collapse to shared chunks. Quotas are a
+  per-directory-tree limit (tessera-quotas.md), not a per-dataset
+  property — isolation + a byte ceiling without a filesystem object.
+
+**Guidance:**
+
+- **Small persistent state — config, UI state, app preferences,
+  session metadata/scrollback — → `tessera` (the default).** These
+  are the overwhelming majority of jails. A Tessera directory per
+  app is so cheap that per-app *isolation* (own dir, own `owner_uid`,
+  own quota domain, own `enforce_statfs`-private mount) is the right
+  call — never share a volume across apps to "save resources." This
+  scales to thousands of small volumes where ZFS-dataset-per-volume
+  would not.
+- **Write-heavy, dedup-poor, DB-class workloads — mysqld, postgres —
+  → a tuned `zfs` backend** (recordsize/logbias tuned, `refquota`,
+  cheap `zfs snapshot`). The manifest still only says
+  `kind = "persistent"`; the operator routes these few jails to ZFS
+  by name. Best of both on one system.
+
+> **Current Tessera implementation limits (2026-06, gating wider
+> use).** Tessera is a working POSIX FS (read/write/dedup/rename/
+> links/setattr/journal-replay; pjdfstest largely green) — but
+> **`mmap`/exec are not yet wired** (`vop_getpages`/`putpages`, see
+> tessera-vfs.md §4.5), so a Tessera volume must not hold binaries
+> that are `exec`'d or files an app `mmap`s (e.g. SQLite in mmap
+> mode). And **`size_max` is not yet enforced on Tessera** (only on
+> `zfs` via `refquota`; tessera-quotas.md is design) — treat it as
+> documentation on Tessera until the quota kmod lands. Plain
+> read/write data volumes (config/state/scrollback) are unaffected.
+
 ## 5. Named backend instances
 
 Operators don't just pick *a kind*; they pick named instances
