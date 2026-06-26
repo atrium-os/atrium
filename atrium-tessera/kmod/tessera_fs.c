@@ -4098,6 +4098,7 @@ struct tessera_jrec_sb_commit {
 	uint64_t snapshots_gen;
 	uint64_t next_inode_no;
 	uint64_t meta_reserve_bump;
+	uint64_t quota_tree_root;
 };
 
 /*
@@ -4223,6 +4224,30 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 		}
 	}
 
+	/* Persist dirty quota domains to the on-disk tree (tessera-quotas.md
+	 * §5.5). Done HERE — before the barrier + journal — so the quota-tree
+	 * sectors are durable and sb.quota_tree_root is current when the
+	 * ROOT_UPDATE record names it, giving crash-consistency identical to
+	 * the inode/snapshot trees. Lazy-create on first flush (non-quota'd
+	 * volumes never grow one). Best-effort: a btree failure leaves
+	 * quota_dirty set to retry next commit. */
+	if (tmp_->quota_dirty && tmp_->quota_ndomains > 0) {
+		uint64_t qroot = tmp_->sb.quota_tree_root;
+		if (tmp_->quota_tree == NULL)
+			tmp_->quota_tree = tessera_btree_create(&tmp_->meta_bio,
+			    TESSERA_BTREE_KIND_QUOTA, /*key*/ 8,
+			    /*value*/ TESSERA_QUOTA_DOMAIN_SIZE, &qroot);
+		int qok = (tmp_->quota_tree != NULL);
+		for (uint32_t i = 0; qok && i < tmp_->quota_ndomains; i++)
+			if (tessera_quota_store_put(tmp_->quota_tree,
+			    &tmp_->quota_domains[i], &qroot) != TESSERA_OK)
+				qok = 0;
+		if (qok) {
+			tmp_->sb.quota_tree_root = qroot;
+			tmp_->quota_dirty = 0;
+		}
+	}
+
 	/* Barrier #1: ensure all prior pack/btree/manifest writes are
 	 * durable on the host file BEFORE we write the journal record
 	 * that names them as committed. Without this, a crash with the
@@ -4245,6 +4270,7 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 			body.snapshots_gen      = tmp_->sb.snapshots_gen;
 			body.next_inode_no      = tmp_->sb.next_inode_no;
 			body.meta_reserve_bump  = tmp_->sb.meta_reserve_bump;
+			body.quota_tree_root    = tmp_->sb.quota_tree_root;
 			(void)tessera_journal_append(tmp_->journal, tx,
 			    TESSERA_ROOT_UPDATE, &body, sizeof body);
 			(void)tessera_journal_tx_commit(tmp_->journal, tx);
@@ -4262,30 +4288,6 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 		printf("tessera_fs: crash-injection — SB write skipped, "
 		    "journal record retained for replay\n");
 		return (0);
-	}
-
-	/* Persist dirty quota domains to the on-disk tree before the SB
-	 * write, so sb.quota_tree_root reflects them and used_bytes survives
-	 * remount (tessera-quotas.md §5.5). Lazy-create the tree on first
-	 * flush (non-quota'd volumes never grow one). Best-effort: a btree
-	 * failure leaves quota_dirty set to retry next commit. Crash between
-	 * the tree write and the SB write is a known gap until the root
-	 * update is journaled; a clean unmount persists correctly. */
-	if (tmp_->quota_dirty && tmp_->quota_ndomains > 0) {
-		uint64_t qroot = tmp_->sb.quota_tree_root;
-		if (tmp_->quota_tree == NULL)
-			tmp_->quota_tree = tessera_btree_create(&tmp_->meta_bio,
-			    TESSERA_BTREE_KIND_QUOTA, /*key*/ 8,
-			    /*value*/ TESSERA_QUOTA_DOMAIN_SIZE, &qroot);
-		int qok = (tmp_->quota_tree != NULL);
-		for (uint32_t i = 0; qok && i < tmp_->quota_ndomains; i++)
-			if (tessera_quota_store_put(tmp_->quota_tree,
-			    &tmp_->quota_domains[i], &qroot) != TESSERA_OK)
-				qok = 0;
-		if (qok) {
-			tmp_->sb.quota_tree_root = qroot;
-			tmp_->quota_dirty = 0;
-		}
 	}
 
 	/* Heap-allocated — sector-sized array on the stack would risk
@@ -6346,6 +6348,7 @@ tessera_replay_handler(void *ctx, const tessera_record_header_t *hdr,
 	rc->tmp_->sb.snapshots_gen      = rec.snapshots_gen;
 	rc->tmp_->sb.next_inode_no      = rec.next_inode_no;
 	rc->tmp_->sb.meta_reserve_bump  = rec.meta_reserve_bump;
+	rc->tmp_->sb.quota_tree_root    = rec.quota_tree_root;
 	rc->applied++;
 	return (0);
 }
@@ -12472,6 +12475,14 @@ tessera_vop_mkdir(struct vop_mkdir_args *ap)
 	cino.size  = 0;
 	cino.nlink = 2;
 	cino.flags = 0;
+	/* Inherit the parent's quota domain (tessera-quotas.md §4.1) so a
+	 * subdirectory joins its tree's domain and propagates it further. */
+	{
+		tessera_inode_record_t pino;
+		if (tessera_fs_inode_get(tmp_, (uint32_t)dn->inode_no, &pino)
+		    == TESSERA_OK)
+			cino.quota_domain = pino.quota_domain;
+	}
 	memcpy(cino.manifest_hash, pub_hash, sizeof pub_hash);
 
 	uint8_t ckey[4];
@@ -12665,6 +12676,13 @@ tessera_vop_symlink(struct vop_symlink_args *ap)
 	cino.atime_ns = cino.mtime_ns = cino.ctime_ns = cino.btime_ns = now_ns;
 	cino.size  = tlen;
 	cino.nlink = 1;
+	/* Inherit the parent's quota domain (tessera-quotas.md §4.1). */
+	{
+		tessera_inode_record_t pino;
+		if (tessera_fs_inode_get(tmp_, (uint32_t)dn->inode_no, &pino)
+		    == TESSERA_OK)
+			cino.quota_domain = pino.quota_domain;
+	}
 	memcpy(cino.manifest_hash, pub_hash, sizeof pub_hash);
 
 	uint8_t ckey[4];
