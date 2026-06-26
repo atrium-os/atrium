@@ -27,3 +27,5 @@ stoa-spawn = { path = "../stoa-spawn" }
 stoa-proto = { path = "../stoa-proto" }
 stoa-term  = { path = "../stoa-term" }
 libc       = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }

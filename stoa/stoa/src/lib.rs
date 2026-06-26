@@ -24,6 +24,7 @@
 
 use stoa_proto::MsgType;
 
+pub mod persist;
 pub mod predict;
 
 /// Default `stoad` local control socket (where mints happen). Overridable

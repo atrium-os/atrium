@@ -22,6 +22,10 @@ rust-version = "1.75"
 sha2 = "0.10"
 hmac = "0.12"
 libc = "0.2"
+# Session-state persistence (S3a). Pure-Rust data libs (not an OS/runtime
+# shim — charter-clean); the rest of the tree (portcullis-*) uses serde too.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.release]
 lto           = "thin"
