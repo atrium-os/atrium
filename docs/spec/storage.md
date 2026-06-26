@@ -219,16 +219,18 @@ should drive routing:
   `kind = "persistent"`; the operator routes these few jails to ZFS
   by name. Best of both on one system.
 
-> **Current Tessera implementation limits (2026-06, gating wider
-> use).** Tessera is a working POSIX FS (read/write/dedup/rename/
-> links/setattr/journal-replay; pjdfstest largely green) — but
-> **`mmap`/exec are not yet wired** (`vop_getpages`/`putpages`, see
-> tessera-vfs.md §4.5), so a Tessera volume must not hold binaries
-> that are `exec`'d or files an app `mmap`s (e.g. SQLite in mmap
-> mode). And **`size_max` is not yet enforced on Tessera** (only on
-> `zfs` via `refquota`; tessera-quotas.md is design) — treat it as
-> documentation on Tessera until the quota kmod lands. Plain
-> read/write data volumes (config/state/scrollback) are unaffected.
+> **Tessera capability status (2026-06-26).** Tessera is a working
+> POSIX FS (read/write/dedup/rename/links/setattr/journal-replay;
+> pjdfstest largely green) and the two former gates are now cleared:
+> **`mmap`/exec work** (real custom `vop_getpages`/`putpages` — `cp` a
+> binary to a Tessera mount and `exec` it, both verified in-VM), and
+> **`size_max` is now enforced on Tessera** as a per-directory quota
+> (`atrium-volumes` sets it at provision time via the kmod ioctl;
+> reserve/release on write/truncate/unlink → `EDQUOT`, statfs-scoped,
+> persistent, crash-consistent — tessera-quotas.md). So a Tessera
+> volume can hold exec'd binaries and mmap'd files, and `size_max` is
+> a real limit. (Remaining minor: setting a quota on an *already-
+> populated* dir starts `used` at 0 — provision quotas on empty dirs.)
 
 ## 5. Named backend instances
 
