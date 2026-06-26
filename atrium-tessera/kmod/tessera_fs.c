@@ -3860,8 +3860,29 @@ static int
 tessera_vop_open(struct vop_open_args *ap)
 {
 	struct vnode *vp = ap->a_vp;
-	if (vp->v_type == VREG)
-		(void)vnode_create_vobject(vp, 0, ap->a_td);
+	if (vp->v_type == VREG) {
+		/* Seed the VM object with the REAL file size, not 0. A cold
+		 * vnode (just instantiated, never written this session) only
+		 * gets its pager size from here — passing 0 leaves the object
+		 * believing the file is empty, so any mmap access beyond
+		 * offset 0 faults SIGBUS before vop_getpages is ever consulted.
+		 * (Warm files masked this: vop_write's vnode_pager_setsize
+		 * overwrites the 0.) */
+		struct tessera_node  *tn   = VTOTNODE(vp);
+		struct tessera_mount *tmp_ = VFSTOTESSERA(vp->v_mount);
+		off_t isize = 0;
+		if (tmp_ != NULL && tmp_->inode_tree != NULL) {
+			tessera_inode_record_t ino;
+			int rc = (tn->snapshot_gen != 0)
+			    ? tessera_fs_inode_get_at_gen(tmp_,
+			          (uint32_t)tn->inode_no, tn->snapshot_gen, &ino)
+			    : tessera_fs_inode_get(tmp_,
+			          (uint32_t)tn->inode_no, &ino);
+			if (rc == TESSERA_OK)
+				isize = (off_t)ino.size;
+		}
+		(void)vnode_create_vobject(vp, isize, ap->a_td);
+	}
 	return (0);
 }
 
