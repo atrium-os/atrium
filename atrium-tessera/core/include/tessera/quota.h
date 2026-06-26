@@ -46,6 +46,33 @@ int tessera_quota_reserve(tessera_quota_domain_t *d, uint64_t delta);
  */
 void tessera_quota_release(tessera_quota_domain_t *d, uint64_t delta);
 
+/* ── Persistence over the quota B+tree (quota_store.c) ──────────────
+ *
+ * Domain records live in their own tree (TESSERA_BTREE_KIND_QUOTA,
+ * key_size 8, value_size TESSERA_QUOTA_DOMAIN_SIZE) rooted at
+ * SB.quota_tree_root. These wrap btree get/put/delete with the
+ * domain_id key encoding + record codec.
+ */
+struct tessera_btree;  /* fwd; full def in tessera/btree.h */
+
+/* Encode domain_id as the 8-byte big-endian btree key. */
+void tessera_quota_key(uint64_t domain_id, uint8_t out[8]);
+
+/* Store/update a domain record; returns the new tree root in *new_root. */
+int tessera_quota_store_put(struct tessera_btree *t,
+                            const tessera_quota_domain_t *d,
+                            uint64_t *new_root);
+
+/* Load a domain by id; TESSERA_ENOENT if absent. */
+int tessera_quota_store_get(struct tessera_btree *t,
+                            uint64_t domain_id,
+                            tessera_quota_domain_t *out);
+
+/* Remove a domain record; returns the new tree root in *new_root. */
+int tessera_quota_store_delete(struct tessera_btree *t,
+                               uint64_t domain_id,
+                               uint64_t *new_root);
+
 #ifdef __cplusplus
 }
 #endif

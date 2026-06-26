@@ -149,6 +149,13 @@ typedef struct TESSERA_PACKED {
 	 * snapshots_gen. */
 	uint64_t  next_quota_domain_id;
 	uint64_t  quota_features;
+	/* Root sector + generation of the quota-domain B+tree (key = domain_id
+	 * u64, value = tessera_quota_domain_t). 0 until the first domain is
+	 * created (mkfs may leave it empty; the kmod lazily creates the tree on
+	 * first domain). Separate tree (not the inode tree) because the value
+	 * size differs (128 vs 144). */
+	uint64_t  quota_tree_root;
+	uint64_t  quota_tree_gen;
 	/* Encryption — reserved by v1 for v3's at-rest encryption.
 	 * v1 mkfs zeros all of these; v1 kmod never reads them.
 	 * v3 will populate `key_slots` with active unlock methods
@@ -169,8 +176,9 @@ typedef struct TESSERA_PACKED {
 	/* Trailing slack — kept BEFORE crc32/hmac (which sit at the very end)
 	 * so any field later carved from it is CRC-covered for free. Sized to
 	 * hold the SB at exactly one sector (4096 B); shrink when naming a new
-	 * field. 1744 = prior 1760 − the 16 B taken by the two quota u64s. */
-	uint8_t   reserved[1744];
+	 * field. 1728 = prior 1760 − 32 B taken by the four quota u64s
+	 * (next_quota_domain_id, quota_features, quota_tree_root, quota_tree_gen). */
+	uint8_t   reserved[1728];
 	uint32_t  crc32;                     /* CRC over bytes 0..(crc32 offset) */
 	/* Keyed integrity — reserved by v1 for v3's authenticated metadata.
 	 * v1 mkfs zeros this; v1/v2 kmod ignore it. v3 derives a separate
@@ -465,6 +473,12 @@ typedef struct TESSERA_PACKED {
 
 /* quota_features bits (SB.quota_features). */
 #define TESSERA_QUOTA_FEATURE_LOGICAL_BYTES  (1ull << 0)  /* V1 */
+
+/* B+tree `tree_kind` values (tessera_btree_node_header.tree_kind). */
+#define TESSERA_BTREE_KIND_INODE     0u
+#define TESSERA_BTREE_KIND_PACK_REG  1u
+#define TESSERA_BTREE_KIND_FREE_EXT  2u
+#define TESSERA_BTREE_KIND_QUOTA     3u
 
 /* Inode flags (tessera-fs §7.2) */
 #define TESSERA_INODE_FLAG_IMMUTABLE   (1u << 0)

@@ -15,7 +15,7 @@ LIB=        tessera_core
 SHLIB_MAJOR= 1
 
 SRCS=       error.c hash.c crc.c codec.c cdc.c btree.c \
-            manifest.c pack.c journal.c extent.c gc.c volume.c quota.c
+            manifest.c pack.c journal.c extent.c gc.c volume.c quota.c quota_store.c
 INCS=       include/tessera/tessera.h \
             include/tessera/error.h \
             include/tessera/format.h \
@@ -56,7 +56,8 @@ TEST_NAMES= \
     test_pack \
     test_journal \
     test_volume \
-    test_quota
+    test_quota \
+    test_quota_store
 
 TEST_BINS= ${TEST_NAMES:S,^,${.OBJDIR}/,}
 
