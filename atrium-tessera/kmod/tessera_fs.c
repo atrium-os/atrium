@@ -1155,6 +1155,11 @@ struct tessera_mount {
 	tessera_quota_domain_t    quota_domains[TESSERA_QUOTA_MAX_DOMAINS];
 	uint32_t                  quota_ndomains;
 	uint64_t                  quota_default_domain;
+	/* Persistence: the on-disk quota-domain tree (lazy-created on first
+	 * flush), and a dirty flag set on any used_bytes/limit change so
+	 * commit_sb only rewrites the records when something changed. */
+	struct tessera_btree     *quota_tree;
+	int                       quota_dirty;
 };
 
 /* Find a quota domain by id in the in-core table; NULL if absent or id 0. */
@@ -1473,18 +1478,9 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	tmp_->dev   = dev;
 	tmp_->sb    = *active;
 	tmp_->chunk_size_override = chunk_size_override;
-	/* Whole-FS quota via mount option: seed domain 1 (rooted at the root
-	 * inode 2) as the default domain, so every inode without its own
-	 * quota_domain is charged to it. used starts 0 (correct for a fresh
-	 * volume). tmp_ was M_ZERO'd so quota is off by default. */
-	if (quota_bytes > 0) {
-		tessera_quota_domain_init(&tmp_->quota_domains[0], 1, 2,
-		    quota_bytes);
-		tmp_->quota_ndomains = 1;
-		tmp_->quota_default_domain = 1;
-		printf("tessera_fs: quota active, default domain limit %ju "
-		    "bytes\n", (uintmax_t)quota_bytes);
-	}
+	/* Quota domains are loaded from the on-disk tree below (after the
+	 * tree opens); the `tessera.quota_bytes=N` mount-option override is
+	 * applied on top of the loaded table there. */
 	/* `active` aliases sb_a or sb_b — copy completed, free the
 	 * heap-alloc'd staging copies. NULL them out so the fail_close
 	 * cleanup at the bottom (which does `if (sb_a) free(sb_a)`) doesn't
@@ -1703,6 +1699,56 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 			printf("tessera_fs: warning — snapshots tree open at "
 			    "sector %lu failed\n",
 			    (unsigned long)tmp_->sb.snapshots_root);
+	}
+
+	/* Quota domains (tessera-quotas.md). Load the persisted table from
+	 * the on-disk quota tree (0 = none yet; lazy-created on first flush
+	 * in commit_sb, so non-quota'd volumes never grow one). Each record
+	 * carries its own used_bytes, so usage survives umount/remount.
+	 * Forensic mounts skip (no enforcement). */
+	if (tmp_->sb.quota_tree_root != 0 && !tmp_->readonly_snapshot) {
+		tmp_->quota_tree = tessera_btree_open(&tmp_->meta_bio,
+		    tmp_->sb.quota_tree_root, TESSERA_BTREE_KIND_QUOTA,
+		    /*key*/ 8, /*value*/ TESSERA_QUOTA_DOMAIN_SIZE);
+		tessera_btree_cursor_t *qc = (tmp_->quota_tree != NULL)
+		    ? tessera_btree_seek_first(tmp_->quota_tree) : NULL;
+		while (qc != NULL &&
+		    tmp_->quota_ndomains < TESSERA_QUOTA_MAX_DOMAINS) {
+			uint8_t qk[8], qv[TESSERA_QUOTA_DOMAIN_SIZE];
+			if (tessera_btree_cursor_get(qc, qk, qv) != TESSERA_OK)
+				break;
+			if (tessera_decode_quota_domain(qv,
+			    &tmp_->quota_domains[tmp_->quota_ndomains])
+			    == TESSERA_OK)
+				tmp_->quota_ndomains++;
+			if (tessera_btree_cursor_next(qc) != TESSERA_OK)
+				break;
+		}
+		if (qc != NULL)
+			tessera_btree_cursor_free(qc);
+		if (tmp_->quota_ndomains > 0)
+			printf("tessera_fs: loaded %u quota domain(s)\n",
+			    tmp_->quota_ndomains);
+	}
+
+	/* `tessera.quota_bytes=N` override: the whole-FS default domain
+	 * (id 1, root inode 2). Update an already-loaded id 1, else seed it.
+	 * Keeps any persisted used_bytes; only the limit + default selection
+	 * come from the mount. */
+	if (quota_bytes > 0) {
+		tessera_quota_domain_t *d1 = tessera_quota_find(tmp_, 1);
+		if (d1 != NULL) {
+			d1->limit_bytes = quota_bytes;
+		} else if (tmp_->quota_ndomains < TESSERA_QUOTA_MAX_DOMAINS) {
+			tessera_quota_domain_init(
+			    &tmp_->quota_domains[tmp_->quota_ndomains], 1, 2,
+			    quota_bytes);
+			tmp_->quota_ndomains++;
+		}
+		tmp_->quota_default_domain = 1;
+		tmp_->quota_dirty = 1;
+		printf("tessera_fs: quota default domain limit %ju bytes\n",
+		    (uintmax_t)quota_bytes);
 	}
 
 	/* Reconstruct the meta-reserve free list across mounts. The
@@ -2175,6 +2221,8 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			tessera_extent_close(tmp_->extent_alloc);
 		if (tmp_->snapshots_tree != NULL)
 			tessera_btree_close(tmp_->snapshots_tree);
+		if (tmp_->quota_tree != NULL)
+			tessera_btree_close(tmp_->quota_tree);
 		if (tmp_->pack_registry_tree != NULL)
 			tessera_btree_close(tmp_->pack_registry_tree);
 		if (tmp_->inode_tree != NULL)
@@ -3732,6 +3780,7 @@ tessera_vop_setattr(struct vop_setattr_args *ap)
 						tessera_quota_release(qd,
 						    ino.size - new_size);
 					}
+					tmp_->quota_dirty = 1;
 				}
 			}
 			uint8_t *old_buf = NULL;
@@ -4213,6 +4262,30 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 		printf("tessera_fs: crash-injection — SB write skipped, "
 		    "journal record retained for replay\n");
 		return (0);
+	}
+
+	/* Persist dirty quota domains to the on-disk tree before the SB
+	 * write, so sb.quota_tree_root reflects them and used_bytes survives
+	 * remount (tessera-quotas.md §5.5). Lazy-create the tree on first
+	 * flush (non-quota'd volumes never grow one). Best-effort: a btree
+	 * failure leaves quota_dirty set to retry next commit. Crash between
+	 * the tree write and the SB write is a known gap until the root
+	 * update is journaled; a clean unmount persists correctly. */
+	if (tmp_->quota_dirty && tmp_->quota_ndomains > 0) {
+		uint64_t qroot = tmp_->sb.quota_tree_root;
+		if (tmp_->quota_tree == NULL)
+			tmp_->quota_tree = tessera_btree_create(&tmp_->meta_bio,
+			    TESSERA_BTREE_KIND_QUOTA, /*key*/ 8,
+			    /*value*/ TESSERA_QUOTA_DOMAIN_SIZE, &qroot);
+		int qok = (tmp_->quota_tree != NULL);
+		for (uint32_t i = 0; qok && i < tmp_->quota_ndomains; i++)
+			if (tessera_quota_store_put(tmp_->quota_tree,
+			    &tmp_->quota_domains[i], &qroot) != TESSERA_OK)
+				qok = 0;
+		if (qok) {
+			tmp_->sb.quota_tree_root = qroot;
+			tmp_->quota_dirty = 0;
+		}
 	}
 
 	/* Heap-allocated — sector-sized array on the stack would risk
@@ -12177,9 +12250,12 @@ tessera_vop_write(struct vop_write_args *ap)
 	 * Under the vnode lock, so no separate domain lock is needed yet. */
 	if (final_size > ino.size) {
 		tessera_quota_domain_t *qd = tessera_quota_for_inode(tmp_, &ino);
-		if (qd != NULL &&
-		    tessera_quota_reserve(qd, final_size - ino.size) != TESSERA_OK)
-			return (EDQUOT);
+		if (qd != NULL) {
+			if (tessera_quota_reserve(qd, final_size - ino.size)
+			    != TESSERA_OK)
+				return (EDQUOT);
+			tmp_->quota_dirty = 1;
+		}
 	}
 
 	/* Coalesce small/medium writes into a per-inode RAM buffer so
@@ -12882,8 +12958,10 @@ tessera_fs_inode_unlink(struct tessera_mount *tmp_, uint32_t inode_no)
 		if (tessera_fs_inode_get(tmp_, inode_no, &live) == TESSERA_OK) {
 			tessera_quota_domain_t *qd =
 			    tessera_quota_for_inode(tmp_, &live);
-			if (qd != NULL)
+			if (qd != NULL) {
 				tessera_quota_release(qd, live.size);
+				tmp_->quota_dirty = 1;
+			}
 		}
 	}
 	uint64_t new_root = tmp_->sb.inode_root;
@@ -13178,6 +13256,8 @@ tessera_vop_ioctl(struct vop_ioctl_args *ap)
 		    tessera_quota_find(tmp_, dino.quota_domain);
 		if (qd != NULL) {
 			qd->limit_bytes = limit;
+			tmp_->quota_dirty = 1;
+			tessera_fs_mark_dirty(tmp_);
 			return (0);
 		}
 		if (tmp_->quota_ndomains >= TESSERA_QUOTA_MAX_DOMAINS)
@@ -13199,6 +13279,7 @@ tessera_vop_ioctl(struct vop_ioctl_args *ap)
 			tmp_->quota_ndomains--;   /* roll back the table add */
 			return (EIO);
 		}
+		tmp_->quota_dirty = 1;
 		tessera_fs_mark_dirty(tmp_);
 		printf("tessera_fs: quota domain %ju on inode %u, limit %ju\n",
 		    (uintmax_t)new_id, (unsigned)tn->inode_no,

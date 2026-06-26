@@ -474,11 +474,13 @@ typedef struct TESSERA_PACKED {
 /* quota_features bits (SB.quota_features). */
 #define TESSERA_QUOTA_FEATURE_LOGICAL_BYTES  (1ull << 0)  /* V1 */
 
-/* B+tree `tree_kind` values (tessera_btree_node_header.tree_kind). */
+/* B+tree `tree_kind` values (tessera_btree_node_header.tree_kind). 3 is the
+ * snapshots tree (kmod), so quota takes 4. */
 #define TESSERA_BTREE_KIND_INODE     0u
 #define TESSERA_BTREE_KIND_PACK_REG  1u
 #define TESSERA_BTREE_KIND_FREE_EXT  2u
-#define TESSERA_BTREE_KIND_QUOTA     3u
+#define TESSERA_BTREE_KIND_SNAPSHOT  3u
+#define TESSERA_BTREE_KIND_QUOTA     4u
 
 /* Inode flags (tessera-fs §7.2) */
 #define TESSERA_INODE_FLAG_IMMUTABLE   (1u << 0)
