@@ -39,6 +39,7 @@ typedef enum {
 	TESSERA_EPERM           = -21,	/* operation not permitted (chflags etc.) */
 	TESSERA_EXDEV           = -22,	/* cross-device operation */
 	TESSERA_ERANGE          = -23,	/* offset/length out of range */
+	TESSERA_EDQUOT          = -24,	/* quota domain limit exceeded */
 } tessera_errno_t;
 
 /* Human-readable description of a code (for logs, never NULL). */

@@ -15,7 +15,7 @@ LIB=        tessera_core
 SHLIB_MAJOR= 1
 
 SRCS=       error.c hash.c crc.c codec.c cdc.c btree.c \
-            manifest.c pack.c journal.c extent.c gc.c volume.c
+            manifest.c pack.c journal.c extent.c gc.c volume.c quota.c
 INCS=       include/tessera/tessera.h \
             include/tessera/error.h \
             include/tessera/format.h \
@@ -29,7 +29,8 @@ INCS=       include/tessera/tessera.h \
             include/tessera/journal.h \
             include/tessera/extent.h \
             include/tessera/gc.h \
-            include/tessera/volume.h
+            include/tessera/volume.h \
+            include/tessera/quota.h
 INCSDIR=    /usr/local/include
 
 WARNS?=     6
@@ -54,7 +55,8 @@ TEST_NAMES= \
     test_manifest \
     test_pack \
     test_journal \
-    test_volume
+    test_volume \
+    test_quota
 
 TEST_BINS= ${TEST_NAMES:S,^,${.OBJDIR}/,}
 

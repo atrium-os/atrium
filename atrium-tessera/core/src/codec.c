@@ -265,6 +265,26 @@ tessera_decode_inode(const uint8_t in[TESSERA_INODE_RECORD_SIZE],
 	return TESSERA_OK;
 }
 
+/* ── quota domain record ─────────────────────────────────────────── */
+
+int
+tessera_encode_quota_domain(const tessera_quota_domain_t *in,
+                            uint8_t out[TESSERA_QUOTA_DOMAIN_SIZE])
+{
+	if (in == NULL || out == NULL) return TESSERA_EINVAL;
+	memcpy(out, in, sizeof(*in));
+	return TESSERA_OK;
+}
+
+int
+tessera_decode_quota_domain(const uint8_t in[TESSERA_QUOTA_DOMAIN_SIZE],
+                            tessera_quota_domain_t *out)
+{
+	if (in == NULL || out == NULL) return TESSERA_EINVAL;
+	memcpy(out, in, sizeof(*out));
+	return TESSERA_OK;
+}
+
 /* ── B+tree node header ──────────────────────────────────────────── */
 
 int

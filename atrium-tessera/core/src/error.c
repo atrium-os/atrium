@@ -30,6 +30,7 @@ tessera_strerror(tessera_errno_t e)
 	case TESSERA_EPERM:        return "operation not permitted";
 	case TESSERA_EXDEV:        return "cross-device";
 	case TESSERA_ERANGE:       return "out of range";
+	case TESSERA_EDQUOT:       return "quota exceeded";
 	}
 	return "unknown error";
 }

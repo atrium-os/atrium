@@ -44,6 +44,7 @@ extern "C" {
 #define TESSERA_PACK_INDEX_ENTRY_SIZE  48u
 #define TESSERA_REGISTRY_ENTRY_SIZE    64u
 #define TESSERA_EXTENT_ENTRY_SIZE      16u
+#define TESSERA_QUOTA_DOMAIN_SIZE     128u    /* per-directory-tree quota record */
 
 #define TESSERA_INODE_NULL              0u
 #define TESSERA_INODE_GC_ROOT_ANCHOR    1u
@@ -140,6 +141,14 @@ typedef struct TESSERA_PACKED {
 	 * the format slot now avoids an on-disk migration when v2 lands. */
 	uint64_t  snapshots_root;
 	uint64_t  snapshots_gen;
+	/* Quota (tessera-quotas.md §4.3). Per-directory-tree quota domains:
+	 * `next_quota_domain_id` is the monotonic allocator (0 until the first
+	 * domain); `quota_features` is a bitmask (bit 0 = logical-bytes quota,
+	 * V1) so the machinery can evolve without a format-version bump. Placed
+	 * here (before crc32) so both are CRC-covered. 8-byte aligned after
+	 * snapshots_gen. */
+	uint64_t  next_quota_domain_id;
+	uint64_t  quota_features;
 	/* Encryption — reserved by v1 for v3's at-rest encryption.
 	 * v1 mkfs zeros all of these; v1 kmod never reads them.
 	 * v3 will populate `key_slots` with active unlock methods
@@ -157,6 +166,11 @@ typedef struct TESSERA_PACKED {
 	                                        re-encryption */
 	tessera_key_slot_t  key_slots[8];    /* 8 × 256 = 2 KiB */
 	uint32_t  last_unmount_clean;
+	/* Trailing slack — kept BEFORE crc32/hmac (which sit at the very end)
+	 * so any field later carved from it is CRC-covered for free. Sized to
+	 * hold the SB at exactly one sector (4096 B); shrink when naming a new
+	 * field. 1744 = prior 1760 − the 16 B taken by the two quota u64s. */
+	uint8_t   reserved[1744];
 	uint32_t  crc32;                     /* CRC over bytes 0..(crc32 offset) */
 	/* Keyed integrity — reserved by v1 for v3's authenticated metadata.
 	 * v1 mkfs zeros this; v1/v2 kmod ignore it. v3 derives a separate
@@ -165,7 +179,6 @@ typedef struct TESSERA_PACKED {
 	 * commit_sb, verifying on mount. CRC32 stays for non-authenticated
 	 * (encryption-off) volumes; HMAC supersedes it when present. */
 	uint8_t   hmac[32];
-	uint8_t   reserved[1760];
 } tessera_superblock_t;
 
 /* Superblock feature flags */
@@ -222,6 +235,7 @@ typedef enum {
 	TESSERA_EXTENT_FREE       = 12,
 	TESSERA_ROOT_UPDATE       = 13,
 	TESSERA_GC_TOMBSTONE      = 14,
+	TESSERA_QUOTA_DELTA       = 15,
 } tessera_record_type_t;
 
 /* DIR_INSERT / DIR_REMOVE body — variable-length, name bytes follow.
@@ -248,6 +262,15 @@ typedef struct TESSERA_PACKED {
 	uint8_t   reserved[3];
 	/* tessera_inode_record_t body follows (144 bytes). Total = 152. */
 } tessera_jrec_inode_t;
+
+/* QUOTA_DELTA body — adjusts a domain's used_bytes, journaled atomically
+ * with the data update it corresponds to (tessera-quotas.md §4.4). On
+ * replay the delta is applied together with the inode/extent update so
+ * on-disk quota accounting stays consistent across a crash. */
+typedef struct TESSERA_PACKED {
+	uint64_t  domain_id;
+	int64_t   delta_bytes;       /* +N grow, -N shrink */
+} tessera_jrec_quota_delta_t;
 
 /* ── Pack header (4096 bytes) ────────────────────────────────────── */
 
@@ -406,8 +429,42 @@ typedef struct TESSERA_PACKED {
 	uint32_t  flags;                     /* see below */
 	tessera_hash_t  manifest_hash;
 	tessera_hash_t  xattr_hash;
-	uint8_t   reserved_b[8];             /* future: per-inode key id, etc. */
+	/* Quota domain this inode belongs to (tessera-quotas.md §4.1).
+	 * 0 = not in any domain (global/legacy); else a tessera_quota_domain
+	 * record id. Set once at create (inherited from parent); changed only
+	 * by a cross-domain rename. Carved from the former reserved_b[8]. */
+	uint64_t  quota_domain;
 } tessera_inode_record_t;
+
+/* ── Quota domain record (128 bytes, tessera-quotas.md §4.2) ────────
+ *
+ * One per-directory-tree quota domain. Stored in the btree keyed by
+ * domain_id (under a 'Q' key prefix). Small (~128 B), so even 10K
+ * active domains is ~1 MiB of metadata. `dedup_policy` + `domain_salt`
+ * are immutable after creation (changing them would orphan every
+ * already-stored chunk hash in the domain).
+ */
+typedef struct TESSERA_PACKED {
+	uint64_t  domain_id;          /* primary key; monotonic from the SB */
+	uint64_t  root_inode_no;      /* the directory marked as quota root */
+	uint64_t  limit_bytes;        /* hard limit; logical bytes */
+	uint64_t  used_bytes;         /* current usage; logical bytes */
+	uint64_t  limit_inodes;       /* V1: 0 (V2 inode quotas) */
+	uint64_t  used_inodes;        /* V1: 0 */
+	uint64_t  snapshot_reserve_bytes; /* V1: 0 (V2 snapshot accounting) */
+	uint8_t   dedup_policy;       /* 0=global, 1=deferred, 2=salted (§20.2) */
+	uint8_t   pad[7];
+	uint8_t   domain_salt[32];    /* set iff salted; else zero */
+	uint8_t   reserved[32];       /* future: HMAC slot, nested-domain ptr */
+} tessera_quota_domain_t;
+
+/* dedup_policy values (tessera-fs.md §20.2). */
+#define TESSERA_DEDUP_GLOBAL    0u
+#define TESSERA_DEDUP_DEFERRED  1u
+#define TESSERA_DEDUP_SALTED    2u
+
+/* quota_features bits (SB.quota_features). */
+#define TESSERA_QUOTA_FEATURE_LOGICAL_BYTES  (1ull << 0)  /* V1 */
 
 /* Inode flags (tessera-fs §7.2) */
 #define TESSERA_INODE_FLAG_IMMUTABLE   (1u << 0)
@@ -560,6 +617,7 @@ TESSERA_STATIC_ASSERT(sizeof(tessera_manifest_header_t)   == 32,   manifest_head
 TESSERA_STATIC_ASSERT(sizeof(tessera_chunk_record_t)      == 48,   chunk_record_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_tree_record_t)       == 40,   tree_record_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_inode_record_t)      == 144,  inode_record_size);
+TESSERA_STATIC_ASSERT(sizeof(tessera_quota_domain_t)      == 128,  quota_domain_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_btree_node_header_t) == 64,   btree_node_header_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_registry_entry_t)    == 64,   registry_entry_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_free_extent_t)       == 16,   free_extent_size);

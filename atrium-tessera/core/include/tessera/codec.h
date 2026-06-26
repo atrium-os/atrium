@@ -67,6 +67,12 @@ int tessera_encode_inode(const tessera_inode_record_t *in,
 int tessera_decode_inode(const uint8_t in[TESSERA_INODE_RECORD_SIZE],
                          tessera_inode_record_t *out);
 
+/* Quota domain record (128 bytes; tessera-quotas.md §4.2). */
+int tessera_encode_quota_domain(const tessera_quota_domain_t *in,
+                                uint8_t out[TESSERA_QUOTA_DOMAIN_SIZE]);
+int tessera_decode_quota_domain(const uint8_t in[TESSERA_QUOTA_DOMAIN_SIZE],
+                                tessera_quota_domain_t *out);
+
 /* B+tree node header (32 bytes; entries follow). */
 int tessera_encode_btree_node_header(const tessera_btree_node_header_t *in,
                                      uint8_t out[32]);
