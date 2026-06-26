@@ -74,6 +74,20 @@ impl BackendPlugin for TesseraPlugin {
         let path = compose_host_path(backend, jail_name, &spec.name)?;
         ensure_dir(&path, spec.mode)?;
         ffi::chown(Path::new(&path), spec.owner_uid, spec.owner_gid)?;
+        // Enforce size_max as a Tessera per-directory quota (the volume root
+        // becomes a quota domain; everything under it counts against it).
+        // Best-effort + loud: if the backend root isn't actually a Tessera
+        // mount (or the kmod predates the ioctl) we get ENOTTY and log a
+        // warning rather than fail the provision — the dir is still usable,
+        // just unbounded. Idempotent: re-provisioning re-sets the limit.
+        if let Some(limit) = spec.size_max {
+            match ffi::tessera_set_quota(Path::new(&path), limit) {
+                Ok(()) => debug!("tessera: quota {} bytes on {}", limit, path),
+                Err(e) => log::warn!(
+                    "tessera: size_max={} not enforced on {} ({}) — \
+                     volume is unbounded", limit, path, e),
+            }
+        }
         debug!("tessera: provisioned {} (mode={:#o} {}:{})",
             path, spec.mode, spec.owner_uid, spec.owner_gid);
         Ok(path)

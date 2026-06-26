@@ -52,3 +52,39 @@ pub fn chown(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
     }
     Ok(())
 }
+
+/// Set a Tessera per-directory quota limit on `path` (the volume root) via
+/// the kmod ioctl `TESSERA_IOC_QUOTA_SET = _IOW('T', 1, uint64_t)`. On
+/// FreeBSD that encodes to `_IOC(IN=0x8000_0000, 'T', 1, sizeof(u64)=8)` =
+/// `0x8000_0000 | (8 << 16) | (0x54 << 8) | 1` = `0x8008_5401`. Returns
+/// `ENOTTY` if `path` isn't on a Tessera mount (or the kmod lacks the op),
+/// which the caller treats as "this backend doesn't enforce size_max".
+#[cfg(target_os = "freebsd")]
+pub fn tessera_set_quota(path: &Path, limit_bytes: u64) -> io::Result<()> {
+    const TESSERA_IOC_QUOTA_SET: libc::c_ulong = 0x8008_5401;
+    let c_path = CString::new(path.as_os_str().to_string_lossy().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "nul in path"))?;
+    // SAFETY: open a directory read-only for the ioctl; close on every path.
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut lim = limit_bytes;
+    let rc = unsafe {
+        libc::ioctl(fd, TESSERA_IOC_QUOTA_SET, &mut lim as *mut u64)
+    };
+    let err = io::Error::last_os_error();
+    unsafe { libc::close(fd) };
+    if rc != 0 {
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn tessera_set_quota(_path: &Path, _limit_bytes: u64) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "tessera quota ioctl is FreeBSD-only",
+    ))
+}
