@@ -89,6 +89,10 @@ pub struct Grid {
     pending_wrap: bool,
     /// Window title set via OSC 0/2 (shells/programs report cwd or command).
     title: String,
+    /// Working directory reported by the shell via OSC 7 (`file://host/path`),
+    /// if any. Used to respawn a shell in the same place after a `stoad`
+    /// restart (S3a). `None` if the shell never emits OSC 7.
+    cwd: Option<String>,
     /// Lines that have scrolled off the top, oldest first (capped). The
     /// scrollback the client can page up into.
     history: Vec<Vec<Cell>>,
@@ -109,6 +113,7 @@ impl Grid {
             pen: Cell::default(),
             pending_wrap: false,
             title: String::new(),
+            cwd: None,
             history: Vec::new(),
         }
     }
@@ -118,6 +123,8 @@ impl Grid {
     pub fn cursor(&self) -> (u16, u16) { (self.cur_row, self.cur_col) }
     /// The window title (OSC 0/2), empty if none set.
     pub fn title(&self) -> &str { &self.title }
+    /// The shell's working directory (OSC 7), if it has reported one.
+    pub fn cwd(&self) -> Option<&str> { self.cwd.as_deref() }
     /// Scrolled-off lines, oldest first (the scrollback).
     pub fn history(&self) -> &[Vec<Cell>] { &self.history }
 
@@ -380,14 +387,55 @@ impl Perform for Grid {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
-        // OSC 0 (icon name + title) / 2 (title) → window title.
-        if let [kind, title, ..] = params {
-            if matches!(*kind, b"0" | b"2") {
+        match params {
+            // OSC 0 (icon name + title) / 2 (title) → window title.
+            [kind, title, ..] if matches!(*kind, b"0" | b"2") => {
                 self.title = String::from_utf8_lossy(title).into_owned();
             }
+            // OSC 7 (`file://host/path`) → working directory.
+            [b"7", uri, ..] => {
+                self.cwd = parse_osc7_cwd(&String::from_utf8_lossy(uri));
+            }
+            _ => {}
         }
     }
     // esc_dispatch / hook / put / unhook: ignored in v1.
+}
+
+/// Parse an OSC 7 value (`file://host/abs/path`, or `file:///abs/path`) into a
+/// local absolute path, percent-decoded. Returns `None` if it isn't a
+/// `file://` URI with an absolute path. The host part (between `//` and the
+/// first `/` of the path) is ignored — we only respawn locally.
+fn parse_osc7_cwd(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    // The path begins at the first '/' (after an optional host). `file:///x`
+    // → rest is `/x`; `file://h/x` → rest is `h/x`, path starts at `/x`.
+    let slash = rest.find('/')?;
+    let path = &rest[slash..];
+    let decoded = percent_decode(path);
+    decoded.starts_with('/').then_some(decoded)
+}
+
+/// Minimal percent-decoding (`%20` → space, etc.); leaves malformed escapes
+/// as-is. Enough for OSC 7 paths, which only really encode spaces/specials.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hi = (b[i + 1] as char).to_digit(16);
+            let lo = (b[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A terminal: the `vte` parser + the [`Grid`] it drives. (`vte::Parser`
@@ -436,6 +484,28 @@ mod tests {
     use super::*;
 
     fn term() -> Terminal { Terminal::new(20, 5) }
+
+    #[test]
+    fn osc7_captures_cwd() {
+        let mut t = term();
+        // host form, bell-terminated
+        t.feed(b"\x1b]7;file://myhost/home/g/src\x07");
+        assert_eq!(t.grid().cwd(), Some("/home/g/src"));
+        // no-host form, ST-terminated; percent-decoded
+        t.feed(b"\x1b]7;file:///var/log/my%20dir\x1b\\");
+        assert_eq!(t.grid().cwd(), Some("/var/log/my dir"));
+    }
+
+    #[test]
+    fn osc7_ignores_malformed() {
+        let mut t = term();
+        t.feed(b"\x1b]7;not-a-uri\x07");
+        assert_eq!(t.grid().cwd(), None);
+        // OSC 7 doesn't touch the title; OSC 2 doesn't touch cwd.
+        t.feed(b"\x1b]2;my title\x07");
+        assert_eq!(t.grid().title(), "my title");
+        assert_eq!(t.grid().cwd(), None);
+    }
 
     #[test]
     fn prints_text_and_advances_cursor() {

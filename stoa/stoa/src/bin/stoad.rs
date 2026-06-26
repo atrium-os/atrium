@@ -88,11 +88,11 @@ fn send_output(udp: &UdpSocket, buf: &[u8], addr: SocketAddr) {
 /// before that or if persistence is disabled.
 static STATE_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-/// A pane's shell cwd for respawn-after-restart. Per-OS capture (FreeBSD
-/// `kern.proc.cwd` / macOS libproc) is a follow-up; for now respawn uses the
-/// shell default.
-fn pane_cwd(_p: &Pane) -> Option<String> {
-    None
+/// A pane's shell cwd for respawn-after-restart, captured in-band from the
+/// shell's OSC 7 reports (uniform across macOS/FreeBSD, no syscall). `None`
+/// if the shell never emits OSC 7 (respawn then uses the shell default).
+fn pane_cwd(p: &Pane) -> Option<String> {
+    p.term.grid().cwd().map(str::to_string)
 }
 
 /// Snapshot the live session table to the persisted [`PersistState`] form.
@@ -240,7 +240,9 @@ fn rebuild_from_restore(
             });
             continue;
         }
-        let Some(widx) = spawn_window(name, state, inner, udp, reg) else { continue };
+        // Respawn the window's primary pane at its last-known cwd.
+        let cwd = pw.panes.first().and_then(|p| p.cwd.as_deref());
+        let Some(widx) = spawn_window(name, state, inner, udp, reg, cwd) else { continue };
         inner.active = widx;
         // Recreate a 2-pane split, if any.
         if let Some(div) = pw.divider {
@@ -838,7 +840,7 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
                                 Some(Control::NewWindow) => {
                                     if inner.started {
                                         if let Some(idx) =
-                                            spawn_window(&name, &state, &mut inner, &udp, &reg)
+                                            spawn_window(&name, &state, &mut inner, &udp, &reg, None)
                                         {
                                             inner.set_active(idx);
                                             structural = true;
@@ -940,7 +942,7 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
                                 state.dead.store(true, Ordering::SeqCst);
                             }
                           } else {
-                            match spawn_window(&name, &state, &mut inner, &udp, &reg) {
+                            match spawn_window(&name, &state, &mut inner, &udp, &reg, None) {
                                 Some(idx) => {
                                     inner.active = idx;
                                     inner.started = true;
@@ -1063,7 +1065,12 @@ fn stoad_is_jailed() -> bool {
 /// `BrokerSpawner` (FreeBSD); `SessionJail` via [`resolve_session_target`]
 /// (DirectSpawner when unjailed, broker when a session jail is configured,
 /// error on a jailed stoad with none).
-fn spawn_for(target: &Target, cols: u16, rows: u16) -> std::io::Result<PtyShell> {
+fn spawn_for(
+    target: &Target,
+    cols: u16,
+    rows: u16,
+    cwd: Option<&str>,
+) -> std::io::Result<PtyShell> {
     let resolved = match target {
         Target::SessionJail => resolve_session_target()?,
         Target::Jail(_) => target.clone(),
@@ -1073,7 +1080,7 @@ fn spawn_for(target: &Target, cols: u16, rows: u16) -> std::io::Result<PtyShell>
         cmd: Vec::new(),
         cols,
         rows,
-        cwd: None,
+        cwd: cwd.map(str::to_string),
         env: Vec::new(),
     };
     match resolved {
@@ -1105,9 +1112,10 @@ fn spawn_window(
     inner: &mut Inner,
     udp: &UdpSocket,
     reg: &Reg,
+    cwd: Option<&str>,
 ) -> Option<usize> {
     let (cols, rows) = (inner.cols, inner.rows);
-    match spawn_for(&parse_target(&state.target), cols, rows) {
+    match spawn_for(&parse_target(&state.target), cols, rows, cwd) {
         Ok(shell) => {
             let fd = shell.master_fd();
             let widx = inner.windows.len();
@@ -1149,7 +1157,9 @@ fn spawn_pane(
     reg: &Reg,
 ) -> Option<usize> {
     let (top, left, prows, pcols) = region;
-    match spawn_for(&parse_target(&state.target), pcols, prows) {
+    // Split panes respawn at the shell default (restoring a 2nd pane's cwd is
+    // a minor follow-up; the window's primary pane carries cwd).
+    match spawn_for(&parse_target(&state.target), pcols, prows, None) {
         Ok(shell) => {
             let fd = shell.master_fd();
             let w = inner.windows.get_mut(win_idx)?;
@@ -1355,6 +1365,7 @@ fn reader(name: String, win_idx: usize, pane_idx: usize, pty_fd: i32, state: Arc
             return;
         }
         let bytes = &buf[..n as usize];
+        let mut cwd_changed = false;
         let out = {
             let mut inner = state.inner.lock().unwrap();
             let (cols, rows) = (inner.cols, inner.rows);
@@ -1362,7 +1373,12 @@ fn reader(name: String, win_idx: usize, pane_idx: usize, pty_fd: i32, state: Arc
             // so a switch/split can paint its current screen.
             if let Some(w) = inner.windows.get_mut(win_idx) {
                 if let Some(p) = w.panes.get_mut(pane_idx) {
+                    // A shell's OSC 7 cwd report arrives in this output stream,
+                    // not via a structural control — note a change so it gets
+                    // persisted (infrequent: once per `cd`).
+                    let before = p.term.grid().cwd().map(str::to_string);
                     p.term.feed(bytes);
+                    cwd_changed = p.term.grid().cwd().map(str::to_string) != before;
                 }
             }
             // Stream only when this pane's window is active and not scrolled.
@@ -1395,6 +1411,9 @@ fn reader(name: String, win_idx: usize, pane_idx: usize, pty_fd: i32, state: Arc
         };
         if let Some((addr, wire)) = out {
             send_output(&udp, &wire, addr);
+        }
+        if cwd_changed {
+            persist(&reg);
         }
     }
 }
