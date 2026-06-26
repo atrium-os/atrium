@@ -13146,8 +13146,73 @@ tessera_vop_pathconf(struct vop_pathconf_args *ap)
 	return (err);
 }
 
+/* ── vop_ioctl: quota domain management (tessera-quotas.md §6) ──── */
+
+/* Mark a directory as a quota root with an N-byte logical limit. Arg is a
+ * uint64_t limit (0 to clear). Userspace: ioctl(dirfd, TESSERA_IOC_QUOTA_SET,
+ * &limit). 'T' family; keep in sync with the tessera-quota tool. */
+#define TESSERA_IOC_QUOTA_SET   _IOW('T', 1, uint64_t)
+
+static int
+tessera_vop_ioctl(struct vop_ioctl_args *ap)
+{
+	struct vnode *vp = ap->a_vp;
+	struct tessera_node *tn = VTOTNODE(vp);
+	struct tessera_mount *tmp_ = VFSTOTESSERA(vp->v_mount);
+
+	switch (ap->a_command) {
+	case TESSERA_IOC_QUOTA_SET: {
+		if (vp->v_type != VDIR) return (ENOTDIR);
+		if (tmp_->inode_tree == NULL) return (EROFS);
+		uint64_t limit = *(uint64_t *)ap->a_data;
+
+		tessera_inode_record_t dino;
+		if (tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no, &dino)
+		    != TESSERA_OK)
+			return (EIO);
+
+		/* Re-set an existing domain's limit, else allocate a new id
+		 * (max in-core id + 1, never colliding with the default id 1)
+		 * and bind this directory's inode to it. */
+		tessera_quota_domain_t *qd =
+		    tessera_quota_find(tmp_, dino.quota_domain);
+		if (qd != NULL) {
+			qd->limit_bytes = limit;
+			return (0);
+		}
+		if (tmp_->quota_ndomains >= TESSERA_QUOTA_MAX_DOMAINS)
+			return (ENOSPC);
+		uint64_t new_id = 1;
+		for (uint32_t i = 0; i < tmp_->quota_ndomains; i++)
+			if (tmp_->quota_domains[i].domain_id >= new_id)
+				new_id = tmp_->quota_domains[i].domain_id + 1;
+		if (new_id < 2) new_id = 2;
+
+		tessera_quota_domain_init(
+		    &tmp_->quota_domains[tmp_->quota_ndomains], new_id,
+		    tn->inode_no, limit);
+		tmp_->quota_ndomains++;
+
+		dino.quota_domain = new_id;
+		if (tessera_fs_inode_put(tmp_, (uint32_t)tn->inode_no, &dino)
+		    != TESSERA_OK) {
+			tmp_->quota_ndomains--;   /* roll back the table add */
+			return (EIO);
+		}
+		tessera_fs_mark_dirty(tmp_);
+		printf("tessera_fs: quota domain %ju on inode %u, limit %ju\n",
+		    (uintmax_t)new_id, (unsigned)tn->inode_no,
+		    (uintmax_t)limit);
+		return (0);
+	}
+	default:
+		return (ENOTTY);
+	}
+}
+
 struct vop_vector tessera_vnodeops = {
 	.vop_default  = &default_vnodeops,
+	.vop_ioctl    = tessera_vop_ioctl,
 	.vop_pathconf = tessera_vop_pathconf,
 	.vop_access   = tessera_vop_access,
 	.vop_getattr  = tessera_vop_getattr,
