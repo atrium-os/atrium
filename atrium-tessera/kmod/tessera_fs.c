@@ -950,6 +950,11 @@ static struct tessera_dirent_log_entry *tessera_dirent_log_entry_clone(
  * republish into the 256-slot scheme. */
 #define TESSERA_DIR_BUCKET_COUNT       256u
 
+/* Max quota domains held in-core per mount (tessera-quotas.md). One per
+ * quota'd directory tree; 256 covers many small volume dirs in a shared
+ * Tessera FS. Lift (to a dynamic table) if a real deployment needs more. */
+#define TESSERA_QUOTA_MAX_DOMAINS      256u
+
 /* ── per-mount state ─────────────────────────────────────────── */
 
 struct tessera_mount {
@@ -1138,18 +1143,41 @@ struct tessera_mount {
 	 * manifest-size cost via log(N) amplification. */
 	uint32_t                  chunk_size_override;
 
-	/* Quota (tessera-quotas.md). v1 = a single whole-FS domain,
-	 * activated by `mount -o tessera.quota_bytes=N`. quota_active gates
-	 * every check; quota_dom carries the running used_bytes against
-	 * limit_bytes (logical bytes, §3.2). used_bytes starts at 0 — correct
-	 * for a freshly-mkfs'd volume; an accurate mount-time used for a
-	 * pre-populated FS, per-directory multi-domain, and the inode
-	 * quota_domain inheritance are the next increments. Guarded by the
-	 * vnode lock on the write/truncate paths (single-domain, no separate
-	 * lock needed yet). */
-	int                       quota_active;
-	tessera_quota_domain_t    quota_dom;
+	/* Quota (tessera-quotas.md). In-memory domain table loaded at mount
+	 * (and seeded by `mount -o tessera.quota_bytes=N`). An inode is
+	 * charged to `ino.quota_domain` if non-zero, else to
+	 * `quota_default_domain` — so the whole-FS mount-option case works
+	 * without rewriting every inode (default domain), while a future
+	 * per-directory domain (set on a dir's inode + inherited by children)
+	 * routes through ino.quota_domain. used_bytes is logical (§3.2) and
+	 * lives only in RAM for now (persistence is a later increment).
+	 * Guarded by the vnode lock on the write/truncate/unlink paths. */
+	tessera_quota_domain_t    quota_domains[TESSERA_QUOTA_MAX_DOMAINS];
+	uint32_t                  quota_ndomains;
+	uint64_t                  quota_default_domain;
 };
+
+/* Find a quota domain by id in the in-core table; NULL if absent or id 0. */
+static tessera_quota_domain_t *
+tessera_quota_find(struct tessera_mount *tmp_, uint64_t domain_id)
+{
+	if (domain_id == 0) return (NULL);
+	for (uint32_t i = 0; i < tmp_->quota_ndomains; i++)
+		if (tmp_->quota_domains[i].domain_id == domain_id)
+			return (&tmp_->quota_domains[i]);
+	return (NULL);
+}
+
+/* The domain an inode is charged to: its own quota_domain if set, else the
+ * mount's default domain. NULL when no quota applies to this inode. */
+static tessera_quota_domain_t *
+tessera_quota_for_inode(struct tessera_mount *tmp_,
+    const tessera_inode_record_t *ino)
+{
+	uint64_t id = (ino->quota_domain != 0)
+	    ? ino->quota_domain : tmp_->quota_default_domain;
+	return (tessera_quota_find(tmp_, id));
+}
 
 /* Allocate the next inode_no atomically. The bare
  * `new = sb.next_inode_no; sb.next_inode_no = new+1;` pattern was
@@ -1445,13 +1473,17 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	tmp_->dev   = dev;
 	tmp_->sb    = *active;
 	tmp_->chunk_size_override = chunk_size_override;
-	/* v1 whole-FS quota: one domain (id 1, rooted at the root inode 2),
-	 * used starts 0. tmp_ was M_ZERO'd so quota_active defaults off. */
+	/* Whole-FS quota via mount option: seed domain 1 (rooted at the root
+	 * inode 2) as the default domain, so every inode without its own
+	 * quota_domain is charged to it. used starts 0 (correct for a fresh
+	 * volume). tmp_ was M_ZERO'd so quota is off by default. */
 	if (quota_bytes > 0) {
-		tessera_quota_domain_init(&tmp_->quota_dom, 1, 2, quota_bytes);
-		tmp_->quota_active = 1;
-		printf("tessera_fs: quota active, limit %ju bytes\n",
-		    (uintmax_t)quota_bytes);
+		tessera_quota_domain_init(&tmp_->quota_domains[0], 1, 2,
+		    quota_bytes);
+		tmp_->quota_ndomains = 1;
+		tmp_->quota_default_domain = 1;
+		printf("tessera_fs: quota active, default domain limit %ju "
+		    "bytes\n", (uintmax_t)quota_bytes);
 	}
 	/* `active` aliases sb_a or sb_b — copy completed, free the
 	 * heap-alloc'd staging copies. NULL them out so the fail_close
@@ -2463,10 +2495,12 @@ tessera_statfs_impl(struct mount *mp, struct statfs *sbp)
 	 * a jail-visible mount must never expose it. Available is clamped to
 	 * the physical pool free so the limit can't promise bytes the pool
 	 * can't deliver. */
-	if (tmp_->quota_active) {
+	tessera_quota_domain_t *df_qd =
+	    tessera_quota_find(tmp_, tmp_->quota_default_domain);
+	if (df_qd != NULL) {
 		uint64_t bs        = TESSERA_SECTOR_SIZE;
-		uint64_t limit_blk = tmp_->quota_dom.limit_bytes / bs;
-		uint64_t used_blk  = (tmp_->quota_dom.used_bytes + bs - 1) / bs;
+		uint64_t limit_blk = df_qd->limit_bytes / bs;
+		uint64_t used_blk  = (df_qd->used_bytes + bs - 1) / bs;
 		uint64_t avail_blk = (limit_blk > used_blk)
 		    ? (limit_blk - used_blk) : 0;
 		if (avail_blk > free_data)
@@ -3686,14 +3720,18 @@ tessera_vop_setattr(struct vop_setattr_args *ap)
 			/* Quota: truncate-up reserves the growth (EDQUOT if it
 			 * would exceed the limit); truncate-down releases the
 			 * freed bytes (tessera-quotas.md §5.2-5.3). */
-			if (tmp_->quota_active) {
-				if (new_size > ino.size) {
-					if (tessera_quota_reserve(&tmp_->quota_dom,
-					    new_size - ino.size) != TESSERA_OK)
-						return (EDQUOT);
-				} else {
-					tessera_quota_release(&tmp_->quota_dom,
-					    ino.size - new_size);
+			{
+				tessera_quota_domain_t *qd =
+				    tessera_quota_for_inode(tmp_, &ino);
+				if (qd != NULL) {
+					if (new_size > ino.size) {
+						if (tessera_quota_reserve(qd,
+						    new_size - ino.size) != TESSERA_OK)
+							return (EDQUOT);
+					} else {
+						tessera_quota_release(qd,
+						    ino.size - new_size);
+					}
 				}
 			}
 			uint8_t *old_buf = NULL;
@@ -12029,6 +12067,15 @@ tessera_vop_create(struct vop_create_args *ap)
 		cino.size  = 0;
 		cino.nlink = 1;
 		cino.flags = 0;
+		/* Inherit the parent directory's quota domain so the new file
+		 * is charged to the same tree (tessera-quotas.md §4.1). 0 (the
+		 * common case) falls through to the mount's default domain. */
+		{
+			tessera_inode_record_t pino;
+			if (tessera_fs_inode_get(tmp_, (uint32_t)dn->inode_no,
+			    &pino) == TESSERA_OK)
+				cino.quota_domain = pino.quota_domain;
+		}
 		memcpy(cino.manifest_hash, pub_hash, sizeof pub_hash);
 
 		uint8_t ckey[4];
@@ -12128,9 +12175,10 @@ tessera_vop_write(struct vop_write_args *ap)
 	 * A pure overwrite (final_size == ino.size) costs nothing. Reservation
 	 * happens once here, ahead of both the buffered and slow paths.
 	 * Under the vnode lock, so no separate domain lock is needed yet. */
-	if (tmp_->quota_active && final_size > ino.size) {
-		uint64_t delta = final_size - ino.size;
-		if (tessera_quota_reserve(&tmp_->quota_dom, delta) != TESSERA_OK)
+	if (final_size > ino.size) {
+		tessera_quota_domain_t *qd = tessera_quota_for_inode(tmp_, &ino);
+		if (qd != NULL &&
+		    tessera_quota_reserve(qd, final_size - ino.size) != TESSERA_OK)
 			return (EDQUOT);
 	}
 
@@ -12829,10 +12877,14 @@ tessera_fs_inode_unlink(struct tessera_mount *tmp_, uint32_t inode_no)
 	 * release its logical size back to the domain (tessera-quotas.md
 	 * §5.3). Use the size-overlay inode_get so any unflushed coalesced
 	 * writes are counted, matching what vop_write reserved. */
-	if (tmp_->quota_active) {
+	{
 		tessera_inode_record_t live;
-		if (tessera_fs_inode_get(tmp_, inode_no, &live) == TESSERA_OK)
-			tessera_quota_release(&tmp_->quota_dom, live.size);
+		if (tessera_fs_inode_get(tmp_, inode_no, &live) == TESSERA_OK) {
+			tessera_quota_domain_t *qd =
+			    tessera_quota_for_inode(tmp_, &live);
+			if (qd != NULL)
+				tessera_quota_release(qd, live.size);
+		}
 	}
 	uint64_t new_root = tmp_->sb.inode_root;
 	if (tessera_fs_inode_delete_byk(tmp_, key,
