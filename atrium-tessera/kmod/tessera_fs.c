@@ -65,6 +65,7 @@
 #include "tessera/extent.h"
 #include "tessera/format.h"
 #include "tessera/hash.h"
+#include "tessera/quota.h"
 #include "tessera/journal.h"
 #include "tessera/manifest.h"
 #include "tessera/pack.h"
@@ -1136,6 +1137,18 @@ struct tessera_mount {
 	 * CHUNK_TREE write-side promotion will lift the resulting
 	 * manifest-size cost via log(N) amplification. */
 	uint32_t                  chunk_size_override;
+
+	/* Quota (tessera-quotas.md). v1 = a single whole-FS domain,
+	 * activated by `mount -o tessera.quota_bytes=N`. quota_active gates
+	 * every check; quota_dom carries the running used_bytes against
+	 * limit_bytes (logical bytes, §3.2). used_bytes starts at 0 — correct
+	 * for a freshly-mkfs'd volume; an accurate mount-time used for a
+	 * pre-populated FS, per-directory multi-domain, and the inode
+	 * quota_domain inheritance are the next increments. Guarded by the
+	 * vnode lock on the write/truncate paths (single-domain, no separate
+	 * lock needed yet). */
+	int                       quota_active;
+	tessera_quota_domain_t    quota_dom;
 };
 
 /* Allocate the next inode_no atomically. The bare
@@ -1333,7 +1346,7 @@ tessera_heal_sb(struct vnode *devvp, uint64_t which,
 
 static int
 tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
-    uint32_t chunk_size_override)
+    uint32_t chunk_size_override, uint64_t quota_bytes)
 {
 	struct tessera_mount *tmp_;
 	struct g_consumer    *cp = NULL;
@@ -1432,6 +1445,14 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	tmp_->dev   = dev;
 	tmp_->sb    = *active;
 	tmp_->chunk_size_override = chunk_size_override;
+	/* v1 whole-FS quota: one domain (id 1, rooted at the root inode 2),
+	 * used starts 0. tmp_ was M_ZERO'd so quota_active defaults off. */
+	if (quota_bytes > 0) {
+		tessera_quota_domain_init(&tmp_->quota_dom, 1, 2, quota_bytes);
+		tmp_->quota_active = 1;
+		printf("tessera_fs: quota active, limit %ju bytes\n",
+		    (uintmax_t)quota_bytes);
+	}
 	/* `active` aliases sb_a or sb_b — copy completed, free the
 	 * heap-alloc'd staging copies. NULL them out so the fail_close
 	 * cleanup at the bottom (which does `if (sb_a) free(sb_a)`) doesn't
@@ -1950,6 +1971,31 @@ tessera_mount_impl(struct mount *mp)
 		}
 	}
 
+	/* Optional `tessera.quota_bytes=N` — activate a whole-FS quota with
+	 * an N-byte logical limit (tessera-quotas.md). 0/absent = no quota.
+	 * Reject a non-numeric value loudly. */
+	uint64_t quota_bytes = 0;
+	{
+		int q_err;
+		char *q_str = vfs_getopts(mp->mnt_optnew, "tessera.quota_bytes",
+		    &q_err);
+		if (q_err == 0 && q_str != NULL) {
+			uint64_t v = 0;
+			int bad = (*q_str == '\0');
+			for (const char *p = q_str; *p; p++) {
+				if (*p < '0' || *p > '9') { bad = 1; break; }
+				if (v > (UINT64_MAX - 9) / 10) { bad = 1; break; }
+				v = v * 10u + (uint64_t)(*p - '0');
+			}
+			if (bad) {
+				printf("tessera_fs: tessera.quota_bytes=%s rejected "
+				    "(want a non-negative integer)\n", q_str);
+				return (EINVAL);
+			}
+			quota_bytes = v;
+		}
+	}
+
 	NDINIT(&ndp, LOOKUP, FOLLOW | LOCKLEAF, UIO_SYSSPACE, fspec);
 	err = namei(&ndp);
 	if (err != 0) return (err);
@@ -1969,7 +2015,8 @@ tessera_mount_impl(struct mount *mp)
 		return (err);
 	}
 
-	err = tessera_mountfs(devvp, mp, requested_gen, chunk_size_override);
+	err = tessera_mountfs(devvp, mp, requested_gen, chunk_size_override,
+	    quota_bytes);
 	if (err != 0) {
 		vrele(devvp);
 		return (err);
@@ -12043,6 +12090,17 @@ tessera_vop_write(struct vop_write_args *ap)
 	const uint64_t final_size = write_end > ino.size ? write_end : ino.size;
 	if (final_size > TESSERA_WRITE_MAX_BYTES)
 		return (EFBIG);
+
+	/* Quota: reserve the logical growth before doing the write, so the
+	 * write is all-or-nothing against the limit (tessera-quotas.md §3.3).
+	 * A pure overwrite (final_size == ino.size) costs nothing. Reservation
+	 * happens once here, ahead of both the buffered and slow paths.
+	 * Under the vnode lock, so no separate domain lock is needed yet. */
+	if (tmp_->quota_active && final_size > ino.size) {
+		uint64_t delta = final_size - ino.size;
+		if (tessera_quota_reserve(&tmp_->quota_dom, delta) != TESSERA_OK)
+			return (EDQUOT);
+	}
 
 	/* Coalesce small/medium writes into a per-inode RAM buffer so
 	 * the manifest is published once at fsync / flush, not once per
