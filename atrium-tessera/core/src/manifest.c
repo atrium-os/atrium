@@ -499,9 +499,9 @@ tessera_manifest_inline_data(const tessera_manifest_parser_t *p,
 	return TESSERA_OK;
 }
 
-/* Read the idx-th xattr entry (sorted by name). Pointers into the parser's
- * body are returned via *out_name/*out_value (valid for the parser's life);
- * lengths via *out_name_len/*out_value_len. TESSERA_ENOENT past the end,
+/* Read the idx-th xattr entry (sorted by name). The out name and value
+ * pointers reference the parser's body (valid for the parser's life); their
+ * lengths come back via the len out-params. TESSERA_ENOENT past the end,
  * TESSERA_ECORRUPT on a truncated record. */
 int
 tessera_manifest_xattr_at(const tessera_manifest_parser_t *p, uint32_t idx,
