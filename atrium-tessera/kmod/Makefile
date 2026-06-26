@@ -22,6 +22,8 @@ SRCS=       tessera_fs.c \
             extent.c \
             pack.c \
             journal.c \
+            quota.c \
+            quota_store.c \
             vnode_if.h
 
 CFLAGS+=    -I${.CURDIR}/../core/include
