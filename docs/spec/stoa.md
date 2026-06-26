@@ -3,9 +3,13 @@
 Status: **S0–S2 + jail-login + S3a BUILT & verified live** (D2.7). S3a
 (history-only persistence — sessions, layout, cwd, and scrollback survive a
 `stoad` restart + host reboot by respawning shells) is host-verified; the
-production `/atrium-data` volume is declared (VM-verify of provisioning
-pending a reboot). S3b (live-process survival via the broker, §5.5),
-ack-based retransmit, and multi-client are aspirational TODOs.
+production `/atrium-data` volume is declared but **VM-verification is parked**
+on two storage-subsystem prerequisites — the volumes allocator isn't
+commissioned on the dev VM (bootstrap runs with an empty `--volumes-socket`),
+and Tessera `size_max` quota isn't yet enforced (so the scrollback-bloat
+backstop is currently stoad's own retention only). Resume after the Tessera
+quota kmod + volumes commissioning. S3b (live-process survival via the broker,
+§5.5), ack-based retransmit, and multi-client are aspirational TODOs.
 Last updated: 2026-06-26.
 
 > **Implementation status (2026-06-25).** Built in `stoa/` (macOS-first
