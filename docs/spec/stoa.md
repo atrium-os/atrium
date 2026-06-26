@@ -1,10 +1,12 @@
 # Stoa — persistent session service
 
-Status: **S0–S2 + jail-login BUILT & verified live** (D2.7). S3a (history-only
-persistence — survives `stoad` restart + host reboot via respawn) IN PROGRESS;
-S3b (live-process survival via the broker, §5.5), ack-based retransmit, and
-multi-client are aspirational TODOs.
-Last updated: 2026-06-25.
+Status: **S0–S2 + jail-login + S3a BUILT & verified live** (D2.7). S3a
+(history-only persistence — sessions, layout, cwd, and scrollback survive a
+`stoad` restart + host reboot by respawning shells) is host-verified; the
+production `/atrium-data` volume is declared (VM-verify of provisioning
+pending a reboot). S3b (live-process survival via the broker, §5.5),
+ack-based retransmit, and multi-client are aspirational TODOs.
+Last updated: 2026-06-26.
 
 > **Implementation status (2026-06-25).** Built in `stoa/` (macOS-first
 > behind a `ShellSpawner` seam): the wire protocol (`stoa-proto`: MAC'd
