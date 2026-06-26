@@ -3664,6 +3664,19 @@ tessera_vop_setattr(struct vop_setattr_args *ap)
 				did_resize = 1;
 				goto post_resize;
 			}
+			/* Quota: truncate-up reserves the growth (EDQUOT if it
+			 * would exceed the limit); truncate-down releases the
+			 * freed bytes (tessera-quotas.md §5.2-5.3). */
+			if (tmp_->quota_active) {
+				if (new_size > ino.size) {
+					if (tessera_quota_reserve(&tmp_->quota_dom,
+					    new_size - ino.size) != TESSERA_OK)
+						return (EDQUOT);
+				} else {
+					tessera_quota_release(&tmp_->quota_dom,
+					    ino.size - new_size);
+				}
+			}
 			uint8_t *old_buf = NULL;
 			size_t   old_len = 0;
 			if (tessera_fs_read_full_content(tmp_, &ino,
@@ -12792,6 +12805,15 @@ tessera_fs_inode_unlink(struct tessera_mount *tmp_, uint32_t inode_no)
 			return (EIO);
 		tmp_->sb.inode_root = new_root;
 		return (0);
+	}
+	/* Quota: the last name is gone and the inode is being deleted —
+	 * release its logical size back to the domain (tessera-quotas.md
+	 * §5.3). Use the size-overlay inode_get so any unflushed coalesced
+	 * writes are counted, matching what vop_write reserved. */
+	if (tmp_->quota_active) {
+		tessera_inode_record_t live;
+		if (tessera_fs_inode_get(tmp_, inode_no, &live) == TESSERA_OK)
+			tessera_quota_release(&tmp_->quota_dom, live.size);
 	}
 	uint64_t new_root = tmp_->sb.inode_root;
 	if (tessera_fs_inode_delete_byk(tmp_, key,
