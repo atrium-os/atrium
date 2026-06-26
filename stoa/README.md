@@ -69,6 +69,7 @@ with the same `attach` command — same shell, fresh key + seq.
 | Var                 | Meaning |
 |---------------------|---------|
 | `STOA_CTL`          | `stoad` control socket path (mint happens here). Default: per-uid temp path. |
+| `STOA_STATE`        | session-state file — sessions are restored from it on `stoad` start and snapshotted on change, so a `stoad` restart / host reboot brings sessions back (shells respawn; S3a). `off` or empty disables persistence. Default: per-uid temp path. |
 | `STOA_PREFIX`       | override the Ctrl-B prefix, e.g. `C-a` or a decimal byte. |
 | `STOA_SYNC=1`       | **grid-sync streaming** — OUTPUT carries encoded `StateDiff`s painted with `render_diff`; **self-healing** on a flaky link (corrupt → repaint, lost/reordered → resync). Supersedes the predictor. |
 | `STOA_PREDICT=1`    | predictive local echo (raw byte mode only; hides round-trip latency). Mutually exclusive with `STOA_SYNC`. |

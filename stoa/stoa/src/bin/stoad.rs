@@ -35,6 +35,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+use std::path::{Path, PathBuf};
+
+use stoa::persist::{
+    default_state_path, PersistDivider, PersistPane, PersistSession, PersistState, PersistWindow,
+};
 use stoa::{default_ctl, gen_key, seal, to_hex, Control, CONTROL, KEY_LEN, OUTPUT};
 use stoa_proto::{Envelope, MsgType, ReplayWindow};
 use stoa_spawn::{DirectSpawner, PtyShell, ShellSpawner, SpawnSpec, Target};
@@ -77,6 +82,192 @@ fn send_output(udp: &UdpSocket, buf: &[u8], addr: SocketAddr) {
     }
 
     let _ = udp.send_to(buf, addr);
+}
+
+/// Where the session table is persisted (S3a). Set once in `main`; `None`
+/// before that or if persistence is disabled.
+static STATE_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// A pane's shell cwd for respawn-after-restart. Per-OS capture (FreeBSD
+/// `kern.proc.cwd` / macOS libproc) is a follow-up; for now respawn uses the
+/// shell default.
+fn pane_cwd(_p: &Pane) -> Option<String> {
+    None
+}
+
+/// Snapshot the live session table to the persisted [`PersistState`] form.
+/// Walks `reg` then each `inner` (the reg→inner lock order).
+fn snapshot_state(reg: &Reg) -> PersistState {
+    let map = reg.lock().unwrap();
+    let mut sessions = Vec::new();
+    for (name, s) in map.iter() {
+        if s.dead.load(Ordering::SeqCst) {
+            continue;
+        }
+        let inner = s.inner.lock().unwrap();
+        let windows: Vec<PersistWindow> = if inner.started {
+            inner
+                .windows
+                .iter()
+                .map(|w| PersistWindow {
+                    alive: w.alive,
+                    active_pane: w.active_pane,
+                    title: w.active().map(|p| p.term.title().to_string()).unwrap_or_default(),
+                    divider: w.divider.map(|d| match d {
+                        Divider::Vertical(c) => PersistDivider::Vertical(c),
+                        Divider::Horizontal(r) => PersistDivider::Horizontal(r),
+                    }),
+                    panes: w
+                        .panes
+                        .iter()
+                        .map(|p| PersistPane {
+                            alive: p.alive,
+                            top: p.top,
+                            left: p.left,
+                            prows: p.prows,
+                            pcols: p.pcols,
+                            cwd: pane_cwd(p),
+                        })
+                        .collect(),
+                })
+                .collect()
+        } else if let Some(ps) = &inner.restore {
+            ps.windows.clone() // dormant restored session — keep its pending layout
+        } else {
+            continue; // brand-new, never contacted — nothing meaningful yet
+        };
+        sessions.push(PersistSession {
+            name: name.clone(),
+            target: s.target.clone(),
+            cols: inner.cols,
+            rows: inner.rows,
+            active: inner.active,
+            last_active: inner.last_active,
+            windows,
+        });
+    }
+    PersistState { version: stoa::persist::VERSION, sessions }
+}
+
+/// Persist the session table now (no-op if `$STOA_STATE` disabled it). Call
+/// after a structural change, with no session lock held.
+fn persist(reg: &Reg) {
+    let Some(path) = STATE_PATH.get() else { return };
+    let st = snapshot_state(reg);
+    if let Err(e) = st.save_atomic(path) {
+        eprintln!("stoad: persist to {path:?} failed: {e}");
+    }
+}
+
+/// Restore dormant sessions from the persisted state at startup: each saved
+/// session re-exists (its own UDP port + recv_loop), but shells are NOT
+/// spawned — the saved layout is rebuilt + shells respawn on the first client
+/// datagram (like the lazy window-0 spawn). The live processes are gone with
+/// the old `stoad`; this is the history-only guarantee (S3a).
+fn restore_sessions(reg: &Reg, path: &Path) {
+    let st = match PersistState::load(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("stoad: load state {path:?}: {e}");
+            return;
+        }
+    };
+    if st.sessions.is_empty() {
+        return;
+    }
+    let mut count = 0;
+    for ps in st.sessions {
+        let mut map = reg.lock().unwrap();
+        if map.contains_key(&ps.name) {
+            continue;
+        }
+        let udp = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(u) => u,
+            Err(_) => continue,
+        };
+        let port = udp.local_addr().unwrap().port();
+        let (cols, rows) = (ps.cols, ps.rows);
+        let name = ps.name.clone();
+        let state = Arc::new(SessionState {
+            port,
+            target: ps.target.clone(),
+            dead: AtomicBool::new(false),
+            inner: Mutex::new(Inner {
+                key: gen_key(),
+                tx_seq: 0,
+                rx: ReplayWindow::new(),
+                last_addr: None,
+                started: false,
+                cols,
+                rows,
+                windows: Vec::new(),
+                active: ps.active,
+                last_active: ps.last_active,
+                need_snapshot: false,
+                scroll: 0,
+                sync: false,
+                last_sent: stoa_term::Grid::new(cols, rows),
+                restore: Some(ps),
+            }),
+        });
+        map.insert(name.clone(), state.clone());
+        drop(map);
+        let reg2 = reg.clone();
+        thread::spawn(move || recv_loop(name, state, udp, reg2));
+        count += 1;
+    }
+    eprintln!("stoad: restored {count} session(s) from {path:?}");
+}
+
+/// Rebuild a restored session's window/pane layout, respawning a fresh shell
+/// per pane. Tombstone (closed) windows are recreated as empty placeholders so
+/// `Ctrl-B <n>` indices line up with the pre-restart session.
+fn rebuild_from_restore(
+    name: &str,
+    state: &Arc<SessionState>,
+    inner: &mut Inner,
+    udp: &UdpSocket,
+    reg: &Reg,
+    ps: PersistSession,
+) {
+    for pw in &ps.windows {
+        if !pw.alive {
+            inner.windows.push(Window {
+                panes: Vec::new(),
+                active_pane: 0,
+                alive: false,
+                divider: None,
+            });
+            continue;
+        }
+        let Some(widx) = spawn_window(name, state, inner, udp, reg) else { continue };
+        inner.active = widx;
+        // Recreate a 2-pane split, if any.
+        if let Some(div) = pw.divider {
+            let vertical = matches!(div, PersistDivider::Vertical(_));
+            split_active(name, state, inner, udp, reg, vertical);
+        }
+        if let Some(w) = inner.windows.get_mut(widx) {
+            if w.panes.get(pw.active_pane).is_some_and(|p| p.alive) {
+                w.active_pane = pw.active_pane;
+            }
+        }
+    }
+    let last = inner.windows.len().saturating_sub(1);
+    inner.active = ps.active.min(last);
+    inner.last_active = ps.last_active.min(last);
+    // If the saved active landed on a tombstone, fall back to a live window.
+    if !inner.windows.get(inner.active).is_some_and(|w| w.alive) {
+        if let Some(i) = inner.next_live(0) {
+            inner.active = i;
+        }
+    }
+    inner.started = true;
+    inner.need_snapshot = true; // paint the rebuilt screen for the client
+    eprintln!(
+        "stoad: session {name:?} restored {} window(s)",
+        inner.windows.iter().filter(|w| w.alive).count()
+    );
 }
 
 /// One pane: a shell on a pty + a server-side grid mirror + the region it
@@ -263,6 +454,9 @@ struct Inner {
     /// is `StateDiff::between(last_sent, current)`. Reset to blanks to force a
     /// full repaint (attach / redraw).
     last_sent: stoa_term::Grid,
+    /// A restored session's saved layout, rebuilt (shells respawned) on the
+    /// first client datagram instead of a single lazy window-0 (S3a).
+    restore: Option<PersistSession>,
 }
 
 impl Inner {
@@ -391,6 +585,18 @@ fn main() {
     eprintln!("stoad: control on {ctl_path} (mint per-session UDP ports, DirectSpawner)");
 
     let reg: Reg = Arc::new(Mutex::new(HashMap::new()));
+
+    // Session-state persistence (S3a): restore dormant sessions from the last
+    // snapshot, then remember the path for future saves. $STOA_STATE=off (or
+    // empty) disables persistence entirely.
+    let state_path = default_state_path();
+    if state_path.as_os_str().is_empty() || state_path == Path::new("off") {
+        eprintln!("stoad: session persistence disabled");
+    } else {
+        restore_sessions(&reg, &state_path);
+        let _ = STATE_PATH.set(state_path);
+    }
+
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
@@ -442,6 +648,9 @@ fn handle_mint(stream: UnixStream, reg: Reg) {
                 Some(name) => kill_session(&reg, name),
                 None => false,
             };
+            if ok {
+                persist(&reg); // drop the killed session from the snapshot
+            }
             let _ = (&stream).write_all(if ok { b"OK\n" } else { b"ERR not found\n" });
         }
         _ => {
@@ -459,13 +668,30 @@ fn list_sessions(reg: &Reg) -> Vec<(String, usize, String)> {
         .filter(|(_, s)| !s.dead.load(Ordering::SeqCst))
         .map(|(n, s)| {
             let inner = s.inner.lock().unwrap();
-            let nwin = inner.windows.iter().filter(|w| w.alive).count().max(1);
-            let title = inner
-                .windows
-                .get(inner.active)
-                .and_then(|w| w.active())
-                .map(|p| p.term.title().replace(['\t', '\n'], " "))
-                .unwrap_or_default();
+            // A dormant restored session reports its pending layout (it hasn't
+            // been reattached yet, so its live windows are empty).
+            let (nwin, title) = if !inner.started {
+                if let Some(ps) = &inner.restore {
+                    let nwin = ps.windows.iter().filter(|w| w.alive).count().max(1);
+                    let title = ps
+                        .windows
+                        .get(ps.active)
+                        .map(|w| w.title.replace(['\t', '\n'], " "))
+                        .unwrap_or_default();
+                    (nwin, title)
+                } else {
+                    (1, String::new())
+                }
+            } else {
+                let nwin = inner.windows.iter().filter(|w| w.alive).count().max(1);
+                let title = inner
+                    .windows
+                    .get(inner.active)
+                    .and_then(|w| w.active())
+                    .map(|p| p.term.title().replace(['\t', '\n'], " "))
+                    .unwrap_or_default();
+                (nwin, title)
+            };
             (n.clone(), nwin, title)
         })
         .collect();
@@ -540,6 +766,7 @@ fn mint(reg: &Reg, name: &str, target: &str) -> (u16, [u8; KEY_LEN]) {
             scroll: 0,
             sync: false,
             last_sent: stoa_term::Grid::new(80, 24),
+            restore: None,
         }),
     });
     map.insert(name.to_string(), state.clone());
@@ -569,6 +796,9 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
         // Decode + admit under the lock (the key may be rekeyed by a
         // concurrent mint). Produce the post-unlock action + any snapshot.
         let mut snapshot: Option<(SocketAddr, Vec<u8>)> = None;
+        // Set when this datagram changed persisted structure (windows/panes/
+        // layout/active/size) → snapshot the session table after unlocking.
+        let mut structural = false;
         let action: Option<(MsgType, Option<i32>, Vec<u8>)> = {
             let mut inner = state.inner.lock().unwrap();
             match Envelope::decode(&inner.key, &buf[..n]) {
@@ -595,6 +825,7 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
                                     if inner.sync && inner.started {
                                         inner.need_snapshot = true;
                                     }
+                                    structural = true; // size persists
                                 }
                                 // Redraw → repaint the active window from its
                                 // mirror (the snapshot block fires below).
@@ -610,15 +841,20 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
                                             spawn_window(&name, &state, &mut inner, &udp, &reg)
                                         {
                                             inner.set_active(idx);
+                                            structural = true;
                                         }
                                     }
                                 }
                                 // Ctrl-B <n> — switch to window n if it's live.
-                                Some(Control::SwitchWindow(n)) => inner.set_active(n as usize),
+                                Some(Control::SwitchWindow(n)) => {
+                                    inner.set_active(n as usize);
+                                    structural = true;
+                                }
                                 // Ctrl-B n / p — next / previous live window.
                                 Some(Control::NextWindow) => {
                                     if let Some(idx) = inner.next_live(inner.active + 1) {
                                         inner.set_active(idx);
+                                        structural = true;
                                     }
                                 }
                                 Some(Control::PrevWindow) => {
@@ -626,6 +862,7 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
                                     if n > 0 {
                                         if let Some(idx) = inner.prev_live((inner.active + n - 1) % n) {
                                             inner.set_active(idx);
+                                            structural = true;
                                         }
                                     }
                                 }
@@ -633,20 +870,26 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
                                 Some(Control::LastWindow) => {
                                     let la = inner.last_active;
                                     inner.set_active(la);
+                                    structural = true;
                                 }
                                 // Ctrl-B % / " — split the active window.
                                 Some(Control::SplitVertical) => {
                                     if inner.started {
                                         split_active(&name, &state, &mut inner, &udp, &reg, true);
+                                        structural = true;
                                     }
                                 }
                                 Some(Control::SplitHorizontal) => {
                                     if inner.started {
                                         split_active(&name, &state, &mut inner, &udp, &reg, false);
+                                        structural = true;
                                     }
                                 }
                                 // Ctrl-B o — switch pane.
-                                Some(Control::PaneSwitch) => pane_switch(&mut inner),
+                                Some(Control::PaneSwitch) => {
+                                    pane_switch(&mut inner);
+                                    structural = true;
+                                }
                                 // Client opts into grid-sync: OUTPUT becomes
                                 // encoded StateDiffs. Force a full repaint.
                                 Some(Control::SyncMode) => {
@@ -685,12 +928,23 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
                             inner.scroll = 0;
                             inner.need_snapshot = true;
                         }
-                        // Lazy spawn of window 0 on the first datagram.
+                        // First datagram: rebuild a restored layout, else lazy
+                        // spawn window 0.
                         if !inner.started {
+                          if let Some(ps) = inner.restore.take() {
+                            rebuild_from_restore(&name, &state, &mut inner, &udp, &reg, ps);
+                            structural = true;
+                            if inner.windows.iter().all(|w| !w.alive) {
+                                // Every restored window failed to respawn — end
+                                // the session rather than leave it empty.
+                                state.dead.store(true, Ordering::SeqCst);
+                            }
+                          } else {
                             match spawn_window(&name, &state, &mut inner, &udp, &reg) {
                                 Some(idx) => {
                                     inner.active = idx;
                                     inner.started = true;
+                                    structural = true;
                                 }
                                 None => {
                                     // window 0 failed → end the session (so the
@@ -708,6 +962,7 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
                                     state.dead.store(true, Ordering::SeqCst);
                                 }
                             }
+                          }
                         }
                         // Snapshot the active window when requested (reattach,
                         // redraw, window switch/new, return-to-live). Any live
@@ -729,6 +984,10 @@ fn recv_loop(name: String, state: Arc<SessionState>, udp: UdpSocket, reg: Reg) {
         }
         if let Some((MsgType::Input, Some(fd), payload)) = action {
             write_all_fd(fd, &payload);
+        }
+        // Persist after the session lock is released (reg→inner order).
+        if structural {
+            persist(&reg);
         }
     }
 }
@@ -1091,6 +1350,8 @@ fn reader(name: String, win_idx: usize, pane_idx: usize, pty_fd: i32, state: Arc
                 }
                 CloseOutcome::Nothing => {}
             }
+            // A window/pane closing (or the session ending) changes structure.
+            persist(&reg);
             return;
         }
         let bytes = &buf[..n as usize];

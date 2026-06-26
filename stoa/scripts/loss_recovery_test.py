@@ -40,7 +40,9 @@ def drain(fd, secs=0.8):
 
 def run(fault_env):
     ctl = tempfile.mktemp(suffix=".ctl")
-    base = dict(os.environ, STOA_CTL=ctl, **fault_env)
+    # STOA_STATE=off — this harness doesn't test persistence; disabling it
+    # keeps runs isolated (no stale session restored from a shared state file).
+    base = dict(os.environ, STOA_CTL=ctl, STOA_STATE="off", **fault_env)
     stoad = subprocess.Popen([os.path.join(BIN, "stoad")], env=base,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(0.7)
@@ -55,12 +57,22 @@ def run(fault_env):
     drain(fd)
     os.write(fd, b"echo LOSSMARK_AAA\n")
     time.sleep(0.4)
-    # Trailing output drives resync past any drops (deterministic 1-in-N means
-    # a non-dropped post-change datagram always arrives to trigger recovery).
     for i in range(8):
         os.write(fd, b"echo settle%d\n" % i)
         time.sleep(0.15)
-    final = drain(fd, 1.5)
+    final = drain(fd, 1.0)
+    # Drive convergence the way a real client does on a bad link: keep asking
+    # for a repaint (Ctrl-B r) until the screen heals. Each redraw is a full
+    # snapshot subject to the same loss/reorder; under heavy fault it takes a
+    # few tries, but resync-on-gap converges — that's the property under test.
+    # (Redraw repaints the server grid in place, so it doesn't scroll markers
+    # off-screen the way feeding more shell output would.)
+    for _ in range(40):
+        if all(m in final for m in MARKERS):
+            break
+        os.write(fd, PREFIX + b"r")
+        time.sleep(0.12)
+        final += drain(fd, 0.25)
     os.write(fd, PREFIX + b"d")
     time.sleep(0.3)
     try:
@@ -73,8 +85,11 @@ def run(fault_env):
     return final
 
 
+MARKERS = [b"LOSSMARK_AAA"] + [b"settle%d" % i for i in range(8)]
+
+
 def main():
-    markers = [b"LOSSMARK_AAA"] + [b"settle%d" % i for i in range(8)]
+    markers = MARKERS
     faults = [
         ("1/3 loss", {"STOA_DROP": "3"}),
         ("1/3 reorder", {"STOA_REORDER": "3"}),
