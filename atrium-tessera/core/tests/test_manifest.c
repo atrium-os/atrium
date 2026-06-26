@@ -237,16 +237,58 @@ test_einval_etoobig(void)
 	tessera_manifest_free(b);
 }
 
+static void
+test_xattr(void)
+{
+	tessera_manifest_builder_t *b =
+	    tessera_manifest_begin(TESSERA_MFT_XATTR_STORE);
+	CHECK(b != NULL);
+	/* Add out of order; must come back sorted. Replace "user.b". */
+	CHECK(tessera_manifest_add_xattr(b, "user.b", 6,
+	    (const uint8_t *)"BBB", 3) == TESSERA_OK);
+	CHECK(tessera_manifest_add_xattr(b, "user.a", 6,
+	    (const uint8_t *)"alpha", 5) == TESSERA_OK);
+	CHECK(tessera_manifest_add_xattr(b, "user.c", 6,
+	    (const uint8_t *)"", 0) == TESSERA_OK);   /* empty value ok */
+	CHECK(tessera_manifest_add_xattr(b, "user.b", 6,
+	    (const uint8_t *)"beta!", 5) == TESSERA_OK);  /* replace */
+
+	uint8_t buf[4096];
+	size_t sz;
+	tessera_hash_t h;
+	CHECK(tessera_manifest_finalize(b, buf, sizeof buf, &sz, h) == TESSERA_OK);
+	tessera_manifest_free(b);
+
+	tessera_manifest_parser_t *p = tessera_manifest_parse(buf, sz);
+	CHECK(p != NULL);
+	CHECK(tessera_manifest_parser_kind(p) == TESSERA_MFT_XATTR_STORE);
+	CHECK(tessera_manifest_parser_count(p) == 3);   /* replace, not add */
+
+	const char *nm; uint16_t nl; const uint8_t *vv; uint16_t vl;
+	/* sorted: a, b (replaced), c */
+	CHECK(tessera_manifest_xattr_at(p, 0, &nm, &nl, &vv, &vl) == TESSERA_OK);
+	CHECK(nl == 6 && memcmp(nm, "user.a", 6) == 0 && vl == 5 &&
+	    memcmp(vv, "alpha", 5) == 0);
+	CHECK(tessera_manifest_xattr_at(p, 1, &nm, &nl, &vv, &vl) == TESSERA_OK);
+	CHECK(nl == 6 && memcmp(nm, "user.b", 6) == 0 && vl == 5 &&
+	    memcmp(vv, "beta!", 5) == 0);   /* replaced value */
+	CHECK(tessera_manifest_xattr_at(p, 2, &nm, &nl, &vv, &vl) == TESSERA_OK);
+	CHECK(nl == 6 && memcmp(nm, "user.c", 6) == 0 && vl == 0);
+	CHECK(tessera_manifest_xattr_at(p, 3, &nm, &nl, &vv, &vl) == TESSERA_ENOENT);
+	tessera_manifest_parser_free(p);
+}
+
 int
 main(void)
 {
 	printf("test_manifest: builder + parser round-trips for INLINE / CHUNK_LIST / "
-	       "CHUNK_TREE / SYMLINK / DIRECTORY\n");
+	       "CHUNK_TREE / SYMLINK / DIRECTORY / XATTR\n");
 	test_inline();
 	test_chunk_list();
 	test_chunk_tree();
 	test_symlink();
 	test_directory_sorted();
+	test_xattr();
 	test_einval_etoobig();
 	if (failures > 0) {
 		fprintf(stderr, "%d failure(s)\n", failures);

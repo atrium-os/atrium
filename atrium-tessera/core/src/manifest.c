@@ -258,6 +258,61 @@ tessera_manifest_add_dirent(tessera_manifest_builder_t *b,
 	return TESSERA_OK;
 }
 
+/* XATTR_STORE (tessera-vfs §6.1) — body is a stream of entries, kept
+ * SORTED by name for stable listxattr + O(log n)-ish lookup. Each entry:
+ *   [u16 name_len][u16 value_len][name bytes][value bytes]
+ * v1 stores values inline (≤4096); larger-value blob-hash form is later.
+ * add replaces an entry with the same name. */
+int
+tessera_manifest_add_xattr(tessera_manifest_builder_t *b,
+                           const char *name, size_t name_len,
+                           const uint8_t *value, size_t value_len)
+{
+	if (b == NULL || name == NULL) return TESSERA_EINVAL;
+	if (b->kind != TESSERA_MFT_XATTR_STORE) return TESSERA_EINVAL;
+	if (name_len == 0 || name_len > TESSERA_XATTR_NAME_MAX)
+		return TESSERA_EINVAL;
+	if (value_len > 4096) return TESSERA_ETOOBIG;   /* v1: inline only */
+	if (value_len > 0 && value == NULL) return TESSERA_EINVAL;
+
+	const size_t hdr = 4;   /* u16 name_len + u16 value_len */
+
+	/* Find the sorted insertion point; if the name already exists, splice
+	 * the old entry out first (replace semantics). */
+	size_t pos = 0;
+	while (pos < b->body_len) {
+		uint16_t nl, vl;
+		memcpy(&nl, b->body + pos, 2);
+		memcpy(&vl, b->body + pos + 2, 2);
+		const uint8_t *nm = b->body + pos + hdr;
+		size_t cmp_len = nl < name_len ? nl : name_len;
+		int c = memcmp(nm, name, cmp_len);
+		if (c == 0 && nl == name_len) {
+			size_t old = hdr + nl + vl;
+			memmove(b->body + pos, b->body + pos + old,
+			    b->body_len - pos - old);
+			b->body_len -= old;
+			b->entry_count--;
+			break;   /* pos is now the insertion point */
+		}
+		if (c > 0 || (c == 0 && nl > name_len)) break;
+		pos += hdr + nl + vl;
+	}
+
+	const size_t add = hdr + name_len + value_len;
+	if (body_reserve(b, b->body_len + add) != 0) return TESSERA_ENOMEM;
+	memmove(b->body + pos + add, b->body + pos, b->body_len - pos);
+	uint16_t nl16 = (uint16_t)name_len, vl16 = (uint16_t)value_len;
+	memcpy(b->body + pos, &nl16, 2);
+	memcpy(b->body + pos + 2, &vl16, 2);
+	memcpy(b->body + pos + hdr, name, name_len);
+	if (value_len > 0)
+		memcpy(b->body + pos + hdr + name_len, value, value_len);
+	b->body_len += add;
+	b->entry_count++;
+	return TESSERA_OK;
+}
+
 /* DIRECTORY_BTREE — body layout is [u8 leaf_flag][u8 reserved×3]
  * [u32 reserved] then a stream of records. Builder appends bytes
  * verbatim; caller is responsible for adding records in ascending
@@ -442,6 +497,38 @@ tessera_manifest_inline_data(const tessera_manifest_parser_t *p,
 	*out_data = p->body;
 	*out_len  = p->body_len;
 	return TESSERA_OK;
+}
+
+/* Read the idx-th xattr entry (sorted by name). Pointers into the parser's
+ * body are returned via *out_name/*out_value (valid for the parser's life);
+ * lengths via *out_name_len/*out_value_len. TESSERA_ENOENT past the end,
+ * TESSERA_ECORRUPT on a truncated record. */
+int
+tessera_manifest_xattr_at(const tessera_manifest_parser_t *p, uint32_t idx,
+                          const char **out_name, uint16_t *out_name_len,
+                          const uint8_t **out_value, uint16_t *out_value_len)
+{
+	if (p == NULL) return TESSERA_EINVAL;
+	if (p->header.manifest_kind != TESSERA_MFT_XATTR_STORE)
+		return TESSERA_EINVAL;
+	size_t pos = 0;
+	for (uint32_t i = 0; pos < p->body_len; i++) {
+		if (pos + 4 > p->body_len) return TESSERA_ECORRUPT;
+		uint16_t nl, vl;
+		memcpy(&nl, p->body + pos, 2);
+		memcpy(&vl, p->body + pos + 2, 2);
+		if (pos + 4 + (size_t)nl + (size_t)vl > p->body_len)
+			return TESSERA_ECORRUPT;
+		if (i == idx) {
+			if (out_name)      *out_name = (const char *)(p->body + pos + 4);
+			if (out_name_len)  *out_name_len = nl;
+			if (out_value)     *out_value = p->body + pos + 4 + nl;
+			if (out_value_len) *out_value_len = vl;
+			return TESSERA_OK;
+		}
+		pos += 4 + (size_t)nl + (size_t)vl;
+	}
+	return TESSERA_ENOENT;
 }
 
 void

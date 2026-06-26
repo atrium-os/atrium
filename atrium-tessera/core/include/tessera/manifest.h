@@ -52,6 +52,12 @@ int tessera_manifest_add_dirent(tessera_manifest_builder_t *,
                                 uint64_t child_inode,
                                 const char *name, size_t name_len);
 
+/* XATTR_STORE entries (tessera-vfs §6.1). Sorted by name; add replaces a
+ * same-named entry. Values are inline (≤4096 in v1). */
+int tessera_manifest_add_xattr(tessera_manifest_builder_t *,
+                               const char *name, size_t name_len,
+                               const uint8_t *value, size_t value_len);
+
 /* DIRECTORY_2L entries — outer-manifest bucket descriptors. */
 int tessera_manifest_add_dir_bucket(tessera_manifest_builder_t *,
                                     uint64_t first_name_hash,
@@ -117,6 +123,12 @@ int tessera_manifest_dir_bucket_at(const tessera_manifest_parser_t *,
 /* Read inline content from an INLINE manifest. */
 int tessera_manifest_inline_data(const tessera_manifest_parser_t *,
                                  const uint8_t **out_data, size_t *out_len);
+
+/* Read the idx-th xattr entry from an XATTR_STORE manifest (sorted by name);
+ * out pointers reference the parser body. ENOENT past the end. */
+int tessera_manifest_xattr_at(const tessera_manifest_parser_t *, uint32_t idx,
+                              const char **out_name, uint16_t *out_name_len,
+                              const uint8_t **out_value, uint16_t *out_value_len);
 
 void tessera_manifest_parser_free(tessera_manifest_parser_t *);
 
