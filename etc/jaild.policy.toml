@@ -164,6 +164,9 @@ allowed_keys = [
     # stoad's control-socket path (points into its own /atrium/sockets
     # mount). STOA_BROKER defaults correctly so it needs no env.
     "STOA_CTL",
+    # stoad's persistent session-state dir (points into its own /atrium-data
+    # data volume). Where session metadata + scrollback are persisted (S3a).
+    "STOA_STATE",
 ]
 allowed_prefixes = [
     "ATRIUM_",        # all Atrium-namespaced vars

@@ -49,6 +49,21 @@ source = "/atrium/sockets"                         # rw: bind its ctl socket + r
 dest   = "atrium/sockets"
 kind   = "rw_nullfs"
 
+# Persistent session state (S3a): metadata + scrollback survive a stoad
+# restart / host reboot. atrium-volumes provisions this at
+# /var/lib/atrium/storage/jails/atrium-stoad/data (Tessera-backed by default →
+# content-addressing/dedup/integrity/GC come from the volume, so stoad just
+# does plain file I/O); jaild mounts it rw at /atrium-data. mode 0700 / owned
+# by _stoad — scrollback can hold sensitive terminal content, so it is the
+# daemon's private store, owner-subdivided per session inside.
+[[volumes]]
+name      = "data"
+kind      = "persistent"
+mount_at  = "/atrium-data"
+mode      = 448            # 0o700
+owner_uid = 50094          # _stoad
+owner_gid = 50094
+
 [exec]
 path = "/usr/local/bin/atrium-stoad"   # atrium- prefix required by policy.exec_paths
 argv = ["atrium-stoad"]
@@ -57,6 +72,9 @@ gid  = 50094
 [[exec.env]]
 key   = "STOA_CTL"                                 # ctl socket in the shared dir (reachable by stoa-shell)
 value = "/atrium/sockets/stoad/stoad.ctl"          # STOA_BROKER defaults to /atrium/sockets/portcullis.sock
+[[exec.env]]
+key   = "STOA_STATE"                               # persist session metadata + scrollback here (the data volume)
+value = "/atrium-data"
 # Optional: STOA_SESSION_JAIL = <jail name> routes a plain `attach <name>`
 # (no --jail) through the broker into that jail. Unset (as here): a jailed
 # stoad REFUSES the session target rather than forkpty-ing a shell in its
