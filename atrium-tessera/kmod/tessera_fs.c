@@ -11466,9 +11466,15 @@ tessera_fs_dirent_log_checkpoint_parent(struct tessera_mount *tmp_,
 {
 	if (!tmp_->dirty_init) return (0);
 
-	/* Snapshot + remove the log entries for this parent. */
+	/* Snapshot + remove the log entries for this parent. Pre-size the
+	 * buffer to the current total log count (a safe upper bound on any
+	 * single parent's entries) BEFORE taking flush_mtx, so the common
+	 * path never reallocates under the lock — malloc(M_WAITOK) is
+	 * forbidden there (it may sleep and deadlock against flush_mtx). */
 	struct tessera_dirent_log_entry **logents = NULL;
 	uint32_t logcount = 0, logcap = 32;
+	if (tmp_->dirent_log_count > logcap)
+		logcap = tmp_->dirent_log_count;
 	logents = malloc(logcap * sizeof *logents, M_TESSERA, M_WAITOK);
 
 	mtx_lock(&tmp_->flush_mtx);
@@ -11477,9 +11483,16 @@ tessera_fs_dirent_log_checkpoint_parent(struct tessera_mount *tmp_,
 	LIST_FOREACH_SAFE(e, &tmp_->dirent_log[b], link, next) {
 		if (e->parent_inode_no != parent_inode_no) continue;
 		if (logcount == logcap) {
+			/* Rare: entries were appended after we sized the
+			 * buffer. Grow with M_NOWAIT — sleeping under
+			 * flush_mtx would deadlock. If it fails, stop
+			 * collecting; the remaining entries stay in the log
+			 * and are picked up by the next checkpoint (seq
+			 * order is preserved across batches). */
 			uint32_t nc = logcap * 2;
 			struct tessera_dirent_log_entry **nx =
-			    malloc(nc * sizeof *nx, M_TESSERA, M_WAITOK);
+			    malloc(nc * sizeof *nx, M_TESSERA, M_NOWAIT);
+			if (nx == NULL) break;
 			memcpy(nx, logents, logcount * sizeof *logents);
 			free(logents, M_TESSERA);
 			logents = nx;
@@ -11651,8 +11664,14 @@ tessera_fs_dirent_log_checkpoint_all(struct tessera_mount *tmp_)
 {
 	if (!tmp_->dirty_init) return (0);
 
-	/* Collect unique parent inode_nos under flush_mtx. */
+	/* Collect unique parent inode_nos under flush_mtx. Pre-size the
+	 * buffer to the current total log count (a safe upper bound on the
+	 * number of unique parents) BEFORE taking the lock, so the common
+	 * path never reallocates under flush_mtx, where malloc(M_WAITOK) is
+	 * forbidden (it may sleep and deadlock). */
 	uint32_t cap = 32, count = 0;
+	if (tmp_->dirent_log_count > cap)
+		cap = tmp_->dirent_log_count;
 	uint32_t *parents = malloc(cap * sizeof *parents, M_TESSERA, M_WAITOK);
 
 	mtx_lock(&tmp_->flush_mtx);
@@ -11667,9 +11686,15 @@ tessera_fs_dirent_log_checkpoint_all(struct tessera_mount *tmp_)
 			}
 			if (already) continue;
 			if (count == cap) {
+				/* Rare: grow with M_NOWAIT (flush_mtx held).
+				 * On failure, stop collecting; uncollected
+				 * parents are checkpointed on the next
+				 * flush — their log entries remain queued. */
 				uint32_t nc = cap * 2;
 				uint32_t *np = malloc(nc * sizeof *np,
-				    M_TESSERA, M_WAITOK);
+				    M_TESSERA, M_NOWAIT);
+				if (np == NULL)
+					goto collected;
 				memcpy(np, parents, count * sizeof *np);
 				free(parents, M_TESSERA);
 				parents = np;
@@ -11678,6 +11703,7 @@ tessera_fs_dirent_log_checkpoint_all(struct tessera_mount *tmp_)
 			parents[count++] = e->parent_inode_no;
 		}
 	}
+collected:
 	mtx_unlock(&tmp_->flush_mtx);
 
 	int rc = 0;
