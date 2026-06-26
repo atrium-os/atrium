@@ -16,6 +16,20 @@
 
 #ifdef TESSERA_KERNEL
 #  include <crypto/sha2/sha256.h>
+#elif defined(__APPLE__)
+   /*
+    * macOS host build (dev/test only — FreeBSD is the real target).
+    * libmd's <sha256.h> isn't in the base SDK, but CommonCrypto's
+    * SHA-256 is built into libSystem (no install, HW-accelerated). Map
+    * the libmd-shaped API the rest of this file uses onto CC_SHA256_*:
+    * the (digest, ctx) argument order matches; CC_SHA256_Update takes a
+    * CC_LONG (u32) length, which is fine for Tessera's bounded chunks.
+    */
+#  include <CommonCrypto/CommonDigest.h>
+#  define SHA256_CTX               CC_SHA256_CTX
+#  define SHA256_Init              CC_SHA256_Init
+#  define SHA256_Update(c, d, n)   CC_SHA256_Update((c), (d), (CC_LONG)(n))
+#  define SHA256_Final             CC_SHA256_Final
 #else
 #  include <sha256.h>      /* libmd, FreeBSD base — HW-accelerated */
 #endif
