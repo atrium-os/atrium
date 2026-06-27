@@ -309,7 +309,7 @@ exec "$QEMU" \
     -drive if=pflash,format=raw,unit=0,file="$EFI_PAD",readonly=on \
     -drive if=pflash,format=raw,unit=1,file="$EFI_VARS" \
     -drive if=virtio,file="$DISK",format=qcow2,cache=writeback \
-    -drive file="$BSD_DIR/vm/crash-test.img",format=raw,cache=writeback,if=none,id=crashdrv \
+    -drive file="$BSD_DIR/vm/crash-test.img",format=raw,cache=directsync,if=none,id=crashdrv \
     -device virtio-blk-pci,drive=crashdrv,serial=tessera-crashtest,config-wce=on \
     -drive file="$BSD_DIR/vm/tessera-storage.img",format=raw,cache=writeback,if=none,id=storagedrv \
     -device virtio-blk-pci,drive=storagedrv,serial=atrium-storage,config-wce=on \
