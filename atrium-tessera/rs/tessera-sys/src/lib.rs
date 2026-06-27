@@ -371,4 +371,5 @@ extern "C" {
     pub fn tessera_volume_pack_zone_length   (v: *const tessera_volume_t) -> u64;
     pub fn tessera_volume_encryption_flags   (v: *const tessera_volume_t) -> u16;
     pub fn tessera_volume_active_slot_count  (v: *const tessera_volume_t) -> u8;
+    pub fn tessera_volume_quota_tree_root    (v: *const tessera_volume_t) -> u64;
 }

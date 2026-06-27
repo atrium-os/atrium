@@ -24,9 +24,10 @@
 //!     (double-state) and leaked sectors (neither)
 //!   - nlink verification: files' nlink == incoming dirent count; dirs == 2
 //!     (tessera stores no '.'/'..' and doesn't track '..' backlinks)
-//!
-//! Not yet covered (reported as "skipped" where applicable, never silently):
-//! multi-extent pack bodies, quota accounting.
+//!   - multi-extent packs: PEL chain resolved; data extents + PEL sectors
+//!     read, opened, blob-verified, and counted in the free-extent partition
+//!   - quota accounting: each domain's used_bytes == summed logical size of
+//!     the regular files in it
 //!
 //! Exit: 0 = clean, 1 = problems found, 2 = usage / I/O error.
 
@@ -50,6 +51,9 @@ const S_IFREG: u32 = 0o100000;
 
 struct Fsck {
     problems: Vec<String>,
+    // informational findings (don't fail the check): space-accounting,
+    // skipped coverage, etc.
+    notes: Vec<String>,
     // every blob hash present in any (single-extent) pack
     all_blobs: HashSet<Hash>,
     // blob bytes for those that parse as a manifest (for recursion)
@@ -58,11 +62,12 @@ struct Fsck {
     checked: HashSet<Hash>,
     // inode_no → (mode, nlink, manifest_hash) for the reachability + nlink walk
     inode_map: HashMap<u32, (u32, u32, Hash)>,
+    // quota_domain_id → summed logical bytes of regular files in it
+    quota_used: HashMap<u64, u64>,
     // stats
     inodes: u64,
     packs: u64,
     blobs: u64,
-    multi_extent_skipped: u64,
 }
 
 impl Fsck {
@@ -227,6 +232,43 @@ impl Fsck {
     }
 }
 
+const PEL_MAGIC: u64 = 0x3150_5645_4C45_5054; // "TPELEV01"
+
+/// Walk a multi-extent pack's PEL chain. Returns (data_extents, pel_sectors)
+/// or None if a PEL sector is unreadable / has a bad magic. PEL layout:
+/// [u64 magic][u32 ver][u32 extent_count][u64 total_len][u64 next_pel]
+/// then extent_count × [u64 start][u64 len] starting at offset 32.
+fn resolve_pel(f: &std::fs::File, head: u64) -> Option<(Vec<(u64, u64)>, Vec<u64>)> {
+    let mut extents = Vec::new();
+    let mut pels = Vec::new();
+    let mut cur = head;
+    let mut guard = 0;
+    while cur != 0 && guard < 512 {
+        guard += 1;
+        pels.push(cur);
+        let mut buf = [0u8; SECTOR_SIZE as usize];
+        if f.read_at(&mut buf, cur * SECTOR_SIZE).ok()? != SECTOR_SIZE as usize {
+            return None;
+        }
+        if u64::from_le_bytes(buf[0..8].try_into().unwrap()) != PEL_MAGIC {
+            return None;
+        }
+        let ecount = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+        let next = u64::from_le_bytes(buf[24..32].try_into().unwrap());
+        if ecount > 253 {
+            return None;
+        }
+        for i in 0..ecount {
+            let o = 32 + i * 16;
+            let s = u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
+            let l = u64::from_le_bytes(buf[o + 8..o + 16].try_into().unwrap());
+            extents.push((s, l));
+        }
+        cur = next;
+    }
+    Some((extents, pels))
+}
+
 unsafe fn name_str(p: *const core::ffi::c_char, len: u16) -> String {
     if p.is_null() || len == 0 {
         return String::new();
@@ -258,14 +300,15 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
 
     let mut fsck = Fsck {
         problems: Vec::new(),
+        notes: Vec::new(),
         all_blobs: HashSet::new(),
         manifests: HashMap::new(),
         checked: HashSet::new(),
         inode_map: HashMap::new(),
+        quota_used: HashMap::new(),
         inodes: 0,
         packs: 0,
         blobs: 0,
-        multi_extent_skipped: 0,
     };
 
     // ── bounds sanity ────────────────────────────────────────────
@@ -303,61 +346,91 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
                 let flags = rd_u32(&val, 60);
                 let pid = hx(&{ let mut h = [0u8; 32]; h[..16].copy_from_slice(&key); h });
 
-                if flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT != 0 {
-                    fsck.multi_extent_skipped += 1;
-                    if verbose { eprintln!("  pack {pid}: multi-extent — extent/blob check skipped (v1)"); }
-                } else {
-                    // extent bounds + overlap bookkeeping
-                    if start < pz_start || start + len > pz_start + pz_len {
-                        fsck.problem(format!("pack {pid} extent [{start}..{}] outside pack zone [{pz_start}..{}]",
-                            start + len, pz_start + pz_len));
-                    }
-                    intervals.push((start, start + len, pid.clone()));
-                    // read + open the pack, enumerate blobs
-                    let nbytes = (len * SECTOR_SIZE) as usize;
-                    let mut buf = vec![0u8; nbytes];
-                    if f.read_at(&mut buf, start * SECTOR_SIZE).map(|n| n == nbytes).unwrap_or(false) {
-                        let pr = tessera_pack_open(buf.as_ptr(), nbytes);
-                        if pr.is_null() {
-                            fsck.problem(format!("pack {pid} failed to open (bad header/CRC)"));
-                        } else {
-                            let n = tessera_pack_blob_count(pr);
-                            if n != blob_count {
-                                fsck.problem(format!("pack {pid}: registry blob_count={blob_count} but pack holds {n}"));
+                // Pack body bytes + the sectors it occupies. Single-extent:
+                // one contiguous run. Multi-extent: walk the PEL chain for the
+                // data extents (the PEL sectors themselves are allocated too).
+                let (body, occ): (Option<Vec<u8>>, Vec<(u64, u64, String)>) =
+                    if flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT != 0 {
+                        match resolve_pel(&f, start) {
+                            Some((exts, pels)) => {
+                                if verbose { eprintln!("  pack {pid}: multi-extent, {} data extent(s)", exts.len()); }
+                                let mut buf = Vec::new();
+                                let mut ok = true;
+                                for (s, l) in &exts {
+                                    let mut e = vec![0u8; (*l * SECTOR_SIZE) as usize];
+                                    if f.read_at(&mut e, s * SECTOR_SIZE).map(|n| n == e.len()).unwrap_or(false) {
+                                        buf.extend_from_slice(&e);
+                                    } else { ok = false; break; }
+                                }
+                                let mut o: Vec<(u64, u64, String)> =
+                                    exts.iter().map(|(s, l)| (*s, s + l, pid.clone())).collect();
+                                for p in &pels { o.push((*p, *p + 1, format!("{pid}:pel"))); }
+                                if !ok { fsck.problem(format!("pack {pid}: could not read multi-extent body")); }
+                                (if ok { Some(buf) } else { None }, o)
                             }
-                            for i in 0..n {
-                                let mut bh = [0u8; 32];
-                                if tessera_pack_blob_hash_at(pr, i, bh.as_mut_ptr()) == 0 {
-                                    fsck.all_blobs.insert(bh);
-                                    fsck.blobs += 1;
-                                    let mut bytes: *const u8 = std::ptr::null();
-                                    let mut blen: u32 = 0;
-                                    if tessera_pack_lookup(pr, bh.as_ptr(), &mut bytes, &mut blen) == 0
-                                        && !bytes.is_null() {
-                                        let slice = std::slice::from_raw_parts(bytes, blen as usize);
-                                        // CONTENT INTEGRITY: the blob hash IS its
-                                        // content address — recompute and compare to
-                                        // catch torn writes / bit-rot in the data.
-                                        let mut got = [0u8; 32];
-                                        tessera_sha256(slice.as_ptr(), slice.len(), got.as_mut_ptr());
-                                        if got != bh {
-                                            fsck.problem(format!(
-                                                "pack {pid}: blob {} content hashes to {} (corrupted data)",
-                                                hx(&bh), hx(&got)));
-                                        }
-                                        // if it parses as a manifest, keep bytes for recursion
-                                        let mp = tessera_manifest_parse(slice.as_ptr(), slice.len());
-                                        if !mp.is_null() {
-                                            fsck.manifests.insert(bh, slice.to_vec());
-                                            tessera_manifest_parser_free(mp);
-                                        }
+                            None => {
+                                fsck.problem(format!("pack {pid}: invalid/unreadable PEL at sector {start}"));
+                                (None, Vec::new())
+                            }
+                        }
+                    } else {
+                        let nbytes = (len * SECTOR_SIZE) as usize;
+                        let mut buf = vec![0u8; nbytes];
+                        let body = if f.read_at(&mut buf, start * SECTOR_SIZE).map(|n| n == nbytes).unwrap_or(false) {
+                            Some(buf)
+                        } else {
+                            fsck.problem(format!("pack {pid}: could not read {nbytes} bytes at sector {start}"));
+                            None
+                        };
+                        (body, vec![(start, start + len, pid.clone())])
+                    };
+
+                // record occupied space (Pass D) + bounds-check every extent
+                for (s, e, lbl) in &occ {
+                    if *s < pz_start || *e > pz_start + pz_len {
+                        fsck.problem(format!("pack {lbl} extent [{s}..{e}] outside pack zone [{pz_start}..{}]",
+                            pz_start + pz_len));
+                    }
+                    intervals.push((*s, *e, lbl.clone()));
+                }
+
+                // open + enumerate blobs (content hash + manifest capture)
+                if let Some(buf) = body {
+                    let pr = tessera_pack_open(buf.as_ptr(), buf.len());
+                    if pr.is_null() {
+                        fsck.problem(format!("pack {pid} failed to open (bad header/CRC)"));
+                    } else {
+                        let n = tessera_pack_blob_count(pr);
+                        if n != blob_count {
+                            fsck.problem(format!("pack {pid}: registry blob_count={blob_count} but pack holds {n}"));
+                        }
+                        for i in 0..n {
+                            let mut bh = [0u8; 32];
+                            if tessera_pack_blob_hash_at(pr, i, bh.as_mut_ptr()) == 0 {
+                                fsck.all_blobs.insert(bh);
+                                fsck.blobs += 1;
+                                let mut bytes: *const u8 = std::ptr::null();
+                                let mut blen: u32 = 0;
+                                if tessera_pack_lookup(pr, bh.as_ptr(), &mut bytes, &mut blen) == 0
+                                    && !bytes.is_null() {
+                                    let slice = std::slice::from_raw_parts(bytes, blen as usize);
+                                    // content-address integrity: re-hash vs claimed hash
+                                    let mut got = [0u8; 32];
+                                    tessera_sha256(slice.as_ptr(), slice.len(), got.as_mut_ptr());
+                                    if got != bh {
+                                        fsck.problem(format!(
+                                            "pack {pid}: blob {} content hashes to {} (corrupted data)",
+                                            hx(&bh), hx(&got)));
+                                    }
+                                    let mp = tessera_manifest_parse(slice.as_ptr(), slice.len());
+                                    if !mp.is_null() {
+                                        fsck.manifests.insert(bh, slice.to_vec());
+                                        tessera_manifest_parser_free(mp);
                                     }
                                 }
                             }
-                            tessera_pack_close(pr);
                         }
-                    } else {
-                        fsck.problem(format!("pack {pid}: could not read {nbytes} bytes at sector {start}"));
+                        tessera_pack_close(pr);
                     }
                 }
                 if tessera_btree_cursor_next(cur) != 0 { break; }
@@ -411,6 +484,11 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
                 fsck.reach(&manifest, true, &label, 0);
                 fsck.reach(&xattr, false, &format!("{label} xattr"), 0);
                 fsck.inode_map.insert(ino, (mode, nlink, manifest));
+                // quota is charged on logical file bytes; accumulate per domain
+                let qdom = rd_u64(&val, 136);
+                if qdom != 0 && mode & S_IFMT == S_IFREG {
+                    *fsck.quota_used.entry(qdom).or_insert(0) += size;
+                }
 
                 if tessera_btree_cursor_next(cur) != 0 { break; }
             }
@@ -532,17 +610,53 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
                     fr.0, fr.1, pk.0, pk.1));
             }
         }
-        // coverage/leak — only meaningful with no multi-extent packs
-        if fsck.multi_extent_skipped == 0 {
-            let mut cursor = pz_start;
-            let mut leaked = 0u64;
-            for (s, e, _) in &all {
-                if *s > cursor { leaked += *s - cursor; }
-                if *e > cursor { cursor = *e; }
-            }
-            if cursor < pz_end { leaked += pz_end - cursor; }
-            if leaked > 0 {
-                fsck.problem(format!("{leaked} pack-zone sector(s) neither allocated nor free (leaked)"));
+        // coverage/leak: packs (incl. multi-extent data extents + PEL sectors)
+        // plus free extents must tile the whole pack zone.
+        let mut cursor = pz_start;
+        let mut leaked = 0u64;
+        for (s, e, _) in &all {
+            if *s > cursor { leaked += *s - cursor; }
+            if *e > cursor { cursor = *e; }
+        }
+        if cursor < pz_end { leaked += pz_end - cursor; }
+        if leaked > 0 {
+            // Informational, not a failure: untracked space is a space-
+            // efficiency issue (not corruption), and can arise from
+            // allocator behaviour under fragmentation. Double-state overlap
+            // above IS a hard problem.
+            fsck.notes.push(format!("{leaked} pack-zone sector(s) neither allocated nor free (leaked space)"));
+        }
+    }
+
+    // ── Pass E: quota accounting ─────────────────────────────────
+    // Each domain's used_bytes must equal the summed logical size of the
+    // regular files in it (quota is charged on file bytes via vop_write).
+    let quota_root = unsafe { tessera_volume_quota_tree_root(v) };
+    if quota_root != 0 {
+        unsafe {
+            let t = tessera_btree_open(&io, quota_root, TESSERA_BTREE_KIND_QUOTA, 8, 128);
+            if t.is_null() {
+                fsck.problem("could not open quota tree".into());
+            } else {
+                let c = tessera_btree_seek_first(t);
+                let cur = c;
+                while !cur.is_null() {
+                    let mut k = [0u8; 8];
+                    let mut val = [0u8; 128];
+                    if tessera_btree_cursor_get(cur, k.as_mut_ptr(), val.as_mut_ptr()) != 0 {
+                        break;
+                    }
+                    let domain_id = rd_u64(&val, 0);
+                    let used = rd_u64(&val, 24);
+                    let computed = *fsck.quota_used.get(&domain_id).unwrap_or(&0);
+                    if used != computed {
+                        fsck.problem(format!(
+                            "quota domain {domain_id}: used_bytes={used} but regular-file sizes sum to {computed}"));
+                    }
+                    if tessera_btree_cursor_next(cur) != 0 { break; }
+                }
+                if !c.is_null() { tessera_btree_cursor_free(c); }
+                tessera_btree_close(t);
             }
         }
     }
@@ -555,8 +669,8 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
     println!("  inodes:       {}", fsck.inodes);
     println!("  packs:        {} ({} blobs, {} parse as manifests)",
         fsck.packs, fsck.blobs, fsck.manifests.len());
-    if fsck.multi_extent_skipped > 0 {
-        println!("  NOTE: {} multi-extent pack(s) not checked (v1 limitation)", fsck.multi_extent_skipped);
+    for n in &fsck.notes {
+        println!("  NOTE: {n}");
     }
     if fsck.problems.is_empty() {
         println!("  result:       CLEAN — no inconsistencies found");

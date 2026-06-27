@@ -106,6 +106,7 @@ uint64_t        tessera_volume_pack_zone_start   (const tessera_volume_t *);
 uint64_t        tessera_volume_pack_zone_length  (const tessera_volume_t *);
 uint16_t        tessera_volume_encryption_flags   (const tessera_volume_t *);
 uint8_t         tessera_volume_active_slot_count  (const tessera_volume_t *);
+uint64_t        tessera_volume_quota_tree_root    (const tessera_volume_t *);
 
 #ifdef __cplusplus
 }

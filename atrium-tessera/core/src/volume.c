@@ -664,3 +664,6 @@ uint16_t tessera_volume_encryption_flags(const tessera_volume_t *v)
 
 uint8_t tessera_volume_active_slot_count(const tessera_volume_t *v)
 { return v ? v->sb.active_slot_count : 0; }
+
+uint64_t tessera_volume_quota_tree_root(const tessera_volume_t *v)
+{ return v ? v->sb.quota_tree_root : 0; }
