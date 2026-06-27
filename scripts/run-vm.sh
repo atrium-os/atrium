@@ -313,6 +313,8 @@ exec "$QEMU" \
     -device virtio-blk-pci,drive=crashdrv,serial=tessera-crashtest,config-wce=on \
     -drive file="$BSD_DIR/vm/tessera-storage.img",format=raw,cache=writeback,if=none,id=storagedrv \
     -device virtio-blk-pci,drive=storagedrv,serial=atrium-storage,config-wce=on \
+    -drive file="$BSD_DIR/vm/tessera-root.img",format=raw,cache=writeback,if=none,id=tessrootdrv \
+    -device virtio-blk-pci,drive=tessrootdrv,serial=tessera-root,config-wce=on \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0,hostfwd=tcp::2222-:22 \
     -fsdev local,id=share,path="$SHARE_DIR",security_model=none \
