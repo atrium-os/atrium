@@ -19,10 +19,12 @@
 //!   - dirent reachability: walk the dir tree from the root inode; report
 //!     orphan inodes (live but unreachable) and dangling dirents (entry →
 //!     inode not in the tree)
+//!   - free-extent cross-check: the pack zone must be exactly partitioned by
+//!     allocated packs + free extents — report free/allocated overlap
+//!     (double-state) and leaked sectors (neither)
 //!
 //! Not yet covered (reported as "skipped" where applicable, never silently):
-//! multi-extent pack bodies, nlink-count verification, free-extent-vs-
-//! allocation cross-check, quota accounting.
+//! multi-extent pack bodies, nlink-count verification, quota accounting.
 //!
 //! Exit: 0 = clean, 1 = problems found, 2 = usage / I/O error.
 
@@ -446,6 +448,78 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
         orphans.sort_unstable();
         for o in &orphans {
             fsck.problem(format!("orphan inode {o} (not reachable from the root dir)"));
+        }
+    }
+
+    // ── Pass D: free-extent vs allocation cross-check ────────────
+    // The pack zone must be exactly partitioned by allocated single-extent
+    // packs and free-extent-tree extents: no sector both free and packed
+    // (double-state → next alloc clobbers a live pack), none lost (leak).
+    // Skipped/approximate when multi-extent packs are present (their sectors
+    // aren't in `intervals`).
+    {
+        let mut free: Vec<(u64, u64)> = Vec::new();
+        if free_root != 0 {
+            unsafe {
+                let t = tessera_btree_open(&io, free_root, TESSERA_BTREE_KIND_FREE_EXT, 8, 8);
+                if t.is_null() {
+                    fsck.problem("could not open free-extent tree".into());
+                } else {
+                    let c = tessera_btree_seek_first(t);
+                    let cur = c;
+                    while !cur.is_null() {
+                        let mut k = [0u8; 8];
+                        let mut val = [0u8; 8];
+                        if tessera_btree_cursor_get(cur, k.as_mut_ptr(), val.as_mut_ptr()) != 0 {
+                            break;
+                        }
+                        free.push((u64::from_le_bytes(k), u64::from_le_bytes(val)));
+                        if tessera_btree_cursor_next(cur) != 0 { break; }
+                    }
+                    if !c.is_null() { tessera_btree_cursor_free(c); }
+                    tessera_btree_close(t);
+                }
+            }
+        }
+        let pz_end = pz_start + pz_len;
+        // free extents in-bounds + free-vs-free overlap
+        free.sort_by_key(|x| x.0);
+        for (s, l) in &free {
+            if *s < pz_start || s + l > pz_end {
+                fsck.problem(format!("free extent [{s}..{}] outside pack zone [{pz_start}..{pz_end}]", s + l));
+            }
+        }
+        for w in free.windows(2) {
+            if w[0].0 + w[0].1 > w[1].0 {
+                fsck.problem(format!("free extents overlap: [{}..{}] and [{}..]",
+                    w[0].0, w[0].0 + w[0].1, w[1].0));
+            }
+        }
+        // merge packs (from Pass A) + free, detect cross-type overlap + gaps
+        let mut all: Vec<(u64, u64, bool)> = Vec::new(); // (start, end, is_free)
+        for (s, l) in &free { all.push((*s, s + l, true)); }
+        for (s, e, _) in &intervals { all.push((*s, *e, false)); }
+        all.sort_by_key(|x| x.0);
+        for w in all.windows(2) {
+            if w[0].1 > w[1].0 && w[0].2 != w[1].2 {
+                let (fr, pk) = if w[0].2 { (w[0], w[1]) } else { (w[1], w[0]) };
+                fsck.problem(format!(
+                    "free extent [{}..{}] overlaps allocated pack [{}..{}] (double-state)",
+                    fr.0, fr.1, pk.0, pk.1));
+            }
+        }
+        // coverage/leak — only meaningful with no multi-extent packs
+        if fsck.multi_extent_skipped == 0 {
+            let mut cursor = pz_start;
+            let mut leaked = 0u64;
+            for (s, e, _) in &all {
+                if *s > cursor { leaked += *s - cursor; }
+                if *e > cursor { cursor = *e; }
+            }
+            if cursor < pz_end { leaked += pz_end - cursor; }
+            if leaked > 0 {
+                fsck.problem(format!("{leaked} pack-zone sector(s) neither allocated nor free (leaked)"));
+            }
         }
     }
 
