@@ -2007,8 +2007,20 @@ tessera_mount_impl(struct mount *mp)
 	char *fspec;
 	int err;
 
-	if (mp->mnt_flag & MNT_UPDATE)
-		return (EOPNOTSUPP);
+	if (mp->mnt_flag & MNT_UPDATE) {
+		/* Remount in place — most importantly the root-boot read-only ->
+		 * read-write transition (vfs_mountroot mounts root ro, then rc
+		 * does `mount -u -o rw /`), and the shutdown rw -> ro remount.
+		 * tessera keeps no ro/rw-specific in-core state: writes always go
+		 * through the deferred-commit path and the VFS layer enforces
+		 * MNT_RDONLY at the syscall boundary, so the FS-specific work is
+		 * just to flush pending writes (durable across the flag change).
+		 * Accept the update so root can come up read-write. */
+		struct tessera_mount *tmp_ = VFSTOTESSERA(mp);
+		if (tmp_ != NULL)
+			(void)tessera_fs_flush(tmp_);
+		return (0);
+	}
 
 	fspec = vfs_getopts(mp->mnt_optnew, "from", &err);
 	if (err != 0) return (err);
