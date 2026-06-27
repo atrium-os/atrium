@@ -562,6 +562,67 @@ tessera_manifest_dir_btree_inner_at(const tessera_manifest_parser_t *p,
 	return TESSERA_OK;
 }
 
+/* Read the idx-th entry of a flat DIRECTORY manifest: child inode + name.
+ * Entry layout: [u64 child_inode][u16 name_len][name]. out_name references
+ * the parser body. ENOENT past the end; ECORRUPT on a truncated record. */
+int
+tessera_manifest_dirent_at(const tessera_manifest_parser_t *p, uint32_t idx,
+                           uint64_t *out_inode, const char **out_name,
+                           uint16_t *out_name_len)
+{
+	if (p == NULL || p->header.manifest_kind != TESSERA_MFT_DIRECTORY)
+		return TESSERA_EINVAL;
+	size_t pos = 0;
+	uint32_t i = 0;
+	while (pos + 10 <= p->body_len) {
+		uint64_t ino;
+		uint16_t nl;
+		memcpy(&ino, p->body + pos, 8);
+		memcpy(&nl, p->body + pos + 8, 2);
+		if (pos + 10 + (size_t)nl > p->body_len) return TESSERA_ECORRUPT;
+		if (i == idx) {
+			if (out_inode)    *out_inode = ino;
+			if (out_name)     *out_name = (const char *)(p->body + pos + 10);
+			if (out_name_len) *out_name_len = nl;
+			return TESSERA_OK;
+		}
+		pos += 10 + (size_t)nl;
+		i++;
+	}
+	return TESSERA_ENOENT;
+}
+
+/* Read the idx-th entry of a DIRECTORY_BTREE LEAF node: inode + name.
+ * Entry layout: [u64 name_hash][u64 inode_no][u16 name_len][name] after the
+ * 8-byte body header. EINVAL if not a leaf node. ENOENT past the end. */
+int
+tessera_manifest_dir_btree_leaf_at(const tessera_manifest_parser_t *p,
+                                   uint32_t idx, uint64_t *out_inode,
+                                   const char **out_name, uint16_t *out_name_len)
+{
+	if (p == NULL || p->header.manifest_kind != TESSERA_MFT_DIRECTORY_BTREE)
+		return TESSERA_EINVAL;
+	if (p->body_len < 8 || p->body[0] != 1) return TESSERA_EINVAL;
+	size_t pos = 8;
+	uint32_t i = 0;
+	while (pos + 18 <= p->body_len) {
+		uint64_t ino;
+		uint16_t nl;
+		memcpy(&ino, p->body + pos + 8, 8);  /* skip name_hash, read inode_no */
+		memcpy(&nl,  p->body + pos + 16, 2);
+		if (pos + 18 + (size_t)nl > p->body_len) return TESSERA_ECORRUPT;
+		if (i == idx) {
+			if (out_inode)    *out_inode = ino;
+			if (out_name)     *out_name = (const char *)(p->body + pos + 18);
+			if (out_name_len) *out_name_len = nl;
+			return TESSERA_OK;
+		}
+		pos += 18 + (size_t)nl;
+		i++;
+	}
+	return TESSERA_ENOENT;
+}
+
 void
 tessera_manifest_parser_free(tessera_manifest_parser_t *p)
 {

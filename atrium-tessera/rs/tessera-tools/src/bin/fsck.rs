@@ -12,15 +12,17 @@
 //!     matches; build the set of all blobs present
 //!   - inode tree: every record decodes; basic field sanity (nlink, S_IFMT,
 //!     size-vs-manifest)
-//!   - reachability: every inode's manifest + xattr blob exists, and every
-//!     blob it transitively references (CHUNK_LIST chunks, CHUNK_TREE /
+//!   - blob reachability: every inode's manifest + xattr blob exists, and
+//!     every blob it transitively references (CHUNK_LIST chunks, CHUNK_TREE /
 //!     DIRECTORY_2L / DIRECTORY_BTREE inner-node child manifests) exists —
 //!     catches dangling manifests and live blobs reclaimed by a GC/recovery bug
+//!   - dirent reachability: walk the dir tree from the root inode; report
+//!     orphan inodes (live but unreachable) and dangling dirents (entry →
+//!     inode not in the tree)
 //!
 //! Not yet covered (reported as "skipped" where applicable, never silently):
-//! multi-extent pack bodies, dirent→inode reachability / orphan detection
-//! (incl. DIRECTORY_BTREE leaf entries), free-extent-vs-allocation
-//! cross-check, quota accounting.
+//! multi-extent pack bodies, nlink-count verification, free-extent-vs-
+//! allocation cross-check, quota accounting.
 //!
 //! Exit: 0 = clean, 1 = problems found, 2 = usage / I/O error.
 
@@ -50,6 +52,8 @@ struct Fsck {
     manifests: HashMap<Hash, Vec<u8>>,
     // manifests already reachability-checked (dedup + cycle guard)
     checked: HashSet<Hash>,
+    // inode_no → (mode, manifest_hash) for the dirent-reachability walk
+    inode_map: HashMap<u32, (u32, Hash)>,
     // stats
     inodes: u64,
     packs: u64,
@@ -149,6 +153,82 @@ impl Fsck {
             tessera_manifest_parser_free(p);
         }
     }
+
+    /// Collect (child_inode, name) for every dirent under a directory's
+    /// manifest, descending DIRECTORY_2L buckets and DIRECTORY_BTREE inner
+    /// nodes to their leaves. Read-only (&self); dir manifests live in the
+    /// `manifests` map already built in Pass A.
+    fn collect_dirents(&self, dir_hash: &Hash, out: &mut Vec<(u64, String)>, depth: u32) {
+        if is_null(dir_hash) || depth > 64 {
+            return;
+        }
+        let bytes = match self.manifests.get(dir_hash) {
+            Some(b) => b.clone(),
+            None => return, // missing dir manifest already flagged by reach()
+        };
+        unsafe {
+            let p = tessera_manifest_parse(bytes.as_ptr(), bytes.len());
+            if p.is_null() {
+                return;
+            }
+            let kind = tessera_manifest_parser_kind(p);
+            let count = tessera_manifest_parser_count(p);
+            match kind {
+                TESSERA_MFT_DIRECTORY => {
+                    let mut i = 0u32;
+                    loop {
+                        let (mut ino, mut nm, mut nl) = (0u64, std::ptr::null(), 0u16);
+                        if tessera_manifest_dirent_at(p, i, &mut ino, &mut nm, &mut nl) != 0 {
+                            break;
+                        }
+                        out.push((ino, name_str(nm, nl)));
+                        i += 1;
+                    }
+                }
+                TESSERA_MFT_DIRECTORY_2L => {
+                    for i in 0..count {
+                        let mut br: tessera_dir_bucket_record_t = std::mem::zeroed();
+                        if tessera_manifest_dir_bucket_at(p, i, &mut br) == 0 {
+                            self.collect_dirents(&br.bucket_manifest_hash, out, depth + 1);
+                        }
+                    }
+                }
+                TESSERA_MFT_DIRECTORY_BTREE => {
+                    if tessera_manifest_dir_btree_is_leaf(p) == 1 {
+                        let mut i = 0u32;
+                        loop {
+                            let (mut ino, mut nm, mut nl) = (0u64, std::ptr::null(), 0u16);
+                            if tessera_manifest_dir_btree_leaf_at(p, i, &mut ino, &mut nm, &mut nl) != 0 {
+                                break;
+                            }
+                            out.push((ino, name_str(nm, nl)));
+                            i += 1;
+                        }
+                    } else {
+                        let mut i = 0u32;
+                        loop {
+                            let mut ch = [0u8; 32];
+                            if tessera_manifest_dir_btree_inner_at(p, i, ch.as_mut_ptr()) != 0 {
+                                break;
+                            }
+                            self.collect_dirents(&ch, out, depth + 1);
+                            i += 1;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            tessera_manifest_parser_free(p);
+        }
+    }
+}
+
+unsafe fn name_str(p: *const core::ffi::c_char, len: u16) -> String {
+    if p.is_null() || len == 0 {
+        return String::new();
+    }
+    let s = std::slice::from_raw_parts(p as *const u8, len as usize);
+    String::from_utf8_lossy(s).into_owned()
 }
 
 fn run(path: &str, verbose: bool) -> Result<i32, String> {
@@ -177,6 +257,7 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
         all_blobs: HashSet::new(),
         manifests: HashMap::new(),
         checked: HashSet::new(),
+        inode_map: HashMap::new(),
         inodes: 0,
         packs: 0,
         blobs: 0,
@@ -325,11 +406,46 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
                 let label = format!("inode {ino}");
                 fsck.reach(&manifest, true, &label, 0);
                 fsck.reach(&xattr, false, &format!("{label} xattr"), 0);
+                fsck.inode_map.insert(ino, (mode, manifest));
 
                 if tessera_btree_cursor_next(cur) != 0 { break; }
             }
             if !c.is_null() { tessera_btree_cursor_free(c); }
             tessera_btree_close(t);
+        }
+    }
+
+    // ── Pass C: dirent → inode reachability (orphans + dangling dirents) ─
+    const S_IFDIR: u32 = 0o040000;
+    let root = TESSERA_INODE_ROOT_DIR;
+    let mut reachable: HashSet<u32> = HashSet::new();
+    if !fsck.inode_map.contains_key(&root) {
+        fsck.problem(format!("root inode {root} missing from inode tree"));
+    } else {
+        let mut stack = vec![root];
+        reachable.insert(root);
+        let mut dangling = Vec::new();
+        while let Some(ino) = stack.pop() {
+            let (mode, manifest) = match fsck.inode_map.get(&ino) { Some(x) => *x, None => continue };
+            if mode & S_IFMT != S_IFDIR { continue; }
+            let mut ents = Vec::new();
+            fsck.collect_dirents(&manifest, &mut ents, 0);
+            for (child, name) in ents {
+                if name == "." || name == ".." { continue; }
+                let c = child as u32;
+                if !fsck.inode_map.contains_key(&c) {
+                    dangling.push(format!("dangling dirent: inode {ino} entry '{name}' -> inode {child} (not in inode tree)"));
+                } else if reachable.insert(c) {
+                    stack.push(c);
+                }
+            }
+        }
+        for d in dangling { fsck.problem(d); }
+        let mut orphans: Vec<u32> = fsck.inode_map.keys().copied()
+            .filter(|k| !reachable.contains(k)).collect();
+        orphans.sort_unstable();
+        for o in &orphans {
+            fsck.problem(format!("orphan inode {o} (not reachable from the root dir)"));
         }
     }
 

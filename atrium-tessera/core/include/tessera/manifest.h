@@ -138,6 +138,17 @@ int tessera_manifest_dir_btree_is_leaf(const tessera_manifest_parser_t *);
 int tessera_manifest_dir_btree_inner_at(const tessera_manifest_parser_t *,
                                         uint32_t idx, tessera_hash_t out_child);
 
+/* Read the idx-th dirent (child inode + name) of a flat DIRECTORY manifest. */
+int tessera_manifest_dirent_at(const tessera_manifest_parser_t *, uint32_t idx,
+                               uint64_t *out_inode, const char **out_name,
+                               uint16_t *out_name_len);
+
+/* Read the idx-th dirent of a DIRECTORY_BTREE LEAF node (EINVAL if inner). */
+int tessera_manifest_dir_btree_leaf_at(const tessera_manifest_parser_t *,
+                                       uint32_t idx, uint64_t *out_inode,
+                                       const char **out_name,
+                                       uint16_t *out_name_len);
+
 void tessera_manifest_parser_free(tessera_manifest_parser_t *);
 
 #ifdef __cplusplus

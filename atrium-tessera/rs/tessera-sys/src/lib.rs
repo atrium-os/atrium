@@ -86,6 +86,8 @@ pub const TESSERA_BTREE_KIND_QUOTA:    u8 = 4;
 pub const TESSERA_INODE_RECORD_SIZE:   u32 = 144;
 pub const TESSERA_REGISTRY_ENTRY_SIZE: u32 = 64;
 
+pub const TESSERA_INODE_ROOT_DIR:      u32 = 2;
+
 pub const TESSERA_REGISTRY_FLAG_SEALED:       u32 = 1 << 0;
 pub const TESSERA_REGISTRY_FLAG_RETIRING:     u32 = 1 << 1;
 pub const TESSERA_REGISTRY_FLAG_MULTI_EXTENT: u32 = 1 << 2;
@@ -252,6 +254,14 @@ extern "C" {
     pub fn tessera_manifest_dir_btree_inner_at(p: *const tessera_manifest_parser_t,
                                                 idx: u32, out_child: *mut u8)
                                                 -> c_int;
+    pub fn tessera_manifest_dirent_at(p: *const tessera_manifest_parser_t, idx: u32,
+                                       out_inode: *mut u64,
+                                       out_name: *mut *const core::ffi::c_char,
+                                       out_name_len: *mut u16) -> c_int;
+    pub fn tessera_manifest_dir_btree_leaf_at(p: *const tessera_manifest_parser_t,
+                                               idx: u32, out_inode: *mut u64,
+                                               out_name: *mut *const core::ffi::c_char,
+                                               out_name_len: *mut u16) -> c_int;
     pub fn tessera_manifest_parser_free(p: *mut tessera_manifest_parser_t);
 }
 
