@@ -3620,6 +3620,57 @@ out:
 	return (err);
 }
 
+/*
+ * mmap coherence (tessera keeps file data in the manifest + dirty_content
+ * buffer, while mmap keeps its own copy in the vnode VM-object pages — two
+ * separate caches because tessera bypasses the unified buffer cache).
+ *
+ * tessera_vm_mapped: is the file ACTIVELY mmap'd? vop_open creates a VM
+ * object for every regular file, but only an mmap fault (vop_getpages)
+ * makes pages resident — so resident_page_count > 0 means there are mmap
+ * pages to reconcile. Non-mmap files stay on the fast dirty_content path.
+ *
+ * tessera_vm_writeback: flush the object's dirty pages through vop_putpages
+ * → replace_content so the manifest reflects every mmap store before a
+ * read(2)/write(2) reads it. vm_object_page_clean self-guards cheaply when
+ * nothing is dirty. It flushes ALL dirty pages (not the subset a pageout
+ * run would), which is what makes the manifest whole.
+ *
+ * tessera_vm_invalidate: drop the pages covering [start,end) after a write(2)
+ * updates the manifest, so the next mmap fault re-reads fresh via getpages
+ * instead of returning a stale resident page.
+ */
+static int
+tessera_vm_mapped(struct vnode *vp)
+{
+	vm_object_t obj = vp->v_object;
+	return (obj != NULL && obj->type == OBJT_VNODE &&
+	    obj->resident_page_count > 0);
+}
+
+static void
+tessera_vm_writeback(struct vnode *vp)
+{
+	vm_object_t obj = vp->v_object;
+	if (obj == NULL || obj->type != OBJT_VNODE)
+		return;
+	VM_OBJECT_WLOCK(obj);
+	vm_object_page_clean(obj, 0, 0, OBJPC_SYNC);
+	VM_OBJECT_WUNLOCK(obj);
+}
+
+static void
+tessera_vm_invalidate(struct vnode *vp, off_t start, off_t end)
+{
+	vm_object_t obj = vp->v_object;
+	if (obj == NULL || obj->type != OBJT_VNODE || end <= start)
+		return;
+	VM_OBJECT_WLOCK(obj);
+	vm_object_page_remove(obj, OFF_TO_IDX(start),
+	    OFF_TO_IDX(end + PAGE_MASK), 0);
+	VM_OBJECT_WUNLOCK(obj);
+}
+
 static int
 tessera_vop_read(struct vop_read_args *ap)
 {
@@ -3633,6 +3684,11 @@ tessera_vop_read(struct vop_read_args *ap)
 	if (uio->uio_offset < 0) return (EINVAL);
 	if (uio->uio_resid == 0) return (0);
 	if (tmp_->inode_tree == NULL) return (EIO);
+
+	/* If the file is actively mmap'd, flush any mmap stores into the
+	 * manifest so this read sees them (live mounts only). */
+	if (tn->snapshot_gen == 0 && tessera_vm_mapped(vp))
+		tessera_vm_writeback(vp);
 
 	uint8_t key[4];
 	tessera_inode_record_t ino;
@@ -12370,6 +12426,16 @@ tessera_vop_write(struct vop_write_args *ap)
 	if (uio->uio_offset < 0) return (EINVAL);
 	if (tmp_->inode_tree == NULL) return (EROFS);
 
+	/* mmap coherence: if the file is actively mmap'd, flush its dirty VM
+	 * pages into the manifest FIRST so the read-modify-write below sees a
+	 * current base, and force the slow (non-dirty_content) path — a
+	 * coalescing buffer seeded from a manifest that's stale w.r.t. mmap
+	 * pages would clobber them on drain. The written range is invalidated
+	 * after, so the next mmap fault re-reads the updated manifest. */
+	int mmapped = tessera_vm_mapped(vp);
+	if (mmapped)
+		tessera_vm_writeback(vp);
+
 	/* Read live inode record. */
 	uint8_t key[4];
 	tessera_inode_record_t ino;
@@ -12411,7 +12477,7 @@ tessera_vop_write(struct vop_write_args *ap)
 	 * Hot path: copy directly from user into the dirty_content
 	 * buffer — no kbuf malloc, no extra memcpy. The vnode lock held
 	 * by VFS guarantees no concurrent drain. */
-	if (final_size <= (uint64_t)tessera_dirty_content_file_max) {
+	if (!mmapped && final_size <= (uint64_t)tessera_dirty_content_file_max) {
 		int wr = tessera_fs_dirty_content_write_uio(tmp_,
 		    (uint32_t)tn->inode_no, write_off, uio,
 		    (size_t)final_size);
@@ -12484,6 +12550,8 @@ tessera_vop_write(struct vop_write_args *ap)
 				}
 			}
 			vnode_pager_setsize(vp, final_size);
+			if (mmapped)
+				tessera_vm_invalidate(vp, write_off, write_end);
 			tessera_fs_mark_dirty(tmp_);
 			return (0);
 		}
@@ -12545,6 +12613,8 @@ tessera_vop_write(struct vop_write_args *ap)
 
 	if (final_size != ino.size)
 		vnode_pager_setsize(vp, final_size);
+	if (mmapped)
+		tessera_vm_invalidate(vp, write_off, write_end);
 	tessera_fs_mark_dirty(tmp_);
 	return (0);
 }
