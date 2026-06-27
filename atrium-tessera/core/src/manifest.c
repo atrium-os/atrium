@@ -531,6 +531,37 @@ tessera_manifest_xattr_at(const tessera_manifest_parser_t *p, uint32_t idx,
 	return TESSERA_ENOENT;
 }
 
+/* DIRECTORY_BTREE leaf flag: 1 = leaf (name→inode records), 0 = inner
+ * (max_name_hash→child-manifest records). -1 if not a DIRECTORY_BTREE or
+ * the body is too short to hold the 8-byte header. */
+int
+tessera_manifest_dir_btree_is_leaf(const tessera_manifest_parser_t *p)
+{
+	if (p == NULL || p->header.manifest_kind != TESSERA_MFT_DIRECTORY_BTREE)
+		return -1;
+	if (p->body_len < 8) return -1;
+	return p->body[0] ? 1 : 0;
+}
+
+/* Read the idx-th child manifest hash from an INNER DIRECTORY_BTREE node.
+ * Inner records are [u64 max_name_hash][32B child_hash] after the 8-byte
+ * body header. TESSERA_ENOENT past the end; TESSERA_EINVAL if this isn't an
+ * inner DIRECTORY_BTREE node. (Leaf nodes hold name→inode entries, not blob
+ * refs — iterate those with a future leaf accessor.) */
+int
+tessera_manifest_dir_btree_inner_at(const tessera_manifest_parser_t *p,
+                                    uint32_t idx, tessera_hash_t out_child)
+{
+	if (p == NULL || out_child == NULL) return TESSERA_EINVAL;
+	if (p->header.manifest_kind != TESSERA_MFT_DIRECTORY_BTREE)
+		return TESSERA_EINVAL;
+	if (p->body_len < 8 || p->body[0] != 0) return TESSERA_EINVAL;
+	size_t off = 8 + (size_t)idx * (8 + TESSERA_HASH_SIZE);
+	if (off + 8 + TESSERA_HASH_SIZE > p->body_len) return TESSERA_ENOENT;
+	memcpy(out_child, p->body + off + 8, TESSERA_HASH_SIZE);
+	return TESSERA_OK;
+}
+
 void
 tessera_manifest_parser_free(tessera_manifest_parser_t *p)
 {

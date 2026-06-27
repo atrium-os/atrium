@@ -247,6 +247,11 @@ extern "C" {
     pub fn tessera_manifest_inline_data(p: *const tessera_manifest_parser_t,
                                          out_data: *mut *const u8,
                                          out_len: *mut usize) -> c_int;
+    pub fn tessera_manifest_dir_btree_is_leaf(p: *const tessera_manifest_parser_t)
+                                               -> c_int;
+    pub fn tessera_manifest_dir_btree_inner_at(p: *const tessera_manifest_parser_t,
+                                                idx: u32, out_child: *mut u8)
+                                                -> c_int;
     pub fn tessera_manifest_parser_free(p: *mut tessera_manifest_parser_t);
 }
 

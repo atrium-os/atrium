@@ -14,13 +14,13 @@
 //!     size-vs-manifest)
 //!   - reachability: every inode's manifest + xattr blob exists, and every
 //!     blob it transitively references (CHUNK_LIST chunks, CHUNK_TREE /
-//!     DIRECTORY_2L child manifests) exists — catches dangling manifests and
-//!     live blobs reclaimed by a GC/recovery bug
+//!     DIRECTORY_2L / DIRECTORY_BTREE inner-node child manifests) exists —
+//!     catches dangling manifests and live blobs reclaimed by a GC/recovery bug
 //!
-//! Not yet covered (reported as "skipped", never silently): multi-extent
-//! pack bodies, DIRECTORY_BTREE inner-node recursion, dirent→inode
-//! reachability / orphan detection, free-extent-vs-allocation cross-check,
-//! quota accounting. See the v2 TODO at the bottom.
+//! Not yet covered (reported as "skipped" where applicable, never silently):
+//! multi-extent pack bodies, dirent→inode reachability / orphan detection
+//! (incl. DIRECTORY_BTREE leaf entries), free-extent-vs-allocation
+//! cross-check, quota accounting.
 //!
 //! Exit: 0 = clean, 1 = problems found, 2 = usage / I/O error.
 
@@ -55,7 +55,6 @@ struct Fsck {
     packs: u64,
     blobs: u64,
     multi_extent_skipped: u64,
-    dir_btree_skipped: u64,
 }
 
 impl Fsck {
@@ -130,10 +129,19 @@ impl Fsck {
                     }
                 }
                 TESSERA_MFT_DIRECTORY_BTREE => {
-                    // The btree-dir blob itself exists (checked above). Its
-                    // inner-node child manifests aren't recursed yet (needs a
-                    // core parse accessor — v2). Count, don't fail.
-                    self.dir_btree_skipped += 1;
+                    // Inner nodes point at child manifests (recurse); leaf
+                    // nodes hold name→inode entries (no blob refs — dirent
+                    // reachability is a separate v2 check).
+                    if tessera_manifest_dir_btree_is_leaf(p) == 0 {
+                        let mut i = 0u32;
+                        loop {
+                            let mut ch = [0u8; 32];
+                            let rc = tessera_manifest_dir_btree_inner_at(p, i, ch.as_mut_ptr());
+                            if rc != 0 { break; }
+                            self.reach(&ch, true, &format!("{}[btree {i}]", hx(hash)), depth + 1);
+                            i += 1;
+                        }
+                    }
                 }
                 // INLINE / SYMLINK / DIRECTORY / XATTR_STORE: no blob refs
                 _ => {}
@@ -173,7 +181,6 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
         packs: 0,
         blobs: 0,
         multi_extent_skipped: 0,
-        dir_btree_skipped: 0,
     };
 
     // ── bounds sanity ────────────────────────────────────────────
@@ -336,10 +343,6 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
         fsck.packs, fsck.blobs, fsck.manifests.len());
     if fsck.multi_extent_skipped > 0 {
         println!("  NOTE: {} multi-extent pack(s) not checked (v1 limitation)", fsck.multi_extent_skipped);
-    }
-    if fsck.dir_btree_skipped > 0 {
-        println!("  NOTE: {} DIRECTORY_BTREE dir(s) — root checked, inner-node children not recursed (v1 limitation)",
-            fsck.dir_btree_skipped);
     }
     if fsck.problems.is_empty() {
         println!("  result:       CLEAN — no inconsistencies found");

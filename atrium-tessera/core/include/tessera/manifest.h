@@ -130,6 +130,14 @@ int tessera_manifest_xattr_at(const tessera_manifest_parser_t *, uint32_t idx,
                               const char **out_name, uint16_t *out_name_len,
                               const uint8_t **out_value, uint16_t *out_value_len);
 
+/* DIRECTORY_BTREE: 1 = leaf, 0 = inner, -1 if not a DIRECTORY_BTREE. */
+int tessera_manifest_dir_btree_is_leaf(const tessera_manifest_parser_t *);
+
+/* Read the idx-th child manifest hash from an INNER DIRECTORY_BTREE node.
+ * ENOENT past the end; EINVAL if not an inner DIRECTORY_BTREE node. */
+int tessera_manifest_dir_btree_inner_at(const tessera_manifest_parser_t *,
+                                        uint32_t idx, tessera_hash_t out_child);
+
 void tessera_manifest_parser_free(tessera_manifest_parser_t *);
 
 #ifdef __cplusplus
