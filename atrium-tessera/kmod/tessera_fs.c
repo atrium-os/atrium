@@ -2602,9 +2602,10 @@ tessera_sync_impl(struct mount *mp, int waitfor)
 {
 	struct tessera_mount *tmp_ = VFSTOTESSERA(mp);
 	if (tmp_ == NULL) return (0);
-	(void)tessera_fs_dirty_content_drain_all(tmp_);
+	/* flush drains all coalesced content inside its gate; doing it here
+	 * too would publish outside the gate and race the commit. */
 	(void)tessera_fs_flush(tmp_);
-	(void)waitfor;  /* drain + flush are synchronous either way */
+	(void)waitfor;  /* flush is synchronous either way */
 	return (0);
 }
 
@@ -4169,12 +4170,11 @@ tessera_vop_fsync(struct vop_fsync_args *ap)
 {
 	struct tessera_mount *tmp_ = VFSTOTESSERA(ap->a_vp->v_mount);
 	if (tmp_ == NULL) return (0);
-	struct tessera_node *tn = VTOTNODE(ap->a_vp);
-	/* Drain this inode's coalesced writes — must publish before
-	 * the SB-commit flush below makes the manifest hashes durable. */
-	if (tn != NULL)
-		(void)tessera_fs_dirty_content_drain_one(tmp_,
-		    (uint32_t)tn->inode_no);
+	/* tessera_fs_flush drains all coalesced writes (this inode included)
+	 * INSIDE its gate before committing, so the publish + commit are
+	 * atomic. Draining here first would publish outside the gate and let
+	 * a concurrent commit persist the allocation without the registry
+	 * entry. flush_unmounting/group-commit semantics are unchanged. */
 	return (tessera_fs_flush(tmp_) == 0 ? 0 : EIO);
 }
 
@@ -5855,13 +5855,48 @@ tessera_fs_dirty_content_publish(struct tessera_mount *tmp_,
 	return (rc);
 }
 
-/* Drain a single inode's buffer (vop_fsync / pre-truncate /
- * pre-chunked-write). Detaches under lock, publishes unlocked. */
-static int
-tessera_fs_dirty_content_drain_one(struct tessera_mount *tmp_,
-                                   uint32_t inode_no)
+/*
+ * Flush-gate ownership, shared by the commit path (tessera_fs_flush) and
+ * the dirty-content publishers below.
+ *
+ * Publishing a coalesced buffer allocates data-zone extents and
+ * COW-updates the pack registry + inode cache in memory. The commit path
+ * (commit_extent + commit_sb) snapshots exactly those structures. The two
+ * MUST be mutually exclusive: if a publish runs concurrently with a
+ * commit, the committer can flush the live allocator (so a just-allocated
+ * extent is persisted as in-use) while writing pack_registry_root /
+ * inode_root snapshots taken before the publish's btree_put landed — and
+ * then clear sb_dirty so the publisher's own flush never commits its
+ * updates. The file's data pack ends up on disk and out of the free tree
+ * but absent from the registry (leaked sectors), and the inode reverts to
+ * its pre-write manifest. flush_in_progress is that mutex; these helpers
+ * let non-flush callers claim it the same way flush's own loop does. */
+static void
+tessera_fs_flush_gate_enter(struct tessera_mount *tmp_)
 {
-	if (!tmp_->flush_mtx_init) return (0);
+	mtx_lock(&tmp_->flush_mtx);
+	while (tmp_->flush_in_progress) {
+		(void)msleep(&tmp_->flush_in_progress, &tmp_->flush_mtx,
+		    PRIBIO, "tessgate", 0);
+	}
+	tmp_->flush_in_progress = 1;
+	mtx_unlock(&tmp_->flush_mtx);
+}
+
+static void
+tessera_fs_flush_gate_exit(struct tessera_mount *tmp_)
+{
+	mtx_lock(&tmp_->flush_mtx);
+	tmp_->flush_in_progress = 0;
+	wakeup(&tmp_->flush_in_progress);
+	mtx_unlock(&tmp_->flush_mtx);
+}
+
+/* Drain a single inode's buffer. Caller MUST hold the flush gate. */
+static int
+tessera_fs_dirty_content_drain_one_locked(struct tessera_mount *tmp_,
+                                          uint32_t inode_no)
+{
 	mtx_lock(&tmp_->flush_mtx);
 	struct tessera_dirty_content *dc =
 	    tessera_fs_dirty_content_lookup(tmp_, inode_no);
@@ -5876,11 +5911,25 @@ tessera_fs_dirty_content_drain_one(struct tessera_mount *tmp_,
 	return (rc);
 }
 
-/* Drain every buffer (called from tessera_fs_flush). */
+/* Drain a single inode's buffer (pre-truncate / pre-chunked-write).
+ * Gated wrapper for callers that don't already own the flush gate, so the
+ * publish can't race a concurrent commit. */
 static int
-tessera_fs_dirty_content_drain_all(struct tessera_mount *tmp_)
+tessera_fs_dirty_content_drain_one(struct tessera_mount *tmp_,
+                                   uint32_t inode_no)
 {
 	if (!tmp_->flush_mtx_init) return (0);
+	tessera_fs_flush_gate_enter(tmp_);
+	int rc = tessera_fs_dirty_content_drain_one_locked(tmp_, inode_no);
+	tessera_fs_flush_gate_exit(tmp_);
+	return (rc);
+}
+
+/* Drain every buffer. Caller MUST hold the flush gate (this is the
+ * version tessera_fs_flush calls from inside its own gate). */
+static int
+tessera_fs_dirty_content_drain_all_locked(struct tessera_mount *tmp_)
+{
 	int last_err = 0;
 	for (uint32_t b = 0; b < TESSERA_DIRTY_CONTENT_BUCKETS; b++) {
 		for (;;) {
@@ -5898,6 +5947,17 @@ tessera_fs_dirty_content_drain_all(struct tessera_mount *tmp_)
 			tessera_fs_dirty_content_free(dc);
 		}
 	}
+	return (last_err);
+}
+
+/* Gated wrapper — claims the flush gate, then drains. */
+static int
+tessera_fs_dirty_content_drain_all(struct tessera_mount *tmp_)
+{
+	if (!tmp_->flush_mtx_init) return (0);
+	tessera_fs_flush_gate_enter(tmp_);
+	int last_err = tessera_fs_dirty_content_drain_all_locked(tmp_);
+	tessera_fs_flush_gate_exit(tmp_);
 	return (last_err);
 }
 
@@ -6193,12 +6253,6 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 		return (r);
 	}
 
-	/* Publish any coalesced INLINE writes first; they feed dirty
-	 * inodes / pending manifests that the rest of this function
-	 * then drains. Done outside flush_in_progress so concurrent
-	 * fsync waiters still benefit from group commit. */
-	(void)tessera_fs_dirty_content_drain_all(tmp_);
-
 	mtx_lock(&tmp_->flush_mtx);
 	for (;;) {
 		if (!tmp_->sb_dirty) {
@@ -6222,6 +6276,19 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 		break;
 	}
 	mtx_unlock(&tmp_->flush_mtx);
+
+	/* Publish any coalesced INLINE/chunked writes — INSIDE the gate, so
+	 * the extent allocations + registry/inode-cache updates the publish
+	 * makes are committed atomically by the commit_extent/commit_sb pass
+	 * below and can't be observed half-done by a concurrent flush. (This
+	 * used to run before the gate "so fsync waiters benefit from group
+	 * commit", but that let a racing committer persist a just-allocated
+	 * extent without the matching registry entry → leaked sectors and a
+	 * file whose inode reverted to its pre-write manifest. Group commit
+	 * still holds: a waiter blocks on flush_in_progress and, on wakeup,
+	 * re-checks sb_dirty — the active committer drains the whole
+	 * dirty_content set, covering the waiter's buffer too.) */
+	(void)tessera_fs_dirty_content_drain_all_locked(tmp_);
 
 	/* v2.6 B.2: force a synchronous group commit of the
 	 * journal-pending list before checkpoint. Two reasons: (a) any
