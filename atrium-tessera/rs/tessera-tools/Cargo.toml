@@ -16,6 +16,10 @@ name = "tessera-debug"
 path = "src/bin/debug.rs"
 
 [[bin]]
+name = "tessera-fsck"
+path = "src/bin/fsck.rs"
+
+[[bin]]
 name = "tessera-import"
 path = "src/bin/import.rs"
 

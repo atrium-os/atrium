@@ -76,6 +76,20 @@ pub struct tessera_btree_t        { _opaque: [u8; 0] }
 #[repr(C)]
 pub struct tessera_btree_cursor_t { _opaque: [u8; 0] }
 
+/* tree kinds + fixed record sizes (format.h) */
+pub const TESSERA_BTREE_KIND_INODE:    u8 = 0;
+pub const TESSERA_BTREE_KIND_PACK_REG: u8 = 1;
+pub const TESSERA_BTREE_KIND_FREE_EXT: u8 = 2;
+pub const TESSERA_BTREE_KIND_SNAPSHOT: u8 = 3;
+pub const TESSERA_BTREE_KIND_QUOTA:    u8 = 4;
+
+pub const TESSERA_INODE_RECORD_SIZE:   u32 = 144;
+pub const TESSERA_REGISTRY_ENTRY_SIZE: u32 = 64;
+
+pub const TESSERA_REGISTRY_FLAG_SEALED:       u32 = 1 << 0;
+pub const TESSERA_REGISTRY_FLAG_RETIRING:     u32 = 1 << 1;
+pub const TESSERA_REGISTRY_FLAG_MULTI_EXTENT: u32 = 1 << 2;
+
 extern "C" {
     pub fn tessera_btree_create(io: *const tessera_block_io_t,
                                  tree_kind:  u8,
@@ -134,6 +148,8 @@ extern "C" {
     pub fn tessera_pack_open(data: *const u8, len: usize)
                               -> *mut tessera_pack_reader_t;
     pub fn tessera_pack_blob_count(r: *const tessera_pack_reader_t) -> u32;
+    pub fn tessera_pack_blob_hash_at(r: *const tessera_pack_reader_t,
+                                      index: u32, out: *mut u8) -> c_int;
     pub fn tessera_pack_lookup(r: *const tessera_pack_reader_t,
                                 blob_hash: *const u8,
                                 out_bytes: *mut *const u8,
@@ -162,11 +178,15 @@ extern "C" {
 /* ── manifests ───────────────────────────────────────────────── */
 
 pub type tessera_manifest_kind_t = c_int;
-pub const TESSERA_MFT_INLINE:        tessera_manifest_kind_t = 1;
-pub const TESSERA_MFT_CHUNK_LIST:    tessera_manifest_kind_t = 2;
-pub const TESSERA_MFT_CHUNK_TREE:    tessera_manifest_kind_t = 3;
-pub const TESSERA_MFT_DIRECTORY:     tessera_manifest_kind_t = 4;
-pub const TESSERA_MFT_SYMLINK:       tessera_manifest_kind_t = 5;
+pub const TESSERA_MFT_INLINE:          tessera_manifest_kind_t = 1;
+pub const TESSERA_MFT_CHUNK_LIST:      tessera_manifest_kind_t = 2;
+pub const TESSERA_MFT_CHUNK_TREE:      tessera_manifest_kind_t = 3;
+pub const TESSERA_MFT_DIRECTORY:       tessera_manifest_kind_t = 4;
+pub const TESSERA_MFT_SYMLINK:         tessera_manifest_kind_t = 5;
+pub const TESSERA_MFT_XATTR_STORE:     tessera_manifest_kind_t = 6;
+pub const TESSERA_MFT_GC_ROOT_LIST:    tessera_manifest_kind_t = 7;
+pub const TESSERA_MFT_DIRECTORY_2L:    tessera_manifest_kind_t = 8;
+pub const TESSERA_MFT_DIRECTORY_BTREE: tessera_manifest_kind_t = 9;
 
 #[repr(C)]
 pub struct tessera_manifest_builder_t { _opaque: [u8; 0] }
@@ -179,6 +199,18 @@ pub struct tessera_chunk_record_t {
     pub logical_offset:    u64,
     pub uncompressed_size: u32,
     pub flags:             u32,
+}
+
+#[repr(C)]
+pub struct tessera_tree_record_t {
+    pub child_manifest_hash: [u8; 32],
+    pub logical_offset:      u64,
+}
+
+#[repr(C)]
+pub struct tessera_dir_bucket_record_t {
+    pub first_name_hash:      u64,
+    pub bucket_manifest_hash: [u8; 32],
 }
 
 extern "C" {
@@ -205,6 +237,13 @@ extern "C" {
     pub fn tessera_manifest_chunk_at(p: *const tessera_manifest_parser_t,
                                       index: u32,
                                       out: *mut tessera_chunk_record_t) -> c_int;
+    pub fn tessera_manifest_tree_at(p: *const tessera_manifest_parser_t,
+                                     index: u32,
+                                     out: *mut tessera_tree_record_t) -> c_int;
+    pub fn tessera_manifest_dir_bucket_at(p: *const tessera_manifest_parser_t,
+                                           index: u32,
+                                           out: *mut tessera_dir_bucket_record_t)
+                                           -> c_int;
     pub fn tessera_manifest_inline_data(p: *const tessera_manifest_parser_t,
                                          out_data: *mut *const u8,
                                          out_len: *mut usize) -> c_int;
