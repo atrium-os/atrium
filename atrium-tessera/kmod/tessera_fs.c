@@ -4372,6 +4372,27 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 		}
 	}
 
+	/* Flush devvp's delayed-write buffers to the device BEFORE the
+	 * barrier. Pack content (tessera_fs_pack_alloc_and_write) and the
+	 * COW btree nodes (meta_bio) are written with bdwrite — they sit on
+	 * devvp's bufobj.bo_dirty list, NOT yet issued to GEOM. A BIO_FLUSH
+	 * only forces the device's volatile write cache to stable storage;
+	 * it does nothing for buffers still in the FreeBSD buffer cache. So
+	 * we must first push those buffers out (VOP_FSYNC, MNT_WAIT issues
+	 * them and waits for completion), THEN barrier-1's BIO_FLUSH makes
+	 * them durable on the host file. This is the batched replacement for
+	 * the per-sector synchronous bwrite the pack path used to do: one
+	 * clustered flush per commit instead of one biowait per file.
+	 *
+	 * Ordering this BEFORE the journal record + SB write is what keeps
+	 * crash-consistency: the data/btree sectors the new roots reference
+	 * are on stable storage before any committed pointer to them is. */
+	if (tmp_->devvp != NULL) {
+		vn_lock(tmp_->devvp, LK_EXCLUSIVE | LK_RETRY);
+		(void)VOP_FSYNC(tmp_->devvp, MNT_WAIT, curthread);
+		VOP_UNLOCK(tmp_->devvp);
+	}
+
 	/* Barrier #1: ensure all prior pack/btree/manifest writes are
 	 * durable on the host file BEFORE we write the journal record
 	 * that names them as committed. Without this, a crash with the
@@ -7247,10 +7268,18 @@ next_p:
  *   1. sha256 the manifest bytes → pack_id (first 16 B) + blob hash.
  *   2. tessera_pack_begin/add_blob/finalize → encoded pack bytes.
  *   3. tessera_extent_alloc on the data zone → start sector.
- *   4. Synchronous bwrite each sector (data must reach disk before
- *      the registry entry pointing at it; bdwrite would let a crash
- *      between the registry put and the sb commit leave a dangling
- *      pointer at unwritten sectors).
+ *   4. DELAYED write (bdwrite) each sector. The pack body is bulk data
+ *      that's only durability-critical once the registry root naming it
+ *      is committed by tessera_commit_sb — and commit_sb pushes ALL
+ *      delayed (pack + meta-btree) buffers to the device via VOP_FSYNC
+ *      on devvp BEFORE its barrier-1 BIO_FLUSH and BEFORE writing the
+ *      SB sector that references them. So the data is durable before the
+ *      registry entry pointing at it ever becomes durable — no dangling
+ *      pointer at unwritten sectors — without paying a synchronous
+ *      biowait per sector (which made metadata-heavy bulk workloads
+ *      I/O-bound: 30k-file tar extracts decelerated as the registry
+ *      btree deepened). Same delayed-write model the meta_bio btree
+ *      writes already use.
  *   5. btree_put a registry entry through the pack_registry_tree.
  *
  * Caller is responsible for: updating any inode-tree records that
@@ -7393,7 +7422,7 @@ tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 	    &contig_start);
 	if (r == TESSERA_OK) {
 		for (uint64_t i = 0; i < n_sectors; i++) {
-			if (tessera_kbio_write(&tmp_->bio_ctx,
+			if (tessera_kbio_write_delayed(&tmp_->bio_ctx,
 			    contig_start + i,
 			    pack_bytes + i * TESSERA_SECTOR_SIZE) != 0) {
 				(void)tessera_extent_free(tmp_->extent_alloc,
@@ -7518,7 +7547,7 @@ tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 		/* Write data extents for this PEL. */
 		for (uint32_t i = 0; i < count; i++) {
 			for (uint64_t j = 0; j < lengths[i]; j++) {
-				if (tessera_kbio_write(&tmp_->bio_ctx,
+				if (tessera_kbio_write_delayed(&tmp_->bio_ctx,
 				    starts[i] + j,
 				    pack_bytes + (data_cursor + j) *
 				        TESSERA_SECTOR_SIZE) != 0)
@@ -7541,8 +7570,8 @@ tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 			pel->extents[i].length_sectors = lengths[i];
 		}
 		if (tessera_encode_pack_extent_list(pel, pel_buf) != TESSERA_OK
-		    || tessera_kbio_write(&tmp_->bio_ctx, pel_sector, pel_buf)
-		        != 0)
+		    || tessera_kbio_write_delayed(&tmp_->bio_ctx, pel_sector,
+		        pel_buf) != 0)
 			_ROLLBACK_AND_RETURN(EIO);
 
 		/* If this isn't the first PEL, link prev → this. */
@@ -7564,7 +7593,7 @@ tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 			prev.next_pel_sector = pel_sector;
 			if (tessera_encode_pack_extent_list(&prev, pel_buf)
 			    != TESSERA_OK ||
-			    tessera_kbio_write(&tmp_->bio_ctx, prev_pel,
+			    tessera_kbio_write_delayed(&tmp_->bio_ctx, prev_pel,
 			    pel_buf) != 0)
 				_ROLLBACK_AND_RETURN(EIO);
 		}
