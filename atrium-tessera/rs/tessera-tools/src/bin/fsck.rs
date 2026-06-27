@@ -22,9 +22,11 @@
 //!   - free-extent cross-check: the pack zone must be exactly partitioned by
 //!     allocated packs + free extents — report free/allocated overlap
 //!     (double-state) and leaked sectors (neither)
+//!   - nlink verification: files' nlink == incoming dirent count; dirs == 2
+//!     (tessera stores no '.'/'..' and doesn't track '..' backlinks)
 //!
 //! Not yet covered (reported as "skipped" where applicable, never silently):
-//! multi-extent pack bodies, nlink-count verification, quota accounting.
+//! multi-extent pack bodies, quota accounting.
 //!
 //! Exit: 0 = clean, 1 = problems found, 2 = usage / I/O error.
 
@@ -54,8 +56,8 @@ struct Fsck {
     manifests: HashMap<Hash, Vec<u8>>,
     // manifests already reachability-checked (dedup + cycle guard)
     checked: HashSet<Hash>,
-    // inode_no → (mode, manifest_hash) for the dirent-reachability walk
-    inode_map: HashMap<u32, (u32, Hash)>,
+    // inode_no → (mode, nlink, manifest_hash) for the reachability + nlink walk
+    inode_map: HashMap<u32, (u32, u32, Hash)>,
     // stats
     inodes: u64,
     packs: u64,
@@ -408,7 +410,7 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
                 let label = format!("inode {ino}");
                 fsck.reach(&manifest, true, &label, 0);
                 fsck.reach(&xattr, false, &format!("{label} xattr"), 0);
-                fsck.inode_map.insert(ino, (mode, manifest));
+                fsck.inode_map.insert(ino, (mode, nlink, manifest));
 
                 if tessera_btree_cursor_next(cur) != 0 { break; }
             }
@@ -427,14 +429,17 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
         let mut stack = vec![root];
         reachable.insert(root);
         let mut dangling = Vec::new();
+        // incoming dirent references per inode (for nlink verification)
+        let mut links: HashMap<u32, u32> = HashMap::new();
         while let Some(ino) = stack.pop() {
-            let (mode, manifest) = match fsck.inode_map.get(&ino) { Some(x) => *x, None => continue };
+            let (mode, _nlink, manifest) = match fsck.inode_map.get(&ino) { Some(x) => *x, None => continue };
             if mode & S_IFMT != S_IFDIR { continue; }
             let mut ents = Vec::new();
             fsck.collect_dirents(&manifest, &mut ents, 0);
             for (child, name) in ents {
                 if name == "." || name == ".." { continue; }
                 let c = child as u32;
+                *links.entry(c).or_insert(0) += 1;
                 if !fsck.inode_map.contains_key(&c) {
                     dangling.push(format!("dangling dirent: inode {ino} entry '{name}' -> inode {child} (not in inode tree)"));
                 } else if reachable.insert(c) {
@@ -449,6 +454,25 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
         for o in &orphans {
             fsck.problem(format!("orphan inode {o} (not reachable from the root dir)"));
         }
+        // nlink verification: files = incoming dirent count; dirs = 2
+        // (tessera stores no '.'/'..' and doesn't track '..' backlinks, so a
+        // directory's nlink is fixed at 2 = parent's entry + implicit '.').
+        let mut ino_sorted: Vec<u32> = fsck.inode_map.keys().copied().collect();
+        ino_sorted.sort_unstable();
+        let mut nlink_problems = Vec::new();
+        for ino in ino_sorted {
+            let (mode, nlink, _) = fsck.inode_map[&ino];
+            let is_dir = mode & S_IFMT == S_IFDIR;
+            let expected = if is_dir { 2 } else { *links.get(&ino).unwrap_or(&0) };
+            // root has no parent dirent but is still nlink 2; only check
+            // reachable inodes (orphans already reported separately).
+            if reachable.contains(&ino) && nlink != expected {
+                nlink_problems.push(format!(
+                    "inode {ino}: nlink {nlink} but {expected} {} reference(s)",
+                    if is_dir { "expected (dir)" } else { "dirent" }));
+            }
+        }
+        for p in nlink_problems { fsck.problem(p); }
     }
 
     // ── Pass D: free-extent vs allocation cross-check ────────────
