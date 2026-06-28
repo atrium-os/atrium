@@ -631,28 +631,28 @@ static int  tessera_fs_count_multi_extent(struct tessera_mount *tmp_,
 /*
  * File-size caps for the write/truncate/putpages paths.
  *
- * TESSERA_WRITE_MAX_BYTES is the overall ceiling on a regular file's
- * logical size. The sequential-append fast-paths
- * (tessera_fs_append_chunked / tessera_fs_append_chunk_tree) only ever
- * hold one write's worth of bytes plus a single chunk in RAM, so they
- * scale to this full ceiling without large contiguous allocations.
- * Streaming extraction (tar, cp) of a multi-hundred-MB file therefore
- * works — which is what root-on-tessera needs (FreeBSD base.txz ships
- * libprivatellvm.so / libprivateclang.so at 70-90 MB). The ceiling
- * exists only so a bogus offset (e.g. pwrite at 1<<48) is rejected
- * before it reaches quota/allocator math; real limits come from quota.
+ * TESSERA_WRITE_MAX_BYTES is a SANITY ceiling, not a real size limit.
+ * The sequential-append fast-paths (tessera_fs_append_chunked /
+ * tessera_fs_append_chunk_tree) only ever hold one write plus a single
+ * chunk in RAM, and chunk_size_for() crosses tiers exactly once (at
+ * 64 MiB) before settling on a terminal 1 MiB chunk — so a file grows
+ * arbitrarily large by append, bounded by quota and free space, NOT by
+ * this constant. It exists only to reject a bogus offset (e.g. pwrite at
+ * 1<<60) before it reaches quota/allocator math. 256 TiB: larger than
+ * any volume we run, small enough to catch garbage.
  *
- * TESSERA_WRITE_MATERIALIZE_MAX is the tighter bound for the
- * read-modify-write SLOW paths that must materialise the whole file in
- * one contiguous M_WAITOK buffer: an in-place overwrite that isn't a
- * pure append, a truncate-extend, an mmap putpages flush, and the
- * one-shot CHUNK_LIST→CHUNK_TREE / chunk-tier-transition rebuilds the
- * append path bounces to. Those cost up to ~2x the file size in kernel
- * memory, so they stay bounded even as the streaming ceiling rises. A
- * non-append write past this bound returns EFBIG rather than risk
- * exhausting kernel memory; the file can still be appended and read.
+ * TESSERA_WRITE_MATERIALIZE_MAX is a real bound, but on an OPERATION,
+ * not on file size. It limits the read-modify-write SLOW paths that must
+ * hold the whole file in one contiguous M_WAITOK buffer: an in-place
+ * overwrite that isn't a pure append, a truncate-extend, an mmap
+ * putpages flush, and the one-shot CHUNK_LIST→CHUNK_TREE promotion plus
+ * the single 64 MiB chunk-tier rebuild. You cannot malloc a 100 GiB
+ * contiguous buffer, so those return EFBIG past this bound — but a huge
+ * file is still fine to create (append), grow, and read; only a
+ * non-append rewrite / truncate-extend of a span larger than this is
+ * refused.
  */
-#define TESSERA_WRITE_MAX_BYTES        (4ULL * 1024 * 1024 * 1024) /* 4 GiB */
+#define TESSERA_WRITE_MAX_BYTES        (256ULL * 1024 * 1024 * 1024 * 1024) /* 256 TiB sanity */
 #define TESSERA_WRITE_MATERIALIZE_MAX  (512ULL * 1024 * 1024)      /* 512 MiB */
 
 /* v2-step-3a: chunked-write helpers. */
@@ -9858,21 +9858,27 @@ out:
  * Adaptive chunk size by file size (step-3b).
  *
  *     final_size < 64 MiB  → 64 KiB chunks (16 records / MiB)
- *     final_size < 4 GiB   → 1 MiB chunks  (~1k records / GiB)
- *     final_size ≥ 4 GiB   → 4 MiB chunks  (~256 records / GiB)
+ *     final_size ≥ 64 MiB  → 1 MiB chunks  (~1k records / GiB)
  *
- * Without this, a 100 GiB file at 64 KiB chunks would produce ~1.6M
- * chunk_records (~75 MiB CHUNK_LIST manifest body) — past the point
- * where the linear-scan manifest design is reasonable. With adaptive
- * sizing, manifest stays under a few MiB even at 100 GiB.
+ * 64 KiB keeps dedup fine-grained for the common small file; 1 MiB keeps
+ * the manifest small for everything bigger (a 1 TiB file is ~1M chunks =
+ * ~4096 CHUNK_TREE groups, a ~200 KiB outer manifest).
  *
- * Trade-off: cross-tier writes (file grows from < 64 MiB to > 64 MiB)
- * can't dedup against prior chunks (different sizes → different
- * hashes). New chunks are re-published. The win on manifest size is
- * worth the dedup loss at tier transitions.
+ * Only TWO tiers, and they cross exactly once: 1 MiB is the *terminal*
+ * chunk size, so a file that grows past 64 MiB re-chunks once (a bounded
+ * ~64 MiB whole-file rewrite, under TESSERA_WRITE_MATERIALIZE_MAX) and
+ * then streams via tessera_fs_append_chunk_tree forever with no further
+ * size-tier transition. That is what lets a file grow ARBITRARILY large
+ * by append — bounded only by quota and free space. (A third 4 MiB tier
+ * used to kick in at 4 GiB, but that transition would re-materialise the
+ * whole multi-GiB file in one buffer — refused by the materialise cap —
+ * and capped files at ~4 GiB. 1 MiB chunks scale fine without it; truly
+ * petabyte files would want a multi-level CHUNK_TREE instead, not a
+ * coarser leaf chunk.)
  *
- * CHUNK_TREE (step-3c) provides log(N)-amplification for VM-scale
- * files where small chunks are required.
+ * Trade-off: the one cross-tier write at 64 MiB can't dedup against the
+ * prior 64 KiB chunks (different sizes → different hashes); they are
+ * re-published once. Worth it for the manifest-size win.
  */
 static inline uint32_t
 tessera_chunk_size_for(struct tessera_mount *tmp_, uint64_t file_size)
@@ -9884,9 +9890,7 @@ tessera_chunk_size_for(struct tessera_mount *tmp_, uint64_t file_size)
 
 	if (file_size <  (64ULL * 1024ULL * 1024ULL))         /* < 64 MiB */
 		return ( 64u * 1024u);
-	if (file_size <  ( 4ULL * 1024ULL * 1024ULL * 1024ULL))/* < 4 GiB */
-		return (  1u * 1024u * 1024u);
-	return (  4u * 1024u * 1024u);                        /* ≥ 4 GiB */
+	return (  1u * 1024u * 1024u);                        /* ≥ 64 MiB */
 }
 
 /*
