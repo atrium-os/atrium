@@ -544,6 +544,61 @@ tessera_kbio_write_delayed(void *ctx, uint64_t sector, const uint8_t *buf)
 	return (0);
 }
 
+/*
+ * Bulk write of a contiguous run of sectors via the GEOM consumer in
+ * large (maxphys) I/Os, bypassing the buffer cache. The per-sector
+ * delayed-write path above is correct but turns a 12 MiB pack into ~3000
+ * 4 KiB buffers → ~3000 tiny BIOs at flush → I/O-bound at a fraction of
+ * the device's large-I/O bandwidth (measured ~0.5 MB/s vs ~20 MB/s raw).
+ * One g_write_data per maxphys chunk collapses that to a handful of large
+ * BIOs.
+ *
+ * g_write_data is synchronous, so on return the pack body is on the
+ * device (ahead of the registry entry that will name it and the SB that
+ * commits the registry — the data-before-pointer invariant commit_sb's
+ * barrier already relies on). Because it bypasses the buffer cache, we
+ * then drop any cached buffers over the written range so a later bread
+ * (the on-demand reader) re-reads fresh from disk — matters only when GC
+ * has recycled sectors that were previously cached. getblk(GB_NOCREAT)
+ * is a cheap hash probe for the common freshly-allocated case.
+ *
+ * Returns 0 on success, -1 to signal the caller to fall back to the
+ * per-sector buffer-cache path (e.g. no GEOM consumer available).
+ */
+static int
+tessera_kbio_write_bulk(struct tessera_kbio_ctx *k, uint64_t start_sector,
+    const uint8_t *bytes, uint64_t n_sectors)
+{
+	if (k->cp == NULL) return (-1);
+	const off_t base = (off_t)start_sector * TESSERA_SECTOR_SIZE;
+	const off_t total = (off_t)n_sectors * TESSERA_SECTOR_SIZE;
+	off_t io = (off_t)maxphys;
+	if (io <= 0 || io > (1 << 20)) io = (1 << 20);   /* cap at 1 MiB */
+	io -= (io % TESSERA_SECTOR_SIZE);                /* sector-align */
+	if (io < TESSERA_SECTOR_SIZE) io = TESSERA_SECTOR_SIZE;
+
+	for (off_t off = 0; off < total; off += io) {
+		off_t len = total - off;
+		if (len > io) len = io;
+		int err = g_write_data(k->cp, base + off,
+		    __DECONST(void *, bytes + off), len);
+		if (err != 0)
+			return (-1);
+	}
+
+	/* Read-coherence: invalidate any cached buffers over the range. */
+	for (uint64_t i = 0; i < n_sectors; i++) {
+		struct buf *bp = getblk(k->devvp,
+		    (start_sector + i) * btodb(TESSERA_SECTOR_SIZE),
+		    TESSERA_SECTOR_SIZE, 0, 0, GB_NOCREAT);
+		if (bp != NULL) {
+			bp->b_flags |= B_INVAL | B_NOCACHE;
+			brelse(bp);
+		}
+	}
+	return (0);
+}
+
 /* Forward decl — defined inline below so we can take the mount's
  * extent_alloc field. */
 static int tessera_kbio_alloc(void *ctx, uint64_t n, uint64_t *out_sector);
@@ -5513,6 +5568,51 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, cas_verify_reads, CTLFLAG_RW,
     &tessera_cas_verify_reads, 0,
     "Re-hash each blob on read to verify content integrity (slow; default off)");
 
+/* Debug microbench for tessera_sha256. Write the per-call chunk size in
+ * KiB; the handler hashes a fixed ~128 MiB total in chunks of that size
+ * (one Init/Update/Final per chunk, matching the real per-chunk hashing)
+ * and prints MB/s to the console. Compare chunk=1024 (1 MiB, the real
+ * grain) vs chunk=131072 (one 128 MiB hash) to separate raw SHA-256
+ * throughput from per-call overhead. */
+static int
+tessera_sysctl_sha_bench(SYSCTL_HANDLER_ARGS)
+{
+	int chunk_kib = 1024;
+	int err = sysctl_handle_int(oidp, &chunk_kib, 0, req);
+	if (err != 0 || req->newptr == NULL)
+		return (err);
+	if (chunk_kib < 1 || chunk_kib > 131072)
+		return (EINVAL);
+	const size_t chunk = (size_t)chunk_kib * 1024u;
+	const size_t total = 128u * 1024u * 1024u;
+	size_t iters = total / chunk;
+	if (iters == 0) iters = 1;
+	uint8_t *buf = malloc(chunk, M_TESSERA, M_WAITOK);
+	arc4rand(buf, chunk, 0);
+	tessera_hash_t h;
+	struct timespec t0, t1;
+	nanouptime(&t0);
+	for (size_t i = 0; i < iters; i++)
+		tessera_sha256(buf, chunk, h);
+	nanouptime(&t1);
+	free(buf, M_TESSERA);
+	uint64_t a = (uint64_t)t0.tv_sec * 1000000000ULL + (uint64_t)t0.tv_nsec;
+	uint64_t b = (uint64_t)t1.tv_sec * 1000000000ULL + (uint64_t)t1.tv_nsec;
+	uint64_t ns = b - a;
+	uint64_t bytes = (uint64_t)iters * chunk;
+	uint64_t ms  = ns / 1000000ULL;
+	uint64_t mib = bytes >> 20;
+	uint64_t mbps = (ms > 0) ? (mib * 1000ULL / ms) : 0;
+	printf("tessera: sha_bench chunk=%d KiB hashed %lu MiB in %lu ms "
+	    "= %lu MB/s\n", chunk_kib, (unsigned long)mib,
+	    (unsigned long)ms, (unsigned long)mbps);
+	return (0);
+}
+SYSCTL_PROC(_kern_tessera, OID_AUTO, sha_bench,
+    CTLTYPE_INT | CTLFLAG_RW, NULL, 0, tessera_sysctl_sha_bench, "I",
+    "Microbench tessera_sha256: write per-call chunk size in KiB; "
+    "prints MB/s to console");
+
 /* Tier A — location entries. Default 16384 entries (~1 MiB). */
 static unsigned long tessera_cas_loc_max = 16384;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_loc_max, CTLFLAG_RW,
@@ -7556,13 +7656,27 @@ tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 	    tessera_extent_alloc(tmp_->extent_alloc, n_sectors,
 	    &contig_start);
 	if (r == TESSERA_OK) {
-		for (uint64_t i = 0; i < n_sectors; i++) {
-			if (tessera_kbio_write_delayed(&tmp_->bio_ctx,
-			    contig_start + i,
-			    pack_bytes + i * TESSERA_SECTOR_SIZE) != 0) {
-				(void)tessera_extent_free(tmp_->extent_alloc,
-				    contig_start, n_sectors);
-				return (EIO);
+		/* Large packs: one bulk GEOM write (few large BIOs). Small
+		 * packs (manifests, metadata) keep the per-sector delayed path
+		 * — they batch cheaply at commit and the bulk path's synchronous
+		 * round-trip would regress metadata-heavy workloads (30k-file
+		 * extracts). 8 sectors = 32 KiB is the crossover. */
+		int wrote_bulk = 0;
+		if (n_sectors >= 8) {
+			if (tessera_kbio_write_bulk(&tmp_->bio_ctx, contig_start,
+			    pack_bytes, n_sectors) == 0)
+				wrote_bulk = 1;
+		}
+		if (!wrote_bulk) {
+			for (uint64_t i = 0; i < n_sectors; i++) {
+				if (tessera_kbio_write_delayed(&tmp_->bio_ctx,
+				    contig_start + i,
+				    pack_bytes + i * TESSERA_SECTOR_SIZE) != 0) {
+					(void)tessera_extent_free(
+					    tmp_->extent_alloc, contig_start,
+					    n_sectors);
+					return (EIO);
+				}
 			}
 		}
 		out->start_sector   = contig_start;
