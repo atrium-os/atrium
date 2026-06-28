@@ -628,6 +628,33 @@ static int  tessera_fs_repack_pass(struct tessera_mount *tmp_,
 static int  tessera_fs_count_multi_extent(struct tessera_mount *tmp_,
                                           uint32_t *out_count);
 
+/*
+ * File-size caps for the write/truncate/putpages paths.
+ *
+ * TESSERA_WRITE_MAX_BYTES is the overall ceiling on a regular file's
+ * logical size. The sequential-append fast-paths
+ * (tessera_fs_append_chunked / tessera_fs_append_chunk_tree) only ever
+ * hold one write's worth of bytes plus a single chunk in RAM, so they
+ * scale to this full ceiling without large contiguous allocations.
+ * Streaming extraction (tar, cp) of a multi-hundred-MB file therefore
+ * works — which is what root-on-tessera needs (FreeBSD base.txz ships
+ * libprivatellvm.so / libprivateclang.so at 70-90 MB). The ceiling
+ * exists only so a bogus offset (e.g. pwrite at 1<<48) is rejected
+ * before it reaches quota/allocator math; real limits come from quota.
+ *
+ * TESSERA_WRITE_MATERIALIZE_MAX is the tighter bound for the
+ * read-modify-write SLOW paths that must materialise the whole file in
+ * one contiguous M_WAITOK buffer: an in-place overwrite that isn't a
+ * pure append, a truncate-extend, an mmap putpages flush, and the
+ * one-shot CHUNK_LIST→CHUNK_TREE / chunk-tier-transition rebuilds the
+ * append path bounces to. Those cost up to ~2x the file size in kernel
+ * memory, so they stay bounded even as the streaming ceiling rises. A
+ * non-append write past this bound returns EFBIG rather than risk
+ * exhausting kernel memory; the file can still be appended and read.
+ */
+#define TESSERA_WRITE_MAX_BYTES        (4ULL * 1024 * 1024 * 1024) /* 4 GiB */
+#define TESSERA_WRITE_MATERIALIZE_MAX  (512ULL * 1024 * 1024)      /* 512 MiB */
+
 /* v2-step-3a: chunked-write helpers. */
 struct tessera_chunk_in {
 	tessera_hash_t  hash;
@@ -3827,10 +3854,12 @@ tessera_vop_setattr(struct vop_setattr_args *ap)
 	int did_resize = 0;
 	if (seen_size) {
 		uint64_t new_size = (uint64_t)vap->va_size;
-		/* Reject impossibly-large truncates before they reach the
-		 * malloc — vop_write has the same cap. Without this, a
-		 * truncate(file, 1<<48) sleeps forever in M_WAITOK. */
-		if (new_size > (uint64_t)(64u * 1024u * 1024u))
+		/* Truncate-extend materialises the whole new file in one
+		 * contiguous M_WAITOK buffer, so it is bounded by the
+		 * slow-path materialise cap (not the higher streaming
+		 * ceiling). Without this, a truncate(file, 1<<48) sleeps
+		 * forever in M_WAITOK. */
+		if (new_size > TESSERA_WRITE_MATERIALIZE_MAX)
 			return (EFBIG);
 		if (new_size != ino.size) {
 			/* Drain any coalesced writes so the on-disk content
@@ -4109,8 +4138,9 @@ tessera_vop_putpages(struct vop_putpages_args *ap)
 		for (int i = 0; i < npages; i++) rtvals[i] = VM_PAGER_OK;
 		return (VM_PAGER_OK);
 	}
-	if (new_size > (64u * 1024u * 1024u)) {
-		/* Match TESSERA_WRITE_MAX_BYTES — defined later in file. */
+	if (new_size > TESSERA_WRITE_MATERIALIZE_MAX) {
+		/* putpages materialises the whole file in one contiguous
+		 * buffer; bounded by the slow-path materialise cap. */
 		for (int i = 0; i < npages; i++) rtvals[i] = VM_PAGER_FAIL;
 		return (VM_PAGER_FAIL);
 	}
@@ -5473,6 +5503,16 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, cas_enable, CTLFLAG_RW,
     &tessera_cas_enable, 0,
     "Enable the CAS read cache (1=on, 0=off — disables both insert and lookup)");
 
+/* When set, the sector-on-demand reader re-verifies sha256(blob) == hash
+ * on every fetch. Off by default: blob content is already CRC-protected
+ * per pack at write time and validated end-to-end by tessera-fsck, and a
+ * software-SHA256 over every byte read dominates large-file read time
+ * (~10x the actual I/O). Turn on for paranoid/diagnostic runs. */
+static int tessera_cas_verify_reads = 0;
+SYSCTL_INT(_kern_tessera, OID_AUTO, cas_verify_reads, CTLFLAG_RW,
+    &tessera_cas_verify_reads, 0,
+    "Re-hash each blob on read to verify content integrity (slow; default off)");
+
 /* Tier A — location entries. Default 16384 entries (~1 MiB). */
 static unsigned long tessera_cas_loc_max = 16384;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_loc_max, CTLFLAG_RW,
@@ -6649,12 +6689,205 @@ tessera_commit_extent(struct tessera_mount *tmp_)
  * frees with M_TESSERA), *out_len is the byte length, return 0.
  * Returns ENOENT if no pack contains the blob.
  *
- * Round-4b note: this whole-pack-into-RAM strategy is wasteful for
- * large packs but correct and small. Round-5+ replaces it with a
- * sector-on-demand reader that walks the on-disk header → index →
- * data layout via bread, never materialising the whole pack.
+ * Round-5: a sector-on-demand reader (tessera_fs_pack_fetch_ondemand)
+ * walks the on-disk header → index → data layout via bread and reads
+ * only the header, the index, and the target blob's own sectors — never
+ * the whole pack. A 1 MiB chunk inside a 12 MiB pack costs ~1 MiB of
+ * I/O, not 12 MiB, which is what makes large-file (root-on-tessera)
+ * reads tractable. The blob's content hash is re-verified on read, so
+ * dropping the whole-pack CRC check costs no integrity.
  */
-#define TESSERA_FETCH_PACK_MAX_SECTORS  4096u   /* 16 MiB cap */
+/* Sanity ceiling on a registered pack's sector length. On-demand reads
+ * never materialise a whole pack, so this only rejects corrupt/garbage
+ * registry entries — set well above any pack the writer emits. */
+#define TESSERA_FETCH_PACK_MAX_SECTORS  (262144u)   /* 1 GiB */
+
+/*
+ * bread one pack-internal sector (pack_sector, 0-based from the pack
+ * header) by mapping it through the pack's extent list to a device
+ * sector. Copies TESSERA_SECTOR_SIZE bytes into out.
+ */
+static int
+tessera_fs_pack_bread_sector(struct tessera_mount *tmp_,
+    const tessera_pack_extent_t *exts, uint32_t nexts,
+    uint64_t pack_sector, uint8_t out[TESSERA_SECTOR_SIZE])
+{
+	uint64_t base = 0;
+	for (uint32_t e = 0; e < nexts; e++) {
+		if (pack_sector < base + exts[e].length_sectors) {
+			const uint64_t dev =
+			    exts[e].start_sector + (pack_sector - base);
+			struct buf *bp = NULL;
+			int err = bread(tmp_->devvp,
+			    dev * btodb(TESSERA_SECTOR_SIZE),
+			    TESSERA_SECTOR_SIZE,
+			    tmp_->bio_ctx.cred ? tmp_->bio_ctx.cred : NOCRED,
+			    &bp);
+			if (err != 0) { if (bp != NULL) brelse(bp); return (EIO); }
+			memcpy(out, bp->b_data, TESSERA_SECTOR_SIZE);
+			brelse(bp);
+			return (0);
+		}
+		base += exts[e].length_sectors;
+	}
+	return (EIO);  /* sector past end of pack */
+}
+
+/*
+ * Read an arbitrary byte range [byte_off, byte_off+len) from a pack into
+ * dst, crossing sector and extent boundaries. total_sectors bounds the
+ * pack so a corrupt offset can't run off the end.
+ */
+static int
+tessera_fs_pack_read_range(struct tessera_mount *tmp_,
+    const tessera_pack_extent_t *exts, uint32_t nexts, uint64_t total_sectors,
+    uint64_t byte_off, uint64_t len, uint8_t *dst)
+{
+	/* Heap, not stack: a 4 KiB sector buffer on a deep VFS call chain
+	 * (vop_read → read_into_uio → fetch_blob → here) overflows the
+	 * 16 KiB kernel stack and faults the VM. */
+	uint8_t *sec = malloc(TESSERA_SECTOR_SIZE, M_TESSERA, M_WAITOK);
+	uint64_t done = 0;
+	while (done < len) {
+		const uint64_t abs = byte_off + done;
+		const uint64_t ps  = abs / TESSERA_SECTOR_SIZE;
+		const uint32_t so  = (uint32_t)(abs % TESSERA_SECTOR_SIZE);
+		if (ps >= total_sectors) { free(sec, M_TESSERA); return (EIO); }
+		int err = tessera_fs_pack_bread_sector(tmp_, exts, nexts, ps, sec);
+		if (err != 0) { free(sec, M_TESSERA); return (err); }
+		uint32_t n = TESSERA_SECTOR_SIZE - so;
+		if ((uint64_t)n > len - done) n = (uint32_t)(len - done);
+		memcpy(dst + done, sec + so, n);
+		done += n;
+	}
+	free(sec, M_TESSERA);
+	return (0);
+}
+
+/*
+ * Sector-on-demand blob fetch. Reads the pack header, binary-searches
+ * the on-disk index for `hash`, and reads just that blob's bytes. On a
+ * hit it re-verifies sha256(bytes) == hash. When warm_pack_id != NULL,
+ * every index hash is seeded into the CAS location cache pointing at this
+ * pack, so a cold sequential read warms the cache one pack-scan rather
+ * than re-scanning per chunk.
+ */
+static int
+tessera_fs_pack_fetch_ondemand(struct tessera_mount *tmp_,
+    const tessera_pack_extent_t *exts, uint32_t nexts, uint64_t total_sectors,
+    const tessera_hash_t hash, const uint8_t *warm_pack_id,
+    uint8_t **out_buf, uint32_t *out_len)
+{
+	/* Heap, not stack: both the 4 KiB sector buffer AND the decoded
+	 * header (tessera_pack_header_t is itself 4096 bytes) would blow the
+	 * kernel stack on the deep VFS read chain. Pull the few fields we
+	 * need into scalars, then drop the big buffers immediately. */
+	uint8_t *hdrsec = malloc(TESSERA_SECTOR_SIZE, M_TESSERA, M_WAITOK);
+	tessera_pack_header_t *hdr =
+	    malloc(sizeof *hdr, M_TESSERA, M_WAITOK);
+	if (tessera_fs_pack_bread_sector(tmp_, exts, nexts, 0, hdrsec) != 0 ||
+	    tessera_decode_pack_header(hdrsec, hdr) != TESSERA_OK) {
+		free(hdrsec, M_TESSERA);
+		free(hdr, M_TESSERA);
+		return (EIO);
+	}
+	const uint32_t bc          = hdr->blob_count;
+	const uint32_t index_blocks = hdr->index_blocks;
+	const uint64_t hdr_data_off = hdr->data_offset;
+	free(hdrsec, M_TESSERA);
+	free(hdr, M_TESSERA);
+	if (bc == 0) return (ENOENT);
+
+	/* Read the whole index (index_blocks sectors from sector 1) — a few
+	 * KiB even for a full fan-out — then binary-search it in RAM. */
+	const uint64_t idx_bytes =
+	    (uint64_t)index_blocks * TESSERA_SECTOR_SIZE;
+	if (idx_bytes == 0 ||
+	    (uint64_t)bc * TESSERA_PACK_INDEX_ENTRY_SIZE > idx_bytes)
+		return (EIO);
+	uint8_t *idx = malloc(idx_bytes, M_TESSERA, M_NOWAIT);
+	if (idx == NULL) return (ENOMEM);
+	if (tessera_fs_pack_read_range(tmp_, exts, nexts, total_sectors,
+	    TESSERA_SECTOR_SIZE, idx_bytes, idx) != 0) {
+		free(idx, M_TESSERA);
+		return (EIO);
+	}
+
+	int lo = 0, hi = (int)bc - 1, found = 0;
+	tessera_pack_index_entry_t ie;
+	while (lo <= hi) {
+		const int mid = lo + (hi - lo) / 2;
+		const uint8_t *e = idx +
+		    (size_t)mid * TESSERA_PACK_INDEX_ENTRY_SIZE;
+		const int c = memcmp(e, hash, 32);
+		if (c == 0) {
+			if (tessera_decode_pack_index_entry(e, &ie) != TESSERA_OK) {
+				free(idx, M_TESSERA);
+				return (EIO);
+			}
+			found = 1;
+			break;
+		}
+		if (c < 0) lo = mid + 1; else hi = mid - 1;
+	}
+
+	/* Warm the location cache for every blob in this pack (cheap; the
+	 * index is already in RAM). Snapshot up to 4 extents inline. */
+	if (found && warm_pack_id != NULL) {
+		tessera_pack_extent_t snap[4];
+		uint8_t snap_n = (nexts <= 4) ? (uint8_t)nexts : (uint8_t)0xFF;
+		if (snap_n <= 4)
+			for (uint32_t i = 0; i < nexts; i++) snap[i] = exts[i];
+		for (uint32_t i = 0; i < bc; i++) {
+			const uint8_t *e = idx +
+			    (size_t)i * TESSERA_PACK_INDEX_ENTRY_SIZE;
+			tessera_hash_t bh;
+			memcpy(bh, e, sizeof bh);
+			tessera_cas_loc_insert(&tmp_->cas_cache, bh,
+			    warm_pack_id, snap, snap_n, total_sectors);
+		}
+	}
+	free(idx, M_TESSERA);
+	if (!found) return (ENOENT);
+
+	/* Read the blob: 16-byte descriptor + data_size bytes at
+	 * header.data_offset + index.data_offset. */
+	const uint64_t blob_off = hdr_data_off + ie.data_offset;
+	const uint32_t dlen = ie.data_size;
+
+	uint8_t descbuf[sizeof(tessera_blob_descriptor_t)];
+	if (tessera_fs_pack_read_range(tmp_, exts, nexts, total_sectors,
+	    blob_off, sizeof descbuf, descbuf) != 0)
+		return (EIO);
+	tessera_blob_descriptor_t bd;
+	if (tessera_decode_blob_descriptor(descbuf, &bd) != TESSERA_OK ||
+	    bd.uncompressed_size != dlen)
+		return (EIO);
+
+	uint8_t *buf = malloc(dlen ? dlen : 1, M_TESSERA, M_WAITOK);
+	if (dlen > 0) {
+		if (tessera_fs_pack_read_range(tmp_, exts, nexts, total_sectors,
+		    blob_off + sizeof(tessera_blob_descriptor_t), dlen,
+		    buf) != 0) {
+			free(buf, M_TESSERA);
+			return (EIO);
+		}
+		/* Content-addressed integrity: when enabled, the returned bytes
+		 * must hash to the key we looked them up by. Off by default —
+		 * see tessera_cas_verify_reads. */
+		if (tessera_cas_verify_reads) {
+			tessera_hash_t check;
+			tessera_sha256(buf, dlen, check);
+			if (memcmp(check, hash, sizeof check) != 0) {
+				free(buf, M_TESSERA);
+				return (EIO);
+			}
+		}
+	}
+	*out_buf = buf;
+	*out_len = dlen;
+	return (0);
+}
 
 static int
 tessera_fs_fetch_blob(struct tessera_mount *tmp_,
@@ -6716,71 +6949,27 @@ tessera_fs_fetch_blob(struct tessera_mount *tmp_,
 				if (need_free_exts) free(exts, M_TESSERA);
 				goto cas_fast_miss;
 			}
-			const size_t pack_len =
-			    (size_t)total_sectors * TESSERA_SECTOR_SIZE;
-			uint8_t *packbuf = malloc(pack_len, M_TESSERA, M_NOWAIT);
-			if (packbuf == NULL) {
-				if (need_free_exts) free(exts, M_TESSERA);
-				goto cas_fast_miss;
-			}
-			int read_ok = 1;
-			uint64_t cursor = 0;
-			for (uint32_t e = 0; e < nexts && read_ok; e++) {
-				for (uint64_t i = 0;
-				    i < exts[e].length_sectors; i++) {
-					struct buf *bp = NULL;
-					int err = bread(tmp_->devvp,
-					    (exts[e].start_sector + i) *
-					        btodb(TESSERA_SECTOR_SIZE),
-					    TESSERA_SECTOR_SIZE,
-					    tmp_->bio_ctx.cred ?
-					        tmp_->bio_ctx.cred : NOCRED,
-					    &bp);
-					if (err != 0) {
-						if (bp != NULL) brelse(bp);
-						read_ok = 0;
-						break;
-					}
-					memcpy(packbuf +
-					    (cursor + i) * TESSERA_SECTOR_SIZE,
-					    bp->b_data, TESSERA_SECTOR_SIZE);
-					brelse(bp);
-				}
-				cursor += exts[e].length_sectors;
-			}
+			/* Sector-on-demand read: header + index + this blob's
+			 * own sectors only. The location is already cached, so
+			 * no warm-seed pass is needed here. */
+			uint8_t *obuf = NULL;
+			uint32_t olen = 0;
+			int frc = tessera_fs_pack_fetch_ondemand(tmp_, exts,
+			    nexts, total_sectors, hash, NULL, &obuf, &olen);
 			if (need_free_exts) free(exts, M_TESSERA);
-			if (!read_ok) {
-				free(packbuf, M_TESSERA);
-				goto cas_fast_miss;
-			}
-			tessera_pack_reader_t *pr =
-			    tessera_pack_open(packbuf, pack_len);
-			if (pr == NULL) {
-				free(packbuf, M_TESSERA);
-				goto cas_fast_miss;
-			}
-			const uint8_t *bytes = NULL;
-			uint32_t blen = 0;
-			if (tessera_pack_lookup(pr, hash, &bytes, &blen)
-			    == TESSERA_OK) {
-				uint8_t *copy = malloc(blen, M_TESSERA, M_WAITOK);
-				memcpy(copy, bytes, blen);
-				*out_buf = copy;
-				*out_len = blen;
-				/* Stash bytes for next time (eligibility
+			if (frc == 0) {
+				*out_buf = obuf;
+				*out_len = olen;
+				/* Stash small blobs for next time (eligibility
 				 * checked in cas_byte_insert). */
 				tessera_cas_byte_insert(&tmp_->cas_cache,
-				    hash, bytes, blen);
-				tessera_pack_close(pr);
-				free(packbuf, M_TESSERA);
+				    hash, obuf, olen);
 				return (0);
 			}
 			/* Cached pack_id no longer contains this hash —
 			 * stale entry (e.g. post-repack). Fall through to
 			 * the slow scan; stage 4's invalidation should
 			 * normally prevent this. */
-			tessera_pack_close(pr);
-			free(packbuf, M_TESSERA);
 		}
 	}
 cas_fast_miss:
@@ -6807,85 +6996,31 @@ cas_fast_miss:
 			goto next_pack;
 		}
 
-		const size_t pack_len =
-		    (size_t)re.length_sectors * TESSERA_SECTOR_SIZE;
-		uint8_t *packbuf = malloc(pack_len, M_TESSERA, M_NOWAIT);
-		if (packbuf == NULL) goto next_pack;
-
 		tessera_pack_extent_t *exts = NULL;
 		uint32_t nexts = 0;
 		if (tessera_fs_pack_extents_resolve(tmp_, &re, &exts, &nexts)
-		    != 0) {
-			free(packbuf, M_TESSERA);
+		    != 0)
 			goto next_pack;
-		}
 
-		/* Snapshot the first 4 extents for the CAS-cache insert
-		 * (in case this is the pack containing our hash).
-		 * Multi-extent packs beyond 4 fall back to the resolver. */
-		tessera_pack_extent_t snap_exts[4];
-		uint8_t snap_n = (nexts <= 4) ? (uint8_t)nexts : (uint8_t)0xFF;
-		if (snap_n <= 4) {
-			for (uint32_t i = 0; i < nexts; i++)
-				snap_exts[i] = exts[i];
-		}
-
-		int read_ok = 1;
-		uint64_t cursor = 0;
-		for (uint32_t e = 0; e < nexts && read_ok; e++) {
-			for (uint64_t i = 0; i < exts[e].length_sectors; i++) {
-				struct buf *bp = NULL;
-				int err = bread(tmp_->devvp,
-				    (exts[e].start_sector + i) *
-				        btodb(TESSERA_SECTOR_SIZE),
-				    TESSERA_SECTOR_SIZE,
-				    tmp_->bio_ctx.cred ?
-				        tmp_->bio_ctx.cred : NOCRED,
-				    &bp);
-				if (err != 0) {
-					if (bp != NULL) brelse(bp);
-					read_ok = 0;
-					break;
-				}
-				memcpy(packbuf +
-				    (cursor + i) * TESSERA_SECTOR_SIZE,
-				    bp->b_data, TESSERA_SECTOR_SIZE);
-				brelse(bp);
-			}
-			cursor += exts[e].length_sectors;
-		}
+		/* Sector-on-demand: read the header + index for this pack and,
+		 * only if it holds `hash`, read that blob's own sectors. Packs
+		 * that don't contain the hash cost a header + index read, not a
+		 * whole-pack read. On a hit, warm the location cache for every
+		 * blob in the pack (pass the pack_id) so the rest of a cold
+		 * sequential read skips the scan entirely. */
+		uint8_t *obuf = NULL;
+		uint32_t olen = 0;
+		int frc = tessera_fs_pack_fetch_ondemand(tmp_, exts, nexts,
+		    re.length_sectors, hash, key, &obuf, &olen);
 		free(exts, M_TESSERA);
-		if (!read_ok) {
-			free(packbuf, M_TESSERA);
-			goto next_pack;
+		if (frc == 0) {
+			*out_buf = obuf;
+			*out_len = olen;
+			tessera_cas_byte_insert(&tmp_->cas_cache,
+			    hash, obuf, olen);
+			rc = 0;
+			break;
 		}
-
-		tessera_pack_reader_t *pr = tessera_pack_open(packbuf, pack_len);
-		if (pr != NULL) {
-			const uint8_t *bytes = NULL;
-			uint32_t blen = 0;
-			if (tessera_pack_lookup(pr, hash, &bytes, &blen)
-			    == TESSERA_OK) {
-				uint8_t *copy = malloc(blen, M_TESSERA, M_WAITOK);
-				memcpy(copy, bytes, blen);
-				*out_buf = copy;
-				*out_len = blen;
-				/* Stash bytes for next time. */
-				tessera_cas_byte_insert(&tmp_->cas_cache,
-				    hash, bytes, blen);
-				tessera_pack_close(pr);
-				free(packbuf, M_TESSERA);
-				/* Cache this hit so future fetches skip the
-				 * scan. `key` is the pack_id (registry key). */
-				tessera_cas_loc_insert(&tmp_->cas_cache, hash,
-				    key, snap_exts, snap_n,
-				    re.length_sectors);
-				rc = 0;
-				break;
-			}
-			tessera_pack_close(pr);
-		}
-		free(packbuf, M_TESSERA);
 
 next_pack:
 		if (tessera_btree_cursor_next(c) != 0) break;
@@ -8271,6 +8406,7 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
 	tessera_pack_builder_t *pb = tessera_pack_begin(0 /* manifest pack */,
 	    pack_id, 0);
 	if (pb == NULL) return (ENOMEM);
+	uint32_t n_pack_blobs = 0;
 	for (uint32_t i = 0; i < n; i++) {
 		int ar = tessera_pack_add_blob(pb, entries[i].hash,
 		    entries[i].bytes, entries[i].len,
@@ -8283,6 +8419,7 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
 			tessera_pack_free(pb);
 			return (EIO);
 		}
+		n_pack_blobs++;
 	}
 
 	size_t pack_size = 0;
@@ -8308,11 +8445,11 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
 	memcpy(re.pack_id, pack_id, 16);
 	re.start_sector    = pa.start_sector;
 	re.length_sectors  = pa.length_sectors;
-	re.blob_count      = n;
+	re.blob_count      = n_pack_blobs;
 	re.pack_kind       = 0;
 	re.total_bytes     = pack_size;
 	re.create_time     = 0;
-	re.reachable_blobs = n;
+	re.reachable_blobs = n_pack_blobs;
 	re.flags           = pa.flags;
 	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
 	if (tessera_encode_registry_entry(&re, reg_value) != TESSERA_OK)
@@ -8344,13 +8481,129 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
 	return (0);
 }
 
-/* v2-step-3a: bundle N chunks + the manifest into ONE pack. Without
- * this, each chunk would publish via single-blob pack like
- * publish_manifest does — ~4 KiB header + 4 KiB footer per chunk =
- * ~32% storage overhead for 64 KiB chunks. Multi-blob packing drops
- * the overhead to ~0.1%. The chunks come first in the pack body, the
- * manifest last; pack_id derives from the manifest hash so re-emitting
- * the same content lands at the same pack_id. */
+/*
+ * Maximum chunk-payload bytes packed into a single pack. The read path
+ * (tessera_fs_fetch_blob) materialises a whole pack into RAM and refuses
+ * any pack longer than TESSERA_FETCH_PACK_MAX_SECTORS (16 MiB). A
+ * CHUNK_TREE group of FANOUT chunks at the 64 KiB tier is exactly 16 MiB
+ * of payload — which, once pack header/index/footer overhead is added,
+ * spills past 4096 sectors and becomes unreadable. Bounding the payload
+ * well under the cap keeps every emitted pack inside the reader's limit
+ * (and bounds per-fetch RAM) no matter how large the file or chunk size.
+ */
+#define TESSERA_PUBLISH_PACK_BYTES_MAX  (12u * 1024u * 1024u)  /* 12 MiB */
+
+/*
+ * Emit ONE multi-blob pack: `n` chunk blobs followed by an optional
+ * trailing manifest blob. Allocates data-zone extents, writes the pack,
+ * registers it, and seeds the CAS location cache for every blob. The
+ * caller chooses pack_id — content-stable so re-publishing identical
+ * content lands on the same pack and dedups via the registry.
+ */
+static int
+tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
+    const uint8_t pack_id[16],
+    const struct tessera_chunk_in *chunks, uint32_t n,
+    const uint8_t *manifest_bytes, size_t mlen,
+    const tessera_hash_t manifest_hash)
+{
+	tessera_pack_builder_t *pb = tessera_pack_begin(2 /* mixed */,
+	    pack_id, 0);
+	if (pb == NULL) return (ENOMEM);
+
+	uint32_t n_pack_blobs = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		if (tessera_pack_add_blob(pb, chunks[i].hash, chunks[i].bytes,
+		    chunks[i].len, TESSERA_BLOB_FLAG_CHUNK) != TESSERA_OK) {
+			tessera_pack_free(pb);
+			return (EIO);
+		}
+		n_pack_blobs++;
+	}
+	if (manifest_bytes != NULL) {
+		if (tessera_pack_add_blob(pb, manifest_hash, manifest_bytes,
+		    (uint32_t)mlen, TESSERA_BLOB_FLAG_MANIFEST) != TESSERA_OK) {
+			tessera_pack_free(pb);
+			return (EIO);
+		}
+		n_pack_blobs++;
+	}
+
+	size_t pack_size = 0;
+	(void)tessera_pack_finalize(pb, NULL, 0, &pack_size);
+	if (pack_size == 0 || (pack_size % TESSERA_SECTOR_SIZE) != 0) {
+		tessera_pack_free(pb);
+		return (EIO);
+	}
+	uint8_t *pack_bytes = malloc(pack_size, M_TESSERA, M_WAITOK);
+	int r = tessera_pack_finalize(pb, pack_bytes, pack_size, &pack_size);
+	tessera_pack_free(pb);
+	if (r != TESSERA_OK) { free(pack_bytes, M_TESSERA); return (EIO); }
+
+	const uint64_t n_sectors = pack_size / TESSERA_SECTOR_SIZE;
+	struct tessera_pack_alloc_result pa;
+	int wrt = tessera_fs_pack_alloc_and_write(tmp_, pack_bytes,
+	    n_sectors, &pa);
+	free(pack_bytes, M_TESSERA);
+	if (wrt != 0) return (wrt);
+
+	tessera_registry_entry_t re;
+	memset(&re, 0, sizeof re);
+	memcpy(re.pack_id, pack_id, 16);
+	re.start_sector    = pa.start_sector;
+	re.length_sectors  = pa.length_sectors;
+	re.blob_count      = n_pack_blobs;
+	re.pack_kind       = 2;
+	re.total_bytes     = pack_size;
+	re.create_time     = 0;
+	re.reachable_blobs = n_pack_blobs;
+	re.flags           = pa.flags;
+	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
+	if (tessera_encode_registry_entry(&re, reg_value) != TESSERA_OK)
+		return (EIO);
+
+	uint64_t new_pack_root = tmp_->sb.pack_registry_root;
+	if (tessera_btree_put(tmp_->pack_registry_tree, pack_id, reg_value,
+	    &new_pack_root) != TESSERA_OK)
+		return (EIO);
+	tmp_->sb.pack_registry_root = new_pack_root;
+
+	/* Every blob in this pack shares the same physical extents (same
+	 * location record, different hash key). */
+	tessera_pack_extent_t cas_extents[4];
+	uint8_t cas_n = 1;
+	if ((pa.flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) == 0) {
+		cas_extents[0].start_sector   = pa.start_sector;
+		cas_extents[0].length_sectors = pa.length_sectors;
+	} else {
+		cas_n = 0xFFu;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		tessera_cas_loc_insert(&tmp_->cas_cache, chunks[i].hash,
+		    pack_id, cas_extents, cas_n, pa.length_sectors);
+	}
+	if (manifest_bytes != NULL) {
+		tessera_cas_loc_insert(&tmp_->cas_cache, manifest_hash,
+		    pack_id, cas_extents, cas_n, pa.length_sectors);
+	}
+	return (0);
+}
+
+/* v2-step-3a: bundle chunks + the manifest into packs. Without multi-blob
+ * packing each chunk would publish via a single-blob pack (~4 KiB header +
+ * 4 KiB footer per chunk = ~32% overhead for 64 KiB chunks); bundling
+ * drops it to ~0.1%.
+ *
+ * Large-file fix: a whole CHUNK_TREE group (up to FANOUT chunks) can
+ * exceed the read-side fetch cap if emitted as one pack, so the chunks
+ * are split into TESSERA_PUBLISH_PACK_BYTES_MAX-bounded packs. Chunk blobs
+ * are content-addressed — the read path finds each by hash regardless of
+ * which pack holds it — so the split is invisible to readers. Each
+ * chunk-only pack is keyed by a content hash of (manifest_hash, batch
+ * index) so re-publishing identical content dedups; the manifest rides in
+ * a final pack keyed by the manifest hash, which is also the whole-group
+ * dedup shortcut below. The manifest pack is written LAST, so its presence
+ * means every chunk pack already landed. */
 static int
 tessera_fs_publish_chunked(struct tessera_mount *tmp_,
     const struct tessera_chunk_in *chunks, uint32_t n_chunks,
@@ -8378,104 +8631,77 @@ tessera_fs_publish_chunked(struct tessera_mount *tmp_,
 		}
 	}
 
-	tessera_pack_builder_t *pb = tessera_pack_begin(2 /* mixed */,
-	    pack_id, 0);
-	if (pb == NULL) return (ENOMEM);
-
-	/* Dedup chunks before adding to the pack: pack_finalize rejects
-	 * duplicate hashes in the same pack (TESSERA_EEXIST), so a write
-	 * with repeating content (e.g. all-zero file, or stress2's `rw`
-	 * which writes uninitialized stack-buf data → all chunks have
-	 * the same hash) would fail the publish entirely.
-	 *
-	 * The manifest's chunk_records can still repeat the hash —
-	 * that's how multiple logical offsets map to a single shared
-	 * blob. The pack body just stores each unique blob once. Use
-	 * a small linear scan since n_chunks is bounded by the file's
-	 * chunk fan-out (≤256). */
+	/* Dedup chunks before packing: a pack rejects duplicate hashes
+	 * (TESSERA_EEXIST), so repeating content (identical non-zero chunks)
+	 * must collapse to one blob. The manifest's chunk_records still
+	 * repeat the hash — that's how multiple logical offsets share one
+	 * blob. Linear scan; n_chunks is bounded by the file's fan-out. */
+	struct tessera_chunk_in *uniq = malloc(
+	    (n_chunks ? n_chunks : 1) * sizeof(*uniq), M_TESSERA,
+	    M_WAITOK | M_ZERO);
+	uint32_t n_uniq = 0;
 	for (uint32_t i = 0; i < n_chunks; i++) {
 		int dup = 0;
-		for (uint32_t j = 0; j < i; j++) {
-			if (memcmp(chunks[j].hash, chunks[i].hash,
-			    sizeof(tessera_hash_t)) == 0) {
-				dup = 1; break;
-			}
+		for (uint32_t j = 0; j < n_uniq; j++) {
+			if (memcmp(uniq[j].hash, chunks[i].hash,
+			    sizeof(tessera_hash_t)) == 0) { dup = 1; break; }
 		}
 		if (dup) continue;
-		int ar = tessera_pack_add_blob(pb, chunks[i].hash,
-		    chunks[i].bytes, chunks[i].len,
-		    TESSERA_BLOB_FLAG_CHUNK);
-		if (ar != TESSERA_OK) {
-			tessera_pack_free(pb);
-			return (EIO);
+		uniq[n_uniq++] = chunks[i];
+	}
+
+	/* Greedily split the unique chunks into byte-bounded batches, each
+	 * emitted as its own pack. A single chunk never exceeds the max
+	 * chunk size (4 MiB) — well under the budget — so every batch holds
+	 * at least one chunk and the loop always makes progress. */
+	uint32_t bi = 0;
+	uint32_t batch_idx = 0;
+	int rc = 0;
+	while (bi < n_uniq) {
+		const uint32_t first = bi;
+		uint64_t batch_bytes = 0;
+		while (bi < n_uniq &&
+		    (bi == first ||
+		     batch_bytes + uniq[bi].len <=
+		         TESSERA_PUBLISH_PACK_BYTES_MAX)) {
+			batch_bytes += uniq[bi].len;
+			bi++;
 		}
-	}
-	if (tessera_pack_add_blob(pb, out_manifest_hash, manifest_bytes,
-	    (uint32_t)mlen, TESSERA_BLOB_FLAG_MANIFEST) != TESSERA_OK) {
-		tessera_pack_free(pb);
-		return (EIO);
-	}
+		const uint32_t batch_n = bi - first;
 
-	size_t pack_size = 0;
-	(void)tessera_pack_finalize(pb, NULL, 0, &pack_size);
-	if (pack_size == 0 || (pack_size % TESSERA_SECTOR_SIZE) != 0) {
-		tessera_pack_free(pb);
-		return (EIO);
+		/* Content-stable pack_id: hash of (manifest_hash, batch index).
+		 * Identical file content → identical manifest hash → identical
+		 * batches → identical ids, so re-publish dedups in the registry
+		 * just as the old single-pack path did. */
+		uint8_t seed[sizeof(tessera_hash_t) + sizeof(uint32_t)];
+		memcpy(seed, out_manifest_hash, sizeof(tessera_hash_t));
+		seed[sizeof(tessera_hash_t) + 0] = (uint8_t)(batch_idx);
+		seed[sizeof(tessera_hash_t) + 1] = (uint8_t)(batch_idx >> 8);
+		seed[sizeof(tessera_hash_t) + 2] = (uint8_t)(batch_idx >> 16);
+		seed[sizeof(tessera_hash_t) + 3] = (uint8_t)(batch_idx >> 24);
+		tessera_hash_t batch_h;
+		tessera_sha256(seed, sizeof seed, batch_h);
+		uint8_t batch_pack_id[16];
+		memcpy(batch_pack_id, batch_h, 16);
+
+		/* Skip the write if this exact batch is already on disk. */
+		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
+		if (tessera_btree_get(tmp_->pack_registry_tree,
+		    batch_pack_id, reg_value) != TESSERA_OK) {
+			rc = tessera_fs_emit_chunk_pack(tmp_, batch_pack_id,
+			    &uniq[first], batch_n, NULL, 0, NULL);
+			if (rc != 0) break;
+		}
+		batch_idx++;
 	}
-	uint8_t *pack_bytes = malloc(pack_size, M_TESSERA, M_WAITOK);
-	int r = tessera_pack_finalize(pb, pack_bytes, pack_size, &pack_size);
-	tessera_pack_free(pb);
-	if (r != TESSERA_OK) { free(pack_bytes, M_TESSERA); return (EIO); }
+	free(uniq, M_TESSERA);
+	if (rc != 0) return (rc);
 
-	const uint64_t n_sectors = pack_size / TESSERA_SECTOR_SIZE;
-	struct tessera_pack_alloc_result pa;
-	int wrt = tessera_fs_pack_alloc_and_write(tmp_, pack_bytes,
-	    n_sectors, &pa);
-	free(pack_bytes, M_TESSERA);
-	if (wrt != 0) return (wrt);
-
-	tessera_registry_entry_t re;
-	memset(&re, 0, sizeof re);
-	memcpy(re.pack_id, pack_id, 16);
-	re.start_sector    = pa.start_sector;
-	re.length_sectors  = pa.length_sectors;
-	re.blob_count      = n_chunks + 1u;
-	re.pack_kind       = 2;
-	re.total_bytes     = pack_size;
-	re.create_time     = 0;
-	re.reachable_blobs = n_chunks + 1u;
-	re.flags           = pa.flags;
-	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
-	if (tessera_encode_registry_entry(&re, reg_value) != TESSERA_OK)
-		return (EIO);
-
-	uint64_t new_pack_root = tmp_->sb.pack_registry_root;
-	if (tessera_btree_put(tmp_->pack_registry_tree, pack_id, reg_value,
-	    &new_pack_root) != TESSERA_OK)
-		return (EIO);
-	tmp_->sb.pack_registry_root = new_pack_root;
-
-	/* CAS-cache insert. We insert location entries for the manifest
-	 * AND each chunk blob — every blob in this pack lives in the
-	 * same physical extents, so they share the same location record
-	 * structure (different hash key only). Without per-chunk
-	 * inserts, the append-fast-path still pays an O(N) pack scan
-	 * for the partial last chunk on every subsequent write. */
-	tessera_pack_extent_t cas_extents[4];
-	uint8_t cas_n = 1;
-	if ((pa.flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) == 0) {
-		cas_extents[0].start_sector   = pa.start_sector;
-		cas_extents[0].length_sectors = pa.length_sectors;
-	} else {
-		cas_n = 0xFFu;
-	}
-	tessera_cas_loc_insert(&tmp_->cas_cache, out_manifest_hash,
-	    pack_id, cas_extents, cas_n, pa.length_sectors);
-	for (uint32_t i = 0; i < n_chunks; i++) {
-		tessera_cas_loc_insert(&tmp_->cas_cache, chunks[i].hash,
-		    pack_id, cas_extents, cas_n, pa.length_sectors);
-	}
-	return (0);
+	/* Manifest rides in a final pack keyed by its own hash. Written
+	 * last so the dedup shortcut at the top (which keys on this id) only
+	 * fires once every chunk pack is already durable. */
+	return (tessera_fs_emit_chunk_pack(tmp_, pack_id, NULL, 0,
+	    manifest_bytes, mlen, out_manifest_hash));
 }
 
 /* ── v2 multi-level directory helpers ───────────────────────────── */
@@ -12514,12 +12740,10 @@ out:
  *       out for free.
  *
  * Still rewrites the whole file each write — range-aware modification
- * + append fast-path land in step-3b. The cap stops us from running
- * the kernel out of M_WAITOK memory; chunked writes raise it from
- * 1 MiB (v1) to 64 MiB.
+ * + append fast-path land in step-3b. Size caps (TESSERA_WRITE_MAX_BYTES
+ * for the streaming ceiling, TESSERA_WRITE_MATERIALIZE_MAX for the
+ * whole-file-in-RAM slow paths) are defined near the top of the file.
  */
-#define TESSERA_WRITE_MAX_BYTES   (64u * 1024u * 1024u)
-
 static int
 tessera_vop_write(struct vop_write_args *ap)
 {
@@ -12673,7 +12897,16 @@ tessera_vop_write(struct vop_write_args *ap)
 
 	/* Slow path: materialise the existing content, splice in the
 	 * new bytes, route through INLINE or whole-file chunked
-	 * rewrite. */
+	 * rewrite. This holds the whole file (final_size) plus the old
+	 * content (~final_size) in contiguous M_WAITOK buffers, so it is
+	 * bounded separately from the streaming ceiling. A non-append
+	 * write past this bound is refused rather than risk exhausting
+	 * kernel memory; pure-append growth above it streamed through the
+	 * append fast-path above and never reaches here. */
+	if (final_size > TESSERA_WRITE_MATERIALIZE_MAX) {
+		free(new_bytes, M_TESSERA);
+		return (EFBIG);
+	}
 	uint8_t *old_buf = NULL;
 	size_t   old_len = 0;
 	if (tessera_fs_read_full_content(tmp_, &ino, &old_buf, &old_len) != 0) {
