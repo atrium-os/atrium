@@ -642,6 +642,12 @@ static int  tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
     size_t final_size);
 static int  tessera_fs_dirty_content_read(struct tessera_mount *tmp_,
     uint32_t inode_no, struct uio *uio);
+static int  tessera_fs_dirty_content_append_uio(struct tessera_mount *tmp_,
+    uint32_t inode_no, uint64_t write_off, struct uio *uio, size_t write_len);
+static int  tessera_fs_dirty_content_has_window(struct tessera_mount *tmp_,
+    uint32_t inode_no);
+static inline uint32_t tessera_chunk_size_for(struct tessera_mount *tmp_,
+    uint64_t file_size);
 static int  tessera_fs_dirty_content_drain_one(struct tessera_mount *tmp_,
     uint32_t inode_no);
 static int  tessera_fs_dirty_content_drain_all(struct tessera_mount *tmp_);
@@ -760,9 +766,20 @@ struct tessera_dirty_content {
 	LIST_ENTRY(tessera_dirty_content) link;
 	uint32_t  inode_no;
 	uint8_t  *bytes;        /* malloc'd, length = capacity */
-	size_t    size;         /* logical file size (≤ capacity) */
+	size_t    size;         /* bytes buffered (≤ capacity) */
 	size_t    capacity;     /* allocated buffer size */
 	int       dirty;        /* 1 = differs from on-disk manifest */
+	/* Append-window mode for large sequential writes. base_off > 0 ⇒ the
+	 * buffer is a sliding window holding file bytes
+	 * [base_off, base_off+size); the on-disk manifest already holds
+	 * [0, base_off). Logical file size = base_off + size. Published by
+	 * APPEND (not whole-file replace) and flushed once it reaches
+	 * tessera_append_window_bytes, so a multi-GB sequential write
+	 * publishes one manifest per window instead of one per write. With
+	 * the bulk-GEOM pack writer that one publish is disk-bound; together
+	 * they take small-block large-file writes from ~0.2 to ~20 MB/s.
+	 * base_off == 0 is the classic whole-file buffer (unchanged). */
+	uint64_t  base_off;
 };
 
 /* CAS read cache — see docs/cas_cache_plan.md.
@@ -3800,6 +3817,19 @@ tessera_vop_read(struct vop_read_args *ap)
 	 * Snapshot reads (gen != 0) bypass the buffer (it always
 	 * reflects the live frontier). */
 	if (tn->snapshot_gen == 0) {
+		/* An append-window buffer holds only the file's tail
+		 * [base_off, size); the prefix is on disk. Publish it first so
+		 * this read sees one consistent on-disk file instead of having
+		 * to compose a straddling read. Only happens mid write-burst —
+		 * a closed/idle file is already flushed. */
+		if (tessera_fs_dirty_content_has_window(tmp_,
+		    (uint32_t)tn->inode_no)) {
+			(void)tessera_fs_dirty_content_drain_one(tmp_,
+			    (uint32_t)tn->inode_no);
+			if (tessera_fs_inode_get_byk(tmp_, key, &ino)
+			    != TESSERA_OK)
+				return (EIO);
+		}
 		int br = tessera_fs_dirty_content_read(tmp_,
 		    (uint32_t)tn->inode_no, uio);
 		if (br > 0) return (0);
@@ -4732,8 +4762,9 @@ tessera_fs_inode_get(struct tessera_mount *tmp_, uint32_t inode_no,
 			struct tessera_dirty_content *dc;
 			LIST_FOREACH(dc, &tmp_->dirty_content[cb], link) {
 				if (dc->inode_no == inode_no) {
-					if ((uint64_t)dc->size > out->size)
-						out->size = dc->size;
+					uint64_t live = dc->base_off + dc->size;
+					if (live > out->size)
+						out->size = live;
 					break;
 				}
 			}
@@ -4757,8 +4788,9 @@ tessera_fs_inode_get(struct tessera_mount *tmp_, uint32_t inode_no,
 		struct tessera_dirty_content *dc;
 		LIST_FOREACH(dc, &tmp_->dirty_content[cb], link) {
 			if (dc->inode_no == inode_no) {
-				if ((uint64_t)dc->size > out->size)
-					out->size = dc->size;
+				uint64_t live = dc->base_off + dc->size;
+				if (live > out->size)
+					out->size = live;
 				break;
 			}
 		}
@@ -5531,6 +5563,16 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, dirty_content_file_max, CTLFLAG_RW,
     &tessera_dirty_content_file_max, 0,
     "Max per-file size eligible for the dirty-content buffer (bytes)");
 
+/* Sliding-window size for batched large sequential appends. A file past
+ * dirty_content_file_max that is being appended sequentially coalesces
+ * into a window of this many bytes and publishes one manifest per window
+ * (via append) instead of one per write. Bigger = fewer, larger publishes
+ * = higher throughput, bounded in aggregate by dirty_content_cap. */
+static unsigned long tessera_append_window_bytes = 16u * 1024u * 1024u;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, append_window_bytes, CTLFLAG_RW,
+    &tessera_append_window_bytes, 0,
+    "Sliding-window size for batched large sequential appends (bytes)");
+
 static unsigned long tessera_stat_dirty_content_hits     = 0;
 static unsigned long tessera_stat_dirty_content_creates  = 0;
 static unsigned long tessera_stat_dirty_content_flushes  = 0;
@@ -6005,17 +6047,93 @@ tessera_fs_dirty_content_free(struct tessera_dirty_content *dc)
 	free(dc, M_TESSERA);
 }
 
+/* Append `len` bytes onto inode_no's file at offset base_off (the true
+ * on-disk content boundary — the window buffer's base). Uses the
+ * streaming append fast-path; on ENOTSUP (the one-shot CHUNK_LIST→
+ * CHUNK_TREE promotion or the single 64 MiB chunk-tier rebuild) falls
+ * back to a bounded whole-file rewrite. Caller holds the flush gate
+ * (this is reached only from dirty_content_publish).
+ *
+ * base_off is passed explicitly rather than read from ino.size because a
+ * non-size vop_setattr (chmod/chown/utimes from e.g. tar) can inode_put
+ * the OVERLAID size (base_off+window) with the old manifest while the
+ * window is still buffered; the append path keys off the file's real end
+ * (base_off), and we correct any such stale size first so append_chunked
+ * — which reads ino.size internally — appends at the right place. */
+static int
+tessera_fs_append_to_file(struct tessera_mount *tmp_, uint32_t inode_no,
+                          uint64_t base_off, const uint8_t *bytes, size_t len)
+{
+	if (len == 0) return (0);
+	tessera_inode_record_t ino;
+	if (tessera_fs_inode_get(tmp_, inode_no, &ino) != TESSERA_OK)
+		return (EIO);
+	if (ino.size != base_off) {
+		/* A non-size setattr persisted the overlaid size; the manifest
+		 * still ends at base_off, so reset the record to match before
+		 * appending. */
+		ino.size = base_off;
+		if (tessera_fs_inode_put(tmp_, inode_no, &ino) != TESSERA_OK)
+			return (EIO);
+	}
+	const uint64_t write_off  = base_off;
+	const uint64_t final_size = write_off + (uint64_t)len;
+
+	/* TESSERA_INLINE_THRESHOLD = 256 KiB; #define is later in the file. */
+	if (final_size > (256u * 1024u)) {
+		const uint32_t cs = tessera_chunk_size_for(tmp_, final_size);
+		int frc = tessera_fs_append_chunked(tmp_, inode_no, bytes,
+		    len, cs);
+		if (frc == 0) {
+			tessera_stat_append_fast_ok++;
+			return (0);
+		}
+		if (frc != ENOTSUP) return (frc);
+		tessera_stat_append_fast_fallback++;
+	}
+	/* Slow fallback: materialise old + splice + chunked rewrite. Only
+	 * the bounded promotion / tier-rebuild events land here. */
+	if (final_size > TESSERA_WRITE_MATERIALIZE_MAX) return (EFBIG);
+	uint8_t *old_buf = NULL;
+	size_t   old_len = 0;
+	if (tessera_fs_read_full_content(tmp_, &ino, &old_buf, &old_len) != 0)
+		return (EIO);
+	uint8_t *full = malloc((size_t)final_size, M_TESSERA, M_WAITOK | M_ZERO);
+	if (old_buf != NULL) {
+		size_t n = old_len < (size_t)final_size ? old_len
+		    : (size_t)final_size;
+		memcpy(full, old_buf, n);
+		free(old_buf, M_TESSERA);
+	}
+	memcpy(full + write_off, bytes, len);
+	int rc;
+	if ((size_t)final_size <= (256u * 1024u))
+		rc = tessera_fs_replace_content(tmp_, inode_no, full,
+		    (size_t)final_size);
+	else
+		rc = tessera_fs_replace_content_chunked(tmp_, inode_no, full,
+		    (size_t)final_size);
+	free(full, M_TESSERA);
+	return (rc);
+}
+
 /* Publish a detached buffer to disk. Routes to the INLINE or chunked
  * publish path based on size — the caller's vop_write doesn't have
- * to choose, the buffer just remembers the contents. */
+ * to choose, the buffer just remembers the contents. base_off > 0 marks
+ * an append-window buffer: the on-disk file already holds [0, base_off)
+ * and we APPEND the buffered tail rather than rewriting the whole file. */
 static int
 tessera_fs_dirty_content_publish(struct tessera_mount *tmp_,
                                  struct tessera_dirty_content *dc)
 {
 	if (!dc->dirty) return (0);
 	int rc;
+	if (dc->base_off > 0) {
+		rc = tessera_fs_append_to_file(tmp_, dc->inode_no,
+		    dc->base_off, dc->bytes, dc->size);
+		if (rc == 0) tessera_stat_vop_write_chunked++;
 	/* TESSERA_INLINE_THRESHOLD = 256 KiB; defined later in file. */
-	if (dc->size <= (256u * 1024u)) {
+	} else if (dc->size <= (256u * 1024u)) {
 		rc = tessera_fs_replace_content(tmp_, dc->inode_no,
 		    dc->bytes, dc->size);
 		if (rc == 0) tessera_stat_vop_write_inline++;
@@ -6025,6 +6143,124 @@ tessera_fs_dirty_content_publish(struct tessera_mount *tmp_,
 		if (rc == 0) tessera_stat_vop_write_chunked++;
 	}
 	if (rc == 0) tessera_stat_dirty_content_flushes++;
+	return (rc);
+}
+
+/* Append-window write (large sequential appends). Buffers a pure append
+ * [write_off, write_off+len) into a per-inode sliding window and flushes
+ * it (publish via append) once it reaches tessera_append_window_bytes —
+ * so a multi-GB sequential write publishes one manifest per window, not
+ * one per write. Returns ENOTSUP if there is no clean window to append
+ * to (a classic base_off==0 buffer is present, or this isn't a tail
+ * append); the caller then drains and takes the per-write path. */
+static int
+tessera_fs_dirty_content_append(struct tessera_mount *tmp_, uint32_t inode_no,
+                                uint64_t write_off, const uint8_t *bytes,
+                                size_t len)
+{
+	if (len == 0) return (0);
+
+	mtx_lock(&tmp_->flush_mtx);
+	int over_cap = (tmp_->dirty_content_bytes + len >
+	    (size_t)tessera_dirty_content_cap);
+	mtx_unlock(&tmp_->flush_mtx);
+	if (over_cap)
+		(void)tessera_fs_dirty_content_drain_all(tmp_);
+
+	mtx_lock(&tmp_->flush_mtx);
+	struct tessera_dirty_content *dc =
+	    tessera_fs_dirty_content_lookup(tmp_, inode_no);
+	if (dc != NULL) {
+		/* A classic whole-file buffer, or a non-tail offset, can't be
+		 * windowed here — let the caller drain and fall back. */
+		if (dc->base_off == 0 ||
+		    dc->base_off + (uint64_t)dc->size != write_off) {
+			mtx_unlock(&tmp_->flush_mtx);
+			return (ENOTSUP);
+		}
+		if (dc->size + len > dc->capacity) {
+			/* Window would overflow — publish it and start a fresh
+			 * one for these bytes. drain_one advances the on-disk
+			 * size to write_off, so the recursion's create path
+			 * lands a new window at exactly this offset. */
+			mtx_unlock(&tmp_->flush_mtx);
+			(void)tessera_fs_dirty_content_drain_one(tmp_, inode_no);
+			return (tessera_fs_dirty_content_append(tmp_, inode_no,
+			    write_off, bytes, len));
+		}
+		memcpy(dc->bytes + dc->size, bytes, len);
+		dc->size  += len;
+		dc->dirty  = 1;
+		tmp_->dirty_content_bytes += len;
+		int full = (dc->size >= (size_t)tessera_append_window_bytes);
+		mtx_unlock(&tmp_->flush_mtx);
+		tessera_stat_dirty_content_hits++;
+		if (full)
+			(void)tessera_fs_dirty_content_drain_one(tmp_, inode_no);
+		return (0);
+	}
+	mtx_unlock(&tmp_->flush_mtx);
+
+	/* Create a fresh window at base_off = write_off, capacity = the
+	 * window size (single allocation; no in-place grow). */
+	size_t cap = (size_t)tessera_append_window_bytes;
+	if (cap < len) cap = len;
+	struct tessera_dirty_content *ndc =
+	    malloc(sizeof *ndc, M_TESSERA, M_WAITOK | M_ZERO);
+	ndc->inode_no = inode_no;
+	ndc->base_off = write_off;
+	ndc->capacity = cap;
+	ndc->bytes    = malloc(cap, M_TESSERA, M_WAITOK);
+	memcpy(ndc->bytes, bytes, len);
+	ndc->size  = len;
+	ndc->dirty = 1;
+
+	mtx_lock(&tmp_->flush_mtx);
+	struct tessera_dirty_content *existing =
+	    tessera_fs_dirty_content_lookup(tmp_, inode_no);
+	if (existing != NULL) {
+		/* Lost the create race — drop ours and retry the append. */
+		mtx_unlock(&tmp_->flush_mtx);
+		tessera_fs_dirty_content_free(ndc);
+		return (tessera_fs_dirty_content_append(tmp_, inode_no,
+		    write_off, bytes, len));
+	}
+	uint32_t b = inode_no & (TESSERA_DIRTY_CONTENT_BUCKETS - 1u);
+	LIST_INSERT_HEAD(&tmp_->dirty_content[b], ndc, link);
+	tmp_->dirty_content_bytes += ndc->size;
+	tessera_stat_dirty_content_creates++;
+	int full = (ndc->size >= (size_t)tessera_append_window_bytes);
+	mtx_unlock(&tmp_->flush_mtx);
+	if (full)
+		(void)tessera_fs_dirty_content_drain_one(tmp_, inode_no);
+	return (0);
+}
+
+/* uio wrapper: pre-check for a classic (base_off==0) buffer or a non-tail
+ * offset BEFORE touching the uio, so an ENOTSUP return leaves the uio
+ * intact for the caller's fallback. (append() only returns ENOTSUP for
+ * those two cases; window overflow is handled internally.) */
+static int
+tessera_fs_dirty_content_append_uio(struct tessera_mount *tmp_,
+                                    uint32_t inode_no, uint64_t write_off,
+                                    struct uio *uio, size_t write_len)
+{
+	mtx_lock(&tmp_->flush_mtx);
+	struct tessera_dirty_content *dc =
+	    tessera_fs_dirty_content_lookup(tmp_, inode_no);
+	int unwindowable = (dc != NULL &&
+	    (dc->base_off == 0 ||
+	     dc->base_off + (uint64_t)dc->size != write_off));
+	mtx_unlock(&tmp_->flush_mtx);
+	if (unwindowable)
+		return (ENOTSUP);
+
+	uint8_t *kbuf = malloc(write_len, M_TESSERA, M_WAITOK);
+	int err = uiomove(kbuf, (int)write_len, uio);
+	if (err != 0) { free(kbuf, M_TESSERA); return (err); }
+	int rc = tessera_fs_dirty_content_append(tmp_, inode_no, write_off,
+	    kbuf, write_len);
+	free(kbuf, M_TESSERA);
 	return (rc);
 }
 
@@ -6377,6 +6613,22 @@ tessera_fs_dirty_content_write(struct tessera_mount *tmp_, uint32_t inode_no,
 	return (0);
 }
 
+/* True if the inode has an append-window buffer (base_off > 0). vop_read
+ * publishes such a buffer before reading, so it never has to compose a
+ * read that straddles the on-disk prefix and the buffered tail. */
+static int
+tessera_fs_dirty_content_has_window(struct tessera_mount *tmp_,
+                                    uint32_t inode_no)
+{
+	if (!tmp_->flush_mtx_init) return (0);
+	mtx_lock(&tmp_->flush_mtx);
+	struct tessera_dirty_content *dc =
+	    tessera_fs_dirty_content_lookup(tmp_, inode_no);
+	int win = (dc != NULL && dc->base_off > 0);
+	mtx_unlock(&tmp_->flush_mtx);
+	return (win);
+}
+
 /* Read from the buffer if present. Returns 1 if served (uio
  * advanced), 0 if no buffer (caller falls through to disk),
  * negative errno on error. */
@@ -6389,6 +6641,14 @@ tessera_fs_dirty_content_read(struct tessera_mount *tmp_, uint32_t inode_no,
 	struct tessera_dirty_content *dc =
 	    tessera_fs_dirty_content_lookup(tmp_, inode_no);
 	if (dc == NULL) {
+		mtx_unlock(&tmp_->flush_mtx);
+		return (0);
+	}
+	/* Append-window buffers are published by vop_read before it reads,
+	 * so they should never be served here; if one slips through, defer
+	 * to disk for the published prefix rather than mis-serve windowed
+	 * offsets. */
+	if (dc->base_off > 0) {
 		mtx_unlock(&tmp_->flush_mtx);
 		return (0);
 	}
@@ -12950,6 +13210,37 @@ tessera_vop_write(struct vop_write_args *ap)
 		 * yet know which manifest kind they'll publish as. */
 		tessera_fs_mark_dirty(tmp_);
 		return (0);
+	}
+
+	/* Large sequential append: batch into a per-inode sliding window and
+	 * publish one manifest per window instead of one per write. Eligible
+	 * when this is a pure tail append, the file is past the classic-buffer
+	 * ceiling, and the single write fits a window (larger writes are
+	 * already one publish via the append path below). On ENOTSUP (a
+	 * classic whole-file buffer is still present, or a non-tail offset)
+	 * the uio is untouched and we fall through. */
+	if (!mmapped && write_off == ino.size &&
+	    final_size > (uint64_t)tessera_dirty_content_file_max &&
+	    write_resid <= (uint64_t)tessera_append_window_bytes) {
+		int wr = tessera_fs_dirty_content_append_uio(tmp_,
+		    (uint32_t)tn->inode_no, write_off, uio,
+		    (size_t)write_resid);
+		if (wr == 0) {
+			if ((ino.mode & 06000) != 0 && ap->a_cred != NULL &&
+			    priv_check_cred(ap->a_cred,
+			        PRIV_VFS_RETAINSUGID) != 0) {
+				ino.mode &= ~06000;
+				(void)tessera_fs_inode_put(tmp_,
+				    (uint32_t)tn->inode_no, &ino);
+			}
+			vnode_pager_setsize(vp, final_size);
+			tessera_fs_mark_dirty(tmp_);
+			return (0);
+		}
+		if (wr != ENOTSUP)
+			return (wr);
+		/* ENOTSUP: uio intact; fall through (the drain below
+		 * publishes any classic buffer, then we per-write append). */
 	}
 
 	/* Slow paths beyond this point materialise new_bytes from the
