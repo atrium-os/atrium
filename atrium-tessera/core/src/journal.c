@@ -53,7 +53,24 @@ struct tessera_journal {
 	uint64_t  head_block;      /* relative to start; 1..length-1 */
 	uint64_t  tail_block;
 	uint64_t  next_tx_id;
+	/* Deferred-write mode (see journal.h). io_deferred is the alternate
+	 * block_io; use_deferred selects it for the duration of a
+	 * begin/end-bracketed batch. has_deferred guards a begin before any
+	 * io was registered. */
+	tessera_block_io_t io_deferred;
+	int       has_deferred;
+	int       use_deferred;
 };
+
+/* Active write io: the deferred io while a deferred batch is open,
+ * else the primary (synchronous) io. */
+static const tessera_block_io_t *
+journal_wio(const tessera_journal_t *j)
+{
+	if (j->use_deferred && j->has_deferred)
+		return &j->io_deferred;
+	return &j->io;
+}
 
 /* ── header persistence ──────────────────────────────────────────── */
 
@@ -75,7 +92,8 @@ write_journal_header(tessera_journal_t *j)
 	if (buf == NULL) return TESSERA_ENOMEM;
 	int r = tessera_encode_journal_header(&h, buf);
 	if (r != TESSERA_OK) { tessera_free(buf); return r; }
-	if (j->io.write_block(j->io.ctx, j->start, buf) != 0) {
+	const tessera_block_io_t *wio = journal_wio(j);
+	if (wio->write_block(wio->ctx, j->start, buf) != 0) {
 		tessera_free(buf);
 		return TESSERA_EIO;
 	}
@@ -162,6 +180,34 @@ tessera_journal_close(tessera_journal_t *j)
 	tessera_free(j);
 }
 
+/* ── deferred-write mode (see journal.h) ─────────────────────────── */
+
+void
+tessera_journal_set_deferred_io(tessera_journal_t *j,
+                                const tessera_block_io_t *deferred_io)
+{
+	if (j == NULL) return;
+	if (deferred_io == NULL) {
+		j->has_deferred = 0;
+		j->use_deferred = 0;
+		return;
+	}
+	j->io_deferred  = *deferred_io;
+	j->has_deferred = 1;
+}
+
+void
+tessera_journal_deferred_begin(tessera_journal_t *j)
+{
+	if (j != NULL && j->has_deferred) j->use_deferred = 1;
+}
+
+void
+tessera_journal_deferred_end(tessera_journal_t *j)
+{
+	if (j != NULL) j->use_deferred = 0;
+}
+
 /* ── append helpers ──────────────────────────────────────────────── */
 
 static uint32_t
@@ -211,7 +257,8 @@ write_record(tessera_journal_t *j, tessera_record_type_t type,
 
 	uint64_t cap = j->length - 1;
 	uint64_t b = j->head_block;
-	if (j->io.write_block(j->io.ctx, j->start + b, blk) != 0) {
+	const tessera_block_io_t *wio = journal_wio(j);
+	if (wio->write_block(wio->ctx, j->start + b, blk) != 0) {
 		tessera_free(blk);
 		return TESSERA_EIO;
 	}
@@ -227,7 +274,7 @@ write_record(tessera_journal_t *j, tessera_record_type_t type,
 			memset(cont, 0, BLK);
 			uint32_t take = remaining > BLK ? BLK : remaining;
 			if (take > 0) memcpy(cont, src, take);
-			if (j->io.write_block(j->io.ctx, j->start + b, cont) != 0) {
+			if (wio->write_block(wio->ctx, j->start + b, cont) != 0) {
 				tessera_free(cont);
 				return TESSERA_EIO;
 			}

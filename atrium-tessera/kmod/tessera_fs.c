@@ -1076,6 +1076,7 @@ struct tessera_mount {
 	struct tessera_kbio_ctx   bio_ctx;
 	tessera_block_io_t        bio;          /* data zone */
 	tessera_block_io_t        meta_bio;     /* metadata reserve */
+	tessera_block_io_t        journal_bio_deferred; /* journal redo-log: bdwrite */
 	tessera_btree_t          *inode_tree;
 	tessera_btree_t          *pack_registry_tree;
 	tessera_btree_t          *snapshots_tree;     /* v2: time-machine */
@@ -1707,6 +1708,21 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 			    rctx.applied,
 			    (unsigned long)tmp_->sb.generation);
 		}
+		/* Register a deferred (bdwrite) block_io for the dirent/inode
+		 * redo-log drain. Those records' durability rides the next
+		 * commit_sb barrier (VOP_FSYNC(devvp) flushes the buffer cache,
+		 * then BIO_FLUSH) — the same deferred-commit boundary the rest
+		 * of the FS uses — so the drain stops paying a synchronous
+		 * device round-trip per record. commit_sb's own journal writes
+		 * (ROOT_UPDATE / checkpoint) keep the default synchronous io and
+		 * their crash-ordering barriers. */
+		tmp_->journal_bio_deferred.read_block  = tessera_kbio_read;
+		tmp_->journal_bio_deferred.write_block = tessera_kbio_write_delayed;
+		tmp_->journal_bio_deferred.alloc       = tessera_kbio_alloc;
+		tmp_->journal_bio_deferred.free        = tessera_kbio_free;
+		tmp_->journal_bio_deferred.ctx         = &tmp_->bio_ctx;
+		tessera_journal_set_deferred_io(tmp_->journal,
+		    &tmp_->journal_bio_deferred);
 	}
 
 	/* Slice 2: tessera.gen=N — historical read-only mount.
@@ -11989,10 +12005,16 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, dirent_log_threshold,
     CTLFLAG_RW, &tessera_dirent_log_threshold, 0,
     "Force flush when dirent_log_count exceeds this");
 
-/* dirty_count past this enqueues an ASYNC flush (non-blocking) so
- * metadata-heavy create workloads pipeline instead of stalling per-op.
- * The meta-reserve safety check provides the hard synchronous throttle. */
-static int tessera_dirty_flush_async = 256;
+/* dirty_count past this triggers a synchronous-but-batched flush, so
+ * metadata-heavy create workloads amortise the per-commit cost (journal
+ * tx + commit_sb's two BIO_FLUSH barriers) over a larger batch instead
+ * of stalling more often. Raised 256 -> 2048 once the redo-log drain
+ * stopped being synchronous (deferred journal writes): with the journal
+ * no longer the per-flush bottleneck, the commit barriers dominate, so
+ * fewer/larger commits is a clear win on a base.txz extract (~254s ->
+ * ~195s; 89 commits -> ~33). The meta-reserve safety check below still
+ * provides the hard throttle and never fired at this batch size. */
+static int tessera_dirty_flush_async = 2048;
 SYSCTL_INT(_kern_tessera, OID_AUTO, dirty_flush_async,
     CTLFLAG_RW, &tessera_dirty_flush_async, 0,
     "dirty_count past this enqueues an async (non-blocking) flush");
@@ -12599,10 +12621,17 @@ tessera_fs_journal_log_drain(struct tessera_mount *tmp_)
 
 	/* Open a tx, append every record, commit. INODE_WRITE records
 	 * go in first so a replay applying them in walk order populates
-	 * dirty_inodes before the dirent records that reference them. */
+	 * dirty_inodes before the dirent records that reference them.
+	 *
+	 * Deferred writes: these redo-log records become durable at the
+	 * next commit_sb barrier (the deferred-commit boundary), so the
+	 * whole batch bdwrites into the buffer cache rather than paying a
+	 * synchronous device round-trip per record. */
+	tessera_journal_deferred_begin(tmp_->journal);
 	uint64_t tx;
 	if (tessera_journal_tx_begin(tmp_->journal, &tx,
 	    "log_drain") != TESSERA_OK) {
+		tessera_journal_deferred_end(tmp_->journal);
 		/* Re-queue. */
 		mtx_lock(&tmp_->flush_mtx);
 		while (!LIST_EMPTY(&snap)) {
@@ -12672,6 +12701,7 @@ tessera_fs_journal_log_drain(struct tessera_mount *tmp_)
 	if (tessera_journal_tx_commit(tmp_->journal, tx) != TESSERA_OK
 	    && rc == 0)
 		rc = EIO;
+	tessera_journal_deferred_end(tmp_->journal);
 
 	/* Publish the in-memory journal head/tail so userspace tests
 	 * can compare against on-disk state. */
@@ -12693,7 +12723,16 @@ tessera_fs_journal_log_task(void *ctx, int pending)
 	(void)pending;
 	struct tessera_mount *tmp_ = ctx;
 	if (tmp_ == NULL || tmp_->flush_unmounting) return;
+	/* Claim the flush gate so this taskqueue-thread drain can't run
+	 * concurrently with a flush's commit_sb — they share tmp_->journal
+	 * (head_block, and the deferred-write toggle) and must serialise. */
+	if (!tmp_->flush_mtx_init) {
+		(void)tessera_fs_journal_log_drain(tmp_);
+		return;
+	}
+	tessera_fs_flush_gate_enter(tmp_);
 	(void)tessera_fs_journal_log_drain(tmp_);
+	tessera_fs_flush_gate_exit(tmp_);
 }
 
 /* Callout handler — fires every journal_log_interval_ms. Callout

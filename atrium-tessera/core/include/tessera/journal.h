@@ -77,6 +77,25 @@ void tessera_journal_close(tessera_journal_t *);
 void tessera_journal_peek_pos(const tessera_journal_t *,
     uint64_t *head_block, uint64_t *tail_block);
 
+/* Deferred-write mode (perf). Some callers (e.g. the kmod's dirent/inode
+ * redo-log drain) journal large batches of records whose durability is
+ * not required until the next superblock commit barrier — the same
+ * deferred-commit boundary the rest of the filesystem uses. For those,
+ * an alternate block_io whose write_block defers to the host buffer
+ * cache (bdwrite) lets a batch of records flush in bulk at commit time
+ * instead of paying a synchronous device round-trip per record.
+ *
+ * tessera_journal_set_deferred_io registers that alternate io (copied,
+ * like the primary io at open). tessera_journal_deferred_begin/_end
+ * bracket a region whose record + header writes route through it. The
+ * default mode is synchronous (the registered primary io), preserving
+ * commit_sb / replay / checkpoint durability semantics unchanged. A
+ * begin with no deferred io registered is a no-op. */
+void tessera_journal_set_deferred_io(tessera_journal_t *,
+    const tessera_block_io_t *deferred_io);
+void tessera_journal_deferred_begin(tessera_journal_t *);
+void tessera_journal_deferred_end(tessera_journal_t *);
+
 #ifdef __cplusplus
 }
 #endif
