@@ -1169,6 +1169,14 @@ struct tessera_mount {
 	struct mtx                flush_mtx;
 	int                       flush_mtx_init;
 	int                       flush_in_progress;
+	/* Recursive flush-gate ownership (Phase C). The gate serialises all
+	 * paths that allocate data/meta extents, COW the registry/inode
+	 * trees, or write packs, against each other and against commit. Made
+	 * re-entrant by the SAME thread so a gated drain can call a publish
+	 * helper (append_chunked etc.) that re-claims the gate without
+	 * deadlocking. owner == the thread holding it; depth == nesting. */
+	struct thread            *flush_gate_owner;
+	int                       flush_gate_depth;
 
 	/* v2-step-2b: dirty-inode write-back cache. Mutations stage
 	 * the new inode record here instead of immediately btree_put-
@@ -6330,11 +6338,20 @@ static void
 tessera_fs_flush_gate_enter(struct tessera_mount *tmp_)
 {
 	mtx_lock(&tmp_->flush_mtx);
+	/* Re-entrant for the owning thread: a gated drain can invoke a
+	 * publish helper that re-claims the gate. */
+	if (tmp_->flush_in_progress && tmp_->flush_gate_owner == curthread) {
+		tmp_->flush_gate_depth++;
+		mtx_unlock(&tmp_->flush_mtx);
+		return;
+	}
 	while (tmp_->flush_in_progress) {
 		(void)msleep(&tmp_->flush_in_progress, &tmp_->flush_mtx,
 		    PRIBIO, "tessgate", 0);
 	}
 	tmp_->flush_in_progress = 1;
+	tmp_->flush_gate_owner  = curthread;
+	tmp_->flush_gate_depth  = 1;
 	mtx_unlock(&tmp_->flush_mtx);
 }
 
@@ -6342,8 +6359,11 @@ static void
 tessera_fs_flush_gate_exit(struct tessera_mount *tmp_)
 {
 	mtx_lock(&tmp_->flush_mtx);
-	tmp_->flush_in_progress = 0;
-	wakeup(&tmp_->flush_in_progress);
+	if (--tmp_->flush_gate_depth == 0) {
+		tmp_->flush_in_progress = 0;
+		tmp_->flush_gate_owner  = NULL;
+		wakeup(&tmp_->flush_in_progress);
+	}
 	mtx_unlock(&tmp_->flush_mtx);
 }
 
@@ -6752,6 +6772,8 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 			continue;
 		}
 		tmp_->flush_in_progress = 1;
+		tmp_->flush_gate_owner  = curthread;
+		tmp_->flush_gate_depth  = 1;
 		break;
 	}
 	mtx_unlock(&tmp_->flush_mtx);
@@ -6858,7 +6880,11 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 
 	mtx_lock(&tmp_->flush_mtx);
 	if (r == 0) tmp_->sb_dirty = 0;
+	/* Balanced with the depth=1 set at acquire; nested gate_enter/exit
+	 * during the drain leave it at 1 here. */
+	tmp_->flush_gate_depth  = 0;
 	tmp_->flush_in_progress = 0;
+	tmp_->flush_gate_owner  = NULL;
 	wakeup(&tmp_->flush_in_progress);
 	mtx_unlock(&tmp_->flush_mtx);
 	return (r);
@@ -6898,21 +6924,12 @@ tessera_fs_gc_now(struct tessera_mount *tmp_, uint64_t *out_reclaimed)
 	 * live set — otherwise a still-pending new manifest looks orphaned. */
 	(void)tessera_fs_flush(tmp_);
 
-	/* Acquire the flush gate exactly as tessera_fs_flush does. */
-	mtx_lock(&tmp_->flush_mtx);
-	while (tmp_->flush_in_progress) {
-		(void)msleep(&tmp_->flush_in_progress, &tmp_->flush_mtx,
-		    PRIBIO, "tessgc", 0);
-	}
-	tmp_->flush_in_progress = 1;
-	mtx_unlock(&tmp_->flush_mtx);
+	/* Acquire the flush gate (recursive-aware). */
+	tessera_fs_flush_gate_enter(tmp_);
 
 	int n = tessera_fs_gc_data_zone(tmp_);
 
-	mtx_lock(&tmp_->flush_mtx);
-	tmp_->flush_in_progress = 0;
-	wakeup(&tmp_->flush_in_progress);
-	mtx_unlock(&tmp_->flush_mtx);
+	tessera_fs_flush_gate_exit(tmp_);
 
 	if (n > 0 && out_reclaimed != NULL)
 		*out_reclaimed = (uint64_t)n;
@@ -8688,8 +8705,23 @@ tessera_fs_repack_first_multi(struct tessera_mount *tmp_)
 	return (err);
 }
 
+static int tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
+    const uint8_t *manifest_bytes, size_t mlen, const tessera_hash_t hash);
 static int
 tessera_fs_publish_manifest_to_disk(struct tessera_mount *tmp_,
+                                    const uint8_t *manifest_bytes,
+                                    size_t mlen,
+                                    const tessera_hash_t hash)
+{
+	int gated = tmp_->flush_mtx_init;
+	if (gated) tessera_fs_flush_gate_enter(tmp_);
+	int rc = tessera_fs_publish_manifest_to_disk_inner(tmp_, manifest_bytes,
+	    mlen, hash);
+	if (gated) tessera_fs_flush_gate_exit(tmp_);
+	return (rc);
+}
+static int
+tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
                                     const uint8_t *manifest_bytes,
                                     size_t mlen,
                                     const tessera_hash_t hash)
@@ -10502,8 +10534,21 @@ tessera_fs_replace_content_chunk_tree(struct tessera_mount *tmp_,
 	return (0);
 }
 
+static int tessera_fs_replace_content_chunked_inner(struct tessera_mount *tmp_,
+    uint32_t inode_no, const uint8_t *new_bytes, size_t new_len);
 static int
 tessera_fs_replace_content_chunked(struct tessera_mount *tmp_,
+    uint32_t inode_no, const uint8_t *new_bytes, size_t new_len)
+{
+	int gated = tmp_->flush_mtx_init;
+	if (gated) tessera_fs_flush_gate_enter(tmp_);
+	int rc = tessera_fs_replace_content_chunked_inner(tmp_, inode_no,
+	    new_bytes, new_len);
+	if (gated) tessera_fs_flush_gate_exit(tmp_);
+	return (rc);
+}
+static int
+tessera_fs_replace_content_chunked_inner(struct tessera_mount *tmp_,
     uint32_t inode_no, const uint8_t *new_bytes, size_t new_len)
 {
 	if (new_len == 0) {
@@ -10709,8 +10754,22 @@ tessera_fs_replace_content_chunked(struct tessera_mount *tmp_,
  * 1 KiB log line appended to a 1 GiB file: ~0.005% of the bytes
  * touched compared with the slow whole-file rewrite.
  */
+static int tessera_fs_append_chunked_inner(struct tessera_mount *tmp_,
+    uint32_t inode_no, const uint8_t *append_bytes, size_t append_len,
+    uint32_t cs);
 static int
 tessera_fs_append_chunked(struct tessera_mount *tmp_, uint32_t inode_no,
+    const uint8_t *append_bytes, size_t append_len, uint32_t cs)
+{
+	int gated = tmp_->flush_mtx_init;
+	if (gated) tessera_fs_flush_gate_enter(tmp_);
+	int rc = tessera_fs_append_chunked_inner(tmp_, inode_no, append_bytes,
+	    append_len, cs);
+	if (gated) tessera_fs_flush_gate_exit(tmp_);
+	return (rc);
+}
+static int
+tessera_fs_append_chunked_inner(struct tessera_mount *tmp_, uint32_t inode_no,
     const uint8_t *append_bytes, size_t append_len, uint32_t cs)
 {
 	if (append_len == 0) return (ENOTSUP);
@@ -11577,8 +11636,28 @@ tessera_fs_read_full_content(struct tessera_mount *tmp_,
  * The caller is responsible for calling tessera_commit_extent +
  * tessera_commit_sb afterwards.
  */
+/* Phase C: gated wrapper. Every content/manifest publish claims the
+ * flush gate so its extent-alloc + pack-write + registry/inode COW is
+ * atomic w.r.t. commit and w.r.t. any other publisher (the background
+ * publisher, or another vop). Re-entrant via the recursive gate, so a
+ * call from inside an already-gated drain just nests. The gate is taken
+ * only once the mount's flush_mtx exists (mount-time GC publishes before
+ * that, single-threaded). */
+static int tessera_fs_replace_content_inner(struct tessera_mount *tmp_,
+    uint32_t inode_no, const uint8_t *new_bytes, size_t new_len);
 static int
 tessera_fs_replace_content(struct tessera_mount *tmp_, uint32_t inode_no,
+                           const uint8_t *new_bytes, size_t new_len)
+{
+	int gated = tmp_->flush_mtx_init;
+	if (gated) tessera_fs_flush_gate_enter(tmp_);
+	int rc = tessera_fs_replace_content_inner(tmp_, inode_no, new_bytes,
+	    new_len);
+	if (gated) tessera_fs_flush_gate_exit(tmp_);
+	return (rc);
+}
+static int
+tessera_fs_replace_content_inner(struct tessera_mount *tmp_, uint32_t inode_no,
                            const uint8_t *new_bytes, size_t new_len)
 {
 	tessera_manifest_builder_t *mb =
