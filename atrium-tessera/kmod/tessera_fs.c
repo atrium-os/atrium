@@ -452,6 +452,24 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, flush_per_write,
     "1 = BIO_FLUSH after every kbio_write (slower, paranoid); "
     "0 = rely on commit_sb's barrier flushes (default, faster)");
 
+/* Content packs >= this many sectors take the synchronous bulk GEOM
+ * write (g_write_data); smaller ones take the per-sector delayed
+ * (bdwrite) path. The delayed path is non-blocking AND read-coherent
+ * (writes land in the buffer cache, so a read-after-write hits the
+ * buffer; they're made durable in bulk by commit_sb's VOP_FSYNC) — so
+ * it's the better choice for the many medium files of a metadata-heavy
+ * extract, where the bulk path's per-file synchronous device round-trip
+ * dominated. The synchronous bulk write is retained only for genuinely
+ * large packs (default >= 256 sectors = 1 MiB), where its few large BIOs
+ * beat thousands of 4 KiB buffer-cache writes and the buffer-cache
+ * dirty-page pressure they'd create. Was 8 sectors (32 KiB), which put
+ * every medium content file on the blocking path. */
+static int tessera_bulk_write_min_sectors = 256;
+SYSCTL_INT(_kern_tessera, OID_AUTO, bulk_write_min_sectors,
+    CTLFLAG_RW, &tessera_bulk_write_min_sectors, 0,
+    "content packs >= this many sectors use the synchronous bulk write; "
+    "smaller use the non-blocking, read-coherent delayed path");
+
 static int
 tessera_kbio_write(void *ctx, uint64_t sector, const uint8_t *buf)
 {
@@ -7944,13 +7962,13 @@ tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 	    tessera_extent_alloc(tmp_->extent_alloc, n_sectors,
 	    &contig_start);
 	if (r == TESSERA_OK) {
-		/* Large packs: one bulk GEOM write (few large BIOs). Small
-		 * packs (manifests, metadata) keep the per-sector delayed path
-		 * — they batch cheaply at commit and the bulk path's synchronous
-		 * round-trip would regress metadata-heavy workloads (30k-file
-		 * extracts). 8 sectors = 32 KiB is the crossover. */
+		/* Large packs: one bulk GEOM write (few large BIOs). Medium and
+		 * small packs keep the per-sector delayed path — non-blocking,
+		 * read-coherent, and batched at commit — so a metadata-heavy
+		 * extract isn't serialised on a synchronous device round-trip
+		 * per file. Crossover is tessera_bulk_write_min_sectors. */
 		int wrote_bulk = 0;
-		if (n_sectors >= 8) {
+		if (n_sectors >= (uint64_t)tessera_bulk_write_min_sectors) {
 			if (tessera_kbio_write_bulk(&tmp_->bio_ctx, contig_start,
 			    pack_bytes, n_sectors) == 0)
 				wrote_bulk = 1;
