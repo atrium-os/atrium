@@ -752,6 +752,10 @@ static int tessera_fs_append_chunked(struct tessera_mount *tmp_,
 static int tessera_fs_append_chunk_tree(struct tessera_mount *tmp_,
     uint32_t inode_no, const uint8_t *append_bytes, size_t append_len,
     uint32_t cs);
+static int tessera_fs_wrap_list_as_tree(struct tessera_mount *tmp_,
+    uint32_t inode_no);
+static uint32_t tessera_fs_existing_chunk_size(struct tessera_mount *tmp_,
+    const tessera_inode_record_t *ino);
 static void encode_inode_key(uint32_t inode_no, uint8_t out[4]);
 
 /* v2 step-2b: dirty inode entry — element of the per-mount hash. */
@@ -6101,6 +6105,70 @@ tessera_fs_dirty_content_free(struct tessera_dirty_content *dc)
 	free(dc, M_TESSERA);
 }
 
+/* Peek the chunk size an already-chunked file is using, so appends stay
+ * sticky to it instead of switching tiers mid-file (which forces a
+ * whole-file re-chunk). Returns the leaf chunk size, or 0 if the file is
+ * inline / not chunked / unreadable (caller uses the size-tier default).
+ * Reads the first leaf chunk: for CHUNK_LIST that's chunk[0] directly; for
+ * CHUNK_TREE it descends into the first group's CHUNK_LIST. Uses chunk[0]'s
+ * size only when there's a second chunk (so chunk[0] is guaranteed full-cs);
+ * a lone partial chunk is ambiguous → 0. */
+static uint32_t
+tessera_fs_existing_chunk_size(struct tessera_mount *tmp_,
+    const tessera_inode_record_t *ino)
+{
+	int has = 0;
+	for (size_t i = 0; i < TESSERA_HASH_SIZE; i++)
+		if (ino->manifest_hash[i] != 0) { has = 1; break; }
+	if (!has) return (0);
+
+	uint8_t  *mft = NULL;
+	uint32_t  mlen = 0;
+	if (tessera_fs_fetch_blob(tmp_, ino->manifest_hash, &mft, &mlen) != 0)
+		return (0);
+	tessera_manifest_parser_t *p = tessera_manifest_parse(mft, mlen);
+	if (p == NULL) { free(mft, M_TESSERA); return (0); }
+
+	uint32_t cs = 0;
+	tessera_manifest_kind_t kind = tessera_manifest_parser_kind(p);
+	if (kind == TESSERA_MFT_CHUNK_TREE) {
+		/* Descend into the first group. */
+		tessera_tree_record_t tr;
+		if (tessera_manifest_parser_count(p) >= 1 &&
+		    tessera_manifest_tree_at(p, 0, &tr) == TESSERA_OK) {
+			tessera_manifest_parser_free(p);
+			free(mft, M_TESSERA);
+			uint8_t  *gmft = NULL;
+			uint32_t  gmlen = 0;
+			if (tessera_fs_fetch_blob(tmp_, tr.child_manifest_hash,
+			    &gmft, &gmlen) != 0)
+				return (0);
+			tessera_manifest_parser_t *gp =
+			    tessera_manifest_parse(gmft, gmlen);
+			if (gp == NULL) { free(gmft, M_TESSERA); return (0); }
+			tessera_chunk_record_t cr;
+			if (tessera_manifest_parser_count(gp) >= 2 &&
+			    tessera_manifest_chunk_at(gp, 0, &cr) == TESSERA_OK)
+				cs = cr.uncompressed_size;
+			tessera_manifest_parser_free(gp);
+			free(gmft, M_TESSERA);
+			return (cs);
+		}
+		tessera_manifest_parser_free(p);
+		free(mft, M_TESSERA);
+		return (0);
+	}
+	if (kind == TESSERA_MFT_CHUNK_LIST) {
+		tessera_chunk_record_t cr;
+		if (tessera_manifest_parser_count(p) >= 2 &&
+		    tessera_manifest_chunk_at(p, 0, &cr) == TESSERA_OK)
+			cs = cr.uncompressed_size;
+	}
+	tessera_manifest_parser_free(p);
+	free(mft, M_TESSERA);
+	return (cs);
+}
+
 /* Append `len` bytes onto inode_no's file at offset base_off (the true
  * on-disk content boundary — the window buffer's base). Uses the
  * streaming append fast-path; on ENOTSUP (the one-shot CHUNK_LIST→
@@ -6135,7 +6203,15 @@ tessera_fs_append_to_file(struct tessera_mount *tmp_, uint32_t inode_no,
 
 	/* TESSERA_INLINE_THRESHOLD = 256 KiB; #define is later in the file. */
 	if (final_size > (256u * 1024u)) {
-		const uint32_t cs = tessera_chunk_size_for(tmp_, final_size);
+		/* Prefer the file's EXISTING chunk size over the size-tier
+		 * default: a file written sequentially (tar) commits to 64 KiB
+		 * chunks while small, then crosses 64 MiB where the tier default
+		 * would switch to 1 MiB — forcing a whole-file re-chunk
+		 * (read+CDC+SHA every byte). Staying sticky to the established
+		 * cs keeps every append on the metadata-only fast-path. New
+		 * files (no existing chunks) fall back to the size-tier default. */
+		uint32_t cs = tessera_fs_existing_chunk_size(tmp_, &ino);
+		if (cs == 0) cs = tessera_chunk_size_for(tmp_, final_size);
 		int frc = tessera_fs_append_chunked(tmp_, inode_no, bytes,
 		    len, cs);
 		if (frc == 0) {
@@ -10818,14 +10894,21 @@ tessera_fs_append_chunked_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 	}
 
 	/* Step-3c: a CHUNK_LIST file whose append would push it past the
-	 * fanout must be promoted to CHUNK_TREE — bail to the slow path,
-	 * which routes through replace_content_chunked and handles the
-	 * promotion. Append fast-path stays flat-only here. */
+	 * fanout must be promoted to CHUNK_TREE. Try the metadata-only
+	 * promotion first: wrap the existing flat list verbatim as the first
+	 * group of a new tree (no content re-read/re-hash/re-write), then run
+	 * the normal tree suffix-append. Only if that bails (malformed list,
+	 * cross-tier chunk-size change) do we fall to the slow whole-file
+	 * rewrite. This converts the dominant base.txz extract cost (94s of
+	 * whole-file re-chunking over 8 files) into pure metadata. */
 	{
 		const uint64_t projected_chunks = (new_size + cs - 1) / cs;
 		if (projected_chunks > (uint64_t)TESSERA_CHUNK_TREE_FANOUT) {
 			tessera_manifest_parser_free(p);
 			free(old_mft, M_TESSERA);
+			if (tessera_fs_wrap_list_as_tree(tmp_, inode_no) == 0)
+				return (tessera_fs_append_chunk_tree(tmp_,
+				    inode_no, append_bytes, append_len, cs));
 			return (ENOTSUP);
 		}
 	}
@@ -11068,6 +11151,106 @@ enomem:
  * back to slow path (replace_content_chunked, which can rebuild from
  * raw bytes correctly even if structurally novel).
  */
+/*
+ * Metadata-only CHUNK_LIST → CHUNK_TREE promotion.
+ *
+ * When a flat CHUNK_LIST file grows past TESSERA_CHUNK_TREE_FANOUT chunks
+ * (16 MiB at the 64 KiB tier), the append fast-path can't extend a flat
+ * list any further. The OLD path materialised the whole file and re-CDC'd
+ * + re-hashed + re-wrote every chunk (O(file size) per promotion — measured
+ * at 94s / 246 MB over 8 base.txz files, the dominant tar-extract cost).
+ *
+ * But a flat CHUNK_LIST with M ≤ FANOUT chunks IS already a valid tree
+ * sub-group: wrap it verbatim as the single child of a new outer CHUNK_TREE
+ * (reusing its manifest hash — no content read, no re-hash, no re-write),
+ * point the inode at the tree, and let tessera_fs_append_chunk_tree do the
+ * normal metadata-mostly suffix append afterwards. Pure metadata.
+ *
+ * Returns 0 on success (inode now points at a single-group CHUNK_TREE of
+ * the same logical content), ENOTSUP if the old manifest isn't a flat
+ * CHUNK_LIST of ≤ FANOUT chunks (caller falls back to the slow rewrite).
+ */
+static int
+tessera_fs_wrap_list_as_tree(struct tessera_mount *tmp_, uint32_t inode_no)
+{
+	uint8_t key[4];
+	tessera_inode_record_t ino;
+	encode_inode_key(inode_no, key);
+	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
+		return (EIO);
+	if (ino.size == 0) return (ENOTSUP);
+
+	int has_old = 0;
+	for (size_t i = 0; i < TESSERA_HASH_SIZE; i++)
+		if (ino.manifest_hash[i] != 0) { has_old = 1; break; }
+	if (!has_old) return (ENOTSUP);
+
+	/* Confirm the existing manifest is a flat CHUNK_LIST within fanout —
+	 * a tree sub-group manifest must not itself exceed FANOUT entries. */
+	uint8_t  *old_mft = NULL;
+	uint32_t  old_mlen = 0;
+	if (tessera_fs_fetch_blob(tmp_, ino.manifest_hash, &old_mft,
+	    &old_mlen) != 0)
+		return (ENOTSUP);
+	tessera_manifest_parser_t *p = tessera_manifest_parse(old_mft, old_mlen);
+	if (p == NULL ||
+	    tessera_manifest_parser_kind(p) != TESSERA_MFT_CHUNK_LIST ||
+	    tessera_manifest_parser_count(p) == 0 ||
+	    tessera_manifest_parser_count(p) > TESSERA_CHUNK_TREE_FANOUT) {
+		if (p) tessera_manifest_parser_free(p);
+		free(old_mft, M_TESSERA);
+		return (ENOTSUP);
+	}
+	tessera_manifest_parser_free(p);
+
+	/* Build a single-child CHUNK_TREE that references the old flat list
+	 * verbatim (child hash = old manifest hash, offset 0). */
+	tessera_manifest_builder_t *outer =
+	    tessera_manifest_begin(TESSERA_MFT_CHUNK_TREE);
+	if (outer == NULL) { free(old_mft, M_TESSERA); return (ENOMEM); }
+	if (tessera_manifest_add_tree_child(outer, ino.manifest_hash, 0)
+	    != TESSERA_OK) {
+		tessera_manifest_free(outer);
+		free(old_mft, M_TESSERA);
+		return (ENOMEM);
+	}
+	free(old_mft, M_TESSERA);
+	(void)tessera_manifest_set_logical_size(outer, ino.size);
+
+	size_t olen = 0;
+	tessera_hash_t ohash;
+	(void)tessera_manifest_finalize(outer, NULL, 0, &olen, ohash);
+	uint8_t *obuf = malloc(olen, M_TESSERA, M_WAITOK);
+	if (tessera_manifest_finalize(outer, obuf, olen, &olen, ohash)
+	    != TESSERA_OK) {
+		tessera_manifest_free(outer);
+		free(obuf, M_TESSERA);
+		return (EIO);
+	}
+	tessera_manifest_free(outer);
+
+	if (tessera_fs_publish_manifest_owned(tmp_, obuf, olen, ohash,
+	    inode_no) != 0) {
+		free(obuf, M_TESSERA);
+		return (EIO);
+	}
+	free(obuf, M_TESSERA);
+
+	/* Re-read (publish may have updated cached state) and repoint the
+	 * inode at the tree. Size unchanged — this is a representation swap. */
+	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
+		return (EIO);
+	memcpy(ino.manifest_hash, ohash, sizeof ohash);
+	ino.gen++;
+	uint64_t new_inode_root = tmp_->sb.inode_root;
+	if (tessera_fs_inode_put_byk(tmp_, key, &ino, &new_inode_root)
+	    != TESSERA_OK)
+		return (EIO);
+	tmp_->sb.inode_root = new_inode_root;
+	tessera_stat_chunk_tree_publish++;
+	return (0);
+}
+
 static int
 tessera_fs_append_chunk_tree(struct tessera_mount *tmp_, uint32_t inode_no,
     const uint8_t *append_bytes, size_t append_len, uint32_t cs)
