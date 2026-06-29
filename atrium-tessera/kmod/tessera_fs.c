@@ -1013,6 +1013,7 @@ static int tessera_fs_dir_btree_migrate(struct tessera_mount *tmp_,
 #define TESSERA_DIRENT_LOG_MISS  (-1)
 static int tessera_dirent_log_enable_default;
 static int tessera_dirent_log_threshold;
+static int tessera_dirty_flush_async;
 static int tessera_fs_dirent_log_append(struct tessera_mount *tmp_,
     uint32_t parent_inode_no, int op,
     const char *name, uint16_t namelen, uint64_t inode_no);
@@ -4687,7 +4688,18 @@ tessera_fs_mark_dirty(struct tessera_mount *tmp_)
 	 *      200-create-into-one-dir workload from accumulating
 	 *      a full meta-reserve's worth of deferred btree_puts.
 	 */
-	if (tmp_->dirty_init && tmp_->dirty_count > 64u) {
+	/* Synchronous flush, but BATCHED: drain only every
+	 * `dirty_flush_async` mutations (default 256) instead of the old
+	 * hard-coded 64. Per-create flush frequency dominated metadata-heavy
+	 * workloads (a base-system extract ran ~40x slower than ZFS/UFS
+	 * because the fixed per-flush journal-drain + commit_sb + barrier cost
+	 * was paid every 64 creates). Fewer, larger drains amortize that cost;
+	 * the meta-reserve safety check below still bounds the per-drain burst,
+	 * so a higher threshold can't overrun the reserve. (An asynchronous
+	 * enqueue was tried and let an unbounded backlog build into one giant
+	 * blocking drain — worse, not better.) */
+	if (tmp_->dirty_init &&
+	    tmp_->dirty_count > (uint32_t)tessera_dirty_flush_async) {
 		(void)tessera_fs_flush(tmp_);
 		return;
 	}
@@ -4709,7 +4721,7 @@ tessera_fs_mark_dirty(struct tessera_mount *tmp_)
 	    - tmp_->sb.meta_reserve_start;
 	const uint64_t cap  = tmp_->sb.meta_reserve_length;
 	const uint64_t free = (uint64_t)tmp_->meta_free_count;
-	if (cap > 0 && (used > free) &&
+	if (tmp_->dirty_init && cap > 0 && (used > free) &&
 	    (used - free) * 2 >= cap) {
 		(void)tessera_fs_flush(tmp_);
 	}
@@ -11976,6 +11988,14 @@ static int tessera_dirent_log_threshold = 1024;
 SYSCTL_INT(_kern_tessera, OID_AUTO, dirent_log_threshold,
     CTLFLAG_RW, &tessera_dirent_log_threshold, 0,
     "Force flush when dirent_log_count exceeds this");
+
+/* dirty_count past this enqueues an ASYNC flush (non-blocking) so
+ * metadata-heavy create workloads pipeline instead of stalling per-op.
+ * The meta-reserve safety check provides the hard synchronous throttle. */
+static int tessera_dirty_flush_async = 256;
+SYSCTL_INT(_kern_tessera, OID_AUTO, dirty_flush_async,
+    CTLFLAG_RW, &tessera_dirty_flush_async, 0,
+    "dirty_count past this enqueues an async (non-blocking) flush");
 
 /* Append (parent, op, name, inode_no) to the log. Caller holds no
  * lock; we take flush_mtx briefly. */
