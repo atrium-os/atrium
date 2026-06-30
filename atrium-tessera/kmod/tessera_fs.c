@@ -1056,6 +1056,8 @@ static int tessera_journal_log_enable_default;
 static int tessera_journal_log_interval_ms;
 static unsigned long tessera_stat_journal_log_replays = 0;
 static int tessera_fs_journal_log_drain(struct tessera_mount *tmp_);
+static void tessera_fs_flush_gate_enter(struct tessera_mount *tmp_);
+static void tessera_fs_flush_gate_exit(struct tessera_mount *tmp_);
 static void tessera_fs_journal_log_callout(void *ctx);
 static void tessera_fs_journal_log_task(void *ctx, int pending);
 static int tessera_replay_dirent_record(struct tessera_mount *tmp_,
@@ -3852,12 +3854,30 @@ tessera_vop_read(struct vop_read_args *ap)
 	uint8_t key[4];
 	tessera_inode_record_t ino;
 	encode_inode_key((uint32_t)tn->inode_no, key);
+
+	/* A live read composes three views that must be mutually consistent:
+	 * the inode snapshot (size, manifest_hash), this inode's unpublished
+	 * dirty_content buffer, and the on-disk published manifest. Each step
+	 * locks individually, but the COMPOSE is not atomic: if a concurrent
+	 * flush / journal-log checkpoint drains this inode's buffer between
+	 * the size snapshot and dirty_content_read, the manifest fallback
+	 * below runs against a now-stale manifest_hash and returns stale
+	 * bytes in a just-grown / just-truncated (hole) region — the
+	 * intermittent fsx read-mismatch. Hold the flush gate across the whole
+	 * compose so no publisher can drain/republish this inode mid-read. The
+	 * gate is recursive, so the window-drain wrapper below re-enters it
+	 * harmlessly; a gate-waiter holds no buffer locks, so reading packs
+	 * under the gate can't deadlock a blocked publisher. Snapshot reads
+	 * (gen != 0) see immutable historical state and need no gate. */
+	int gated = (tn->snapshot_gen == 0) && tmp_->flush_mtx_init;
+	if (gated) tessera_fs_flush_gate_enter(tmp_);
+
+	int rc;
 	int igrc3 = (tn->snapshot_gen != 0)
 	    ? tessera_fs_inode_get_at_gen(tmp_, (uint32_t)tn->inode_no,
 	          tn->snapshot_gen, &ino)
 	    : tessera_fs_inode_get_byk(tmp_, key, &ino);
-	if (igrc3 != TESSERA_OK)
-		return (EIO);
+	if (igrc3 != TESSERA_OK) { rc = EIO; goto out; }
 
 	/* Live mounts may have a coalesced write buffer for this inode
 	 * that hasn't been published yet — serve from there if present.
@@ -3874,16 +3894,18 @@ tessera_vop_read(struct vop_read_args *ap)
 			(void)tessera_fs_dirty_content_drain_one(tmp_,
 			    (uint32_t)tn->inode_no);
 			if (tessera_fs_inode_get_byk(tmp_, key, &ino)
-			    != TESSERA_OK)
-				return (EIO);
+			    != TESSERA_OK) { rc = EIO; goto out; }
 		}
 		int br = tessera_fs_dirty_content_read(tmp_,
 		    (uint32_t)tn->inode_no, uio);
-		if (br > 0) return (0);
-		if (br < 0) return (-br);
+		if (br > 0) { rc = 0; goto out; }
+		if (br < 0) { rc = -br; goto out; }
 	}
 
-	return (tessera_fs_read_inode_uio(tmp_, &ino, uio));
+	rc = tessera_fs_read_inode_uio(tmp_, &ino, uio);
+out:
+	if (gated) tessera_fs_flush_gate_exit(tmp_);
+	return (rc);
 }
 
 /* ── vop_setattr (utimes / chmod / chown / chflags) ─────────── */
