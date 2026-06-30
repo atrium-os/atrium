@@ -6614,6 +6614,12 @@ tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
 		goto out;
 	}
 
+	/* final_size came from vop_write's UNGATED inode_get; never let it cap
+	 * below the buffer's real extent (a concurrent syncer republish could
+	 * make it stale-small, and the new_size cap below would then shrink
+	 * dc->size, after which a hole-write's zero-fill clobbers live data). */
+	if (final_size < dc->size) final_size = dc->size;
+
 	if (final_size > dc->capacity) {
 		size_t new_cap = dc->capacity ? dc->capacity * 2 : 4096;
 		while (new_cap < final_size) new_cap *= 2;
@@ -6695,6 +6701,11 @@ tessera_fs_dirty_content_write(struct tessera_mount *tmp_, uint32_t inode_no,
 	struct tessera_dirty_content *dc =
 	    tessera_fs_dirty_content_lookup(tmp_, inode_no);
 	if (dc != NULL) {
+		/* Never let a stale-small final_size (from vop_write's ungated
+		 * inode_get, racing a syncer republish) cap below the buffer's
+		 * real extent — that shrink enables a later hole-write zero-fill
+		 * to clobber live data. */
+		if (final_size < dc->size) final_size = dc->size;
 		/* Grow buffer geometrically when needed. Without doubling,
 		 * a sequential dd of N writes triggers N reallocs and
 		 * O(N²) memcpy total — for 256 4-KiB writes that's ~131
@@ -6747,6 +6758,16 @@ tessera_fs_dirty_content_write(struct tessera_mount *tmp_, uint32_t inode_no,
 		    &old_len) != 0)
 			return (EIO);
 	}
+	/* final_size was computed in vop_write from an UNGATED inode_get and
+	 * can be stale-small: if a concurrent syncer flush republished this
+	 * inode at a larger size between that read and here, capping the
+	 * rebuilt buffer / copied content at the stale final_size silently
+	 * drops the tail (fsx-visible persistent corruption). Clamp it up to
+	 * the content we actually see under the gate so no bytes are lost. */
+	if (final_size < (size_t)ino.size) final_size = (size_t)ino.size;
+	if (final_size < old_len) final_size = old_len;
+	if (final_size < (size_t)(write_off + write_len))
+		final_size = (size_t)(write_off + write_len);
 
 	struct tessera_dirty_content *ndc =
 	    malloc(sizeof *ndc, M_TESSERA, M_WAITOK | M_ZERO);
