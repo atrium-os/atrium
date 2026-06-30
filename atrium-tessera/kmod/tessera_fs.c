@@ -6568,6 +6568,23 @@ tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
 {
 	const size_t write_len = (size_t)uio->uio_resid;
 
+	/* Hold the flush gate across the whole buffered write. The uiomove
+	 * into dc->bytes below necessarily runs WITHOUT flush_mtx (uiomove can
+	 * fault / sleep), and — contrary to the old assumption — the vnode lock
+	 * does NOT exclude a concurrent GLOBAL drain: the kernel syncer
+	 * (tessera_sync_impl -> tessera_fs_flush) and fsync drain every inode's
+	 * dirty_content under the gate without taking this vnode's lock. Without
+	 * the gate here, such a drain can detach + publish + FREE this dc
+	 * mid-uiomove, so the write lands in freed memory and the published
+	 * manifest captures torn/stale content — the write is silently lost
+	 * (persistent corruption; surfaced by fsx as a non-transient mismatch).
+	 * The gate is recursive and sleepable, so the uiomove and any
+	 * first-touch read_full_content run safely under it, and a gate-held
+	 * drain (over-cap, below) just re-enters. */
+	int gated = tmp_->flush_mtx_init;
+	if (gated) tessera_fs_flush_gate_enter(tmp_);
+	int rc;
+
 	mtx_lock(&tmp_->flush_mtx);
 	int over_cap = (tmp_->dirty_content_bytes + final_size >
 	    (size_t)tessera_dirty_content_cap);
@@ -6589,11 +6606,12 @@ tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
 		 * relative to subsequent writes.) */
 		uint8_t *kbuf = malloc(write_len, M_TESSERA, M_WAITOK);
 		int err = uiomove(kbuf, (int)write_len, uio);
-		if (err != 0) { free(kbuf, M_TESSERA); return (err); }
+		if (err != 0) { free(kbuf, M_TESSERA); rc = err; goto out; }
 		err = tessera_fs_dirty_content_write(tmp_, inode_no,
 		    write_off, kbuf, write_len, final_size);
 		free(kbuf, M_TESSERA);
-		return (err);
+		rc = err;
+		goto out;
 	}
 
 	if (final_size > dc->capacity) {
@@ -6605,7 +6623,8 @@ tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
 		uint8_t *nb = malloc(new_cap, M_TESSERA, M_NOWAIT | M_ZERO);
 		if (nb == NULL) {
 			mtx_unlock(&tmp_->flush_mtx);
-			return (ENOMEM);
+			rc = ENOMEM;
+			goto out;
 		}
 		if (dc->size > 0)
 			memcpy(nb, dc->bytes, dc->size);
@@ -6619,20 +6638,17 @@ tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
 	target_bytes = dc->bytes + write_off;
 	mtx_unlock(&tmp_->flush_mtx);
 
-	/* Direct copy from user — vnode is held exclusive so dc->bytes
-	 * cannot be freed under us. */
+	/* Safe under the flush gate: no concurrent drain can free dc->bytes. */
 	int err = uiomove(target_bytes, (int)write_len, uio);
-	if (err != 0) return (err);
+	if (err != 0) { rc = err; goto out; }
 
 	mtx_lock(&tmp_->flush_mtx);
-	/* Re-lookup defensively; in normal operation dc is still the
-	 * same entry, but a concurrent invalidate-by-inode could have
-	 * dropped it (we don't have that path today, but keep the
-	 * structure honest). */
+	/* Re-lookup defensively; under the gate dc is still the same entry. */
 	dc = tessera_fs_dirty_content_lookup(tmp_, inode_no);
 	if (dc == NULL) {
 		mtx_unlock(&tmp_->flush_mtx);
-		return (0);
+		rc = 0;
+		goto out;
 	}
 	size_t new_size = (size_t)(write_off + write_len) > dc->size
 	    ? (size_t)(write_off + write_len) : dc->size;
@@ -6643,7 +6659,10 @@ tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
 	dc->dirty = 1;
 	tessera_stat_dirty_content_hits++;
 	mtx_unlock(&tmp_->flush_mtx);
-	return (0);
+	rc = 0;
+out:
+	if (gated) tessera_fs_flush_gate_exit(tmp_);
+	return (rc);
 }
 
 /* Apply a write into the per-inode buffer. Buffer is created on
