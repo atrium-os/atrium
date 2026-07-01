@@ -3014,8 +3014,10 @@ tessera_fs_dir_2l_lookup(struct tessera_mount *tmp_,
 	return (rc);
 }
 
+/* Wired as .vop_cachedlookup (behind vfs_cache_lookup). vop_cachedlookup_args
+ * is layout-identical to vop_lookup_args (a_gen, a_dvp, a_vpp, a_cnp). */
 static int
-tessera_vop_lookup(struct vop_lookup_args *ap)
+tessera_vop_lookup(struct vop_cachedlookup_args *ap)
 {
 	struct vnode *dvp = ap->a_dvp;
 	struct vnode **vpp = ap->a_vpp;
@@ -3248,11 +3250,23 @@ have_child_no:
 	 * content across gens — vget_synth mints a fresh vnode and
 	 * propagates snapshot_gen. */
 	if (dn->snapshot_gen != 0) {
+		/* Snapshot vnodes are never namecached (same inode_no maps to
+		 * different content across gens). */
 		return (tessera_vget_synth(dvp->v_mount, child_no,
 		    dn->inode_no, TESSERA_NODE_REGULAR,
 		    dn->snapshot_gen, vpp));
 	}
-	return (tessera_vget(dvp->v_mount, child_no, dn->inode_no, vpp));
+	int gerr = tessera_vget(dvp->v_mount, child_no, dn->inode_no, vpp);
+	/* Positive namecache entry (this is the .vop_cachedlookup backend
+	 * behind vfs_cache_lookup): repeated path components — usr/, lib/,
+	 * share/ across a whole tree walk — then resolve from the VFS cache
+	 * instead of re-reading the directory manifest + btree every time.
+	 * Only when namei asked to cache (MAKEENTRY) and only for live vnodes;
+	 * invalidated by cache_purge in remove/rmdir/rename. We do NOT insert
+	 * negative entries, so there is no stale-negative-vs-create hazard. */
+	if (gerr == 0 && (cnp->cn_flags & MAKEENTRY) != 0)
+		cache_enter(dvp, *vpp, cnp);
+	return (gerr);
 }
 
 #define DIRENT_HDR  offsetof(struct dirent, d_name)
@@ -11801,6 +11815,12 @@ tessera_vop_remove(struct vop_remove_args *ap)
 	 * hardlinks survive. */
 	(void)tessera_fs_inode_unlink(tmp_, (uint32_t)cn->inode_no);
 
+	/* Invalidate any namecache entries for the removed name. cache_purge
+	 * drops every (parent,name)->vp mapping for vp — over-purges other
+	 * hardlink names of the same inode, which is safe (they just re-cache
+	 * on next lookup). */
+	cache_purge(vp);
+
 	tessera_fs_mark_dirty(tmp_);
 	return (0);
 }
@@ -13965,6 +13985,9 @@ tessera_vop_rmdir(struct vop_rmdir_args *ap)
 	else
 		tmp_->sb.inode_root = new_inode_root;
 
+	/* Invalidate namecache entries for the removed directory. */
+	cache_purge(vp);
+
 	tessera_fs_mark_dirty(tmp_);
 	return (0);
 }
@@ -14531,6 +14554,14 @@ tessera_vop_rename(struct vop_rename_args *ap)
 		}
 	}
 	if (err != 0) goto release;
+
+	/* Namecache: the source moved away from fdvp/fromname, and any
+	 * clobbered target is unlinked — purge both so stale (parent,name)->vp
+	 * entries can't survive. The new tdvp/toname mapping re-caches on next
+	 * lookup. (Positive-only cache, so no negative entries to reconcile.) */
+	cache_purge(fvp);
+	if (tvp != NULL)
+		cache_purge(tvp);
 
 	tessera_fs_mark_dirty(tmp_);
 
@@ -15112,7 +15143,8 @@ struct vop_vector tessera_vnodeops = {
 	.vop_access   = tessera_vop_access,
 	.vop_getattr  = tessera_vop_getattr,
 	.vop_setattr  = tessera_vop_setattr,
-	.vop_lookup   = tessera_vop_lookup,
+	.vop_lookup   = vfs_cache_lookup,
+	.vop_cachedlookup = tessera_vop_lookup,
 	.vop_readdir  = tessera_vop_readdir,
 	.vop_read     = tessera_vop_read,
 	.vop_write    = tessera_vop_write,
