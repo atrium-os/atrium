@@ -20,6 +20,10 @@ fn main() {
         feed_mode(&args);
         return;
     }
+    if args.iter().any(|a| a == "--calibrate") {
+        calibrate_mode(&args);
+        return;
+    }
     if args.iter().any(|a| a == "--effect") {
         effect_mode(&args);
         return;
@@ -112,15 +116,16 @@ fn main() {
 /// it is scheduled promptly on every device wakeup. Reports the device's own
 /// underrun count. The headline: under load, the lane holds underruns at ~0
 /// where plain timeshare does not — the metronome result, on real hardware.
-fn feed_mode(args: &[String]) {
-    let secs: u64 = args.iter().position(|a| a == "--feed").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(10);
-    let spinners: usize = args.iter().position(|a| a == "--feed").and_then(|i| args.get(i + 2)).and_then(|s| s.parse().ok()).unwrap_or(16);
-    let use_lane = args.iter().any(|a| a == "lane");
-
-    // Order matters: open the sink, take the band, and PRIME the buffer BEFORE
-    // any load exists — otherwise the feed thread fights the spinners with an
-    // empty buffer and an un-banded priority, which is the start-time crackle.
-    let nfrags: u32 = std::env::var("LYRA_NFRAGS").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
+/// Run ONE glitch measurement: prime a `nfrags`-deep OSS buffer, (optionally)
+/// sponsor the feed thread on the deadline lane, fork `spinners` CPU hogs, feed
+/// a 440 Hz tone for `secs`, and return the steady-state `play_underruns`.
+///
+/// The spinner lifecycle is owned entirely here: this function forks the hogs
+/// AND SIGKILL+reaps every one of them before returning. Because it is
+/// synchronous and self-contained, a caller can loop it (e.g. calibration)
+/// without any risk of orphaned spinners accumulating across trials — the
+/// failure mode that a shell-loop driver has when a child hangs.
+fn run_feed_trial(secs: u64, spinners: usize, use_lane: bool, nfrags: u32, verbose: bool) -> u32 {
     let sink = match OssSink::open(RATE, 2, FRAMES_PER_PERIOD, nfrags) {
         Ok(s) => s,
         Err(e) => {
@@ -128,10 +133,13 @@ fn feed_mode(args: &[String]) {
             std::process::exit(1);
         }
     };
+    // Order matters: prime the buffer BEFORE any load exists — otherwise the
+    // feed thread fights the spinners with an empty buffer and an un-banded
+    // priority, which is the start-time crackle.
     let _lane = if use_lane {
         match lyra::lane::self_sponsor(1000, period_us_for_feed()) {
-            Ok(fd) => { eprintln!("lyrad: feed thread sponsored on the lane"); Some(fd) }
-            Err(e) => { eprintln!("lyrad: self_sponsor failed ({e}); feeding without lane"); None }
+            Ok(fd) => { if verbose { eprintln!("lyrad: feed thread sponsored on the lane"); } Some(fd) }
+            Err(e) => { if verbose { eprintln!("lyrad: self_sponsor failed ({e}); feeding without lane"); } None }
         }
     } else {
         None
@@ -195,11 +203,90 @@ fn feed_mode(args: &[String]) {
     for pid in kids {
         unsafe { libc::kill(pid, libc::SIGKILL); libc::waitpid(pid, std::ptr::null_mut(), 0); }
     }
-    println!(
-        "lyrad feed: {secs}s, {spinners} spinners, lane={} => play_underruns={underruns}",
-        use_lane
-    );
+    underruns
+}
+
+fn feed_mode(args: &[String]) {
+    let secs: u64 = args.iter().position(|a| a == "--feed").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(10);
+    let spinners: usize = args.iter().position(|a| a == "--feed").and_then(|i| args.get(i + 2)).and_then(|s| s.parse().ok()).unwrap_or(16);
+    let use_lane = args.iter().any(|a| a == "lane");
+    let nfrags: u32 = std::env::var("LYRA_NFRAGS").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
+
+    let underruns = run_feed_trial(secs, spinners, use_lane, nfrags, true);
+    println!("lyrad feed: {secs}s, {spinners} spinners, lane={use_lane} => play_underruns={underruns}");
     std::process::exit(if underruns == 0 { 0 } else { 1 });
+}
+
+/// Read a `u64` sysctl by name, or 0 if unavailable.
+fn sysctl_u64(name: &str) -> u64 {
+    std::process::Command::new("sysctl").arg("-n").arg(name).output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// `lyrad --calibrate [spinners] [secs] [trials]` — find the per-platform
+/// sweet-spot audio buffer for the deadline lane. Sweeps buffer depth under
+/// load, reports the smallest depth that is glitch-free across all trials, and
+/// cross-checks against the scheduler's measured worst-case wake latency. All
+/// spinners are forked and reaped in-process (via run_feed_trial), so the sweep
+/// can never leak load — the cascade a shell driver risks.
+fn calibrate_mode(args: &[String]) {
+    let i = args.iter().position(|a| a == "--calibrate").unwrap();
+    let spinners: usize = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(16);
+    let secs: u64 = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(3);
+    let trials: u32 = args.get(i + 3).and_then(|s| s.parse().ok()).unwrap_or(3);
+    let period_us = period_us_for_feed();
+
+    let _ = std::process::Command::new("sysctl").arg("kern.sched.deadline_enable=1").output();
+    let _ = std::process::Command::new("sysctl").arg("kern.sched.wake_pick_max_us=0").output();
+
+    println!("=== Laminar deadline-lane audio calibration ===");
+    println!("period {period_us} us ({FRAMES_PER_PERIOD} frames @ {RATE} Hz); load {spinners} spinners; {trials} trials/step");
+    println!("buffer sweep (smallest glitch-free depth wins):");
+
+    let depths: [u32; 7] = [3, 4, 6, 8, 10, 12, 16];
+    let mut best: Option<u32> = None;
+    for &nf in &depths {
+        let buf_ms = nf * FRAMES_PER_PERIOD * 1000 / RATE;
+        let mut worst = 0u32;
+        let mut runs = String::new();
+        for _ in 0..trials {
+            let u = run_feed_trial(secs, spinners, true, nf, false);
+            worst = worst.max(u);
+            runs.push_str(&format!(" {u}"));
+        }
+        let verdict = if worst == 0 {
+            if best.is_none() { best = Some(nf); }
+            "CLEAN".to_string()
+        } else {
+            format!("glitch (worst={worst})")
+        };
+        println!("  NFRAGS={nf:<2} {buf_ms:>3} ms  runs:{runs:<18}  {verdict}");
+        if let Some(b) = best { if nf >= b + 4 { break; } }
+    }
+
+    // Diagnostics only. NOTE: wake_pick_max is the worst wake across ALL
+    // threads, so it captures non-lane background threads that the lane does
+    // NOT protect (and thus over-estimates the audio path's real latency — the
+    // very reason the recommendation is empirical, not derived from this). A
+    // trustworthy analytical floor needs a per-lane-entity wake-to-run metric,
+    // which the scheduler does not yet export.
+    let wake = sysctl_u64("kern.sched.wake_pick_max_us");
+    let late = sysctl_u64("kern.sched.lane_max_late_us");
+    println!("diagnostics: worst wake-to-run (all threads) {wake} us; worst replenish late {late} us");
+
+    match best {
+        Some(b) => {
+            let rec = b + 2; // +2-fragment tail margin for rare events
+            let rec_ms = rec * FRAMES_PER_PERIOD * 1000 / RATE;
+            println!("RESULT: smallest glitch-free NFRAGS={b}; RECOMMENDED LYRA_NFRAGS={rec}  ({rec_ms} ms buffer, +2-frag margin)");
+        }
+        None => {
+            println!("RESULT: no glitch-free depth <=16 (buffer < platform jitter);");
+            println!("        reduce scheduling jitter (renice/pin the audio path) or raise the ceiling.");
+        }
+    }
 }
 
 fn period_us_for_feed() -> u64 {
