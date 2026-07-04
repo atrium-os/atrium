@@ -659,7 +659,7 @@ static int tessera_fs_gc_data_zone(struct tessera_mount *tmp_);
 struct tessera_pack_alloc_result;
 static int tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
     const uint8_t *pack_bytes, uint64_t n_sectors,
-    struct tessera_pack_alloc_result *out);
+    struct tessera_pack_alloc_result *out, int contig_only);
 static int tessera_fs_pack_extents_resolve(struct tessera_mount *tmp_,
     const tessera_registry_entry_t *re,
     tessera_pack_extent_t **out_extents, uint32_t *out_count);
@@ -1204,6 +1204,19 @@ struct tessera_mount {
 	uint32_t                  multi_extent_pack_count;
 	struct task               repack_task;
 	int                       repack_task_init;
+
+	/* Pack-relocation generation. Bumped (release-ordered) by any
+	 * path that frees a pack's data-zone extents while the FS is
+	 * live (repack, GC) — always AFTER the registry/cache updates
+	 * and BEFORE the extent_free calls. Readers that resolved a
+	 * pack's extents (loc-cache snapshot or registry entry) sample
+	 * this before the resolve and re-check after the read: if it
+	 * moved, the extents may have been freed and reused mid-read,
+	 * so the (possibly garbage) result is discarded and the fetch
+	 * retried. This covers ALL fetch paths, including ungated ones
+	 * (vop_lookup / vop_readdir manifest fetches), which the flush
+	 * gate alone cannot protect. */
+	volatile uint64_t         pack_reloc_gen;
 
 	/* v2 polish: fsync group-commit. Multiple processes calling
 	 * fsync (or vop_fsync via the deferred-flush callout) coalesce
@@ -7890,6 +7903,20 @@ tessera_fs_fetch_blob_ex(struct tessera_mount *tmp_,
 	    out_buf, out_len))
 		return (0);
 
+	/* Relocation-retry: everything below reads pack data from
+	 * extents resolved from a loc-cache snapshot or a registry
+	 * entry. Repack/GC can free (→ reuse) those extents mid-read;
+	 * they bump pack_reloc_gen AFTER the registry/cache update and
+	 * BEFORE the frees. Sample the gen before resolving; if it moved
+	 * by the time the bytes are in hand, the read window overlapped
+	 * a relocation and the bytes can't be trusted — discard and
+	 * retry from a fresh resolve. Bounded: relocations are rare and
+	 * each retry re-resolves current state. */
+	int reloc_retries = 0;
+	uint64_t reloc_gen0;
+retry_reloc:
+	reloc_gen0 = atomic_load_acq_64(&tmp_->pack_reloc_gen);
+
 	/* Tier A: location cache hit — skip the O(N) linear scan of the
 	 * pack registry, jump straight to bread + parse. */
 	{
@@ -7946,6 +7973,26 @@ tessera_fs_fetch_blob_ex(struct tessera_mount *tmp_,
 				    snap.pack_id, exts, nexts, total_sectors,
 				    hash, dst, dst_cap, &pcbuf, &pclen) == 0) {
 					if (need_free_exts) free(exts, M_TESSERA);
+					if (atomic_load_acq_64(
+					    &tmp_->pack_reloc_gen) !=
+					    reloc_gen0) {
+						/* Read overlapped a
+						 * relocation; the bytes may
+						 * be garbage AND fetch_cached
+						 * may have just inserted that
+						 * garbage into the whole-pack
+						 * cache (after the reloc's
+						 * own invalidate ran). Purge
+						 * and retry. */
+						tessera_cas_invalidate_pack(
+						    &tmp_->cas_cache,
+						    snap.pack_id);
+						if (pcbuf != dst)
+							free(pcbuf, M_TESSERA);
+						if (++reloc_retries <= 4)
+							goto retry_reloc;
+						return (EIO);
+					}
 					*out_buf = pcbuf;
 					*out_len = pclen;
 					return (0);
@@ -7960,6 +8007,16 @@ tessera_fs_fetch_blob_ex(struct tessera_mount *tmp_,
 			    nexts, total_sectors, hash, NULL, &obuf, &olen);
 			if (need_free_exts) free(exts, M_TESSERA);
 			if (frc == 0) {
+				if (atomic_load_acq_64(&tmp_->pack_reloc_gen)
+				    != reloc_gen0) {
+					/* Overlapped a relocation — discard
+					 * before the byte-cache insert so
+					 * garbage never enters the cache. */
+					free(obuf, M_TESSERA);
+					if (++reloc_retries <= 4)
+						goto retry_reloc;
+					return (EIO);
+				}
 				*out_buf = obuf;
 				*out_len = olen;
 				/* Stash small blobs for next time (eligibility
@@ -8016,6 +8073,22 @@ cas_fast_miss:
 		    re.length_sectors, hash, key, &obuf, &olen);
 		free(exts, M_TESSERA);
 		if (frc == 0) {
+			if (atomic_load_acq_64(&tmp_->pack_reloc_gen)
+			    != reloc_gen0) {
+				/* Overlapped a relocation — discard and
+				 * retry with a fresh registry walk. The
+				 * on-demand fetch warm-seeded loc-cache
+				 * entries for this pack's blobs (key !=
+				 * NULL) from possibly-stale extents;
+				 * purge those too. */
+				tessera_cas_invalidate_pack(
+				    &tmp_->cas_cache, key);
+				free(obuf, M_TESSERA);
+				tessera_btree_cursor_free(c);
+				if (++reloc_retries <= 4)
+					goto retry_reloc;
+				return (EIO);
+			}
 			*out_buf = obuf;
 			*out_len = olen;
 			tessera_cas_byte_insert(&tmp_->cas_cache,
@@ -8339,7 +8412,11 @@ next_p:
 	printf("tessera_fs: gc pass2 done — %u dead packs\n", dead_count);
 
 	/* Pass 3: apply. btree_delete each dead key, extent_free each
-	 * range, then commit. */
+	 * range, then commit. Bump the relocation generation first so
+	 * any in-flight fetch that resolved a doomed pack's extents
+	 * retries instead of reading freed (possibly reused) sectors. */
+	if (dead_count > 0)
+		atomic_add_rel_64(&tmp_->pack_reloc_gen, 1);
 	uint64_t new_pack_root = tmp_->sb.pack_registry_root;
 	for (uint32_t i = 0; i < dead_count; i++) {
 		if (tessera_btree_delete(tmp_->pack_registry_tree,
@@ -8554,7 +8631,8 @@ static int
 tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
                                 const uint8_t *pack_bytes,
                                 uint64_t n_sectors,
-                                struct tessera_pack_alloc_result *out)
+                                struct tessera_pack_alloc_result *out,
+                                int contig_only)
 {
 	if (tmp_->extent_alloc == NULL) return (EROFS);
 
@@ -8614,6 +8692,13 @@ tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 		return (0);
 	}
 	if (r != TESSERA_ENOSPC) return (EIO);
+
+	/* contig_only callers (repack) would rather leave the source pack
+	 * as-is than rewrite it into ANOTHER multi-extent layout — a
+	 * multi→multi repack is pure write churn that never converges
+	 * (observed as a background repack task ping-ponging one pack
+	 * between two gang layouts indefinitely). */
+	if (contig_only) return (ENOSPC);
 
 	/* Gang fallback with PEL chaining. When dust fragmentation makes
 	 * a single PEL's 253-extent cap insufficient, allocate multiple
@@ -8699,6 +8784,21 @@ tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 			    "remaining: extent allocator exhausted (r=%d)\n",
 			    (unsigned long long)remaining,
 			    (unsigned long long)n_sectors, r);
+			_ROLLBACK_AND_RETURN(ENOSPC);
+		}
+		if (filled == 0 || count == 0) {
+			/* "Success" that allocated nothing. Without this
+			 * guard `remaining -= filled` never decreases and
+			 * this loop spins FOREVER — observed in-VM as a
+			 * pinned taskqueue thread holding the flush gate
+			 * (repack), starving every reader/writer until the
+			 * whole system wedged on dirty buffers. Treat as
+			 * exhaustion. */
+			printf("tessera_fs: pack alloc — allocator returned "
+			    "OK with 0 sectors (%llu of %llu remaining); "
+			    "treating as ENOSPC\n",
+			    (unsigned long long)remaining,
+			    (unsigned long long)n_sectors);
 			_ROLLBACK_AND_RETURN(ENOSPC);
 		}
 
@@ -8894,8 +8994,85 @@ tessera_fs_pack_extents_resolve(struct tessera_mount *tmp_,
  * Returns 0 on success or no-op-needed, errno otherwise. Sets
  * *out_was_repacked to 1 if a real repack happened (caller's stats).
  */
+/* Return a just-allocated (but not yet registry-committed) pack's
+ * space to the free set. Counterpart of pack_alloc_and_write for
+ * failure paths AFTER a successful alloc+write (registry encode or
+ * btree_put failing): without this the extents of a pack that never
+ * entered the registry leak PERSISTENTLY — GC only sees registry-
+ * referenced packs, and commit_extent persists the allocator state. */
+static void
+tessera_fs_pack_alloc_rollback(struct tessera_mount *tmp_,
+                               const struct tessera_pack_alloc_result *pa)
+{
+	if ((pa->flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) == 0) {
+		(void)tessera_extent_free(tmp_->extent_alloc,
+		    pa->start_sector, pa->length_sectors);
+		return;
+	}
+	/* Multi-extent: free the data extents, then the PEL chain
+	 * (chained packs have >1 PEL sector — freeing only the head
+	 * would leak the tail). PEL content is still readable through
+	 * the buffer cache after the data-extent frees. */
+	tessera_registry_entry_t fake;
+	memset(&fake, 0, sizeof fake);
+	fake.start_sector   = pa->start_sector;
+	fake.length_sectors = pa->length_sectors;
+	fake.flags          = pa->flags;
+	tessera_pack_extent_t *exts = NULL;
+	uint32_t nexts = 0;
+	if (tessera_fs_pack_extents_resolve(tmp_, &fake, &exts, &nexts)
+	    == 0) {
+		for (uint32_t i = 0; i < nexts; i++)
+			(void)tessera_extent_free(tmp_->extent_alloc,
+			    exts[i].start_sector, exts[i].length_sectors);
+	}
+	free(exts, M_TESSERA);
+	uint64_t pel_s = pa->start_sector;
+	for (int d = 0; d < 64 && pel_s != 0; d++) {
+		struct buf *bp = NULL;
+		uint64_t next = 0;
+		if (bread(tmp_->devvp, pel_s * btodb(TESSERA_SECTOR_SIZE),
+		    TESSERA_SECTOR_SIZE,
+		    tmp_->bio_ctx.cred ? tmp_->bio_ctx.cred : NOCRED,
+		    &bp) == 0) {
+			tessera_pack_extent_list_t pel;
+			if (tessera_decode_pack_extent_list(
+			    (const uint8_t *)bp->b_data, &pel) == TESSERA_OK)
+				next = pel.next_pel_sector;
+			brelse(bp);
+		}
+		(void)tessera_extent_free(tmp_->extent_alloc, pel_s, 1);
+		pel_s = next;
+	}
+	/* alloc_and_write's multi path counted this pack; un-count it. */
+	if (tmp_->multi_extent_pack_count > 0)
+		tmp_->multi_extent_pack_count--;
+}
+
+static int tessera_fs_repack_one_pack_inner(struct tessera_mount *tmp_,
+    const uint8_t pack_id[16], int *out_was_repacked);
+
+/* Gated wrapper. Repack mutates exactly the structures the flush gate
+ * exists to protect (pack_registry btree + root, extent allocator):
+ * running it ungated against a concurrent commit lets commit_extent /
+ * commit_sb persist a half-mutated snapshot (see the gate comment at
+ * tessera_fs_flush_gate_enter). The background taskqueue handler used
+ * to call the pass bare — every caller now serializes here. */
 static int
 tessera_fs_repack_one_pack(struct tessera_mount *tmp_,
+                           const uint8_t pack_id[16],
+                           int *out_was_repacked)
+{
+	int gated = tmp_->flush_mtx_init;
+	if (gated) tessera_fs_flush_gate_enter(tmp_);
+	int rc = tessera_fs_repack_one_pack_inner(tmp_, pack_id,
+	    out_was_repacked);
+	if (gated) tessera_fs_flush_gate_exit(tmp_);
+	return (rc);
+}
+
+static int
+tessera_fs_repack_one_pack_inner(struct tessera_mount *tmp_,
                            const uint8_t pack_id[16],
                            int *out_was_repacked)
 {
@@ -8954,17 +9131,18 @@ tessera_fs_repack_one_pack(struct tessera_mount *tmp_,
 		return (EIO);
 	}
 
-	/* Allocate + write a fresh location. The helper prefers contig
-	 * and falls back to multi only if contig fails — for repack this
-	 * is exactly what we want. */
+	/* Allocate + write a fresh location — CONTIG ONLY. Repack's whole
+	 * point is defragmentation; if the data zone can't provide a
+	 * contiguous run, rewriting into another gang layout is pure
+	 * churn. Skip (not an error): the pack stays as-is and a later
+	 * pass retries once space frees up. */
 	struct tessera_pack_alloc_result pa;
 	int wrt = tessera_fs_pack_alloc_and_write(tmp_, body,
-	    re.length_sectors, &pa);
+	    re.length_sectors, &pa, /*contig_only=*/1);
 	free(body, M_TESSERA);
 	if (wrt != 0) {
-		/* Couldn't allocate space — leave old layout intact. */
 		free(old_exts, M_TESSERA);
-		return (wrt);
+		return (wrt == ENOSPC ? 0 : wrt);
 	}
 
 	/* Commit point: same pack_id, new layout, preserved metadata. */
@@ -8975,30 +9153,16 @@ tessera_fs_repack_one_pack(struct tessera_mount *tmp_,
 	uint8_t new_value[TESSERA_REGISTRY_ENTRY_SIZE];
 	if (tessera_encode_registry_entry(&new_re, new_value) != TESSERA_OK) {
 		/* Should not fail; defensive cleanup of the new copy. */
-		if ((pa.flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) == 0) {
-			(void)tessera_extent_free(tmp_->extent_alloc,
-			    pa.start_sector, pa.length_sectors);
-		} else {
-			tessera_pack_extent_t *neexts = NULL;
-			uint32_t nnexts = 0;
-			if (tessera_fs_pack_extents_resolve(tmp_, &new_re,
-			    &neexts, &nnexts) == 0) {
-				for (uint32_t i = 0; i < nnexts; i++)
-					(void)tessera_extent_free(
-					    tmp_->extent_alloc,
-					    neexts[i].start_sector,
-					    neexts[i].length_sectors);
-			}
-			free(neexts, M_TESSERA);
-			(void)tessera_extent_free(tmp_->extent_alloc,
-			    pa.start_sector, 1);
-		}
+		tessera_fs_pack_alloc_rollback(tmp_, &pa);
 		free(old_exts, M_TESSERA);
 		return (EIO);
 	}
 	uint64_t new_pack_root = tmp_->sb.pack_registry_root;
 	if (tessera_btree_put(tmp_->pack_registry_tree, pack_id,
 	    new_value, &new_pack_root) != TESSERA_OK) {
+		/* Registry unchanged — old layout stays live; the NEW
+		 * copy must be returned or its extents leak forever. */
+		tessera_fs_pack_alloc_rollback(tmp_, &pa);
 		free(old_exts, M_TESSERA);
 		return (EIO);
 	}
@@ -9007,6 +9171,13 @@ tessera_fs_repack_one_pack(struct tessera_mount *tmp_,
 	/* Same pack_id, new layout — invalidate any cache entries that
 	 * still point at the OLD extents. They'd bread freed sectors. */
 	tessera_cas_invalidate_pack(&tmp_->cas_cache, pack_id);
+
+	/* Relocation barrier: a fetch that resolved the OLD extents
+	 * before the invalidation above may still be mid-read. Bump the
+	 * generation BEFORE freeing so such a reader sees the change on
+	 * its post-read re-check and retries instead of trusting bytes
+	 * from sectors that may already be reused. */
+	atomic_add_rel_64(&tmp_->pack_reloc_gen, 1);
 
 	/* Past the commit point — free the OLD extents + old PEL. */
 	for (uint32_t e = 0; e < old_nexts; e++)
@@ -9131,43 +9302,49 @@ tessera_fs_repack_pass(struct tessera_mount *tmp_,
 	getmicrotime(&tv0);
 	uint32_t repacked = 0;
 
-	while (repacked < max_packs) {
+	/* Collect-then-apply (same shape as GC): ONE cursor walk gathers
+	 * up to max_packs MULTI_EXTENT keys, then each is repacked. The
+	 * old shape restarted the walk from seek_first after every
+	 * attempt — a pack that repack declines (contig space
+	 * unavailable → skip, was=0) would be re-found and re-attempted
+	 * in a tight loop until the time budget expired, every pass. */
+	uint8_t (*cand)[16] = malloc((size_t)max_packs * 16, M_TESSERA,
+	    M_WAITOK);
+	uint32_t cand_n = 0;
+	tessera_btree_cursor_t *c =
+	    tessera_btree_seek_first(tmp_->pack_registry_tree);
+	while (c != NULL && cand_n < max_packs) {
+		uint8_t key[16];
+		uint8_t value[TESSERA_REGISTRY_ENTRY_SIZE];
+		if (tessera_btree_cursor_get(c, key, value) != TESSERA_OK)
+			break;
+		tessera_registry_entry_t re;
+		if (tessera_decode_registry_entry(value, &re) == TESSERA_OK &&
+		    (re.flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) != 0) {
+			memcpy(cand[cand_n], key, 16);
+			cand_n++;
+		}
+		if (tessera_btree_cursor_next(c) != TESSERA_OK) break;
+	}
+	if (c != NULL) tessera_btree_cursor_free(c);
+
+	for (uint32_t ci = 0; ci < cand_n; ci++) {
 		getmicrotime(&tv1);
 		uint64_t elapsed_ms = (uint64_t)(tv1.tv_sec - tv0.tv_sec) * 1000ULL +
 		    ((uint64_t)tv1.tv_usec - (uint64_t)tv0.tv_usec) / 1000ULL;
 		if (elapsed_ms >= max_time_ms) break;
 
-		tessera_btree_cursor_t *c =
-		    tessera_btree_seek_first(tmp_->pack_registry_tree);
-		if (c == NULL) break;
-		uint8_t found_key[16];
-		int found = 0;
-		for (;;) {
-			uint8_t key[16];
-			uint8_t value[TESSERA_REGISTRY_ENTRY_SIZE];
-			if (tessera_btree_cursor_get(c, key, value) != TESSERA_OK)
-				break;
-			tessera_registry_entry_t re;
-			if (tessera_decode_registry_entry(value, &re) == TESSERA_OK &&
-			    (re.flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) != 0) {
-				memcpy(found_key, key, 16);
-				found = 1;
-				break;
-			}
-			if (tessera_btree_cursor_next(c) != TESSERA_OK) break;
-		}
-		tessera_btree_cursor_free(c);
-		if (!found) break;
-
 		int was = 0;
-		int err = tessera_fs_repack_one_pack(tmp_, found_key, &was);
+		int err = tessera_fs_repack_one_pack(tmp_, cand[ci], &was);
 		if (err != 0) {
+			free(cand, M_TESSERA);
 			if (out_repacked != NULL) *out_repacked = repacked;
 			tessera_repack_last_packs = repacked;
 			return (err);
 		}
 		if (was) repacked++;
 	}
+	free(cand, M_TESSERA);
 
 	getmicrotime(&tv1);
 	uint64_t elapsed_ms = (uint64_t)(tv1.tv_sec - tv0.tv_sec) * 1000ULL +
@@ -9247,7 +9424,14 @@ tessera_fs_repack_task(void *ctx, int pending)
 	(void)tessera_fs_repack_pass(tmp_, budget_packs, budget_ms,
 	    &repacked);
 
-	if (!tmp_->flush_unmounting &&
+	/* Re-arm ONLY if this pass made progress. A pass that repacked
+	 * nothing (data zone can't provide contig space, or every
+	 * attempt failed) would otherwise re-enqueue itself in a tight
+	 * loop — the taskqueue thread re-runs it immediately, pinning a
+	 * CPU and hammering the flush gate until the machine wedges.
+	 * With no progress we go quiet; the next mark_dirty re-arms us
+	 * once the FS state has actually changed. */
+	if (!tmp_->flush_unmounting && repacked > 0 &&
 	    tmp_->multi_extent_pack_count >
 	        (uint32_t)tessera_repack_threshold) {
 		(void)taskqueue_enqueue(taskqueue_thread, &tmp_->repack_task);
@@ -9357,7 +9541,7 @@ tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
 	const uint64_t n_sectors = pack_size / TESSERA_SECTOR_SIZE;
 	struct tessera_pack_alloc_result pa;
 	int wrt = tessera_fs_pack_alloc_and_write(tmp_, pack_bytes,
-	    n_sectors, &pa);
+	    n_sectors, &pa, /*contig_only=*/0);
 	free(pack_bytes, M_TESSERA);
 	if (wrt != 0) return (wrt);
 
@@ -9373,13 +9557,20 @@ tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
 	re.reachable_blobs = 1;
 	re.flags           = pa.flags;
 	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
-	if (tessera_encode_registry_entry(&re, reg_value) != TESSERA_OK)
+	if (tessera_encode_registry_entry(&re, reg_value) != TESSERA_OK) {
+		/* Pack is written but can't enter the registry — return
+		 * its extents or they leak persistently (GC only sees
+		 * registry-referenced packs). */
+		tessera_fs_pack_alloc_rollback(tmp_, &pa);
 		return (EIO);
+	}
 
 	uint64_t new_pack_root = tmp_->sb.pack_registry_root;
 	if (tessera_btree_put(tmp_->pack_registry_tree, pack_id, reg_value,
-	    &new_pack_root) != TESSERA_OK)
+	    &new_pack_root) != TESSERA_OK) {
+		tessera_fs_pack_alloc_rollback(tmp_, &pa);
 		return (EIO);
+	}
 	tmp_->sb.pack_registry_root = new_pack_root;
 
 	/* CAS-cache insert for the manifest blob. Single-blob pack ⇒ one
@@ -9494,7 +9685,7 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
 	const uint64_t n_sectors = pack_size / TESSERA_SECTOR_SIZE;
 	struct tessera_pack_alloc_result pa;
 	int wrt = tessera_fs_pack_alloc_and_write(tmp_, pack_bytes,
-	    n_sectors, &pa);
+	    n_sectors, &pa, /*contig_only=*/0);
 	free(pack_bytes, M_TESSERA);
 	if (wrt != 0) return (wrt);
 
@@ -9510,13 +9701,20 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
 	re.reachable_blobs = n_pack_blobs;
 	re.flags           = pa.flags;
 	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
-	if (tessera_encode_registry_entry(&re, reg_value) != TESSERA_OK)
+	if (tessera_encode_registry_entry(&re, reg_value) != TESSERA_OK) {
+		/* Pack is written but can't enter the registry — return
+		 * its extents or they leak persistently (GC only sees
+		 * registry-referenced packs). */
+		tessera_fs_pack_alloc_rollback(tmp_, &pa);
 		return (EIO);
+	}
 
 	uint64_t new_pack_root = tmp_->sb.pack_registry_root;
 	if (tessera_btree_put(tmp_->pack_registry_tree, pack_id, reg_value,
-	    &new_pack_root) != TESSERA_OK)
+	    &new_pack_root) != TESSERA_OK) {
+		tessera_fs_pack_alloc_rollback(tmp_, &pa);
 		return (EIO);
+	}
 	tmp_->sb.pack_registry_root = new_pack_root;
 
 	/* Per-blob CAS-cache inserts. All blobs share the same physical
@@ -9601,7 +9799,7 @@ tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
 	const uint64_t n_sectors = pack_size / TESSERA_SECTOR_SIZE;
 	struct tessera_pack_alloc_result pa;
 	int wrt = tessera_fs_pack_alloc_and_write(tmp_, pack_bytes,
-	    n_sectors, &pa);
+	    n_sectors, &pa, /*contig_only=*/0);
 	free(pack_bytes, M_TESSERA);
 	if (wrt != 0) return (wrt);
 
@@ -9617,13 +9815,20 @@ tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
 	re.reachable_blobs = n_pack_blobs;
 	re.flags           = pa.flags;
 	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
-	if (tessera_encode_registry_entry(&re, reg_value) != TESSERA_OK)
+	if (tessera_encode_registry_entry(&re, reg_value) != TESSERA_OK) {
+		/* Pack is written but can't enter the registry — return
+		 * its extents or they leak persistently (GC only sees
+		 * registry-referenced packs). */
+		tessera_fs_pack_alloc_rollback(tmp_, &pa);
 		return (EIO);
+	}
 
 	uint64_t new_pack_root = tmp_->sb.pack_registry_root;
 	if (tessera_btree_put(tmp_->pack_registry_tree, pack_id, reg_value,
-	    &new_pack_root) != TESSERA_OK)
+	    &new_pack_root) != TESSERA_OK) {
+		tessera_fs_pack_alloc_rollback(tmp_, &pa);
 		return (EIO);
+	}
 	tmp_->sb.pack_registry_root = new_pack_root;
 
 	/* Every blob in this pack shares the same physical extents (same
