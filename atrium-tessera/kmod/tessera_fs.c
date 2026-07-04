@@ -868,6 +868,21 @@ struct tessera_dirty_content {
 	 * its wall time blocked on it). At most one writer per inode
 	 * exists (exclusive vnode lock), so this is 0/1. */
 	int       busy;
+	/* Publish-in-place: set (under flush_mtx, by the gate-holding
+	 * drain) while this buffer's contents are being published. The
+	 * entry STAYS IN THE TABLE so the ungated getattr size overlay
+	 * and read compose keep seeing it — detaching first opened a
+	 * window where stat() observed the file size regress to the
+	 * pre-write value (drain detached the overlay before its publish
+	 * updated the inode; fsx "Size error" under concurrency).
+	 * Writers that find a draining buffer sleep on the dc address
+	 * until the publish completes. Bytes/size are immutable while
+	 * set. */
+	int       draining;
+	/* Stamp of the last drain_all round that attempted this entry —
+	 * lets the sweep skip publish-failed entries (they stay in the
+	 * table, data intact, retried next flush) without a side list. */
+	uint64_t  drain_round;
 	/* Append-window mode for large sequential writes. base_off > 0 ⇒ the
 	 * buffer is a sliding window holding file bytes
 	 * [base_off, base_off+size); the on-disk manifest already holds
@@ -1284,6 +1299,7 @@ struct tessera_mount {
 	struct mtx                flush_mtx;
 	int                       flush_mtx_init;
 	sbintime_t                flush_gate_t0;   /* TPROF: acquire time */
+	uint64_t                  dc_drain_round;  /* see dc->drain_round */
 	int                       flush_in_progress;
 	/* Recursive flush-gate ownership (Phase C). The gate serialises all
 	 * paths that allocate data/meta extents, COW the registry/inode
@@ -6582,8 +6598,16 @@ tessera_fs_dirty_content_append(struct tessera_mount *tmp_, uint32_t inode_no,
 		(void)tessera_fs_dirty_content_drain_all(tmp_);
 
 	mtx_lock(&tmp_->flush_mtx);
-	struct tessera_dirty_content *dc =
-	    tessera_fs_dirty_content_lookup(tmp_, inode_no);
+	struct tessera_dirty_content *dc;
+	for (;;) {
+		dc = tessera_fs_dirty_content_lookup(tmp_, inode_no);
+		/* Never mutate a window whose bytes an in-place publish is
+		 * reading (draining) — wait for it to finish, then
+		 * re-lookup (success removes the entry → create path). */
+		if (dc == NULL || !dc->draining)
+			break;
+		(void)msleep(dc, &tmp_->flush_mtx, PRIBIO, "tessdrn", 0);
+	}
 	if (dc != NULL) {
 		/* A classic whole-file buffer, or a non-tail offset, can't be
 		 * windowed here — let the caller drain and fall back. */
@@ -6733,6 +6757,56 @@ tessera_fs_flush_gate_exit(struct tessera_mount *tmp_)
 	mtx_unlock(&tmp_->flush_mtx);
 }
 
+/* Publish one dirty-content buffer IN PLACE. Called with flush_mtx
+ * HELD and dc in the table; returns with flush_mtx dropped.
+ *
+ * The entry is never detached before publishing: it is marked
+ * `draining` and stays in the table, so the (ungated) getattr size
+ * overlay and the read compose keep seeing the buffered state for the
+ * whole publish. Detach-first opened a window — overlay gone, inode
+ * not yet updated — where stat() saw the file size REGRESS (fsx
+ * "Size error: stat new / lseek old" once writes ran concurrently
+ * with drains). On success the entry is removed after the publish
+ * (which updates the inode cache) completes; on failure `draining` is
+ * simply cleared — the data was never at risk, which also replaces
+ * the old detach/reinsert-on-failure machinery. */
+static int
+tessera_fs_dirty_content_drain_dc(struct tessera_mount *tmp_,
+                                  struct tessera_dirty_content *dc)
+{
+	mtx_assert(&tmp_->flush_mtx, MA_OWNED);
+	/* Freeze the bytes: wait out a writer mid-uiomove. */
+	while (dc->busy)
+		(void)msleep(dc, &tmp_->flush_mtx, PRIBIO, "tessbusy", 0);
+	dc->draining = 1;
+	mtx_unlock(&tmp_->flush_mtx);
+
+	int rc = tessera_fs_dirty_content_publish(tmp_, dc);
+
+	mtx_lock(&tmp_->flush_mtx);
+	dc->draining = 0;
+	if (rc == 0) {
+		LIST_REMOVE(dc, link);
+		if (tmp_->dirty_content_bytes >= dc->size)
+			tmp_->dirty_content_bytes -= dc->size;
+		else
+			tmp_->dirty_content_bytes = 0;
+		wakeup(dc);
+		mtx_unlock(&tmp_->flush_mtx);
+		tessera_fs_dirty_content_free(dc);
+		return (0);
+	}
+	/* Publish failed (e.g. ENOSPC once the data zone fills). The
+	 * buffer holds the ONLY copy of these writes; it simply stays in
+	 * the table for retry at the next drain. */
+	printf("tessera_fs: dirty-content publish failed (rc=%d, "
+	    "inode %u, %zu bytes) — kept in RAM for retry\n",
+	    rc, dc->inode_no, dc->size);
+	wakeup(dc);
+	mtx_unlock(&tmp_->flush_mtx);
+	return (rc);
+}
+
 /* Drain a single inode's buffer. Caller MUST hold the flush gate. */
 static int
 tessera_fs_dirty_content_drain_one_locked(struct tessera_mount *tmp_,
@@ -6745,31 +6819,9 @@ tessera_fs_dirty_content_drain_one_locked(struct tessera_mount *tmp_,
 		mtx_unlock(&tmp_->flush_mtx);
 		return (0);
 	}
-	tessera_fs_dirty_content_detach(tmp_, dc);
-	mtx_unlock(&tmp_->flush_mtx);
-	int rc = tessera_fs_dirty_content_publish(tmp_, dc);
-	if (rc != 0) {
-		/* Publish failed (e.g. ENOSPC once the data zone fills).
-		 * The buffer holds the ONLY copy of these writes — freeing
-		 * it here silently destroys them, and the caller then
-		 * rebuilds state from the stale on-disk content (observed
-		 * as fsx "zeros where data was written" persistent
-		 * corruption once a 64 MiB image filled up). Reinsert so
-		 * the data survives for retry, and hand the error up so
-		 * the vop can fail with ENOSPC instead of corrupting. */
-		printf("tessera_fs: dirty-content publish failed (rc=%d, "
-		    "inode %u, %zu bytes) — kept in RAM for retry\n",
-		    rc, dc->inode_no, dc->size);
-		mtx_lock(&tmp_->flush_mtx);
-		uint32_t b = dc->inode_no &
-		    (TESSERA_DIRTY_CONTENT_BUCKETS - 1u);
-		LIST_INSERT_HEAD(&tmp_->dirty_content[b], dc, link);
-		tmp_->dirty_content_bytes += dc->size;
-		mtx_unlock(&tmp_->flush_mtx);
-		return (rc);
-	}
-	tessera_fs_dirty_content_free(dc);
-	return (rc);
+	/* Drains are serialized by the flush gate, so this entry cannot
+	 * already be draining. */
+	return (tessera_fs_dirty_content_drain_dc(tmp_, dc));
 }
 
 /* Drain a single inode's buffer (pre-truncate / pre-chunked-write).
@@ -6792,45 +6844,29 @@ static int
 tessera_fs_dirty_content_drain_all_locked(struct tessera_mount *tmp_)
 {
 	int last_err = 0;
-	/* Buffers whose publish fails are parked here and reinserted after
-	 * the sweep — reinserting inside the loop would retry them forever,
-	 * and freeing them (the old behaviour) silently destroyed the only
-	 * copy of the buffered writes (ENOSPC → persistent corruption). */
-	LIST_HEAD(, tessera_dirty_content) failed;
-	LIST_INIT(&failed);
+	/* Round-stamped sweep: entries publish IN PLACE (see drain_dc) —
+	 * success removes them, failure leaves them stamped with this
+	 * round so the sweep skips them (retried next flush) instead of
+	 * spinning. Entries inserted mid-sweep (future ungated writers)
+	 * carry an older stamp and are picked up naturally. */
+	tmp_->dc_drain_round++;
+	const uint64_t round = tmp_->dc_drain_round;
 	for (uint32_t b = 0; b < TESSERA_DIRTY_CONTENT_BUCKETS; b++) {
 		for (;;) {
 			mtx_lock(&tmp_->flush_mtx);
-			struct tessera_dirty_content *dc =
-			    LIST_FIRST(&tmp_->dirty_content[b]);
+			struct tessera_dirty_content *dc = NULL, *e;
+			LIST_FOREACH(e, &tmp_->dirty_content[b], link) {
+				if (e->drain_round != round) { dc = e; break; }
+			}
 			if (dc == NULL) {
 				mtx_unlock(&tmp_->flush_mtx);
 				break;
 			}
-			tessera_fs_dirty_content_detach(tmp_, dc);
-			mtx_unlock(&tmp_->flush_mtx);
-			int rc = tessera_fs_dirty_content_publish(tmp_, dc);
-			if (rc != 0) {
-				printf("tessera_fs: dirty-content publish "
-				    "failed (rc=%d, inode %u, %zu bytes) — "
-				    "kept in RAM for retry\n",
-				    rc, dc->inode_no, dc->size);
+			dc->drain_round = round;
+			int rc = tessera_fs_dirty_content_drain_dc(tmp_, dc);
+			if (rc != 0)
 				last_err = rc;
-				LIST_INSERT_HEAD(&failed, dc, link);
-				continue;
-			}
-			tessera_fs_dirty_content_free(dc);
 		}
-	}
-	struct tessera_dirty_content *fdc;
-	while ((fdc = LIST_FIRST(&failed)) != NULL) {
-		LIST_REMOVE(fdc, link);
-		mtx_lock(&tmp_->flush_mtx);
-		uint32_t b = fdc->inode_no &
-		    (TESSERA_DIRTY_CONTENT_BUCKETS - 1u);
-		LIST_INSERT_HEAD(&tmp_->dirty_content[b], fdc, link);
-		tmp_->dirty_content_bytes += fdc->size;
-		mtx_unlock(&tmp_->flush_mtx);
 	}
 	return (last_err);
 }
@@ -6852,8 +6888,17 @@ tessera_fs_dirty_content_drop(struct tessera_mount *tmp_, uint32_t inode_no)
 {
 	if (!tmp_->flush_mtx_init) return;
 	mtx_lock(&tmp_->flush_mtx);
-	struct tessera_dirty_content *dc =
-	    tessera_fs_dirty_content_lookup(tmp_, inode_no);
+	struct tessera_dirty_content *dc;
+	for (;;) {
+		dc = tessera_fs_dirty_content_lookup(tmp_, inode_no);
+		/* An in-place publish (draining) or a writer mid-uiomove
+		 * (busy) is using dc->bytes right now — freeing it here
+		 * is use-after-free. Wait; on wakeup re-lookup (a
+		 * successful publish removes+frees the entry). */
+		if (dc == NULL || (!dc->draining && !dc->busy))
+			break;
+		(void)msleep(dc, &tmp_->flush_mtx, PRIBIO, "tessdrp", 0);
+	}
 	if (dc != NULL) {
 		tessera_fs_dirty_content_detach(tmp_, dc);
 		tessera_stat_dirty_content_drops++;
@@ -6913,8 +6958,17 @@ tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
 	 * hands back a pointer for the caller-side uiomove. */
 	uint8_t *target_bytes = NULL;
 	mtx_lock(&tmp_->flush_mtx);
-	struct tessera_dirty_content *dc =
-	    tessera_fs_dirty_content_lookup(tmp_, inode_no);
+	struct tessera_dirty_content *dc;
+	for (;;) {
+		dc = tessera_fs_dirty_content_lookup(tmp_, inode_no);
+		/* Draining = an in-place publish is reading dc->bytes;
+		 * mutating them now would publish torn content. Unreachable
+		 * while writes hold the flush gate, load-bearing once they
+		 * don't. On wakeup re-lookup (publish success frees dc). */
+		if (dc == NULL || !dc->draining)
+			break;
+		(void)msleep(dc, &tmp_->flush_mtx, PRIBIO, "tessdrn", 0);
+	}
 	if (dc == NULL) {
 		mtx_unlock(&tmp_->flush_mtx);
 		/* Slow path — fall back to the kbuf variant which
