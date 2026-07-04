@@ -465,6 +465,13 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, flush_per_write,
  * dirty-page pressure they'd create. Was 8 sectors (32 KiB), which put
  * every medium content file on the blocking path. */
 static int tessera_bulk_write_min_sectors = 256;
+/* DIAG: gate the read-side g_read_data coalesce independently of the bulk
+ * WRITE path (they share bulk_write_min_sectors otherwise), so corruption
+ * can be attributed to the reader vs the writer. */
+static int tessera_read_coalesce_enable = 1;
+SYSCTL_INT(_kern_tessera, OID_AUTO, read_coalesce_enable, CTLFLAG_RW,
+    &tessera_read_coalesce_enable, 0,
+    "DIAG: enable the coalesced g_read_data fast path (0 = bread only)");
 SYSCTL_INT(_kern_tessera, OID_AUTO, bulk_write_min_sectors,
     CTLFLAG_RW, &tessera_bulk_write_min_sectors, 0,
     "content packs >= this many sectors use the synchronous bulk write; "
@@ -610,10 +617,19 @@ tessera_kbio_write_bulk(struct tessera_kbio_ctx *k, uint64_t start_sector,
 		    (start_sector + i) * btodb(TESSERA_SECTOR_SIZE),
 		    TESSERA_SECTOR_SIZE, 0, 0, GB_NOCREAT);
 		if (bp != NULL) {
+			/* A DIRTY buffer under a freshly allocated bulk
+			 * extent means these sectors are still owned by
+			 * unflushed data (double allocation) — invalidating
+			 * would destroy it. Never observed; scream if it is. */
+			if (bp->b_flags & B_DELWRI)
+				printf("tessera_fs: WARNING bulk write over "
+				    "DIRTY buffered sector %llu\n",
+				    (unsigned long long)(start_sector + i));
 			bp->b_flags |= B_INVAL | B_NOCACHE;
 			brelse(bp);
 		}
 	}
+
 	return (0);
 }
 
@@ -4071,9 +4087,15 @@ tessera_vop_setattr(struct vop_setattr_args *ap)
 			return (EFBIG);
 		if (new_size != ino.size) {
 			/* Drain any coalesced writes so the on-disk content
-			 * we're about to read reflects the latest writes. */
-			(void)tessera_fs_dirty_content_drain_one(tmp_,
+			 * we're about to read reflects the latest writes.
+			 * A failed drain (ENOSPC) MUST abort the truncate:
+			 * proceeding would rebuild the file from stale
+			 * on-disk content, silently discarding the buffered
+			 * writes (the fsx zero-fill corruption). */
+			int drc = tessera_fs_dirty_content_drain_one(tmp_,
 			    (uint32_t)tn->inode_no);
+			if (drc != 0)
+				return (drc);
 			/* Re-fetch ino post-drain (size may have grown). */
 			if (tessera_fs_inode_get(tmp_,
 			    (uint32_t)tn->inode_no, &ino) != TESSERA_OK)
@@ -5594,12 +5616,20 @@ tessera_fs_pending_manifests_drain(struct tessera_mount *tmp_)
 	while ((e = LIST_FIRST(&snap)) != NULL) {
 		LIST_REMOVE(e, link);
 
-		/* Per-blob dedup: if we've already got a pack containing
-		 * this blob hash on disk (or in the warm CAS cache),
-		 * skip publishing — the existing copy is canonical. */
+		/* Per-blob dedup: skip publishing when a DURABLE copy of
+		 * this blob already exists. The loc cache alone is NOT a
+		 * durability oracle (it is a 16K-entry LRU whose entry can
+		 * outlive — or precede — the pack's registry entry); trusting
+		 * it dropped pending manifests whose "canonical" copy was
+		 * never on disk, leaving inodes referencing a blob in no
+		 * pack (fsck dangling). Verify the loc hit's pack_id against
+		 * the pack registry before skipping. */
 		struct tessera_cas_loc_snap snap_dummy;
+		uint8_t dedup_reg[TESSERA_REGISTRY_ENTRY_SIZE];
 		if (tessera_cas_loc_lookup(&tmp_->cas_cache, e->hash,
-		    &snap_dummy)) {
+		    &snap_dummy) &&
+		    tessera_btree_get(tmp_->pack_registry_tree,
+		        snap_dummy.pack_id, dedup_reg) == TESSERA_OK) {
 			tessera_stat_aggregation_dedups++;
 			struct tessera_pending_owner *po;
 			while ((po = LIST_FIRST(&e->owners)) != NULL) {
@@ -6586,6 +6616,26 @@ tessera_fs_dirty_content_drain_one_locked(struct tessera_mount *tmp_,
 	tessera_fs_dirty_content_detach(tmp_, dc);
 	mtx_unlock(&tmp_->flush_mtx);
 	int rc = tessera_fs_dirty_content_publish(tmp_, dc);
+	if (rc != 0) {
+		/* Publish failed (e.g. ENOSPC once the data zone fills).
+		 * The buffer holds the ONLY copy of these writes — freeing
+		 * it here silently destroys them, and the caller then
+		 * rebuilds state from the stale on-disk content (observed
+		 * as fsx "zeros where data was written" persistent
+		 * corruption once a 64 MiB image filled up). Reinsert so
+		 * the data survives for retry, and hand the error up so
+		 * the vop can fail with ENOSPC instead of corrupting. */
+		printf("tessera_fs: dirty-content publish failed (rc=%d, "
+		    "inode %u, %zu bytes) — kept in RAM for retry\n",
+		    rc, dc->inode_no, dc->size);
+		mtx_lock(&tmp_->flush_mtx);
+		uint32_t b = dc->inode_no &
+		    (TESSERA_DIRTY_CONTENT_BUCKETS - 1u);
+		LIST_INSERT_HEAD(&tmp_->dirty_content[b], dc, link);
+		tmp_->dirty_content_bytes += dc->size;
+		mtx_unlock(&tmp_->flush_mtx);
+		return (rc);
+	}
 	tessera_fs_dirty_content_free(dc);
 	return (rc);
 }
@@ -6610,6 +6660,12 @@ static int
 tessera_fs_dirty_content_drain_all_locked(struct tessera_mount *tmp_)
 {
 	int last_err = 0;
+	/* Buffers whose publish fails are parked here and reinserted after
+	 * the sweep — reinserting inside the loop would retry them forever,
+	 * and freeing them (the old behaviour) silently destroyed the only
+	 * copy of the buffered writes (ENOSPC → persistent corruption). */
+	LIST_HEAD(, tessera_dirty_content) failed;
+	LIST_INIT(&failed);
 	for (uint32_t b = 0; b < TESSERA_DIRTY_CONTENT_BUCKETS; b++) {
 		for (;;) {
 			mtx_lock(&tmp_->flush_mtx);
@@ -6622,9 +6678,27 @@ tessera_fs_dirty_content_drain_all_locked(struct tessera_mount *tmp_)
 			tessera_fs_dirty_content_detach(tmp_, dc);
 			mtx_unlock(&tmp_->flush_mtx);
 			int rc = tessera_fs_dirty_content_publish(tmp_, dc);
-			if (rc != 0) last_err = rc;
+			if (rc != 0) {
+				printf("tessera_fs: dirty-content publish "
+				    "failed (rc=%d, inode %u, %zu bytes) — "
+				    "kept in RAM for retry\n",
+				    rc, dc->inode_no, dc->size);
+				last_err = rc;
+				LIST_INSERT_HEAD(&failed, dc, link);
+				continue;
+			}
 			tessera_fs_dirty_content_free(dc);
 		}
+	}
+	struct tessera_dirty_content *fdc;
+	while ((fdc = LIST_FIRST(&failed)) != NULL) {
+		LIST_REMOVE(fdc, link);
+		mtx_lock(&tmp_->flush_mtx);
+		uint32_t b = fdc->inode_no &
+		    (TESSERA_DIRTY_CONTENT_BUCKETS - 1u);
+		LIST_INSERT_HEAD(&tmp_->dirty_content[b], fdc, link);
+		tmp_->dirty_content_bytes += fdc->size;
+		mtx_unlock(&tmp_->flush_mtx);
 	}
 	return (last_err);
 }
@@ -7416,14 +7490,21 @@ tessera_fs_pack_read_range(struct tessera_mount *tmp_,
 	 * becomes tens of thousands of tiny reads (~0.8 MB/s, the read-path
 	 * analogue of the write path's pre-g_write_data ~0.5 MB/s). Read each
 	 * extent-contiguous, sector-aligned span in one g_read_data (maxphys-
-	 * capped) instead. COHERENCE: only for packs >= bulk_write_min_sectors,
-	 * which the write path wrote via g_write_data — synchronous to disk +
-	 * buffer-cache-invalidated — so bypassing the buffer cache here reads
-	 * current data. Small reads (index/descriptor) and small packs stay on
-	 * the buffer-cached per-sector path so read-after-write-before-flush
-	 * (bdwrite'd small packs) remains coherent. On any g_read_data error we
-	 * fall through to the safe bread path. */
-	if (tmp_->cp != NULL && len >= 32768 &&
+	 * capped) instead. COHERENCE: only for SINGLE-EXTENT packs >=
+	 * bulk_write_min_sectors — exactly the packs the write path wrote via
+	 * g_write_data (synchronous to disk + buffer-cache-invalidated) — so
+	 * bypassing the buffer cache here reads current data. MULTI-EXTENT
+	 * (PEL) packs of ANY size are written per-sector with bdwrite and can
+	 * sit only in the buffer cache until the syncer runs; g_read_data on
+	 * those returns stale disk (zeros on a fresh image) — a large INLINE
+	 * manifest published through the pending-manifest drain into a
+	 * fragmented allocation was read back with a zeroed tail, and the next
+	 * write's read-modify-write persisted the zeros (fsx corruption at op
+	 * ~2224 in the replay trace; root-caused 2026-07-03). They stay on the
+	 * coherent bread path. Small reads (index/descriptor) and small packs
+	 * likewise. On any g_read_data error we fall through to bread. */
+	if (tessera_read_coalesce_enable &&
+	    tmp_->cp != NULL && nexts == 1 && len >= 32768 &&
 	    total_sectors >= (uint64_t)tessera_bulk_write_min_sectors) {
 		uint64_t cap = (uint64_t)maxphys;
 		if (cap == 0 || cap > (1u << 20)) cap = (1u << 20);
@@ -8484,6 +8565,9 @@ tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 	int r = tessera_force_multi_extent ? TESSERA_ENOSPC :
 	    tessera_extent_alloc(tmp_->extent_alloc, n_sectors,
 	    &contig_start);
+	if (r != TESSERA_OK && r != TESSERA_ENOSPC)
+		printf("tessera_fs: pack alloc unexpected rc=%d (n=%llu)\n",
+		    r, (unsigned long long)n_sectors);
 	if (r == TESSERA_OK) {
 		/* Large packs: one bulk GEOM write (few large BIOs). Medium and
 		 * small packs keep the per-sector delayed path — non-blocking,
@@ -8491,16 +8575,32 @@ tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 		 * extract isn't serialised on a synchronous device round-trip
 		 * per file. Crossover is tessera_bulk_write_min_sectors. */
 		int wrote_bulk = 0;
-		if (n_sectors >= (uint64_t)tessera_bulk_write_min_sectors) {
+		int is_bulk_class =
+		    (n_sectors >= (uint64_t)tessera_bulk_write_min_sectors);
+		if (is_bulk_class) {
 			if (tessera_kbio_write_bulk(&tmp_->bio_ctx, contig_start,
 			    pack_bytes, n_sectors) == 0)
 				wrote_bulk = 1;
 		}
 		if (!wrote_bulk) {
 			for (uint64_t i = 0; i < n_sectors; i++) {
-				if (tessera_kbio_write_delayed(&tmp_->bio_ctx,
-				    contig_start + i,
-				    pack_bytes + i * TESSERA_SECTOR_SIZE) != 0) {
+				/* Readers treat "single-extent AND >= bulk
+				 * threshold" as ON DISK (g_read_data fast
+				 * path in pack_read_range bypasses the buffer
+				 * cache). If the bulk write failed for a
+				 * bulk-class pack, fall back to SYNCHRONOUS
+				 * bwrite — not bdwrite — so that invariant
+				 * still holds. Sub-threshold packs keep the
+				 * non-blocking delayed path (readers bread
+				 * them, which is buffer-cache coherent). */
+				int wrc = is_bulk_class ?
+				    tessera_kbio_write(&tmp_->bio_ctx,
+				        contig_start + i,
+				        pack_bytes + i * TESSERA_SECTOR_SIZE) :
+				    tessera_kbio_write_delayed(&tmp_->bio_ctx,
+				        contig_start + i,
+				        pack_bytes + i * TESSERA_SECTOR_SIZE);
+				if (wrc != 0) {
 					(void)tessera_extent_free(
 					    tmp_->extent_alloc, contig_start,
 					    n_sectors);
@@ -11210,11 +11310,14 @@ tessera_fs_replace_content_chunked_inner(struct tessera_mount *tmp_,
 	tessera_manifest_free(mb);
 
 	tessera_hash_t pub_hash;
-	if (tessera_fs_publish_chunked(tmp_, dirty, n_dirty, mft, mlen,
-	    pub_hash) != 0) {
+	int prc = tessera_fs_publish_chunked(tmp_, dirty, n_dirty, mft, mlen,
+	    pub_hash);
+	if (prc != 0) {
+		/* Propagate the real errno — laundering ENOSPC into EIO hid
+		 * disk-full from every caller (and from userland). */
 		free(mft, M_TESSERA);
 		free(dirty, M_TESSERA);
-		return (EIO);
+		return (prc);
 	}
 	free(mft, M_TESSERA);
 	free(dirty, M_TESSERA);
@@ -14031,8 +14134,17 @@ tessera_vop_write(struct vop_write_args *ap)
 	/* If we have a coalesced buffer but the write spills past
 	 * dirty_content_file_max, drain it to disk first so the chunked
 	 * path below sees the latest content (and so we stop holding the
-	 * old size's bytes in RAM). */
-	(void)tessera_fs_dirty_content_drain_one(tmp_, (uint32_t)tn->inode_no);
+	 * old size's bytes in RAM). A failed drain (ENOSPC) aborts the
+	 * write — the chunked path would otherwise splice into stale
+	 * content and persist it over the buffered writes. */
+	{
+		int drc = tessera_fs_dirty_content_drain_one(tmp_,
+		    (uint32_t)tn->inode_no);
+		if (drc != 0) {
+			free(new_bytes, M_TESSERA);
+			return (drc);
+		}
+	}
 	/* Re-fetch ino; the drain may have grown it. */
 	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK) {
 		free(new_bytes, M_TESSERA);
