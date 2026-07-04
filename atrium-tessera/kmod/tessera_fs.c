@@ -163,6 +163,48 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, mark_dirty,
     CTLFLAG_RD, &tessera_stat_mark_dirty, 0,
     "Cumulative tessera_fs_mark_dirty invocations");
 
+/* Phase profiling: wall-nanoseconds + call counts accumulated per
+ * phase, exposed as kern.tessera.prof_*. Plain (non-atomic) adds —
+ * meant for single-workload profiling runs, tolerate races. DTrace's
+ * profile provider panics this kernel (dtrace_state_deadman spin-lock
+ * timeout on smp_rendezvous), so the FS carries its own timers. */
+enum tessera_prof_phase {
+	TPROF_LOOKUP = 0, TPROF_CREATE, TPROF_WRITE, TPROF_SETATTR,
+	TPROF_GATE_WAIT, TPROF_PENDING_SCAN, TPROF_FL_DC, TPROF_FL_JOURNAL,
+	TPROF_FL_DIRENT, TPROF_FL_PENDING, TPROF_FL_INODES,
+	TPROF_FL_EXTENT, TPROF_FL_SB, TPROF_FLUSH, TPROF_JTASK,
+	TPROF_GATE_HELD,
+	TPROF_NPHASE
+};
+static unsigned long tessera_prof_ns[TPROF_NPHASE];
+static unsigned long tessera_prof_calls[TPROF_NPHASE];
+#define TPROF_T0()            sbinuptime()
+#define TPROF_ADD(ph, t0) do {                                          \
+	tessera_prof_ns[(ph)]    += (unsigned long)sbttons(sbinuptime() - (t0)); \
+	tessera_prof_calls[(ph)] += 1;                                   \
+} while (0)
+#define TPROF_SYSCTL(name, ph, desc)                                    \
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, prof_##name##_ns,                 \
+    CTLFLAG_RW, &tessera_prof_ns[ph], 0, desc " (ns)");                 \
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, prof_##name##_calls,              \
+    CTLFLAG_RW, &tessera_prof_calls[ph], 0, desc " (calls)")
+TPROF_SYSCTL(lookup,       TPROF_LOOKUP,       "vop_lookup wall time");
+TPROF_SYSCTL(create,       TPROF_CREATE,       "vop_create wall time");
+TPROF_SYSCTL(write,        TPROF_WRITE,        "vop_write wall time");
+TPROF_SYSCTL(setattr,      TPROF_SETATTR,      "vop_setattr wall time");
+TPROF_SYSCTL(gate_wait,    TPROF_GATE_WAIT,    "time blocked entering flush gate");
+TPROF_SYSCTL(pending_scan, TPROF_PENDING_SCAN, "pending-manifest owner supersession scan");
+TPROF_SYSCTL(fl_dc,        TPROF_FL_DC,        "flush: dirty-content drain");
+TPROF_SYSCTL(fl_journal,   TPROF_FL_JOURNAL,   "flush: journal-log drain");
+TPROF_SYSCTL(fl_dirent,    TPROF_FL_DIRENT,    "flush: dirent-log checkpoint");
+TPROF_SYSCTL(fl_pending,   TPROF_FL_PENDING,   "flush: pending-manifest drain");
+TPROF_SYSCTL(fl_inodes,    TPROF_FL_INODES,    "flush: dirty-inode drain");
+TPROF_SYSCTL(fl_extent,    TPROF_FL_EXTENT,    "flush: commit_extent");
+TPROF_SYSCTL(fl_sb,        TPROF_FL_SB,        "flush: commit_sb");
+TPROF_SYSCTL(flush,        TPROF_FLUSH,        "flush: total");
+TPROF_SYSCTL(jtask,        TPROF_JTASK,        "periodic journal-log task (gated)");
+TPROF_SYSCTL(gate_held,    TPROF_GATE_HELD,    "total time the flush gate was held");
+
 /* v2 slice-4 debug tooling: meta-reserve trace ring. Records every
  * meta_alloc / meta_free / drain-* event with (op, sector, gen, count)
  * so a hung VM's dmesg-via-sysctl can show what the meta-reserve was
@@ -656,6 +698,11 @@ struct meta_mark_ctx { uint8_t *bitmap; uint64_t lo; uint64_t hi; };
 static int meta_mark_visitor(void *ctx, uint64_t sector);
 static void tessera_meta_pin_bitmap_rebuild(struct tessera_mount *tmp_);
 static int tessera_fs_gc_data_zone(struct tessera_mount *tmp_);
+static void tessera_fs_seed_constant_manifests(struct tessera_mount *tmp_);
+static int tessera_vop_lookup_impl(struct vop_cachedlookup_args *ap);
+static int tessera_vop_create_impl(struct vop_create_args *ap);
+static int tessera_vop_write_impl(struct vop_write_args *ap);
+static int tessera_vop_setattr_impl(struct vop_setattr_args *ap);
 struct tessera_pack_alloc_result;
 static int tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
     const uint8_t *pack_bytes, uint64_t n_sectors,
@@ -811,6 +858,16 @@ struct tessera_dirty_content {
 	size_t    size;         /* bytes buffered (≤ capacity) */
 	size_t    capacity;     /* allocated buffer size */
 	int       dirty;        /* 1 = differs from on-disk manifest */
+	/* Writer-in-progress flag, protected by flush_mtx. Set (under
+	 * flush_mtx) by the buffered-write fast path around its unlocked
+	 * uiomove into ->bytes; drains wait for it to clear before
+	 * detaching the buffer. Replaces holding the GLOBAL flush gate
+	 * across every buffered write — that hold serialized the whole
+	 * FS on the write hot path (measured: gate held ~56% of a
+	 * base-system extract across ~20k acquisitions; tar spent ~half
+	 * its wall time blocked on it). At most one writer per inode
+	 * exists (exclusive vnode lock), so this is 0/1. */
+	int       busy;
 	/* Append-window mode for large sequential writes. base_off > 0 ⇒ the
 	 * buffer is a sliding window holding file bytes
 	 * [base_off, base_off+size); the on-disk manifest already holds
@@ -1226,6 +1283,7 @@ struct tessera_mount {
 	 * wakeup when the active commit clears it. */
 	struct mtx                flush_mtx;
 	int                       flush_mtx_init;
+	sbintime_t                flush_gate_t0;   /* TPROF: acquire time */
 	int                       flush_in_progress;
 	/* Recursive flush-gate ownership (Phase C). The gate serialises all
 	 * paths that allocate data/meta extents, COW the registry/inode
@@ -1244,14 +1302,14 @@ struct tessera_mount {
 	 * unlinked while dirty (drain calls btree_delete). All accesses
 	 * take flush_mtx — same lock that protects the commit-coordi-
 	 * nation flag, so a flush sees a coherent snapshot. */
-#define TESSERA_DIRTY_INODE_BUCKETS  128u
+#define TESSERA_DIRTY_INODE_BUCKETS  8192u
 	LIST_HEAD(, tessera_dirty_inode) dirty_inodes[TESSERA_DIRTY_INODE_BUCKETS];
 	uint32_t                  dirty_count;
 	int                       dirty_init;
 
 	/* Per-inode dirty content buffers (write coalescing). See
 	 * struct tessera_dirty_content. */
-#define TESSERA_DIRTY_CONTENT_BUCKETS  128u
+#define TESSERA_DIRTY_CONTENT_BUCKETS  2048u
 	LIST_HEAD(, tessera_dirty_content) dirty_content[TESSERA_DIRTY_CONTENT_BUCKETS];
 	size_t                    dirty_content_bytes; /* sum of size across all */
 
@@ -1283,7 +1341,7 @@ struct tessera_mount {
 	 * Crash safety: log is RAM-only. fsync triggers checkpoint
 	 * → BTREE update → commit_sb. Same durability as today's
 	 * dirty_inodes cache. */
-#define TESSERA_DIRENT_LOG_BUCKETS  64u
+#define TESSERA_DIRENT_LOG_BUCKETS  4096u
 	LIST_HEAD(, tessera_dirent_log_entry)
 	    dirent_log[TESSERA_DIRENT_LOG_BUCKETS];
 	uint32_t                  dirent_log_count;
@@ -2163,6 +2221,19 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 			(void)tessera_fs_repack_pass(tmp_, budget_packs,
 			    budget_ms, &repacked);
 		}
+		/* Pre-publish the CONSTANT manifests (empty INLINE for
+		 * vop_create, empty DIRECTORY for vop_mkdir) as durable
+		 * single-blob packs. Every create/mkdir then short-
+		 * circuits at publish's registry pre-check: no pending-
+		 * cache entry, no owner tracking, no supersession scan.
+		 * Without this, a 30k-file untar built ONE pending entry
+		 * with 30k owner nodes (every empty file shares the same
+		 * hash) and every subsequent owned publish walked that
+		 * list under flush_mtx — O(N^2), measured 22s → 35s. It
+		 * also closes the fsck dangling-manifest class for good:
+		 * the constants can never be supersede-dropped because
+		 * they never sit in RAM. */
+		tessera_fs_seed_constant_manifests(tmp_);
 	}
 	mp->mnt_stat.f_namemax = TESSERA_PATH_NAME_MAX;
 	mp->mnt_flag |= MNT_LOCAL;
@@ -2814,10 +2885,19 @@ tessera_sync_impl(struct mount *mp, int waitfor)
 {
 	struct tessera_mount *tmp_ = VFSTOTESSERA(mp);
 	if (tmp_ == NULL) return (0);
+	/* MNT_LAZY is the VFS syncer daemon's periodic pass. Tessera has
+	 * its own flush cadence (flush_co every flush_interval_sec, plus
+	 * the mark_dirty pressure triggers), so servicing the syncer with
+	 * a full gated flush just serialized foreground vops against a
+	 * commit ~1×/s — measured as ~half the wall time of a base-system
+	 * extract (tar blocked on tessgate). Same policy as ZFS: ignore
+	 * MNT_LAZY, keep our own schedule. sync(2)/unmount use MNT_WAIT
+	 * and still get the synchronous flush. */
+	if (waitfor == MNT_LAZY)
+		return (0);
 	/* flush drains all coalesced content inside its gate; doing it here
 	 * too would publish outside the gate and race the commit. */
 	(void)tessera_fs_flush(tmp_);
-	(void)waitfor;  /* flush is synchronous either way */
 	return (0);
 }
 
@@ -3070,6 +3150,14 @@ tessera_fs_dir_2l_lookup(struct tessera_mount *tmp_,
  * is layout-identical to vop_lookup_args (a_gen, a_dvp, a_vpp, a_cnp). */
 static int
 tessera_vop_lookup(struct vop_cachedlookup_args *ap)
+{
+	sbintime_t _tp0 = TPROF_T0();
+	int _rc = tessera_vop_lookup_impl(ap);
+	TPROF_ADD(TPROF_LOOKUP, _tp0);
+	return (_rc);
+}
+static int
+tessera_vop_lookup_impl(struct vop_cachedlookup_args *ap)
 {
 	struct vnode *dvp = ap->a_dvp;
 	struct vnode **vpp = ap->a_vpp;
@@ -4022,6 +4110,14 @@ out:
 static int
 tessera_vop_setattr(struct vop_setattr_args *ap)
 {
+	sbintime_t _tp0 = TPROF_T0();
+	int _rc = tessera_vop_setattr_impl(ap);
+	TPROF_ADD(TPROF_SETATTR, _tp0);
+	return (_rc);
+}
+static int
+tessera_vop_setattr_impl(struct vop_setattr_args *ap)
+{
 	struct vnode *vp = ap->a_vp;
 	struct vattr *vap = ap->a_vap;
 	struct tessera_node *tn = VTOTNODE(vp);
@@ -4455,6 +4551,14 @@ tessera_vop_fsync(struct vop_fsync_args *ap)
 {
 	struct tessera_mount *tmp_ = VFSTOTESSERA(ap->a_vp->v_mount);
 	if (tmp_ == NULL) return (0);
+	/* The VFS syncer daemon walks dirty vnodes with MNT_LAZY /
+	 * MNT_NOWAIT; servicing each with a full gated flush produced a
+	 * ~1 Hz commit storm that serialized every foreground vop (see
+	 * tessera_sync_impl). Tessera's own flush cadence covers those.
+	 * Only a real fsync(2)/fdatasync (MNT_WAIT) pays the synchronous
+	 * flush — that's the durability contract that matters. */
+	if (ap->a_waitfor != MNT_WAIT)
+		return (0);
 	/* tessera_fs_flush drains all coalesced writes (this inode included)
 	 * INSIDE its gate before committing, so the publish + commit are
 	 * atomic. Draining here first would publish outside the gate and let
@@ -5435,6 +5539,7 @@ tessera_fs_pending_manifest_put(struct tessera_mount *tmp_,
 	 * three inodes pointing at a hash that fetch_blob couldn't find
 	 * (not yet on disk, and no longer in the pending cache). */
 	if (owner_inode_no != 0) {
+		sbintime_t _tp0 = TPROF_T0();
 		for (uint32_t bb = 0;
 		    bb < TESSERA_PENDING_MANIFEST_BUCKETS; bb++) {
 			struct tessera_pending_manifest *prev, *tmp_e;
@@ -5467,6 +5572,7 @@ tessera_fs_pending_manifest_put(struct tessera_mount *tmp_,
 				}
 			}
 		}
+		TPROF_ADD(TPROF_PENDING_SCAN, _tp0);
 	}
 
 	uint32_t b = hash[0];
@@ -6261,6 +6367,13 @@ static void
 tessera_fs_dirty_content_detach(struct tessera_mount *tmp_,
                                 struct tessera_dirty_content *dc)
 {
+	/* A buffered write may be mid-uiomove into dc->bytes with only
+	 * dc->busy set (it does NOT hold the flush gate — see the busy
+	 * field's comment). Wait it out before detaching; the dc stays
+	 * valid and listed across the msleep because only drains remove
+	 * entries and drains are serialized by the gate. */
+	while (dc->busy)
+		(void)msleep(dc, &tmp_->flush_mtx, PRIBIO, "tessbusy", 0);
 	LIST_REMOVE(dc, link);
 	if (tmp_->dirty_content_bytes >= dc->size)
 		tmp_->dirty_content_bytes -= dc->size;
@@ -6592,13 +6705,18 @@ tessera_fs_flush_gate_enter(struct tessera_mount *tmp_)
 		mtx_unlock(&tmp_->flush_mtx);
 		return;
 	}
-	while (tmp_->flush_in_progress) {
-		(void)msleep(&tmp_->flush_in_progress, &tmp_->flush_mtx,
-		    PRIBIO, "tessgate", 0);
+	if (tmp_->flush_in_progress) {
+		sbintime_t _tp0 = TPROF_T0();
+		while (tmp_->flush_in_progress) {
+			(void)msleep(&tmp_->flush_in_progress,
+			    &tmp_->flush_mtx, PRIBIO, "tessgate", 0);
+		}
+		TPROF_ADD(TPROF_GATE_WAIT, _tp0);
 	}
 	tmp_->flush_in_progress = 1;
 	tmp_->flush_gate_owner  = curthread;
 	tmp_->flush_gate_depth  = 1;
+	tmp_->flush_gate_t0     = TPROF_T0();
 	mtx_unlock(&tmp_->flush_mtx);
 }
 
@@ -6607,6 +6725,7 @@ tessera_fs_flush_gate_exit(struct tessera_mount *tmp_)
 {
 	mtx_lock(&tmp_->flush_mtx);
 	if (--tmp_->flush_gate_depth == 0) {
+		TPROF_ADD(TPROF_GATE_HELD, tmp_->flush_gate_t0);
 		tmp_->flush_in_progress = 0;
 		tmp_->flush_gate_owner  = NULL;
 		wakeup(&tmp_->flush_in_progress);
@@ -6761,19 +6880,23 @@ tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
 {
 	const size_t write_len = (size_t)uio->uio_resid;
 
-	/* Hold the flush gate across the whole buffered write. The uiomove
-	 * into dc->bytes below necessarily runs WITHOUT flush_mtx (uiomove can
-	 * fault / sleep), and — contrary to the old assumption — the vnode lock
-	 * does NOT exclude a concurrent GLOBAL drain: the kernel syncer
-	 * (tessera_sync_impl -> tessera_fs_flush) and fsync drain every inode's
-	 * dirty_content under the gate without taking this vnode's lock. Without
-	 * the gate here, such a drain can detach + publish + FREE this dc
-	 * mid-uiomove, so the write lands in freed memory and the published
-	 * manifest captures torn/stale content — the write is silently lost
-	 * (persistent corruption; surfaced by fsx as a non-transient mismatch).
-	 * The gate is recursive and sleepable, so the uiomove and any
-	 * first-touch read_full_content run safely under it, and a gate-held
-	 * drain (over-cap, below) just re-enters. */
+	/* The uiomove into dc->bytes below necessarily runs WITHOUT
+	 * flush_mtx (uiomove can fault / sleep), and the vnode lock does
+	 * NOT exclude a concurrent GLOBAL drain (flush/fsync drain every
+	 * inode's dirty_content without taking this vnode's lock) — a
+	 * drain could detach + publish + FREE this dc mid-uiomove
+	 * (persistent fsx corruption). The dc->busy flag provides the
+	 * per-buffer exclusion for the uiomove itself; the flush gate is
+	 * STILL held across the write because dropping it exposes a
+	 * second, pre-existing TOCTOU: a drain that detaches this file's
+	 * buffer removes the size overlay before its publish updates the
+	 * inode, so a concurrent getattr sees the size go BACKWARD (fsx
+	 * "Size error", stat new / lseek old). Fixing that needs
+	 * publish-in-place (keep the entry visible, marked draining,
+	 * until the inode is updated) — until that lands, the gate stays.
+	 * Measured cost: gate held ~56% of a base-system extract, ~20k
+	 * acquisitions; the payoff for removing it arrives only together
+	 * with the chunked-write de-gate anyway. */
 	int gated = tmp_->flush_mtx_init;
 	if (gated) tessera_fs_flush_gate_enter(tmp_);
 	int rc;
@@ -6796,7 +6919,9 @@ tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
 		mtx_unlock(&tmp_->flush_mtx);
 		/* Slow path — fall back to the kbuf variant which
 		 * handles read_full_content. (First-touch is uncommon
-		 * relative to subsequent writes.) */
+		 * relative to subsequent writes.) All its dc mutations
+		 * happen in single flush_mtx critical sections, so it
+		 * needs neither the gate nor the busy flag. */
 		uint8_t *kbuf = malloc(write_len, M_TESSERA, M_WAITOK);
 		int err = uiomove(kbuf, (int)write_len, uio);
 		if (err != 0) { free(kbuf, M_TESSERA); rc = err; goto out; }
@@ -6835,18 +6960,22 @@ tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
 		memset(dc->bytes + dc->size, 0,
 		    (size_t)(write_off - dc->size));
 	target_bytes = dc->bytes + write_off;
+	/* Mark the buffer busy for the unlocked uiomove below. Drains
+	 * (detach) wait on this instead of us holding the global flush
+	 * gate for every buffered write. */
+	dc->busy = 1;
 	mtx_unlock(&tmp_->flush_mtx);
 
-	/* Safe under the flush gate: no concurrent drain can free dc->bytes. */
+	/* Safe: detach waits on dc->busy, so no drain can free dc->bytes. */
 	int err = uiomove(target_bytes, (int)write_len, uio);
-	if (err != 0) { rc = err; goto out; }
 
 	mtx_lock(&tmp_->flush_mtx);
-	/* Re-lookup defensively; under the gate dc is still the same entry. */
-	dc = tessera_fs_dirty_content_lookup(tmp_, inode_no);
-	if (dc == NULL) {
+	/* dc cannot have been detached (busy), so it is still this entry. */
+	dc->busy = 0;
+	wakeup(dc);
+	if (err != 0) {
 		mtx_unlock(&tmp_->flush_mtx);
-		rc = 0;
+		rc = err;
 		goto out;
 	}
 	size_t new_size = (size_t)(write_off + write_len) > dc->size
@@ -6871,8 +7000,37 @@ out:
  *
  * Caller does NOT hold flush_mtx. Returns 0 on success.
  */
+static int tessera_fs_dirty_content_write_inner(struct tessera_mount *tmp_,
+    uint32_t inode_no, uint64_t write_off, const uint8_t *new_bytes,
+    size_t write_len, size_t final_size);
+
+/* Gated wrapper. This is the SLOW path (first touch, or the uio fast
+ * path lost its buffer to a concurrent drain). The gate matters for
+ * exactly that second case: the drain that detached the buffer may
+ * still be mid-publish, having already superseded-and-dropped the
+ * inode's previous pending manifest while the inode record still
+ * points at it — an ungated first-touch then reads through the stale
+ * manifest_hash and read_full_content fails (fsx: dowrite EIO at
+ * ~op 7000). Under the gate we serialize AFTER the publish, so the
+ * inode is durable and consistent. Uncontended entry is one mutex
+ * acquisition; the hot per-write path (write_uio direct-into-buffer)
+ * stays gate-free via dc->busy. */
 static int
 tessera_fs_dirty_content_write(struct tessera_mount *tmp_, uint32_t inode_no,
+                               uint64_t write_off, const uint8_t *new_bytes,
+                               size_t write_len, size_t final_size)
+{
+	int gated = tmp_->flush_mtx_init;
+	if (gated) tessera_fs_flush_gate_enter(tmp_);
+	int rc = tessera_fs_dirty_content_write_inner(tmp_, inode_no,
+	    write_off, new_bytes, write_len, final_size);
+	if (gated) tessera_fs_flush_gate_exit(tmp_);
+	return (rc);
+}
+
+static int
+tessera_fs_dirty_content_write_inner(struct tessera_mount *tmp_,
+                               uint32_t inode_no,
                                uint64_t write_off, const uint8_t *new_bytes,
                                size_t write_len, size_t final_size)
 {
@@ -7105,9 +7263,12 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 		tmp_->flush_in_progress = 1;
 		tmp_->flush_gate_owner  = curthread;
 		tmp_->flush_gate_depth  = 1;
+		tmp_->flush_gate_t0     = TPROF_T0();
 		break;
 	}
 	mtx_unlock(&tmp_->flush_mtx);
+
+	sbintime_t _tpfl = TPROF_T0(), _tp;
 
 	/* Publish any coalesced INLINE/chunked writes — INSIDE the gate, so
 	 * the extent allocations + registry/inode-cache updates the publish
@@ -7120,7 +7281,9 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	 * still holds: a waiter blocks on flush_in_progress and, on wakeup,
 	 * re-checks sb_dirty — the active committer drains the whole
 	 * dirty_content set, covering the waiter's buffer too.) */
+	_tp = TPROF_T0();
 	(void)tessera_fs_dirty_content_drain_all_locked(tmp_);
+	TPROF_ADD(TPROF_FL_DC, _tp);
 
 	/* v2.6 B.2: force a synchronous group commit of the
 	 * journal-pending list before checkpoint. Two reasons: (a) any
@@ -7135,7 +7298,9 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	 * the just-written DIR_INSERT/REMOVE records are also gone
 	 * from the journal — they're already reflected in the new
 	 * SB roots. */
+	_tp = TPROF_T0();
 	(void)tessera_fs_journal_log_drain(tmp_);
+	TPROF_ADD(TPROF_FL_JOURNAL, _tp);
 
 	/* v2.6: checkpoint the dirent log BEFORE the manifest /
 	 * inode-tree drains. Each dirty parent gets a single bulk
@@ -7143,7 +7308,9 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	 * dirent ops; the rebuild itself produces NEW manifest publishes
 	 * + inode_tree updates which feed into the existing drains
 	 * naturally. */
+	_tp = TPROF_T0();
 	(void)tessera_fs_dirent_log_checkpoint_all(tmp_);
+	TPROF_ADD(TPROF_FL_DIRENT, _tp);
 
 	/* Drain dirty inodes BEFORE commit_sb so the SB sectors written
 	 * by commit_sb capture the post-drain inode_root. drain itself
@@ -7183,36 +7350,47 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 		(void)tessera_fs_gc_data_zone(tmp_);
 	}
 
+	_tp = TPROF_T0();
 	int r = tessera_fs_pending_manifests_drain(tmp_);
+	TPROF_ADD(TPROF_FL_PENDING, _tp);
 	if (r != 0)
 		printf("tessera_fs: flush — pending_manifests_drain failed: %d "
 		    "(unmounting=%d sb_dirty=%d)\n",
 		    r, tmp_->flush_unmounting, tmp_->sb_dirty);
 	if (r == 0) {
+		_tp = TPROF_T0();
 		r = tessera_fs_dirty_inodes_drain(tmp_);
+		TPROF_ADD(TPROF_FL_INODES, _tp);
 		if (r != 0)
 			printf("tessera_fs: flush — dirty_inodes_drain failed: "
 			    "%d (unmounting=%d sb_dirty=%d)\n",
 			    r, tmp_->flush_unmounting, tmp_->sb_dirty);
 	}
 	if (r == 0) {
+		_tp = TPROF_T0();
 		int rce = tessera_commit_extent(tmp_);
+		TPROF_ADD(TPROF_FL_EXTENT, _tp);
 		if (rce != 0)
 			printf("tessera_fs: flush — commit_extent failed: %d "
 			    "(unmounting=%d sb_dirty=%d)\n",
 			    rce, tmp_->flush_unmounting, tmp_->sb_dirty);
 	}
 	if (r == 0) {
+		_tp = TPROF_T0();
 		r = tessera_commit_sb(tmp_);
+		TPROF_ADD(TPROF_FL_SB, _tp);
 		if (r != 0)
 			printf("tessera_fs: flush — commit_sb failed: %d "
 			    "(unmounting=%d)\n", r, tmp_->flush_unmounting);
 	}
 
+	TPROF_ADD(TPROF_FLUSH, _tpfl);
+
 	mtx_lock(&tmp_->flush_mtx);
 	if (r == 0) tmp_->sb_dirty = 0;
 	/* Balanced with the depth=1 set at acquire; nested gate_enter/exit
 	 * during the drain leave it at 1 here. */
+	TPROF_ADD(TPROF_GATE_HELD, tmp_->flush_gate_t0);
 	tmp_->flush_gate_depth  = 0;
 	tmp_->flush_in_progress = 0;
 	tmp_->flush_gate_owner  = NULL;
@@ -9588,6 +9766,55 @@ tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
 		    NULL, 0xFFu, pa.length_sectors);
 	}
 	return (0);
+}
+
+/* Seed one constant manifest as a durable single-blob pack, if the
+ * registry doesn't already hold it. Consumes the builder. Best-effort:
+ * on failure creators just fall back to the pending-cache path
+ * (correct, slower). */
+static void
+tessera_fs_seed_one_constant(struct tessera_mount *tmp_,
+                             tessera_manifest_builder_t *mb)
+{
+	if (mb == NULL) return;
+	size_t mlen = 0;
+	tessera_hash_t h;
+	(void)tessera_manifest_finalize(mb, NULL, 0, &mlen, h);
+	uint8_t *buf = malloc(mlen, M_TESSERA, M_WAITOK);
+	if (tessera_manifest_finalize(mb, buf, mlen, &mlen, h)
+	    == TESSERA_OK) {
+		uint8_t pack_id[16];
+		memcpy(pack_id, h, 16);
+		uint8_t reg[TESSERA_REGISTRY_ENTRY_SIZE];
+		if (tessera_btree_get(tmp_->pack_registry_tree, pack_id,
+		    reg) != TESSERA_OK)
+			(void)tessera_fs_publish_manifest_to_disk(tmp_,
+			    buf, mlen, h);
+	}
+	tessera_manifest_free(mb);
+	free(buf, M_TESSERA);
+}
+
+/* Pre-publish the constant manifests every creator emits (empty INLINE
+ * for vop_create, empty DIRECTORY for vop_mkdir) so the publish
+ * pre-check short-circuits on the registry and the pending-manifest /
+ * owner-supersession machinery never sees them. See the mount-site
+ * comment for the O(N^2) this removes. */
+static void
+tessera_fs_seed_constant_manifests(struct tessera_mount *tmp_)
+{
+	if (tmp_->pack_registry_tree == NULL || tmp_->extent_alloc == NULL)
+		return;
+	tessera_manifest_builder_t *mb =
+	    tessera_manifest_begin(TESSERA_MFT_INLINE);
+	if (mb != NULL &&
+	    tessera_manifest_set_inline(mb, NULL, 0) != TESSERA_OK) {
+		tessera_manifest_free(mb);
+		mb = NULL;
+	}
+	tessera_fs_seed_one_constant(tmp_, mb);
+	tessera_fs_seed_one_constant(tmp_,
+	    tessera_manifest_begin(TESSERA_MFT_DIRECTORY));
 }
 
 /* Multi-blob aggregation: bundle N small INLINE manifests into
@@ -13024,7 +13251,12 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, dirent_log_enable,
     CTLFLAG_RW, &tessera_dirent_log_enable_default, 0,
     "1 = route dirent ops through the v2.6 log instead of immediate BTREE update");
 
-static int tessera_dirent_log_threshold = 1024;
+/* Raised 1024 -> 8192 (2026-07-04 perf): with the syncer MNT_LAZY
+ * no-op landed, this threshold was the flush-cadence driver during a
+ * 30k-file extract (~29 synchronous flushes on the writer's thread).
+ * 8192 keeps the drain burst bounded (meta-reserve pressure trigger
+ * remains the backstop) while cutting forced flushes ~8x. */
+static int tessera_dirent_log_threshold = 8192;
 SYSCTL_INT(_kern_tessera, OID_AUTO, dirent_log_threshold,
     CTLFLAG_RW, &tessera_dirent_log_threshold, 0,
     "Force flush when dirent_log_count exceeds this");
@@ -13038,7 +13270,8 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, dirent_log_threshold,
  * fewer/larger commits is a clear win on a base.txz extract (~254s ->
  * ~195s; 89 commits -> ~33). The meta-reserve safety check below still
  * provides the hard throttle and never fired at this batch size. */
-static int tessera_dirty_flush_async = 2048;
+/* Raised 2048 -> 8192 alongside dirent_log_threshold above. */
+static int tessera_dirty_flush_async = 8192;
 SYSCTL_INT(_kern_tessera, OID_AUTO, dirty_flush_async,
     CTLFLAG_RW, &tessera_dirty_flush_async, 0,
     "dirty_count past this enqueues an async (non-blocking) flush");
@@ -13755,7 +13988,9 @@ tessera_fs_journal_log_task(void *ctx, int pending)
 		return;
 	}
 	tessera_fs_flush_gate_enter(tmp_);
+	sbintime_t _tp0 = TPROF_T0();
 	(void)tessera_fs_journal_log_drain(tmp_);
+	TPROF_ADD(TPROF_JTASK, _tp0);
 	tessera_fs_flush_gate_exit(tmp_);
 }
 
@@ -14062,6 +14297,14 @@ commit:
 static int
 tessera_vop_create(struct vop_create_args *ap)
 {
+	sbintime_t _tp0 = TPROF_T0();
+	int _rc = tessera_vop_create_impl(ap);
+	TPROF_ADD(TPROF_CREATE, _tp0);
+	return (_rc);
+}
+static int
+tessera_vop_create_impl(struct vop_create_args *ap)
+{
 	struct vnode *dvp = ap->a_dvp;
 	struct vnode **vpp = ap->a_vpp;
 	struct componentname *cnp = ap->a_cnp;
@@ -14213,6 +14456,14 @@ out:
  */
 static int
 tessera_vop_write(struct vop_write_args *ap)
+{
+	sbintime_t _tp0 = TPROF_T0();
+	int _rc = tessera_vop_write_impl(ap);
+	TPROF_ADD(TPROF_WRITE, _tp0);
+	return (_rc);
+}
+static int
+tessera_vop_write_impl(struct vop_write_args *ap)
 {
 	struct vnode *vp = ap->a_vp;
 	struct uio   *uio = ap->a_uio;
