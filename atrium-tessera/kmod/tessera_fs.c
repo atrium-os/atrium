@@ -13898,8 +13898,14 @@ tessera_vop_create(struct vop_create_args *ap)
 		tessera_manifest_free(mb);
 
 		tessera_hash_t pub_hash;
-		if (tessera_fs_publish_manifest(tmp_, child_mft, mlen,
-		    pub_hash) != 0) { err = EIO; goto out; }
+		/* Tag the child inode as owner: the empty INLINE manifest is
+		 * a hash shared by every empty file. Publishing it unowned
+		 * left it unprotected from supersede-drop when some *other*
+		 * inode that shared the same pending entry got superseded —
+		 * this file's only reference then dangled (fsck: "in no pack").
+		 * See tessera_fs_pending_manifest_put supersession logic. */
+		if (tessera_fs_publish_manifest_owned(tmp_, child_mft, mlen,
+		    pub_hash, new_ino) != 0) { err = EIO; goto out; }
 
 		/* 3. Compose & insert child inode record. */
 		tessera_inode_record_t cino;
@@ -14303,8 +14309,12 @@ tessera_vop_mkdir(struct vop_mkdir_args *ap)
 	tessera_manifest_free(mb);
 
 	tessera_hash_t pub_hash;
-	if (tessera_fs_publish_manifest(tmp_, child_mft, mlen,
-	    pub_hash) != 0) { err = EIO; goto out; }
+	/* Tag the new child inode as owner of its (often shared: empty-dir /
+	 * duplicate-symlink-target) manifest so supersession of some other
+	 * inode sharing the same pending hash can't drop it out from under
+	 * this reference. Mirrors the vop_create fix. */
+	if (tessera_fs_publish_manifest_owned(tmp_, child_mft, mlen,
+	    pub_hash, new_ino) != 0) { err = EIO; goto out; }
 
 	tessera_inode_record_t cino;
 	memset(&cino, 0, sizeof cino);
@@ -14510,8 +14520,12 @@ tessera_vop_symlink(struct vop_symlink_args *ap)
 	tessera_manifest_free(mb);
 
 	tessera_hash_t pub_hash;
-	if (tessera_fs_publish_manifest(tmp_, child_mft, mlen,
-	    pub_hash) != 0) { err = EIO; goto out; }
+	/* Tag the new child inode as owner of its (often shared: empty-dir /
+	 * duplicate-symlink-target) manifest so supersession of some other
+	 * inode sharing the same pending hash can't drop it out from under
+	 * this reference. Mirrors the vop_create fix. */
+	if (tessera_fs_publish_manifest_owned(tmp_, child_mft, mlen,
+	    pub_hash, new_ino) != 0) { err = EIO; goto out; }
 
 	tessera_inode_record_t cino;
 	memset(&cino, 0, sizeof cino);
