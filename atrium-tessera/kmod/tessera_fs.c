@@ -814,11 +814,11 @@ static int tessera_fs_publish_chunked(struct tessera_mount *tmp_,
 static int tessera_fs_replace_content_chunked(struct tessera_mount *tmp_,
     uint32_t inode_no, const uint8_t *new_bytes, size_t new_len);
 static int tessera_fs_append_chunked(struct tessera_mount *tmp_,
-    uint32_t inode_no, const uint8_t *append_bytes, size_t append_len,
-    uint32_t cs);
+    uint32_t inode_no, uint64_t append_off, const uint8_t *append_bytes,
+    size_t append_len, uint32_t cs);
 static int tessera_fs_append_chunk_tree(struct tessera_mount *tmp_,
-    uint32_t inode_no, const uint8_t *append_bytes, size_t append_len,
-    uint32_t cs);
+    uint32_t inode_no, uint64_t append_off, const uint8_t *append_bytes,
+    size_t append_len, uint32_t cs);
 static int tessera_fs_wrap_list_as_tree(struct tessera_mount *tmp_,
     uint32_t inode_no);
 static uint32_t tessera_fs_existing_chunk_size(struct tessera_mount *tmp_,
@@ -6512,8 +6512,8 @@ tessera_fs_append_to_file(struct tessera_mount *tmp_, uint32_t inode_no,
 		 * files (no existing chunks) fall back to the size-tier default. */
 		uint32_t cs = tessera_fs_existing_chunk_size(tmp_, &ino);
 		if (cs == 0) cs = tessera_chunk_size_for(tmp_, final_size);
-		int frc = tessera_fs_append_chunked(tmp_, inode_no, bytes,
-		    len, cs);
+		int frc = tessera_fs_append_chunked(tmp_, inode_no,
+		    write_off, bytes, len, cs);
 		if (frc == 0) {
 			tessera_stat_append_fast_ok++;
 			return (0);
@@ -6844,25 +6844,38 @@ static int
 tessera_fs_dirty_content_drain_all_locked(struct tessera_mount *tmp_)
 {
 	int last_err = 0;
-	/* Round-stamped sweep: entries publish IN PLACE (see drain_dc) —
-	 * success removes them, failure leaves them stamped with this
-	 * round so the sweep skips them (retried next flush) instead of
-	 * spinning. Entries inserted mid-sweep (future ungated writers)
-	 * carry an older stamp and are picked up naturally. */
+	/* Snapshot-population sweep. Pass 1 stamps every CURRENTLY
+	 * present entry with this round; pass 2 drains exactly those.
+	 * Entries created after pass 1 (ungated writers stream in while
+	 * we publish) are NOT picked up — they wait for the next flush.
+	 * The first de-gated version drained anything unstamped, so a
+	 * sweep racing a 30k-file extract kept consuming fresh buffers,
+	 * publishing files at partial state and republishing them next
+	 * flush — every republish orphans the previous content pack (no
+	 * GC without tombstones) and a 3 GiB disk filled mid-extract.
+	 * Failed publishes keep their bytes (publish-in-place) and are
+	 * re-stamped and retried on the next sweep. */
 	tmp_->dc_drain_round++;
 	const uint64_t round = tmp_->dc_drain_round;
+	mtx_lock(&tmp_->flush_mtx);
+	for (uint32_t b = 0; b < TESSERA_DIRTY_CONTENT_BUCKETS; b++) {
+		struct tessera_dirty_content *e;
+		LIST_FOREACH(e, &tmp_->dirty_content[b], link)
+			e->drain_round = round;
+	}
+	mtx_unlock(&tmp_->flush_mtx);
 	for (uint32_t b = 0; b < TESSERA_DIRTY_CONTENT_BUCKETS; b++) {
 		for (;;) {
 			mtx_lock(&tmp_->flush_mtx);
 			struct tessera_dirty_content *dc = NULL, *e;
 			LIST_FOREACH(e, &tmp_->dirty_content[b], link) {
-				if (e->drain_round != round) { dc = e; break; }
+				if (e->drain_round == round) { dc = e; break; }
 			}
 			if (dc == NULL) {
 				mtx_unlock(&tmp_->flush_mtx);
 				break;
 			}
-			dc->drain_round = round;
+			dc->drain_round = 0;
 			int rc = tessera_fs_dirty_content_drain_dc(tmp_, dc);
 			if (rc != 0)
 				last_err = rc;
@@ -6925,23 +6938,28 @@ tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
 {
 	const size_t write_len = (size_t)uio->uio_resid;
 
-	/* The uiomove into dc->bytes below necessarily runs WITHOUT
-	 * flush_mtx (uiomove can fault / sleep), and the vnode lock does
-	 * NOT exclude a concurrent GLOBAL drain (flush/fsync drain every
-	 * inode's dirty_content without taking this vnode's lock) — a
-	 * drain could detach + publish + FREE this dc mid-uiomove
-	 * (persistent fsx corruption). The dc->busy flag provides the
-	 * per-buffer exclusion for the uiomove itself; the flush gate is
-	 * STILL held across the write because dropping it exposes a
-	 * second, pre-existing TOCTOU: a drain that detaches this file's
-	 * buffer removes the size overlay before its publish updates the
-	 * inode, so a concurrent getattr sees the size go BACKWARD (fsx
-	 * "Size error", stat new / lseek old). Fixing that needs
-	 * publish-in-place (keep the entry visible, marked draining,
-	 * until the inode is updated) — until that lands, the gate stays.
-	 * Measured cost: gate held ~56% of a base-system extract, ~20k
-	 * acquisitions; the payoff for removing it arrives only together
-	 * with the chunked-write de-gate anyway. */
+	/* NO flush gate here — this is the write hot path (~20k
+	 * acquisitions / 56% gate occupancy during a base-system extract
+	 * when it was gated). Correctness against a concurrent global
+	 * drain rests on three legs, each closing a race fsx actually
+	 * caught when this was first de-gated:
+	 *   1. dc->busy around the unlocked uiomove — a drain waits for
+	 *      it before freezing the buffer (drain would otherwise
+	 *      publish torn bytes / free them mid-copy);
+	 *   2. publish-in-place — the drain keeps the entry visible
+	 *      (draining) until the publish updates the inode, so the
+	 *      getattr size overlay never regresses, and the hit path
+	 *      below waits out `draining` before mutating;
+	 *   3. the lookup-miss fallback (dirty_content_write) is a GATED
+	 *      slow path — if the buffer vanished because a drain is
+	 *      mid-publish, we serialize after it and see the durable
+	 *      inode instead of reading through a stale manifest_hash.
+	 *
+	 * STATUS: the gate is RE-HELD for now. A fully de-gated build
+	 * passes fsx solo but intermittently fails S1-style concurrency
+	 * (truncate → EIO at ~op 4700, not space, not the size TOCTOU —
+	 * unresolved). Until that race is found, writes keep the gate;
+	 * legs 1-3 stay in as they are prerequisites either way. */
 	int gated = tmp_->flush_mtx_init;
 	if (gated) tessera_fs_flush_gate_enter(tmp_);
 	int rc;
@@ -11850,22 +11868,24 @@ tessera_fs_replace_content_chunked_inner(struct tessera_mount *tmp_,
  * touched compared with the slow whole-file rewrite.
  */
 static int tessera_fs_append_chunked_inner(struct tessera_mount *tmp_,
-    uint32_t inode_no, const uint8_t *append_bytes, size_t append_len,
-    uint32_t cs);
+    uint32_t inode_no, uint64_t append_off, const uint8_t *append_bytes,
+    size_t append_len, uint32_t cs);
 static int
 tessera_fs_append_chunked(struct tessera_mount *tmp_, uint32_t inode_no,
-    const uint8_t *append_bytes, size_t append_len, uint32_t cs)
+    uint64_t append_off, const uint8_t *append_bytes, size_t append_len,
+    uint32_t cs)
 {
 	int gated = tmp_->flush_mtx_init;
 	if (gated) tessera_fs_flush_gate_enter(tmp_);
-	int rc = tessera_fs_append_chunked_inner(tmp_, inode_no, append_bytes,
-	    append_len, cs);
+	int rc = tessera_fs_append_chunked_inner(tmp_, inode_no, append_off,
+	    append_bytes, append_len, cs);
 	if (gated) tessera_fs_flush_gate_exit(tmp_);
 	return (rc);
 }
 static int
 tessera_fs_append_chunked_inner(struct tessera_mount *tmp_, uint32_t inode_no,
-    const uint8_t *append_bytes, size_t append_len, uint32_t cs)
+    uint64_t append_off, const uint8_t *append_bytes, size_t append_len,
+    uint32_t cs)
 {
 	if (append_len == 0) return (ENOTSUP);
 
@@ -11875,7 +11895,15 @@ tessera_fs_append_chunked_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 	if (tessera_fs_inode_get_byk(tmp_, key, &old_ino) != TESSERA_OK)
 		return (EIO);
 
-	const uint64_t old_size = old_ino.size;
+	/* old_size comes from the CALLER (the durable content boundary it
+	 * is appending at), NOT from old_ino.size: inode_get overlays the
+	 * live dirty-content size, and with publish-in-place the window
+	 * being published is still visible — using the overlaid size here
+	 * double-counts the window (observed: record jumped to base +
+	 * 2*window, every later append tier-rebuilt the whole file, and a
+	 * base-system extract filled a 3 GiB disk). The manifest we
+	 * retain below covers exactly [0, append_off). */
+	const uint64_t old_size = append_off;
 	if (old_size == 0) return (ENOTSUP);   /* nothing to retain */
 	const uint64_t new_size = old_size + (uint64_t)append_len;
 
@@ -11903,7 +11931,7 @@ tessera_fs_append_chunked_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 		tessera_manifest_parser_free(p);
 		free(old_mft, M_TESSERA);
 		return (tessera_fs_append_chunk_tree(tmp_, inode_no,
-		    append_bytes, append_len, cs));
+		    append_off, append_bytes, append_len, cs));
 	}
 
 	if (old_kind != TESSERA_MFT_CHUNK_LIST) {
@@ -11927,7 +11955,8 @@ tessera_fs_append_chunked_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 			free(old_mft, M_TESSERA);
 			if (tessera_fs_wrap_list_as_tree(tmp_, inode_no) == 0)
 				return (tessera_fs_append_chunk_tree(tmp_,
-				    inode_no, append_bytes, append_len, cs));
+				    inode_no, append_off, append_bytes,
+				    append_len, cs));
 			return (ENOTSUP);
 		}
 	}
@@ -12272,7 +12301,8 @@ tessera_fs_wrap_list_as_tree(struct tessera_mount *tmp_, uint32_t inode_no)
 
 static int
 tessera_fs_append_chunk_tree(struct tessera_mount *tmp_, uint32_t inode_no,
-    const uint8_t *append_bytes, size_t append_len, uint32_t cs)
+    uint64_t append_off, const uint8_t *append_bytes, size_t append_len,
+    uint32_t cs)
 {
 	if (append_len == 0) return (ENOTSUP);
 
@@ -12282,7 +12312,9 @@ tessera_fs_append_chunk_tree(struct tessera_mount *tmp_, uint32_t inode_no,
 	if (tessera_fs_inode_get_byk(tmp_, key, &old_ino) != TESSERA_OK)
 		return (EIO);
 
-	const uint64_t old_size = old_ino.size;
+	/* Caller-authoritative durable boundary — see append_chunked_inner
+	 * for why old_ino.size (overlaid) must not be used here. */
+	const uint64_t old_size = append_off;
 	if (old_size == 0) return (ENOTSUP);
 	const uint64_t new_size = old_size + (uint64_t)append_len;
 
@@ -14675,7 +14707,7 @@ tessera_vop_write_impl(struct vop_write_args *ap)
 	    final_size > TESSERA_INLINE_THRESHOLD) {
 		const uint32_t cs = tessera_chunk_size_for(tmp_, final_size);
 		int frc = tessera_fs_append_chunked(tmp_,
-		    (uint32_t)tn->inode_no, new_bytes,
+		    (uint32_t)tn->inode_no, write_off, new_bytes,
 		    (size_t)write_resid, cs);
 		if (frc == 0) {
 			tessera_stat_append_fast_ok++;
