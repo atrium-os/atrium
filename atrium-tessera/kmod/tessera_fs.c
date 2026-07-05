@@ -831,6 +831,20 @@ struct tessera_dirty_inode {
 	uint32_t                inode_no;
 	int                     tombstone;   /* 1 = drain calls btree_delete */
 	tessera_inode_record_t  rec;
+	/* Publish-in-place (same protocol as dirty_content / pending
+	 * manifests): the drain marks the entry `draining` and leaves it
+	 * IN THE CACHE while the btree op runs, so a concurrent
+	 * inode_get keeps hitting the cache. The old snapshot-out drain
+	 * made the entry invisible for the whole btree_put — a stat in
+	 * that window fell through to the on-disk btree and returned a
+	 * many-ops-stale size (fsx S1 "Size error: expected new, stat
+	 * OLD" right after a truncate). A put that lands while the
+	 * entry is draining updates rec in place and sets `redirty`;
+	 * the drain then leaves the entry for the next flush instead of
+	 * retiring the now-superseded publish. */
+	int                     draining;
+	int                     redirty;
+	uint64_t                round;
 };
 
 /* Per-inode dirty content buffer.
@@ -1008,6 +1022,19 @@ struct tessera_pending_manifest {
 	 * + insertion via the "untagged" path (owner_inode_no=0 at put
 	 * time) means "anyone may reference this; never supersede". */
 	LIST_HEAD(, tessera_pending_owner) owners;
+	/* Publish-in-place (same protocol as dirty_content): the drain
+	 * marks an entry `draining` and leaves it IN THE TABLE while its
+	 * pack is written, so a concurrent fetch_blob still hits the
+	 * pending cache the whole time. The old snapshot-out drain made
+	 * every entry invisible for the entire publish phase while the
+	 * registry didn't have it yet either — an ungated reader
+	 * (truncate's read_full_content, lookup's dir-manifest fetch)
+	 * fetching in that window got ENOENT→EIO (fsx S1 intermittent
+	 * "dotruncate: EIO"). Supersession skips draining entries
+	 * (freeing one mid-publish is use-after-free; the pack going
+	 * durable although superseded is just a GC-able orphan). */
+	int             draining;
+	uint64_t        round;     /* drain-sweep stamp, see dc_drain_round */
 };
 
 /* v2.6 dirent log entry. Variable-length: name bytes follow the
@@ -1300,6 +1327,8 @@ struct tessera_mount {
 	int                       flush_mtx_init;
 	sbintime_t                flush_gate_t0;   /* TPROF: acquire time */
 	uint64_t                  dc_drain_round;  /* see dc->drain_round */
+	uint64_t                  pm_drain_round;  /* pending-manifest sweep */
+	uint64_t                  di_drain_round;  /* dirty-inode sweep */
 	int                       flush_in_progress;
 	/* Recursive flush-gate ownership (Phase C). The gate serialises all
 	 * paths that allocate data/meta extents, COW the registry/inode
@@ -4250,8 +4279,14 @@ tessera_vop_setattr_impl(struct vop_setattr_args *ap)
 			uint8_t *old_buf = NULL;
 			size_t   old_len = 0;
 			if (tessera_fs_read_full_content(tmp_, &ino,
-			    &old_buf, &old_len) != 0)
+			    &old_buf, &old_len) != 0) {
+				printf("tessera_fs: truncate read_full_content failed "
+				    "(ino=%u size=%lu new=%lu)\n",
+				    (uint32_t)tn->inode_no,
+				    (unsigned long)ino.size,
+				    (unsigned long)new_size);
 				return (EIO);
+			}
 			uint8_t *new_buf = malloc((size_t)new_size, M_TESSERA,
 			    M_WAITOK | M_ZERO);
 			size_t copy_len = old_len < (size_t)new_size
@@ -4262,7 +4297,12 @@ tessera_vop_setattr_impl(struct vop_setattr_args *ap)
 			int rc = tessera_fs_replace_content(tmp_,
 			    (uint32_t)tn->inode_no, new_buf, (size_t)new_size);
 			free(new_buf, M_TESSERA);
-			if (rc != 0) return (rc);
+			if (rc != 0) {
+				printf("tessera_fs: truncate replace_content failed "
+				    "(rc=%d ino=%u)\n",
+				    rc, (uint32_t)tn->inode_no);
+				return (rc);
+			}
 			/* replace_content updated the inode record; re-fetch
 			 * the live copy so atime/mtime updates below stick. */
 			if (tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no,
@@ -5219,6 +5259,8 @@ tessera_fs_inode_put(struct tessera_mount *tmp_, uint32_t inode_no,
 		if (e->inode_no == inode_no) {
 			memcpy(&e->rec, rec, sizeof e->rec);
 			e->tombstone = 0;
+			if (e->draining)
+				e->redirty = 1;
 			found = 1;
 			break;
 		}
@@ -5236,6 +5278,8 @@ tessera_fs_inode_put(struct tessera_mount *tmp_, uint32_t inode_no,
 			if (existing->inode_no == inode_no) {
 				memcpy(&existing->rec, rec, sizeof existing->rec);
 				existing->tombstone = 0;
+				if (existing->draining)
+					existing->redirty = 1;
 				raced = 1; break;
 			}
 		}
@@ -5298,6 +5342,8 @@ tessera_fs_inode_delete(struct tessera_mount *tmp_, uint32_t inode_no)
 	LIST_FOREACH(e, &tmp_->dirty_inodes[b], link) {
 		if (e->inode_no == inode_no) {
 			e->tombstone = 1;
+			if (e->draining)
+				e->redirty = 1;
 			found = 1; break;
 		}
 	}
@@ -5312,6 +5358,8 @@ tessera_fs_inode_delete(struct tessera_mount *tmp_, uint32_t inode_no)
 		LIST_FOREACH(existing, &tmp_->dirty_inodes[b], link) {
 			if (existing->inode_no == inode_no) {
 				existing->tombstone = 1;
+				if (existing->draining)
+					existing->redirty = 1;
 				raced = 1; break;
 			}
 		}
@@ -5362,51 +5410,66 @@ tessera_fs_dirty_inodes_drain_tombstones(struct tessera_mount *tmp_)
 {
 	if (!tmp_->dirty_init || tmp_->inode_tree == NULL) return (0);
 
-	LIST_HEAD(, tessera_dirty_inode) snap;
-	LIST_INIT(&snap);
+	/* In-place tombstone sweep — same protocol as the regular drain
+	 * (entries stay visible/draining during the btree_delete; a
+	 * concurrent re-create sets redirty and the entry survives for
+	 * the next flush). */
 	mtx_lock(&tmp_->flush_mtx);
-	uint32_t snap_count = 0;
+	tmp_->di_drain_round++;
+	const uint64_t round = tmp_->di_drain_round;
+	uint32_t stamped = 0;
 	for (uint32_t b = 0; b < TESSERA_DIRTY_INODE_BUCKETS; b++) {
-		struct tessera_dirty_inode *e, *next;
-		LIST_FOREACH_SAFE(e, &tmp_->dirty_inodes[b], link, next) {
-			if (!e->tombstone) continue;
-			LIST_REMOVE(e, link);
-			LIST_INSERT_HEAD(&snap, e, link);
-			snap_count++;
-			tmp_->dirty_count--;
+		struct tessera_dirty_inode *x;
+		LIST_FOREACH(x, &tmp_->dirty_inodes[b], link) {
+			if (x->tombstone) {
+				x->round = round;
+				stamped++;
+			}
 		}
 	}
 	mtx_unlock(&tmp_->flush_mtx);
-	if (snap_count == 0) return (0);
+	if (stamped == 0) return (0);
 
 	int err = 0;
 	uint64_t root = tmp_->sb.inode_root;
-	struct tessera_dirty_inode *e;
-	while ((e = LIST_FIRST(&snap)) != NULL) {
-		LIST_REMOVE(e, link);
-		uint8_t key[4];
-		encode_inode_key(e->inode_no, key);
-		int r = tessera_btree_delete(tmp_->inode_tree, key, &root);
-		if (r != TESSERA_OK && r != TESSERA_ENOENT) {
-			err = EIO;
-			/* Restore on failure so the regular drain retries. */
+	for (uint32_t b = 0; b < TESSERA_DIRTY_INODE_BUCKETS; b++) {
+		for (;;) {
 			mtx_lock(&tmp_->flush_mtx);
-			uint32_t b = e->inode_no &
-			    (TESSERA_DIRTY_INODE_BUCKETS - 1u);
-			LIST_INSERT_HEAD(&tmp_->dirty_inodes[b], e, link);
-			tmp_->dirty_count++;
+			struct tessera_dirty_inode *e = NULL, *x;
+			LIST_FOREACH(x, &tmp_->dirty_inodes[b], link) {
+				if (x->round == round && !x->draining &&
+				    x->tombstone) {
+					e = x;
+					break;
+				}
+			}
+			if (e == NULL) {
+				mtx_unlock(&tmp_->flush_mtx);
+				break;
+			}
+			e->round    = 0;
+			e->draining = 1;
+			e->redirty  = 0;
 			mtx_unlock(&tmp_->flush_mtx);
-			break;
+
+			uint8_t key[4];
+			encode_inode_key(e->inode_no, key);
+			int r = tessera_btree_delete(tmp_->inode_tree, key,
+			    &root);
+			int ok = (r == TESSERA_OK || r == TESSERA_ENOENT);
+
+			mtx_lock(&tmp_->flush_mtx);
+			e->draining = 0;
+			if (ok && !e->redirty) {
+				LIST_REMOVE(e, link);
+				if (tmp_->dirty_count > 0)
+					tmp_->dirty_count--;
+				free(e, M_TESSERA);
+			} else if (!ok) {
+				err = EIO;
+			}
+			mtx_unlock(&tmp_->flush_mtx);
 		}
-		free(e, M_TESSERA);
-	}
-	while ((e = LIST_FIRST(&snap)) != NULL) {
-		LIST_REMOVE(e, link);
-		mtx_lock(&tmp_->flush_mtx);
-		uint32_t b = e->inode_no & (TESSERA_DIRTY_INODE_BUCKETS - 1u);
-		LIST_INSERT_HEAD(&tmp_->dirty_inodes[b], e, link);
-		tmp_->dirty_count++;
-		mtx_unlock(&tmp_->flush_mtx);
 	}
 	if (err == 0) tmp_->sb.inode_root = root;
 	return (err);
@@ -5424,85 +5487,90 @@ tessera_fs_dirty_inodes_drain(struct tessera_mount *tmp_)
 	if (!tmp_->dirty_init) return (0);
 	if (tmp_->inode_tree == NULL) return (TESSERA_EIO);
 
-	LIST_HEAD(, tessera_dirty_inode) snap;
-	LIST_INIT(&snap);
-
+	/* Publish IN PLACE (see the struct comment): entries stay in the
+	 * cache, marked draining, while their btree op runs; removal
+	 * happens after, and only if no put superseded the entry mid-
+	 * publish (redirty). Snapshot-population: pass 1 stamps, pass 2
+	 * publishes exactly those; entries added mid-sweep wait for the
+	 * next flush; failures stay cached for retry (the old detach
+	 * drain both hid the entry from inode_get for the whole btree op
+	 * — stat fell through to the many-ops-stale on-disk btree — and
+	 * LEAKED all remaining snapshotted entries on first error). */
 	mtx_lock(&tmp_->flush_mtx);
-	uint32_t snap_count = 0;
+	tmp_->di_drain_round++;
+	const uint64_t round = tmp_->di_drain_round;
+	uint32_t stamped = 0;
 	for (uint32_t b = 0; b < TESSERA_DIRTY_INODE_BUCKETS; b++) {
-		struct tessera_dirty_inode *e;
-		while ((e = LIST_FIRST(&tmp_->dirty_inodes[b])) != NULL) {
-			LIST_REMOVE(e, link);
-			LIST_INSERT_HEAD(&snap, e, link);
-			snap_count++;
+		struct tessera_dirty_inode *x;
+		LIST_FOREACH(x, &tmp_->dirty_inodes[b], link) {
+			x->round = round;
+			stamped++;
 		}
 	}
-	tmp_->dirty_count = 0;
 	mtx_unlock(&tmp_->flush_mtx);
-	if (snap_count == 0) return (0);
-	tessera_stat_dirty_drained += snap_count;
+	if (stamped == 0) return (0);
+	tessera_stat_dirty_drained += stamped;
 
-	/* Process without the lock. Failures partway leave residual
-	 * entries leaked — better than corrupting the cache state.
-	 * Successful path frees every entry. */
 	int err = 0;
 	uint64_t root = tmp_->sb.inode_root;
-	struct tessera_dirty_inode *e;
-	while ((e = LIST_FIRST(&snap)) != NULL) {
-		LIST_REMOVE(e, link);
-		uint8_t key[4];
-		encode_inode_key(e->inode_no, key);
-		int r;
-		if (e->tombstone) {
-			r = tessera_btree_delete(tmp_->inode_tree, key, &root);
-			if (r != TESSERA_OK && r != TESSERA_ENOENT) {
-				printf("tessera_fs: dirty_inodes_drain — "
-				    "btree_delete inode_no=%u failed: r=%d "
-				    "root=%llu (drained %u/%u)\n",
-				    (unsigned)e->inode_no, r,
-				    (unsigned long long)root,
-				    (unsigned)tessera_stat_dirty_drained,
-				    (unsigned)snap_count);
-				err = EIO;
-			}
-		} else {
-			r = tessera_btree_put(tmp_->inode_tree, key,
-			    &e->rec, &root);
-			if (r != TESSERA_OK) {
-				printf("tessera_fs: dirty_inodes_drain — "
-				    "btree_put inode_no=%u failed: r=%d "
-				    "root=%llu (drained %u/%u)\n",
-				    (unsigned)e->inode_no, r,
-				    (unsigned long long)root,
-				    (unsigned)tessera_stat_dirty_drained,
-				    (unsigned)snap_count);
-				err = EIO;
-			}
-		}
-		if (err == 0) {
-			free(e, M_TESSERA);
-		} else {
-			/* Restore the failed entry to the cache so the next
-			 * flush can retry. Bug #3: prior code freed it,
-			 * losing the inode update — subsequent ops saw the
-			 * pre-update inode record from on-disk btree. */
+	for (uint32_t b = 0; b < TESSERA_DIRTY_INODE_BUCKETS; b++) {
+		for (;;) {
 			mtx_lock(&tmp_->flush_mtx);
-			uint32_t b = e->inode_no &
-			    (TESSERA_DIRTY_INODE_BUCKETS - 1u);
-			LIST_INSERT_HEAD(&tmp_->dirty_inodes[b], e, link);
-			tmp_->dirty_count++;
+			struct tessera_dirty_inode *e = NULL, *x;
+			LIST_FOREACH(x, &tmp_->dirty_inodes[b], link) {
+				if (x->round == round && !x->draining) {
+					e = x;
+					break;
+				}
+			}
+			if (e == NULL) {
+				mtx_unlock(&tmp_->flush_mtx);
+				break;
+			}
+			e->round    = 0;
+			e->draining = 1;
+			e->redirty  = 0;
+			/* Copy under the lock: a concurrent put may update
+			 * e->rec while the btree op below sleeps. */
+			int tomb = e->tombstone;
+			tessera_inode_record_t rec = e->rec;
 			mtx_unlock(&tmp_->flush_mtx);
-			break;
+
+			uint8_t key[4];
+			encode_inode_key(e->inode_no, key);
+			int r, ok;
+			if (tomb) {
+				r = tessera_btree_delete(tmp_->inode_tree,
+				    key, &root);
+				ok = (r == TESSERA_OK || r == TESSERA_ENOENT);
+			} else {
+				r = tessera_btree_put(tmp_->inode_tree, key,
+				    &rec, &root);
+				ok = (r == TESSERA_OK);
+			}
+			if (!ok)
+				printf("tessera_fs: dirty_inodes_drain — "
+				    "btree_%s inode_no=%u failed: r=%d "
+				    "root=%llu\n", tomb ? "delete" : "put",
+				    (unsigned)e->inode_no, r,
+				    (unsigned long long)root);
+
+			mtx_lock(&tmp_->flush_mtx);
+			e->draining = 0;
+			if (ok && !e->redirty) {
+				LIST_REMOVE(e, link);
+				if (tmp_->dirty_count > 0)
+					tmp_->dirty_count--;
+				free(e, M_TESSERA);
+			} else if (!ok) {
+				/* Stays cached (data preserved); retried at
+				 * the next flush. */
+				err = EIO;
+			}
+			/* redirty: leave the (newer) entry for the next
+			 * sweep — this publish is already superseded. */
+			mtx_unlock(&tmp_->flush_mtx);
 		}
-	}
-	/* Restore any leftover entries (only on error) to the cache. */
-	while ((e = LIST_FIRST(&snap)) != NULL) {
-		LIST_REMOVE(e, link);
-		mtx_lock(&tmp_->flush_mtx);
-		uint32_t b = e->inode_no & (TESSERA_DIRTY_INODE_BUCKETS - 1u);
-		LIST_INSERT_HEAD(&tmp_->dirty_inodes[b], e, link);
-		tmp_->dirty_count++;
-		mtx_unlock(&tmp_->flush_mtx);
 	}
 	if (err == 0) tmp_->sb.inode_root = root;
 	return (err);
@@ -5561,6 +5629,13 @@ tessera_fs_pending_manifest_put(struct tessera_mount *tmp_,
 			struct tessera_pending_manifest *prev, *tmp_e;
 			LIST_FOREACH_SAFE(prev,
 			    &tmp_->pending_manifests[bb], link, tmp_e) {
+				/* Mid-publish entries are off-limits: their
+				 * bytes are being read by the drain and a
+				 * supersede-free here is use-after-free. The
+				 * pack lands durable although superseded —
+				 * a harmless GC-able orphan. */
+				if (prev->draining)
+					continue;
 				struct tessera_pending_owner *po, *po_n;
 				int removed = 0;
 				LIST_FOREACH_SAFE(po, &prev->owners, link, po_n) {
@@ -5672,41 +5747,34 @@ tessera_fs_pending_manifests_drain(struct tessera_mount *tmp_)
 {
 	if (!tmp_->dirty_init) return (0);
 
-	LIST_HEAD(, tessera_pending_manifest) snap;
-	LIST_INIT(&snap);
-
+	/* Publish IN PLACE (see the struct comment): entries stay in the
+	 * table, marked draining, until their pack is durable; removal
+	 * happens after the publish. Snapshot-population sweep: pass 1
+	 * stamps the current entries, pass 2 publishes exactly those.
+	 * Entries added mid-sweep wait for the next flush; failed
+	 * publishes keep their bytes and are re-stamped next sweep. */
 	mtx_lock(&tmp_->flush_mtx);
-	uint32_t snap_count = 0;
+	tmp_->pm_drain_round++;
+	const uint64_t round = tmp_->pm_drain_round;
+	uint32_t stamped = 0;
 	for (uint32_t b = 0; b < TESSERA_PENDING_MANIFEST_BUCKETS; b++) {
-		struct tessera_pending_manifest *e;
-		while ((e = LIST_FIRST(&tmp_->pending_manifests[b])) != NULL) {
-			LIST_REMOVE(e, link);
-			LIST_INSERT_HEAD(&snap, e, link);
-			snap_count++;
+		struct tessera_pending_manifest *x;
+		LIST_FOREACH(x, &tmp_->pending_manifests[b], link) {
+			x->round = round;
+			stamped++;
 		}
 	}
-	tmp_->pending_manifest_count = 0;
-	tmp_->pending_manifest_bytes = 0;
 	mtx_unlock(&tmp_->flush_mtx);
-	if (snap_count == 0) return (0);
-	tessera_stat_pending_drained += snap_count;
+	if (stamped == 0) return (0);
+	tessera_stat_pending_drained += stamped;
 
 	int err = 0;
 
 	/* Two-tier publishing: small eligible manifests get aggregated
 	 * into multi-blob packs; large manifests fall back to the
 	 * single-blob path so they don't get bloated by neighbours.
-	 *
-	 * The aggregation cuts per-pack header/index overhead from
-	 * ~16 KiB per tiny file to ~1 KiB amortized. Critical for
-	 * tessera-import workloads (3000-file app installs).
-	 *
-	 * Per-blob dedup: before adding to a batch we check the CAS
-	 * cache; warm hashes mean the content is already on disk and
-	 * we can skip publishing entirely (the existing pending entry
-	 * is removed and freed without writing).
-	 */
-	struct tessera_pending_manifest *e;
+	 * Per-blob dedup: a hash whose pack is already in the registry
+	 * is dropped without writing. */
 	struct tessera_aggr_entry *batch =
 	    malloc((size_t)tessera_aggregation_max_blobs *
 	        sizeof *batch, M_TESSERA, M_WAITOK);
@@ -5716,109 +5784,82 @@ tessera_fs_pending_manifests_drain(struct tessera_mount *tmp_)
 	uint32_t bn = 0;
 	size_t bbytes = 0;
 
-	/* Helper: flush the current batch (publish + free its owners).
-	 * Defined inline to share state. */
-#define FLUSH_BATCH() do { \
-	if (bn > 0 && err == 0) { \
-		int _r = tessera_fs_publish_manifests_batch(tmp_, \
-		    batch, bn); \
-		if (_r != 0) err = _r; \
-	} \
-	for (uint32_t _i = 0; _i < bn; _i++) { \
-		struct tessera_pending_manifest *_pm = batch_owners[_i]; \
-		if (err == 0) { \
-			struct tessera_pending_owner *_po; \
-			while ((_po = LIST_FIRST(&_pm->owners)) != NULL) { \
-				LIST_REMOVE(_po, link); \
-				free(_po, M_TESSERA); \
-			} \
-			free(_pm->bytes, M_TESSERA); \
-			free(_pm, M_TESSERA); \
-		} else { \
-			mtx_lock(&tmp_->flush_mtx); \
-			uint32_t _bk = _pm->hash[0]; \
-			LIST_INSERT_HEAD(&tmp_->pending_manifests[_bk], \
-			    _pm, link); \
-			tmp_->pending_manifest_count++; \
-			tmp_->pending_manifest_bytes += _pm->len; \
-			mtx_unlock(&tmp_->flush_mtx); \
-		} \
-	} \
-	bn = 0; \
-	bbytes = 0; \
-} while (0)
+	/* Remove + free a published (or durable-dup) entry. flush_mtx held
+	 * on entry and exit. */
+#define RETIRE_ENTRY(_pm) do { 	LIST_REMOVE((_pm), link); 	if (tmp_->pending_manifest_count > 0) 		tmp_->pending_manifest_count--; 	if (tmp_->pending_manifest_bytes >= (_pm)->len) 		tmp_->pending_manifest_bytes -= (_pm)->len; 	else 		tmp_->pending_manifest_bytes = 0; 	struct tessera_pending_owner *_po; 	while ((_po = LIST_FIRST(&(_pm)->owners)) != NULL) { 		LIST_REMOVE(_po, link); 		free(_po, M_TESSERA); 	} 	free((_pm)->bytes, M_TESSERA); 	free((_pm), M_TESSERA); } while (0)
 
-	while ((e = LIST_FIRST(&snap)) != NULL) {
-		LIST_REMOVE(e, link);
+	/* Publish the accumulated batch, then retire its entries (or, on
+	 * failure, clear draining so they are retried next sweep). */
+#define FLUSH_BATCH() do { 	if (bn > 0) { 		int _r = tessera_fs_publish_manifests_batch(tmp_, 		    batch, bn); 		mtx_lock(&tmp_->flush_mtx); 		for (uint32_t _i = 0; _i < bn; _i++) { 			struct tessera_pending_manifest *_pm = 			    batch_owners[_i]; 			_pm->draining = 0; 			if (_r == 0) 				RETIRE_ENTRY(_pm); 		} 		mtx_unlock(&tmp_->flush_mtx); 		if (_r != 0) err = _r; 	} 	bn = 0; 	bbytes = 0; } while (0)
 
-		/* Per-blob dedup: skip publishing when a DURABLE copy of
-		 * this blob already exists. The loc cache alone is NOT a
-		 * durability oracle (it is a 16K-entry LRU whose entry can
-		 * outlive — or precede — the pack's registry entry); trusting
-		 * it dropped pending manifests whose "canonical" copy was
-		 * never on disk, leaving inodes referencing a blob in no
-		 * pack (fsck dangling). Verify the loc hit's pack_id against
-		 * the pack registry before skipping. */
-		struct tessera_cas_loc_snap snap_dummy;
-		uint8_t dedup_reg[TESSERA_REGISTRY_ENTRY_SIZE];
-		if (tessera_cas_loc_lookup(&tmp_->cas_cache, e->hash,
-		    &snap_dummy) &&
-		    tessera_btree_get(tmp_->pack_registry_tree,
-		        snap_dummy.pack_id, dedup_reg) == TESSERA_OK) {
-			tessera_stat_aggregation_dedups++;
-			struct tessera_pending_owner *po;
-			while ((po = LIST_FIRST(&e->owners)) != NULL) {
-				LIST_REMOVE(po, link);
-				free(po, M_TESSERA);
+	for (uint32_t b = 0; b < TESSERA_PENDING_MANIFEST_BUCKETS; b++) {
+		for (;;) {
+			mtx_lock(&tmp_->flush_mtx);
+			struct tessera_pending_manifest *e = NULL, *x;
+			LIST_FOREACH(x, &tmp_->pending_manifests[b], link) {
+				if (x->round == round && !x->draining) {
+					e = x;
+					break;
+				}
 			}
-			free(e->bytes, M_TESSERA);
-			free(e, M_TESSERA);
-			continue;
-		}
+			if (e == NULL) {
+				mtx_unlock(&tmp_->flush_mtx);
+				break;
+			}
+			e->round    = 0;
+			e->draining = 1;
+			mtx_unlock(&tmp_->flush_mtx);
 
-		/* Eligibility: only batch small manifests. Larger ones
-		 * publish as single-blob packs (their pack overhead is
-		 * already amortized over the body bytes). */
-		if (e->len > (uint32_t)tessera_aggregation_blob_max) {
-			if (err == 0) {
+			/* Per-blob dedup: skip publishing when a DURABLE copy
+			 * already exists (loc-cache hit VERIFIED against the
+			 * pack registry — the loc cache alone is not a
+			 * durability oracle). */
+			struct tessera_cas_loc_snap snap_dummy;
+			uint8_t dedup_reg[TESSERA_REGISTRY_ENTRY_SIZE];
+			if (tessera_cas_loc_lookup(&tmp_->cas_cache, e->hash,
+			    &snap_dummy) &&
+			    tessera_btree_get(tmp_->pack_registry_tree,
+			        snap_dummy.pack_id, dedup_reg) == TESSERA_OK) {
+				tessera_stat_aggregation_dedups++;
+				mtx_lock(&tmp_->flush_mtx);
+				e->draining = 0;
+				RETIRE_ENTRY(e);
+				mtx_unlock(&tmp_->flush_mtx);
+				continue;
+			}
+
+			/* Eligibility: only batch small manifests. Larger
+			 * ones publish as single-blob packs. */
+			if (e->len > (uint32_t)tessera_aggregation_blob_max) {
 				int r = tessera_fs_publish_manifest_to_disk(
 				    tmp_, e->bytes, e->len, e->hash);
-				if (r != 0) err = r;
-			}
-			if (err == 0) {
-				struct tessera_pending_owner *po;
-				while ((po = LIST_FIRST(&e->owners)) != NULL) {
-					LIST_REMOVE(po, link);
-					free(po, M_TESSERA);
-				}
-				free(e->bytes, M_TESSERA);
-				free(e, M_TESSERA);
-			} else {
 				mtx_lock(&tmp_->flush_mtx);
-				uint32_t b = e->hash[0];
-				LIST_INSERT_HEAD(&tmp_->pending_manifests[b],
-				    e, link);
-				tmp_->pending_manifest_count++;
-				tmp_->pending_manifest_bytes += e->len;
+				e->draining = 0;
+				if (r == 0)
+					RETIRE_ENTRY(e);
+				else
+					err = r;
 				mtx_unlock(&tmp_->flush_mtx);
+				continue;
 			}
-			continue;
-		}
 
-		/* Add to current batch; flush if full. */
-		if (bn == (uint32_t)tessera_aggregation_max_blobs ||
-		    bbytes + e->len > (size_t)tessera_aggregation_max_bytes) {
-			FLUSH_BATCH();
+			/* Add to the current batch (entry stays visible and
+			 * draining until FLUSH_BATCH); flush if full. */
+			if (bn == (uint32_t)tessera_aggregation_max_blobs ||
+			    bbytes + e->len >
+			        (size_t)tessera_aggregation_max_bytes)
+				FLUSH_BATCH();
+			batch[bn].bytes = e->bytes;
+			batch[bn].len   = e->len;
+			memcpy(batch[bn].hash, e->hash, sizeof e->hash);
+			batch_owners[bn] = e;
+			bn++;
+			bbytes += e->len;
 		}
-		batch[bn].bytes = e->bytes;
-		batch[bn].len   = e->len;
-		memcpy(batch[bn].hash, e->hash, sizeof e->hash);
-		batch_owners[bn] = e;
-		bn++;
-		bbytes += e->len;
 	}
 	FLUSH_BATCH();
 #undef FLUSH_BATCH
+#undef RETIRE_ENTRY
 
 	free(batch, M_TESSERA);
 	free(batch_owners, M_TESSERA);
@@ -5949,6 +5990,7 @@ tessera_sysctl_sha_bench(SYSCTL_HANDLER_ARGS)
 	    (unsigned long)ms, (unsigned long)mbps);
 	return (0);
 }
+
 SYSCTL_PROC(_kern_tessera, OID_AUTO, sha_bench,
     CTLTYPE_INT | CTLFLAG_RW, NULL, 0, tessera_sysctl_sha_bench, "I",
     "Microbench tessera_sha256: write per-call chunk size in KiB; "
@@ -6955,13 +6997,8 @@ tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
 	 *      mid-publish, we serialize after it and see the durable
 	 *      inode instead of reading through a stale manifest_hash.
 	 *
-	 * STATUS: the gate is RE-HELD for now. A fully de-gated build
-	 * passes fsx solo but intermittently fails S1-style concurrency
-	 * (truncate → EIO at ~op 4700, not space, not the size TOCTOU —
-	 * unresolved). Until that race is found, writes keep the gate;
-	 * legs 1-3 stay in as they are prerequisites either way. */
-	int gated = tmp_->flush_mtx_init;
-	if (gated) tessera_fs_flush_gate_enter(tmp_);
+	 * DE-GATE UNDER TEST (attempt #3, diagnosing the S1 truncate
+	 * EIO). */
 	int rc;
 
 	mtx_lock(&tmp_->flush_mtx);
@@ -7061,7 +7098,6 @@ tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
 	mtx_unlock(&tmp_->flush_mtx);
 	rc = 0;
 out:
-	if (gated) tessera_fs_flush_gate_exit(tmp_);
 	return (rc);
 }
 
@@ -7178,8 +7214,12 @@ tessera_fs_dirty_content_write_inner(struct tessera_mount *tmp_,
 	size_t   old_len = 0;
 	if (ino.size > 0) {
 		if (tessera_fs_read_full_content(tmp_, &ino, &old_buf,
-		    &old_len) != 0)
+		    &old_len) != 0) {
+			printf("tessera_fs: first-touch read_full_content failed "
+			    "(ino=%u size=%lu)\n",
+			    inode_no, (unsigned long)ino.size);
 			return (EIO);
+		}
 	}
 	/* final_size was computed in vop_write from an UNGATED inode_get and
 	 * can be stale-small: if a concurrent syncer flush republished this
@@ -12919,18 +12959,27 @@ tessera_fs_replace_content_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 	tessera_manifest_free(mb);
 
 	tessera_hash_t pub_hash;
-	if (tessera_fs_publish_manifest_owned(tmp_, mft, mlen, pub_hash,
-	    inode_no) != 0) {
+	int prc = tessera_fs_publish_manifest_owned(tmp_, mft, mlen, pub_hash,
+	    inode_no);
+	if (prc != 0) {
+		/* Propagate the real errno — laundering ENOSPC to EIO here
+		 * hid genuine disk-full conditions from callers (same class
+		 * as the e787f53 chunked-path fix). */
+		printf("tessera_fs: replace_content publish failed "
+		    "(rc=%d ino=%u)\n", prc, inode_no);
 		free(mft, M_TESSERA);
-		return (EIO);
+		return (prc);
 	}
 	free(mft, M_TESSERA);
 
 	uint8_t key[4];
 	tessera_inode_record_t ino;
 	encode_inode_key(inode_no, key);
-	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
+	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK) {
+		printf("tessera_fs: replace_content inode_get failed (ino=%u)\n",
+		    inode_no);
 		return (EIO);
+	}
 	memcpy(ino.manifest_hash, pub_hash, sizeof pub_hash);
 	ino.size = new_len;
 	ino.gen++;
