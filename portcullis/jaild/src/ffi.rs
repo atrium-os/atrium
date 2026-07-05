@@ -387,9 +387,10 @@ impl IovBuilder {
     /// `ip4=disable`, or `ip4.addr=<struct in_addr>`.
     fn add_network(&mut self, ip4_addr: Option<&str>, inherit: bool) -> io::Result<()> {
         if inherit {
-            /* `ip4=inherit`: JAIL_SYS_INHERIT = 1 (per <sys/jail.h>). The
-             * jail shares the host's IPv4 addresses. */
-            self.add_i32("ip4", 1);
+            /* `ip4=inherit`: JAIL_SYS_INHERIT = 2 (per <sys/jail.h>: DISABLE=0,
+             * NEW=1, INHERIT=2). The jail shares the host's IPv4 addresses.
+             * (NEW=1 would give an empty address set → binds fail.) */
+            self.add_i32("ip4", 2);
             return Ok(());
         }
         match ip4_addr {
