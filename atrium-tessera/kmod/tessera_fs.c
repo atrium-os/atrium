@@ -177,6 +177,8 @@ enum tessera_prof_phase {
 	TPROF_W_VMCHK, TPROF_W_INOGET, TPROF_W_QUOTA, TPROF_W_UIOCPY,
 	TPROF_W_SETSZ, TPROF_W_MARKD,
 	TPROF_U_PREP, TPROF_U_MOVE, TPROF_U_FALLBK,
+	TPROF_C_PRECHK, TPROF_C_PENDPUT, TPROF_C_INOPUT, TPROF_C_SERIAL,
+	TPROF_C_REAPWAIT,
 	TPROF_NPHASE
 };
 static unsigned long tessera_prof_ns[TPROF_NPHASE];
@@ -216,6 +218,11 @@ TPROF_SYSCTL(w_markd,      TPROF_W_MARKD,      "vop_write: mark_dirty");
 TPROF_SYSCTL(u_prep,       TPROF_U_PREP,       "write_uio: lookup+grow under mtx");
 TPROF_SYSCTL(u_move,       TPROF_U_MOVE,       "write_uio: uiomove copyin");
 TPROF_SYSCTL(u_fallbk,     TPROF_U_FALLBK,     "write_uio: first-touch kbuf fallback");
+TPROF_SYSCTL(c_prechk,     TPROF_C_PRECHK,     "publish commit: registry pre-check");
+TPROF_SYSCTL(c_pendput,    TPROF_C_PENDPUT,    "publish commit: pending_put");
+TPROF_SYSCTL(c_inoput,     TPROF_C_INOPUT,     "publish commit: inode get+put");
+TPROF_SYSCTL(c_serial,     TPROF_C_SERIAL,     "drain sweep: serial (non-INLINE) drain_dc");
+TPROF_SYSCTL(c_reapwait,   TPROF_C_REAPWAIT,   "drain sweep: blocked waiting for workers");
 
 /* v2 slice-4 debug tooling: meta-reserve trace ring. Records every
  * meta_alloc / meta_free / drain-* event with (op, sector, gen, count)
@@ -922,6 +929,29 @@ struct tessera_dirty_content {
 	uint64_t  base_off;
 };
 
+/* Parallel-drain prepare job: the flush thread freezes a dc (busy
+ * waited out, draining set), hands it to a prepare worker which builds
+ * the INLINE manifest bytes (pure CPU: malloc + memcpy + SHA-256 — no
+ * locks, no gate, per the parallel-drain rules), then the flush thread
+ * commits the result under the gate (publish move + inode update) and
+ * retires the dc. Bounded in-flight window caps the extra RAM. */
+struct tessera_chunk_in;
+#define TESSERA_DC_PREP_BATCH 32
+struct tessera_dc_prep {
+	STAILQ_ENTRY(tessera_dc_prep) link;
+	int n;                       /* items used */
+	struct {
+		struct tessera_dirty_content *dc;
+		int       kind;      /* 0 = INLINE, 1 = CHUNKED */
+		uint8_t  *mft;       /* built manifest (owned) */
+		size_t    mlen;
+		tessera_hash_t mhash; /* computed by the worker (INLINE) */
+		struct tessera_chunk_in *dirty;  /* CHUNKED (owned) */
+		uint32_t  n_dirty;
+		int       error;     /* prepare failure -> serial fallback */
+	} it[TESSERA_DC_PREP_BATCH];
+};
+
 /* CAS read cache — see docs/cas_cache_plan.md.
  *
  * tessera_fs_fetch_blob() previously linearly scanned pack_registry
@@ -1100,6 +1130,23 @@ static int tessera_fs_pending_manifest_put(struct tessera_mount *tmp_,
                                            const uint8_t *bytes,
                                            uint32_t len,
                                            uint32_t owner_inode_no);
+static int tessera_fs_publish_manifest_owned_move(struct tessera_mount *tmp_,
+    uint8_t *manifest_bytes, size_t mlen, tessera_hash_t out_hash,
+    uint32_t owner_inode_no, const uint8_t *precomputed_hash);
+static int tessera_fs_replace_content_build(const uint8_t *new_bytes,
+    size_t new_len, uint8_t **out_mft, size_t *out_mlen,
+    tessera_hash_t out_mhash);
+static int tessera_fs_replace_content_apply(struct tessera_mount *tmp_,
+    uint32_t inode_no, uint8_t *mft, size_t mlen, size_t new_len,
+    const uint8_t *precomputed_hash);
+static void tessera_fs_dc_prep_worker(void *ctx, int pending);
+static int tessera_fs_chunked_prepare(struct tessera_mount *tmp_,
+    uint32_t inode_no, const uint8_t *new_bytes, size_t new_len,
+    struct tessera_chunk_in **out_dirty, uint32_t *out_ndirty,
+    uint8_t **out_mft, size_t *out_mlen);
+static int tessera_fs_chunked_apply(struct tessera_mount *tmp_,
+    uint32_t inode_no, struct tessera_chunk_in *dirty, uint32_t n_dirty,
+    uint8_t *mft, size_t mlen, size_t new_len);
 static int tessera_fs_pending_manifest_lookup(struct tessera_mount *tmp_,
                                               const tessera_hash_t hash,
                                               uint8_t **out_bytes,
@@ -1341,6 +1388,15 @@ struct tessera_mount {
 	uint64_t                  dc_drain_round;  /* see dc->drain_round */
 	uint64_t                  pm_drain_round;  /* pending-manifest sweep */
 	uint64_t                  di_drain_round;  /* dirty-inode sweep */
+
+	/* Parallel-drain prepare pool (see struct tessera_dc_prep). */
+	struct taskqueue         *dc_prep_tq;
+	struct task               dc_prep_tasks[4];
+	struct mtx                dc_prep_mtx;
+	int                       dc_prep_mtx_init;
+	STAILQ_HEAD(, tessera_dc_prep) dc_prep_work;
+	STAILQ_HEAD(, tessera_dc_prep) dc_prep_done;
+	int                       dc_prep_inflight;
 	int                       flush_in_progress;
 	/* Recursive flush-gate ownership (Phase C). The gate serialises all
 	 * paths that allocate data/meta extents, COW the registry/inode
@@ -1841,6 +1897,20 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	TASK_INIT(&tmp_->flush_task, 0, tessera_fs_flush_task, tmp_);
 	TASK_INIT(&tmp_->repack_task, 0, tessera_fs_repack_task, tmp_);
 	tmp_->repack_task_init = 1;
+
+	/* Parallel-drain prepare pool (rule 5: created here, freed in
+	 * unmount after the final flush). */
+	mtx_init(&tmp_->dc_prep_mtx, "tessera_dcprep", NULL, MTX_DEF);
+	tmp_->dc_prep_mtx_init = 1;
+	STAILQ_INIT(&tmp_->dc_prep_work);
+	STAILQ_INIT(&tmp_->dc_prep_done);
+	tmp_->dc_prep_tq = taskqueue_create("tessera_dcprep", M_WAITOK,
+	    taskqueue_thread_enqueue, &tmp_->dc_prep_tq);
+	(void)taskqueue_start_threads(&tmp_->dc_prep_tq, 4, PRIBIO,
+	    "tessdcp");
+	for (int _i = 0; _i < 4; _i++)
+		TASK_INIT(&tmp_->dc_prep_tasks[_i], 0,
+		    tessera_fs_dc_prep_worker, tmp_);
 	tmp_->multi_extent_pack_count = 0;
 	mtx_init(&tmp_->flush_mtx, "tess_flush", NULL, MTX_DEF);
 	tmp_->flush_mtx_init = 1;
@@ -2494,6 +2564,16 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 		if (tmp_->repack_task_init) {
 			taskqueue_drain(taskqueue_thread, &tmp_->repack_task);
 			tmp_->repack_task_init = 0;
+		}
+		/* Prepare pool: the final flush above was its last user;
+		 * taskqueue_free drains the workers before freeing. */
+		if (tmp_->dc_prep_tq != NULL) {
+			taskqueue_free(tmp_->dc_prep_tq);
+			tmp_->dc_prep_tq = NULL;
+		}
+		if (tmp_->dc_prep_mtx_init) {
+			mtx_destroy(&tmp_->dc_prep_mtx);
+			tmp_->dc_prep_mtx_init = 0;
 		}
 		/* Drain any leftover dirty inodes (best-effort) — the
 		 * final flush above should have cleared them, but if
@@ -5607,17 +5687,30 @@ tessera_fs_dirty_inodes_drain(struct tessera_mount *tmp_)
  *
  * Lock: flush_mtx (same one that protects dirty_inodes).
  */
+/* own_bytes != NULL → ownership of that buffer moves into the cache
+ * (no copy); the drain paths use this to kill a full manifest memcpy
+ * per published file (~600 MB of memcpy per base-system extract).
+ * own_bytes == NULL → classic copy semantics from `bytes`. */
 static int
-tessera_fs_pending_manifest_put(struct tessera_mount *tmp_,
+tessera_fs_pending_manifest_put_impl(struct tessera_mount *tmp_,
                                 const tessera_hash_t hash,
                                 const uint8_t *bytes, uint32_t len,
-                                uint32_t owner_inode_no)
+                                uint32_t owner_inode_no,
+                                uint8_t *own_bytes)
 {
-	if (!tmp_->dirty_init) return (TESSERA_EIO);
+	if (!tmp_->dirty_init) {
+		if (own_bytes != NULL) free(own_bytes, M_TESSERA);
+		return (TESSERA_EIO);
+	}
 
 	/* malloc outside the mtx (M_WAITOK can sleep). */
-	uint8_t *buf = malloc(len, M_TESSERA, M_WAITOK);
-	memcpy(buf, bytes, len);
+	uint8_t *buf;
+	if (own_bytes != NULL) {
+		buf = own_bytes;
+	} else {
+		buf = malloc(len, M_TESSERA, M_WAITOK);
+		memcpy(buf, bytes, len);
+	}
 	struct tessera_pending_manifest *e =
 	    malloc(sizeof *e, M_TESSERA, M_WAITOK | M_ZERO);
 	memcpy(e->hash, hash, sizeof e->hash);
@@ -5725,6 +5818,16 @@ tessera_fs_pending_manifest_put(struct tessera_mount *tmp_,
 	tmp_->pending_manifest_bytes += len;
 	mtx_unlock(&tmp_->flush_mtx);
 	return (TESSERA_OK);
+}
+
+static int
+tessera_fs_pending_manifest_put(struct tessera_mount *tmp_,
+                                const tessera_hash_t hash,
+                                const uint8_t *bytes, uint32_t len,
+                                uint32_t owner_inode_no)
+{
+	return (tessera_fs_pending_manifest_put_impl(tmp_, hash, bytes, len,
+	    owner_inode_no, NULL));
 }
 
 /* Returns 1 (and copies bytes into a freshly malloc'd buffer) on hit;
@@ -6823,6 +6926,127 @@ tessera_fs_flush_gate_exit(struct tessera_mount *tmp_)
 	mtx_unlock(&tmp_->flush_mtx);
 }
 
+/* ── Parallel drain prepare pool ────────────────────────────────
+ *
+ * Phase-1 scope: INLINE-eligible buffers only (base_off == 0, size ≤
+ * 256 KiB — the 14k-file mass of an extract). Rules (all load-bearing,
+ * see the perf-push notes):
+ *   1. Workers take NO gate and NO fs locks: prepare is a pure
+ *      function (malloc + memcpy + SHA-256) over bytes frozen by the
+ *      flush thread (busy waited out, draining set) BEFORE hand-off.
+ *   2. Hand-off through dc_prep_mtx-protected queues provides the
+ *      memory ordering; no flag-based cleverness.
+ *   3. At most one dc per inode exists, so commits cannot reorder
+ *      against each other for the same file.
+ *   4. Commit runs on the flush thread, under its gate, using the
+ *      same publish/retire protocol as the serial drain.
+ *   5. Pool lifecycle: created at mount, freed in unmount after the
+ *      final flush (taskqueue_free drains the workers).
+ */
+static int tessera_dc_prep_workers = 3;
+SYSCTL_INT(_kern_tessera, OID_AUTO, dc_prep_workers, CTLFLAG_RW,
+    &tessera_dc_prep_workers, 0,
+    "Parallel drain prepare workers (0 = serial drain)");
+
+static void
+tessera_fs_dc_prep_worker(void *ctx, int pending)
+{
+	struct tessera_mount *tmp_ = ctx;
+	(void)pending;
+	mtx_lock(&tmp_->dc_prep_mtx);
+	for (;;) {
+		struct tessera_dc_prep *j =
+		    STAILQ_FIRST(&tmp_->dc_prep_work);
+		if (j == NULL)
+			break;
+		STAILQ_REMOVE_HEAD(&tmp_->dc_prep_work, link);
+		mtx_unlock(&tmp_->dc_prep_mtx);
+		/* PURE prepare — rule 1. dc bytes/size are frozen
+		 * (draining) for the whole job lifetime. Batched so the
+		 * queue/wakeup overhead amortizes over ~32 files (per-file
+		 * jobs were SLOWER than the serial drain). */
+		for (int i = 0; i < j->n; i++) {
+			struct tessera_dirty_content *dc = j->it[i].dc;
+			if (dc->size <= (256u * 1024u)) {
+				j->it[i].kind = 0;
+				j->it[i].error =
+				    tessera_fs_replace_content_build(
+				    dc->bytes, dc->size, &j->it[i].mft,
+				    &j->it[i].mlen, j->it[i].mhash);
+			} else {
+				j->it[i].kind = 1;
+				j->it[i].error = tessera_fs_chunked_prepare(
+				    tmp_, dc->inode_no, dc->bytes, dc->size,
+				    &j->it[i].dirty, &j->it[i].n_dirty,
+				    &j->it[i].mft, &j->it[i].mlen);
+			}
+		}
+		mtx_lock(&tmp_->dc_prep_mtx);
+		STAILQ_INSERT_TAIL(&tmp_->dc_prep_done, j, link);
+		wakeup(&tmp_->dc_prep_done);
+	}
+	mtx_unlock(&tmp_->dc_prep_mtx);
+}
+
+/* Commit one prepared job on the flush thread (gate held): publish the
+ * built manifest (move semantics) + repoint the inode, then retire the
+ * dc exactly as the serial drain would. Prepare failure falls back to
+ * the serial publish from the still-intact dc bytes. */
+static int
+tessera_fs_dc_prep_commit(struct tessera_mount *tmp_,
+                          struct tessera_dc_prep *j)
+{
+	int last = 0;
+	for (int i = 0; i < j->n; i++) {
+		struct tessera_dirty_content *dc = j->it[i].dc;
+		int rc;
+		if (j->it[i].error != 0) {
+			/* Prepare failed (incl. ENOTSUP fanout) — full
+			 * serial publish from the intact dc. */
+			rc = tessera_fs_dirty_content_publish(tmp_, dc);
+		} else if (j->it[i].kind == 0) {
+			rc = tessera_fs_replace_content_apply(tmp_,
+			    dc->inode_no, j->it[i].mft, j->it[i].mlen,
+			    dc->size, j->it[i].mhash);   /* consumes mft */
+			if (rc == 0) {
+				tessera_stat_vop_write_inline++;
+				tessera_stat_dirty_content_flushes++;
+			}
+		} else {
+			rc = tessera_fs_chunked_apply(tmp_, dc->inode_no,
+			    j->it[i].dirty, j->it[i].n_dirty,
+			    j->it[i].mft, j->it[i].mlen, dc->size);
+			if (rc == 0) {
+				tessera_stat_vop_write_chunked++;
+				tessera_stat_dirty_content_flushes++;
+			}
+		}
+		j->it[i].mft = NULL;
+		j->it[i].dirty = NULL;
+		mtx_lock(&tmp_->flush_mtx);
+		dc->draining = 0;
+		if (rc == 0) {
+			LIST_REMOVE(dc, link);
+			if (tmp_->dirty_content_bytes >= dc->size)
+				tmp_->dirty_content_bytes -= dc->size;
+			else
+				tmp_->dirty_content_bytes = 0;
+			wakeup(dc);
+			mtx_unlock(&tmp_->flush_mtx);
+			tessera_fs_dirty_content_free(dc);
+			continue;
+		}
+		printf("tessera_fs: dirty-content publish failed (rc=%d, "
+		    "inode %u, %zu bytes) — kept in RAM for retry\n",
+		    rc, dc->inode_no, dc->size);
+		wakeup(dc);
+		mtx_unlock(&tmp_->flush_mtx);
+		last = rc;
+	}
+	j->n = 0;
+	return (last);
+}
+
 /* Publish one dirty-content buffer IN PLACE. Called with flush_mtx
  * HELD and dc in the table; returns with flush_mtx dropped.
  *
@@ -6930,6 +7154,60 @@ tessera_fs_dirty_content_drain_all_locked(struct tessera_mount *tmp_)
 			e->drain_round = round;
 	}
 	mtx_unlock(&tmp_->flush_mtx);
+	/* Parallel prepare (see the pool comment above): INLINE-eligible
+	 * buffers are frozen and handed to workers that build manifest
+	 * bytes concurrently; this thread commits completions in arrival
+	 * order and drains ineligible buffers serially in the gaps. A
+	 * bounded job window caps the extra manifest RAM. */
+	int workers = tessera_dc_prep_workers;
+	if (workers > 4) workers = 4;
+	/* Energy-posture derating (coordinated, not coupled — the same
+	 * read-only-intent pattern the Tier-2/3 router and display use):
+	 * under a powersave posture the drain must not wake parked cores
+	 * for a deferrable batch job, so the pool derates toward the
+	 * serial floor. kern.sched.power_policy is Laminar's unified
+	 * 0..10 knob (0 = performance, 10 = max powersave); absence of
+	 * the sysctl (non-Laminar kernel) means no derating. Our own
+	 * dc_prep_workers sysctl remains the ceiling. */
+	if (workers > 0) {
+		int posture = 0;
+		size_t plen = sizeof(posture);
+		if (kernel_sysctlbyname(curthread,
+		    "kern.sched.power_policy", &posture, &plen,
+		    NULL, 0, NULL, 0) == 0) {
+			/* 0-5 (performance..balanced): full pool — flush
+			 * bursts are short and race-to-idle wins there.
+			 * 6-7: halve. 8-10 (powersave): serial floor so
+			 * parked cores stay dark. */
+			if (posture >= 8)
+				workers = 0;
+			else if (posture >= 6 && workers > 2)
+				workers = 2;
+		}
+	}
+	int par = (workers > 0 && tmp_->dc_prep_tq != NULL &&
+	    tmp_->dc_prep_mtx_init);
+
+#define TESSERA_DC_PREP_WINDOW 8
+	struct tessera_dc_prep *jobs = NULL;
+	STAILQ_HEAD(, tessera_dc_prep) freeq;
+	STAILQ_INIT(&freeq);
+	int inflight = 0;
+	struct tessera_dc_prep *open_j = NULL;   /* batch being filled */
+	if (par) {
+		jobs = malloc(TESSERA_DC_PREP_WINDOW * sizeof *jobs,
+		    M_TESSERA, M_WAITOK | M_ZERO);
+		for (int i = 0; i < TESSERA_DC_PREP_WINDOW; i++)
+			STAILQ_INSERT_TAIL(&freeq, &jobs[i], link);
+	}
+
+	/* Dispatch the open batch to the workers. */
+#define DC_PREP_DISPATCH() do {                                          	if (open_j != NULL && open_j->n > 0) {                           		mtx_lock(&tmp_->dc_prep_mtx);                            		STAILQ_INSERT_TAIL(&tmp_->dc_prep_work, open_j, link);   		mtx_unlock(&tmp_->dc_prep_mtx);                          		inflight++;                                              		for (int _w = 0; _w < workers; _w++)                     			(void)taskqueue_enqueue(tmp_->dc_prep_tq,        			    &tmp_->dc_prep_tasks[_w]);                   		open_j = NULL;                                           	}                                                                } while (0)
+
+	/* Reap completed jobs; if `block`, wait for at least one. Only
+	 * the flush thread touches freeq/inflight. */
+#define DC_PREP_REAP(block) do {                                        	mtx_lock(&tmp_->dc_prep_mtx);                                    	while ((block) && inflight > 0 &&                                	    STAILQ_EMPTY(&tmp_->dc_prep_done))                           		(void)msleep(&tmp_->dc_prep_done, &tmp_->dc_prep_mtx,    		    PRIBIO, "tessprep", 0);                              	for (;;) {                                                       		struct tessera_dc_prep *_j =                             		    STAILQ_FIRST(&tmp_->dc_prep_done);                   		if (_j == NULL)                                          			break;                                           		STAILQ_REMOVE_HEAD(&tmp_->dc_prep_done, link);           		mtx_unlock(&tmp_->dc_prep_mtx);                          		int _rc = tessera_fs_dc_prep_commit(tmp_, _j);           		if (_rc != 0)                                            			last_err = _rc;                                  		inflight--;                                              		STAILQ_INSERT_TAIL(&freeq, _j, link);                    		mtx_lock(&tmp_->dc_prep_mtx);                            	}                                                                	mtx_unlock(&tmp_->dc_prep_mtx);                                  } while (0)
+
 	for (uint32_t b = 0; b < TESSERA_DIRTY_CONTENT_BUCKETS; b++) {
 		for (;;) {
 			mtx_lock(&tmp_->flush_mtx);
@@ -6942,11 +7220,65 @@ tessera_fs_dirty_content_drain_all_locked(struct tessera_mount *tmp_)
 				break;
 			}
 			dc->drain_round = 0;
-			int rc = tessera_fs_dirty_content_drain_dc(tmp_, dc);
-			if (rc != 0)
-				last_err = rc;
+			if (!par) {
+				int rc = tessera_fs_dirty_content_drain_dc(
+				    tmp_, dc);
+				if (rc != 0)
+					last_err = rc;
+				continue;
+			}
+			/* Eligibility for parallel prepare: classic INLINE
+			 * buffer. Windows / oversize / clean buffers take
+			 * the serial path (drain_dc consumes flush_mtx). */
+			if (dc->base_off != 0 || !dc->dirty) {
+				sbintime_t _ts = TPROF_T0();
+				int rc = tessera_fs_dirty_content_drain_dc(
+				    tmp_, dc);
+				TPROF_ADD(TPROF_C_SERIAL, _ts);
+				if (rc != 0)
+					last_err = rc;
+				continue;
+			}
+			/* Freeze — same protocol as drain_dc. */
+			while (dc->busy)
+				(void)msleep(dc, &tmp_->flush_mtx, PRIBIO,
+				    "tessbusy", 0);
+			dc->draining = 1;
+			mtx_unlock(&tmp_->flush_mtx);
+
+			if (open_j == NULL) {
+				open_j = STAILQ_FIRST(&freeq);
+				if (open_j == NULL) {
+					DC_PREP_REAP(1);
+					open_j = STAILQ_FIRST(&freeq);
+				}
+				STAILQ_REMOVE_HEAD(&freeq, link);
+				open_j->n = 0;
+			}
+			int slot = open_j->n++;
+			open_j->it[slot].dc    = dc;
+			open_j->it[slot].mft   = NULL;
+			open_j->it[slot].mlen  = 0;
+			open_j->it[slot].error = 0;
+			if (open_j->n == TESSERA_DC_PREP_BATCH) {
+				DC_PREP_DISPATCH();
+				/* Opportunistic non-blocking reap keeps
+				 * commits flowing between dispatches. */
+				DC_PREP_REAP(0);
+			}
 		}
 	}
+	if (par) {
+		DC_PREP_DISPATCH();
+		while (inflight > 0)
+			DC_PREP_REAP(1);
+		if (open_j != NULL)
+			STAILQ_INSERT_TAIL(&freeq, open_j, link);
+		free(jobs, M_TESSERA);
+	}
+#undef DC_PREP_DISPATCH
+#undef DC_PREP_REAP
+#undef TESSERA_DC_PREP_WINDOW
 	return (last_err);
 }
 
@@ -8911,6 +9243,57 @@ tessera_fs_publish_manifest_owned_ex(struct tessera_mount *tmp_,
 	}
 	return (tessera_fs_publish_manifest_to_disk(tmp_, manifest_bytes,
 	    mlen, out_hash));
+}
+
+/* Ownership-transfer variant of publish_manifest_owned: CONSUMES
+ * manifest_bytes on every path (moved into the pending cache, freed on
+ * registry-dup short-circuit, freed after a durable write). Lets the
+ * publish pipeline hand the built manifest straight to the cache
+ * instead of copying it — one full manifest memcpy per file saved. */
+static int
+tessera_fs_publish_manifest_owned_move(struct tessera_mount *tmp_,
+    uint8_t *manifest_bytes, size_t mlen, tessera_hash_t out_hash,
+    uint32_t owner_inode_no, const uint8_t *precomputed_hash)
+{
+	if (tmp_->pack_registry_tree == NULL || tmp_->extent_alloc == NULL) {
+		free(manifest_bytes, M_TESSERA);
+		return (EROFS);
+	}
+
+	if (precomputed_hash != NULL)
+		memcpy(out_hash, precomputed_hash, sizeof(tessera_hash_t));
+	else
+		tessera_sha256(manifest_bytes, mlen, out_hash);
+
+	/* publish_dedup pre-check — see publish_manifest_owned_ex. */
+	{
+		sbintime_t _tc = TPROF_T0();
+		uint8_t pack_id_local[16];
+		memcpy(pack_id_local, out_hash, 16);
+		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
+		if (tessera_btree_get(tmp_->pack_registry_tree,
+		    pack_id_local, reg_value) == TESSERA_OK) {
+			TPROF_ADD(TPROF_C_PRECHK, _tc);
+			tessera_stat_publish_dedup_manifest++;
+			free(manifest_bytes, M_TESSERA);
+			return (0);
+		}
+		TPROF_ADD(TPROF_C_PRECHK, _tc);
+	}
+
+	if (tmp_->dirty_init &&
+	    tmp_->pending_manifest_bytes <
+	        TESSERA_PENDING_MANIFEST_BYTES_MAX) {
+		sbintime_t _tc = TPROF_T0();
+		int _rc = tessera_fs_pending_manifest_put_impl(tmp_, out_hash,
+		    NULL, (uint32_t)mlen, owner_inode_no, manifest_bytes);
+		TPROF_ADD(TPROF_C_PENDPUT, _tc);
+		return (_rc);
+	}
+	int rc = tessera_fs_publish_manifest_to_disk(tmp_, manifest_bytes,
+	    mlen, out_hash);
+	free(manifest_bytes, M_TESSERA);
+	return (rc);
 }
 
 /* Original signature — caller has no logical-owner context (e.g.
@@ -11756,37 +12139,38 @@ tessera_fs_replace_content_chunked(struct tessera_mount *tmp_,
 	if (gated) tessera_fs_flush_gate_exit(tmp_);
 	return (rc);
 }
+/* PREPARE half of the chunked rewrite: old-manifest dedup peek, zero-
+ * hole detection, per-chunk SHA-256, CHUNK_LIST manifest build. PURE
+ * apart from leaf-lock reads (inode_get/fetch_blob) — safe on a
+ * prepare worker over frozen dc bytes (the dc is draining, so the
+ * inode's content state cannot change under us). Returns ENOTSUP for
+ * the CHUNK_TREE promotion case (caller takes the serial path).
+ * On success the caller owns *out_dirty and *out_mft; out_dirty's
+ * entries POINT INTO new_bytes and are only valid while it lives. */
 static int
-tessera_fs_replace_content_chunked_inner(struct tessera_mount *tmp_,
-    uint32_t inode_no, const uint8_t *new_bytes, size_t new_len)
+tessera_fs_chunked_prepare(struct tessera_mount *tmp_, uint32_t inode_no,
+    const uint8_t *new_bytes, size_t new_len,
+    struct tessera_chunk_in **out_dirty, uint32_t *out_ndirty,
+    uint8_t **out_mft, size_t *out_mlen)
 {
-	if (new_len == 0) {
-		/* Empty file = empty INLINE manifest, no chunks. */
-		return tessera_fs_replace_content(tmp_, inode_no, new_bytes, 0);
-	}
-
-	/* Step-3c promotion: when the chunk count exceeds the fanout,
-	 * spill into a CHUNK_TREE rather than a flat CHUNK_LIST. */
-	{
-		const uint32_t cs0 = tessera_chunk_size_for(tmp_, new_len);
-		const uint32_t n0  = (uint32_t)((new_len + cs0 - 1) / cs0);
-		if (n0 > TESSERA_CHUNK_TREE_FANOUT)
-			return (tessera_fs_replace_content_chunk_tree(tmp_,
-			    inode_no, new_bytes, new_len, cs0));
-	}
-
-	/* Step-3b: chunk-level dedup vs the old manifest. Read the old
-	 * inode + its CHUNK_LIST manifest (if any). Per slot, hash the
-	 * new bytes; if the slot's old hash already matches, the chunk
-	 * blob is already on disk in some prior pack — skip republishing.
-	 * Storage cost of an unchanged-content rewrite drops from N
-	 * chunks to ~zero (just the manifest pack itself). */
-
 	uint8_t key[4];
 	tessera_inode_record_t old_ino;
 	encode_inode_key(inode_no, key);
 	if (tessera_fs_inode_get_byk(tmp_, key, &old_ino) != TESSERA_OK)
 		return (EIO);
+
+	/* CHUNK_TREE promotion is the serial path's business. */
+	{
+		const uint32_t cs0 = tessera_chunk_size_for(tmp_, new_len);
+		const uint32_t n0  = (uint32_t)((new_len + cs0 - 1) / cs0);
+		if (n0 > TESSERA_CHUNK_TREE_FANOUT)
+			return (ENOTSUP);
+	}
+
+	/* Step-3b: chunk-level dedup vs the old manifest. Per slot, hash
+	 * the new bytes; if the slot's old hash already matches, the
+	 * chunk blob is already on disk in some prior pack — skip
+	 * republishing. */
 
 	const uint32_t cs = tessera_chunk_size_for(tmp_, new_len);
 
@@ -11912,6 +12296,24 @@ tessera_fs_replace_content_chunked_inner(struct tessera_mount *tmp_,
 	}
 	tessera_manifest_free(mb);
 
+
+	*out_dirty  = dirty;
+	*out_ndirty = n_dirty;
+	*out_mft    = mft;
+	*out_mlen   = mlen;
+	return (0);
+}
+
+/* APPLY half: publish the dirty chunks + manifest and repoint the
+ * inode. Runs in publish/commit context (flush gate or vop path).
+ * Consumes/frees dirty and mft. */
+static int
+tessera_fs_chunked_apply(struct tessera_mount *tmp_, uint32_t inode_no,
+    struct tessera_chunk_in *dirty, uint32_t n_dirty,
+    uint8_t *mft, size_t mlen, size_t new_len)
+{
+	uint8_t key[4];
+	encode_inode_key(inode_no, key);
 	tessera_hash_t pub_hash;
 	int prc = tessera_fs_publish_chunked(tmp_, dirty, n_dirty, mft, mlen,
 	    pub_hash);
@@ -11943,6 +12345,33 @@ tessera_fs_replace_content_chunked_inner(struct tessera_mount *tmp_,
 		return (EIO);
 	tmp_->sb.inode_root = new_inode_root;
 	return (0);
+}
+
+static int
+tessera_fs_replace_content_chunked_inner(struct tessera_mount *tmp_,
+    uint32_t inode_no, const uint8_t *new_bytes, size_t new_len)
+{
+	if (new_len == 0) {
+		/* Empty file = empty INLINE manifest, no chunks. */
+		return tessera_fs_replace_content(tmp_, inode_no, new_bytes, 0);
+	}
+
+	struct tessera_chunk_in *dirty = NULL;
+	uint32_t n_dirty = 0;
+	uint8_t *mft = NULL;
+	size_t mlen = 0;
+	int rc = tessera_fs_chunked_prepare(tmp_, inode_no, new_bytes,
+	    new_len, &dirty, &n_dirty, &mft, &mlen);
+	if (rc == ENOTSUP) {
+		/* Fanout exceeded — CHUNK_TREE path. */
+		const uint32_t cs0 = tessera_chunk_size_for(tmp_, new_len);
+		return (tessera_fs_replace_content_chunk_tree(tmp_,
+		    inode_no, new_bytes, new_len, cs0));
+	}
+	if (rc != 0)
+		return (rc);
+	return (tessera_fs_chunked_apply(tmp_, inode_no, dirty, n_dirty,
+	    mft, mlen, new_len));
 }
 
 /*
@@ -12995,9 +13424,13 @@ tessera_fs_replace_content(struct tessera_mount *tmp_, uint32_t inode_no,
 	if (gated) tessera_fs_flush_gate_exit(tmp_);
 	return (rc);
 }
+
+/* Build the INLINE manifest bytes for new content. PURE — no locks, no
+ * shared state; safe on a prepare worker thread. Returns a malloc'd
+ * buffer the caller owns (or frees via the _move publish). */
 static int
-tessera_fs_replace_content_inner(struct tessera_mount *tmp_, uint32_t inode_no,
-                           const uint8_t *new_bytes, size_t new_len)
+tessera_fs_replace_content_build(const uint8_t *new_bytes, size_t new_len,
+    uint8_t **out_mft, size_t *out_mlen, tessera_hash_t out_mhash)
 {
 	tessera_manifest_builder_t *mb =
 	    tessera_manifest_begin(TESSERA_MFT_INLINE);
@@ -13010,27 +13443,45 @@ tessera_fs_replace_content_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 	tessera_hash_t mhash;
 	(void)tessera_manifest_finalize(mb, NULL, 0, &mlen, mhash);
 	uint8_t *mft = malloc(mlen, M_TESSERA, M_WAITOK);
-	if (tessera_manifest_finalize(mb, mft, mlen, &mlen, mhash) != TESSERA_OK) {
+	if (tessera_manifest_finalize(mb, mft, mlen, &mlen, mhash)
+	    != TESSERA_OK) {
 		tessera_manifest_free(mb);
 		free(mft, M_TESSERA);
 		return (EIO);
 	}
 	tessera_manifest_free(mb);
+	*out_mft  = mft;
+	*out_mlen = mlen;
+	/* manifest_finalize's out hash IS sha256(serialized bytes) — the
+	 * publish layer can reuse it instead of hashing again (the
+	 * double hash made the commit thread the parallel-drain
+	 * bottleneck: workers hashed, then the serial commit re-hashed). */
+	memcpy(out_mhash, mhash, sizeof(tessera_hash_t));
+	return (0);
+}
 
+/* Publish prebuilt INLINE manifest bytes and repoint the inode.
+ * CONSUMES mft (ownership moves into the pending cache or is freed).
+ * Must run in publish/commit context (flush gate or vop path). */
+static int
+tessera_fs_replace_content_apply(struct tessera_mount *tmp_,
+    uint32_t inode_no, uint8_t *mft, size_t mlen, size_t new_len,
+    const uint8_t *precomputed_hash)
+{
 	tessera_hash_t pub_hash;
-	int prc = tessera_fs_publish_manifest_owned(tmp_, mft, mlen, pub_hash,
-	    inode_no);
+	int prc = tessera_fs_publish_manifest_owned_move(tmp_, mft, mlen,
+	    pub_hash, inode_no, precomputed_hash);
+	/* mft consumed either way. */
 	if (prc != 0) {
 		/* Propagate the real errno — laundering ENOSPC to EIO here
 		 * hid genuine disk-full conditions from callers (same class
 		 * as the e787f53 chunked-path fix). */
 		printf("tessera_fs: replace_content publish failed "
 		    "(rc=%d ino=%u)\n", prc, inode_no);
-		free(mft, M_TESSERA);
 		return (prc);
 	}
-	free(mft, M_TESSERA);
 
+	sbintime_t _tc = TPROF_T0();
 	uint8_t key[4];
 	tessera_inode_record_t ino;
 	encode_inode_key(inode_no, key);
@@ -13053,7 +13504,22 @@ tessera_fs_replace_content_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 	    &new_inode_root) != TESSERA_OK)
 		return (EIO);
 	tmp_->sb.inode_root = new_inode_root;
+	TPROF_ADD(TPROF_C_INOPUT, _tc);
 	return (0);
+}
+
+static int
+tessera_fs_replace_content_inner(struct tessera_mount *tmp_, uint32_t inode_no,
+                           const uint8_t *new_bytes, size_t new_len)
+{
+	uint8_t *mft = NULL;
+	size_t mlen = 0;
+	tessera_hash_t mhash;
+	int rc = tessera_fs_replace_content_build(new_bytes, new_len,
+	    &mft, &mlen, mhash);
+	if (rc != 0) return (rc);
+	return (tessera_fs_replace_content_apply(tmp_, inode_no, mft, mlen,
+	    new_len, mhash));
 }
 
 /*
