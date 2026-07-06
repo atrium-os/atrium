@@ -7112,28 +7112,32 @@ static int tessera_fs_dirty_content_write_inner(struct tessera_mount *tmp_,
     uint32_t inode_no, uint64_t write_off, const uint8_t *new_bytes,
     size_t write_len, size_t final_size);
 
-/* Gated wrapper. This is the SLOW path (first touch, or the uio fast
- * path lost its buffer to a concurrent drain). The gate matters for
- * exactly that second case: the drain that detached the buffer may
- * still be mid-publish, having already superseded-and-dropped the
- * inode's previous pending manifest while the inode record still
- * points at it — an ungated first-touch then reads through the stale
- * manifest_hash and read_full_content fails (fsx: dowrite EIO at
- * ~op 7000). Under the gate we serialize AFTER the publish, so the
- * inode is durable and consistent. Uncontended entry is one mutex
- * acquisition; the hot per-write path (write_uio direct-into-buffer)
- * stays gate-free via dc->busy. */
+/* Slow-path wrapper (first touch, or the uio fast path lost its
+ * buffer to a concurrent drain). This used to take the flush gate:
+ * before publish-in-place, a drain could detach this inode's buffer
+ * and supersede-drop its previous pending manifest mid-publish, so an
+ * ungated first-touch read through the (still-pointing) manifest_hash
+ * failed (fsx: dowrite EIO). That window no longer exists — every
+ * write-back cache keeps its entries visible while publishing:
+ *   - the pending manifest stays fetchable (draining) until its pack
+ *     is in the registry, and supersession skips draining entries;
+ *   - the dirty-inode entry stays visible during its btree_put, so
+ *     inode_get below never falls through to a stale on-disk record;
+ *   - no dirty-content buffer exists for this inode (that's what
+ *     routed us here), so no drain can be publishing one.
+ * The read_full_content therefore always sees a fetchable manifest,
+ * gate or no gate. All dc mutations in the inner body are single
+ * flush_mtx critical sections (atomic vs drains); the over-cap
+ * drain_all takes the gate internally.
+ * This was the last per-write gate hold — ~15k acquisitions per
+ * 30k-file extract (every file's FIRST write is a lookup miss). */
 static int
 tessera_fs_dirty_content_write(struct tessera_mount *tmp_, uint32_t inode_no,
                                uint64_t write_off, const uint8_t *new_bytes,
                                size_t write_len, size_t final_size)
 {
-	int gated = tmp_->flush_mtx_init;
-	if (gated) tessera_fs_flush_gate_enter(tmp_);
-	int rc = tessera_fs_dirty_content_write_inner(tmp_, inode_no,
-	    write_off, new_bytes, write_len, final_size);
-	if (gated) tessera_fs_flush_gate_exit(tmp_);
-	return (rc);
+	return (tessera_fs_dirty_content_write_inner(tmp_, inode_no,
+	    write_off, new_bytes, write_len, final_size));
 }
 
 static int
@@ -7157,8 +7161,16 @@ tessera_fs_dirty_content_write_inner(struct tessera_mount *tmp_,
 	 * existing on-disk content for the first dirty — do that without
 	 * holding flush_mtx (read_full_content can sleep / fetch_blob). */
 	mtx_lock(&tmp_->flush_mtx);
-	struct tessera_dirty_content *dc =
-	    tessera_fs_dirty_content_lookup(tmp_, inode_no);
+	struct tessera_dirty_content *dc;
+	for (;;) {
+		dc = tessera_fs_dirty_content_lookup(tmp_, inode_no);
+		/* Defensive: never mutate a buffer an in-place publish is
+		 * reading (the callers' own draining-waits should make this
+		 * unreachable, but the invariant belongs here too). */
+		if (dc == NULL || !dc->draining)
+			break;
+		(void)msleep(dc, &tmp_->flush_mtx, PRIBIO, "tessdrn", 0);
+	}
 	if (dc != NULL) {
 		/* Never let a stale-small final_size (from vop_write's ungated
 		 * inode_get, racing a syncer republish) cap below the buffer's
