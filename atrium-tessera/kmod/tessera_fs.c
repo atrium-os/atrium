@@ -174,6 +174,9 @@ enum tessera_prof_phase {
 	TPROF_FL_DIRENT, TPROF_FL_PENDING, TPROF_FL_INODES,
 	TPROF_FL_EXTENT, TPROF_FL_SB, TPROF_FLUSH, TPROF_JTASK,
 	TPROF_GATE_HELD,
+	TPROF_W_VMCHK, TPROF_W_INOGET, TPROF_W_QUOTA, TPROF_W_UIOCPY,
+	TPROF_W_SETSZ, TPROF_W_MARKD,
+	TPROF_U_PREP, TPROF_U_MOVE, TPROF_U_FALLBK,
 	TPROF_NPHASE
 };
 static unsigned long tessera_prof_ns[TPROF_NPHASE];
@@ -204,6 +207,15 @@ TPROF_SYSCTL(fl_sb,        TPROF_FL_SB,        "flush: commit_sb");
 TPROF_SYSCTL(flush,        TPROF_FLUSH,        "flush: total");
 TPROF_SYSCTL(jtask,        TPROF_JTASK,        "periodic journal-log task (gated)");
 TPROF_SYSCTL(gate_held,    TPROF_GATE_HELD,    "total time the flush gate was held");
+TPROF_SYSCTL(w_vmchk,      TPROF_W_VMCHK,      "vop_write: tessera_vm_mapped check");
+TPROF_SYSCTL(w_inoget,     TPROF_W_INOGET,     "vop_write: inode_get_byk");
+TPROF_SYSCTL(w_quota,      TPROF_W_QUOTA,      "vop_write: quota reserve");
+TPROF_SYSCTL(w_uiocpy,     TPROF_W_UIOCPY,     "vop_write: dirty_content_write_uio");
+TPROF_SYSCTL(w_setsz,      TPROF_W_SETSZ,      "vop_write: vnode_pager_setsize");
+TPROF_SYSCTL(w_markd,      TPROF_W_MARKD,      "vop_write: mark_dirty");
+TPROF_SYSCTL(u_prep,       TPROF_U_PREP,       "write_uio: lookup+grow under mtx");
+TPROF_SYSCTL(u_move,       TPROF_U_MOVE,       "write_uio: uiomove copyin");
+TPROF_SYSCTL(u_fallbk,     TPROF_U_FALLBK,     "write_uio: first-touch kbuf fallback");
 
 /* v2 slice-4 debug tooling: meta-reserve trace ring. Records every
  * meta_alloc / meta_free / drain-* event with (op, sector, gen, count)
@@ -4988,7 +5000,15 @@ tessera_fs_mark_dirty(struct tessera_mount *tmp_)
 {
 	tessera_stat_mark_dirty++;
 	tmp_->sb_dirty = 1;
-	if (tmp_->flush_co_init && !tmp_->flush_unmounting) {
+	/* Arm the flush timer only if it isn't already ticking.
+	 * callout_reset on EVERY mutation cost ~54µs a call (1.1s of a
+	 * 30k-file extract) and turned the timer into a debounce — under
+	 * a sustained write stream the deadline kept moving away, so the
+	 * timer never fired and only pressure triggers flushed. Arm-once
+	 * gives a throttle: the flush fires interval_sec after the FIRST
+	 * unflushed mutation. */
+	if (tmp_->flush_co_init && !tmp_->flush_unmounting &&
+	    !callout_pending(&tmp_->flush_co)) {
 		int t = tessera_flush_interval_sec;
 		if (t < 1) t = 1;
 		callout_reset(&tmp_->flush_co, hz * t,
@@ -6633,11 +6653,15 @@ tessera_fs_dirty_content_append(struct tessera_mount *tmp_, uint32_t inode_no,
 	if (len == 0) return (0);
 
 	mtx_lock(&tmp_->flush_mtx);
-	int over_cap = (tmp_->dirty_content_bytes + len >
-	    (size_t)tessera_dirty_content_cap);
+	size_t _dcb = tmp_->dirty_content_bytes + len;
 	mtx_unlock(&tmp_->flush_mtx);
-	if (over_cap)
+	if (_dcb > 2u * (size_t)tessera_dirty_content_cap) {
 		(void)tessera_fs_dirty_content_drain_all(tmp_);
+	} else if (_dcb > (size_t)tessera_dirty_content_cap &&
+	    tmp_->flush_co_init && !tmp_->flush_unmounting) {
+		/* Soft cap: async flush, don't block the writer. */
+		(void)taskqueue_enqueue(taskqueue_thread, &tmp_->flush_task);
+	}
 
 	mtx_lock(&tmp_->flush_mtx);
 	struct tessera_dirty_content *dc;
@@ -7001,17 +7025,28 @@ tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
 	 * EIO). */
 	int rc;
 
+	/* Soft/hard watermark. At the soft cap, kick the ASYNC flush and
+	 * keep writing — the old behaviour ran a synchronous gated
+	 * drain_all on the writer's thread the moment the cap tripped,
+	 * which serialized the writer against a full drain for the rest
+	 * of any large extract (~3.5s of a 30k-file untar). Only at the
+	 * hard watermark (2x cap: the flush isn't keeping up) does the
+	 * writer pay the synchronous drain as memory protection. */
 	mtx_lock(&tmp_->flush_mtx);
-	int over_cap = (tmp_->dirty_content_bytes + final_size >
-	    (size_t)tessera_dirty_content_cap);
+	size_t _dcb = tmp_->dirty_content_bytes + final_size;
 	mtx_unlock(&tmp_->flush_mtx);
-	if (over_cap)
+	if (_dcb > 2u * (size_t)tessera_dirty_content_cap) {
 		(void)tessera_fs_dirty_content_drain_all(tmp_);
+	} else if (_dcb > (size_t)tessera_dirty_content_cap &&
+	    tmp_->flush_co_init && !tmp_->flush_unmounting) {
+		(void)taskqueue_enqueue(taskqueue_thread, &tmp_->flush_task);
+	}
 
 	/* Get or create the buffer; grow if needed. Same logic as the
 	 * non-uio variant, but stops short of the memcpy and instead
 	 * hands back a pointer for the caller-side uiomove. */
 	uint8_t *target_bytes = NULL;
+	sbintime_t _tu = TPROF_T0();
 	mtx_lock(&tmp_->flush_mtx);
 	struct tessera_dirty_content *dc;
 	for (;;) {
@@ -7031,12 +7066,14 @@ tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
 		 * relative to subsequent writes.) All its dc mutations
 		 * happen in single flush_mtx critical sections, so it
 		 * needs neither the gate nor the busy flag. */
+		sbintime_t _tu = TPROF_T0();
 		uint8_t *kbuf = malloc(write_len, M_TESSERA, M_WAITOK);
 		int err = uiomove(kbuf, (int)write_len, uio);
 		if (err != 0) { free(kbuf, M_TESSERA); rc = err; goto out; }
 		err = tessera_fs_dirty_content_write(tmp_, inode_no,
 		    write_off, kbuf, write_len, final_size);
 		free(kbuf, M_TESSERA);
+		TPROF_ADD(TPROF_U_FALLBK, _tu);
 		rc = err;
 		goto out;
 	}
@@ -7074,9 +7111,12 @@ tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
 	 * gate for every buffered write. */
 	dc->busy = 1;
 	mtx_unlock(&tmp_->flush_mtx);
+	TPROF_ADD(TPROF_U_PREP, _tu);
 
 	/* Safe: detach waits on dc->busy, so no drain can free dc->bytes. */
+	_tu = TPROF_T0();
 	int err = uiomove(target_bytes, (int)write_len, uio);
+	TPROF_ADD(TPROF_U_MOVE, _tu);
 
 	mtx_lock(&tmp_->flush_mtx);
 	/* dc cannot have been detached (busy), so it is still this entry. */
@@ -7147,14 +7187,21 @@ tessera_fs_dirty_content_write_inner(struct tessera_mount *tmp_,
                                size_t write_len, size_t final_size)
 {
 
-	/* Memory cap: if this write would push us past the cap, drain
-	 * everything first. Coarse but correct; refine later. */
+	/* Soft/hard watermark. At the soft cap, kick the ASYNC flush and
+	 * keep writing — the old behaviour ran a synchronous gated
+	 * drain_all on the writer's thread the moment the cap tripped,
+	 * which serialized the writer against a full drain for the rest
+	 * of any large extract (~3.5s of a 30k-file untar). Only at the
+	 * hard watermark (2x cap: the flush isn't keeping up) does the
+	 * writer pay the synchronous drain as memory protection. */
 	mtx_lock(&tmp_->flush_mtx);
-	int over_cap = (tmp_->dirty_content_bytes + final_size >
-	    (size_t)tessera_dirty_content_cap);
+	size_t _dcb = tmp_->dirty_content_bytes + final_size;
 	mtx_unlock(&tmp_->flush_mtx);
-	if (over_cap) {
+	if (_dcb > 2u * (size_t)tessera_dirty_content_cap) {
 		(void)tessera_fs_dirty_content_drain_all(tmp_);
+	} else if (_dcb > (size_t)tessera_dirty_content_cap &&
+	    tmp_->flush_co_init && !tmp_->flush_unmounting) {
+		(void)taskqueue_enqueue(taskqueue_thread, &tmp_->flush_task);
 	}
 
 	/* Look up or create the buffer. We may need to materialise the
@@ -14629,16 +14676,20 @@ tessera_vop_write_impl(struct vop_write_args *ap)
 	 * coalescing buffer seeded from a manifest that's stale w.r.t. mmap
 	 * pages would clobber them on drain. The written range is invalidated
 	 * after, so the next mmap fault re-reads the updated manifest. */
+	sbintime_t _tw = TPROF_T0();
 	int mmapped = tessera_vm_mapped(vp);
 	if (mmapped)
 		tessera_vm_writeback(vp);
+	TPROF_ADD(TPROF_W_VMCHK, _tw);
 
 	/* Read live inode record. */
 	uint8_t key[4];
 	tessera_inode_record_t ino;
 	encode_inode_key((uint32_t)tn->inode_no, key);
+	_tw = TPROF_T0();
 	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
 		return (EIO);
+	TPROF_ADD(TPROF_W_INOGET, _tw);
 
 	if (ioflag & IO_APPEND)
 		uio->uio_offset = (off_t)ino.size;
@@ -14656,6 +14707,7 @@ tessera_vop_write_impl(struct vop_write_args *ap)
 	 * happens once here, ahead of both the buffered and slow paths.
 	 * Under the vnode lock, so no separate domain lock is needed yet. */
 	if (final_size > ino.size) {
+		_tw = TPROF_T0();
 		tessera_quota_domain_t *qd = tessera_quota_for_inode(tmp_, &ino);
 		if (qd != NULL) {
 			if (tessera_quota_reserve(qd, final_size - ino.size)
@@ -14663,6 +14715,7 @@ tessera_vop_write_impl(struct vop_write_args *ap)
 				return (EDQUOT);
 			tmp_->quota_dirty = 1;
 		}
+		TPROF_ADD(TPROF_W_QUOTA, _tw);
 	}
 
 	/* Coalesce small/medium writes into a per-inode RAM buffer so
@@ -14675,9 +14728,11 @@ tessera_vop_write_impl(struct vop_write_args *ap)
 	 * buffer — no kbuf malloc, no extra memcpy. The vnode lock held
 	 * by VFS guarantees no concurrent drain. */
 	if (!mmapped && final_size <= (uint64_t)tessera_dirty_content_file_max) {
+		_tw = TPROF_T0();
 		int wr = tessera_fs_dirty_content_write_uio(tmp_,
 		    (uint32_t)tn->inode_no, write_off, uio,
 		    (size_t)final_size);
+		TPROF_ADD(TPROF_W_UIOCPY, _tw);
 		if (wr != 0) return (wr);
 		/* Size update is implicit: inode_get overlays the live
 		 * size from dirty_content, so no inode_put needed for
@@ -14690,12 +14745,16 @@ tessera_vop_write_impl(struct vop_write_args *ap)
 			(void)tessera_fs_inode_put(tmp_,
 			    (uint32_t)tn->inode_no, &ino);
 		}
+		_tw = TPROF_T0();
 		vnode_pager_setsize(vp, final_size);
+		TPROF_ADD(TPROF_W_SETSZ, _tw);
 		/* Note: vop_write_inline / vop_write_chunked counters are
 		 * incremented at publish time (in dirty_content_publish or
 		 * the slow path below), not here — buffered writes don't
 		 * yet know which manifest kind they'll publish as. */
+		_tw = TPROF_T0();
 		tessera_fs_mark_dirty(tmp_);
+		TPROF_ADD(TPROF_W_MARKD, _tw);
 		return (0);
 	}
 
