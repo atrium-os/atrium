@@ -15,7 +15,8 @@ LIB=        tessera_core
 SHLIB_MAJOR= 1
 
 SRCS=       error.c hash.c crc.c codec.c cdc.c btree.c \
-            manifest.c pack.c journal.c extent.c gc.c volume.c quota.c quota_store.c
+            manifest.c pack.c journal.c extent.c gc.c volume.c quota.c quota_store.c \
+            b3_blake3.c b3_blake3_portable.c b3_shim.c
 INCS=       include/tessera/tessera.h \
             include/tessera/error.h \
             include/tessera/format.h \

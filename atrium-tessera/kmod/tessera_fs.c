@@ -6154,6 +6154,111 @@ SYSCTL_PROC(_kern_tessera, OID_AUTO, sha_bench,
     "Microbench tessera_sha256: write per-call chunk size in KiB; "
     "prints MB/s to console");
 
+/*
+ * BLAKE3 known-answer self-test, run once at module load. Inputs are
+ * the official test-vector pattern (byte i = i % 251); digests are the
+ * first 32 bytes of the published extended outputs. If any vector
+ * mismatches, blake3 stays disabled (blake3_ok=0) — the bench refuses
+ * and any future hash_alg=BLAKE3 mount must refuse too.
+ */
+static int tessera_blake3_ok = 0;
+SYSCTL_INT(_kern_tessera, OID_AUTO, blake3_ok, CTLFLAG_RD,
+    &tessera_blake3_ok, 0,
+    "BLAKE3 load-time known-answer self-test passed");
+
+static const struct {
+	uint32_t len;
+	uint8_t digest[32];
+} tessera_blake3_kat[] = {
+	{ 0, { 0xaf, 0x13, 0x49, 0xb9, 0xf5, 0xf9, 0xa1, 0xa6, 0xa0, 0x40, 0x4d, 0xea, 0x36, 0xdc, 0xc9, 0x49, 0x9b, 0xcb, 0x25, 0xc9, 0xad, 0xc1, 0x12, 0xb7, 0xcc, 0x9a, 0x93, 0xca, 0xe4, 0x1f, 0x32, 0x62 } },
+	{ 1, { 0x2d, 0x3a, 0xde, 0xdf, 0xf1, 0x1b, 0x61, 0xf1, 0x4c, 0x88, 0x6e, 0x35, 0xaf, 0xa0, 0x36, 0x73, 0x6d, 0xcd, 0x87, 0xa7, 0x4d, 0x27, 0xb5, 0xc1, 0x51, 0x02, 0x25, 0xd0, 0xf5, 0x92, 0xe2, 0x13 } },
+	{ 1024, { 0x42, 0x21, 0x47, 0x39, 0xf0, 0x95, 0xa4, 0x06, 0xf3, 0xfc, 0x83, 0xde, 0xb8, 0x89, 0x74, 0x4a, 0xc0, 0x0d, 0xf8, 0x31, 0xc1, 0x0d, 0xaa, 0x55, 0x18, 0x9b, 0x5d, 0x12, 0x1c, 0x85, 0x5a, 0xf7 } },
+	{ 102400, { 0xbc, 0x3e, 0x3d, 0x41, 0xa1, 0x14, 0x6b, 0x06, 0x9a, 0xbf, 0xfa, 0xd3, 0xc0, 0xd4, 0x48, 0x60, 0xcf, 0x66, 0x43, 0x90, 0xaf, 0xce, 0x4d, 0x96, 0x61, 0xf7, 0x90, 0x2e, 0x79, 0x43, 0xe0, 0x85 } },
+};
+
+static void
+tessera_blake3_selftest(void *arg __unused)
+{
+	const uint32_t maxlen = 102400;
+	uint8_t *buf = malloc(maxlen, M_TESSERA, M_WAITOK);
+	tessera_hash_t h;
+	int ok = 1;
+
+	for (uint32_t i = 0; i < maxlen; i++)
+		buf[i] = (uint8_t)(i % 251);
+	for (size_t k = 0; k < nitems(tessera_blake3_kat); k++) {
+		tessera_blake3_256(buf, tessera_blake3_kat[k].len, h);
+		if (memcmp(h, tessera_blake3_kat[k].digest, 32) != 0) {
+			printf("tessera: BLAKE3 KAT FAILED at len=%u — "
+			    "blake3 disabled\n", tessera_blake3_kat[k].len);
+			ok = 0;
+			break;
+		}
+	}
+	free(buf, M_TESSERA);
+	tessera_blake3_ok = ok;
+	if (ok)
+		printf("tessera: BLAKE3 self-test passed (%zu vectors)\n",
+		    nitems(tessera_blake3_kat));
+}
+SYSINIT(tessera_blake3_kat, SI_SUB_VFS, SI_ORDER_ANY,
+    tessera_blake3_selftest, NULL);
+
+/* A/B microbench: same protocol as sha_bench (one one-shot hash per
+ * chunk over a fixed ~128 MiB total), run for SHA-256 and BLAKE3
+ * back-to-back on the same buffer. Write the chunk size in KiB. */
+static int
+tessera_sysctl_hash_bench(SYSCTL_HANDLER_ARGS)
+{
+	int chunk_kib = 1024;
+	int err = sysctl_handle_int(oidp, &chunk_kib, 0, req);
+	if (err != 0 || req->newptr == NULL)
+		return (err);
+	if (chunk_kib < 1 || chunk_kib > 131072)
+		return (EINVAL);
+	if (!tessera_blake3_ok) {
+		printf("tessera: hash_bench refused — BLAKE3 KAT not passed\n");
+		return (ENXIO);
+	}
+	const size_t chunk = (size_t)chunk_kib * 1024u;
+	const size_t total = 128u * 1024u * 1024u;
+	size_t iters = total / chunk;
+	if (iters == 0) iters = 1;
+	uint8_t *buf = malloc(chunk, M_TESSERA, M_WAITOK);
+	arc4rand(buf, chunk, 0);
+	tessera_hash_t h;
+	struct timespec t0, t1;
+	uint64_t ms[2], mbps[2];
+	for (int alg = 0; alg < 2; alg++) {
+		nanouptime(&t0);
+		for (size_t i = 0; i < iters; i++) {
+			if (alg == 0)
+				tessera_sha256(buf, chunk, h);
+			else
+				tessera_blake3_256(buf, chunk, h);
+		}
+		nanouptime(&t1);
+		uint64_t ns =
+		    ((uint64_t)t1.tv_sec * 1000000000ULL + t1.tv_nsec) -
+		    ((uint64_t)t0.tv_sec * 1000000000ULL + t0.tv_nsec);
+		uint64_t bytes = (uint64_t)iters * chunk;
+		ms[alg] = ns / 1000000ULL;
+		mbps[alg] = (ms[alg] > 0) ?
+		    ((bytes >> 20) * 1000ULL / ms[alg]) : 0;
+	}
+	free(buf, M_TESSERA);
+	printf("tessera: hash_bench chunk=%d KiB: sha256 %lu MB/s (%lu ms), "
+	    "blake3 %lu MB/s (%lu ms)\n", chunk_kib,
+	    (unsigned long)mbps[0], (unsigned long)ms[0],
+	    (unsigned long)mbps[1], (unsigned long)ms[1]);
+	return (0);
+}
+
+SYSCTL_PROC(_kern_tessera, OID_AUTO, hash_bench,
+    CTLTYPE_INT | CTLFLAG_RW, NULL, 0, tessera_sysctl_hash_bench, "I",
+    "A/B microbench SHA-256 vs BLAKE3: write per-call chunk size in KiB; "
+    "prints MB/s for both to console");
+
 /* Tier A — location entries. Default 16384 entries (~1 MiB). */
 static unsigned long tessera_cas_loc_max = 16384;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_loc_max, CTLFLAG_RW,

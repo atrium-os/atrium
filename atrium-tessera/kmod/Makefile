@@ -19,6 +19,9 @@ SRCS=       tessera_fs.c \
             btree.c \
             manifest.c \
             hash.c \
+            b3_blake3.c \
+            b3_blake3_portable.c \
+            b3_shim.c \
             extent.c \
             pack.c \
             journal.c \

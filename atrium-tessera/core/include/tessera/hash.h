@@ -37,6 +37,13 @@ void tessera_sha256_update(tessera_sha256_ctx_t *, const uint8_t *data, size_t l
 void tessera_sha256_final(tessera_sha256_ctx_t *, tessera_hash_t out);
 void tessera_sha256_free(tessera_sha256_ctx_t *);
 
+/*
+ * One-shot 256-bit BLAKE3 (portable compression only — plain integer
+ * registers, no FPU/SIMD state on any architecture). Candidate
+ * hash_alg=2 backend; implementation is the vendored b3_blake3*.c.
+ */
+void tessera_blake3_256(const uint8_t *data, size_t len, tessera_hash_t out);
+
 /* Compare two hashes for equality. Constant-time. */
 int  tessera_hash_equal(const tessera_hash_t a, const tessera_hash_t b);
 
