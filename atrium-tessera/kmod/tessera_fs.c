@@ -936,6 +936,41 @@ struct tessera_dirty_content {
  * commits the result under the gate (publish move + inode update) and
  * retires the dc. Bounded in-flight window caps the extra RAM. */
 struct tessera_chunk_in;
+
+/* Prepared-append carrier (see tessera_fs_append_apply). dirty[]
+ * entries point into the append bytes and merge_buf — both must
+ * outlive the apply. */
+struct tessera_append_prep {
+	struct tessera_chunk_in *dirty;
+	uint32_t n_dirty;
+	uint8_t *mft;
+	size_t   mlen;
+	uint8_t *merge_buf;
+	uint64_t new_size;
+};
+/* Prepare outcome: the caller (in publish context) performs the
+ * delegation. Prepare itself NEVER publishes — that invariant is what
+ * lets it run ungated on the writer's thread (attempt #1 hid full
+ * publishes inside prepare and panicked racing the flush). */
+#define TAPP_NONE     0
+#define TAPP_TREE     1   /* delegate to append_chunk_tree */
+#define TAPP_PROMOTE  2   /* wrap_list_as_tree, then chunk_tree */
+static int tessera_fs_append_apply(struct tessera_mount *tmp_,
+    uint32_t inode_no, struct tessera_append_prep *pp);
+static int tessera_fs_append_prepare(struct tessera_mount *tmp_,
+    uint32_t inode_no, uint64_t append_off, const uint8_t *append_bytes,
+    size_t append_len, uint32_t cs, struct tessera_append_prep *pp,
+    int *delegate);
+static int tessera_fs_append_chunked_inner(struct tessera_mount *tmp_,
+    uint32_t inode_no, uint64_t append_off, const uint8_t *append_bytes,
+    size_t append_len, uint32_t cs);
+static int tessera_fs_window_publish(struct tessera_mount *tmp_,
+    uint32_t inode_no);
+static struct tessera_dirty_content *tessera_fs_dc_claim_locked(
+    struct tessera_mount *tmp_, uint32_t inode_no);
+static uint32_t tessera_fs_existing_chunk_size(struct tessera_mount *tmp_,
+    const tessera_inode_record_t *ino);
+
 #define TESSERA_DC_PREP_BATCH 32
 struct tessera_dc_prep {
 	STAILQ_ENTRY(tessera_dc_prep) link;
@@ -6741,6 +6776,86 @@ tessera_fs_dirty_content_publish(struct tessera_mount *tmp_,
 	return (rc);
 }
 
+/* Writer-side window publish. The old path ran the WHOLE publish
+ * (chunk SHA + pack build + write + registry) inside the flush gate
+ * via drain_one — ~200ms of gate hold per 16 MiB window, and the
+ * writer additionally queued behind ~0.8s flush holds (gate_wait
+ * ~7.5s of a base-system extract). The writer now CLAIMS the full
+ * window with the publish-in-place protocol (draining: the flush
+ * sweep skips it, readers/getattr still see it), runs the expensive
+ * prepare UNGATED on its own thread, and takes the gate only for the
+ * short commit. Prepare cannot publish (delegations come back as
+ * verdicts), so nothing here races the flush's commits; delegation /
+ * ineligible cases fall back to the fully gated publish. */
+static int
+tessera_fs_window_publish(struct tessera_mount *tmp_, uint32_t inode_no)
+{
+	mtx_lock(&tmp_->flush_mtx);
+	struct tessera_dirty_content *dc =
+	    tessera_fs_dc_claim_locked(tmp_, inode_no);
+	if (dc == NULL)
+		return (0);      /* gone, or a flush owns the publish */
+	if (dc->base_off == 0 || !dc->dirty) {
+		/* Not a window (or clean) — unclaim; the normal drain
+		 * paths handle it. Fields are stable: we own the claim. */
+		mtx_lock(&tmp_->flush_mtx);
+		dc->draining = 0;
+		wakeup(dc);
+		mtx_unlock(&tmp_->flush_mtx);
+		return (0);
+	}
+
+	/* UNGATED prepare: bytes frozen by the claim; the inode's
+	 * content state is stable (previous windows durable, other
+	 * writers excluded by the vnode lock). */
+	struct tessera_append_prep pp;
+	int delegate = TAPP_NONE;
+	int prc = ENOTSUP;
+	{
+		uint8_t key[4];
+		tessera_inode_record_t ino;
+		encode_inode_key(inode_no, key);
+		if (tessera_fs_inode_get_byk(tmp_, key, &ino)
+		    == TESSERA_OK) {
+			uint32_t cs = tessera_fs_existing_chunk_size(tmp_,
+			    &ino);
+			if (cs == 0)
+				cs = tessera_chunk_size_for(tmp_,
+				    dc->base_off + dc->size);
+			prc = tessera_fs_append_prepare(tmp_, inode_no,
+			    dc->base_off, dc->bytes, dc->size, cs, &pp,
+			    &delegate);
+		}
+	}
+
+	int rc;
+	tessera_fs_flush_gate_enter(tmp_);
+	if (prc == 0 && delegate == TAPP_NONE)
+		rc = tessera_fs_append_apply(tmp_, inode_no, &pp);
+	else
+		rc = tessera_fs_dirty_content_publish(tmp_, dc);
+	tessera_fs_flush_gate_exit(tmp_);
+
+	mtx_lock(&tmp_->flush_mtx);
+	dc->draining = 0;
+	if (rc == 0) {
+		LIST_REMOVE(dc, link);
+		if (tmp_->dirty_content_bytes >= dc->size)
+			tmp_->dirty_content_bytes -= dc->size;
+		else
+			tmp_->dirty_content_bytes = 0;
+		wakeup(dc);
+		mtx_unlock(&tmp_->flush_mtx);
+		tessera_fs_dirty_content_free(dc);
+		return (0);
+	}
+	printf("tessera_fs: window publish failed (rc=%d, inode %u, "
+	    "%zu bytes) — kept in RAM for retry\n", rc, inode_no, dc->size);
+	wakeup(dc);
+	mtx_unlock(&tmp_->flush_mtx);
+	return (rc);
+}
+
 /* Append-window write (large sequential appends). Buffers a pure append
  * [write_off, write_off+len) into a per-inode sliding window and flushes
  * it (publish via append) once it reaches tessera_append_window_bytes —
@@ -6791,7 +6906,7 @@ tessera_fs_dirty_content_append(struct tessera_mount *tmp_, uint32_t inode_no,
 			 * size to write_off, so the recursion's create path
 			 * lands a new window at exactly this offset. */
 			mtx_unlock(&tmp_->flush_mtx);
-			(void)tessera_fs_dirty_content_drain_one(tmp_, inode_no);
+			(void)tessera_fs_window_publish(tmp_, inode_no);
 			return (tessera_fs_dirty_content_append(tmp_, inode_no,
 			    write_off, bytes, len));
 		}
@@ -6803,7 +6918,7 @@ tessera_fs_dirty_content_append(struct tessera_mount *tmp_, uint32_t inode_no,
 		mtx_unlock(&tmp_->flush_mtx);
 		tessera_stat_dirty_content_hits++;
 		if (full)
-			(void)tessera_fs_dirty_content_drain_one(tmp_, inode_no);
+			(void)tessera_fs_window_publish(tmp_, inode_no);
 		return (0);
 	}
 	mtx_unlock(&tmp_->flush_mtx);
@@ -6839,7 +6954,7 @@ tessera_fs_dirty_content_append(struct tessera_mount *tmp_, uint32_t inode_no,
 	int full = (ndc->size >= (size_t)tessera_append_window_bytes);
 	mtx_unlock(&tmp_->flush_mtx);
 	if (full)
-		(void)tessera_fs_dirty_content_drain_one(tmp_, inode_no);
+		(void)tessera_fs_window_publish(tmp_, inode_no);
 	return (0);
 }
 
@@ -7047,6 +7162,31 @@ tessera_fs_dc_prep_commit(struct tessera_mount *tmp_,
 	return (last);
 }
 
+/* Canonical publish-in-place CLAIM. flush_mtx held on entry; returns
+ * with it DROPPED. Re-looks the entry up after EVERY sleep — a raw dc
+ * pointer is dead the moment the mutex drops, because a concurrent
+ * claimant can publish and free it. NULL = no entry, or someone else
+ * owns the publish (their completion handles retire/retry). */
+static struct tessera_dirty_content *
+tessera_fs_dc_claim_locked(struct tessera_mount *tmp_, uint32_t inode_no)
+{
+	mtx_assert(&tmp_->flush_mtx, MA_OWNED);
+	for (;;) {
+		struct tessera_dirty_content *dc =
+		    tessera_fs_dirty_content_lookup(tmp_, inode_no);
+		if (dc == NULL || dc->draining) {
+			mtx_unlock(&tmp_->flush_mtx);
+			return (NULL);
+		}
+		if (!dc->busy) {
+			dc->draining = 1;
+			mtx_unlock(&tmp_->flush_mtx);
+			return (dc);
+		}
+		(void)msleep(dc, &tmp_->flush_mtx, PRIBIO, "tessbusy", 0);
+	}
+}
+
 /* Publish one dirty-content buffer IN PLACE. Called with flush_mtx
  * HELD and dc in the table; returns with flush_mtx dropped.
  *
@@ -7065,11 +7205,17 @@ tessera_fs_dirty_content_drain_dc(struct tessera_mount *tmp_,
                                   struct tessera_dirty_content *dc)
 {
 	mtx_assert(&tmp_->flush_mtx, MA_OWNED);
-	/* Freeze the bytes: wait out a writer mid-uiomove. */
-	while (dc->busy)
-		(void)msleep(dc, &tmp_->flush_mtx, PRIBIO, "tessbusy", 0);
-	dc->draining = 1;
-	mtx_unlock(&tmp_->flush_mtx);
+	/* Claim via the canonical re-lookup loop (dc_claim_locked). A raw
+	 * dc pointer must NEVER be dereferenced after an msleep here: the
+	 * sleep drops flush_mtx, a writer's window_publish can claim,
+	 * publish and FREE the dc meanwhile, and the post-sleep
+	 * `dc->draining = 1` write landed in freed memory (UAF panic,
+	 * malloc-128 trash at the draining offset). */
+	struct tessera_dirty_content *claimed =
+	    tessera_fs_dc_claim_locked(tmp_, dc->inode_no);
+	if (claimed == NULL)
+		return (0);      /* vanished or foreign-owned */
+	dc = claimed;
 
 	int rc = tessera_fs_dirty_content_publish(tmp_, dc);
 
@@ -7103,14 +7249,21 @@ tessera_fs_dirty_content_drain_one_locked(struct tessera_mount *tmp_,
                                           uint32_t inode_no)
 {
 	mtx_lock(&tmp_->flush_mtx);
-	struct tessera_dirty_content *dc =
-	    tessera_fs_dirty_content_lookup(tmp_, inode_no);
-	if (dc == NULL) {
-		mtx_unlock(&tmp_->flush_mtx);
-		return (0);
+	struct tessera_dirty_content *dc;
+	for (;;) {
+		dc = tessera_fs_dirty_content_lookup(tmp_, inode_no);
+		if (dc == NULL) {
+			mtx_unlock(&tmp_->flush_mtx);
+			return (0);
+		}
+		/* Gate serialization covers drain-vs-drain, but a WRITER
+		 * claims its full append window (window_publish) without
+		 * the gate — wait that publish out, then re-look (success
+		 * removes the entry). Proceeding would double-publish. */
+		if (!dc->draining)
+			break;
+		(void)msleep(dc, &tmp_->flush_mtx, PRIBIO, "tessdrn", 0);
 	}
-	/* Drains are serialized by the flush gate, so this entry cannot
-	 * already be draining. */
 	return (tessera_fs_dirty_content_drain_dc(tmp_, dc));
 }
 
@@ -7239,12 +7392,14 @@ tessera_fs_dirty_content_drain_all_locked(struct tessera_mount *tmp_)
 					last_err = rc;
 				continue;
 			}
-			/* Freeze — same protocol as drain_dc. */
-			while (dc->busy)
-				(void)msleep(dc, &tmp_->flush_mtx, PRIBIO,
-				    "tessbusy", 0);
-			dc->draining = 1;
-			mtx_unlock(&tmp_->flush_mtx);
+			/* Freeze via the canonical claim (re-lookup safe). */
+			uint32_t claim_ino = dc->inode_no;
+			dc = tessera_fs_dc_claim_locked(tmp_, claim_ino);
+			if (dc == NULL) {
+				/* Writer stole it mid-sleep — its completion
+				 * covers this entry. */
+				continue;
+			}
 
 			if (open_j == NULL) {
 				open_j = STAILQ_FIRST(&freeq);
@@ -12395,9 +12550,6 @@ tessera_fs_replace_content_chunked_inner(struct tessera_mount *tmp_,
  * 1 KiB log line appended to a 1 GiB file: ~0.005% of the bytes
  * touched compared with the slow whole-file rewrite.
  */
-static int tessera_fs_append_chunked_inner(struct tessera_mount *tmp_,
-    uint32_t inode_no, uint64_t append_off, const uint8_t *append_bytes,
-    size_t append_len, uint32_t cs);
 static int
 tessera_fs_append_chunked(struct tessera_mount *tmp_, uint32_t inode_no,
     uint64_t append_off, const uint8_t *append_bytes, size_t append_len,
@@ -12411,10 +12563,11 @@ tessera_fs_append_chunked(struct tessera_mount *tmp_, uint32_t inode_no,
 	return (rc);
 }
 static int
-tessera_fs_append_chunked_inner(struct tessera_mount *tmp_, uint32_t inode_no,
+tessera_fs_append_prepare(struct tessera_mount *tmp_, uint32_t inode_no,
     uint64_t append_off, const uint8_t *append_bytes, size_t append_len,
-    uint32_t cs)
+    uint32_t cs, struct tessera_append_prep *pp, int *delegate)
 {
+	*delegate = TAPP_NONE;
 	if (append_len == 0) return (ENOTSUP);
 
 	uint8_t key[4];
@@ -12458,8 +12611,8 @@ tessera_fs_append_chunked_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 	if (old_kind == TESSERA_MFT_CHUNK_TREE) {
 		tessera_manifest_parser_free(p);
 		free(old_mft, M_TESSERA);
-		return (tessera_fs_append_chunk_tree(tmp_, inode_no,
-		    append_off, append_bytes, append_len, cs));
+		*delegate = TAPP_TREE;
+		return (0);
 	}
 
 	if (old_kind != TESSERA_MFT_CHUNK_LIST) {
@@ -12481,11 +12634,8 @@ tessera_fs_append_chunked_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 		if (projected_chunks > (uint64_t)TESSERA_CHUNK_TREE_FANOUT) {
 			tessera_manifest_parser_free(p);
 			free(old_mft, M_TESSERA);
-			if (tessera_fs_wrap_list_as_tree(tmp_, inode_no) == 0)
-				return (tessera_fs_append_chunk_tree(tmp_,
-				    inode_no, append_off, append_bytes,
-				    append_len, cs));
-			return (ENOTSUP);
+			*delegate = TAPP_PROMOTE;
+			return (0);
 		}
 	}
 
@@ -12654,20 +12804,80 @@ tessera_fs_append_chunked_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 	}
 	tessera_manifest_free(mb);
 
-	tessera_hash_t pub_hash;
-	int rc = tessera_fs_publish_chunked(tmp_, dirty, n_dirty, mft, mlen,
-	    pub_hash);
-	free(mft, M_TESSERA);
+	free(old, M_TESSERA);
+	pp->dirty     = dirty;
+	pp->n_dirty   = n_dirty;
+	pp->mft       = mft;
+	pp->mlen      = mlen;
+	pp->merge_buf = merge_buf;
+	pp->new_size  = new_size;
+	return (0);
+
+enomem:
+	tessera_manifest_free(mb);
 	if (merge_buf) free(merge_buf, M_TESSERA);
 	free(dirty, M_TESSERA);
 	free(old, M_TESSERA);
+	return (ENOMEM);
+}
+
+/* Serial chunked append = prepare + delegate/apply, all in publish
+ * context (the gated wrapper above). Behavior-identical to the
+ * pre-split monolith. */
+static int
+tessera_fs_append_chunked_inner(struct tessera_mount *tmp_, uint32_t inode_no,
+    uint64_t append_off, const uint8_t *append_bytes, size_t append_len,
+    uint32_t cs)
+{
+	struct tessera_append_prep pp;
+	int delegate = TAPP_NONE;
+	int rc = tessera_fs_append_prepare(tmp_, inode_no, append_off,
+	    append_bytes, append_len, cs, &pp, &delegate);
+	if (rc != 0)
+		return (rc);
+	switch (delegate) {
+	case TAPP_TREE:
+		return (tessera_fs_append_chunk_tree(tmp_, inode_no,
+		    append_off, append_bytes, append_len, cs));
+	case TAPP_PROMOTE:
+		if (tessera_fs_wrap_list_as_tree(tmp_, inode_no) == 0)
+			return (tessera_fs_append_chunk_tree(tmp_,
+			    inode_no, append_off, append_bytes,
+			    append_len, cs));
+		return (ENOTSUP);
+	default:
+		return (tessera_fs_append_apply(tmp_, inode_no, &pp));
+	}
+}
+
+/* APPLY half of the chunked append: publish the prepared dirty chunks
+ * + extended manifest, then repoint the inode. Publish/commit context
+ * (flush gate or vop path). Consumes pp's allocations (mft, merge_buf,
+ * dirty). pp->dirty entries point into the caller's append bytes and
+ * pp->merge_buf, which must both be alive across this call. */
+static int
+tessera_fs_append_apply(struct tessera_mount *tmp_, uint32_t inode_no,
+    struct tessera_append_prep *pp)
+{
+	uint8_t key[4];
+	encode_inode_key(inode_no, key);
+
+	tessera_hash_t pub_hash;
+	int rc = tessera_fs_publish_chunked(tmp_, pp->dirty, pp->n_dirty,
+	    pp->mft, pp->mlen, pub_hash);
+	free(pp->mft, M_TESSERA);
+	if (pp->merge_buf) free(pp->merge_buf, M_TESSERA);
+	free(pp->dirty, M_TESSERA);
+	pp->mft = NULL;
+	pp->merge_buf = NULL;
+	pp->dirty = NULL;
 	if (rc != 0) return (rc);
 
 	tessera_inode_record_t ino;
 	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
 		return (EIO);
 	memcpy(ino.manifest_hash, pub_hash, sizeof pub_hash);
-	ino.size = new_size;
+	ino.size = pp->new_size;
 	ino.gen++;
 	struct timeval tv;
 	getmicrotime(&tv);
@@ -12681,13 +12891,6 @@ tessera_fs_append_chunked_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 		return (EIO);
 	tmp_->sb.inode_root = new_inode_root;
 	return (0);
-
-enomem:
-	tessera_manifest_free(mb);
-	if (merge_buf) free(merge_buf, M_TESSERA);
-	free(dirty, M_TESSERA);
-	free(old, M_TESSERA);
-	return (ENOMEM);
 }
 
 /*
