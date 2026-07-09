@@ -42,6 +42,7 @@ struct tessera_manifest_builder {
 	size_t                   body_cap;
 	uint32_t                 entry_count;
 	uint64_t                 logical_size;
+	uint32_t                 hash_alg;   /* TESSERA_HASH_ALG_*, default SHA256 */
 };
 
 static int
@@ -72,7 +73,19 @@ tessera_manifest_begin(tessera_manifest_kind_t kind)
 	tessera_manifest_builder_t *b = tessera_zalloc(sizeof *b);
 	if (b == NULL) return NULL;
 	b->kind = kind;
+	b->hash_alg = TESSERA_HASH_ALG_SHA256;
 	return b;
+}
+
+int
+tessera_manifest_set_hash_alg(tessera_manifest_builder_t *b, uint32_t alg)
+{
+	if (b == NULL) return TESSERA_EINVAL;
+	if (alg != TESSERA_HASH_ALG_SHA256 &&
+	    alg != TESSERA_HASH_ALG_BLAKE3_256)
+		return TESSERA_EINVAL;
+	b->hash_alg = alg;
+	return TESSERA_OK;
 }
 
 void
@@ -396,7 +409,7 @@ tessera_manifest_finalize(tessera_manifest_builder_t *b,
 		memcpy(out_buffer + HEADER_SIZE, b->body, b->body_len);
 
 	if (out_hash != NULL)
-		tessera_sha256(out_buffer, total, out_hash);
+		tessera_content_hash(b->hash_alg, out_buffer, total, out_hash);
 
 	return TESSERA_OK;
 }

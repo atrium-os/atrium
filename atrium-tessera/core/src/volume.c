@@ -128,6 +128,8 @@ seed_root_dirent(const tessera_block_io_t *shim,
 	 * file" workflow. */
 	tessera_manifest_builder_t *mb =
 	    tessera_manifest_begin(TESSERA_MFT_DIRECTORY);
+	if (mb != NULL)
+		(void)tessera_manifest_set_hash_alg(mb, opts->hash_alg);
 	if (mb == NULL) return TESSERA_ENOMEM;
 	if (has_seed) {
 		r = tessera_manifest_add_dirent(mb, opts->seed_dirent_inode,
@@ -168,6 +170,9 @@ seed_root_dirent(const tessera_block_io_t *shim,
 		    ? TESSERA_MFT_CHUNK_LIST
 		    : TESSERA_MFT_INLINE;
 		tessera_manifest_builder_t *ib = tessera_manifest_begin(kind);
+	if (ib != NULL) {
+		(void)tessera_manifest_set_hash_alg(ib, opts->hash_alg);
+	}
 		if (ib == NULL) {
 			tessera_free(mft_bytes);
 			return TESSERA_ENOMEM;
@@ -185,7 +190,8 @@ seed_root_dirent(const tessera_block_io_t *shim,
 				             opts->seed_content_len)
 				    ? opts->seed_content_len - off
 				    : opts->seed_chunk_size;
-				tessera_sha256(opts->seed_content_data + off,
+				tessera_content_hash(opts->hash_alg,
+				    opts->seed_content_data + off,
 				    cs, chunk_hashes[i]);
 				r = tessera_manifest_add_chunk(ib,
 				    chunk_hashes[i], off, (uint32_t)cs, 0);
@@ -403,6 +409,9 @@ tessera_volume_format(const tessera_block_io_t *io,
                       const tessera_format_opts_t *opts)
 {
 	if (io == NULL || opts == NULL) return TESSERA_EINVAL;
+	if (opts->hash_alg != TESSERA_HASH_ALG_SHA256 &&
+	    opts->hash_alg != TESSERA_HASH_ALG_BLAKE3_256)
+		return TESSERA_EINVAL;
 	if (io->read_block == NULL || io->write_block == NULL)
 		return TESSERA_EINVAL;
 
@@ -539,7 +548,9 @@ tessera_volume_format(const tessera_block_io_t *io,
 	sb.version_major          = 1;
 	sb.version_minor          = 0;
 	sb.feature_flags          = 0;
-	sb.incompat_flags         = 0;
+	sb.incompat_flags         = (opts->hash_alg != TESSERA_HASH_ALG_SHA256)
+	    ? TESSERA_INCOMPAT_HASH_ALG : 0;
+	sb.hash_alg               = opts->hash_alg;
 	sb.generation             = 1;
 	memcpy(sb.volume_uuid, opts->volume_uuid, 16);
 	sb.total_sectors          = opts->total_sectors;
@@ -596,7 +607,16 @@ tessera_volume_open(const tessera_block_io_t *io, tessera_volume_t **out)
 
 	if (active->version_major != 1)            return TESSERA_EBADVERSION;
 	if (active->sector_size != TESSERA_SECTOR_SIZE) return TESSERA_EBADVERSION;
-	if (active->incompat_flags != 0)           return TESSERA_EINCOMPAT;
+	if ((active->incompat_flags & ~TESSERA_INCOMPAT_HASH_ALG) != 0)
+		return TESSERA_EINCOMPAT;
+	if (active->hash_alg != TESSERA_HASH_ALG_SHA256 &&
+	    active->hash_alg != TESSERA_HASH_ALG_BLAKE3_256)
+		return TESSERA_EINCOMPAT;
+	/* Non-default alg must carry the incompat bit (and vice versa) —
+	 * a mismatch means a corrupt or hand-edited superblock. */
+	if ((active->hash_alg != TESSERA_HASH_ALG_SHA256) !=
+	    ((active->incompat_flags & TESSERA_INCOMPAT_HASH_ALG) != 0))
+		return TESSERA_ECORRUPT;
 
 	tessera_volume_t *v = tessera_zalloc(sizeof *v);
 	if (v == NULL) return TESSERA_ENOMEM;
@@ -638,6 +658,8 @@ uint64_t tessera_volume_journal_length(const tessera_volume_t *v)
 const uint8_t *tessera_volume_uuid(const tessera_volume_t *v)
 { return v ? v->sb.volume_uuid : NULL; }
 
+uint32_t tessera_volume_hash_alg(const tessera_volume_t *v)
+{ return v ? v->sb.hash_alg : 0; }
 uint64_t tessera_volume_snapshots_root(const tessera_volume_t *v)
 { return v ? v->sb.snapshots_root : 0; }
 

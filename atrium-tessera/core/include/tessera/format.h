@@ -55,6 +55,24 @@ extern "C" {
 
 typedef uint8_t tessera_hash_t[TESSERA_HASH_SIZE];
 
+/* Content-hash algorithm, recorded per volume in sb.hash_alg. All
+ * content addressing (chunk hashes, manifest hashes) on a volume uses
+ * this one algorithm; it is chosen at mkfs and never changes. SHA256=0
+ * so pre-hash_alg volumes (zeroed field) decode correctly. Any value
+ * other than SHA256 must be accompanied by TESSERA_INCOMPAT_HASH_ALG
+ * so older implementations refuse the mount instead of mis-hashing.
+ *
+ * Note: tessera_dir_name_hash() is a key derivation (directory btree
+ * keys), NOT content addressing — it stays SHA-256 on every volume
+ * regardless of hash_alg.
+ */
+#define TESSERA_HASH_ALG_SHA256      0u
+#define TESSERA_HASH_ALG_BLAKE3_256  1u   /* portable, no-FPU kernel path */
+#define TESSERA_HASH_ALG_ASCON_256   2u   /* reserved: Karythra K16 CAS */
+
+/* sb.incompat_flags bits — mount must refuse any bit it doesn't know. */
+#define TESSERA_INCOMPAT_HASH_ALG    (1u << 0)  /* hash_alg != SHA256 */
+
 /* ── Magic strings ───────────────────────────────────────────────── */
 
 #define TESSERA_MAGIC_SUPERBLOCK   "TESSERA1"
@@ -173,12 +191,16 @@ typedef struct TESSERA_PACKED {
 	                                        re-encryption */
 	tessera_key_slot_t  key_slots[8];    /* 8 × 256 = 2 KiB */
 	uint32_t  last_unmount_clean;
+	/* Content-hash algorithm (TESSERA_HASH_ALG_*). 0 = SHA-256, which is
+	 * also what every pre-hash_alg volume's zeroed slack decodes to — no
+	 * migration. Non-zero requires TESSERA_INCOMPAT_HASH_ALG in
+	 * incompat_flags. */
+	uint32_t  hash_alg;
 	/* Trailing slack — kept BEFORE crc32/hmac (which sit at the very end)
 	 * so any field later carved from it is CRC-covered for free. Sized to
 	 * hold the SB at exactly one sector (4096 B); shrink when naming a new
-	 * field. 1728 = prior 1760 − 32 B taken by the four quota u64s
-	 * (next_quota_domain_id, quota_features, quota_tree_root, quota_tree_gen). */
-	uint8_t   reserved[1728];
+	 * field. 1724 = prior 1728 − 4 B taken by hash_alg. */
+	uint8_t   reserved[1724];
 	uint32_t  crc32;                     /* CRC over bytes 0..(crc32 offset) */
 	/* Keyed integrity — reserved by v1 for v3's authenticated metadata.
 	 * v1 mkfs zeros this; v1/v2 kmod ignore it. v3 derives a separate

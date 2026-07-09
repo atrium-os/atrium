@@ -39,10 +39,20 @@ void tessera_sha256_free(tessera_sha256_ctx_t *);
 
 /*
  * One-shot 256-bit BLAKE3 (portable compression only — plain integer
- * registers, no FPU/SIMD state on any architecture). Candidate
- * hash_alg=2 backend; implementation is the vendored b3_blake3*.c.
+ * registers, no FPU/SIMD state on any architecture). Backend for
+ * TESSERA_HASH_ALG_BLAKE3_256; implementation is the vendored
+ * b3_blake3*.c.
  */
 void tessera_blake3_256(const uint8_t *data, size_t len, tessera_hash_t out);
+
+/*
+ * Content-hash dispatch keyed on the volume's sb.hash_alg
+ * (TESSERA_HASH_ALG_*). All content addressing must go through this
+ * (or match it); callers guarantee `alg` was validated at mount or
+ * format time.
+ */
+void tessera_content_hash(uint32_t alg, const uint8_t *data, size_t len,
+                          tessera_hash_t out);
 
 /* Compare two hashes for equality. Constant-time. */
 int  tessera_hash_equal(const tessera_hash_t a, const tessera_hash_t b);

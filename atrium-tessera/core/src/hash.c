@@ -49,6 +49,23 @@ tessera_sha256(const uint8_t *data, size_t len, tessera_hash_t out)
 	SHA256_Final(out, &ctx);
 }
 
+void
+tessera_content_hash(uint32_t alg, const uint8_t *data, size_t len,
+                     tessera_hash_t out)
+{
+	switch (alg) {
+	case TESSERA_HASH_ALG_BLAKE3_256:
+		tessera_blake3_256(data, len, out);
+		break;
+	case TESSERA_HASH_ALG_SHA256:
+	default:
+		/* Unknown algs are rejected at mount/format time; only
+		 * validated values reach here. */
+		tessera_sha256(data, len, out);
+		break;
+	}
+}
+
 tessera_sha256_ctx_t *
 tessera_sha256_init(void)
 {

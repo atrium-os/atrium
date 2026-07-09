@@ -20,7 +20,8 @@ use tessera_tools::{
 fn usage() -> ! {
     eprintln!(
         "usage: mkfs-tessera [-j JOURNAL_SECTORS] [--create -s SIZE_MIB] \\\n\
-         \x20             [--seed-file NAME [--seed-inode N]] PATH"
+         \x20             [--seed-file NAME [--seed-inode N]] \\\n\
+         \x20             [--hash-alg sha256|blake3] PATH"
     );
     std::process::exit(2);
 }
@@ -33,13 +34,14 @@ struct Args {
     seed_inode: u64,
     seed_content: Option<String>,
     seed_chunk_size: u32,
+    hash_alg: u32,
 }
 
 fn parse_args() -> Args {
     let mut a = Args {
         path: String::new(), journal_sectors: 256, create: None,
         seed_name: None, seed_inode: 1000, seed_content: None,
-        seed_chunk_size: 0,
+        seed_chunk_size: 0, hash_alg: 0,
     };
     let argv: Vec<_> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -76,6 +78,15 @@ fn parse_args() -> Args {
                 i += 1;
                 if i >= argv.len() { usage(); }
                 a.seed_chunk_size = argv[i].parse().unwrap_or_else(|_| usage());
+            }
+            "--hash-alg" => {
+                i += 1;
+                if i >= argv.len() { usage(); }
+                a.hash_alg = match argv[i].as_str() {
+                    "sha256" => 0,
+                    "blake3" => 1,
+                    _ => usage(),
+                };
             }
             "-h" | "--help" => usage(),
             arg if !arg.starts_with('-') => a.path = arg.to_string(),
@@ -155,6 +166,7 @@ fn run() -> Result<(), String> {
         seed_content_data:    content_ptr,
         seed_content_len:     content_len,
         seed_chunk_size:      args.seed_chunk_size,
+        hash_alg:             args.hash_alg,
     };
     let r = unsafe { tessera_volume_format(&io, &opts) };
     if r != 0 {
@@ -166,6 +178,7 @@ fn run() -> Result<(), String> {
     println!("  total_sectors:   {total_sectors}");
     println!("  journal_sectors: {}", args.journal_sectors);
     println!("  uuid:            {}", format_uuid(&uuid));
+    println!("  hash_alg:        {}", if args.hash_alg == 1 { "blake3" } else { "sha256" });
     if let Some(ref name) = args.seed_name {
         println!("  seeded:          /{} -> inode {} ({} bytes content)",
             name, args.seed_inode, content_len);

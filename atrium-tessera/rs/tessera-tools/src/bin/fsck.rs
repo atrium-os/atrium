@@ -297,6 +297,9 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
     let pz_start = unsafe { tessera_volume_pack_zone_start(v) };
     let pz_len = unsafe { tessera_volume_pack_zone_length(v) };
     let generation = unsafe { tessera_volume_generation(v) };
+    /* volume content-hash algorithm (0=sha256, 1=blake3) — all blob
+     * re-hash verification below must use it, not raw sha256 */
+    let hash_alg = unsafe { tessera_volume_hash_alg(v) };
 
     let mut fsck = Fsck {
         problems: Vec::new(),
@@ -416,7 +419,7 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
                                     let slice = std::slice::from_raw_parts(bytes, blen as usize);
                                     // content-address integrity: re-hash vs claimed hash
                                     let mut got = [0u8; 32];
-                                    tessera_sha256(slice.as_ptr(), slice.len(), got.as_mut_ptr());
+                                    tessera_content_hash(hash_alg, slice.as_ptr(), slice.len(), got.as_mut_ptr());
                                     if got != bh {
                                         fsck.problem(format!(
                                             "pack {pid}: blob {} content hashes to {} (corrupted data)",

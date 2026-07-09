@@ -36,6 +36,11 @@ int tessera_manifest_add_tree_child(tessera_manifest_builder_t *,
  * offset (it has no inherent knowledge of the child's own extent).
  * No-op for kinds that derive logical_size from contents (INLINE,
  * SYMLINK, CHUNK_LIST). */
+/* Select the content-hash algorithm finalize uses for out_hash
+ * (TESSERA_HASH_ALG_*). Defaults to SHA256; set from the volume's
+ * sb.hash_alg before finalizing. */
+int tessera_manifest_set_hash_alg(tessera_manifest_builder_t *, uint32_t alg);
+
 int tessera_manifest_set_logical_size(tessera_manifest_builder_t *,
                                       uint64_t logical_size);
 

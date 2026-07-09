@@ -34,6 +34,7 @@ extern "C" {
 
     /* SHA-256 (FreeBSD libmd, HW-accelerated where available). */
     pub fn tessera_sha256(data: *const u8, len: usize, out: *mut u8);
+    pub fn tessera_content_hash(alg: u32, data: *const u8, len: usize, out: *mut u8);
     pub fn tessera_hash_equal(a: *const u8, b: *const u8) -> c_int;
     pub fn tessera_hash_is_null(h: *const u8) -> c_int;
 }
@@ -67,6 +68,7 @@ pub struct tessera_format_opts_t {
     pub seed_content_data:    *const u8,    /* NULL = empty file */
     pub seed_content_len:     usize,
     pub seed_chunk_size:      u32,          /* 0 = INLINE, >0 = CHUNK_LIST */
+    pub hash_alg:             u32,          /* TESSERA_HASH_ALG_*: 0=sha256 1=blake3 */
 }
 
 /* ── B+tree ──────────────────────────────────────────────────── */
@@ -352,6 +354,7 @@ extern "C" {
 
     pub fn tessera_volume_close(v: *mut tessera_volume_t);
 
+    pub fn tessera_volume_hash_alg(v: *const tessera_volume_t) -> u32;
     pub fn tessera_volume_total_sectors    (v: *const tessera_volume_t) -> u64;
     pub fn tessera_volume_generation       (v: *const tessera_volume_t) -> u64;
     pub fn tessera_volume_inode_root       (v: *const tessera_volume_t) -> u64;

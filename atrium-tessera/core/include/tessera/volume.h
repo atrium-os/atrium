@@ -60,6 +60,12 @@ typedef struct {
 	const uint8_t *seed_content_data;
 	size_t         seed_content_len;
 	uint32_t       seed_chunk_size;     /* 0 = INLINE, >0 = CHUNK_LIST */
+
+	/* Content-hash algorithm for the volume (TESSERA_HASH_ALG_*).
+	 * 0 = SHA-256 (default). Non-zero sets TESSERA_INCOMPAT_HASH_ALG
+	 * so older implementations refuse to mount. Rust FFI mirror:
+	 * rs/tessera-sys/src/lib.rs — keep in lockstep. */
+	uint32_t       hash_alg;
 } tessera_format_opts_t;
 
 /* Reserved metadata-zone size, in sectors, immediately after the
@@ -97,6 +103,7 @@ uint64_t        tessera_volume_journal_start    (const tessera_volume_t *);
 uint64_t        tessera_volume_journal_length   (const tessera_volume_t *);
 const uint8_t  *tessera_volume_uuid             (const tessera_volume_t *);
 /* v2 snapshots / metadata-reserve / encryption fields (added 2026-04-30). */
+uint32_t        tessera_volume_hash_alg         (const tessera_volume_t *);
 uint64_t        tessera_volume_snapshots_root   (const tessera_volume_t *);
 uint64_t        tessera_volume_snapshots_gen    (const tessera_volume_t *);
 uint64_t        tessera_volume_meta_reserve_start (const tessera_volume_t *);
