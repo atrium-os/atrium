@@ -41,7 +41,7 @@ fn parse_args() -> Args {
     let mut a = Args {
         path: String::new(), journal_sectors: 256, create: None,
         seed_name: None, seed_inode: 1000, seed_content: None,
-        seed_chunk_size: 0, hash_alg: 0,
+        seed_chunk_size: 0, hash_alg: 1, /* default blake3 (2026-07-09) */
     };
     let argv: Vec<_> = std::env::args().skip(1).collect();
     let mut i = 0;
