@@ -410,6 +410,9 @@ static unsigned long tessera_stat_chunk_zero_hole     = 0;
  * surfaced as EIO — previously silently laundered to ENOENT. */
 static unsigned long tessera_stat_lookup_eio           = 0;
 static unsigned long tessera_stat_ckpt_fail            = 0;
+static unsigned long tessera_stat_window_seals         = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, window_seals, CTLFLAG_RW,
+    &tessera_stat_window_seals, 0, "Append windows sealed into chains");
 static struct tessera_mount *tessera_debug_mount;
 static unsigned long tessera_stat_chunk_tree_publish  = 0;
 static unsigned long tessera_stat_append_fast_ok      = 0;
@@ -911,6 +914,17 @@ struct tessera_dirty_inode {
  * past the cap forces a flush of the largest dirty buffer first.
  *
  * Locking: same flush_mtx as dirty_inodes / pending_manifests. */
+/* A sealed append window: an immutable [base_off, base_off+size) span
+ * of file bytes waiting for the flush to publish it. Sealing (not
+ * publishing) at window-full is what keeps the writer off the flush
+ * gate entirely -- Option C's core move. Chain order == offset order. */
+struct tessera_dc_seg {
+	STAILQ_ENTRY(tessera_dc_seg) link;
+	uint8_t  *seg_bytes;
+	size_t    seg_size;
+	uint64_t  seg_base;
+};
+
 struct tessera_dirty_content {
 	LIST_ENTRY(tessera_dirty_content) link;
 	uint32_t  inode_no;
@@ -954,6 +968,13 @@ struct tessera_dirty_content {
 	 * they take small-block large-file writes from ~0.2 to ~20 MB/s.
 	 * base_off == 0 is the classic whole-file buffer (unchanged). */
 	uint64_t  base_off;
+	/* Sealed windows awaiting publish, oldest first; base_off/size
+	 * above describe the ACTIVE window (the chain's tail), so the
+	 * live-size overlay (base_off + size) needs no chain awareness.
+	 * Writer-side mutation only (exclusive vnode lock) under
+	 * flush_mtx; frozen by the claim like the rest of the dc. */
+	STAILQ_HEAD(, tessera_dc_seg) segs;
+	size_t    segs_bytes;
 };
 
 /* Parallel-drain prepare job: the flush thread freezes a dc (busy
@@ -1418,6 +1439,12 @@ struct tessera_mount {
 	int                       flush_unmounting;  /* don't rearm callout */
 	struct callout            flush_co;
 	struct task               flush_task;
+	/* Dedicated single-thread flush queue. The async pressure flushes
+	 * (Option C) run long — commit_sb's FSYNC holds device buffers
+	 * for the whole write-back — and doing that on the SHARED
+	 * taskqueue_thread starves every other subsystem queued there
+	 * (observed: md-on-ZFS test rigs crawling for minutes). */
+	struct taskqueue         *flush_tq;
 
 	/* v2 repack engine slice 3: background trigger.
 	 * multi_extent_pack_count tracks how many MULTI_EXTENT-flagged
@@ -2038,6 +2065,10 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	for (int _i = 0; _i < 4; _i++)
 		TASK_INIT(&tmp_->dc_prep_tasks[_i], 0,
 		    tessera_fs_dc_prep_worker, tmp_);
+	tmp_->flush_tq = taskqueue_create("tessera_flush", M_WAITOK,
+	    taskqueue_thread_enqueue, &tmp_->flush_tq);
+	(void)taskqueue_start_threads(&tmp_->flush_tq, 1, PRIBIO,
+	    "tessflush");
 	tmp_->multi_extent_pack_count = 0;
 	mtx_init(&tmp_->flush_mtx, "tess_flush", NULL, MTX_DEF);
 	tmp_->flush_mtx_init = 1;
@@ -2675,7 +2706,7 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 		if (tmp_->flush_co_init) {
 			tmp_->flush_unmounting = 1;
 			callout_drain(&tmp_->flush_co);
-			taskqueue_drain(taskqueue_thread, &tmp_->flush_task);
+			taskqueue_drain(tmp_->flush_tq, &tmp_->flush_task);
 			/* v2.6 B.2: stop the journal-log callout + drain its
 			 * task, then force a final synchronous drain so any
 			 * unjournaled ops become durable before we close
@@ -2692,6 +2723,13 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 		if (tmp_->repack_task_init) {
 			taskqueue_drain(taskqueue_thread, &tmp_->repack_task);
 			tmp_->repack_task_init = 0;
+		}
+		/* Flush queue first (its task may still enqueue prepare
+		 * work), then the prepare pool; taskqueue_free drains
+		 * before freeing. */
+		if (tmp_->flush_tq != NULL) {
+			taskqueue_free(tmp_->flush_tq);
+			tmp_->flush_tq = NULL;
 		}
 		/* Prepare pool: the final flush above was its last user;
 		 * taskqueue_free drains the workers before freeing. */
@@ -5249,7 +5287,7 @@ tessera_fs_flush_callout(void *arg)
 {
 	struct tessera_mount *tmp_ = arg;
 	if (tmp_->flush_unmounting) return;
-	(void)taskqueue_enqueue(taskqueue_thread, &tmp_->flush_task);
+	(void)taskqueue_enqueue(tmp_->flush_tq, &tmp_->flush_task);
 }
 
 static void
@@ -5308,23 +5346,30 @@ tessera_fs_mark_dirty(struct tessera_mount *tmp_)
 	 * waits forever for a repack that never arms). */
 	if (tmp_->flush_in_progress && tmp_->flush_gate_owner == curthread)
 		goto repack_arm;
+	/* Option C: threshold pressure flushes are ASYNC — the writer
+	 * enqueues the flush task and keeps going instead of running the
+	 * whole drain+commit inline (tar's thread used to spend ~6s of a
+	 * base-system extract inside these). Admission
+	 * (tessera_fs_space_admit) bounds what can accumulate, so the
+	 * old unbounded-backlog failure mode of a purely async design is
+	 * gone; a 4x hard backstop still throttles the writer
+	 * synchronously if the async flush can't keep up. */
 	if (tmp_->dirty_init &&
-	    tmp_->dirty_count > (uint32_t)tessera_dirty_flush_async) {
+	    (tmp_->dirty_count > 4u * (uint32_t)tessera_dirty_flush_async ||
+	     tmp_->dirent_log_count >
+	         4u * (uint32_t)tessera_dirent_log_threshold)) {
 		(void)tessera_fs_flush(tmp_);
 		return;
 	}
-	/* v2.6: dirent log overflow trigger. */
 	if (tmp_->dirty_init &&
-	    tmp_->dirent_log_count >
-	        (uint32_t)tessera_dirent_log_threshold) {
-		(void)tessera_fs_flush(tmp_);
-		return;
-	}
-	/* Cap pending-manifest cache size — past 1 MiB held in RAM,
-	 * force a drain. */
-	if (tmp_->dirty_init && tmp_->pending_manifest_bytes >=
-	    TESSERA_PENDING_MANIFEST_BYTES_MAX) {
-		(void)tessera_fs_flush(tmp_);
+	    (tmp_->dirty_count > (uint32_t)tessera_dirty_flush_async ||
+	     tmp_->dirent_log_count >
+	         (uint32_t)tessera_dirent_log_threshold ||
+	     tmp_->pending_manifest_bytes >=
+	         TESSERA_PENDING_MANIFEST_BYTES_MAX)) {
+		if (tmp_->flush_co_init && !tmp_->flush_unmounting)
+			(void)taskqueue_enqueue(tmp_->flush_tq,
+			    &tmp_->flush_task);
 		return;
 	}
 	const uint64_t used = tmp_->sb.meta_reserve_bump
@@ -6855,16 +6900,26 @@ tessera_fs_dirty_content_detach(struct tessera_mount *tmp_,
 	while (dc->busy)
 		(void)msleep(dc, &tmp_->flush_mtx, PRIBIO, "tessbusy", 0);
 	LIST_REMOVE(dc, link);
-	if (tmp_->dirty_content_bytes >= dc->size)
-		tmp_->dirty_content_bytes -= dc->size;
-	else
-		tmp_->dirty_content_bytes = 0;
+	{
+		size_t _ret = dc->size + dc->segs_bytes;
+		if (tmp_->dirty_content_bytes >= _ret)
+			tmp_->dirty_content_bytes -= _ret;
+		else
+			tmp_->dirty_content_bytes = 0;
+		wakeup(&tmp_->dirty_content_bytes);
+	}
 }
 
 static void
 tessera_fs_dirty_content_free(struct tessera_dirty_content *dc)
 {
 	if (dc == NULL) return;
+	while (!STAILQ_EMPTY(&dc->segs)) {
+		struct tessera_dc_seg *seg = STAILQ_FIRST(&dc->segs);
+		STAILQ_REMOVE_HEAD(&dc->segs, link);
+		if (seg->seg_bytes != NULL) free(seg->seg_bytes, M_TESSERA);
+		free(seg, M_TESSERA);
+	}
 	if (dc->bytes != NULL) free(dc->bytes, M_TESSERA);
 	free(dc, M_TESSERA);
 }
@@ -7022,6 +7077,34 @@ tessera_fs_dirty_content_publish(struct tessera_mount *tmp_,
 {
 	if (!dc->dirty) return (0);
 	int rc;
+	/* Sealed windows first, oldest first — each append advances the
+	 * durable tail to the next seg's base. A failure keeps the
+	 * remaining chain (and the active window) intact for retry; the
+	 * published prefix is simply gone from RAM. Segments are freed
+	 * as they land, with the global accounting (which admission and
+	 * statfs read) updated under flush_mtx. The dc is CLAIMED
+	 * (draining) here, so the chain is frozen against the writer. */
+	while (!STAILQ_EMPTY(&dc->segs)) {
+		struct tessera_dc_seg *seg = STAILQ_FIRST(&dc->segs);
+		rc = tessera_fs_append_to_file(tmp_, dc->inode_no,
+		    seg->seg_base, seg->seg_bytes, seg->seg_size);
+		if (rc != 0)
+			return (rc);
+		tessera_stat_vop_write_chunked++;
+		mtx_lock(&tmp_->flush_mtx);
+		STAILQ_REMOVE_HEAD(&dc->segs, link);
+		dc->segs_bytes -= seg->seg_size;
+		if (tmp_->dirty_content_bytes >= seg->seg_size)
+			tmp_->dirty_content_bytes -= seg->seg_size;
+		else
+			tmp_->dirty_content_bytes = 0;
+		wakeup(&tmp_->dirty_content_bytes);
+		mtx_unlock(&tmp_->flush_mtx);
+		free(seg->seg_bytes, M_TESSERA);
+		free(seg, M_TESSERA);
+	}
+	if (dc->base_off > 0 && dc->size == 0)
+		return (0);      /* freshly sealed; nothing in the tail */
 	if (dc->base_off > 0) {
 		rc = tessera_fs_append_to_file(tmp_, dc->inode_no,
 		    dc->base_off, dc->bytes, dc->size);
@@ -7051,6 +7134,91 @@ tessera_fs_dirty_content_publish(struct tessera_mount *tmp_,
  * short commit. Prepare cannot publish (delegations come back as
  * verdicts), so nothing here races the flush's commits; delegation /
  * ineligible cases fall back to the fully gated publish. */
+/* Convert a classic whole-file buffer into an append window by sealing
+ * its current content as the chain's first segment (seg_base 0 — the
+ * flush's chain publish handles base 0 as a whole-content publish).
+ * This makes the 4 MiB classic->window transition a pure RAM operation;
+ * it used to synchronously drain + gated-append on the writer, and
+ * those ~2 gated ops per large file were the residual gate_wait once
+ * the threshold flushes went async. Returns 0 when the dc is now a
+ * window whose tail is at write_off, ENOTSUP when the shape didn't
+ * match (caller falls back to the old drain path). */
+static int
+tessera_fs_classic_to_window(struct tessera_mount *tmp_, uint32_t inode_no,
+                             uint64_t write_off)
+{
+	struct tessera_dc_seg *seg = malloc(sizeof *seg, M_TESSERA, M_WAITOK);
+	size_t cap = (size_t)tessera_append_window_bytes;
+	uint8_t *nbuf = malloc(cap, M_TESSERA, M_WAITOK);
+
+	mtx_lock(&tmp_->flush_mtx);
+	struct tessera_dirty_content *dc =
+	    tessera_fs_dirty_content_lookup(tmp_, inode_no);
+	if (dc == NULL || dc->draining || dc->busy || dc->base_off != 0 ||
+	    !dc->dirty || dc->size == 0 ||
+	    (uint64_t)dc->size != write_off) {
+		mtx_unlock(&tmp_->flush_mtx);
+		free(seg, M_TESSERA);
+		free(nbuf, M_TESSERA);
+		return (ENOTSUP);
+	}
+	seg->seg_bytes = dc->bytes;
+	seg->seg_size  = dc->size;
+	seg->seg_base  = 0;
+	STAILQ_INSERT_TAIL(&dc->segs, seg, link);
+	dc->segs_bytes += dc->size;
+	dc->base_off    = dc->size;
+	dc->bytes       = nbuf;
+	dc->capacity    = cap;
+	dc->size        = 0;
+	mtx_unlock(&tmp_->flush_mtx);
+	tessera_stat_window_seals++;
+	return (0);
+}
+
+/* Seal the inode's full ACTIVE window into the dc's segment chain and
+ * install a fresh empty window after it. This is the Option-C writer
+ * path: window-full costs two mallocs and a list insert instead of a
+ * gated publish — the flush drains the chain in offset order. Best
+ * effort: if the dc changed shape while we allocated (drained, being
+ * drained, or already resealed by this same thread's recursion) the
+ * allocations are dropped and the caller's retry logic takes over. */
+static void
+tessera_fs_window_seal(struct tessera_mount *tmp_, uint32_t inode_no)
+{
+	struct tessera_dc_seg *seg = malloc(sizeof *seg, M_TESSERA, M_WAITOK);
+	size_t cap = (size_t)tessera_append_window_bytes;
+	uint8_t *nbuf = malloc(cap, M_TESSERA, M_WAITOK);
+
+	mtx_lock(&tmp_->flush_mtx);
+	struct tessera_dirty_content *dc =
+	    tessera_fs_dirty_content_lookup(tmp_, inode_no);
+	/* Seal whatever the active window holds — the overflow path can
+	 * arrive with size < window_bytes (incoming write larger than the
+	 * remaining capacity) and must still seal, or its retry recurses
+	 * forever. Only skip when there is nothing to move or the dc is
+	 * frozen/absent. */
+	if (dc == NULL || dc->draining || dc->base_off == 0 || !dc->dirty ||
+	    dc->size == 0) {
+		mtx_unlock(&tmp_->flush_mtx);
+		free(seg, M_TESSERA);
+		free(nbuf, M_TESSERA);
+		return;
+	}
+	seg->seg_bytes = dc->bytes;
+	seg->seg_size  = dc->size;
+	seg->seg_base  = dc->base_off;
+	STAILQ_INSERT_TAIL(&dc->segs, seg, link);
+	dc->segs_bytes += dc->size;
+	dc->base_off   += dc->size;
+	dc->bytes       = nbuf;
+	dc->capacity    = cap;
+	dc->size        = 0;
+	/* dc->dirty stays 1 — the chain is the dirty state now. */
+	mtx_unlock(&tmp_->flush_mtx);
+	tessera_stat_window_seals++;
+}
+
 static int
 tessera_fs_window_publish(struct tessera_mount *tmp_, uint32_t inode_no)
 {
@@ -7104,10 +7272,14 @@ tessera_fs_window_publish(struct tessera_mount *tmp_, uint32_t inode_no)
 	dc->draining = 0;
 	if (rc == 0) {
 		LIST_REMOVE(dc, link);
-		if (tmp_->dirty_content_bytes >= dc->size)
-			tmp_->dirty_content_bytes -= dc->size;
-		else
-			tmp_->dirty_content_bytes = 0;
+		{
+			size_t _ret = dc->size + dc->segs_bytes;
+			if (tmp_->dirty_content_bytes >= _ret)
+				tmp_->dirty_content_bytes -= _ret;
+			else
+				tmp_->dirty_content_bytes = 0;
+			wakeup(&tmp_->dirty_content_bytes);
+		}
 		wakeup(dc);
 		mtx_unlock(&tmp_->flush_mtx);
 		tessera_fs_dirty_content_free(dc);
@@ -7172,12 +7344,36 @@ tessera_fs_dirty_content_append(struct tessera_mount *tmp_, uint32_t inode_no,
 	mtx_lock(&tmp_->flush_mtx);
 	size_t _dcb = tmp_->dirty_content_bytes + len;
 	mtx_unlock(&tmp_->flush_mtx);
-	if (_dcb > 2u * (size_t)tessera_dirty_content_cap) {
-		(void)tessera_fs_dirty_content_drain_all(tmp_);
+	if (_dcb > 2u * (size_t)tessera_dirty_content_cap &&
+	    tmp_->flush_co_init && !tmp_->flush_unmounting) {
+		/* Hard cap: WAIT FOR SPACE while the async flush drains —
+		 * do not run the whole drain on the writer (that stall was
+		 * the new gate_wait once threshold flushes went async).
+		 * Retirements wake &dirty_content_bytes per dc; the writer
+		 * resumes as soon as the pool dips under the soft cap, not
+		 * when the entire flush finishes. Timeout-bounded so a
+		 * stuck flush degrades to the old inline drain instead of
+		 * hanging the writer. */
+		(void)taskqueue_enqueue(tmp_->flush_tq, &tmp_->flush_task);
+		mtx_lock(&tmp_->flush_mtx);
+		int _bp_spins = 0;
+		while (tmp_->dirty_content_bytes + len >
+		    (size_t)tessera_dirty_content_cap) {
+			if (msleep(&tmp_->dirty_content_bytes,
+			    &tmp_->flush_mtx, PRIBIO, "tessbp", hz) ==
+			    EWOULDBLOCK && ++_bp_spins >= 3) {
+				mtx_unlock(&tmp_->flush_mtx);
+				(void)tessera_fs_dirty_content_drain_all(
+				    tmp_);
+				mtx_lock(&tmp_->flush_mtx);
+				break;
+			}
+		}
+		mtx_unlock(&tmp_->flush_mtx);
 	} else if (_dcb > (size_t)tessera_dirty_content_cap &&
 	    tmp_->flush_co_init && !tmp_->flush_unmounting) {
 		/* Soft cap: async flush, don't block the writer. */
-		(void)taskqueue_enqueue(taskqueue_thread, &tmp_->flush_task);
+		(void)taskqueue_enqueue(tmp_->flush_tq, &tmp_->flush_task);
 	}
 
 	mtx_lock(&tmp_->flush_mtx);
@@ -7192,8 +7388,18 @@ tessera_fs_dirty_content_append(struct tessera_mount *tmp_, uint32_t inode_no,
 		(void)msleep(dc, &tmp_->flush_mtx, PRIBIO, "tessdrn", 0);
 	}
 	if (dc != NULL) {
-		/* A classic whole-file buffer, or a non-tail offset, can't be
-		 * windowed here — let the caller drain and fall back. */
+		/* A classic whole-file buffer whose tail matches the write
+		 * converts to a window in RAM (content sealed as seg 0);
+		 * a non-tail offset still falls back. */
+		if (dc->base_off == 0 &&
+		    (uint64_t)dc->size == write_off && dc->dirty) {
+			mtx_unlock(&tmp_->flush_mtx);
+			if (tessera_fs_classic_to_window(tmp_, inode_no,
+			    write_off) == 0)
+				return (tessera_fs_dirty_content_append(
+				    tmp_, inode_no, write_off, bytes, len));
+			return (ENOTSUP);
+		}
 		if (dc->base_off == 0 ||
 		    dc->base_off + (uint64_t)dc->size != write_off) {
 			mtx_unlock(&tmp_->flush_mtx);
@@ -7205,7 +7411,7 @@ tessera_fs_dirty_content_append(struct tessera_mount *tmp_, uint32_t inode_no,
 			 * size to write_off, so the recursion's create path
 			 * lands a new window at exactly this offset. */
 			mtx_unlock(&tmp_->flush_mtx);
-			(void)tessera_fs_window_publish(tmp_, inode_no);
+			tessera_fs_window_seal(tmp_, inode_no);
 			return (tessera_fs_dirty_content_append(tmp_, inode_no,
 			    write_off, bytes, len));
 		}
@@ -7224,7 +7430,7 @@ tessera_fs_dirty_content_append(struct tessera_mount *tmp_, uint32_t inode_no,
 		mtx_unlock(&tmp_->flush_mtx);
 		tessera_stat_dirty_content_hits++;
 		if (full)
-			(void)tessera_fs_window_publish(tmp_, inode_no);
+			tessera_fs_window_seal(tmp_, inode_no);
 		return (0);
 	}
 	mtx_unlock(&tmp_->flush_mtx);
@@ -7236,6 +7442,7 @@ tessera_fs_dirty_content_append(struct tessera_mount *tmp_, uint32_t inode_no,
 	struct tessera_dirty_content *ndc =
 	    malloc(sizeof *ndc, M_TESSERA, M_WAITOK | M_ZERO);
 	ndc->inode_no = inode_no;
+	STAILQ_INIT(&ndc->segs);
 	ndc->base_off = write_off;
 	ndc->capacity = cap;
 	ndc->bytes    = malloc(cap, M_TESSERA, M_WAITOK);
@@ -7268,7 +7475,7 @@ tessera_fs_dirty_content_append(struct tessera_mount *tmp_, uint32_t inode_no,
 	int full = (ndc->size >= (size_t)tessera_append_window_bytes);
 	mtx_unlock(&tmp_->flush_mtx);
 	if (full)
-		(void)tessera_fs_window_publish(tmp_, inode_no);
+		tessera_fs_window_seal(tmp_, inode_no);
 	return (0);
 }
 
@@ -7285,6 +7492,10 @@ tessera_fs_dirty_content_append_uio(struct tessera_mount *tmp_,
 	struct tessera_dirty_content *dc =
 	    tessera_fs_dirty_content_lookup(tmp_, inode_no);
 	int unwindowable = (dc != NULL &&
+	    /* classic buffer with a tail-matching write converts to a
+	     * window in-RAM (dirty_content_append seals it as seg 0) */
+	    !(dc->base_off == 0 && (uint64_t)dc->size == write_off &&
+	      dc->dirty) &&
 	    (dc->base_off == 0 ||
 	     dc->base_off + (uint64_t)dc->size != write_off));
 	mtx_unlock(&tmp_->flush_mtx);
@@ -7458,10 +7669,14 @@ tessera_fs_dc_prep_commit(struct tessera_mount *tmp_,
 		dc->draining = 0;
 		if (rc == 0) {
 			LIST_REMOVE(dc, link);
-			if (tmp_->dirty_content_bytes >= dc->size)
-				tmp_->dirty_content_bytes -= dc->size;
-			else
-				tmp_->dirty_content_bytes = 0;
+			{
+				size_t _ret = dc->size + dc->segs_bytes;
+				if (tmp_->dirty_content_bytes >= _ret)
+					tmp_->dirty_content_bytes -= _ret;
+				else
+					tmp_->dirty_content_bytes = 0;
+				wakeup(&tmp_->dirty_content_bytes);
+			}
 			wakeup(dc);
 			mtx_unlock(&tmp_->flush_mtx);
 			tessera_fs_dirty_content_free(dc);
@@ -7540,10 +7755,14 @@ tessera_fs_dirty_content_drain_dc(struct tessera_mount *tmp_,
 	dc->draining = 0;
 	if (rc == 0) {
 		LIST_REMOVE(dc, link);
-		if (tmp_->dirty_content_bytes >= dc->size)
-			tmp_->dirty_content_bytes -= dc->size;
-		else
-			tmp_->dirty_content_bytes = 0;
+		{
+			size_t _ret = dc->size + dc->segs_bytes;
+			if (tmp_->dirty_content_bytes >= _ret)
+				tmp_->dirty_content_bytes -= _ret;
+			else
+				tmp_->dirty_content_bytes = 0;
+			wakeup(&tmp_->dirty_content_bytes);
+		}
 		wakeup(dc);
 		mtx_unlock(&tmp_->flush_mtx);
 		tessera_fs_dirty_content_free(dc);
@@ -7839,11 +8058,28 @@ tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
 	mtx_lock(&tmp_->flush_mtx);
 	size_t _dcb = tmp_->dirty_content_bytes + final_size;
 	mtx_unlock(&tmp_->flush_mtx);
-	if (_dcb > 2u * (size_t)tessera_dirty_content_cap) {
-		(void)tessera_fs_dirty_content_drain_all(tmp_);
+	if (_dcb > 2u * (size_t)tessera_dirty_content_cap &&
+	    tmp_->flush_co_init && !tmp_->flush_unmounting) {
+		/* Hard cap: wait for space (see dirty_content_append). */
+		(void)taskqueue_enqueue(tmp_->flush_tq, &tmp_->flush_task);
+		mtx_lock(&tmp_->flush_mtx);
+		int _bp_spins = 0;
+		while (tmp_->dirty_content_bytes + final_size >
+		    (size_t)tessera_dirty_content_cap) {
+			if (msleep(&tmp_->dirty_content_bytes,
+			    &tmp_->flush_mtx, PRIBIO, "tessbp", hz) ==
+			    EWOULDBLOCK && ++_bp_spins >= 3) {
+				mtx_unlock(&tmp_->flush_mtx);
+				(void)tessera_fs_dirty_content_drain_all(
+				    tmp_);
+				mtx_lock(&tmp_->flush_mtx);
+				break;
+			}
+		}
+		mtx_unlock(&tmp_->flush_mtx);
 	} else if (_dcb > (size_t)tessera_dirty_content_cap &&
 	    tmp_->flush_co_init && !tmp_->flush_unmounting) {
-		(void)taskqueue_enqueue(taskqueue_thread, &tmp_->flush_task);
+		(void)taskqueue_enqueue(tmp_->flush_tq, &tmp_->flush_task);
 	}
 
 	/* Get or create the buffer; grow if needed. Same logic as the
@@ -8009,11 +8245,28 @@ tessera_fs_dirty_content_write_inner(struct tessera_mount *tmp_,
 	mtx_lock(&tmp_->flush_mtx);
 	size_t _dcb = tmp_->dirty_content_bytes + final_size;
 	mtx_unlock(&tmp_->flush_mtx);
-	if (_dcb > 2u * (size_t)tessera_dirty_content_cap) {
-		(void)tessera_fs_dirty_content_drain_all(tmp_);
+	if (_dcb > 2u * (size_t)tessera_dirty_content_cap &&
+	    tmp_->flush_co_init && !tmp_->flush_unmounting) {
+		/* Hard cap: wait for space (see dirty_content_append). */
+		(void)taskqueue_enqueue(tmp_->flush_tq, &tmp_->flush_task);
+		mtx_lock(&tmp_->flush_mtx);
+		int _bp_spins = 0;
+		while (tmp_->dirty_content_bytes + final_size >
+		    (size_t)tessera_dirty_content_cap) {
+			if (msleep(&tmp_->dirty_content_bytes,
+			    &tmp_->flush_mtx, PRIBIO, "tessbp", hz) ==
+			    EWOULDBLOCK && ++_bp_spins >= 3) {
+				mtx_unlock(&tmp_->flush_mtx);
+				(void)tessera_fs_dirty_content_drain_all(
+				    tmp_);
+				mtx_lock(&tmp_->flush_mtx);
+				break;
+			}
+		}
+		mtx_unlock(&tmp_->flush_mtx);
 	} else if (_dcb > (size_t)tessera_dirty_content_cap &&
 	    tmp_->flush_co_init && !tmp_->flush_unmounting) {
-		(void)taskqueue_enqueue(taskqueue_thread, &tmp_->flush_task);
+		(void)taskqueue_enqueue(tmp_->flush_tq, &tmp_->flush_task);
 	}
 
 	/* Look up or create the buffer. We may need to materialise the
@@ -8113,6 +8366,7 @@ tessera_fs_dirty_content_write_inner(struct tessera_mount *tmp_,
 	struct tessera_dirty_content *ndc =
 	    malloc(sizeof *ndc, M_TESSERA, M_WAITOK | M_ZERO);
 	ndc->inode_no = inode_no;
+	STAILQ_INIT(&ndc->segs);
 	/* Start with at least 64 KiB so a typical sequential dd doesn't
 	 * pay log2(file_size / 4 KiB) ≈ 6 reallocs to climb out of the
 	 * tiny range. Cap at file_max so we never over-allocate beyond
