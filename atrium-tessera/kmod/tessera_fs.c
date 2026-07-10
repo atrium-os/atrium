@@ -397,6 +397,11 @@ static unsigned long tessera_stat_vop_write_inline    = 0;
 static unsigned long tessera_stat_vop_write_chunked   = 0;
 static unsigned long tessera_stat_chunk_dedup_skip    = 0;
 static unsigned long tessera_stat_chunk_zero_hole     = 0;
+/* Lookup-path integrity failures (inode read / dir-manifest fetch)
+ * surfaced as EIO — previously silently laundered to ENOENT. */
+static unsigned long tessera_stat_lookup_eio           = 0;
+static unsigned long tessera_stat_ckpt_fail            = 0;
+static struct tessera_mount *tessera_debug_mount;
 static unsigned long tessera_stat_chunk_tree_publish  = 0;
 static unsigned long tessera_stat_append_fast_ok      = 0;
 static unsigned long tessera_stat_append_fast_fallback = 0;
@@ -412,6 +417,9 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, chunk_dedup_skip,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, chunk_zero_hole,
     CTLFLAG_RD, &tessera_stat_chunk_zero_hole, 0,
     "ZERO_HOLE chunks emitted (sparse-file detection)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_eio, CTLFLAG_RD,
+    &tessera_stat_lookup_eio, 0,
+    "Lookup-path inode/manifest fetch failures surfaced as EIO");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, chunk_tree_publish,
     CTLFLAG_RD, &tessera_stat_chunk_tree_publish, 0,
     "CHUNK_TREE outer-manifest publishes (write-side promotion)");
@@ -1128,6 +1136,11 @@ struct tessera_pending_manifest {
  * struct (flexible array). seq is monotonic — most-recent entries
  * have the highest seq, used for read-side ordering when multiple
  * ops touch the same name (ADD-then-REMOVE-then-ADD etc.). */
+struct tessera_ckpt_busy {
+	LIST_ENTRY(tessera_ckpt_busy) link;
+	uint32_t parent_inode_no;
+};
+
 struct tessera_dirent_log_entry {
 	LIST_ENTRY(tessera_dirent_log_entry) link;
 	uint32_t parent_inode_no;
@@ -1135,6 +1148,9 @@ struct tessera_dirent_log_entry {
 	uint64_t name_hash;
 	uint64_t seq;
 	uint8_t  op;             /* 0 = ADD, 1 = REMOVE */
+	uint8_t  draining;       /* claimed by an in-flight checkpoint; still
+	                            VISIBLE to log lookups (publish-in-place —
+	                            never detach before the new root is live) */
 	uint16_t name_len;
 	char     name[];
 };
@@ -1502,6 +1518,13 @@ struct tessera_mount {
 #define TESSERA_DIRENT_LOG_BUCKETS  4096u
 	LIST_HEAD(, tessera_dirent_log_entry)
 	    dirent_log[TESSERA_DIRENT_LOG_BUCKETS];
+	/* Parents with a dirent-log checkpoint in flight. Serializes
+	 * same-parent checkpoints (flush vs readdir/rmdir/rename callers
+	 * hold different locks): without this, two rebuilds race
+	 * read-modify-write on the parent's manifest and the loser's
+	 * batch is silently lost. Nodes live on the checkpointing
+	 * thread's stack; protected by flush_mtx. */
+	LIST_HEAD(, tessera_ckpt_busy) ckpt_busy;
 	uint32_t                  dirent_log_count;
 	uint64_t                  dirent_log_seq;   /* monotonic */
 
@@ -1933,6 +1956,8 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	}
 
 	tmp_ = malloc(sizeof(*tmp_), M_TESSERA, M_WAITOK | M_ZERO);
+	tessera_debug_mount = tmp_;	/* debug sysctls peek at the most
+					   recent mount; diag only */
 	tmp_->devvp = devvp;
 	tmp_->cp    = cp;
 	tmp_->dev   = dev;
@@ -2014,6 +2039,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		LIST_INIT(&tmp_->pending_manifests[_b]);
 	for (uint32_t _b = 0; _b < TESSERA_DIRENT_LOG_BUCKETS; _b++)
 		LIST_INIT(&tmp_->dirent_log[_b]);
+	LIST_INIT(&tmp_->ckpt_busy);
 	for (uint32_t _b = 0; _b < TESSERA_DIRTY_CONTENT_BUCKETS; _b++)
 		LIST_INIT(&tmp_->dirty_content[_b]);
 	tmp_->dirty_content_bytes = 0;
@@ -3530,8 +3556,20 @@ tessera_vop_lookup_impl(struct vop_cachedlookup_args *ap)
 	    ? tessera_fs_inode_get_at_gen(tmp_, (uint32_t)dn->inode_no,
 	          dn->snapshot_gen, &dino)
 	    : tessera_fs_inode_get_byk(tmp_, key, &dino);
-	if (igrc != TESSERA_OK)
-		return (ENOENT);
+	if (igrc != TESSERA_OK) {
+		/* Inode-read FAILURE on a live directory vnode is an I/O
+		 * error, not "no such file" — laundering it to ENOENT made a
+		 * transient fetch race look like a missing name (tar
+		 * hard-link "target does not exist"). Keep ENOENT only for
+		 * snapshot lookups where the inode may genuinely predate the
+		 * gen. */
+		if (dn->snapshot_gen != 0)
+			return (ENOENT);
+		tessera_stat_lookup_eio++;
+		printf("tessera_fs: lookup: inode %u read failed (rc=%d)\n",
+		    (unsigned)dn->inode_no, igrc);
+		return (EIO);
+	}
 	if (tessera_hash_is_null(dino.manifest_hash))
 		return (ENOENT);                  /* empty directory */
 
@@ -3539,7 +3577,18 @@ tessera_vop_lookup_impl(struct vop_cachedlookup_args *ap)
 	uint32_t blob_len = 0;
 	int err = tessera_fs_fetch_blob(tmp_, dino.manifest_hash,
 	    &blob, &blob_len);
-	if (err != 0) return (ENOENT);
+	if (err != 0) {
+		/* Same rule: the directory's CURRENT manifest failing to
+		 * fetch is an integrity/race event — surface EIO and log,
+		 * never a silent ENOENT. */
+		tessera_stat_lookup_eio++;
+		printf("tessera_fs: lookup: dir %u manifest fetch failed "
+		    "(err=%d, hash %02x%02x%02x%02x)\n",
+		    (unsigned)dn->inode_no, err, dino.manifest_hash[0],
+		    dino.manifest_hash[1], dino.manifest_hash[2],
+		    dino.manifest_hash[3]);
+		return (EIO);
+	}
 
 	tessera_manifest_parser_t *p = tessera_manifest_parse(blob, blob_len);
 	if (p == NULL) {
@@ -5208,6 +5257,22 @@ tessera_fs_mark_dirty(struct tessera_mount *tmp_)
 	 * so a higher threshold can't overrun the reserve. (An asynchronous
 	 * enqueue was tried and let an unbounded backlog build into one giant
 	 * blocking drain — worse, not better.) */
+	/* NEVER trigger a synchronous flush from inside the flush itself
+	 * (publishes under the gate call mark_dirty). The gate is
+	 * deliberately re-entrant for its owner, so without this guard a
+	 * checkpoint rebuild whose publish sees a still-over-threshold
+	 * counter recurses into flush → checkpoint_all → the SAME parent —
+	 * and with per-parent checkpoint serialization that is a self-wait
+	 * livelock (the inner call waits on its own outer frame's busy
+	 * claim, forever). The in-flight flush converges all of this
+	 * state anyway. Unlocked read is safe: only curthread ever sets
+	 * flush_gate_owner to curthread.
+	 * `goto`, NOT `return`: the repack-arm below must still run —
+	 * packs are born inside flush drains, so an early return here
+	 * starves the background repack trigger entirely (S1 stress
+	 * waits forever for a repack that never arms). */
+	if (tmp_->flush_in_progress && tmp_->flush_gate_owner == curthread)
+		goto repack_arm;
 	if (tmp_->dirty_init &&
 	    tmp_->dirty_count > (uint32_t)tessera_dirty_flush_async) {
 		(void)tessera_fs_flush(tmp_);
@@ -5236,6 +5301,7 @@ tessera_fs_mark_dirty(struct tessera_mount *tmp_)
 		(void)tessera_fs_flush(tmp_);
 	}
 
+repack_arm:
 	/* C2 — background repack trigger. Cheap check on every dirty
 	 * mutation: if MULTI_EXTENT-flagged pack count crosses the
 	 * threshold, arm the background task. taskqueue_enqueue is a
@@ -14327,6 +14393,9 @@ tessera_fs_dirent_log_append(struct tessera_mount *tmp_,
 	e->inode_no        = (uint32_t)inode_no;
 	e->name_hash       = tessera_dir_name_hash(name, namelen);
 	e->op              = (uint8_t)op;
+	e->draining        = 0;	/* malloc is not M_ZERO — a garbage nonzero
+				   here makes the entry permanently invisible
+				   to checkpoints (born "draining") */
 	e->name_len        = namelen;
 	memcpy(e->name, name, namelen);
 
@@ -14579,17 +14648,51 @@ tessera_fs_dirent_log_checkpoint_parent(struct tessera_mount *tmp_,
 		logcap = tmp_->dirent_log_count;
 	logents = malloc(logcap * sizeof *logents, M_TESSERA, M_WAITOK);
 
+	/* Serialize same-parent checkpoints. Callers arrive under
+	 * DIFFERENT locks (flush under the gate; readdir/rmdir/rename
+	 * under a vnode lock), so two rebuilds of the same parent can
+	 * otherwise interleave read-modify-write on its manifest and the
+	 * loser's batch is silently lost. Wait, don't skip — the
+	 * semantic callers (rmdir empty-check, readdir) need the log
+	 * drained when we return. */
+	struct tessera_ckpt_busy busy = { .parent_inode_no = parent_inode_no };
 	mtx_lock(&tmp_->flush_mtx);
+	for (;;) {
+		struct tessera_ckpt_busy *cb;
+		int found = 0;
+		LIST_FOREACH(cb, &tmp_->ckpt_busy, link) {
+			if (cb->parent_inode_no == parent_inode_no) {
+				found = 1;
+				break;
+			}
+		}
+		if (!found)
+			break;
+		(void)msleep(&tmp_->ckpt_busy, &tmp_->flush_mtx, PRIBIO,
+		    "tessckpt", 0);
+	}
+	LIST_INSERT_HEAD(&tmp_->ckpt_busy, &busy, link);
+
+	/* Publish-in-place (design rule; this was pattern instance #5):
+	 * MARK the batch draining but leave every entry linked and
+	 * visible — detaching here made freshly-created names invisible
+	 * to lookups for the whole rebuild (tar hard-link "target does
+	 * not exist"), and the old failure path then FREED the detached
+	 * entries, losing the dirents permanently. Entries appended
+	 * after this scan keep draining==0, stay out of this batch, and
+	 * win log lookups by higher seq. */
 	uint32_t b = parent_inode_no & (TESSERA_DIRENT_LOG_BUCKETS - 1u);
-	struct tessera_dirent_log_entry *e, *next;
-	LIST_FOREACH_SAFE(e, &tmp_->dirent_log[b], link, next) {
+	struct tessera_dirent_log_entry *e;
+	LIST_FOREACH(e, &tmp_->dirent_log[b], link) {
 		if (e->parent_inode_no != parent_inode_no) continue;
+		if (e->draining) continue;	/* impossible once serialized;
+						   belt-and-suspenders */
 		if (logcount == logcap) {
 			/* Rare: entries were appended after we sized the
 			 * buffer. Grow with M_NOWAIT — sleeping under
 			 * flush_mtx would deadlock. If it fails, stop
-			 * collecting; the remaining entries stay in the log
-			 * and are picked up by the next checkpoint (seq
+			 * collecting; the remaining entries stay live and
+			 * are picked up by the next checkpoint (seq
 			 * order is preserved across batches). */
 			uint32_t nc = logcap * 2;
 			struct tessera_dirent_log_entry **nx =
@@ -14600,13 +14703,24 @@ tessera_fs_dirent_log_checkpoint_parent(struct tessera_mount *tmp_,
 			logents = nx;
 			logcap = nc;
 		}
+		e->draining = 1;
+		/* dirent_log_count is TRIGGER accounting ("entries still
+		 * needing checkpoint"), not visibility — decrement at mark
+		 * time or every publish inside the rebuild below sees
+		 * count>threshold and fires a synchronous flush →
+		 * checkpoint_all → nested rebuild storm (live-lock; the
+		 * pre-fix detach dropped the count here for the same
+		 * reason). The entry itself stays linked and visible. */
+		tmp_->dirent_log_count--;
 		logents[logcount++] = e;
-		LIST_REMOVE(e, link);
 	}
-	tmp_->dirent_log_count -= logcount;
 	mtx_unlock(&tmp_->flush_mtx);
 
 	if (logcount == 0) {
+		mtx_lock(&tmp_->flush_mtx);
+		LIST_REMOVE(&busy, link);
+		wakeup(&tmp_->ckpt_busy);
+		mtx_unlock(&tmp_->flush_mtx);
 		free(logents, M_TESSERA);
 		return (0);
 	}
@@ -14753,11 +14867,77 @@ out_free_col:
 	free(col.hashes, M_TESSERA); free(col.inos, M_TESSERA);
 	free(col.names,  M_TESSERA); free(col.nlens, M_TESSERA);
 out_free:
-	for (uint32_t i = 0; i < logcount; i++)
-		free(logents[i], M_TESSERA);
+	/* Only NOW (new root live in the inode, or rebuild failed) does
+	 * the batch leave the log. Success: unlink + free — lookups no
+	 * longer need the entries, the btree covers them. Failure: clear
+	 * draining so the entries stay visible and the next checkpoint
+	 * retries them — freeing here would permanently lose the dirents
+	 * (the #19 drain-free lesson). */
+	mtx_lock(&tmp_->flush_mtx);
+	if (rc == 0) {
+		for (uint32_t i = 0; i < logcount; i++)
+			LIST_REMOVE(logents[i], link);
+	} else {
+		for (uint32_t i = 0; i < logcount; i++) {
+			logents[i]->draining = 0;
+			tmp_->dirent_log_count++;	/* back into trigger
+							   accounting for retry */
+		}
+		if (tessera_stat_ckpt_fail++ % 64 == 0)
+			printf("tessera_fs: dirent checkpoint parent=%u "
+			    "FAILED rc=%d (%u entries kept for retry, "
+			    "fail #%lu)\n", parent_inode_no, rc, logcount,
+			    tessera_stat_ckpt_fail);
+	}
+	LIST_REMOVE(&busy, link);
+	wakeup(&tmp_->ckpt_busy);
+	mtx_unlock(&tmp_->flush_mtx);
+	if (rc == 0) {
+		for (uint32_t i = 0; i < logcount; i++)
+			free(logents[i], M_TESSERA);
+	}
 	free(logents, M_TESSERA);
 	return (rc);
 }
+
+/* Debug: dump live dirent-log state to console (read the sysctl). */
+static int
+tessera_sysctl_dlog_dump(SYSCTL_HANDLER_ARGS)
+{
+	struct tessera_mount *tmp_ = tessera_debug_mount;
+	int v = 0;
+	int err = sysctl_handle_int(oidp, &v, 0, req);
+	if (err != 0 || req->newptr == NULL || tmp_ == NULL ||
+	    !tmp_->dirty_init)
+		return (err);
+	uint32_t tot = 0, drain = 0, top_par = 0, top_n = 0;
+	uint32_t pars[64]; uint32_t parn[64]; uint32_t np = 0;
+	mtx_lock(&tmp_->flush_mtx);
+	for (uint32_t b = 0; b < TESSERA_DIRENT_LOG_BUCKETS; b++) {
+		struct tessera_dirent_log_entry *e;
+		LIST_FOREACH(e, &tmp_->dirent_log[b], link) {
+			tot++;
+			if (e->draining) drain++;
+			uint32_t i;
+			for (i = 0; i < np; i++)
+				if (pars[i] == e->parent_inode_no) break;
+			if (i < np)
+				parn[i]++;
+			else if (np < 64) { pars[np] = e->parent_inode_no; parn[np] = 1; np++; }
+		}
+	}
+	uint32_t counter = tmp_->dirent_log_count;
+	mtx_unlock(&tmp_->flush_mtx);
+	for (uint32_t i = 0; i < np; i++)
+		if (parn[i] > top_n) { top_n = parn[i]; top_par = pars[i]; }
+	printf("tessera_fs: dlog-dump counter=%u actual=%u draining=%u "
+	    "parents>=%u top=%u(%u entries)\n", counter, tot, drain, np,
+	    top_par, top_n);
+	return (0);
+}
+SYSCTL_PROC(_kern_tessera, OID_AUTO, dlog_dump,
+    CTLTYPE_INT | CTLFLAG_RW, NULL, 0, tessera_sysctl_dlog_dump, "I",
+    "Dump dirent-log state to console");
 
 /* Walk every bucket; checkpoint each unique parent_inode_no found.
  * Used by tessera_fs_flush before commit_sb. */
