@@ -179,6 +179,8 @@ enum tessera_prof_phase {
 	TPROF_U_PREP, TPROF_U_MOVE, TPROF_U_FALLBK,
 	TPROF_C_PRECHK, TPROF_C_PENDPUT, TPROF_C_INOPUT, TPROF_C_SERIAL,
 	TPROF_C_REAPWAIT,
+	TPROF_SB_FSYNC, TPROF_SB_BAR1, TPROF_SB_JREC, TPROF_SB_SBW,
+	TPROF_SB_BAR2, TPROF_SB_SNAP, TPROF_C_COMMIT,
 	TPROF_NPHASE
 };
 static unsigned long tessera_prof_ns[TPROF_NPHASE];
@@ -223,6 +225,13 @@ TPROF_SYSCTL(c_pendput,    TPROF_C_PENDPUT,    "publish commit: pending_put");
 TPROF_SYSCTL(c_inoput,     TPROF_C_INOPUT,     "publish commit: inode get+put");
 TPROF_SYSCTL(c_serial,     TPROF_C_SERIAL,     "drain sweep: serial (non-INLINE) drain_dc");
 TPROF_SYSCTL(c_reapwait,   TPROF_C_REAPWAIT,   "drain sweep: blocked waiting for workers");
+TPROF_SYSCTL(sb_fsync,     TPROF_SB_FSYNC,     "commit_sb: devvp VOP_FSYNC (bdwrite push)");
+TPROF_SYSCTL(sb_bar1,      TPROF_SB_BAR1,      "commit_sb: barrier #1");
+TPROF_SYSCTL(sb_jrec,      TPROF_SB_JREC,      "commit_sb: journal root-update record");
+TPROF_SYSCTL(sb_sbw,       TPROF_SB_SBW,       "commit_sb: SB-A/B sector writes");
+TPROF_SYSCTL(sb_bar2,      TPROF_SB_BAR2,      "commit_sb: barrier #2 + checkpoint");
+TPROF_SYSCTL(sb_snap,      TPROF_SB_SNAP,      "commit_sb: snapshot record + retention");
+TPROF_SYSCTL(c_commit,     TPROF_C_COMMIT,     "parallel drain: serial commit of prepared jobs");
 
 /* v2 slice-4 debug tooling: meta-reserve trace ring. Records every
  * meta_alloc / meta_free / drain-* event with (op, sector, gen, count)
@@ -4905,6 +4914,7 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 {
 	tessera_stat_sb_commits++;
 	tmp_->sb.generation++;
+	sbintime_t _sbt = TPROF_T0();
 
 	/* v2 snapshots: append a record for the about-to-commit gen
 	 * BEFORE writing the SB. The record references the same roots
@@ -5015,6 +5025,8 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 		}
 	}
 
+	TPROF_ADD(TPROF_SB_SNAP, _sbt);
+
 	/* Persist dirty quota domains to the on-disk tree (tessera-quotas.md
 	 * §5.5). Done HERE — before the barrier + journal — so the quota-tree
 	 * sectors are durable and sb.quota_tree_root is current when the
@@ -5054,11 +5066,13 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 	 * Ordering this BEFORE the journal record + SB write is what keeps
 	 * crash-consistency: the data/btree sectors the new roots reference
 	 * are on stable storage before any committed pointer to them is. */
+	_sbt = TPROF_T0();
 	if (tmp_->devvp != NULL) {
 		vn_lock(tmp_->devvp, LK_EXCLUSIVE | LK_RETRY);
 		(void)VOP_FSYNC(tmp_->devvp, MNT_WAIT, curthread);
 		VOP_UNLOCK(tmp_->devvp);
 	}
+	TPROF_ADD(TPROF_SB_FSYNC, _sbt);
 
 	/* Barrier #1: ensure all prior pack/btree/manifest writes are
 	 * durable on the host file BEFORE we write the journal record
@@ -5067,8 +5081,11 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 	 * would have replay re-applying a record whose payload references
 	 * sectors that don't have the right contents. (No-op fast path
 	 * if cp is NULL.) */
+	_sbt = TPROF_T0();
 	tessera_kbio_barrier(&tmp_->bio_ctx);
+	TPROF_ADD(TPROF_SB_BAR1, _sbt);
 
+	_sbt = TPROF_T0();
 	if (tmp_->journal != NULL) {
 		uint64_t tx;
 		if (tessera_journal_tx_begin(tmp_->journal, &tx,
@@ -5088,6 +5105,7 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 			(void)tessera_journal_tx_commit(tmp_->journal, tx);
 		}
 	}
+	TPROF_ADD(TPROF_SB_JREC, _sbt);
 
 	/* Crash-injection knob: simulate the journal-tx-committed-but-SB-
 	 * write-failed window that replay-on-mount is supposed to cover.
@@ -5105,6 +5123,7 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 	/* Heap-allocated — sector-sized array on the stack would risk
 	 * kstack overflow when commit_sb is called from a deep frame
 	 * (e.g., mount-time GC: mountfs → gc_data_zone → commit_sb). */
+	_sbt = TPROF_T0();
 	uint8_t *buf = malloc(TESSERA_SECTOR_SIZE, M_TESSERA, M_WAITOK | M_ZERO);
 	if (tessera_encode_superblock(&tmp_->sb, buf) != TESSERA_OK) {
 		free(buf, M_TESSERA);
@@ -5119,6 +5138,7 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 		return (EIO);
 	}
 	free(buf, M_TESSERA);
+	TPROF_ADD(TPROF_SB_SBW, _sbt);
 
 	/* Barrier #2: ensure SB-A and SB-B are both durable on the host
 	 * file BEFORE journal_checkpoint advances head=tail=1, retiring
@@ -5127,6 +5147,7 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 	 * RAM) and the checkpoint write (also in qemu RAM, but it's the
 	 * later sector so qemu may flush it first) leaves disk with an
 	 * empty journal AND a stale on-disk SB — unrecoverable state. */
+	_sbt = TPROF_T0();
 	tessera_kbio_barrier(&tmp_->bio_ctx);
 
 	/* SB durably advanced. The journal record we just appended is now
@@ -5136,6 +5157,7 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 	 * `record.gen > sb.gen` so the already-applied record is skipped. */
 	if (tmp_->journal != NULL)
 		(void)tessera_journal_checkpoint(tmp_->journal);
+	TPROF_ADD(TPROF_SB_BAR2, _sbt);
 
 	/* The new SB is durable, so the OLD SB no longer references any
 	 * of the meta-reserve sectors freed during this commit cycle.
@@ -7341,6 +7363,7 @@ static int
 tessera_fs_dc_prep_commit(struct tessera_mount *tmp_,
                           struct tessera_dc_prep *j)
 {
+	sbintime_t _ct0 = TPROF_T0();
 	int last = 0;
 	for (int i = 0; i < j->n; i++) {
 		struct tessera_dirty_content *dc = j->it[i].dc;
@@ -7389,6 +7412,7 @@ tessera_fs_dc_prep_commit(struct tessera_mount *tmp_,
 		last = rc;
 	}
 	j->n = 0;
+	TPROF_ADD(TPROF_C_COMMIT, _ct0);
 	return (last);
 }
 
