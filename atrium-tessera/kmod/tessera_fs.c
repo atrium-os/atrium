@@ -3093,6 +3093,19 @@ tessera_statfs_impl(struct mount *mp, struct statfs *sbp)
 	uint64_t free_data = (tmp_->extent_alloc != NULL)
 	    ? tessera_extent_free_blocks(tmp_->extent_alloc)
 	    : tmp_->sb.pack_zone_length;
+	/* Pessimistic-reservation view: bytes buffered in RAM (dirty
+	 * content + pending manifests) are admitted against future
+	 * sectors — show them as unavailable so df and the admission
+	 * check (tessera_fs_space_admit) agree. Dedup at publish gives
+	 * the difference back automatically. */
+	{
+		mtx_lock(&tmp_->flush_mtx);
+		uint64_t resv = (tmp_->dirty_content_bytes +
+		    tmp_->pending_manifest_bytes +
+		    TESSERA_SECTOR_SIZE - 1) / TESSERA_SECTOR_SIZE;
+		mtx_unlock(&tmp_->flush_mtx);
+		free_data = (free_data > resv) ? free_data - resv : 0;
+	}
 	sbp->f_bfree  = free_data;
 	sbp->f_bavail = free_data;
 	/* Quota-scoped statfs (tessera-quotas.md §3.6): inside a quota'd
@@ -7107,6 +7120,41 @@ tessera_fs_window_publish(struct tessera_mount *tmp_, uint32_t inode_no)
 	return (rc);
 }
 
+/* ── Pessimistic space admission (Option C groundwork) ──────────
+ *
+ * Writers buffer into RAM caches and publish later (flush side), so
+ * ENOSPC must be decided at write() time, not discovered at drain
+ * (the #19 lesson: late ENOSPC once meant silent data loss). The
+ * reservation ledger IS the existing RAM accounting —
+ * dirty_content_bytes + pending_manifest_bytes are exactly the bytes
+ * not yet backed by allocated sectors. Admission compares that
+ * worst-case demand (dedup may consume less; the "refund" is
+ * automatic because a deduped publish never decrements the allocator
+ * while the retire drops the RAM bytes) against the live extent-
+ * allocator free count, minus slack for pack/manifest framing and
+ * the flush's own metadata appetite.
+ *
+ * flush_mtx held. The free-count read is approximate (the flush
+ * mutates the allocator under the gate, not flush_mtx) — an aligned
+ * u64 load is atomic on every target and the slack absorbs the
+ * skew. */
+static int
+tessera_fs_space_admit(struct tessera_mount *tmp_, size_t delta_bytes)
+{
+	mtx_assert(&tmp_->flush_mtx, MA_OWNED);
+	if (tmp_->extent_alloc == NULL)
+		return (0);      /* degraded mount; drain-time ENOSPC path */
+	uint64_t free_sec = tessera_extent_free_blocks(tmp_->extent_alloc);
+	uint64_t slack = tmp_->sb.pack_zone_length / 64;
+	if (slack < 1024) slack = 1024;
+	uint64_t need = (tmp_->dirty_content_bytes +
+	    tmp_->pending_manifest_bytes + delta_bytes +
+	    TESSERA_SECTOR_SIZE - 1) / TESSERA_SECTOR_SIZE;
+	if (free_sec < need + slack)
+		return (ENOSPC);
+	return (0);
+}
+
 /* Append-window write (large sequential appends). Buffers a pure append
  * [write_off, write_off+len) into a per-inode sliding window and flushes
  * it (publish via append) once it reaches tessera_append_window_bytes —
@@ -7161,6 +7209,13 @@ tessera_fs_dirty_content_append(struct tessera_mount *tmp_, uint32_t inode_no,
 			return (tessera_fs_dirty_content_append(tmp_, inode_no,
 			    write_off, bytes, len));
 		}
+		{
+			int _sperr = tessera_fs_space_admit(tmp_, len);
+			if (_sperr != 0) {
+				mtx_unlock(&tmp_->flush_mtx);
+				return (_sperr);
+			}
+		}
 		memcpy(dc->bytes + dc->size, bytes, len);
 		dc->size  += len;
 		dc->dirty  = 1;
@@ -7197,6 +7252,14 @@ tessera_fs_dirty_content_append(struct tessera_mount *tmp_, uint32_t inode_no,
 		tessera_fs_dirty_content_free(ndc);
 		return (tessera_fs_dirty_content_append(tmp_, inode_no,
 		    write_off, bytes, len));
+	}
+	{
+		int _sperr = tessera_fs_space_admit(tmp_, ndc->size);
+		if (_sperr != 0) {
+			mtx_unlock(&tmp_->flush_mtx);
+			tessera_fs_dirty_content_free(ndc);
+			return (_sperr);
+		}
 	}
 	uint32_t b = inode_no & (TESSERA_DIRTY_CONTENT_BUCKETS - 1u);
 	LIST_INSERT_HEAD(&tmp_->dirty_content[b], ndc, link);
@@ -7871,8 +7934,16 @@ tessera_fs_dirty_content_write_uio(struct tessera_mount *tmp_,
 	size_t new_size = (size_t)(write_off + write_len) > dc->size
 	    ? (size_t)(write_off + write_len) : dc->size;
 	if (new_size > final_size) new_size = final_size;
-	if (new_size > dc->size)
+	if (new_size > dc->size) {
+		int _sperr = tessera_fs_space_admit(tmp_,
+		    new_size - dc->size);
+		if (_sperr != 0) {
+			mtx_unlock(&tmp_->flush_mtx);
+			rc = _sperr;
+			goto out;
+		}
 		tmp_->dirty_content_bytes += (new_size - dc->size);
+	}
 	dc->size  = new_size;
 	dc->dirty = 1;
 	tessera_stat_dirty_content_hits++;
@@ -7996,8 +8067,15 @@ tessera_fs_dirty_content_write_inner(struct tessera_mount *tmp_,
 		size_t new_size = (size_t)(write_off + write_len) > dc->size
 		    ? (size_t)(write_off + write_len) : dc->size;
 		if (new_size > final_size) new_size = final_size;
-		if (new_size > dc->size)
+		if (new_size > dc->size) {
+			int _sperr = tessera_fs_space_admit(tmp_,
+			    new_size - dc->size);
+			if (_sperr != 0) {
+				mtx_unlock(&tmp_->flush_mtx);
+				return (_sperr);
+			}
 			tmp_->dirty_content_bytes += (new_size - dc->size);
+		}
 		dc->size  = new_size;
 		dc->dirty = 1;
 		tessera_stat_dirty_content_hits++;
@@ -8071,6 +8149,14 @@ tessera_fs_dirty_content_write_inner(struct tessera_mount *tmp_,
 		tessera_fs_dirty_content_free(ndc);
 		return (tessera_fs_dirty_content_write(tmp_, inode_no,
 		    write_off, new_bytes, write_len, final_size));
+	}
+	{
+		int _sperr = tessera_fs_space_admit(tmp_, ndc->size);
+		if (_sperr != 0) {
+			mtx_unlock(&tmp_->flush_mtx);
+			tessera_fs_dirty_content_free(ndc);
+			return (_sperr);
+		}
 	}
 	uint32_t b = inode_no & (TESSERA_DIRTY_CONTENT_BUCKETS - 1u);
 	LIST_INSERT_HEAD(&tmp_->dirty_content[b], ndc, link);
