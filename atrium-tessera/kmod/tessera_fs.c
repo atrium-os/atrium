@@ -3476,7 +3476,12 @@ tessera_vop_getattr(struct vop_getattr_args *ap)
 	VATTR_NULL(vap);
 	vap->va_fsid      = vp->v_mount->mnt_stat.f_fsid.val[0];
 	vap->va_fileid    = tn->inode_no;
-	vap->va_blocksize = TESSERA_SECTOR_SIZE;
+	/* st_blksize drives userland I/O sizing (stdio, cp, dd defaults).
+	 * 128 KiB matches ZFS practice and our chunk tier; reporting the
+	 * 4 KiB sector made tools that honor the INPUT blksize read in
+	 * droplets. (FreeBSD cat sizes its buffer from the OUTPUT fd, so
+	 * `cat > /dev/null` reads 4 KiB regardless — bench with dd/cp.) */
+	vap->va_blocksize = 128u * 1024u;
 
 	/* v2 slice-3: magic-dir vnodes (`.tessera`, `.tessera/snapshots`)
 	 * have no on-disk inode. Synthesize stable read-only-dir attrs. */
@@ -6748,7 +6753,12 @@ SYSCTL_PROC(_kern_tessera, OID_AUTO, hash_bench,
     "prints MB/s for both to console");
 
 /* Tier A — location entries. Default 16384 entries (~1 MiB). */
-static unsigned long tessera_cas_loc_max = 16384;
+/* Sized so a base-system-scale tree (~45k blobs) fits: a loc-cache
+ * miss falls back to a LINEAR pack-registry scan + per-pack index
+ * probe — a cold tree walk that overflows this cache degrades to
+ * O(N_packs) per fetch (measured: 22k registry-cursor ops/s). ~150B
+ * per entry. */
+static unsigned long tessera_cas_loc_max = 65536;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_loc_max, CTLFLAG_RW,
     &tessera_cas_loc_max, 0,
     "Max number of CAS location entries (LRU-evicted past this)");
