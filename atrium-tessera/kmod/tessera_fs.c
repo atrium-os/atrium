@@ -180,7 +180,8 @@ enum tessera_prof_phase {
 	TPROF_C_PRECHK, TPROF_C_PENDPUT, TPROF_C_INOPUT, TPROF_C_SERIAL,
 	TPROF_C_REAPWAIT,
 	TPROF_SB_FSYNC, TPROF_SB_BAR1, TPROF_SB_JREC, TPROF_SB_SBW,
-	TPROF_SB_BAR2, TPROF_SB_SNAP, TPROF_C_COMMIT,
+	TPROF_SB_BAR2, TPROF_SB_SNAP, TPROF_C_COMMIT, TPROF_C_REGPUT,
+	TPROF_C_PACKW,
 	TPROF_NPHASE
 };
 static unsigned long tessera_prof_ns[TPROF_NPHASE];
@@ -232,6 +233,8 @@ TPROF_SYSCTL(sb_sbw,       TPROF_SB_SBW,       "commit_sb: SB-A/B sector writes"
 TPROF_SYSCTL(sb_bar2,      TPROF_SB_BAR2,      "commit_sb: barrier #2 + checkpoint");
 TPROF_SYSCTL(sb_snap,      TPROF_SB_SNAP,      "commit_sb: snapshot record + retention");
 TPROF_SYSCTL(c_commit,     TPROF_C_COMMIT,     "parallel drain: serial commit of prepared jobs");
+TPROF_SYSCTL(c_regput,     TPROF_C_REGPUT,     "publish: pack-registry btree_put");
+TPROF_SYSCTL(c_packw,      TPROF_C_PACKW,      "publish: pack byte writes (delayed)");
 
 /* v2 slice-4 debug tooling: meta-reserve trace ring. Records every
  * meta_alloc / meta_free / drain-* event with (op, sector, gen, count)
@@ -1166,6 +1169,12 @@ struct tessera_pending_manifest {
  * struct (flexible array). seq is monotonic — most-recent entries
  * have the highest seq, used for read-side ordering when multiple
  * ops touch the same name (ADD-then-REMOVE-then-ADD etc.). */
+struct tessera_reg_ov {
+	LIST_ENTRY(tessera_reg_ov) link;
+	uint8_t pack_id[16];
+	uint8_t val[TESSERA_REGISTRY_ENTRY_SIZE];
+};
+
 struct tessera_ckpt_busy {
 	LIST_ENTRY(tessera_ckpt_busy) link;
 	uint32_t parent_inode_no;
@@ -1554,6 +1563,15 @@ struct tessera_mount {
 #define TESSERA_DIRENT_LOG_BUCKETS  4096u
 	LIST_HEAD(, tessera_dirent_log_entry)
 	    dirent_log[TESSERA_DIRENT_LOG_BUCKETS];
+	/* Pack-registry RAM overlay (Option D part 2): appended by
+	 * publishes (gate-held), consulted by registry gets on lookup,
+	 * batch-put into the btree in ONE sorted pass before
+	 * commit_extent/commit_sb. Crash-consistency unchanged (registry
+	 * btree writes were RAM-until-commit anyway); a failed batch-put
+	 * keeps the overlay and retries. flush_mtx protected. */
+	LIST_HEAD(, tessera_reg_ov) reg_ov[64];
+	uint32_t                  reg_ov_count;
+
 	/* Parents with a dirent-log checkpoint in flight. Serializes
 	 * same-parent checkpoints (flush vs readdir/rmdir/rename callers
 	 * hold different locks): without this, two rebuilds race
@@ -1632,6 +1650,135 @@ struct tessera_mount {
 	struct tessera_btree     *quota_tree;
 	int                       quota_dirty;
 };
+/* Pack-registry overlay ops (Option D part 2). Publishes APPEND here
+ * instead of walking the btree; the flush batch-puts the whole
+ * overlay sorted in one COW pass. Replace-on-equal keeps dedup
+ * re-publishes of an identical pack_id idempotent. */
+static uint32_t
+tessera_reg_ov_bucket(const uint8_t *pack_id)
+{
+	return ((uint32_t)pack_id[0] | ((uint32_t)pack_id[1] << 8)) & 63u;
+}
+
+static int
+tessera_fs_registry_put_pending(struct tessera_mount *tmp_,
+    const uint8_t *pack_id, const void *value)
+{
+	sbintime_t _t0 = TPROF_T0();
+	struct tessera_reg_ov *ov = malloc(sizeof *ov, M_TESSERA, M_WAITOK);
+	memcpy(ov->pack_id, pack_id, 16);
+	memcpy(ov->val, value, TESSERA_REGISTRY_ENTRY_SIZE);
+	uint32_t b = tessera_reg_ov_bucket(pack_id);
+	mtx_lock(&tmp_->flush_mtx);
+	struct tessera_reg_ov *e;
+	LIST_FOREACH(e, &tmp_->reg_ov[b], link) {
+		if (memcmp(e->pack_id, pack_id, 16) == 0) {
+			memcpy(e->val, value, TESSERA_REGISTRY_ENTRY_SIZE);
+			mtx_unlock(&tmp_->flush_mtx);
+			free(ov, M_TESSERA);
+			TPROF_ADD(TPROF_C_REGPUT, _t0);
+			return (TESSERA_OK);
+		}
+	}
+	LIST_INSERT_HEAD(&tmp_->reg_ov[b], ov, link);
+	tmp_->reg_ov_count++;
+	mtx_unlock(&tmp_->flush_mtx);
+	TPROF_ADD(TPROF_C_REGPUT, _t0);
+	return (TESSERA_OK);
+}
+
+/* Overlay-aware registry lookup: overlay first (newest state), then
+ * the btree. Every kmod registry get must come through here while
+ * the overlay can be non-empty. */
+static int
+tessera_fs_registry_get(struct tessera_mount *tmp_,
+    const uint8_t *pack_id, void *out_value)
+{
+	if (tmp_->flush_mtx_init) {
+		uint32_t b = tessera_reg_ov_bucket(pack_id);
+		mtx_lock(&tmp_->flush_mtx);
+		struct tessera_reg_ov *e;
+		LIST_FOREACH(e, &tmp_->reg_ov[b], link) {
+			if (memcmp(e->pack_id, pack_id, 16) == 0) {
+				memcpy(out_value, e->val,
+				    TESSERA_REGISTRY_ENTRY_SIZE);
+				mtx_unlock(&tmp_->flush_mtx);
+				return (TESSERA_OK);
+			}
+		}
+		mtx_unlock(&tmp_->flush_mtx);
+	}
+	return (tessera_btree_get(tmp_->pack_registry_tree, pack_id,
+	    out_value));
+}
+
+/* Flush-side: sorted-batch-put the overlay into the registry btree
+ * and clear it. Gate held; publishes (the only appenders) are also
+ * gate-holders, so the overlay is stable here. Atomic: failure keeps
+ * the overlay (reads stay correct through it) and the old root;
+ * retried next flush. */
+static int
+tessera_fs_registry_ov_flush(struct tessera_mount *tmp_)
+{
+	if (tmp_->reg_ov_count == 0 || tmp_->pack_registry_tree == NULL)
+		return (0);
+	sbintime_t _t0 = TPROF_T0();
+	uint32_t n = tmp_->reg_ov_count;
+	uint8_t *keys = malloc((size_t)n * 16, M_TESSERA, M_WAITOK);
+	uint8_t *vals = malloc((size_t)n * TESSERA_REGISTRY_ENTRY_SIZE,
+	    M_TESSERA, M_WAITOK);
+	struct tessera_reg_ov **ents = malloc((size_t)n * sizeof *ents,
+	    M_TESSERA, M_WAITOK);
+	uint32_t cnt = 0;
+	mtx_lock(&tmp_->flush_mtx);
+	for (uint32_t b = 0; b < 64 && cnt < n; b++) {
+		struct tessera_reg_ov *e;
+		LIST_FOREACH(e, &tmp_->reg_ov[b], link) {
+			if (cnt >= n)
+				break;
+			ents[cnt++] = e;
+		}
+	}
+	mtx_unlock(&tmp_->flush_mtx);
+	for (uint32_t i = 1; i < cnt; i++) {
+		struct tessera_reg_ov *cur = ents[i];
+		int32_t j = (int32_t)i - 1;
+		while (j >= 0 && memcmp(ents[j]->pack_id, cur->pack_id,
+		    16) > 0) {
+			ents[j + 1] = ents[j];
+			j--;
+		}
+		ents[j + 1] = cur;
+	}
+	for (uint32_t i = 0; i < cnt; i++) {
+		memcpy(keys + (size_t)i * 16, ents[i]->pack_id, 16);
+		memcpy(vals + (size_t)i * TESSERA_REGISTRY_ENTRY_SIZE,
+		    ents[i]->val, TESSERA_REGISTRY_ENTRY_SIZE);
+	}
+	uint64_t root = tmp_->sb.pack_registry_root;
+	int rc = tessera_btree_put_sorted_batch(tmp_->pack_registry_tree,
+	    keys, vals, cnt, &root);
+	if (rc == TESSERA_OK) {
+		tmp_->sb.pack_registry_root = root;
+		mtx_lock(&tmp_->flush_mtx);
+		for (uint32_t i = 0; i < cnt; i++) {
+			LIST_REMOVE(ents[i], link);
+			tmp_->reg_ov_count--;
+		}
+		mtx_unlock(&tmp_->flush_mtx);
+		for (uint32_t i = 0; i < cnt; i++)
+			free(ents[i], M_TESSERA);
+	} else {
+		printf("tessera_fs: registry overlay batch-put of %u "
+		    "failed rc=%d - kept for retry\n", cnt, rc);
+	}
+	free(keys, M_TESSERA);
+	free(vals, M_TESSERA);
+	free(ents, M_TESSERA);
+	TPROF_ADD(TPROF_C_REGPUT, _t0);
+	return (rc == TESSERA_OK ? 0 : EIO);
+}
+
 /* Manifest builder pre-set to the volume's hash_alg so finalize's
  * out_hash matches the volume's content addressing. Every kmod
  * manifest build must come through here, not tessera_manifest_begin. */
@@ -2080,6 +2227,9 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	for (uint32_t _b = 0; _b < TESSERA_DIRENT_LOG_BUCKETS; _b++)
 		LIST_INIT(&tmp_->dirent_log[_b]);
 	LIST_INIT(&tmp_->ckpt_busy);
+	for (uint32_t _b = 0; _b < 64; _b++)
+		LIST_INIT(&tmp_->reg_ov[_b]);
+	tmp_->reg_ov_count = 0;
 	for (uint32_t _b = 0; _b < TESSERA_DIRTY_CONTENT_BUCKETS; _b++)
 		LIST_INIT(&tmp_->dirty_content[_b]);
 	tmp_->dirty_content_bytes = 0;
@@ -2730,6 +2880,19 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 		if (tmp_->flush_tq != NULL) {
 			taskqueue_free(tmp_->flush_tq);
 			tmp_->flush_tq = NULL;
+		}
+		/* Registry overlay: empty after the final flush; free
+		 * defensively (forced unmount after a failed flush may
+		 * leave entries — their packs are on disk but never
+		 * became reachable, which fsck reports as unreferenced
+		 * space, not corruption). */
+		for (uint32_t _b = 0; _b < 64; _b++) {
+			while (!LIST_EMPTY(&tmp_->reg_ov[_b])) {
+				struct tessera_reg_ov *_e =
+				    LIST_FIRST(&tmp_->reg_ov[_b]);
+				LIST_REMOVE(_e, link);
+				free(_e, M_TESSERA);
+			}
 		}
 		/* Prepare pool: the final flush above was its last user;
 		 * taskqueue_free drains the workers before freeing. */
@@ -6286,7 +6449,7 @@ tessera_fs_pending_manifests_drain(struct tessera_mount *tmp_)
 			uint8_t dedup_reg[TESSERA_REGISTRY_ENTRY_SIZE];
 			if (tessera_cas_loc_lookup(&tmp_->cas_cache, e->hash,
 			    &snap_dummy) &&
-			    tessera_btree_get(tmp_->pack_registry_tree,
+			    tessera_fs_registry_get(tmp_,
 			        snap_dummy.pack_id, dedup_reg) == TESSERA_OK) {
 				tessera_stat_aggregation_dedups++;
 				mtx_lock(&tmp_->flush_mtx);
@@ -8725,6 +8888,20 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 			    r, tmp_->flush_unmounting, tmp_->sb_dirty);
 	}
 	if (r == 0) {
+		/* Registry overlay -> btree, one sorted batch pass. MUST
+		 * precede commit_extent/commit_sb so the committed
+		 * pack_registry_root names every pack published this
+		 * flush (data-before-pointer). Failure keeps the overlay
+		 * (reads stay correct through it) and aborts the commit;
+		 * retried next flush. */
+		int rov = tessera_fs_registry_ov_flush(tmp_);
+		if (rov != 0) {
+			printf("tessera_fs: flush — registry overlay "
+			    "flush failed: %d\n", rov);
+			r = rov;
+		}
+	}
+	if (r == 0) {
 		_tp = TPROF_T0();
 		int rce = tessera_commit_extent(tmp_);
 		TPROF_ADD(TPROF_FL_EXTENT, _tp);
@@ -9475,7 +9652,7 @@ retry_reloc:
 				 * entry by pack_id (O(log N)) and resolve
 				 * extents. Still much cheaper than scanning. */
 				uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
-				if (tessera_btree_get(tmp_->pack_registry_tree,
+				if (tessera_fs_registry_get(tmp_,
 				    snap.pack_id, reg_value) != TESSERA_OK)
 					goto cas_fast_miss; /* stale entry */
 				tessera_registry_entry_t re;
@@ -10078,7 +10255,7 @@ tessera_fs_publish_manifest_owned_ex(struct tessera_mount *tmp_,
 		uint8_t pack_id_local[16];
 		memcpy(pack_id_local, out_hash, 16);
 		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
-		if (tessera_btree_get(tmp_->pack_registry_tree,
+		if (tessera_fs_registry_get(tmp_,
 		    pack_id_local, reg_value) == TESSERA_OK) {
 			tessera_stat_publish_dedup_manifest++;
 			return (0);
@@ -10127,7 +10304,7 @@ tessera_fs_publish_manifest_owned_move(struct tessera_mount *tmp_,
 		uint8_t pack_id_local[16];
 		memcpy(pack_id_local, out_hash, 16);
 		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
-		if (tessera_btree_get(tmp_->pack_registry_tree,
+		if (tessera_fs_registry_get(tmp_,
 		    pack_id_local, reg_value) == TESSERA_OK) {
 			TPROF_ADD(TPROF_C_PRECHK, _tc);
 			tessera_stat_publish_dedup_manifest++;
@@ -10216,7 +10393,31 @@ struct tessera_pack_alloc_result {
  * set so the caller doesn't have to clean up.
  */
 static int
+tessera_fs_pack_alloc_and_write_impl(struct tessera_mount *tmp_,
+                                const uint8_t *pack_bytes,
+                                uint64_t n_sectors,
+                                struct tessera_pack_alloc_result *out,
+                                int contig_only);
+
+/* Timed wrapper — TPROF_C_PACKW = pack allocate+byte-write share of
+ * the commit tail (extent alloc + buffer-cache memcpy/bdwrite or the
+ * bulk GEOM path). */
+static int
 tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
+                                const uint8_t *pack_bytes,
+                                uint64_t n_sectors,
+                                struct tessera_pack_alloc_result *out,
+                                int contig_only)
+{
+	sbintime_t _t0 = TPROF_T0();
+	int rc = tessera_fs_pack_alloc_and_write_impl(tmp_, pack_bytes,
+	    n_sectors, out, contig_only);
+	TPROF_ADD(TPROF_C_PACKW, _t0);
+	return (rc);
+}
+
+static int
+tessera_fs_pack_alloc_and_write_impl(struct tessera_mount *tmp_,
                                 const uint8_t *pack_bytes,
                                 uint64_t n_sectors,
                                 struct tessera_pack_alloc_result *out,
@@ -10668,7 +10869,7 @@ tessera_fs_repack_one_pack_inner(struct tessera_mount *tmp_,
 	if (tmp_->pack_registry_tree == NULL) return (EROFS);
 
 	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
-	if (tessera_btree_get(tmp_->pack_registry_tree, pack_id, reg_value)
+	if (tessera_fs_registry_get(tmp_, pack_id, reg_value)
 	    != TESSERA_OK)
 		return (ENOENT);
 	tessera_registry_entry_t re;
@@ -10746,6 +10947,9 @@ tessera_fs_repack_one_pack_inner(struct tessera_mount *tmp_,
 		return (EIO);
 	}
 	uint64_t new_pack_root = tmp_->sb.pack_registry_root;
+	/* Repack relocation stays a DIRECT tree put: its scan cursor
+	 * reads the tree, and relocations are rare — the overlay is for
+	 * the hot publish path. */
 	if (tessera_btree_put(tmp_->pack_registry_tree, pack_id,
 	    new_value, &new_pack_root) != TESSERA_OK) {
 		/* Registry unchanged — old layout stays live; the NEW
@@ -11153,13 +11357,11 @@ tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
 		return (EIO);
 	}
 
-	uint64_t new_pack_root = tmp_->sb.pack_registry_root;
-	if (tessera_btree_put(tmp_->pack_registry_tree, pack_id, reg_value,
-	    &new_pack_root) != TESSERA_OK) {
+	if (tessera_fs_registry_put_pending(tmp_, pack_id, reg_value)
+	    != TESSERA_OK) {
 		tessera_fs_pack_alloc_rollback(tmp_, &pa);
 		return (EIO);
 	}
-	tmp_->sb.pack_registry_root = new_pack_root;
 
 	/* CAS-cache insert for the manifest blob. Single-blob pack ⇒ one
 	 * extent. Multi-extent layout (PEL) defers extent resolution to
@@ -11196,7 +11398,7 @@ tessera_fs_seed_one_constant(struct tessera_mount *tmp_,
 		uint8_t pack_id[16];
 		memcpy(pack_id, h, 16);
 		uint8_t reg[TESSERA_REGISTRY_ENTRY_SIZE];
-		if (tessera_btree_get(tmp_->pack_registry_tree, pack_id,
+		if (tessera_fs_registry_get(tmp_, pack_id,
 		    reg) != TESSERA_OK)
 			(void)tessera_fs_publish_manifest_to_disk(tmp_,
 			    buf, mlen, h);
@@ -11285,7 +11487,7 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
 	 * republish. */
 	{
 		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
-		if (tessera_btree_get(tmp_->pack_registry_tree, pack_id,
+		if (tessera_fs_registry_get(tmp_, pack_id,
 		    reg_value) == TESSERA_OK) {
 			tessera_stat_publish_dedup_manifest++;
 			return (0);
@@ -11349,13 +11551,11 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
 		return (EIO);
 	}
 
-	uint64_t new_pack_root = tmp_->sb.pack_registry_root;
-	if (tessera_btree_put(tmp_->pack_registry_tree, pack_id, reg_value,
-	    &new_pack_root) != TESSERA_OK) {
+	if (tessera_fs_registry_put_pending(tmp_, pack_id, reg_value)
+	    != TESSERA_OK) {
 		tessera_fs_pack_alloc_rollback(tmp_, &pa);
 		return (EIO);
 	}
-	tmp_->sb.pack_registry_root = new_pack_root;
 
 	/* Per-blob CAS-cache inserts. All blobs share the same physical
 	 * extents — different hash keys, same location. */
@@ -11463,13 +11663,11 @@ tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
 		return (EIO);
 	}
 
-	uint64_t new_pack_root = tmp_->sb.pack_registry_root;
-	if (tessera_btree_put(tmp_->pack_registry_tree, pack_id, reg_value,
-	    &new_pack_root) != TESSERA_OK) {
+	if (tessera_fs_registry_put_pending(tmp_, pack_id, reg_value)
+	    != TESSERA_OK) {
 		tessera_fs_pack_alloc_rollback(tmp_, &pa);
 		return (EIO);
 	}
-	tmp_->sb.pack_registry_root = new_pack_root;
 
 	/* Every blob in this pack shares the same physical extents (same
 	 * location record, different hash key). */
@@ -11527,7 +11725,7 @@ tessera_fs_publish_chunked(struct tessera_mount *tmp_,
 	 * each chunk's content stops changing. */
 	{
 		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
-		if (tessera_btree_get(tmp_->pack_registry_tree,
+		if (tessera_fs_registry_get(tmp_,
 		    pack_id, reg_value) == TESSERA_OK) {
 			tessera_stat_publish_dedup_chunked++;
 			return (0);
@@ -11590,7 +11788,7 @@ tessera_fs_publish_chunked(struct tessera_mount *tmp_,
 
 		/* Skip the write if this exact batch is already on disk. */
 		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
-		if (tessera_btree_get(tmp_->pack_registry_tree,
+		if (tessera_fs_registry_get(tmp_,
 		    batch_pack_id, reg_value) != TESSERA_OK) {
 			rc = tessera_fs_emit_chunk_pack(tmp_, batch_pack_id,
 			    &uniq[first], batch_n, NULL, 0, NULL);
