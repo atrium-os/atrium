@@ -141,7 +141,10 @@ test_sb_a_corruption(void)
 	tessera_block_io_t io = mk_io(d);
 	tessera_format_opts_t opts;
 	memset(&opts, 0, sizeof opts);
-	opts.total_sectors = 1024;
+	/* Must exceed journal + TESSERA_METADATA_ZONE_SECTORS (1024) +
+	 * room for the seed pack — 1024 total stopped being formattable
+	 * when the metadata reserve grew. */
+	opts.total_sectors = 2048;
 	opts.journal_sectors = 32;
 	CHECK(tessera_volume_format(&io, &opts) == TESSERA_OK);
 
@@ -150,7 +153,7 @@ test_sb_a_corruption(void)
 
 	tessera_volume_t *v = NULL;
 	CHECK(tessera_volume_open(&io, &v) == TESSERA_OK);
-	CHECK(tessera_volume_total_sectors(v) == 1024);
+	CHECK(tessera_volume_total_sectors(v) == 2048);
 	tessera_volume_close(v);
 	free(d);
 }
@@ -163,7 +166,7 @@ test_sb_b_corruption(void)
 	tessera_block_io_t io = mk_io(d);
 	tessera_format_opts_t opts;
 	memset(&opts, 0, sizeof opts);
-	opts.total_sectors = 1024;
+	opts.total_sectors = 2048;
 	opts.journal_sectors = 32;
 	tessera_volume_format(&io, &opts);
 
@@ -182,7 +185,7 @@ test_dual_corruption(void)
 	tessera_block_io_t io = mk_io(d);
 	tessera_format_opts_t opts;
 	memset(&opts, 0, sizeof opts);
-	opts.total_sectors = 1024;
+	opts.total_sectors = 2048;
 	opts.journal_sectors = 32;
 	tessera_volume_format(&io, &opts);
 
@@ -213,10 +216,15 @@ test_free_extent_tree_reachable(void)
 	    tessera_volume_free_extent_root(v));
 	CHECK(ea != NULL);
 
+	/* Format publishes the root dir's empty manifest into an initial
+	 * pack (5 sectors today), consumed from the front of the data
+	 * zone. Bound rather than pin the pack size so header/framing
+	 * drift doesn't rot this test again. */
 	const uint64_t metadata_end = 4 + 64 + TESSERA_METADATA_ZONE_SECTORS;
-	const uint64_t expect_free  = 4000 - metadata_end;
-	CHECK(tessera_extent_free_blocks(ea) == expect_free);
-	CHECK(tessera_extent_largest_free_run(ea) == expect_free);
+	const uint64_t zone = 4000 - metadata_end;
+	uint64_t fb = tessera_extent_free_blocks(ea);
+	CHECK(fb < zone && fb >= zone - 64);
+	CHECK(tessera_extent_largest_free_run(ea) == fb);
 
 	tessera_extent_close(ea);
 	tessera_volume_close(v);
@@ -231,7 +239,7 @@ test_inode_and_pack_roots_reachable(void)
 	tessera_block_io_t io = mk_io(d);
 	tessera_format_opts_t opts;
 	memset(&opts, 0, sizeof opts);
-	opts.total_sectors = 1024;
+	opts.total_sectors = 2048;
 	opts.journal_sectors = 32;
 	tessera_volume_format(&io, &opts);
 
@@ -260,7 +268,10 @@ test_inode_and_pack_roots_reachable(void)
 	tessera_btree_cursor_t *c2 = tessera_btree_seek_first(pack_tree);
 	CHECK(c2 != NULL);
 	uint8_t pk[16]; uint8_t pv[TESSERA_REGISTRY_ENTRY_SIZE];
-	CHECK(tessera_btree_cursor_get(c2, pk, pv) == TESSERA_ENOENT);
+	/* Format registers exactly one pack: the root dir's empty
+	 * DIRECTORY manifest. */
+	CHECK(tessera_btree_cursor_get(c2, pk, pv) == TESSERA_OK);
+	CHECK(tessera_btree_cursor_next(c2) == TESSERA_ENOENT);
 	tessera_btree_cursor_free(c2);
 	tessera_btree_close(pack_tree);
 

@@ -426,6 +426,21 @@ put_into_internal(tessera_btree_t *t, uint64_t old_sector,
 	uint64_t child_sector;
 	memcpy(&child_sector, child_entry + t->key_size, 8);
 
+	/* Maintain the documented invariant that entry[0].key is the
+	 * SMALLEST key in child 0. Routing a key below entries[0].key
+	 * descends into child 0 (leftmost-descent rule) -- without
+	 * lowering the routing key here, child 0 silently accumulates
+	 * keys below its key, and the NEXT split of child 0 then hands
+	 * this node a split_key SMALLER than entries[0].key, which the
+	 * idx+1 insertion below places out of order. An unsorted
+	 * internal node makes binary-search routing undefined: gets miss
+	 * live keys and puts create DUPLICATES in sibling leaves (found
+	 * by the batch-merge A/B test; random-keyed trees like the pack
+	 * registry were exposed in production). We are already COWing
+	 * this node, so the fix is one memcpy. */
+	if (idx == 0 && key_compare(key, child_entry, t->key_size) < 0)
+		memcpy(child_entry, key, t->key_size);
+
 	struct put_result child_res;
 	cblk = tessera_zalloc(BLOCK_SIZE);
 	if (cblk == NULL) { rc = TESSERA_ENOMEM; goto out; }
@@ -587,6 +602,279 @@ out:
 	if (lb)      tessera_free(lb);
 	if (newroot) tessera_free(newroot);
 	return rc;
+}
+
+/* ── sorted-batch put — one COW pass for k updates ───────────────────
+ *
+ * tessera_btree_put_sorted_batch(): apply n (key,value) pairs, sorted
+ * strictly ascending by key, in ONE copy-on-write pass. Semantics are
+ * identical to n sequential tessera_btree_put() calls (insert or
+ * replace), but each affected node is rewritten ONCE: a flush that
+ * drains ~1.4k dirty inodes touches ~50 contiguous leaves instead of
+ * paying 1.4k root-to-leaf COW walks (the untar commit tail).
+ *
+ * A merged node stream that overflows fanout is split into BALANCED
+ * siblings (ceil(total/fanout) nodes), and each level returns the
+ * (min_key, sector) list of its replacements; the parent splices those
+ * in place of the old child entry and merges its own level the same
+ * way. New root levels are added at the top while more than one node
+ * remains. Heap-only buffers (kmod kstack budget), same alloc/flush/
+ * free_node COW discipline as put/delete. */
+
+struct batch_repl {
+	uint8_t  *keys;      /* m × key_size — min key of each new node */
+	uint64_t *sectors;
+	uint32_t  m;
+	uint32_t  cap;
+};
+
+static void
+batch_repl_free(struct batch_repl *r)
+{
+	if (r->keys)    tessera_free(r->keys);
+	if (r->sectors) tessera_free(r->sectors);
+	r->keys = NULL; r->sectors = NULL; r->m = 0; r->cap = 0;
+}
+
+static int
+batch_repl_reserve(struct batch_repl *r, uint32_t want, uint32_t key_size)
+{
+	if (want <= r->cap) return TESSERA_OK;
+	uint32_t nc = r->cap ? r->cap : 8;
+	while (nc < want) nc *= 2;
+	uint8_t  *nk = tessera_zalloc((size_t)nc * key_size);
+	uint64_t *ns = tessera_zalloc((size_t)nc * 8);
+	if (nk == NULL || ns == NULL) {
+		if (nk) tessera_free(nk);
+		if (ns) tessera_free(ns);
+		return TESSERA_ENOMEM;
+	}
+	if (r->m > 0) {
+		memcpy(nk, r->keys, (size_t)r->m * key_size);
+		memcpy(ns, r->sectors, (size_t)r->m * 8);
+	}
+	if (r->keys)    tessera_free(r->keys);
+	if (r->sectors) tessera_free(r->sectors);
+	r->keys = nk; r->sectors = ns; r->cap = nc;
+	return TESSERA_OK;
+}
+
+/* Emit `total` already-merged entries (entry_size each, in `flat`) as
+ * ceil(total/fanout) balanced nodes of `node_kind`; append each node's
+ * (min_key, sector) to `repl`. */
+static int
+batch_emit(tessera_btree_t *t, const uint8_t *flat, uint32_t total,
+           uint32_t entry_size, uint8_t node_kind, uint32_t fanout,
+           struct batch_repl *repl)
+{
+	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
+	int rc = TESSERA_OK;
+	if (block == NULL) return TESSERA_ENOMEM;
+	uint32_t nnodes = (total + fanout - 1) / fanout;
+	if (nnodes == 0) nnodes = 1;    /* total==0: emit one empty node */
+	uint32_t done = 0;
+	for (uint32_t i = 0; i < nnodes; i++) {
+		uint32_t left  = total - done;
+		uint32_t nrem  = nnodes - i;
+		uint32_t take  = (left + nrem - 1) / nrem;   /* balanced */
+		write_header(block, t, node_kind, take);
+		memcpy(leaf_entries(block), flat + (size_t)done * entry_size,
+		    (size_t)take * entry_size);
+		uint64_t sec;
+		if (alloc_node(t, &sec) != TESSERA_OK) {
+			rc = TESSERA_ENOSPC; goto out;
+		}
+		if (flush_node(t, sec, block, node_kind, take) != TESSERA_OK) {
+			rc = TESSERA_EIO; goto out;
+		}
+		rc = batch_repl_reserve(repl, repl->m + 1, t->key_size);
+		if (rc != TESSERA_OK) goto out;
+		if (take > 0)
+			memcpy(repl->keys + (size_t)repl->m * t->key_size,
+			    flat + (size_t)done * entry_size, t->key_size);
+		repl->sectors[repl->m] = sec;
+		repl->m++;
+		done += take;
+	}
+out:
+	tessera_free(block);
+	return rc;
+}
+
+static int
+batch_recurse(tessera_btree_t *t, uint64_t cur,
+              const uint8_t *keys, const uint8_t *vals, uint32_t n,
+              struct batch_repl *out)
+{
+	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
+	uint8_t *flat = NULL;
+	int rc;
+	if (block == NULL) return TESSERA_ENOMEM;
+	rc = load_node(t, cur, block);
+	if (rc != TESSERA_OK) goto out;
+	tessera_btree_node_header_t h;
+	(void)read_header(block, &h);
+
+	if (h.node_kind == 0) {
+		/* Leaf: two-pointer merge (replace on equal key). */
+		const uint32_t es = leaf_entry_size(t);
+		flat = tessera_zalloc((size_t)(h.entry_count + n) * es);
+		if (flat == NULL) { rc = TESSERA_ENOMEM; goto out; }
+		const uint8_t *ex = leaf_entries_const(block);
+		uint32_t i = 0, j = 0, total = 0;
+		while (i < h.entry_count || j < n) {
+			int c;
+			if (i >= h.entry_count)       c = 1;
+			else if (j >= n)              c = -1;
+			else c = key_compare(ex + (size_t)i * es,
+			    keys + (size_t)j * t->key_size, t->key_size);
+			uint8_t *dst = flat + (size_t)total * es;
+			if (c < 0) {
+				memcpy(dst, ex + (size_t)i * es, es);
+				i++;
+			} else {
+				memcpy(dst, keys + (size_t)j * t->key_size,
+				    t->key_size);
+				memcpy(dst + t->key_size,
+				    vals + (size_t)j * t->value_size,
+				    t->value_size);
+				if (c == 0) i++;    /* replace */
+				j++;
+			}
+			total++;
+		}
+		rc = batch_emit(t, flat, total, es, 0, t->leaf_fanout, out);
+		if (rc == TESSERA_OK)
+			(void)free_node(t, cur);
+		goto out;
+	}
+
+	/* Internal: partition the batch among children by routing key,
+	 * recurse into touched children, splice their replacement lists
+	 * into a merged entry stream, re-emit balanced. */
+	const uint32_t es = inner_entry_size(t);
+	if (h.entry_count == 0) { rc = TESSERA_ECORRUPT; goto out; }
+	/* Worst-case new entries: untouched children + every touched
+	 * child's replacement list. Build incrementally. */
+	uint32_t flat_cap = h.entry_count + n + 8;
+	flat = tessera_zalloc((size_t)flat_cap * es);
+	if (flat == NULL) { rc = TESSERA_ENOMEM; goto out; }
+	uint32_t total = 0;
+	uint32_t j = 0;
+	for (uint32_t i = 0; i < h.entry_count; i++) {
+		const uint8_t *e = leaf_entries_const(block) + (size_t)i * es;
+		/* Child i covers keys in [e.key, next.key); child 0 also
+		 * covers anything below its key (leftmost-descent rule). */
+		uint32_t jend = j;
+		if (i + 1 < h.entry_count) {
+			const uint8_t *nk =
+			    leaf_entries_const(block) + (size_t)(i + 1) * es;
+			while (jend < n && key_compare(keys +
+			    (size_t)jend * t->key_size, nk, t->key_size) < 0)
+				jend++;
+		} else {
+			jend = n;
+		}
+		if (jend == j) {
+			/* Untouched — keep the entry verbatim. */
+			memcpy(flat + (size_t)total * es, e, es);
+			total++;
+			continue;
+		}
+		uint64_t child;
+		memcpy(&child, e + t->key_size, 8);
+		struct batch_repl sub;
+		memset(&sub, 0, sizeof sub);
+		rc = batch_recurse(t, child,
+		    keys + (size_t)j * t->key_size,
+		    vals + (size_t)j * t->value_size, jend - j, &sub);
+		if (rc != TESSERA_OK) { batch_repl_free(&sub); goto out; }
+		if (total + sub.m > flat_cap) {
+			uint32_t nc = flat_cap * 2 + sub.m;
+			uint8_t *nf = tessera_zalloc((size_t)nc * es);
+			if (nf == NULL) {
+				batch_repl_free(&sub);
+				rc = TESSERA_ENOMEM; goto out;
+			}
+			memcpy(nf, flat, (size_t)total * es);
+			tessera_free(flat);
+			flat = nf; flat_cap = nc;
+		}
+		for (uint32_t k = 0; k < sub.m; k++) {
+			uint8_t *dst = flat + (size_t)total * es;
+			/* Child 0 keeps its ORIGINAL routing key if the
+			 * replacement's min key is larger — the leftmost
+			 * entry's key must stay <= every key that routes
+			 * here (batch keys below entries[0].key routed to
+			 * child 0). Simplest correct rule: for the first
+			 * replacement of the FIRST entry, take the smaller
+			 * of (old key, new min key). */
+			if (i == 0 && k == 0 &&
+			    key_compare(e, sub.keys, t->key_size) < 0)
+				memcpy(dst, e, t->key_size);
+			else
+				memcpy(dst, sub.keys + (size_t)k * t->key_size,
+				    t->key_size);
+			memcpy(dst + t->key_size, &sub.sectors[k], 8);
+			total++;
+		}
+		batch_repl_free(&sub);
+		j = jend;
+	}
+	rc = batch_emit(t, flat, total, es, 1, t->inner_fanout, out);
+	if (rc == TESSERA_OK)
+		(void)free_node(t, cur);
+out:
+	if (flat) tessera_free(flat);
+	tessera_free(block);
+	return rc;
+}
+
+int
+tessera_btree_put_sorted_batch(tessera_btree_t *t, const void *keys,
+                               const void *values, uint32_t n,
+                               uint64_t *out_new_root)
+{
+	if (t == NULL || keys == NULL || values == NULL || n == 0 ||
+	    out_new_root == NULL)
+		return TESSERA_EINVAL;
+	const uint8_t *kb = keys;
+	/* Strictly ascending keys are a caller contract — verify (cheap,
+	 * O(n)) so a mis-sorted batch fails loudly instead of building a
+	 * silently mis-ordered tree. */
+	for (uint32_t i = 1; i < n; i++) {
+		if (key_compare(kb + (size_t)(i - 1) * t->key_size,
+		    kb + (size_t)i * t->key_size, t->key_size) >= 0)
+			return TESSERA_EINVAL;
+	}
+
+	struct batch_repl repl;
+	memset(&repl, 0, sizeof repl);
+	int rc = batch_recurse(t, t->root, keys, values, n, &repl);
+	if (rc != TESSERA_OK) { batch_repl_free(&repl); return rc; }
+
+	/* Add root levels until a single node remains. */
+	while (repl.m > 1) {
+		const uint32_t es = inner_entry_size(t);
+		uint8_t *flat = tessera_zalloc((size_t)repl.m * es);
+		if (flat == NULL) { batch_repl_free(&repl); return TESSERA_ENOMEM; }
+		for (uint32_t i = 0; i < repl.m; i++) {
+			uint8_t *dst = flat + (size_t)i * es;
+			memcpy(dst, repl.keys + (size_t)i * t->key_size,
+			    t->key_size);
+			memcpy(dst + t->key_size, &repl.sectors[i], 8);
+		}
+		uint32_t total = repl.m;
+		batch_repl_free(&repl);
+		memset(&repl, 0, sizeof repl);
+		rc = batch_emit(t, flat, total, es, 1, t->inner_fanout, &repl);
+		tessera_free(flat);
+		if (rc != TESSERA_OK) { batch_repl_free(&repl); return rc; }
+	}
+	t->root = repl.sectors[0];
+	*out_new_root = t->root;
+	batch_repl_free(&repl);
+	return TESSERA_OK;
 }
 
 /* ── delete — leaf-only deletion + opportunistic root collapse ───── */

@@ -49,6 +49,7 @@ LIBADD=     md
 TEST_NAMES= \
     test_smoke \
     test_crc \
+    test_btree_batch \
     test_codec \
     test_cdc \
     test_extent \

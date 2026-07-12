@@ -54,6 +54,14 @@ int tessera_btree_get(tessera_btree_t *,
 
 /* COW-style insert/update. Writes new path to root; allocates new
  * blocks; frees old. Returns the new root sector via *out_root. */
+/* Apply n (key,value) pairs sorted STRICTLY ascending by key in one
+ * copy-on-write pass — semantics identical to n sequential puts
+ * (insert-or-replace), but every affected node is rewritten once.
+ * Returns TESSERA_EINVAL on a mis-sorted batch. */
+int tessera_btree_put_sorted_batch(tessera_btree_t *, const void *keys,
+                                   const void *values, uint32_t n,
+                                   uint64_t *out_new_root);
+
 int tessera_btree_put(tessera_btree_t *,
                       const void *key, const void *value,
                       uint64_t *out_new_root);
