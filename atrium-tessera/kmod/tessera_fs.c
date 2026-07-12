@@ -5852,6 +5852,112 @@ tessera_fs_dirty_inodes_drain(struct tessera_mount *tmp_)
 
 	int err = 0;
 	uint64_t root = tmp_->sb.inode_root;
+
+	/* Batched put pass (Option D): claim every stamped non-tombstone
+	 * entry at once (same publish-in-place flags as the per-entry
+	 * path), sort by key, and apply each chunk with ONE sorted-batch
+	 * COW pass — a flush draining ~1.4k inodes rewrites ~50 leaves
+	 * instead of paying 1.4k root-to-leaf walks. The batch is atomic
+	 * by construction (COW: a failure leaves the old root), so on
+	 * error every claimed entry is unmarked and retried next flush.
+	 * Tombstones fall through to the per-entry loop below. */
+	{
+		struct tessera_dirty_inode **claimed = NULL;
+		uint8_t  *bkeys = NULL;
+		uint8_t  *brecs = NULL;
+		uint32_t  nclaim = 0;
+
+		claimed = malloc((size_t)stamped * sizeof *claimed,
+		    M_TESSERA, M_WAITOK);
+		bkeys = malloc((size_t)stamped * 4, M_TESSERA, M_WAITOK);
+		brecs = malloc((size_t)stamped *
+		    sizeof(tessera_inode_record_t), M_TESSERA, M_WAITOK);
+
+		mtx_lock(&tmp_->flush_mtx);
+		for (uint32_t b = 0; b < TESSERA_DIRTY_INODE_BUCKETS; b++) {
+			struct tessera_dirty_inode *x;
+			LIST_FOREACH(x, &tmp_->dirty_inodes[b], link) {
+				if (x->round != round || x->draining ||
+				    x->tombstone || nclaim >= stamped)
+					continue;
+				x->round    = 0;
+				x->draining = 1;
+				x->redirty  = 0;
+				claimed[nclaim] = x;
+				nclaim++;
+			}
+		}
+		mtx_unlock(&tmp_->flush_mtx);
+
+		if (nclaim > 1) {
+			/* Sort claim pointers by inode_no (== BE-key
+			 * order). Insertion sort is fine at flush batch
+			 * sizes and avoids kernel qsort_r plumbing. */
+			for (uint32_t i = 1; i < nclaim; i++) {
+				struct tessera_dirty_inode *cur = claimed[i];
+				int32_t j = (int32_t)i - 1;
+				while (j >= 0 &&
+				    claimed[j]->inode_no > cur->inode_no) {
+					claimed[j + 1] = claimed[j];
+					j--;
+				}
+				claimed[j + 1] = cur;
+			}
+		}
+
+		uint32_t done = 0;
+		int brc = 0;
+		while (done < nclaim && brc == 0) {
+			uint32_t take = nclaim - done;
+			if (take > 4096) take = 4096;
+			mtx_lock(&tmp_->flush_mtx);
+			for (uint32_t i = 0; i < take; i++) {
+				struct tessera_dirty_inode *e =
+				    claimed[done + i];
+				encode_inode_key(e->inode_no,
+				    bkeys + (size_t)i * 4);
+				memcpy(brecs + (size_t)i *
+				    sizeof(tessera_inode_record_t), &e->rec,
+				    sizeof(tessera_inode_record_t));
+			}
+			mtx_unlock(&tmp_->flush_mtx);
+			brc = tessera_btree_put_sorted_batch(tmp_->inode_tree,
+			    bkeys, brecs, take, &root);
+			if (brc != TESSERA_OK) {
+				printf("tessera_fs: dirty_inodes_drain — "
+				    "batch put of %u failed: r=%d\n",
+				    take, brc);
+				break;
+			}
+			mtx_lock(&tmp_->flush_mtx);
+			for (uint32_t i = 0; i < take; i++) {
+				struct tessera_dirty_inode *e =
+				    claimed[done + i];
+				e->draining = 0;
+				if (!e->redirty) {
+					LIST_REMOVE(e, link);
+					if (tmp_->dirty_count > 0)
+						tmp_->dirty_count--;
+					free(e, M_TESSERA);
+				}
+			}
+			mtx_unlock(&tmp_->flush_mtx);
+			done += take;
+		}
+		if (brc != 0) {
+			/* Unmark everything not yet applied; retry next
+			 * flush with data intact. */
+			mtx_lock(&tmp_->flush_mtx);
+			for (uint32_t i = done; i < nclaim; i++)
+				claimed[i]->draining = 0;
+			mtx_unlock(&tmp_->flush_mtx);
+			err = EIO;
+		}
+		free(claimed, M_TESSERA);
+		free(bkeys, M_TESSERA);
+		free(brecs, M_TESSERA);
+	}
+
 	for (uint32_t b = 0; b < TESSERA_DIRTY_INODE_BUCKETS; b++) {
 		for (;;) {
 			mtx_lock(&tmp_->flush_mtx);
