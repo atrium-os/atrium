@@ -42,6 +42,7 @@
 #include <sys/conf.h>
 #include <sys/priv.h>
 #include <sys/fcntl.h>
+#include <sys/filio.h>
 #include <sys/callout.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
@@ -4111,15 +4112,24 @@ tessera_vop_readdir(struct vop_readdir_args *ap)
 		if (_off + 10 + _nl > (_blen)) break;                     \
 		const char *_nm = (const char *)((_body) + _off + 10);    \
 		uint8_t _dt = DT_UNKNOWN;                                 \
-		uint8_t _k2[4];                                           \
-		tessera_inode_record_t _cino;                             \
-		encode_inode_key((uint32_t)_ch, _k2);                     \
-		int _crc = (_rd_gen != 0)                                 \
-		    ? tessera_fs_inode_get_at_gen(tmp_, (uint32_t)_ch,    \
-		          _rd_gen, &_cino)                                \
-		    : tessera_fs_inode_get_byk(tmp_, _k2, &_cino);        \
-		if (_crc == TESSERA_OK)                                   \
-			_dt = tessera_dt_from_mode(_cino.mode);           \
+		/* Resolve d_type ONLY for entries this call will emit —  \
+		 * doing it for skipped (pre-cookie) entries made the     \
+		 * multi-call cookie protocol O(n^2) full btree walks     \
+		 * per listing (ls of a 5.7k dir = 90k inode_gets).       \
+		 * The skip test needs only the reclen. */                \
+		if (walked + (off_t)tessera_dirent_reclen(_nl) >          \
+		    resume_at) {                                          \
+			uint8_t _k2[4];                                   \
+			tessera_inode_record_t _cino;                     \
+			encode_inode_key((uint32_t)_ch, _k2);             \
+			int _crc = (_rd_gen != 0)                         \
+			    ? tessera_fs_inode_get_at_gen(tmp_,           \
+			          (uint32_t)_ch, _rd_gen, &_cino)         \
+			    : tessera_fs_inode_get_byk(tmp_, _k2,         \
+			          &_cino);                                \
+			if (_crc == TESSERA_OK)                           \
+				_dt = tessera_dt_from_mode(_cino.mode);   \
+		}                                                         \
 		_EMIT(_ch, _dt, _nm, _nl);                                \
 		_off += 10 + _nl;                                         \
 	}                                                                 \
@@ -4134,15 +4144,20 @@ tessera_vop_readdir(struct vop_readdir_args *ap)
 		if (_off + 18 + _nl > (_blen)) break;                     \
 		const char *_nm = (const char *)((_body) + _off + 18);    \
 		uint8_t _dt = DT_UNKNOWN;                                 \
-		uint8_t _k2[4];                                           \
-		tessera_inode_record_t _cino;                             \
-		encode_inode_key((uint32_t)_ch, _k2);                     \
-		int _crc = (_rd_gen != 0)                                 \
-		    ? tessera_fs_inode_get_at_gen(tmp_, (uint32_t)_ch,    \
-		          _rd_gen, &_cino)                                \
-		    : tessera_fs_inode_get_byk(tmp_, _k2, &_cino);        \
-		if (_crc == TESSERA_OK)                                   \
-			_dt = tessera_dt_from_mode(_cino.mode);           \
+		/* Emit-only d_type resolution — see _RD_EMIT_BODY. */    \
+		if (walked + (off_t)tessera_dirent_reclen(_nl) >          \
+		    resume_at) {                                          \
+			uint8_t _k2[4];                                   \
+			tessera_inode_record_t _cino;                     \
+			encode_inode_key((uint32_t)_ch, _k2);             \
+			int _crc = (_rd_gen != 0)                         \
+			    ? tessera_fs_inode_get_at_gen(tmp_,           \
+			          (uint32_t)_ch, _rd_gen, &_cino)         \
+			    : tessera_fs_inode_get_byk(tmp_, _k2,         \
+			          &_cino);                                \
+			if (_crc == TESSERA_OK)                           \
+				_dt = tessera_dt_from_mode(_cino.mode);   \
+		}                                                         \
 		_EMIT(_ch, _dt, _nm, _nl);                                \
 		_off += 18 + _nl;                                         \
 	}                                                                 \
@@ -17539,6 +17554,29 @@ tessera_vop_ioctl(struct vop_ioctl_args *ap)
 		if (e == 0 && ap->a_data != NULL)
 			*(uint64_t *)ap->a_data = reclaimed;
 		return (e);
+	}
+	case FIOSEEKDATA:
+	case FIOSEEKHOLE: {
+		/* Sparse-seek support — bsdtar/cp/rsync probe SEEK_HOLE on
+		 * every regular file and treat EINVAL/ENOTTY as an error.
+		 * Phase 1 semantics (== vop_stdioctl): the whole file
+		 * [0, size) is one data region with the virtual hole at
+		 * EOF. Manifest-aware holes (ZERO_HOLE chunks are known
+		 * exactly) can refine this later without an API change. */
+		if (vp->v_type != VREG)
+			return (ENOTTY);
+		off_t *offp = (off_t *)ap->a_data;
+		uint8_t key[4];
+		tessera_inode_record_t ino;
+		encode_inode_key((uint32_t)tn->inode_no, key);
+		if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
+			return (EIO);
+		if (*offp < 0 || (uint64_t)*offp >= ino.size)
+			return (ENXIO);
+		if (ap->a_command == FIOSEEKHOLE)
+			*offp = (off_t)ino.size;
+		/* FIOSEEKDATA: *offp already points at data. */
+		return (0);
 	}
 	default:
 		return (ENOTTY);
