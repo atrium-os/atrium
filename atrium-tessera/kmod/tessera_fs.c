@@ -3778,6 +3778,18 @@ tessera_vop_lookup_impl(struct vop_cachedlookup_args *ap)
 	 * DIRECTORY manifest blob, walk it for `cnp`. Snapshot-tagged
 	 * vnodes (snapshot_gen != 0) read the inode + manifest from
 	 * the historical inode_tree. */
+	/* Live-directory lookup runs UNDER THE FLUSH GATE so it cannot
+	 * interleave with a checkpoint that moves a dirent from the log
+	 * into the parent's btree manifest: without this, a lookup could
+	 * read the OLD manifest, then find the log entry already removed
+	 * by a concurrent (async, Option C) checkpoint, and miss a name
+	 * that exists — tar's "hard-link target does not exist" (the #27
+	 * race, reopened by async flush). The gate is recursive + sleep-
+	 * able, so holding it across the manifest fetch is safe, and a
+	 * checkpoint (also gated) is fully serialized against us. Snapshot
+	 * lookups read immutable historical state and skip the gate. */
+	int _lk_gated = (dn->snapshot_gen == 0) && tmp_->flush_mtx_init;
+	if (_lk_gated) tessera_fs_flush_gate_enter(tmp_);
 	uint8_t key[4];
 	tessera_inode_record_t dino;
 	encode_inode_key((uint32_t)dn->inode_no, key);
@@ -3793,14 +3805,14 @@ tessera_vop_lookup_impl(struct vop_cachedlookup_args *ap)
 		 * snapshot lookups where the inode may genuinely predate the
 		 * gen. */
 		if (dn->snapshot_gen != 0)
-			return (ENOENT);
+			{ if (_lk_gated) tessera_fs_flush_gate_exit(tmp_); return (ENOENT); }
 		tessera_stat_lookup_eio++;
 		printf("tessera_fs: lookup: inode %u read failed (rc=%d)\n",
 		    (unsigned)dn->inode_no, igrc);
-		return (EIO);
+		{ if (_lk_gated) tessera_fs_flush_gate_exit(tmp_); return (EIO); }
 	}
 	if (tessera_hash_is_null(dino.manifest_hash))
-		return (ENOENT);                  /* empty directory */
+		{ if (_lk_gated) tessera_fs_flush_gate_exit(tmp_); return (ENOENT); }                  /* empty directory */
 
 	uint8_t *blob = NULL;
 	uint32_t blob_len = 0;
@@ -3816,13 +3828,13 @@ tessera_vop_lookup_impl(struct vop_cachedlookup_args *ap)
 		    (unsigned)dn->inode_no, err, dino.manifest_hash[0],
 		    dino.manifest_hash[1], dino.manifest_hash[2],
 		    dino.manifest_hash[3]);
-		return (EIO);
+		{ if (_lk_gated) tessera_fs_flush_gate_exit(tmp_); return (EIO); }
 	}
 
 	tessera_manifest_parser_t *p = tessera_manifest_parse(blob, blob_len);
 	if (p == NULL) {
 		free(blob, M_TESSERA);
-		return (EIO);
+		{ if (_lk_gated) tessera_fs_flush_gate_exit(tmp_); return (EIO); }
 	}
 	const tessera_manifest_kind_t dkind = tessera_manifest_parser_kind(p);
 	if (dkind != TESSERA_MFT_DIRECTORY &&
@@ -3830,7 +3842,7 @@ tessera_vop_lookup_impl(struct vop_cachedlookup_args *ap)
 	    dkind != TESSERA_MFT_DIRECTORY_BTREE) {
 		tessera_manifest_parser_free(p);
 		free(blob, M_TESSERA);
-		return (ENOTDIR);
+		{ if (_lk_gated) tessera_fs_flush_gate_exit(tmp_); return (ENOTDIR); }
 	}
 
 	uint64_t child_no = 0;
@@ -3854,8 +3866,8 @@ tessera_vop_lookup_impl(struct vop_cachedlookup_args *ap)
 				if ((cnp->cn_flags & ISLASTCN) &&
 				    (cnp->cn_nameiop == CREATE ||
 				     cnp->cn_nameiop == RENAME))
-					return (EJUSTRETURN);
-				return (ENOENT);
+					{ if (_lk_gated) tessera_fs_flush_gate_exit(tmp_); return (EJUSTRETURN); }
+				{ if (_lk_gated) tessera_fs_flush_gate_exit(tmp_); return (ENOENT); }
 			}
 			child_no = log_ino;
 			goto have_child_no;
@@ -3887,8 +3899,8 @@ tessera_vop_lookup_impl(struct vop_cachedlookup_args *ap)
 		 * locked and routes the next op (VOP_CREATE etc.) here. */
 		if ((cnp->cn_flags & ISLASTCN) &&
 		    (cnp->cn_nameiop == CREATE || cnp->cn_nameiop == RENAME))
-			return (EJUSTRETURN);
-		return (rc);
+			{ if (_lk_gated) tessera_fs_flush_gate_exit(tmp_); return (EJUSTRETURN); }
+		{ if (_lk_gated) tessera_fs_flush_gate_exit(tmp_); return (rc); }
 	}
 
 have_child_no:
@@ -3900,9 +3912,9 @@ have_child_no:
 	if (dn->snapshot_gen != 0) {
 		/* Snapshot vnodes are never namecached (same inode_no maps to
 		 * different content across gens). */
-		return (tessera_vget_synth(dvp->v_mount, child_no,
+		{ if (_lk_gated) tessera_fs_flush_gate_exit(tmp_); return (tessera_vget_synth(dvp->v_mount, child_no,
 		    dn->inode_no, TESSERA_NODE_REGULAR,
-		    dn->snapshot_gen, vpp));
+		    dn->snapshot_gen, vpp)); }
 	}
 	int gerr = tessera_vget(dvp->v_mount, child_no, dn->inode_no, vpp);
 	/* Positive namecache entry (this is the .vop_cachedlookup backend
@@ -3914,7 +3926,7 @@ have_child_no:
 	 * negative entries, so there is no stale-negative-vs-create hazard. */
 	if (gerr == 0 && (cnp->cn_flags & MAKEENTRY) != 0)
 		cache_enter(dvp, *vpp, cnp);
-	return (gerr);
+	{ if (_lk_gated) tessera_fs_flush_gate_exit(tmp_); return (gerr); }
 }
 
 #define DIRENT_HDR  offsetof(struct dirent, d_name)
