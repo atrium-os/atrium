@@ -6780,7 +6780,13 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_small_blob_cap, CTLFLAG_RW,
 /* Whole-pack cache cap. A sequential big-file read only needs the pack it's
  * currently draining (plus interleaved manifest packs), so a modest cap
  * serves sequential reads while bounding RAM. */
-static unsigned long tessera_cas_pack_max_bytes = 64u * 1024u * 1024u;
+/* 256 MiB default (was 64): a cold tree walk re-touches packs
+ * (manifests interleave with content); retention across the walk
+ * measured a 2x cold-walk win (245s -> 118s for a base-system tree).
+ * Truly-warm walks serve entirely from here (8.2s/800MB). Desktop
+ * memory-pressure integration (memfed) can drive this dynamically
+ * later. */
+static unsigned long tessera_cas_pack_max_bytes = 256u * 1024u * 1024u;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_pack_max_bytes, CTLFLAG_RW,
     &tessera_cas_pack_max_bytes, 0,
     "Max bytes held in the whole-pack cache (LRU-evicted past this)");
