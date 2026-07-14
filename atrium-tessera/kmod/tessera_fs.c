@@ -789,6 +789,7 @@ static inline uint32_t tessera_chunk_size_for(struct tessera_mount *tmp_,
 static int  tessera_fs_dirty_content_drain_one(struct tessera_mount *tmp_,
     uint32_t inode_no);
 static int  tessera_fs_dirty_content_drain_all(struct tessera_mount *tmp_);
+#define TESSERA_FS_PUT_RACED  (-1000)	/* inode_put_cond: gen moved, retry */
 static void tessera_fs_dirty_content_drop(struct tessera_mount *tmp_,
     uint32_t inode_no);
 struct tessera_cas_cache;
@@ -1581,6 +1582,12 @@ struct tessera_mount {
 	 * thread's stack; protected by flush_mtx. */
 	LIST_HEAD(, tessera_ckpt_busy) ckpt_busy;
 	uint32_t                  dirent_log_count;
+	/* Bumped (under flush_mtx) each time a checkpoint removes a
+	 * parent's entries from the dirent log after publishing its new
+	 * manifest. vop_lookup uses it for optimistic concurrency: an
+	 * ungated lookup that MISSES while this changed may have raced a
+	 * log->manifest move and retries once under the flush gate. */
+	volatile uint64_t         ckpt_gen;
 	uint64_t                  dirent_log_seq;   /* monotonic */
 
 	/* v2.6 Phase B.2 — journal-resident dirent records.
@@ -3788,10 +3795,22 @@ tessera_vop_lookup_impl(struct vop_cachedlookup_args *ap)
 	 * able, so holding it across the manifest fetch is safe, and a
 	 * checkpoint (also gated) is fully serialized against us. Snapshot
 	 * lookups read immutable historical state and skip the gate. */
-	int _lk_gated = (dn->snapshot_gen == 0) && tmp_->flush_mtx_init;
-	if (_lk_gated) tessera_fs_flush_gate_enter(tmp_);
+	int _lk_live = (dn->snapshot_gen == 0) && tmp_->flush_mtx_init;
+	int _lk_gated = 0;
+	uint64_t _lk_gen = 0;
 	uint8_t key[4];
 	tessera_inode_record_t dino;
+lookup_restart:
+	/* Optimistic pass: run UNGATED but snapshot ckpt_gen first. A HIT
+	 * is always safe (log entries stay visible until the new manifest
+	 * is live — the db03505 draining doctrine — and a published
+	 * manifest covers them). Only a MISS can be a race artifact: old
+	 * manifest + log entry already removed. So on a miss, if ckpt_gen
+	 * moved during our walk, retry ONCE under the gate (serialized
+	 * against checkpoints => authoritative). Hits and non-racing
+	 * misses never touch the gate. */
+	if (_lk_live && !_lk_gated)
+		_lk_gen = atomic_load_acq_64(__DEVOLATILE(uint64_t *, &tmp_->ckpt_gen));
 	encode_inode_key((uint32_t)dn->inode_no, key);
 	int igrc = (dn->snapshot_gen != 0)
 	    ? tessera_fs_inode_get_at_gen(tmp_, (uint32_t)dn->inode_no,
@@ -3811,8 +3830,17 @@ tessera_vop_lookup_impl(struct vop_cachedlookup_args *ap)
 		    (unsigned)dn->inode_no, igrc);
 		{ if (_lk_gated) tessera_fs_flush_gate_exit(tmp_); return (EIO); }
 	}
-	if (tessera_hash_is_null(dino.manifest_hash))
-		{ if (_lk_gated) tessera_fs_flush_gate_exit(tmp_); return (ENOENT); }                  /* empty directory */
+	if (tessera_hash_is_null(dino.manifest_hash)) {
+		/* Could be an empty dir — or a stale record read just as a
+		 * checkpoint published the first real manifest. */
+		if (_lk_live && !_lk_gated && atomic_load_acq_64(
+		    __DEVOLATILE(uint64_t *, &tmp_->ckpt_gen)) != _lk_gen) {
+			_lk_gated = 1;
+			tessera_fs_flush_gate_enter(tmp_);
+			goto lookup_restart;
+		}
+		{ if (_lk_gated) tessera_fs_flush_gate_exit(tmp_); return (ENOENT); }
+	}
 
 	uint8_t *blob = NULL;
 	uint32_t blob_len = 0;
@@ -3893,6 +3921,16 @@ tessera_vop_lookup_impl(struct vop_cachedlookup_args *ap)
 	tessera_manifest_parser_free(p);
 	free(blob, M_TESSERA);
 	if (rc != 0) {
+		/* MISS: retry once under the gate if a checkpoint moved
+		 * entries log->manifest while we walked (see lookup_restart
+		 * comment) — the ungated result is untrustworthy exactly and
+		 * only in that window. */
+		if (_lk_live && !_lk_gated && atomic_load_acq_64(
+		    __DEVOLATILE(uint64_t *, &tmp_->ckpt_gen)) != _lk_gen) {
+			_lk_gated = 1;
+			tessera_fs_flush_gate_enter(tmp_);
+			goto lookup_restart;
+		}
 		/* Standard FreeBSD lookup convention: on the final path
 		 * component, when the caller is about to CREATE / RENAME
 		 * this name, return EJUSTRETURN so namei keeps the parent
@@ -4645,7 +4683,18 @@ static int
 tessera_vop_setattr(struct vop_setattr_args *ap)
 {
 	sbintime_t _tp0 = TPROF_T0();
+	/* Directory setattr (tar -p chmod/utimes on dirs) is a full
+	 * inode-record RMW racing the async checkpoint publish of the
+	 * same record — run it under the flush gate so the two are
+	 * serialized (rare op; file records are never touched by
+	 * checkpoints and stay ungated). */
+	struct tessera_mount *_gtmp =
+	    VFSTOTESSERA(ap->a_vp->v_mount);
+	int _gated = (ap->a_vp->v_type == VDIR) &&
+	    VTOTNODE(ap->a_vp)->snapshot_gen == 0 && _gtmp->flush_mtx_init;
+	if (_gated) tessera_fs_flush_gate_enter(_gtmp);
 	int _rc = tessera_vop_setattr_impl(ap);
+	if (_gated) tessera_fs_flush_gate_exit(_gtmp);
 	TPROF_ADD(TPROF_SETATTR, _tp0);
 	return (_rc);
 }
@@ -5755,8 +5804,9 @@ tessera_fs_inode_delete_byk(struct tessera_mount *tmp_, const uint8_t key[4],
 }
 
 static int
-tessera_fs_inode_put(struct tessera_mount *tmp_, uint32_t inode_no,
-                     const tessera_inode_record_t *rec)
+tessera_fs_inode_put_impl(struct tessera_mount *tmp_, uint32_t inode_no,
+                          const tessera_inode_record_t *rec, int cond,
+                          uint32_t expect_gen, uint64_t expect_ckpt_gen)
 {
 	if (!tmp_->dirty_init) {
 		/* Pre-init mount-time path — write through directly. */
@@ -5791,6 +5841,17 @@ tessera_fs_inode_put(struct tessera_mount *tmp_, uint32_t inode_no,
 	int found = 0;
 	LIST_FOREACH(e, &tmp_->dirty_inodes[b], link) {
 		if (e->inode_no == inode_no) {
+			/* Conditional put (RMW writers vs checkpoint publish):
+			 * the record changed since the caller's get — do NOT
+			 * overwrite (a blind full-record put here can REVERT a
+			 * concurrently-published manifest_hash, silently
+			 * orphaning the whole checkpointed subtree). Caller
+			 * re-gets and retries. */
+			if (cond && e->rec.gen != expect_gen) {
+				mtx_unlock(&tmp_->flush_mtx);
+				if (jc != NULL) free(jc, M_TESSERA);
+				return (TESSERA_FS_PUT_RACED);
+			}
 			memcpy(&e->rec, rec, sizeof e->rec);
 			e->tombstone = 0;
 			if (e->draining)
@@ -5800,6 +5861,17 @@ tessera_fs_inode_put(struct tessera_mount *tmp_, uint32_t inode_no,
 		}
 	}
 	if (!found) {
+		/* Absent from cache: gen can't be compared (the freshest
+		 * copy is in the btree; reading it here would mean I/O under
+		 * intent). Conservatively fail the cond put if ANY checkpoint
+		 * published since the caller's snapshot — covers the
+		 * publish->drain->evict window. Spurious retries are rare
+		 * (window is µs) and cheap. */
+		if (cond && tmp_->ckpt_gen != expect_ckpt_gen) {
+			mtx_unlock(&tmp_->flush_mtx);
+			if (jc != NULL) free(jc, M_TESSERA);
+			return (TESSERA_FS_PUT_RACED);
+		}
 		mtx_unlock(&tmp_->flush_mtx);
 		/* malloc(M_WAITOK) outside the mutex. */
 		e = malloc(sizeof *e, M_TESSERA, M_WAITOK | M_ZERO);
@@ -5810,12 +5882,24 @@ tessera_fs_inode_put(struct tessera_mount *tmp_, uint32_t inode_no,
 		int raced = 0;
 		LIST_FOREACH(existing, &tmp_->dirty_inodes[b], link) {
 			if (existing->inode_no == inode_no) {
+				if (cond && existing->rec.gen != expect_gen) {
+					free(e, M_TESSERA);
+					mtx_unlock(&tmp_->flush_mtx);
+					if (jc != NULL) free(jc, M_TESSERA);
+					return (TESSERA_FS_PUT_RACED);
+				}
 				memcpy(&existing->rec, rec, sizeof existing->rec);
 				existing->tombstone = 0;
 				if (existing->draining)
 					existing->redirty = 1;
 				raced = 1; break;
 			}
+		}
+		if (!raced && cond && tmp_->ckpt_gen != expect_ckpt_gen) {
+			free(e, M_TESSERA);
+			mtx_unlock(&tmp_->flush_mtx);
+			if (jc != NULL) free(jc, M_TESSERA);
+			return (TESSERA_FS_PUT_RACED);
 		}
 		if (raced) {
 			free(e, M_TESSERA);
@@ -5843,6 +5927,28 @@ tessera_fs_inode_put(struct tessera_mount *tmp_, uint32_t inode_no,
 	mtx_unlock(&tmp_->flush_mtx);
 	if (jc != NULL && dropped_jc) free(jc, M_TESSERA);
 	return (TESSERA_OK);
+}
+
+static int
+tessera_fs_inode_put(struct tessera_mount *tmp_, uint32_t inode_no,
+                     const tessera_inode_record_t *rec)
+{
+	return (tessera_fs_inode_put_impl(tmp_, inode_no, rec, 0, 0, 0));
+}
+
+/* Gen-conditional put: succeed only if the cached record's gen still
+ * equals expect_gen (or, when absent from cache, no checkpoint has
+ * published since expect_ckpt_gen). Returns TESSERA_FS_PUT_RACED when
+ * the condition fails; callers loop get -> modify -> put_cond. This is
+ * the atomicity primitive for parent-directory record RMWs racing the
+ * async checkpoint publish. */
+static int
+tessera_fs_inode_put_cond(struct tessera_mount *tmp_, uint32_t inode_no,
+                          const tessera_inode_record_t *rec,
+                          uint32_t expect_gen, uint64_t expect_ckpt_gen)
+{
+	return (tessera_fs_inode_put_impl(tmp_, inode_no, rec, 1,
+	    expect_gen, expect_ckpt_gen));
 }
 
 static int
@@ -15146,14 +15252,27 @@ tessera_fs_dirent_log_append(struct tessera_mount *tmp_,
 		uint8_t pkey[4];
 		tessera_inode_record_t pino;
 		encode_inode_key(parent_inode_no, pkey);
-		if (tessera_fs_inode_get_byk(tmp_, pkey, &pino) == TESSERA_OK) {
+		/* Gen-conditional RMW loop: this full-record put races the
+		 * async checkpoint's publish of the SAME parent record; a
+		 * blind put would revert the freshly-published manifest_hash
+		 * (silent whole-subtree orphaning). Snapshot ckpt_gen BEFORE
+		 * the get so a publish anywhere in the window forces a
+		 * retry against the fresh record. */
+		for (int _try = 0; _try < 16; _try++) {
+			uint64_t ckg = tmp_->ckpt_gen;
+			if (tessera_fs_inode_get_byk(tmp_, pkey, &pino)
+			    != TESSERA_OK)
+				break;
+			uint32_t eg = pino.gen;
 			struct timeval tv;
 			getmicrotime(&tv);
 			uint64_t now_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
 			    (uint64_t)tv.tv_usec * 1000ULL;
 			pino.mtime_ns = now_ns;
 			pino.ctime_ns = now_ns;
-			(void)tessera_fs_inode_put_byk(tmp_, pkey, &pino, NULL);
+			if (tessera_fs_inode_put_cond(tmp_, parent_inode_no,
+			    &pino, eg, ckg) != TESSERA_FS_PUT_RACED)
+				break;
 		}
 	}
 	return (0);
@@ -15553,24 +15672,41 @@ tessera_fs_dirent_log_checkpoint_parent(struct tessera_mount *tmp_,
 	    new_root);
 	if (rc != 0) goto out_free_col;
 
-	/* Update the parent inode's manifest_hash. */
-	memcpy(pino.manifest_hash, new_root, TESSERA_HASH_SIZE);
-	pino.gen++;
-	{
-		struct timeval tv;
-		getmicrotime(&tv);
-		uint64_t now_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
-		    (uint64_t)tv.tv_usec * 1000ULL;
-		pino.mtime_ns = now_ns;
-		pino.ctime_ns = now_ns;
+	/* Publish: update the parent inode's manifest_hash. RE-GET the
+	 * record here (not the copy read before the ms-long rebuild) so
+	 * concurrent RMW writers' fields (chmod/utimes/mtime bumps) are
+	 * preserved, and put gen-conditionally so we can't clobber a
+	 * writer that slipped between our re-get and put. The manifest
+	 * itself cannot have changed under us (per-parent busy list
+	 * serializes checkpoints; rewrite/rename run under the flush
+	 * gate), so re-applying new_root to the fresh record is sound. */
+	for (;;) {
+		uint64_t ckg = tmp_->ckpt_gen;
+		if (tessera_fs_inode_get_byk(tmp_, pkey, &pino)
+		    != TESSERA_OK) {
+			rc = EIO;
+			goto out_free_col;
+		}
+		uint32_t eg = pino.gen;
+		memcpy(pino.manifest_hash, new_root, TESSERA_HASH_SIZE);
+		pino.gen++;
+		{
+			struct timeval tv;
+			getmicrotime(&tv);
+			uint64_t now_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
+			    (uint64_t)tv.tv_usec * 1000ULL;
+			pino.mtime_ns = now_ns;
+			pino.ctime_ns = now_ns;
+		}
+		int prc = tessera_fs_inode_put_cond(tmp_,
+		    parent_inode_no, &pino, eg, ckg);
+		if (prc == TESSERA_OK)
+			break;
+		if (prc != TESSERA_FS_PUT_RACED) {
+			rc = EIO;
+			goto out_free_col;
+		}
 	}
-	uint64_t new_inode_root = tmp_->sb.inode_root;
-	if (tessera_fs_inode_put_byk(tmp_, pkey, &pino,
-	    &new_inode_root) != TESSERA_OK) {
-		rc = EIO;
-		goto out_free_col;
-	}
-	tmp_->sb.inode_root = new_inode_root;
 
 out_free_col:
 	for (uint32_t i = 0; i < col.count; i++)
@@ -15588,6 +15724,10 @@ out_free:
 	if (rc == 0) {
 		for (uint32_t i = 0; i < logcount; i++)
 			LIST_REMOVE(logents[i], link);
+		/* Entries now live ONLY in the published manifest; any
+		 * concurrent ungated lookup that read the old manifest
+		 * must detect this transition (see ckpt_gen). */
+		tmp_->ckpt_gen++;
 	} else {
 		for (uint32_t i = 0; i < logcount; i++) {
 			logents[i]->draining = 0;
@@ -15987,8 +16127,39 @@ tessera_replay_dirent_record(struct tessera_mount *tmp_,
 	return (1);
 }
 
+static int tessera_fs_dirent_rewrite_impl(struct tessera_mount *,
+    uint32_t, int, uint64_t, uint64_t, const char *, size_t);
+
+/* Slow-path dirent_rewrite mutates the parent's manifest inline (get
+ * -> rebuild -> put): a whole-manifest RMW racing the async
+ * checkpoint. Run the entire op under the flush gate (recursive, so
+ * already-gated callers are fine). */
 static int
 tessera_fs_dirent_rewrite(struct tessera_mount *tmp_,
+                          uint32_t parent_inode_no,
+                          int op, uint64_t verify_inode,
+                          uint64_t add_inode,
+                          const char *name, size_t namelen)
+{
+	/* Fast path (dirent log append) is append-only — same protection
+	 * as vop_create's direct log_append (cond-put mtime bump) — and
+	 * must NOT pay the gate: hard links hit this per-link. Only the
+	 * inline manifest-rebuild slow path is an RMW needing the gate. */
+	if (tessera_dirent_log_enable_default && tmp_->dirty_init) {
+		uint64_t ino = (op == 0) ? add_inode : verify_inode;
+		return (tessera_fs_dirent_log_append(tmp_, parent_inode_no,
+		    op, name, (uint16_t)namelen, ino));
+	}
+	int gated = tmp_->flush_mtx_init;
+	if (gated) tessera_fs_flush_gate_enter(tmp_);
+	int r = tessera_fs_dirent_rewrite_impl(tmp_, parent_inode_no, op,
+	    verify_inode, add_inode, name, namelen);
+	if (gated) tessera_fs_flush_gate_exit(tmp_);
+	return (r);
+}
+
+static int
+tessera_fs_dirent_rewrite_impl(struct tessera_mount *tmp_,
                           uint32_t parent_inode_no,
                           int op, uint64_t verify_inode,
                           uint64_t add_inode,
@@ -17115,8 +17286,29 @@ rename_visit(void *vctx, uint64_t ch, const char *nm, uint16_t nl)
 	return (0);
 }
 
+static int tessera_fs_dirent_rename_same_dir_impl(struct tessera_mount *,
+    uint32_t, uint64_t, const char *, size_t, const char *, size_t);
+
+/* Inline same-dir rename rebuilds the parent manifest (RMW) — gate it
+ * against the async checkpoint, like dirent_rewrite. */
 static int
 tessera_fs_dirent_rename_same_dir(struct tessera_mount *tmp_,
+    uint32_t parent_inode_no,
+    uint64_t target_inode,
+    const char *old_name, size_t old_namelen,
+    const char *new_name, size_t new_namelen)
+{
+	int gated = tmp_->flush_mtx_init;
+	if (gated) tessera_fs_flush_gate_enter(tmp_);
+	int r = tessera_fs_dirent_rename_same_dir_impl(tmp_,
+	    parent_inode_no, target_inode, old_name, old_namelen,
+	    new_name, new_namelen);
+	if (gated) tessera_fs_flush_gate_exit(tmp_);
+	return (r);
+}
+
+static int
+tessera_fs_dirent_rename_same_dir_impl(struct tessera_mount *tmp_,
     uint32_t parent_inode_no,
     uint64_t target_inode,
     const char *old_name, size_t old_namelen,
@@ -17521,8 +17713,24 @@ tessera_vop_pathconf(struct vop_pathconf_args *ap)
  * &count). Any vnode on the mount works as the fd. */
 #define TESSERA_IOC_GC          _IOR('T', 2, uint64_t)
 
+static int tessera_vop_ioctl_impl(struct vop_ioctl_args *ap);
+
+/* Directory-record RMW (xattr_hash / quota_domain fields) can race the
+ * async checkpoint publish of the same record — gate directory ops.
+ * File records are never touched by checkpoints; files stay ungated. */
 static int
 tessera_vop_ioctl(struct vop_ioctl_args *ap)
+{
+	struct tessera_mount *tmp_ = VFSTOTESSERA(ap->a_vp->v_mount);
+	int gated = (ap->a_vp->v_type == VDIR) && tmp_->flush_mtx_init;
+	if (gated) tessera_fs_flush_gate_enter(tmp_);
+	int r = tessera_vop_ioctl_impl(ap);
+	if (gated) tessera_fs_flush_gate_exit(tmp_);
+	return (r);
+}
+
+static int
+tessera_vop_ioctl_impl(struct vop_ioctl_args *ap)
 {
 	struct vnode *vp = ap->a_vp;
 	struct tessera_node *tn = VTOTNODE(vp);
@@ -17731,8 +17939,24 @@ tessera_xattr_rebuild(struct tessera_mount *tmp_, uint32_t inode_no,
 	return (0);
 }
 
+static int tessera_vop_setextattr_impl(struct vop_setextattr_args *ap);
+
+/* Directory-record RMW (xattr_hash / quota_domain fields) can race the
+ * async checkpoint publish of the same record — gate directory ops.
+ * File records are never touched by checkpoints; files stay ungated. */
 static int
 tessera_vop_setextattr(struct vop_setextattr_args *ap)
+{
+	struct tessera_mount *tmp_ = VFSTOTESSERA(ap->a_vp->v_mount);
+	int gated = (ap->a_vp->v_type == VDIR) && tmp_->flush_mtx_init;
+	if (gated) tessera_fs_flush_gate_enter(tmp_);
+	int r = tessera_vop_setextattr_impl(ap);
+	if (gated) tessera_fs_flush_gate_exit(tmp_);
+	return (r);
+}
+
+static int
+tessera_vop_setextattr_impl(struct vop_setextattr_args *ap)
 {
 	struct vnode *vp = ap->a_vp;
 	struct tessera_node *tn = VTOTNODE(vp);
@@ -17774,8 +17998,24 @@ tessera_vop_setextattr(struct vop_setextattr_args *ap)
 	return (0);
 }
 
+static int tessera_vop_deleteextattr_impl(struct vop_deleteextattr_args *ap);
+
+/* Directory-record RMW (xattr_hash / quota_domain fields) can race the
+ * async checkpoint publish of the same record — gate directory ops.
+ * File records are never touched by checkpoints; files stay ungated. */
 static int
 tessera_vop_deleteextattr(struct vop_deleteextattr_args *ap)
+{
+	struct tessera_mount *tmp_ = VFSTOTESSERA(ap->a_vp->v_mount);
+	int gated = (ap->a_vp->v_type == VDIR) && tmp_->flush_mtx_init;
+	if (gated) tessera_fs_flush_gate_enter(tmp_);
+	int r = tessera_vop_deleteextattr_impl(ap);
+	if (gated) tessera_fs_flush_gate_exit(tmp_);
+	return (r);
+}
+
+static int
+tessera_vop_deleteextattr_impl(struct vop_deleteextattr_args *ap)
 {
 	struct vnode *vp = ap->a_vp;
 	struct tessera_node *tn = VTOTNODE(vp);
