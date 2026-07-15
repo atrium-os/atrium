@@ -747,9 +747,13 @@ static int tessera_commit_extent(struct tessera_mount *tmp_);
 struct tessera_replay_ctx { struct tessera_mount *tmp_; int applied; };
 static int tessera_replay_handler(void *ctx,
     const tessera_record_header_t *hdr, const uint8_t *body);
-struct meta_mark_ctx { uint8_t *bitmap; uint64_t lo; uint64_t hi; };
+struct meta_mark_ctx { uint8_t *bitmap; uint64_t lo; uint64_t hi;
+	volatile int *abort_flag; /* nonzero -> stop the walk (unmount) */ };
 static int meta_mark_visitor(void *ctx, uint64_t sector);
 static void tessera_meta_pin_bitmap_rebuild(struct tessera_mount *tmp_);
+static void tessera_fs_pinscan_task(void *ctx, int pending);
+static void tessera_fs_pinscan_run(struct tessera_mount *tmp_);
+static void tessera_fs_meta_pending_drain(struct tessera_mount *tmp_);
 static int tessera_fs_gc_data_zone(struct tessera_mount *tmp_);
 static void tessera_fs_seed_constant_manifests(struct tessera_mount *tmp_);
 static int tessera_vop_lookup_impl(struct vop_cachedlookup_args *ap);
@@ -1332,6 +1336,11 @@ static int tessera_fs_dir_btree_migrate(struct tessera_mount *tmp_,
  * cap-trigger threshold need to be declared here too because
  * mark_dirty (also above the impl) reads them. */
 #define TESSERA_DIRENT_LOG_MISS  (-1)
+static int tessera_mount_gc_enable = 0;
+SYSCTL_INT(_kern_tessera, OID_AUTO, mount_gc, CTLFLAG_RW,
+    &tessera_mount_gc_enable, 0,
+    "1 = run data-zone GC synchronously at mount (legacy; slow with snapshots)");
+
 static int tessera_dirent_log_enable_default;
 static int tessera_dirent_log_threshold;
 static int tessera_dirty_flush_async;
@@ -1441,6 +1450,25 @@ struct tessera_mount {
 	 * snapshot is dropped) is the next step, currently not implemented;
 	 * with no retention the bitmap monotonically grows but is bounded
 	 * by meta_reserve_length bits = ~32 KB for a 64 MiB reserve. */
+	/* Background pin-bitmap scan (task #33): mount starts with an
+	 * ALL-PINNED bitmap (nothing recycled = always safe) and defers
+	 * the tree walks to pinscan_tq. While pinscan_active, the meta
+	 * allocator is bump-only so sectors consumed from meta_free
+	 * can't be re-freed by the swap. */
+	struct taskqueue         *pinscan_tq;
+	struct task               pinscan_task;
+	int                       pinscan_tq_init;
+	volatile int              pinscan_abort;
+	volatile int              pinscan_active;
+	/* Sectors >= watermark are implicitly pinned: allocated after the
+	 * last completed pinscan started, so the scan never judged their
+	 * reachability (a retained snapshot may reference them). Only a
+	 * later scan's swap raises it. Fixes a PRE-EXISTING drain bug:
+	 * post-(mount|rebuild)-allocated sectors had unset bitmap bits and
+	 * were released even when a newer snapshot still referenced them
+	 * (silent snapshot-tree corruption, previously masked by the
+	 * every-retire synchronous rebuild). */
+	uint64_t                  meta_pin_watermark;
 	uint8_t                  *meta_pin_bitmap;
 	size_t                    meta_pin_bitmap_bytes;
 
@@ -1864,6 +1892,49 @@ tessera_kbio_free(void *ctx, uint64_t s, uint64_t n)
  * registry / free-extent tree updates. NOT recursing into the data
  * extent allocator avoids the iterating-while-mutating problem
  * (tessera-fs.md §3.3). */
+/* Filter meta_pending against the pin bitmap + watermark: release
+ * unpinned sectors to meta_free, keep the rest pending. Caller holds
+ * the flush gate (commit_sb tail, or the allocator's emergency inline
+ * pinscan path). */
+static void
+tessera_fs_meta_pending_drain(struct tessera_mount *tmp_)
+{
+	if (tmp_->meta_pending_count == 0 || tmp_->meta_free == NULL)
+		return;
+	const uint64_t mstart = tmp_->sb.meta_reserve_start;
+	const uint64_t mlen   = tmp_->sb.meta_reserve_length;
+	uint32_t kept = 0;
+	for (uint32_t i = 0; i < tmp_->meta_pending_count; i++) {
+		uint64_t s = tmp_->meta_pending[i];
+		int pinned = 0;
+		/* Watermark: the last completed scan never saw this
+		 * sector (allocated after its start) — reachability
+		 * unknown, keep pinned until a later scan covers it. */
+		if (s >= tmp_->meta_pin_watermark)
+			pinned = 1;
+		if (!pinned && tmp_->meta_pin_bitmap != NULL &&
+		    s >= mstart && s < mstart + mlen) {
+			uint64_t bit = s - mstart;
+			if (tmp_->meta_pin_bitmap[bit / 8]
+			    & (1u << (bit % 8))) {
+				pinned = 1;
+			}
+		}
+		if (pinned) {
+			tmp_->meta_pending[kept++] = s;
+			tessera_metatrace(TM_OP_DRAIN_KEEP, s,
+			    tmp_->sb.generation, kept);
+		} else if (tmp_->meta_free_count
+		    < tmp_->meta_free_cap) {
+			tmp_->meta_free[tmp_->meta_free_count++] = s;
+			tessera_metatrace(TM_OP_DRAIN_RELEASE, s,
+			    tmp_->sb.generation,
+			    tmp_->meta_free_count);
+		}
+	}
+	tmp_->meta_pending_count = kept;
+}
+
 static int
 tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 {
@@ -1873,7 +1944,7 @@ tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 	if (n != 1) return (-1);
 	/* Prefer recycled sectors (released by a prior commit cycle's
 	 * post-success drain) before pushing the bump pointer forward. */
-	if (tmp_->meta_free_count > 0) {
+	if (!tmp_->pinscan_active && tmp_->meta_free_count > 0) {
 		*out_sector = tmp_->meta_free[--tmp_->meta_free_count];
 		tessera_metatrace(TM_OP_ALLOC_REUSE, *out_sector,
 		    tmp_->sb.generation, tmp_->meta_free_count);
@@ -2224,6 +2295,15 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	    taskqueue_thread_enqueue, &tmp_->flush_tq);
 	(void)taskqueue_start_threads(&tmp_->flush_tq, 1, PRIBIO,
 	    "tessflush");
+	/* Task #33: background pin-bitmap scan queue (own thread — the
+	 * walk can take minutes on snapshot-heavy volumes and must not
+	 * block flushes). */
+	TASK_INIT(&tmp_->pinscan_task, 0, tessera_fs_pinscan_task, tmp_);
+	tmp_->pinscan_tq = taskqueue_create("tessera_pinscan", M_WAITOK,
+	    taskqueue_thread_enqueue, &tmp_->pinscan_tq);
+	(void)taskqueue_start_threads(&tmp_->pinscan_tq, 1, PRIBIO,
+	    "tesspinscan");
+	tmp_->pinscan_tq_init = 1;
 	tmp_->multi_extent_pack_count = 0;
 	mtx_init(&tmp_->flush_mtx, "tess_flush", NULL, MTX_DEF);
 	tmp_->flush_mtx_init = 1;
@@ -2473,119 +2553,22 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * [meta_reserve_start, meta_reserve_bump) that is NOT marked is
 	 * orphaned and safe to recycle. */
 	{
-		const uint64_t mstart = tmp_->sb.meta_reserve_start;
-		const uint64_t mlen   = tmp_->sb.meta_reserve_length;
-		const uint64_t mbump  = tmp_->sb.meta_reserve_bump;
+		const uint64_t mlen = tmp_->sb.meta_reserve_length;
 		size_t bitmap_bytes = (size_t)((mlen + 7) / 8);
-		/* v2 slice-4: this bitmap is also consulted at every
-		 * commit_sb drain to filter snapshot-pinned sectors out of
-		 * meta_pending → meta_free reuse. So instead of allocating
-		 * locally and free()ing at scope exit, persist on the mount. */
-		uint8_t *bitmap = malloc(bitmap_bytes, M_TESSERA,
-		    M_WAITOK | M_ZERO);
+		/* Task #33: start ALL-PINNED (recycle nothing = always
+		 * safe) and defer the reachability walks — live trees plus
+		 * three trees per retained snapshot, minutes on snapshot-
+		 * heavy volumes — to the background pinscan kicked below,
+		 * which swaps in the real bitmap and populates meta_free.
+		 * Until then the allocator just bumps; the reserve is sized
+		 * for far more than one scan-window of allocations. */
+		uint8_t *bitmap = malloc(bitmap_bytes, M_TESSERA, M_WAITOK);
+		memset(bitmap, 0xFF, bitmap_bytes);
 		tmp_->meta_pin_bitmap       = bitmap;
 		tmp_->meta_pin_bitmap_bytes = bitmap_bytes;
-		struct meta_mark_ctx mctx = { bitmap, mstart, mstart + mlen };
-		if (tmp_->inode_tree != NULL)
-			(void)tessera_btree_walk_nodes(tmp_->inode_tree,
-			    meta_mark_visitor, &mctx);
-		if (tmp_->pack_registry_tree != NULL)
-			(void)tessera_btree_walk_nodes(tmp_->pack_registry_tree,
-			    meta_mark_visitor, &mctx);
-		/* Free-extent tree: open separately, walk, close. The live
-		 * extent_alloc handle (opened below) reads the same tree
-		 * but doesn't expose its node sectors. */
-		if (tmp_->sb.free_extent_root != 0) {
-			tessera_btree_t *fet = tessera_btree_open(&tmp_->meta_bio,
-			    tmp_->sb.free_extent_root, /*tree_kind*/ 2,
-			    /*key*/ 8, /*value*/ 8);
-			if (fet != NULL) {
-				(void)tessera_btree_walk_nodes(fet,
-				    meta_mark_visitor, &mctx);
-				tessera_btree_close(fet);
-			}
-		}
-		/* v2 snapshots: every retained snapshot's inode_tree,
-		 * pack_registry_tree, and free_extent_tree node sectors are
-		 * still live — we must NOT recycle their meta-reserve sectors
-		 * even though the current SB doesn't reference them. COW
-		 * sharing means most nodes are already covered by the walks
-		 * above; this loop just plugs the remaining gap. */
-		if (tmp_->snapshots_tree != NULL) {
-			(void)tessera_btree_walk_nodes(tmp_->snapshots_tree,
-			    meta_mark_visitor, &mctx);
-			tessera_btree_cursor_t *sc =
-			    tessera_btree_seek_first(tmp_->snapshots_tree);
-			while (sc != NULL) {
-				uint8_t sk[8];
-				tessera_snapshot_record_t srec;
-				if (tessera_btree_cursor_get(sc, sk, &srec)
-				    != TESSERA_OK) break;
-				if (srec.inode_root != 0 &&
-				    srec.inode_root != tmp_->sb.inode_root) {
-					tessera_btree_t *t =
-					    tessera_btree_open(&tmp_->meta_bio,
-					        srec.inode_root,
-					        /*tree_kind*/ 0, /*key*/ 4,
-					        /*value*/ TESSERA_INODE_RECORD_SIZE);
-					if (t != NULL) {
-						(void)tessera_btree_walk_nodes(
-						    t, meta_mark_visitor, &mctx);
-						tessera_btree_close(t);
-					}
-				}
-				if (srec.pack_registry_root != 0 &&
-				    srec.pack_registry_root !=
-				        tmp_->sb.pack_registry_root) {
-					tessera_btree_t *t =
-					    tessera_btree_open(&tmp_->meta_bio,
-					        srec.pack_registry_root,
-					        /*tree_kind*/ 1, /*key*/ 16,
-					        /*value*/ TESSERA_REGISTRY_ENTRY_SIZE);
-					if (t != NULL) {
-						(void)tessera_btree_walk_nodes(
-						    t, meta_mark_visitor, &mctx);
-						tessera_btree_close(t);
-					}
-				}
-				if (srec.free_extent_root != 0 &&
-				    srec.free_extent_root !=
-				        tmp_->sb.free_extent_root) {
-					tessera_btree_t *t =
-					    tessera_btree_open(&tmp_->meta_bio,
-					        srec.free_extent_root,
-					        /*tree_kind*/ 2, /*key*/ 8,
-					        /*value*/ 8);
-					if (t != NULL) {
-						(void)tessera_btree_walk_nodes(
-						    t, meta_mark_visitor, &mctx);
-						tessera_btree_close(t);
-					}
-				}
-				if (tessera_btree_cursor_next(sc)
-				    != TESSERA_OK) break;
-			}
-			if (sc != NULL) tessera_btree_cursor_free(sc);
-		}
-		/* Push every unmarked sector in the bumped range onto
-		 * meta_free[]. Cap == mlen so push can't overflow. */
-		uint32_t freed = 0;
-		for (uint64_t s = mstart; s < mbump &&
-		    tmp_->meta_free_count < tmp_->meta_free_cap; s++) {
-			uint64_t bit = s - mstart;
-			if (!(bitmap[bit / 8] & (1u << (bit % 8)))) {
-				tmp_->meta_free[tmp_->meta_free_count++] = s;
-				freed++;
-			}
-		}
-		/* Bitmap persists on tmp_->meta_pin_bitmap — used by
-		 * commit_sb drain. Freed at unmount. */
+		tmp_->meta_pin_watermark    = tmp_->sb.meta_reserve_start;
 		tessera_metatrace(TM_OP_BITMAP_BUILT, 0,
-		    tmp_->sb.generation,
-		    (uint32_t)tmp_->meta_pin_bitmap_bytes);
-		if (freed > 0)
-			printf("tessera_fs: meta-reserve reclaimed %u orphaned "
-			    "sector(s) from prior session(s)\n", freed);
+		    tmp_->sb.generation, (uint32_t)bitmap_bytes);
 	}
 
 	/* Open the free-extent allocator off the on-disk tree. Powers
@@ -2609,13 +2592,20 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * earlier hang here was traced to two 4 KiB structs on the stack
 	 * (sb_a/sb_b in mountfs and buf in commit_sb); both are now
 	 * heap-allocated. */
-	if (!tmp_->readonly_snapshot) {
+	if (!tmp_->readonly_snapshot && tessera_mount_gc_enable) {
 		int gc_reclaimed = tessera_fs_gc_data_zone(tmp_);
 		if (gc_reclaimed > 0)
 			printf("tessera_fs: GC reclaimed %d orphaned pack(s); "
 			    "%lu free sectors now\n", gc_reclaimed,
 			    (unsigned long)tessera_extent_free_blocks(tmp_->extent_alloc));
 	}
+	/* Task #33: kick the background pinscan (bitmap starts all-pinned;
+	 * the scan swaps in the real one and populates meta_free). Data-
+	 * zone GC is no longer run synchronously at mount by default —
+	 * kern.tessera.mount_gc=1 restores it; kern.tessera.gc_now works
+	 * on the live mount at any time. */
+	if (tmp_->pinscan_tq_init)
+		(void)taskqueue_enqueue(tmp_->pinscan_tq, &tmp_->pinscan_task);
 
 	mp->mnt_data = tmp_;
 	/* B1 test hook: stash the most-recently-mounted tessera in a
@@ -2861,6 +2851,15 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 		 * callout / task, then do one final synchronous flush so the
 		 * SB on disk reflects every committed mutation before tear-
 		 * down. After this point sb_dirty must be 0. */
+		/* Task #33: stop the background pinscan first — it holds
+		 * private btree handles over meta_bio and takes the gate;
+		 * both must still exist while it drains. */
+		if (tmp_->pinscan_tq_init) {
+			tmp_->pinscan_abort = 1;
+			taskqueue_drain(tmp_->pinscan_tq, &tmp_->pinscan_task);
+			taskqueue_free(tmp_->pinscan_tq);
+			tmp_->pinscan_tq_init = 0;
+		}
 		if (tmp_->flush_co_init) {
 			tmp_->flush_unmounting = 1;
 			callout_drain(&tmp_->flush_co);
@@ -5474,35 +5473,7 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 	 */
 	tessera_metatrace(TM_OP_DRAIN_BEGIN, 0, tmp_->sb.generation,
 	    tmp_->meta_pending_count);
-	if (tmp_->meta_pending_count > 0 && tmp_->meta_free != NULL) {
-		const uint64_t mstart = tmp_->sb.meta_reserve_start;
-		const uint64_t mlen   = tmp_->sb.meta_reserve_length;
-		uint32_t kept = 0;
-		for (uint32_t i = 0; i < tmp_->meta_pending_count; i++) {
-			uint64_t s = tmp_->meta_pending[i];
-			int pinned = 0;
-			if (tmp_->meta_pin_bitmap != NULL &&
-			    s >= mstart && s < mstart + mlen) {
-				uint64_t bit = s - mstart;
-				if (tmp_->meta_pin_bitmap[bit / 8]
-				    & (1u << (bit % 8))) {
-					pinned = 1;
-				}
-			}
-			if (pinned) {
-				tmp_->meta_pending[kept++] = s;
-				tessera_metatrace(TM_OP_DRAIN_KEEP, s,
-				    tmp_->sb.generation, kept);
-			} else if (tmp_->meta_free_count
-			    < tmp_->meta_free_cap) {
-				tmp_->meta_free[tmp_->meta_free_count++] = s;
-				tessera_metatrace(TM_OP_DRAIN_RELEASE, s,
-				    tmp_->sb.generation,
-				    tmp_->meta_free_count);
-			}
-		}
-		tmp_->meta_pending_count = kept;
-	}
+	tessera_fs_meta_pending_drain(tmp_);
 	tessera_metatrace(TM_OP_DRAIN_END, 0, tmp_->sb.generation,
 	    tmp_->meta_pending_count);
 	return (0);
@@ -8938,6 +8909,25 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	}
 	mtx_unlock(&tmp_->flush_mtx);
 
+	/* Meta-reserve preflight (task #33): with the pinscan deferred, a
+	 * churn-heavy stretch can outrun the background swaps and leave
+	 * the reserve tight. This is the ONE safe place to recover
+	 * synchronously: the gate is held and no mutation of this flush
+	 * has started, so the in-memory roots equal the durable SB —
+	 * the scan's free-list synthesis and the pending drain are both
+	 * crash-consistent here (mid-flush they are NOT: half-built COW
+	 * nodes are unmarked, and pending sectors are still referenced
+	 * by the durable SB until commit_sb). */
+	if (tmp_->dirty_init && tmp_->meta_free_count == 0 &&
+	    tmp_->sb.meta_reserve_length -
+	    (tmp_->sb.meta_reserve_bump - tmp_->sb.meta_reserve_start)
+	    < 4096) {
+		printf("tessera_fs: meta_reserve preflight — synchronous "
+		    "pinscan (pending=%u)\n", tmp_->meta_pending_count);
+		tessera_fs_pinscan_run(tmp_);
+		tessera_fs_meta_pending_drain(tmp_);
+	}
+
 	sbintime_t _tpfl = TPROF_T0(), _tp;
 
 	/* Publish any coalesced INLINE/chunked writes — INSIDE the gate, so
@@ -9135,6 +9125,11 @@ tessera_fs_gc_now(struct tessera_mount *tmp_, uint64_t *out_reclaimed)
 static int
 meta_mark_visitor(void *ctx, uint64_t sector)
 {
+	{
+		struct meta_mark_ctx *_c = ctx;
+		if (_c->abort_flag != NULL && *_c->abort_flag)
+			return (1);	/* abort the walk */
+	}
 	struct meta_mark_ctx *m = ctx;
 	if (sector >= m->lo && sector < m->hi) {
 		uint64_t bit = sector - m->lo;
@@ -9158,81 +9153,175 @@ meta_mark_visitor(void *ctx, uint64_t sector)
  * underfoot). Mount-time caller is single-threaded; commit_sb caller
  * is serialised by flush_in_progress.
  */
+/* Background pin-bitmap scan (task #33). Rebuilds meta_pin_bitmap by
+ * walking PRIVATE btree handles opened at the committed roots (copied
+ * under the flush gate), so it runs concurrently with live mutation:
+ * committed COW nodes are immutable, and they cannot be recycled from
+ * under the walk because (a) the in-place bitmap keeps them pinned and
+ * (b) pinscan_active makes the meta allocator bump-only, so no sector
+ * below the captured bump0 is ever reused during the scan. At swap
+ * time, [bump0, current bump) is conservatively window-pinned (those
+ * sectors were allocated during the scan and are referenced by roots
+ * the scan never saw); meta_free is rebuilt from the fresh bitmap.
+ * Sectors the window-pin over-retains are recovered by the next scan
+ * (kicked at every snapshot retire) or the next mount. */
+static void
+tessera_fs_pinscan_run(struct tessera_mount *tmp_)
+{
+	if (tmp_->meta_pin_bitmap == NULL || tmp_->pinscan_abort)
+		return;
+
+	/* Snapshot committed roots + bump under the gate. */
+	sbintime_t _ps0 = sbinuptime();
+	tessera_fs_flush_gate_enter(tmp_);
+	const uint64_t mstart = tmp_->sb.meta_reserve_start;
+	const uint64_t mlen   = tmp_->sb.meta_reserve_length;
+	const uint64_t bump0  = tmp_->sb.meta_reserve_bump;
+	uint64_t r_inode = tmp_->sb.inode_root;
+	uint64_t r_reg   = tmp_->sb.pack_registry_root;
+	uint64_t r_fext  = tmp_->sb.free_extent_root;
+	uint64_t r_snap  = tmp_->sb.snapshots_root;
+	tmp_->pinscan_active = 1;
+	tessera_fs_flush_gate_exit(tmp_);
+
+	size_t bitmap_bytes = (size_t)((mlen + 7) / 8);
+	uint8_t *scratch = malloc(bitmap_bytes, M_TESSERA, M_WAITOK | M_ZERO);
+	struct meta_mark_ctx mctx = { scratch, mstart, mstart + mlen,
+	    &tmp_->pinscan_abort };
+	int aborted = 0;
+
+	struct { uint64_t root; int kind; uint32_t ksz; uint32_t vsz; } roots[4] = {
+		{ r_inode, 0, 4, TESSERA_INODE_RECORD_SIZE },
+		{ r_reg,   1, 16, TESSERA_REGISTRY_ENTRY_SIZE },
+		{ r_fext,  2, 8, 8 },
+		{ r_snap,  3, 8, TESSERA_SNAPSHOT_RECORD_SIZE },
+	};
+	for (int i = 0; i < 4 && !aborted; i++) {
+		if (roots[i].root == 0) continue;
+		tessera_btree_t *t = tessera_btree_open(&tmp_->meta_bio,
+		    roots[i].root, roots[i].kind, roots[i].ksz, roots[i].vsz);
+		if (t == NULL) continue;
+		int _wrc = tessera_btree_walk_nodes(t, meta_mark_visitor,
+		    &mctx);
+		if (_wrc != 0) {
+			printf("tessera_fs: pinscan walk[%d] root=%lu "
+			    "rc=%d%s\n", i, (unsigned long)roots[i].root,
+			    _wrc, tmp_->pinscan_abort ? " (abort)" : "");
+			aborted = 1;
+		}
+		tessera_btree_close(t);
+	}
+	/* Every retained snapshot's three tree roots. */
+	if (!aborted && r_snap != 0) {
+		tessera_btree_t *st = tessera_btree_open(&tmp_->meta_bio,
+		    r_snap, /*tree_kind*/ 3, /*key*/ 8,
+		    /*value*/ TESSERA_SNAPSHOT_RECORD_SIZE);
+		tessera_btree_cursor_t *sc = (st != NULL)
+		    ? tessera_btree_seek_first(st) : NULL;
+		while (sc != NULL && !aborted && !tmp_->pinscan_abort) {
+			uint8_t sk[8];
+			tessera_snapshot_record_t srec;
+			if (tessera_btree_cursor_get(sc, sk, &srec)
+			    != TESSERA_OK) break;
+			struct { uint64_t root; int kind; uint32_t ksz;
+			    uint32_t vsz; } sr[3] = {
+				{ srec.inode_root, 0, 4,
+				    TESSERA_INODE_RECORD_SIZE },
+				{ srec.pack_registry_root, 1, 16,
+				    TESSERA_REGISTRY_ENTRY_SIZE },
+				{ srec.free_extent_root, 2, 8, 8 },
+			};
+			for (int i = 0; i < 3 && !aborted; i++) {
+				if (sr[i].root == 0) continue;
+				tessera_btree_t *t = tessera_btree_open(
+				    &tmp_->meta_bio, sr[i].root, sr[i].kind,
+				    sr[i].ksz, sr[i].vsz);
+				if (t == NULL) continue;
+				int _src = tessera_btree_walk_nodes(t,
+				    meta_mark_visitor, &mctx);
+				if (_src != 0) {
+					printf("tessera_fs: pinscan snapwalk"
+					    "[%d] root=%lu rc=%d\n", i,
+					    (unsigned long)sr[i].root, _src);
+					aborted = 1;
+				}
+				tessera_btree_close(t);
+			}
+			if (tessera_btree_cursor_next(sc) != TESSERA_OK)
+				break;
+		}
+		if (sc != NULL) tessera_btree_cursor_free(sc);
+		if (st != NULL) tessera_btree_close(st);
+	}
+	if (aborted || tmp_->pinscan_abort) {
+		printf("tessera_fs: pinscan aborted after %ld ms\n",
+		    (long)((sbinuptime() - _ps0) / SBT_1MS));
+		free(scratch, M_TESSERA);
+		tmp_->pinscan_active = 0;
+		return;
+	}
+
+	/* Swap in under the gate: window-pin the scan-window allocations,
+	 * install the fresh bitmap, rebuild meta_free below bump0. */
+	tessera_fs_flush_gate_enter(tmp_);
+	const uint64_t bump1 = tmp_->sb.meta_reserve_bump;
+	/* Monotonic swap: never replace a NEWER scan's result — a stale
+	 * scratch judged reachability from older roots, and lowering the
+	 * watermark would re-expose sectors it never saw. */
+	if (bump0 < tmp_->meta_pin_watermark) {
+		tmp_->pinscan_active = 0;
+		tessera_fs_flush_gate_exit(tmp_);
+		free(scratch, M_TESSERA);
+		printf("tessera_fs: pinscan superseded (stale)\n");
+		return;
+	}
+	/* Watermark = bump0: everything allocated at/after scan start is
+	 * implicitly pinned by the drain filter — covers both the scan
+	 * window [bump0, bump1) and all future allocations until the next
+	 * swap. No explicit bit-setting needed. */
+	tmp_->meta_pin_watermark = bump0;
+	free(tmp_->meta_pin_bitmap, M_TESSERA);
+	tmp_->meta_pin_bitmap = scratch;
+	tmp_->meta_free_count = 0;
+	uint32_t freed = 0;
+	for (uint64_t sct = mstart; sct < bump0 &&
+	    tmp_->meta_free_count < tmp_->meta_free_cap; sct++) {
+		uint64_t bit = sct - mstart;
+		if (!(scratch[bit / 8] & (1u << (bit % 8)))) {
+			tmp_->meta_free[tmp_->meta_free_count++] = sct;
+			freed++;
+		}
+	}
+	tmp_->pinscan_active = 0;
+	tessera_fs_flush_gate_exit(tmp_);
+	tessera_metatrace(TM_OP_BITMAP_BUILT, 1, tmp_->sb.generation,
+	    (uint32_t)bitmap_bytes);
+	printf("tessera_fs: pinscan done in %ld ms — freed=%u "
+	    "pending=%u bump=%lu/%lu\n",
+	    (long)((sbinuptime() - _ps0) / (SBT_1MS)), freed,
+	    tmp_->meta_pending_count,
+	    (unsigned long)(bump1 - mstart), (unsigned long)mlen);
+}
+
+static void
+tessera_fs_pinscan_task(void *ctx, int pending)
+{
+	(void)pending;
+	tessera_fs_pinscan_run((struct tessera_mount *)ctx);
+}
+
 static void
 tessera_meta_pin_bitmap_rebuild(struct tessera_mount *tmp_)
 {
-	if (tmp_->meta_pin_bitmap == NULL) return;
-	memset(tmp_->meta_pin_bitmap, 0, tmp_->meta_pin_bitmap_bytes);
-
-	struct meta_mark_ctx mctx = {
-		tmp_->meta_pin_bitmap,
-		tmp_->sb.meta_reserve_start,
-		tmp_->sb.meta_reserve_start + tmp_->sb.meta_reserve_length,
-	};
-
-	if (tmp_->inode_tree != NULL)
-		(void)tessera_btree_walk_nodes(tmp_->inode_tree,
-		    meta_mark_visitor, &mctx);
-	if (tmp_->pack_registry_tree != NULL)
-		(void)tessera_btree_walk_nodes(tmp_->pack_registry_tree,
-		    meta_mark_visitor, &mctx);
-	if (tmp_->sb.free_extent_root != 0) {
-		tessera_btree_t *fet = tessera_btree_open(&tmp_->meta_bio,
-		    tmp_->sb.free_extent_root, /*tree_kind*/ 2,
-		    /*key*/ 8, /*value*/ 8);
-		if (fet != NULL) {
-			(void)tessera_btree_walk_nodes(fet,
-			    meta_mark_visitor, &mctx);
-			tessera_btree_close(fet);
-		}
-	}
-	if (tmp_->snapshots_tree == NULL) return;
-
-	(void)tessera_btree_walk_nodes(tmp_->snapshots_tree,
-	    meta_mark_visitor, &mctx);
-	tessera_btree_cursor_t *sc =
-	    tessera_btree_seek_first(tmp_->snapshots_tree);
-	while (sc != NULL) {
-		uint8_t sk[8];
-		tessera_snapshot_record_t srec;
-		if (tessera_btree_cursor_get(sc, sk, &srec) != TESSERA_OK)
-			break;
-		if (srec.inode_root != 0 &&
-		    srec.inode_root != tmp_->sb.inode_root) {
-			tessera_btree_t *t = tessera_btree_open(&tmp_->meta_bio,
-			    srec.inode_root, /*tree_kind*/ 0, /*key*/ 4,
-			    /*value*/ TESSERA_INODE_RECORD_SIZE);
-			if (t != NULL) {
-				(void)tessera_btree_walk_nodes(t,
-				    meta_mark_visitor, &mctx);
-				tessera_btree_close(t);
-			}
-		}
-		if (srec.pack_registry_root != 0 &&
-		    srec.pack_registry_root != tmp_->sb.pack_registry_root) {
-			tessera_btree_t *t = tessera_btree_open(&tmp_->meta_bio,
-			    srec.pack_registry_root, /*tree_kind*/ 1,
-			    /*key*/ 16, /*value*/ TESSERA_REGISTRY_ENTRY_SIZE);
-			if (t != NULL) {
-				(void)tessera_btree_walk_nodes(t,
-				    meta_mark_visitor, &mctx);
-				tessera_btree_close(t);
-			}
-		}
-		if (srec.free_extent_root != 0 &&
-		    srec.free_extent_root != tmp_->sb.free_extent_root) {
-			tessera_btree_t *t = tessera_btree_open(&tmp_->meta_bio,
-			    srec.free_extent_root, /*tree_kind*/ 2,
-			    /*key*/ 8, /*value*/ 8);
-			if (t != NULL) {
-				(void)tessera_btree_walk_nodes(t,
-				    meta_mark_visitor, &mctx);
-				tessera_btree_close(t);
-			}
-		}
-		if (tessera_btree_cursor_next(sc) != TESSERA_OK) break;
-	}
-	if (sc != NULL) tessera_btree_cursor_free(sc);
+	/* Task #33: the synchronous full-tree walk (live trees + three
+	 * trees per retained snapshot) is gone from this path — at commit
+	 * time it stalled the flush for the whole walk. Kick the
+	 * background pinscan instead; until it swaps in the fresh bitmap
+	 * the stale one conservatively over-pins (retired-snapshot
+	 * sectors stay unreclaimed a little longer — safe). */
+	if (tmp_->pinscan_tq_init)
+		(void)taskqueue_enqueue(tmp_->pinscan_tq,
+		    &tmp_->pinscan_task);
 }
 
 /*

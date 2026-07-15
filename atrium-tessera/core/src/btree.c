@@ -112,8 +112,12 @@ load_node(const tessera_btree_t *t, uint64_t sector, uint8_t *block)
 	tessera_btree_node_header_t h;
 	if (read_header(block, &h) != TESSERA_OK)
 		return TESSERA_ECORRUPT;
-	if (h.tree_kind != t->tree_kind)
+	if (h.tree_kind != t->tree_kind) {
+		tessera_debugf("btree load_node: sector %llu kind=%u "
+		    "expected=%u\n", (unsigned long long)sector,
+		    (unsigned)h.tree_kind, (unsigned)t->tree_kind);
 		return TESSERA_ECORRUPT;
+	}
 	return TESSERA_OK;
 }
 

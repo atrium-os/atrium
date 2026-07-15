@@ -26,9 +26,12 @@
 #  define tessera_calloc(c, n)     malloc((c) * (n), M_TESSERA, M_WAITOK | M_ZERO)
 #  define tessera_realloc(p, n)    realloc((p), (n), M_TESSERA, M_WAITOK)
 #  define tessera_free(p)          free((p), M_TESSERA)
+#  define tessera_debugf(...)      printf(__VA_ARGS__)
 #else
 #  include <stdlib.h>
 #  include <string.h>
+#  include <stdio.h>
+#  define tessera_debugf(...)      fprintf(stderr, __VA_ARGS__)
 #  define tessera_malloc(n)        malloc(n)
 #  define tessera_zalloc(n)        calloc(1u, (n))
 #  define tessera_calloc(c, n)     calloc((c), (n))
