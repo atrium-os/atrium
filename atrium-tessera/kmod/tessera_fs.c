@@ -1336,6 +1336,9 @@ static int tessera_fs_dir_btree_migrate(struct tessera_mount *tmp_,
  * cap-trigger threshold need to be declared here too because
  * mark_dirty (also above the impl) reads them. */
 #define TESSERA_DIRENT_LOG_MISS  (-1)
+static int tessera_preflight_enable = 1;
+SYSCTL_INT(_kern_tessera, OID_AUTO, preflight, CTLFLAG_RW,
+    &tessera_preflight_enable, 0, "1 = flush-start meta-reserve preflight pinscan");
 static int tessera_mount_gc_enable = 0;
 SYSCTL_INT(_kern_tessera, OID_AUTO, mount_gc, CTLFLAG_RW,
     &tessera_mount_gc_enable, 0,
@@ -6383,6 +6386,7 @@ tessera_fs_pending_manifest_put_impl(struct tessera_mount *tmp_,
 				 * list to begin with — skipping them here
 				 * was the bug that made truncate(file)
 				 * silently wipe the parent directory. */
+				if (removed)
 				if (removed && LIST_EMPTY(&prev->owners)) {
 					LIST_REMOVE(prev, link);
 					tmp_->pending_manifest_count--;
@@ -6560,7 +6564,7 @@ tessera_fs_pending_manifests_drain(struct tessera_mount *tmp_)
 			    &snap_dummy) &&
 			    tessera_fs_registry_get(tmp_,
 			        snap_dummy.pack_id, dedup_reg) == TESSERA_OK) {
-				tessera_stat_aggregation_dedups++;
+			tessera_stat_aggregation_dedups++;
 				mtx_lock(&tmp_->flush_mtx);
 				e->draining = 0;
 				RETIRE_ENTRY(e);
@@ -8918,7 +8922,8 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	 * crash-consistent here (mid-flush they are NOT: half-built COW
 	 * nodes are unmarked, and pending sectors are still referenced
 	 * by the durable SB until commit_sb). */
-	if (tmp_->dirty_init && tmp_->meta_free_count == 0 &&
+	if (tessera_preflight_enable && tmp_->dirty_init &&
+	    tmp_->meta_free_count == 0 &&
 	    tmp_->sb.meta_reserve_length -
 	    (tmp_->sb.meta_reserve_bump - tmp_->sb.meta_reserve_start)
 	    < 4096) {
@@ -8926,6 +8931,46 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 		    "pinscan (pending=%u)\n", tmp_->meta_pending_count);
 		tessera_fs_pinscan_run(tmp_);
 		tessera_fs_meta_pending_drain(tmp_);
+		/* Escalation valve (retention-economics spiral): if the
+		 * scan freed NOTHING, everything pending is legitimately
+		 * pinned by retained snapshots — and once the reserve hits
+		 * total exhaustion, commits fail, so retires never run, so
+		 * nothing ever unpins: a livelock (observed: 6h of failing
+		 * flushes under rm+untar churn). Retire oldest snapshots
+		 * NOW, while there is still headroom for the snapshots-
+		 * btree COW, rescanning after each retire. Retention is a
+		 * convenience; the live filesystem is not. */
+		int _rr = 0;
+		while (tmp_->meta_free_count == 0 &&
+		    tmp_->snapshots_tree != NULL &&
+		    tmp_->sb.snapshots_gen > 1 && _rr < 8) {
+			tessera_btree_cursor_t *sc =
+			    tessera_btree_seek_first(tmp_->snapshots_tree);
+			if (sc == NULL) break;
+			uint8_t okey[8];
+			tessera_snapshot_record_t orec;
+			int got = (tessera_btree_cursor_get(sc, okey, &orec)
+			    == TESSERA_OK);
+			tessera_btree_cursor_free(sc);
+			if (!got) break;
+			uint64_t after_root = tmp_->sb.snapshots_root;
+			if (tessera_btree_delete(tmp_->snapshots_tree, okey,
+			    &after_root) != TESSERA_OK) {
+				printf("tessera_fs: preflight retire failed "
+				    "(reserve too far gone)\n");
+				break;
+			}
+			tmp_->sb.snapshots_root = after_root;
+			tmp_->sb.snapshots_gen--;
+			tessera_stat_snapshots_retired++;
+			_rr++;
+			tessera_fs_pinscan_run(tmp_);
+			tessera_fs_meta_pending_drain(tmp_);
+		}
+		if (_rr > 0)
+			printf("tessera_fs: preflight retired %d snapshot(s) "
+			    "under reserve pressure — free=%u\n", _rr,
+			    tmp_->meta_free_count);
 	}
 
 	sbintime_t _tpfl = TPROF_T0(), _tp;
@@ -9280,6 +9325,30 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	 * window [bump0, bump1) and all future allocations until the next
 	 * swap. No explicit bit-setting needed. */
 	tmp_->meta_pin_watermark = bump0;
+	/* CRITICAL: sectors currently in meta_pending are unreachable
+	 * from every root (that is why they were freed), so the scan
+	 * left them unmarked — but they must enter meta_free ONLY via
+	 * the pending drain, or the synthesis below adds them a SECOND
+	 * time -> duplicate meta_free entries -> the allocator hands the
+	 * same sector to two btree nodes -> live tree corruption ("root
+	 * inode 2 missing"). Mark them in the scratch bitmap so the
+	 * synthesis skips them. (The mount-time original never hit this:
+	 * meta_pending is empty at mount.) */
+	uint32_t pend_n = 0;
+	uint64_t *pend_bits = NULL;
+	if (tmp_->meta_pending_count > 0)
+		pend_bits = malloc((size_t)tmp_->meta_pending_count *
+		    sizeof(uint64_t), M_TESSERA, M_WAITOK);
+	for (uint32_t i = 0; i < tmp_->meta_pending_count; i++) {
+		uint64_t ps = tmp_->meta_pending[i];
+		if (ps >= mstart && ps < mstart + mlen) {
+			uint64_t bit = ps - mstart;
+			if (!(scratch[bit / 8] & (1u << (bit % 8)))) {
+				scratch[bit / 8] |= (uint8_t)(1u << (bit % 8));
+				pend_bits[pend_n++] = bit;
+			}
+		}
+	}
 	free(tmp_->meta_pin_bitmap, M_TESSERA);
 	tmp_->meta_pin_bitmap = scratch;
 	tmp_->meta_free_count = 0;
@@ -9292,6 +9361,15 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 			freed++;
 		}
 	}
+	/* The pending-sector marks above exist ONLY to keep synthesis
+	 * from double-adding sectors the drain will release — clear them
+	 * so the installed bitmap reflects true reachability and the
+	 * drain can actually release unpinned pending sectors (leaving
+	 * them set starves the reserve under churn). */
+	for (uint32_t i = 0; i < pend_n; i++)
+		scratch[pend_bits[i] / 8] &=
+		    (uint8_t)~(1u << (pend_bits[i] % 8));
+	if (pend_bits != NULL) free(pend_bits, M_TESSERA);
 	tmp_->pinscan_active = 0;
 	tessera_fs_flush_gate_exit(tmp_);
 	tessera_metatrace(TM_OP_BITMAP_BUILT, 1, tmp_->sb.generation,
@@ -10123,15 +10201,7 @@ tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
 	 * keeps only the ROOT alive. depth caps recursion so a corrupt
 	 * cycle can't loop forever. Inline lambda via nested macro for
 	 * conciseness — pure C function follows. */
-#define _GC_WALK_INODE_TREE(_tree) do {                                   \
-	if ((_tree) == NULL) break;                                       \
-	tessera_btree_cursor_t *_c = tessera_btree_seek_first(_tree);     \
-	if (_c == NULL) break;                                            \
-	for (;;) {                                                        \
-		uint8_t _k[4];                                            \
-		tessera_inode_record_t _ino;                              \
-		if (tessera_btree_cursor_get(_c, _k, &_ino) != TESSERA_OK)\
-			break;                                            \
+#define _GC_WALK_RECORD(_ino) do {                                       \
 		tessera_hash_t _stack[64];                                \
 		int _sp = 0;                                              \
 		if (!tessera_hash_is_null(_ino.manifest_hash)) {          \
@@ -10211,6 +10281,18 @@ tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
 			tessera_manifest_parser_free(_p);                 \
 			free(_blob, M_TESSERA);                           \
 		}                                                         \
+} while (0)
+
+#define _GC_WALK_INODE_TREE(_tree) do {                                   \
+	if ((_tree) == NULL) break;                                       \
+	tessera_btree_cursor_t *_c = tessera_btree_seek_first(_tree);     \
+	if (_c == NULL) break;                                            \
+	for (;;) {                                                        \
+		uint8_t _k[4];                                            \
+		tessera_inode_record_t _ino;                              \
+		if (tessera_btree_cursor_get(_c, _k, &_ino) != TESSERA_OK)\
+			break;                                            \
+		_GC_WALK_RECORD(_ino);                                    \
 		if (tessera_btree_cursor_next(_c) != TESSERA_OK) break;   \
 	}                                                                 \
 	tessera_btree_cursor_free(_c);                                    \
@@ -10253,7 +10335,84 @@ tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
 			    "unionised; %u total live hashes\n",
 			    snap_count, live_count);
 	}
+	/* In-flight state (task #37): inode records still in the dirty
+	 * cache and manifests still pending are INVISIBLE to the
+	 * committed-tree walks above — and this GC runs MID-FLUSH (the
+	 * tombstone pre-pass in tessera_fs_flush) BEFORE those caches
+	 * drain. Without walking them, a pack whose only remaining
+	 * references live in the caches (rm + re-untar dedup churn: the
+	 * old owners were just tombstoned, the new owners haven't
+	 * drained) is reclaimed as garbage — committed inodes then
+	 * reference blobs that are in no pack (fsck danglings). Seeds
+	 * are copied under flush_mtx, walked outside it (fetch_blob
+	 * sleeps; it resolves pending-cache roots per the publish-in-
+	 * place doctrine). If the seed buffer would overflow (caches
+	 * grew mid-copy — Option C writers don't hold the gate), ABORT
+	 * the GC pass entirely: reclaiming with an incomplete live set
+	 * is exactly the bug this fixes. */
+	int gc_seed_abort = 0;
+	{
+		mtx_lock(&tmp_->flush_mtx);
+		uint32_t scap = tmp_->dirty_count * 2 +
+		    tmp_->pending_manifest_count + 1024;
+		mtx_unlock(&tmp_->flush_mtx);
+		tessera_hash_t *seeds = malloc(
+		    (size_t)scap * sizeof(*seeds), M_TESSERA, M_WAITOK);
+		uint32_t scount = 0;
+		mtx_lock(&tmp_->flush_mtx);
+		for (uint32_t b = 0; b < TESSERA_DIRTY_INODE_BUCKETS &&
+		    !gc_seed_abort; b++) {
+			struct tessera_dirty_inode *e;
+			LIST_FOREACH(e, &tmp_->dirty_inodes[b], link) {
+				if (e->tombstone) continue;
+				if (scount + 2 > scap) {
+					gc_seed_abort = 1; break;
+				}
+				if (!tessera_hash_is_null(
+				    e->rec.manifest_hash))
+					memcpy(seeds[scount++],
+					    e->rec.manifest_hash,
+					    TESSERA_HASH_SIZE);
+				if (!tessera_hash_is_null(e->rec.xattr_hash))
+					memcpy(seeds[scount++],
+					    e->rec.xattr_hash,
+					    TESSERA_HASH_SIZE);
+			}
+		}
+		for (uint32_t b = 0; b < TESSERA_PENDING_MANIFEST_BUCKETS &&
+		    !gc_seed_abort; b++) {
+			struct tessera_pending_manifest *pm;
+			LIST_FOREACH(pm, &tmp_->pending_manifests[b], link) {
+				if (scount + 1 > scap) {
+					gc_seed_abort = 1; break;
+				}
+				memcpy(seeds[scount++], pm->hash,
+				    TESSERA_HASH_SIZE);
+			}
+		}
+		mtx_unlock(&tmp_->flush_mtx);
+		if (!gc_seed_abort) {
+			for (uint32_t si = 0; si < scount; si++) {
+				tessera_inode_record_t fake;
+				memset(&fake, 0, sizeof fake);
+				memcpy(fake.manifest_hash, seeds[si],
+				    TESSERA_HASH_SIZE);
+				_GC_WALK_RECORD(fake);
+			}
+			printf("tessera_fs: gc pass1 — %u in-flight seeds; "
+			    "%u total live hashes\n", scount, live_count);
+		}
+		free(seeds, M_TESSERA);
+	}
+	if (gc_seed_abort) {
+		printf("tessera_fs: gc ABORTED — in-flight seed buffer "
+		    "overflow (caches grew mid-scan); no reclaim\n");
+		free(live, M_TESSERA);
+		return (0);
+	}
+
 #undef _GC_WALK_INODE_TREE
+#undef _GC_WALK_RECORD
 #undef _GC_PUSH_HASH
 
 	/* Pass 2: walk pack_registry_tree, identify dead single-blob
