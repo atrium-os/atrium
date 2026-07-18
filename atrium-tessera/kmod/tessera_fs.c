@@ -793,6 +793,8 @@ static inline uint32_t tessera_chunk_size_for(struct tessera_mount *tmp_,
 static int  tessera_fs_dirty_content_drain_one(struct tessera_mount *tmp_,
     uint32_t inode_no);
 static int  tessera_fs_dirty_content_drain_all(struct tessera_mount *tmp_);
+static int tessera_cmp_dirty_inode_ptr(const void *, const void *);
+static int tessera_cmp_logent_ptr(const void *, const void *);
 #define TESSERA_FS_PUT_RACED  (-1000)	/* inode_put_cond: gen moved, retry */
 static void tessera_fs_dirty_content_drop(struct tessera_mount *tmp_,
     uint32_t inode_no);
@@ -1199,6 +1201,27 @@ struct tessera_dirent_log_entry {
 	uint16_t name_len;
 	char     name[];
 };
+
+/* qsort comparators (task #38 — quadratic-sort livelock fix). */
+static int
+tessera_cmp_dirty_inode_ptr(const void *a, const void *b)
+{
+	const struct tessera_dirty_inode *x =
+	    *(const struct tessera_dirty_inode * const *)a;
+	const struct tessera_dirty_inode *y =
+	    *(const struct tessera_dirty_inode * const *)b;
+	return ((x->inode_no > y->inode_no) - (x->inode_no < y->inode_no));
+}
+static int
+tessera_cmp_logent_ptr(const void *a, const void *b)
+{
+	const struct tessera_dirent_log_entry *x =
+	    *(const struct tessera_dirent_log_entry * const *)a;
+	const struct tessera_dirent_log_entry *y =
+	    *(const struct tessera_dirent_log_entry * const *)b;
+	return ((x->seq > y->seq) - (x->seq < y->seq));
+}
+
 static int tessera_fs_inode_get(struct tessera_mount *tmp_,
                                 uint32_t inode_no,
                                 tessera_inode_record_t *out);
@@ -6165,19 +6188,13 @@ tessera_fs_dirty_inodes_drain(struct tessera_mount *tmp_)
 		mtx_unlock(&tmp_->flush_mtx);
 
 		if (nclaim > 1) {
-			/* Sort claim pointers by inode_no (== BE-key
-			 * order). Insertion sort is fine at flush batch
-			 * sizes and avoids kernel qsort_r plumbing. */
-			for (uint32_t i = 1; i < nclaim; i++) {
-				struct tessera_dirty_inode *cur = claimed[i];
-				int32_t j = (int32_t)i - 1;
-				while (j >= 0 &&
-				    claimed[j]->inode_no > cur->inode_no) {
-					claimed[j + 1] = claimed[j];
-					j--;
-				}
-				claimed[j + 1] = cur;
-			}
+			/* Sort claim pointers by inode_no (== BE-key order).
+			 * O(n log n) — task #38: the old insertion sort went
+			 * quadratic when churn backlogged the cache (10k+
+			 * claims = minutes of kernel spin UNDER THE GATE,
+			 * presenting as a whole-system livelock). */
+			qsort(claimed, nclaim, sizeof(claimed[0]),
+			    tessera_cmp_dirty_inode_ptr);
 		}
 
 		uint32_t done = 0;
@@ -15805,15 +15822,13 @@ tessera_fs_dirent_log_checkpoint_parent(struct tessera_mount *tmp_,
 
 	/* Sort by seq (oldest → newest). Insertion sort; logcount is
 	 * bounded by dirent_log_threshold. */
-	for (uint32_t i = 1; i < logcount; i++) {
-		struct tessera_dirent_log_entry *cur = logents[i];
-		int32_t j = (int32_t)i - 1;
-		while (j >= 0 && logents[j]->seq > cur->seq) {
-			logents[j+1] = logents[j];
-			j--;
-		}
-		logents[j+1] = cur;
-	}
+	/* O(n log n) — task #38: under churn + checkpoint-failure retry a
+	 * parent accumulated 100k+ log entries; the old insertion sort on
+	 * seq was quadratic (hours of kernel spin under the gate = the
+	 * "kernel wedge"). */
+	if (logcount > 1)
+		qsort(logents, logcount, sizeof(logents[0]),
+		    tessera_cmp_logent_ptr);
 
 	/* Read parent inode, fetch current dir contents into a working
 	 * collection. */
