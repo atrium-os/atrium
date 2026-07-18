@@ -1495,6 +1495,10 @@ struct tessera_mount {
 	 * (silent snapshot-tree corruption, previously masked by the
 	 * every-retire synchronous rebuild). */
 	uint64_t                  meta_pin_watermark;
+	/* task #39: last tick the tombstone-flush data-zone GC ran, to
+	 * rate-limit it (gc_data_zone is O(inodes × retained-snapshots ×
+	 * fetch_blob); running per-remove made rm -rf take hours). */
+	int                       last_tombstone_gc_ticks;
 	uint8_t                  *meta_pin_bitmap;
 	size_t                    meta_pin_bitmap_bytes;
 
@@ -9068,8 +9072,29 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	}
 	mtx_unlock(&tmp_->flush_mtx);
 	if (has_tombstones && !tmp_->readonly_snapshot) {
+		/* Draining tombstoned inode records from the btree is cheap
+		 * (O(tombstones · log N)) — always do it. */
 		(void)tessera_fs_dirty_inodes_drain_tombstones(tmp_);
-		(void)tessera_fs_gc_data_zone(tmp_);
+		/* The data-zone GC that reclaims the unlinked files' now-
+		 * orphaned content packs is NOT cheap: O(inodes × retained
+		 * snapshots × fetch_blob), ~110k cold reads once snapshots
+		 * accumulate. Its ONLY purpose is to keep the data zone from
+		 * filling to ENOSPC during rm-heavy work — so run it only
+		 * under genuine free-space pressure, and no more than ~twice
+		 * a second so a GC that reclaims nothing can't thrash every
+		 * flush (task #39). During a normal rm -rf the zone has ample
+		 * free space and this never fires. */
+		uint64_t _free = tmp_->extent_alloc != NULL
+		    ? tessera_extent_free_blocks(tmp_->extent_alloc) : 0;
+		uint64_t _zone = tmp_->sb.pack_zone_length;
+		int _tight = (_zone > 0 && _free < _zone / 8);  /* <12.5% */
+		int _now = (int)ticks;
+		int _elapsed = _now - tmp_->last_tombstone_gc_ticks;
+		if (_tight && (tmp_->last_tombstone_gc_ticks == 0 ||
+		    _elapsed < 0 || _elapsed > (hz / 2))) {
+			tmp_->last_tombstone_gc_ticks = _now;
+			(void)tessera_fs_gc_data_zone(tmp_);
+		}
 	}
 
 	_tp = TPROF_T0();
