@@ -27,6 +27,7 @@ mod injector_reader;
 mod input_reader;
 mod laminar;
 mod pointer_reader;
+mod redraw;
 mod socket_server;
 
 use atrium_gpu::amd::{Display, Gpu, Scanout};
@@ -127,12 +128,21 @@ fn main() -> std::io::Result<()> {
         .unwrap_or_else(|_| PathBuf::from("/atrium/sockets/fresco/fresco.sock"));
     let wm_sock = Some(std::env::var("FRESCOD_WM_SOCK").map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/atrium/sockets/fresco-wm/fresco-wm.sock")));
+    /* Task #25: damage signal shared by every producer (socket ops,
+     * input, compositor events) and consumed by the display loop so it
+     * recomposes on change instead of spinning at TARGET_FPS. */
+    let redraw = redraw::RedrawSignal::new();
+
     let event_subs = socket_server::spawn(
-        socket_server::Shared { frontend: frontend.clone(), lane: None },
+        socket_server::Shared {
+            frontend: frontend.clone(),
+            lane: None,
+            redraw: redraw.clone(),
+        },
         &sock_path,
         wm_sock.as_deref(),
     )?;
-    socket_server::spawn_event_fanout(ev_rx, event_subs);
+    socket_server::spawn_event_fanout(ev_rx, event_subs, redraw.clone());
 
     /* Native FreeBSD keyboard + pointer input. Both read /dev/hidraw*
      * directly (boot-protocol HID), update server cursor / focus state,
@@ -158,8 +168,46 @@ fn main() -> std::io::Result<()> {
     check_fault("page_flip", dpy.page_flip(scan_off, scan_size, true)?)?;
     frame += 1;
 
-    let mut next = Instant::now() + Duration::from_nanos(FRAME_NS);
+    /* ── Damage-driven present (task #25) ────────────────────────────
+     * Recompose + flip only when a producer signalled `redraw`; otherwise
+     * block. The display engine scans out the shared VRAM BO on its own,
+     * so a static screen needs no frescod work. Bursts of damage between
+     * frame boundaries coalesce into one render (last_gen jumps ahead),
+     * capping present rate at TARGET_FPS. IDLE_HEARTBEAT re-renders as a
+     * safety net against any damage source not wired to `redraw`. */
+    const IDLE_HEARTBEAT: Duration = Duration::from_secs(1);
+    let mut last_gen: u64 = 0;              /* 0 != initial 1 -> render frame 0 */
+    /* Force the first present immediately (heartbeat treated as already due). */
+    let mut last_render = Instant::now()
+        .checked_sub(IDLE_HEARTBEAT)
+        .unwrap_or_else(Instant::now);
+    let mut next = Instant::now();
     loop {
+        let cur = redraw.current();
+        let heartbeat_due = last_render.elapsed() >= IDLE_HEARTBEAT;
+        if cur == last_gen && !heartbeat_due {
+            /* Nothing changed since the last present — sleep until the
+             * next damage signal, or until the heartbeat comes due,
+             * consuming no CPU meanwhile. The bounded wait is the safety
+             * net: even a damage source not wired to `redraw` refreshes
+             * within IDLE_HEARTBEAT. */
+            let until_beat =
+                IDLE_HEARTBEAT.saturating_sub(last_render.elapsed());
+            redraw.wait_past(last_gen, until_beat);
+            continue;
+        }
+
+        /* Rate-limit to the frame interval: coalesce any further damage
+         * that lands while we wait for the boundary. */
+        let now = Instant::now();
+        if next > now {
+            std::thread::sleep(next - now);
+        }
+
+        /* Snapshot the generation AFTER the pacing sleep so damage during
+         * the sleep is folded into this present rather than triggering an
+         * immediate extra one. */
+        last_gen = redraw.current();
         render_one_frame(&mut renderer, &frontend, &comp, mode.width, mode.height)
             .map_err(io_other)?;
         fill_framebuffer(&renderer, &mut framebuffer).map_err(io_other)?;
@@ -168,11 +216,8 @@ fn main() -> std::io::Result<()> {
         frame = frame.wrapping_add(1);
         let _ = frame;
 
-        let now = Instant::now();
-        if next > now {
-            std::thread::sleep(next - now);
-        }
-        next += Duration::from_nanos(FRAME_NS);
+        last_render = Instant::now();
+        next = last_render + Duration::from_nanos(FRAME_NS);
     }
 }
 
@@ -211,10 +256,15 @@ fn run_headless(png: &str) -> std::io::Result<()> {
         .unwrap_or_else(|_| PathBuf::from("/atrium/sockets/fresco/fresco.sock"));
     let wm_sock = Some(std::env::var("FRESCOD_WM_SOCK").map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/atrium/sockets/fresco-wm/fresco-wm.sock")));
+    let redraw = redraw::RedrawSignal::new();
     let subs = socket_server::spawn(
-        socket_server::Shared { frontend: frontend.clone(), lane: None },
+        socket_server::Shared {
+            frontend: frontend.clone(),
+            lane: None,
+            redraw: redraw.clone(),
+        },
         &sock, wm_sock.as_deref())?;
-    socket_server::spawn_event_fanout(ev_rx, subs);
+    socket_server::spawn_event_fanout(ev_rx, subs, redraw);
     eprintln!("frescod-headless: {W}x{H} on {} → {png}.png", sock.display());
 
     let out = format!("{png}.png");

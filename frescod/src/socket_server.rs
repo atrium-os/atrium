@@ -53,6 +53,9 @@ pub struct Shared {
     /// Deadline broker (Laminar phase J); None when /dev/laminar is
     /// absent or the scheduler is not Laminar.
     pub lane: Option<Arc<LaneBroker>>,
+    /// Damage signal (task #25): woken after every client op so the
+    /// display loop recomposes only when the scene actually changed.
+    pub redraw: crate::redraw::Redraw,
 }
 
 /// Bring up frescod's connection acceptor(s).
@@ -115,11 +118,16 @@ fn start_listener(sock_path: &Path, shared: Shared, event_subs: EventSubs, wm_gr
 pub fn spawn_event_fanout(
     rx: Receiver<DisplayEvent>,
     subs: EventSubs,
+    redraw: crate::redraw::Redraw,
 ) {
     std::thread::Builder::new()
         .name("frescod-event-fanout".into())
         .spawn(move || {
             for ev in rx.iter() {
+                /* Task #25: input + compositor events all funnel through
+                 * here — wake the display loop so cursor/focus/window
+                 * changes recompose. */
+                redraw.wake();
                 let (op, payload) = match encode_event(&ev) {
                     Ok(p) => p,
                     Err(e) => {
@@ -190,12 +198,13 @@ fn accept_loop(listener: UnixListener, shared: Shared, event_subs: EventSubs, wm
                 /* Reader thread. */
                 let frontend = shared.frontend.clone();
                 let lane = shared.lane.clone();
+                let redraw = shared.redraw.clone();
                 std::thread::Builder::new()
                     .name(format!("frescod-reader-{client_id}"))
                     .spawn(move || {
                         if let Err(e) = reader_loop(
                             stream, frontend.clone(), client_id, tx,
-                            lane.clone(), wm_grant,
+                            lane.clone(), wm_grant, redraw,
                         ) {
                             eprintln!("frescod: reader {client_id}: {e}");
                         }
@@ -222,6 +231,7 @@ fn reader_loop(
     out: Sender<Outbound>,
     lane: Option<Arc<LaneBroker>>,
     wm_grant: bool,
+    redraw: crate::redraw::Redraw,
 ) -> io::Result<()> {
     let peer_pid = peer_cred_pid(&stream);
 
@@ -324,6 +334,10 @@ fn reader_loop(
                 vec![error_reply(msg.op, &e)]
             }
         };
+        /* Task #25: a client op just mutated scene/window state — wake the
+         * display loop to recompose. Over-signalling is harmless (bumps
+         * coalesce into a single render). */
+        redraw.wake();
         for o in outs {
             if out.send(o).is_err() {
                 /* Writer exited; bail. */

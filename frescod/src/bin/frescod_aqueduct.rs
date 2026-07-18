@@ -81,6 +81,8 @@ mod input_reader;
 mod pointer_reader;
 #[path = "../laminar.rs"]
 mod laminar;
+#[path = "../redraw.rs"]
+mod redraw;
 #[path = "../socket_server.rs"]
 mod socket_server;
 
@@ -312,15 +314,17 @@ fn main() -> std::io::Result<()> {
         }
     };
 
+    let redraw = redraw::RedrawSignal::new();
     let event_subs = socket_server::spawn(
         socket_server::Shared {
             frontend: frontend.clone(),
             lane: lane.clone(),
+            redraw: redraw.clone(),
         },
         &sock_path,
         None,
     )?;
-    socket_server::spawn_event_fanout(ev_rx, event_subs);
+    socket_server::spawn_event_fanout(ev_rx, event_subs, redraw);
 
     // Input readers (same as the standalone frescod).
     input_reader::spawn(ev_tx.clone(), comp.clone());

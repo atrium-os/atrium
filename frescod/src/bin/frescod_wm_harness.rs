@@ -23,6 +23,8 @@ use fresco_scene_server::window::Compositor;
 
 #[path = "../laminar.rs"]
 mod laminar;
+#[path = "../redraw.rs"]
+mod redraw;
 #[path = "../socket_server.rs"]
 mod socket_server;
 
@@ -41,7 +43,7 @@ fn main() -> std::io::Result<()> {
 
     // No deadline lane here — the WM path doesn't use it.
     let _subs = socket_server::spawn(
-        socket_server::Shared { frontend, lane: None },
+        socket_server::Shared { frontend, lane: None, redraw: redraw::RedrawSignal::new() },
         &sock,
         None,
     )?;
