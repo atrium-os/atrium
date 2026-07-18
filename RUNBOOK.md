@@ -978,6 +978,20 @@ vssh '
 # forum-bar declares role=Chrome, forum-dock role=Background so the WM doesn't gate them; forum-wm's forum-ctl
 # socket is 0666 for the chrome's cross-uid connect (bar shows live "0 windows" = it queried forum-ctl).
 
+#### Jail-boot nullfs panic — PRELOAD nullfs (task #41, 2026-07-18)
+# Intermittent (~1/33) boot panic `getnewvnode: not registered vector op` (vfs_subr.c:2082)
+# <- null_nodeget <- vfs_domount_first. Cause: nullfs is a LOADABLE module (nullfs.ko, not
+# builtin), auto-loaded on the first jail nullfs mount. portcullisd-bootstrap creates the 5
+# system-service jails (frescod/ostiarius/memoryd/memfed/stoad) CONCURRENTLY, each with many
+# ro_nullfs rootfs mounts — so a 2nd jail's mount can use `null_vnodeops` before the on-demand
+# nullfs.ko load's VFS_VOP_VECTOR_REGISTER SYSINIT (SI_SUB_VFS) has marked it registered.
+# Diagnosis without reproducing: mapped getnewvnode+0x1f0 via the host-side kernel.debug
+# (scratch/kernel-syms/) -> addr2line -> the KASSERT line.
+# FIX: preload nullfs so it is fully registered before any userland mount —
+#   echo 'nullfs_load="YES"' >> /boot/loader.conf
+# Safe (nullfs is stock FreeBSD, not a buggy kmod — the loader-preload brick risk at line ~1110
+# does not apply). Standard FreeBSD dependency-preload, same pattern as atrium_virtio_gpu_load.
+
 #### Boot directly to vestibulum (rc services, VERIFIED 2026-06-18)
 # rc.d: atrium-jaild (portcullis/jaild/etc) + atrium-frescod (frescod/etc) + atrium-ostiarius
 # (portcullis/ostiarius/etc) → /usr/local/etc/rc.d/ (chmod +x). Binaries → /usr/local/bin/
