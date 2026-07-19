@@ -247,6 +247,25 @@ vssh "df -k /mnt/tessera; ls -la /mnt/tessera; stat /mnt/tessera"
 vssh "umount /mnt/tessera; mdconfig -d -u md0; kldunload tessera_fs"
 ```
 
+`tessera-fsck` — offline consistency checker AND repair (commits 76460dd Tier-A,
+d7b1c1c Tier-B). Default is read-only detect (exit 1 on problems). `--repair`
+(`-y`) applies fixes in place then re-verifies; `-n` forces detect-only.
+
+```sh
+vssh "$BIN/tessera-fsck /tmp/test.img"          # detect (read-only)
+vssh "$BIN/tessera-fsck --repair -v /tmp/test.img"  # repair + re-verify
+```
+
+Repairs (safe → structural): nlink correction, quota used_bytes, free-extent-tree
+rebuild (reclaims leaked space + fixes double-state); dangling-dirent removal,
+orphan → /lost+found relink. `--repair` iterates to a fixpoint (≤8 passes) because
+some fixes expose others. Persists via a new SB (bumped generation) written with
+the offline `tessera_volume_commit_roots` core primitive — repaired volumes remount
+cleanly in the kmod. Needs the device opened O_SYNC (the tool does this). NOTE: core
+must be rebuilt IN-VM after editing `atrium-tessera/core/*` (`vssh 'cd
+/mnt/host/atrium-tessera/core && make'`) BEFORE the host cross-build, or the tools
+link a stale libtessera_core.a — do NOT `ar` the .a on macOS (mangles ELF objects).
+
 Gotchas (each one cost a kernel panic + qcow2 restore — preserved here so the next round doesn't repeat them):
 
 - **`vflush(mp, rootrefs, …)` rootrefs MUST be 0** — vfs_root allocates the root vnode lazily on every call; rootrefs=1 is for filesystems that hold one for the lifetime of the mount, and tessera_fs panics at umount with `vflush: not busy`.
