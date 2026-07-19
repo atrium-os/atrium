@@ -2906,6 +2906,24 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 				tmp_->journal_log_co_init = 0;
 			}
 			(void)tessera_fs_flush(tmp_);
+			/* Clean-unmount journal reset. The final flush above made
+			 * the SB fully reflect every committed mutation and every
+			 * referenced manifest durable. Any journal records still
+			 * present are redo for ALREADY-committed ops — either
+			 * written by journal_log_drain just now, or left when a
+			 * prior periodic flush committed the SB (sb_dirty→0) so
+			 * this flush early-returned without a checkpoint. Replaying
+			 * them on the next mount is at best redundant and at worst
+			 * fatal: a record can name a directory manifest that was
+			 * only ever in the RAM pending cache (never persisted),
+			 * which replay then restores as a dead inode→manifest
+			 * pointer → mount-time "manifest fetch failed" → the root
+			 * dir is unreadable. Checkpoint unconditionally so a
+			 * cleanly-unmounted volume mounts with an empty journal and
+			 * replays nothing. (Crash recovery still relies on the live
+			 * journal; this only runs on the orderly unmount path.) */
+			if (tmp_->journal != NULL)
+				(void)tessera_journal_checkpoint(tmp_->journal);
 		}
 		if (tmp_->repack_task_init) {
 			taskqueue_drain(taskqueue_thread, &tmp_->repack_task);
