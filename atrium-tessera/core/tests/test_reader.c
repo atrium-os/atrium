@@ -24,6 +24,15 @@ static int rb(void *ctx, uint64_t sector, uint8_t *out)
 	ssize_t n = pread(g_fd, out, SEC, (off_t)sector * SEC);
 	return (n == SEC) ? 0 : -1;
 }
+/* bulk read: like the loader's tf_read_blocks (one I/O per pack), so this
+ * harness measures the reader, not per-sector raw-device latency. */
+static int rbb(void *ctx, uint64_t sector, uint32_t count, uint8_t *out)
+{
+	(void)ctx;
+	size_t bytes = (size_t)count * SEC;
+	ssize_t n = pread(g_fd, out, bytes, (off_t)sector * SEC);
+	return ((size_t)n == bytes) ? 0 : -1;
+}
 
 #define S_IFMT  0170000
 #define S_IFDIR 0040000
@@ -38,7 +47,7 @@ main(int argc, char **argv)
 
 	tessera_block_io_t io = { .read_block = rb, .write_block = NULL,
 	    .alloc = NULL, .free = NULL, .ctx = NULL };
-	tessera_reader_t *rd = tessera_reader_open(&io);
+	tessera_reader_t *rd = tessera_reader_open_ex(&io, rbb);
 	if (rd == NULL) { fprintf(stderr, "reader_open failed (bad superblock?)\n"); return 1; }
 
 	uint32_t ino, mode; uint64_t size;

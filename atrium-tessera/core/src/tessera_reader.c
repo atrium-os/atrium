@@ -6,14 +6,19 @@
  * content-hash algorithm. Built on the volume / btree / manifest / pack
  * primitives. Used by the FreeBSD loader's Tessera fs_ops and by tools.
  *
- * v1 limitations (documented, not silent): single-extent packs only
- * (multi-extent/PEL packs are skipped in the blob scan — large files that
- * spilled into gang extents won't read yet); no symlink following.
+ * Memory is bounded: only each touched pack's HEADER-derived layout, its
+ * sorted blob INDEX, and its extent map are cached (a few KiB per pack).
+ * Blob bytes are read on demand straight into the caller's buffer, never
+ * cached — so reading a 19 MiB kernel that spans dozens of packs costs a few
+ * hundred KiB in the loader's small heap, not the whole kernel's worth of
+ * pack bodies. Single- and multi-extent (PEL) packs both read. No symlink
+ * following (v1).
  */
 #include "tessera_compat.h"
 
 #include "tessera/error.h"
 #include "tessera/format.h"
+#include "tessera/codec.h"
 #include "tessera/btree.h"
 #include "tessera/volume.h"
 #include "tessera/manifest.h"
@@ -33,24 +38,34 @@
 #define REG_OFF_LEN      24u
 #define REG_OFF_FLAGS    60u
 
-/* A pack whose body has been read + opened, kept so it is read at most
- * once per reader lifetime. The blob-fetch scan checks every cached pack
- * (cheap in-memory lookup) before reading any new pack, so reading a file
- * touches each of its packs exactly once — O(total bytes), not
- * O(chunks × packs). */
+/* A pack's cached METADATA — its extent map (pack-logical → disk sectors),
+ * the header-derived data layout, and the sorted blob index — read once per
+ * pack. Blob bytes are NOT cached here: each blob is read on demand straight
+ * into the caller's buffer. The blob-fetch scan bsearches every cached
+ * index (cheap, in memory) before reading any new pack, so reading a file
+ * touches each of its packs' metadata exactly once. */
+struct pack_extent { uint64_t start; uint64_t len; };   /* disk sectors */
+
 struct tessera_cached_pack {
 	uint8_t  id[16];
-	uint8_t *buf;
-	tessera_pack_reader_t *pr;
+	struct pack_extent *extents;    /* pack-logical → disk sector map */
+	uint32_t n_extents;
+	uint64_t total_sectors;         /* sum of extent lengths */
+	uint64_t data_offset;           /* header.data_offset (bytes) */
+	uint64_t data_length;           /* header.data_length (bytes) */
+	uint32_t blob_count;
+	uint32_t index_blocks;
+	uint8_t *index;                 /* blob_count sorted 48-byte entries,
+	                                 * padded to index_blocks sectors */
 	struct tessera_cached_pack *next;
 };
 
-/* Cap on cached pack bodies. Sequential file reads (the loader loading a
- * kernel) touch each pack once in order, so a small MRU window keeps the
- * O(total bytes) behaviour while bounding memory — critical in the loader,
- * whose heap can't hold a whole 19 MiB kernel's worth of pack bodies at
- * once (that exhausts it and the kernel load fails). */
-#define TESSERA_MAX_CACHED_PACKS 6u
+/* Cap on cached pack METADATA entries. Each is only a few KiB (index +
+ * extent map), so a generous cap costs little and a real file's packs
+ * (a kernel ≈ 30) all stay resident with no eviction. Past the cap,
+ * eviction only re-reads a small index, never a whole pack body — so
+ * unlike whole-body caching there is no thrash-to-failure or OOM. */
+#define TESSERA_MAX_CACHED_PACKS 128u
 
 /* Bulk-read batch ceiling (256 sectors = 1 MiB). read_run starts here and
  * halves on any bulk-read failure, so it auto-tunes DOWN to whatever the
@@ -135,8 +150,8 @@ tessera_reader_close(tessera_reader_t *rd)
 	struct tessera_cached_pack *cp = rd->packs;
 	while (cp != NULL) {
 		struct tessera_cached_pack *n = cp->next;
-		if (cp->pr) tessera_pack_close(cp->pr);
-		if (cp->buf) tessera_free(cp->buf);
+		if (cp->index) tessera_free(cp->index);
+		if (cp->extents) tessera_free(cp->extents);
 		tessera_free(cp);
 		cp = n;
 	}
@@ -156,31 +171,27 @@ pack_cached(const tessera_reader_t *rd, const uint8_t id[16])
 uint32_t tessera_reader_root_ino(const tessera_reader_t *rd)
 { (void)rd; return TESSERA_INODE_ROOT_DIR; }
 
-/* Read a whole pack body (single-extent) into a fresh buffer. */
-static uint8_t *
-read_pack_body(tessera_reader_t *rd, uint64_t start, uint64_t len)
+/* Collect a pack's disk extents from its registry entry. Single-extent packs
+ * are one {start,len}; multi-extent packs walk the PEL (pack-extent-list)
+ * chain from `start` (= pel_head). PEL layout: magic@0, extent_count@12,
+ * next_pel_sector@24, then extent_count × {u64 start, u64 len} at 32.
+ * Returns 0 (fills *out_ext malloc'd / *out_n / *out_total sectors) or -1. */
+static int
+collect_extents(tessera_reader_t *rd, uint32_t flags, uint64_t start,
+                uint64_t len, struct pack_extent **out_ext,
+                uint32_t *out_n, uint64_t *out_total)
 {
-	if (len == 0 || len > (1u<<22)) return NULL;   /* sanity: < 16 GiB */
-	uint8_t *buf = tessera_malloc((size_t)len * SECTOR);
-	if (buf == NULL) return NULL;
-	if (read_run(rd, start, len, buf) != 0) {
-		tessera_free(buf);
-		return NULL;
+	if (!(flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT)) {
+		if (len == 0 || len > (1u << 22)) return -1;
+		struct pack_extent *e = tessera_malloc(sizeof *e);
+		if (e == NULL) return -1;
+		e[0].start = start; e[0].len = len;
+		*out_ext = e; *out_n = 1; *out_total = len;
+		return 0;
 	}
-	return buf;
-}
-
-/* Read a multi-extent pack body: walk the PEL (pack-extent-list) chain from
- * `pel_head`, concatenating the data extents into one contiguous buffer.
- * PEL layout: magic@0, extent_count@12, next_pel_sector@24, then
- * extent_count × {u64 start, u64 len} at offset 32. */
-static uint8_t *
-read_pack_body_multi(tessera_reader_t *rd, uint64_t pel_head, size_t *out_len)
-{
-	/* pass 1: collect extents (grow a small dynamic list) */
-	uint64_t *es = NULL, *el = NULL;
+	struct pack_extent *es = NULL;
 	uint32_t ne = 0, cap = 0;
-	uint64_t total = 0, cur = pel_head;
+	uint64_t total = 0, cur = start;
 	int guard = 0, ok = 1;
 	uint8_t pel[SECTOR];
 	while (cur != 0 && guard++ < 512) {
@@ -192,14 +203,13 @@ read_pack_body_multi(tessera_reader_t *rd, uint64_t pel_head, size_t *out_len)
 		for (uint32_t i = 0; i < ec; i++) {
 			if (ne == cap) {
 				uint32_t nc = cap ? cap * 2 : 32;
-				uint64_t *ns = tessera_realloc(es, nc * sizeof *ns);
-				uint64_t *nl = tessera_realloc(el, nc * sizeof *nl);
-				if (ns == NULL || nl == NULL) { ok = 0; break; }
-				es = ns; el = nl; cap = nc;
+				struct pack_extent *ns = tessera_realloc(es, nc * sizeof *ns);
+				if (ns == NULL) { ok = 0; break; }
+				es = ns; cap = nc;
 			}
-			es[ne] = rd_u64(pel, 32 + i * 16);
-			el[ne] = rd_u64(pel, 32 + i * 16 + 8);
-			total += el[ne];
+			es[ne].start = rd_u64(pel, 32 + i * 16);
+			es[ne].len   = rd_u64(pel, 32 + i * 16 + 8);
+			total += es[ne].len;
 			ne++;
 		}
 		if (!ok) break;
@@ -207,49 +217,169 @@ read_pack_body_multi(tessera_reader_t *rd, uint64_t pel_head, size_t *out_len)
 	}
 	if (!ok || total == 0 || total > (1u << 22)) {
 		if (es) tessera_free(es);
-		if (el) tessera_free(el);
-		return NULL;
+		return -1;
 	}
-	/* pass 2: read the extents concatenated */
-	uint8_t *buf = tessera_malloc((size_t)total * SECTOR);
-	if (buf != NULL) {
-		uint64_t pos = 0;
-		for (uint32_t i = 0; i < ne && buf; i++) {
-			if (read_run(rd, es[i], el[i], buf + pos * SECTOR) != 0) {
-				tessera_free(buf); buf = NULL; break;
-			}
-			pos += el[i];
-		}
-	}
-	tessera_free(es); tessera_free(el);
-	if (buf) *out_len = (size_t)total * SECTOR;
-	return buf;
+	*out_ext = es; *out_n = ne; *out_total = total;
+	return 0;
 }
 
-/* Locate blob `hash`, returning a freshly-allocated copy (caller frees).
- * Consults the one-pack cache, then scans the pack registry. */
+/* Read `len` bytes at pack-logical byte offset `off` into buf, mapping
+ * pack-logical sectors to disk sectors through the extent map (a run per
+ * extent). Reads whole covering sectors then copies out the sub-range. */
 static int
-dup_blob(const uint8_t *b, uint32_t bl, uint8_t **out, size_t *out_len)
+read_pack_bytes(tessera_reader_t *rd, const struct tessera_cached_pack *pk,
+                uint64_t off, uint64_t len, uint8_t *buf)
 {
-	uint8_t *cp = tessera_malloc(bl);
+	if (len == 0) return 0;
+	uint64_t end = off + len;
+	if (end < off || end > pk->total_sectors * SECTOR) return -1;
+	uint64_t first_sec = off / SECTOR;
+	uint64_t last_sec  = (end - 1) / SECTOR;
+	uint64_t n_sec = last_sec - first_sec + 1;
+	uint8_t *tmp = tessera_malloc((size_t)n_sec * SECTOR);
+	if (tmp == NULL) return -1;
+
+	uint64_t psec = first_sec, remaining = n_sec;
+	uint8_t *dst = tmp;
+	while (remaining > 0) {
+		/* locate pack-logical sector `psec` in the extent map */
+		uint64_t acc = 0, in_ext = 0;
+		const struct pack_extent *ex = NULL;
+		for (uint32_t i = 0; i < pk->n_extents; i++) {
+			if (psec < acc + pk->extents[i].len) {
+				ex = &pk->extents[i]; in_ext = psec - acc; break;
+			}
+			acc += pk->extents[i].len;
+		}
+		if (ex == NULL) { tessera_free(tmp); return -1; }
+		uint64_t run_left = ex->len - in_ext;
+		uint64_t run = remaining < run_left ? remaining : run_left;
+		if (read_run(rd, ex->start + in_ext, run, dst) != 0) {
+			tessera_free(tmp); return -1;
+		}
+		dst += run * SECTOR; psec += run; remaining -= run;
+	}
+	memcpy(buf, tmp + (off - first_sec * SECTOR), (size_t)len);
+	tessera_free(tmp);
+	return 0;
+}
+
+/* Read + cache a pack's metadata (header + index + extent map). Prepends to
+ * the MRU list and returns the new entry, or NULL. */
+static struct tessera_cached_pack *
+pack_load(tessera_reader_t *rd, const uint8_t id[16], uint32_t flags,
+          uint64_t start, uint64_t len)
+{
+	struct pack_extent *ext = NULL; uint32_t ne = 0; uint64_t total = 0;
+	if (collect_extents(rd, flags, start, len, &ext, &ne, &total) != 0)
+		return NULL;
+	struct tessera_cached_pack *pk = tessera_zalloc(sizeof *pk);
+	if (pk == NULL) { tessera_free(ext); return NULL; }
+	memcpy(pk->id, id, 16);
+	pk->extents = ext; pk->n_extents = ne; pk->total_sectors = total;
+
+	/* header = pack-logical sector 0 */
+	uint8_t hdr[SECTOR];
+	tessera_pack_header_t h;
+	if (read_pack_bytes(rd, pk, 0, SECTOR, hdr) != 0) goto fail;
+	if (tessera_decode_pack_header(hdr, &h) != TESSERA_OK) goto fail;
+	if (h.total_pack_bytes != total * SECTOR) goto fail;
+	pk->data_offset  = h.data_offset;
+	pk->data_length  = h.data_length;
+	pk->blob_count   = h.blob_count;
+	pk->index_blocks = h.index_blocks;
+	/* index must be large enough to hold blob_count sorted entries */
+	if (pk->index_blocks == 0 ||
+	    (uint64_t)pk->index_blocks * SECTOR <
+	        (uint64_t)pk->blob_count * TESSERA_PACK_INDEX_ENTRY_SIZE)
+		goto fail;
+
+	/* index = index_blocks sectors starting at pack-logical sector 1 */
+	pk->index = tessera_malloc((size_t)pk->index_blocks * SECTOR);
+	if (pk->index == NULL) goto fail;
+	if (read_pack_bytes(rd, pk, SECTOR,
+	    (uint64_t)pk->index_blocks * SECTOR, pk->index) != 0)
+		goto fail;
+
+	pk->next = rd->packs; rd->packs = pk; rd->npacks++;
+	return pk;
+fail:
+	if (pk->index) tessera_free(pk->index);
+	tessera_free(pk->extents);
+	tessera_free(pk);
+	return NULL;
+}
+
+/* Binary-search a cached pack's sorted index for `hash`; fill *ie on a hit. */
+static int
+pack_find_blob(const struct tessera_cached_pack *pk, const uint8_t *hash,
+               tessera_pack_index_entry_t *ie)
+{
+	int lo = 0, hi = (int)pk->blob_count - 1;
+	while (lo <= hi) {
+		int mid = lo + (hi - lo) / 2;
+		const uint8_t *e = pk->index +
+		    (size_t)mid * TESSERA_PACK_INDEX_ENTRY_SIZE;
+		int c = memcmp(e, hash, 32);            /* blob_hash is first field */
+		if (c == 0) { tessera_decode_pack_index_entry(e, ie); return 1; }
+		if (c < 0) lo = mid + 1; else hi = mid - 1;
+	}
+	return 0;
+}
+
+/* Read the blob described by `ie` from pack `pk` into a fresh buffer (caller
+ * frees). Blob bytes follow a 16-byte descriptor in the pack's data area. */
+static int
+read_blob(tessera_reader_t *rd, const struct tessera_cached_pack *pk,
+          const tessera_pack_index_entry_t *ie, uint8_t **out, size_t *out_len)
+{
+	uint64_t desc = sizeof(tessera_blob_descriptor_t);
+	if (ie->data_offset + desc + ie->data_size > pk->data_length)
+		return TESSERA_ECORRUPT;
+	uint8_t *cp = tessera_malloc(ie->data_size ? ie->data_size : 1);
 	if (cp == NULL) return TESSERA_EIO;
-	memcpy(cp, b, bl); *out = cp; *out_len = bl;
+	if (ie->data_size > 0 &&
+	    read_pack_bytes(rd, pk, pk->data_offset + ie->data_offset + desc,
+	    ie->data_size, cp) != 0) {
+		tessera_free(cp);
+		return TESSERA_EIO;
+	}
+	*out = cp; *out_len = ie->data_size;
 	return TESSERA_OK;
 }
 
+/* Evict MRU-tail packs beyond the cap (only small metadata is freed). */
+static void
+evict_packs(tessera_reader_t *rd)
+{
+	while (rd->npacks > TESSERA_MAX_CACHED_PACKS) {
+		struct tessera_cached_pack *p = rd->packs;
+		while (p->next && p->next->next) p = p->next;
+		if (p->next == NULL) break;
+		if (p->next->index) tessera_free(p->next->index);
+		if (p->next->extents) tessera_free(p->next->extents);
+		tessera_free(p->next);
+		p->next = NULL;
+		rd->npacks--;
+	}
+}
+
+/* Locate blob `hash` and return a freshly-allocated copy (caller frees).
+ * Consults each cached pack's index, then scans the registry, loading each
+ * not-yet-cached pack's METADATA once and reading the blob on demand. */
 static int
 fetch_blob_dup(tessera_reader_t *rd, const uint8_t *hash,
                uint8_t **out, size_t *out_len)
 {
-	const uint8_t *b; uint32_t bl;
+	tessera_pack_index_entry_t ie;
 
-	/* 1. check every already-read pack (cheap in-memory lookup) */
-	for (struct tessera_cached_pack *cp = rd->packs; cp; cp = cp->next)
-		if (tessera_pack_lookup(cp->pr, hash, &b, &bl) == 0 && b != NULL)
-			return dup_blob(b, bl, out, out_len);
+	/* 1. bsearch every cached pack's index (in-memory) */
+	for (struct tessera_cached_pack *pk = rd->packs; pk; pk = pk->next)
+		if (pack_find_blob(pk, hash, &ie))
+			return read_blob(rd, pk, &ie, out, out_len);
 
-	/* 2. scan the registry, reading + caching each not-yet-cached pack
-	 *    exactly once, until the blob turns up. */
+	/* 2. scan the registry, caching each not-yet-cached pack's metadata
+	 *    once, until the blob's pack turns up. */
 	tessera_btree_t *t = tessera_btree_open(&rd->io, rd->pack_root,
 	    TESSERA_BTREE_KIND_PACK_REG, 16, REGENT);
 	if (t == NULL) return TESSERA_EIO;
@@ -263,38 +393,12 @@ fetch_blob_dup(tessera_reader_t *rd, const uint8_t *hash,
 		uint32_t flags = rd_u32(val, REG_OFF_FLAGS);
 		uint64_t start = rd_u64(val, REG_OFF_START);
 		uint64_t len   = rd_u64(val, REG_OFF_LEN);
-		size_t body_len;
-		uint8_t *body = (flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT)
-		    ? read_pack_body_multi(rd, start, &body_len)
-		    : (body_len = (size_t)len * SECTOR, read_pack_body(rd, start, len));
-		if (body != NULL) {
-			tessera_pack_reader_t *pr = tessera_pack_open(body, body_len);
-			if (pr != NULL) {
-				/* cache it (read at most once) */
-				struct tessera_cached_pack *cp = tessera_zalloc(sizeof *cp);
-				if (cp != NULL) {
-					memcpy(cp->id, key, 16); cp->buf = body; cp->pr = pr;
-					cp->next = rd->packs; rd->packs = cp; rd->npacks++;
-					int found = (tessera_pack_lookup(pr, hash, &b, &bl) == 0 && b != NULL);
-					if (found) rc = dup_blob(b, bl, out, out_len);
-					/* evict the oldest pack(s) beyond the cap (tail of the
-					 * MRU list); never the head we just added/used. */
-					while (rd->npacks > TESSERA_MAX_CACHED_PACKS) {
-						struct tessera_cached_pack *p = rd->packs;
-						while (p->next && p->next->next) p = p->next;
-						if (p->next) {
-							if (p->next->pr) tessera_pack_close(p->next->pr);
-							if (p->next->buf) tessera_free(p->next->buf);
-							tessera_free(p->next);
-							p->next = NULL;
-							rd->npacks--;
-						} else break;
-					}
-					if (found) break;
-				} else { tessera_pack_close(pr); tessera_free(body); }
-			} else {
-				tessera_free(body);
-			}
+		struct tessera_cached_pack *pk = pack_load(rd, key, flags, start, len);
+		if (pk != NULL) {
+			int found = pack_find_blob(pk, hash, &ie);
+			if (found) rc = read_blob(rd, pk, &ie, out, out_len);
+			evict_packs(rd);   /* head (just loaded) is never evicted */
+			if (found) break;
 		}
 		if (tessera_btree_cursor_next(c) != 0) break;
 	}
