@@ -52,9 +52,11 @@ struct tessera_cached_pack {
  * once (that exhausts it and the kernel load fails). */
 #define TESSERA_MAX_CACHED_PACKS 6u
 
-/* Bulk-read batch cap (16 sectors = 64 KiB): collapses per-sector
- * round-trips ~16x while staying within backends' per-transfer limits. */
-#define TESSERA_READ_BATCH 16u
+/* Bulk-read batch ceiling (256 sectors = 1 MiB). read_run starts here and
+ * halves on any bulk-read failure, so it auto-tunes DOWN to whatever the
+ * backend's max transfer actually is (the FreeBSD loader's EFI ReadBlocks
+ * accepts far less than 1 MiB) without a hard-coded guess. */
+#define TESSERA_READ_BATCH 256u
 
 struct tessera_reader {
 	tessera_block_io_t io;
@@ -72,18 +74,23 @@ static int
 read_run(tessera_reader_t *rd, uint64_t start, uint64_t len, uint8_t *buf)
 {
 	uint64_t done = 0;
+	uint32_t batch = TESSERA_READ_BATCH;   /* shrinks to the backend's max */
 	while (done < len) {
 		uint64_t rem = len - done;
-		uint32_t n = rem > TESSERA_READ_BATCH ? TESSERA_READ_BATCH : (uint32_t)rem;
-		int ok = (rd->read_blocks != NULL) &&
-		    rd->read_blocks(rd->io.ctx, start + done, n, buf + done * SECTOR) == 0;
-		if (!ok) {
-			for (uint32_t k = 0; k < n; k++)
-				if (rd->io.read_block(rd->io.ctx, start + done + k,
-				    buf + (done + k) * SECTOR) != 0)
-					return -1;
+		uint32_t n = rem > batch ? batch : (uint32_t)rem;
+		if (rd->read_blocks != NULL &&
+		    rd->read_blocks(rd->io.ctx, start + done, n, buf + done * SECTOR) == 0) {
+			done += n;                 /* bulk read succeeded */
+		} else if (rd->read_blocks != NULL && n > 1) {
+			batch = n / 2;             /* too big — halve, retry same offset */
+		} else {
+			/* per-sector: either no bulk path, or even 1 sector failed
+			 * via bulk (retry that one sector with read_block). */
+			if (rd->io.read_block(rd->io.ctx, start + done,
+			    buf + done * SECTOR) != 0)
+				return -1;
+			done += 1;
 		}
-		done += n;
 	}
 	return 0;
 }
