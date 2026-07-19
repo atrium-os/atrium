@@ -23,9 +23,23 @@ extern "C" {
 
 typedef struct tessera_reader tessera_reader_t;
 
+/* Optional bulk-read callback: read `count` contiguous 4 KiB sectors from
+ * `sector` into `out`. Returns 0 on success. A backend that can satisfy a
+ * whole pack extent in one I/O (e.g. a multi-block dv_strategy) makes large
+ * reads much faster than one round-trip per sector. read_run falls back to
+ * per-sector read_block if a bulk read fails, so correctness never depends
+ * on it. */
+typedef int (*tessera_read_blocks_fn)(void *ctx, uint64_t sector,
+                                       uint32_t count, uint8_t *out);
+
 /* Open a volume for reading. `io` needs a working read_block; alloc/free
  * are never used. Returns NULL on a bad/unreadable superblock. */
 tessera_reader_t *tessera_reader_open(const tessera_block_io_t *io);
+
+/* As tessera_reader_open, plus an optional bulk-read fast path. */
+tessera_reader_t *tessera_reader_open_ex(const tessera_block_io_t *io,
+                                         tessera_read_blocks_fn read_blocks);
+
 void              tessera_reader_close(tessera_reader_t *);
 
 /* The root directory inode number. */

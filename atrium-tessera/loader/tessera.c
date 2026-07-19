@@ -52,6 +52,20 @@ tf_read_block(void *ctx, uint64_t sector, uint8_t *out)
 	return (rc == 0 && rsize == TESSERA_SEC) ? 0 : -1;
 }
 
+/* bulk read: `count` contiguous 4 KiB sectors in one device strategy call.
+ * Collapses per-sector round-trips on large reads (the kernel). The reader
+ * falls back to tf_read_block per sector if a bulk read is rejected. */
+static int
+tf_read_blocks(void *ctx, uint64_t sector, uint32_t count, uint8_t *out)
+{
+	struct tessera_file *tf = ctx;
+	size_t rsize = 0;
+	size_t bytes = (size_t)count * TESSERA_SEC;
+	int rc = tf->f->f_dev->dv_strategy(tf->f->f_devdata, F_READ,
+	    (daddr_t)(sector * SEC_PER_DEVB), bytes, (char *)out, &rsize);
+	return (rc == 0 && rsize == bytes) ? 0 : -1;
+}
+
 /* libtessera_core references tessera_content_hash from format/builder
  * paths that the read-only reader never calls; provide a stub so the
  * hash-free subset links without SHA/BLAKE3. */
@@ -119,7 +133,7 @@ tessera_open(const char *path, struct open_file *f)
 	memset(&io, 0, sizeof io);
 	io.read_block = tf_read_block;
 	io.ctx = tf;
-	tf->rd = tessera_reader_open(&io);
+	tf->rd = tessera_reader_open_ex(&io, tf_read_blocks);
 #ifdef TESSERA_LOADER_DEBUG
 	printf("tessera: open '%s' reader=%p\n", path, (void *)tf->rd);
 #endif

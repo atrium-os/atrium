@@ -45,13 +45,48 @@ struct tessera_cached_pack {
 	struct tessera_cached_pack *next;
 };
 
+/* Cap on cached pack bodies. Sequential file reads (the loader loading a
+ * kernel) touch each pack once in order, so a small MRU window keeps the
+ * O(total bytes) behaviour while bounding memory — critical in the loader,
+ * whose heap can't hold a whole 19 MiB kernel's worth of pack bodies at
+ * once (that exhausts it and the kernel load fails). */
+#define TESSERA_MAX_CACHED_PACKS 6u
+
+/* Bulk-read batch cap (16 sectors = 64 KiB): collapses per-sector
+ * round-trips ~16x while staying within backends' per-transfer limits. */
+#define TESSERA_READ_BATCH 16u
+
 struct tessera_reader {
 	tessera_block_io_t io;
 	tessera_volume_t  *v;
 	uint64_t inode_root;
 	uint64_t pack_root;
-	struct tessera_cached_pack *packs;   /* all packs read so far */
+	tessera_read_blocks_fn read_blocks;  /* optional bulk fast path */
+	struct tessera_cached_pack *packs;   /* MRU list, capped */
+	uint32_t npacks;
 };
+
+/* Read `len` contiguous sectors into buf: bulk fast path in batches when
+ * available, falling back to per-sector read_block for any failed batch. */
+static int
+read_run(tessera_reader_t *rd, uint64_t start, uint64_t len, uint8_t *buf)
+{
+	uint64_t done = 0;
+	while (done < len) {
+		uint64_t rem = len - done;
+		uint32_t n = rem > TESSERA_READ_BATCH ? TESSERA_READ_BATCH : (uint32_t)rem;
+		int ok = (rd->read_blocks != NULL) &&
+		    rd->read_blocks(rd->io.ctx, start + done, n, buf + done * SECTOR) == 0;
+		if (!ok) {
+			for (uint32_t k = 0; k < n; k++)
+				if (rd->io.read_block(rd->io.ctx, start + done + k,
+				    buf + (done + k) * SECTOR) != 0)
+					return -1;
+		}
+		done += n;
+	}
+	return 0;
+}
 
 static uint32_t rd_u32(const uint8_t *b, unsigned o)
 { return (uint32_t)b[o] | ((uint32_t)b[o+1]<<8) | ((uint32_t)b[o+2]<<16) | ((uint32_t)b[o+3]<<24); }
@@ -65,10 +100,18 @@ static int is_null_hash(const uint8_t *h)
 tessera_reader_t *
 tessera_reader_open(const tessera_block_io_t *io)
 {
+	return tessera_reader_open_ex(io, NULL);
+}
+
+tessera_reader_t *
+tessera_reader_open_ex(const tessera_block_io_t *io,
+                       tessera_read_blocks_fn read_blocks)
+{
 	if (io == NULL || io->read_block == NULL) return NULL;
 	tessera_reader_t *rd = tessera_zalloc(sizeof *rd);
 	if (rd == NULL) return NULL;
 	rd->io = *io;
+	rd->read_blocks = read_blocks;
 	if (tessera_volume_open(&rd->io, &rd->v) != TESSERA_OK) {
 		tessera_free(rd);
 		return NULL;
@@ -113,11 +156,9 @@ read_pack_body(tessera_reader_t *rd, uint64_t start, uint64_t len)
 	if (len == 0 || len > (1u<<22)) return NULL;   /* sanity: < 16 GiB */
 	uint8_t *buf = tessera_malloc((size_t)len * SECTOR);
 	if (buf == NULL) return NULL;
-	for (uint64_t i = 0; i < len; i++) {
-		if (rd->io.read_block(rd->io.ctx, start + i, buf + i * SECTOR) != 0) {
-			tessera_free(buf);
-			return NULL;
-		}
+	if (read_run(rd, start, len, buf) != 0) {
+		tessera_free(buf);
+		return NULL;
 	}
 	return buf;
 }
@@ -167,13 +208,10 @@ read_pack_body_multi(tessera_reader_t *rd, uint64_t pel_head, size_t *out_len)
 	if (buf != NULL) {
 		uint64_t pos = 0;
 		for (uint32_t i = 0; i < ne && buf; i++) {
-			for (uint64_t j = 0; j < el[i]; j++) {
-				if (rd->io.read_block(rd->io.ctx, es[i] + j,
-				    buf + pos * SECTOR) != 0) {
-					tessera_free(buf); buf = NULL; break;
-				}
-				pos++;
+			if (read_run(rd, es[i], el[i], buf + pos * SECTOR) != 0) {
+				tessera_free(buf); buf = NULL; break;
 			}
+			pos += el[i];
 		}
 	}
 	tessera_free(es); tessera_free(el);
@@ -229,11 +267,23 @@ fetch_blob_dup(tessera_reader_t *rd, const uint8_t *hash,
 				struct tessera_cached_pack *cp = tessera_zalloc(sizeof *cp);
 				if (cp != NULL) {
 					memcpy(cp->id, key, 16); cp->buf = body; cp->pr = pr;
-					cp->next = rd->packs; rd->packs = cp;
-					if (tessera_pack_lookup(pr, hash, &b, &bl) == 0 && b != NULL) {
-						rc = dup_blob(b, bl, out, out_len);
-						break;
+					cp->next = rd->packs; rd->packs = cp; rd->npacks++;
+					int found = (tessera_pack_lookup(pr, hash, &b, &bl) == 0 && b != NULL);
+					if (found) rc = dup_blob(b, bl, out, out_len);
+					/* evict the oldest pack(s) beyond the cap (tail of the
+					 * MRU list); never the head we just added/used. */
+					while (rd->npacks > TESSERA_MAX_CACHED_PACKS) {
+						struct tessera_cached_pack *p = rd->packs;
+						while (p->next && p->next->next) p = p->next;
+						if (p->next) {
+							if (p->next->pr) tessera_pack_close(p->next->pr);
+							if (p->next->buf) tessera_free(p->next->buf);
+							tessera_free(p->next);
+							p->next = NULL;
+							rd->npacks--;
+						} else break;
 					}
+					if (found) break;
 				} else { tessera_pack_close(pr); tessera_free(body); }
 			} else {
 				tessera_free(body);
