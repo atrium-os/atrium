@@ -27,7 +27,7 @@ fn run(path: &str) -> Result<(), String> {
     let f = open_file_ro(path).map_err(|e| format!("open {path}: {e}"))?;
     let total_bytes = file_size(&f).map_err(|e| format!("stat: {e}"))?;
 
-    let mut ctx = DiskCtx { fd: fd_of(&f) };
+    let mut ctx = DiskCtx::ro(fd_of(&f));
     let io = make_io(&mut ctx);
     let mut v: *mut tessera_sys::tessera_volume_t = std::ptr::null_mut();
     let r = unsafe { tessera_volume_open(&io, &mut v) };

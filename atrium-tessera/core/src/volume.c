@@ -583,6 +583,75 @@ tessera_volume_format(const tessera_block_io_t *io,
 	return TESSERA_OK;
 }
 
+/* ── offline commit (fsck-repair) ─────────────────────────────────── */
+
+/*
+ * Seal a fresh superblock from the volume's active SB with a repaired
+ * set of roots and write both SB copies. This is the offline analogue
+ * of the kmod's commit_sb tail — no journal, no barriers beyond the
+ * fd's own durability (tessera-fsck opens the device O_SYNC, so every
+ * btree / pack / free-tree sector the repair wrote is already durable
+ * before we get here). Bumping `generation` makes tessera_volume_open
+ * prefer the repaired SB; writing BOTH slots keeps A and B in lockstep
+ * so a crash mid-commit still opens a self-consistent volume (either
+ * the old gen from an un-updated slot, or the new gen whose roots point
+ * at already-durable structures).
+ *
+ * Only the fields a repair can legitimately change are overridden; all
+ * other SB state (uuid, zones, journal, hash_alg, encryption, …) is
+ * preserved verbatim. A per-root generation counter is bumped only for
+ * the roots that actually moved, so `tessera-stat` still reflects which
+ * structure the repair rewrote.
+ */
+int
+tessera_volume_commit_roots(tessera_volume_t *v,
+                            const tessera_commit_roots_t *roots)
+{
+	if (v == NULL || roots == NULL) return TESSERA_EINVAL;
+	if (v->io.write_block == NULL) return TESSERA_EINVAL;
+
+	tessera_superblock_t sb = v->sb;   /* preserve everything */
+
+	sb.generation += 1;
+	if (roots->inode_root != sb.inode_root) {
+		sb.inode_root = roots->inode_root;
+		sb.inode_root_generation += 1;
+	}
+	if (roots->pack_registry_root != sb.pack_registry_root) {
+		sb.pack_registry_root = roots->pack_registry_root;
+		sb.pack_registry_gen += 1;
+	}
+	if (roots->free_extent_root != sb.free_extent_root) {
+		sb.free_extent_root = roots->free_extent_root;
+		sb.free_extent_gen += 1;
+	}
+	if (roots->quota_tree_root != sb.quota_tree_root) {
+		sb.quota_tree_root = roots->quota_tree_root;
+		sb.quota_tree_gen += 1;
+	}
+	if (roots->snapshots_root != sb.snapshots_root) {
+		sb.snapshots_root = roots->snapshots_root;
+		sb.snapshots_gen += 1;
+	}
+	/* meta_reserve_bump only ever grows (repair consumed reserve
+	 * sectors for the rewritten trees); never let it regress. */
+	if (roots->meta_reserve_bump > sb.meta_reserve_bump)
+		sb.meta_reserve_bump = roots->meta_reserve_bump;
+	/* next_inode_no may grow if repair minted an inode (lost+found). */
+	if (roots->next_inode_no > sb.next_inode_no)
+		sb.next_inode_no = roots->next_inode_no;
+	sb.last_unmount_clean = 1;
+
+	uint8_t buf[TESSERA_SECTOR_SIZE];
+	int r = tessera_encode_superblock(&sb, buf);
+	if (r != TESSERA_OK) return r;
+	if (v->io.write_block(v->io.ctx, 0, buf) != 0) return TESSERA_EIO;
+	if (v->io.write_block(v->io.ctx, 1, buf) != 0) return TESSERA_EIO;
+
+	v->sb = sb;   /* keep the handle coherent for any further work */
+	return TESSERA_OK;
+}
+
 /* ── open ────────────────────────────────────────────────────────── */
 
 int
@@ -689,3 +758,6 @@ uint8_t tessera_volume_active_slot_count(const tessera_volume_t *v)
 
 uint64_t tessera_volume_quota_tree_root(const tessera_volume_t *v)
 { return v ? v->sb.quota_tree_root : 0; }
+
+uint64_t tessera_volume_next_inode_no(const tessera_volume_t *v)
+{ return v ? v->sb.next_inode_no : 0; }

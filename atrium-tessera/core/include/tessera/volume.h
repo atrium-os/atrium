@@ -93,6 +93,27 @@ int tessera_volume_open(const tessera_block_io_t *io,
 
 void tessera_volume_close(tessera_volume_t *);
 
+/* Offline-repair commit (tessera-fsck --repair). Overrides the roots a
+ * consistency repair can legitimately move, bumps the superblock
+ * generation, and writes both SB copies. All other SB fields are
+ * preserved. `meta_reserve_bump` / `next_inode_no` are only advanced,
+ * never regressed. The block_io's write_block MUST be valid and every
+ * structure the new roots reference MUST already be durable on disk
+ * (open the device O_SYNC). Not for the runtime mutation path — the
+ * kmod commits through the journal. */
+typedef struct {
+	uint64_t inode_root;
+	uint64_t pack_registry_root;
+	uint64_t free_extent_root;
+	uint64_t quota_tree_root;
+	uint64_t snapshots_root;
+	uint64_t meta_reserve_bump;   /* advanced past reserve sectors used */
+	uint64_t next_inode_no;       /* advanced if repair minted an inode */
+} tessera_commit_roots_t;
+
+int tessera_volume_commit_roots(tessera_volume_t *v,
+                                const tessera_commit_roots_t *roots);
+
 /* Read-only accessors over the active superblock's fields. */
 uint64_t        tessera_volume_total_sectors    (const tessera_volume_t *);
 uint64_t        tessera_volume_generation       (const tessera_volume_t *);
@@ -114,6 +135,7 @@ uint64_t        tessera_volume_pack_zone_length  (const tessera_volume_t *);
 uint16_t        tessera_volume_encryption_flags   (const tessera_volume_t *);
 uint8_t         tessera_volume_active_slot_count  (const tessera_volume_t *);
 uint64_t        tessera_volume_quota_tree_root    (const tessera_volume_t *);
+uint64_t        tessera_volume_next_inode_no       (const tessera_volume_t *);
 
 #ifdef __cplusplus
 }

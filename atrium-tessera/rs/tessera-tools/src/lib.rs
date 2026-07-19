@@ -16,6 +16,26 @@ pub const SECTOR_SIZE: u64 = 4096;
 
 pub struct DiskCtx {
     pub fd: i32,
+    /// Next free sector for the metadata-reserve bump allocator (repair).
+    /// `bump_max == 0` disables allocation — read-only tools keep the
+    /// original stub behaviour (alloc returns -1).
+    pub bump: std::cell::Cell<u64>,
+    /// One past the last allocatable reserve sector (meta_reserve_start +
+    /// meta_reserve_length). 0 = allocation disabled.
+    pub bump_max: u64,
+}
+
+impl DiskCtx {
+    /// Read-only context: allocation disabled.
+    pub fn ro(fd: i32) -> Self {
+        DiskCtx { fd, bump: std::cell::Cell::new(0), bump_max: 0 }
+    }
+    /// Read-write context with a metadata-reserve bump allocator over
+    /// [bump_start, bump_max). Used by tessera-fsck --repair to allocate
+    /// COW btree / free-tree nodes exactly like the kmod's runtime bump.
+    pub fn rw(fd: i32, bump_start: u64, bump_max: u64) -> Self {
+        DiskCtx { fd, bump: std::cell::Cell::new(bump_start), bump_max }
+    }
 }
 
 pub extern "C" fn disk_read(ctx: *mut c_void, sector: u64, out: *mut u8) -> i32 {
@@ -44,11 +64,29 @@ pub extern "C" fn disk_write(ctx: *mut c_void, sector: u64, buf: *const u8) -> i
     if n == SECTOR_SIZE as isize { 0 } else { -1 }
 }
 
-/// Stub allocators: format() never invokes io->alloc/free; tessera-debug
-/// only opens (never mutates). Phase-3 mutation paths will need a real
-/// allocator backed by tessera_extent_alloc.
-pub extern "C" fn disk_alloc(_: *mut c_void, _: u64, _: *mut u64) -> i32 { -1 }
-pub extern "C" fn disk_free (_: *mut c_void, _: u64, _: u64)  -> i32 { 0 }
+/// Metadata-reserve bump allocator. Mirrors core's `fmt_alloc`: hand out
+/// `n` contiguous sectors from the reserve, advancing the bump pointer.
+/// Read-only contexts (bump_max == 0) return -1, preserving the old stub
+/// behaviour for tools that never mutate. On exhaustion returns -1
+/// (ENOSPC) — the repair aborts before committing a partial change.
+pub extern "C" fn disk_alloc(ctx: *mut c_void, n: u64, out_start: *mut u64) -> i32 {
+    let d = unsafe { &*(ctx as *const DiskCtx) };
+    if d.bump_max == 0 {
+        return -1;
+    }
+    let start = d.bump.get();
+    if start + n > d.bump_max {
+        return -1;
+    }
+    d.bump.set(start + n);
+    unsafe { *out_start = start; }
+    0
+}
+/// Free is a no-op bump-back is not tracked: retired COW nodes leak into
+/// the reserve until the next `tessera repack`, exactly as the runtime
+/// bump allocator behaves. Offline repair touches only a handful of
+/// nodes, so the leak is negligible.
+pub extern "C" fn disk_free(_: *mut c_void, _: u64, _: u64) -> i32 { 0 }
 
 pub fn make_io(ctx: &mut DiskCtx) -> tessera_block_io_t {
     tessera_block_io_t {

@@ -36,7 +36,7 @@ use std::os::unix::fs::FileExt;
 use std::process::ExitCode;
 
 use tessera_sys::*;
-use tessera_tools::{fd_of, make_io, open_file_ro, DiskCtx, SECTOR_SIZE};
+use tessera_tools::{fd_of, make_io, open_file_ro, open_file_rw, DiskCtx, SECTOR_SIZE};
 
 type Hash = [u8; 32];
 
@@ -62,8 +62,23 @@ struct Fsck {
     checked: HashSet<Hash>,
     // inode_no → (mode, nlink, manifest_hash) for the reachability + nlink walk
     inode_map: HashMap<u32, (u32, u32, Hash)>,
+    // inode_no → (btree key bytes, full 144-byte record) — kept so --repair
+    // can patch a field (nlink) and btree_put the record back verbatim.
+    inode_raw: HashMap<u32, ([u8; 4], Vec<u8>)>,
     // quota_domain_id → summed logical bytes of regular files in it
     quota_used: HashMap<u64, u64>,
+    // ── structured repair actions (populated during the detect passes,
+    //    applied by apply_repairs when --repair is set) ──
+    // inode records to rewrite (nlink correction): (key, patched value).
+    nlink_fixes: Vec<([u8; 4], Vec<u8>)>,
+    // quota records to rewrite (used_bytes correction): (key, patched value).
+    quota_fixes: Vec<([u8; 8], Vec<u8>)>,
+    // the authoritative free-extent set (pack zone minus allocated packs);
+    // used to rebuild the free-extent tree when free_tree_dirty.
+    free_runs: Vec<(u64, u64)>,
+    // set when the on-disk free-extent tree disagrees with reality
+    // (leaked sectors, double-state, free overlap / out-of-bounds).
+    free_tree_dirty: bool,
     // stats
     inodes: u64,
     packs: u64,
@@ -277,9 +292,16 @@ unsafe fn name_str(p: *const core::ffi::c_char, len: u16) -> String {
     String::from_utf8_lossy(s).into_owned()
 }
 
-fn run(path: &str, verbose: bool) -> Result<i32, String> {
-    let f = open_file_ro(path).map_err(|e| format!("open {path}: {e}"))?;
-    let mut ctx = DiskCtx { fd: fd_of(&f) };
+fn run(path: &str, verbose: bool, repair: bool) -> Result<i32, String> {
+    let f = if repair {
+        open_file_rw(path).map_err(|e| format!("open {path} (rw): {e}"))?
+    } else {
+        open_file_ro(path).map_err(|e| format!("open {path}: {e}"))?
+    };
+    // ctx starts read-only; the bump allocator is armed below once the
+    // superblock's meta-reserve extent is known (io holds a raw pointer to
+    // ctx, so mutating ctx after make_io is fine — no live borrow).
+    let mut ctx = DiskCtx::ro(fd_of(&f));
     let io = make_io(&mut ctx);
 
     let mut v: *mut tessera_volume_t = std::ptr::null_mut();
@@ -300,6 +322,19 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
     /* volume content-hash algorithm (0=sha256, 1=blake3) — all blob
      * re-hash verification below must use it, not raw sha256 */
     let hash_alg = unsafe { tessera_volume_hash_alg(v) };
+    let quota_root = unsafe { tessera_volume_quota_tree_root(v) };
+    let snapshots_root = unsafe { tessera_volume_snapshots_root(v) };
+    let next_inode_no = unsafe { tessera_volume_next_inode_no(v) };
+    let mr_start = unsafe { tessera_volume_meta_reserve_start(v) };
+    let mr_len = unsafe { tessera_volume_meta_reserve_length(v) };
+    let mr_bump = unsafe { tessera_volume_meta_reserve_bump(v) };
+
+    // Arm the metadata-reserve bump allocator for --repair. COW btree /
+    // free-tree nodes written during apply come from [mr_bump, mr_start+mr_len).
+    if repair {
+        ctx.bump.set(mr_bump);
+        ctx.bump_max = mr_start + mr_len;
+    }
 
     let mut fsck = Fsck {
         problems: Vec::new(),
@@ -308,7 +343,12 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
         manifests: HashMap::new(),
         checked: HashSet::new(),
         inode_map: HashMap::new(),
+        inode_raw: HashMap::new(),
         quota_used: HashMap::new(),
+        nlink_fixes: Vec::new(),
+        quota_fixes: Vec::new(),
+        free_runs: Vec::new(),
+        free_tree_dirty: false,
         inodes: 0,
         packs: 0,
         blobs: 0,
@@ -487,6 +527,7 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
                 fsck.reach(&manifest, true, &label, 0);
                 fsck.reach(&xattr, false, &format!("{label} xattr"), 0);
                 fsck.inode_map.insert(ino, (mode, nlink, manifest));
+                fsck.inode_raw.insert(ino, (key, val.to_vec()));
                 // quota is charged on logical file bytes; accumulate per domain
                 let qdom = rd_u64(&val, 136);
                 if qdom != 0 && mode & S_IFMT == S_IFREG {
@@ -551,6 +592,12 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
                 nlink_problems.push(format!(
                     "inode {ino}: nlink {nlink} but {expected} {} reference(s)",
                     if is_dir { "expected (dir)" } else { "dirent" }));
+                // repair: patch nlink (offset 64, u32 LE) into the record.
+                if let Some((key, raw)) = fsck.inode_raw.get(&ino) {
+                    let mut patched = raw.clone();
+                    patched[64..68].copy_from_slice(&expected.to_le_bytes());
+                    fsck.nlink_fixes.push((*key, patched));
+                }
             }
         }
         for p in nlink_problems { fsck.problem(p); }
@@ -592,12 +639,14 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
         for (s, l) in &free {
             if *s < pz_start || s + l > pz_end {
                 fsck.problem(format!("free extent [{s}..{}] outside pack zone [{pz_start}..{pz_end}]", s + l));
+                fsck.free_tree_dirty = true;
             }
         }
         for w in free.windows(2) {
             if w[0].0 + w[0].1 > w[1].0 {
                 fsck.problem(format!("free extents overlap: [{}..{}] and [{}..]",
                     w[0].0, w[0].0 + w[0].1, w[1].0));
+                fsck.free_tree_dirty = true;
             }
         }
         // merge packs (from Pass A) + free, detect cross-type overlap + gaps
@@ -611,6 +660,7 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
                 fsck.problem(format!(
                     "free extent [{}..{}] overlaps allocated pack [{}..{}] (double-state)",
                     fr.0, fr.1, pk.0, pk.1));
+                fsck.free_tree_dirty = true;
             }
         }
         // coverage/leak: packs (incl. multi-extent data extents + PEL sectors)
@@ -626,15 +676,36 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
             // Informational, not a failure: untracked space is a space-
             // efficiency issue (not corruption), and can arise from
             // allocator behaviour under fragmentation. Double-state overlap
-            // above IS a hard problem.
+            // above IS a hard problem. --repair reclaims it when rebuilding
+            // the free tree.
             fsck.notes.push(format!("{leaked} pack-zone sector(s) neither allocated nor free (leaked space)"));
+            fsck.free_tree_dirty = true;
         }
+
+        // Authoritative free set for --repair: the pack zone minus every
+        // allocated pack extent (the pack registry is the source of truth
+        // for what is in use). Rebuilding the free-extent tree from this
+        // complement fixes leaked space, double-state, and free overlap in
+        // one shot. Computed regardless of dirtiness; applied only when
+        // free_tree_dirty. NB: `intervals` already includes multi-extent
+        // data extents + PEL sectors (Pass A), so the complement is exact.
+        let mut alloc: Vec<(u64, u64)> =
+            intervals.iter().map(|(s, e, _)| (*s, *e)).collect();
+        alloc.sort_by_key(|x| x.0);
+        let mut cur = pz_start;
+        for (s, e) in &alloc {
+            let s = (*s).max(pz_start);
+            let e = (*e).min(pz_end);
+            if s > cur { fsck.free_runs.push((cur, s - cur)); }
+            if e > cur { cur = e; }
+        }
+        if cur < pz_end { fsck.free_runs.push((cur, pz_end - cur)); }
     }
 
     // ── Pass E: quota accounting ─────────────────────────────────
     // Each domain's used_bytes must equal the summed logical size of the
     // regular files in it (quota is charged on file bytes via vop_write).
-    let quota_root = unsafe { tessera_volume_quota_tree_root(v) };
+    // quota_root read up-front (also needed by apply_repairs).
     if quota_root != 0 {
         unsafe {
             let t = tessera_btree_open(&io, quota_root, TESSERA_BTREE_KIND_QUOTA, 8, 128);
@@ -655,6 +726,10 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
                     if used != computed {
                         fsck.problem(format!(
                             "quota domain {domain_id}: used_bytes={used} but regular-file sizes sum to {computed}"));
+                        // repair: patch used_bytes (offset 24, u64 LE).
+                        let mut patched = val.to_vec();
+                        patched[24..32].copy_from_slice(&computed.to_le_bytes());
+                        fsck.quota_fixes.push((k, patched));
                     }
                     if tessera_btree_cursor_next(cur) != 0 { break; }
                 }
@@ -663,8 +738,6 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
             }
         }
     }
-
-    unsafe { tessera_volume_close(v); }
 
     // ── report ───────────────────────────────────────────────────
     println!("tessera-fsck: {path}");
@@ -677,32 +750,211 @@ fn run(path: &str, verbose: bool) -> Result<i32, String> {
     }
     if fsck.problems.is_empty() {
         println!("  result:       CLEAN — no inconsistencies found");
+        unsafe { tessera_volume_close(v); }
+        return Ok(0);
+    }
+    println!("  result:       {} PROBLEM(S) FOUND:", fsck.problems.len());
+    for p in &fsck.problems {
+        println!("    - {p}");
+    }
+
+    if !repair {
+        unsafe { tessera_volume_close(v); }
+        return Ok(1);
+    }
+
+    // ── --repair: apply fixes, commit a new superblock, re-verify ──
+    let roots = RepairRoots {
+        inode_root, pack_registry_root: pack_root, free_extent_root: free_root,
+        quota_tree_root: quota_root, snapshots_root, next_inode_no,
+        pz_start, pz_len, hash_alg, mr_start, mr_len,
+    };
+    println!("\ntessera-fsck: --repair — applying fixes…");
+    let (applied, new_roots) = match apply_repairs(&f, &io, &fsck, &roots, verbose) {
+        Ok(x) => x,
+        Err(e) => { unsafe { tessera_volume_close(v); } return Err(format!("repair aborted: {e}")); }
+    };
+    if applied == 0 {
+        println!("tessera-fsck: nothing safely repairable by this tool (Tier-B/structural or superblock-level damage) — see problems above");
+        unsafe { tessera_volume_close(v); }
+        return Ok(1);
+    }
+    // Seal a new superblock pointing at the repaired roots. ctx.bump has
+    // advanced past every reserve sector the rewrites consumed.
+    let commit = tessera_commit_roots_t {
+        inode_root:         new_roots.inode_root,
+        pack_registry_root: new_roots.pack_registry_root,
+        free_extent_root:   new_roots.free_extent_root,
+        quota_tree_root:    new_roots.quota_tree_root,
+        snapshots_root:     new_roots.snapshots_root,
+        meta_reserve_bump:  ctx.bump.get(),
+        next_inode_no:      new_roots.next_inode_no,
+    };
+    let rc = unsafe { tessera_volume_commit_roots(v, &commit) };
+    unsafe { tessera_volume_close(v); }
+    if rc != 0 {
+        return Err(format!("commit_roots failed: rc={rc}"));
+    }
+    println!("tessera-fsck: applied {applied} repair action(s); committed generation {} — re-verifying…\n",
+        generation + 1);
+
+    // Fresh read-only scan of the now-repaired volume.
+    let verify = run(path, verbose, false)?;
+    if verify == 0 {
+        println!("\ntessera-fsck: REPAIR SUCCESSFUL — volume is now clean");
         Ok(0)
     } else {
-        println!("  result:       {} PROBLEM(S) FOUND:", fsck.problems.len());
-        for p in &fsck.problems {
-            println!("    - {p}");
-        }
+        println!("\ntessera-fsck: REPAIR INCOMPLETE — problems remain (structural/Tier-B or unrepairable)");
         Ok(1)
     }
+}
+
+/// Roots + geometry the repair passes need, snapshotted from the volume
+/// before mutation.
+struct RepairRoots {
+    inode_root: u64,
+    pack_registry_root: u64,
+    free_extent_root: u64,
+    quota_tree_root: u64,
+    snapshots_root: u64,
+    next_inode_no: u64,
+    pz_start: u64,
+    pz_len: u64,
+    hash_alg: u32,
+    mr_start: u64,
+    mr_len: u64,
+}
+
+/// The roots after repair (only the moved ones differ from RepairRoots).
+struct NewRoots {
+    inode_root: u64,
+    pack_registry_root: u64,
+    free_extent_root: u64,
+    quota_tree_root: u64,
+    snapshots_root: u64,
+    next_inode_no: u64,
+}
+
+/// Apply the structured repairs collected during the detect passes and
+/// return (actions applied, new roots). Every write goes through the
+/// O_SYNC device fd, so on return all rewritten structures are durable;
+/// the caller then seals a new superblock via tessera_volume_commit_roots.
+///
+/// Ordering: Tier-B structural repairs (which mint inodes / republish
+/// directories / add packs) run first so Tier-A's nlink recount and the
+/// free-tree rebuild observe the final inode tree and pack registry.
+fn apply_repairs(
+    _f: &std::fs::File,
+    io: &tessera_block_io_t,
+    fsck: &Fsck,
+    r: &RepairRoots,
+    verbose: bool,
+) -> Result<(u32, NewRoots), String> {
+    let mut new = NewRoots {
+        inode_root: r.inode_root,
+        pack_registry_root: r.pack_registry_root,
+        free_extent_root: r.free_extent_root,
+        quota_tree_root: r.quota_tree_root,
+        snapshots_root: r.snapshots_root,
+        next_inode_no: r.next_inode_no,
+    };
+    let mut applied = 0u32;
+    let _ = (r.pz_start, r.pz_len, r.hash_alg, r.mr_start, r.mr_len); // used by Tier B
+
+    // ── Tier A.1: nlink correction (inode-record rewrites) ──
+    if !fsck.nlink_fixes.is_empty() {
+        unsafe {
+            let t = tessera_btree_open(io, new.inode_root, TESSERA_BTREE_KIND_INODE,
+                4, TESSERA_INODE_RECORD_SIZE);
+            if t.is_null() { return Err("open inode tree for repair".into()); }
+            let mut root = new.inode_root;
+            for (key, val) in &fsck.nlink_fixes {
+                if tessera_btree_put(t, key.as_ptr(), val.as_ptr(), &mut root) != 0 {
+                    tessera_btree_close(t);
+                    return Err("btree_put(inode) during nlink repair".into());
+                }
+                applied += 1;
+            }
+            tessera_btree_close(t);
+            new.inode_root = root;
+        }
+        if verbose { eprintln!("  nlink: rewrote {} inode record(s)", fsck.nlink_fixes.len()); }
+    }
+
+    // ── Tier A.2: quota used_bytes correction ──
+    if !fsck.quota_fixes.is_empty() {
+        unsafe {
+            let t = tessera_btree_open(io, new.quota_tree_root, TESSERA_BTREE_KIND_QUOTA,
+                8, 128);
+            if t.is_null() { return Err("open quota tree for repair".into()); }
+            let mut root = new.quota_tree_root;
+            for (key, val) in &fsck.quota_fixes {
+                if tessera_btree_put(t, key.as_ptr(), val.as_ptr(), &mut root) != 0 {
+                    tessera_btree_close(t);
+                    return Err("btree_put(quota) during quota repair".into());
+                }
+                applied += 1;
+            }
+            tessera_btree_close(t);
+            new.quota_tree_root = root;
+        }
+        if verbose { eprintln!("  quota: rewrote {} domain record(s)", fsck.quota_fixes.len()); }
+    }
+
+    // ── Tier A.3: rebuild the free-extent tree from the authoritative
+    //    complement (pack zone minus allocated packs). Fixes leaked
+    //    space, double-state, and free overlap in one shot. ──
+    if fsck.free_tree_dirty {
+        unsafe {
+            let ea = tessera_extent_open(io, 0); // fresh, empty
+            if ea.is_null() { return Err("open extent allocator for repair".into()); }
+            for (s, l) in &fsck.free_runs {
+                if tessera_extent_free(ea, *s, *l) != 0 {
+                    tessera_extent_close(ea);
+                    return Err(format!("extent_free([{s}..{}]) during free-tree rebuild", s + l));
+                }
+            }
+            let mut nr = 0u64;
+            let rc = tessera_extent_flush(ea, &mut nr);
+            tessera_extent_close(ea);
+            if rc != 0 { return Err(format!("extent_flush during free-tree rebuild: rc={rc}")); }
+            new.free_extent_root = nr;
+        }
+        applied += 1;
+        if verbose {
+            eprintln!("  free-tree: rebuilt from {} free run(s)", fsck.free_runs.len());
+        }
+    }
+
+    Ok((applied, new))
 }
 
 fn main() -> ExitCode {
     let args: Vec<_> = std::env::args().collect();
     let mut path = None;
     let mut verbose = false;
+    let mut repair = false;
     for a in &args[1..] {
         match a.as_str() {
             "-v" | "--verbose" => verbose = true,
+            // --repair / -y: apply safe repairs in place, then re-verify.
+            // Opens the device O_SYNC read-write. -n forces detect-only.
+            "-y" | "--repair" => repair = true,
+            "-n" | "--dry-run" => repair = false,
             s if !s.starts_with('-') => path = Some(s.to_string()),
             _ => {}
         }
     }
     let path = match path {
         Some(p) => p,
-        None => { eprintln!("usage: tessera-fsck [-v] PATH"); return ExitCode::from(2); }
+        None => {
+            eprintln!("usage: tessera-fsck [-v] [-y|--repair | -n] PATH");
+            eprintln!("  default: read-only check (exit 1 if problems found)");
+            eprintln!("  -y, --repair: apply repairs in place, then re-verify");
+            return ExitCode::from(2);
+        }
     };
-    match run(&path, verbose) {
+    match run(&path, verbose, repair) {
         Ok(0) => ExitCode::SUCCESS,
         Ok(_) => ExitCode::FAILURE,
         Err(e) => { eprintln!("tessera-fsck: {e}"); ExitCode::from(2) }

@@ -139,7 +139,7 @@ fn run() -> Result<(), String> {
     }
 
     let uuid = random_uuid_v4().map_err(|e| format!("uuid: {e}"))?;
-    let mut ctx = DiskCtx { fd: fd_of(&f) };
+    let mut ctx = DiskCtx::ro(fd_of(&f));
     let io = make_io(&mut ctx);
 
     /* Seed-name and seed-content bytes must outlive the format call. */

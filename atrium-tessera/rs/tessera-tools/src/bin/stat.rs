@@ -132,7 +132,7 @@ fn run(vol_path: &str, hash_hex: &str) -> Result<(), String> {
     let f = open_file_ro(vol_path).map_err(|e| format!("open {vol_path}: {e}"))?;
     let fd = fd_of(&f);
 
-    let mut ctx = DiskCtx { fd };
+    let mut ctx = DiskCtx::ro(fd);
     let io = make_io(&mut ctx);
 
     let mut v: *mut tessera_sys::tessera_volume_t = std::ptr::null_mut();

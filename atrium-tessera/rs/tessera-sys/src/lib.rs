@@ -71,6 +71,20 @@ pub struct tessera_format_opts_t {
     pub hash_alg:             u32,          /* TESSERA_HASH_ALG_*: 0=sha256 1=blake3 */
 }
 
+/* Repaired roots for tessera_volume_commit_roots. Field order MUST match
+ * tessera_commit_roots_t in tessera/volume.h. Pass the volume's current
+ * value for any root the repair did not move. */
+#[repr(C)]
+pub struct tessera_commit_roots_t {
+    pub inode_root:         u64,
+    pub pack_registry_root: u64,
+    pub free_extent_root:   u64,
+    pub quota_tree_root:    u64,
+    pub snapshots_root:     u64,
+    pub meta_reserve_bump:  u64,
+    pub next_inode_no:      u64,
+}
+
 /* ── B+tree ──────────────────────────────────────────────────── */
 
 #[repr(C)]
@@ -354,6 +368,12 @@ extern "C" {
 
     pub fn tessera_volume_close(v: *mut tessera_volume_t);
 
+    /// Offline-repair commit: override moved roots + bump generation, write
+    /// both SB copies. See tessera/volume.h. Every structure the new roots
+    /// reference must already be durable (open the device O_SYNC).
+    pub fn tessera_volume_commit_roots(v: *mut tessera_volume_t,
+                                       roots: *const tessera_commit_roots_t) -> c_int;
+
     pub fn tessera_volume_hash_alg(v: *const tessera_volume_t) -> u32;
     pub fn tessera_volume_total_sectors    (v: *const tessera_volume_t) -> u64;
     pub fn tessera_volume_generation       (v: *const tessera_volume_t) -> u64;
@@ -375,4 +395,5 @@ extern "C" {
     pub fn tessera_volume_encryption_flags   (v: *const tessera_volume_t) -> u16;
     pub fn tessera_volume_active_slot_count  (v: *const tessera_volume_t) -> u8;
     pub fn tessera_volume_quota_tree_root    (v: *const tessera_volume_t) -> u64;
+    pub fn tessera_volume_next_inode_no      (v: *const tessera_volume_t) -> u64;
 }
