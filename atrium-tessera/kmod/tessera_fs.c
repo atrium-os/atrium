@@ -2905,6 +2905,24 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 				(void)tessera_fs_journal_log_drain(tmp_);
 				tmp_->journal_log_co_init = 0;
 			}
+			/*
+			 * Force the final flush to run its full commit path
+			 * (drain dirty content + inodes, commit_sb, and its
+			 * durability barrier) even if sb_dirty happens to be 0
+			 * here. tessera_fs_flush early-returns on !sb_dirty, but
+			 * "not dirty" only means no *uncommitted-to-the-btree*
+			 * change is pending — a straggler write whose metadata
+			 * was written via the deferred (bdwrite) journal/inode
+			 * path may still be sitting in the buffer cache, made
+			 * durable only by commit_sb's barrier. Skipping that
+			 * barrier and then checkpointing the journal below would
+			 * discard the redo records that are the ONLY remaining
+			 * recovery path for those not-yet-flushed writes — the
+			 * last file written before unmount then comes back
+			 * 0-length. Forcing a commit here is a cheap, safe
+			 * no-op-ish gen bump when nothing is actually pending.
+			 */
+			tmp_->sb_dirty = 1;
 			(void)tessera_fs_flush(tmp_);
 			/* Clean-unmount journal reset. The final flush above made
 			 * the SB fully reflect every committed mutation and every
