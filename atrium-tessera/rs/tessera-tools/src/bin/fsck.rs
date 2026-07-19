@@ -79,6 +79,13 @@ struct Fsck {
     // set when the on-disk free-extent tree disagrees with reality
     // (leaked sectors, double-state, free overlap / out-of-bounds).
     free_tree_dirty: bool,
+    // ── Tier-B structural repairs ──
+    // dirents pointing at a non-existent inode: (parent_ino, child_ino, name).
+    // --repair republishes the parent directory without them.
+    dangling_dirents: Vec<(u32, u64, String)>,
+    // live inodes not reachable from the root dir. --repair relinks each
+    // into /lost+found as "inode_<n>".
+    orphans: Vec<u32>,
     // stats
     inodes: u64,
     packs: u64,
@@ -292,7 +299,11 @@ unsafe fn name_str(p: *const core::ffi::c_char, len: u16) -> String {
     String::from_utf8_lossy(s).into_owned()
 }
 
-fn run(path: &str, verbose: bool, repair: bool) -> Result<i32, String> {
+/// One scan pass. Returns (exit_code, repair_actions_applied). With
+/// repair=false it only detects. With repair=true it applies fixes, commits,
+/// and returns (1, applied>0) so the caller can re-scan; a fully clean scan
+/// returns (0, 0).
+fn run(path: &str, verbose: bool, repair: bool) -> Result<(i32, u32), String> {
     let f = if repair {
         open_file_rw(path).map_err(|e| format!("open {path} (rw): {e}"))?
     } else {
@@ -309,7 +320,7 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<i32, String> {
     if r != 0 {
         // The superblock itself is unreadable/corrupt — the worst case.
         eprintln!("tessera-fsck: SUPERBLOCK INVALID (tessera_volume_open errno={r}) — both SB copies failed magic/CRC/HMAC/version");
-        return Ok(1);
+        return Ok((1, 0));
     }
 
     let total = unsafe { tessera_volume_total_sectors(v) };
@@ -349,6 +360,8 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<i32, String> {
         quota_fixes: Vec::new(),
         free_runs: Vec::new(),
         free_tree_dirty: false,
+        dangling_dirents: Vec::new(),
+        orphans: Vec::new(),
         inodes: 0,
         packs: 0,
         blobs: 0,
@@ -551,6 +564,7 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<i32, String> {
         let mut stack = vec![root];
         reachable.insert(root);
         let mut dangling = Vec::new();
+        let mut dangling_struct: Vec<(u32, u64, String)> = Vec::new();
         // incoming dirent references per inode (for nlink verification)
         let mut links: HashMap<u32, u32> = HashMap::new();
         while let Some(ino) = stack.pop() {
@@ -561,21 +575,28 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<i32, String> {
             for (child, name) in ents {
                 if name == "." || name == ".." { continue; }
                 let c = child as u32;
-                *links.entry(c).or_insert(0) += 1;
                 if !fsck.inode_map.contains_key(&c) {
                     dangling.push(format!("dangling dirent: inode {ino} entry '{name}' -> inode {child} (not in inode tree)"));
-                } else if reachable.insert(c) {
-                    stack.push(c);
+                    dangling_struct.push((ino, child, name));
+                    // a dangling entry will be removed by repair, so it does
+                    // NOT count toward the child's incoming links.
+                } else {
+                    *links.entry(c).or_insert(0) += 1;
+                    if reachable.insert(c) {
+                        stack.push(c);
+                    }
                 }
             }
         }
         for d in dangling { fsck.problem(d); }
+        fsck.dangling_dirents = dangling_struct;
         let mut orphans: Vec<u32> = fsck.inode_map.keys().copied()
             .filter(|k| !reachable.contains(k)).collect();
         orphans.sort_unstable();
         for o in &orphans {
             fsck.problem(format!("orphan inode {o} (not reachable from the root dir)"));
         }
+        fsck.orphans = orphans.clone();
         // nlink verification: files = incoming dirent count; dirs = 2
         // (tessera stores no '.'/'..' and doesn't track '..' backlinks, so a
         // directory's nlink is fixed at 2 = parent's entry + implicit '.').
@@ -751,7 +772,7 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<i32, String> {
     if fsck.problems.is_empty() {
         println!("  result:       CLEAN — no inconsistencies found");
         unsafe { tessera_volume_close(v); }
-        return Ok(0);
+        return Ok((0, 0));
     }
     println!("  result:       {} PROBLEM(S) FOUND:", fsck.problems.len());
     for p in &fsck.problems {
@@ -760,10 +781,13 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<i32, String> {
 
     if !repair {
         unsafe { tessera_volume_close(v); }
-        return Ok(1);
+        return Ok((1, 0));
     }
 
-    // ── --repair: apply fixes, commit a new superblock, re-verify ──
+    // ── --repair: apply fixes and commit a new superblock. The caller
+    //    (run_to_fixpoint) re-scans to verify and to catch second-order
+    //    fixes — e.g. an orphan relinked into lost+found this pass has its
+    //    nlink recounted next pass. ──
     let roots = RepairRoots {
         inode_root, pack_registry_root: pack_root, free_extent_root: free_root,
         quota_tree_root: quota_root, snapshots_root, next_inode_no,
@@ -775,9 +799,9 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<i32, String> {
         Err(e) => { unsafe { tessera_volume_close(v); } return Err(format!("repair aborted: {e}")); }
     };
     if applied == 0 {
-        println!("tessera-fsck: nothing safely repairable by this tool (Tier-B/structural or superblock-level damage) — see problems above");
+        println!("tessera-fsck: nothing safely repairable by this tool (superblock-level or unrecoverable damage) — see problems above");
         unsafe { tessera_volume_close(v); }
-        return Ok(1);
+        return Ok((1, 0));
     }
     // Seal a new superblock pointing at the repaired roots. ctx.bump has
     // advanced past every reserve sector the rewrites consumed.
@@ -795,18 +819,32 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<i32, String> {
     if rc != 0 {
         return Err(format!("commit_roots failed: rc={rc}"));
     }
-    println!("tessera-fsck: applied {applied} repair action(s); committed generation {} — re-verifying…\n",
+    println!("tessera-fsck: applied {applied} repair action(s); committed generation {}",
         generation + 1);
+    Ok((1, applied))
+}
 
-    // Fresh read-only scan of the now-repaired volume.
-    let verify = run(path, verbose, false)?;
-    if verify == 0 {
-        println!("\ntessera-fsck: REPAIR SUCCESSFUL — volume is now clean");
-        Ok(0)
-    } else {
-        println!("\ntessera-fsck: REPAIR INCOMPLETE — problems remain (structural/Tier-B or unrepairable)");
-        Ok(1)
+/// Drive --repair to a fixpoint: repeatedly scan + apply until the volume
+/// verifies clean, no further progress is possible, or a pass cap is hit.
+/// Multiple passes are needed because some repairs expose others (relinking
+/// an orphan changes its link count; republishing a directory changes the
+/// free set). Returns the process exit code.
+fn run_to_fixpoint(path: &str, verbose: bool) -> Result<i32, String> {
+    const MAX_PASSES: u32 = 8;
+    for pass in 0..MAX_PASSES {
+        if pass > 0 { println!("\n──── repair pass {} ────", pass + 1); }
+        let (exit, applied) = run(path, verbose, true)?;
+        if exit == 0 {
+            if pass > 0 { println!("\ntessera-fsck: REPAIR SUCCESSFUL — volume is now clean"); }
+            return Ok(0);
+        }
+        if applied == 0 {
+            println!("\ntessera-fsck: REPAIR INCOMPLETE — remaining problems are not safely repairable");
+            return Ok(1);
+        }
     }
+    println!("\ntessera-fsck: repair did not converge after {MAX_PASSES} passes — re-run or inspect manually");
+    Ok(1)
 }
 
 /// Roots + geometry the repair passes need, snapshotted from the volume
@@ -844,7 +882,7 @@ struct NewRoots {
 /// directories / add packs) run first so Tier-A's nlink recount and the
 /// free-tree rebuild observe the final inode tree and pack registry.
 fn apply_repairs(
-    _f: &std::fs::File,
+    f: &std::fs::File,
     io: &tessera_block_io_t,
     fsck: &Fsck,
     r: &RepairRoots,
@@ -859,7 +897,95 @@ fn apply_repairs(
         next_inode_no: r.next_inode_no,
     };
     let mut applied = 0u32;
-    let _ = (r.pz_start, r.pz_len, r.hash_alg, r.mr_start, r.mr_len); // used by Tier B
+    let _ = (r.pz_start, r.pz_len, r.mr_start, r.mr_len);
+
+    // Local mutable free set (authoritative complement from Pass D). Tier-B
+    // pack publishes carve from it; the Tier-A.3 rebuild flushes the final
+    // set, so new packs never end up double-stated against the free tree.
+    let mut free: Vec<(u64, u64)> = fsck.free_runs.clone();
+    let mut free_dirty = fsck.free_tree_dirty;
+
+    // ── Tier B: structural repairs (republish directories) ──
+    // Collect every directory mutation first, keyed by dir inode, so each
+    // directory is republished exactly once even when it needs several edits
+    // (e.g. the root dir both loses a dangling entry and gains lost+found).
+    const S_IFDIR: u32 = 0o040000;
+    #[derive(Default)]
+    struct DirMod {
+        remove: std::collections::HashSet<(u64, String)>,
+        add: Vec<(String, u64)>,
+        from_empty: bool, // true for a freshly-minted (lost+found) directory
+    }
+    let mut mods: HashMap<u32, DirMod> = HashMap::new();
+
+    for (parent, child, name) in &fsck.dangling_dirents {
+        mods.entry(*parent).or_default().remove.insert((*child, name.clone()));
+    }
+
+    if !fsck.orphans.is_empty() {
+        // Resolve (or mint) /lost+found, then link each orphan into it.
+        let root = TESSERA_INODE_ROOT_DIR;
+        let root_manifest = fsck.inode_map.get(&root).map(|x| x.2).unwrap_or([0u8; 32]);
+        let mut root_ents = Vec::new();
+        fsck.collect_dirents(&root_manifest, &mut root_ents, 0);
+        let existing = root_ents.iter().find(|(_, n)| n == "lost+found").map(|(c, _)| *c as u32);
+        let laf_ino = match existing {
+            Some(l) if fsck.inode_map.get(&l).map(|x| x.0 & S_IFMT == S_IFDIR).unwrap_or(false) => l,
+            _ => {
+                // Mint a new lost+found directory inode and link it into root.
+                let l = new.next_inode_no as u32;
+                new.next_inode_no += 1;
+                mods.entry(root).or_default().add.push(("lost+found".to_string(), l as u64));
+                mods.entry(l).or_default().from_empty = true;
+                l
+            }
+        };
+        let m = mods.entry(laf_ino).or_default();
+        for o in &fsck.orphans {
+            // Don't relink lost+found itself if it somehow appears orphaned.
+            if *o == laf_ino { continue; }
+            m.add.push((format!("inode_{o}"), *o as u64));
+        }
+    }
+
+    // Publish each modified directory once.
+    let mut dirs: Vec<u32> = mods.keys().copied().collect();
+    dirs.sort_unstable();
+    for dir_ino in dirs {
+        let m = &mods[&dir_ino];
+        // Base entry list: current on-disk entries, or empty for a minted dir.
+        let mut ents: Vec<(String, u64)> = if m.from_empty {
+            Vec::new()
+        } else {
+            let manifest = fsck.inode_map.get(&dir_ino).map(|x| x.2).unwrap_or([0u8; 32]);
+            let mut e = Vec::new();
+            fsck.collect_dirents(&manifest, &mut e, 0);
+            e.into_iter()
+                .filter(|(_, n)| n != "." && n != "..")
+                .map(|(child, name)| (name, child))
+                .collect()
+        };
+        ents.retain(|(name, child)| !m.remove.contains(&(*child, name.clone())));
+        for a in &m.add { ents.push(a.clone()); }
+
+        let (new_hash, npr) = publish_dir(io, f, &ents, &mut free, r.hash_alg,
+            new.pack_registry_root)?;
+        new.pack_registry_root = npr;
+        free_dirty = true;
+        if m.from_empty {
+            // Create the directory inode pointing at the freshly-published
+            // manifest (nlink 2; the parent's new dirent is its one link).
+            let rec = make_dir_inode(dir_ino, &new_hash);
+            new.inode_root = put_inode(io, new.inode_root, &dir_ino.to_be_bytes(), &rec)?;
+        } else {
+            new.inode_root = set_inode_manifest(io, new.inode_root, dir_ino, &new_hash, fsck)?;
+        }
+        applied += (m.remove.len() + m.add.len()) as u32;
+        if verbose {
+            eprintln!("  dir {dir_ino}: republished ({} removed, {} added){}",
+                m.remove.len(), m.add.len(), if m.from_empty { " [minted]" } else { "" });
+        }
+    }
 
     // ── Tier A.1: nlink correction (inode-record rewrites) ──
     if !fsck.nlink_fixes.is_empty() {
@@ -901,14 +1027,16 @@ fn apply_repairs(
         if verbose { eprintln!("  quota: rewrote {} domain record(s)", fsck.quota_fixes.len()); }
     }
 
-    // ── Tier A.3: rebuild the free-extent tree from the authoritative
-    //    complement (pack zone minus allocated packs). Fixes leaked
-    //    space, double-state, and free overlap in one shot. ──
-    if fsck.free_tree_dirty {
+    // ── Tier A.3: rebuild the free-extent tree from the authoritative free
+    //    set (Pass-D complement minus any sectors Tier-B just carved for new
+    //    packs). Fixes leaked space, double-state, and free overlap in one
+    //    shot, and keeps new packs out of the free tree. ──
+    if free_dirty {
+        let runs: Vec<(u64, u64)> = free.iter().copied().filter(|(_, l)| *l > 0).collect();
         unsafe {
             let ea = tessera_extent_open(io, 0); // fresh, empty
             if ea.is_null() { return Err("open extent allocator for repair".into()); }
-            for (s, l) in &fsck.free_runs {
+            for (s, l) in &runs {
                 if tessera_extent_free(ea, *s, *l) != 0 {
                     tessera_extent_close(ea);
                     return Err(format!("extent_free([{s}..{}]) during free-tree rebuild", s + l));
@@ -922,11 +1050,152 @@ fn apply_repairs(
         }
         applied += 1;
         if verbose {
-            eprintln!("  free-tree: rebuilt from {} free run(s)", fsck.free_runs.len());
+            eprintln!("  free-tree: rebuilt from {} free run(s)", runs.len());
         }
     }
 
     Ok((applied, new))
+}
+
+/// First-fit allocate `n` contiguous sectors from the running free set,
+/// shrinking the chosen run. Zero-length remnants are filtered at flush.
+fn alloc_extent(free: &mut [(u64, u64)], n: u64) -> Result<u64, String> {
+    for run in free.iter_mut() {
+        if run.1 >= n {
+            let start = run.0;
+            run.0 += n;
+            run.1 -= n;
+            return Ok(start);
+        }
+    }
+    Err(format!("no free extent of {n} sector(s) for a repair pack"))
+}
+
+/// A 144-byte DIRECTORY inode record for a freshly-minted directory
+/// (lost+found): mode drwxr-xr-x, nlink 2, gen 1, pointing at `hash`.
+fn make_dir_inode(ino: u32, hash: &Hash) -> Vec<u8> {
+    let mut r = vec![0u8; TESSERA_INODE_RECORD_SIZE as usize];
+    r[0..4].copy_from_slice(&ino.to_le_bytes());       // inode_no
+    r[4..8].copy_from_slice(&1u32.to_le_bytes());      // gen
+    r[8..12].copy_from_slice(&0o040755u32.to_le_bytes()); // mode S_IFDIR|0755
+    r[64..68].copy_from_slice(&2u32.to_le_bytes());    // nlink
+    r[72..104].copy_from_slice(hash);                  // manifest_hash
+    r
+}
+
+/// btree_put a raw inode record; returns the new inode-tree root.
+fn put_inode(io: &tessera_block_io_t, inode_root: u64, key: &[u8], val: &[u8])
+    -> Result<u64, String>
+{
+    unsafe {
+        let t = tessera_btree_open(io, inode_root, TESSERA_BTREE_KIND_INODE, 4,
+            TESSERA_INODE_RECORD_SIZE);
+        if t.is_null() { return Err("open inode tree".into()); }
+        let mut root = inode_root;
+        let rc = tessera_btree_put(t, key.as_ptr(), val.as_ptr(), &mut root);
+        tessera_btree_close(t);
+        if rc != 0 { return Err("btree_put(inode)".into()); }
+        Ok(root)
+    }
+}
+
+/// Rewrite an existing inode's manifest_hash (offset 72). Returns new root.
+fn set_inode_manifest(io: &tessera_block_io_t, inode_root: u64, ino: u32, hash: &Hash,
+    fsck: &Fsck) -> Result<u64, String>
+{
+    let (key, raw) = fsck.inode_raw.get(&ino)
+        .ok_or_else(|| format!("inode {ino} record missing for manifest update"))?;
+    let mut rec = raw.clone();
+    rec[72..104].copy_from_slice(hash);
+    put_inode(io, inode_root, key, &rec)
+}
+
+/// Build a flat DIRECTORY manifest from `entries`, publish it as a
+/// single-blob pack (content-addressed pack_id = hash[0..16], SEALED,
+/// pack_kind 0 — matching the kmod's publish_manifest_to_disk), allocate
+/// pack-zone space, write it, and register it. Returns (manifest hash, new
+/// pack-registry root). Mirrors tessera_fs_publish_manifest_to_disk.
+fn publish_dir(io: &tessera_block_io_t, f: &std::fs::File, entries: &[(String, u64)],
+    free: &mut [(u64, u64)], hash_alg: u32, pack_root: u64) -> Result<(Hash, u64), String>
+{
+    unsafe {
+        // 1. build the manifest
+        let mb = tessera_manifest_begin(TESSERA_MFT_DIRECTORY);
+        if mb.is_null() { return Err("manifest_begin(DIRECTORY)".into()); }
+        tessera_manifest_set_hash_alg(mb, hash_alg);
+        for (name, child) in entries {
+            if tessera_manifest_add_dirent(mb, *child,
+                name.as_ptr() as *const core::ffi::c_char, name.len()) != 0 {
+                tessera_manifest_free(mb);
+                return Err(format!("add_dirent('{name}')"));
+            }
+        }
+        // finalize into an escalating buffer (dir manifests are small; a huge
+        // flat directory would need DIRECTORY_2L — reported, not silently lost)
+        let mut mbytes = Vec::new();
+        let mut mlen = 0usize;
+        let mut hash = [0u8; 32];
+        let mut ok = false;
+        for cap in [64 * 1024usize, 1 << 20, 16 << 20] {
+            mbytes = vec![0u8; cap];
+            let rc = tessera_manifest_finalize(mb, mbytes.as_mut_ptr(), cap,
+                &mut mlen, hash.as_mut_ptr());
+            if rc == 0 { ok = true; break; }
+        }
+        tessera_manifest_free(mb);
+        if !ok {
+            return Err("directory too large to re-emit as a flat manifest \
+                (needs DIRECTORY_2L — not yet supported by repair)".into());
+        }
+
+        // 2. pack it (content-addressed pack_id = first 16 bytes of the hash)
+        let pack_id = &hash[0..16];
+        let pb = tessera_pack_begin(0, pack_id.as_ptr(), 0);
+        if pb.is_null() { return Err("pack_begin".into()); }
+        if tessera_pack_add_blob(pb, hash.as_ptr(), mbytes.as_ptr(), mlen as u32,
+            TESSERA_BLOB_FLAG_MANIFEST) != 0 {
+            tessera_pack_free(pb);
+            return Err("pack_add_blob".into());
+        }
+        let mut psz = 0usize;
+        tessera_pack_finalize(pb, std::ptr::null_mut(), 0, &mut psz);
+        if psz == 0 || psz % SECTOR_SIZE as usize != 0 {
+            tessera_pack_free(pb);
+            return Err(format!("pack_finalize probe gave bad size {psz}"));
+        }
+        let mut pbuf = vec![0u8; psz];
+        let rc = tessera_pack_finalize(pb, pbuf.as_mut_ptr(), psz, &mut psz);
+        tessera_pack_free(pb);
+        if rc != 0 { return Err("pack_finalize fill".into()); }
+
+        // 3. allocate pack-zone space + write the pack
+        let n_sectors = psz as u64 / SECTOR_SIZE;
+        let start = alloc_extent(free, n_sectors)?;
+        f.write_at(&pbuf, start * SECTOR_SIZE)
+            .map_err(|e| format!("write pack at sector {start}: {e}"))?;
+
+        // 4. register the pack (raw 64-byte tessera_registry_entry_t, LE;
+        //    same field layout fsck reads back in Pass A)
+        let mut re = [0u8; TESSERA_REGISTRY_ENTRY_SIZE as usize];
+        re[0..16].copy_from_slice(pack_id);
+        re[16..24].copy_from_slice(&start.to_le_bytes());       // start_sector
+        re[24..32].copy_from_slice(&n_sectors.to_le_bytes());   // length_sectors
+        re[32..36].copy_from_slice(&1u32.to_le_bytes());        // blob_count
+        re[36..40].copy_from_slice(&0u32.to_le_bytes());        // pack_kind
+        re[40..48].copy_from_slice(&(psz as u64).to_le_bytes()); // total_bytes
+        // create_time (48..56) = 0
+        re[56..60].copy_from_slice(&1u32.to_le_bytes());        // reachable_blobs
+        re[60..64].copy_from_slice(&TESSERA_REGISTRY_FLAG_SEALED.to_le_bytes()); // flags
+
+        let t = tessera_btree_open(io, pack_root, TESSERA_BTREE_KIND_PACK_REG, 16,
+            TESSERA_REGISTRY_ENTRY_SIZE);
+        if t.is_null() { return Err("open pack registry for repair".into()); }
+        let mut npr = pack_root;
+        let rc = tessera_btree_put(t, pack_id.as_ptr(), re.as_ptr(), &mut npr);
+        tessera_btree_close(t);
+        if rc != 0 { return Err("btree_put(pack registry)".into()); }
+        Ok((hash, npr))
+    }
 }
 
 fn main() -> ExitCode {
@@ -954,7 +1223,12 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match run(&path, verbose, repair) {
+    let result = if repair {
+        run_to_fixpoint(&path, verbose)
+    } else {
+        run(&path, verbose, false).map(|(exit, _)| exit)
+    };
+    match result {
         Ok(0) => ExitCode::SUCCESS,
         Ok(_) => ExitCode::FAILURE,
         Err(e) => { eprintln!("tessera-fsck: {e}"); ExitCode::from(2) }

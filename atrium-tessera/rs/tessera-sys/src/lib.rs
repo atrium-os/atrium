@@ -234,12 +234,23 @@ pub struct tessera_dir_bucket_record_t {
 extern "C" {
     pub fn tessera_manifest_begin(kind: tessera_manifest_kind_t)
                                    -> *mut tessera_manifest_builder_t;
+    /// Set the content-hash algorithm for the manifest being built so its
+    /// finalized hash matches the volume's alg (0=sha256, 1=blake3).
+    pub fn tessera_manifest_set_hash_alg(b: *mut tessera_manifest_builder_t,
+                                          alg: u32) -> c_int;
     pub fn tessera_manifest_add_chunk(b: *mut tessera_manifest_builder_t,
                                        chunk_hash: *const u8,
                                        logical_offset: u64,
                                        size: u32, flags: u32) -> c_int;
     pub fn tessera_manifest_set_inline(b: *mut tessera_manifest_builder_t,
                                         data: *const u8, len: usize) -> c_int;
+    /// Append a directory entry (flat DIRECTORY manifest). Entries are kept
+    /// sorted by name internally. Used by fsck --repair to republish a
+    /// directory without its dangling entries / with a lost+found link.
+    pub fn tessera_manifest_add_dirent(b: *mut tessera_manifest_builder_t,
+                                        child_inode: u64,
+                                        name: *const core::ffi::c_char,
+                                        name_len: usize) -> c_int;
     pub fn tessera_manifest_finalize(b: *mut tessera_manifest_builder_t,
                                       out_buf: *mut u8, buf_len: usize,
                                       out_size: *mut usize,
