@@ -744,7 +744,17 @@ static int tessera_blake3_ok;
 #define TESSERA_MP_HASH(tmp, buf, len, out) \
 	tessera_content_hash((tmp)->sb.hash_alg, (buf), (len), (out))
 static int tessera_commit_extent(struct tessera_mount *tmp_);
-struct tessera_replay_ctx { struct tessera_mount *tmp_; int applied; };
+struct tessera_replay_ctx {
+	struct tessera_mount *tmp_;
+	int applied;
+	/* roots_only: apply only ROOT_UPDATE checkpoints (roll the in-core SB
+	 * roots forward) and skip the dirent/inode redo records. Used by the
+	 * read-only mount recovery pass, which must roll the trees to the last
+	 * crash-consistent checkpoint before they open but cannot (and need
+	 * not) replay the finer-grained redo log into the dirty overlay — that
+	 * is deferred to the ro->rw upgrade, which can drain it. */
+	int roots_only;
+};
 static int tessera_replay_handler(void *ctx,
     const tessera_record_header_t *hdr, const uint8_t *body);
 struct meta_mark_ctx { uint8_t *bitmap; uint64_t lo; uint64_t hi;
@@ -2134,51 +2144,70 @@ tessera_heal_sb(struct vnode *devvp, uint64_t which,
 	return (bwrite(bp));
 }
 
-/* Open the journal, replay any records (rolling the SB forward on recovery),
- * and wire the deferred redo-log io. Idempotent. Runs at a read-write mount,
- * and again at the ro->rw remount of a volume first mounted MNT_RDONLY (which
- * deferred all of this — a read-only mount opens no journal and writes
- * nothing). Requires write access to the device (SB roll-forward + the
- * deferred redo-log both write), so callers must already hold rw access. */
+/* Open the on-disk journal (idempotent). Reads only, so safe on a ro mount. */
 static void
-tessera_fs_journal_setup(struct tessera_mount *tmp_)
+tessera_fs_journal_open_dev(struct tessera_mount *tmp_)
 {
 	if (tmp_->journal != NULL)
 		return;
 	tmp_->journal = tessera_journal_open(&tmp_->bio,
 	    tmp_->sb.journal_start, tmp_->sb.journal_length);
-	if (tmp_->journal == NULL)
-		return;
+	if (tmp_->journal != NULL)
+		printf("tessera_fs: journal_open OK at sector %lu len %lu\n",
+		    (unsigned long)tmp_->sb.journal_start,
+		    (unsigned long)tmp_->sb.journal_length);
+}
 
-	struct tessera_replay_ctx rctx = { .tmp_ = tmp_, .applied = 0 };
-	printf("tessera_fs: journal_open OK at sector %lu len %lu; "
-	    "starting replay\n",
-	    (unsigned long)tmp_->sb.journal_start,
-	    (unsigned long)tmp_->sb.journal_length);
+/* Replay the journal into IN-CORE state — RAM only, no device writes, so it
+ * is safe on a read-only mount. roots_only=1 applies just the ROOT_UPDATE
+ * checkpoints (rolls the in-core SB roots forward, which MUST happen before
+ * the btrees open so they open against the recovered roots); roots_only=0 also
+ * re-applies the dirent/inode redo records into the dirty overlay (which a
+ * writable mount later drains to disk). Returns the count of ROOT_UPDATE
+ * records applied. Opens the journal if needed. */
+static int
+tessera_fs_journal_replay(struct tessera_mount *tmp_, int roots_only)
+{
+	tessera_fs_journal_open_dev(tmp_);
+	if (tmp_->journal == NULL)
+		return (0);
+	struct tessera_replay_ctx rctx =
+	    { .tmp_ = tmp_, .applied = 0, .roots_only = roots_only };
 	tmp_->in_replay = 1;
 	(void)tessera_journal_replay(tmp_->journal,
 	    tessera_replay_handler, &rctx);
 	tmp_->in_replay = 0;
-	printf("tessera_fs: replay applied %d ROOT_UPDATE record(s); "
-	    "%lu DIR records re-applied\n",
+	printf("tessera_fs: journal replay (%s) applied %d ROOT_UPDATE "
+	    "record(s); %lu redo records re-applied\n",
+	    roots_only ? "roots-only" : "full",
 	    rctx.applied, tessera_stat_journal_log_replays);
-	if (rctx.applied > 0) {
-		/* Persist the rolled-forward SB so subsequent crashes see the
-		 * recovered state without needing replay. */
-		uint8_t *sbbuf = malloc(TESSERA_SECTOR_SIZE, M_TESSERA,
-		    M_WAITOK | M_ZERO);
-		if (tessera_encode_superblock(&tmp_->sb, sbbuf) == TESSERA_OK) {
-			(void)tessera_kbio_write(&tmp_->bio_ctx, 0, sbbuf);
-			(void)tessera_kbio_write(&tmp_->bio_ctx, 1, sbbuf);
-		}
-		free(sbbuf, M_TESSERA);
-		printf("tessera_fs: journal replay rolled forward %d record(s); "
-		    "SB now gen=%lu\n",
-		    rctx.applied, (unsigned long)tmp_->sb.generation);
+	return (rctx.applied);
+}
+
+/* Persist the (possibly rolled-forward) in-core SB to both sectors so a later
+ * crash sees the recovered state without needing replay. Requires write access. */
+static void
+tessera_fs_journal_persist_sb(struct tessera_mount *tmp_)
+{
+	uint8_t *sbbuf = malloc(TESSERA_SECTOR_SIZE, M_TESSERA,
+	    M_WAITOK | M_ZERO);
+	if (tessera_encode_superblock(&tmp_->sb, sbbuf) == TESSERA_OK) {
+		(void)tessera_kbio_write(&tmp_->bio_ctx, 0, sbbuf);
+		(void)tessera_kbio_write(&tmp_->bio_ctx, 1, sbbuf);
 	}
-	/* Deferred (bdwrite) io for the dirent/inode redo-log drain; its
-	 * durability rides the next commit_sb barrier. commit_sb's own
-	 * journal writes (ROOT_UPDATE / checkpoint) keep the synchronous io. */
+	free(sbbuf, M_TESSERA);
+	printf("tessera_fs: recovered SB persisted, gen=%lu\n",
+	    (unsigned long)tmp_->sb.generation);
+}
+
+/* Wire the deferred (bdwrite) block_io used to drain the dirent/inode redo
+ * log; its durability rides the next commit_sb barrier. commit_sb's own
+ * journal writes (ROOT_UPDATE / checkpoint) keep the synchronous io. */
+static void
+tessera_fs_journal_wire_deferred(struct tessera_mount *tmp_)
+{
+	if (tmp_->journal == NULL)
+		return;
 	tmp_->journal_bio_deferred.read_block  = tessera_kbio_read;
 	tmp_->journal_bio_deferred.write_block = tessera_kbio_write_delayed;
 	tmp_->journal_bio_deferred.alloc       = tessera_kbio_alloc;
@@ -2186,6 +2215,23 @@ tessera_fs_journal_setup(struct tessera_mount *tmp_)
 	tmp_->journal_bio_deferred.ctx         = &tmp_->bio_ctx;
 	tessera_journal_set_deferred_io(tmp_->journal,
 	    &tmp_->journal_bio_deferred);
+}
+
+/* Full read-write journal bring-up: open + FULL replay (roots + redo) + persist
+ * the rolled-forward SB + wire the deferred io. Requires device write access.
+ * Used by a from-the-start rw mount and by the ro->rw upgrade — in the latter
+ * the ro mount already rolled the roots forward (roots-only replay), so the
+ * re-walk here applies the dirent/inode redo records for the first time; the
+ * caller must follow with a flush to drain that overlay durably. */
+static void
+tessera_fs_journal_setup(struct tessera_mount *tmp_)
+{
+	int applied = tessera_fs_journal_replay(tmp_, /*roots_only=*/0);
+	if (tmp_->journal == NULL)
+		return;
+	if (applied > 0)
+		tessera_fs_journal_persist_sb(tmp_);
+	tessera_fs_journal_wire_deferred(tmp_);
 }
 
 /* ── core mount: open device + decode SB ─────────────────────── */
@@ -2449,12 +2495,21 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * rolled-forward generation lifts sb.inode_root / pack_registry_
 	 * root / free_extent_root to the just-committed values. The
 	 * trees then open against the correct (replayed) roots. */
-	/* Open + replay the journal now for a live read-write mount. Forensic
-	 * (tessera.gen) and read-only (ronly) mounts open no journal and write
-	 * nothing here — a ronly mount defers this to tessera_fs_journal_setup
-	 * on the ro->rw remount. */
-	if (requested_gen == 0 && !ronly)
-		tessera_fs_journal_setup(tmp_);
+	/* Crash recovery. A live rw mount does the FULL bring-up (replay roots +
+	 * redo, persist the rolled-forward SB, wire the deferred redo-log io).
+	 * A read-only mount can't write, so it replays only the ROOT_UPDATE
+	 * checkpoints IN-CORE — rolling the SB roots to the last crash-consistent
+	 * checkpoint before the trees open, so a ro root mounted after a crash
+	 * still presents a consistent tree. The finer-grained dirent/inode redo
+	 * records (and the SB persist) are deferred to the ro->rw upgrade, which
+	 * has write access to drain them. Forensic (tessera.gen) mounts skip all
+	 * of this — replay would advance the roots past the requested snapshot. */
+	if (requested_gen == 0) {
+		if (ronly)
+			(void)tessera_fs_journal_replay(tmp_, /*roots_only=*/1);
+		else
+			tessera_fs_journal_setup(tmp_);
+	}
 
 	/* Slice 2: tessera.gen=N — historical read-only mount.
 	 *
@@ -2692,7 +2747,10 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	{
 		int t_ms = tessera_journal_log_interval_ms;
 		if (t_ms < 10) t_ms = 10;
-		if (tmp_->journal_log_co_init && tmp_->journal != NULL)
+		/* Don't arm on a read-only mount: the callout drains the dirent
+		 * log to the on-disk journal (writes), and a ro mount holds no
+		 * write access. The ro->rw upgrade arms it. */
+		if (tmp_->journal_log_co_init && tmp_->journal != NULL && !ronly)
 			callout_reset(&tmp_->journal_log_co,
 			    (hz * t_ms) / 1000,
 			    tessera_fs_journal_log_callout, tmp_);
@@ -2791,11 +2849,14 @@ tessera_mount_impl(struct mount *mp)
 		 * upgrade the consumer — g_vfs_open(...,wr) is g_access(cp,1,wr,
 		 * wr), so ro is (1,0,0) and the rw upgrade is g_access(cp,0,1,1).
 		 * Detect the direction the way ffs_mount does: "ro" absent from
-		 * the new options means going rw. A cleanly-unmounted volume has
-		 * an empty journal, so no roll-forward recovery is owed on this
-		 * transition (crash-recovery on the ro->rw path is not yet wired
-		 * up — mount rw from the start for that; see #40). The reverse
-		 * rw->ro remount flushes and flips the VFS posture to read-only
+		 * the new options means going rw. Crash recovery spans the two
+		 * mounts: the initial ro mount already rolled the SB roots to the
+		 * last checkpoint (roots-only replay), and this ro->rw upgrade now
+		 * replays the dirent/inode redo records the ro mount deferred,
+		 * persists the recovered SB, wires the redo-log io, and flushes to
+		 * make it all durable. A cleanly-unmounted volume has an empty
+		 * journal so this is a no-op. The reverse rw->ro remount flushes
+		 * and flips the VFS posture to read-only
 		 * but KEEPS the GEOM write access it already holds: unmount still
 		 * needs to write the final SB/checkpoint, and a later ro->rw would
 		 * otherwise have to re-acquire it. Dropping write access here is
@@ -2828,10 +2889,23 @@ tessera_mount_impl(struct mount *mp)
 				MNT_ILOCK(mp);
 				mp->mnt_flag &= ~MNT_RDONLY;
 				MNT_IUNLOCK(mp);
-				/* Now writable: open + replay the journal the ro
-				 * mount deferred, so the redo-log + commit path work
-				 * and any crash records are applied before use. */
+				/* Now writable: apply the dirent/inode redo records
+				 * the ro mount's roots-only replay deferred, persist
+				 * the recovered SB, and wire the redo-log io. The
+				 * fall-through flush below drains the redo overlay to
+				 * disk so the recovery is durable. */
 				tessera_fs_journal_setup(tmp_);
+				/* Arm the journal-log group-commit callout the ro
+				 * mount left unarmed, so dirent-op durability now
+				 * matches a from-the-start rw mount. */
+				if (tmp_->journal_log_co_init &&
+				    tmp_->journal != NULL) {
+					int t_ms = tessera_journal_log_interval_ms;
+					if (t_ms < 10) t_ms = 10;
+					callout_reset(&tmp_->journal_log_co,
+					    (hz * t_ms) / 1000,
+					    tessera_fs_journal_log_callout, tmp_);
+				}
 			} else if (!tmp_->ronly && going_ro) {
 				/* rw -> ro (shutdown): flush and flip to read-only,
 				 * but keep the GEOM write access (see comment above)
@@ -9618,8 +9692,13 @@ tessera_replay_handler(void *ctx, const tessera_record_header_t *hdr,
 	/* v2.6 B.2: dirent log records re-create the in-memory log
 	 * for replay. They live alongside ROOT_UPDATE records in the
 	 * journal; the dirent record handler returns 1 on hit so the
-	 * SB-commit path below is skipped. */
-	if (tessera_replay_dirent_record(rc->tmp_, hdr, body))
+	 * SB-commit path below is skipped. In roots_only mode (read-only
+	 * mount recovery) skip them entirely — applying redo records would
+	 * populate the dirty overlay, which a ro mount can never drain. Note
+	 * the dirent handler must still be SKIPPED, not just its result
+	 * ignored, so check roots_only first. */
+	if (!rc->roots_only &&
+	    tessera_replay_dirent_record(rc->tmp_, hdr, body))
 		return (0);
 	if (hdr->record_type != (uint32_t)TESSERA_ROOT_UPDATE) return (0);
 	if (hdr->body_length < sizeof(struct tessera_jrec_sb_commit))
