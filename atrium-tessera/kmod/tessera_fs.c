@@ -1685,6 +1685,27 @@ struct tessera_mount {
 	int                       readonly_snapshot;
 	uint64_t                  snapshot_gen;
 
+	/* Read-only LIVE mount (MNT_RDONLY, not a tessera.gen snapshot):
+	 * honor it as a true ro mount — the GEOM consumer is opened without
+	 * write access and every mount-time write (SB self-heal, journal
+	 * roll-forward, snapshots-tree lazy-alloc, mount GC) is skipped. The
+	 * committed on-disk state is read as-is. This is what vfs_mountroot
+	 * does first (mount root ro) before rc's `mount -u -o rw /`; the
+	 * ro->rw MNT_UPDATE upgrades the consumer to writable. Distinct from
+	 * readonly_snapshot, which also overrides the SB roots to a snapshot. */
+	int                       ronly;
+
+	/* Whether the GEOM consumer holds WRITE access to the device — the
+	 * physical ability to write, distinct from `ronly` (the VFS-level
+	 * MNT_RDONLY posture). A from-scratch MNT_RDONLY mount opens the
+	 * consumer read-only (dev_writable=0); a live rw mount (or a ro->rw
+	 * remount) holds write access (dev_writable=1). A rw->ro downgrade
+	 * flips `ronly` but KEEPS write access, so the unmount flush/journal-
+	 * checkpoint can still commit. The unmount write path gates on THIS,
+	 * not on `ronly`: pushing a bufwrite at a consumer without write
+	 * access panics in g_vfs_strategy. */
+	int                       dev_writable;
+
 	/* v2 step-3c prereq: per-mount chunk-size override. When 0 (the
 	 * default), tessera_chunk_size_for() returns the auto-tier size
 	 * keyed off file_size (64 KiB / 1 MiB / 4 MiB). When non-zero,
@@ -2113,6 +2134,60 @@ tessera_heal_sb(struct vnode *devvp, uint64_t which,
 	return (bwrite(bp));
 }
 
+/* Open the journal, replay any records (rolling the SB forward on recovery),
+ * and wire the deferred redo-log io. Idempotent. Runs at a read-write mount,
+ * and again at the ro->rw remount of a volume first mounted MNT_RDONLY (which
+ * deferred all of this — a read-only mount opens no journal and writes
+ * nothing). Requires write access to the device (SB roll-forward + the
+ * deferred redo-log both write), so callers must already hold rw access. */
+static void
+tessera_fs_journal_setup(struct tessera_mount *tmp_)
+{
+	if (tmp_->journal != NULL)
+		return;
+	tmp_->journal = tessera_journal_open(&tmp_->bio,
+	    tmp_->sb.journal_start, tmp_->sb.journal_length);
+	if (tmp_->journal == NULL)
+		return;
+
+	struct tessera_replay_ctx rctx = { .tmp_ = tmp_, .applied = 0 };
+	printf("tessera_fs: journal_open OK at sector %lu len %lu; "
+	    "starting replay\n",
+	    (unsigned long)tmp_->sb.journal_start,
+	    (unsigned long)tmp_->sb.journal_length);
+	tmp_->in_replay = 1;
+	(void)tessera_journal_replay(tmp_->journal,
+	    tessera_replay_handler, &rctx);
+	tmp_->in_replay = 0;
+	printf("tessera_fs: replay applied %d ROOT_UPDATE record(s); "
+	    "%lu DIR records re-applied\n",
+	    rctx.applied, tessera_stat_journal_log_replays);
+	if (rctx.applied > 0) {
+		/* Persist the rolled-forward SB so subsequent crashes see the
+		 * recovered state without needing replay. */
+		uint8_t *sbbuf = malloc(TESSERA_SECTOR_SIZE, M_TESSERA,
+		    M_WAITOK | M_ZERO);
+		if (tessera_encode_superblock(&tmp_->sb, sbbuf) == TESSERA_OK) {
+			(void)tessera_kbio_write(&tmp_->bio_ctx, 0, sbbuf);
+			(void)tessera_kbio_write(&tmp_->bio_ctx, 1, sbbuf);
+		}
+		free(sbbuf, M_TESSERA);
+		printf("tessera_fs: journal replay rolled forward %d record(s); "
+		    "SB now gen=%lu\n",
+		    rctx.applied, (unsigned long)tmp_->sb.generation);
+	}
+	/* Deferred (bdwrite) io for the dirent/inode redo-log drain; its
+	 * durability rides the next commit_sb barrier. commit_sb's own
+	 * journal writes (ROOT_UPDATE / checkpoint) keep the synchronous io. */
+	tmp_->journal_bio_deferred.read_block  = tessera_kbio_read;
+	tmp_->journal_bio_deferred.write_block = tessera_kbio_write_delayed;
+	tmp_->journal_bio_deferred.alloc       = tessera_kbio_alloc;
+	tmp_->journal_bio_deferred.free        = tessera_kbio_free;
+	tmp_->journal_bio_deferred.ctx         = &tmp_->bio_ctx;
+	tessera_journal_set_deferred_io(tmp_->journal,
+	    &tmp_->journal_bio_deferred);
+}
+
 /* ── core mount: open device + decode SB ─────────────────────── */
 
 static int
@@ -2133,11 +2208,14 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	int err;
 
 	dev_ref(dev);
-	/* Open the device read-write at the GEOM layer for live mounts so
-	 * the SB self-heal + commit path can write. For historical
-	 * (`tessera.gen=N`) mounts we open read-only — that lets a
-	 * forensic mount coexist with the live mount on the same device. */
-	const int gvfs_writers = (requested_gen != 0) ? 0 : 1;
+	/* Open the device read-write at the GEOM layer for live read-write
+	 * mounts so the SB self-heal + commit path can write. Open READ-ONLY
+	 * for (a) historical `tessera.gen=N` forensic mounts and (b) plain
+	 * MNT_RDONLY mounts (incl. vfs_mountroot's initial ro root mount) —
+	 * honoring ro means taking no write access and skipping every
+	 * mount-time write below; the ro->rw MNT_UPDATE upgrades access. */
+	const int ronly = (mp->mnt_flag & MNT_RDONLY) != 0;
+	const int gvfs_writers = (requested_gen != 0 || ronly) ? 0 : 1;
 	g_topology_lock();
 	err = g_vfs_open(devvp, &cp, "tessera", gvfs_writers);
 	g_topology_unlock();
@@ -2220,10 +2298,11 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * into a single-copy gambit. Best-effort; failures are logged
 	 * but don't block the mount.
 	 *
-	 * Skip the heal for read-only forensic mounts — the GEOM consumer
-	 * was opened with no write permission. The live mount (or a
-	 * future writable mount) will fix any SB asymmetry. */
-	if (requested_gen != 0) {
+	 * Skip the heal for any read-only mount (forensic tessera.gen OR a
+	 * plain MNT_RDONLY mount) — the GEOM consumer was opened with no
+	 * write permission. The live rw mount (or the ro->rw remount) will
+	 * fix any SB asymmetry. */
+	if (requested_gen != 0 || ronly) {
 		/* nothing */
 	} else if (!valid_a) {
 		if (tessera_heal_sb(devvp, 0, active) == 0)
@@ -2254,6 +2333,10 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	tmp_->cp    = cp;
 	tmp_->dev   = dev;
 	tmp_->sb    = *active;
+	tmp_->ronly = ronly;
+	/* Device write access mirrors gvfs_writers: a from-scratch ro mount
+	 * (or forensic tessera.gen) opened the consumer read-only. */
+	tmp_->dev_writable = (gvfs_writers != 0);
 	tmp_->chunk_size_override = chunk_size_override;
 	/* Quota domains are loaded from the on-disk tree below (after the
 	 * tree opens); the `tessera.quota_bytes=N` mount-option override is
@@ -2366,60 +2449,12 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * rolled-forward generation lifts sb.inode_root / pack_registry_
 	 * root / free_extent_root to the just-committed values. The
 	 * trees then open against the correct (replayed) roots. */
-	/* Forensic mounts skip journal replay: the journal sits at the
-	 * live FS's frontier, and replaying its records would advance
-	 * sb roots past the snapshot we requested. Read-only mounts
-	 * also can't write the SB sectors, so the tail of the replay
-	 * block (SB rewrite) would fail anyway. */
-	tmp_->journal = (requested_gen != 0) ? NULL :
-	    tessera_journal_open(&tmp_->bio,
-	    tmp_->sb.journal_start, tmp_->sb.journal_length);
-	if (tmp_->journal != NULL) {
-		struct tessera_replay_ctx rctx = { .tmp_ = tmp_, .applied = 0 };
-		printf("tessera_fs: journal_open OK at sector %lu len %lu; "
-		    "starting replay\n",
-		    (unsigned long)tmp_->sb.journal_start,
-		    (unsigned long)tmp_->sb.journal_length);
-		tmp_->in_replay = 1;
-		(void)tessera_journal_replay(tmp_->journal,
-		    tessera_replay_handler, &rctx);
-		tmp_->in_replay = 0;
-		printf("tessera_fs: replay applied %d ROOT_UPDATE record(s); "
-		    "%lu DIR records re-applied\n",
-		    rctx.applied,
-		    tessera_stat_journal_log_replays);
-		if (rctx.applied > 0) {
-			/* Persist the rolled-forward SB so subsequent crashes
-			 * see the recovered state without needing replay. */
-			uint8_t *sbbuf = malloc(TESSERA_SECTOR_SIZE, M_TESSERA,
-			    M_WAITOK | M_ZERO);
-			if (tessera_encode_superblock(&tmp_->sb, sbbuf)
-			    == TESSERA_OK) {
-				(void)tessera_kbio_write(&tmp_->bio_ctx, 0, sbbuf);
-				(void)tessera_kbio_write(&tmp_->bio_ctx, 1, sbbuf);
-			}
-			free(sbbuf, M_TESSERA);
-			printf("tessera_fs: journal replay rolled forward "
-			    "%d record(s); SB now gen=%lu\n",
-			    rctx.applied,
-			    (unsigned long)tmp_->sb.generation);
-		}
-		/* Register a deferred (bdwrite) block_io for the dirent/inode
-		 * redo-log drain. Those records' durability rides the next
-		 * commit_sb barrier (VOP_FSYNC(devvp) flushes the buffer cache,
-		 * then BIO_FLUSH) — the same deferred-commit boundary the rest
-		 * of the FS uses — so the drain stops paying a synchronous
-		 * device round-trip per record. commit_sb's own journal writes
-		 * (ROOT_UPDATE / checkpoint) keep the default synchronous io and
-		 * their crash-ordering barriers. */
-		tmp_->journal_bio_deferred.read_block  = tessera_kbio_read;
-		tmp_->journal_bio_deferred.write_block = tessera_kbio_write_delayed;
-		tmp_->journal_bio_deferred.alloc       = tessera_kbio_alloc;
-		tmp_->journal_bio_deferred.free        = tessera_kbio_free;
-		tmp_->journal_bio_deferred.ctx         = &tmp_->bio_ctx;
-		tessera_journal_set_deferred_io(tmp_->journal,
-		    &tmp_->journal_bio_deferred);
-	}
+	/* Open + replay the journal now for a live read-write mount. Forensic
+	 * (tessera.gen) and read-only (ronly) mounts open no journal and write
+	 * nothing here — a ronly mount defers this to tessera_fs_journal_setup
+	 * on the ro->rw remount. */
+	if (requested_gen == 0 && !ronly)
+		tessera_fs_journal_setup(tmp_);
 
 	/* Slice 2: tessera.gen=N — historical read-only mount.
 	 *
@@ -2496,7 +2531,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * existing one. tree_kind=3 is the snapshot kind; key is the
 	 * 8-byte big-endian generation. Forensic mounts never lazy-
 	 * allocate (would write to disk; we're read-only). */
-	if (tmp_->sb.snapshots_root == 0 && !tmp_->readonly_snapshot) {
+	if (tmp_->sb.snapshots_root == 0 && !tmp_->readonly_snapshot && !ronly) {
 		uint64_t new_root = 0;
 		tmp_->snapshots_tree = tessera_btree_create(&tmp_->meta_bio,
 		    /*tree_kind*/ 3, /*key*/ 8,
@@ -2622,7 +2657,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * earlier hang here was traced to two 4 KiB structs on the stack
 	 * (sb_a/sb_b in mountfs and buf in commit_sb); both are now
 	 * heap-allocated. */
-	if (!tmp_->readonly_snapshot && tessera_mount_gc_enable) {
+	if (!tmp_->readonly_snapshot && !ronly && tessera_mount_gc_enable) {
 		int gc_reclaimed = tessera_fs_gc_data_zone(tmp_);
 		if (gc_reclaimed > 0)
 			printf("tessera_fs: GC reclaimed %d orphaned pack(s); "
@@ -2746,14 +2781,66 @@ tessera_mount_impl(struct mount *mp)
 		/* Remount in place — most importantly the root-boot read-only ->
 		 * read-write transition (vfs_mountroot mounts root ro, then rc
 		 * does `mount -u -o rw /`), and the shutdown rw -> ro remount.
-		 * tessera keeps no ro/rw-specific in-core state: writes always go
-		 * through the deferred-commit path and the VFS layer enforces
-		 * MNT_RDONLY at the syscall boundary, so the FS-specific work is
-		 * just to flush pending writes (durable across the flag change).
-		 * Accept the update so root can come up read-write. */
+		 *
+		 * A volume mounted MNT_RDONLY (tmp_->ronly) took NO write access
+		 * to the GEOM consumer, so going read-write here must first
+		 * upgrade the consumer — g_vfs_open(...,wr) is g_access(cp,1,wr,
+		 * wr), so ro is (1,0,0) and the rw upgrade is g_access(cp,0,1,1).
+		 * Detect the direction the way ffs_mount does: "ro" absent from
+		 * the new options means going rw. A cleanly-unmounted volume has
+		 * an empty journal, so no roll-forward recovery is owed on this
+		 * transition (crash-recovery on the ro->rw path is not yet wired
+		 * up — mount rw from the start for that; see #40). The reverse
+		 * rw->ro remount flushes and flips the VFS posture to read-only
+		 * but KEEPS the GEOM write access it already holds: unmount still
+		 * needs to write the final SB/checkpoint, and a later ro->rw would
+		 * otherwise have to re-acquire it. Dropping write access here is
+		 * the hazard that panics the syncer (a leftover dirty buffer's
+		 * bufwrite hits a consumer with no write access in g_vfs_strategy).
+		 *
+		 * Beyond the access change tessera keeps no ro/rw-specific
+		 * in-core state: writes go through the deferred-commit path and
+		 * the VFS layer enforces MNT_RDONLY at the syscall boundary. */
 		struct tessera_mount *tmp_ = VFSTOTESSERA(mp);
-		if (tmp_ != NULL)
+		if (tmp_ != NULL) {
+			int going_ro = vfs_flagopt(mp->mnt_optnew, "ro", NULL, 0);
+			if (tmp_->ronly && !going_ro) {
+				/* ro -> rw: acquire write access before any write. */
+				g_topology_lock();
+				int gerr = g_access(tmp_->cp, 0, 1, 1);
+				g_topology_unlock();
+				if (gerr != 0) {
+					printf("tessera_fs: ro->rw remount: g_access "
+					    "failed (%d); staying read-only\n", gerr);
+					return (gerr);
+				}
+				tmp_->ronly = 0;
+				tmp_->dev_writable = 1;
+				/* Clear MNT_RDONLY ourselves — the generic mount
+				 * code leaves the flag to the fs (FFS does the same
+				 * in its MNT_UPDATE handler). Without this the mount
+				 * still reads read-only and the mutating-VOP guards
+				 * keep rejecting writes. */
+				MNT_ILOCK(mp);
+				mp->mnt_flag &= ~MNT_RDONLY;
+				MNT_IUNLOCK(mp);
+				/* Now writable: open + replay the journal the ro
+				 * mount deferred, so the redo-log + commit path work
+				 * and any crash records are applied before use. */
+				tessera_fs_journal_setup(tmp_);
+			} else if (!tmp_->ronly && going_ro) {
+				/* rw -> ro (shutdown): flush and flip to read-only,
+				 * but keep the GEOM write access (see comment above)
+				 * so unmount can still commit. */
+				(void)tessera_fs_flush(tmp_);
+				tmp_->ronly = 1;
+				MNT_ILOCK(mp);
+				mp->mnt_flag |= MNT_RDONLY;
+				MNT_IUNLOCK(mp);
+				return (0);
+			}
 			(void)tessera_fs_flush(tmp_);
+		}
 		return (0);
 	}
 
@@ -2922,6 +3009,16 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			 * 0-length. Forcing a commit here is a cheap, safe
 			 * no-op-ish gen bump when nothing is actually pending.
 			 */
+			/* A from-scratch MNT_RDONLY mount holds no write access to
+			 * the device and dirtied nothing — the mutating-VOP guards
+			 * reject every write and the journal was never opened.
+			 * Emitting the final flush/checkpoint here would push a
+			 * bufwrite at a consumer with no write access and panic in
+			 * g_vfs_strategy, so skip all of it. Gate on dev_writable,
+			 * NOT ronly: a rw mount later remounted ro keeps its write
+			 * access (ronly=1 but dev_writable=1) and DOES need the
+			 * final commit. */
+			if (tmp_->dev_writable) {
 			tmp_->sb_dirty = 1;
 			(void)tessera_fs_flush(tmp_);
 			/* Clean-unmount journal reset. The final flush above made
@@ -2942,6 +3039,7 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			 * journal; this only runs on the orderly unmount path.) */
 			if (tmp_->journal != NULL)
 				(void)tessera_journal_checkpoint(tmp_->journal);
+			} /* tmp_->dev_writable */
 		}
 		if (tmp_->repack_task_init) {
 			taskqueue_drain(taskqueue_thread, &tmp_->repack_task);
@@ -3482,6 +3580,21 @@ static struct vfsops tessera_vfsops = {
 };
 
 /* ── vop ops on the synthesized root ─────────────────────────── */
+
+/* True when the mount carrying vp is read-only (MNT_RDONLY, e.g. the
+ * initial vfs_mountroot root mount or an explicit `-o ro` mount). Every
+ * mutating VOP must reject with EROFS up front: a read-only mount holds
+ * NO write access to the GEOM consumer, so any dirtied buffer would later
+ * panic in g_vfs_strategy when the syncer tried to write it back. The
+ * generic VFS layer only blocks DELETE/RENAME at namei; CREATE/WRITE/
+ * SETATTR/etc. reach the fs, so we guard them here. Keyed on mnt_flag so
+ * it tracks the live ro<->rw remount state, not a stale shadow. */
+static __inline int
+tessera_vop_rdonly(struct vnode *vp)
+{
+	return (vp != NULL && vp->v_mount != NULL &&
+	    (vp->v_mount->mnt_flag & MNT_RDONLY) != 0);
+}
 
 static int
 tessera_vop_access(struct vop_access_args *ap)
@@ -4747,6 +4860,8 @@ out:
 static int
 tessera_vop_setattr(struct vop_setattr_args *ap)
 {
+	if (tessera_vop_rdonly(ap->a_vp))
+		return (EROFS);
 	sbintime_t _tp0 = TPROF_T0();
 	/* Directory setattr (tar -p chmod/utimes on dirs) is a full
 	 * inode-record RMW racing the async checkpoint publish of the
@@ -14868,6 +14983,8 @@ tessera_vop_remove(struct vop_remove_args *ap)
 	struct vnode *dvp = ap->a_dvp;
 	struct vnode *vp  = ap->a_vp;
 	struct componentname *cnp = ap->a_cnp;
+	if (tessera_vop_rdonly(dvp))
+		return (EROFS);
 	struct tessera_mount *tmp_ = VFSTOTESSERA(dvp->v_mount);
 	struct tessera_node  *dn = VTOTNODE(dvp);
 	struct tessera_node  *cn = VTOTNODE(vp);
@@ -16718,6 +16835,8 @@ commit:
 static int
 tessera_vop_create(struct vop_create_args *ap)
 {
+	if (tessera_vop_rdonly(ap->a_dvp))
+		return (EROFS);
 	sbintime_t _tp0 = TPROF_T0();
 	int _rc = tessera_vop_create_impl(ap);
 	TPROF_ADD(TPROF_CREATE, _tp0);
@@ -16878,6 +16997,8 @@ out:
 static int
 tessera_vop_write(struct vop_write_args *ap)
 {
+	if (tessera_vop_rdonly(ap->a_vp))
+		return (EROFS);
 	sbintime_t _tp0 = TPROF_T0();
 	int _rc = tessera_vop_write_impl(ap);
 	TPROF_ADD(TPROF_WRITE, _tp0);
@@ -17167,6 +17288,8 @@ tessera_vop_mkdir(struct vop_mkdir_args *ap)
 	struct vnode **vpp = ap->a_vpp;
 	struct componentname *cnp = ap->a_cnp;
 	struct vattr *vap = ap->a_vap;
+	if (tessera_vop_rdonly(dvp))
+		return (EROFS);
 	struct tessera_mount *tmp_ = VFSTOTESSERA(dvp->v_mount);
 	struct tessera_node  *dn   = VTOTNODE(dvp);
 
@@ -17277,6 +17400,8 @@ tessera_vop_rmdir(struct vop_rmdir_args *ap)
 	struct vnode *dvp = ap->a_dvp;
 	struct vnode *vp  = ap->a_vp;
 	struct componentname *cnp = ap->a_cnp;
+	if (tessera_vop_rdonly(dvp))
+		return (EROFS);
 	struct tessera_mount *tmp_ = VFSTOTESSERA(dvp->v_mount);
 	struct tessera_node  *dn = VTOTNODE(dvp);
 	struct tessera_node  *cn = VTOTNODE(vp);
@@ -17371,6 +17496,8 @@ tessera_vop_symlink(struct vop_symlink_args *ap)
 	struct vnode **vpp = ap->a_vpp;
 	struct componentname *cnp = ap->a_cnp;
 	const char *target = ap->a_target;
+	if (tessera_vop_rdonly(dvp))
+		return (EROFS);
 	struct tessera_mount *tmp_ = VFSTOTESSERA(dvp->v_mount);
 	struct tessera_node  *dn   = VTOTNODE(dvp);
 
@@ -17521,6 +17648,8 @@ tessera_vop_link(struct vop_link_args *ap)
 	struct vnode *tdvp = ap->a_tdvp;
 	struct vnode *vp   = ap->a_vp;
 	struct componentname *cnp = ap->a_cnp;
+	if (tessera_vop_rdonly(tdvp))
+		return (EROFS);
 	struct tessera_mount *tmp_ = VFSTOTESSERA(tdvp->v_mount);
 	struct tessera_node  *dn = VTOTNODE(tdvp);
 	struct tessera_node  *cn = VTOTNODE(vp);
@@ -17790,6 +17919,10 @@ tessera_vop_rename(struct vop_rename_args *ap)
 
 	int err = 0;
 
+	if (tessera_vop_rdonly(fdvp) || tessera_vop_rdonly(tdvp)) {
+		err = EROFS;
+		goto release;
+	}
 	if (fdvp->v_mount != tdvp->v_mount) {
 		err = EXDEV;
 		goto release;
@@ -18271,6 +18404,8 @@ static int tessera_vop_setextattr_impl(struct vop_setextattr_args *ap);
 static int
 tessera_vop_setextattr(struct vop_setextattr_args *ap)
 {
+	if (tessera_vop_rdonly(ap->a_vp))
+		return (EROFS);
 	struct tessera_mount *tmp_ = VFSTOTESSERA(ap->a_vp->v_mount);
 	int gated = (ap->a_vp->v_type == VDIR) && tmp_->flush_mtx_init;
 	if (gated) tessera_fs_flush_gate_enter(tmp_);
@@ -18330,6 +18465,8 @@ static int tessera_vop_deleteextattr_impl(struct vop_deleteextattr_args *ap);
 static int
 tessera_vop_deleteextattr(struct vop_deleteextattr_args *ap)
 {
+	if (tessera_vop_rdonly(ap->a_vp))
+		return (EROFS);
 	struct tessera_mount *tmp_ = VFSTOTESSERA(ap->a_vp->v_mount);
 	int gated = (ap->a_vp->v_type == VDIR) && tmp_->flush_mtx_init;
 	if (gated) tessera_fs_flush_gate_enter(tmp_);
@@ -18492,6 +18629,8 @@ tessera_vop_copy_file_range(struct vop_copy_file_range_args *ap)
 	struct vnode *outvp = ap->a_outvp;
 
 	/* Cheap gates first, before any lock or flush. */
+	if (tessera_vop_rdonly(outvp))
+		return (EROFS);
 	if (invp->v_type != VREG || outvp->v_type != VREG)
 		return (ENOSYS);
 	if (invp == outvp)
