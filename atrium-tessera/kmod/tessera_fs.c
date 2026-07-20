@@ -2669,7 +2669,11 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * zone GC is no longer run synchronously at mount by default —
 	 * kern.tessera.mount_gc=1 restores it; kern.tessera.gc_now works
 	 * on the live mount at any time. */
-	if (tmp_->pinscan_tq_init)
+	/* Skip on a read-only mount: the pinscan populates the meta_free
+	 * reserve for future allocations that a ro mount will never make, and
+	 * gating it here keeps the read-only path free of the reclaim
+	 * machinery (matches the GC gate above). */
+	if (tmp_->pinscan_tq_init && !ronly)
 		(void)taskqueue_enqueue(tmp_->pinscan_tq, &tmp_->pinscan_task);
 
 	mp->mnt_data = tmp_;
