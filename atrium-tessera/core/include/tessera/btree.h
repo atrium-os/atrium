@@ -81,6 +81,12 @@ void                     tessera_btree_cursor_free(tessera_btree_cursor_t *);
 
 void tessera_btree_close(tessera_btree_t *);
 
+/* Suppress the tree_kind-mismatch debug print in load_node for this handle
+ * (still returns ECORRUPT). For speculative walks of possibly-recycled roots
+ * — e.g. the pin-bitmap scan's retained-snapshot roots — where a mismatch is
+ * an expected, benign miss rather than corruption. */
+void tessera_btree_set_quiet_kind_mismatch(tessera_btree_t *t, int quiet);
+
 /* Visitor: called once per on-disk node sector (root + every internal
  * + every leaf), pre-order. Return non-zero to abort the walk. */
 typedef int (*tessera_btree_node_visitor_t)(void *ctx, uint64_t sector);

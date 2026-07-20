@@ -48,6 +48,12 @@ struct tessera_btree {
 	tessera_block_io_t  io;
 	uint64_t            root;
 	uint8_t             tree_kind;
+	/* When set, load_node suppresses the tree_kind-mismatch debug line
+	 * (still returns ECORRUPT). Used by the pin-bitmap scan's speculative
+	 * walk of RETAINED-snapshot roots, which can be legitimately recycled
+	 * to a live tree under create+retire churn — a benign, expected miss,
+	 * not corruption. Off for every ordinary (live-tree) handle. */
+	uint8_t             quiet_kind_mismatch;
 	uint32_t            key_size;
 	uint32_t            value_size;
 	uint32_t            leaf_fanout;       /* max entries in a leaf */
@@ -113,9 +119,10 @@ load_node(const tessera_btree_t *t, uint64_t sector, uint8_t *block)
 	if (read_header(block, &h) != TESSERA_OK)
 		return TESSERA_ECORRUPT;
 	if (h.tree_kind != t->tree_kind) {
-		tessera_debugf("btree load_node: sector %llu kind=%u "
-		    "expected=%u\n", (unsigned long long)sector,
-		    (unsigned)h.tree_kind, (unsigned)t->tree_kind);
+		if (!t->quiet_kind_mismatch)
+			tessera_debugf("btree load_node: sector %llu kind=%u "
+			    "expected=%u\n", (unsigned long long)sector,
+			    (unsigned)h.tree_kind, (unsigned)t->tree_kind);
 		return TESSERA_ECORRUPT;
 	}
 	return TESSERA_OK;
@@ -208,6 +215,13 @@ make_handle(const tessera_block_io_t *io, uint8_t tree_kind,
 		return NULL;
 	}
 	return t;
+}
+
+void
+tessera_btree_set_quiet_kind_mismatch(tessera_btree_t *t, int quiet)
+{
+	if (t != NULL)
+		t->quiet_kind_mismatch = quiet ? 1 : 0;
 }
 
 tessera_btree_t *

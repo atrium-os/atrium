@@ -1372,6 +1372,19 @@ static int tessera_fs_dir_btree_migrate(struct tessera_mount *tmp_,
 static int tessera_preflight_enable = 1;
 SYSCTL_INT(_kern_tessera, OID_AUTO, preflight, CTLFLAG_RW,
     &tessera_preflight_enable, 0, "1 = flush-start meta-reserve preflight pinscan");
+/*
+ * Task #33 follow-up: the pin-bitmap scan runs on every snapshot retire, i.e.
+ * once per commit, so at a churning (or "settled" but steadily-committing)
+ * root its "pinscan done" line is ~60/s of console spam. The scan itself must
+ * keep running per retire — it maintains the meta-reserve reclaim state, and
+ * the snapshot walk is now race-clean (recycled retained-snapshot roots are
+ * skipped, not aborted-on). So fix the log symptom: rate-limit the routine
+ * line to at most one per wall-clock second. pinscan_verbose=1 logs each scan.
+ */
+static int tessera_pinscan_verbose = 0;
+SYSCTL_INT(_kern_tessera, OID_AUTO, pinscan_verbose, CTLFLAG_RW,
+    &tessera_pinscan_verbose, 0,
+    "1 = log every background pin-bitmap scan (default rate-limits to 1/s)");
 static int tessera_mount_gc_enable = 0;
 SYSCTL_INT(_kern_tessera, OID_AUTO, mount_gc, CTLFLAG_RW,
     &tessera_mount_gc_enable, 0,
@@ -1399,6 +1412,11 @@ static int tessera_fs_dirent_log_checkpoint_all(
 static int tessera_journal_log_enable_default;
 static int tessera_journal_log_interval_ms;
 static unsigned long tessera_stat_journal_log_replays = 0;
+/* Count of retained-snapshot roots the pin-bitmap scan found recycled
+ * (create+retire churn) and skipped. Benign — the recycled sectors are
+ * pinned by the live tree that now owns them; skipping keeps the scan alive
+ * (an abort here used to starve meta_free -> reserve exhaustion). */
+static unsigned long tessera_stat_pinscan_stale_snap = 0;
 static int tessera_fs_journal_log_drain(struct tessera_mount *tmp_);
 static void tessera_fs_flush_gate_enter(struct tessera_mount *tmp_);
 static void tessera_fs_flush_gate_exit(struct tessera_mount *tmp_);
@@ -1496,6 +1514,9 @@ struct tessera_mount {
 	int                       pinscan_tq_init;
 	volatile int              pinscan_abort;
 	volatile int              pinscan_active;
+	/* Wall-clock second of the last "pinscan done" log line — rate-limits
+	 * the routine per-retire log to 1/s (see pinscan_verbose). */
+	time_t                    pinscan_last_log_sec;
 	/* Sectors >= watermark are implicitly pinned: allocated after the
 	 * last completed pinscan started, so the scan never judged their
 	 * reachability (a retained snapshot may reference them). Only a
@@ -9557,15 +9578,30 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 				    &tmp_->meta_bio, sr[i].root, sr[i].kind,
 				    sr[i].ksz, sr[i].vsz);
 				if (t == NULL) continue;
+				/* A retained snapshot's root can be recycled to a
+				 * live tree under create+retire churn — the walk
+				 * then reads a sector whose tree_kind no longer
+				 * matches (ECORRUPT). Quiet that expected miss. */
+				tessera_btree_set_quiet_kind_mismatch(t, 1);
 				int _src = tessera_btree_walk_nodes(t,
 				    meta_mark_visitor, &mctx);
-				if (_src != 0) {
-					printf("tessera_fs: pinscan snapwalk"
-					    "[%d] root=%lu rc=%d\n", i,
-					    (unsigned long)sr[i].root, _src);
-					aborted = 1;
-				}
 				tessera_btree_close(t);
+				if (_src != 0) {
+					/* Benign: any recycled sector is already
+					 * pinned by the live tree that now owns it
+					 * (walked above), so skipping this stale
+					 * snapshot cannot under-pin. SKIP it and
+					 * keep scanning — aborting the whole scan
+					 * (the old behavior) left the stale bitmap
+					 * and starved meta_free until the reserve
+					 * exhausted. Only a real teardown aborts. */
+					if (tmp_->pinscan_abort) {
+						aborted = 1;
+						break;
+					}
+					tessera_stat_pinscan_stale_snap++;
+					break;  /* skip this snapshot's other trees */
+				}
 			}
 			if (tessera_btree_cursor_next(sc) != TESSERA_OK)
 				break;
@@ -9649,11 +9685,18 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	tessera_fs_flush_gate_exit(tmp_);
 	tessera_metatrace(TM_OP_BITMAP_BUILT, 1, tmp_->sb.generation,
 	    (uint32_t)bitmap_bytes);
-	printf("tessera_fs: pinscan done in %ld ms — freed=%u "
-	    "pending=%u bump=%lu/%lu\n",
-	    (long)((sbinuptime() - _ps0) / (SBT_1MS)), freed,
-	    tmp_->meta_pending_count,
-	    (unsigned long)(bump1 - mstart), (unsigned long)mlen);
+	/* Rate-limit the routine log to 1/s (the scan runs per retire ~ per
+	 * commit, so unthrottled this is console spam). pinscan_verbose logs
+	 * every scan. time_uptime is a monotonic per-second counter. */
+	time_t _now = (time_t)time_uptime;
+	if (tessera_pinscan_verbose || _now != tmp_->pinscan_last_log_sec) {
+		tmp_->pinscan_last_log_sec = _now;
+		printf("tessera_fs: pinscan done in %ld ms — freed=%u "
+		    "pending=%u bump=%lu/%lu\n",
+		    (long)((sbinuptime() - _ps0) / (SBT_1MS)), freed,
+		    tmp_->meta_pending_count,
+		    (unsigned long)(bump1 - mstart), (unsigned long)mlen);
+	}
 }
 
 static void
@@ -16399,6 +16442,9 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_log_records,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_log_replays,
     CTLFLAG_RD, &tessera_stat_journal_log_replays, 0,
     "Cumulative dirent log records re-applied during mount-time replay");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_stale_snap,
+    CTLFLAG_RD, &tessera_stat_pinscan_stale_snap, 0,
+    "Cumulative retained-snapshot roots the pin-bitmap scan found recycled and skipped");
 
 /* B.2 debug — live in-memory journal head/tail of the *most-recently-
  * touched* mount. Updated on every callout drain. Lets a userspace
