@@ -447,7 +447,14 @@ typedef struct TESSERA_PACKED {
 	uint32_t  inode_no;                  /* denormalized; same as table key */
 	uint32_t  gen;                       /* increments per write */
 	uint32_t  mode;                      /* POSIX mode incl. S_IFMT */
-	uint32_t  reserved_a;
+	/* For a directory: the inode number of its parent directory, set at
+	 * mkdir and re-pointed on a cross-directory rename. Enables an
+	 * arbitrary-depth ancestor walk (the rename "move into own subtree"
+	 * loop check) and an accurate ".." d_fileno without an in-memory
+	 * descent chain. 0 = unknown (legacy inode / non-directory); the root
+	 * dir is its own parent by convention (TESSERA_INODE_ROOT_DIR).
+	 * Carved from the former reserved_a — old volumes read it as 0. */
+	uint32_t  parent_dir_inode;
 	uint32_t  uid;
 	uint32_t  gid;
 	uint64_t  atime_ns;

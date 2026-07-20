@@ -4313,7 +4313,11 @@ tessera_vop_readdir(struct vop_readdir_args *ap)
 } while (0)
 
 	_EMIT(tn->inode_no, DT_DIR, ".", 1);
-	_EMIT(tn->inode_no, DT_DIR, "..", 2);
+	/* ".." d_fileno = the parent dir's inode (its own inode at the root).
+	 * parent_inode_no is tracked at descent time; fall back to self when
+	 * unknown so the entry is never a zero (deleted-tombstone) fileno. */
+	_EMIT(tn->parent_inode_no != 0 ? tn->parent_inode_no : tn->inode_no,
+	    DT_DIR, "..", 2);
 
 	/* v2 slice-3: synthesized magic-dir contents. d_fileno must be
 	 * non-zero (zero is a "deleted entry" tombstone for ls). */
@@ -17428,6 +17432,9 @@ tessera_vop_mkdir(struct vop_mkdir_args *ap)
 	cino.size  = 0;
 	cino.nlink = 2;
 	cino.flags = 0;
+	/* Record the parent so the ancestor walk (rename loop check) and ".."
+	 * d_fileno work without an in-memory descent chain. */
+	cino.parent_dir_inode = (uint32_t)dn->inode_no;
 	/* Inherit the parent's quota domain (tessera-quotas.md §4.1) so a
 	 * subdirectory joins its tree's domain and propagates it further. */
 	{
@@ -18040,20 +18047,35 @@ tessera_vop_rename(struct vop_rename_args *ap)
 			if (serr != 0) { err = serr; goto release; }
 		}
 	}
-	/* POSIX: rename of a directory into itself or a subdirectory of
-	 * itself must fail with EINVAL. Tessera's on-disk inode record
-	 * doesn't store parent_inode_no, so we do the one-level check
-	 * that's reachable via the in-memory node: target dir == source,
-	 * or target dir's direct parent == source. This catches the
-	 * pjdfstest rename/18 case (rename A A/B/C) and any
-	 * one-level-deep variant. UFS does an unbounded walk via
-	 * ufs_checkpath; deeper cases here would need an in-memory
-	 * ancestor chain or an on-disk parent pointer (deferred). */
-	if (fvp->v_type == VDIR &&
-	    (tdn->inode_no == fn->inode_no ||
-	     tdn->parent_inode_no == fn->inode_no)) {
-		err = EINVAL;
-		goto release;
+	/* POSIX: rename of a directory into itself or into a DESCENDANT of
+	 * itself must fail with EINVAL — otherwise the moved subtree becomes a
+	 * disconnected cycle, orphaned from the root. Walk the target
+	 * directory's ancestor chain up to the root via the on-disk
+	 * parent_dir_inode pointer; if the source dir appears, it's a loop.
+	 * (UFS does the same via ufs_checkpath.) The in-memory tdn->parent is
+	 * a robust seed for the first hop in case the target dir's on-disk
+	 * parent pointer is a legacy 0; the walk is bounded so a corrupt
+	 * on-disk cycle can't spin forever. */
+	if (fvp->v_type == VDIR) {
+		uint32_t src = (uint32_t)fn->inode_no;
+		uint32_t cur = (uint32_t)tdn->inode_no;
+		uint32_t hop_parent = (uint32_t)tdn->parent_inode_no;
+		int depth = 0;
+		for (;;) {
+			if (cur == src) { err = EINVAL; goto release; }
+			if (cur == TESSERA_INODE_ROOT_DIR || cur == 0)
+				break;
+			if (++depth > 65536) { err = EINVAL; goto release; }
+			if (hop_parent != 0) {
+				cur = hop_parent;   /* seed first hop from in-memory */
+				hop_parent = 0;
+				continue;
+			}
+			tessera_inode_record_t arec;
+			if (tessera_fs_inode_get(tmp_, cur, &arec) != TESSERA_OK)
+				break;
+			cur = arec.parent_dir_inode;
+		}
 	}
 	if (tvp != NULL) {
 		/* POSIX type matching: regular ↔ regular, dir ↔ empty-dir. */
@@ -18155,8 +18177,34 @@ tessera_vop_rename(struct vop_rename_args *ap)
 			err = 0;
 		}
 		if (tvp != NULL) {
-			(void)tessera_fs_inode_unlink(tmp_,
-			    (uint32_t)tn->inode_no);
+			if (tvp->v_type == VDIR) {
+				/* Displaced empty dir: delete the inode outright,
+				 * like vop_rmdir. The nlink=2 dir model means a
+				 * single inode_unlink would leave nlink=1 — a
+				 * live-but-unreachable orphan. */
+				uint8_t tkey2[4];
+				encode_inode_key((uint32_t)tn->inode_no, tkey2);
+				uint64_t nir = tmp_->sb.inode_root;
+				if (tessera_fs_inode_delete_byk(tmp_, tkey2,
+				    &nir) == TESSERA_OK)
+					tmp_->sb.inode_root = nir;
+			} else {
+				(void)tessera_fs_inode_unlink(tmp_,
+				    (uint32_t)tn->inode_no);
+			}
+		}
+		/* Cross-directory directory move: re-point the moved dir's
+		 * on-disk parent so ".." and future ancestor walks resolve to
+		 * the new parent. (Same-dir moves and file moves don't change
+		 * the parent.) */
+		if (fvp->v_type == VDIR && fdn->inode_no != tdn->inode_no) {
+			tessera_inode_record_t frec;
+			if (tessera_fs_inode_get(tmp_, (uint32_t)fn->inode_no,
+			    &frec) == TESSERA_OK) {
+				frec.parent_dir_inode = (uint32_t)tdn->inode_no;
+				(void)tessera_fs_inode_put(tmp_,
+				    (uint32_t)fn->inode_no, &frec);
+			}
 		}
 	}
 	if (err != 0) goto release;
