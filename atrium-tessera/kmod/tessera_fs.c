@@ -1477,6 +1477,7 @@ struct tessera_mount {
 	tessera_block_io_t        journal_bio_deferred; /* journal redo-log: bdwrite */
 	tessera_btree_t          *inode_tree;
 	tessera_btree_t          *pack_registry_tree;
+	tessera_btree_t          *blob_index_tree;    /* hash→pack_id accel (or NULL) */
 	tessera_btree_t          *snapshots_tree;     /* v2: time-machine */
 	tessera_extent_alloc_t   *extent_alloc;
 	tessera_journal_t        *journal;
@@ -2637,6 +2638,21 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		    "failed; blob lookups will fail\n",
 		    (unsigned long)tmp_->sb.pack_registry_root);
 
+	/* Blob→pack acceleration index (optional). 0 = absent → blob lookups
+	 * fall back to the O(N) registry scan. When present, fetch_blob resolves
+	 * hash→pack_id in O(log n) before scanning. Best-effort: a stale entry
+	 * (post-repack) that no longer holds the blob falls through to the scan. */
+	tmp_->blob_index_tree = NULL;
+	if (tmp_->sb.blob_index_root != 0) {
+		tmp_->blob_index_tree = tessera_btree_open(&tmp_->meta_bio,
+		    tmp_->sb.blob_index_root, TESSERA_BTREE_KIND_BLOB_INDEX,
+		    TESSERA_BLOB_INDEX_KEY_SIZE, TESSERA_BLOB_INDEX_VAL_SIZE);
+		if (tmp_->blob_index_tree == NULL)
+			printf("tessera_fs: warning — blob index open at sector %lu "
+			    "failed; falling back to registry scans\n",
+			    (unsigned long)tmp_->sb.blob_index_root);
+	}
+
 	/* Snapshots tree (v2). Format slot was reserved in round 7-step9;
 	 * v1 mkfs left it 0 ("not initialised"). On first mount with this
 	 * kmod we lazy-allocate an empty tree; subsequent mounts open the
@@ -3291,6 +3307,8 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			tessera_btree_close(tmp_->quota_tree);
 		if (tmp_->pack_registry_tree != NULL)
 			tessera_btree_close(tmp_->pack_registry_tree);
+		if (tmp_->blob_index_tree != NULL)
+			tessera_btree_close(tmp_->blob_index_tree);
 		if (tmp_->inode_tree != NULL)
 			tessera_btree_close(tmp_->inode_tree);
 		if (tmp_->meta_free       != NULL) free(tmp_->meta_free, M_TESSERA);
@@ -7198,6 +7216,9 @@ static unsigned long tessera_stat_cas_pack_hits    = 0;
 static unsigned long tessera_stat_cas_pack_misses  = 0;
 static unsigned long tessera_stat_cas_pack_inserts = 0;
 static unsigned long tessera_stat_cas_pack_evicts  = 0;
+static unsigned long tessera_stat_blob_index_hits  = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, blob_index_hits, CTLFLAG_RD,
+    &tessera_stat_blob_index_hits, 0, "blob→pack index fast-path hits");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_pack_hits, CTLFLAG_RD,
     &tessera_stat_cas_pack_hits, 0, "CAS pack-cache hits");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_pack_misses, CTLFLAG_RD,
@@ -10477,6 +10498,51 @@ retry_reloc:
 			 * normally prevent this. */
 		}
 	}
+	/* Blob→pack index fast path: resolve hash→pack_id in O(log n) and fetch
+	 * from that one pack, skipping the registry scan. A stale entry (the pack
+	 * no longer holds the blob, e.g. post-repack) falls through to the scan. */
+	if (tmp_->blob_index_tree != NULL) {
+		uint8_t pid[16];
+		if (tessera_btree_get(tmp_->blob_index_tree, hash, pid) == TESSERA_OK) {
+			uint8_t rv[TESSERA_REGISTRY_ENTRY_SIZE];
+			tessera_registry_entry_t re;
+			if (tessera_fs_registry_get(tmp_, pid, rv) == TESSERA_OK &&
+			    tessera_decode_registry_entry(rv, &re) == TESSERA_OK &&
+			    re.length_sectors > 0 &&
+			    re.length_sectors <= TESSERA_FETCH_PACK_MAX_SECTORS) {
+				tessera_pack_extent_t *exts = NULL;
+				uint32_t nexts = 0;
+				if (tessera_fs_pack_extents_resolve(tmp_, &re, &exts,
+				    &nexts) == 0) {
+					uint8_t *obuf = NULL;
+					uint32_t olen = 0;
+					int frc = tessera_fs_pack_fetch_ondemand(tmp_,
+					    exts, nexts, re.length_sectors, hash, pid,
+					    &obuf, &olen);
+					free(exts, M_TESSERA);
+					if (frc == 0) {
+						if (atomic_load_acq_64(
+						    &tmp_->pack_reloc_gen) != reloc_gen0) {
+							tessera_cas_invalidate_pack(
+							    &tmp_->cas_cache, pid);
+							free(obuf, M_TESSERA);
+							if (++reloc_retries <= 4)
+								goto retry_reloc;
+							return (EIO);
+						}
+						*out_buf = obuf;
+						*out_len = olen;
+						tessera_cas_byte_insert(
+						    &tmp_->cas_cache, hash, obuf, olen);
+						tessera_stat_blob_index_hits++;
+						return (0);
+					}
+					/* stale index entry — fall to the scan */
+				}
+			}
+		}
+	}
+
 cas_fast_miss:
 	;
 	tessera_btree_cursor_t *c =
