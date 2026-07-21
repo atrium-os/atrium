@@ -13,8 +13,10 @@
 #include <time.h>
 #include <stdint.h>
 
+static unsigned long g_n1, g_nb, g_sectors;
 static int rd_blk(void *ctx, uint64_t sec, uint8_t *out) {
 	int fd = *(int *)ctx;
+	g_n1++; g_sectors += 1;
 	return pread(fd, out, 4096, (off_t)sec * 4096) == 4096 ? 0 : -1;
 }
 /* Bulk read path (mirrors the loader's EFI ReadBlocks) — read n sectors in one
@@ -22,6 +24,7 @@ static int rd_blk(void *ctx, uint64_t sec, uint8_t *out) {
 static int rd_blks(void *ctx, uint64_t sec, uint32_t n, uint8_t *out) {
 	int fd = *(int *)ctx;
 	size_t len = (size_t)n * 4096;
+	g_nb++; g_sectors += n;
 	return pread(fd, out, len, (off_t)sec * 4096) == (ssize_t)len ? 0 : -1;
 }
 
@@ -43,10 +46,11 @@ int main(int argc, char **argv) {
 	if (rc != 0) { fprintf(stderr, "lookup %s rc=%d\n", argv[2], rc); return 1; }
 	printf("lookup ok: ino=%u size=%llu\n", ino, (unsigned long long)size);
 
-	static uint8_t buf[1u << 16];
+	size_t bufsz = getenv("ONESHOT") ? (size_t)size : (1u << 16);
+	uint8_t *buf = malloc(bufsz ? bufsz : 1);
 	uint64_t off = 0, tot = 0, sum = 0;
 	while (off < size) {
-		size_t want = (size - off) < sizeof buf ? (size_t)(size - off) : sizeof buf;
+		size_t want = (size - off) < bufsz ? (size_t)(size - off) : bufsz;
 		size_t got = 0;
 		if (tessera_reader_pread(rd, ino, off, buf, want, &got) != 0 || got == 0) {
 			fprintf(stderr, "pread failed at off=%llu\n", (unsigned long long)off);
@@ -55,11 +59,14 @@ int main(int argc, char **argv) {
 		for (size_t i = 0; i < got; i++) sum += buf[i];   /* touch bytes */
 		off += got; tot += got;
 	}
+	free(buf);
 	clock_gettime(CLOCK_MONOTONIC, &t1);
 	double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 	printf("read %llu bytes in %.2fs  (%.1f MB/s)  checksum=%llu\n",
 	    (unsigned long long)tot, dt, tot / 1e6 / (dt > 0 ? dt : 1e-9),
 	    (unsigned long long)sum);
+	printf("  disk I/O: %lu single-sector + %lu bulk reads, %lu sectors (%.1f MiB)\n",
+	    g_n1, g_nb, g_sectors, g_sectors * 4096.0 / 1048576.0);
 	tessera_reader_close(rd);
 	return 0;
 }

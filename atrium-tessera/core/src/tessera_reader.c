@@ -57,6 +57,11 @@ struct tessera_cached_pack {
 	uint32_t index_blocks;
 	uint8_t *index;                 /* blob_count sorted 48-byte entries,
 	                                 * padded to index_blocks sectors */
+	uint8_t *body;                  /* whole pack body (all sectors) or NULL —
+	                                 * populated on first blob read so the rest
+	                                 * of the pack's blobs come from RAM, not one
+	                                 * disk read each. Bounded by body_bytes. */
+	uint64_t body_len;
 	struct tessera_cached_pack *next;
 };
 
@@ -66,6 +71,14 @@ struct tessera_cached_pack {
  * eviction only re-reads a small index, never a whole pack body — so
  * unlike whole-body caching there is no thrash-to-failure or OOM. */
 #define TESSERA_MAX_CACHED_PACKS 128u
+
+/* Whole-pack body cache cap. A file read is sequential and its chunks cluster in
+ * a few packs, so reading each touched pack's body ONCE (a 250 MB/s bulk read)
+ * and serving its blobs from RAM turns ~thousands of tiny per-blob reads into a
+ * handful of bulk reads — the difference between ~7 s and a fraction of a second
+ * for a 19 MiB kernel. Bounded so the loader's heap stays modest; a pack larger
+ * than the cap, or an exhausted cap, falls back to the per-blob read path. */
+#define TESSERA_MAX_CACHED_BODY_BYTES (16u * 1024u * 1024u)
 
 /* Bulk-read batch ceiling (256 sectors = 1 MiB). read_run starts here and
  * halves on any bulk-read failure, so it auto-tunes DOWN to whatever the
@@ -82,6 +95,7 @@ struct tessera_reader {
 	tessera_read_blocks_fn read_blocks;  /* optional bulk fast path */
 	struct tessera_cached_pack *packs;   /* MRU list, capped */
 	uint32_t npacks;
+	uint64_t body_bytes;                 /* sum of cached pack bodies */
 };
 
 /* Read `len` contiguous sectors into buf: bulk fast path in batches when
@@ -154,6 +168,7 @@ tessera_reader_close(tessera_reader_t *rd)
 		struct tessera_cached_pack *n = cp->next;
 		if (cp->index) tessera_free(cp->index);
 		if (cp->extents) tessera_free(cp->extents);
+		if (cp->body) tessera_free(cp->body);
 		tessera_free(cp);
 		cp = n;
 	}
@@ -342,10 +357,38 @@ pack_find_blob(const struct tessera_cached_pack *pk, const uint8_t *hash,
 	return 0;
 }
 
+/* Populate pk->body (the whole pack, read once in bulk) if it isn't cached and
+ * fits the body-cache budget — evicting other packs' bodies as needed. No-op
+ * (leaves pk->body NULL → caller reads per-blob) if the pack is too big or the
+ * budget can't be freed. */
+static void
+cache_pack_body(tessera_reader_t *rd, struct tessera_cached_pack *pk)
+{
+	if (pk->body != NULL) return;
+	uint64_t blen = pk->total_sectors * SECTOR;
+	if (blen == 0 || blen > TESSERA_MAX_CACHED_BODY_BYTES) return;
+	while (rd->body_bytes + blen > TESSERA_MAX_CACHED_BODY_BYTES) {
+		/* free the tail-most other pack that still has a body (LRU-ish) */
+		struct tessera_cached_pack *victim = NULL, *p = rd->packs;
+		for (; p; p = p->next)
+			if (p != pk && p->body != NULL) victim = p;
+		if (victim == NULL) return;   /* nothing else to free */
+		rd->body_bytes -= victim->body_len;
+		tessera_free(victim->body);
+		victim->body = NULL; victim->body_len = 0;
+	}
+	uint8_t *b = tessera_malloc((size_t)blen);
+	if (b == NULL) return;
+	if (read_pack_bytes(rd, pk, 0, blen, b) != 0) { tessera_free(b); return; }
+	pk->body = b; pk->body_len = blen; rd->body_bytes += blen;
+}
+
 /* Read the blob described by `ie` from pack `pk` into a fresh buffer (caller
- * frees). Blob bytes follow a 16-byte descriptor in the pack's data area. */
+ * frees). Blob bytes follow a 16-byte descriptor in the pack's data area.
+ * Served from the cached whole-pack body when present (one bulk read amortised
+ * over all the pack's blobs), else read straight from disk. */
 static int
-read_blob(tessera_reader_t *rd, const struct tessera_cached_pack *pk,
+read_blob(tessera_reader_t *rd, struct tessera_cached_pack *pk,
           const tessera_pack_index_entry_t *ie, uint8_t **out, size_t *out_len)
 {
 	uint64_t desc = sizeof(tessera_blob_descriptor_t);
@@ -353,11 +396,18 @@ read_blob(tessera_reader_t *rd, const struct tessera_cached_pack *pk,
 		return TESSERA_ECORRUPT;
 	uint8_t *cp = tessera_malloc(ie->data_size ? ie->data_size : 1);
 	if (cp == NULL) return TESSERA_EIO;
-	if (ie->data_size > 0 &&
-	    read_pack_bytes(rd, pk, pk->data_offset + ie->data_offset + desc,
-	    ie->data_size, cp) != 0) {
-		tessera_free(cp);
-		return TESSERA_EIO;
+	if (ie->data_size > 0) {
+		uint64_t off = pk->data_offset + ie->data_offset + desc;
+		if (pk->body == NULL) cache_pack_body(rd, pk);
+		if (pk->body != NULL) {
+			if (off + ie->data_size > pk->body_len) {
+				tessera_free(cp); return TESSERA_ECORRUPT;
+			}
+			memcpy(cp, pk->body + off, (size_t)ie->data_size);
+		} else if (read_pack_bytes(rd, pk, off, ie->data_size, cp) != 0) {
+			tessera_free(cp);
+			return TESSERA_EIO;
+		}
 	}
 	*out = cp; *out_len = ie->data_size;
 	return TESSERA_OK;
@@ -373,6 +423,10 @@ evict_packs(tessera_reader_t *rd)
 		if (p->next == NULL) break;
 		if (p->next->index) tessera_free(p->next->index);
 		if (p->next->extents) tessera_free(p->next->extents);
+		if (p->next->body) {
+			rd->body_bytes -= p->next->body_len;
+			tessera_free(p->next->body);
+		}
 		tessera_free(p->next);
 		p->next = NULL;
 		rd->npacks--;
