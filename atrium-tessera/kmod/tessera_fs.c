@@ -355,6 +355,18 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, snapshots_retired,
     CTLFLAG_RD, &tessera_stat_snapshots_retired, 0,
     "Cumulative snapshot records dropped by retention horizon");
 
+/* Cumulative count of meta_reserve-bump EXHAUST events. The EXHAUST
+ * printf is rate-limited to 1/s (a tight-commit hammer over a big tree
+ * used to emit hundreds of identical lines — see tessera_kbio_meta_alloc),
+ * so this counter is the faithful total. Non-zero is not corruption: the
+ * flush-gate preflight recovers the reserve. A rising count under a given
+ * workload means the background pinscan can't reclaim fast enough and the
+ * synchronous preflight is carrying the load. */
+static unsigned long tessera_stat_meta_exhaust = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, meta_exhaust,
+    CTLFLAG_RD, &tessera_stat_meta_exhaust, 0,
+    "Cumulative meta_reserve bump-exhaust events (preflight-recovered)");
+
 /* v2 publish-cache observability — increments on every short-circuit
  * via existing pack_registry hit (no extent_alloc / no bwrite). */
 static unsigned long tessera_stat_publish_dedup_manifest = 0;
@@ -1517,6 +1529,19 @@ struct tessera_mount {
 	/* Wall-clock second of the last "pinscan done" log line — rate-limits
 	 * the routine per-retire log to 1/s (see pinscan_verbose). */
 	time_t                    pinscan_last_log_sec;
+	/* Wall-clock second of the last background-pinscan re-kick. The retire
+	 * path (commit_sb) calls the rebuild every commit once past the
+	 * retention horizon; coalescing the re-kick to <=1/s (and never
+	 * stacking one on an already-running scan) keeps the scan from being
+	 * continuously active — while pinscan_active the meta allocator is
+	 * bump-only, so a permanently-active scan starves meta_free and the
+	 * bump pointer races the reserve ceiling. See
+	 * tessera_meta_pin_bitmap_rebuild. */
+	time_t                    pinscan_last_kick_sec;
+	/* Wall-clock second of the last meta_reserve EXHAUST printf, to
+	 * rate-limit that log to 1/s (the count lives in the meta_exhaust
+	 * sysctl). */
+	time_t                    meta_exhaust_last_log_sec;
 	/* Sectors >= watermark are implicitly pinned: allocated after the
 	 * last completed pinscan started, so the scan never judged their
 	 * reachability (a retained snapshot may reference them). Only a
@@ -2035,11 +2060,22 @@ tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 	const uint64_t used = tmp_->sb.meta_reserve_bump
 	    - tmp_->sb.meta_reserve_start;
 	if (used + n > tmp_->sb.meta_reserve_length) {
-		printf("tessera_fs: meta_reserve EXHAUSTED — used=%lu of %lu, "
-		    "free_count=%u, pending=%u\n",
-		    (unsigned long)used,
-		    (unsigned long)tmp_->sb.meta_reserve_length,
-		    tmp_->meta_free_count, tmp_->meta_pending_count);
+		/* Rate-limit to 1/s: under a tight-commit hammer on a big tree
+		 * the bump can hit the ceiling on many consecutive allocs
+		 * before the flush-gate preflight recovers, and hundreds of
+		 * identical lines are pure spam. The meta_exhaust sysctl keeps
+		 * the faithful total. */
+		tessera_stat_meta_exhaust++;
+		time_t _now = (time_t)time_uptime;
+		if (_now != tmp_->meta_exhaust_last_log_sec) {
+			tmp_->meta_exhaust_last_log_sec = _now;
+			printf("tessera_fs: meta_reserve EXHAUSTED — used=%lu of "
+			    "%lu, free_count=%u, pending=%u (total=%lu)\n",
+			    (unsigned long)used,
+			    (unsigned long)tmp_->sb.meta_reserve_length,
+			    tmp_->meta_free_count, tmp_->meta_pending_count,
+			    tessera_stat_meta_exhaust);
+		}
 		return (-1);
 	}
 	*out_sector = tmp_->sb.meta_reserve_bump;
@@ -9197,11 +9233,19 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	 * crash-consistent here (mid-flush they are NOT: half-built COW
 	 * nodes are unmarked, and pending sectors are still referenced
 	 * by the durable SB until commit_sb). */
+	/* Fire when the recycle list is empty and the reserve is running tight.
+	 * The margin is a whole drain-burst wide so the recovery lands before
+	 * this flush's own btree_puts can bump the reserve to the ceiling
+	 * mid-drain. NOTE: do NOT also fire on pinscan_active — running a
+	 * synchronous preflight scan while the background scan is mid-walk is
+	 * a concurrent-scan hazard (the pinscan_run reentrancy guard now makes
+	 * that call a safe no-op, but firing it during every scan is pointless
+	 * churn/log-noise); the background scan itself replenishes meta_free. */
 	if (tessera_preflight_enable && tmp_->dirty_init &&
 	    tmp_->meta_free_count == 0 &&
 	    tmp_->sb.meta_reserve_length -
 	    (tmp_->sb.meta_reserve_bump - tmp_->sb.meta_reserve_start)
-	    < 4096) {
+	    < 8192) {
 		printf("tessera_fs: meta_reserve preflight — synchronous "
 		    "pinscan (pending=%u)\n", tmp_->meta_pending_count);
 		tessera_fs_pinscan_run(tmp_);
@@ -9515,6 +9559,19 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	/* Snapshot committed roots + bump under the gate. */
 	sbintime_t _ps0 = sbinuptime();
 	tessera_fs_flush_gate_enter(tmp_);
+	/* Reentrancy guard: only ONE scan may run at a time. pinscan_active is
+	 * set (below) and cleared (at swap) under the gate, so a second entrant
+	 * — e.g. the flush-gate preflight calling pinscan_run while the
+	 * background taskqueue scan is mid-walk — sees it set and bails. Two
+	 * concurrent scans share the single pinscan_active boolean and would
+	 * clobber each other's bump-only window, letting the allocator reuse a
+	 * sector the other scan is walking (observed as write EIO on a
+	 * reserve-pressured mount). The background scan will reclaim + swap;
+	 * the caller that bailed simply relies on that. */
+	if (tmp_->pinscan_active) {
+		tessera_fs_flush_gate_exit(tmp_);
+		return;
+	}
 	const uint64_t mstart = tmp_->sb.meta_reserve_start;
 	const uint64_t mlen   = tmp_->sb.meta_reserve_length;
 	const uint64_t bump0  = tmp_->sb.meta_reserve_bump;
@@ -9715,9 +9772,35 @@ tessera_meta_pin_bitmap_rebuild(struct tessera_mount *tmp_)
 	 * background pinscan instead; until it swaps in the fresh bitmap
 	 * the stale one conservatively over-pins (retired-snapshot
 	 * sectors stay unreclaimed a little longer — safe). */
-	if (tmp_->pinscan_tq_init)
-		(void)taskqueue_enqueue(tmp_->pinscan_tq,
-		    &tmp_->pinscan_task);
+	if (!tmp_->pinscan_tq_init)
+		return;
+	/* Task #33 follow-up (meta_reserve EXHAUST under tight-commit churn):
+	 * commit_sb calls this on every retire, i.e. every commit once past
+	 * the retention horizon. Blindly re-enqueueing kept a scan almost
+	 * continuously active on a big tree — and while pinscan_active the
+	 * meta allocator is BUMP-ONLY (tessera_kbio_meta_alloc never consults
+	 * meta_free), so the just-completed scan's freed sectors were never
+	 * reused and the bump pointer raced the reserve ceiling. Coalesce:
+	 *
+	 *   - Never stack a re-kick on an already-running scan. taskqueue
+	 *     would schedule an immediate re-run on completion, which is
+	 *     exactly what pinned pinscan_active high. The sectors this
+	 *     retire freed are safely over-pinned until the next scan.
+	 *   - Otherwise rate-limit auto re-kicks to <=1/wall-clock-second,
+	 *     leaving windows where pinscan_active==0 so the allocator can
+	 *     actually drain meta_free between scans.
+	 *
+	 * Correctness is unaffected: over-pinning is always safe, and the
+	 * flush-gate preflight (tessera_fs_flush) remains the synchronous
+	 * safety net that recovers the reserve when it genuinely runs tight,
+	 * so throttling opportunistic reclaim here can never starve a commit. */
+	if (tmp_->pinscan_active)
+		return;
+	time_t _now = (time_t)time_uptime;
+	if (_now == tmp_->pinscan_last_kick_sec)
+		return;
+	tmp_->pinscan_last_kick_sec = _now;
+	(void)taskqueue_enqueue(tmp_->pinscan_tq, &tmp_->pinscan_task);
 }
 
 /*
