@@ -2284,6 +2284,12 @@ struct tessera_node {
 	/* v2 slice-3: magic dir kind + per-vnode snapshot context. */
 	uint8_t  kind;          /* enum tessera_node_kind */
 	uint64_t snapshot_gen;  /* 0 = live; non-zero = read from gen N */
+	/* Set by vop_remove/vop_rename when a name of this inode was
+	 * unlinked. vop_inactive deletes the inode at last close ONLY when
+	 * this is set AND the on-disk nlink is 0 — the flag protects
+	 * legacy/seeded records whose nlink field is 0-as-unset (getattr's
+	 * `nlink ? nlink : 2` fallback) from being misread as orphans. */
+	uint8_t  unlinked;
 };
 
 #define VTOTNODE(vp) ((struct tessera_node *)(vp)->v_data)
@@ -5652,6 +5658,52 @@ tessera_vop_reclaim(struct vop_reclaim_args *ap)
 		free(tn, M_TESSERA);
 		vp->v_data = NULL;
 	}
+	return (0);
+}
+
+/*
+ * vop_inactive — the last user reference to the vnode dropped. If a name
+ * of this inode was unlinked while the file was open (inode_unlink keeps
+ * the record with nlink=0 so the open fd stays fully usable — POSIX),
+ * delete the inode now. Both conditions are required:
+ *   - tn->unlinked (set by vop_remove / vop_rename): protects
+ *     legacy/seeded records whose on-disk nlink is 0-as-unset from being
+ *     misread as orphans;
+ *   - on-disk nlink == 0: protects hardlinks (unlink of one name leaves
+ *     nlink >= 1 — the file lives on).
+ * A crash between unlink and last close leaves an nlink=0 orphan record;
+ * fsck/recovery frees those (they are never reachable by name).
+ */
+static int
+tessera_vop_inactive(struct vop_inactive_args *ap)
+{
+	struct vnode *vp = ap->a_vp;
+	struct tessera_node *tn = VTOTNODE(vp);
+
+	if (tn == NULL || !tn->unlinked || tn->kind != TESSERA_NODE_REGULAR)
+		return (0);
+	if (vp->v_mount == NULL)
+		return (0);
+	struct tessera_mount *tmp_ = VFSTOTESSERA(vp->v_mount);
+	if (tmp_ == NULL || tmp_->inode_tree == NULL)
+		return (0);
+	/* Read-only mount can't delete; the orphan is freed by recovery on
+	 * the next writable mount. */
+	if (tessera_vop_rdonly(vp))
+		return (0);
+
+	tessera_inode_record_t ino;
+	if (tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no, &ino)
+	    != TESSERA_OK)
+		return (0);            /* already gone */
+	if (ino.nlink != 0)
+		return (0);            /* hardlink survives */
+
+	(void)tessera_fs_inode_delete(tmp_, (uint32_t)tn->inode_no);
+	tn->unlinked = 0;
+	tessera_fs_mark_dirty(tmp_);
+	/* Hand the vnode to reclaim so the stale mapping can't be revived. */
+	vrecycle(vp);
 	return (0);
 }
 
@@ -9744,6 +9796,7 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	uint64_t r_reg   = tmp_->sb.pack_registry_root;
 	uint64_t r_fext  = tmp_->sb.free_extent_root;
 	uint64_t r_snap  = tmp_->sb.snapshots_root;
+	uint64_t r_bidx  = tmp_->sb.blob_index_root;
 	tmp_->pinscan_active = 1;
 	tessera_fs_flush_gate_exit(tmp_);
 
@@ -9753,13 +9806,18 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	    &tmp_->pinscan_abort };
 	int aborted = 0;
 
-	struct { uint64_t root; int kind; uint32_t ksz; uint32_t vsz; } roots[4] = {
+	struct { uint64_t root; int kind; uint32_t ksz; uint32_t vsz; } roots[5] = {
 		{ r_inode, 0, 4, TESSERA_INODE_RECORD_SIZE },
 		{ r_reg,   1, 16, TESSERA_REGISTRY_ENTRY_SIZE },
 		{ r_fext,  2, 8, 8 },
 		{ r_snap,  3, 8, TESSERA_SNAPSHOT_RECORD_SIZE },
+		/* Blob→pack index: without this pin, GC recycles its nodes
+		 * out from under it (seen live as kind-mismatch load errors +
+		 * the index self-destructing on the dev root). */
+		{ r_bidx,  TESSERA_BTREE_KIND_BLOB_INDEX,
+		    TESSERA_BLOB_INDEX_KEY_SIZE, TESSERA_BLOB_INDEX_VAL_SIZE },
 	};
-	for (int i = 0; i < 4 && !aborted; i++) {
+	for (int i = 0; i < 5 && !aborted; i++) {
 		if (roots[i].root == 0) continue;
 		tessera_btree_t *t = tessera_btree_open(&tmp_->meta_bio,
 		    roots[i].root, roots[i].kind, roots[i].ksz, roots[i].vsz);
@@ -15449,9 +15507,11 @@ tessera_vop_remove(struct vop_remove_args *ap)
 	if (err != 0) return (err);
 
 	/* Drop a link on the child. tessera_fs_inode_unlink decrements
-	 * nlink; only btree_deletes the record when it hits 0, so
-	 * hardlinks survive. */
+	 * nlink; at the last link it KEEPS the record with nlink=0 (the
+	 * file may still be open — POSIX). Flag the vnode so vop_inactive
+	 * deletes the inode at last close. */
 	(void)tessera_fs_inode_unlink(tmp_, (uint32_t)cn->inode_no);
+	cn->unlinked = 1;
 
 	/* Invalidate any namecache entries for the removed name. cache_purge
 	 * drops every (parent,name)->vp mapping for vp — over-purges other
@@ -18314,10 +18374,11 @@ tessera_fs_inode_unlink(struct tessera_mount *tmp_, uint32_t inode_no)
 		tmp_->sb.inode_root = new_root;
 		return (0);
 	}
-	/* Quota: the last name is gone and the inode is being deleted —
-	 * release its logical size back to the domain (tessera-quotas.md
-	 * §5.3). Use the size-overlay inode_get so any unflushed coalesced
-	 * writes are counted, matching what vop_write reserved. */
+	/* Quota: the last name is gone — release its logical size back to
+	 * the domain (tessera-quotas.md §5.3) NOW, even though the inode
+	 * record itself survives until last close. Use the size-overlay
+	 * inode_get so any unflushed coalesced writes are counted, matching
+	 * what vop_write reserved. */
 	{
 		tessera_inode_record_t live;
 		if (tessera_fs_inode_get(tmp_, inode_no, &live) == TESSERA_OK) {
@@ -18329,10 +18390,22 @@ tessera_fs_inode_unlink(struct tessera_mount *tmp_, uint32_t inode_no)
 			}
 		}
 	}
+	/* Last link gone — but the file may still be OPEN. POSIX: an
+	 * unlinked file with a live fd stays fully readable/writable until
+	 * the last close. Keep the inode record with nlink=0 (detached from
+	 * the namespace, invisible to lookup); tessera_vop_inactive deletes
+	 * it when the last reference drops. A crash before that leaves an
+	 * nlink=0 orphan for fsck/recovery to free. */
+	ino.nlink = 0;
+	{
+		struct timeval tv;
+		getmicrotime(&tv);
+		ino.ctime_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
+		    (uint64_t)tv.tv_usec * 1000ULL;
+	}
 	uint64_t new_root = tmp_->sb.inode_root;
-	if (tessera_fs_inode_delete_byk(tmp_, key,
-	    &new_root) != TESSERA_OK)
-		printf("tessera_fs: inode_unlink — btree_delete inode=%u "
+	if (tessera_fs_inode_put_byk(tmp_, key, &ino, &new_root) != TESSERA_OK)
+		printf("tessera_fs: inode_unlink — nlink=0 put inode=%u "
 		    "failed\n", (unsigned)inode_no);
 	else
 		tmp_->sb.inode_root = new_root;
@@ -18544,6 +18617,9 @@ tessera_vop_rename(struct vop_rename_args *ap)
 			} else {
 				(void)tessera_fs_inode_unlink(tmp_,
 				    (uint32_t)tn->inode_no);
+				/* Displaced open file: defer the delete to
+				 * vop_inactive (see vop_remove). */
+				tn->unlinked = 1;
 			}
 		}
 		/* Cross-directory directory move: re-point the moved dir's
@@ -19246,6 +19322,7 @@ struct vop_vector tessera_vnodeops = {
 	.vop_putpages = tessera_vop_putpages,
 	.vop_copy_file_range = tessera_vop_copy_file_range,
 	.vop_fsync    = tessera_vop_fsync,
+	.vop_inactive = tessera_vop_inactive,
 	.vop_reclaim  = tessera_vop_reclaim,
 };
 VFS_VOP_VECTOR_REGISTER(tessera_vnodeops);
