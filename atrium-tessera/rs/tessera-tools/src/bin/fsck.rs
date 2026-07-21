@@ -310,10 +310,25 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<(i32, u32), String> {
         open_file_ro(path).map_err(|e| format!("open {path}: {e}"))?
     };
     // ctx starts read-only; the bump allocator is armed below once the
-    // superblock's meta-reserve extent is known (io holds a raw pointer to
-    // ctx, so mutating ctx after make_io is fine — no live borrow).
+    // superblock's meta-reserve extent is known.
+    //
+    // ⚠ ALIASING: `io`'s alloc/write callbacks mutate this same DiskCtx
+    // through the raw pointer stashed in `io.ctx` during the (opaque) FFI
+    // repair build. Touch `ctx` ONLY through `ctxp` past here — never through
+    // the owned binding — because an access that reaches ctx through the owned
+    // tag (a plain field write like `ctx.bump_max = …`, or a `&mut` binding)
+    // aliases what disk_alloc mutates through io.ctx: with a live `&mut`
+    // binding that is a `noalias` violation the compiler exploits to cache
+    // `bump` and miss disk_alloc's advance, committing a meta_reserve_bump
+    // BELOW freshly-written repair nodes (see repack.rs and
+    // project_tessera_repack_crashsafe). `ctxp` is derived FROM `io.ctx` — the
+    // SAME pointer/provenance io's callbacks use — rather than a second
+    // `&mut ctx` reborrow, so set/get here and disk_alloc's writes never
+    // invalidate each other (verified UB-clean under Miri Stacked + Tree
+    // Borrows).
     let mut ctx = DiskCtx::ro(fd_of(&f));
     let io = make_io(&mut ctx);
+    let ctxp = io.ctx as *mut DiskCtx;
 
     let mut v: *mut tessera_volume_t = std::ptr::null_mut();
     let r = unsafe { tessera_volume_open(&io, &mut v) };
@@ -343,8 +358,10 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<(i32, u32), String> {
     // Arm the metadata-reserve bump allocator for --repair. COW btree /
     // free-tree nodes written during apply come from [mr_bump, mr_start+mr_len).
     if repair {
-        ctx.bump.set(mr_bump);
-        ctx.bump_max = mr_start + mr_len;
+        unsafe {
+            (*ctxp).bump.set(mr_bump);
+            (*ctxp).bump_max = mr_start + mr_len;
+        }
     }
 
     let mut fsck = Fsck {
@@ -803,15 +820,17 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<(i32, u32), String> {
         unsafe { tessera_volume_close(v); }
         return Ok((1, 0));
     }
-    // Seal a new superblock pointing at the repaired roots. ctx.bump has
-    // advanced past every reserve sector the rewrites consumed.
+    // Seal a new superblock pointing at the repaired roots. The bump has
+    // advanced past every reserve sector the rewrites consumed — read it
+    // back through the raw pointer (see the aliasing note above), never the
+    // owned `ctx` binding, so we observe disk_alloc's actual advance.
     let commit = tessera_commit_roots_t {
         inode_root:         new_roots.inode_root,
         pack_registry_root: new_roots.pack_registry_root,
         free_extent_root:   new_roots.free_extent_root,
         quota_tree_root:    new_roots.quota_tree_root,
         snapshots_root:     new_roots.snapshots_root,
-        meta_reserve_bump:  ctx.bump.get(),
+        meta_reserve_bump:  unsafe { (*ctxp).bump.get() },
         next_inode_no:      new_roots.next_inode_no,
     };
     let rc = unsafe { tessera_volume_commit_roots(v, &commit) };

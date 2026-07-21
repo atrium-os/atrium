@@ -181,7 +181,11 @@ fn run(path: &str, apply: bool, force: bool) -> Result<i32, String> {
     let io = make_io(&mut ctx);
     // Access ctx ONLY through this raw pointer past here (see build_all): io's
     // alloc callback aliases ctx, so a &mut binding across the FFI build is UB.
-    let ctxp: *mut DiskCtx = &mut ctx;
+    // Derive it FROM io.ctx (the same pointer/provenance the callbacks use) —
+    // NOT a second `&mut ctx` reborrow, which would push a fresh tag above io's
+    // and let (*ctxp).bump_max writes invalidate io's pointer (UB under Miri
+    // Stacked + Tree Borrows, even though it dodges the LLVM `noalias` miscompile).
+    let ctxp = io.ctx as *mut DiskCtx;
 
     let mut v: *mut tessera_volume_t = std::ptr::null_mut();
     if unsafe { tessera_volume_open(&io, &mut v) } != 0 {
