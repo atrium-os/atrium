@@ -196,11 +196,17 @@ typedef struct TESSERA_PACKED {
 	 * migration. Non-zero requires TESSERA_INCOMPAT_HASH_ALG in
 	 * incompat_flags. */
 	uint32_t  hash_alg;
+	/* Blob→pack acceleration index root (TESSERA_BTREE_KIND_BLOB_INDEX).
+	 * 0 = absent (pre-index volumes, and the default) → consumers scan.
+	 * Carved from the trailing slack, so all preceding field offsets are
+	 * unchanged and old volumes decode this as 0 (no migration). */
+	uint64_t  blob_index_root;
+	uint64_t  blob_index_gen;
 	/* Trailing slack — kept BEFORE crc32/hmac (which sit at the very end)
 	 * so any field later carved from it is CRC-covered for free. Sized to
 	 * hold the SB at exactly one sector (4096 B); shrink when naming a new
-	 * field. 1724 = prior 1728 − 4 B taken by hash_alg. */
-	uint8_t   reserved[1724];
+	 * field. 1708 = prior 1724 − 16 B taken by blob_index_root/gen. */
+	uint8_t   reserved[1708];
 	uint32_t  crc32;                     /* CRC over bytes 0..(crc32 offset) */
 	/* Keyed integrity — reserved by v1 for v3's authenticated metadata.
 	 * v1 mkfs zeros this; v1/v2 kmod ignore it. v3 derives a separate
@@ -510,6 +516,15 @@ typedef struct TESSERA_PACKED {
 #define TESSERA_BTREE_KIND_FREE_EXT  2u
 #define TESSERA_BTREE_KIND_SNAPSHOT  3u
 #define TESSERA_BTREE_KIND_QUOTA     4u
+/* Blob→pack acceleration index: key = 32-byte blob hash, value = 16-byte
+ * pack_id. Resolves a content-hash to a pack in O(log n) so cold reads don't
+ * scan the whole pack registry. Best-effort (a reader verifies the blob is
+ * actually in the named pack and falls back to a scan on a stale entry), so it
+ * needs no strict transactional upkeep across repack/GC. sb.blob_index_root==0
+ * means "no index" — every consumer falls back to the scan. */
+#define TESSERA_BTREE_KIND_BLOB_INDEX 5u
+#define TESSERA_BLOB_INDEX_KEY_SIZE   32u
+#define TESSERA_BLOB_INDEX_VAL_SIZE   16u
 
 /* Inode flags (tessera-fs §7.2) */
 #define TESSERA_INODE_FLAG_IMMUTABLE   (1u << 0)

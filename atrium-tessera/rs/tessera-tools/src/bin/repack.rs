@@ -164,6 +164,8 @@ fn commit(v: *mut tessera_volume_t, b: &Built, next_ino: u64, bump_exact: bool) 
         snapshots_root:     0,          // retire all retained snapshots
         meta_reserve_bump:  b.bump,
         next_inode_no:      next_ino,
+        blob_index_root:    0,          // reserve is rewritten — index dropped;
+                                        // rebuild with tessera-reindex afterward
     };
     let flags = if bump_exact { TESSERA_COMMIT_BUMP_EXACT } else { 0 };
     let rc = unsafe { tessera_volume_commit_roots_ex(v, &roots, flags) };

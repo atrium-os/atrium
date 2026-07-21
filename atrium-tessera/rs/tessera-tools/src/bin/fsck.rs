@@ -832,6 +832,9 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<(i32, u32), String> {
         snapshots_root:     new_roots.snapshots_root,
         meta_reserve_bump:  unsafe { (*ctxp).bump.get() },
         next_inode_no:      new_roots.next_inode_no,
+        // repair appends to the bump (never rewrites the reserve start), so the
+        // blob→pack index nodes survive — preserve its root.
+        blob_index_root:    unsafe { tessera_volume_blob_index_root(v) },
     };
     let rc = unsafe { tessera_volume_commit_roots(v, &commit) };
     unsafe { tessera_volume_close(v); }

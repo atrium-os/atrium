@@ -39,6 +39,10 @@ path = "src/bin/repack.rs"
 name = "tessera-defrag"
 path = "src/bin/defrag.rs"
 
+[[bin]]
+name = "tessera-reindex"
+path = "src/bin/reindex.rs"
+
 [dependencies]
 tessera-sys = { path = "../tessera-sys" }
 libc        = "0.2"

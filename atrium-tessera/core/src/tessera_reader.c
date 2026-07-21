@@ -78,6 +78,7 @@ struct tessera_reader {
 	tessera_volume_t  *v;
 	uint64_t inode_root;
 	uint64_t pack_root;
+	uint64_t blob_index_root;            /* 0 = none (fall back to scan) */
 	tessera_read_blocks_fn read_blocks;  /* optional bulk fast path */
 	struct tessera_cached_pack *packs;   /* MRU list, capped */
 	uint32_t npacks;
@@ -140,6 +141,7 @@ tessera_reader_open_ex(const tessera_block_io_t *io,
 	}
 	rd->inode_root = tessera_volume_inode_root(rd->v);
 	rd->pack_root  = tessera_volume_pack_registry_root(rd->v);
+	rd->blob_index_root = tessera_volume_blob_index_root(rd->v);
 	return rd;
 }
 
@@ -166,6 +168,19 @@ pack_cached(const tessera_reader_t *rd, const uint8_t id[16])
 	for (const struct tessera_cached_pack *cp = rd->packs; cp; cp = cp->next)
 		if (memcmp(cp->id, id, 16) == 0) return 1;
 	return 0;
+}
+
+/* Fetch a pack's registry entry by pack_id (O(log n)). Returns 0 + fills
+ * out[REGENT] on hit, -1 on miss. Used by the blob→pack index fast path. */
+static int
+registry_get(tessera_reader_t *rd, const uint8_t id[16], uint8_t out[REGENT])
+{
+	tessera_btree_t *t = tessera_btree_open(&rd->io, rd->pack_root,
+	    TESSERA_BTREE_KIND_PACK_REG, 16, REGENT);
+	if (t == NULL) return -1;
+	int rc = tessera_btree_get(t, id, out);
+	tessera_btree_close(t);
+	return rc == TESSERA_OK ? 0 : -1;
 }
 
 uint32_t tessera_reader_root_ino(const tessera_reader_t *rd)
@@ -378,8 +393,41 @@ fetch_blob_dup(tessera_reader_t *rd, const uint8_t *hash,
 		if (pack_find_blob(pk, hash, &ie))
 			return read_blob(rd, pk, &ie, out, out_len);
 
-	/* 2. scan the registry, caching each not-yet-cached pack's metadata
-	 *    once, until the blob's pack turns up. */
+	/* 2. blob→pack index (if present): resolve hash→pack_id in O(log n),
+	 *    load that one pack, and verify. Only reached on a cold-pack miss
+	 *    (sequential reads keep hitting the cached pack at step 1), so this
+	 *    costs one index lookup + one pack load per distinct pack — not per
+	 *    blob. A stale/wrong entry (repack/GC moved the blob) simply falls
+	 *    through to the scan. */
+	if (rd->blob_index_root != 0) {
+		tessera_btree_t *bt = tessera_btree_open(&rd->io,
+		    rd->blob_index_root, TESSERA_BTREE_KIND_BLOB_INDEX,
+		    TESSERA_BLOB_INDEX_KEY_SIZE, TESSERA_BLOB_INDEX_VAL_SIZE);
+		if (bt != NULL) {
+			uint8_t pack_id[16];
+			int got = tessera_btree_get(bt, hash, pack_id);
+			tessera_btree_close(bt);
+			if (got == TESSERA_OK) {
+				uint8_t rv[REGENT];
+				if (registry_get(rd, pack_id, rv) == 0) {
+					uint32_t flags = rd_u32(rv, REG_OFF_FLAGS);
+					uint64_t start = rd_u64(rv, REG_OFF_START);
+					uint64_t len   = rd_u64(rv, REG_OFF_LEN);
+					struct tessera_cached_pack *pk =
+					    pack_load(rd, pack_id, flags, start, len);
+					if (pk != NULL && pack_find_blob(pk, hash, &ie)) {
+						int rc = read_blob(rd, pk, &ie, out, out_len);
+						evict_packs(rd);
+						return rc;
+					}
+					evict_packs(rd);   /* stale → fall to scan */
+				}
+			}
+		}
+	}
+
+	/* 3. scan the registry, caching each not-yet-cached pack's metadata
+	 *    once, until the blob's pack turns up (fallback: no/stale index). */
 	tessera_btree_t *t = tessera_btree_open(&rd->io, rd->pack_root,
 	    TESSERA_BTREE_KIND_PACK_REG, 16, REGENT);
 	if (t == NULL) return TESSERA_EIO;

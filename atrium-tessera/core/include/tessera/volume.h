@@ -109,6 +109,7 @@ typedef struct {
 	uint64_t snapshots_root;
 	uint64_t meta_reserve_bump;   /* advanced past reserve sectors used */
 	uint64_t next_inode_no;       /* advanced if repair minted an inode */
+	uint64_t blob_index_root;     /* blob→pack index (0 keeps current) */
 } tessera_commit_roots_t;
 
 int tessera_volume_commit_roots(tessera_volume_t *v,
@@ -151,6 +152,7 @@ uint16_t        tessera_volume_encryption_flags   (const tessera_volume_t *);
 uint8_t         tessera_volume_active_slot_count  (const tessera_volume_t *);
 uint64_t        tessera_volume_quota_tree_root    (const tessera_volume_t *);
 uint64_t        tessera_volume_next_inode_no       (const tessera_volume_t *);
+uint64_t        tessera_volume_blob_index_root      (const tessera_volume_t *);
 
 #ifdef __cplusplus
 }

@@ -641,6 +641,10 @@ tessera_volume_commit_roots_ex(tessera_volume_t *v,
 		sb.snapshots_root = roots->snapshots_root;
 		sb.snapshots_gen += 1;
 	}
+	if (roots->blob_index_root != sb.blob_index_root) {
+		sb.blob_index_root = roots->blob_index_root;
+		sb.blob_index_gen += 1;
+	}
 	/* meta_reserve_bump: by default only ever grows (repair consumed
 	 * reserve sectors for the rewritten trees); never let it regress.
 	 * With TESSERA_COMMIT_BUMP_EXACT (repack) set it exactly — repack
@@ -773,3 +777,6 @@ uint64_t tessera_volume_quota_tree_root(const tessera_volume_t *v)
 
 uint64_t tessera_volume_next_inode_no(const tessera_volume_t *v)
 { return v ? v->sb.next_inode_no : 0; }
+
+uint64_t tessera_volume_blob_index_root(const tessera_volume_t *v)
+{ return v ? v->sb.blob_index_root : 0; }

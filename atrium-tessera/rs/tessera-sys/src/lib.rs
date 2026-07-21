@@ -83,6 +83,7 @@ pub struct tessera_commit_roots_t {
     pub snapshots_root:     u64,
     pub meta_reserve_bump:  u64,
     pub next_inode_no:      u64,
+    pub blob_index_root:    u64,
 }
 
 /// commit_roots_ex flag: set meta_reserve_bump exactly (permit lowering) —
@@ -102,6 +103,7 @@ pub const TESSERA_BTREE_KIND_PACK_REG: u8 = 1;
 pub const TESSERA_BTREE_KIND_FREE_EXT: u8 = 2;
 pub const TESSERA_BTREE_KIND_SNAPSHOT: u8 = 3;
 pub const TESSERA_BTREE_KIND_QUOTA:    u8 = 4;
+pub const TESSERA_BTREE_KIND_BLOB_INDEX: u8 = 5;   /* key=32 hash, val=16 pack_id */
 
 pub const TESSERA_INODE_RECORD_SIZE:   u32 = 144;
 pub const TESSERA_REGISTRY_ENTRY_SIZE: u32 = 64;
@@ -435,4 +437,5 @@ extern "C" {
     pub fn tessera_volume_active_slot_count  (v: *const tessera_volume_t) -> u8;
     pub fn tessera_volume_quota_tree_root    (v: *const tessera_volume_t) -> u64;
     pub fn tessera_volume_next_inode_no      (v: *const tessera_volume_t) -> u64;
+    pub fn tessera_volume_blob_index_root    (v: *const tessera_volume_t) -> u64;
 }
