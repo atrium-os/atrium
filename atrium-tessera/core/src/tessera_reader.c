@@ -96,6 +96,11 @@ struct tessera_reader {
 	struct tessera_cached_pack *packs;   /* MRU list, capped */
 	uint32_t npacks;
 	uint64_t body_bytes;                 /* sum of cached pack bodies */
+	/* Last-inode record cache. tessera_reader_pread resolves ino→manifest on
+	 * every call (an inode-btree walk); a granular read of one file would else
+	 * re-walk the tree per pread. One entry covers the common sequential read. */
+	uint32_t ic_ino; int ic_valid; uint8_t ic_mhash[32];
+	uint32_t ic_mode; uint64_t ic_size;
 };
 
 /* Read `len` contiguous sectors into buf: bulk fast path in batches when
@@ -531,6 +536,12 @@ static int
 inode_manifest(tessera_reader_t *rd, uint32_t ino, uint8_t out[32],
                uint32_t *out_mode, uint64_t *out_size)
 {
+	if (rd->ic_valid && rd->ic_ino == ino) {          /* last-inode cache */
+		memcpy(out, rd->ic_mhash, 32);
+		if (out_mode) *out_mode = rd->ic_mode;
+		if (out_size) *out_size = rd->ic_size;
+		return TESSERA_OK;
+	}
 	tessera_btree_t *t = tessera_btree_open(&rd->io, rd->inode_root,
 	    TESSERA_BTREE_KIND_INODE, 4, INOREC);
 	if (t == NULL) return TESSERA_EIO;
@@ -540,8 +551,12 @@ inode_manifest(tessera_reader_t *rd, uint32_t ino, uint8_t out[32],
 	tessera_btree_close(t);
 	if (rc != TESSERA_OK) return TESSERA_ENOENT;
 	memcpy(out, val + INO_OFF_MANIFEST, 32);
-	if (out_mode) *out_mode = rd_u32(val, INO_OFF_MODE);
-	if (out_size) *out_size = rd_u64(val, INO_OFF_SIZE);
+	uint32_t mode = rd_u32(val, INO_OFF_MODE);
+	uint64_t size = rd_u64(val, INO_OFF_SIZE);
+	if (out_mode) *out_mode = mode;
+	if (out_size) *out_size = size;
+	rd->ic_ino = ino; rd->ic_valid = 1;
+	memcpy(rd->ic_mhash, out, 32); rd->ic_mode = mode; rd->ic_size = size;
 	return TESSERA_OK;
 }
 
