@@ -10035,7 +10035,7 @@ tessera_fs_pack_read_range(struct tessera_mount *tmp_,
 static int
 tessera_fs_pack_extract_blob(const uint8_t *pack, uint32_t packlen,
     uint32_t hash_alg, const tessera_hash_t hash, uint8_t *dst,
-    uint64_t dst_cap, uint8_t **out_buf, uint32_t *out_len)
+    uint64_t dst_cap, uint8_t **out_buf, uint32_t *out_len, int mflags)
 {
 	if (packlen < TESSERA_SECTOR_SIZE) return (EIO);
 	/* Read the few header fields we need straight out of the (already
@@ -10093,7 +10093,12 @@ tessera_fs_pack_extract_blob(const uint8_t *pack, uint32_t packlen,
 	if (dst != NULL && (uint64_t)dlen <= dst_cap) {
 		buf = dst;                       /* reuse the caller's scratch */
 	} else {
-		buf = malloc(dlen ? dlen : 1, M_TESSERA, M_WAITOK);
+		/* mflags is M_WAITOK when called outside the pack-cache lock,
+		 * M_NOWAIT when called under it (a sleeping alloc under a mutex
+		 * trips WITNESS and risks a stall). On an M_NOWAIT miss the
+		 * caller drops the lock and retries with M_WAITOK. */
+		buf = malloc(dlen ? dlen : 1, M_TESSERA, mflags);
+		if (buf == NULL) return (ENOMEM);
 	}
 	if (dlen > 0)
 		memcpy(buf, pack + blob_off + sizeof(tessera_blob_descriptor_t),
@@ -10140,15 +10145,20 @@ tessera_fs_pack_fetch_cached(struct tessera_mount *tmp_,
 		if (memcmp(pe->pack_id, pack_id, 16) == 0) {
 			TAILQ_REMOVE(&c->pack_lru, pe, lru_link);
 			TAILQ_INSERT_HEAD(&c->pack_lru, pe, lru_link);
+			/* M_NOWAIT: never sleep while holding c->mtx. If the
+			 * fallback buffer alloc fails (dst too small AND memory
+			 * pressure), drop the lock and re-extract via the miss
+			 * path, which allocs M_WAITOK outside the lock. */
 			int rc = tessera_fs_pack_extract_blob(pe->bytes, pe->len,
 			    tmp_->sb.hash_alg, hash, dst, dst_cap, out_buf,
-			    out_len);
+			    out_len, M_NOWAIT);
 			mtx_unlock(&c->mtx);
+			if (rc == ENOMEM) break;   /* -> miss path (M_WAITOK) */
 			if (rc == 0) tessera_stat_cas_pack_hits++;
 			return (rc);
 		}
 	}
-	mtx_unlock(&c->mtx);
+	if (pe == NULL) mtx_unlock(&c->mtx);
 	tessera_stat_cas_pack_misses++;
 
 	/* Miss — read the whole pack (coalesced g_read_data for bulk packs). */
@@ -10160,7 +10170,7 @@ tessera_fs_pack_fetch_cached(struct tessera_mount *tmp_,
 		return (ENOENT);
 	}
 	int rc = tessera_fs_pack_extract_blob(wbuf, (uint32_t)packlen,
-	    tmp_->sb.hash_alg, hash, dst, dst_cap, out_buf, out_len);
+	    tmp_->sb.hash_alg, hash, dst, dst_cap, out_buf, out_len, M_WAITOK);
 	if (rc != 0) { free(wbuf, M_TESSERA); return (rc); }
 
 	/* Insert into the pack cache (evict LRU past the cap). */
