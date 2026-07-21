@@ -1205,6 +1205,15 @@ struct tessera_reg_ov {
 	uint8_t val[TESSERA_REGISTRY_ENTRY_SIZE];
 };
 
+/* Blob→pack index overlay: appended at publish (one per new blob), batch-put
+ * into blob_index_tree at flush (mirrors reg_ov). Best-effort — a lost/stale
+ * entry just costs a registry scan on read, so this never blocks a publish. */
+struct tessera_blob_ov {
+	LIST_ENTRY(tessera_blob_ov) link;
+	uint8_t hash[32];
+	uint8_t pack_id[16];
+};
+
 struct tessera_ckpt_busy {
 	LIST_ENTRY(tessera_ckpt_busy) link;
 	uint32_t parent_inode_no;
@@ -1689,6 +1698,12 @@ struct tessera_mount {
 	LIST_HEAD(, tessera_reg_ov) reg_ov[64];
 	uint32_t                  reg_ov_count;
 
+	/* Blob→pack index overlay (best-effort; same flush_mtx + flush cycle
+	 * as reg_ov). Appended per published blob, batch-put into
+	 * blob_index_tree at flush. */
+	LIST_HEAD(, tessera_blob_ov) blob_ov[64];
+	uint32_t                  blob_ov_count;
+
 	/* Parents with a dirent-log checkpoint in flight. Serializes
 	 * same-parent checkpoints (flush vs readdir/rmdir/rename callers
 	 * hold different locks): without this, two rebuilds race
@@ -1921,6 +1936,123 @@ tessera_fs_registry_ov_flush(struct tessera_mount *tmp_)
 	free(ents, M_TESSERA);
 	TPROF_ADD(TPROF_C_REGPUT, _t0);
 	return (rc == TESSERA_OK ? 0 : EIO);
+}
+
+/* Append (blob hash → pack_id) to the blob-index overlay. Best-effort: a malloc
+ * failure or a duplicate just skips indexing that blob (it will fall back to a
+ * scan on read). Gate-held publish path, like registry_put_pending. */
+static void
+tessera_fs_blob_index_put_pending(struct tessera_mount *tmp_,
+    const uint8_t *hash, const uint8_t *pack_id)
+{
+	if (!tmp_->flush_mtx_init)
+		return;
+	struct tessera_blob_ov *ov = malloc(sizeof *ov, M_TESSERA, M_NOWAIT);
+	if (ov == NULL)
+		return;   /* best-effort — skip; read falls back to scan */
+	memcpy(ov->hash, hash, 32);
+	memcpy(ov->pack_id, pack_id, 16);
+	uint32_t b = ((uint32_t)hash[0] | ((uint32_t)hash[1] << 8)) & 63u;
+	mtx_lock(&tmp_->flush_mtx);
+	struct tessera_blob_ov *e;
+	LIST_FOREACH(e, &tmp_->blob_ov[b], link) {
+		if (memcmp(e->hash, hash, 32) == 0) {   /* dedup: update pack_id */
+			memcpy(e->pack_id, pack_id, 16);
+			mtx_unlock(&tmp_->flush_mtx);
+			free(ov, M_TESSERA);
+			return;
+		}
+	}
+	LIST_INSERT_HEAD(&tmp_->blob_ov[b], ov, link);
+	tmp_->blob_ov_count++;
+	mtx_unlock(&tmp_->flush_mtx);
+}
+
+/* Flush-side: sorted-batch-put the blob-index overlay into blob_index_tree
+ * (lazy-creating it on first use) and clear it. Best-effort: a failure keeps
+ * the overlay for retry and leaves sb.blob_index_root unchanged. Gate held. */
+static int
+tessera_fs_blob_index_ov_flush(struct tessera_mount *tmp_)
+{
+	if (tmp_->blob_ov_count == 0)
+		return (0);
+	/* Lazy-create the tree on first write to a volume that had no index. */
+	if (tmp_->blob_index_tree == NULL) {
+		uint64_t root = 0;
+		tmp_->blob_index_tree = tessera_btree_create(&tmp_->meta_bio,
+		    TESSERA_BTREE_KIND_BLOB_INDEX, TESSERA_BLOB_INDEX_KEY_SIZE,
+		    TESSERA_BLOB_INDEX_VAL_SIZE, &root);
+		if (tmp_->blob_index_tree == NULL)
+			return (0);   /* out of reserve — skip, retry next flush */
+		tmp_->sb.blob_index_root = root;
+	}
+
+	uint32_t n = tmp_->blob_ov_count;
+	struct tessera_blob_ov **ents =
+	    malloc((size_t)n * sizeof *ents, M_TESSERA, M_NOWAIT);
+	if (ents == NULL)
+		return (0);
+	uint32_t cnt = 0;
+	mtx_lock(&tmp_->flush_mtx);
+	for (uint32_t b = 0; b < 64 && cnt < n; b++) {
+		struct tessera_blob_ov *e;
+		LIST_FOREACH(e, &tmp_->blob_ov[b], link) {
+			if (cnt >= n)
+				break;
+			ents[cnt++] = e;
+		}
+	}
+	mtx_unlock(&tmp_->flush_mtx);
+
+	/* Sort by hash (insertion sort — cnt is one flush's worth of blobs). */
+	for (uint32_t i = 1; i < cnt; i++) {
+		struct tessera_blob_ov *cur = ents[i];
+		int32_t j = (int32_t)i - 1;
+		while (j >= 0 && memcmp(ents[j]->hash, cur->hash, 32) > 0) {
+			ents[j + 1] = ents[j];
+			j--;
+		}
+		ents[j + 1] = cur;
+	}
+	uint8_t *keys = malloc((size_t)cnt * 32, M_TESSERA, M_NOWAIT);
+	uint8_t *vals = malloc((size_t)cnt * 16, M_TESSERA, M_NOWAIT);
+	if (keys == NULL || vals == NULL) {
+		if (keys) free(keys, M_TESSERA);
+		if (vals) free(vals, M_TESSERA);
+		free(ents, M_TESSERA);
+		return (0);
+	}
+	/* Drop adjacent duplicate hashes (keep first) — put_sorted_batch wants
+	 * strictly increasing keys. */
+	uint32_t m = 0;
+	for (uint32_t i = 0; i < cnt; i++) {
+		if (m > 0 && memcmp(keys + (size_t)(m - 1) * 32,
+		    ents[i]->hash, 32) == 0)
+			continue;
+		memcpy(keys + (size_t)m * 32, ents[i]->hash, 32);
+		memcpy(vals + (size_t)m * 16, ents[i]->pack_id, 16);
+		m++;
+	}
+	uint64_t root = tmp_->sb.blob_index_root;
+	int rc = tessera_btree_put_sorted_batch(tmp_->blob_index_tree,
+	    keys, vals, m, &root);
+	if (rc == TESSERA_OK) {
+		tmp_->sb.blob_index_root = root;
+		mtx_lock(&tmp_->flush_mtx);
+		for (uint32_t i = 0; i < cnt; i++) {
+			LIST_REMOVE(ents[i], link);
+			tmp_->blob_ov_count--;
+		}
+		mtx_unlock(&tmp_->flush_mtx);
+		for (uint32_t i = 0; i < cnt; i++)
+			free(ents[i], M_TESSERA);
+	}
+	/* On failure keep the overlay (reads unaffected — they just scan) and
+	 * retry next flush. */
+	free(keys, M_TESSERA);
+	free(vals, M_TESSERA);
+	free(ents, M_TESSERA);
+	return (0);
 }
 
 /* Manifest builder pre-set to the volume's hash_alg so finalize's
@@ -2535,6 +2667,9 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	for (uint32_t _b = 0; _b < 64; _b++)
 		LIST_INIT(&tmp_->reg_ov[_b]);
 	tmp_->reg_ov_count = 0;
+	for (uint32_t _b = 0; _b < 64; _b++)
+		LIST_INIT(&tmp_->blob_ov[_b]);
+	tmp_->blob_ov_count = 0;
 	for (uint32_t _b = 0; _b < TESSERA_DIRTY_CONTENT_BUCKETS; _b++)
 		LIST_INIT(&tmp_->dirty_content[_b]);
 	tmp_->dirty_content_bytes = 0;
@@ -3212,6 +3347,12 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			while (!LIST_EMPTY(&tmp_->reg_ov[_b])) {
 				struct tessera_reg_ov *_e =
 				    LIST_FIRST(&tmp_->reg_ov[_b]);
+				LIST_REMOVE(_e, link);
+				free(_e, M_TESSERA);
+			}
+			while (!LIST_EMPTY(&tmp_->blob_ov[_b])) {
+				struct tessera_blob_ov *_e =
+				    LIST_FIRST(&tmp_->blob_ov[_b]);
 				LIST_REMOVE(_e, link);
 				free(_e, M_TESSERA);
 			}
@@ -9445,6 +9586,9 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 			    "flush failed: %d\n", rov);
 			r = rov;
 		}
+		/* Best-effort blob→pack index maintenance (never fails the
+		 * flush; a skipped batch just means those blobs scan on read). */
+		(void)tessera_fs_blob_index_ov_flush(tmp_);
 	}
 	if (r == 0) {
 		_tp = TPROF_T0();
@@ -12241,6 +12385,7 @@ tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
 		tessera_fs_pack_alloc_rollback(tmp_, &pa);
 		return (EIO);
 	}
+	tessera_fs_blob_index_put_pending(tmp_, hash, pack_id);
 
 	/* CAS-cache insert for the manifest blob. Single-blob pack ⇒ one
 	 * extent. Multi-extent layout (PEL) defers extent resolution to
@@ -12449,6 +12594,7 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
 	for (uint32_t i = 0; i < n; i++) {
 		tessera_cas_loc_insert(&tmp_->cas_cache, entries[i].hash,
 		    pack_id, cas_extents, cas_n, pa.length_sectors);
+		tessera_fs_blob_index_put_pending(tmp_, entries[i].hash, pack_id);
 	}
 
 	tessera_stat_aggregation_packs++;
@@ -12561,10 +12707,12 @@ tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
 	for (uint32_t i = 0; i < n; i++) {
 		tessera_cas_loc_insert(&tmp_->cas_cache, chunks[i].hash,
 		    pack_id, cas_extents, cas_n, pa.length_sectors);
+		tessera_fs_blob_index_put_pending(tmp_, chunks[i].hash, pack_id);
 	}
 	if (manifest_bytes != NULL) {
 		tessera_cas_loc_insert(&tmp_->cas_cache, manifest_hash,
 		    pack_id, cas_extents, cas_n, pa.length_sectors);
+		tessera_fs_blob_index_put_pending(tmp_, manifest_hash, pack_id);
 	}
 	return (0);
 }
