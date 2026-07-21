@@ -31,6 +31,10 @@ path = "src/bin/stat.rs"
 name = "tessera-binsplit"
 path = "src/bin/binsplit.rs"
 
+[[bin]]
+name = "tessera-repack"
+path = "src/bin/repack.rs"
+
 [dependencies]
 tessera-sys = { path = "../tessera-sys" }
 libc        = "0.2"
