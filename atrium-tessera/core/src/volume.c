@@ -607,6 +607,14 @@ int
 tessera_volume_commit_roots(tessera_volume_t *v,
                             const tessera_commit_roots_t *roots)
 {
+	return tessera_volume_commit_roots_ex(v, roots, 0);
+}
+
+int
+tessera_volume_commit_roots_ex(tessera_volume_t *v,
+                               const tessera_commit_roots_t *roots,
+                               uint32_t flags)
+{
 	if (v == NULL || roots == NULL) return TESSERA_EINVAL;
 	if (v->io.write_block == NULL) return TESSERA_EINVAL;
 
@@ -633,9 +641,13 @@ tessera_volume_commit_roots(tessera_volume_t *v,
 		sb.snapshots_root = roots->snapshots_root;
 		sb.snapshots_gen += 1;
 	}
-	/* meta_reserve_bump only ever grows (repair consumed reserve
-	 * sectors for the rewritten trees); never let it regress. */
-	if (roots->meta_reserve_bump > sb.meta_reserve_bump)
+	/* meta_reserve_bump: by default only ever grows (repair consumed
+	 * reserve sectors for the rewritten trees); never let it regress.
+	 * With TESSERA_COMMIT_BUMP_EXACT (repack) set it exactly — repack
+	 * compacts the reserve and legitimately LOWERS the bump. */
+	if (flags & TESSERA_COMMIT_BUMP_EXACT)
+		sb.meta_reserve_bump = roots->meta_reserve_bump;
+	else if (roots->meta_reserve_bump > sb.meta_reserve_bump)
 		sb.meta_reserve_bump = roots->meta_reserve_bump;
 	/* next_inode_no may grow if repair minted an inode (lost+found). */
 	if (roots->next_inode_no > sb.next_inode_no)

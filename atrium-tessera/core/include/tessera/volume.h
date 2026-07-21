@@ -114,6 +114,21 @@ typedef struct {
 int tessera_volume_commit_roots(tessera_volume_t *v,
                                 const tessera_commit_roots_t *roots);
 
+/* commit_roots flags. Default (0) matches tessera_volume_commit_roots:
+ * meta_reserve_bump only advances, never regresses (repair semantics). */
+#define TESSERA_COMMIT_BUMP_EXACT  0x1u   /* set bump to roots->meta_reserve_bump
+                                           * exactly, permitting it to LOWER —
+                                           * for tessera-repack, which compacts
+                                           * the reserve and reclaims headroom. */
+
+/* As tessera_volume_commit_roots, but `flags` selects bump semantics. With
+ * TESSERA_COMMIT_BUMP_EXACT the caller MUST have written the new (compacted)
+ * trees to sectors the CURRENT committed SB does not reference, so a crash
+ * before/during this commit leaves the old SB pointing at intact trees. */
+int tessera_volume_commit_roots_ex(tessera_volume_t *v,
+                                   const tessera_commit_roots_t *roots,
+                                   uint32_t flags);
+
 /* Read-only accessors over the active superblock's fields. */
 uint64_t        tessera_volume_total_sectors    (const tessera_volume_t *);
 uint64_t        tessera_volume_generation       (const tessera_volume_t *);

@@ -85,6 +85,10 @@ pub struct tessera_commit_roots_t {
     pub next_inode_no:      u64,
 }
 
+/// commit_roots_ex flag: set meta_reserve_bump exactly (permit lowering) —
+/// for tessera-repack, which compacts the reserve and reclaims headroom.
+pub const TESSERA_COMMIT_BUMP_EXACT: u32 = 0x1;
+
 /* ── B+tree ──────────────────────────────────────────────────── */
 
 #[repr(C)]
@@ -127,6 +131,11 @@ extern "C" {
     pub fn tessera_btree_put   (t: *mut tessera_btree_t,
                                  key: *const u8, value: *const u8,
                                  out_new_root: *mut u64) -> c_int;
+    /// Bulk insert `n` already-key-sorted (key,value) pairs (keys packed
+    /// contiguously, then values), building bottom-up with minimal node churn.
+    pub fn tessera_btree_put_sorted_batch(t: *mut tessera_btree_t,
+                                 keys: *const u8, values: *const u8, n: u32,
+                                 out_new_root: *mut u64) -> c_int;
     pub fn tessera_btree_delete(t: *mut tessera_btree_t,
                                  key: *const u8,
                                  out_new_root: *mut u64) -> c_int;
@@ -138,7 +147,18 @@ extern "C" {
                                       out_value: *mut u8) -> c_int;
     pub fn tessera_btree_cursor_next(c: *mut tessera_btree_cursor_t) -> c_int;
     pub fn tessera_btree_cursor_free(c: *mut tessera_btree_cursor_t);
+
+    /* Visit every node sector of the tree (internal + leaf). Used by
+     * tessera-repack to compute the live node-set before compacting. */
+    pub fn tessera_btree_walk_nodes(t: *mut tessera_btree_t,
+                                     cb: tessera_btree_node_visitor_t,
+                                     ctx: *mut c_void) -> c_int;
 }
+
+/// Node visitor for tessera_btree_walk_nodes: called once per node sector.
+/// Return 0 to continue, non-zero to abort the walk.
+pub type tessera_btree_node_visitor_t =
+    Option<unsafe extern "C" fn(ctx: *mut c_void, sector: u64) -> c_int>;
 
 /* ── pack files ──────────────────────────────────────────────── */
 
@@ -384,6 +404,14 @@ extern "C" {
     /// reference must already be durable (open the device O_SYNC).
     pub fn tessera_volume_commit_roots(v: *mut tessera_volume_t,
                                        roots: *const tessera_commit_roots_t) -> c_int;
+
+    /// As commit_roots, but `flags` selects bump semantics. With
+    /// TESSERA_COMMIT_BUMP_EXACT the bump is set exactly (may LOWER) —
+    /// for tessera-repack. Caller MUST have written the new trees to
+    /// sectors the current committed SB does not reference.
+    pub fn tessera_volume_commit_roots_ex(v: *mut tessera_volume_t,
+                                          roots: *const tessera_commit_roots_t,
+                                          flags: u32) -> c_int;
 
     pub fn tessera_volume_hash_alg(v: *const tessera_volume_t) -> u32;
     pub fn tessera_volume_total_sectors    (v: *const tessera_volume_t) -> u64;
