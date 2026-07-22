@@ -10902,8 +10902,14 @@ tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
 			_GC_PUSH_HASH(_h);                                \
 			uint8_t  *_blob = NULL;                           \
 			uint32_t _blen = 0;                               \
+			/* A live inode's manifest that will not fetch     \
+			 * means its children can't be enumerated — the    \
+			 * live set would be incomplete. Flag an abort so   \
+			 * this GC cycle reclaims nothing (#66). The hash   \
+			 * itself was already pushed above, so the manifest  \
+			 * blob stays protected regardless. */             \
 			if (tessera_fs_fetch_blob(tmp_, _h, &_blob,       \
-			    &_blen) != 0) continue;                       \
+			    &_blen) != 0) { gc_walk_abort = 1; continue; } \
 			tessera_manifest_parser_t *_p =                   \
 			    tessera_manifest_parse(_blob, _blen);         \
 			if (_p == NULL) { free(_blob, M_TESSERA);         \
@@ -10967,17 +10973,36 @@ tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
 		}                                                         \
 } while (0)
 
+	/*
+	 * CRITICAL (dangling-manifest over-free, dogfood #66): the pass-1
+	 * live-set walk MUST enumerate every reachable manifest hash, or a
+	 * pack whose only reference is an inode past the truncation point is
+	 * misclassified dead and freed. tessera_btree_cursor_next() descends
+	 * into child nodes (I/O), so it can return TESSERA_EIO/ECORRUPT on a
+	 * transient bad-node read under -j4 buffer pressure — which the old
+	 * walk conflated with TESSERA_ENOENT (clean end) and silently
+	 * truncated the live set. Treat ANY non-ENOENT cursor status as a
+	 * hard GC abort (no reclaim this cycle), exactly like gc_seed_abort.
+	 */
+	int gc_walk_abort = 0;
 #define _GC_WALK_INODE_TREE(_tree) do {                                   \
 	if ((_tree) == NULL) break;                                       \
 	tessera_btree_cursor_t *_c = tessera_btree_seek_first(_tree);     \
-	if (_c == NULL) break;                                            \
+	if (_c == NULL) { gc_walk_abort = 1; break; }                     \
 	for (;;) {                                                        \
 		uint8_t _k[4];                                            \
 		tessera_inode_record_t _ino;                              \
-		if (tessera_btree_cursor_get(_c, _k, &_ino) != TESSERA_OK)\
+		int _grc = tessera_btree_cursor_get(_c, _k, &_ino);       \
+		if (_grc != TESSERA_OK) {                                 \
+			if (_grc != TESSERA_ENOENT) gc_walk_abort = 1;    \
 			break;                                            \
+		}                                                         \
 		_GC_WALK_RECORD(_ino);                                    \
-		if (tessera_btree_cursor_next(_c) != TESSERA_OK) break;   \
+		int _nrc = tessera_btree_cursor_next(_c);                 \
+		if (_nrc != TESSERA_OK) {                                 \
+			if (_nrc != TESSERA_ENOENT) gc_walk_abort = 1;    \
+			break;                                            \
+		}                                                         \
 	}                                                                 \
 	tessera_btree_cursor_free(_c);                                    \
 } while (0)
@@ -10991,11 +11016,14 @@ tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
 		tessera_btree_cursor_t *sc =
 		    tessera_btree_seek_first(tmp_->snapshots_tree);
 		uint32_t snap_count = 0;
-		while (sc != NULL) {
+		while (sc != NULL && !gc_walk_abort) {
 			uint8_t sk[8];
 			tessera_snapshot_record_t srec;
-			if (tessera_btree_cursor_get(sc, sk, &srec)
-			    != TESSERA_OK) break;
+			int _sgrc = tessera_btree_cursor_get(sc, sk, &srec);
+			if (_sgrc != TESSERA_OK) {
+				if (_sgrc != TESSERA_ENOENT) gc_walk_abort = 1;
+				break;
+			}
 			/* Skip the just-current snapshot; its tree is the
 			 * same root as tmp_->sb.inode_root and we already
 			 * walked it. */
@@ -11006,18 +11034,40 @@ tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
 				        srec.inode_root, /*tree_kind*/ 0,
 				        /*key*/ 4,
 				        /*value*/ TESSERA_INODE_RECORD_SIZE);
+				/* A retained snapshot we cannot open/enumerate
+				 * means an unknown live set — abort rather than
+				 * reclaim on a partial union. */
+				if (snap_inode == NULL) {
+					gc_walk_abort = 1;
+					break;
+				}
 				_GC_WALK_INODE_TREE(snap_inode);
-				if (snap_inode != NULL)
-					tessera_btree_close(snap_inode);
+				tessera_btree_close(snap_inode);
 				snap_count++;
 			}
-			if (tessera_btree_cursor_next(sc) != TESSERA_OK) break;
+			int _sqrc = tessera_btree_cursor_next(sc);
+			if (_sqrc != TESSERA_OK) {
+				if (_sqrc != TESSERA_ENOENT) gc_walk_abort = 1;
+				break;
+			}
 		}
 		if (sc != NULL) tessera_btree_cursor_free(sc);
 		if (snap_count > 0)
 			printf("tessera_fs: gc pass1 — %u retained snapshots "
 			    "unionised; %u total live hashes\n",
 			    snap_count, live_count);
+	}
+	/*
+	 * If any committed-tree or snapshot walk hit a read/corruption error
+	 * (not a clean end-of-tree), the live set is incomplete — reclaiming
+	 * on it would free packs whose only references are inodes we failed
+	 * to enumerate. Bail with no reclaim; the next flush retries. (#66)
+	 */
+	if (gc_walk_abort) {
+		printf("tessera_fs: gc ABORTED — pass-1 live-set walk hit a "
+		    "btree read error; no reclaim this cycle\n");
+		free(live, M_TESSERA);
+		return (0);
 	}
 	/* In-flight state (task #37): inode records still in the dirty
 	 * cache and manifests still pending are INVISIBLE to the
