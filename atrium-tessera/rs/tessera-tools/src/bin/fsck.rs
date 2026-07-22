@@ -944,7 +944,34 @@ fn apply_repairs(
         mods.entry(*parent).or_default().remove.insert((*child, name.clone()));
     }
 
-    if !fsck.orphans.is_empty() {
+    // nlink==0 orphans are unlinked-but-still-open files caught by a crash
+    // (the kmod keeps the record at unlink and deletes it at last close —
+    // POSIX; a crash in between leaves this exact signature). The file WAS
+    // deleted: FREE the record rather than resurrecting a dead temp file in
+    // lost+found. Orphans with nlink > 0 are genuine losses — relink those.
+    let (free_orphans, relink_orphans): (Vec<u32>, Vec<u32>) =
+        fsck.orphans.iter().copied().partition(|o|
+            fsck.inode_map.get(o).map(|x| x.1 == 0).unwrap_or(false));
+    if !free_orphans.is_empty() {
+        unsafe {
+            let t = tessera_btree_open(io, new.inode_root, TESSERA_BTREE_KIND_INODE,
+                4, TESSERA_INODE_RECORD_SIZE);
+            if t.is_null() { return Err("open inode tree for orphan free".into()); }
+            let mut root = new.inode_root;
+            for o in &free_orphans {
+                let key = o.to_be_bytes();
+                if tessera_btree_delete(t, key.as_ptr(), &mut root) != 0 {
+                    tessera_btree_close(t);
+                    return Err(format!("btree_delete(inode {o}) during orphan free"));
+                }
+                applied += 1;
+            }
+            tessera_btree_close(t);
+            new.inode_root = root;
+        }
+        if verbose { eprintln!("  freed {} nlink=0 orphan(s) (unlinked-open at crash)", free_orphans.len()); }
+    }
+    if !relink_orphans.is_empty() {
         // Resolve (or mint) /lost+found, then link each orphan into it.
         let root = TESSERA_INODE_ROOT_DIR;
         let root_manifest = fsck.inode_map.get(&root).map(|x| x.2).unwrap_or([0u8; 32]);
@@ -963,7 +990,7 @@ fn apply_repairs(
             }
         };
         let m = mods.entry(laf_ino).or_default();
-        for o in &fsck.orphans {
+        for o in &relink_orphans {
             // Don't relink lost+found itself if it somehow appears orphaned.
             if *o == laf_ino { continue; }
             m.add.push((format!("inode_{o}"), *o as u64));
