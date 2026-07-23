@@ -2705,7 +2705,22 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * mount — the synthesized root vnode lets `df` / `umount` work
 	 * for diagnostic purposes. */
 	tmp_->bio_ctx.devvp = devvp;
-	tmp_->bio_ctx.cred  = curthread->td_ucred;
+	/*
+	 * Take a REFERENCE on the mounting thread's credential — every bread()
+	 * on the device vnode passes this for the life of the mount, which far
+	 * outlives the process that issued mount(2).
+	 *
+	 * Storing td_ucred bare was a use-after-free: once the mounting process
+	 * exited its ucred was freed, and every subsequent device read handed
+	 * breadn_flags() a dangling pointer that crhold() then dereferenced —
+	 * "panic: vm_fault failed ... far 0x8" inside witness_checkorder, from
+	 * whichever path happened to fault the block in (vop_read, VOP_LOOKUP,
+	 * ...). It only bites mounts made by an ordinary, exiting process; the
+	 * root mount survives because vfs_mountroot runs in early boot on a
+	 * credential that never dies — which is why / stayed up through a
+	 * 20-minute buildkernel while a shell-mounted volume panicked twice.
+	 */
+	tmp_->bio_ctx.cred  = crhold(curthread->td_ucred);
 	tmp_->bio_ctx.mount = tmp_;
 	tmp_->bio_ctx.cp    = cp;
 	/* Data-zone io: alloc/free route through the extent allocator. */
@@ -2847,6 +2862,8 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 			    "open failed\n", (unsigned long)requested_gen);
 			free(tmp_->meta_free,    M_TESSERA);
 			free(tmp_->meta_pending, M_TESSERA);
+			if (tmp_->bio_ctx.cred != NULL)
+				crfree(tmp_->bio_ctx.cred);
 			free(tmp_, M_TESSERA);
 			err = ENOENT;
 			goto fail_close;
@@ -2861,6 +2878,8 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 			    (unsigned long)requested_gen);
 			free(tmp_->meta_free,    M_TESSERA);
 			free(tmp_->meta_pending, M_TESSERA);
+			if (tmp_->bio_ctx.cred != NULL)
+				crfree(tmp_->bio_ctx.cred);
 			free(tmp_, M_TESSERA);
 			err = ENOENT;
 			goto fail_close;
@@ -3616,6 +3635,11 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 		}
 		if (tmp_->devvp != NULL) vrele(tmp_->devvp);
 		if (tmp_->dev != NULL)   dev_rel(tmp_->dev);
+		/* Release the credential reference taken at mount. */
+		if (tmp_->bio_ctx.cred != NULL) {
+			crfree(tmp_->bio_ctx.cred);
+			tmp_->bio_ctx.cred = NULL;
+		}
 		free(tmp_, M_TESSERA);
 		mp->mnt_data = NULL;
 	}
