@@ -1565,6 +1565,11 @@ struct tessera_mount {
 	 * rate-limit it (gc_data_zone is O(inodes × retained-snapshots ×
 	 * fetch_blob); running per-remove made rm -rf take hours). */
 	int                       last_tombstone_gc_ticks;
+	/* Adaptive retry interval (ticks) for the tombstone data-zone GC.
+	 * Doubles each time a run reclaims nothing so an expensive no-op GC
+	 * cannot re-run back-to-back under the flush gate and starve every
+	 * writer (task #67); reset to the base on a productive run. */
+	int                       tombstone_gc_backoff;
 	uint8_t                  *meta_pin_bitmap;
 	size_t                    meta_pin_bitmap_bytes;
 
@@ -1580,6 +1585,26 @@ struct tessera_mount {
 	 * taskqueue_thread starves every other subsystem queued there
 	 * (observed: md-on-ZFS test rigs crawling for minutes). */
 	struct taskqueue         *flush_tq;
+
+	/* ★ task #67: the background repack task takes the flush gate (and
+	 * can hold/retake it for a long time). Running it on the SHARED
+	 * taskqueue_thread wedged the whole system: once repack blocked in
+	 * "tessgate", taskqueue_thread — which also carries thread_reap_task
+	 * and every other subsystem's deferred work — was stuck behind it
+	 * (observed live: "kernel/thread taskq" in DLs tessgate while a
+	 * buildkernel's writers piled up on the gate). Give repack its own
+	 * queue, exactly like flush_tq/pinscan_tq above. */
+	struct taskqueue         *repack_tq;
+	int                       repack_tq_init;
+
+	/* ★ task #67 (same hazard, worse): tessera_fs_journal_log_task ALSO
+	 * claims the flush gate, and it is driven by a periodic callout — so
+	 * under write load it blocks on the gate constantly. On the shared
+	 * taskqueue_thread that is what actually wedged the system. Private
+	 * queue, separate from repack_tq so a long repack cannot delay the
+	 * journal drain cadence. */
+	struct taskqueue         *journal_tq;
+	int                       journal_tq_init;
 
 	/* v2 repack engine slice 3: background trigger.
 	 * multi_extent_pack_count tracks how many MULTI_EXTENT-flagged
@@ -2659,6 +2684,18 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	(void)taskqueue_start_threads(&tmp_->pinscan_tq, 1, PRIBIO,
 	    "tesspinscan");
 	tmp_->pinscan_tq_init = 1;
+	/* task #67: private queue for the gate-taking background repack —
+	 * must NOT share taskqueue_thread (see repack_tq declaration). */
+	tmp_->repack_tq = taskqueue_create("tessera_repack", M_WAITOK,
+	    taskqueue_thread_enqueue, &tmp_->repack_tq);
+	(void)taskqueue_start_threads(&tmp_->repack_tq, 1, PRIBIO,
+	    "tessrepack");
+	tmp_->repack_tq_init = 1;
+	tmp_->journal_tq = taskqueue_create("tessera_journal", M_WAITOK,
+	    taskqueue_thread_enqueue, &tmp_->journal_tq);
+	(void)taskqueue_start_threads(&tmp_->journal_tq, 1, PRIBIO,
+	    "tessjournal");
+	tmp_->journal_tq_init = 1;
 	tmp_->multi_extent_pack_count = 0;
 	mtx_init(&tmp_->flush_mtx, "tess_flush", NULL, MTX_DEF);
 	tmp_->flush_mtx_init = 1;
@@ -3279,7 +3316,7 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			 * the journal. */
 			if (tmp_->journal_log_co_init) {
 				callout_drain(&tmp_->journal_log_co);
-				taskqueue_drain(taskqueue_thread,
+				taskqueue_drain(tmp_->journal_tq,
 				    &tmp_->journal_log_task);
 				(void)tessera_fs_journal_log_drain(tmp_);
 				tmp_->journal_log_co_init = 0;
@@ -3334,7 +3371,7 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			} /* tmp_->dev_writable */
 		}
 		if (tmp_->repack_task_init) {
-			taskqueue_drain(taskqueue_thread, &tmp_->repack_task);
+			taskqueue_drain(tmp_->repack_tq, &tmp_->repack_task);
 			tmp_->repack_task_init = 0;
 		}
 		/* Flush queue first (its task may still enqueue prepare
@@ -3343,6 +3380,20 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 		if (tmp_->flush_tq != NULL) {
 			taskqueue_free(tmp_->flush_tq);
 			tmp_->flush_tq = NULL;
+		}
+		/* task #67: private gate-taking background queues. */
+		if (tmp_->repack_tq_init) {
+			taskqueue_drain(tmp_->repack_tq, &tmp_->repack_task);
+			taskqueue_free(tmp_->repack_tq);
+			tmp_->repack_tq = NULL;
+			tmp_->repack_tq_init = 0;
+		}
+		if (tmp_->journal_tq_init) {
+			taskqueue_drain(tmp_->journal_tq,
+			    &tmp_->journal_log_task);
+			taskqueue_free(tmp_->journal_tq);
+			tmp_->journal_tq = NULL;
+			tmp_->journal_tq_init = 0;
 		}
 		/* Registry overlay: empty after the final flush; free
 		 * defensively (forced unmount after a failed flush may
@@ -6136,7 +6187,9 @@ repack_arm:
 	if (tmp_->repack_task_init && !tmp_->flush_unmounting &&
 	    tmp_->multi_extent_pack_count >
 	        (uint32_t)tessera_repack_threshold) {
-		(void)taskqueue_enqueue(taskqueue_thread, &tmp_->repack_task);
+		if (tmp_->repack_tq_init)
+			(void)taskqueue_enqueue(tmp_->repack_tq,
+			    &tmp_->repack_task);
 	}
 }
 
@@ -9602,10 +9655,34 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 		int _tight = (_zone > 0 && _free < _zone / 8);  /* <12.5% */
 		int _now = (int)ticks;
 		int _elapsed = _now - tmp_->last_tombstone_gc_ticks;
+		/*
+		 * ★ task #67: the fixed hz/2 retry assumed a GC pass is cheap
+		 * relative to 0.5s. On a large volume it is NOT — a full pass is
+		 * O(inodes × manifests) + O(registry packs) and can run for many
+		 * seconds. Because this whole flush (and hence the GC) runs with
+		 * the flush GATE held, back-to-back unproductive passes pin the
+		 * gate ~continuously and every writer wedges in "tessgate"
+		 * forever — observed as a buildkernel hanging with ld.lld and
+		 * objcopy stuck in D. It is self-sustaining: reclaiming nothing
+		 * keeps the zone _tight, which re-arms the GC on the next flush.
+		 * So back off exponentially whenever a pass reclaims nothing
+		 * (including the #66 abort-on-corrupt-walk path, which returns
+		 * without reclaiming), and reset once a pass is productive.
+		 */
+		const int _base = hz / 2;
+		int _iv = tmp_->tombstone_gc_backoff > 0 ?
+		    tmp_->tombstone_gc_backoff : _base;
 		if (_tight && (tmp_->last_tombstone_gc_ticks == 0 ||
-		    _elapsed < 0 || _elapsed > (hz / 2))) {
+		    _elapsed < 0 || _elapsed > _iv)) {
 			tmp_->last_tombstone_gc_ticks = _now;
-			(void)tessera_fs_gc_data_zone(tmp_);
+			int _gcn = tessera_fs_gc_data_zone(tmp_);
+			if (_gcn > 0) {
+				tmp_->tombstone_gc_backoff = _base;
+			} else {
+				int _nb = _iv * 2;
+				if (_nb > 60 * hz) _nb = 60 * hz;
+				tmp_->tombstone_gc_backoff = _nb;
+			}
 		}
 	}
 
@@ -12357,7 +12434,9 @@ tessera_fs_repack_task(void *ctx, int pending)
 	if (!tmp_->flush_unmounting && repacked > 0 &&
 	    tmp_->multi_extent_pack_count >
 	        (uint32_t)tessera_repack_threshold) {
-		(void)taskqueue_enqueue(taskqueue_thread, &tmp_->repack_task);
+		if (tmp_->repack_tq_init)
+			(void)taskqueue_enqueue(tmp_->repack_tq,
+			    &tmp_->repack_task);
 	}
 }
 
@@ -17061,7 +17140,8 @@ tessera_fs_journal_log_callout(void *ctx)
 {
 	struct tessera_mount *tmp_ = ctx;
 	if (tmp_ == NULL || tmp_->flush_unmounting) return;
-	(void)taskqueue_enqueue(taskqueue_thread, &tmp_->journal_log_task);
+	if (tmp_->journal_tq_init)
+		(void)taskqueue_enqueue(tmp_->journal_tq, &tmp_->journal_log_task);
 	int t_ms = tessera_journal_log_interval_ms;
 	if (t_ms < 10) t_ms = 10;
 	if (tmp_->journal_log_co_init && !tmp_->flush_unmounting)
