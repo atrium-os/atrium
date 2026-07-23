@@ -429,6 +429,14 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, putpages_range_enable, CTLFLAG_RW,
     &tessera_putpages_range_enable, 0,
     "use the range-scoped RMW path in vop_putpages (0 = whole-file)");
 static unsigned long tessera_stat_vop_write_range     = 0;
+/* Max pages of forward read-ahead per getpages (task #69). 16 pages = 64 KiB
+ * = one chunk at the small tier, so a run costs one chunk fetch. */
+static int tessera_getpages_rahead_max = 16;
+SYSCTL_INT(_kern_tessera, OID_AUTO, getpages_rahead_max, CTLFLAG_RW,
+    &tessera_getpages_rahead_max, 0,
+    "max forward read-ahead pages per vop_getpages (0 disables)");
+static unsigned long tessera_stat_gp_calls            = 0;
+static unsigned long tessera_stat_gp_pages            = 0;
 static unsigned long tessera_stat_rr_bail_fetch       = 0;
 static unsigned long tessera_stat_rr_bail_kind        = 0;
 static unsigned long tessera_stat_rr_bail_layout      = 0;
@@ -452,6 +460,10 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, vop_write_inline,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, vop_write_chunked,
     CTLFLAG_RD, &tessera_stat_vop_write_chunked, 0,
     "vop_write completions via CHUNK_LIST manifest path");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gp_calls, CTLFLAG_RD,
+    &tessera_stat_gp_calls, 0, "vop_getpages calls");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gp_pages, CTLFLAG_RD,
+    &tessera_stat_gp_pages, 0, "pages filled by vop_getpages");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, rr_bail_fetch, CTLFLAG_RD,
     &tessera_stat_rr_bail_fetch, 0, "range RMW bail: manifest fetch");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, rr_bail_kind, CTLFLAG_RD,
@@ -5493,9 +5505,11 @@ tessera_vop_open(struct vop_open_args *ap)
  * which uses the buffer cache + VOP_STRATEGY. Tessera's pack model
  * doesn't fit a "logical block → physical block" mapping (chunks live in
  * content-addressed packs reached via two btrees), so we fill pages
- * directly via tessera_fs_read_inode_uio. One sf_buf-mapped page at a
- * time — short-term mappings, sleepable allocator, no recursion through
- * the strategy path that panics in bufstrategy().
+ * directly via tessera_fs_read_inode_uio — short-term sf_buf mappings, no
+ * recursion through the strategy path that panics in bufstrategy().
+ *
+ * The whole page run is mapped and read in ONE uio (see below): filling a
+ * page at a time re-fetched the containing chunk once per page.
  */
 static int
 tessera_vop_getpages(struct vop_getpages_args *ap)
@@ -5524,45 +5538,135 @@ tessera_vop_getpages(struct vop_getpages_args *ap)
 	    : tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no, &ino);
 	if (igrc != TESSERA_OK) return (VM_PAGER_FAIL);
 
+	/*
+	 * Map every page in the run and satisfy it with ONE read_inode_uio
+	 * (task #69). Doing a read per page meant a separate fetch_blob_ex ->
+	 * pack_fetch_ondemand -> g_read_data for each 4 KiB, and each of those
+	 * pulls the whole containing chunk off disk — so a 16-page run inside
+	 * one 64 KiB chunk read that chunk 16 times (256x at the 1 MiB tier).
+	 * Measured on the dev root: 690-890 MB/s of disk reads with the CPU
+	 * 60% idle while ld.lld faulted in its mmap'd inputs.
+	 *
+	 * uiomove walks the iovec array, so one uio spanning the whole run
+	 * costs ceil(run / chunk_size) chunk fetches instead of one per page.
+	 * The pages are consecutive pindexes and EOF cuts the run at most
+	 * once, so the in-range pages are a prefix — a single uio_offset
+	 * describes them all.
+	 */
+	/*
+	 * Read-ahead (task #69). The fault path hands a pager ONE page plus
+	 * rbehind/rahead *hints* and expects the pager to grab the neighbours
+	 * itself — vnode_pager_generic_getpages does exactly this. Tessera
+	 * ignored the hints and zeroed them, so every 4 KiB of an mmap cost a
+	 * full VOP_GETPAGES + chunk fetch + pmap round trip (measured: 1.00
+	 * pages per call over 65537 calls, ~230-270 us each, capping mmap
+	 * reads at ~15 MB/s regardless of volume size or cache state).
+	 *
+	 * Grab the run forward, fill it in one read below, and report what we
+	 * covered. Only rahead is taken: a chunk fetch already reads forward,
+	 * so extending backwards buys nothing and complicates the uio.
+	 */
+	vm_object_t obj = vp->v_object;
+	vm_page_t *mp = ma;
+	int npages = count;
+	int rbehind = 0;
+	int rahead = (ap->a_rahead != NULL) ? *ap->a_rahead : 0;
+	vm_page_t *grabbed = NULL;
+
+	if (rahead > tessera_getpages_rahead_max)
+		rahead = tessera_getpages_rahead_max;
+	if (rahead > 0 && obj != NULL) {
+		grabbed = malloc((count + rahead) * sizeof *grabbed, M_TESSERA,
+		    M_WAITOK | M_ZERO);
+		VM_OBJECT_WLOCK(obj);
+		vm_object_prepare_buf_pages(obj, grabbed, count, &rbehind,
+		    &rahead, ma);
+		VM_OBJECT_WUNLOCK(obj);
+		if (rahead > 0) {
+			mp = grabbed;
+			npages = count + rahead;
+		} else {
+			free(grabbed, M_TESSERA);
+			grabbed = NULL;
+		}
+	} else {
+		rahead = 0;
+	}
+
+	tessera_stat_gp_calls++;
+	tessera_stat_gp_pages += (unsigned long)npages;
+
 	int rv = VM_PAGER_OK;
-	for (int i = 0; i < count; i++) {
-		vm_page_t pg = ma[i];
+	struct sf_buf **sfv = malloc(npages * sizeof *sfv, M_TESSERA,
+	    M_WAITOK | M_ZERO);
+	struct iovec *iov = malloc(npages * sizeof *iov, M_TESSERA,
+	    M_WAITOK | M_ZERO);
+	int mapped = 0, nio = 0, past_eof = 0;
+	size_t total = 0;
+
+	for (int i = 0; i < npages; i++) {
+		vm_page_t pg = mp[i];
 		off_t     off = (off_t)pg->pindex << PAGE_SHIFT;
 
 		struct sf_buf *sf = sf_buf_alloc(pg, 0);
 		if (sf == NULL) { rv = VM_PAGER_FAIL; break; }
+		sfv[mapped++] = sf;
 		void *kva = (void *)sf_buf_kva(sf);
-		bzero(kva, PAGE_SIZE);
+		bzero(kva, PAGE_SIZE);	/* tail past EOF stays zero */
 
-		if ((uint64_t)off < ino.size) {
+		if (!past_eof && (uint64_t)off < ino.size) {
 			size_t to_read = (off + PAGE_SIZE > (off_t)ino.size)
 			    ? (size_t)(ino.size - off)
 			    : PAGE_SIZE;
-
-			struct iovec iov = { .iov_base = kva,
-			                     .iov_len  = to_read };
-			struct uio uio;
-			uio.uio_iov     = &iov;
-			uio.uio_iovcnt  = 1;
-			uio.uio_offset  = off;
-			uio.uio_resid   = (ssize_t)to_read;
-			uio.uio_segflg  = UIO_SYSSPACE;
-			uio.uio_rw      = UIO_READ;
-			uio.uio_td      = curthread;
-
-			int err = tessera_fs_read_inode_uio(tmp_, &ino, &uio);
-			if (err != 0) {
-				sf_buf_free(sf);
-				rv = VM_PAGER_FAIL;
-				break;
-			}
+			iov[nio].iov_base = kva;
+			iov[nio].iov_len  = to_read;
+			nio++;
+			total += to_read;
+		} else {
+			past_eof = 1;	/* keep the io run contiguous */
 		}
-		vm_page_valid(pg);
-		sf_buf_free(sf);
 	}
 
+	if (rv == VM_PAGER_OK && nio > 0) {
+		struct uio uio;
+		uio.uio_iov     = iov;
+		uio.uio_iovcnt  = nio;
+		uio.uio_offset  = (off_t)mp[0]->pindex << PAGE_SHIFT;
+		uio.uio_resid   = (ssize_t)total;
+		uio.uio_segflg  = UIO_SYSSPACE;
+		uio.uio_rw      = UIO_READ;
+		uio.uio_td      = curthread;
+
+		if (tessera_fs_read_inode_uio(tmp_, &ino, &uio) != 0)
+			rv = VM_PAGER_FAIL;
+	}
+	for (int i = 0; i < mapped; i++)
+		sf_buf_free(sfv[i]);
+	free(sfv, M_TESSERA);
+	free(iov, M_TESSERA);
+
+	if (rv == VM_PAGER_OK) {
+		for (int i = 0; i < npages; i++)
+			vm_page_valid(mp[i]);
+		/*
+		 * The requested pages stay busied for the caller; the pages we
+		 * grabbed ourselves must be released here (mirrors
+		 * vnode_pager_generic_getpages_done).
+		 */
+		for (int i = count; i < npages; i++)
+			vm_page_readahead_finish(mp[i]);
+	} else if (grabbed != NULL) {
+		VM_OBJECT_WLOCK(obj);
+		for (int i = count; i < npages; i++)
+			vm_page_free(mp[i]);
+		VM_OBJECT_WUNLOCK(obj);
+		rahead = 0;
+	}
+	if (grabbed != NULL)
+		free(grabbed, M_TESSERA);
+
 	if (ap->a_rbehind != NULL) *ap->a_rbehind = 0;
-	if (ap->a_rahead  != NULL) *ap->a_rahead  = 0;
+	if (ap->a_rahead  != NULL) *ap->a_rahead  = (rv == VM_PAGER_OK) ? rahead : 0;
 	return (rv);
 }
 
