@@ -2711,14 +2711,14 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * outlives the process that issued mount(2).
 	 *
 	 * Storing td_ucred bare was a use-after-free: once the mounting process
-	 * exited its ucred was freed, and every subsequent device read handed
-	 * breadn_flags() a dangling pointer that crhold() then dereferenced —
+	 * exited, its ucred was freed and every subsequent device read handed
+	 * breadn_flags() a dangling pointer, which crhold() then dereferenced —
 	 * "panic: vm_fault failed ... far 0x8" inside witness_checkorder, from
-	 * whichever path happened to fault the block in (vop_read, VOP_LOOKUP,
+	 * whatever path happened to fault the block in (vop_read, VOP_LOOKUP,
 	 * ...). It only bites mounts made by an ordinary, exiting process; the
 	 * root mount survives because vfs_mountroot runs in early boot on a
-	 * credential that never dies — which is why / stayed up through a
-	 * 20-minute buildkernel while a shell-mounted volume panicked twice.
+	 * credential that never dies, which is why / was stable while a
+	 * separately-mounted volume panicked.
 	 */
 	tmp_->bio_ctx.cred  = crhold(curthread->td_ucred);
 	tmp_->bio_ctx.mount = tmp_;
@@ -14981,19 +14981,67 @@ tessera_fs_replace_range_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 	if (fsize == 0 || off + (uint64_t)len > fsize)
 		return (ENOTSUP);		/* size-changing → slow path */
 
-	/* Use the manifest's own chunk size, not the nominal one for this
-	 * file size — see tessera_fs_manifest_chunk_size(). */
+	int has_old = 0;
+	for (size_t i = 0; i < TESSERA_HASH_SIZE; i++)
+		if (ino.manifest_hash[i] != 0) { has_old = 1; break; }
+	if (!has_old)
+		return (ENOTSUP);
+
+	/*
+	 * Fetch and parse the manifest ONCE, and derive the chunk size from
+	 * that same parse.
+	 *
+	 * This used to call tessera_fs_manifest_chunk_size() first and then
+	 * re-fetch the identical blob for the snapshot below — two fetches of
+	 * the same manifest on every range op, and for a CHUNK_TREE the helper
+	 * also fetched child 0. That is on the hot vop_putpages path, so an
+	 * mmap write paid it per 128 KiB dirty run (task #70).
+	 *
+	 * Use the manifest's own chunk size, not the nominal one for this file
+	 * size: a file grown by appends keeps the chunk size it started with,
+	 * so once it crosses the 64 KiB -> 1 MiB tier the two disagree.
+	 */
+	uint8_t *omft = NULL;
+	uint32_t omlen = 0;
+	if (tessera_fs_fetch_blob(tmp_, ino.manifest_hash, &omft, &omlen) != 0 ||
+	    omft == NULL)
+		return (ENOTSUP);
+	tessera_manifest_parser_t *p = tessera_manifest_parse(omft, omlen);
+	if (p == NULL || tessera_manifest_parser_count(p) == 0) {
+		if (p != NULL) tessera_manifest_parser_free(p);
+		free(omft, M_TESSERA);
+		return (ENOTSUP);
+	}
+	const int mkind = tessera_manifest_parser_kind(p);
 	uint32_t cs = 0;
-	if (tessera_fs_manifest_chunk_size(tmp_, ino.manifest_hash, &cs) != 0 ||
-	    cs == 0 || (cs & (cs - 1)) != 0)
+	if (mkind == TESSERA_MFT_CHUNK_LIST) {
+		tessera_chunk_record_t cr0;
+		if (tessera_manifest_chunk_at(p, 0, &cr0) == TESSERA_OK)
+			cs = cr0.uncompressed_size;
+	} else if (mkind == TESSERA_MFT_CHUNK_TREE) {
+		/* Chunk size lives one level down; the tree path re-derives it
+		 * from the child it rebuilds, so this is the only extra fetch
+		 * and only for tree-shaped files. */
+		(void)tessera_fs_manifest_chunk_size(tmp_, ino.manifest_hash,
+		    &cs);
+	}
+	if (cs == 0 || (cs & (cs - 1)) != 0) {
+		tessera_manifest_parser_free(p);
+		free(omft, M_TESSERA);
 		return (ENOTSUP);
+	}
 	const uint64_t n64 = (fsize + cs - 1) / cs;
-	if (n64 > 0xffffffffULL)
+	if (n64 > 0xffffffffULL) {
+		tessera_manifest_parser_free(p);
+		free(omft, M_TESSERA);
 		return (ENOTSUP);
+	}
 	const uint32_t n_chunks = (uint32_t)n64;
 	if (n64 > TESSERA_CHUNK_TREE_FANOUT) {
 		/* task #68 phase 3: CHUNK_TREE — rebuild only the affected
 		 * groups instead of falling back to the whole-file path. */
+		tessera_manifest_parser_free(p);
+		free(omft, M_TESSERA);
 		return (tessera_fs_replace_range_tree(tmp_, inode_no, &ino, cs,
 		    n_chunks, off, buf, len));
 	}
@@ -15002,19 +15050,7 @@ tessera_fs_replace_range_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 	tessera_hash_t *ohash = NULL;
 	uint32_t *oflags = NULL;
 	{
-		int has_old = 0;
-		for (size_t i = 0; i < TESSERA_HASH_SIZE; i++)
-			if (ino.manifest_hash[i] != 0) { has_old = 1; break; }
-		if (!has_old)
-			return (ENOTSUP);
-		uint8_t *omft = NULL; uint32_t omlen = 0;
-		if (tessera_fs_fetch_blob(tmp_, ino.manifest_hash, &omft,
-		    &omlen) != 0 || omft == NULL)
-			return (ENOTSUP);
-		tessera_manifest_parser_t *p =
-		    tessera_manifest_parse(omft, omlen);
-		int ok = (p != NULL &&
-		    tessera_manifest_parser_kind(p) == TESSERA_MFT_CHUNK_LIST &&
+		int ok = (mkind == TESSERA_MFT_CHUNK_LIST &&
 		    tessera_manifest_parser_count(p) == n_chunks);
 		if (ok) {
 			ohash = malloc(n_chunks * sizeof *ohash, M_TESSERA,
@@ -15032,7 +15068,7 @@ tessera_fs_replace_range_inner(struct tessera_mount *tmp_, uint32_t inode_no,
 				oflags[i] = cr.flags;
 			}
 		}
-		if (p != NULL) tessera_manifest_parser_free(p);
+		tessera_manifest_parser_free(p);
 		free(omft, M_TESSERA);
 		if (!ok) {
 			if (ohash) free(ohash, M_TESSERA);
