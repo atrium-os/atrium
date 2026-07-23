@@ -86,6 +86,11 @@ struct Fsck {
     // live inodes not reachable from the root dir. --repair relinks each
     // into /lost+found as "inode_<n>".
     orphans: Vec<u32>,
+    /// Inodes whose OWN manifest blob is missing from every pack. The
+    /// directory listing / file content is unrecoverable, so repair resets
+    /// them to empty (a valid, mountable state) and lets the next pass
+    /// relink the now-unreferenced children into lost+found.
+    dangling_manifests: Vec<(u32, u32)>,
     // stats
     inodes: u64,
     packs: u64,
@@ -379,6 +384,7 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<(i32, u32), String> {
         free_tree_dirty: false,
         dangling_dirents: Vec::new(),
         orphans: Vec::new(),
+        dangling_manifests: Vec::new(),
         inodes: 0,
         packs: 0,
         blobs: 0,
@@ -554,6 +560,12 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<(i32, u32), String> {
                     fsck.problem(format!("inode {ino}: regular file size {size} but null manifest_hash"));
                 }
                 let label = format!("inode {ino}");
+                // An inode whose own manifest blob is gone can't be walked or
+                // read at all (the kmod fails lookups into it with EIO). Record
+                // it as repairable rather than merely reporting it dangling.
+                if !is_null(&manifest) && !fsck.all_blobs.contains(&manifest) {
+                    fsck.dangling_manifests.push((ino, mode));
+                }
                 fsck.reach(&manifest, true, &label, 0);
                 fsck.reach(&xattr, false, &format!("{label} xattr"), 0);
                 fsck.inode_map.insert(ino, (mode, nlink, manifest));
@@ -1037,6 +1049,42 @@ fn apply_repairs(
     }
 
     // ── Tier A.1: nlink correction (inode-record rewrites) ──
+    // ── Tier B.3: inode whose own manifest blob is gone ──
+    // Nothing references the lost blob any more, so the entries/content it
+    // described are unrecoverable. fsck_ffs's equivalent is to clear the
+    // object rather than leave an unusable one: reset the inode to empty
+    // (null manifest, size 0) so it mounts and can be removed/rewritten.
+    // Children that the lost directory listing referenced become orphans and
+    // the iterate-to-fixpoint pass relinks them into lost+found.
+    if !fsck.dangling_manifests.is_empty() {
+        unsafe {
+            let t = tessera_btree_open(io, new.inode_root, TESSERA_BTREE_KIND_INODE,
+                4, TESSERA_INODE_RECORD_SIZE);
+            if t.is_null() { return Err("open inode tree for dangling-manifest repair".into()); }
+            let mut root = new.inode_root;
+            for (ino, _mode) in &fsck.dangling_manifests {
+                let (key, raw) = match fsck.inode_raw.get(ino) {
+                    Some(x) => x,
+                    None => continue,
+                };
+                let mut patched = raw.clone();
+                patched[56..64].copy_from_slice(&0u64.to_le_bytes());   // size
+                patched[72..104].copy_from_slice(&[0u8; 32]);           // manifest_hash
+                if tessera_btree_put(t, key.as_ptr(), patched.as_ptr(), &mut root) != 0 {
+                    tessera_btree_close(t);
+                    return Err(format!("btree_put(inode {ino}) during dangling-manifest repair"));
+                }
+                applied += 1;
+            }
+            tessera_btree_close(t);
+            new.inode_root = root;
+        }
+        if verbose {
+            eprintln!("  reset {} inode(s) with a missing manifest blob to empty",
+                fsck.dangling_manifests.len());
+        }
+    }
+
     if !fsck.nlink_fixes.is_empty() {
         unsafe {
             let t = tessera_btree_open(io, new.inode_root, TESSERA_BTREE_KIND_INODE,
