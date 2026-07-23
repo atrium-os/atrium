@@ -435,6 +435,28 @@ static int tessera_getpages_rahead_max = 16;
 SYSCTL_INT(_kern_tessera, OID_AUTO, getpages_rahead_max, CTLFLAG_RW,
     &tessera_getpages_rahead_max, 0,
     "max forward read-ahead pages per vop_getpages (0 disables)");
+/*
+ * Amortization counters (task #69 follow-up audit). The signature of the
+ * whole family of tessera perf bugs is a per-CALL cost that should have been
+ * per-RUN: getpages was found at exactly 1.00 pages/call. Ratios worth
+ * watching, all derivable from these:
+ *   gp_pages / gp_calls        pages per getpages   (was 1.00, now ~17)
+ *   pp_pages / pp_calls        pages per putpages
+ *   rd_bytes / rd_calls        bytes per vop_read
+ *   disk_rd_bytes / (rd_bytes + gp_pages*4096 + pp_pages*4096)
+ *                              READ AMPLIFICATION - disk bytes moved per
+ *                              byte actually delivered. This is the number
+ *                              that exposed #69 (hundreds of MB/s of reads
+ *                              for a trickle of progress).
+ *   blob_fetches / rd_calls    manifest+chunk fetches per read op
+ */
+static unsigned long tessera_stat_rd_calls            = 0;
+static unsigned long tessera_stat_rd_bytes            = 0;
+static unsigned long tessera_stat_pp_calls            = 0;
+static unsigned long tessera_stat_pp_pages            = 0;
+static unsigned long tessera_stat_blob_fetches        = 0;
+static unsigned long tessera_stat_disk_rd_ops         = 0;
+static unsigned long tessera_stat_disk_rd_bytes       = 0;
 static unsigned long tessera_stat_gp_calls            = 0;
 static unsigned long tessera_stat_gp_pages            = 0;
 static unsigned long tessera_stat_rr_bail_fetch       = 0;
@@ -460,6 +482,20 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, vop_write_inline,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, vop_write_chunked,
     CTLFLAG_RD, &tessera_stat_vop_write_chunked, 0,
     "vop_write completions via CHUNK_LIST manifest path");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, rd_calls, CTLFLAG_RD,
+    &tessera_stat_rd_calls, 0, "vop_read calls");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, rd_bytes, CTLFLAG_RD,
+    &tessera_stat_rd_bytes, 0, "bytes delivered by vop_read");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pp_calls, CTLFLAG_RD,
+    &tessera_stat_pp_calls, 0, "vop_putpages calls");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pp_pages, CTLFLAG_RD,
+    &tessera_stat_pp_pages, 0, "pages written by vop_putpages");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, blob_fetches, CTLFLAG_RD,
+    &tessera_stat_blob_fetches, 0, "fetch_blob_ex calls (manifest + chunk)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, disk_rd_ops, CTLFLAG_RD,
+    &tessera_stat_disk_rd_ops, 0, "pack_read_range calls (disk reads)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, disk_rd_bytes, CTLFLAG_RD,
+    &tessera_stat_disk_rd_bytes, 0, "bytes read from disk by pack_read_range");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gp_calls, CTLFLAG_RD,
     &tessera_stat_gp_calls, 0, "vop_getpages calls");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gp_pages, CTLFLAG_RD,
@@ -5168,6 +5204,9 @@ tessera_vop_read(struct vop_read_args *ap)
 	if (uio->uio_resid == 0) return (0);
 	if (tmp_->inode_tree == NULL) return (EIO);
 
+	tessera_stat_rd_calls++;
+	tessera_stat_rd_bytes += (unsigned long)uio->uio_resid;
+
 	/* If the file is actively mmap'd, flush any mmap stores into the
 	 * manifest so this read sees them (live mounts only). */
 	if (tn->snapshot_gen == 0 && tessera_vm_mapped(vp))
@@ -5701,6 +5740,9 @@ tessera_vop_putpages(struct vop_putpages_args *ap)
 	 * differs from a_count in vop_getpages which passes pages). */
 	int          npages  = ap->a_count / PAGE_SIZE;
 	int         *rtvals  = ap->a_rtvals;
+
+	tessera_stat_pp_calls++;
+	tessera_stat_pp_pages += (unsigned long)npages;
 
 	if (vp->v_type != VREG || npages <= 0) {
 		for (int i = 0; i < npages; i++) rtvals[i] = VM_PAGER_FAIL;
@@ -10467,6 +10509,9 @@ tessera_fs_pack_read_range(struct tessera_mount *tmp_,
     const tessera_pack_extent_t *exts, uint32_t nexts, uint64_t total_sectors,
     uint64_t byte_off, uint64_t len, uint8_t *dst)
 {
+	tessera_stat_disk_rd_ops++;
+	tessera_stat_disk_rd_bytes += (unsigned long)len;
+
 	/* Coalesced fast path for LARGE reads on BULK-class packs. The
 	 * per-sector bread loop below turns a 64 KiB blob into 16 synchronous
 	 * 4 KiB device round-trips; a big-file read (thousands of chunks) then
@@ -10869,6 +10914,8 @@ tessera_fs_fetch_blob_ex(struct tessera_mount *tmp_,
                       const tessera_hash_t hash, uint8_t *dst, uint64_t dst_cap,
                       uint8_t **out_buf, uint32_t *out_len)
 {
+	tessera_stat_blob_fetches++;
+
 	/* v2 step-2b: check the in-memory pending-manifest cache first.
 	 * Manifests written via publish_manifest land here without
 	 * touching disk until flush; readers in the same flush window
