@@ -428,6 +428,7 @@ static int tessera_putpages_range_enable = 1;
 SYSCTL_INT(_kern_tessera, OID_AUTO, putpages_range_enable, CTLFLAG_RW,
     &tessera_putpages_range_enable, 0,
     "use the range-scoped RMW path in vop_putpages (0 = whole-file)");
+static unsigned long tessera_stat_vop_write_range     = 0;
 static unsigned long tessera_stat_putpages_range      = 0;
 static unsigned long tessera_stat_putpages_wholefile  = 0;
 static unsigned long tessera_stat_chunk_zero_hole     = 0;
@@ -448,6 +449,9 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, vop_write_inline,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, vop_write_chunked,
     CTLFLAG_RD, &tessera_stat_vop_write_chunked, 0,
     "vop_write completions via CHUNK_LIST manifest path");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, vop_write_range,
+    CTLFLAG_RD, &tessera_stat_vop_write_range, 0,
+    "vop_write in-place overwrites served by the range-scoped RMW path");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, putpages_range,
     CTLFLAG_RD, &tessera_stat_putpages_range, 0,
     "vop_putpages served by the range-scoped RMW path");
@@ -18170,6 +18174,24 @@ tessera_vop_write_impl(struct vop_write_args *ap)
 	 * write past this bound is refused rather than risk exhausting
 	 * kernel memory; pure-append growth above it streamed through the
 	 * append fast-path above and never reaches here. */
+	/*
+	 * ★ task #68: a pure IN-PLACE overwrite (the write does not grow the
+	 * file) only touches the chunks it overlaps — take the range-scoped
+	 * path and skip materialising/re-hashing the whole file. Deliberately
+	 * ahead of the MATERIALIZE_MAX check: the range path never builds a
+	 * whole-file buffer, so an in-place overwrite of a file larger than
+	 * the cap stops being EFBIG. Falls through on ENOTSUP (INLINE,
+	 * CHUNK_TREE, chunk-tier change, odd layout).
+	 */
+	if (tessera_putpages_range_enable &&
+	    (uint64_t)final_size == ino.size &&
+	    tessera_fs_replace_range(tmp_, (uint32_t)tn->inode_no,
+	        write_off, new_bytes, (size_t)write_resid) == 0) {
+		free(new_bytes, M_TESSERA);
+		tessera_stat_vop_write_range++;
+		goto write_done;
+	}
+
 	if (final_size > TESSERA_WRITE_MATERIALIZE_MAX) {
 		free(new_bytes, M_TESSERA);
 		return (EFBIG);
@@ -18204,6 +18226,7 @@ tessera_vop_write_impl(struct vop_write_args *ap)
 	free(full, M_TESSERA);
 	if (rc != 0) return (rc);
 
+write_done:
 	/* POSIX: after a successful write, S_ISUID and S_ISGID are
 	 * cleared unless the caller has appropriate privilege. Refetch
 	 * the inode (replace_content advanced the cache copy), clear
