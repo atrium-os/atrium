@@ -5615,7 +5615,24 @@ tessera_vop_putpages(struct vop_putpages_args *ap)
 
 	uint8_t *full = malloc(new_size, M_TESSERA, M_WAITOK | M_ZERO);
 
-	if (ino.size > 0) {
+	/*
+	 * ★ task #67 follow-up: the read-back below is O(filesize) of
+	 * SYNCHRONOUS CAS/disk I/O (read_full_content → fetch_blob_ex →
+	 * pack_read_range → g_read_data → biowait) and it runs inside the
+	 * pageout path (vinactivef → vnode_pager_clean_async → putpages).
+	 * Caught live: ld.lld closing a large linked binary re-read the whole
+	 * file from disk on every page-flush, stalling the build for minutes.
+	 *
+	 * When the dirty run covers the entire file every byte of `full` is
+	 * overwritten from the pages below, so the read is pure waste — skip
+	 * it. `full` is M_ZERO, so the ONLY correctness risk is a page we
+	 * fail to map (which would leave zeros where old content belongs);
+	 * that is handled after the splice loop by filling just those holes.
+	 */
+	int skipped_read = 0;
+	int covers_all = (base_off == 0 &&
+	    (uint64_t)npages * PAGE_SIZE >= (uint64_t)new_size);
+	if (ino.size > 0 && !covers_all) {
 		uint8_t *old_buf = NULL;
 		size_t   old_len = 0;
 		if (tessera_fs_read_full_content(tmp_, &ino, &old_buf,
@@ -5624,6 +5641,8 @@ tessera_vop_putpages(struct vop_putpages_args *ap)
 			memcpy(full, old_buf, n);
 			free(old_buf, M_TESSERA);
 		}
+	} else if (ino.size > 0) {
+		skipped_read = 1;
 	}
 
 	for (int i = 0; i < npages; i++) {
@@ -5646,6 +5665,45 @@ tessera_vop_putpages(struct vop_putpages_args *ap)
 		memcpy(full + poff, (void *)sf_buf_kva(sf), pcopy);
 		sf_buf_free(sf);
 		rtvals[i] = VM_PAGER_OK;
+	}
+
+	/*
+	 * Hole repair for the skipped read-back: if any in-EOF page failed to
+	 * map above, `full` still holds zeros there. Read the old content now
+	 * and restore ONLY those ranges, so a transient sf_buf failure can
+	 * never persist zeros over live file data. (Never taken on the common
+	 * path — and on arm64 sf_buf_alloc is a direct-map handoff.)
+	 */
+	if (skipped_read) {
+		int hole = 0;
+		for (int i = 0; i < npages; i++) {
+			if (rtvals[i] == VM_PAGER_FAIL &&
+			    (size_t)base_off + (size_t)i * PAGE_SIZE < new_size) {
+				hole = 1;
+				break;
+			}
+		}
+		if (hole) {
+			uint8_t *old_buf = NULL;
+			size_t   old_len = 0;
+			if (tessera_fs_read_full_content(tmp_, &ino, &old_buf,
+			    &old_len) == 0 && old_buf != NULL) {
+				for (int i = 0; i < npages; i++) {
+					size_t poff = (size_t)base_off +
+					    (size_t)i * PAGE_SIZE;
+					if (rtvals[i] != VM_PAGER_FAIL ||
+					    poff >= new_size || poff >= old_len)
+						continue;
+					size_t pc = PAGE_SIZE;
+					if (poff + pc > new_size)
+						pc = new_size - poff;
+					if (poff + pc > old_len)
+						pc = old_len - poff;
+					memcpy(full + poff, old_buf + poff, pc);
+				}
+				free(old_buf, M_TESSERA);
+			}
+		}
 	}
 
 	int rc;
