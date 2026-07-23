@@ -1142,12 +1142,42 @@ fn apply_repairs(
             let mut nr = 0u64;
             let rc = tessera_extent_flush(ea, &mut nr);
             tessera_extent_close(ea);
-            if rc != 0 { return Err(format!("extent_flush during free-tree rebuild: rc={rc}")); }
-            new.free_extent_root = nr;
-        }
-        applied += 1;
-        if verbose {
-            eprintln!("  free-tree: rebuilt from {} free run(s)", runs.len());
+            if rc != 0 {
+                /*
+                 * BEST EFFORT. The rebuild writes a WHOLE new free-extent
+                 * btree out of the metadata-reserve bump allocator and never
+                 * reuses the sectors the old tree occupied, so its cost scales
+                 * with the number of free runs and is capped by whatever
+                 * reserve is left. On a large, churned volume that runs out
+                 * (rc=-5 TESSERA_ENOSPC observed on a 25 GiB / 63917-pack dev
+                 * root at generation 4360) — and because apply_repairs is
+                 * atomic, failing here discarded EVERY other repair with it,
+                 * making the volume unrepairable even though all its actual
+                 * problems had repair actions that had already succeeded.
+                 *
+                 * Not rebuilding the free tree only leaves space unaccounted —
+                 * the same class fsck already reports as a NOTE ("neither
+                 * allocated nor free"), not as an inconsistency. Losing space
+                 * accounting is strictly better than losing the repair, so
+                 * keep the existing tree and commit everything else.
+                 */
+                eprintln!("tessera-fsck: WARNING — free-tree rebuild skipped \
+                    (extent_flush rc={rc}); space accounting left as-is, all \
+                    other repairs still applied");
+                if rc == -5 {
+                    eprintln!("tessera-fsck:   cause is metadata-reserve \
+                        exhaustion, not a full data zone — run tessera-repack \
+                        to reclaim reserve, then re-run --repair to rebuild \
+                        the free tree");
+                }
+            } else {
+                new.free_extent_root = nr;
+                applied += 1;
+                if verbose {
+                    eprintln!("  free-tree: rebuilt from {} free run(s)",
+                        runs.len());
+                }
+            }
         }
     }
 
