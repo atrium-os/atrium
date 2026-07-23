@@ -421,6 +421,15 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, aggregation_blob_max, CTLFLAG_RW,
 static unsigned long tessera_stat_vop_write_inline    = 0;
 static unsigned long tessera_stat_vop_write_chunked   = 0;
 static unsigned long tessera_stat_chunk_dedup_skip    = 0;
+/* task #68: putpages served by the range-scoped path vs the whole-file
+ * materialise fallback — proves the fast path is actually being taken. */
+/* Knob: 0 forces the legacy whole-file materialise path (A/B + fallback). */
+static int tessera_putpages_range_enable = 1;
+SYSCTL_INT(_kern_tessera, OID_AUTO, putpages_range_enable, CTLFLAG_RW,
+    &tessera_putpages_range_enable, 0,
+    "use the range-scoped RMW path in vop_putpages (0 = whole-file)");
+static unsigned long tessera_stat_putpages_range      = 0;
+static unsigned long tessera_stat_putpages_wholefile  = 0;
 static unsigned long tessera_stat_chunk_zero_hole     = 0;
 /* Lookup-path integrity failures (inode read / dir-manifest fetch)
  * surfaced as EIO — previously silently laundered to ENOENT. */
@@ -439,6 +448,12 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, vop_write_inline,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, vop_write_chunked,
     CTLFLAG_RD, &tessera_stat_vop_write_chunked, 0,
     "vop_write completions via CHUNK_LIST manifest path");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, putpages_range,
+    CTLFLAG_RD, &tessera_stat_putpages_range, 0,
+    "vop_putpages served by the range-scoped RMW path");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, putpages_wholefile,
+    CTLFLAG_RD, &tessera_stat_putpages_wholefile, 0,
+    "vop_putpages that fell back to whole-file materialise");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, chunk_dedup_skip,
     CTLFLAG_RD, &tessera_stat_chunk_dedup_skip, 0,
     "Chunks skipped because slot's old hash already matched");
@@ -1304,6 +1319,9 @@ static int tessera_fs_chunked_prepare(struct tessera_mount *tmp_,
     uint32_t inode_no, const uint8_t *new_bytes, size_t new_len,
     struct tessera_chunk_in **out_dirty, uint32_t *out_ndirty,
     uint8_t **out_mft, size_t *out_mlen);
+/* task #68: range-scoped in-place overwrite; ENOTSUP => use whole-file path. */
+static int tessera_fs_replace_range(struct tessera_mount *tmp_,
+    uint32_t inode_no, uint64_t off, const uint8_t *buf, size_t len);
 static int tessera_fs_chunked_apply(struct tessera_mount *tmp_,
     uint32_t inode_no, struct tessera_chunk_in *dirty, uint32_t n_dirty,
     uint8_t *mft, size_t mlen, size_t new_len);
@@ -5606,13 +5624,52 @@ tessera_vop_putpages(struct vop_putpages_args *ap)
 		for (int i = 0; i < npages; i++) rtvals[i] = VM_PAGER_OK;
 		return (VM_PAGER_OK);
 	}
+	/*
+	 * ★ task #68: try the RANGE-scoped path first. The dirty pages are a
+	 * contiguous run, so this touches only the chunks they overlap —
+	 * O(run + chunk_size) instead of O(filesize) malloc + read + rehash.
+	 * Deliberately ahead of the MATERIALIZE_MAX check below: the range
+	 * path never builds a whole-file buffer, so it also lifts the 512 MiB
+	 * ceiling on mmap-writing large files. Falls through on ENOTSUP
+	 * (CHUNK_TREE, tier change, odd layout) or if a page won't map.
+	 */
+	if (tessera_putpages_range_enable &&
+	    (uint64_t)base_off < (uint64_t)new_size) {
+		size_t r_len = (size_t)npages * PAGE_SIZE;
+		if ((uint64_t)base_off + r_len > (uint64_t)new_size)
+			r_len = (size_t)((uint64_t)new_size - (uint64_t)base_off);
+		uint8_t *rb = malloc(r_len, M_TESSERA, M_WAITOK | M_ZERO);
+		int mapped_all = 1;
+		for (int i = 0; i < npages; i++) {
+			size_t poff = (size_t)i * PAGE_SIZE;
+			if (poff >= r_len) break;
+			struct sf_buf *sf = sf_buf_alloc(ma[i], 0);
+			if (sf == NULL) { mapped_all = 0; break; }
+			size_t pc = PAGE_SIZE;
+			if (poff + pc > r_len) pc = r_len - poff;
+			memcpy(rb + poff, (void *)sf_buf_kva(sf), pc);
+			sf_buf_free(sf);
+		}
+		if (mapped_all &&
+		    tessera_fs_replace_range(tmp_, (uint32_t)tn->inode_no,
+		        (uint64_t)base_off, rb, r_len) == 0) {
+			free(rb, M_TESSERA);
+			for (int i = 0; i < npages; i++) rtvals[i] = VM_PAGER_OK;
+			tessera_stat_putpages_range++;
+			tessera_fs_mark_dirty(tmp_);
+			return (VM_PAGER_OK);
+		}
+		free(rb, M_TESSERA);
+	}
+
 	if (new_size > TESSERA_WRITE_MATERIALIZE_MAX) {
-		/* putpages materialises the whole file in one contiguous
+		/* Whole-file fallback materialises the file in one contiguous
 		 * buffer; bounded by the slow-path materialise cap. */
 		for (int i = 0; i < npages; i++) rtvals[i] = VM_PAGER_FAIL;
 		return (VM_PAGER_FAIL);
 	}
 
+	tessera_stat_putpages_wholefile++;
 	uint8_t *full = malloc(new_size, M_TESSERA, M_WAITOK | M_ZERO);
 
 	/*
@@ -14632,6 +14689,216 @@ tessera_fs_chunked_prepare(struct tessera_mount *tmp_, uint32_t inode_no,
 	*out_mft    = mft;
 	*out_mlen   = mlen;
 	return (0);
+}
+
+/*
+ * ★ task #68 — RANGE-SCOPED read-modify-write.
+ *
+ * The whole-file paths (replace_content{,_chunked} via putpages / non-append
+ * overwrite) materialise the ENTIRE file into one contiguous buffer, re-read
+ * it off disk, and re-hash every chunk just to discover which ones changed.
+ * That is O(filesize) of malloc + synchronous CAS read + BLAKE3 for a change
+ * of any size, and it is capped at TESSERA_WRITE_MATERIALIZE_MAX (512 MiB).
+ *
+ * Chunks are FIXED size (tessera_chunk_size_for), and a CHUNK_LIST entry
+ * carries its chunk's own content hash — so a byte range maps to a slot range
+ * by arithmetic, an untouched slot can be re-emitted verbatim (no read, no
+ * hash), and a touched slot's old bytes are one fetch_blob() away. Cost
+ * becomes O(range + chunk_size) instead of O(filesize).
+ *
+ * Overwrites [off, off+len) in place; the file size never changes. Returns
+ * ENOTSUP (caller falls back to the whole-file path) unless every
+ * precondition holds: existing CHUNK_LIST manifest at the current chunk
+ * size, slot i at exactly i*cs, in-bounds range, fanout not exceeded.
+ */
+static int
+tessera_fs_replace_range_inner(struct tessera_mount *tmp_, uint32_t inode_no,
+    uint64_t off, const uint8_t *buf, size_t len)
+{
+	uint8_t key[4];
+	tessera_inode_record_t ino;
+
+	if (len == 0)
+		return (0);
+	encode_inode_key(inode_no, key);
+	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
+		return (EIO);
+
+	const uint64_t fsize = ino.size;
+	if (fsize == 0 || off + (uint64_t)len > fsize)
+		return (ENOTSUP);		/* size-changing → slow path */
+
+	const uint32_t cs = tessera_chunk_size_for(tmp_, fsize);
+	const uint64_t n64 = (fsize + cs - 1) / cs;
+	if (n64 > TESSERA_CHUNK_TREE_FANOUT)
+		return (ENOTSUP);		/* CHUNK_TREE → slow path */
+	const uint32_t n_chunks = (uint32_t)n64;
+
+	/* Snapshot the old CHUNK_LIST: hash + flags per slot. */
+	tessera_hash_t *ohash = NULL;
+	uint32_t *oflags = NULL;
+	{
+		int has_old = 0;
+		for (size_t i = 0; i < TESSERA_HASH_SIZE; i++)
+			if (ino.manifest_hash[i] != 0) { has_old = 1; break; }
+		if (!has_old)
+			return (ENOTSUP);
+		uint8_t *omft = NULL; uint32_t omlen = 0;
+		if (tessera_fs_fetch_blob(tmp_, ino.manifest_hash, &omft,
+		    &omlen) != 0 || omft == NULL)
+			return (ENOTSUP);
+		tessera_manifest_parser_t *p =
+		    tessera_manifest_parse(omft, omlen);
+		int ok = (p != NULL &&
+		    tessera_manifest_parser_kind(p) == TESSERA_MFT_CHUNK_LIST &&
+		    tessera_manifest_parser_count(p) == n_chunks);
+		if (ok) {
+			ohash = malloc(n_chunks * sizeof *ohash, M_TESSERA,
+			    M_WAITOK | M_ZERO);
+			oflags = malloc(n_chunks * sizeof *oflags, M_TESSERA,
+			    M_WAITOK | M_ZERO);
+			for (uint32_t i = 0; i < n_chunks && ok; i++) {
+				tessera_chunk_record_t cr;
+				if (tessera_manifest_chunk_at(p, i, &cr)
+				    != TESSERA_OK ||
+				    cr.logical_offset != (uint64_t)i * cs) {
+					ok = 0; break;	/* unexpected layout */
+				}
+				memcpy(ohash[i], cr.chunk_hash, sizeof ohash[i]);
+				oflags[i] = cr.flags;
+			}
+		}
+		if (p != NULL) tessera_manifest_parser_free(p);
+		free(omft, M_TESSERA);
+		if (!ok) {
+			if (ohash) free(ohash, M_TESSERA);
+			if (oflags) free(oflags, M_TESSERA);
+			return (ENOTSUP);
+		}
+	}
+
+	const uint32_t first = (uint32_t)(off / cs);
+	const uint32_t last  = (uint32_t)((off + len - 1) / cs);
+	const uint32_t n_aff = last - first + 1;
+
+	struct tessera_chunk_in *dirty = malloc(n_aff * sizeof *dirty,
+	    M_TESSERA, M_WAITOK | M_ZERO);
+	uint8_t **cbufs = malloc(n_aff * sizeof *cbufs, M_TESSERA,
+	    M_WAITOK | M_ZERO);
+	uint32_t n_dirty = 0;
+	int rc = 0;
+
+	tessera_manifest_builder_t *mb =
+	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_CHUNK_LIST);
+	if (mb == NULL) { rc = ENOMEM; goto out; }
+
+	for (uint32_t i = 0; i < n_chunks; i++) {
+		const uint64_t soff = (uint64_t)i * cs;
+		const uint32_t slen = (soff + cs <= fsize) ? cs
+		    : (uint32_t)(fsize - soff);
+
+		if (i < first || i > last) {
+			/* Untouched slot: re-emit verbatim. No read, no hash —
+			 * this is where the O(filesize) work disappears. */
+			if (tessera_manifest_add_chunk(mb, ohash[i], soff, slen,
+			    oflags[i]) != TESSERA_OK) { rc = ENOMEM; goto out; }
+			continue;
+		}
+
+		/* Touched slot: materialise just this chunk. */
+		uint8_t *cb = malloc(slen, M_TESSERA, M_WAITOK | M_ZERO);
+		cbufs[i - first] = cb;
+		const uint64_t ov_s = soff > off ? soff : off;
+		const uint64_t ov_e = (soff + slen) < (off + len)
+		    ? (soff + slen) : (off + len);
+		if (!(ov_s == soff && ov_e == soff + slen)) {
+			/* Partially covered — need the old bytes. One blob
+			 * fetch for THIS chunk (at most the head/tail slots). */
+			if (oflags[i] & TESSERA_CHUNK_FLAG_ZERO_HOLE) {
+				/* already zeroed by M_ZERO */
+			} else {
+				uint8_t *ob = NULL; uint32_t ol = 0;
+				if (tessera_fs_fetch_blob(tmp_, ohash[i], &ob,
+				    &ol) != 0 || ob == NULL) {
+					rc = ENOTSUP; goto out;
+				}
+				memcpy(cb, ob, ol < slen ? ol : slen);
+				free(ob, M_TESSERA);
+			}
+		}
+		memcpy(cb + (ov_s - soff), buf + (ov_s - off),
+		    (size_t)(ov_e - ov_s));
+
+		int all_zero = 1;
+		for (uint32_t j = 0; j < slen; j++)
+			if (cb[j] != 0) { all_zero = 0; break; }
+		if (all_zero) {
+			tessera_hash_t zh;
+			memset(zh, 0, sizeof zh);
+			if (tessera_manifest_add_chunk(mb, zh, soff, slen,
+			    TESSERA_CHUNK_FLAG_ZERO_HOLE) != TESSERA_OK) {
+				rc = ENOMEM; goto out;
+			}
+			tessera_stat_chunk_zero_hole++;
+			continue;
+		}
+		tessera_hash_t h;
+		TESSERA_MP_HASH(tmp_, cb, slen, h);
+		if (tessera_manifest_add_chunk(mb, h, soff, slen, 0)
+		    != TESSERA_OK) { rc = ENOMEM; goto out; }
+		if (!(oflags[i] & TESSERA_CHUNK_FLAG_ZERO_HOLE) &&
+		    memcmp(h, ohash[i], TESSERA_HASH_SIZE) == 0) {
+			tessera_stat_chunk_dedup_skip++;
+			continue;		/* unchanged — already on disk */
+		}
+		dirty[n_dirty].bytes = cb;
+		dirty[n_dirty].len   = slen;
+		memcpy(dirty[n_dirty].hash, h, sizeof h);
+		n_dirty++;
+	}
+
+	{
+		size_t mlen = 0;
+		tessera_hash_t mhash;
+		(void)tessera_manifest_finalize(mb, NULL, 0, &mlen, mhash);
+		uint8_t *mft = malloc(mlen, M_TESSERA, M_WAITOK);
+		if (tessera_manifest_finalize(mb, mft, mlen, &mlen, mhash)
+		    != TESSERA_OK) {
+			free(mft, M_TESSERA);
+			rc = EIO; goto out;
+		}
+		tessera_manifest_free(mb); mb = NULL;
+		/* apply consumes dirty+mft; size is unchanged. */
+		rc = tessera_fs_chunked_apply(tmp_, inode_no, dirty, n_dirty,
+		    mft, mlen, (size_t)fsize);
+		dirty = NULL;
+	}
+out:
+	if (mb != NULL) tessera_manifest_free(mb);
+	if (dirty != NULL) free(dirty, M_TESSERA);
+	if (cbufs != NULL) {
+		for (uint32_t i = 0; i < n_aff; i++)
+			if (cbufs[i] != NULL) free(cbufs[i], M_TESSERA);
+		free(cbufs, M_TESSERA);
+	}
+	free(ohash, M_TESSERA);
+	free(oflags, M_TESSERA);
+	return (rc);
+}
+
+/* Gated wrapper — publish + inode repoint must serialise against a flush's
+ * commit_sb, same contract as tessera_fs_replace_content_chunked. The gate
+ * is re-entrant for the owning thread, so callers already holding it are
+ * fine. */
+static int
+tessera_fs_replace_range(struct tessera_mount *tmp_, uint32_t inode_no,
+    uint64_t off, const uint8_t *buf, size_t len)
+{
+	int gated = tmp_->flush_mtx_init;
+	if (gated) tessera_fs_flush_gate_enter(tmp_);
+	int rc = tessera_fs_replace_range_inner(tmp_, inode_no, off, buf, len);
+	if (gated) tessera_fs_flush_gate_exit(tmp_);
+	return (rc);
 }
 
 /* APPLY half: publish the dirty chunks + manifest and repoint the
