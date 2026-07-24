@@ -10718,6 +10718,36 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	uint64_t r_fext  = tmp_->sb.free_extent_root;
 	uint64_t r_snap  = tmp_->sb.snapshots_root;
 	uint64_t r_bidx  = tmp_->sb.blob_index_root;
+	/*
+	 * ★ tasks #72/#78: pin the data-zone GC's FROZEN roots for as long as
+	 * its scan is running.
+	 *
+	 * The ungated GC scan walks btrees opened at roots frozen at
+	 * activation. Those roots are superseded almost immediately by
+	 * ongoing commits, so without a pin the recycler hands their sectors
+	 * back out mid-scan and the walk reads a reused node — which the #66
+	 * rule (correctly) turns into "abort, reclaim nothing".
+	 *
+	 * That was designed as a benign degradation. It is not benign at
+	 * scale: on the 25 GiB dev root under buildkernel, ALL EIGHT GC passes
+	 * aborted this way after collecting 396k-425k live hashes each, so
+	 * gc_reclaimed stayed 0 while the data zone filled to 100% and the
+	 * build died with ENOSPC. The reclaim never got to run.
+	 *
+	 * Made worse by ed8b26a: pressure-driven reclaim advances the
+	 * watermark far more often, which is exactly what frees superseded
+	 * roots sooner. The two fixes interact.
+	 *
+	 * Same remedy as #64 for blob_index_tree — if a tree is being walked,
+	 * the pin bitmap has to know about it. Reading the fields here is safe:
+	 * they are published under the gate at activation, and we hold it.
+	 */
+	uint64_t r_gc_inode = 0, r_gc_reg = 0, r_gc_snap = 0;
+	if (tmp_->gc_scan_active) {
+		r_gc_inode = tmp_->gc_scan_inode_root;
+		r_gc_reg   = tmp_->gc_scan_registry_root;
+		r_gc_snap  = tmp_->gc_scan_snapshots_root;
+	}
 	tmp_->pinscan_active = 1;
 	tessera_fs_flush_gate_exit(tmp_);
 
@@ -10727,7 +10757,7 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	    &tmp_->pinscan_abort };
 	int aborted = 0;
 
-	struct { uint64_t root; int kind; uint32_t ksz; uint32_t vsz; } roots[5] = {
+	struct { uint64_t root; int kind; uint32_t ksz; uint32_t vsz; } roots[8] = {
 		{ r_inode, 0, 4, TESSERA_INODE_RECORD_SIZE },
 		{ r_reg,   1, 16, TESSERA_REGISTRY_ENTRY_SIZE },
 		{ r_fext,  2, 8, 8 },
@@ -10737,8 +10767,14 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 		 * the index self-destructing on the dev root). */
 		{ r_bidx,  TESSERA_BTREE_KIND_BLOB_INDEX,
 		    TESSERA_BLOB_INDEX_KEY_SIZE, TESSERA_BLOB_INDEX_VAL_SIZE },
+		/* ★ #72/#78: the in-flight GC scan's frozen roots. Zero when no
+		 * scan is running, and a zero root is skipped below. Shared COW
+		 * nodes are marked once — walking them twice is idempotent. */
+		{ r_gc_inode, 0, 4, TESSERA_INODE_RECORD_SIZE },
+		{ r_gc_reg,   1, 16, TESSERA_REGISTRY_ENTRY_SIZE },
+		{ r_gc_snap,  3, 8, TESSERA_SNAPSHOT_RECORD_SIZE },
 	};
-	for (int i = 0; i < 5 && !aborted; i++) {
+	for (int i = 0; i < 8 && !aborted; i++) {
 		if (roots[i].root == 0) continue;
 		tessera_btree_t *t = tessera_btree_open(&tmp_->meta_bio,
 		    roots[i].root, roots[i].kind, roots[i].ksz, roots[i].vsz);
