@@ -913,6 +913,8 @@ static void tessera_fs_gc_note_hash_slow(struct tessera_mount *tmp_,
     const tessera_hash_t h);
 static void tessera_fs_gc_note_hash_locked(struct tessera_mount *tmp_,
     const tessera_hash_t h);
+static __inline void tessera_fs_gc_note_hash(struct tessera_mount *tmp_,
+    const tessera_hash_t h);
 static void tessera_fs_gc_task(void *ctx, int pending);
 static void tessera_fs_gc_arm(struct tessera_mount *tmp_);
 static void tessera_fs_seed_constant_manifests(struct tessera_mount *tmp_);
@@ -1770,6 +1772,21 @@ struct tessera_mount {
 	 * bitmap. A stale set bit is harmless (conservative). */
 	uint8_t                  *gc_touch_bm;
 #define TESSERA_GC_TOUCH_BITS   (2u * 1024u * 1024u)   /* 256 KiB */
+	/* ★ task #79: seqlock over the GC apply phase.
+	 *
+	 * The touch filter covers the SCAN, but not the apply itself: a
+	 * publisher can interleave as test(P) -> note(P) -> get(P) ->
+	 * delete(P), dedup-hitting a pack that apply is about to free. Odd
+	 * = an apply is in progress. A publisher samples this alongside its
+	 * barrier note, does the registry lookup, and re-samples; a hit is
+	 * only honoured if the generation is unchanged AND even. Same
+	 * optimistic-retry shape as ckpt_gen and pack_reloc_gen.
+	 *
+	 * WRITTEN under flush_mtx, READ lock-free (a plain seqlock). The
+	 * dedup pre-check is a hot path — it already dominated per-op cost
+	 * before the pack_registry pre-check was made skippable — so the
+	 * guard must not add mutex round-trips to it. */
+	volatile uint64_t         gc_apply_gen;
 	uint8_t                  *meta_pin_bitmap;
 	size_t                    meta_pin_bitmap_bytes;
 
@@ -2094,6 +2111,87 @@ tessera_fs_registry_get(struct tessera_mount *tmp_,
 	}
 	return (tessera_btree_get(tmp_->pack_registry_tree, pack_id,
 	    out_value));
+}
+
+/*
+ * ★ task #79: the registry lookup a PUBLISH-DEDUP pre-check must use.
+ *
+ * A dedup hit means "this pack is already on disk, write nothing" — the
+ * publisher then stamps an inode with the hash. That is a NEW reference
+ * created with no trace anywhere, so it races the GC apply phase:
+ *
+ *   gc apply:   test(P) -> untouched
+ *   publisher:  note(P)              [too late, apply already tested]
+ *   publisher:  get(P)  -> HIT
+ *   gc apply:   delete(P) + extent_free(P)
+ *
+ * and the inode is left pointing at a pack that no longer exists. Every
+ * other interleaving is already safe: a note before the test spares P
+ * via the touch filter, and a delete before the get MISSES, so the
+ * publisher simply republishes P correctly.
+ *
+ * So: sample the apply generation in the same flush_mtx section as the
+ * barrier note, do the lookup, re-sample. Honour the hit only if the
+ * generation is unchanged and even (no apply in progress).
+ *
+ * On a straddle, RETRY — do not fall through and publish. The apply has
+ * already captured its delete list, so a fresh btree_put of that same
+ * pack_id would just be deleted behind us. The wait is bounded: the
+ * apply phase does no data-zone reads and is sized by dead_count.
+ */
+static int
+tessera_fs_registry_get_stable(struct tessera_mount *tmp_,
+    const uint8_t *pack_id, void *out_value, const tessera_hash_t note_hash)
+{
+	uint64_t g0, g1;
+	int rc;
+
+	if (!tmp_->flush_mtx_init)
+		return (tessera_fs_registry_get(tmp_, pack_id, out_value));
+
+	/*
+	 * If we already hold the gate, an apply CANNOT be in progress —
+	 * apply holds the gate too, and it is not us (the GC thread does
+	 * not publish). Waiting here would therefore be waiting on
+	 * ourselves. Gated drain paths publish constantly, so this is the
+	 * common case, not a corner: take the plain lookup.
+	 */
+	if (tmp_->flush_gate_owner == curthread)
+		return (tessera_fs_registry_get(tmp_, pack_id, out_value));
+
+	for (;;) {
+		/* Barrier note (inline, no lock taken when no scan is
+		 * running), then the seqlock read. Both sides are plain
+		 * atomic loads, so the common case — no GC anywhere near —
+		 * costs nothing beyond the lookup itself. */
+		if (note_hash != NULL)
+			tessera_fs_gc_note_hash(tmp_, note_hash);
+
+		g0 = atomic_load_acq_64(&tmp_->gc_apply_gen);
+		if ((g0 & 1) != 0) {
+			/* Already inside an apply. Wait it out rather than
+			 * run a lookup whose answer must be discarded. */
+			mtx_lock(&tmp_->flush_mtx);
+			while ((tmp_->gc_apply_gen & 1) != 0)
+				(void)msleep(__DEVOLATILE(void *,
+				    &tmp_->gc_apply_gen), &tmp_->flush_mtx,
+				    PRIBIO, "tessgca", hz);
+			mtx_unlock(&tmp_->flush_mtx);
+			continue;
+		}
+
+		rc = tessera_fs_registry_get(tmp_, pack_id, out_value);
+		if (rc != TESSERA_OK)
+			return (rc);   /* a MISS is always safe to act on */
+
+		g1 = atomic_load_acq_64(&tmp_->gc_apply_gen);
+		if (g0 == g1)
+			return (TESSERA_OK);
+		/* An apply straddled the lookup — the hit is untrustworthy.
+		 * g0 even and g0 == g1 together prove no apply began, ran, or
+		 * finished across it (a completed apply advances the counter
+		 * by two, so it cannot alias). */
+	}
 }
 
 /* Flush-side: sorted-batch-put the overlay into the registry btree
@@ -12294,6 +12392,22 @@ next_p:
 		tessera_fs_flush_gate_enter(tmp_);
 
 	/*
+	 * ★ task #79: open the apply window (generation -> odd) BEFORE the
+	 * liveness test, so it spans test-through-free. A publisher whose
+	 * registry lookup overlaps this window cannot trust the result and
+	 * retries. Done for the gated callers too: they exclude other
+	 * flushes, but NOT the ungated Option-C publishers, which race the
+	 * apply exactly the same way.
+	 */
+	mtx_lock(&tmp_->flush_mtx);
+	atomic_store_rel_64(&tmp_->gc_apply_gen, tmp_->gc_apply_gen + 1);
+	KASSERT((tmp_->gc_apply_gen & 1) == 1,
+	    ("tessera gc_apply_gen %ju is even after opening the apply "
+	     "window — unbalanced apply bracket",
+	     (uintmax_t)tmp_->gc_apply_gen));
+	mtx_unlock(&tmp_->flush_mtx);
+
+	/*
 	 * SATB filter. The scan decided "dead" from a view frozen at
 	 * activation; a writer may have published or re-referenced any of
 	 * these since. Drop those candidates — they are reclaimed by a
@@ -12404,6 +12518,19 @@ next_p:
 		(void)tessera_commit_sb(tmp_);
 		printf("tessera_fs: gc post commit_sb\n");
 	}
+	/* ★ #79: close the apply window. Must be AFTER commit_extent /
+	 * commit_sb — the freed sectors only become reusable once the
+	 * allocator deltas are committed, so that is the true end of the
+	 * span a publisher must not have straddled. */
+	mtx_lock(&tmp_->flush_mtx);
+	atomic_store_rel_64(&tmp_->gc_apply_gen, tmp_->gc_apply_gen + 1);
+	KASSERT((tmp_->gc_apply_gen & 1) == 0,
+	    ("tessera gc_apply_gen %ju is odd after closing the apply "
+	     "window — unbalanced apply bracket",
+	     (uintmax_t)tmp_->gc_apply_gen));
+	wakeup(__DEVOLATILE(void *, &tmp_->gc_apply_gen));
+	mtx_unlock(&tmp_->flush_mtx);
+
 	if (concurrent)
 		tessera_fs_flush_gate_exit(tmp_);
 	tessera_stat_gc_reclaimed += dead_count;
@@ -12549,8 +12676,10 @@ tessera_fs_publish_manifest_owned_ex(struct tessera_mount *tmp_,
 		uint8_t pack_id_local[16];
 		memcpy(pack_id_local, out_hash, 16);
 		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
-		if (tessera_fs_registry_get(tmp_,
-		    pack_id_local, reg_value) == TESSERA_OK) {
+		/* #79: apply-phase-safe lookup — a dedup hit creates a new
+		 * reference that is recorded nowhere else. */
+		if (tessera_fs_registry_get_stable(tmp_,
+		    pack_id_local, reg_value, out_hash) == TESSERA_OK) {
 			tessera_stat_publish_dedup_manifest++;
 			return (0);
 		}
@@ -12601,8 +12730,8 @@ tessera_fs_publish_manifest_owned_move(struct tessera_mount *tmp_,
 		uint8_t pack_id_local[16];
 		memcpy(pack_id_local, out_hash, 16);
 		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
-		if (tessera_fs_registry_get(tmp_,
-		    pack_id_local, reg_value) == TESSERA_OK) {
+		if (tessera_fs_registry_get_stable(tmp_,
+		    pack_id_local, reg_value, out_hash) == TESSERA_OK) {
 			TPROF_ADD(TPROF_C_PRECHK, _tc);
 			tessera_stat_publish_dedup_manifest++;
 			free(manifest_bytes, M_TESSERA);
@@ -14039,8 +14168,8 @@ tessera_fs_publish_chunked(struct tessera_mount *tmp_,
 	 * each chunk's content stops changing. */
 	{
 		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
-		if (tessera_fs_registry_get(tmp_,
-		    pack_id, reg_value) == TESSERA_OK) {
+		if (tessera_fs_registry_get_stable(tmp_,
+		    pack_id, reg_value, out_manifest_hash) == TESSERA_OK) {
 			tessera_stat_publish_dedup_chunked++;
 			return (0);
 		}
@@ -14100,10 +14229,14 @@ tessera_fs_publish_chunked(struct tessera_mount *tmp_,
 		uint8_t batch_pack_id[16];
 		memcpy(batch_pack_id, batch_h, 16);
 
-		/* Skip the write if this exact batch is already on disk. */
+		/* Skip the write if this exact batch is already on disk.
+		 * #79: same hazard as any other dedup hit — skipping the
+		 * write while the apply phase frees that batch's pack loses
+		 * the chunks. The generation guard is what closes it; the
+		 * chunk hashes themselves were noted at function entry. */
 		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
-		if (tessera_fs_registry_get(tmp_,
-		    batch_pack_id, reg_value) != TESSERA_OK) {
+		if (tessera_fs_registry_get_stable(tmp_,
+		    batch_pack_id, reg_value, uniq[first].hash) != TESSERA_OK) {
 			rc = tessera_fs_emit_chunk_pack(tmp_, batch_pack_id,
 			    &uniq[first], batch_n, NULL, 0, NULL);
 			if (rc != 0) break;
