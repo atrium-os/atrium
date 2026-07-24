@@ -459,6 +459,30 @@ static unsigned long tessera_stat_disk_rd_ops         = 0;
 static unsigned long tessera_stat_disk_rd_bytes       = 0;
 /* Dirents whose target inode has no record — corrupt directory, lookup
  * returns ENOENT instead of minting a typeless vnode (task #76). */
+/* Meta-reserve drain visibility (task #74). The reserve refills because
+ * released sectors pile up in meta_pending instead of reaching meta_free;
+ * these mirror the live state so the ratio is observable. */
+static unsigned long tessera_stat_meta_watermark      = 0;
+static unsigned long tessera_stat_meta_pending_now    = 0;
+static unsigned long tessera_stat_meta_free_now       = 0;
+static unsigned long tessera_stat_drain_keep          = 0;
+static unsigned long tessera_stat_drain_release       = 0;
+static unsigned long tessera_stat_drain_calls         = 0;
+static unsigned long tessera_stat_pinscan_swaps       = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, meta_watermark, CTLFLAG_RD,
+    &tessera_stat_meta_watermark, 0, "pin watermark (sector) at last drain");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, meta_pending_now, CTLFLAG_RD,
+    &tessera_stat_meta_pending_now, 0, "meta_pending_count at last drain");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, meta_free_now, CTLFLAG_RD,
+    &tessera_stat_meta_free_now, 0, "meta_free_count at last drain");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, drain_keep, CTLFLAG_RD,
+    &tessera_stat_drain_keep, 0, "sectors kept pinned by the drain");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, drain_release, CTLFLAG_RD,
+    &tessera_stat_drain_release, 0, "sectors released to meta_free");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, drain_calls, CTLFLAG_RD,
+    &tessera_stat_drain_calls, 0, "meta_pending_drain calls");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_swaps, CTLFLAG_RD,
+    &tessera_stat_pinscan_swaps, 0, "pinscan bitmap swaps (watermark advances)");
 static unsigned long tessera_stat_lookup_no_inode     = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_no_inode, CTLFLAG_RD,
     &tessera_stat_lookup_no_inode, 0,
@@ -1594,6 +1618,21 @@ struct tessera_mount {
 	uint64_t                 *meta_free;
 	uint32_t                  meta_free_count;
 	uint32_t                  meta_free_cap;
+	/*
+	 * Sectors handed out FROM meta_free while a pinscan is running
+	 * (task #74). The scan's swap wipes and re-synthesises meta_free from
+	 * the fresh bitmap, so a sector reused mid-scan would be re-added and
+	 * then allocated a SECOND time — two btree nodes on one sector. That
+	 * hazard is why reuse used to be disabled for the whole scan, which
+	 * starved the allocator: under build load a scan is nearly always
+	 * active, so every allocation was forced to the bump and the reserve
+	 * hit its ceiling with 386k sectors sitting free. Recording the
+	 * scan-window reuses lets the swap mark them so synthesis skips them,
+	 * exactly as it already does for meta_pending.
+	 */
+	uint64_t                 *meta_scanwin;
+	uint32_t                  meta_scanwin_count;
+	uint32_t                  meta_scanwin_cap;
 	uint64_t                 *meta_pending;
 	uint32_t                  meta_pending_count;
 	uint32_t                  meta_pending_cap;
@@ -2288,17 +2327,23 @@ tessera_fs_meta_pending_drain(struct tessera_mount *tmp_)
 		}
 		if (pinned) {
 			tmp_->meta_pending[kept++] = s;
+			tessera_stat_drain_keep++;
 			tessera_metatrace(TM_OP_DRAIN_KEEP, s,
 			    tmp_->sb.generation, kept);
 		} else if (tmp_->meta_free_count
 		    < tmp_->meta_free_cap) {
 			tmp_->meta_free[tmp_->meta_free_count++] = s;
+			tessera_stat_drain_release++;
 			tessera_metatrace(TM_OP_DRAIN_RELEASE, s,
 			    tmp_->sb.generation,
 			    tmp_->meta_free_count);
 		}
 	}
 	tmp_->meta_pending_count = kept;
+	tessera_stat_drain_calls++;
+	tessera_stat_meta_watermark   = (unsigned long)tmp_->meta_pin_watermark;
+	tessera_stat_meta_pending_now = tmp_->meta_pending_count;
+	tessera_stat_meta_free_now    = tmp_->meta_free_count;
 }
 
 static int
@@ -2308,10 +2353,32 @@ tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 	struct tessera_mount   *tmp_ = k->mount;
 	if (tmp_ == NULL) return (-1);
 	if (n != 1) return (-1);
-	/* Prefer recycled sectors (released by a prior commit cycle's
-	 * post-success drain) before pushing the bump pointer forward. */
-	if (!tmp_->pinscan_active && tmp_->meta_free_count > 0) {
+	/*
+	 * Prefer recycled sectors (released by a prior commit cycle's
+	 * post-success drain) before pushing the bump pointer forward.
+	 *
+	 * Reuse is allowed even while a pinscan runs (task #74). It used to be
+	 * disabled for the whole scan because the scan's swap wipes and
+	 * re-synthesises meta_free from the fresh bitmap, so a sector reused
+	 * mid-scan would be re-added and handed out a second time. But under
+	 * build load a scan is active almost continuously, so that gate forced
+	 * every allocation to the bump and the reserve hit its ceiling while
+	 * hundreds of thousands of sectors sat free — measured:
+	 *   meta_reserve EXHAUSTED — used=408544 of 408544, free_count=386105
+	 * with the allocator failing 1088 times.
+	 *
+	 * Instead, record each scan-window reuse; the swap marks those sectors
+	 * in the scratch bitmap so synthesis skips them, the same trick already
+	 * used for meta_pending. If the record fills up we fall through to the
+	 * bump, which is always safe.
+	 */
+	if (tmp_->meta_free_count > 0 &&
+	    (!tmp_->pinscan_active ||
+	     tmp_->meta_scanwin_count < tmp_->meta_scanwin_cap)) {
 		*out_sector = tmp_->meta_free[--tmp_->meta_free_count];
+		if (tmp_->pinscan_active && tmp_->meta_scanwin != NULL)
+			tmp_->meta_scanwin[tmp_->meta_scanwin_count++] =
+			    *out_sector;
 		tessera_metatrace(TM_OP_ALLOC_REUSE, *out_sector,
 		    tmp_->sb.generation, tmp_->meta_free_count);
 		return (0);
@@ -2759,10 +2826,13 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	/* Meta-reserve recycler buffers. Sized to the entire reserve so
 	 * we can never overflow on push. */
 	tmp_->meta_free_cap     = (uint32_t)tmp_->sb.meta_reserve_length;
+	tmp_->meta_scanwin_cap  = (uint32_t)tmp_->sb.meta_reserve_length;
 	tmp_->meta_pending_cap  = (uint32_t)tmp_->sb.meta_reserve_length;
 	tmp_->meta_free    = malloc(tmp_->meta_free_cap    * sizeof(uint64_t),
 	    M_TESSERA, M_WAITOK | M_ZERO);
 	tmp_->meta_pending = malloc(tmp_->meta_pending_cap * sizeof(uint64_t),
+	    M_TESSERA, M_WAITOK | M_ZERO);
+	tmp_->meta_scanwin = malloc(tmp_->meta_scanwin_cap * sizeof(uint64_t),
 	    M_TESSERA, M_WAITOK | M_ZERO);
 
 	/* v2-step-2a: deferred-commit infrastructure. Initialise BEFORE
@@ -2881,6 +2951,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 			    "open failed\n", (unsigned long)requested_gen);
 			free(tmp_->meta_free,    M_TESSERA);
 			free(tmp_->meta_pending, M_TESSERA);
+			free(tmp_->meta_scanwin, M_TESSERA);
 			if (tmp_->bio_ctx.cred != NULL)
 				crfree(tmp_->bio_ctx.cred);
 			free(tmp_, M_TESSERA);
@@ -2897,6 +2968,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 			    (unsigned long)requested_gen);
 			free(tmp_->meta_free,    M_TESSERA);
 			free(tmp_->meta_pending, M_TESSERA);
+			free(tmp_->meta_scanwin, M_TESSERA);
 			if (tmp_->bio_ctx.cred != NULL)
 				crfree(tmp_->bio_ctx.cred);
 			free(tmp_, M_TESSERA);
@@ -3631,6 +3703,7 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			tessera_btree_close(tmp_->inode_tree);
 		if (tmp_->meta_free       != NULL) free(tmp_->meta_free, M_TESSERA);
 		if (tmp_->meta_pending    != NULL) free(tmp_->meta_pending, M_TESSERA);
+		if (tmp_->meta_scanwin    != NULL) free(tmp_->meta_scanwin, M_TESSERA);
 		if (tmp_->meta_pin_bitmap != NULL) free(tmp_->meta_pin_bitmap, M_TESSERA);
 		/* Drain any still-dirty buffers on devvp BEFORE detaching
 		 * the GEOM consumer. tessera_kbio_write_delayed uses
@@ -10317,6 +10390,7 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 		    (long)((sbinuptime() - _ps0) / SBT_1MS));
 		free(scratch, M_TESSERA);
 		tmp_->pinscan_active = 0;
+		tmp_->meta_scanwin_count = 0;
 		return;
 	}
 
@@ -10329,6 +10403,7 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	 * watermark would re-expose sectors it never saw. */
 	if (bump0 < tmp_->meta_pin_watermark) {
 		tmp_->pinscan_active = 0;
+		tmp_->meta_scanwin_count = 0;
 		tessera_fs_flush_gate_exit(tmp_);
 		free(scratch, M_TESSERA);
 		printf("tessera_fs: pinscan superseded (stale)\n");
@@ -10339,6 +10414,7 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	 * window [bump0, bump1) and all future allocations until the next
 	 * swap. No explicit bit-setting needed. */
 	tmp_->meta_pin_watermark = bump0;
+	tessera_stat_pinscan_swaps++;
 	/* CRITICAL: sectors currently in meta_pending are unreachable
 	 * from every root (that is why they were freed), so the scan
 	 * left them unmarked — but they must enter meta_free ONLY via
@@ -10363,6 +10439,23 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 			}
 		}
 	}
+	/*
+	 * Sectors handed out from meta_free DURING this scan (task #74) are in
+	 * use now, but this scan judged reachability from older roots and never
+	 * saw them. Mark them so the synthesis below does not re-add them —
+	 * re-adding would hand the same sector to a second btree node. Unlike
+	 * the meta_pending marks these are NOT cleared afterwards: the sectors
+	 * are genuinely live until a later scan observes them.
+	 */
+	for (uint32_t i = 0; i < tmp_->meta_scanwin_count; i++) {
+		uint64_t ws = tmp_->meta_scanwin[i];
+		if (ws >= mstart && ws < mstart + mlen) {
+			uint64_t bit = ws - mstart;
+			scratch[bit / 8] |= (uint8_t)(1u << (bit % 8));
+		}
+	}
+	tmp_->meta_scanwin_count = 0;
+
 	free(tmp_->meta_pin_bitmap, M_TESSERA);
 	tmp_->meta_pin_bitmap = scratch;
 	tmp_->meta_free_count = 0;
