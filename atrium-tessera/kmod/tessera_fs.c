@@ -883,7 +883,6 @@ static void tessera_fs_pinscan_task(void *ctx, int pending);
 static void tessera_fs_pinscan_run(struct tessera_mount *tmp_);
 static void tessera_fs_meta_pending_drain(struct tessera_mount *tmp_);
 static int tessera_fs_gc_data_zone(struct tessera_mount *tmp_);
-static int tessera_fs_gc_data_zone_inner(struct tessera_mount *tmp_);
 static void tessera_fs_seed_constant_manifests(struct tessera_mount *tmp_);
 static int tessera_vop_lookup_impl(struct vop_cachedlookup_args *ap);
 static int tessera_vop_create_impl(struct vop_create_args *ap);
@@ -1811,18 +1810,6 @@ struct tessera_mount {
 	LIST_HEAD(, tessera_dirty_content) dirty_content[TESSERA_DIRTY_CONTENT_BUCKETS];
 	size_t                    dirty_content_bytes; /* sum of size across all */
 
-	/*
-	 * Thread currently running tessera_fs_gc_data_zone() (task #72).
-	 * The GC runs INSIDE tessera_fs_flush with the flush gate held, so any
-	 * blocking buffer acquisition it performs can deadlock: GC holds the
-	 * gate plus a buffer and waits for a second buffer, while that buffer's
-	 * owner is a writer waiting on the gate. Reads issued by THIS thread
-	 * take the buffer lock non-blocking and fail rather than sleep; the
-	 * failure feeds the existing gc_walk_abort path, which reclaims nothing
-	 * (over-retention is always safe). Per-thread, not per-mount, so a
-	 * concurrent ungated reader never gets a spurious EIO.
-	 */
-	struct thread           *gc_td;
 	/* CAS read cache (see struct tessera_cas_cache + cas_cache_plan.md). */
 	struct tessera_cas_cache cas_cache;
 
@@ -8947,6 +8934,14 @@ static void
 tessera_fs_flush_gate_exit(struct tessera_mount *tmp_)
 {
 	mtx_lock(&tmp_->flush_mtx);
+	/* task #72: an exit without a matching enter corrupts the depth and
+	 * releases a gate this thread never held. */
+	KASSERT(tmp_->flush_gate_depth > 0,
+	    ("tessera flush gate exit with depth %d (no matching enter)",
+	     tmp_->flush_gate_depth));
+	KASSERT(tmp_->flush_gate_owner == curthread,
+	    ("tessera flush gate exit by %p, owner is %p",
+	     curthread, tmp_->flush_gate_owner));
 	if (--tmp_->flush_gate_depth == 0) {
 		TPROF_ADD(TPROF_GATE_HELD, tmp_->flush_gate_t0);
 		tmp_->flush_in_progress = 0;
@@ -10161,7 +10156,19 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	mtx_lock(&tmp_->flush_mtx);
 	if (r == 0) tmp_->sb_dirty = 0;
 	/* Balanced with the depth=1 set at acquire; nested gate_enter/exit
-	 * during the drain leave it at 1 here. */
+	 * during the drain leave it at 1 here.
+	 *
+	 * ASSERT it (task #72). Forcing depth to 0 unconditionally MASKS an
+	 * imbalance: a nested gate_enter whose matching exit was skipped on an
+	 * error path leaves depth==2 and this silently papers over it. The
+	 * converse — an early return between the acquire above and this
+	 * release — leaks the gate outright, which wedged the machine with
+	 * EVERY thread asleep on tessgat, all CPUs idle and no owner running.
+	 * That cost a full DDB session to identify; an assertion names it at
+	 * the moment of the bug. */
+	KASSERT(tmp_->flush_gate_depth == 1,
+	    ("tessera flush gate depth %d at release (expected 1) — a nested "
+	     "gate_enter/exit pair is unbalanced", tmp_->flush_gate_depth));
 	TPROF_ADD(TPROF_GATE_HELD, tmp_->flush_gate_t0);
 	tmp_->flush_gate_depth  = 0;
 	tmp_->flush_in_progress = 0;
@@ -10646,29 +10653,12 @@ tessera_fs_pack_bread_sector(struct tessera_mount *tmp_,
 			const uint64_t dev =
 			    exts[e].start_sector + (pack_sector - base);
 			struct buf *bp = NULL;
-			int err;
-			if (tmp_->gc_td == curthread) {
-				/* task #72: never sleep on a buffer lock with
-				 * the flush gate held — fail the pass instead. */
-				err = breadn_flags(tmp_->devvp,
-				    dev * btodb(TESSERA_SECTOR_SIZE),
-				    dev * btodb(TESSERA_SECTOR_SIZE),
-				    TESSERA_SECTOR_SIZE, NULL, NULL, 0,
-				    tmp_->bio_ctx.cred ? tmp_->bio_ctx.cred
-				        : NOCRED,
-				    GB_LOCK_NOWAIT, NULL, &bp);
-			} else {
-				err = bread(tmp_->devvp,
-				    dev * btodb(TESSERA_SECTOR_SIZE),
-				    TESSERA_SECTOR_SIZE,
-				    tmp_->bio_ctx.cred ? tmp_->bio_ctx.cred
-				        : NOCRED,
-				    &bp);
-			}
-			if (err != 0 || bp == NULL) {
-				if (bp != NULL) brelse(bp);
-				return (EIO);
-			}
+			int err = bread(tmp_->devvp,
+			    dev * btodb(TESSERA_SECTOR_SIZE),
+			    TESSERA_SECTOR_SIZE,
+			    tmp_->bio_ctx.cred ? tmp_->bio_ctx.cred : NOCRED,
+			    &bp);
+			if (err != 0) { if (bp != NULL) brelse(bp); return (EIO); }
 			memcpy(out, bp->b_data, TESSERA_SECTOR_SIZE);
 			brelse(bp);
 			return (0);
@@ -11383,43 +11373,8 @@ tessera_fs_fetch_blob(struct tessera_mount *tmp_, const tessera_hash_t hash,
  *
  * Returns the number of packs reclaimed.
  */
-/*
- * Wrapper (task #72): mark this thread as the GC for the duration of the
- * pass, so tessera_fs_pack_bread_sector() takes buffer locks NON-BLOCKING
- * and fails instead of sleeping.
- *
- * The GC runs inside tessera_fs_flush() with the flush gate held. Sleeping
- * on a buffer lock there deadlocks: this thread holds the gate plus one
- * buffer and waits for a second, while that buffer's owner is a writer
- * blocked on the gate. Observed live — a second back-to-back buildkernel
- * wedged with every writer in D state on `tessgat` and this thread parked
- * in bufwait under gc_data_zone -> fetch_blob_ex -> pack_read_range.
- *
- * A failed read propagates as an ordinary fetch failure, which the pass-1
- * walk already treats as gc_walk_abort => reclaim nothing this cycle (#66).
- * Over-retention is always safe, so losing a GC pass to contention costs
- * only a little delayed reclaim.
- */
 static int
 tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
-{
-	struct thread *prev = tmp_->gc_td;
-	sbintime_t t0 = sbinuptime();
-
-	tmp_->gc_td = curthread;
-	int rc = tessera_fs_gc_data_zone_inner(tmp_);
-	tmp_->gc_td = prev;
-
-	/* Log only slow passes: an "enter" with no matching line is what
-	 * exposed the deadlock, but logging every pass floods the console. */
-	int ms = (int)((sbinuptime() - t0) / SBT_1MS);
-	if (ms > 1000)
-		printf("tessera_fs: gc pass took %d ms (reclaimed %d)\n", ms, rc);
-	return (rc);
-}
-
-static int
-tessera_fs_gc_data_zone_inner(struct tessera_mount *tmp_)
 {
 	if (tmp_->inode_tree == NULL || tmp_->pack_registry_tree == NULL)
 		return (0);
