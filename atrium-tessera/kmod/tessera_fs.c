@@ -917,6 +917,7 @@ struct meta_mark_ctx { uint8_t *bitmap; uint64_t lo; uint64_t hi;
 	volatile int *abort_flag; /* nonzero -> stop the walk (unmount) */ };
 static int meta_mark_visitor(void *ctx, uint64_t sector);
 static void tessera_meta_pin_bitmap_rebuild(struct tessera_mount *tmp_);
+static void tessera_fs_meta_pressure_kick(struct tessera_mount *tmp_);
 static void tessera_fs_pinscan_task(void *ctx, int pending);
 static void tessera_fs_pinscan_run(struct tessera_mount *tmp_);
 static void tessera_fs_meta_pending_drain(struct tessera_mount *tmp_);
@@ -1548,6 +1549,52 @@ static int tessera_fs_dir_btree_migrate(struct tessera_mount *tmp_,
  * cap-trigger threshold need to be declared here too because
  * mark_dirty (also above the impl) reads them. */
 #define TESSERA_DIRENT_LOG_MISS  (-1)
+/*
+ * ★ task #74: meta-reserve reclamation must be driven by PRESSURE, not by
+ * snapshot retirement.
+ *
+ * tessera_meta_pin_bitmap_rebuild() — the only thing that advances
+ * meta_pin_watermark and thus lets the pending list drain — had exactly ONE
+ * call site: the snapshot-retire branch of commit_sb. That made reclamation
+ * hostage to retire traffic, and worse, self-defeating: the retire runs
+ * btree_delete, btree_delete COWs, COW needs reserve. Under pressure the
+ * delete fails, so the retire fails, so the rebuild never runs, so nothing is
+ * reclaimed, so pressure rises. A volume that reached the ceiling could never
+ * recover on its own — it needed an offline `tessera-repack --force`.
+ *
+ * Measured on a fresh volume under small-file churn: drain_keep +40000 against
+ * drain_release +23 (~1700:1), meta_free_now pinned at 2-4, meta_pending_now
+ * climbing without bound, meta_pin_watermark frozen at 268 and pinscan_swaps
+ * frozen — for the whole run. The instant one swap landed, watermark went
+ * 268 -> 6034 and free went 4 -> 5567. The reclaim logic was always correct;
+ * it was simply never triggered.
+ *
+ * Kick when the bump has consumed this percentage of the reserve. The rebuild
+ * itself already coalesces (never stacks on a running scan, <=1 kick/second),
+ * so calling it per commit is cheap.
+ */
+static int tessera_meta_pressure_pct = 50;
+SYSCTL_INT(_kern_tessera, OID_AUTO, meta_pressure_pct, CTLFLAG_RW,
+    &tessera_meta_pressure_pct, 0,
+    "kick a pin-bitmap rebuild once the meta-reserve bump passes this % of "
+    "the ceiling (0 = disable pressure-driven reclaim)");
+/* Or when this many sectors are stranded in meta_pending regardless of the
+ * bump — pending IS the reclaimable backlog, so a large one means a scan is
+ * worth running even on a volume with plenty of headroom left. */
+static int tessera_meta_pressure_pending = 1024;
+SYSCTL_INT(_kern_tessera, OID_AUTO, meta_pressure_pending, CTLFLAG_RW,
+    &tessera_meta_pressure_pending, 0,
+    "kick a pin-bitmap rebuild once this many sectors sit in meta_pending");
+/* ★ task #74: the flush preflight used to demand meta_free_count == 0
+ * EXACTLY. A couple of sectors lingering in the recycle list — the measured
+ * steady state was 2 to 4 — disabled the safety net permanently while the
+ * reserve was effectively exhausted and thousands of sectors sat stranded in
+ * pending. An emergency net must arm on "nearly empty", not "provably zero". */
+static int tessera_meta_free_lowat = 64;
+SYSCTL_INT(_kern_tessera, OID_AUTO, meta_free_lowat, CTLFLAG_RW,
+    &tessera_meta_free_lowat, 0,
+    "flush preflight arms when the meta recycle list falls to this many "
+    "sectors (not just when it is exactly empty)");
 static int tessera_preflight_enable = 1;
 SYSCTL_INT(_kern_tessera, OID_AUTO, preflight, CTLFLAG_RW,
     &tessera_preflight_enable, 0, "1 = flush-start meta-reserve preflight pinscan");
@@ -6549,6 +6596,13 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 
 	TPROF_ADD(TPROF_SB_SNAP, _sbt);
 
+	/* ★ task #74: reclaim on PRESSURE, not only on retire. The rebuild
+	 * above fires only when a snapshot is successfully retired, which made
+	 * reserve recovery hostage to retire traffic — and unreachable exactly
+	 * when it is needed most, since the retire's btree_delete needs the
+	 * reserve it is trying to reclaim. */
+	tessera_fs_meta_pressure_kick(tmp_);
+
 	/* Persist dirty quota domains to the on-disk tree (tessera-quotas.md
 	 * §5.5). Done HERE — before the barrier + journal — so the quota-tree
 	 * sectors are durable and sb.quota_tree_root is current when the
@@ -10187,7 +10241,7 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	 * that call a safe no-op, but firing it during every scan is pointless
 	 * churn/log-noise); the background scan itself replenishes meta_free. */
 	if (tessera_preflight_enable && tmp_->dirty_init &&
-	    tmp_->meta_free_count == 0 &&
+	    tmp_->meta_free_count <= (uint32_t)tessera_meta_free_lowat &&
 	    tmp_->sb.meta_reserve_length -
 	    (tmp_->sb.meta_reserve_bump - tmp_->sb.meta_reserve_start)
 	    < 8192) {
@@ -10779,6 +10833,35 @@ tessera_fs_pinscan_task(void *ctx, int pending)
 {
 	(void)pending;
 	tessera_fs_pinscan_run((struct tessera_mount *)ctx);
+}
+
+/*
+ * ★ task #74: kick a rebuild when the reserve is under pressure, regardless of
+ * whether any snapshot happens to be retiring. Called unconditionally from
+ * commit_sb; the rebuild below self-throttles, so this is cheap.
+ *
+ * This is the fix for the death spiral described at tessera_meta_pressure_pct:
+ * reclamation used to require a successful btree_delete, which requires the
+ * very reserve it is trying to reclaim.
+ */
+static void
+tessera_fs_meta_pressure_kick(struct tessera_mount *tmp_)
+{
+	uint64_t used, len;
+
+	len = tmp_->sb.meta_reserve_length;
+	if (len == 0 || !tmp_->pinscan_tq_init)
+		return;
+	if (tessera_meta_pressure_pending > 0 &&
+	    tmp_->meta_pending_count >= (uint32_t)tessera_meta_pressure_pending)
+		goto kick;
+	if (tessera_meta_pressure_pct <= 0)
+		return;
+	used = tmp_->sb.meta_reserve_bump - tmp_->sb.meta_reserve_start;
+	if ((used * 100) / len < (uint64_t)tessera_meta_pressure_pct)
+		return;
+kick:
+	tessera_meta_pin_bitmap_rebuild(tmp_);
 }
 
 static void
