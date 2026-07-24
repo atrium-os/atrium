@@ -247,7 +247,7 @@ fn run(path: &str, apply: bool, force: bool) -> Result<i32, String> {
         println!("  --force: in-place overwrite from reserve start (NOT crash-safe — back up first)");
         let b = build_all(&io, ctxp, mr_start, ceiling, &trees)?;
         commit(v, &b, next_ino, true)?;
-        report_done(v, mr_start, used, b.bump);
+        report_done(v, mr_start, used, b.bump, path, trees.packs.len());
         return Ok(0);
     }
 
@@ -281,7 +281,7 @@ fn run(path: &str, apply: bool, force: bool) -> Result<i32, String> {
             if let Ok(b) = build_all(&io, ctxp, mr_start, first_live, &trees) {
                 commit(v, &b, next_ino, true)?;
                 println!("  crash-safe: compacted into the free reserve prefix (commit, bump lowered)");
-                report_done(v, mr_start, used, b.bump);
+                report_done(v, mr_start, used, b.bump, path, trees.packs.len());
                 return Ok(0);
             }
         }
@@ -298,12 +298,36 @@ fn run(path: &str, apply: bool, force: bool) -> Result<i32, String> {
     Err("repack did not converge in 3 passes (unexpected)".into())
 }
 
-fn report_done(v: *mut tessera_volume_t, mr_start: u64, used: u64, new_bump: u64) {
+fn report_done(v: *mut tessera_volume_t, mr_start: u64, used: u64, new_bump: u64,
+    path: &str, npacks: usize) {
     unsafe { tessera_volume_close(v) };
     let new_used = new_bump - mr_start;
     println!("  compacted:     bump {used} -> {new_used} sectors  (reclaimed {} sectors headroom)",
         used.saturating_sub(new_used));
+    /*
+     * The blob->pack index was dropped (commit() sets blob_index_root = 0,
+     * correctly: the reserve is rewritten under it, and a STALE index returns
+     * wrong data while no index is merely slow). But saying so only in a
+     * source comment is a trap — without the index every cold read linearly
+     * scans the pack registry, and the next boot sits at "Loading kernel..."
+     * with the CPU pegged and NO console output for many minutes, which is
+     * indistinguishable from a hang. That happened here on a 63929-pack dev
+     * root: ~20 minutes to boot, versus 8 seconds for tessera-reindex to
+     * rebuild the index. Say it loudly, and scale the wording to the cost.
+     */
     println!("tessera-repack: DONE — run tessera-fsck to verify.");
+    println!("tessera-repack: NOTE — the blob->pack index was DROPPED (the \
+reserve is rewritten, so the old index would point at reused sectors).");
+    if npacks >= 10_000 {
+        println!("tessera-repack: *** RUN `tessera-reindex {path}` BEFORE \
+MOUNTING. *** With {npacks} packs and no index, every cold read scans the \
+whole pack registry: the next boot can take MANY MINUTES at \"Loading \
+kernel...\" with no output, looking exactly like a hang. Reindexing takes \
+seconds.");
+    } else {
+        println!("tessera-repack: run `tessera-reindex {path}` to rebuild it; \
+until then cold reads scan the pack registry and are slow.");
+    }
 }
 
 fn main() -> ExitCode {
