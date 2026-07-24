@@ -513,6 +513,18 @@ static unsigned long tessera_stat_lookup_no_inode     = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_no_inode, CTLFLAG_RD,
     &tessera_stat_lookup_no_inode, 0,
     "lookups rejected: dirent target inode has no record");
+/* ★ task #78: log WHICH inode each rejected dirent points at, not just how
+ * many. The count alone cannot tell pre-existing damage (a small, stable,
+ * repeating set of inode numbers) from the filesystem still minting bad
+ * dirents under load (fresh numbers appearing mid-build) — and those call for
+ * opposite responses. Rate-limited to 1/s inside the log site, so a `rm -rf`
+ * looping over a damaged directory cannot flood the console. On by default:
+ * this only fires when a directory is genuinely damaged, and silence there is
+ * how #77 stayed invisible. */
+static int tessera_lookup_no_inode_verbose = 1;
+SYSCTL_INT(_kern_tessera, OID_AUTO, lookup_no_inode_verbose, CTLFLAG_RW,
+    &tessera_lookup_no_inode_verbose, 0,
+    "log the parent/inode of each dirent whose target inode has no record");
 static unsigned long tessera_stat_gp_calls            = 0;
 static unsigned long tessera_stat_gp_pages            = 0;
 static unsigned long tessera_stat_rr_bail_fetch       = 0;
@@ -4022,6 +4034,35 @@ tessera_vget(struct mount *mp, uint64_t inode_no, uint64_t parent_inode_no,
 			inode_mode_valid = 1;
 		} else if (inode_no != TESSERA_INODE_ROOT_DIR) {
 			tessera_stat_lookup_no_inode++;
+			/*
+			 * ★ task #78: a bare count cannot distinguish
+			 * PRE-EXISTING damage from the filesystem still
+			 * MINTING bad dirents under load — and those need
+			 * opposite responses (remove some entries vs find a
+			 * live corruption path). Identifying the rejected
+			 * inode does separate them: a stable, repeating set
+			 * is old damage; fresh high-numbered inodes appearing
+			 * during a build are not.
+			 *
+			 * Rate-limited to 1/s: this fires on every lookup of a
+			 * damaged name, and `rm -rf` over such a directory
+			 * retries constantly.
+			 */
+			if (tessera_lookup_no_inode_verbose) {
+				static time_t last_sec;
+				struct timespec ts;
+				getnanouptime(&ts);
+				if (ts.tv_sec != last_sec) {
+					last_sec = ts.tv_sec;
+					printf("tessera_fs: lookup — dirent "
+					    "resolves to inode %u under parent "
+					    "%u, but that inode has NO record "
+					    "(damaged directory entry; "
+					    "returning ENOENT)\n",
+					    (unsigned)inode_no,
+					    (unsigned)parent_inode_no);
+				}
+			}
 			return (ENOENT);
 		}
 	}
