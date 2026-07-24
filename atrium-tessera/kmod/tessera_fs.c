@@ -457,6 +457,12 @@ static unsigned long tessera_stat_pp_pages            = 0;
 static unsigned long tessera_stat_blob_fetches        = 0;
 static unsigned long tessera_stat_disk_rd_ops         = 0;
 static unsigned long tessera_stat_disk_rd_bytes       = 0;
+/* Dirents whose target inode has no record — corrupt directory, lookup
+ * returns ENOENT instead of minting a typeless vnode (task #76). */
+static unsigned long tessera_stat_lookup_no_inode     = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_no_inode, CTLFLAG_RD,
+    &tessera_stat_lookup_no_inode, 0,
+    "lookups rejected: dirent target inode has no record");
 static unsigned long tessera_stat_gp_calls            = 0;
 static unsigned long tessera_stat_gp_pages            = 0;
 static unsigned long tessera_stat_rr_bail_fetch       = 0;
@@ -853,6 +859,7 @@ static void tessera_fs_pinscan_task(void *ctx, int pending);
 static void tessera_fs_pinscan_run(struct tessera_mount *tmp_);
 static void tessera_fs_meta_pending_drain(struct tessera_mount *tmp_);
 static int tessera_fs_gc_data_zone(struct tessera_mount *tmp_);
+static int tessera_fs_gc_data_zone_inner(struct tessera_mount *tmp_);
 static void tessera_fs_seed_constant_manifests(struct tessera_mount *tmp_);
 static int tessera_vop_lookup_impl(struct vop_cachedlookup_args *ap);
 static int tessera_vop_create_impl(struct vop_create_args *ap);
@@ -1765,6 +1772,18 @@ struct tessera_mount {
 	LIST_HEAD(, tessera_dirty_content) dirty_content[TESSERA_DIRTY_CONTENT_BUCKETS];
 	size_t                    dirty_content_bytes; /* sum of size across all */
 
+	/*
+	 * Thread currently running tessera_fs_gc_data_zone() (task #72).
+	 * The GC runs INSIDE tessera_fs_flush with the flush gate held, so any
+	 * blocking buffer acquisition it performs can deadlock: GC holds the
+	 * gate plus a buffer and waits for a second buffer, while that buffer's
+	 * owner is a writer waiting on the gate. Reads issued by THIS thread
+	 * take the buffer lock non-blocking and fail rather than sleep; the
+	 * failure feeds the existing gc_walk_abort path, which reclaims nothing
+	 * (over-retention is always safe). Per-thread, not per-mount, so a
+	 * concurrent ungated reader never gets a spurious EIO.
+	 */
+	struct thread           *gc_td;
 	/* CAS read cache (see struct tessera_cas_cache + cas_cache_plan.md). */
 	struct tessera_cas_cache cas_cache;
 
@@ -3715,6 +3734,39 @@ tessera_vget(struct mount *mp, uint64_t inode_no, uint64_t parent_inode_no,
 		return (0);
 	}
 
+	/*
+	 * Resolve the inode record BEFORE minting a vnode (task #76).
+	 *
+	 * A dirent can point at an inode that has no record — readdir
+	 * enumerates the name while lookup of it cannot resolve, which is what
+	 * a damaged directory looks like (see #77). Previously the type switch
+	 * below simply didn't fire in that case and vget returned SUCCESS with
+	 * a typeless VNON vnode; tessera_vop_lookup then handed it to
+	 * cache_enter(), which PANICS on a typeless/doomed vnode. A corrupt
+	 * dirent thus crashed the kernel — fatal for a filesystem meant to be
+	 * root, where the result is an unbootable machine rather than an
+	 * fsck-able volume.
+	 *
+	 * Probing first means the failure costs no vnode and needs no teardown
+	 * (tearing one down here is its own hazard: VOP_RECLAIM frees v_data,
+	 * so an explicit free() after vgone would double-free).
+	 */
+	struct tessera_mount *tmp_ = VFSTOTESSERA(mp);
+	uint32_t inode_mode = 0;
+	int inode_mode_valid = 0;
+	if (tmp_ != NULL && tmp_->inode_tree != NULL) {
+		uint8_t k4[4];
+		tessera_inode_record_t cino;
+		encode_inode_key((uint32_t)inode_no, k4);
+		if (tessera_fs_inode_get_byk(tmp_, k4, &cino) == TESSERA_OK) {
+			inode_mode = cino.mode;
+			inode_mode_valid = 1;
+		} else if (inode_no != TESSERA_INODE_ROOT_DIR) {
+			tessera_stat_lookup_no_inode++;
+			return (ENOENT);
+		}
+	}
+
 	error = getnewvnode("tessera", mp, &tessera_vnodeops, &vp);
 	if (error != 0) return (error);
 	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
@@ -3726,23 +3778,16 @@ tessera_vget(struct mount *mp, uint64_t inode_no, uint64_t parent_inode_no,
 	vp->v_data = tn;
 	vp->v_type = VNON;
 
-	struct tessera_mount *tmp_ = VFSTOTESSERA(mp);
-	if (tmp_->inode_tree != NULL) {
-		uint8_t k4[4];
-		tessera_inode_record_t cino;
-		encode_inode_key((uint32_t)inode_no, k4);
-		if (tessera_fs_inode_get_byk(tmp_, k4, &cino)
-		    == TESSERA_OK) {
-			switch (cino.mode & 0170000) {
-			case 0040000: vp->v_type = VDIR;  break;
-			case 0100000: vp->v_type = VREG;  break;
-			case 0120000: vp->v_type = VLNK;  break;
-			case 0140000: vp->v_type = VSOCK; break;
-			case 0010000: vp->v_type = VFIFO; break;
-			case 0020000: vp->v_type = VCHR;  break;
-			case 0060000: vp->v_type = VBLK;  break;
-			default:      vp->v_type = VBAD;  break;
-			}
+	if (inode_mode_valid) {
+		switch (inode_mode & 0170000) {
+		case 0040000: vp->v_type = VDIR;  break;
+		case 0100000: vp->v_type = VREG;  break;
+		case 0120000: vp->v_type = VLNK;  break;
+		case 0140000: vp->v_type = VSOCK; break;
+		case 0010000: vp->v_type = VFIFO; break;
+		case 0020000: vp->v_type = VCHR;  break;
+		case 0060000: vp->v_type = VBLK;  break;
+		default:      vp->v_type = VBAD;  break;
 		}
 	}
 	if (inode_no == TESSERA_INODE_ROOT_DIR) {
@@ -10508,12 +10553,29 @@ tessera_fs_pack_bread_sector(struct tessera_mount *tmp_,
 			const uint64_t dev =
 			    exts[e].start_sector + (pack_sector - base);
 			struct buf *bp = NULL;
-			int err = bread(tmp_->devvp,
-			    dev * btodb(TESSERA_SECTOR_SIZE),
-			    TESSERA_SECTOR_SIZE,
-			    tmp_->bio_ctx.cred ? tmp_->bio_ctx.cred : NOCRED,
-			    &bp);
-			if (err != 0) { if (bp != NULL) brelse(bp); return (EIO); }
+			int err;
+			if (tmp_->gc_td == curthread) {
+				/* task #72: never sleep on a buffer lock with
+				 * the flush gate held — fail the pass instead. */
+				err = breadn_flags(tmp_->devvp,
+				    dev * btodb(TESSERA_SECTOR_SIZE),
+				    dev * btodb(TESSERA_SECTOR_SIZE),
+				    TESSERA_SECTOR_SIZE, NULL, NULL, 0,
+				    tmp_->bio_ctx.cred ? tmp_->bio_ctx.cred
+				        : NOCRED,
+				    GB_LOCK_NOWAIT, NULL, &bp);
+			} else {
+				err = bread(tmp_->devvp,
+				    dev * btodb(TESSERA_SECTOR_SIZE),
+				    TESSERA_SECTOR_SIZE,
+				    tmp_->bio_ctx.cred ? tmp_->bio_ctx.cred
+				        : NOCRED,
+				    &bp);
+			}
+			if (err != 0 || bp == NULL) {
+				if (bp != NULL) brelse(bp);
+				return (EIO);
+			}
 			memcpy(out, bp->b_data, TESSERA_SECTOR_SIZE);
 			brelse(bp);
 			return (0);
@@ -11228,10 +11290,44 @@ tessera_fs_fetch_blob(struct tessera_mount *tmp_, const tessera_hash_t hash,
  *
  * Returns the number of packs reclaimed.
  */
+/*
+ * Wrapper (task #72): mark this thread as the GC for the duration of the
+ * pass, so tessera_fs_pack_bread_sector() takes buffer locks NON-BLOCKING
+ * and fails instead of sleeping.
+ *
+ * The GC runs inside tessera_fs_flush() with the flush gate held. Sleeping
+ * on a buffer lock there deadlocks: this thread holds the gate plus one
+ * buffer and waits for a second, while that buffer's owner is a writer
+ * blocked on the gate. Observed live — a second back-to-back buildkernel
+ * wedged with every writer in D state on `tessgat` and this thread parked
+ * in bufwait under gc_data_zone -> fetch_blob_ex -> pack_read_range.
+ *
+ * A failed read propagates as an ordinary fetch failure, which the pass-1
+ * walk already treats as gc_walk_abort => reclaim nothing this cycle (#66).
+ * Over-retention is always safe, so losing a GC pass to contention costs
+ * only a little delayed reclaim.
+ */
 static int
 tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
 {
-	printf("tessera_fs: gc enter\n");
+	struct thread *prev = tmp_->gc_td;
+	sbintime_t t0 = sbinuptime();
+
+	tmp_->gc_td = curthread;
+	int rc = tessera_fs_gc_data_zone_inner(tmp_);
+	tmp_->gc_td = prev;
+
+	/* Log only slow passes: an "enter" with no matching line is what
+	 * exposed the deadlock, but logging every pass floods the console. */
+	int ms = (int)((sbinuptime() - t0) / SBT_1MS);
+	if (ms > 1000)
+		printf("tessera_fs: gc pass took %d ms (reclaimed %d)\n", ms, rc);
+	return (rc);
+}
+
+static int
+tessera_fs_gc_data_zone_inner(struct tessera_mount *tmp_)
+{
 	if (tmp_->inode_tree == NULL || tmp_->pack_registry_tree == NULL)
 		return (0);
 
