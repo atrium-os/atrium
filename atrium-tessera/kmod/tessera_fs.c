@@ -378,6 +378,32 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, publish_dedup_chunked,
     CTLFLAG_RD, &tessera_stat_publish_dedup_chunked, 0,
     "publish_chunked calls satisfied by existing pack_registry entry");
 
+/* ★ tasks #72/#71 observability. The whole point of moving the scan off
+ * the gate is that its cost stops being a global stall — so measure both
+ * the cost (gc_scan_ms) and how often the ungated scan had to be thrown
+ * away (gc_aborts, gc_touch_keeps). Instrument first, theorise second:
+ * every misdiagnosis this campaign was settled by one counter. */
+static unsigned long tessera_stat_gc_scans       = 0;
+static unsigned long tessera_stat_gc_scan_ms     = 0;
+static unsigned long tessera_stat_gc_aborts      = 0;
+static unsigned long tessera_stat_gc_touch_keeps = 0;
+static unsigned long tessera_stat_gc_reclaimed   = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_scans, CTLFLAG_RD,
+    &tessera_stat_gc_scans, 0,
+    "Data-zone GC scans started (ungated, on gc_tq)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_scan_ms, CTLFLAG_RD,
+    &tessera_stat_gc_scan_ms, 0,
+    "Cumulative ms spent in the ungated GC scan (NOT gate-held)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_aborts, CTLFLAG_RD,
+    &tessera_stat_gc_aborts, 0,
+    "GC passes that reclaimed nothing because the live-set walk aborted");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_touch_keeps, CTLFLAG_RD,
+    &tessera_stat_gc_touch_keeps, 0,
+    "Dead candidates spared by the SATB touch filter (referenced mid-scan)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_reclaimed, CTLFLAG_RD,
+    &tessera_stat_gc_reclaimed, 0,
+    "Packs reclaimed by the data-zone GC");
+
 /* Aggregation packs: small INLINE manifests batched together at
  * pending_manifests_drain time so we don't pay per-pack header/index
  * overhead per tiny file. ~1.5 KiB amortized overhead per manifest
@@ -883,6 +909,12 @@ static void tessera_fs_pinscan_task(void *ctx, int pending);
 static void tessera_fs_pinscan_run(struct tessera_mount *tmp_);
 static void tessera_fs_meta_pending_drain(struct tessera_mount *tmp_);
 static int tessera_fs_gc_data_zone(struct tessera_mount *tmp_);
+static void tessera_fs_gc_note_hash_slow(struct tessera_mount *tmp_,
+    const tessera_hash_t h);
+static void tessera_fs_gc_note_hash_locked(struct tessera_mount *tmp_,
+    const tessera_hash_t h);
+static void tessera_fs_gc_task(void *ctx, int pending);
+static void tessera_fs_gc_arm(struct tessera_mount *tmp_);
 static void tessera_fs_seed_constant_manifests(struct tessera_mount *tmp_);
 static int tessera_vop_lookup_impl(struct vop_cachedlookup_args *ap);
 static int tessera_vop_create_impl(struct vop_create_args *ap);
@@ -1697,6 +1729,47 @@ struct tessera_mount {
 	 * cannot re-run back-to-back under the flush gate and starve every
 	 * writer (task #67); reset to the base on a productive run. */
 	int                       tombstone_gc_backoff;
+
+	/* ★ tasks #72/#71: data-zone GC no longer runs inside the flush
+	 * gate. The gate cannot be held across gc_data_zone's blocking
+	 * reads — that is the ABBA deadlock (GC holds gate + sleeps in
+	 * bufwait; a writer holds that buf + sleeps on the gate) — and an
+	 * O(volume) scan under a coarse gate stalls every writer for as
+	 * long as it runs.
+	 *
+	 * Instead the scan runs UNGATED on gc_tq against FROZEN btree
+	 * roots. Tessera is COW, so a root IS an immutable snapshot: the
+	 * scan sees a consistent committed state without excluding
+	 * writers. Only activation and the (bounded) apply take the gate.
+	 *
+	 * Concurrent writers are covered by a snapshot-at-the-beginning
+	 * write barrier — see tessera_fs_gc_note_hash. */
+	struct taskqueue         *gc_tq;
+	struct task               gc_task;
+	int                       gc_tq_init;
+	/* Set (under flush_mtx, gate held) for the duration of a scan.
+	 * Read lock-free on the publish hot path; the only cost when no
+	 * scan is running is one atomic load. */
+	volatile int              gc_scan_active;
+	/* An enqueued-or-running GC task; keeps flush from stacking them. */
+	volatile int              gc_task_armed;
+	/* Committed roots frozen at activation. The scan opens its btrees
+	 * at these, NOT at the live sb.* roots which move under it. */
+	uint64_t                  gc_scan_inode_root;
+	uint64_t                  gc_scan_registry_root;
+	uint64_t                  gc_scan_snapshots_root;
+	/* SATB touch filter: every hash a writer publishes or re-references
+	 * while gc_scan_active gets 2 bits set here, and the apply phase
+	 * refuses to reclaim any pack whose blob hash tests present. A
+	 * false positive only KEEPS a pack (reclaimed by a later pass), so
+	 * a fixed-size approximate filter is exactly the right structure —
+	 * O(1) insert, no overflow, no abort path.
+	 *
+	 * Allocated lazily on the first GC and freed only at unmount, so a
+	 * writer racing the end of a scan can never dereference a freed
+	 * bitmap. A stale set bit is harmless (conservative). */
+	uint8_t                  *gc_touch_bm;
+#define TESSERA_GC_TOUCH_BITS   (2u * 1024u * 1024u)   /* 256 KiB */
 	uint8_t                  *meta_pin_bitmap;
 	size_t                    meta_pin_bitmap_bytes;
 
@@ -2869,6 +2942,14 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	(void)taskqueue_start_threads(&tmp_->journal_tq, 1, PRIBIO,
 	    "tessjournal");
 	tmp_->journal_tq_init = 1;
+	/* ★ tasks #72/#71: the data-zone GC gets its own queue too. Same
+	 * rule as repack and the journal drain (task #67): work that claims
+	 * the flush gate must never sit on taskqueue_thread. */
+	tmp_->gc_tq = taskqueue_create("tessera_gc", M_WAITOK,
+	    taskqueue_thread_enqueue, &tmp_->gc_tq);
+	(void)taskqueue_start_threads(&tmp_->gc_tq, 1, PRIBIO, "tessgc");
+	TASK_INIT(&tmp_->gc_task, 0, tessera_fs_gc_task, tmp_);
+	tmp_->gc_tq_init = 1;
 	tmp_->multi_extent_pack_count = 0;
 	mtx_init(&tmp_->flush_mtx, "tess_flush", NULL, MTX_DEF);
 	tmp_->flush_mtx_init = 1;
@@ -3573,6 +3654,26 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			taskqueue_free(tmp_->journal_tq);
 			tmp_->journal_tq = NULL;
 			tmp_->journal_tq_init = 0;
+		}
+		/* ★ #72: drain the GC queue before anything it touches goes
+		 * away. flush_unmounting is already set, so gc_arm is a no-op
+		 * by now and nothing can re-enqueue behind the drain. */
+		if (tmp_->gc_tq_init) {
+			/* Clear the init flag FIRST: gc_arm gates on it, so
+			 * closing that door before draining means nothing can
+			 * enqueue onto a queue we are about to free. */
+			tmp_->gc_tq_init = 0;
+			taskqueue_drain(tmp_->gc_tq, &tmp_->gc_task);
+			taskqueue_free(tmp_->gc_tq);
+			tmp_->gc_tq = NULL;
+		}
+		/* The SATB touch bitmap lives for the whole mount by design —
+		 * writers dereference it lock-free-ish, so it must not be
+		 * freed while any of them could still be running. Here, with
+		 * the GC queue drained and the FS going away, it is safe. */
+		if (tmp_->gc_touch_bm != NULL) {
+			free(tmp_->gc_touch_bm, M_TESSERA);
+			tmp_->gc_touch_bm = NULL;
 		}
 		/* Registry overlay: empty after the final flush; free
 		 * defensively (forced unmount after a failed flush may
@@ -6797,6 +6898,19 @@ tessera_fs_inode_put_impl(struct tessera_mount *tmp_, uint32_t inode_no,
 	int dropped_jc = 0;
 
 	mtx_lock(&tmp_->flush_mtx);
+	/* ★ #72 SATB barrier. This function is where a reference becomes
+	 * visible, so it is where an ungated GC scan must learn about it.
+	 * Noting INSIDE the flush_mtx section is the whole point: a scan
+	 * activating concurrently also flips gc_scan_active under this
+	 * lock, so this put is strictly either before activation (and thus
+	 * in the dirty-inode snapshot activation seeds from) or after it
+	 * (and thus in the bitmap). Never neither.
+	 *
+	 * Note BEFORE branching, so the RACED early-returns are covered
+	 * too — noting a hash we then don't install merely keeps a pack one
+	 * cycle longer, which is the safe direction. */
+	tessera_fs_gc_note_hash_locked(tmp_, rec->manifest_hash);
+	tessera_fs_gc_note_hash_locked(tmp_, rec->xattr_hash);
 	uint32_t b = inode_no & (TESSERA_DIRTY_INODE_BUCKETS - 1u);
 	struct tessera_dirty_inode *e;
 	int found = 0;
@@ -6839,6 +6953,12 @@ tessera_fs_inode_put_impl(struct tessera_mount *tmp_, uint32_t inode_no,
 		e->inode_no = inode_no;
 		memcpy(&e->rec, rec, sizeof e->rec);
 		mtx_lock(&tmp_->flush_mtx);
+		/* ★ #72: re-note. flush_mtx was DROPPED across the malloc
+		 * above, so a GC scan can have activated in that gap — the
+		 * note in the first section would then have been a no-op while
+		 * this insert lands after activation. Both sections must note. */
+		tessera_fs_gc_note_hash_locked(tmp_, rec->manifest_hash);
+		tessera_fs_gc_note_hash_locked(tmp_, rec->xattr_hash);
 		struct tessera_dirty_inode *existing;
 		int raced = 0;
 		LIST_FOREACH(existing, &tmp_->dirty_inodes[b], link) {
@@ -7326,6 +7446,11 @@ tessera_fs_pending_manifest_put_impl(struct tessera_mount *tmp_,
 	}
 
 	mtx_lock(&tmp_->flush_mtx);
+	/* ★ #72 SATB barrier — see tessera_fs_gc_note_hash. Every publish
+	 * that defers into this cache lands here, under the same lock that
+	 * activation flips gc_scan_active with, so an ungated scan cannot
+	 * miss a manifest published while it walks. */
+	tessera_fs_gc_note_hash_locked(tmp_, hash);
 
 	/* Supersession FIRST: if the new manifest is tagged with an
 	 * owner_inode_no, walk every bucket and remove this owner from
@@ -10089,14 +10214,22 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 		if (_tight && (tmp_->last_tombstone_gc_ticks == 0 ||
 		    _elapsed < 0 || _elapsed > _iv)) {
 			tmp_->last_tombstone_gc_ticks = _now;
-			int _gcn = tessera_fs_gc_data_zone(tmp_);
-			if (_gcn > 0) {
-				tmp_->tombstone_gc_backoff = _base;
-			} else {
-				int _nb = _iv * 2;
-				if (_nb > 60 * hz) _nb = 60 * hz;
-				tmp_->tombstone_gc_backoff = _nb;
-			}
+			/* ★ tasks #72/#71: HAND OFF, don't run it here.
+			 *
+			 * This used to call gc_data_zone() inline — with the
+			 * flush gate held, from a thread that may also hold an
+			 * exclusive vnode lock and a locked buffer. GC then
+			 * blocks in bufwait on a buffer some writer holds while
+			 * that writer waits on the gate: a textbook ABBA, and
+			 * the observed wedge (kern_fsync -> tessera_fs_flush ->
+			 * gc_data_zone -> ... -> bufwait, everyone else on
+			 * "tessgat", all CPUs idle).
+			 *
+			 * The background pass takes the gate only to snapshot
+			 * state and to apply a bounded result; the O(volume)
+			 * walk in between runs ungated. The backoff is
+			 * maintained by the task itself now. */
+			tessera_fs_gc_arm(tmp_);
 		}
 	}
 
@@ -11357,6 +11490,105 @@ tessera_fs_fetch_blob(struct tessera_mount *tmp_, const tessera_hash_t hash,
 /* ── Round 6d: blob publishing + vop_remove ──────────────────── */
 
 /*
+ * ── SATB touch filter (tasks #72/#71) ───────────────────────────────
+ *
+ * The data-zone GC scan runs UNGATED, so writers publish packs and take
+ * fresh references to existing ones while the scan is walking. Both are
+ * invisible to a live-set built from roots frozen at activation:
+ *
+ *   - a pack published mid-scan is in the registry at pass 2 but its
+ *     referencing inode was not in the frozen inode tree at pass 1;
+ *   - an EXISTING pack gains a new reference mid-scan (the dedup hit
+ *     path: identical content lands on the same pack_id, so the write
+ *     publishes nothing and just reuses the pack).
+ *
+ * Either one, reclaimed, is silent data loss. So every hash a writer
+ * publishes or re-references during a scan is recorded here, and the
+ * apply phase refuses to reclaim any pack whose blob hash tests
+ * present.
+ *
+ * The filter is APPROXIMATE ON PURPOSE. A false positive only keeps a
+ * pack alive one extra cycle — the next pass reclaims it — while a
+ * false negative would be corruption. An approximate filter that can
+ * only err toward "keep" is therefore exactly the right structure, and
+ * it buys O(1) insert, fixed memory, and no overflow/abort path (the
+ * seed-buffer overflow abort that a growable exact set needs is a pass
+ * thrown away, and under buildkernel load it would fire constantly).
+ *
+ * Two bits per hash from disjoint byte ranges. The hash is already
+ * uniformly distributed, so no mixing is needed. At 2M bits and ~100k
+ * publishes per scan the false-positive rate is ~0.25%.
+ *
+ * ORDERING — this is the subtle part. gc_scan_active is set under
+ * flush_mtx, and the note below runs under flush_mtx too, so a publish
+ * cannot straddle activation: either its flush_mtx section precedes
+ * activation, in which case its entry is in the dirty/pending caches
+ * that activation snapshots as live seeds, or it follows activation and
+ * lands in the bitmap. There is no gap between the two.
+ */
+/* Caller already holds flush_mtx. This is the form used at the cache-
+ * insert sites, where noting inside the SAME critical section as the
+ * insert is what makes the barrier airtight. */
+static void
+tessera_fs_gc_note_hash_locked(struct tessera_mount *tmp_,
+    const tessera_hash_t h)
+{
+	uint8_t *bm = tmp_->gc_touch_bm;
+	uint32_t i0, i1;
+
+	mtx_assert(&tmp_->flush_mtx, MA_OWNED);
+	if (bm == NULL || !tmp_->gc_scan_active || tessera_hash_is_null(h))
+		return;
+	i0 = (((uint32_t)h[0]) | ((uint32_t)h[1] << 8) |
+	      ((uint32_t)h[2] << 16) | ((uint32_t)h[3] << 24)) %
+	    TESSERA_GC_TOUCH_BITS;
+	i1 = (((uint32_t)h[16]) | ((uint32_t)h[17] << 8) |
+	      ((uint32_t)h[18] << 16) | ((uint32_t)h[19] << 24)) %
+	    TESSERA_GC_TOUCH_BITS;
+	bm[i0 >> 3] |= (uint8_t)(1u << (i0 & 7));
+	bm[i1 >> 3] |= (uint8_t)(1u << (i1 & 7));
+}
+
+static void
+tessera_fs_gc_note_hash_slow(struct tessera_mount *tmp_,
+    const tessera_hash_t h)
+{
+	mtx_lock(&tmp_->flush_mtx);
+	tessera_fs_gc_note_hash_locked(tmp_, h);
+	mtx_unlock(&tmp_->flush_mtx);
+}
+
+/* Hot path: one atomic load when no scan is running, which is almost
+ * always. Called from every publish funnel point. */
+static __inline void
+tessera_fs_gc_note_hash(struct tessera_mount *tmp_, const tessera_hash_t h)
+{
+	if (__predict_true(atomic_load_int(
+	    (volatile int *)&tmp_->gc_scan_active) == 0))
+		return;
+	tessera_fs_gc_note_hash_slow(tmp_, h);
+}
+
+/* Apply-phase test. Caller holds the flush gate. */
+static int
+tessera_fs_gc_hash_touched(struct tessera_mount *tmp_, const tessera_hash_t h)
+{
+	uint8_t *bm = tmp_->gc_touch_bm;
+	uint32_t i0, i1;
+
+	if (bm == NULL)
+		return (0);
+	i0 = (((uint32_t)h[0]) | ((uint32_t)h[1] << 8) |
+	      ((uint32_t)h[2] << 16) | ((uint32_t)h[3] << 24)) %
+	    TESSERA_GC_TOUCH_BITS;
+	i1 = (((uint32_t)h[16]) | ((uint32_t)h[17] << 8) |
+	      ((uint32_t)h[18] << 16) | ((uint32_t)h[19] << 24)) %
+	    TESSERA_GC_TOUCH_BITS;
+	return ((bm[i0 >> 3] & (1u << (i0 & 7))) != 0 &&
+	        (bm[i1 >> 3] & (1u << (i1 & 7))) != 0);
+}
+
+/*
  * Mount-time data-zone GC.
  *
  * Walks the pack registry; for each pack that contains exactly one
@@ -11373,11 +11605,174 @@ tessera_fs_fetch_blob(struct tessera_mount *tmp_, const tessera_hash_t hash,
  *
  * Returns the number of packs reclaimed.
  */
+/*
+ * Frozen state a concurrent (ungated) scan walks. Tessera is COW, so a
+ * committed root is an immutable snapshot — the scan gets a consistent
+ * view of the filesystem without excluding writers from it, which is
+ * the entire trick that lets the gate be dropped.
+ */
+struct tessera_gc_scan {
+	int             concurrent;
+	uint64_t        inode_root;
+	uint64_t        registry_root;
+	uint64_t        snapshots_root;
+	tessera_hash_t *seeds;      /* in-flight refs, copied at activation */
+	uint32_t        nseeds;
+};
+
+/*
+ * Activation. Caller holds the flush gate.
+ *
+ * Everything that must be consistent with everything else is sampled in
+ * ONE flush_mtx section: the committed roots, the in-flight cache
+ * contents, and the gc_scan_active flip. That single section is what
+ * closes the straddle window — a publisher is either entirely before it
+ * (so its reference is in the seeds) or entirely after it (so its
+ * reference is in the touch bitmap).
+ *
+ * Returns 0 on success, errno on failure (caller skips the pass).
+ */
 static int
-tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
+tessera_fs_gc_scan_begin(struct tessera_mount *tmp_, struct tessera_gc_scan *s)
 {
+	memset(s, 0, sizeof *s);
+	s->concurrent = 1;
+
+	/* Lazily allocate the touch bitmap, ONCE per mount. It is never
+	 * freed before unmount, so a writer racing the end of a scan can
+	 * never dereference a freed pointer. malloc outside flush_mtx. */
+	if (tmp_->gc_touch_bm == NULL) {
+		uint8_t *bm = malloc(TESSERA_GC_TOUCH_BITS / 8, M_TESSERA,
+		    M_WAITOK | M_ZERO);
+		mtx_lock(&tmp_->flush_mtx);
+		if (tmp_->gc_touch_bm == NULL) {
+			tmp_->gc_touch_bm = bm;
+			bm = NULL;
+		}
+		mtx_unlock(&tmp_->flush_mtx);
+		if (bm != NULL) free(bm, M_TESSERA);
+	}
+
+	/* Size the seed buffer, allocate outside the lock, then commit —
+	 * retrying if the caches grew in between. M_WAITOK under flush_mtx
+	 * is forbidden, hence the two-step. */
+	for (int attempt = 0; attempt < 4; attempt++) {
+		mtx_lock(&tmp_->flush_mtx);
+		uint32_t scap = tmp_->dirty_count * 2 +
+		    tmp_->pending_manifest_count + 1024;
+		mtx_unlock(&tmp_->flush_mtx);
+
+		tessera_hash_t *seeds = malloc((size_t)scap * sizeof(*seeds),
+		    M_TESSERA, M_WAITOK);
+		uint32_t scount = 0;
+		int overflow = 0;
+
+		mtx_lock(&tmp_->flush_mtx);
+		for (uint32_t b = 0; b < TESSERA_DIRTY_INODE_BUCKETS &&
+		    !overflow; b++) {
+			struct tessera_dirty_inode *e;
+			LIST_FOREACH(e, &tmp_->dirty_inodes[b], link) {
+				if (e->tombstone) continue;
+				if (scount + 2 > scap) { overflow = 1; break; }
+				if (!tessera_hash_is_null(e->rec.manifest_hash))
+					memcpy(seeds[scount++],
+					    e->rec.manifest_hash,
+					    TESSERA_HASH_SIZE);
+				if (!tessera_hash_is_null(e->rec.xattr_hash))
+					memcpy(seeds[scount++],
+					    e->rec.xattr_hash,
+					    TESSERA_HASH_SIZE);
+			}
+		}
+		for (uint32_t b = 0; b < TESSERA_PENDING_MANIFEST_BUCKETS &&
+		    !overflow; b++) {
+			struct tessera_pending_manifest *pm;
+			LIST_FOREACH(pm, &tmp_->pending_manifests[b], link) {
+				if (scount + 1 > scap) { overflow = 1; break; }
+				memcpy(seeds[scount++], pm->hash,
+				    TESSERA_HASH_SIZE);
+			}
+		}
+		if (overflow) {
+			mtx_unlock(&tmp_->flush_mtx);
+			free(seeds, M_TESSERA);
+			continue;       /* caches grew — resize and retry */
+		}
+
+		/* Commit the activation, still inside the same section that
+		 * just read the caches. */
+		s->inode_root     = tmp_->sb.inode_root;
+		s->registry_root  = tmp_->sb.pack_registry_root;
+		s->snapshots_root = tmp_->sb.snapshots_root;
+		s->seeds          = seeds;
+		s->nseeds         = scount;
+		memset(tmp_->gc_touch_bm, 0, TESSERA_GC_TOUCH_BITS / 8);
+		tmp_->gc_scan_active = 1;
+		mtx_unlock(&tmp_->flush_mtx);
+		return (0);
+	}
+	return (EAGAIN);
+}
+
+static void
+tessera_fs_gc_scan_end(struct tessera_mount *tmp_, struct tessera_gc_scan *s)
+{
+	mtx_lock(&tmp_->flush_mtx);
+	tmp_->gc_scan_active = 0;
+	mtx_unlock(&tmp_->flush_mtx);
+	if (s->seeds != NULL) {
+		free(s->seeds, M_TESSERA);
+		s->seeds = NULL;
+	}
+}
+
+static int
+tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
+    struct tessera_gc_scan *scan)
+{
+	const int concurrent = (scan != NULL && scan->concurrent);
+	/* Trees the scan walks. Gated callers (mount time, the sysctl
+	 * entry point) use the live ones — nothing else is running. A
+	 * concurrent scan opens its own at the frozen roots, because the
+	 * live tmp_->*_tree roots move underneath it as writers commit. */
+	tessera_btree_t *scan_inode_tree = tmp_->inode_tree;
+	tessera_btree_t *scan_reg_tree   = tmp_->pack_registry_tree;
+	tessera_btree_t *scan_snap_tree  = tmp_->snapshots_tree;
+	tessera_btree_t *open_inode = NULL, *open_reg = NULL, *open_snap = NULL;
+
 	if (tmp_->inode_tree == NULL || tmp_->pack_registry_tree == NULL)
 		return (0);
+
+	if (concurrent) {
+		if (scan->inode_root != 0) {
+			open_inode = tessera_btree_open(&tmp_->meta_bio,
+			    scan->inode_root, /*tree_kind*/ 0, /*key*/ 4,
+			    /*value*/ TESSERA_INODE_RECORD_SIZE);
+			if (open_inode == NULL) return (0);
+			scan_inode_tree = open_inode;
+		}
+		if (scan->registry_root != 0) {
+			open_reg = tessera_btree_open(&tmp_->meta_bio,
+			    scan->registry_root, /*tree_kind*/ 1, /*key*/ 16,
+			    TESSERA_REGISTRY_ENTRY_SIZE);
+			if (open_reg == NULL) {
+				if (open_inode) tessera_btree_close(open_inode);
+				return (0);
+			}
+			scan_reg_tree = open_reg;
+		}
+		if (scan->snapshots_root != 0) {
+			open_snap = tessera_btree_open(&tmp_->meta_bio,
+			    scan->snapshots_root, /*tree_kind*/ 3, /*key*/ 8,
+			    TESSERA_SNAPSHOT_RECORD_SIZE);
+			scan_snap_tree = open_snap;   /* NULL is tolerated */
+		} else {
+			/* No snapshots at activation. Must NOT fall back to
+			 * the live tree — walking that ungated is exactly the
+			 * race this design exists to avoid. */
+			scan_snap_tree = NULL;
+		}
+	}
 
 	/* Pass 1: collect every live manifest_hash. v2 unionises across
 	 * the current SB's inode_tree AND every retained snapshot's
@@ -11534,14 +11929,14 @@ tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
 	tessera_btree_cursor_free(_c);                                    \
 } while (0)
 
-	_GC_WALK_INODE_TREE(tmp_->inode_tree);
+	_GC_WALK_INODE_TREE(scan_inode_tree);
 	printf("tessera_fs: gc pass1 — %u live hashes from current SB\n",
 	    live_count);
 
 	/* Snapshot inode_trees */
-	if (tmp_->snapshots_tree != NULL) {
+	if (scan_snap_tree != NULL) {
 		tessera_btree_cursor_t *sc =
-		    tessera_btree_seek_first(tmp_->snapshots_tree);
+		    tessera_btree_seek_first(scan_snap_tree);
 		uint32_t snap_count = 0;
 		while (sc != NULL && !gc_walk_abort) {
 			uint8_t sk[8];
@@ -11554,8 +11949,12 @@ tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
 			/* Skip the just-current snapshot; its tree is the
 			 * same root as tmp_->sb.inode_root and we already
 			 * walked it. */
+			/* Skip the tree we already walked. For a concurrent
+			 * scan that is the FROZEN root, not the live
+			 * sb.inode_root — which has moved on. */
 			if (srec.inode_root != 0 &&
-			    srec.inode_root != tmp_->sb.inode_root) {
+			    srec.inode_root != (concurrent ? scan->inode_root
+			                                   : tmp_->sb.inode_root)) {
 				tessera_btree_t *snap_inode =
 				    tessera_btree_open(&tmp_->meta_bio,
 				        srec.inode_root, /*tree_kind*/ 0,
@@ -11590,10 +11989,27 @@ tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
 	 * on it would free packs whose only references are inodes we failed
 	 * to enumerate. Bail with no reclaim; the next flush retries. (#66)
 	 */
+	/* Trees opened at the frozen roots by a concurrent scan. Every exit
+	 * from here on must close them. */
+#define _GC_CLOSE_SCAN_TREES() do {                                       \
+	if (open_inode != NULL) tessera_btree_close(open_inode);          \
+	if (open_reg   != NULL) tessera_btree_close(open_reg);            \
+	if (open_snap  != NULL) tessera_btree_close(open_snap);           \
+	open_inode = open_reg = open_snap = NULL;                         \
+} while (0)
+
 	if (gc_walk_abort) {
+		/* A concurrent scan reaches here for one EXTRA reason a gated
+		 * one cannot: the frozen roots were superseded and their meta
+		 * sectors recycled out from under the walk, so a node read
+		 * returns garbage. That degrades to a wasted pass, never to a
+		 * bad reclaim — which is exactly why the #66 abort-on-any-
+		 * non-ENOENT-cursor-status rule is load-bearing here. */
 		printf("tessera_fs: gc ABORTED — pass-1 live-set walk hit a "
 		    "btree read error; no reclaim this cycle\n");
+		tessera_stat_gc_aborts++;
 		free(live, M_TESSERA);
+		_GC_CLOSE_SCAN_TREES();
 		return (0);
 	}
 	/* In-flight state (task #37): inode records still in the dirty
@@ -11612,7 +12028,20 @@ tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
 	 * the GC pass entirely: reclaiming with an incomplete live set
 	 * is exactly the bug this fixes. */
 	int gc_seed_abort = 0;
-	{
+	if (concurrent) {
+		/* Already copied, atomically with the root freeze and the
+		 * gc_scan_active flip (tessera_fs_gc_scan_begin). Only the
+		 * walk — which does I/O — happens here, ungated. */
+		for (uint32_t si = 0; si < scan->nseeds; si++) {
+			tessera_inode_record_t fake;
+			memset(&fake, 0, sizeof fake);
+			memcpy(fake.manifest_hash, scan->seeds[si],
+			    TESSERA_HASH_SIZE);
+			_GC_WALK_RECORD(fake);
+		}
+		printf("tessera_fs: gc pass1 — %u in-flight seeds; "
+		    "%u total live hashes\n", scan->nseeds, live_count);
+	} else {
 		mtx_lock(&tmp_->flush_mtx);
 		uint32_t scap = tmp_->dirty_count * 2 +
 		    tmp_->pending_manifest_count + 1024;
@@ -11668,7 +12097,9 @@ tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
 	if (gc_seed_abort) {
 		printf("tessera_fs: gc ABORTED — in-flight seed buffer "
 		    "overflow (caches grew mid-scan); no reclaim\n");
+		tessera_stat_gc_aborts++;
 		free(live, M_TESSERA);
+		_GC_CLOSE_SCAN_TREES();
 		return (0);
 	}
 
@@ -11685,13 +12116,29 @@ tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
 		uint64_t start;             /* contig start, OR PEL sector if multi */
 		uint64_t len;               /* total length (sum of extents) */
 		uint32_t flags;             /* MULTI_EXTENT bit drives the free path */
+		/* The pack's blob hash, carried so the apply phase can test it
+		 * against the SATB touch filter. A concurrent scan decides
+		 * "dead" from a frozen view; between that decision and the
+		 * apply, a writer may have taken a fresh reference. */
+		tessera_hash_t bh;
+		/* MULTI_EXTENT packs only: the extent list and the PEL chain
+		 * sectors, RESOLVED DURING THE SCAN. Reading them in the apply
+		 * phase would put content-zone breads back under the gate —
+		 * the exact ABBA shape this whole change exists to remove (GC
+		 * sleeps in bufwait holding the gate; a writer holds that
+		 * buffer and sleeps on the gate). Apply must be pure in-memory
+		 * bookkeeping plus registry btree ops. */
+		tessera_pack_extent_t *exts;
+		uint32_t               nexts;
+		uint64_t              *pels;
+		uint32_t               npels;
 	};
 	uint32_t dead_cap = 16, dead_count = 0;
 	struct dead *deads = malloc(dead_cap * sizeof(*deads), M_TESSERA,
 	    M_WAITOK);
 
 	tessera_btree_cursor_t *pc =
-	    tessera_btree_seek_first(tmp_->pack_registry_tree);
+	    tessera_btree_seek_first(scan_reg_tree);
 	if (pc != NULL) {
 		for (;;) {
 			uint8_t pkey[16];
@@ -11769,10 +12216,61 @@ tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
 					free(deads, M_TESSERA);
 					deads = grown;
 				}
-				memcpy(deads[dead_count].pack_id, pkey, 16);
-				deads[dead_count].start = re.start_sector;
-				deads[dead_count].len   = re.length_sectors;
-				deads[dead_count].flags = re.flags;
+				struct dead *d = &deads[dead_count];
+				memcpy(d->pack_id, pkey, 16);
+				d->start = re.start_sector;
+				d->len   = re.length_sectors;
+				d->flags = re.flags;
+				memcpy(d->bh, bh, sizeof(tessera_hash_t));
+				d->exts  = NULL; d->nexts = 0;
+				d->pels  = NULL; d->npels = 0;
+
+				/* Resolve the extent list and PEL chain NOW,
+				 * while ungated. The apply phase must not read
+				 * the data zone. */
+				if ((re.flags &
+				    TESSERA_REGISTRY_FLAG_MULTI_EXTENT) != 0) {
+					tessera_pack_extent_t *dex = NULL;
+					uint32_t ndex = 0;
+					if (tessera_fs_pack_extents_resolve(
+					    tmp_, &re, &dex, &ndex) == 0) {
+						d->exts  = dex;
+						d->nexts = ndex;
+					}
+					uint64_t pel_s = re.start_sector;
+					uint64_t plist[64];
+					uint32_t pn = 0;
+					for (int dd = 0; dd < 64 && pel_s != 0;
+					     dd++) {
+						struct buf *bp = NULL;
+						uint64_t next = 0;
+						if (bread(tmp_->devvp, pel_s *
+						    btodb(TESSERA_SECTOR_SIZE),
+						    TESSERA_SECTOR_SIZE,
+						    tmp_->bio_ctx.cred ?
+						        tmp_->bio_ctx.cred :
+						        NOCRED, &bp) == 0) {
+							tessera_pack_extent_list_t
+							    pel;
+							if (tessera_decode_pack_extent_list(
+							    (const uint8_t *)
+							    bp->b_data, &pel)
+							    == TESSERA_OK)
+								next = pel.next_pel_sector;
+							brelse(bp);
+						}
+						plist[pn++] = pel_s;
+						pel_s = next;
+					}
+					if (pn > 0) {
+						d->pels = malloc(pn *
+						    sizeof(uint64_t), M_TESSERA,
+						    M_WAITOK);
+						memcpy(d->pels, plist,
+						    pn * sizeof(uint64_t));
+						d->npels = pn;
+					}
+				}
 				dead_count++;
 			}
 next_p:
@@ -11781,12 +12279,49 @@ next_p:
 		tessera_btree_cursor_free(pc);
 	}
 	free(live, M_TESSERA);
+	_GC_CLOSE_SCAN_TREES();
 	printf("tessera_fs: gc pass2 done — %u dead packs\n", dead_count);
 
-	/* Pass 3: apply. btree_delete each dead key, extent_free each
-	 * range, then commit. Bump the relocation generation first so
-	 * any in-flight fetch that resolved a doomed pack's extents
-	 * retries instead of reading freed (possibly reused) sectors. */
+	/*
+	 * ── Pass 3: APPLY ───────────────────────────────────────────
+	 *
+	 * Everything above ran without the flush gate. Take it now, for a
+	 * span bounded by dead_count rather than by the size of the volume,
+	 * and doing no data-zone reads (extents and PEL chains were
+	 * resolved during the scan).
+	 */
+	if (concurrent)
+		tessera_fs_flush_gate_enter(tmp_);
+
+	/*
+	 * SATB filter. The scan decided "dead" from a view frozen at
+	 * activation; a writer may have published or re-referenced any of
+	 * these since. Drop those candidates — they are reclaimed by a
+	 * later pass once they are genuinely unreferenced.
+	 */
+	if (concurrent && dead_count > 0) {
+		uint32_t kept = 0;
+		for (uint32_t i = 0; i < dead_count; i++) {
+			if (tessera_fs_gc_hash_touched(tmp_, deads[i].bh)) {
+				tessera_stat_gc_touch_keeps++;
+				if (deads[i].exts) free(deads[i].exts, M_TESSERA);
+				if (deads[i].pels) free(deads[i].pels, M_TESSERA);
+				continue;
+			}
+			if (kept != i) deads[kept] = deads[i];
+			kept++;
+		}
+		if (kept != dead_count)
+			printf("tessera_fs: gc — %u of %u candidates spared by "
+			    "the touch filter (referenced mid-scan)\n",
+			    dead_count - kept, dead_count);
+		dead_count = kept;
+	}
+
+	/* btree_delete each dead key, extent_free each range, then commit.
+	 * Bump the relocation generation first so any in-flight fetch that
+	 * resolved a doomed pack's extents retries instead of reading freed
+	 * (possibly reused) sectors. */
 	if (dead_count > 0)
 		atomic_add_rel_64(&tmp_->pack_reloc_gen, 1);
 	uint64_t new_pack_root = tmp_->sb.pack_registry_root;
@@ -11801,47 +12336,64 @@ next_p:
 			(void)tessera_extent_free(tmp_->extent_alloc,
 			    deads[i].start, deads[i].len);
 		} else {
-			/* Multi-extent: read the PEL, free each extent, then
-			 * free the PEL sector itself. */
-			tessera_registry_entry_t fake;
-			memset(&fake, 0, sizeof fake);
-			fake.start_sector   = deads[i].start;
-			fake.length_sectors = deads[i].len;
-			fake.flags          = deads[i].flags;
-			tessera_pack_extent_t *exts = NULL;
-			uint32_t nexts = 0;
-			if (tessera_fs_pack_extents_resolve(tmp_, &fake,
-			    &exts, &nexts) == 0) {
-				for (uint32_t e = 0; e < nexts; e++)
+			/* Multi-extent. Both the extent list and the PEL chain
+			 * were resolved during the ungated scan, so this is
+			 * pure allocator bookkeeping — no reads under the
+			 * gate. A gated caller (mount time) resolves inline,
+			 * which is fine: nothing else is running then. */
+			tessera_pack_extent_t *exts = deads[i].exts;
+			uint32_t nexts = deads[i].nexts;
+			tessera_pack_extent_t *tofree = NULL;
+			if (exts == NULL) {
+				tessera_registry_entry_t fake;
+				memset(&fake, 0, sizeof fake);
+				fake.start_sector   = deads[i].start;
+				fake.length_sectors = deads[i].len;
+				fake.flags          = deads[i].flags;
+				if (tessera_fs_pack_extents_resolve(tmp_,
+				    &fake, &exts, &nexts) == 0)
+					tofree = exts;
+				else
+					nexts = 0;
+			}
+			for (uint32_t e = 0; e < nexts; e++)
+				(void)tessera_extent_free(tmp_->extent_alloc,
+				    exts[e].start_sector,
+				    exts[e].length_sectors);
+			if (tofree != NULL) free(tofree, M_TESSERA);
+
+			/* Free the PEL chain sectors. */
+			if (deads[i].pels != NULL) {
+				for (uint32_t p = 0; p < deads[i].npels; p++)
 					(void)tessera_extent_free(
 					    tmp_->extent_alloc,
-					    exts[e].start_sector,
-					    exts[e].length_sectors);
-			}
-			free(exts, M_TESSERA);
-			/* Walk + free the PEL chain (one or more sectors). */
-			uint64_t pel_s = deads[i].start;
-			for (int d = 0; d < 64 && pel_s != 0; d++) {
-				struct buf *bp = NULL;
-				uint64_t next = 0;
-				if (bread(tmp_->devvp,
-				    pel_s * btodb(TESSERA_SECTOR_SIZE),
-				    TESSERA_SECTOR_SIZE,
-				    tmp_->bio_ctx.cred ?
-				        tmp_->bio_ctx.cred : NOCRED,
-				    &bp) == 0) {
-					tessera_pack_extent_list_t pel;
-					if (tessera_decode_pack_extent_list(
-					    (const uint8_t *)bp->b_data, &pel)
-					    == TESSERA_OK)
-						next = pel.next_pel_sector;
-					brelse(bp);
+					    deads[i].pels[p], 1);
+			} else {
+				uint64_t pel_s = deads[i].start;
+				for (int d = 0; d < 64 && pel_s != 0; d++) {
+					struct buf *bp = NULL;
+					uint64_t next = 0;
+					if (bread(tmp_->devvp,
+					    pel_s * btodb(TESSERA_SECTOR_SIZE),
+					    TESSERA_SECTOR_SIZE,
+					    tmp_->bio_ctx.cred ?
+					        tmp_->bio_ctx.cred : NOCRED,
+					    &bp) == 0) {
+						tessera_pack_extent_list_t pel;
+						if (tessera_decode_pack_extent_list(
+						    (const uint8_t *)bp->b_data,
+						    &pel) == TESSERA_OK)
+							next = pel.next_pel_sector;
+						brelse(bp);
+					}
+					(void)tessera_extent_free(
+					    tmp_->extent_alloc, pel_s, 1);
+					pel_s = next;
 				}
-				(void)tessera_extent_free(tmp_->extent_alloc,
-				    pel_s, 1);
-				pel_s = next;
 			}
 		}
+		if (deads[i].exts != NULL) free(deads[i].exts, M_TESSERA);
+		if (deads[i].pels != NULL) free(deads[i].pels, M_TESSERA);
 	}
 	free(deads, M_TESSERA);
 
@@ -11852,8 +12404,86 @@ next_p:
 		(void)tessera_commit_sb(tmp_);
 		printf("tessera_fs: gc post commit_sb\n");
 	}
+	if (concurrent)
+		tessera_fs_flush_gate_exit(tmp_);
+	tessera_stat_gc_reclaimed += dead_count;
 	printf("tessera_fs: gc done\n");
 	return ((int)dead_count);
+#undef _GC_CLOSE_SCAN_TREES
+}
+
+/* Gated entry point — mount time and the sysctl/ioctl forced sweep,
+ * where the caller already holds the gate and nothing else is running. */
+static int
+tessera_fs_gc_data_zone(struct tessera_mount *tmp_)
+{
+	return (tessera_fs_gc_data_zone_ex(tmp_, NULL));
+}
+
+/*
+ * ★ tasks #72/#71: the background, UNGATED data-zone GC.
+ *
+ * Runs on gc_tq — a PRIVATE taskqueue. Never taskqueue_thread: task #67
+ * established that gate-taking work on the shared queue wedges the whole
+ * system, because thread_reap_task and every other subsystem's deferred
+ * work queues behind it.
+ */
+static void
+tessera_fs_gc_task(void *ctx, int pending)
+{
+	struct tessera_mount *tmp_ = ctx;
+	struct tessera_gc_scan scan;
+	sbintime_t t0;
+	int n;
+
+	(void)pending;
+	if (tmp_->flush_unmounting || tmp_->readonly_snapshot)
+		goto out;
+	if (tmp_->inode_tree == NULL || tmp_->pack_registry_tree == NULL)
+		goto out;
+
+	/* Activation needs the gate — briefly, and with no I/O under it. */
+	tessera_fs_flush_gate_enter(tmp_);
+	int berr = tessera_fs_gc_scan_begin(tmp_, &scan);
+	tessera_fs_flush_gate_exit(tmp_);
+	if (berr != 0) {
+		printf("tessera_fs: gc — could not snapshot in-flight state "
+		    "(%d); skipping this pass\n", berr);
+		goto out;
+	}
+
+	tessera_stat_gc_scans++;
+	t0 = TPROF_T0();
+	n = tessera_fs_gc_data_zone_ex(tmp_, &scan);
+	tessera_stat_gc_scan_ms +=
+	    (unsigned long)(sbttons(sbinuptime() - t0) / 1000000);
+	tessera_fs_gc_scan_end(tmp_, &scan);
+
+	/* Same productivity backoff as before: a pass that reclaims nothing
+	 * doubles the retry interval. Off the gate this is no longer a
+	 * correctness matter — an unproductive pass no longer stalls every
+	 * writer — but it still keeps a fruitless O(volume) walk from
+	 * burning I/O bandwidth continuously. */
+	if (n > 0)
+		tmp_->tombstone_gc_backoff = hz / 2;
+	else {
+		int nb = (tmp_->tombstone_gc_backoff > 0 ?
+		    tmp_->tombstone_gc_backoff : hz / 2) * 2;
+		if (nb > 60 * hz) nb = 60 * hz;
+		tmp_->tombstone_gc_backoff = nb;
+	}
+out:
+	atomic_store_rel_int((volatile int *)&tmp_->gc_task_armed, 0);
+}
+
+/* Enqueue a GC pass if one isn't already queued or running. */
+static void
+tessera_fs_gc_arm(struct tessera_mount *tmp_)
+{
+	if (!tmp_->gc_tq_init || tmp_->flush_unmounting)
+		return;
+	if (atomic_cmpset_acq_int((volatile int *)&tmp_->gc_task_armed, 0, 1))
+		taskqueue_enqueue(tmp_->gc_tq, &tmp_->gc_task);
 }
 
 /*
@@ -11891,6 +12521,12 @@ tessera_fs_publish_manifest_owned_ex(struct tessera_mount *tmp_,
 		return (EROFS);
 
 	TESSERA_MP_HASH(tmp_, manifest_bytes, mlen, out_hash);
+
+	/* ★ #72 SATB barrier, covering all three outcomes below in one
+	 * place: the dedup short-circuit (which takes a NEW reference to an
+	 * EXISTING pack and writes nothing — invisible everywhere else),
+	 * the pending-cache deferral, and the write-through to disk. */
+	tessera_fs_gc_note_hash(tmp_, out_hash);
 
 	/* Publish-cache shortcut (publish_dedup): pack_id is derived
 	 * from the manifest hash, so identical content lands at the same
@@ -11955,6 +12591,9 @@ tessera_fs_publish_manifest_owned_move(struct tessera_mount *tmp_,
 		memcpy(out_hash, precomputed_hash, sizeof(tessera_hash_t));
 	else
 		TESSERA_MP_HASH(tmp_, manifest_bytes, mlen, out_hash);
+
+	/* ★ #72 SATB barrier — see publish_manifest_owned_ex. */
+	tessera_fs_gc_note_hash(tmp_, out_hash);
 
 	/* publish_dedup pre-check — see publish_manifest_owned_ex. */
 	{
@@ -13379,6 +14018,17 @@ tessera_fs_publish_chunked(struct tessera_mount *tmp_,
 		return (EROFS);
 
 	TESSERA_MP_HASH(tmp_, manifest_bytes, mlen, out_manifest_hash);
+
+	/* ★ #72 SATB barrier. Both the manifest AND every chunk hash: a
+	 * batch that holds a single chunk is emitted as a blob_count==1
+	 * pack, which is precisely the shape the data-zone GC reclaims. The
+	 * dedup short-circuit right below makes this mandatory rather than
+	 * belt-and-braces — a re-publish of identical content writes
+	 * nothing at all, so this note is the ONLY trace that the pack is
+	 * still referenced. */
+	tessera_fs_gc_note_hash(tmp_, out_manifest_hash);
+	for (uint32_t _ci = 0; _ci < n_chunks; _ci++)
+		tessera_fs_gc_note_hash(tmp_, chunks[_ci].hash);
 
 	uint8_t pack_id[16];
 	memcpy(pack_id, out_manifest_hash, 16);
