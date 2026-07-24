@@ -1595,6 +1595,49 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, meta_free_lowat, CTLFLAG_RW,
     &tessera_meta_free_lowat, 0,
     "flush preflight arms when the meta recycle list falls to this many "
     "sectors (not just when it is exactly empty)");
+/*
+ * ★ task #73: EMERGENCY HEADROOM BAND.
+ *
+ * A slice at the top of the meta-reserve that the LIVE filesystem may never
+ * bump-allocate into. Offline repair tools get the whole reserve, because the
+ * band is enforced here in the kmod allocator only — tessera-fsck and
+ * tessera-repack drive their own allocator shim and are unaffected.
+ *
+ * Why this must exist: at 100% reserve a volume is simultaneously
+ * UNREPAIRABLE and UNCOMPACTABLE-SAFELY. Observed on the dev root:
+ *   - `tessera-fsck --repair` aborted at its first mutation
+ *     ("btree_delete(inode 582724) during orphan free") because btree_delete
+ *     COWs and COW needs reserve sectors;
+ *   - `tessera-repack -y` (crash-safe) refused: "insufficient reserve headroom
+ *     ... only 0 free sectors above the bump";
+ *   - the only remaining exit was `--force`, an in-place rewrite that is
+ *     explicitly NOT crash-safe. A power cut during it loses the volume.
+ * Reserving a small band means fsck --repair and the STAGED repack always have
+ * somewhere to land, so recovery never requires the unsafe path.
+ *
+ * The trade-off is deliberate and cheap: the live FS gives up a few MiB of
+ * metadata capacity and starts failing bump allocations slightly earlier, in
+ * exchange for a guarantee that the volume can always be repaired safely.
+ * Failing earlier is also strictly better behaviour — with ed8b26a the
+ * pressure kick reclaims well before this point, so reaching the band at all
+ * means reclamation genuinely could not keep up.
+ *
+ * Capped at 1/8 of the reserve so small volumes are not crippled by the
+ * absolute default.
+ */
+static int tessera_meta_emergency_band = 8192;   /* sectors */
+SYSCTL_INT(_kern_tessera, OID_AUTO, meta_emergency_band, CTLFLAG_RW,
+    &tessera_meta_emergency_band, 0,
+    "sectors at the top of the meta-reserve the live FS may never bump into, "
+    "kept so offline fsck --repair and staged repack always have room "
+    "(0 = disable; capped at 1/8 of the reserve)");
+static unsigned long tessera_stat_meta_band_refusals = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, meta_band_refusals, CTLFLAG_RD,
+    &tessera_stat_meta_band_refusals, 0,
+    "bump allocations refused to protect the emergency headroom band");
+
+/* Defined after struct tessera_mount. */
+static uint64_t tessera_meta_soft_length(const struct tessera_mount *tmp_);
 static int tessera_preflight_enable = 1;
 SYSCTL_INT(_kern_tessera, OID_AUTO, preflight, CTLFLAG_RW,
     &tessera_preflight_enable, 0, "1 = flush-start meta-reserve preflight pinscan");
@@ -2563,6 +2606,22 @@ tessera_fs_meta_pending_drain(struct tessera_mount *tmp_)
 	tessera_stat_meta_free_now    = tmp_->meta_free_count;
 }
 
+/* Sectors of reserve the live FS may bump into — the ceiling minus the
+ * emergency band. See the tessera_meta_emergency_band comment. */
+static uint64_t
+tessera_meta_soft_length(const struct tessera_mount *tmp_)
+{
+	uint64_t len = tmp_->sb.meta_reserve_length;
+	uint64_t band;
+
+	if (tessera_meta_emergency_band <= 0)
+		return (len);
+	band = (uint64_t)tessera_meta_emergency_band;
+	if (band > len / 8)
+		band = len / 8;          /* never starve a small volume */
+	return (len > band ? len - band : len);
+}
+
 static int
 tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 {
@@ -2602,6 +2661,34 @@ tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 	}
 	const uint64_t used = tmp_->sb.meta_reserve_bump
 	    - tmp_->sb.meta_reserve_start;
+	/*
+	 * ★ task #73: stop at the emergency band, not at the hard ceiling, so
+	 * offline repair always has room. Reuse above already succeeded if it
+	 * could — recycled sectors consume no new headroom, so the band never
+	 * blocks them.
+	 */
+	const uint64_t soft = tessera_meta_soft_length(tmp_);
+	if (used + n > soft && used + n <= tmp_->sb.meta_reserve_length) {
+		tessera_stat_meta_band_refusals++;
+		time_t _bnow = (time_t)time_uptime;
+		if (_bnow != tmp_->meta_exhaust_last_log_sec) {
+			tmp_->meta_exhaust_last_log_sec = _bnow;
+			printf("tessera_fs: meta_reserve at the emergency band — "
+			    "used=%lu of %lu (soft limit %lu), free_count=%u, "
+			    "pending=%u. Refusing to consume the band so offline "
+			    "fsck --repair and staged repack keep working; "
+			    "reclaim should recover it (total refusals=%lu)\n",
+			    (unsigned long)used,
+			    (unsigned long)tmp_->sb.meta_reserve_length,
+			    (unsigned long)soft, tmp_->meta_free_count,
+			    tmp_->meta_pending_count,
+			    tessera_stat_meta_band_refusals);
+		}
+		/* Ask for reclaim right now — this is the loudest possible
+		 * signal that the reserve needs a scan (self-throttled). */
+		tessera_meta_pin_bitmap_rebuild(tmp_);
+		return (-1);
+	}
 	if (used + n > tmp_->sb.meta_reserve_length) {
 		/* Rate-limit to 1/s: under a tight-commit hammer on a big tree
 		 * the bump can hit the ceiling on many consecutive allocs
@@ -10240,11 +10327,16 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	 * a concurrent-scan hazard (the pinscan_run reentrancy guard now makes
 	 * that call a safe no-op, but firing it during every scan is pointless
 	 * churn/log-noise); the background scan itself replenishes meta_free. */
+	/* ★ task #73: measure headroom against the SOFT limit (ceiling minus
+	 * the emergency band), so the synchronous recovery fires BEFORE the
+	 * allocator starts refusing to protect the band — not after. Guard the
+	 * subtraction: the bump can already sit inside the band on a volume
+	 * mounted in that state. */
+	uint64_t _soft = tessera_meta_soft_length(tmp_);
+	uint64_t _used = tmp_->sb.meta_reserve_bump - tmp_->sb.meta_reserve_start;
 	if (tessera_preflight_enable && tmp_->dirty_init &&
 	    tmp_->meta_free_count <= (uint32_t)tessera_meta_free_lowat &&
-	    tmp_->sb.meta_reserve_length -
-	    (tmp_->sb.meta_reserve_bump - tmp_->sb.meta_reserve_start)
-	    < 8192) {
+	    (_used >= _soft || _soft - _used < 8192)) {
 		printf("tessera_fs: meta_reserve preflight — synchronous "
 		    "pinscan (pending=%u)\n", tmp_->meta_pending_count);
 		tessera_fs_pinscan_run(tmp_);
