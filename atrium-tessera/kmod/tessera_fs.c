@@ -1638,6 +1638,29 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, meta_band_refusals, CTLFLAG_RD,
 
 /* Defined after struct tessera_mount. */
 static uint64_t tessera_meta_soft_length(const struct tessera_mount *tmp_);
+/*
+ * ★ task #80 pre-reservation knobs. See tessera_fs_space_admit.
+ *
+ * meta_publish_resv: data-zone sectors charged per staged metadata object
+ * (pending manifest / dirty inode) for the pack it must still publish. The
+ * old admission test counted only content bytes, so staged metadata was
+ * free — and the flush then could not publish it.
+ *
+ * remove_reserve: sectors only the removal path may spend. Unlink is how a
+ * full volume gets unstuck, but it republishes the parent directory
+ * manifest, so it needs space too. Letting creates spend the last sector
+ * strands removals as well, which is the state that corrupts.
+ */
+static int tessera_meta_publish_resv = 4;
+SYSCTL_INT(_kern_tessera, OID_AUTO, meta_publish_resv, CTLFLAG_RW,
+    &tessera_meta_publish_resv, 0,
+    "data-zone sectors reserved per staged metadata object for its "
+    "eventual publish (0 = disable, restores the pre-#80 behaviour)");
+static int tessera_remove_reserve = 2048;
+SYSCTL_INT(_kern_tessera, OID_AUTO, remove_reserve, CTLFLAG_RW,
+    &tessera_remove_reserve, 0,
+    "data-zone sectors withheld from creates/writes so unlink can always "
+    "republish a directory manifest on a full volume");
 static int tessera_preflight_enable = 1;
 SYSCTL_INT(_kern_tessera, OID_AUTO, preflight, CTLFLAG_RW,
     &tessera_preflight_enable, 0, "1 = flush-start meta-reserve preflight pinscan");
@@ -9104,6 +9127,47 @@ tessera_fs_space_admit(struct tessera_mount *tmp_, size_t delta_bytes)
 	uint64_t need = (tmp_->dirty_content_bytes +
 	    tmp_->pending_manifest_bytes + delta_bytes +
 	    TESSERA_SECTOR_SIZE - 1) / TESSERA_SECTOR_SIZE;
+
+	/*
+	 * ★ task #80: charge for the METADATA the staged work still has to
+	 * publish, not just its content bytes.
+	 *
+	 * This admission test covered dirty_content_bytes and
+	 * pending_manifest_bytes — the DATA. But every staged dirent
+	 * mutation and every dirty inode also has to publish a directory
+	 * manifest and a pack at flush time, and that costs data-zone
+	 * sectors nobody was accounting for. So the FS kept accepting work
+	 * until the flush could no longer publish what was already staged.
+	 *
+	 * When that publish fails, a removal's two halves complete
+	 * independently — the dirent goes but the inode record stays, or the
+	 * reverse — and the volume comes back with dangling dirents and
+	 * orphan inodes. Reproduced on a 256 MiB volume: 192 orphans and 5
+	 * dangling dirents, the 5 being exactly the files the workload had
+	 * deleted.
+	 *
+	 * Reordering the drain cannot fix that (tried, measured, reverted:
+	 * it turned 8 problems into 2429). Ordering only chooses which half
+	 * leaks. The pair has to become unaffordable BEFORE it is staged,
+	 * which is what this term does.
+	 */
+	need += ((uint64_t)tmp_->pending_manifest_count +
+	         (uint64_t)tmp_->dirty_count) *
+	        (uint64_t)tessera_meta_publish_resv;
+
+	/*
+	 * ★ task #80: keep a slice only REMOVALS may spend.
+	 *
+	 * Unlinking is the escape valve — it is how a full volume gets
+	 * unstuck — but it is not free: it republishes the parent's
+	 * directory manifest. If creates are allowed to consume the last
+	 * sector, removals cannot complete either, and that is precisely
+	 * the deadlock that corrupts. Admission applies to work that ADDS
+	 * (writes, creates); the remove path does not call this, so this
+	 * band is what it spends.
+	 */
+	slack += (uint64_t)tessera_remove_reserve;
+
 	if (free_sec < need + slack)
 		return (ENOSPC);
 	return (0);
