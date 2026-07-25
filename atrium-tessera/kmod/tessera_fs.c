@@ -540,6 +540,21 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, epoch_sweeps, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, epoch_reclaimed, CTLFLAG_RD,
     &tessera_stat_epoch_reclaimed, 0,
     "sectors recycled mid-flush because no durable SB ever referenced them");
+/* ★ #80: flushes aborted because the dirent checkpoint could not publish.
+ * A nonzero count means the FS refused to commit half of a
+ * rename/unlink/create — the alternative is the dangling dirent / orphan
+ * inode corruption this counter exists to prove is gone. */
+static unsigned long tessera_stat_dirent_ckpt_fail = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, dirent_ckpt_fail, CTLFLAG_RD,
+    &tessera_stat_dirent_ckpt_fail, 0,
+    "flushes aborted because the dirent-log checkpoint failed to publish");
+/* ★ #80: staged inodes rolled back because their dirent add failed. Each
+ * one is an orphan inode that did NOT get created. */
+static unsigned long tessera_stat_create_rollback = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, create_rollback, CTLFLAG_RD,
+    &tessera_stat_create_rollback, 0,
+    "staged inodes rolled back after their dirent add failed (would have "
+    "become orphan inodes)");
 static unsigned long tessera_stat_lookup_no_inode     = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_no_inode, CTLFLAG_RD,
     &tessera_stat_lookup_no_inode, 0,
@@ -1896,6 +1911,8 @@ struct tessera_mount {
 	 * cannot re-run back-to-back under the flush gate and starve every
 	 * writer (task #67); reset to the base on a productive run. */
 	int                       tombstone_gc_backoff;
+	/* ★ #80: rate-limit the dirent-checkpoint-failure log to 1/s. */
+	time_t                    dirent_ckpt_fail_log_sec;
 
 	/* ★ tasks #72/#71: data-zone GC no longer runs inside the flush
 	 * gate. The gate cannot be held across gc_data_zone's blocking
@@ -10696,8 +10713,36 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	 * + inode_tree updates which feed into the existing drains
 	 * naturally. */
 	_tp = TPROF_T0();
-	(void)tessera_fs_dirent_log_checkpoint_all(tmp_);
+	/*
+	 * ★ task #80: this return value used to be discarded entirely. Every
+	 * other drain stage gates the commit through `r`; this one does not,
+	 * so a parent whose directory-manifest republish fails is silently
+	 * skipped while the rest of the flush commits.
+	 *
+	 * Report it, do not act on it — YET. Making a failed checkpoint abort
+	 * the commit was implemented and MEASURED (20 runs): it fired 7 times
+	 * and the run in which it fired came back with a dangling BLOB ref
+	 * instead, because aborting mid-flush strands manifests the
+	 * checkpoint had already pointed the in-memory inode roots at. So the
+	 * hole is real but the naive abort trades one corruption for another;
+	 * closing it properly requires unwinding the staged manifests too.
+	 * Until then this counter is how we know the condition occurred.
+	 */
+	int dirent_rc = tessera_fs_dirent_log_checkpoint_all(tmp_);
 	TPROF_ADD(TPROF_FL_DIRENT, _tp);
+	if (dirent_rc != 0) {
+		tessera_stat_dirent_ckpt_fail++;
+		time_t _dnow = (time_t)time_uptime;
+		if (_dnow != tmp_->dirent_ckpt_fail_log_sec) {
+			tmp_->dirent_ckpt_fail_log_sec = _dnow;
+			printf("tessera_fs: flush — dirent checkpoint failed: "
+			    "%d; some parent's directory manifest did NOT "
+			    "publish and the rest of this flush still commits "
+			    "(log_count=%u dirty=%u total_fails=%lu)\n",
+			    dirent_rc, tmp_->dirent_log_count,
+			    tmp_->dirty_count, tessera_stat_dirent_ckpt_fail);
+		}
+	}
 
 	/* Drain dirty inodes BEFORE commit_sb so the SB sectors written
 	 * by commit_sb capture the post-drain inode_root. drain itself
@@ -20025,7 +20070,31 @@ tessera_vop_create_impl(struct vop_create_args *ap)
 		    /*op=ADD*/ 0, /*verify*/ 0,
 		    /*add_inode*/ new_ino,
 		    cnp->cn_nameptr, cnp->cn_namelen);
-		if (drc != 0) { err = drc; goto out; }
+		if (drc != 0) {
+			/*
+			 * ★ task #80: ROLL BACK the staged inode record.
+			 *
+			 * Step 3 above already staged the new inode into the
+			 * dirty cache. If the dirent add fails here — ENOSPC
+			 * publishing the parent's directory manifest is the
+			 * common case — returning without undoing that leaves
+			 * an inode record that the next flush commits with NO
+			 * dirent naming it: an ORPHAN INODE, unreachable from
+			 * the root. Measured: a single failing ENOSPC run
+			 * produced 718 of them, at high inode numbers, which
+			 * is exactly this path firing under space pressure.
+			 *
+			 * Nothing else can reference the inode yet: the vnode
+			 * is only minted in step 5, below, so there is no open
+			 * fd to honour and a hard delete is correct here (as
+			 * opposed to inode_unlink, which keeps an nlink=0
+			 * record alive for POSIX open-file semantics — that
+			 * would leave the very orphan we are avoiding).
+			 */
+			(void)tessera_fs_inode_delete(tmp_, new_ino);
+			tessera_stat_create_rollback++;
+			err = drc; goto out;
+		}
 	}
 
 	/* 5. Get a deduped vnode for the new inode. tessera_vget reads
@@ -20459,7 +20528,15 @@ tessera_vop_mkdir(struct vop_mkdir_args *ap)
 	err = tessera_fs_dirent_rewrite(tmp_, (uint32_t)dn->inode_no,
 	    /*op*/ 0, /*verify*/ 0, /*add_inode*/ new_ino,
 	    cnp->cn_nameptr, cnp->cn_namelen);
-	if (err != 0) goto out;
+	if (err != 0) {
+		/* ★ #80: roll back the staged inode — without this the next
+		 * flush commits a directory inode with no dirent naming it
+		 * (orphan). Same reasoning as vop_create; no vnode exists
+		 * yet, so a hard delete is correct. */
+		(void)tessera_fs_inode_delete(tmp_, new_ino);
+		tessera_stat_create_rollback++;
+		goto out;
+	}
 
 	/* Get a deduped vnode for the new dir. */
 	struct vnode *cvp;
@@ -20669,7 +20746,12 @@ tessera_vop_symlink(struct vop_symlink_args *ap)
 	err = tessera_fs_dirent_rewrite(tmp_, (uint32_t)dn->inode_no,
 	    /*op*/ 0, /*verify*/ 0, /*add*/ new_ino,
 	    cnp->cn_nameptr, cnp->cn_namelen);
-	if (err != 0) goto out;
+	if (err != 0) {
+		/* ★ #80: roll back the staged inode (see vop_create). */
+		(void)tessera_fs_inode_delete(tmp_, new_ino);
+		tessera_stat_create_rollback++;
+		goto out;
+	}
 
 	struct vnode *cvp;
 	if (tessera_vget(dvp->v_mount, new_ino, dn->inode_no, &cvp) != 0) {
