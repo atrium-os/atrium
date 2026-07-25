@@ -531,6 +531,15 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_skips_active, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_aborts, CTLFLAG_RD,
     &tessera_stat_pinscan_aborts, 0,
     "pinscan runs that aborted before swapping (unmount teardown only)");
+/* ★ #73: intra-flush (epoch) sector recycling. See meta_epoch_bm. */
+static unsigned long tessera_stat_epoch_sweeps    = 0;
+static unsigned long tessera_stat_epoch_reclaimed = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, epoch_sweeps, CTLFLAG_RD,
+    &tessera_stat_epoch_sweeps, 0,
+    "meta-reserve sweeps for intra-flush-recyclable sectors (#73)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, epoch_reclaimed, CTLFLAG_RD,
+    &tessera_stat_epoch_reclaimed, 0,
+    "sectors recycled mid-flush because no durable SB ever referenced them");
 static unsigned long tessera_stat_lookup_no_inode     = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_no_inode, CTLFLAG_RD,
     &tessera_stat_lookup_no_inode, 0,
@@ -1936,6 +1945,19 @@ struct tessera_mount {
 	volatile uint64_t         gc_apply_gen;
 	uint8_t                  *meta_pin_bitmap;
 	size_t                    meta_pin_bitmap_bytes;
+	/*
+	 * ★ task #73: epoch bitmap — bit set for every meta sector allocated
+	 * since the last SUCCESSFUL commit_sb, cleared wholesale at commit.
+	 *
+	 * A sector both allocated AND freed within the current uncommitted
+	 * flush is intra-flush COW garbage: no durable superblock has ever
+	 * referenced it, so it is safe to hand straight back out. Sectors
+	 * freed from the previously-committed tree are NOT — the on-disk SB
+	 * still points at them until the next commit_sb, which is why they
+	 * must sit in meta_pending. Distinguishing the two is what lets a
+	 * long drain recycle instead of walking the bump to the ceiling.
+	 */
+	uint8_t                  *meta_epoch_bm;
 
 	/* v2-step-2a: deferred-commit state. See sysctl block above. */
 	int                       sb_dirty;
@@ -2707,6 +2729,77 @@ tessera_meta_soft_length(const struct tessera_mount *tmp_)
 	return (len > band ? len - band : len);
 }
 
+/*
+ * ★ task #73 — intra-flush sector recycling.
+ *
+ * Mark a sector as allocated in the current (uncommitted) epoch. Cleared
+ * wholesale by commit_sb, at which point everything still live is durable.
+ */
+static __inline void
+tessera_meta_epoch_mark(struct tessera_mount *tmp_, uint64_t s)
+{
+	if (tmp_->meta_epoch_bm == NULL)
+		return;
+	const uint64_t mstart = tmp_->sb.meta_reserve_start;
+	if (s < mstart || s >= mstart + tmp_->sb.meta_reserve_length)
+		return;
+	uint64_t bit = s - mstart;
+	tmp_->meta_epoch_bm[bit / 8] |= (uint8_t)(1u << (bit % 8));
+}
+
+/*
+ * Move every meta_pending entry that was allocated in THIS epoch onto the
+ * recycle list. Such a sector was allocated and freed without any commit_sb
+ * in between, so no durable superblock has ever referenced it — reusing it
+ * now is safe even mid-flush, and a crash simply discards the whole
+ * uncommitted flush (the on-disk SB still describes the older tree, which
+ * never pointed here).
+ *
+ * This is the escape from the wedge: a long drain COWs the same btree path
+ * thousands of times, and every superseded copy is exactly this kind of
+ * garbage. Without it the allocator walks the bump to the ceiling while the
+ * reserve is full of sectors it is entitled to reuse (measured: 6671 of 8192
+ * stuck in pending while the flush spun unable to allocate).
+ *
+ * Sectors freed from the previously-committed tree keep their normal path:
+ * they stay pending until commit_sb + the pinscan drain clears them.
+ */
+static void
+tessera_fs_meta_epoch_sweep(struct tessera_mount *tmp_)
+{
+	if (tmp_->meta_epoch_bm == NULL || tmp_->meta_pending_count == 0)
+		return;
+	const uint64_t mstart = tmp_->sb.meta_reserve_start;
+	const uint64_t mlen   = tmp_->sb.meta_reserve_length;
+	uint32_t kept = 0, moved = 0;
+
+	tessera_stat_epoch_sweeps++;
+	for (uint32_t i = 0; i < tmp_->meta_pending_count; i++) {
+		uint64_t s = tmp_->meta_pending[i];
+		int epoch_new = 0;
+		if (s >= mstart && s < mstart + mlen) {
+			uint64_t bit = s - mstart;
+			epoch_new = (tmp_->meta_epoch_bm[bit / 8] &
+			    (1u << (bit % 8))) != 0;
+			if (epoch_new &&
+			    tmp_->meta_free_count < tmp_->meta_free_cap) {
+				/* Clear the bit: it is no longer allocated. A
+				 * later re-allocation re-marks it. */
+				tmp_->meta_epoch_bm[bit / 8] &=
+				    (uint8_t)~(1u << (bit % 8));
+				tmp_->meta_free[tmp_->meta_free_count++] = s;
+				moved++;
+				continue;
+			}
+		}
+		tmp_->meta_pending[kept++] = s;
+	}
+	tmp_->meta_pending_count = kept;
+	tessera_stat_epoch_reclaimed += moved;
+	tessera_stat_meta_pending_now = tmp_->meta_pending_count;
+	tessera_stat_meta_free_now    = tmp_->meta_free_count;
+}
+
 static int
 tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 {
@@ -2740,9 +2833,34 @@ tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 		if (tmp_->pinscan_active && tmp_->meta_scanwin != NULL)
 			tmp_->meta_scanwin[tmp_->meta_scanwin_count++] =
 			    *out_sector;
+		tessera_meta_epoch_mark(tmp_, *out_sector);
 		tessera_metatrace(TM_OP_ALLOC_REUSE, *out_sector,
 		    tmp_->sb.generation, tmp_->meta_free_count);
 		return (0);
+	}
+	/*
+	 * ★ task #73: the recycle list is dry. Before pushing the bump — and
+	 * long before the band/ceiling refusals that wedge a flush — reclaim
+	 * the intra-flush garbage sitting in meta_pending. These sectors were
+	 * allocated and freed inside this same uncommitted flush, so they are
+	 * ours to reuse right now. Retry the recycle path once it lands.
+	 */
+	if (tmp_->meta_free_count == 0) {
+		tessera_fs_meta_epoch_sweep(tmp_);
+		if (tmp_->meta_free_count > 0 &&
+		    (!tmp_->pinscan_active ||
+		     tmp_->meta_scanwin_count < tmp_->meta_scanwin_cap)) {
+			*out_sector =
+			    tmp_->meta_free[--tmp_->meta_free_count];
+			if (tmp_->pinscan_active &&
+			    tmp_->meta_scanwin != NULL)
+				tmp_->meta_scanwin[
+				    tmp_->meta_scanwin_count++] = *out_sector;
+			tessera_meta_epoch_mark(tmp_, *out_sector);
+			tessera_metatrace(TM_OP_ALLOC_REUSE, *out_sector,
+			    tmp_->sb.generation, tmp_->meta_free_count);
+			return (0);
+		}
 	}
 	const uint64_t used = tmp_->sb.meta_reserve_bump
 	    - tmp_->sb.meta_reserve_start;
@@ -2795,6 +2913,7 @@ tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 	}
 	*out_sector = tmp_->sb.meta_reserve_bump;
 	tmp_->sb.meta_reserve_bump += n;
+	tessera_meta_epoch_mark(tmp_, *out_sector);
 	tessera_metatrace(TM_OP_ALLOC_BUMP, *out_sector,
 	    tmp_->sb.generation, (uint32_t)used + 1);
 	return (0);
@@ -3527,6 +3646,11 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		tmp_->meta_pin_bitmap       = bitmap;
 		tmp_->meta_pin_bitmap_bytes = bitmap_bytes;
 		tmp_->meta_pin_watermark    = tmp_->sb.meta_reserve_start;
+		/* ★ #73: epoch bitmap starts all-zero — nothing has been
+		 * allocated since the SB we just mounted, which is by
+		 * definition durable. */
+		tmp_->meta_epoch_bm = malloc(bitmap_bytes, M_TESSERA,
+		    M_WAITOK | M_ZERO);
 		tessera_metatrace(TM_OP_BITMAP_BUILT, 0,
 		    tmp_->sb.generation, (uint32_t)bitmap_bytes);
 	}
@@ -4122,6 +4246,7 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 		if (tmp_->meta_pending    != NULL) free(tmp_->meta_pending, M_TESSERA);
 		if (tmp_->meta_scanwin    != NULL) free(tmp_->meta_scanwin, M_TESSERA);
 		if (tmp_->meta_pin_bitmap != NULL) free(tmp_->meta_pin_bitmap, M_TESSERA);
+		if (tmp_->meta_epoch_bm   != NULL) free(tmp_->meta_epoch_bm, M_TESSERA);
 		/* Drain any still-dirty buffers on devvp BEFORE detaching
 		 * the GEOM consumer. tessera_kbio_write_delayed uses
 		 * bdwrite — buffers stay on devvp's bufobj.bo_dirty list
@@ -6932,6 +7057,16 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 	tessera_fs_meta_pending_drain(tmp_);
 	tessera_metatrace(TM_OP_DRAIN_END, 0, tmp_->sb.generation,
 	    tmp_->meta_pending_count);
+	/*
+	 * ★ task #73: close the epoch. The SB just written is durable, so
+	 * every sector still live is now referenced by an on-disk root and is
+	 * NO LONGER intra-flush garbage — a later free of one must go through
+	 * the normal pending/pinscan path, not the epoch sweep. Clearing here
+	 * (after the drain, so this cycle's releases already happened) is what
+	 * keeps the sweep's safety argument true.
+	 */
+	if (tmp_->meta_epoch_bm != NULL)
+		memset(tmp_->meta_epoch_bm, 0, tmp_->meta_pin_bitmap_bytes);
 	return (0);
 }
 
