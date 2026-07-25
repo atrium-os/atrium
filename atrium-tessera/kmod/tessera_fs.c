@@ -555,6 +555,14 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, create_rollback, CTLFLAG_RD,
     &tessera_stat_create_rollback, 0,
     "staged inodes rolled back after their dirent add failed (would have "
     "become orphan inodes)");
+/* ★ #80: dirent ops still queued when the mount was torn down. Each one is
+ * a namespace change that never reached disk while its inode side may have
+ * committed — i.e. a silently-produced orphan or dangling dirent. */
+static unsigned long tessera_stat_dirent_lost_unmount = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, dirent_lost_unmount, CTLFLAG_RD,
+    &tessera_stat_dirent_lost_unmount, 0,
+    "unpublished dirent ops discarded at unmount (each is a lost namespace "
+    "change: orphan inode or dangling dirent)");
 static unsigned long tessera_stat_lookup_no_inode     = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_no_inode, CTLFLAG_RD,
     &tessera_stat_lookup_no_inode, 0,
@@ -4031,6 +4039,16 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 	if (tessera_singleton_mount == tmp_)
 		tessera_singleton_mount = NULL;
 
+	/* ★ task #80 instrumentation: what is still staged as teardown
+	 * begins? Anything left after the final flush below is discarded, so
+	 * a nonzero residue here that survives is the silent-corruption
+	 * source. Printed unconditionally — unmount is rare. */
+	if (tmp_ != NULL && tmp_->dirty_init)
+		printf("tessera_fs: unmount ENTRY — dirent_log=%u dirty=%u "
+		    "pending_manifests=%u sb_dirty=%d\n",
+		    tmp_->dirent_log_count, tmp_->dirty_count,
+		    tmp_->pending_manifest_count, tmp_->sb_dirty);
+
 	if (tmp_ != NULL) {
 		/* v2-step-2a: stop accepting new flushes, drain any in-flight
 		 * callout / task, then do one final synchronous flush so the
@@ -4213,13 +4231,53 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 					free(_pm, M_TESSERA);
 				}
 			}
-			for (uint32_t _b = 0;
-			    _b < TESSERA_DIRENT_LOG_BUCKETS; _b++) {
-				struct tessera_dirent_log_entry *_de;
-				while ((_de = LIST_FIRST(
-				    &tmp_->dirent_log[_b])) != NULL) {
-					LIST_REMOVE(_de, link);
-					free(_de, M_TESSERA);
+			/*
+			 * ★ task #80 instrumentation: these entries are being
+			 * DISCARDED. Any dirent op still queued here never
+			 * reached a directory manifest, while the matching
+			 * inode record may already have been committed by an
+			 * earlier flush — which produces an orphan inode (op
+			 * ADD lost) or a dangling dirent (op REMOVE lost) with
+			 * NO error reported anywhere. That silent shape is
+			 * exactly what a failing run showed (66 fsck problems
+			 * with dirent_ckpt_fail == 0).
+			 *
+			 * Log the inode numbers so they can be correlated
+			 * directly against the orphan list fsck reports. Capped
+			 * so a large residue cannot flood the console.
+			 */
+			{
+				uint32_t _lost = 0, _shown = 0;
+				for (uint32_t _b = 0;
+				    _b < TESSERA_DIRENT_LOG_BUCKETS; _b++) {
+					struct tessera_dirent_log_entry *_de;
+					while ((_de = LIST_FIRST(
+					    &tmp_->dirent_log[_b])) != NULL) {
+						LIST_REMOVE(_de, link);
+						_lost++;
+						if (_shown < 16) {
+							printf("tessera_fs: "
+							    "unmount DISCARDING "
+							    "dirent op=%s "
+							    "parent=%u inode=%u "
+							    "(never published)\n",
+							    _de->op == 0 ? "ADD"
+							    : "REMOVE",
+							    _de->parent_inode_no,
+							    _de->inode_no);
+							_shown++;
+						}
+						free(_de, M_TESSERA);
+					}
+				}
+				if (_lost > 0) {
+					tessera_stat_dirent_lost_unmount +=
+					    _lost;
+					printf("tessera_fs: ★ unmount DROPPED "
+					    "%u unpublished dirent op(s) — "
+					    "expect that many orphan inodes / "
+					    "dangling dirents from fsck\n",
+					    _lost);
 				}
 			}
 			for (uint32_t _b = 0;
@@ -10574,7 +10632,29 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 
 	mtx_lock(&tmp_->flush_mtx);
 	for (;;) {
-		if (!tmp_->sb_dirty) {
+		/*
+		 * ★ task #80: sb_dirty alone is NOT "nothing to do".
+		 *
+		 * The dirent log is staged separately, and a queued dirent op
+		 * is an unpublished namespace change. Returning early with a
+		 * non-empty log means the log is never checkpointed — and at
+		 * unmount every remaining entry is discarded, losing the
+		 * namespace half of operations whose inode half was already
+		 * committed by an earlier flush. That is an orphan inode (ADD
+		 * lost) or a dangling dirent (REMOVE lost), produced with NO
+		 * error reported anywhere, which is why this bug looked
+		 * causeless for so long.
+		 *
+		 * Measured directly: at unmount, "dirent_log=1972 dirty=0
+		 * pending_manifests=0 sb_dirty=0" — the filesystem believed it
+		 * was clean while holding 1972 unpublished namespace changes,
+		 * then dropped all of them.
+		 *
+		 * So the flush is only a no-op when EVERY staged set is empty.
+		 */
+		if (!tmp_->sb_dirty && tmp_->dirent_log_count == 0 &&
+		    tmp_->dirty_count == 0 &&
+		    tmp_->pending_manifest_count == 0) {
 			mtx_unlock(&tmp_->flush_mtx);
 			return (0);
 		}
