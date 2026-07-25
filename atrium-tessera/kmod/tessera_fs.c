@@ -1417,6 +1417,15 @@ struct tessera_dirent_log_entry {
 	char     name[];
 };
 
+/* qsort/bsearch comparator over raw tessera_hash_t (task #81 — the GC
+ * live set is sorted once after pass 1 so pass 2 can binary-search it,
+ * turning an O(blobs x live) scan into O(blobs x log live)). */
+static int
+tessera_cmp_hash(const void *a, const void *b)
+{
+	return (memcmp(a, b, sizeof(tessera_hash_t)));
+}
+
 /* qsort comparators (task #38 — quadratic-sort livelock fix). */
 static int
 tessera_cmp_dirty_inode_ptr(const void *a, const void *b)
@@ -12728,20 +12737,40 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 #undef _GC_WALK_RECORD
 #undef _GC_PUSH_HASH
 
-	/* Pass 2: walk pack_registry_tree, identify dead single-blob
-	 * packs. We collect (pack_id, start_sector, length_sectors)
-	 * tuples first then mutate the tree afterwards — mutating mid-
-	 * walk would invalidate the cursor. */
+	/*
+	 * ★ task #81: sort the live set so pass 2 can binary-search it.
+	 *
+	 * Pass 2 now tests EVERY blob of EVERY pack against the live set
+	 * (multi-blob reclaim), not one blob per single-blob pack. With a
+	 * linear scan that is O(total_blobs x live_count) — on the dev root
+	 * ~580k x ~400k, which would never finish before the frozen roots
+	 * recycle and the scan aborts. Sorted once here, each membership
+	 * test is O(log live_count).
+	 */
+	if (live_count > 1)
+		qsort(live, live_count, sizeof(tessera_hash_t),
+		    tessera_cmp_hash);
+#define _GC_HASH_IS_LIVE(_h) (live_count > 0 && bsearch((_h), live, \
+	live_count, sizeof(tessera_hash_t), tessera_cmp_hash) != NULL)
+
+	/* Pass 2: walk pack_registry_tree, identify dead packs (every blob
+	 * absent from the live set). We collect (pack_id, start_sector,
+	 * length_sectors) tuples first then mutate the tree afterwards —
+	 * mutating mid-walk would invalidate the cursor. */
 	struct dead {
 		uint8_t  pack_id[16];
 		uint64_t start;             /* contig start, OR PEL sector if multi */
 		uint64_t len;               /* total length (sum of extents) */
 		uint32_t flags;             /* MULTI_EXTENT bit drives the free path */
-		/* The pack's blob hash, carried so the apply phase can test it
-		 * against the SATB touch filter. A concurrent scan decides
-		 * "dead" from a frozen view; between that decision and the
-		 * apply, a writer may have taken a fresh reference. */
-		tessera_hash_t bh;
+		/* Every blob hash this pack holds, carried so the apply phase
+		 * can test each against the SATB touch filter. A concurrent
+		 * scan decides "dead" from a frozen view; between that decision
+		 * and the apply, a writer may have taken a fresh reference to
+		 * ANY of them. Single-blob packs use bh[0]; multi-blob packs
+		 * (#81) fill bh_extra with the rest. */
+		tessera_hash_t bh;             /* first blob */
+		tessera_hash_t *bh_extra;      /* blobs 1..nbh-1, or NULL */
+		uint32_t        nbh;           /* total blob count */
 		/* MULTI_EXTENT packs only: the extent list and the PEL chain
 		 * sectors, RESOLVED DURING THE SCAN. Reading them in the apply
 		 * phase would put content-zone breads back under the gate —
@@ -12762,6 +12791,10 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 	    tessera_btree_seek_first(scan_reg_tree);
 	if (pc != NULL) {
 		for (;;) {
+			/* Declared before the first `goto next_p` so the
+			 * cleanup at that label never sees an indeterminate
+			 * pointer (#81). */
+			tessera_hash_t *bh_all = NULL;
 			uint8_t pkey[16];
 			uint8_t pval[TESSERA_REGISTRY_ENTRY_SIZE];
 			if (tessera_btree_cursor_get(pc, pkey, pval) != TESSERA_OK)
@@ -12769,15 +12802,35 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 			tessera_registry_entry_t re;
 			if (tessera_decode_registry_entry(pval, &re)
 			    != TESSERA_OK) goto next_p;
-			if (re.blob_count != 1) goto next_p; /* skip multi-blob */
+			/*
+			 * ★ task #81: reclaim multi-blob packs whose blobs are
+			 * ALL dead, not just single-blob packs.
+			 *
+			 * This used to bail on `re.blob_count != 1`, with the
+			 * rationale that multi-blob packs were mkfs seeds with
+			 * lifetimes tied to directory manifests. That stopped
+			 * being true when pack aggregation (#31) made multi-blob
+			 * the NORM — ~4.4 blobs/pack on the dev root — so the
+			 * overwhelming majority of packs became permanently
+			 * unreclaimable online. `rm -rf` of a whole objdir on a
+			 * 98%-full volume freed 1 MiB, and buildkernel died with
+			 * ENOSPC because deleted data could not come back.
+			 *
+			 * Safe now because the pass-1 live set is the FULL
+			 * transitive closure (#66): every reachable manifest and
+			 * blob hash, across the current SB and all retained
+			 * snapshots. A pack every one of whose blobs is absent
+			 * from that closure is genuinely unreferenced. A pack
+			 * with even one live blob is kept whole — freeing shared
+			 * extents is not possible here (that is compaction,
+			 * #81 direction 2), only whole-pack reclaim.
+			 */
 			if (re.length_sectors == 0 ||
 			    re.length_sectors > 4096u) goto next_p; /* sanity */
 
-			/* Read the pack's first sector — that's the header,
-			 * which contains a pointer to the index. To get the
-			 * blob hash we need the full pack (or at least the
-			 * index sector). For simplicity, materialise the
-			 * whole pack — same path as fetch_blob already uses. */
+			/* Materialise the whole pack (bounded by the sanity cap
+			 * above, 16 MiB) to read its index. Same path fetch_blob
+			 * uses. */
 			const size_t pack_len = (size_t)re.length_sectors *
 			    TESSERA_SECTOR_SIZE;
 			uint8_t *packbuf = malloc(pack_len, M_TESSERA, M_WAITOK);
@@ -12811,20 +12864,43 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 			if (!ok) { free(packbuf, M_TESSERA); goto next_p; }
 			tessera_pack_reader_t *pr = tessera_pack_open(packbuf,
 			    pack_len);
-			tessera_hash_t bh;
+			tessera_hash_t bh;              /* blob 0 */
+			uint32_t nbh = 0;
 			int dead = 0;
-			if (pr != NULL &&
-			    tessera_pack_blob_hash_at(pr, 0, bh) == TESSERA_OK) {
-				dead = 1;
-				for (uint32_t li = 0; li < live_count; li++) {
-					if (memcmp(bh, live[li],
-					    sizeof(tessera_hash_t)) == 0) {
-						dead = 0; break;
+			if (pr != NULL) {
+				nbh = tessera_pack_blob_count(pr);
+				/* A pack is dead iff EVERY blob it holds is absent
+				 * from the live set. Collect the hashes as we go so
+				 * the apply phase can touch-test all of them; stop
+				 * the moment one blob proves live, since a live pack
+				 * is kept whole regardless. */
+				if (nbh > 0) {
+					bh_all = malloc((size_t)nbh *
+					    sizeof(tessera_hash_t), M_TESSERA,
+					    M_WAITOK);
+					dead = 1;
+					for (uint32_t bi = 0; bi < nbh; bi++) {
+						if (tessera_pack_blob_hash_at(pr,
+						    bi, bh_all[bi]) != TESSERA_OK) {
+							/* Unreadable index — cannot
+							 * prove all-dead; keep the
+							 * pack. */
+							dead = 0; break;
+						}
+						if (_GC_HASH_IS_LIVE(bh_all[bi])) {
+							dead = 0; break;
+						}
 					}
+					memcpy(bh, bh_all[0],
+					    sizeof(tessera_hash_t));
 				}
 			}
 			if (pr) tessera_pack_close(pr);
 			free(packbuf, M_TESSERA);
+			if (!dead && bh_all != NULL) {
+				free(bh_all, M_TESSERA);
+				bh_all = NULL;
+			}
 
 			if (dead) {
 				if (dead_count == dead_cap) {
@@ -12843,6 +12919,20 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 				d->len   = re.length_sectors;
 				d->flags = re.flags;
 				memcpy(d->bh, bh, sizeof(tessera_hash_t));
+				/* Hand the collected hash array to the dead record
+				 * (blobs 1..nbh-1 kept for the apply touch test;
+				 * blob 0 lives in bh). NULL for a single-blob pack. */
+				d->nbh = nbh;
+				if (nbh > 1 && bh_all != NULL) {
+					d->bh_extra = malloc((size_t)(nbh - 1) *
+					    sizeof(tessera_hash_t), M_TESSERA,
+					    M_WAITOK);
+					memcpy(d->bh_extra, &bh_all[1],
+					    (size_t)(nbh - 1) *
+					    sizeof(tessera_hash_t));
+				} else {
+					d->bh_extra = NULL;
+				}
 				d->exts  = NULL; d->nexts = 0;
 				d->pels  = NULL; d->npels = 0;
 
@@ -12894,11 +12984,20 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 				}
 				dead_count++;
 			}
+			/* bh_all was copied into the dead record (bh + bh_extra),
+			 * or the pack is live; either way the scratch copy is
+			 * done with. On the live path it was freed above; on the
+			 * dead path free it here. */
+			if (bh_all != NULL) {
+				free(bh_all, M_TESSERA);
+				bh_all = NULL;
+			}
 next_p:
 			if (tessera_btree_cursor_next(pc) != TESSERA_OK) break;
 		}
 		tessera_btree_cursor_free(pc);
 	}
+#undef _GC_HASH_IS_LIVE
 	free(live, M_TESSERA);
 	_GC_CLOSE_SCAN_TREES();
 	printf("tessera_fs: gc pass2 done — %u dead packs\n", dead_count);
@@ -12939,10 +13038,21 @@ next_p:
 	if (concurrent && dead_count > 0) {
 		uint32_t kept = 0;
 		for (uint32_t i = 0; i < dead_count; i++) {
-			if (tessera_fs_gc_hash_touched(tmp_, deads[i].bh)) {
+			/* #79 + #81: spare the pack if ANY blob it holds was
+			 * touched mid-scan, not just its first. */
+			int touched = tessera_fs_gc_hash_touched(tmp_,
+			    deads[i].bh);
+			for (uint32_t bi = 0; !touched &&
+			    deads[i].bh_extra != NULL &&
+			    bi + 1 < deads[i].nbh; bi++)
+				touched = tessera_fs_gc_hash_touched(tmp_,
+				    deads[i].bh_extra[bi]);
+			if (touched) {
 				tessera_stat_gc_touch_keeps++;
 				if (deads[i].exts) free(deads[i].exts, M_TESSERA);
 				if (deads[i].pels) free(deads[i].pels, M_TESSERA);
+				if (deads[i].bh_extra)
+					free(deads[i].bh_extra, M_TESSERA);
 				continue;
 			}
 			if (kept != i) deads[kept] = deads[i];
@@ -13031,6 +13141,7 @@ next_p:
 		}
 		if (deads[i].exts != NULL) free(deads[i].exts, M_TESSERA);
 		if (deads[i].pels != NULL) free(deads[i].pels, M_TESSERA);
+		if (deads[i].bh_extra != NULL) free(deads[i].bh_extra, M_TESSERA);
 	}
 	free(deads, M_TESSERA);
 
