@@ -355,6 +355,7 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, snapshots_retired,
     CTLFLAG_RD, &tessera_stat_snapshots_retired, 0,
     "Cumulative snapshot records dropped by retention horizon");
 
+
 /* Cumulative count of meta_reserve-bump EXHAUST events. The EXHAUST
  * printf is rate-limited to 1/s (a tight-commit hammer over a big tree
  * used to emit hundreds of identical lines — see tessera_kbio_meta_alloc),
@@ -509,6 +510,27 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, drain_calls, CTLFLAG_RD,
     &tessera_stat_drain_calls, 0, "meta_pending_drain calls");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_swaps, CTLFLAG_RD,
     &tessera_stat_pinscan_swaps, 0, "pinscan bitmap swaps (watermark advances)");
+/* ★ #73(C) instrumentation: the meta_pending non-drain wedge. Separate
+ * "was a scan asked for" (kicks) from "did a scan actually run the walk"
+ * (runs) from "a kick/run bailed because one was already active"
+ * (skips_active) — the counts alone say whether the reclaim path is being
+ * driven at all under a pure-delete workload, before any theory. */
+static unsigned long tessera_stat_pinscan_kicks        = 0;
+static unsigned long tessera_stat_pinscan_runs         = 0;
+static unsigned long tessera_stat_pinscan_skips_active = 0;
+static unsigned long tessera_stat_pinscan_aborts       = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_kicks, CTLFLAG_RD,
+    &tessera_stat_pinscan_kicks, 0,
+    "pin-bitmap rebuild enqueues (pressure kicks + retire kicks)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_runs, CTLFLAG_RD,
+    &tessera_stat_pinscan_runs, 0,
+    "pinscan runs that got past the active-guard and started walking");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_skips_active, CTLFLAG_RD,
+    &tessera_stat_pinscan_skips_active, 0,
+    "pinscan kicks/runs skipped because a scan was already active");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_aborts, CTLFLAG_RD,
+    &tessera_stat_pinscan_aborts, 0,
+    "pinscan runs that aborted before swapping (unmount teardown only)");
 static unsigned long tessera_stat_lookup_no_inode     = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_no_inode, CTLFLAG_RD,
     &tessera_stat_lookup_no_inode, 0,
@@ -2176,6 +2198,46 @@ struct tessera_mount {
 	struct tessera_btree     *quota_tree;
 	int                       quota_dirty;
 };
+
+/*
+ * ★ #73(C) instrumentation: expose the flush-gate holder.
+ *
+ * The wedge signature is "every thread waits on the gate, who holds it?".
+ * This reports the tid of tessera_singleton_mount->flush_gate_owner (0 if
+ * unheld) plus the gate depth and reserve state, so at a hang a single
+ * `sysctl kern.tessera.gate_owner` names the thread to procstat -kk —
+ * without needing DDB. Read-only, best-effort (racy by nature; that's fine
+ * for a stuck-system probe). */
+static int
+tessera_sysctl_gate_owner(SYSCTL_HANDLER_ARGS)
+{
+	struct tessera_mount *tmp_ = tessera_singleton_mount;
+	char buf[192];
+	int tid = 0, depth = 0, inprog = 0;
+	unsigned long used = 0, len = 0, pend = 0, freec = 0;
+
+	if (tmp_ != NULL) {
+		struct thread *o = tmp_->flush_gate_owner;
+		if (o != NULL) tid = o->td_tid;
+		depth  = tmp_->flush_gate_depth;
+		inprog = tmp_->flush_in_progress;
+		len    = (unsigned long)tmp_->sb.meta_reserve_length;
+		used   = (unsigned long)(tmp_->sb.meta_reserve_bump -
+		    tmp_->sb.meta_reserve_start);
+		pend   = tmp_->meta_pending_count;
+		freec  = tmp_->meta_free_count;
+	}
+	snprintf(buf, sizeof buf,
+	    "owner_tid=%d depth=%d in_progress=%d meta_used=%lu/%lu "
+	    "pending=%lu free=%lu",
+	    tid, depth, inprog, used, len, pend, freec);
+	return (sysctl_handle_string(oidp, buf, sizeof buf, req));
+}
+SYSCTL_PROC(_kern_tessera, OID_AUTO, gate_owner,
+    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    tessera_sysctl_gate_owner, "A",
+    "flush-gate holder tid + gate depth + meta-reserve state (wedge probe)");
+
 /* Pack-registry overlay ops (Option D part 2). Publishes APPEND here
  * instead of walking the btree; the flush batch-puts the whole
  * overlay sorted in one COW pass. Replace-on-equal keeps dedup
@@ -6581,6 +6643,41 @@ struct tessera_jrec_sb_commit {
 };
 
 /*
+ * Retire the OLDEST snapshot record. Returns 1 if one was dropped, 0 if
+ * none remained or the delete failed. Does NOT rebuild the pin bitmap —
+ * the caller batches that so a multi-retire pass rebuilds once. Caller is
+ * in commit_sb context (flush_in_progress held). Extracted from the
+ * inline retention block for pressure-driven aggressive retirement (#73C).
+ */
+static int
+tessera_fs_snapshot_retire_oldest(struct tessera_mount *tmp_)
+{
+	if (tmp_->snapshots_tree == NULL)
+		return (0);
+	tessera_btree_cursor_t *sc =
+	    tessera_btree_seek_first(tmp_->snapshots_tree);
+	if (sc == NULL)
+		return (0);
+	uint8_t okey[8];
+	tessera_snapshot_record_t orec;
+	if (tessera_btree_cursor_get(sc, okey, &orec) != TESSERA_OK) {
+		tessera_btree_cursor_free(sc);
+		return (0);
+	}
+	tessera_btree_cursor_free(sc);
+	uint64_t after_root = tmp_->sb.snapshots_root;
+	if (tessera_btree_delete(tmp_->snapshots_tree, okey, &after_root)
+	    != TESSERA_OK)
+		return (0);
+	tmp_->sb.snapshots_root = after_root;
+	tmp_->sb.snapshots_gen--;
+	tessera_stat_snapshots_retired++;
+	tessera_metatrace(TM_OP_SNAPSHOT_REC, 1 /* retire marker */,
+	    orec.generation, 0);
+	return (1);
+}
+
+/*
  * Write the in-memory superblock back to sectors 0 and 1 with the
  * generation bumped. Each commit is preceded by a journal transaction
  * (BEGIN → ROOT_UPDATE record → COMMIT). On remount,
@@ -6658,48 +6755,15 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 		if (tessera_snapshot_retention > 0 &&
 		    tmp_->sb.snapshots_gen >
 		        (uint64_t)tessera_snapshot_retention) {
-			tessera_btree_cursor_t *sc =
-			    tessera_btree_seek_first(tmp_->snapshots_tree);
-			if (sc != NULL) {
-				uint8_t okey[8];
-				tessera_snapshot_record_t orec;
-				if (tessera_btree_cursor_get(sc, okey, &orec)
-				    == TESSERA_OK) {
-					tessera_btree_cursor_free(sc);
-					sc = NULL;
-					uint64_t after_root =
-					    tmp_->sb.snapshots_root;
-					if (tessera_btree_delete(
-					    tmp_->snapshots_tree, okey,
-					    &after_root) == TESSERA_OK) {
-						tmp_->sb.snapshots_root =
-						    after_root;
-						tmp_->sb.snapshots_gen--;
-						tessera_stat_snapshots_retired++;
-						tessera_metatrace(
-						    TM_OP_SNAPSHOT_REC,
-						    1 /* retire marker */,
-						    orec.generation, 0);
-						/* The retired snapshot's
-						 * tree sectors are no longer
-						 * pinned by anything (unless
-						 * shared via COW with a
-						 * surviving snapshot). Rebuild
-						 * the bitmap from the new
-						 * retained set so the next
-						 * meta_pending drain releases
-						 * sectors that just lost
-						 * their last referent.
-						 * Without this rebuild,
-						 * sustained-write workloads
-						 * exhaust meta-reserve in a
-						 * few hundred commits (bug #2). */
-						tessera_meta_pin_bitmap_rebuild(
-						    tmp_);
-					}
-				} else {
-					tessera_btree_cursor_free(sc);
-				}
+			if (tessera_fs_snapshot_retire_oldest(tmp_)) {
+				/* The retired snapshot's tree sectors are no
+				 * longer pinned (unless shared via COW with a
+				 * survivor). Rebuild the bitmap so the next
+				 * meta_pending drain releases sectors that lost
+				 * their last referent. Without this rebuild,
+				 * sustained-write workloads exhaust meta-reserve
+				 * in a few hundred commits (bug #2). */
+				tessera_meta_pin_bitmap_rebuild(tmp_);
 			}
 		}
 	}
@@ -10771,9 +10835,11 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	 * reserve-pressured mount). The background scan will reclaim + swap;
 	 * the caller that bailed simply relies on that. */
 	if (tmp_->pinscan_active) {
+		tessera_stat_pinscan_skips_active++;
 		tessera_fs_flush_gate_exit(tmp_);
 		return;
 	}
+	tessera_stat_pinscan_runs++;
 	const uint64_t mstart = tmp_->sb.meta_reserve_start;
 	const uint64_t mlen   = tmp_->sb.meta_reserve_length;
 	const uint64_t bump0  = tmp_->sb.meta_reserve_bump;
@@ -10911,8 +10977,11 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 		if (st != NULL) tessera_btree_close(st);
 	}
 	if (aborted || tmp_->pinscan_abort) {
-		printf("tessera_fs: pinscan aborted after %ld ms\n",
-		    (long)((sbinuptime() - _ps0) / SBT_1MS));
+		tessera_stat_pinscan_aborts++;
+		printf("tessera_fs: pinscan aborted after %ld ms "
+		    "(pinscan_abort=%d — set ONLY at unmount)\n",
+		    (long)((sbinuptime() - _ps0) / SBT_1MS),
+		    tmp_->pinscan_abort);
 		free(scratch, M_TESSERA);
 		tmp_->pinscan_active = 0;
 		tmp_->meta_scanwin_count = 0;
@@ -11087,12 +11156,15 @@ tessera_meta_pin_bitmap_rebuild(struct tessera_mount *tmp_)
 	 * flush-gate preflight (tessera_fs_flush) remains the synchronous
 	 * safety net that recovers the reserve when it genuinely runs tight,
 	 * so throttling opportunistic reclaim here can never starve a commit. */
-	if (tmp_->pinscan_active)
+	if (tmp_->pinscan_active) {
+		tessera_stat_pinscan_skips_active++;
 		return;
+	}
 	time_t _now = (time_t)time_uptime;
 	if (_now == tmp_->pinscan_last_kick_sec)
 		return;
 	tmp_->pinscan_last_kick_sec = _now;
+	tessera_stat_pinscan_kicks++;
 	(void)taskqueue_enqueue(tmp_->pinscan_tq, &tmp_->pinscan_task);
 }
 
