@@ -35,6 +35,9 @@
 #include <sys/proc.h>
 #include <sys/sysctl.h>
 #include <sys/sbuf.h>		/* verify_mft_kinds breakdown (#90) */
+#ifdef __aarch64__
+#include <machine/vfp.h>	/* fpu_kern_enter/leave — NEON latency study (#89) */
+#endif
 #include <sys/priv.h>
 #include <sys/malloc.h>
 #include <sys/uio.h>
@@ -523,6 +526,83 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, vnode_blob_refused, CTLFLAG_RD,
     &tessera_stat_vnode_blob_refused, 0,
     "Adoptions refused because the global ceiling was reached (#94) — "
     "non-zero means the caches are saturated, not broken");
+
+/*
+ * ── NEON feasibility: the LATENCY half (#89) ────────────────────────
+ *
+ * BLAKE3 has a NEON backend; core/src/b3_compat.h force-disables all SIMD
+ * with the rationale that kernel NEON "would require fpu_kern_enter()
+ * around every hash". Feasibility is not actually in doubt — FreeBSD arm64
+ * exports fpu_kern_enter/leave and sys/crypto/armv8 wraps whole operations
+ * with FPU_KERN_NOCTX. The real question is one nobody had measured:
+ *
+ *   FPU_KERN_NOCTX regions are NON-PREEMPTIBLE. Atrium has hard real-time
+ *   commitments (Lyra's EDF audio deadlines, Laminar's deadline lanes), so
+ *   the cost that matters is how long the CPU cannot be preempted, plus the
+ *   fixed enter/leave overhead that sets the minimum useful granularity.
+ *
+ * Write a sector count to run the bench:
+ *   kern.tessera.fpu_bench=32   -> enter/leave cost, and the hash duration
+ *                                  for a 32-sector (128 KiB) region.
+ * Results print to the console. Bench only — no effect on the FS.
+ */
+static int tessera_fpu_bench_arg = 0;
+static int
+tessera_sysctl_fpu_bench(SYSCTL_HANDLER_ARGS)
+{
+	int n = tessera_fpu_bench_arg;
+	int error = sysctl_handle_int(oidp, &n, 0, req);
+
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (n <= 0 || n > 4096)
+		return (EINVAL);
+	tessera_fpu_bench_arg = n;
+
+#ifdef __aarch64__
+	const int iters = 2000;
+	sbintime_t t0, d;
+	uint64_t sz = (uint64_t)n * TESSERA_SECTOR_SIZE;
+	uint8_t *buf = malloc(sz, M_TESSERA, M_WAITOK | M_ZERO);
+	tessera_hash_t out;
+
+	/* 1. Fixed cost of one enter/leave pair. This sets the smallest
+	 *    region worth wrapping: if the pair costs more than the work,
+	 *    per-blob granularity is pointless. */
+	t0 = sbinuptime();
+	for (int i = 0; i < iters; i++) {
+		fpu_kern_enter(curthread, NULL,
+		    FPU_KERN_NORMAL | FPU_KERN_NOCTX);
+		(void)fpu_kern_leave(curthread, NULL);
+	}
+	d = sbinuptime() - t0;
+	printf("tessera_fs: fpu_kern_enter+leave = %lu ns/pair (%d iters)\n",
+	    (unsigned long)(sbttons(d) / iters), iters);
+
+	/* 2. How long the CPU would be non-preemptible while hashing one
+	 *    blob of this size. Measured with the PORTABLE hash — the point
+	 *    is the region length, and NEON would shorten it by whatever
+	 *    factor the SIMD backend delivers, not change its shape. */
+	t0 = sbinuptime();
+	tessera_content_hash(TESSERA_HASH_ALG_BLAKE3_256, buf, sz, out);
+	d = sbinuptime() - t0;
+	unsigned long hns = (unsigned long)sbttons(d);
+	printf("tessera_fs: hash %lu KiB (portable blake3) = %lu us "
+	    "-> non-preemptible region if wrapped in NOCTX\n",
+	    (unsigned long)(sz / 1024), hns / 1000);
+	printf("tessera_fs: at a hypothetical 3x SIMD speedup that region "
+	    "would be ~%lu us\n", (hns / 3) / 1000);
+	free(buf, M_TESSERA);
+#else
+	printf("tessera_fs: fpu bench is arm64-only\n");
+#endif
+	return (0);
+}
+SYSCTL_PROC(_kern_tessera, OID_AUTO, fpu_bench,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0,
+    tessera_sysctl_fpu_bench, "I",
+    "NEON latency study (#89): write a sector count to measure "
+    "fpu_kern_enter/leave cost and the resulting non-preemptible region");
 
 /* Reserve `len` bytes against the global ceiling. 1 = go ahead. */
 static int
