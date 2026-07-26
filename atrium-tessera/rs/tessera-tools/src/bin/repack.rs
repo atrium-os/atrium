@@ -37,7 +37,7 @@
 
 use std::process::ExitCode;
 use tessera_sys::*;
-use tessera_tools::{fd_of, make_io, open_file_ro, open_file_rw, DiskCtx};
+use tessera_tools::{fd_of, make_io, open_file_ro, open_file_rw, rebuild_blob_index, DiskCtx};
 
 /// Read every (key, value) of a b-tree into RAM. Empty vec if root == 0.
 fn read_tree(io: &tessera_block_io_t, root: u64, kind: u8, ksz: u32, vsz: u32)
@@ -394,6 +394,7 @@ fn run(path: &str, apply: bool, force: bool, stage_cap: Option<u64>) -> Result<i
         println!("  --force: in-place overwrite from reserve start (NOT crash-safe — back up first)");
         let b = build_all(&io, ctxp, mr_start, ceiling, &trees)?;
         commit(v, &b, next_ino, true)?;
+        rebuild_index_after_repack(&f, &io, ctxp, v, path);
         report_done(v, mr_start, used, b.bump, path, trees.packs.len());
         return Ok(0);
     }
@@ -428,6 +429,7 @@ fn run(path: &str, apply: bool, force: bool, stage_cap: Option<u64>) -> Result<i
             if let Ok(b) = build_all(&io, ctxp, mr_start, first_live, &trees) {
                 commit(v, &b, next_ino, true)?;
                 println!("  crash-safe: compacted into the free reserve prefix (commit, bump lowered)");
+                rebuild_index_after_repack(&f, &io, ctxp, v, path);
                 report_done(v, mr_start, used, b.bump, path, trees.packs.len());
                 return Ok(0);
             }
@@ -466,6 +468,54 @@ fn run(path: &str, apply: bool, force: bool, stage_cap: Option<u64>) -> Result<i
     Err("repack did not converge in 3 passes (unexpected)".into())
 }
 
+/// Rebuild the blob->pack index that this repack necessarily dropped (#75).
+///
+/// repack rewrites the meta-reserve, so the old index would point at reused
+/// sectors and MUST be dropped — but leaving it absent is a trap: the window
+/// between "repack finished" and "operator runs tessera-reindex" is exactly
+/// when a reboot becomes a multi-minute apparent hang, because every cold
+/// read then scans the whole pack registry.
+///
+/// Done as a SEPARATE commit after the compaction commits, deliberately. The
+/// tree is built in fresh reserve sectors nothing references yet, so if this
+/// step fails or is interrupted the volume simply keeps blob_index_root = 0 —
+/// exactly the state repack produced before this change, and one that
+/// tessera-debug and tessera-fsck now both report explicitly. So the worst
+/// case is the old behaviour, never a worse one.
+fn rebuild_index_after_repack(f: &std::fs::File, io: &tessera_block_io_t,
+    ctxp: *mut DiskCtx, v: *mut tessera_volume_t, path: &str)
+{
+    let pack_root = unsafe { tessera_volume_pack_registry_root(v) };
+    let bump0 = unsafe { tessera_volume_meta_reserve_bump(v) };
+    unsafe { (*ctxp).bump.set(bump0); }
+    match rebuild_blob_index(f, io, ctxp, pack_root) {
+        Ok((root, nblobs, npacks, new_bump)) => {
+            let commit = tessera_commit_roots_t {
+                inode_root:         unsafe { tessera_volume_inode_root(v) },
+                pack_registry_root: pack_root,
+                free_extent_root:   unsafe { tessera_volume_free_extent_root(v) },
+                quota_tree_root:    unsafe { tessera_volume_quota_tree_root(v) },
+                snapshots_root:     unsafe { tessera_volume_snapshots_root(v) },
+                meta_reserve_bump:  new_bump,
+                next_inode_no:      unsafe { tessera_volume_next_inode_no(v) },
+                blob_index_root:    root,
+            };
+            let rc = unsafe { tessera_volume_commit_roots(v, &commit) };
+            if rc == 0 {
+                println!("  blob index REBUILT: root@{root}, {nblobs} blobs from \
+{npacks} packs, {} reserve sectors", new_bump.saturating_sub(bump0));
+            } else {
+                println!("tessera-repack: index rebuild commit failed (rc={rc}) — \
+volume is fine, but run `tessera-reindex {path}` before mounting.");
+            }
+        }
+        Err(e) => {
+            println!("tessera-repack: could not rebuild the blob index ({e}) — \
+volume is fine, but run `tessera-reindex {path}` before mounting.");
+        }
+    }
+}
+
 fn report_done(v: *mut tessera_volume_t, mr_start: u64, used: u64, new_bump: u64,
     path: &str, npacks: usize) {
     unsafe { tessera_volume_close(v) };
@@ -484,18 +534,7 @@ fn report_done(v: *mut tessera_volume_t, mr_start: u64, used: u64, new_bump: u64
      * rebuild the index. Say it loudly, and scale the wording to the cost.
      */
     println!("tessera-repack: DONE — run tessera-fsck to verify.");
-    println!("tessera-repack: NOTE — the blob->pack index was DROPPED (the \
-reserve is rewritten, so the old index would point at reused sectors).");
-    if npacks >= 10_000 {
-        println!("tessera-repack: *** RUN `tessera-reindex {path}` BEFORE \
-MOUNTING. *** With {npacks} packs and no index, every cold read scans the \
-whole pack registry: the next boot can take MANY MINUTES at \"Loading \
-kernel...\" with no output, looking exactly like a hang. Reindexing takes \
-seconds.");
-    } else {
-        println!("tessera-repack: run `tessera-reindex {path}` to rebuild it; \
-until then cold reads scan the pack registry and are slow.");
-    }
+    let _ = npacks;
 }
 
 fn main() -> ExitCode {
