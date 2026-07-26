@@ -153,6 +153,40 @@ fn build_all(io: &tessera_block_io_t, ctxp: *mut DiskCtx, start: u64, cap: u64, 
     Ok(Built { inode, pack, free, quota, bump })
 }
 
+/// Build ONE tree into [start, cap). Same aliasing discipline as build_all.
+/// Returns (root, frontier), or Err if it overran the window — in which case
+/// only sectors inside [start, cap) were touched.
+fn build_one(io: &tessera_block_io_t, ctxp: *mut DiskCtx, start: u64, cap: u64,
+    existed: bool, kind: u8, ksz: u32, vsz: u32, entries: &[(Vec<u8>, Vec<u8>)])
+    -> Result<(u64, u64), String>
+{
+    unsafe { (*ctxp).bump.set(start); (*ctxp).bump_max = cap; }
+    let root = write_tree(io, existed, kind, ksz, vsz, entries)?;
+    let frontier = unsafe { (*ctxp).bump.get() };
+    Ok((root, frontier))
+}
+
+/// Maximal runs in [lo, hi) containing NO live node, widest first.
+///
+/// Staging may only write where a crash cannot hurt: a gap holds nothing the
+/// committed superblock references, so an interrupted build there leaves the
+/// volume exactly as it was. This is what lets a tree be rebuilt anywhere in
+/// the reserve rather than only in the prefix or the tail.
+fn free_gaps(live: &[u64], lo: u64, hi: u64) -> Vec<(u64, u64)> {
+    let mut s: Vec<u64> = live.iter().copied().filter(|&x| x >= lo && x < hi).collect();
+    s.sort_unstable();
+    s.dedup();
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    let mut cur = lo;
+    for &n in &s {
+        if n > cur { out.push((cur, n)); }
+        cur = n + 1;
+    }
+    if cur < hi { out.push((cur, hi)); }
+    out.sort_by_key(|&(a, b)| std::cmp::Reverse(b - a));
+    out
+}
+
 /// Atomically commit the four compacted roots, retire snapshots, and set the
 /// bump. `bump_exact` lowers the bump (repack reclaim); otherwise it only grows.
 fn commit(v: *mut tessera_volume_t, b: &Built, next_ino: u64, bump_exact: bool) -> Result<(), String> {
@@ -173,7 +207,109 @@ fn commit(v: *mut tessera_volume_t, b: &Built, next_ino: u64, bump_exact: bool) 
     Ok(())
 }
 
-fn run(path: &str, apply: bool, force: bool) -> Result<i32, String> {
+/// Phase C (#82): bounded per-tree staging.
+///
+/// Phases A and B rebuild ALL FOUR trees into one window, so they need a
+/// contiguous free run as large as the WHOLE live metadata set. That is why a
+/// fixed emergency band cannot guarantee the crash-safe path works: the
+/// requirement scales with live metadata, and no constant tracks it.
+///
+/// Moving ONE tree at a time drops the peak requirement to the LARGEST SINGLE
+/// TREE, and each committed move frees that tree's old nodes for the next one,
+/// so the space available grows as the pass proceeds. Any free gap will do, not
+/// just the prefix or the tail — a gap holds nothing the committed SB
+/// references, so an interrupted build there is a no-op and the crash-safety
+/// argument is unchanged. Each commit publishes one new root alongside the
+/// other three unchanged: every intermediate state is a valid volume.
+///
+/// Returns the number of trees moved.
+fn stage_bounded(v: *mut tessera_volume_t, io: &tessera_block_io_t, ctxp: *mut DiskCtx,
+    mr_start: u64, ceiling: u64, t: &Trees, next_ino: u64) -> Result<u32, String>
+{
+    let mut moved = 0u32;
+
+    // Bounded because each iteration STRICTLY lowers the highest live node, and
+    // that is a decreasing bounded integer. An earlier version simply moved the
+    // first tree that fit anywhere and re-moved the same tree forever without
+    // converging; requiring strict improvement is what makes this terminate.
+    for _ in 0..64 {
+        let (ir, pr, fr, qr, cur_bump) = unsafe {(
+            tessera_volume_inode_root(v), tessera_volume_pack_registry_root(v),
+            tessera_volume_free_extent_root(v), tessera_volume_quota_tree_root(v),
+            tessera_volume_meta_reserve_bump(v),
+        )};
+        let specs: [(usize, u8, u32, u32, &Vec<(Vec<u8>, Vec<u8>)>, bool, u64); 4] = [
+            (0, TESSERA_BTREE_KIND_INODE,    4,  TESSERA_INODE_RECORD_SIZE,   &t.inodes, t.existed.0, ir),
+            (1, TESSERA_BTREE_KIND_PACK_REG, 16, TESSERA_REGISTRY_ENTRY_SIZE, &t.packs,  t.existed.1, pr),
+            (2, TESSERA_BTREE_KIND_FREE_EXT, 8,  8,                           &t.frees,  t.existed.2, fr),
+            (3, TESSERA_BTREE_KIND_QUOTA,    8,  128,                         &t.quotas, t.existed.3, qr),
+        ];
+
+        // Per-tree live sets: the victim is whichever tree owns the highest
+        // live sector, since that is the one pinning the bump.
+        let mut per: Vec<(usize, Vec<u64>)> = Vec::new();
+        let mut all: Vec<u64> = Vec::new();
+        for (idx, kind, ksz, vsz, _e, existed, root) in specs {
+            let mut n = Vec::new();
+            if existed { live_nodes(io, root, kind, ksz, vsz, &mut n)?; }
+            all.extend_from_slice(&n);
+            per.push((idx, n));
+        }
+        if all.is_empty() { break; }
+        let Some(&(victim, _)) = per.iter()
+            .filter(|(_, n)| !n.is_empty())
+            .max_by_key(|(_, n)| n.iter().copied().max().unwrap_or(0))
+            .map(|x| x) else { break };
+        let victim_top = per[victim].1.iter().copied().max().unwrap_or(0);
+
+        // Windows that hold nothing the committed SB references, lowest first:
+        // a crash inside one is a no-op, which is what keeps this crash-safe.
+        let mut gaps = free_gaps(&all, mr_start, ceiling);
+        gaps.sort_by_key(|&(a, _)| a);
+
+        let (_, kind, ksz, vsz, entries, existed, _) = specs[victim];
+        let mut progressed = false;
+        for &(gs, ge) in &gaps {
+            if gs >= victim_top { break; }          // cannot improve from here
+            let Ok((root, frontier)) = build_one(io, ctxp, gs, ge, existed, kind, ksz, vsz, entries)
+                else { continue };
+            if frontier == 0 || frontier - 1 >= victim_top { continue; }  // not strictly lower
+            let bump = if frontier > cur_bump { frontier } else { cur_bump };
+            let mut b = Built { inode: ir, pack: pr, free: fr, quota: qr, bump };
+            match victim { 0 => b.inode = root, 1 => b.pack = root,
+                           2 => b.free = root, _ => b.quota = root }
+            commit(v, &b, next_ino, false)?;
+            println!("  crash-safe: moved tree kind={kind} to [{gs},{frontier}) \
+(top {victim_top} -> {})", frontier - 1);
+            moved += 1;
+            progressed = true;
+            break;
+        }
+        if !progressed { break; }
+    }
+
+    // Reclaim: the bump may now sit far above the highest live node. Lower it
+    // exactly once, at the end — never during the loop, because a bump below a
+    // live node is precisely the corruption build_all's aliasing note warns of.
+    if moved > 0 {
+        let (ir, pr, fr, qr) = unsafe {(
+            tessera_volume_inode_root(v), tessera_volume_pack_registry_root(v),
+            tessera_volume_free_extent_root(v), tessera_volume_quota_tree_root(v),
+        )};
+        let mut all: Vec<u64> = Vec::new();
+        live_nodes(io, ir, TESSERA_BTREE_KIND_INODE,    4,  TESSERA_INODE_RECORD_SIZE,   &mut all)?;
+        live_nodes(io, pr, TESSERA_BTREE_KIND_PACK_REG, 16, TESSERA_REGISTRY_ENTRY_SIZE, &mut all)?;
+        live_nodes(io, fr, TESSERA_BTREE_KIND_FREE_EXT, 8,  8,                           &mut all)?;
+        live_nodes(io, qr, TESSERA_BTREE_KIND_QUOTA,    8,  128,                         &mut all)?;
+        let top = all.iter().copied().max().map(|m| m + 1).unwrap_or(mr_start);
+        let b = Built { inode: ir, pack: pr, free: fr, quota: qr, bump: top.max(mr_start) };
+        commit(v, &b, next_ino, true)?;
+        println!("  crash-safe: bounded staging done — bump lowered to {}", b.bump);
+    }
+    Ok(moved)
+}
+
+fn run(path: &str, apply: bool, force: bool, stage_cap: Option<u64>) -> Result<i32, String> {
     let f = if apply {
         open_file_rw(path).map_err(|e| format!("open {path} (rw): {e}"))?
     } else {
@@ -240,7 +376,18 @@ fn run(path: &str, apply: bool, force: bool) -> Result<i32, String> {
     println!("  read: {} inodes, {} packs, {} free-extents, {} quota domains",
         trees.inodes.len(), trees.packs.len(), trees.frees.len(), trees.quotas.len());
 
-    let ceiling = mr_start + mr_len;
+    // --stage-cap artificially shrinks the usable reserve so the all-at-once
+    // path FAILS on demand. Without it the Phase-A refusal only appears on a
+    // large, heavily-used, fragmented reserve (the dev root reached it at
+    // 408,544 sectors); synthetic volumes always fit, which left the recovery
+    // path untestable — and an untestable recovery path is how #57 happened.
+    let ceiling = match stage_cap {
+        Some(n) => (mr_start + n).min(mr_start + mr_len),
+        None    => mr_start + mr_len,
+    };
+    if stage_cap.is_some() {
+        println!("  --stage-cap: usable reserve clamped to [{mr_start},{ceiling}) for testing");
+    }
 
     if force {
         // Legacy in-place overwrite — NOT crash-safe. Only if explicitly asked.
@@ -287,26 +434,32 @@ fn run(path: &str, apply: bool, force: bool) -> Result<i32, String> {
         }
 
         // Phase A: stage into headroom above the current bump, commit, loop.
-        //
-        // Staging rewrites the four live trees into unreferenced sectors, so
-        // the requirement scales with LIVE METADATA, not with any constant —
-        // which is exactly why a fixed emergency band cannot guarantee this
-        // fits (#82). `live` is the live node set we just walked, and each
-        // node is a sector, so live.len() is a direct estimate of what a
-        // staged copy needs. Report it: "insufficient headroom" without a
-        // number leaves the operator guessing how much to grow the reserve,
-        // and the only other exit is --force, which is NOT crash-safe.
-        let headroom = ceiling - cur_bump;
+        let headroom = ceiling.saturating_sub(cur_bump);
         let need = live.len() as u64;
-        let a = build_all(&io, ctxp, cur_bump, ceiling, &trees).map_err(|_| format!(
-            "insufficient reserve headroom to repack crash-safely: a live node sits low, \
-             and staging the {need} live metadata sector(s) needs roughly that much free \
-             above the bump — only {headroom} available{}. Grow the meta-reserve by at \
-             least {} sectors ({} MiB) and re-run; or re-run with --force for an in-place \
-             (NOT crash-safe) compaction — back up first.",
-            if need > headroom { format!(", short by ~{}", need - headroom) } else { String::new() },
-            need.saturating_sub(headroom).max(1),
-            (need.saturating_sub(headroom).max(1) * 4096).div_ceil(1024 * 1024)))?;
+        let a = match build_all(&io, ctxp, cur_bump, ceiling, &trees) {
+            Ok(a) => a,
+            Err(_) => {
+                // All-at-once needs sum(trees) of contiguous space. Fall back
+                // to moving ONE tree at a time (#82): peak requirement becomes
+                // the largest single tree, and any free gap qualifies.
+                println!("  all-at-once staging does not fit ({need} live sectors, \
+{headroom} free above the bump) — trying bounded per-tree staging");
+                let moved = stage_bounded(v, &io, ctxp, mr_start, ceiling, &trees, next_ino)?;
+                if moved > 0 {
+                    println!("  bounded staging moved {moved} tree(s); re-evaluating");
+                    continue;   // outer loop retries Phase B / A with more room
+                }
+                return Err(format!(
+                    "insufficient reserve headroom to repack crash-safely: a live node sits low, \
+                     staging the {need} live metadata sector(s) needs roughly that much \
+                     contiguous free space, only {headroom} above the bump, and no single tree \
+                     fits in any free gap either. Grow the meta-reserve by at least {} sectors \
+                     ({} MiB) and re-run; or re-run with --force for an in-place (NOT crash-safe) \
+                     compaction — back up first.",
+                    need.saturating_sub(headroom).max(1),
+                    (need.saturating_sub(headroom).max(1) * 4096).div_ceil(1024 * 1024)));
+            }
+        };
         commit(v, &a, next_ino, false)?;   // grow-only bump; snapshots now retired
         println!("  crash-safe: staged compacted trees in reserve headroom (snapshots retired)");
     }
@@ -350,10 +503,15 @@ fn main() -> ExitCode {
     let mut path = None;
     let mut apply = false;
     let mut force = false;
+    let mut stage_cap: Option<u64> = None;
     for a in &args[1..] {
         match a.as_str() {
             "-y" | "--apply" => apply = true,
             "--force"        => { apply = true; force = true; }
+            s if s.starts_with("--stage-cap=") => {
+                stage_cap = s["--stage-cap=".len()..].parse::<u64>().ok();
+                apply = true;
+            }
             s if !s.starts_with('-') => path = Some(s.to_string()),
             _ => {}
         }
@@ -368,10 +526,12 @@ fn main() -> ExitCode {
             eprintln!("           reserve sectors, lower the bump");
             eprintln!("  --force: in-place overwrite (NOT crash-safe) when the reserve is too");
             eprintln!("           maxed for the staged path — back up first");
+            eprintln!("  --stage-cap=N: TESTING — clamp the usable reserve to N sectors so the");
+            eprintln!("           all-at-once path fails and the bounded per-tree path is taken");
             return ExitCode::from(2);
         }
     };
-    match run(&path, apply, force) {
+    match run(&path, apply, force, stage_cap) {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => { eprintln!("tessera-repack: {e}"); ExitCode::from(1) }
     }
