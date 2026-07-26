@@ -486,6 +486,71 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, mft_cache_hits, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, mft_cache_misses, CTLFLAG_RD,
     &tessera_stat_mft_cache_misses, 0,
     "Reads that had to fetch the inode's manifest blob (#91)");
+/*
+ * ── Global bound on per-vnode cached blobs (#94) ────────────────────
+ *
+ * #91 and #93 each cache up to cas_manifest_blob_cap (256 KiB) of blob
+ * PER VNODE. That is bounded per entry and NOT bounded in aggregate:
+ * this VM's vnode cache can hold ~10^5 vnodes, so at 512 KiB apiece the
+ * worst case is gigabytes of wired kernel memory. Exactly the mistake
+ * the #90 admission cap made in the other direction — a limit that
+ * looks safe per item and isn't in total.
+ *
+ * So account every adopted byte against one global ceiling. Refusal is
+ * a plain "don't cache": the read still works, it just refetches, so
+ * over-pressure degrades to the old behaviour rather than failing.
+ *
+ * Deliberately NOT a cross-vnode LRU. The value here is locality within
+ * the file currently being read; a global reclaim policy would need its
+ * own lock ordering against the flush gate and vnode locks, which is a
+ * real deadlock surface for a modest gain. Refuse-when-full is simple
+ * and cannot deadlock.
+ *
+ * Counter is atomic because the free path runs in vop_reclaim, which
+ * does NOT hold the flush gate that serialises the adopt path.
+ */
+static unsigned long tessera_vnode_blob_bytes = 0;
+static unsigned long tessera_vnode_blob_max   = 32u * 1024u * 1024u;
+static unsigned long tessera_stat_vnode_blob_refused = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, vnode_blob_bytes, CTLFLAG_RD,
+    &tessera_vnode_blob_bytes, 0,
+    "Bytes currently held in per-vnode manifest/chunk caches (#94)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, vnode_blob_max, CTLFLAG_RW,
+    &tessera_vnode_blob_max, 0,
+    "Global ceiling on per-vnode cached blob bytes (#94; 0 disables "
+    "the per-vnode caches entirely)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, vnode_blob_refused, CTLFLAG_RD,
+    &tessera_stat_vnode_blob_refused, 0,
+    "Adoptions refused because the global ceiling was reached (#94) — "
+    "non-zero means the caches are saturated, not broken");
+
+/* Reserve `len` bytes against the global ceiling. 1 = go ahead. */
+static int
+tessera_vnode_blob_admit(uint32_t len)
+{
+	unsigned long cur = atomic_load_long(&tessera_vnode_blob_bytes);
+
+	if (len == 0 || cur + (unsigned long)len > tessera_vnode_blob_max) {
+		tessera_stat_vnode_blob_refused++;
+		return (0);
+	}
+	atomic_add_long(&tessera_vnode_blob_bytes, (unsigned long)len);
+	return (1);
+}
+
+/* Free a cached slot and return its bytes to the ceiling. Safe to call
+ * with an empty slot, and from vop_reclaim without the gate. */
+static void
+tessera_vnode_blob_release(uint8_t **slot, uint32_t *slot_len)
+{
+	if (*slot == NULL) { *slot_len = 0; return; }
+	free(*slot, M_TESSERA);
+	atomic_subtract_long(&tessera_vnode_blob_bytes,
+	    (unsigned long)*slot_len);
+	*slot = NULL;
+	*slot_len = 0;
+}
+
 static unsigned long tessera_stat_chunk_cache_hits   = 0;
 static unsigned long tessera_stat_chunk_cache_misses = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, chunk_cache_hits, CTLFLAG_RD,
@@ -6105,17 +6170,28 @@ tessera_fs_read_into_uio(struct tessera_mount *tmp_,
 			 * vnode cannot pin a huge chunk. */
 			if (!cb_cached && tn != NULL && err == 0 &&
 			    cb_len <= (uint32_t)tessera_cas_manifest_blob_cap) {
-				uint8_t *keep = malloc(cb_len, M_TESSERA,
-				    M_NOWAIT);
-				if (keep != NULL) {
-					memcpy(keep, cb, cb_len);
-					if (tn->chunk_bytes != NULL)
-						free(tn->chunk_bytes,
-						    M_TESSERA);
-					tn->chunk_bytes = keep;
-					tn->chunk_len   = cb_len;
-					memcpy(tn->chunk_hash, cr.chunk_hash,
-					    sizeof tn->chunk_hash);
+				/* Free the previous chunk before reserving the
+				 * new one, so a steady sequential read holds
+				 * one chunk, not two, against the ceiling. */
+				tessera_vnode_blob_release(&tn->chunk_bytes,
+				    &tn->chunk_len);
+				if (tessera_vnode_blob_admit(cb_len)) {
+					uint8_t *keep = malloc(cb_len,
+					    M_TESSERA, M_NOWAIT);
+					if (keep != NULL) {
+						memcpy(keep, cb, cb_len);
+						tn->chunk_bytes = keep;
+						tn->chunk_len   = cb_len;
+						memcpy(tn->chunk_hash,
+						    cr.chunk_hash,
+						    sizeof tn->chunk_hash);
+					} else {
+						/* malloc failed after the
+						 * reservation — give it back */
+						atomic_subtract_long(
+						    &tessera_vnode_blob_bytes,
+						    (unsigned long)cb_len);
+					}
 				}
 			}
 			if (!cb_cached && cb != scratch) free(cb, M_TESSERA);
@@ -6230,13 +6306,18 @@ tessera_fs_read_inode_uio(struct tessera_mount *tmp_,
 		 * manifest cannot pin arbitrary memory per open vnode. */
 		if (tn != NULL &&
 		    blob_len <= (uint32_t)tessera_cas_manifest_blob_cap) {
-			if (tn->mft_bytes != NULL)
-				free(tn->mft_bytes, M_TESSERA);
-			tn->mft_bytes = blob;
-			tn->mft_len   = blob_len;
-			memcpy(tn->mft_hash, ino->manifest_hash,
-			    sizeof tn->mft_hash);
-			blob_owned = 0;	/* the vnode owns it now */
+			/* Release the old slot FIRST so replacing an entry
+			 * does not transiently double-count against the
+			 * ceiling (#94). */
+			tessera_vnode_blob_release(&tn->mft_bytes,
+			    &tn->mft_len);
+			if (tessera_vnode_blob_admit(blob_len)) {
+				tn->mft_bytes = blob;
+				tn->mft_len   = blob_len;
+				memcpy(tn->mft_hash, ino->manifest_hash,
+				    sizeof tn->mft_hash);
+				blob_owned = 0;	/* the vnode owns it now */
+			}
 		}
 	}
 	tessera_manifest_parser_t *p = tessera_manifest_parse(blob, blob_len);
@@ -7144,10 +7225,9 @@ tessera_vop_reclaim(struct vop_reclaim_args *ap)
 	vfs_hash_remove(vp);
 	if (tn != NULL) {
 		/* #91: release the cached manifest blob with the vnode. */
-		if (tn->mft_bytes != NULL)
-			free(tn->mft_bytes, M_TESSERA);
-		if (tn->chunk_bytes != NULL)
-			free(tn->chunk_bytes, M_TESSERA);
+		/* #94: return both slots' bytes to the global ceiling. */
+		tessera_vnode_blob_release(&tn->mft_bytes, &tn->mft_len);
+		tessera_vnode_blob_release(&tn->chunk_bytes, &tn->chunk_len);
 		free(tn, M_TESSERA);
 		vp->v_data = NULL;
 	}
