@@ -486,6 +486,14 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, mft_cache_hits, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, mft_cache_misses, CTLFLAG_RD,
     &tessera_stat_mft_cache_misses, 0,
     "Reads that had to fetch the inode's manifest blob (#91)");
+static unsigned long tessera_stat_chunk_cache_hits   = 0;
+static unsigned long tessera_stat_chunk_cache_misses = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, chunk_cache_hits, CTLFLAG_RD,
+    &tessera_stat_chunk_cache_hits, 0,
+    "Chunk reads served from the per-vnode last-chunk cache (#93)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, chunk_cache_misses, CTLFLAG_RD,
+    &tessera_stat_chunk_cache_misses, 0,
+    "Chunk reads that had to fetch the chunk blob (#93)");
 static unsigned long tessera_stat_verify_ns       = 0;
 static unsigned long tessera_stat_verify_fail     = 0;
 /*
@@ -1779,10 +1787,12 @@ static int tessera_fs_dirent_rewrite(struct tessera_mount *tmp_,
                                      uint64_t add_inode,
                                      const char *name, size_t namelen);
 /* CHUNK_LIST / CHUNK_TREE recursive reader (v2 step-3c). */
+struct tessera_node;
 static int tessera_fs_read_into_uio(struct tessera_mount *tmp_,
                                     tessera_manifest_parser_t *p,
                                     struct uio *uio, uint8_t *scratch,
-                                    uint64_t scratch_cap);
+                                    uint64_t scratch_cap,
+                                    struct tessera_node *tn);
 static int tessera_fs_publish_directory(struct tessera_mount *tmp_,
                                          uint32_t owner_inode_no,
                                          const uint8_t *flat_mft,
@@ -3259,6 +3269,12 @@ struct tessera_node {
 	uint8_t       *mft_bytes;
 	uint32_t       mft_len;
 	tessera_hash_t mft_hash;
+	/* Most recently read data chunk (#93) — same gate protection,
+	 * same self-invalidating hash key. Collapses small sequential
+	 * reads that would otherwise refetch the whole chunk each time. */
+	uint8_t       *chunk_bytes;
+	uint32_t       chunk_len;
+	tessera_hash_t chunk_hash;
 };
 
 #define VTOTNODE(vp) ((struct tessera_node *)(vp)->v_data)
@@ -6002,7 +6018,8 @@ stop_walk:
 static int
 tessera_fs_read_into_uio(struct tessera_mount *tmp_,
                         tessera_manifest_parser_t *p,
-                        struct uio *uio, uint8_t *scratch, uint64_t scratch_cap)
+                        struct uio *uio, uint8_t *scratch, uint64_t scratch_cap,
+                        struct tessera_node *tn)
 {
 	const tessera_manifest_kind_t k = tessera_manifest_parser_kind(p);
 
@@ -6039,18 +6056,69 @@ tessera_fs_read_into_uio(struct tessera_mount *tmp_,
 
 			uint8_t *cb = NULL;
 			uint32_t cb_len = 0;
-			/* Leaf data — copy into the reusable scratch buffer when
-			 * it fits (avoids the per-chunk >64 KiB malloc). cb points
-			 * at the scratch on the fast path, at a malloc'd buffer on
-			 * the fallback; only free the latter. */
-			if (tessera_fs_fetch_blob_ex(tmp_, cr.chunk_hash,
-			    scratch, scratch_cap, &cb, &cb_len) != 0) return (EIO);
+			int cb_cached = 0;
+			/*
+			 * Per-vnode LAST-CHUNK cache (task #93).
+			 *
+			 * A read() smaller than the chunk fetches the WHOLE
+			 * chunk, so a 4 KiB read of a 64 KiB chunk moves 16x
+			 * the bytes asked for. Measured over 170 chunked
+			 * files (192 MiB): `cat > /dev/null`, which reads in
+			 * 4 KiB units, fetched 3,046 MiB — 15.8x — while
+			 * `dd bs=128k` fetched 191 MiB, i.e. 0.9x and 11x
+			 * faster. The read path is already optimal for
+			 * well-sized reads; it is small reads that hurt, and
+			 * plenty of real software does small reads.
+			 *
+			 * Sequential small reads walk the SAME chunk over and
+			 * over, so caching just the most recent one collapses
+			 * that. Keyed by chunk hash (self-invalidating, as in
+			 * #91) and protected by the same exclusive flush gate,
+			 * so no extra lock. tn is NULL on ungated paths.
+			 */
+			if (tn != NULL && tn->chunk_bytes != NULL &&
+			    memcmp(tn->chunk_hash, cr.chunk_hash,
+			        sizeof tn->chunk_hash) == 0) {
+				cb = tn->chunk_bytes;
+				cb_len = tn->chunk_len;
+				cb_cached = 1;
+				tessera_stat_chunk_cache_hits++;
+			} else {
+				/* Leaf data — copy into the reusable scratch
+				 * buffer when it fits (avoids the per-chunk
+				 * >64 KiB malloc). cb points at the scratch on
+				 * the fast path, at a malloc'd buffer on the
+				 * fallback; only free the latter. */
+				if (tessera_fs_fetch_blob_ex(tmp_,
+				    cr.chunk_hash, scratch, scratch_cap,
+				    &cb, &cb_len) != 0) return (EIO);
+				tessera_stat_chunk_cache_misses++;
+			}
 			if (cb_len < cr.uncompressed_size) {
-				if (cb != scratch) free(cb, M_TESSERA);
+				if (!cb_cached && cb != scratch)
+					free(cb, M_TESSERA);
 				return (EIO);
 			}
 			int err = uiomove(cb + lo, n_copy, uio);
-			if (cb != scratch) free(cb, M_TESSERA);
+			/* Adopt this chunk for the next read() before
+			 * releasing it. Bounded by the manifest cap so one
+			 * vnode cannot pin a huge chunk. */
+			if (!cb_cached && tn != NULL && err == 0 &&
+			    cb_len <= (uint32_t)tessera_cas_manifest_blob_cap) {
+				uint8_t *keep = malloc(cb_len, M_TESSERA,
+				    M_NOWAIT);
+				if (keep != NULL) {
+					memcpy(keep, cb, cb_len);
+					if (tn->chunk_bytes != NULL)
+						free(tn->chunk_bytes,
+						    M_TESSERA);
+					tn->chunk_bytes = keep;
+					tn->chunk_len   = cb_len;
+					memcpy(tn->chunk_hash, cr.chunk_hash,
+					    sizeof tn->chunk_hash);
+				}
+			}
+			if (!cb_cached && cb != scratch) free(cb, M_TESSERA);
 			if (err != 0) return (err);
 		}
 		return (0);
@@ -6095,7 +6163,7 @@ tessera_fs_read_into_uio(struct tessera_mount *tmp_,
 				return (EIO);
 			}
 			int err = tessera_fs_read_into_uio(tmp_, cp, uio,
-			    scratch, scratch_cap);
+			    scratch, scratch_cap, tn);
 			tessera_manifest_parser_free(cp);
 			free(cblob, M_TESSERA);
 			if (err != 0) return (err);
@@ -6204,7 +6272,7 @@ tessera_fs_read_inode_uio(struct tessera_mount *tmp_,
 		uint8_t *scratch = malloc(TESSERA_READ_SCRATCH_BYTES, M_TESSERA,
 		    M_NOWAIT);
 		err = tessera_fs_read_into_uio(tmp_, p, uio, scratch,
-		    scratch ? TESSERA_READ_SCRATCH_BYTES : 0);
+		    scratch ? TESSERA_READ_SCRATCH_BYTES : 0, tn);
 		if (scratch != NULL) free(scratch, M_TESSERA);
 	} else {
 		err = EIO;
@@ -7078,6 +7146,8 @@ tessera_vop_reclaim(struct vop_reclaim_args *ap)
 		/* #91: release the cached manifest blob with the vnode. */
 		if (tn->mft_bytes != NULL)
 			free(tn->mft_bytes, M_TESSERA);
+		if (tn->chunk_bytes != NULL)
+			free(tn->chunk_bytes, M_TESSERA);
 		free(tn, M_TESSERA);
 		vp->v_data = NULL;
 	}
@@ -18967,7 +19037,8 @@ tessera_fs_read_full_content(struct tessera_mount *tmp_,
 		_uio.uio_segflg = UIO_SYSSPACE;
 		_uio.uio_rw     = UIO_READ;
 		_uio.uio_td     = curthread;
-		err = tessera_fs_read_into_uio(tmp_, p, &_uio, NULL, 0);
+		/* ungated helper: no per-vnode caching (#91/#93) */
+		err = tessera_fs_read_into_uio(tmp_, p, &_uio, NULL, 0, NULL);
 	} else {
 		err = EIO;  /* SYMLINK / DIRECTORY not handled here */
 	}
