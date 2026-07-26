@@ -871,6 +871,47 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_swaps, CTLFLAG_RD,
  * (runs) from "a kick/run bailed because one was already active"
  * (skips_active) — the counts alone say whether the reclaim path is being
  * driven at all under a pure-delete workload, before any theory. */
+/*
+ * ★ task #71: bound pinscan DUTY, not kick RATE.
+ *
+ * The old throttle allowed <=1 kick per wall-clock second. That bounds how
+ * OFTEN a scan starts, not how much work it does — and each scan is a full
+ * live-tree walk, O(volume). Measured on the 25 GiB / 245k-inode dev root:
+ * ~370-400 ms per scan, ~11 kicks/min under write load => ~4% duty. The kick
+ * rate is driven by commit frequency, which does NOT fall as a volume grows,
+ * so a 10x larger volume means ~4 s per scan at the same rate — duty goes
+ * from ~4% to over half a core, with nothing in the throttle to stop it.
+ *
+ * So space scans by a multiple of how long the LAST one actually took:
+ * after a scan costing T, refuse the next for T * (100/duty - 1). Duty then
+ * stays near the target whatever the volume size, and the throttle becomes
+ * self-tuning instead of a constant that silently stops being appropriate.
+ * The 1/s floor is kept as a minimum spacing for volumes so small the scan
+ * is ~0 ms.
+ *
+ * Correctness is unaffected, for the same reason the old throttle was safe:
+ * over-pinning is always safe, and the flush-gate preflight remains the
+ * synchronous net that reclaims when the reserve genuinely runs tight.
+ */
+static int tessera_pinscan_duty_pct = 5;
+SYSCTL_INT(_kern_tessera, OID_AUTO, pinscan_duty_pct, CTLFLAG_RW,
+    &tessera_pinscan_duty_pct, 0,
+    "Target background-pinscan duty cycle in percent (#71): the next scan "
+    "is refused until last_scan_ms * (100/pct - 1) has elapsed. "
+    "0 = old behaviour (rate-limit only, <=1 kick/s)");
+static unsigned long tessera_stat_pinscan_skips_duty = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_skips_duty, CTLFLAG_RD,
+    &tessera_stat_pinscan_skips_duty, 0,
+    "pinscan kicks refused to hold the duty cycle (#71)");
+static unsigned long tessera_stat_pinscan_last_ms = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_last_ms, CTLFLAG_RD,
+    &tessera_stat_pinscan_last_ms, 0,
+    "Duration of the most recent pinscan, ms (#71)");
+static unsigned long tessera_stat_pinscan_total_ms = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_total_ms, CTLFLAG_RD,
+    &tessera_stat_pinscan_total_ms, 0,
+    "Cumulative ms spent in background pinscans (#71) — divide by uptime "
+    "for the achieved duty cycle");
 static unsigned long tessera_stat_pinscan_kicks        = 0;
 static unsigned long tessera_stat_pinscan_runs         = 0;
 static unsigned long tessera_stat_pinscan_skips_active = 0;
@@ -2279,6 +2320,10 @@ struct tessera_mount {
 	 * bump pointer races the reserve ceiling. See
 	 * tessera_meta_pin_bitmap_rebuild. */
 	time_t                    pinscan_last_kick_sec;
+	/* #71: when the last scan finished, and how long it took, so the
+	 * next kick can be spaced to hold a duty cycle rather than a rate. */
+	sbintime_t                pinscan_last_end;
+	sbintime_t                pinscan_last_dur;
 	/* Wall-clock second of the last meta_reserve EXHAUST printf, to
 	 * rate-limit that log to 1/s (the count lives in the meta_exhaust
 	 * sysctl). */
@@ -12039,6 +12084,11 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	/* Rate-limit the routine log to 1/s (the scan runs per retire ~ per
 	 * commit, so unthrottled this is console spam). pinscan_verbose logs
 	 * every scan. time_uptime is a monotonic per-second counter. */
+	sbintime_t _ps_dur = sbinuptime() - _ps0;
+	tmp_->pinscan_last_dur = _ps_dur;
+	tmp_->pinscan_last_end = sbinuptime();
+	tessera_stat_pinscan_last_ms  = (unsigned long)(_ps_dur / SBT_1MS);
+	tessera_stat_pinscan_total_ms += (unsigned long)(_ps_dur / SBT_1MS);
 	time_t _now = (time_t)time_uptime;
 	if (tessera_pinscan_verbose || _now != tmp_->pinscan_last_log_sec) {
 		tmp_->pinscan_last_log_sec = _now;
@@ -12124,6 +12174,21 @@ tessera_meta_pin_bitmap_rebuild(struct tessera_mount *tmp_)
 	time_t _now = (time_t)time_uptime;
 	if (_now == tmp_->pinscan_last_kick_sec)
 		return;
+	/*
+	 * #71: hold the DUTY CYCLE. A scan costing T ms earns T*(100/pct - 1)
+	 * ms of quiet, so cost-per-second stays near the target however large
+	 * the volume — where the 1/s rule above bounds only how often a scan
+	 * may START.
+	 */
+	if (tessera_pinscan_duty_pct > 0 && tessera_pinscan_duty_pct < 100 &&
+	    tmp_->pinscan_last_dur > 0) {
+		sbintime_t quiet = tmp_->pinscan_last_dur *
+		    ((100 / tessera_pinscan_duty_pct) - 1);
+		if (sbinuptime() < tmp_->pinscan_last_end + quiet) {
+			tessera_stat_pinscan_skips_duty++;
+			return;
+		}
+	}
 	tmp_->pinscan_last_kick_sec = _now;
 	tessera_stat_pinscan_kicks++;
 	(void)taskqueue_enqueue(tmp_->pinscan_tq, &tmp_->pinscan_task);
