@@ -34,6 +34,7 @@
 #include <sys/jail.h>
 #include <sys/proc.h>
 #include <sys/sysctl.h>
+#include <sys/sbuf.h>		/* verify_mft_kinds breakdown (#90) */
 #include <sys/priv.h>
 #include <sys/malloc.h>
 #include <sys/uio.h>
@@ -432,6 +433,23 @@ static unsigned long tessera_stat_verify_data     = 0;
 static unsigned long tessera_stat_verify_cached   = 0;
 static unsigned long tessera_stat_verify_skipped  = 0;
 static unsigned long tessera_stat_verify_bytes    = 0;
+/* Split the byte total by class (#90). The COUNTS alone said manifests
+ * were fetched 2.4x more often than data blobs, but a count says nothing
+ * about volume — a directory btree manifest can be far larger than a file
+ * chunk. Without this split, "12.8 GiB hashed to read 1.1 GiB" cannot be
+ * attributed, and the fix would be guesswork. */
+static unsigned long tessera_stat_verify_bytes_manifest = 0;
+static unsigned long tessera_stat_verify_bytes_data     = 0;
+/*
+ * Per-manifest-KIND attribution (#90). "manifests are 77% of the bytes"
+ * is still not actionable — a CHUNK_LIST for a big file and a directory
+ * btree node are both manifests and want completely different fixes.
+ * manifest_kind lives at byte 6 of the 32-byte header (format.h), so
+ * this costs one load. Indexed by kind, 0..15.
+ */
+#define TESSERA_MFT_KINDS 16
+static unsigned long tessera_stat_mft_count[TESSERA_MFT_KINDS];
+static unsigned long tessera_stat_mft_bytes[TESSERA_MFT_KINDS];
 static unsigned long tessera_stat_verify_ns       = 0;
 static unsigned long tessera_stat_verify_fail     = 0;
 /*
@@ -486,6 +504,42 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_skipped, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_bytes, CTLFLAG_RD,
     &tessera_stat_verify_bytes, 0,
     "Total bytes re-hashed (#87) — the cost driver");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_bytes_manifest, CTLFLAG_RD,
+    &tessera_stat_verify_bytes_manifest, 0,
+    "Of verify_bytes, the share that was manifest blobs (#90)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_bytes_data, CTLFLAG_RD,
+    &tessera_stat_verify_bytes_data, 0,
+    "Of verify_bytes, the share that was file data (#90)");
+
+/* Per-manifest-kind fetch attribution (#90): "kind=N count=C bytes=B". */
+static int
+tessera_sysctl_mft_breakdown(SYSCTL_HANDLER_ARGS)
+{
+	static const char *names[TESSERA_MFT_KINDS] = {
+		"?0", "INLINE", "CHUNK_LIST", "CHUNK_TREE", "DIRECTORY",
+		"SYMLINK", "XATTR_STORE", "GC_ROOT_LIST", "DIRECTORY_2L",
+		"DIRECTORY_BTREE", "?10", "?11", "?12", "?13", "?14", "?15"
+	};
+	struct sbuf sb;
+	int error;
+
+	sbuf_new_for_sysctl(&sb, NULL, 512, req);
+	for (int i = 0; i < TESSERA_MFT_KINDS; i++) {
+		if (tessera_stat_mft_count[i] == 0)
+			continue;
+		sbuf_printf(&sb, "%-16s count=%lu bytes=%lu avg=%lu\n",
+		    names[i], tessera_stat_mft_count[i],
+		    tessera_stat_mft_bytes[i],
+		    tessera_stat_mft_bytes[i] / tessera_stat_mft_count[i]);
+	}
+	error = sbuf_finish(&sb);
+	sbuf_delete(&sb);
+	return (error);
+}
+SYSCTL_PROC(_kern_tessera, OID_AUTO, verify_mft_kinds,
+    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    tessera_sysctl_mft_breakdown, "A",
+    "Fetched-manifest breakdown by kind — which manifests dominate (#90)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_ns, CTLFLAG_RD,
     &tessera_stat_verify_ns, 0,
     "Cumulative ns spent re-hashing (#87) — the cost actually paid");
@@ -8569,10 +8623,18 @@ tessera_fs_verify_blob(uint32_t hash_alg, const uint8_t *buf, uint32_t len,
 	tessera_content_hash(hash_alg, buf, len, check);
 	tessera_stat_verify_ns += (unsigned long)sbttons(sbinuptime() - _t0);
 	tessera_stat_verify_bytes += len;
-	if (is_manifest)
+	if (is_manifest) {
 		tessera_stat_verify_manifest++;
-	else
+		tessera_stat_verify_bytes_manifest += len;
+		if (len >= 8) {
+			uint8_t k = buf[6] & 0x0f;	/* manifest_kind */
+			tessera_stat_mft_count[k]++;
+			tessera_stat_mft_bytes[k] += len;
+		}
+	} else {
 		tessera_stat_verify_data++;
+		tessera_stat_verify_bytes_data += len;
+	}
 	if (cached)
 		tessera_stat_verify_cached++;
 
@@ -8750,7 +8812,10 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_loc_max, CTLFLAG_RW,
     "Max number of CAS location entries (LRU-evicted past this)");
 
 /* Tier B — bytes cache. Default 8 MiB (stage 5). */
-static unsigned long tessera_cas_byte_max_bytes = 8u * 1024u * 1024u;
+/* 64 MiB (was 8): with the manifest admission cap raised to 256 KiB (#90),
+ * 8 MiB held only ~64 manifests and evicted them before reuse. Still modest
+ * next to the 256 MiB whole-pack cache below. */
+static unsigned long tessera_cas_byte_max_bytes = 64u * 1024u * 1024u;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_byte_max_bytes, CTLFLAG_RW,
     &tessera_cas_byte_max_bytes, 0,
     "Max bytes held in the CAS bytes cache (LRU-evicted past this)");
@@ -8761,7 +8826,32 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_byte_max_bytes, CTLFLAG_RW,
 static unsigned long tessera_cas_small_blob_cap = 4096;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_small_blob_cap, CTLFLAG_RW,
     &tessera_cas_small_blob_cap, 0,
-    "Max blob size eligible for the CAS bytes cache");
+    "Max NON-manifest blob size eligible for the CAS bytes cache");
+/*
+ * Manifests get their own, much larger cap (#90).
+ *
+ * The single 4 KiB cap was excluding the hottest blobs on the system.
+ * Measured over a 34,931-file tree walk, fetched-manifest bytes break
+ * down as: INLINE avg 131,125 B (97% of all manifest bytes),
+ * CHUNK_LIST avg 10,824 B, DIRECTORY_BTREE avg 354 B. INLINE manifests
+ * carry small files' contents, so they are simultaneously the most
+ * re-read blobs and — at ~128 KiB — 32x over the old cap, meaning they
+ * were NEVER cached. Not a capacity problem: raising the TOTAL from
+ * 8 MiB to 64 MiB changed the miss count by literally zero, because
+ * insertion was refused before capacity ever came into play.
+ *
+ * Sweep on that workload (hashed bytes are a direct miss-volume meter):
+ *   cap   4 KiB: 12,864 MiB hashed, 47% hit, 27.1 s
+ *   cap 128 KiB:  9,558 MiB hashed, 73% hit, 24.2 s
+ *   cap 256 KiB:  7,682 MiB hashed, 77% hit, 21.8 s
+ * Non-manifest data blobs keep the small cap: they are large, cold and
+ * already served by the whole-pack cache tier, so admitting them would
+ * evict the manifests that actually get reused.
+ */
+static unsigned long tessera_cas_manifest_blob_cap = 262144;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, cas_manifest_blob_cap, CTLFLAG_RW,
+    &tessera_cas_manifest_blob_cap, 0,
+    "Max MANIFEST blob size eligible for the CAS bytes cache (#90)");
 
 /* Whole-pack cache cap. A sequential big-file read only needs the pack it's
  * currently draining (plus interleaved manifest packs), so a modest cap
@@ -9076,7 +9166,13 @@ tessera_cas_byte_insert(struct tessera_cas_cache *c,
 	if (!tessera_cas_enable || !c->mtx_init ||
 	    tessera_cas_byte_max_bytes == 0)
 		return;
-	if (length == 0 || length > (uint32_t)tessera_cas_small_blob_cap)
+	/* Manifests are the reused blobs; admit them up to the larger cap
+	 * (#90). Identified by the "TMFT" magic, same one-load test the
+	 * verifier uses. */
+	uint32_t adm_cap = (uint32_t)tessera_cas_small_blob_cap;
+	if (length >= 4 && memcmp(bytes, TESSERA_MAGIC_MANIFEST, 4) == 0)
+		adm_cap = (uint32_t)tessera_cas_manifest_blob_cap;
+	if (length == 0 || length > adm_cap)
 		return;
 
 	uint8_t *copy = malloc(length, M_TESSERA, M_NOWAIT);
