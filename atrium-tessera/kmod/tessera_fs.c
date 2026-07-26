@@ -450,6 +450,20 @@ static unsigned long tessera_stat_verify_bytes_data     = 0;
 #define TESSERA_MFT_KINDS 16
 static unsigned long tessera_stat_mft_count[TESSERA_MFT_KINDS];
 static unsigned long tessera_stat_mft_bytes[TESSERA_MFT_KINDS];
+/*
+ * Storage-layout question left over from #91: an INLINE manifest embeds the
+ * file's whole content (threshold 256 KiB), so its blob SHOULD be about
+ * header + logical_size. Post-#91 the tree walk fetched ~165 KiB per file
+ * for files averaging ~33 KiB — a 5x gap that a per-fetch AVERAGE cannot
+ * explain, because an average hides whether it is a few big files or a
+ * uniform overhead. So record both sides directly: logical_size lives at
+ * byte 8 of the header, so the comparison is exact rather than inferred.
+ * mft_logical vs mft_bytes gives the true stored-vs-content ratio, and the
+ * histogram shows the distribution the average was concealing.
+ */
+static unsigned long tessera_stat_mft_logical[TESSERA_MFT_KINDS];
+#define TESSERA_MFT_HIST 12	/* log2 buckets: <1K,<2K,...,<2M,>=2M */
+static unsigned long tessera_stat_mft_hist[TESSERA_MFT_HIST];
 /* Admission cap for MANIFEST blobs in the CAS bytes cache (#90). Declared
  * here rather than beside the rest of the CAS tunables because the read
  * path (#91) bounds its per-vnode cache by the same value. Its SYSCTL is
@@ -541,10 +555,28 @@ tessera_sysctl_mft_breakdown(SYSCTL_HANDLER_ARGS)
 	for (int i = 0; i < TESSERA_MFT_KINDS; i++) {
 		if (tessera_stat_mft_count[i] == 0)
 			continue;
-		sbuf_printf(&sb, "%-16s count=%lu bytes=%lu avg=%lu\n",
+		/* overhead = stored bytes per byte of actual content, x100 */
+		unsigned long lg = tessera_stat_mft_logical[i];
+		unsigned long ovh = (lg != 0)
+		    ? (tessera_stat_mft_bytes[i] * 100UL) / lg : 0;
+		sbuf_printf(&sb,
+		    "%-16s count=%lu bytes=%lu avg=%lu logical=%lu ovh=%lu%%\n",
 		    names[i], tessera_stat_mft_count[i],
 		    tessera_stat_mft_bytes[i],
-		    tessera_stat_mft_bytes[i] / tessera_stat_mft_count[i]);
+		    tessera_stat_mft_bytes[i] / tessera_stat_mft_count[i],
+		    lg, ovh);
+	}
+	sbuf_printf(&sb, "size histogram (fetched manifests):\n");
+	for (int b = 0; b < TESSERA_MFT_HIST; b++) {
+		if (tessera_stat_mft_hist[b] == 0)
+			continue;
+		if (b == 0)
+			sbuf_printf(&sb, "  <1KiB      %lu\n",
+			    tessera_stat_mft_hist[b]);
+		else
+			sbuf_printf(&sb, "  <%luKiB%*s %lu\n",
+			    1UL << b, (b < 4 ? 6 : (b < 7 ? 5 : 4)), "",
+			    tessera_stat_mft_hist[b]);
 	}
 	error = sbuf_finish(&sb);
 	sbuf_delete(&sb);
@@ -8699,10 +8731,36 @@ tessera_fs_verify_blob(uint32_t hash_alg, const uint8_t *buf, uint32_t len,
 	if (is_manifest) {
 		tessera_stat_verify_manifest++;
 		tessera_stat_verify_bytes_manifest += len;
-		if (len >= 8) {
+		if (len >= 16) {
 			uint8_t k = buf[6] & 0x0f;	/* manifest_kind */
+			uint64_t lsz = 0;		/* logical_size, LE */
+			for (int _b = 7; _b >= 0; _b--)
+				lsz = (lsz << 8) | buf[8 + _b];
 			tessera_stat_mft_count[k]++;
 			tessera_stat_mft_bytes[k] += len;
+			tessera_stat_mft_logical[k] += lsz;
+			uint32_t b = 0, v = len >> 10;	/* KiB */
+			while (v != 0 && b < TESSERA_MFT_HIST - 1) {
+				v >>= 1; b++;
+			}
+			tessera_stat_mft_hist[b]++;
+			/* An INLINE manifest carries the whole file, and the
+			 * write path caps that at TESSERA_INLINE_THRESHOLD
+			 * (256 KiB) — so a multi-megabyte one cannot exist by
+			 * that rule. The tree walk fetched 1,167 of them.
+			 * Name them (rate-limited) rather than theorise. */
+			if (k == 1 && len > (512u * 1024u)) {
+				static int _warned;
+				if (_warned < 8) {
+					_warned++;
+					printf("tessera_fs: OVERSIZE INLINE "
+					    "manifest %02x%02x%02x%02x... "
+					    "blob=%u logical=%ju (threshold "
+					    "%u)\n", hash[0], hash[1],
+					    hash[2], hash[3], len,
+					    (uintmax_t)lsz, 256u * 1024u);
+				}
+			}
 		}
 	} else {
 		tessera_stat_verify_data++;
