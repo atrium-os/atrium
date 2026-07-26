@@ -25,18 +25,33 @@ pub struct DiskCtx {
     /// One past the last allocatable reserve sector (meta_reserve_start +
     /// meta_reserve_length). 0 = allocation disabled.
     pub bump_max: u64,
+    /// ★ task #82(d): optional FREE-GAP list, [start, end) runs the caller
+    /// has proven the committed superblock does not reference.
+    ///
+    /// A plain bump can only build a tree that fits in ONE contiguous
+    /// window, which is why staged repack's requirement was O(largest
+    /// single tree) even after #82(b) — a tree bigger than every gap simply
+    /// could not be built anywhere. Allocating from a LIST of gaps makes
+    /// the requirement "enough free sectors IN TOTAL", i.e. genuinely
+    /// O(slack), because reserve fragmentation stops mattering. btree nodes
+    /// are allocated a sector at a time, so almost any gap is usable.
+    ///
+    /// Empty = behave exactly as the old bump (every existing caller).
+    pub gaps: std::cell::RefCell<Vec<(u64, u64)>>,
 }
 
 impl DiskCtx {
     /// Read-only context: allocation disabled.
     pub fn ro(fd: i32) -> Self {
-        DiskCtx { fd, bump: std::cell::Cell::new(0), bump_max: 0 }
+        DiskCtx { fd, bump: std::cell::Cell::new(0), bump_max: 0,
+                  gaps: std::cell::RefCell::new(Vec::new()) }
     }
     /// Read-write context with a metadata-reserve bump allocator over
     /// [bump_start, bump_max). Used by tessera-fsck --repair to allocate
     /// COW btree / free-tree nodes exactly like the kmod's runtime bump.
     pub fn rw(fd: i32, bump_start: u64, bump_max: u64) -> Self {
-        DiskCtx { fd, bump: std::cell::Cell::new(bump_start), bump_max }
+        DiskCtx { fd, bump: std::cell::Cell::new(bump_start), bump_max,
+                  gaps: std::cell::RefCell::new(Vec::new()) }
     }
 }
 
@@ -75,6 +90,27 @@ pub extern "C" fn disk_alloc(ctx: *mut c_void, n: u64, out_start: *mut u64) -> i
     let d = unsafe { &*(ctx as *const DiskCtx) };
     if d.bump_max == 0 {
         return -1;
+    }
+    // #82(d): draw from the free-gap list when one is set, so a build is
+    // limited by TOTAL free sectors rather than by the largest contiguous
+    // run. First-fit is enough: node allocations are almost all n == 1.
+    {
+        let mut g = d.gaps.borrow_mut();
+        if !g.is_empty() {
+            for i in 0..g.len() {
+                if g[i].1 - g[i].0 >= n {
+                    let s = g[i].0;
+                    g[i].0 += n;
+                    if g[i].0 >= g[i].1 { g.remove(i); }
+                    // Keep `bump` as the high-water mark so the committed
+                    // meta_reserve_bump still covers every node written.
+                    if s + n > d.bump.get() { d.bump.set(s + n); }
+                    unsafe { *out_start = s; }
+                    return 0;
+                }
+            }
+            return -1;   /* out of free space anywhere in the reserve */
+        }
     }
     let start = d.bump.get();
     if start + n > d.bump_max {

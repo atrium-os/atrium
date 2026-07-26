@@ -166,6 +166,25 @@ fn build_one(io: &tessera_block_io_t, ctxp: *mut DiskCtx, start: u64, cap: u64,
     Ok((root, frontier))
 }
 
+/// Build ONE tree using EVERY free gap (#82d), not just one window. The
+/// allocator draws from the list, so the build succeeds whenever the gaps
+/// hold enough sectors IN TOTAL — reserve fragmentation stops mattering,
+/// which is what makes the requirement O(slack) rather than O(largest tree).
+/// Restores the allocator to plain-bump mode before returning either way.
+fn build_one_gaps(io: &tessera_block_io_t, ctxp: *mut DiskCtx, gaps: &[(u64, u64)],
+    cur_bump: u64, existed: bool, kind: u8, ksz: u32, vsz: u32,
+    entries: &[(Vec<u8>, Vec<u8>)]) -> Result<(u64, u64), String>
+{
+    unsafe {
+        (*ctxp).bump.set(cur_bump);
+        *(*ctxp).gaps.borrow_mut() = gaps.to_vec();
+    }
+    let r = write_tree(io, existed, kind, ksz, vsz, entries);
+    let frontier = unsafe { (*ctxp).bump.get() };
+    unsafe { (*ctxp).gaps.borrow_mut().clear(); }
+    r.map(|root| (root, frontier))
+}
+
 /// Maximal runs in [lo, hi) containing NO live node, widest first.
 ///
 /// Staging may only write where a crash cannot hurt: a gap holds nothing the
@@ -269,6 +288,33 @@ fn stage_bounded(v: *mut tessera_volume_t, io: &tessera_block_io_t, ctxp: *mut D
 
         let (_, kind, ksz, vsz, entries, existed, _) = specs[victim];
         let mut progressed = false;
+
+        // #82(d): first try building across ALL gaps at once. This succeeds
+        // when the free sectors suffice IN TOTAL, covering the case a
+        // per-gap attempt cannot: a tree larger than every individual gap.
+        // Only space strictly below the victim's top can improve on it.
+        let below: Vec<(u64, u64)> = gaps.iter().copied()
+            .filter(|&(gs, _)| gs < victim_top)
+            .map(|(gs, ge)| (gs, ge.min(victim_top)))
+            .filter(|&(gs, ge)| ge > gs)
+            .collect();
+        if !below.is_empty() {
+            if let Ok((root, frontier)) = build_one_gaps(io, ctxp, &below, cur_bump,
+                existed, kind, ksz, vsz, entries)
+            {
+                let bump = if frontier > cur_bump { frontier } else { cur_bump };
+                let mut b = Built { inode: ir, pack: pr, free: fr, quota: qr, bump };
+                match victim { 0 => b.inode = root, 1 => b.pack = root,
+                               2 => b.free = root, _ => b.quota = root }
+                commit(v, &b, next_ino, false)?;
+                let span: u64 = below.iter().map(|&(a, c)| c - a).sum();
+                println!("  crash-safe: moved tree kind={kind} across {} gap(s) \
+({span} free sectors), top was {victim_top}", below.len());
+                moved += 1;
+                continue;
+            }
+        }
+
         for &(gs, ge) in &gaps {
             if gs >= victim_top { break; }          // cannot improve from here
             let Ok((root, frontier)) = build_one(io, ctxp, gs, ge, existed, kind, ksz, vsz, entries)
