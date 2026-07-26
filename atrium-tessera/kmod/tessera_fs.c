@@ -391,6 +391,49 @@ static unsigned long tessera_stat_gc_touch_keeps = 0;
 static unsigned long tessera_stat_gc_reclaimed   = 0;
 static unsigned long tessera_stat_gc_lost_subtrees = 0;
 static unsigned long tessera_stat_gc_snapshots_retired = 0;
+
+/*
+ * ── Read-path content verification (task #87) ───────────────────────
+ *
+ * CONFIRMED BUG: a read() can return SUCCESS with zeros substituted for
+ * stored bytes. Zeroing one 4 KiB sector of a blob's data made an 80-byte
+ * range read back as zeros, exit 0, no error — in a CONTENT-ADDRESSED
+ * filesystem, where the address IS the hash and serving bytes that do not
+ * hash to it should be impossible.
+ *
+ * The fix is to re-hash on fetch, but the cost lands squarely on the read
+ * path that #17/#34/#61/#69 spent real effort optimising. So rather than
+ * guess, all three candidate policies are implemented on one ladder and
+ * instrumented, so the choice can be made from measurements:
+ *
+ *   0 OFF       today's behaviour — the bug, kept as the baseline arm.
+ *   1 MANIFEST  metadata only. Manifest blobs are small and a corrupt one
+ *               is catastrophic (it is how whole subtrees go missing),
+ *               so this buys the highest-value protection for the least
+ *               work. Identified exactly by the "TMFT" magic.
+ *   2 COLD      everything that actually came off disk; byte-cache hits
+ *               are trusted because they were verified when inserted.
+ *               Full protection against media corruption, zero cost on
+ *               warm reads. Expected sweet spot.
+ *   3 ALL       every fetch including cache hits. Only adds protection
+ *               against RAM corruption; included so the cache-hit cost
+ *               is measurable rather than assumed.
+ *
+ * Counters below price each arm: verify_bytes is the cost driver,
+ * verify_ns the cost actually paid, verify_fail the benefit obtained.
+ */
+#define TESSERA_VERIFY_OFF      0
+#define TESSERA_VERIFY_MANIFEST 1
+#define TESSERA_VERIFY_COLD     2
+#define TESSERA_VERIFY_ALL      3
+static int tessera_verify_reads = TESSERA_VERIFY_COLD;
+static unsigned long tessera_stat_verify_manifest = 0;
+static unsigned long tessera_stat_verify_data     = 0;
+static unsigned long tessera_stat_verify_cached   = 0;
+static unsigned long tessera_stat_verify_skipped  = 0;
+static unsigned long tessera_stat_verify_bytes    = 0;
+static unsigned long tessera_stat_verify_ns       = 0;
+static unsigned long tessera_stat_verify_fail     = 0;
 /*
  * Auto-retire a retained snapshot the GC live-set walk proves unreadable
  * (task #86). Safe ONLY because #84 made the fetch verdict definitive:
@@ -421,6 +464,35 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, gc_retire_damaged, CTLFLAG_RW,
     &tessera_gc_retire_damaged, 0,
     "Auto-retire retained snapshots proven unreadable by the GC walk "
     "(1=retire, 0=report only)");
+SYSCTL_INT(_kern_tessera, OID_AUTO, verify_reads, CTLFLAG_RW,
+    &tessera_verify_reads, 0,
+    "Re-hash fetched blobs against their content address (#87): "
+    "0=off, 1=manifests only, 2=cold (disk reads, not cache hits), "
+    "3=all fetches incl. cache hits");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_manifest, CTLFLAG_RD,
+    &tessera_stat_verify_manifest, 0,
+    "Manifest blobs re-hashed on fetch (#87)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_data, CTLFLAG_RD,
+    &tessera_stat_verify_data, 0,
+    "Non-manifest (file data) blobs re-hashed on fetch (#87)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_cached, CTLFLAG_RD,
+    &tessera_stat_verify_cached, 0,
+    "Verifications performed on byte-cache HITS (mode 3 only) — the "
+    "cost mode 2 avoids");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_skipped, CTLFLAG_RD,
+    &tessera_stat_verify_skipped, 0,
+    "Fetches returned WITHOUT verification under the current mode — "
+    "the coverage gap of that mode");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_bytes, CTLFLAG_RD,
+    &tessera_stat_verify_bytes, 0,
+    "Total bytes re-hashed (#87) — the cost driver");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_ns, CTLFLAG_RD,
+    &tessera_stat_verify_ns, 0,
+    "Cumulative ns spent re-hashing (#87) — the cost actually paid");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_fail, CTLFLAG_RD,
+    &tessera_stat_verify_fail, 0,
+    "Blobs whose bytes did NOT match their content address — silent "
+    "corruption caught and turned into EIO (#87)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_touch_keeps, CTLFLAG_RD,
     &tessera_stat_gc_touch_keeps, 0,
     "Dead candidates spared by the SATB touch filter (referenced mid-scan)");
@@ -8455,15 +8527,65 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, cas_enable, CTLFLAG_RW,
     &tessera_cas_enable, 0,
     "Enable the CAS read cache (1=on, 0=off — disables both insert and lookup)");
 
-/* When set, the sector-on-demand reader re-verifies sha256(blob) == hash
- * on every fetch. Off by default: blob content is already CRC-protected
- * per pack at write time and validated end-to-end by tessera-fsck, and a
- * software-SHA256 over every byte read dominates large-file read time
- * (~10x the actual I/O). Turn on for paranoid/diagnostic runs. */
-static int tessera_cas_verify_reads = 0;
-SYSCTL_INT(_kern_tessera, OID_AUTO, cas_verify_reads, CTLFLAG_RW,
-    &tessera_cas_verify_reads, 0,
-    "Re-hash each blob on read to verify content integrity (slow; default off)");
+/*
+ * Decide whether the blob just extracted from a pack must be re-hashed,
+ * and do it, with the accounting that lets the policy be chosen from
+ * measurements rather than argument (task #87).
+ *
+ * `cached` distinguishes a byte-cache hit (bytes that were already
+ * verified when inserted, if verification was on then) from bytes that
+ * just came off disk — that difference IS the mode-2-vs-mode-3 choice.
+ *
+ * Manifests are identified exactly by their "TMFT" magic. A file-data
+ * blob that happens to start with those four bytes is merely verified
+ * too, which is the safe direction to err in.
+ */
+static int
+tessera_fs_verify_blob(uint32_t hash_alg, const uint8_t *buf, uint32_t len,
+    const tessera_hash_t hash, int cached)
+{
+	int mode = tessera_verify_reads;
+	int is_manifest;
+
+	if (mode == TESSERA_VERIFY_OFF || len == 0) {
+		tessera_stat_verify_skipped++;
+		return (0);
+	}
+	/* Cache hits are trusted below mode 3 — that is the whole point of
+	 * mode 2: full media-corruption coverage at zero warm-read cost. */
+	if (cached && mode < TESSERA_VERIFY_ALL) {
+		tessera_stat_verify_skipped++;
+		return (0);
+	}
+	is_manifest = (len >= 4 &&
+	    memcmp(buf, TESSERA_MAGIC_MANIFEST, 4) == 0);
+	if (mode == TESSERA_VERIFY_MANIFEST && !is_manifest) {
+		tessera_stat_verify_skipped++;
+		return (0);
+	}
+
+	sbintime_t _t0 = sbinuptime();
+	tessera_hash_t check;
+	tessera_content_hash(hash_alg, buf, len, check);
+	tessera_stat_verify_ns += (unsigned long)sbttons(sbinuptime() - _t0);
+	tessera_stat_verify_bytes += len;
+	if (is_manifest)
+		tessera_stat_verify_manifest++;
+	else
+		tessera_stat_verify_data++;
+	if (cached)
+		tessera_stat_verify_cached++;
+
+	if (memcmp(check, hash, sizeof check) != 0) {
+		tessera_stat_verify_fail++;
+		printf("tessera_fs: CONTENT MISMATCH — blob %02x%02x%02x%02x... "
+		    "(%u bytes) does not hash to its address; returning EIO "
+		    "instead of corrupt data (#87)\n",
+		    hash[0], hash[1], hash[2], hash[3], len);
+		return (EIO);
+	}
+	return (0);
+}
 
 /* Debug microbench for tessera_sha256. Write the per-call chunk size in
  * KiB; the handler hashes a fixed ~128 MiB total in chunks of that size
@@ -11834,13 +11956,10 @@ tessera_fs_pack_extract_blob(const uint8_t *pack, uint32_t packlen,
 	if (dlen > 0)
 		memcpy(buf, pack + blob_off + sizeof(tessera_blob_descriptor_t),
 		    dlen);
-	if (tessera_cas_verify_reads && dlen > 0) {
-		tessera_hash_t check;
-		tessera_content_hash(hash_alg, buf, dlen, check);
-		if (memcmp(check, hash, sizeof check) != 0) {
-			if (buf != dst) free(buf, M_TESSERA);
-			return (EIO);
-		}
+	if (tessera_fs_verify_blob(hash_alg, buf, dlen, hash, /*cached*/ 0)
+	    != 0) {
+		if (buf != dst) free(buf, M_TESSERA);
+		return (EIO);
 	}
 	*out_buf = buf;
 	*out_len = dlen;
@@ -12039,16 +12158,13 @@ tessera_fs_pack_fetch_ondemand(struct tessera_mount *tmp_,
 			free(buf, M_TESSERA);
 			return (EIO);
 		}
-		/* Content-addressed integrity: when enabled, the returned bytes
-		 * must hash to the key we looked them up by. Off by default —
-		 * see tessera_cas_verify_reads. */
-		if (tessera_cas_verify_reads) {
-			tessera_hash_t check;
-			TESSERA_MP_HASH(tmp_, buf, dlen, check);
-			if (memcmp(check, hash, sizeof check) != 0) {
-				free(buf, M_TESSERA);
-				return (EIO);
-			}
+		/* Content-addressed integrity: the returned bytes must hash to
+		 * the key we looked them up by. Policy + accounting live in
+		 * tessera_fs_verify_blob (kern.tessera.verify_reads, #87). */
+		if (tessera_fs_verify_blob(tmp_->sb.hash_alg, buf, dlen, hash,
+		    /*cached*/ 0) != 0) {
+			free(buf, M_TESSERA);
+			return (EIO);
 		}
 	}
 	*out_buf = buf;
@@ -12083,10 +12199,20 @@ tessera_fs_fetch_blob_ex(struct tessera_mount *tmp_,
 	 */
 	if (tmp_->pack_registry_tree == NULL) return (EIO);
 
-	/* Tier B: bytes cache hit returns the blob with no disk I/O. */
+	/* Tier B: bytes cache hit returns the blob with no disk I/O. Only
+	 * mode 3 re-hashes here (RAM corruption); modes 1-2 trust the cache,
+	 * and the skip is counted so the difference is measurable. */
 	if (tessera_cas_byte_lookup(&tmp_->cas_cache, hash,
-	    out_buf, out_len))
+	    out_buf, out_len)) {
+		if (tessera_fs_verify_blob(tmp_->sb.hash_alg, *out_buf,
+		    *out_len, hash, /*cached*/ 1) != 0) {
+			free(*out_buf, M_TESSERA);
+			*out_buf = NULL;
+			*out_len = 0;
+			return (EIO);
+		}
 		return (0);
+	}
 
 	/* Relocation-retry: everything below reads pack data from
 	 * extents resolved from a loc-cache snapshot or a registry
