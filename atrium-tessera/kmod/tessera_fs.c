@@ -390,6 +390,16 @@ static unsigned long tessera_stat_gc_aborts      = 0;
 static unsigned long tessera_stat_gc_touch_keeps = 0;
 static unsigned long tessera_stat_gc_reclaimed   = 0;
 static unsigned long tessera_stat_gc_lost_subtrees = 0;
+static unsigned long tessera_stat_gc_snapshots_retired = 0;
+/*
+ * Auto-retire a retained snapshot the GC live-set walk proves unreadable
+ * (task #86). Safe ONLY because #84 made the fetch verdict definitive:
+ * a snapshot is condemned on ENOENT after a COMPLETED registry scan, and
+ * any EIO/unknown aborts the whole cycle long before this runs — so a
+ * transient read error can never retire a healthy snapshot. Set to 0 to
+ * report the damage (kern.tessera.gc_lost_subtrees) without acting on it.
+ */
+static int tessera_gc_retire_damaged = 1;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_scans, CTLFLAG_RD,
     &tessera_stat_gc_scans, 0,
     "Data-zone GC scans started (ungated, on gc_tq)");
@@ -403,6 +413,14 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_lost_subtrees, CTLFLAG_RD,
     &tessera_stat_gc_lost_subtrees, 0,
     "Live-inode manifests found in NO pack (already-lost subtrees; "
     "damage, but does not block reclaim — see task #84)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_snapshots_retired, CTLFLAG_RD,
+    &tessera_stat_gc_snapshots_retired, 0,
+    "Retained snapshots auto-retired by GC because their trees "
+    "reference blobs that are in no pack (task #86)");
+SYSCTL_INT(_kern_tessera, OID_AUTO, gc_retire_damaged, CTLFLAG_RW,
+    &tessera_gc_retire_damaged, 0,
+    "Auto-retire retained snapshots proven unreadable by the GC walk "
+    "(1=retire, 0=report only)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_touch_keeps, CTLFLAG_RD,
     &tessera_stat_gc_touch_keeps, 0,
     "Dead candidates spared by the SATB touch filter (referenced mid-scan)");
@@ -6916,6 +6934,38 @@ tessera_fs_snapshot_retire_oldest(struct tessera_mount *tmp_)
 }
 
 /*
+ * Retire ONE specific snapshot generation (task #86 — prevention half of
+ * #84/#85). Same mechanics as retire_oldest, but keyed: the GC live-set
+ * walk names the generation whose tree references blobs that are in no
+ * pack, and a snapshot that cannot be read back is worth nothing while
+ * costing real space (it anchors packs GC must otherwise preserve).
+ *
+ * Caller holds the flush gate and is responsible for committing the SB.
+ * Returns 1 if the record was dropped.
+ */
+static int
+tessera_fs_snapshot_retire_gen(struct tessera_mount *tmp_, uint64_t gen)
+{
+	uint8_t key[8];
+
+	if (tmp_->snapshots_tree == NULL)
+		return (0);
+	for (int i = 0; i < 8; i++)
+		key[i] = (uint8_t)(gen >> ((7 - i) * 8));
+	uint64_t after_root = tmp_->sb.snapshots_root;
+	if (tessera_btree_delete(tmp_->snapshots_tree, key, &after_root)
+	    != TESSERA_OK)
+		return (0);
+	tmp_->sb.snapshots_root = after_root;
+	if (tmp_->sb.snapshots_gen > 0)
+		tmp_->sb.snapshots_gen--;
+	tessera_stat_snapshots_retired++;
+	tessera_stat_gc_snapshots_retired++;
+	tessera_metatrace(TM_OP_SNAPSHOT_REC, 1 /* retire marker */, gen, 0);
+	return (1);
+}
+
+/*
  * Write the in-memory superblock back to sectors 0 and 1 with the
  * generation bumped. Each commit is preceded by a journal transaction
  * (BEGIN → ROOT_UPDATE record → COMMIT). On remount,
@@ -12786,6 +12836,17 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 	 * veto reclaim. Counted and reported so it is never silent. */
 	uint32_t gc_lost_subtrees = 0;
 	uint32_t gc_lost_inode = 0;
+	/*
+	 * Retained snapshots whose trees reference definitively-absent blobs
+	 * (#86). The walk below already visits every snapshot, so naming the
+	 * damaged generations costs nothing extra — and without this the
+	 * damage simply accumulates until someone runs fsck by hand.
+	 * Bounded: retiring is a committed mutation, so cap the work one
+	 * cycle can do. Any excess is caught by the next cycle.
+	 */
+#define TESSERA_GC_MAX_RETIRE 8
+	uint64_t gc_damaged_gens[TESSERA_GC_MAX_RETIRE];
+	uint32_t gc_damaged_count = 0;
 	tessera_hash_t gc_abort_hash;
 	memset(gc_abort_hash, 0, sizeof(gc_abort_hash));
 #define _GC_ABORT(_site, _st) do {                                        \
@@ -12865,8 +12926,16 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 					_GC_ABORT("snap-btree_open", 0);
 					break;
 				}
+				/* Attribute any definitively-absent blob to THIS
+				 * generation, so the apply phase can retire
+				 * exactly the unreadable snapshots (#86). */
+				uint32_t _lost0 = gc_lost_subtrees;
 				_GC_WALK_INODE_TREE(snap_inode);
 				tessera_btree_close(snap_inode);
+				if (gc_lost_subtrees > _lost0 &&
+				    gc_damaged_count < TESSERA_GC_MAX_RETIRE)
+					gc_damaged_gens[gc_damaged_count++] =
+					    srec.generation;
 				snap_count++;
 			}
 			int _sqrc = tessera_btree_cursor_next(sc);
@@ -13468,10 +13537,64 @@ next_p:
 	}
 	free(deads, M_TESSERA);
 
+	/*
+	 * ── Retire snapshots the walk proved unreadable (task #86) ──
+	 *
+	 * PREVENTION half of #84/#85. Detection (#84) and offline repair
+	 * (#85, tessera-fsck --repair) both existed, but nothing stopped the
+	 * damage ACCUMULATING between manual fsck runs — and each damaged
+	 * snapshot anchors packs GC must otherwise preserve forever.
+	 *
+	 * The walk above already visited every snapshot, so this costs no
+	 * extra I/O: it acts on what pass 1 already learned. Retiring here
+	 * does not free that snapshot's packs THIS cycle (dead_count was
+	 * computed from a live set that still included it) — the next cycle
+	 * sees them unreferenced and reclaims them.
+	 *
+	 * Only definitively-absent (ENOENT-after-full-scan) blobs get here;
+	 * an EIO/unknown fetch aborts the whole pass long before pass 3, so
+	 * a transient read error can never retire a healthy snapshot. That
+	 * property is exactly what #84 bought, and it is what makes acting
+	 * automatically defensible rather than reckless.
+	 */
+	uint32_t retired = 0;
+	if (gc_damaged_count > 0) {
+		if (!tessera_gc_retire_damaged) {
+			printf("tessera_fs: gc — %u damaged snapshot(s) found "
+			    "but kern.tessera.gc_retire_damaged=0; leaving "
+			    "them in place (run tessera-fsck --repair)\n",
+			    gc_damaged_count);
+		} else {
+			for (uint32_t i = 0; i < gc_damaged_count; i++) {
+				if (tessera_fs_snapshot_retire_gen(tmp_,
+				    gc_damaged_gens[i])) {
+					retired++;
+					printf("tessera_fs: gc RETIRED damaged "
+					    "snapshot generation %ju — its tree "
+					    "referenced blobs that are in no "
+					    "pack\n",
+					    (uintmax_t)gc_damaged_gens[i]);
+				}
+			}
+			if (retired > 0) {
+				tmp_->sb_dirty = 1;
+				/* The retired trees' meta sectors are no longer
+				 * pinned (unless shared via COW with a
+				 * survivor). Same rebuild the retention path
+				 * does — without it a sustained-write workload
+				 * exhausts the meta-reserve in a few hundred
+				 * commits. */
+				tessera_meta_pin_bitmap_rebuild(tmp_);
+			}
+		}
+	}
+
 	printf("tessera_fs: gc pass3 done — committing\n");
-	if (dead_count > 0) {
-		(void)tessera_commit_extent(tmp_);
-		printf("tessera_fs: gc post commit_extent\n");
+	if (dead_count > 0 || retired > 0) {
+		if (dead_count > 0) {
+			(void)tessera_commit_extent(tmp_);
+			printf("tessera_fs: gc post commit_extent\n");
+		}
 		(void)tessera_commit_sb(tmp_);
 		printf("tessera_fs: gc post commit_sb\n");
 	}
