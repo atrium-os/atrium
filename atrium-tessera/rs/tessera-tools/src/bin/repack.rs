@@ -491,19 +491,24 @@ fn run(path: &str, apply: bool, force: bool, stage_cap: Option<u64>) -> Result<i
                 // to moving ONE tree at a time (#82): peak requirement becomes
                 // the largest single tree, and any free gap qualifies.
                 println!("  all-at-once staging does not fit ({need} live sectors, \
-{headroom} free above the bump) — trying bounded per-tree staging");
+{headroom} contiguous above the bump) — trying bounded per-tree staging");
                 let moved = stage_bounded(v, &io, ctxp, mr_start, ceiling, &trees, next_ino)?;
                 if moved > 0 {
                     println!("  bounded staging moved {moved} tree(s); re-evaluating");
                     continue;   // outer loop retries Phase B / A with more room
                 }
+                let all_gaps = free_gaps(&live, mr_start, ceiling);
+                let total_free: u64 = all_gaps.iter().map(|&(a, b)| b - a).sum();
+                let ngaps = all_gaps.len();
                 return Err(format!(
-                    "insufficient reserve headroom to repack crash-safely: a live node sits low, \
-                     staging the {need} live metadata sector(s) needs roughly that much \
-                     contiguous free space, only {headroom} above the bump, and no single tree \
-                     fits in any free gap either. Grow the meta-reserve by at least {} sectors \
-                     ({} MiB) and re-run; or re-run with --force for an in-place (NOT crash-safe) \
-                     compaction — back up first.",
+                    "insufficient reserve to repack crash-safely.\n  \
+all-at-once staging needs {need} CONTIGUOUS free sector(s); only {headroom} \
+are free above the bump.\n  per-tree staging (#82d) needs only the LARGEST \
+single tree to fit in the {total_free} sector(s) free across {ngaps} gap(s), \
+which it also could not do — no tree could be placed lower than it already \
+sits.\n  Grow the meta-reserve by at least {} sector(s) ({} MiB) and re-run; \
+or re-run with --force for an in-place (NOT crash-safe) compaction — back up \
+first.",
                     need.saturating_sub(headroom).max(1),
                     (need.saturating_sub(headroom).max(1) * 4096).div_ceil(1024 * 1024)));
             }
