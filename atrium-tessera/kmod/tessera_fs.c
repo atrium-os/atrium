@@ -462,6 +462,14 @@ static unsigned long tessera_stat_mft_bytes[TESSERA_MFT_KINDS];
  * histogram shows the distribution the average was concealing.
  */
 static unsigned long tessera_stat_mft_logical[TESSERA_MFT_KINDS];
+/* Writes that asked for INLINE above the threshold and were routed to the
+ * chunked builder instead (#92). Non-zero means a caller is still relying
+ * on the old convention — which is fine, that is the point of enforcing
+ * it centrally, but it names the paths worth tidying. */
+static unsigned long tessera_stat_inline_oversize_routed = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, inline_oversize_routed, CTLFLAG_RD,
+    &tessera_stat_inline_oversize_routed, 0,
+    "Oversize INLINE writes rerouted to the chunked builder (#92)");
 #define TESSERA_MFT_HIST 12	/* log2 buckets: <1K,<2K,...,<2M,>=2M */
 static unsigned long tessera_stat_mft_hist[TESSERA_MFT_HIST];
 /* Admission cap for MANIFEST blobs in the CAS bytes cache (#90). Declared
@@ -6522,8 +6530,20 @@ tessera_vop_setattr_impl(struct vop_setattr_args *ap)
 			if (copy_len > 0 && old_buf != NULL)
 				memcpy(new_buf, old_buf, copy_len);
 			if (old_buf) free(old_buf, M_TESSERA);
-			int rc = tessera_fs_replace_content(tmp_,
-			    (uint32_t)tn->inode_no, new_buf, (size_t)new_size);
+			/* #92: this was the caller that skipped the INLINE
+			 * threshold, so an ftruncate of any size stored the
+			 * whole file in one manifest. replace_content now
+			 * enforces it centrally; check here too so the size
+			 * decision is visible where it is made. */
+			int rc;
+			if ((size_t)new_size <= (256u * 1024u))
+				rc = tessera_fs_replace_content(tmp_,
+				    (uint32_t)tn->inode_no, new_buf,
+				    (size_t)new_size);
+			else
+				rc = tessera_fs_replace_content_chunked(tmp_,
+				    (uint32_t)tn->inode_no, new_buf,
+				    (size_t)new_size);
 			free(new_buf, M_TESSERA);
 			if (rc != 0) {
 				printf("tessera_fs: truncate replace_content failed "
@@ -18980,6 +19000,34 @@ static int
 tessera_fs_replace_content(struct tessera_mount *tmp_, uint32_t inode_no,
                            const uint8_t *new_bytes, size_t new_len)
 {
+	/*
+	 * ★ task #92: enforce the INLINE threshold HERE, at the one place
+	 * that builds the manifest, not at each call site.
+	 *
+	 * This function unconditionally built a TESSERA_MFT_INLINE manifest
+	 * — the whole file in one blob — and the 256 KiB limit was a
+	 * convention every caller was expected to check for itself. Most
+	 * did (vop_write, the dirty-content flush, the append path); the
+	 * TRUNCATE path did not, so ftruncate to any size stored the entire
+	 * file inline. Measured on a /usr/src/sys tree: a 4.7 MB
+	 * qat_c4xxx.bin as a single 4,777,912-byte INLINE manifest, 18x
+	 * over the threshold.
+	 *
+	 * The cost compounds badly: such a blob also exceeds
+	 * cas_manifest_blob_cap, so it is admitted to neither the CAS byte
+	 * cache (#90) nor the per-vnode cache (#91), and is refetched in
+	 * FULL on every read() — ~344 MB of fetches to read that one file.
+	 * An entry that can never be cached is refetched forever.
+	 *
+	 * Routing to the chunked builder is recursion-safe: chunked never
+	 * calls back into this function.
+	 */
+	if (new_len > TESSERA_INLINE_THRESHOLD) {
+		tessera_stat_inline_oversize_routed++;
+		return (tessera_fs_replace_content_chunked(tmp_, inode_no,
+		    new_bytes, new_len));
+	}
+
 	int gated = tmp_->flush_mtx_init;
 	if (gated) tessera_fs_flush_gate_enter(tmp_);
 	int rc = tessera_fs_replace_content_inner(tmp_, inode_no, new_bytes,
