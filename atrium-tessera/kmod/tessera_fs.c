@@ -389,6 +389,7 @@ static unsigned long tessera_stat_gc_scan_ms     = 0;
 static unsigned long tessera_stat_gc_aborts      = 0;
 static unsigned long tessera_stat_gc_touch_keeps = 0;
 static unsigned long tessera_stat_gc_reclaimed   = 0;
+static unsigned long tessera_stat_gc_lost_subtrees = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_scans, CTLFLAG_RD,
     &tessera_stat_gc_scans, 0,
     "Data-zone GC scans started (ungated, on gc_tq)");
@@ -398,6 +399,10 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_scan_ms, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_aborts, CTLFLAG_RD,
     &tessera_stat_gc_aborts, 0,
     "GC passes that reclaimed nothing because the live-set walk aborted");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_lost_subtrees, CTLFLAG_RD,
+    &tessera_stat_gc_lost_subtrees, 0,
+    "Live-inode manifests found in NO pack (already-lost subtrees; "
+    "damage, but does not block reclaim — see task #84)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_touch_keeps, CTLFLAG_RD,
     &tessera_stat_gc_touch_keeps, 0,
     "Dead candidates spared by the SATB touch filter (referenced mid-scan)");
@@ -12020,7 +12025,13 @@ tessera_fs_fetch_blob_ex(struct tessera_mount *tmp_,
 	if (tessera_fs_pending_manifest_lookup(tmp_, hash,
 	    out_buf, out_len) != 0)
 		return (0);
-	if (tmp_->pack_registry_tree == NULL) return (ENOENT);
+	/*
+	 * NOT ENOENT: with the registry unavailable we know nothing about
+	 * what is on this volume, and ENOENT now MEANS "definitively absent"
+	 * to the GC live-set walk (#84) — returning it here would declare
+	 * every manifest lost and invite a total over-free. Unknown = EIO.
+	 */
+	if (tmp_->pack_registry_tree == NULL) return (EIO);
 
 	/* Tier B: bytes cache hit returns the blob with no disk I/O. */
 	if (tessera_cas_byte_lookup(&tmp_->cas_cache, hash,
@@ -12204,13 +12215,25 @@ cas_fast_miss:
 	;
 	tessera_btree_cursor_t *c =
 	    tessera_btree_seek_first(tmp_->pack_registry_tree);
-	if (c == NULL) return (ENOENT);
+	if (c == NULL) return (EIO);	/* couldn't scan at all: unknown */
 
+	/*
+	 * ENOENT from here is a LOAD-BEARING answer, not just "didn't find
+	 * it": callers (GC #84) use it to conclude the blob is on no pack of
+	 * this volume, which is only sound if the scan actually completed.
+	 * A cursor error mid-walk means an UNKNOWN answer — report EIO so it
+	 * is never mistaken for a definitive absence.
+	 */
 	int rc = ENOENT;
 	for (;;) {
 		uint8_t key[16];
 		uint8_t value[TESSERA_REGISTRY_ENTRY_SIZE];
-		if (tessera_btree_cursor_get(c, key, value) != 0) break;
+		int _crc = tessera_btree_cursor_get(c, key, value);
+		if (_crc != TESSERA_OK) {
+			if (_crc != TESSERA_ENOENT)
+				rc = EIO;	/* scan truncated: unknown */
+			break;
+		}
 
 		tessera_registry_entry_t re;
 		if (tessera_decode_registry_entry(value, &re) != TESSERA_OK)
@@ -12267,7 +12290,14 @@ cas_fast_miss:
 		}
 
 next_pack:
-		if (tessera_btree_cursor_next(c) != 0) break;
+		{
+			int _nrc = tessera_btree_cursor_next(c);
+			if (_nrc != TESSERA_OK) {
+				if (_nrc != TESSERA_ENOENT)
+					rc = EIO;	/* truncated: unknown */
+				break;
+			}
+		}
 	}
 	tessera_btree_cursor_free(c);
 	return (rc);
@@ -12620,12 +12650,44 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 			uint32_t _blen = 0;                               \
 			/* A live inode's manifest that will not fetch     \
 			 * means its children can't be enumerated — the    \
-			 * live set would be incomplete. Flag an abort so   \
-			 * this GC cycle reclaims nothing (#66). The hash   \
-			 * itself was already pushed above, so the manifest  \
-			 * blob stays protected regardless. */             \
-			if (tessera_fs_fetch_blob(tmp_, _h, &_blob,       \
-			    &_blen) != 0) { gc_walk_abort = 1; continue; } \
+			 * live set would be incomplete. But WHY it won't  \
+			 * fetch decides whether that is fatal (#84):      \
+			 *                                                 \
+			 * EIO/other = UNKNOWN. The blob may well exist    \
+			 * and be readable next time (transient bad-node   \
+			 * read under -j4 buffer pressure is exactly the   \
+			 * #66 scenario). Freeing children we failed to    \
+			 * enumerate would turn a transient error into     \
+			 * permanent loss. Hard abort — reclaim nothing.   \
+			 *                                                 \
+			 * ENOENT = DEFINITIVE. The full registry scan     \
+			 * completed and no pack on this volume holds the  \
+			 * hash, so this subtree is ALREADY unreachable:   \
+			 * you cannot learn a child's hash without reading \
+			 * the parent manifest. Anything reachable only    \
+			 * through it is already lost, and anything also   \
+			 * reachable elsewhere is enumerated by that other \
+			 * live path. Freeing loses nothing that is not    \
+			 * already gone — so COUNT it, report it, and keep \
+			 * scanning rather than vetoing all reclaim. One   \
+			 * damaged manifest must not strand a whole        \
+			 * volume's free space forever. */                 \
+			int _frc = tessera_fs_fetch_blob(tmp_, _h, &_blob, \
+			    &_blen);                                      \
+			if (_frc != 0) {                                  \
+				if (gc_abort_fetchfail++ == 0)            \
+					memcpy(gc_abort_hash, _h,         \
+					    TESSERA_HASH_SIZE);           \
+				if (_frc == ENOENT) {                     \
+					gc_lost_subtrees++;               \
+					if (gc_lost_inode == 0)           \
+						gc_lost_inode =           \
+						    gc_cur_inode;         \
+					continue;                         \
+				}                                         \
+				_GC_ABORT("manifest-fetch", _frc);        \
+				continue;                                 \
+			}                                                 \
 			tessera_manifest_parser_t *_p =                   \
 			    tessera_manifest_parse(_blob, _blen);         \
 			if (_p == NULL) { free(_blob, M_TESSERA);         \
@@ -12701,22 +12763,62 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 	 * hard GC abort (no reclaim this cycle), exactly like gc_seed_abort.
 	 */
 	int gc_walk_abort = 0;
+	/*
+	 * #84 diagnostics. "gc ABORTED — btree read error" names seven
+	 * possible sites and no cause, which is useless on a volume that
+	 * aborts every cycle (the 25 GiB dev root: ~8s to abort, 24 GiB
+	 * unreclaimable). Record the FIRST abort with enough context to act
+	 * on without another round-trip: which site, the cursor status, and
+	 * — for the manifest-fetch case, the prime suspect, since a stale
+	 * blob->pack index makes a perfectly live manifest unfetchable
+	 * (#75) — the hash that would not resolve, so it can be looked up
+	 * in the registry by hand.
+	 */
+	const char *gc_abort_site = NULL;
+	const char *gc_abort_phase = NULL;
+	const char *gc_phase = "current-sb";
+	int gc_abort_status = 0;
+	uint32_t gc_abort_fetchfail = 0;
+	uint32_t gc_walk_records = 0;
+	uint32_t gc_cur_inode = 0;
+	uint32_t gc_abort_inode = 0;
+	/* Definitively-absent manifests (#84): damage, but not a reason to
+	 * veto reclaim. Counted and reported so it is never silent. */
+	uint32_t gc_lost_subtrees = 0;
+	uint32_t gc_lost_inode = 0;
+	tessera_hash_t gc_abort_hash;
+	memset(gc_abort_hash, 0, sizeof(gc_abort_hash));
+#define _GC_ABORT(_site, _st) do {                                        \
+	gc_walk_abort = 1;                                                \
+	if (gc_abort_site == NULL) {                                      \
+		gc_abort_site = (_site);                                  \
+		gc_abort_status = (_st);                                  \
+		gc_abort_phase = gc_phase;                                \
+		gc_abort_inode = gc_cur_inode;                            \
+	}                                                                 \
+} while (0)
 #define _GC_WALK_INODE_TREE(_tree) do {                                   \
 	if ((_tree) == NULL) break;                                       \
 	tessera_btree_cursor_t *_c = tessera_btree_seek_first(_tree);     \
-	if (_c == NULL) { gc_walk_abort = 1; break; }                     \
+	if (_c == NULL) { _GC_ABORT("seek_first-null", 0); break; }       \
 	for (;;) {                                                        \
 		uint8_t _k[4];                                            \
 		tessera_inode_record_t _ino;                              \
 		int _grc = tessera_btree_cursor_get(_c, _k, &_ino);       \
 		if (_grc != TESSERA_OK) {                                 \
-			if (_grc != TESSERA_ENOENT) gc_walk_abort = 1;    \
+			if (_grc != TESSERA_ENOENT)                       \
+				_GC_ABORT("cursor_get", _grc);            \
 			break;                                            \
 		}                                                         \
+		gc_walk_records++;                                        \
+		gc_cur_inode = ((uint32_t)_k[0] << 24) |                  \
+		    ((uint32_t)_k[1] << 16) | ((uint32_t)_k[2] << 8) |    \
+		    (uint32_t)_k[3];                                      \
 		_GC_WALK_RECORD(_ino);                                    \
 		int _nrc = tessera_btree_cursor_next(_c);                 \
 		if (_nrc != TESSERA_OK) {                                 \
-			if (_nrc != TESSERA_ENOENT) gc_walk_abort = 1;    \
+			if (_nrc != TESSERA_ENOENT)                       \
+				_GC_ABORT("cursor_next", _nrc);           \
 			break;                                            \
 		}                                                         \
 	}                                                                 \
@@ -12728,6 +12830,7 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 	    live_count);
 
 	/* Snapshot inode_trees */
+	gc_phase = "snapshot";
 	if (scan_snap_tree != NULL) {
 		tessera_btree_cursor_t *sc =
 		    tessera_btree_seek_first(scan_snap_tree);
@@ -12737,7 +12840,8 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 			tessera_snapshot_record_t srec;
 			int _sgrc = tessera_btree_cursor_get(sc, sk, &srec);
 			if (_sgrc != TESSERA_OK) {
-				if (_sgrc != TESSERA_ENOENT) gc_walk_abort = 1;
+				if (_sgrc != TESSERA_ENOENT)
+					_GC_ABORT("snap-cursor_get", _sgrc);
 				break;
 			}
 			/* Skip the just-current snapshot; its tree is the
@@ -12758,7 +12862,7 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 				 * means an unknown live set — abort rather than
 				 * reclaim on a partial union. */
 				if (snap_inode == NULL) {
-					gc_walk_abort = 1;
+					_GC_ABORT("snap-btree_open", 0);
 					break;
 				}
 				_GC_WALK_INODE_TREE(snap_inode);
@@ -12767,7 +12871,8 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 			}
 			int _sqrc = tessera_btree_cursor_next(sc);
 			if (_sqrc != TESSERA_OK) {
-				if (_sqrc != TESSERA_ENOENT) gc_walk_abort = 1;
+				if (_sqrc != TESSERA_ENOENT)
+					_GC_ABORT("snap-cursor_next", _sqrc);
 				break;
 			}
 		}
@@ -12801,6 +12906,19 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 		 * non-ENOENT-cursor-status rule is load-bearing here. */
 		printf("tessera_fs: gc ABORTED — pass-1 live-set walk hit a "
 		    "btree read error; no reclaim this cycle\n");
+		printf("tessera_fs: gc abort site=%s phase=%s inode=%u "
+		    "status=%d records_walked=%u fetch_failures=%u live=%u\n",
+		    gc_abort_site != NULL ? gc_abort_site : "?",
+		    gc_abort_phase != NULL ? gc_abort_phase : "?",
+		    gc_abort_inode, gc_abort_status, gc_walk_records,
+		    gc_abort_fetchfail, live_count);
+		if (gc_abort_fetchfail > 0)
+			printf("tessera_fs: gc first unfetchable manifest "
+			    "%02x%02x%02x%02x%02x%02x%02x%02x...\n",
+			    gc_abort_hash[0], gc_abort_hash[1],
+			    gc_abort_hash[2], gc_abort_hash[3],
+			    gc_abort_hash[4], gc_abort_hash[5],
+			    gc_abort_hash[6], gc_abort_hash[7]);
 		tessera_stat_gc_aborts++;
 		free(live, M_TESSERA);
 		_GC_CLOSE_SCAN_TREES();
@@ -12822,6 +12940,8 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 	 * the GC pass entirely: reclaiming with an incomplete live set
 	 * is exactly the bug this fixes. */
 	int gc_seed_abort = 0;
+	gc_phase = "seeds";
+	gc_cur_inode = 0;
 	if (concurrent) {
 		/* Already copied, atomically with the root freeze and the
 		 * gc_scan_active flip (tessera_fs_gc_scan_begin). Only the
@@ -12896,10 +13016,49 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 		_GC_CLOSE_SCAN_TREES();
 		return (0);
 	}
+	/*
+	 * Damage found but survived (#84). fsck validates only the CURRENT
+	 * tree, so a manifest referenced solely from a retained SNAPSHOT can
+	 * be missing while fsck still reports CLEAN — that is precisely the
+	 * dev root's case, and it silently stranded 24 GiB. Say so loudly,
+	 * and name the inode, so it is actionable rather than mysterious.
+	 */
+	if (gc_lost_subtrees > 0) {
+		tessera_stat_gc_lost_subtrees += gc_lost_subtrees;
+		printf("tessera_fs: gc WARNING — %u manifest(s) referenced by "
+		    "live inodes are in NO pack (first: inode %u, hash "
+		    "%02x%02x%02x%02x%02x%02x%02x%02x...). Those subtrees are "
+		    "already unreadable; reclaim continues. Run tessera-fsck; "
+		    "if it reports CLEAN the damage is in a retained snapshot "
+		    "(fsck does not walk snapshots — task #85).\n",
+		    gc_lost_subtrees, gc_lost_inode,
+		    gc_abort_hash[0], gc_abort_hash[1], gc_abort_hash[2],
+		    gc_abort_hash[3], gc_abort_hash[4], gc_abort_hash[5],
+		    gc_abort_hash[6], gc_abort_hash[7]);
+	}
+	/*
+	 * The seed walks above expand manifests through the same
+	 * _GC_WALK_RECORD, so they can raise gc_walk_abort too — and until
+	 * now nothing re-checked it after the pass-1 test at the top, so an
+	 * unfetchable SEED manifest yielded a silently incomplete live set
+	 * and a bad reclaim. Same failure mode as #66, one walk later.
+	 */
+	if (gc_walk_abort) {
+		printf("tessera_fs: gc ABORTED — in-flight seed walk hit a "
+		    "read error (site=%s status=%d fetch_failures=%u); "
+		    "no reclaim this cycle\n",
+		    gc_abort_site != NULL ? gc_abort_site : "?",
+		    gc_abort_status, gc_abort_fetchfail);
+		tessera_stat_gc_aborts++;
+		free(live, M_TESSERA);
+		_GC_CLOSE_SCAN_TREES();
+		return (0);
+	}
 
 #undef _GC_WALK_INODE_TREE
 #undef _GC_WALK_RECORD
 #undef _GC_PUSH_HASH
+#undef _GC_ABORT
 
 	/*
 	 * ★ task #81: sort the live set so pass 2 can binary-search it.
