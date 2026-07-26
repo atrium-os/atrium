@@ -10,12 +10,15 @@ core/test_manifest
 core/test_pack
 core/test_journal
 core/test_volume
+core/test_quota
+core/test_quota_store
 core/bench_sha256
 
 # kmod build artifacts (bsd.kmod.mk + the symlink to kernel arch headers).
 kmod/*.ko
 kmod/*.kld
 kmod/*.o
+kmod/*.o.tmp
 kmod/.depend.*
 kmod/export_syms
 kmod/machine
