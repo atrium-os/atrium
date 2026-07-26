@@ -10,7 +10,8 @@ use std::process::ExitCode;
 use tessera_sys::{
     tessera_volume_active_slot_count, tessera_volume_close,
     tessera_volume_encryption_flags, tessera_volume_free_extent_root,
-    tessera_volume_generation, tessera_volume_hash_alg, tessera_volume_inode_root,
+    tessera_volume_blob_index_root, tessera_volume_generation,
+    tessera_volume_hash_alg, tessera_volume_inode_root,
     tessera_volume_journal_length, tessera_volume_journal_start,
     tessera_volume_meta_reserve_bump, tessera_volume_meta_reserve_length,
     tessera_volume_meta_reserve_start, tessera_volume_open,
@@ -70,6 +71,18 @@ fn run(path: &str) -> Result<(), String> {
     println!("  inode_root:       sector {inode_root}");
     println!("  pack_registry:    sector {pack_root}");
     println!("  free_extent_root: sector {free_root}");
+    // #75 part 2: a volume with no blob->pack index was INDISTINGUISHABLE
+    // from a healthy one until you mounted it and the first cold read took
+    // minutes. tessera-repack drops the index and says so, but only if you
+    // happen to be the one who ran it — anyone inspecting the volume later
+    // had no way to ask.
+    let bidx = unsafe { tessera_volume_blob_index_root(v) };
+    if bidx == 0 {
+        println!("  blob_index_root:  0 (ABSENT — cold reads scan the whole \
+pack registry; run tessera-reindex)");
+    } else {
+        println!("  blob_index_root:  sector {bidx}");
+    }
 
     let snap_root = unsafe { tessera_volume_snapshots_root(v) };
     let snap_gen  = unsafe { tessera_volume_snapshots_gen(v) };

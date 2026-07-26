@@ -914,6 +914,25 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<(i32, u32), String> {
         }
     }
 
+    // A volume with no blob→pack index is perfectly CONSISTENT, so this is
+    // an advisory rather than a problem — same category as leaked space.
+    // But it is worth surfacing on the routine health check, because the
+    // symptom is otherwise invisible until the first cold read: every read
+    // linearly scans the pack registry, and on a large volume the next boot
+    // sits at "Loading kernel..." for many minutes looking exactly like a
+    // hang. tessera-repack drops the index and warns, but only the person
+    // who ran repack ever sees that warning (#75).
+    if unsafe { tessera_volume_blob_index_root(v) } == 0 && fsck.packs > 0 {
+        fsck.notes.push(format!(
+            "no blob->pack index (blob_index_root=0): every cold read scans \
+             all {} packs — run `tessera-reindex {path}`{}",
+            fsck.packs,
+            if fsck.packs >= 10_000 {
+                "  *** BEFORE MOUNTING: at this pack count the next boot can \
+                 take many minutes with no output ***"
+            } else { "" }));
+    }
+
     // ── report ───────────────────────────────────────────────────
     println!("tessera-fsck: {path}");
     println!("  generation:   {generation}");
