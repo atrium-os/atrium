@@ -107,6 +107,8 @@ pub const TESSERA_BTREE_KIND_BLOB_INDEX: u8 = 5;   /* key=32 hash, val=16 pack_i
 
 pub const TESSERA_INODE_RECORD_SIZE:   u32 = 144;
 pub const TESSERA_REGISTRY_ENTRY_SIZE: u32 = 64;
+/// Snapshot record (format.h): key is the 8-byte BIG-endian generation.
+pub const TESSERA_SNAPSHOT_RECORD_SIZE: u32 = 64;
 
 pub const TESSERA_INODE_ROOT_DIR:      u32 = 2;
 

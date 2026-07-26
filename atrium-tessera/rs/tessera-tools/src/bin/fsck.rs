@@ -31,7 +31,7 @@
 //!
 //! Exit: 0 = clean, 1 = problems found, 2 = usage / I/O error.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::os::unix::fs::FileExt;
 use std::process::ExitCode;
 
@@ -91,14 +91,46 @@ struct Fsck {
     /// them to empty (a valid, mountable state) and lets the next pass
     /// relink the now-unreferenced children into lost+found.
     dangling_manifests: Vec<(u32, u32)>,
+    // ── retained-snapshot validation (task #85) ──
+    /// When Some(generation), the walk in progress is inside that retained
+    /// snapshot, and problem() routes there instead of to the current-tree
+    /// list. Snapshot damage is reported SEPARATELY because the repair is
+    /// different in kind: you retire the snapshot, you do not patch inodes
+    /// inside it (a snapshot is immutable history, not the live tree).
+    current_snapshot: Option<u64>,
+    /// generation → problems found walking that snapshot's tree.
+    snapshot_problems: BTreeMap<u64, Vec<String>>,
+    /// generations whose trees reference blobs that are in no pack.
+    /// --repair retires these (deletes the snapshot record).
+    damaged_snapshots: Vec<u64>,
     // stats
     inodes: u64,
     packs: u64,
     blobs: u64,
+    snapshots: u64,
+    snapshot_inodes: u64,
 }
 
+/// Cap on problems recorded per snapshot: one damaged shared manifest can be
+/// referenced by thousands of inodes, and the repair (retire the snapshot) is
+/// identical whether it is 1 or 10,000. Keep the report readable.
+const SNAP_PROBLEM_CAP: usize = 16;
+
 impl Fsck {
-    fn problem(&mut self, s: String) { self.problems.push(s); }
+    fn problem(&mut self, s: String) {
+        match self.current_snapshot {
+            Some(gen) => {
+                let v = self.snapshot_problems.entry(gen).or_default();
+                if v.len() < SNAP_PROBLEM_CAP {
+                    v.push(s);
+                } else if v.len() == SNAP_PROBLEM_CAP {
+                    v.push("… (further problems in this snapshot suppressed; \
+                            the repair is the same regardless of count)".into());
+                }
+            }
+            None => self.problems.push(s),
+        }
+    }
 
     /// Verify `hash` exists; if `as_manifest`, parse it and recurse into the
     /// blobs it references. `ctx` labels the referrer for diagnostics.
@@ -385,9 +417,14 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<(i32, u32), String> {
         dangling_dirents: Vec::new(),
         orphans: Vec::new(),
         dangling_manifests: Vec::new(),
+        current_snapshot: None,
+        snapshot_problems: BTreeMap::new(),
+        damaged_snapshots: Vec::new(),
         inodes: 0,
         packs: 0,
         blobs: 0,
+        snapshots: 0,
+        snapshot_inodes: 0,
     };
 
     // ── bounds sanity ────────────────────────────────────────────
@@ -580,6 +617,94 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<(i32, u32), String> {
             }
             if !c.is_null() { tessera_btree_cursor_free(c); }
             tessera_btree_close(t);
+        }
+    }
+
+    // ── Pass B2: retained snapshot trees (task #85) ──────────────
+    //
+    // Until now fsck walked ONLY the current tree, so a manifest referenced
+    // solely from a retained snapshot could be missing while fsck reported
+    // CLEAN. That is not a corner case: on the dev root the snapshot union
+    // more than DOUBLED the reachable set (327k → 751k hashes), so over half
+    // the volume's metadata sat in a blind spot — and three missing blobs in
+    // there stranded 24 GiB, because the kmod's GC unions snapshots into its
+    // live set and (pre-#84) aborted every reclaim cycle over them.
+    //
+    // Snapshots are immutable history: the only repair is to retire the whole
+    // snapshot, so damage is bucketed per generation rather than per inode.
+    if snapshots_root != 0 {
+        unsafe {
+            let st = tessera_btree_open(&io, snapshots_root,
+                TESSERA_BTREE_KIND_SNAPSHOT, 8, TESSERA_SNAPSHOT_RECORD_SIZE);
+            if st.is_null() {
+                fsck.problem("could not open snapshots tree".into());
+            } else {
+                let sc = tessera_btree_seek_first(st);
+                while !sc.is_null() {
+                    let mut skey = [0u8; 8];
+                    let mut sval = [0u8; TESSERA_SNAPSHOT_RECORD_SIZE as usize];
+                    if tessera_btree_cursor_get(sc, skey.as_mut_ptr(),
+                        sval.as_mut_ptr()) != 0 { break; }
+                    let snap_gen = rd_u64(&sval, 0);
+                    let snap_inode_root = rd_u64(&sval, 16);
+                    fsck.snapshots += 1;
+
+                    // Skip the snapshot that shares the live tree's root: it
+                    // is the current tree under another name, already walked.
+                    if snap_inode_root != 0 && snap_inode_root != inode_root {
+                        if snap_inode_root >= total {
+                            fsck.problem(format!(
+                                "snapshot generation {snap_gen}: inode_root sector \
+                                 {snap_inode_root} >= total_sectors {total}"));
+                        } else {
+                            let before = fsck.snapshot_problems
+                                .get(&snap_gen).map_or(0, |v| v.len());
+                            fsck.current_snapshot = Some(snap_gen);
+                            let sit = tessera_btree_open(&io, snap_inode_root,
+                                TESSERA_BTREE_KIND_INODE, 4,
+                                TESSERA_INODE_RECORD_SIZE);
+                            if sit.is_null() {
+                                fsck.problem(
+                                    "inode tree could not be opened".into());
+                            } else {
+                                let ic = tessera_btree_seek_first(sit);
+                                while !ic.is_null() {
+                                    let mut k = [0u8; 4];
+                                    let mut val =
+                                        [0u8; TESSERA_INODE_RECORD_SIZE as usize];
+                                    if tessera_btree_cursor_get(ic,
+                                        k.as_mut_ptr(), val.as_mut_ptr()) != 0 {
+                                        break;
+                                    }
+                                    fsck.snapshot_inodes += 1;
+                                    let ino = rd_u32(&val, 0);
+                                    let manifest = rd_hash(&val, 72);
+                                    let xattr = rd_hash(&val, 104);
+                                    // `checked` is shared with the current-tree
+                                    // walk, so blobs common to both (the vast
+                                    // majority) cost nothing here.
+                                    fsck.reach(&manifest, true,
+                                        &format!("inode {ino}"), 0);
+                                    fsck.reach(&xattr, false,
+                                        &format!("inode {ino} xattr"), 0);
+                                    if tessera_btree_cursor_next(ic) != 0 { break; }
+                                }
+                                if !ic.is_null() { tessera_btree_cursor_free(ic); }
+                                tessera_btree_close(sit);
+                            }
+                            fsck.current_snapshot = None;
+                            let after = fsck.snapshot_problems
+                                .get(&snap_gen).map_or(0, |v| v.len());
+                            if after > before {
+                                fsck.damaged_snapshots.push(snap_gen);
+                            }
+                        }
+                    }
+                    if tessera_btree_cursor_next(sc) != 0 { break; }
+                }
+                if !sc.is_null() { tessera_btree_cursor_free(sc); }
+                tessera_btree_close(st);
+            }
         }
     }
 
@@ -795,17 +920,45 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<(i32, u32), String> {
     println!("  inodes:       {}", fsck.inodes);
     println!("  packs:        {} ({} blobs, {} parse as manifests)",
         fsck.packs, fsck.blobs, fsck.manifests.len());
+    if fsck.snapshots > 0 {
+        println!("  snapshots:    {} retained ({} inodes walked)",
+            fsck.snapshots, fsck.snapshot_inodes);
+    }
     for n in &fsck.notes {
         println!("  NOTE: {n}");
     }
-    if fsck.problems.is_empty() {
+    // Snapshot damage is reported in its own section, and never folded into
+    // the current-tree problem list: the volume can be perfectly healthy for
+    // every live read while a retained snapshot is unreadable, and the repair
+    // (retire the snapshot) is unrelated to any current-tree fix.
+    if !fsck.snapshot_problems.is_empty() {
+        let total_snap: usize = fsck.snapshot_problems.values().map(|v| v.len()).sum();
+        println!("  SNAPSHOT DAMAGE: {} problem(s) across {} retained snapshot(s):",
+            total_snap, fsck.snapshot_problems.len());
+        for (gen, probs) in &fsck.snapshot_problems {
+            println!("    snapshot generation {gen}:");
+            for p in probs {
+                println!("      - {p}");
+            }
+        }
+        println!("    → These blobs are gone; the snapshots referencing them cannot be");
+        println!("      fully read back. The live filesystem is unaffected. Repair is to");
+        println!("      RETIRE the affected snapshots (tessera-fsck --repair does this).");
+    }
+    if fsck.problems.is_empty() && fsck.snapshot_problems.is_empty() {
         println!("  result:       CLEAN — no inconsistencies found");
         unsafe { tessera_volume_close(v); }
         return Ok((0, 0));
     }
-    println!("  result:       {} PROBLEM(S) FOUND:", fsck.problems.len());
-    for p in &fsck.problems {
-        println!("    - {p}");
+    if fsck.problems.is_empty() {
+        // Historically this printed CLEAN — the #85 bug exactly.
+        println!("  result:       current tree CLEAN; {} damaged snapshot(s)",
+            fsck.snapshot_problems.len());
+    } else {
+        println!("  result:       {} PROBLEM(S) FOUND:", fsck.problems.len());
+        for p in &fsck.problems {
+            println!("    - {p}");
+        }
     }
 
     if !repair {
@@ -1083,6 +1236,31 @@ fn apply_repairs(
             eprintln!("  reset {} inode(s) with a missing manifest blob to empty",
                 fsck.dangling_manifests.len());
         }
+        /*
+         * Resetting a DIRECTORY empties it: every name it held is gone, and
+         * its children become orphans that the next pass relinks into
+         * lost+found under synthetic inode_N names. The volume comes out
+         * CLEAN, but the SYSTEM can be broken — emptying /var cost a dev root
+         * its /var/run, after which login, sshd, devd and cron all failed with
+         * "No such file or directory" on a filesystem that was perfectly
+         * consistent and writable. Say so loudly; a CLEAN result must not be
+         * read as "the system still works".
+         */
+        let dirs: Vec<u32> = fsck.dangling_manifests.iter()
+            .filter(|(_, mode)| mode & S_IFMT == S_IFDIR)
+            .map(|(ino, _)| *ino).collect();
+        if !dirs.is_empty() {
+            eprintln!("tessera-fsck: WARNING — {} of those were DIRECTORIES \
+                (inode(s) {}); their entries are UNRECOVERABLE and have been \
+                discarded. Any child that survived is relinked into \
+                lost+found under an inode_N name. If one of these was a \
+                system directory (/var, /etc, /usr/lib ...) the volume is now \
+                CLEAN but the installed system may not boot or run correctly \
+                — check those paths and restore from backup or mtree before \
+                relying on it.",
+                dirs.len(),
+                dirs.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", "));
+        }
     }
 
     if !fsck.nlink_fixes.is_empty() {
@@ -1122,6 +1300,45 @@ fn apply_repairs(
             new.quota_tree_root = root;
         }
         if verbose { eprintln!("  quota: rewrote {} domain record(s)", fsck.quota_fixes.len()); }
+    }
+
+    // ── Tier B.4: retire damaged snapshots (task #85) ──
+    // A snapshot whose tree references blobs that are in no pack cannot be
+    // read back, and — unlike the live tree — there is nothing to patch: it
+    // is immutable history. Deleting the record is the whole repair, and it
+    // is a cheap and legitimate one (a snapshot is an automatic checkpoint,
+    // not user data). It also un-anchors whatever packs only that snapshot
+    // held, so the next GC can reclaim them.
+    //
+    // Deliberately AFTER the inode/dirent repairs and BEFORE the free-tree
+    // rebuild: retiring changes only the snapshots tree, but the rebuild
+    // below must be the last thing that observes allocation state.
+    if !fsck.damaged_snapshots.is_empty() {
+        if r.snapshots_root == 0 {
+            return Err("damaged snapshots reported but snapshots_root is 0".into());
+        }
+        unsafe {
+            let t = tessera_btree_open(io, new.snapshots_root,
+                TESSERA_BTREE_KIND_SNAPSHOT, 8, TESSERA_SNAPSHOT_RECORD_SIZE);
+            if t.is_null() { return Err("open snapshots tree for retire".into()); }
+            let mut root = new.snapshots_root;
+            for gen in &fsck.damaged_snapshots {
+                // Key is the 8-byte BIG-endian generation (see format.h).
+                let key = gen.to_be_bytes();
+                if tessera_btree_delete(t, key.as_ptr(), &mut root) != 0 {
+                    tessera_btree_close(t);
+                    return Err(format!("btree_delete(snapshot {gen}) during retire"));
+                }
+                applied += 1;
+                println!("  retired damaged snapshot generation {gen}");
+            }
+            tessera_btree_close(t);
+            new.snapshots_root = root;
+        }
+        if verbose {
+            eprintln!("  snapshots: retired {} damaged snapshot(s)",
+                fsck.damaged_snapshots.len());
+        }
     }
 
     // ── Tier A.3: rebuild the free-extent tree from the authoritative free
