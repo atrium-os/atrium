@@ -1719,6 +1719,30 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, meta_publish_resv, CTLFLAG_RW,
     &tessera_meta_publish_resv, 0,
     "data-zone sectors reserved per staged metadata object for its "
     "eventual publish (0 = disable, restores the pre-#80 behaviour)");
+/*
+ * ★ task #80 follow-up: charge for the STAGED DIRENT WORK too.
+ *
+ * space_admit charged content bytes and per-object metadata, but not the
+ * dirent log — yet every queued dirent op must eventually be published as
+ * part of its parent's rebuilt directory manifest. Leaving it uncharged is
+ * what lets the volume fill to the point where a checkpoint cannot publish.
+ * (45c7591 made losing that work impossible to do silently; this makes the
+ * pressure that causes it rarer.)
+ *
+ * SIZING MATTERS. The checkpoint cost is per DIRTY PARENT — one BTREE
+ * rebuild per parent, no matter how many ops target it — not per op. A
+ * 500-file directory stages 500 ops and republishes ONCE. Charging a full
+ * pack per op would overcharge by ~two orders of magnitude and hand users
+ * premature ENOSPC, which is its own bug. So charge a fraction: sectors per
+ * DIRENT_RESV_UNIT ops, approximating "how many manifest packs will this
+ * batch actually produce".
+ */
+#define TESSERA_DIRENT_RESV_UNIT  64u
+static int tessera_dirent_publish_resv = 4;
+SYSCTL_INT(_kern_tessera, OID_AUTO, dirent_publish_resv, CTLFLAG_RW,
+    &tessera_dirent_publish_resv, 0,
+    "data-zone sectors reserved per 64 staged dirent ops for the directory "
+    "manifests the checkpoint must republish (0 = disable)");
 static int tessera_remove_reserve = 2048;
 SYSCTL_INT(_kern_tessera, OID_AUTO, remove_reserve, CTLFLAG_RW,
     &tessera_remove_reserve, 0,
@@ -9437,6 +9461,21 @@ tessera_fs_space_admit(struct tessera_mount *tmp_, size_t delta_bytes)
 	need += ((uint64_t)tmp_->pending_manifest_count +
 	         (uint64_t)tmp_->dirty_count) *
 	        (uint64_t)tessera_meta_publish_resv;
+
+	/*
+	 * ★ #80 follow-up: the staged dirent log. Each queued op is a
+	 * namespace change the checkpoint must publish inside its parent's
+	 * rebuilt directory manifest, and until now none of it was charged —
+	 * so writers kept being admitted until the checkpoint itself could
+	 * not allocate. Charged per DIRENT_RESV_UNIT ops rather than per op,
+	 * because the rebuild is per parent (see the knob comment): a
+	 * thousand creates in one directory cost one republish, not a
+	 * thousand.
+	 */
+	if (tessera_dirent_publish_resv > 0)
+		need += ((uint64_t)tmp_->dirent_log_count *
+		         (uint64_t)tessera_dirent_publish_resv) /
+		        TESSERA_DIRENT_RESV_UNIT;
 
 	/*
 	 * ★ task #80: keep a slice only REMOVALS may spend.
