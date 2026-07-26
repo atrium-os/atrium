@@ -287,11 +287,26 @@ fn run(path: &str, apply: bool, force: bool) -> Result<i32, String> {
         }
 
         // Phase A: stage into headroom above the current bump, commit, loop.
+        //
+        // Staging rewrites the four live trees into unreferenced sectors, so
+        // the requirement scales with LIVE METADATA, not with any constant —
+        // which is exactly why a fixed emergency band cannot guarantee this
+        // fits (#82). `live` is the live node set we just walked, and each
+        // node is a sector, so live.len() is a direct estimate of what a
+        // staged copy needs. Report it: "insufficient headroom" without a
+        // number leaves the operator guessing how much to grow the reserve,
+        // and the only other exit is --force, which is NOT crash-safe.
         let headroom = ceiling - cur_bump;
+        let need = live.len() as u64;
         let a = build_all(&io, ctxp, cur_bump, ceiling, &trees).map_err(|_| format!(
-            "insufficient reserve headroom to repack crash-safely (a live node sits low \
-             AND only {headroom} free sectors above the bump). Grow the reserve, or re-run \
-             with --force for an in-place (NOT crash-safe) compaction — back up first."))?;
+            "insufficient reserve headroom to repack crash-safely: a live node sits low, \
+             and staging the {need} live metadata sector(s) needs roughly that much free \
+             above the bump — only {headroom} available{}. Grow the meta-reserve by at \
+             least {} sectors ({} MiB) and re-run; or re-run with --force for an in-place \
+             (NOT crash-safe) compaction — back up first.",
+            if need > headroom { format!(", short by ~{}", need - headroom) } else { String::new() },
+            need.saturating_sub(headroom).max(1),
+            (need.saturating_sub(headroom).max(1) * 4096).div_ceil(1024 * 1024)))?;
         commit(v, &a, next_ino, false)?;   // grow-only bump; snapshots now retired
         println!("  crash-safe: staged compacted trees in reserve headroom (snapshots retired)");
     }
