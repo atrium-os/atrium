@@ -15,8 +15,13 @@
 #ifndef B3_COMPAT_H_
 #define B3_COMPAT_H_
 
-/* Force the portable code paths before b3_blake3_impl.h autodetects. */
+/* Force the portable code paths before b3_blake3_impl.h autodetects.
+ * Overridable so a build can opt IN to NEON (task #89: userspace bench, and
+ * eventually the kernel once sliced fpu_kern regions land). The kernel build
+ * passes nothing, so it still gets 0. */
+#ifndef BLAKE3_USE_NEON
 #define BLAKE3_USE_NEON 0
+#endif
 #define BLAKE3_NO_SSE2 1
 #define BLAKE3_NO_SSE41 1
 #define BLAKE3_NO_AVX2 1

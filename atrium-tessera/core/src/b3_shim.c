@@ -51,14 +51,22 @@ blake3_hash_many(const uint8_t *const *inputs, size_t num_inputs,
     bool increment_counter, uint8_t flags, uint8_t flags_start,
     uint8_t flags_end, uint8_t *out)
 {
+#if BLAKE3_USE_NEON
+	/* NEON hashes MAX_SIMD_DEGREE chunks in parallel; compress_in_place
+	 * and compress_xof stay portable (upstream's NEON backend provides
+	 * only hash_many). */
+	blake3_hash_many_neon(inputs, num_inputs, blocks, key, counter,
+	    increment_counter, flags, flags_start, flags_end, out);
+#else
 	blake3_hash_many_portable(inputs, num_inputs, blocks, key, counter,
 	    increment_counter, flags, flags_start, flags_end, out);
+#endif
 }
 
 size_t
 blake3_simd_degree(void)
 {
-	return (1);
+	return (MAX_SIMD_DEGREE);
 }
 
 /* One-shot 256-bit BLAKE3 of a contiguous buffer. */
