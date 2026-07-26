@@ -340,7 +340,8 @@ unsafe fn name_str(p: *const core::ffi::c_char, len: u16) -> String {
 /// repair=false it only detects. With repair=true it applies fixes, commits,
 /// and returns (1, applied>0) so the caller can re-scan; a fully clean scan
 /// returns (0, 0).
-fn run(path: &str, verbose: bool, repair: bool) -> Result<(i32, u32), String> {
+fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
+    -> Result<(i32, u32), String> {
     let f = if repair {
         open_file_rw(path).map_err(|e| format!("open {path} (rw): {e}"))?
     } else {
@@ -995,7 +996,13 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<(i32, u32), String> {
         pz_start, pz_len, hash_alg, mr_start, mr_len,
     };
     println!("\ntessera-fsck: --repair — applying fixes…");
-    let (applied, new_roots) = match apply_repairs(&f, &io, &fsck, &roots, verbose) {
+    // #96: bound the work per pass so a space-limited repair commits partial
+    // progress instead of failing atomically. The fixpoint loop re-runs until
+    // it converges or stops making progress.
+    let mut truncated = false;
+    let (applied, new_roots) = match apply_repairs(&f, &io, &fsck, &roots, verbose,
+        repair_budget, &mut truncated)
+    {
         Ok(x) => x,
         Err(e) => { unsafe { tessera_volume_close(v); } return Err(format!("repair aborted: {e}")); }
     };
@@ -1027,6 +1034,10 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<(i32, u32), String> {
     }
     println!("tessera-fsck: applied {applied} repair action(s); committed generation {}",
         generation + 1);
+    if truncated {
+        println!("tessera-fsck: this pass was CAPPED (budget {repair_budget}) or ran out of \
+reserve — the repairs above are committed and durable; re-run to continue.");
+    }
     Ok((1, applied))
 }
 
@@ -1035,21 +1046,35 @@ fn run(path: &str, verbose: bool, repair: bool) -> Result<(i32, u32), String> {
 /// Multiple passes are needed because some repairs expose others (relinking
 /// an orphan changes its link count; republishing a directory changes the
 /// free set). Returns the process exit code.
+/// Drive --repair to a fixpoint. Each pass now applies at most REPAIR_BUDGET
+/// actions and COMMITS them (#96), so a volume too damaged to repair in one
+/// go still converges over several passes — and if it runs out of reserve
+/// entirely, everything achieved up to that point is durable rather than
+/// discarded. Pass cap is generous because each pass is deliberately small.
 fn run_to_fixpoint(path: &str, verbose: bool) -> Result<i32, String> {
-    const MAX_PASSES: u32 = 8;
+    const MAX_PASSES: u32 = 64;
+    const REPAIR_BUDGET: u32 = 256;
+    let mut total = 0u32;
     for pass in 0..MAX_PASSES {
         if pass > 0 { println!("\n──── repair pass {} ────", pass + 1); }
-        let (exit, applied) = run(path, verbose, true)?;
+        let (exit, applied) = run(path, verbose, true, REPAIR_BUDGET)?;
+        total += applied;
         if exit == 0 {
-            if pass > 0 { println!("\ntessera-fsck: REPAIR SUCCESSFUL — volume is now clean"); }
+            if pass > 0 {
+                println!("\ntessera-fsck: REPAIR SUCCESSFUL — volume is now clean \
+({total} action(s) over {} pass(es))", pass + 1);
+            }
             return Ok(0);
         }
         if applied == 0 {
-            println!("\ntessera-fsck: REPAIR INCOMPLETE — remaining problems are not safely repairable");
+            println!("\ntessera-fsck: REPAIR INCOMPLETE after {total} action(s) — the \
+remaining problems are not safely repairable by this tool (or the reserve is \
+exhausted; run tessera-repack to reclaim it, then re-run).");
             return Ok(1);
         }
     }
-    println!("\ntessera-fsck: repair did not converge after {MAX_PASSES} passes — re-run or inspect manually");
+    println!("\ntessera-fsck: still making progress after {MAX_PASSES} passes \
+({total} action(s) applied and committed) — re-run to continue.");
     Ok(1)
 }
 
@@ -1087,12 +1112,30 @@ struct NewRoots {
 /// Ordering: Tier-B structural repairs (which mint inodes / republish
 /// directories / add packs) run first so Tier-A's nlink recount and the
 /// free-tree rebuild observe the final inode tree and pack registry.
+///
+/// ★ task #96: BOUNDED and NON-ATOMIC on purpose.
+///
+/// Repair consumption was measured at ~0.65-0.8 meta-reserve sectors PER
+/// PROBLEM — O(damage), not the "few btree_deletes" the emergency band was
+/// sized against. A 1696-problem volume consumed 1361 sectors against a
+/// 256-sector band, and one 64 MiB case failed with applied=0: it did
+/// NOTHING, losing every repair it had computed.
+///
+/// So: apply at most `budget` actions, then stop at a unit boundary and let
+/// the caller COMMIT what was done. Every unit (one directory republish, one
+/// inode put) leaves the trees individually valid, so a commit after K units
+/// is a consistent volume — the same argument that makes repack's staged
+/// commits safe. And an allocation failure mid-way now TRUNCATES rather than
+/// propagating, so partial progress survives instead of being discarded.
+/// Re-running continues from the committed state.
 fn apply_repairs(
     f: &std::fs::File,
     io: &tessera_block_io_t,
     fsck: &Fsck,
     r: &RepairRoots,
     verbose: bool,
+    budget: u32,
+    truncated: &mut bool,
 ) -> Result<(u32, NewRoots), String> {
     let mut new = NewRoots {
         inode_root: r.inode_root,
@@ -1187,6 +1230,7 @@ fn apply_repairs(
     for dir_ino in dirs {
         let m = &mods[&dir_ino];
         // Base entry list: current on-disk entries, or empty for a minted dir.
+        if applied >= budget { *truncated = true; break; }
         let mut ents: Vec<(String, u64)> = if m.from_empty {
             Vec::new()
         } else {
@@ -1242,9 +1286,14 @@ fn apply_repairs(
                 let mut patched = raw.clone();
                 patched[56..64].copy_from_slice(&0u64.to_le_bytes());   // size
                 patched[72..104].copy_from_slice(&[0u8; 32]);           // manifest_hash
+                if applied >= budget { *truncated = true; break; }
                 if tessera_btree_put(t, key.as_ptr(), patched.as_ptr(), &mut root) != 0 {
-                    tessera_btree_close(t);
-                    return Err(format!("btree_put(inode {ino}) during dangling-manifest repair"));
+                    /* Out of reserve. Keep what we have (#96) — the old
+                     * behaviour discarded every repair computed so far. */
+                    eprintln!("tessera-fsck: reserve exhausted at inode {ino} \
+(dangling-manifest repair) — committing {applied} completed repair(s); re-run to continue");
+                    *truncated = true;
+                    break;
                 }
                 applied += 1;
             }
@@ -1289,9 +1338,12 @@ fn apply_repairs(
             if t.is_null() { return Err("open inode tree for repair".into()); }
             let mut root = new.inode_root;
             for (key, val) in &fsck.nlink_fixes {
+                if applied >= budget { *truncated = true; break; }
                 if tessera_btree_put(t, key.as_ptr(), val.as_ptr(), &mut root) != 0 {
-                    tessera_btree_close(t);
-                    return Err("btree_put(inode) during nlink repair".into());
+                    eprintln!("tessera-fsck: reserve exhausted during nlink repair \
+— committing {applied} completed repair(s); re-run to continue");
+                    *truncated = true;
+                    break;
                 }
                 applied += 1;
             }
@@ -1309,9 +1361,12 @@ fn apply_repairs(
             if t.is_null() { return Err("open quota tree for repair".into()); }
             let mut root = new.quota_tree_root;
             for (key, val) in &fsck.quota_fixes {
+                if applied >= budget { *truncated = true; break; }
                 if tessera_btree_put(t, key.as_ptr(), val.as_ptr(), &mut root) != 0 {
-                    tessera_btree_close(t);
-                    return Err("btree_put(quota) during quota repair".into());
+                    eprintln!("tessera-fsck: reserve exhausted during quota repair \
+— committing {applied} completed repair(s); re-run to continue");
+                    *truncated = true;
+                    break;
                 }
                 applied += 1;
             }
@@ -1589,7 +1644,7 @@ fn main() -> ExitCode {
     let result = if repair {
         run_to_fixpoint(&path, verbose)
     } else {
-        run(&path, verbose, false).map(|(exit, _)| exit)
+        run(&path, verbose, false, u32::MAX).map(|(exit, _)| exit)
     };
     match result {
         Ok(0) => ExitCode::SUCCESS,
