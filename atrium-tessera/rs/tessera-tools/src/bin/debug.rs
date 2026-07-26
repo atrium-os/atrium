@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use tessera_sys::{
     tessera_volume_active_slot_count, tessera_volume_close,
     tessera_volume_encryption_flags, tessera_volume_free_extent_root,
-    tessera_volume_generation, tessera_volume_inode_root,
+    tessera_volume_generation, tessera_volume_hash_alg, tessera_volume_inode_root,
     tessera_volume_journal_length, tessera_volume_journal_start,
     tessera_volume_meta_reserve_bump, tessera_volume_meta_reserve_length,
     tessera_volume_meta_reserve_start, tessera_volume_open,
@@ -57,6 +57,14 @@ fn run(path: &str) -> Result<(), String> {
     println!("  total_sectors:    {total_sectors}");
     println!("  generation:       {generation}");
     println!("  uuid:             {}", format_uuid(&uuid));
+    // Which content hash this volume uses. Absent until now, which made a
+    // read-verification benchmark (#87/#88) impossible to interpret: there
+    // was no way to confirm --hash-alg had taken effect. Same class of gap
+    // as blob_index_root being unobservable (#75).
+    let hash_alg = unsafe { tessera_volume_hash_alg(v) };
+    println!("  hash_alg:         {} ({})", hash_alg,
+        match hash_alg { 0 => "sha256", 1 => "blake3", _ => "UNKNOWN" });
+
     println!("  ── on-disk roots ───────────────────────────────────");
     println!("  journal:          start={j_start} length={j_length}");
     println!("  inode_root:       sector {inode_root}");
