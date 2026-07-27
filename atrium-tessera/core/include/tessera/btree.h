@@ -91,11 +91,38 @@ void tessera_btree_set_quiet_kind_mismatch(tessera_btree_t *t, int quiet);
  * + every leaf), pre-order. Return non-zero to abort the walk. */
 typedef int (*tessera_btree_node_visitor_t)(void *ctx, uint64_t sector);
 
+/* Pre-visitor return value meaning "I have already seen this sector; do
+ * NOT descend into it, but keep walking the rest of the tree". Distinct
+ * from 0 (descend) and from every tessera_errno_t (abort). Only
+ * tessera_btree_walk_nodes_ex() honours it.
+ *
+ * This is what makes a multi-tree walk cost O(distinct nodes) rather
+ * than O(sum of nodes per tree). Under COW a node's sector changes
+ * whenever anything beneath it changes, so two trees that reach the
+ * SAME sector reach byte-identical subtrees — re-descending is pure
+ * waste. Snapshots of one volume share almost all of their nodes. */
+#define TESSERA_BTREE_WALK_PRUNE  0x50524E45  /* 'PRNE' */
+
 /* Walk every node sector in the tree. Used at mount time to
  * reconstruct which sectors of the metadata-reserve are still
  * referenced (and therefore which are free to recycle). */
 int tessera_btree_walk_nodes(tessera_btree_t *,
                              tessera_btree_node_visitor_t cb, void *ctx);
+
+/* As above, with two hooks:
+ *   pre  — called before descending; may return TESSERA_BTREE_WALK_PRUNE.
+ *   post — called after a node's ENTIRE subtree has been walked without
+ *          error; NULL if not needed.
+ *
+ * `post` exists so a caller can prune safely. A pre-visitor that prunes
+ * on "already marked" is WRONG if the earlier visit aborted part-way:
+ * that node is marked but its subtree is not, so pruning on it silently
+ * under-reports. Pruning on "post-visited" instead is sound, because a
+ * node is post-visited only once every descendant has been reported. */
+int tessera_btree_walk_nodes_ex(tessera_btree_t *,
+                                tessera_btree_node_visitor_t pre,
+                                tessera_btree_node_visitor_t post,
+                                void *ctx);
 
 #ifdef __cplusplus
 }

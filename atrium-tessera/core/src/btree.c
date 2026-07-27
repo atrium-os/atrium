@@ -1063,9 +1063,13 @@ tessera_btree_delete(tessera_btree_t *t, const void *key,
 
 static int
 walk_recursive(tessera_btree_t *t, uint64_t sector,
-               tessera_btree_node_visitor_t cb, void *ctx)
+               tessera_btree_node_visitor_t cb,
+               tessera_btree_node_visitor_t post, void *ctx)
 {
 	int rc = cb(ctx, sector);
+	/* Already-seen subtree: report nothing below it, but this is not an
+	 * error and the caller's walk continues with our siblings. */
+	if (rc == TESSERA_BTREE_WALK_PRUNE) return TESSERA_OK;
 	if (rc != 0) return rc;
 	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
 	if (block == NULL) return TESSERA_ENOMEM;
@@ -1073,7 +1077,14 @@ walk_recursive(tessera_btree_t *t, uint64_t sector,
 	if (rc != TESSERA_OK) { tessera_free(block); return rc; }
 	tessera_btree_node_header_t h;
 	(void)read_header(block, &h);
-	if (h.node_kind == 0) { tessera_free(block); return TESSERA_OK; }
+	if (h.node_kind == 0) {
+		tessera_free(block);
+		if (post != NULL) {
+			rc = post(ctx, sector);
+			if (rc != 0) return rc;
+		}
+		return TESSERA_OK;
+	}
 	/* Internal node — copy out child sectors, free the parent buffer
 	 * before recursing to keep heap pressure low across MAX_DEPTH. */
 	const uint32_t es = inner_entry_size(t);
@@ -1086,10 +1097,13 @@ walk_recursive(tessera_btree_t *t, uint64_t sector,
 	}
 	tessera_free(block);
 	for (uint32_t i = 0; i < n; i++) {
-		rc = walk_recursive(t, children[i], cb, ctx);
+		rc = walk_recursive(t, children[i], cb, post, ctx);
 		if (rc != TESSERA_OK) break;
 	}
 	tessera_free(children);
+	/* Post-visit ONLY on a fully successful subtree — that is the whole
+	 * contract `post` exists to provide (see btree.h). */
+	if (rc == TESSERA_OK && post != NULL) rc = post(ctx, sector);
 	return rc;
 }
 
@@ -1098,7 +1112,16 @@ tessera_btree_walk_nodes(tessera_btree_t *t,
                          tessera_btree_node_visitor_t cb, void *ctx)
 {
 	if (t == NULL || cb == NULL) return TESSERA_EINVAL;
-	return walk_recursive(t, t->root, cb, ctx);
+	return walk_recursive(t, t->root, cb, NULL, ctx);
+}
+
+int
+tessera_btree_walk_nodes_ex(tessera_btree_t *t,
+                            tessera_btree_node_visitor_t pre,
+                            tessera_btree_node_visitor_t post, void *ctx)
+{
+	if (t == NULL || pre == NULL) return TESSERA_EINVAL;
+	return walk_recursive(t, t->root, pre, post, ctx);
 }
 
 /* ── cursor: forward in-order iteration ──────────────────────────── */

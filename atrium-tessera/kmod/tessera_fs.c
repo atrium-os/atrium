@@ -912,6 +912,39 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_total_ms, CTLFLAG_RD,
     &tessera_stat_pinscan_total_ms, 0,
     "Cumulative ms spent in background pinscans (#71) — divide by uptime "
     "for the achieved duty cycle");
+/*
+ * ★ #71 part 2: make each scan cheap instead of merely infrequent.
+ *
+ * The scan walks the 4 live trees plus every retained snapshot's 3 trees.
+ * Those trees are COW siblings of each other — a snapshot differs from the
+ * next by one commit's worth of rewritten nodes, so they share the
+ * overwhelming majority of their sectors. The exhaustive walk re-read every
+ * shared node once per tree.
+ *
+ * Pruning on "already fully walked in this scan" turns that into one walk of
+ * the union. 0 = exhaustive (the old behaviour, kept for A/B).
+ */
+static int tessera_pinscan_prune = 1;
+SYSCTL_INT(_kern_tessera, OID_AUTO, pinscan_prune, CTLFLAG_RW,
+    &tessera_pinscan_prune, 0,
+    "1 = skip re-descending subtrees already walked in this pinscan (#71); "
+    "0 = exhaustive walk");
+static unsigned long tessera_stat_pinscan_freed = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_freed, CTLFLAG_RD,
+    &tessera_stat_pinscan_freed, 0,
+    "Sectors the most recent pinscan judged reclaimable. Toggling "
+    "pinscan_prune between two forced scans of an UNCHANGED volume must "
+    "not change this: it is a direct sum over the bitmap, so a pruned "
+    "walk that missed a live sector would report MORE free (#71)");
+static unsigned long tessera_stat_pinscan_nodes  = 0;
+static unsigned long tessera_stat_pinscan_pruned = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_nodes, CTLFLAG_RD,
+    &tessera_stat_pinscan_nodes, 0,
+    "btree nodes descended into by the most recent pinscan (#71)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_pruned, CTLFLAG_RD,
+    &tessera_stat_pinscan_pruned, 0,
+    "subtree descents skipped as already-walked in the most recent "
+    "pinscan (#71) — the sharing between snapshots");
 static unsigned long tessera_stat_pinscan_kicks        = 0;
 static unsigned long tessera_stat_pinscan_runs         = 0;
 static unsigned long tessera_stat_pinscan_skips_active = 0;
@@ -1365,8 +1398,17 @@ struct tessera_replay_ctx {
 static int tessera_replay_handler(void *ctx,
     const tessera_record_header_t *hdr, const uint8_t *body);
 struct meta_mark_ctx { uint8_t *bitmap; uint64_t lo; uint64_t hi;
-	volatile int *abort_flag; /* nonzero -> stop the walk (unmount) */ };
+	volatile int *abort_flag; /* nonzero -> stop the walk (unmount) */
+	/* ★ #71 part 2: subtree-sharing prune. `complete` marks sectors whose
+	 * ENTIRE subtree has already been walked in THIS scan; the pre-visitor
+	 * prunes on it. NULL disables pruning (kern.tessera.pinscan_prune=0),
+	 * which restores the old exhaustive walk for A/B. */
+	uint8_t *complete;
+	unsigned long visited;   /* nodes descended into */
+	unsigned long pruned;    /* descents skipped by the share test */
+};
 static int meta_mark_visitor(void *ctx, uint64_t sector);
+static int meta_mark_post_visitor(void *ctx, uint64_t sector);
 static void tessera_meta_pin_bitmap_rebuild(struct tessera_mount *tmp_);
 static void tessera_fs_meta_pressure_kick(struct tessera_mount *tmp_);
 static void tessera_fs_pinscan_task(void *ctx, int pending);
@@ -11790,7 +11832,34 @@ meta_mark_visitor(void *ctx, uint64_t sector)
 	struct meta_mark_ctx *m = ctx;
 	if (sector >= m->lo && sector < m->hi) {
 		uint64_t bit = sector - m->lo;
+		if (m->complete != NULL &&
+		    (m->complete[bit / 8] & (1u << (bit % 8)))) {
+			/* Seen, in full, earlier in this same scan. Under COW
+			 * the sector number IS the content identity, so the
+			 * subtree below is byte-identical to the one already
+			 * marked — descending again would read the same nodes
+			 * off disk to set bits that are already set. */
+			m->pruned++;
+			return (TESSERA_BTREE_WALK_PRUNE);
+		}
 		m->bitmap[bit / 8] |= (uint8_t)(1u << (bit % 8));
+	}
+	m->visited++;
+	return (0);
+}
+
+/* Called only after every descendant of `sector` has been walked without
+ * error — see the `post` contract in btree.h. Marking here rather than in
+ * the pre-visitor is what makes pruning safe when a walk fails part-way
+ * (a stale snapshot root, say): the aborted subtree's nodes are marked
+ * pinned but never marked complete, so no later tree prunes on them. */
+static int
+meta_mark_post_visitor(void *ctx, uint64_t sector)
+{
+	struct meta_mark_ctx *m = ctx;
+	if (m->complete != NULL && sector >= m->lo && sector < m->hi) {
+		uint64_t bit = sector - m->lo;
+		m->complete[bit / 8] |= (uint8_t)(1u << (bit % 8));
 	}
 	return (0);
 }
@@ -11889,8 +11958,13 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 
 	size_t bitmap_bytes = (size_t)((mlen + 7) / 8);
 	uint8_t *scratch = malloc(bitmap_bytes, M_TESSERA, M_WAITOK | M_ZERO);
+	/* Scan-local, freed below: which sectors have been walked to
+	 * completion. Never installed — over-pinning is safe, but pruning on
+	 * a partially-walked node is NOT, so this must not survive the scan. */
+	uint8_t *complete = tessera_pinscan_prune
+	    ? malloc(bitmap_bytes, M_TESSERA, M_WAITOK | M_ZERO) : NULL;
 	struct meta_mark_ctx mctx = { scratch, mstart, mstart + mlen,
-	    &tmp_->pinscan_abort };
+	    &tmp_->pinscan_abort, complete, 0, 0 };
 	int aborted = 0;
 
 	struct { uint64_t root; int kind; uint32_t ksz; uint32_t vsz; } roots[8] = {
@@ -11915,8 +11989,8 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 		tessera_btree_t *t = tessera_btree_open(&tmp_->meta_bio,
 		    roots[i].root, roots[i].kind, roots[i].ksz, roots[i].vsz);
 		if (t == NULL) continue;
-		int _wrc = tessera_btree_walk_nodes(t, meta_mark_visitor,
-		    &mctx);
+		int _wrc = tessera_btree_walk_nodes_ex(t, meta_mark_visitor,
+		    meta_mark_post_visitor, &mctx);
 		if (_wrc != 0) {
 			printf("tessera_fs: pinscan walk[%d] root=%lu "
 			    "rc=%d%s\n", i, (unsigned long)roots[i].root,
@@ -11956,8 +12030,9 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 				 * then reads a sector whose tree_kind no longer
 				 * matches (ECORRUPT). Quiet that expected miss. */
 				tessera_btree_set_quiet_kind_mismatch(t, 1);
-				int _src = tessera_btree_walk_nodes(t,
-				    meta_mark_visitor, &mctx);
+				int _src = tessera_btree_walk_nodes_ex(t,
+				    meta_mark_visitor, meta_mark_post_visitor,
+				    &mctx);
 				tessera_btree_close(t);
 				if (_src != 0) {
 					/* Benign: any recycled sector is already
@@ -11989,6 +12064,7 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 		    (long)((sbinuptime() - _ps0) / SBT_1MS),
 		    tmp_->pinscan_abort);
 		free(scratch, M_TESSERA);
+		if (complete != NULL) free(complete, M_TESSERA);
 		tmp_->pinscan_active = 0;
 		tmp_->meta_scanwin_count = 0;
 		return;
@@ -12006,6 +12082,7 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 		tmp_->meta_scanwin_count = 0;
 		tessera_fs_flush_gate_exit(tmp_);
 		free(scratch, M_TESSERA);
+		if (complete != NULL) free(complete, M_TESSERA);
 		printf("tessera_fs: pinscan superseded (stale)\n");
 		return;
 	}
@@ -12079,6 +12156,10 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	if (pend_bits != NULL) free(pend_bits, M_TESSERA);
 	tmp_->pinscan_active = 0;
 	tessera_fs_flush_gate_exit(tmp_);
+	if (complete != NULL) free(complete, M_TESSERA);
+	tessera_stat_pinscan_nodes  = mctx.visited;
+	tessera_stat_pinscan_pruned = mctx.pruned;
+	tessera_stat_pinscan_freed  = freed;
 	tessera_metatrace(TM_OP_BITMAP_BUILT, 1, tmp_->sb.generation,
 	    (uint32_t)bitmap_bytes);
 	/* Rate-limit the routine log to 1/s (the scan runs per retire ~ per
@@ -12093,10 +12174,11 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	if (tessera_pinscan_verbose || _now != tmp_->pinscan_last_log_sec) {
 		tmp_->pinscan_last_log_sec = _now;
 		printf("tessera_fs: pinscan done in %ld ms — freed=%u "
-		    "pending=%u bump=%lu/%lu\n",
+		    "pending=%u bump=%lu/%lu nodes=%lu pruned=%lu\n",
 		    (long)((sbinuptime() - _ps0) / (SBT_1MS)), freed,
 		    tmp_->meta_pending_count,
-		    (unsigned long)(bump1 - mstart), (unsigned long)mlen);
+		    (unsigned long)(bump1 - mstart), (unsigned long)mlen,
+		    mctx.visited, mctx.pruned);
 	}
 }
 
@@ -15342,6 +15424,30 @@ tessera_sysctl_repack_now(SYSCTL_HANDLER_ARGS)
 	return (tessera_fs_repack_pass(tessera_singleton_mount,
 	    max_packs, 30000u, &repacked));
 }
+/*
+ * sysctl kern.tessera.pinscan_now — write 1 to run a pin-bitmap scan
+ * synchronously on the active mount. Exists so a scan can be forced on a
+ * volume that is NOT being written to: the routine trigger is a snapshot
+ * retire, which needs a commit, which changes the very tree the scan then
+ * measures. Two forced scans of an unchanged volume are directly
+ * comparable — that is what makes the pinscan_prune A/B a controlled one.
+ */
+static int
+tessera_sysctl_pinscan_now(SYSCTL_HANDLER_ARGS)
+{
+	int go = 0;
+	int err = sysctl_handle_int(oidp, &go, 0, req);
+	if (err != 0 || req->newptr == NULL) return (err);
+	if (go == 0) return (0);
+	if (tessera_singleton_mount == NULL) return (ENXIO);
+	tessera_fs_pinscan_run(tessera_singleton_mount);
+	return (0);
+}
+SYSCTL_PROC(_kern_tessera, OID_AUTO, pinscan_now,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+    NULL, 0, tessera_sysctl_pinscan_now, "I",
+    "Write 1 to run a pin-bitmap scan synchronously on the active mount");
+
 SYSCTL_PROC(_kern_tessera, OID_AUTO, repack_now,
     CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
     NULL, 0, tessera_sysctl_repack_now, "I",
