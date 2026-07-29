@@ -2405,6 +2405,13 @@ struct tessera_mount {
 	 *
 	 * Concurrent writers are covered by a snapshot-at-the-beginning
 	 * write barrier — see tessera_fs_gc_note_hash. */
+	/* ★ #99: set at unmount teardown to cut a GC pass short.
+	 * gc_tq_init/flush_unmounting already stop new passes being ARMED,
+	 * but a pass already walking is O(volume) — on the dev root, 95k
+	 * packs x 12 snapshots x ~2.4M inodes — so taskqueue_drain() below
+	 * waited on it effectively forever and umount hung in "tq_drain".
+	 * Aborting is always safe: GC reclaims, it never has to. */
+	volatile int              gc_abort;
 	struct taskqueue         *gc_tq;
 	struct task               gc_task;
 	int                       gc_tq_init;
@@ -4642,6 +4649,12 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			 * closing that door before draining means nothing can
 			 * enqueue onto a queue we are about to free. */
 			tmp_->gc_tq_init = 0;
+			/* ★ #99: and tell a pass that is ALREADY WALKING to
+			 * stop. Closing the door only stops new passes; the
+			 * one in flight is O(volume) and drain waits for it,
+			 * which is why umount hung in "tq_drain" for over an
+			 * hour with tessgc <running>. */
+			tmp_->gc_abort = 1;
 			taskqueue_drain(tmp_->gc_tq, &tmp_->gc_task);
 			taskqueue_free(tmp_->gc_tq);
 			tmp_->gc_tq = NULL;
@@ -13562,6 +13575,9 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 	 * hard GC abort (no reclaim this cycle), exactly like gc_seed_abort.
 	 */
 	int gc_walk_abort = 0;
+	/* Teardown aborts the walk exactly like a corrupt-read does — same
+	 * "reclaim nothing this pass" outcome, which is always correct. */
+#define _GC_TEARDOWN()	(tmp_->gc_abort != 0)
 	/*
 	 * #84 diagnostics. "gc ABORTED — btree read error" names seven
 	 * possible sites and no cause, which is useless on a volume that
@@ -13620,6 +13636,10 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 				_GC_ABORT("cursor_get", _grc);            \
 			break;                                            \
 		}                                                         \
+		if (__predict_false(_GC_TEARDOWN())) {                    \
+			_GC_ABORT("unmount", 0);                          \
+			break;                                            \
+		}                                                         \
 		gc_walk_records++;                                        \
 		gc_cur_inode = ((uint32_t)_k[0] << 24) |                  \
 		    ((uint32_t)_k[1] << 16) | ((uint32_t)_k[2] << 8) |    \
@@ -13645,7 +13665,7 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 		tessera_btree_cursor_t *sc =
 		    tessera_btree_seek_first(scan_snap_tree);
 		uint32_t snap_count = 0;
-		while (sc != NULL && !gc_walk_abort) {
+		while (sc != NULL && !gc_walk_abort && !_GC_TEARDOWN()) {
 			uint8_t sk[8];
 			tessera_snapshot_record_t srec;
 			int _sgrc = tessera_btree_cursor_get(sc, sk, &srec);
@@ -13938,6 +13958,8 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 			tessera_hash_t *bh_all = NULL;
 			uint8_t pkey[16];
 			uint8_t pval[TESSERA_REGISTRY_ENTRY_SIZE];
+			if (__predict_false(_GC_TEARDOWN()))
+				break;
 			if (tessera_btree_cursor_get(pc, pkey, pval) != TESSERA_OK)
 				break;
 			tessera_registry_entry_t re;
