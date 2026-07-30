@@ -391,6 +391,22 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, publish_dedup_chunked,
 static unsigned long tessera_stat_gc_scans       = 0;
 static unsigned long tessera_stat_gc_scan_ms     = 0;
 static unsigned long tessera_stat_gc_aborts      = 0;
+/* ★ #99: duty-cycle bound for the data-zone GC. A pass costing T that
+ * reclaims nothing earns T*(100/pct - 1) of quiet, so GC's share of the
+ * machine stays near pct whatever the volume size. 0 = the old
+ * doubling-to-60s wall-clock backoff.
+ *
+ * DEFAULT 0 — this is DELIBERATE. The code is correct by inspection but has
+ * never been exercised: reaching it needs a pass that reclaims NOTHING, and
+ * every volume small enough to iterate on has productive GC (no retained
+ * snapshots pinning the dead packs, so n > 0 every time and the branch below
+ * is skipped — measured: gc_scans=2, last_ms=0, backoff_ms=0). Verifying it
+ * needs a volume in the dev-root condition: a dozen retained snapshots
+ * pinning unreclaimable multi-blob packs (#81). Set to 5 and confirm
+ * gc_last_ms / gc_backoff_ms actually move before trusting it. */
+static int tessera_gc_duty_pct = 0;	/* OFF: unverified, see the commit */
+static unsigned long tessera_stat_gc_last_ms    = 0;
+static unsigned long tessera_stat_gc_backoff_ms = 0;
 static unsigned long tessera_stat_gc_touch_keeps = 0;
 static unsigned long tessera_stat_gc_reclaimed   = 0;
 static unsigned long tessera_stat_gc_lost_subtrees = 0;
@@ -656,6 +672,17 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_scans, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_scan_ms, CTLFLAG_RD,
     &tessera_stat_gc_scan_ms, 0,
     "Cumulative ms spent in the ungated GC scan (NOT gate-held)");
+SYSCTL_INT(_kern_tessera, OID_AUTO, gc_duty_pct, CTLFLAG_RW,
+    &tessera_gc_duty_pct, 0,
+    "Target data-zone GC duty cycle in percent (#99): after an unproductive "
+    "pass costing T, the next is refused for T*(100/pct - 1). 0 = the old "
+    "fixed doubling-to-60s backoff");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_last_ms, CTLFLAG_RD,
+    &tessera_stat_gc_last_ms, 0,
+    "Duration of the most recent unproductive GC pass, ms (#99)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_backoff_ms, CTLFLAG_RD,
+    &tessera_stat_gc_backoff_ms, 0,
+    "Quiet period the duty bound imposed after it, ms (#99)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_aborts, CTLFLAG_RD,
     &tessera_stat_gc_aborts, 0,
     "GC passes that reclaimed nothing because the live-set walk aborted");
@@ -1020,6 +1047,29 @@ static unsigned long tessera_stat_chunk_zero_hole     = 0;
 /* Lookup-path integrity failures (inode read / dir-manifest fetch)
  * surfaced as EIO — previously silently laundered to ENOENT. */
 static unsigned long tessera_stat_lookup_eio           = 0;
+/* ★ #100: EIO returned because a manifest could not be fetched / parsed.
+ * Separated because they mean different things: UNFETCHABLE is a missing or
+ * unreadable blob, WILL NOT PARSE is a blob that came back but is not a
+ * manifest — the second implies the pack/registry is lying about what it
+ * holds, which is the more serious of the two. */
+static unsigned long tessera_stat_content_fetch_eio    = 0;
+static unsigned long tessera_stat_content_parse_eio    = 0;
+static time_t        tessera_eio_last_log_sec          = 0;
+
+/* Log at most one line per wall-clock second: a damaged tree under `rm -rf`
+ * produces these in bursts, and a console storm is how the useful first line
+ * gets lost. A predicate rather than a vprintf wrapper — no varargs, so no
+ * <machine/stdarg.h> dependency for two call sites. */
+static int
+tessera_eio_should_log(void)
+{
+	time_t now = (time_t)time_uptime;
+
+	if (tessera_eio_last_log_sec == now)
+		return (0);
+	tessera_eio_last_log_sec = now;
+	return (1);
+}
 static unsigned long tessera_stat_ckpt_fail            = 0;
 static unsigned long tessera_stat_window_seals         = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, window_seals, CTLFLAG_RW,
@@ -1073,6 +1123,12 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, chunk_dedup_skip,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, chunk_zero_hole,
     CTLFLAG_RD, &tessera_stat_chunk_zero_hole, 0,
     "ZERO_HOLE chunks emitted (sparse-file detection)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, content_fetch_eio, CTLFLAG_RD,
+    &tessera_stat_content_fetch_eio, 0,
+    "EIO from read_full_content: manifest blob could not be fetched (#100)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, content_parse_eio, CTLFLAG_RD,
+    &tessera_stat_content_parse_eio, 0,
+    "EIO from read_full_content: manifest blob fetched but unparseable (#100)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_eio, CTLFLAG_RD,
     &tessera_stat_lookup_eio, 0,
     "Lookup-path inode/manifest fetch failures surfaced as EIO");
@@ -14442,13 +14498,42 @@ tessera_fs_gc_task(void *ctx, int pending)
 	 * correctness matter — an unproductive pass no longer stalls every
 	 * writer — but it still keeps a fruitless O(volume) walk from
 	 * burning I/O bandwidth continuously. */
-	if (n > 0)
+	/*
+	 * ★ #99: bound GC's DUTY, not its retry RATE.
+	 *
+	 * The doubling-to-60s backoff above assumed a pass is short compared
+	 * to the interval. On a large volume it is not: this pass walks
+	 * ~95k packs against a live set unioned over 12 retained snapshots of
+	 * ~2.4M inodes and takes MINUTES, so even the 60s ceiling left GC
+	 * running a large fraction of the time — and unproductively, since
+	 * #81 means there is usually nothing it can reclaim.
+	 *
+	 * This is the same mistake #71 had for the pinscan, fixed the same
+	 * way: a fixed interval is the wrong constant when the work it spaces
+	 * is O(volume). Space the next pass by a multiple of how long THIS
+	 * pass actually took, so duty stays near the target whatever the
+	 * volume size, and keep the old interval as a floor for volumes where
+	 * a pass is ~free.
+	 */
+	if (n > 0) {
 		tmp_->tombstone_gc_backoff = hz / 2;
-	else {
-		int nb = (tmp_->tombstone_gc_backoff > 0 ?
-		    tmp_->tombstone_gc_backoff : hz / 2) * 2;
-		if (nb > 60 * hz) nb = 60 * hz;
+	} else {
+		int cost = (int)((sbinuptime() - t0) / SBT_1MS) * hz / 1000;
+		int duty = tessera_gc_duty_pct;
+		int nb;
+
+		if (duty > 0 && duty < 100 && cost > 0)
+			nb = cost * ((100 / duty) - 1);
+		else
+			nb = (tmp_->tombstone_gc_backoff > 0 ?
+			    tmp_->tombstone_gc_backoff : hz / 2) * 2;
+		if (nb < hz / 2) nb = hz / 2;	/* floor, as before */
+		if (nb > 3600 * hz) nb = 3600 * hz;
 		tmp_->tombstone_gc_backoff = nb;
+		tessera_stat_gc_last_ms =
+		    (unsigned long)((sbinuptime() - t0) / SBT_1MS);
+		tessera_stat_gc_backoff_ms =
+		    (unsigned long)((uint64_t)nb * 1000 / hz);
 	}
 out:
 	atomic_store_rel_int((volatile int *)&tmp_->gc_task_armed, 0);
@@ -19352,13 +19437,45 @@ tessera_fs_read_full_content(struct tessera_mount *tmp_,
 
 	uint8_t *blob = NULL;
 	uint32_t blob_len = 0;
+	/*
+	 * ★ #100: SAY WHICH OBJECT FAILED.
+	 *
+	 * Both EIO returns below used to be silent. `rm -rf` on a damaged
+	 * tree then produced dozens of "Input/output error" lines naming
+	 * paths, with NOTHING in dmesg and no counter moving — three separate
+	 * occurrences were observed and none could be diagnosed, because the
+	 * kernel never said which manifest it could not fetch or parse. By
+	 * the time the objects were identifiable they had been deleted.
+	 * An I/O error that names nothing is an I/O error you get to debug
+	 * exactly once, badly.
+	 */
 	if (tessera_fs_fetch_blob(tmp_, ino->manifest_hash,
 	    &blob, &blob_len) != 0) {
+		tessera_stat_content_fetch_eio++;
+		if (tessera_eio_should_log())
+			printf("tessera_fs: read_full_content: manifest "
+			    "%02x%02x%02x%02x%02x%02x%02x%02x.. UNFETCHABLE "
+			    "(logical size %ju) -> EIO\n",
+			    ino->manifest_hash[0], ino->manifest_hash[1],
+			    ino->manifest_hash[2], ino->manifest_hash[3],
+			    ino->manifest_hash[4], ino->manifest_hash[5],
+			    ino->manifest_hash[6], ino->manifest_hash[7],
+			    (uintmax_t)ino->size);
 		free(buf, M_TESSERA);
 		return (EIO);
 	}
 	tessera_manifest_parser_t *p = tessera_manifest_parse(blob, blob_len);
 	if (p == NULL) {
+		tessera_stat_content_parse_eio++;
+		if (tessera_eio_should_log())
+			printf("tessera_fs: read_full_content: manifest "
+			    "%02x%02x%02x%02x%02x%02x%02x%02x.. fetched %u "
+			    "bytes but WILL NOT PARSE -> EIO\n",
+			    ino->manifest_hash[0], ino->manifest_hash[1],
+			    ino->manifest_hash[2], ino->manifest_hash[3],
+			    ino->manifest_hash[4], ino->manifest_hash[5],
+			    ino->manifest_hash[6], ino->manifest_hash[7],
+			    blob_len);
 		free(blob, M_TESSERA);
 		free(buf, M_TESSERA);
 		return (EIO);
