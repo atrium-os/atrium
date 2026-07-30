@@ -405,6 +405,11 @@ static unsigned long tessera_stat_gc_aborts      = 0;
  * pinning unreclaimable multi-blob packs (#81). Set to 5 and confirm
  * gc_last_ms / gc_backoff_ms actually move before trusting it. */
 static int tessera_gc_duty_pct = 0;	/* OFF: unverified, see the commit */
+/* Data-zone free-space threshold, in percent, below which the tombstone GC
+ * arms. 12 preserves the historical hardcoded _zone/8. Raising it makes GC
+ * fight for space sooner; setting it high forces the GC path on ANY volume,
+ * which is what makes that path testable at all. */
+static int tessera_gc_pressure_pct = 12;
 static unsigned long tessera_stat_gc_last_ms    = 0;
 static unsigned long tessera_stat_gc_backoff_ms = 0;
 static unsigned long tessera_stat_gc_touch_keeps = 0;
@@ -672,6 +677,11 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_scans, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_scan_ms, CTLFLAG_RD,
     &tessera_stat_gc_scan_ms, 0,
     "Cumulative ms spent in the ungated GC scan (NOT gate-held)");
+SYSCTL_INT(_kern_tessera, OID_AUTO, gc_pressure_pct, CTLFLAG_RW,
+    &tessera_gc_pressure_pct, 0,
+    "Arm the tombstone GC when data-zone free space falls below this percent "
+    "(default 12 = the historical hardcoded 12.5%). Set high to force the GC "
+    "path on any volume for testing");
 SYSCTL_INT(_kern_tessera, OID_AUTO, gc_duty_pct, CTLFLAG_RW,
     &tessera_gc_duty_pct, 0,
     "Target data-zone GC duty cycle in percent (#99): after an unproductive "
@@ -11721,7 +11731,18 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 		uint64_t _free = tmp_->extent_alloc != NULL
 		    ? tessera_extent_free_blocks(tmp_->extent_alloc) : 0;
 		uint64_t _zone = tmp_->sb.pack_zone_length;
-		int _tight = (_zone > 0 && _free < _zone / 8);  /* <12.5% */
+		/* ★ The pressure threshold is a KNOB, not a constant. It was
+		 * hardcoded at _zone/8 (12.5%), which made the GC path
+		 * untestable except by guessing a fill percentage — three
+		 * attempts in a row missed it (48% free: never armed; 13.3%
+		 * free: still above 12.5%, never armed). It is also the one
+		 * number that decides how eagerly GC fights for space, so it
+		 * belongs to the operator. */
+		int _pct = tessera_gc_pressure_pct;
+		if (_pct < 1) _pct = 1;
+		if (_pct > 99) _pct = 99;
+		int _tight = (_zone > 0 &&
+		    _free < (uint64_t)((_zone / 100) * (uint64_t)_pct));
 		int _now = (int)ticks;
 		int _elapsed = _now - tmp_->last_tombstone_gc_ticks;
 		/*
