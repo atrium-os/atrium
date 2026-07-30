@@ -13806,6 +13806,10 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 	uint32_t gc_damaged_count = 0;
 	tessera_hash_t gc_abort_hash;
 	memset(gc_abort_hash, 0, sizeof(gc_abort_hash));
+	/* ★ #102: retained snapshots this cycle could not enumerate. Nonzero
+	 * => the live set is incomplete => reclaim nothing, but keep walking
+	 * so all of them get reported. */
+	uint32_t gc_snap_stale_seen = 0;
 #define _GC_ABORT(_site, _st) do {                                        \
 	gc_walk_abort = 1;                                                \
 	if (gc_abort_site == NULL) {                                      \
@@ -13895,6 +13899,33 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 					tessera_btree_cursor_t *_probe =
 					    tessera_btree_seek_first(snap_inode);
 					if (_probe == NULL) {
+						/*
+						 * ★ #102: DO NOT abort here, and
+						 * DO NOT retire this generation.
+						 *
+						 * Abort stops at the FIRST stale
+						 * snapshot, so an operator sees
+						 * one and never learns there are
+						 * eight. Retiring on this evidence
+						 * is worse: an earlier attempt did
+						 * exactly that, reclaimed 41392
+						 * packs, and took fsck from CLEAN
+						 * to a dangling blob — "the kmod
+						 * cannot read it" proves two
+						 * readers disagree, not that the
+						 * data is bad.
+						 *
+						 * So: note it, keep enumerating so
+						 * every stale generation is
+						 * reported, and suppress reclaim
+						 * for this cycle below. Same
+						 * safety as the abort (an
+						 * unenumerable snapshot means an
+						 * unknown live set, so NOTHING is
+						 * provably dead), strictly better
+						 * diagnostics, and no mutation.
+						 */
+						gc_snap_stale_seen++;
 						tessera_stat_gc_snap_stale++;
 						printf("tessera_fs: gc — "
 						    "snapshot gen %ju claims "
@@ -13905,9 +13936,10 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 						    "dump that sector)\n",
 						    (uintmax_t)srec.generation,
 						    (uintmax_t)srec.inode_root);
-					} else {
-						tessera_btree_cursor_free(_probe);
+						tessera_btree_close(snap_inode);
+						goto snap_next;
 					}
+					tessera_btree_cursor_free(_probe);
 				}
 				/* A retained snapshot we cannot open/enumerate
 				 * means an unknown live set — abort rather than
@@ -13928,6 +13960,8 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 					    srec.generation;
 				snap_count++;
 			}
+snap_next:
+			;
 			int _sqrc = tessera_btree_cursor_next(sc);
 			if (_sqrc != TESSERA_OK) {
 				if (_sqrc != TESSERA_ENOENT)
@@ -13940,6 +13974,21 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 			printf("tessera_fs: gc pass1 — %u retained snapshots "
 			    "unionised; %u total live hashes\n",
 			    snap_count, live_count);
+		/*
+		 * ★ #102: now that EVERY snapshot has been visited and each
+		 * stale one reported, suppress reclaim for this cycle. An
+		 * unenumerable snapshot means an unknown live set, so nothing
+		 * is provably dead — identical safety to the old abort, but
+		 * the operator now sees all N stale generations instead of
+		 * only the first, and no snapshot has been mutated.
+		 */
+		if (gc_snap_stale_seen > 0) {
+			printf("tessera_fs: gc — %u retained snapshot(s) could "
+			    "not be enumerated; live set incomplete, reclaiming "
+			    "NOTHING this cycle (see kern.tessera.gc_snap_stale)"
+			    "\n", gc_snap_stale_seen);
+			_GC_ABORT("snapshot-stale", 0);
+		}
 	}
 	/*
 	 * If any committed-tree or snapshot walk hit a read/corruption error
