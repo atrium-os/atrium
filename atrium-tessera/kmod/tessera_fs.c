@@ -2346,6 +2346,10 @@ static unsigned long tessera_stat_journal_log_replays = 0;
  * pinned by the live tree that now owns them; skipping keeps the scan alive
  * (an abort here used to starve meta_free -> reserve exhaustion). */
 static unsigned long tessera_stat_pinscan_stale_snap = 0;
+/* ★ #102: scans that skipped a retained snapshot and therefore unioned the
+ * previous pin bitmap rather than replacing it. Nonzero means reclaim is
+ * being deliberately delayed to avoid unpinning something still live. */
+static unsigned long tessera_stat_pinscan_incomplete = 0;
 static int tessera_fs_journal_log_drain(struct tessera_mount *tmp_);
 static void tessera_fs_flush_gate_enter(struct tessera_mount *tmp_);
 static void tessera_fs_flush_gate_exit(struct tessera_mount *tmp_);
@@ -12133,6 +12137,10 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	struct meta_mark_ctx mctx = { scratch, mstart, mstart + mlen,
 	    &tmp_->pinscan_abort, complete, 0, 0 };
 	int aborted = 0;
+	/* ★ #102: did we fail to walk some retained snapshot this scan? If so
+	 * the resulting bitmap is INCOMPLETE and must not be allowed to unpin
+	 * anything — see the union at swap time. */
+	int stale_skipped = 0;
 
 	struct { uint64_t root; int kind; uint32_t ksz; uint32_t vsz; } roots[8] = {
 		{ r_inode, 0, 4, TESSERA_INODE_RECORD_SIZE },
@@ -12215,6 +12223,7 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 						break;
 					}
 					tessera_stat_pinscan_stale_snap++;
+					stale_skipped = 1;
 					break;  /* skip this snapshot's other trees */
 				}
 			}
@@ -12300,6 +12309,35 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	}
 	tmp_->meta_scanwin_count = 0;
 
+	/*
+	 * ★ #102: AN INCOMPLETE SCAN MAY OVER-PIN, NEVER UNDER-PIN.
+	 *
+	 * The skip above was justified as "benign: any recycled sector is
+	 * already pinned by the live tree that now owns it". That holds only
+	 * if the snapshot's root really was recycled. If its tree is INTACT
+	 * and the walk merely failed — a transient read error, a partial walk
+	 * — then skipping leaves that snapshot's sectors unmarked here, the
+	 * swap installs a bitmap missing those pins, the synthesis below frees
+	 * them, and they get recycled. At which point the snapshot IS
+	 * unreadable and the next scan skips it again for real.
+	 *
+	 * So a transient failure became permanent damage, and the skip was
+	 * self-fulfilling. That is the mechanism behind #102: snapshot records
+	 * whose inode_root sector now holds a blob-index node, on volumes with
+	 * no crash history.
+	 *
+	 * Fix: when any snapshot was skipped, OR the previous bitmap into this
+	 * one before installing. Pins can then only GROW on an incomplete
+	 * scan. Over-pinning is safe everywhere in this file (it only delays
+	 * reclaim); under-pinning frees live data. A later COMPLETE scan
+	 * installs an exact bitmap and reclaims whatever this one over-kept,
+	 * so the cost is bounded and self-correcting.
+	 */
+	if (stale_skipped && tmp_->meta_pin_bitmap != NULL) {
+		for (size_t _i = 0; _i < bitmap_bytes; _i++)
+			scratch[_i] |= tmp_->meta_pin_bitmap[_i];
+		tessera_stat_pinscan_incomplete++;
+	}
 	free(tmp_->meta_pin_bitmap, M_TESSERA);
 	tmp_->meta_pin_bitmap = scratch;
 	tmp_->meta_free_count = 0;
@@ -20920,6 +20958,11 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_log_records,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_log_replays,
     CTLFLAG_RD, &tessera_stat_journal_log_replays, 0,
     "Cumulative dirent log records re-applied during mount-time replay");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_incomplete,
+    CTLFLAG_RD, &tessera_stat_pinscan_incomplete, 0,
+    "Pinscans that skipped a retained snapshot and so UNIONED the previous "
+    "pin bitmap instead of replacing it — an incomplete scan may over-pin, "
+    "never under-pin (#102)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_stale_snap,
     CTLFLAG_RD, &tessera_stat_pinscan_stale_snap, 0,
     "Cumulative retained-snapshot roots the pin-bitmap scan found recycled and skipped");
