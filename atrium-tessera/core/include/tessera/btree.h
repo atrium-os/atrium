@@ -87,6 +87,33 @@ void tessera_btree_close(tessera_btree_t *);
  * an expected, benign miss rather than corruption. */
 void tessera_btree_set_quiet_kind_mismatch(tessera_btree_t *t, int quiet);
 
+/*
+ * ★ #102: why the most recent node load failed.
+ *
+ * load_node collapsed three conditions into ECORRUPT, so a caller could not
+ * distinguish a transient read failure from positive evidence that a sector
+ * had been recycled. KIND is that evidence: the sector holds a VALID btree
+ * node belonging to a different tree, which can only happen if it was freed
+ * and reused. A retained snapshot root reporting KIND is genuinely gone; one
+ * reporting IO may be perfectly fine and merely unreadable this instant.
+ *
+ * That difference decides whether reclaiming what the snapshot referenced is
+ * safe. Acting without it retired healthy snapshots and produced a dangling
+ * blob, so treat IO/HEADER as "unknown, do nothing".
+ */
+typedef enum {
+	TESSERA_BTREE_FAIL_NONE   = 0,
+	TESSERA_BTREE_FAIL_IO     = 1,	/* device read failed */
+	TESSERA_BTREE_FAIL_HEADER = 2,	/* not a btree node (magic/CRC) */
+	TESSERA_BTREE_FAIL_KIND   = 3,	/* valid node of ANOTHER tree */
+} tessera_btree_fail_t;
+
+/* out_sector / out_found_kind may be NULL. found_kind is meaningful only for
+ * TESSERA_BTREE_FAIL_KIND. */
+tessera_btree_fail_t tessera_btree_last_fail(const tessera_btree_t *t,
+                                            uint64_t *out_sector,
+                                            uint8_t *out_found_kind);
+
 /* Visitor: called once per on-disk node sector (root + every internal
  * + every leaf), pre-order. Return non-zero to abort the walk. */
 typedef int (*tessera_btree_node_visitor_t)(void *ctx, uint64_t sector);

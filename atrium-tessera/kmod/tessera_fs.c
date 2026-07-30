@@ -420,6 +420,13 @@ static unsigned long tessera_stat_gc_last_reclaimed      = 0;
  * Each one aborts the whole GC cycle today, so a nonzero value here explains a
  * volume where nothing is ever reclaimed. */
 static unsigned long tessera_stat_gc_snap_stale          = 0;
+/* ★ #102: the stale count split by WHY the probe failed. KIND is proof the
+ * root was recycled (snapshot genuinely destroyed); IO/HEADER are "we could
+ * not read it", which is not evidence about the data. Reclaim acts on
+ * neither yet — these exist to measure which one real volumes actually hit. */
+static unsigned long tessera_stat_gc_snap_stale_kind     = 0;
+static unsigned long tessera_stat_gc_snap_stale_header   = 0;
+static unsigned long tessera_stat_gc_snap_stale_io       = 0;
 static unsigned long tessera_stat_gc_productive_passes   = 0;
 static unsigned long tessera_stat_gc_productive_ms       = 0;
 static unsigned long tessera_stat_gc_unproductive_passes = 0;
@@ -705,6 +712,15 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_last_ms, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_last_reclaimed, CTLFLAG_RD,
     &tessera_stat_gc_last_reclaimed, 0,
     "Packs reclaimed by the most recent GC pass (#81)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_snap_stale_kind, CTLFLAG_RD,
+    &tessera_stat_gc_snap_stale_kind, 0,
+    "stale retained snapshots whose root sector provably holds another tree");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_snap_stale_header, CTLFLAG_RD,
+    &tessera_stat_gc_snap_stale_header, 0,
+    "stale retained snapshots whose root sector is not a btree node");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_snap_stale_io, CTLFLAG_RD,
+    &tessera_stat_gc_snap_stale_io, 0,
+    "stale retained snapshots whose root sector could not be read");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_snap_stale, CTLFLAG_RD,
     &tessera_stat_gc_snap_stale, 0,
     "Retained snapshots whose inode_root sector no longer holds an inode tree "
@@ -13927,15 +13943,59 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 						 */
 						gc_snap_stale_seen++;
 						tessera_stat_gc_snap_stale++;
-						printf("tessera_fs: gc — "
-						    "snapshot gen %ju claims "
-						    "inode_root sector %ju, "
-						    "which does not hold an "
-						    "inode tree (record "
-						    "outlived its roots; "
-						    "dump that sector)\n",
+						/*
+						 * ★ #102: WHY the probe failed decides
+						 * whether this is recoverable evidence or
+						 * noise, so record the class rather than
+						 * just the fact.
+						 *
+						 * KIND means the sector holds a VALID btree
+						 * node of a different tree — the root was
+						 * freed and reused, so the snapshot really
+						 * is gone. IO/HEADER mean we simply could
+						 * not read it, which says nothing about the
+						 * contents.
+						 *
+						 * Reclaim stays OFF for BOTH: knowing a
+						 * snapshot is destroyed still does not tell
+						 * us which blobs only it referenced. This
+						 * counter exists to answer that question
+						 * with data from real volumes before any
+						 * code acts on it — the last time reclaim
+						 * ran on a guess it cost a dangling blob.
+						 */
+						uint64_t _fs = 0;
+						uint8_t _fk = 0;
+						tessera_btree_fail_t _f =
+						    tessera_btree_last_fail(snap_inode,
+						    &_fs, &_fk);
+						const char *_fname;
+						switch (_f) {
+						case TESSERA_BTREE_FAIL_KIND:
+							_fname = "RECYCLED (sector now holds "
+							    "another tree)";
+							tessera_stat_gc_snap_stale_kind++;
+							break;
+						case TESSERA_BTREE_FAIL_HEADER:
+							_fname = "NOT-A-NODE (bad magic/CRC)";
+							tessera_stat_gc_snap_stale_header++;
+							break;
+						case TESSERA_BTREE_FAIL_IO:
+							_fname = "UNREADABLE (device read "
+							    "failed)";
+							tessera_stat_gc_snap_stale_io++;
+							break;
+						default:
+							_fname = "unknown";
+							break;
+						}
+						printf("tessera_fs: gc — snapshot gen %ju "
+						    "claims inode_root sector %ju: %s"
+						    " (failed at sector %ju, found "
+						    "tree_kind=%u)\n",
 						    (uintmax_t)srec.generation,
-						    (uintmax_t)srec.inode_root);
+						    (uintmax_t)srec.inode_root, _fname,
+						    (uintmax_t)_fs, (unsigned)_fk);
 						tessera_btree_close(snap_inode);
 						goto snap_next;
 					}

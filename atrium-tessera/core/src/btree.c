@@ -54,6 +54,25 @@ struct tessera_btree {
 	 * to a live tree under create+retire churn — a benign, expected miss,
 	 * not corruption. Off for every ordinary (live-tree) handle. */
 	uint8_t             quiet_kind_mismatch;
+	/*
+	 * ★ #102: why the last load_node failed. Three very different
+	 * conditions used to collapse into ECORRUPT, and a caller could not
+	 * tell them apart:
+	 *
+	 *   IO      the device read failed — transient, says nothing about
+	 *           the contents
+	 *   HEADER  the sector is not a btree node at all (bad magic/CRC)
+	 *   KIND    it IS a valid btree node, of a DIFFERENT tree — which is
+	 *           positive proof the sector was freed and reused
+	 *
+	 * The GC needs KIND specifically: it means a retained snapshot's root
+	 * is genuinely gone, not merely unreadable this instant. Acting on the
+	 * undifferentiated failure retired healthy snapshots and lost data
+	 * once already, so the distinction is load-bearing, not cosmetic.
+	 */
+	uint8_t             last_fail;          /* tessera_btree_fail_t */
+	uint8_t             last_fail_found_kind;
+	uint64_t            last_fail_sector;
 	uint32_t            key_size;
 	uint32_t            value_size;
 	uint32_t            leaf_fanout;       /* max entries in a leaf */
@@ -111,21 +130,42 @@ read_header(const uint8_t *block, tessera_btree_node_header_t *h)
 }
 
 static int
-load_node(const tessera_btree_t *t, uint64_t sector, uint8_t *block)
+load_node(tessera_btree_t *t, uint64_t sector, uint8_t *block)
 {
 	int r = t->io.read_block(t->io.ctx, sector, block);
-	if (r != 0) return TESSERA_EIO;
+	if (r != 0) {
+		t->last_fail = TESSERA_BTREE_FAIL_IO;
+		t->last_fail_sector = sector;
+		return TESSERA_EIO;
+	}
 	tessera_btree_node_header_t h;
-	if (read_header(block, &h) != TESSERA_OK)
+	if (read_header(block, &h) != TESSERA_OK) {
+		t->last_fail = TESSERA_BTREE_FAIL_HEADER;
+		t->last_fail_sector = sector;
 		return TESSERA_ECORRUPT;
+	}
 	if (h.tree_kind != t->tree_kind) {
 		if (!t->quiet_kind_mismatch)
 			tessera_debugf("btree load_node: sector %llu kind=%u "
 			    "expected=%u\n", (unsigned long long)sector,
 			    (unsigned)h.tree_kind, (unsigned)t->tree_kind);
+		t->last_fail = TESSERA_BTREE_FAIL_KIND;
+		t->last_fail_found_kind = h.tree_kind;
+		t->last_fail_sector = sector;
 		return TESSERA_ECORRUPT;
 	}
+	t->last_fail = TESSERA_BTREE_FAIL_NONE;
 	return TESSERA_OK;
+}
+
+tessera_btree_fail_t
+tessera_btree_last_fail(const tessera_btree_t *t, uint64_t *out_sector,
+                        uint8_t *out_found_kind)
+{
+	if (t == NULL) return TESSERA_BTREE_FAIL_NONE;
+	if (out_sector != NULL) *out_sector = t->last_fail_sector;
+	if (out_found_kind != NULL) *out_found_kind = t->last_fail_found_kind;
+	return (tessera_btree_fail_t)t->last_fail;
 }
 
 static int
@@ -1142,7 +1182,7 @@ struct tessera_btree_cursor {
 static int
 descend_to_leftmost(tessera_btree_cursor_t *c, uint64_t start)
 {
-	const tessera_btree_t *t = c->t;
+	tessera_btree_t *t = c->t;
 	uint64_t cur = start;
 	for (;;) {
 		if (c->depth >= (int)MAX_DEPTH) return TESSERA_ECORRUPT;
@@ -1228,7 +1268,7 @@ tessera_btree_cursor_get(tessera_btree_cursor_t *c, void *out_key,
 {
 	if (c == NULL) return TESSERA_EINVAL;
 	if (!c->valid) return TESSERA_ENOENT;
-	const tessera_btree_t *t = c->t;
+	tessera_btree_t *t = c->t;
 	uint8_t *leaf = c->path_blocks[c->depth - 1];
 	const uint32_t es = leaf_entry_size(t);
 	const uint32_t i  = c->path_indices[c->depth - 1];
@@ -1243,7 +1283,7 @@ tessera_btree_cursor_next(tessera_btree_cursor_t *c)
 {
 	if (c == NULL) return TESSERA_EINVAL;
 	if (!c->valid) return TESSERA_ENOENT;
-	const tessera_btree_t *t = c->t;
+	tessera_btree_t *t = c->t;
 
 	/* Try advancing within the current leaf. */
 	tessera_btree_node_header_t h;
