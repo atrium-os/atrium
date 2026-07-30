@@ -415,6 +415,11 @@ static unsigned long tessera_stat_gc_backoff_ms = 0;
 /* ★ #81 follow-up (a): the cost/benefit curve for choosing gc_pressure_pct.
  * Productive = the pass freed at least one pack. */
 static unsigned long tessera_stat_gc_last_reclaimed      = 0;
+/* ★ #102: retained snapshots whose recorded inode_root does not hold an inode
+ * tree — the record outlived the sectors, which were recycled to another tree.
+ * Each one aborts the whole GC cycle today, so a nonzero value here explains a
+ * volume where nothing is ever reclaimed. */
+static unsigned long tessera_stat_gc_snap_stale          = 0;
 static unsigned long tessera_stat_gc_productive_passes   = 0;
 static unsigned long tessera_stat_gc_productive_ms       = 0;
 static unsigned long tessera_stat_gc_unproductive_passes = 0;
@@ -700,6 +705,10 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_last_ms, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_last_reclaimed, CTLFLAG_RD,
     &tessera_stat_gc_last_reclaimed, 0,
     "Packs reclaimed by the most recent GC pass (#81)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_snap_stale, CTLFLAG_RD,
+    &tessera_stat_gc_snap_stale, 0,
+    "Retained snapshots whose inode_root sector no longer holds an inode tree "
+    "(record outlived its roots) — each aborts a GC cycle (#102)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_productive_passes, CTLFLAG_RD,
     &tessera_stat_gc_productive_passes, 0,
     "GC passes that freed at least one pack (#81)");
@@ -13833,6 +13842,35 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 				        srec.inode_root, /*tree_kind*/ 0,
 				        /*key*/ 4,
 				        /*value*/ TESSERA_INODE_RECORD_SIZE);
+				/*
+				 * ★ #102 diagnostic (read-only): name the exact
+				 * sector so it can be dumped offline. The GC can
+				 * seek only 1 of 15 snapshot inode trees that
+				 * tessera-fsck reads without trouble, and until
+				 * we know WHICH field differs at that sector
+				 * every fix is a guess. Do not act on this — the
+				 * previous attempt to treat "unseekable" as
+				 * "damaged" retired 7 healthy snapshots and lost
+				 * data.
+				 */
+				if (snap_inode != NULL) {
+					tessera_btree_cursor_t *_probe =
+					    tessera_btree_seek_first(snap_inode);
+					if (_probe == NULL) {
+						tessera_stat_gc_snap_stale++;
+						printf("tessera_fs: gc — "
+						    "snapshot gen %ju claims "
+						    "inode_root sector %ju, "
+						    "which does not hold an "
+						    "inode tree (record "
+						    "outlived its roots; "
+						    "dump that sector)\n",
+						    (uintmax_t)srec.generation,
+						    (uintmax_t)srec.inode_root);
+					} else {
+						tessera_btree_cursor_free(_probe);
+					}
+				}
 				/* A retained snapshot we cannot open/enumerate
 				 * means an unknown live set — abort rather than
 				 * reclaim on a partial union. */
