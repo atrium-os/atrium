@@ -13,6 +13,10 @@
  */
 
 #include "b3_compat.h"
+#if defined(TESSERA_KERNEL) && defined(BLAKE3_USE_NEON) && BLAKE3_USE_NEON
+#include <sys/proc.h>		/* curthread */
+#include <machine/vfp.h>	/* fpu_kern_enter/leave (#94) */
+#endif
 #include "b3_blake3.h"
 #include "b3_blake3_impl.h"
 
@@ -69,7 +73,63 @@ blake3_simd_degree(void)
 	return (MAX_SIMD_DEGREE);
 }
 
-/* One-shot 256-bit BLAKE3 of a contiguous buffer. */
+/*
+ * One-shot 256-bit BLAKE3 of a contiguous buffer.
+ *
+ * ★ #94: when the NEON backend is compiled into the KERNEL, the update is
+ * SLICED — one fpu_kern_enter/leave per TESSERA_B3_FPU_SLICE of input —
+ * rather than one region around the whole blob.
+ *
+ * Why slicing rather than one big region: FPU_KERN_NOCTX regions are
+ * NON-PREEMPTIBLE, and Atrium has hard real-time deadline lanes (lyrad's
+ * audio quantum is 2.67 ms at 48 kHz / 128 frames). At the MEASURED 1.9x
+ * NEON rate an unsliced 1 MiB blob is ~486 us of non-preemptible time —
+ * ~18% of that quantum, which is not acceptable for a filesystem read. A
+ * 64 KiB slice is ~32 us, which is.
+ *
+ * Why slicing is CORRECT: BLAKE3's incremental state lives in the hasher
+ * struct in ordinary memory, not in FPU registers, so dropping and
+ * re-taking the FPU between updates cannot lose state. Verified the strong
+ * way rather than argued — digests are byte-identical to the portable
+ * backend at 4/64/128/1024 KiB (#89), and a faster-but-different hash would
+ * silently rewrite every content address in the store.
+ *
+ * Why it cannot sleep: FPU_KERN_NOCTX forbids sleeping, and the region here
+ * contains only blake3_hasher_update over an already-resident kernel buffer
+ * — no allocation, no locks, no faults. The hazard is excluded by the shape
+ * of the call, not by an audit that could rot.
+ *
+ * fpu_kern_enter+leave measured at 31 ns/pair, i.e. 0.05% of a 64 KiB hash
+ * (#89), so the slicing overhead is noise. That measurement is also what
+ * refuted the original "NEON would need fpu_kern_enter around every hash"
+ * objection: the cost was never the problem, the region length was.
+ */
+#if defined(TESSERA_KERNEL) && defined(BLAKE3_USE_NEON) && BLAKE3_USE_NEON
+#define TESSERA_B3_FPU_SLICE	(64u * 1024u)
+
+void
+tessera_blake3_256(const uint8_t *data, size_t len, tessera_hash_t out)
+{
+	blake3_hasher hasher;
+	size_t off = 0;
+
+	blake3_hasher_init(&hasher);
+	while (off < len) {
+		size_t n = len - off;
+
+		if (n > TESSERA_B3_FPU_SLICE)
+			n = TESSERA_B3_FPU_SLICE;
+		fpu_kern_enter(curthread, NULL, FPU_KERN_NORMAL | FPU_KERN_NOCTX);
+		blake3_hasher_update(&hasher, data + off, n);
+		(void)fpu_kern_leave(curthread, NULL);
+		off += n;
+	}
+	/* finalize touches the same SIMD compression path */
+	fpu_kern_enter(curthread, NULL, FPU_KERN_NORMAL | FPU_KERN_NOCTX);
+	blake3_hasher_finalize(&hasher, out, TESSERA_HASH_SIZE);
+	(void)fpu_kern_leave(curthread, NULL);
+}
+#else
 void
 tessera_blake3_256(const uint8_t *data, size_t len, tessera_hash_t out)
 {
@@ -79,3 +139,4 @@ tessera_blake3_256(const uint8_t *data, size_t len, tessera_hash_t out)
 	blake3_hasher_update(&hasher, data, len);
 	blake3_hasher_finalize(&hasher, out, TESSERA_HASH_SIZE);
 }
+#endif
