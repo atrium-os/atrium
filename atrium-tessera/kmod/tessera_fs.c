@@ -1057,6 +1057,12 @@ static unsigned long tessera_stat_chunk_zero_hole     = 0;
 /* Lookup-path integrity failures (inode read / dir-manifest fetch)
  * surfaced as EIO — previously silently laundered to ENOENT. */
 static unsigned long tessera_stat_lookup_eio           = 0;
+/* ★ #101: inode-record reads that failed UNGATED while a checkpoint was
+ * moving the tree, and were retried under the gate instead of being reported
+ * as EIO. A nonzero value here with lookup_eio still 0 is the race being
+ * absorbed; lookup_eio rising means a failure survived the gated retry and
+ * is genuinely an I/O error. */
+static unsigned long tessera_stat_lookup_eio_retry     = 0;
 /* ★ #100: EIO returned because a manifest could not be fetched / parsed.
  * Separated because they mean different things: UNFETCHABLE is a missing or
  * unreadable blob, WILL NOT PARSE is a blob that came back but is not a
@@ -1139,6 +1145,10 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, content_fetch_eio, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, content_parse_eio, CTLFLAG_RD,
     &tessera_stat_content_parse_eio, 0,
     "EIO from read_full_content: manifest blob fetched but unparseable (#100)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_eio_retry, CTLFLAG_RD,
+    &tessera_stat_lookup_eio_retry, 0,
+    "Inode-record reads that failed ungated during a checkpoint and were "
+    "retried under the gate rather than returned as EIO (#101)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_eio, CTLFLAG_RD,
     &tessera_stat_lookup_eio, 0,
     "Lookup-path inode/manifest fetch failures surfaced as EIO");
@@ -5794,8 +5804,42 @@ lookup_restart:
 		 * gen. */
 		if (dn->snapshot_gen != 0)
 			{ if (_lk_gated) tessera_fs_flush_gate_exit(tmp_); return (ENOENT); }
+		/*
+		 * ★ #101: retry a FAILED inode-record read under the gate,
+		 * exactly as the null-manifest branch below already does.
+		 *
+		 * Both branches are the same race: an UNGATED reader walking
+		 * the inode btree while a checkpoint moves it. The
+		 * null-manifest case ("stale record read just as a checkpoint
+		 * published the first real manifest") was given a ckpt_gen
+		 * retry; this sibling — the read failing outright — was not,
+		 * so a transient race surfaced as a hard EIO.
+		 *
+		 * Observed: `rm -rf` of a previous objdir during a buildkernel
+		 * dogfood failed on 3 directories out of ~40k with
+		 * Input/output error, lookup_eio counted exactly 3, and every
+		 * affected entry stat'ed and read back FINE immediately
+		 * afterwards. fsck reported CLEAN — correctly, because there
+		 * is no on-disk damage: the dirents and inode records were
+		 * always consistent. The failure was purely in the read
+		 * timing, and reporting EIO for it made a recoverable race
+		 * look like media damage.
+		 *
+		 * Bounded to one retry: _lk_gated is set before the jump, and
+		 * the guard requires !_lk_gated, so the gated pass is
+		 * authoritative — serialized against checkpoints. If it still
+		 * fails there, the EIO is real and gets reported.
+		 */
+		if (_lk_live && !_lk_gated && atomic_load_acq_64(
+		    __DEVOLATILE(uint64_t *, &tmp_->ckpt_gen)) != _lk_gen) {
+			tessera_stat_lookup_eio_retry++;
+			_lk_gated = 1;
+			tessera_fs_flush_gate_enter(tmp_);
+			goto lookup_restart;
+		}
 		tessera_stat_lookup_eio++;
-		printf("tessera_fs: lookup: inode %u read failed (rc=%d)\n",
+		printf("tessera_fs: lookup: inode %u read failed (rc=%d) "
+		    "AFTER a gated retry — this one is real\n",
 		    (unsigned)dn->inode_no, igrc);
 		{ if (_lk_gated) tessera_fs_flush_gate_exit(tmp_); return (EIO); }
 	}
