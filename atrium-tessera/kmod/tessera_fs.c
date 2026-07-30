@@ -412,6 +412,13 @@ static int tessera_gc_duty_pct = 0;	/* OFF: unverified, see the commit */
 static int tessera_gc_pressure_pct = 12;
 static unsigned long tessera_stat_gc_last_ms    = 0;
 static unsigned long tessera_stat_gc_backoff_ms = 0;
+/* ★ #81 follow-up (a): the cost/benefit curve for choosing gc_pressure_pct.
+ * Productive = the pass freed at least one pack. */
+static unsigned long tessera_stat_gc_last_reclaimed      = 0;
+static unsigned long tessera_stat_gc_productive_passes   = 0;
+static unsigned long tessera_stat_gc_productive_ms       = 0;
+static unsigned long tessera_stat_gc_unproductive_passes = 0;
+static unsigned long tessera_stat_gc_unproductive_ms     = 0;
 static unsigned long tessera_stat_gc_touch_keeps = 0;
 static unsigned long tessera_stat_gc_reclaimed   = 0;
 static unsigned long tessera_stat_gc_lost_subtrees = 0;
@@ -689,7 +696,24 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, gc_duty_pct, CTLFLAG_RW,
     "fixed doubling-to-60s backoff");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_last_ms, CTLFLAG_RD,
     &tessera_stat_gc_last_ms, 0,
-    "Duration of the most recent unproductive GC pass, ms (#99)");
+    "Duration of the most recent GC pass, ms — ANY outcome (#81)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_last_reclaimed, CTLFLAG_RD,
+    &tessera_stat_gc_last_reclaimed, 0,
+    "Packs reclaimed by the most recent GC pass (#81)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_productive_passes, CTLFLAG_RD,
+    &tessera_stat_gc_productive_passes, 0,
+    "GC passes that freed at least one pack (#81)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_productive_ms, CTLFLAG_RD,
+    &tessera_stat_gc_productive_ms, 0,
+    "Cumulative ms in productive GC passes — divide gc_reclaimed by this "
+    "for the reclaim rate (#81)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_unproductive_passes, CTLFLAG_RD,
+    &tessera_stat_gc_unproductive_passes, 0,
+    "GC passes that freed nothing (#81)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_unproductive_ms, CTLFLAG_RD,
+    &tessera_stat_gc_unproductive_ms, 0,
+    "Cumulative ms in GC passes that freed nothing — this over the total is "
+    "the waste fraction a gc_pressure_pct choice should minimise (#81)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_backoff_ms, CTLFLAG_RD,
     &tessera_stat_gc_backoff_ms, 0,
     "Quiet period the duty bound imposed after it, ms (#99)");
@@ -14554,8 +14578,36 @@ tessera_fs_gc_task(void *ctx, int pending)
 	tessera_stat_gc_scans++;
 	t0 = TPROF_T0();
 	n = tessera_fs_gc_data_zone_ex(tmp_, &scan);
-	tessera_stat_gc_scan_ms +=
+	/*
+	 * ★ #81 follow-up (a): price EVERY pass, split by whether it freed
+	 * anything.
+	 *
+	 * gc_scan_ms was cumulative-over-all-passes and gc_last_ms was set
+	 * ONLY on the unproductive branch (#99), so the cost of a pass that
+	 * actually reclaims — the number you need to decide how eagerly GC
+	 * should run — was not recorded anywhere. That gap is why the
+	 * gc_pressure_pct default could not be chosen on evidence: raising
+	 * it trades steady background I/O for avoiding the near-full cliff,
+	 * and neither side of that trade was measurable.
+	 *
+	 * With the split: reclaim rate = gc_reclaimed / gc_productive_ms,
+	 * and waste = gc_unproductive_ms / (productive + unproductive). A
+	 * threshold that mostly produces unproductive passes is too eager;
+	 * one that leaves a large fully-dead pool (see tessera-fsck's space
+	 * note) is too lazy.
+	 */
+	unsigned long _gc_ms =
 	    (unsigned long)(sbttons(sbinuptime() - t0) / 1000000);
+	tessera_stat_gc_scan_ms += _gc_ms;
+	tessera_stat_gc_last_ms = _gc_ms;		/* ANY outcome now */
+	tessera_stat_gc_last_reclaimed = (unsigned long)(n > 0 ? n : 0);
+	if (n > 0) {
+		tessera_stat_gc_productive_passes++;
+		tessera_stat_gc_productive_ms += _gc_ms;
+	} else {
+		tessera_stat_gc_unproductive_passes++;
+		tessera_stat_gc_unproductive_ms += _gc_ms;
+	}
 	tessera_fs_gc_scan_end(tmp_, &scan);
 
 	/* Same productivity backoff as before: a pass that reclaims nothing
@@ -14595,8 +14647,7 @@ tessera_fs_gc_task(void *ctx, int pending)
 		if (nb < hz / 2) nb = hz / 2;	/* floor, as before */
 		if (nb > 3600 * hz) nb = 3600 * hz;
 		tmp_->tombstone_gc_backoff = nb;
-		tessera_stat_gc_last_ms =
-		    (unsigned long)((sbinuptime() - t0) / SBT_1MS);
+		/* gc_last_ms is set for every pass above now (#81 follow-up). */
 		tessera_stat_gc_backoff_ms =
 		    (unsigned long)((uint64_t)nb * 1000 / hz);
 	}
