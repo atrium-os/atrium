@@ -56,6 +56,12 @@ struct Fsck {
     notes: Vec<String>,
     // every blob hash present in any (single-extent) pack
     all_blobs: HashSet<Hash>,
+    // ★ #81: every blob REACHED by the reachability walk (current tree +
+    // every retained snapshot). all_blobs minus this is dead space.
+    live_blobs: HashSet<Hash>,
+    // per pack: (id, sectors occupied, [(blob hash, blob bytes)]) — kept so
+    // deadness can be attributed to packs AFTER the live set is known.
+    pack_space: Vec<(String, u64, Vec<(Hash, u32)>)>,
     // blob bytes for those that parse as a manifest (for recursion)
     manifests: HashMap<Hash, Vec<u8>>,
     // manifests already reachability-checked (dedup + cycle guard)
@@ -145,6 +151,9 @@ impl Fsck {
             self.problem(format!("{ctx}: references blob {} which is in no pack (dangling)", hx(hash)));
             return;
         }
+        // ★ #81: reached => live. Recorded for BOTH manifests and leaf/chunk
+        // blobs; the early return below skips the recursion, not the liveness.
+        self.live_blobs.insert(*hash);
         if !as_manifest {
             return; // chunk/leaf blob: existence is enough
         }
@@ -406,6 +415,8 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
         problems: Vec::new(),
         notes: Vec::new(),
         all_blobs: HashSet::new(),
+        live_blobs: HashSet::new(),
+        pack_space: Vec::new(),
         manifests: HashMap::new(),
         checked: HashSet::new(),
         inode_map: HashMap::new(),
@@ -521,6 +532,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
                         if n != blob_count {
                             fsck.problem(format!("pack {pid}: registry blob_count={blob_count} but pack holds {n}"));
                         }
+                        let mut this_pack: Vec<(Hash, u32)> = Vec::new();
                         for i in 0..n {
                             let mut bh = [0u8; 32];
                             if tessera_pack_blob_hash_at(pr, i, bh.as_mut_ptr()) == 0 {
@@ -544,10 +556,15 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
                                         fsck.manifests.insert(bh, slice.to_vec());
                                         tessera_manifest_parser_free(mp);
                                     }
+                                    this_pack.push((bh, blen));
                                 }
                             }
                         }
                         tessera_pack_close(pr);
+                        // ★ #81: sectors this pack occupies (data extents +
+                        // any PEL sectors), paired with its blob sizes.
+                        let secs: u64 = occ.iter().map(|(s, e, _)| e - s).sum();
+                        fsck.pack_space.push((pid.clone(), secs, this_pack));
                     }
                 }
                 if tessera_btree_cursor_next(cur) != 0 { break; }
@@ -752,6 +769,59 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
             fsck.problem(format!("orphan inode {o} (not reachable from the root dir)"));
         }
         fsck.orphans = orphans.clone();
+
+        // ── ★ #81: how much space would COMPACTION actually recover? ──
+        //
+        // #81's committed fix (6cc3734) frees a pack only when EVERY blob in
+        // it is dead. Its own caveat 2 notes that with ~62-blob aggregation
+        // the odds of that are ~0.85^62, so the real prize is packs that MIX
+        // live and dead blobs — recoverable only by rewriting the survivors
+        // into a new pack. Nobody had measured how big that prize is, so the
+        // compactor could not be justified or dismissed. This measures it.
+        //
+        // Read-only, and it reuses two things the walk already produced: the
+        // set of blobs actually reached (current tree UNIONED with every
+        // retained snapshot — so snapshot-pinned data counts as LIVE, which
+        // is correct: GC must not free it and compaction cannot either), and
+        // each pack's blob sizes.
+        {
+            let mut fully_dead = (0u64, 0u64);   // (packs, sectors)
+            let mut fully_live = (0u64, 0u64);
+            let mut mixed = (0u64, 0u64);        // (packs, sectors)
+            let mut mixed_dead_bytes = 0u64;
+            let mut mixed_live_bytes = 0u64;
+            for (_pid, secs, blobs) in &fsck.pack_space {
+                if blobs.is_empty() { continue; }
+                let mut dead_b = 0u64;
+                let mut live_b = 0u64;
+                for (h, len) in blobs {
+                    if fsck.live_blobs.contains(h) { live_b += *len as u64; }
+                    else { dead_b += *len as u64; }
+                }
+                if dead_b == 0 { fully_live.0 += 1; fully_live.1 += secs; }
+                else if live_b == 0 { fully_dead.0 += 1; fully_dead.1 += secs; }
+                else {
+                    mixed.0 += 1; mixed.1 += secs;
+                    mixed_dead_bytes += dead_b;
+                    mixed_live_bytes += live_b;
+                }
+            }
+            let mib = |sectors: u64| sectors * SECTOR_SIZE / (1024 * 1024);
+            let bmib = |b: u64| b / (1024 * 1024);
+            fsck.notes.push(format!(
+                "space: {} packs fully live ({} MiB), {} fully dead ({} MiB, \
+                 reclaimable by GC today), {} MIXED ({} MiB holding {} MiB \
+                 dead + {} MiB live)",
+                fully_live.0, mib(fully_live.1),
+                fully_dead.0, mib(fully_dead.1),
+                mixed.0, mib(mixed.1), bmib(mixed_dead_bytes), bmib(mixed_live_bytes)));
+            if mixed.0 > 0 {
+                fsck.notes.push(format!(
+                    "space: COMPACTION would recover ~{} MiB by rewriting {} MiB \
+                     of survivors out of {} mixed packs (#81 caveat 2)",
+                    bmib(mixed_dead_bytes), bmib(mixed_live_bytes), mixed.0));
+            }
+        }
         // nlink verification: files = incoming dirent count; dirs = 2
         // (tessera stores no '.'/'..' and doesn't track '..' backlinks, so a
         // directory's nlink is fixed at 2 = parent's entry + implicit '.').
