@@ -117,6 +117,28 @@ struct Fsck {
     snapshot_inodes: u64,
 }
 
+/// `tessera_errno_t` value for a clean end-of-iteration.
+const TESSERA_ENOENT: i32 = -6;
+
+/// Render a `tessera_btree_last_fail` class for an operator (★ #102).
+///
+/// The distinction is not cosmetic. KIND means the sector holds a valid btree
+/// node of another tree, so it was freed and reused and the snapshot rooted
+/// there is destroyed — no amount of retrying recovers it. IO means only that
+/// this run could not read it, which may well be transient. Reporting both as
+/// "damaged" would invite retiring snapshots that are perfectly fine.
+fn describe_fail(f: i32, sector: u64, found_kind: u8) -> String {
+    match f {
+        btree_fail::KIND => format!(
+            "sector {sector} now holds a tree of kind {found_kind}, so it was recycled — this snapshot is destroyed, not merely unreadable"),
+        btree_fail::HEADER => format!(
+            "sector {sector} is not a btree node (bad magic or CRC)"),
+        btree_fail::IO => format!(
+            "sector {sector} could not be read — this may be transient, so do NOT retire the snapshot on this evidence alone"),
+        _ => "unknown reason".to_string(),
+    }
+}
+
 /// Cap on problems recorded per snapshot: one damaged shared manifest can be
 /// referenced by thousands of inodes, and the repair (retire the snapshot) is
 /// identical whether it is 1 or 10,000. Keep the report readable.
@@ -658,11 +680,28 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
                 fsck.problem("could not open snapshots tree".into());
             } else {
                 let sc = tessera_btree_seek_first(st);
+                // ★ #102: NULL here is either "no snapshots" or "the
+                // snapshots tree root is unreadable". Treating the second as
+                // the first reports CLEAN on a volume whose entire snapshot
+                // history is gone.
+                if sc.is_null() {
+                    let mut fs: u64 = 0;
+                    let mut fk: u8 = 0;
+                    let f = tessera_btree_last_fail(st, &mut fs, &mut fk);
+                    if f != btree_fail::NONE {
+                        fsck.problem(format!(
+                            "snapshots tree at sector {snapshots_root} could not be enumerated ({}) — retained snapshots were NOT checked",
+                            describe_fail(f, fs, fk)));
+                    }
+                }
                 while !sc.is_null() {
                     let mut skey = [0u8; 8];
                     let mut sval = [0u8; TESSERA_SNAPSHOT_RECORD_SIZE as usize];
                     if tessera_btree_cursor_get(sc, skey.as_mut_ptr(),
-                        sval.as_mut_ptr()) != 0 { break; }
+                        sval.as_mut_ptr()) != 0 {
+                        fsck.problem("snapshots tree enumeration failed part-way — remaining snapshots were NOT checked".into());
+                        break;
+                    }
                     let snap_gen = rd_u64(&sval, 0);
                     let snap_inode_root = rd_u64(&sval, 16);
                     fsck.snapshots += 1;
@@ -686,12 +725,34 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
                                     "inode tree could not be opened".into());
                             } else {
                                 let ic = tessera_btree_seek_first(sit);
+                                // ★ #102 — THE silent skip. btree_open does
+                                // not read the root, so `sit` is non-null even
+                                // when the sector was recycled; seek_first is
+                                // where that surfaces, as NULL. The old code
+                                // then just fell through this loop, walking
+                                // zero inodes and recording nothing, so a
+                                // volume with destroyed snapshot roots read
+                                // CLEAN. The kmod's GC saw the same sectors
+                                // and reported them, and the disagreement was
+                                // read as the GC being wrong.
+                                if ic.is_null() {
+                                    let mut fs: u64 = 0;
+                                    let mut fk: u8 = 0;
+                                    let f = tessera_btree_last_fail(
+                                        sit, &mut fs, &mut fk);
+                                    if f != btree_fail::NONE {
+                                        fsck.problem(format!(
+                                            "inode_root sector {snap_inode_root} no longer holds this snapshot's inode tree ({}) — its contents are unrecoverable",
+                                            describe_fail(f, fs, fk)));
+                                    }
+                                }
                                 while !ic.is_null() {
                                     let mut k = [0u8; 4];
                                     let mut val =
                                         [0u8; TESSERA_INODE_RECORD_SIZE as usize];
                                     if tessera_btree_cursor_get(ic,
                                         k.as_mut_ptr(), val.as_mut_ptr()) != 0 {
+                                        fsck.problem("inode tree enumeration failed part-way — the rest of this snapshot was NOT checked".into());
                                         break;
                                     }
                                     fsck.snapshot_inodes += 1;
@@ -705,7 +766,13 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
                                         &format!("inode {ino}"), 0);
                                     fsck.reach(&xattr, false,
                                         &format!("inode {ino} xattr"), 0);
-                                    if tessera_btree_cursor_next(ic) != 0 { break; }
+                                    let nrc = tessera_btree_cursor_next(ic);
+                                    if nrc == TESSERA_ENOENT { break; }
+                                    if nrc != 0 {
+                                        fsck.problem(format!(
+                                            "inode tree enumeration aborted (rc {nrc}) — the rest of this snapshot was NOT checked"));
+                                        break;
+                                    }
                                 }
                                 if !ic.is_null() { tessera_btree_cursor_free(ic); }
                                 tessera_btree_close(sit);
@@ -718,7 +785,15 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
                             }
                         }
                     }
-                    if tessera_btree_cursor_next(sc) != 0 { break; }
+                // ENOENT is the ONLY clean end of iteration; any other
+                // status truncated the walk (★ #102).
+                let nrc = tessera_btree_cursor_next(sc);
+                    if nrc == TESSERA_ENOENT { break; }
+                    if nrc != 0 {
+                        fsck.problem(format!(
+                            "snapshots tree enumeration aborted (rc {nrc}) — remaining snapshots were NOT checked"));
+                        break;
+                    }
                 }
                 if !sc.is_null() { tessera_btree_cursor_free(sc); }
                 tessera_btree_close(st);
@@ -808,6 +883,14 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
             }
             let mib = |sectors: u64| sectors * SECTOR_SIZE / (1024 * 1024);
             let bmib = |b: u64| b / (1024 * 1024);
+            // ★ #102: the DIRECT comparison against the kmod's pass-1 line
+            // ("gc pass1 — N live hashes"). If these two live-set sizes
+            // disagree, the components disagree about liveness itself; if
+            // they match, the disagreement is in pack-level accounting.
+            fsck.notes.push(format!(
+                "space: live set = {} of {} blobs reachable (compare with the \
+                 kmod's 'gc pass1 — N live hashes')",
+                fsck.live_blobs.len(), fsck.all_blobs.len()));
             fsck.notes.push(format!(
                 "space: {} packs fully live ({} MiB), {} fully dead ({} MiB, \
                  reclaimable by GC today), {} MIXED ({} MiB holding {} MiB \

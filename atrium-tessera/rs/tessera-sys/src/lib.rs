@@ -152,6 +152,15 @@ extern "C" {
     pub fn tessera_btree_cursor_next(c: *mut tessera_btree_cursor_t) -> c_int;
     pub fn tessera_btree_cursor_free(c: *mut tessera_btree_cursor_t);
 
+    /* ★ #102: why the most recent node load failed. seek_first() returns
+     * NULL both for "the tree is empty" and for "the root sector is not
+     * this tree any more", and those need opposite handling: the first is
+     * normal, the second is a destroyed snapshot that fsck must report.
+     * See TesseraBtreeFail. */
+    pub fn tessera_btree_last_fail(t: *const tessera_btree_t,
+                                    out_sector: *mut u64,
+                                    out_found_kind: *mut u8) -> c_int;
+
     /* Visit every node sector of the tree (internal + leaf). Used by
      * tessera-repack to compute the live node-set before compacting. */
     pub fn tessera_btree_walk_nodes(t: *mut tessera_btree_t,
@@ -440,4 +449,17 @@ extern "C" {
     pub fn tessera_volume_quota_tree_root    (v: *const tessera_volume_t) -> u64;
     pub fn tessera_volume_next_inode_no      (v: *const tessera_volume_t) -> u64;
     pub fn tessera_volume_blob_index_root    (v: *const tessera_volume_t) -> u64;
+}
+
+/// Reason the most recent `tessera_btree` node load failed (★ #102).
+///
+/// `KIND` is the load-bearing one: the sector holds a VALID btree node of a
+/// DIFFERENT tree, which can only happen if it was freed and reused. For a
+/// retained snapshot's root that means the snapshot is destroyed, not merely
+/// unreadable.
+pub mod btree_fail {
+    pub const NONE: i32 = 0;
+    pub const IO: i32 = 1;
+    pub const HEADER: i32 = 2;
+    pub const KIND: i32 = 3;
 }
