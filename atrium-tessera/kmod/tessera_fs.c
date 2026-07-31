@@ -690,6 +690,29 @@ static unsigned long tessera_stat_verify_fail     = 0;
  * report the damage (kern.tessera.gc_lost_subtrees) without acting on it.
  */
 static int tessera_gc_retire_damaged = 1;
+/*
+ * ★ #102: retire a retained snapshot whose inode_root sector is PROVABLY
+ * recycled (TESSERA_BTREE_FAIL_KIND — the sector holds a well-formed node of
+ * a different tree, which only a free-and-reuse can produce).
+ *
+ * Why this unblocks anything: an unenumerable retained snapshot makes the
+ * live set incomplete, so nothing is provably dead and reclaim is suppressed
+ * forever. Retiring the record removes it from the retained set; the next
+ * cycle computes a complete live set and reclaims normally. There is no way
+ * to reclaim "past" such a snapshot without first resolving it.
+ *
+ * Why it is safe: the snapshot is already destroyed — its tree cannot be read
+ * by anyone, now or later. Retiring discards an unreadable record, not data.
+ * tessera-fsck --repair has made exactly this judgement offline since 61a28cd
+ * and leaves the volume CLEAN.
+ *
+ * Why it defaults to 0 anyway: it mutates the snapshot set from the GC's
+ * abort path, and the last time snapshot retirement acted on weaker evidence
+ * it reclaimed 41392 packs and produced a dangling blob. The evidence is
+ * stronger now; the default stays off until it has run on real volumes.
+ * IO/HEADER never reach here — only KIND is condemned.
+ */
+static int tessera_gc_retire_recycled = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_scans, CTLFLAG_RD,
     &tessera_stat_gc_scans, 0,
     "Data-zone GC scans started (ungated, on gc_tq)");
@@ -753,6 +776,12 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_snapshots_retired, CTLFLAG_RD,
     &tessera_stat_gc_snapshots_retired, 0,
     "Retained snapshots auto-retired by GC because their trees "
     "reference blobs that are in no pack (task #86)");
+SYSCTL_INT(_kern_tessera, OID_AUTO, gc_retire_recycled, CTLFLAG_RW,
+    &tessera_gc_retire_recycled, 0,
+    "1 = retire retained snapshots whose inode_root sector is provably "
+    "recycled (#102), which is what lets reclaim resume on such a volume; "
+    "0 (default) = report them and reclaim nothing. Never acts on a merely "
+    "unreadable root — only on a sector proven to hold another tree.");
 SYSCTL_INT(_kern_tessera, OID_AUTO, gc_retire_damaged, CTLFLAG_RW,
     &tessera_gc_retire_damaged, 0,
     "Auto-retire retained snapshots proven unreadable by the GC walk "
@@ -13984,8 +14013,8 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 					    tessera_btree_seek_first(snap_inode);
 					if (_probe == NULL) {
 						/*
-						 * ★ #102: DO NOT abort here, and
-						 * DO NOT retire this generation.
+						 * ★ #102: do not abort here, and
+						 * retire ONLY on proof (KIND).
 						 *
 						 * Abort stops at the FIRST stale
 						 * snapshot, so an operator sees
@@ -14064,6 +14093,42 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 						    (uintmax_t)srec.generation,
 						    (uintmax_t)srec.inode_root, _fname,
 						    (uintmax_t)_fs, (unsigned)_fk);
+						/*
+						 * ★ #102: KIND — and ONLY kind — condemns
+						 * the snapshot to the existing #86 retire
+						 * list.
+						 *
+						 * The sector holds a well-formed node of a
+						 * DIFFERENT tree, which cannot happen unless
+						 * it was freed and reused. The snapshot is
+						 * therefore already destroyed: retiring it
+						 * discards a record that can never be read
+						 * again, not data. tessera-fsck --repair has
+						 * made exactly this judgement offline since
+						 * 61a28cd, verified to leave the volume
+						 * CLEAN; this is the same call made online.
+						 *
+						 * IO/HEADER deliberately do NOT retire. They
+						 * mean "this reader failed", which a healthy
+						 * snapshot can also produce. Acting on the
+						 * undifferentiated failure is what cost 41392
+						 * packs and a dangling blob before the reason
+						 * code existed.
+						 *
+						 * Reclaim is still suppressed for THIS cycle
+						 * regardless (gc_snap_stale_seen > 0 below):
+						 * the live set was computed while this
+						 * snapshot still counted. The retire takes
+						 * effect next cycle, which then sees a
+						 * complete snapshot set and reclaims
+						 * normally. That is what unblocks reclaim on
+						 * a volume carrying a recycled root.
+						 */
+						if (_f == TESSERA_BTREE_FAIL_KIND &&
+						    gc_damaged_count <
+						    TESSERA_GC_MAX_RETIRE)
+							gc_damaged_gens[gc_damaged_count++] =
+							    srec.generation;
 						tessera_btree_close(snap_inode);
 						goto snap_next;
 					}
@@ -14113,8 +14178,10 @@ snap_next:
 		if (gc_snap_stale_seen > 0) {
 			printf("tessera_fs: gc — %u retained snapshot(s) could "
 			    "not be enumerated; live set incomplete, reclaiming "
-			    "NOTHING this cycle (see kern.tessera.gc_snap_stale)"
-			    "\n", gc_snap_stale_seen);
+			    "NOTHING this cycle (see kern.tessera.gc_snap_stale;"
+			    " %u provably recycled and queued for retire, the"
+			    " rest merely unreadable and left alone)\n",
+			    gc_snap_stale_seen, gc_damaged_count);
 			_GC_ABORT("snapshot-stale", 0);
 		}
 	}
@@ -14156,6 +14223,52 @@ snap_next:
 			    gc_abort_hash[4], gc_abort_hash[5],
 			    gc_abort_hash[6], gc_abort_hash[7]);
 		tessera_stat_gc_aborts++;
+		/*
+		 * ★ #102: this early return is the ONLY exit taken when a
+		 * retained snapshot's root was recycled, so the retire block
+		 * in pass 3 is never reached and such a volume could never
+		 * reclaim again. Resolve the condemned generations here.
+		 *
+		 * Gated: retire mutates the snapshots tree and the SB, exactly
+		 * as the pass-3 retire does inside the apply gate. Pass 1 runs
+		 * ungated, so take the gate explicitly. The GC has its own
+		 * taskqueue, which is what makes taking it here safe — see the
+		 * shared-taskqueue gate wedge (896de97).
+		 *
+		 * Still no reclaim this cycle: the live set was computed while
+		 * these snapshots counted. The next cycle sees a complete set.
+		 */
+		if (gc_damaged_count > 0 && tessera_gc_retire_recycled) {
+			uint32_t _rr = 0;
+			tessera_fs_flush_gate_enter(tmp_);
+			for (uint32_t i = 0; i < gc_damaged_count; i++) {
+				if (tessera_fs_snapshot_retire_gen(tmp_,
+				    gc_damaged_gens[i])) {
+					_rr++;
+					printf("tessera_fs: gc RETIRED "
+					    "snapshot generation %ju — its "
+					    "inode_root sector was provably "
+					    "recycled; the snapshot was "
+					    "already unreadable\n",
+					    (uintmax_t)gc_damaged_gens[i]);
+				}
+			}
+			if (_rr > 0) {
+				tmp_->sb_dirty = 1;
+				tessera_meta_pin_bitmap_rebuild(tmp_);
+				tessera_stat_gc_snapshots_retired += _rr;
+				tessera_stat_snapshots_retired += _rr;
+			}
+			tessera_fs_flush_gate_exit(tmp_);
+			printf("tessera_fs: gc — %u recycled snapshot(s) "
+			    "retired; reclaim can resume next cycle\n", _rr);
+		} else if (gc_damaged_count > 0) {
+			printf("tessera_fs: gc — %u snapshot(s) provably "
+			    "recycled but kern.tessera.gc_retire_recycled=0; "
+			    "reclaim stays blocked until they are retired "
+			    "(tessera-fsck --repair does this offline)\n",
+			    gc_damaged_count);
+		}
 		free(live, M_TESSERA);
 		_GC_CLOSE_SCAN_TREES();
 		return (0);
