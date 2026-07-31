@@ -2366,6 +2366,13 @@ static unsigned long tessera_stat_pinscan_stale_snap = 0;
  * previous pin bitmap rather than replacing it. Nonzero means reclaim is
  * being deliberately delayed to avoid unpinning something still live. */
 static unsigned long tessera_stat_pinscan_incomplete = 0;
+/* ★ #102: pinscans that stopped enumerating retained snapshots for a reason
+ * OTHER than reaching the last one. Each such truncation used to install a
+ * bitmap asserting the unreached snapshots were unreferenced, which freed
+ * their roots and let the allocator overwrite them. Non-zero here is not
+ * fatal (the scan now unions instead of replacing) but it means reclaim is
+ * stalling and wants investigating. */
+static unsigned long tessera_stat_pinscan_trunc = 0;
 static int tessera_fs_journal_log_drain(struct tessera_mount *tmp_);
 static void tessera_fs_flush_gate_enter(struct tessera_mount *tmp_);
 static void tessera_fs_flush_gate_exit(struct tessera_mount *tmp_);
@@ -12190,18 +12197,62 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 		}
 		tessera_btree_close(t);
 	}
-	/* Every retained snapshot's three tree roots. */
+	/*
+	 * Every retained snapshot's three tree roots.
+	 *
+	 * ★ #102: EVERY way out of this enumeration that is not "reached the
+	 * last snapshot" must mark the scan incomplete. This is the bug that
+	 * recycled live snapshot roots.
+	 *
+	 * A pinscan's output is a bitmap of what is still referenced, and the
+	 * swap below REPLACES the old one. So a scan that silently stops
+	 * enumerating half-way does not merely learn less — it actively
+	 * asserts that every snapshot it never reached is unreferenced. Those
+	 * sectors are then synthesised into meta_free, handed out, and
+	 * overwritten. That is exactly the observed damage: retained snapshot
+	 * inode_roots now holding BLOB_INDEX nodes.
+	 *
+	 * Only ONE path used to set stale_skipped (the kind-mismatch walk
+	 * failure). A failed snapshots-tree open, a failed seek, a cursor
+	 * error, or a failed per-tree open all fell through with the flag
+	 * clear, and the truncated bitmap was installed as authoritative.
+	 *
+	 * Under-pinning is unrecoverable (the data is gone); over-pinning
+	 * merely delays reclaim. So every uncertainty resolves to incomplete.
+	 */
 	if (!aborted && r_snap != 0) {
 		tessera_btree_t *st = tessera_btree_open(&tmp_->meta_bio,
 		    r_snap, /*tree_kind*/ 3, /*key*/ 8,
 		    /*value*/ TESSERA_SNAPSHOT_RECORD_SIZE);
+		if (st == NULL) {
+			/* Cannot even open the snapshots tree: we know nothing
+			 * about any snapshot, so pin everything we knew before. */
+			tessera_stat_pinscan_trunc++;
+			stale_skipped = 1;
+		}
 		tessera_btree_cursor_t *sc = (st != NULL)
 		    ? tessera_btree_seek_first(st) : NULL;
+		if (st != NULL && sc == NULL &&
+		    tessera_btree_last_fail(st, NULL, NULL) !=
+		    TESSERA_BTREE_FAIL_NONE) {
+			/* NULL with a recorded load failure is a failed seek,
+			 * not an empty tree — the two are indistinguishable
+			 * without the #102 reason code, and guessing "empty"
+			 * here unpins every snapshot on the volume. */
+			tessera_stat_pinscan_trunc++;
+			stale_skipped = 1;
+		}
 		while (sc != NULL && !aborted && !tmp_->pinscan_abort) {
 			uint8_t sk[8];
 			tessera_snapshot_record_t srec;
 			if (tessera_btree_cursor_get(sc, sk, &srec)
-			    != TESSERA_OK) break;
+			    != TESSERA_OK) {
+				/* Mid-enumeration failure: the rest of the
+				 * snapshots are unexamined, not absent. */
+				tessera_stat_pinscan_trunc++;
+				stale_skipped = 1;
+				break;
+			}
 			struct { uint64_t root; int kind; uint32_t ksz;
 			    uint32_t vsz; } sr[3] = {
 				{ srec.inode_root, 0, 4,
@@ -12215,7 +12266,14 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 				tessera_btree_t *t = tessera_btree_open(
 				    &tmp_->meta_bio, sr[i].root, sr[i].kind,
 				    sr[i].ksz, sr[i].vsz);
-				if (t == NULL) continue;
+				if (t == NULL) {
+					/* ★ #102: an unopenable tree is one we
+					 * did not pin. `continue` here claimed
+					 * otherwise. */
+					tessera_stat_pinscan_trunc++;
+					stale_skipped = 1;
+					continue;
+				}
 				/* A retained snapshot's root can be recycled to a
 				 * live tree under create+retire churn — the walk
 				 * then reads a sector whose tree_kind no longer
@@ -12243,8 +12301,18 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 					break;  /* skip this snapshot's other trees */
 				}
 			}
-			if (tessera_btree_cursor_next(sc) != TESSERA_OK)
+			/* ★ #102: ENOENT is "reached the last snapshot" and is
+			 * the ONLY clean way out. Every other status left the
+			 * remaining snapshots unpinned while the scan still
+			 * counted as complete. */
+			int _nrc = tessera_btree_cursor_next(sc);
+			if (_nrc == TESSERA_ENOENT)
 				break;
+			if (_nrc != TESSERA_OK) {
+				tessera_stat_pinscan_trunc++;
+				stale_skipped = 1;
+				break;
+			}
 		}
 		if (sc != NULL) tessera_btree_cursor_free(sc);
 		if (st != NULL) tessera_btree_close(st);
@@ -21067,6 +21135,11 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_log_records,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_log_replays,
     CTLFLAG_RD, &tessera_stat_journal_log_replays, 0,
     "Cumulative dirent log records re-applied during mount-time replay");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_trunc,
+    CTLFLAG_RD, &tessera_stat_pinscan_trunc, 0,
+    "pinscan snapshot enumerations cut short by an error rather than by "
+    "reaching the last snapshot (#102) — each would have unpinned every "
+    "snapshot it never reached");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_incomplete,
     CTLFLAG_RD, &tessera_stat_pinscan_incomplete, 0,
     "Pinscans that skipped a retained snapshot and so UNIONED the previous "
