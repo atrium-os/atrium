@@ -2437,6 +2437,12 @@ static unsigned long tessera_stat_trace_events = 0;
  * scan simply could not have seen them. */
 static uint64_t tessera_pinscan_gen_at_start   = 0;
 static uint64_t tessera_pinscan_rsnap_at_start = 0;
+static unsigned long tessera_stat_pinscan_carried_cur  = 0;
+/* ★ #102 EFFECT COUNTER for the double-buffer. Bits the SECOND buffer
+ * contributed — the ones a single-buffer carry-forward would have dropped.
+ * Zero means the second buffer is inert and any improvement came from
+ * something else. */
+static unsigned long tessera_stat_pinscan_carried_prev = 0;
 static unsigned long tessera_stat_stolen_from_bump    = 0;
 static unsigned long tessera_stat_stolen_from_free    = 0;
 static unsigned long tessera_stat_stolen_src_unknown  = 0;
@@ -2700,6 +2706,26 @@ struct tessera_mount {
 	 * sector the trace happened to catch.
 	 */
 	uint8_t                  *meta_allocsrc_bm;
+	/*
+	 * ★ #102 FIX: sectors handed out from meta_free, double-buffered.
+	 *
+	 * A scan judges reachability from roots captured at its start, so it
+	 * cannot know about anything allocated afterwards — including the
+	 * root of a snapshot created after that capture. Such a root is also
+	 * below the watermark (allocating from the free list does not move
+	 * the bump), so both protections miss and the drain frees it.
+	 * Measured: 206 of 206 stolen roots came from meta_free, all born
+	 * after a capture.
+	 *
+	 * ONE buffer is not enough, which is how the first attempt failed.
+	 * The swap immediately after an allocation belongs to the very scan
+	 * that captured BEFORE it — clearing the mark there discards it
+	 * before any scan has observed the sector. Two buffers give the mark
+	 * a full extra swap of life, by which point a scan whose capture
+	 * postdates the allocation has run and can judge it on its merits.
+	 */
+	uint8_t                  *meta_recycled_bm;      /* this swap-interval */
+	uint8_t                  *meta_recycled_prev_bm; /* the one before */
 
 	/* v2-step-2a: deferred-commit state. See sysctl block above. */
 	int                       sb_dirty;
@@ -3723,6 +3749,13 @@ tessera_fs_meta_epoch_sweep(struct tessera_mount *tmp_)
  * delays reclaim; under-pinning destroys data — the invariant this file
  * states everywhere and this path quietly broke.
  */
+static inline unsigned _bitcount8(uint8_t v)
+{
+	unsigned c = 0;
+	while (v) { v &= (uint8_t)(v - 1); c++; }
+	return (c);
+}
+
 /* ★ #102: remember whether `s` came from the bump (1) or meta_free (0). */
 static void
 tessera_meta_allocsrc_set(struct tessera_mount *tmp_, uint64_t s, int from_bump)
@@ -3760,6 +3793,9 @@ tessera_meta_pin_mark_alloc(struct tessera_mount *tmp_, uint64_t s)
 		return;
 	uint64_t bit = s - mstart;
 	tmp_->meta_pin_bitmap[bit / 8] |= (uint8_t)(1u << (bit % 8));
+	/* ★ #102: and durably, so the next TWO swaps carry it. */
+	if (tmp_->meta_recycled_bm != NULL)
+		tmp_->meta_recycled_bm[bit / 8] |= (uint8_t)(1u << (bit % 8));
 }
 
 static int
@@ -4645,6 +4681,10 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		    M_WAITOK | M_ZERO);
 		tmp_->meta_allocsrc_bm = malloc(bitmap_bytes, M_TESSERA,
 		    M_WAITOK | M_ZERO);
+		tmp_->meta_recycled_bm = malloc(bitmap_bytes, M_TESSERA,
+		    M_WAITOK | M_ZERO);
+		tmp_->meta_recycled_prev_bm = malloc(bitmap_bytes, M_TESSERA,
+		    M_WAITOK | M_ZERO);
 		tessera_metatrace(TM_OP_BITMAP_BUILT, 0,
 		    tmp_->sb.generation, (uint32_t)bitmap_bytes);
 	}
@@ -5298,6 +5338,10 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 		if (tmp_->meta_pin_bitmap != NULL) free(tmp_->meta_pin_bitmap, M_TESSERA);
 		if (tmp_->meta_allocsrc_bm != NULL)
 			free(tmp_->meta_allocsrc_bm, M_TESSERA);
+		if (tmp_->meta_recycled_bm != NULL)
+			free(tmp_->meta_recycled_bm, M_TESSERA);
+		if (tmp_->meta_recycled_prev_bm != NULL)
+			free(tmp_->meta_recycled_prev_bm, M_TESSERA);
 		if (tmp_->meta_epoch_bm   != NULL) free(tmp_->meta_epoch_bm, M_TESSERA);
 		/* Drain any still-dirty buffers on devvp BEFORE detaching
 		 * the GEOM consumer. tessera_kbio_write_delayed uses
@@ -12866,6 +12910,47 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 		scratch[pend_bits[i] / 8] &=
 		    (uint8_t)~(1u << (pend_bits[i] % 8));
 	if (pend_bits != NULL) free(pend_bits, M_TESSERA);
+	/*
+	 * ★ #102 THE FIX: carry forward meta_free handouts from the last TWO
+	 * swap intervals, then rotate.
+	 *
+	 * PLACEMENT IS LOAD-BEARING — this must run AFTER the pend_bits
+	 * clearing above, not before it. Earlier in the swap, the pending
+	 * marks set these same bits temporarily so synthesis will skip them,
+	 * and then clear them again here. Running before that, every carried
+	 * bit read as already-present (carried_cur and carried_prev both 0)
+	 * and the clear then wiped it — the fix contributed literally
+	 * nothing. Both effect counters reading zero is what exposed it.
+	 *
+	 * `cur` covers allocations since the previous swap — this scan
+	 * captured before them, so it cannot have seen them. `prev` covers
+	 * the interval before that, whose sectors THIS scan's capture does
+	 * postdate; carrying them one more swap is what gives a scan a real
+	 * chance to observe them before the mark is dropped. Dropping after a
+	 * single swap is exactly the bug the first attempt shipped.
+	 *
+	 * carried_prev is the effect counter: if it stays zero the second
+	 * buffer is doing nothing and this fix is not what changed anything.
+	 */
+	if (tmp_->meta_recycled_bm != NULL &&
+	    tmp_->meta_recycled_prev_bm != NULL) {
+		unsigned long _cur = 0, _prv = 0;
+		for (size_t _i = 0; _i < bitmap_bytes; _i++) {
+			uint8_t _c = (uint8_t)(tmp_->meta_recycled_bm[_i]
+			    & ~scratch[_i]);
+			if (_c) { scratch[_i] |= _c; _cur += _bitcount8(_c); }
+			uint8_t _p = (uint8_t)(tmp_->meta_recycled_prev_bm[_i]
+			    & ~scratch[_i]);
+			if (_p) { scratch[_i] |= _p; _prv += _bitcount8(_p); }
+		}
+		tessera_stat_pinscan_carried_cur  += _cur;
+		tessera_stat_pinscan_carried_prev += _prv;
+		/* Rotate: this interval becomes the previous one. */
+		uint8_t *_t = tmp_->meta_recycled_prev_bm;
+		tmp_->meta_recycled_prev_bm = tmp_->meta_recycled_bm;
+		tmp_->meta_recycled_bm = _t;
+		memset(tmp_->meta_recycled_bm, 0, bitmap_bytes);
+	}
 	tmp_->pinscan_active = 0;
 	tessera_fs_flush_gate_exit(tmp_);
 	if (complete != NULL) free(complete, M_TESSERA);
@@ -21645,6 +21730,13 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_log_replays,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, epoch_frees_snaproot, CTLFLAG_RD,
     &tessera_stat_epoch_frees_snaproot, 0,
     "epoch sweeps that released a retained snapshot's inode_root (#102)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_carried_cur, CTLFLAG_RD,
+    &tessera_stat_pinscan_carried_cur, 0,
+    "sector bits carried across a swap from the current recycle interval");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_carried_prev, CTLFLAG_RD,
+    &tessera_stat_pinscan_carried_prev, 0,
+    "sector bits carried from the PREVIOUS recycle interval (#102 effect "
+    "counter: zero means the double-buffer is inert)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, stolen_from_bump, CTLFLAG_RD,
     &tessera_stat_stolen_from_bump, 0,
     "stolen snapshot roots last allocated from the BUMP (#102)");
