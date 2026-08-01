@@ -2414,6 +2414,9 @@ static unsigned long tessera_stat_drain_frees_snaproot = 0;
  * this is the switch that found the #102 root cause and stays available for
  * the next time the question is "who freed this sector". */
 static int tessera_drain_audit_snaproots = 0;
+/* ★ Companion to drain_frees_snaproot: releases by the EPOCH SWEEP, which
+ * consults neither the pin bitmap nor the watermark. */
+static unsigned long tessera_stat_epoch_frees_snaproot = 0;
 static int tessera_fs_journal_log_drain(struct tessera_mount *tmp_);
 static void tessera_fs_flush_gate_enter(struct tessera_mount *tmp_);
 static void tessera_fs_flush_gate_exit(struct tessera_mount *tmp_);
@@ -3379,7 +3382,12 @@ tessera_fs_meta_pending_drain(struct tessera_mount *tmp_)
 	 * we are about to release. No behaviour change — the release still
 	 * happens, so this run measures rather than masks.
 	 */
-	uint64_t _snaproots[64];
+	/* ★ 512, not 64: at snapshot_retention=400 a 64-entry cap silently
+	 * audited only the first 64 snapshots and reported ZERO hits while 12
+	 * snapshots were being destroyed — an instrumentation artifact that
+	 * looked exactly like an exoneration. If this ever truncates, say so. */
+	uint64_t _snaproots[512];
+	uint64_t _snapgens[512];
 	uint32_t _nsr = 0;
 	if (tessera_drain_audit_snaproots && tmp_->sb.snapshots_root != 0) {
 		tessera_btree_t *_st = tessera_btree_open(&tmp_->meta_bio,
@@ -3387,18 +3395,23 @@ tessera_fs_meta_pending_drain(struct tessera_mount *tmp_)
 		    TESSERA_SNAPSHOT_RECORD_SIZE);
 		tessera_btree_cursor_t *_sc = (_st != NULL)
 		    ? tessera_btree_seek_first(_st) : NULL;
-		while (_sc != NULL && _nsr < 64) {
+		while (_sc != NULL && _nsr < 512) {
 			uint8_t _k[8];
 			tessera_snapshot_record_t _r;
 			if (tessera_btree_cursor_get(_sc, _k, &_r)
 			    != TESSERA_OK) break;
-			if (_r.inode_root != 0)
+			if (_r.inode_root != 0) {
+				_snapgens[_nsr] = _r.generation;
 				_snaproots[_nsr++] = _r.inode_root;
+			}
 			if (tessera_btree_cursor_next(_sc) != TESSERA_OK)
 				break;
 		}
 		if (_sc != NULL) tessera_btree_cursor_free(_sc);
 		if (_st != NULL) tessera_btree_close(_st);
+		if (_nsr == 512)
+			printf("tessera_fs: drain audit TRUNCATED at 512 "
+			    "snapshots — results are NOT conclusive\n");
 	}
 	for (uint32_t i = 0; i < tmp_->meta_pending_count; i++) {
 		uint64_t s = tmp_->meta_pending[i];
@@ -3426,14 +3439,16 @@ tessera_fs_meta_pending_drain(struct tessera_mount *tmp_)
 			for (uint32_t _j = 0; _j < _nsr; _j++) {
 				if (_snaproots[_j] != s) continue;
 				tessera_stat_drain_frees_snaproot++;
-				printf("tessera_fs: DRAIN RELEASED sector "
-				    "%ju which is a RETAINED snapshot's "
-				    "inode_root (watermark %ju, bitmap "
-				    "%s) — this destroys that snapshot\n",
-				    (uintmax_t)s,
-				    (uintmax_t)tmp_->meta_pin_watermark,
-				    tmp_->meta_pin_bitmap ? "present"
-				    : "NULL");
+				/* Report the OWNING GENERATION so the residual
+				 * can be settled: if that generation no longer
+				 * exists afterwards it was retired and the
+				 * release was legitimate; if it survives still
+				 * pointing here, this is real damage. */
+				printf("tessera_fs: DRAIN RELEASED sector %ju "
+				    "= inode_root of snapshot gen %ju "
+				    "(watermark %ju)\n", (uintmax_t)s,
+				    (uintmax_t)_snapgens[_j],
+				    (uintmax_t)tmp_->meta_pin_watermark);
 				break;
 			}
 			tmp_->meta_free[tmp_->meta_free_count++] = s;
@@ -3511,6 +3526,41 @@ tessera_fs_meta_epoch_sweep(struct tessera_mount *tmp_)
 	uint32_t kept = 0, moved = 0;
 
 	tessera_stat_epoch_sweeps++;
+	/*
+	 * ★ Same audit as the drain (#102). The epoch sweep releases on the
+	 * epoch bitmap ALONE — it consults neither meta_pin_bitmap nor the
+	 * watermark — on the argument that a sector allocated AND freed inside
+	 * this uncommitted flush is nobody's. That fails if a snapshot record
+	 * created in the same flush roots at it. Under retention=400 the drain
+	 * audit went to ZERO while 11 snapshots still died, so this is the
+	 * only unaudited releaser left. Measure before believing it.
+	 */
+	uint64_t _esr[512];
+	uint64_t _esg[512];
+	uint32_t _ens = 0;
+	if (tessera_drain_audit_snaproots && tmp_->sb.snapshots_root != 0) {
+		tessera_btree_t *_t = tessera_btree_open(&tmp_->meta_bio,
+		    tmp_->sb.snapshots_root, 3, 8,
+		    TESSERA_SNAPSHOT_RECORD_SIZE);
+		tessera_btree_cursor_t *_c = (_t != NULL)
+		    ? tessera_btree_seek_first(_t) : NULL;
+		while (_c != NULL && _ens < 512) {
+			uint8_t _k[8];
+			tessera_snapshot_record_t _r;
+			if (tessera_btree_cursor_get(_c, _k, &_r) != TESSERA_OK)
+				break;
+			if (_r.inode_root != 0) {
+				_esg[_ens] = _r.generation;
+				_esr[_ens++] = _r.inode_root;
+			}
+			if (tessera_btree_cursor_next(_c) != TESSERA_OK) break;
+		}
+		if (_c != NULL) tessera_btree_cursor_free(_c);
+		if (_t != NULL) tessera_btree_close(_t);
+		if (_ens == 512)
+			printf("tessera_fs: epoch audit TRUNCATED at 512 "
+			    "snapshots — results are NOT conclusive\n");
+	}
 	for (uint32_t i = 0; i < tmp_->meta_pending_count; i++) {
 		uint64_t s = tmp_->meta_pending[i];
 		int epoch_new = 0;
@@ -3522,6 +3572,16 @@ tessera_fs_meta_epoch_sweep(struct tessera_mount *tmp_)
 			    tmp_->meta_free_count < tmp_->meta_free_cap) {
 				/* Clear the bit: it is no longer allocated. A
 				 * later re-allocation re-marks it. */
+				for (uint32_t _j = 0; _j < _ens; _j++) {
+					if (_esr[_j] != s) continue;
+					tessera_stat_epoch_frees_snaproot++;
+					printf("tessera_fs: EPOCH SWEEP "
+					    "RELEASED sector %ju = inode_root "
+					    "of snapshot gen %ju\n",
+					    (uintmax_t)s,
+					    (uintmax_t)_esg[_j]);
+					break;
+				}
 				tmp_->meta_epoch_bm[bit / 8] &=
 				    (uint8_t)~(1u << (bit % 8));
 				tmp_->meta_free[tmp_->meta_free_count++] = s;
@@ -21406,6 +21466,9 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_log_records,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_log_replays,
     CTLFLAG_RD, &tessera_stat_journal_log_replays, 0,
     "Cumulative dirent log records re-applied during mount-time replay");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, epoch_frees_snaproot, CTLFLAG_RD,
+    &tessera_stat_epoch_frees_snaproot, 0,
+    "epoch sweeps that released a retained snapshot's inode_root (#102)");
 SYSCTL_INT(_kern_tessera, OID_AUTO, drain_audit_snaproots, CTLFLAG_RW,
     &tessera_drain_audit_snaproots, 0,
     "1 = on every meta_pending drain, check each released sector against the "
