@@ -2443,6 +2443,12 @@ static unsigned long tessera_stat_pinscan_carried_cur  = 0;
  * Zero means the second buffer is inert and any improvement came from
  * something else. */
 static unsigned long tessera_stat_pinscan_carried_prev = 0;
+/* ★ pack-zone leak balance. alloc - rollback - (registry growth) should equal
+ * the leak fsck reports. Counters, no behaviour change. */
+static unsigned long tessera_stat_pack_alloc_calls      = 0;
+static unsigned long tessera_stat_pack_alloc_sectors    = 0;
+static unsigned long tessera_stat_pack_rollback_calls   = 0;
+static unsigned long tessera_stat_pack_rollback_sectors = 0;
 static unsigned long tessera_stat_stolen_from_bump    = 0;
 static unsigned long tessera_stat_stolen_from_free    = 0;
 static unsigned long tessera_stat_stolen_src_unknown  = 0;
@@ -15736,6 +15742,12 @@ tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 	int rc = tessera_fs_pack_alloc_and_write_impl(tmp_, pack_bytes,
 	    n_sectors, out, contig_only);
 	TPROF_ADD(TPROF_C_PACKW, _t0);
+	/* ★ pack-zone leak: the other half of the balance. Every success here
+	 * owns space that must end registered or rolled back. */
+	if (rc == 0) {
+		tessera_stat_pack_alloc_calls++;
+		tessera_stat_pack_alloc_sectors += n_sectors;
+	}
 	return (rc);
 }
 
@@ -16116,6 +16128,15 @@ static void
 tessera_fs_pack_alloc_rollback(struct tessera_mount *tmp_,
                                const struct tessera_pack_alloc_result *pa)
 {
+	/* ★ pack-zone leak: half of the balance. Every successful pack alloc
+	 * must end either registered or rolled back; a path that does
+	 * neither strands its extents in no structure at all, which is what
+	 * fsck reports as "neither allocated nor free". Measured +55 sectors
+	 * across one buildkernel -j4 and ZERO across five single-threaded
+	 * phases, so the missing path is one only concurrent publishers
+	 * reach. */
+	tessera_stat_pack_rollback_calls++;
+	tessera_stat_pack_rollback_sectors += pa->length_sectors;
 	if ((pa->flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) == 0) {
 		(void)tessera_extent_free(tmp_->extent_alloc,
 		    pa->start_sector, pa->length_sectors);
@@ -21737,6 +21758,14 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_carried_prev, CTLFLAG_RD,
     &tessera_stat_pinscan_carried_prev, 0,
     "sector bits carried from the PREVIOUS recycle interval (#102 effect "
     "counter: zero means the double-buffer is inert)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pack_alloc_calls, CTLFLAG_RD,
+    &tessera_stat_pack_alloc_calls, 0, "successful pack extent allocations");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pack_alloc_sectors, CTLFLAG_RD,
+    &tessera_stat_pack_alloc_sectors, 0, "sectors allocated for packs");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pack_rollback_calls, CTLFLAG_RD,
+    &tessera_stat_pack_rollback_calls, 0, "pack allocations rolled back");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pack_rollback_sectors, CTLFLAG_RD,
+    &tessera_stat_pack_rollback_sectors, 0, "sectors returned by rollback");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, stolen_from_bump, CTLFLAG_RD,
     &tessera_stat_stolen_from_bump, 0,
     "stolen snapshot roots last allocated from the BUMP (#102)");
