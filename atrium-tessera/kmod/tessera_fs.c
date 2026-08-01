@@ -2414,6 +2414,39 @@ static unsigned long tessera_stat_drain_frees_snaproot = 0;
  * this is the switch that found the #102 root cause and stays available for
  * the next time the question is "who freed this sector". */
 static int tessera_drain_audit_snaproots = 0;
+/*
+ * ★ #102 residual: follow ONE sector through its whole life.
+ *
+ * The remaining leak releases roots that sit just below the watermark with
+ * the bitmap unmarked, on very recent generations. Aggregate counters cannot
+ * distinguish the candidate orderings, and guessing has already cost a
+ * volume, so trace a single sector instead: latch the first one the drain
+ * audit flags, then log every allocation, free, pin and drain decision that
+ * touches it. The flags recur ~330x per run, so a latched sector is very
+ * likely to come round again with its full history recorded.
+ */
+static uint64_t tessera_trace_sector = 0;	/* 0 = not tracing */
+static int      tessera_trace_latch   = 0;	/* 1 = latch on first flag */
+static unsigned long tessera_stat_trace_events = 0;
+/* ★ #102 confirming probe: the SB generation and snapshots-tree root captured
+ * at the last pinscan's start, and the split of stolen roots by whether their
+ * snapshot was born before or after that capture. If "after" dominates, the
+ * scan simply could not have seen them. */
+static uint64_t tessera_pinscan_gen_at_start   = 0;
+static uint64_t tessera_pinscan_rsnap_at_start = 0;
+static unsigned long tessera_stat_stolen_born_after_capture  = 0;
+static unsigned long tessera_stat_stolen_born_before_capture = 0;
+
+/* Log one event for the traced sector. Deliberately unconditional printf —
+ * this runs only for a single hand-picked sector. */
+#define TSEC(_s, _fmt, ...)   do {                                        \
+	if (tessera_trace_sector != 0 && (uint64_t)(_s)                   \
+	    == tessera_trace_sector) {                                    \
+		tessera_stat_trace_events++;                              \
+		printf("tessera_fs: TRACE %ju " _fmt "\n",                \
+		    (uintmax_t)(_s), ##__VA_ARGS__);                      \
+	}                                                                 \
+} while (0)
 /* ★ Companion to drain_frees_snaproot: releases by the EPOCH SWEEP, which
  * consults neither the pin bitmap nor the watermark. */
 static unsigned long tessera_stat_epoch_frees_snaproot = 0;
@@ -3429,6 +3462,9 @@ tessera_fs_meta_pending_drain(struct tessera_mount *tmp_)
 				pinned = 1;
 			}
 		}
+		TSEC(s, "DRAIN decision pinned=%d (watermark=%ju bitmap=%s)",
+		    pinned, (uintmax_t)tmp_->meta_pin_watermark,
+		    tmp_->meta_pin_bitmap ? "present" : "NULL");
 		if (pinned) {
 			tmp_->meta_pending[kept++] = s;
 			tessera_stat_drain_keep++;
@@ -3436,9 +3472,24 @@ tessera_fs_meta_pending_drain(struct tessera_mount *tmp_)
 			    tmp_->sb.generation, kept);
 		} else if (tmp_->meta_free_count
 		    < tmp_->meta_free_cap) {
+			int _wasflag = 0;
 			for (uint32_t _j = 0; _j < _nsr; _j++) {
 				if (_snaproots[_j] != s) continue;
+				_wasflag = 1;
 				tessera_stat_drain_frees_snaproot++;
+				if (tessera_trace_latch &&
+				    tessera_trace_sector == 0) {
+					tessera_trace_sector = s;
+					printf("tessera_fs: TRACE LATCHED on "
+					    "sector %ju (snapshot gen %ju) — "
+					    "logging its full life from "
+					    "here\n", (uintmax_t)s,
+					    (uintmax_t)_snapgens[_j]);
+				}
+				if (_snapgens[_j] > tessera_pinscan_gen_at_start)
+					tessera_stat_stolen_born_after_capture++;
+				else
+					tessera_stat_stolen_born_before_capture++;
 				/* Report the OWNING GENERATION so the residual
 				 * can be settled: if that generation no longer
 				 * exists afterwards it was retired and the
@@ -3446,10 +3497,32 @@ tessera_fs_meta_pending_drain(struct tessera_mount *tmp_)
 				 * pointing here, this is real damage. */
 				printf("tessera_fs: DRAIN RELEASED sector %ju "
 				    "= inode_root of snapshot gen %ju "
-				    "(watermark %ju)\n", (uintmax_t)s,
+				    "(watermark %ju; last scan captured "
+				    "snapshots at gen %ju rsnap %ju -> born "
+				    "%s the capture)\n", (uintmax_t)s,
 				    (uintmax_t)_snapgens[_j],
-				    (uintmax_t)tmp_->meta_pin_watermark);
+				    (uintmax_t)tmp_->meta_pin_watermark,
+				    (uintmax_t)tessera_pinscan_gen_at_start,
+				    (uintmax_t)tessera_pinscan_rsnap_at_start,
+				    _snapgens[_j] > tessera_pinscan_gen_at_start
+				    ? "AFTER" : "BEFORE");
 				break;
+			}
+			/*
+			 * ★ ROTATE the trace. Most released sectors belong to
+			 * snapshots that were legitimately retired first, and
+			 * the first traced sector was exactly that — a healthy
+			 * life, no bug. Only a handful of snapshots per run
+			 * are actually damaged, so keep re-latching until the
+			 * traced sector is one the audit FLAGS. Then the log
+			 * holds the history of a sector that really was stolen.
+			 */
+			if (tessera_trace_sector == s && !_wasflag) {
+				tessera_trace_sector = 0;
+				printf("tessera_fs: TRACE %ju released "
+				    "legitimately (owner already retired) — "
+				    "re-latching on the next snapshot\n",
+				    (uintmax_t)s);
 			}
 			tmp_->meta_free[tmp_->meta_free_count++] = s;
 			tessera_stat_drain_release++;
@@ -3669,6 +3742,10 @@ tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 			    *out_sector;
 		tessera_meta_pin_mark_alloc(tmp_, *out_sector);
 		tessera_meta_epoch_mark(tmp_, *out_sector);
+		TSEC(*out_sector, "ALLOC reuse-from-meta_free gen=%ju "
+		    "pinscan_active=%d watermark=%ju",
+		    (uintmax_t)tmp_->sb.generation, tmp_->pinscan_active,
+		    (uintmax_t)tmp_->meta_pin_watermark);
 		tessera_metatrace(TM_OP_ALLOC_REUSE, *out_sector,
 		    tmp_->sb.generation, tmp_->meta_free_count);
 		return (0);
@@ -3693,6 +3770,10 @@ tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 				    tmp_->meta_scanwin_count++] = *out_sector;
 			tessera_meta_pin_mark_alloc(tmp_, *out_sector);
 			tessera_meta_epoch_mark(tmp_, *out_sector);
+			TSEC(*out_sector, "ALLOC reuse-after-epoch-sweep "
+			    "gen=%ju pinscan_active=%d",
+			    (uintmax_t)tmp_->sb.generation,
+			    tmp_->pinscan_active);
 			tessera_metatrace(TM_OP_ALLOC_REUSE, *out_sector,
 			    tmp_->sb.generation, tmp_->meta_free_count);
 			return (0);
@@ -3749,6 +3830,9 @@ tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 	}
 	*out_sector = tmp_->sb.meta_reserve_bump;
 	tmp_->sb.meta_reserve_bump += n;
+	TSEC(*out_sector, "ALLOC bump gen=%ju pinscan_active=%d watermark=%ju",
+	    (uintmax_t)tmp_->sb.generation, tmp_->pinscan_active,
+	    (uintmax_t)tmp_->meta_pin_watermark);
 	tessera_meta_epoch_mark(tmp_, *out_sector);
 	tessera_metatrace(TM_OP_ALLOC_BUMP, *out_sector,
 	    tmp_->sb.generation, (uint32_t)used + 1);
@@ -3768,6 +3852,7 @@ tessera_kbio_meta_free(void *ctx, uint64_t s, uint64_t n)
 	if (tmp_->meta_pending_count >= tmp_->meta_pending_cap)
 		return (-1);
 	tmp_->meta_pending[tmp_->meta_pending_count++] = s;
+	TSEC(s, "FREED->pending gen=%ju", (uintmax_t)tmp_->sb.generation);
 	tessera_metatrace(TM_OP_FREE_PUSH, s, tmp_->sb.generation,
 	    tmp_->meta_pending_count);
 	return (0);
@@ -7941,6 +8026,24 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 		srec.pack_registry_root = tmp_->sb.pack_registry_root;
 		srec.free_extent_root   = tmp_->sb.free_extent_root;
 		memcpy(srec.reason_tag, "auto", 4);
+		/*
+		 * ★ #102: latch the trace HERE, at snapshot birth, not on the
+		 * drain flag. Latching on the flag captured only the
+		 * aftermath — the sector sitting in meta_pending, correctly
+		 * pinned, forever. The window that matters is between a root
+		 * becoming a snapshot root and the drain deciding about it, so
+		 * start the trace at the moment the record is written.
+		 */
+		if (tessera_trace_latch && tessera_trace_sector == 0 &&
+		    srec.inode_root != 0) {
+			tessera_trace_sector = srec.inode_root;
+			printf("tessera_fs: TRACE LATCHED at snapshot birth: "
+			    "gen %ju inode_root sector %ju (watermark %ju, "
+			    "bump %ju)\n", (uintmax_t)srec.generation,
+			    (uintmax_t)srec.inode_root,
+			    (uintmax_t)tmp_->meta_pin_watermark,
+			    (uintmax_t)tmp_->sb.meta_reserve_bump);
+		}
 
 		uint8_t skey[8];
 		for (int i = 0; i < 8; i++)
@@ -12208,6 +12311,7 @@ tessera_fs_gc_now(struct tessera_mount *tmp_, uint64_t *out_reclaimed)
 static int
 meta_mark_visitor(void *ctx, uint64_t sector)
 {
+	TSEC(sector, "PINSCAN visited (walk marks it)");
 	{
 		struct meta_mark_ctx *_c = ctx;
 		if (_c->abort_flag != NULL && *_c->abort_flag)
@@ -12307,6 +12411,16 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	uint64_t r_fext  = tmp_->sb.free_extent_root;
 	uint64_t r_snap  = tmp_->sb.snapshots_root;
 	uint64_t r_bidx  = tmp_->sb.blob_index_root;
+	/*
+	 * ★ #102 CONFIRMING PROBE. The scan enumerates the snapshots tree as
+	 * it was AT THIS INSTANT. A snapshot created after this capture is not
+	 * in r_snap, so this scan never marks its root — and if that root is a
+	 * recycled LOW sector it is also below the watermark, so both
+	 * protections miss at once. Record the capture point; the drain audit
+	 * compares each stolen root's generation against it.
+	 */
+	tessera_pinscan_gen_at_start   = tmp_->sb.generation;
+	tessera_pinscan_rsnap_at_start = r_snap;
 	/*
 	 * ★ tasks #72/#78: pin the data-zone GC's FROZEN roots for as long as
 	 * its scan is running.
@@ -21469,6 +21583,23 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_log_replays,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, epoch_frees_snaproot, CTLFLAG_RD,
     &tessera_stat_epoch_frees_snaproot, 0,
     "epoch sweeps that released a retained snapshot's inode_root (#102)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, stolen_born_after_capture, CTLFLAG_RD,
+    &tessera_stat_stolen_born_after_capture, 0,
+    "stolen snapshot roots whose snapshot was created AFTER the last pinscan "
+    "captured the snapshots tree (#102: the scan could not have seen it)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, stolen_born_before_capture, CTLFLAG_RD,
+    &tessera_stat_stolen_born_before_capture, 0,
+    "stolen snapshot roots whose snapshot predates the capture (#102: the "
+    "scan SHOULD have marked it — a different bug)");
+SYSCTL_UQUAD(_kern_tessera, OID_AUTO, trace_sector, CTLFLAG_RW,
+    &tessera_trace_sector, 0,
+    "meta-reserve sector to trace through alloc/free/pin/drain (#102); "
+    "0 = off");
+SYSCTL_INT(_kern_tessera, OID_AUTO, trace_latch, CTLFLAG_RW,
+    &tessera_trace_latch, 0,
+    "1 = latch trace_sector onto the first sector the drain audit flags");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, trace_events, CTLFLAG_RD,
+    &tessera_stat_trace_events, 0, "traced-sector events logged");
 SYSCTL_INT(_kern_tessera, OID_AUTO, drain_audit_snaproots, CTLFLAG_RW,
     &tessera_drain_audit_snaproots, 0,
     "1 = on every meta_pending drain, check each released sector against the "
