@@ -2402,6 +2402,18 @@ static unsigned long tessera_stat_pinscan_incomplete = 0;
  * fatal (the scan now unions instead of replacing) but it means reclaim is
  * stalling and wants investigating. */
 static unsigned long tessera_stat_pinscan_trunc = 0;
+/* ★ DIAGNOSTIC (#102 recurrence): live retained-snapshot roots that a pinscan
+ * swap was about to synthesise into meta_free. Non-zero means the swap is the
+ * culprit; staying zero while snapshots still die means it is NOT. */
+static unsigned long tessera_stat_pinscan_unpinned_snaproot = 0;
+/* ★ DIAGNOSTIC (#102 recurrence): meta_pending drains that released a sector
+ * still serving as a retained snapshot's inode_root. Non-zero confirms the
+ * drain — not the pinscan swap — is what destroys snapshots. */
+static unsigned long tessera_stat_drain_frees_snaproot = 0;
+/* Walking the snapshots btree on EVERY drain is far too costly to ship on;
+ * this is the switch that found the #102 root cause and stays available for
+ * the next time the question is "who freed this sector". */
+static int tessera_drain_audit_snaproots = 0;
 static int tessera_fs_journal_log_drain(struct tessera_mount *tmp_);
 static void tessera_fs_flush_gate_enter(struct tessera_mount *tmp_);
 static void tessera_fs_flush_gate_exit(struct tessera_mount *tmp_);
@@ -3351,6 +3363,43 @@ tessera_fs_meta_pending_drain(struct tessera_mount *tmp_)
 	const uint64_t mstart = tmp_->sb.meta_reserve_start;
 	const uint64_t mlen   = tmp_->sb.meta_reserve_length;
 	uint32_t kept = 0;
+	/*
+	 * ★ DIAGNOSTIC (#102 recurrence): is the DRAIN releasing a sector a
+	 * retained snapshot still needs?
+	 *
+	 * The swap was already exonerated (pinscan_unpinned_snaproot stayed 0
+	 * while 7 snapshots died). The suspected hole is here instead: a
+	 * sector recycled out of meta_free BETWEEN scans is marked nowhere —
+	 * meta_scanwin only records it while pinscan_active, and it is far
+	 * below meta_pin_watermark because it is an OLD low sector. So both
+	 * checks below miss it, and if a snapshot's tree has since come to
+	 * reference it, releasing it destroys that snapshot.
+	 *
+	 * Collect the retained roots once per drain (~15) and report any that
+	 * we are about to release. No behaviour change — the release still
+	 * happens, so this run measures rather than masks.
+	 */
+	uint64_t _snaproots[64];
+	uint32_t _nsr = 0;
+	if (tessera_drain_audit_snaproots && tmp_->sb.snapshots_root != 0) {
+		tessera_btree_t *_st = tessera_btree_open(&tmp_->meta_bio,
+		    tmp_->sb.snapshots_root, 3, 8,
+		    TESSERA_SNAPSHOT_RECORD_SIZE);
+		tessera_btree_cursor_t *_sc = (_st != NULL)
+		    ? tessera_btree_seek_first(_st) : NULL;
+		while (_sc != NULL && _nsr < 64) {
+			uint8_t _k[8];
+			tessera_snapshot_record_t _r;
+			if (tessera_btree_cursor_get(_sc, _k, &_r)
+			    != TESSERA_OK) break;
+			if (_r.inode_root != 0)
+				_snaproots[_nsr++] = _r.inode_root;
+			if (tessera_btree_cursor_next(_sc) != TESSERA_OK)
+				break;
+		}
+		if (_sc != NULL) tessera_btree_cursor_free(_sc);
+		if (_st != NULL) tessera_btree_close(_st);
+	}
 	for (uint32_t i = 0; i < tmp_->meta_pending_count; i++) {
 		uint64_t s = tmp_->meta_pending[i];
 		int pinned = 0;
@@ -3374,6 +3423,19 @@ tessera_fs_meta_pending_drain(struct tessera_mount *tmp_)
 			    tmp_->sb.generation, kept);
 		} else if (tmp_->meta_free_count
 		    < tmp_->meta_free_cap) {
+			for (uint32_t _j = 0; _j < _nsr; _j++) {
+				if (_snaproots[_j] != s) continue;
+				tessera_stat_drain_frees_snaproot++;
+				printf("tessera_fs: DRAIN RELEASED sector "
+				    "%ju which is a RETAINED snapshot's "
+				    "inode_root (watermark %ju, bitmap "
+				    "%s) — this destroys that snapshot\n",
+				    (uintmax_t)s,
+				    (uintmax_t)tmp_->meta_pin_watermark,
+				    tmp_->meta_pin_bitmap ? "present"
+				    : "NULL");
+				break;
+			}
 			tmp_->meta_free[tmp_->meta_free_count++] = s;
 			tessera_stat_drain_release++;
 			tessera_metatrace(TM_OP_DRAIN_RELEASE, s,
@@ -3475,6 +3537,43 @@ tessera_fs_meta_epoch_sweep(struct tessera_mount *tmp_)
 	tessera_stat_meta_free_now    = tmp_->meta_free_count;
 }
 
+/*
+ * ★ #102 ROOT CAUSE: a sector recycled out of meta_free is IN USE the instant
+ * it is handed out, and until now nothing recorded that.
+ *
+ * The drain decides keep-vs-release from two tests, and a recycled sector
+ * evades both. The watermark only covers sectors at/after the last scan's
+ * start, and a recycled sector is by definition an OLD low one. The pin
+ * bitmap was built by that scan, when the sector was still free — so it reads
+ * unmarked. meta_scanwin plugs this ONLY while pinscan_active; between scans
+ * there is no record at all. If the sector then becomes part of a tree a
+ * retained snapshot shares, the next drain releases it and destroys that
+ * snapshot.
+ *
+ * Measured on a freshly-CLEAN dev root, 60s of create/delete: the drain
+ * released a retained snapshot's inode_root 14386 times, always below the
+ * watermark with the bitmap present; the pinscan swap was innocent (0). 12
+ * snapshots destroyed.
+ *
+ * So mark it here. The bit then means "reachable OR in use", which is
+ * strictly more conservative, and the next COMPLETE scan rebuilds the bitmap
+ * exactly and clears whatever is genuinely unreachable. Over-pinning only
+ * delays reclaim; under-pinning destroys data — the invariant this file
+ * states everywhere and this path quietly broke.
+ */
+static void
+tessera_meta_pin_mark_alloc(struct tessera_mount *tmp_, uint64_t s)
+{
+	if (tmp_->meta_pin_bitmap == NULL)
+		return;
+	const uint64_t mstart = tmp_->sb.meta_reserve_start;
+	const uint64_t mlen   = tmp_->sb.meta_reserve_length;
+	if (s < mstart || s >= mstart + mlen)
+		return;
+	uint64_t bit = s - mstart;
+	tmp_->meta_pin_bitmap[bit / 8] |= (uint8_t)(1u << (bit % 8));
+}
+
 static int
 tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 {
@@ -3508,6 +3607,7 @@ tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 		if (tmp_->pinscan_active && tmp_->meta_scanwin != NULL)
 			tmp_->meta_scanwin[tmp_->meta_scanwin_count++] =
 			    *out_sector;
+		tessera_meta_pin_mark_alloc(tmp_, *out_sector);
 		tessera_meta_epoch_mark(tmp_, *out_sector);
 		tessera_metatrace(TM_OP_ALLOC_REUSE, *out_sector,
 		    tmp_->sb.generation, tmp_->meta_free_count);
@@ -3531,6 +3631,7 @@ tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 			    tmp_->meta_scanwin != NULL)
 				tmp_->meta_scanwin[
 				    tmp_->meta_scanwin_count++] = *out_sector;
+			tessera_meta_pin_mark_alloc(tmp_, *out_sector);
 			tessera_meta_epoch_mark(tmp_, *out_sector);
 			tessera_metatrace(TM_OP_ALLOC_REUSE, *out_sector,
 			    tmp_->sb.generation, tmp_->meta_free_count);
@@ -12451,6 +12552,63 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 			scratch[_i] |= tmp_->meta_pin_bitmap[_i];
 		tessera_stat_pinscan_incomplete++;
 	}
+	/*
+	 * ★ DIAGNOSTIC ONLY (#102 recurrence): is this swap about to free a
+	 * LIVE retained snapshot's root?
+	 *
+	 * 60s of write load on a freshly-CLEAN dev root destroys ~8 retained
+	 * snapshots, with roots at LOW sectors (10047, 10090, 10135, 12123) —
+	 * far below bump0, so the watermark does not implicitly pin them and
+	 * they must have been marked explicitly by this scan. Something is
+	 * installing a bitmap without them.
+	 *
+	 * Rather than infer which of the several candidate paths does it, ask
+	 * the bitmap directly at the only place meta_free is synthesised. This
+	 * changes NO behaviour: it reads the snapshots tree and the scratch
+	 * bitmap and prints. If it never fires, the free happens somewhere
+	 * else entirely and this rules the swap out — which is worth as much
+	 * as catching it.
+	 */
+	if (r_snap != 0) {
+		tessera_btree_t *_dt = tessera_btree_open(&tmp_->meta_bio,
+		    r_snap, /*tree_kind*/ 3, /*key*/ 8,
+		    /*value*/ TESSERA_SNAPSHOT_RECORD_SIZE);
+		tessera_btree_cursor_t *_dc = (_dt != NULL)
+		    ? tessera_btree_seek_first(_dt) : NULL;
+		uint32_t _miss = 0;
+		while (_dc != NULL) {
+			uint8_t _dk[8];
+			tessera_snapshot_record_t _dr;
+			if (tessera_btree_cursor_get(_dc, _dk, &_dr)
+			    != TESSERA_OK)
+				break;
+			uint64_t _ir = _dr.inode_root;
+			if (_ir >= mstart && _ir < bump0) {
+				uint64_t _b = _ir - mstart;
+				if (!(scratch[_b / 8] & (1u << (_b % 8)))) {
+					_miss++;
+					tessera_stat_pinscan_unpinned_snaproot++;
+					printf("tessera_fs: pinscan SWAP WOULD "
+					    "FREE live snapshot gen %ju root "
+					    "sector %ju (below bump0 %ju, not "
+					    "marked; stale_skipped=%d "
+					    "incomplete_union=%d)\n",
+					    (uintmax_t)_dr.generation,
+					    (uintmax_t)_ir, (uintmax_t)bump0,
+					    stale_skipped,
+					    stale_skipped &&
+					    tmp_->meta_pin_bitmap != NULL);
+				}
+			}
+			if (tessera_btree_cursor_next(_dc) != TESSERA_OK)
+				break;
+		}
+		if (_dc != NULL) tessera_btree_cursor_free(_dc);
+		if (_dt != NULL) tessera_btree_close(_dt);
+		if (_miss > 0)
+			printf("tessera_fs: pinscan swap would free %u live "
+			    "snapshot root(s) THIS swap\n", _miss);
+	}
 	free(tmp_->meta_pin_bitmap, M_TESSERA);
 	tmp_->meta_pin_bitmap = scratch;
 	tmp_->meta_free_count = 0;
@@ -21248,6 +21406,19 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_log_records,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_log_replays,
     CTLFLAG_RD, &tessera_stat_journal_log_replays, 0,
     "Cumulative dirent log records re-applied during mount-time replay");
+SYSCTL_INT(_kern_tessera, OID_AUTO, drain_audit_snaproots, CTLFLAG_RW,
+    &tessera_drain_audit_snaproots, 0,
+    "1 = on every meta_pending drain, check each released sector against the "
+    "retained snapshot roots (#102 diagnostic; COSTLY — walks the snapshots "
+    "btree per drain)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, drain_frees_snaproot,
+    CTLFLAG_RD, &tessera_stat_drain_frees_snaproot, 0,
+    "meta_pending drains that released a retained snapshot's inode_root "
+    "(#102 diagnostic)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_unpinned_snaproot,
+    CTLFLAG_RD, &tessera_stat_pinscan_unpinned_snaproot, 0,
+    "live retained-snapshot roots a pinscan swap would have freed (#102 "
+    "diagnostic; zero exonerates the swap)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_trunc,
     CTLFLAG_RD, &tessera_stat_pinscan_trunc, 0,
     "pinscan snapshot enumerations cut short by an error rather than by "
