@@ -996,11 +996,16 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
         // plus free extents must tile the whole pack zone.
         let mut cursor = pz_start;
         let mut leaked = 0u64;
+        // Record the gaps themselves, not just the total. A count alone cannot
+        // distinguish one big abandoned run (an allocation that died partway)
+        // from thousands of single-sector crumbs (an off-by-one at every
+        // free), and those have opposite fixes.
+        let mut gaps: Vec<(u64, u64)> = Vec::new();
         for (s, e, _) in &all {
-            if *s > cursor { leaked += *s - cursor; }
+            if *s > cursor { leaked += *s - cursor; gaps.push((cursor, *s)); }
             if *e > cursor { cursor = *e; }
         }
-        if cursor < pz_end { leaked += pz_end - cursor; }
+        if cursor < pz_end { leaked += pz_end - cursor; gaps.push((cursor, pz_end)); }
         if leaked > 0 {
             // Informational, not a failure: untracked space is a space-
             // efficiency issue (not corruption), and can arise from
@@ -1008,6 +1013,19 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
             // above IS a hard problem. --repair reclaims it when rebuilding
             // the free tree.
             fsck.notes.push(format!("{leaked} pack-zone sector(s) neither allocated nor free (leaked space)"));
+            let mut hist: BTreeMap<u64, u64> = BTreeMap::new();
+            for (a, b) in &gaps { *hist.entry(b - a).or_insert(0) += 1; }
+            let shape: Vec<String> = hist.iter().rev().take(6)
+                .map(|(len, n)| format!("{n}x{len}sec")).collect();
+            fsck.notes.push(format!(
+                "  leak shape: {} gap(s), sizes: {}", gaps.len(),
+                shape.join(" ")));
+            if verbose {
+                for (a, b) in gaps.iter().take(24) {
+                    fsck.notes.push(format!(
+                        "  leaked extent [{a}..{b}] ({} sectors)", b - a));
+                }
+            }
             fsck.free_tree_dirty = true;
         }
 
