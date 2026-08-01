@@ -1568,6 +1568,9 @@ static void tessera_fs_meta_pressure_kick(struct tessera_mount *tmp_);
 static void tessera_fs_pinscan_task(void *ctx, int pending);
 static void tessera_fs_pinscan_run(struct tessera_mount *tmp_);
 static void tessera_fs_meta_pending_drain(struct tessera_mount *tmp_);
+/* ★ #102: defined after the allocator, used by the drain audit above it. */
+static int tessera_meta_allocsrc_is_bump(const struct tessera_mount *tmp_,
+    uint64_t s);
 static int tessera_fs_gc_data_zone(struct tessera_mount *tmp_);
 static void tessera_fs_gc_note_hash_slow(struct tessera_mount *tmp_,
     const tessera_hash_t h);
@@ -2434,6 +2437,9 @@ static unsigned long tessera_stat_trace_events = 0;
  * scan simply could not have seen them. */
 static uint64_t tessera_pinscan_gen_at_start   = 0;
 static uint64_t tessera_pinscan_rsnap_at_start = 0;
+static unsigned long tessera_stat_stolen_from_bump    = 0;
+static unsigned long tessera_stat_stolen_from_free    = 0;
+static unsigned long tessera_stat_stolen_src_unknown  = 0;
 static unsigned long tessera_stat_stolen_born_after_capture  = 0;
 static unsigned long tessera_stat_stolen_born_before_capture = 0;
 
@@ -2681,6 +2687,19 @@ struct tessera_mount {
 	 * long drain recycle instead of walking the bump to the ceiling.
 	 */
 	uint8_t                  *meta_epoch_bm;
+	/*
+	 * ★ #102: how each meta-reserve sector was LAST allocated — bit set =
+	 * from the bump, clear = recycled from meta_free.
+	 *
+	 * be2800e asserted the stolen roots were recycled low sectors. A fix
+	 * built on that premise carried ZERO bytes, so the premise is wrong.
+	 * The two sources have different protections (bump allocations are
+	 * covered by the watermark, recycled ones only by the bitmap), so
+	 * which one it is decides the shape of the fix. Record it per sector
+	 * and read it out at the theft, instead of generalising from the one
+	 * sector the trace happened to catch.
+	 */
+	uint8_t                  *meta_allocsrc_bm;
 
 	/* v2-step-2a: deferred-commit state. See sysctl block above. */
 	int                       sb_dirty;
@@ -3490,6 +3509,16 @@ tessera_fs_meta_pending_drain(struct tessera_mount *tmp_)
 					tessera_stat_stolen_born_after_capture++;
 				else
 					tessera_stat_stolen_born_before_capture++;
+				{
+					int _src =
+					    tessera_meta_allocsrc_is_bump(tmp_, s);
+					if (_src == 1)
+						tessera_stat_stolen_from_bump++;
+					else if (_src == 0)
+						tessera_stat_stolen_from_free++;
+					else
+						tessera_stat_stolen_src_unknown++;
+				}
 				/* Report the OWNING GENERATION so the residual
 				 * can be settled: if that generation no longer
 				 * exists afterwards it was retired and the
@@ -3694,6 +3723,32 @@ tessera_fs_meta_epoch_sweep(struct tessera_mount *tmp_)
  * delays reclaim; under-pinning destroys data — the invariant this file
  * states everywhere and this path quietly broke.
  */
+/* ★ #102: remember whether `s` came from the bump (1) or meta_free (0). */
+static void
+tessera_meta_allocsrc_set(struct tessera_mount *tmp_, uint64_t s, int from_bump)
+{
+	if (tmp_->meta_allocsrc_bm == NULL) return;
+	const uint64_t mstart = tmp_->sb.meta_reserve_start;
+	const uint64_t mlen   = tmp_->sb.meta_reserve_length;
+	if (s < mstart || s >= mstart + mlen) return;
+	uint64_t bit = s - mstart;
+	if (from_bump)
+		tmp_->meta_allocsrc_bm[bit / 8] |= (uint8_t)(1u << (bit % 8));
+	else
+		tmp_->meta_allocsrc_bm[bit / 8] &= (uint8_t)~(1u << (bit % 8));
+}
+
+static int
+tessera_meta_allocsrc_is_bump(const struct tessera_mount *tmp_, uint64_t s)
+{
+	if (tmp_->meta_allocsrc_bm == NULL) return (-1);
+	const uint64_t mstart = tmp_->sb.meta_reserve_start;
+	const uint64_t mlen   = tmp_->sb.meta_reserve_length;
+	if (s < mstart || s >= mstart + mlen) return (-1);
+	uint64_t bit = s - mstart;
+	return ((tmp_->meta_allocsrc_bm[bit / 8] & (1u << (bit % 8))) != 0);
+}
+
 static void
 tessera_meta_pin_mark_alloc(struct tessera_mount *tmp_, uint64_t s)
 {
@@ -3741,6 +3796,7 @@ tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 			tmp_->meta_scanwin[tmp_->meta_scanwin_count++] =
 			    *out_sector;
 		tessera_meta_pin_mark_alloc(tmp_, *out_sector);
+		tessera_meta_allocsrc_set(tmp_, *out_sector, 0);
 		tessera_meta_epoch_mark(tmp_, *out_sector);
 		TSEC(*out_sector, "ALLOC reuse-from-meta_free gen=%ju "
 		    "pinscan_active=%d watermark=%ju",
@@ -3769,6 +3825,7 @@ tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 				tmp_->meta_scanwin[
 				    tmp_->meta_scanwin_count++] = *out_sector;
 			tessera_meta_pin_mark_alloc(tmp_, *out_sector);
+		tessera_meta_allocsrc_set(tmp_, *out_sector, 0);
 			tessera_meta_epoch_mark(tmp_, *out_sector);
 			TSEC(*out_sector, "ALLOC reuse-after-epoch-sweep "
 			    "gen=%ju pinscan_active=%d",
@@ -3830,6 +3887,7 @@ tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 	}
 	*out_sector = tmp_->sb.meta_reserve_bump;
 	tmp_->sb.meta_reserve_bump += n;
+	tessera_meta_allocsrc_set(tmp_, *out_sector, 1);
 	TSEC(*out_sector, "ALLOC bump gen=%ju pinscan_active=%d watermark=%ju",
 	    (uintmax_t)tmp_->sb.generation, tmp_->pinscan_active,
 	    (uintmax_t)tmp_->meta_pin_watermark);
@@ -4585,6 +4643,8 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		 * definition durable. */
 		tmp_->meta_epoch_bm = malloc(bitmap_bytes, M_TESSERA,
 		    M_WAITOK | M_ZERO);
+		tmp_->meta_allocsrc_bm = malloc(bitmap_bytes, M_TESSERA,
+		    M_WAITOK | M_ZERO);
 		tessera_metatrace(TM_OP_BITMAP_BUILT, 0,
 		    tmp_->sb.generation, (uint32_t)bitmap_bytes);
 	}
@@ -5236,6 +5296,8 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 		if (tmp_->meta_pending    != NULL) free(tmp_->meta_pending, M_TESSERA);
 		if (tmp_->meta_scanwin    != NULL) free(tmp_->meta_scanwin, M_TESSERA);
 		if (tmp_->meta_pin_bitmap != NULL) free(tmp_->meta_pin_bitmap, M_TESSERA);
+		if (tmp_->meta_allocsrc_bm != NULL)
+			free(tmp_->meta_allocsrc_bm, M_TESSERA);
 		if (tmp_->meta_epoch_bm   != NULL) free(tmp_->meta_epoch_bm, M_TESSERA);
 		/* Drain any still-dirty buffers on devvp BEFORE detaching
 		 * the GEOM consumer. tessera_kbio_write_delayed uses
@@ -21583,6 +21645,15 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_log_replays,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, epoch_frees_snaproot, CTLFLAG_RD,
     &tessera_stat_epoch_frees_snaproot, 0,
     "epoch sweeps that released a retained snapshot's inode_root (#102)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, stolen_from_bump, CTLFLAG_RD,
+    &tessera_stat_stolen_from_bump, 0,
+    "stolen snapshot roots last allocated from the BUMP (#102)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, stolen_from_free, CTLFLAG_RD,
+    &tessera_stat_stolen_from_free, 0,
+    "stolen snapshot roots last allocated from meta_free (#102)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, stolen_src_unknown, CTLFLAG_RD,
+    &tessera_stat_stolen_src_unknown, 0,
+    "stolen snapshot roots with no recorded allocation source (#102)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, stolen_born_after_capture, CTLFLAG_RD,
     &tessera_stat_stolen_born_after_capture, 0,
     "stolen snapshot roots whose snapshot was created AFTER the last pinscan "
