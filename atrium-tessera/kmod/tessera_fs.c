@@ -3269,34 +3269,51 @@ tessera_fs_registry_get_stable(struct tessera_mount *tmp_,
 	}
 }
 
-/* Reclaim the extents of a registry entry the overlay drain is about to
- * overwrite. See the ★ PACK-ZONE LEAK note in the drain for why these
- * collisions happen at all. Called from inside the batch merge with the
- * flush gate held; must not touch the tree. */
+/* Collector for entries the overlay drain displaces. See the ★ PACK-ZONE
+ * LEAK note in the drain for why these collisions happen at all. */
+struct tessera_regov_displaced {
+	struct tessera_pack_alloc_result *pa;
+	uint32_t                          n;
+	uint32_t                          cap;
+};
+
+/*
+ * ★ RECORD ONLY — do NOT reclaim here.
+ *
+ * This runs inside tessera_btree_put_sorted_batch_ex's merge, mid-COW, with
+ * the flush gate held. tessera_fs_pack_alloc_rollback() bread()s the PEL
+ * chain on the multi-extent path and mutates the free-extent btree, so
+ * calling it from here nests blocking buffer-cache I/O and a second tree
+ * mutation inside the first tree's merge — which wedged kldxref on tessgate
+ * with the whole system idle (the #67 flush-gate/buffer-cache deadlock
+ * class). Collect now; reclaim after the batch returns.
+ *
+ * The array is pre-sized to the batch count by the caller, so this never
+ * allocates.
+ */
 static void
 tessera_fs_regov_displaced_cb(void *ctx, const void *key,
     const void *old_value, const void *new_value)
 {
-	struct tessera_mount *tmp_ = ctx;
+	struct tessera_regov_displaced *d = ctx;
 	tessera_registry_entry_t _o, _n;
 
 	(void)key;
+	if (d->n >= d->cap)
+		return;                 /* cannot happen: cap == batch count */
 	if (tessera_decode_registry_entry(old_value, &_o) != TESSERA_OK ||
 	    tessera_decode_registry_entry(new_value, &_n) != TESSERA_OK)
 		return;
 	/* Same placement — the new entry still owns these sectors, so
-	 * freeing them here would hand out live extents. */
+	 * reclaiming them would hand out live extents. */
 	if (_o.start_sector == _n.start_sector &&
 	    _o.length_sectors == _n.length_sectors)
 		return;
 
-	struct tessera_pack_alloc_result _pa;
-	_pa.start_sector   = _o.start_sector;
-	_pa.length_sectors = _o.length_sectors;
-	_pa.flags          = _o.flags;
-	tessera_stat_regov_displaced++;
-	tessera_stat_regov_displaced_sectors += _o.length_sectors;
-	tessera_fs_pack_alloc_rollback(tmp_, &_pa);
+	d->pa[d->n].start_sector   = _o.start_sector;
+	d->pa[d->n].length_sectors = _o.length_sectors;
+	d->pa[d->n].flags          = _o.flags;
+	d->n++;
 }
 
 /* Flush-side: sorted-batch-put the overlay into the registry btree
@@ -3373,9 +3390,30 @@ tessera_fs_registry_ov_flush(struct tessera_mount *tmp_)
 	 * through here, and frees its own old extents after its commit point
 	 * — so there is no double-free path.
 	 */
+	struct tessera_regov_displaced _disp;
+	_disp.cap = cnt;        /* at most one displacement per batch key */
+	_disp.n   = 0;
+	_disp.pa  = malloc((size_t)cnt * sizeof *_disp.pa, M_TESSERA,
+	    M_WAITOK);
+
 	uint64_t root = tmp_->sb.pack_registry_root;
 	int rc = tessera_btree_put_sorted_batch_ex(tmp_->pack_registry_tree,
-	    keys, vals, cnt, &root, tessera_fs_regov_displaced_cb, tmp_);
+	    keys, vals, cnt, &root, tessera_fs_regov_displaced_cb, &_disp);
+
+	/* Reclaim AFTER the merge: rollback does buffer-cache I/O and frees
+	 * into the extent tree, neither of which is safe inside it. Only on
+	 * success — if the put failed the old entries are still live, and
+	 * leaking their extents is recoverable where freeing live ones is
+	 * not. */
+	if (rc == TESSERA_OK) {
+		for (uint32_t i = 0; i < _disp.n; i++) {
+			tessera_stat_regov_displaced++;
+			tessera_stat_regov_displaced_sectors +=
+			    _disp.pa[i].length_sectors;
+			tessera_fs_pack_alloc_rollback(tmp_, &_disp.pa[i]);
+		}
+	}
+	free(_disp.pa, M_TESSERA);
 	if (rc == TESSERA_OK) {
 		tessera_stat_regov_flushed += cnt;
 		/* ★ pack-zone leak: did the n-bound truncate the collection?

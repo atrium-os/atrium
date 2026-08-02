@@ -66,8 +66,14 @@ int tessera_btree_put_sorted_batch(tessera_btree_t *, const void *keys,
  * entry's key, its old value, and the new value replacing it — a caller
  * reclaiming resources owned by the old value needs the new one to tell
  * a genuine displacement from a rewrite that keeps the same resources.
- * The callback must not re-enter the tree; all three pointers are valid
- * only for the duration of the call. */
+ *
+ * ★ RECORD ONLY. This fires from INSIDE the merge, mid-COW, with whatever
+ * lock the caller holds over the whole batch. It must not block, perform
+ * I/O, allocate, or re-enter any tree — copy what you need into caller
+ * storage and do the real work after the batch call returns. Doing the
+ * reclaim in the callback instead deadlocked the kmod against its own
+ * flush gate. All three pointers are valid only for the duration of the
+ * call. */
 typedef void (*tessera_btree_displaced_cb_t)(void *ctx, const void *key,
                                              const void *old_value,
                                              const void *new_value);
