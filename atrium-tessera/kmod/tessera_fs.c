@@ -2426,6 +2426,20 @@ static unsigned long tessera_stat_drain_frees_snaproot = 0;
  * this is the switch that found the #102 root cause and stays available for
  * the next time the question is "who freed this sector". */
 static int tessera_drain_audit_snaproots = 0;
+/* ★ pack-zone leak: at unmount, cross-check recorded pack allocations against
+ * the registry and print any that never landed, with the caller's address. */
+static int tessera_pack_ring_audit = 0;
+/* ★ pack-zone leak: both ends of the registry overlay. inserted-flushed
+ * should equal what is still resident; a gap means entries vanished. */
+static unsigned long tessera_stat_regov_inserted    = 0;
+static unsigned long tessera_stat_regov_flushed     = 0;
+static unsigned long tessera_stat_regov_left_behind = 0;
+/* ★ pack-zone leak: registry entries DISPLACED by a later put of the same
+ * content-addressed pack_id at a different location. Each one used to orphan
+ * the displaced pack's extents. This is the effect counter — it must be
+ * non-zero on a run that previously leaked. */
+static unsigned long tessera_stat_regov_displaced         = 0;
+static unsigned long tessera_stat_regov_displaced_sectors = 0;
 /*
  * ★ #102 residual: follow ONE sector through its whole life.
  *
@@ -2727,6 +2741,20 @@ struct tessera_mount {
 	 * sector the trace happened to catch.
 	 */
 	uint8_t                  *meta_allocsrc_bm;
+	/*
+	 * ★ pack-zone leak: a ring of recent pack allocations.
+	 *
+	 * Two mechanism guesses (the four callers' error paths, then
+	 * registry-overlay supersession) each fit the counter signature —
+	 * clean populate gives packs = alloc+1, a leaking one gives
+	 * packs = alloc — and each cost a build+verify cycle before being
+	 * disproved. So stop guessing at DISPOSAL sites and record the
+	 * ALLOCATION itself: at unmount, any recorded sector absent from the
+	 * registry is the leak, and its return address names the caller.
+	 */
+	struct { uint64_t sector; uint64_t len; void *caller; } *pack_ring;
+	uint32_t                  pack_ring_n;   /* next slot (wraps) */
+	uint32_t                  pack_ring_cap;
 	/*
 	 * ★ #102 FIX: sectors handed out from meta_free, double-buffered.
 	 *
@@ -3129,6 +3157,7 @@ tessera_fs_registry_put_pending(struct tessera_mount *tmp_,
 	}
 	LIST_INSERT_HEAD(&tmp_->reg_ov[b], ov, link);
 	tmp_->reg_ov_count++;
+	tessera_stat_regov_inserted++;
 	mtx_unlock(&tmp_->flush_mtx);
 	TPROF_ADD(TPROF_C_REGPUT, _t0);
 	return (TESSERA_OK);
@@ -3283,10 +3312,66 @@ tessera_fs_registry_ov_flush(struct tessera_mount *tmp_)
 		memcpy(vals + (size_t)i * TESSERA_REGISTRY_ENTRY_SIZE,
 		    ents[i]->val, TESSERA_REGISTRY_ENTRY_SIZE);
 	}
+	/*
+	 * ★ PACK-ZONE LEAK ROOT CAUSE: a cross-flush pack_id collision
+	 * silently orphans the OLD pack's extents.
+	 *
+	 * pack_id is content-addressed, so identical content published in two
+	 * DIFFERENT flushes lands the same key here twice. The second
+	 * batch-put REPLACES the first entry and the first pack's extents are
+	 * referenced by nothing — no rollback, and no overlay collision (the
+	 * same-flush case is already deduped in reg_ov by c3c0776, which is
+	 * why regov_superseded reads 0 while this still leaks).
+	 *
+	 * Evidenced by conservation: every alloc reached the overlay and
+	 * every overlay entry reached the btree (inserted == flushed,
+	 * left_behind == 0, remaining == 0), yet the btree ends with FEWER
+	 * entries than there were puts, and the deficit equals the orphan
+	 * count exactly:
+	 *     clean   alloc=109803 flushed=109803 packs=109804  0 orphans
+	 *     leaking alloc=111045 flushed=111045 packs=111044  2 orphans
+	 *
+	 * So look each key up first and return the extents of any entry we
+	 * are about to displace. Safe against repack, which is the only other
+	 * writer of this tree: it calls tessera_btree_put directly (line
+	 * ~16496), never routes through here, and frees its own old extents
+	 * after its commit point — so there is no double-free path.
+	 */
+	for (uint32_t i = 0; i < cnt; i++) {
+		uint8_t _old[TESSERA_REGISTRY_ENTRY_SIZE];
+		if (tessera_btree_get(tmp_->pack_registry_tree,
+		    keys + (size_t)i * 16, _old) != TESSERA_OK)
+			continue;               /* new key — nothing displaced */
+		tessera_registry_entry_t _o, _n;
+		if (tessera_decode_registry_entry(_old, &_o) != TESSERA_OK ||
+		    tessera_decode_registry_entry(vals +
+		    (size_t)i * TESSERA_REGISTRY_ENTRY_SIZE, &_n)
+		    != TESSERA_OK)
+			continue;
+		if (_o.start_sector == _n.start_sector &&
+		    _o.length_sectors == _n.length_sectors)
+			continue;               /* identical placement — no-op */
+		struct tessera_pack_alloc_result _pa;
+		_pa.start_sector   = _o.start_sector;
+		_pa.length_sectors = _o.length_sectors;
+		_pa.flags          = _o.flags;
+		tessera_stat_regov_displaced++;
+		tessera_stat_regov_displaced_sectors += _o.length_sectors;
+		tessera_fs_pack_alloc_rollback(tmp_, &_pa);
+	}
 	uint64_t root = tmp_->sb.pack_registry_root;
 	int rc = tessera_btree_put_sorted_batch(tmp_->pack_registry_tree,
 	    keys, vals, cnt, &root);
 	if (rc == TESSERA_OK) {
+		tessera_stat_regov_flushed += cnt;
+		/* ★ pack-zone leak: did the n-bound truncate the collection?
+		 * n is sampled OUTSIDE flush_mtx; if entries exist beyond it
+		 * they are silently left for a later flush — and if none
+		 * follows they are lost with the mount. Non-zero here is the
+		 * smoking gun; zero exonerates the bound. */
+		if (cnt < tmp_->reg_ov_count)
+			tessera_stat_regov_left_behind +=
+			    (tmp_->reg_ov_count - cnt);
 		tmp_->sb.pack_registry_root = root;
 		mtx_lock(&tmp_->flush_mtx);
 		for (uint32_t i = 0; i < cnt; i++) {
@@ -4750,6 +4835,23 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		    M_WAITOK | M_ZERO);
 		tmp_->meta_allocsrc_bm = malloc(bitmap_bytes, M_TESSERA,
 		    M_WAITOK | M_ZERO);
+		/*
+		 * ★ 512 was USELESS: a populate makes ~108000 pack
+		 * allocations, so a 512-entry ring wrapped ~210 times and
+		 * held only the last 0.5% of the run — the orphan was
+		 * essentially never in it (measured: 0 orphans of 512
+		 * recorded, on a run where fsck found the leak). Size the
+		 * ring to the workload, not to a round number.
+		 *
+		 * 65536 entries x 24 B = 1.5 MB. Combined with the
+		 * small-allocation filter below (every leaked extent
+		 * observed all day has been exactly 5 sectors), this covers
+		 * a whole populate with room to spare.
+		 */
+		tmp_->pack_ring_cap = 65536;
+		tmp_->pack_ring = malloc(tmp_->pack_ring_cap *
+		    sizeof *tmp_->pack_ring, M_TESSERA, M_WAITOK | M_ZERO);
+		tmp_->pack_ring_n = 0;
 		tmp_->meta_recycled_bm = malloc(bitmap_bytes, M_TESSERA,
 		    M_WAITOK | M_ZERO);
 		tmp_->meta_recycled_prev_bm = malloc(bitmap_bytes, M_TESSERA,
@@ -5108,6 +5210,82 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 	if (tessera_singleton_mount == tmp_)
 		tessera_singleton_mount = NULL;
 
+	/*
+	 * ★ pack-zone leak: name the leaked allocation and its caller.
+	 *
+	 * Walk the registry once collecting every start_sector, then report
+	 * any ring entry whose sector is absent. That entry's return address
+	 * identifies the caller that allocated a pack and never registered
+	 * it — which two rounds of auditing suspected disposal sites failed
+	 * to find. Runs only when kern.tessera.pack_ring_audit=1.
+	 */
+	/* ★ pack-zone leak: anything still in the overlay at unmount was
+	 * published but never registered — the packs it names are exactly the
+	 * orphans the ring audit reports. */
+	if (tmp_->reg_ov_count != 0)
+		printf("tessera_fs: UNMOUNT with %u UNFLUSHED registry overlay "
+		    "entr%s — these packs were written but never registered\n",
+		    tmp_->reg_ov_count,
+		    tmp_->reg_ov_count == 1 ? "y" : "ies");
+	printf("tessera_fs: regov totals: inserted=%lu flushed=%lu "
+	    "left_behind=%lu remaining=%u\n",
+	    tessera_stat_regov_inserted, tessera_stat_regov_flushed,
+	    tessera_stat_regov_left_behind, tmp_->reg_ov_count);
+	if (tessera_pack_ring_audit && tmp_->pack_ring != NULL &&
+	    tmp_->pack_registry_tree != NULL) {
+		uint32_t _cap = 8192, _n = 0;
+		uint64_t *_reg = malloc(_cap * sizeof(uint64_t), M_TESSERA,
+		    M_WAITOK);
+		tessera_btree_cursor_t *_c =
+		    tessera_btree_seek_first(tmp_->pack_registry_tree);
+		while (_c != NULL) {
+			uint8_t _k[16];
+			uint8_t _v[TESSERA_REGISTRY_ENTRY_SIZE];
+			if (tessera_btree_cursor_get(_c, _k, _v) != TESSERA_OK)
+				break;
+			tessera_registry_entry_t _re;
+			if (tessera_decode_registry_entry(_v, &_re)
+			    == TESSERA_OK) {
+				if (_n == _cap) {
+					uint64_t *_g = malloc(_cap * 2 *
+					    sizeof(uint64_t), M_TESSERA,
+					    M_WAITOK);
+					memcpy(_g, _reg,
+					    _cap * sizeof(uint64_t));
+					free(_reg, M_TESSERA);
+					_reg = _g; _cap *= 2;
+				}
+				_reg[_n++] = _re.start_sector;
+			}
+			if (tessera_btree_cursor_next(_c) != TESSERA_OK) break;
+		}
+		if (_c != NULL) tessera_btree_cursor_free(_c);
+		uint32_t _seen = tmp_->pack_ring_n < tmp_->pack_ring_cap
+		    ? tmp_->pack_ring_n : tmp_->pack_ring_cap;
+		uint32_t _orphans = 0;
+		for (uint32_t _i = 0; _i < _seen; _i++) {
+			uint64_t _s = tmp_->pack_ring[_i].sector;
+			int _found = 0;
+			for (uint32_t _j = 0; _j < _n; _j++)
+				if (_reg[_j] == _s) { _found = 1; break; }
+			if (!_found) {
+				_orphans++;
+				printf("tessera_fs: ORPHANED PACK ALLOC "
+				    "sector=%ju len=%ju caller=%p — allocated "
+				    "but never registered\n",
+				    (uintmax_t)_s,
+				    (uintmax_t)tmp_->pack_ring[_i].len,
+				    tmp_->pack_ring[_i].caller);
+			}
+		}
+		printf("tessera_fs: pack-ring audit: %u orphan(s) of %u "
+		    "recorded allocs (%u registry entries)%s\n",
+		    _orphans, _seen, _n,
+		    tmp_->pack_ring_n > tmp_->pack_ring_cap
+		    ? " *** RING WRAPPED — COVERAGE INCOMPLETE ***" : "");
+		free(_reg, M_TESSERA);
+	}
+
 	/* ★ task #80 instrumentation: what is still staged as teardown
 	 * begins? Anything left after the final flush below is discarded, so
 	 * a nonzero residue here that survives is the silent-corruption
@@ -5407,6 +5585,7 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 		if (tmp_->meta_pin_bitmap != NULL) free(tmp_->meta_pin_bitmap, M_TESSERA);
 		if (tmp_->meta_allocsrc_bm != NULL)
 			free(tmp_->meta_allocsrc_bm, M_TESSERA);
+		if (tmp_->pack_ring != NULL) free(tmp_->pack_ring, M_TESSERA);
 		if (tmp_->meta_recycled_bm != NULL)
 			free(tmp_->meta_recycled_bm, M_TESSERA);
 		if (tmp_->meta_recycled_prev_bm != NULL)
@@ -15805,6 +15984,21 @@ tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
 	if (rc == 0) {
 		tessera_stat_pack_alloc_calls++;
 		tessera_stat_pack_alloc_sectors += n_sectors;
+		/*
+		 * Record only SMALL allocations. Every leaked extent measured
+		 * — across populates, buildkernels and the 10-sample rate run
+		 * — has been a 5-sector unit (occasionally 2-4 such units
+		 * adjacent). Filtering to <= 8 sectors cuts the recorded
+		 * volume by orders of magnitude while keeping every candidate.
+		 */
+		if (tmp_->pack_ring != NULL && n_sectors <= 8) {
+			uint32_t _i = tmp_->pack_ring_n % tmp_->pack_ring_cap;
+			tmp_->pack_ring[_i].sector = out->start_sector;
+			tmp_->pack_ring[_i].len    = out->length_sectors;
+			tmp_->pack_ring[_i].caller =
+			    __builtin_return_address(0);
+			tmp_->pack_ring_n++;
+		}
 	}
 	return (rc);
 }
@@ -21857,6 +22051,24 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, trace_latch, CTLFLAG_RW,
     "1 = latch trace_sector onto the first sector the drain audit flags");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, trace_events, CTLFLAG_RD,
     &tessera_stat_trace_events, 0, "traced-sector events logged");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, regov_inserted, CTLFLAG_RD,
+    &tessera_stat_regov_inserted, 0, "entries inserted into the registry overlay");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, regov_flushed, CTLFLAG_RD,
+    &tessera_stat_regov_flushed, 0, "overlay entries written to the registry btree");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, regov_displaced, CTLFLAG_RD,
+    &tessera_stat_regov_displaced, 0,
+    "registry entries displaced by a later put of the same pack_id at a "
+    "different location (pack-zone leak root cause)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, regov_displaced_sectors, CTLFLAG_RD,
+    &tessera_stat_regov_displaced_sectors, 0,
+    "sectors reclaimed from displaced registry entries");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, regov_left_behind, CTLFLAG_RD,
+    &tessera_stat_regov_left_behind, 0,
+    "overlay entries the n-bound left uncollected in a flush (#pack-zone leak)");
+SYSCTL_INT(_kern_tessera, OID_AUTO, pack_ring_audit, CTLFLAG_RW,
+    &tessera_pack_ring_audit, 0,
+    "1 = at unmount, report pack allocations absent from the registry with "
+    "the allocating caller's return address (pack-zone leak hunt)");
 SYSCTL_INT(_kern_tessera, OID_AUTO, drain_audit_snaproots, CTLFLAG_RW,
     &tessera_drain_audit_snaproots, 0,
     "1 = on every meta_pending drain, check each released sector against the "
