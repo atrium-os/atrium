@@ -300,6 +300,18 @@ fi
 #   sudo renice -10 -p $(pgrep -n qemu-system-aarch64)
 taskpolicy -B -p $$ 2>/dev/null || true
 
+# Boot device: the devroot device below carries bootindex=0, so EDK2 boots the
+# Tessera dev root rather than the ZFS disk and ongoing work dogfoods the FS
+# continuously. Devices carrying a bootindex sort ahead of those without, so
+# the ZFS drive needs no change — and must NOT be converted to an explicit
+# -device merely to give it bootindex=1: that shifts PCI enumeration and
+# renumbers every vtbd, including the vtbd3p2 that the dev root's own
+# loader.conf and fstab name (see rebuild_devroot.sh). ZFS stays attached as
+# vtbd4 — drop the bootindex to fall back to it.
+#
+# Guest disk order (confirm with: diskinfo -v /dev/vtbdN | grep ident):
+#   vtbd0 tessera-crashtest   vtbd1 atrium-storage
+#   vtbd2 tessera-root        vtbd3 tessera-devroot   vtbd4 ZFS (no ident)
 exec "$QEMU" \
     -L "$QEMU_DIR/pc-bios" \
     ${ATRIUM_QEMU_TRACE:+-trace events=$ATRIUM_QEMU_TRACE} \
@@ -315,6 +327,8 @@ exec "$QEMU" \
     -device virtio-blk-pci,drive=storagedrv,serial=atrium-storage,config-wce=on \
     -drive file="$BSD_DIR/vm/tessera-root.img",format=raw,cache=writeback,if=none,id=tessrootdrv \
     -device virtio-blk-pci,drive=tessrootdrv,serial=tessera-root,config-wce=on \
+    -drive file="$BSD_DIR/vm/tessera-devroot.img",format=raw,cache=writeback,if=none,id=devrootdrv \
+    -device virtio-blk-pci,drive=devrootdrv,serial=tessera-devroot,config-wce=on,bootindex=0 \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0,hostfwd=tcp::2222-:22 \
     -fsdev local,id=share,path="$SHARE_DIR",security_model=none \
