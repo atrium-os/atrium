@@ -1568,6 +1568,15 @@ static void tessera_fs_meta_pressure_kick(struct tessera_mount *tmp_);
 static void tessera_fs_pinscan_task(void *ctx, int pending);
 static void tessera_fs_pinscan_run(struct tessera_mount *tmp_);
 static void tessera_fs_meta_pending_drain(struct tessera_mount *tmp_);
+/* ★ pack-zone leak fix: registry_put_pending needs this to return a
+ * superseded pack's extents; hoisted from ~13k lines below. */
+struct tessera_pack_alloc_result {
+	uint64_t start_sector;     /* contig start, OR PEL sector if multi */
+	uint64_t length_sectors;   /* logical (sum of extents) */
+	uint32_t flags;            /* SEALED + (MULTI_EXTENT if applicable) */
+};
+static void tessera_fs_pack_alloc_rollback(struct tessera_mount *tmp_,
+    const struct tessera_pack_alloc_result *pa);
 /* ★ #102: defined after the allocator, used by the drain audit above it. */
 static int tessera_meta_allocsrc_is_bump(const struct tessera_mount *tmp_,
     uint64_t s);
@@ -2445,6 +2454,12 @@ static unsigned long tessera_stat_pinscan_carried_cur  = 0;
 static unsigned long tessera_stat_pinscan_carried_prev = 0;
 /* ★ pack-zone leak balance. alloc - rollback - (registry growth) should equal
  * the leak fsck reports. Counters, no behaviour change. */
+/* ★ pack-zone leak: registry-overlay entries superseded by a second put of
+ * the SAME pack_id at a DIFFERENT location. Each one used to orphan the old
+ * pack's extents; they are now rolled back. Should track the leak rate that
+ * was ~55% per populate. */
+static unsigned long tessera_stat_regov_superseded         = 0;
+static unsigned long tessera_stat_regov_superseded_sectors = 0;
 static unsigned long tessera_stat_pack_alloc_calls      = 0;
 static unsigned long tessera_stat_pack_alloc_sectors    = 0;
 static unsigned long tessera_stat_pack_rollback_calls   = 0;
@@ -3057,8 +3072,56 @@ tessera_fs_registry_put_pending(struct tessera_mount *tmp_,
 	struct tessera_reg_ov *e;
 	LIST_FOREACH(e, &tmp_->reg_ov[b], link) {
 		if (memcmp(e->pack_id, pack_id, 16) == 0) {
+			/*
+			 * ★ PACK-ZONE LEAK: overwriting this entry DISCARDS the
+			 * old pack's extents.
+			 *
+			 * pack_ids are content-addressed, so the same id lands
+			 * here twice when identical content is published twice
+			 * inside one flush window — both publishes miss the
+			 * dedup check (which consults the on-disk registry, not
+			 * this overlay), both allocate, and the second silently
+			 * orphans the first. The caller gets TESSERA_OK, so it
+			 * never rolls back.
+			 *
+			 * Measured: exactly ONE stranded allocation per leak
+			 * event (packs == alloc instead of alloc+1) with
+			 * rollback_calls == 0, and every leaked extent a single
+			 * 5-sector pack.
+			 *
+			 * The superseded copy is unreachable — readers resolve
+			 * through this overlay and will get the NEW value — so
+			 * returning its extents is safe. Only do it when they
+			 * actually differ: an identical re-put (same location)
+			 * must NOT free the extents still described by the
+			 * entry we are keeping.
+			 *
+			 * Note repack does NOT come through here (it calls
+			 * tessera_btree_put directly and frees the old extents
+			 * itself after its commit point), so this cannot
+			 * double-free with that path.
+			 */
+			tessera_registry_entry_t _old, _new;
+			int _decoded =
+			    tessera_decode_registry_entry(e->val, &_old)
+			    == TESSERA_OK &&
+			    tessera_decode_registry_entry(value, &_new)
+			    == TESSERA_OK;
+			int _differs = _decoded &&
+			    (_old.start_sector != _new.start_sector ||
+			     _old.length_sectors != _new.length_sectors);
 			memcpy(e->val, value, TESSERA_REGISTRY_ENTRY_SIZE);
 			mtx_unlock(&tmp_->flush_mtx);
+			if (_differs) {
+				struct tessera_pack_alloc_result _pa;
+				_pa.start_sector   = _old.start_sector;
+				_pa.length_sectors = _old.length_sectors;
+				_pa.flags          = _old.flags;
+				tessera_stat_regov_superseded++;
+				tessera_stat_regov_superseded_sectors +=
+				    _old.length_sectors;
+				tessera_fs_pack_alloc_rollback(tmp_, &_pa);
+			}
 			free(ov, M_TESSERA);
 			TPROF_ADD(TPROF_C_REGPUT, _t0);
 			return (TESSERA_OK);
@@ -15701,11 +15764,6 @@ tessera_fs_publish_manifest_owned_known_new(struct tessera_mount *tmp_,
 
 /* Result of tessera_fs_pack_alloc_and_write — the bits the caller
  * stamps onto a fresh tessera_registry_entry_t. */
-struct tessera_pack_alloc_result {
-	uint64_t start_sector;     /* contig start, OR PEL sector if multi */
-	uint64_t length_sectors;   /* logical (sum of extents) */
-	uint32_t flags;            /* SEALED + (MULTI_EXTENT if applicable) */
-};
 
 /*
  * Allocate data-zone space for `pack_bytes` (n_sectors) and write it
@@ -21758,6 +21816,13 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_carried_prev, CTLFLAG_RD,
     &tessera_stat_pinscan_carried_prev, 0,
     "sector bits carried from the PREVIOUS recycle interval (#102 effect "
     "counter: zero means the double-buffer is inert)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, regov_superseded, CTLFLAG_RD,
+    &tessera_stat_regov_superseded, 0,
+    "registry-overlay entries superseded at a different location (each one "
+    "previously orphaned a pack's extents)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, regov_superseded_sectors, CTLFLAG_RD,
+    &tessera_stat_regov_superseded_sectors, 0,
+    "sectors reclaimed from superseded registry-overlay entries");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, pack_alloc_calls, CTLFLAG_RD,
     &tessera_stat_pack_alloc_calls, 0, "successful pack extent allocations");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, pack_alloc_sectors, CTLFLAG_RD,
