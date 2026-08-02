@@ -62,6 +62,26 @@ int tessera_btree_put_sorted_batch(tessera_btree_t *, const void *keys,
                                    const void *values, uint32_t n,
                                    uint64_t *out_new_root);
 
+/* Called once per batch key that REPLACED an existing entry, with that
+ * entry's key, its old value, and the new value replacing it — a caller
+ * reclaiming resources owned by the old value needs the new one to tell
+ * a genuine displacement from a rewrite that keeps the same resources.
+ * The callback must not re-enter the tree; all three pointers are valid
+ * only for the duration of the call. */
+typedef void (*tessera_btree_displaced_cb_t)(void *ctx, const void *key,
+                                             const void *old_value,
+                                             const void *new_value);
+
+/* put_sorted_batch with displaced-entry notification. The merge pass
+ * already knows which keys collide; a caller that must reclaim resources
+ * owned by the old value gets them here instead of paying a separate
+ * O(n log n) lookup pass. cb == NULL is exactly put_sorted_batch. */
+int tessera_btree_put_sorted_batch_ex(tessera_btree_t *, const void *keys,
+                                      const void *values, uint32_t n,
+                                      uint64_t *out_new_root,
+                                      tessera_btree_displaced_cb_t cb,
+                                      void *ctx);
+
 int tessera_btree_put(tessera_btree_t *,
                       const void *key, const void *value,
                       uint64_t *out_new_root);

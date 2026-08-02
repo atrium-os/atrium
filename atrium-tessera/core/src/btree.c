@@ -762,7 +762,8 @@ out:
 static int
 batch_recurse(tessera_btree_t *t, uint64_t cur,
               const uint8_t *keys, const uint8_t *vals, uint32_t n,
-              struct batch_repl *out)
+              struct batch_repl *out,
+              tessera_btree_displaced_cb_t cb, void *cbctx)
 {
 	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
 	uint8_t *flat = NULL;
@@ -796,7 +797,19 @@ batch_recurse(tessera_btree_t *t, uint64_t cur,
 				memcpy(dst + t->key_size,
 				    vals + (size_t)j * t->value_size,
 				    t->value_size);
-				if (c == 0) i++;    /* replace */
+				if (c == 0) {       /* replace */
+					/* The merge is the only place that
+					 * knows this key collided — hand the
+					 * displaced value to the caller before
+					 * it is overwritten. */
+					if (cb != NULL)
+						cb(cbctx, ex + (size_t)i * es,
+						    ex + (size_t)i * es +
+						    t->key_size,
+						    vals + (size_t)j *
+						    t->value_size);
+					i++;
+				}
 				j++;
 			}
 			total++;
@@ -845,7 +858,8 @@ batch_recurse(tessera_btree_t *t, uint64_t cur,
 		memset(&sub, 0, sizeof sub);
 		rc = batch_recurse(t, child,
 		    keys + (size_t)j * t->key_size,
-		    vals + (size_t)j * t->value_size, jend - j, &sub);
+		    vals + (size_t)j * t->value_size, jend - j, &sub,
+		    cb, cbctx);
 		if (rc != TESSERA_OK) { batch_repl_free(&sub); goto out; }
 		if (total + sub.m > flat_cap) {
 			uint32_t nc = flat_cap * 2 + sub.m;
@@ -893,6 +907,16 @@ tessera_btree_put_sorted_batch(tessera_btree_t *t, const void *keys,
                                const void *values, uint32_t n,
                                uint64_t *out_new_root)
 {
+	return tessera_btree_put_sorted_batch_ex(t, keys, values, n,
+	    out_new_root, NULL, NULL);
+}
+
+int
+tessera_btree_put_sorted_batch_ex(tessera_btree_t *t, const void *keys,
+                                  const void *values, uint32_t n,
+                                  uint64_t *out_new_root,
+                                  tessera_btree_displaced_cb_t cb, void *ctx)
+{
 	if (t == NULL || keys == NULL || values == NULL || n == 0 ||
 	    out_new_root == NULL)
 		return TESSERA_EINVAL;
@@ -908,7 +932,7 @@ tessera_btree_put_sorted_batch(tessera_btree_t *t, const void *keys,
 
 	struct batch_repl repl;
 	memset(&repl, 0, sizeof repl);
-	int rc = batch_recurse(t, t->root, keys, values, n, &repl);
+	int rc = batch_recurse(t, t->root, keys, values, n, &repl, cb, ctx);
 	if (rc != TESSERA_OK) { batch_repl_free(&repl); return rc; }
 
 	/* Add root levels until a single node remains. */
