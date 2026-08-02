@@ -15817,6 +15817,35 @@ tessera_fs_publish_manifest_owned_ex(struct tessera_mount *tmp_,
 	 * which descends a disk-backed tree (multiple kbio_reads). With
 	 * the BTREE directory landing 2-3 publishes per dirent op, that
 	 * was the dominant per-op cost. */
+	/*
+	 * ★ THIS SKIP IS THE PACK-ZONE LEAK'S TRIGGER (fixed at the put, see
+	 * 1e42188). Recorded here because the reasoning above is subtly wrong
+	 * and the next reader will otherwise repeat it.
+	 *
+	 * The comment above justifies skipping the pre-check with: "pack_
+	 * registry's btree_put on commit_sb is idempotent for identical
+	 * pack_id". It is idempotent for the KEY — the tree ends up with one
+	 * entry either way — but it is NOT idempotent for the EXTENTS. The
+	 * displaced entry's sectors were silently dropped, referenced by
+	 * nothing, with no rollback: 5 sectors per occurrence, ~40% of
+	 * populates.
+	 *
+	 * It also assumes "a true content collision doesn't happen for
+	 * fresh-built content". It does. A known_new publish skips this check,
+	 * allocates a pack whose content-addressed pack_id already exists, and
+	 * displaces the old entry at flush.
+	 *
+	 * That asymmetry is why the leak resisted reproduction: deliberately
+	 * republishing identical content goes down the !known_new path and
+	 * dedups (measured: 3 publishes, 3 dedup hits, 0 displacements),
+	 * while the natural collisions arrive via known_new and skip it.
+	 *
+	 * The fix is at the put, not here — registry_ov_flush now returns the
+	 * displaced entry's extents, making the put idempotent for extents as
+	 * this comment already assumed. Restoring the pre-check would also
+	 * work but reintroduces the per-publish btree_get this skip exists to
+	 * avoid, which was the dominant per-op cost.
+	 */
 	if (!known_new) {
 		uint8_t pack_id_local[16];
 		memcpy(pack_id_local, out_hash, 16);
