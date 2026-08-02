@@ -2386,7 +2386,7 @@ static int tessera_fs_dirent_log_lookup(struct tessera_mount *tmp_,
     uint32_t parent_inode_no, const char *name, uint16_t namelen,
     int *out_op, uint64_t *out_inode);
 static int tessera_fs_dirent_log_checkpoint_parent(
-    struct tessera_mount *tmp_, uint32_t parent_inode_no);
+    struct tessera_mount *tmp_, uint32_t parent_inode_no, int wait_busy);
 static int tessera_fs_dirent_log_checkpoint_all(
     struct tessera_mount *tmp_);
 
@@ -2440,6 +2440,10 @@ static unsigned long tessera_stat_regov_left_behind = 0;
  * non-zero on a run that previously leaked. */
 static unsigned long tessera_stat_regov_displaced         = 0;
 static unsigned long tessera_stat_regov_displaced_sectors = 0;
+/* Effect counter for the ABBA fix: times flush declined to wait on a parent
+ * another thread was already checkpointing. Non-zero proves the skip path is
+ * being taken — i.e. the deadlock window was entered and survived. */
+static unsigned long tessera_stat_ckpt_skip_busy = 0;
 /*
  * ★ #102 residual: follow ONE sector through its whole life.
  *
@@ -6874,7 +6878,7 @@ tessera_vop_readdir(struct vop_readdir_args *ap)
 	 * cheaply (no log entries to apply). */
 	if (tn->snapshot_gen == 0)
 		(void)tessera_fs_dirent_log_checkpoint_parent(tmp_,
-		    (uint32_t)tn->inode_no);
+		    (uint32_t)tn->inode_no, 1);
 
 	uint8_t key[4];
 	tessera_inode_record_t dino;
@@ -21675,7 +21679,7 @@ tessera_dirent_log_collect_remove_at(
  * all dirty parents before commit_sb). */
 static int
 tessera_fs_dirent_log_checkpoint_parent(struct tessera_mount *tmp_,
-    uint32_t parent_inode_no)
+    uint32_t parent_inode_no, int wait_busy)
 {
 	if (!tmp_->dirty_init) return (0);
 
@@ -21694,9 +21698,24 @@ tessera_fs_dirent_log_checkpoint_parent(struct tessera_mount *tmp_,
 	 * DIFFERENT locks (flush under the gate; readdir/rmdir/rename
 	 * under a vnode lock), so two rebuilds of the same parent can
 	 * otherwise interleave read-modify-write on its manifest and the
-	 * loser's batch is silently lost. Wait, don't skip — the
-	 * semantic callers (rmdir empty-check, readdir) need the log
-	 * drained when we return. */
+	 * loser's batch is silently lost. The semantic callers (rmdir
+	 * empty-check, readdir, rename) need the log drained when we
+	 * return, so they WAIT (wait_busy=1).
+	 *
+	 * ★★ FLUSH MUST NOT WAIT (wait_busy=0) — ABBA deadlock otherwise:
+	 *
+	 *   readdir  holds ckpt_busy(P), then blocks taking the flush gate
+	 *            (the rebuild publishes: checkpoint_parent →
+	 *            dir_btree_publish_leaf → publish_manifest_to_disk →
+	 *            flush_gate_enter)
+	 *   flush    holds the flush gate, then blocks here on ckpt_busy(P)
+	 *
+	 * Observed live: kldxref(readdir) on tessgate + tessflush on
+	 * tessckpt, whole system idle. Flush has no semantic need to drain
+	 * this parent — another thread is already publishing exactly these
+	 * entries, and anything it does not take stays in the log (still
+	 * visible to lookups, still journaled for replay) for the next
+	 * checkpoint. So skip and let the holder finish. */
 	struct tessera_ckpt_busy busy = { .parent_inode_no = parent_inode_no };
 	mtx_lock(&tmp_->flush_mtx);
 	for (;;) {
@@ -21710,6 +21729,12 @@ tessera_fs_dirent_log_checkpoint_parent(struct tessera_mount *tmp_,
 		}
 		if (!found)
 			break;
+		if (!wait_busy) {
+			mtx_unlock(&tmp_->flush_mtx);
+			tessera_stat_ckpt_skip_busy++;
+			free(logents, M_TESSERA);
+			return (0);
+		}
 		(void)msleep(&tmp_->ckpt_busy, &tmp_->flush_mtx, PRIBIO,
 		    "tessckpt", 0);
 	}
@@ -22051,8 +22076,11 @@ collected:
 
 	int rc = 0;
 	for (uint32_t i = 0; i < count; i++) {
+		/* wait_busy=0: flush must never block on a parent another
+		 * thread is checkpointing — see the ABBA note in
+		 * checkpoint_parent. */
 		int prc = tessera_fs_dirent_log_checkpoint_parent(tmp_,
-		    parents[i]);
+		    parents[i], 0);
 		if (prc != 0 && rc == 0) rc = prc;
 	}
 	free(parents, M_TESSERA);
@@ -22143,6 +22171,10 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, regov_displaced, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, regov_displaced_sectors, CTLFLAG_RD,
     &tessera_stat_regov_displaced_sectors, 0,
     "sectors reclaimed from displaced registry entries");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, ckpt_skip_busy, CTLFLAG_RD,
+    &tessera_stat_ckpt_skip_busy, 0,
+    "flush skipped a dirent checkpoint another thread already held "
+    "(breaks the readdir-vs-flush ABBA deadlock)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, regov_left_behind, CTLFLAG_RD,
     &tessera_stat_regov_left_behind, 0,
     "overlay entries the n-bound left uncollected in a flush (#pack-zone leak)");
@@ -23341,7 +23373,7 @@ tessera_vop_rmdir(struct vop_rmdir_args *ap)
 	 * remaining REMOVE op is still pending in the log looks
 	 * non-empty to the manifest walk. */
 	(void)tessera_fs_dirent_log_checkpoint_parent(tmp_,
-	    (uint32_t)cn->inode_no);
+	    (uint32_t)cn->inode_no, 1);
 
 	/* Fetch child inode + manifest, verify it's empty. */
 	uint8_t ckey[4];
@@ -23935,7 +23967,7 @@ tessera_vop_rename(struct vop_rename_args *ap)
 			 * v2.6: force-checkpoint the target dir so the
 			 * manifest reflects any pending log REMOVEs. */
 			(void)tessera_fs_dirent_log_checkpoint_parent(tmp_,
-			    (uint32_t)tn->inode_no);
+			    (uint32_t)tn->inode_no, 1);
 			uint8_t tkey[4];
 			tessera_inode_record_t tino;
 			encode_inode_key((uint32_t)tn->inode_no, tkey);
