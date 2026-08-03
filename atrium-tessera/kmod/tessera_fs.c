@@ -1593,6 +1593,44 @@ static void tessera_fs_seed_constant_manifests(struct tessera_mount *tmp_);
 static int tessera_vop_lookup_impl(struct vop_cachedlookup_args *ap);
 static int tessera_vop_create_impl(struct vop_create_args *ap);
 static int tessera_vop_write_impl(struct vop_write_args *ap);
+
+/* ── BSD file flags <-> on-disk TESSERA_INODE_FLAG_* (#105) ──────────
+ *
+ * The on-disk flags word is Tessera's own encoding, NOT the BSD UF_ / SF_
+ * bit values, so it cannot be handed to va_flags raw. It also carries an
+ * INTERNAL bit (SUBVOL_ROOT) that is not user-visible and must survive a
+ * chflags round-trip.
+ *
+ * Only the UF_* flags are supported. Anything else — notably the SF_*
+ * system flags, which need securelevel handling — is REFUSED rather than
+ * accepted-and-dropped: silently ignoring a flag change is exactly the bug
+ * being fixed here.
+ */
+#define TESSERA_BSD_FLAGS_SUPPORTED \
+	(UF_IMMUTABLE | UF_APPEND | UF_NODUMP | UF_OPAQUE)
+
+static u_long
+tessera_flags_to_bsd(uint32_t f)
+{
+	u_long v = 0;
+	if (f & TESSERA_INODE_FLAG_IMMUTABLE)   v |= UF_IMMUTABLE;
+	if (f & TESSERA_INODE_FLAG_APPEND_ONLY) v |= UF_APPEND;
+	if (f & TESSERA_INODE_FLAG_NODUMP)      v |= UF_NODUMP;
+	if (f & TESSERA_INODE_FLAG_OPAQUE)      v |= UF_OPAQUE;
+	return (v);
+}
+
+static uint32_t
+tessera_flags_from_bsd(u_long v, uint32_t keep)
+{
+	uint32_t f = keep & TESSERA_INODE_FLAG_SUBVOL_ROOT;  /* internal */
+	if (v & UF_IMMUTABLE)   f |= TESSERA_INODE_FLAG_IMMUTABLE;
+	if (v & UF_APPEND)      f |= TESSERA_INODE_FLAG_APPEND_ONLY;
+	if (v & UF_NODUMP)      f |= TESSERA_INODE_FLAG_NODUMP;
+	if (v & UF_OPAQUE)      f |= TESSERA_INODE_FLAG_OPAQUE;
+	return (f);
+}
+
 static int tessera_vop_setattr_impl(struct vop_setattr_args *ap);
 struct tessera_pack_alloc_result;
 static int tessera_fs_pack_alloc_and_write(struct tessera_mount *tmp_,
@@ -2444,6 +2482,14 @@ static unsigned long tessera_stat_regov_displaced_sectors = 0;
  * another thread was already checkpointing. Non-zero proves the skip path is
  * being taken — i.e. the deadlock window was entered and survived. */
 static unsigned long tessera_stat_ckpt_skip_busy = 0;
+/* #105 diagnostics: is the enforcement hook actually reached, and from
+ * which VOP? unlink is refused nowhere while write/chmod are refused, so
+ * measure the call rather than reason about the dispatch. */
+static unsigned long tessera_stat_flags_checked = 0;
+static unsigned long tessera_stat_flags_refused = 0;
+static unsigned long tessera_stat_flags_remove_calls = 0;
+static unsigned long tessera_stat_flags_last_ino = 0;
+static unsigned long tessera_stat_flags_last_val = 0;
 /*
  * ★ #102 residual: follow ONE sector through its whole life.
  *
@@ -6284,7 +6330,10 @@ tessera_vop_getattr(struct vop_getattr_args *ap)
 			vap->va_birthtime.tv_sec  = ino.btime_ns / 1000000000ULL;
 			vap->va_birthtime.tv_nsec = ino.btime_ns % 1000000000ULL;
 			vap->va_gen   = ino.gen ? ino.gen : 1;
-			vap->va_flags = ino.flags;
+			/* #105: map — the on-disk word is Tessera's encoding,
+			 * not BSD UF_ / SF_ values, and carries an internal
+			 * SUBVOL_ROOT bit that must not leak to userland. */
+			vap->va_flags = tessera_flags_to_bsd(ino.flags);
 			/*
 			 * st_blocks (va_bytes/512). Reporting 0 here made `du`
 			 * report 0 for EVERY file and every tree — a 31 KB
@@ -7593,6 +7642,42 @@ out:
  * stack arrays per recursion level vs FreeBSD aarch64's 16 KiB
  * kstack). Fix: btree.c put-path now heap-allocates its node buffers.
  */
+/*
+ * Is this vnode protected against the mutation `want`? Storing the flag is
+ * only half of #105 — an unenforced uchg is arguably worse than none, since
+ * stat then reports a protection that does not hold.
+ *   want 0 = general mutation (write/unlink/rename/link/attr change)
+ *   want 1 = append-class write (allowed under APPEND_ONLY)
+ * Returns EPERM if refused, 0 otherwise. Unreadable inode => allow, so a
+ * damaged record cannot wedge the namespace.
+ */
+static int
+tessera_flags_check(struct vnode *vp, int want_append)
+{
+	struct tessera_node *tn = vp->v_data;
+	struct tessera_mount *tmp_;
+	tessera_inode_record_t ino;
+	uint8_t key[4];
+
+	if (tn == NULL || tn->kind != TESSERA_NODE_REGULAR) return (0);
+	tmp_ = VFSTOTESSERA(vp->v_mount);
+	if (tmp_ == NULL || tmp_->inode_tree == NULL) return (0);
+	encode_inode_key((uint32_t)tn->inode_no, key);
+	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK) return (0);
+	tessera_stat_flags_checked++;
+	tessera_stat_flags_last_ino = (unsigned long)tn->inode_no;
+	tessera_stat_flags_last_val = (unsigned long)ino.flags;
+	if (ino.flags & TESSERA_INODE_FLAG_IMMUTABLE) {
+		tessera_stat_flags_refused++;
+		return (EPERM);
+	}
+	if ((ino.flags & TESSERA_INODE_FLAG_APPEND_ONLY) && !want_append) {
+		tessera_stat_flags_refused++;
+		return (EPERM);
+	}
+	return (0);
+}
+
 static int
 tessera_vop_setattr(struct vop_setattr_args *ap)
 {
@@ -7628,9 +7713,17 @@ tessera_vop_setattr_impl(struct vop_setattr_args *ap)
 	int seen_mode  = (vap->va_mode != (mode_t)VNOVAL);
 	int seen_uid   = (vap->va_uid  != (uid_t)VNOVAL);
 	int seen_gid   = (vap->va_gid  != (gid_t)VNOVAL);
+	int seen_flags = (vap->va_flags != VNOVAL);
+
+	/* #105: refuse flags we do not implement rather than accept and drop
+	 * them. chflags returning 0 while storing nothing is exactly how an
+	 * unenforced uchg shipped. */
+	if (seen_flags &&
+	    (vap->va_flags & ~(u_long)TESSERA_BSD_FLAGS_SUPPORTED))
+		return (EOPNOTSUPP);
 
 	if (!seen_atime && !seen_mtime && !seen_size && !seen_mode &&
-	    !seen_uid && !seen_gid)
+	    !seen_uid && !seen_gid && !seen_flags)
 		return (0);
 	if (tmp_->inode_tree == NULL) return (EROFS);
 
@@ -7638,6 +7731,23 @@ tessera_vop_setattr_impl(struct vop_setattr_args *ap)
 	if (tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no, &ino)
 	    != TESSERA_OK)
 		return (EIO);
+
+	/*
+	 * #105 enforcement, against the ON-DISK flags and before any are
+	 * overwritten below. An immutable inode refuses every attribute
+	 * change except clearing its own flags; append-only refuses a size
+	 * change (truncate) but permits the rest.
+	 */
+	if (ino.flags & TESSERA_INODE_FLAG_IMMUTABLE) {
+		if (seen_atime || seen_mtime || seen_size || seen_mode ||
+		    seen_uid || seen_gid)
+			return (EPERM);
+	}
+	if ((ino.flags & TESSERA_INODE_FLAG_APPEND_ONLY) && seen_size)
+		return (EPERM);
+	if (seen_flags && ap->a_cred != NULL &&
+	    ap->a_cred->cr_uid != 0 && ap->a_cred->cr_uid != ino.uid)
+		return (EPERM);   /* only the owner or root may change flags */
 
 	/* POSIX permission gate — match UFS's behaviour. The kernel calls
 	 * VOP_ACCESS(VWRITE) before VOP_SETATTR for the truncate path, so
@@ -7789,6 +7899,8 @@ post_resize:
 		ino.mode = (ino.mode & 0170000) | (vap->va_mode & 07777);
 	if (seen_uid) ino.uid = vap->va_uid;
 	if (seen_gid) ino.gid = vap->va_gid;
+	if (seen_flags)
+		ino.flags = tessera_flags_from_bsd(vap->va_flags, ino.flags);
 	/* POSIX: chown by a non-privileged process clears S_ISUID and
 	 * S_ISGID. Symlinks are exempt (they have no executable
 	 * payload); UFS guards similarly. PRIV_VFS_RETAINSUGID lets a
@@ -7799,7 +7911,8 @@ post_resize:
 	    priv_check_cred(cred, PRIV_VFS_RETAINSUGID) != 0) {
 		ino.mode &= ~06000;
 	}
-	if (seen_atime || seen_mtime || seen_mode || seen_uid || seen_gid) {
+	if (seen_atime || seen_mtime || seen_mode || seen_uid || seen_gid ||
+	    seen_flags) {
 		struct timeval tv;
 		getmicrotime(&tv);
 		ino.ctime_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
@@ -20724,6 +20837,9 @@ tessera_fs_sticky_check(struct tessera_mount *tmp_,
 static int
 tessera_vop_remove(struct vop_remove_args *ap)
 {
+	/* #105: immutable/append-only inodes resist unlink and link. */
+	tessera_stat_flags_remove_calls++;
+	{ int _fe = tessera_flags_check(ap->a_vp, 0); if (_fe != 0) return (_fe); }
 	struct vnode *dvp = ap->a_dvp;
 	struct vnode *vp  = ap->a_vp;
 	struct componentname *cnp = ap->a_cnp;
@@ -22205,6 +22321,16 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, regov_displaced, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, regov_displaced_sectors, CTLFLAG_RD,
     &tessera_stat_regov_displaced_sectors, 0,
     "sectors reclaimed from displaced registry entries");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_checked, CTLFLAG_RD,
+    &tessera_stat_flags_checked, 0, "tessera_flags_check calls reaching the inode");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_refused, CTLFLAG_RD,
+    &tessera_stat_flags_refused, 0, "mutations refused by file flags");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_remove_calls, CTLFLAG_RD,
+    &tessera_stat_flags_remove_calls, 0, "vop_remove reached the flags check");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_last_ino, CTLFLAG_RD,
+    &tessera_stat_flags_last_ino, 0, "inode last inspected by the flags check");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_last_val, CTLFLAG_RD,
+    &tessera_stat_flags_last_val, 0, "on-disk flags word last inspected");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, ckpt_skip_busy, CTLFLAG_RD,
     &tessera_stat_ckpt_skip_busy, 0,
     "flush skipped a dirent checkpoint another thread already held "
@@ -22962,6 +23088,20 @@ tessera_vop_write(struct vop_write_args *ap)
 static int
 tessera_vop_write_impl(struct vop_write_args *ap)
 {
+	/* #105: immutable refuses all writes; append-only permits a write
+	 * only when it is an append (IO_APPEND, or the caller is at EOF). */
+	{
+		struct uio *_u = ap->a_uio;
+		int _app = (ap->a_ioflag & IO_APPEND) != 0;
+		if (!_app && _u != NULL) {
+			struct vattr _va;
+			if (VOP_GETATTR(ap->a_vp, &_va, ap->a_cred) == 0 &&
+			    _u->uio_offset >= (off_t)_va.va_size)
+				_app = 1;
+		}
+		int _fe = tessera_flags_check(ap->a_vp, _app);
+		if (_fe != 0) return (_fe);
+	}
 	struct vnode *vp = ap->a_vp;
 	struct uio   *uio = ap->a_uio;
 	int           ioflag = ap->a_ioflag;
@@ -23635,6 +23775,8 @@ tessera_vop_readlink(struct vop_readlink_args *ap)
 static int
 tessera_vop_link(struct vop_link_args *ap)
 {
+	/* #105: immutable/append-only inodes resist unlink and link. */
+	{ int _fe = tessera_flags_check(ap->a_vp, 0); if (_fe != 0) return (_fe); }
 	struct vnode *tdvp = ap->a_tdvp;
 	struct vnode *vp   = ap->a_vp;
 	struct componentname *cnp = ap->a_cnp;
@@ -23913,6 +24055,20 @@ tessera_fs_inode_unlink(struct tessera_mount *tmp_, uint32_t inode_no)
 static int
 tessera_vop_rename(struct vop_rename_args *ap)
 {
+	/* #105: refuse to rename a protected source, or over a protected
+	 * target — both are mutations of a flagged inode's namespace entry. */
+	{
+		int _fe = tessera_flags_check(ap->a_fvp, 0);
+		if (_fe == 0 && ap->a_tvp != NULL)
+			_fe = tessera_flags_check(ap->a_tvp, 0);
+		if (_fe != 0) {
+			if (ap->a_tdvp == ap->a_tvp) vrele(ap->a_tdvp);
+			else vput(ap->a_tdvp);
+			if (ap->a_tvp) vput(ap->a_tvp);
+			vrele(ap->a_fdvp); vrele(ap->a_fvp);
+			return (_fe);
+		}
+	}
 	struct vnode *fdvp = ap->a_fdvp;
 	struct vnode *fvp  = ap->a_fvp;
 	struct componentname *fcnp = ap->a_fcnp;
