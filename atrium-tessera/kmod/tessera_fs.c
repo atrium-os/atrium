@@ -2493,6 +2493,9 @@ static unsigned long tessera_stat_flags_last_val = 0;
 static unsigned long tessera_stat_flags_last_fsid = 0;
 static unsigned long tessera_stat_flags_last_mode = 0;
 static unsigned long tessera_stat_flags_last_nlink = 0;
+static unsigned long tessera_stat_flags_btree_val = 0;
+static unsigned long tessera_stat_flags_src_dirty = 0;
+static unsigned long tessera_stat_flags_btree_rc = 0;
 /*
  * ★ #102 residual: follow ONE sector through its whole life.
  *
@@ -7674,6 +7677,35 @@ tessera_flags_check(struct vnode *vp, int want_append)
 	    (unsigned long)vp->v_mount->mnt_stat.f_fsid.val[0];
 	tessera_stat_flags_last_mode  = (unsigned long)ino.mode;
 	tessera_stat_flags_last_nlink = (unsigned long)ino.nlink;
+	/*
+	 * #105 discriminator: read the SAME inode straight from the btree,
+	 * bypassing the dirty-inode overlay, and separately note whether an
+	 * overlay entry exists. getattr and this check call the same
+	 * accessor yet disagree about the flags field alone, so establish
+	 * which SOURCE each is actually landing on.
+	 */
+	{
+		tessera_inode_record_t _b;
+		memset(&_b, 0, sizeof _b);
+		int _rc = tessera_btree_get(tmp_->inode_tree, key, &_b);
+		tessera_stat_flags_btree_rc  = (unsigned long)(_rc & 0xff);
+		tessera_stat_flags_btree_val = (unsigned long)_b.flags;
+		unsigned long _d = 0;
+		if (tmp_->dirty_init) {
+			mtx_lock(&tmp_->flush_mtx);
+			uint32_t _bk = (uint32_t)tn->inode_no &
+			    (TESSERA_DIRTY_INODE_BUCKETS - 1u);
+			struct tessera_dirty_inode *_e;
+			LIST_FOREACH(_e, &tmp_->dirty_inodes[_bk], link) {
+				if (_e->inode_no == (uint32_t)tn->inode_no) {
+					_d = 1u | ((unsigned long)_e->rec.flags << 8);
+					break;
+				}
+			}
+			mtx_unlock(&tmp_->flush_mtx);
+		}
+		tessera_stat_flags_src_dirty = _d;
+	}
 	if (ino.flags & TESSERA_INODE_FLAG_IMMUTABLE) {
 		tessera_stat_flags_refused++;
 		return (EPERM);
@@ -22344,6 +22376,12 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_last_mode, CTLFLAG_RD,
     &tessera_stat_flags_last_mode, 0, "mode of the record the flags check read");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_last_nlink, CTLFLAG_RD,
     &tessera_stat_flags_last_nlink, 0, "nlink of the record the flags check read");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_btree_val, CTLFLAG_RD,
+    &tessera_stat_flags_btree_val, 0, "flags word read STRAIGHT from the inode btree");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_btree_rc, CTLFLAG_RD,
+    &tessera_stat_flags_btree_rc, 0, "rc of that direct btree read");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_src_dirty, CTLFLAG_RD,
+    &tessera_stat_flags_src_dirty, 0, "1 = a dirty-overlay entry existed for this inode");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, ckpt_skip_busy, CTLFLAG_RD,
     &tessera_stat_ckpt_skip_busy, 0,
     "flush skipped a dirent checkpoint another thread already held "
