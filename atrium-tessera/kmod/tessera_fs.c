@@ -2490,6 +2490,9 @@ static unsigned long tessera_stat_flags_refused = 0;
 static unsigned long tessera_stat_flags_remove_calls = 0;
 static unsigned long tessera_stat_flags_last_ino = 0;
 static unsigned long tessera_stat_flags_last_val = 0;
+static unsigned long tessera_stat_flags_last_fsid = 0;
+static unsigned long tessera_stat_flags_last_mode = 0;
+static unsigned long tessera_stat_flags_last_nlink = 0;
 /*
  * ★ #102 residual: follow ONE sector through its whole life.
  *
@@ -7667,6 +7670,10 @@ tessera_flags_check(struct vnode *vp, int want_append)
 	tessera_stat_flags_checked++;
 	tessera_stat_flags_last_ino = (unsigned long)tn->inode_no;
 	tessera_stat_flags_last_val = (unsigned long)ino.flags;
+	tessera_stat_flags_last_fsid =
+	    (unsigned long)vp->v_mount->mnt_stat.f_fsid.val[0];
+	tessera_stat_flags_last_mode  = (unsigned long)ino.mode;
+	tessera_stat_flags_last_nlink = (unsigned long)ino.nlink;
 	if (ino.flags & TESSERA_INODE_FLAG_IMMUTABLE) {
 		tessera_stat_flags_refused++;
 		return (EPERM);
@@ -22331,6 +22338,12 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_last_ino, CTLFLAG_RD,
     &tessera_stat_flags_last_ino, 0, "inode last inspected by the flags check");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_last_val, CTLFLAG_RD,
     &tessera_stat_flags_last_val, 0, "on-disk flags word last inspected");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_last_fsid, CTLFLAG_RD,
+    &tessera_stat_flags_last_fsid, 0, "fsid of the mount the flags check resolved");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_last_mode, CTLFLAG_RD,
+    &tessera_stat_flags_last_mode, 0, "mode of the record the flags check read");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_last_nlink, CTLFLAG_RD,
+    &tessera_stat_flags_last_nlink, 0, "nlink of the record the flags check read");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, ckpt_skip_busy, CTLFLAG_RD,
     &tessera_stat_ckpt_skip_busy, 0,
     "flush skipped a dirent checkpoint another thread already held "
