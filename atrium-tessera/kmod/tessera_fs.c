@@ -1596,23 +1596,32 @@ static int tessera_vop_write_impl(struct vop_write_args *ap);
 
 /* ── BSD file flags <-> on-disk TESSERA_INODE_FLAG_* (#105) ──────────
  *
- * The on-disk flags word is Tessera's own encoding, NOT the BSD UF_ / SF_
- * bit values, so it cannot be handed to va_flags raw. It also carries an
- * INTERNAL bit (SUBVOL_ROOT) that is not user-visible and must survive a
- * chflags round-trip.
+ * Supported = every UF_ flag (the low 16 bits of va_flags). SF_ system flags
+ * need securelevel semantics we do not implement and are REFUSED, never
+ * silently dropped.
  *
- * Only the UF_* flags are supported. Anything else — notably the SF_*
- * system flags, which need securelevel handling — is REFUSED rather than
- * accepted-and-dropped: silently ignoring a flag change is exactly the bug
- * being fixed here.
+ * ★ Honouring only the four flags we model was not enough: ZFS sets
+ * UF_ARCHIVE (0x800) on every file, so `cp -a` and `tar -p` from a ZFS
+ * source hand us a flag we then rejected — which broke the devroot rebuild
+ * outright ("cp: chflags: ...: Operation not supported"). Any UF_ flag must
+ * ROUND-TRIP even when it carries no behaviour here.
+ *
+ * On-disk layout of the flags word:
+ *   bits 0..15   Tessera's own TESSERA_INODE_FLAG_* (semantic + internal)
+ *   bits 16..31  the raw UF_ value, so unmodelled flags survive verbatim
+ * A zero raw half means "written before this encoding", and the low bits are
+ * mapped the legacy way so existing volumes keep working.
  */
-#define TESSERA_BSD_FLAGS_SUPPORTED \
-	(UF_IMMUTABLE | UF_APPEND | UF_NODUMP | UF_OPAQUE)
+#define TESSERA_BSD_UF_MASK      0x0000ffffu  /* UF_*; SF_* live above this */
+#define TESSERA_FLAGS_RAW_SHIFT  16
 
 static u_long
 tessera_flags_to_bsd(uint32_t f)
 {
-	u_long v = 0;
+	u_long raw = (u_long)(f >> TESSERA_FLAGS_RAW_SHIFT) & TESSERA_BSD_UF_MASK;
+	if (raw != 0)
+		return (raw);            /* authoritative: exact round-trip */
+	u_long v = 0;                    /* legacy volume: semantic bits only */
 	if (f & TESSERA_INODE_FLAG_IMMUTABLE)   v |= UF_IMMUTABLE;
 	if (f & TESSERA_INODE_FLAG_APPEND_ONLY) v |= UF_APPEND;
 	if (f & TESSERA_INODE_FLAG_NODUMP)      v |= UF_NODUMP;
@@ -1624,10 +1633,13 @@ static uint32_t
 tessera_flags_from_bsd(u_long v, uint32_t keep)
 {
 	uint32_t f = keep & TESSERA_INODE_FLAG_SUBVOL_ROOT;  /* internal */
+	/* Semantic bits drive enforcement (immutable / append-only). */
 	if (v & UF_IMMUTABLE)   f |= TESSERA_INODE_FLAG_IMMUTABLE;
 	if (v & UF_APPEND)      f |= TESSERA_INODE_FLAG_APPEND_ONLY;
 	if (v & UF_NODUMP)      f |= TESSERA_INODE_FLAG_NODUMP;
 	if (v & UF_OPAQUE)      f |= TESSERA_INODE_FLAG_OPAQUE;
+	/* ...and the raw half preserves everything, modelled or not. */
+	f |= (uint32_t)((v & TESSERA_BSD_UF_MASK) << TESSERA_FLAGS_RAW_SHIFT);
 	return (f);
 }
 
@@ -7836,9 +7848,8 @@ tessera_vop_setattr_impl(struct vop_setattr_args *ap)
 	/* #105: refuse flags we do not implement rather than accept and drop
 	 * them. chflags returning 0 while storing nothing is exactly how an
 	 * unenforced uchg shipped. */
-	if (seen_flags &&
-	    (vap->va_flags & ~(u_long)TESSERA_BSD_FLAGS_SUPPORTED))
-		return (EOPNOTSUPP);
+	if (seen_flags && (vap->va_flags & ~(u_long)TESSERA_BSD_UF_MASK))
+		return (EOPNOTSUPP);   /* SF_* need securelevel; not modelled */
 
 	if (!seen_atime && !seen_mtime && !seen_size && !seen_mode &&
 	    !seen_uid && !seen_gid && !seen_flags)
