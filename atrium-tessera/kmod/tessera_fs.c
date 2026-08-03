@@ -2508,18 +2508,7 @@ static unsigned long tessera_stat_ckpt_skip_busy = 0;
 /* #105 diagnostics: is the enforcement hook actually reached, and from
  * which VOP? unlink is refused nowhere while write/chmod are refused, so
  * measure the call rather than reason about the dispatch. */
-static unsigned long tessera_stat_flags_checked = 0;
 static unsigned long tessera_stat_flags_refused = 0;
-static unsigned long tessera_stat_flags_remove_calls = 0;
-static unsigned long tessera_stat_flags_last_ino = 0;
-static unsigned long tessera_stat_flags_last_val = 0;
-static unsigned long tessera_stat_flags_last_fsid = 0;
-static unsigned long tessera_stat_flags_last_mode = 0;
-static unsigned long tessera_stat_flags_last_nlink = 0;
-static unsigned long tessera_stat_flags_btree_val = 0;
-static unsigned long tessera_stat_flags_src_dirty = 0;
-static unsigned long tessera_stat_flags_btree_rc = 0;
-static unsigned long tessera_stat_flags_ovl_caller = 0;
 
 /*
  * #105: a ring of the last setattr calls. One field per rebuild cycle was
@@ -7751,44 +7740,6 @@ tessera_flags_check(struct vnode *vp, int want_append)
 	if (tmp_ == NULL || tmp_->inode_tree == NULL) return (0);
 	encode_inode_key((uint32_t)tn->inode_no, key);
 	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK) return (0);
-	tessera_stat_flags_checked++;
-	tessera_stat_flags_last_ino = (unsigned long)tn->inode_no;
-	tessera_stat_flags_last_val = (unsigned long)ino.flags;
-	tessera_stat_flags_last_fsid =
-	    (unsigned long)vp->v_mount->mnt_stat.f_fsid.val[0];
-	tessera_stat_flags_last_mode  = (unsigned long)ino.mode;
-	tessera_stat_flags_last_nlink = (unsigned long)ino.nlink;
-	/*
-	 * #105 discriminator: read the SAME inode straight from the btree,
-	 * bypassing the dirty-inode overlay, and separately note whether an
-	 * overlay entry exists. getattr and this check call the same
-	 * accessor yet disagree about the flags field alone, so establish
-	 * which SOURCE each is actually landing on.
-	 */
-	{
-		tessera_inode_record_t _b;
-		memset(&_b, 0, sizeof _b);
-		int _rc = tessera_btree_get(tmp_->inode_tree, key, &_b);
-		tessera_stat_flags_btree_rc  = (unsigned long)(_rc & 0xff);
-		tessera_stat_flags_btree_val = (unsigned long)_b.flags;
-		unsigned long _d = 0;
-		if (tmp_->dirty_init) {
-			mtx_lock(&tmp_->flush_mtx);
-			uint32_t _bk = (uint32_t)tn->inode_no &
-			    (TESSERA_DIRTY_INODE_BUCKETS - 1u);
-			struct tessera_dirty_inode *_e;
-			LIST_FOREACH(_e, &tmp_->dirty_inodes[_bk], link) {
-				if (_e->inode_no == (uint32_t)tn->inode_no) {
-					_d = 1u | ((unsigned long)_e->rec.flags << 8);
-					tessera_stat_flags_ovl_caller =
-					    (unsigned long)_e->caller;
-					break;
-				}
-			}
-			mtx_unlock(&tmp_->flush_mtx);
-		}
-		tessera_stat_flags_src_dirty = _d;
-	}
 	if (ino.flags & TESSERA_INODE_FLAG_IMMUTABLE) {
 		tessera_stat_flags_refused++;
 		return (EPERM);
@@ -20999,7 +20950,6 @@ static int
 tessera_vop_remove(struct vop_remove_args *ap)
 {
 	/* #105: immutable/append-only inodes resist unlink and link. */
-	tessera_stat_flags_remove_calls++;
 	{ int _fe = tessera_flags_check(ap->a_vp, 0); if (_fe != 0) return (_fe); }
 	struct vnode *dvp = ap->a_dvp;
 	struct vnode *vp  = ap->a_vp;
@@ -22482,31 +22432,8 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, regov_displaced, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, regov_displaced_sectors, CTLFLAG_RD,
     &tessera_stat_regov_displaced_sectors, 0,
     "sectors reclaimed from displaced registry entries");
-SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_checked, CTLFLAG_RD,
-    &tessera_stat_flags_checked, 0, "tessera_flags_check calls reaching the inode");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_refused, CTLFLAG_RD,
     &tessera_stat_flags_refused, 0, "mutations refused by file flags");
-SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_remove_calls, CTLFLAG_RD,
-    &tessera_stat_flags_remove_calls, 0, "vop_remove reached the flags check");
-SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_last_ino, CTLFLAG_RD,
-    &tessera_stat_flags_last_ino, 0, "inode last inspected by the flags check");
-SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_last_val, CTLFLAG_RD,
-    &tessera_stat_flags_last_val, 0, "on-disk flags word last inspected");
-SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_last_fsid, CTLFLAG_RD,
-    &tessera_stat_flags_last_fsid, 0, "fsid of the mount the flags check resolved");
-SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_last_mode, CTLFLAG_RD,
-    &tessera_stat_flags_last_mode, 0, "mode of the record the flags check read");
-SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_last_nlink, CTLFLAG_RD,
-    &tessera_stat_flags_last_nlink, 0, "nlink of the record the flags check read");
-SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_btree_val, CTLFLAG_RD,
-    &tessera_stat_flags_btree_val, 0, "flags word read STRAIGHT from the inode btree");
-SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_btree_rc, CTLFLAG_RD,
-    &tessera_stat_flags_btree_rc, 0, "rc of that direct btree read");
-SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_src_dirty, CTLFLAG_RD,
-    &tessera_stat_flags_src_dirty, 0, "1 = a dirty-overlay entry existed for this inode");
-SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_ovl_caller, CTLFLAG_RD,
-    &tessera_stat_flags_ovl_caller, 0,
-    "return address of whoever last wrote that overlay entry");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, ckpt_skip_busy, CTLFLAG_RD,
     &tessera_stat_ckpt_skip_busy, 0,
     "flush skipped a dirent checkpoint another thread already held "
