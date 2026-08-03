@@ -104,6 +104,8 @@ pub const TESSERA_BTREE_KIND_FREE_EXT: u8 = 2;
 pub const TESSERA_BTREE_KIND_SNAPSHOT: u8 = 3;
 pub const TESSERA_BTREE_KIND_QUOTA:    u8 = 4;
 pub const TESSERA_BTREE_KIND_BLOB_INDEX: u8 = 5;   /* key=32 hash, val=16 pack_id */
+pub const TESSERA_BLOB_INDEX_KEY_SIZE: u32 = 32;
+pub const TESSERA_BLOB_INDEX_VAL_SIZE: u32 = 16;
 
 pub const TESSERA_INODE_RECORD_SIZE:   u32 = 144;
 pub const TESSERA_REGISTRY_ENTRY_SIZE: u32 = 64;

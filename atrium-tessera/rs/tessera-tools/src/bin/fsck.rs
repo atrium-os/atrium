@@ -127,16 +127,45 @@ const TESSERA_ENOENT: i32 = -6;
 /// there is destroyed — no amount of retrying recovers it. IO means only that
 /// this run could not read it, which may well be transient. Reporting both as
 /// "damaged" would invite retiring snapshots that are perfectly fine.
-fn describe_fail(f: i32, sector: u64, found_kind: u8) -> String {
+fn describe_fail(f: i32, sector: u64, found_kind: u8, subject: &str) -> String {
     match f {
         btree_fail::KIND => format!(
-            "sector {sector} now holds a tree of kind {found_kind}, so it was recycled — this snapshot is destroyed, not merely unreadable"),
+            "sector {sector} now holds a tree of kind {found_kind}, so it was recycled — this {subject} is destroyed, not merely unreadable"),
         btree_fail::HEADER => format!(
             "sector {sector} is not a btree node (bad magic or CRC)"),
         btree_fail::IO => format!(
-            "sector {sector} could not be read — this may be transient, so do NOT retire the snapshot on this evidence alone"),
+            "sector {sector} could not be read — this may be transient, so do NOT act destructively on this {subject} on this evidence alone"),
         _ => "unknown reason".to_string(),
     }
+}
+
+/// Explain why a root sector did not open as `want_kind`.
+///
+/// `tessera_btree_last_fail` cannot be used here: it reports state recorded on
+/// a tree handle while loading a node, and a failed OPEN yields no handle. So
+/// read the sector and classify it directly. The KIND case is the important
+/// one — it means the sector holds a valid node of ANOTHER tree, i.e. it was
+/// freed and reused, which is #64 (GC reclaiming index nodes) and is
+/// unrecoverable rather than transient.
+fn describe_root_sector(f: &std::fs::File, sector: u64, want_kind: u8) -> String {
+    let mut b = [0u8; SECTOR_SIZE as usize];
+    match f.read_at(&mut b, sector * SECTOR_SIZE) {
+        Ok(n) if n == b.len() => {}
+        _ => return format!("sector {sector} could not be read \
+                             — this may be transient, so re-run before concluding"),
+    }
+    if &b[0..4] != b"TBTR" {
+        return format!("sector {sector} is not a btree node (bad magic) \
+                        — it was freed and overwritten by unrelated data");
+    }
+    let got = b[7];
+    if got != want_kind {
+        return format!("sector {sector} holds a tree of kind {got}, not {want_kind} \
+                        — it was recycled into another tree, so the index is destroyed, \
+                        not merely stale");
+    }
+    format!("sector {sector} has the right magic and kind but failed to open \
+             (CRC or geometry mismatch)")
 }
 
 /// Cap on problems recorded per snapshot: one damaged shared manifest can be
@@ -418,6 +447,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
      * re-hash verification below must use it, not raw sha256 */
     let hash_alg = unsafe { tessera_volume_hash_alg(v) };
     let quota_root = unsafe { tessera_volume_quota_tree_root(v) };
+    let blob_index_root = unsafe { tessera_volume_blob_index_root(v) };
     let snapshots_root = unsafe { tessera_volume_snapshots_root(v) };
     let next_inode_no = unsafe { tessera_volume_next_inode_no(v) };
     let mr_start = unsafe { tessera_volume_meta_reserve_start(v) };
@@ -475,6 +505,11 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
 
     // ── Pass A: pack registry → blob set + extent overlap ────────
     let mut intervals: Vec<(u64, u64, String)> = Vec::new();
+    // Truth for blob-index validation: which packs exist, and which packs
+    // actually hold each blob. Both are byproducts of the registry walk
+    // below, so validating the index costs a comparison, not a second pass.
+    let mut pack_ids: HashSet<[u8; 16]> = HashSet::new();
+    let mut blob_pack: HashMap<Hash, Vec<[u8; 16]>> = HashMap::new();
     unsafe {
         let t = tessera_btree_open(&io, pack_root, TESSERA_BTREE_KIND_PACK_REG, 16,
             TESSERA_REGISTRY_ENTRY_SIZE);
@@ -490,6 +525,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
                     break;
                 }
                 fsck.packs += 1;
+                pack_ids.insert(key);
                 let start = rd_u64(&val, 16);
                 let len = rd_u64(&val, 24);
                 let blob_count = rd_u32(&val, 32);
@@ -579,6 +615,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
                                         tessera_manifest_parser_free(mp);
                                     }
                                     this_pack.push((bh, blen));
+                                    blob_pack.entry(bh).or_default().push(key);
                                 }
                             }
                         }
@@ -595,6 +632,100 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
             tessera_btree_close(t);
         }
     }
+    // ── blob→pack index validation ───────────────────────────────
+    //
+    // The index is BEST-EFFORT by format contract (format.h: a reader
+    // verifies the blob is really in the named pack and falls back to a
+    // registry scan on a stale entry, "so it needs no strict transactional
+    // upkeep across repack/GC"). So stale and missing entries are NOT
+    // inconsistencies — reporting them as such would make fsck cry wolf on a
+    // volume the design says is fine. They are reported as health NOTEs
+    // because the remedy (tessera-reindex) and the cost (cold reads fall back
+    // to the O(N) scan the index exists to avoid) are both real.
+    //
+    // What IS a genuine problem is the tree not being there: blob_index_root
+    // naming a sector that no longer holds a BLOB_INDEX node. That is #64 —
+    // GC freeing index nodes — and it is exactly the damage that sat
+    // invisible through a whole dogfood, because nothing audited it.
+    if blob_index_root != 0 {
+        unsafe {
+            let t = tessera_btree_open(&io, blob_index_root,
+                TESSERA_BTREE_KIND_BLOB_INDEX,
+                TESSERA_BLOB_INDEX_KEY_SIZE, TESSERA_BLOB_INDEX_VAL_SIZE);
+            if t.is_null() {
+                // Only reachable if open itself refuses (geometry mismatch).
+                // A damaged root is caught at the cursor below, not here —
+                // open is lazy. last_fail needs a handle, so inspect the raw
+                // sector instead.
+                let why = describe_root_sector(&f, blob_index_root,
+                    TESSERA_BTREE_KIND_BLOB_INDEX);
+                fsck.problem(format!(
+                    "blob_index_root: {why} — cold reads lose the index and fall back to \
+                     scanning the whole pack registry; run tessera-reindex"));
+            } else {
+                let (mut entries, mut stale, mut misdirected) = (0u64, 0u64, 0u64);
+                let mut indexed: HashSet<Hash> = HashSet::new();
+                let c = tessera_btree_seek_first(t);
+                let cur = c;
+                // ★ tessera_btree_open does NOT validate the root eagerly — it
+                // hands back a handle and the load failure only surfaces when
+                // the cursor first touches the root. So a damaged index root
+                // shows up as a NULL cursor here, not as a NULL tree above.
+                // Ask the handle WHY (this is what last_fail is for), and
+                // distinguish it from a legitimately empty index, which is not
+                // a problem at all.
+                if cur.is_null() {
+                    let mut fs: u64 = 0; let mut fk: u8 = 0;
+                    let f = tessera_btree_last_fail(t, &mut fs, &mut fk);
+                    if f != btree_fail::NONE {
+                        fsck.problem(format!(
+                            "blob_index_root: {} — cold reads lose the index and fall back \
+                             to scanning the whole pack registry; run tessera-reindex",
+                            describe_fail(f, fs, fk, "index")));
+                    }
+                }
+                let mut truncated = false;
+                while !cur.is_null() {
+                    let mut k = [0u8; TESSERA_BLOB_INDEX_KEY_SIZE as usize];
+                    let mut val = [0u8; TESSERA_BLOB_INDEX_VAL_SIZE as usize];
+                    if tessera_btree_cursor_get(cur, k.as_mut_ptr(), val.as_mut_ptr()) != 0 { break; }
+                    entries += 1;
+                    indexed.insert(k);
+                    if !pack_ids.contains(&val) {
+                        stale += 1;
+                        if verbose && stale <= 8 {
+                            eprintln!("  blob-index: {} → pack {} not in registry", hx(&k),
+                                hx(&{ let mut h=[0u8;32]; h[..16].copy_from_slice(&val); h }));
+                        }
+                    } else if !blob_pack.get(&k).map_or(false, |v| v.contains(&val)) {
+                        misdirected += 1;
+                        if verbose && misdirected <= 8 {
+                            eprintln!("  blob-index: {} → pack that does not hold it", hx(&k));
+                        }
+                    }
+                    let rc = tessera_btree_cursor_next(cur);
+                    if rc != 0 { truncated = rc != TESSERA_ENOENT; break; }
+                }
+                if !c.is_null() { tessera_btree_cursor_free(c); }
+                tessera_btree_close(t);
+                if truncated {
+                    fsck.problem("blob-index enumeration failed part-way — the rest of \
+                                  the index was NOT checked".into());
+                }
+                let uncovered = fsck.all_blobs.iter().filter(|h| !indexed.contains(*h)).count();
+                fsck.notes.push(format!(
+                    "blob-index: {entries} entries, {stale} naming a pack not in the registry, \
+                     {misdirected} naming a pack that does not hold the blob, \
+                     {uncovered} of {} blobs not indexed (all best-effort by design — \
+                     they cost a registry scan per cold read, not correctness; \
+                     tessera-reindex rebuilds)", fsck.all_blobs.len()));
+            }
+        }
+    } else {
+        fsck.notes.push("blob-index: absent (sb.blob_index_root=0) — every cold read \
+                         falls back to scanning the pack registry; tessera-reindex builds it".into());
+    }
+
     // extent overlap detection
     intervals.sort_by_key(|x| x.0);
     for w in intervals.windows(2) {
@@ -691,7 +822,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
                     if f != btree_fail::NONE {
                         fsck.problem(format!(
                             "snapshots tree at sector {snapshots_root} could not be enumerated ({}) — retained snapshots were NOT checked",
-                            describe_fail(f, fs, fk)));
+                            describe_fail(f, fs, fk, "snapshot")));
                     }
                 }
                 while !sc.is_null() {
@@ -743,7 +874,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
                                     if f != btree_fail::NONE {
                                         fsck.problem(format!(
                                             "inode_root sector {snap_inode_root} no longer holds this snapshot's inode tree ({}) — its contents are unrecoverable",
-                                            describe_fail(f, fs, fk)));
+                                            describe_fail(f, fs, fk, "snapshot")));
                                     }
                                 }
                                 while !ic.is_null() {
