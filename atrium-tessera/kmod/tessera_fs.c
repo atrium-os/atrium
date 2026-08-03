@@ -6268,7 +6268,24 @@ tessera_vop_getattr(struct vop_getattr_args *ap)
 			vap->va_birthtime.tv_nsec = ino.btime_ns % 1000000000ULL;
 			vap->va_gen   = ino.gen ? ino.gen : 1;
 			vap->va_flags = ino.flags;
-			vap->va_bytes = 0;
+			/*
+			 * st_blocks (va_bytes/512). Reporting 0 here made `du`
+			 * report 0 for EVERY file and every tree — a 31 KB
+			 * source file and a 418 KB module both stat'd as
+			 * blocks=0 — so du, build systems, backup tools and any
+			 * disk-usage reporting were all silently wrong.
+			 *
+			 * APPARENT size, rounded to a 512-byte block. It is not
+			 * post-dedup physical: there is no per-inode physical
+			 * field, and per-file physical is not well defined when
+			 * a blob is shared by many inodes — attributing it in
+			 * full to each referrer is the conventional choice
+			 * (ZFS `du` reports referenced size the same way).
+			 * Sparse files therefore over-report; Tessera supports
+			 * SEEK_HOLE, so a hole-aware accounting would need the
+			 * manifest walked here, which stat must not do.
+			 */
+			vap->va_bytes = roundup2(ino.size, 512);
 			read_real = 1;
 		}
 	}
