@@ -2504,6 +2504,51 @@ static unsigned long tessera_stat_flags_btree_val = 0;
 static unsigned long tessera_stat_flags_src_dirty = 0;
 static unsigned long tessera_stat_flags_btree_rc = 0;
 static unsigned long tessera_stat_flags_ovl_caller = 0;
+
+/*
+ * #105: a ring of the last setattr calls. One field per rebuild cycle was
+ * costing ~6 min each, so capture the whole SEQUENCE at once: what userland
+ * asked for (va_flags + which attrs were seen), what we decided to store,
+ * and whether the inode_put actually ran. The open question is why write and
+ * unlink disagree about the same inode at the same instant, so ordering
+ * matters more than any single value.
+ */
+#define TESSERA_SETATTR_RING 12
+struct tessera_setattr_ev {
+	uint32_t ino;
+	uint32_t seen;        /* bit0 atime b1 mtime b2 size b3 mode b4 uid b5 gid b6 flags */
+	uint64_t va_flags;    /* raw vap->va_flags as handed in */
+	uint32_t in_flags;    /* ino.flags as READ before we touched it */
+	uint32_t put_flags;   /* ino.flags at the inode_put (0xffffffff = no put) */
+	uint32_t rc;
+};
+static struct tessera_setattr_ev tessera_setattr_ring[TESSERA_SETATTR_RING];
+static unsigned long tessera_setattr_ring_n = 0;
+
+static int
+tessera_sysctl_setattr_ring(SYSCTL_HANDLER_ARGS)
+{
+	struct sbuf sb;
+	unsigned long n = tessera_setattr_ring_n;
+	unsigned long start = (n > TESSERA_SETATTR_RING) ? n - TESSERA_SETATTR_RING : 0;
+	sbuf_new_for_sysctl(&sb, NULL, 1024, req);
+	sbuf_printf(&sb, "\n");
+	for (unsigned long i = start; i < n; i++) {
+		struct tessera_setattr_ev *e =
+		    &tessera_setattr_ring[i % TESSERA_SETATTR_RING];
+		sbuf_printf(&sb,
+		    "  #%lu ino=%u seen=0x%02x va_flags=0x%lx in=0x%x put=0x%x rc=%u\n",
+		    i, e->ino, e->seen, (unsigned long)e->va_flags,
+		    e->in_flags, e->put_flags, e->rc);
+	}
+	int err = sbuf_finish(&sb);
+	sbuf_delete(&sb);
+	return (err);
+}
+SYSCTL_PROC(_kern_tessera, OID_AUTO, setattr_ring,
+    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    tessera_sysctl_setattr_ring, "A",
+    "last setattr calls: what was asked, what was stored");
 /*
  * ★ #102 residual: follow ONE sector through its whole life.
  *
@@ -7763,6 +7808,18 @@ tessera_vop_setattr_impl(struct vop_setattr_args *ap)
 	int seen_uid   = (vap->va_uid  != (uid_t)VNOVAL);
 	int seen_gid   = (vap->va_gid  != (gid_t)VNOVAL);
 	int seen_flags = (vap->va_flags != VNOVAL);
+	struct tessera_setattr_ev *_ev =
+	    &tessera_setattr_ring[tessera_setattr_ring_n % TESSERA_SETATTR_RING];
+	memset(_ev, 0, sizeof *_ev);
+	_ev->ino = (uint32_t)tn->inode_no;
+	_ev->va_flags = (uint64_t)vap->va_flags;
+	_ev->seen = (seen_atime ? 1u : 0) | (seen_mtime ? 2u : 0) |
+	            (seen_size ? 4u : 0)  | (seen_mode ? 8u : 0) |
+	            (seen_uid ? 16u : 0)  | (seen_gid ? 32u : 0) |
+	            (seen_flags ? 64u : 0);
+	_ev->put_flags = 0xffffffffu;   /* overwritten iff the put runs */
+	_ev->rc = 0;
+	tessera_setattr_ring_n++;
 
 	/* #105: refuse flags we do not implement rather than accept and drop
 	 * them. chflags returning 0 while storing nothing is exactly how an
@@ -7780,6 +7837,8 @@ tessera_vop_setattr_impl(struct vop_setattr_args *ap)
 	if (tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no, &ino)
 	    != TESSERA_OK)
 		return (EIO);
+
+	_ev->in_flags = ino.flags;
 
 	/*
 	 * #105 enforcement, against the ON-DISK flags and before any are
@@ -7966,9 +8025,12 @@ post_resize:
 		getmicrotime(&tv);
 		ino.ctime_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
 		    (uint64_t)tv.tv_usec * 1000ULL;
+		_ev->put_flags = ino.flags;
 		if (tessera_fs_inode_put(tmp_, (uint32_t)tn->inode_no,
-		    &ino) != TESSERA_OK)
+		    &ino) != TESSERA_OK) {
+			_ev->rc = EIO;
 			return (EIO);
+		}
 	}
 
 	if (did_resize)
