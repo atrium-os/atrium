@@ -410,6 +410,7 @@ static int tessera_gc_duty_pct = 0;	/* OFF: unverified, see the commit */
  * fight for space sooner; setting it high forces the GC path on ANY volume,
  * which is what makes that path testable at all. */
 static int tessera_gc_pressure_pct = 12;
+static unsigned long tessera_stat_gc_armed      = 0;  /* #107 */
 static unsigned long tessera_stat_gc_last_ms    = 0;
 static unsigned long tessera_stat_gc_backoff_ms = 0;
 /* ★ #81 follow-up (a): the cost/benefit curve for choosing gc_pressure_pct.
@@ -729,6 +730,9 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, gc_duty_pct, CTLFLAG_RW,
     "Target data-zone GC duty cycle in percent (#99): after an unproductive "
     "pass costing T, the next is refused for T*(100/pct - 1). 0 = the old "
     "fixed doubling-to-60s backoff");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_armed, CTLFLAG_RD,
+    &tessera_stat_gc_armed, 0,
+    "times the data-zone GC was armed by free-space pressure (#107)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_last_ms, CTLFLAG_RD,
     &tessera_stat_gc_last_ms, 0,
     "Duration of the most recent GC pass, ms — ANY outcome (#81)");
@@ -12810,6 +12814,25 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 		/* Draining tombstoned inode records from the btree is cheap
 		 * (O(tombstones · log N)) — always do it. */
 		(void)tessera_fs_dirty_inodes_drain_tombstones(tmp_);
+	}
+	/*
+	 * ★★ #107: the data-zone GC arms on PRESSURE, not on pending deletes.
+	 *
+	 * This used to live inside the has_tombstones branch above, so it
+	 * could only ever fire in the same flush as a not-yet-drained delete.
+	 * Dead packs, however, come from deletes flushed long ago — so once
+	 * deletion stops the pressure check was never even evaluated and the
+	 * space never came back. Measured on the live root: 99% full, 113298
+	 * fully-dead packs (11904 MiB reclaimable), gc_pressure_pct forced to
+	 * 90, and across a reboot plus 4.5 minutes of write pressure GC never
+	 * armed once — gc_productive_passes=0, gc_aborts=0, free stuck at
+	 * 382M. On a ROOT filesystem that makes "disk full" permanent.
+	 *
+	 * Evaluating it every flush is safe: _tight is false whenever there is
+	 * room, and the rate limit plus exponential backoff below still stop
+	 * an unproductive GC from thrashing.
+	 */
+	if (!tmp_->readonly_snapshot) {
 		/* The data-zone GC that reclaims the unlinked files' now-
 		 * orphaned content packs is NOT cheap: O(inodes × retained
 		 * snapshots × fetch_blob), ~110k cold reads once snapshots
@@ -12872,6 +12895,7 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 			 * walk in between runs ungated. The backoff is
 			 * maintained by the task itself now. */
 			tessera_fs_gc_arm(tmp_);
+			tessera_stat_gc_armed++;
 		}
 	}
 
