@@ -5023,6 +5023,23 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	}
 	mp->mnt_stat.f_namemax = TESSERA_PATH_NAME_MAX;
 	mp->mnt_flag |= MNT_LOCAL;
+	/*
+	 * ★ Every mount needs its OWN filesystem id. Without this every
+	 * Tessera mount carried the same (zero) f_fsid, and with two of them
+	 * mounted the ids collided: umount(2) resolved the wrong mount and
+	 * failed EINVAL, permanently — umount -f did not help and only a
+	 * reboot cleared it. It went unnoticed because it needs TWO Tessera
+	 * mounts: Tessera-on-ZFS and tmpfs-on-Tessera both unmount fine.
+	 *
+	 * Since d17e91e the dev VM roots on Tessera, so every nested mount
+	 * (jails, bundles, nullfs staging, /var) hits this.
+	 *
+	 * f_fsid is also what vop_getattr reports as va_fsid/st_dev, so a
+	 * zero fsid additionally made every file on every Tessera mount share
+	 * st_dev — breaking (st_dev, st_ino) identity, which find(1) -xdev,
+	 * tar's hardlink detection and backup tools all rely on.
+	 */
+	vfs_getnewfsid(mp);
 	if (tmp_->readonly_snapshot)
 		mp->mnt_flag |= MNT_RDONLY;
 	/* MNT_RDONLY removed in round 6c — vop_setattr (utimes) is the
