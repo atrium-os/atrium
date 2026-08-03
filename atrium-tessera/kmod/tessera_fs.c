@@ -1777,6 +1777,13 @@ struct tessera_dirty_inode {
 	int                     draining;
 	int                     redirty;
 	uint64_t                round;
+	/* #105 attribution: return address of whoever last wrote this
+	 * entry. A stale entry (flags predating a chflags) shadows the
+	 * btree and defeats immutability on unlink; reading the ~12
+	 * inode_put call sites did not identify the writer, so record it.
+	 * Same technique as the pack ring that named the pack-zone leak's
+	 * caller in one run. */
+	void                   *caller;
 };
 
 /* Per-inode dirty content buffer.
@@ -2496,6 +2503,7 @@ static unsigned long tessera_stat_flags_last_nlink = 0;
 static unsigned long tessera_stat_flags_btree_val = 0;
 static unsigned long tessera_stat_flags_src_dirty = 0;
 static unsigned long tessera_stat_flags_btree_rc = 0;
+static unsigned long tessera_stat_flags_ovl_caller = 0;
 /*
  * ★ #102 residual: follow ONE sector through its whole life.
  *
@@ -7699,6 +7707,8 @@ tessera_flags_check(struct vnode *vp, int want_append)
 			LIST_FOREACH(_e, &tmp_->dirty_inodes[_bk], link) {
 				if (_e->inode_no == (uint32_t)tn->inode_no) {
 					_d = 1u | ((unsigned long)_e->rec.flags << 8);
+					tessera_stat_flags_ovl_caller =
+					    (unsigned long)_e->caller;
 					break;
 				}
 			}
@@ -9234,6 +9244,7 @@ tessera_fs_inode_put_impl(struct tessera_mount *tmp_, uint32_t inode_no,
 			}
 			memcpy(&e->rec, rec, sizeof e->rec);
 			e->tombstone = 0;
+			e->caller = __builtin_return_address(0);
 			if (e->draining)
 				e->redirty = 1;
 			found = 1;
@@ -9257,6 +9268,7 @@ tessera_fs_inode_put_impl(struct tessera_mount *tmp_, uint32_t inode_no,
 		e = malloc(sizeof *e, M_TESSERA, M_WAITOK | M_ZERO);
 		e->inode_no = inode_no;
 		memcpy(&e->rec, rec, sizeof e->rec);
+		e->caller = __builtin_return_address(0);
 		mtx_lock(&tmp_->flush_mtx);
 		/* ★ #72: re-note. flush_mtx was DROPPED across the malloc
 		 * above, so a GC scan can have activated in that gap — the
@@ -9276,6 +9288,7 @@ tessera_fs_inode_put_impl(struct tessera_mount *tmp_, uint32_t inode_no,
 				}
 				memcpy(&existing->rec, rec, sizeof existing->rec);
 				existing->tombstone = 0;
+				existing->caller = __builtin_return_address(0);
 				if (existing->draining)
 					existing->redirty = 1;
 				raced = 1; break;
@@ -22382,6 +22395,9 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_btree_rc, CTLFLAG_RD,
     &tessera_stat_flags_btree_rc, 0, "rc of that direct btree read");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_src_dirty, CTLFLAG_RD,
     &tessera_stat_flags_src_dirty, 0, "1 = a dirty-overlay entry existed for this inode");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, flags_ovl_caller, CTLFLAG_RD,
+    &tessera_stat_flags_ovl_caller, 0,
+    "return address of whoever last wrote that overlay entry");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, ckpt_skip_busy, CTLFLAG_RD,
     &tessera_stat_ckpt_skip_busy, 0,
     "flush skipped a dirent checkpoint another thread already held "
