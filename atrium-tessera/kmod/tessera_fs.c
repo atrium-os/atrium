@@ -4339,6 +4339,7 @@ struct tessera_node {
 #define VTOTNODE(vp) ((struct tessera_node *)(vp)->v_data)
 
 extern struct vop_vector tessera_vnodeops;
+extern struct vop_vector tessera_fifoops;   /* #106 */
 
 /* ── superblock loader ───────────────────────────────────────── */
 
@@ -5960,6 +5961,10 @@ tessera_vget(struct mount *mp, uint64_t inode_no, uint64_t parent_inode_no,
 		vp->v_type = VDIR;
 		vp->v_vflag |= VV_ROOT;
 	}
+	/* #106: a FIFO's open/read/write belong to fifofs, not to us. Must
+	 * be set before insmntque publishes the vnode. */
+	if (vp->v_type == VFIFO)
+		vp->v_op = &tessera_fifoops;
 
 	VN_LOCK_ASHARE(vp);
 	/* insmntque (dtr=true) handles its own vgone+vput on failure;
@@ -6388,6 +6393,13 @@ tessera_vop_getattr(struct vop_getattr_args *ap)
 			vap->va_ctime.tv_nsec = ino.ctime_ns % 1000000000ULL;
 			vap->va_birthtime.tv_sec  = ino.btime_ns / 1000000000ULL;
 			vap->va_birthtime.tv_nsec = ino.btime_ns % 1000000000ULL;
+			/* #106: device nodes keep their rdev in `size`
+			 * (no rdev field on disk); report it as va_rdev and
+			 * present size 0, which is what a device node has. */
+			if (vap->va_type == VCHR || vap->va_type == VBLK) {
+				vap->va_rdev = (dev_t)ino.size;
+				vap->va_size = 0;
+			}
 			vap->va_gen   = ino.gen ? ino.gen : 1;
 			/* #105: map — the on-disk word is Tessera's encoding,
 			 * not BSD UF_ / SF_ values, and carries an internal
@@ -23028,6 +23040,54 @@ tessera_vop_create(struct vop_create_args *ap)
 	TPROF_ADD(TPROF_CREATE, _tp0);
 	return (_rc);
 }
+
+/*
+ * #106: VOP_MKNOD — mkfifo(2), mknod(2) and socket nodes.
+ *
+ * vop_mknod_args and vop_create_args have identical shape (dvp, vpp, cnp,
+ * vap), and create already encodes VFIFO/VSOCK in its S_IFMT switch, so the
+ * namespace work is shared rather than duplicated.
+ *
+ * rdev has nowhere of its own to live: tessera_inode_record_t has no rdev
+ * field, and adding one would change the on-disk record size. A device node
+ * has no content, so `size` is meaningless for it — store the dev there,
+ * exactly as UFS overlays di_rdev onto di_db[0]. getattr reports va_rdev
+ * from it and forces va_size to 0 for VCHR/VBLK.
+ */
+static int
+tessera_vop_mknod(struct vop_mknod_args *ap)
+{
+	struct vattr *vap = ap->a_vap;
+	struct vop_create_args ca;
+	int err;
+
+	switch (vap->va_type) {
+	case VFIFO:
+	case VSOCK:
+	case VCHR:
+	case VBLK:
+		break;
+	default:
+		return (EOPNOTSUPP);
+	}
+	if ((vap->va_type == VCHR || vap->va_type == VBLK) &&
+	    vap->va_rdev == (dev_t)VNOVAL)
+		return (EINVAL);
+
+	ca.a_gen  = ap->a_gen;
+	ca.a_dvp  = ap->a_dvp;
+	ca.a_vpp  = ap->a_vpp;
+	ca.a_cnp  = ap->a_cnp;
+	ca.a_vap  = vap;
+	err = tessera_vop_create_impl(&ca);
+	if (err != 0)
+		return (err);
+
+	/* The vnode create minted is typed from the mode bits it wrote, so
+	 * VFIFO already routes to tessera_fifoops via the alloc path. */
+	return (0);
+}
+
 static int
 tessera_vop_create_impl(struct vop_create_args *ap)
 {
@@ -23091,6 +23151,8 @@ tessera_vop_create_impl(struct vop_create_args *ap)
 			switch (vap->va_type) {
 			case VSOCK: ifmt = 0140000; break;
 			case VFIFO: ifmt = 0010000; break;
+			case VCHR:  ifmt = 0020000; break;   /* #106 */
+			case VBLK:  ifmt = 0060000; break;   /* #106 */
 			default:    ifmt = 0100000; break;  /* S_IFREG */
 			}
 			cino.mode = (vap->va_mode & 07777) | ifmt;
@@ -23107,7 +23169,11 @@ tessera_vop_create_impl(struct vop_create_args *ap)
 		uint64_t now_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
 		    (uint64_t)tv.tv_usec * 1000ULL;
 		cino.atime_ns = cino.mtime_ns = cino.ctime_ns = cino.btime_ns = now_ns;
-		cino.size  = 0;
+		/* #106: a device node has no content, so `size` carries its
+		 * rdev (UFS overlays di_rdev on di_db[0] for the same
+		 * reason). getattr maps it back and reports size 0. */
+		cino.size  = (vap->va_type == VCHR || vap->va_type == VBLK)
+		    ? (uint64_t)vap->va_rdev : 0;
 		cino.nlink = 1;
 		cino.flags = 0;
 		/* Inherit the parent directory's quota domain so the new file
@@ -25081,6 +25147,7 @@ struct vop_vector tessera_vnodeops = {
 	.vop_read     = tessera_vop_read,
 	.vop_write    = tessera_vop_write,
 	.vop_create   = tessera_vop_create,
+	.vop_mknod    = tessera_vop_mknod,
 	.vop_mkdir    = tessera_vop_mkdir,
 	.vop_remove   = tessera_vop_remove,
 	.vop_rmdir    = tessera_vop_rmdir,
@@ -25098,6 +25165,31 @@ struct vop_vector tessera_vnodeops = {
 	.vop_reclaim  = tessera_vop_reclaim,
 };
 VFS_VOP_VECTOR_REGISTER(tessera_vnodeops);
+
+/*
+ * #106: a VFIFO vnode needs fifofs for open/read/write/poll — those have
+ * nothing to do with on-disk content — while attributes, access checks and
+ * lifecycle stay ours. Same split UFS uses (ufs_fifoops).
+ */
+struct vop_vector tessera_fifoops = {
+	.vop_default    = &fifo_specops,
+	.vop_access     = tessera_vop_access,
+	.vop_getattr    = tessera_vop_getattr,
+	.vop_setattr    = tessera_vop_setattr,
+	.vop_inactive   = tessera_vop_inactive,
+	.vop_reclaim    = tessera_vop_reclaim,
+	/* ★ fifo_specops does NOT supply pathconf — its default chain ends
+	 * at vop_panic, so `ls -l` on a FIFO panicked the kernel with
+	 * "filesystem goof: vop_panic[vop_pathconf]" via lpathconf(2).
+	 * ufs_fifoops lists it explicitly for exactly this reason. */
+	.vop_pathconf   = tessera_vop_pathconf,
+	/* Keep the lockless fast-path lookup out of a FIFO vnode; UFS does
+	 * the same. (read/write/fsync are deliberately left to
+	 * fifo_specops rather than UFS's defensive VOP_PANIC.) */
+	.vop_fplookup_vexec   = VOP_EAGAIN,
+	.vop_fplookup_symlink = VOP_EAGAIN,
+};
+VFS_VOP_VECTOR_REGISTER(tessera_fifoops);
 
 VFS_SET(tessera_vfsops, tessera, 0);
 MODULE_VERSION(tessera_fs, 1);
