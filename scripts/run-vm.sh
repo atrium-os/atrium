@@ -88,6 +88,11 @@ WANT_TABLET=0
 WANT_KGDB=0
 # Serial on TCP + qemu monitor on a unix socket. Keeps the VM detachable
 # (no stdio coupling) while still letting us reach the FreeBSD serial
+# console. NOTE: `~^B` is a tip(1)/cu(1) ESCAPE, not a wire sequence — piping
+# it through raw `nc` just types a tilde at the login prompt (verified
+# 2026-08-04). To reach ddb over this TCP console you need a client that can
+# send a real serial BREAK, or boot with the console on stdio. Plain
+# `nc 127.0.0.1 4444` is still the way to READ the console and log in —
 # console — `nc 127.0.0.1 4444` and send `~^B` to drop into ddb when
 # debug.kdb.alt_break_to_debugger=1, or `~B` to send a break when
 # debug.kdb.break_to_debugger=1. Use `nc -U /tmp/qmp.sock` for QMP.
@@ -328,7 +333,7 @@ exec "$QEMU" \
     -drive file="$BSD_DIR/vm/tessera-root.img",format=raw,cache=writeback,if=none,id=tessrootdrv \
     -device virtio-blk-pci,drive=tessrootdrv,serial=tessera-root,config-wce=on \
     -drive file="$BSD_DIR/vm/tessera-devroot.img",format=raw,cache=writeback,if=none,id=devrootdrv \
-    -device virtio-blk-pci,drive=devrootdrv,serial=tessera-devroot,config-wce=on,bootindex=0 \
+    -device virtio-blk-pci,drive=devrootdrv,serial=tessera-devroot,config-wce=on \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0,hostfwd=tcp::2222-:22 \
     -fsdev local,id=share,path="$SHARE_DIR",security_model=none \
