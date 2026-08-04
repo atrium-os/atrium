@@ -202,11 +202,28 @@ typedef struct TESSERA_PACKED {
 	 * unchanged and old volumes decode this as 0 (no migration). */
 	uint64_t  blob_index_root;
 	uint64_t  blob_index_gen;
+	/* Dead-extent log root (TESSERA_BTREE_KIND_DEAD_EXT). Extents that are
+	 * allocated and durably written but deliberately NOT referenced by the
+	 * pack registry — the losing copy of a `deferred`-policy duplicate
+	 * append (tessera-fs.md §20.2). They cannot be freed at write time
+	 * (that hands the free-space delta straight back to the dedup existence
+	 * oracle this exists to close) and they cannot be left implicit: GC
+	 * pass 2 enumerates candidates from the pack registry, so an extent in
+	 * no registry entry is invisible to it and would leak permanently.
+	 * So they are recorded here and drained by GC.
+	 *
+	 * Key = start_sector (u64 big-endian, so the tree is in disk order),
+	 * value = tessera_dead_extent_t. 0 = absent (every pre-existing volume,
+	 * and any volume that has never taken a deferred append) → nothing to
+	 * drain. Carved from the trailing slack like blob_index_root above, so
+	 * preceding offsets are unchanged and old volumes decode it as 0. */
+	uint64_t  dead_extent_root;
+	uint64_t  dead_extent_gen;
 	/* Trailing slack — kept BEFORE crc32/hmac (which sit at the very end)
 	 * so any field later carved from it is CRC-covered for free. Sized to
 	 * hold the SB at exactly one sector (4096 B); shrink when naming a new
-	 * field. 1708 = prior 1724 − 16 B taken by blob_index_root/gen. */
-	uint8_t   reserved[1708];
+	 * field. 1692 = prior 1708 − 16 B taken by dead_extent_root/gen. */
+	uint8_t   reserved[1692];
 	uint32_t  crc32;                     /* CRC over bytes 0..(crc32 offset) */
 	/* Keyed integrity — reserved by v1 for v3's authenticated metadata.
 	 * v1 mkfs zeros this; v1/v2 kmod ignore it. v3 derives a separate
@@ -525,6 +542,29 @@ typedef struct TESSERA_PACKED {
 #define TESSERA_BTREE_KIND_BLOB_INDEX 5u
 #define TESSERA_BLOB_INDEX_KEY_SIZE   32u
 #define TESSERA_BLOB_INDEX_VAL_SIZE   16u
+
+/* Dead-extent log (sb.dead_extent_root): extents that are allocated and
+ * durably written but intentionally absent from the pack registry — the
+ * losing copy of a `deferred` duplicate append (§20.2). Unlike the blob
+ * index this is NOT best-effort: an entry lost here leaks its extent
+ * permanently, because GC pass 2 enumerates from the pack registry and
+ * therefore cannot see an unregistered extent at all.
+ *
+ * Key = start_sector as u64 BIG-ENDIAN so the tree orders by disk position
+ * and a drain walks the volume forwards. Value = tessera_dead_extent_t. */
+#define TESSERA_BTREE_KIND_DEAD_EXT   6u
+#define TESSERA_DEAD_EXT_KEY_SIZE     8u
+#define TESSERA_DEAD_EXT_VAL_SIZE     24u
+
+typedef struct TESSERA_PACKED {
+	uint64_t  length_sectors;   /* total sectors to return to the allocator */
+	uint32_t  flags;            /* registry-entry flags; MULTI_EXTENT drives
+	                             * the free path exactly as in GC apply */
+	uint32_t  reserved0;
+	uint64_t  pel_sector;       /* MULTI_EXTENT only: the PEL chain head,
+	                             * 0 otherwise. Resolved at record time so
+	                             * the drain never reads the content zone. */
+} tessera_dead_extent_t;
 
 /* Inode flags (tessera-fs §7.2) */
 #define TESSERA_INODE_FLAG_IMMUTABLE   (1u << 0)

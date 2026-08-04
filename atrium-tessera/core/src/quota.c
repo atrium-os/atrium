@@ -22,7 +22,21 @@ tessera_quota_domain_init(tessera_quota_domain_t *d,
 	d->domain_id = domain_id;
 	d->root_inode_no = root_inode_no;
 	d->limit_bytes = limit_bytes;
-	d->dedup_policy = TESSERA_DEDUP_DEFERRED;
+	/* GLOBAL, not DEFERRED.
+	 *
+	 * This used to default to DEFERRED on the reasoning that it is "the
+	 * safe default" (§20.2 calls it that for OVERLAYS). But the publish
+	 * path ignored the field entirely, so nothing ever acted on it — and
+	 * the moment it stopped ignoring it, every domain including domain 1
+	 * (the whole-FS default, covering the root and the trusted-ingest app
+	 * trees) would have flipped to append-anyway. That regresses exactly
+	 * the case the disk-cost thesis is won on, and §20.2's own table
+	 * assigns `global` to those trees.
+	 *
+	 * So: default to the behaviour the filesystem already had, and make
+	 * `deferred` an explicit per-domain choice (TESSERA_IOC_DEDUP_POLICY),
+	 * which is what Portcullis sets on an overlay. */
+	d->dedup_policy = TESSERA_DEDUP_GLOBAL;
 }
 
 int
