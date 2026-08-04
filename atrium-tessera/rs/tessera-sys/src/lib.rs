@@ -101,6 +101,9 @@ pub struct tessera_btree_cursor_t { _opaque: [u8; 0] }
 pub const TESSERA_BTREE_KIND_INODE:    u8 = 0;
 pub const TESSERA_BTREE_KIND_PACK_REG: u8 = 1;
 pub const TESSERA_BTREE_KIND_FREE_EXT: u8 = 2;
+/// Dead-extent log (sb.dead_extent_root, §20.2 / #114). Key = start_sector
+/// BIG-endian (disk order), value = tessera_dead_extent_t (24 bytes).
+pub const TESSERA_BTREE_KIND_DEAD_EXT: u8 = 6;
 pub const TESSERA_BTREE_KIND_SNAPSHOT: u8 = 3;
 pub const TESSERA_BTREE_KIND_QUOTA:    u8 = 4;
 pub const TESSERA_BTREE_KIND_BLOB_INDEX: u8 = 5;   /* key=32 hash, val=16 pack_id */
@@ -451,6 +454,11 @@ extern "C" {
     pub fn tessera_volume_quota_tree_root    (v: *const tessera_volume_t) -> u64;
     pub fn tessera_volume_next_inode_no      (v: *const tessera_volume_t) -> u64;
     pub fn tessera_volume_blob_index_root    (v: *const tessera_volume_t) -> u64;
+    /// Root of the dead-extent log (§20.2 / #114). 0 = the volume has never
+    /// taken a deferred duplicate append. Every extent it names is ALLOCATED
+    /// but deliberately absent from the pack registry, so any checker that
+    /// knows only the registry must consult this or it will call them leaked.
+    pub fn tessera_volume_dead_extent_root   (v: *const tessera_volume_t) -> u64;
 }
 
 /// Reason the most recent `tessera_btree` node load failed (★ #102).

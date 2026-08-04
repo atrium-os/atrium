@@ -780,3 +780,11 @@ uint64_t tessera_volume_next_inode_no(const tessera_volume_t *v)
 
 uint64_t tessera_volume_blob_index_root(const tessera_volume_t *v)
 { return v ? v->sb.blob_index_root : 0; }
+
+/* Root of the dead-extent log (§20.2 / #114). 0 = this volume has never taken a
+ * deferred duplicate append. fsck MUST consult it: every extent it names is
+ * ALLOCATED but deliberately absent from the pack registry, so a checker that
+ * knows only the registry sees them as leaked and would "repair" them into the
+ * free tree while the allocator still holds them — double-allocation. */
+uint64_t tessera_volume_dead_extent_root(const tessera_volume_t *v)
+{ return v ? v->sb.dead_extent_root : 0; }

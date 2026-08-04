@@ -153,6 +153,7 @@ uint8_t         tessera_volume_active_slot_count  (const tessera_volume_t *);
 uint64_t        tessera_volume_quota_tree_root    (const tessera_volume_t *);
 uint64_t        tessera_volume_next_inode_no       (const tessera_volume_t *);
 uint64_t        tessera_volume_blob_index_root      (const tessera_volume_t *);
+uint64_t        tessera_volume_dead_extent_root     (const tessera_volume_t *);
 
 #ifdef __cplusplus
 }

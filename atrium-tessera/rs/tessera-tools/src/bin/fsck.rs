@@ -1069,6 +1069,63 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
     // (double-state → next alloc clobbers a live pack), none lost (leak).
     // Skipped/approximate when multi-extent packs are present (their sectors
     // aren't in `intervals`).
+    // ★ #114: the dead-extent log. These sectors are ALLOCATED and durably
+    // written but deliberately absent from the pack registry — the losing copy
+    // of a `deferred` duplicate append (tessera-fs.md §20.2). They are not in
+    // `intervals`, so without this they land in the coverage gap below and get
+    // reported as leaked; a --repair run would then hand them to the free tree
+    // while the allocator still holds them, which is double-allocation. Fold
+    // them in as allocated, and say how much is held so the transient double
+    // storage §20.2 accepts is visible rather than implied.
+    {
+        let dead_root = unsafe { tessera_volume_dead_extent_root(v) };
+        let mut dead_n = 0u64;
+        let mut dead_sectors = 0u64;
+        if dead_root != 0 {
+            unsafe {
+                let t = tessera_btree_open(&io, dead_root,
+                    TESSERA_BTREE_KIND_DEAD_EXT, 8, 24);
+                if t.is_null() {
+                    // Not cosmetic: without the tree we cannot tell these
+                    // extents from leaks, so every one becomes a false repair
+                    // target. Refuse to guess.
+                    fsck.problem(format!(
+                        "dead-extent log at sector {dead_root} will not open — \
+                         its extents cannot be distinguished from leaks; do NOT \
+                         --repair this volume until it reads"));
+                } else {
+                    let c = tessera_btree_seek_first(t);
+                    let cur = c;
+                    while !cur.is_null() {
+                        let mut k = [0u8; 8];
+                        let mut val = [0u8; 24];
+                        if tessera_btree_cursor_get(cur, k.as_mut_ptr(), val.as_mut_ptr()) != 0 {
+                            break;
+                        }
+                        // key is start_sector BIG-endian (disk order)
+                        let start = u64::from_be_bytes(k);
+                        let len = u64::from_le_bytes(val[0..8].try_into().unwrap());
+                        if len > 0 {
+                            intervals.push((start, start + len,
+                                "dead-extent log (deferred duplicate, pending GC drain)".to_string()));
+                            dead_n += 1;
+                            dead_sectors += len;
+                        }
+                        if tessera_btree_cursor_next(cur) != 0 { break; }
+                    }
+                    if !c.is_null() { tessera_btree_cursor_free(c); }
+                    tessera_btree_close(t);
+                }
+            }
+        }
+        if dead_n > 0 {
+            intervals.sort_by_key(|x| x.0);
+            fsck.notes.push(format!(
+                "dead-extent log: {dead_n} extent(s), {dead_sectors} sector(s) held \
+                 pending GC drain — allocated on purpose, not leaked (§20.2)"));
+        }
+    }
+
     {
         let mut free: Vec<(u64, u64)> = Vec::new();
         if free_root != 0 {
