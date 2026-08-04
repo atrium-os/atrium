@@ -2228,7 +2228,8 @@ static int tessera_fs_pending_manifests_drain(struct tessera_mount *tmp_);
 static int tessera_fs_publish_manifest_to_disk(struct tessera_mount *tmp_,
                                                const uint8_t *manifest_bytes,
                                                size_t mlen,
-                                               const tessera_hash_t hash);
+                                               const tessera_hash_t hash,
+                                               uint32_t owner_inode_no);
 struct tessera_aggr_entry {
 	const uint8_t  *bytes;
 	uint32_t        len;
@@ -10204,8 +10205,24 @@ tessera_fs_pending_manifests_drain(struct tessera_mount *tmp_)
 			/* Eligibility: only batch small manifests. Larger
 			 * ones publish as single-blob packs. */
 			if (e->len > (uint32_t)tessera_aggregation_blob_max) {
+				/* Deferred if ANY owner's domain is deferred:
+				 * one entry can be referenced by several
+				 * inodes, and the weaker policy must not
+				 * silently cover for the stronger one. Read
+				 * under flush_mtx, which the drain already
+				 * holds around the owners list. */
+				uint32_t owner_for_policy = 0;
+				struct tessera_pending_owner *po_;
+				LIST_FOREACH(po_, &e->owners, link) {
+					if (tessera_fs_dedup_is_deferred(tmp_,
+					    po_->inode_no)) {
+						owner_for_policy = po_->inode_no;
+						break;
+					}
+				}
 				int r = tessera_fs_publish_manifest_to_disk(
-				    tmp_, e->bytes, e->len, e->hash);
+				    tmp_, e->bytes, e->len, e->hash,
+				    owner_for_policy);
 				mtx_lock(&tmp_->flush_mtx);
 				e->draining = 0;
 				if (r == 0)
@@ -16360,7 +16377,7 @@ tessera_fs_publish_manifest_owned_ex(struct tessera_mount *tmp_,
 		    manifest_bytes, (uint32_t)mlen, owner_inode_no));
 	}
 	return (tessera_fs_publish_manifest_to_disk(tmp_, manifest_bytes,
-	    mlen, out_hash));
+	    mlen, out_hash, owner_inode_no));
 }
 
 /* Ownership-transfer variant of publish_manifest_owned: CONSUMES
@@ -16414,7 +16431,7 @@ tessera_fs_publish_manifest_owned_move(struct tessera_mount *tmp_,
 		return (_rc);
 	}
 	int rc = tessera_fs_publish_manifest_to_disk(tmp_, manifest_bytes,
-	    mlen, out_hash);
+	    mlen, out_hash, owner_inode_no);
 	free(manifest_bytes, M_TESSERA);
 	return (rc);
 }
@@ -17429,25 +17446,34 @@ tessera_fs_repack_first_multi(struct tessera_mount *tmp_)
 }
 
 static int tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
-    const uint8_t *manifest_bytes, size_t mlen, const tessera_hash_t hash);
+    const uint8_t *manifest_bytes, size_t mlen, const tessera_hash_t hash,
+    uint32_t owner_inode_no);
 static int
 tessera_fs_publish_manifest_to_disk(struct tessera_mount *tmp_,
                                     const uint8_t *manifest_bytes,
                                     size_t mlen,
-                                    const tessera_hash_t hash)
+                                    const tessera_hash_t hash,
+                                    uint32_t owner_inode_no)
 {
 	int gated = tmp_->flush_mtx_init;
 	if (gated) tessera_fs_flush_gate_enter(tmp_);
 	int rc = tessera_fs_publish_manifest_to_disk_inner(tmp_, manifest_bytes,
-	    mlen, hash);
+	    mlen, hash, owner_inode_no);
 	if (gated) tessera_fs_flush_gate_exit(tmp_);
 	return (rc);
 }
+/* owner_inode_no identifies the writer so the `deferred` dedup policy can be
+ * resolved HERE, after the pack is written. Deliberately re-resolved rather
+ * than threaded as a flag: the pending-manifest drain publishes long after the
+ * write was requested and already carries owner_inode_no, so re-resolving keeps
+ * one source of truth instead of a flag that can go stale in the cache.
+ * 0 = no identified owner (GC, mount-time work) ⇒ global. */
 static int
 tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
                                     const uint8_t *manifest_bytes,
                                     size_t mlen,
-                                    const tessera_hash_t hash)
+                                    const tessera_hash_t hash,
+                                    uint32_t owner_inode_no)
 {
 	uint8_t pack_id[16];
 	memcpy(pack_id, hash, 16);
@@ -17498,6 +17524,47 @@ tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
 		return (EIO);
 	}
 
+	/* ★ #114 / §20.2 — the deferred append's losing copy.
+	 *
+	 * A `deferred` writer skipped the pre-check, so the pack was written
+	 * unconditionally. If the content-addressed pack_id is ALREADY
+	 * registered, this copy is redundant. §20.2: keep the existing entry
+	 * and mark THIS extent dead.
+	 *
+	 * Do not free it. Freeing returns the space, so the duplicate write
+	 * nets to zero and free space once again answers "did these bytes
+	 * already exist" — the oracle, measured at 5 blocks vs 1039. The
+	 * extent stays allocated and is reclaimed later by the GC drain, which
+	 * is the repack-cadence-granular, noisy residual §20.2 accepts.
+	 *
+	 * Order matters: record FIRST, and only skip the registry put if the
+	 * record is durable. If it fails we fall through to freeing, because a
+	 * lost record strands the extent forever (GC enumerates from the
+	 * registry and cannot see it), and a permanent leak is worse than
+	 * briefly behaving like the global policy that every other volume runs
+	 * with today. */
+	if (owner_inode_no != 0 &&
+	    tessera_fs_dedup_is_deferred(tmp_, owner_inode_no)) {
+		uint8_t existing[TESSERA_REGISTRY_ENTRY_SIZE];
+		if (tessera_fs_registry_get_stable(tmp_, pack_id, existing,
+		    hash) == TESSERA_OK) {
+			uint64_t pel = ((pa.flags &
+			    TESSERA_REGISTRY_FLAG_MULTI_EXTENT) != 0)
+			    ? pa.start_sector : 0;
+			if (tessera_fs_dead_extent_record(tmp_, pa.start_sector,
+			    pa.length_sectors, pa.flags, pel) == TESSERA_OK) {
+				/* Existing entry kept; this copy is dead but
+				 * still allocated. The blob is readable via the
+				 * entry that stayed, so no index update. */
+				tessera_stat_publish_dedup_manifest++;
+				return (0);
+			}
+			/* Could not record — fall back to today's behaviour. */
+			tessera_fs_pack_alloc_rollback(tmp_, &pa);
+			return (0);
+		}
+	}
+
 	if (tessera_fs_registry_put_pending(tmp_, pack_id, reg_value)
 	    != TESSERA_OK) {
 		tessera_fs_pack_alloc_rollback(tmp_, &pa);
@@ -17543,7 +17610,7 @@ tessera_fs_seed_one_constant(struct tessera_mount *tmp_,
 		if (tessera_fs_registry_get(tmp_, pack_id,
 		    reg) != TESSERA_OK)
 			(void)tessera_fs_publish_manifest_to_disk(tmp_,
-			    buf, mlen, h);
+			    buf, mlen, h, 0);
 	}
 	tessera_manifest_free(mb);
 	free(buf, M_TESSERA);
