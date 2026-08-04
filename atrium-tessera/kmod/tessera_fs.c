@@ -1016,6 +1016,19 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_swaps, CTLFLAG_RD,
  * half-built: the publish pre-check is gated, but the losing extent is not yet
  * recorded in the dead-extent log, so free space still nets to zero on a
  * duplicate and the oracle stays open. Flip to 1 only to test the halves. */
+static unsigned long tessera_stat_dead_extent_recorded = 0;
+static unsigned long tessera_stat_dead_extent_sectors  = 0;
+static unsigned long tessera_stat_dead_extent_drained  = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, dead_extent_recorded, CTLFLAG_RD,
+    &tessera_stat_dead_extent_recorded, 0,
+    "Extents recorded in the dead-extent log (deferred duplicate appends)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, dead_extent_sectors, CTLFLAG_RD,
+    &tessera_stat_dead_extent_sectors, 0,
+    "Sectors currently held by the dead-extent log (transient double storage)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, dead_extent_drained, CTLFLAG_RD,
+    &tessera_stat_dead_extent_drained, 0,
+    "Dead extents reclaimed by the GC drain");
+
 static int tessera_dedup_deferred_enable = 0;
 SYSCTL_INT(_kern_tessera, OID_AUTO, dedup_deferred_enable, CTLFLAG_RW,
     &tessera_dedup_deferred_enable, 0,
@@ -2669,6 +2682,10 @@ struct tessera_mount {
 	tessera_btree_t          *inode_tree;
 	tessera_btree_t          *pack_registry_tree;
 	tessera_btree_t          *blob_index_tree;    /* hash→pack_id accel (or NULL) */
+	/* Dead-extent log (§20.2 / #114): extents durably written but
+	 * deliberately unregistered — the losing copy of a `deferred`
+	 * duplicate append. NULL until the volume takes its first one. */
+	tessera_btree_t          *dead_extent_tree;
 	tessera_btree_t          *snapshots_tree;     /* v2: time-machine */
 	tessera_extent_alloc_t   *extent_alloc;
 	tessera_journal_t        *journal;
@@ -3603,6 +3620,70 @@ tessera_fs_blob_index_put_pending(struct tessera_mount *tmp_,
 	LIST_INSERT_HEAD(&tmp_->blob_ov[b], ov, link);
 	tmp_->blob_ov_count++;
 	mtx_unlock(&tmp_->flush_mtx);
+}
+
+/* Record an extent in the dead-extent log (§20.2 / #114).
+ *
+ * Called when a `deferred`-policy publish has already written its pack and then
+ * finds the content-addressed pack_id already registered. The existing registry
+ * entry is kept and THIS copy's extents become dead. They must not be freed:
+ * freeing returns the space and hands the free-space delta straight back to the
+ * dedup existence oracle this whole mechanism exists to close (§20.1 channel 1,
+ * measured 5 blocks vs 1039). They must also not be merely dropped: GC pass 2
+ * enumerates candidates from the pack registry, so an unregistered extent is
+ * invisible to it and would strand permanently.
+ *
+ * So they are recorded here, left allocated, and reclaimed by the GC drain.
+ *
+ * Key is start_sector BIG-ENDIAN so the tree orders by disk position and a
+ * drain walks the volume forwards. pel_sector is captured by the caller at
+ * record time — the drain must never read the content zone to discover an
+ * extent list, because doing that under the flush gate is the ABBA shape
+ * #67/#99 exist to remove.
+ *
+ * Returns TESSERA_OK only if the entry is durable enough to find again. On
+ * failure the caller MUST fall back to freeing the extents: a lost record is a
+ * permanent leak, and leaking is worse than momentarily reopening a channel
+ * that is already open on every non-deferred volume.
+ */
+static int
+tessera_fs_dead_extent_record(struct tessera_mount *tmp_,
+    uint64_t start_sector, uint64_t length_sectors, uint32_t flags,
+    uint64_t pel_sector)
+{
+	if (length_sectors == 0)
+		return (TESSERA_OK);          /* nothing to reclaim */
+
+	if (tmp_->dead_extent_tree == NULL) {
+		uint64_t root = 0;
+		tmp_->dead_extent_tree = tessera_btree_create(&tmp_->meta_bio,
+		    TESSERA_BTREE_KIND_DEAD_EXT, TESSERA_DEAD_EXT_KEY_SIZE,
+		    TESSERA_DEAD_EXT_VAL_SIZE, &root);
+		if (tmp_->dead_extent_tree == NULL)
+			return (TESSERA_ENOSPC);  /* caller frees instead */
+		tmp_->sb.dead_extent_root = root;
+	}
+
+	uint8_t key[TESSERA_DEAD_EXT_KEY_SIZE];
+	for (int i = 0; i < 8; i++)
+		key[i] = (uint8_t)(start_sector >> (56 - 8 * i));
+
+	tessera_dead_extent_t de;
+	memset(&de, 0, sizeof de);
+	de.length_sectors = length_sectors;
+	de.flags          = flags;
+	de.pel_sector     = pel_sector;
+
+	uint64_t root = tmp_->sb.dead_extent_root;
+	int rc = tessera_btree_put(tmp_->dead_extent_tree, key,
+	    (const uint8_t *)&de, &root);
+	if (rc != TESSERA_OK)
+		return (rc);
+	tmp_->sb.dead_extent_root = root;
+	tessera_stat_dead_extent_recorded++;
+	tessera_stat_dead_extent_sectors += length_sectors;
+	tessera_fs_mark_dirty(tmp_);
+	return (TESSERA_OK);
 }
 
 /* Flush-side: sorted-batch-put the blob-index overlay into blob_index_tree
@@ -4946,6 +5027,22 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 			    (unsigned long)tmp_->sb.blob_index_root);
 	}
 
+	/* Dead-extent log. Unlike the blob index this is NOT best-effort: every
+	 * entry names an extent that is allocated and referenced by nothing
+	 * else, so failing to open it strands that space for good. Warn loudly
+	 * — a drain simply will not happen this mount. */
+	tmp_->dead_extent_tree = NULL;
+	if (tmp_->sb.dead_extent_root != 0) {
+		tmp_->dead_extent_tree = tessera_btree_open(&tmp_->meta_bio,
+		    tmp_->sb.dead_extent_root, TESSERA_BTREE_KIND_DEAD_EXT,
+		    TESSERA_DEAD_EXT_KEY_SIZE, TESSERA_DEAD_EXT_VAL_SIZE);
+		if (tmp_->dead_extent_tree == NULL)
+			printf("tessera_fs: WARNING — dead-extent log open at "
+			    "sector %lu failed; those extents cannot be "
+			    "reclaimed this mount\n",
+			    (unsigned long)tmp_->sb.dead_extent_root);
+	}
+
 	/* Snapshots tree (v2). Format slot was reserved in round 7-step9;
 	 * v1 mkfs left it 0 ("not initialised"). On first mount with this
 	 * kmod we lazy-allocate an empty tree; subsequent mounts open the
@@ -5827,6 +5924,8 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 			tessera_btree_close(tmp_->pack_registry_tree);
 		if (tmp_->blob_index_tree != NULL)
 			tessera_btree_close(tmp_->blob_index_tree);
+		if (tmp_->dead_extent_tree != NULL)
+			tessera_btree_close(tmp_->dead_extent_tree);
 		if (tmp_->inode_tree != NULL)
 			tessera_btree_close(tmp_->inode_tree);
 		if (tmp_->meta_free       != NULL) free(tmp_->meta_free, M_TESSERA);
@@ -13146,6 +13245,7 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	uint64_t r_fext  = tmp_->sb.free_extent_root;
 	uint64_t r_snap  = tmp_->sb.snapshots_root;
 	uint64_t r_bidx  = tmp_->sb.blob_index_root;
+	uint64_t r_dext  = tmp_->sb.dead_extent_root;
 	/*
 	 * ★ #102 CONFIRMING PROBE. The scan enumerates the snapshots tree as
 	 * it was AT THIS INSTANT. A snapshot created after this capture is not
@@ -13204,7 +13304,7 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	 * anything — see the union at swap time. */
 	int stale_skipped = 0;
 
-	struct { uint64_t root; int kind; uint32_t ksz; uint32_t vsz; } roots[8] = {
+	struct { uint64_t root; int kind; uint32_t ksz; uint32_t vsz; } roots[9] = {
 		{ r_inode, 0, 4, TESSERA_INODE_RECORD_SIZE },
 		{ r_reg,   1, 16, TESSERA_REGISTRY_ENTRY_SIZE },
 		{ r_fext,  2, 8, 8 },
@@ -13214,6 +13314,12 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 		 * the index self-destructing on the dev root). */
 		{ r_bidx,  TESSERA_BTREE_KIND_BLOB_INDEX,
 		    TESSERA_BLOB_INDEX_KEY_SIZE, TESSERA_BLOB_INDEX_VAL_SIZE },
+		/* Dead-extent log — same reasoning as the blob index above, and
+		 * worse consequences: its nodes being recycled mid-scan loses
+		 * the only record that those extents exist, stranding them
+		 * permanently. */
+		{ r_dext,  TESSERA_BTREE_KIND_DEAD_EXT,
+		    TESSERA_DEAD_EXT_KEY_SIZE, TESSERA_DEAD_EXT_VAL_SIZE },
 		/* ★ #72/#78: the in-flight GC scan's frozen roots. Zero when no
 		 * scan is running, and a zero root is skipped below. Shared COW
 		 * nodes are marked once — walking them twice is idempotent. */
@@ -13221,7 +13327,7 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 		{ r_gc_reg,   1, 16, TESSERA_REGISTRY_ENTRY_SIZE },
 		{ r_gc_snap,  3, 8, TESSERA_SNAPSHOT_RECORD_SIZE },
 	};
-	for (int i = 0; i < 8 && !aborted; i++) {
+	for (int i = 0; i < 9 && !aborted; i++) {
 		if (roots[i].root == 0) continue;
 		tessera_btree_t *t = tessera_btree_open(&tmp_->meta_bio,
 		    roots[i].root, roots[i].kind, roots[i].ksz, roots[i].vsz);
