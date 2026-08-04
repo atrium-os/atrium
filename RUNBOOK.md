@@ -133,11 +133,23 @@ and booting: came up on `/dev/vtbd3p2 on / (tessera, local)` with the module
 live. This is also what `bootstrap-atrium.sh` hands a new machine, so the
 newcomer path is the verified path.
 
-Consequence: the saved NVRAM variants in `vm/` — `edk2-vars-devroot.fd`,
-`-tessboot.fd`, `-tessraw.fd`, `-tessint.fd`, `-mu.fd` — are **legacy**. Nothing
-in `run-vm.sh` references them; they date from before `bootindex` settled boot
-selection. Keep `edk2-vars-blank.fd` (it is the 0xFF template the bootstrap
-copies); the rest can go.
+The per-scenario vars files in `vm/` — `edk2-vars-devroot.fd`, `-tessboot.fd`,
+`-tessraw.fd`, `-tessint.fd`, `-mu.fd` — are **regenerated caches, not state**.
+`run-vm.sh` references none of them, but each is used by a boot harness that
+recreates it first (`scripts/run-vm-tessera.sh`, and
+`scratch/stress/boot_tessera_{isolated,raw,interact}.sh`,
+`boot_multiuser_{soak,interact}.sh`, `pinscan_ab_probe.sh`). They exist because
+those harnesses present a *different device set* than `run-vm.sh`, so a vars
+store carrying `run-vm.sh`'s boot entries would drop them to the UEFI shell —
+each blanks its own before booting. Deleting any of them is therefore safe; they
+reappear on next use. Keep `edk2-vars-blank.fd`: it is the 0xFF template several
+of them copy.
+
+**On the fill byte.** `run-vm-tessera.sh` blanks with `truncate`, i.e. 0x00, and
+works — so EDK2 evidently reformats a zero-filled store. The bootstrap prefers
+0xFF because that is what erased NOR flash reads as and what
+`edk2-vars-blank.fd` contains, but treat that as defensive, not as a proven
+requirement.
 
 ### Not covered yet
 
