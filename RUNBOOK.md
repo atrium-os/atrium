@@ -2007,6 +2007,42 @@ vssh '/mnt/host/carillon-guest/target/aarch64-unknown-freebsd/release/carillon-g
 
 ---
 
+### VM wedge triage (2026-07-17, task #38 campaign)
+
+Three distinct "VM unresponsive" modes under heavy Tessera churn — do NOT
+blind-reset; discriminate first (each has different handling):
+
+1. **sshd starvation** (banner-exchange timeout, VM fine): sample guest PCs
+   via HMP — `printf 'info registers -a\n' | nc -U /tmp/qmp.sock -w 3`,
+   3× a few seconds apart. PCs MOVING → just load; wait and retry ssh.
+2. **Quadratic-sort "livelock"** (PCs frozen at non-idle addresses):
+   was O(n²) insertion sorts under the flush gate (fixed — libkern qsort,
+   task #38). If frozen PCs recur: start gdbstub via HMP
+   (`gdbserver tcp::4445`), attach `lldb -o 'gdb-remote 4445'`, symbolize
+   PCs against `scratch/kernel-syms/kernel` (nm; pull a fresh copy off the
+   VM if the kernel was rebuilt), disassemble loops, read registers.
+   Harvest EVERYTHING before any reset — reset destroys the evidence.
+3. **Boot-time gpusim poll hang after system_reset** (CPU0 in
+   `generic_bs_r_4`, CPUs 1-3 parked in `init_secondary`): the gpusim
+   device-model session can break across a guest reset; the guest then
+   polls a dead register forever during early boot. Fix: just
+   `system_reset` again (transient); if repeated, restart
+   `gpusim-server` on the host, then reset; last resort, full QEMU
+   relaunch via run-vm.sh.
+
+Serial console: `nc 127.0.0.1 4444` (login root). Under livelock even
+shell builtins won't run — tty echo works (interrupt level), nothing
+schedules; that itself is diagnostic.
+
+**frescod during FS/scheduler test campaigns: kill it.** It busy-spins
+when idle (task #25, unfixed), polluting CPU/energy baselines and
+occasionally thrashing memory. rc.conf already disables it, but the
+jailed-desktop launch path can bring it back after some boots —
+`pkill -9 atrium-frescod` (plus memfed/memoryd only if the test
+explicitly wants memory-management off; otherwise LEAVE those running —
+they matter under churn). Benchmark scripts should pkill -STOP / -CONT
+around timed sections instead of assuming a quiet system.
+
 ## 6. Ports of call — credentials and addresses
 
 | Resource | Value |

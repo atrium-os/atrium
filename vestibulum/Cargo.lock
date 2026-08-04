@@ -964,6 +964,7 @@ dependencies = [
  "fresco-protocol",
  "log",
  "pergola",
+ "serde_json",
 ]
 
 [[package]]

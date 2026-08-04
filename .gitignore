@@ -52,6 +52,35 @@ tarballs/
 # Test-tool extracted source trees that occasionally land in scratch/.
 scratch/pjdfstest_*
 
+# Dev-iteration framebuffer captures in scratch/ — splash/animation/boot
+# screenshots dumped while bringing up the display path. Regenerable; a
+# milestone frame worth keeping goes in with `git add -f`.
+scratch/*.png
+scratch/*.ppm
+
+# Salvage copies of VM disk images. `vm/*.img` / `vm/*.qcow2` are already
+# ignored above, but the suffixed rescue copies a debug session leaves
+# behind are multi-GB and must never be committed.
+vm/*.qcow2.*
+vm/*.img.*
+vm/*.stock
+
+# In-VM-built kmod scratch: a partial `make` leaves .o.tmp behind, and the
+# quota tests write their store into the source tree.
+**/*.o.tmp
+atrium-tessera/core/test_quota
+atrium-tessera/core/test_quota_store
+
+# Python bytecode caches.
+**/__pycache__/
+
+# Extracted kernel debug symbols for kgdb — ~95 MB, regenerable from the
+# matching kernel build.
+scratch/kernel-syms/
+
+# Browser-pane dev-server config: machine-local, like settings.local.json.
+.claude/launch.json
+
 # Local IDE / OS junk.
 .DS_Store
 .vscode/
