@@ -3724,8 +3724,27 @@ tessera_fs_dead_extent_drain(struct tessera_mount *tmp_)
 	    ents[TESSERA_DEAD_EXT_DRAIN_MAX];
 	uint32_t n = 0;
 
+	/* #114 instrumentation. Unconditional but self-limiting: the drain only
+	 * does anything when dead extents exist (rare, and never on a global-
+	 * policy volume), and the walk is capped at 256. Printing per iteration
+	 * is what distinguishes "cursor never terminates" from "free loop never
+	 * terminates" from "neither" — three candidates that a stale ddb trace
+	 * cannot separate. Remove once the spin is understood. */
+	printf("tessera_fs: drain enter (root=%ju)\n",
+	    (uintmax_t)tmp_->sb.dead_extent_root);
+	uint32_t iters = 0;
 	tessera_btree_cursor_t *c = tessera_btree_seek_first(tmp_->dead_extent_tree);
+	printf("tessera_fs: drain seek_first -> %s\n", c ? "cursor" : "NULL");
 	while (c != NULL && n < TESSERA_DEAD_EXT_DRAIN_MAX) {
+		if (++iters > TESSERA_DEAD_EXT_DRAIN_MAX * 4) {
+			/* Hard stop. If the cursor is the thing that will not
+			 * advance, this converts an unkillable spin into a
+			 * loud, survivable bug report. */
+			printf("tessera_fs: drain ABORT — cursor walked %u "
+			    "iterations for %u entries; not advancing\n",
+			    iters, n);
+			break;
+		}
 		uint8_t k[TESSERA_DEAD_EXT_KEY_SIZE];
 		uint8_t v[TESSERA_DEAD_EXT_VAL_SIZE];
 		if (tessera_btree_cursor_get(c, k, v) != TESSERA_OK)
@@ -3745,9 +3764,15 @@ tessera_fs_dead_extent_drain(struct tessera_mount *tmp_)
 	if (c != NULL)
 		tessera_btree_cursor_free(c);
 
+	printf("tessera_fs: drain collected %u entr%s in %u iteration(s)\n",
+	    n, n == 1 ? "y" : "ies", iters);
+
 	uint64_t root = tmp_->sb.dead_extent_root;
 	uint32_t freed = 0, undeletable = 0;
 	for (uint32_t i = 0; i < n; i++) {
+		printf("tessera_fs: drain[%u/%u] start=%ju len=%ju flags=0x%x\n",
+		    i + 1, n, (uintmax_t)ents[i].start,
+		    (uintmax_t)ents[i].len, ents[i].flags);
 		/* ★ DELETE FIRST, and only free if the delete committed.
 		 *
 		 * The original order was free-then-delete, reasoning that a
@@ -3805,6 +3830,8 @@ tessera_fs_dead_extent_drain(struct tessera_mount *tmp_)
 		if (tessera_stat_dead_extent_sectors >= ents[i].len)
 			tessera_stat_dead_extent_sectors -= ents[i].len;
 	}
+	printf("tessera_fs: drain exit — freed=%u undeletable=%u\n",
+	    freed, undeletable);
 	if (freed > 0) {
 		tessera_stat_dead_extent_drained += freed;
 		tessera_fs_mark_dirty(tmp_);
