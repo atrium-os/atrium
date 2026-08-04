@@ -1012,6 +1012,15 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_swaps, CTLFLAG_RD,
  * over-pinning is always safe, and the flush-gate preflight remains the
  * synchronous net that reclaims when the reserve genuinely runs tight.
  */
+/* Arms `deferred` dedup (§20.2). Default OFF because the control is only
+ * half-built: the publish pre-check is gated, but the losing extent is not yet
+ * recorded in the dead-extent log, so free space still nets to zero on a
+ * duplicate and the oracle stays open. Flip to 1 only to test the halves. */
+static int tessera_dedup_deferred_enable = 0;
+SYSCTL_INT(_kern_tessera, OID_AUTO, dedup_deferred_enable, CTLFLAG_RW,
+    &tessera_dedup_deferred_enable, 0,
+    "Allow arming deferred dedup before the dead-extent log is wired (#114)");
+
 static int tessera_pinscan_duty_pct = 5;
 SYSCTL_INT(_kern_tessera, OID_AUTO, pinscan_duty_pct, CTLFLAG_RW,
     &tessera_pinscan_duty_pct, 0,
@@ -3144,6 +3153,14 @@ struct tessera_mount {
 	 * Guarded by the vnode lock on the write/truncate/unlink paths. */
 	tessera_quota_domain_t    quota_domains[TESSERA_QUOTA_MAX_DOMAINS];
 	uint32_t                  quota_ndomains;
+	/* How many domains have dedup_policy != GLOBAL. The publish path must
+	 * know a writer's policy, but resolving it means inode_get -> domain,
+	 * and a per-publish inode_get is exactly the cost the dedup pre-check
+	 * skip was added to avoid (it dominated per-op cost). Almost every
+	 * volume has zero non-global domains, so this counter lets the hot
+	 * path answer "everything is global" with one compare and pay nothing.
+	 * Maintained by the policy ioctl and by domain load at mount. */
+	uint32_t                  quota_nnonglobal;
 	uint64_t                  quota_default_domain;
 	/* Persistence: the on-disk quota-domain tree (lazy-created on first
 	 * flush), and a dirty flag set on any used_bytes/limit change so
@@ -3707,6 +3724,47 @@ tessera_quota_for_inode(struct tessera_mount *tmp_,
 	uint64_t id = (ino->quota_domain != 0)
 	    ? ino->quota_domain : tmp_->quota_default_domain;
 	return (tessera_quota_find(tmp_, id));
+}
+
+/* Is this writer's quota domain on a `deferred` dedup policy
+ * (tessera-fs.md §20.2)? A deferred domain must NOT short-circuit a publish on
+ * a registry hit: doing so is the dedup existence oracle (§20.1 channel 1),
+ * measured at 5 blocks for a duplicate 4 MiB write versus 1039 for a novel one.
+ *
+ * FAST PATH FIRST. quota_nnonglobal is zero on essentially every volume, and
+ * the whole point of the pre-check skip this feeds is that a per-publish
+ * inode_get dominated per-op cost. When nothing is non-global we answer with
+ * one compare and touch no metadata at all, so a global-only volume pays
+ * exactly what it paid before this existed.
+ *
+ * owner_inode_no == 0 means "no identified owner" (internal publishes: GC,
+ * mount-time work, the snapshot machinery). Those are TCB writers, not jailed
+ * ones, so they take the global path.
+ */
+static int
+tessera_fs_dedup_is_deferred(struct tessera_mount *tmp_, uint32_t owner_inode_no)
+{
+	if (tmp_->quota_nnonglobal == 0 || owner_inode_no == 0)
+		return (0);
+
+	tessera_inode_record_t ino;
+	if (tessera_fs_inode_get(tmp_, owner_inode_no, &ino) != TESSERA_OK)
+		return (0);   /* unreadable inode: fail toward today's behaviour */
+	tessera_quota_domain_t *qd = tessera_quota_for_inode(tmp_, &ino);
+	return (qd != NULL && qd->dedup_policy == TESSERA_DEDUP_DEFERRED);
+}
+
+/* Recount quota_nnonglobal from the domain table. Called after any change to a
+ * domain's policy and after loading domains at mount. Cheap — the table is
+ * bounded by TESSERA_QUOTA_MAX_DOMAINS. */
+static void
+tessera_fs_quota_recount_nonglobal(struct tessera_mount *tmp_)
+{
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < tmp_->quota_ndomains; i++)
+		if (tmp_->quota_domains[i].dedup_policy != TESSERA_DEDUP_GLOBAL)
+			n++;
+	tmp_->quota_nnonglobal = n;
 }
 
 /* Allocate the next inode_no atomically. The bare
@@ -4947,6 +5005,14 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		}
 		if (qc != NULL)
 			tessera_btree_cursor_free(qc);
+		/* Domains carry their dedup_policy on disk, so the publish
+		 * path's fast-path counter has to be rebuilt from what was
+		 * just loaded — otherwise a volume with a deferred domain
+		 * would silently publish it as global after every remount. */
+		tessera_fs_quota_recount_nonglobal(tmp_);
+		if (tmp_->quota_nnonglobal > 0)
+			printf("tessera_fs: %u non-global dedup domain(s)\n",
+			    (unsigned)tmp_->quota_nnonglobal);
 		if (tmp_->quota_ndomains > 0)
 			printf("tessera_fs: loaded %u quota domain(s)\n",
 			    tmp_->quota_ndomains);
@@ -16161,7 +16227,8 @@ tessera_fs_publish_manifest_owned_ex(struct tessera_mount *tmp_,
 	 * work but reintroduces the per-publish btree_get this skip exists to
 	 * avoid, which was the dominant per-op cost.
 	 */
-	if (!known_new) {
+	if (!known_new &&
+	    !tessera_fs_dedup_is_deferred(tmp_, owner_inode_no)) {
 		uint8_t pack_id_local[16];
 		memcpy(pack_id_local, out_hash, 16);
 		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
@@ -16213,8 +16280,10 @@ tessera_fs_publish_manifest_owned_move(struct tessera_mount *tmp_,
 	/* ★ #72 SATB barrier — see publish_manifest_owned_ex. */
 	tessera_fs_gc_note_hash(tmp_, out_hash);
 
-	/* publish_dedup pre-check — see publish_manifest_owned_ex. */
-	{
+	/* publish_dedup pre-check — see publish_manifest_owned_ex. Skipped
+	 * entirely for a `deferred` domain: short-circuiting here IS the
+	 * oracle (§20.1 channel 1). */
+	if (!tessera_fs_dedup_is_deferred(tmp_, owner_inode_no)) {
 		sbintime_t _tc = TPROF_T0();
 		uint8_t pack_id_local[16];
 		memcpy(pack_id_local, out_hash, 16);
@@ -24530,6 +24599,26 @@ tessera_vop_pathconf(struct vop_pathconf_args *ap)
  * &count). Any vnode on the mount works as the fd. */
 #define TESSERA_IOC_GC          _IOR('T', 2, uint64_t)
 
+/* Set the dedup policy of the quota domain rooted at this directory
+ * (tessera-fs.md §20.2). Arg is a uint64_t holding TESSERA_DEDUP_GLOBAL or
+ * TESSERA_DEDUP_DEFERRED. Userspace:
+ *   ioctl(dirfd, TESSERA_IOC_DEDUP_POLICY, &policy).
+ *
+ * The directory must already BE a quota root (TESSERA_IOC_QUOTA_SET first) —
+ * the dedup-domain boundary deliberately coincides with the quota-domain
+ * boundary (tessera-quotas.md §4.2), one record and one tree attachment.
+ *
+ * SALTED is rejected with EOPNOTSUPP: it changes the chunk hash itself
+ * (SHA-256(domain_salt ‖ content)), so it can only be chosen at domain
+ * creation, and nothing implements it yet.
+ *
+ * GLOBAL <-> DEFERRED is safe to flip on a live domain: both hash content
+ * identically, only the write path differs, so already-stored blobs stay
+ * addressable either way. (§20.2 calls dedup_policy immutable; that is
+ * load-bearing for SALTED, which orphans existing hashes, and not for this
+ * pair.) */
+#define TESSERA_IOC_DEDUP_POLICY _IOW('T', 3, uint64_t)
+
 static int tessera_vop_ioctl_impl(struct vop_ioctl_args *ap);
 
 /* Directory-record RMW (xattr_hash / quota_domain fields) can race the
@@ -24599,6 +24688,56 @@ tessera_vop_ioctl_impl(struct vop_ioctl_args *ap)
 		printf("tessera_fs: quota domain %ju on inode %u, limit %ju\n",
 		    (uintmax_t)new_id, (unsigned)tn->inode_no,
 		    (uintmax_t)limit);
+		return (0);
+	}
+	case TESSERA_IOC_DEDUP_POLICY: {
+		if (vp->v_type != VDIR) return (ENOTDIR);
+		if (tmp_->inode_tree == NULL) return (EROFS);
+		uint64_t pol = *(uint64_t *)ap->a_data;
+		if (pol == TESSERA_DEDUP_SALTED)
+			return (EOPNOTSUPP);   /* see the #define comment */
+		if (pol != TESSERA_DEDUP_GLOBAL && pol != TESSERA_DEDUP_DEFERRED)
+			return (EINVAL);
+		/* INTERLOCK. Gating the publish pre-check is only half of
+		 * `deferred`: the losing extent must also be recorded in the
+		 * dead-extent log and left allocated. Without that half the
+		 * registry put still displaces the old entry and frees its
+		 * extents, so free space nets to zero and the oracle is exactly
+		 * as open as before — while the volume pays the extra write.
+		 * Refuse to arm a half-built security control; the sysctl is
+		 * the deliberate escape hatch for testing the halves. */
+		if (pol == TESSERA_DEDUP_DEFERRED &&
+		    !tessera_dedup_deferred_enable) {
+			printf("tessera_fs: refusing deferred dedup — the "
+			    "dead-extent log is not wired yet; set "
+			    "kern.tessera.dedup_deferred_enable=1 to test\n");
+			return (EOPNOTSUPP);
+		}
+
+		tessera_inode_record_t dino;
+		if (tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no, &dino)
+		    != TESSERA_OK)
+			return (EIO);
+		/* Must already be a quota root: the dedup domain and the quota
+		 * domain are one record (tessera-quotas.md §4.2). Setting a
+		 * policy on a plain directory would otherwise silently apply to
+		 * whatever domain it happens to inherit — i.e. to the whole
+		 * filesystem via the default domain. */
+		if (dino.quota_domain == 0)
+			return (EINVAL);
+		tessera_quota_domain_t *qd =
+		    tessera_quota_find(tmp_, dino.quota_domain);
+		if (qd == NULL)
+			return (ENOENT);
+
+		qd->dedup_policy = (uint8_t)pol;
+		tessera_fs_quota_recount_nonglobal(tmp_);
+		tmp_->quota_dirty = 1;
+		tessera_fs_mark_dirty(tmp_);
+		printf("tessera_fs: quota domain %ju dedup_policy=%ju "
+		    "(%u non-global domain(s))\n",
+		    (uintmax_t)dino.quota_domain, (uintmax_t)pol,
+		    (unsigned)tmp_->quota_nnonglobal);
 		return (0);
 	}
 	case TESSERA_IOC_GC: {
