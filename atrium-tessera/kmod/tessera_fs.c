@@ -3746,8 +3746,35 @@ tessera_fs_dead_extent_drain(struct tessera_mount *tmp_)
 		tessera_btree_cursor_free(c);
 
 	uint64_t root = tmp_->sb.dead_extent_root;
-	uint32_t freed = 0;
+	uint32_t freed = 0, undeletable = 0;
 	for (uint32_t i = 0; i < n; i++) {
+		/* ★ DELETE FIRST, and only free if the delete committed.
+		 *
+		 * The original order was free-then-delete, reasoning that a
+		 * lost record leaks whereas a lost free is retried. That was
+		 * wrong, and it is what made this drain spin: if the delete
+		 * fails the entry SURVIVES, so the next pass frees the SAME
+		 * extent again — a double free into the extent allocator.
+		 * RUNBOOK's own note is that a pinned CPU here is "almost
+		 * always the malloc allocator after heap corruption (double
+		 * free of a sector-sized block)".
+		 *
+		 * Leaking one extent is recoverable; corrupting the allocator
+		 * is not. So the record is removed first and the space is
+		 * returned only once nothing can re-return it. A delete that
+		 * fails now costs that extent (it stays allocated and stays
+		 * recorded, and the next pass retries it) instead of costing
+		 * the volume. */
+		uint8_t dkey[TESSERA_DEAD_EXT_KEY_SIZE];
+		for (int b = 0; b < 8; b++)
+			dkey[b] = (uint8_t)(ents[i].start >> (56 - 8 * b));
+		if (tessera_btree_delete(tmp_->dead_extent_tree, dkey, &root)
+		    != TESSERA_OK) {
+			undeletable++;
+			continue;          /* do NOT free — see above */
+		}
+		tmp_->sb.dead_extent_root = root;
+
 		if ((ents[i].flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) == 0) {
 			(void)tessera_extent_free(tmp_->extent_alloc,
 			    ents[i].start, ents[i].len);
@@ -3774,12 +3801,6 @@ tessera_fs_dead_extent_drain(struct tessera_mount *tmp_)
 				free(exts, M_TESSERA);
 			}
 		}
-		uint8_t key[TESSERA_DEAD_EXT_KEY_SIZE];
-		for (int b = 0; b < 8; b++)
-			key[b] = (uint8_t)(ents[i].start >> (56 - 8 * b));
-		if (tessera_btree_delete(tmp_->dead_extent_tree, key, &root)
-		    == TESSERA_OK)
-			tmp_->sb.dead_extent_root = root;
 		freed++;
 		if (tessera_stat_dead_extent_sectors >= ents[i].len)
 			tessera_stat_dead_extent_sectors -= ents[i].len;
@@ -3787,6 +3808,16 @@ tessera_fs_dead_extent_drain(struct tessera_mount *tmp_)
 	if (freed > 0) {
 		tessera_stat_dead_extent_drained += freed;
 		tessera_fs_mark_dirty(tmp_);
+	}
+	if (undeletable > 0) {
+		/* Report, and report ONCE per pass rather than per entry: a
+		 * caller that retries until no progress must be able to see
+		 * that the remainder is stuck rather than spin on it. `freed`
+		 * deliberately excludes these, so a pass that can only find
+		 * undeletable entries returns 0 = no progress = stop. */
+		printf("tessera_fs: dead-extent drain: %u entr%s could not be "
+		    "deleted and were left allocated (retry next pass)\n",
+		    undeletable, undeletable == 1 ? "y" : "ies");
 	}
 	return (freed);
 }
