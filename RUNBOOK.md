@@ -107,9 +107,37 @@ builds that "succeeded" while doing nothing (a sync that silently no-op'd, a
 - **The EFI firmware path in `run-vm.sh` is a broken symlink** in a fresh qemu
   build tree (`build/qemu-bundle/…` → `build/pc-bios/…`). The real file is in the
   source tree's `pc-bios/`. The script tries all three locations.
+- **The EFI files are PADDED, not patched.** Contents are byte-identical to
+  qemu's shipped EDK2 image; they are zero-extended from 2 MiB to exactly
+  64 MiB because the aarch64 `virt` machine models two 64 MiB `cfi.pflash01`
+  chips and a flash chip has a physical size. Get it wrong and qemu refuses to
+  start: `cfi.pflash01 device '/machine/virt.flash0' requires 67108864 bytes,
+  pflash0 block backend provides 2097152 bytes`.
+- **The vars store must be 0xFF-filled, not 0x00.** `edk2-arm-vars.fd` is UEFI's
+  NVRAM and has to look like a *blank flash chip*; erased NOR flash reads as
+  0xFF. The script copies `vm/edk2-vars-blank.fd` when present and synthesises
+  0xFF otherwise.
 - **It will not overwrite an existing `vm.qcow2`.** On a dev machine that is the
   working VM with real state in it; `--force` means redo a *build*, not destroy a
   disk. Move it aside deliberately if you want it rebuilt.
+
+### A blank EFI vars store is enough (verified 2026-08-04)
+
+Boot device selection comes from **`bootindex=0` on the devroot `-device` line**,
+which qemu passes to EDK2 via fw_cfg — *not* from saved NVRAM boot entries. So a
+pristine vars store boots the Tessera root with no further configuration: no env
+vars, no disk renumbering, no hand-maintained NVRAM image.
+
+Verified by swapping in a pristine 0xFF `edk2-arm-vars.fd` (zero boot entries)
+and booting: came up on `/dev/vtbd3p2 on / (tessera, local)` with the module
+live. This is also what `bootstrap-atrium.sh` hands a new machine, so the
+newcomer path is the verified path.
+
+Consequence: the saved NVRAM variants in `vm/` — `edk2-vars-devroot.fd`,
+`-tessboot.fd`, `-tessraw.fd`, `-tessint.fd`, `-mu.fd` — are **legacy**. Nothing
+in `run-vm.sh` references them; they date from before `bootindex` settled boot
+selection. Keep `edk2-vars-blank.fd` (it is the 0xFF template the bootstrap
+copies); the rest can go.
 
 ### Not covered yet
 

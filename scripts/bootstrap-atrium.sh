@@ -536,9 +536,24 @@ and set ATRIUM_VM_IMAGE_URL to the -ufs.qcow2.xz that is actually there."
     if [ -s "$vmd/edk2-arm-vars.fd" ]; then
         ok "EFI vars present"
     else
-        dd if=/dev/zero of="$vmd/edk2-arm-vars.fd" bs=1m count=64 >/dev/null 2>&1 \
-            || die "could not create the EFI vars store" "Check free space."
-        ok "EFI vars store created (64 MiB, blank)"
+        # This is UEFI's NVRAM (boot entries, boot order), so it must look like a
+        # BLANK FLASH CHIP, and erased NOR flash reads as 0xFF — not 0x00. A
+        # zero-filled store is not an erased one; EDK2 has to decide the header is
+        # invalid and reformat, and the failure mode if it does not is a VM that
+        # simply will not boot. The repo's own edk2-vars-blank.fd is 0xFF-filled,
+        # so prefer that template and only synthesise one as a fallback.
+        if [ -s "$vmd/edk2-vars-blank.fd" ]; then
+            cp "$vmd/edk2-vars-blank.fd" "$vmd/edk2-arm-vars.fd" \
+                || die "could not copy the blank vars template" "Check permissions."
+            ok "EFI vars store created from edk2-vars-blank.fd"
+        else
+            # 64 MiB of 0xFF without depending on GNU tools.
+            perl -e 'print "\xff" x (1024*1024) for 1..64' > "$vmd/edk2-arm-vars.fd" \
+                || die "could not create the EFI vars store" "Check free space."
+            ok "EFI vars store created (64 MiB of 0xFF = erased flash)"
+        fi
+        first=$(xxd -l4 -p "$vmd/edk2-arm-vars.fd" 2>/dev/null)
+        [ "$first" = "ffffffff" ] || warn "vars store does not begin 0xFFFFFFFF (got $first)"
     fi
 
     # ---- prove run-vm.sh has everything it needs ---------------------------
