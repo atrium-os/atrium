@@ -84,7 +84,7 @@ die()  { printf '\n%sFAILED%s %s\n' "$RED" "$R" "$1" >&2; shift
          [ $# -gt 0 ] && { printf '\n%s\n' "$*" >&2; }; exit 1; }
 
 # ------------------------------------------------------------ phase plumbing --
-PHASES="preflight clone fetch sysroot qemu kernel kmod userspace image stage"
+PHASES="preflight clone fetch sysroot qemu kernel kmod corelib userspace image stage"
 
 phase_desc() {
     case $1 in
@@ -95,6 +95,7 @@ phase_desc() {
     qemu)      echo "build the Atrium-patched qemu-system-aarch64";;
     kernel)    echo "cross-build the FreeBSD kernel on this Mac";;
     kmod)      echo "cross-build the Tessera filesystem module";;
+    corelib)   echo "cross-build libtessera_core.a (the Rust tools link against it)";;
     userspace) echo "cross-build the Rust userspace (frescod, portcullis, forum apps)";;
     image)     echo "create the VM disks and EFI firmware run-vm.sh needs";;
     stage)     echo "assemble everything under dist/";;
@@ -418,8 +419,48 @@ Re-run with --force --only kmod."
     ok "tessera_fs.ko built and symbol-checked"
 }
 
+# libtessera_core.a — the C core the Rust tessera-tools (fsck, repack, stat,
+# reindex, ...) link against. Without it NONE of them link: cargo reports ~100
+# undefined symbols and the failure looks like a Rust problem, which is why it
+# went unnoticed. A newcomer following the runbook could not build fsck at all.
+#
+# The Makefile is FreeBSD make syntax, so macOS make dies on it with "missing
+# separator" — use the Homebrew bmake we already require, and hand it the cross
+# toolchain explicitly so the archive is aarch64-FreeBSD rather than host code.
+ph_corelib() {
+    cd_core="$REPO/atrium-tessera/core"
+    [ -d "$cd_core" ] || { warn "atrium-tessera/core not in this tree, skipping"; return 0; }
+    L=$(brew --prefix llvm)
+    head_ "cross-building libtessera_core.a"
+    ( cd "$cd_core" && bmake -s libtessera_core.a \
+        CC="$L/bin/clang" AR="$L/bin/llvm-ar" RANLIB="$L/bin/llvm-ranlib" \
+        CFLAGS="-O2 -fno-strict-aliasing --target=aarch64-unknown-freebsd16.0 \
+                --sysroot=$SYSROOT -isystem $SYSROOT/usr/include \
+                -I$cd_core/include -I$cd_core/src -D__libtessera_core__" ) \
+        > "$LOGS/corelib.log" 2>&1 \
+        || die "libtessera_core build failed" "See $LOGS/corelib.log"
+
+    a="$cd_core/libtessera_core.a"
+    [ -f "$a" ] || die "bmake exited 0 but produced no libtessera_core.a" "See $LOGS/corelib.log"
+    # Prove it is TARGET code. A host-built archive links "fine" right up until
+    # the tools are run in the guest.
+    "$L/bin/llvm-nm" "$a" >/dev/null 2>&1 \
+        || die "$a is not a readable archive" "See $LOGS/corelib.log"
+    obj=$("$L/bin/llvm-ar" t "$a" 2>/dev/null | head -1)
+    "$L/bin/llvm-ar" x "$a" "$obj" --output=/tmp 2>/dev/null
+    if [ -f "/tmp/$obj" ]; then
+        file "/tmp/$obj" | grep -q 'ARM aarch64' \
+            || die "libtessera_core.a contains host objects, not aarch64" \
+                   "The cross flags did not reach bmake. See $LOGS/corelib.log"
+        rm -f "/tmp/$obj"
+    fi
+    ok "libtessera_core.a ($(( $(stat -f %z "$a") / 1024 )) KiB, aarch64)"
+}
+
 ph_userspace() {
     rustup target add "$TARGET_TRIPLE" >/dev/null 2>&1 || true
+    # tessera-sys/build.rs links the static core only when this points at it.
+    export TESSERA_CORE_LIB="$REPO/atrium-tessera/core"
     # Each of these is its own cargo workspace with its own target/ dir.
     # (crate-dir, cargo args, produced binaries)
     set -- \
@@ -429,7 +470,8 @@ ph_userspace() {
       "frescod|--bin frescod|frescod" \
       "forum-wm||forum-wm" \
       "forum-bar||forum-bar" \
-      "forum-dock||forum-dock"
+      "forum-dock||forum-dock" \
+      "atrium-tessera/rs|-p tessera-tools|tessera-fsck tessera-stat tessera-repack tessera-reindex"
     for spec in "$@"; do
         dir=$(echo "$spec" | cut -d'|' -f1)
         args=$(echo "$spec" | cut -d'|' -f2)
@@ -578,7 +620,9 @@ ph_stage() {
     [ -n "$k" ] && [ -f "$k" ] && cp "$k" "$DIST/boot/kernel"
     cp "$REPO/atrium-tessera/kmod/tessera_fs.ko" "$DIST/kmod/" 2>/dev/null
     for spec in portcullis:portcullisd portcullis:portcullis portcullis:opifex \
-                frescod:frescod forum-wm:forum-wm forum-bar:forum-bar forum-dock:forum-dock; do
+                frescod:frescod forum-wm:forum-wm forum-bar:forum-bar forum-dock:forum-dock \
+                atrium-tessera/rs:tessera-fsck atrium-tessera/rs:tessera-stat \
+                atrium-tessera/rs:tessera-repack atrium-tessera/rs:tessera-reindex; do
         d=${spec%%:*}; b=${spec##*:}
         bp="$REPO/$d/target/$TARGET_TRIPLE/release/$b"
         [ -x "$bp" ] && cp "$bp" "$DIST/bin/$b"
