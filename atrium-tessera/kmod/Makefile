@@ -47,15 +47,30 @@ CFLAGS+=    -DBLAKE3_USE_NEON=1
 OBJS+=      b3_blake3_neon.o
 
 # The NEON file needs its own rule, following the pattern FreeBSD uses for
-# sys/crypto/armv8 (see sys/modules/armv8crypto/Makefile). Two kernel-build
-# flags have to come off for it:
-#   -nostdinc            hides the compiler's own arm_neon.h intrinsics header
+# sys/crypto/armv8 (see sys/modules/armv8crypto/Makefile). One kernel-build
+# flag has to come off for it:
 #   -mgeneral-regs-only  is how the kernel FORBIDS FP/SIMD registers, so this
 #                        translation unit is the sanctioned exception — and the
 #                        reason b3_shim.c must bracket its calls with
 #                        fpu_kern_enter/leave (#94).
+#
+# It also needs the compiler's own arm_neon.h, which -nostdinc hides. We do NOT
+# drop -nostdinc to get it: that exposes the compiler's whole include dir, and
+# when CROSS-BUILDING from macOS the host clang's stdint.h then collides with
+# the kernel's types (int_fast16_t as int16_t vs FreeBSD's __int_fast16_t as
+# int, -Werror, build dies). In-VM it happens to work only because the compiler
+# is FreeBSD's own clang. Instead keep -nostdinc and append JUST the resource
+# dir with -idirafter: arm_neon.h lives only there so it is still found, while
+# every header FreeBSD also provides is resolved from the -I paths first.
+# It also needs the compiler's own arm_neon.h, which -nostdinc hides. We keep
+# -nostdinc and append JUST the resource dir with -idirafter, plus neon-compat/
+# ahead of it to satisfy arm_neon.h's `#include <stdint.h>` with the kernel's
+# types. See neon-compat/stdint.h for why dropping -nostdinc (FreeBSD's own
+# armv8crypto pattern) cannot work across two different toolchains.
+NEON_RESOURCE_DIR!=	${CC} -print-resource-dir 2>/dev/null || echo /nonexistent
 b3_blake3_neon.o: b3_blake3_neon.c
-	${CC} -c ${CFLAGS:N-nostdinc:N-mgeneral-regs-only} ${WERROR} ${PROF} 	    ${.IMPSRC}
+	${CC} -c ${CFLAGS:N-mgeneral-regs-only} -I${.CURDIR}/neon-compat \
+	    -idirafter ${NEON_RESOURCE_DIR}/include ${WERROR} ${PROF} ${.IMPSRC}
 	${CTFCONVERT_CMD}
 .endif
 
