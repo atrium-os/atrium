@@ -88,7 +88,10 @@ WANT_TABLET=0
 WANT_KGDB=0
 # Serial on TCP + qemu monitor on a unix socket. Keeps the VM detachable
 # (no stdio coupling) while still letting us reach the FreeBSD serial
-# console. NOTE: `~^B` is a tip(1)/cu(1) ESCAPE, not a wire sequence — piping
+# console. USE scripts/ddb_session.py — it handles the break sequence and drives
+# ddb over this socket (RUNBOOK §5). `ddb_session.py break`, then
+# `ddb_session.py "ps; tr <tid>"`, then `ddb_session.py continue`.
+# NOTE: `~^B` is a tip(1)/cu(1) ESCAPE, not a wire sequence — piping
 # it through raw `nc` just types a tilde at the login prompt (verified
 # 2026-08-04). To reach ddb over this TCP console you need a client that can
 # send a real serial BREAK, or boot with the console on stdio. Plain
