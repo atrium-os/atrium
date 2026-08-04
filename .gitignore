@@ -106,3 +106,6 @@ external/
 # VM debug screenshots — dev-iteration captures accumulate here. Milestone /
 # showcase frames that are worth keeping are committed explicitly (git add -f).
 vm/*.png
+
+# bootstrap-atrium.sh phase stamps, logs and the kernel objdir.
+.bootstrap-state/
