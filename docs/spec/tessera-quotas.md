@@ -127,10 +127,11 @@ in domain B:
 
 If the domains are equal, no quota update happens.
 
-### 3.6 statfs is quota-scoped, not pool-scoped (security-relevant)
+### 3.6 statfs is quota-scoped per MOUNT, not per path (security-relevant)
 
-For any path inside a quota domain, `VFS_STATFS`/`statfs(2)`
-reports **domain-logical** numbers, not the physical pool:
+**Normative:** a mount carrying a whole-FS quota (`mount -o
+tessera.quota_bytes=N`) reports **domain-logical** numbers from
+`VFS_STATFS`/`statfs(2)`, not the physical pool:
 
 - `f_blocks` = `limit_bytes / f_bsize`
 - `f_bavail` = `f_bfree` = `(limit_bytes − used_bytes) / f_bsize`
@@ -144,10 +145,72 @@ security, not just predictability**: the global physical
 free-space counter is a noise-free dedup existence oracle
 (tessera-fs.md §20.1 channel 1 — write a candidate file, fsync,
 re-read `df`; unchanged free space → those bytes already exist
-somewhere on the system). Every jail-visible mount MUST sit
-inside a quota domain; Portcullis provisions overlays accordingly
-(portcullis.md §4.1). A path *not* under any quota domain sees
-pool-physical statfs — host-only by policy.
+somewhere on the system).
+
+A mount *without* a whole-FS quota reports pool-physical statfs —
+host-only by policy.
+
+> **Scoping is per-mount and cannot be per-path.** `VFS_STATFS(mp,
+> sbp)` receives a *mount*, not a vnode, so the filesystem has no
+> way to know which directory the caller asked about. An earlier
+> draft of this section said "for any path inside a quota domain",
+> which promised something the interface structurally cannot
+> deliver. A **per-directory** domain (§3.1, set via
+> `TESSERA_IOC_QUOTA_SET`) therefore enforces its limit correctly
+> but does **not** scope `statfs` — see §3.6.1.
+
+#### 3.6.1 Per-directory quotas enforce, but do not scope statfs
+
+`ioctl(dirfd, TESSERA_IOC_QUOTA_SET, &limit)` marks a directory as
+a quota root. Verified behaviour (2026-08-04, live Tessera root):
+the limit is enforced exactly at the byte, child directories
+inherit the domain, space is released on unlink, and `limit = 0`
+clears it. Enforcement is sound.
+
+What it does **not** do is scope `statfs` — a path inside a
+per-directory domain still sees pool-physical numbers, because of
+the per-mount constraint above.
+
+#### 3.6.2 OPEN: channel 1 inside a jail (needs a decision)
+
+tessera-fs.md §20.1 lists free space (`statfs`) as observation
+channel 1 and states it is "closed by quota-scoped statfs
+(tessera-quotas.md §3.6)". As built, that closure does not reach a
+Portcullis jail, and this section should not be read as claiming
+it does. Two facts, both measured 2026-08-04:
+
+1. Jails are subtrees of **one shared Tessera volume** by design
+   (portcullis.md §4.1 — the choice that makes cross-jail dedup
+   work, so per-app volumes are not an option). The shared mount
+   therefore has no per-app whole-FS quota to scope against, and
+   §3.6.1 means a per-directory domain does not scope either.
+2. A jail root is `unionfs` over read-only `nullfs`, so `df`
+   inside the jail is answered by **unionfs**, not Tessera.
+   Measured inside such a jail, over a directory quota'd at
+   10 MiB on a 25 GiB pool:
+
+   ```
+   <above>:/var/lib/atrium/…/overlay   50G   40G   9.9G   80%   /
+   ```
+
+   The `9.9G` available matches the underlying pool's `9.9G`
+   exactly — unionfs **passes the underlying free space through**.
+   So a jailed app can read pool free space, which is precisely
+   channel 1.
+
+Whether this is exploitable in practice depends on the
+`overlays/<id>` dedup policy: with `deferred` (the default,
+portcullis.md §4.1) an untrusted write always allocates, so free
+space moves whether or not the content already exists, and the
+oracle gets no signal. If that reasoning holds, channel 1 is
+closed by the same mechanism as channel 2 and §20.1's attribution
+to statfs scoping is redundant rather than load-bearing.
+
+**This has not been verified end to end and is not settled.** It
+needs either (a) a demonstration that `deferred` really does make
+free-space movement content-independent for a jailed writer, or
+(b) a statfs override at the jail boundary. Until one of those
+lands, do not cite §3.6 as the closure for channel 1 in a jail.
 
 ### 3.7 Mount-time toggle for testing
 

@@ -943,7 +943,13 @@ The observation channels, strongest first:
 
 1. **Physical free space** (`statfs`). Write a candidate, fsync,
    re-read free space. Unchanged → dedup hit. Noise-free.
-   Closed by quota-scoped statfs (tessera-quotas.md §3.6).
+   Closed by quota-scoped statfs (tessera-quotas.md §3.6) **on a
+   mount carrying a whole-FS quota**. ⚠ That closure does NOT
+   currently reach a Portcullis jail: jails share one volume
+   (portcullis.md §4.1), statfs scoping is per-mount not per-path,
+   and a jail's `df` is answered by unionfs, which passes the
+   underlying pool's free space through (measured 2026-08-04).
+   See tessera-quotas.md §3.6.2 — OPEN.
 2. **Write/fsync timing.** A synchronous-dedup hit skips the
    pack append; latency is content-dependent. Closed by the
    `deferred` policy below.
