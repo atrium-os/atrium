@@ -20,10 +20,12 @@
 #include <errno.h>
 
 #define TESSERA_IOC_QUOTA_SET   _IOW('T', 1, uint64_t)
+#define TESSERA_IOC_DEDUP_POLICY _IOW('T', 3, uint64_t)
+#define TESSERA_IOC_GC          _IOR('T', 2, uint64_t)
 
 int main(int argc, char **argv)
 {
-    if (argc < 3) { fprintf(stderr, "usage: tquota set|clear|statfs <path> [bytes]\n"); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: tquota set|clear|statfs|policy <path> [arg]\n"); return 2; }
     const char *op = argv[1], *path = argv[2];
 
     if (strcmp(op, "statfs") == 0) {
@@ -36,6 +38,34 @@ int main(int argc, char **argv)
         printf("  total=%.2f MiB  avail=%.2f MiB\n",
                sb.f_blocks * (double)bs / 1048576.0,
                sb.f_bavail * (double)bs / 1048576.0);
+        return 0;
+    }
+
+    if (strcmp(op, "gc") == 0) {
+        uint64_t reclaimed = 0;
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) { perror("open"); return 1; }
+        if (ioctl(fd, TESSERA_IOC_GC, &reclaimed) != 0) {
+            fprintf(stderr, "ioctl GC: %s\n", strerror(errno));
+            close(fd); return 1;
+        }
+        close(fd);
+        printf("  gc reclaimed %llu pack(s)\n", (unsigned long long)reclaimed);
+        return 0;
+    }
+
+    if (strcmp(op, "policy") == 0) {
+        if (argc < 4) { fprintf(stderr, "policy needs 0|1 (global|deferred)\n"); return 2; }
+        uint64_t pol = strtoull(argv[3], NULL, 10);
+        int fd = open(path, O_RDONLY | O_DIRECTORY);
+        if (fd < 0) { perror("open"); return 1; }
+        if (ioctl(fd, TESSERA_IOC_DEDUP_POLICY, &pol) != 0) {
+            fprintf(stderr, "ioctl DEDUP_POLICY(%llu): %s\n",
+                    (unsigned long long)pol, strerror(errno));
+            close(fd); return 1;
+        }
+        close(fd);
+        printf("  dedup_policy on %s = %llu\n", path, (unsigned long long)pol);
         return 0;
     }
 
