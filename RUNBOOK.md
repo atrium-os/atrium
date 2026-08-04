@@ -325,6 +325,35 @@ Key bits:
 > host — it was written before the cross path existed. `scripts/bootstrap-atrium.sh`
 > (§0) automates all of this; the recipes here are the manual equivalents.
 
+### Build on the host. Always.
+
+**As of 2026-08-04 nothing requires a booted VM to produce artifacts.** The VM is
+for running and testing. Cross-build everything:
+
+| what | how |
+|---|---|
+| Rust userspace | `cargo build --release --target aarch64-unknown-freebsd` |
+| FreeBSD kernel | `tools/build/make.py … buildkernel` (below) |
+| `tessera_fs.ko` | same, via `buildenv` (below) — ~2s |
+| one-off C tools | `$(brew --prefix llvm)/bin/clang --target=aarch64-unknown-freebsd16.0 --sysroot=~/src/bsd/sysroot -fuse-ld=lld -isystem $SYSROOT/usr/include -L$SYSROOT/usr/lib -L$SYSROOT/lib` |
+| installing a bundle | `opifex … --sysroot ~/src/bsd/sysroot` |
+| all of it | `scripts/bootstrap-atrium.sh` (§0) |
+
+It is 2.8x faster, and the in-VM loop is where the worst failures came from: p9fs
+panics under heavy I/O, `make -j4` linking a `.ko` before its `.o` compiled and
+still exiting 0, and stale 9p builds leaving an old `.ko` in place.
+
+**Stage with `scp`, not the 9p share.** p9fs is the weak link — plain `cp` off
+`/mnt/host` can fail with *"Too many open files"* while the guest has 69 of
+392202 files open, and it panics under heavy I/O. Use
+`scp -i ~/.ssh/fresco_bsd_ed25519 -P 2222 <file> root@localhost:/root/`.
+Never `execve` off 9p regardless.
+
+**`scripts/vssh` uses `ConnectTimeout=3`**, which is too tight when the guest is
+busy: it fails with *empty output*, indistinguishable from a command that ran and
+printed nothing. For scripted work use a 30s-timeout wrapper and gate on a marker
+at the destination.
+
 ### FreeBSD kernel + kmod on the host
 
 Verified 2026-08-04. `tools/build/make.py` is upstream FreeBSD's cross-build
