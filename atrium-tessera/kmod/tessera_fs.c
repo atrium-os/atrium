@@ -1780,7 +1780,7 @@ struct tessera_chunk_in {
 static int tessera_fs_publish_chunked(struct tessera_mount *tmp_,
     const struct tessera_chunk_in *chunks, uint32_t n_chunks,
     const uint8_t *manifest_bytes, size_t mlen,
-    tessera_hash_t out_manifest_hash);
+    tessera_hash_t out_manifest_hash, uint32_t owner_inode_no);
 static int tessera_fs_replace_content_chunked(struct tessera_mount *tmp_,
     uint32_t inode_no, const uint8_t *new_bytes, size_t new_len);
 static int tessera_fs_append_chunked(struct tessera_mount *tmp_,
@@ -17928,7 +17928,8 @@ tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
     const uint8_t pack_id[16],
     const struct tessera_chunk_in *chunks, uint32_t n,
     const uint8_t *manifest_bytes, size_t mlen,
-    const tessera_hash_t manifest_hash)
+    const tessera_hash_t manifest_hash,
+    uint32_t owner_inode_no)
 {
 	tessera_pack_builder_t *pb = tessera_pack_begin(2 /* mixed */,
 	    pack_id, 0);
@@ -17990,6 +17991,34 @@ tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
 		return (EIO);
 	}
 
+	/* ★ #114 / §20.2 — chunk path. Same contract as the manifest path:
+	 * a deferred writer's duplicate keeps the EXISTING registry entry and
+	 * this copy's extents are recorded dead rather than freed. Freeing
+	 * nets the write to zero and hands free space back as the oracle.
+	 * This is the path that actually carries a file's bytes — the
+	 * manifest is a few KB, the chunks are the payload — so wiring only
+	 * the manifest side left the measurement completely unchanged
+	 * (5 blk vs 1039 blk, three rounds). */
+	if (owner_inode_no != 0 &&
+	    tessera_fs_dedup_is_deferred(tmp_, owner_inode_no)) {
+		uint8_t existing[TESSERA_REGISTRY_ENTRY_SIZE];
+		if (tessera_fs_registry_get_stable(tmp_, pack_id, existing,
+		    manifest_hash != NULL ? manifest_hash
+		                          : (const uint8_t *)pack_id)
+		    == TESSERA_OK) {
+			uint64_t pel = ((pa.flags &
+			    TESSERA_REGISTRY_FLAG_MULTI_EXTENT) != 0)
+			    ? pa.start_sector : 0;
+			if (tessera_fs_dead_extent_record(tmp_, pa.start_sector,
+			    pa.length_sectors, pa.flags, pel) == TESSERA_OK) {
+				tessera_stat_publish_dedup_chunked++;
+				return (0);
+			}
+			tessera_fs_pack_alloc_rollback(tmp_, &pa);
+			return (0);
+		}
+	}
+
 	if (tessera_fs_registry_put_pending(tmp_, pack_id, reg_value)
 	    != TESSERA_OK) {
 		tessera_fs_pack_alloc_rollback(tmp_, &pa);
@@ -18038,7 +18067,7 @@ static int
 tessera_fs_publish_chunked(struct tessera_mount *tmp_,
     const struct tessera_chunk_in *chunks, uint32_t n_chunks,
     const uint8_t *manifest_bytes, size_t mlen,
-    tessera_hash_t out_manifest_hash)
+    tessera_hash_t out_manifest_hash, uint32_t owner_inode_no)
 {
 	if (tmp_->pack_registry_tree == NULL || tmp_->extent_alloc == NULL)
 		return (EROFS);
@@ -18063,7 +18092,7 @@ tessera_fs_publish_chunked(struct tessera_mount *tmp_,
 	 * chunked variant gets even more value because cp(1)-driven
 	 * repeated whole-file rewrites land at the same pack_id once
 	 * each chunk's content stops changing. */
-	{
+	if (!tessera_fs_dedup_is_deferred(tmp_, owner_inode_no)) {
 		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
 		if (tessera_fs_registry_get_stable(tmp_,
 		    pack_id, reg_value, out_manifest_hash) == TESSERA_OK) {
@@ -18132,10 +18161,16 @@ tessera_fs_publish_chunked(struct tessera_mount *tmp_,
 		 * the chunks. The generation guard is what closes it; the
 		 * chunk hashes themselves were noted at function entry. */
 		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
-		if (tessera_fs_registry_get_stable(tmp_,
+		/* Note the INVERSION vs the other sites: this one emits when
+		 * the lookup MISSES. A deferred writer must emit regardless —
+		 * emit_chunk_pack then keeps the existing entry and records
+		 * this copy dead. */
+		if (tessera_fs_dedup_is_deferred(tmp_, owner_inode_no) ||
+		    tessera_fs_registry_get_stable(tmp_,
 		    batch_pack_id, reg_value, uniq[first].hash) != TESSERA_OK) {
 			rc = tessera_fs_emit_chunk_pack(tmp_, batch_pack_id,
-			    &uniq[first], batch_n, NULL, 0, NULL);
+			    &uniq[first], batch_n, NULL, 0, NULL,
+			    owner_inode_no);
 			if (rc != 0) break;
 		}
 		batch_idx++;
@@ -18147,7 +18182,7 @@ tessera_fs_publish_chunked(struct tessera_mount *tmp_,
 	 * last so the dedup shortcut at the top (which keys on this id) only
 	 * fires once every chunk pack is already durable. */
 	return (tessera_fs_emit_chunk_pack(tmp_, pack_id, NULL, 0,
-	    manifest_bytes, mlen, out_manifest_hash));
+	    manifest_bytes, mlen, out_manifest_hash, owner_inode_no));
 }
 
 /* ── v2 multi-level directory helpers ───────────────────────────── */
@@ -19458,7 +19493,7 @@ tessera_fs_replace_content_chunk_tree(struct tessera_mount *tmp_,
 
 		tessera_hash_t pub_hash;
 		if (tessera_fs_publish_chunked(tmp_, dirty, n_dirty, mft,
-		    mlen, pub_hash) != 0) {
+		    mlen, pub_hash, inode_no) != 0) {
 			free(mft, M_TESSERA);
 			free(dirty, M_TESSERA);
 			tessera_manifest_free(outer);
@@ -20208,7 +20243,7 @@ tessera_fs_replace_range_tree(struct tessera_mount *tmp_, uint32_t inode_no,
 				tessera_manifest_free(mb); mb = NULL;
 				tessera_hash_t pub;
 				if (tessera_fs_publish_chunked(tmp_, dirty,
-				    n_dirty, mft, mlen, pub) != 0)
+				    n_dirty, mft, mlen, pub, inode_no) != 0)
 					rc = EIO;
 				else if (tessera_manifest_add_tree_child(outer,
 				    pub, g_off) != TESSERA_OK)
@@ -20292,7 +20327,7 @@ tessera_fs_chunked_apply(struct tessera_mount *tmp_, uint32_t inode_no,
 	encode_inode_key(inode_no, key);
 	tessera_hash_t pub_hash;
 	int prc = tessera_fs_publish_chunked(tmp_, dirty, n_dirty, mft, mlen,
-	    pub_hash);
+	    pub_hash, inode_no);
 	if (prc != 0) {
 		/* Propagate the real errno — laundering ENOSPC into EIO hid
 		 * disk-full from every caller (and from userland). */
@@ -20685,7 +20720,7 @@ tessera_fs_append_apply(struct tessera_mount *tmp_, uint32_t inode_no,
 
 	tessera_hash_t pub_hash;
 	int rc = tessera_fs_publish_chunked(tmp_, pp->dirty, pp->n_dirty,
-	    pp->mft, pp->mlen, pub_hash);
+	    pp->mft, pp->mlen, pub_hash, inode_no);
 	free(pp->mft, M_TESSERA);
 	if (pp->merge_buf) free(pp->merge_buf, M_TESSERA);
 	free(pp->dirty, M_TESSERA);
@@ -21172,7 +21207,7 @@ tessera_fs_append_chunk_tree(struct tessera_mount *tmp_, uint32_t inode_no,
 
 		tessera_hash_t pub_hash;
 		if (tessera_fs_publish_chunked(tmp_, dirty, n_dirty, mft,
-		    mlen, pub_hash) != 0) {
+		    mlen, pub_hash, inode_no) != 0) {
 			free(mft, M_TESSERA);
 			free(dirty, M_TESSERA);
 			tessera_manifest_free(outer);
