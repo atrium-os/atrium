@@ -2064,6 +2064,13 @@ struct tessera_pending_inode {
 struct tessera_pending_owner {
 	LIST_ENTRY(tessera_pending_owner) link;
 	uint32_t inode_no;
+	/* Owner's dedup policy, resolved ONCE at put time and cached here.
+	 * Resolving it means inode_get, and the drain that needs the answer
+	 * runs under flush_mtx — reading the inode tree under that lock is the
+	 * ABBA shape #67/#103 exist to remove. The put happens before the lock
+	 * is taken, so the expensive part is done in the safe place and the
+	 * drain just reads a byte. 1 = deferred (§20.2). */
+	uint8_t  deferred;
 };
 
 struct tessera_pending_manifest {
@@ -10064,6 +10071,11 @@ tessera_fs_pending_manifest_put_impl(struct tessera_mount *tmp_,
 	if (owner_inode_no != 0) {
 		new_own = malloc(sizeof *new_own, M_TESSERA, M_WAITOK | M_ZERO);
 		new_own->inode_no = owner_inode_no;
+		/* Resolve HERE — before the mtx_lock below. This is the whole
+		 * point of caching it: the drain must not call inode_get while
+		 * holding flush_mtx. */
+		new_own->deferred = tessera_fs_dedup_is_deferred(tmp_,
+		    owner_inode_no) ? 1 : 0;
 	}
 
 	mtx_lock(&tmp_->flush_mtx);
@@ -10311,8 +10323,11 @@ tessera_fs_pending_manifests_drain(struct tessera_mount *tmp_)
 				uint32_t owner_for_policy = 0;
 				struct tessera_pending_owner *po_;
 				LIST_FOREACH(po_, &e->owners, link) {
-					if (tessera_fs_dedup_is_deferred(tmp_,
-					    po_->inode_no)) {
+					/* Cached at put time — deliberately NOT
+					 * re-resolved: this runs under
+					 * flush_mtx and inode_get here is the
+					 * #67/#103 ABBA shape. */
+					if (po_->deferred) {
 						owner_for_policy = po_->inode_no;
 						break;
 					}
