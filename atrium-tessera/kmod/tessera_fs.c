@@ -3687,6 +3687,103 @@ tessera_fs_dead_extent_record(struct tessera_mount *tmp_,
 	return (TESSERA_OK);
 }
 
+/* Drain the dead-extent log (§20.2 / #114): free the extents recorded by
+ * deferred duplicate appends and delete their entries.
+ *
+ * Runs in the GC's GATED apply phase, alongside the dead-pack free loop it
+ * mirrors, because both are pure allocator + btree bookkeeping.
+ *
+ * Two rules inherited from that loop, and both are load-bearing:
+ *   - Collect first, mutate after. Deleting while a cursor is open on the same
+ *     tree invalidates it (the same reason pass 2 collects its tuples).
+ *   - Free the extent BEFORE deleting the entry, and only delete if the delete
+ *     itself succeeds. If we deleted first and then failed to free, the record
+ *     of that space would be gone while the allocator still held it — a
+ *     permanent leak with nothing left pointing at it. Freeing first and
+ *     failing to delete is merely a retry next pass: the extent is already
+ *     back, and a second free of an already-free range is a no-op.
+ *
+ * Bounded per pass. This runs under the gate, and an unbounded walk of a log
+ * that a hostile jail can grow is a stall the length of that log.
+ */
+#define TESSERA_DEAD_EXT_DRAIN_MAX 256
+static uint32_t
+tessera_fs_dead_extent_drain(struct tessera_mount *tmp_)
+{
+	if (tmp_->dead_extent_tree == NULL || tmp_->sb.dead_extent_root == 0)
+		return (0);
+
+	struct { uint64_t start, len; uint32_t flags; uint64_t pel; }
+	    ents[TESSERA_DEAD_EXT_DRAIN_MAX];
+	uint32_t n = 0;
+
+	tessera_btree_cursor_t *c = tessera_btree_seek_first(tmp_->dead_extent_tree);
+	while (c != NULL && n < TESSERA_DEAD_EXT_DRAIN_MAX) {
+		uint8_t k[TESSERA_DEAD_EXT_KEY_SIZE];
+		uint8_t v[TESSERA_DEAD_EXT_VAL_SIZE];
+		if (tessera_btree_cursor_get(c, k, v) != TESSERA_OK)
+			break;
+		uint64_t start = 0;
+		for (int i = 0; i < 8; i++)
+			start = (start << 8) | k[i];
+		const tessera_dead_extent_t *de = (const tessera_dead_extent_t *)v;
+		ents[n].start = start;
+		ents[n].len   = de->length_sectors;
+		ents[n].flags = de->flags;
+		ents[n].pel   = de->pel_sector;
+		n++;
+		if (tessera_btree_cursor_next(c) != TESSERA_OK)
+			break;
+	}
+	if (c != NULL)
+		tessera_btree_cursor_free(c);
+
+	uint64_t root = tmp_->sb.dead_extent_root;
+	uint32_t freed = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		if ((ents[i].flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) == 0) {
+			(void)tessera_extent_free(tmp_->extent_alloc,
+			    ents[i].start, ents[i].len);
+		} else {
+			/* pel_sector was captured at record time precisely so
+			 * this path never reads the content zone under the
+			 * gate (#67/#99). Resolve from it and free each
+			 * extent, then the chain sectors themselves. */
+			tessera_registry_entry_t fake;
+			memset(&fake, 0, sizeof fake);
+			fake.start_sector   = ents[i].pel ? ents[i].pel
+			                                  : ents[i].start;
+			fake.length_sectors = ents[i].len;
+			fake.flags          = ents[i].flags;
+			tessera_pack_extent_t *exts = NULL;
+			uint32_t nexts = 0;
+			if (tessera_fs_pack_extents_resolve(tmp_, &fake,
+			    &exts, &nexts) == 0) {
+				for (uint32_t e = 0; e < nexts; e++)
+					(void)tessera_extent_free(
+					    tmp_->extent_alloc,
+					    exts[e].start_sector,
+					    exts[e].length_sectors);
+				free(exts, M_TESSERA);
+			}
+		}
+		uint8_t key[TESSERA_DEAD_EXT_KEY_SIZE];
+		for (int b = 0; b < 8; b++)
+			key[b] = (uint8_t)(ents[i].start >> (56 - 8 * b));
+		if (tessera_btree_delete(tmp_->dead_extent_tree, key, &root)
+		    == TESSERA_OK)
+			tmp_->sb.dead_extent_root = root;
+		freed++;
+		if (tessera_stat_dead_extent_sectors >= ents[i].len)
+			tessera_stat_dead_extent_sectors -= ents[i].len;
+	}
+	if (freed > 0) {
+		tessera_stat_dead_extent_drained += freed;
+		tessera_fs_mark_dirty(tmp_);
+	}
+	return (freed);
+}
+
 /* Flush-side: sorted-batch-put the blob-index overlay into blob_index_tree
  * (lazy-creating it on first use) and clear it. Best-effort: a failure keeps
  * the overlay for retry and leaves sb.blob_index_root unchanged. Gate held. */
@@ -16048,6 +16145,11 @@ next_p:
 		if (deads[i].pels != NULL) free(deads[i].pels, M_TESSERA);
 		if (deads[i].bh_extra != NULL) free(deads[i].bh_extra, M_TESSERA);
 	}
+
+	/* #114: same gated phase, same kind of work — return the extents left
+	 * behind by deferred duplicate appends. Independent of dead_count: a
+	 * pass that found no dead packs can still have a log to drain. */
+	(void)tessera_fs_dead_extent_drain(tmp_);
 	free(deads, M_TESSERA);
 
 	/*
