@@ -54,6 +54,7 @@ FBSD_MIRROR="${ATRIUM_FBSD_MIRROR:-https://download.freebsd.org/snapshots/${FBSD
 #   ATRIUM_OBJDIR     kernel build objdir (large; worth putting on a fast disk)
 #   ATRIUM_STATE      where phase stamps and logs live
 #   ATRIUM_DIST       where staged artifacts land
+#   ATRIUM_VM_DIR     where the VM disks and firmware live (default vm/)
 #
 # Anything already present at the default path is reused too — the override
 # exists for when it lives somewhere else entirely.
@@ -63,6 +64,7 @@ SYSROOT="${ATRIUM_SYSROOT:-$REPO/sysroot}"
 FBSD_SRC="${ATRIUM_FBSD_SRC:-$REPO/freebsd-src/usr/src}"
 QEMU_DIR="${ATRIUM_QEMU_DIR:-$REPO/external/qemu-build}"
 OBJDIR="${ATRIUM_OBJDIR:-$STATE/fbsdobj}"
+VM_DIR="${ATRIUM_VM_DIR:-$REPO/vm}"
 
 TARGET_TRIPLE="aarch64-unknown-freebsd"
 JOBS=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
@@ -82,7 +84,7 @@ die()  { printf '\n%sFAILED%s %s\n' "$RED" "$R" "$1" >&2; shift
          [ $# -gt 0 ] && { printf '\n%s\n' "$*" >&2; }; exit 1; }
 
 # ------------------------------------------------------------ phase plumbing --
-PHASES="preflight clone fetch sysroot qemu kernel kmod userspace stage"
+PHASES="preflight clone fetch sysroot qemu kernel kmod userspace image stage"
 
 phase_desc() {
     case $1 in
@@ -94,6 +96,7 @@ phase_desc() {
     kernel)    echo "cross-build the FreeBSD kernel on this Mac";;
     kmod)      echo "cross-build the Tessera filesystem module";;
     userspace) echo "cross-build the Rust userspace (frescod, portcullis, forum apps)";;
+    image)     echo "create the VM disks and EFI firmware run-vm.sh needs";;
     stage)     echo "assemble everything under dist/";;
     esac
 }
@@ -446,6 +449,114 @@ ph_userspace() {
     ok "userspace built for $TARGET_TRIPLE"
 }
 
+# Disk set run-vm.sh expects. Sizes match the existing dev VM's volumes. These
+# are SPARSE raw files: creating a 25G volume costs kilobytes until it is used.
+#   name                       bytes         what it is
+AUX_DISKS="crash-test.img:268435456 tessera-storage.img:17179869184 \
+tessera-root.img:3221225472 tessera-devroot.img:26843545600"
+VM_DISK_GROW="60G"
+
+ph_image() {
+    vmd="$VM_DIR"
+    mkdir -p "$vmd"
+
+    # ---- the root disk -----------------------------------------------------
+    # NEVER overwrite an existing vm.qcow2. On a dev machine that file is the
+    # working VM with real state in it (~29G here), and --force is meant for
+    # redoing BUILDS, not for destroying disks. Replacing it has to be a
+    # separate, deliberate act.
+    # -s not -e: a zero-byte vm.qcow2 is a failed earlier attempt, not a VM
+    # worth protecting. A real one always has content.
+    if [ -s "$vmd/vm.qcow2" ]; then
+        ok "vm.qcow2 already exists — left untouched"
+        say "     (to rebuild it from a fresh FreeBSD image, move it aside first;"
+        say "      --force deliberately does NOT overwrite disks)"
+    else
+        img="FreeBSD-${FBSD_VER}-arm64-aarch64-ufs.qcow2.xz"
+        url="${ATRIUM_VM_IMAGE_URL:-https://download.freebsd.org/snapshots/VM-IMAGES/${FBSD_VER}/aarch64/Latest/$img}"
+        if [ ! -s "$TARBALLS/$img" ]; then
+            head_ "downloading the FreeBSD VM image (~500 MB)"
+            curl -fL --progress-bar -o "$TARBALLS/$img.part" "$url" \
+                || die "downloading $img failed" \
+"Tried: $url
+Snapshot builds rotate, so this can 404. Browse
+  https://download.freebsd.org/snapshots/VM-IMAGES/${FBSD_VER}/aarch64/Latest/
+and set ATRIUM_VM_IMAGE_URL to the -ufs.qcow2.xz that is actually there."
+            mv "$TARBALLS/$img.part" "$TARBALLS/$img"
+        else
+            ok "reusing $img"
+        fi
+        head_ "decompressing into vm/vm.qcow2"
+        xz -dc "$TARBALLS/$img" > "$vmd/vm.qcow2.part" \
+            || die "decompressing $img failed" "The download may be truncated; delete it and re-run."
+        mv "$vmd/vm.qcow2.part" "$vmd/vm.qcow2"
+        # The stock image is sized to its contents; give the guest room to build in.
+        qemu="${ATRIUM_QEMU_BIN:-$QEMU_DIR/build/qemu-system-aarch64}"
+        qimg="$(dirname "$qemu")/qemu-img"
+        [ -x "$qimg" ] || qimg=$(command -v qemu-img)
+        [ -n "$qimg" ] && "$qimg" resize "$vmd/vm.qcow2" "$VM_DISK_GROW" >/dev/null 2>&1 \
+            && ok "root disk grown to $VM_DISK_GROW" \
+            || warn "could not resize vm.qcow2 (no qemu-img); the guest will have less room"
+        ok "vm/vm.qcow2 created from stock FreeBSD $FBSD_VER"
+    fi
+
+    # ---- auxiliary volumes -------------------------------------------------
+    # Scratch/Tessera volumes. The guest formats these itself; here they only
+    # have to exist at the right size, or qemu refuses to start.
+    for spec in $AUX_DISKS; do
+        n=${spec%%:*}; sz=${spec##*:}
+        if [ -e "$vmd/$n" ]; then ok "$n exists"; continue; fi
+        # Sparse: seek to size-1 and write one byte.
+        dd if=/dev/zero of="$vmd/$n" bs=1 count=1 seek=$((sz - 1)) >/dev/null 2>&1 \
+            || die "could not create $vmd/$n" "Check free space and permissions."
+        ok "created $n ($((sz / 1073741824))G sparse)"
+    done
+
+    # ---- EFI firmware ------------------------------------------------------
+    # qemu ships a 2 MiB edk2 image; the -drive if=pflash unit wants exactly
+    # 64 MiB, so it is zero-padded. run-vm.sh points at a path inside
+    # build/qemu-bundle/ that is a symlink into build/pc-bios/ and is BROKEN in a
+    # fresh build tree — the real file is in the source tree's pc-bios/. Try both.
+    if [ -s "$vmd/edk2-aarch64-code.fd" ]; then
+        ok "EFI code firmware present"
+    else
+        src=''
+        for c in "$QEMU_DIR/build/qemu-bundle/opt/homebrew/share/qemu/edk2-aarch64-code.fd" \
+                 "$QEMU_DIR/build/pc-bios/edk2-aarch64-code.fd" \
+                 "$QEMU_DIR/pc-bios/edk2-aarch64-code.fd"; do
+            [ -s "$c" ] && { src=$c; break; }
+        done
+        [ -n "$src" ] || die "cannot find edk2-aarch64-code.fd" \
+"Looked under $QEMU_DIR. The qemu phase must run before this one."
+        dd if=/dev/zero of="$vmd/edk2-aarch64-code.fd" bs=1m count=64 >/dev/null 2>&1
+        dd if="$src" of="$vmd/edk2-aarch64-code.fd" conv=notrunc >/dev/null 2>&1 \
+            || die "padding the EFI firmware failed" "Source was $src"
+        ok "EFI code firmware padded to 64 MiB from $(basename "$(dirname "$src")")/"
+    fi
+    if [ -s "$vmd/edk2-arm-vars.fd" ]; then
+        ok "EFI vars present"
+    else
+        dd if=/dev/zero of="$vmd/edk2-arm-vars.fd" bs=1m count=64 >/dev/null 2>&1 \
+            || die "could not create the EFI vars store" "Check free space."
+        ok "EFI vars store created (64 MiB, blank)"
+    fi
+
+    # ---- prove run-vm.sh has everything it needs ---------------------------
+    missing=''
+    for f in vm.qcow2 crash-test.img tessera-storage.img tessera-root.img \
+             tessera-devroot.img edk2-aarch64-code.fd edk2-arm-vars.fd; do
+        [ -s "$vmd/$f" ] || missing="$missing $f"
+    done
+    [ -z "$missing" ] || die "the VM is still missing:$missing" \
+        "run-vm.sh will refuse to start without every one of these."
+    for f in edk2-aarch64-code.fd edk2-arm-vars.fd; do
+        sz=$(stat -f %z "$vmd/$f")
+        [ "$sz" = "67108864" ] || die "$f is $sz bytes, must be exactly 67108864" \
+            "qemu's pflash unit requires a 64 MiB image. Delete it and re-run this phase."
+    done
+    ok "run-vm.sh has every disk and firmware file it needs"
+}
+
 ph_stage() {
     rm -rf "$DIST"; mkdir -p "$DIST/bin" "$DIST/boot" "$DIST/kmod"
     k=$(cat "$STATE/kernel.path" 2>/dev/null)
@@ -468,8 +579,61 @@ ph_stage() {
     done
     [ -z "$bad" ] || die "staged files are not aarch64:$bad" \
         "A host build was copied in by mistake. Re-run --only userspace --force."
+    # The staged artifacts still have to get INTO the guest. macOS cannot mount
+    # UFS, so this cannot happen from the host — it happens on first boot, over
+    # the 9p share, driven by this script. Generated here so it always matches
+    # what was actually staged.
+    cat > "$DIST/install-atrium.sh" <<'INSTALLER'
+#!/bin/sh
+# install-atrium.sh — run this INSIDE the VM, once, after the first boot.
+#
+#   kldload p9fs; mount -t p9fs -o trans=virtio bsd_share /mnt/host
+#   sh /mnt/host/dist/install-atrium.sh
+#
+# Installs the cross-built kernel, the Tessera module and the Atrium userspace
+# that scripts/bootstrap-atrium.sh produced on the host.
+set -eu
+D=$(cd "$(dirname "$0")" && pwd)
+[ -d /mnt/host ] || { echo "mount the 9p share first (see the header)"; exit 1; }
+
+echo "== kernel =="
+if [ -f "$D/boot/kernel" ]; then
+    mkdir -p /boot/atrium
+    cp "$D/boot/kernel" /boot/atrium/kernel
+    echo "  installed /boot/atrium/kernel (boot it with: boot /boot/atrium/kernel)"
+fi
+
+echo "== tessera module =="
+if [ -f "$D/kmod/tessera_fs.ko" ]; then
+    cp "$D/kmod/tessera_fs.ko" /boot/modules/ 2>/dev/null || cp "$D/kmod/tessera_fs.ko" /boot/kernel/
+    # nullfs must be preloaded, not demand-loaded: an on-demand load races jail
+    # mounts and panics getnewvnode intermittently.
+    grep -q '^nullfs_load' /boot/loader.conf 2>/dev/null || echo 'nullfs_load="YES"' >> /boot/loader.conf
+    echo "  installed tessera_fs.ko + ensured nullfs_load=YES"
+fi
+
+echo "== userspace =="
+mkdir -p /usr/local/bin
+for b in "$D"/bin/*; do
+    [ -f "$b" ] || continue
+    install -m 755 "$b" /usr/local/bin/ && echo "  $(basename "$b")"
+done
+
+echo "== verify =="
+for b in portcullisd frescod opifex; do
+    if [ -x /usr/local/bin/$b ]; then
+        ldd /usr/local/bin/$b >/dev/null 2>&1 \
+            && echo "  $b: links cleanly" \
+            || echo "  $b: WARNING unresolved libraries (ldd failed)"
+    fi
+done
+echo
+echo "Done. Atrium userspace is in /usr/local/bin."
+INSTALLER
+    chmod 755 "$DIST/install-atrium.sh"
+
     n=$(find "$DIST" -type f | wc -l | tr -d ' ')
-    ok "staged $n files under dist/"
+    ok "staged $n files under dist/ (including install-atrium.sh)"
 }
 
 # --------------------------------------------------------------------- main ---
@@ -522,5 +686,12 @@ say ""
 say "Nothing has been booted. Next:"
 say "  sh scripts/run-vm.sh          boot the VM"
 say "  sh scripts/vssh               ssh into it once it is up"
+say ""
+say "Then, inside the guest, install what was just built:"
+say "  kldload p9fs && mount -t p9fs -o trans=virtio bsd_share /mnt/host"
+say "  sh /mnt/host/dist/install-atrium.sh"
+say ""
+say "(macOS cannot mount the guest's UFS, so the artifacts go in over 9p on"
+say " first boot rather than being injected into the image from here.)"
 say ""
 say "Re-run this script any time; finished phases are skipped."
