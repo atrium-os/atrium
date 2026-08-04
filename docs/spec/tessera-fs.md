@@ -950,6 +950,11 @@ The observation channels, strongest first:
    and a jail's `df` is answered by unionfs, which passes the
    underlying pool's free space through (measured 2026-08-04).
    See tessera-quotas.md §3.6.2 — OPEN.
+   ⚠⚠ And §20.2's `deferred` policy does NOT cover for it: the
+   policy field is set but never read by the kmod, so every write
+   dedups synchronously. Measured 4 MiB duplicate = 5 blocks vs
+   4 MiB novel = 1039 blocks, three rounds, zero variance — the
+   oracle is open and noise-free. Task #114.
 2. **Write/fsync timing.** A synchronous-dedup hit skips the
    pack append; latency is content-dependent. Closed by the
    `deferred` policy below.

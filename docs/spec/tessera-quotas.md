@@ -198,19 +198,31 @@ it does. Two facts, both measured 2026-08-04:
    So a jailed app can read pool free space, which is precisely
    channel 1.
 
-Whether this is exploitable in practice depends on the
-`overlays/<id>` dedup policy: with `deferred` (the default,
-portcullis.md §4.1) an untrusted write always allocates, so free
-space moves whether or not the content already exists, and the
-oracle gets no signal. If that reasoning holds, channel 1 is
-closed by the same mechanism as channel 2 and §20.1's attribution
-to statfs scoping is redundant rather than load-bearing.
+It was hoped that the `overlays/<id>` `deferred` policy would
+close this anyway — an untrusted write that always allocates moves
+free space regardless of content, so the oracle gets no signal.
+**Measured 2026-08-04: it does not, because `deferred` is not
+implemented.** `dedup_policy` is defined in the format
+(format.h:498) and every domain is initialised to
+`TESSERA_DEDUP_DEFERRED` (core/src/quota.c:25), but the kmod never
+reads the field and `domain_salt` is referenced nowhere. There is
+no policy branch in the publish path; every write dedups
+synchronously.
 
-**This has not been verified end to end and is not settled.** It
-needs either (a) a demonstration that `deferred` really does make
-free-space movement content-independent for a jailed writer, or
-(b) a statfs override at the jail boundary. Until one of those
-lands, do not cite §3.6 as the closure for channel 1 in a jail.
+The oracle is consequently open and noise-free. On a fresh 2 GiB
+volume, writing 4 MiB that already exists versus 4 MiB of novel
+content, measured in statfs blocks over three rounds:
+
+| round | duplicate | unique |
+|---|---|---|
+| 1 | **5 blk** | 1039 blk |
+| 2 | **5 blk** | 1039 blk |
+| 3 | **5 blk** | 1039 blk |
+
+208× separation, zero variance. See task #114 and
+`scratch/oracle.sh`. **Do not cite §3.6 as the closure for
+channel 1 in a jail.** Closing it requires implementing §20.2 in
+the publish path so a `deferred` domain always allocates.
 
 ### 3.7 Mount-time toggle for testing
 
