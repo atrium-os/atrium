@@ -16036,13 +16036,21 @@ snap_next:
 						    tmp_->bio_ctx.cred ?
 						        tmp_->bio_ctx.cred :
 						        NOCRED, &bp) == 0) {
+							/* ★ #114: heap. This struct
+							 * is 4096 B; two copies of it
+							 * inlined here were 8192 of
+							 * gc_data_zone_ex's 9392-byte
+							 * frame on a 16 KiB kstack. */
 							tessera_pack_extent_list_t
-							    pel;
+							    *pel = malloc(
+							    sizeof(*pel),
+							    M_TESSERA, M_WAITOK);
 							if (tessera_decode_pack_extent_list(
 							    (const uint8_t *)
-							    bp->b_data, &pel)
+							    bp->b_data, pel)
 							    == TESSERA_OK)
-								next = pel.next_pel_sector;
+								next = pel->next_pel_sector;
+							free(pel, M_TESSERA);
 							brelse(bp);
 						}
 						plist[pn++] = pel_s;
@@ -16201,11 +16209,16 @@ next_p:
 					    tmp_->bio_ctx.cred ?
 					        tmp_->bio_ctx.cred : NOCRED,
 					    &bp) == 0) {
-						tessera_pack_extent_list_t pel;
+						/* ★ #114: heap — see the sibling
+						 * site above; 4096 B each. */
+						tessera_pack_extent_list_t *pel =
+						    malloc(sizeof(*pel),
+						    M_TESSERA, M_WAITOK);
 						if (tessera_decode_pack_extent_list(
 						    (const uint8_t *)bp->b_data,
-						    &pel) == TESSERA_OK)
-							next = pel.next_pel_sector;
+						    pel) == TESSERA_OK)
+							next = pel->next_pel_sector;
+						free(pel, M_TESSERA);
 						brelse(bp);
 					}
 					(void)tessera_extent_free(
@@ -17015,6 +17028,11 @@ tessera_fs_pack_extents_resolve(struct tessera_mount *tmp_,
 	    M_TESSERA, M_WAITOK);
 
 	uint64_t cur_sector = re->start_sector;
+	/* ★ #114: heap, allocated ONCE for the whole chain walk. This struct is
+	 * 4096 B (format.h static-asserts it); as a loop local it put a 4 KiB
+	 * frame on the deep GC read path and blew the 4-page kstack. */
+	tessera_pack_extent_list_t *pel =
+	    malloc(sizeof(*pel), M_TESSERA, M_WAITOK);
 	for (int depth = 0; depth < 64; depth++) {  /* depth cap */
 		struct buf *bp = NULL;
 		int err = bread(tmp_->devvp,
@@ -17024,32 +17042,34 @@ tessera_fs_pack_extents_resolve(struct tessera_mount *tmp_,
 		if (err != 0) {
 			if (bp != NULL) brelse(bp);
 			free(result, M_TESSERA);
+			free(pel, M_TESSERA);
 			return (EIO);
 		}
-		tessera_pack_extent_list_t pel;
 		int r = tessera_decode_pack_extent_list(
-		    (const uint8_t *)bp->b_data, &pel);
+		    (const uint8_t *)bp->b_data, pel);
 		brelse(bp);
 		if (r != TESSERA_OK) {
 			printf("tessera_fs: pack extent list at sector %llu — "
 			    "decode failed: r=%d (chain depth=%d)\n",
 			    (unsigned long long)cur_sector, r, depth);
 			free(result, M_TESSERA);
+			free(pel, M_TESSERA);
 			return (EIO);
 		}
-		if (cnt + pel.extent_count > cap) {
-			while (cap < cnt + pel.extent_count) cap *= 2;
+		if (cnt + pel->extent_count > cap) {
+			while (cap < cnt + pel->extent_count) cap *= 2;
 			tessera_pack_extent_t *grown = malloc(
 			    cap * sizeof *grown, M_TESSERA, M_WAITOK);
 			memcpy(grown, result, cnt * sizeof *result);
 			free(result, M_TESSERA);
 			result = grown;
 		}
-		for (uint32_t i = 0; i < pel.extent_count; i++)
-			result[cnt++] = pel.extents[i];
-		if (pel.next_pel_sector == 0) break;
-		cur_sector = pel.next_pel_sector;
+		for (uint32_t i = 0; i < pel->extent_count; i++)
+			result[cnt++] = pel->extents[i];
+		if (pel->next_pel_sector == 0) break;
+		cur_sector = pel->next_pel_sector;
 	}
+	free(pel, M_TESSERA);
 
 	*out_extents = result;
 	*out_count   = cnt;
