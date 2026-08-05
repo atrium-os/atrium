@@ -84,7 +84,13 @@ die()  { printf '\n%sFAILED%s %s\n' "$RED" "$R" "$1" >&2; shift
          [ $# -gt 0 ] && { printf '\n%s\n' "$*" >&2; }; exit 1; }
 
 # ------------------------------------------------------------ phase plumbing --
-PHASES="preflight clone fetch sysroot qemu kernel kmod corelib userspace image stage"
+PHASES="preflight clone fetch sysroot qemu kernel kmod corelib corecheck userspace image stage"
+
+# Phases that RUN EVERY TIME, never skipped by their done-stamp. A test phase
+# that runs once and is then skipped forever is worse than no test phase: it
+# reports green from a stamp written weeks ago. These still stamp (so --list
+# shows when they last ran), they just never short-circuit.
+ALWAYS_PHASES="corecheck"
 
 phase_desc() {
     case $1 in
@@ -96,6 +102,7 @@ phase_desc() {
     kernel)    echo "cross-build the FreeBSD kernel on this Mac";;
     kmod)      echo "cross-build the Tessera filesystem module";;
     corelib)   echo "cross-build libtessera_core.a (the Rust tools link against it)";;
+    corecheck) echo "run the C core test suite natively (every build)";;
     userspace) echo "cross-build the Rust userspace (frescod, portcullis, forum apps)";;
     image)     echo "create the VM disks and EFI firmware run-vm.sh needs";;
     stage)     echo "assemble everything under dist/";;
@@ -484,6 +491,30 @@ ph_corelib() {
     ok "libtessera_core.a ($(( $(stat -f %z "$a") / 1024 )) KiB, aarch64, $nmemb objects)"
 }
 
+# Run the C core's own test suite on the BUILD HOST, every build.
+#
+# These are cheap (~10 s) and they are the only tests in this tree that can run
+# without booting the VM. Keeping them in the bootstrap is what stops them
+# rotting: test_quota asserted a default that had been changed two days earlier
+# and nobody saw it, because on macOS the suite could not even be linked
+# (f015b588). A suite nothing runs is documentation, not verification.
+#
+# Deliberately AFTER corelib: a cross-build failure should surface before a
+# test failure, since the tests exercise a separately compiled host archive and
+# cannot tell you anything about the cross artifacts.
+ph_corecheck() {
+    cd_core="$REPO/atrium-tessera/core"
+    [ -d "$cd_core" ] || { warn "atrium-tessera/core not in this tree, skipping"; return 0; }
+    command -v cc >/dev/null 2>&1 || { warn "no host cc, skipping core tests"; return 0; }
+    head_ "running the C core test suite on this host"
+    if sh "$REPO/scripts/core-host-tests.sh" -k > "$LOGS/corecheck.log" 2>&1; then
+        ok "$(grep -a "^host tests:" "$LOGS/corecheck.log")"
+    else
+        tail -30 "$LOGS/corecheck.log"
+        die "core test suite FAILED" "See $LOGS/corecheck.log"
+    fi
+}
+
 ph_userspace() {
     rustup target add "$TARGET_TRIPLE" >/dev/null 2>&1 || true
     # tessera-sys/build.rs links the static core only when this points at it.
@@ -746,7 +777,9 @@ for p in $PHASES; do
     if [ -n "$FROM" ] && [ -z "$reached" ]; then
         [ "$FROM" = "$p" ] && reached=1 || continue
     fi
-    if is_done "$p" && [ -z "$FORCE" ] && [ -z "$ONLY" ]; then
+    always=''
+    case " $ALWAYS_PHASES " in *" $p "*) always=1 ;; esac
+    if is_done "$p" && [ -z "$FORCE" ] && [ -z "$ONLY" ] && [ -z "$always" ]; then
         say "  ${GRN}skip${R} $p (done $(cat "$(done_stamp "$p")"))"
         continue
     fi
