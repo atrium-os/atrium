@@ -54,6 +54,9 @@ fn run(path: &str) -> Result<i32, String> {
         meta_reserve_bump:  new_bump,
         next_inode_no:      unsafe { tessera_volume_next_inode_no(v) },
         blob_index_root:    root,
+        // Ignored: TESSERA_COMMIT_DEAD_EXTENT is not set, so the
+        // superblock's own dead_extent_root is preserved.
+        dead_extent_root:   0,
     };
     let rc = unsafe { tessera_volume_commit_roots(v, &commit) };
     unsafe { tessera_volume_close(v) };

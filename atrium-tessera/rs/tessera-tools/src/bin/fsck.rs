@@ -49,6 +49,22 @@ fn hx(h: &Hash) -> String { h[..6].iter().map(|b| format!("{b:02x}")).collect() 
 const S_IFMT: u32 = 0o170000;
 const S_IFREG: u32 = 0o100000;
 
+/// What --repair may do about a superblock root that no longer holds a node
+/// of its own tree kind. The tiers are NOT a severity ranking — they answer a
+/// narrower question: is clearing this root a recovery, a bounded downgrade,
+/// or the destruction of the filesystem?
+#[derive(Clone, Copy, PartialEq)]
+enum StaleFix {
+    /// Fully reconstructible. fsck already derives the authoritative free set
+    /// from the pack zone, so rebuilding is a real repair, not a loss.
+    Rebuild,
+    /// Clearing loses that tree, but the loss is bounded, nameable, and leaves
+    /// a consistent mountable volume.
+    Clear,
+    /// Clearing would destroy the filesystem. Refuse and say why.
+    Refuse,
+}
+
 struct Fsck {
     problems: Vec<String>,
     // informational findings (don't fail the check): space-accounting,
@@ -85,6 +101,12 @@ struct Fsck {
     // set when the on-disk free-extent tree disagrees with reality
     // (leaked sectors, double-state, free overlap / out-of-bounds).
     free_tree_dirty: bool,
+    /// Superblock roots proven stale by the #115 sweep that --repair will
+    /// CLEAR (StaleFix::Clear). Names only; the commit maps them to fields.
+    stale_clear: Vec<&'static str>,
+    /// Stale roots this tool refuses to touch, kept so --repair can say so
+    /// out loud instead of exiting "nothing repairable" with no reason.
+    stale_refused: Vec<&'static str>,
     // ── Tier-B structural repairs ──
     // dirents pointing at a non-existent inode: (parent_ino, child_ino, name).
     // --repair republishes the parent directory without them.
@@ -478,6 +500,8 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
         quota_fixes: Vec::new(),
         free_runs: Vec::new(),
         free_tree_dirty: false,
+        stale_clear: Vec::new(),
+        stale_refused: Vec::new(),
         dangling_dirents: Vec::new(),
         orphans: Vec::new(),
         dangling_manifests: Vec::new(),
@@ -503,21 +527,28 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
     // Cause is always the same: a tree whose root pinscan does not pin gets
     // its sector reclaimed and handed to another tree. Prevention is in the
     // kmod; this is the detector for volumes already in that state.
-    for &(name, root, kind, consequence) in &[
+    for &(name, root, kind, fix, consequence) in &[
         ("inode_root",         inode_root,      TESSERA_BTREE_KIND_INODE,
+         StaleFix::Refuse,
          "every file and directory is unreachable"),
         ("pack_registry_root", pack_root,       TESSERA_BTREE_KIND_PACK_REG,
+         StaleFix::Refuse,
          "no blob can be located; the volume is effectively empty"),
         ("free_extent_root",   free_root,       TESSERA_BTREE_KIND_FREE_EXT,
+         StaleFix::Rebuild,
          "free-space accounting is lost; allocation may hand out live sectors"),
         ("snapshots_root",     snapshots_root,  TESSERA_BTREE_KIND_SNAPSHOT,
+         StaleFix::Refuse,
          "all retained snapshots are unreachable"),
         ("quota_tree_root",    quota_root,      TESSERA_BTREE_KIND_QUOTA,
+         StaleFix::Clear,
          "all per-directory quota domains are lost; limits stop being enforced"),
         ("blob_index_root",    blob_index_root, TESSERA_BTREE_KIND_BLOB_INDEX,
+         StaleFix::Clear,
          "cold reads fall back to scanning the whole registry; run tessera-reindex"),
         ("dead_extent_root",
          unsafe { tessera_volume_dead_extent_root(v) }, TESSERA_BTREE_KIND_DEAD_EXT,
+         StaleFix::Clear,
          "deferred-dedup dead extents are stranded and never reclaimed"),
     ] {
         if root == 0 { continue; }          // an unset root is not damage
@@ -529,8 +560,25 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
         // else — unreadable, bad magic, wrong kind — gets described.
         if ok && &hb[0..4] == b"TBTR" && hb[7] == kind { continue; }
         let why = describe_root_sector(&f, root, kind);
-        fsck.problem(format!("{name}: {why} — {consequence}"));
+        let plan = match fix {
+            StaleFix::Rebuild => "--repair rebuilds it from the pack zone",
+            StaleFix::Clear   => "--repair clears it (that tree stays lost)",
+            StaleFix::Refuse  => "NOT repairable by this tool — restore from backup",
+        };
+        fsck.problem(format!("{name}: {why} — {consequence} [{plan}]"));
+        match fix {
+            // The rebuild path already exists (#44) and derives the free set
+            // from the pack zone, not from the tree being replaced, so it is
+            // indifferent to the old root being garbage.
+            StaleFix::Rebuild => fsck.free_tree_dirty = true,
+            StaleFix::Clear   => fsck.stale_clear.push(name),
+            StaleFix::Refuse  => fsck.stale_refused.push(name),
+        }
     }
+    // A stale quota root makes every quota record unreadable, so the quota
+    // audit below would compare live usage against nothing and "fix" records
+    // that do not exist. Skip it; the root is being cleared anyway.
+    let quota_root_stale = fsck.stale_clear.contains(&"quota_tree_root");
 
 
     // ── bounds sanity ────────────────────────────────────────────
@@ -1283,7 +1331,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
     // Each domain's used_bytes must equal the summed logical size of the
     // regular files in it (quota is charged on file bytes via vop_write).
     // quota_root read up-front (also needed by apply_repairs).
-    if quota_root != 0 {
+    if quota_root != 0 && !quota_root_stale {
         unsafe {
             let t = tessera_btree_open(&io, quota_root, TESSERA_BTREE_KIND_QUOTA, 8, 128);
             if t.is_null() {
@@ -1407,7 +1455,29 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
         Ok(x) => x,
         Err(e) => { unsafe { tessera_volume_close(v); } return Err(format!("repair aborted: {e}")); }
     };
-    if applied == 0 {
+    // ── stale superblock roots (#115) ────────────────────────────────
+    // These are not btree work, so apply_repairs knows nothing about them:
+    // the repair IS the superblock write below. Count them as actions so a
+    // volume whose ONLY damage is a stale root still commits.
+    let mut clear_quota = false;
+    let mut clear_blob_index = false;
+    let mut clear_dead_extent = false;
+    for name in &fsck.stale_clear {
+        match *name {
+            "quota_tree_root"  => clear_quota = true,
+            "blob_index_root"  => clear_blob_index = true,
+            "dead_extent_root" => clear_dead_extent = true,
+            _ => {}
+        }
+        println!("  stale root: clearing {name}");
+    }
+    let stale_applied = fsck.stale_clear.len() as u32;
+    for name in &fsck.stale_refused {
+        println!("  stale root: {name} NOT cleared — clearing it would destroy the \
+filesystem, and this tool will not do that. Restore from backup.");
+    }
+
+    if applied + stale_applied == 0 {
         println!("tessera-fsck: nothing safely repairable by this tool (superblock-level or unrecoverable damage) — see problems above");
         unsafe { tessera_volume_close(v); }
         return Ok((1, 0));
@@ -1420,26 +1490,39 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
         inode_root:         new_roots.inode_root,
         pack_registry_root: new_roots.pack_registry_root,
         free_extent_root:   new_roots.free_extent_root,
-        quota_tree_root:    new_roots.quota_tree_root,
+        quota_tree_root:    if clear_quota { 0 } else { new_roots.quota_tree_root },
         snapshots_root:     new_roots.snapshots_root,
         meta_reserve_bump:  unsafe { (*ctxp).bump.get() },
         next_inode_no:      new_roots.next_inode_no,
         // repair appends to the bump (never rewrites the reserve start), so the
         // blob→pack index nodes survive — preserve its root.
-        blob_index_root:    unsafe { tessera_volume_blob_index_root(v) },
+        blob_index_root:    if clear_blob_index { 0 }
+                            else { unsafe { tessera_volume_blob_index_root(v) } },
+        // Only read when the flag below is set; 0 clears the stale tree.
+        dead_extent_root:   0,
     };
-    let rc = unsafe { tessera_volume_commit_roots(v, &commit) };
+    // The dead-extent root is preserved unless we explicitly opt in, so ask
+    // for it only when this run actually proved that root stale.
+    let cflags = if clear_dead_extent { TESSERA_COMMIT_DEAD_EXTENT } else { 0 };
+    let rc = unsafe { tessera_volume_commit_roots_ex(v, &commit, cflags) };
     unsafe { tessera_volume_close(v); }
     if rc != 0 {
         return Err(format!("commit_roots failed: rc={rc}"));
     }
-    println!("tessera-fsck: applied {applied} repair action(s); committed generation {}",
-        generation + 1);
+    println!("tessera-fsck: applied {} repair action(s); committed generation {}",
+        applied + stale_applied, generation + 1);
+    if clear_blob_index {
+        println!("tessera-fsck: the blob→pack index was cleared — run tessera-reindex \
+to rebuild it, or cold reads will scan the whole pack registry.");
+    }
     if truncated {
         println!("tessera-fsck: this pass was CAPPED (budget {repair_budget}) or ran out of \
 reserve — the repairs above are committed and durable; re-run to continue.");
     }
-    Ok((1, applied))
+    // Report the stale-root clears too: the fixpoint driver decides whether
+    // to run another pass from this count, and a pass that only cleared a
+    // root DID make progress.
+    Ok((1, applied + stale_applied))
 }
 
 /// Drive --repair to a fixpoint: repeatedly scan + apply until the volume

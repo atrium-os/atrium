@@ -109,7 +109,16 @@ typedef struct {
 	uint64_t snapshots_root;
 	uint64_t meta_reserve_bump;   /* advanced past reserve sectors used */
 	uint64_t next_inode_no;       /* advanced if repair minted an inode */
-	uint64_t blob_index_root;     /* blob→pack index (0 keeps current) */
+	uint64_t blob_index_root;     /* blob→pack index — WRITTEN VERBATIM.
+	                               * (An earlier comment here claimed "0 keeps
+	                               * current". It does not: the code below
+	                               * compares and assigns, so a caller that
+	                               * leaves this 0 ZEROES the index. Read the
+	                               * live value and pass it through.) */
+	uint64_t dead_extent_root;    /* deferred-dedup dead extents. IGNORED
+	                               * unless TESSERA_COMMIT_DEAD_EXTENT is set,
+	                               * so every existing caller keeps preserving
+	                               * it by doing nothing. */
 } tessera_commit_roots_t;
 
 int tessera_volume_commit_roots(tessera_volume_t *v,
@@ -117,6 +126,13 @@ int tessera_volume_commit_roots(tessera_volume_t *v,
 
 /* commit_roots flags. Default (0) matches tessera_volume_commit_roots:
  * meta_reserve_bump only advances, never regresses (repair semantics). */
+#define TESSERA_COMMIT_DEAD_EXTENT 0x2u  /* apply roots->dead_extent_root.
+                                           * Opt-in because the field is new:
+                                           * without it a caller that zero-fills
+                                           * the struct would silently destroy
+                                           * the dead-extent tree. Only
+                                           * tessera-fsck --repair sets it, to
+                                           * clear a root proven STALE. */
 #define TESSERA_COMMIT_BUMP_EXACT  0x1u   /* set bump to roots->meta_reserve_bump
                                            * exactly, permitting it to LOWER —
                                            * for tessera-repack, which compacts

@@ -84,11 +84,20 @@ pub struct tessera_commit_roots_t {
     pub meta_reserve_bump:  u64,
     pub next_inode_no:      u64,
     pub blob_index_root:    u64,
+    /// Deferred-dedup dead-extent tree. IGNORED unless the caller passes
+    /// TESSERA_COMMIT_DEAD_EXTENT to commit_roots_ex — plain commit_roots
+    /// preserves whatever the superblock already holds.
+    pub dead_extent_root:   u64,
 }
 
 /// commit_roots_ex flag: set meta_reserve_bump exactly (permit lowering) —
 /// for tessera-repack, which compacts the reserve and reclaims headroom.
 pub const TESSERA_COMMIT_BUMP_EXACT: u32 = 0x1;
+
+/// commit_roots_ex flag: apply `dead_extent_root`. Opt-in, so that every
+/// caller written before the field existed keeps preserving the tree by
+/// doing nothing. tessera-fsck --repair sets it to CLEAR a stale root.
+pub const TESSERA_COMMIT_DEAD_EXTENT: u32 = 0x2;
 
 /* ── B+tree ──────────────────────────────────────────────────── */
 

@@ -218,6 +218,9 @@ fn commit(v: *mut tessera_volume_t, b: &Built, next_ino: u64, bump_exact: bool) 
         meta_reserve_bump:  b.bump,
         next_inode_no:      next_ino,
         blob_index_root:    0,          // reserve is rewritten — index dropped;
+        // Ignored: TESSERA_COMMIT_DEAD_EXTENT is not set, so the
+        // superblock's own dead_extent_root is preserved.
+        dead_extent_root:   0,
                                         // rebuild with tessera-reindex afterward
     };
     let flags = if bump_exact { TESSERA_COMMIT_BUMP_EXACT } else { 0 };
@@ -550,6 +553,9 @@ fn rebuild_index_after_repack(f: &std::fs::File, io: &tessera_block_io_t,
                 meta_reserve_bump:  new_bump,
                 next_inode_no:      unsafe { tessera_volume_next_inode_no(v) },
                 blob_index_root:    root,
+                // Ignored: TESSERA_COMMIT_DEAD_EXTENT is not set, so the
+                // superblock's own dead_extent_root is preserved.
+                dead_extent_root:   0,
             };
             let rc = unsafe { tessera_volume_commit_roots(v, &commit) };
             if rc == 0 {

@@ -645,6 +645,13 @@ tessera_volume_commit_roots_ex(tessera_volume_t *v,
 		sb.blob_index_root = roots->blob_index_root;
 		sb.blob_index_gen += 1;
 	}
+	/* dead_extent_root is preserved by default (it is not part of the
+	 * struct's original contract), and moved ONLY on explicit opt-in. */
+	if ((flags & TESSERA_COMMIT_DEAD_EXTENT) &&
+	    roots->dead_extent_root != sb.dead_extent_root) {
+		sb.dead_extent_root = roots->dead_extent_root;
+		sb.dead_extent_gen += 1;
+	}
 	/* meta_reserve_bump: by default only ever grows (repair consumed
 	 * reserve sectors for the rewritten trees); never let it regress.
 	 * With TESSERA_COMMIT_BUMP_EXACT (repack) set it exactly — repack
