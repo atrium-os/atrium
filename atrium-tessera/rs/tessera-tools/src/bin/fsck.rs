@@ -161,7 +161,7 @@ fn describe_root_sector(f: &std::fs::File, sector: u64, want_kind: u8) -> String
     let got = b[7];
     if got != want_kind {
         return format!("sector {sector} holds a tree of kind {got}, not {want_kind} \
-                        — it was recycled into another tree, so the index is destroyed, \
+                        — it was recycled into another tree, so that tree is destroyed, \
                         not merely stale");
     }
     format!("sector {sector} has the right magic and kind but failed to open \
@@ -490,6 +490,48 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
         snapshots: 0,
         snapshot_inodes: 0,
     };
+
+    // ── Stale-root sweep (#115) ──────────────────────────────────────
+    //
+    // Every root in the superblock must point at a node OF ITS OWN KIND.
+    // describe_root_sector already existed for exactly this test but was
+    // wired to blob_index_root alone, so the other six roots went unchecked
+    // — which is how a recycled QUOTA root sat undetected on the dev volume
+    // across many fsck runs, visible only as a per-mount kernel warning that
+    // named no tree ("sector 325 kind=5 expected=4").
+    //
+    // Cause is always the same: a tree whose root pinscan does not pin gets
+    // its sector reclaimed and handed to another tree. Prevention is in the
+    // kmod; this is the detector for volumes already in that state.
+    for &(name, root, kind, consequence) in &[
+        ("inode_root",         inode_root,      TESSERA_BTREE_KIND_INODE,
+         "every file and directory is unreachable"),
+        ("pack_registry_root", pack_root,       TESSERA_BTREE_KIND_PACK_REG,
+         "no blob can be located; the volume is effectively empty"),
+        ("free_extent_root",   free_root,       TESSERA_BTREE_KIND_FREE_EXT,
+         "free-space accounting is lost; allocation may hand out live sectors"),
+        ("snapshots_root",     snapshots_root,  TESSERA_BTREE_KIND_SNAPSHOT,
+         "all retained snapshots are unreachable"),
+        ("quota_tree_root",    quota_root,      TESSERA_BTREE_KIND_QUOTA,
+         "all per-directory quota domains are lost; limits stop being enforced"),
+        ("blob_index_root",    blob_index_root, TESSERA_BTREE_KIND_BLOB_INDEX,
+         "cold reads fall back to scanning the whole registry; run tessera-reindex"),
+        ("dead_extent_root",
+         unsafe { tessera_volume_dead_extent_root(v) }, TESSERA_BTREE_KIND_DEAD_EXT,
+         "deferred-dedup dead extents are stranded and never reclaimed"),
+    ] {
+        if root == 0 { continue; }          // an unset root is not damage
+        let mut hb = [0u8; SECTOR_SIZE as usize];
+        let ok = f.read_at(&mut hb, root * SECTOR_SIZE)
+            .map(|n| n == hb.len()).unwrap_or(false);
+        // Silence only when we can positively read a node of the RIGHT kind
+        // (tree_kind is byte 7 of tessera_btree_node_header_t). Anything
+        // else — unreadable, bad magic, wrong kind — gets described.
+        if ok && &hb[0..4] == b"TBTR" && hb[7] == kind { continue; }
+        let why = describe_root_sector(&f, root, kind);
+        fsck.problem(format!("{name}: {why} — {consequence}"));
+    }
+
 
     // ── bounds sanity ────────────────────────────────────────────
     for (name, s) in [("inode_root", inode_root), ("pack_registry_root", pack_root),
