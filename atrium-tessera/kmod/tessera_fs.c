@@ -5510,6 +5510,49 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		mp->mnt_iosize_max = maxphys;
 
 	(void)bo;
+	/* ★ #114/#115: two SB roots naming the SAME sector is always corruption.
+	 *
+	 * This is the check that would have caught the quota/blob-index
+	 * collision on day one. sb.quota_tree_root and sb.blob_index_root both
+	 * pointed at sector 325 because the quota tree was missing from the
+	 * pinscan root table, so GC recycled its root and handed the sector to
+	 * the index. The only visible symptom was a per-mount
+	 * "load_node: sector N kind=X expected=Y", which names neither tree and
+	 * is easy to read as a transient. Say it plainly instead.
+	 *
+	 * Generic on purpose: it does not know which tree is at fault and does
+	 * not need to. Any future root added to the superblock is covered by
+	 * adding one line to the table below. */
+	{
+		static const struct { const char *name; size_t off; } _roots[] = {
+			{ "inode",       offsetof(tessera_superblock_t, inode_root) },
+			{ "registry",    offsetof(tessera_superblock_t, pack_registry_root) },
+			{ "free_extent", offsetof(tessera_superblock_t, free_extent_root) },
+			{ "snapshots",   offsetof(tessera_superblock_t, snapshots_root) },
+			{ "quota",       offsetof(tessera_superblock_t, quota_tree_root) },
+			{ "blob_index",  offsetof(tessera_superblock_t, blob_index_root) },
+			{ "dead_extent", offsetof(tessera_superblock_t, dead_extent_root) },
+		};
+		const uint32_t _n = nitems(_roots);
+		for (uint32_t _a = 0; _a < _n; _a++) {
+			uint64_t _ra = *(const uint64_t *)((const char *)
+			    &tmp_->sb + _roots[_a].off);
+			if (_ra == 0) continue;          /* unset is not a clash */
+			for (uint32_t _b = _a + 1; _b < _n; _b++) {
+				uint64_t _rb = *(const uint64_t *)((const char *)
+				    &tmp_->sb + _roots[_b].off);
+				if (_rb != _ra) continue;
+				printf("tessera_fs: ★ CORRUPT — %s_root and "
+				    "%s_root both name sector %ju. One tree's "
+				    "root was recycled under it; that tree's "
+				    "contents are LOST. Run tessera-fsck on an "
+				    "UNMOUNTED volume.\n",
+				    _roots[_a].name, _roots[_b].name,
+				    (uintmax_t)_ra);
+			}
+		}
+	}
+
 	printf("tessera_fs: mounted gen=%lu, %lu sectors\n",
 	    (unsigned long)tmp_->sb.generation,
 	    (unsigned long)tmp_->sb.total_sectors);
