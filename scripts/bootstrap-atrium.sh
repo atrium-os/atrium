@@ -445,7 +445,7 @@ ph_corelib() {
     head_ "cross-building libtessera_core.a"
     ( cd "$cd_core" && bmake -s libtessera_core.a \
         CC="$L/bin/clang" AR="$L/bin/llvm-ar" RANLIB="$L/bin/llvm-ranlib" \
-        CFLAGS="-O2 -fno-strict-aliasing --target=aarch64-unknown-freebsd16.0 \
+        CFLAGS="-O2 -fPIC -fno-strict-aliasing --target=aarch64-unknown-freebsd16.0 \
                 --sysroot=$SYSROOT -isystem $SYSROOT/usr/include \
                 -I$cd_core/include -I$cd_core/src -D__libtessera_core__" ) \
         > "$LOGS/corelib.log" 2>&1 \
