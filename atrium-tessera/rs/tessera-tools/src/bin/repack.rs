@@ -118,17 +118,24 @@ fn write_tree(io: &tessera_block_io_t, existed: bool, kind: u8, ksz: u32, vsz: u
     }
 }
 
-/// The four live metadata trees, read into RAM.
+/// The live metadata trees, read into RAM.
+///
+/// ★ The dead-extent tree (#115) is one of these. It was omitted when it was
+/// added, so repack rewrote the reserve on top of its nodes while leaving
+/// sb.dead_extent_root pointing at them — reproducible in one command on a
+/// fresh volume: root 268 survived, sector 268 came back a blob-index node.
+/// A tree that lives in the reserve MUST be in this struct.
 struct Trees {
     inodes: Vec<(Vec<u8>, Vec<u8>)>,
     packs:  Vec<(Vec<u8>, Vec<u8>)>,
     frees:  Vec<(Vec<u8>, Vec<u8>)>,
     quotas: Vec<(Vec<u8>, Vec<u8>)>,
-    existed: (bool, bool, bool, bool),
+    deads:  Vec<(Vec<u8>, Vec<u8>)>,
+    existed: (bool, bool, bool, bool, bool),
 }
 
-/// Four compacted roots + the bump frontier after building.
-struct Built { inode: u64, pack: u64, free: u64, quota: u64, bump: u64 }
+/// The compacted roots + the bump frontier after building.
+struct Built { inode: u64, pack: u64, free: u64, quota: u64, dead: u64, bump: u64 }
 
 /// Build all four compacted trees starting at `start`, capped at `cap`
 /// (allocations restricted to [start, cap)). Returns the roots + new frontier,
@@ -149,8 +156,9 @@ fn build_all(io: &tessera_block_io_t, ctxp: *mut DiskCtx, start: u64, cap: u64, 
     let pack  = write_tree(io, t.existed.1, TESSERA_BTREE_KIND_PACK_REG, 16, TESSERA_REGISTRY_ENTRY_SIZE, &t.packs)?;
     let free  = write_tree(io, t.existed.2, TESSERA_BTREE_KIND_FREE_EXT, 8,  8,                           &t.frees)?;
     let quota = write_tree(io, t.existed.3, TESSERA_BTREE_KIND_QUOTA,    8,  128,                         &t.quotas)?;
+    let dead  = write_tree(io, t.existed.4, TESSERA_BTREE_KIND_DEAD_EXT, 8,  24,                          &t.deads)?;
     let bump = unsafe { (*ctxp).bump.get() };
-    Ok(Built { inode, pack, free, quota, bump })
+    Ok(Built { inode, pack, free, quota, dead, bump })
 }
 
 /// Build ONE tree into [start, cap). Same aliasing discipline as build_all.
@@ -218,12 +226,14 @@ fn commit(v: *mut tessera_volume_t, b: &Built, next_ino: u64, bump_exact: bool) 
         meta_reserve_bump:  b.bump,
         next_inode_no:      next_ino,
         blob_index_root:    0,          // reserve is rewritten — index dropped;
-        // Ignored: TESSERA_COMMIT_DEAD_EXTENT is not set, so the
-        // superblock's own dead_extent_root is preserved.
-        dead_extent_root:   0,
                                         // rebuild with tessera-reindex afterward
+        // Repack MOVES this tree like the others, so it must write the new
+        // root. Preserving the old value would point the SB at sectors this
+        // very commit just recycled.
+        dead_extent_root:   b.dead,
     };
-    let flags = if bump_exact { TESSERA_COMMIT_BUMP_EXACT } else { 0 };
+    let mut flags = TESSERA_COMMIT_DEAD_EXTENT;
+    if bump_exact { flags |= TESSERA_COMMIT_BUMP_EXACT; }
     let rc = unsafe { tessera_volume_commit_roots_ex(v, &roots, flags) };
     if rc != 0 { return Err(format!("commit_roots rc={rc}")); }
     Ok(())
@@ -255,16 +265,18 @@ fn stage_bounded(v: *mut tessera_volume_t, io: &tessera_block_io_t, ctxp: *mut D
     // first tree that fit anywhere and re-moved the same tree forever without
     // converging; requiring strict improvement is what makes this terminate.
     for _ in 0..64 {
-        let (ir, pr, fr, qr, cur_bump) = unsafe {(
+        let (ir, pr, fr, qr, dr, cur_bump) = unsafe {(
             tessera_volume_inode_root(v), tessera_volume_pack_registry_root(v),
             tessera_volume_free_extent_root(v), tessera_volume_quota_tree_root(v),
+            tessera_volume_dead_extent_root(v),
             tessera_volume_meta_reserve_bump(v),
         )};
-        let specs: [(usize, u8, u32, u32, &Vec<(Vec<u8>, Vec<u8>)>, bool, u64); 4] = [
+        let specs: [(usize, u8, u32, u32, &Vec<(Vec<u8>, Vec<u8>)>, bool, u64); 5] = [
             (0, TESSERA_BTREE_KIND_INODE,    4,  TESSERA_INODE_RECORD_SIZE,   &t.inodes, t.existed.0, ir),
             (1, TESSERA_BTREE_KIND_PACK_REG, 16, TESSERA_REGISTRY_ENTRY_SIZE, &t.packs,  t.existed.1, pr),
             (2, TESSERA_BTREE_KIND_FREE_EXT, 8,  8,                           &t.frees,  t.existed.2, fr),
             (3, TESSERA_BTREE_KIND_QUOTA,    8,  128,                         &t.quotas, t.existed.3, qr),
+            (4, TESSERA_BTREE_KIND_DEAD_EXT, 8,  24,                          &t.deads,  t.existed.4, dr),
         ];
 
         // Per-tree live sets: the victim is whichever tree owns the highest
@@ -306,9 +318,15 @@ fn stage_bounded(v: *mut tessera_volume_t, io: &tessera_block_io_t, ctxp: *mut D
                 existed, kind, ksz, vsz, entries)
             {
                 let bump = if frontier > cur_bump { frontier } else { cur_bump };
-                let mut b = Built { inode: ir, pack: pr, free: fr, quota: qr, bump };
+                let mut b = Built { inode: ir, pack: pr, free: fr, quota: qr,
+                                    dead: dr, bump };
+                // Every arm explicit: the old `_ => quota` catch-all would
+                // silently absorb the new index and write a dead-extent root
+                // into quota_tree_root — the exact #115 failure, self-inflicted.
                 match victim { 0 => b.inode = root, 1 => b.pack = root,
-                               2 => b.free = root, _ => b.quota = root }
+                               2 => b.free = root, 3 => b.quota = root,
+                               4 => b.dead = root,
+                               _ => unreachable!("victim index out of range") }
                 commit(v, &b, next_ino, false)?;
                 let span: u64 = below.iter().map(|&(a, c)| c - a).sum();
                 println!("  crash-safe: moved tree kind={kind} across {} gap(s) \
@@ -324,9 +342,12 @@ fn stage_bounded(v: *mut tessera_volume_t, io: &tessera_block_io_t, ctxp: *mut D
                 else { continue };
             if frontier == 0 || frontier - 1 >= victim_top { continue; }  // not strictly lower
             let bump = if frontier > cur_bump { frontier } else { cur_bump };
-            let mut b = Built { inode: ir, pack: pr, free: fr, quota: qr, bump };
+            let mut b = Built { inode: ir, pack: pr, free: fr, quota: qr,
+                                dead: dr, bump };
             match victim { 0 => b.inode = root, 1 => b.pack = root,
-                           2 => b.free = root, _ => b.quota = root }
+                           2 => b.free = root, 3 => b.quota = root,
+                           4 => b.dead = root,
+                           _ => unreachable!("victim index out of range") }
             commit(v, &b, next_ino, false)?;
             println!("  crash-safe: moved tree kind={kind} to [{gs},{frontier}) \
 (top {victim_top} -> {})", frontier - 1);
@@ -341,17 +362,21 @@ fn stage_bounded(v: *mut tessera_volume_t, io: &tessera_block_io_t, ctxp: *mut D
     // exactly once, at the end — never during the loop, because a bump below a
     // live node is precisely the corruption build_all's aliasing note warns of.
     if moved > 0 {
-        let (ir, pr, fr, qr) = unsafe {(
+        let (ir, pr, fr, qr, dr) = unsafe {(
             tessera_volume_inode_root(v), tessera_volume_pack_registry_root(v),
             tessera_volume_free_extent_root(v), tessera_volume_quota_tree_root(v),
+            tessera_volume_dead_extent_root(v),
         )};
         let mut all: Vec<u64> = Vec::new();
         live_nodes(io, ir, TESSERA_BTREE_KIND_INODE,    4,  TESSERA_INODE_RECORD_SIZE,   &mut all)?;
         live_nodes(io, pr, TESSERA_BTREE_KIND_PACK_REG, 16, TESSERA_REGISTRY_ENTRY_SIZE, &mut all)?;
         live_nodes(io, fr, TESSERA_BTREE_KIND_FREE_EXT, 8,  8,                           &mut all)?;
         live_nodes(io, qr, TESSERA_BTREE_KIND_QUOTA,    8,  128,                         &mut all)?;
+        // Omitting this is what let the bump drop BELOW live dead-extent nodes.
+        live_nodes(io, dr, TESSERA_BTREE_KIND_DEAD_EXT, 8,  24,                          &mut all)?;
         let top = all.iter().copied().max().map(|m| m + 1).unwrap_or(mr_start);
-        let b = Built { inode: ir, pack: pr, free: fr, quota: qr, bump: top.max(mr_start) };
+        let b = Built { inode: ir, pack: pr, free: fr, quota: qr, dead: dr,
+                        bump: top.max(mr_start) };
         commit(v, &b, next_ino, true)?;
         println!("  crash-safe: bounded staging done — bump lowered to {}", b.bump);
     }
@@ -383,6 +408,7 @@ fn run(path: &str, apply: bool, force: bool, stage_cap: Option<u64>) -> Result<i
     let pack_root   = unsafe { tessera_volume_pack_registry_root(v) };
     let free_root   = unsafe { tessera_volume_free_extent_root(v) };
     let quota_root  = unsafe { tessera_volume_quota_tree_root(v) };
+    let dead_root   = unsafe { tessera_volume_dead_extent_root(v) };
     let snap_root   = unsafe { tessera_volume_snapshots_root(v) };
     let next_ino    = unsafe { tessera_volume_next_inode_no(v) };
     let generation  = unsafe { tessera_volume_generation(v) };
@@ -420,10 +446,14 @@ fn run(path: &str, apply: bool, force: bool, stage_cap: Option<u64>) -> Result<i
         packs:  read_tree(&io, pack_root,  TESSERA_BTREE_KIND_PACK_REG, 16, TESSERA_REGISTRY_ENTRY_SIZE)?,
         frees:  read_tree(&io, free_root,  TESSERA_BTREE_KIND_FREE_EXT, 8,  8)?,
         quotas: read_tree(&io, quota_root, TESSERA_BTREE_KIND_QUOTA,    8,  128)?,
-        existed: (inode_root != 0, pack_root != 0, free_root != 0, quota_root != 0),
+        deads:  read_tree(&io, dead_root,  TESSERA_BTREE_KIND_DEAD_EXT, 8,  24)?,
+        existed: (inode_root != 0, pack_root != 0, free_root != 0, quota_root != 0,
+                  dead_root != 0),
     };
-    println!("  read: {} inodes, {} packs, {} free-extents, {} quota domains",
-        trees.inodes.len(), trees.packs.len(), trees.frees.len(), trees.quotas.len());
+    println!("  read: {} inodes, {} packs, {} free-extents, {} quota domains, \
+{} dead extents",
+        trees.inodes.len(), trees.packs.len(), trees.frees.len(), trees.quotas.len(),
+        trees.deads.len());
 
     // --stage-cap artificially shrinks the usable reserve so the all-at-once
     // path FAILS on demand. Without it the Phase-A refusal only appears on a
@@ -461,9 +491,10 @@ fn run(path: &str, apply: bool, force: bool, stage_cap: Option<u64>) -> Result<i
     // Converges in at most two commits (Phase A then Phase B); 3 passes is slack.
     for _ in 0..3 {
         // Live node-set + bump from the current on-disk roots (commit updates v).
-        let (ir, pr, fr, qr, cur_bump) = unsafe {(
+        let (ir, pr, fr, qr, dr, cur_bump) = unsafe {(
             tessera_volume_inode_root(v), tessera_volume_pack_registry_root(v),
             tessera_volume_free_extent_root(v), tessera_volume_quota_tree_root(v),
+            tessera_volume_dead_extent_root(v),
             tessera_volume_meta_reserve_bump(v),
         )};
         let mut live: Vec<u64> = Vec::new();
@@ -471,6 +502,7 @@ fn run(path: &str, apply: bool, force: bool, stage_cap: Option<u64>) -> Result<i
         live_nodes(&io, pr, TESSERA_BTREE_KIND_PACK_REG, 16, TESSERA_REGISTRY_ENTRY_SIZE, &mut live)?;
         live_nodes(&io, fr, TESSERA_BTREE_KIND_FREE_EXT, 8,  8,                           &mut live)?;
         live_nodes(&io, qr, TESSERA_BTREE_KIND_QUOTA,    8,  128,                         &mut live)?;
+        live_nodes(&io, dr, TESSERA_BTREE_KIND_DEAD_EXT, 8, 24,                          &mut live)?;
         let first_live = live.iter().copied().min().unwrap_or(ceiling);
 
         // Phase B: fit entirely below the lowest live node?
