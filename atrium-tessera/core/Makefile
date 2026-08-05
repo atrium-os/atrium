@@ -56,6 +56,8 @@ TEST_NAMES= \
     test_cdc \
     test_extent \
     test_btree \
+    test_btree_guards \
+    test_gc \
     test_manifest \
     test_pack \
     test_journal \
