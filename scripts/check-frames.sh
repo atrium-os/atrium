@@ -18,13 +18,15 @@ log=${1:?usage: check-frames.sh <build-log>}
 # from a clean build — a partial one silently under-counts. LOWER THIS as frames are fixed; never raise
 # it without a recorded reason.
 #
-# Current 12 (dead_extent_drain and meta_pending_drain both dropped off — their
-# 8192 B arrays are now heap):
+# Current 11. All THREE ~8.4 KiB frames are gone — dead_extent_drain,
+# meta_pending_drain and kbio_meta_alloc (the last via its inlinee
+# meta_epoch_sweep). Worst remaining is pack_finalize 8336.
+# Former entries, kept for context:
 # kbio_meta_alloc 8384, repack_one_pack 4576, pack_alloc_and_write 4432,
 # pack_alloc_rollback 4288, decode_pack_extent_list 4160,
 # gc_data_zone_ex 2880, blake3_256 2000, blake3_init_derive_key 1984,
 # vop_readdir 1792.
-BASELINE=12
+BASELINE=11
 
 n=$(grep -c "stack frame size" "$log" 2>/dev/null || echo 0)
 echo "oversized frames: $n (baseline $BASELINE)"
