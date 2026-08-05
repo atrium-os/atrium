@@ -3714,7 +3714,18 @@ tessera_fs_dead_extent_record(struct tessera_mount *tmp_,
  * that a hostile jail can grow is a stall the length of that log.
  */
 #define TESSERA_DEAD_EXT_DRAIN_MAX 256
-static uint32_t
+/* ★ #114: __noinline is LOAD-BEARING, not style. This function's
+ * collect-then-mutate array is TESSERA_DEAD_EXT_DRAIN_MAX (256) entries
+ * x 32 B = 8192 bytes. Inlined into tessera_fs_gc_data_zone_ex it put
+ * that 8192 into the GC's OWN top frame — 9008 of a 16 KiB kstack before
+ * the GC called anything — which is what made the deep GC read path
+ * overflow the stack (see e960b79, d53e4aa). The drain runs ONCE per GC
+ * pass, so refusing to inline it costs nothing measurable.
+ * MEASURED: gc_data_zone_ex 9008 -> 2880, and the 8192 slot disappears.
+ * If you remove this attribute, re-check with
+ *   make CWARNFLAGS+=-Wframe-larger-than=1024
+ */
+static uint32_t __noinline
 tessera_fs_dead_extent_drain(struct tessera_mount *tmp_)
 {
 	if (tmp_->dead_extent_tree == NULL || tmp_->sb.dead_extent_root == 0)
