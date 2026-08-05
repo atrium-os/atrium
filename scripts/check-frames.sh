@@ -18,7 +18,9 @@ log=${1:?usage: check-frames.sh <build-log>}
 # from a clean build — a partial one silently under-counts. LOWER THIS as frames are fixed; never raise
 # it without a recorded reason.
 #
-# Current 8. write_journal_header and pack_open joined pack_finalize —
+# Current 6. The repack-path pel locals went too, taking repack_one_pack and
+# pack_alloc_rollback with them.
+# write_journal_header and pack_open joined pack_finalize —
 # their 4096 B on-disk structs are heap now too.
 # All THREE ~8.4 KiB frames are gone — dead_extent_drain,
 # meta_pending_drain and kbio_meta_alloc (the last via its inlinee
@@ -28,7 +30,7 @@ log=${1:?usage: check-frames.sh <build-log>}
 # pack_alloc_rollback 4288, decode_pack_extent_list 4160,
 # gc_data_zone_ex 2880, blake3_256 2000, blake3_init_derive_key 1984,
 # vop_readdir 1792.
-BASELINE=8
+BASELINE=6
 
 n=$(grep -c "stack frame size" "$log" 2>/dev/null || echo 0)
 echo "oversized frames: $n (baseline $BASELINE)"

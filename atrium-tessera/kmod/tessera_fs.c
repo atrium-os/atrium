@@ -17169,10 +17169,15 @@ tessera_fs_pack_alloc_rollback(struct tessera_mount *tmp_,
 		    TESSERA_SECTOR_SIZE,
 		    tmp_->bio_ctx.cred ? tmp_->bio_ctx.cred : NOCRED,
 		    &bp) == 0) {
-			tessera_pack_extent_list_t pel;
+			/* ★ #114: heap — 4096 B, and only next_pel_sector is
+			 * wanted. Same conversion as the gc_data_zone_ex
+			 * sites in d53e4aa. */
+			tessera_pack_extent_list_t *pel =
+			    malloc(sizeof(*pel), M_TESSERA, M_WAITOK);
 			if (tessera_decode_pack_extent_list(
-			    (const uint8_t *)bp->b_data, &pel) == TESSERA_OK)
-				next = pel.next_pel_sector;
+			    (const uint8_t *)bp->b_data, pel) == TESSERA_OK)
+				next = pel->next_pel_sector;
+			free(pel, M_TESSERA);
 			brelse(bp);
 		}
 		(void)tessera_extent_free(tmp_->extent_alloc, pel_s, 1);
@@ -17335,11 +17340,14 @@ tessera_fs_repack_one_pack_inner(struct tessera_mount *tmp_,
 			    tmp_->bio_ctx.cred ?
 			        tmp_->bio_ctx.cred : NOCRED,
 			    &bp) == 0) {
-				tessera_pack_extent_list_t pel;
+				/* ★ #114: heap — see the sibling site. */
+				tessera_pack_extent_list_t *pel =
+				    malloc(sizeof(*pel), M_TESSERA, M_WAITOK);
 				if (tessera_decode_pack_extent_list(
-				    (const uint8_t *)bp->b_data, &pel)
+				    (const uint8_t *)bp->b_data, pel)
 				    == TESSERA_OK)
-					next = pel.next_pel_sector;
+					next = pel->next_pel_sector;
+				free(pel, M_TESSERA);
 				brelse(bp);
 			}
 			(void)tessera_extent_free(tmp_->extent_alloc,
