@@ -13451,6 +13451,7 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	uint64_t r_snap  = tmp_->sb.snapshots_root;
 	uint64_t r_bidx  = tmp_->sb.blob_index_root;
 	uint64_t r_dext  = tmp_->sb.dead_extent_root;
+	uint64_t r_quota = tmp_->sb.quota_tree_root;
 	/*
 	 * ★ #102 CONFIRMING PROBE. The scan enumerates the snapshots tree as
 	 * it was AT THIS INSTANT. A snapshot created after this capture is not
@@ -13509,7 +13510,7 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	 * anything — see the union at swap time. */
 	int stale_skipped = 0;
 
-	struct { uint64_t root; int kind; uint32_t ksz; uint32_t vsz; } roots[9] = {
+	struct { uint64_t root; int kind; uint32_t ksz; uint32_t vsz; } roots[10] = {
 		{ r_inode, 0, 4, TESSERA_INODE_RECORD_SIZE },
 		{ r_reg,   1, 16, TESSERA_REGISTRY_ENTRY_SIZE },
 		{ r_fext,  2, 8, 8 },
@@ -13525,6 +13526,17 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 		 * permanently. */
 		{ r_dext,  TESSERA_BTREE_KIND_DEAD_EXT,
 		    TESSERA_DEAD_EXT_KEY_SIZE, TESSERA_DEAD_EXT_VAL_SIZE },
+		/* ★ Quota-domain tree — MISSING UNTIL NOW, and it cost us the
+		 * exact failure the blob-index comment above predicts. On the
+		 * dev root sb.quota_tree_root pointed at sector 325, which by
+		 * then held a kind-5 BLOB-INDEX node: the quota root was
+		 * recycled out from under the SB because nothing pinned it,
+		 * and every mount logged "load_node: sector 325 kind=N
+		 * expected=4". Third instance of this bug (#64 blob index,
+		 * dead-extent log above, quota here) — any tree whose root
+		 * lives in the SB must appear in this table. */
+		{ r_quota, TESSERA_BTREE_KIND_QUOTA,
+		    8, TESSERA_QUOTA_DOMAIN_SIZE },
 		/* ★ #72/#78: the in-flight GC scan's frozen roots. Zero when no
 		 * scan is running, and a zero root is skipped below. Shared COW
 		 * nodes are marked once — walking them twice is idempotent. */
@@ -13532,7 +13544,7 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 		{ r_gc_reg,   1, 16, TESSERA_REGISTRY_ENTRY_SIZE },
 		{ r_gc_snap,  3, 8, TESSERA_SNAPSHOT_RECORD_SIZE },
 	};
-	for (int i = 0; i < 9 && !aborted; i++) {
+	for (int i = 0; i < 10 && !aborted; i++) {
 		if (roots[i].root == 0) continue;
 		tessera_btree_t *t = tessera_btree_open(&tmp_->meta_bio,
 		    roots[i].root, roots[i].kind, roots[i].ksz, roots[i].vsz);
