@@ -16834,6 +16834,14 @@ tessera_fs_pack_alloc_and_write_impl(struct tessera_mount *tmp_,
 	    M_TESSERA, M_WAITOK);
 	tessera_pack_extent_list_t *pel = malloc(sizeof *pel, M_TESSERA,
 	    M_WAITOK);
+	/* ★ #114: heap, not a local. This struct is 4096 B; as
+	 * `tessera_pack_extent_list_t prev;` further down it was the entire
+	 * oversized frame of this function (4432 B). Allocated here beside
+	 * `pel` so _ROLLBACK_AND_RETURN frees it on every error path, which
+	 * is why this is the safe shape — prev is live across three of those
+	 * macro exits. */
+	tessera_pack_extent_list_t *prev = malloc(sizeof *prev, M_TESSERA,
+	    M_WAITOK);
 	uint8_t *pel_buf  = malloc(TESSERA_SECTOR_SIZE, M_TESSERA, M_WAITOK);
 
 	/* Track every allocation we've made so we can roll back cleanly
@@ -16858,6 +16866,7 @@ tessera_fs_pack_alloc_and_write_impl(struct tessera_mount *tmp_,
 		(void)tessera_extent_free(tmp_->extent_alloc,                \
 		    pel_chain[_i], 1);                                       \
 	free(pel_buf, M_TESSERA); free(pel, M_TESSERA);                      \
+	free(prev, M_TESSERA);                                               \
 	free(lengths, M_TESSERA); free(starts, M_TESSERA);                   \
 	free(all_starts, M_TESSERA); free(all_lengths, M_TESSERA);           \
 	free(pel_chain, M_TESSERA);                                          \
@@ -16979,15 +16988,14 @@ tessera_fs_pack_alloc_and_write_impl(struct tessera_mount *tmp_,
 			    tmp_->bio_ctx.cred ?
 			        tmp_->bio_ctx.cred : NOCRED, &bp) != 0)
 				_ROLLBACK_AND_RETURN(EIO);
-			tessera_pack_extent_list_t prev;
 			if (tessera_decode_pack_extent_list(
-			    (const uint8_t *)bp->b_data, &prev) != TESSERA_OK) {
+			    (const uint8_t *)bp->b_data, prev) != TESSERA_OK) {
 				brelse(bp);
 				_ROLLBACK_AND_RETURN(EIO);
 			}
 			brelse(bp);
-			prev.next_pel_sector = pel_sector;
-			if (tessera_encode_pack_extent_list(&prev, pel_buf)
+			prev->next_pel_sector = pel_sector;
+			if (tessera_encode_pack_extent_list(prev, pel_buf)
 			    != TESSERA_OK ||
 			    tessera_kbio_write_delayed(&tmp_->bio_ctx, prev_pel,
 			    pel_buf) != 0)
@@ -17007,6 +17015,7 @@ tessera_fs_pack_alloc_and_write_impl(struct tessera_mount *tmp_,
 	             TESSERA_REGISTRY_FLAG_MULTI_EXTENT;
 	tmp_->multi_extent_pack_count++;
 	free(pel_buf, M_TESSERA); free(pel, M_TESSERA);
+	free(prev, M_TESSERA);
 	free(lengths, M_TESSERA); free(starts, M_TESSERA);
 	free(all_starts, M_TESSERA); free(all_lengths, M_TESSERA);
 	free(pel_chain, M_TESSERA);
