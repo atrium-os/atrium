@@ -1,6 +1,9 @@
 # Adding a B-tree to the Tessera meta reserve — the registration checklist
 
-Status: normative. Last verified against the tree at c391f09 (2026-08-05).
+Status: normative. Last verified against the tree at 17ab219 (2026-08-05):
+generated pinscan A/B'd in-VM against the hand-written one (identical node
+sets, no kind warnings), fsck + repack re-verified on a damaged and a clean
+volume.
 
 A tree whose nodes live in the metadata reserve is not finished when it reads
 and writes correctly. It is finished when **every component that walks, moves,
