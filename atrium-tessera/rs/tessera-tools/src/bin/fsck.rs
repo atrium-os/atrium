@@ -91,6 +91,10 @@ struct Fsck {
     /// Stale roots this tool refuses to touch, kept so --repair can say so
     /// out loud instead of exiting "nothing repairable" with no reason.
     stale_refused: Vec<&'static str>,
+    /// Stale roots that will be REBUILT from other on-disk state. Recorded
+    /// so the detect passes can skip auditing a tree they already know is
+    /// unreadable — see the free-extent audit below.
+    stale_rebuild: Vec<&'static str>,
     // ── Tier-B structural repairs ──
     // dirents pointing at a non-existent inode: (parent_ino, child_ino, name).
     // --repair republishes the parent directory without them.
@@ -486,6 +490,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
         free_tree_dirty: false,
         stale_clear: Vec::new(),
         stale_refused: Vec::new(),
+        stale_rebuild: Vec::new(),
         dangling_dirents: Vec::new(),
         orphans: Vec::new(),
         dangling_manifests: Vec::new(),
@@ -536,7 +541,10 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
             // The rebuild path already exists (#44) and derives the free set
             // from the pack zone, not from the tree being replaced, so it is
             // indifferent to the old root being garbage.
-            StaleTier::Rebuild => fsck.free_tree_dirty = true,
+            StaleTier::Rebuild => {
+                fsck.free_tree_dirty = true;
+                fsck.stale_rebuild.push(t.field);
+            }
             StaleTier::Clear   => fsck.stale_clear.push(t.field),
             StaleTier::Refuse  => fsck.stale_refused.push(t.field),
         }
@@ -1184,8 +1192,14 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
     }
 
     {
+        // A stale free root cannot be read, and reading it anyway turns one
+        // real problem into a page of derived ones — every "free extent
+        // outside the pack zone" and every bogus overlap that garbage
+        // produces. The rebuild does not need it either: free_runs is the
+        // authoritative complement, computed from the pack zone below.
+        let free_root_stale = fsck.stale_rebuild.contains(&"free_extent_root");
         let mut free: Vec<(u64, u64)> = Vec::new();
-        if free_root != 0 {
+        if free_root != 0 && !free_root_stale {
             unsafe {
                 let t = tessera_btree_open(&io, free_root, TESSERA_BTREE_KIND_FREE_EXT, 8, 8);
                 if t.is_null() {
