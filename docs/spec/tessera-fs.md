@@ -125,6 +125,15 @@ Mutations allocate metadata-tree nodes (inode, pack-registry, and free-extent B+
 
 A `tessera repack` pass periodically compacts the metadata reserve and shifts unused tail back into the pack zone.
 
+> ⚠ **Adding a tree to the reserve? Read
+> [`tessera-reserve-trees.md`](tessera-reserve-trees.md) first.** Seven
+> components must be told the tree exists (pinscan, repack's live sets and
+> commit, `commit_roots_t`, fsck's stale-root sweep, …). All three trees ever
+> added to the reserve missed at least one, and each miss silently recycled a
+> live root sector into another tree: the blob index (#64), the quota tree
+> (#115), and the dead-extent log (#115 follow-up, which corrupted every
+> volume repack touched). The omission is the default outcome.
+
 **Implementation status (round 6a):** the reserve is *not* yet carved out. Format-time metadata zone (`TESSERA_METADATA_ZONE_SECTORS = 16`) only covers the empty-tree roots; mutation paths therefore can't be implemented yet. Round 6 starts with the reserve format-time change before any vop-write code lands.
 
 ### 3.4 Self-heal at mount
