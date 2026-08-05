@@ -44,6 +44,32 @@ CFLAGS+=    -DTESSERA_KERNEL=1
 # which is the property that makes this safe to switch on at all.
 .if ${MACHINE_ARCH} == "aarch64"
 CFLAGS+=    -DBLAKE3_USE_NEON=1
+
+# ★ #114: kernel stack-frame ceiling.
+#
+# FreeBSD's kstack is 4 pages (16 KiB) and the GC read path nests deeply
+# (gc_data_zone_ex -> _GC_WALK_RECORD -> fetch_blob -> fetch_blob_ex ->
+# btree_get). Three separate 4-8 KiB stack objects on that path overflowed it,
+# and an arm64 stack overflow does NOT panic cleanly: it faults in a loop, so
+# the thread pins a CPU at 100% with no console output and cannot be killed or
+# even stopped for ddb. It took a long investigation to identify precisely
+# because the symptom looks like an infinite loop in code that cannot loop.
+#
+# WARNING, not error, deliberately: six functions still exceed this and fixing
+# them is separate work (see scratchpad frame-sweep logs / task #114). The point
+# is that any NEW oversized frame shows up in the build output immediately.
+# scripts/check-frames.sh ratchets the count so the list cannot grow silently.
+#
+# When a frame exceeds this and the declarations do not explain it, ask the
+# compiler rather than reading the source:
+#   -Rpass-analysis=stack-frame-layout   which slot
+#   -Rpass=inline                        which callees were inlined in
+#   __noinline on a callee + re-measure  attributes the delta
+CFLAGS+=    -Wframe-larger-than=1024
+# The kmod builds -Werror, so the line above would HARD-FAIL the build on the
+# eleven frames that already exceed the limit. Downgrade just this one to a
+# warning; scripts/check-frames.sh is what turns growth into a failure.
+CFLAGS+=    -Wno-error=frame-larger-than
 OBJS+=      b3_blake3_neon.o
 
 # The NEON file needs its own rule, following the pattern FreeBSD uses for

@@ -416,6 +416,17 @@ ph_kmod() {
 "The module linked without all of its objects — a known parallel-make race.
 Re-run with --force --only kmod."
     done
+    # ★ #114: fail the build if the oversized-stack-frame count grows. An
+    # arm64 kernel stack overflow faults in a loop instead of panicking, so a
+    # new large stack object on a deep path presents as an unkillable 100%-CPU
+    # thread with no console output — very expensive to diagnose, trivial to
+    # catch here.
+    if ! "$REPO/scripts/check-frames.sh" "$LOGS/kmod.log"; then
+        die "kernel stack frames regressed" \
+"A new oversized stack frame was introduced. See the list above.
+Heap-allocate the object, or mark the callee __noinline, then re-run."
+    fi
+
     ok "tessera_fs.ko built and symbol-checked"
 }
 
