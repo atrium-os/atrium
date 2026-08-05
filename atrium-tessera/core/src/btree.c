@@ -317,31 +317,46 @@ tessera_btree_get(tessera_btree_t *t, const void *key, void *out_value)
 {
 	if (t == NULL || key == NULL || out_value == NULL)
 		return TESSERA_EINVAL;
-	uint8_t block[BLOCK_SIZE];
+	/* ★ #114: heap, NOT stack. A 4 KiB array here overruns the FreeBSD
+	 * kmod's 4-page kstack on the deep GC read path
+	 * (gc_data_zone_ex -> _GC_WALK_RECORD -> fetch_blob -> fetch_blob_ex
+	 * -> btree_get). It does not panic cleanly: it faults in a loop, so
+	 * the thread pins a CPU at 100% in state R with no wchan, emits NOTHING
+	 * to the console, cannot be killed, and will not even stop for ddb.
+	 * put_into_leaf below already heap-allocates for exactly this reason
+	 * (see its comment) — the READ path was missed.
+	 * Verified: with this change the same GC that hung now walks the
+	 * blob index (root sector 325, depth 0 -> 1) and returns rc=0. */
+	uint8_t *block = tessera_zalloc(BLOCK_SIZE);
+	if (block == NULL) return TESSERA_ENOMEM;
+	int _rc = TESSERA_ECORRUPT;         /* depth exceeded, unless set */
 	uint64_t cur = t->root;
 	for (uint32_t depth = 0; depth < MAX_DEPTH; depth++) {
 		int r = load_node(t, cur, block);
-		if (r != TESSERA_OK) return r;
+		if (r != TESSERA_OK) { _rc = r; goto out; }
 		tessera_btree_node_header_t h;
 		(void)read_header(block, &h);
 		if (h.node_kind == 0) {                  /* leaf */
 			int exact;
 			int idx = search_leaf(block, h.entry_count,
 			    t->key_size, leaf_entry_size(t), key, &exact);
-			if (!exact) return TESSERA_ENOENT;
+			if (!exact) { _rc = TESSERA_ENOENT; goto out; }
 			const uint8_t *e = leaf_entries_const(block) +
 			    (size_t)idx * leaf_entry_size(t);
 			memcpy(out_value, e + t->key_size, t->value_size);
-			return TESSERA_OK;
+			_rc = TESSERA_OK;
+			goto out;
 		}
-		if (h.entry_count == 0) return TESSERA_ENOENT;
+		if (h.entry_count == 0) { _rc = TESSERA_ENOENT; goto out; }
 		int idx = search_internal(block, h.entry_count,
 		    t->key_size, inner_entry_size(t), key);
 		const uint8_t *e = leaf_entries_const(block) +
 		    (size_t)idx * inner_entry_size(t);
 		memcpy(&cur, e + t->key_size, 8);
 	}
-	return TESSERA_ECORRUPT;        /* depth exceeded */
+out:
+	tessera_free(block);
+	return _rc;
 }
 
 /* ── put — recursive COW with split propagation ──────────────────── */
