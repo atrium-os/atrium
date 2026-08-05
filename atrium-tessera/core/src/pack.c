@@ -323,13 +323,16 @@ tessera_pack_open(const uint8_t *data, size_t len)
 	r->k_hashes   = r->header.bloom_hash_count;
 
 	/* Footer integrity. */
-	tessera_pack_footer_t ft;
+	/* ★ #114: heap — 4096 B, and only needed to validate. */
+	tessera_pack_footer_t *ft = tessera_zalloc(sizeof *ft);
+	if (ft == NULL) goto fail;
 	const size_t footer_off = len - TESSERA_SECTOR_SIZE;
-	if (tessera_decode_pack_footer(data + footer_off, &ft) != TESSERA_OK)
-		goto fail;
-	if (ft.blob_count_check != r->header.blob_count) goto fail;
-	uint32_t want = tessera_crc32(r->data_base, r->header.data_length);
-	if (ft.crc32_pack != want) goto fail;
+	int ok = (tessera_decode_pack_footer(data + footer_off, ft) == TESSERA_OK)
+	    && ft->blob_count_check == r->header.blob_count
+	    && ft->crc32_pack == tessera_crc32(r->data_base,
+	        r->header.data_length);
+	tessera_free(ft);                /* validated; not needed past here */
+	if (!ok) goto fail;
 
 	return r;
 fail:

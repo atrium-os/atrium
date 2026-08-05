@@ -77,20 +77,24 @@ journal_wio(const tessera_journal_t *j)
 static int
 write_journal_header(tessera_journal_t *j)
 {
-	tessera_journal_header_t h;
-	memset(&h, 0, sizeof h);
-	memcpy(h.magic, TESSERA_MAGIC_JOURNAL, 8);
-	h.version    = 1;
-	h.head_seq   = j->head_seq;
-	h.tail_seq   = j->tail_seq;
-	h.head_block = j->head_block;
-	h.tail_block = j->tail_block;
+	/* ★ #114: heap. tessera_journal_header_t is 4096 B. The BUFFER below was
+	 * already heap-allocated for exactly this reason — this struct sat
+	 * beside it on the stack and was missed. */
+	tessera_journal_header_t *h = tessera_zalloc(sizeof *h);
+	if (h == NULL) return TESSERA_ENOMEM;
+	memcpy(h->magic, TESSERA_MAGIC_JOURNAL, 8);
+	h->version    = 1;
+	h->head_seq   = j->head_seq;
+	h->tail_seq   = j->tail_seq;
+	h->head_block = j->head_block;
+	h->tail_block = j->tail_block;
 	/* Heap-alloc'd to avoid 4 KiB on the kernel stack (FreeBSD aarch64
 	 * KSTACK_PAGES=4 → 16 KiB; mountfs frame chain leaves ~6 KiB
 	 * usable here). */
 	uint8_t *buf = tessera_zalloc(BLK);
-	if (buf == NULL) return TESSERA_ENOMEM;
-	int r = tessera_encode_journal_header(&h, buf);
+	if (buf == NULL) { tessera_free(h); return TESSERA_ENOMEM; }
+	int r = tessera_encode_journal_header(h, buf);
+	tessera_free(h);                 /* encoded into buf; done with it */
 	if (r != TESSERA_OK) { tessera_free(buf); return r; }
 	const tessera_block_io_t *wio = journal_wio(j);
 	if (wio->write_block(wio->ctx, j->start, buf) != 0) {
