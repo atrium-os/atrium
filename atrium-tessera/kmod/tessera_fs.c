@@ -4091,10 +4091,16 @@ tessera_fs_meta_pending_drain(struct tessera_mount *tmp_)
 	 * audited only the first 64 snapshots and reported ZERO hits while 12
 	 * snapshots were being destroyed — an instrumentation artifact that
 	 * looked exactly like an exoneration. If this ever truncates, say so. */
-	uint64_t _snaproots[512];
-	uint64_t _snapgens[512];
+	/* ★ #114: heap, and ONLY when the audit is on. Two 512-entry
+	 * arrays are 8192 B — half the 16 KiB kstack — spent
+	 * unconditionally on a diagnostic that is off by default. */
+	uint64_t *_snaproots = NULL, *_snapgens = NULL;
 	uint32_t _nsr = 0;
 	if (tessera_drain_audit_snaproots && tmp_->sb.snapshots_root != 0) {
+		_snaproots = malloc(512 * sizeof(*_snaproots), M_TESSERA,
+		    M_WAITOK);
+		_snapgens  = malloc(512 * sizeof(*_snapgens), M_TESSERA,
+		    M_WAITOK);
 		tessera_btree_t *_st = tessera_btree_open(&tmp_->meta_bio,
 		    tmp_->sb.snapshots_root, 3, 8,
 		    TESSERA_SNAPSHOT_RECORD_SIZE);
@@ -4218,6 +4224,8 @@ tessera_fs_meta_pending_drain(struct tessera_mount *tmp_)
 	tessera_stat_meta_watermark   = (unsigned long)tmp_->meta_pin_watermark;
 	tessera_stat_meta_pending_now = tmp_->meta_pending_count;
 	tessera_stat_meta_free_now    = tmp_->meta_free_count;
+	free(_snaproots, M_TESSERA);
+	free(_snapgens, M_TESSERA);
 }
 
 /* Sectors of reserve the live FS may bump into — the ceiling minus the
