@@ -110,6 +110,40 @@ pub struct tessera_btree_cursor_t { _opaque: [u8; 0] }
 pub const TESSERA_BTREE_KIND_INODE:    u8 = 0;
 pub const TESSERA_BTREE_KIND_PACK_REG: u8 = 1;
 pub const TESSERA_BTREE_KIND_FREE_EXT: u8 = 2;
+/* ── The metadata-reserve tree table (generated) ───────────────── */
+
+/// What `tessera-fsck --repair` may do about a root that no longer holds a
+/// node of its own kind. Not a severity ranking — it answers whether clearing
+/// the root is a recovery, a bounded loss, or the end of the filesystem.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StaleTier {
+    /// Reconstructible from other on-disk state — a real repair.
+    Rebuild,
+    /// Bounded, nameable loss; the volume stays consistent and mountable.
+    Clear,
+    /// Clearing destroys the filesystem. Refuse and say why.
+    Refuse,
+}
+
+/// One B-tree rooted in the superblock and allocated from the metadata
+/// reserve. Rows come from `tessera/reserve_trees.h` via build.rs — the same
+/// list the kmod's pinscan expands — so a tree added there is picked up by
+/// every consumer at once. See docs/spec/tessera-reserve-trees.md.
+#[derive(Clone, Copy, Debug)]
+pub struct ReserveTree {
+    /// Superblock field, e.g. "quota_tree_root". Also names the accessor
+    /// `tessera_volume_<field>()`. A root of 0 means absent, not damaged.
+    pub field: &'static str,
+    pub kind: u8,
+    pub ksz: u32,
+    pub vsz: u32,
+    pub tier: StaleTier,
+    /// What the operator loses if this root is stale.
+    pub consequence: &'static str,
+}
+
+include!(concat!(env!("OUT_DIR"), "/reserve_trees.rs"));
+
 /// Dead-extent log (sb.dead_extent_root, §20.2 / #114). Key = start_sector
 /// BIG-endian (disk order), value = tessera_dead_extent_t (24 bytes).
 pub const TESSERA_BTREE_KIND_DEAD_EXT: u8 = 6;

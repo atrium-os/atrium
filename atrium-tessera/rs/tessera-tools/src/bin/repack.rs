@@ -367,13 +367,14 @@ fn stage_bounded(v: *mut tessera_volume_t, io: &tessera_block_io_t, ctxp: *mut D
             tessera_volume_free_extent_root(v), tessera_volume_quota_tree_root(v),
             tessera_volume_dead_extent_root(v),
         )};
+        // ★ Every reserve tree, from tessera/reserve_trees.h. Omitting ONE
+        // here is what let the bump drop below live dead-extent nodes and
+        // corrupt the volume; a generated sweep cannot be short a tree.
         let mut all: Vec<u64> = Vec::new();
-        live_nodes(io, ir, TESSERA_BTREE_KIND_INODE,    4,  TESSERA_INODE_RECORD_SIZE,   &mut all)?;
-        live_nodes(io, pr, TESSERA_BTREE_KIND_PACK_REG, 16, TESSERA_REGISTRY_ENTRY_SIZE, &mut all)?;
-        live_nodes(io, fr, TESSERA_BTREE_KIND_FREE_EXT, 8,  8,                           &mut all)?;
-        live_nodes(io, qr, TESSERA_BTREE_KIND_QUOTA,    8,  128,                         &mut all)?;
-        // Omitting this is what let the bump drop BELOW live dead-extent nodes.
-        live_nodes(io, dr, TESSERA_BTREE_KIND_DEAD_EXT, 8,  24,                          &mut all)?;
+        for t in RESERVE_TREES {
+            let r = unsafe { reserve_tree_root(v, t) };
+            live_nodes(io, r, t.kind, t.ksz, t.vsz, &mut all)?;
+        }
         let top = all.iter().copied().max().map(|m| m + 1).unwrap_or(mr_start);
         let b = Built { inode: ir, pack: pr, free: fr, quota: qr, dead: dr,
                         bump: top.max(mr_start) };
@@ -490,19 +491,15 @@ fn run(path: &str, apply: bool, force: bool, stage_cap: Option<u64>) -> Result<i
     //     compacts to the reserve start.
     // Converges in at most two commits (Phase A then Phase B); 3 passes is slack.
     for _ in 0..3 {
-        // Live node-set + bump from the current on-disk roots (commit updates v).
-        let (ir, pr, fr, qr, dr, cur_bump) = unsafe {(
-            tessera_volume_inode_root(v), tessera_volume_pack_registry_root(v),
-            tessera_volume_free_extent_root(v), tessera_volume_quota_tree_root(v),
-            tessera_volume_dead_extent_root(v),
-            tessera_volume_meta_reserve_bump(v),
-        )};
+        // The roots themselves are read per-tree by the sweep below; only the
+        // bump is needed here. commit() updates v, so this is the CURRENT one.
+        let cur_bump = unsafe { tessera_volume_meta_reserve_bump(v) };
+        // Same generated sweep as the reclaim step: every reserve tree.
         let mut live: Vec<u64> = Vec::new();
-        live_nodes(&io, ir, TESSERA_BTREE_KIND_INODE,   4,  TESSERA_INODE_RECORD_SIZE,   &mut live)?;
-        live_nodes(&io, pr, TESSERA_BTREE_KIND_PACK_REG, 16, TESSERA_REGISTRY_ENTRY_SIZE, &mut live)?;
-        live_nodes(&io, fr, TESSERA_BTREE_KIND_FREE_EXT, 8,  8,                           &mut live)?;
-        live_nodes(&io, qr, TESSERA_BTREE_KIND_QUOTA,    8,  128,                         &mut live)?;
-        live_nodes(&io, dr, TESSERA_BTREE_KIND_DEAD_EXT, 8, 24,                          &mut live)?;
+        for t in RESERVE_TREES {
+            let r = unsafe { reserve_tree_root(v, t) };
+            live_nodes(&io, r, t.kind, t.ksz, t.vsz, &mut live)?;
+        }
         let first_live = live.iter().copied().min().unwrap_or(ceiling);
 
         // Phase B: fit entirely below the lowest live node?

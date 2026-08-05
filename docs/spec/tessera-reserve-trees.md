@@ -8,7 +8,10 @@ or validates the reserve knows it exists.** Miss one and the tree's root sector
 gets handed to another tree, the superblock keeps pointing at it, and the
 damage is silent until a mount warns about a node kind nobody can explain.
 
-This has now happened three times, once per tree ever added to the reserve:
+This happened three times, once per tree ever added to the reserve. The list
+is now generated from one header (see *What is mechanised* below), so the
+specific failure below cannot recur — but the history is why the rest of this
+document is worth reading:
 
 | tree | added | what was missed | found by | cost |
 |---|---|---|---|---|
@@ -33,8 +36,18 @@ loss, and for `inode_root` or `pack_registry_root` that is the filesystem.
 
 ## The checklist
 
-Adding a tree means touching all seven. Do them in this order — each later item
-assumes the earlier ones.
+**Start here: add one row to `core/include/tessera/reserve_trees.h`.** That
+row is what steps 2, 3 (partly) and 5 below consume — they are generated from
+it and need no edit of their own. The remaining steps are still manual.
+
+```c
+X(<name>_root, TESSERA_BTREE_KIND_<NAME>, <ksz>, <vsz>, <TIER>,
+  "what the operator loses if this root goes stale")
+```
+
+Sizes must be integer literals or plain `#define`d constants from `format.h`
+— the Rust generator resolves them textually and refuses to guess at
+expressions.
 
 ### 1. Format — name the root and its kind
 
@@ -50,37 +63,44 @@ assumes the earlier ones.
 at 0, and everything below must treat 0 as "nothing to do" rather than as a
 sector number.
 
-### 2. Pinscan — the GC must not free the tree's nodes
+### 2. Pinscan — GENERATED, nothing to do
 
-`kmod/tessera_fs.c`, the roots table around line 13560. Add an entry **and
-raise the loop bound**:
+`kmod/tessera_fs.c` expands `TESSERA_RESERVE_TREES(X)` into its roots table,
+and both the array size and the loop bound derive from it:
 
 ```c
-{ r_<name>, TESSERA_BTREE_KIND_<NAME>, <ksz>, <vsz> },
-...
-for (int i = 0; i < 10 && !aborted; i++) {   /* ← this number */
+roots[TESSERA_RESERVE_TREE_COUNT + 3] = { ... };   /* +3 = GC frozen roots */
+for (int i = 0; i < (int)nitems(roots) && !aborted; i++)
 ```
 
-★ The bound is a separate edit from the table, in a different statement, and
-nothing connects them. A table entry past the bound is invisible and compiles
-clean. This is precisely how the quota tree was missed (#115).
+★ It is worth knowing what this replaced, because the shape recurs elsewhere:
+the table, the array dimension and the loop bound were **three independent
+numbers with nothing connecting them**, so a row added past the bound compiled
+clean and never ran. That is exactly how the quota tree was missed (#115).
+Any time you write a literal bound next to a literal table, you have rebuilt
+that bug.
+
+The GC's three frozen roots stay hand-written: they are a snapshot of roots
+already superseded on disk, not superblock state, so they are deliberately not
+in the header.
 
 ### 3. Repack — the tree MOVES, it is not a spectator
 
 `rs/tessera-tools/src/bin/repack.rs`, five sites, all required:
 
-| site | what breaks if skipped |
-|---|---|
-| `struct Trees` + `existed` tuple (`:128`) | entries never read into RAM |
-| `struct Built` (`:138`) | no field to carry the new root |
-| `build_all` (`:151`) | Phase-B compaction drops the tree |
-| `specs` table + every `match victim` arm (`:274`) | staged path skips it |
-| both `live_nodes` sweeps (`:376`, `:505`) | **nodes offered as free staging space, bump lowered past them** |
-| `commit` (`:219`) | superblock keeps the pre-move root |
+| site | generated? | what breaks if skipped |
+|---|---|---|
+| both `live_nodes` sweeps | **yes** — `RESERVE_TREES` | nodes offered as free staging space, bump lowered past them |
+| `struct Trees` + `existed` tuple | no | entries never read into RAM |
+| `struct Built` | no | no field to carry the new root |
+| `build_all` | no | Phase-B compaction drops the tree |
+| `specs` table + `match victim` arms | no | staged path skips it |
+| `commit` | no | superblock keeps the pre-move root |
 
-The last two are the corrupting ones. Missing `live_nodes` is what let repack
-recycle sector 268 into a blob-index node; missing the commit is what left the
-superblock pointing there.
+The live sweeps were the corrupting ones — missing one is what let repack
+recycle sector 268 into a blob-index node — and they are now generated. What
+is left un-generated can only fail to COMPACT your tree, which costs space and
+latency, not integrity.
 
 ★ Make every `match victim` arm explicit and end with `unreachable!()`. A
 `_ =>` catch-all silently absorbs the new index and writes your root into the
@@ -107,10 +127,10 @@ match the C struct exactly.
 
 ### 5. fsck — detect a stale root, and say what its loss costs
 
-`rs/tessera-tools/src/bin/fsck.rs:518`. Add a row to the sweep table with a
-`StaleFix` tier and a *consequence string*. "kind mismatch" does not tell an
-operator what they lost; "all per-directory quota domains are lost; limits stop
-being enforced" does.
+GENERATED — the sweep iterates `RESERVE_TREES`. What you must get right is the
+**tier and the consequence string in your header row**, because nothing can
+infer those. "kind mismatch" does not tell an operator what they lost; "all
+per-directory quota domains are lost; limits stop being enforced" does.
 
 Pick the tier honestly:
 
@@ -163,15 +183,40 @@ dd if=$DEV bs=4096 count=1 | dd bs=1 skip=<off> count=8 | od -An -tu8
 Step 3 is the one that catches the repack class of bug, and only a *moved*
 root proves it — an unchanged root is exactly what the broken tool produced.
 
-## Why a checklist and not a test
+## What is mechanised, and what is still on you
 
-A test would be better. The obstacle is that each of these registration points
-lives in a different language and process (kmod C, offline Rust tools, the
-core library), and the failure is a *missing* entry — there is nothing to
-assert against without first enumerating what should exist. The realistic
-mechanised version is a single generated table of reserve trees that all three
-consumers read, which is worth doing and has not been done. Until then this
-file is the enumeration.
+The list is now **data**: `core/include/tessera/reserve_trees.h` holds one
+X-macro table, and the consumers expand or generate from it.
+
+| consumer | how it gets the list |
+|---|---|
+| kmod pinscan | expands the X-macro directly; array size and loop bound are both derived from it |
+| fsck stale-root sweep | `RESERVE_TREES`, generated by `tessera-sys/build.rs` |
+| repack live-node sweeps (both) | same generated slice |
+| root accessors | `reserve_tree_root()`, generated arms — so no consumer hand-maps field names |
+
+So **steps 2, 5 and the corrupting half of step 3 are automatic**: add a row
+and they all pick it up. The build script parses the same header on every
+build, so the C and Rust views cannot drift; if it cannot resolve a column it
+fails the build rather than guessing.
+
+Still hand-written, and still yours to do:
+
+- **Step 1** (format.h) — nothing can generate a superblock field for you.
+- **Step 4** (`commit_roots_t` + its flag) — a C struct the tools fill in.
+- **Repack's per-tree MOVE** (`Trees`, `Built`, `build_all`, the `specs`
+  table). Forgetting these now costs a tree that is never *compacted* — a
+  space and latency issue, not corruption, because the generated live sweeps
+  already pin its nodes. That is the point of mechanising the sweeps first:
+  the failure mode drops from "silently destroys the tree" to "misses an
+  optimisation".
+- **Step 7** (prove it on a real volume). Unchanged: nothing here tests that
+  your tree actually round-trips.
+
+The remaining generation gap is `Trees`/`Built`, which are per-tree struct
+fields rather than table rows. Generating them means either a macro-built
+struct or a proc-macro; neither is obviously worth it while the failure is
+non-corrupting.
 
 ## See also
 

@@ -74,6 +74,7 @@
 #include "tessera/format.h"
 #include "tessera/hash.h"
 #include "tessera/quota.h"
+#include "tessera/reserve_trees.h"
 #include "tessera/journal.h"
 #include "tessera/manifest.h"
 #include "tessera/pack.h"
@@ -13488,13 +13489,7 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	const uint64_t mstart = tmp_->sb.meta_reserve_start;
 	const uint64_t mlen   = tmp_->sb.meta_reserve_length;
 	const uint64_t bump0  = tmp_->sb.meta_reserve_bump;
-	uint64_t r_inode = tmp_->sb.inode_root;
-	uint64_t r_reg   = tmp_->sb.pack_registry_root;
-	uint64_t r_fext  = tmp_->sb.free_extent_root;
-	uint64_t r_snap  = tmp_->sb.snapshots_root;
-	uint64_t r_bidx  = tmp_->sb.blob_index_root;
-	uint64_t r_dext  = tmp_->sb.dead_extent_root;
-	uint64_t r_quota = tmp_->sb.quota_tree_root;
+	uint64_t r_snap  = tmp_->sb.snapshots_root;   /* #102 probe, below */
 	/*
 	 * ★ #102 CONFIRMING PROBE. The scan enumerates the snapshots tree as
 	 * it was AT THIS INSTANT. A snapshot created after this capture is not
@@ -13553,41 +13548,35 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	 * anything — see the union at swap time. */
 	int stale_skipped = 0;
 
-	struct { uint64_t root; int kind; uint32_t ksz; uint32_t vsz; } roots[10] = {
-		{ r_inode, 0, 4, TESSERA_INODE_RECORD_SIZE },
-		{ r_reg,   1, 16, TESSERA_REGISTRY_ENTRY_SIZE },
-		{ r_fext,  2, 8, 8 },
-		{ r_snap,  3, 8, TESSERA_SNAPSHOT_RECORD_SIZE },
-		/* Blob→pack index: without this pin, GC recycles its nodes
-		 * out from under it (seen live as kind-mismatch load errors +
-		 * the index self-destructing on the dev root). */
-		{ r_bidx,  TESSERA_BTREE_KIND_BLOB_INDEX,
-		    TESSERA_BLOB_INDEX_KEY_SIZE, TESSERA_BLOB_INDEX_VAL_SIZE },
-		/* Dead-extent log — same reasoning as the blob index above, and
-		 * worse consequences: its nodes being recycled mid-scan loses
-		 * the only record that those extents exist, stranding them
-		 * permanently. */
-		{ r_dext,  TESSERA_BTREE_KIND_DEAD_EXT,
-		    TESSERA_DEAD_EXT_KEY_SIZE, TESSERA_DEAD_EXT_VAL_SIZE },
-		/* ★ Quota-domain tree — MISSING UNTIL NOW, and it cost us the
-		 * exact failure the blob-index comment above predicts. On the
-		 * dev root sb.quota_tree_root pointed at sector 325, which by
-		 * then held a kind-5 BLOB-INDEX node: the quota root was
-		 * recycled out from under the SB because nothing pinned it,
-		 * and every mount logged "load_node: sector 325 kind=N
-		 * expected=4". Third instance of this bug (#64 blob index,
-		 * dead-extent log above, quota here) — any tree whose root
-		 * lives in the SB must appear in this table. */
-		{ r_quota, TESSERA_BTREE_KIND_QUOTA,
-		    8, TESSERA_QUOTA_DOMAIN_SIZE },
-		/* ★ #72/#78: the in-flight GC scan's frozen roots. Zero when no
-		 * scan is running, and a zero root is skipped below. Shared COW
-		 * nodes are marked once — walking them twice is idempotent. */
-		{ r_gc_inode, 0, 4, TESSERA_INODE_RECORD_SIZE },
-		{ r_gc_reg,   1, 16, TESSERA_REGISTRY_ENTRY_SIZE },
-		{ r_gc_snap,  3, 8, TESSERA_SNAPSHOT_RECORD_SIZE },
+	/*
+	 * ★ The seven superblock-rooted trees come from ONE list —
+	 * <tessera/reserve_trees.h>. They used to be copied in by hand, and
+	 * three separate trees were forgotten in turn (blob index #64, the
+	 * dead-extent log, quota #115); each omission let the recycler hand a
+	 * live root sector to another tree while the SB kept pointing at it.
+	 * A row added to that header now lands here automatically, and the
+	 * bound below is derived, so it cannot fall out of step.
+	 */
+#define TESSERA_PINSCAN_ROW(field, kind, ksz, vsz, tier, why) \
+	{ tmp_->sb.field, (int)(kind), (ksz), (vsz) },
+	struct { uint64_t root; int kind; uint32_t ksz; uint32_t vsz; }
+	    roots[TESSERA_RESERVE_TREE_COUNT + 3] = {
+		TESSERA_RESERVE_TREES(TESSERA_PINSCAN_ROW)
+		/* ★ #72/#78: the in-flight GC scan's frozen roots. Not
+		 * superblock state — they are a snapshot of roots already
+		 * superseded on disk — so they are NOT in reserve_trees.h and
+		 * stay hand-written here. Zero when no scan is running, and a
+		 * zero root is skipped below. Shared COW nodes are marked
+		 * once; walking them twice is idempotent. */
+		{ r_gc_inode, TESSERA_BTREE_KIND_INODE,    4,
+		    TESSERA_INODE_RECORD_SIZE },
+		{ r_gc_reg,   TESSERA_BTREE_KIND_PACK_REG, 16,
+		    TESSERA_REGISTRY_ENTRY_SIZE },
+		{ r_gc_snap,  TESSERA_BTREE_KIND_SNAPSHOT, 8,
+		    TESSERA_SNAPSHOT_RECORD_SIZE },
 	};
-	for (int i = 0; i < 10 && !aborted; i++) {
+#undef TESSERA_PINSCAN_ROW
+	for (int i = 0; i < (int)nitems(roots) && !aborted; i++) {
 		if (roots[i].root == 0) continue;
 		tessera_btree_t *t = tessera_btree_open(&tmp_->meta_bio,
 		    roots[i].root, roots[i].kind, roots[i].ksz, roots[i].vsz);

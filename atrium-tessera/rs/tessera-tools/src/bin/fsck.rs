@@ -49,22 +49,6 @@ fn hx(h: &Hash) -> String { h[..6].iter().map(|b| format!("{b:02x}")).collect() 
 const S_IFMT: u32 = 0o170000;
 const S_IFREG: u32 = 0o100000;
 
-/// What --repair may do about a superblock root that no longer holds a node
-/// of its own tree kind. The tiers are NOT a severity ranking — they answer a
-/// narrower question: is clearing this root a recovery, a bounded downgrade,
-/// or the destruction of the filesystem?
-#[derive(Clone, Copy, PartialEq)]
-enum StaleFix {
-    /// Fully reconstructible. fsck already derives the authoritative free set
-    /// from the pack zone, so rebuilding is a real repair, not a loss.
-    Rebuild,
-    /// Clearing loses that tree, but the loss is bounded, nameable, and leaves
-    /// a consistent mountable volume.
-    Clear,
-    /// Clearing would destroy the filesystem. Refuse and say why.
-    Refuse,
-}
-
 struct Fsck {
     problems: Vec<String>,
     // informational findings (don't fail the check): space-accounting,
@@ -102,7 +86,7 @@ struct Fsck {
     // (leaked sectors, double-state, free overlap / out-of-bounds).
     free_tree_dirty: bool,
     /// Superblock roots proven stale by the #115 sweep that --repair will
-    /// CLEAR (StaleFix::Clear). Names only; the commit maps them to fields.
+    /// CLEAR (StaleTier::Clear). Names only; the commit maps them to fields.
     stale_clear: Vec<&'static str>,
     /// Stale roots this tool refuses to touch, kept so --repair can say so
     /// out loud instead of exiting "nothing repairable" with no reason.
@@ -527,30 +511,12 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
     // Cause is always the same: a tree whose root pinscan does not pin gets
     // its sector reclaimed and handed to another tree. Prevention is in the
     // kmod; this is the detector for volumes already in that state.
-    for &(name, root, kind, fix, consequence) in &[
-        ("inode_root",         inode_root,      TESSERA_BTREE_KIND_INODE,
-         StaleFix::Refuse,
-         "every file and directory is unreachable"),
-        ("pack_registry_root", pack_root,       TESSERA_BTREE_KIND_PACK_REG,
-         StaleFix::Refuse,
-         "no blob can be located; the volume is effectively empty"),
-        ("free_extent_root",   free_root,       TESSERA_BTREE_KIND_FREE_EXT,
-         StaleFix::Rebuild,
-         "free-space accounting is lost; allocation may hand out live sectors"),
-        ("snapshots_root",     snapshots_root,  TESSERA_BTREE_KIND_SNAPSHOT,
-         StaleFix::Refuse,
-         "all retained snapshots are unreachable"),
-        ("quota_tree_root",    quota_root,      TESSERA_BTREE_KIND_QUOTA,
-         StaleFix::Clear,
-         "all per-directory quota domains are lost; limits stop being enforced"),
-        ("blob_index_root",    blob_index_root, TESSERA_BTREE_KIND_BLOB_INDEX,
-         StaleFix::Clear,
-         "cold reads fall back to scanning the whole registry; run tessera-reindex"),
-        ("dead_extent_root",
-         unsafe { tessera_volume_dead_extent_root(v) }, TESSERA_BTREE_KIND_DEAD_EXT,
-         StaleFix::Clear,
-         "deferred-dedup dead extents are stranded and never reclaimed"),
-    ] {
+    //
+    // The rows come from tessera/reserve_trees.h — the SAME list the kmod's
+    // pinscan expands — so this sweep cannot fall behind a newly added tree
+    // the way the hand-written version did.
+    for t in RESERVE_TREES {
+        let root = unsafe { reserve_tree_root(v, t) };
         if root == 0 { continue; }          // an unset root is not damage
         let mut hb = [0u8; SECTOR_SIZE as usize];
         let ok = f.read_at(&mut hb, root * SECTOR_SIZE)
@@ -558,23 +524,24 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
         // Silence only when we can positively read a node of the RIGHT kind
         // (tree_kind is byte 7 of tessera_btree_node_header_t). Anything
         // else — unreadable, bad magic, wrong kind — gets described.
-        if ok && &hb[0..4] == b"TBTR" && hb[7] == kind { continue; }
-        let why = describe_root_sector(&f, root, kind);
-        let plan = match fix {
-            StaleFix::Rebuild => "--repair rebuilds it from the pack zone",
-            StaleFix::Clear   => "--repair clears it (that tree stays lost)",
-            StaleFix::Refuse  => "NOT repairable by this tool — restore from backup",
+        if ok && &hb[0..4] == b"TBTR" && hb[7] == t.kind { continue; }
+        let why = describe_root_sector(&f, root, t.kind);
+        let plan = match t.tier {
+            StaleTier::Rebuild => "--repair rebuilds it from the pack zone",
+            StaleTier::Clear   => "--repair clears it (that tree stays lost)",
+            StaleTier::Refuse  => "NOT repairable by this tool — restore from backup",
         };
-        fsck.problem(format!("{name}: {why} — {consequence} [{plan}]"));
-        match fix {
+        fsck.problem(format!("{}: {why} — {} [{plan}]", t.field, t.consequence));
+        match t.tier {
             // The rebuild path already exists (#44) and derives the free set
             // from the pack zone, not from the tree being replaced, so it is
             // indifferent to the old root being garbage.
-            StaleFix::Rebuild => fsck.free_tree_dirty = true,
-            StaleFix::Clear   => fsck.stale_clear.push(name),
-            StaleFix::Refuse  => fsck.stale_refused.push(name),
+            StaleTier::Rebuild => fsck.free_tree_dirty = true,
+            StaleTier::Clear   => fsck.stale_clear.push(t.field),
+            StaleTier::Refuse  => fsck.stale_refused.push(t.field),
         }
     }
+
     // A stale quota root makes every quota record unreadable, so the quota
     // audit below would compare live usage against nothing and "fix" records
     // that do not exist. Skip it; the root is being cleared anyway.
