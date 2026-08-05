@@ -88,6 +88,29 @@ packs_before=$(sysc pack_alloc_calls)
 rm -rf $MNT/trash
 sync; sleep 2
 
+# ★ Deleting is not enough to make data collectable. The last
+# kern.tessera.snapshot_retention (16) snapshot records still reference it, and
+# fsck counts snapshot-pinned blobs as LIVE — correctly, since GC must not free
+# them. So drive enough commits to push those snapshots past the horizon.
+#
+# Measured, on this exact workload:
+#     GC right after the delete            ->  3 packs reclaimed
+#     GC after 12 records aged out         -> 89 packs reclaimed, STILL MOUNTED
+# Online reclaim is not blocked by being mounted; its latency IS the retention
+# horizon. An earlier version of this file reached the same state via an
+# unmount/remount and concluded the unmount was the mechanism — it was not, the
+# commits were.
+retention=$(sysc snapshot_retention)
+say "aging out snapshots (retention horizon = $retention records)"
+snap0=$(sysc snapshots_retired)
+i=1
+while [ $i -le $((retention + 8)) ]; do
+    echo tick > $MNT/live/.tick; sync; sleep 1
+    i=$((i+1))
+done
+rm -f $MNT/live/.tick; sync
+say "snapshot records aged out: $(( $(sysc snapshots_retired) - snap0 ))"
+
 # 1. GATE: did the delete actually produce dead space? If not, everything
 #    below would "pass" against an empty workload.
 
@@ -97,13 +120,11 @@ if [ "$packs_before" -lt 1 ]; then
 fi
 ok "workload: $packs_before pack-alloc call(s), 40 MiB deleted, 12 MiB live"
 
-# ★ Measure the reclaimable garbage BEFORE the GC, with fsck on the UNMOUNTED
-# volume. Without this the reclaim assertion is VACUOUS, and it was: a control
-# run that never invoked GC at all still ended with ~0 fully-dead packs and
-# "passed". The reason is that fsck's live set unions RETAINED SNAPSHOTS, and
-# the snapshots still pin the deleted files — so on this filesystem deleting a
-# file does not by itself create garbage. Asserting on a post-state alone
-# cannot tell "GC worked" from "there was nothing to do".
+# ★ Measure the reclaimable garbage BEFORE the GC. Without this the reclaim
+# assertion is VACUOUS, and it was: a control run that never invoked GC at all
+# still ended with ~0 fully-dead packs and "passed", because fsck's live set
+# unions retained snapshots. Asserting on a post-state alone cannot tell "GC
+# worked" from "there was nothing to do". fsck needs the volume unmounted.
 dead_of() {
     $FSCK "$1" 2>&1 | grep -a "packs fully live" | head -1 |
         sed -E 's/.*MiB\), ([0-9]+) fully dead.*/\1/'
