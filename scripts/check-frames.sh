@@ -18,13 +18,13 @@ log=${1:?usage: check-frames.sh <build-log>}
 # from a clean build — a partial one silently under-counts. LOWER THIS as frames are fixed; never raise
 # it without a recorded reason.
 #
-# Current 11: dead_extent_drain 8400 (moved OUT of gc_data_zone_ex by
-# __noinline — fine standalone, it is a leaf), meta_pending_drain 8400,
+# Current 13 (dead_extent_drain's 8192 B array is now heap — it dropped off the
+# list entirely): meta_pending_drain 8400,
 # kbio_meta_alloc 8384, repack_one_pack 4576, pack_alloc_and_write 4432,
 # pack_alloc_rollback 4288, decode_pack_extent_list 4160,
 # gc_data_zone_ex 2880, blake3_256 2000, blake3_init_derive_key 1984,
 # vop_readdir 1792.
-BASELINE=14
+BASELINE=13
 
 n=$(grep -c "stack frame size" "$log" 2>/dev/null || echo 0)
 echo "oversized frames: $n (baseline $BASELINE)"

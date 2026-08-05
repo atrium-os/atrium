@@ -3731,8 +3731,13 @@ tessera_fs_dead_extent_drain(struct tessera_mount *tmp_)
 	if (tmp_->dead_extent_tree == NULL || tmp_->sb.dead_extent_root == 0)
 		return (0);
 
-	struct { uint64_t start, len; uint32_t flags; uint64_t pel; }
-	    ents[TESSERA_DEAD_EXT_DRAIN_MAX];
+	/* ★ #114: heap. 256 * 32 = 8192 B — half the 16 KiB kstack. Inlined into
+	 * gc_data_zone_ex this WAS the slot that overflowed the GC read path;
+	 * 35ca1fe stopped the inlining, this removes the object itself so the
+	 * drain is no longer an 8 KiB frame in its own right. */
+	struct dext_ent { uint64_t start, len; uint32_t flags; uint64_t pel; };
+	struct dext_ent *ents = malloc(
+	    TESSERA_DEAD_EXT_DRAIN_MAX * sizeof(*ents), M_TESSERA, M_WAITOK);
 	uint32_t n = 0;
 
 	/* #114 instrumentation. Unconditional but self-limiting: the drain only
@@ -3845,6 +3850,7 @@ tessera_fs_dead_extent_drain(struct tessera_mount *tmp_)
 		    "deleted and were left allocated (retry next pass)\n",
 		    undeletable, undeletable == 1 ? "y" : "ies");
 	}
+	free(ents, M_TESSERA);
 	return (freed);
 }
 
