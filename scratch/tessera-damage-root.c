@@ -16,10 +16,12 @@
  *
  * usage: tessera-damage-root <device> <field> <sector>
  *        tessera-damage-root <device> --list
+ *        tessera-damage-root <device> --node-count <sector> <n>
  */
 #include <tessera/reserve_trees.h>
 #include <tessera/volume.h>
 #include <tessera/codec.h>
+#include <tessera/btree.h>
 #include <tessera/format.h>
 #include <tessera/error.h>
 
@@ -66,6 +68,39 @@ main(int argc, char **argv)
 #undef SHOW
 		return 0;
 	}
+	/*
+	 * --node-count: rewrite a btree node's entry_count and FIX THE CRC.
+	 * Without the CRC fixup the node is rejected as corrupt before the
+	 * entry_count is ever looked at, so the bound under test never runs
+	 * — the check would appear to pass for the wrong reason.
+	 */
+	if (strcmp(field, "--node-count") == 0) {
+		if (argc < 5) usage();
+		uint64_t ns = strtoull(argv[3], NULL, 0);
+		uint32_t nc = (uint32_t)strtoul(argv[4], NULL, 0);
+		uint8_t nb[TESSERA_SECTOR_SIZE];
+		if (pread(fd, nb, sizeof nb, (off_t)ns * TESSERA_SECTOR_SIZE)
+		    != (ssize_t)sizeof nb) { perror("pread node"); return 1; }
+		tessera_btree_node_header_t nh;
+		if (tessera_decode_btree_node_header(nb, &nh) != TESSERA_OK) {
+			fprintf(stderr, "sector %llu is not a btree node\n",
+			    (unsigned long long)ns);
+			return 1;
+		}
+		uint32_t old_c = nh.entry_count;
+		nh.entry_count = nc;
+		if (tessera_encode_btree_node_header(&nh, nb) != TESSERA_OK) {
+			fprintf(stderr, "encode node header failed\n"); return 1;
+		}
+		if (pwrite(fd, nb, sizeof nb, (off_t)ns * TESSERA_SECTOR_SIZE)
+		    != (ssize_t)sizeof nb) { perror("pwrite node"); return 1; }
+		if (fsync(fd) != 0) { perror("fsync"); return 1; }
+		printf("%s: sector %llu entry_count %u -> %u (CRC refreshed, "
+		    "kind=%u node_kind=%u)\n", dev, (unsigned long long)ns,
+		    old_c, nc, nh.tree_kind, nh.node_kind);
+		return 0;
+	}
+
 	if (argc < 4) usage();
 	uint64_t sector = strtoull(argv[3], NULL, 0);
 

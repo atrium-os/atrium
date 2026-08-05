@@ -185,6 +185,57 @@ load_node(tessera_btree_t *t, uint64_t sector, uint8_t *block)
 		t->last_fail_sector = sector;
 		return TESSERA_ECORRUPT;
 	}
+	/*
+	 * ★ Bound entry_count by what a node can PHYSICALLY hold.
+	 *
+	 * Every reader below walks [0, entry_count) computing
+	 * block + HEADER_SIZE + i * entry_size. `block` is one 4 KiB
+	 * sector, so an entry_count larger than the fanout walks straight
+	 * off the end of the buffer — and since #114 moved that buffer to
+	 * the heap, off the end of a kernel heap allocation. entry_count is
+	 * uint32: the overread is bounded only by 4 billion * entry_size.
+	 *
+	 * The INSERT path has always checked this ("entry_count + 1 <=
+	 * leaf_fanout"); the READ path never did. Neither magic nor CRC
+	 * catches it — the CRC covers the header, so a header claiming
+	 * 4,000,000 entries is perfectly self-consistent.
+	 *
+	 * load_node is the single choke point for every node read (10 call
+	 * sites), which is why the check belongs here and not in the
+	 * decoder: the decoder is handed 32 bytes and does not know the
+	 * tree's geometry, while `t` does.
+	 */
+	uint32_t cap = (h.node_kind == 0) ? t->leaf_fanout : t->inner_fanout;
+	if (h.entry_count > cap) {
+		tessera_debugf("btree load_node: sector %llu claims %u entries "
+		    "but a %s node of this %s tree holds at most %u — refusing "
+		    "to read past the block.\n",
+		    (unsigned long long)sector, (unsigned)h.entry_count,
+		    h.node_kind == 0 ? "leaf" : "internal",
+		    tessera_btree_kind_name(t->tree_kind), (unsigned)cap);
+		t->last_fail = TESSERA_BTREE_FAIL_HEADER;
+		t->last_fail_sector = sector;
+		return TESSERA_ECORRUPT;
+	}
+	/*
+	 * Geometry must match too: a node whose key/value sizes differ from
+	 * the tree's would be indexed with the wrong stride, reading real
+	 * bytes at meaningless offsets. Only checked when nonzero so that
+	 * any node predating these fields still loads.
+	 */
+	uint32_t want_vs = (h.node_kind == 0) ? t->value_size : 8u;
+	if ((h.key_size != 0 && h.key_size != t->key_size) ||
+	    (h.value_size != 0 && h.value_size != want_vs)) {
+		tessera_debugf("btree load_node: sector %llu has geometry "
+		    "key=%u val=%u but this %s tree is key=%u val=%u\n",
+		    (unsigned long long)sector, (unsigned)h.key_size,
+		    (unsigned)h.value_size,
+		    tessera_btree_kind_name(t->tree_kind),
+		    (unsigned)t->key_size, (unsigned)want_vs);
+		t->last_fail = TESSERA_BTREE_FAIL_HEADER;
+		t->last_fail_sector = sector;
+		return TESSERA_ECORRUPT;
+	}
 	t->last_fail = TESSERA_BTREE_FAIL_NONE;
 	return TESSERA_OK;
 }
