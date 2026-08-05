@@ -144,6 +144,20 @@ Pick the tier honestly:
 - **Refuse** — clearing destroys the filesystem. `inode`, `pack_registry`,
   `snapshots`.
 
+All three are verified against deliberately damaged volumes (scratch/
+tessera-damage-root.c puts a root into the stale state; `dd` cannot, because
+the superblock is CRC-covered). Rebuild recovers the free-extent tree to the
+exact pre-damage free-space figure; Clear repairs quota / blob-index /
+dead-extent and re-verifies CLEAN; Refuse leaves the root untouched, exits 1,
+and is a strict no-op — restoring the original root value afterwards returns
+the volume to CLEAN with its files intact.
+
+★ A Refuse must never suggest `tessera-repack`. Repack rewrites the metadata
+reserve using the trees the volume has just lost, so on a destroyed inode or
+pack-registry root it is the worst available next step. fsck's generic
+"…or the reserve is exhausted, run tessera-repack" hint is suppressed when a
+Refuse-tier root is the reason no progress was made.
+
 If the tree is *derivable*, say from what, and print the command that rebuilds
 it (`tessera-reindex` does this for the blob index). If it is **not** derivable,
 it must not be silently dropped anywhere — that is a permanent space or

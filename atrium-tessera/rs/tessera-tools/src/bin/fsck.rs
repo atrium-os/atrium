@@ -410,8 +410,13 @@ unsafe fn name_str(p: *const core::ffi::c_char, len: u16) -> String {
 /// repair=false it only detects. With repair=true it applies fixes, commits,
 /// and returns (1, applied>0) so the caller can re-scan; a fully clean scan
 /// returns (0, 0).
+/// Returns (exit code, repair actions applied, saw-a-Refuse-tier-stale-root).
+/// The third field exists so the fixpoint driver does not guess WHY it made no
+/// progress: a destroyed inode or pack-registry root is not reserve pressure,
+/// and telling the operator to run tessera-repack in that state is actively
+/// dangerous — repack rewrites the reserve using trees it cannot read.
 fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
-    -> Result<(i32, u32), String> {
+    -> Result<(i32, u32, bool), String> {
     let f = if repair {
         open_file_rw(path).map_err(|e| format!("open {path} (rw): {e}"))?
     } else {
@@ -443,7 +448,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
     if r != 0 {
         // The superblock itself is unreadable/corrupt — the worst case.
         eprintln!("tessera-fsck: SUPERBLOCK INVALID (tessera_volume_open errno={r}) — both SB copies failed magic/CRC/HMAC/version");
-        return Ok((1, 0));
+        return Ok((1, 0, false));
     }
 
     let total = unsafe { tessera_volume_total_sectors(v) };
@@ -1398,7 +1403,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
     if fsck.problems.is_empty() && fsck.snapshot_problems.is_empty() {
         println!("  result:       CLEAN — no inconsistencies found");
         unsafe { tessera_volume_close(v); }
-        return Ok((0, 0));
+        return Ok((0, 0, false));
     }
     if fsck.problems.is_empty() {
         // Historically this printed CLEAN — the #85 bug exactly.
@@ -1413,7 +1418,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
 
     if !repair {
         unsafe { tessera_volume_close(v); }
-        return Ok((1, 0));
+        return Ok((1, 0, false));
     }
 
     // ── --repair: apply fixes and commit a new superblock. The caller
@@ -1458,10 +1463,12 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
 filesystem, and this tool will not do that. Restore from backup.");
     }
 
+    let refused = !fsck.stale_refused.is_empty();
+
     if applied + stale_applied == 0 {
         println!("tessera-fsck: nothing safely repairable by this tool (superblock-level or unrecoverable damage) — see problems above");
         unsafe { tessera_volume_close(v); }
-        return Ok((1, 0));
+        return Ok((1, 0, refused));
     }
     // Seal a new superblock pointing at the repaired roots. The bump has
     // advanced past every reserve sector the rewrites consumed — read it
@@ -1503,7 +1510,7 @@ reserve — the repairs above are committed and durable; re-run to continue.");
     // Report the stale-root clears too: the fixpoint driver decides whether
     // to run another pass from this count, and a pass that only cleared a
     // root DID make progress.
-    Ok((1, applied + stale_applied))
+    Ok((1, applied + stale_applied, refused))
 }
 
 /// Drive --repair to a fixpoint: repeatedly scan + apply until the volume
@@ -1522,7 +1529,7 @@ fn run_to_fixpoint(path: &str, verbose: bool) -> Result<i32, String> {
     let mut total = 0u32;
     for pass in 0..MAX_PASSES {
         if pass > 0 { println!("\n──── repair pass {} ────", pass + 1); }
-        let (exit, applied) = run(path, verbose, true, REPAIR_BUDGET)?;
+        let (exit, applied, refused) = run(path, verbose, true, REPAIR_BUDGET)?;
         total += applied;
         if exit == 0 {
             if pass > 0 {
@@ -1532,9 +1539,21 @@ fn run_to_fixpoint(path: &str, verbose: bool) -> Result<i32, String> {
             return Ok(0);
         }
         if applied == 0 {
-            println!("\ntessera-fsck: REPAIR INCOMPLETE after {total} action(s) — the \
+            if refused {
+                // Do NOT offer tessera-repack here. It rewrites the metadata
+                // reserve using the very trees this volume has lost, so on a
+                // destroyed inode or pack-registry root it is the worst
+                // available next step, not a remedy.
+                println!("\ntessera-fsck: REPAIR INCOMPLETE after {total} action(s) — a \
+superblock root named above points at another tree's node. Its contents are \
+gone, and clearing it would destroy the filesystem, so this tool will not. \
+Restore from backup. Do NOT run tessera-repack: it rewrites the reserve using \
+trees this volume no longer has.");
+            } else {
+                println!("\ntessera-fsck: REPAIR INCOMPLETE after {total} action(s) — the \
 remaining problems are not safely repairable by this tool (or the reserve is \
 exhausted; run tessera-repack to reclaim it, then re-run).");
+            }
             return Ok(1);
         }
     }
@@ -2109,7 +2128,7 @@ fn main() -> ExitCode {
     let result = if repair {
         run_to_fixpoint(&path, verbose)
     } else {
-        run(&path, verbose, false, u32::MAX).map(|(exit, _)| exit)
+        run(&path, verbose, false, u32::MAX).map(|(exit, _, _)| exit)
     };
     match result {
         Ok(0) => ExitCode::SUCCESS,
