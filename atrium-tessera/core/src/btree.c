@@ -129,6 +129,23 @@ read_header(const uint8_t *block, tessera_btree_node_header_t *h)
 	return tessera_decode_btree_node_header(block, h);
 }
 
+/* Human names for TESSERA_BTREE_KIND_*. Used only in diagnostics, so an
+ * unknown value returns a printable placeholder rather than asserting. */
+static const char *
+tessera_btree_kind_name(uint8_t kind)
+{
+	switch (kind) {
+	case TESSERA_BTREE_KIND_INODE:      return "inode";
+	case TESSERA_BTREE_KIND_PACK_REG:   return "pack-registry";
+	case TESSERA_BTREE_KIND_FREE_EXT:   return "free-extent";
+	case TESSERA_BTREE_KIND_SNAPSHOT:   return "snapshot";
+	case TESSERA_BTREE_KIND_QUOTA:      return "quota";
+	case TESSERA_BTREE_KIND_BLOB_INDEX: return "blob-index";
+	case TESSERA_BTREE_KIND_DEAD_EXT:   return "dead-extent";
+	default:                            return "UNKNOWN-KIND";
+	}
+}
+
 static int
 load_node(tessera_btree_t *t, uint64_t sector, uint8_t *block)
 {
@@ -146,9 +163,23 @@ load_node(tessera_btree_t *t, uint64_t sector, uint8_t *block)
 	}
 	if (h.tree_kind != t->tree_kind) {
 		if (!t->quiet_kind_mismatch)
-			tessera_debugf("btree load_node: sector %llu kind=%u "
-			    "expected=%u\n", (unsigned long long)sector,
-			    (unsigned)h.tree_kind, (unsigned)t->tree_kind);
+			/* ★ #115: name the trees and state the consequence.
+			 *
+			 * This message used to read "sector 325 kind=5
+			 * expected=4" — two bare numbers that identify neither
+			 * tree and sound transient. It was the ONLY symptom of
+			 * a quota root recycled out from under the superblock
+			 * (fixed by pinning it, 0e27ab8), and it went
+			 * unexplained across many mounts precisely because it
+			 * did not say what had been lost. A diagnostic nobody
+			 * can act on is barely a diagnostic. */
+			tessera_debugf("btree load_node: sector %llu holds a "
+			    "%s node but was reached as %s — that root is "
+			    "STALE and its tree's contents are LOST. Run "
+			    "tessera-fsck on an UNMOUNTED volume.\n",
+			    (unsigned long long)sector,
+			    tessera_btree_kind_name(h.tree_kind),
+			    tessera_btree_kind_name(t->tree_kind));
 		t->last_fail = TESSERA_BTREE_FAIL_KIND;
 		t->last_fail_found_kind = h.tree_kind;
 		t->last_fail_sector = sector;
