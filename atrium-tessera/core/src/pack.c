@@ -210,24 +210,27 @@ tessera_pack_finalize(tessera_pack_builder_t *b,
 	memset(out_buffer, 0, total);
 
 	/* Header. */
-	tessera_pack_header_t hdr;
-	memset(&hdr, 0, sizeof hdr);
-	memcpy(hdr.magic, TESSERA_MAGIC_PACK, 8);
-	hdr.version          = 1;
-	hdr.pack_kind        = b->pack_kind;
-	memcpy(hdr.pack_id, b->pack_id, 16);
-	hdr.create_time      = 0;        /* caller may set via raw rewrite */
-	hdr.creator_tx_id    = b->creator_tx_id;
-	hdr.blob_count       = (uint32_t)b->count;
-	hdr.index_blocks     = (uint32_t)(index_size_pad / TESSERA_SECTOR_SIZE);
-	hdr.bloom_bytes      = (uint32_t)bloom_bytes;
-	hdr.bloom_hash_count = k_hashes;
-	hdr.data_offset      = data_off;
-	hdr.data_length      = data_len;
-	hdr.total_pack_bytes = total;
+	/* ★ #114: heap. tessera_pack_header_t is 4096 B (format.h asserts it);
+	 * as a local it was half a 16 KiB kstack, and with the footer below the
+	 * pair made this function an 8336-byte frame. */
+	tessera_pack_header_t *hdr = tessera_zalloc(sizeof *hdr);
+	if (hdr == NULL) return TESSERA_ENOMEM;
+	memcpy(hdr->magic, TESSERA_MAGIC_PACK, 8);
+	hdr->version          = 1;
+	hdr->pack_kind        = b->pack_kind;
+	memcpy(hdr->pack_id, b->pack_id, 16);
+	hdr->create_time      = 0;       /* caller may set via raw rewrite */
+	hdr->creator_tx_id    = b->creator_tx_id;
+	hdr->blob_count       = (uint32_t)b->count;
+	hdr->index_blocks     = (uint32_t)(index_size_pad / TESSERA_SECTOR_SIZE);
+	hdr->bloom_bytes      = (uint32_t)bloom_bytes;
+	hdr->bloom_hash_count = k_hashes;
+	hdr->data_offset      = data_off;
+	hdr->data_length      = data_len;
+	hdr->total_pack_bytes = total;
 
-	int r = tessera_encode_pack_header(&hdr,
-	    out_buffer + header_off);
+	int r = tessera_encode_pack_header(hdr, out_buffer + header_off);
+	tessera_free(hdr);               /* encoded into out_buffer; done with it */
 	if (r != TESSERA_OK) return r;
 
 	/* Bloom filter. */
@@ -272,12 +275,15 @@ tessera_pack_finalize(tessera_pack_builder_t *b,
 	uint32_t data_crc = tessera_crc32(data_base, data_len);
 
 	/* Footer. */
-	tessera_pack_footer_t ft;
-	memset(&ft, 0, sizeof ft);
-	memcpy(ft.magic, TESSERA_MAGIC_PACK_END, 8);
-	ft.blob_count_check = (uint32_t)b->count;
-	ft.crc32_pack       = data_crc;
-	(void)tessera_encode_pack_footer(&ft, out_buffer + footer_off);
+	/* ★ #114: heap — 4096 B, same reason as the header above. Freed right
+	 * after the encode, so no exit below needs cleanup. */
+	tessera_pack_footer_t *ft = tessera_zalloc(sizeof *ft);
+	if (ft == NULL) return TESSERA_ENOMEM;
+	memcpy(ft->magic, TESSERA_MAGIC_PACK_END, 8);
+	ft->blob_count_check = (uint32_t)b->count;
+	ft->crc32_pack       = data_crc;
+	(void)tessera_encode_pack_footer(ft, out_buffer + footer_off);
+	tessera_free(ft);
 
 	return TESSERA_OK;
 }
