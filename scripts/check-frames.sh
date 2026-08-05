@@ -32,7 +32,34 @@ log=${1:?usage: check-frames.sh <build-log>}
 # vop_readdir 1792.
 BASELINE=5
 
-n=$(grep -c "stack frame size" "$log" 2>/dev/null || echo 0)
+# ★ A GATE THAT CANNOT FAIL IS NOT A GATE. Two ways this one could not:
+#
+# 1. `n=$(grep -c ... || echo 0)` — grep -c PRINTS "0" and EXITS 1 when there
+#    are no matches, so the fallback appended a second line. `n` became "0\n0",
+#    the numeric comparison errored, and the script fell through to exit 0.
+#    Every clean-of-warnings build "passed" for the wrong reason.
+# 2. An INCREMENTAL build only recompiles what changed, so the log carries a
+#    handful of warnings or none. Zero matches then reads as "no oversized
+#    frames" when it means "did not look". The BASELINE comment already warned
+#    that partial builds under-count; nothing enforced it.
+# Anchor on the -c flag, NOT on "clang .* <file>": bmake echoes one enormous
+# command that the log wraps across physical lines, so the compiler name and
+# the source name are usually not on the same line and `.*` cannot bridge them.
+# grep -a because these logs carry non-text bytes.
+#
+# Both a kmod TU and a core TU must appear — the baseline counts frames across
+# both, so a build that recompiled only one of them still under-counts.
+for tu in tessera_fs.c btree.c; do
+    # Core TUs are compiled by absolute path (-c .../core/src/btree.c), the
+    # kmod TU by bare name, so match the suffix rather than the whole token.
+    grep -aq -- "-c [^ ]*$tu" "$log" 2>/dev/null || {
+        echo "REFUSING: $log has no '-c $tu' line — this is a partial or"
+        echo "incremental build log, and its warning count means nothing."
+        echo "Re-run after: rm -f *.o *.ko  (a FULL build), then re-check."
+        exit 2
+    }
+done
+n=$(grep -c "stack frame size" "$log" 2>/dev/null) || n=0
 echo "oversized frames: $n (baseline $BASELINE)"
 grep -a "stack frame size" "$log" 2>/dev/null | sed -E 's/.*warning: //' | sort -u | sed 's/^/  /'
 
