@@ -90,6 +90,18 @@ ${BENCH_SHA_BIN}: lib${LIB}.a ${.CURDIR}/tests/bench_sha256.c
 	${CC} ${CFLAGS} -o ${.TARGET} ${.CURDIR}/tests/bench_sha256.c \
 	    ${.OBJDIR}/libtessera_core.a -lmd
 
+# ── Host-native test run (macOS / any non-FreeBSD build host) ───
+# `check` above links ${.OBJDIR}/libtessera_core.a, which with MK_AUTO_OBJ=no
+# is the CROSS archive kept in-tree for TESSERA_CORE_LIB. On a FreeBSD host
+# that is the right thing; on the macOS build host it links host test objects
+# against aarch64-FreeBSD code and fails with "symbol(s) not found for
+# architecture arm64", which reads like a missing library. hostcheck builds a
+# separate host-native archive under build-host/ and never touches the cross
+# artifacts.
+hostcheck:
+	sh ${.CURDIR}/../../scripts/core-host-tests.sh -k
+
 CLEANFILES+= ${TEST_BINS} ${BENCH_SHA_BIN}
+CLEANDIRS+= build-host
 
 .include <bsd.lib.mk>

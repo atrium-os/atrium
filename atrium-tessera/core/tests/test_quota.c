@@ -37,7 +37,15 @@ test_init(void)
 	CHECK(d.root_inode_no == 1000);
 	CHECK(d.limit_bytes == 100);
 	CHECK(d.used_bytes == 0);
-	CHECK(d.dedup_policy == TESSERA_DEDUP_DEFERRED);
+	/* GLOBAL, not DEFERRED — changed deliberately in 6bac9879 (#114 step 1)
+	 * because domain 1 covers the root and the trusted-ingest trees, and
+	 * flipping those to append-anyway regresses the case the disk-cost
+	 * thesis is won on. `deferred` is now an explicit per-domain choice
+	 * via TESSERA_IOC_DEDUP_POLICY. See the rationale in quota.c.
+	 *
+	 * This assertion sat wrong for two days: the host test suite could not
+	 * be built at all (it linked the cross archive), so nothing ran it. */
+	CHECK(d.dedup_policy == TESSERA_DEDUP_GLOBAL);
 	CHECK(d.limit_inodes == 0 && d.used_inodes == 0);
 }
 

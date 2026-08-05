@@ -442,6 +442,12 @@ ph_corelib() {
     cd_core="$REPO/atrium-tessera/core"
     [ -d "$cd_core" ] || { warn "atrium-tessera/core not in this tree, skipping"; return 0; }
     L=$(brew --prefix llvm)
+    # ★ Remove the archive first. bmake compares it against the .o files and
+    # prints "`libtessera_core.a' is up to date", so --force forced nothing —
+    # which is how an EMPTY archive survived repeated rebuilds. (It was
+    # emptied by running `bmake check` on macOS, where the host-side test
+    # target re-archives into the same in-tree path.)
+    rm -f "$cd_core/libtessera_core.a"
     head_ "cross-building libtessera_core.a"
     ( cd "$cd_core" && bmake -s libtessera_core.a \
         CC="$L/bin/clang" AR="$L/bin/llvm-ar" RANLIB="$L/bin/llvm-ranlib" \
@@ -457,15 +463,25 @@ ph_corelib() {
     # the tools are run in the guest.
     "$L/bin/llvm-nm" "$a" >/dev/null 2>&1 \
         || die "$a is not a readable archive" "See $LOGS/corelib.log"
+    # ★ An EMPTY archive used to pass this gate. `ar t | head -1` returned "",
+    # the extraction silently failed, `[ -f /tmp/ ]` was false, and the whole
+    # architecture check was SKIPPED — reported as
+    #     ok  libtessera_core.a (0 KiB, aarch64)
+    # Missing evidence must never read as success. Count members first, and
+    # make the arch check mandatory rather than conditional.
+    nmemb=$("$L/bin/llvm-ar" t "$a" 2>/dev/null | grep -c '\.o$')
+    [ "${nmemb:-0}" -ge 15 ] || die \
+        "libtessera_core.a holds $nmemb object(s) — it is empty or truncated" \
+        "Expected one per core/src/*.c. See $LOGS/corelib.log"
     obj=$("$L/bin/llvm-ar" t "$a" 2>/dev/null | head -1)
     "$L/bin/llvm-ar" x "$a" "$obj" --output=/tmp 2>/dev/null
-    if [ -f "/tmp/$obj" ]; then
-        file "/tmp/$obj" | grep -q 'ARM aarch64' \
-            || die "libtessera_core.a contains host objects, not aarch64" \
-                   "The cross flags did not reach bmake. See $LOGS/corelib.log"
-        rm -f "/tmp/$obj"
-    fi
-    ok "libtessera_core.a ($(( $(stat -f %z "$a") / 1024 )) KiB, aarch64)"
+    [ -f "/tmp/$obj" ] || die "could not extract $obj from libtessera_core.a" \
+        "The gate cannot verify the architecture, so it must not pass."
+    file "/tmp/$obj" | grep -q 'ARM aarch64' \
+        || die "libtessera_core.a contains host objects, not aarch64" \
+               "The cross flags did not reach bmake. See $LOGS/corelib.log"
+    rm -f "/tmp/$obj"
+    ok "libtessera_core.a ($(( $(stat -f %z "$a") / 1024 )) KiB, aarch64, $nmemb objects)"
 }
 
 ph_userspace() {
