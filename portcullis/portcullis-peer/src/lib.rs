@@ -51,6 +51,16 @@ pub fn uid_gid(fd: RawFd) -> io::Result<(u32, u32)> {
 }
 
 /// The username for a uid (via the passwd database).
+/// This process's own user name, from its REAL uid.
+///
+/// The counterpart to [`username`] for a client that needs to agree with what
+/// portcullisd will see: the daemon identifies callers with getpeereid(2), so
+/// anything deriving the user from $USER can disagree with the daemon about
+/// whose policy is in play (see the note on the CLI's `current_user`).
+pub fn current_username() -> Option<String> {
+    username(unsafe { libc::getuid() })
+}
+
 pub fn username(uid: u32) -> Option<String> {
     let pw = unsafe { libc::getpwuid(uid) };
     if pw.is_null() {

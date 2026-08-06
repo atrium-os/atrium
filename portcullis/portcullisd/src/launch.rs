@@ -343,15 +343,78 @@ fn run_one_jail(
     Ok(code)
 }
 
-/// Final teardown: optional jail -r (idempotent if already removed),
-/// then unmount in reverse order: unionfs, then nullfs.
+/// Every mount point at or under `root`, DEEPEST FIRST.
+///
+/// Parsed from `mount -p` (fstab-style; field 2 is the mount point) rather than
+/// assumed, because the set is not fixed: it is the overlay pair plus whatever
+/// capability mounts this app's manifest asked for. Sorting by path length puts
+/// nested mounts ahead of the parents that contain them.
+fn mounts_under(root: &Path) -> Vec<PathBuf> {
+    let out = match Command::new("mount").arg("-p").output() {
+        Ok(o) => o.stdout,
+        Err(_) => return Vec::new(),
+    };
+    let mut v: Vec<PathBuf> = String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .map(PathBuf::from)
+        .filter(|p| p == root || p.starts_with(root))
+        .collect();
+    v.sort_by_key(|p| std::cmp::Reverse(p.as_os_str().len()));
+    v
+}
+
+/// Final teardown: optional jail -r (idempotent if already removed), then
+/// unmount everything the launch mounted — deepest first.
+///
+/// It used to unmount `dev`, then the jail path twice (unionfs, nullfs), and
+/// nothing else. But the capability mounts live UNDER the jail path
+/// (<jail>/atrium/sockets/fresco, .../forum-ctl, …), so they held the overlay
+/// busy and the whole stack survived:
+///
+///     umount: unmount of /var/lib/atrium/jails/<app> failed: Device busy
+///
+/// `jail -r` is documented to drop a jail's own mounts and demonstrably does
+/// not always. Each relaunch then stacked a fresh set on top of the survivors —
+/// 12 mounts with no jail running, no process, no open file.
+///
+/// ★ And a stacked pile cannot be cleaned up afterwards by path: a path
+/// resolves through the topmost layer, so buried mounts answer
+/// "not a file system root directory" and are reachable only by fsid. So the
+/// fix has to be to never leave the pile, not to clean it up later.
+///
+/// Re-enumerating each pass (rather than unmounting a list captured once) is
+/// what makes it converge: unmounting a layer can reveal another mounted at the
+/// same path underneath it.
 fn full_teardown(jail_path: &Path, jail_name: Option<&str>) {
     if let Some(n) = jail_name {
         let _ = Command::new("jail").arg("-r").arg(n).status();
     }
-    let _ = umount(&jail_path.join("dev"));   /* belt-and-braces */
-    let _ = umount(jail_path);                 /* unionfs */
-    let _ = umount(jail_path);                 /* nullfs */
+    for _ in 0..16 {
+        let ms = mounts_under(jail_path);
+        if ms.is_empty() {
+            break;
+        }
+        let before = ms.len();
+        for m in &ms {
+            let _ = umount_silent(m);
+        }
+        /* No progress means the rest is genuinely held (a live process, a
+         * wedged fs) — stop rather than spin; the check below reports it. */
+        if mounts_under(jail_path).len() == before {
+            break;
+        }
+    }
+    /* Gate on the mounts being GONE, not on having called umount. A silent
+     * leak here is invisible until the stack is unrecoverable. */
+    let left = mounts_under(jail_path);
+    if !left.is_empty() {
+        eprintln!("portcullisd: WARNING {} mount(s) still under {} after teardown \
+                   — a relaunch will stack on top of them:", left.len(), jail_path.display());
+        for m in left.iter().take(6) {
+            eprintln!("portcullisd:   {}", m.display());
+        }
+    }
 }
 
 /// Resolve the dedicated per-app uid the app executes as (PRIVILEGE INVARIANT,

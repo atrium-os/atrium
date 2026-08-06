@@ -723,13 +723,22 @@ fn check_authorization(
 // ── policy subcommands ───────────────────────────────────────────
 
 /// Resolve the current user's name for the policy file path.
-/// Falls back to "atrium" when neither USER nor LOGNAME is set
-/// (e.g. headless cron contexts) — the file will then be at
-/// /var/db/atrium/atrium/policy.toml.
+///
+/// ★ From the REAL uid, not from $USER. portcullisd identifies a caller with
+/// getpeereid(2), so a CLI that trusted the environment could read a different
+/// user's policy than the one `grant`/`launch` act on — and it did: under
+/// `su -m` (which preserves $USER) `policy grant` correctly wrote
+/// /var/db/atrium/atrium-app-50001/policy.toml via the daemon, while
+/// `policy show` read root's and reported "no grant for ...". That fails in the
+/// worst direction: it says a grant did not take when it did.
+///
+/// Falls back to the environment, then to "atrium", only if the uid has no
+/// passwd entry (headless/odd contexts) — never in preference to it.
 fn current_user() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_else(|_| "atrium".into())
+    portcullis_peer::current_username()
+        .or_else(|| std::env::var("USER").ok())
+        .or_else(|| std::env::var("LOGNAME").ok())
+        .unwrap_or_else(|| "atrium".into())
 }
 
 /// Read + parse an app's manifest given its id (uses APPS_DIR).

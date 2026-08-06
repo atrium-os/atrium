@@ -571,6 +571,7 @@ version = "0.1.0"
 dependencies = [
  "portcullis-ipc",
  "portcullis-jail",
+ "portcullis-peer",
  "portcullis-policy",
  "portcullis-toml",
 ]
