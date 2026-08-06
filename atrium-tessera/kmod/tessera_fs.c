@@ -346,12 +346,35 @@ SYSCTL_PROC(_kern_tessera, OID_AUTO, metatrace_dump,
  * in the snapshots_tree. At every commit_sb, if the count exceeds
  * this horizon, the oldest (lowest-gen) record is btree_delete'd.
  *
- * Default chosen to keep meta-reserve growth bounded under typical
- * workloads while still giving useful time-machine depth. Users can
- * tune at runtime. Setting to 0 disables retention (snapshots
- * accumulate indefinitely — only fine for small/short-lived volumes
- * or testing). */
-static int tessera_snapshot_retention = 16;
+ * Setting to 0 disables retention (snapshots accumulate indefinitely
+ * — only fine for small/short-lived volumes or testing).
+ *
+ * ★ 8, lowered from 16 (6ec960f2). This horizon is not only time-machine
+ * depth: it gates when DELETED DATA BECOMES COLLECTABLE. A retained snapshot
+ * still references the deleted files, so GC cannot free them until the record
+ * ages out — one record per commit. Measured, same workload, two runs,
+ * identical:
+ *
+ *     retention 16 -> 13 commits before reclaim, 83 packs recovered
+ *     retention  8 ->  5 commits             , 83 packs
+ *     retention  4 ->  2 commits             , 84 packs
+ *     retention  2 ->  1 commit              , 84 packs
+ *
+ * Latency is linear in the horizon and the amount reclaimed does not change,
+ * so the shorter horizon buys reclaim latency at no cost in recovered space.
+ * The only thing traded is rollback depth. 8 halves the latency while keeping
+ * a usable horizon; 2-4 would make reclaim near-immediate but leaves almost
+ * no depth, which would be deciding that snapshots are a GC mechanism rather
+ * than a user-facing feature. That decision has not been made.
+ *
+ * ★ CAVEAT worth fixing separately: this is counted in COMMITS, so the
+ * wall-clock history it preserves varies enormously with write rate — minutes
+ * on an idle volume, possibly seconds under buildkernel load, which is exactly
+ * when someone wants to roll back. If depth is meant to be a duration, records
+ * are the wrong unit and no value here fixes that.
+ *
+ * Harness: scratch/gc-retention-latency.sh */
+static int tessera_snapshot_retention = 8;
 SYSCTL_INT(_kern_tessera, OID_AUTO, snapshot_retention,
     CTLFLAG_RW, &tessera_snapshot_retention, 0,
     "Cap on retained snapshot records (oldest dropped at next commit; 0 = unlimited)");
