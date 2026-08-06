@@ -127,7 +127,7 @@ test_record_header(void)
 	rh.block_count = 1;
 	rh.crc32_body = 0xa5a5a5a5;
 
-	uint8_t buf[32];
+	uint8_t buf[TESSERA_RECORD_HEADER_SIZE];
 	CHECK(tessera_encode_record_header(&rh, buf) == TESSERA_OK);
 
 	tessera_record_header_t rh2;
@@ -251,7 +251,7 @@ test_manifest_header(void)
 	mh.chunk_size_avg = 64 * 1024;
 	mh.entry_count = 16;
 
-	uint8_t buf[32];
+	uint8_t buf[TESSERA_MANIFEST_HEADER_SIZE];
 	CHECK(tessera_encode_manifest_header(&mh, buf) == TESSERA_OK);
 
 	tessera_manifest_header_t mh2;
@@ -307,7 +307,7 @@ test_btree_node_header(void)
 	nh.key_size = 4;      /* inode_no */
 	nh.value_size = TESSERA_INODE_RECORD_SIZE;
 
-	uint8_t buf[32];
+	uint8_t buf[TESSERA_BTREE_NODE_HEADER_SIZE];
 	CHECK(tessera_encode_btree_node_header(&nh, buf) == TESSERA_OK);
 
 	tessera_btree_node_header_t nh2;

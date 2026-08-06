@@ -1,0 +1,5 @@
+---
+triple:          'arm64-apple-darwin'
+binary-path:     '/Users/girivs/src/bsd/atrium-tessera/core/build-host-san/test_btree_guards'
+relocations:     []
+...

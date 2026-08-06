@@ -113,7 +113,7 @@ tessera_decode_journal_header(const uint8_t in[TESSERA_SECTOR_SIZE],
 
 int
 tessera_encode_record_header(const tessera_record_header_t *in,
-                             uint8_t out[32])
+                             uint8_t out[TESSERA_RECORD_HEADER_SIZE])
 {
 	if (in == NULL || out == NULL) return TESSERA_EINVAL;
 	memcpy(out, in, sizeof(*in));
@@ -123,7 +123,7 @@ tessera_encode_record_header(const tessera_record_header_t *in,
 }
 
 int
-tessera_decode_record_header(const uint8_t in[32],
+tessera_decode_record_header(const uint8_t in[TESSERA_RECORD_HEADER_SIZE],
                              tessera_record_header_t *out)
 {
 	if (in == NULL || out == NULL) return TESSERA_EINVAL;
@@ -205,7 +205,7 @@ tessera_decode_pack_index_entry(const uint8_t in[TESSERA_PACK_INDEX_ENTRY_SIZE],
 
 int
 tessera_encode_blob_descriptor(const tessera_blob_descriptor_t *in,
-                               uint8_t out[16])
+                               uint8_t out[TESSERA_BLOB_DESCRIPTOR_SIZE])
 {
 	if (in == NULL || out == NULL) return TESSERA_EINVAL;
 	memcpy(out, in, sizeof(*in));
@@ -213,7 +213,7 @@ tessera_encode_blob_descriptor(const tessera_blob_descriptor_t *in,
 }
 
 int
-tessera_decode_blob_descriptor(const uint8_t in[16],
+tessera_decode_blob_descriptor(const uint8_t in[TESSERA_BLOB_DESCRIPTOR_SIZE],
                                tessera_blob_descriptor_t *out)
 {
 	if (in == NULL || out == NULL) return TESSERA_EINVAL;
@@ -227,7 +227,7 @@ tessera_decode_blob_descriptor(const uint8_t in[16],
 
 int
 tessera_encode_manifest_header(const tessera_manifest_header_t *in,
-                               uint8_t out[32])
+                               uint8_t out[TESSERA_MANIFEST_HEADER_SIZE])
 {
 	if (in == NULL || out == NULL) return TESSERA_EINVAL;
 	memcpy(out, in, sizeof(*in));
@@ -235,7 +235,7 @@ tessera_encode_manifest_header(const tessera_manifest_header_t *in,
 }
 
 int
-tessera_decode_manifest_header(const uint8_t in[32],
+tessera_decode_manifest_header(const uint8_t in[TESSERA_MANIFEST_HEADER_SIZE],
                                tessera_manifest_header_t *out)
 {
 	if (in == NULL || out == NULL) return TESSERA_EINVAL;
@@ -289,7 +289,7 @@ tessera_decode_quota_domain(const uint8_t in[TESSERA_QUOTA_DOMAIN_SIZE],
 
 int
 tessera_encode_btree_node_header(const tessera_btree_node_header_t *in,
-                                 uint8_t out[32])
+                                 uint8_t out[TESSERA_BTREE_NODE_HEADER_SIZE])
 {
 	if (in == NULL || out == NULL) return TESSERA_EINVAL;
 	memcpy(out, in, sizeof(*in));
@@ -299,7 +299,7 @@ tessera_encode_btree_node_header(const tessera_btree_node_header_t *in,
 }
 
 int
-tessera_decode_btree_node_header(const uint8_t in[32],
+tessera_decode_btree_node_header(const uint8_t in[TESSERA_BTREE_NODE_HEADER_SIZE],
                                  tessera_btree_node_header_t *out)
 {
 	if (in == NULL || out == NULL) return TESSERA_EINVAL;

@@ -45,6 +45,18 @@ extern "C" {
 #define TESSERA_REGISTRY_ENTRY_SIZE    64u
 #define TESSERA_EXTENT_ENTRY_SIZE      16u
 #define TESSERA_QUOTA_DOMAIN_SIZE     128u    /* per-directory-tree quota record */
+/* ★ These four exist so codec.h can stop writing bare literals for its output
+ * buffers. A prototype's `uint8_t out[32]` is not checked by C — it decays to a
+ * pointer — so when the record header and the btree node header grew from 32 to
+ * 64 bytes, both prototypes kept saying 32 and nothing complained. A caller that
+ * believed the header and allocated 32 bytes got a 32-byte overflow; the
+ * codec test did exactly that, and it took ASAN to notice. The static
+ * assertions below now tie each constant to its struct, so a size change breaks
+ * the build instead of the caller. */
+#define TESSERA_RECORD_HEADER_SIZE      64u    /* journal record header */
+#define TESSERA_BTREE_NODE_HEADER_SIZE  64u    /* B+tree node header; entries follow */
+#define TESSERA_MANIFEST_HEADER_SIZE    32u
+#define TESSERA_BLOB_DESCRIPTOR_SIZE    16u
 
 #define TESSERA_INODE_NULL              0u
 #define TESSERA_INODE_GC_ROOT_ANCHOR    1u
@@ -708,17 +720,17 @@ typedef struct TESSERA_PACKED {
 TESSERA_STATIC_ASSERT(sizeof(tessera_key_slot_t)          == 256,  key_slot_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_superblock_t)        == 4096, superblock_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_journal_header_t)    == 4096, journal_header_size);
-TESSERA_STATIC_ASSERT(sizeof(tessera_record_header_t)     == 64,   record_header_size);
+TESSERA_STATIC_ASSERT(sizeof(tessera_record_header_t)     == TESSERA_RECORD_HEADER_SIZE,     record_header_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_pack_header_t)       == 4096, pack_header_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_pack_index_entry_t)  == 48,   pack_index_entry_size);
-TESSERA_STATIC_ASSERT(sizeof(tessera_blob_descriptor_t)   == 16,   blob_descriptor_size);
+TESSERA_STATIC_ASSERT(sizeof(tessera_blob_descriptor_t)   == TESSERA_BLOB_DESCRIPTOR_SIZE,   blob_descriptor_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_pack_footer_t)       == 4096, pack_footer_size);
-TESSERA_STATIC_ASSERT(sizeof(tessera_manifest_header_t)   == 32,   manifest_header_size);
+TESSERA_STATIC_ASSERT(sizeof(tessera_manifest_header_t)   == TESSERA_MANIFEST_HEADER_SIZE,   manifest_header_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_chunk_record_t)      == 48,   chunk_record_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_tree_record_t)       == 40,   tree_record_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_inode_record_t)      == 144,  inode_record_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_quota_domain_t)      == 128,  quota_domain_size);
-TESSERA_STATIC_ASSERT(sizeof(tessera_btree_node_header_t) == 64,   btree_node_header_size);
+TESSERA_STATIC_ASSERT(sizeof(tessera_btree_node_header_t) == TESSERA_BTREE_NODE_HEADER_SIZE, btree_node_header_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_registry_entry_t)    == 64,   registry_entry_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_free_extent_t)       == 16,   free_extent_size);
 TESSERA_STATIC_ASSERT(sizeof(tessera_snapshot_record_t)   == 64,   snapshot_record_size);
