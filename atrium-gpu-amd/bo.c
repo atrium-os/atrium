@@ -18,7 +18,8 @@
  */
 struct amd_bo_load {
 	bus_addr_t	*pages;
-	int		 npages;
+	int		 npages;	/* segments stored (out) */
+	int		 max;		/* capacity of pages[] (in) */
 	int		 error;
 };
 
@@ -31,7 +32,9 @@ amd_bo_load_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 	l->error = error;
 	if (error != 0)
 		return;
-	for (i = 0; i < nseg && i < ATRIUM_AMD_BO_MAX_PAGES; i++)
+	/* Bound by the CALLER's array, not a global maximum: pages[] is sized
+	 * to its BO now, and this callback also serves the single-page helper. */
+	for (i = 0; i < nseg && i < l->max; i++)
 		l->pages[i] = segs[i].ds_addr;
 	l->npages = nseg;
 }
@@ -63,6 +66,7 @@ amd_dma_page_alloc(struct atrium_amd_softc *sc, struct atrium_amd_dma_page *p)
 	}
 	load.pages = &seg;
 	load.npages = 0;
+	load.max = 1;		/* &seg is ONE entry — the callback must not run past it */
 	load.error = 0;
 	err = bus_dmamap_load(p->tag, p->map, p->kva, PAGE_SIZE, amd_bo_load_cb,
 	    &load, BUS_DMA_NOWAIT);
@@ -188,13 +192,22 @@ amd_bo_backing_alloc(struct atrium_amd_softc *sc, struct atrium_amd_bo *bo,
 	rounded = round_page(size);
 	npages = rounded / PAGE_SIZE;
 
+	/* Page list sized to THIS BO. It used to be an inline array in every
+	 * struct, which is what forced a 2 MiB ceiling on all BOs and capped
+	 * the display at VGA (see ATRIUM_AMD_BO_MAX_PAGES). */
+	bo->pages = malloc((size_t)npages * sizeof(bus_addr_t), M_DEVBUF,
+	    M_WAITOK | M_ZERO);
+
 	if ((flags & ATRIUM_GPU_BO_VRAM) != 0) {
 		uint64_t vram_off;
 		int i;
 
 		/* Carve from the device VRAM pool (base-owned — see vram.c). */
-		if (amd_vram_alloc(sc, rounded, &vram_off) != 0)
+		if (amd_vram_alloc(sc, rounded, &vram_off) != 0) {
+			free(bo->pages, M_DEVBUF);
+			bo->pages = NULL;
 			return (ENOMEM);
+		}
 		mtx_lock(&sc->lock);
 		sc->bo_count++;
 		mtx_unlock(&sc->lock);
@@ -211,12 +224,17 @@ amd_bo_backing_alloc(struct atrium_amd_softc *sc, struct atrium_amd_bo *bo,
 	    BUS_SPACE_MAXADDR, BUS_SPACE_MAXADDR, NULL, NULL,
 	    rounded, npages, PAGE_SIZE,	/* maxsize, nsegments, maxsegsz */
 	    0, NULL, NULL, &dmat);
-	if (err != 0)
+	if (err != 0) {
+		free(bo->pages, M_DEVBUF);
+		bo->pages = NULL;
 		return (err);
+	}
 	err = bus_dmamem_alloc(dmat, &kva,
 	    BUS_DMA_WAITOK | BUS_DMA_ZERO | BUS_DMA_COHERENT, &dmamap);
 	if (err != 0) {
 		bus_dma_tag_destroy(dmat);
+		free(bo->pages, M_DEVBUF);
+		bo->pages = NULL;
 		return (ENOMEM);
 	}
 	bo->kva = kva;
@@ -226,6 +244,7 @@ amd_bo_backing_alloc(struct atrium_amd_softc *sc, struct atrium_amd_bo *bo,
 
 	load.pages = bo->pages;
 	load.npages = 0;
+	load.max = npages;
 	load.error = 0;
 	err = bus_dmamap_load(dmat, dmamap, kva, rounded, amd_bo_load_cb, &load,
 	    BUS_DMA_NOWAIT);
@@ -234,6 +253,8 @@ amd_bo_backing_alloc(struct atrium_amd_softc *sc, struct atrium_amd_bo *bo,
 		bus_dma_tag_destroy(dmat);
 		bo->kva = NULL;
 		bo->dmat = NULL;
+		free(bo->pages, M_DEVBUF);
+		bo->pages = NULL;
 		return (err != 0 ? err : EIO);
 	}
 	bo->npages = load.npages;
@@ -279,6 +300,8 @@ amd_bo_backing_free(struct atrium_amd_bo *bo)
 		bus_dma_tag_destroy(bo->dmat);
 		bo->dmat = NULL;
 	}
+	free(bo->pages, M_DEVBUF);	/* free(NULL) is a no-op */
+	bo->pages = NULL;
 }
 
 /*

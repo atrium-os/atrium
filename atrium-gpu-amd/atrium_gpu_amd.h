@@ -373,9 +373,21 @@ struct atrium_amd_vm {
  * Each binding holds a reference (vm_fp) on its VM, so every VM the BO is mapped
  * into outlives the BO and fo_close can unmap from all of them.
  */
-#define ATRIUM_AMD_BO_MAX_PAGES	512	/* largest BO = 2 MiB; a 640x480x4 scanout
-					 * FB is 300 pages, so a display FB must
-					 * fit (small GPU BOs use a handful). */
+/*
+ * Upper bound on ONE BO, as a sanity check on a userspace-supplied size — not a
+ * design limit. The page list is allocated to fit the BO (see bo->pages), so a
+ * scanout is bounded by memory, not by a compiled-in array.
+ *
+ * It used to be 512 pages (2 MiB) because pages[] was an inline fixed array
+ * sized around "a 640x480x4 scanout FB is 300 pages". That silently capped the
+ * display at VGA: moving the modeled monitor to 1080p made frescod die at
+ * startup with EINVAL, because a 1920x1080x4 scanout is 2025 pages. 4K is 8100
+ * and 8K is 32400 — none of which can be an inline array in every BO.
+ *
+ * 64 Ki pages = 256 MiB: comfortably above an 8K RGBA scanout (132 MiB) while
+ * still refusing a nonsense request outright rather than trying to honour it.
+ */
+#define ATRIUM_AMD_BO_MAX_PAGES	(64 * 1024)
 #define ATRIUM_AMD_BO_MAX_BIND	8	/* VMs a BO can be shared into at once */
 
 /* One mapping of a BO into a VM: its address space, a held ref on it, and the
@@ -396,7 +408,8 @@ struct atrium_amd_bo {
 	int		 npages;	/* pages backing this BO */
 	int		 vram;		/* 1 = VRAM-resident (pages[] are VRAM offsets,
 					 * no kva/dmat); 0 = System/GTT (bus_dma) */
-	bus_addr_t	 pages[ATRIUM_AMD_BO_MAX_PAGES]; /* per-page bus addrs / VRAM offsets */
+	bus_addr_t	*pages;		/* per-page bus addrs / VRAM offsets;
+					 * npages entries, allocated with the BO */
 	uint64_t	 size;
 };
 
