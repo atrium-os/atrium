@@ -952,22 +952,24 @@ The observation channels, strongest first:
 
 1. **Physical free space** (`statfs`). Write a candidate, fsync,
    re-read free space. Unchanged → dedup hit. Noise-free.
-   Closed by quota-scoped statfs (tessera-quotas.md §3.6) **on a
-   mount carrying a whole-FS quota** — which for a jail means the
-   jail's own Tessera volume, not a quota'd subdirectory of a
-   shared one. ⚠ A quota'd SUBDIRECTORY does not close it: statfs
-   scoping is per-mount not per-path, and a jail's `df` is
-   answered by unionfs, which passes the underlying pool's free
-   space through (measured 2026-08-04). Per-app volumes were
-   verified to close it. See tessera-quotas.md §3.6.2 — RESOLVED.
-   Measured on a shared volume, 4 MiB duplicate = 5 blocks vs
-   4 MiB novel = 1039 blocks, three rounds, zero variance — the
-   oracle is open and noise-free there.
-   §20.2's `deferred` policy is a second lever and IS implemented
-   as of #114 (an earlier note here said the field was never read
-   by the kmod; that is no longer true). It is gated behind
-   `kern.tessera.dedup_deferred_enable`, armed per domain, and
-   domains default to `GLOBAL` — see tessera-quotas.md §3.6.2.
+   Closed for a jail by §20.2's **`deferred` policy** on every
+   domain the jail can write to — measured 2026-08-06: under
+   `GLOBAL` a 4 MiB duplicate costs 20 K vs 4156 K for novel
+   content (208×, oracle open); under `DEFERRED` both cost
+   4156 K, content-independent. Dedup is preserved, moved off the
+   write path: the duplicate extents are reclaimed by the drain
+   (5 duplicates consumed 20700 K, recovered 20740 K after
+   drain + GC, files intact). `deferred` IS implemented as of
+   #114 — an earlier note here said the kmod never read the
+   field, which is no longer true — but it is gated behind
+   `kern.tessera.dedup_deferred_enable` and domains default to
+   `GLOBAL`, so it must be armed.
+   A per-app Tessera volume also closes it and is stronger, but a
+   volume is the dedup boundary, so it is not the general answer.
+   ⚠ A quota'd SUBDIRECTORY closes nothing: statfs scoping is
+   per-mount not per-path, and a jail's `df` is answered by
+   unionfs, which passes the pool's free space through.
+   See tessera-quotas.md §3.6.2.
 2. **Write/fsync timing.** A synchronous-dedup hit skips the
    pack append; latency is content-dependent. Closed by the
    `deferred` policy below.
