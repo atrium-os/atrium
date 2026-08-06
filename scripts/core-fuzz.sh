@@ -44,7 +44,7 @@ while [ $# -gt 0 ]; do
         *)             TARGETS="$TARGETS $1"; shift ;;
     esac
 done
-[ -n "$TARGETS" ] || TARGETS="fuzz_manifest fuzz_pack"
+[ -n "$TARGETS" ] || TARGETS="fuzz_manifest fuzz_pack fuzz_btree fuzz_superblock"
 
 SRCS="error.c hash.c crc.c codec.c cdc.c btree.c manifest.c pack.c journal.c
       extent.c gc.c volume.c quota.c quota_store.c
@@ -125,9 +125,15 @@ EOF
             # tested nothing. Any target with a minimum input size must raise
             # this explicitly. Check `lim:` in the log against the parser's
             # minimum before believing a run.
+            # Each target's minimum viable input, NOT a guess:
+            #   fuzz_pack        2 sectors (header + footer)
+            #   fuzz_btree       2 control bytes + >=1 sector, more = deeper trees
+            #   fuzz_superblock  1 control byte + the two SB sectors
             case "$t" in
-                fuzz_pack) MAXLEN=32768 ;;
-                *)         MAXLEN=4096 ;;
+                fuzz_pack)       MAXLEN=32768 ;;
+                fuzz_btree)      MAXLEN=32768 ;;
+                fuzz_superblock) MAXLEN=16384 ;;
+                *)               MAXLEN=4096 ;;
             esac
             echo
             echo "== EXPLORE $t: ${SECS}s (max_len=$MAXLEN) =="
