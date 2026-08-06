@@ -126,7 +126,17 @@ for arg in "$@"; do
                       -device ivshmem-doorbell,vectors=2,chardev=ivshmem"
             ;;
         --virtio-gpu)
-            VIRTIO_GPU_ARGS="-device virtio-gpu-pci"
+            # ★ virtio-gpu-gl-pci with hostmem/blob, NOT plain virtio-gpu-pci.
+            # docs/spec/atrium-gpu-host-contract.md: the kmod REQUIRES
+            # VIRTIO_GPU_F_RESOURCE_BLOB and a host-visible shared-memory
+            # region. Plain virtio-gpu-pci advertises neither, so the driver
+            # attaches and then rejects the device:
+            #     atrium_virtio_gpu0: host does not advertise
+            #       VIRTIO_GPU_F_RESOURCE_BLOB
+            #     device_attach: atrium_virtio_gpu0 attach returned 45
+            # and no /dev/atrium-gpu0 appears — which reads like a driver bug
+            # and is a host-configuration one.
+            VIRTIO_GPU_ARGS="-device virtio-gpu-gl-pci,hostmem=1G,blob=on"
             ;;
         --gpusim)
             # Out-of-process gpusim RDNA functional model: a thin pure-C QEMU PCI
@@ -282,6 +292,28 @@ elif [ "$WANT_TABLET" = 1 ]; then
     echo "error: --tablet requires --display" >&2
     exit 1
 fi
+
+# ★ --virtio-gpu REQUIRES --display. The Atrium GPU driver needs
+# VIRTIO_GPU_F_RESOURCE_BLOB, which only virtio-gpu-gl-pci advertises, and QEMU
+# refuses that device unless the display backend has OpenGL:
+#     qemu: -device virtio-gpu-gl-pci,...: The display backend does not have
+#           OpenGL support enabled
+# Headless (-display none) cannot satisfy it on macOS, where the GL-capable
+# backend is the Cocoa window. Fail here with the fix rather than letting QEMU
+# die after the caller has already torn down a working VM.
+case "$VIRTIO_GPU_ARGS" in
+  *virtio-gpu-gl*)
+    if [ -n "$NOGRAPHIC" ]; then
+        echo "error: --virtio-gpu requires --display" >&2
+        echo "  The Atrium GPU driver needs VIRTIO_GPU_F_RESOURCE_BLOB" >&2
+        echo "  (docs/spec/atrium-gpu-host-contract.md), which only" >&2
+        echo "  virtio-gpu-gl-pci provides, and QEMU will not create that" >&2
+        echo "  device without a GL-capable display backend." >&2
+        echo "  Use:  ./scripts/run-vm.sh --virtio-gpu --display" >&2
+        exit 1
+    fi
+    ;;
+esac
 
 KGDB_ARGS=""
 if [ "$WANT_KGDB" = 1 ]; then
