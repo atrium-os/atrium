@@ -126,6 +126,15 @@ for arg in "$@"; do
                       -device ivshmem-doorbell,vectors=2,chardev=ivshmem"
             ;;
         --virtio-gpu)
+            # ★ THIS IS NOT THE DISPLAY PATH. Fresco/Forum render through
+            # CARILLON — the paravirtualised doorbell transport — i.e.
+            # `--gpu` plus fresco-server (~/src/fresco) on the host, over
+            # ivshmem-doorbell on /tmp/fresco-shmem.sock. See RUNBOOK.md,
+            # "Boot with GPU server attached". --virtio-gpu is D0 native-driver
+            # bring-up and the header above already says "no UI"; reaching for
+            # it to run a desktop means debugging a driver that is not in the
+            # display path at all.
+            #
             # ★ virtio-gpu-gl-pci with hostmem/blob, NOT plain virtio-gpu-pci.
             # docs/spec/atrium-gpu-host-contract.md: the kmod REQUIRES
             # VIRTIO_GPU_F_RESOURCE_BLOB and a host-visible shared-memory
