@@ -26,13 +26,14 @@ use std::io::BufReader;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use portcullis_ipc::{
-    read_request, write_response, GovSignal, Request, Response, PROTO_VERSION, SOCKET_PATH,
+    read_request, write_response, GovSignal, Request, Response, PROTO_VERSION,
+    SERVICE_SOCKET_PATH, SOCKET_PATH,
 };
 use portcullis_policy::{compute_delta, hash_manifest, now_iso8601, Grant, Policy};
 
@@ -74,7 +75,15 @@ fn main() -> ExitCode {
             }
         }
     }
-    let socket_path = socket_path.unwrap_or_else(|| PathBuf::from(SOCKET_PATH));
+    /* Bind under the per-service DIRECTORY (/atrium/sockets/portcullis/), not
+     * loose in the shared sockets root. A jail reaches a service by nullfs-
+     * mounting that service's directory — mount_nullfs cannot mount a socket
+     * node — so while the socket sat directly in /atrium/sockets/ there was no
+     * way to give a jailed app the daemon WITHOUT also exposing every other
+     * service's socket. That is why the dock, which IS the app launcher, could
+     * not reach portcullisd to launch anything. The flat path stays as a
+     * symlink below, so every existing client keeps working untouched. */
+    let socket_path = socket_path.unwrap_or_else(|| PathBuf::from(SERVICE_SOCKET_PATH));
 
     /* Stale-socket cleanup: a previous crashed daemon may have left
      * the file behind; bind() refuses to overwrite. */
@@ -99,6 +108,16 @@ fn main() -> ExitCode {
                         std::fs::Permissions::from_mode(0o666)) {
         eprintln!("portcullisd: chmod {}: {e}", socket_path.display());
         return ExitCode::from(1);
+    }
+    /* Compat: keep the historical flat path working for every client that
+     * still holds SOCKET_PATH (the CLI, scripts, anything outside a jail).
+     * A symlink, not a second listener — one accept loop, one socket. */
+    if socket_path == Path::new(SERVICE_SOCKET_PATH) {
+        let _ = std::fs::remove_file(SOCKET_PATH);
+        if let Err(e) = std::os::unix::fs::symlink(SERVICE_SOCKET_PATH, SOCKET_PATH) {
+            eprintln!("portcullisd: WARNING could not link {SOCKET_PATH} -> \
+                {SERVICE_SOCKET_PATH}: {e} (clients using the old path will fail)");
+        }
     }
     eprintln!("portcullisd: listening on {} (multi-tenant)",
         socket_path.display());
@@ -234,6 +253,45 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
         if let Request::Launch { app_id, bypass_policy } = req {
             handle_launch(app_id, bypass_policy, &user, &shared,
                           &mut writer, &reader)?;
+            continue;
+        }
+        /* Catalog is gated on the PEER UID like the broker verbs below, not on
+         * per-tenant policy: the caller is identified through the launch
+         * registry (uid -> app-id) and must hold `app-launch` in its INSTALLED
+         * manifest. Nothing the caller sends is trusted here. */
+        if matches!(req, Request::Catalog) {
+            let resp = match portcullis_peer::AppRegistry::load(
+                              portcullis_peer::DEFAULT_REGISTRY)
+                          .unwrap_or_default()
+                          .resolve(uid)
+                          .map(|(_user, app)| app.to_string())
+            {
+                Some(app) if launch::app_may_launch_apps(&app) => {
+                    let apps = launch::catalog();
+                    eprintln!("portcullisd: catalog -> {app} (uid {uid}): {} app(s)",
+                              apps.len());
+                    Response::CatalogList { apps }
+                }
+                Some(app) => {
+                    eprintln!("portcullisd: catalog DENIED to {app} (uid {uid}): \
+                               no app-launch capability");
+                    Response::Error { message:
+                        "cap.app_launch.denied: this app may not list installed apps"
+                        .into() }
+                }
+                /* Not in the registry → not a Portcullis-launched app. Default-deny
+                 * is the rule for every capability-enforcing service (peer.rs).
+                 * Logged like the other two outcomes: a silent refusal here is
+                 * indistinguishable, from the daemon's side, from a client that
+                 * never called — and the client just sees an empty catalog. */
+                None => {
+                    eprintln!("portcullisd: catalog DENIED to uid {uid}: \
+                               not a launched app (no registry entry)");
+                    Response::Error { message:
+                        "cap.app_launch.denied: caller is not a launched app".into() }
+                }
+            };
+            write_response(&mut writer, &resp)?;
             continue;
         }
         /* Memory-governor broker verbs are gated on the PEER UID (the caller must
@@ -714,6 +772,12 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
             message: "Hello already exchanged".into(),
         },
         Request::Ping => Response::Pong,
+        /* Routed in serve(), which has the peer uid this verb is gated on.
+         * Reaching here would mean that routing was removed — refuse rather
+         * than fall through to a policy path that cannot check the caller. */
+        Request::Catalog => Response::Error {
+            message: "Catalog must be handled on the peer-uid path".into(),
+        },
         Request::Authorize { app_id, manifest_hash, requested } => {
             let mut s = shared.lock().unwrap();
             let tp = match s.get_or_load(user) {

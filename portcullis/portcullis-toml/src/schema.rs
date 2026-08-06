@@ -113,6 +113,15 @@ pub struct Capabilities {
     /// but still restricted so a random app can't drive the shell.
     #[serde(rename = "forum-control")]
     pub forum_control: Option<bool>,
+    /// Ask portcullisd to list the installed apps and to launch one — the app
+    /// LAUNCHER's grant (Forum's dock today). It is only ever the requester: the
+    /// TCB still does the manifest verify, the policy check, the per-app uid and
+    /// the jail, exactly as for a launch from the CLI. Restricted, and strictly
+    /// narrower than handing an app the app tree: the daemon decides what the
+    /// catalog contains, so the holder learns what it is allowed to launch and
+    /// nothing else about the filesystem.
+    #[serde(rename = "app-launch")]
+    pub app_launch: Option<bool>,
     /// Unknown / future keys. Validator warns; doesn't reject.
     #[serde(flatten)]
     pub extra:      BTreeMap<String, toml::Value>,
@@ -213,6 +222,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         audio_monitor:    ovr.audio_monitor.or(base.audio_monitor),
         window_management: ovr.window_management.or(base.window_management),
         forum_control:    ovr.forum_control.or(base.forum_control),
+        app_launch:       ovr.app_launch.or(base.app_launch),
         extra:            {
             let mut e = base.extra.clone();
             for (k, v) in &ovr.extra { e.insert(k.clone(), v.clone()); }

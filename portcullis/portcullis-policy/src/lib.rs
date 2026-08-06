@@ -155,6 +155,7 @@ pub struct CapabilityDelta {
     pub audio_monitor:   bool,
     pub window_management: bool,
     pub forum_control:   bool,
+    pub app_launch:      bool,
     pub tessera_cas_read: bool,
     /// Filesystem paths in manifest but not in granted list.
     pub filesystem_added: Vec<String>,
@@ -180,6 +181,7 @@ impl CapabilityDelta {
             && !self.audio_monitor
             && !self.window_management
             && !self.forum_control
+            && !self.app_launch
             && !self.tessera_cas_read
             && self.filesystem_added.is_empty()
             && self.fonts_added.is_empty()
@@ -206,6 +208,7 @@ impl CapabilityDelta {
         if self.audio_monitor   { out.push("Record the system audio output (everything you hear)".into()); }
         if self.window_management { out.push("Manage other apps' windows and route input (the session shell)".into()); }
         if self.forum_control   { out.push("Drive the window manager (a Forum chrome app)".into()); }
+        if self.app_launch      { out.push("List the installed apps and ask to launch them".into()); }
         if self.tessera_cas_read{ out.push("Read the global Tessera CAS (privileged)".into()); }
         for p in &self.filesystem_added {
             out.push(format!("Read and write {p}"));
@@ -283,6 +286,7 @@ pub fn compute_delta(
     bool_cap!(audio_monitor);
     bool_cap!(window_management);
     bool_cap!(forum_control);
+    bool_cap!(app_launch);
     bool_cap!(tessera_cas_read);
 
     if let Some(req_paths) = &requested.filesystem {
@@ -342,6 +346,7 @@ mod tests {
             audio_monitor: None,
             window_management: None,
             forum_control: None,
+            app_launch: None,
             extra:      Default::default(),
         }
     }

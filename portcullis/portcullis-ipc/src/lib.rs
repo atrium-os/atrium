@@ -29,6 +29,34 @@ pub use fdpass::{recv_fds, send_fds};
 /// processes inside session jails without an extra mount entry.
 pub const SOCKET_PATH: &str = "/atrium/sockets/portcullis.sock";
 
+/// The same socket under the per-service DIRECTORY convention:
+/// `/atrium/sockets/<service>/<service>.sock`.
+///
+/// This exists because a jail cannot be given the flat path above.
+/// `mount_nullfs` refuses to mount a unix-socket node ("must be either a file or
+/// directory"), so every capability-granted socket is reached by mounting the
+/// service's own directory — see portcullis-jail's `apply_socket`. With the
+/// socket sitting loose in the shared sockets root there is no directory to
+/// mount that wouldn't also expose every OTHER service's socket, which is
+/// exactly the capability granularity that design protects.
+///
+/// portcullisd binds HERE and leaves the flat path as a symlink, so existing
+/// clients (the CLI, anything holding `SOCKET_PATH`) keep working unchanged.
+pub const SERVICE_SOCKET_PATH: &str = "/atrium/sockets/portcullis/portcullis.sock";
+
+/// Where a client should look for portcullisd: the per-service path first (the
+/// only one that exists inside a jail), then the flat compat path.
+///
+/// Returning a path that exists — rather than one that merely might — keeps the
+/// in-jail failure honest: if neither is present the caller reports "not
+/// reachable" instead of a confusing ENOENT on a path that was never the right
+/// one for its context.
+pub fn resolve_socket_path() -> Option<&'static str> {
+    [SERVICE_SOCKET_PATH, SOCKET_PATH]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+}
+
 /// Protocol version — bumped if a wire-incompatible change lands.
 /// Clients send their version in `Request::Hello`; mismatched versions
 /// get `Response::ProtoMismatch` and the daemon closes the connection.
@@ -91,6 +119,16 @@ pub enum Request {
         app_id:        String,
         bypass_policy: bool,
     },
+
+    /// "What may I launch?" — the installed-app catalog, for the launcher UI
+    /// (Forum's dock). Requires the caller's manifest to hold `app-launch`.
+    ///
+    /// The daemon answers from its own view of the app tree rather than the
+    /// caller reading the tree itself. That is the point: a jailed launcher
+    /// never needs the app directory mounted, so it learns exactly what it may
+    /// launch and nothing else about the filesystem — and the TCB stays the one
+    /// deciding what is listed.
+    Catalog,
 
     /// A memory governor (atrium-memoryd) asks portcullisd to signal a
     /// jaild-created jail's processes — the reclaim cascade. portcullisd checks
@@ -160,6 +198,20 @@ pub enum Request {
     },
 }
 
+/// One installed app, as the daemon is willing to describe it to a launcher.
+///
+/// Deliberately just what a launcher must draw and act on — id, name, blurb,
+/// icon. No entry path, no bundle hash, no capability set: the launcher only
+/// ever names an app back to the daemon, so nothing here needs to describe how
+/// it would run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogEntry {
+    pub id:          String,
+    pub name:        String,
+    pub description: Option<String>,
+    pub icon:        Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
@@ -192,6 +244,9 @@ pub enum Response {
     /// drains the daemon's BufReader so the cmsg's 1-byte payload
     /// can't be silently swallowed by a buffered read.
     ReadyForFds,
+    /// Catalog → the apps this caller may launch.
+    CatalogList { apps: Vec<CatalogEntry> },
+
     /// Launch → policy gate refused. `delta` is the human-readable
     /// list of capabilities the user hasn't granted yet (suitable
     /// for showing in a prompt UI). Distinct from LaunchFailed —

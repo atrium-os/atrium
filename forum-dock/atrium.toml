@@ -13,6 +13,11 @@ icon        = "files"
 [capabilities]
 graphics      = "fresco"
 forum-control = true
+# The dock IS the launcher: this is what lets it ask portcullisd for the
+# installed-app catalog and request a launch. Without it a jailed dock can do
+# neither — it cannot even reach the daemon. It stays only the requester; the
+# TCB does the verify, the policy check, the uid and the jail.
+app-launch    = true
 network       = "none"
 
 [supervision]

@@ -520,3 +520,40 @@ fn umount_silent(p: &Path) -> std::io::Result<()> {
 /// transitively via build()/render() but not directly here anymore.
 #[allow(dead_code)]
 fn _silence(s: &str) -> String { jail_name_from_app_id(s) }
+
+/// The installed-app catalog, as the daemon is willing to describe it.
+///
+/// Reads the app tree that only the TCB can see, so a jailed launcher never
+/// needs `/var/lib/atrium/apps` mounted — it asks for this instead. Apps whose
+/// manifest is unreadable or unparseable are skipped rather than reported: a
+/// broken bundle is not something a launcher can act on, and listing it would
+/// only offer the human a button that cannot work.
+pub fn catalog() -> Vec<portcullis_ipc::CatalogEntry> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(APPS_DIR) else { return out };
+    for e in entries.flatten() {
+        let Ok(text) = fs::read_to_string(e.path().join("atrium.toml")) else { continue };
+        let Ok(m) = Manifest::from_str(&text) else { continue };
+        out.push(portcullis_ipc::CatalogEntry {
+            id:          m.app.id.clone(),
+            name:        m.app.name.clone(),
+            description: m.app.description.clone(),
+            icon:        m.app.icon.clone(),
+        });
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// Does `app_id`'s installed manifest hold the `app-launch` capability?
+///
+/// The gate for [`catalog`]: the caller is identified by peer uid through the
+/// launch registry, so this reads the capability off the INSTALLED manifest, not
+/// off anything the caller sent. An app that is not in the registry at all (not
+/// Portcullis-launched) resolves to no app-id and is refused by the caller.
+pub fn app_may_launch_apps(app_id: &str) -> bool {
+    let path = PathBuf::from(APPS_DIR).join(app_id).join("atrium.toml");
+    let Ok(text) = fs::read_to_string(path) else { return false };
+    let Ok(m) = Manifest::from_str(&text) else { return false };
+    m.capabilities.app_launch == Some(true)
+}

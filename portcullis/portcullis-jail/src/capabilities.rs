@@ -67,6 +67,9 @@ pub fn apply_all(
     if caps.forum_control == Some(true) {
         apply_forum_control(jc, opts);
     }
+    if caps.app_launch == Some(true) {
+        apply_app_launch(jc, opts);
+    }
     Ok(())
 }
 
@@ -106,6 +109,19 @@ pub fn apply_window_management(jc: &mut JailConfig, opts: &BuildOpts) {
 /// ask forum-wm, which is the sole `window-management` holder.
 pub fn apply_forum_control(jc: &mut JailConfig, opts: &BuildOpts) {
     apply_socket("forum-ctl.sock", jc, opts);
+}
+
+/// `app-launch` — the app LAUNCHER (Forum's dock). Mounts portcullisd's own
+/// socket directory so the holder can ask the daemon for the catalog and request
+/// a launch.
+///
+/// Without this an app that IS the launcher cannot do either job: portcullisd
+/// lives at `/atrium/sockets/portcullis/` and nothing else in a jail reaches it.
+/// Note what is deliberately NOT mounted — the app tree. The catalog arrives
+/// over this socket, so the launcher never gets to read `/var/lib/atrium/apps`,
+/// and the daemon stays the one deciding what it may see and start.
+pub fn apply_app_launch(jc: &mut JailConfig, opts: &BuildOpts) {
+    apply_socket("portcullis.sock", jc, opts);
 }
 
 /// Grant a service socket into the jail.
@@ -260,6 +276,29 @@ mod tests {
         let srcs: Vec<_> = j.mounts.iter().map(|m| m.src.clone()).collect();
         assert!(srcs.contains(&PathBuf::from("/atrium/sockets/fresco-wm")));
         assert!(srcs.contains(&PathBuf::from("/atrium/sockets/forum-ctl")));
+    }
+
+    #[test]
+    fn app_launch_mounts_the_portcullis_socket_and_not_the_app_tree() {
+        let mut j = jc();
+        apply_app_launch(&mut j, &opts());
+        assert_eq!(j.mounts.len(), 1);
+        assert_eq!(j.mounts[0].src, PathBuf::from("/atrium/sockets/portcullis"));
+        assert_eq!(j.mounts[0].dst,
+            PathBuf::from("/var/lib/atrium/jails/test/atrium/sockets/portcullis"));
+        // The point of routing the catalog through the daemon: the launcher gets
+        // the socket and NOT the app tree. If this ever starts mounting
+        // /var/lib/atrium/apps, the capability has quietly become much broader.
+        assert!(!j.mounts.iter().any(|m| m.src.starts_with("/var/lib/atrium/apps")));
+    }
+
+    /// The chrome caps must NOT drag the launcher grant in with them: a bar that
+    /// only drives the WM has no business reaching portcullisd.
+    #[test]
+    fn forum_control_alone_does_not_reach_portcullisd() {
+        let mut j = jc();
+        apply_forum_control(&mut j, &opts());
+        assert!(!j.mounts.iter().any(|m| m.src == PathBuf::from("/atrium/sockets/portcullis")));
     }
 
     #[test]

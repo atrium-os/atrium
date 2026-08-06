@@ -1,9 +1,11 @@
 //! forum-dock — Forum's launcher, an ordinary graphics-only app.
 //!
-//! It holds no special capability. It lists the installed apps and, on activate,
-//! REQUESTS a launch from portcullisd (the TCB), which does the verify → allocate
-//! uid → register → jail dance. The dock never launches anything itself; launching
-//! is a request authorized by the user's grants (docs/spec/forum.md §6).
+//! It holds `app-launch` — the grant to ASK portcullisd for the installed-app
+//! catalog and to request a launch. That is all it is: the requester. portcullisd
+//! (the TCB) still does the verify → allocate uid → register → jail dance, and the
+//! user's grants still authorize it (docs/spec/forum.md §6). The capability exists
+//! because a jailed dock can reach the daemon no other way, and because the catalog
+//! coming over that socket means the launcher never needs the app tree mounted.
 //!
 //! Usage:
 //!   forum-dock              # list installed apps
@@ -165,7 +167,21 @@ fn render_dock() -> io::Result<()> {
         Ok("dark") => Semantic::DARK,
         _ => Semantic::LIGHT,
     };
-    let mut apps = catalog(&apps_dir());
+    // ★ Ask the daemon first, filesystem second. A jailed dock has no app tree
+    // (deliberately), so the old filesystem-only scan came back empty and the
+    // fallback below quietly drew FAKE apps — a launcher that looks like it is
+    // working. Say what happened instead of papering over it.
+    let (mut apps, src) = forum_dock::catalog_resolved(&apps_dir());
+    match (&src, apps.is_empty()) {
+        (forum_dock::CatalogSource::Unavailable, _) => eprintln!(
+            "forum-dock: NO CATALOG — portcullisd is not reachable and {} is not \
+             readable. Drawing placeholders; nothing here can launch. (A jailed \
+             dock needs the `app-launch` capability.)",
+            apps_dir().display()
+        ),
+        (_, true) => eprintln!("forum-dock: catalog from {src:?} is empty — no apps installed"),
+        (_, false) => eprintln!("forum-dock: {} app(s) from {src:?}", apps.len()),
+    }
     if apps.is_empty() {
         apps = sample_apps();
     }
@@ -191,9 +207,9 @@ fn main() -> io::Result<()> {
     match args.first().map(String::as_str) {
         None => render_dock(),
         Some("list") => {
-            let apps = catalog(&apps_dir());
+            let (apps, src) = forum_dock::catalog_resolved(&apps_dir());
             if apps.is_empty() {
-                println!("forum-dock: no apps installed under {}", apps_dir().display());
+                println!("forum-dock: no apps ({src:?}) — daemon unreachable or nothing installed");
             }
             for a in apps {
                 let desc = a.description.unwrap_or_default();
@@ -220,10 +236,19 @@ fn main() -> io::Result<()> {
 /// portcullis CLI's wire dance: Hello → Launch → ReadyForFds → hand over stdio
 /// (SCM_RIGHTS) → LaunchExit.
 fn launch(app_id: &str) -> io::Result<()> {
-    let mut s = match UnixStream::connect(SOCKET_PATH) {
+    // Resolve the daemon's socket rather than hardcoding the flat path: inside a
+    // jail only the per-service directory is mounted (by `app-launch`), and the
+    // flat /atrium/sockets/portcullis.sock does not exist there at all.
+    let Some(path) = portcullis_ipc::resolve_socket_path() else {
+        eprintln!("forum-dock: portcullisd not reachable (looked for {} and {}). \
+                   A jailed dock needs the `app-launch` capability.",
+                  portcullis_ipc::SERVICE_SOCKET_PATH, SOCKET_PATH);
+        std::process::exit(1);
+    };
+    let mut s = match UnixStream::connect(path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("forum-dock: portcullisd not reachable at {SOCKET_PATH}: {e}");
+            eprintln!("forum-dock: portcullisd not reachable at {path}: {e}");
             std::process::exit(1);
         }
     };
