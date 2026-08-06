@@ -11,10 +11,17 @@
 //! PRIVILEGE INVARIANT (see portcullis.md §9.0, insula.md): no app runs as
 //! root — every app runs under a dedicated, non-root, non-human per-app uid
 //! (50000+) inside its jail. Root is the TCB's alone (jaild + the privileged
-//! launch step). The connecting human is the OWNER (recorded in the launch
-//! registry); the app executes as its own uid that services peer-cred back to
-//! `(owner, app_id)`. Implemented in `launch::resolve_app_uid`. (Longer-term the
-//! privileged passwd/jail steps consolidate into jaild, the audited broker.)
+//! launch step). The owning HUMAN is recorded in the launch registry; the app
+//! executes as its own uid that services peer-cred back to `(owner, app_id)`.
+//! Implemented in `launch::resolve_app_uid`. (Longer-term the privileged
+//! passwd/jail steps consolidate into jaild, the audited broker.)
+//!
+//! The owner is not simply the connecting peer. When the caller is itself a
+//! jailed app — a launcher like Forum's dock — it is the REQUESTER, and the
+//! launch belongs to the human that launcher belongs to. `launch_owner` reads
+//! that from the registry, which makes it transitive down a chain of launchers.
+//! Deliberately scoped to launches: Grant/Revoke stay on the peer identity, or
+//! an app could write capabilities into its owner's policy and approve itself.
 //!
 //! Concurrency: one thread per accepted connection. Per-tenant
 //! policy state lives behind `Arc<Mutex<Tenants>>`; lock is held
@@ -215,6 +222,20 @@ fn username_for_uid(uid: u32) -> std::io::Result<String> {
 
 // ── connection handling ──────────────────────────────────────────
 
+/// Who OWNS an app launched over this connection.
+///
+/// `peer_user` is getpeereid's answer — who is talking to us. `registry_owner`
+/// is set when that uid is itself a Portcullis-launched app, and is the owner
+/// recorded when THAT app was launched.
+///
+/// A launcher is the requester, not the owner, so an app's launches belong to
+/// the human the launcher belongs to. Because each app's registry entry already
+/// carries the owner it was launched under, resolving one level is transitively
+/// correct — a chain of launchers all land on the human at its root.
+fn launch_owner(peer_user: &str, registry_owner: Option<&str>) -> String {
+    registry_owner.unwrap_or(peer_user).to_string()
+}
+
 fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()> {
     /* Identify the peer before reading any protocol bytes. If we
      * can't, refuse the connection — we have no way to know whose
@@ -222,6 +243,32 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
     let (uid, _gid) = peer_eid(&stream)?;
     let user = username_for_uid(uid)?;
     eprintln!("portcullisd: conn from uid={uid} ({user})");
+
+    /* ★ Owner inheritance (#118). getpeereid answers "who is talking to me",
+     * which is the right owner when a human runs the CLI and the WRONG one
+     * when the caller is itself a jailed app: a launcher is the REQUESTER, not
+     * the owner. Without this, an app the dock launches comes out owned by the
+     * dock's per-app uid — so the grant authorizing it has to live in a robot
+     * identity's policy file instead of the human's, the launch registry
+     * records an app as the owner of an app, and a prompt UI would have no
+     * human to ask.
+     *
+     * The registry already maps uid -> (owner, app-id), and the requesting
+     * app's own entry records the owner it was launched under. So resolving
+     * one level here is transitively correct: a chain of launchers all resolve
+     * to the human at the root of the chain, however deep it gets.
+     *
+     * ONLY the launch path uses this. Grant/Revoke stay on the peer identity
+     * on purpose — a jailed app that inherited its owner for Grant could write
+     * capabilities into the HUMAN's policy and approve itself. Requesting a
+     * launch on the owner's behalf is delegation; editing the owner's policy
+     * is escalation. */
+    let registry = portcullis_peer::AppRegistry::load(portcullis_peer::DEFAULT_REGISTRY)
+        .unwrap_or_default();
+    if let Some((reg_owner, app)) = registry.resolve(uid) {
+        eprintln!("portcullisd: uid={uid} is app {app}; launches inherit owner={reg_owner}");
+    }
+    let owner = launch_owner(&user, registry.resolve(uid).map(|(o, _)| o));
 
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
@@ -251,7 +298,10 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             Err(e) => return Err(e),
         };
         if let Request::Launch { app_id, bypass_policy } = req {
-            handle_launch(app_id, bypass_policy, &user, &shared,
+            /* `owner`, not `user`: see the inheritance note above. This is both
+             * whose policy authorizes the launch and who the launched app is
+             * recorded as belonging to. */
+            handle_launch(app_id, bypass_policy, &owner, &shared,
                           &mut writer, &reader)?;
             continue;
         }
@@ -936,5 +986,35 @@ mod tests {
         let (uid, _gid) = peer_eid(&a).unwrap();
         let me = unsafe { libc::geteuid() };
         assert_eq!(uid, me);
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::launch_owner;
+
+    /// A human at the CLI owns their own launches — nothing to inherit.
+    #[test]
+    fn a_human_owns_their_own_launches() {
+        assert_eq!(launch_owner("alice", None), "alice");
+    }
+
+    /// The #118 case: the dock (running as its per-app uid) asks for a launch.
+    /// The launched app must belong to the human the DOCK belongs to, not to
+    /// the dock's robot identity — otherwise the grant authorizing it has to
+    /// live in a per-app policy file and no human is on the hook for it.
+    #[test]
+    fn a_launcher_app_passes_its_own_owner_through() {
+        assert_eq!(launch_owner("atrium-app-50001", Some("alice")), "alice");
+        assert_ne!(launch_owner("atrium-app-50001", Some("alice")), "atrium-app-50001");
+    }
+
+    /// Transitivity: an app launched BY a launcher already carries the human as
+    /// its registry owner, so a deeper chain still resolves to that human.
+    #[test]
+    fn inheritance_is_transitive_through_a_chain() {
+        let second = launch_owner("atrium-app-50001", Some("alice"));      // dock -> app
+        let third  = launch_owner("atrium-app-50002", Some(&second));      // app  -> app
+        assert_eq!(third, "alice");
     }
 }
