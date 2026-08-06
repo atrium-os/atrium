@@ -47,8 +47,10 @@ kill $LPID 2>/dev/null; wait $LPID 2>/dev/null
 # for b24eb847). The builds died of ENOSPC, caused by THIS SCRIPT pointing the
 # object tree at a 256 MiB scratch volume. A GENERIC obj tree is 1.0 GB.
 #
-#   MAKEOBJDIRPREFIX=/usr/obj  (ZFS, 20 GiB free)   -> exit 0, clean build
+#   MAKEOBJDIRPREFIX=/usr/obj  (ZFS,     20 GiB)   -> exit 0, clean build
 #   MAKEOBJDIRPREFIX=/mnt/obj  (Tessera, 256 MiB)   -> exit 2, ENOSPC
+#   MAKEOBJDIRPREFIX=/mnt/obj  (Tessera,   4 GiB)   -> exit 0, 0 error lines,
+#                                  2.0 GB obj tree, 19 MB kernel, fsck CLEAN
 #
 # What made it look like a source/toolchain fault: clang reports a failed write
 # to its output stream as "fatal error: error in backend: IO failure on output
