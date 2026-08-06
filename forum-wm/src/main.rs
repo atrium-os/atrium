@@ -171,6 +171,23 @@ fn main() -> io::Result<()> {
 /// back up the socket), note the last primary-button press, release the lock,
 /// then act on that press under a fresh lock. The forum-ctl server therefore
 /// sees the lock contended only for the brief drain + an actual focus change.
+/// Is this poll error the compositor going away, rather than a transient hiccup?
+///
+/// A dead frescod shows up as an EOF mid-message ("failed to fill whole buffer"
+/// — `UnexpectedEof`) or a reset/closed pipe. Read timeouts (`WouldBlock`,
+/// `TimedOut`) are the NORMAL idle case for a polling reader and must never
+/// count here, or an idle session would shut its own WM down.
+fn is_compositor_gone(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+    )
+}
+
 fn spawn_input_poller(core: Core) {
     std::thread::Builder::new()
         .name("forum-wm-input".into())
@@ -233,6 +250,19 @@ fn spawn_input_poller(core: Core) {
                             switch_ws = Some((hid_usage - KEY_1) as usize),
                         Ok(Some(_)) => {}        // other event — ignore
                         Ok(None) => break,       // backlog drained
+                        Err(ref e) if is_compositor_gone(e) => {
+                            // frescod has gone away. Every later poll returns
+                            // this same error, so treating it like a transient
+                            // one means logging it every tick forever: measured
+                            // at 2.9 KB/s (~250 MB/day) against a dead socket.
+                            // Worse, the process stays up and keeps serving
+                            // forum-ctl, so the chrome apps go on believing a
+                            // working WM is there when it can no longer reach
+                            // the compositor at all. Nothing here works without
+                            // frescod — say so once and go.
+                            eprintln!("forum-wm: compositor connection lost ({e}) — exiting");
+                            std::process::exit(1);
+                        }
                         Err(e) => {
                             eprintln!("forum-wm: input poll error: {e}");
                             break;
@@ -420,4 +450,52 @@ fn peer_uid(s: &std::os::unix::net::UnixStream) -> Option<u32> {
     let (mut uid, mut gid) = (0u32, 0u32);
     let rc = unsafe { libc::getpeereid(s.as_raw_fd(), &mut uid, &mut gid) };
     (rc == 0).then_some(uid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The dangerous direction is the false positive: a read timeout is the
+    /// NORMAL idle case for the polling reader, so classifying it as "gone"
+    /// would make an idle session shut its own WM down after five seconds.
+    #[test]
+    fn read_timeouts_are_not_the_compositor_going_away() {
+        for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::TimedOut, io::ErrorKind::Interrupted] {
+            assert!(
+                !is_compositor_gone(&io::Error::new(kind, "poll tick")),
+                "{kind:?} must not be treated as a dead compositor"
+            );
+        }
+    }
+
+    /// The other direction: a dead frescod surfaces as an EOF mid-message
+    /// ("failed to fill whole buffer") or a reset pipe. Each must be fatal, or
+    /// the poller logs it every tick forever — measured at 2.9 KB/s.
+    #[test]
+    fn eof_and_reset_are_the_compositor_going_away() {
+        for kind in [
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::NotConnected,
+        ] {
+            assert!(
+                is_compositor_gone(&io::Error::new(kind, "frescod gone")),
+                "{kind:?} must end the poller"
+            );
+        }
+    }
+
+    /// read_exact's own EOF error is the exact one seen in the VM; assert on the
+    /// real constructor rather than a hand-made ErrorKind.
+    #[test]
+    fn read_exact_eof_is_recognised() {
+        use std::io::Read;
+        let mut buf = [0u8; 8];
+        let err = (&[1u8, 2, 3][..]).read_exact(&mut buf).unwrap_err();
+        assert_eq!(err.to_string(), "failed to fill whole buffer");
+        assert!(is_compositor_gone(&err));
+    }
 }
