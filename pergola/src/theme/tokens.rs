@@ -40,6 +40,8 @@ pub mod font {
 }
 
 pub mod type_size {
+    /// Machine-text captions, Mono only (hashes, column headers). Rev. 1.
+    pub const XXS: f32 = 10.0;
     pub const XS: f32 = 11.0;
     pub const SM: f32 = 13.0;
     pub const MD: f32 = 15.0;
@@ -80,7 +82,10 @@ pub mod letter_spacing {
 pub mod palette {
     use crate::color::Color;
 
-    // Cool slate neutrals
+    // Cool slate neutrals. 0/850/925 are rev. 1 additions: elevation
+    // needs a step above 50 on light, and dark needs three distinct
+    // tones between 900 and 950 for canvas/surface/elevated.
+    pub fn neutral_0() -> Color { Color::from_hex("#FFFFFF") }
     pub fn neutral_50() -> Color { Color::from_hex("#FAFBFC") }
     pub fn neutral_100() -> Color { Color::from_hex("#F2F4F6") }
     pub fn neutral_200() -> Color { Color::from_hex("#E4E8EC") }
@@ -90,7 +95,9 @@ pub mod palette {
     pub fn neutral_600() -> Color { Color::from_hex("#5A636C") }
     pub fn neutral_700() -> Color { Color::from_hex("#3F484F") }
     pub fn neutral_800() -> Color { Color::from_hex("#2A3137") }
+    pub fn neutral_850() -> Color { Color::from_hex("#22282E") }
     pub fn neutral_900() -> Color { Color::from_hex("#181C20") }
+    pub fn neutral_925() -> Color { Color::from_hex("#12161A") }
     pub fn neutral_950() -> Color { Color::from_hex("#0E1114") }
 
     /// Atrium signature deep teal — the chromatic neutral used as the
@@ -107,7 +114,8 @@ pub mod palette {
     pub fn accent_400() -> Color { Color::from_hex("#BD7F3A") }
     pub fn accent_500() -> Color { Color::from_hex("#9E6628") }
     pub fn accent_600() -> Color { Color::from_hex("#7B4F1E") }
-    pub fn accent_700() -> Color { Color::from_hex("#5C3A14") }
+    pub fn accent_700() -> Color { Color::from_hex("#4A3212") }
+    pub fn accent_800() -> Color { Color::from_hex("#2A2013") }
 
     // Status — semantic only
     pub fn success_500() -> Color { Color::from_hex("#2E8B57") }
@@ -149,26 +157,31 @@ impl Semantic {
             Mode::Dark => palette::neutral_950(),
         }
     }
+    /// Content areas — the tone an app's document/work area sits on,
+    /// and the fill for inputs sitting on an elevated panel. (Rev. 1
+    /// restored the doc's canvas/surface orientation: canvas is the
+    /// *lightest* working tone on light, surface is the chrome tone.)
     pub fn bg_canvas(&self) -> Color {
-        // Recessed neutral — the slightly-darker-than-elevated fill
-        // used for inputs and other inset surfaces sitting on top of
-        // a panel. Distinct from `bg_window`: this lives *inside* the
-        // panel hierarchy.
-        match self.mode {
-            Mode::Light => palette::neutral_100(),
-            Mode::Dark => palette::neutral_950(),
-        }
-    }
-    pub fn bg_surface(&self) -> Color {
         match self.mode {
             Mode::Light => palette::neutral_50(),
+            Mode::Dark => palette::neutral_925(),
+        }
+    }
+    /// Chrome strips — bar, dock, seams, panel headers. One step
+    /// recessed from canvas on light; one step raised on dark.
+    pub fn bg_surface(&self) -> Color {
+        match self.mode {
+            Mode::Light => palette::neutral_100(),
             Mode::Dark => palette::neutral_900(),
         }
     }
+    /// Floating surfaces — cards, popovers, dialogs. One step *above*
+    /// canvas in both themes (rev. 1: neutral-0/850; 50-on-50 made
+    /// elevation invisible on light, the first-light token collision).
     pub fn bg_elevated(&self) -> Color {
         match self.mode {
-            Mode::Light => palette::neutral_50(),
-            Mode::Dark => palette::neutral_800(),
+            Mode::Light => palette::neutral_0(),
+            Mode::Dark => palette::neutral_850(),
         }
     }
     pub fn border_default(&self) -> Color {
@@ -219,10 +232,54 @@ impl Semantic {
             Mode::Dark => palette::accent_700(),
         }
     }
+    /// Hover/pressed *text* on accent-tinted fills (`accent_bg`), and
+    /// hover states of accent-colored glyphs. Higher-contrast sibling
+    /// of `accent_fg`. (Rev. 1.)
+    pub fn accent_strong(&self) -> Color {
+        match self.mode {
+            Mode::Light => palette::accent_600(),
+            Mode::Dark => palette::accent_200(),
+        }
+    }
+    /// Pressed state of accent-filled controls — one step deeper than
+    /// `accent_fg` in both themes. (Rev. 1.)
+    pub fn accent_pressed(&self) -> Color {
+        palette::accent_500()
+    }
     pub fn focus_ring(&self) -> Color {
         match self.mode {
             Mode::Light => palette::accent_400(),
             Mode::Dark => palette::accent_300(),
+        }
+    }
+    /// Label color on accent-filled controls. Near-white in both
+    /// themes — a brand choice (amber-with-white), deliberately not
+    /// `auto_on`, which would pick black on the mid-amber fill. (Rev. 1.)
+    pub fn text_on_accent(&self) -> Color {
+        palette::neutral_50()
+    }
+    /// Terminal surfaces are dark in both themes — the terminal is a
+    /// place, not a widget. (Rev. 1.)
+    pub fn terminal_bg(&self) -> Color {
+        match self.mode {
+            Mode::Light => palette::neutral_900(),
+            Mode::Dark => palette::neutral_950(),
+        }
+    }
+    pub fn terminal_text(&self) -> Color {
+        match self.mode {
+            Mode::Light => palette::neutral_200(),
+            Mode::Dark => palette::neutral_300(),
+        }
+    }
+    /// Overlay backdrop behind launcher/dialog/overview layers. Carries
+    /// its own alpha. (Rev. 1.)
+    pub fn scrim(&self) -> Color {
+        match self.mode {
+            Mode::Light => palette::neutral_950().with_alpha(0.45),
+            // Off-ramp near-black: at 62% alpha over arbitrary content
+            // even neutral-950 reads slightly warm; this reads neutral.
+            Mode::Dark => Color::from_hex("#040608").with_alpha(0.62),
         }
     }
 
@@ -245,6 +302,8 @@ pub mod radius {
     pub const XS: f32 = 4.0;
     pub const SM: f32 = 6.0;
     pub const MD: f32 = 8.0;
+    /// 40px app tiles only (dock, launcher). Rev. 1.
+    pub const TILE: f32 = 10.0;
     pub const LG: f32 = 12.0;
     pub const XL: f32 = 16.0;
     pub const PILL: f32 = 9999.0;
@@ -308,6 +367,51 @@ pub mod size {
     /// Multiplier applied to all interactive control sizes when the
     /// host reports primary input is touch.
     pub const TOUCH_SCALE: f32 = 1.25;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// §8 (rev. 1) — shell chrome: fixed landmarks + wallpaper values.
+// Shell-scoped: only Forum chrome apps reference this module.
+// ────────────────────────────────────────────────────────────────────────────
+
+pub mod shell {
+    use super::Mode;
+    use crate::color::Color;
+
+    pub const BAR_H: f32 = 38.0;
+    /// The Forum-owned identity strip drawn over every surface.
+    pub const SEAM_H: f32 = 28.0;
+    pub const DOCK_W: f32 = 56.0;
+    pub const DOCK_TILE: f32 = 40.0;
+    pub const SURFACE_CHIP_H: f32 = 24.0;
+    pub const WORKSPACE_CHIP_H: f32 = 26.0;
+    /// Dense-tier button inside shell popovers/dialogs.
+    pub const BUTTON_H: f32 = 28.0;
+
+    /// Wallpaper vertical gradient stops, top → bottom, with each
+    /// stop's position in [0,1]. Until the gradient wire op lands,
+    /// flat fills should use the mid stop.
+    pub fn wallpaper_stops(mode: Mode) -> &'static [(f32, &'static str)] {
+        match mode {
+            Mode::Light => &[(0.0, "#F4F5F7"), (0.62, "#E9EDF0"), (1.0, "#DFE4E9")],
+            Mode::Dark => &[(0.0, "#14181D"), (1.0, "#0E1114")],
+        }
+    }
+    /// Flat stand-in for the wallpaper (the mid stop).
+    pub fn wallpaper_flat(mode: Mode) -> Color {
+        match mode {
+            Mode::Light => Color::from_hex("#E9EDF0"),
+            Mode::Dark => Color::from_hex("#111519"),
+        }
+    }
+    /// 64px hairline grid drawn over the wallpaper.
+    pub const GRID_STEP: f32 = 64.0;
+    pub fn grid_line(mode: Mode) -> Color {
+        match mode {
+            Mode::Light => Color::from_hex("#5A636C").with_alpha(0.055),
+            Mode::Dark => Color::from_hex("#A8B0B8").with_alpha(0.045),
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────

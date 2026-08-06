@@ -1,10 +1,10 @@
-//! forum-demo — render a genuinely Atrium-styled surface, to validate the locked
-//! visual language (docs/design/atrium-visual-language.md) as actual pixels.
+//! forum-demo — the §12 reference render from `docs/design/atrium-visual-language.md`.
 //!
-//! This is the doc's hero example — a "Sign in to Atrium" card — built entirely from
-//! Pergola theme TOKENS (cool-neutral ramp, the single amber-bronze accent, moderate
-//! radii, the IBM Plex type scale), not hardcoded colors. It's what a Forum chrome
-//! app is: a Pergola app; Pergola translates it to the fresco scene graph.
+//! "Before any widget code, Pergola produces one screen showing the language
+//! standing alone." This is that screen, built entirely from theme tokens
+//! (rev. 1): the shell wallpaper + hairline grid, one elevated panel, the type
+//! scale doing the work, the three button variants, and an input carrying the
+//! focus ring. If this screen reads wrong, fix the tokens — not the widgets.
 //!
 //! Run against frescod-vulkan-smoke (renders each frame to a PNG via lavapipe):
 //!   FRESCO_SOCKET=/tmp/frescod-smoke.sock forum-demo [light|dark]
@@ -12,51 +12,76 @@
 use fresco_client::Connection;
 use fresco_protocol::WindowHints;
 use pergola::geom::Rect;
-use pergola::theme::{font, palette, radius, space, type_size, Semantic, Weight};
+use pergola::theme::{font, radius, shell, size, space, stroke, type_size, Semantic, Weight};
 use pergola::view::{Ctx, View};
 use pergola::{commit, App, FrescoSurface, Node, Surface, TextStyle};
 
-// Full-screen login surface (the smoke render target). The card is centred on it —
-// it's the only thing on screen until the human signs in.
 const W: f32 = 1280.0;
 const H: f32 = 720.0;
-const CARD_W: f32 = 420.0;
-const CARD_H: f32 = 360.0;
+const PANEL_W: f32 = 460.0;
+const PANEL_H: f32 = 272.0;
 
-/// The login screen: the signature deep-teal wallpaper filling the screen, with a
-/// single rounded card centred on it. Card contents are all theme tokens, so it
-/// reads as Atrium and flips cleanly light↔dark.
-struct LoginCard;
+struct ReferenceScreen;
 
-impl View for LoginCard {
+/// A filled rect with a 1px border, faked as two fills until an outline
+/// pass exists (M2). Good enough for the token gate.
+fn bordered(ctx: &mut Ctx, r: Rect, border: pergola::color::Color, fill: pergola::color::Color, rad: f32) {
+    ctx.add(Node::Rect { rect: r, fill: border, radius: rad });
+    ctx.add(Node::Rect {
+        rect: Rect::new(
+            r.origin.x + stroke::DEFAULT,
+            r.origin.y + stroke::DEFAULT,
+            r.size.w - 2.0 * stroke::DEFAULT,
+            r.size.h - 2.0 * stroke::DEFAULT,
+        ),
+        fill,
+        radius: (rad - stroke::DEFAULT).max(0.0),
+    });
+}
+
+impl View for ReferenceScreen {
     fn render(&self, ctx: &mut Ctx) {
         let t = ctx.theme;
-        // Full-screen wallpaper — the Atrium signature deep teal (square; the screen
-        // edge isn't rounded, so neither is this).
+
+        // Shell wallpaper (flat mid-stop until the gradient op lands) + the
+        // 64px hairline grid.
         ctx.push(Node::Rect {
             rect: Rect::new(0.0, 0.0, W, H),
-            fill: palette::deep_teal(),
+            fill: shell::wallpaper_flat(t.mode),
             radius: 0.0,
         });
+        let grid = shell::grid_line(t.mode);
+        let mut x = shell::GRID_STEP;
+        while x < W {
+            ctx.add(Node::Rect { rect: Rect::new(x, 0.0, 1.0, H), fill: grid, radius: 0.0 });
+            x += shell::GRID_STEP;
+        }
+        let mut y = shell::GRID_STEP;
+        while y < H {
+            ctx.add(Node::Rect { rect: Rect::new(0.0, y, W, 1.0), fill: grid, radius: 0.0 });
+            y += shell::GRID_STEP;
+        }
 
-        // The card — an elevated surface, centred, rounded (radius-lg), no shadow.
-        let cx = (W - CARD_W) * 0.5;
-        let cy = (H - CARD_H) * 0.5;
-        let (cw, ch) = (CARD_W, CARD_H);
-        ctx.add(Node::Rect {
-            rect: Rect::new(cx, cy, cw, ch),
-            fill: t.bg_elevated(),
-            radius: radius::LG,
-        });
+        // The elevated panel — radius-md per §12, no shadow.
+        let px = (W - PANEL_W) * 0.5;
+        let py = (H - PANEL_H) * 0.5;
+        bordered(
+            ctx,
+            Rect::new(px, py, PANEL_W, PANEL_H),
+            t.border_default(),
+            t.bg_elevated(),
+            radius::MD,
+        );
 
         let pad = space::LG;
-        let ix = cx + pad; // inner x
-        let iw = cw - 2.0 * pad; // inner width
+        let ix = px + pad;
+        let iw = PANEL_W - 2.0 * pad;
+        let mut cy = py + pad;
 
-        // Heading (3xl-ish, semibold) — type does the work.
+        // Heading — 2xl semibold, text-primary. Type does the work.
         ctx.add(Node::Text {
-            rect: Rect::new(ix, cy + pad, 0.0, 0.0),
-            content: "Sign in to Atrium".into(),
+            rect: Rect::new(ix, cy, 0.0, 0.0),
+            content: "The language, standing alone".into(),
             style: TextStyle {
                 family: font::SANS.into(),
                 size: type_size::XXL,
@@ -64,10 +89,23 @@ impl View for LoginCard {
                 color: t.text_primary(),
             },
         });
-        // Subhead (sm, secondary).
+        cy += type_size::XXL * 1.25 + space::SM;
+
+        // Body — sm regular, primary then secondary.
         ctx.add(Node::Text {
-            rect: Rect::new(ix, cy + pad + 40.0, 0.0, 0.0),
-            content: "Use your local account password.".into(),
+            rect: Rect::new(ix, cy, 0.0, 0.0),
+            content: "Calm, confident, slightly sharp. Neutrals carry the surface;".into(),
+            style: TextStyle {
+                family: font::SANS.into(),
+                size: type_size::SM,
+                weight: Weight::Regular,
+                color: t.text_primary(),
+            },
+        });
+        cy += type_size::SM * 1.45;
+        ctx.add(Node::Text {
+            rect: Rect::new(ix, cy, 0.0, 0.0),
+            content: "the single amber accent carries focus and nothing else.".into(),
             style: TextStyle {
                 family: font::SANS.into(),
                 size: type_size::SM,
@@ -75,43 +113,94 @@ impl View for LoginCard {
                 color: t.text_secondary(),
             },
         });
+        cy += type_size::SM * 1.45 + space::LG;
 
-        // Two input fields — recessed surface tone, radius-sm, with placeholder text.
-        let field_y0 = cy + pad + 78.0;
-        for (i, ph) in ["username", "password"].iter().enumerate() {
-            let fy = field_y0 + i as f32 * (36.0 + space::SM);
-            ctx.add(Node::Rect {
-                rect: Rect::new(ix, fy, iw, 36.0),
-                fill: t.bg_surface(),
-                radius: radius::SM,
-            });
-            ctx.add(Node::Text {
-                rect: Rect::new(ix + space::SM, fy + 9.0, 0.0, 0.0),
-                content: (*ph).into(),
-                style: TextStyle {
-                    family: font::SANS.into(),
-                    size: type_size::MD,
-                    weight: Weight::Regular,
-                    color: t.text_tertiary(),
-                },
-            });
-        }
-
-        // Primary action — the single amber-bronze accent, radius-sm, white label.
-        let by = field_y0 + 2.0 * (36.0 + space::SM) + space::XS;
+        // Text input with placeholder, carrying the focus ring:
+        // 2px accent-bg halo, 1px focus-ring stroke, canvas fill.
+        let input_h = size::INPUT_HEIGHT_DEFAULT;
+        let halo = 2.0;
         ctx.add(Node::Rect {
-            rect: Rect::new(ix, by, iw, 40.0),
+            rect: Rect::new(ix - halo - stroke::DEFAULT, cy - halo - stroke::DEFAULT,
+                            iw + 2.0 * (halo + stroke::DEFAULT), input_h + 2.0 * (halo + stroke::DEFAULT)),
+            fill: t.accent_bg(),
+            radius: radius::XS + halo,
+        });
+        bordered(
+            ctx,
+            Rect::new(ix - stroke::DEFAULT, cy - stroke::DEFAULT,
+                      iw + 2.0 * stroke::DEFAULT, input_h + 2.0 * stroke::DEFAULT),
+            t.focus_ring(),
+            t.bg_canvas(),
+            radius::XS + stroke::DEFAULT,
+        );
+        ctx.add(Node::Text {
+            rect: Rect::new(ix + space::SM, cy + (input_h - type_size::MD) * 0.5, 0.0, 0.0),
+            content: "focused input — placeholder".into(),
+            style: TextStyle {
+                family: font::SANS.into(),
+                size: type_size::MD,
+                weight: Weight::Regular,
+                color: t.text_tertiary(),
+            },
+        });
+        cy += input_h + space::LG;
+
+        // The three button variants: primary / secondary / ghost.
+        let bh = size::BUTTON_HEIGHT_DEFAULT;
+        let bw = (iw - 2.0 * space::SM) / 3.0;
+        // Primary — accent fill, text-on-accent label.
+        ctx.add(Node::Rect {
+            rect: Rect::new(ix, cy, bw, bh),
             fill: t.accent_fg(),
             radius: radius::SM,
         });
         ctx.add(Node::Text {
-            rect: Rect::new(ix + iw * 0.5 - 28.0, by + 11.0, 0.0, 0.0),
-            content: "Sign in".into(),
+            rect: Rect::new(ix + bw * 0.5 - 24.0, cy + (bh - type_size::SM) * 0.5, 0.0, 0.0),
+            content: "Primary".into(),
             style: TextStyle {
                 family: font::SANS.into(),
-                size: type_size::MD,
+                size: type_size::SM,
                 weight: Weight::Medium,
-                color: pergola::color::Color::rgba(1.0, 1.0, 1.0, 1.0),
+                color: t.text_on_accent(),
+            },
+        });
+        // Secondary — border-strong outline, text-primary label.
+        let sx = ix + bw + space::SM;
+        bordered(ctx, Rect::new(sx, cy, bw, bh), t.border_strong(), t.bg_elevated(), radius::SM);
+        ctx.add(Node::Text {
+            rect: Rect::new(sx + bw * 0.5 - 32.0, cy + (bh - type_size::SM) * 0.5, 0.0, 0.0),
+            content: "Secondary".into(),
+            style: TextStyle {
+                family: font::SANS.into(),
+                size: type_size::SM,
+                weight: Weight::Medium,
+                color: t.text_primary(),
+            },
+        });
+        // Ghost — text only.
+        let gx = sx + bw + space::SM;
+        ctx.add(Node::Text {
+            rect: Rect::new(gx + bw * 0.5 - 20.0, cy + (bh - type_size::SM) * 0.5, 0.0, 0.0),
+            content: "Ghost".into(),
+            style: TextStyle {
+                family: font::SANS.into(),
+                size: type_size::SM,
+                weight: Weight::Medium,
+                color: t.text_secondary(),
+            },
+        });
+        cy += bh + space::LG;
+
+        // Machine-text line — Mono, dense-shell tier, tertiary. The voice of
+        // everything machine-true in the shell.
+        ctx.add(Node::Text {
+            rect: Rect::new(ix, cy, 0.0, 0.0),
+            content: "seat0 · lucius · forum-wm · #a3f8".into(),
+            style: TextStyle {
+                family: font::MONO.into(),
+                size: type_size::XS,
+                weight: Weight::Regular,
+                color: t.text_tertiary(),
             },
         });
 
@@ -130,7 +219,7 @@ fn main() -> std::io::Result<()> {
     let win = conn.window_create(W as u32, H as u32, "Atrium", WindowHints::default())?;
 
     let mut surface = FrescoSurface::new(conn, win);
-    let mut app = App::new(LoginCard).with_theme(mode);
+    let mut app = App::new(ReferenceScreen).with_theme(mode);
     let deltas = app.tick();
     eprintln!("forum-demo: committing {} node delta(s)", deltas.len());
     commit(&mut surface, &deltas)?;
