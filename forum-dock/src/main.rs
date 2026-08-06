@@ -35,20 +35,38 @@ fn apps_dir() -> PathBuf {
     std::env::var("FORUM_APPS_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(APPS_DIR))
 }
 
-/// The output geometry. Hardcoding it meant the dock drew its panel at
-/// y = H - dock_h - 28 for a 720-tall screen — off the bottom of the actual
-/// 640x480 scanout, so the wallpaper appeared but the launcher never did.
-/// Same FORUM_SCREEN="WxH" convention forum-wm uses; frescod knows the real
-/// mode and should eventually tell both (see the mode-query follow-up).
-fn screen_wh() -> (f32, f32) {
-    std::env::var("FORUM_SCREEN")
-        .ok()
-        .and_then(|s| {
-            let (a, b) = s.split_once('x')?;
-            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
-        })
-        .unwrap_or((1280.0, 720.0))
+/// The output geometry — ASKED, not assumed.
+///
+/// The dock fills the screen (it paints the wallpaper) and anchors its launcher
+/// to the bottom edge, so a wrong screen size does not just look off, it puts
+/// the launcher outside the display: hardcoded 1280x720 on a 640x480 scanout
+/// placed the strip at y=600, below the bottom, and the desktop came up with no
+/// visible dock at all.
+///
+/// FRESCO_SCREEN/FORUM_SCREEN still override for dev, but they cannot be the
+/// mechanism: portcullisd launches an app through jail(8), which does not carry
+/// the environment in, so a jailed dock can only be told by asking frescod.
+fn screen_wh(conn: &mut Connection) -> (f32, f32) {
+    if let Some((w, h)) = std::env::var("FORUM_SCREEN").ok().and_then(|s| {
+        let (a, b) = s.split_once('x')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    }) {
+        eprintln!("forum-dock: screen {w}x{h} (FORUM_SCREEN override)");
+        return (w, h);
+    }
+    match conn.display_info() {
+        Ok(d) if d.width > 0 && d.height > 0 => {
+            eprintln!("forum-dock: screen {}x{} @ {} mHz (from frescod)",
+                      d.width, d.height, d.refresh_mhz);
+            (d.width as f32, d.height as f32)
+        }
+        Ok(_) => { eprintln!("forum-dock: frescod reports no mode; assuming 1280x720");
+                   (1280.0, 720.0) }
+        Err(e) => { eprintln!("forum-dock: display_info failed ({e}); assuming 1280x720");
+                    (1280.0, 720.0) }
+    }
 }
+
 const TILE: f32 = 60.0;
 const GAP: f32 = 16.0;
 const PAD: f32 = 16.0;
@@ -204,7 +222,7 @@ fn render_dock() -> io::Result<()> {
     // back/background surface — the WM places it behind everything; the dock
     // panel it paints in the bottom strip stays visible under documents.
     let hints = WindowHints { role: Some(WmRole::Background), ..Default::default() };
-    let (sw, sh) = screen_wh();
+    let (sw, sh) = screen_wh(&mut conn);
     let win = conn.window_create(sw as u32, sh as u32, "forum-dock", hints)?;
     let mut surface = FrescoSurface::new(conn, win);
 

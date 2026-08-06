@@ -47,7 +47,7 @@ use fresco_protocol::{
     WindowRequestClosePayload, WindowPresentPayload,
     WindowPresentDamagePayload, DamageRect,
     FontOpenPayload, FontOpenResponse, FontClosePayload, TextRunInstallPayload,
-    TextMeasurePayload, TextMeasureResponse,
+    TextMeasurePayload, TextMeasureResponse, DisplayInfoResponse,
     WmSurfaceInfo, WmEnumerateReply, WmRole, WmRect,
     WmDeclareLayoutPayload, WmSetRenderingPayload,
 };
@@ -288,6 +288,12 @@ pub struct EnvelopeFrontend {
     /// report the stable kernel identity (the WM resolves it to an app-id for
     /// workspace assignment). Absent → 0 (unresolved, e.g. a test harness).
     client_uids: HashMap<u8, u32>,
+
+    /// The mode the display is actually scanning out, answered to
+    /// `OP_DISPLAY_INFO`. frescod sets it from the connector at startup — the
+    /// scene server has no display of its own to ask. Zero until set, which is
+    /// what a headless/test frontend reports.
+    display_mode: (u32, u32, u32),
 }
 
 impl EnvelopeFrontend {
@@ -312,7 +318,15 @@ impl EnvelopeFrontend {
             pending_region_uploads: Vec::new(),
             wm_capable: std::collections::HashSet::new(),
             client_uids: HashMap::new(),
+            display_mode: (0, 0, 0),
         }
+    }
+
+    /// Tell the frontend what the display is running at, so clients can ask
+    /// (`OP_DISPLAY_INFO`) instead of assuming. Called by frescod once it has
+    /// read the connector; call it again on a mode change.
+    pub fn set_display_mode(&mut self, width: u32, height: u32, refresh_mhz: u32) {
+        self.display_mode = (width, height, refresh_mhz);
     }
 
     /// Grant a client the `window-management` capability. Called by the
@@ -447,6 +461,7 @@ impl EnvelopeFrontend {
             control::OP_FONT_CLOSE         => self.handle_font_close(msg),
             control::OP_TEXT_RUN_INSTALL   => self.handle_text_run_install(msg),
             control::OP_TEXT_MEASURE       => self.handle_text_measure(msg),
+            control::OP_DISPLAY_INFO       => self.handle_display_info(),
 
             // ── Window management ops (window_id is in payload) ──
             control::OP_WINDOW_CREATE        => self.handle_window_create(msg),
@@ -757,6 +772,21 @@ impl EnvelopeFrontend {
         let payload = encode(&resp).map_err(|_| DispatchError::BadPayload)?;
         Ok(vec![Outbound {
             op:      control::OP_TEXT_MEASURE,
+            flags:   flag::IS_RESPONSE,
+            payload,
+        }])
+    }
+
+    /// `OP_DISPLAY_INFO` — hand back the scanout mode. No payload in, no state
+    /// touched, allowed to every client: a surface cannot lay itself out
+    /// correctly without knowing the screen, and withholding that from ordinary
+    /// apps is what left each of them guessing a different size.
+    fn handle_display_info(&mut self) -> Result<Vec<Outbound>, DispatchError> {
+        let (width, height, refresh_mhz) = self.display_mode;
+        let payload = encode(&DisplayInfoResponse { width, height, refresh_mhz })
+            .map_err(|_| DispatchError::BadPayload)?;
+        Ok(vec![Outbound {
+            op:      control::OP_DISPLAY_INFO,
             flags:   flag::IS_RESPONSE,
             payload,
         }])

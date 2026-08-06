@@ -18,8 +18,29 @@ use pergola::theme::{font, type_size, Semantic, Weight};
 use pergola::view::{Ctx, View};
 use pergola::{commit, App, FrescoSurface, Node, Surface, TextStyle};
 
-const W: f32 = 1280.0;
+/// The bar spans the FULL width of the display, so it has to know what that is.
+/// It used to be a constant 1280, which on a 1920-wide screen left the last 640
+/// px bare — the bar simply stopped two-thirds of the way across. Asked from
+/// frescod now (FORUM_SCREEN overrides for dev; see the dock for why an env var
+/// cannot be the mechanism for a jailed app).
 const BAR_H: f32 = 36.0;
+
+fn screen_w(conn: &mut Connection) -> f32 {
+    if let Some(w) = std::env::var("FORUM_SCREEN").ok()
+        .and_then(|s| s.split_once('x').and_then(|(a, _)| a.trim().parse().ok()))
+    {
+        eprintln!("forum-bar: width {w} (FORUM_SCREEN override)");
+        return w;
+    }
+    match conn.display_info() {
+        Ok(d) if d.width > 0 => {
+            eprintln!("forum-bar: width {} (from frescod)", d.width);
+            d.width as f32
+        }
+        Ok(_)  => { eprintln!("forum-bar: frescod reports no mode; assuming 1280"); 1280.0 }
+        Err(e) => { eprintln!("forum-bar: display_info failed ({e}); assuming 1280"); 1280.0 }
+    }
+}
 
 /// What the bar shows. Tiny data model; the WM core (forum-ctl) feeds it.
 /// Live session state, as signals rather than plain values: the bar is session
@@ -27,6 +48,7 @@ const BAR_H: f32 = 36.0;
 /// updatable without rebuilding the view. Setting a `Mutable` marks the app
 /// dirty, which is what makes the next `tick()` re-render.
 struct BarView {
+    w:         f32,
     focus_app: pergola::reactive::Mutable<String>,
     windows:   pergola::reactive::Mutable<usize>,
     clock:     pergola::reactive::Mutable<String>,
@@ -38,13 +60,13 @@ impl View for BarView {
 
         // Bar surface — a chrome neutral spanning the screen width.
         ctx.push(Node::Rect {
-            rect: Rect::new(0.0, 0.0, W, BAR_H),
+            rect: Rect::new(0.0, 0.0, self.w, BAR_H),
             fill: t.bg_surface(),
             radius: 0.0,
         });
         // A 1px bottom hairline (elevation by a line, not a shadow — the doc's rule).
         ctx.add(Node::Rect {
-            rect: Rect::new(0.0, BAR_H - 1.0, W, 1.0),
+            rect: Rect::new(0.0, BAR_H - 1.0, self.w, 1.0),
             fill: t.border_default(),
             radius: 0.0,
         });
@@ -76,7 +98,7 @@ impl View for BarView {
 
         // Right cluster: window count + clock + an accent "session active" dot.
         ctx.add(Node::Text {
-            rect: Rect::new(W - 250.0, ty + 1.0, 0.0, 0.0),
+            rect: Rect::new(self.w - 250.0, ty + 1.0, 0.0, 0.0),
             content: { let n = self.windows.get(); format!("{n} window{}", if n == 1 { "" } else { "s" }) },
             style: TextStyle {
                 family: font::SANS.into(),
@@ -86,7 +108,7 @@ impl View for BarView {
             },
         });
         ctx.add(Node::Text {
-            rect: Rect::new(W - 96.0, ty, 0.0, 0.0),
+            rect: Rect::new(self.w - 96.0, ty, 0.0, 0.0),
             content: self.clock.get_cloned(),
             style: TextStyle {
                 family: font::SANS.into(),
@@ -97,7 +119,7 @@ impl View for BarView {
         });
         // Session-active indicator — the single accent, used for meaning.
         ctx.add(Node::Rect {
-            rect: Rect::new(W - 26.0, BAR_H * 0.5 - 4.0, 8.0, 8.0),
+            rect: Rect::new(self.w - 26.0, BAR_H * 0.5 - 4.0, 8.0, 8.0),
             fill: t.accent_fg(),
             radius: 4.0,
         });
@@ -133,7 +155,8 @@ fn main() -> std::io::Result<()> {
     // Declare the chrome role so the WM reserves the top edge for the bar
     // (rather than treating it as an ordinary document).
     let hints = WindowHints { role: Some(WmRole::Chrome), ..Default::default() };
-    let win = conn.window_create(W as u32, BAR_H as u32, "forum-bar", hints)?;
+    let w = screen_w(&mut conn);
+    let win = conn.window_create(w as u32, BAR_H as u32, "forum-bar", hints)?;
     let mut surface = FrescoSurface::new(conn, win);
 
     // One dirty flag shared by the app and its signals, so `set()` on any of
@@ -144,6 +167,7 @@ fn main() -> std::io::Result<()> {
     let window_sig = Mutable::with_dirty(windows,   dirty.clone());
     let clock_sig  = Mutable::with_dirty(clock_hhmm(), dirty.clone());
     let view = BarView {
+        w,
         focus_app: focus_sig.clone(),
         windows:   window_sig.clone(),
         clock:     clock_sig.clone(),

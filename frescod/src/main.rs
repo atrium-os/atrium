@@ -121,6 +121,10 @@ fn main() -> std::io::Result<()> {
     comp.lock().unwrap().set_event_sink(ev_tx.clone());
 
     let frontend = Arc::new(Mutex::new(EnvelopeFrontend::new(cas, comp.clone())));
+    /* Publish the mode we just read from the connector, so clients can ASK
+     * (OP_DISPLAY_INFO) rather than each assuming a screen size. */
+    frontend.lock().unwrap()
+        .set_display_mode(mode.width, mode.height, mode.refresh_mhz);
 
     /* ── Socket server ───────────────────────────────────────────── */
     let sock_path = std::env::var("FRESCOD_SOCK")
@@ -250,6 +254,9 @@ fn run_headless(png: &str) -> std::io::Result<()> {
         injector_reader::spawn(ev_tx.clone(), comp.clone(), W, H, isock);
     }
     let frontend = Arc::new(Mutex::new(EnvelopeFrontend::new(cas, comp.clone())));
+    /* Headless has no connector, but clients still need an answer — the surface
+     * it renders into IS the screen here. Refresh 0 says "no real mode". */
+    frontend.lock().unwrap().set_display_mode(W, H, 0);
 
     let sock = std::env::var("FRESCOD_SOCK")
         .map(PathBuf::from)

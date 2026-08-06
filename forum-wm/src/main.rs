@@ -80,15 +80,29 @@ impl FrescoConn for ClientConn {
 }
 
 
-/// The output geometry. Until frescod exposes a mode query over the WM channel we
-/// take it from the environment (FORUM_SCREEN="WxH"), defaulting to 1080p. The
-/// chrome reservations (bar/dock) are the shell's, fixed here.
-fn screen() -> Screen {
+/// The output geometry, ASKED of frescod (the mode query this comment used to
+/// say was missing). The WM places every surface, so if it believes a different
+/// screen than the compositor is scanning out, every window is laid out for a
+/// screen that does not exist. FORUM_SCREEN still overrides, for driving a
+/// layout the hardware isn't showing.
+///
+/// The chrome reservations (bar/dock) stay the shell's own: frescod reports the
+/// mode, not what the session has reserved from it.
+fn screen(conn: &mut Connection) -> Screen {
     let (w, h) = std::env::var("FORUM_SCREEN")
         .ok()
         .and_then(|s| {
             let (a, b) = s.split_once('x')?;
             Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+        })
+        .or_else(|| match conn.display_info() {
+            Ok(d) if d.width > 0 && d.height > 0 => {
+                eprintln!("forum-wm: screen {}x{} @ {} mHz (from frescod)",
+                          d.width, d.height, d.refresh_mhz);
+                Some((d.width as i32, d.height as i32))
+            }
+            Ok(_)  => { eprintln!("forum-wm: frescod reports no mode"); None }
+            Err(e) => { eprintln!("forum-wm: display_info failed: {e}"); None }
         })
         .unwrap_or((1920, 1080));
     Screen { rect: WmRect { x: 0, y: 0, w, h }, bar_h: 24, dock_h: 48 }
@@ -110,7 +124,7 @@ fn main() -> io::Result<()> {
 
     // Per-user workspace config (count / names / app rules); defaults if absent.
     let cfg = config::ForumConfig::load();
-    let mut wm = Wm::new(screen());
+    let mut wm = Wm::new(screen(&mut io_conn.conn));
     wm.workspaces = cfg.workspaces;
     wm.names = cfg.names;
     wm.assign_rules = cfg.assign;

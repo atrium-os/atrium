@@ -48,11 +48,13 @@ use fresco_protocol::{
     InputPointerButtonEvent, InputPointerScrollEvent,
     FontOpenPayload, FontOpenResponse, FontClosePayload, TextRunInstallPayload,
     TextMeasurePayload, TextMeasureResponse,
+    DisplayInfoResponse,
     WmEnumerateReply, WmDeclareLayoutPayload, WmSetRenderingPayload,
     ErrorReply,
     scene_ops,
 };
 pub use fresco_protocol::{WmSurfaceInfo, WmRole, WmRect, WmSlot};
+pub use fresco_protocol::DisplayInfoResponse as DisplayInfo;
 pub use fresco_protocol::DamageRect;
 pub use fresco_protocol::FontOpenResponse as RemoteFontMetrics;
 pub use fresco_protocol::TextMeasureResponse as TextMetrics;
@@ -546,6 +548,30 @@ impl Connection {
                         format!("decode TEXT_MEASURE reply: {e}")));
             }
             log::debug!("text_measure: skipping unrelated message op={:#x}", m.op);
+        }
+    }
+
+    /// What is the display actually running at? One round-trip; the answer is
+    /// the mode the connector is driving, plus the edges session chrome has
+    /// reserved.
+    ///
+    /// Ask this instead of assuming a size. Every client that fills the screen
+    /// or anchors to an edge needs it, and the ones that need it most — jailed
+    /// apps — cannot be told out-of-band, because jail(8) does not carry an
+    /// environment in.
+    pub fn display_info(&mut self) -> io::Result<DisplayInfoResponse> {
+        self.send_payload(control::OP_DISPLAY_INFO, 0, &())?;
+        loop {
+            let m = self.inner.recv_message()?;
+            if m.opcode_class == CLASS_DISPLAY
+               && m.op == control::OP_DISPLAY_INFO
+               && m.flags & flag::IS_RESPONSE != 0
+            {
+                return decode::<DisplayInfoResponse>(&m.payload)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
+                        format!("decode DISPLAY_INFO reply: {e}")));
+            }
+            log::debug!("display_info: skipping unrelated message op={:#x}", m.op);
         }
     }
 

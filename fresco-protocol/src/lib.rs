@@ -96,6 +96,10 @@ pub mod control {
     pub const OP_TEXT_RUN_INSTALL:   u16 = 0x0052;
     pub const OP_TEXT_MEASURE:       u16 = 0x0053;  // → response with width/ascent/descent
 
+    /// Synchronous query: what is the display actually running at?
+    /// → response with `DisplayInfoResponse` (mode + reserved chrome edges).
+    pub const OP_DISPLAY_INFO:       u16 = 0x0054;
+
     // ── Window management (§3.8.1) ──
     // Control (client → server)
     pub const OP_WINDOW_CREATE:        u16 = 0x0500;
@@ -605,6 +609,34 @@ pub struct TextMeasureResponse {
     pub width_px:   f32,
     pub ascent_px:  f32,
     pub descent_px: f32,
+}
+
+/// `OP_DISPLAY_INFO` — synchronous query: the mode the display is ACTUALLY
+/// scanning out, so a client can lay itself out for the real screen.
+///
+/// Every full-screen or edge-anchored surface needs this — a background, a
+/// bar, a dock, an overview — and before it existed each of them simply
+/// assumed a size. They disagreed: the dock was built for 1280x720, the WM
+/// defaulted to 1920x1080, and the scanout was 640x480. The dock's launcher
+/// strip then landed below the bottom edge, so the desktop came up with
+/// wallpaper and bar and no launcher, looking like a dock failure when it was
+/// drawing perfectly at a size nobody had told it was wrong.
+///
+/// An environment variable cannot replace this: portcullisd runs a jailed app
+/// through jail(8), which does not carry the environment in, so the apps that
+/// most need the answer are exactly the ones that cannot be told out-of-band.
+///
+/// Deliberately just the mode. Chrome reservations (what a bar or dock has
+/// claimed) belong to the WM, which frescod does not track — a client that
+/// needs its usable area rather than the raw screen asks forum-ctl. Reporting
+/// a field frescod cannot populate would be worse than not having it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DisplayInfoResponse {
+    /// Scanout dimensions in pixels — what the connector is driving.
+    pub width:  u32,
+    pub height: u32,
+    /// Refresh in milli-Hz (60000 = 60.000 Hz), matching the connector's mode.
+    pub refresh_mhz: u32,
 }
 
 // ── Window event payloads (server → client, ASYNC_EVENT flag) ────────
