@@ -2,7 +2,7 @@
 
 Operational reference for the Fresco scenegraph FreeBSD POC. Update this file whenever a new gotcha is found, a command line changes, or a directory moves.
 
-**Naming.** *Fresco* is the protocol/architecture name (a retained-mode, content-addressed scenegraph protocol). The reference server lives at `~/src/fresco-server/` (Cargo crate `fresco-server`). It was renamed from `karythra-gpu-server` after this BSD port began; karythra-os was updated in lockstep. Components: `fresco.ko` (kernel module), `libfresco` (userspace), `slint-fresco` (Slint backend), `/dev/fresco0`.
+**Naming.** *Fresco* is the protocol/architecture name (a retained-mode, content-addressed scenegraph protocol). The reference server lives at `~/src/fresco/` (directory `fresco`, Cargo crate `fresco-server` — the DIRECTORY was renamed, the crate name was not). It was renamed from `karythra-gpu-server` after this BSD port began; karythra-os was updated in lockstep. Components: `fresco.ko` (kernel module), `libfresco` (userspace), `slint-fresco` (Slint backend), `/dev/fresco0`.
 
 Project context lives in claude-memory (`~/.claude/projects/-Users-girivs-src-bsd/memory/`); architectural decisions live in commit messages and the gpu-server source. This file is for **how to do things** — recipes, paths, quirks.
 
@@ -223,7 +223,7 @@ been exercised on a machine without an existing `vm.qcow2`. There is also no
   (atrium-core/atrium-text bundle SPIR-V build).
 
 **Other Atrium-related siblings (not under `external/`):**
-- `~/src/fresco-server/` — Fresco reference server (Rust crate
+- `~/src/fresco/` — Fresco reference server (Rust crate
   `fresco-server`, Metal backend on macOS). Predates the BSD port;
   not vendored. Renamed from `karythra-gpu-server`.
 - `~/src/karythra-os/` — the OS that originated the Fresco protocol.
@@ -247,7 +247,7 @@ been exercised on a machine without an existing `vm.qcow2`. There is also no
 ### Boot with GPU server attached
 ```sh
 # Terminal 1 — start the GPU server first
-cd ~/src/fresco-server && cargo run --release
+cd ~/src/fresco && cargo run --release
 
 # Terminal 2 — boot the VM with ivshmem-doorbell
 ~/src/bsd/scripts/run-vm.sh --gpu
@@ -1596,10 +1596,10 @@ D0 step 2d (async fence retirement) and step 3.5 (vblank events, hardware cursor
 
 **D1 step 2(b) (frescod first-light)** — DONE (2026-04-28). Standalone binary at `~/src/bsd/frescod/` owns the display + GPU cdevs, runs a 30 fps frame loop, renders an animated analog clock inside a shadowed panel via tiny-skia, page-flips. **Visually verified** — no fresco-server, no Metal, no winit, no QEMU host compositing. ~330 lines including drop shadow, tick marks, hands, frame heartbeat.
 
-**D1 step 2(c.0) (fresco-server → dual-target lib)** — DONE (2026-04-28). `~/src/fresco-server/` is now a Cargo lib + bin. macOS-only deps (winit, metal, objc2-*, core-graphics-types, raw-window-handle) gated under `[target.'cfg(target_os = "macos")'.dependencies]`. macOS-only modules cfg-gated: `render::metal_backend`, `input::capture`, the existing winit-coupled bin (moved to `main_macos.rs`, called from a stub `main.rs`). `GpuBackend` trait decoupled from `winit::Window` — `new()` removed from the trait, each concrete backend has its own constructor. `InputEvent` lifted from `input::capture` to `input::mod` so platform-neutral modules (ivshmem, network) can import it.
+**D1 step 2(c.0) (fresco-server → dual-target lib)** — DONE (2026-04-28). `~/src/fresco/` is now a Cargo lib + bin. macOS-only deps (winit, metal, objc2-*, core-graphics-types, raw-window-handle) gated under `[target.'cfg(target_os = "macos")'.dependencies]`. macOS-only modules cfg-gated: `render::metal_backend`, `input::capture`, the existing winit-coupled bin (moved to `main_macos.rs`, called from a stub `main.rs`). `GpuBackend` trait decoupled from `winit::Window` — `new()` removed from the trait, each concrete backend has its own constructor. `InputEvent` lifted from `input::capture` to `input::mod` so platform-neutral modules (ivshmem, network) can import it.
 
 Both targets build cleanly:
-- `cd /Users/girivs/src/fresco-server && cargo check --release` — full macOS bin
+- `cd /Users/girivs/src/fresco && cargo check --release` — full macOS bin
 - `cd /Users/girivs/src/bsd/frescod && cargo check --target aarch64-unknown-freebsd` — FreeBSD lib (frescod pulls fresco-server as a path dep; the cross-compile config in `bsd/.cargo/` propagates).
 
 `frescod` smoke-tested as still running after the restructure.
@@ -2468,7 +2468,7 @@ PUBKEY=$(cat ~/.ssh/fresco_bsd_ed25519.pub)
 
 # 4. Start fresco-server, then VM (with --gpu for ivshmem)
 > /tmp/fresco-server.log
-RUST_LOG=info nohup ~/src/fresco-server/target/release/fresco-server \
+RUST_LOG=info nohup ~/src/fresco/target/release/fresco-server \
     /tmp/fresco-shmem > /tmp/fresco-server.log 2>&1 &
 sleep 1
 > /tmp/vm.log
@@ -2511,7 +2511,7 @@ qemu-img resize ~/src/bsd/vm/vm.qcow2 +20G
 ### Run the GPU server alongside the VM
 ```sh
 # terminal 1
-cd ~/src/fresco-server && RUST_LOG=info cargo run --release
+cd ~/src/fresco && RUST_LOG=info cargo run --release
 # terminal 2 — wait for "Waiting for QEMU to connect" then:
 ~/src/bsd/scripts/run-vm.sh --gpu
 ```
