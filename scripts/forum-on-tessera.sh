@@ -6,13 +6,18 @@
 # it, closing the free-space existence oracle (tessera-quotas.md §3.6.2).
 #
 # Prerequisites the VM must already have — checked, not assumed:
-#   /dev/atrium-gpu0                     -> boot with run-vm.sh --virtio-gpu
+#   /dev/fresco0                         -> Carillon transport. Boot with
+#                                           run-vm.sh --gpu (ivshmem-doorbell)
+#                                           AND fresco-server running on the
+#                                           host (~/src/fresco), then
+#                                           kldload fresco.ko in the guest.
 #   /usr/local/share/atrium/bundles/atrium-core   -> frescod's shaders
 #   /usr/local/bin/{portcullisd,portcullis,frescod,forum-bar}
 set -u
-DEV=${1:-/dev/vtbd0}
+DEV=${1:-/dev/gpt/atrium-apps}
 ROOT=/var/lib/atrium
 APP=org.atrium.forum-bar
+SRC=${SRC:-/root/fbbundle}        # staging dir opifex installs FROM
 fails=0
 ok()  { echo "  ok   $*"; }
 bad() { echo "  FAIL $*"; fails=$((fails+1)); }
@@ -24,17 +29,47 @@ for b in portcullisd portcullis frescod forum-bar; do
 done
 [ -d /usr/local/share/atrium/bundles/atrium-core ] \
     || { echo "  MISSING atrium-core bundle (frescod cannot start)"; exit 2; }
-if [ ! -c /dev/atrium-gpu0 ]; then
-    echo "  MISSING /dev/atrium-gpu0 — the VM was booted without --virtio-gpu."
-    echo "  frescod cannot start, so no graphical app can run. Reboot with:"
-    echo "      ./scripts/run-vm.sh --virtio-gpu"
+# ★ /dev/fresco0, NOT /dev/atrium-gpu0. The display path is CARILLON — the
+# paravirtualised doorbell transport to fresco-server on the host. Earlier
+# versions of this script checked for the D0 virtio-gpu device, which is a
+# different, non-display path and would never appear on a --gpu boot.
+# EITHER display path is acceptable — frescod only needs one:
+#   Carillon  /dev/fresco0          doorbell transport to fresco-server on the host
+#   gpusim    /dev/atrium-display0  the RDNA functional model's display engine
+[ -c /dev/fresco0 ] || kldload fresco 2>/dev/null || kldload /root/fresco.ko 2>/dev/null
+if [ -c /dev/fresco0 ]; then
+    ok "binaries, bundle and the Carillon transport (/dev/fresco0) present"
+elif [ -c /dev/atrium-display0 ]; then
+    ok "binaries, bundle and the gpusim display engine (/dev/atrium-display0) present"
+else
+    echo "  MISSING a display transport — frescod has nothing to scan out to."
+    echo "  Either:"
+    echo "    Carillon: host  cd ~/src/fresco && cargo run --release --bin fresco-server"
+    echo "              host  ./scripts/run-vm.sh --gpu     (ivshmem-doorbell)"
+    echo "              guest kldload fresco.ko"
+    echo "    gpusim:   host  ./scripts/run-vm.sh --gpusim"
+    echo "              guest atrium_gpu_amd{,_gpu,_display} preloaded via loader.conf"
     exit 2
 fi
-ok "binaries, bundle and /dev/atrium-gpu0 present"
 
 echo "=== Tessera volume for $ROOT ==="
 pkill -f portcullisd 2>/dev/null; pkill -f frescod 2>/dev/null; sleep 1
-umount $ROOT 2>/dev/null
+# ★ Never mkfs the live root. DEV defaults to the APP volume; if someone passes
+# the device the system root is mounted from, refuse rather than destroy it.
+rootdev=$(mount | awk '$3 == "/" {print $1}')
+[ "$DEV" = "$rootdev" ] && { echo "  REFUSING to mkfs $DEV — it is the live root"; exit 2; }
+# A previous launch leaves the jail's stacked mounts (nullfs rootfs, unionfs
+# overlay, two socket binds) live under $ROOT, and they hold the volume busy —
+# so the mkfs fails and the whole run dies at "mkfs failed". Peel them off
+# deepest-first before touching $ROOT itself.
+mount | awk -v r="$ROOT/" '$3 ~ "^"r {print $3}' | sort -r | while read -r m; do
+    umount -f "$m" 2>/dev/null
+done
+for i in 1 2 3; do umount $ROOT 2>/dev/null && break; sleep 1; done
+if mount | awk -v r="$ROOT" '$3 == r {found=1} END {exit !found}'; then
+    echo "  CANNOT unmount $ROOT — still busy:"; mount | grep " $ROOT" | sed 's/^/       /'
+    exit 2
+fi
 kldstat -q -n tessera_fs || kldload tessera_fs 2>/dev/null
 /root/mkfs-tessera "$DEV" >/dev/null 2>&1 || { echo "mkfs failed"; exit 2; }
 mkdir -p $ROOT
@@ -44,10 +79,22 @@ ok "$ROOT is $(df -k $ROOT | tail -1 | awk '{print $1}') (tessera, $(df -k $ROOT
 # ★ Deliberately leave this OFF. portcullisd must turn it on itself; if it does
 # not, the overlay silently leaks and the run must fail rather than look fine.
 sysctl kern.tessera.dedup_deferred_enable=0 >/dev/null
-mkdir -p $ROOT/apps/$APP/bin $ROOT/overlays $ROOT/jails
-cp /usr/local/bin/forum-bar $ROOT/apps/$APP/bin/forum-bar
-[ -f $ROOT/apps/$APP/atrium.toml ] || { echo "  MISSING $ROOT/apps/$APP/atrium.toml"; exit 2; }
-ok "app tree assembled on Tessera"
+mkdir -p $ROOT/overlays $ROOT/jails
+# ★ The jail rootfs IS the bundle: it has no /lib but its own. Copying the entry
+# binary alone produces a bundle where EVERY dynamic binary dies on SIGABRT with
+# no diagnostic at all (the kernel cannot load /libexec/ld-elf.so.1, and the
+# failure reads like an application bug). opifex resolves the recursive
+# DT_NEEDED closure into the tree — use it, never `cp`.
+[ -x /usr/local/bin/opifex ] || { echo "  MISSING /usr/local/bin/opifex"; exit 2; }
+[ -f $SRC/atrium.toml ] || { echo "  MISSING $SRC/atrium.toml"; exit 2; }
+mkdir -p $SRC/bin && cp /usr/local/bin/forum-bar $SRC/bin/forum-bar
+/usr/local/bin/opifex install $SRC --allow-unsigned --root $ROOT 2>&1 | sed 's/^/    /'
+# Gate on the loader LANDING, not on opifex exiting 0.
+if [ -x $ROOT/apps/$APP/libexec/ld-elf.so.1 ] && [ -f $ROOT/apps/$APP/lib/libc.so.7 ]; then
+    ok "app tree assembled on Tessera with its lib closure ($(find $ROOT/apps/$APP -type f | wc -l | tr -d ' ') files)"
+else
+    bad "bundle has no runtime loader — every binary in the jail will SIGABRT"
+fi
 
 echo "=== frescod ==="
 daemon -f -o /tmp/fresco.log /usr/local/bin/frescod
@@ -73,9 +120,14 @@ grep -aq "armed deferred dedup" /tmp/pd.log \
 dmesg | grep -aq "dedup_policy=1" \
     && ok "kernel confirms a non-global dedup domain" \
     || bad "kernel never logged dedup_policy=1"
-jls 2>/dev/null | grep -q "$APP" \
-    && ok "jail $APP is running" \
-    || bad "jail $APP is not in jls"
+# forum-bar is a one-shot: it draws the bar and exits, so the jail is already
+# gone by the time we look. Assert on what it DID, not on jls.
+grep -aq "created" /tmp/launch.log \
+    && ok "jail $APP was created" \
+    || bad "jail $APP was never created"
+grep -aq "drawing the bar" /tmp/launch.log \
+    && ok "the jailed app rendered — talked to frescod through the nullfs socket" \
+    || bad "the app never drew (signal 6 here means a bundle with no lib closure)"
 [ -d $ROOT/overlays/$APP ] \
     && ok "overlay exists on Tessera: $ROOT/overlays/$APP" \
     || bad "no overlay directory"
