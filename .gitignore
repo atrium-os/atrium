@@ -109,3 +109,4 @@ vm/*.png
 
 # bootstrap-atrium.sh phase stamps, logs and the kernel objdir.
 .bootstrap-state/
+vm/atrium-apps.img

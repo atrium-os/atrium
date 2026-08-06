@@ -383,6 +383,16 @@ taskpolicy -B -p $$ 2>/dev/null || true
 # is why run-vm.sh had to warn that adding a -device "renumbers every vtbd".
 # Labels: gpart modify -i 2 -l atrium-root vtbd0 (and -i 1 -l atrium-esp).
 #
+# ★ TWO-VOLUME SPLIT (both Tessera): the devroot is the SYSTEM volume, and
+# atrium-apps.img is the APP/DATA volume mounted at /var/lib/atrium — apps,
+# overlays and jails. Same shape as Android's read-only system partitions vs a
+# separate userdata, or macOS's Sealed System Volume vs Data volume.
+#
+# The app volume needs NO module work: tessera_fs is already resident because
+# the loader loaded it to mount root, so a second Tessera volume is an ordinary
+# `mount -t tessera`. Only REPLACING the root driver needs a reboot. Both
+# volumes are named by GPT label, so disk count and order stay irrelevant.
+#
 # --all-disks re-attaches everything (ZFS last) for RECOVERY. With labels the
 # devroot still boots under that layout; the extra disks just come back.
 EXTRA_DISKS=""
@@ -407,6 +417,8 @@ exec "$QEMU" \
     ${EXTRA_DISKS} \
     -drive file="$BSD_DIR/vm/tessera-devroot.img",format=raw,cache=writeback,if=none,id=devrootdrv \
     -device virtio-blk-pci,drive=devrootdrv,serial=tessera-devroot,config-wce=on \
+    -drive file="$BSD_DIR/vm/atrium-apps.img",format=raw,cache=writeback,if=none,id=appsdrv \
+    -device virtio-blk-pci,drive=appsdrv,serial=atrium-apps,config-wce=on \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0,hostfwd=tcp::2222-:22 \
     -fsdev local,id=share,path="$SHARE_DIR",security_model=none \
