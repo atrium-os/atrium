@@ -114,3 +114,9 @@ vm/*.png
 # bootstrap-atrium.sh phase stamps, logs and the kernel objdir.
 .bootstrap-state/
 vm/atrium-apps.img
+
+# tessera-core host/fuzz build trees (see scripts/core-host-tests.sh)
+atrium-tessera/core/build-host/
+atrium-tessera/core/build-host-san/
+atrium-tessera/core/build-fuzz/
+atrium-tessera/core/fuzz/artifacts/

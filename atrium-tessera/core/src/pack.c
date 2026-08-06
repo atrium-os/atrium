@@ -315,9 +315,56 @@ tessera_pack_open(const uint8_t *data, size_t len)
 		goto fail;
 	if (r->header.total_pack_bytes != len) goto fail;
 
-	r->index_base = data + TESSERA_SECTOR_SIZE;
-	r->bloom_base = r->index_base +
-	    (size_t)r->header.index_blocks * TESSERA_SECTOR_SIZE;
+	/* ★ #124: VALIDATE THE GEOMETRY BEFORE FORMING ANY POINTER FROM IT.
+	 *
+	 * index_blocks, blob_count, bloom_bytes, data_offset and data_length are
+	 * read straight off disk. Every one of them used to flow directly into
+	 * pointer arithmetic below and into the accessors' bounds checks, with
+	 * total_pack_bytes == len as the ONLY constraint — and that bounds none
+	 * of them. A pack claiming data_offset = 2^64-1 made `data + data_offset`
+	 * overflow the pointer (undefined behaviour, caught by UBSAN at
+	 * pack.c:321), and had it not wrapped, the tessera_crc32(data_base,
+	 * data_length) two lines down would have read an arbitrary length from an
+	 * arbitrary address. Found by fuzzing, not by review — reviewers had read
+	 * this function repeatedly.
+	 *
+	 * Bounding them HERE is what makes the accessors sound: blob_hash_at
+	 * indexes by blob_count, lookup binary-searches the index, and
+	 * bloom_might_contain walks bloom_bits, none of which check the region
+	 * they are walking. One validation, one place.
+	 *
+	 * Every check is written as SUBTRACTION or DIVISION against a known-good
+	 * bound. The obvious `off + size > len` forms are themselves the bug:
+	 * they overflow on exactly the inputs that need rejecting, and then pass.
+	 *
+	 * Layout is header | index | bloom | data | footer (tessera_pack_finalize).
+	 * Only containment within the buffer is enforced, not the ORDER of the
+	 * regions: a pack written by an older builder with a different layout is
+	 * still safe to read, and rejecting it here would be a compatibility
+	 * break, not a safety win. */
+	const size_t sect      = TESSERA_SECTOR_SIZE;
+	const size_t index_off = sect;
+	const size_t foot_off  = len - sect;      /* len >= 2*sect, checked above */
+
+	/* Index region: index_blocks sectors starting after the header, and it
+	 * must stop before the footer. */
+	if (r->header.index_blocks > (foot_off - index_off) / sect) goto fail;
+	const size_t index_bytes = (size_t)r->header.index_blocks * sect;
+
+	/* Every index entry blob_count promises must lie inside that region. */
+	if (r->header.blob_count > index_bytes / TESSERA_PACK_INDEX_ENTRY_SIZE)
+		goto fail;
+
+	/* Bloom follows the index; its bytes must stop before the footer. */
+	const size_t bloom_off = index_off + index_bytes;   /* <= foot_off */
+	if (r->header.bloom_bytes > foot_off - bloom_off) goto fail;
+
+	/* Data region must lie wholly inside the buffer, ahead of the footer. */
+	if (r->header.data_offset > foot_off) goto fail;
+	if (r->header.data_length > foot_off - r->header.data_offset) goto fail;
+
+	r->index_base = data + index_off;
+	r->bloom_base = data + bloom_off;
 	r->data_base  = data + r->header.data_offset;
 	r->bloom_bits = (size_t)r->header.bloom_bytes * 8u;
 	r->k_hashes   = r->header.bloom_hash_count;
@@ -372,8 +419,18 @@ tessera_pack_lookup(const tessera_pack_reader_t *r,
 		if (c == 0) {
 			tessera_pack_index_entry_t ie;
 			(void)tessera_decode_pack_index_entry(e, &ie);
-			if (ie.data_offset + sizeof(tessera_blob_descriptor_t)
-			    + ie.data_size > r->header.data_length)
+			/* ★ #124: subtraction, not addition. The old form —
+			 * `data_offset + sizeof(bd) + data_size > data_length`
+			 * — wraps in 64-bit on a large data_offset and then
+			 * COMPARES AS SMALL, so the check passed for precisely
+			 * the entries it existed to reject. data_length is now
+			 * bounded by pack_open, so this is exact. */
+			if (ie.data_offset > r->header.data_length)
+				return TESSERA_ECORRUPT;
+			uint64_t avail = r->header.data_length - ie.data_offset;
+			if (avail < sizeof(tessera_blob_descriptor_t) ||
+			    ie.data_size >
+			        avail - sizeof(tessera_blob_descriptor_t))
 				return TESSERA_ECORRUPT;
 			tessera_blob_descriptor_t bd;
 			if (tessera_decode_blob_descriptor(
