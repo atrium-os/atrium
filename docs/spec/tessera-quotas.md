@@ -171,47 +171,50 @@ What it does **not** do is scope `statfs` — a path inside a
 per-directory domain still sees pool-physical numbers, because of
 the per-mount constraint above.
 
-#### 3.6.2 OPEN: channel 1 inside a jail (needs a decision)
+#### 3.6.2 channel 1 inside a jail — RESOLVED: per-app volumes
 
-tessera-fs.md §20.1 lists free space (`statfs`) as observation
-channel 1 and states it is "closed by quota-scoped statfs
-(tessera-quotas.md §3.6)". As built, that closure does not reach a
-Portcullis jail, and this section should not be read as claiming
-it does. Two facts, both measured 2026-08-04:
+**Normative:** a jail-visible mount MUST be its own Tessera volume
+carrying a whole-FS quota. Quota'ing a subdirectory of a shared
+volume does NOT close channel 1, and §3.6 must not be cited as if
+it did.
 
-1. Jails are subtrees of **one shared Tessera volume** by design
-   (portcullis.md §4.1 — the choice that makes cross-jail dedup
-   work, so per-app volumes are not an option). The shared mount
-   therefore has no per-app whole-FS quota to scope against, and
-   §3.6.1 means a per-directory domain does not scope either.
-2. A jail root is `unionfs` over read-only `nullfs`, so `df`
-   inside the jail is answered by **unionfs**, not Tessera.
-   Measured inside such a jail, over a directory quota'd at
-   10 MiB on a 25 GiB pool:
+Two measurements decided this (2026-08-04).
+
+1. **A quota'd subdirectory does not scope what a jail sees.** A
+   jail root is `unionfs` over read-only `nullfs`, so `df` inside
+   is answered by **unionfs**, not Tessera. Over a directory
+   quota'd at 10 MiB on a 25 GiB pool:
 
    ```
    <above>:/var/lib/atrium/…/overlay   50G   40G   9.9G   80%   /
    ```
 
-   The `9.9G` available matches the underlying pool's `9.9G`
-   exactly — unionfs **passes the underlying free space through**.
-   So a jailed app can read pool free space, which is precisely
-   channel 1.
+   The `9.9G` matches the underlying pool exactly — unionfs passes
+   free space through, and the `50G` on a 25 GiB pool is unionfs
+   summing its layers. **Tessera is never consulted**, so making
+   its statfs path-aware could not change that number by one byte.
+   That is why §3.6's per-mount scoping is not a limitation to be
+   fixed but the shape of the answer: scope the MOUNT.
 
-It was hoped that the `overlays/<id>` `deferred` policy would
-close this anyway — an untrusted write that always allocates moves
-free space regardless of content, so the oracle gets no signal.
-**Measured 2026-08-04: it does not, because `deferred` is not
-implemented.** `dedup_policy` is defined in the format
-(format.h:498) and every domain is initialised to
-`TESSERA_DEDUP_DEFERRED` (core/src/quota.c:25), but the kmod never
-reads the field and `domain_salt` is referenced nowhere. There is
-no policy branch in the publish path; every write dedups
-synchronously.
+2. **A per-app volume does close it**, verified:
 
-The oracle is consequently open and noise-free. On a fresh 2 GiB
-volume, writing 4 MiB that already exists versus 4 MiB of novel
-content, measured in statfs blocks over three rounds:
+   ```
+   mount -t tessera -o tessera.quota_bytes=N /dev/vtbdX /path
+   -> df outside: 10M ; jail rooted there: "10M 100%"
+   -> writes refused at exactly 10 MiB
+   ```
+
+This supersedes the earlier reading of portcullis.md §4.1, which
+took "one shared volume" as fixed because cross-jail dedup depends
+on it. Cross-jail dedup and a jail-visible free-space oracle are
+the same mechanism seen from two sides; you cannot keep the first
+and close the second on one volume. The doctrine is now: shared
+volume for trusted/system content, per-app volume for anything a
+jail can observe.
+
+The oracle on a shared volume is open and noise-free — writing
+4 MiB that already exists versus 4 MiB of novel content, in
+statfs blocks, on a fresh 2 GiB volume:
 
 | round | duplicate | unique |
 |---|---|---|
@@ -219,10 +222,32 @@ content, measured in statfs blocks over three rounds:
 | 2 | **5 blk** | 1039 blk |
 | 3 | **5 blk** | 1039 blk |
 
-208× separation, zero variance. See task #114 and
-`scratch/oracle.sh`. **Do not cite §3.6 as the closure for
-channel 1 in a jail.** Closing it requires implementing §20.2 in
-the publish path so a `deferred` domain always allocates.
+208× separation, zero variance (`scratch/oracle.sh`).
+
+> **Correction (2026-08-06).** An earlier version of this section
+> said the `deferred` policy "is not implemented — the kmod never
+> reads the field, there is no policy branch in the publish path".
+> That is **no longer true**: `deferred` landed with the
+> dead-extent log (#114). The publish path branches on the
+> writer's domain policy (`tessera_fs.c`, the
+> `TESSERA_DEDUP_DEFERRED` test around line 4027), the policy is
+> settable per domain via `TESSERA_IOC_DEDUP_POLICY`, and
+> `kern.tessera.dead_extent_recorded` counts extents the deferred
+> path allocated instead of deduplicating. It is gated behind
+> `kern.tessera.dedup_deferred_enable` and domains default to
+> `GLOBAL`, not `DEFERRED` (changed deliberately in 6bac9879 —
+> domain 1 covers the root and trusted-ingest trees, and flipping
+> those to append-anyway regresses the disk-cost thesis).
+>
+> So a `deferred` domain is now a real second lever against
+> channel 1 on a shared volume: an untrusted write always
+> allocates, so free space moves regardless of content. It is not
+> a substitute for requirement 1 above — it costs disk space, and
+> it must be armed per domain — but it is available.
+>
+> Still unimplemented: `TESSERA_DEDUP_SALTED`. `domain_salt`
+> appears only in a comment, and the policy ioctl rejects any
+> value other than `GLOBAL` or `DEFERRED`.
 
 ### 3.7 Mount-time toggle for testing
 

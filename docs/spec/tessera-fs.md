@@ -953,17 +953,21 @@ The observation channels, strongest first:
 1. **Physical free space** (`statfs`). Write a candidate, fsync,
    re-read free space. Unchanged → dedup hit. Noise-free.
    Closed by quota-scoped statfs (tessera-quotas.md §3.6) **on a
-   mount carrying a whole-FS quota**. ⚠ That closure does NOT
-   currently reach a Portcullis jail: jails share one volume
-   (portcullis.md §4.1), statfs scoping is per-mount not per-path,
-   and a jail's `df` is answered by unionfs, which passes the
-   underlying pool's free space through (measured 2026-08-04).
-   See tessera-quotas.md §3.6.2 — OPEN.
-   ⚠⚠ And §20.2's `deferred` policy does NOT cover for it: the
-   policy field is set but never read by the kmod, so every write
-   dedups synchronously. Measured 4 MiB duplicate = 5 blocks vs
+   mount carrying a whole-FS quota** — which for a jail means the
+   jail's own Tessera volume, not a quota'd subdirectory of a
+   shared one. ⚠ A quota'd SUBDIRECTORY does not close it: statfs
+   scoping is per-mount not per-path, and a jail's `df` is
+   answered by unionfs, which passes the underlying pool's free
+   space through (measured 2026-08-04). Per-app volumes were
+   verified to close it. See tessera-quotas.md §3.6.2 — RESOLVED.
+   Measured on a shared volume, 4 MiB duplicate = 5 blocks vs
    4 MiB novel = 1039 blocks, three rounds, zero variance — the
-   oracle is open and noise-free. Task #114.
+   oracle is open and noise-free there.
+   §20.2's `deferred` policy is a second lever and IS implemented
+   as of #114 (an earlier note here said the field was never read
+   by the kmod; that is no longer true). It is gated behind
+   `kern.tessera.dedup_deferred_enable`, armed per domain, and
+   domains default to `GLOBAL` — see tessera-quotas.md §3.6.2.
 2. **Write/fsync timing.** A synchronous-dedup hit skips the
    pack append; latency is content-dependent. Closed by the
    `deferred` policy below.
