@@ -125,6 +125,9 @@ pub fn launch_with_stdio(
     fs::create_dir_all(&overlay_dir)
         .map_err(|e| LaunchError::Failed("mount",
                  format!("create {}: {e}", overlay_dir.display())))?;
+    /* Before anything is mounted over it, and before the app can write:
+     * close the dedup existence oracle on the overlay. */
+    arm_overlay_dedup(&overlay_dir)?;
     fs::create_dir_all(&jail_path)
         .map_err(|e| LaunchError::Failed("mount",
                  format!("create {}: {e}", jail_path.display())))?;
@@ -390,6 +393,103 @@ fn resolve_app_uid(owner: &str, app_id: &str) -> Result<(u32, String), LaunchErr
         }
     };
     Ok((uid, run_as))
+}
+
+/* ── dedup-oracle containment on overlays (tessera-quotas.md §3.6.2) ──
+ *
+ * An overlay is the one place a jailed app writes to the shared Tessera
+ * volume, so it is where the dedup existence oracle leaks: write a candidate
+ * file, fsync, read free space — unchanged means those bytes already exist
+ * somewhere on the system. Measured on a GLOBAL domain, 4 MiB duplicate costs
+ * 20 K vs 4156 K for novel content: a 208x, noise-free signal.
+ *
+ * `deferred` closes it. The write always allocates, so free space moves by the
+ * full size regardless of content and the observer learns nothing; the
+ * duplicate extents go into the dead-extent log and the GC reclaims them
+ * later. Dedup is preserved — measured, 5 duplicates consumed 20700 K and
+ * recovered 20740 K after the drain, files intact. That is why this is not
+ * "give every app its own volume": a volume is the dedup boundary, and every
+ * bundle shares a base, so per-app volumes would store it once per app.
+ *
+ * NEITHER PREREQUISITE IS A DEFAULT. Domains initialise to GLOBAL and
+ * kern.tessera.dedup_deferred_enable is 0, so this must be armed explicitly —
+ * which is the whole reason this function exists.
+ */
+
+/* FreeBSD _IOW('T', n, uint64_t): IOC_IN | (sizeof<<16) | ('T'<<8) | n */
+const TESSERA_IOC_QUOTA_SET:    libc::c_ulong = 0x8008_5401;
+const TESSERA_IOC_DEDUP_POLICY: libc::c_ulong = 0x8008_5403;
+const TESSERA_DEDUP_DEFERRED:   u64 = 1;
+
+/* The quota exists to CREATE THE DOMAIN — the kmod refuses a dedup policy on a
+ * directory that is not already a quota root (EINVAL), because a policy on a
+ * plain directory would silently apply to whatever domain it inherits, i.e.
+ * the whole filesystem. It is not a meaningful cap on overlay growth; sizing
+ * that is a separate question (storage.md). f_bavail is clamped to real pool
+ * free space, so a limit above the volume size is harmless. */
+const OVERLAY_DOMAIN_QUOTA_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+fn is_tessera(dir: &Path) -> bool {
+    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    let mut sfs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut sfs) } != 0 { return false; }
+    let name: Vec<u8> = sfs.f_fstypename.iter()
+        .take_while(|&&ch| ch != 0).map(|&ch| ch as u8).collect();
+    name == b"tessera"
+}
+
+fn arm_overlay_dedup(overlay_dir: &Path) -> Result<(), LaunchError> {
+    /* Not on Tessera (a dev box on ZFS, say). Nothing to arm — but do NOT
+     * pass silently: the containment simply is not in place, and a warning
+     * that says so is the difference between a known gap and a believed-closed
+     * one. */
+    if !is_tessera(overlay_dir) {
+        eprintln!("portcullisd: WARNING: {} is not on Tessera — the dedup existence oracle (tessera-quotas.md §3.6.2) is NOT closed for this app",
+            overlay_dir.display());
+        return Ok(());
+    }
+
+    /* Host-wide prerequisite. The kmod refuses to arm `deferred` without it,
+     * deliberately: gating the publish pre-check without the dead-extent log
+     * would leave the oracle exactly as open while paying the extra write. */
+    let enabled = Command::new("sysctl")
+        .args(["-n", "kern.tessera.dedup_deferred_enable"])
+        .output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "1").unwrap_or(false);
+    if !enabled {
+        run("sysctl", &["kern.tessera.dedup_deferred_enable=1"]).map_err(|e| {
+            LaunchError::Failed("mount",
+                format!("enable deferred dedup: {e} (required by tessera-quotas.md §3.6.2)"))
+        })?;
+        eprintln!("portcullisd: enabled kern.tessera.dedup_deferred_enable");
+    }
+
+    let f = fs::File::open(overlay_dir).map_err(|e| {
+        LaunchError::Failed("mount", format!("open {}: {e}", overlay_dir.display()))
+    })?;
+    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&f);
+
+    let mut limit: u64 = OVERLAY_DOMAIN_QUOTA_BYTES;
+    if unsafe { libc::ioctl(fd, TESSERA_IOC_QUOTA_SET, &mut limit) } != 0 {
+        return Err(LaunchError::Failed("mount", format!(
+            "quota-set on {}: {} — cannot create the dedup domain",
+            overlay_dir.display(), std::io::Error::last_os_error())));
+    }
+    let mut pol: u64 = TESSERA_DEDUP_DEFERRED;
+    if unsafe { libc::ioctl(fd, TESSERA_IOC_DEDUP_POLICY, &mut pol) } != 0 {
+        /* HARD FAILURE, deliberately. Launching with the oracle open would be
+         * a silent security regression, and the failure is actionable. */
+        return Err(LaunchError::Failed("mount", format!(
+            "dedup-policy=deferred on {}: {} — refusing to launch with the \
+dedup existence oracle open (tessera-quotas.md §3.6.2)",
+            overlay_dir.display(), std::io::Error::last_os_error())));
+    }
+    eprintln!("portcullisd: {} armed deferred dedup (oracle closed)",
+        overlay_dir.display());
+    Ok(())
 }
 
 fn run(cmd: &str, args: &[&str]) -> std::io::Result<()> {
