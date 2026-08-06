@@ -686,6 +686,25 @@ ph_stage() {
         [ -x "$bp" ] && cp "$bp" "$DIST/bin/$b"
     done
 
+    # ★ The SPIR-V bundles. frescod loads bundles/atrium-core/{compute,pipelines}
+    # /*.spv at startup and will not start without them, so staging only the
+    # binaries produces an install that looks complete and cannot run a
+    # compositor. atrium-text is a sibling frescod picks up on its own.
+    # These are ARCH-INDEPENDENT (SPIR-V + JSON), which is why they are staged
+    # here, ABOVE the aarch64 check — that check must not see them.
+    for b in atrium-core atrium-text; do
+        [ -d "$REPO/bundles/$b" ] || continue
+        nspv=$(find "$REPO/bundles/$b" -name '*.spv' | wc -l | tr -d ' ')
+        if [ "$nspv" -eq 0 ]; then
+            warn "bundles/$b has no .spv — build it with bundles/$b/build.sh" \
+                 "frescod will fail to start without the compiled shaders."
+            continue
+        fi
+        mkdir -p "$DIST/bundles"
+        cp -R "$REPO/bundles/$b" "$DIST/bundles/$b"
+        ok "staged bundle $b ($nspv .spv)"
+    done
+
     # Verify every staged file is a FreeBSD aarch64 object, not a macOS one. It
     # is easy to copy a host build by mistake, and the mistake only shows up
     # much later as an exec failure inside the guest.
@@ -736,6 +755,32 @@ for b in "$D"/bin/*; do
     install -m 755 "$b" /usr/local/bin/ && echo "  $(basename "$b")"
 done
 
+echo "== bundles =="
+# frescod loads bundles/atrium-core/{compute,pipelines}/*.spv at startup and
+# refuses to run without them. It searches /usr/local/share/atrium/bundles, so
+# that is where they go; atrium-text is a sibling it picks up on its own.
+# Prefer the staged copy under dist/, fall back to the repo over the 9p share.
+SRCB=""
+[ -d "$D/bundles" ] && SRCB="$D/bundles"
+[ -z "$SRCB" ] && [ -d "$D/../bundles" ] && SRCB="$D/../bundles"
+if [ -n "$SRCB" ]; then
+    mkdir -p /usr/local/share/atrium/bundles
+    for b in atrium-core atrium-text; do
+        [ -d "$SRCB/$b" ] || continue
+        rm -rf "/usr/local/share/atrium/bundles/$b"
+        cp -R "$SRCB/$b" /usr/local/share/atrium/bundles/
+        # Copying dist/ off macOS with tar leaves AppleDouble "._name" siblings.
+        # They are junk, and "._op_path.comp.spv" MATCHES *.spv — so they both
+        # pollute the bundle and inflate every shader count that looks for it.
+        find "/usr/local/share/atrium/bundles/$b" -name '._*' -delete 2>/dev/null
+        echo "  $b ($(find /usr/local/share/atrium/bundles/$b -name '*.spv' | wc -l | tr -d ' ') .spv)"
+    done
+else
+    echo "  WARNING no bundles found — frescod will not start."
+    echo "  Build them on the host with bundles/atrium-core/build.sh, re-run"
+    echo "  bootstrap-atrium.sh --only stage, then re-run this installer."
+fi
+
 echo "== verify =="
 for b in portcullisd frescod opifex; do
     if [ -x /usr/local/bin/$b ]; then
@@ -744,8 +789,19 @@ for b in portcullisd frescod opifex; do
             || echo "  $b: WARNING unresolved libraries (ldd failed)"
     fi
 done
+# Gate on the SHADERS landing, not on the copy having been attempted: an empty
+# or partial bundle directory makes frescod fail at startup with a message that
+# points at the compositor, not at the install.
+core=/usr/local/share/atrium/bundles/atrium-core
+n=$(find $core -name '*.spv' 2>/dev/null | wc -l | tr -d ' ')
+if [ -f "$core/manifest.json" ] && [ "$n" -gt 0 ]; then
+    echo "  atrium-core bundle: $n shaders + manifest.json installed"
+else
+    echo "  atrium-core bundle: MISSING or incomplete — frescod cannot start"
+fi
 echo
-echo "Done. Atrium userspace is in /usr/local/bin."
+echo "Done. Atrium userspace is in /usr/local/bin,"
+echo "bundles in /usr/local/share/atrium/bundles."
 INSTALLER
     chmod 755 "$DIST/install-atrium.sh"
 
