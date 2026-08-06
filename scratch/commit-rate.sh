@@ -42,17 +42,36 @@ LPID=$!
 phase LIGHT 120
 kill $LPID 2>/dev/null; wait $LPID 2>/dev/null
 
-# ★ NEITHER buildkernel NOR a libc build runs in this guest's /usr/src:
-# buildkernel dies after ~39s on sched_laminar.o, libc within 30s. Both are
-# pre-existing tree problems, nothing to do with Tessera. An earlier run
-# ramped 60s and then sampled a DEAD build, reporting "0 commits" as though
-# the filesystem were quiet under load — so this arm now uses a synthetic
-# workload that reliably runs, and ASSERTS IT IS ALIVE while sampling.
+# ★ CORRECTION (this comment previously said the guest's /usr/src was broken —
+# it is NOT, and that claim reached a commit message; see the correction commit
+# for b24eb847). The builds died of ENOSPC, caused by THIS SCRIPT pointing the
+# object tree at a 256 MiB scratch volume. A GENERIC obj tree is 1.0 GB.
+#
+#   MAKEOBJDIRPREFIX=/usr/obj  (ZFS, 20 GiB free)   -> exit 0, clean build
+#   MAKEOBJDIRPREFIX=/mnt/obj  (Tessera, 256 MiB)   -> exit 2, ENOSPC
+#
+# What made it look like a source/toolchain fault: clang reports a failed write
+# to its output stream as "fatal error: error in backend: IO failure on output
+# stream: No space left on device" followed by a full LLVM backtrace and
+# "PLEASE submit a bug report". That reads like a compiler crash on
+# sched_laminar.o. It is a full disk.
+#
+# ★ THE LESSON worth keeping: a backtrace is not a diagnosis. The first arm of
+# any harness that "fails to build" should be the SAME build somewhere with
+# room — that one control would have caught this immediately, and instead the
+# wrong conclusion propagated into a commit message and a task description.
+#
+# The synthetic workload below stays, for a reason unrelated to the above: it
+# starts producing load in ~1s instead of ~60s of config/depend, which keeps
+# the sampling window aligned with steady state. The liveness gate stays too —
+# an earlier run ramped 60s and sampled a DEAD build, reporting "0 commits" as
+# though the filesystem were quiet under load.
 #
 # SUBSTITUTION, stated plainly: this measures the commit rate under sustained
 # concurrent small-file writes — the shape of load a build puts on the FS —
 # not buildkernel specifically. It bounds the commit interval under heavy
-# write pressure, which is the quantity #116 needs.
+# write pressure, which is the quantity #116 needs. buildkernel onto a
+# large-enough Tessera volume is the higher-fidelity arm and is now possible.
 echo "== HEAVY: 4 concurrent small-file writer loops on the Tessera volume =="
 mkdir -p $MNT/heavy
 w=1
