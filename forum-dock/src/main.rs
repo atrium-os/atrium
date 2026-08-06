@@ -35,8 +35,20 @@ fn apps_dir() -> PathBuf {
     std::env::var("FORUM_APPS_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(APPS_DIR))
 }
 
-const SCREEN_W: f32 = 1280.0;
-const SCREEN_H: f32 = 720.0;
+/// The output geometry. Hardcoding it meant the dock drew its panel at
+/// y = H - dock_h - 28 for a 720-tall screen — off the bottom of the actual
+/// 640x480 scanout, so the wallpaper appeared but the launcher never did.
+/// Same FORUM_SCREEN="WxH" convention forum-wm uses; frescod knows the real
+/// mode and should eventually tell both (see the mode-query follow-up).
+fn screen_wh() -> (f32, f32) {
+    std::env::var("FORUM_SCREEN")
+        .ok()
+        .and_then(|s| {
+            let (a, b) = s.split_once('x')?;
+            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+        })
+        .unwrap_or((1280.0, 720.0))
+}
 const TILE: f32 = 60.0;
 const GAP: f32 = 16.0;
 const PAD: f32 = 16.0;
@@ -90,6 +102,8 @@ impl Icons {
 struct DockView {
     apps: Vec<AppEntry>,
     icons: Icons,
+    w: f32,
+    h: f32,
 }
 
 impl View for DockView {
@@ -97,7 +111,7 @@ impl View for DockView {
         let t = ctx.theme;
         // Desktop wallpaper.
         ctx.push(Node::Rect {
-            rect: Rect::new(0.0, 0.0, SCREEN_W, SCREEN_H),
+            rect: Rect::new(0.0, 0.0, self.w, self.h),
             fill: palette::deep_teal(),
             radius: 0.0,
         });
@@ -105,8 +119,8 @@ impl View for DockView {
         let n = self.apps.len().max(1) as f32;
         let dock_w = PAD * 2.0 + n * TILE + (n - 1.0) * GAP;
         let dock_h = PAD * 2.0 + TILE;
-        let dock_x = (SCREEN_W - dock_w) * 0.5;
-        let dock_y = SCREEN_H - dock_h - 28.0;
+        let dock_x = (self.w - dock_w) * 0.5;
+        let dock_y = self.h - dock_h - 28.0;
 
         // Dock panel — elevated, rounded.
         ctx.add(Node::Rect {
@@ -190,16 +204,25 @@ fn render_dock() -> io::Result<()> {
     // back/background surface — the WM places it behind everything; the dock
     // panel it paints in the bottom strip stays visible under documents.
     let hints = WindowHints { role: Some(WmRole::Background), ..Default::default() };
-    let win = conn.window_create(SCREEN_W as u32, SCREEN_H as u32, "forum-dock", hints)?;
+    let (sw, sh) = screen_wh();
+    let win = conn.window_create(sw as u32, sh as u32, "forum-dock", hints)?;
     let mut surface = FrescoSurface::new(conn, win);
 
-    let mut app = App::new(DockView { apps, icons: Icons::load() }).with_theme(mode);
+    let mut app = App::new(DockView { apps, icons: Icons::load(), w: sw, h: sh }).with_theme(mode);
     let deltas = app.tick();
     eprintln!("forum-dock: drawing the dock ({} node deltas)", deltas.len());
     commit(&mut surface, &deltas)?;
     surface.present()?;
-    std::thread::sleep(std::time::Duration::from_secs(30));
-    Ok(())
+
+    // ★ Stay up. The dock paints the wallpaper and the launcher strip — it IS
+    // the desktop background, so exiting takes the desktop with it. It used to
+    // draw once, sleep 30s and quit. Its content is static (the catalog only
+    // changes on install/uninstall), so unlike the bar it has nothing to
+    // repaint: park instead of polling, and do no compositing at all while
+    // idle. A redraw comes from the WM re-declaring the layout, not from here.
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
 }
 
 fn main() -> io::Result<()> {

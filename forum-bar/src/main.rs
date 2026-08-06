@@ -22,10 +22,14 @@ const W: f32 = 1280.0;
 const BAR_H: f32 = 36.0;
 
 /// What the bar shows. Tiny data model; the WM core (forum-ctl) feeds it.
+/// Live session state, as signals rather than plain values: the bar is session
+/// chrome that stays up for the whole session, so every field it shows has to be
+/// updatable without rebuilding the view. Setting a `Mutable` marks the app
+/// dirty, which is what makes the next `tick()` re-render.
 struct BarView {
-    focus_app: String,
-    windows: usize,
-    clock: String,
+    focus_app: pergola::reactive::Mutable<String>,
+    windows:   pergola::reactive::Mutable<usize>,
+    clock:     pergola::reactive::Mutable<String>,
 }
 
 impl View for BarView {
@@ -61,7 +65,7 @@ impl View for BarView {
         // The focused app, next to the wordmark.
         ctx.add(Node::Text {
             rect: Rect::new(86.0, ty + 1.0, 0.0, 0.0),
-            content: format!("· {}", self.focus_app),
+            content: format!("· {}", self.focus_app.get_cloned()),
             style: TextStyle {
                 family: font::SANS.into(),
                 size: type_size::SM,
@@ -73,7 +77,7 @@ impl View for BarView {
         // Right cluster: window count + clock + an accent "session active" dot.
         ctx.add(Node::Text {
             rect: Rect::new(W - 250.0, ty + 1.0, 0.0, 0.0),
-            content: format!("{} window{}", self.windows, if self.windows == 1 { "" } else { "s" }),
+            content: { let n = self.windows.get(); format!("{n} window{}", if n == 1 { "" } else { "s" }) },
             style: TextStyle {
                 family: font::SANS.into(),
                 size: type_size::SM,
@@ -83,7 +87,7 @@ impl View for BarView {
         });
         ctx.add(Node::Text {
             rect: Rect::new(W - 96.0, ty, 0.0, 0.0),
-            content: self.clock.clone(),
+            content: self.clock.get_cloned(),
             style: TextStyle {
                 family: font::SANS.into(),
                 size: type_size::MD,
@@ -132,13 +136,40 @@ fn main() -> std::io::Result<()> {
     let win = conn.window_create(W as u32, BAR_H as u32, "forum-bar", hints)?;
     let mut surface = FrescoSurface::new(conn, win);
 
-    let view = BarView { focus_app, windows, clock: clock_hhmm() };
-    let mut app = App::new(view).with_theme(mode);
+    // One dirty flag shared by the app and its signals, so `set()` on any of
+    // them is what schedules the next repaint.
+    let dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    use pergola::reactive::Mutable;
+    let focus_sig  = Mutable::with_dirty(focus_app, dirty.clone());
+    let window_sig = Mutable::with_dirty(windows,   dirty.clone());
+    let clock_sig  = Mutable::with_dirty(clock_hhmm(), dirty.clone());
+    let view = BarView {
+        focus_app: focus_sig.clone(),
+        windows:   window_sig.clone(),
+        clock:     clock_sig.clone(),
+    };
+    let mut app = App::new_with_flag(view, dirty).with_theme(mode);
     let deltas = app.tick();
     eprintln!("forum-bar: drawing the bar ({} node deltas)", deltas.len());
     commit(&mut surface, &deltas)?;
     surface.present()?;
 
-    std::thread::sleep(std::time::Duration::from_secs(30));
-    Ok(())
+    // ★ Stay up. The bar is session chrome, not a one-shot: it used to draw
+    // once, sleep 30s and exit, so the desktop evaporated half a minute after
+    // login. Poll once a second, but only COMMIT when something actually
+    // changed — tick() returns no deltas while the app is clean, so an idle bar
+    // does no compositing and lets the GPU stay gated (forum.md §2.5).
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let now = clock_hhmm();
+        if now != clock_sig.get_cloned() { clock_sig.set(now); }
+        let (f, w) = status();
+        if f != focus_sig.get_cloned()  { focus_sig.set(f); }
+        if w != window_sig.get() { window_sig.set(w); }
+
+        let deltas = app.tick();
+        if deltas.is_empty() { continue; }
+        commit(&mut surface, &deltas)?;
+        surface.present()?;
+    }
 }
