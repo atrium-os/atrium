@@ -298,7 +298,15 @@ if [ "$WANT_DISPLAY" = 1 ]; then
     # ddb_session.py — defeats the point of "panic in display path"
     # debugging. Use `nc 127.0.0.1 4444` for serial / break with
     # `~^B`; QMP at /tmp/qmp.sock for screendumps etc.
-    DISPLAY_FRONTEND="-display cocoa \
+    # ★ zoom-to-fit: without it the Cocoa view draws the guest surface at the
+    # Retina backing scale — one guest pixel per DEVICE pixel — so a 640x480
+    # guest renders 1280x960 into a window sized in POINTS and you see roughly a
+    # quarter of it, magnified: the top bar scrolled off, the right edge cut.
+    # It looks like the compositor laid the desktop out wrong when the scanout
+    # is perfectly correct (verified against `screendump`, which captures the
+    # guest framebuffer and shows the whole desktop). With zoom-to-fit the
+    # guest is scaled to the window instead of cropped.
+    DISPLAY_FRONTEND="-display cocoa,zoom-to-fit=on \
                       -serial tcp:127.0.0.1:4444,server=on,wait=off \
                       -monitor unix:/tmp/qmp.sock,server=on,wait=off \
                       -device qemu-xhci \
