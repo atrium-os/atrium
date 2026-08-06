@@ -718,14 +718,44 @@ mod tests {
     #[test]
     fn network_inherit_requires_allowlist() {
         let mut p = load_sample_policy();
+        // ★ Assert the PREMISE rather than assuming it. This test used to use
+        // "atrium-stoad" as its not-allowlisted example; stoad was later
+        // genuinely added to the shipped allowlist (22d2481b — it needs
+        // ip4=inherit for per-session UDP), so the test began failing for a
+        // reason that had nothing to do with the validator, and stayed red.
+        // A name the shipped policy happens not to list is not a fixture.
+        let outsider = "atrium-not-allowlisted";
+        assert!(
+            !p.network.allow_inherit_jails.iter().any(|n| n == outsider),
+            "fixture broken: {outsider:?} IS in the shipped allowlist, so this \
+             test cannot show that inherit is refused without one"
+        );
+
         // not in the allowlist → rejected
-        let err = validate_network(&NetworkConfig::Inherit, "atrium-stoad", &p).unwrap_err();
+        let err = validate_network(&NetworkConfig::Inherit, outsider, &p).unwrap_err();
         assert!(matches!(err,
             JaildError::PolicyViolation { rule: "network.inherit.not_allowed", .. }));
         // allowlisted by name → ok; a different name stays rejected
-        p.network.allow_inherit_jails.push("atrium-stoad".into());
-        validate_network(&NetworkConfig::Inherit, "atrium-stoad", &p).unwrap();
+        p.network.allow_inherit_jails.push(outsider.into());
+        validate_network(&NetworkConfig::Inherit, outsider, &p).unwrap();
         assert!(validate_network(&NetworkConfig::Inherit, "atrium-other", &p).is_err());
+    }
+
+    /// The other half, against the REAL shipped policy: the allowlist actually
+    /// grants. ip4=inherit shares the host stack, so both directions are worth
+    /// pinning — that it is refused by default, and that the one jail the
+    /// policy deliberately lists still gets it. Catches an accidental deletion
+    /// from etc/jaild.policy.toml, which would break stoa's remote sessions
+    /// with a policy error rather than anything that points at the cause.
+    #[test]
+    fn shipped_policy_grants_inherit_to_the_jails_it_lists() {
+        let p = load_sample_policy();
+        assert!(!p.network.allow_inherit_jails.is_empty(),
+            "shipped policy lists no inherit jails — stoad needs one");
+        for name in &p.network.allow_inherit_jails {
+            validate_network(&NetworkConfig::Inherit, name, &p)
+                .unwrap_or_else(|e| panic!("shipped allowlist entry {name:?} refused: {e}"));
+        }
     }
 
     #[test]
