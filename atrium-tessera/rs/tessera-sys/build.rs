@@ -13,9 +13,28 @@ fn main() {
     println!("cargo:rerun-if-env-changed=TESSERA_CORE_LIB");
     println!("cargo:rerun-if-env-changed=TESSERA_CORE_INCLUDE");
 
-    if let Ok(libdir) = env::var("TESSERA_CORE_LIB") {
-        println!("cargo:rustc-link-search=native={libdir}");
-        println!("cargo:rustc-link-lib=static=tessera_core");
+    // ── linking the C core ──────────────────────────────────────────────
+    //
+    // Cross (the FreeBSD target) links the prebuilt archive the bootstrap
+    // produces. The HOST cannot: the archive sitting in the tree is that same
+    // CROSS-built ELF one, so linking it into a macOS binary dies with
+    //
+    //     ld: archive member 'tessera_reader.o' not a mach-o file
+    //
+    // which is why tessera-fsck could not be built on the host at all — and an
+    // offline fsck of vm/*.img is exactly what you want when a guest is too
+    // wedged to run one itself. `cargo clean -p tessera-sys` does not help;
+    // the archive it picks up is wrong for the target, not stale.
+    //
+    // So for a non-FreeBSD target, compile the core from source right here.
+    // No archive to mismatch, no build ordering to get right.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("freebsd") {
+        if let Ok(libdir) = env::var("TESSERA_CORE_LIB") {
+            println!("cargo:rustc-link-search=native={libdir}");
+            println!("cargo:rustc-link-lib=static=tessera_core");
+        }
+    } else {
+        build_core_for_host();
     }
     // libmd provides SHA-256 on FreeBSD. CARGO_CFG_TARGET_OS reflects
     // the cross-target (set by cargo); cfg!(target_os = ...) in
@@ -26,6 +45,59 @@ fn main() {
     }
 
     gen_reserve_trees();
+}
+
+/// Compile the C core for the build target (the non-FreeBSD case).
+///
+/// The file list comes from the core's own Makefile, never a copy: 17 of the 20
+/// .c files in core/src belong to the library, so globbing would pull in ones
+/// that don't, and hand-copying the list is how a file silently stops being
+/// built. (scripts/core-host-tests.sh carries its own hand-copied SRCS for the
+/// same job — worth collapsing onto this parser.)
+fn build_core_for_host() {
+    let core = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../core");
+    let mk = core.join("Makefile");
+    println!("cargo:rerun-if-changed={}", mk.display());
+    let Ok(text) = std::fs::read_to_string(&mk) else {
+        println!("cargo:warning=tessera-sys: {} unreadable — core not linked", mk.display());
+        return;
+    };
+    let srcs = parse_make_srcs(&text);
+    if srcs.is_empty() {
+        println!("cargo:warning=tessera-sys: no SRCS in the core Makefile — core not linked");
+        return;
+    }
+    let mut b = cc::Build::new();
+    b.include(core.join("include")).include(core.join("src"))
+        .flag_if_supported("-fno-strict-aliasing")
+        .warnings(false);
+    for f in &srcs {
+        let p = core.join("src").join(f);
+        println!("cargo:rerun-if-changed={}", p.display());
+        b.file(p);
+    }
+    b.compile("tessera_core");
+}
+
+/// Pull `SRCS= a.c b.c \` (backslash-continued) out of a BSD makefile.
+fn parse_make_srcs(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_srcs = false;
+    for line in text.lines() {
+        let l = line.trim();
+        if !in_srcs {
+            if !l.starts_with("SRCS") { continue; }
+            in_srcs = true;
+        }
+        let cont = l.ends_with('\\');
+        let body = l.trim_end_matches('\\');
+        let body = body.split_once('=').map(|(_, v)| v).unwrap_or(body);
+        out.extend(body.split_whitespace()
+                       .filter(|t| t.ends_with(".c"))
+                       .map(str::to_string));
+        if !cont { break; }
+    }
+    out
 }
 
 /// Turn `tessera/reserve_trees.h`'s X-macro table into a Rust slice.

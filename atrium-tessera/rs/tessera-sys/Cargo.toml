@@ -11,6 +11,9 @@ links       = "tessera_core"
 crate-type = ["rlib"]
 
 [build-dependencies]
+# Compiles the C core for non-FreeBSD targets (see build.rs): the prebuilt
+# archive in the tree is the cross-built one and cannot link on the host.
+cc = "1"
 # bindgen is added in Phase 1 once the C surface stabilises; for Phase 0
 # we hand-write a minimal subset to keep the toolchain dependency light.
 

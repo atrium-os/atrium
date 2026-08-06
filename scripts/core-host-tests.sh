@@ -25,6 +25,11 @@ CORE="$(cd "$(dirname "$0")/.." && pwd)/atrium-tessera/core"
 OBJ="$CORE/build-host"
 KEEPGOING=${1:-}
 
+# NOTE: hand-copied, and it should not be — tessera-sys/build.rs now parses the
+# same list out of core/Makefile (parse_make_srcs) for its host compile. Worth
+# collapsing this onto that single source, for the reason the TESTS comment
+# below already gives: a file added to the Makefile and missed here silently
+# stops being built.
 SRCS="error.c hash.c crc.c codec.c cdc.c btree.c manifest.c pack.c journal.c
       extent.c gc.c volume.c quota.c quota_store.c
       b3_blake3.c b3_blake3_portable.c b3_shim.c tessera_reader.c"
