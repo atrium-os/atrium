@@ -157,8 +157,9 @@ fn main() -> io::Result<()> {
     let ctl = forum_ctl::default_socket_path();
     let ctl = ctl.to_string_lossy();
     eprintln!("forum-wm: serving forum-ctl at {ctl}");
-    serve_forum_ctl(&ctl, &core)?;
-    Ok(())
+    let r = serve_forum_ctl(&ctl, &core);
+    remove_ctl_socket(); // also covers serve_forum_ctl failing after the bind
+    r
 }
 
 /// The input poller — focus-follows-click. frescod broadcasts every input event
@@ -261,6 +262,7 @@ fn spawn_input_poller(core: Core) {
                             // the compositor at all. Nothing here works without
                             // frescod — say so once and go.
                             eprintln!("forum-wm: compositor connection lost ({e}) — exiting");
+                            remove_ctl_socket();
                             std::process::exit(1);
                         }
                         Err(e) => {
@@ -401,10 +403,58 @@ fn spawn_input_poller(core: Core) {
 /// widen the trust of) a decision the TCB already made + enforced. See docs/spec/
 /// portcullis.md §9.0. (Dev `--no-prompt` launches skip the launch-time policy
 /// gate — an explicit operator trust decision, not a hole here.)
+/// The forum-ctl socket we bound, remembered so every exit path can unlink it:
+/// the path as a C string (a signal handler may not allocate), plus the
+/// (dev, ino) it had at bind time.
+///
+/// The identity check matters. `serve_forum_ctl` unlinks a stale socket before
+/// binding, so a second forum-wm displaces the first's file — without it, the
+/// displaced process would delete the NEW server's socket on its way out and
+/// leave a live daemon nobody can reach. We only remove the file if it is still
+/// the one we created.
+static CTL_SOCKET: std::sync::OnceLock<(std::ffi::CString, u64, u64)> = std::sync::OnceLock::new();
+
+/// Unlink our forum-ctl socket if the path still refers to it. Allocation-free
+/// and async-signal-safe (`stat`/`unlink` on a pre-built C string), so the same
+/// function serves the normal return, the fatal-error exit, and the signal
+/// handler.
+fn remove_ctl_socket() {
+    let Some((path, dev, ino)) = CTL_SOCKET.get() else { return };
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::stat(path.as_ptr(), &mut st) == 0
+            && st.st_dev as u64 == *dev
+            && st.st_ino as u64 == *ino
+        {
+            libc::unlink(path.as_ptr());
+        }
+    }
+}
+
+/// SIGTERM/SIGINT/SIGHUP: `pkill forum-wm` is how this daemon is stopped, and
+/// the default disposition would leave the socket file behind. Clean up, then
+/// `_exit` — the only async-signal-safe way out.
+extern "C" fn on_terminate(sig: libc::c_int) {
+    remove_ctl_socket();
+    unsafe { libc::_exit(128 + sig) };
+}
+
 fn serve_forum_ctl(path: &str, core: &Core) -> io::Result<()> {
     use std::os::unix::net::UnixListener;
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
+    // Remember what we just bound, then arrange to remove it on the way out.
+    if let Ok(c) = std::ffi::CString::new(path) {
+        if let Ok(md) = std::fs::metadata(path) {
+            use std::os::unix::fs::MetadataExt;
+            let _ = CTL_SOCKET.set((c, md.dev() as u64, md.ino() as u64));
+        }
+    }
+    unsafe {
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::signal(sig, on_terminate as libc::sighandler_t);
+        }
+    }
     // 0666 so the chrome apps (each its own per-app uid) can connect to this
     // socket served by forum-wm (yet another uid). Reachability is the gate: the
     // TCB only mounts /atrium/sockets/forum-ctl/ into a jail holding the
