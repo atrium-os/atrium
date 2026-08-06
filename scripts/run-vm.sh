@@ -99,9 +99,19 @@ WANT_KGDB=0
 # console — `nc 127.0.0.1 4444` and send `~^B` to drop into ddb when
 # debug.kdb.alt_break_to_debugger=1, or `~B` to send a break when
 # debug.kdb.break_to_debugger=1. Use `nc -U /tmp/qmp.sock` for QMP.
+ALL_DISKS=${ALL_DISKS:-0}
 NOGRAPHIC="-display none -serial tcp:127.0.0.1:4444,server=on,wait=off -monitor unix:/tmp/qmp.sock,server=on,wait=off"
 for arg in "$@"; do
     case "$arg" in
+        --all-disks)
+            # Re-attach the ZFS install + the scratch/storage/minimal-root
+            # images. Needed to RECOVER if the Tessera devroot will not boot:
+            # ZFS comes back as the last disk and EDK2 falls back to it.
+            # ★ It also RENUMBERS the devroot back to vtbd3, so its
+            # loader.conf/fstab must name vtbd3p2 again (backups of both are
+            # kept inside the devroot as *.vtbd3).
+            ALL_DISKS=1
+            ;;
         --gpu)
             SOCK="/tmp/fresco-shmem.sock"
             if [ ! -S "$SOCK" ]; then
@@ -361,6 +371,31 @@ taskpolicy -B -p $$ 2>/dev/null || true
 # Guest disk order (confirm with: diskinfo -v /dev/vtbdN | grep ident):
 #   vtbd0 tessera-crashtest   vtbd1 atrium-storage
 #   vtbd2 tessera-root        vtbd3 tessera-devroot   vtbd4 ZFS (no ident)
+# ★ DEFAULT: the Tessera dev root is the ONLY disk, so there is nothing to
+# disambiguate and NO bootindex is needed. (bootindex only ever existed because
+# three bootable disks were attached at once — ZFS plus two Tessera images.)
+#
+# ★ And the devroot names its root BY GPT LABEL, not by device number:
+#     /boot/loader.conf  vfs.root.mountfrom="tessera:/dev/gpt/atrium-root"
+#     /etc/fstab         /dev/gpt/atrium-root  /  tessera  rw  0 0
+# so attaching or reordering disks — or running on a machine with a different
+# device tree — cannot break the boot. It previously hard-coded vtbd3p2, which
+# is why run-vm.sh had to warn that adding a -device "renumbers every vtbd".
+# Labels: gpart modify -i 2 -l atrium-root vtbd0 (and -i 1 -l atrium-esp).
+#
+# --all-disks re-attaches everything (ZFS last) for RECOVERY. With labels the
+# devroot still boots under that layout; the extra disks just come back.
+EXTRA_DISKS=""
+if [ "$ALL_DISKS" = 1 ]; then
+    EXTRA_DISKS="-drive if=virtio,file=$DISK,format=qcow2,cache=writeback \
+      -drive file=$BSD_DIR/vm/crash-test.img,format=raw,cache=directsync,if=none,id=crashdrv \
+      -device virtio-blk-pci,drive=crashdrv,serial=tessera-crashtest,config-wce=on \
+      -drive file=$BSD_DIR/vm/tessera-storage.img,format=raw,cache=writeback,if=none,id=storagedrv \
+      -device virtio-blk-pci,drive=storagedrv,serial=atrium-storage,config-wce=on \
+      -drive file=$BSD_DIR/vm/tessera-root.img,format=raw,cache=writeback,if=none,id=tessrootdrv \
+      -device virtio-blk-pci,drive=tessrootdrv,serial=tessera-root,config-wce=on"
+fi
+
 exec "$QEMU" \
     -L "$QEMU_DIR/pc-bios" \
     ${ATRIUM_QEMU_TRACE:+-trace events=$ATRIUM_QEMU_TRACE} \
@@ -369,13 +404,7 @@ exec "$QEMU" \
     -smp "$SMP" -m "$MEM" \
     -drive if=pflash,format=raw,unit=0,file="$EFI_PAD",readonly=on \
     -drive if=pflash,format=raw,unit=1,file="$EFI_VARS" \
-    -drive if=virtio,file="$DISK",format=qcow2,cache=writeback \
-    -drive file="$BSD_DIR/vm/crash-test.img",format=raw,cache=directsync,if=none,id=crashdrv \
-    -device virtio-blk-pci,drive=crashdrv,serial=tessera-crashtest,config-wce=on \
-    -drive file="$BSD_DIR/vm/tessera-storage.img",format=raw,cache=writeback,if=none,id=storagedrv \
-    -device virtio-blk-pci,drive=storagedrv,serial=atrium-storage,config-wce=on \
-    -drive file="$BSD_DIR/vm/tessera-root.img",format=raw,cache=writeback,if=none,id=tessrootdrv \
-    -device virtio-blk-pci,drive=tessrootdrv,serial=tessera-root,config-wce=on \
+    ${EXTRA_DISKS} \
     -drive file="$BSD_DIR/vm/tessera-devroot.img",format=raw,cache=writeback,if=none,id=devrootdrv \
     -device virtio-blk-pci,drive=devrootdrv,serial=tessera-devroot,config-wce=on \
     -device virtio-net-pci,netdev=net0 \
