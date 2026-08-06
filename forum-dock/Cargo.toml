@@ -21,3 +21,5 @@ portcullis-ipc = { path = "../portcullis/portcullis-ipc" }
 pergola = { path = "../pergola" }
 fresco-client = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }
+# The dock asks forum-wm to raise an already-running app instead of erroring.
+forum-ctl = { path = "../forum-ctl" }

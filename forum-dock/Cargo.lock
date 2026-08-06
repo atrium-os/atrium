@@ -171,9 +171,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "forum-ctl"
+version = "0.1.0"
+dependencies = [
+ "fresco-protocol",
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "forum-dock"
 version = "0.1.0"
 dependencies = [
+ "forum-ctl",
  "fresco-client",
  "fresco-protocol",
  "pergola",

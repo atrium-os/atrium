@@ -405,6 +405,11 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
                     eprintln!("portcullis launch [{stage}]: {message}");
                     return ExitCode::from(1);
                 }
+                Ok(Some(daemon::LaunchReply::AlreadyRunning { jid, uid })) => {
+                    println!("portcullis launch: {} is already running (jid {jid}, uid {uid})",
+                        manifest.app.id);
+                    return ExitCode::SUCCESS;
+                }
                 Ok(Some(daemon::LaunchReply::NeedsApproval { delta })) => {
                     /* Phase 5: prompt on tty, refuse otherwise. */
                     if !stdin_is_tty() {
@@ -583,6 +588,14 @@ fn handle_daemon_launch_reply(
         daemon::LaunchReply::Failed { stage, message } => {
             eprintln!("portcullis launch [{stage}]: {message}");
             ExitCode::from(1)
+        }
+        /* Not an error: the app declares instances = "single" and one is
+         * already up, so the state the caller asked for already holds. It used
+         * to reach jail(8) and come back as a raw "already exists" plus exit 1,
+         * which a script (or a dock) could not tell from a broken app. */
+        daemon::LaunchReply::AlreadyRunning { jid, uid } => {
+            println!("portcullis launch: {tree_arg} is already running (jid {jid}, uid {uid})");
+            ExitCode::SUCCESS
         }
         daemon::LaunchReply::NeedsApproval { delta } => {
             /* Short-circuit path — no manifest text on the CLI side

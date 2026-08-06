@@ -148,6 +148,9 @@ pub enum LaunchReply {
     Exited        { code: Option<i32> },
     Failed        { stage: String, message: String },
     NeedsApproval { delta: Vec<String> },
+    /// The app is single-instance and one is already up. Not a failure: the
+    /// requested state (this app is running) already holds.
+    AlreadyRunning { jid: i32, uid: u32 },
 }
 
 /// Forward a launch to portcullisd. Synchronous: returns when the
@@ -174,6 +177,7 @@ pub fn launch(app_id: &str, bypass_policy: bool) -> DaemonResult<LaunchReply> {
     match read_response(&mut s)? {
         Response::ReadyForFds                     => { /* fall through */ }
         Response::LaunchNeedsApproval { delta }   => return Ok(Some(LaunchReply::NeedsApproval { delta })),
+        Response::AlreadyRunning { jid, uid, .. } => return Ok(Some(LaunchReply::AlreadyRunning { jid, uid })),
         Response::LaunchFailed { stage, message } => return Ok(Some(LaunchReply::Failed { stage, message })),
         Response::Error{message}                  => return Err(io::Error::other(message)),
         other => return Err(io::Error::other(format!("unexpected pre-launch reply: {other:?}"))),

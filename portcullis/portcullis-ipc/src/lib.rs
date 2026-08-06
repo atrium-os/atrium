@@ -247,6 +247,20 @@ pub enum Response {
     /// Catalog → the apps this caller may launch.
     CatalogList { apps: Vec<CatalogEntry> },
 
+    /// Launch → the app is `instances = "single"` and one is already running.
+    ///
+    /// Refusing is correct; reporting it as a failure is not. Without this, a
+    /// duplicate launch surfaced as a raw jail(8) "already exists" line plus a
+    /// generic non-zero exit, which a launcher cannot tell apart from a broken
+    /// app — so clicking a dock icon twice showed an error instead of raising
+    /// the window that was already there.
+    ///
+    /// `uid` is the running instance's per-app uid. That is what makes this
+    /// actionable: surfaces carry `owner_uid`, so a launcher can find the live
+    /// window and focus it without needing the launch registry (which a jailed
+    /// launcher cannot read).
+    AlreadyRunning { app_id: String, jid: i32, uid: u32 },
+
     /// Launch → policy gate refused. `delta` is the human-readable
     /// list of capabilities the user hasn't granted yet (suitable
     /// for showing in a prompt UI). Distinct from LaunchFailed —

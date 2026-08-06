@@ -388,6 +388,31 @@ fn handle_launch(
     writer:        &mut UnixStream,
     reader:        &BufReader<UnixStream>,
 ) -> std::io::Result<()> {
+    /* 0. Already running? Answer before touching anything.
+     *
+     * This is checked FIRST, ahead of the policy gate and long before any
+     * mount, so a duplicate launch cannot disturb the instance that is already
+     * up. Previously the request went all the way to jail(8), which failed with
+     *     jail: "org_atrium_forum-bar" already exists
+     * and a generic non-zero exit — indistinguishable, to a launcher, from a
+     * broken app. Clicking a dock icon twice reported an error instead of
+     * raising the window that was already there.
+     *
+     * The uid goes back with the reply because surfaces carry `owner_uid`: it
+     * is what lets a jailed launcher find the live window and focus it without
+     * the launch registry, which it cannot read. */
+    if launch::is_single_instance(&app_id) {
+        if let Some(jid) = launch::running_jid(&app_id) {
+            let uid = portcullis_peer::uid_for_app(
+                portcullis_peer::DEFAULT_REGISTRY, user, &app_id).unwrap_or(0);
+            eprintln!("portcullisd: {app_id} already running (jid {jid}, uid {uid}) \
+                       — refusing a second instance");
+            return write_response(writer, &Response::AlreadyRunning {
+                app_id, jid, uid,
+            });
+        }
+    }
+
     /* 1. policy gate (per-tenant). */
     if !bypass_policy {
         let tree = std::path::PathBuf::from("/var/lib/atrium/apps").join(&app_id);

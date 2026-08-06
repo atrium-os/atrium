@@ -620,3 +620,32 @@ pub fn app_may_launch_apps(app_id: &str) -> bool {
     let Ok(m) = Manifest::from_str(&text) else { return false };
     m.capabilities.app_launch == Some(true)
 }
+
+/// The jid of a running jail for `app_id`, or `None`.
+///
+/// Asks jls(8) rather than tracking state in-process: portcullisd can be
+/// restarted while jails keep running, so the kernel's view is the only one
+/// that is always right.
+pub fn running_jid(app_id: &str) -> Option<i32> {
+    let name = jail_name_from_app_id(app_id);
+    let out = Command::new("jls").args(["-j", &name, "jid"]).output().ok()?;
+    if !out.status.success() {
+        return None;   /* jls exits non-zero when the jail does not exist */
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Does this app's manifest say only one instance may run?
+///
+/// Absent `[supervision] instances`, treat it as single: that is what every
+/// current manifest declares, and quietly allowing a second instance of an app
+/// that did not ask for it is the worse default.
+pub fn is_single_instance(app_id: &str) -> bool {
+    let path = PathBuf::from(APPS_DIR).join(app_id).join("atrium.toml");
+    let Ok(text) = fs::read_to_string(path) else { return true };
+    let Ok(m) = Manifest::from_str(&text) else { return true };
+    !matches!(
+        m.supervision.as_ref().and_then(|s| s.instances),
+        Some(portcullis_toml::InstancesPolicy::Multi)
+    )
+}

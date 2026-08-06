@@ -277,6 +277,23 @@ fn launch(app_id: &str) -> io::Result<()> {
             eprintln!("forum-dock: launch of '{app_id}' failed at {stage}: {message}");
             std::process::exit(1);
         }
+        /* The daemon answers this BEFORE ReadyForFds — it decides "already
+         * running" up front, without mounting anything — so the second click on
+         * a dock icon lands here, not on the post-launch path. Raise the window
+         * that exists instead of reporting a failure. */
+        Response::AlreadyRunning { jid, uid, .. } => {
+            println!("forum-dock: '{app_id}' is already running (jid {jid})");
+            match focus_running(uid) {
+                // Ack means the WM ACCEPTED the intent, not that focus moved:
+                // roles that never take focus (a panel, the background) are
+                // declined by the layout policy, which is correct. Say what we
+                // actually know.
+                Ok(Some(sid)) => println!("forum-dock: asked the WM to focus its surface {sid}"),
+                Ok(None)      => println!("forum-dock: it has no surface to focus"),
+                Err(e)        => eprintln!("forum-dock: could not focus it: {e}"),
+            }
+            return Ok(());
+        }
         other => {
             eprintln!("forum-dock: unexpected pre-launch reply: {other:?}");
             std::process::exit(1);
@@ -304,5 +321,42 @@ fn launch(app_id: &str) -> io::Result<()> {
             eprintln!("forum-dock: unexpected post-launch reply: {other:?}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Ask forum-wm to focus the surface owned by `uid` — the running instance of
+/// an app we were asked to launch a second time.
+///
+/// Matching on `owner_uid` is what makes this work from inside a jail: the dock
+/// cannot read the launch registry, but every surface already carries the uid
+/// that created it, and portcullisd told us which uid to look for. Returns the
+/// focused surface id, or `None` if the app has not created a window (yet).
+fn focus_running(uid: u32) -> io::Result<Option<u32>> {
+    use std::os::unix::net::UnixStream;
+    let path = forum_ctl::default_socket_path();
+    let mut s = UnixStream::connect(&path)?;
+    let req = forum_ctl::encode(&forum_ctl::Intent::ListSurfaces)
+        .map_err(|e| io::Error::other(format!("encode: {e}")))?;
+    forum_ctl::write_frame(&mut s, &req)?;
+    let reply: forum_ctl::Reply = forum_ctl::decode(&forum_ctl::read_frame(&mut s)?)
+        .map_err(|e| io::Error::other(format!("decode: {e}")))?;
+    let surfaces = match reply {
+        forum_ctl::Reply::Surfaces { surfaces, .. } => surfaces,
+        forum_ctl::Reply::Err { message } => return Err(io::Error::other(message)),
+        other => return Err(io::Error::other(format!("unexpected reply: {other:?}"))),
+    };
+    let Some(target) = surfaces.iter().find(|s| s.owner_uid == uid) else {
+        return Ok(None);
+    };
+    /* One connection per intent — the control protocol is request/response. */
+    let mut s = UnixStream::connect(&path)?;
+    let req = forum_ctl::encode(&forum_ctl::Intent::Focus { surface_id: target.surface_id })
+        .map_err(|e| io::Error::other(format!("encode: {e}")))?;
+    forum_ctl::write_frame(&mut s, &req)?;
+    match forum_ctl::decode::<forum_ctl::Reply>(&forum_ctl::read_frame(&mut s)?) {
+        Ok(forum_ctl::Reply::Ack)              => Ok(Some(target.surface_id)),
+        Ok(forum_ctl::Reply::Err { message })  => Err(io::Error::other(message)),
+        Ok(other)                              => Err(io::Error::other(format!("{other:?}"))),
+        Err(e)                                 => Err(io::Error::other(format!("decode: {e}"))),
     }
 }
