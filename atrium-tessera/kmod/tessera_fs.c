@@ -383,6 +383,70 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, snapshots_retired,
     CTLFLAG_RD, &tessera_stat_snapshots_retired, 0,
     "Cumulative snapshot records dropped by retention horizon");
 
+/*
+ * ★ #116: the TIME floor, the second half of the hybrid horizon.
+ *
+ * snapshot_retention above is a floor on the COUNT of records, and that is the
+ * whole bug: commits are write-driven, so the same count preserves wildly
+ * different amounts of history. Measured (b24eb847), same volume, retention=8:
+ *
+ *     LIGHT (4 KiB every 10s)   12 commits over 120s   ->  80.0 s of depth
+ *     HEAVY (4 writer loops)   621 commits over 120s   ->   1.5 s of depth
+ *
+ * 53x, and the short end lands exactly when a rollback is most likely wanted.
+ * flush_interval_sec is a floor for a dirty volume, not the commit rate: the
+ * light arm committed every 10s and the heavy arm every 0.19s.
+ *
+ * So retirement now requires BOTH floors: more records than the count horizon
+ * AND an oldest record older than min_age_sec. Records are already stamped
+ * with timestamp_ns at birth (commit_sb, from getmicrotime) so this needs no
+ * format change and no new I/O — retire_oldest already reads the record it is
+ * about to drop.
+ *
+ * ★★ WHY THERE IS ALSO A CEILING. "Refusing to retire" sounds unconditionally
+ * safe — it can never free live data. It is NOT safe for SPACE: unbounded
+ * retention is precisely what exhausts meta-reserve (#73/#74), and a snapshot
+ * record that is never retired keeps its tree sectors pinned in meta_pending
+ * forever. A stuck or absurd clock, or a min_age longer than the volume's
+ * write burst, would otherwise wedge the reserve. So the count horizon still
+ * wins once the retained set reaches max_retention, and the time floor can
+ * only ever hold records BETWEEN the two bounds.
+ *
+ * Default 0 = disabled = byte-for-byte today's behaviour, so this lands inert
+ * and is turned on deliberately after measurement.
+ *
+ * ★ COST WARNING for whoever raises it: retained snapshots are not free. Mount
+ * cost scales with them (#33) and GC pass-1 walks every one of them (#108
+ * lever 2 — 14 retained snapshots were 93% of a 430s pass). At the heavy
+ * arm's 0.19 s/commit, a 60s floor implies ~316 retained records. Raise this
+ * with those two issues open at your peril; that interaction is the reason
+ * #116 option (c) exists.
+ */
+static int tessera_snapshot_min_age_sec = 0;
+SYSCTL_INT(_kern_tessera, OID_AUTO, snapshot_min_age_sec,
+    CTLFLAG_RW, &tessera_snapshot_min_age_sec, 0,
+    "Time floor: don't retire a snapshot record younger than this many "
+    "seconds, up to snapshot_max_retention records (0 = disabled)");
+
+static int tessera_snapshot_max_retention = 0;
+SYSCTL_INT(_kern_tessera, OID_AUTO, snapshot_max_retention,
+    CTLFLAG_RW, &tessera_snapshot_max_retention, 0,
+    "Ceiling on retained records when the time floor holds them "
+    "(0 = 8x snapshot_retention). Bounds meta-reserve exposure");
+
+static unsigned long tessera_stat_snapshots_age_held = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, snapshots_age_held, CTLFLAG_RD,
+    &tessera_stat_snapshots_age_held, 0,
+    "Cumulative retirements SKIPPED because the oldest record was younger "
+    "than snapshot_min_age_sec (effect counter: 0 here means the floor "
+    "never actually fired)");
+
+static unsigned long tessera_stat_snapshots_ceiling_forced = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, snapshots_ceiling_forced, CTLFLAG_RD,
+    &tessera_stat_snapshots_ceiling_forced, 0,
+    "Cumulative retirements forced by snapshot_max_retention despite the "
+    "time floor (nonzero means min_age_sec is too long for this write rate)");
+
 
 /* Cumulative count of meta_reserve-bump EXHAUST events. The EXHAUST
  * printf is rate-limited to 1/s (a tight-commit hammer over a big tree
@@ -9006,6 +9070,44 @@ tessera_fs_snapshot_retire_oldest(struct tessera_mount *tmp_)
 		return (0);
 	}
 	tessera_btree_cursor_free(sc);
+
+	/*
+	 * ★ #116: the time floor. The record we are about to drop is already
+	 * in hand, timestamp and all, so this costs one clock read.
+	 *
+	 * Held only BETWEEN the two bounds: past max_retention the count wins,
+	 * because over-retention is not a safe failure mode — it pins tree
+	 * sectors in meta_pending and exhausts the reserve (#73/#74).
+	 *
+	 * A record stamped in the FUTURE (clock stepped backwards, or a
+	 * corrupt/hand-edited record) must NOT be treated as infinitely young;
+	 * that would pin history forever. Unsigned subtraction would wrap to a
+	 * colossal age and silently retire it, which is the right OUTCOME by
+	 * luck rather than by intent — so say so explicitly instead.
+	 */
+	if (tessera_snapshot_min_age_sec > 0) {
+		int maxret = tessera_snapshot_max_retention > 0
+		    ? tessera_snapshot_max_retention
+		    : tessera_snapshot_retention * 8;
+
+		if (tmp_->sb.snapshots_gen <= (uint64_t)maxret) {
+			struct timeval _tv;
+			getmicrotime(&_tv);
+			uint64_t now_ns = (uint64_t)_tv.tv_sec * 1000000000ULL +
+			                  (uint64_t)_tv.tv_usec * 1000ULL;
+			uint64_t min_ns = (uint64_t)tessera_snapshot_min_age_sec
+			                  * 1000000000ULL;
+			/* now < ts => future stamp => treat as ELIGIBLE. */
+			if (now_ns >= orec.timestamp_ns &&
+			    (now_ns - orec.timestamp_ns) < min_ns) {
+				tessera_stat_snapshots_age_held++;
+				return (0);
+			}
+		} else {
+			tessera_stat_snapshots_ceiling_forced++;
+		}
+	}
+
 	uint64_t after_root = tmp_->sb.snapshots_root;
 	if (tessera_btree_delete(tmp_->snapshots_tree, okey, &after_root)
 	    != TESSERA_OK)
