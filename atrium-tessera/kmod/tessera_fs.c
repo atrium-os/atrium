@@ -604,6 +604,26 @@ static unsigned long tessera_stat_gc_snap_stale          = 0;
 static unsigned long tessera_stat_gc_snap_stale_kind     = 0;
 static unsigned long tessera_stat_gc_snap_stale_header   = 0;
 static unsigned long tessera_stat_gc_snap_stale_io       = 0;
+/*
+ * ★ #131 MEASUREMENT ONLY — no behaviour change yet, deliberately.
+ *
+ * The concurrent scan opens the FROZEN snapshots root. Its two siblings abort
+ * the whole scan if their open fails (inode_root, registry_root); this one is
+ * marked "NULL is tolerated" and, when it fails, the entire retained-snapshot
+ * union is skipped by `if (scan_snap_tree != NULL)` — silently. Reclaim then
+ * runs on a live set that omits every snapshot, which is the free-live-data
+ * shape.
+ *
+ * The obvious fix (abort like the siblings) is strictly conservative but could
+ * convert "silent unsafe reclaim" into NO RECLAIM AT ALL on a busy volume,
+ * because the snapshots tree is mutated on EVERY commit and so its frozen root
+ * is superseded almost immediately. That trade cannot be made on a guess.
+ *
+ * So: count first. union_ok vs root_fail across real passes gives the failure
+ * RATE, which is the number the decision actually depends on.
+ */
+static unsigned long tessera_stat_gc_snap_union_ok       = 0;
+static unsigned long tessera_stat_gc_snap_root_fail      = 0;
 static unsigned long tessera_stat_gc_productive_passes   = 0;
 static unsigned long tessera_stat_gc_productive_ms       = 0;
 static unsigned long tessera_stat_gc_unproductive_passes = 0;
@@ -924,6 +944,16 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_snap_stale_header, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_snap_stale_io, CTLFLAG_RD,
     &tessera_stat_gc_snap_stale_io, 0,
     "stale retained snapshots whose root sector could not be read");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_snap_union_ok, CTLFLAG_RD,
+    &tessera_stat_gc_snap_union_ok, 0,
+    "GC passes that successfully OPENED the frozen snapshots tree and so "
+    "unionised retained snapshots into the live set (#131)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_snap_root_fail, CTLFLAG_RD,
+    &tessera_stat_gc_snap_root_fail, 0,
+    "★ #131: GC passes where the frozen snapshots root FAILED to open, so "
+    "EVERY retained snapshot was silently omitted from the live set and "
+    "reclaim ran on a partial union. Compare against gc_snap_union_ok for the "
+    "failure rate");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_snap_stale, CTLFLAG_RD,
     &tessera_stat_gc_snap_stale, 0,
     "Retained snapshots whose inode_root sector no longer holds an inode tree "
@@ -15536,6 +15566,20 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 			open_snap = tessera_btree_open(&tmp_->meta_bio,
 			    scan->snapshots_root, /*tree_kind*/ 3, /*key*/ 8,
 			    TESSERA_SNAPSHOT_RECORD_SIZE);
+			/* ★ #131: BEHAVIOUR UNCHANGED — still tolerated — but
+			 * no longer SILENT. A failure here drops every retained
+			 * snapshot from the live set; that must be countable
+			 * before we decide whether to abort on it instead. */
+			if (open_snap == NULL) {
+				tessera_stat_gc_snap_root_fail++;
+				printf("tessera_fs: ★ gc — frozen snapshots "
+				    "root sector %ju did NOT open; ALL retained "
+				    "snapshots omitted from the live set this "
+				    "pass (#131, reclaim still proceeds)\n",
+				    (uintmax_t)scan->snapshots_root);
+			} else {
+				tessera_stat_gc_snap_union_ok++;
+			}
 			scan_snap_tree = open_snap;   /* NULL is tolerated */
 		} else {
 			/* No snapshots at activation. Must NOT fall back to
