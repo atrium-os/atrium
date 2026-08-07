@@ -180,6 +180,16 @@ fn main() -> std::io::Result<()> {
      * capping present rate at TARGET_FPS. IDLE_HEARTBEAT re-renders as a
      * safety net against any damage source not wired to `redraw`. */
     const IDLE_HEARTBEAT: Duration = Duration::from_secs(1);
+    /* The heartbeat is a SAFETY NET, and it must never become the
+     * workload: on a slow renderer (lavapipe in a VM renders a frame
+     * in whole seconds) a fixed 1 s heartbeat re-renders back-to-back
+     * forever — a treadmill that pegged every vCPU and starved sshd.
+     * Scale the interval to the measured render cost so idle overhead
+     * is bounded (~1/8 of one core worst-case); fast hardware keeps
+     * the 1 s beat. */
+    const HEARTBEAT_COST_FACTOR: u32 = 8;
+    let mut heartbeat = IDLE_HEARTBEAT;
+    let mut slow_render_warned = false;
     let mut last_gen: u64 = 0;              /* 0 != initial 1 -> render frame 0 */
     /* Force the first present immediately (heartbeat treated as already due). */
     let mut last_render = Instant::now()
@@ -188,15 +198,15 @@ fn main() -> std::io::Result<()> {
     let mut next = Instant::now();
     loop {
         let cur = redraw.current();
-        let heartbeat_due = last_render.elapsed() >= IDLE_HEARTBEAT;
+        let heartbeat_due = last_render.elapsed() >= heartbeat;
         if cur == last_gen && !heartbeat_due {
             /* Nothing changed since the last present — sleep until the
              * next damage signal, or until the heartbeat comes due,
              * consuming no CPU meanwhile. The bounded wait is the safety
              * net: even a damage source not wired to `redraw` refreshes
-             * within IDLE_HEARTBEAT. */
+             * within `heartbeat`. */
             let until_beat =
-                IDLE_HEARTBEAT.saturating_sub(last_render.elapsed());
+                heartbeat.saturating_sub(last_render.elapsed());
             redraw.wait_past(last_gen, until_beat);
             continue;
         }
@@ -212,6 +222,7 @@ fn main() -> std::io::Result<()> {
          * the sleep is folded into this present rather than triggering an
          * immediate extra one. */
         last_gen = redraw.current();
+        let t_render = Instant::now();
         render_one_frame(&mut renderer, &frontend, &comp, mode.width, mode.height)
             .map_err(io_other)?;
         fill_framebuffer(&renderer, &mut framebuffer).map_err(io_other)?;
@@ -219,6 +230,16 @@ fn main() -> std::io::Result<()> {
         check_fault("page_flip", dpy.page_flip(scan_off, scan_size, true)?)?;
         frame = frame.wrapping_add(1);
         let _ = frame;
+
+        let cost = t_render.elapsed();
+        heartbeat = IDLE_HEARTBEAT.max(cost * HEARTBEAT_COST_FACTOR);
+        if heartbeat > IDLE_HEARTBEAT && !slow_render_warned {
+            slow_render_warned = true;
+            eprintln!(
+                "frescod: slow renderer (frame took {cost:?}); \
+                 idle heartbeat backed off to {heartbeat:?}"
+            );
+        }
 
         last_render = Instant::now();
         next = last_render + Duration::from_nanos(FRAME_NS);
@@ -263,19 +284,51 @@ fn run_headless(png: &str) -> std::io::Result<()> {
         .unwrap_or_else(|_| PathBuf::from("/atrium/sockets/fresco/fresco.sock"));
     let wm_sock = Some(std::env::var("FRESCOD_WM_SOCK").map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/atrium/sockets/fresco-wm/fresco-wm.sock")));
-    let redraw = redraw::RedrawSignal::new();
+    let redraw2 = redraw::RedrawSignal::new();
     let subs = socket_server::spawn(
         socket_server::Shared {
             frontend: frontend.clone(),
             lane: None,
-            redraw: redraw.clone(),
+            redraw: redraw2.clone(),
         },
         &sock, wm_sock.as_deref())?;
-    socket_server::spawn_event_fanout(ev_rx, subs, redraw);
+    socket_server::spawn_event_fanout(ev_rx, subs, redraw2.clone());
     eprintln!("frescod-headless: {W}x{H} on {} → {png}.png", sock.display());
 
+    /* Damage-driven, like the display path — this loop used to render
+     * + PNG-encode unconditionally at 5 Hz (encode alone costs ~1.5 s
+     * under a loaded VM, and the PNG lands on the 9p share), which
+     * pegged the VM whenever a jailed-desktop harness was left
+     * running. Renders only when a client op or input event signals
+     * damage; a long heartbeat covers unwired sources. */
+    /* The capture PNG going stale between damage events is harmless
+     * (it's a debug/e2e artifact), so the safety-net heartbeat is long
+     * and — like the display path — scales with measured render cost:
+     * a slow renderer must never turn the safety net into the load. */
+    const HEADLESS_HEARTBEAT: Duration = Duration::from_secs(60);
+    const HEADLESS_MIN_INTERVAL: Duration = Duration::from_millis(200);
     let out = format!("{png}.png");
+    let mut heartbeat = HEADLESS_HEARTBEAT;
+    let mut last_gen: u64 = 0;
+    let mut last_render = Instant::now()
+        .checked_sub(HEADLESS_HEARTBEAT)
+        .unwrap_or_else(Instant::now);
     loop {
+        let cur = redraw2.current();
+        let heartbeat_due = last_render.elapsed() >= heartbeat;
+        if cur == last_gen && !heartbeat_due {
+            let until_beat = heartbeat.saturating_sub(last_render.elapsed());
+            redraw2.wait_past(last_gen, until_beat);
+            continue;
+        }
+        /* Coalesce bursts: floor the interval between captures. */
+        let since = last_render.elapsed();
+        if since < HEADLESS_MIN_INTERVAL {
+            std::thread::sleep(HEADLESS_MIN_INTERVAL - since);
+        }
+
+        last_gen = redraw2.current();
+        let t_render = Instant::now();
         render_one_frame(&mut renderer, &frontend, &comp, W, H).map_err(io_other)?;
         let mut rgba = renderer.read_pixels_vec().map_err(io_other)?;
         for px in rgba.chunks_exact_mut(4) { px.swap(0, 2); } // BGRA → RGBA
@@ -285,7 +338,8 @@ fn run_headless(png: &str) -> std::io::Result<()> {
                 let _ = std::fs::rename(&tmp, &out);
             }
         }
-        std::thread::sleep(Duration::from_millis(200));
+        heartbeat = HEADLESS_HEARTBEAT.max(t_render.elapsed() * 8);
+        last_render = Instant::now();
     }
 }
 

@@ -334,10 +334,17 @@ fn reader_loop(
                 vec![error_reply(msg.op, &e)]
             }
         };
-        /* Task #25: a client op just mutated scene/window state — wake the
-         * display loop to recompose. Over-signalling is harmless (bumps
-         * coalesce into a single render). */
-        redraw.wake();
+        /* Task #25: wake the display loop only when the op can have
+         * mutated scene/window state. Read-only queries MUST NOT count
+         * as damage: chrome polls them steadily (forum-bar asks the WM
+         * for ListSurfaces → WM_ENUMERATE every second), and waking on
+         * queries kept an "idle" desktop recomposing forever — under a
+         * slow software renderer that treadmill ate every core and
+         * starved sshd. Unknown ops still wake (over-signalling is
+         * harmless; under-signalling is a stuck frame). */
+        if op_can_mutate(msg.op) {
+            redraw.wake();
+        }
         for o in outs {
             if out.send(o).is_err() {
                 /* Writer exited; bail. */
@@ -494,4 +501,16 @@ fn handle_lane_request(
         }
         Err(e) => fail(&format!("sponsor: {e}"), broker.t_us()),
     }
+}
+
+/// Whether an op can change composited output. Pure queries return
+/// data and touch nothing the renderer reads — they must not count as
+/// damage. Anything not listed here is assumed mutating (the safe
+/// direction: a spurious render beats a stuck frame).
+fn op_can_mutate(op: u16) -> bool {
+    use fresco_protocol::control::*;
+    !matches!(
+        op,
+        OP_FONT_OPEN | OP_FONT_CLOSE | OP_TEXT_MEASURE | OP_DISPLAY_INFO | OP_WM_ENUMERATE
+    )
 }

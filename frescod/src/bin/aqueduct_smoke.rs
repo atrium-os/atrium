@@ -142,6 +142,7 @@ fn main() -> io::Result<()> {
         &font_bytes,
         "aqueduct-gpu on FreeBSD",
         (h * 0.05).max(16.0),
+        400.0,
     ).map_err(|e| io_other(format!("shape: {e}")))?;
     eprintln!(
         "frescod-aqueduct-smoke: shaped {} glyphs into {}×{} atlas",
