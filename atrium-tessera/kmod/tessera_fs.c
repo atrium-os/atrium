@@ -2751,6 +2751,23 @@ static unsigned long tessera_stat_drain_frees_snaproot = 0;
  * this is the switch that found the #102 root cause and stays available for
  * the next time the question is "who freed this sector". */
 static int tessera_drain_audit_snaproots = 0;
+/* ★ #132 DIAGNOSTIC: the allocator handing out a sector that is STILL a
+ * retained snapshot's root. The two existing #102 switches both read zero
+ * while snapshots kept dying (pinscan_unpinned_snaproot=0 clears the swap,
+ * drain_frees_snaproot=0 clears the drain), and the destruction tracks GC
+ * PASSES rather than commits — so the remaining suspect is the allocation
+ * path itself, feeding GC's apply-phase rewrites of the free-extent tree
+ * (the recycled sectors come back as tree_kind=2 = FREE_EXT).
+ *
+ * ★ src is the whole point: meta_free vs BUMP. The swap audit only inspects
+ * roots in [mstart, bump0), so a live root at or above bump0 can only be
+ * re-issued by the bump — and no existing diagnostic would see it. This one
+ * names which. */
+static unsigned long tessera_stat_alloc_hands_out_snaproot = 0;
+static unsigned long tessera_stat_alloc_audit_calls        = 0;
+/* Walks the snapshots btree on EVERY meta allocation — far too costly to ship
+ * on, exactly like drain_audit_snaproots. Debug switch only. */
+static int tessera_alloc_audit_snaproots = 0;
 /* ★ pack-zone leak: at unmount, cross-check recorded pack allocations against
  * the registry and print any that never landed, with the caller's address. */
 static int tessera_pack_ring_audit = 0;
@@ -4672,6 +4689,59 @@ tessera_meta_pin_mark_alloc(struct tessera_mount *tmp_, uint64_t s)
 		tmp_->meta_recycled_bm[bit / 8] |= (uint8_t)(1u << (bit % 8));
 }
 
+/*
+ * ★ #132: allocation-time assertion. Is the sector we are about to hand out
+ * still serving as a retained snapshot's root?
+ *
+ * Read-only: opens the snapshots tree and walks it. Reads never allocate, so
+ * this cannot recurse into the allocator. It CAN observe the snapshots tree
+ * mid-commit and so may report a root that is about to be legitimately
+ * retired — a false positive is acceptable in a debug audit whose job is to
+ * say WHICH PATH hands the sector out. Bounded walk; default OFF.
+ */
+static void
+tessera_meta_alloc_audit_snaproot(struct tessera_mount *tmp_, uint64_t sect,
+    int src)
+{
+	if (!tessera_alloc_audit_snaproots || tmp_->sb.snapshots_root == 0)
+		return;
+	tessera_stat_alloc_audit_calls++;
+	tessera_btree_t *t = tessera_btree_open(&tmp_->meta_bio,
+	    tmp_->sb.snapshots_root, /*tree_kind*/ 3, /*key*/ 8,
+	    TESSERA_SNAPSHOT_RECORD_SIZE);
+	if (t == NULL)
+		return;
+	tessera_btree_cursor_t *c = tessera_btree_seek_first(t);
+	unsigned guard = 0;
+	while (c != NULL && ++guard < 4096u) {
+		uint8_t k[8];
+		tessera_snapshot_record_t r;
+		if (tessera_btree_cursor_get(c, k, &r) != TESSERA_OK)
+			break;
+		const char *which = NULL;
+		if (sect == r.inode_root)              which = "inode_root";
+		else if (sect == r.pack_registry_root) which = "pack_registry_root";
+		else if (sect == r.free_extent_root)   which = "free_extent_root";
+		if (which != NULL) {
+			tessera_stat_alloc_hands_out_snaproot++;
+			printf("tessera_fs: ★ #132 ALLOCATOR HANDED OUT sector "
+			    "%ju — it is snapshot gen %ju's %s. src=%s "
+			    "bump=%ju gen=%ju. THAT SNAPSHOT IS NOW "
+			    "DESTROYED.\n",
+			    (uintmax_t)sect, (uintmax_t)r.generation, which,
+			    src ? "BUMP" : "meta_free",
+			    (uintmax_t)tmp_->sb.meta_reserve_bump,
+			    (uintmax_t)tmp_->sb.generation);
+			break;
+		}
+		if (tessera_btree_cursor_next(c) != TESSERA_OK)
+			break;
+	}
+	if (c != NULL)
+		tessera_btree_cursor_free(c);
+	tessera_btree_close(t);
+}
+
 static int
 tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 {
@@ -4707,6 +4777,7 @@ tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 			    *out_sector;
 		tessera_meta_pin_mark_alloc(tmp_, *out_sector);
 		tessera_meta_allocsrc_set(tmp_, *out_sector, 0);
+		tessera_meta_alloc_audit_snaproot(tmp_, *out_sector, 0);
 		tessera_meta_epoch_mark(tmp_, *out_sector);
 		TSEC(*out_sector, "ALLOC reuse-from-meta_free gen=%ju "
 		    "pinscan_active=%d watermark=%ju",
@@ -4736,6 +4807,7 @@ tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 				    tmp_->meta_scanwin_count++] = *out_sector;
 			tessera_meta_pin_mark_alloc(tmp_, *out_sector);
 		tessera_meta_allocsrc_set(tmp_, *out_sector, 0);
+		tessera_meta_alloc_audit_snaproot(tmp_, *out_sector, 0);
 			tessera_meta_epoch_mark(tmp_, *out_sector);
 			TSEC(*out_sector, "ALLOC reuse-after-epoch-sweep "
 			    "gen=%ju pinscan_active=%d",
@@ -4798,6 +4870,7 @@ tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 	*out_sector = tmp_->sb.meta_reserve_bump;
 	tmp_->sb.meta_reserve_bump += n;
 	tessera_meta_allocsrc_set(tmp_, *out_sector, 1);
+	tessera_meta_alloc_audit_snaproot(tmp_, *out_sector, 1);
 	TSEC(*out_sector, "ALLOC bump gen=%ju pinscan_active=%d watermark=%ju",
 	    (uintmax_t)tmp_->sb.generation, tmp_->pinscan_active,
 	    (uintmax_t)tmp_->meta_pin_watermark);
@@ -23486,6 +23559,20 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, drain_audit_snaproots, CTLFLAG_RW,
     "1 = on every meta_pending drain, check each released sector against the "
     "retained snapshot roots (#102 diagnostic; COSTLY — walks the snapshots "
     "btree per drain)");
+SYSCTL_INT(_kern_tessera, OID_AUTO, alloc_audit_snaproots, CTLFLAG_RW,
+    &tessera_alloc_audit_snaproots, 0,
+    "#132 DEBUG (costly: walks the snapshots btree on EVERY meta "
+    "allocation): assert that a sector being handed out is not still a "
+    "retained snapshot's root, and report whether it came from meta_free or "
+    "the BUMP");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, alloc_hands_out_snaproot, CTLFLAG_RD,
+    &tessera_stat_alloc_hands_out_snaproot, 0,
+    "#132: allocations that handed out a live retained-snapshot root. "
+    "Non-zero names the allocator as what destroys snapshots");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, alloc_audit_calls, CTLFLAG_RD,
+    &tessera_stat_alloc_audit_calls, 0,
+    "#132 effect counter: meta allocations actually audited. 0 means the "
+    "audit never ran and any conclusion from it is void");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, drain_frees_snaproot,
     CTLFLAG_RD, &tessera_stat_drain_frees_snaproot, 0,
     "meta_pending drains that released a retained snapshot's inode_root "
