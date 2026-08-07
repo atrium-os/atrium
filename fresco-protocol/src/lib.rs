@@ -585,7 +585,7 @@ pub struct TextRunInstallPayload {
 }
 
 /// `OP_TEXT_MEASURE` — synchronous query: how wide is this string
-/// when shaped with `(font_id, size_px)`? Apps that lay out
+/// when shaped with `(font_id, size_px, weight)`? Apps that lay out
 /// proportional text (toolkits with right-aligned widgets, dialog
 /// auto-sizing, in-line wrapping) call this once per logical run
 /// and use the returned width to position the next element.
@@ -601,6 +601,10 @@ pub struct TextRunInstallPayload {
 pub struct TextMeasurePayload {
     pub font_id: u32,
     pub size_px: f32,
+    /// Variable-font `wght` (400/500/600/700). Shaped advances differ
+    /// per weight, so measurement must match the weight the run will
+    /// be installed with.
+    pub weight:  u16,
     pub text:    String,
 }
 

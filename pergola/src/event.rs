@@ -92,11 +92,12 @@ fn hit_test_subtree(tree: &NodeTree, id: NodeId, point: Point) -> Option<NodeId>
         }
     }
 
-    // No child claimed the hit. If this node is interactive (i.e.
-    // not a pure Stack), it is the hit. Stacks fall through to the
-    // parent — they're layout helpers, not click targets.
+    // No child claimed the hit. Painted nodes are hit targets;
+    // layout-only Stacks fall through to the parent — they're layout
+    // helpers, not click targets. A *filled* Stack paints (chip,
+    // panel), so it takes the hit.
     match node {
-        Node::Stack { .. } => None,
+        Node::Stack { fill: None, .. } => None,
         _ => Some(id),
     }
 }
@@ -121,11 +122,7 @@ mod tests {
     #[test]
     fn picks_innermost_non_stack_child() {
         let mut t = NodeTree::new();
-        let stack = t.insert(None, Node::Stack {
-            rect: Rect::new(0.0, 0.0, 100.0, 100.0),
-            axis: Axis::Vertical,
-            spacing: 0.0,
-        });
+        let stack = t.insert(None, Node::vstack(Rect::new(0.0, 0.0, 100.0, 100.0), 0.0));
         let inner = t.insert(Some(stack), red(Rect::new(10.0, 10.0, 20.0, 20.0)));
         assert_eq!(hit_test(&t, Point::new(15.0, 15.0)), Some(inner));
     }
@@ -133,11 +130,7 @@ mod tests {
     #[test]
     fn stack_alone_does_not_register_a_hit() {
         let mut t = NodeTree::new();
-        t.insert(None, Node::Stack {
-            rect: Rect::new(0.0, 0.0, 100.0, 100.0),
-            axis: Axis::Vertical,
-            spacing: 0.0,
-        });
+        t.insert(None, Node::vstack(Rect::new(0.0, 0.0, 100.0, 100.0), 0.0));
         assert_eq!(hit_test(&t, Point::new(50.0, 50.0)), None);
     }
 

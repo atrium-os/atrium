@@ -12,8 +12,15 @@
 //! Both reference theme tokens exclusively (no raw colors, sizes, or
 //! radii) per `docs/design/atrium-visual-language.md` §10.
 
+pub mod basics;
 pub mod button;
+pub mod chip;
+pub mod label;
+pub mod phosphor;
 pub mod text_field;
 
+pub use basics::{Avatar, Divider, Dot, ProgressBar};
 pub use button::Button;
+pub use chip::{Chip, ListRow};
+pub use label::{Glyph, Label};
 pub use text_field::TextField;

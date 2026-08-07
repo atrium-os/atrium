@@ -39,16 +39,12 @@ impl View for LoginView {
             radius: radius::XL,
         });
         // Inner stack.
-        let stack = ctx.tree.insert(Some(panel), Node::Stack {
-            rect: Rect::new(
+        let stack = ctx.tree.insert(Some(panel), Node::vstack(Rect::new(
                 80.0 + space::LG,
                 80.0 + space::LG,
                 480.0 - 2.0 * space::LG,
                 360.0 - 2.0 * space::LG,
-            ),
-            axis: Axis::Vertical,
-            spacing: space::MD,
-        });
+            ), space::MD));
         let _ = stack;
         // Heading.
         ctx.tree.insert(Some(stack), Node::Text {

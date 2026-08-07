@@ -761,7 +761,7 @@ impl EnvelopeFrontend {
     {
         let p: TextMeasurePayload = decode(&msg.payload)
             .map_err(|_| DispatchError::BadPayload)?;
-        let resp = match self.text.write().unwrap().measure(p.font_id, p.size_px, &p.text) {
+        let resp = match self.text.write().unwrap().measure(p.font_id, p.size_px, p.weight, &p.text) {
             Some((w, a, d)) => TextMeasureResponse {
                 width_px: w, ascent_px: a, descent_px: d,
             },

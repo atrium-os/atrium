@@ -568,6 +568,7 @@ impl TextEngine {
         &mut self,
         font_id: u32,
         size_px: f32,
+        weight: u16,
         text: &str,
     ) -> Option<(f32, f32, f32)> {
         let f = self.fonts.get(&font_id)?;
@@ -590,9 +591,7 @@ impl TextEngine {
             let cp = ch as u32;
             if cp < 0x20 || cp == 0x7f { continue; }
             clock += 1;
-            // measure defaults to Regular; weight-aware measurement (for correct
-            // semibold layout) would thread weight through TextMeasurePayload — TODO.
-            let entry = match page.ensure(font_id, size_px, 400, cp, &font_bytes, clock) {
+            let entry = match page.ensure(font_id, size_px, weight, cp, &font_bytes, clock) {
                 Some(e) => e,
                 None    => continue,
             };
@@ -611,6 +610,10 @@ impl TextEngine {
                 &["IBMPlexMono-Regular.ttf", "DejaVuSansMono.ttf", "DejaVuSansMono-Bold.ttf"],
             "IBMPlexSans" | "DejaVuSans" | "system-sans" =>
                 &["IBMPlexSans.ttf", "DejaVuSans.ttf"],
+            // System icon set (visual-language §9) as a glyph font —
+            // icons ride the text pipeline: measured, atlased, tinted.
+            "Phosphor" | "system-icons" =>
+                &["Phosphor.ttf"],
             "DejaVuSerif" | "system-serif" =>
                 &["DejaVuSerif.ttf"],
             other => {

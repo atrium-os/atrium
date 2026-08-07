@@ -20,6 +20,17 @@ use crate::interaction::{ClickHandler, Interactions};
 use crate::node::{Node, NodeId, NodeTree};
 use crate::theme::Semantic;
 
+/// Interaction state carried into a render pass so widgets can draw
+/// their hover / pressed / focused looks. Node ids are stable across
+/// renders while the view structure is stable, so last frame's state
+/// keys match this frame's nodes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InteractionState {
+    pub hovered: Option<NodeId>,
+    pub pressed: Option<NodeId>,
+    pub focused: Option<NodeId>,
+}
+
 /// Per-render context handed to `View::render`. Owns the in-construction
 /// `NodeTree`, tracks the current parent for nested views, and
 /// accumulates the `Interactions` table for this render pass.
@@ -32,6 +43,8 @@ pub struct Ctx<'a> {
     parent_stack: Vec<NodeId>,
     /// Theme tokens — light or dark.
     pub theme: Semantic,
+    /// Hover/press/focus from the app, for state-dependent looks.
+    pub state: InteractionState,
 }
 
 impl<'a> Ctx<'a> {
@@ -40,8 +53,23 @@ impl<'a> Ctx<'a> {
         interactions: &'a mut Interactions,
         theme: Semantic,
     ) -> Self {
-        Self { tree, interactions, parent_stack: Vec::new(), theme }
+        Self::with_state(tree, interactions, theme, InteractionState::default())
     }
+
+    pub fn with_state(
+        tree: &'a mut NodeTree,
+        interactions: &'a mut Interactions,
+        theme: Semantic,
+        state: InteractionState,
+    ) -> Self {
+        Self { tree, interactions, parent_stack: Vec::new(), theme, state }
+    }
+
+    /// Whether `id` is the current hover target. Valid for nodes whose
+    /// id is stable across renders (stable view structure).
+    pub fn is_hovered(&self, id: NodeId) -> bool { self.state.hovered == Some(id) }
+    pub fn is_pressed(&self, id: NodeId) -> bool { self.state.pressed == Some(id) }
+    pub fn is_focused(&self, id: NodeId) -> bool { self.state.focused == Some(id) }
 
     /// Add a leaf node under the current parent.
     pub fn add(&mut self, node: Node) -> NodeId {
@@ -79,6 +107,12 @@ impl<'a> Ctx<'a> {
     pub fn focusable(&mut self, id: NodeId) {
         self.interactions.entry(id).focusable = true;
     }
+
+    /// Attach flex parameters (grow, alignment, container padding /
+    /// justify) to a node emitted in this render pass.
+    pub fn set_flex(&mut self, id: NodeId, style: crate::layout::FlexStyle) {
+        self.tree.set_style(id, style);
+    }
 }
 
 /// Anything that can produce render output by emitting nodes into a `Ctx`.
@@ -90,6 +124,16 @@ pub trait View {
 /// optional-content patterns later.
 impl View for () {
     fn render(&self, _ctx: &mut Ctx) {}
+}
+
+/// Closure-as-View adapter — one-off content (chip innards, panel
+/// bodies) without a named struct per composition.
+pub struct Draw<F: Fn(&mut Ctx)>(pub F);
+
+impl<F: Fn(&mut Ctx)> View for Draw<F> {
+    fn render(&self, ctx: &mut Ctx) {
+        (self.0)(ctx)
+    }
 }
 
 /// `Vec<V>` renders each element in order. Lets a View produce a
@@ -106,10 +150,20 @@ impl<V: View> View for Vec<V> {
 /// interaction table built up during the pass. The diff vs the
 /// previous tree (and the wire emission) lives in `surface::commit`.
 pub fn render<V: View>(view: &V, theme: Semantic) -> (NodeTree, Interactions) {
+    render_with_state(view, theme, InteractionState::default())
+}
+
+/// `render` with hover/press/focus state, so widgets can draw their
+/// state-dependent looks. `App::tick` uses this.
+pub fn render_with_state<V: View>(
+    view: &V,
+    theme: Semantic,
+    state: InteractionState,
+) -> (NodeTree, Interactions) {
     let mut tree = NodeTree::new();
     let mut interactions = Interactions::new();
     {
-        let mut ctx = Ctx::new(&mut tree, &mut interactions, theme);
+        let mut ctx = Ctx::with_state(&mut tree, &mut interactions, theme, state);
         view.render(&mut ctx);
     }
     (tree, interactions)

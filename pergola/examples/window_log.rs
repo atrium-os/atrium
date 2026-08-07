@@ -35,11 +35,7 @@ impl View for LoginForm {
         });
 
         // Inner stack.
-        ctx.push(Node::Stack {
-            rect: Rect::new(80.0 + space::LG, 80.0 + space::LG, 480.0 - 2.0 * space::LG, 360.0 - 2.0 * space::LG),
-            axis: Axis::Vertical,
-            spacing: space::MD,
-        });
+        ctx.push(Node::vstack(Rect::new(80.0 + space::LG, 80.0 + space::LG, 480.0 - 2.0 * space::LG, 360.0 - 2.0 * space::LG), space::MD));
 
         ctx.add(Node::Text {
             rect: Rect::ZERO_SIZED,

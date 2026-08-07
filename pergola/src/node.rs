@@ -60,10 +60,19 @@ pub enum Node {
     /// A layout container that arranges children along an axis with
     /// uniform spacing. The layout pass walks Stacks and assigns
     /// child rects based on intrinsic sizes + spacing + axis.
+    ///
+    /// With `fill: Some(_)` the container also *paints* — one rounded
+    /// rect behind its children (panels, chips, popover bodies). A
+    /// filled Stack is a hit-target; a layout-only Stack is
+    /// transparent to hits. Borders are composed by nesting: an outer
+    /// filled Stack in the border color with 1px padding around an
+    /// inner filled Stack.
     Stack {
         rect: Rect,
         axis: Axis,
         spacing: f32,
+        fill: Option<Color>,
+        radius: f32,
     },
     /// A single stroked line segment (a thick rotated quad at the GPU layer).
     /// Absolutely positioned — layout doesn't touch it. Vector icons are built from
@@ -77,6 +86,24 @@ pub enum Node {
 }
 
 impl Node {
+    /// Layout-only stack (no paint).
+    pub fn stack(axis: Axis, rect: Rect, spacing: f32) -> Self {
+        Node::Stack { rect, axis, spacing, fill: None, radius: 0.0 }
+    }
+
+    pub fn vstack(rect: Rect, spacing: f32) -> Self {
+        Self::stack(Axis::Vertical, rect, spacing)
+    }
+
+    pub fn hstack(rect: Rect, spacing: f32) -> Self {
+        Self::stack(Axis::Horizontal, rect, spacing)
+    }
+
+    /// Stack that paints a rounded rect behind its children.
+    pub fn stack_filled(axis: Axis, rect: Rect, spacing: f32, fill: Color, radius: f32) -> Self {
+        Node::Stack { rect, axis, spacing, fill: Some(fill), radius }
+    }
+
     /// Logical bounds in this node's own (parent-relative) coordinate
     /// space. Layout uses this as the *current* rect; for some node
     /// kinds (Text) it is mutated in place by the layout pass.
@@ -109,16 +136,10 @@ impl Node {
         }
     }
 
-    /// Proportional-font width estimate. **Placeholder.** Real
-    /// shaping comes from `fresco-text` once wire emission lands
-    /// (phase 4). Until then: average char width ≈ 0.55 × size for
-    /// proportional faces. Tuned to undershoot slightly so layout
-    /// doesn't overflow when real shaping replaces this.
+    /// Shaped text size via the installed measurer (`crate::text`);
+    /// falls back to the historical 0.55·size estimate when headless.
     pub fn measure_text(content: &str, style: &TextStyle) -> Size {
-        let avg_char_w = style.size * 0.55;
-        let w = content.chars().count() as f32 * avg_char_w;
-        let h = style.size * crate::theme::tokens::line_height::UI_SINGLE_LINE;
-        Size::new(w, h)
+        crate::text::measure(content, style)
     }
 }
 
@@ -130,6 +151,10 @@ pub struct NodeTree {
     nodes: Vec<Option<Node>>,
     parent: Vec<Option<NodeId>>,
     children: Vec<Vec<NodeId>>,
+    /// Flex parameters per node (side-table — layout concerns stay
+    /// out of the wire-facing `Node` payloads). Sparse: most nodes
+    /// use defaults.
+    styles: Vec<Option<crate::layout::FlexStyle>>,
 }
 
 impl NodeTree {
@@ -141,10 +166,23 @@ impl NodeTree {
         self.nodes.push(Some(node));
         self.parent.push(parent);
         self.children.push(Vec::new());
+        self.styles.push(None);
         if let Some(p) = parent {
             self.children[p.0 as usize].push(id);
         }
         id
+    }
+
+    /// Attach flex parameters to a node (grow, alignment, container
+    /// padding/justify for Stacks). See `layout::FlexStyle`.
+    pub fn set_style(&mut self, id: NodeId, style: crate::layout::FlexStyle) {
+        if let Some(slot) = self.styles.get_mut(id.0 as usize) {
+            *slot = Some(style);
+        }
+    }
+
+    pub fn style(&self, id: NodeId) -> Option<&crate::layout::FlexStyle> {
+        self.styles.get(id.0 as usize).and_then(|s| s.as_ref())
     }
 
     pub fn get(&self, id: NodeId) -> Option<&Node> {

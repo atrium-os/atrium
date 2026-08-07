@@ -28,11 +28,7 @@ impl View for Counter {
     fn render(&self, ctx: &mut Ctx) {
         let n = self.count.get();
 
-        ctx.push(Node::Stack {
-            rect: Rect::new(0.0, 0.0, 240.0, 96.0),
-            axis: Axis::Vertical,
-            spacing: space::SM,
-        });
+        ctx.push(Node::vstack(Rect::new(0.0, 0.0, 240.0, 96.0), space::SM));
 
         // The count is illustrated by the width of a bar — toy demo
         // for phase 1, before Text widgets exist. Wider = bigger n.

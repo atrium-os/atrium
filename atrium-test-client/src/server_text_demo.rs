@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let text = "Hello from frescod!";
-    let m = conn.text_measure(f.font_id, 64.0, text)?;
+    let m = conn.text_measure(f.font_id, 64.0, 400, text)?;
     eprintln!(
         "measured '{text}' @ 64px → width={:.1} ascent={:.1} descent={:.1}",
         m.width_px, m.ascent_px, m.descent_px,

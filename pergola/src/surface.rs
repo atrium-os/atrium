@@ -46,7 +46,9 @@ pub fn commit(surface: &mut dyn Surface, deltas: &[NodeDelta]) -> io::Result<()>
     for d in deltas {
         match d {
             NodeDelta::Added { id, node, .. } | NodeDelta::Changed { id, node } => {
-                if matches!(node, Node::Stack { .. }) {
+                // Layout-only Stacks have no wire presence; filled
+                // Stacks paint their background rect.
+                if matches!(node, Node::Stack { fill: None, .. }) {
                     continue;
                 }
                 surface.set_node(*id, node)?;
@@ -97,7 +99,11 @@ impl Surface for LogSurface {
                 "  set  id={:>3}  Path ({:>4.1},{:>4.1})→({:>4.1},{:>4.1}) w={:.1}",
                 id.0, p0.0, p0.1, p1.0, p1.1, width,
             ),
-            Node::Stack { .. } => unreachable!("commit() filters Stack"),
+            Node::Stack { fill: Some(fill), rect, radius, .. } => println!(
+                "  set  id={:>3}  Panel({:>4.0},{:>4.0} {:>4.0}×{:>4.0}) r={:.0} rgba=({:.2},{:.2},{:.2},{:.2})",
+                id.0, rect.x(), rect.y(), rect.w(), rect.h(), radius, fill.r, fill.g, fill.b, fill.a,
+            ),
+            Node::Stack { fill: None, .. } => unreachable!("commit() filters layout-only Stacks"),
         }
         Ok(())
     }
@@ -123,7 +129,8 @@ impl Surface for LogSurface {
 ///   `Node::Text` → `text_run_install` (the server shapes + rasterizes
 ///                   + atlases on its side; the client just sends the
 ///                   string + font + size + position + color).
-///   `Node::Stack` → no wire op (pure layout container).
+///   `Node::Stack` → no wire op when layout-only; filled Stacks
+///                   paint their background via `scene_node_rect`.
 ///
 /// Maintains a font_id cache keyed on family name so `font_open` is
 /// called at most once per family per session.
@@ -208,7 +215,16 @@ impl Surface for FrescoSurface {
                 };
                 self.conn.scene_node_path(id.0, params)
             }
-            Node::Stack { .. } => Ok(()),  // pure layout, no wire op
+            Node::Stack { fill: Some(fill), rect, radius, .. } => {
+                // Filled Stack — paints its background as a rect.
+                let params = fresco_protocol::RectParams {
+                    x: rect.x(), y: rect.y(), w: rect.w(), h: rect.h(),
+                    r: fill.r, g: fill.g, b: fill.b, a: fill.a,
+                    radius: *radius,
+                };
+                self.conn.scene_node_rect(id.0, params)
+            }
+            Node::Stack { fill: None, .. } => Ok(()),  // pure layout, no wire op
         }
     }
 

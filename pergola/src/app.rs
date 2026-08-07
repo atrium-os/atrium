@@ -20,13 +20,13 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::event::{hit_test, Event};
+use crate::event::{hit_test, Event, Key, KeyEventKind};
 use crate::interaction::Interactions;
 use crate::layout;
 use crate::node::{diff, NodeDelta, NodeId, NodeTree};
 use crate::reactive::Mutable;
 use crate::theme::Semantic;
-use crate::view::{render, View};
+use crate::view::{render_with_state, InteractionState, View};
 
 pub struct App<V: View> {
     view: V,
@@ -38,10 +38,16 @@ pub struct App<V: View> {
     /// PointerUp if the up event lands on the same node. Drag
     /// detection (when up lands elsewhere) lives in a future phase.
     pending_press: Option<NodeId>,
-    /// The node currently receiving keyboard input, if any.
-    /// Pointer-down on a focusable node sets this; nothing else
-    /// changes it yet (Tab navigation in a later phase).
+    /// The node currently receiving keyboard input, if any. Pointer-
+    /// down on a focusable node sets this; Tab / Shift-Tab cycle it
+    /// through focusables in id order.
     focused: Option<NodeId>,
+    /// Current hover target — nearest interactive ancestor under the
+    /// pointer. Drives widgets' hover looks via `InteractionState`.
+    hovered: Option<NodeId>,
+    /// Interactive node currently held down (visual pressed state;
+    /// distinct from `pending_press`, which is click bookkeeping).
+    pressed_vis: Option<NodeId>,
     dirty: Arc<AtomicBool>,
     pub theme: Semantic,
 }
@@ -70,6 +76,8 @@ impl<V: View> App<V> {
             interactions: Interactions::new(),
             pending_press: None,
             focused: None,
+            hovered: None,
+            pressed_vis: None,
             dirty,
             theme: Semantic::LIGHT,
         }
@@ -78,6 +86,15 @@ impl<V: View> App<V> {
     pub fn with_theme(mut self, theme: Semantic) -> Self {
         self.theme = theme;
         self
+    }
+
+    /// Switch theme at runtime; marks dirty so the next tick
+    /// re-renders everything in the other mode.
+    pub fn set_theme(&mut self, theme: Semantic) {
+        if self.theme != theme {
+            self.theme = theme;
+            self.dirty.store(true, Ordering::Release);
+        }
     }
 
     /// A handle to the dirty flag. Pass to `Mutable::with_dirty` if
@@ -106,7 +123,12 @@ impl<V: View> App<V> {
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return Vec::new();
         }
-        let (mut next, interactions) = render(&self.view, self.theme);
+        let state = InteractionState {
+            hovered: self.hovered,
+            pressed: self.pressed_vis,
+            focused: self.focused,
+        };
+        let (mut next, interactions) = render_with_state(&self.view, self.theme, state);
         // Run layout from each root in the tree (a render pass may
         // produce multiple top-level nodes; in practice it's one per
         // window).
@@ -142,6 +164,47 @@ impl<V: View> App<V> {
         }
     }
 
+    /// Mark the UI dirty (state-dependent looks need a re-render).
+    fn touch(&self) {
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    /// Focusable node ids in id order — the Tab traversal sequence.
+    fn focusables(&self) -> Vec<NodeId> {
+        let mut ids: Vec<NodeId> = self
+            .interactions
+            .by_node
+            .iter()
+            .filter(|(_, h)| h.focusable)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_by_key(|id| id.0);
+        ids
+    }
+
+    /// Advance focus to the next/previous focusable (Tab / Shift-Tab),
+    /// wrapping. No-op when nothing is focusable.
+    fn cycle_focus(&mut self, backwards: bool) {
+        let ids = self.focusables();
+        if ids.is_empty() {
+            return;
+        }
+        let next = match self.focused.and_then(|f| ids.iter().position(|&i| i == f)) {
+            Some(pos) => {
+                let n = ids.len() as isize;
+                let step = if backwards { -1 } else { 1 };
+                ids[((pos as isize + step).rem_euclid(n)) as usize]
+            }
+            None => {
+                if backwards { *ids.last().unwrap() } else { ids[0] }
+            }
+        };
+        if self.focused != Some(next) {
+            self.focused = Some(next);
+            self.touch();
+        }
+    }
+
     pub fn handle_event(&mut self, event: Event) {
         match &event {
             Event::PointerDown { at } => {
@@ -152,7 +215,15 @@ impl<V: View> App<V> {
                 // the handler. Press-tracking uses the nearest on_click ancestor;
                 // focus uses the nearest focusable ancestor.
                 self.pending_press = hit.and_then(|id| self.bubble_to(id, |h| h.on_click.is_some()));
-                self.focused = hit.and_then(|id| self.bubble_to(id, |h| h.focusable));
+                let new_focus = hit.and_then(|id| self.bubble_to(id, |h| h.focusable));
+                if self.focused != new_focus {
+                    self.focused = new_focus;
+                    self.touch();
+                }
+                if self.pressed_vis != self.pending_press {
+                    self.pressed_vis = self.pending_press;
+                    self.touch();
+                }
             }
             Event::PointerUp { at } => {
                 let target = hit_test(&self.prev_tree, *at)
@@ -167,11 +238,27 @@ impl<V: View> App<V> {
                     }
                 }
                 self.pending_press = None;
+                if self.pressed_vis.take().is_some() {
+                    self.touch();
+                }
             }
-            Event::PointerMove { .. } => {
-                // Hover/drag: future phase
+            Event::PointerMove { at } => {
+                // Hover target = nearest interactive ancestor (clickable
+                // or focusable) under the pointer.
+                let hover = hit_test(&self.prev_tree, *at)
+                    .and_then(|id| self.bubble_to(id, |h| h.on_click.is_some() || h.focusable));
+                if self.hovered != hover {
+                    self.hovered = hover;
+                    self.touch();
+                }
             }
-            Event::Key { .. } => {
+            Event::Key { kind, key, modifiers, .. } => {
+                // Tab is focus traversal, owned by the App; focused
+                // widgets never see it.
+                if *kind == KeyEventKind::Down && *key == Key::Tab {
+                    self.cycle_focus(modifiers.shift);
+                    return;
+                }
                 if let Some(id) = self.focused {
                     if let Some(h) = self.interactions.get(id) {
                         if let Some(cb) = &h.on_key {
@@ -234,6 +321,60 @@ mod tests {
         app.handle_event(Event::PointerDown { at: crate::geom::Point::new(50.0, 20.0) });
         app.handle_event(Event::PointerUp { at: crate::geom::Point::new(50.0, 20.0) });
         assert!(fired.load(Ordering::SeqCst), "on_click must fire via bubbling from a child hit");
+    }
+
+    /// Two focusable rects side by side — the Tab-cycling shape.
+    struct TwoFields;
+    impl View for TwoFields {
+        fn render(&self, ctx: &mut Ctx) {
+            for i in 0..2 {
+                let id = ctx.tree.insert(None, Node::Rect {
+                    rect: Rect::new(i as f32 * 60.0, 0.0, 50.0, 20.0),
+                    fill: Color::rgba(0.5, 0.5, 0.5, 1.0), radius: 0.0,
+                });
+                ctx.focusable(id);
+            }
+        }
+    }
+
+    #[test]
+    fn hover_change_marks_dirty_and_reaches_render_state() {
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let mut app = App::new(ClickParent { fired });
+        app.tick();
+        assert!(!app.is_dirty());
+        // Move onto the interactive parent: dirty, hovered set.
+        app.handle_event(Event::PointerMove { at: crate::geom::Point::new(50.0, 20.0) });
+        assert!(app.is_dirty());
+        app.tick();
+        // Move within the same target: no spurious dirty.
+        app.handle_event(Event::PointerMove { at: crate::geom::Point::new(60.0, 20.0) });
+        assert!(!app.is_dirty());
+        // Move off: dirty again, hover cleared.
+        app.handle_event(Event::PointerMove { at: crate::geom::Point::new(500.0, 500.0) });
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn tab_cycles_focus_and_shift_tab_reverses() {
+        let mut app = App::new(TwoFields);
+        app.tick();
+        let tab = |shift| Event::Key {
+            kind: crate::event::KeyEventKind::Down,
+            key: crate::event::Key::Tab,
+            modifiers: crate::event::Modifiers { shift, ..Default::default() },
+            chars: String::new(),
+        };
+        assert_eq!(app.focused(), None);
+        app.handle_event(tab(false));
+        let first = app.focused().expect("tab focuses first focusable");
+        app.handle_event(tab(false));
+        let second = app.focused().unwrap();
+        assert_ne!(first, second);
+        app.handle_event(tab(false));
+        assert_eq!(app.focused(), Some(first), "wraps around");
+        app.handle_event(tab(true));
+        assert_eq!(app.focused(), Some(second), "shift-tab reverses");
     }
 
     #[test]

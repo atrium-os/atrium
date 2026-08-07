@@ -15,6 +15,7 @@ fresco-client   = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }
 futures-signals = "0.3"
 log             = "0.4"
+taffy = "0.12.2"
 
 [dev-dependencies]
 env_logger = "0.11"

@@ -532,11 +532,11 @@ impl Connection {
     /// a follow-up `text_run_install` doesn't re-rasterize).
     pub fn text_measure(
         &mut self,
-        font_id: u32, size_px: f32,
+        font_id: u32, size_px: f32, weight: u16,
         text: impl Into<String>,
     ) -> io::Result<TextMeasureResponse> {
         self.send_payload(control::OP_TEXT_MEASURE, 0,
-            &TextMeasurePayload { font_id, size_px, text: text.into() })?;
+            &TextMeasurePayload { font_id, size_px, weight, text: text.into() })?;
         loop {
             let m = self.inner.recv_message()?;
             if m.opcode_class == CLASS_DISPLAY

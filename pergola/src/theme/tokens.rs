@@ -37,6 +37,9 @@ pub mod font {
     /// reference the token, so the face is centralized here.
     pub const SANS: &str = "system-sans";
     pub const MONO: &str = "system-mono";
+    /// Phosphor Icons as a glyph font (§9) — icons ride the text
+    /// pipeline. Codepoints live in `widgets::phosphor`.
+    pub const ICONS: &str = "system-icons";
 }
 
 pub mod type_size {

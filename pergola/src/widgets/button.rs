@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::geom::Rect;
 use crate::node::{Node, TextStyle};
-use crate::theme::{font, radius, size, type_size, Weight};
+use crate::theme::{font, radius, size, stroke, type_size, Weight};
 use crate::view::{Ctx, View};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,21 +79,81 @@ impl View for Button {
     fn render(&self, ctx: &mut Ctx) {
         let theme = ctx.theme;
 
-        // Resolve fill + label color per variant.
-        let (fill, label_color) = match self.variant {
-            Variant::Primary => (theme.accent_fg(), theme.bg_canvas()),
-            Variant::Secondary => (theme.bg_surface(), theme.text_primary()),
-            Variant::Ghost => (crate::Color::TRANSPARENT, theme.text_primary()),
-        };
-
         let h = if self.rect.size.h > 0.0 { self.rect.size.h } else { size::BUTTON_HEIGHT_DEFAULT };
         let rect = Rect::new(self.rect.x(), self.rect.y(), self.rect.size.w, h);
 
+        // Node structure is IDENTICAL in every state — state changes
+        // colors, never node count — so ids stay stable across renders
+        // and last frame's hover/press/focus (keyed by id) selects
+        // this frame's look. Layers: focus halo, focus ring, body
+        // (doubles as the border for Secondary), inner fill, label.
+        let halo_id = ctx.tree.insert(None, Node::Rect {
+            rect: inflate(rect, 3.0),
+            fill: crate::Color::TRANSPARENT,
+            radius: radius::SM + 3.0,
+        });
+        let ring_id = ctx.tree.insert(None, Node::Rect {
+            rect: inflate(rect, 1.0),
+            fill: crate::Color::TRANSPARENT,
+            radius: radius::SM + 1.0,
+        });
         let bg_id = ctx.tree.insert(None, Node::Rect {
             rect,
-            fill,
+            fill: crate::Color::TRANSPARENT,
             radius: radius::SM,
         });
+        let inner_id = ctx.tree.insert(Some(bg_id), Node::Rect {
+            rect: inflate(rect, -stroke::DEFAULT),
+            fill: crate::Color::TRANSPARENT,
+            radius: (radius::SM - stroke::DEFAULT).max(0.0),
+        });
+
+        let hovered = ctx.is_hovered(bg_id);
+        let pressed = ctx.is_pressed(bg_id);
+        let focused = ctx.is_focused(bg_id);
+
+        // Resolve per variant and state. Pressed beats hover. `body`
+        // is the outer rect; `inner` is the 1px-inset fill Secondary
+        // uses to fake its border until an outline pass exists.
+        let (body, inner, label_color) = match self.variant {
+            Variant::Primary => {
+                let fill = if pressed {
+                    theme.accent_pressed()
+                } else if hovered {
+                    theme.accent_strong()
+                } else {
+                    theme.accent_fg()
+                };
+                (fill, crate::Color::TRANSPARENT, theme.text_on_accent())
+            }
+            Variant::Secondary => {
+                let fill = if pressed || hovered { theme.bg_surface() } else { theme.bg_elevated() };
+                (theme.border_strong(), fill, theme.text_primary())
+            }
+            Variant::Ghost => {
+                let fill = if pressed || hovered {
+                    theme.bg_surface()
+                } else {
+                    crate::Color::TRANSPARENT
+                };
+                (fill, crate::Color::TRANSPARENT, theme.text_secondary())
+            }
+        };
+
+        if focused {
+            if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(halo_id) {
+                *fill = theme.accent_bg();
+            }
+            if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(ring_id) {
+                *fill = theme.focus_ring();
+            }
+        }
+        if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(bg_id) {
+            *fill = body;
+        }
+        if let Some(Node::Rect { fill, .. }) = ctx.tree.get_mut(inner_id) {
+            *fill = inner;
+        }
 
         // Label centered on the rect — phase 5 places it at a
         // hardcoded vertical center; full text metrics-aware
@@ -121,10 +181,16 @@ impl View for Button {
             },
         });
 
-        // Wire the click handler.
+        // Wire the click handler; clickable buttons take Tab focus.
         if let Some(cb) = &self.on_click {
             let cb = Arc::clone(cb);
             ctx.on_click(bg_id, move || cb());
+            ctx.focusable(bg_id);
         }
     }
+}
+
+/// Grow (positive) or shrink (negative) a rect by `d` on every edge.
+fn inflate(r: Rect, d: f32) -> Rect {
+    Rect::new(r.x() - d, r.y() - d, r.w() + 2.0 * d, r.h() + 2.0 * d)
 }

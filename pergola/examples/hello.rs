@@ -34,11 +34,7 @@ impl View for LoginPlaceholder {
         });
 
         // Stack container for content. Inset by space::LG.
-        ctx.push(Node::Stack {
-            rect: Rect::new(space::LG, space::LG, 480.0 - 2.0 * space::LG, 360.0 - 2.0 * space::LG),
-            axis: Axis::Vertical,
-            spacing: space::MD,
-        });
+        ctx.push(Node::vstack(Rect::new(space::LG, space::LG, 480.0 - 2.0 * space::LG, 360.0 - 2.0 * space::LG), space::MD));
 
         // Heading.
         ctx.add(Node::Text {
@@ -112,7 +108,7 @@ fn print_subtree(tree: &pergola::NodeTree, id: NodeId, depth: usize) {
                 "{indent}[{:>2}] Text ({:>3.0},{:>3.0} {:>3.0}×{:>3.0}) {:?}px {:?}  {:?}",
                 id.0, rect.x(), rect.y(), rect.w(), rect.h(), style.size, style.weight, content,
             ),
-            Node::Stack { rect, axis, spacing } => println!(
+            Node::Stack { rect, axis, spacing, .. } => println!(
                 "{indent}[{:>2}] Stack ({:>3.0},{:>3.0} {:>3.0}×{:>3.0}) axis={:?} sp={:.0}",
                 id.0, rect.x(), rect.y(), rect.w(), rect.h(), axis, spacing,
             ),
