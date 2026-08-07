@@ -93,13 +93,33 @@ fn main() -> io::Result<()> {
     let scene = Arc::new(Mutex::new(SceneGraph::new()));
     let slots = Arc::new(Mutex::new(SlotTable::new()));
     let comp  = Arc::new(Mutex::new(Compositor::new_with_window0(scene, slots)));
-    let mut frontend = EnvelopeFrontend::new(cas.clone(), comp);
+    let text_engine: fresco_scene_server::text::SharedTextEngine = Default::default();
+    let mut frontend = EnvelopeFrontend::new_with_text(cas.clone(), comp, text_engine.clone());
+    /* The harness IS the display — report its render target as the
+     * scanout mode so DISPLAY_INFO answers truthfully (a FullScreen
+     * Pergola window sized itself to 0×0 without this). */
+    frontend.set_display_mode(WIDTH, HEIGHT, 60_000);
 
-    /* Single-client smoke loop: accept one connection, drive everything
-     * inline. Multi-client fan-out is M2.7d-final. */
+    /* Single-client smoke loop for the RENDERING client; side clients
+     * (Pergola's text measurer opens its own connection so measurement
+     * replies never interleave with the event stream) are served by a
+     * measurement-only acceptor thread sharing the text engine. */
     eprintln!("frescod-vulkan-smoke: waiting for client...");
     let (stream, _) = listener.accept()?;
     eprintln!("frescod-vulkan-smoke: client connected");
+
+    {
+        let side_listener = listener.try_clone()?;
+        let side_text = text_engine.clone();
+        std::thread::spawn(move || loop {
+            let Ok((s, _)) = side_listener.accept() else { break };
+            eprintln!("frescod-vulkan-smoke: side client (measure) connected");
+            let text = side_text.clone();
+            std::thread::spawn(move || {
+                let _ = serve_measure_client(s, text);
+            });
+        });
+    }
 
     let mut conn = AqConn::wrap(stream)?;
     let mut frame_no: u32 = 0;
@@ -239,4 +259,76 @@ fn main() -> io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Measurement-only side protocol: FONT_OPEN + TEXT_MEASURE (+
+/// DISPLAY_INFO), backed by the shared text engine. Everything else is
+/// ignored — side clients don't render.
+fn serve_measure_client(
+    stream: std::os::unix::net::UnixStream,
+    text: fresco_scene_server::text::SharedTextEngine,
+) -> io::Result<()> {
+    use aqueduct::flag;
+    use fresco_protocol::{decode, encode, control,
+        FontOpenPayload, FontOpenResponse, TextMeasurePayload, TextMeasureResponse,
+        DisplayInfoResponse};
+
+    let mut conn = AqConn::wrap(stream)?;
+    loop {
+        let msg = match conn.recv_message() {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        if msg.opcode_class != CLASS_DISPLAY { continue; }
+        match msg.op {
+            op if op == control::OP_FONT_OPEN => {
+                let Ok(p) = decode::<FontOpenPayload>(&msg.payload) else { continue };
+                let resp = match text.write().unwrap().open(&p.name) {
+                    Some((font_id, m)) => FontOpenResponse {
+                        font_id,
+                        units_per_em: m.units_per_em,
+                        ascent_units: m.ascent_units,
+                        descent_units: m.descent_units,
+                        mono_advance_units: m.mono_advance_units,
+                    },
+                    None => FontOpenResponse {
+                        font_id: 0, units_per_em: 0,
+                        ascent_units: 0, descent_units: 0, mono_advance_units: 0,
+                    },
+                };
+                let payload = encode(&resp).map_err(|_| io::Error::new(
+                    io::ErrorKind::InvalidData, "encode FontOpenResponse"))?;
+                conn.send_message(CLASS_DISPLAY, control::OP_FONT_OPEN,
+                    flag::IS_RESPONSE, &payload)?;
+            }
+            op if op == control::OP_TEXT_MEASURE => {
+                let Ok(p) = decode::<TextMeasurePayload>(&msg.payload) else { continue };
+                let resp = match text.write().unwrap()
+                    .measure(p.font_id, p.size_px, p.weight, &p.text)
+                {
+                    Some((w, a, d)) => TextMeasureResponse {
+                        width_px: w, ascent_px: a, descent_px: d,
+                    },
+                    None => TextMeasureResponse {
+                        width_px: 0.0, ascent_px: 0.0, descent_px: 0.0,
+                    },
+                };
+                let payload = encode(&resp).map_err(|_| io::Error::new(
+                    io::ErrorKind::InvalidData, "encode TextMeasureResponse"))?;
+                conn.send_message(CLASS_DISPLAY, control::OP_TEXT_MEASURE,
+                    flag::IS_RESPONSE, &payload)?;
+            }
+            op if op == control::OP_DISPLAY_INFO => {
+                let resp = DisplayInfoResponse {
+                    width: WIDTH, height: HEIGHT, refresh_mhz: 60_000,
+                };
+                let payload = encode(&resp).map_err(|_| io::Error::new(
+                    io::ErrorKind::InvalidData, "encode DisplayInfoResponse"))?;
+                conn.send_message(CLASS_DISPLAY, control::OP_DISPLAY_INFO,
+                    flag::IS_RESPONSE, &payload)?;
+            }
+            _ => {}
+        }
+    }
 }
