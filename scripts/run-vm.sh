@@ -12,7 +12,21 @@
 # Tunables (env vars):
 #   SMP=N        vCPU count, default 4. Lower = less host wakeup overhead
 #                when the guest is idle. 2 is plenty for shell + cargo work.
-#   MEM=MB       guest RAM, default 12288 (12 GiB).
+#   MEM=MB       guest RAM, default 4096 (4 GiB).
+#
+#                ★ Lowered from 12288 on 2026-08-07. 12 GiB was ~6x what this
+#                VM uses — measured in-guest: "15M Active, 524M Inact, 252M
+#                Wired, 11G Free" of 12 GiB. But the guest TOUCHES most of the
+#                region during boot and the mount-time pinscan (13.1M inodes at
+#                63 retained snapshots), and with no ballooning the host never
+#                gets those pages back. They go cold, macOS compresses them
+#                (measured 884k pages at 9.6:1) and swaps them out: 10.4 GiB
+#                swapped, host swap 88% full (7187 of 8192 MB).
+#
+#                That is stranded, NOT leaked — qemu's malloc count was flat
+#                (59220 -> 59220) and its phys_footprint (23.4 GiB) EXCEEDED
+#                its entire virtual size (14.2 GiB), which real usage cannot
+#                do. Raise MEM only for a workload that genuinely needs it.
 #
 # Power note (laptop battery):
 #   Measured 2026-05-03 on this VM: idle qemu sits at ~99% host CPU
@@ -41,7 +55,7 @@ BSD_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 QEMU_DIR="$BSD_DIR/external/qemu-build"
 QEMU="$QEMU_DIR/build/qemu-system-aarch64"
 SMP="${SMP:-4}"
-MEM="${MEM:-12288}"
+MEM="${MEM:-4096}"
 EFI_SRC="$QEMU_DIR/build/qemu-bundle/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
 EFI_PAD="$BSD_DIR/vm/edk2-aarch64-code.fd"
 EFI_VARS="$BSD_DIR/vm/edk2-arm-vars.fd"

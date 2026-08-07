@@ -622,6 +622,34 @@ static unsigned long tessera_stat_gc_snap_stale_io       = 0;
  * So: count first. union_ok vs root_fail across real passes gives the failure
  * RATE, which is the number the decision actually depends on.
  */
+/*
+ * ★ #131 candidate 1: force a PINSCAN immediately after activation.
+ *
+ * Publishing the frozen roots (d18a91a3) was necessary but did not move the
+ * abort rate: 8/9 passes still aborted under write load. The leading remaining
+ * hypothesis is TIMING — the published roots only become PINS when a pinscan
+ * actually runs, and between gc_scan_begin() and the next scheduled pinscan
+ * the frozen roots are unprotected. A commit landing in that window frees and
+ * reuses them, and the walk then reads a recycled node.
+ *
+ * So: run one pinscan right after activation, before the walk starts, so the
+ * pins exist for the whole walk. Costs one extra O(volume) pinscan per GC pass
+ * (cheap since #98's subtree-sharing prune).
+ *
+ * Default ON so the experiment is the shipping path if it works; set to 0 to
+ * get the old behaviour back without a rebuild.
+ */
+static int tessera_gc_pinscan_at_activation = 1;
+SYSCTL_INT(_kern_tessera, OID_AUTO, gc_pinscan_at_activation, CTLFLAG_RW,
+    &tessera_gc_pinscan_at_activation, 0,
+    "Run a pinscan immediately after GC scan activation so the frozen roots "
+    "are pinned before the walk starts (1=on, 0=old behaviour)");
+static unsigned long tessera_stat_gc_pinscan_at_activation = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_pinscan_at_activation_runs, CTLFLAG_RD,
+    &tessera_stat_gc_pinscan_at_activation, 0,
+    "Pinscans run at GC activation (effect counter: 0 means the call never "
+    "fired and any conclusion about it is void)");
+
 static unsigned long tessera_stat_gc_snap_union_ok       = 0;
 static unsigned long tessera_stat_gc_snap_root_fail      = 0;
 static unsigned long tessera_stat_gc_productive_passes   = 0;
@@ -16864,6 +16892,19 @@ tessera_fs_gc_task(void *ctx, int pending)
 		printf("tessera_fs: gc — could not snapshot in-flight state "
 		    "(%d); skipping this pass\n", berr);
 		goto out;
+	}
+
+	/*
+	 * ★ #131 candidate 1: pin the frozen roots BEFORE walking them.
+	 * Activation has just published gc_scan_{inode,registry,snapshots}_root
+	 * and set gc_scan_active, so this pinscan is the first that can see
+	 * them — and it runs before any of the walk's blocking reads, closing
+	 * the window in which a commit could free and reuse those sectors.
+	 * Outside the gate: pinscan_run takes it itself.
+	 */
+	if (tessera_gc_pinscan_at_activation) {
+		tessera_fs_pinscan_run(tmp_);
+		tessera_stat_gc_pinscan_at_activation++;
 	}
 
 	tessera_stat_gc_scans++;
