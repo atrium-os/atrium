@@ -15505,6 +15505,32 @@ tessera_fs_gc_scan_begin(struct tessera_mount *tmp_, struct tessera_gc_scan *s)
 		s->inode_root     = tmp_->sb.inode_root;
 		s->registry_root  = tmp_->sb.pack_registry_root;
 		s->snapshots_root = tmp_->sb.snapshots_root;
+		/*
+		 * ★ #131: PUBLISH the frozen roots to the mount so the pinscan
+		 * can actually pin them.
+		 *
+		 * The pinning half of tasks #72/#78 has been present all along
+		 * — the pinscan reads tmp_->gc_scan_{inode,registry,snapshots}
+		 * _root and marks those trees "for as long as its scan is
+		 * running", and its comment states they "are published under
+		 * the gate at activation". They were NOT: the three fields were
+		 * declared and read but never once assigned, so they were
+		 * permanently 0 and the pinscan pinned nothing. The consumer
+		 * shipped without the producer, and the symptom is exactly what
+		 * that comment predicts — the recycler hands the frozen roots'
+		 * sectors back mid-scan and the #66 rule turns the reused node
+		 * into "abort, reclaim nothing".
+		 *
+		 * Measured before this line existed: 8 of 11 GC passes aborted
+		 * under continuous write load, 0 of 2 when idle.
+		 *
+		 * Published inside the same flush_mtx section that sets
+		 * gc_scan_active, so a pinscan that observes the flag also sees
+		 * the roots — the ordering the pinscan already assumes.
+		 */
+		tmp_->gc_scan_inode_root     = s->inode_root;
+		tmp_->gc_scan_registry_root  = s->registry_root;
+		tmp_->gc_scan_snapshots_root = s->snapshots_root;
 		s->seeds          = seeds;
 		s->nseeds         = scount;
 		memset(tmp_->gc_touch_bm, 0, TESSERA_GC_TOUCH_BITS / 8);
@@ -15520,6 +15546,13 @@ tessera_fs_gc_scan_end(struct tessera_mount *tmp_, struct tessera_gc_scan *s)
 {
 	mtx_lock(&tmp_->flush_mtx);
 	tmp_->gc_scan_active = 0;
+	/* ★ #131: drop the pins with the flag. The pinscan only consults
+	 * these while gc_scan_active, so clearing is belt-and-braces — but a
+	 * stale root left here is a root some future reader could pin
+	 * forever, and this field already cost us one half-wired fix. */
+	tmp_->gc_scan_inode_root     = 0;
+	tmp_->gc_scan_registry_root  = 0;
+	tmp_->gc_scan_snapshots_root = 0;
 	mtx_unlock(&tmp_->flush_mtx);
 	if (s->seeds != NULL) {
 		free(s->seeds, M_TESSERA);
