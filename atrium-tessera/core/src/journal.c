@@ -390,6 +390,26 @@ read_record(tessera_journal_t *j, uint64_t *block,
 	int r = tessera_decode_record_header(blk, out_hdr);
 	if (r != TESSERA_OK) { tessera_free(blk); return r; }
 
+	/* ★ #126: VALIDATE THE RECORD GEOMETRY.
+	 *
+	 * body_length and block_count are read off disk and were previously
+	 * used unchecked — block_count to advance the replay cursor, and both
+	 * to size the body walk. The header CRC does NOT protect against this:
+	 * a torn write landing inside a header produces a header that is
+	 * self-consistent and semantically absurd.
+	 *
+	 * block_count is fully determined by body_length, so any disagreement
+	 * is corruption. Enforcing the identity kills the whole class at once:
+	 * block_count == 0 (which advanced the cursor by nothing, leaving
+	 * replay spinning on one record forever) and block_count enormous
+	 * (which jumped the cursor to an unrelated block, forming a ring —
+	 * see the loop bound in tessera_journal_replay). */
+	if (out_hdr->body_length > cap * BLK) { tessera_free(blk); return TESSERA_ECORRUPT; }
+	if (out_hdr->block_count != sectors_for(out_hdr->body_length)) {
+		tessera_free(blk);
+		return TESSERA_ECORRUPT;
+	}
+
 	const uint32_t bl = out_hdr->body_length;
 	uint8_t *body = NULL;
 	if (bl > 0) {
@@ -428,12 +448,12 @@ read_record(tessera_journal_t *j, uint64_t *block,
 		return TESSERA_EBADCRC;
 	}
 
-	uint64_t b = *block;
-	for (uint32_t k = 0; k < out_hdr->block_count; k++) {
-		b++;
-		if (b > cap) b = 1;
-	}
-	*block = b;
+	/* ★ #126: advance in O(1). This was a loop stepping one block at a
+	 * time, so a single record claiming block_count = 12582913 cost 12.5
+	 * MILLION iterations to compute a modular add. Data blocks are numbered
+	 * 1..cap and wrap, and block_count is now bounded above, but the closed
+	 * form is both correct and free. */
+	*block = ((*block - 1u + out_hdr->block_count) % cap) + 1u;
 	*out_body = body;
 	return TESSERA_OK;
 }
@@ -450,7 +470,38 @@ tessera_journal_replay(tessera_journal_t *j,
 	int in_tx = 0;
 	int rc = TESSERA_OK;
 
+	/* ★ #126: BOUND THE WALK INDEPENDENTLY OF THE DATA.
+	 *
+	 * `cur != head_block` assumes the record chain always arrives at
+	 * head_block. It is not a termination condition — it is a hope. cur is
+	 * advanced by block_count out of each record and head_block comes off
+	 * disk, so any ring among the records loops here FOREVER, at mount, in
+	 * the kernel: a permanent unbootable volume from a single flipped byte.
+	 * Fuzzing produced exactly that (3->4->...->17->3 with head_block=19
+	 * sitting outside the cycle).
+	 *
+	 * The geometry check in read_record closes the case that was found, but
+	 * termination must not depend on data validation being exhaustive. A
+	 * journal of N data blocks cannot contain more than N records, since
+	 * every record occupies at least one block — so exceeding that is
+	 * corruption, provably, whatever the records claim. This bound holds
+	 * even if some future field reopens a cycle. */
+	uint64_t steps = 0;
+	const uint64_t max_steps = j->length;   /* >= records the region holds */
+
 	while (cur != j->head_block) {
+		if (++steps > max_steps) {
+			tessera_debugf("journal replay: record chain from block "
+			    "%llu did not reach head %llu within %llu blocks — "
+			    "the journal is CORRUPT (cycle or bad block_count). "
+			    "Abandoning replay; run tessera-fsck on an "
+			    "UNMOUNTED volume.\n",
+			    (unsigned long long)j->tail_block,
+			    (unsigned long long)j->head_block,
+			    (unsigned long long)max_steps);
+			rc = TESSERA_ECORRUPT;
+			goto cleanup;
+		}
 		tessera_record_header_t hdr;
 		uint8_t *body = NULL;
 		int r = read_record(j, &cur, &hdr, &body);

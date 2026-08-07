@@ -44,7 +44,7 @@ while [ $# -gt 0 ]; do
         *)             TARGETS="$TARGETS $1"; shift ;;
     esac
 done
-[ -n "$TARGETS" ] || TARGETS="fuzz_manifest fuzz_pack fuzz_btree fuzz_superblock"
+[ -n "$TARGETS" ] || TARGETS="fuzz_manifest fuzz_pack fuzz_btree fuzz_superblock fuzz_journal"
 
 SRCS="error.c hash.c crc.c codec.c cdc.c btree.c manifest.c pack.c journal.c
       extent.c gc.c volume.c quota.c quota_store.c
@@ -133,6 +133,7 @@ EOF
                 fuzz_pack)       MAXLEN=32768 ;;
                 fuzz_btree)      MAXLEN=32768 ;;
                 fuzz_superblock) MAXLEN=16384 ;;
+                fuzz_journal)    MAXLEN=8192 ;;
                 *)               MAXLEN=4096 ;;
             esac
             echo
@@ -145,8 +146,13 @@ EOF
             # ★ Log to a FILE and tail the file. Piping into `tail` would make
             # $? the status of tail — 0 whether or not the fuzzer crashed.
             UBSAN_OPTIONS=print_stacktrace=1 \
+            # ★ -timeout: libFuzzer's default is 1200s per input. Journal
+            # replay loops on values read off disk, so a non-terminating input
+            # is a REAL possible finding — and at the default the fuzzer would
+            # hang for 20 minutes rather than report it. 20s is far above any
+            # legitimate input here.
             "$OBJ/$t" "$CORPUS/$t" -max_total_time="$SECS" -max_len="$MAXLEN" \
-                -use_value_profile=1 -print_final_stats=1 \
+                -timeout=20 -use_value_profile=1 -print_final_stats=1 \
                 -artifact_prefix="$ARTIFACTS/$t-" > "$OBJ/$t.explore.log" 2>&1
             st=$?
             grep -aE "^#[0-9]+.*(DONE|cov:)|ERROR|runtime error|stat::" \

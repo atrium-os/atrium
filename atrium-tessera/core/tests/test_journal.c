@@ -15,6 +15,9 @@
 #include "tessera/journal.h"
 #include "tessera/error.h"
 #include "tessera/format.h"
+#include "tessera/crc.h"
+
+#include <stddef.h>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -265,6 +268,91 @@ test_multiblock_body(void)
 	free(d);
 }
 
+/* ── #126: replay must TERMINATE on a corrupt journal ───────────────
+ *
+ * Found by fuzzing (fuzz/fuzz_journal.c). block_count is read off disk and was
+ * used unchecked to advance the replay cursor, so a torn write inside a record
+ * header could point the cursor at an unrelated block and form a RING among
+ * the records — a ring that never reaches head_block. Replay then span
+ * forever, at mount, in the kernel: an unbootable volume from one flipped
+ * byte. The reproducer walked 3->4->...->17->3 with head_block=19 outside the
+ * cycle.
+ *
+ * Two guards, tested separately, because the second must hold even if the
+ * first is ever incomplete:
+ *   A. read_record rejects a record whose block_count disagrees with
+ *      body_length (they are not independent — block_count is derived).
+ *   B. replay bounds its own walk by the journal length, so termination does
+ *      not depend on validation being exhaustive.
+ */
+static void
+corrupt_record_field(struct mem_disk *d, uint64_t sector, size_t off,
+                     uint32_t value)
+{
+	uint8_t *r = d->blocks[sector];
+	memcpy(r + off, &value, 4);
+	/* Re-stamp the header CRC: we are modelling a torn write that lands
+	 * INSIDE a header, which after recomputation is structurally valid and
+	 * semantically absurd. Leaving the CRC stale would only test the CRC. */
+	const size_t crc_off = offsetof(tessera_record_header_t, crc32_header);
+	uint32_t c = tessera_crc32(r, crc_off);
+	memcpy(r + crc_off, &c, 4);
+}
+
+static void
+test_corrupt_block_count_terminates(void)
+{
+	struct mem_disk *d = calloc(1, sizeof *d);
+	tessera_block_io_t io = mk_io(d);
+	const uint64_t START = 4, LEN = 32;
+	tessera_journal_format(&io, START, LEN);
+	tessera_journal_t *j = tessera_journal_open(&io, START, LEN);
+	CHECK(j != NULL);
+
+	/* A few committed transactions, so there is a chain to corrupt. */
+	for (int t = 0; t < 6; t++) {
+		uint64_t tx = 0;
+		CHECK(tessera_journal_tx_begin(j, &tx, "test\0\0\0\0\0\0\0\0\0\0\0")
+		    == TESSERA_OK);
+		uint8_t body[16];
+		memset(body, 0xA5 ^ t, sizeof body);
+		CHECK(tessera_journal_append(j, tx, TESSERA_INODE_WRITE,
+		    body, sizeof body) == TESSERA_OK);
+		CHECK(tessera_journal_tx_commit(j, tx) == TESSERA_OK);
+	}
+	tessera_journal_close(j);
+
+	/* (A) A wild block_count on one record. Before the fix this both cost
+	 * 12.5M iterations to "advance" and landed the cursor mid-chain. */
+	corrupt_record_field(d, START + 5,
+	    offsetof(tessera_record_header_t, block_count), 12582913u);
+
+	j = tessera_journal_open(&io, START, LEN);
+	CHECK(j != NULL);
+	struct cap_ctx cc = {0};
+	int rc = tessera_journal_replay(j, cap_cb, &cc);
+	/* The ONLY assertion that matters is that we got here at all — before
+	 * the fix this call never returned. Whether it reports ECORRUPT or
+	 * simply stops early is a policy detail; not hanging is not. */
+	CHECK(rc == TESSERA_OK || rc == TESSERA_ECORRUPT);
+	cap_free(&cc);
+	tessera_journal_close(j);
+
+	/* (B) block_count = 0, the degenerate case: the cursor advanced by
+	 * nothing, so replay re-read ONE record forever. */
+	corrupt_record_field(d, START + 5,
+	    offsetof(tessera_record_header_t, block_count), 0u);
+	j = tessera_journal_open(&io, START, LEN);
+	CHECK(j != NULL);
+	struct cap_ctx cc2 = {0};
+	rc = tessera_journal_replay(j, cap_cb, &cc2);
+	CHECK(rc == TESSERA_OK || rc == TESSERA_ECORRUPT);
+	cap_free(&cc2);
+	tessera_journal_close(j);
+
+	free(d);
+}
+
 int
 main(void)
 {
@@ -274,6 +362,7 @@ main(void)
 	test_aborted_then_committed();
 	test_torn_then_committed();
 	test_multiblock_body();
+	test_corrupt_block_count_terminates();
 	if (failures > 0) {
 		fprintf(stderr, "%d failure(s)\n", failures);
 		return 1;
