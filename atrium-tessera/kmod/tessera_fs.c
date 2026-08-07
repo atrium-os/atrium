@@ -447,6 +447,94 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, snapshots_ceiling_forced, CTLFLAG_RD,
     "Cumulative retirements forced by snapshot_max_retention despite the "
     "time floor (nonzero means min_age_sec is too long for this write rate)");
 
+/*
+ * ★ #116(c): express the horizon as a TIME SPAN with a SPARSE record set.
+ *
+ * max_age_sec is the actual product statement — "you can roll back this far".
+ * It is also, unavoidably, the reclaim-latency bound: a retained record pins
+ * its data, so deleted bytes become collectable exactly when the record
+ * covering them ages out. These are the same number and this makes that
+ * explicit instead of leaving it to emerge from a commit count.
+ *
+ * thin decouples the only thing that CAN be decoupled: how many RECORDS it
+ * takes to cover that span. Retaining the last N commits spends the whole
+ * budget on the last few seconds under load; retaining a log-decay-spaced
+ * subset covers the same span with the same N. That is the lever that matters
+ * for cost, because GC pass-1 and mount are linear in the RECORD COUNT
+ * (#108 lever 2, #33), not in the span.
+ *
+ * ORDER OF THE THREE BOUNDS at retirement, and why:
+ *   1. oldest older than max_age_sec   -> drop the OLDEST. Shortening the span
+ *      is the only thing that returns space, so this must win.
+ *   2. thinning enabled                -> drop the most redundant INTERIOR
+ *      record. Span preserved, count reduced.
+ *   3. otherwise                       -> drop the oldest (today's behaviour).
+ * The min_age_sec floor from (b) gates all three, and max_retention still caps
+ * the count so nothing here can wedge meta-reserve.
+ *
+ * ★ Thinning alone would be a BUG: never dropping the oldest means the span
+ * grows without bound and deleted data is pinned forever. max_age_sec is what
+ * makes thinning safe, which is why it is not an independent knob.
+ *
+ * Both default off.
+ */
+static int tessera_snapshot_max_age_sec = 0;
+SYSCTL_INT(_kern_tessera, OID_AUTO, snapshot_max_age_sec,
+    CTLFLAG_RW, &tessera_snapshot_max_age_sec, 0,
+    "Retire the oldest snapshot record once it is older than this many "
+    "seconds, whatever the count. This is BOTH the rollback horizon and the "
+    "reclaim-latency bound (0 = disabled)");
+
+static int tessera_snapshot_thin = 0;
+SYSCTL_INT(_kern_tessera, OID_AUTO, snapshot_thin,
+    CTLFLAG_RW, &tessera_snapshot_thin, 0,
+    "Retire the most redundant INTERIOR record (log-decay spacing) instead of "
+    "the oldest, so a fixed record budget covers a long span (0 = disabled)");
+
+static unsigned long tessera_stat_snapshots_thinned = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, snapshots_thinned, CTLFLAG_RD,
+    &tessera_stat_snapshots_thinned, 0,
+    "Cumulative retirements that dropped a THINNED interior record rather than "
+    "the oldest (effect counter: 0 here means thinning never actually fired)");
+
+static unsigned long tessera_stat_snapshots_max_age_retired = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, snapshots_max_age_retired, CTLFLAG_RD,
+    &tessera_stat_snapshots_max_age_retired, 0,
+    "Cumulative oldest-record retirements forced by snapshot_max_age_sec "
+    "(this is what bounds reclaim latency)");
+
+/*
+ * ★ The span is the WHOLE POINT of (c), so it must be observable. Without this
+ * you can see that thinning fired (snapshots_thinned) but not that it bought
+ * anything — and "the counter incremented" is not the claim. This is the
+ * rollback depth in seconds, and simultaneously the reclaim-latency bound,
+ * stamped at each retirement decision from the oldest record actually on disk.
+ */
+/*
+ * ★ #116(c): the EMERGENCY override must be countable.
+ *
+ * The meta-reserve preflight (search: "Retention is a convenience; the live
+ * filesystem is not") retires the OLDEST records when meta_free_count hits 0,
+ * bypassing the count floor, the time floor, thinning AND max_age_sec. That
+ * priority is correct — history is worth less than a working filesystem — but
+ * it silently eats rollback depth, and it is the reason a thinning arm can lose
+ * span it was designed to preserve. Measured: 40 thinned retirements still cost
+ * 298s of span, which policy alone cannot explain. An override with no counter
+ * is indistinguishable from a policy that does not work.
+ */
+static unsigned long tessera_stat_snapshots_emergency_retired = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, snapshots_emergency_retired, CTLFLAG_RD,
+    &tessera_stat_snapshots_emergency_retired, 0,
+    "Oldest-record retirements forced by META-RESERVE EXHAUSTION, which "
+    "overrides every retention policy. Nonzero means measured rollback depth "
+    "reflects reserve pressure, not the configured horizon");
+
+static unsigned long tessera_stat_snapshot_span_sec = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, snapshot_span_sec, CTLFLAG_RD,
+    &tessera_stat_snapshot_span_sec, 0,
+    "Age in seconds of the OLDEST retained snapshot record as of the last "
+    "retirement decision = actual rollback depth AND reclaim-latency bound");
+
 
 /* Cumulative count of meta_reserve-bump EXHAUST events. The EXHAUST
  * printf is rate-limited to 1/s (a tight-commit hammer over a big tree
@@ -9054,6 +9142,94 @@ struct tessera_jrec_sb_commit {
  * in commit_sb context (flush_in_progress held). Extracted from the
  * inline retention block for pressure-driven aggressive retirement (#73C).
  */
+/*
+ * ★ #116(c): pick a THINNING victim instead of always the oldest.
+ *
+ * WHY THIS AND NOT "DECOUPLE GC ELIGIBILITY FROM RETENTION". A retained record
+ * PINS ITS DATA — the GC live-set walk unions every retained snapshot's three
+ * trees (see the pinscan comment above: "the 4 live trees plus every retained
+ * snapshot's 3 trees"). So a design where GC ignores records older than some
+ * eligibility bound does not decouple anything; it manufactures records whose
+ * roots have been freed, which is EXACTLY #102 ("retained snapshots whose
+ * recorded inode_root does not hold an inode tree") — a state this code already
+ * treats as damage and auto-retires. You cannot free bytes you might roll back
+ * to: reclaim latency and rollback depth are one physical quantity.
+ *
+ * What CAN be separated is the record COUNT from the time SPAN, and that is
+ * where the cost actually lives: GC pass-1 walk cost is linear in the number of
+ * retained snapshots (#108 lever 2 — 14 of them were 93% of a 430s pass) and so
+ * is mount cost (#33). Retaining the most recent N COMMITS spends all N records
+ * on the last few seconds under load. Retaining a log-decay-SPACED subset spans
+ * hours with the same N.
+ *
+ * THE RULE: a record at age A only needs to be spaced ~A/k from its neighbours
+ * — fine granularity recently, coarse long ago. So score each interior record
+ * by the gap its removal would create, normalised by its own age:
+ *
+ *     score(i) = (t[i+1] - t[i-1]) / age(i)
+ *
+ * and drop the smallest. That is densest-relative-to-its-age, i.e. the record
+ * carrying the least information. Endpoints are never chosen: the newest is
+ * protected by the min_age floor anyway, and the OLDEST must be dropped only by
+ * the age/count bounds, because dropping it is what shortens the span and
+ * therefore what actually returns space.
+ *
+ * Sliding 3-element window, no array and no allocation — #114 was three kernel
+ * stack overflows, so a 64-record scratch buffer is not on the table.
+ *
+ * Returns 1 and fills okey/orec if a thinning victim was chosen; 0 to fall back
+ * to oldest-first.
+ */
+static int
+tessera_fs_snapshot_pick_thin_victim(struct tessera_mount *tmp_,
+    uint8_t okey[8], tessera_snapshot_record_t *orec)
+{
+	tessera_btree_cursor_t *c =
+	    tessera_btree_seek_first(tmp_->snapshots_tree);
+	if (c == NULL)
+		return (0);
+
+	struct timeval _tv;
+	getmicrotime(&_tv);
+	const uint64_t now_ns = (uint64_t)_tv.tv_sec * 1000000000ULL +
+	                        (uint64_t)_tv.tv_usec * 1000ULL;
+
+	uint8_t  pk[8], ck[8], nk[8];
+	tessera_snapshot_record_t pr, cr, nr;
+	int have_p = 0, have_c = 0;
+	int found = 0;
+	uint64_t best_score = ~0ULL;
+	unsigned guard = 0;
+
+	while (tessera_btree_cursor_get(c, nk, &nr) == TESSERA_OK) {
+		if (have_p && have_c) {
+			/* cr is interior: pr .. cr .. nr */
+			uint64_t age = (now_ns >= cr.timestamp_ns)
+			    ? (now_ns - cr.timestamp_ns) : 0;
+			if (age > 0 && nr.timestamp_ns > pr.timestamp_ns) {
+				uint64_t gap = nr.timestamp_ns - pr.timestamp_ns;
+				/* Scale before dividing: integer math, and gap
+				 * is nanoseconds so the shift cannot overflow
+				 * for any realistic span. */
+				uint64_t score = (gap << 10) / age;
+				if (score < best_score) {
+					best_score = score;
+					memcpy(okey, ck, 8);
+					*orec = cr;
+					found = 1;
+				}
+			}
+		}
+		if (have_c) { memcpy(pk, ck, 8); pr = cr; have_p = 1; }
+		memcpy(ck, nk, 8); cr = nr; have_c = 1;
+		(void)pk;
+		if (tessera_btree_cursor_next(c) != TESSERA_OK) break;
+		if (++guard > 4096u) break;    /* bounded, always */
+	}
+	tessera_btree_cursor_free(c);
+	return (found);
+}
+
 static int
 tessera_fs_snapshot_retire_oldest(struct tessera_mount *tmp_)
 {
@@ -9105,6 +9281,66 @@ tessera_fs_snapshot_retire_oldest(struct tessera_mount *tmp_)
 			}
 		} else {
 			tessera_stat_snapshots_ceiling_forced++;
+		}
+	}
+
+	/*
+	 * ★ #116(c): choose WHICH record dies. Precedence is deliberate — see
+	 * the block comment on tessera_fs_snapshot_pick_thin_victim().
+	 *
+	 * max_age_sec wins over thinning because only shortening the SPAN
+	 * returns space; thinning preserves the span by construction, so a
+	 * thin-only policy would pin the oldest data forever.
+	 */
+	{
+		struct timeval _tv2;
+		getmicrotime(&_tv2);
+		const uint64_t now2 = (uint64_t)_tv2.tv_sec * 1000000000ULL +
+		                      (uint64_t)_tv2.tv_usec * 1000ULL;
+		/* Publish the span unconditionally — it is the observable that
+		 * says whether any of this bought depth. */
+		tessera_stat_snapshot_span_sec = (now2 >= orec.timestamp_ns)
+		    ? (unsigned long)((now2 - orec.timestamp_ns) / 1000000000ULL)
+		    : 0UL;
+
+		int over_age = 0;
+		if (tessera_snapshot_max_age_sec > 0) {
+			uint64_t maxn = (uint64_t)tessera_snapshot_max_age_sec
+			                * 1000000000ULL;
+			if (now2 >= orec.timestamp_ns &&
+			    (now2 - orec.timestamp_ns) >= maxn)
+				over_age = 1;
+		}
+
+		/*
+		 * ★ SELF-GUARD. max_age_sec must be able to fire when the
+		 * count is BELOW the retention floor (an idle volume never
+		 * exceeds the count, so an age bound that only ran on
+		 * over-count would never run at all). The call site therefore
+		 * invokes us whenever EITHER condition might hold, and the
+		 * count floor is enforced here instead — otherwise a
+		 * max_age-driven call on a small retained set would fall
+		 * through and delete a record the count floor should protect.
+		 */
+		if (!over_age && tessera_snapshot_retention > 0 &&
+		    tmp_->sb.snapshots_gen <=
+		        (uint64_t)tessera_snapshot_retention)
+			return (0);
+
+		if (over_age) {
+			tessera_stat_snapshots_max_age_retired++;
+			/* keep okey/orec = the oldest */
+		} else if (tessera_snapshot_thin) {
+			uint8_t tkey[8];
+			tessera_snapshot_record_t trec;
+			if (tessera_fs_snapshot_pick_thin_victim(tmp_, tkey,
+			    &trec)) {
+				memcpy(okey, tkey, 8);
+				orec = trec;
+				tessera_stat_snapshots_thinned++;
+			}
+			/* no interior record (fewer than 3 retained) -> fall
+			 * through and drop the oldest, as before. */
 		}
 	}
 
@@ -9245,9 +9481,14 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 		 * case) need retention to fire there too, otherwise
 		 * snapshots_gen grows unboundedly mount-to-mount.
 		 */
-		if (tessera_snapshot_retention > 0 &&
-		    tmp_->sb.snapshots_gen >
-		        (uint64_t)tessera_snapshot_retention) {
+		/* ★ #116(c): also enter when a TIME bound is armed — an idle
+		 * volume never trips the count, so max_age_sec would otherwise
+		 * never get a chance to run. retire_oldest() re-checks the
+		 * count floor itself, so this wider gate cannot over-retire. */
+		if ((tessera_snapshot_retention > 0 &&
+		     tmp_->sb.snapshots_gen >
+		         (uint64_t)tessera_snapshot_retention) ||
+		    tessera_snapshot_max_age_sec > 0) {
 			if (tessera_fs_snapshot_retire_oldest(tmp_)) {
 				/* The retired snapshot's tree sectors are no
 				 * longer pinned (unless shared via COW with a
@@ -13185,6 +13426,7 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 			tmp_->sb.snapshots_root = after_root;
 			tmp_->sb.snapshots_gen--;
 			tessera_stat_snapshots_retired++;
+			tessera_stat_snapshots_emergency_retired++;
 			_rr++;
 			tessera_fs_pinscan_run(tmp_);
 			tessera_fs_meta_pending_drain(tmp_);
