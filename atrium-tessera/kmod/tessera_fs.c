@@ -2768,6 +2768,25 @@ static unsigned long tessera_stat_alloc_audit_calls        = 0;
 /* Walks the snapshots btree on EVERY meta allocation — far too costly to ship
  * on, exactly like drain_audit_snaproots. Debug switch only. */
 static int tessera_alloc_audit_snaproots = 0;
+/*
+ * ★ #132 final probe: latch the per-sector trace onto a root AT THE MOMENT IT
+ * BECOMES a snapshot root, then let the existing TSEC instrumentation log its
+ * whole life (alloc / free / pin / drain).
+ *
+ * Why this and not another point-in-time audit: three of those now read zero
+ * (pinscan swap, meta_pending drain, allocator) while snapshots keep dying, and
+ * each of them can only answer "is this sector a snapshot root RIGHT NOW" — a
+ * question that is false at exactly the moments they ask it. The existing
+ * trace_latch hooks only the drain path, which is one of the cleared suspects,
+ * so it never fires.
+ *
+ * The "record is born stale" theory is already dead: commit_sb runs AFTER the
+ * inode drains ("Drain dirty inodes BEFORE commit_sb so the SB sectors written
+ * by commit_sb capture the post-drain inode_root"), so the stamped root IS the
+ * final one. What is NOT known is what happens to that sector afterwards, and
+ * that is precisely what a life-trace shows.
+ */
+static int tessera_trace_latch_snaproot = 0;
 /* ★ pack-zone leak: at unmount, cross-check recorded pack allocations against
  * the registry and print any that never landed, with the caller's address. */
 static int tessera_pack_ring_audit = 0;
@@ -9554,6 +9573,20 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 		srec.pack_registry_root = tmp_->sb.pack_registry_root;
 		srec.free_extent_root   = tmp_->sb.free_extent_root;
 		memcpy(srec.reason_tag, "auto", 4);
+		/* ★ #132: latch the life-trace onto this brand-new snapshot
+		 * root. From here TSEC logs every alloc/free/pin/drain touching
+		 * it, which is the one thing the point-in-time audits cannot
+		 * show. One-shot: only latches while nothing else is traced. */
+		if (tessera_trace_latch_snaproot && tessera_trace_sector == 0 &&
+		    srec.inode_root != 0) {
+			tessera_trace_sector = srec.inode_root;
+			printf("tessera_fs: ★ #132 TRACE LATCHED on sector %ju "
+			    "as it BECOMES snapshot gen %ju's inode_root "
+			    "(sb.inode_root=%ju) — logging its life from "
+			    "here\n", (uintmax_t)srec.inode_root,
+			    (uintmax_t)srec.generation,
+			    (uintmax_t)tmp_->sb.inode_root);
+		}
 		/*
 		 * ★ #102: latch the trace HERE, at snapshot birth, not on the
 		 * drain flag. Latching on the flag captured only the
@@ -23528,6 +23561,10 @@ SYSCTL_UQUAD(_kern_tessera, OID_AUTO, trace_sector, CTLFLAG_RW,
 SYSCTL_INT(_kern_tessera, OID_AUTO, trace_latch, CTLFLAG_RW,
     &tessera_trace_latch, 0,
     "1 = latch trace_sector onto the first sector the drain audit flags");
+SYSCTL_INT(_kern_tessera, OID_AUTO, trace_latch_snaproot, CTLFLAG_RW,
+    &tessera_trace_latch_snaproot, 0,
+    "#132: 1 = latch trace_sector onto a sector AT THE MOMENT it becomes a "
+    "snapshot's inode_root, so TSEC logs its whole life (alloc/free/pin/drain)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, trace_events, CTLFLAG_RD,
     &tessera_stat_trace_events, 0, "traced-sector events logged");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, regov_inserted, CTLFLAG_RD,
