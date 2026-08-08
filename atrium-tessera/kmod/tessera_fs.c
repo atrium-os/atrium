@@ -2832,6 +2832,8 @@ static int tessera_gc_fetch_frozen_reg = 0;
  * this check absorbed.
  */
 static unsigned long tessera_stat_gc_snap_retired_midpass = 0;
+static unsigned long tessera_stat_blob_index_bypassed = 0;
+static uint32_t tessera_blob_index_bypass_ctr = 0;
 /* ★ pack-zone leak: at unmount, cross-check recorded pack allocations against
  * the registry and print any that never landed, with the caller's address. */
 static int tessera_pack_ring_audit = 0;
@@ -15346,7 +15348,25 @@ retry_reloc:
 	/* Blob→pack index fast path: resolve hash→pack_id in O(log n) and fetch
 	 * from that one pack, skipping the registry scan. A stale entry (the pack
 	 * no longer holds the blob, e.g. post-repack) falls through to the scan. */
-	if (tmp_->blob_index_tree != NULL && !tessera_blob_index_bypass) {
+	/*
+	 * #133 TEST HOOK. blob_index_bypass is a SAMPLING RATE, not a switch:
+	 * N>0 forces a miss on one fetch in N. Forcing EVERY fetch to miss
+	 * (the original all-or-nothing knob) made a GC pass cost
+	 * O(blobs x packs) reads — it saturated the disk, starved userland to
+	 * the point that login could not read /etc, and no pass ever finished.
+	 * Both A/B arms then logged ~0 scans, which is the dead arm that made
+	 * the first measurement meaningless. Sampling keeps passes finishable
+	 * while still driving the fallback thousands of times.
+	 */
+	int _bypass = 0;
+	if (tessera_blob_index_bypass > 0) {
+		uint32_t _n = atomic_fetchadd_32(&tessera_blob_index_bypass_ctr, 1);
+		if ((_n % (uint32_t)tessera_blob_index_bypass) == 0) {
+			_bypass = 1;
+			tessera_stat_blob_index_bypassed++;
+		}
+	}
+	if (tmp_->blob_index_tree != NULL && !_bypass) {
 		uint8_t pid[16];
 		if (tessera_btree_get(tmp_->blob_index_tree, hash, pid) == TESSERA_OK) {
 			uint8_t rv[TESSERA_REGISTRY_ENTRY_SIZE];
@@ -23693,8 +23713,15 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_snap_retired_midpass, CTLFLAG_RD,
     "'recycled' alarms that used to suppress reclaim forever");
 SYSCTL_INT(_kern_tessera, OID_AUTO, blob_index_bypass, CTLFLAG_RW,
     &tessera_blob_index_bypass, 0,
-    "#133 TEST: 1 = force every blob-index lookup to miss, so fetches take the "
-    "registry-scan fallback (the path an unindexed blob exercises)");
+    "#133 TEST: SAMPLING RATE, not a switch. N>0 forces a blob-index miss on "
+    "one fetch in N, so fetches take the registry-scan fallback. N=1 (every "
+    "fetch) makes a GC pass cost O(blobs x packs) reads and it will never "
+    "finish — use N>=64. 0 = off");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, blob_index_bypassed, CTLFLAG_RD,
+    &tessera_stat_blob_index_bypassed, 0,
+    "#133: fetches forced down the registry-scan fallback by the sampler. "
+    "This is the MECHANISM COUNTER for the A/B — an arm where this did not "
+    "move never exercised the code under test, so its result means nothing");
 SYSCTL_INT(_kern_tessera, OID_AUTO, gc_fetch_frozen_reg, CTLFLAG_RW,
     &tessera_gc_fetch_frozen_reg, 0,
     "#133: 1 = GC's fetch fallback scans the FROZEN registry (the fix, "
