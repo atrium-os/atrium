@@ -410,6 +410,16 @@ taskpolicy -B -p $$ 2>/dev/null || true
 # overlays and jails. Same shape as Android's read-only system partitions vs a
 # separate userdata, or macOS's Sealed System Volume vs Data volume.
 #
+# ★ THIRD DISK: atrium-scratch.img is a SCRATCH volume for filesystem
+# experiments, and it exists because the obvious alternative DEADLOCKS. Backing
+# a test Tessera volume with `mdconfig -t vnode` on a file ON THE ROOT wedges
+# the machine: writes to the md volume become writes to a file on the root, so
+# the [mdN] kthread blocks on the root's flush (tessfls) while sync/dd sit in
+# wdrain waiting for the buffer cache to drain -- which needs that same md
+# thread to progress. Observed 2026-08-08 in ddb: [md8] on tessfls, sync+dd on
+# wdrain, cron/getty/sshd all on tessgat. A separate BLOCK DEVICE has no such
+# dependency on the root. Never run a scratch Tessera volume on md-over-root.
+#
 # The app volume needs NO module work: tessera_fs is already resident because
 # the loader loaded it to mount root, so a second Tessera volume is an ordinary
 # `mount -t tessera`. Only REPLACING the root driver needs a reboot. Both
@@ -441,6 +451,8 @@ exec "$QEMU" \
     -device virtio-blk-pci,drive=devrootdrv,serial=tessera-devroot,config-wce=on \
     -drive file="$BSD_DIR/vm/atrium-apps.img",format=raw,cache=writeback,if=none,id=appsdrv \
     -device virtio-blk-pci,drive=appsdrv,serial=atrium-apps,config-wce=on \
+    -drive file="$BSD_DIR/vm/atrium-scratch.img",format=raw,cache=writeback,if=none,id=scratchdrv \
+    -device virtio-blk-pci,drive=scratchdrv,serial=atrium-scratch,config-wce=on \
     -device virtio-net-pci,netdev=net0 \
     -netdev user,id=net0,hostfwd=tcp::2222-:22 \
     -fsdev local,id=share,path="$SHARE_DIR",security_model=none \

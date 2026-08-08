@@ -2833,6 +2833,8 @@ static int tessera_gc_fetch_frozen_reg = 0;
  */
 static unsigned long tessera_stat_gc_snap_retired_midpass = 0;
 static unsigned long tessera_stat_blob_index_bypassed = 0;
+static unsigned long tessera_stat_gc_walk_dedup_skips = 0;
+static int tessera_gc_walk_visited = 1;   /* #134: 0 = pre-fix walk, for A/B */
 static uint32_t tessera_blob_index_bypass_ctr = 0;
 /* ★ pack-zone leak: at unmount, cross-check recorded pack allocations against
  * the registry and print any that never landed, with the caller's address. */
@@ -15855,8 +15857,65 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 	tessera_hash_t *live = malloc(live_cap * sizeof(*live), M_TESSERA,
 	    M_WAITOK);
 
+	/*
+	 * ★ VISITED SET (#134). The walk used to fetch EVERY hash it popped,
+	 * with no record of what it had already walked — so a manifest
+	 * reachable N times was fetched, parsed and re-descended N times.
+	 * That is the dominant cost of a pass on any volume with sharing,
+	 * and sharing is the normal case here: dedup makes identical content
+	 * one blob with many referrers, hard links point many inodes at one
+	 * manifest, and COW means every retained snapshot re-walks a tree it
+	 * shares almost entirely with the live one.
+	 *
+	 * Skipping an already-seen hash is sound because the store is
+	 * content-addressed: equal hash implies equal bytes implies the same
+	 * children, so the subtree is already fully enumerated in `live`.
+	 * The hash is pushed BEFORE its fetch, so a hash whose fetch later
+	 * fails is still marked live and cannot be reclaimed.
+	 *
+	 * seen[] is open-addressed and holds index+1 into live[] (0 = empty),
+	 * so growing live[] never invalidates it. Hashes are uniformly
+	 * distributed, so the low 4 bytes are the probe.
+	 */
+	const int use_visited = tessera_gc_walk_visited;
+	uint32_t seen_cap = 256;                 /* power of two, >= 2*live_cap */
+	uint32_t *seen = malloc(seen_cap * sizeof(*seen), M_TESSERA,
+	    M_WAITOK | M_ZERO);
+	int _gc_push_dup = 0;
+
+#define _GC_SEEN_REHASH() do {                                            \
+	free(seen, M_TESSERA);                                            \
+	seen_cap = 2u;                                                    \
+	while (seen_cap < live_cap * 4u) seen_cap <<= 1;                  \
+	seen = malloc(seen_cap * sizeof(*seen), M_TESSERA,                \
+	    M_WAITOK | M_ZERO);                                           \
+	for (uint32_t _r = 0; _r < live_count; _r++) {                    \
+		uint32_t _rp;                                             \
+		memcpy(&_rp, live[_r], sizeof(_rp));                      \
+		_rp &= (seen_cap - 1u);                                   \
+		while (seen[_rp] != 0) _rp = (_rp + 1u) & (seen_cap - 1u);\
+		seen[_rp] = _r + 1u;                                      \
+	}                                                                 \
+} while (0)
+
 #define _GC_PUSH_HASH(_h) do {                                            \
+	_gc_push_dup = 0;                                                 \
 	if (tessera_hash_is_null(_h)) break;                              \
+	uint32_t _pr = 0;                                                 \
+	if (use_visited) {                                                \
+		memcpy(&_pr, (_h), sizeof(_pr));                          \
+		_pr &= (seen_cap - 1u);                                   \
+		while (seen[_pr] != 0) {                                  \
+			if (memcmp(live[seen[_pr] - 1u], (_h),            \
+			    TESSERA_HASH_SIZE) == 0) {                    \
+				_gc_push_dup = 1;                         \
+				tessera_stat_gc_walk_dedup_skips++;       \
+				break;                                    \
+			}                                                 \
+			_pr = (_pr + 1u) & (seen_cap - 1u);               \
+		}                                                         \
+		if (_gc_push_dup) break;                                  \
+	}                                                                 \
 	if (live_count == live_cap) {                                     \
 		live_cap *= 2;                                            \
 		tessera_hash_t *grown = malloc(                           \
@@ -15864,8 +15923,16 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 		memcpy(grown, live, live_count * sizeof(*live));          \
 		free(live, M_TESSERA);                                    \
 		live = grown;                                             \
+		if (use_visited) {                                        \
+			_GC_SEEN_REHASH();                                \
+			memcpy(&_pr, (_h), sizeof(_pr));                  \
+			_pr &= (seen_cap - 1u);                           \
+			while (seen[_pr] != 0)                            \
+				_pr = (_pr + 1u) & (seen_cap - 1u);       \
+		}                                                         \
 	}                                                                 \
 	memcpy(live[live_count], _h, sizeof(tessera_hash_t));             \
+	if (use_visited) seen[_pr] = live_count + 1u;                     \
 	live_count++;                                                     \
 } while (0)
 
@@ -15893,6 +15960,10 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 			tessera_hash_t _h;                                \
 			memcpy(_h, _stack[--_sp], TESSERA_HASH_SIZE);     \
 			_GC_PUSH_HASH(_h);                                \
+			/* #134: already walked — same hash, same bytes,  \
+			 * same children, so its subtree is already in    \
+			 * live[]. Re-fetching it is the redundant work.*/\
+			if (_gc_push_dup) continue;                       \
 			uint8_t  *_blob = NULL;                           \
 			uint32_t _blen = 0;                               \
 			/* A live inode's manifest that will not fetch     \
@@ -16456,6 +16527,7 @@ snap_next:
 			    gc_damaged_count);
 		}
 		free(live, M_TESSERA);
+		free(seen, M_TESSERA);
 		_GC_CLOSE_SCAN_TREES();
 		return (0);
 	}
@@ -16548,6 +16620,7 @@ snap_next:
 		    "overflow (caches grew mid-scan); no reclaim\n");
 		tessera_stat_gc_aborts++;
 		free(live, M_TESSERA);
+		free(seen, M_TESSERA);
 		_GC_CLOSE_SCAN_TREES();
 		return (0);
 	}
@@ -16586,6 +16659,7 @@ snap_next:
 		    gc_abort_status, gc_abort_fetchfail);
 		tessera_stat_gc_aborts++;
 		free(live, M_TESSERA);
+		free(seen, M_TESSERA);
 		_GC_CLOSE_SCAN_TREES();
 		return (0);
 	}
@@ -16867,6 +16941,7 @@ next_p:
 	}
 #undef _GC_HASH_IS_LIVE
 	free(live, M_TESSERA);
+	free(seen, M_TESSERA);
 	_GC_CLOSE_SCAN_TREES();
 	printf("tessera_fs: gc pass2 done — %u dead packs\n", dead_count);
 
@@ -23717,6 +23792,16 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, blob_index_bypass, CTLFLAG_RW,
     "one fetch in N, so fetches take the registry-scan fallback. N=1 (every "
     "fetch) makes a GC pass cost O(blobs x packs) reads and it will never "
     "finish — use N>=64. 0 = off");
+SYSCTL_INT(_kern_tessera, OID_AUTO, gc_walk_visited, CTLFLAG_RW,
+    &tessera_gc_walk_visited, 0,
+    "#134: 1 (default) = the GC walk skips a hash it has already visited; "
+    "0 = re-fetch every reference (the pre-fix walk, for A/B only)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_dedup_skips, CTLFLAG_RD,
+    &tessera_stat_gc_walk_dedup_skips, 0,
+    "#134: manifest fetches AVOIDED because the walk had already visited that "
+    "hash. This is the mechanism counter for the visited set — on a volume "
+    "with dedup, hard links or snapshots it should be a large fraction of "
+    "blob_fetches; on a volume of unique random content it should be ~0");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, blob_index_bypassed, CTLFLAG_RD,
     &tessera_stat_blob_index_bypassed, 0,
     "#133: fetches forced down the registry-scan fallback by the sampler. "
