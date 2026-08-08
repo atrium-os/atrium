@@ -2787,6 +2787,24 @@ static int tessera_alloc_audit_snaproots = 0;
  * that is precisely what a life-trace shows.
  */
 static int tessera_trace_latch_snaproot = 0;
+/*
+ * ★ #132 FIX: frozen snapshot records that GC would have called "stale" but
+ * which had simply been RETIRED between scan activation and the walk.
+ *
+ * GC walks the FROZEN snapshots list captured at activation. Retention retires
+ * exactly one record per commit (measured: 875 retirements over 875 commits),
+ * and a pass spans hundreds of commits — so a frozen entry is routinely a
+ * record that no longer exists, whose root was legitimately freed and reused.
+ * GC read that as "RECYCLED (sector now holds another tree)" and suppressed
+ * reclaim. Proven by offline fsck immediately after such a run: all 63 retained
+ * snapshots intact, 13,133,353 inodes walked, while the kernel had just
+ * reported 268 recycled roots. No data was ever lost; the pass was reading a
+ * list that had moved on.
+ *
+ * Non-zero here is NORMAL on a busy volume and is the count of false alarms
+ * this check absorbed.
+ */
+static unsigned long tessera_stat_gc_snap_retired_midpass = 0;
 /* ★ pack-zone leak: at unmount, cross-check recorded pack allocations against
  * the registry and print any that never landed, with the caller's address. */
 static int tessera_pack_ring_audit = 0;
@@ -16011,6 +16029,15 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 
 	/* Snapshot inode_trees */
 	gc_phase = "snapshot";
+	/* ★ #132: the CURRENT snapshots tree, for re-checking frozen entries
+	 * against retirement. Opened once per pass; read-only; NULL is
+	 * tolerated and simply makes the re-check conservative. */
+	tessera_btree_t *cur_snap_tree = NULL;
+	if (tmp_->sb.snapshots_root != 0)
+		cur_snap_tree = tessera_btree_open(&tmp_->meta_bio,
+		    tmp_->sb.snapshots_root, /*tree_kind*/ 3, /*key*/ 8,
+		    TESSERA_SNAPSHOT_RECORD_SIZE);
+
 	if (scan_snap_tree != NULL) {
 		tessera_btree_cursor_t *sc =
 		    tessera_btree_seek_first(scan_snap_tree);
@@ -16079,6 +16106,46 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 						 * provably dead), strictly better
 						 * diagnostics, and no mutation.
 						 */
+						/*
+						 * ★ #132: is this record still
+						 * RETAINED? We are walking the
+						 * FROZEN list; retention retires
+						 * one record per commit and this
+						 * pass spans hundreds of them, so
+						 * a "stale" root is usually just a
+						 * record that was retired since
+						 * activation — its root freed and
+						 * reused entirely legitimately.
+						 *
+						 * Look it up in the CURRENT tree
+						 * by its 8-byte big-endian gen. If
+						 * it is gone, this is not damage
+						 * and must NOT suppress reclaim;
+						 * that false alarm is what made GC
+						 * unable to reclaim at all on any
+						 * volume committing faster than a
+						 * pass completes.
+						 *
+						 * Absent the current tree we cannot
+						 * prove it was retired, so we fall
+						 * through and treat it as stale —
+						 * the conservative direction.
+						 */
+						if (cur_snap_tree != NULL) {
+							uint8_t _ck[8];
+							for (int _i = 0; _i < 8; _i++)
+								_ck[_i] = (uint8_t)
+								    (srec.generation >>
+								     ((7 - _i) * 8));
+							tessera_snapshot_record_t _cv;
+							if (tessera_btree_get(
+							    cur_snap_tree, _ck, &_cv)
+							    != TESSERA_OK) {
+								tessera_stat_gc_snap_retired_midpass++;
+								tessera_btree_close(snap_inode);
+								goto snap_next;
+							}
+						}
 						gc_snap_stale_seen++;
 						tessera_stat_gc_snap_stale++;
 						/*
@@ -16204,6 +16271,10 @@ snap_next:
 			}
 		}
 		if (sc != NULL) tessera_btree_cursor_free(sc);
+		if (cur_snap_tree != NULL) {
+			tessera_btree_close(cur_snap_tree);
+			cur_snap_tree = NULL;
+		}
 		if (snap_count > 0)
 			printf("tessera_fs: gc pass1 — %u retained snapshots "
 			    "unionised; %u total live hashes\n",
@@ -23561,6 +23632,11 @@ SYSCTL_UQUAD(_kern_tessera, OID_AUTO, trace_sector, CTLFLAG_RW,
 SYSCTL_INT(_kern_tessera, OID_AUTO, trace_latch, CTLFLAG_RW,
     &tessera_trace_latch, 0,
     "1 = latch trace_sector onto the first sector the drain audit flags");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_snap_retired_midpass, CTLFLAG_RD,
+    &tessera_stat_gc_snap_retired_midpass, 0,
+    "#132: frozen snapshot records skipped because retention retired them "
+    "between scan activation and the walk. NOT damage — these are the false "
+    "'recycled' alarms that used to suppress reclaim forever");
 SYSCTL_INT(_kern_tessera, OID_AUTO, trace_latch_snaproot, CTLFLAG_RW,
     &tessera_trace_latch_snaproot, 0,
     "#132: 1 = latch trace_sector onto a sector AT THE MOMENT it becomes a "
