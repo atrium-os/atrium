@@ -1783,6 +1783,7 @@ static int tessera_fs_fetch_blob(struct tessera_mount *tmp_,
                                   const tessera_hash_t hash,
                                   uint8_t **out_buf, uint32_t *out_len);
 static int tessera_fs_fetch_blob_ex(struct tessera_mount *tmp_,
+                      tessera_btree_t *reg_override,
                                   const tessera_hash_t hash, uint8_t *dst,
                                   uint64_t dst_cap,
                                   uint8_t **out_buf, uint32_t *out_len);
@@ -2787,6 +2788,32 @@ static int tessera_alloc_audit_snaproots = 0;
  * that is precisely what a life-trace shows.
  */
 static int tessera_trace_latch_snaproot = 0;
+/*
+ * ★ #133 TEST AFFORDANCES. The fix (GC's fetch fallback scans the FROZEN
+ * registry instead of the live one) is only exercised when the blob index
+ * MISSES — and a freshly reindexed volume never misses, so the new path would
+ * ship untested. These two knobs make both arms reachable on one kernel:
+ *
+ *   blob_index_bypass=1   force every index lookup to miss, so every fetch
+ *                         takes the fallback registry scan.
+ *   gc_fetch_frozen_reg=0 make the GC fallback scan the LIVE registry again,
+ *                         i.e. the pre-fix behaviour.
+ *
+ * bypass=1 + frozen=0 should reproduce the EIO aborts under write load;
+ * bypass=1 + frozen=1 should not. Both default to the shipping behaviour.
+ */
+static int tessera_blob_index_bypass   = 0;
+/*
+ * ★ DEFAULT 0 = OFF, deliberately: the fix is UNVERIFIED. Two attempts to
+ * measure it failed to produce evidence — the first was a DEAD ARM (arm A got
+ * 1 GC scan, arm B got 0, so "0 aborts in both" measured nothing), the second
+ * lost its session before reporting. Shipping a default-on change to the GC
+ * fetch path on the strength of "it compiles" is exactly the move this
+ * subsystem punishes. Flip to 1 only after an A/B with blob_index_bypass=1
+ * shows aborts under frozen=0 and none under frozen=1, with BOTH arms
+ * confirmed to have run several scans.
+ */
+static int tessera_gc_fetch_frozen_reg = 0;
 /*
  * ★ #132 FIX: frozen snapshot records that GC would have called "stale" but
  * which had simply been RETIRED between scan activation and the walk.
@@ -8081,7 +8108,7 @@ tessera_fs_read_into_uio(struct tessera_mount *tmp_,
 				 * >64 KiB malloc). cb points at the scratch on
 				 * the fast path, at a malloc'd buffer on the
 				 * fallback; only free the latter. */
-				if (tessera_fs_fetch_blob_ex(tmp_,
+				if (tessera_fs_fetch_blob_ex(tmp_, NULL,
 				    cr.chunk_hash, scratch, scratch_cap,
 				    &cb, &cb_len) != 0) return (EIO);
 				tessera_stat_chunk_cache_misses++;
@@ -15131,9 +15158,30 @@ tessera_fs_pack_fetch_ondemand(struct tessera_mount *tmp_,
  * detects that by *out_buf != dst. */
 static int
 tessera_fs_fetch_blob_ex(struct tessera_mount *tmp_,
+                      tessera_btree_t *reg_override,
                       const tessera_hash_t hash, uint8_t *dst, uint64_t dst_cap,
                       uint8_t **out_buf, uint32_t *out_len)
 {
+	/*
+	 * ★ #133: reg_override lets a caller pin the registry this fetch
+	 * scans. NULL means "the live tree", which is right for every
+	 * ordinary read.
+	 *
+	 * It exists for the GC walk. The blob-index fast path can miss
+	 * legitimately (a blob published since the index was built, or one
+	 * fsck --repair published without indexing — measured: exactly 1
+	 * unindexed blob was enough), and a miss falls through to the full
+	 * registry cursor scan below. That scan is the problem: run from the
+	 * UNGATED GC walk against the LIVE registry, a concurrent pack publish
+	 * truncates the cursor, the scan reports EIO ("unknown"), and GC
+	 * correctly treats unknown as fatal and abandons the pass.
+	 *
+	 * The GC scan already froze a registry root at activation and opens it
+	 * as scan_reg_tree; it simply was not reaching this far down. Passing
+	 * it here makes the fallback read the same immutable snapshot the rest
+	 * of the walk uses. Same class of fix as #132 — give the walk a stable
+	 * structure to read rather than loosening what it does on failure.
+	 */
 	tessera_stat_blob_fetches++;
 
 	/* v2 step-2b: check the in-memory pending-manifest cache first.
@@ -15298,7 +15346,7 @@ retry_reloc:
 	/* Blob→pack index fast path: resolve hash→pack_id in O(log n) and fetch
 	 * from that one pack, skipping the registry scan. A stale entry (the pack
 	 * no longer holds the blob, e.g. post-repack) falls through to the scan. */
-	if (tmp_->blob_index_tree != NULL) {
+	if (tmp_->blob_index_tree != NULL && !tessera_blob_index_bypass) {
 		uint8_t pid[16];
 		if (tessera_btree_get(tmp_->blob_index_tree, hash, pid) == TESSERA_OK) {
 			uint8_t rv[TESSERA_REGISTRY_ENTRY_SIZE];
@@ -15342,8 +15390,10 @@ retry_reloc:
 
 cas_fast_miss:
 	;
-	tessera_btree_cursor_t *c =
-	    tessera_btree_seek_first(tmp_->pack_registry_tree);
+	tessera_btree_t *_reg = (reg_override != NULL &&
+	    tessera_gc_fetch_frozen_reg) ? reg_override
+	                                 : tmp_->pack_registry_tree;
+	tessera_btree_cursor_t *c = tessera_btree_seek_first(_reg);
 	if (c == NULL) return (EIO);	/* couldn't scan at all: unknown */
 
 	/*
@@ -15437,7 +15487,8 @@ static int
 tessera_fs_fetch_blob(struct tessera_mount *tmp_, const tessera_hash_t hash,
     uint8_t **out_buf, uint32_t *out_len)
 {
-	return (tessera_fs_fetch_blob_ex(tmp_, hash, NULL, 0, out_buf, out_len));
+	return (tessera_fs_fetch_blob_ex(tmp_, NULL, hash, NULL, 0, out_buf,
+	    out_len));
 }
 
 /* ── Round 6d: blob publishing + vop_remove ──────────────────── */
@@ -15848,8 +15899,11 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 			 * scanning rather than vetoing all reclaim. One   \
 			 * damaged manifest must not strand a whole        \
 			 * volume's free space forever. */                 \
-			int _frc = tessera_fs_fetch_blob(tmp_, _h, &_blob, \
-			    &_blen);                                      \
+			/* #133: scan the FROZEN registry, not the live    \
+			 * one — an index miss must not become EIO because \
+			 * a concurrent pack publish truncated the scan. */\
+			int _frc = tessera_fs_fetch_blob_ex(tmp_,         \
+			    scan_reg_tree, _h, NULL, 0, &_blob, &_blen);  \
 			if (_frc != 0) {                                  \
 				if (gc_abort_fetchfail++ == 0)            \
 					memcpy(gc_abort_hash, _h,         \
@@ -23637,6 +23691,14 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_snap_retired_midpass, CTLFLAG_RD,
     "#132: frozen snapshot records skipped because retention retired them "
     "between scan activation and the walk. NOT damage — these are the false "
     "'recycled' alarms that used to suppress reclaim forever");
+SYSCTL_INT(_kern_tessera, OID_AUTO, blob_index_bypass, CTLFLAG_RW,
+    &tessera_blob_index_bypass, 0,
+    "#133 TEST: 1 = force every blob-index lookup to miss, so fetches take the "
+    "registry-scan fallback (the path an unindexed blob exercises)");
+SYSCTL_INT(_kern_tessera, OID_AUTO, gc_fetch_frozen_reg, CTLFLAG_RW,
+    &tessera_gc_fetch_frozen_reg, 0,
+    "#133: 1 = GC's fetch fallback scans the FROZEN registry (the fix, "
+    "UNVERIFIED); 0 (default) = scan the LIVE tree, i.e. today's behaviour");
 SYSCTL_INT(_kern_tessera, OID_AUTO, trace_latch_snaproot, CTLFLAG_RW,
     &tessera_trace_latch_snaproot, 0,
     "#132: 1 = latch trace_sector onto a sector AT THE MOMENT it becomes a "
