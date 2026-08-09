@@ -570,9 +570,29 @@ walk_dir(tessera_reader_t *rd, const uint8_t *dir_hash, dirent_fn cb,
 {
 	if (is_null_hash(dir_hash) || depth > 64) return 0;
 	uint8_t *bytes = NULL; size_t blen = 0;
-	if (fetch_blob_dup(rd, dir_hash, &bytes, &blen) != TESSERA_OK) return 0;
+	/*
+	 * ★ These two soft-fails are why a broken directory reports as a
+	 * MISSING FILE. Returning 0 means "the callback never stopped us", so
+	 * dir_lookup() sees hit==0 and answers TESSERA_ENOENT — indistinguish-
+	 * able from a name that genuinely is not there. A caller (the EFI
+	 * loader) then prints "Failed to find bootable partition" for what is
+	 * really an unreadable blob. Report them.
+	 */
+	int _frc = fetch_blob_dup(rd, dir_hash, &bytes, &blen);
+	if (_frc != TESSERA_OK) {
+#ifdef TESSERA_LOADER_DEBUG
+		printf("tessera: walk_dir depth=%d FETCH FAILED rc=%d\n",
+		    depth, _frc);
+#endif
+		return 0;
+	}
 	tessera_manifest_parser_t *p = tessera_manifest_parse(bytes, blen);
-	if (p == NULL) { tessera_free(bytes); return 0; }
+	if (p == NULL) {
+#ifdef TESSERA_LOADER_DEBUG
+		printf("tessera: walk_dir depth=%d PARSE FAILED blen=%zu\n",
+		    depth, blen);
+#endif
+		tessera_free(bytes); return 0; }
 	int stop = 0;
 	int kind = tessera_manifest_parser_kind(p);
 	uint32_t n = tessera_manifest_parser_count(p);

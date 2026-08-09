@@ -63,7 +63,22 @@ struct Fsck {
     // deadness can be attributed to packs AFTER the live set is known.
     pack_space: Vec<(String, u64, Vec<(Hash, u32)>)>,
     // blob bytes for those that parse as a manifest (for recursion)
-    manifests: HashMap<Hash, Vec<u8>>,
+    /// Blobs that parse as a manifest.
+    ///
+    /// `Some(bytes)` only for the kinds the walks actually descend
+    /// (CHUNK_LIST / CHUNK_TREE / DIRECTORY*). `None` means "this hash IS a
+    /// manifest, but of a kind with no blob refs" — INLINE, SYMLINK,
+    /// XATTR_STORE. Presence in the map is what answers "referenced as a
+    /// manifest but does not parse as one", so the None entries must stay.
+    ///
+    /// ★ Storing bytes for EVERY manifest made fsck's RSS scale with the
+    /// volume's DATA, not its metadata: an INLINE manifest holds the file's
+    /// own content (up to ~128 KiB, and #92 found a 4.7 MB one), so on a
+    /// source tree the map became a copy of most of the filesystem. It was
+    /// OOM-killed on the 25 GB dev root in a 4 GiB VM ("failed to reclaim
+    /// memory"). The walk never looks at INLINE bytes — see the `_ => {}` arm
+    /// in reach() — so they were pure ballast.
+    manifests: HashMap<Hash, Option<Vec<u8>>>,
     // manifests already reachability-checked (dedup + cycle guard)
     checked: HashSet<Hash>,
     // inode_no → (mode, nlink, manifest_hash) for the reachability + nlink walk
@@ -222,7 +237,12 @@ impl Fsck {
             return; // already walked (shared via dedup)
         }
         let bytes = match self.manifests.get(hash) {
-            Some(b) => b.clone(),
+            Some(Some(b)) => b.clone(),
+            // A manifest of a kind with no blob refs (INLINE / SYMLINK /
+            // XATTR_STORE). It is live and it parses; there is nothing under
+            // it to walk, which is exactly what the `_ => {}` arm below did
+            // when the bytes were still retained.
+            Some(None) => return,
             None => {
                 self.problem(format!(
                     "{ctx}: blob {} is referenced as a manifest but does not parse as one",
@@ -301,8 +321,10 @@ impl Fsck {
             return;
         }
         let bytes = match self.manifests.get(dir_hash) {
-            Some(b) => b.clone(),
-            None => return, // missing dir manifest already flagged by reach()
+            Some(Some(b)) => b.clone(),
+            // Bodyless kind (not a directory) or missing — either way there
+            // are no dirents here; reach() already flagged a truly absent one.
+            Some(None) | None => return,
         };
         unsafe {
             let p = tessera_manifest_parse(bytes.as_ptr(), bytes.len());
@@ -681,7 +703,18 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
                                     }
                                     let mp = tessera_manifest_parse(slice.as_ptr(), slice.len());
                                     if !mp.is_null() {
-                                        fsck.manifests.insert(bh, slice.to_vec());
+                                        // Retain bytes ONLY for kinds a walk
+                                        // descends; the rest are recorded as
+                                        // present-but-bodyless.
+                                        let k = tessera_manifest_parser_kind(mp);
+                                        let keep = matches!(k,
+                                            TESSERA_MFT_CHUNK_LIST
+                                            | TESSERA_MFT_CHUNK_TREE
+                                            | TESSERA_MFT_DIRECTORY
+                                            | TESSERA_MFT_DIRECTORY_2L
+                                            | TESSERA_MFT_DIRECTORY_BTREE);
+                                        fsck.manifests.insert(bh,
+                                            if keep { Some(slice.to_vec()) } else { None });
                                         tessera_manifest_parser_free(mp);
                                     }
                                     this_pack.push((bh, blen));
