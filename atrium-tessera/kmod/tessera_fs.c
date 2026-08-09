@@ -1604,6 +1604,16 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, flush_per_write,
  * dirty-page pressure they'd create. Was 8 sectors (32 KiB), which put
  * every medium content file on the blocking path. */
 static int tessera_bulk_write_min_sectors = 256;
+/*
+ * ★ #108: smallest pack (in sectors) worth keeping a whole RAM copy of.
+ * 1 = cache every pack, which is the point: the packs the GC walk reads are
+ * SMALL, and they were the ones excluded. Raise it to shrink the cache's
+ * appetite, or set it above bulk_write_min_sectors to restore the old
+ * bulk-only behaviour for an A/B. The total is still bounded by
+ * cas_pack_max_bytes (256 MiB) with LRU eviction, and any single pack over
+ * 64 MiB is refused inside tessera_fs_pack_fetch_cached.
+ */
+static int tessera_pack_cache_min_sectors = 1;
 /* DIAG: gate the read-side g_read_data coalesce independently of the bulk
  * WRITE path (they share bulk_write_min_sectors otherwise), so corruption
  * can be attributed to the reader vs the writer. */
@@ -1611,6 +1621,12 @@ static int tessera_read_coalesce_enable = 1;
 SYSCTL_INT(_kern_tessera, OID_AUTO, read_coalesce_enable, CTLFLAG_RW,
     &tessera_read_coalesce_enable, 0,
     "DIAG: enable the coalesced g_read_data fast path (0 = bread only)");
+SYSCTL_INT(_kern_tessera, OID_AUTO, pack_cache_min_sectors,
+    CTLFLAG_RW, &tessera_pack_cache_min_sectors, 0,
+    "#108: smallest pack (sectors) eligible for the whole-pack RAM cache. "
+    "1 = all packs (default). Set above bulk_write_min_sectors to restore the "
+    "old bulk-only behaviour, which left every manifest read paying "
+    "header+index+data per blob");
 SYSCTL_INT(_kern_tessera, OID_AUTO, bulk_write_min_sectors,
     CTLFLAG_RW, &tessera_bulk_write_min_sectors, 0,
     "content packs >= this many sectors use the synchronous bulk write; "
@@ -15429,8 +15445,29 @@ retry_reloc:
 			 * miss/oversize it returns non-zero and we fall to the
 			 * per-sector on-demand path below (coherent for small/
 			 * unflushed packs). */
+			/*
+			 * ★ #108: this gate used to be bulk_write_min_sectors,
+			 * so ONLY bulk packs were ever cached. Manifest packs
+			 * are small, so the GC walk — which reads nothing BUT
+			 * manifests — took the per-blob header+index+data path
+			 * for every single blob. Measured on a cold pass:
+			 * 2.75 pack_read_range calls per fetch at ~4 KiB each,
+			 * with cas_pack hits AND misses both 0 because the
+			 * cache was never even consulted.
+			 *
+			 * Widening it is safe by construction: the fill goes
+			 * through tessera_fs_pack_read_range, which itself
+			 * picks the coalesced g_read_data path ONLY for
+			 * single-extent bulk packs and otherwise falls to the
+			 * per-sector bread loop that is buffer-cache coherent.
+			 * The coherence decision lives in the read, not here;
+			 * this gate was duplicating it more conservatively.
+			 * Pack bytes are immutable once published, and a
+			 * relocation bumps pack_reloc_gen, which the caller
+			 * already re-checks below.
+			 */
 			if (total_sectors >=
-			    (uint64_t)tessera_bulk_write_min_sectors) {
+			    (uint64_t)tessera_pack_cache_min_sectors) {
 				uint8_t *pcbuf = NULL;
 				uint32_t pclen = 0;
 				if (tessera_fs_pack_fetch_cached(tmp_,
