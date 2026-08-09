@@ -536,10 +536,31 @@ rebuild (reclaims leaked space + fixes double-state); dangling-dirent removal,
 orphan → /lost+found relink. `--repair` iterates to a fixpoint (≤8 passes) because
 some fixes expose others. Persists via a new SB (bumped generation) written with
 the offline `tessera_volume_commit_roots` core primitive — repaired volumes remount
-cleanly in the kmod. Needs the device opened O_SYNC (the tool does this). NOTE: core
-must be rebuilt IN-VM after editing `atrium-tessera/core/*` (`vssh 'cd
-/mnt/host/atrium-tessera/core && make'`) BEFORE the host cross-build, or the tools
-link a stale libtessera_core.a — do NOT `ar` the .a on macOS (mangles ELF objects).
+cleanly in the kmod. Needs the device opened O_SYNC (the tool does this).
+
+After editing `atrium-tessera/core/*`, rebuild the archive BEFORE the host
+cross-build or the tools link a stale libtessera_core.a:
+
+```sh
+sh scripts/cross-build-core.sh                       # on the HOST
+( cd atrium-tessera/rs && TESSERA_CORE_LIB=$PWD/../core \
+    cargo build --release --target aarch64-unknown-freebsd -p tessera-tools )
+```
+
+This used to say the archive "must be rebuilt IN-VM", because macOS `ar`
+mangles ELF objects. That is true of macOS's ar and indicts the ARCHIVER only —
+the kmod has always cross-compiled on the host. Two things were actually
+missing, and both are now handled:
+
+  * an ELF-aware archiver — the cross toolchain already ships `llvm-ar`;
+  * FreeBSD userland headers — the obj-tree sysroot carries only what the
+    KERNEL build installed (55 dirs, no `stdlib.h`), and `make includes` dies
+    on macOS in the install step (`_INCSINS` error code 64). Stage them once
+    with `sh scripts/sync-freebsd-sysroot.sh`, which pulls them from the
+    running guest — built from this same tree, so no version skew. Re-run it
+    after a world update.
+
+Do NOT reach for `ar` on macOS; cross-build-core.sh uses llvm-ar deliberately.
 
 Gotchas (each one cost a kernel panic + qcow2 restore — preserved here so the next round doesn't repeat them):
 
