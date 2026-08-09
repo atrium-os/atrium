@@ -24154,7 +24154,20 @@ tessera_replay_dirent_record(struct tessera_mount *tmp_,
 		 * where the SB commit landed but the journal was not trimmed,
 		 * and of ring wraparound.
 		 */
-		if (ih.generation <= tmp_->sb.generation) {
+		/*
+		 * ★ STRICTLY LESS THAN, and the difference is crash recovery.
+		 * A redo record is stamped with the generation it was logged ON
+		 * TOP OF, so records still needed after a crash carry exactly
+		 * the committed SB's generation — `<=` would discard the very
+		 * records recovery exists to replay. Only records older than the
+		 * committed generation are redundant: commit N already folded in
+		 * everything logged against N-1.
+		 *
+		 * (tessera_jrec_sb_commit is the opposite: its generation is the
+		 * one the record COMMITS TO, so ROOT_UPDATE's `<=` is right.
+		 * Same-looking comparison, inverted meaning.)
+		 */
+		if (ih.generation < tmp_->sb.generation) {
 			tessera_stat_journal_redo_stale++;
 			return (1);
 		}
@@ -24192,7 +24205,7 @@ tessera_replay_dirent_record(struct tessera_mount *tmp_,
 		return (1);
 	tessera_jrec_dirent_t r;
 	memcpy(&r, body, sizeof r);
-	if (r.generation <= tmp_->sb.generation) {   /* #137, see above */
+	if (r.generation < tmp_->sb.generation) {   /* #137 — strict, see above */
 		tessera_stat_journal_redo_stale++;
 		return (1);
 	}
