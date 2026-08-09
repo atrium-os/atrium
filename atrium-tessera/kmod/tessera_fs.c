@@ -2834,6 +2834,8 @@ static int tessera_gc_fetch_frozen_reg = 0;
 static unsigned long tessera_stat_gc_snap_retired_midpass = 0;
 static unsigned long tessera_stat_blob_index_bypassed = 0;
 static unsigned long tessera_stat_gc_walk_dedup_skips = 0;
+static unsigned long tessera_stat_journal_redo_stale   = 0;
+static unsigned long tessera_stat_journal_redo_refused = 0;
 static int tessera_gc_walk_visited = 1;   /* #134: 0 = pre-fix walk, for A/B */
 static uint32_t tessera_blob_index_bypass_ctr = 0;
 /* ★ pack-zone leak: at unmount, cross-check recorded pack allocations against
@@ -23792,6 +23794,17 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, blob_index_bypass, CTLFLAG_RW,
     "one fetch in N, so fetches take the registry-scan fallback. N=1 (every "
     "fetch) makes a GC pass cost O(blobs x packs) reads and it will never "
     "finish — use N>=64. 0 = off");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_redo_stale, CTLFLAG_RD,
+    &tessera_stat_journal_redo_stale, 0,
+    "#137: redo records DROPPED at replay because their generation was at or "
+    "below the mounted superblock's. Non-zero after an offline repair or an "
+    "untrimmed crash journal is CORRECT — each one is an inode overwrite that "
+    "would have been applied over live state");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_redo_refused, CTLFLAG_RD,
+    &tessera_stat_journal_redo_refused, 0,
+    "#137: redo records refused because the inode's manifest resolves to no "
+    "pack. Should be 0; non-zero means the ring held a record naming a blob "
+    "this volume no longer has");
 SYSCTL_INT(_kern_tessera, OID_AUTO, gc_walk_visited, CTLFLAG_RW,
     &tessera_gc_walk_visited, 0,
     "#134: 1 (default) = the GC walk skips a hash it has already visited; "
@@ -23998,6 +24011,9 @@ tessera_fs_journal_log_drain(struct tessera_mount *tmp_)
 		ih->inode_no  = p->inode_no;
 		ih->tombstone = (uint8_t)(p->tombstone ? 1 : 0);
 		ih->reserved[0] = ih->reserved[1] = ih->reserved[2] = 0;
+		/* #137: stamp the generation this record describes, so replay
+		 * can drop it once the superblock has moved past it. */
+		ih->generation = tmp_->sb.generation;
 		memcpy(body + sizeof *ih, &p->rec, sizeof p->rec);
 
 		int ar = tessera_journal_append(tmp_->journal, tx,
@@ -24019,6 +24035,7 @@ tessera_fs_journal_log_drain(struct tessera_mount *tmp_)
 		hdr->inode_no        = e->inode_no;
 		hdr->name_len        = e->name_len;
 		hdr->reserved[0] = hdr->reserved[1] = 0;
+		hdr->generation      = tmp_->sb.generation;   /* #137 */
 		memcpy(body + sizeof *hdr, e->name, e->name_len);
 
 		tessera_record_type_t rt = (e->op == 0) ?
@@ -24090,6 +24107,25 @@ tessera_fs_journal_log_callout(void *ctx)
 		    tessera_fs_journal_log_callout, tmp_);
 }
 
+/*
+ * ★ #137: does this blob resolve on THIS volume? Used by journal replay to
+ * refuse restoring an inode whose manifest is gone. Goes through the normal
+ * fetch path (blob index, then the registry scan), so a blob that any reader
+ * could find is found here too. Replay is bounded by the journal ring, and
+ * the generation guard runs first, so this costs at most a handful of reads.
+ */
+static int
+tessera_fs_blob_exists(struct tessera_mount *tmp_, const tessera_hash_t h)
+{
+	uint8_t *buf = NULL;
+	uint32_t len = 0;
+	if (tessera_fs_fetch_blob_ex(tmp_, NULL, h, NULL, 0, &buf, &len) != 0)
+		return (0);
+	if (buf != NULL)
+		free(buf, M_TESSERA);
+	return (1);
+}
+
 /* Replay handler shim — extends the existing replay handler to
  * recognise DIR_INSERT / DIR_REMOVE records and rebuild the
  * in-memory log. Called from tessera_replay_handler. Returns 1 if
@@ -24109,11 +24145,41 @@ tessera_replay_dirent_record(struct tessera_mount *tmp_,
 			return (1);
 		tessera_jrec_inode_t ih;
 		memcpy(&ih, body, sizeof ih);
+		/*
+		 * ★ #137 THE GUARD THIS PATH NEVER HAD. ROOT_UPDATE has always
+		 * refused records at or below the mounted generation; these redo
+		 * records did not, so any CRC-valid leftover in the ring was
+		 * replayed over live state. That is not a rare condition — it is
+		 * the normal aftermath of an offline fsck/repack, of a crash
+		 * where the SB commit landed but the journal was not trimmed,
+		 * and of ring wraparound.
+		 */
+		if (ih.generation <= tmp_->sb.generation) {
+			tessera_stat_journal_redo_stale++;
+			return (1);
+		}
 		if (ih.tombstone) {
 			(void)tessera_fs_inode_delete(tmp_, ih.inode_no);
 		} else {
 			tessera_inode_record_t rec;
 			memcpy(&rec, body + sizeof ih, sizeof rec);
+			/*
+			 * ★ #137 belt-and-braces: never restore an inode whose
+			 * manifest is not actually on this volume. A record that
+			 * passes the generation test can still name a blob a
+			 * concurrent repack moved; writing it would dangle the
+			 * inode, and for inode 2 that costs the whole namespace.
+			 * Refuse loudly instead of corrupting silently.
+			 */
+			if (!tessera_hash_is_null(rec.manifest_hash) &&
+			    !tessera_fs_blob_exists(tmp_, rec.manifest_hash)) {
+				printf("tessera_fs: journal replay REFUSED "
+				    "inode %u — its manifest is in no pack "
+				    "(stale record; volume left as committed)\n",
+				    ih.inode_no);
+				tessera_stat_journal_redo_refused++;
+				return (1);
+			}
 			(void)tessera_fs_inode_put(tmp_, ih.inode_no, &rec);
 		}
 		tessera_stat_journal_log_replays++;
@@ -24126,6 +24192,10 @@ tessera_replay_dirent_record(struct tessera_mount *tmp_,
 		return (1);
 	tessera_jrec_dirent_t r;
 	memcpy(&r, body, sizeof r);
+	if (r.generation <= tmp_->sb.generation) {   /* #137, see above */
+		tessera_stat_journal_redo_stale++;
+		return (1);
+	}
 	if (r.name_len == 0 || r.name_len > TESSERA_PATH_NAME_MAX)
 		return (1);
 	if (sizeof(tessera_jrec_dirent_t) + r.name_len > hdr->body_length)

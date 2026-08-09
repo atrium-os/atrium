@@ -313,6 +313,10 @@ typedef struct TESSERA_PACKED {
 	uint32_t  inode_no;
 	uint16_t  name_len;
 	uint8_t   reserved[2];
+	/* Generation this record was logged under — see the note on
+	 * tessera_jrec_inode_t::generation (#137). Replay drops records at or
+	 * below the mounted superblock's generation. */
+	uint64_t  generation;
 	/* name_len bytes of name follow inline */
 } tessera_jrec_dirent_t;
 
@@ -325,7 +329,23 @@ typedef struct TESSERA_PACKED {
 	uint32_t  inode_no;
 	uint8_t   tombstone;       /* 1 = delete, 0 = put */
 	uint8_t   reserved[3];
-	/* tessera_inode_record_t body follows (144 bytes). Total = 152. */
+	/* ★ Generation this record was LOGGED under (#137). Replay must drop
+	 * any record whose generation is <= the mounted superblock's: those
+	 * describe a state the superblock has already superseded, and applying
+	 * one rewrites a live inode with a stale body — manifest_hash and all.
+	 * That is how the dev root lost its root directory: a stale INODE_WRITE
+	 * for inode 2 restored a manifest_hash whose blob had since been
+	 * rewritten, leaving inode 2 dangling and every other inode an orphan.
+	 *
+	 * ROOT_UPDATE (tessera_jrec_sb_commit) always carried a generation and
+	 * was always guarded; these redo records were added later and were not.
+	 *
+	 * Growing the struct is deliberate: a record written by an older kmod
+	 * now fails replay's `body_length <` size check and is DROPPED. Dropping
+	 * a stale record is the safe direction — misapplying one is what
+	 * destroys a volume. */
+	uint64_t  generation;
+	/* tessera_inode_record_t body follows (144 bytes). Total = 160. */
 } tessera_jrec_inode_t;
 
 /* QUOTA_DELTA body — adjusts a domain's used_bytes, journaled atomically

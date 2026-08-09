@@ -216,7 +216,7 @@ fn free_gaps(live: &[u64], lo: u64, hi: u64) -> Vec<(u64, u64)> {
 
 /// Atomically commit the four compacted roots, retire snapshots, and set the
 /// bump. `bump_exact` lowers the bump (repack reclaim); otherwise it only grows.
-fn commit(v: *mut tessera_volume_t, b: &Built, next_ino: u64, bump_exact: bool) -> Result<(), String> {
+fn commit(v: *mut tessera_volume_t, io: &tessera_block_io_t, b: &Built, next_ino: u64, bump_exact: bool) -> Result<(), String> {
     let roots = tessera_commit_roots_t {
         inode_root:         b.inode,
         pack_registry_root: b.pack,
@@ -236,6 +236,23 @@ fn commit(v: *mut tessera_volume_t, b: &Built, next_ino: u64, bump_exact: bool) 
     if bump_exact { flags |= TESSERA_COMMIT_BUMP_EXACT; }
     let rc = unsafe { tessera_volume_commit_roots_ex(v, &roots, flags) };
     if rc != 0 { return Err(format!("commit_roots rc={rc}")); }
+    /*
+     * #137: the new superblock is sealed, so the journal ring — which still
+     * describes the trees this repack just MOVED — must not survive. The
+     * kernel replays it at mount; its redo path had no generation guard, so a
+     * leftover INODE_WRITE could restore an inode whose manifest_hash points
+     * into sectors this repack recycled. For inode 2 that costs the entire
+     * namespace. Format the ring: the committed SB is authoritative.
+     */
+    let start = unsafe { tessera_volume_journal_start(v) };
+    let jlen  = unsafe { tessera_volume_journal_length(v) };
+    if start != 0 && jlen != 0 {
+        let jrc = unsafe { tessera_journal_format(io, start, jlen) };
+        if jrc != 0 {
+            eprintln!("tessera-repack: WARNING — journal reset failed (rc={jrc}); \
+the ring still holds records that predate this commit");
+        }
+    }
     Ok(())
 }
 
@@ -327,7 +344,7 @@ fn stage_bounded(v: *mut tessera_volume_t, io: &tessera_block_io_t, ctxp: *mut D
                                2 => b.free = root, 3 => b.quota = root,
                                4 => b.dead = root,
                                _ => unreachable!("victim index out of range") }
-                commit(v, &b, next_ino, false)?;
+                commit(v, io, &b, next_ino, false)?;
                 let span: u64 = below.iter().map(|&(a, c)| c - a).sum();
                 println!("  crash-safe: moved tree kind={kind} across {} gap(s) \
 ({span} free sectors), top was {victim_top}", below.len());
@@ -348,7 +365,7 @@ fn stage_bounded(v: *mut tessera_volume_t, io: &tessera_block_io_t, ctxp: *mut D
                            2 => b.free = root, 3 => b.quota = root,
                            4 => b.dead = root,
                            _ => unreachable!("victim index out of range") }
-            commit(v, &b, next_ino, false)?;
+            commit(v, io, &b, next_ino, false)?;
             println!("  crash-safe: moved tree kind={kind} to [{gs},{frontier}) \
 (top {victim_top} -> {})", frontier - 1);
             moved += 1;
@@ -378,7 +395,7 @@ fn stage_bounded(v: *mut tessera_volume_t, io: &tessera_block_io_t, ctxp: *mut D
         let top = all.iter().copied().max().map(|m| m + 1).unwrap_or(mr_start);
         let b = Built { inode: ir, pack: pr, free: fr, quota: qr, dead: dr,
                         bump: top.max(mr_start) };
-        commit(v, &b, next_ino, true)?;
+        commit(v, &io, &b, next_ino, true)?;
         println!("  crash-safe: bounded staging done — bump lowered to {}", b.bump);
     }
     Ok(moved)
@@ -473,7 +490,7 @@ fn run(path: &str, apply: bool, force: bool, stage_cap: Option<u64>) -> Result<i
         // Legacy in-place overwrite — NOT crash-safe. Only if explicitly asked.
         println!("  --force: in-place overwrite from reserve start (NOT crash-safe — back up first)");
         let b = build_all(&io, ctxp, mr_start, ceiling, &trees)?;
-        commit(v, &b, next_ino, true)?;
+        commit(v, &io, &b, next_ino, true)?;
         rebuild_index_after_repack(&f, &io, ctxp, v, path);
         report_done(v, mr_start, used, b.bump, path, trees.packs.len());
         return Ok(0);
@@ -505,7 +522,7 @@ fn run(path: &str, apply: bool, force: bool, stage_cap: Option<u64>) -> Result<i
         // Phase B: fit entirely below the lowest live node?
         if first_live > mr_start {
             if let Ok(b) = build_all(&io, ctxp, mr_start, first_live, &trees) {
-                commit(v, &b, next_ino, true)?;
+                commit(v, &io, &b, next_ino, true)?;
                 println!("  crash-safe: compacted into the free reserve prefix (commit, bump lowered)");
                 rebuild_index_after_repack(&f, &io, ctxp, v, path);
                 report_done(v, mr_start, used, b.bump, path, trees.packs.len());
@@ -545,7 +562,7 @@ first.",
                     (need.saturating_sub(headroom).max(1) * 4096).div_ceil(1024 * 1024)));
             }
         };
-        commit(v, &a, next_ino, false)?;   // grow-only bump; snapshots now retired
+        commit(v, &io, &a, next_ino, false)?;   // grow-only bump; snapshots now retired
         println!("  crash-safe: staged compacted trees in reserve headroom (snapshots retired)");
     }
     Err("repack did not converge in 3 passes (unexpected)".into())

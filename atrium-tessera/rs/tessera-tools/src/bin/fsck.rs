@@ -437,6 +437,36 @@ unsafe fn name_str(p: *const core::ffi::c_char, len: u16) -> String {
 /// progress: a destroyed inode or pack-registry root is not reserve pressure,
 /// and telling the operator to run tessera-repack in that state is actively
 /// dangerous — repack rewrites the reserve using trees it cannot read.
+
+/// Reset the journal to empty after an offline commit (#137).
+///
+/// An offline repair rewrites the trees and seals a NEW superblock, but the
+/// journal ring still holds redo records describing the OLD ones. The kernel
+/// replays that ring on the next mount. Its ROOT_UPDATE path is guarded by
+/// generation, but the dirent/inode redo path was not — so a stale
+/// TESSERA_INODE_WRITE was re-applied over live state and rewrote an inode
+/// with a manifest_hash whose blob this repair had just moved. When that inode
+/// is 2, the volume loses its root directory and every other inode becomes an
+/// orphan. That is exactly how the dev root was lost on 2026-08-09.
+///
+/// The kernel-side generation guard is the real fix; this is the other half,
+/// and it needs no on-disk format change, so it also protects volumes written
+/// by a kmod that predates the guard. Formatting the ring leaves nothing to
+/// replay: the committed superblock is authoritative by construction.
+fn reset_journal_after_commit(v: *mut tessera_volume_t, io: &tessera_block_io_t) {
+    let start = unsafe { tessera_volume_journal_start(v) };
+    let len   = unsafe { tessera_volume_journal_length(v) };
+    if start == 0 || len == 0 {
+        return;
+    }
+    let rc = unsafe { tessera_journal_format(io, start, len) };
+    if rc != 0 {
+        eprintln!("WARNING — journal reset failed (rc={rc}); the ring still \
+holds records that predate this commit. Do NOT mount with a kmod older than \
+the #137 generation guard: replay can re-apply them over the repaired state.");
+    }
+}
+
 fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
     -> Result<(i32, u32, bool), String> {
     let f = if repair {
@@ -1526,6 +1556,11 @@ filesystem, and this tool will not do that. Restore from backup.");
     // for it only when this run actually proved that root stale.
     let cflags = if clear_dead_extent { TESSERA_COMMIT_DEAD_EXTENT } else { 0 };
     let rc = unsafe { tessera_volume_commit_roots_ex(v, &commit, cflags) };
+    if rc == 0 {
+        // #137: the new superblock is sealed — drop the ring that still
+        // describes the old one, BEFORE closing the volume.
+        reset_journal_after_commit(v, &io);
+    }
     unsafe { tessera_volume_close(v); }
     if rc != 0 {
         return Err(format!("commit_roots failed: rc={rc}"));
