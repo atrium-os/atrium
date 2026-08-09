@@ -2834,6 +2834,24 @@ static int tessera_gc_fetch_frozen_reg = 0;
 static unsigned long tessera_stat_gc_snap_retired_midpass = 0;
 static unsigned long tessera_stat_blob_index_bypassed = 0;
 static unsigned long tessera_stat_gc_walk_dedup_skips = 0;
+static int tessera_fault_commit_fail = 0;   /* #135 TEST: force commit_sb to fail */
+/*
+ * ★ #135 operator clear — the analogue of `zpool clear`.
+ *
+ * The cannot-commit latch is sticky on purpose (a degraded mount must not
+ * silently resume), but "sticky until unmount" is unusable on the ROOT
+ * filesystem: you cannot unmount it, so it degrades to "sticky until reboot"
+ * — on the one volume where this bug is most destructive. ZFS suspends a pool
+ * just as stickily and still gives you an in-place escape hatch; this is ours.
+ *
+ * Setting it to 1 asks the next flush to drop the latch and try again. If the
+ * underlying cause is still there the commit fails and the latch returns
+ * immediately, exactly like clearing a pool whose disks are still missing.
+ */
+static int tessera_commit_failed_clear = 0;
+
+static unsigned long tessera_stat_commit_failed       = 0;
+static unsigned long tessera_stat_commit_failed_admit = 0;
 static unsigned long tessera_stat_journal_redo_stale   = 0;
 static unsigned long tessera_stat_journal_redo_refused = 0;
 static int tessera_gc_walk_visited = 1;   /* #134: 0 = pre-fix walk, for A/B */
@@ -3452,6 +3470,18 @@ struct tessera_mount {
 	 * mount-time GC + meta-recycler are skipped, commit_sb won't
 	 * fire (sb_dirty never gets set since mark_dirty isn't called). */
 	int                       readonly_snapshot;
+	/*
+	 * ★ #135: STICKY "this volume can no longer commit".
+	 *
+	 * Set when a flush fails to seal a superblock, cleared when one
+	 * succeeds. Until it clears, every write is doomed: it lands in the
+	 * cache, the caller is told it worked, and it evaporates at reboot
+	 * because no commit ever names it. That is exactly how the dev root
+	 * silently discarded a kernel module — stat(2) reported 450856 bytes
+	 * before the reboot and 447072 after, with sync(2) returning success
+	 * throughout. A filesystem that cannot commit must SAY SO.
+	 */
+	int                       commit_failed;
 	uint64_t                  snapshot_gen;
 
 	/* Read-only LIVE mount (MNT_RDONLY, not a tessera.gen snapshot):
@@ -6991,7 +7021,18 @@ tessera_sync_impl(struct mount *mp, int waitfor)
 		return (0);
 	/* flush drains all coalesced content inside its gate; doing it here
 	 * too would publish outside the gate and race the commit. */
-	(void)tessera_fs_flush(tmp_);
+	int r = tessera_fs_flush(tmp_);
+	/*
+	 * ★ #135: PROPAGATE IT. This used to be `(void)flush; return 0`, so
+	 * sync(2) reported success on a volume that could not commit a thing.
+	 * sync(2) returning 0 is a durability claim; making it while the
+	 * superblock is unwritable is the difference between "the machine
+	 * told me and I fixed it" and "my kernel module vanished at reboot".
+	 */
+	if (r != 0)
+		return (EIO);
+	if (tmp_->commit_failed)
+		return (EIO);
 	return (0);
 }
 
@@ -9248,7 +9289,13 @@ tessera_vop_fsync(struct vop_fsync_args *ap)
 	 * atomic. Draining here first would publish outside the gate and let
 	 * a concurrent commit persist the allocation without the registry
 	 * entry. flush_unmounting/group-commit semantics are unchanged. */
-	return (tessera_fs_flush(tmp_) == 0 ? 0 : EIO);
+	if (tessera_fs_flush(tmp_) != 0)
+		return (EIO);
+	/* #135: a flush with nothing dirty returns 0 even on a volume that
+	 * cannot commit; the latch is what makes fsync honest across that. */
+	if (tmp_->commit_failed)
+		return (EIO);
+	return (0);
 }
 
 static int
@@ -12282,10 +12329,59 @@ tessera_fs_window_publish(struct tessera_mount *tmp_, uint32_t inode_no)
  * mutates the allocator under the gate, not flush_mtx) — an aligned
  * u64 load is atomic on every target and the slack absorbs the
  * skew. */
+/*
+ * Consume a pending operator clear. MUST be called from every place that
+ * consults commit_failed, not just the flush: the latch blocks WRITE
+ * ADMISSION, so if only the flush honoured the clear, the first write after
+ * `commit_failed_clear=1` would still be refused and the flush that would
+ * have cleared the state would never run. The latch would prevent its own
+ * clearing — the same trap, one layer down. Caller holds flush_mtx.
+ */
+/*
+ * Enter the cannot-commit state (#135). Announce the edge only: a volume in
+ * this state fails every subsequent commit, and a message per attempt would
+ * bury the console — which is exactly where the operator has to find out.
+ */
+static void
+tessera_fs_commit_failed_latch(struct tessera_mount *tmp_, int rc)
+{
+	if (tmp_->commit_failed)
+		return;
+	tmp_->commit_failed = 1;
+	tessera_stat_commit_failed++;
+	printf("tessera_fs: ★ VOLUME CANNOT COMMIT (commit_sb rc=%d) — writes "
+	    "from here on are NOT durable and will be lost at reboot. fsync(2) "
+	    "now fails EIO and new allocations are refused; this is STICKY. "
+	    "Fix the cause (tessera-fsck --repair on the UNMOUNTED volume), "
+	    "then remount or sysctl kern.tessera.commit_failed_clear=1.\n", rc);
+}
+
+static void
+tessera_fs_commit_clear_consume(struct tessera_mount *tmp_)
+{
+	if (tmp_->commit_failed && tessera_commit_failed_clear) {
+		tmp_->commit_failed = 0;
+		tessera_commit_failed_clear = 0;
+		printf("tessera_fs: operator cleared the cannot-commit state; "
+		    "retrying. If the cause persists it will latch again.\n");
+	}
+}
+
 static int
 tessera_fs_space_admit(struct tessera_mount *tmp_, size_t delta_bytes)
 {
 	mtx_assert(&tmp_->flush_mtx, MA_OWNED);
+	/*
+	 * ★ #135: stop taking on work that provably cannot be made durable.
+	 * Accepting it is what turns an operator-visible failure into silent
+	 * loss — the bytes look written, then are not there. EIO (not ENOSPC):
+	 * the volume is not full, it is broken.
+	 */
+	tessera_fs_commit_clear_consume(tmp_);
+	if (tmp_->commit_failed) {
+		tessera_stat_commit_failed_admit++;
+		return (EIO);
+	}
 	if (tmp_->extent_alloc == NULL)
 		return (0);      /* degraded mount; drain-time ENOSPC path */
 	uint64_t free_sec = tessera_extent_free_blocks(tmp_->extent_alloc);
@@ -13530,6 +13626,14 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	}
 
 	mtx_lock(&tmp_->flush_mtx);
+	/*
+	 * #135: honour an operator clear before deciding anything. Doing it
+	 * here (rather than only in the write-admission path) means a bare
+	 * fsync(2) is enough to re-test the volume — no write has to be
+	 * admitted first, which matters because admission is what the latch
+	 * blocks.
+	 */
+	tessera_fs_commit_clear_consume(tmp_);
 	for (;;) {
 		/*
 		 * ★ task #80: sb_dirty alone is NOT "nothing to do".
@@ -13890,17 +13994,59 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	}
 	if (r == 0) {
 		_tp = TPROF_T0();
-		r = tessera_commit_sb(tmp_);
+		/*
+		 * ★ #135 TEST HOOK. Manufacturing a genuine cannot-commit
+		 * state means exhausting the meta-reserve, which is slow and
+		 * not reliably repeatable; the behaviour under test is what
+		 * happens AFTER a commit fails, so inject the failure. Used by
+		 * scripts/vm-commit-fail-test.sh. 0 = off (default).
+		 */
+		if (tessera_fault_commit_fail)
+			r = EIO;
+		else
+			r = tessera_commit_sb(tmp_);
 		TPROF_ADD(TPROF_FL_SB, _tp);
-		if (r != 0)
+		if (r != 0) {
 			printf("tessera_fs: flush — commit_sb failed: %d "
 			    "(unmounting=%d)\n", r, tmp_->flush_unmounting);
+			/*
+			 * ★ #135 LATCH HERE, and only here. The first version
+			 * latched on any non-zero return from tessera_fs_flush,
+			 * which is WRONG and cost a boot: flush returns non-zero
+			 * for reasons that are not "this volume cannot commit"
+			 * — notably during vfs_mountroot, where the root mounts
+			 * read-only and then upgrades. Latching there made
+			 * space_admit refuse everything and the mount itself
+			 * failed:
+			 *     panic: mountroot: unable to (re-)mount root.
+			 * The state means "a commit was ATTEMPTED and FAILED",
+			 * so it is set at the attempt. Teardown is excluded: a
+			 * commit failing while unmounting is already reported
+			 * and has no writes left to protect.
+			 */
+			if (!tmp_->flush_unmounting)
+				tessera_fs_commit_failed_latch(tmp_, r);
+		}
 	}
 
 	TPROF_ADD(TPROF_FLUSH, _tpfl);
 
 	mtx_lock(&tmp_->flush_mtx);
 	if (r == 0) tmp_->sb_dirty = 0;
+	/*
+	 * ★ Deliberately NO auto-clear. Two reasons, and the first was found
+	 * by the test:
+	 *
+	 * 1. It cannot work. space_admit refuses writes while latched, so the
+	 *    write whose flush would clear the latch never happens — the latch
+	 *    prevents its own clearing.
+	 * 2. It should not work. A volume that failed to commit may already
+	 *    have lost data; quietly resuming is the papering-over that let
+	 *    this bug hide in the first place. ext4 (errors=remount-ro) and UFS
+	 *    both stay degraded until the operator remounts, and so do we: the
+	 *    state clears when the mount is torn down and rebuilt, which is
+	 *    also when tessera-fsck can run on the UNMOUNTED volume.
+	 */
 	/* Balanced with the depth=1 set at acquire; nested gate_enter/exit
 	 * during the drain leave it at 1 here.
 	 *
@@ -23794,6 +23940,24 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, blob_index_bypass, CTLFLAG_RW,
     "one fetch in N, so fetches take the registry-scan fallback. N=1 (every "
     "fetch) makes a GC pass cost O(blobs x packs) reads and it will never "
     "finish — use N>=64. 0 = off");
+SYSCTL_INT(_kern_tessera, OID_AUTO, commit_failed_clear, CTLFLAG_RW,
+    &tessera_commit_failed_clear, 0,
+    "#135: set to 1 to clear the cannot-commit state and retry, after fixing "
+    "the cause — the `zpool clear` of this filesystem. The state is otherwise "
+    "STICKY: a degraded mount never silently resumes. Re-latches immediately "
+    "if the volume still cannot commit");
+SYSCTL_INT(_kern_tessera, OID_AUTO, fault_commit_fail, CTLFLAG_RW,
+    &tessera_fault_commit_fail, 0,
+    "#135 TEST ONLY: 1 = make every superblock commit fail, to exercise the "
+    "cannot-commit path (sync/fsync EIO, allocations refused). 0 = off");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, commit_failed, CTLFLAG_RD,
+    &tessera_stat_commit_failed, 0,
+    "#135: times a volume entered the cannot-commit state. NON-ZERO MEANS "
+    "DATA WAS AT RISK: while latched, nothing written is durable. sync/fsync "
+    "return EIO and new allocations are refused so the loss is loud");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, commit_failed_admit, CTLFLAG_RD,
+    &tessera_stat_commit_failed_admit, 0,
+    "#135: allocations refused because the volume cannot commit");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_redo_stale, CTLFLAG_RD,
     &tessera_stat_journal_redo_stale, 0,
     "#137: redo records DROPPED at replay because their generation was at or "
