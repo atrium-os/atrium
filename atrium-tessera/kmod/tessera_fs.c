@@ -10889,7 +10889,6 @@ tessera_fs_pending_manifest_put_impl(struct tessera_mount *tmp_,
 				 * list to begin with — skipping them here
 				 * was the bug that made truncate(file)
 				 * silently wipe the parent directory. */
-				if (removed)
 				if (removed && LIST_EMPTY(&prev->owners)) {
 					LIST_REMOVE(prev, link);
 					tmp_->pending_manifest_count--;
