@@ -13,10 +13,24 @@
 #   even consulted (hits AND misses both zero), which is what made this
 #   invisible for so long.
 #
-# CAVEAT, unproven: this volume has 16 packs, so everything fits in the
-# 256 MiB cache. On the 128k-pack dev root the hit rate depends on the walk's
-# locality across a bounded cache, and the win may be smaller. Do not quote
-# 24x for the real root without re-measuring there.
+# ★ AND THEN MEASURED ON THE REAL ROOT (128k packs, 14 GB, cold boot each
+# arm, same tree both times — `tar cf /dev/null /usr/src/sys`):
+#
+#   arm              wall  fetches   disk_ops   MiB   pack_hits  pack_miss
+#   OLD(bulk-only)    14s   151263    125490    678       0          0
+#   NEW(all packs)    13s    52112     61200    677   21984       3588
+#
+#   2.05x fewer read operations for IDENTICAL bytes, and an 85% pack-cache
+#   hit rate at 128k packs. NOT the 24x the 16-pack scratch volume showed —
+#   that fit entirely in the cache and the real root does not. Quote 2x.
+#
+#   Wall time moved only 14s -> 13s because this VM is SSD-backed, where op
+#   COUNT is nearly free; the saving shows up on slower media or a deep queue.
+#   Do not sell this as a wall-clock win on this rig.
+#
+#   Unexplained and worth a look: the fetch COUNT also fell 151263 -> 52112.
+#   Same files, same bytes, so something upstream is re-entering the fetch
+#   path fewer times when the pack is cached. Not investigated.
 #
 # Run on the SCRATCH disk only (vtbd1 under the test harness, vtbd2 under
 # run-vm.sh — check the ident, see #129).
