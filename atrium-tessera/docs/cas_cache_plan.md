@@ -335,3 +335,41 @@ loc_max + byte_max_bytes overhead.
 - Memory note added under
   `~/.claude/projects/.../memory/project_tessera_*` summarizing
   the cache and its sysctls.
+
+## 12. Metadata pack segregation — MEASURED, NOT WARRANTED (2026-08-09)
+
+The per-file publish path emits a `2 /* mixed */` pack: a file's chunks
+followed by that file's manifest (`tessera_fs_emit_chunk_pack`). The obvious
+worry is that a metadata-only walk then drags up to 12 MiB of chunk payload to
+reach a ~200-byte manifest, and that segregating metadata into its own packs
+would fix it. Measured on the real dev root (14 GB used, 128k packs, cold
+boot), and the worry does not survive contact:
+
+    metadata-only walk (readdir + lstat), /usr/src/sys, 38282 entries
+      wall 1s   18 MiB read   12271 disk ops   1630 pack hits   7 pack MISSES
+
+    readdir-only, same tree
+      0 MiB read   18433 fetches   0 pack misses
+
+Seven pack misses across the whole walk. There is no mixed-pack amplification
+to remove, for two structural reasons:
+
+1. `lstat` is served from the **inode btree in the metadata zone**, not from
+   packs. A stat walk never fetches a manifest at all, so mixed packs are not
+   on its path.
+2. Directory manifests are already published through the batched
+   `tessera_pack_begin(0 /* manifest pack */, ...)` route, so they are already
+   segregated. Only per-file publishes are mixed — and colocating a file's
+   chunks with its own manifest is the RIGHT layout for the read path, because
+   opening the file wants both.
+
+18 MiB for 38282 entries is ~490 bytes per entry, which is close to the
+inode-record size; there is no headroom worth chasing.
+
+So: do not build metadata pack segregation. It would trade away per-file read
+locality to fix an amplification that measurement says is not occurring.
+
+The residual amplification is on the CONTENT path, and it is modest: `tar` of
+the same tree read 677 MiB against 518 MiB apparent size (1.31x), from pack
+overhead and whole-chunk reads for partial tails. That is the next lever if
+one is wanted; it is not this one.
