@@ -2850,6 +2850,14 @@ static int tessera_gc_fetch_frozen_reg = 0;
 static unsigned long tessera_stat_gc_snap_retired_midpass = 0;
 static unsigned long tessera_stat_blob_index_bypassed = 0;
 static unsigned long tessera_stat_gc_walk_dedup_skips = 0;
+/* #133: pass-2 pack enumeration cost. prefix_sectors counts sectors read by
+ * the header+index path, full_sectors those read by the whole-pack path they
+ * replace — the pair IS the measurement, and both are load-invariant, unlike
+ * any wall-clock number on this rig. fallback counts packs the prefix path
+ * could not enumerate and handed back to the caller to KEEP. */
+static unsigned long tessera_stat_gc_pack_prefix_sectors = 0;
+static unsigned long tessera_stat_gc_pack_full_sectors = 0;
+static unsigned long tessera_stat_gc_pack_prefix_fallback = 0;
 static int tessera_fault_commit_fail = 0;   /* #135 TEST: force commit_sb to fail */
 /*
  * ★ #135 operator clear — the analogue of `zpool clear`.
@@ -2871,6 +2879,7 @@ static unsigned long tessera_stat_commit_failed_admit = 0;
 static unsigned long tessera_stat_journal_redo_stale   = 0;
 static unsigned long tessera_stat_journal_redo_refused = 0;
 static int tessera_gc_walk_visited = 1;   /* #134: 0 = pre-fix walk, for A/B */
+static int tessera_gc_pack_prefix_read = 1; /* #133: 0 = whole-pack read, for A/B */
 static uint32_t tessera_blob_index_bypass_ctr = 0;
 /* ★ pack-zone leak: at unmount, cross-check recorded pack allocations against
  * the registry and print any that never landed, with the caller's address. */
@@ -15969,6 +15978,139 @@ tessera_fs_gc_scan_end(struct tessera_mount *tmp_, struct tessera_gc_scan *s)
 	}
 }
 
+/*
+ * ── #133: pass 2 reads the pack HEADER + INDEX, not the whole pack ──
+ *
+ * Pass 2 has to answer one question per pack: "what blob hashes does it
+ * hold?" — so it can test every one against the live set. It used to answer
+ * it by materialising the ENTIRE pack (up to the 16 MiB sanity cap) purely to
+ * call tessera_pack_open() and read the index. On a volume with ~128k packs
+ * that reads the whole data zone every pass, which is why a root pass cost
+ * minutes: the information needed is O(packs), and the I/O done was O(bytes).
+ *
+ * The layout is `header | index | bloom | data | footer`, so every hash lives
+ * in the first 1 + index_blocks sectors. This reads exactly those and decodes
+ * the index entries directly.
+ *
+ * Why not tessera_pack_open(): it requires header.total_pack_bytes == len and
+ * validates the footer, so by construction it refuses a prefix. Bypassing it
+ * means bypassing its geometry validation too, so that is re-done HERE, in the
+ * same style #124 established after fuzzing found the OOB read — every check
+ * written as SUBTRACTION against a known-good bound, never `off + size > len`,
+ * because that form overflows on exactly the inputs that must be rejected.
+ *
+ * WHAT THIS GIVES UP, deliberately: the footer CRC that pack_open verifies. We
+ * are enumerating an index to decide reclaim, and a pack we misread here is
+ * kept (see the caller: any decode failure => not dead), never freed. The
+ * apply phase still touch-tests every hash. So the failure direction stays
+ * "keep a dead pack one more cycle", which is the same direction the SATB
+ * filter already errs in — not "free a live one".
+ *
+ * Returns 0 and fills *out_bh (malloc'd, caller frees) / *out_n on success.
+ * Non-zero means "could not enumerate" and the caller must keep the pack.
+ */
+static int
+tessera_fs_gc_pack_index_hashes(struct tessera_mount *tmp_,
+    const tessera_pack_extent_t *exts, uint32_t nexts,
+    uint64_t length_sectors, tessera_hash_t **out_bh, uint32_t *out_n)
+{
+	*out_bh = NULL;
+	*out_n  = 0;
+	if (nexts == 0 || length_sectors == 0) return (EINVAL);
+
+	/* Read the first `want` sectors in PACK order, which may span extents. */
+	uint8_t *buf = NULL;
+	uint64_t have = 0;
+	uint64_t want = 1;                      /* header only, to start */
+	/* ★ #114: the pack header is 4096 B — heap, never stack. The build
+	 * gate caught this as a NEW oversized frame; on a deep GC path a 4 KiB
+	 * stack object is how the kernel wedges unkillably. */
+	tessera_pack_header_t *ph = malloc(sizeof *ph, M_TESSERA, M_WAITOK);
+	int rc = EIO;
+
+	for (int phase = 0; phase < 2; phase++) {
+		if (want > length_sectors) goto out;
+		uint8_t *nb = malloc((size_t)want * TESSERA_SECTOR_SIZE,
+		    M_TESSERA, M_WAITOK);
+		if (buf != NULL) {
+			memcpy(nb, buf, (size_t)have * TESSERA_SECTOR_SIZE);
+			free(buf, M_TESSERA);
+		}
+		buf = nb;
+		uint64_t cursor = 0;
+		for (uint32_t e = 0; e < nexts && have < want; e++) {
+			for (uint64_t i = 0; i < exts[e].length_sectors &&
+			    have < want; i++) {
+				if (cursor + i < have) continue;
+				struct buf *bp = NULL;
+				if (bread(tmp_->devvp,
+				    (exts[e].start_sector + i) *
+				        btodb(TESSERA_SECTOR_SIZE),
+				    TESSERA_SECTOR_SIZE,
+				    tmp_->bio_ctx.cred ? tmp_->bio_ctx.cred
+				        : NOCRED, &bp) != 0) {
+					if (bp) brelse(bp);
+					goto out;
+				}
+				memcpy(buf + have * TESSERA_SECTOR_SIZE,
+				    bp->b_data, TESSERA_SECTOR_SIZE);
+				brelse(bp);
+				have++;
+			}
+			cursor += exts[e].length_sectors;
+		}
+		if (have < want) goto out;
+		tessera_stat_gc_pack_prefix_sectors += want -
+		    (phase == 0 ? 0 : 1);
+
+		if (phase == 0) {
+			if (tessera_decode_pack_header(buf, ph) != TESSERA_OK)
+				goto out;
+			/* Geometry, as subtraction against known-good bounds.
+			 * length_sectors >= 1 (checked). The index occupies
+			 * index_blocks sectors starting at sector 1, and must
+			 * stop before the footer sector. */
+			if (length_sectors < 2) goto out;
+			const uint64_t max_index = length_sectors - 2;
+			if (ph->index_blocks > max_index) goto out;
+			if (ph->index_blocks == 0) {
+				/* No index => cannot enumerate => keep. */
+				goto out;
+			}
+			const size_t index_bytes = (size_t)ph->index_blocks *
+			    TESSERA_SECTOR_SIZE;
+			if (ph->blob_count >
+			    index_bytes / TESSERA_PACK_INDEX_ENTRY_SIZE)
+				goto out;
+			if (ph->blob_count == 0) goto out;
+			want = 1 + ph->index_blocks;
+			continue;
+		}
+	}
+
+	tessera_hash_t *bh = malloc((size_t)ph->blob_count *
+	    sizeof(tessera_hash_t), M_TESSERA, M_WAITOK);
+	for (uint32_t i = 0; i < ph->blob_count; i++) {
+		tessera_pack_index_entry_t ie;
+		if (tessera_decode_pack_index_entry(
+		    buf + TESSERA_SECTOR_SIZE +
+		    (size_t)i * TESSERA_PACK_INDEX_ENTRY_SIZE, &ie)
+		    != TESSERA_OK) {
+			free(bh, M_TESSERA);
+			goto out;
+		}
+		memcpy(bh[i], ie.blob_hash, sizeof(tessera_hash_t));
+	}
+	*out_bh = bh;
+	*out_n  = ph->blob_count;
+	rc = 0;
+out:
+	if (buf != NULL) free(buf, M_TESSERA);
+	free(ph, M_TESSERA);
+	if (rc != 0) tessera_stat_gc_pack_prefix_fallback++;
+	return (rc);
+}
+
 static int
 tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
     struct tessera_gc_scan *scan)
@@ -16946,16 +17088,51 @@ snap_next:
 			if (re.length_sectors == 0 ||
 			    re.length_sectors > 4096u) goto next_p; /* sanity */
 
+			/* Shared by both enumeration arms below. */
+			tessera_hash_t bh;              /* blob 0 */
+			uint32_t nbh = 0;
+			int dead = 0;
+
+			/* ★ #133: enumerate this pack's blob hashes from its
+			 * header + index (1 + index_blocks sectors) instead of
+			 * materialising the whole pack. The old whole-pack read
+			 * is kept below, selectable, because it is the control
+			 * arm for the A/B and the fallback if the prefix path
+			 * cannot decode. */
+			tessera_pack_extent_t *exts = NULL;
+			uint32_t nexts = 0;
+			int ok = (tessera_fs_pack_extents_resolve(tmp_, &re,
+			    &exts, &nexts) == 0);
+			if (ok && tessera_gc_pack_prefix_read) {
+				tessera_hash_t *pbh = NULL;
+				uint32_t pn = 0;
+				if (tessera_fs_gc_pack_index_hashes(tmp_,
+				    exts, nexts, re.length_sectors,
+				    &pbh, &pn) == 0) {
+					free(exts, M_TESSERA);
+					nbh = pn;
+					bh_all = pbh;
+					dead = 1;
+					for (uint32_t bi = 0; bi < pn; bi++) {
+						if (_GC_HASH_IS_LIVE(
+						    bh_all[bi])) {
+							dead = 0; break;
+						}
+					}
+					memcpy(bh, bh_all[0],
+					    sizeof(tessera_hash_t));
+					goto have_hashes;
+				}
+				/* Could not enumerate — fall through to the
+				 * whole-pack read rather than guess. */
+			}
 			/* Materialise the whole pack (bounded by the sanity cap
 			 * above, 16 MiB) to read its index. Same path fetch_blob
 			 * uses. */
 			const size_t pack_len = (size_t)re.length_sectors *
 			    TESSERA_SECTOR_SIZE;
 			uint8_t *packbuf = malloc(pack_len, M_TESSERA, M_WAITOK);
-			tessera_pack_extent_t *exts = NULL;
-			uint32_t nexts = 0;
-			int ok = (tessera_fs_pack_extents_resolve(tmp_, &re,
-			    &exts, &nexts) == 0);
+			tessera_stat_gc_pack_full_sectors += re.length_sectors;
 			uint64_t cursor = 0;
 			for (uint32_t e = 0; e < nexts && ok; e++) {
 				for (uint64_t i = 0; i < exts[e].length_sectors;
@@ -16982,9 +17159,6 @@ snap_next:
 			if (!ok) { free(packbuf, M_TESSERA); goto next_p; }
 			tessera_pack_reader_t *pr = tessera_pack_open(packbuf,
 			    pack_len);
-			tessera_hash_t bh;              /* blob 0 */
-			uint32_t nbh = 0;
-			int dead = 0;
 			if (pr != NULL) {
 				nbh = tessera_pack_blob_count(pr);
 				/* A pack is dead iff EVERY blob it holds is absent
@@ -17015,6 +17189,7 @@ snap_next:
 			}
 			if (pr) tessera_pack_close(pr);
 			free(packbuf, M_TESSERA);
+have_hashes:
 			if (!dead && bh_all != NULL) {
 				free(bh_all, M_TESSERA);
 				bh_all = NULL;
@@ -24065,6 +24240,24 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, alloc_audit_snaproots, CTLFLAG_RW,
     "allocation): assert that a sector being handed out is not still a "
     "retained snapshot's root, and report whether it came from meta_free or "
     "the BUMP");
+SYSCTL_INT(_kern_tessera, OID_AUTO, gc_pack_prefix_read, CTLFLAG_RW,
+    &tessera_gc_pack_prefix_read, 0,
+    "#133: GC pass 2 reads each pack's header+index only (1) instead of "
+    "materialising the whole pack (0). 0 is the control arm for the A/B");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_pack_prefix_sectors, CTLFLAG_RD,
+    &tessera_stat_gc_pack_prefix_sectors, 0,
+    "#133: sectors read by the pass-2 header+index path. Compare against "
+    "gc_pack_full_sectors — this pair is the measurement, and both are "
+    "load-invariant unlike any wall-clock number on this rig");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_pack_full_sectors, CTLFLAG_RD,
+    &tessera_stat_gc_pack_full_sectors, 0,
+    "#133: sectors read by the whole-pack pass-2 path (the control arm, and "
+    "the fallback when the prefix path cannot decode)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_pack_prefix_fallback, CTLFLAG_RD,
+    &tessera_stat_gc_pack_prefix_fallback, 0,
+    "#133: packs the header+index path could not enumerate, so pass 2 fell "
+    "back to the whole-pack read. Every one of these is a pack KEPT, never "
+    "freed on a guess");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, alloc_hands_out_snaproot, CTLFLAG_RD,
     &tessera_stat_alloc_hands_out_snaproot, 0,
     "#132: allocations that handed out a live retained-snapshot root. "
