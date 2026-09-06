@@ -2858,6 +2858,11 @@ static unsigned long tessera_stat_gc_walk_dedup_skips = 0;
 static unsigned long tessera_stat_gc_pack_prefix_sectors = 0;
 static unsigned long tessera_stat_gc_pack_full_sectors = 0;
 static unsigned long tessera_stat_gc_pack_prefix_fallback = 0;
+/* tessera_fs_flush() called by the thread that already holds the flush gate.
+ * Each one is a self-deadlock that was refused with EDEADLK instead of
+ * wedging the machine; non-zero names a caller that flushes under its own
+ * bracket and must be fixed. */
+static unsigned long tessera_stat_flush_self_wait = 0;
 static int tessera_fault_commit_fail = 0;   /* #135 TEST: force commit_sb to fail */
 /*
  * ★ #135 operator clear — the analogue of `zpool clear`.
@@ -13685,6 +13690,25 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 			mtx_unlock(&tmp_->flush_mtx);
 			return (0);
 		}
+		if (tmp_->flush_in_progress &&
+		    tmp_->flush_gate_owner == curthread) {
+			/*
+			 * The gate is held by THIS thread. Waiting for it to
+			 * clear cannot succeed — nothing else will release
+			 * it — so sleeping here is a wedge with no owner
+			 * running: everyone else piles onto "tessgate", all
+			 * CPUs idle. That is exactly what `tq /` produced
+			 * through the vop_ioctl gate. A wait that can never
+			 * complete must fail loudly, not hang.
+			 */
+			tessera_stat_flush_self_wait++;
+			mtx_unlock(&tmp_->flush_mtx);
+			printf("tessera_fs: flush called by the thread that "
+			    "already holds the flush gate (depth %d) — "
+			    "refusing to wait on itself: EDEADLK\n",
+			    tmp_->flush_gate_depth);
+			return (EDEADLK);
+		}
 		if (tmp_->flush_in_progress) {
 			/* Another thread is already committing; wait for
 			 * it. When we wake we re-check sb_dirty: if it's
@@ -14094,51 +14118,6 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	return (r);
 }
 
-/*
- * On-demand data-zone GC (drives TESSERA_IOC_GC).
- *
- * Mount-time GC and the tombstone-flush GC already reclaim deleted-file
- * packs. This entry point lets userspace force a sweep WITHOUT a remount,
- * which is the only way to reclaim orphans from in-place rewrites and
- * xattr churn: when a file is rewritten (or an xattr changes) the inode
- * repoints to a fresh single-blob pack and the old one becomes an orphan,
- * but there's no tombstone, so the flush-path GC never fires for it. Today
- * those orphans wait for the next mount; this closes that gap.
- *
- * No new walk logic — it reuses the exact gc_data_zone the flush path
- * runs, inside the same flush_in_progress bracket flush uses to keep
- * writers and concurrent flushes from COWing the live trees underfoot.
- *
- * Returns 0 and the reclaimed pack count in *out_reclaimed, or an errno.
- */
-static int
-tessera_fs_gc_now(struct tessera_mount *tmp_, uint64_t *out_reclaimed)
-{
-	if (out_reclaimed != NULL) *out_reclaimed = 0;
-	if (tmp_->inode_tree == NULL || tmp_->pack_registry_tree == NULL)
-		return (EROFS);
-	if (tmp_->readonly_snapshot)
-		return (EROFS);
-	if (!tmp_->flush_mtx_init)
-		return (0);
-
-	/* Drain pending writes first: rewrite-orphaned content packs must be
-	 * fully on disk (and out of the pending set) and the inode tree must
-	 * reflect the current post-rewrite hashes before pass 1 collects the
-	 * live set — otherwise a still-pending new manifest looks orphaned. */
-	(void)tessera_fs_flush(tmp_);
-
-	/* Acquire the flush gate (recursive-aware). */
-	tessera_fs_flush_gate_enter(tmp_);
-
-	int n = tessera_fs_gc_data_zone(tmp_);
-
-	tessera_fs_flush_gate_exit(tmp_);
-
-	if (n > 0 && out_reclaimed != NULL)
-		*out_reclaimed = (uint64_t)n;
-	return (0);
-}
 
 /* Visitor used at mount time to mark which meta-reserve sectors are
  * still referenced by a live tree. ctx is `struct meta_mark_ctx`
@@ -17670,6 +17649,88 @@ tessera_fs_gc_task(void *ctx, int pending)
 	}
 out:
 	atomic_store_rel_int((volatile int *)&tmp_->gc_task_armed, 0);
+}
+
+/*
+ * On-demand data-zone GC (drives TESSERA_IOC_GC).
+ *
+ * Mount-time GC and the tombstone-flush GC already reclaim deleted-file
+ * packs. This entry point lets userspace force a sweep WITHOUT a remount,
+ * which is the only way to reclaim orphans from in-place rewrites and
+ * xattr churn: when a file is rewritten (or an xattr changes) the inode
+ * repoints to a fresh single-blob pack and the old one becomes an orphan,
+ * but there's no tombstone, so the flush-path GC never fires for it. Today
+ * those orphans wait for the next mount; this closes that gap.
+ *
+ * No new walk logic — it reuses the exact gc_data_zone the flush path
+ * runs, inside the same flush_in_progress bracket flush uses to keep
+ * writers and concurrent flushes from COWing the live trees underfoot.
+ *
+ * Returns 0 and the reclaimed pack count in *out_reclaimed, or an errno.
+ */
+static int
+tessera_fs_gc_now(struct tessera_mount *tmp_, uint64_t *out_reclaimed)
+{
+	if (out_reclaimed != NULL) *out_reclaimed = 0;
+	if (tmp_->inode_tree == NULL || tmp_->pack_registry_tree == NULL)
+		return (EROFS);
+	if (tmp_->readonly_snapshot)
+		return (EROFS);
+	if (!tmp_->flush_mtx_init)
+		return (0);
+
+	/* Drain pending writes first: rewrite-orphaned content packs must be
+	 * fully on disk (and out of the pending set) and the inode tree must
+	 * reflect the current post-rewrite hashes before pass 1 collects the
+	 * live set — otherwise a still-pending new manifest looks orphaned. */
+	(void)tessera_fs_flush(tmp_);
+
+	/*
+	 * Run the SAME pass the background task runs, the same way: the gate
+	 * is held only around the activation snapshot, and the O(volume) walk
+	 * runs ungated under the SATB touch filter (#72). This used to hold the
+	 * gate for the ENTIRE pass — on the 14 GB dev root that is minutes in
+	 * which every writer, sshd's login path included, sits on "tessgate".
+	 * It also passed a NULL scan, which has no frozen registry, so the
+	 * frozen-fetch path (#133) could never be exercised from here.
+	 *
+	 * Only one scan may exist at a time (they share gc_touch_bm and
+	 * gc_scan_active), so take the same arm the background task takes and
+	 * report EBUSY if a pass is already running rather than race it.
+	 */
+	if (!atomic_cmpset_int((volatile int *)&tmp_->gc_task_armed, 0, 1))
+		return (EBUSY);
+
+	struct tessera_gc_scan scan;
+	tessera_fs_flush_gate_enter(tmp_);
+	int berr = tessera_fs_gc_scan_begin(tmp_, &scan);
+	tessera_fs_flush_gate_exit(tmp_);
+	if (berr != 0) {
+		atomic_store_rel_int((volatile int *)&tmp_->gc_task_armed, 0);
+		return (berr);
+	}
+
+	tessera_stat_gc_scans++;
+	sbintime_t t0 = TPROF_T0();
+	int n = tessera_fs_gc_data_zone_ex(tmp_, &scan);
+	unsigned long _gc_ms =
+	    (unsigned long)(sbttons(sbinuptime() - t0) / 1000000);
+	tessera_stat_gc_scan_ms += _gc_ms;
+	tessera_stat_gc_last_ms = _gc_ms;
+	tessera_stat_gc_last_reclaimed = (unsigned long)(n > 0 ? n : 0);
+	if (n > 0) {
+		tessera_stat_gc_productive_passes++;
+		tessera_stat_gc_productive_ms += _gc_ms;
+	} else {
+		tessera_stat_gc_unproductive_passes++;
+		tessera_stat_gc_unproductive_ms += _gc_ms;
+	}
+	tessera_fs_gc_scan_end(tmp_, &scan);
+	atomic_store_rel_int((volatile int *)&tmp_->gc_task_armed, 0);
+
+	if (n > 0 && out_reclaimed != NULL)
+		*out_reclaimed = (uint64_t)n;
+	return (0);
 }
 
 /* Enqueue a GC pass if one isn't already queued or running. */
@@ -24253,6 +24314,11 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_pack_full_sectors, CTLFLAG_RD,
     &tessera_stat_gc_pack_full_sectors, 0,
     "#133: sectors read by the whole-pack pass-2 path (the control arm, and "
     "the fallback when the prefix path cannot decode)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, flush_self_wait, CTLFLAG_RD,
+    &tessera_stat_flush_self_wait, 0,
+    "tessera_fs_flush() called by the thread already holding the flush gate "
+    "and refused with EDEADLK instead of wedging. Non-zero names a caller "
+    "that flushes under its own bracket — a bug, not a condition");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_pack_prefix_fallback, CTLFLAG_RD,
     &tessera_stat_gc_pack_prefix_fallback, 0,
     "#133: packs the header+index path could not enumerate, so pass 2 fell "
@@ -26445,7 +26511,23 @@ static int
 tessera_vop_ioctl(struct vop_ioctl_args *ap)
 {
 	struct tessera_mount *tmp_ = VFSTOTESSERA(ap->a_vp->v_mount);
-	int gated = (ap->a_vp->v_type == VDIR) && tmp_->flush_mtx_init;
+	/*
+	 * The gate here exists for the quota ioctls, which mutate the inode
+	 * tree. TESSERA_IOC_GC must NOT run under it: gc_now() drains pending
+	 * writes with tessera_fs_flush() BEFORE taking its own bracket, and
+	 * flush's acquire loop waits for flush_in_progress to clear — with the
+	 * gate already held by this same thread, that wait can never end.
+	 *
+	 * That was `tq /` on the dev root: the ioctl on a VDIR took the gate,
+	 * gc_now called flush, flush slept on "tessflsh" for a gate its own
+	 * thread owned (ddb: flush_gate_owner == tq's td, depth 1), and every
+	 * other thread queued on "tessgate" — 24 of them, all CPUs idle. Twice.
+	 * The GC pass never even started. See the self-wait refusal in
+	 * tessera_fs_flush, which turns this shape into EDEADLK instead of a
+	 * wedge if it ever recurs by another route.
+	 */
+	int gated = (ap->a_vp->v_type == VDIR) && tmp_->flush_mtx_init &&
+	    ap->a_command != TESSERA_IOC_GC;
 	if (gated) tessera_fs_flush_gate_enter(tmp_);
 	int r = tessera_vop_ioctl_impl(ap);
 	if (gated) tessera_fs_flush_gate_exit(tmp_);
