@@ -46,6 +46,10 @@ typedef struct tessera_pack_reader tessera_pack_reader_t;
 tessera_pack_reader_t *tessera_pack_open(const uint8_t *data, size_t len);
 
 uint32_t tessera_pack_blob_count(const tessera_pack_reader_t *);
+/* The pack_id recorded in the header of the bytes this reader was opened on.
+ * A consumer that reached these bytes via a registry entry must check it
+ * against the entry's pack_id: a mismatch is a stale or foreign read. */
+const uint8_t *tessera_pack_pack_id(const tessera_pack_reader_t *);
 int      tessera_pack_lookup(const tessera_pack_reader_t *,
                              const tessera_hash_t blob_hash,
                              const uint8_t **out_bytes,

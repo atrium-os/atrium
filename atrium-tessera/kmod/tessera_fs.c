@@ -1739,8 +1739,9 @@ tessera_kbio_write_delayed(void *ctx, uint64_t sector, const uint8_t *buf)
  * barrier already relies on). Because it bypasses the buffer cache, we
  * then drop any cached buffers over the written range so a later bread
  * (the on-demand reader) re-reads fresh from disk — matters only when GC
- * has recycled sectors that were previously cached. getblk(GB_NOCREAT)
- * is a cheap hash probe for the common freshly-allocated case.
+ * has recycled sectors that were previously cached. The invalidation MUST
+ * create the buffer (not GB_NOCREAT) so the underlying VMIO pages are
+ * invalidated too — see the loop.
  *
  * Returns 0 on success, -1 to signal the caller to fall back to the
  * per-sector buffer-cache path (e.g. no GEOM consumer available).
@@ -1766,11 +1767,31 @@ tessera_kbio_write_bulk(struct tessera_kbio_ctx *k, uint64_t start_sector,
 			return (-1);
 	}
 
-	/* Read-coherence: invalidate any cached buffers over the range. */
+	/*
+	 * Read-coherence: invalidate any cached DATA over the range.
+	 *
+	 * ★ NOT GB_NOCREAT. It used to be — "a cheap hash probe for the common
+	 * freshly-allocated case" — and that was exactly the bug. The device
+	 * vnode is VMIO-backed: cached data lives in VM PAGES and the buf
+	 * header over them is transient. GB_NOCREAT finds only headers that
+	 * still exist, so once the old occupant's header had been recycled the
+	 * loop found nothing and skipped, while the pages underneath stayed
+	 * VALID with the old bytes. The next bread() built a fresh header over
+	 * those pages, got B_CACHE, did no I/O, and returned the PREVIOUS pack.
+	 * Measured 2026-09-06: 1565 of 1565 GC pass-2 header reads of recycled
+	 * ranges were stale in the cache with the disk correct, the same few
+	 * sectors stale across ~100 passes; GC judged the new pack dead on the
+	 * old pack's index and freed it — 28 of 40 files lost per run.
+	 *
+	 * Creating the header binds the pages, and brelse(B_INVAL|B_NOCACHE)
+	 * invalidates THEM. getblk's lock also waits out an in-flight read of
+	 * the same sector, which makes this the read/write barrier the old
+	 * comment assumed it already was.
+	 */
 	for (uint64_t i = 0; i < n_sectors; i++) {
 		struct buf *bp = getblk(k->devvp,
 		    (start_sector + i) * btodb(TESSERA_SECTOR_SIZE),
-		    TESSERA_SECTOR_SIZE, 0, 0, GB_NOCREAT);
+		    TESSERA_SECTOR_SIZE, 0, 0, 0);
 		if (bp != NULL) {
 			/* A DIRTY buffer under a freshly allocated bulk
 			 * extent means these sectors are still owned by
@@ -1780,7 +1801,7 @@ tessera_kbio_write_bulk(struct tessera_kbio_ctx *k, uint64_t start_sector,
 				printf("tessera_fs: WARNING bulk write over "
 				    "DIRTY buffered sector %llu\n",
 				    (unsigned long long)(start_sector + i));
-			bp->b_flags |= B_INVAL | B_NOCACHE;
+			bp->b_flags |= B_INVAL | B_NOCACHE | B_RELBUF;
 			brelse(bp);
 		}
 	}
@@ -2749,6 +2770,17 @@ static unsigned long tessera_stat_pinscan_stale_snap = 0;
  * previous pin bitmap rather than replacing it. Nonzero means reclaim is
  * being deliberately delayed to avoid unpinning something still live. */
 static unsigned long tessera_stat_pinscan_incomplete = 0;
+/* pinscans discarded at swap because a GC scan froze roots after the walk
+ * began — the bitmap never covered them. Each one is a prevented silent
+ * release of frozen-tree blocks. */
+static unsigned long tessera_stat_pinscan_gc_roots_moved = 0;
+static unsigned long tessera_stat_gc_apply_delete_failed = 0;
+/* pass 2 read a pack header whose pack_id is not the registry entry it was sent
+ * to: a stale or foreign read. The pack is KEPT. Non-zero names a coherence hole. */
+static unsigned long tessera_stat_gc_pack_id_mismatch = 0;
+static unsigned long tessera_stat_gc_mismatch_cache_stale = 0; /* disk has the right pack: buffer cache was stale */
+static unsigned long tessera_stat_gc_mismatch_disk_stale  = 0; /* disk ALSO has the old pack: registry start is wrong */
+static unsigned long tessera_stat_gc_mismatch_other       = 0; /* registry delete failed at apply; the extent free that follows is then a free of space we may not own */
 /* ★ #102: pinscans that stopped enumerating retained snapshots for a reason
  * OTHER than reaching the last one. Each such truncation used to install a
  * bitmap asserting the unreached snapshots were unreferenced, which freed
@@ -2863,6 +2895,33 @@ static unsigned long tessera_stat_gc_pack_prefix_fallback = 0;
  * wedging the machine; non-zero names a caller that flushes under its own
  * bracket and must be fixed. */
 static unsigned long tessera_stat_flush_self_wait = 0;
+/* Pass-1 (liveness walk) fetch census by manifest kind, indexed by
+ * tessera_manifest_kind_t. The bytes column is the cost; INLINE bytes are the
+ * file bodies the walk reads and throws away. */
+static unsigned long tessera_stat_gc_walk_kind[16];
+static unsigned long tessera_stat_gc_walk_kind_bytes[16];
+/* Pass-1 leaf skip: inodes flagged MFT_LEAF are pushed live without fetching
+ * their manifest. trust=0 fetches anyway (the pre-flag walk) — and VERIFIES,
+ * counting every flagged inode whose manifest is not INLINE/SYMLINK. A lie
+ * here is a stale flag, which under trust=1 could free a dedup'd chunk. */
+static int tessera_gc_walk_trust_leaf = 1;
+static int tessera_gc_trace = 0;   /* DEBUG: printf publish/begin/free events */
+static unsigned long tessera_stat_gc_walk_leaf_skips = 0;
+static unsigned long tessera_stat_gc_walk_leaf_lies  = 0;
+
+/* THE ONE WAY to point an inode record at a manifest. Sets or clears
+ * TESSERA_INODE_FLAG_MFT_LEAF from the manifest kind, so the flag can never
+ * go stale relative to the hash beside it. Do not memcpy into manifest_hash. */
+static __inline void
+tessera_fs_ino_set_mft(tessera_inode_record_t *r, const tessera_hash_t h,
+    tessera_manifest_kind_t k)
+{
+	memcpy(r->manifest_hash, h, TESSERA_HASH_SIZE);
+	if (k == TESSERA_MFT_INLINE || k == TESSERA_MFT_SYMLINK)
+		r->flags |= TESSERA_INODE_FLAG_MFT_LEAF;
+	else
+		r->flags &= ~TESSERA_INODE_FLAG_MFT_LEAF;
+}
 static int tessera_fault_commit_fail = 0;   /* #135 TEST: force commit_sb to fail */
 /*
  * ★ #135 operator clear — the analogue of `zpool clear`.
@@ -14475,6 +14534,41 @@ tessera_fs_pinscan_run(struct tessera_mount *tmp_)
 	 * implicitly pinned by the drain filter — covers both the scan
 	 * window [bump0, bump1) and all future allocations until the next
 	 * swap. No explicit bit-setting needed. */
+	/*
+	 * ★ The frozen GC roots this bitmap pinned are the ones that were
+	 * active when the walk STARTED (r_gc_*, zero if no scan was active).
+	 * If a scan is active NOW with different roots, it froze after our
+	 * snapshot — and if a commit landed in between, the frozen root's
+	 * exclusive blocks were walked by nobody: not by us (we walked the
+	 * older root) and not pinned as GC roots. Swapping this bitmap in
+	 * would release them the moment they are COW'd away, the allocator
+	 * reuses them, and the GC walk reads overwritten nodes: ECORRUPT if
+	 * garbage, SILENT RECORD LOSS if the new contents parse. Measured
+	 * 2026-09-06 (scratch, continuous passes vs inline->chunked
+	 * rewrites): the walk aborted once with status=-14 at cursor_next in
+	 * the snapshot phase, and the passes that did not abort freed the
+	 * grown files' chunk packs — 3/3, independent of the leaf skip.
+	 *
+	 * Same rule as the ECORRUPT abort: a walk that did not cover
+	 * everything it must pin never reaches the swap. Drop it; the next
+	 * pinscan starts with the active roots in hand.
+	 */
+	if (tmp_->gc_scan_active &&
+	    (tmp_->gc_scan_inode_root     != r_gc_inode ||
+	     tmp_->gc_scan_registry_root  != r_gc_reg   ||
+	     tmp_->gc_scan_snapshots_root != r_gc_snap)) {
+		tessera_stat_pinscan_gc_roots_moved++;
+		tmp_->pinscan_active = 0;
+		tmp_->meta_scanwin_count = 0;
+		tessera_fs_flush_gate_exit(tmp_);
+		free(scratch, M_TESSERA);
+		if (complete != NULL) free(complete, M_TESSERA);
+		printf("tessera_fs: pinscan discarded — a GC scan froze roots "
+		    "after this walk started (walked inode root %ju, active "
+		    "%ju); its blocks are not in this bitmap\n",
+		    (uintmax_t)r_gc_inode, (uintmax_t)tmp_->gc_scan_inode_root);
+		return;
+	}
 	tmp_->meta_pin_watermark = bump0;
 	tessera_stat_pinscan_swaps++;
 	/* CRITICAL: sectors currently in meta_pending are unreachable
@@ -15932,6 +16026,10 @@ tessera_fs_gc_scan_begin(struct tessera_mount *tmp_, struct tessera_gc_scan *s)
 		s->nseeds         = scount;
 		memset(tmp_->gc_touch_bm, 0, TESSERA_GC_TOUCH_BITS / 8);
 		tmp_->gc_scan_active = 1;
+		if (tessera_gc_trace)
+			printf("GC-TRACE begin mnt=%s pass=%lu inode_root=%ju reg_root=%ju seeds=%u\n",
+			    (tmp_->devvp && tmp_->devvp->v_rdev ? devtoname(tmp_->devvp->v_rdev) : "?"), tessera_stat_gc_scans + 1, (uintmax_t)s->inode_root,
+			    (uintmax_t)s->registry_root, s->nseeds);
 		mtx_unlock(&tmp_->flush_mtx);
 		return (0);
 	}
@@ -15990,6 +16088,7 @@ tessera_fs_gc_scan_end(struct tessera_mount *tmp_, struct tessera_gc_scan *s)
  */
 static int
 tessera_fs_gc_pack_index_hashes(struct tessera_mount *tmp_,
+    const uint8_t expect_pack_id[16],
     const tessera_pack_extent_t *exts, uint32_t nexts,
     uint64_t length_sectors, tessera_hash_t **out_bh, uint32_t *out_n)
 {
@@ -16045,6 +16144,50 @@ tessera_fs_gc_pack_index_hashes(struct tessera_mount *tmp_,
 		if (phase == 0) {
 			if (tessera_decode_pack_header(buf, ph) != TESSERA_OK)
 				goto out;
+			/* The bytes at these sectors must be THIS pack. A header
+			 * naming another pack_id is a stale buffer or a recycled
+			 * range read before the new occupant's write became
+			 * visible — enumerating its index would test the WRONG
+			 * hashes against the live set and free a live pack. */
+			if (memcmp(ph->pack_id, expect_pack_id, 16) != 0) {
+				tessera_stat_gc_pack_id_mismatch++;
+				/* DIAG: is the DISK stale or the BUFFER CACHE?
+				 * Re-read sector 0 bypassing the cache. */
+				if (tmp_->bio_ctx.cp != NULL) {
+					uint8_t *raw = g_read_data(tmp_->bio_ctx.cp,
+					    (off_t)exts[0].start_sector *
+					        TESSERA_SECTOR_SIZE,
+					    TESSERA_SECTOR_SIZE, NULL);
+					if (raw != NULL) {
+						if (memcmp(raw + 16, expect_pack_id,
+						    16) == 0) {
+							tessera_stat_gc_mismatch_cache_stale++;
+							/* IDENTITY probe: what buffer did
+							 * bread() hand us? */
+							if (tessera_gc_trace) {
+								struct buf *pb = getblk(tmp_->devvp,
+								    exts[0].start_sector *
+								        btodb(TESSERA_SECTOR_SIZE),
+								    TESSERA_SECTOR_SIZE, 0, 0, GB_NOCREAT);
+								printf("GC-TRACE STALE sector=%ju buf=%p bcount=%ld lblkno=%jd flags=%b vflags=%b\n",
+								    (uintmax_t)exts[0].start_sector, pb,
+								    pb ? (long)pb->b_bcount : -1L,
+								    pb ? (intmax_t)pb->b_lblkno : -1,
+								    pb ? pb->b_flags : 0, PRINT_BUF_FLAGS,
+								    pb ? pb->b_vflags : 0, PRINT_BUF_VFLAGS);
+								if (pb) brelse(pb);
+							}
+						}
+						else if (memcmp(raw + 16, ph->pack_id,
+						    16) == 0)
+							tessera_stat_gc_mismatch_disk_stale++;
+						else
+							tessera_stat_gc_mismatch_other++;
+						g_free(raw);
+					}
+				}
+				goto out;
+			}
 			/* Geometry, as subtraction against known-good bounds.
 			 * length_sectors >= 1 (checked). The index occupies
 			 * index_blocks sectors starting at sector 1, and must
@@ -16254,8 +16397,19 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 		tessera_hash_t _stack[64];                                \
 		int _sp = 0;                                              \
 		if (!tessera_hash_is_null(_ino.manifest_hash)) {          \
-			memcpy(_stack[_sp++], _ino.manifest_hash,         \
-			    TESSERA_HASH_SIZE);                           \
+			if (tessera_gc_walk_trust_leaf &&                 \
+			    (_ino.flags & TESSERA_INODE_FLAG_MFT_LEAF)) { \
+				/* Leaf: live, and nothing beneath it to  \
+				 * walk. Push without fetching. */        \
+				tessera_hash_t _lh;                       \
+				memcpy(_lh, _ino.manifest_hash,           \
+				    TESSERA_HASH_SIZE);                   \
+				_GC_PUSH_HASH(_lh);                       \
+				tessera_stat_gc_walk_leaf_skips++;        \
+			} else {                                          \
+				memcpy(_stack[_sp++], _ino.manifest_hash, \
+				    TESSERA_HASH_SIZE);                   \
+			}                                                 \
 		}                                                         \
 		if (!tessera_hash_is_null(_ino.xattr_hash)) {             \
 			memcpy(_stack[_sp++], _ino.xattr_hash,            \
@@ -16322,6 +16476,22 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 			    tessera_manifest_parser_kind(_p);             \
 			uint32_t _cnt =                                   \
 			    tessera_manifest_parser_count(_p);            \
+			/* Pass-1 cost decomposition: what the walk       \
+			 * fetched, by kind and bytes. An INLINE manifest \
+			 * carries the file body and has NO child hashes, \
+			 * so every byte of it is read for nothing.       \
+			 * Measured 2026-09-06: ~3 GiB per pass. */       \
+			if ((_ino.flags & TESSERA_INODE_FLAG_MFT_LEAF) && \
+			    _k2 != TESSERA_MFT_INLINE &&                  \
+			    _k2 != TESSERA_MFT_SYMLINK &&                 \
+			    memcmp(_h, _ino.manifest_hash,                \
+			        TESSERA_HASH_SIZE) == 0)                  \
+				tessera_stat_gc_walk_leaf_lies++;         \
+			if (_k2 < 16) {                                   \
+				tessera_stat_gc_walk_kind[_k2]++;         \
+				tessera_stat_gc_walk_kind_bytes[_k2] +=   \
+				    _blen;                                \
+			}                                                 \
 			if (_k2 == TESSERA_MFT_CHUNK_LIST) {              \
 				for (uint32_t _i = 0; _i < _cnt; _i++) {  \
 					tessera_chunk_record_t _cr;       \
@@ -17086,7 +17256,7 @@ snap_next:
 				tessera_hash_t *pbh = NULL;
 				uint32_t pn = 0;
 				if (tessera_fs_gc_pack_index_hashes(tmp_,
-				    exts, nexts, re.length_sectors,
+				    re.pack_id, exts, nexts, re.length_sectors,
 				    &pbh, &pn) == 0) {
 					free(exts, M_TESSERA);
 					nbh = pn;
@@ -17138,6 +17308,12 @@ snap_next:
 			if (!ok) { free(packbuf, M_TESSERA); goto next_p; }
 			tessera_pack_reader_t *pr = tessera_pack_open(packbuf,
 			    pack_len);
+			if (pr != NULL &&
+			    memcmp(tessera_pack_pack_id(pr), re.pack_id, 16) != 0) {
+				tessera_stat_gc_pack_id_mismatch++;
+				tessera_pack_close(pr);
+				pr = NULL;
+			}
 			if (pr != NULL) {
 				nbh = tessera_pack_blob_count(pr);
 				/* A pack is dead iff EVERY blob it holds is absent
@@ -17354,12 +17530,27 @@ next_p:
 		atomic_add_rel_64(&tmp_->pack_reloc_gen, 1);
 	uint64_t new_pack_root = tmp_->sb.pack_registry_root;
 	for (uint32_t i = 0; i < dead_count; i++) {
+		if (tessera_gc_trace)
+			printf("GC-TRACE free mnt=%s pass=%lu pack=%8D bh0=%8D nbh=%u\n",
+			    (tmp_->devvp && tmp_->devvp->v_rdev ? devtoname(tmp_->devvp->v_rdev) : "?"), tessera_stat_gc_scans, deads[i].pack_id, "",
+			    deads[i].bh, "", deads[i].nbh);
 		if (tessera_btree_delete(tmp_->pack_registry_tree,
 		    deads[i].pack_id, &new_pack_root) == TESSERA_OK) {
 			tmp_->sb.pack_registry_root = new_pack_root;
 			tessera_cas_invalidate_pack(&tmp_->cas_cache,
 			    deads[i].pack_id);
+		} else {
+			tessera_stat_gc_apply_delete_failed++;
+			if (tessera_gc_trace)
+				printf("GC-TRACE DELETE-FAILED pass=%lu pack=%8D start=%ju len=%ju\n",
+				    tessera_stat_gc_scans, deads[i].pack_id, "",
+				    (uintmax_t)deads[i].start, (uintmax_t)deads[i].len);
 		}
+		if (tessera_gc_trace)
+			printf("GC-TRACE extfree mnt=%s pass=%lu start=%ju len=%ju multi=%d\n",
+			    (tmp_->devvp && tmp_->devvp->v_rdev ? devtoname(tmp_->devvp->v_rdev) : "?"),
+			    tessera_stat_gc_scans, (uintmax_t)deads[i].start, (uintmax_t)deads[i].len,
+			    (deads[i].flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) != 0);
 		if ((deads[i].flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT) == 0) {
 			(void)tessera_extent_free(tmp_->extent_alloc,
 			    deads[i].start, deads[i].len);
@@ -18080,6 +18271,11 @@ tessera_fs_pack_alloc_and_write_impl(struct tessera_mount *tmp_,
 			}
 		}
 		out->start_sector   = contig_start;
+		if (tessera_gc_trace)
+			printf("GC-TRACE alloc mnt=%s pass=%lu start=%ju len=%ju pack=%8D scan_active=%d\n",
+			    (tmp_->devvp && tmp_->devvp->v_rdev ? devtoname(tmp_->devvp->v_rdev) : "?"),
+			    tessera_stat_gc_scans, (uintmax_t)contig_start, (uintmax_t)n_sectors,
+			    pack_bytes + 16, "", atomic_load_int((volatile int *)&tmp_->gc_scan_active));
 		out->length_sectors = n_sectors;
 		out->flags          = TESSERA_REGISTRY_FLAG_SEALED;
 		return (0);
@@ -19472,6 +19668,12 @@ tessera_fs_publish_chunked(struct tessera_mount *tmp_,
 	tessera_fs_gc_note_hash(tmp_, out_manifest_hash);
 	for (uint32_t _ci = 0; _ci < n_chunks; _ci++)
 		tessera_fs_gc_note_hash(tmp_, chunks[_ci].hash);
+	if (tessera_gc_trace)
+		printf("GC-TRACE publish ino=%u mft=%8D chunks=%u chunk0=%8D scan_active=%d pass=%lu\n",
+		    owner_inode_no, out_manifest_hash, "", n_chunks,
+		    n_chunks ? chunks[0].hash : out_manifest_hash, "",
+		    atomic_load_int((volatile int *)&tmp_->gc_scan_active),
+		    tessera_stat_gc_scans);
 
 	uint8_t pack_id[16];
 	memcpy(pack_id, out_manifest_hash, 16);
@@ -20932,7 +21134,7 @@ tessera_fs_replace_content_chunk_tree(struct tessera_mount *tmp_,
 	tessera_inode_record_t ino;
 	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
 		return (EIO);
-	memcpy(ino.manifest_hash, ohash, sizeof ohash);
+	tessera_fs_ino_set_mft(&ino, ohash, TESSERA_MFT_CHUNK_LIST);
 	ino.size = new_len;
 	ino.gen++;
 	struct timeval tv;
@@ -21674,7 +21876,7 @@ tessera_fs_replace_range_tree(struct tessera_mount *tmp_, uint32_t inode_no,
 	tessera_inode_record_t ino;
 	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
 		return (EIO);
-	memcpy(ino.manifest_hash, ohash, sizeof ohash);
+	tessera_fs_ino_set_mft(&ino, ohash, TESSERA_MFT_CHUNK_LIST);
 	ino.gen++;
 	struct timeval tv;
 	getmicrotime(&tv);
@@ -21729,7 +21931,7 @@ tessera_fs_chunked_apply(struct tessera_mount *tmp_, uint32_t inode_no,
 	tessera_inode_record_t ino;
 	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
 		return (EIO);
-	memcpy(ino.manifest_hash, pub_hash, sizeof pub_hash);
+	tessera_fs_ino_set_mft(&ino, pub_hash, TESSERA_MFT_CHUNK_LIST);
 	ino.size = new_len;
 	ino.gen++;
 	struct timeval tv;
@@ -22120,7 +22322,7 @@ tessera_fs_append_apply(struct tessera_mount *tmp_, uint32_t inode_no,
 	tessera_inode_record_t ino;
 	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
 		return (EIO);
-	memcpy(ino.manifest_hash, pub_hash, sizeof pub_hash);
+	tessera_fs_ino_set_mft(&ino, pub_hash, TESSERA_MFT_CHUNK_LIST);
 	ino.size = pp->new_size;
 	ino.gen++;
 	struct timeval tv;
@@ -22263,7 +22465,7 @@ tessera_fs_wrap_list_as_tree(struct tessera_mount *tmp_, uint32_t inode_no)
 	 * inode at the tree. Size unchanged — this is a representation swap. */
 	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
 		return (EIO);
-	memcpy(ino.manifest_hash, ohash, sizeof ohash);
+	tessera_fs_ino_set_mft(&ino, ohash, TESSERA_MFT_CHUNK_TREE);
 	ino.gen++;
 	uint64_t new_inode_root = tmp_->sb.inode_root;
 	if (tessera_fs_inode_put_byk(tmp_, key, &ino, &new_inode_root)
@@ -22660,7 +22862,7 @@ et_enomem:
 	tessera_inode_record_t ino;
 	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
 		return (EIO);
-	memcpy(ino.manifest_hash, ohash, sizeof ohash);
+	tessera_fs_ino_set_mft(&ino, ohash, TESSERA_MFT_CHUNK_LIST);
 	ino.size = new_size;
 	ino.gen++;
 	struct timeval tv;
@@ -23007,7 +23209,7 @@ tessera_fs_replace_content_apply(struct tessera_mount *tmp_,
 		    inode_no);
 		return (EIO);
 	}
-	memcpy(ino.manifest_hash, pub_hash, sizeof pub_hash);
+	tessera_fs_ino_set_mft(&ino, pub_hash, TESSERA_MFT_INLINE);
 	ino.size = new_len;
 	ino.gen++;
 	struct timeval tv;
@@ -23383,7 +23585,7 @@ tessera_fs_dirent_rewrite_2l(struct tessera_mount *tmp_,
 	}
 	free(obody, M_TESSERA);
 
-	memcpy(pino->manifest_hash, pub_hash, sizeof pub_hash);
+	tessera_fs_ino_set_mft(pino, pub_hash, TESSERA_MFT_DIRECTORY);
 	return (0);
 }
 
@@ -23966,7 +24168,7 @@ tessera_fs_dirent_log_checkpoint_parent(struct tessera_mount *tmp_,
 			goto out_free_col;
 		}
 		uint32_t eg = pino.gen;
-		memcpy(pino.manifest_hash, new_root, TESSERA_HASH_SIZE);
+		tessera_fs_ino_set_mft(&pino, new_root, TESSERA_MFT_DIRECTORY_BTREE);
 		pino.gen++;
 		{
 			struct timeval tv;
@@ -24314,6 +24516,58 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_pack_full_sectors, CTLFLAG_RD,
     &tessera_stat_gc_pack_full_sectors, 0,
     "#133: sectors read by the whole-pack pass-2 path (the control arm, and "
     "the fallback when the prefix path cannot decode)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_inline, CTLFLAG_RD,
+    &tessera_stat_gc_walk_kind[1], 0, "pass-1 manifests fetched: inline");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_inline_bytes, CTLFLAG_RD,
+    &tessera_stat_gc_walk_kind_bytes[1], 0, "pass-1 bytes fetched: inline");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_chunk_list, CTLFLAG_RD,
+    &tessera_stat_gc_walk_kind[2], 0, "pass-1 manifests fetched: chunk_list");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_chunk_list_bytes, CTLFLAG_RD,
+    &tessera_stat_gc_walk_kind_bytes[2], 0, "pass-1 bytes fetched: chunk_list");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_chunk_tree, CTLFLAG_RD,
+    &tessera_stat_gc_walk_kind[3], 0, "pass-1 manifests fetched: chunk_tree");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_chunk_tree_bytes, CTLFLAG_RD,
+    &tessera_stat_gc_walk_kind_bytes[3], 0, "pass-1 bytes fetched: chunk_tree");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_directory, CTLFLAG_RD,
+    &tessera_stat_gc_walk_kind[4], 0, "pass-1 manifests fetched: directory");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_directory_bytes, CTLFLAG_RD,
+    &tessera_stat_gc_walk_kind_bytes[4], 0, "pass-1 bytes fetched: directory");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_symlink, CTLFLAG_RD,
+    &tessera_stat_gc_walk_kind[5], 0, "pass-1 manifests fetched: symlink");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_symlink_bytes, CTLFLAG_RD,
+    &tessera_stat_gc_walk_kind_bytes[5], 0, "pass-1 bytes fetched: symlink");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_xattr_store, CTLFLAG_RD,
+    &tessera_stat_gc_walk_kind[6], 0, "pass-1 manifests fetched: xattr_store");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_xattr_store_bytes, CTLFLAG_RD,
+    &tessera_stat_gc_walk_kind_bytes[6], 0, "pass-1 bytes fetched: xattr_store");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_dir_btree, CTLFLAG_RD,
+    &tessera_stat_gc_walk_kind[9], 0, "pass-1 manifests fetched: dir_btree");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_dir_btree_bytes, CTLFLAG_RD,
+    &tessera_stat_gc_walk_kind_bytes[9], 0, "pass-1 bytes fetched: dir_btree");
+SYSCTL_INT(_kern_tessera, OID_AUTO, gc_walk_trust_leaf, CTLFLAG_RW,
+    &tessera_gc_walk_trust_leaf, 0,
+    "pass 1 skips fetching MFT_LEAF-flagged manifests (1). 0 = fetch anyway "
+    "AND verify the flag, counting lies in gc_walk_leaf_lies");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_leaf_skips, CTLFLAG_RD,
+    &tessera_stat_gc_walk_leaf_skips, 0, "pass-1 manifest fetches skipped via MFT_LEAF");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_leaf_lies, CTLFLAG_RD,
+    &tessera_stat_gc_walk_leaf_lies, 0,
+    "MFT_LEAF-flagged inodes whose manifest was NOT a leaf (verify mode). "
+    "Must be 0; non-zero is a stale flag = a writer bypassing ino_set_mft");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_gc_roots_moved, CTLFLAG_RD,
+    &tessera_stat_pinscan_gc_roots_moved, 0,
+    "pinscans discarded at swap because a GC scan froze roots after the walk "
+    "started; swapping would release frozen-tree blocks the walk never pinned");
+SYSCTL_INT(_kern_tessera, OID_AUTO, gc_trace, CTLFLAG_RW, &tessera_gc_trace, 0,
+    "DEBUG: log chunk publishes, scan begins and pack frees to the console");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_apply_delete_failed, CTLFLAG_RD,
+    &tessera_stat_gc_apply_delete_failed, 0, "GC apply: registry deletes that failed");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_pack_id_mismatch, CTLFLAG_RD,
+    &tessera_stat_gc_pack_id_mismatch, 0,
+    "GC pass 2: pack header pack_id != registry pack_id (stale/foreign read); pack kept");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_mismatch_cache_stale, CTLFLAG_RD, &tessera_stat_gc_mismatch_cache_stale, 0, "DIAG pack_id mismatch classification");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_mismatch_disk_stale, CTLFLAG_RD, &tessera_stat_gc_mismatch_disk_stale, 0, "DIAG pack_id mismatch classification");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_mismatch_other, CTLFLAG_RD, &tessera_stat_gc_mismatch_other, 0, "DIAG pack_id mismatch classification");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, flush_self_wait, CTLFLAG_RD,
     &tessera_stat_flush_self_wait, 0,
     "tessera_fs_flush() called by the thread already holding the flush gate "
@@ -24803,8 +25057,7 @@ tessera_fs_dirent_rewrite_impl(struct tessera_mount *tmp_,
 			    /*root_is_empty=*/!have_root, name, namelen,
 			    add_inode, new_root);
 			if (rc != 0) return (rc);
-			memcpy(pino.manifest_hash, new_root,
-			    TESSERA_HASH_SIZE);
+			tessera_fs_ino_set_mft(&pino, new_root, TESSERA_MFT_DIRECTORY_BTREE);
 			goto commit;
 		}
 		/* REMOVE */
@@ -24835,10 +25088,9 @@ tessera_fs_dirent_rewrite_impl(struct tessera_mount *tmp_,
 			    mlen, pub);
 			free(buf, M_TESSERA);
 			if (prc != 0) return (EIO);
-			memcpy(pino.manifest_hash, pub, TESSERA_HASH_SIZE);
+			tessera_fs_ino_set_mft(&pino, pub, TESSERA_MFT_DIRECTORY);
 		} else {
-			memcpy(pino.manifest_hash, new_root,
-			    TESSERA_HASH_SIZE);
+			tessera_fs_ino_set_mft(&pino, new_root, TESSERA_MFT_DIRECTORY_BTREE);
 		}
 		goto commit;
 	}
@@ -24900,7 +25152,7 @@ tessera_fs_dirent_rewrite_impl(struct tessera_mount *tmp_,
 	}
 	free(new_mft, M_TESSERA);
 
-	memcpy(pino.manifest_hash, pub_hash, sizeof pub_hash);
+	tessera_fs_ino_set_mft(&pino, pub_hash, TESSERA_MFT_DIRECTORY);
 
 commit:
 	pino.gen++;
@@ -25099,7 +25351,7 @@ tessera_vop_create_impl(struct vop_create_args *ap)
 			    &pino) == TESSERA_OK)
 				cino.quota_domain = pino.quota_domain;
 		}
-		memcpy(cino.manifest_hash, pub_hash, sizeof pub_hash);
+		tessera_fs_ino_set_mft(&cino, pub_hash, TESSERA_MFT_INLINE);
 
 		uint8_t ckey[4];
 		encode_inode_key(new_ino, ckey);
@@ -25579,7 +25831,7 @@ tessera_vop_mkdir(struct vop_mkdir_args *ap)
 		    == TESSERA_OK)
 			cino.quota_domain = pino.quota_domain;
 	}
-	memcpy(cino.manifest_hash, pub_hash, sizeof pub_hash);
+	tessera_fs_ino_set_mft(&cino, pub_hash, TESSERA_MFT_DIRECTORY);
 
 	uint8_t ckey[4];
 	encode_inode_key(new_ino, ckey);
@@ -25798,7 +26050,7 @@ tessera_vop_symlink(struct vop_symlink_args *ap)
 		    == TESSERA_OK)
 			cino.quota_domain = pino.quota_domain;
 	}
-	memcpy(cino.manifest_hash, pub_hash, sizeof pub_hash);
+	tessera_fs_ino_set_mft(&cino, pub_hash, TESSERA_MFT_SYMLINK);
 
 	uint8_t ckey[4];
 	encode_inode_key(new_ino, ckey);
@@ -26067,7 +26319,7 @@ tessera_fs_dirent_rename_same_dir_impl(struct tessera_mount *tmp_,
 	}
 	free(new_mft, M_TESSERA);
 
-	memcpy(pino.manifest_hash, pub_hash, sizeof pub_hash);
+	tessera_fs_ino_set_mft(&pino, pub_hash, TESSERA_MFT_DIRECTORY);
 	pino.gen++;
 	{
 		struct timeval tv;
@@ -27097,7 +27349,7 @@ tessera_vop_copy_file_range(struct vop_copy_file_range_args *ap)
 
 	/* The reflink: share the source's content manifest. xattrs are NOT
 	 * copied (copy_file_range covers data, not metadata). */
-	memcpy(dino.manifest_hash, sino.manifest_hash, TESSERA_HASH_SIZE);
+	memcpy(dino.manifest_hash, sino.manifest_hash, TESSERA_HASH_SIZE); dino.flags = (dino.flags & ~TESSERA_INODE_FLAG_MFT_LEAF) | (sino.flags & TESSERA_INODE_FLAG_MFT_LEAF);
 	dino.size = sino.size;
 	dino.gen++;
 	struct timeval tv;

@@ -604,6 +604,17 @@ typedef struct TESSERA_PACKED {
 #define TESSERA_INODE_FLAG_NODUMP      (1u << 2)
 #define TESSERA_INODE_FLAG_OPAQUE      (1u << 3)
 #define TESSERA_INODE_FLAG_SUBVOL_ROOT (1u << 4)
+/* manifest_hash names a LEAF manifest — one with no child hashes (INLINE,
+ * SYMLINK). The GC liveness walk can push the hash as live WITHOUT fetching
+ * it: an INLINE manifest carries the file body, and fetching 162k of them
+ * cost 2.5 GiB of the 3 GiB a pass read on the dev root (2026-09-06), all
+ * discarded. A STALE flag (set, but manifest_hash since repointed at a
+ * CHUNK_LIST) would make the walk skip that file's chunk hashes and could
+ * free a dedup'd chunk in another pack — so every writer of manifest_hash
+ * goes through tessera_fs_ino_set_mft(), fsck checks flag against kind, and
+ * the walk's verify mode fetches anyway and counts lies. Absent = unknown =
+ * fetch (every pre-existing record). */
+#define TESSERA_INODE_FLAG_MFT_LEAF    (1u << 5)
 
 /* ── B+tree node header (64 bytes) ─────────────────────────────────
  *

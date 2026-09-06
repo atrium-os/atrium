@@ -901,6 +901,25 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
                     fsck.problem(format!("inode {ino}: regular file size {size} but null manifest_hash"));
                 }
                 let label = format!("inode {ino}");
+                // MFT_LEAF (format.h bit 5): the kmod's GC walk trusts this
+                // flag to skip fetching the manifest, so a flag on a manifest
+                // that DOES carry child hashes (CHUNK_LIST/TREE, a directory)
+                // would let the walk miss those children and free a dedup'd
+                // chunk in another pack. `manifests` holds Some(bytes) exactly
+                // for descendable kinds and None for leaf kinds, so a flagged
+                // inode whose entry is Some(_) is a stale flag. Loud, not
+                // silently ignored: this is a data-loss precondition.
+                let flags = rd_u32(&val, 68);
+                const MFT_LEAF: u32 = 1 << 5;
+                if flags & MFT_LEAF != 0 && !is_null(&manifest) {
+                    if let Some(Some(_)) = fsck.manifests.get(&manifest) {
+                        fsck.problem(format!(
+                            "inode {ino}: MFT_LEAF flag set but manifest {} is a descendable kind \
+                             (stale flag — the GC walk would skip its children)",
+                            hx(&manifest)
+                        ));
+                    }
+                }
                 // An inode whose own manifest blob is gone can't be walked or
                 // read at all (the kmod fails lookups into it with EIO). Record
                 // it as repairable rather than merely reporting it dangling.

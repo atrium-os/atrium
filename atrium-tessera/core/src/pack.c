@@ -393,6 +393,12 @@ tessera_pack_blob_count(const tessera_pack_reader_t *r)
 	return r ? r->header.blob_count : 0;
 }
 
+const uint8_t *
+tessera_pack_pack_id(const tessera_pack_reader_t *r)
+{
+	return (r->header.pack_id);
+}
+
 int
 tessera_pack_bloom_might_contain(const tessera_pack_reader_t *r,
                                  const tessera_hash_t blob_hash)
