@@ -11,8 +11,24 @@
 #     byte-identical to the source;
 #   - fsck's single "problem" is one ORPHAN INODE (an unlink interrupted by
 #     the EIO); tessera-fsck --repair relinks it.
-# So: not data loss. Shape: a read racing a reclaim returns EIO instead of
-# retrying (pack_reloc_gen / cas_invalidate_pack family). Open.
+# So: not data loss.
+#
+# RESOLVED 2026-09-07. ktrace named it: nearly every failure was rmdir ->
+# ENOTEMPTY on a LEAF directory cascading upward, i.e. readdir had returned a
+# truncated listing with no error. Cause: UNGATED inode-tree reads racing a GC
+# commit. The pass COWs nodes, the pinscan swap recycles the old ones, and an
+# ungated tessera_btree_get lands in a valid-but-wrong node and reports ENOENT
+# for a live inode. #101's gated retry existed only in lookup and only fired
+# when ckpt_gen moved — a GC commit does not move it. Fixes:
+#   - tessera_fs_inode_get retries under the flush gate on ANY failure (one
+#     place: lookup, readdir, rmdir, unlink, getattr);
+#   - readdir: a failed/unparsable directory manifest is EIO, not silent EOF;
+#   - the registry-scan fallback waits out the GC apply window, as
+#     registry_get_stable already did;
+#   - (also) a fetch whose bytes hash to the requested blob is accepted even
+#     if pack_reloc_gen moved — correct, but fired once; not the cause.
+# After: inode_get_retry=6 fixed=6, lookup_eio=0, readdir_fetch_fail=0,
+# rm_errs 0/3, fsck clean (ktrace reps at 14/26/38 scans).
 S(){ sysctl -n kern.tessera.$1 2>/dev/null || echo 0; }
 DEV=/dev/vtbd2; M=/mnt/scratch
 diskinfo -v $DEV | grep -q "atrium-scratch" || { echo "REFUSING"; exit 2; }

@@ -1401,6 +1401,11 @@ static unsigned long tessera_stat_lookup_eio           = 0;
  * absorbed; lookup_eio rising means a failure survived the gated retry and
  * is genuinely an I/O error. */
 static unsigned long tessera_stat_lookup_eio_retry     = 0;
+/* gated lookup retries taken while ckpt_gen had NOT moved: the read raced a GC commit, not a dirent checkpoint */
+static unsigned long tessera_stat_lookup_retry_nockpt = 0;
+static unsigned long tessera_stat_inode_get_retry = 0;
+static unsigned long tessera_stat_inode_get_retry_fixed = 0;
+static unsigned long tessera_stat_readdir_fetch_fail = 0;
 /* ★ #100: EIO returned because a manifest could not be fetched / parsed.
  * Separated because they mean different things: UNFETCHABLE is a missing or
  * unreadable blob, WILL NOT PARSE is a blob that came back but is not a
@@ -7630,24 +7635,24 @@ lookup_restart:
 		 * authoritative — serialized against checkpoints. If it still
 		 * fails there, the EIO is real and gets reported.
 		 */
-		if (_lk_live && !_lk_gated && atomic_load_acq_64(
-		    __DEVOLATILE(uint64_t *, &tmp_->ckpt_gen)) != _lk_gen) {
+		if (_lk_live && !_lk_gated) { /* retry under the gate on ANY failure — a GC pass commits without moving ckpt_gen, and an ungated read can land in a recycled node (rm-vs-GC: ENOENT -6 on a live dir, 2026-09-07) */
 			tessera_stat_lookup_eio_retry++;
+			if (atomic_load_acq_64(__DEVOLATILE(uint64_t *, &tmp_->ckpt_gen)) == _lk_gen)
+				tessera_stat_lookup_retry_nockpt++;
 			_lk_gated = 1;
 			tessera_fs_flush_gate_enter(tmp_);
 			goto lookup_restart;
 		}
 		tessera_stat_lookup_eio++;
 		printf("tessera_fs: lookup: inode %u read failed (rc=%d) "
-		    "AFTER a gated retry — this one is real\n",
+		    "AFTER a gated retry — this one is real\n" /* now true: the retry always ran */,
 		    (unsigned)dn->inode_no, igrc);
 		{ if (_lk_gated) tessera_fs_flush_gate_exit(tmp_); return (EIO); }
 	}
 	if (tessera_hash_is_null(dino.manifest_hash)) {
 		/* Could be an empty dir — or a stale record read just as a
 		 * checkpoint published the first real manifest. */
-		if (_lk_live && !_lk_gated && atomic_load_acq_64(
-		    __DEVOLATILE(uint64_t *, &tmp_->ckpt_gen)) != _lk_gen) {
+		if (_lk_live && !_lk_gated) { /* retry under the gate on ANY failure — a GC pass commits without moving ckpt_gen, and an ungated read can land in a recycled node (rm-vs-GC: ENOENT -6 on a live dir, 2026-09-07) */
 			_lk_gated = 1;
 			tessera_fs_flush_gate_enter(tmp_);
 			goto lookup_restart;
@@ -7738,8 +7743,7 @@ lookup_restart:
 		 * entries log->manifest while we walked (see lookup_restart
 		 * comment) — the ungated result is untrustworthy exactly and
 		 * only in that window. */
-		if (_lk_live && !_lk_gated && atomic_load_acq_64(
-		    __DEVOLATILE(uint64_t *, &tmp_->ckpt_gen)) != _lk_gen) {
+		if (_lk_live && !_lk_gated) { /* retry under the gate on ANY failure — a GC pass commits without moving ckpt_gen, and an ungated read can land in a recycled node (rm-vs-GC: ENOENT -6 on a live dir, 2026-09-07) */
 			_lk_gated = 1;
 			tessera_fs_flush_gate_enter(tmp_);
 			goto lookup_restart;
@@ -7957,12 +7961,20 @@ tessera_vop_readdir(struct vop_readdir_args *ap)
 	uint8_t *blob = NULL;
 	uint32_t blob_len = 0;
 	if (tessera_fs_fetch_blob(tmp_, dino.manifest_hash, &blob, &blob_len)
-	    != 0)
+	    != 0) {
+		/* Silent EOF here truncated listings under a GC race; rm then
+		 * believed the directory empty and rmdir said ENOTEMPTY. A
+		 * fetch failure is an ERROR, not the end of the directory. */
+		tessera_stat_readdir_fetch_fail++;
+		err = EIO;
 		goto stop_walk;
+	}
 
 	tessera_manifest_parser_t *p = tessera_manifest_parse(blob, blob_len);
 	if (p == NULL) {
 		free(blob, M_TESSERA);
+		tessera_stat_readdir_fetch_fail++;
+		err = EIO;
 		goto stop_walk;
 	}
 	const tessera_manifest_kind_t rkind = tessera_manifest_parser_kind(p);
@@ -10214,7 +10226,33 @@ tessera_fs_inode_get(struct tessera_mount *tmp_, uint32_t inode_no,
 	uint8_t key[4];
 	encode_inode_key(inode_no, key);
 	rc = tessera_btree_get(tmp_->inode_tree, key, out);
-	if (rc != TESSERA_OK) return (rc);
+	if (rc != TESSERA_OK) {
+		/*
+		 * ★ Retry under the flush gate before believing a failure. This
+		 * read is UNGATED; a GC pass's commit COWs inode-tree nodes and
+		 * the pinscan swap can recycle the old ones under a reader still
+		 * descending them — the read then lands in a valid node that is
+		 * not the one it wanted and reports ENOENT for a live inode.
+		 * #101 added exactly this retry to lookup, keyed on ckpt_gen; a
+		 * GC commit does not move ckpt_gen, so rmdir/readdir/unlink kept
+		 * failing (rm-vs-GC, 2026-09-07). Under the gate no commit or
+		 * swap is in flight, so a failure here is real. Skipped when the
+		 * caller already holds the gate.
+		 */
+		if (tmp_->flush_mtx_init &&
+		    tmp_->flush_gate_owner != curthread) {
+			tessera_stat_inode_get_retry++;
+			tessera_fs_flush_gate_enter(tmp_);
+			int rc2 = tessera_btree_get(tmp_->inode_tree, key, out);
+			tessera_fs_flush_gate_exit(tmp_);
+			if (rc2 != TESSERA_OK)
+				return (rc2);
+			tessera_stat_inode_get_retry_fixed++;
+			rc = TESSERA_OK;
+		} else {
+			return (rc);
+		}
+	}
 
 	/* Overlay live size from dirty_content for the (rarer) case
 	 * where the inode wasn't in the dirty_inodes cache. */
@@ -15405,6 +15443,35 @@ tessera_fs_pack_fetch_ondemand(struct tessera_mount *tmp_,
  * instead of malloc'ing — only the whole-pack-cache path honours it; other
  * tiers still malloc (they're not the big-read hot path), and the caller
  * detects that by *out_buf != dst. */
+/*
+ * ★ Relocation check for a FETCHED blob. pack_reloc_gen moving during a
+ * fetch used to mean "discard and retry, EIO after 4" — the guard for repack
+ * relocating THIS pack mid-read. But every GC apply bumps the gen once, and
+ * with on-demand passes every ~50 ms a read that spans five bumps failed on
+ * bytes that were CORRECT: transient EIO inside `rm -rf` racing passes, then
+ * ENOTEMPTY chains and an orphan inode from the unlink it interrupted
+ * (scripts/vm-gc-rm-race.sh, 2026-09-07). The right test is the bytes, not
+ * the counter: a blob that hashes to the requested hash is that blob by
+ * definition, whatever else moved. Returns 1 to accept the fetch.
+ */
+static unsigned long tessera_stat_fetch_reloc_verified = 0;
+static unsigned long tessera_stat_fetch_reloc_mismatch = 0;
+static __inline int
+tessera_fs_fetch_reloc_ok(struct tessera_mount *tmp_, uint64_t reloc_gen0,
+    const uint8_t *buf, uint32_t len, const tessera_hash_t hash)
+{
+	if (atomic_load_acq_64(&tmp_->pack_reloc_gen) == reloc_gen0)
+		return (1);
+	tessera_hash_t h;
+	tessera_content_hash(tmp_->sb.hash_alg, buf, len, h);
+	if (memcmp(h, hash, TESSERA_HASH_SIZE) == 0) {
+		tessera_stat_fetch_reloc_verified++;
+		return (1);
+	}
+	tessera_stat_fetch_reloc_mismatch++;
+	return (0);
+}
+
 static int
 tessera_fs_fetch_blob_ex(struct tessera_mount *tmp_,
                       tessera_btree_t *reg_override,
@@ -15555,9 +15622,8 @@ retry_reloc:
 				    snap.pack_id, exts, nexts, total_sectors,
 				    hash, dst, dst_cap, &pcbuf, &pclen) == 0) {
 					if (need_free_exts) free(exts, M_TESSERA);
-					if (atomic_load_acq_64(
-					    &tmp_->pack_reloc_gen) !=
-					    reloc_gen0) {
+					if (!tessera_fs_fetch_reloc_ok(tmp_,
+					    reloc_gen0, pcbuf, pclen, hash)) {
 						/* Read overlapped a
 						 * relocation; the bytes may
 						 * be garbage AND fetch_cached
@@ -15589,8 +15655,8 @@ retry_reloc:
 			    nexts, total_sectors, hash, NULL, &obuf, &olen);
 			if (need_free_exts) free(exts, M_TESSERA);
 			if (frc == 0) {
-				if (atomic_load_acq_64(&tmp_->pack_reloc_gen)
-				    != reloc_gen0) {
+				if (!tessera_fs_fetch_reloc_ok(tmp_, reloc_gen0,
+				    obuf, olen, hash)) {
 					/* Overlapped a relocation — discard
 					 * before the byte-cache insert so
 					 * garbage never enters the cache. */
@@ -15654,8 +15720,8 @@ retry_reloc:
 					    &obuf, &olen);
 					free(exts, M_TESSERA);
 					if (frc == 0) {
-						if (atomic_load_acq_64(
-						    &tmp_->pack_reloc_gen) != reloc_gen0) {
+						if (!tessera_fs_fetch_reloc_ok(tmp_,
+						    reloc_gen0, obuf, olen, hash)) {
 							tessera_cas_invalidate_pack(
 							    &tmp_->cas_cache, pid);
 							free(obuf, M_TESSERA);
@@ -15678,6 +15744,17 @@ retry_reloc:
 
 cas_fast_miss:
 	;
+	/* A scan during the GC apply window walks a registry being rewritten
+	 * and comes back TRUNCATED, reported as EIO ("unknown") — a transient
+	 * failure of a LIVE blob's read. registry_get_stable waits the window
+	 * out; the scan fallback must too. */
+	while ((atomic_load_acq_64(&tmp_->gc_apply_gen) & 1) != 0) {
+		mtx_lock(&tmp_->flush_mtx);
+		while ((tmp_->gc_apply_gen & 1) != 0)
+			(void)msleep(__DEVOLATILE(void *, &tmp_->gc_apply_gen),
+			    &tmp_->flush_mtx, PRIBIO, "tessgca", hz);
+		mtx_unlock(&tmp_->flush_mtx);
+	}
 	tessera_btree_t *_reg = (reg_override != NULL &&
 	    tessera_gc_fetch_frozen_reg) ? reg_override
 	                                 : tmp_->pack_registry_tree;
@@ -15732,8 +15809,8 @@ cas_fast_miss:
 		    re.length_sectors, hash, key, &obuf, &olen);
 		free(exts, M_TESSERA);
 		if (frc == 0) {
-			if (atomic_load_acq_64(&tmp_->pack_reloc_gen)
-			    != reloc_gen0) {
+			if (!tessera_fs_fetch_reloc_ok(tmp_, reloc_gen0,
+			    obuf, olen, hash)) {
 				/* Overlapped a relocation — discard and
 				 * retry with a fresh registry walk. The
 				 * on-demand fetch warm-seeded loc-cache
@@ -24568,6 +24645,15 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_pack_id_mismatch, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_mismatch_cache_stale, CTLFLAG_RD, &tessera_stat_gc_mismatch_cache_stale, 0, "DIAG pack_id mismatch classification");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_mismatch_disk_stale, CTLFLAG_RD, &tessera_stat_gc_mismatch_disk_stale, 0, "DIAG pack_id mismatch classification");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_mismatch_other, CTLFLAG_RD, &tessera_stat_gc_mismatch_other, 0, "DIAG pack_id mismatch classification");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_reloc_verified, CTLFLAG_RD, &tessera_stat_fetch_reloc_verified, 0,
+    "fetches accepted after pack_reloc_gen moved because the bytes hashed to the requested blob");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_reloc_mismatch, CTLFLAG_RD, &tessera_stat_fetch_reloc_mismatch, 0,
+    "fetches discarded after pack_reloc_gen moved AND the bytes did not hash to the blob (a real relocation race)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_retry_nockpt, CTLFLAG_RD, &tessera_stat_lookup_retry_nockpt, 0,
+    "gated lookup retries taken with ckpt_gen unchanged (read raced a GC commit)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, inode_get_retry, CTLFLAG_RD, &tessera_stat_inode_get_retry, 0, "ungated inode reads that failed and were retried under the gate");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, inode_get_retry_fixed, CTLFLAG_RD, &tessera_stat_inode_get_retry_fixed, 0, "of those, satisfied by the gated retry (GC-commit race)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, readdir_fetch_fail, CTLFLAG_RD, &tessera_stat_readdir_fetch_fail, 0, "readdir: directory manifest fetch/parse failed -> EIO (was silent EOF)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, flush_self_wait, CTLFLAG_RD,
     &tessera_stat_flush_self_wait, 0,
     "tessera_fs_flush() called by the thread already holding the flush gate "
