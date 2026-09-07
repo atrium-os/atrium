@@ -2771,13 +2771,48 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, meta_free_lowat, CTLFLAG_RW,
  *
  * Capped at 1/8 of the reserve so small volumes are not crippled by the
  * absolute default.
+ *
+ * ★★ 2026-09-07 — THE PROMISE ABOVE WAS OVERSTATED, AND MEASURED FALSE.
+ * Demonstrated on a purpose-built band-limited volume (96 MiB, reserve 1536,
+ * band = reserve/8 = 192): `fsck --repair` applied ZERO actions
+ * ("free-tree rebuild skipped (extent_flush rc=-5) … metadata-reserve
+ * exhaustion"), and crash-safe `repack -y` refused, wanting 719 sectors MORE
+ * than existed. Only `--force` — the not-crash-safe path this band exists to
+ * avoid — could recover the volume.
+ *
+ * Why reserve/8 was wrong: it is a fraction of the WRONG QUANTITY. What
+ * recovery needs has nothing to do with how big the reserve is; it is set by
+ * what ONE BOUNDED REPAIR PASS costs. Since #96 that pass is capped at
+ * REPAIR_BUDGET (256) actions, and repair consumes ~0.65-0.8 sectors per
+ * problem (measured, [[project_tessera_repair_cost_model]]), so a pass needs
+ * ~205 sectors plus the free-extent tree rebuild that actually failed here.
+ * Hence a FLOOR in sectors, not a ratio: below it the band funds nothing.
+ *
+ * ★ AND THE SECOND HALF OF THE PROMISE IS DROPPED, because it is not
+ * achievable with any fixed band: STAGED REPACK needs the largest single live
+ * tree to fit (#82d bounded staging still moves whole trees), which scales
+ * with LIVE METADATA, not with the reserve. A band big enough to guarantee it
+ * would have to be as large as the metadata it protects. Repack already tells
+ * the operator the exact shortfall and to grow the reserve; that is the honest
+ * contract. The band guarantees a REPAIR PASS, not compaction.
  */
 static int tessera_meta_emergency_band = 8192;   /* sectors */
 SYSCTL_INT(_kern_tessera, OID_AUTO, meta_emergency_band, CTLFLAG_RW,
     &tessera_meta_emergency_band, 0,
     "sectors at the top of the meta-reserve the live FS may never bump into, "
-    "kept so offline fsck --repair and staged repack always have room "
-    "(0 = disable; capped at 1/8 of the reserve)");
+    "kept so offline fsck --repair always has room "
+    "(0 = disable; capped at 1/8 of the reserve, but never below "
+    "meta_band_floor)");
+/*
+ * Sectors one bounded `fsck --repair` pass needs: REPAIR_BUDGET (256) actions
+ * at ~0.8 sectors each, plus headroom for the free-extent tree it rebuilds.
+ * The band is never smaller than this — that is the whole point of it.
+ */
+static int tessera_meta_band_floor = 384;        /* sectors */
+SYSCTL_INT(_kern_tessera, OID_AUTO, meta_band_floor, CTLFLAG_RW,
+    &tessera_meta_band_floor, 0,
+    "minimum emergency band in sectors — what one bounded fsck --repair pass "
+    "costs; the band is raised to this even when reserve/8 is smaller");
 static unsigned long tessera_stat_meta_band_refusals = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, meta_band_refusals, CTLFLAG_RD,
     &tessera_stat_meta_band_refusals, 0,
@@ -4861,13 +4896,32 @@ static uint64_t
 tessera_meta_soft_length(const struct tessera_mount *tmp_)
 {
 	uint64_t len = tmp_->sb.meta_reserve_length;
-	uint64_t band;
+	uint64_t band, cap;
 
 	if (tessera_meta_emergency_band <= 0)
 		return (len);
 	band = (uint64_t)tessera_meta_emergency_band;
 	if (band > len / 8)
 		band = len / 8;          /* never starve a small volume */
+	/*
+	 * ★ FLOOR (see the meta_emergency_band comment): reserve/8 is a
+	 * fraction of the wrong quantity. What recovery needs is set by one
+	 * bounded repair pass, in SECTORS, so raise the band to that floor —
+	 * on a small volume reserve/8 lands below it and funds nothing.
+	 */
+	if (tessera_meta_band_floor > 0 &&
+	    band < (uint64_t)tessera_meta_band_floor)
+		band = (uint64_t)tessera_meta_band_floor;
+	/*
+	 * ★ ...but never hand so much of the reserve to the band that the live
+	 * FS cannot use the volume: that trades a recovery guarantee for
+	 * permanent premature ENOSPC. If this cap binds, the reserve is simply
+	 * too small to guarantee repair, and the mount says so out loud rather
+	 * than pretending (see the mount-time check).
+	 */
+	cap = len / 3;
+	if (band > cap)
+		band = cap;
 	return (len > band ? len - band : len);
 }
 
@@ -6266,6 +6320,30 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	printf("tessera_fs: mounted gen=%lu, %lu sectors\n",
 	    (unsigned long)tmp_->sb.generation,
 	    (unsigned long)tmp_->sb.total_sectors);
+	/*
+	 * ★ Say so when the reserve is too small to guarantee an offline repair
+	 * pass. The old code silently promised a guarantee it could not keep on
+	 * small volumes (band = reserve/8 = 192 funded ZERO repair actions on a
+	 * 96 MiB fixture). The band is capped at reserve/3 so it cannot starve
+	 * the live FS, so on a small enough reserve the floor is unreachable —
+	 * that is a property of the volume, and the operator should hear it at
+	 * mount rather than discover it while trying to recover.
+	 */
+	if (tessera_meta_emergency_band > 0 && tessera_meta_band_floor > 0) {
+		uint64_t _rl = tmp_->sb.meta_reserve_length;
+		uint64_t _bd = _rl - tessera_meta_soft_length(tmp_);
+		if (_bd < (uint64_t)tessera_meta_band_floor)
+			printf("tessera_fs: WARNING — meta reserve %ju sectors "
+			    "is too small to guarantee offline repair: the "
+			    "emergency band is %ju, below the %d sectors one "
+			    "bounded `fsck --repair` pass needs (capped at a "
+			    "third of the reserve so the live FS still fits). "
+			    "Recovery on this volume may require the "
+			    "NOT-crash-safe `tessera-repack --force`. Grow the "
+			    "meta reserve (mkfs) to fix this properly.\n",
+			    (uintmax_t)_rl, (uintmax_t)_bd,
+			    tessera_meta_band_floor);
+	}
 	return (0);
 
 fail_close:
