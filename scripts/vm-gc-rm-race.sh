@@ -29,6 +29,16 @@
 #     if pack_reloc_gen moved — correct, but fired once; not the cause.
 # After: inode_get_retry=6 fixed=6, lookup_eio=0, readdir_fetch_fail=0,
 # rm_errs 0/3, fsck clean (ktrace reps at 14/26/38 scans).
+#
+# READER EPOCH (67c89b2d): the recycled-node hazard itself is removed — every
+# descent registers, the pinscan swap drains before unpinning. 6 reps: clean,
+# meta_rd_drains=152 (= swaps), drain_waits=7, max 11 ms, abandoned 0.
+# Residual, classified (654207ff): inode_get_retry 2 in 3 reps, ALL ENOENT,
+# ALL with a flush in progress, 0 ECORRUPT. Not node reuse; a transient in the
+# flush's publication that the gated retry absorbs. Drain keeps entries visible
+# through the batch put; the batch assigns t->root after every node is
+# written. Next step if chased: trace the failing descent's root sector vs the
+# retry's.
 S(){ sysctl -n kern.tessera.$1 2>/dev/null || echo 0; }
 DEV=/dev/vtbd2; M=/mnt/scratch
 diskinfo -v $DEV | grep -q "atrium-scratch" || { echo "REFUSING"; exit 2; }
