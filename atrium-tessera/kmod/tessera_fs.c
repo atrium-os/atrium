@@ -23250,6 +23250,24 @@ tessera_vop_remove(struct vop_remove_args *ap)
 		if (serr != 0) return (serr);
 	}
 
+	/* ★ unlink crash-atomicity (found by the first rm-under-powercut soak,
+	 * 2026-09-07). The DIR_REMOVE (dirent-log append) and the inode
+	 * tombstone are two independent in-memory writes; tessera_fs_flush
+	 * runs dirent_log_checkpoint_all BEFORE it drains inode tombstones,
+	 * both under the flush gate. If these two writes straddle that
+	 * boundary — DIR_REMOVE appended after the checkpoint phase, tombstone
+	 * caught by the drain — the flush commits the inode removal while the
+	 * dirent removal waits for the next checkpoint. A power cut in between
+	 * leaves the durable inode-tree ahead of the parent manifest: a
+	 * DANGLING DIRENT (deleted name -> inode not in tree). The mirror
+	 * ordering leaves an ORPHAN inode (the transient the rm-race harness
+	 * saw). Perform BOTH writes under the gate so the op is wholly inside
+	 * one flush or wholly in the next — the flush holds the gate across
+	 * checkpoint AND drain, so it cannot interleave. The gate is
+	 * re-entrant, so dirent_rewrite's own slow-path gate nests cleanly. */
+	int _rm_gated = tmp_->flush_mtx_init;
+	if (_rm_gated) tessera_fs_flush_gate_enter(tmp_);
+
 	/* dirent_rewrite handles flat DIRECTORY and DIRECTORY_2L parents
 	 * uniformly via dir_walk + auto-promoting publish_directory. */
 	int err = tessera_fs_dirent_rewrite(tmp_,
@@ -23257,7 +23275,10 @@ tessera_vop_remove(struct vop_remove_args *ap)
 	    /*op=REMOVE*/ 1, /*verify*/ cn->inode_no,
 	    /*add_inode*/ 0,
 	    cnp->cn_nameptr, cnp->cn_namelen);
-	if (err != 0) return (err);
+	if (err != 0) {
+		if (_rm_gated) tessera_fs_flush_gate_exit(tmp_);
+		return (err);
+	}
 
 	/* Drop a link on the child. tessera_fs_inode_unlink decrements
 	 * nlink; at the last link it KEEPS the record with nlink=0 (the
@@ -23265,6 +23286,7 @@ tessera_vop_remove(struct vop_remove_args *ap)
 	 * deletes the inode at last close. */
 	(void)tessera_fs_inode_unlink(tmp_, (uint32_t)cn->inode_no);
 	cn->unlinked = 1;
+	if (_rm_gated) tessera_fs_flush_gate_exit(tmp_);
 
 	/* Invalidate any namecache entries for the removed name. cache_purge
 	 * drops every (parent,name)->vp mapping for vp — over-purges other
@@ -26259,11 +26281,22 @@ tessera_vop_rmdir(struct vop_rmdir_args *ap)
 		free(cblob, M_TESSERA);
 	}
 
+	/* ★ unlink crash-atomicity (see vop_remove): the deferred DIR_REMOVE
+	 * and the child-inode removal must land in one flush. rmdir is more
+	 * directly exposed — inode_delete_byk mutates sb.inode_root in place,
+	 * so a flush's commit_sb can capture the new inode_root while the
+	 * DIR_REMOVE still sits un-checkpointed in the dirent log. Gate both. */
+	int _rd_gated = tmp_->flush_mtx_init;
+	if (_rd_gated) tessera_fs_flush_gate_enter(tmp_);
+
 	/* Remove dirent from parent. */
 	int err = tessera_fs_dirent_rewrite(tmp_, (uint32_t)dn->inode_no,
 	    /*op*/ 1, /*verify*/ cn->inode_no, /*add*/ 0,
 	    cnp->cn_nameptr, cnp->cn_namelen);
-	if (err != 0) return (err);
+	if (err != 0) {
+		if (_rd_gated) tessera_fs_flush_gate_exit(tmp_);
+		return (err);
+	}
 
 	/* Delete child inode record. */
 	uint64_t new_inode_root = tmp_->sb.inode_root;
@@ -26273,6 +26306,7 @@ tessera_vop_rmdir(struct vop_rmdir_args *ap)
 		    "inode=%u failed\n", (unsigned)cn->inode_no);
 	else
 		tmp_->sb.inode_root = new_inode_root;
+	if (_rd_gated) tessera_fs_flush_gate_exit(tmp_);
 
 	/* Invalidate namecache entries for the removed directory. */
 	cache_purge(vp);
