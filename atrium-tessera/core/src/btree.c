@@ -346,6 +346,15 @@ tessera_btree_set_quiet_kind_mismatch(tessera_btree_t *t, int quiet)
 		t->quiet_kind_mismatch = quiet ? 1 : 0;
 }
 
+/* The one place a root is published; fires the optional platform hook. */
+static void
+set_root(tessera_btree_t *t, uint64_t r)
+{
+	t->root = r;
+	if (t->io.root_published != NULL)
+		t->io.root_published(t->io.ctx, r);
+}
+
 tessera_btree_t *
 tessera_btree_open(const tessera_block_io_t *io, uint64_t root_sector,
                    uint8_t tree_kind, uint32_t key_size, uint32_t value_size)
@@ -353,7 +362,7 @@ tessera_btree_open(const tessera_block_io_t *io, uint64_t root_sector,
 	if (io == NULL) return NULL;
 	tessera_btree_t *t = make_handle(io, tree_kind, key_size, value_size);
 	if (t == NULL) return NULL;
-	t->root = root_sector;
+	set_root(t, root_sector);
 	return t;
 }
 
@@ -377,7 +386,7 @@ tessera_btree_create(const tessera_block_io_t *io, uint8_t tree_kind,
 		goto fail;
 	}
 	tessera_free(block);
-	t->root = s;
+	set_root(t, s);
 	*out_root_sector = s;
 	return t;
 fail:
@@ -411,7 +420,8 @@ rd_exit(tessera_btree_t *t, int active, uint64_t tok)
 }
 
 static int
-tessera_btree_get_impl(tessera_btree_t *t, const void *key, void *out_value)
+tessera_btree_get_impl(tessera_btree_t *t, const void *key, void *out_value,
+    tessera_btree_trace_t *tr)
 {
 	if (t == NULL || key == NULL || out_value == NULL)
 		return TESSERA_EINVAL;
@@ -429,12 +439,15 @@ tessera_btree_get_impl(tessera_btree_t *t, const void *key, void *out_value)
 	if (block == NULL) return TESSERA_ENOMEM;
 	int _rc = TESSERA_ECORRUPT;         /* depth exceeded, unless set */
 	uint64_t cur = t->root;
+	if (tr) { tr->depth = 0; tr->leaf_entries = 0; }
 	for (uint32_t depth = 0; depth < MAX_DEPTH; depth++) {
+		if (tr && depth < 16) { tr->path[depth] = cur; tr->depth = depth + 1; }
 		int r = load_node(t, cur, block);
 		if (r != TESSERA_OK) { _rc = r; goto out; }
 		tessera_btree_node_header_t h;
 		(void)read_header(block, &h);
 		if (h.node_kind == 0) {                  /* leaf */
+			if (tr) tr->leaf_entries = h.entry_count;
 			int exact;
 			int idx = search_leaf(block, h.entry_count,
 			    t->key_size, leaf_entry_size(t), key, &exact);
@@ -457,13 +470,31 @@ out:
 	return _rc;
 }
 
+uint64_t
+tessera_btree_root(const tessera_btree_t *t)
+{
+	return t == NULL ? 0 : t->root;
+}
+
 int
 tessera_btree_get(tessera_btree_t *t, const void *key, void *out_value)
 {
 	if (t == NULL) return TESSERA_EINVAL;
 	uint64_t tok = 0;
 	int act = rd_enter(t, &tok);
-	int rc = tessera_btree_get_impl(t, key, out_value);
+	int rc = tessera_btree_get_impl(t, key, out_value, NULL);
+	rd_exit(t, act, tok);
+	return rc;
+}
+
+int
+tessera_btree_get_traced(tessera_btree_t *t, const void *key, void *out_value,
+    tessera_btree_trace_t *tr)
+{
+	if (t == NULL) return TESSERA_EINVAL;
+	uint64_t tok = 0;
+	int act = rd_enter(t, &tok);
+	int rc = tessera_btree_get_impl(t, key, out_value, tr);
 	rd_exit(t, act, tok);
 	return rc;
 }
@@ -747,7 +778,7 @@ tessera_btree_put(tessera_btree_t *t, const void *key, const void *value,
 	if (rc != TESSERA_OK) goto out;
 
 	if (!res.split) {
-		t->root = res.new_left;
+		set_root(t, res.new_left);
 		*out_new_root = t->root;
 		rc = TESSERA_OK; goto out;
 	}
@@ -776,7 +807,7 @@ tessera_btree_put(tessera_btree_t *t, const void *key, const void *value,
 	if (flush_node(t, rs, newroot, 1, 2) != TESSERA_OK) {
 		rc = TESSERA_EIO; goto out;
 	}
-	t->root = rs;
+	set_root(t, rs);
 	*out_new_root = rs;
 	rc = TESSERA_OK;
 out:
@@ -1077,7 +1108,7 @@ tessera_btree_put_sorted_batch_ex(tessera_btree_t *t, const void *keys,
 		tessera_free(flat);
 		if (rc != TESSERA_OK) { batch_repl_free(&repl); return rc; }
 	}
-	t->root = repl.sectors[0];
+	set_root(t, repl.sectors[0]);
 	*out_new_root = t->root;
 	batch_repl_free(&repl);
 	return TESSERA_OK;
@@ -1220,7 +1251,7 @@ tessera_btree_delete(tessera_btree_t *t, const void *key,
 			tessera_free(block); return TESSERA_EIO;
 		}
 		tessera_free(block);
-		t->root = s;
+		set_root(t, s);
 	} else {
 		/* Root collapse: if root is internal with a single child,
 		 * promote that child as the new root. */
@@ -1241,7 +1272,7 @@ tessera_btree_delete(tessera_btree_t *t, const void *key,
 			(void)read_header(block, &h);
 		}
 		tessera_free(block);
-		t->root = new_root;
+		set_root(t, new_root);
 	}
 	*out_new_root = t->root;
 	return TESSERA_OK;

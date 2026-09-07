@@ -1561,6 +1561,9 @@ struct tessera_kbio_ctx {
 	volatile uint64_t     rd_epoch;
 	volatile int          rd_count[2];
 	struct thread        *rd_exempt[2];
+	/* meta_pending index below which every entry was freed BEFORE the last
+	 * root publish — the only entries a mid-mutation recycler may touch. */
+	volatile uint32_t     pub_mark;
 	struct g_consumer    *cp;   /* used by tessera_kbio_write to bypass
 	                             * the buf cache for sectors that get
 	                             * rewritten frequently — the buf cache
@@ -1854,6 +1857,27 @@ tessera_kbio_reader_exit(void *ctx, uint64_t tok)
 	atomic_subtract_rel_int(&k->rd_count[tok & 1], 1);
 }
 static unsigned long tessera_stat_meta_rd_drains = 0;
+static unsigned long tessera_stat_meta_rd_deferred = 0;  /* releases skipped because a descent was in flight; retried on the next call */
+/*
+ * Non-blocking grace check for the HOT release paths (commit tail, epoch
+ * sweep — the latter runs per allocation whenever the free list is empty).
+ * Flip the epoch; if the previous slot is already empty, every descent that
+ * could hold a pointer into a block freed before now has exited and the
+ * caller may recycle. Otherwise the caller skips this release and the next
+ * call retries — a descent lasts microseconds, a blocked flush costs
+ * seconds. Measured: the blocking drain here made 1.1-1.7k waits per rm-rf
+ * rep on the flush path and deletions stayed invisible to GC for >5 s.
+ */
+static int
+tessera_kbio_reader_quiesced(struct tessera_kbio_ctx *k)
+{
+	uint64_t e = atomic_load_acq_64(&k->rd_epoch);
+	atomic_add_rel_64(&k->rd_epoch, 1);
+	if (atomic_load_acq_int(&k->rd_count[e & 1]) == 0)
+		return (1);
+	tessera_stat_meta_rd_deferred++;
+	return (0);
+}
 static unsigned long tessera_stat_meta_rd_drain_waits = 0;
 static unsigned long tessera_stat_meta_rd_drain_max_ms = 0;
 static unsigned long tessera_stat_meta_rd_drain_abandoned = 0;
@@ -1900,6 +1924,7 @@ tessera_kbio_reader_drain(struct tessera_kbio_ctx *k)
 	}
 }
 
+static void tessera_kbio_root_published(void *ctx, uint64_t new_root);
 static int tessera_kbio_alloc(void *ctx, uint64_t n, uint64_t *out_sector);
 static int tessera_kbio_free (void *ctx, uint64_t s, uint64_t n);
 
@@ -2995,6 +3020,7 @@ static unsigned long tessera_stat_gc_walk_kind_bytes[16];
  * here is a stale flag, which under trust=1 could free a dedup'd chunk. */
 static int tessera_gc_walk_trust_leaf = 1;
 static int tessera_gc_trace = 0;   /* DEBUG: printf publish/begin/free events */
+static int tessera_inode_enoent_trace = 1; /* DIAG: one line per ungated inode read that failed and was retried under the gate (rare) */
 static unsigned long tessera_stat_gc_walk_leaf_skips = 0;
 static unsigned long tessera_stat_gc_walk_leaf_lies  = 0;
 
@@ -4588,6 +4614,15 @@ tessera_kbio_free(void *ctx, uint64_t s, uint64_t n)
  * registry / free-extent tree updates. NOT recursing into the data
  * extent allocator avoids the iterating-while-mutating problem
  * (tessera-fs.md §3.3). */
+static void
+tessera_kbio_root_published(void *ctx, uint64_t new_root)
+{
+	struct tessera_kbio_ctx *k = ctx;
+	(void)new_root;
+	if (k->mount != NULL)
+		k->pub_mark = k->mount->meta_pending_count;
+}
+
 /* Filter meta_pending against the pin bitmap + watermark: release
  * unpinned sectors to meta_free, keep the rest pending. Caller holds
  * the flush gate (commit_sb tail, or the allocator's emergency inline
@@ -4595,6 +4630,11 @@ tessera_kbio_free(void *ctx, uint64_t s, uint64_t n)
 static void
 tessera_fs_meta_pending_drain(struct tessera_mount *tmp_)
 {
+	/* Same rule as the epoch sweep: no metadata sector reaches meta_free
+	 * ahead of the reader drain (cheap when no descent is in flight). */
+	if (!tessera_kbio_reader_quiesced(&tmp_->bio_ctx))
+		return;   /* a descent is in flight: release next time, never under it */
+
 	if (tmp_->meta_pending_count == 0 || tmp_->meta_free == NULL)
 		return;
 	const uint64_t mstart = tmp_->sb.meta_reserve_start;
@@ -4653,8 +4693,15 @@ tessera_fs_meta_pending_drain(struct tessera_mount *tmp_)
 			printf("tessera_fs: drain audit TRUNCATED at 512 "
 			    "snapshots — results are NOT conclusive\n");
 	}
+	/* Only entries freed BEFORE the last root publish are unreferenced by the
+	 * live tree. Anything at or above pub_mark was freed by a mutation still
+	 * in flight and MUST stay pending: a reader starting now walks the old
+	 * root into it. */
+	const uint32_t _count0 = tmp_->meta_pending_count;
+	const uint32_t _mark = tmp_->bio_ctx.pub_mark < _count0 ? tmp_->bio_ctx.pub_mark : _count0;
 	for (uint32_t i = 0; i < tmp_->meta_pending_count; i++) {
 		uint64_t s = tmp_->meta_pending[i];
+		if (i >= _mark) { tmp_->meta_pending[kept++] = s; continue; }
 		int pinned = 0;
 		/* Watermark: the last completed scan never saw this
 		 * sector (allocated after its start) — reachability
@@ -4749,6 +4796,7 @@ tessera_fs_meta_pending_drain(struct tessera_mount *tmp_)
 		}
 	}
 	tmp_->meta_pending_count = kept;
+	tmp_->bio_ctx.pub_mark = kept - (_count0 - _mark);
 	tessera_stat_drain_calls++;
 	tessera_stat_meta_watermark   = (unsigned long)tmp_->meta_pin_watermark;
 	tessera_stat_meta_pending_now = tmp_->meta_pending_count;
@@ -4811,6 +4859,21 @@ tessera_meta_epoch_mark(struct tessera_mount *tmp_, uint64_t s)
 static void
 tessera_fs_meta_epoch_sweep(struct tessera_mount *tmp_)
 {
+	/*
+	 * ★ Every release of a metadata sector to meta_free passes the reader
+	 * drain first. This sweep recycles sectors allocated and freed within
+	 * ONE flush on the argument that no durable superblock referenced
+	 * them — true for crash safety, false for readers: the batch put
+	 * publishes a node through t->root in memory, a later put in the same
+	 * flush COWs it away, and a reader still descending through it then
+	 * reads the next occupant. Traced 2026-09-07: sector 4764 read as a
+	 * 26-entry leaf without the key, on retry a 7-entry leaf with it —
+	 * root moved during the descent, flush in progress, 5 of 5 events.
+	 * The drain waits only for descents that began before this point.
+	 */
+	if (!tessera_kbio_reader_quiesced(&tmp_->bio_ctx))
+		return;   /* a descent is in flight: release next time, never under it */
+
 	if (tmp_->meta_epoch_bm == NULL || tmp_->meta_pending_count == 0)
 		return;
 	const uint64_t mstart = tmp_->sb.meta_reserve_start;
@@ -4856,8 +4919,15 @@ tessera_fs_meta_epoch_sweep(struct tessera_mount *tmp_)
 			printf("tessera_fs: epoch audit TRUNCATED at 512 "
 			    "snapshots — results are NOT conclusive\n");
 	}
+	/* Only entries freed BEFORE the last root publish are unreferenced by the
+	 * live tree. Anything at or above pub_mark was freed by a mutation still
+	 * in flight and MUST stay pending: a reader starting now walks the old
+	 * root into it. */
+	const uint32_t _count0 = tmp_->meta_pending_count;
+	const uint32_t _mark = tmp_->bio_ctx.pub_mark < _count0 ? tmp_->bio_ctx.pub_mark : _count0;
 	for (uint32_t i = 0; i < tmp_->meta_pending_count; i++) {
 		uint64_t s = tmp_->meta_pending[i];
+		if (i >= _mark) { tmp_->meta_pending[kept++] = s; continue; }
 		int epoch_new = 0;
 		if (s >= mstart && s < mstart + mlen) {
 			uint64_t bit = s - mstart;
@@ -4887,6 +4957,7 @@ tessera_fs_meta_epoch_sweep(struct tessera_mount *tmp_)
 		tmp_->meta_pending[kept++] = s;
 	}
 	tmp_->meta_pending_count = kept;
+	tmp_->bio_ctx.pub_mark = kept - (_count0 - _mark);
 	tessera_stat_epoch_reclaimed += moved;
 	tessera_stat_meta_pending_now = tmp_->meta_pending_count;
 	tessera_stat_meta_free_now    = tmp_->meta_free_count;
@@ -5586,6 +5657,8 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	tmp_->meta_bio.ctx         = &tmp_->bio_ctx;
 	tmp_->meta_bio.reader_enter = tessera_kbio_reader_enter;
 	tmp_->meta_bio.reader_exit  = tessera_kbio_reader_exit;
+	tmp_->meta_bio.root_published = tessera_kbio_root_published;
+	tmp_->bio_ctx.mount = tmp_;
 
 	/* Meta-reserve recycler buffers. Sized to the entire reserve so
 	 * we can never overflow on push. */
@@ -10311,7 +10384,9 @@ tessera_fs_inode_get(struct tessera_mount *tmp_, uint32_t inode_no,
 	if (tmp_->inode_tree == NULL) return (TESSERA_ENOENT);
 	uint8_t key[4];
 	encode_inode_key(inode_no, key);
-	rc = tessera_btree_get(tmp_->inode_tree, key, out);
+	const uint64_t _root0 = tessera_btree_root(tmp_->inode_tree);
+	tessera_btree_trace_t _tr0, _trR;
+	rc = tessera_btree_get_traced(tmp_->inode_tree, key, out, &_tr0);
 	if (rc != TESSERA_OK) {
 		/*
 		 * ★ Retry under the flush gate before believing a failure. This
@@ -10333,9 +10408,38 @@ tessera_fs_inode_get(struct tessera_mount *tmp_, uint32_t inode_no,
 			else if (rc == TESSERA_ECORRUPT) tessera_stat_inode_get_retry_ecorrupt++;
 			else tessera_stat_inode_get_retry_other++;
 			if (tmp_->flush_in_progress) tessera_stat_inode_get_retry_inflush++;
+			/* DIAG trace of the failing descent (rare; printed when
+			 * gc_trace is on). */
+			int _dirty_now = 0;
+			const uint64_t _root_now = tessera_btree_root(tmp_->inode_tree);
+			if (tmp_->dirty_init) {
+				mtx_lock(&tmp_->flush_mtx);
+				struct tessera_dirty_inode *_e;
+				LIST_FOREACH(_e, &tmp_->dirty_inodes[inode_no & (TESSERA_DIRTY_INODE_BUCKETS - 1u)], link)
+					if (_e->inode_no == inode_no) {
+						_dirty_now = _e->tombstone ? 2 :
+						    (_e->draining ? 3 : 1);
+						break;
+					}
+				mtx_unlock(&tmp_->flush_mtx);
+			}
+			const int _inflush = tmp_->flush_in_progress;
 			tessera_fs_flush_gate_enter(tmp_);
-			int rc2 = tessera_btree_get(tmp_->inode_tree, key, out);
+			const uint64_t _root_retry = tessera_btree_root(tmp_->inode_tree);
+			int rc2 = tessera_btree_get_traced(tmp_->inode_tree, key, out, &_trR);
 			tessera_fs_flush_gate_exit(tmp_);
+			if (tessera_inode_enoent_trace) {
+				char _p0[160], _pR[160]; int _o = 0, _oR = 0;
+				for (uint32_t _i = 0; _i < _tr0.depth && _o < 140; _i++) _o += snprintf(_p0 + _o, sizeof(_p0) - _o, "%s%ju", _i ? ">" : "", (uintmax_t)_tr0.path[_i]);
+				for (uint32_t _i = 0; _i < _trR.depth && _oR < 140; _i++) _oR += snprintf(_pR + _oR, sizeof(_pR) - _oR, "%s%ju", _i ? ">" : "", (uintmax_t)_trR.path[_i]);
+				printf("INODE-PATH ino=%u fail=[%s] leaf_n=%u | retry=[%s] leaf_n=%u same_leaf=%d\n", inode_no, _p0, _tr0.leaf_entries, _pR, _trR.leaf_entries,
+				    (_tr0.depth && _trR.depth && _tr0.path[_tr0.depth-1] == _trR.path[_trR.depth-1]));
+			}
+			if (tessera_inode_enoent_trace)
+				printf("INODE-ENOENT ino=%u rc=%d root0=%ju root_now=%ju root_retry=%ju dirty_now=%d inflush=%d retry_rc=%d gen=%ju\n",
+				    inode_no, rc, (uintmax_t)_root0, (uintmax_t)_root_now,
+				    (uintmax_t)_root_retry, _dirty_now, _inflush, rc2,
+				    (uintmax_t)tmp_->sb.generation);
 			if (rc2 != TESSERA_OK)
 				return (rc2);
 			tessera_stat_inode_get_retry_fixed++;
@@ -24747,6 +24851,8 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_gc_roots_moved, CTLFLAG_RD,
     &tessera_stat_pinscan_gc_roots_moved, 0,
     "pinscans discarded at swap because a GC scan froze roots after the walk "
     "started; swapping would release frozen-tree blocks the walk never pinned");
+SYSCTL_INT(_kern_tessera, OID_AUTO, inode_enoent_trace, CTLFLAG_RW, &tessera_inode_enoent_trace, 0,
+    "DIAG: print a line for every ungated inode read that failed and was retried under the gate (rare; on by default)");
 SYSCTL_INT(_kern_tessera, OID_AUTO, gc_trace, CTLFLAG_RW, &tessera_gc_trace, 0,
     "DEBUG: log chunk publishes, scan begins and pack frees to the console");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_apply_delete_failed, CTLFLAG_RD,
@@ -24771,6 +24877,7 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, inode_get_retry, CTLFLAG_RD, &tessera_stat
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, inode_get_retry_fixed, CTLFLAG_RD, &tessera_stat_inode_get_retry_fixed, 0, "of those, satisfied by the gated retry (GC-commit race)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, readdir_fetch_fail, CTLFLAG_RD, &tessera_stat_readdir_fetch_fail, 0, "readdir: directory manifest fetch/parse failed -> EIO (was silent EOF)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, meta_rd_drain_abandoned, CTLFLAG_RD, &tessera_stat_meta_rd_drain_abandoned, 0, "drains abandoned after 30 s: a reader bracket LEAKED (bug); swap proceeded unprotected");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, meta_rd_deferred, CTLFLAG_RD, &tessera_stat_meta_rd_deferred, 0, "hot-path releases skipped because a descent was in flight (retried next call)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, meta_rd_drains, CTLFLAG_RD, &tessera_stat_meta_rd_drains, 0, "reader-epoch drains (one per pinscan swap)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, meta_rd_drain_waits, CTLFLAG_RD, &tessera_stat_meta_rd_drain_waits, 0, "drains that had to wait for an in-flight descent");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, meta_rd_drain_max_ms, CTLFLAG_RD, &tessera_stat_meta_rd_drain_max_ms, 0, "longest drain wait (ms)");

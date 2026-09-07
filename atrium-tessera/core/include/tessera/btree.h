@@ -42,6 +42,15 @@ typedef struct {
 	 */
 	uint64_t (*reader_enter)(void *ctx);
 	void     (*reader_exit) (void *ctx, uint64_t token);
+	/*
+	 * OPTIONAL: called every time a tree's root is published (t->root
+	 * assigned). Blocks freed by a mutation are unreferenced by the LIVE
+	 * tree only from this moment; a recycler that runs mid-mutation (from
+	 * the allocator) must not reuse anything freed since the last publish,
+	 * or a reader that starts after the free but before the publish walks
+	 * the old root into a reused block.
+	 */
+	void     (*root_published)(void *ctx, uint64_t new_root);
 } tessera_block_io_t;
 
 typedef struct tessera_btree tessera_btree_t;
@@ -61,6 +70,17 @@ tessera_btree_t *tessera_btree_create(const tessera_block_io_t *io,
                                       uint64_t *out_root_sector);
 
 /* O(log n). Returns TESSERA_ENOENT if absent. */
+/* Current root sector of an open tree (DIAG: descent tracing). */
+uint64_t tessera_btree_root(const tessera_btree_t *);
+/* DIAG: btree_get that records the descent — sector per level, the leaf's
+ * entry count — so two reads of one key can be compared path-by-path. */
+typedef struct {
+	uint32_t depth;              /* levels visited, leaf included */
+	uint64_t path[16];           /* sector at each level */
+	uint32_t leaf_entries;       /* entry_count of the leaf reached (0 if none) */
+} tessera_btree_trace_t;
+int tessera_btree_get_traced(tessera_btree_t *, const void *key, void *out_value,
+                             tessera_btree_trace_t *tr);
 int tessera_btree_get(tessera_btree_t *,
                       const void *key, void *out_value);
 

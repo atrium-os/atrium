@@ -33,12 +33,26 @@
 # READER EPOCH (67c89b2d): the recycled-node hazard itself is removed — every
 # descent registers, the pinscan swap drains before unpinning. 6 reps: clean,
 # meta_rd_drains=152 (= swaps), drain_waits=7, max 11 ms, abandoned 0.
-# Residual, classified (654207ff): inode_get_retry 2 in 3 reps, ALL ENOENT,
-# ALL with a flush in progress, 0 ECORRUPT. Not node reuse; a transient in the
-# flush's publication that the gated retry absorbs. Drain keeps entries visible
-# through the batch put; the batch assigns t->root after every node is
-# written. Next step if chased: trace the failing descent's root sector vs the
-# retry's.
+# RESIDUAL CHASED AND CLOSED (2026-09-07). The descent trace showed every event
+# one level shorter than its retry and one SAME leaf sector read as a 26-entry
+# leaf without the key, then a 7-entry leaf with it: a metadata block reused
+# under a descent. The path was tessera_fs_meta_epoch_sweep, which recycles
+# blocks allocated and freed within ONE flush on a crash-safety argument that
+# ignores in-memory readers. Two-part fix:
+#   - every release into meta_free passes a reader-epoch grace check; the hot
+#     paths (commit tail, epoch sweep — per allocation when free is empty) use
+#     a NON-BLOCKING check (flip; recycle only if the previous slot is already
+#     empty, else defer to the next call). A blocking drain there cost 1.1-1.7k
+#     waits per rep on the flush path and deletions stayed invisible to GC for
+#     >5 s (arm A: reclaimed ~50 in 3 of 6 reps). Only the pinscan swap blocks.
+#   - a publish mark: core fires root_published() at every t->root assignment;
+#     the kmod records meta_pending_count there, and mid-mutation recyclers
+#     touch only entries below it. Without it a reader starting AFTER the free
+#     but BEFORE the publish walked the old root into the reused block
+#     (arm C: one retry in rep 6).
+# Arm D (6e8a286c): inode_get_retry 0/6 reps, loop reclaim 6.5k-9.8k per rep,
+# swap drain waits <=1 per rep, hot-path deferrals 1-5k per rep, no blocking.
+
 S(){ sysctl -n kern.tessera.$1 2>/dev/null || echo 0; }
 DEV=/dev/vtbd2; M=/mnt/scratch
 diskinfo -v $DEV | grep -q "atrium-scratch" || { echo "REFUSING"; exit 2; }
