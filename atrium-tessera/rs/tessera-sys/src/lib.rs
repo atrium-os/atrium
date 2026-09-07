@@ -48,6 +48,9 @@ pub struct tessera_block_io_t {
     pub alloc:       Option<extern "C" fn(*mut c_void, u64, *mut u64) -> c_int>,
     pub free:        Option<extern "C" fn(*mut c_void, u64, u64) -> c_int>,
     pub ctx:         *mut c_void,
+    /* reader epoch hooks — optional, unused by userspace tools */
+    pub reader_enter: Option<extern "C" fn(*mut c_void) -> u64>,
+    pub reader_exit:  Option<extern "C" fn(*mut c_void, u64)>,
 }
 
 /* ── volume layer ────────────────────────────────────────────── */

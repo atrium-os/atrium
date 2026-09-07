@@ -30,6 +30,18 @@ typedef struct {
 	int (*free)       (void *ctx, uint64_t start, uint64_t n);
 	/* Opaque context passed to every callback. */
 	void *ctx;
+	/*
+	 * OPTIONAL reader epoch (may be NULL). A descent — one btree_get, or a
+	 * cursor from seek to free, or a walk — is bracketed by enter/exit so
+	 * the platform can defer REUSE of freed nodes until every descent that
+	 * might still reference them has ended. Without it an ungated reader
+	 * can follow a stale pointer into a node the allocator has already
+	 * handed out again: valid contents, wrong node, silent misses. The
+	 * token returned by enter is passed back to exit. Appended last so the
+	 * struct stays layout-compatible for callers that zero-fill it.
+	 */
+	uint64_t (*reader_enter)(void *ctx);
+	void     (*reader_exit) (void *ctx, uint64_t token);
 } tessera_block_io_t;
 
 typedef struct tessera_btree tessera_btree_t;

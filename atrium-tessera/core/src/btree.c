@@ -394,8 +394,24 @@ tessera_btree_close(tessera_btree_t *t)
 
 /* ── get ─────────────────────────────────────────────────────────── */
 
-int
-tessera_btree_get(tessera_btree_t *t, const void *key, void *out_value)
+
+/* Reader-epoch bracket (see tessera_block_io_t). No-ops when unset. */
+static inline int
+rd_enter(tessera_btree_t *t, uint64_t *tok)
+{
+	if (t->io.reader_enter == NULL) return 0;
+	*tok = t->io.reader_enter(t->io.ctx);
+	return 1;
+}
+static inline void
+rd_exit(tessera_btree_t *t, int active, uint64_t tok)
+{
+	if (active && t->io.reader_exit != NULL)
+		t->io.reader_exit(t->io.ctx, tok);
+}
+
+static int
+tessera_btree_get_impl(tessera_btree_t *t, const void *key, void *out_value)
 {
 	if (t == NULL || key == NULL || out_value == NULL)
 		return TESSERA_EINVAL;
@@ -439,6 +455,17 @@ tessera_btree_get(tessera_btree_t *t, const void *key, void *out_value)
 out:
 	tessera_free(block);
 	return _rc;
+}
+
+int
+tessera_btree_get(tessera_btree_t *t, const void *key, void *out_value)
+{
+	if (t == NULL) return TESSERA_EINVAL;
+	uint64_t tok = 0;
+	int act = rd_enter(t, &tok);
+	int rc = tessera_btree_get_impl(t, key, out_value);
+	rd_exit(t, act, tok);
+	return rc;
 }
 
 /* ── put — recursive COW with split propagation ──────────────────── */
@@ -1273,7 +1300,7 @@ tessera_btree_walk_nodes(tessera_btree_t *t,
                          tessera_btree_node_visitor_t cb, void *ctx)
 {
 	if (t == NULL || cb == NULL) return TESSERA_EINVAL;
-	return walk_recursive(t, t->root, cb, NULL, ctx);
+	return tessera_btree_walk_nodes_ex(t, cb, NULL, ctx);   /* bracketed */
 }
 
 int
@@ -1282,13 +1309,19 @@ tessera_btree_walk_nodes_ex(tessera_btree_t *t,
                             tessera_btree_node_visitor_t post, void *ctx)
 {
 	if (t == NULL || pre == NULL) return TESSERA_EINVAL;
-	return walk_recursive(t, t->root, pre, post, ctx);
+	uint64_t tok = 0;
+	int act = rd_enter(t, &tok);
+	int rc = walk_recursive(t, t->root, pre, post, ctx);
+	rd_exit(t, act, tok);
+	return rc;
 }
 
 /* ── cursor: forward in-order iteration ──────────────────────────── */
 
 struct tessera_btree_cursor {
 	tessera_btree_t *t;
+	uint64_t  rd_token;         /* reader-epoch token held from seek to free */
+	int       rd_active;
 	uint64_t  path_sectors[MAX_DEPTH];
 	uint32_t  path_indices[MAX_DEPTH];
 	uint8_t   path_blocks[MAX_DEPTH][BLOCK_SIZE];
@@ -1327,6 +1360,18 @@ descend_to_leftmost(tessera_btree_cursor_t *c, uint64_t start)
 	}
 }
 
+
+/* Every cursor dies here — including the failed-descent paths in seek_*,
+ * which used to tessera_free(c) directly and leaked the reader-epoch
+ * registration (63 phantom descents wedged a drain for 1940 s). */
+static void
+cursor_abandon(tessera_btree_cursor_t *c)
+{
+	if (c == NULL) return;
+	rd_exit(c->t, c->rd_active, c->rd_token);
+	tessera_free(c);
+}
+
 tessera_btree_cursor_t *
 tessera_btree_seek_first(tessera_btree_t *t)
 {
@@ -1334,9 +1379,10 @@ tessera_btree_seek_first(tessera_btree_t *t)
 	tessera_btree_cursor_t *c = tessera_zalloc(sizeof *c);
 	if (c == NULL) return NULL;
 	c->t = t;
+	c->rd_active = rd_enter(t, &c->rd_token);
 	c->depth = 0;
 	if (descend_to_leftmost(c, t->root) != TESSERA_OK) {
-		tessera_free(c);
+		cursor_abandon(c);
 		return NULL;
 	}
 	return c;
@@ -1349,13 +1395,14 @@ tessera_btree_seek_at(tessera_btree_t *t, const void *key)
 	tessera_btree_cursor_t *c = tessera_zalloc(sizeof *c);
 	if (c == NULL) return NULL;
 	c->t = t;
+	c->rd_active = rd_enter(t, &c->rd_token);
 	uint64_t cur = t->root;
 	c->depth = 0;
 	for (;;) {
-		if (c->depth >= (int)MAX_DEPTH) { tessera_free(c); return NULL; }
+		if (c->depth >= (int)MAX_DEPTH) { cursor_abandon(c); return NULL; }
 		c->path_sectors[c->depth] = cur;
 		if (load_node(t, cur, c->path_blocks[c->depth]) != TESSERA_OK) {
-			tessera_free(c); return NULL;
+			cursor_abandon(c); return NULL;
 		}
 		tessera_btree_node_header_t h;
 		(void)read_header(c->path_blocks[c->depth], &h);
@@ -1438,5 +1485,5 @@ tessera_btree_cursor_next(tessera_btree_cursor_t *c)
 void
 tessera_btree_cursor_free(tessera_btree_cursor_t *c)
 {
-	tessera_free(c);
+	cursor_abandon(c);
 }

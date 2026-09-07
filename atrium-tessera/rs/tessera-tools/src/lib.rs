@@ -133,6 +133,8 @@ pub fn make_io(ctx: &mut DiskCtx) -> tessera_block_io_t {
         alloc:       Some(disk_alloc),
         free:        Some(disk_free),
         ctx:         ctx as *mut DiskCtx as *mut c_void,
+        reader_enter: None,
+        reader_exit:  None,
     }
 }
 
