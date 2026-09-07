@@ -2832,6 +2832,56 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, remove_reserve, CTLFLAG_RW,
     &tessera_remove_reserve, 0,
     "data-zone sectors withheld from creates/writes so unlink can always "
     "republish a directory manifest on a full volume");
+/*
+ * ★ 2026-09-07: the same admission argument, for the META RESERVE.
+ *
+ * Everything above charges the DATA zone — including, per #80, the data-zone
+ * cost of publishing metadata. But the meta reserve itself (the btree region:
+ * inode tree, pack registry, extent tree, snapshots) had NO admission term at
+ * all, so work was accepted until the ALLOCATOR refused mid-flush. That is not
+ * a clean stop. The refusal fails dirty_inodes_drain, which short-circuits the
+ * flush BEFORE commit_sb — so the #135 cannot-commit latch, which fires only
+ * in the commit_sb arm, never fires; writes keep being admitted; and repeated
+ * failed flushes advance in-memory roots while reclaim recycles underneath.
+ * Measured on a purpose-built band-limited volume (96 MiB, reserve 1536,
+ * band 192): EIO on live directories while writes still "succeeded", an inode
+ * root left pointing at a snapshot node ("that root is STALE"), and 440
+ * on-disk problems (126 double-state extents + ~314 bad-CRC/blob_count packs)
+ * that fsck --repair cannot repair at ANY reserve level.
+ *
+ * Running out of metadata must be ENOSPC BEFORE the fact, exactly like running
+ * out of data.
+ *
+ * ★ SIZING IS THE WHOLE DIFFICULTY, and the first attempt got it wrong in the
+ * direction the dirent_publish_resv comment above already warns about. Staged
+ * objects do NOT cost a COW path each: they land in ONE btree, so N inodes
+ * share leaves and internal nodes and the marginal cost is per LEAF, not per
+ * object. Charging 3 sectors/object refused writes on a 7%-full volume at 456
+ * files — premature ENOSPC, its own bug. MEASURED end-to-end instead: driving
+ * the reserve from bump 8 to the band at 1344 took ~18k objects, i.e. ~0.074
+ * sectors each. So charge a FRACTION, per RESV_UNIT objects, exactly like the
+ * dirent term. 5/64 = 0.078 is that number with a little conservatism.
+ *
+ * The dirent log is deliberately NOT charged separately here: those ops are
+ * published inside the same parents' manifests that dirty_count already
+ * covers, and the 0.074 figure is end-to-end, so a second term double-counts.
+ */
+#define TESSERA_META_RESV_UNIT  64u
+static int tessera_meta_admit_resv = 5;
+SYSCTL_INT(_kern_tessera, OID_AUTO, meta_admit_resv, CTLFLAG_RW,
+    &tessera_meta_admit_resv, 0,
+    "meta-reserve sectors charged per 64 staged metadata objects at admission "
+    "(0 = disable the meta-reserve admission test)");
+static int tessera_meta_admit_slack = 64;
+SYSCTL_INT(_kern_tessera, OID_AUTO, meta_admit_slack, CTLFLAG_RW,
+    &tessera_meta_admit_slack, 0,
+    "meta-reserve sectors kept unadmitted so a flush already in flight can "
+    "always finish");
+static unsigned long tessera_stat_meta_admit_refusals = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, meta_admit_refusals, CTLFLAG_RD,
+    &tessera_stat_meta_admit_refusals, 0,
+    "writes refused ENOSPC because the meta reserve could not fund them "
+    "(the clean stop; compare meta_band_refusals, the mid-flush one)");
 static int tessera_preflight_enable = 1;
 SYSCTL_INT(_kern_tessera, OID_AUTO, preflight, CTLFLAG_RW,
     &tessera_preflight_enable, 0, "1 = flush-start meta-reserve preflight pinscan");
@@ -12688,6 +12738,50 @@ tessera_fs_commit_clear_consume(struct tessera_mount *tmp_)
 	}
 }
 
+/*
+ * ★ META-RESERVE admission (see tessera_meta_admit_resv). Available =
+ * headroom below the SOFT (band-limited) ceiling plus the recycle list, which
+ * is reusable right now. meta_pending is deliberately EXCLUDED: it only
+ * becomes free at a pinscan swap, so counting it would re-admit the very work
+ * that is waiting on that swap.
+ *
+ * Self-clearing by construction — as reclaim refills meta_free, admission
+ * resumes. No sticky state, unlike the #135 latch, because this is "full",
+ * not "broken".
+ *
+ * Callers: space_admit (the content-write paths) AND the namespace-ADDING
+ * vops. The latter matter most and were the actual hole: space_admit is
+ * reached only from the content paths, so a pure-namespace workload (empty
+ * files — `touch`) was never admission-tested at all, which is exactly how
+ * the reserve was driven into the band. The REMOVE paths deliberately do NOT
+ * call this, so unlink still works to unstick a full volume; that is what
+ * keeps ENOSPC from becoming a deadlock.
+ *
+ * Lock-free by design: this is a heuristic on integers, and the namespace
+ * callers hold the flush GATE (which excludes a concurrent flush) rather than
+ * flush_mtx. A boundary race admits or refuses one extra op; the slack
+ * absorbs it.
+ */
+static int
+tessera_fs_meta_admit(struct tessera_mount *tmp_)
+{
+	if (tessera_meta_admit_resv <= 0)
+		return (0);
+	uint64_t msoft = tessera_meta_soft_length(tmp_);
+	uint64_t mused = tmp_->sb.meta_reserve_bump > tmp_->sb.meta_reserve_start
+	    ? tmp_->sb.meta_reserve_bump - tmp_->sb.meta_reserve_start : 0;
+	uint64_t mavail = (msoft > mused ? msoft - mused : 0) +
+	    (uint64_t)tmp_->meta_free_count;
+	uint64_t mneed = (((uint64_t)tmp_->pending_manifest_count +
+	    (uint64_t)tmp_->dirty_count) *
+	    (uint64_t)tessera_meta_admit_resv) / TESSERA_META_RESV_UNIT;
+	if (mavail < mneed + (uint64_t)tessera_meta_admit_slack) {
+		tessera_stat_meta_admit_refusals++;
+		return (ENOSPC);
+	}
+	return (0);
+}
+
 static int
 tessera_fs_space_admit(struct tessera_mount *tmp_, size_t delta_bytes)
 {
@@ -12769,7 +12863,8 @@ tessera_fs_space_admit(struct tessera_mount *tmp_, size_t delta_bytes)
 
 	if (free_sec < need + slack)
 		return (ENOSPC);
-	return (0);
+
+	return (tessera_fs_meta_admit(tmp_));
 }
 
 /* Append-window write (large sequential appends). Buffers a pure append
@@ -25606,6 +25701,10 @@ tessera_vop_create_impl(struct vop_create_args *ap)
 		if (aerr != 0) return (aerr);
 	}
 
+	/* ★ meta-reserve admission: refuse ENOSPC BEFORE staging namespace
+	 * work the reserve cannot fund (see tessera_fs_meta_admit). */
+	{ int _me = tessera_fs_meta_admit(tmp_); if (_me != 0) return (_me); }
+
 	int err = 0;
 	uint8_t  *child_mft = NULL;
 	/* ★ create crash-atomicity (sibling of the vop_remove/rmdir fix): the
@@ -26129,6 +26228,10 @@ tessera_vop_mkdir(struct vop_mkdir_args *ap)
 		if (aerr != 0) return (aerr);
 	}
 
+	/* ★ meta-reserve admission: refuse ENOSPC BEFORE staging namespace
+	 * work the reserve cannot fund (see tessera_fs_meta_admit). */
+	{ int _me = tessera_fs_meta_admit(tmp_); if (_me != 0) return (_me); }
+
 	int err = 0;
 	uint8_t *child_mft = NULL;
 	int _mk_gated = 0;	/* ★ create crash-atomicity, see vop_create */
@@ -26371,6 +26474,10 @@ tessera_vop_symlink(struct vop_symlink_args *ap)
 		if (aerr != 0) return (aerr);
 	}
 
+	/* ★ meta-reserve admission: refuse ENOSPC BEFORE staging namespace
+	 * work the reserve cannot fund (see tessera_fs_meta_admit). */
+	{ int _me = tessera_fs_meta_admit(tmp_); if (_me != 0) return (_me); }
+
 	int err = 0;
 	uint8_t *child_mft = NULL;
 	int _sl_gated = 0;	/* ★ create crash-atomicity, see vop_create */
@@ -26539,6 +26646,10 @@ tessera_vop_link(struct vop_link_args *ap)
 		int aerr = VOP_ACCESS(tdvp, VWRITE, cnp->cn_cred, curthread);
 		if (aerr != 0) return (aerr);
 	}
+
+	/* ★ meta-reserve admission: refuse ENOSPC BEFORE staging namespace
+	 * work the reserve cannot fund (see tessera_fs_meta_admit). */
+	{ int _me = tessera_fs_meta_admit(tmp_); if (_me != 0) return (_me); }
 
 	uint8_t ckey[4];
 	tessera_inode_record_t cino;
