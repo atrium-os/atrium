@@ -94,6 +94,26 @@ struct Fsck {
     nlink_fixes: Vec<([u8; 4], Vec<u8>)>,
     // quota records to rewrite (used_bytes correction): (key, patched value).
     quota_fixes: Vec<([u8; 8], Vec<u8>)>,
+    // ── pack-level repairs ──
+    /// Packs whose registry blob_count disagrees with what the pack body
+    /// actually holds: (pack key, corrected 64-byte entry). Always safe — the
+    /// pack opens and parses; only the registry's cached count is stale.
+    pack_count_fixes: Vec<([u8; 16], Vec<u8>)>,
+    /// SINGLE-EXTENT packs that fail header/CRC: (pack key, start, sectors).
+    /// Their bytes are unreadable, so they serve nothing; --repair
+    /// de-registers them and returns the sectors — but only under the
+    /// dangling_blob_refs gate below. Multi-extent packs are deliberately not
+    /// collected: reclaiming a PEL chain correctly is a different job, and
+    /// getting it wrong frees sectors that are still linked.
+    bad_packs: Vec<([u8; 16], u64, u64)>,
+    /// Count of "references blob X which is in no pack". THE SAFETY GATE for
+    /// reclaiming bad packs: if nothing anywhere is missing, then every live
+    /// reference resolved out of a READABLE pack, so an unopenable pack
+    /// demonstrably held nothing live and its sectors are garbage. If
+    /// something IS missing we cannot attribute it (an unopenable pack cannot
+    /// be enumerated), so we refuse and say why rather than free sectors that
+    /// might still be forensically recoverable.
+    dangling_blob_refs: u32,
     // the authoritative free-extent set (pack zone minus allocated packs);
     // used to rebuild the free-extent tree when free_tree_dirty.
     free_runs: Vec<(u64, u64)>,
@@ -224,6 +244,7 @@ impl Fsck {
             return;
         }
         if !self.all_blobs.contains(hash) {
+            self.dangling_blob_refs += 1;
             self.problem(format!("{ctx}: references blob {} which is in no pack (dangling)", hx(hash)));
             return;
         }
@@ -542,6 +563,9 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
         inode_raw: HashMap::new(),
         quota_used: HashMap::new(),
         nlink_fixes: Vec::new(),
+        pack_count_fixes: Vec::new(),
+        bad_packs: Vec::new(),
+        dangling_blob_refs: 0,
         quota_fixes: Vec::new(),
         free_runs: Vec::new(),
         free_tree_dirty: false,
@@ -707,10 +731,24 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
                     let pr = tessera_pack_open(buf.as_ptr(), buf.len());
                     if pr.is_null() {
                         fsck.problem(format!("pack {pid} failed to open (bad header/CRC)"));
+                        // Repairable only for a single contiguous extent —
+                        // see Fsck::bad_packs on why PEL chains are excluded.
+                        if flags & TESSERA_REGISTRY_FLAG_MULTI_EXTENT == 0 {
+                            fsck.bad_packs.push((key, start, len));
+                        }
                     } else {
                         let n = tessera_pack_blob_count(pr);
                         if n != blob_count {
                             fsck.problem(format!("pack {pid}: registry blob_count={blob_count} but pack holds {n}"));
+                            // The pack parses; only the cached count is stale.
+                            // Rewrite it verbatim with the true count, and
+                            // clamp reachable_blobs, which can never exceed it.
+                            let mut fixed = val.to_vec();
+                            fixed[32..36].copy_from_slice(&n.to_le_bytes());
+                            if rd_u32(&val, 56) > n {
+                                fixed[56..60].copy_from_slice(&n.to_le_bytes());
+                            }
+                            fsck.pack_count_fixes.push((key, fixed));
                         }
                         let mut this_pack: Vec<(Hash, u32)> = Vec::new();
                         for i in 0..n {
@@ -1922,6 +1960,83 @@ fn apply_repairs(
             new.inode_root = root;
         }
         if verbose { eprintln!("  nlink: rewrote {} inode record(s)", fsck.nlink_fixes.len()); }
+    }
+
+    // ── Tier A.1b: pack registry blob_count correction ──
+    // The pack opens and parses; only the registry's cached count is stale.
+    // Always safe, so it is unconditional — no gate, no data touched.
+    if !fsck.pack_count_fixes.is_empty() {
+        unsafe {
+            let t = tessera_btree_open(io, new.pack_registry_root,
+                TESSERA_BTREE_KIND_PACK_REG, 16, TESSERA_REGISTRY_ENTRY_SIZE);
+            if t.is_null() { return Err("open pack registry for repair".into()); }
+            let mut root = new.pack_registry_root;
+            let mut done = 0usize;
+            for (key, val) in &fsck.pack_count_fixes {
+                if applied >= budget { *truncated = true; break; }
+                if tessera_btree_put(t, key.as_ptr(), val.as_ptr(), &mut root) != 0 {
+                    eprintln!("tessera-fsck: reserve exhausted during pack blob_count \
+repair — committing {applied} completed repair(s); re-run to continue");
+                    *truncated = true;
+                    break;
+                }
+                applied += 1;
+                done += 1;
+            }
+            tessera_btree_close(t);
+            new.pack_registry_root = root;
+            if verbose { eprintln!("  packs: corrected blob_count on {done} entr(y/ies)"); }
+        }
+    }
+
+    // ── Tier A.1c: de-register unreadable packs and reclaim their sectors ──
+    // GATED. An unopenable pack cannot be enumerated, so we cannot prove which
+    // blobs it held. What we CAN prove is the converse: if the reachability
+    // walk found nothing missing anywhere, every live reference resolved out
+    // of a readable pack, so this pack held nothing live and its sectors are
+    // garbage. When something IS missing we refuse — those bytes may still be
+    // forensically recoverable, and freeing them makes that permanent.
+    if !fsck.bad_packs.is_empty() {
+        if fsck.dangling_blob_refs != 0 {
+            println!("tessera-fsck: {} unreadable pack(s) NOT reclaimed — {} blob \
+reference(s) are already unresolved, so this tool cannot prove those packs held \
+nothing live. Their sectors stay allocated (recoverable by hand); everything else \
+above was still repaired.",
+                fsck.bad_packs.len(), fsck.dangling_blob_refs);
+        } else {
+            unsafe {
+                let t = tessera_btree_open(io, new.pack_registry_root,
+                    TESSERA_BTREE_KIND_PACK_REG, 16, TESSERA_REGISTRY_ENTRY_SIZE);
+                if t.is_null() { return Err("open pack registry for repair".into()); }
+                let mut root = new.pack_registry_root;
+                let mut done = 0usize;
+                let mut sectors = 0u64;
+                for (key, start, len) in &fsck.bad_packs {
+                    if applied >= budget { *truncated = true; break; }
+                    if tessera_btree_delete(t, key.as_ptr(), &mut root) != 0 {
+                        eprintln!("tessera-fsck: reserve exhausted de-registering an \
+unreadable pack — committing {applied} completed repair(s); re-run to continue");
+                        *truncated = true;
+                        break;
+                    }
+                    // Hand the sectors back. free_dirty makes Tier A.3 flush
+                    // the rebuilt free tree, so they never end up double-stated.
+                    // NOTE: these runs are (start, LENGTH) — tessera_extent_free
+                    // and alloc_extent both take a length, not an end sector.
+                    free.push((*start, *len));
+                    free_dirty = true;
+                    sectors += *len;
+                    applied += 1;
+                    done += 1;
+                }
+                tessera_btree_close(t);
+                new.pack_registry_root = root;
+                if done > 0 {
+                    println!("tessera-fsck: de-registered {done} unreadable pack(s), \
+reclaiming {sectors} sector(s) — nothing referenced them.");
+                }
+            }
+        }
     }
 
     // ── Tier A.2: quota used_bytes correction ──
