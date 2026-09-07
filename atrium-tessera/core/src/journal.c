@@ -149,6 +149,28 @@ tessera_journal_format(const tessera_block_io_t *io, uint64_t start,
 		tessera_free(buf);
 		return TESSERA_EIO;
 	}
+	/*
+	 * ★ #136: resetting head/tail/seq is NOT enough. Replay walks the ring
+	 * block-by-block from tail_block, and a formatted header alone leaves
+	 * the ring BODY holding whatever record blocks the previous epoch (or a
+	 * previous mkfs of a reused image) wrote — each with valid magic/CRC.
+	 * Those stale blocks re-apply at the next mount: a dev root was lost
+	 * this way (2026-08-09), and a scratch crash-soak re-materialised
+	 * deleted dirents from them (2026-09-07). Erase the body so there is
+	 * nothing to replay — the committed superblock is authoritative by
+	 * construction. Same addressing as record append (start + b, b in
+	 * [1, length-1]); the header already wrote start + 0.
+	 */
+	uint8_t *zero = tessera_zalloc(BLK);
+	if (zero == NULL) { tessera_free(buf); return TESSERA_ENOMEM; }
+	for (uint64_t b = 1; b < length; b++) {
+		if (io->write_block(io->ctx, start + b, zero) != 0) {
+			tessera_free(zero);
+			tessera_free(buf);
+			return TESSERA_EIO;
+		}
+	}
+	tessera_free(zero);
 	tessera_free(buf);
 	return TESSERA_OK;
 }
