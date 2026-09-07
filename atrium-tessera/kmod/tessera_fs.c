@@ -25608,6 +25608,15 @@ tessera_vop_create_impl(struct vop_create_args *ap)
 
 	int err = 0;
 	uint8_t  *child_mft = NULL;
+	/* ★ create crash-atomicity (sibling of the vop_remove/rmdir fix): the
+	 * inode record is committed (step 3, mutating sb.inode_root in place)
+	 * and the DIR_INSERT appended (step 4) as two ungated writes; a flush
+	 * — or a power cut — between them commits the inode with no dirent
+	 * naming it: an ORPHAN inode. The #80 rollback below only covers a
+	 * SYNCHRONOUS dirent failure, not a crash in the window. Gate steps
+	 * 3+4 so they land in one flush; released before vget (step 5) and on
+	 * every error path via _cr_gated. */
+	int _cr_gated = 0;
 
 	/* 1. Allocate inode_no. */
 	uint32_t new_ino = tessera_fs_alloc_inode_no(tmp_);
@@ -25688,6 +25697,10 @@ tessera_vop_create_impl(struct vop_create_args *ap)
 		}
 		tessera_fs_ino_set_mft(&cino, pub_hash, TESSERA_MFT_INLINE);
 
+		if (tmp_->flush_mtx_init && !_cr_gated) {
+			tessera_fs_flush_gate_enter(tmp_);
+			_cr_gated = 1;
+		}
 		uint8_t ckey[4];
 		encode_inode_key(new_ino, ckey);
 		uint64_t new_inode_root = tmp_->sb.inode_root;
@@ -25734,6 +25747,11 @@ tessera_vop_create_impl(struct vop_create_args *ap)
 		}
 	}
 
+	/* inode record + dirent are now both staged; the op is atomic w.r.t.
+	 * the flush. Release before vget so vnode instantiation does not run
+	 * under the gate. */
+	if (_cr_gated) { tessera_fs_flush_gate_exit(tmp_); _cr_gated = 0; }
+
 	/* 5. Get a deduped vnode for the new inode. tessera_vget reads
 	 * the just-written inode record, sets v_type=VREG. */
 	struct vnode *cvp;
@@ -25751,6 +25769,7 @@ tessera_vop_create_impl(struct vop_create_args *ap)
 	tessera_fs_mark_dirty(tmp_);
 
 out:
+	if (_cr_gated) tessera_fs_flush_gate_exit(tmp_);
 	if (child_mft) free(child_mft, M_TESSERA);
 	return (err);
 }
@@ -26112,6 +26131,7 @@ tessera_vop_mkdir(struct vop_mkdir_args *ap)
 
 	int err = 0;
 	uint8_t *child_mft = NULL;
+	int _mk_gated = 0;	/* ★ create crash-atomicity, see vop_create */
 
 	uint32_t new_ino = tessera_fs_alloc_inode_no(tmp_);
 
@@ -26168,6 +26188,10 @@ tessera_vop_mkdir(struct vop_mkdir_args *ap)
 	}
 	tessera_fs_ino_set_mft(&cino, pub_hash, TESSERA_MFT_DIRECTORY);
 
+	if (tmp_->flush_mtx_init && !_mk_gated) {
+		tessera_fs_flush_gate_enter(tmp_);
+		_mk_gated = 1;
+	}
 	uint8_t ckey[4];
 	encode_inode_key(new_ino, ckey);
 	uint64_t new_inode_root = tmp_->sb.inode_root;
@@ -26188,6 +26212,8 @@ tessera_vop_mkdir(struct vop_mkdir_args *ap)
 		tessera_stat_create_rollback++;
 		goto out;
 	}
+	/* inode + dirent staged atomically; release before vget. */
+	if (_mk_gated) { tessera_fs_flush_gate_exit(tmp_); _mk_gated = 0; }
 
 	/* Get a deduped vnode for the new dir. */
 	struct vnode *cvp;
@@ -26204,6 +26230,7 @@ tessera_vop_mkdir(struct vop_mkdir_args *ap)
 	tessera_fs_mark_dirty(tmp_);
 
 out:
+	if (_mk_gated) tessera_fs_flush_gate_exit(tmp_);
 	if (child_mft) free(child_mft, M_TESSERA);
 	return (err);
 }
@@ -26346,6 +26373,7 @@ tessera_vop_symlink(struct vop_symlink_args *ap)
 
 	int err = 0;
 	uint8_t *child_mft = NULL;
+	int _sl_gated = 0;	/* ★ create crash-atomicity, see vop_create */
 
 	uint32_t new_ino = tessera_fs_alloc_inode_no(tmp_);
 
@@ -26399,6 +26427,10 @@ tessera_vop_symlink(struct vop_symlink_args *ap)
 	}
 	tessera_fs_ino_set_mft(&cino, pub_hash, TESSERA_MFT_SYMLINK);
 
+	if (tmp_->flush_mtx_init && !_sl_gated) {
+		tessera_fs_flush_gate_enter(tmp_);
+		_sl_gated = 1;
+	}
 	uint8_t ckey[4];
 	encode_inode_key(new_ino, ckey);
 	uint64_t new_inode_root = tmp_->sb.inode_root;
@@ -26415,6 +26447,8 @@ tessera_vop_symlink(struct vop_symlink_args *ap)
 		tessera_stat_create_rollback++;
 		goto out;
 	}
+	/* inode + dirent staged atomically; release before vget. */
+	if (_sl_gated) { tessera_fs_flush_gate_exit(tmp_); _sl_gated = 0; }
 
 	struct vnode *cvp;
 	if (tessera_vget(dvp->v_mount, new_ino, dn->inode_no, &cvp) != 0) {
@@ -26430,6 +26464,7 @@ tessera_vop_symlink(struct vop_symlink_args *ap)
 	tessera_fs_mark_dirty(tmp_);
 
 out:
+	if (_sl_gated) tessera_fs_flush_gate_exit(tmp_);
 	if (child_mft) free(child_mft, M_TESSERA);
 	return (err);
 }
@@ -26515,10 +26550,18 @@ tessera_vop_link(struct vop_link_args *ap)
 	getmicrotime(&tv);
 	cino.ctime_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
 	    (uint64_t)tv.tv_usec * 1000ULL;
+	/* ★ create crash-atomicity (see vop_create): the nlink bump (inode
+	 * put) and the DIR_INSERT must land in one flush, or a cut between
+	 * them commits nlink=N+1 with only N dirents — an nlink mismatch.
+	 * Gate both. */
+	int _ln_gated = tmp_->flush_mtx_init;
+	if (_ln_gated) tessera_fs_flush_gate_enter(tmp_);
 	uint64_t new_inode_root = tmp_->sb.inode_root;
 	if (tessera_fs_inode_put_byk(tmp_, ckey, &cino,
-	    &new_inode_root) != TESSERA_OK)
+	    &new_inode_root) != TESSERA_OK) {
+		if (_ln_gated) tessera_fs_flush_gate_exit(tmp_);
 		return (EIO);
+	}
 	tmp_->sb.inode_root = new_inode_root;
 
 	int err = tessera_fs_dirent_rewrite(tmp_, (uint32_t)dn->inode_no,
@@ -26530,8 +26573,10 @@ tessera_vop_link(struct vop_link_args *ap)
 		(void)tessera_fs_inode_put_byk(tmp_, ckey, &cino,
 		    &new_inode_root);
 		tmp_->sb.inode_root = new_inode_root;
+		if (_ln_gated) tessera_fs_flush_gate_exit(tmp_);
 		return (err);
 	}
+	if (_ln_gated) tessera_fs_flush_gate_exit(tmp_);
 
 	tessera_fs_mark_dirty(tmp_);
 	return (0);
@@ -26785,6 +26830,7 @@ tessera_vop_rename(struct vop_rename_args *ap)
 	struct componentname *tcnp = ap->a_tcnp;
 
 	int err = 0;
+	int _rn_gated = 0;	/* ★ rename crash-atomicity, see below */
 
 	if (tessera_vop_rdonly(fdvp) || tessera_vop_rdonly(tdvp)) {
 		err = EROFS;
@@ -26904,6 +26950,19 @@ tessera_vop_rename(struct vop_rename_args *ap)
 	    memcmp(fcnp->cn_nameptr, tcnp->cn_nameptr, fcnp->cn_namelen) == 0)
 		goto release;            /* identical name — silent no-op */
 
+	/* ★ rename crash-atomicity (sibling of the vop_remove/create fixes):
+	 * a rename is 2-4 ungated dirent rewrites (REMOVE old + ADD new,
+	 * across two parents) plus any displaced-target inode delete/unlink
+	 * and a ".." repoint. A flush — or a power cut — between them can leave
+	 * the file under BOTH names, under NEITHER, or with a dangling target.
+	 * Gate the whole mutation region so it lands in one flush; released at
+	 * `release:` via _rn_gated (early pre-mutation goto-release paths ran
+	 * with the flag still 0). */
+	if (tmp_->flush_mtx_init) {
+		tessera_fs_flush_gate_enter(tmp_);
+		_rn_gated = 1;
+	}
+
 	if (same_parent && tvp == NULL) {
 		/* Same-dir, no collision. Two dirent_rewrite calls (ADD
 		 * then REMOVE) instead of the legacy
@@ -27000,6 +27059,7 @@ tessera_vop_rename(struct vop_rename_args *ap)
 	tessera_fs_mark_dirty(tmp_);
 
 release:
+	if (_rn_gated) tessera_fs_flush_gate_exit(tmp_);
 	/* fdvp + fvp came UNLOCKED → vrele only */
 	if (tvp != NULL) vput(tvp);
 	vput(tdvp);
