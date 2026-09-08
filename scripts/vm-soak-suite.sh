@@ -32,6 +32,20 @@ export KMOD
 rc=0
 echo "########## SUITE START $(date) kmod=$KMOD ##########"
 
+# ★ Ride along with the stall probe. The rare multi-second stall that fails
+# ssh's banner exchange has never been reproduced on demand
+# (project_tessera_guest_spin_on_damaged_volume), so the only realistic way to
+# catch it is to have the instrument already running during hours of soak.
+# It uses its OWN ssh with a LONG ConnectTimeout — scripts/vssh's
+# ConnectTimeout=3 turns every stall into an indistinguishable "failure".
+STALL_OUT="$OUT/stall-probe"
+if [ "${STALL_PROBE:-1}" = "1" ]; then
+    OUT="$STALL_OUT" INTERVAL=${STALL_INTERVAL:-10} sh "$BSD/scripts/vm-stall-probe.sh" \
+        >"$OUT/stall-probe.log" 2>&1 &
+    STALL_PID=$!
+    echo "stall probe: armed (pid $STALL_PID) -> $STALL_OUT"
+fi
+
 echo "########## 1/3 DELETE-HEAVY SOAK ($CYCLES1 cuts) ##########"
 CYCLES=$CYCLES1 sh "$BSD/scripts/vm-crash-soak.sh" 2>&1 | tee "$OUT/delete.log" \
     | grep -E "SOAK|FSCK-DIRTY|FAILED|ABORT|stopping" || rc=1
@@ -48,6 +62,17 @@ scp -i "$HOME/.ssh/fresco_bsd_ed25519" -o StrictHostKeyChecking=no \
     "$BSD/scripts/vm-meta-exhaustion-test.sh" root@localhost:/root/ >/dev/null \
     || { echo "could not stage the meta test"; rc=1; }
 "$BSD/scripts/vssh" 'sh /root/vm-meta-exhaustion-test.sh' 2>&1 | tee "$OUT/meta.log" | tail -4
+
+if [ "${STALL_PROBE:-1}" = "1" ]; then
+    touch /tmp/stall-probe.stop; sleep 8
+    echo "########## STALL PROBE ##########"
+    echo "  host ssh stalls >1s : $(wc -l < "$STALL_OUT/ssh-stalls.log" 2>/dev/null | tr -d " ")"
+    echo "  guest exec stalls   : $(grep -c "SLOW exec" "$STALL_OUT/guest-stalls.log" 2>/dev/null || echo 0)"
+    # The wchan histogram under a SLOW exec is the whole point — it names the
+    # blocking resource. Print it if anything landed.
+    grep -A6 "SLOW exec" "$STALL_OUT/guest-stalls.log" 2>/dev/null | head -30
+    rm -f /tmp/stall-probe.stop
+fi
 
 echo "########## SUITE DONE $(date) ##########"
 echo "delete: $(grep -E 'SOAK DONE' "$OUT/delete.log" | tail -1)"
