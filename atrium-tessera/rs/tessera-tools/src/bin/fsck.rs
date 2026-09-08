@@ -113,6 +113,17 @@ struct Fsck {
     /// something IS missing we cannot attribute it (an unopenable pack cannot
     /// be enumerated), so we refuse and say why rather than free sectors that
     /// might still be forensically recoverable.
+    /// Directories whose manifest references a CHILD MANIFEST that is in no
+    /// pack — a missing directory-btree node. The entries in that subtree are
+    /// unrecoverable, but the rest of the directory is fine, so --repair
+    /// republishes it from the entries that ARE readable. Without this the
+    /// directory is stuck: the kmod EIOs on readdir, so even `rm -rf` cannot
+    /// remove it (measured on the dev root: rm failed EIO on
+    /// /usr/local/share/man/man3).
+    damaged_dirs: Vec<u32>,
+    /// Inode currently being walked, when it is a DIRECTORY — attributes a
+    /// dangling manifest child to its owner. Same idiom as current_snapshot.
+    current_dir_inode: Option<u32>,
     dangling_blob_refs: u32,
     // the authoritative free-extent set (pack zone minus allocated packs);
     // used to rebuild the free-extent tree when free_tree_dirty.
@@ -236,6 +247,12 @@ impl Fsck {
 
     /// Verify `hash` exists; if `as_manifest`, parse it and recurse into the
     /// blobs it references. `ctx` labels the referrer for diagnostics.
+    /// `ctx` labels the referrer. ★ It CHAINS: each recursion appends to the
+    /// caller's ctx rather than restarting from the child's hash. Restarting
+    /// discarded the only actionable fact — WHICH INODE owns the damage — so a
+    /// dangling child of a directory btree reported as "d2a471d61442[btree 63]"
+    /// named a manifest hash the operator cannot map back to a file. Now it
+    /// reads "inode 12345[btree 63]".
     fn reach(&mut self, hash: &Hash, as_manifest: bool, ctx: &str, depth: u32) {
         if is_null(hash) || depth > 64 {
             if depth > 64 {
@@ -245,6 +262,13 @@ impl Fsck {
         }
         if !self.all_blobs.contains(hash) {
             self.dangling_blob_refs += 1;
+            // A missing CHILD MANIFEST of a directory is repairable: republish
+            // the directory without the lost subtree (see Fsck::damaged_dirs).
+            if as_manifest {
+                if let Some(d) = self.current_dir_inode {
+                    if !self.damaged_dirs.contains(&d) { self.damaged_dirs.push(d); }
+                }
+            }
             self.problem(format!("{ctx}: references blob {} which is in no pack (dangling)", hx(hash)));
             return;
         }
@@ -288,7 +312,7 @@ impl Fsck {
                             // ZERO_HOLE chunks have a null hash and no blob
                             let ch = cr.chunk_hash;
                             if !is_null(&ch) {
-                                self.reach(&ch, false, &format!("{}[chunk {i}]", hx(hash)), depth + 1);
+                                self.reach(&ch, false, &format!("{ctx}[chunk {i}]"), depth + 1);
                             }
                         }
                     }
@@ -298,7 +322,7 @@ impl Fsck {
                         let mut tr: tessera_tree_record_t = std::mem::zeroed();
                         if tessera_manifest_tree_at(p, i, &mut tr) == 0 {
                             let ch = tr.child_manifest_hash;
-                            self.reach(&ch, true, &format!("{}[tree {i}]", hx(hash)), depth + 1);
+                            self.reach(&ch, true, &format!("{ctx}[tree {i}]"), depth + 1);
                         }
                     }
                 }
@@ -307,7 +331,7 @@ impl Fsck {
                         let mut br: tessera_dir_bucket_record_t = std::mem::zeroed();
                         if tessera_manifest_dir_bucket_at(p, i, &mut br) == 0 {
                             let ch = br.bucket_manifest_hash;
-                            self.reach(&ch, true, &format!("{}[bucket {i}]", hx(hash)), depth + 1);
+                            self.reach(&ch, true, &format!("{ctx}[bucket {i}]"), depth + 1);
                         }
                     }
                 }
@@ -321,7 +345,7 @@ impl Fsck {
                             let mut ch = [0u8; 32];
                             let rc = tessera_manifest_dir_btree_inner_at(p, i, ch.as_mut_ptr());
                             if rc != 0 { break; }
-                            self.reach(&ch, true, &format!("{}[btree {i}]", hx(hash)), depth + 1);
+                            self.reach(&ch, true, &format!("{ctx}[btree {i}]"), depth + 1);
                             i += 1;
                         }
                     }
@@ -566,6 +590,8 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
         pack_count_fixes: Vec::new(),
         bad_packs: Vec::new(),
         dangling_blob_refs: 0,
+        damaged_dirs: Vec::new(),
+        current_dir_inode: None,
         quota_fixes: Vec::new(),
         free_runs: Vec::new(),
         free_tree_dirty: false,
@@ -964,7 +990,10 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
                 if !is_null(&manifest) && !fsck.all_blobs.contains(&manifest) {
                     fsck.dangling_manifests.push((ino, mode));
                 }
+                fsck.current_dir_inode =
+                    if mode & S_IFMT == S_IFDIR { Some(ino) } else { None };
                 fsck.reach(&manifest, true, &label, 0);
+                fsck.current_dir_inode = None;
                 fsck.reach(&xattr, false, &format!("{label} xattr"), 0);
                 fsck.inode_map.insert(ino, (mode, nlink, manifest));
                 fsck.inode_raw.insert(ino, (key, val.to_vec()));
@@ -1960,6 +1989,34 @@ fn apply_repairs(
             new.inode_root = root;
         }
         if verbose { eprintln!("  nlink: rewrote {} inode record(s)", fsck.nlink_fixes.len()); }
+    }
+
+    // ── Tier B.2: republish a directory whose btree child manifest is gone ──
+    // The lost subtree's entries are unrecoverable — the blob holding them is
+    // in no pack — but everything else in the directory is intact, and
+    // collect_dirents already walks past a child it cannot fetch. So rebuild
+    // the directory from what IS readable. This is the only way out: while the
+    // manifest still names the missing child the kmod EIOs on readdir, so the
+    // directory cannot even be deleted from inside the guest.
+    if !fsck.damaged_dirs.is_empty() {
+        for ino in &fsck.damaged_dirs {
+            if applied >= budget { *truncated = true; break; }
+            let manifest = match fsck.inode_map.get(ino) { Some(x) => x.2, None => continue };
+            let mut e = Vec::new();
+            fsck.collect_dirents(&manifest, &mut e, 0);
+            let ents: Vec<(String, u64)> = e.into_iter()
+                .filter(|(_, n)| n != "." && n != "..")
+                .map(|(child, name)| (name, child))
+                .collect();
+            let (new_hash, npr) = publish_dir(io, f, &ents, &mut free, r.hash_alg,
+                new.pack_registry_root)?;
+            new.pack_registry_root = npr;
+            free_dirty = true;
+            new.inode_root = set_inode_manifest(io, new.inode_root, *ino, &new_hash, fsck)?;
+            applied += 1;
+            println!("tessera-fsck: rebuilt directory inode {ino} from its {} readable \
+entry(ies) — the entries in the missing subtree are gone for good.", ents.len());
+        }
     }
 
     // ── Tier A.1b: pack registry blob_count correction ──
