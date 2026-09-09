@@ -8046,6 +8046,31 @@ lookup_restart:
 	}
 
 have_child_no:
+	/*
+	 * ★★ RELEASE THE GATE BEFORE INSTANTIATING THE VNODE — lock-order.
+	 *
+	 * The gate exists to make the dirent->inode resolution trustworthy
+	 * (see the retry above); that job is DONE the moment child_no is
+	 * known. Holding it across tessera_vget takes a VNODE lock while
+	 * holding the GATE, i.e. GATE -> VNODE.
+	 *
+	 * The namespace vops take those in the OPPOSITE order: VFS enters
+	 * VOP_CREATE / VOP_MKDIR / VOP_REMOVE / VOP_RENAME with the directory
+	 * vnode already EXCLUSIVELY LOCKED, and 43b4e26d / cd759fe9 made each
+	 * of them acquire the flush gate inside — VNODE -> GATE. Two threads,
+	 * one in each order, deadlock: lookup holds the gate and waits for a
+	 * vnode while the vop holds that vnode and waits for the gate.
+	 * Observed as a whole-machine hang (sshd/cron/login all blocked; all
+	 * CPUs idle; never recovers) — see
+	 * project_tessera_guest_spin_on_damaged_volume.
+	 *
+	 * Dropping the gate here removes the GATE->VNODE edge entirely, which
+	 * is the cheaper side to fix: the vops genuinely need the gate across
+	 * their two writes (that is what makes an unlink atomic), whereas
+	 * nothing here needs it once the name is resolved.
+	 */
+	if (_lk_gated) { tessera_fs_flush_gate_exit(tmp_); _lk_gated = 0; }
+
 	/* Found — return a vnode. Live mounts use the deduping
 	 * tessera_vget (vfs_hash keyed on inode_no). Snapshot vnodes
 	 * skip the hash because the same inode_no maps to different
