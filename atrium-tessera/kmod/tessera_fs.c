@@ -1418,6 +1418,18 @@ static unsigned long tessera_stat_access_retry_fixed   = 0;
  * lookup_eio rising means a fetch failed even under the gate, which is real. */
 static unsigned long tessera_stat_lookup_fetch_retry   = 0;
 static unsigned long tessera_stat_readdir_fetch_retry  = 0;
+/* ★ Which TIER of fetch_blob_ex missed on an ENOENT. A bare "not found" is
+ * not actionable — "the blob-index named a pack the registry has never heard
+ * of" and "the pack is registered but does not hold the blob" are different
+ * bugs with different fixes. */
+static unsigned long tessera_stat_fetch_miss            = 0;
+static unsigned long tessera_stat_fetch_miss_loc_absent = 0;
+static unsigned long tessera_stat_fetch_miss_loc_stale  = 0;
+static unsigned long tessera_stat_fetch_miss_idx_absent = 0;
+static unsigned long tessera_stat_fetch_miss_idx_unreg  = 0;
+static unsigned long tessera_stat_fetch_miss_idx_stale  = 0;
+static unsigned long tessera_stat_fetch_miss_scan_empty = 0;
+static int tessera_fetch_miss_verbose = 0;
 /* gated lookup retries taken while ckpt_gen had NOT moved: the read raced a GC commit, not a dirent checkpoint */
 static unsigned long tessera_stat_lookup_retry_nockpt = 0;
 static unsigned long tessera_stat_inode_get_retry = 0;
@@ -1513,6 +1525,33 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_eio_retry, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_eio, CTLFLAG_RD,
     &tessera_stat_lookup_eio, 0,
     "Lookup-path inode/manifest fetch failures surfaced as EIO");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_miss, CTLFLAG_RD,
+    &tessera_stat_fetch_miss, 0,
+    "fetch_blob_ex ENOENT: every tier missed (denominator for the tiers below)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_miss_loc_absent, CTLFLAG_RD,
+    &tessera_stat_fetch_miss_loc_absent, 0,
+    "fetch miss: the CAS location cache had no entry for the hash");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_miss_loc_stale, CTLFLAG_RD,
+    &tessera_stat_fetch_miss_loc_stale, 0,
+    "fetch miss: loc-cache entry present but unusable/stale (fell to the scan)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_miss_idx_absent, CTLFLAG_RD,
+    &tessera_stat_fetch_miss_idx_absent, 0,
+    "fetch miss: the blob->pack index had no entry (blob published since the "
+    "index was built, or never indexed)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_miss_idx_unreg, CTLFLAG_RD,
+    &tessera_stat_fetch_miss_idx_unreg, 0,
+    "★ fetch miss: the blob-index named a pack the REGISTRY does not have — a "
+    "publish/registration visibility gap, not a stale index");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_miss_idx_stale, CTLFLAG_RD,
+    &tessera_stat_fetch_miss_idx_stale, 0,
+    "fetch miss: indexed pack is registered but does not hold the blob");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_miss_scan_empty, CTLFLAG_RD,
+    &tessera_stat_fetch_miss_scan_empty, 0,
+    "★ fetch miss: the registry cursor scan walked ZERO packs — the registry "
+    "the reader saw was empty");
+SYSCTL_INT(_kern_tessera, OID_AUTO, fetch_miss_verbose, CTLFLAG_RW,
+    &tessera_fetch_miss_verbose, 0,
+    "log one fetch-miss line per second naming the hash and the failing tier");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_fetch_retry, CTLFLAG_RD,
     &tessera_stat_lookup_fetch_retry, 0,
     "lookup: directory-manifest fetches that failed ungated and were retried "
@@ -16160,14 +16199,28 @@ tessera_fs_fetch_blob_ex(struct tessera_mount *tmp_,
 	 * each retry re-resolves current state. */
 	int reloc_retries = 0;
 	uint64_t reloc_gen0;
+	/*
+	 * ★ MISS-TIER TRACE. A bare ENOENT out of this function says only
+	 * "all four tiers missed", which is not enough to act on: the fix for
+	 * "the loc cache pointed at a stale pack" is nothing like the fix for
+	 * "the blob-index named a pack the registry has never heard of". So
+	 * record WHICH tier failed and how, and report it on the ENOENT path.
+	 * Reset at retry_reloc so a relocation retry describes its own pass.
+	 */
+	int _mt_loc = 0, _mt_loc_stale = 0;
+	int _mt_idx = 0, _mt_idx_reg = 0, _mt_idx_stale = 0;
+	uint32_t _mt_packs = 0;
 retry_reloc:
 	reloc_gen0 = atomic_load_acq_64(&tmp_->pack_reloc_gen);
+	_mt_loc = _mt_loc_stale = _mt_idx = _mt_idx_reg = _mt_idx_stale = 0;
+	_mt_packs = 0;
 
 	/* Tier A: location cache hit — skip the O(N) linear scan of the
 	 * pack registry, jump straight to bread + parse. */
 	{
 		struct tessera_cas_loc_snap snap;
 		if (tessera_cas_loc_lookup(&tmp_->cas_cache, hash, &snap)) {
+			_mt_loc = 1;
 			tessera_pack_extent_t *exts = NULL;
 			uint32_t nexts = 0;
 			tessera_pack_extent_t inline_one[4];
@@ -16186,14 +16239,14 @@ retry_reloc:
 				uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
 				if (tessera_fs_registry_get(tmp_,
 				    snap.pack_id, reg_value) != TESSERA_OK)
-					goto cas_fast_miss; /* stale entry */
+					{ _mt_loc_stale = 1; goto cas_fast_miss; } /* stale entry */
 				tessera_registry_entry_t re;
 				if (tessera_decode_registry_entry(reg_value,
 				    &re) != TESSERA_OK)
-					goto cas_fast_miss;
+					{ _mt_loc_stale = 1; goto cas_fast_miss; }
 				if (tessera_fs_pack_extents_resolve(tmp_, &re,
 				    &exts, &nexts) != 0)
-					goto cas_fast_miss;
+					{ _mt_loc_stale = 1; goto cas_fast_miss; }
 				need_free_exts = 1;
 				total_sectors = re.length_sectors;
 			}
@@ -16201,6 +16254,7 @@ retry_reloc:
 			if (total_sectors == 0 ||
 			    total_sectors > TESSERA_FETCH_PACK_MAX_SECTORS) {
 				if (need_free_exts) free(exts, M_TESSERA);
+				_mt_loc_stale = 1;
 				goto cas_fast_miss;
 			}
 			/* Whole-pack cache: for BULK-class packs, serve from a
@@ -16295,6 +16349,7 @@ retry_reloc:
 			 * stale entry (e.g. post-repack). Fall through to
 			 * the slow scan; stage 4's invalidation should
 			 * normally prevent this. */
+			_mt_loc_stale = 1;
 		}
 	}
 	/* Blob→pack index fast path: resolve hash→pack_id in O(log n) and fetch
@@ -16321,9 +16376,16 @@ retry_reloc:
 	if (tmp_->blob_index_tree != NULL && !_bypass) {
 		uint8_t pid[16];
 		if (tessera_btree_get(tmp_->blob_index_tree, hash, pid) == TESSERA_OK) {
+			_mt_idx = 1;
 			uint8_t rv[TESSERA_REGISTRY_ENTRY_SIZE];
 			tessera_registry_entry_t re;
-			if (tessera_fs_registry_get(tmp_, pid, rv) == TESSERA_OK &&
+			/* Split from the compound condition ONLY so the miss
+			 * trace can distinguish "the index named a pack the
+			 * registry does not have" from "the pack is there but
+			 * does not hold the blob" — different bugs entirely. */
+			if (tessera_fs_registry_get(tmp_, pid, rv) == TESSERA_OK)
+				_mt_idx_reg = 1;
+			if (_mt_idx_reg &&
 			    tessera_decode_registry_entry(rv, &re) == TESSERA_OK &&
 			    re.length_sectors > 0 &&
 			    re.length_sectors <= TESSERA_FETCH_PACK_MAX_SECTORS) {
@@ -16354,6 +16416,7 @@ retry_reloc:
 						tessera_stat_blob_index_hits++;
 						return (0);
 					}
+					_mt_idx_stale = 1;
 					/* stale index entry — fall to the scan */
 				}
 			}
@@ -16397,6 +16460,7 @@ cas_fast_miss:
 			break;
 		}
 
+		_mt_packs++;
 		tessera_registry_entry_t re;
 		if (tessera_decode_registry_entry(value, &re) != TESSERA_OK)
 			goto next_pack;
@@ -16462,6 +16526,39 @@ next_pack:
 		}
 	}
 	tessera_btree_cursor_free(c);
+	/*
+	 * ★ Name the tier that missed. ENOENT here is the "definitively
+	 * absent" answer, and when it is WRONG (the blob is fetchable a
+	 * second later — the transient manifest-fetch race) the tier that
+	 * failed is the whole question.
+	 */
+	if (rc == ENOENT) {
+		tessera_stat_fetch_miss++;
+		if (!_mt_loc)            tessera_stat_fetch_miss_loc_absent++;
+		else if (_mt_loc_stale)  tessera_stat_fetch_miss_loc_stale++;
+		if (!_mt_idx)            tessera_stat_fetch_miss_idx_absent++;
+		else if (!_mt_idx_reg)   tessera_stat_fetch_miss_idx_unreg++;
+		else if (_mt_idx_stale)  tessera_stat_fetch_miss_idx_stale++;
+		if (_mt_packs == 0)      tessera_stat_fetch_miss_scan_empty++;
+		if (tessera_fetch_miss_verbose) {
+			static time_t _fm_last;
+			struct timespec _fm_ts;
+			getnanouptime(&_fm_ts);
+			if (_fm_ts.tv_sec != _fm_last) {   /* 1/s */
+				_fm_last = _fm_ts.tv_sec;
+				printf("tessera_fs: fetch MISS hash %02x%02x%02x%02x "
+				    "loc=%s idx=%s%s%s scanned=%u packs\n",
+				    hash[0], hash[1], hash[2], hash[3],
+				    !_mt_loc ? "absent" :
+				        (_mt_loc_stale ? "stale" : "miss"),
+				    !_mt_idx ? "absent" : "present",
+				    (_mt_idx && !_mt_idx_reg) ? " (pack NOT in registry)" : "",
+				    (_mt_idx && _mt_idx_reg && _mt_idx_stale) ?
+				        " (pack lacks the blob)" : "",
+				    (unsigned)_mt_packs);
+			}
+		}
+	}
 	return (rc);
 }
 
