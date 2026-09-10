@@ -1401,6 +1401,17 @@ static unsigned long tessera_stat_lookup_eio           = 0;
  * absorbed; lookup_eio rising means a failure survived the gated retry and
  * is genuinely an I/O error. */
 static unsigned long tessera_stat_lookup_eio_retry     = 0;
+/* ★ Directory manifests that FETCHED but did not PARSE. Split out from
+ * lookup_eio because the two mean opposite things: lookup_eio is "the bytes
+ * would not come back", this is "the bytes came back and were somebody
+ * else's". This return used to be silent, so a reproducible EIO on a live
+ * directory showed up as zero on every EIO counter. */
+static unsigned long tessera_stat_lookup_parse_eio     = 0;
+/* vop_access inode-record reads: absent after a gated retry (the vnode names a
+ * removed object — namecache purged, ENOENT reported) vs. absorbed by the
+ * retry (the #101 race, previously a hard EIO here). */
+static unsigned long tessera_stat_access_no_inode      = 0;
+static unsigned long tessera_stat_access_retry_fixed   = 0;
 /* gated lookup retries taken while ckpt_gen had NOT moved: the read raced a GC commit, not a dirent checkpoint */
 static unsigned long tessera_stat_lookup_retry_nockpt = 0;
 static unsigned long tessera_stat_inode_get_retry = 0;
@@ -1496,6 +1507,19 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_eio_retry, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_eio, CTLFLAG_RD,
     &tessera_stat_lookup_eio, 0,
     "Lookup-path inode/manifest fetch failures surfaced as EIO");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, access_no_inode, CTLFLAG_RD,
+    &tessera_stat_access_no_inode, 0,
+    "vop_access on a vnode whose inode record is gone (removed object still "
+    "name-cached): namecache purged and ENOENT reported, formerly a sticky EIO");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, access_retry_fixed, CTLFLAG_RD,
+    &tessera_stat_access_retry_fixed, 0,
+    "vop_access inode reads that failed ungated and succeeded under the gate "
+    "(the #101 race; formerly a hard EIO)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_parse_eio, CTLFLAG_RD,
+    &tessera_stat_lookup_parse_eio, 0,
+    "Lookup-path directory manifests that fetched but did not parse — the "
+    "blob address resolved to somebody else's bytes (set "
+    "lookup_no_inode_verbose=1 to log inode/hash/len)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, chunk_tree_publish,
     CTLFLAG_RD, &tessera_stat_chunk_tree_publish, 0,
     "CHUNK_TREE outer-manifest publishes (write-side promotion)");
@@ -7497,8 +7521,54 @@ tessera_vop_access(struct vop_access_args *ap)
 	uint8_t key[4];
 	tessera_inode_record_t ino;
 	encode_inode_key((uint32_t)tn->inode_no, key);
-	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
-		return (EIO);
+	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK) {
+		/*
+		 * ★ A failed inode-record read here is NOT an I/O error, and
+		 * calling it one wedges the name PERMANENTLY.
+		 *
+		 * Two different things land in this branch, and the old
+		 * unconditional EIO was wrong for both:
+		 *
+		 *  1. The same ungated-btree-read race that #101 gave
+		 *     vop_lookup a gated retry for. vop_access never got the
+		 *     sibling retry, so a transient miss became a hard EIO.
+		 *
+		 *  2. The record is genuinely GONE, because the object was
+		 *     removed while this vnode stayed alive. Unlike
+		 *     vop_remove — which keeps the record at nlink=0 and sets
+		 *     tn->unlinked so a lingering vnode still resolves —
+		 *     vop_rmdir hard-deletes the child record. So a directory
+		 *     removed while a concurrent traversal held it name-cached
+		 *     leaves a vnode whose every access check fails. That is
+		 *     exactly the observed failure: `stat dir` SUCCEEDS (it
+		 *     only needs VEXEC on the PARENT) while everything inside
+		 *     the directory returns EIO, and `mkdir -p` therefore sees
+		 *     "already exists" and never recreates it — so the path
+		 *     stays broken for the rest of the mount. Measured: 8-9
+		 *     directories wedged per 200s of concurrent traversal +
+		 *     churn, ~22k EIOs, with fsck CLEAN and the names gone
+		 *     after a remount (there is no on-disk damage at all).
+		 *
+		 * So: retry once under the gate, and if the record really is
+		 * absent, drop the stale namecache entry and report ENOENT.
+		 * Purging is what makes this self-healing — the next lookup
+		 * MISSES, resolves against the real directory, and the name
+		 * either comes back or correctly does not exist.
+		 */
+		int _ac_ok = 0;
+		if (tmp_->flush_mtx_init) {
+			tessera_fs_flush_gate_enter(tmp_);
+			_ac_ok = (tessera_fs_inode_get_byk(tmp_, key, &ino) ==
+			    TESSERA_OK);
+			tessera_fs_flush_gate_exit(tmp_);
+		}
+		if (!_ac_ok) {
+			tessera_stat_access_no_inode++;
+			cache_purge(vp);
+			return (ENOENT);
+		}
+		tessera_stat_access_retry_fixed++;
+	}
 	/* vaccess() does the standard POSIX permission-bit check against
 	 * cred (root override, owner/group/other). */
 	return (vaccess(vp->v_type, ino.mode & 07777, ino.uid, ino.gid,
@@ -7966,6 +8036,37 @@ lookup_restart:
 
 	tessera_manifest_parser_t *p = tessera_manifest_parse(blob, blob_len);
 	if (p == NULL) {
+		/*
+		 * ★ This return had NO counter and NO message. That is exactly
+		 * why a REPRODUCIBLE EIO on a live directory took five separate
+		 * experiments to localise: every instrumented EIO path
+		 * (lookup_eio, content_fetch_eio, content_parse_eio,
+		 * readdir_fetch_fail) read ZERO while userspace was collecting
+		 * thousands of Input/output errors. A silent failure return is
+		 * indistinguishable from "this code never ran".
+		 *
+		 * The distinction from the fetch-failure branch above matters:
+		 * there the blob could not be READ, here it was read and then
+		 * did not PARSE as a manifest — the signature of a blob address
+		 * that now resolves to somebody else's bytes (a recycled pack,
+		 * a stale cached page). So name the inode, the hash and the
+		 * length rather than just counting.
+		 */
+		tessera_stat_lookup_parse_eio++;
+		if (tessera_lookup_no_inode_verbose) {
+			static time_t _lp_last;
+			struct timespec _lp_ts;
+			getnanouptime(&_lp_ts);
+			if (_lp_ts.tv_sec != _lp_last) {   /* 1/s, as above */
+				_lp_last = _lp_ts.tv_sec;
+				printf("tessera_fs: lookup — dir %u manifest "
+				    "FETCHED but did not PARSE (len=%u, hash "
+				    "%02x%02x%02x%02x); returning EIO\n",
+				    (unsigned)dn->inode_no, (unsigned)blob_len,
+				    dino.manifest_hash[0], dino.manifest_hash[1],
+				    dino.manifest_hash[2], dino.manifest_hash[3]);
+			}
+		}
 		free(blob, M_TESSERA);
 		{ if (_lk_gated) tessera_fs_flush_gate_exit(tmp_); return (EIO); }
 	}
