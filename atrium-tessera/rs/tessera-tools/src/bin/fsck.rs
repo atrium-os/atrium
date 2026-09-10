@@ -1809,11 +1809,15 @@ fn apply_repairs(
         mods.entry(*parent).or_default().remove.insert((*child, name.clone()));
     }
 
-    // nlink==0 orphans are unlinked-but-still-open files caught by a crash
-    // (the kmod keeps the record at unlink and deletes it at last close —
-    // POSIX; a crash in between leaves this exact signature). The file WAS
-    // deleted: FREE the record rather than resurrecting a dead temp file in
-    // lost+found. Orphans with nlink > 0 are genuine losses — relink those.
+    // nlink==0 orphans are unlinked-but-still-referenced objects caught by a
+    // crash: the kmod keeps the record at nlink=0 and deletes it at last
+    // close (POSIX), so a crash in between leaves this exact signature.
+    // Covers files AND directories — rmdir/rename detach a removed directory
+    // to nlink=0 rather than hard-deleting it, so a surviving reference keeps
+    // resolving (see tessera_fs_inode_detach_dir). The object WAS deleted:
+    // FREE the record rather than resurrecting a dead temp file or an empty
+    // removed directory in lost+found. Orphans with nlink > 0 are genuine
+    // losses — relink those.
     let (free_orphans, relink_orphans): (Vec<u32>, Vec<u32>) =
         fsck.orphans.iter().copied().partition(|o|
             fsck.inode_map.get(o).map(|x| x.1 == 0).unwrap_or(false));

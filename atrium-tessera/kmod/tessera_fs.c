@@ -2598,6 +2598,8 @@ static int tessera_fs_inode_put_byk(struct tessera_mount *tmp_,
 static int tessera_fs_inode_delete_byk(struct tessera_mount *tmp_,
                                        const uint8_t key[4],
                                        uint64_t *out_root);
+static int tessera_fs_inode_detach_dir(struct tessera_mount *tmp_,
+                                       uint32_t inode_no);
 static int tessera_fs_inode_put(struct tessera_mount *tmp_,
                                 uint32_t inode_no,
                                 const tessera_inode_record_t *rec);
@@ -9834,10 +9836,14 @@ tessera_vop_reclaim(struct vop_reclaim_args *ap)
 
 /*
  * vop_inactive — the last user reference to the vnode dropped. If a name
- * of this inode was unlinked while the file was open (inode_unlink keeps
- * the record with nlink=0 so the open fd stays fully usable — POSIX),
- * delete the inode now. Both conditions are required:
- *   - tn->unlinked (set by vop_remove / vop_rename): protects
+ * of this inode was unlinked while it was still open (inode_unlink for
+ * files, inode_detach_dir for directories, both of which keep the record
+ * with nlink=0 so a live reference stays fully usable — POSIX), delete the
+ * inode now. Directories reach this path too: they are
+ * TESSERA_NODE_REGULAR, and since rmdir/rename detach instead of
+ * hard-deleting, this is what actually frees them. Both conditions are
+ * required:
+ *   - tn->unlinked (set by vop_remove / vop_rmdir / vop_rename): protects
  *     legacy/seeded records whose on-disk nlink is 0-as-unset from being
  *     misread as orphans;
  *   - on-disk nlink == 0: protects hardlinks (unlink of one name leaves
@@ -26632,14 +26638,12 @@ tessera_vop_rmdir(struct vop_rmdir_args *ap)
 		return (err);
 	}
 
-	/* Delete child inode record. */
-	uint64_t new_inode_root = tmp_->sb.inode_root;
-	if (tessera_fs_inode_delete_byk(tmp_, ckey,
-	    &new_inode_root) != TESSERA_OK)
-		printf("tessera_fs: vop_rmdir — btree_delete child "
-		    "inode=%u failed\n", (unsigned)cn->inode_no);
-	else
-		tmp_->sb.inode_root = new_inode_root;
+	/* ★ DETACH the child, don't delete it — symmetry with vop_remove.
+	 * Hard-deleting here left any vnode that outlived the rmdir pointing
+	 * at a record that no longer existed, which made vop_access fail
+	 * permanently for that name. See tessera_fs_inode_detach_dir. */
+	(void)tessera_fs_inode_detach_dir(tmp_, (uint32_t)cn->inode_no);
+	cn->unlinked = 1;
 	if (_rd_gated) tessera_fs_flush_gate_exit(tmp_);
 
 	/* Invalidate namecache entries for the removed directory. */
@@ -27110,6 +27114,59 @@ tessera_fs_inode_unlink(struct tessera_mount *tmp_, uint32_t inode_no)
 }
 
 /*
+ * ★ Detach a DIRECTORY from the namespace WITHOUT deleting its record —
+ * the directory counterpart of tessera_fs_inode_unlink above.
+ *
+ * Why directories need their own entry point: the file path decrements
+ * nlink one name at a time and only reaches 0 on the last one. A
+ * directory's nlink is 2 — the parent's entry plus '.' — and rmdir drops
+ * both at once, so it goes straight to 0. A single inode_unlink would
+ * strand the record at nlink=1, live but unreachable, which is exactly why
+ * rmdir and rename previously hard-DELETED the record instead.
+ *
+ * That hard delete was a real bug. vop_remove keeps the record at nlink=0
+ * and lets vop_inactive free it at last close (POSIX: an unlinked object
+ * with a live reference stays usable), so a directory removed while
+ * another thread still held it name-cached left a vnode whose inode record
+ * was gone — and every VOP_ACCESS on it then failed, wedging the name for
+ * the rest of the mount. Keeping the record makes the directory lifecycle
+ * match the file lifecycle instead of contradicting it.
+ *
+ * No quota release, deliberately: mkdir INHERITS a quota domain but never
+ * RESERVES for a directory, so releasing here would under-count the domain
+ * (the file path releases because vop_write reserved).
+ *
+ * A crash between here and last close leaves an nlink=0 orphan — the same
+ * signature vop_remove already produces, and fsck already frees those: it
+ * partitions orphans on nlink==0 and frees rather than relinking, and it
+ * does so mode-agnostically, so directories are covered.
+ */
+static int
+tessera_fs_inode_detach_dir(struct tessera_mount *tmp_, uint32_t inode_no)
+{
+	uint8_t key[4];
+	tessera_inode_record_t ino;
+	encode_inode_key(inode_no, key);
+	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
+		return (EIO);
+	ino.nlink = 0;
+	{
+		struct timeval tv;
+		getmicrotime(&tv);
+		ino.ctime_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
+		    (uint64_t)tv.tv_usec * 1000ULL;
+	}
+	uint64_t new_root = tmp_->sb.inode_root;
+	if (tessera_fs_inode_put_byk(tmp_, key, &ino, &new_root) != TESSERA_OK) {
+		printf("tessera_fs: inode_detach_dir — nlink=0 put inode=%u "
+		    "failed\n", (unsigned)inode_no);
+		return (EIO);
+	}
+	tmp_->sb.inode_root = new_root;
+	return (0);
+}
+
+/*
  * vop_rename — minimal v1 implementation.
  *
  * Lock contract (FreeBSD WILLRELE): fdvp + fvp arrive REFERENCED but
@@ -27329,16 +27386,18 @@ tessera_vop_rename(struct vop_rename_args *ap)
 		}
 		if (tvp != NULL) {
 			if (tvp->v_type == VDIR) {
-				/* Displaced empty dir: delete the inode outright,
-				 * like vop_rmdir. The nlink=2 dir model means a
-				 * single inode_unlink would leave nlink=1 — a
-				 * live-but-unreachable orphan. */
-				uint8_t tkey2[4];
-				encode_inode_key((uint32_t)tn->inode_no, tkey2);
-				uint64_t nir = tmp_->sb.inode_root;
-				if (tessera_fs_inode_delete_byk(tmp_, tkey2,
-				    &nir) == TESSERA_OK)
-					tmp_->sb.inode_root = nir;
+				/* Displaced empty dir: detach to nlink=0 and
+				 * defer the delete to vop_inactive, exactly
+				 * like the file branch below and like
+				 * vop_rmdir. The nlink=2 dir model is why this
+				 * cannot just call inode_unlink (that would
+				 * strand it at nlink=1) — but it is NOT a
+				 * reason to hard-delete, which is what left a
+				 * displaced directory's surviving vnode
+				 * unable to resolve. */
+				(void)tessera_fs_inode_detach_dir(tmp_,
+				    (uint32_t)tn->inode_no);
+				tn->unlinked = 1;
 			} else {
 				(void)tessera_fs_inode_unlink(tmp_,
 				    (uint32_t)tn->inode_no);
