@@ -1412,6 +1412,12 @@ static unsigned long tessera_stat_lookup_parse_eio     = 0;
  * retry (the #101 race, previously a hard EIO here). */
 static unsigned long tessera_stat_access_no_inode      = 0;
 static unsigned long tessera_stat_access_retry_fixed   = 0;
+/* Directory-manifest fetches that failed UNGATED and were retried under the
+ * gate instead of being reported as EIO — the sibling of lookup_eio_retry
+ * (#101). A rising value here with lookup_eio flat is the race being absorbed;
+ * lookup_eio rising means a fetch failed even under the gate, which is real. */
+static unsigned long tessera_stat_lookup_fetch_retry   = 0;
+static unsigned long tessera_stat_readdir_fetch_retry  = 0;
 /* gated lookup retries taken while ckpt_gen had NOT moved: the read raced a GC commit, not a dirent checkpoint */
 static unsigned long tessera_stat_lookup_retry_nockpt = 0;
 static unsigned long tessera_stat_inode_get_retry = 0;
@@ -1507,6 +1513,14 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_eio_retry, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_eio, CTLFLAG_RD,
     &tessera_stat_lookup_eio, 0,
     "Lookup-path inode/manifest fetch failures surfaced as EIO");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_fetch_retry, CTLFLAG_RD,
+    &tessera_stat_lookup_fetch_retry, 0,
+    "lookup: directory-manifest fetches that failed ungated and were retried "
+    "under the gate rather than reported as EIO (sibling of #101)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, readdir_fetch_retry, CTLFLAG_RD,
+    &tessera_stat_readdir_fetch_retry, 0,
+    "readdir: directory-manifest fetches retried under the gate rather than "
+    "reported as EIO");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, access_no_inode, CTLFLAG_RD,
     &tessera_stat_access_no_inode, 0,
     "vop_access on a vnode whose inode record is gone (removed object still "
@@ -8024,6 +8038,55 @@ lookup_restart:
 	int err = tessera_fs_fetch_blob(tmp_, dino.manifest_hash,
 	    &blob, &blob_len);
 	if (err != 0) {
+		/*
+		 * ★ The SIBLING of #101, and it was missed the same way.
+		 *
+		 * The inode-read failure above retries once under the gate
+		 * before reporting EIO; this branch — the directory's manifest
+		 * blob failing to fetch — went straight to EIO. Both are the
+		 * same class of race: an UNGATED reader against a publish or a
+		 * GC apply that is moving the blob's home.
+		 *
+		 * Measured, not assumed: freezing the volume at the moment of
+		 * failure and retrying the same path succeeded 10 times out of
+		 * 10 within a second, the parent still listed the directory,
+		 * it survived a remount, and fsck was CLEAN. The blob is NOT
+		 * lost — so reporting EIO here is wrong, and a gated retry is
+		 * the correct fix rather than a way of hiding data loss. (Had
+		 * the retries failed, the opposite conclusion would follow and
+		 * a retry would be papering over a liveness bug.)
+		 *
+		 * ★★ BUT THE GATE IS NOT THE RIGHT SERIALIZATION, and this
+		 * retry is NOT a fix — measured, 3 reps of the churn test:
+		 * lookup_fetch_retry=6 against lookup_eio=5, i.e. it absorbed
+		 * ONE case in six. readdir was the same (5 retries, 4 still
+		 * failed). So the window outlasts a gate-serialized in-kernel
+		 * retry even though a USERSPACE retry a second later succeeds
+		 * every time. Whatever makes the blob findable again is not
+		 * something the flush gate waits for.
+		 *
+		 * It is kept because the pair of counters is the instrument
+		 * that proves this: lookup_fetch_retry rising while lookup_eio
+		 * rises with it says the retry is not helping, and any future
+		 * attempt at the real fix can be judged by that ratio moving.
+		 * Do not read it as "the race is handled".
+		 *
+		 * Next lead: fetch_blob_ex tries pending-manifest cache -> CAS
+		 * bytes cache -> blob-index -> full registry cursor scan, and
+		 * ENOENT means all four missed. The drain publishes IN PLACE
+		 * specifically to avoid a visibility gap, so the tier that
+		 * actually misses needs instrumenting before anything is
+		 * changed there.
+		 *
+		 * Bounded to one retry exactly as the sibling is: _lk_gated is
+		 * set before the jump and the guard requires !_lk_gated.
+		 */
+		if (_lk_live && !_lk_gated) {
+			tessera_stat_lookup_fetch_retry++;
+			_lk_gated = 1;
+			tessera_fs_flush_gate_enter(tmp_);
+			goto lookup_restart;
+		}
 		/* Same rule: the directory's CURRENT manifest failing to
 		 * fetch is an integrity/race event — surface EIO and log,
 		 * never a silent ENOENT. */
@@ -8260,6 +8323,12 @@ tessera_vop_readdir(struct vop_readdir_args *ap)
 	struct tessera_node *tn = VTOTNODE(ap->a_vp);
 	struct tessera_mount *tmp_ = VFSTOTESSERA(ap->a_vp->v_mount);
 	int err = 0;
+	/* ★ Gated-retry state for the manifest fetch below (sibling of the
+	 * lookup fix). Declared HERE, at the top, because several `goto
+	 * stop_walk` jumps precede the retry point — a declaration with an
+	 * initializer that is jumped over is left uninitialized, and
+	 * stop_walk reads this to decide whether to release the gate. */
+	int _rd_gated2 = 0;
 
 	/* Multi-call readdir support. uio_offset is treated as a logical
 	 * directory cookie: total bytes returned by all prior readdir
@@ -8356,6 +8425,8 @@ tessera_vop_readdir(struct vop_readdir_args *ap)
 
 	uint8_t key[4];
 	tessera_inode_record_t dino;
+	const int _rd_live = (tn->snapshot_gen == 0) && tmp_->flush_mtx_init;
+readdir_restart:
 	encode_inode_key((uint32_t)tn->inode_no, key);
 	int igrc2 = (tn->snapshot_gen != 0)
 	    ? tessera_fs_inode_get_at_gen(tmp_, (uint32_t)tn->inode_no,
@@ -8377,6 +8448,17 @@ tessera_vop_readdir(struct vop_readdir_args *ap)
 	uint32_t blob_len = 0;
 	if (tessera_fs_fetch_blob(tmp_, dino.manifest_hash, &blob, &blob_len)
 	    != 0) {
+		/* ★ Retry once under the gate — same race as the lookup side,
+		 * and the SAME CAVEAT: measured, this absorbs about one case
+		 * in five (readdir_fetch_retry=5 vs readdir_fetch_fail=4), so
+		 * it is instrumentation plus partial mitigation, not a fix.
+		 * See the long note in vop_lookup. */
+		if (_rd_live && !_rd_gated2) {
+			tessera_stat_readdir_fetch_retry++;
+			_rd_gated2 = 1;
+			tessera_fs_flush_gate_enter(tmp_);
+			goto readdir_restart;
+		}
 		/* Silent EOF here truncated listings under a GC race; rm then
 		 * believed the directory empty and rmdir said ENOTEMPTY. A
 		 * fetch failure is an ERROR, not the end of the directory. */
@@ -8388,10 +8470,29 @@ tessera_vop_readdir(struct vop_readdir_args *ap)
 	tessera_manifest_parser_t *p = tessera_manifest_parse(blob, blob_len);
 	if (p == NULL) {
 		free(blob, M_TESSERA);
+		if (_rd_live && !_rd_gated2) {
+			tessera_stat_readdir_fetch_retry++;
+			_rd_gated2 = 1;
+			tessera_fs_flush_gate_enter(tmp_);
+			goto readdir_restart;
+		}
 		tessera_stat_readdir_fetch_fail++;
 		err = EIO;
 		goto stop_walk;
 	}
+	/* ★ RELEASE THE GATE THE MOMENT THE BLOB IS IN HAND — lock order.
+	 *
+	 * The retry above exists only to make the FETCH coherent, and `blob`
+	 * is a private copy once it succeeds. The emit loop below calls
+	 * uiomove into a USER buffer, which can fault; if that buffer is
+	 * mmap'd from this same filesystem the fault re-enters us, and
+	 * holding the gate across it would rebuild the GATE -> VNODE
+	 * inversion that 68ca5329 removed from vop_lookup. Keep the gated
+	 * window to the fetch itself. (stop_walk still releases, for the
+	 * failure paths that leave before reaching here.)
+	 */
+	if (_rd_gated2) { tessera_fs_flush_gate_exit(tmp_); _rd_gated2 = 0; }
+
 	const tessera_manifest_kind_t rkind = tessera_manifest_parser_kind(p);
 	if (rkind != TESSERA_MFT_DIRECTORY &&
 	    rkind != TESSERA_MFT_DIRECTORY_2L &&
@@ -8583,6 +8684,9 @@ out_free:
 	free(blob, M_TESSERA);
 
 stop_walk:
+	/* ★ Single exit, so the gated-retry pass releases here — every
+	 * `goto stop_walk` above funnels through this one point. */
+	if (_rd_gated2) { tessera_fs_flush_gate_exit(tmp_); _rd_gated2 = 0; }
 	if (err != 0) return (err);
 	if (!stopped && ap->a_eofflag != NULL) *ap->a_eofflag = 1;
 	return (0);
