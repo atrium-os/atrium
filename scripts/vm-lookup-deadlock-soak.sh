@@ -20,9 +20,11 @@
 #       C churn loops       - mkdir/touch/ln/mv/rm in the SAME directories
 #       1 GC loop           - tq, to keep flushes and the gate busy
 #
-#   Near-band operation is part of the trigger, not decoration: meta pressure
-#   is what makes the flush path re-enter often. meta_admit_resv/band_floor
-#   are dropped to 0 so the volume can run right up against the band.
+#   NEARBAND=1 additionally zeroes meta_admit_resv/meta_band_floor. That is
+#   OPT-IN and off by default: it does not just run the volume closer to the
+#   band, it disables the 381f55b8 admission guard, so the run ends with
+#   on-disk damage by construction and the fsck at the end becomes
+#   uninterpretable. See the note at the arming step.
 #
 # WHAT COUNTS AS A FAILURE
 #
@@ -46,7 +48,7 @@ DEV=/dev/vtbd2; M=/mnt/scratch
 DURATION=${DURATION:-7200}          # seconds of concurrent churn
 DIRS=${DIRS:-400}; FILES=${FILES:-60}   # ~24k files, ~150k dirents after churn
 TRAVERSALS=${TRAVERSALS:-3}; CHURNERS=${CHURNERS:-3}
-PROBE_INTERVAL=${PROBE_INTERVAL:-5}
+PROBE_INTERVAL=${PROBE_INTERVAL:-5}; NEARBAND=${NEARBAND:-0}
 STALL_TIMEOUT=${STALL_TIMEOUT:-90}  # ssh unanswered this long => capture
 VSSH="$BSD/scripts/vssh"
 
@@ -87,9 +89,25 @@ grep -q seeded "$OUT/seed.log" || { echo "ABORT: fixture build failed"; exit 1; 
 
 echo "--- arming the workload ---"
 $VSSH "$GATE
-  # near-band: let the volume run up against the emergency band, which is what
-  # keeps the flush path (and therefore the gate) hot.
-  sysctl kern.tessera.meta_admit_resv=0 kern.tessera.meta_band_floor=0 >/dev/null 2>&1
+  # ★ NEAR-BAND IS OPT-IN, AND IT IS NOT A FREE KNOB.
+  #
+  # Zeroing meta_admit_resv/meta_band_floor does not merely 'run closer to the
+  # band' — it DISABLES the admission term added in 381f55b8, which exists
+  # because running into the band CORRUPTS the volume (440 fsck problems, an
+  # inode root gone STALE, recoverable only by repack --force). A soak run this
+  # way therefore ends with on-disk damage BY CONSTRUCTION, and that damage says
+  # nothing about the filesystem — it re-creates a failure mode that is already
+  # understood and already fixed.
+  #
+  # The first 2h run here did exactly that (recycled snapshots root, overlapping
+  # pack extents, a double-state free/allocated region) and the result was
+  # uninterpretable as a consequence. Default is now GUARDS ON, so a dirty fsck
+  # at the end is a genuine signal. Set NEARBAND=1 only when the deliberate
+  # objective is exhaustion behaviour, and expect a dirty fsck when you do.
+  if [ '${NEARBAND:-0}' = 1 ]; then
+    sysctl kern.tessera.meta_admit_resv=0 kern.tessera.meta_band_floor=0 >/dev/null 2>&1
+    echo 'NEARBAND=1: admission guard DISABLED — a dirty fsck is expected and proves nothing'
+  fi
   rm -f /root/soak.stop; : > /root/soak.err
   # traversal loops: force lookups that MISS and RETRY under gate contention
   i=1; while [ \$i -le $TRAVERSALS ]; do
@@ -122,10 +140,34 @@ while [ "$(python3 -c 'import time;print(int(time.time()))')" -lt $END ]; do
     S=$(python3 -c 'import time;print(time.time())')
     if slowssh 'echo ok' >/dev/null 2>&1; then R=ok; else R=FAIL; fi
     E=$(python3 -c 'import time;print(time.time())')
-    D=$(python3 -c "print(f'{$E-$S:.2f}')")
-    over=$(python3 -c "print(1 if $E-$S > 2.0 else 0)")
+    # ★ FAIL CLOSED. The previous version computed the elapsed time and the
+    # over-threshold flag in two separate python3 calls and treated an empty
+    # result as "not slow". So if either call failed, a slow probe was recorded
+    # as healthy — a stall and a healthy probe became indistinguishable, which
+    # is the exact failure this script exists to detect. A 45-minute control
+    # run averaged ~46s per iteration while logging zero slow probes; the
+    # iteration cost is ~5.2s when the timing works, so the detection had
+    # silently stopped firing and the run's liveness verdict was worthless.
+    #
+    # One call now emits both fields, and anything unparseable counts as a
+    # STALL rather than being swallowed.
+    read -r D over <<EOF
+$(python3 -c "d=$E-$S; print(f'{d:.2f}', 1 if d > 2.0 else 0)" 2>/dev/null || echo "TIMING_BROKEN 1")
+EOF
+    [ -n "${over:-}" ] || { D=TIMING_BROKEN; over=1; }
     if [ "$over" = 1 ] || [ "$R" != ok ]; then
         slow=$((slow+1)); echo "probe $probes: ${D}s $R" | tee -a "$OUT/stalls.log"
+    fi
+    # ★ Also assert the CADENCE. Sampling every ~5s is what makes "no stall"
+    # mean anything; if iterations silently stretch, the run can miss a hang
+    # entirely between probes. Record it rather than assume it.
+    if [ "$over" != 1 ] && [ "$R" = ok ]; then
+        python3 -c "
+import time
+gap = time.time() - $S
+if gap > 3 * $PROBE_INTERVAL:
+    print(f'probe $probes: CADENCE {gap:.1f}s between samples (expected ~$PROBE_INTERVAL)')
+" >> "$OUT/stalls.log" 2>/dev/null || true
     fi
     [ "$R" = ok ] && { sleep "$PROBE_INTERVAL"; continue; }
 
