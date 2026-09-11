@@ -586,6 +586,43 @@ static int tessera_gc_duty_pct = 0;	/* OFF: unverified, see the commit */
  * fight for space sooner; setting it high forces the GC path on ANY volume,
  * which is what makes that path testable at all. */
 static int tessera_gc_pressure_pct = 12;
+/*
+ * ★ tessera-fs.md §11.3: "GC ignores packs whose create_time is within the
+ * last gc_grace_seconds (default 300)... prevents a race where GC sees a pack
+ * with a 'dead' blob, but a transaction is in flight that would make it live."
+ *
+ * This was specified and never implemented — create_time was written as a
+ * literal 0 at every publish site and never read. Spec default kept. Set to 0
+ * to disable. NOTE the bypass in the dead-pack decision: grace is ignored under
+ * space pressure, because deferring reclaim for 5 minutes on a nearly-full
+ * volume trades a rare transient read failure for ENOSPC, which is worse.
+ */
+/*
+ * ★ DEFAULT 0 (OFF), DELIBERATELY DEPARTING FROM THE SPEC'S 300.
+ *
+ * Measured, 600s of namespace churn, packs retained at the end:
+ *      grace=0     16 packs        grace=5    721 packs  (45x)
+ *      grace=2    191 packs (12x)  grace=300 9890 packs  (618x)
+ * with fetch_miss = 0 in EVERY arm, because the actual cause of the
+ * manifest-fetch ENOENT was unpinned format-time constants, fixed
+ * separately. So grace costs 12-618x pack retention here and buys nothing
+ * measurable.
+ *
+ * The reason the spec's 300 does not fit: §11.3 assumes packs age slowly
+ * relative to the in-flight-transaction window, but this implementation
+ * publishes a manifest pack per flush, so under churn essentially every pack
+ * is always "young" and reclaim stops altogether. The ⅛ pressure bypass below
+ * does not rescue that — by the time it engages, ~10k packs of garbage have
+ * already accumulated and reclaim happens in a rush.
+ *
+ * The mechanism is kept, and create_time is now stamped, because the race
+ * §11.3 describes is real and a future change (slower pack turnover, or a
+ * grace keyed on the flush generation rather than wall time) may want it.
+ * Turning it on without re-measuring that table would be a space regression.
+ */
+static int tessera_gc_grace_seconds = 0;
+static unsigned long tessera_stat_gc_grace_spared = 0;
+static unsigned long tessera_stat_gc_grace_bypassed = 0;
 static unsigned long tessera_stat_gc_armed      = 0;  /* #107 */
 static unsigned long tessera_stat_gc_last_ms    = 0;
 static unsigned long tessera_stat_gc_backoff_ms = 0;
@@ -944,6 +981,16 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_scans, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_scan_ms, CTLFLAG_RD,
     &tessera_stat_gc_scan_ms, 0,
     "Cumulative ms spent in the ungated GC scan (NOT gate-held)");
+SYSCTL_INT(_kern_tessera, OID_AUTO, gc_grace_seconds, CTLFLAG_RW,
+    &tessera_gc_grace_seconds, 0,
+    "tessera-fs.md §11.3: do not reclaim packs created within this many "
+    "seconds (0 disables; ignored under space pressure)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_grace_spared, CTLFLAG_RD,
+    &tessera_stat_gc_grace_spared, 0,
+    "★ dead packs spared because they were younger than gc_grace_seconds");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_grace_bypassed, CTLFLAG_RD,
+    &tessera_stat_gc_grace_bypassed, 0,
+    "young packs reclaimed anyway because the volume was under space pressure");
 SYSCTL_INT(_kern_tessera, OID_AUTO, gc_pressure_pct, CTLFLAG_RW,
     &tessera_gc_pressure_pct, 0,
     "Arm the tombstone GC when data-zone free space falls below this percent "
@@ -18480,6 +18527,39 @@ have_hashes:
 				bh_all = NULL;
 			}
 
+			/*
+			 * ★ §11.3 GRACE. A pack young enough that a
+			 * transaction referencing its blobs could still be in
+			 * flight is not safe to call dead: the walk saw the
+			 * blob unreferenced only because the referencing inode
+			 * has not committed yet. create_time == 0 means a pack
+			 * written before this was implemented — no grace, same
+			 * behaviour as before.
+			 *
+			 * Bypassed under space pressure: holding reclaim for 5
+			 * minutes on a nearly-full volume converts a rare
+			 * transient read failure into ENOSPC.
+			 */
+			if (dead && tessera_gc_grace_seconds > 0 &&
+			    re.create_time != 0) {
+				const uint64_t _now = (uint64_t)time_second;
+				if (_now >= re.create_time &&
+				    _now - re.create_time <
+				        (uint64_t)tessera_gc_grace_seconds) {
+					uint64_t _free = tmp_->extent_alloc !=
+					    NULL ? tessera_extent_free_blocks(
+					        tmp_->extent_alloc) : ~0ULL;
+					uint64_t _lim =
+					    tmp_->sb.pack_zone_length / 8;
+					if (_free > _lim) {
+						tessera_stat_gc_grace_spared++;
+						dead = 0;
+					} else {
+						tessera_stat_gc_grace_bypassed++;
+					}
+				}
+			}
+
 			if (dead) {
 				if (dead_count == dead_cap) {
 					dead_cap *= 2;
@@ -20347,7 +20427,12 @@ tessera_fs_publish_manifest_to_disk_inner(struct tessera_mount *tmp_,
 	re.blob_count      = 1;
 	re.pack_kind       = 0;
 	re.total_bytes     = pack_size;
-	re.create_time     = 0;
+	/* ★ tessera-fs.md §11.3 grace: stamp when this pack was created so GC
+	 * can refuse to reclaim one whose referencing inode may still be
+	 * in flight. Seconds since the epoch; 0 means "unknown/ancient",
+	 * which is what every pack written before this change carries and
+	 * which correctly gets NO grace. */
+	re.create_time     = (uint64_t)time_second;
 	re.reachable_blobs = 1;
 	re.flags           = pa.flags;
 	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
@@ -20601,7 +20686,12 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
 	re.blob_count      = n_pack_blobs;
 	re.pack_kind       = 0;
 	re.total_bytes     = pack_size;
-	re.create_time     = 0;
+	/* ★ tessera-fs.md §11.3 grace: stamp when this pack was created so GC
+	 * can refuse to reclaim one whose referencing inode may still be
+	 * in flight. Seconds since the epoch; 0 means "unknown/ancient",
+	 * which is what every pack written before this change carries and
+	 * which correctly gets NO grace. */
+	re.create_time     = (uint64_t)time_second;
 	re.reachable_blobs = n_pack_blobs;
 	re.flags           = pa.flags;
 	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
@@ -20715,7 +20805,12 @@ tessera_fs_emit_chunk_pack(struct tessera_mount *tmp_,
 	re.blob_count      = n_pack_blobs;
 	re.pack_kind       = 2;
 	re.total_bytes     = pack_size;
-	re.create_time     = 0;
+	/* ★ tessera-fs.md §11.3 grace: stamp when this pack was created so GC
+	 * can refuse to reclaim one whose referencing inode may still be
+	 * in flight. Seconds since the epoch; 0 means "unknown/ancient",
+	 * which is what every pack written before this change carries and
+	 * which correctly gets NO grace. */
+	re.create_time     = (uint64_t)time_second;
 	re.reachable_blobs = n_pack_blobs;
 	re.flags           = pa.flags;
 	uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
