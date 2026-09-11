@@ -1436,6 +1436,17 @@ static unsigned long tessera_stat_dedup_note_in_scan     = 0;
  * already missed. Each one is an ENOENT that would have been reported for a
  * blob a live inode references. */
 static unsigned long tessera_stat_fetch_overlay_hits      = 0;
+/* ★ The overlay loop's formerly-silent failure paths, split apart: "no
+ * candidate" and "candidate whose read failed" are different findings. */
+static unsigned long tessera_stat_fetch_ovl_cands         = 0;
+static unsigned long tessera_stat_fetch_ovl_decode_fail   = 0;
+static unsigned long tessera_stat_fetch_ovl_resolve_fail  = 0;
+static unsigned long tessera_stat_fetch_ovl_read_fail     = 0;
+static unsigned long tessera_stat_fetch_ovl_reloc_fail    = 0;
+/* ★ The PENDING tier, never measured until now: hash absent from every pack
+ * but present in the pending cache at miss time. */
+static unsigned long tessera_stat_fetch_miss_pending_race = 0;
+static unsigned long tessera_stat_fetch_miss_pending_depth = 0;
 static int tessera_fetch_miss_verbose = 0;
 /* gated lookup retries taken while ckpt_gen had NOT moved: the read raced a GC commit, not a dirent checkpoint */
 static unsigned long tessera_stat_lookup_retry_nockpt = 0;
@@ -1532,6 +1543,24 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_eio_retry, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_eio, CTLFLAG_RD,
     &tessera_stat_lookup_eio, 0,
     "Lookup-path inode/manifest fetch failures surfaced as EIO");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_ovl_cands, CTLFLAG_RD,
+    &tessera_stat_fetch_ovl_cands, 0, "overlay candidates examined on a miss");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_ovl_decode_fail, CTLFLAG_RD,
+    &tessera_stat_fetch_ovl_decode_fail, 0, "overlay candidate: undecodable/bad length");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_ovl_resolve_fail, CTLFLAG_RD,
+    &tessera_stat_fetch_ovl_resolve_fail, 0, "overlay candidate: extent resolve failed");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_ovl_read_fail, CTLFLAG_RD,
+    &tessera_stat_fetch_ovl_read_fail, 0,
+    "★ overlay candidate read failed (was a SILENT continue)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_ovl_reloc_fail, CTLFLAG_RD,
+    &tessera_stat_fetch_ovl_reloc_fail, 0, "overlay candidate: relocation straddle");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_miss_pending_race, CTLFLAG_RD,
+    &tessera_stat_fetch_miss_pending_race, 0,
+    "★★ hash absent from every pack but PRESENT in the pending cache at miss "
+    "time — the blob was in RAM and ENOENT was wrong");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_miss_pending_depth, CTLFLAG_RD,
+    &tessera_stat_fetch_miss_pending_depth, 0,
+    "sum of pending_manifest_count sampled at each miss (0 => pending was empty)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_overlay_hits, CTLFLAG_RD,
     &tessera_stat_fetch_overlay_hits, 0,
     "★ blobs resolved from a reg_ov OVERLAY-only pack after the registry btree "
@@ -11671,6 +11700,28 @@ tessera_fs_pending_manifest_put_impl(struct tessera_mount *tmp_,
 			 * owner to the existing entry so a later supersede
 			 * by some OTHER owner doesn't yank the bytes out
 			 * from under us. */
+			/*
+			 * ★ THIS IS A DEDUP HIT TOO, and it is the third one —
+			 * after the aggregation drain and publish_to_disk. Same
+			 * #79 rule: the caller is about to stamp an inode with
+			 * this hash, so a NEW reference is created here that is
+			 * recorded nowhere else, and a GC scan running against
+			 * roots frozen at activation cannot see it. Make the
+			 * SATB barrier note.
+			 *
+			 * It matters most for exactly the blob that fails:
+			 * directory manifests come through with
+			 * owner_inode_no == 0, so new_own is NULL and the owner
+			 * bookkeeping below — the thing that protects a SHARED
+			 * pending entry from a supersede — records nothing at
+			 * all for them. Every empty directory on the volume
+			 * shares one manifest blob, so this is the hot path for
+			 * it.
+			 *
+			 * flush_mtx is HELD here, so use the _locked entry
+			 * point; the fast one would recurse on it.
+			 */
+			tessera_fs_gc_note_hash_locked(tmp_, hash);
 			if (new_own != NULL) {
 				int already = 0;
 				struct tessera_pending_owner *po;
@@ -16694,30 +16745,46 @@ next_pack:
 
 		for (i = 0; i < ncand && rc == ENOENT; i++) {
 			tessera_registry_entry_t re;
+			tessera_stat_fetch_ovl_cands++;
 			if (tessera_decode_registry_entry(cand[i].val, &re)
-			    != TESSERA_OK)
+			    != TESSERA_OK) {
+				tessera_stat_fetch_ovl_decode_fail++;
 				continue;
+			}
 			if (re.length_sectors == 0 ||
-			    re.length_sectors > TESSERA_FETCH_PACK_MAX_SECTORS)
+			    re.length_sectors > TESSERA_FETCH_PACK_MAX_SECTORS) {
+				tessera_stat_fetch_ovl_decode_fail++;
 				continue;
+			}
 			tessera_pack_extent_t *exts = NULL;
 			uint32_t nexts = 0;
 			if (tessera_fs_pack_extents_resolve(tmp_, &re, &exts,
-			    &nexts) != 0)
+			    &nexts) != 0) {
+				tessera_stat_fetch_ovl_resolve_fail++;
 				continue;
+			}
 			uint8_t *obuf = NULL;
 			uint32_t olen = 0;
 			int frc = tessera_fs_pack_fetch_ondemand(tmp_, exts,
 			    nexts, re.length_sectors, hash, cand[i].pid,
 			    &obuf, &olen);
 			free(exts, M_TESSERA);
-			if (frc != 0)
+			if (frc != 0) {
+				/* ★ was a SILENT continue — the same
+				 * silent-drop pattern that made this bug take
+				 * five experiments to localise. "the overlay
+				 * had no candidate" and "the overlay had one
+				 * and its read failed" are different findings
+				 * and must not look identical. */
+				tessera_stat_fetch_ovl_read_fail++;
 				continue;
+			}
 			if (!tessera_fs_fetch_reloc_ok(tmp_, reloc_gen0, obuf,
 			    olen, hash)) {
 				tessera_cas_invalidate_pack(&tmp_->cas_cache,
 				    cand[i].pid);
 				free(obuf, M_TESSERA);
+				tessera_stat_fetch_ovl_reloc_fail++;
 				continue;   /* the btree retry path owns reloc */
 			}
 			*out_buf = obuf;
@@ -16737,8 +16804,30 @@ next_pack:
 	 * second later — the transient manifest-fetch race) the tier that
 	 * failed is the whole question.
 	 */
+	/*
+	 * ★ PENDING-TIER RE-CHECK. Tier 1 consulted the pending-manifest cache
+	 * on the way in and missed. Ask again now: if the hash IS pending at
+	 * this instant, the blob was never absent — it was in RAM the whole
+	 * time, or it landed there during the scan — and reporting ENOENT for
+	 * it is simply wrong. This is the tier that has never been measured,
+	 * and the drain's own comment describes exactly this failure for
+	 * SHARED pending manifests ("no longer in the pending cache, not yet
+	 * on disk"), which is what a deduped empty-directory manifest is.
+	 */
+	if (rc == ENOENT) {
+		uint8_t *pbuf = NULL;
+		uint32_t plen = 0;
+		if (tessera_fs_pending_manifest_lookup(tmp_, hash, &pbuf,
+		    &plen) != 0) {
+			tessera_stat_fetch_miss_pending_race++;
+			*out_buf = pbuf;
+			*out_len = plen;
+			rc = 0;
+		}
+	}
 	if (rc == ENOENT) {
 		tessera_stat_fetch_miss++;
+		tessera_stat_fetch_miss_pending_depth += tmp_->pending_manifest_count;
 		if (!_mt_loc)            tessera_stat_fetch_miss_loc_absent++;
 		else if (_mt_loc_stale)  tessera_stat_fetch_miss_loc_stale++;
 		if (!_mt_idx)            tessera_stat_fetch_miss_idx_absent++;
