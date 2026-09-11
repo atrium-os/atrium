@@ -1436,6 +1436,9 @@ static unsigned long tessera_stat_dedup_note_in_scan     = 0;
  * already missed. Each one is an ENOENT that would have been reported for a
  * blob a live inode references. */
 static unsigned long tessera_stat_fetch_overlay_hits      = 0;
+/* ★ Format-time constant manifests pinned into the GC live set (tessera-fs.md
+ * §13 step 6). Zero would mean the pin never ran. */
+static unsigned long tessera_stat_gc_const_pins           = 0;
 /* ★ The overlay loop's formerly-silent failure paths, split apart: "no
  * candidate" and "candidate whose read failed" are different findings. */
 static unsigned long tessera_stat_fetch_ovl_cands         = 0;
@@ -1543,6 +1546,9 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_eio_retry, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_eio, CTLFLAG_RD,
     &tessera_stat_lookup_eio, 0,
     "Lookup-path inode/manifest fetch failures surfaced as EIO");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_const_pins, CTLFLAG_RD,
+    &tessera_stat_gc_const_pins, 0,
+    "★ format-time constant manifests pinned into the GC live set per pass");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_ovl_cands, CTLFLAG_RD,
     &tessera_stat_fetch_ovl_cands, 0, "overlay candidates examined on a miss");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_ovl_decode_fail, CTLFLAG_RD,
@@ -3597,6 +3603,22 @@ struct tessera_mount {
 	 * bitmap. A stale set bit is harmless (conservative). */
 	uint8_t                  *gc_touch_bm;
 #define TESSERA_GC_TOUCH_BITS   (2u * 1024u * 1024u)   /* 256 KiB */
+	/*
+	 * ★ The format-time CONSTANT manifests (tessera-fs.md §13 step 6): the
+	 * empty INLINE and the empty DIRECTORY. Recorded at seed time so GC can
+	 * PIN them.
+	 *
+	 * They need pinning because they are the one class of blob the spec
+	 * expects to exist without necessarily having a referencing live inode
+	 * — §15's GC-root list is the mechanism for exactly that, and it is not
+	 * implemented here. Every empty directory on the volume shares the
+	 * empty-DIRECTORY blob, so the instant the last empty directory goes
+	 * away GC sees it as dead and frees its pack; nothing re-seeds it until
+	 * the next MOUNT, and a directory created in between references a blob
+	 * that is in no pack at all.
+	 */
+	tessera_hash_t            const_hashes[2];
+	uint32_t                  n_const_hashes;
 	/* ★ task #79: seqlock over the GC apply phase.
 	 *
 	 * The touch filter covers the SCAN, but not the apply itself: a
@@ -17733,8 +17755,27 @@ tessera_fs_gc_data_zone_ex(struct tessera_mount *tmp_,
 } while (0)
 
 	_GC_WALK_INODE_TREE(scan_inode_tree);
-	printf("tessera_fs: gc pass1 — %u live hashes from current SB\n",
-	    live_count);
+
+	/*
+	 * ★ PIN THE FORMAT-TIME CONSTANTS (tessera-fs.md §13 step 6, and §15's
+	 * intent). These are reachable-by-construction: any empty directory
+	 * created from now on will reference the empty-DIRECTORY blob, and the
+	 * seeding that guarantees it exists runs at MOUNT ONLY. Collecting
+	 * them because no inode happens to reference one RIGHT NOW leaves the
+	 * very next mkdir pointing at a blob in no pack — observed as
+	 * fetch_blob_ex ENOENT for a live inode's manifest, transient because
+	 * the next publish recreates identical content.
+	 *
+	 * Cost is two hashes out of a live set in the tens of thousands, and
+	 * their packs are a few sectors each.
+	 */
+	for (uint32_t _ci = 0; _ci < tmp_->n_const_hashes; _ci++) {
+		_GC_PUSH_HASH(tmp_->const_hashes[_ci]);
+		tessera_stat_gc_const_pins++;
+	}
+
+	printf("tessera_fs: gc pass1 — %u live hashes from current SB "
+	    "(%u constant pins)\n", live_count, tmp_->n_const_hashes);
 
 	/* Snapshot inode_trees */
 	gc_phase = "snapshot";
@@ -20398,6 +20439,16 @@ tessera_fs_seed_one_constant(struct tessera_mount *tmp_,
 	uint8_t *buf = malloc(mlen, M_TESSERA, M_WAITOK);
 	if (tessera_manifest_finalize(mb, buf, mlen, &mlen, h)
 	    == TESSERA_OK) {
+		/* Record it for the GC pin regardless of whether we publish
+		 * below — an already-registered constant still has to be kept
+		 * live, and that is the common case on every remount. */
+		if (tmp_->n_const_hashes <
+		    (uint32_t)(sizeof tmp_->const_hashes /
+		               sizeof tmp_->const_hashes[0])) {
+			memcpy(tmp_->const_hashes[tmp_->n_const_hashes], h,
+			    TESSERA_HASH_SIZE);
+			tmp_->n_const_hashes++;
+		}
 		uint8_t pack_id[16];
 		memcpy(pack_id, h, 16);
 		uint8_t reg[TESSERA_REGISTRY_ENTRY_SIZE];
