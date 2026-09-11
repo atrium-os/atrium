@@ -593,6 +593,7 @@ A blob hash is *reachable* if:
 - It appears as a child-manifest hash within a reachable tree-manifest, or
 - It is referenced from a directory manifest entry (the entry's child inode is alive AND its manifest is reachable), or
 - It is a `pinned_hash` in the GC-root list (see §15) whose `expires_at_ns` has not passed.
+- It is a **format-time constant** manifest (§13 step 6) — reachable *by construction* rather than by any current reference. See `__format_constants` in §15.5.
 
 GC computes this set by scanning live inodes and the GC-root list, then transitively walking manifests.
 
@@ -623,7 +624,31 @@ GC is incremental and idempotent; interruption at any step leaves the volume in 
 
 Writers run concurrently with GC. New writes during GC always reference reachable blobs (a writer never publishes an inode pointing at an unreachable blob); the steady-state invariant is preserved.
 
-The window where a freshly-written blob exists in a pack but its referencing inode hasn't been committed yet is handled by *grace*: GC ignores packs whose `create_time` is within the last `gc_grace_seconds` (default 300). This prevents a race where GC sees a pack with a "dead" blob, but a transaction is in flight that would make it live.
+The window where a freshly-written blob exists in a pack but its referencing inode hasn't been committed yet is handled by *grace*: GC ignores packs whose `create_time` is within the last `gc_grace_seconds`. This prevents a race where GC sees a pack with a "dead" blob, but a transaction is in flight that would make it live.
+
+#### 11.3.1 Applicability of pack-age grace (amended 2026-09-12)
+
+Pack-age grace is sound **only where pack turnover is slow relative to the transaction window**. It is not a general mechanism, and the original default of 300 seconds is unsafe for any implementation that publishes a pack per flush: under sustained namespace churn every pack is perpetually younger than the grace window, so GC finds nothing it is willing to call dead and reclaim stops altogether.
+
+Measured on the reference kmod — 600 s of concurrent traversal plus namespace churn, packs retained on the volume at the end:
+
+| `gc_grace_seconds` | packs retained | vs. baseline |
+|---|---|---|
+| 0 | 16 | — |
+| 2 | 191 | 12× |
+| 5 | 721 | 45× |
+| 300 (original default) | 9,890 | 618× |
+
+An implementation MUST therefore do one of:
+
+- **(a)** default `gc_grace_seconds` to `0`, and record the measurement justifying any other value — the table above is workload-specific and must be re-derived per implementation; or
+- **(b)** key grace on the **flush/commit generation** rather than wall-clock pack age, so the window closes when the referencing transaction actually commits instead of after a fixed duration. **(b) is preferred**: it is bounded by real progress rather than by a timer, so it does not degrade as pack-creation rate rises.
+
+Where grace is enabled, a **space-pressure bypass is REQUIRED**: grace MUST be ignored once free space falls below an implementation-defined threshold. Deferring reclaim on a nearly-full volume converts a rare transient read failure into ENOSPC, which is strictly worse. Note that a bypass alone does not make a long grace safe — by the time it engages, a large backlog of dead packs has already accumulated and reclaim happens as a single burst.
+
+Grace is **not** a substitute for pinning blobs that are reachable by construction (§15.5 `__format_constants`). Using it that way only narrows the window; the blob is still collectable once the grace period elapses with no live reference.
+
+The reference implementation ships (a) with grace disabled by default, and pins the format-time constants instead.
 
 ## 12. Layout invariants
 
@@ -735,6 +760,13 @@ The implementation MUST insert and maintain the following SYSTEM-flagged GC root
 - `__current_root` — pinned_hash equals the current root directory's manifest hash. Updated on every commit. Defends against a GC race where the in-memory root is stale.
 - `__last_n_commits` — the last N (default 3) snapshots of inode 2's manifest hash, with HAS_EXPIRY flag set to a configurable retention window (default 7 days). Allows trivial rollback to recent states.
 - `__open_xfers` — in-flight `tessera-receive` transfers add a temporary entry per transfer, removed on completion or expired automatically.
+- `__format_constants` *(added 2026-09-12)* — one `pinned_hash` per format-time constant manifest (§13 step 6: the empty `INLINE` and the empty `DIRECTORY` manifest). No expiry; these are permanent.
+
+  These are reachable **by construction**, not by any current reference: mkfs writes them, mount re-establishes them, and the next `creat()` or `mkdir()` will reference them — but at any given instant *no live inode need point at one*. Every empty directory on a volume shares the one empty-`DIRECTORY` blob, so the moment the last empty directory is removed, an unpinned GC correctly computes it as dead and frees its pack. The next `mkdir` then stamps an inode with a hash that is in **no pack at all**.
+
+  Observed in the reference implementation before this pin existed: a transient `EIO` from lookup and readdir on a live directory, ~5 directories per 600 s of churn, self-healing within a second (only because ongoing churn happened to republish identical content) and leaving `fsck` clean throughout — an unusually hard signature to attribute, because nothing is wrong on disk. Pinning the constants eliminated it completely (0 occurrences across 6 × 600 s, against 43–90 fetch misses per run before).
+
+  An implementation that seeds constants at mount MUST pin them. Re-seeding at mount is **not** sufficient on its own: the collection happens mid-session, and nothing restores the blob until the next mount.
 
 User pins use unique names without leading `__` to avoid collision with system-managed pins.
 
