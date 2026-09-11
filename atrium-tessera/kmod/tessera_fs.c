@@ -1429,6 +1429,13 @@ static unsigned long tessera_stat_fetch_miss_idx_absent = 0;
 static unsigned long tessera_stat_fetch_miss_idx_unreg  = 0;
 static unsigned long tessera_stat_fetch_miss_idx_stale  = 0;
 static unsigned long tessera_stat_fetch_miss_scan_empty = 0;
+/* ★ Mechanism oracle for the drain-dedup SATB note: dedup hits taken while a
+ * GC scan is actually running. Zero here falsifies the causal story. */
+static unsigned long tessera_stat_dedup_note_in_scan     = 0;
+/* ★ Blobs found in an OVERLAY-only pack after the registry BTREE scan had
+ * already missed. Each one is an ENOENT that would have been reported for a
+ * blob a live inode references. */
+static unsigned long tessera_stat_fetch_overlay_hits      = 0;
 static int tessera_fetch_miss_verbose = 0;
 /* gated lookup retries taken while ckpt_gen had NOT moved: the read raced a GC commit, not a dirent checkpoint */
 static unsigned long tessera_stat_lookup_retry_nockpt = 0;
@@ -1525,6 +1532,14 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_eio_retry, CTLFLAG_RD,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, lookup_eio, CTLFLAG_RD,
     &tessera_stat_lookup_eio, 0,
     "Lookup-path inode/manifest fetch failures surfaced as EIO");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_overlay_hits, CTLFLAG_RD,
+    &tessera_stat_fetch_overlay_hits, 0,
+    "★ blobs resolved from a reg_ov OVERLAY-only pack after the registry btree "
+    "scan missed — each is an ENOENT the old code reported for a live blob");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, dedup_note_in_scan, CTLFLAG_RD,
+    &tessera_stat_dedup_note_in_scan, 0,
+    "aggregation-drain dedup hits taken while a GC scan was active — the "
+    "mechanism the SATB note exists for; 0 falsifies it");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, fetch_miss, CTLFLAG_RD,
     &tessera_stat_fetch_miss, 0,
     "fetch_blob_ex ENOENT: every tier missed (denominator for the tiers below)");
@@ -4106,17 +4121,53 @@ tessera_fs_registry_get_stable(struct tessera_mount *tmp_,
 	 * ourselves. Gated drain paths publish constantly, so this is the
 	 * common case, not a corner: take the plain lookup.
 	 */
+	/*
+	 * ★★ THE BARRIER NOTE IS NOT PART OF THE SEQLOCK — make it BEFORE the
+	 * gate short-circuit, not inside the loop the short-circuit skips.
+	 *
+	 * The two answer different questions. The seqlock asks "is a GC apply
+	 * rewriting the registry underneath this lookup", and owning the gate
+	 * genuinely answers it (an apply owns the gate too and cannot be us).
+	 * The note is the SATB barrier telling a GC SCAN — which runs against
+	 * roots frozen at activation and therefore cannot see anything
+	 * published since — that this hash was just re-referenced. Owning the
+	 * gate says nothing about that, because the scan is not gated. So
+	 * every gate-owning caller silently made no note, and a dedup hit
+	 * creates a reference recorded NOWHERE ELSE.
+	 *
+	 * The mechanism is measured, not assumed: 1161 aggregation-drain dedup
+	 * hits per 200s run land while gc_scan_active is set
+	 * (kern.tessera.dedup_note_in_scan), which is exactly the window in
+	 * which the scan cannot see the new reference.
+	 *
+	 * ★ On the evidence for doing this GENERALLY rather than only at the
+	 * drain: an earlier pass reverted this hoist because it scored 2-of-4
+	 * clean reps against 4-of-4 for the drain-only note. That comparison
+	 * was worthless — the SAME build subsequently scored 4-of-4 and then
+	 * 1-of-5, so the wedged-directory metric cannot distinguish a build
+	 * from ITSELF at this sample size, let alone two builds. The
+	 * justification here is the #79 invariant (a dedup hit must make the
+	 * barrier note), which holds for every call site; it is not an A/B
+	 * result, and it should not be re-litigated with one.
+	 *
+	 * mtx_owned() picks the entry point rather than assuming: the fast
+	 * note takes flush_mtx in its slow path, which would recurse for a
+	 * caller already holding it.
+	 */
+	if (note_hash != NULL) {
+		if (mtx_owned(&tmp_->flush_mtx))
+			tessera_fs_gc_note_hash_locked(tmp_, note_hash);
+		else
+			tessera_fs_gc_note_hash(tmp_, note_hash);
+	}
+
 	if (tmp_->flush_gate_owner == curthread)
 		return (tessera_fs_registry_get(tmp_, pack_id, out_value));
 
 	for (;;) {
-		/* Barrier note (inline, no lock taken when no scan is
-		 * running), then the seqlock read. Both sides are plain
-		 * atomic loads, so the common case — no GC anywhere near —
-		 * costs nothing beyond the lookup itself. */
-		if (note_hash != NULL)
-			tessera_fs_gc_note_hash(tmp_, note_hash);
-
+		/* Seqlock read; the barrier note was made above. Both sides
+		 * are plain atomic loads, so the common case — no GC anywhere
+		 * near — costs nothing beyond the lookup itself. */
 		g0 = atomic_load_acq_64(&tmp_->gc_apply_gen);
 		if ((g0 & 1) != 0) {
 			/* Already inside an apply. Wait it out rather than
@@ -11768,13 +11819,63 @@ tessera_fs_pending_manifests_drain(struct tessera_mount *tmp_)
 			/* Per-blob dedup: skip publishing when a DURABLE copy
 			 * already exists (loc-cache hit VERIFIED against the
 			 * pack registry — the loc cache alone is not a
-			 * durability oracle). */
+			 * durability oracle).
+			 *
+			 * ★ #79, AND IT WAS MISSING HERE. A dedup hit creates a
+			 * new reference to that pack which is recorded NOWHERE
+			 * ELSE — the bytes are then dropped by RETIRE_ENTRY
+			 * below, so the inode record is the only thing pointing
+			 * at the blob. The single-blob path
+			 * (publish_manifest_to_disk) has always used
+			 * registry_get_stable for exactly this reason; this
+			 * aggregation path used the bare lookup, so it made no
+			 * SATB BARRIER NOTE. A GC scan runs against roots
+			 * frozen at activation, so without the note it cannot
+			 * see the reference this dedup just created, and it
+			 * frees the pack underneath us.
+			 *
+			 * Measured consequence: fetch_blob_ex then reports
+			 * ENOENT for a blob a LIVE inode still references —
+			 * 16 of 16 misses in a churn run were this, all of them
+			 * the shared empty-directory manifest, which is simply
+			 * the most-deduped blob on the volume (1 -> 51 empty
+			 * directories grows the volume by 3 blobs, not 50).
+			 *
+			 * ★★ AND THE NOTE MUST BE MADE EXPLICITLY HERE.
+			 * registry_get_stable short-circuits to the bare lookup
+			 * when the caller already owns the gate — correct for
+			 * the SEQLOCK half (an apply owns the gate too and
+			 * cannot be us, so waiting would be waiting on
+			 * ourselves) but it returns BEFORE the barrier note.
+			 * The drain always owns the gate, so routing this call
+			 * through registry_get_stable alone changes NOTHING
+			 * here: measured, fetch_miss_idx_unreg still tracked
+			 * fetch_miss exactly (10/10, 35/35, 40/40) and
+			 * directories still wedged. The note is not part of the
+			 * seqlock and must not be skipped with it.
+			 */
 			struct tessera_cas_loc_snap snap_dummy;
 			uint8_t dedup_reg[TESSERA_REGISTRY_ENTRY_SIZE];
+			/* SATB barrier for the reference this dedup is about to
+			 * create. Safe here: flush_mtx was released just above,
+			 * and the note's slow path takes it. */
+			/* ★ MECHANISM CHECK, not decoration. The whole causal
+			 * story is "a dedup hit during an active GC scan
+			 * creates a reference the scan cannot see". If this
+			 * counter stays 0, that never happens and the story is
+			 * FALSE regardless of what the outcome metric does —
+			 * which matters, because the outcome metric (wedged
+			 * directories, ~1 per 200s) turned out to be far too
+			 * noisy to separate the arms: the SAME build scored
+			 * 4-of-4 clean and then 1-of-5. */
+			if (atomic_load_int((volatile int *)&tmp_->gc_scan_active) != 0)
+				tessera_stat_dedup_note_in_scan++;
+			tessera_fs_gc_note_hash(tmp_, e->hash);
 			if (tessera_cas_loc_lookup(&tmp_->cas_cache, e->hash,
 			    &snap_dummy) &&
-			    tessera_fs_registry_get(tmp_,
-			        snap_dummy.pack_id, dedup_reg) == TESSERA_OK) {
+			    tessera_fs_registry_get_stable(tmp_,
+			        snap_dummy.pack_id, dedup_reg,
+			        e->hash) == TESSERA_OK) {
 			tessera_stat_aggregation_dedups++;
 				mtx_lock(&tmp_->flush_mtx);
 				e->draining = 0;
@@ -16526,6 +16627,110 @@ next_pack:
 		}
 	}
 	tessera_btree_cursor_free(c);
+
+	/*
+	 * ★★ THE SCAN ABOVE WALKS THE REGISTRY BTREE ONLY — finish the job
+	 * over the OVERLAY before declaring the blob absent.
+	 *
+	 * tessera_fs_registry_get is overlay-aware and says so: "every kmod
+	 * registry get must come through here while the overlay can be
+	 * non-empty". This cursor scan does not come through there. It walks
+	 * pack_registry_tree directly, so a pack published in the CURRENT
+	 * flush window — which lives in reg_ov and does not reach the btree
+	 * until registry_ov_flush — is invisible to it.
+	 *
+	 * That is the whole bug behind the transient manifest-fetch EIO:
+	 *   - the blob-index still names the blob's OLD pack, which really is
+	 *     gone, so the indexed lookup misses (fetch_miss_idx_unreg);
+	 *   - the blob now lives in a NEW, overlay-only pack;
+	 *   - this scan cannot see that pack, so ENOENT — for a blob a LIVE
+	 *     inode references;
+	 *   - the next flush pushes the overlay into the btree, which is why
+	 *     a userspace retry a second later succeeded 10 times out of 10.
+	 * It also explains why the earlier attempts did nothing: the flush
+	 * gate does not force the overlay out (the gated retry absorbed only
+	 * ~1 in 6), and GC was never involved, so SATB barrier notes left
+	 * idx_unreg at 100% of misses (309 of 309) even hoisted to every
+	 * dedup site.
+	 *
+	 * Snapshot the overlay under flush_mtx and try the candidates AFTER
+	 * dropping it — pack_fetch_ondemand does I/O and sleeps.
+	 */
+	if (rc == ENOENT && tmp_->flush_mtx_init &&
+	    reg_override == NULL) {   /* frozen-registry GC walks opt out */
+		struct tessera_ovcand {
+			uint8_t pid[16];
+			uint8_t val[TESSERA_REGISTRY_ENTRY_SIZE];
+		} *cand = NULL;
+		uint32_t ncand = 0, i;
+
+		mtx_lock(&tmp_->flush_mtx);
+		for (i = 0; i < 64; i++) {
+			struct tessera_reg_ov *e;
+			LIST_FOREACH(e, &tmp_->reg_ov[i], link)
+				ncand++;
+		}
+		if (ncand > 0) {
+			cand = malloc((size_t)ncand * sizeof *cand, M_TESSERA,
+			    M_NOWAIT);
+			if (cand != NULL) {
+				uint32_t k = 0;
+				for (i = 0; i < 64 && k < ncand; i++) {
+					struct tessera_reg_ov *e;
+					LIST_FOREACH(e, &tmp_->reg_ov[i], link) {
+						if (k >= ncand) break;
+						memcpy(cand[k].pid, e->pack_id, 16);
+						memcpy(cand[k].val, e->val,
+						    TESSERA_REGISTRY_ENTRY_SIZE);
+						k++;
+					}
+				}
+				ncand = k;
+			} else {
+				ncand = 0;
+			}
+		}
+		mtx_unlock(&tmp_->flush_mtx);
+
+		for (i = 0; i < ncand && rc == ENOENT; i++) {
+			tessera_registry_entry_t re;
+			if (tessera_decode_registry_entry(cand[i].val, &re)
+			    != TESSERA_OK)
+				continue;
+			if (re.length_sectors == 0 ||
+			    re.length_sectors > TESSERA_FETCH_PACK_MAX_SECTORS)
+				continue;
+			tessera_pack_extent_t *exts = NULL;
+			uint32_t nexts = 0;
+			if (tessera_fs_pack_extents_resolve(tmp_, &re, &exts,
+			    &nexts) != 0)
+				continue;
+			uint8_t *obuf = NULL;
+			uint32_t olen = 0;
+			int frc = tessera_fs_pack_fetch_ondemand(tmp_, exts,
+			    nexts, re.length_sectors, hash, cand[i].pid,
+			    &obuf, &olen);
+			free(exts, M_TESSERA);
+			if (frc != 0)
+				continue;
+			if (!tessera_fs_fetch_reloc_ok(tmp_, reloc_gen0, obuf,
+			    olen, hash)) {
+				tessera_cas_invalidate_pack(&tmp_->cas_cache,
+				    cand[i].pid);
+				free(obuf, M_TESSERA);
+				continue;   /* the btree retry path owns reloc */
+			}
+			*out_buf = obuf;
+			*out_len = olen;
+			tessera_cas_byte_insert(&tmp_->cas_cache, hash, obuf,
+			    olen);
+			tessera_stat_fetch_overlay_hits++;
+			rc = 0;
+		}
+		if (cand != NULL)
+			free(cand, M_TESSERA);
+	}
+
 	/*
 	 * ★ Name the tier that missed. ENOENT here is the "definitively
 	 * absent" answer, and when it is WRONG (the blob is fetchable a
@@ -20107,8 +20312,12 @@ tessera_fs_seed_one_constant(struct tessera_mount *tmp_,
 		uint8_t pack_id[16];
 		memcpy(pack_id, h, 16);
 		uint8_t reg[TESSERA_REGISTRY_ENTRY_SIZE];
-		if (tessera_fs_registry_get(tmp_, pack_id,
-		    reg) != TESSERA_OK)
+		/* ★ #79: a HIT here skips the publish and so becomes a dedup
+		 * reference recorded nowhere else — same reasoning as the
+		 * other two sites. A MISS is always safe to act on (it just
+		 * publishes), so only the hit side needed the guard. */
+		if (tessera_fs_registry_get_stable(tmp_, pack_id,
+		    reg, h) != TESSERA_OK)
 			(void)tessera_fs_publish_manifest_to_disk(tmp_,
 			    buf, mlen, h, 0);
 	}
@@ -20193,11 +20402,15 @@ tessera_fs_publish_manifests_batch(struct tessera_mount *tmp_,
 	memcpy(pack_id, agg_hash, 16);
 
 	/* If a pack with this same set already exists, skip the
-	 * republish. */
+	 * republish. ★ #79: guarded lookup — skipping the republish makes
+	 * this a dedup HIT, i.e. a new reference to that pack recorded
+	 * nowhere else, so it needs the SATB barrier note or a GC scan with
+	 * frozen roots will free the pack underneath the reference. Same
+	 * omission as the aggregation drain's dedup. */
 	{
 		uint8_t reg_value[TESSERA_REGISTRY_ENTRY_SIZE];
-		if (tessera_fs_registry_get(tmp_, pack_id,
-		    reg_value) == TESSERA_OK) {
+		if (tessera_fs_registry_get_stable(tmp_, pack_id,
+		    reg_value, agg_hash) == TESSERA_OK) {
 			tessera_stat_publish_dedup_manifest++;
 			return (0);
 		}
