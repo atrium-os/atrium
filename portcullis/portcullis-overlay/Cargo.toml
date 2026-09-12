@@ -1,0 +1,10 @@
+[package]
+name        = "portcullis-overlay"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+description = "Per-app overlay VOLUMES: create, mount and tear down the Tessera volume mounted at /var/lib/atrium/overlays/<app.id>. Spec: docs/spec/portcullis.md §4.1-4.2."
+
+[dependencies]
+libc = "0.2"

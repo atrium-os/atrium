@@ -156,6 +156,16 @@ pub struct ResourcesSection {
     pub memory: Option<String>,                 /* "512M", "2G" */
     pub cpu:    Option<u32>,                    /* percent of one core */
     pub files:  Option<u32>,
+    /// Size of the app's overlay volume — everything it can write, since the
+    /// app tree itself is mounted read-only (`portcullis.md` §4.2). Same size
+    /// strings as `memory`. Absent = 1 GiB. This is a quota, not an
+    /// allocation: a fresh overlay costs about 12 MiB of real space.
+    ///
+    /// Unlike its siblings here, this field IS enforced — it becomes the
+    /// overlay volume's whole-filesystem quota, and the jail's `df` reports
+    /// it. `memory`, `cpu` and `files` are still declarations that nothing
+    /// reads yet.
+    pub storage: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

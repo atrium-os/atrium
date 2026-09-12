@@ -787,6 +787,50 @@ three trees of §4.2:
 > from `apps/`. It hides app content from the oracle but still leaks between
 > jails, so it pays the split without buying the structural guarantee.
 
+> **Implemented 2026-09-12** in `portcullis-overlay`, called from launch step 0
+> and from `portcullis remove`. Three things the design above did not say:
+>
+> **Where the volume comes from.** `<overlay-vol>` is an image file under
+> `/var/lib/atrium/overlay-vols/<app.id>.img` attached through `md(4)`:
+> `mkfs-tessera --create -s <MiB>`, `mdconfig -a -t vnode -f`, then the mount.
+> Every attach checks `mdconfig -lv` first — two `md` devices over one image is
+> corruption waiting to happen.
+>
+> **The size ceiling is 384 MiB, and it is not a policy choice.** Image
+> creation ends in `ftruncate`, and a truncate-extend on Tessera materialises
+> the whole new file in one contiguous `M_WAITOK` buffer, so the kmod refuses
+> any new size past `TESSERA_WRITE_MATERIALIZE_MAX` (512 MiB) with `EFBIG`.
+> Measured: 512 MiB truncates, 576 MiB does not. With the 25% headroom an
+> overlay needs for the journal and metadata reserve, that caps the quota at
+> 384 MiB — which is therefore also the default, since handing apps less than
+> the ceiling buys nothing. `[resources] storage` in the manifest sets it and
+> is clamped, loudly, not silently. The bound is on the OPERATION, not on file
+> size: a Tessera file can be appended far past it, so the ceiling lifts as
+> soon as image creation stops going through a single truncate, or the kmod
+> grows a sparse extend.
+>
+> **The cost figure above is for a FULL volume.** The image is
+> allocate-on-write like any other file, so a fresh overlay costs about 12 MiB
+> of real space, not its nominal size (measured: a 512 MiB image grew the store
+> by 11.9 MiB). Fifty idle apps is ~600 MiB, not 3.2 GiB; the ~6.4% applies to
+> what each app actually stores. The fifty flush gates, GC contexts and
+> pinscans are real either way.
+>
+> **The oracle claim was tested through the union, not just on the volume.**
+> `unionfs` sums the layers for `statfs`: `f_blocks` is the lower layer plus
+> the overlay (so a jail can see how big the pool is, which is static and not
+> an oracle), but `f_bavail` — the number the oracle reads — comes from the
+> overlay alone. Copying a file that demonstrably exists on the shared volume
+> (`libc.so.7` from the app tree, globally deduped) consumed exactly the same
+> free space as writing the same number of random bytes: 2056 KiB both times.
+>
+> **Migrating an existing overlay is not automatic.** An app installed under
+> the old layout has its state in the overlay *directory*, and mounting an
+> empty volume over it would hide every file — indistinguishable from data
+> loss. Launch detects a non-empty overlay directory with no image, leaves it
+> a directory, arms `deferred`, and prints what to do. A slower shape, not an
+> unsafe one.
+
 Each overlay is provisioned inside its own quota domain
 (tessera-quotas.md), which sets the dedup-domain boundary and
 enforces the overlay's byte limit. atrium-volumes' tessera plugin
@@ -901,10 +945,12 @@ mounted at that path (adopted 2026-09-12, §4.1):
 At launch, `portcullis launch --no-prompt`:
 
 0. Mounts the app's overlay VOLUME at `overlays/<id>/` with its
-   whole-FS quota, if not already mounted:
-   `mount -t tessera -o tessera.quota_bytes=N <overlay-vol> overlays/<id>/`.
+   whole-FS quota, if not already mounted — creating the backing image
+   and attaching it through `md(4)` on first launch:
+   `mount -t tessera -o tessera.quota_bytes=N /dev/md<n> overlays/<id>/`.
    This is what makes the jail's `df` report its own quota rather than
    the pool (§3.6) — and therefore what closes §20.1 channel 1.
+   Idempotent: a relaunch is one `statfs` and nothing else.
 1. Mounts `apps/<id>/` read-only via nullfs at `jails/<id>/`.
 2. Mounts `overlays/<id>/` writable via unionfs over the same
    `jails/<id>/`. Writes inside the jail land in the overlay;
@@ -913,9 +959,13 @@ At launch, `portcullis launch --no-prompt`:
    `jail -c`.
 
 On jail exit (or `jail -r`): tear down in reverse order — devfs,
-unionfs, nullfs. The overlay VOLUME may stay mounted across launches
-(its content is the app's persistent state); unmount it only when the
-app is uninstalled or the jail is being fully torn down.
+unionfs, nullfs. The overlay VOLUME stays mounted across launches
+(its content is the app's persistent state); it comes down only in
+`portcullis remove`, which unmounts it, releases the `md(4)` device,
+and deletes the backing image unless `--keep-overlay` says to keep it.
+`rm -rf` on the overlay path is NOT a substitute: against a mounted
+volume it empties the contents and then fails on the mount point, so
+the state is destroyed while the volume and its image survive.
 
 Rationale for the three-tree split (vs. nesting `rootfs/` and
 `overlay/` under one per-app dir as earlier drafts suggested):

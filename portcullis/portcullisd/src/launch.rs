@@ -122,12 +122,31 @@ pub fn launch_with_stdio(
     /* Mount overlay once; both setup and runtime jails see the same
      * union, so setup writes to /usr/local etc. are visible to the
      * runtime app. */
-    fs::create_dir_all(&overlay_dir)
-        .map_err(|e| LaunchError::Failed("mount",
-                 format!("create {}: {e}", overlay_dir.display())))?;
-    /* Before anything is mounted over it, and before the app can write:
-     * close the dedup existence oracle on the overlay. */
-    arm_overlay_dedup(&overlay_dir)?;
+
+    /* STEP 0 (portcullis.md §4.2): bring up the app's own overlay VOLUME, so
+     * the jail's statfs reports its own quota instead of the pool. That is
+     * what closes channel 1 of the dedup existence oracle, and it is the
+     * reason the overlay is a volume rather than a directory: quota-scoped
+     * statfs is per-mount and cannot be per-path.
+     *
+     * Stays mounted across launches — it holds the app's persistent state, and
+     * only `portcullis remove` takes it down. */
+    let overlay_quota = manifest.resources.as_ref()
+        .and_then(|r| r.storage.as_deref())
+        .and_then(portcullis_overlay::parse_size)
+        .unwrap_or(portcullis_overlay::DEFAULT_QUOTA_BYTES);
+    let backing = portcullis_overlay::ensure_mounted(app_id, overlay_quota)
+        .map_err(|m| LaunchError::Failed("mount", m))?;
+    if backing == portcullis_overlay::Backing::Directory {
+        /* No volume, so the structural mitigation is not in place. Fall back
+         * to the behavioural one: a per-directory dedup domain on `deferred`,
+         * which costs a full write per duplicate but keeps the observable
+         * free-space number content-independent. */
+        fs::create_dir_all(&overlay_dir)
+            .map_err(|e| LaunchError::Failed("mount",
+                     format!("create {}: {e}", overlay_dir.display())))?;
+        arm_overlay_dedup(&overlay_dir)?;
+    }
     fs::create_dir_all(&jail_path)
         .map_err(|e| LaunchError::Failed("mount",
                  format!("create {}: {e}", jail_path.display())))?;

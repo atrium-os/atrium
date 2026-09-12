@@ -1143,13 +1143,27 @@ fn cmd_remove(app_id: &str, keep_overlay: bool) -> ExitCode {
         println!("removed {}", app_dir.display());
     }
 
+    /* The overlay is the app's own Tessera VOLUME (portcullis.md §4.2), not a
+     * directory, whenever one could be built. `rm -rf` on a mounted volume
+     * empties its contents and then fails to remove the mount point, so the
+     * state is destroyed but the volume stays mounted and the backing image
+     * stays on disk — the worst of both answers. Go through the volume
+     * lifecycle instead; it degrades to a plain remove_dir_all when the
+     * overlay really is just a directory. */
     if !keep_overlay && overlay_dir.exists() {
-        if let Err(e) = fs::remove_dir_all(&overlay_dir) {
-            eprintln!("portcullis remove: {}: {e}", overlay_dir.display());
+        if let Err(e) = portcullis_overlay::destroy(app_id) {
+            eprintln!("portcullis remove: {e}");
             return ExitCode::from(1);
         }
-        println!("removed {}", overlay_dir.display());
+        println!("removed {} and its backing volume", overlay_dir.display());
     } else if keep_overlay && overlay_dir.exists() {
+        /* Unmount it, but keep the image: a kept overlay whose volume stays
+         * mounted would hold an md(4) device open against an app that is no
+         * longer installed. The next launch mounts it again. */
+        if let Err(e) = portcullis_overlay::teardown(app_id) {
+            eprintln!("portcullis remove: {e}");
+            return ExitCode::from(1);
+        }
         println!("kept {} (--keep-overlay)", overlay_dir.display());
     }
 

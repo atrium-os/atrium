@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 portcullis-toml   = { path = "../portcullis-toml" }
 portcullis-jail   = { path = "../portcullis-jail" }
+portcullis-overlay = { path = "../portcullis-overlay" }
 portcullis-policy = { path = "../portcullis-policy" }
 portcullis-ipc    = { path = "../portcullis-ipc" }
 portcullis-peer   = { path = "../portcullis-peer" }
