@@ -28203,6 +28203,12 @@ tessera_vop_pathconf(struct vop_pathconf_args *ap)
  * load-bearing for SALTED, which orphans existing hashes, and not for this
  * pair.) */
 #define TESSERA_IOC_DEDUP_POLICY _IOW('T', 3, uint64_t)
+/* Dump this mount's quota/dedup domain table to the console. Diagnostic only.
+ * There was NO way to enumerate domains, which meant a volume could carry
+ * non-global (deferred) domains with nobody able to say which trees they were
+ * attached to — and an unexplained deferred domain means unexplained
+ * double-writes. */
+#define TESSERA_IOC_QUOTA_DUMP  _IO('T', 4)
 
 static int tessera_vop_ioctl_impl(struct vop_ioctl_args *ap);
 
@@ -28347,6 +28353,26 @@ tessera_vop_ioctl_impl(struct vop_ioctl_args *ap)
 		    "(%u non-global domain(s))\n",
 		    (uintmax_t)dino.quota_domain, (uintmax_t)pol,
 		    (unsigned)tmp_->quota_nnonglobal);
+		return (0);
+	}
+	case TESSERA_IOC_QUOTA_DUMP: {
+		printf("tessera_fs: quota/dedup domains on this mount "
+		    "(%u total, %u non-global, default id %ju):\n",
+		    (unsigned)tmp_->quota_ndomains,
+		    (unsigned)tmp_->quota_nnonglobal,
+		    (uintmax_t)tmp_->quota_default_domain);
+		for (uint32_t i = 0; i < tmp_->quota_ndomains; i++) {
+			tessera_quota_domain_t *d = &tmp_->quota_domains[i];
+			const char *pol =
+			    d->dedup_policy == TESSERA_DEDUP_GLOBAL ? "global" :
+			    d->dedup_policy == TESSERA_DEDUP_DEFERRED ? "DEFERRED" :
+			    d->dedup_policy == TESSERA_DEDUP_SALTED ? "SALTED" : "?";
+			printf("  domain %ju root_inode=%u policy=%s "
+			    "limit=%ju used=%ju\n",
+			    (uintmax_t)d->domain_id, (unsigned)d->root_inode_no,
+			    pol, (uintmax_t)d->limit_bytes,
+			    (uintmax_t)d->used_bytes);
+		}
 		return (0);
 	}
 	case TESSERA_IOC_GC: {
