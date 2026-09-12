@@ -522,9 +522,11 @@ ph_userspace() {
     # Each of these is its own cargo workspace with its own target/ dir.
     # (crate-dir, cargo args, produced binaries)
     set -- \
-      "portcullis|-p portcullisd|portcullisd" \
+      "portcullis|-p portcullisd|portcullisd atrium-portcullisd-daemon atrium-portcullisd-bootstrap atrium-portcullisd-jclient atrium-portcullisd-aq" \
       "portcullis|-p portcullis-cli|portcullis" \
       "portcullis|-p opifex|opifex" \
+      "portcullis|-p jaild|atrium-jaild" \
+      "portcullis|-p atrium-volumes|atrium-volumes atrium-volumes-cli" \
       "frescod|--bin frescod|frescod" \
       "forum-wm||forum-wm" \
       "forum-bar||forum-bar" \
