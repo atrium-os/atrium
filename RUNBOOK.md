@@ -234,6 +234,36 @@ been exercised on a machine without an existing `vm.qcow2`. There is also no
 
 ## 2. VM lifecycle
 
+### ⚠ The devroot needs `varmfs="NO"` — do not let it drift back to AUTO
+
+The Tessera devroot's `/etc/rc.conf` sets `varmfs="NO"` deliberately. With
+FreeBSD's default `varmfs="AUTO"`, `/etc/rc.d/var` probes with
+`mkdir -p /var/.diskless` and, on failure, mounts a **memory `/var`** over the
+top. That memory filesystem then **shadows the apps volume**, which `fstab`
+mounts at `/var/lib/atrium`:
+
+```
+3  /dev/gpt/atrium-apps on /var/lib/atrium (tessera)
+4  tmpfs on /var (tmpfs)          <- mounted after, hides the line above
+```
+
+The volume stays mounted and busy, but is unreachable: `ls /var/lib` returns
+*No such file or directory*. This went unnoticed for over a month — the 8 GB
+apps volume read as 22 MB and its contents (`apps/org.atrium.forum-bar`,
+`apps/org.atrium.forum-dock`, `jails/`, `overlays/`) were invisible, not lost.
+Anything that writes under `/var/lib/atrium` — `atrium-pkg`, bundle install,
+per-jail trees — silently writes to a memory filesystem instead.
+
+`/var` on the Tessera root is writable, so the AUTO probe was failing for some
+other reason at boot; `varmfs="NO"` makes the question moot. `/tmp` stays tmpfs,
+which is correct.
+
+★ There is no in-repo template for the devroot's `/etc/rc.conf` —
+`build-zfs-root.sh` writes the *ZFS* root (`hostname="atrium-dev"`), not this
+one. The devroot is a maintained-in-place image, so this setting exists only
+inside it. If the devroot is ever rebuilt, re-apply:
+`sysrc varmfs="NO"` (a backup of the prior file is at `/etc/rc.conf.pre-varmfs`).
+
 ### Boot (no GPU server attached — smoke test)
 ```sh
 ~/src/bsd/scripts/run-vm.sh
