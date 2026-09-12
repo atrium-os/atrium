@@ -37,9 +37,16 @@
 #   a GC bug — but with GC off the signal is ~8x rarer, so the test would need
 #   to run far longer to have the same power. Hence gc=1 by default.
 #
-#   Assert the mechanism actually fired: access_no_inode must be NONZERO. A
-#   run where it stayed 0 did not exercise the fixed path at all and its green
+#   Assert the mechanism actually fired: gc_const_pins must be NONZERO. A run
+#   where it stayed 0 never ran a GC pass that pinned the format-time
+#   constants, so it did not exercise the mechanism under test and its green
 #   result means nothing (the dead-arm trap).
+#
+#   ★ The guard used to key on access_no_inode, which was correct while
+#   vop_access's sticky EIO was the failure. 4417ed6c made that path
+#   unreachable BY DESIGN, so the guard began firing on every healthy run —
+#   a guard that warns when things are correct just trains you to ignore it.
+#   Re-point a dead-arm check whenever the mechanism it guards is superseded.
 #
 #   sh scripts/vm-namespace-churn-test.sh            # 200s, GC on
 #   SECS=600 sh scripts/vm-namespace-churn-test.sh   # longer
@@ -66,7 +73,7 @@ i=0; while [ \$i -lt 20 ]; do d=\$M/t0/d\$i; mkdir -p \$d
 sync
 sysctl kern.tessera.lookup_no_inode_verbose=1 >/dev/null 2>&1
 S(){ sysctl -n kern.tessera.\$1 2>/dev/null || echo 0; }
-A0=\$(S access_no_inode); G0=\$(S gc_touch_keeps)
+A0=\$(S access_no_inode); G0=\$(S gc_touch_keeps); P0=\$(S gc_const_pins)
 
 rm -f /root/nc.stop; : > /root/nc.err
 n=1; while [ \$n -le 3 ]; do
@@ -82,7 +89,7 @@ sleep $SECS
 touch /root/nc.stop; sleep 4; wait 2>/dev/null
 
 BROKEN=\$(grep -oE '/mnt/scratch[^ :]*' /root/nc.err 2>/dev/null | sed 's|/[abc]\$||' | sort -u | wc -l | tr -d ' ')
-echo \"broken_dirs=\$BROKEN errors=\$(wc -l < /root/nc.err | tr -d ' ') access_no_inode=\$(( \$(S access_no_inode)-A0 )) gc_touch_keeps=\$(( \$(S gc_touch_keeps)-G0 ))\"
+echo \"broken_dirs=\$BROKEN errors=\$(wc -l < /root/nc.err | tr -d ' ') access_no_inode=\$(( \$(S access_no_inode)-A0 )) gc_touch_keeps=\$(( \$(S gc_touch_keeps)-G0 )) const_pins=\$(( \$(S gc_const_pins)-P0 ))\"
 sync; umount \$M 2>/dev/null || echo UMOUNT_FAIL
 tessera-fsck \$DEV > /root/nc.fsck 2>&1
 echo \"fsck_problems=\$(grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem' /root/nc.fsck)\"" 2>&1 | tr -d '\r')
@@ -91,11 +98,27 @@ echo "$OUT"
 case "$OUT" in *REFUSING*|*MKFS_FAIL*|*UMOUNT_FAIL*) echo "FAIL — harness could not run"; exit 1;; esac
 B=$(echo "$OUT" | sed -n 's/.*broken_dirs=\([0-9]*\).*/\1/p')
 A=$(echo "$OUT" | sed -n 's/.*access_no_inode=\([0-9]*\).*/\1/p')
+P=$(echo "$OUT" | sed -n 's/.*const_pins=\([0-9]*\).*/\1/p')
 F=$(echo "$OUT" | sed -n 's/.*fsck_problems=\([0-9]*\).*/\1/p')
 rc=0
 [ "${B:-1}" = 0 ] || { echo "FAIL — $B directories wedged"; rc=1; }
 [ "${F:-1}" = 0 ] || { echo "FAIL — fsck found $F problems"; rc=1; }
-# ★ dead-arm guard: a green run that never entered the path proves nothing.
-[ "${A:-0}" -gt 0 ] 2>/dev/null || echo "WARNING — access_no_inode never fired; this run did not exercise the fixed path, so its PASS is not evidence"
+# ★ DEAD-ARM GUARD — keyed on the mechanism that is load-bearing NOW.
+#
+# This used to require access_no_inode > 0. That was right when vop_access's
+# sticky EIO was the failure under test, but the rmdir-detach fix (4417ed6c)
+# made that path UNREACHABLE by design, so the guard then fired on every clean
+# run and cried wolf: "this run did not exercise the fixed path" on a run that
+# was working exactly as intended. A guard that warns when things are correct
+# trains you to ignore it.
+#
+# What must fire now is the constant pin (8b326074): if GC never pinned the
+# format-time constants, the run did not exercise the mechanism that keeps the
+# shared empty-directory manifest reachable, and its PASS proves nothing.
+[ "${P:-0}" -gt 0 ] 2>/dev/null || echo "WARNING — gc_const_pins never fired: no GC pass pinned the format-time constants, so this PASS is not evidence"
+# access_no_inode is now expected to be ZERO (the path is unreachable since
+# 4417ed6c). A NONZERO value means removed directories are once again
+# outliving their inode records — report it rather than treating it as normal.
+[ "${A:-0}" -eq 0 ] 2>/dev/null || echo "NOTE — access_no_inode=$A: vop_access hit a missing inode record, which 4417ed6c was supposed to make impossible"
 [ $rc = 0 ] && echo "PASS — no directory wedged in ${SECS}s of concurrent traversal + churn"
 exit $rc
