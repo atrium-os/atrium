@@ -652,10 +652,66 @@ The reference implementation ships (a) with grace disabled by default, and pins 
 
 ## 12. Layout invariants
 
-- The journal is sized at format time. Default: `max(64 MiB, 1% of volume)`.
+- The journal is sized at format time. Default: **256 sectors (1 MiB)**
+  (`DEFAULT_JOURNAL_SECTORS`), overridable per-volume at mkfs.
+- The **meta-reserve zone** is `max(1024 sectors, total_sectors / 16)` — i.e.
+  **~6.25% of the volume**, floored at 4 MiB. This is the dominant fixed cost,
+  not the journal.
 - The inode-table zone is sized to hold `min(initial_size, 0.1% of volume)` worth of blocks. Beyond that, additional blocks are allocated from the free-extent zone.
 - The pack-registry zone is sized for `1024` packs initial capacity; expansion uses the free-extent map.
 - The pack-file zone is the rest of the volume.
+
+> **Corrected 2026-09-12.** This list previously said the journal default was
+> `max(64 MiB, 1% of volume)` and did not mention the meta-reserve zone at all.
+> Both were wrong in a way that mattered: the journal is a flat 1 MiB, and the
+> unmentioned meta reserve at `total/16` is where essentially all the fixed
+> overhead lives. Anyone sizing a small volume from the old text would have
+> budgeted 64 MiB for a journal that is 1 MiB, and missed the 6.25% that
+> actually dominates.
+
+### 12.1 Measured fixed overhead per volume
+
+A freshly formatted, empty volume consumes **~6.4%** of its capacity, which
+tracks the `total/16` meta reserve as expected:
+
+| volume | used when empty | overhead |
+|---|---|---|
+| 4 GiB | 257 MiB | 6.3% |
+| 512 MiB | 33 MiB | 6.5% |
+
+**It scales, so it cannot be amortised by using more, smaller volumes.** This
+is the number to design against when a layout multiplies volumes — e.g.
+portcullis.md §4.1's per-overlay-volume design, where 50 app overlays cost
+~6.4% of their combined size in pure overhead. The practical floor on volume
+size is a few hundred MiB: 180 MiB volumes format and mount correctly, but the
+4 MiB meta-reserve floor and the 1 MiB journal stop being negligible below
+roughly that.
+
+### 12.2 Per-mount runtime cost
+
+Distinct from on-disk overhead, each *mounted* volume carries per-mount kernel
+state (flush gate, dirty lists, GC context, pinscan bitmap, and the 256 KiB
+SATB touch bitmap allocated lazily on first GC).
+
+Measured, mounting 1→20 volumes and touching each so the lazy allocations
+happen:
+
+| mounts | wired memory |
+|---|---|
+| 1 | 2 MiB |
+| 8 | 17 MiB |
+| 20 | 46 MiB |
+
+Cleanly linear at **~2.3 MiB per mount**, fully released at unmount (46 MiB →
+4 MiB residual). Idle CPU was flat at 99.2–99.6% across 0→20 mounts, and
+throughput on an active volume was unchanged with 8 others mounted (23,430 vs
+23,282 iters, against 2.5% within-arm spread). **Idle mounts do not spin**: GC
+is armed by activity, so a quiet volume costs memory and nothing else.
+
+★ The 2.3 MiB figure is a floor, not a ceiling — it was measured on 180 MiB
+volumes, and per-mount structures that scale with volume size (notably the meta
+pin bitmap) will cost more on larger ones. Re-measure at the volume size and
+count actually intended.
 
 ## 13. mkfs.tessera contract
 
