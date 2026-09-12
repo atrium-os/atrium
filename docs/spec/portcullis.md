@@ -792,6 +792,32 @@ Each overlay is provisioned inside its own quota domain
 enforces the overlay's byte limit. atrium-volumes' tessera plugin
 sets `dedup_policy` at domain creation.
 
+The policy comes from the volume's own spec if it names one
+(`dedup_policy` in the manifest's `[[volumes]]` entry), otherwise
+from the backend-wide `dedup_policy` in
+`/etc/atrium/volumes.policy.toml`, otherwise nothing is set and the
+volume stays in whatever domain it inherits. Because the dedup
+domain and the quota domain are one record, a volume that names a
+policy gets a domain even with no `size_max`: the plugin mints it
+with a limit of 0, which Tessera reads as unlimited.
+
+> **Corrected 2026-09-12.** The sentence above was aspirational
+> when written: the plugin did `mkdir` + `chown` +
+> `TESSERA_IOC_QUOTA_SET` and nothing else, so every provisioned
+> overlay came up `policy=global` — the oracle-open setting this
+> section exists to avoid. Demonstrated live before the fix, with
+> a freshly provisioned overlay landing as `domain 6
+> root_inode=146 policy=global`. The `TESSERA_IOC_DEDUP_POLICY`
+> plumbing now exists and the claim holds; a provision through a
+> `dedup_policy = "deferred"` backend was verified to produce
+> `domain 7 root_inode=148 policy=DEFERRED limit=0`.
+>
+> **Known gap.** `destroy` releases the directory but not the
+> quota-domain record, which is left pointing at a freed inode.
+> Domain ids are a bounded table, so a long enough
+> provision/destroy cycle will exhaust it. There is no detach
+> ioctl yet.
+
 > **Corrected 2026-09-12.** This paragraph previously also claimed
 > the per-overlay domain "gives the jail quota-scoped `statfs`
 > (tessera-quotas.md §3.6) — a jail never sees the pool-physical

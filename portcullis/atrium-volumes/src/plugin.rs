@@ -80,12 +80,33 @@ impl BackendPlugin for TesseraPlugin {
         // mount (or the kmod predates the ioctl) we get ENOTTY and log a
         // warning rather than fail the provision — the dir is still usable,
         // just unbounded. Idempotent: re-provisioning re-sets the limit.
-        if let Some(limit) = spec.size_max {
+        //
+        // The dedup policy rides on the same record, so a volume that asks
+        // for one needs a domain even when it has no size_max — a limit of 0
+        // means unlimited, which is exactly "a domain of my own, no cap".
+        // Spec-declared policy wins over the backend-wide default.
+        let policy = resolve_dedup_policy(spec, backend);
+        let limit = spec.size_max.or(policy.map(|_| 0));
+        if let Some(limit) = limit {
             match ffi::tessera_set_quota(Path::new(&path), limit) {
                 Ok(()) => debug!("tessera: quota {} bytes on {}", limit, path),
                 Err(e) => log::warn!(
                     "tessera: size_max={} not enforced on {} ({}) — \
                      volume is unbounded", limit, path, e),
+            }
+        }
+        // Same best-effort-and-loud contract as the quota: a volume that
+        // silently stayed `global` when the operator asked for `deferred` is
+        // a security control that isn't there, so it must show up in the log.
+        if let Some(policy) = policy {
+            match ffi::tessera_set_dedup_policy(
+                Path::new(&path), policy.as_ioctl_arg())
+            {
+                Ok(()) => debug!("tessera: dedup_policy={:?} on {}", policy, path),
+                Err(e) => log::warn!(
+                    "tessera: dedup_policy={:?} NOT applied to {} ({}) — \
+                     the volume dedups against the rest of the filesystem",
+                    policy, path, e),
             }
         }
         debug!("tessera: provisioned {} (mode={:#o} {}:{})",
@@ -197,6 +218,18 @@ fn compose_host_path(
     Ok(p.to_string_lossy().into_owned())
 }
 
+/// Which dedup policy this volume gets: the one its own spec names, else the
+/// backend-wide default, else none (inherit the parent tree's domain). The
+/// per-volume answer wins because a manifest describes one app's data, while
+/// the backend default describes a whole tree — an app asking for `deferred`
+/// on a `global` backend must not be quietly downgraded.
+fn resolve_dedup_policy(
+    spec: &VolumeSpec,
+    backend: &BackendConfig,
+) -> Option<crate::protocol::DedupPolicy> {
+    spec.dedup_policy.or(backend.dedup_policy)
+}
+
 fn ensure_dir(path: &str, mode: u32) -> io::Result<()> {
     /* Idempotent mkdir -p with the requested mode. If the
      * directory already exists, we ensure perms still match. */
@@ -256,6 +289,7 @@ mod tests {
             owner_uid: uid,
             owner_gid: gid,
             size_max:  None,
+            dedup_policy: None,
         }
     }
 
@@ -276,6 +310,7 @@ mod tests {
             kind: BackendKind::Plain,
             root: Some(dir.path().to_string_lossy().into_owned()),
             default: true,
+            dedup_policy: None,
         };
         let p = PlainPlugin;
         let host_path = p.provision(&backend, "mysqld", &spec_data())
@@ -295,6 +330,7 @@ mod tests {
             kind: BackendKind::Plain,
             root: Some(dir.path().to_string_lossy().into_owned()),
             default: true,
+            dedup_policy: None,
         };
         let p = PlainPlugin;
         let host_path = p.provision(&backend, "mysqld", &spec_data()).unwrap();
@@ -311,6 +347,7 @@ mod tests {
             kind: BackendKind::Plain,
             root: Some("/tmp".into()),
             default: true,
+            dedup_policy: None,
         };
         let err = p.destroy(&backend, "/etc/passwd").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
@@ -323,6 +360,7 @@ mod tests {
             kind: BackendKind::Tmpfs,
             root: None,
             default: false,
+            dedup_policy: None,
         };
         let p = TmpfsPlugin;
         let path = p.provision(&backend, "mysqld", &spec_data()).unwrap();
@@ -336,6 +374,7 @@ mod tests {
             kind: BackendKind::Plain,
             root: Some("/var/lib".into()),
             default: true,
+            dedup_policy: None,
         };
         assert!(compose_host_path(&backend, "../escape", "data").is_err());
         assert!(compose_host_path(&backend, "ok",         "../bad").is_err());
@@ -350,11 +389,38 @@ mod tests {
             kind: BackendKind::Plain,
             root: Some(dir.path().to_string_lossy().into_owned()),
             default: true,
+            dedup_policy: None,
         };
         let p = PlainPlugin;
         let h1 = p.provision(&backend, "mysqld", &spec_data()).unwrap();
         let h2 = p.provision(&backend, "mysqld", &spec_data()).unwrap();
         assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn dedup_policy_precedence() {
+        use crate::protocol::DedupPolicy;
+        let mut backend = BackendConfig {
+            name: "overlays".into(),
+            kind: BackendKind::Tessera,
+            root: Some("/var/lib/atrium".into()),
+            default: false,
+            dedup_policy: None,
+        };
+        let mut spec = spec_data();
+
+        // Nothing set anywhere: leave the volume in its inherited domain.
+        assert_eq!(resolve_dedup_policy(&spec, &backend), None);
+
+        // Backend-wide default applies when the spec is silent.
+        backend.dedup_policy = Some(DedupPolicy::Deferred);
+        assert_eq!(resolve_dedup_policy(&spec, &backend),
+                   Some(DedupPolicy::Deferred));
+
+        // The spec overrides the backend, including downward.
+        spec.dedup_policy = Some(DedupPolicy::Global);
+        assert_eq!(resolve_dedup_policy(&spec, &backend),
+                   Some(DedupPolicy::Global));
     }
 
     #[test]

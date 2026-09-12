@@ -9,11 +9,23 @@ schema_version = 1
 # name one. Most deployments make this `tessera` (Atrium-native;
 # CAS dedup; POSIX-compliant). For testing on a non-Tessera host,
 # `plain` works on any UFS / ext4 / NFS / etc. mount.
+#
+# dedup_policy is the Tessera dedup-domain policy applied to every volume
+# this backend provisions (tessera-fs.md §20.2). It is "deferred" here and
+# not "global" for the same reason the overlay tree is: a per-jail data
+# volume is one app's private state, and under "global" a writer can test
+# whether a chunk already exists anywhere else on the volume by watching
+# free space (the existence oracle, §20.1). "deferred" closes that at the
+# cost of one full write per duplicate chunk, reclaimed later by the
+# dead-extent drain. Set it to "global" on a backend whose tenants already
+# trust each other and where sharing matters more (the read-only apps tree
+# is the example).
 [[backend]]
 name    = "default"
 kind    = "tessera"
 root    = "/var/lib/atrium/storage"
 default = true
+dedup_policy = "deferred"
 
 # Operator's fast DB tier. Separate ZFS pool, tuned for small
 # random writes (recordsize=16k, logbias=throughput). The zfs

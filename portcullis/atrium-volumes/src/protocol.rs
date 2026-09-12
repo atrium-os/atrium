@@ -39,6 +39,38 @@ pub struct VolumeSpec {
     pub owner_gid: u32,
     #[serde(default)]
     pub size_max:  Option<u64>,
+    /// Dedup domain policy for the volume root (Tessera only;
+    /// other backends ignore it). `None` = don't touch, i.e. the
+    /// volume inherits whatever domain its parent tree is in.
+    #[serde(default)]
+    pub dedup_policy: Option<DedupPolicy>,
+}
+
+/// Tessera dedup-domain policy (`tessera-fs.md` §20.2). The values match
+/// `TESSERA_DEDUP_*` in `tessera/format.h`; `salted` is deliberately absent
+/// because the kmod rejects it (it changes the chunk hash, so it can only be
+/// chosen at domain creation and nothing implements it).
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DedupPolicy {
+    /// Chunks dedup against every other tree on the volume. Maximum sharing;
+    /// also means a writer can learn whether a chunk already exists elsewhere
+    /// by watching free space (the existence oracle, §20.1).
+    Global,
+    /// A duplicate chunk still costs a full write; the losing extent goes to
+    /// the dead-extent log and is reclaimed later. Closes the oracle at the
+    /// cost of one write per duplicate.
+    Deferred,
+}
+
+impl DedupPolicy {
+    /// The `uint64_t` the `TESSERA_IOC_DEDUP_POLICY` ioctl takes.
+    pub fn as_ioctl_arg(self) -> u64 {
+        match self {
+            DedupPolicy::Global   => 0,   // TESSERA_DEDUP_GLOBAL
+            DedupPolicy::Deferred => 1,   // TESSERA_DEDUP_DEFERRED
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -167,6 +199,7 @@ mod tests {
                 owner_uid: 88,
                 owner_gid: 88,
                 size_max:  Some(100 * 1024 * 1024 * 1024),
+                dedup_policy: Some(DedupPolicy::Deferred),
             },
         });
         let bytes = serde_json::to_vec(&req).unwrap();

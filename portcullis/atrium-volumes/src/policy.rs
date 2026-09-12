@@ -35,6 +35,14 @@ pub struct BackendConfig {
     /// must have `default = true`.
     #[serde(default)]
     pub default: bool,
+
+    /// Dedup policy applied to every volume this backend provisions, unless
+    /// the volume's own spec names one. This is where the operator says "the
+    /// overlays backend is `deferred`" once, instead of repeating it in every
+    /// app manifest. `None` = leave the volume in whatever domain it inherits.
+    /// Tessera-only; other backends ignore it.
+    #[serde(default)]
+    pub dedup_policy: Option<crate::protocol::DedupPolicy>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]

@@ -68,6 +68,7 @@ fn main() -> ExitCode {
                     owner_uid: 0,
                     owner_gid: 0,
                     size_max:  None,
+                    dedup_policy: None,
                 },
             })
         }

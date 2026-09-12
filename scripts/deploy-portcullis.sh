@@ -39,6 +39,23 @@ if [ ! -x "$T/atrium-jaild" ] || [ ! -x "$T/atrium-volumes" ]; then
         echo "ABORT: cross-build failed"; exit 1; }
 fi
 
+# ★ Stop the daemons BEFORE copying. FreeBSD refuses to write a running
+# executable (ETXTBSY), so a deploy onto a live stack copied nothing for
+# exactly the three binaries that matter, then reported "already running" and
+# exited 0 — a green deploy that deployed the OLD code. Caught by comparing
+# sha256 at the destination (feedback_verify_the_input_not_just_the_output).
+# They are restarted below in dependency order; with START=0 the operator
+# restarts them.
+echo "=== stopping daemons (ETXTBSY guard) ==="
+for s in atrium-portcullisd-daemon atrium-volumes atrium-jaild; do
+    if g "pgrep -f $s >/dev/null 2>&1"; then
+        g "service $s stop >/dev/null 2>&1"
+        printf '  %-34s stopped\n' "$s"
+    else
+        printf '  %-34s not running\n' "$s"
+    fi
+done
+
 echo "=== binaries -> /usr/local/bin ==="
 rc=0
 for b in atrium-jaild atrium-volumes atrium-volumes-cli \
@@ -47,7 +64,16 @@ for b in atrium-jaild atrium-volumes atrium-volumes-cli \
          portcullisd portcullis opifex ostiarius; do
     if [ -x "$T/$b" ]; then
         if scp $SSHOPT -P 2222 "$T/$b" root@localhost:/usr/local/bin/ >/dev/null 2>&1; then
-            printf '  %-34s ok\n' "$b"
+            # Gate on the INPUT landing, not on scp's exit status: assert the
+            # bytes AT THE DESTINATION are the bytes we built.
+            want=$(shasum -a 256 "$T/$b" | awk '{print $1}')
+            got=$(g "sha256 -q /usr/local/bin/$b" 2>/dev/null | tr -d '\r')
+            if [ "$want" = "$got" ]; then
+                printf '  %-34s ok\n' "$b"
+            else
+                printf '  %-34s SHA MISMATCH (want %.12s got %.12s)\n' "$b" "$want" "$got"
+                rc=1
+            fi
         else printf '  %-34s COPY FAILED\n' "$b"; rc=1; fi
     else
         printf '  %-34s not built (skipped)\n' "$b"

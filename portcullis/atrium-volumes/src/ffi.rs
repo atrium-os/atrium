@@ -88,3 +88,44 @@ pub fn tessera_set_quota(_path: &Path, _limit_bytes: u64) -> io::Result<()> {
         "tessera quota ioctl is FreeBSD-only",
     ))
 }
+
+/// Set the dedup policy of the quota domain rooted at `path` via
+/// `TESSERA_IOC_DEDUP_POLICY = _IOW('T', 3, uint64_t)` — encoded the same way
+/// as the quota ioctl above, with command 3: `0x8008_5403`.
+///
+/// `path` must ALREADY be a quota-domain root: the kmod returns `EINVAL`
+/// otherwise, because the dedup domain and the quota domain are one record
+/// (`tessera-quotas.md` §4.2) and setting a policy on a plain directory would
+/// silently retarget whatever domain it inherits — in the common case the
+/// default domain, i.e. the whole filesystem. Callers mint the domain with
+/// `tessera_set_quota` first (a limit of 0 means unlimited, so a volume with
+/// no `size_max` can still have its own domain).
+#[cfg(target_os = "freebsd")]
+pub fn tessera_set_dedup_policy(path: &Path, policy: u64) -> io::Result<()> {
+    const TESSERA_IOC_DEDUP_POLICY: libc::c_ulong = 0x8008_5403;
+    let c_path = CString::new(path.as_os_str().to_string_lossy().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "nul in path"))?;
+    // SAFETY: open a directory read-only for the ioctl; close on every path.
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut pol = policy;
+    let rc = unsafe {
+        libc::ioctl(fd, TESSERA_IOC_DEDUP_POLICY, &mut pol as *mut u64)
+    };
+    let err = io::Error::last_os_error();
+    unsafe { libc::close(fd) };
+    if rc != 0 {
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn tessera_set_dedup_policy(_path: &Path, _policy: u64) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "tessera dedup-policy ioctl is FreeBSD-only",
+    ))
+}

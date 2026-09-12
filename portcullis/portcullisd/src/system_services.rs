@@ -335,6 +335,12 @@ pub struct ManifestVolume {
     #[serde(default)]
     pub size_max: Option<u64>,
 
+    /// Dedup domain policy for this volume's root (`global` or `deferred`).
+    /// Tessera-only; see `tessera-fs.md` §20.2. Omitted = inherit whatever
+    /// domain the backend's tree is in.
+    #[serde(default)]
+    pub dedup_policy: Option<atrium_volumes::protocol::DedupPolicy>,
+
     /// First-run initialization. If present, portcullisd runs this
     /// as a one-shot jail (sharing the manifest's mounts + path,
     /// no network) before launching the real service. A sentinel
@@ -375,6 +381,7 @@ impl ManifestVolume {
             owner_uid: self.owner_uid,
             owner_gid: self.owner_gid,
             size_max:  self.size_max,
+            dedup_policy: self.dedup_policy,
         }
     }
 }
@@ -725,12 +732,15 @@ mod tests {
             owner_uid: 88,
             owner_gid: 88,
             size_max: Some(100 * 1024 * 1024 * 1024),
+            dedup_policy: Some(atrium_volumes::protocol::DedupPolicy::Deferred),
             init: None,
         };
         let spec = v.to_volume_spec();
         assert_eq!(spec.name, "data");
         assert_eq!(spec.backend.as_deref(), Some("fast-db"));
         assert_eq!(spec.size_max, Some(100 * 1024 * 1024 * 1024));
+        assert_eq!(spec.dedup_policy,
+            Some(atrium_volumes::protocol::DedupPolicy::Deferred));
     }
 
     #[test]
