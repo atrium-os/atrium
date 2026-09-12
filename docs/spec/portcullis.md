@@ -738,11 +738,43 @@ three trees of §4.2:
 | `jails/<id>/` | mountpoint only | n/a (no persistent content) |
 
 Each overlay is provisioned inside its own quota domain
-(tessera-quotas.md), which simultaneously sets the dedup-domain
-boundary and gives the jail quota-scoped `statfs`
-(tessera-quotas.md §3.6) — a jail never sees the pool-physical
-free-space counter. atrium-volumes' tessera plugin sets
-`dedup_policy` at domain creation.
+(tessera-quotas.md), which sets the dedup-domain boundary and
+enforces the overlay's byte limit. atrium-volumes' tessera plugin
+sets `dedup_policy` at domain creation.
+
+> **Corrected 2026-09-12.** This paragraph previously also claimed
+> the per-overlay domain "gives the jail quota-scoped `statfs`
+> (tessera-quotas.md §3.6) — a jail never sees the pool-physical
+> free-space counter." **That is false, and it was a security
+> assurance**, so it is called out rather than quietly edited.
+>
+> §3.6 is explicit that scoping is **per-mount and cannot be
+> per-path**: `VFS_STATFS(mp, sbp)` receives a *mount*, not a
+> vnode, so the filesystem cannot know which directory the caller
+> asked about. §3.6 records having made this exact mistake in an
+> earlier draft. The implementation matches the spec — it keys on
+> the *mount's* `quota_default_domain`, so a per-directory domain
+> does not scope `df` at all.
+>
+> Measured on the apps volume, where `overlays/org.atrium.forum-bar`
+> **is** a domain root with a 64 GiB quota — every path returns the
+> identical whole-volume figures:
+>
+> ```
+> /var/lib/atrium                                f_blocks=2097142 f_bavail=1959401
+> /var/lib/atrium/apps                           f_blocks=2097142 f_bavail=1959401
+> /var/lib/atrium/overlays                       f_blocks=2097142 f_bavail=1959401
+> /var/lib/atrium/overlays/org.atrium.forum-bar  f_blocks=2097142 f_bavail=1959401
+> ```
+>
+> So **`deferred` is the whole mitigation** for §20.1 channel 1 in
+> this layout — nothing else is closing it, and the earlier wording
+> invited the reader to assume a second, independent defence that
+> does not exist. If genuine statfs scoping is wanted per jail, the
+> overlay must be its **own mount** carrying a whole-FS quota
+> (`mount -o tessera.quota_bytes=N`), which sets
+> `quota_default_domain` and makes §3.6 apply. That is a layout
+> change, not a policy flag.
 
 ### 4.2 Per-jail layout (split across three trees)
 
