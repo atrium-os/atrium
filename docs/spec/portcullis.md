@@ -737,6 +737,56 @@ three trees of §4.2:
 | `overlays/<id>/` | the jailed app (untrusted) | `deferred` (default) — content-independent write behavior; physical dedup converges at repack. `salted` iff the manifest sets `privacy = true` on the volume. |
 | `jails/<id>/` | mountpoint only | n/a (no persistent content) |
 
+> **Adopted 2026-09-12 — overlays become per-app VOLUMES, and their policy
+> reverts to `global`.** The row above says `deferred` because, in a layout
+> where every overlay is a directory on one shared volume, `deferred` is the
+> only thing closing §20.1 channel 1 (see the correction below: the
+> per-directory quota does *not* scope `statfs`). Making each overlay its own
+> Tessera volume mounted with a whole-FS quota replaces that behavioural
+> mitigation with a structural one:
+>
+> ```
+> mount -t tessera -o tessera.quota_bytes=N /dev/<overlay-vol> \
+>       /var/lib/atrium/overlays/<app.id>
+> ```
+>
+> Measured on the reference kmod:
+>
+> | claim | result |
+> |---|---|
+> | whole-FS quota scopes `statfs` (§3.6) | 256 MiB visible vs a 4096 MiB pool |
+> | physical dedup still active inside the volume | `publish_dedup_chunked` +1 on a duplicate |
+> | the jail observes **logical** usage | 248 MiB free of a 256 MiB quota, pool holding 261 MiB |
+>
+> The third row is why `global` is safe here. `f_bavail = (limit − used_bytes)
+> / bsize` and `used_bytes` is **logical** (tessera-quotas.md §3.2), so a
+> duplicate consumes full quota whether or not it deduped physically. The
+> number a jail can observe is therefore **content-independent by
+> construction** — the oracle is closed by the accounting, not by how the write
+> path behaves — and the volume contains only that app's own content, so there
+> is nothing of anyone else's to probe for. `deferred`'s transient double
+> storage is no longer needed.
+>
+> **What this does NOT change:** `apps/` stays a single shared volume on
+> `global`. tessera-fs.md §20.2 is explicit that the N-apps-≈-1× thesis is won
+> *entirely* on trusted-ingest content, so keeping one apps volume preserves
+> the whole disk-cost win. A volume is the dedup boundary, so per-app overlay
+> volumes do lose cross-*overlay* dedup — which §20.2 already judges marginal,
+> since it is user data that rarely repeats between jails. Dedup *within* an
+> overlay is unaffected.
+>
+> **Cost, stated honestly.** A Tessera volume carries ~6.4% fixed overhead
+> (measured: 257 MiB on 4 GiB, 33 MiB on 512 MiB — it scales, so it cannot be
+> amortised away), and each overlay volume is a separate mount with its own
+> flush gate, dirty lists, GC context and pinscan. Fifty apps with 1 GiB
+> overlays is ~3.2 GiB of overhead and fifty background GC loops. Provisioning
+> also becomes volume-create rather than `mkdir`. Re-measure at the app count
+> actually expected before committing to it at scale.
+>
+> ⚠ Do **not** take the middle option of one shared *overlays* volume separate
+> from `apps/`. It hides app content from the oracle but still leaks between
+> jails, so it pays the split without buying the structural guarantee.
+
 Each overlay is provisioned inside its own quota domain
 (tessera-quotas.md), which sets the dedup-domain boundary and
 enforces the overlay's byte limit. atrium-volumes' tessera plugin
@@ -779,7 +829,9 @@ sets `dedup_policy` at domain creation.
 ### 4.2 Per-jail layout (split across three trees)
 
 Per-app state is split across three sibling trees under
-`/var/lib/atrium/`, all subtrees of the same Tessera volume:
+`/var/lib/atrium/`. `apps/` and `jails/` are subtrees of the shared
+Tessera volume; each `overlays/<app.id>/` is its **own Tessera volume**
+mounted at that path (adopted 2026-09-12, §4.1):
 
 ```
 /var/lib/atrium/
@@ -788,7 +840,11 @@ Per-app state is split across three sibling trees under
 │   ├── lib/...                     by the jail — preserves cross-jail
 │   ├── share/...                   CAS dedup of binaries + libs)
 │   └── atrium.toml
-├── overlays/<app.id>/         ← upper layer: per-app writable (Tessera)
+├── overlays/<app.id>/         ← upper layer: per-app writable — its OWN
+│   │                             Tessera VOLUME mounted here with
+│   │                             -o tessera.quota_bytes=N (adopted
+│   │                             2026-09-12; see §4.1). Was a directory
+│   │                             on the shared volume.
 │   ├── home/                  ← what the app sees as $HOME
 │   ├── tmp/                   ← scratch
 │   ├── var/                   ← persisted app state
@@ -801,6 +857,11 @@ Per-app state is split across three sibling trees under
 
 At launch, `portcullis launch --no-prompt`:
 
+0. Mounts the app's overlay VOLUME at `overlays/<id>/` with its
+   whole-FS quota, if not already mounted:
+   `mount -t tessera -o tessera.quota_bytes=N <overlay-vol> overlays/<id>/`.
+   This is what makes the jail's `df` report its own quota rather than
+   the pool (§3.6) — and therefore what closes §20.1 channel 1.
 1. Mounts `apps/<id>/` read-only via nullfs at `jails/<id>/`.
 2. Mounts `overlays/<id>/` writable via unionfs over the same
    `jails/<id>/`. Writes inside the jail land in the overlay;
@@ -809,7 +870,9 @@ At launch, `portcullis launch --no-prompt`:
    `jail -c`.
 
 On jail exit (or `jail -r`): tear down in reverse order — devfs,
-unionfs, nullfs.
+unionfs, nullfs. The overlay VOLUME may stay mounted across launches
+(its content is the app's persistent state); unmount it only when the
+app is uninstalled or the jail is being fully torn down.
 
 Rationale for the three-tree split (vs. nesting `rootfs/` and
 `overlay/` under one per-app dir as earlier drafts suggested):
