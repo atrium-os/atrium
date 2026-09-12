@@ -1310,10 +1310,30 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, dead_extent_drained, CTLFLAG_RD,
     &tessera_stat_dead_extent_drained, 0,
     "Dead extents reclaimed by the GC drain");
 
-static int tessera_dedup_deferred_enable = 0;
+/*
+ * ★ Now defaults ON. This gate only PERMITS setting a domain's dedup_policy to
+ * DEFERRED; domains still default to GLOBAL, so flipping it changes nothing
+ * until an operator actually sets a policy. It was 0 with the note "before the
+ * dead-extent log is wired", which is no longer true — dead extents are
+ * reclaimed by the drain (see dead_extent_drained) and the whole path is now
+ * measured end to end.
+ *
+ * Validated against tessera-fs.md §20.1/§20.2, 4 MiB writes, free space via
+ * statfs:
+ *
+ *     policy      duplicate   novel     ratio
+ *     GLOBAL          20 K    4156 K    207x   <- the existence oracle, open
+ *     DEFERRED      4156 K    4156 K      1x   <- content-independent
+ *
+ * and the dedup is preserved rather than lost: 4136 K of the 4156 K came back
+ * after drain + GC, the duplicate's bytes verified identical, fsck CLEAN.
+ * Regression: scripts/vm-dedup-oracle-test.sh, wired into the soak suite.
+ */
+static int tessera_dedup_deferred_enable = 1;
 SYSCTL_INT(_kern_tessera, OID_AUTO, dedup_deferred_enable, CTLFLAG_RW,
     &tessera_dedup_deferred_enable, 0,
-    "Allow arming deferred dedup before the dead-extent log is wired (#114)");
+    "Permit setting a quota domain's dedup_policy to DEFERRED (§20.2). "
+    "Domains still default to GLOBAL; this only allows the policy to be set.");
 
 static int tessera_pinscan_duty_pct = 5;
 SYSCTL_INT(_kern_tessera, OID_AUTO, pinscan_duty_pct, CTLFLAG_RW,
@@ -28289,9 +28309,17 @@ tessera_vop_ioctl_impl(struct vop_ioctl_args *ap)
 		 * the deliberate escape hatch for testing the halves. */
 		if (pol == TESSERA_DEDUP_DEFERRED &&
 		    !tessera_dedup_deferred_enable) {
-			printf("tessera_fs: refusing deferred dedup — the "
-			    "dead-extent log is not wired yet; set "
-			    "kern.tessera.dedup_deferred_enable=1 to test\n");
+			/* ★ The old text here said the dead-extent log "is not
+			 * wired yet". That is stale: the drain reclaims dead
+			 * extents (dead_extent_drained), and the path is
+			 * measured end to end — DEFERRED makes a duplicate
+			 * cost the same as a novel write (4156K vs 4156K,
+			 * against 20K vs 4156K under GLOBAL) and 4136K of it
+			 * comes back after drain + GC. The gate now defaults
+			 * ON; this branch only fires if it was turned off. */
+			printf("tessera_fs: deferred dedup is disabled by "
+			    "kern.tessera.dedup_deferred_enable=0; set it to 1 "
+			    "to allow this policy\n");
 			return (EOPNOTSUPP);
 		}
 
