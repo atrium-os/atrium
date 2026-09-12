@@ -129,3 +129,40 @@ pub fn tessera_set_dedup_policy(_path: &Path, _policy: u64) -> io::Result<()> {
         "tessera dedup-policy ioctl is FreeBSD-only",
     ))
 }
+
+/// Retire the quota/dedup domain rooted at `path` via
+/// `TESSERA_IOC_QUOTA_DETACH = _IO('T', 5)`. `_IO` carries no direction bits
+/// and no argument, so it encodes as `IOC_VOID(0x2000_0000) | ('T' << 8) | 5`
+/// = `0x2000_5405`.
+///
+/// Must be called BEFORE the directory is removed — after the removal there is
+/// nothing left to name the domain, and the record is orphaned for good (well,
+/// until a remount reclaims it). `path` must be the domain's root: a directory
+/// that merely inherited the domain gets `EPERM`, and `EINVAL` means it is in
+/// no domain at all.
+#[cfg(target_os = "freebsd")]
+pub fn tessera_detach_quota_domain(path: &Path) -> io::Result<()> {
+    const TESSERA_IOC_QUOTA_DETACH: libc::c_ulong = 0x2000_5405;
+    let c_path = CString::new(path.as_os_str().to_string_lossy().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "nul in path"))?;
+    // SAFETY: open a directory read-only for the ioctl; close on every path.
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let rc = unsafe { libc::ioctl(fd, TESSERA_IOC_QUOTA_DETACH) };
+    let err = io::Error::last_os_error();
+    unsafe { libc::close(fd) };
+    if rc != 0 {
+        return Err(err);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "freebsd"))]
+pub fn tessera_detach_quota_domain(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "tessera quota-detach ioctl is FreeBSD-only",
+    ))
+}

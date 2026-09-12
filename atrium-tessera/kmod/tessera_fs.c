@@ -4038,6 +4038,14 @@ struct tessera_mount {
 	 * path answer "everything is global" with one compare and pay nothing.
 	 * Maintained by the policy ioctl and by domain load at mount. */
 	uint32_t                  quota_nnonglobal;
+	/* Domain ids retired since the last commit. Removing a record from
+	 * quota_domains[] is not enough: the flush only PUTs the in-core table
+	 * and never deletes, so a dropped domain would reload from the quota
+	 * tree at the next mount. These ids are deleted from the tree on the
+	 * next commit and the list is then cleared. Bounded by the table it
+	 * drains from. */
+	uint64_t                  quota_dead_ids[TESSERA_QUOTA_MAX_DOMAINS];
+	uint32_t                  quota_ndead;
 	uint64_t                  quota_default_domain;
 	/* Persistence: the on-disk quota-domain tree (lazy-created on first
 	 * flush), and a dirty flag set on any used_bytes/limit change so
@@ -4902,6 +4910,64 @@ tessera_fs_quota_recount_nonglobal(struct tessera_mount *tmp_)
 		if (tmp_->quota_domains[i].dedup_policy != TESSERA_DEDUP_GLOBAL)
 			n++;
 	tmp_->quota_nnonglobal = n;
+}
+
+/* Retire the domain at table index `i`: drop the in-core record and queue its
+ * id for deletion from the on-disk quota tree at the next commit.
+ *
+ * Descendants of the retired tree still carry the old id in their inode
+ * records. That resolves to NULL through tessera_quota_find, i.e. "no quota
+ * and global dedup" — correct for the caller that is tearing the tree down,
+ * and SAFE IN GENERAL ONLY BECAUSE IDS ARE NEVER REUSED. The allocator is
+ * sb.next_quota_domain_id, which only ever counts up; if it instead re-derived
+ * an id from the surviving table (as it did before this existed), a retired id
+ * could be handed to an unrelated tree and those stale descendants would be
+ * silently charged to it. */
+static void
+tessera_fs_quota_retire_at(struct tessera_mount *tmp_, uint32_t i)
+{
+	KASSERT(i < tmp_->quota_ndomains, ("quota retire index out of range"));
+	uint64_t id = tmp_->quota_domains[i].domain_id;
+	if (tmp_->quota_ndead < TESSERA_QUOTA_MAX_DOMAINS)
+		tmp_->quota_dead_ids[tmp_->quota_ndead++] = id;
+	/* Compact by moving the last record down; order is not meaningful. */
+	tmp_->quota_ndomains--;
+	if (i != tmp_->quota_ndomains)
+		tmp_->quota_domains[i] = tmp_->quota_domains[tmp_->quota_ndomains];
+	memset(&tmp_->quota_domains[tmp_->quota_ndomains], 0,
+	    sizeof(tmp_->quota_domains[0]));
+	tessera_fs_quota_recount_nonglobal(tmp_);
+	tmp_->quota_dirty = 1;
+}
+
+/* Allocate a fresh domain id from the superblock's monotonic counter.
+ *
+ * ★ sb.next_quota_domain_id is documented in format.h as "the monotonic
+ * allocator", and nothing had ever read or written it — the allocator did not
+ * exist. The id came from a scan for the maximum id in the live table, which
+ * is fine only while records are never removed. It made retiring a domain
+ * unsafe, because the maximum drops back and the next allocation reissues a
+ * just-freed id.
+ *
+ * The scan survives as a FLOOR, not as the allocator: volumes created before
+ * this have the field at 0 while carrying real domains, so the first
+ * allocation on such a volume has to start above what is already there. */
+static uint64_t
+tessera_fs_quota_alloc_id(struct tessera_mount *tmp_)
+{
+	/* 0 means "no domain"; 1 is reserved for the whole-FS default. */
+	uint64_t id = tmp_->sb.next_quota_domain_id;
+	if (id < 2) id = 2;
+	for (uint32_t i = 0; i < tmp_->quota_ndomains; i++)
+		if (tmp_->quota_domains[i].domain_id >= id)
+			id = tmp_->quota_domains[i].domain_id + 1;
+	/* Retired-but-not-yet-committed ids must not come back either. */
+	for (uint32_t i = 0; i < tmp_->quota_ndead; i++)
+		if (tmp_->quota_dead_ids[i] >= id)
+			id = tmp_->quota_dead_ids[i] + 1;
+	tmp_->sb.next_quota_domain_id = id + 1;
+	tessera_fs_mark_dirty(tmp_);
+	return (id);
 }
 
 /* Allocate the next inode_no atomically. The bare
@@ -6295,6 +6361,52 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		}
 		if (qc != NULL)
 			tessera_btree_cursor_free(qc);
+		/* Reclaim orphans. A domain whose root directory is gone can
+		 * never be charged, named or detached again, and it still
+		 * occupies one of TESSERA_QUOTA_MAX_DOMAINS slots. Volumes
+		 * predating the detach ioctl have one of these per destroyed
+		 * volume, so the recovery has to happen here and not only at
+		 * the new free path.
+		 *
+		 * FAIL SAFE. Reclaim only on a definite answer: the inode is
+		 * absent, or it exists and does NOT point back at this domain.
+		 * Anything else — an IO error, an unreadable tree — keeps the
+		 * record. Dropping a live domain would silently un-quota a
+		 * tree and flip its dedup policy back to global, which is far
+		 * worse than leaking a slot.
+		 *
+		 * The round-trip (inode -> domain -> same inode) is what makes
+		 * this safe against inode-number reuse: a freed root inode
+		 * handed to some unrelated file does not carry the domain id
+		 * back, so the record is still recognised as dead. */
+		uint32_t qi = 0;
+		while (qi < tmp_->quota_ndomains) {
+			tessera_quota_domain_t *d = &tmp_->quota_domains[qi];
+			/* The default domain's root is nominal, not a real
+			 * per-directory attachment; never reap it. */
+			if (d->domain_id == 1 || d->root_inode_no == 0) {
+				qi++;
+				continue;
+			}
+			tessera_inode_record_t rino;
+			int rr = tessera_fs_inode_get(tmp_, d->root_inode_no,
+			    &rino);
+			int dead = (rr == TESSERA_ENOENT) ||
+			    (rr == TESSERA_OK &&
+			     rino.quota_domain != d->domain_id);
+			if (!dead) {
+				qi++;
+				continue;
+			}
+			printf("tessera_fs: reclaiming orphaned quota domain "
+			    "%ju (root inode %u is %s)\n",
+			    (uintmax_t)d->domain_id, (unsigned)d->root_inode_no,
+			    rr == TESSERA_ENOENT ? "gone"
+			                         : "not in this domain");
+			tessera_fs_quota_retire_at(tmp_, qi);
+			/* retire_at compacted index qi; re-examine it. */
+		}
+
 		/* Domains carry their dedup_policy on disk, so the publish
 		 * path's fast-path counter has to be rebuilt from what was
 		 * just loaded — otherwise a volume with a deferred domain
@@ -10612,13 +10724,29 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 	 * the inode/snapshot trees. Lazy-create on first flush (non-quota'd
 	 * volumes never grow one). Best-effort: a btree failure leaves
 	 * quota_dirty set to retry next commit. */
-	if (tmp_->quota_dirty && tmp_->quota_ndomains > 0) {
+	/* ★ quota_ndead is part of the condition, not just quota_ndomains.
+	 * Retiring the LAST domain leaves ndomains at 0, and gating solely on
+	 * it would skip the commit that removes the record — the domain would
+	 * come back at the next mount, which is precisely the leak the detach
+	 * ioctl exists to stop. */
+	if (tmp_->quota_dirty &&
+	    (tmp_->quota_ndomains > 0 || tmp_->quota_ndead > 0)) {
 		uint64_t qroot = tmp_->sb.quota_tree_root;
-		if (tmp_->quota_tree == NULL)
+		if (tmp_->quota_tree == NULL && tmp_->quota_ndomains > 0)
 			tmp_->quota_tree = tessera_btree_create(&tmp_->meta_bio,
 			    TESSERA_BTREE_KIND_QUOTA, /*key*/ 8,
 			    /*value*/ TESSERA_QUOTA_DOMAIN_SIZE, &qroot);
 		int qok = (tmp_->quota_tree != NULL);
+		/* Deletes first: a retire followed by a fresh allocation can
+		 * only ever produce a HIGHER id (the allocator is monotonic),
+		 * so the two sets are disjoint and the order is not load-
+		 * bearing for correctness — it just keeps the tree smaller
+		 * across the puts. A delete of an absent key is not an error
+		 * worth failing the commit for: the record may predate the
+		 * tree, or have been removed by an earlier partial commit. */
+		for (uint32_t i = 0; qok && i < tmp_->quota_ndead; i++)
+			(void)tessera_quota_store_delete(tmp_->quota_tree,
+			    tmp_->quota_dead_ids[i], &qroot);
 		for (uint32_t i = 0; qok && i < tmp_->quota_ndomains; i++)
 			if (tessera_quota_store_put(tmp_->quota_tree,
 			    &tmp_->quota_domains[i], &qroot) != TESSERA_OK)
@@ -10626,6 +10754,7 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 		if (qok) {
 			tmp_->sb.quota_tree_root = qroot;
 			tmp_->quota_dirty = 0;
+			tmp_->quota_ndead = 0;
 		}
 	}
 
@@ -28210,6 +28339,32 @@ tessera_vop_pathconf(struct vop_pathconf_args *ap)
  * double-writes. */
 #define TESSERA_IOC_QUOTA_DUMP  _IO('T', 4)
 
+/* Retire the quota/dedup domain rooted at this directory: clear the
+ * directory's quota_domain, drop the in-core record, and delete it from the
+ * quota tree at the next commit. Userspace:
+ *   ioctl(dirfd, TESSERA_IOC_QUOTA_DETACH).
+ *
+ * WHY THIS EXISTS. There was no way to release a domain, so a volume manager
+ * that provisions and destroys per-jail volumes leaked one record per
+ * provision — the directory went away and the record stayed, pointing at a
+ * freed inode. The table is capped at TESSERA_QUOTA_MAX_DOMAINS and
+ * TESSERA_IOC_QUOTA_SET returns ENOSPC once it fills, at which point every
+ * later volume silently loses BOTH its quota and its dedup policy (callers
+ * treat those ioctls as best-effort). A bounded resource with an allocate and
+ * no free is a slow ENOSPC with the diagnosis a long way from the cause.
+ *
+ * Only the domain's ROOT directory may detach it. Every directory in the tree
+ * inherits the same quota_domain at mkdir, so accepting any member would let a
+ * child silently dissolve the quota of everything above it; the root check is
+ * the one that tells a root from a member.
+ *
+ * The tree does NOT have to be empty. The intended caller detaches and then
+ * unlinks, and requiring empty would mean detaching after the directory is
+ * gone — with no directory left to name it. See tessera_fs_quota_retire_at for
+ * what descendants see, and why the monotonic id allocator is what makes it
+ * safe. */
+#define TESSERA_IOC_QUOTA_DETACH _IO('T', 5)
+
 static int tessera_vop_ioctl_impl(struct vop_ioctl_args *ap);
 
 /* Directory-record RMW (xattr_hash / quota_domain fields) can race the
@@ -28261,8 +28416,8 @@ tessera_vop_ioctl_impl(struct vop_ioctl_args *ap)
 			return (EIO);
 
 		/* Re-set an existing domain's limit, else allocate a new id
-		 * (max in-core id + 1, never colliding with the default id 1)
-		 * and bind this directory's inode to it. */
+		 * from the superblock's monotonic counter and bind this
+		 * directory's inode to it. */
 		tessera_quota_domain_t *qd =
 		    tessera_quota_find(tmp_, dino.quota_domain);
 		if (qd != NULL) {
@@ -28273,11 +28428,7 @@ tessera_vop_ioctl_impl(struct vop_ioctl_args *ap)
 		}
 		if (tmp_->quota_ndomains >= TESSERA_QUOTA_MAX_DOMAINS)
 			return (ENOSPC);
-		uint64_t new_id = 1;
-		for (uint32_t i = 0; i < tmp_->quota_ndomains; i++)
-			if (tmp_->quota_domains[i].domain_id >= new_id)
-				new_id = tmp_->quota_domains[i].domain_id + 1;
-		if (new_id < 2) new_id = 2;
+		uint64_t new_id = tessera_fs_quota_alloc_id(tmp_);
 
 		tessera_quota_domain_init(
 		    &tmp_->quota_domains[tmp_->quota_ndomains], new_id,
@@ -28373,6 +28524,59 @@ tessera_vop_ioctl_impl(struct vop_ioctl_args *ap)
 			    pol, (uintmax_t)d->limit_bytes,
 			    (uintmax_t)d->used_bytes);
 		}
+		return (0);
+	}
+	case TESSERA_IOC_QUOTA_DETACH: {
+		if (vp->v_type != VDIR) return (ENOTDIR);
+		if (tmp_->inode_tree == NULL) return (EROFS);
+
+		tessera_inode_record_t dino;
+		if (tessera_fs_inode_get(tmp_, (uint32_t)tn->inode_no, &dino)
+		    != TESSERA_OK)
+			return (EIO);
+		if (dino.quota_domain == 0)
+			return (EINVAL);   /* not in any domain */
+
+		uint32_t idx = TESSERA_QUOTA_MAX_DOMAINS;
+		for (uint32_t i = 0; i < tmp_->quota_ndomains; i++)
+			if (tmp_->quota_domains[i].domain_id == dino.quota_domain) {
+				idx = i;
+				break;
+			}
+		if (idx == TESSERA_QUOTA_MAX_DOMAINS) {
+			/* The inode names a domain the table doesn't have. Clear
+			 * the dangling reference rather than leaving it: nothing
+			 * can be charged to it and it would fail this way
+			 * forever. */
+			dino.quota_domain = 0;
+			if (tessera_fs_inode_put(tmp_, (uint32_t)tn->inode_no,
+			    &dino) != TESSERA_OK)
+				return (EIO);
+			tessera_fs_mark_dirty(tmp_);
+			return (0);
+		}
+		/* Members inherit the id; only the root may retire it. */
+		if (tmp_->quota_domains[idx].root_inode_no != tn->inode_no)
+			return (EPERM);
+		/* The default domain is the mount's, not a volume's. */
+		if (dino.quota_domain == tmp_->quota_default_domain)
+			return (EBUSY);
+
+		uint64_t id = dino.quota_domain;
+		/* Clear the inode FIRST. If the retire succeeded and this
+		 * failed, the directory would name a domain that no longer
+		 * exists; this order leaves the record orphaned instead, which
+		 * is the state we already recover from at mount. */
+		dino.quota_domain = 0;
+		if (tessera_fs_inode_put(tmp_, (uint32_t)tn->inode_no, &dino)
+		    != TESSERA_OK)
+			return (EIO);
+		tessera_fs_quota_retire_at(tmp_, idx);
+		tessera_fs_mark_dirty(tmp_);
+		printf("tessera_fs: quota domain %ju detached from inode %u "
+		    "(%u domain(s) left, %u non-global)\n", (uintmax_t)id,
+		    (unsigned)tn->inode_no, (unsigned)tmp_->quota_ndomains,
+		    (unsigned)tmp_->quota_nnonglobal);
 		return (0);
 	}
 	case TESSERA_IOC_GC: {

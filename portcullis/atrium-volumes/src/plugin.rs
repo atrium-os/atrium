@@ -115,6 +115,29 @@ impl BackendPlugin for TesseraPlugin {
     }
 
     fn destroy(&self, _backend: &BackendConfig, host_path: &str) -> io::Result<()> {
+        // Release the quota/dedup domain BEFORE removing the tree. Afterwards
+        // there is no directory left to name it, and the record is stranded
+        // pointing at a freed inode — the table is capped, so enough
+        // provision/destroy cycles exhaust it and every later volume silently
+        // loses both its quota and its dedup policy.
+        //
+        // Best-effort for the same reasons the provision side is: a volume on
+        // a non-Tessera backend, or one that never got a domain, must still be
+        // destroyable. ENOTTY and EINVAL are the expected "nothing to release"
+        // answers and are not worth a warning; anything else means a domain is
+        // being leaked and has to be visible.
+        match ffi::tessera_detach_quota_domain(Path::new(host_path)) {
+            Ok(()) => debug!("tessera: released quota domain on {}", host_path),
+            Err(e) => {
+                let expected = matches!(e.raw_os_error(),
+                    Some(libc::ENOTTY) | Some(libc::EINVAL));
+                if !expected {
+                    log::warn!(
+                        "tessera: quota domain on {} NOT released ({}) — \
+                         the record is leaked", host_path, e);
+                }
+            }
+        }
         rm_rf_safe(host_path)
     }
 }

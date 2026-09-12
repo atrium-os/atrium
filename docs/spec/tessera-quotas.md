@@ -348,6 +348,25 @@ uint64_t quota_features;        /* bitmask: quota_logical_bytes (V1),
 `quota_features` lets us evolve the quota machinery without a
 full format-version bump.
 
+**`next_quota_domain_id` is load-bearing, not bookkeeping.** Once a
+domain can be retired (§6.1, `QUOTA_DETACH`), descendants of the
+retired tree still carry the old id in their inode records until
+they are deleted. A stale id must resolve to nothing, which holds
+only if the id is never handed out again. Ids therefore only ever
+count up, and a retired id is burned.
+
+> **Implemented 2026-09-12.** Nothing read or wrote this field for
+> the first year of its existence: the kmod derived each new id
+> from the highest one in the live domain table instead, which is
+> equivalent only while records are never removed. It made retiring
+> a domain unsafe — the maximum drops back and the next allocation
+> reissues a just-freed id. The table scan survives as a *floor*,
+> so volumes written before this, which carry real domains and a
+> zeroed counter, still allocate above what is already there.
+
+Id 0 means "no domain" and id 1 is reserved for the whole-volume
+default domain, so per-directory allocation starts at 2.
+
 ### 4.4 Journal records
 
 New journal record kind for atomic quota updates:
@@ -487,6 +506,37 @@ ascending domain_id order to avoid deadlock.
 ## 6. API surface
 
 ### 6.1 ioctls
+
+> **What is actually implemented (2026-09-12).** The kmod ships a
+> smaller, flatter set than the structs below, on commands 1-5
+> rather than 32-35, each taking a bare `uint64_t` or nothing:
+>
+> | command | ioctl | designed counterpart |
+> |---|---|---|
+> | `_IOW('T', 1, uint64_t)` | `QUOTA_SET` — create-or-reset a limit | `QUOTA_CREATE` + `QUOTA_SET_LIMIT` |
+> | `_IOW('T', 3, uint64_t)` | `DEDUP_POLICY` — set `global`/`deferred` | the `dedup_policy` field of `QUOTA_CREATE` |
+> | `_IO('T', 4)` | `QUOTA_DUMP` — console dump of the table | `QUOTA_QUERY` (roughly; it is a diagnostic, not an API) |
+> | `_IO('T', 5)` | `QUOTA_DETACH` — retire the domain | `QUOTA_DESTROY` |
+>
+> Three deliberate differences from the design:
+>
+> - `DEDUP_POLICY` is a separate command because policy is **not**
+>   immutable post-create for the `global`/`deferred` pair. Both
+>   hash content identically, so stored blobs stay addressable
+>   either way. Immutability is load-bearing only for `salted`,
+>   which changes the chunk hash and orphans existing ones, and
+>   which the kmod rejects with `EOPNOTSUPP`.
+> - `QUOTA_DETACH` does **not** clear descendants' `quota_domain`,
+>   lazily or otherwise. It does not need to: ids are never reused
+>   (§4.3), so a stale id resolves to nothing rather than to some
+>   later tree's domain. Its caller unlinks the tree immediately
+>   afterwards.
+> - `QUOTA_DETACH` has no force flag and does not refuse on
+>   `used_bytes > 0`. The volume manager detaches precisely because
+>   it is about to delete the data.
+>
+> `QUOTA_QUERY`, the sysctl tree in §6.2 and the CLI in §6.3 do not
+> exist yet.
 
 A small set on a directory fd:
 

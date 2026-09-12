@@ -812,11 +812,28 @@ with a limit of 0, which Tessera reads as unlimited.
 > `dedup_policy = "deferred"` backend was verified to produce
 > `domain 7 root_inode=148 policy=DEFERRED limit=0`.
 >
-> **Known gap.** `destroy` releases the directory but not the
-> quota-domain record, which is left pointing at a freed inode.
-> Domain ids are a bounded table, so a long enough
-> provision/destroy cycle will exhaust it. There is no detach
-> ioctl yet.
+> **Gap closed 2026-09-12.** `destroy` used to release the
+> directory but not the quota-domain record, leaving it pointing
+> at a freed inode. The table is capped at 256 domains and
+> `TESSERA_IOC_QUOTA_SET` returns `ENOSPC` once it fills, at which
+> point every later volume silently loses both its quota and its
+> dedup policy — the plugin treats both ioctls as best-effort. The
+> plugin now retires the domain through
+> `TESSERA_IOC_QUOTA_DETACH` before removing the tree, and a mount
+> reclaims records whose root directory is gone (four such
+> orphans were reclaimed on the dev volume at first boot with the
+> fix). Verified over provision/destroy cycles: the table returns
+> to its live set each time.
+
+Detaching a domain is safe only because domain ids are never
+reused. Descendants of a retired tree still carry the old id in
+their inode records, and with a reusing allocator that id could be
+handed to an unrelated tree, silently charging those descendants to
+it. The allocator is `next_quota_domain_id` in the superblock,
+which only counts up. The format has always specified it as "the
+monotonic allocator"; until this change nothing read or wrote it,
+and the kmod derived each id from the highest one in the live
+table — correct only while records are never removed.
 
 > **Corrected 2026-09-12.** This paragraph previously also claimed
 > the per-overlay domain "gives the jail quota-scoped `statfs`
