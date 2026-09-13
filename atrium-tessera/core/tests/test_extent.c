@@ -249,12 +249,13 @@ test_random_stress(void)
 
 /* ── B+tree-backed round-trip ────────────────────────────────────── */
 
-#define MAX_SECTORS 256
+#define MAX_SECTORS 1024
 
 struct mem_disk {
 	uint8_t  blocks[MAX_SECTORS][4096];
 	uint8_t  used[MAX_SECTORS];
 	uint64_t next_sector;
+	uint64_t allocs;          /* md_alloc calls — the flush cost under test */
 };
 
 static int md_read(void *ctx, uint64_t s, uint8_t *o) {
@@ -270,6 +271,7 @@ static int md_write(void *ctx, uint64_t s, const uint8_t *b) {
 static int md_alloc(void *ctx, uint64_t n, uint64_t *o) {
 	struct mem_disk *d = ctx;
 	if (n != 1) return -1;
+	d->allocs++;
 	for (uint64_t i = d->next_sector; i < MAX_SECTORS; i++) {
 		if (!d->used[i]) { d->used[i] = 1; d->next_sector = i + 1;
 		    *o = i; return 0; }
@@ -355,6 +357,78 @@ test_btree_round_trip(void)
 	free(d);
 }
 
+/* ★ The regression that emptied the dev root's metadata reserve at boot.
+ *
+ * tessera_extent_flush_via rebuilt the whole free-extent tree with one
+ * tessera_btree_put per extent, each copy-on-writing its root-to-leaf path:
+ * O(N x depth) metadata allocations per flush, ~3,600 per commit on the dev
+ * root. It now builds with one sorted batch (each node written once) and does
+ * nothing at all when the allocator has not changed. */
+static void
+test_flush_cost_many_extents(void)
+{
+	struct mem_disk *d = calloc(1, sizeof *d);
+	d->next_sector = 1;
+	tessera_block_io_t io = {
+		.read_block = md_read, .write_block = md_write,
+		.alloc      = md_alloc, .free       = md_free,
+		.ctx        = d,
+	};
+	tessera_extent_alloc_t *a = tessera_extent_open(&io, 0);
+	CHECK(a != NULL);
+
+	/* 4000 non-touching extents: many leaves, and start sectors whose
+	 * little-endian byte order differs from numeric order throughout. */
+	const uint64_t N = 4000;
+	uint64_t total = 0;
+	for (uint64_t i = 0; i < N; i++) {
+		CHECK(tessera_extent_free(a, 1000 + i * 3, 1 + (i % 2)) == TESSERA_OK);
+		total += 1 + (i % 2);
+	}
+
+	uint64_t root = 0, before = d->allocs;
+	CHECK(tessera_extent_flush(a, &root) == TESSERA_OK);
+	CHECK(root != 0);
+	uint64_t cost = d->allocs - before;
+	/* ~16-byte entries in 4 KiB leaves: tens of leaves. The per-put build
+	 * needed N x depth (>= 8000). Bound it loosely but far below that. */
+	printf("  flush of %ju extents allocated %ju sector(s)\n",
+	    (uintmax_t)N, (uintmax_t)cost);
+	CHECK(cost < 200);
+
+	/* Unchanged → same root, zero allocations. */
+	uint64_t root2 = 0;
+	before = d->allocs;
+	CHECK(tessera_extent_flush(a, &root2) == TESSERA_OK);
+	CHECK(root2 == root);
+	CHECK(d->allocs == before);
+
+	/* Reopen: the loaded state is identical, and a flush with no change
+	 * reuses the root it was opened from. */
+	tessera_extent_close(a);
+	tessera_extent_alloc_t *b = tessera_extent_open(&io, root);
+	CHECK(b != NULL);
+	CHECK(tessera_extent_free_blocks(b) == total);
+	uint64_t root3 = 0;
+	before = d->allocs;
+	CHECK(tessera_extent_flush(b, &root3) == TESSERA_OK);
+	CHECK(root3 == root);
+	CHECK(d->allocs == before);
+
+	/* A change → a real rebuild, and it round-trips. */
+	uint64_t s0 = 0;
+	CHECK(tessera_extent_alloc(b, 2, &s0) == TESSERA_OK);
+	uint64_t root4 = 0;
+	CHECK(tessera_extent_flush(b, &root4) == TESSERA_OK);
+	CHECK(root4 != root);
+	tessera_extent_close(b);
+	tessera_extent_alloc_t *c = tessera_extent_open(&io, root4);
+	CHECK(c != NULL);
+	CHECK(tessera_extent_free_blocks(c) == total - 2);
+	tessera_extent_close(c);
+	free(d);
+}
+
 int
 main(void)
 {
@@ -368,6 +442,7 @@ main(void)
 	test_einval_zero();
 	test_random_stress();
 	test_btree_round_trip();
+	test_flush_cost_many_extents();
 	if (failures > 0) {
 		fprintf(stderr, "%d failure(s)\n", failures);
 		return 1;

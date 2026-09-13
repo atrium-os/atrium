@@ -1341,6 +1341,11 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, pinscan_duty_pct, CTLFLAG_RW,
     "Target background-pinscan duty cycle in percent (#71): the next scan "
     "is refused until last_scan_ms * (100/pct - 1) has elapsed. "
     "0 = old behaviour (rate-limit only, <=1 kick/s)");
+static unsigned long tessera_stat_pinscan_duty_bypass_tight = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_duty_bypass_tight, CTLFLAG_RD,
+    &tessera_stat_pinscan_duty_bypass_tight, 0,
+    "pinscan kicks that skipped the duty-cycle quiet period because the "
+    "metadata reserve was tight (see tessera_fs_meta_tight)");
 static unsigned long tessera_stat_pinscan_skips_duty = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_skips_duty, CTLFLAG_RD,
     &tessera_stat_pinscan_skips_duty, 0,
@@ -4182,6 +4187,7 @@ SYSCTL_PROC(_kern_tessera, OID_AUTO, gate_owner,
     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
     tessera_sysctl_gate_owner, "A",
     "flush-gate holder tid + gate depth + meta-reserve state (wedge probe)");
+
 
 /* Pack-registry overlay ops (Option D part 2). Publishes APPEND here
  * instead of walking the btree; the flush batch-puts the whole
@@ -16327,6 +16333,25 @@ kick:
 	tessera_meta_pin_bitmap_rebuild(tmp_);
 }
 
+/*
+ * The metadata reserve is TIGHT when the sectors still available to the
+ * allocator (soft headroom above the bump pointer, plus meta_free) are fewer
+ * than those parked in meta_pending awaiting a scan, or under a quarter of the
+ * soft reserve. Unlocked read of counters, like tessera_fs_meta_admit: a
+ * boundary race costs one scan early or one skipped.
+ */
+static int
+tessera_fs_meta_tight(struct tessera_mount *tmp_)
+{
+	uint64_t msoft = tessera_meta_soft_length(tmp_);
+	uint64_t mused = tmp_->sb.meta_reserve_bump > tmp_->sb.meta_reserve_start
+	    ? tmp_->sb.meta_reserve_bump - tmp_->sb.meta_reserve_start : 0;
+	uint64_t mavail = (msoft > mused ? msoft - mused : 0) +
+	    (uint64_t)tmp_->meta_free_count;
+	return (mavail < (uint64_t)tmp_->meta_pending_count ||
+	    mavail < msoft / 4);
+}
+
 static void
 tessera_meta_pin_bitmap_rebuild(struct tessera_mount *tmp_)
 {
@@ -16371,13 +16396,27 @@ tessera_meta_pin_bitmap_rebuild(struct tessera_mount *tmp_)
 	 * the volume — where the 1/s rule above bounds only how often a scan
 	 * may START.
 	 */
+	/*
+	 * ★ ...but never while the reserve is running out. The duty cycle is a
+	 * cost bound for OPPORTUNISTIC reclaim; it must not decide whether
+	 * reclaim happens at all. At boot the mount-time scan of the dev root
+	 * took 1.1 s, which bought 21 s of quiet — and in those 21 s a commit
+	 * burst moved the whole metadata free list into meta_pending (free
+	 * 292,191 -> 0, pending 82,545 -> 374,978, 112 kicks all skipped on
+	 * duty), so creates failed ENOSPC until the quiet ran out. Only a scan
+	 * can release pending sectors, so when they outnumber what is left,
+	 * the scan is the cheapest thing the volume can do.
+	 */
 	if (tessera_pinscan_duty_pct > 0 && tessera_pinscan_duty_pct < 100 &&
 	    tmp_->pinscan_last_dur > 0) {
 		sbintime_t quiet = tmp_->pinscan_last_dur *
 		    ((100 / tessera_pinscan_duty_pct) - 1);
 		if (sbinuptime() < tmp_->pinscan_last_end + quiet) {
-			tessera_stat_pinscan_skips_duty++;
-			return;
+			if (!tessera_fs_meta_tight(tmp_)) {
+				tessera_stat_pinscan_skips_duty++;
+				return;
+			}
+			tessera_stat_pinscan_duty_bypass_tight++;
 		}
 	}
 	tmp_->pinscan_last_kick_sec = _now;
@@ -30143,4 +30182,68 @@ struct vop_vector tessera_fifoops = {
 VFS_VOP_VECTOR_REGISTER(tessera_fifoops);
 
 VFS_SET(tessera_vfsops, tessera, 0);
+
+/*
+ * kern.tessera.mounts — the metadata-reserve admission inputs for EVERY Tessera
+ * mount, one line each.
+ *
+ * gate_owner above reports a single mount (the singleton, i.e. whichever
+ * mounted last), which on the dev VM is the apps volume. The root volume was
+ * refusing creates with ENOSPC (meta_admit_refusals climbing, df showing GiBs
+ * free) and nothing could show why: its bump pointer, free list and pending
+ * count were invisible. These are exactly the terms tessera_fs_meta_admit
+ * compares — soft headroom + free against (pending_manifest + dirty) * resv +
+ * slack — plus the pinscan state that refills the free list.
+ */
+static int
+tessera_sysctl_mounts(SYSCTL_HANDLER_ARGS)
+{
+	/* Fixed buffer, formatted under mountlist_mtx and copied out after it is
+	 * dropped: a sysctl-backed sbuf drains to userspace as it fills, and that
+	 * copyout can sleep, which is not allowed under a mutex. */
+	const size_t cap = 4096;
+	char *buf = malloc(cap, M_TESSERA, M_WAITOK | M_ZERO);
+	struct sbuf sbs, *sb = sbuf_new(&sbs, buf, (int)cap, SBUF_FIXEDLEN);
+	struct mount *mp;
+	mtx_lock(&mountlist_mtx);
+	TAILQ_FOREACH(mp, &mountlist, mnt_list) {
+		if (mp->mnt_op != &tessera_vfsops)
+			continue;
+		struct tessera_mount *t = VFSTOTESSERA(mp);
+		if (t == NULL)
+			continue;
+		uint64_t start = t->sb.meta_reserve_start;
+		uint64_t used = t->sb.meta_reserve_bump > start
+		    ? t->sb.meta_reserve_bump - start : 0;
+		uint64_t soft = tessera_meta_soft_length(t);
+		uint64_t need = (((uint64_t)t->pending_manifest_count +
+		    (uint64_t)t->dirty_count) * (uint64_t)tessera_meta_admit_resv) /
+		    TESSERA_META_RESV_UNIT + (uint64_t)tessera_meta_admit_slack;
+		uint64_t avail = (soft > used ? soft - used : 0) +
+		    (uint64_t)t->meta_free_count;
+		sbuf_printf(sb, "%s gen=%ju bump=%ju soft=%ju len=%ju free=%u/%u "
+		    "pending=%u dirty=%u pend_mft=%u admit_avail=%ju admit_need=%ju "
+		    "%s pinscan_active=%d last_kick=%jd uptime=%jd\n",
+		    mp->mnt_stat.f_mntonname, (uintmax_t)t->sb.generation,
+		    (uintmax_t)used, (uintmax_t)soft,
+		    (uintmax_t)t->sb.meta_reserve_length,
+		    t->meta_free_count, t->meta_free_cap, t->meta_pending_count,
+		    t->dirty_count, t->pending_manifest_count,
+		    (uintmax_t)avail, (uintmax_t)need,
+		    avail < need ? "REFUSING" : "admitting",
+		    t->pinscan_active, (intmax_t)t->pinscan_last_kick_sec,
+		    (intmax_t)time_uptime);
+	}
+	mtx_unlock(&mountlist_mtx);
+	(void)sbuf_finish(sb);   /* truncation just drops trailing mounts */
+	int error = sysctl_handle_string(oidp, buf, cap, req);
+	sbuf_delete(sb);
+	free(buf, M_TESSERA);
+	return (error);
+}
+SYSCTL_PROC(_kern_tessera, OID_AUTO, mounts,
+    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    tessera_sysctl_mounts, "A",
+    "Per-mount metadata-reserve admission inputs and pinscan state");
+
 MODULE_VERSION(tessera_fs, 1);

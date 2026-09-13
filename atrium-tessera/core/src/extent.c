@@ -44,6 +44,12 @@ struct tessera_extent_alloc {
 	uint64_t free_blocks;     /* sum of all extent lengths (cached) */
 	tessera_block_io_t  io;
 	int                 has_io;     /* 1 iff io was provided to open() */
+	/* The on-disk tree root this allocator was last loaded from or flushed
+	 * to (0 = none), and whether anything has changed since. A flush with
+	 * nothing changed returns `root` instead of rebuilding — see
+	 * tessera_extent_flush_via. Every mutator sets `dirty`. */
+	uint64_t            root;
+	int                 dirty;
 };
 
 static int
@@ -112,6 +118,10 @@ tessera_extent_open(const tessera_block_io_t *io, uint64_t free_root_sector)
 		tessera_btree_cursor_free(c);
 	}
 	tessera_btree_close(t);
+	/* Replaying the tree through free() set dirty; the in-memory state IS
+	 * the tree now, so a flush with no further change can reuse it. */
+	a->root  = free_root_sector;
+	a->dirty = 0;
 	return a;
 
 fail:
@@ -124,6 +134,18 @@ int
 tessera_extent_flush(tessera_extent_alloc_t *a, uint64_t *out_new_root)
 {
 	return tessera_extent_flush_via(a, NULL, out_new_root);
+}
+
+/* Order keys the way the B+tree does: bytewise over the stored 8-byte key.
+ * Keys are stored exactly as tessera_btree_put always stored them (a native
+ * uint64_t), so a batch build sorted this way yields the same tree ordering
+ * the old one-put-per-extent loop produced. Sorting numerically instead would
+ * not be memcmp-ascending on a little-endian host, and the batch put rejects a
+ * batch that is not strictly ascending. */
+static int
+extent_key_bytes_cmp(const void *x, const void *y)
+{
+	return memcmp(x, y, EXTENT_KEY_SIZE);   /* start sectors are unique */
 }
 
 int
@@ -140,15 +162,66 @@ tessera_extent_flush_via(tessera_extent_alloc_t *a,
 		use_io = &a->io;
 	}
 
+	/*
+	 * ★ NOTHING CHANGED → NOTHING TO WRITE. The tree already on disk at
+	 * `root` describes exactly this allocator, and it stays reachable from
+	 * the superblock, so pinscan keeps its sectors pinned. This used to
+	 * rebuild the whole tree on every flush regardless.
+	 */
+	if (!a->dirty && a->root != 0) {
+		*out_new_root = a->root;
+		return TESSERA_OK;
+	}
+
 	uint64_t root = 0;
 	tessera_btree_t *t = tessera_btree_create(use_io, EXTENT_TREE_KIND,
 	    EXTENT_KEY_SIZE, EXTENT_VALUE_SIZE, &root);
 	if (t == NULL) return TESSERA_ENOSPC;
 
-	for (size_t i = 0; i < a->count; i++) {
-		uint64_t k = a->extents[i].start_sector;
-		uint64_t v = a->extents[i].length_sectors;
-		int r = tessera_btree_put(t, &k, &v, &root);
+	/*
+	 * ★ ONE SORTED BATCH, not one put per extent.
+	 *
+	 * The tree is rebuilt from scratch, and each tessera_btree_put
+	 * copy-on-writes its whole root-to-leaf path, so N extents cost
+	 * O(N x depth) metadata allocations per flush — the nodes each put
+	 * copies are the ones the previous put just wrote. On the dev root
+	 * (a fragmented 25 GiB volume) that was ~3,600 metadata sectors per
+	 * commit (dtrace: 168,960 tessera_kbio_meta_alloc calls over 47
+	 * commits, all under this loop). A boot-time burst of ~5 commits/s
+	 * then emptied the ~375,000-sector metadata free list in ~16 s, and the
+	 * volume refused creates with ENOSPC while df showed GiBs free.
+	 *
+	 * The batch put writes each node of the new tree once: ~N/fanout
+	 * leaves plus their parents.
+	 */
+	if (a->count > 0) {
+		const size_t es = EXTENT_KEY_SIZE + EXTENT_VALUE_SIZE;
+		uint8_t *pairs = tessera_zalloc(a->count * es);
+		uint8_t *keys  = tessera_zalloc(a->count * EXTENT_KEY_SIZE);
+		uint8_t *vals  = tessera_zalloc(a->count * EXTENT_VALUE_SIZE);
+		if (pairs == NULL || keys == NULL || vals == NULL) {
+			tessera_free(pairs); tessera_free(keys); tessera_free(vals);
+			tessera_btree_close(t);
+			return TESSERA_ENOMEM;
+		}
+		for (size_t i = 0; i < a->count; i++) {
+			uint64_t k = a->extents[i].start_sector;
+			uint64_t v = a->extents[i].length_sectors;
+			memcpy(pairs + i * es, &k, EXTENT_KEY_SIZE);
+			memcpy(pairs + i * es + EXTENT_KEY_SIZE, &v,
+			    EXTENT_VALUE_SIZE);
+		}
+		qsort(pairs, a->count, es, extent_key_bytes_cmp);
+		for (size_t i = 0; i < a->count; i++) {
+			memcpy(keys + i * EXTENT_KEY_SIZE, pairs + i * es,
+			    EXTENT_KEY_SIZE);
+			memcpy(vals + i * EXTENT_VALUE_SIZE,
+			    pairs + i * es + EXTENT_KEY_SIZE, EXTENT_VALUE_SIZE);
+		}
+		int r = (a->count > UINT32_MAX) ? TESSERA_EINVAL :
+		    tessera_btree_put_sorted_batch(t, keys, vals,
+		        (uint32_t)a->count, &root);
+		tessera_free(pairs); tessera_free(keys); tessera_free(vals);
 		if (r != TESSERA_OK) {
 			tessera_btree_close(t);
 			return r;
@@ -156,6 +229,8 @@ tessera_extent_flush_via(tessera_extent_alloc_t *a,
 	}
 	tessera_btree_close(t);
 	*out_new_root = root;
+	a->root  = root;
+	a->dirty = 0;
 	return TESSERA_OK;
 }
 
@@ -188,6 +263,7 @@ int
 tessera_extent_alloc(tessera_extent_alloc_t *a, uint64_t n_sectors,
                      uint64_t *out_start)
 {
+	if (a != NULL) a->dirty = 1;   /* see tessera_extent_flush_via */
 	if (a == NULL || out_start == NULL) return TESSERA_EINVAL;
 	if (n_sectors == 0) return TESSERA_EINVAL;
 
@@ -227,6 +303,7 @@ tessera_extent_alloc_multi(tessera_extent_alloc_t *a,
                             uint64_t *out_lengths,
                             uint32_t *out_count)
 {
+	if (a != NULL) a->dirty = 1;   /* see tessera_extent_flush_via */
 	if (a == NULL || out_starts == NULL || out_lengths == NULL ||
 	    out_count == NULL) return TESSERA_EINVAL;
 	if (n_sectors == 0 || max_count == 0) return TESSERA_EINVAL;
@@ -306,6 +383,7 @@ tessera_extent_alloc_multi_partial(tessera_extent_alloc_t *a,
                                     uint32_t *out_count,
                                     uint64_t *out_filled)
 {
+	if (a != NULL) a->dirty = 1;   /* see tessera_extent_flush_via */
 	if (a == NULL || out_starts == NULL || out_lengths == NULL ||
 	    out_count == NULL || out_filled == NULL) return TESSERA_EINVAL;
 	if (n_sectors == 0 || max_count == 0) return TESSERA_EINVAL;
@@ -367,6 +445,7 @@ int
 tessera_extent_free(tessera_extent_alloc_t *a, uint64_t start,
                     uint64_t n_sectors)
 {
+	if (a != NULL) a->dirty = 1;   /* see tessera_extent_flush_via */
 	if (a == NULL) return TESSERA_EINVAL;
 	if (n_sectors == 0) return TESSERA_EINVAL;
 
