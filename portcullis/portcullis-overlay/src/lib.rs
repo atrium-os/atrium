@@ -40,31 +40,39 @@ use std::process::Command;
 pub const OVERLAYS_DIR:     &str = "/var/lib/atrium/overlays";
 pub const OVERLAY_VOLS_DIR: &str = "/var/lib/atrium/overlay-vols";
 
-/// Largest overlay we can build today, and also the default — the ceiling is a
-/// platform limit rather than a policy choice, so there is no reason to hand
-/// apps less than all of it.
+/// Largest overlay we will build.
 ///
-/// ★ THE CEILING IS `TESSERA_WRITE_MATERIALIZE_MAX` (512 MiB). Creating the
-/// image ends in `ftruncate`, and a truncate-EXTEND on Tessera materialises the
-/// whole new file in one contiguous `M_WAITOK` buffer, so the kmod refuses any
-/// new size past that bound with `EFBIG`. It is a bound on the OPERATION, not
-/// on file size — a Tessera file can be appended far past it — so the ceiling
-/// lifts as soon as image creation stops going through a single truncate, or
-/// the kmod grows a sparse extend. Measured: 512 MiB truncates, 576 MiB does
-/// not.
+/// ★ NOT A FILESYSTEM LIMIT ANY MORE. Until 2026-09-13 overlays were capped at
+/// 384 MiB because the image is created by `ftruncate` and Tessera refused a
+/// truncate-extend past `TESSERA_WRITE_MATERIALIZE_MAX` (512 MiB): it built the
+/// whole new file in one contiguous kernel buffer. `tessera_fs_extend_sparse`
+/// now appends hole windows instead, so an image can be as large as the store
+/// holding it (the kmod refuses an extend past the volume's own capacity).
 ///
-/// With [`image_mib_for_quota`]'s 25% headroom, a 384 MiB quota needs a 480 MiB
-/// image, which fits. Verified end to end: `df` reports 384 MiB and all 384 MiB
-/// are writable.
+/// What bounds it now is the COST OF CREATING THE IMAGE, which is linear in its
+/// nominal size even though the image is all holes: every hole chunk is a
+/// manifest record, and the whole extend runs under the store's flush gate so a
+/// crash cannot leave it half-extended. Measured on the dev VM:
 ///
-/// This is a QUOTA, not an allocation. A fresh image costs about 12 MiB of
-/// real space on a Tessera-backed store (measured: a 512 MiB image grew the
-/// store by 11.9 MiB), because the image file is allocate-on-write like any
-/// other file. The nominal size is what the app may grow into.
-pub const MAX_QUOTA_BYTES: u64 = 384 * 1024 * 1024;
+/// | image   | truncate | metadata |
+/// |---------|----------|----------|
+/// | 1 GiB   | 0.25 s   | 1.5 MiB  |
+/// | 2 GiB   | 0.52 s   | 1.6 MiB  |
+/// | 4 GiB   | 0.99 s   | 3.1 MiB  |
+/// | 7 GiB   | 1.76 s   | 4.6 MiB  |
+///
+/// An 8 GiB quota needs a 10 GiB image: about 2.5 s during which every other
+/// publish on the shared volume waits, once, at the app's first launch. That is
+/// the line. Large media belongs in a user volume, not in an app's overlay.
+///
+/// This is a QUOTA, not an allocation: an unused image costs its metadata and
+/// nothing else (a fresh 2.5 GiB image grew the store by 15 MiB).
+pub const MAX_QUOTA_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-/// Overlay size when the manifest does not ask for one. See [`MAX_QUOTA_BYTES`].
-pub const DEFAULT_QUOTA_BYTES: u64 = MAX_QUOTA_BYTES;
+/// Overlay size when the manifest does not ask for one — an app's own writable
+/// state (config, caches, pkg-installed files from its setup phase). Creating
+/// its image takes about a third of a second.
+pub const DEFAULT_QUOTA_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Smallest overlay we will build. Below this the filesystem's own fixed costs
 /// (a 1 MiB journal plus a metadata reserve of `max(1024 sectors, total/16)`)
@@ -104,6 +112,34 @@ pub fn image_path(app_id: &str) -> PathBuf {
 pub fn image_mib_for_quota(quota_bytes: u64) -> u64 {
     let quota_mib = quota_bytes / (1024 * 1024);
     quota_mib + std::cmp::max(64, quota_mib / 4)
+}
+
+/// The largest quota whose image fits in `bytes` — the inverse of
+/// [`image_mib_for_quota`], rounded down to a whole MiB.
+///
+/// Used two ways. Against the STORE, so a manifest asking for more than the
+/// store can hold gets clamped with a message instead of an `EFBIG` from
+/// `mkfs-tessera` and a silent fall back to a directory. And against an
+/// EXISTING IMAGE, whose inner filesystem was sized at creation and cannot
+/// grow: mounting it with a larger quota would make `df` advertise space the
+/// volume does not have, and the app would hit ENOSPC below its own quota.
+pub fn max_quota_fitting(bytes: u64) -> u64 {
+    let mib = bytes / (1024 * 1024);
+    // q + max(64, q/4) <= mib. Above 320 MiB the 25% term dominates, so
+    // q <= mib * 4/5; below it the 64 MiB floor does.
+    let q = if mib >= 320 { mib * 4 / 5 } else { mib.saturating_sub(64) };
+    q * 1024 * 1024
+}
+
+/// Total size of the filesystem holding `dir`, in bytes.
+fn store_bytes(dir: &Path) -> Option<u64> {
+    let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
+    let mut sfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: c outlives the call; sfs is a zeroed stack local of the right type.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut sfs) } != 0 {
+        return None;
+    }
+    Some(sfs.f_blocks as u64 * sfs.f_frsize as u64)
 }
 
 /// Is `dir` itself a mount point, and if so of what filesystem type and from
@@ -208,13 +244,14 @@ pub fn ensure_mounted(app_id: &str, quota_bytes: u64) -> Result<Backing, String>
         return Ok(Backing::Volume { device });
     }
 
-    /* Clamp, but never silently: an app that declared 2 GiB and quietly got
-     * 384 MiB would look like a Tessera bug the first time it filled up. */
-    let quota = quota_bytes.clamp(MIN_QUOTA_BYTES, MAX_QUOTA_BYTES);
+    /* Clamp, but never silently: an app that declared 20 GiB and quietly got
+     * 8 GiB would look like a Tessera bug the first time it filled up. */
+    let mut quota = quota_bytes.clamp(MIN_QUOTA_BYTES, MAX_QUOTA_BYTES);
     if quota != quota_bytes {
         eprintln!("portcullis: {app_id} asked for a {} MiB overlay; using {} MiB \
-                   (the ceiling is Tessera's truncate-extend bound, not a policy)",
-            quota_bytes / (1024 * 1024), quota / (1024 * 1024));
+                   (overlays are {}-{} MiB; see MAX_QUOTA_BYTES for why)",
+            quota_bytes / (1024 * 1024), quota / (1024 * 1024),
+            MIN_QUOTA_BYTES / (1024 * 1024), MAX_QUOTA_BYTES / (1024 * 1024));
     }
 
     fs::create_dir_all(&dir)
@@ -262,6 +299,25 @@ pub fn ensure_mounted(app_id: &str, quota_bytes: u64) -> Result<Backing, String>
         if let Err(e) = fs::create_dir_all(OVERLAY_VOLS_DIR) {
             return fail(format!("create {OVERLAY_VOLS_DIR}: {e}"));
         }
+        /* The image can be no larger than the store holding it: Tessera
+         * refuses to extend a file past its own volume's capacity. Clamp here
+         * rather than let mkfs-tessera die with EFBIG and demote the app to a
+         * directory. */
+        if let Some(store) = store_bytes(Path::new(OVERLAY_VOLS_DIR)) {
+            let fits = max_quota_fitting(store);
+            if fits < MIN_QUOTA_BYTES {
+                return fail(format!("{OVERLAY_VOLS_DIR} is only {} MiB, too \
+                    small for a {} MiB overlay", store / (1024 * 1024),
+                    MIN_QUOTA_BYTES / (1024 * 1024)));
+            }
+            if quota > fits {
+                eprintln!("portcullis: {app_id}'s {} MiB overlay does not fit \
+                           the {} MiB store; using {} MiB",
+                    quota / (1024 * 1024), store / (1024 * 1024),
+                    fits / (1024 * 1024));
+                quota = fits;
+            }
+        }
         let mib = image_mib_for_quota(quota);
         let out = Command::new("mkfs-tessera")
             .args(["--create", "-s", &mib.to_string()])
@@ -281,6 +337,25 @@ pub fn ensure_mounted(app_id: &str, quota_bytes: u64) -> Result<Backing, String>
         }
         eprintln!("portcullis: created {} ({} MiB image for a {} MiB overlay)",
             img.display(), mib, quota / (1024 * 1024));
+    }
+
+    /* An existing image's filesystem was sized when it was made and does not
+     * grow with the manifest. Mounting it with a bigger quota would have `df`
+     * advertise space the volume cannot hold. Cap to what the image fits, and
+     * say how to get more. */
+    if img_exists {
+        if let Ok(meta) = fs::metadata(&img) {
+            let fits = max_quota_fitting(meta.len());
+            if quota > fits {
+                eprintln!("portcullis: {app_id} asks for a {} MiB overlay but its \
+                           existing image holds {} MiB; mounting at {} MiB. A \
+                           larger overlay needs the image recreated (portcullis \
+                           remove --keep-overlay does not do that).",
+                    quota / (1024 * 1024), fits / (1024 * 1024),
+                    fits / (1024 * 1024));
+                quota = fits;
+            }
+        }
     }
 
     let unit = match attach(&img) {
@@ -410,23 +485,30 @@ mod tests {
     }
 
     #[test]
-    fn the_default_image_fits_under_tesseras_truncate_bound() {
-        /* The whole ceiling exists because mkfs-tessera ends in an ftruncate
-         * and Tessera refuses a truncate-extend past TESSERA_WRITE_MATERIALIZE_MAX
-         * (512 MiB) with EFBIG. If MAX_QUOTA_BYTES or the headroom formula
-         * drifts so the image crosses that line, every first launch falls back
-         * to a directory with only a warning — a silent loss of the structural
-         * mitigation. Fail here instead. */
-        const TESSERA_WRITE_MATERIALIZE_MAX_MIB: u64 = 512;
-        assert!(image_mib_for_quota(MAX_QUOTA_BYTES)
-                <= TESSERA_WRITE_MATERIALIZE_MAX_MIB,
-            "a {} MiB quota needs a {} MiB image, past Tessera's {} MiB \
-             truncate-extend bound",
-            MAX_QUOTA_BYTES / (1024 * 1024),
-            image_mib_for_quota(MAX_QUOTA_BYTES),
-            TESSERA_WRITE_MATERIALIZE_MAX_MIB);
-        assert!(image_mib_for_quota(DEFAULT_QUOTA_BYTES)
-                <= TESSERA_WRITE_MATERIALIZE_MAX_MIB);
+    fn max_quota_fitting_is_the_inverse_of_image_size() {
+        /* The image built for the returned quota must fit in the space it was
+         * computed from — at every size, including the small stores where the
+         * 64 MiB headroom floor dominates — and it must not be needlessly
+         * pessimistic (within a few MiB of the space). */
+        for mib in [128u64, 200, 320, 480, 1000, 1024, 8192, 10_000, 65_536] {
+            let bytes = mib * 1024 * 1024;
+            let q = max_quota_fitting(bytes);
+            let img = image_mib_for_quota(q);
+            assert!(img <= mib, "{mib} MiB space: {} MiB quota needs {img} MiB",
+                q / (1024 * 1024));
+            assert!(mib - img <= 4, "{mib} MiB space: only {img} MiB used");
+        }
+        assert_eq!(max_quota_fitting(0), 0);
+        assert_eq!(max_quota_fitting(32 * 1024 * 1024), 0);
+    }
+
+    #[test]
+    fn defaults_are_inside_the_bounds() {
+        assert!(MIN_QUOTA_BYTES <= DEFAULT_QUOTA_BYTES);
+        assert!(DEFAULT_QUOTA_BYTES <= MAX_QUOTA_BYTES);
+        /* The pre-2026-09-13 overlays were 480 MiB images. An existing one
+         * must still mount, at the quota it was built for. */
+        assert_eq!(max_quota_fitting(480 * 1024 * 1024), 384 * 1024 * 1024);
     }
 
     #[test]

@@ -158,8 +158,10 @@ pub struct ResourcesSection {
     pub files:  Option<u32>,
     /// Size of the app's overlay volume — everything it can write, since the
     /// app tree itself is mounted read-only (`portcullis.md` §4.2). Same size
-    /// strings as `memory`. Absent = 1 GiB. This is a quota, not an
-    /// allocation: a fresh overlay costs about 12 MiB of real space.
+    /// strings as `memory`. Absent = 1 GiB; accepted range 64M-8G, clamped
+    /// with a message outside it (`portcullis_overlay::MAX_QUOTA_BYTES`
+    /// records why 8G). This is a quota, not an allocation: an unused
+    /// overlay costs its metadata, about 15 MiB.
     ///
     /// Unlike its siblings here, this field IS enforced — it becomes the
     /// overlay volume's whole-filesystem quota, and the jail's `df` reports

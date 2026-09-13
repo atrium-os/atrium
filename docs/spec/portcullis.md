@@ -796,31 +796,70 @@ three trees of §4.2:
 > Every attach checks `mdconfig -lv` first — two `md` devices over one image is
 > corruption waiting to happen.
 >
-> **The size ceiling is 384 MiB, and it is not a policy choice.** Image
-> creation ends in `ftruncate`, and a truncate-extend on Tessera materialises
-> the whole new file in one contiguous `M_WAITOK` buffer, so the kmod refuses
-> any new size past `TESSERA_WRITE_MATERIALIZE_MAX` (512 MiB) with `EFBIG`.
-> Measured: 512 MiB truncates, 576 MiB does not. With the 25% headroom an
-> overlay needs for the journal and metadata reserve, that caps the quota at
-> 384 MiB — which is therefore also the default, since handing apps less than
-> the ceiling buys nothing. `[resources] storage` in the manifest sets it and
-> is clamped, loudly, not silently. The bound is on the OPERATION, not on file
-> size: a Tessera file can be appended far past it, so the ceiling lifts as
-> soon as image creation stops going through a single truncate, or the kmod
-> grows a sparse extend.
+> **Overlays are 64 MiB to 8 GiB, default 1 GiB.** `[resources] storage` in the
+> manifest sets the size and is clamped, loudly, never silently.
+>
+> *History.* The first implementation was capped at 384 MiB by the kmod, not by
+> policy: image creation ends in `ftruncate`, and a truncate-extend on Tessera
+> built the whole new file in one contiguous `M_WAITOK` buffer, so it refused
+> any new size past `TESSERA_WRITE_MATERIALIZE_MAX` (512 MiB). Lifted
+> 2026-09-13 by `tessera_fs_extend_sparse`, which extends by appending hole
+> windows through the existing append path (an all-zero chunk is a `ZERO_HOLE`
+> record with no blob), under one flush gate so a crash cannot persist a
+> half-extended file. Verified byte-exact across every starting layout, clean
+> under fsck and after remount (`scripts/vm-sparse-extend-test.sh`), and under
+> fsx with file sizes crossing the threshold.
+>
+> *What bounds it now* is the cost of creating the image, which is linear in
+> its nominal size even though it is all holes — every hole chunk is a
+> manifest record, and the flush gate is held for the whole extend:
+>
+> | image | truncate | metadata |
+> |---|---|---|
+> | 1 GiB | 0.25 s | 1.5 MiB |
+> | 2 GiB | 0.52 s | 1.6 MiB |
+> | 4 GiB | 0.99 s | 3.1 MiB |
+> | 7 GiB | 1.76 s | 4.6 MiB |
+>
+> An 8 GiB quota needs a 10 GiB image: about 2.5 s during which every other
+> publish on the shared store waits, once, at the app's first launch. That is
+> the line; large media belongs in a user volume. The kmod also refuses to
+> extend a file past its own volume's capacity (a hole still costs metadata),
+> so the quota is further clamped to what the store can hold.
+>
+> *An existing image does not grow with the manifest.* Its inner filesystem was
+> sized at creation, so launch mounts it at the quota it can actually hold and
+> says so — the 480 MiB images built before the ceiling lifted still mount at
+> 384 MiB. Getting a larger overlay means recreating the image.
+>
+> *Verified end to end:* a manifest asking for `4G` got a 5120 MiB image for
+> 15 MiB of store space; `df` reported 4.0G; 3.5 GiB written through the union
+> mount a jail uses left 512M available; the overlay volume fscked clean; the
+> content matched after a relaunch; `portcullis remove` left nothing behind.
+>
+> *fsck had been flagging every overlay volume.* It counted quota usage only
+> for files tagged with a domain, but the whole-volume default domain that
+> `-o tessera.quota_bytes` creates charges UNTAGGED files — so any overlay with
+> data reported "used_bytes=N but regular-file sizes sum to 0", and `--repair`
+> would have zeroed `used_bytes`, handing the app back every byte it had
+> already written as fresh quota. Fixed in the same change.
 >
 > **The cost figure above is for a FULL volume.** The image is
-> allocate-on-write like any other file, so a fresh overlay costs about 12 MiB
-> of real space, not its nominal size (measured: a 512 MiB image grew the store
-> by 11.9 MiB). Fifty idle apps is ~600 MiB, not 3.2 GiB; the ~6.4% applies to
+> allocate-on-write like any other file, so a fresh overlay costs its metadata,
+> not its nominal size (measured: a 512 MiB image grew the store by 11.9 MiB, a
+> 5120 MiB one by 15 MiB). Fifty idle apps is ~600 MiB, not 3.2 GiB; the ~6.4% applies to
 > what each app actually stores. The fifty flush gates, GC contexts and
 > pinscans are real either way.
 >
 > **The oracle claim was tested through the union, not just on the volume.**
 > `unionfs` sums the layers for `statfs`: `f_blocks` is the lower layer plus
 > the overlay (so a jail can see how big the pool is, which is static and not
-> an oracle), but `f_bavail` — the number the oracle reads — comes from the
-> overlay alone. Copying a file that demonstrably exists on the shared volume
+> an oracle), but `f_bfree` and `f_bavail` — the numbers the oracle reads — come
+> from the overlay alone. Measured field by field: 2097142 + 98304 = 2195446
+> blocks through the union, with free and available both 98303, the overlay's
+> own; neither moved when 64 MiB was written into the shared store. `df` inside
+> the jail therefore shows a large and changing-looking *Used* column, but it is
+> `f_blocks − f_bfree`, derived from the static total, not a view of the store. Copying a file that demonstrably exists on the shared volume
 > (`libc.so.7` from the app tree, globally deduped) consumed exactly the same
 > free space as writing the same number of random bytes: 2056 KiB both times.
 >

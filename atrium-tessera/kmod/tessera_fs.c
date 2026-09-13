@@ -1555,6 +1555,12 @@ static struct tessera_mount *tessera_debug_mount;
 static unsigned long tessera_stat_chunk_tree_publish  = 0;
 static unsigned long tessera_stat_append_fast_ok      = 0;
 static unsigned long tessera_stat_append_fast_fallback = 0;
+/* Sparse truncate-extend (tessera_fs_extend_sparse): extends taken, and the
+ * zero windows appended across them. A dead arm reads 0/0 — check both before
+ * trusting a large-file test that "passed". */
+static unsigned long tessera_stat_extend_sparse        = 0;
+static unsigned long tessera_stat_extend_sparse_windows = 0;
+static unsigned long tessera_stat_extend_sparse_fallback = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, vop_write_inline,
     CTLFLAG_RD, &tessera_stat_vop_write_inline, 0,
     "vop_write completions via INLINE manifest path");
@@ -1699,6 +1705,15 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, append_fast_ok,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, append_fast_fallback,
     CTLFLAG_RD, &tessera_stat_append_fast_fallback, 0,
     "Append fast-path fallbacks to slow rewrite path");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, extend_sparse,
+    CTLFLAG_RD, &tessera_stat_extend_sparse, 0,
+    "Truncate-extends done by appending hole windows, without materialising");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, extend_sparse_windows,
+    CTLFLAG_RD, &tessera_stat_extend_sparse_windows, 0,
+    "Hole windows appended by sparse truncate-extends");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, extend_sparse_fallback,
+    CTLFLAG_RD, &tessera_stat_extend_sparse_fallback, 0,
+    "Sparse truncate-extends that fell back to the materialising path");
 
 /* fsync group commit (v2 polish): how many times a flush caller
  * waited on an already-in-flight commit instead of triggering a new
@@ -2340,7 +2355,8 @@ static int  tessera_fs_count_multi_extent(struct tessera_mount *tmp_,
  * TESSERA_WRITE_MATERIALIZE_MAX is a real bound, but on an OPERATION,
  * not on file size. It limits the read-modify-write SLOW paths that must
  * hold the whole file in one contiguous M_WAITOK buffer: an in-place
- * overwrite that isn't a pure append, a truncate-extend, an mmap
+ * overwrite that isn't a pure append, a SHRINK or a small (<64 MiB)
+ * truncate-extend, an mmap
  * putpages flush, and the one-shot CHUNK_LIST→CHUNK_TREE promotion plus
  * the single 64 MiB chunk-tier rebuild. You cannot malloc a 100 GiB
  * contiguous buffer, so those return EFBIG past this bound — but a huge
@@ -2350,6 +2366,12 @@ static int  tessera_fs_count_multi_extent(struct tessera_mount *tmp_,
  */
 #define TESSERA_WRITE_MAX_BYTES        (256ULL * 1024 * 1024 * 1024 * 1024) /* 256 TiB sanity */
 #define TESSERA_WRITE_MATERIALIZE_MAX  (512ULL * 1024 * 1024)      /* 512 MiB */
+/* Truncate-EXTEND does not go through the materialise cap above once the new
+ * size reaches the 1 MiB chunk tier: tessera_fs_extend_sparse appends hole
+ * windows of this size instead, holding one window in RAM. See that function
+ * for why it is bounded by volume capacity instead. */
+#define TESSERA_EXTEND_SPARSE_MIN      (64ULL * 1024 * 1024)
+#define TESSERA_EXTEND_WINDOW_BYTES    (16ULL * 1024 * 1024)
 
 /* v2-step-3a: chunked-write helpers. */
 struct tessera_chunk_in {
@@ -2366,6 +2388,9 @@ static int tessera_fs_replace_content_chunked(struct tessera_mount *tmp_,
 static int tessera_fs_append_chunked(struct tessera_mount *tmp_,
     uint32_t inode_no, uint64_t append_off, const uint8_t *append_bytes,
     size_t append_len, uint32_t cs);
+static int tessera_fs_extend_sparse(struct tessera_mount *tmp_,
+    uint32_t inode_no, uint64_t old_size, uint64_t new_size,
+    uint64_t *out_reached);
 static int tessera_fs_append_chunk_tree(struct tessera_mount *tmp_,
     uint32_t inode_no, uint64_t append_off, const uint8_t *append_bytes,
     size_t append_len, uint32_t cs);
@@ -9629,12 +9654,9 @@ tessera_vop_setattr_impl(struct vop_setattr_args *ap)
 	int did_resize = 0;
 	if (seen_size) {
 		uint64_t new_size = (uint64_t)vap->va_size;
-		/* Truncate-extend materialises the whole new file in one
-		 * contiguous M_WAITOK buffer, so it is bounded by the
-		 * slow-path materialise cap (not the higher streaming
-		 * ceiling). Without this, a truncate(file, 1<<48) sleeps
-		 * forever in M_WAITOK. */
-		if (new_size > TESSERA_WRITE_MATERIALIZE_MAX)
+		/* A bogus size must not reach quota/allocator math — same
+		 * sanity ceiling the write path uses. */
+		if (new_size > TESSERA_WRITE_MAX_BYTES)
 			return (EFBIG);
 		if (new_size != ino.size) {
 			/* Drain any coalesced writes so the on-disk content
@@ -9655,22 +9677,81 @@ tessera_vop_setattr_impl(struct vop_setattr_args *ap)
 				did_resize = 1;
 				goto post_resize;
 			}
+			/* Large EXTENSIONS append hole windows instead of
+			 * materialising (tessera_fs_extend_sparse). Everything
+			 * else — shrinks, and extends that stay small — keeps
+			 * the materialising path, which is bounded by
+			 * TESSERA_WRITE_MATERIALIZE_MAX because it holds the
+			 * whole new file in one M_WAITOK buffer. */
+			const int sparse = (new_size > ino.size &&
+			    new_size >= TESSERA_EXTEND_SPARSE_MIN);
+			if (!sparse && new_size > TESSERA_WRITE_MATERIALIZE_MAX)
+				return (EFBIG);
+			/* A hole is not free: every chunk of it is a manifest
+			 * record, so metadata grows linearly with the extension
+			 * and the whole extension runs under one flush gate.
+			 * Bound it by the volume's own capacity — a file that
+			 * could never be filled on this volume is not worth a
+			 * gate hold proportional to its size. (Before this, the
+			 * materialise cap bounded truncate(file, 1<<48)
+			 * implicitly; this bound replaces that.) */
+			if (sparse &&
+			    new_size > tmp_->sb.total_sectors * TESSERA_SECTOR_SIZE &&
+			    new_size > TESSERA_WRITE_MATERIALIZE_MAX)
+				return (EFBIG);
 			/* Quota: truncate-up reserves the growth (EDQUOT if it
 			 * would exceed the limit); truncate-down releases the
-			 * freed bytes (tessera-quotas.md §5.2-5.3). */
-			{
-				tessera_quota_domain_t *qd =
-				    tessera_quota_for_inode(tmp_, &ino);
-				if (qd != NULL) {
-					if (new_size > ino.size) {
-						if (tessera_quota_reserve(qd,
-						    new_size - ino.size) != TESSERA_OK)
-							return (EDQUOT);
-					} else {
+			 * freed bytes (tessera-quotas.md §5.2-5.3). A hole
+			 * charges its full LOGICAL size, like a duplicate chunk
+			 * does — that is what keeps statfs content-independent. */
+			tessera_quota_domain_t *qd =
+			    tessera_quota_for_inode(tmp_, &ino);
+			if (qd != NULL) {
+				if (new_size > ino.size) {
+					if (tessera_quota_reserve(qd,
+					    new_size - ino.size) != TESSERA_OK)
+						return (EDQUOT);
+				} else {
+					tessera_quota_release(qd,
+					    ino.size - new_size);
+				}
+				tmp_->quota_dirty = 1;
+			}
+			if (sparse) {
+				const uint64_t old_size = ino.size;
+				uint64_t reached = old_size;
+				int erc = tessera_fs_extend_sparse(tmp_,
+				    (uint32_t)tn->inode_no, old_size, new_size,
+				    &reached);
+				if (erc == 0) {
+					if (tessera_fs_inode_get(tmp_,
+					    (uint32_t)tn->inode_no, &ino)
+					    != TESSERA_OK)
+						return (EIO);
+					did_resize = 1;
+					goto post_resize;
+				}
+				if (erc == ENOTSUP && reached == old_size &&
+				    new_size <= TESSERA_WRITE_MATERIALIZE_MAX) {
+					/* Nothing published; the layout just
+					 * isn't append-eligible. The quota is
+					 * already reserved for the path below. */
+					tessera_stat_extend_sparse_fallback++;
+				} else {
+					/* Give back the growth that never
+					 * landed. A partial extension is only
+					 * possible after a mid-way publish
+					 * failure (ENOSPC on metadata); the file
+					 * is left at `reached`, which is a valid
+					 * size, and the caller sees the error. */
+					if (qd != NULL && new_size > reached) {
 						tessera_quota_release(qd,
-						    ino.size - new_size);
+						    new_size - reached);
+						tmp_->quota_dirty = 1;
 					}
-					tmp_->quota_dirty = 1;
+					if (reached != old_size)
+						vnode_pager_setsize(vp, reached);
+					return (erc == ENOTSUP ? EFBIG : erc);
 				}
 			}
 			uint8_t *old_buf = NULL;
@@ -23733,6 +23814,146 @@ tessera_fs_append_apply(struct tessera_mount *tmp_, uint32_t inode_no,
 		return (EIO);
 	tmp_->sb.inode_root = new_inode_root;
 	return (0);
+}
+
+/*
+ * Sparse truncate-extend.
+ *
+ * The truncate path in vop_setattr builds the WHOLE new file in one
+ * contiguous M_WAITOK buffer — old content plus zero padding — and rewrites
+ * it, so it is capped at TESSERA_WRITE_MATERIALIZE_MAX and refuses anything
+ * larger with EFBIG. That cap is on the operation, not on file size, and for
+ * an extension it is pure waste: the new range is zeros, and the append
+ * paths already record an all-zero chunk as a ZERO_HOLE with no blob, no
+ * hash and no disk. So extend the way a sequential writer would — append
+ * zero windows — and never hold more than one window in RAM.
+ *
+ * What made the cap bite: a Tessera volume image for a per-app overlay
+ * (portcullis.md §4.1) is created by mkfs-tessera's ftruncate, so no overlay
+ * could exceed 512 MiB and the usable quota topped out at 384 MiB.
+ *
+ * Geometry matches what the materialising path would have produced if it
+ * had no cap:
+ *   - An already-chunked file keeps its own chunk size (like vop_write's
+ *     sticky appends); a flat list past FANOUT promotes metadata-only.
+ *   - A file with nothing an append can retain (empty, INLINE, a lone
+ *     partial chunk) gets a head window rebuilt as a CHUNK_TREE at the
+ *     FINAL size's tier, then grows by tree appends. A one-group tree is the
+ *     same shape wrap_list_as_tree leaves behind, not a new state.
+ *
+ * CRASH ATOMICITY. The whole extension runs under ONE flush gate (it is
+ * re-entrant, so the per-window publish helpers nest inside it), so no
+ * checkpoint can land between windows and a crash leaves either the old
+ * size or the new one. Dropping and re-taking the gate per window would let
+ * a crash persist a half-extended file.
+ *
+ * *out_reached is the size actually published. On success it is new_size.
+ * On failure the caller needs it: equal to old_size means nothing changed
+ * (ENOTSUP there is safe to retry through the materialising path); anything
+ * larger means the file was partially extended and the unreached growth's
+ * quota reservation must be released.
+ */
+static int
+tessera_fs_extend_sparse(struct tessera_mount *tmp_, uint32_t inode_no,
+    uint64_t old_size, uint64_t new_size, uint64_t *out_reached)
+{
+	*out_reached = old_size;
+	if (new_size <= old_size)
+		return (EINVAL);
+
+	/*
+	 * ★ ALLOCATE AND READ BEFORE TAKING THE GATE. Both buffers are M_WAITOK,
+	 * and an M_WAITOK allocation under memory pressure sleeps until the
+	 * pagedaemon frees pages — which can mean laundering a Tessera file's
+	 * dirty pages, which publishes, which needs this same flush gate. Holding
+	 * the gate across that sleep is an ordering deadlock. Nothing here needs
+	 * the gate to be read safely: VOP_SETATTR holds the vnode lock
+	 * exclusively, so this file's content cannot change underneath, and the
+	 * append/prepare paths already read ungated on the same grounds.
+	 */
+	int rc = 0;
+	uint8_t *zeros = malloc((size_t)TESSERA_EXTEND_WINDOW_BYTES, M_TESSERA,
+	    M_WAITOK | M_ZERO);
+	uint8_t *head_buf = NULL;
+	uint64_t head = 0;
+	uint64_t cur = old_size;
+	int gated = 0;
+
+	tessera_inode_record_t ino;
+	if (tessera_fs_inode_get(tmp_, inode_no, &ino) != TESSERA_OK) {
+		rc = EIO;
+		goto out;
+	}
+	uint32_t cs = (old_size > 0)
+	    ? tessera_fs_existing_chunk_size(tmp_, &ino) : 0;
+
+	if (cs == 0) {
+		/* Nothing to retain by append. Rebuild a head window. It holds
+		 * the old bytes, so it is only safe while those fit in RAM. */
+		if (old_size > TESSERA_WRITE_MATERIALIZE_MAX) {
+			rc = ENOTSUP;
+			goto out;
+		}
+		cs = tessera_chunk_size_for(tmp_, new_size);
+		head = old_size > TESSERA_EXTEND_WINDOW_BYTES
+		    ? old_size : TESSERA_EXTEND_WINDOW_BYTES;
+		head = ((head + cs - 1) / cs) * cs;
+		if (head > new_size)
+			head = new_size;
+		head_buf = malloc((size_t)head, M_TESSERA, M_WAITOK | M_ZERO);
+		if (old_size > 0) {
+			uint8_t *old_buf = NULL;
+			size_t   old_len = 0;
+			if (tessera_fs_read_full_content(tmp_, &ino, &old_buf,
+			    &old_len) != 0) {
+				rc = EIO;
+				goto out;
+			}
+			if (old_buf != NULL) {
+				memcpy(head_buf, old_buf,
+				    old_len < (size_t)head ? old_len : (size_t)head);
+				free(old_buf, M_TESSERA);
+			}
+		}
+	}
+
+	/* From here to `out`, every publish lands in one flush. */
+	gated = tmp_->flush_mtx_init;
+	if (gated) tessera_fs_flush_gate_enter(tmp_);
+
+	if (head_buf != NULL) {
+		rc = tessera_fs_replace_content_chunk_tree(tmp_, inode_no,
+		    head_buf, (size_t)head, cs);
+		if (rc != 0)
+			goto out;
+		cur = head;
+		*out_reached = cur;
+		tessera_stat_extend_sparse_windows++;
+	}
+
+	while (cur < new_size) {
+		uint64_t w = new_size - cur;
+		if (w > TESSERA_EXTEND_WINDOW_BYTES)
+			w = TESSERA_EXTEND_WINDOW_BYTES;
+		rc = tessera_fs_append_chunked(tmp_, inode_no, cur, zeros,
+		    (size_t)w, cs);
+		if (rc != 0)
+			break;
+		cur += w;
+		*out_reached = cur;
+		tessera_stat_extend_sparse_windows++;
+		/* The gate is a flag, not a held mutex, so yielding is safe;
+		 * a multi-GiB extend should not monopolise a CPU. */
+		maybe_yield();
+	}
+
+out:
+	if (gated) tessera_fs_flush_gate_exit(tmp_);
+	if (head_buf != NULL) free(head_buf, M_TESSERA);
+	free(zeros, M_TESSERA);
+	if (rc == 0)
+		tessera_stat_extend_sparse++;
+	return (rc);
 }
 
 /*

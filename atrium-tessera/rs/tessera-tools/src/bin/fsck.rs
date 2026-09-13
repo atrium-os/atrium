@@ -997,9 +997,12 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
                 fsck.reach(&xattr, false, &format!("{label} xattr"), 0);
                 fsck.inode_map.insert(ino, (mode, nlink, manifest));
                 fsck.inode_raw.insert(ino, (key, val.to_vec()));
-                // quota is charged on logical file bytes; accumulate per domain
+                // quota is charged on logical file bytes; accumulate per domain.
+                // Key 0 collects UNTAGGED files: the kmod charges those to the
+                // mount's default domain (tessera_quota_for_inode), which Pass E
+                // resolves to domain 1 below.
                 let qdom = rd_u64(&val, 136);
-                if qdom != 0 && mode & S_IFMT == S_IFREG {
+                if mode & S_IFMT == S_IFREG {
                     *fsck.quota_used.entry(qdom).or_insert(0) += size;
                 }
 
@@ -1482,7 +1485,19 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
                     }
                     let domain_id = rd_u64(&val, 0);
                     let used = rd_u64(&val, 24);
-                    let computed = *fsck.quota_used.get(&domain_id).unwrap_or(&0);
+                    // ★ Domain 1 is the whole-volume DEFAULT domain
+                    // (`mount -o tessera.quota_bytes=N`; the kmod never
+                    // allocates id 1 per-directory). Its files are NOT tagged
+                    // — their inode quota_domain is 0 and the kmod charges
+                    // them to the mount's default domain. Counting only tagged
+                    // files reported every per-app overlay volume (portcullis.md
+                    // §4.1) as "used_bytes=N but sizes sum to 0", and --repair
+                    // would then zero used_bytes: a quota bypass of exactly the
+                    // bytes already written.
+                    let mut computed = *fsck.quota_used.get(&domain_id).unwrap_or(&0);
+                    if domain_id == 1 {
+                        computed += *fsck.quota_used.get(&0).unwrap_or(&0);
+                    }
                     if used != computed {
                         fsck.problem(format!(
                             "quota domain {domain_id}: used_bytes={used} but regular-file sizes sum to {computed}"));
