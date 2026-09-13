@@ -181,14 +181,24 @@ fn validate_path(path: &str, policy: &Policy) -> Result<(), JaildError> {
     {
         return Ok(());
     }
-    /* Special case: "/" is permitted. Smoke tests use it. The
-     * policy file's allow-lists don't include "/" because no
-     * production jail should use it as path. Allowing here so that
-     * scratch tests don't need to add it to the policy file. The
-     * production policy will set this off via a separate flag in
-     * V1. */
+    /* The HOST ROOT is refused, explicitly and first-class — not merely
+     * "not on the list".
+     *
+     * It used to be special-cased IN, "because smoke tests use it". A
+     * path="/" jail shares the host's entire filesystem and, since jaild
+     * only mounts a per-jail devfs under a real root, the host's full /dev
+     * (kmem, mem, pci) — PID isolation and nothing else (portcullis.md
+     * §9.1). The exception outlived its reason: by 2026-09-13 the only
+     * jails still taking it were those smoke manifests, and every real
+     * service and session app already ran on a real root. Keeping the
+     * door open meant any manifest could walk back through it. */
     if path == "/" {
-        return Ok(());
+        return Err(JaildError::PolicyViolation {
+            rule:   "path.host_root",
+            detail: "jail path \"/\" is the host root: no filesystem or device \
+                     isolation. Use a per-jail root under /var/lib/atrium/jails/ \
+                     (portcullis.md §9.1)".into(),
+        });
     }
     Err(JaildError::PolicyViolation {
         rule:   "path.not_in_allowlist",
@@ -409,7 +419,16 @@ mod tests {
         validate_path("/usr/local/lib", &p).unwrap();         // ro
         validate_path("/var/run/aqueduct", &p).unwrap();      // rw
         validate_path("/usr/home/girivs", &p).unwrap();       // rw_pattern
-        validate_path("/", &p).unwrap();                      // smoke-test escape
+        validate_path("/var/lib/atrium/jails/atrium-test", &p).unwrap(); // per-jail root
+    }
+
+    #[test]
+    fn path_refuses_the_host_root() {
+        let p = load_sample_policy();
+        match validate_path("/", &p).unwrap_err() {
+            JaildError::PolicyViolation { rule: "path.host_root", .. } => {}
+            other => panic!("wrong: {other:?}"),
+        }
     }
 
     #[test]
@@ -443,7 +462,7 @@ mod tests {
         let p = load_sample_policy();
         let req = CreateJailRequest {
             name:          "atrium-test".into(),
-            path:          "/".into(),
+            path:          "/var/lib/atrium/jails/atrium-test".into(),
             children_max:  0,
             mounts:        vec![],
             devfs_ruleset: 0,
@@ -458,7 +477,7 @@ mod tests {
         let p = load_sample_policy();
         let req = CreateJailRequest {
             name:          "evil-x".into(),
-            path:          "/".into(),
+            path:          "/var/lib/atrium/jails/atrium-test".into(),
             children_max:  0,
             mounts:        vec![],
             devfs_ruleset: 0,
@@ -475,7 +494,7 @@ mod tests {
     fn req_default() -> CreateJailRequest {
         CreateJailRequest {
             name: "atrium-test".into(),
-            path: "/".into(),
+            path: "/var/lib/atrium/jails/atrium-test".into(),
             children_max:  0,
             mounts:        vec![],
             devfs_ruleset: 0,

@@ -9,5 +9,5 @@
 
 enabled      = true
 name         = "atrium-smoke-persist"
-path         = "/"
+path         = "/var/lib/atrium/jails/atrium-smoke-persist"   # a real per-jail root; jaild refuses "/"
 children_max = 0

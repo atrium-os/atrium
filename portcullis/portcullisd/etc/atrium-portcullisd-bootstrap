@@ -76,8 +76,17 @@ atrium_portcullisd_bootstrap_start() {
         ""|NO|no|none|NONE)
             _vol="" ;;
         *)
+            # atrium-volumes runs earlier in rcorder but daemonizes, so its
+            # socket appears asynchronously. A single immediate check lost that
+            # race on every boot and started bootstrap WITHOUT storage — every
+            # manifest with a persistent volume was skipped ("allocator
+            # unavailable"). Wait for it, bounded.
+            _i=0
+            while [ ! -S "${_vol}" ] && [ ${_i} -lt 20 ]; do
+                sleep 0.5; _i=$((_i + 1))
+            done
             if [ ! -S "${_vol}" ]; then
-                warn "atrium-volumes socket ${_vol} missing; starting without storage"
+                warn "atrium-volumes socket ${_vol} missing after 10s; starting without storage"
                 _vol=""
             fi ;;
     esac

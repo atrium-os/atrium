@@ -715,7 +715,23 @@ fn handle_create(
      * with a REAL root — with path="/" the jail's /dev IS the host's, and
      * mounting devfs there would clobber it, so those stay on the host devfs
      * (the documented bring-up exposure) until the per-jail-root migration. */
-    if req.path != "/" && req.devfs_ruleset != 0 {
+    /* The root itself. Mount destinations get created under it by the exec
+     * child, which creates the root as a side effect — but a jail with no
+     * mounts (a persistent jail with no exec) has nothing to do that, and
+     * jail_set on a missing path is ENOENT. path="/" is refused by the
+     * validator, so every root here is a real per-jail directory. */
+    if let Err(e) = std::fs::create_dir_all(&req.path) {
+        if let Some(addr) = &lo0_alias {
+            let _ = ffi::ifconfig_lo0_alias_del(addr);
+        }
+        return Err(JaildError::Syscall {
+            name:  "mkdir",
+            errno: e.raw_os_error().unwrap_or(-1),
+            msg:   format!("mkdir -p {}: {e}", req.path),
+        });
+    }
+
+    if req.devfs_ruleset != 0 {
         let devdir = format!("{}/dev", req.path.trim_end_matches('/'));
         let _ = std::fs::create_dir_all(&devdir);
         if let Err(e) = ffi::devfs_mount(&devdir, req.devfs_ruleset) {
@@ -730,14 +746,6 @@ fn handle_create(
         }
         info!("jaild: mounted per-jail devfs at {devdir} ruleset {}",
             req.devfs_ruleset);
-    } else if req.path == "/" {
-        /* Operational visibility for the §9.1 KNOWN GAP: a path="/" jail shares
-         * the host root + host /dev (no fs/device isolation — PID isolation only).
-         * Still the bring-up reality for ostiarius-launched session apps; logged
-         * so the unisolated jails are visible until the per-jail-root migration. */
-        warn!("jaild: jail {} created with path=\"/\" — NO filesystem/device \
-               isolation (shares host root + /dev); §9.1 KNOWN GAP, migrate to a \
-               per-jail root", req.name);
     }
 
     if let Some(exec) = &req.exec {
@@ -800,11 +808,17 @@ fn handle_create_with_exec(
      * mount. Validator already screened sources + traversal. */
     let resolved_mounts: Vec<(String, String, MountKind)> = req.mounts.iter()
         .map(|m| {
-            let dest = if m.dest.starts_with('/') {
-                PathBuf::from(&m.dest)
-            } else {
-                PathBuf::from(&req.path).join(&m.dest)
-            };
+            /* ALWAYS under the jail root. A leading '/' used to mean a
+             * HOST path, so a real-root jail's capability socket mount
+             * ("/atrium/sockets/portcullisd/") and volumes
+             * (mount_at = "/atrium-data", e.g. stoad) landed on the host
+             * and never appeared inside the jail — invisible while every
+             * jail was path="/", where the two coincide. It was also an
+             * escape: the validator checks sources and "..", not
+             * absolute dests, so an allow-listed source could be mounted
+             * over any host path. Runtime AttachMount already re-rooted
+             * this way; create time now matches it. */
+            let dest = PathBuf::from(&req.path).join(m.dest.trim_start_matches('/'));
             (m.source.clone(), dest.to_string_lossy().into_owned(), m.kind)
         })
         .collect();

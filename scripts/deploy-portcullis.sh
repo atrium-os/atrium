@@ -99,6 +99,13 @@ scp $SSHOPT -P 2222 "$BSD"/etc/services.d/*.toml \
     && echo "  services.d ok ($(ls "$BSD"/etc/services.d/*.toml | wc -l | tr -d ' ') manifests)" \
     || { echo "  services.d FAILED"; rc=1; }
 
+# The slow-fail smoke's exec target: sleep(1) under an atrium- name, so it
+# satisfies jaild's exec allow-list and lives the ~3 s its budget model needs.
+# Its manifest always promised this "setup-time" helper and nothing installed
+# it, so every launch was an execve ENOENT.
+g 'install -m 0755 /bin/sleep /usr/local/bin/atrium-slowfail' >/dev/null 2>&1 \
+    && echo "  atrium-slowfail helper ok" || { echo "  atrium-slowfail helper FAILED"; rc=1; }
+
 g 'chmod 0755 /usr/local/etc/rc.d/atrium-* /usr/local/bin/atrium-* \
               /usr/local/bin/portcullisd /usr/local/bin/portcullis \
               /usr/local/bin/opifex 2>/dev/null' >/dev/null 2>&1

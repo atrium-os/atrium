@@ -174,7 +174,7 @@ The privsep architecture (jaild + portcullisd, see [`spec/portcullis.md`](spec/p
 |---|---|---|
 | 1 — schema + parser | ✅ done | `system_services.rs` (`ServiceManifest`, `ManifestVolume`, `[capabilities]`); 20 unit tests |
 | 2 — jail builder | ✅ done | jaild + bootstrap; `[[mounts]]`, `[[volumes]]`, network, exec all wired |
-| 3 — overlay + rootfs unionfs | ⬜ deferred | smoke uses `path="/"`; D5 atrium-rootfs lands per-jail trees |
+| 3 — overlay + rootfs unionfs | ✅ done | per-jail roots everywhere; jaild refuses `path="/"`; user apps get per-app overlay VOLUMES (2026-09-13) |
 | 4 — portcullisd + capability policy | ✅ done | aqueduct daemon, `CLASS_PORTCULLIS = 6`, peer-uid → manifest cross-check, manifest `[capabilities]` gate |
 | 4.5 — first-run setup phase | ✅ done | per-volume `[volumes.init]` block + sentinel; init failure short-circuits launch |
 | 5 — capability prompt UI | ⬜ deferred | needs Forum (D3) |

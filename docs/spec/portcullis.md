@@ -25,7 +25,7 @@ Each ships an `rc.d` script in-tree (`portcullis/{jaild,atrium-volumes,portculli
 - Graceful shutdown: SIGTERM/SIGINT → close procdescs, unmount per-jail mounts, RemoveJail (which also drops the jail's runtime mounts).
 
 **Deliberately deferred** (V1):
-- Per-jail rootfs trees / overlay+unionfs. Smoke manifests use `path = "/"` as a transitional stand-in; D5 atrium-rootfs lands real per-jail trees.
+- ~~Per-jail rootfs trees.~~ Done 2026-09-13: every shipped manifest runs on a real root under `/var/lib/atrium/jails/`, and jaild refuses `path = "/"` (see the §9.1 note).
 - Capability prompt UI (Forum integration — D3 dependency).
 - Multi-cap composition smoke (single `attach_mount` capability is exercised; multi-cap layout is designed but no second cap exists yet).
 - `portcullis launch <app-id>` user-app CLI (the daemon's underlying primitives are all there; the user-facing wrapper is a small additional slice).
@@ -1348,35 +1348,31 @@ Concretely:
 > jaild so its uid-range validation is the enforcement point. Until then, do not
 > treat the jailed-desktop bring-up as evidence that the privilege boundary holds.
 
-> ⚠️ **KNOWN GAP — filesystem & device isolation NOT yet enforced (found 2026-06-24).**
-> The two claims below are the DESIGN; the current bring-up does **not** meet
-> them. Every jail today is created with `path = "/"` (the documented placeholder
-> "until D5 atrium-rootfs") **and** jaild only passes the `devfs_ruleset`
-> *parameter* — it never *mounts* a per-jail devfs. Consequence, verified on the
-> real `app-org-atrium-vestibulum` jail (`devfs_ruleset=0`, single `devfs on /dev`
-> mount): a jailed app sees the **entire host filesystem** and the **full host
-> `/dev`** — `kmem`, `mem`, `pci`, every device. With `path = "/"` the jail's
-> `/dev` *is* the host `/dev`, so any `devfs_ruleset` is inert (there is no
-> separate devfs for it to restrict). PID/process isolation holds; filesystem and
-> device isolation do **not**. PROGRESS (2026-06-24): the jaild HALF of the fix is
-> DONE + verified — `ffi::devfs_mount(target, ruleset)` + `handle_create` mounts a
-> per-jail devfs at `<root>/dev` (gated on `path != "/"`, unmounted on RemoveJail),
-> so a jail with a REAL root now sees only the ruleset's nodes (verified: 5 nodes
-> vs the host's 66, no `kmem`/`mem`/`pci`). The memory governor proves the whole
-> pattern (a real root + nullfs lib/binary mounts + the per-jail devfs — see
-> `memoryd/etc/services.d/50-atrium-memoryd.toml`). jaild now also `warn!`s on
-> every `path="/"` create so the remaining unisolated jails are visible.
+> ✅ **CLOSED 2026-09-13 — filesystem & device isolation now enforced for every
+> jaild jail.** (Found 2026-06-24: every jail was created with `path = "/"`, so a
+> jailed app saw the entire host filesystem and the full host `/dev` — `kmem`,
+> `mem`, `pci` — with PID isolation only.)
 >
-> REMAINING (the per-jail-ROOT migration — D5; high-risk, touches the LIVE session
-> launch): give the ostiarius-launched session apps real roots. Concrete change
-> points: `ostiarius/src/lib.rs` `spec()` hardcodes `jail_path: "/"` (→ a real root,
-> e.g. `/var/lib/atrium/jails/<app_id>`); `JaildLauncher::launch()` sends
-> `mounts: vec![], devfs_ruleset: 0` (→ the standard rootfs nullfs mounts — libs +
-> the `apps/<id>` bundle + the caps→socket mounts — plus a session-app devfs
-> ruleset). Needs each app's rootfs populated + the caps→mount mapping + full
-> ostiarius→frescod→session-path testing (a broken launch = no login). user-app
-> jails (`launch.rs`) ALREADY use real roots (`JAILS_DIR/<app_id>` + nullfs/unionfs)
-> — the gap is the SYSTEM/session jails on `path="/"`.
+> How it closed:
+> - **Session apps** moved to real roots earlier (ostiarius's `spec()` and the
+>   `session.d` manifests), with the standard rootfs nullfs mounts and a per-jail
+>   devfs that jaild mounts at `<root>/dev`.
+> - **The last `path = "/"` jails were the ten smoke manifests** in
+>   `etc/services.d`. They now run on real roots with minimal read-only mounts.
+> - **jaild refuses `path = "/"`** (`path.host_root`). The validator used to
+>   special-case it in "because smoke tests use it"; the exception outlived its
+>   reason, and keeping it open meant any manifest could walk back through it.
+>   `portcullisd/tests/shipped_manifests.rs` checks every shipped manifest against
+>   the shipped policy, so a regression fails `cargo test`.
+> - **Mount destinations always resolve under the jail root.** A leading `/`
+>   used to mean a HOST path at create time (runtime AttachMount already
+>   re-rooted it). Invisible while every jail was on `/`, where the two coincide;
+>   on a real root it put capability sockets and volumes on the host instead of in
+>   the jail — `stoad`'s `mount_at = "/atrium-data"` would have — and it let an
+>   allow-listed source be mounted over any host path.
+>
+> Not in this note's scope: the user-app launch path's per-app uid (the ⚠️ note
+> above) and per-capability socket scoping.
 
 - **App-to-app isolation.** A compromised app cannot read another
   app's files (no shared mount), cannot talk to services it
@@ -1385,8 +1381,7 @@ Concretely:
 - **App-to-host isolation.** Standard FreeBSD jail protections —
   no access to host filesystem outside declared mounts, no raw
   sockets, no kernel modules, no dev nodes outside the devfs
-  ruleset. *(See the KNOWN GAP above — not enforced in the current
-  `path = "/"` bring-up; this is the target, not today's reality.)*
+  ruleset. *(Enforced since 2026-09-13 — see the §9.1 note above.)*
 - **Capability auditability.** The grant list is a human-readable
   text file. Users can revoke anytime by editing or via UI.
 - **Manifest-tampering detection.** The grant record includes the

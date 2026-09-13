@@ -17,18 +17,41 @@
 # is host-side. Real services (mysqld, etc.) point this at their
 # own `*_install_db`-style tool.
 #
-# `mount_at` is `/atrium-init-data` (NOT `/atrium-data` like
-# 60-atrium-smoke-volumes) because both manifests use `path = "/"`
-# and so both nullfs mounts land on the host's filesystem; using
-# the same target would collide (EDEADLK from the kernel's
-# nullfs lock). Real services will have proper jail-root trees
-# (D5 atrium-rootfs) and the collision will go away.
+# `mount_at` is `/atrium-init-data` (not `/atrium-data` like
+# 60-atrium-smoke-volumes). That distinct name used to be REQUIRED: both
+# manifests ran on `path = "/"`, so both nullfs mounts landed on the host
+# and collided (EDEADLK). Every jail now has its own root and the
+# destinations resolve under it, so the names no longer interact; this one
+# is kept distinct only so the two volumes are easy to tell apart in `mount`.
 
 enabled       = true
 name          = "atrium-smoke-init"
-path          = "/"
+path          = "/var/lib/atrium/jails/atrium-smoke-init"   # a real per-jail root; jaild refuses "/"
 children_max  = 0
 devfs_ruleset = 0
+
+# Minimal per-jail rootfs (portcullis.md §9.1): the dynamic linker, the
+# libraries the exec target links (ldd: all under /lib), and the binary.
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/etc/atrium"
+dest   = "etc/atrium"
+kind   = "ro_nullfs"
 
 [[volumes]]
 name      = "data"

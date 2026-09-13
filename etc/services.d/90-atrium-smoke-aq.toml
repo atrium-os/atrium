@@ -19,12 +19,36 @@
 # This is the first time anything Atrium-shaped runs aqueduct
 # end-to-end in the production socket topology — capability =
 # directory mount, no daemon-side trust check on the path.
+#
+# uid 1099, not the 1001 every other smoke uses. portcullisd maps a peer
+# uid back to exactly one manifest; with nine manifests on 1001 it refused
+# the attach ("peer uid 1001 matches 9 manifests … cannot determine owning
+# jail"), so this smoke had been failing before it tested anything.
 
 enabled       = true
 name          = "atrium-aq-photoeditor"
-path          = "/"
+path          = "/var/lib/atrium/jails/atrium-aq-photoeditor"   # a real per-jail root; jaild refuses "/"
 children_max  = 0
 devfs_ruleset = 0
+
+# Minimal per-jail rootfs (portcullis.md §9.1): the dynamic linker, the
+# libraries the exec target links (ldd: all under /lib), and the binary.
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
 
 [exec]
 # attach + linger 60s. The linger gives a SIGTERM-driven
@@ -38,8 +62,8 @@ argv = ["atrium-portcullisd-aq",
         "/atrium-via-aq",
         "rw_nullfs",
         "--sleep-after", "60"]
-uid  = 1001
-gid  = 1001
+uid  = 1099
+gid  = 1099
 
 [[exec.env]]
 key   = "PATH"

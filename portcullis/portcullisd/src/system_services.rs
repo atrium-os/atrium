@@ -16,9 +16,11 @@
 //! # /etc/atrium/services.d/atrium-frescod.toml
 //! enabled = true
 //! name    = "atrium-frescod"
-//! path    = "/"            # placeholder until D5 atrium-rootfs lands
+//! path    = "/var/lib/atrium/jails/atrium-frescod"   # a real per-jail root;
+//!                          # jaild refuses "/" (no fs/device isolation)
 //! children_max = 0
-//! devfs_ruleset = 0        # 0 = inherit; production uses non-zero
+//! devfs_ruleset = 4        # non-zero mounts a per-jail /dev with that ruleset;
+//!                          # 0 = no /dev at all
 //!
 //! [[mounts]]
 //! source = "/usr/local/lib"

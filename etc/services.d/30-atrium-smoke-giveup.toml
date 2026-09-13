@@ -9,9 +9,32 @@
 
 enabled       = true
 name          = "atrium-smoke-giveup"
-path          = "/"
+path          = "/var/lib/atrium/jails/atrium-smoke-giveup"   # a real per-jail root; jaild refuses "/"
 children_max  = 0
 devfs_ruleset = 0
+
+# Minimal per-jail rootfs (portcullis.md §9.1): the dynamic linker, the
+# libraries the exec target links (ldd: all under /lib), and the binary.
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/etc/atrium"
+dest   = "etc/atrium"
+kind   = "ro_nullfs"
 
 [exec]
 path = "/usr/local/bin/atrium-jaild"

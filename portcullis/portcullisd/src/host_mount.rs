@@ -70,11 +70,10 @@ pub fn unmount_jail_dest(jail_path: &str, dest: &str) -> io::Result<()> {
 /// The resolution shared with jaild's `resolved_mounts`. Split out so
 /// it can be unit-tested without a live mount.
 fn resolve_jail_dest(jail_path: &str, dest: &str) -> String {
-    let target = if dest.starts_with('/') {
-        std::path::PathBuf::from(dest)
-    } else {
-        std::path::Path::new(jail_path).join(dest)
-    };
+    // Always under the root — a leading '/' is NOT a host path. Must match
+    // jaild's create-time resolution exactly, or cleanup unmounts the wrong
+    // path and leaks the real mount.
+    let target = std::path::Path::new(jail_path).join(dest.trim_start_matches('/'));
     target.to_string_lossy().into_owned()
 }
 
@@ -97,8 +96,13 @@ mod tests {
     }
 
     #[test]
-    fn absolute_dest_is_used_verbatim() {
-        // Matches jaild: a dest beginning with '/' is NOT re-rooted.
-        assert_eq!(resolve_jail_dest("/var/lib/atrium/jails/x", "/dev"), "/dev");
+    fn absolute_dest_is_rerooted_under_the_jail() {
+        // Matches jaild: a leading '/' is inside the jail, never the host.
+        // This used to assert "/dev" -> "/dev", which is how a real-root
+        // jail's "/atrium-data" volume ended up mounted on the host.
+        assert_eq!(resolve_jail_dest("/var/lib/atrium/jails/x", "/dev"),
+            "/var/lib/atrium/jails/x/dev");
+        assert_eq!(resolve_jail_dest("/var/lib/atrium/jails/stoad", "/atrium-data"),
+            "/var/lib/atrium/jails/stoad/atrium-data");
     }
 }

@@ -6,19 +6,41 @@
 # before give-up — meaningfully more than the ~3 retries the
 # fast-fail (0s lifetime) variant gets at the same budget.
 #
-# The "binary" is sh -c 'sleep 3'; we route it through
-# /usr/local/bin/atrium-slowfail (a small symlink installed at
-# smoke-test setup time) to satisfy jaild's exec-path allowlist.
+# The "binary" is FreeBSD's sleep(1), installed as
+# /usr/local/bin/atrium-slowfail by scripts/deploy-portcullis.sh so it
+# satisfies jaild's exec-path allowlist, and run with "3". (The old comment
+# promised a symlink "installed at smoke-test setup time" that nothing
+# installed: every launch was `execve … No such file or directory`, so this
+# smoke never tested a 3 s lifetime until 2026-09-13.)
 
 enabled       = true
 name          = "atrium-smoke-slowfail"
-path          = "/"
+path          = "/var/lib/atrium/jails/atrium-smoke-slowfail"   # a real per-jail root; jaild refuses "/"
 children_max  = 0
 devfs_ruleset = 0
 
+# Minimal per-jail rootfs (portcullis.md §9.1): the dynamic linker, the
+# libraries the exec target links (ldd: all under /lib), and the binary.
+[[mounts]]
+source = "/libexec"
+dest   = "libexec"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/lib"
+dest   = "lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/lib"
+dest   = "usr/lib"
+kind   = "ro_nullfs"
+[[mounts]]
+source = "/usr/local/bin"
+dest   = "usr/local/bin"
+kind   = "ro_nullfs"
+
 [exec]
 path = "/usr/local/bin/atrium-slowfail"
-argv = ["atrium-slowfail"]
+argv = ["atrium-slowfail", "3"]
 uid  = 1001
 gid  = 1001
 
