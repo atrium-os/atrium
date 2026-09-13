@@ -1341,6 +1341,21 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, pinscan_duty_pct, CTLFLAG_RW,
     "Target background-pinscan duty cycle in percent (#71): the next scan "
     "is refused until last_scan_ms * (100/pct - 1) has elapsed. "
     "0 = old behaviour (rate-limit only, <=1 kick/s)");
+/*
+ * A/B switch for the tight-reserve duty bypass below, so its effect can be
+ * measured against the same workload with it off (scripts/vm-pinscan-tight-
+ * test.sh). 1 = bypass the duty quiet when tessera_fs_meta_tight (default).
+ */
+static int tessera_pinscan_tight_bypass = 1;
+SYSCTL_INT(_kern_tessera, OID_AUTO, pinscan_tight_bypass, CTLFLAG_RW,
+    &tessera_pinscan_tight_bypass, 0,
+    "1 = pressure kicks skip the pinscan duty-cycle quiet period while the "
+    "metadata reserve is tight; 0 = always honour the quiet (test A/B only)");
+static unsigned long tessera_stat_pinscan_duty_tight_honoured = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_duty_tight_honoured, CTLFLAG_RD,
+    &tessera_stat_pinscan_duty_tight_honoured, 0,
+    "kicks skipped on duty while the reserve was tight because "
+    "pinscan_tight_bypass=0 — the kicks the bypass would have taken");
 static unsigned long tessera_stat_pinscan_duty_bypass_tight = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_duty_bypass_tight, CTLFLAG_RD,
     &tessera_stat_pinscan_duty_bypass_tight, 0,
@@ -16412,7 +16427,10 @@ tessera_meta_pin_bitmap_rebuild(struct tessera_mount *tmp_)
 		sbintime_t quiet = tmp_->pinscan_last_dur *
 		    ((100 / tessera_pinscan_duty_pct) - 1);
 		if (sbinuptime() < tmp_->pinscan_last_end + quiet) {
-			if (!tessera_fs_meta_tight(tmp_)) {
+			int tight = tessera_fs_meta_tight(tmp_);
+			if (!tight || !tessera_pinscan_tight_bypass) {
+				if (tight)
+					tessera_stat_pinscan_duty_tight_honoured++;
 				tessera_stat_pinscan_skips_duty++;
 				return;
 			}
