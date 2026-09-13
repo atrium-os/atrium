@@ -1561,6 +1561,18 @@ static unsigned long tessera_stat_append_fast_fallback = 0;
 static unsigned long tessera_stat_extend_sparse        = 0;
 static unsigned long tessera_stat_extend_sparse_windows = 0;
 static unsigned long tessera_stat_extend_sparse_fallback = 0;
+/* Whole-file materialisation accounting (2026-09-13 memory starvation). Each
+ * *_wholefile counter is a path that held the old file AND a new full-size
+ * buffer at once; *_bytes sums what those buffers cost. The range-scoped
+ * replacements count their own successes and fallbacks. */
+static unsigned long tessera_stat_truncate_prefix          = 0;
+static unsigned long tessera_stat_truncate_prefix_fallback = 0;
+static unsigned long tessera_stat_setattr_wholefile        = 0;
+static unsigned long tessera_stat_setattr_wholefile_bytes  = 0;
+static unsigned long tessera_stat_write_range_grow         = 0;
+static unsigned long tessera_stat_write_range_grow_fallback = 0;
+static unsigned long tessera_stat_write_wholefile          = 0;
+static unsigned long tessera_stat_write_wholefile_bytes    = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, vop_write_inline,
     CTLFLAG_RD, &tessera_stat_vop_write_inline, 0,
     "vop_write completions via INLINE manifest path");
@@ -1714,6 +1726,30 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, extend_sparse_windows,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, extend_sparse_fallback,
     CTLFLAG_RD, &tessera_stat_extend_sparse_fallback, 0,
     "Sparse truncate-extends that fell back to the materialising path");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, truncate_prefix,
+    CTLFLAG_RD, &tessera_stat_truncate_prefix, 0,
+    "Truncate-shrinks done without materialising the old file");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, truncate_prefix_fallback,
+    CTLFLAG_RD, &tessera_stat_truncate_prefix_fallback, 0,
+    "Truncate-shrinks that fell back to the whole-file path");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, setattr_wholefile,
+    CTLFLAG_RD, &tessera_stat_setattr_wholefile, 0,
+    "Truncates that materialised the whole file (old + new buffers)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, setattr_wholefile_bytes,
+    CTLFLAG_RD, &tessera_stat_setattr_wholefile_bytes, 0,
+    "Bytes of old+new buffers held by whole-file truncates");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, write_range_grow,
+    CTLFLAG_RD, &tessera_stat_write_range_grow, 0,
+    "Size-changing writes done range-scoped (overwrite + holes + append)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, write_range_grow_fallback,
+    CTLFLAG_RD, &tessera_stat_write_range_grow_fallback, 0,
+    "Size-changing writes that fell back to the whole-file path");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, write_wholefile,
+    CTLFLAG_RD, &tessera_stat_write_wholefile, 0,
+    "Writes that materialised the whole file (old + new buffers)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, write_wholefile_bytes,
+    CTLFLAG_RD, &tessera_stat_write_wholefile_bytes, 0,
+    "Bytes of old+new buffers held by whole-file writes");
 
 /* fsync group commit (v2 polish): how many times a flush caller
  * waited on an already-in-flight commit instead of triggering a new
@@ -2354,15 +2390,25 @@ static int  tessera_fs_count_multi_extent(struct tessera_mount *tmp_,
  *
  * TESSERA_WRITE_MATERIALIZE_MAX is a real bound, but on an OPERATION,
  * not on file size. It limits the read-modify-write SLOW paths that must
- * hold the whole file in one contiguous M_WAITOK buffer: an in-place
- * overwrite that isn't a pure append, a SHRINK or a small (<64 MiB)
- * truncate-extend, an mmap
- * putpages flush, and the one-shot CHUNK_LIST→CHUNK_TREE promotion plus
- * the single 64 MiB chunk-tier rebuild. You cannot malloc a 100 GiB
- * contiguous buffer, so those return EFBIG past this bound — but a huge
- * file is still fine to create (append), grow, and read; only a
- * non-append rewrite / truncate-extend of a span larger than this is
- * refused.
+ * hold the whole file in one contiguous M_WAITOK buffer. You cannot malloc a
+ * 100 GiB contiguous buffer, so those return EFBIG past this bound.
+ *
+ * ★ The cap bounds SIZE, not MEMORY PRESSURE. Each slow path holds the old
+ * file AND a new full-size buffer at once, so 2x the file wired per call.
+ * fsx on a 300 MiB file (2026-09-13) did that on most writes and truncates,
+ * wired ~900 MiB in a 4 GiB guest and made it unresponsive; the run never
+ * finished. What is range-scoped now, and no longer reaches these paths
+ * for large files:
+ *   - in-place overwrites        tessera_fs_replace_range{,_tree}
+ *   - truncate-extend >= 64 MiB  tessera_fs_extend_sparse
+ *   - truncate-SHRINK, any size  tessera_fs_truncate_prefix
+ *   - writes ending past EOF     tessera_fs_write_grow_range (>= 64 MiB)
+ *   - mmap putpages              range path first
+ * With those, the same fsx completes in 50 s with wired memory peaking at
+ * 566 MiB. What still materialises: extends and size-changing writes whose
+ * result is under 64 MiB (<= 128 MiB of buffers), putpages on layouts the
+ * range path rejects, and the one-shot CHUNK_LIST->CHUNK_TREE promotion plus
+ * the 64 MiB chunk-tier rebuild. Each has a *_wholefile counter.
  */
 #define TESSERA_WRITE_MAX_BYTES        (256ULL * 1024 * 1024 * 1024 * 1024) /* 256 TiB sanity */
 #define TESSERA_WRITE_MATERIALIZE_MAX  (512ULL * 1024 * 1024)      /* 512 MiB */
@@ -2391,6 +2437,13 @@ static int tessera_fs_append_chunked(struct tessera_mount *tmp_,
 static int tessera_fs_extend_sparse(struct tessera_mount *tmp_,
     uint32_t inode_no, uint64_t old_size, uint64_t new_size,
     uint64_t *out_reached);
+static int tessera_fs_truncate_prefix(struct tessera_mount *tmp_,
+    uint32_t inode_no, uint64_t new_size);
+static int tessera_fs_write_grow_range(struct tessera_mount *tmp_,
+    uint32_t inode_no, uint64_t old_size, uint64_t off, const uint8_t *buf,
+    size_t len);
+static int tessera_fs_replace_range(struct tessera_mount *tmp_,
+    uint32_t inode_no, uint64_t off, const uint8_t *buf, size_t len);
 static int tessera_fs_append_chunk_tree(struct tessera_mount *tmp_,
     uint32_t inode_no, uint64_t append_off, const uint8_t *append_bytes,
     size_t append_len, uint32_t cs);
@@ -9685,7 +9738,11 @@ tessera_vop_setattr_impl(struct vop_setattr_args *ap)
 			 * whole new file in one M_WAITOK buffer. */
 			const int sparse = (new_size > ino.size &&
 			    new_size >= TESSERA_EXTEND_SPARSE_MIN);
-			if (!sparse && new_size > TESSERA_WRITE_MATERIALIZE_MAX)
+			/* Shrinks are checked below: the prefix path does not
+			 * build the file, so the materialise cap applies to a
+			 * shrink only if it has to fall back. */
+			if (!sparse && new_size > ino.size &&
+			    new_size > TESSERA_WRITE_MATERIALIZE_MAX)
 				return (EFBIG);
 			/* A hole is not free: every chunk of it is a manifest
 			 * record, so metadata grows linearly with the extension
@@ -9754,6 +9811,61 @@ tessera_vop_setattr_impl(struct vop_setattr_args *ap)
 					return (erc == ENOTSUP ? EFBIG : erc);
 				}
 			}
+			/* SHRINK without materialising. Only the part being
+			 * kept matters, so never read — let alone copy — the
+			 * whole old file to throw most of it away. */
+			if (new_size < ino.size) {
+				int src = -1;
+				if (new_size == 0) {
+					static const uint8_t empty_byte = 0;
+					src = tessera_fs_replace_content(tmp_,
+					    (uint32_t)tn->inode_no, &empty_byte, 0);
+				} else if (new_size <= (256u * 1024u)) {
+					/* TESSERA_INLINE_THRESHOLD; defined later. */
+					/* Small result: read just the prefix
+					 * and store it INLINE (#92). */
+					uint8_t *pb = malloc((size_t)new_size,
+					    M_TESSERA, M_WAITOK | M_ZERO);
+					struct iovec piov = { .iov_base = pb,
+					    .iov_len = (size_t)new_size };
+					struct uio puio;
+					puio.uio_iov = &piov;
+					puio.uio_iovcnt = 1;
+					puio.uio_offset = 0;
+					puio.uio_resid = (ssize_t)new_size;
+					puio.uio_segflg = UIO_SYSSPACE;
+					puio.uio_rw = UIO_READ;
+					puio.uio_td = curthread;
+					src = tessera_fs_read_inode_uio(tmp_, &ino,
+					    &puio, NULL);
+					if (src == 0 && puio.uio_resid != 0)
+						src = EIO;
+					if (src == 0)
+						src = tessera_fs_replace_content(tmp_,
+						    (uint32_t)tn->inode_no, pb,
+						    (size_t)new_size);
+					free(pb, M_TESSERA);
+				} else {
+					src = tessera_fs_truncate_prefix(tmp_,
+					    (uint32_t)tn->inode_no, new_size);
+				}
+				if (src == 0) {
+					tessera_stat_truncate_prefix++;
+					if (tessera_fs_inode_get(tmp_,
+					    (uint32_t)tn->inode_no, &ino)
+					    != TESSERA_OK)
+						return (EIO);
+					did_resize = 1;
+					goto post_resize;
+				}
+				if (src != ENOTSUP)
+					return (src);
+				tessera_stat_truncate_prefix_fallback++;
+				if (new_size > TESSERA_WRITE_MATERIALIZE_MAX)
+					return (EFBIG);
+			}
+			tessera_stat_setattr_wholefile++;
+			tessera_stat_setattr_wholefile_bytes += ino.size + new_size;
 			uint8_t *old_buf = NULL;
 			size_t   old_len = 0;
 			if (tessera_fs_read_full_content(tmp_, &ino,
@@ -23957,6 +24069,365 @@ out:
 }
 
 /*
+ * A write [off, off+len) that ends past EOF, without materialising the file.
+ *
+ * Three pieces, each an existing range-scoped operation:
+ *   1. [off, old_size)          in-place overwrite   tessera_fs_replace_range
+ *   2. [old_size, off)          holes (if a gap)     tessera_fs_extend_sparse
+ *   3. [max(off,old_size), end) append               tessera_fs_append_chunked
+ * RAM is the caller's write buffer plus chunk-sized work buffers.
+ *
+ * ENOTSUP from any piece means "not eligible", and the caller re-applies the
+ * WHOLE write through the materialising path. That is correct even after
+ * earlier pieces landed: they wrote a prefix of the same bytes, and holes read
+ * as the zeros the full path would pad with.
+ *
+ * Not crash-atomic as one unit: each piece is its own flush-atomic publish, so
+ * a crash between them can leave the overwrite without the append, or the
+ * holes without the data. Every such state is a consistent file of a valid
+ * size — the same guarantee a crash mid-write gives on UFS. Holding one gate
+ * across all three is not an option: extend_sparse and append allocate
+ * M_WAITOK, and allocating under the gate can deadlock against the pagedaemon
+ * laundering this file system's pages.
+ */
+static int
+tessera_fs_write_grow_range(struct tessera_mount *tmp_, uint32_t inode_no,
+    uint64_t old_size, uint64_t off, const uint8_t *buf, size_t len)
+{
+	const uint64_t end = off + (uint64_t)len;
+	if (end <= old_size || old_size == 0)
+		return (ENOTSUP);
+
+	if (off < old_size) {
+		int r = tessera_fs_replace_range(tmp_, inode_no, off, buf,
+		    (size_t)(old_size - off));
+		if (r != 0)
+			return (r);
+	}
+	if (off > old_size) {
+		uint64_t reached = old_size;
+		int r = tessera_fs_extend_sparse(tmp_, inode_no, old_size, off,
+		    &reached);
+		if (r != 0)
+			return (r);
+	}
+
+	const uint64_t tail_off = off > old_size ? off : old_size;
+	tessera_inode_record_t ino;
+	if (tessera_fs_inode_get(tmp_, inode_no, &ino) != TESSERA_OK)
+		return (EIO);
+	if (ino.size != tail_off)
+		return (ENOTSUP);		/* someone else's view; be safe */
+	uint32_t cs = tessera_fs_existing_chunk_size(tmp_, &ino);
+	if (cs == 0)
+		return (ENOTSUP);
+	return (tessera_fs_append_chunked(tmp_, inode_no, tail_off,
+	    buf + (tail_off - off), (size_t)(end - tail_off), cs));
+}
+
+/*
+ * Truncate-SHRINK as a manifest prefix.
+ *
+ * The truncate path built the whole new file in RAM — read_full_content of
+ * the OLD file plus a new_size buffer — and rewrote every chunk of it. For a
+ * shrink that is all waste: every chunk wholly below the new size is already
+ * on disk under its own hash and does not change. Only the chunk the new EOF
+ * falls inside is different, and only by losing its tail.
+ *
+ * Measured cost of the old way (2026-09-13): fsx on a 300 MiB file in the
+ * 4 GiB dev VM wired ~900 MiB, pinned free memory at 30-200 MiB and made the
+ * guest unresponsive within minutes; truncates were one of the two paths
+ * doing it (the other is size-changing writes, see vop_write).
+ *
+ * So: re-emit every retained chunk record (CHUNK_LIST) or group record
+ * (CHUNK_TREE) by hash, rebuild the single boundary chunk from its first
+ * (new_size - chunk_off) bytes, and publish. RAM is one chunk plus the record
+ * arrays, independent of file size.
+ *
+ * ENOTSUP on any layout it does not recognise; the caller falls back.
+ */
+
+/* Rebuild the CHUNK_LIST manifest `cm` (whose chunk i starts at base + i*cs)
+ * truncated to end at new_size. On success the caller owns *out_mft and
+ * *out_dirty and *out_buf (at most one dirty chunk, the trimmed boundary). */
+static int
+tessera_fs_trim_chunk_list(struct tessera_mount *tmp_, const uint8_t *cm,
+    uint32_t cmlen, uint64_t base, uint32_t cs, uint64_t new_size,
+    uint8_t **out_mft, size_t *out_mlen, struct tessera_chunk_in *out_dirty,
+    uint32_t *out_ndirty, uint8_t **out_buf)
+{
+	*out_mft = NULL; *out_ndirty = 0; *out_buf = NULL;
+	tessera_manifest_parser_t *p = tessera_manifest_parse(cm, cmlen);
+	if (p == NULL || tessera_manifest_parser_kind(p) != TESSERA_MFT_CHUNK_LIST) {
+		if (p != NULL) tessera_manifest_parser_free(p);
+		return (ENOTSUP);
+	}
+	const uint32_t n = tessera_manifest_parser_count(p);
+	tessera_manifest_builder_t *mb =
+	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_CHUNK_LIST);
+	if (mb == NULL) { tessera_manifest_parser_free(p); return (ENOMEM); }
+
+	int rc = 0;
+	for (uint32_t i = 0; i < n && rc == 0; i++) {
+		tessera_chunk_record_t cr;
+		const uint64_t want_off = base + (uint64_t)i * cs;
+		if (tessera_manifest_chunk_at(p, i, &cr) != TESSERA_OK ||
+		    cr.logical_offset != want_off) {
+			rc = ENOTSUP;
+			break;
+		}
+		if (cr.logical_offset >= new_size)
+			break;					/* past the new EOF */
+		const uint64_t end = cr.logical_offset + cr.uncompressed_size;
+		if (end <= new_size) {
+			if (tessera_manifest_add_chunk(mb, cr.chunk_hash,
+			    cr.logical_offset, cr.uncompressed_size, cr.flags)
+			    != TESSERA_OK) rc = ENOMEM;
+			continue;
+		}
+		/* The boundary chunk: keep its first `keep` bytes. */
+		const uint32_t keep = (uint32_t)(new_size - cr.logical_offset);
+		uint8_t *b = malloc(keep, M_TESSERA, M_WAITOK | M_ZERO);
+		if (!(cr.flags & TESSERA_CHUNK_FLAG_ZERO_HOLE)) {
+			uint8_t *ob = NULL; uint32_t ol = 0;
+			if (tessera_fs_fetch_blob(tmp_, cr.chunk_hash, &ob, &ol)
+			    != 0 || ob == NULL) {
+				free(b, M_TESSERA);
+				rc = ENOTSUP;
+				break;
+			}
+			memcpy(b, ob, ol < keep ? ol : keep);
+			free(ob, M_TESSERA);
+		}
+		int allzero = 1;
+		for (uint32_t j = 0; j < keep; j++)
+			if (b[j] != 0) { allzero = 0; break; }
+		if (allzero) {
+			tessera_hash_t zh;
+			memset(zh, 0, sizeof zh);
+			if (tessera_manifest_add_chunk(mb, zh, cr.logical_offset,
+			    keep, TESSERA_CHUNK_FLAG_ZERO_HOLE) != TESSERA_OK)
+				rc = ENOMEM;
+			free(b, M_TESSERA);
+		} else {
+			tessera_hash_t h;
+			TESSERA_MP_HASH(tmp_, b, keep, h);
+			if (tessera_manifest_add_chunk(mb, h, cr.logical_offset,
+			    keep, 0) != TESSERA_OK) {
+				free(b, M_TESSERA);
+				rc = ENOMEM;
+			} else {
+				out_dirty->bytes = b;
+				out_dirty->len   = keep;
+				memcpy(out_dirty->hash, h, sizeof h);
+				*out_ndirty = 1;
+				*out_buf = b;
+			}
+		}
+		break;						/* nothing after it */
+	}
+	tessera_manifest_parser_free(p);
+	if (rc != 0) {
+		tessera_manifest_free(mb);
+		if (*out_buf != NULL) { free(*out_buf, M_TESSERA); *out_buf = NULL; }
+		*out_ndirty = 0;
+		return (rc);
+	}
+	size_t mlen = 0; tessera_hash_t mh;
+	(void)tessera_manifest_finalize(mb, NULL, 0, &mlen, mh);
+	uint8_t *mft = malloc(mlen, M_TESSERA, M_WAITOK);
+	if (tessera_manifest_finalize(mb, mft, mlen, &mlen, mh) != TESSERA_OK) {
+		tessera_manifest_free(mb);
+		free(mft, M_TESSERA);
+		if (*out_buf != NULL) { free(*out_buf, M_TESSERA); *out_buf = NULL; }
+		*out_ndirty = 0;
+		return (EIO);
+	}
+	tessera_manifest_free(mb);
+	*out_mft = mft;
+	*out_mlen = mlen;
+	return (0);
+}
+
+static int
+tessera_fs_truncate_prefix_inner(struct tessera_mount *tmp_, uint32_t inode_no,
+    uint64_t new_size)
+{
+	uint8_t key[4];
+	encode_inode_key(inode_no, key);
+	tessera_inode_record_t ino;
+	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
+		return (EIO);
+	if (new_size == 0 || new_size >= ino.size)
+		return (ENOTSUP);
+
+	uint8_t *omft = NULL; uint32_t omlen = 0;
+	if (tessera_fs_fetch_blob(tmp_, ino.manifest_hash, &omft, &omlen) != 0 ||
+	    omft == NULL)
+		return (ENOTSUP);
+	tessera_manifest_parser_t *op = tessera_manifest_parse(omft, omlen);
+	if (op == NULL) { free(omft, M_TESSERA); return (ENOTSUP); }
+	const int kind = tessera_manifest_parser_kind(op);
+	int rc = 0;
+
+	if (kind == TESSERA_MFT_CHUNK_LIST) {
+		tessera_chunk_record_t cr0;
+		uint32_t cs = 0;
+		if (tessera_manifest_parser_count(op) > 1 &&
+		    tessera_manifest_chunk_at(op, 0, &cr0) == TESSERA_OK)
+			cs = cr0.uncompressed_size;
+		tessera_manifest_parser_free(op);
+		if (cs == 0) { free(omft, M_TESSERA); return (ENOTSUP); }
+
+		struct tessera_chunk_in *dirty = malloc(sizeof *dirty,
+		    M_TESSERA, M_WAITOK | M_ZERO);
+		uint32_t nd = 0; uint8_t *bbuf = NULL;
+		uint8_t *mft = NULL; size_t mlen = 0;
+		rc = tessera_fs_trim_chunk_list(tmp_, omft, omlen, 0, cs,
+		    new_size, &mft, &mlen, dirty, &nd, &bbuf);
+		free(omft, M_TESSERA);
+		if (rc != 0) { free(dirty, M_TESSERA); return (rc); }
+		/* chunked_apply publishes the dirty chunk + manifest, repoints the
+		 * inode at new_size, and frees mft and dirty (not the bytes). */
+		rc = tessera_fs_chunked_apply(tmp_, inode_no, dirty, nd, mft,
+		    mlen, (size_t)new_size);
+		if (bbuf != NULL) free(bbuf, M_TESSERA);
+		return (rc);
+	}
+
+	if (kind != TESSERA_MFT_CHUNK_TREE) {
+		tessera_manifest_parser_free(op);
+		free(omft, M_TESSERA);
+		return (ENOTSUP);
+	}
+
+	uint32_t cs = 0;
+	if (tessera_fs_manifest_chunk_size(tmp_, ino.manifest_hash, &cs) != 0 ||
+	    cs == 0 || (cs & (cs - 1)) != 0) {
+		tessera_manifest_parser_free(op);
+		free(omft, M_TESSERA);
+		return (ENOTSUP);
+	}
+	const uint64_t gspan = (uint64_t)TESSERA_CHUNK_TREE_FANOUT * cs;
+	const uint32_t K = tessera_manifest_parser_count(op);
+	const uint32_t gb = (uint32_t)((new_size - 1) / gspan);	/* boundary */
+	if (gb >= K) {
+		tessera_manifest_parser_free(op);
+		free(omft, M_TESSERA);
+		return (ENOTSUP);
+	}
+
+	tessera_manifest_builder_t *outer =
+	    tessera_fs_mft_begin(tmp_, TESSERA_MFT_CHUNK_TREE);
+	if (outer == NULL) {
+		tessera_manifest_parser_free(op);
+		free(omft, M_TESSERA);
+		return (ENOMEM);
+	}
+	tessera_hash_t bhash;
+	for (uint32_t g = 0; g <= gb && rc == 0; g++) {
+		tessera_tree_record_t tr;
+		if (tessera_manifest_tree_at(op, g, &tr) != TESSERA_OK ||
+		    tr.logical_offset != (uint64_t)g * gspan) {
+			rc = ENOTSUP;
+			break;
+		}
+		if (g < gb) {
+			if (tessera_manifest_add_tree_child(outer,
+			    tr.child_manifest_hash, tr.logical_offset)
+			    != TESSERA_OK) rc = ENOMEM;
+			continue;
+		}
+		memcpy(bhash, tr.child_manifest_hash, sizeof bhash);
+	}
+	tessera_manifest_parser_free(op);
+	free(omft, M_TESSERA);
+
+	if (rc == 0) {
+		/* Rebuild only the boundary group. */
+		const uint64_t g_off = (uint64_t)gb * gspan;
+		uint8_t *cm = NULL; uint32_t cml = 0;
+		if (tessera_fs_fetch_blob(tmp_, bhash, &cm, &cml) != 0 ||
+		    cm == NULL) {
+			rc = ENOTSUP;
+		} else {
+			struct tessera_chunk_in *dirty = malloc(sizeof *dirty,
+			    M_TESSERA, M_WAITOK | M_ZERO);
+			uint32_t nd = 0; uint8_t *bbuf = NULL;
+			uint8_t *gm = NULL; size_t gml = 0;
+			rc = tessera_fs_trim_chunk_list(tmp_, cm, cml, g_off, cs,
+			    new_size, &gm, &gml, dirty, &nd, &bbuf);
+			free(cm, M_TESSERA);
+			if (rc == 0) {
+				tessera_hash_t pub;
+				if (tessera_fs_publish_chunked(tmp_, dirty, nd,
+				    gm, gml, pub, inode_no) != 0)
+					rc = EIO;
+				else if (tessera_manifest_add_tree_child(outer,
+				    pub, g_off) != TESSERA_OK)
+					rc = ENOMEM;
+				free(gm, M_TESSERA);
+			}
+			if (bbuf != NULL) free(bbuf, M_TESSERA);
+			free(dirty, M_TESSERA);
+		}
+	}
+	if (rc != 0) {
+		tessera_manifest_free(outer);
+		return (rc);
+	}
+
+	/* The read path derives the last child's upper bound from this. */
+	(void)tessera_manifest_set_logical_size(outer, new_size);
+	size_t olen = 0; tessera_hash_t ohash;
+	(void)tessera_manifest_finalize(outer, NULL, 0, &olen, ohash);
+	uint8_t *obuf = malloc(olen, M_TESSERA, M_WAITOK);
+	if (tessera_manifest_finalize(outer, obuf, olen, &olen, ohash)
+	    != TESSERA_OK) {
+		tessera_manifest_free(outer);
+		free(obuf, M_TESSERA);
+		return (EIO);
+	}
+	tessera_manifest_free(outer);
+	if (tessera_fs_publish_manifest_owned(tmp_, obuf, olen, ohash,
+	    inode_no) != 0) {
+		free(obuf, M_TESSERA);
+		return (EIO);
+	}
+	free(obuf, M_TESSERA);
+
+	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
+		return (EIO);
+	tessera_fs_ino_set_mft(&ino, ohash, TESSERA_MFT_CHUNK_TREE);
+	ino.size = new_size;
+	ino.gen++;
+	struct timeval tv;
+	getmicrotime(&tv);
+	ino.mtime_ns = ino.ctime_ns = (uint64_t)tv.tv_sec * 1000000000ULL +
+	    (uint64_t)tv.tv_usec * 1000ULL;
+	uint64_t nr = tmp_->sb.inode_root;
+	if (tessera_fs_inode_put_byk(tmp_, key, &ino, &nr) != TESSERA_OK)
+		return (EIO);
+	tmp_->sb.inode_root = nr;
+	return (0);
+}
+
+/* Gated like tessera_fs_replace_range: the publish and the inode repoint
+ * must land in one flush. Every allocation inside is bounded by one chunk
+ * plus the record arrays, the same budget replace_range already runs under
+ * the gate. */
+static int
+tessera_fs_truncate_prefix(struct tessera_mount *tmp_, uint32_t inode_no,
+    uint64_t new_size)
+{
+	int gated = tmp_->flush_mtx_init;
+	if (gated) tessera_fs_flush_gate_enter(tmp_);
+	int rc = tessera_fs_truncate_prefix_inner(tmp_, inode_no, new_size);
+	if (gated) tessera_fs_flush_gate_exit(tmp_);
+	return (rc);
+}
+
+/*
  * Append fast-path for CHUNK_TREE files (v2 step-3c follow-up).
  *
  * The flat-CHUNK_LIST append fast-path doesn't apply once a file has
@@ -27304,6 +27775,10 @@ tessera_vop_write_impl(struct vop_write_args *ap)
 		free(new_bytes, M_TESSERA);
 		return (EIO);
 	}
+	/* The size this write started from. The range-grow path below
+	 * republishes the inode in steps, so `ino` can be refetched mid-way;
+	 * write_done must still resize the pager against the ORIGINAL size. */
+	const uint64_t size_before = ino.size;
 
 	/* Append fast-path (step-3b): pure append into a chunked file
 	 * skips materialising the existing bytes entirely. Eligibility
@@ -27371,10 +27846,48 @@ tessera_vop_write_impl(struct vop_write_args *ap)
 		goto write_done;
 	}
 
+	/*
+	 * ★ SIZE-CHANGING write on a large file, range-scoped. A write that
+	 * ends past EOF used to land in the whole-file path below: read the
+	 * entire old file, allocate the entire new one zeroed, splice, rewrite.
+	 * fsx on a 300 MiB file did that on most writes and starved a 4 GiB
+	 * guest into unresponsiveness (dtrace profile: malloc_large from here,
+	 * then kmem back/unback + pagezero churn). The write decomposes into
+	 * three pieces the file system already does without materialising:
+	 * an in-place overwrite below the old EOF, holes across any gap, and an
+	 * append. See tessera_fs_write_grow_range.
+	 */
+	if (final_size > ino.size && ino.size > 0 &&
+	    final_size >= TESSERA_EXTEND_SPARSE_MIN) {
+		int grc = tessera_fs_write_grow_range(tmp_,
+		    (uint32_t)tn->inode_no, ino.size, write_off, new_bytes,
+		    (size_t)write_resid);
+		if (grc == 0) {
+			free(new_bytes, M_TESSERA);
+			tessera_stat_write_range_grow++;
+			tessera_stat_vop_write_chunked++;
+			goto write_done;
+		}
+		if (grc != ENOTSUP) {
+			free(new_bytes, M_TESSERA);
+			return (grc);
+		}
+		/* A piece was not eligible. Earlier pieces may already have
+		 * landed; the whole-file path re-applies the entire write over
+		 * the current content, which is idempotent, so refetch and go. */
+		tessera_stat_write_range_grow_fallback++;
+		if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK) {
+			free(new_bytes, M_TESSERA);
+			return (EIO);
+		}
+	}
+
 	if (final_size > TESSERA_WRITE_MATERIALIZE_MAX) {
 		free(new_bytes, M_TESSERA);
 		return (EFBIG);
 	}
+	tessera_stat_write_wholefile++;
+	tessera_stat_write_wholefile_bytes += ino.size + final_size;
 	uint8_t *old_buf = NULL;
 	size_t   old_len = 0;
 	if (tessera_fs_read_full_content(tmp_, &ino, &old_buf, &old_len) != 0) {
@@ -27421,7 +27934,7 @@ write_done:
 		}
 	}
 
-	if (final_size != ino.size)
+	if (final_size != size_before)
 		vnode_pager_setsize(vp, final_size);
 	if (mmapped)
 		tessera_vm_invalidate(vp, write_off, write_end);
