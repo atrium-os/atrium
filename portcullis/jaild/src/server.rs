@@ -1,13 +1,22 @@
-//! Request-handling loop. Single-threaded, blocking accept;
-//! one request → one response per connection-iteration.
+//! Request-handling loop. Single-threaded, multiplexed over kqueue;
+//! one request → one response.
 //!
-//! No async runtime (smallest-TCB carve-out), no per-connection
-//! thread (yet — rationale: V0 is a low-rate broker, ~10 requests
-//! per boot + 1 per app launch. Single-threaded handles that fine.
-//! V1 may add a small thread pool if profiling shows contention).
+//! No async runtime (smallest-TCB carve-out) and no per-connection
+//! threads: requests are cheap and `PersistentState` is `&mut`, so one
+//! thread serves every connection, one request per connection per round.
+//!
+//! ★ It used to handle each connection TO COMPLETION before accepting the
+//! next. atrium-portcullisd-bootstrap holds one jaild connection for its whole
+//! supervisor lifetime (every restart pdforks over it), so every other client
+//! — portcullisd-daemon forwarding an aqueduct AttachMount — sat in the listen
+//! backlog until the bootstrap exited. At boot the attach smoke timed out
+//! ("timeout waiting for reply") and jaild accepted the daemon's connection
+//! 54 s later, the instant the bootstrap logged "all services retired".
 
-use std::io::BufReader;
+use std::collections::HashMap;
+use std::io::{ErrorKind, Read};
 use std::os::unix::io::AsRawFd;
+use std::time::Duration;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
@@ -24,13 +33,13 @@ use crate::state::PersistentState;
 use crate::validator;
 use crate::JaildError;
 
-/// Run the accept loop. Blocks until `listener` is dropped or an
-/// unrecoverable error occurs.
+/// Run the serve loop. Blocks until an unrecoverable error occurs.
 ///
-/// Each accepted connection is handled to completion before the
-/// next is accepted. That's intentional: if a client misbehaves
-/// (slow, blocked), it doesn't affect other clients beyond a
-/// queueing delay. Real load is too low for that to matter.
+/// Every connection stays registered with one kqueue. Bytes are buffered
+/// per connection without blocking, so a client that sends half a frame —
+/// or holds its connection idle for an hour — costs nobody else anything.
+/// Each round dispatches at most ONE complete request per connection, so
+/// a client pipelining requests cannot starve the rest.
 ///
 /// `dry_run`: if true, the validator runs but `jail_set` is not
 /// invoked — useful for testing the protocol path without
@@ -90,75 +99,220 @@ pub fn serve(
         }
     }
 
-    for inbound in listener.incoming() {
-        let stream = match inbound {
-            Ok(s) => s,
-            Err(e) => {
-                error!("accept: {e}");
-                return Err(JaildError::Io(e));
+    let kq = ffi::Kqueue::new()?;
+    listener.set_nonblocking(true)?;
+    let listen_fd = listener.as_raw_fd();
+    kq.add_read(listen_fd)?;
+
+    let mut conns: HashMap<i32, Conn> = HashMap::new();
+    /* Round-robin order: accept order, rotated each round. */
+    let mut order: Vec<i32> = Vec::new();
+
+    loop {
+        /* Poll instead of block while a connection already holds a
+         * complete request: its bytes are in OUR buffer, so kqueue has
+         * nothing left to report for it. */
+        let pending = conns.values().any(|c| c.has_frame());
+        for fd in kq.wait(!pending)? {
+            if fd == listen_fd {
+                accept_ready(listener, &kq, &mut conns, &mut order);
+            } else if let Some(c) = conns.get_mut(&fd) {
+                if let Err(e) = c.fill() {
+                    warn!("connection closed with error: {e}");
+                    c.dead = true;
+                }
+                if c.eof {
+                    /* Level-triggered EOF would fire every wait. */
+                    let _ = kq.remove_read(fd);
+                }
             }
-        };
-        if let Err(e) = handle_connection(stream, policy, dry_run, &mut state, state_path) {
-            warn!("connection closed with error: {e}");
+        }
+
+        /* One request per connection per round. */
+        for fd in order.clone() {
+            let Some(c) = conns.get_mut(&fd) else { continue };
+            if c.dead {
+                continue;
+            }
+            let body = match c.take_frame() {
+                Ok(Some(b)) => b,
+                Ok(None)    => continue,
+                Err(e) => {
+                    warn!("connection closed with error: {e}");
+                    c.dead = true;
+                    continue;
+                }
+            };
+            if let Err(e) = serve_request(&c.stream, &body, policy, dry_run, &mut state, state_path) {
+                warn!("connection closed with error: {e}");
+                c.dead = true;
+            }
+        }
+
+        /* Drop dead connections, and cleanly closed ones with nothing
+         * left to serve. Dropping the stream closes the fd, which also
+         * removes it from the kqueue. */
+        conns.retain(|_, c| !(c.dead || (c.eof && !c.has_frame())));
+        order.retain(|fd| conns.contains_key(fd));
+        if order.len() > 1 {
+            order.rotate_left(1);
         }
     }
-    Ok(())
 }
 
-fn handle_connection(
-    stream:     UnixStream,
+/// How long a reply may block on a client that is not reading. The reply
+/// path stays blocking (a reply carries SCM_RIGHTS fds in one sendmsg and
+/// is small), so this bounds how long one stuck client can stall the loop.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One client connection: its stream and the bytes read but not yet
+/// dispatched.
+struct Conn {
+    stream: UnixStream,
+    buf:    Vec<u8>,
+    eof:    bool,
+    dead:   bool,
+}
+
+impl Conn {
+    /// Length of the first complete frame in `buf` (header + body), if any.
+    fn frame_len(&self) -> Result<Option<usize>, JaildError> {
+        if self.buf.len() < 4 {
+            return Ok(None);
+        }
+        let len = u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]);
+        if len > protocol::MAX_FRAME_BYTES {
+            return Err(JaildError::Io(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("frame too large: {len} > {}", protocol::MAX_FRAME_BYTES),
+            )));
+        }
+        let total = 4 + len as usize;
+        Ok((self.buf.len() >= total).then_some(total))
+    }
+
+    fn has_frame(&self) -> bool {
+        !self.dead && matches!(self.frame_len(), Ok(Some(_)))
+    }
+
+    /// Read whatever is available without blocking. Stops once a complete
+    /// frame is buffered, so a client flooding requests is held to one
+    /// frame of jaild memory; the rest waits in its socket.
+    fn fill(&mut self) -> std::io::Result<()> {
+        let mut chunk = [0u8; 16 * 1024];
+        while !self.has_frame() {
+            match self.stream.read(&mut chunk) {
+                Ok(0) => { self.eof = true; return Ok(()); }
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+            if self.frame_len().is_err() {
+                return Ok(());      // take_frame reports it
+            }
+        }
+        Ok(())
+    }
+
+    fn take_frame(&mut self) -> Result<Option<Vec<u8>>, JaildError> {
+        match self.frame_len()? {
+            Some(total) => {
+                let body = self.buf[4..total].to_vec();
+                self.buf.drain(..total);
+                Ok(Some(body))
+            }
+            None => {
+                if self.eof && !self.buf.is_empty() {
+                    /* Peer closed mid-frame: nothing to answer. */
+                    self.buf.clear();
+                }
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Accept every queued connection. Non-root peers get a refusal and are
+/// closed immediately.
+fn accept_ready(
+    listener: &UnixListener,
+    kq:       &ffi::Kqueue,
+    conns:    &mut HashMap<i32, Conn>,
+    order:    &mut Vec<i32>,
+) {
+    loop {
+        let stream = match listener.accept() {
+            Ok((s, _)) => s,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => return,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => {
+                /* ECONNABORTED, EMFILE, ...: keep serving the clients
+                 * we have; the listener fires again. */
+                error!("accept: {e}");
+                return;
+            }
+        };
+        let peer_uid = peer_uid(&stream).unwrap_or(u32::MAX);
+        info!("jaild: accepted conn (peer uid={peer_uid})");
+
+        /* Caller-must-be-root check. portcullisd will be root
+         * (it's started by jaild itself in the boot sequence). A non-
+         * root caller is suspicious; refuse. */
+        if peer_uid != 0 {
+            warn!("non-root peer uid={peer_uid}; refusing");
+            if let Ok(body) = serde_json::to_vec(&Response::Error {
+                detail: "non-root peer".into(),
+            }) {
+                let _ = ffi::send_frame_with_optional_fd(stream.as_raw_fd(), &body, None);
+            }
+            continue;
+        }
+
+        let fd = stream.as_raw_fd();
+        let setup = stream.set_nonblocking(true)
+            .and_then(|_| stream.set_write_timeout(Some(SEND_TIMEOUT)))
+            .and_then(|_| kq.add_read(fd));
+        if let Err(e) = setup {
+            warn!("jaild: connection setup failed: {e}");
+            continue;
+        }
+        conns.insert(fd, Conn { stream, buf: Vec::new(), eof: false, dead: false });
+        order.push(fd);
+    }
+}
+
+/// Decode one request, dispatch it, and send the reply.
+fn serve_request(
+    stream:     &UnixStream,
+    body:       &[u8],
     policy:     &Policy,
     dry_run:    bool,
     state:      &mut PersistentState,
     state_path: &Path,
 ) -> Result<(), JaildError> {
-    let peer_uid = peer_uid(&stream).unwrap_or(u32::MAX);
-    info!("jaild: accepted conn (peer uid={peer_uid})");
-
-    /* Caller-must-be-root check. portcullisd will be root
-     * (it's started by jaild itself in the boot sequence). A non-
-     * root caller is suspicious; refuse. */
-    if peer_uid != 0 {
-        warn!("non-root peer uid={peer_uid}; refusing");
-        let body = serde_json::to_vec(&Response::Error {
-            detail: "non-root peer".into(),
-        })?;
-        let _ = ffi::send_frame_with_optional_fd(stream.as_raw_fd(), &body, None);
-        return Ok(());
-    }
-
-    let socket_fd = stream.as_raw_fd();
-    let mut reader = BufReader::new(stream.try_clone()?);
-
-    loop {
-        let body = match protocol::read_frame(&mut reader)? {
-            Some(b) => b,
-            None    => return Ok(()),       // peer closed cleanly
-        };
-
-        let req: Request = match serde_json::from_slice(&body) {
-            Ok(r) => r,
-            Err(e) => {
-                let resp = Response::Error {
-                    detail: format!("malformed request: {e}"),
-                };
-                send_response(socket_fd, &resp, &[])?;
-                continue;
-            }
-        };
-
-        /* dispatch returns any fds to pass via SCM_RIGHTS:
-         * CreateJail-with-exec → [procdesc]; ExecInJail →
-         * [procdesc, pty_master]; everything else → []. */
-        let (resp, fds_to_attach) = dispatch(req, policy, dry_run, state, state_path);
-        send_response(socket_fd, &resp, &fds_to_attach)?;
-
-        /* Our copies are no longer needed once sent — the kernel keeps
-         * the procdesc / pty alive while the receiver holds its copy. */
-        for fd in fds_to_attach {
-            let _ = ffi::close_fd(fd);
+    let req: Request = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            let resp = Response::Error {
+                detail: format!("malformed request: {e}"),
+            };
+            return send_blocking(stream, &resp, &[]);
         }
+    };
+
+    /* dispatch returns any fds to pass via SCM_RIGHTS:
+     * CreateJail-with-exec → [procdesc]; ExecInJail →
+     * [procdesc, pty_master]; everything else → []. */
+    let (resp, fds_to_attach) = dispatch(req, policy, dry_run, state, state_path);
+    let sent = send_blocking(stream, &resp, &fds_to_attach);
+
+    /* Our copies are no longer needed once sent — the kernel keeps
+     * the procdesc / pty alive while the receiver holds its copy. */
+    for fd in fds_to_attach {
+        let _ = ffi::close_fd(fd);
     }
+    sent
 }
 
 fn dispatch(
@@ -1031,6 +1185,20 @@ fn handle_exec_in_jail(
         jail.name, jid, pdf.pid, pdf.procdesc_fd, master
     );
     Ok((Response::JailExecStarted { pid: pdf.pid, uid }, vec![pdf.procdesc_fd, master]))
+}
+
+/// Send a reply on a connection that is non-blocking for reads. The send
+/// itself blocks (bounded by SEND_TIMEOUT): a non-blocking sendmsg would
+/// fail with EAGAIN or write short instead of honouring SO_SNDTIMEO.
+fn send_blocking(
+    stream: &UnixStream,
+    resp:   &Response,
+    fds:    &[i32],
+) -> Result<(), JaildError> {
+    stream.set_nonblocking(false)?;
+    let sent = send_response(stream.as_raw_fd(), resp, fds);
+    stream.set_nonblocking(true)?;
+    sent
 }
 
 fn send_response(

@@ -26,12 +26,11 @@
 //!
 //! ## Threading
 //!
-//! Single-threaded blocking accept loop, same convention as jaild
-//! and atrium-volumes (smallest-TCB carve-out per LANGUAGE-POLICY).
-//! For low-rate operator-mediated mounts that's fine. The single
-//! jaild connection is held for the daemon's lifetime — opening a
-//! new one per request would deadlock against jaild's
-//! single-threaded accept-loop.
+//! Single-threaded blocking accept loop (smallest-TCB carve-out per
+//! LANGUAGE-POLICY). For low-rate operator-mediated mounts that's fine.
+//! A fresh jaild connection is opened per forwarded request (see main);
+//! jaild multiplexes its clients, so that never waits on the bootstrap's
+//! long-lived connection.
 
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -101,14 +100,12 @@ fn main() -> ExitCode {
         }
     }
 
-    /* We do NOT hold a persistent jaild connection. jaild is
-     * single-threaded accept-one-at-a-time, and bootstrap
-     * (running in supervisor mode) wants its own concurrent
-     * connection during the launch loop. Holding one here would
-     * deadlock the other. Instead we open a fresh connection per
-     * forwarded request — the connect/send/recv cost is
-     * negligible at the rates this daemon serves and avoids the
-     * coordination problem entirely. */
+    /* A fresh jaild connection per forwarded request — the
+     * connect/send/recv cost is negligible at the rates this daemon
+     * serves. This comment used to claim that avoided blocking on the
+     * bootstrap's connection; it did not, because jaild then served one
+     * connection at a time and the bootstrap never closes its own. jaild
+     * now multiplexes (jaild/src/server.rs). */
 
     /* Ensure the per-capability socket directory exists; bootstrap
      * nullfs-mounts the *directory* into authorized jails at

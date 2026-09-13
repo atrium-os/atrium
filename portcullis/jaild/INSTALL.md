@@ -6,31 +6,31 @@ broker. Spec: `docs/spec/portcullis.md` §0.5,
 
 ## Why single-threaded
 
-`atrium-jaild`'s accept loop processes one connection at a time.
-Every operation it does (`jail_set`, `jail_remove`, `pdfork`,
-`nmount`, `execve` in the fork-child) is a fast syscall —
-sub-millisecond on a healthy system. The work that *takes time*
-runs in the children jaild forks, which run in parallel by virtue
-of the kernel scheduler; jaild's parent side returns the moment
-`pdfork` does.
+`atrium-jaild` serves every client from one thread. Every operation it
+does (`jail_set`, `jail_remove`, `pdfork`, `nmount`, `execve` in the
+fork-child) is a fast syscall — sub-millisecond on a healthy system. The
+work that *takes time* runs in the children jaild forks, which run in
+parallel by virtue of the kernel scheduler; jaild's parent side returns the
+moment `pdfork` does.
 
 This matches the OpenSSH-privsep pattern: smallest TCB, no shared
 mutable state, no locks, no race conditions. It is intentional.
 
-**Convention for clients:** *one* persistent connection per
-client process. Opening a second concurrent connection while the
-first is still open will block on `accept(2)` until the first
-connection is closed. portcullisd respects this convention; if
-another privileged daemon ever wants to be a jaild client (today
-none do — all the GUI-mediator daemons in
-`docs/spec/service-management.md` §6 manage their own domains),
-it should hold a single jaild connection and serialise its own
-requests through it.
+**Connections are multiplexed, requests are serialised.** All client
+connections sit on one kqueue; bytes are buffered per connection without
+blocking, and each round dispatches at most one request per connection.
+So any number of clients may hold connections open for as long as they
+like — atrium-portcullisd-bootstrap holds one for its whole supervisor
+lifetime while portcullisd-daemon opens one per forwarded aqueduct
+request — and a client that stalls mid-frame costs nobody else anything.
+A reply that cannot be delivered within 5 s (a client that stopped
+reading) drops that client.
 
-If multi-client jaild is ever genuinely needed, the right answer
-is a small thread-per-connection pool inside jaild — not async,
-not multiple jaild instances. That's a deliberate future
-re-architecture decision, not something to bolt on.
+★ Until 2026-09 the loop handled each connection to completion before
+accepting the next, and this section told clients to hold one connection.
+The bootstrap did exactly that, which parked portcullisd-daemon's
+AttachMount in the listen backlog until the bootstrap exited: the aqueduct
+attach smoke timed out at every boot.
 
 ## Why root, not a dedicated user
 

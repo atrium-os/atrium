@@ -106,6 +106,16 @@ scp $SSHOPT -P 2222 "$BSD"/etc/services.d/*.toml \
 g 'install -m 0755 /bin/sleep /usr/local/bin/atrium-slowfail' >/dev/null 2>&1 \
     && echo "  atrium-slowfail helper ok" || { echo "  atrium-slowfail helper FAILED"; rc=1; }
 
+# The aqueduct attach smoke's SOURCE directory. Its manifest asks jaild to
+# nullfs it into the jail; it was created by hand on the ZFS-era VM and never
+# by anything in the tree, so on a fresh root the attach got all the way to
+# nmount(2) and failed ENOENT. The marker lets a check confirm the content is
+# visible through the jail-side mount, not just that a mount exists.
+g 'mkdir -p /var/lib/atrium/storage/jails/atrium-attach-source &&
+   echo "atrium aqueduct attach smoke source" \
+     > /var/lib/atrium/storage/jails/atrium-attach-source/MARKER' >/dev/null 2>&1 \
+    && echo "  aq attach-source dir ok" || { echo "  aq attach-source dir FAILED"; rc=1; }
+
 g 'chmod 0755 /usr/local/etc/rc.d/atrium-* /usr/local/bin/atrium-* \
               /usr/local/bin/portcullisd /usr/local/bin/portcullis \
               /usr/local/bin/opifex 2>/dev/null' >/dev/null 2>&1

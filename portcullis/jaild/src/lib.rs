@@ -14,7 +14,7 @@
 //!   behind safe Rust APIs. (forbid would be stricter but
 //!   irrelaxable; we use deny so the audit point is one
 //!   well-named module rather than spread across the tree.)
-//! - No async runtime. Single-threaded blocking accept loop;
+//! - No async runtime. Single-threaded, kqueue-multiplexed serve loop;
 //!   future per-request fork (Phase 0b/V1) is via plain `fork(2)`,
 //!   not tokio-anything.
 //! - Minimal external deps: `libc`, `serde`, `serde_json`, `toml`,
