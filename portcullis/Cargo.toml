@@ -12,6 +12,7 @@ members = [
     "atrium-session",
     "jaild-policy",
     "jaild",
+    "sockmux",
     "portcullis-sig",
     "portcullis-peer",
     "atrium-volumes",

@@ -18,7 +18,10 @@
 //!   future per-request fork (Phase 0b/V1) is via plain `fork(2)`,
 //!   not tokio-anything.
 //! - Minimal external deps: `libc`, `serde`, `serde_json`, `toml`,
-//!   `thiserror`, `log`, `env_logger`. New deps require a written
+//!   `thiserror`, `log`, `env_logger`, plus the workspace's own
+//!   `sockmux` (the kqueue connection multiplexer shared with
+//!   atrium-volumes and portcullisd-daemon; libc + log only, one
+//!   unsafe module). New deps require a written
 //!   case in this crate's `CONTRIBUTING.md` (TODO: add when the
 //!   first PR proposing one arrives).
 //! - "C with safety" reading style. A FreeBSD developer should be

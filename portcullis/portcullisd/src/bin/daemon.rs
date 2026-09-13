@@ -26,13 +26,17 @@
 //!
 //! ## Threading
 //!
-//! Single-threaded blocking accept loop (smallest-TCB carve-out per
-//! LANGUAGE-POLICY). For low-rate operator-mediated mounts that's fine.
-//! A fresh jaild connection is opened per forwarded request (see main);
-//! jaild multiplexes its clients, so that never waits on the bootstrap's
-//! long-lived connection.
+//! One thread (smallest-TCB carve-out per LANGUAGE-POLICY), every client
+//! connection multiplexed over kqueue by sockmux: one request per
+//! connection per round, so an in-jail client that holds its connection
+//! open — atrium-portcullisd-aq lingers after its attach — never holds up
+//! another jail's request. It used to serve each connection to completion,
+//! the loop that let the bootstrap's long-lived connection starve this
+//! daemon's AttachMount inside jaild. A fresh jaild connection is opened per
+//! forwarded request (see main).
 
 use std::io;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -43,6 +47,7 @@ use jaild::protocol::{
     MountKind as JaildKind, Request as JaildReq, Response as JaildResp,
 };
 use log::{error, info, warn};
+use sockmux::{Mux, Session};
 use portcullis_protocol::{
     AttachMountReq, DetachMountReq, MountKind as ProtoKind, MountReply,
     OP_ATTACH_MOUNT, OP_DETACH_MOUNT, OP_MOUNT_REPLY,
@@ -141,65 +146,90 @@ fn main() -> ExitCode {
     { warn!("chmod {}: {e}", socket_path.display()); }
     info!("portcullisd-daemon: listening on {}", socket_path.display());
 
-    for s in listener.incoming() {
-        let s = match s {
-            Ok(s) => s,
-            Err(e) => { warn!("accept: {e}"); continue; }
-        };
-        if let Err(e) = handle_client(s, &jaild_path, &svcdir) {
-            warn!("client handler: {e}");
-        }
-    }
-    ExitCode::SUCCESS
-}
-
-fn handle_client(
-    s:           UnixStream,
-    jaild_path:  &Path,
-    svcdir:      &Path,
-) -> io::Result<()> {
-    let peer = peer_uid(&s);
-    info!("portcullisd-daemon: accepted (peer uid={peer:?})");
-    let mut conn = Connection::wrap(s)?;
-
-    /* Re-load manifests per connection so a manifest edited
-     * after daemon start takes effect on the next request. (Cost
-     * is one filesystem walk per connection, fine for V0
-     * operator-rate traffic.) */
-    let outcome = match system_services::load_dir(svcdir) {
-        Ok(o)  => o,
+    let mut mux: Mux<AqClient> = match Mux::new(listener) {
+        Ok(m) => m,
         Err(e) => {
-            warn!("load services dir {}: {e}", svcdir.display());
-            send_reply(&mut conn, MountReply::Error {
-                detail: format!("server load services dir: {e}"),
-            })?;
-            return Ok(());
+            error!("kqueue setup: {e}");
+            return ExitCode::FAILURE;
         }
     };
-
+    let mut admit = |s: UnixStream| admit_client(s, &svcdir);
     loop {
-        let m = match conn.recv_message() {
-            Ok(m)  => m,
+        let ready = match mux.next_round(&mut admit) {
+            Ok(r) => r,
             Err(e) => {
-                /* Connection closed or I/O error. Exit cleanly. */
-                let _ = e;
-                return Ok(());
+                error!("serve loop: {e}");
+                return ExitCode::FAILURE;
             }
         };
-        if m.opcode_class != classes::CLASS_PORTCULLIS {
-            warn!("portcullisd-daemon: ignoring non-portcullis class {}",
-                m.opcode_class);
-            continue;
+        /* One request per connection per round. */
+        for fd in ready {
+            let Some(client) = mux.session_mut(fd) else { continue };
+            if let Err(e) = serve_one(client, &jaild_path) {
+                warn!("client handler: {e}");
+                mux.close(fd);
+            }
         }
-        let reply = match m.op {
-            OP_ATTACH_MOUNT => handle_attach(&m.payload, &outcome.manifests, peer, jaild_path),
-            OP_DETACH_MOUNT => handle_detach(&m.payload, &outcome.manifests, peer, jaild_path),
-            other => MountReply::Error {
-                detail: format!("unknown opcode 0x{other:04x} on CLASS_PORTCULLIS"),
-            },
-        };
-        send_reply(&mut conn, reply)?;
     }
+}
+
+/// One in-jail (or operator) client: its aqueduct connection, the peer uid
+/// recovered at accept, and the manifests as they were when it connected.
+struct AqClient {
+    conn:      Connection,
+    peer:      Option<u32>,
+    manifests: Vec<ServiceManifest>,
+}
+
+impl Session for AqClient {
+    fn fd(&self) -> RawFd { self.conn.as_raw_fd() }
+    fn set_nonblocking(&self, nb: bool) -> io::Result<()> { self.conn.set_nonblocking(nb) }
+    fn fill(&mut self) -> io::Result<bool> { self.conn.fill_available() }
+    fn ready(&self) -> bool { self.conn.has_buffered_message() }
+}
+
+fn admit_client(s: UnixStream, svcdir: &Path) -> Option<AqClient> {
+    let peer = peer_uid(&s);
+    info!("portcullisd-daemon: accepted (peer uid={peer:?})");
+    let mut conn = match Connection::wrap(s) {
+        Ok(c) => c,
+        Err(e) => { warn!("wrap connection: {e}"); return None; }
+    };
+
+    /* Re-load manifests per connection so a manifest edited
+     * after daemon start takes effect on the next connection. (Cost
+     * is one filesystem walk per connection, fine for V0
+     * operator-rate traffic.) */
+    match system_services::load_dir(svcdir) {
+        Ok(o)  => Some(AqClient { conn, peer, manifests: o.manifests }),
+        Err(e) => {
+            warn!("load services dir {}: {e}", svcdir.display());
+            let _ = send_reply(&mut conn, MountReply::Error {
+                detail: format!("server load services dir: {e}"),
+            });
+            None
+        }
+    }
+}
+
+/// Serve the next buffered request, if any. `Err` closes the connection.
+fn serve_one(client: &mut AqClient, jaild_path: &Path) -> io::Result<()> {
+    /* Buffered only: CLASS_CORE traffic is handled inside and may leave
+     * nothing for us this round. */
+    let Some(m) = client.conn.try_recv_message()? else { return Ok(()) };
+    if m.opcode_class != classes::CLASS_PORTCULLIS {
+        warn!("portcullisd-daemon: ignoring non-portcullis class {}",
+            m.opcode_class);
+        return Ok(());
+    }
+    let reply = match m.op {
+        OP_ATTACH_MOUNT => handle_attach(&m.payload, &client.manifests, client.peer, jaild_path),
+        OP_DETACH_MOUNT => handle_detach(&m.payload, &client.manifests, client.peer, jaild_path),
+        other => MountReply::Error {
+            detail: format!("unknown opcode 0x{other:04x} on CLASS_PORTCULLIS"),
+        },
+    };
+    send_reply(&mut client.conn, reply)
 }
 
 /// Map a peer uid to the manifest whose exec runs under that uid.

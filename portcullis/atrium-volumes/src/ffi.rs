@@ -27,20 +27,6 @@ pub fn getpeereid(_fd: i32) -> io::Result<u32> {
     Ok(0)
 }
 
-/// dup an open fd and wrap as a UnixStream so std::io::Write
-/// can be used on it. Caller's original fd stays open.
-pub fn dup_to_stream(fd: i32) -> std::os::unix::net::UnixStream {
-    use std::os::unix::io::FromRawFd;
-    // SAFETY: dup returns a fresh fd referencing the same open
-    // file table entry; UnixStream::from_raw_fd takes ownership
-    // of the duplicate so std drops it cleanly.
-    unsafe {
-        let d = libc::dup(fd);
-        assert!(d >= 0, "dup failed");
-        std::os::unix::net::UnixStream::from_raw_fd(d)
-    }
-}
-
 /// `chown(path, uid, gid)`. std::fs has no equivalent.
 pub fn chown(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
     let c_path = CString::new(path.as_os_str().to_string_lossy().as_bytes())

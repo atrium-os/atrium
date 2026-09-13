@@ -17,7 +17,8 @@ This matches the OpenSSH-privsep pattern: smallest TCB, no shared
 mutable state, no locks, no race conditions. It is intentional.
 
 **Connections are multiplexed, requests are serialised.** All client
-connections sit on one kqueue; bytes are buffered per connection without
+connections sit on one kqueue (`portcullis/sockmux`, which
+atrium-volumes and portcullisd-daemon use the same way); bytes are buffered per connection without
 blocking, and each round dispatches at most one request per connection.
 So any number of clients may hold connections open for as long as they
 like — atrium-portcullisd-bootstrap holds one for its whole supervisor

@@ -573,8 +573,9 @@ privileged daemons):
 - `#![deny(unsafe_code)]` at root; localised `mod ffi` for the
   ZFS-shellout / `mkdir(2)` / `mount(2)` calls (latter delegated
   to jaild — see §10).
-- No async runtime. Single-threaded blocking accept loop. (jaild,
-  by contrast, multiplexes its connections over kqueue.)
+- No async runtime. One thread, every client connection multiplexed
+  over kqueue (`portcullis/sockmux`, shared with jaild and
+  portcullisd-daemon): one request per connection per round.
 - Aqueduct service at `/var/run/aqueduct/atrium-volumes.sock`.
   Only portcullisd connects.
 

@@ -13,10 +13,9 @@
 //! ("timeout waiting for reply") and jaild accepted the daemon's connection
 //! 54 s later, the instant the bootstrap logged "all services retired".
 
-use std::collections::HashMap;
-use std::io::{ErrorKind, Read};
 use std::os::unix::io::AsRawFd;
-use std::time::Duration;
+
+use sockmux::{LengthPrefixed, Mux};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
@@ -99,160 +98,8 @@ pub fn serve(
         }
     }
 
-    let kq = ffi::Kqueue::new()?;
-    listener.set_nonblocking(true)?;
-    let listen_fd = listener.as_raw_fd();
-    kq.add_read(listen_fd)?;
-
-    let mut conns: HashMap<i32, Conn> = HashMap::new();
-    /* Round-robin order: accept order, rotated each round. */
-    let mut order: Vec<i32> = Vec::new();
-
-    loop {
-        /* Poll instead of block while a connection already holds a
-         * complete request: its bytes are in OUR buffer, so kqueue has
-         * nothing left to report for it. */
-        let pending = conns.values().any(|c| c.has_frame());
-        for fd in kq.wait(!pending)? {
-            if fd == listen_fd {
-                accept_ready(listener, &kq, &mut conns, &mut order);
-            } else if let Some(c) = conns.get_mut(&fd) {
-                if let Err(e) = c.fill() {
-                    warn!("connection closed with error: {e}");
-                    c.dead = true;
-                }
-                if c.eof {
-                    /* Level-triggered EOF would fire every wait. */
-                    let _ = kq.remove_read(fd);
-                }
-            }
-        }
-
-        /* One request per connection per round. */
-        for fd in order.clone() {
-            let Some(c) = conns.get_mut(&fd) else { continue };
-            if c.dead {
-                continue;
-            }
-            let body = match c.take_frame() {
-                Ok(Some(b)) => b,
-                Ok(None)    => continue,
-                Err(e) => {
-                    warn!("connection closed with error: {e}");
-                    c.dead = true;
-                    continue;
-                }
-            };
-            if let Err(e) = serve_request(&c.stream, &body, policy, dry_run, &mut state, state_path) {
-                warn!("connection closed with error: {e}");
-                c.dead = true;
-            }
-        }
-
-        /* Drop dead connections, and cleanly closed ones with nothing
-         * left to serve. Dropping the stream closes the fd, which also
-         * removes it from the kqueue. */
-        conns.retain(|_, c| !(c.dead || (c.eof && !c.has_frame())));
-        order.retain(|fd| conns.contains_key(fd));
-        if order.len() > 1 {
-            order.rotate_left(1);
-        }
-    }
-}
-
-/// How long a reply may block on a client that is not reading. The reply
-/// path stays blocking (a reply carries SCM_RIGHTS fds in one sendmsg and
-/// is small), so this bounds how long one stuck client can stall the loop.
-const SEND_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// One client connection: its stream and the bytes read but not yet
-/// dispatched.
-struct Conn {
-    stream: UnixStream,
-    buf:    Vec<u8>,
-    eof:    bool,
-    dead:   bool,
-}
-
-impl Conn {
-    /// Length of the first complete frame in `buf` (header + body), if any.
-    fn frame_len(&self) -> Result<Option<usize>, JaildError> {
-        if self.buf.len() < 4 {
-            return Ok(None);
-        }
-        let len = u32::from_le_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]);
-        if len > protocol::MAX_FRAME_BYTES {
-            return Err(JaildError::Io(std::io::Error::new(
-                ErrorKind::InvalidData,
-                format!("frame too large: {len} > {}", protocol::MAX_FRAME_BYTES),
-            )));
-        }
-        let total = 4 + len as usize;
-        Ok((self.buf.len() >= total).then_some(total))
-    }
-
-    fn has_frame(&self) -> bool {
-        !self.dead && matches!(self.frame_len(), Ok(Some(_)))
-    }
-
-    /// Read whatever is available without blocking. Stops once a complete
-    /// frame is buffered, so a client flooding requests is held to one
-    /// frame of jaild memory; the rest waits in its socket.
-    fn fill(&mut self) -> std::io::Result<()> {
-        let mut chunk = [0u8; 16 * 1024];
-        while !self.has_frame() {
-            match self.stream.read(&mut chunk) {
-                Ok(0) => { self.eof = true; return Ok(()); }
-                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
-                Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(()),
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            }
-            if self.frame_len().is_err() {
-                return Ok(());      // take_frame reports it
-            }
-        }
-        Ok(())
-    }
-
-    fn take_frame(&mut self) -> Result<Option<Vec<u8>>, JaildError> {
-        match self.frame_len()? {
-            Some(total) => {
-                let body = self.buf[4..total].to_vec();
-                self.buf.drain(..total);
-                Ok(Some(body))
-            }
-            None => {
-                if self.eof && !self.buf.is_empty() {
-                    /* Peer closed mid-frame: nothing to answer. */
-                    self.buf.clear();
-                }
-                Ok(None)
-            }
-        }
-    }
-}
-
-/// Accept every queued connection. Non-root peers get a refusal and are
-/// closed immediately.
-fn accept_ready(
-    listener: &UnixListener,
-    kq:       &ffi::Kqueue,
-    conns:    &mut HashMap<i32, Conn>,
-    order:    &mut Vec<i32>,
-) {
-    loop {
-        let stream = match listener.accept() {
-            Ok((s, _)) => s,
-            Err(e) if e.kind() == ErrorKind::WouldBlock => return,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => {
-                /* ECONNABORTED, EMFILE, ...: keep serving the clients
-                 * we have; the listener fires again. */
-                error!("accept: {e}");
-                return;
-            }
-        };
+    let mut mux: Mux<LengthPrefixed> = Mux::new(listener.try_clone()?)?;
+    let mut admit = |stream: UnixStream| -> Option<LengthPrefixed> {
         let peer_uid = peer_uid(&stream).unwrap_or(u32::MAX);
         info!("jaild: accepted conn (peer uid={peer_uid})");
 
@@ -266,19 +113,26 @@ fn accept_ready(
             }) {
                 let _ = ffi::send_frame_with_optional_fd(stream.as_raw_fd(), &body, None);
             }
-            continue;
+            return None;
         }
+        Some(LengthPrefixed::new(stream, protocol::MAX_FRAME_BYTES))
+    };
 
-        let fd = stream.as_raw_fd();
-        let setup = stream.set_nonblocking(true)
-            .and_then(|_| stream.set_write_timeout(Some(SEND_TIMEOUT)))
-            .and_then(|_| kq.add_read(fd));
-        if let Err(e) = setup {
-            warn!("jaild: connection setup failed: {e}");
-            continue;
+    loop {
+        /* One request per connection per round. */
+        for fd in mux.next_round(&mut admit)? {
+            let Some(conn) = mux.session_mut(fd) else { continue };
+            let served = match conn.take_frame() {
+                Ok(Some(body)) => serve_request(conn.stream(), &body, policy,
+                    dry_run, &mut state, state_path),
+                Ok(None) => Ok(()),
+                Err(e) => Err(JaildError::Io(e)),
+            };
+            if let Err(e) = served {
+                warn!("connection closed with error: {e}");
+                mux.close(fd);
+            }
         }
-        conns.insert(fd, Conn { stream, buf: Vec::new(), eof: false, dead: false });
-        order.push(fd);
     }
 }
 
@@ -297,7 +151,7 @@ fn serve_request(
             let resp = Response::Error {
                 detail: format!("malformed request: {e}"),
             };
-            return send_blocking(stream, &resp, &[]);
+            return send_response(stream.as_raw_fd(), &resp, &[]);
         }
     };
 
@@ -305,7 +159,7 @@ fn serve_request(
      * CreateJail-with-exec → [procdesc]; ExecInJail →
      * [procdesc, pty_master]; everything else → []. */
     let (resp, fds_to_attach) = dispatch(req, policy, dry_run, state, state_path);
-    let sent = send_blocking(stream, &resp, &fds_to_attach);
+    let sent = send_response(stream.as_raw_fd(), &resp, &fds_to_attach);
 
     /* Our copies are no longer needed once sent — the kernel keeps
      * the procdesc / pty alive while the receiver holds its copy. */
@@ -1185,20 +1039,6 @@ fn handle_exec_in_jail(
         jail.name, jid, pdf.pid, pdf.procdesc_fd, master
     );
     Ok((Response::JailExecStarted { pid: pdf.pid, uid }, vec![pdf.procdesc_fd, master]))
-}
-
-/// Send a reply on a connection that is non-blocking for reads. The send
-/// itself blocks (bounded by SEND_TIMEOUT): a non-blocking sendmsg would
-/// fail with EAGAIN or write short instead of honouring SO_SNDTIMEO.
-fn send_blocking(
-    stream: &UnixStream,
-    resp:   &Response,
-    fds:    &[i32],
-) -> Result<(), JaildError> {
-    stream.set_nonblocking(false)?;
-    let sent = send_response(stream.as_raw_fd(), resp, fds);
-    stream.set_nonblocking(true)?;
-    sent
 }
 
 fn send_response(

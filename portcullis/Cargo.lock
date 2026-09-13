@@ -92,6 +92,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "sockmux",
  "tempfile",
  "thiserror",
  "toml",
@@ -419,6 +420,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "sockmux",
  "tempfile",
  "thiserror",
  "toml",
@@ -667,6 +669,7 @@ dependencies = [
  "portcullis-toml",
  "serde",
  "serde_json",
+ "sockmux",
  "tempfile",
  "toml",
 ]
@@ -866,6 +869,15 @@ checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "digest",
  "rand_core",
+]
+
+[[package]]
+name = "sockmux"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "tempfile",
 ]
 
 [[package]]

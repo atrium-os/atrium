@@ -1,13 +1,19 @@
-//! Accept-loop + request dispatcher. Same shape as jaild's:
-//! single-threaded blocking accept, peer-uid root-only,
+//! Serve loop + request dispatcher. Same shape as jaild's: one thread,
+//! every connection multiplexed over kqueue (sockmux), peer-uid root-only,
 //! length-prefixed JSON.
+//!
+//! ★ It used to serve each connection to completion before accepting the
+//! next, the loop that made jaild starve portcullisd-daemon behind the
+//! bootstrap's long-lived connection. Any client holding an atrium-volumes
+//! connection open would have done the same here.
 
-use std::io::BufReader;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
-use log::{error, info, warn};
+use sockmux::{LengthPrefixed, Mux};
+
+use log::{info, warn};
 
 use crate::ffi;
 use crate::plugin::plugin_for;
@@ -28,59 +34,58 @@ pub fn serve(
     info!("atrium-volumes: ready ({} volume(s) known, {} backend(s) configured)",
         state.volumes.len(), policy.backends.len());
 
-    for inbound in listener.incoming() {
-        let stream = match inbound {
-            Ok(s) => s,
-            Err(e) => {
-                error!("accept: {e}");
-                return Err(VolumesError::Io(e));
+    let mut mux: Mux<LengthPrefixed> = Mux::new(listener.try_clone()?)?;
+    let mut admit = |stream: UnixStream| -> Option<LengthPrefixed> {
+        let peer_uid = ffi::getpeereid(stream.as_raw_fd()).unwrap_or(u32::MAX);
+        if peer_uid != 0 {
+            warn!("non-root peer uid={peer_uid}; refusing");
+            if let Ok(body) = serde_json::to_vec(&Response::Error {
+                detail: "non-root peer".into(),
+            }) {
+                let mut s = stream;
+                let _ = protocol::write_frame(&mut s, &body);
             }
-        };
-        if let Err(e) = handle_connection(stream, policy, &mut state, state_path) {
-            warn!("connection closed with error: {e}");
+            return None;
+        }
+        Some(LengthPrefixed::new(stream, protocol::MAX_FRAME_BYTES))
+    };
+
+    loop {
+        /* One request per connection per round. */
+        for fd in mux.next_round(&mut admit)? {
+            let Some(conn) = mux.session_mut(fd) else { continue };
+            let served = match conn.take_frame() {
+                Ok(Some(body)) => serve_request(conn.stream(), &body, policy,
+                    &mut state, state_path),
+                Ok(None) => Ok(()),
+                Err(e) => Err(VolumesError::Io(e)),
+            };
+            if let Err(e) = served {
+                warn!("connection closed with error: {e}");
+                mux.close(fd);
+            }
         }
     }
-    Ok(())
 }
 
-fn handle_connection(
-    stream:     UnixStream,
+/// Decode one request, dispatch it, and send the reply.
+fn serve_request(
+    stream:     &UnixStream,
+    body:       &[u8],
     policy:     &Policy,
     state:      &mut State,
     state_path: &Path,
 ) -> Result<(), VolumesError> {
-    let peer_uid = ffi::getpeereid(stream.as_raw_fd()).unwrap_or(u32::MAX);
-    if peer_uid != 0 {
-        warn!("non-root peer uid={peer_uid}; refusing");
-        let body = serde_json::to_vec(&Response::Error {
-            detail: "non-root peer".into(),
-        })?;
-        let mut s = stream;
-        let _ = protocol::write_frame(&mut s, &body);
-        return Ok(());
-    }
-
-    let socket_fd = stream.as_raw_fd();
-    let mut reader = BufReader::new(stream.try_clone()?);
-
-    loop {
-        let body = match protocol::read_frame(&mut reader)? {
-            Some(b) => b,
-            None    => return Ok(()),
-        };
-        let req: Request = match serde_json::from_slice(&body) {
-            Ok(r) => r,
-            Err(e) => {
-                send(socket_fd, &Response::Error {
-                    detail: format!("malformed: {e}"),
-                })?;
-                continue;
-            }
-        };
-
-        let resp = dispatch(req, policy, state, state_path);
-        send(socket_fd, &resp)?;
-    }
+    let req: Request = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => {
+            return send(stream, &Response::Error {
+                detail: format!("malformed: {e}"),
+            });
+        }
+    };
+    let resp = dispatch(req, policy, state, state_path);
+    send(stream, &resp)
 }
 
 fn dispatch(
@@ -259,13 +264,12 @@ fn err_to_resp(e: VolumesError) -> Response {
     }
 }
 
-fn send(fd: i32, resp: &Response) -> Result<(), VolumesError> {
+fn send(stream: &UnixStream, resp: &Response) -> Result<(), VolumesError> {
     let body = serde_json::to_vec(resp)?;
-    /* Direct write on the socket fd via a duped owned stream;
-     * we don't need the cmsg mechanics jaild has, since
-     * atrium-volumes never passes fds. */
-    let mut tmp = ffi::dup_to_stream(fd);
-    protocol::write_frame(&mut tmp, &body)?;
+    /* atrium-volumes never passes fds, so a plain framed write. The socket
+     * is blocking here (sockmux makes it non-blocking only while reading),
+     * bounded by sockmux::SEND_TIMEOUT. */
+    protocol::write_frame(stream, &body)?;
     Ok(())
 }
 

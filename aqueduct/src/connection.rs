@@ -6,6 +6,10 @@
 //!  * `recv_message` — pull the next message; auto-handles CAS-layer
 //!    traffic (UPLOAD_BEGIN/DATA/FINISH, ACKs) so the caller only
 //!    sees their own opcode_class messages.
+//!  * `fill_available` / `has_buffered_message` / `try_recv_message` —
+//!    the same, for a server multiplexing many connections over kqueue:
+//!    read what is there without blocking, then serve complete messages
+//!    from the buffer.
 //!  * `upload_blob` / `fetch_blob` — convenience for CAS payload
 //!    handoff.
 //!  * `set_cache_cap` — cap RAM used by the per-connection blob
@@ -15,7 +19,7 @@
 //! bytes and rejects on mismatch.
 
 use std::collections::HashMap;
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -66,7 +70,12 @@ struct CacheEntry {
 }
 
 pub struct Connection {
-    rd:        BufReader<UnixStream>,
+    rd:        UnixStream,
+    /// Bytes read from `rd` but not yet decoded into envelopes. Every
+    /// receive path decodes from here, so blocking and non-blocking
+    /// receives can be mixed on one connection, and a read timeout
+    /// mid-message loses nothing.
+    inbuf:     Vec<u8>,
     wr:        BufWriter<UnixStream>,
     cache:     HashMap<Hash, CacheEntry>,
     cache_bytes:    usize,
@@ -89,7 +98,7 @@ impl AsRawFd for Connection {
     /// The underlying socket fd, for kqueue / EVFILT_READ
     /// registration when the caller multiplexes events with other
     /// fds.
-    fn as_raw_fd(&self) -> RawFd { self.rd.get_ref().as_raw_fd() }
+    fn as_raw_fd(&self) -> RawFd { self.rd.as_raw_fd() }
 }
 
 impl Connection {
@@ -99,10 +108,11 @@ impl Connection {
     }
 
     pub fn wrap(s: UnixStream) -> io::Result<Self> {
-        let rd = BufReader::new(s.try_clone()?);
+        let rd = s.try_clone()?;
         let wr = BufWriter::new(s);
         Ok(Self {
             rd, wr,
+            inbuf: Vec::new(),
             cache: HashMap::new(),
             cache_bytes: 0,
             cache_cap:   DEFAULT_CACHE_BYTES,
@@ -145,27 +155,113 @@ impl Connection {
     /// re-uploading) and EVICT_HINT (advisory).
     pub fn recv_message(&mut self) -> io::Result<Message> {
         loop {
-            let (h, payload) = envelope::read_message_alloc(&mut self.rd)?;
-            if h.opcode_class == CLASS_CORE
-                && self.handle_core(h.op, &payload)?
-            {
-                continue; /* swallowed at the substrate layer */
+            let (h, payload) = self.read_envelope()?;
+            if let Some(m) = self.deliver(h, payload)? {
+                return Ok(m);
             }
-            let kind = if h.flags & flag::IS_RESPONSE != 0 {
-                MessageKind::Response
-            } else if h.flags & flag::ASYNC_EVENT != 0 {
-                MessageKind::Event
-            } else {
-                MessageKind::Request
-            };
-            return Ok(Message {
-                opcode_class: h.opcode_class,
-                op:           h.op,
-                flags:        h.flags,
-                kind,
-                payload,
-            });
         }
+    }
+
+    /// Read whatever the socket has right now into the receive buffer.
+    /// For a server multiplexing connections: call it when kqueue reports
+    /// the fd readable, with the socket set non-blocking
+    /// (`set_nonblocking(true)`). Returns `Ok(false)` once the peer has
+    /// closed. Stops early once a complete message is buffered — the rest
+    /// stays in the socket, and a level-triggered kqueue reports it again.
+    pub fn fill_available(&mut self) -> io::Result<bool> {
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            if self.has_buffered_message() {
+                return Ok(true);
+            }
+            match self.rd.read(&mut chunk) {
+                Ok(0) => return Ok(false),
+                Ok(n) => self.inbuf.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(true),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Whether a complete envelope is buffered — or a malformed header,
+    /// which `try_recv_message` will report. Does not read the socket.
+    pub fn has_buffered_message(&self) -> bool {
+        !matches!(self.buffered_envelope_len(), Ok(None))
+    }
+
+    /// Serve from the receive buffer only: decode buffered envelopes,
+    /// handling CLASS_CORE traffic as `recv_message` does, and return the
+    /// first caller-visible message. `Ok(None)` when the buffer holds no
+    /// complete caller-visible message. Never reads the socket; any reply
+    /// the substrate sends (e.g. UPLOAD_ACK) is written normally, so call
+    /// it with the socket blocking.
+    pub fn try_recv_message(&mut self) -> io::Result<Option<Message>> {
+        while let Some((h, payload)) = self.pop_envelope()? {
+            if let Some(m) = self.deliver(h, payload)? {
+                return Ok(Some(m));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Length (header + payload) of the first buffered envelope, if complete.
+    fn buffered_envelope_len(&self) -> io::Result<Option<usize>> {
+        if self.inbuf.len() < envelope::HEADER_LEN {
+            return Ok(None);
+        }
+        let h = Header::decode(&self.inbuf[..envelope::HEADER_LEN])?;
+        let total = envelope::HEADER_LEN + h.length as usize;
+        Ok((self.inbuf.len() >= total).then_some(total))
+    }
+
+    fn pop_envelope(&mut self) -> io::Result<Option<(Header, Vec<u8>)>> {
+        let Some(total) = self.buffered_envelope_len()? else { return Ok(None) };
+        let h = Header::decode(&self.inbuf[..envelope::HEADER_LEN])?;
+        let payload = self.inbuf[envelope::HEADER_LEN..total].to_vec();
+        self.inbuf.drain(..total);
+        Ok(Some((h, payload)))
+    }
+
+    /// Next envelope, reading (and blocking, per the socket's mode and
+    /// read timeout) until one is complete. EOF before a complete envelope
+    /// is `UnexpectedEof`, as `read_exact` reported it.
+    fn read_envelope(&mut self) -> io::Result<(Header, Vec<u8>)> {
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            if let Some(env) = self.pop_envelope()? {
+                return Ok(env);
+            }
+            match self.rd.read(&mut chunk) {
+                Ok(0) => return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof, "connection closed")),
+                Ok(n) => self.inbuf.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Run CLASS_CORE handling on one envelope; return the message if the
+    /// caller should see it.
+    fn deliver(&mut self, h: Header, payload: Vec<u8>) -> io::Result<Option<Message>> {
+        if h.opcode_class == CLASS_CORE && self.handle_core(h.op, &payload)? {
+            return Ok(None); /* swallowed at the substrate layer */
+        }
+        let kind = if h.flags & flag::IS_RESPONSE != 0 {
+            MessageKind::Response
+        } else if h.flags & flag::ASYNC_EVENT != 0 {
+            MessageKind::Event
+        } else {
+            MessageKind::Request
+        };
+        Ok(Some(Message {
+            opcode_class: h.opcode_class,
+            op:           h.op,
+            flags:        h.flags,
+            kind,
+            payload,
+        }))
     }
 
     /// Handle a CLASS_CORE op. Returns true if the message was
@@ -305,7 +401,7 @@ impl Connection {
     /// CLASS_CORE op arrives. Used by the upload state machine.
     fn recv_message_until_class(&mut self, class: u8, op: u16) -> io::Result<Hash> {
         loop {
-            let (h, payload) = envelope::read_message_alloc(&mut self.rd)?;
+            let (h, payload) = self.read_envelope()?;
             if h.opcode_class == class && h.op == op {
                 return cas::decode_hash_msg(&payload).map_err(io_invalid);
             }
@@ -375,7 +471,7 @@ impl Connection {
     /// Set socket read timeout. Useful for clients that want to
     /// poll with a deadline. None = block forever.
     pub fn set_read_timeout(&self, t: Option<Duration>) -> io::Result<()> {
-        self.rd.get_ref().set_read_timeout(t)
+        self.rd.set_read_timeout(t)
     }
 
     /// Toggle non-blocking I/O. Used by clients that want a true
@@ -383,7 +479,7 @@ impl Connection {
     /// timeout (FreeBSD rejects `set_read_timeout(Duration::ZERO)`
     /// with EINVAL — `set_nonblocking(true)` is the portable way).
     pub fn set_nonblocking(&self, nb: bool) -> io::Result<()> {
-        self.rd.get_ref().set_nonblocking(nb)
+        self.rd.set_nonblocking(nb)
     }
 
     /// Diagnostic: how many bytes are currently in the cache.
@@ -440,6 +536,65 @@ mod tests {
         let mut cb = server.join().unwrap();
         let got = cb.cache_get(&h).unwrap();
         assert_eq!(got, big_clone);
+    }
+
+    /// The multiplexing receive path: bytes arrive in pieces, fills never
+    /// block, and a message is served only once complete.
+    #[test]
+    fn nonblocking_receive_serves_only_complete_messages() {
+        let (mut raw, b) = UnixStream::pair().unwrap();
+        let mut cb = Connection::wrap(b).unwrap();
+        cb.set_nonblocking(true).unwrap();
+
+        /* Nothing sent: a fill returns at once, nothing is ready. */
+        assert!(cb.fill_available().unwrap());
+        assert!(!cb.has_buffered_message());
+        assert!(cb.try_recv_message().unwrap().is_none());
+
+        /* Half a header, then the rest plus a second message in one write. */
+        let m1 = envelope_bytes(40, 7, b"first");
+        let m2 = envelope_bytes(40, 8, b"second");
+        raw.write_all(&m1[..4]).unwrap();
+        assert!(cb.fill_available().unwrap());
+        assert!(!cb.has_buffered_message());
+
+        let mut rest = m1[4..].to_vec();
+        rest.extend_from_slice(&m2);
+        raw.write_all(&rest).unwrap();
+        assert!(cb.fill_available().unwrap());
+        assert!(cb.has_buffered_message());
+        let got1 = cb.try_recv_message().unwrap().unwrap();
+        assert_eq!((got1.op, got1.payload.as_slice()), (7, &b"first"[..]));
+        /* fill may have stopped after the first message; the second is in
+         * the buffer or still in the socket. */
+        let _ = cb.fill_available().unwrap();
+        let got2 = cb.try_recv_message().unwrap().unwrap();
+        assert_eq!((got2.op, got2.payload.as_slice()), (8, &b"second"[..]));
+        assert!(cb.try_recv_message().unwrap().is_none());
+
+        /* Peer closes: fill reports it. */
+        drop(raw);
+        assert!(!cb.fill_available().unwrap());
+    }
+
+    /// A message split by a read timeout is not lost: the blocking path
+    /// resumes from the buffered bytes.
+    #[test]
+    fn blocking_receive_keeps_bytes_across_a_timeout() {
+        let (mut raw, b) = UnixStream::pair().unwrap();
+        let mut cb = Connection::wrap(b).unwrap();
+        let m = envelope_bytes(40, 9, b"split");
+        raw.write_all(&m[..6]).unwrap();
+        assert!(cb.recv_message_or_timeout(Duration::from_millis(50)).unwrap().is_none());
+        raw.write_all(&m[6..]).unwrap();
+        let got = cb.recv_message_or_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!((got.op, got.payload.as_slice()), (9, &b"split"[..]));
+    }
+
+    fn envelope_bytes(class: u8, op: u16, payload: &[u8]) -> Vec<u8> {
+        let mut v = Header::new(class, op, 0, payload.len() as u32).encode().to_vec();
+        v.extend_from_slice(payload);
+        v
     }
 
     #[test]

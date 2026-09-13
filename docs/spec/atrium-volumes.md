@@ -526,7 +526,8 @@ Per `LANGUAGE-POLICY.md` smallest-TCB carve-out:
   unsafe Rust, just untrusted-string-formatting we have to be
   careful about (use `--` arg separators, never construct
   shell strings).
-- No async runtime. Single-threaded blocking accept.
+- No async runtime. One thread; client connections multiplexed over
+  kqueue (`portcullis/sockmux`), one request per connection per round.
 - Aqueduct service at `/var/run/aqueduct/atrium-volumes.sock`.
 - Only portcullisd connects. Same `getpeereid` peer check as
   jaild.
