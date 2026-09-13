@@ -1566,6 +1566,7 @@ static unsigned long tessera_stat_extend_sparse_fallback = 0;
  * buffer at once; *_bytes sums what those buffers cost. The range-scoped
  * replacements count their own successes and fallbacks. */
 static unsigned long tessera_stat_truncate_prefix          = 0;
+static unsigned long tessera_stat_journal_replay_dropped_dirents = 0;
 static unsigned long tessera_stat_truncate_prefix_fallback = 0;
 static unsigned long tessera_stat_setattr_wholefile        = 0;
 static unsigned long tessera_stat_setattr_wholefile_bytes  = 0;
@@ -1726,6 +1727,9 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, extend_sparse_windows,
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, extend_sparse_fallback,
     CTLFLAG_RD, &tessera_stat_extend_sparse_fallback, 0,
     "Sparse truncate-extends that fell back to the materialising path");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, journal_replay_dropped_dirents,
+    CTLFLAG_RD, &tessera_stat_journal_replay_dropped_dirents, 0,
+    "Replayed directory entries dropped because their inode was unrestorable");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, truncate_prefix,
     CTLFLAG_RD, &tessera_stat_truncate_prefix, 0,
     "Truncate-shrinks done without materialising the old file");
@@ -4042,6 +4046,14 @@ struct tessera_mount {
 	 * journal_checkpoint cleans them up so it's net-benign, but
 	 * pure waste on every mount. */
 	int                       in_replay;
+	/* Inodes whose INODE_WRITE redo record journal replay REFUSED (manifest
+	 * in no pack) while no other record for them existed — i.e. inodes the
+	 * namespace may now name but that cannot be restored. Collected during a
+	 * full replay, consumed by tessera_fs_replay_drop_unrestorable, then
+	 * freed. */
+	uint32_t                 *replay_refused;
+	uint32_t                  replay_refused_n;
+	uint32_t                  replay_refused_cap;
 
 	/* v2 snapshots slice 2: read-only historical mount via
 	 * `tessera.gen=N`. When 1, mountfs overrode sb roots from a
@@ -5883,6 +5895,199 @@ tessera_fs_journal_open_dev(struct tessera_mount *tmp_)
  * re-applies the dirent/inode redo records into the dirty overlay (which a
  * writable mount later drains to disk). Returns the count of ROOT_UPDATE
  * records applied. Opens the journal if needed. */
+/*
+ * ★ Make a replay refusal consistent with the namespace.
+ *
+ * WHAT WENT WRONG (2026-09-13, dev root, after hard resets of a guest hung
+ * under memory starvation). The journal coalesces an inode's pending redo
+ * records to its LATEST state and writes it in the same transaction as the
+ * directory entry. For a file created and written in the window, that latest
+ * state names a content manifest that was still only in RAM. The redo
+ * buffers reached the disk (bdwrite; the buffer daemon flushes them) while
+ * the flush that would have packed the manifest never ran. Replay then did
+ * the right thing to the inode — refused it, "manifest is in no pack" — and
+ * replayed the DIR_INSERT anyway. The first checkpoint committed a name
+ * pointing at nothing: lookups returned ENOENT ("damaged directory entry"),
+ * O_CREAT on the name failed the same way, and fsck reported 7 dangling
+ * dirents — /var/log/messages and /var/db/entropy/saved-entropy.2 among them,
+ * so syslogd could no longer write its log.
+ *
+ * WHY DROP THE NAME rather than install an empty file under it. The inode
+ * record and the directory entry are the two halves of ONE namespace op, and
+ * the create/mkdir/link paths already go to lengths to make them land in the
+ * same flush (cd759fe9). If one half cannot be recovered, the op did not
+ * commit, and the other half must not survive it — exactly as if the crash
+ * had landed a moment earlier. The content is gone either way; an empty file
+ * wearing the real name is worse than no file, because every reader then
+ * trusts contents that were never written (a config file that is suddenly
+ * blank, a truncated log that looks rotated).
+ *
+ * WHAT IS DROPPED, from the replayed in-memory dirent log only:
+ *   - every entry (ADD or REMOVE) naming an unrestorable inode, and
+ *   - every entry whose PARENT is one — a directory created in the window
+ *     takes its children's entries with it. A child whose last live name
+ *     was under it loses a link; at zero it is deleted and treated the same
+ *     way in turn, so a lost subtree goes away as a whole instead of leaving
+ *     orphans. A child also named elsewhere keeps its other name.
+ * Entries are removed, not countered with a REMOVE op: a REMOVE of a name the
+ * committed parent manifest never held is ENOENT in the rewrite paths.
+ *
+ * Idempotent across another crash before the first flush commits: the ring
+ * still holds the same records, replay refuses the same inodes, and this
+ * drops the same entries.
+ */
+static void
+tessera_fs_replay_drop_unrestorable(struct tessera_mount *tmp_)
+{
+	if (tmp_->replay_refused_n == 0 || !tmp_->dirty_init)
+		goto out;
+
+	/* Worklist. Upper bound on pushes: the refused set plus one per log
+	 * entry removed. */
+	mtx_lock(&tmp_->flush_mtx);
+	uint32_t cap = tmp_->replay_refused_n + tmp_->dirent_log_count + 1;
+	mtx_unlock(&tmp_->flush_mtx);
+	uint32_t *D = malloc(cap * sizeof *D, M_TESSERA, M_WAITOK);
+	uint32_t nD = 0;
+	for (uint32_t i = 0; i < tmp_->replay_refused_n; i++) {
+		uint32_t x = tmp_->replay_refused[i];
+		tessera_inode_record_t r;
+		int dup = 0;
+		for (uint32_t j = 0; j < nD; j++)
+			if (D[j] == x) { dup = 1; break; }
+		/* A later record in the ring may have restored it after all. */
+		if (!dup && tessera_fs_inode_get(tmp_, x, &r) != TESSERA_OK)
+			D[nD++] = x;
+	}
+
+	/* Children that lose a live link, gathered under the lock and acted
+	 * on after it (inode_get/put sleep). */
+	struct lost_link { uint32_t inode_no; uint64_t seq; uint64_t name_hash;
+	    uint32_t parent; };
+	uint32_t dropped = 0, deleted = 0, undone_moves = 0;
+	const uint32_t n_unrestorable = nD;
+
+	for (uint32_t i = 0; i < nD; i++) {
+		const uint32_t X = D[i];
+		struct lost_link *ll = malloc(cap * sizeof *ll, M_TESSERA,
+		    M_WAITOK);
+		uint32_t nll = 0;
+
+		mtx_lock(&tmp_->flush_mtx);
+		/* Live links under X: for each (X, name) the NEWEST entry, if
+		 * it is an ADD. A child added and then renamed out of X nets to
+		 * nothing and must not lose a link it no longer has there. */
+		uint32_t xb = X & (TESSERA_DIRENT_LOG_BUCKETS - 1u);
+		struct tessera_dirent_log_entry *e, *e2, *tmp;
+		LIST_FOREACH(e, &tmp_->dirent_log[xb], link) {
+			if (e->parent_inode_no != X || e->op != 0)
+				continue;
+			int newest = 1;
+			LIST_FOREACH(e2, &tmp_->dirent_log[xb], link) {
+				if (e2 != e && e2->parent_inode_no == X &&
+				    e2->name_len == e->name_len &&
+				    memcmp(e2->name, e->name, e->name_len) == 0 &&
+				    e2->seq > e->seq) { newest = 0; break; }
+			}
+			if (newest && nll < cap) {
+				ll[nll].inode_no = e->inode_no;
+				ll[nll].seq = e->seq;
+				ll[nll].name_hash = e->name_hash;
+				ll[nll].parent = X;
+				nll++;
+			}
+		}
+		/* Drop every entry naming X, or living under X. */
+		for (uint32_t b = 0; b < TESSERA_DIRENT_LOG_BUCKETS; b++) {
+			LIST_FOREACH_SAFE(e, &tmp_->dirent_log[b], link, tmp) {
+				if (e->inode_no != X && e->parent_inode_no != X)
+					continue;
+				LIST_REMOVE(e, link);
+				tmp_->dirent_log_count--;
+				free(e, M_TESSERA);
+				dropped++;
+			}
+		}
+		mtx_unlock(&tmp_->flush_mtx);
+
+		for (uint32_t k = 0; k < nll; k++) {
+			const uint32_t c = ll[k].inode_no;
+
+			/* MOVED IN? A cross-directory rename appends the ADD to
+			 * the target and THEN the REMOVE from the source, both
+			 * naming the same inode. If that target is lost, the
+			 * rename did not commit, so its REMOVE must not either —
+			 * otherwise a file committed long ago loses its old name
+			 * and, below, its record: data destroyed because a
+			 * RENAME was cut. Undo it: drop the first REMOVE of this
+			 * inode from another parent that follows the ADD. */
+			int undone = 0;
+			mtx_lock(&tmp_->flush_mtx);
+			struct tessera_dirent_log_entry *pair = NULL;
+			for (uint32_t b = 0;
+			    b < TESSERA_DIRENT_LOG_BUCKETS; b++) {
+				LIST_FOREACH(e, &tmp_->dirent_log[b], link) {
+					if (e->inode_no == c && e->op == 1 &&
+					    e->parent_inode_no != X &&
+					    e->seq > ll[k].seq &&
+					    (pair == NULL || e->seq < pair->seq))
+						pair = e;
+				}
+			}
+			if (pair != NULL) {
+				LIST_REMOVE(pair, link);
+				tmp_->dirent_log_count--;
+				free(pair, M_TESSERA);
+				dropped++;
+				undone = 1;
+			}
+			mtx_unlock(&tmp_->flush_mtx);
+			if (undone) {
+				undone_moves++;
+				continue;	/* keeps its old name; nlink unchanged */
+			}
+
+			tessera_inode_record_t cr;
+			if (tessera_fs_inode_get(tmp_, c, &cr) != TESSERA_OK)
+				continue;	/* never restored: nothing to unlink */
+			const int is_dir = ((cr.mode & 0170000) == 0040000);
+			/* LINKED IN: it has other names; this one never
+			 * committed, so neither did its link count. */
+			if (!is_dir && cr.nlink > 1) {
+				cr.nlink--;
+				(void)tessera_fs_inode_put(tmp_, c, &cr);
+				continue;
+			}
+			/* CREATED IN the lost directory: its only name was
+			 * there, so it goes with it — and if it is a directory,
+			 * so does everything under it. */
+			(void)tessera_fs_inode_delete(tmp_, c);
+			deleted++;
+			int seen = 0;
+			for (uint32_t j = 0; j < nD; j++)
+				if (D[j] == c) { seen = 1; break; }
+			if (!seen && nD < cap)
+				D[nD++] = c;
+		}
+		free(ll, M_TESSERA);
+	}
+
+	if (dropped > 0 || deleted > 0)
+		printf("tessera_fs: journal replay dropped %u directory entr%s "
+		    "for %u unrestorable inode(s); %u move(s) into a lost "
+		    "directory undone, %u record(s) created inside one removed "
+		    "— those operations did not survive the crash\n",
+		    dropped, dropped == 1 ? "y" : "ies", n_unrestorable,
+		    undone_moves, deleted);
+	tessera_stat_journal_replay_dropped_dirents += dropped;
+	free(D, M_TESSERA);
+out:
+	if (tmp_->replay_refused != NULL)
+		free(tmp_->replay_refused, M_TESSERA);
+	tmp_->replay_refused = NULL;
+	tmp_->replay_refused_n = tmp_->replay_refused_cap = 0;
+}
+
 static int
 tessera_fs_journal_replay(struct tessera_mount *tmp_, int roots_only)
 {
@@ -5894,6 +6099,14 @@ tessera_fs_journal_replay(struct tessera_mount *tmp_, int roots_only)
 	tmp_->in_replay = 1;
 	(void)tessera_journal_replay(tmp_->journal,
 	    tessera_replay_handler, &rctx);
+	/* Only a full replay applies redo records, so only it can refuse one
+	 * and leave a name without an inode. Still inside in_replay on
+	 * purpose: its inode puts/deletes must NOT be journaled. Like replay's
+	 * own, they reach disk atomically with the first flush; journaling
+	 * them would make a second crash before that flush replay the nlink
+	 * decrement AND redo it here — a double unlink. */
+	if (!roots_only)
+		tessera_fs_replay_drop_unrestorable(tmp_);
 	tmp_->in_replay = 0;
 	printf("tessera_fs: journal replay (%s) applied %d ROOT_UPDATE "
 	    "record(s); %lu redo records re-applied\n",
@@ -6267,11 +6480,28 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * records (and the SB persist) are deferred to the ro->rw upgrade, which
 	 * has write access to drain them. Forensic (tessera.gen) mounts skip all
 	 * of this — replay would advance the roots past the requested snapshot. */
+	/*
+	 * ★ A rw mount replays in TWO stages, like the ro->rw upgrade always
+	 * did. Here: ROOT_UPDATE only, so the trees below open against the
+	 * recovered roots. The dirent/inode REDO records wait until those
+	 * trees are open (see "late redo replay" below).
+	 *
+	 * This used to run the full replay right here, BEFORE the inode tree,
+	 * pack registry and blob index existed. The redo path checks every
+	 * inode record against them (#137: refuse a record whose manifest is
+	 * in no pack), and with nothing open every check failed — dtrace on a
+	 * recovery mount showed fetch_blob_ex = EIO and inode_get = ENOENT for
+	 * EVERY inode, the root directory included. So every redo INODE_WRITE
+	 * was refused, while the DIR_INSERTs beside them replayed: after any
+	 * crash that reached the redo log, every file created since the last
+	 * commit came back as a name with no inode ("dangling dirent"). The
+	 * root volume escaped the blanket version only because it mounts ro
+	 * and upgrades, and the upgrade replays after the trees are open.
+	 */
 	if (requested_gen == 0) {
-		if (ronly)
-			(void)tessera_fs_journal_replay(tmp_, /*roots_only=*/1);
-		else
-			tessera_fs_journal_setup(tmp_);
+		int applied = tessera_fs_journal_replay(tmp_, /*roots_only=*/1);
+		if (!ronly && applied > 0 && tmp_->journal != NULL)
+			tessera_fs_journal_persist_sb(tmp_);
 	}
 
 	/* Slice 2: tessera.gen=N — historical read-only mount.
@@ -6414,6 +6644,17 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 			    (unsigned long)tmp_->sb.snapshots_root);
 	}
 
+	/* Late redo replay (rw mounts; see the two-stage note above). Every
+	 * tree a redo check reads is open now, and nothing that consumes the
+	 * dirty overlay has run yet: the quota orphan reclaim just below reads
+	 * inode records, and GC/pinscan further down decide liveness from
+	 * them. ROOT_UPDATEs are skipped by their generation guard, having
+	 * been applied in the first stage. */
+	if (requested_gen == 0 && !ronly && tmp_->journal != NULL) {
+		(void)tessera_fs_journal_replay(tmp_, /*roots_only=*/0);
+		tessera_fs_journal_wire_deferred(tmp_);
+	}
+
 	/* Quota domains (tessera-quotas.md). Load the persisted table from
 	 * the on-disk quota tree (0 = none yet; lazy-created on first flush
 	 * in commit_sb, so non-quota'd volumes never grow one). Each record
@@ -6458,7 +6699,11 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		 * handed to some unrelated file does not carry the domain id
 		 * back, so the record is still recognised as dead. */
 		uint32_t qi = 0;
-		while (qi < tmp_->quota_ndomains) {
+		/* Not on a ro mount: its redo records are not replayed until the
+		 * ro->rw upgrade, so a domain root created since the last commit
+		 * would look gone and be retired. Leaking a slot is safe;
+		 * un-quota'ing a live tree is not. */
+		while (!ronly && qi < tmp_->quota_ndomains) {
 			tessera_quota_domain_t *d = &tmp_->quota_domains[qi];
 			/* The default domain's root is nominal, not a real
 			 * per-directory attachment; never reap it. */
@@ -27034,6 +27279,38 @@ tessera_replay_dirent_record(struct tessera_mount *tmp_,
 				    "(stale record; volume left as committed)\n",
 				    ih.inode_no);
 				tessera_stat_journal_redo_refused++;
+				/*
+				 * "Left as committed" is only true for an inode
+				 * that HAS a committed (or earlier replayed)
+				 * record. For one created in the lost window
+				 * there is nothing to leave, while the
+				 * DIR_INSERT from the same transaction still
+				 * replays — a name for an inode that does not
+				 * exist. Remember it; the post-pass drops the
+				 * names once the whole ring has been walked.
+				 */
+				tessera_inode_record_t have;
+				if (tessera_fs_inode_get(tmp_, ih.inode_no, &have)
+				    != TESSERA_OK) {
+					if (tmp_->replay_refused_n ==
+					    tmp_->replay_refused_cap) {
+						uint32_t nc = tmp_->replay_refused_cap
+						    ? tmp_->replay_refused_cap * 2 : 16;
+						uint32_t *na = malloc(nc * sizeof *na,
+						    M_TESSERA, M_WAITOK);
+						if (tmp_->replay_refused_n > 0)
+							memcpy(na, tmp_->replay_refused,
+							    tmp_->replay_refused_n *
+							    sizeof *na);
+						if (tmp_->replay_refused != NULL)
+							free(tmp_->replay_refused,
+							    M_TESSERA);
+						tmp_->replay_refused = na;
+						tmp_->replay_refused_cap = nc;
+					}
+					tmp_->replay_refused[
+					    tmp_->replay_refused_n++] = ih.inode_no;
+				}
 				return (1);
 			}
 			(void)tessera_fs_inode_put(tmp_, ih.inode_no, &rec);
