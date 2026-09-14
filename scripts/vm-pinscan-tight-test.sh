@@ -25,6 +25,15 @@
 #      files, removes the previous round's 800, and syncs (a commit),
 #   3. sample kern.tessera.mounts at 5 Hz.
 #
+# ★ THROUGHPUT IS `rounds`, NOT `commits`. Commits are not work here:
+#   tessera_fs_mark_dirty runs a SYNCHRONOUS flush on every mutation while
+#   (bump - meta_free) * 2 >= reserve length, and meta_pending counts as used,
+#   so a reserve short on recycled sectors turns each create/remove into its
+#   own commit. The first version of this test reported commits and read the
+#   bypass arm's ~30% fewer as a cost; it was doing 2.8x the work (dtrace: 37%
+#   of mutations flushed synchronously with the bypass off, 10.5% with it on).
+#   `sync_flush_samples` counts the samples in that per-mutation-flush state.
+#
 # ★ DEAD-ARM GUARDS. The bypass arm must show pinscan_duty_bypass_tight > 0,
 #   and the control arm pinscan_duty_tight_honoured > 0 (the reserve was
 #   tight and the quiet was honoured). A run where neither counter moved never
@@ -65,7 +74,7 @@ B0=\$(S pinscan_duty_bypass_tight); H0=\$(S pinscan_duty_tight_honoured)
 R0=\$(S meta_admit_refusals); K0=\$(S pinscan_kicks); D0=\$(S pinscan_skips_duty)
 C0=\$(S sb_commits)
 
-rm -f /root/pt.stop /root/pt.samples; : > /root/pt.err
+rm -f /root/pt.stop /root/pt.samples /root/pt.rounds.*; : > /root/pt.err
 sh -c 'while [ ! -f /root/pt.stop ]; do sysctl -n kern.tessera.mounts | grep \"^/mnt/scratch \" >> /root/pt.samples; sleep 0.2; done' &
 w=0; while [ \$w -lt 4 ]; do
   sh -c 'w=\$1; r=0; M=/mnt/scratch
@@ -74,7 +83,7 @@ w=0; while [ \$w -lt 4 ]; do
       while [ \$i -lt \$e ]; do files=\"\$files \$M/d\$i/\$(( (r % 500) + 1 ))\"; news=\"\$news \$M/d\$i/n\$w.\$r\"; i=\$((i+1)); done
       touch -c \$files; touch \$news
       [ \$r -gt 0 ] && { i=\$(( w * 200 )); while [ \$i -lt \$e ]; do rm -f \$M/d\$i/n\$w.\$((r-1)); i=\$((i+1)); done; }
-      sync; r=\$((r+1))
+      sync; r=\$((r+1)); echo \$r > /root/pt.rounds.\$w
     done' _ \$w 2>>/root/pt.err &
   w=\$((w+1))
 done
@@ -85,8 +94,12 @@ sysctl kern.tessera.pinscan_duty_pct=\$OLD_DUTY kern.tessera.pinscan_tight_bypas
 MINAV=\$(sed -n 's/.*admit_avail=\([0-9]*\).*/\1/p' /root/pt.samples | sort -n | head -1)
 MAXPEND=\$(sed -n 's/.* pending=\([0-9]*\).*/\1/p' /root/pt.samples | sort -n | tail -1)
 REFS=\$(grep -c REFUSING /root/pt.samples)
+ROUNDS=\$(cat /root/pt.rounds.* 2>/dev/null | awk '{s+=\$1} END{print s+0}')
+# tessera_fs_mark_dirty runs a SYNCHRONOUS flush on every mutation while
+# (bump - meta_free) * 2 >= reserve length. Count the samples in that state.
+SYNCF=\$(awk '{for(i=1;i<=NF;i++){split(\$i,a,\"=\"); v[a[1]]=a[2]} split(v[\"free\"],f,\"/\"); if ((v[\"bump\"] - f[1]) * 2 >= v[\"len\"]) n++} END{print n+0}' /root/pt.samples)
 TIGHT=\$(awk '{for(i=1;i<=NF;i++){split(\$i,a,\"=\"); v[a[1]]=a[2]} av=v[\"admit_avail\"]; if (av < v[\"pending\"] || av < v[\"soft\"]/4) t++} END{print t+0}' /root/pt.samples)
-echo \"bypass=$1 samples=\$(wc -l < /root/pt.samples | tr -d ' ') tight_samples=\$TIGHT refusing_samples=\$REFS min_avail=\$MINAV max_pending=\$MAXPEND bypass_tight=\$(( \$(S pinscan_duty_bypass_tight)-B0 )) tight_honoured=\$(( \$(S pinscan_duty_tight_honoured)-H0 )) kicks=\$(( \$(S pinscan_kicks)-K0 )) skips_duty=\$(( \$(S pinscan_skips_duty)-D0 )) admit_refusals=\$(( \$(S meta_admit_refusals)-R0 )) commits=\$(( \$(S sb_commits)-C0 )) enospc=\$(grep -ci 'no space' /root/pt.err) errs=\$(wc -l < /root/pt.err | tr -d ' ')\"
+echo \"bypass=$1 rounds=\$ROUNDS samples=\$(wc -l < /root/pt.samples | tr -d ' ') sync_flush_samples=\$SYNCF tight_samples=\$TIGHT refusing_samples=\$REFS min_avail=\$MINAV max_pending=\$MAXPEND bypass_tight=\$(( \$(S pinscan_duty_bypass_tight)-B0 )) tight_honoured=\$(( \$(S pinscan_duty_tight_honoured)-H0 )) kicks=\$(( \$(S pinscan_kicks)-K0 )) skips_duty=\$(( \$(S pinscan_skips_duty)-D0 )) admit_refusals=\$(( \$(S meta_admit_refusals)-R0 )) commits=\$(( \$(S sb_commits)-C0 )) enospc=\$(grep -ci 'no space' /root/pt.err) errs=\$(wc -l < /root/pt.err | tr -d ' ')\"
 sync; umount \$M 2>/dev/null || echo UMOUNT_FAIL
 tessera-fsck \$DEV > /root/pt.fsck 2>&1
 echo \"fsck_problems=\$(grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem' /root/pt.fsck)\"" 2>&1 | tr -d '\r'
@@ -111,7 +124,7 @@ sum() {  # $1 arm, $2 field
 }
 echo "=== totals over $REPS rep(s) ==="
 for arm in 0 1; do
-    echo "bypass=$arm tight_samples=$(sum $arm tight_samples) refusing_samples=$(sum $arm refusing_samples) bypass_tight=$(sum $arm bypass_tight) tight_honoured=$(sum $arm tight_honoured) kicks=$(sum $arm kicks) admit_refusals=$(sum $arm admit_refusals) enospc=$(sum $arm enospc) commits=$(sum $arm commits)"
+    echo "bypass=$arm rounds=$(sum $arm rounds) sync_flush_samples=$(sum $arm sync_flush_samples) tight_samples=$(sum $arm tight_samples) refusing_samples=$(sum $arm refusing_samples) bypass_tight=$(sum $arm bypass_tight) tight_honoured=$(sum $arm tight_honoured) kicks=$(sum $arm kicks) admit_refusals=$(sum $arm admit_refusals) enospc=$(sum $arm enospc) commits=$(sum $arm commits)"
 done
 [ "$(sum 1 bypass_tight)" -gt 0 ] || echo "WARNING — the bypass never fired: the reserve never got tight in the bypass arm, so this run is not evidence"
 [ "$(sum 0 tight_honoured)" -gt 0 ] || echo "WARNING — the control arm never honoured a quiet while tight: no evidence of what the bypass changes"
