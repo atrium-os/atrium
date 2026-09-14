@@ -2381,6 +2381,8 @@ struct tessera_cas_loc_snap {
 };
 static int  tessera_cas_loc_lookup (struct tessera_cas_cache *c,
     const tessera_hash_t hash, struct tessera_cas_loc_snap *out);
+static void tessera_cas_invalidate_packs(struct tessera_cas_cache *c,
+    const uint8_t *pack_ids, uint32_t n);
 static void tessera_cas_invalidate_pack(struct tessera_cas_cache *c,
     const uint8_t pack_id[16]);
 /* Tier B: cache small hot blob *bytes*. Lookup returns a freshly
@@ -3271,6 +3273,16 @@ static unsigned long tessera_stat_pinscan_incomplete = 0;
  * began — the bitmap never covered them. Each one is a prevented silent
  * release of frozen-tree blocks. */
 static unsigned long tessera_stat_pinscan_gc_roots_moved = 0;
+/* GC pass-3 apply cost, gated (see tessera_cas_invalidate_packs). */
+static unsigned long tessera_stat_gc_apply_ns = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_apply_ns, CTLFLAG_RD,
+    &tessera_stat_gc_apply_ns, 0,
+    "cumulative ns in GC pass-3 apply (registry deletes, extent frees, "
+    "CAS invalidation) — all under the flush gate");
+static unsigned long tessera_stat_gc_cas_invalidate_ns = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_cas_invalidate_ns, CTLFLAG_RD,
+    &tessera_stat_gc_cas_invalidate_ns, 0,
+    "cumulative ns of GC pass-3 CAS cache invalidation");
 static unsigned long tessera_stat_gc_apply_delete_failed = 0;
 /* pass 2 read a pack header whose pack_id is not the registry entry it was sent
  * to: a stale or foreign read. The pack is KEPT. Non-zero names a coherence hole. */
@@ -13224,13 +13236,68 @@ tessera_cas_loc_insert(struct tessera_cas_cache *c,
 	mtx_unlock(&c->mtx);
 }
 
-/* Drop every cache entry pointing at the given pack_id. Called when
- * a pack is deleted (gc_data_zone) or relocated (repack). O(loc_count)
- * but invalidations are rare relative to lookups.
- *
- * Also drops bytes-cache entries with matching hashes — we walk the
- * loc entries we're dropping and look each one up in bytes (cheap:
- * O(1) per loc entry). */
+/* Drop one location entry, and the bytes-cache entry for its hash if any —
+ * same hash, same bytes, but the on-disk source is gone or moved, and
+ * invalidation keeps the uniform "post-invalidate, both tiers are clean"
+ * rule. Caller holds c->mtx. */
+static void
+tessera_cas_drop_loc_locked(struct tessera_cas_cache *c,
+                            struct tessera_cas_loc_entry *e)
+{
+	uint32_t bb;
+	memcpy(&bb, e->hash, sizeof bb);
+	bb &= (TESSERA_CAS_BYTE_BUCKETS - 1u);
+	struct tessera_cas_byte_entry *be, *bnext;
+	LIST_FOREACH_SAFE(be, &c->byte_buckets[bb], hash_link, bnext) {
+		if (memcmp(be->hash, e->hash, sizeof be->hash) == 0) {
+			TAILQ_REMOVE(&c->byte_lru, be, lru_link);
+			LIST_REMOVE(be, hash_link);
+			if (c->byte_bytes >= be->length)
+				c->byte_bytes -= be->length;
+			else
+				c->byte_bytes = 0;
+			if (be->bytes != NULL)
+				free(be->bytes, M_TESSERA);
+			free(be, M_TESSERA);
+			tessera_stat_cas_byte_evicts++;
+			break;
+		}
+	}
+	TAILQ_REMOVE(&c->loc_lru, e, lru_link);
+	LIST_REMOVE(e, hash_link);
+	c->loc_count--;
+	tessera_stat_cas_invalidations++;
+	free(e, M_TESSERA);
+}
+
+/* Tier C — drop the whole-pack image if this pack_id is cached; its on-disk
+ * sectors are being freed/reused (repack/GC). Caller holds c->mtx. */
+static void
+tessera_cas_drop_pack_image_locked(struct tessera_cas_cache *c,
+                                   const uint8_t pack_id[16])
+{
+	uint32_t pb;
+	memcpy(&pb, pack_id, sizeof pb);
+	pb &= (TESSERA_CAS_PACK_BUCKETS - 1u);
+	struct tessera_cas_pack_entry *pe, *pnext;
+	LIST_FOREACH_SAFE(pe, &c->pack_buckets[pb], hash_link, pnext) {
+		if (memcmp(pe->pack_id, pack_id, 16) == 0) {
+			TAILQ_REMOVE(&c->pack_lru, pe, lru_link);
+			LIST_REMOVE(pe, hash_link);
+			if (c->pack_bytes >= pe->len)
+				c->pack_bytes -= pe->len;
+			else
+				c->pack_bytes = 0;
+			if (pe->bytes != NULL) free(pe->bytes, M_TESSERA);
+			free(pe, M_TESSERA);
+			break;
+		}
+	}
+}
+
+/* Drop every cache entry pointing at the given pack_id. Called when a single
+ * pack is relocated (repack) or found bad on a read path. O(loc_count) — for
+ * many packs at once use tessera_cas_invalidate_packs. */
 static void
 tessera_cas_invalidate_pack(struct tessera_cas_cache *c,
                             const uint8_t pack_id[16])
@@ -13239,63 +13306,76 @@ tessera_cas_invalidate_pack(struct tessera_cas_cache *c,
 	mtx_lock(&c->mtx);
 	struct tessera_cas_loc_entry *e, *next;
 	TAILQ_FOREACH_SAFE(e, &c->loc_lru, lru_link, next) {
-		if (memcmp(e->pack_id, pack_id, 16) == 0) {
-			/* Also drop the bytes-cache entry for this hash, if
-			 * any — same hash → same bytes, but the on-disk
-			 * source is gone or moved. (Bytes are still
-			 * correct, but invalidation gives a uniform
-			 * "post-invalidate, both tiers are clean" rule.) */
-			uint32_t bb;
-			memcpy(&bb, e->hash, sizeof bb);
-			bb &= (TESSERA_CAS_BYTE_BUCKETS - 1u);
-			struct tessera_cas_byte_entry *be, *bnext;
-			LIST_FOREACH_SAFE(be, &c->byte_buckets[bb],
-			                   hash_link, bnext) {
-				if (memcmp(be->hash, e->hash,
-				    sizeof be->hash) == 0) {
-					TAILQ_REMOVE(&c->byte_lru, be,
-					    lru_link);
-					LIST_REMOVE(be, hash_link);
-					if (c->byte_bytes >= be->length)
-						c->byte_bytes -= be->length;
-					else
-						c->byte_bytes = 0;
-					if (be->bytes != NULL)
-						free(be->bytes, M_TESSERA);
-					free(be, M_TESSERA);
-					tessera_stat_cas_byte_evicts++;
-					break;
-				}
-			}
-			TAILQ_REMOVE(&c->loc_lru, e, lru_link);
-			LIST_REMOVE(e, hash_link);
-			c->loc_count--;
-			tessera_stat_cas_invalidations++;
-			free(e, M_TESSERA);
-		}
+		if (memcmp(e->pack_id, pack_id, 16) == 0)
+			tessera_cas_drop_loc_locked(c, e);
 	}
-	/* Tier C — drop the whole-pack image if this pack_id is cached; its
-	 * on-disk sectors are being freed/reused (repack/GC). */
-	{
-		uint32_t pb;
-		memcpy(&pb, pack_id, sizeof pb);
-		pb &= (TESSERA_CAS_PACK_BUCKETS - 1u);
-		struct tessera_cas_pack_entry *pe, *pnext;
-		LIST_FOREACH_SAFE(pe, &c->pack_buckets[pb], hash_link, pnext) {
-			if (memcmp(pe->pack_id, pack_id, 16) == 0) {
-				TAILQ_REMOVE(&c->pack_lru, pe, lru_link);
-				LIST_REMOVE(pe, hash_link);
-				if (c->pack_bytes >= pe->len)
-					c->pack_bytes -= pe->len;
-				else
-					c->pack_bytes = 0;
-				if (pe->bytes != NULL) free(pe->bytes, M_TESSERA);
-				free(pe, M_TESSERA);
+	tessera_cas_drop_pack_image_locked(c, pack_id);
+	mtx_unlock(&c->mtx);
+}
+
+static inline uint32_t
+tessera_cas_packset_hash(const uint8_t pack_id[16], uint32_t mask)
+{
+	uint64_t v;
+	memcpy(&v, pack_id, sizeof v);
+	return ((uint32_t)((v * 0x9E3779B97F4A7C15ull) >> 32) & mask);
+}
+
+/*
+ * ★ Drop every cache entry pointing at ANY of `n` pack_ids (16 bytes each,
+ * contiguous) in ONE pass over the location LRU.
+ *
+ * GC pass 3 used to call tessera_cas_invalidate_pack once per dead pack, and
+ * each call walks the whole location LRU (up to tessera_cas_loc_max = 65,536
+ * entries) — O(dead x cache), all under the flush gate. A root with 204,845
+ * dead packs held its gate for 2 min 40 s (06:28:12 -> 06:30:52, 2026-09-14),
+ * and every vop on the volume, sshd's login path included, sat on "tessgate"
+ * behind it; a live memory dump found the GC thread in memcmp here. Not one of
+ * those scans matched (cas_invalidations stayed 0).
+ *
+ * Now: hash the doomed ids into an open-addressing set (allocated before
+ * taking the cache mutex, since M_WAITOK may sleep), then walk the LRU once.
+ * O(cache + dead). Tier C is keyed by pack_id, so it is one bucket probe per
+ * id under the same lock hold.
+ */
+static void
+tessera_cas_invalidate_packs(struct tessera_cas_cache *c,
+                             const uint8_t *pack_ids, uint32_t n)
+{
+	if (!c->mtx_init || n == 0) return;
+	if (n == 1) {
+		tessera_cas_invalidate_pack(c, pack_ids);
+		return;
+	}
+	uint32_t cap = 16;
+	while (cap < 2u * n && cap < (1u << 30))
+		cap <<= 1;
+	uint32_t mask = cap - 1;
+	/* Slot value = index + 1; 0 = empty. */
+	uint32_t *set = malloc(cap * sizeof(*set), M_TESSERA, M_WAITOK | M_ZERO);
+	for (uint32_t i = 0; i < n; i++) {
+		uint32_t h = tessera_cas_packset_hash(&pack_ids[i * 16u], mask);
+		while (set[h] != 0)
+			h = (h + 1) & mask;
+		set[h] = i + 1;
+	}
+
+	mtx_lock(&c->mtx);
+	struct tessera_cas_loc_entry *e, *next;
+	TAILQ_FOREACH_SAFE(e, &c->loc_lru, lru_link, next) {
+		uint32_t h = tessera_cas_packset_hash(e->pack_id, mask);
+		for (; set[h] != 0; h = (h + 1) & mask) {
+			if (memcmp(&pack_ids[(set[h] - 1) * 16u], e->pack_id,
+			    16) == 0) {
+				tessera_cas_drop_loc_locked(c, e);
 				break;
 			}
 		}
 	}
+	for (uint32_t i = 0; i < n; i++)
+		tessera_cas_drop_pack_image_locked(c, &pack_ids[i * 16u]);
 	mtx_unlock(&c->mtx);
+	free(set, M_TESSERA);
 }
 
 static inline uint32_t
@@ -19383,6 +19463,14 @@ next_p:
 	if (dead_count > 0)
 		atomic_add_rel_64(&tmp_->pack_reloc_gen, 1);
 	uint64_t new_pack_root = tmp_->sb.pack_registry_root;
+	/* Pack ids whose registry delete succeeded, invalidated from the CAS
+	 * cache in ONE pass after this loop (tessera_cas_invalidate_packs).
+	 * Deferring is safe: the gate is held throughout, so no allocator can
+	 * hand out the extents freed below before the invalidation runs. */
+	sbintime_t _apply_t0 = sbinuptime();
+	uint8_t *gone_ids = dead_count > 0 ?
+	    malloc((size_t)dead_count * 16u, M_TESSERA, M_WAITOK) : NULL;
+	uint32_t gone_n = 0;
 	for (uint32_t i = 0; i < dead_count; i++) {
 		if (tessera_gc_trace)
 			printf("GC-TRACE free mnt=%s pass=%lu pack=%8D bh0=%8D nbh=%u\n",
@@ -19391,8 +19479,9 @@ next_p:
 		if (tessera_btree_delete(tmp_->pack_registry_tree,
 		    deads[i].pack_id, &new_pack_root) == TESSERA_OK) {
 			tmp_->sb.pack_registry_root = new_pack_root;
-			tessera_cas_invalidate_pack(&tmp_->cas_cache,
-			    deads[i].pack_id);
+			memcpy(&gone_ids[(size_t)gone_n * 16u],
+			    deads[i].pack_id, 16);
+			gone_n++;
 		} else {
 			tessera_stat_gc_apply_delete_failed++;
 			if (tessera_gc_trace)
@@ -19474,6 +19563,16 @@ next_p:
 		if (deads[i].pels != NULL) free(deads[i].pels, M_TESSERA);
 		if (deads[i].bh_extra != NULL) free(deads[i].bh_extra, M_TESSERA);
 	}
+
+	if (gone_ids != NULL) {
+		sbintime_t _inv_t0 = sbinuptime();
+		tessera_cas_invalidate_packs(&tmp_->cas_cache, gone_ids, gone_n);
+		tessera_stat_gc_cas_invalidate_ns +=
+		    (unsigned long)sbttons(sbinuptime() - _inv_t0);
+		free(gone_ids, M_TESSERA);
+	}
+	tessera_stat_gc_apply_ns +=
+	    (unsigned long)sbttons(sbinuptime() - _apply_t0);
 
 	/* #114: same gated phase, same kind of work — return the extents left
 	 * behind by deferred duplicate appends. Independent of dead_count: a
