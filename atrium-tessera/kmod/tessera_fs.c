@@ -2528,6 +2528,7 @@ static int tessera_fs_wrap_list_as_tree(struct tessera_mount *tmp_,
 static uint32_t tessera_fs_existing_chunk_size(struct tessera_mount *tmp_,
     const tessera_inode_record_t *ino);
 static void encode_inode_key(uint32_t inode_no, uint8_t out[4]);
+static uint32_t _inode_key_decode(const uint8_t key[4]);
 
 /* v2 step-2b: dirty inode entry — element of the per-mount hash. */
 struct tessera_dirty_inode {
@@ -3676,6 +3677,7 @@ static struct tessera_dirent_log_entry *tessera_dirent_log_entry_clone(
 
 /* ── per-mount state ─────────────────────────────────────────── */
 
+struct tessera_legacy_sweep;
 struct tessera_mount {
 	struct vnode             *devvp;     /* the block-device vnode */
 	struct g_consumer        *cp;        /* GEOM consumer for I/O */
@@ -3763,6 +3765,15 @@ struct tessera_mount {
 	struct taskqueue         *pinscan_tq;
 	struct task               pinscan_task;
 	int                       pinscan_tq_init;
+	/* One-time legacy orphan sweep (tessera_fs_legacy_sweep_task):
+	 * its queue, its unmount abort, and the live sweep the rename
+	 * barrier notes into (NULL when none is walking). */
+	struct taskqueue         *legacy_tq;
+	struct task               legacy_task;
+	int                       legacy_tq_init;
+	volatile int              legacy_sweep_abort;
+	struct mtx                legacy_sweep_mtx;
+	struct tessera_legacy_sweep *legacy_sweep;
 	volatile int              pinscan_abort;
 	volatile int              pinscan_active;
 	/* Wall-clock second of the last "pinscan done" log line — rate-limits
@@ -6414,61 +6425,111 @@ tessera_fs_reap_unlinked(struct tessera_mount *tmp_)
 }
 
 /*
- * One-time: free the nlink=0 orphans that kmods older than
+ * One-time, BACKGROUND: free the nlink=0 orphans that kmods older than
  * TESSERA_INODE_FLAG_UNLINKED left behind.
  *
  * tessera_fs_reap_unlinked keys on the flag, which those records lack — and
  * nlink==0 alone is not enough, because legacy seeding left LIVE records
  * (mostly directories) with nlink 0-as-unset. The discriminator for an
  * unflagged record is the one fsck --repair uses: nlink == 0 AND not
- * reachable by name from the root directory. So this walks the namespace.
+ * reachable by name from the root directory. So this walks the namespace —
+ * 16k directories / ~25 s on the dev root, which is why it runs on its own
+ * taskqueue after the mount is live instead of holding up boot.
  *
  * It runs until it completes once, then sets TESSERA_FEATURE_UNLINKED_FLAG
  * (persisted by the next commit) and never runs on that volume again —
  * every nlink=0 record written since carries the flag. mkfs sets the bit.
  *
- * Same call sites and exclusion argument as tessera_fs_reap_unlinked: rw
- * mount before mnt_data is published, and the ro->rw upgrade before
- * MNT_RDONLY is cleared, so no namespace op can move an entry mid-walk.
+ * WHY A CONCURRENT WALK IS SAFE. Only a record with no name can be freed,
+ * so the danger is a walk that misses a name. With namespace ops running:
+ *   - creates / mkdir make records with nlink >= 1: never candidates;
+ *   - link bumps nlink: the pre-delete re-check skips it;
+ *   - unlink / rmdir / rename-over set the UNLINKED flag: the re-check skips
+ *     it (vop_inactive or tessera_fs_reap_unlinked owns those — freeing one
+ *     here could pull a record out from under an open file);
+ *   - RENAME can move an entry from a directory the walk has not read into
+ *     one it already has. That is the only way to hide a name, and it is
+ *     closed by a barrier: vop_rename calls tessera_fs_legacy_sweep_note
+ *     after the move, which marks the moved inode reachable and, for a
+ *     directory, queues it to be walked. A rename whose note ran before the
+ *     sweep activated appended its dirent ops before the activation
+ *     snapshot of the dirent log, so the walk sees it there or in the
+ *     published manifest (publish swaps log entry for manifest atomically).
+ * Every inode named by the dirent log at activation counts as reachable
+ * (ADD or REMOVE — over-counting is the safe direction).
  *
- * FAIL SAFE. Any walk error — an unreadable directory, a manifest that is
- * not a directory, an inode number beyond the bitmap — abandons the sweep:
- * nothing is freed and the bit stays clear. Reachability is over-counted,
- * never under-counted: every inode named by an unpublished dirent-log op
- * (ADD or REMOVE) counts as reachable.
+ * FAIL SAFE. A directory that cannot be walked (after one re-read, in case
+ * its manifest was republished mid-walk), a missing root, a walk that
+ * reaches no directory, a barrier queue overflow, or unmount abandons the
+ * sweep: nothing is freed and the bit stays clear, so it retries next mount.
  */
 struct tessera_legacy_sweep {
-	struct tessera_mount *tmp;
+	struct mtx lock;        /* reach, isdir, stack, overflow */
 	uint8_t  *reach;
 	uint8_t  *isdir;
 	uint64_t  nbits;
 	uint32_t *stack;
 	uint32_t  sp, scap;
 	uint32_t  beyond;
+	int       overflow;
 };
 
 #define _LS_TEST(bm, i) (((bm)[(i) >> 3] >> ((i) & 7)) & 1)
 #define _LS_SET(bm, i)  ((bm)[(i) >> 3] |= (uint8_t)(1 << ((i) & 7)))
 
+static int tessera_fault_legacy_sweep_pause = 0;
+SYSCTL_INT(_kern_tessera, OID_AUTO, fault_legacy_sweep_pause, CTLFLAG_RW,
+    &tessera_fault_legacy_sweep_pause, 0,
+    "TEST ONLY: nonzero holds the legacy orphan sweep after it has walked "
+    "the root directory (up to 120 s) — the window for a rename race");
+static int tessera_legacy_sweep_batch = 4096;
+SYSCTL_INT(_kern_tessera, OID_AUTO, legacy_sweep_batch, CTLFLAG_RW,
+    &tessera_legacy_sweep_batch, 0,
+    "inode records per ungated cursor in the legacy orphan sweep (tests "
+    "set it small to exercise batch resume)");
+static int tessera_fault_legacy_sweep_dir_delay_ms = 0;
+SYSCTL_INT(_kern_tessera, OID_AUTO, fault_legacy_sweep_dir_delay_ms,
+    CTLFLAG_RW, &tessera_fault_legacy_sweep_dir_delay_ms, 0,
+    "TEST ONLY: sleep this long after each directory the legacy orphan "
+    "sweep walks — stretches the walk across a concurrent churn");
+static int tessera_fault_legacy_sweep_nobarrier = 0;
+SYSCTL_INT(_kern_tessera, OID_AUTO, fault_legacy_sweep_nobarrier, CTLFLAG_RW,
+    &tessera_fault_legacy_sweep_nobarrier, 0,
+    "TEST ONLY: 1 disables the rename barrier (proves the race test can "
+    "see the bug)");
+static int tessera_stat_legacy_sweep_paused = 0;
+SYSCTL_INT(_kern_tessera, OID_AUTO, legacy_sweep_paused, CTLFLAG_RD,
+    &tessera_stat_legacy_sweep_paused, 0,
+    "1 while a legacy orphan sweep is held by fault_legacy_sweep_pause");
+static unsigned long tessera_stat_legacy_sweeps_done = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, legacy_sweeps_done, CTLFLAG_RD,
+    &tessera_stat_legacy_sweeps_done, 0,
+    "legacy orphan sweeps that finished (completed or abandoned)");
+static unsigned long tessera_stat_legacy_barrier_notes = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, legacy_barrier_notes, CTLFLAG_RD,
+    &tessera_stat_legacy_barrier_notes, 0,
+    "renames noted by the legacy orphan sweep barrier while it walked");
+
+/* Caller holds ls->lock. */
 static void
-tessera_legacy_sweep_mark(struct tessera_legacy_sweep *ls, uint64_t ino)
+tessera_legacy_sweep_mark_locked(struct tessera_legacy_sweep *ls,
+    uint64_t ino, int force_dir)
 {
 	if (ino >= ls->nbits) {
-		ls->beyond++;
+		ls->beyond++;           /* created after activation: not a
+		                         * candidate, nothing to protect */
 		return;
 	}
+	if (force_dir)
+		_LS_SET(ls->isdir, ino);
 	if (_LS_TEST(ls->reach, ino))
 		return;
 	_LS_SET(ls->reach, ino);
 	if (!_LS_TEST(ls->isdir, ino))
 		return;
 	if (ls->sp == ls->scap) {
-		uint32_t *g = malloc(ls->scap * 2 * sizeof *g, M_TESSERA,
-		    M_WAITOK);
-		memcpy(g, ls->stack, ls->sp * sizeof *g);
-		free(ls->stack, M_TESSERA);
-		ls->stack = g;
-		ls->scap *= 2;
+		ls->overflow = 1;
+		return;
 	}
 	ls->stack[ls->sp++] = (uint32_t)ino;
 }
@@ -6477,94 +6538,84 @@ static int
 tessera_legacy_sweep_cb(void *ctx, uint64_t child_inode, const char *name,
     uint16_t name_len)
 {
+	struct tessera_legacy_sweep *ls = ctx;
 	(void)name; (void)name_len;
-	tessera_legacy_sweep_mark(ctx, child_inode);
+	mtx_lock(&ls->lock);
+	tessera_legacy_sweep_mark_locked(ls, child_inode, 0);
+	mtx_unlock(&ls->lock);
 	return (0);
 }
 
-static int
-tessera_fs_sweep_legacy_orphans(struct tessera_mount *tmp_)
+/* The rename barrier. Called by vop_rename after a successful move. */
+static void
+tessera_fs_legacy_sweep_note(struct tessera_mount *tmp_, uint64_t ino,
+    int is_dir)
 {
+	if (__predict_true(tmp_->legacy_sweep == NULL))
+		return;
+	if (tessera_fault_legacy_sweep_nobarrier)
+		return;
+	mtx_lock(&tmp_->legacy_sweep_mtx);
+	struct tessera_legacy_sweep *ls = tmp_->legacy_sweep;
+	if (ls != NULL) {
+		mtx_lock(&ls->lock);
+		tessera_legacy_sweep_mark_locked(ls, ino, is_dir);
+		mtx_unlock(&ls->lock);
+		tessera_stat_legacy_barrier_notes++;
+	}
+	mtx_unlock(&tmp_->legacy_sweep_mtx);
+}
+
+static void
+tessera_fs_legacy_sweep_task(void *arg, int pending)
+{
+	struct tessera_mount *tmp_ = arg;
+	(void)pending;
 	const int mode = tessera_legacy_orphan_sweep;
-	if (mode == 0 || tmp_->inode_tree == NULL || !tmp_->dirty_init)
-		return (0);
-	if (tmp_->sb.feature_flags & TESSERA_FEATURE_UNLINKED_FLAG)
-		return (0);
+	if (mode == 0 || tmp_->inode_tree == NULL || !tmp_->dirty_init ||
+	    (tmp_->sb.feature_flags & TESSERA_FEATURE_UNLINKED_FLAG))
+		return;
 
 	sbintime_t t0 = sbinuptime();
-	struct tessera_legacy_sweep ls = { .tmp = tmp_ };
-	/* Inode numbers are allocated sequentially from next_inode_no; any
-	 * record at or past it (+ slack) aborts rather than being guessed. */
-	ls.nbits = tmp_->sb.next_inode_no + 4096;
-	if (ls.nbits > ((uint64_t)1 << 32) || ls.nbits / 8 > 256 * 1024 * 1024) {
+	struct tessera_legacy_sweep *ls = malloc(sizeof *ls, M_TESSERA,
+	    M_WAITOK | M_ZERO);
+	/* Inode numbers are sequential; anything at or past this was created
+	 * after activation (+ slack for replayed numbers). */
+	ls->nbits = tmp_->sb.next_inode_no + 65536;
+	if (ls->nbits > ((uint64_t)1 << 24)) {
 		printf("tessera_fs: legacy orphan sweep skipped — "
-		    "next_inode_no %ju too large for the bitmap\n",
+		    "next_inode_no %ju too large for the in-memory walk\n",
 		    (uintmax_t)tmp_->sb.next_inode_no);
 		tessera_stat_legacy_sweep_aborted++;
-		return (0);
+		tessera_stat_legacy_sweeps_done++;
+		free(ls, M_TESSERA);
+		return;
 	}
-	size_t bmb = (size_t)((ls.nbits + 7) / 8);
-	ls.reach = malloc(bmb, M_TESSERA, M_WAITOK | M_ZERO);
-	ls.isdir = malloc(bmb, M_TESSERA, M_WAITOK | M_ZERO);
-	ls.scap = 1024;
-	ls.stack = malloc(ls.scap * sizeof *ls.stack, M_TESSERA, M_WAITOK);
+	size_t bmb = (size_t)((ls->nbits + 7) / 8);
+	mtx_init(&ls->lock, "tessera_lsweep", NULL, MTX_DEF);
+	ls->reach = malloc(bmb, M_TESSERA, M_WAITOK | M_ZERO);
+	ls->isdir = malloc(bmb, M_TESSERA, M_WAITOK | M_ZERO);
+	/* Each inode is pushed at most once (reach bit), so nbits entries
+	 * can never overflow; the check stays as a fail-safe. */
+	ls->scap = (uint32_t)ls->nbits;
+	ls->stack = malloc(ls->scap * sizeof *ls->stack, M_TESSERA, M_WAITOK);
 	uint32_t ccap = 256, nc = 0;
 	uint32_t *cand = malloc(ccap * sizeof *cand, M_TESSERA, M_WAITOK);
 	const char *why = NULL;
 	uint64_t records = 0, dirs = 0;
-	uint32_t found = 0, freed = 0, kept = 0;
+	uint32_t found = 0, freed = 0, kept = 0, retried = 0;
 
-	/* 1. Inode tree: directory bitmap + nlink=0 candidates. */
-	tessera_fs_flush_gate_enter(tmp_);
-	tessera_btree_cursor_t *c = tessera_btree_seek_first(tmp_->inode_tree);
-	if (c == NULL)
-		why = "inode tree seek failed";
-	while (c != NULL) {
-		uint8_t k[4];
-		tessera_inode_record_t ino;
-		int rc = tessera_btree_cursor_get(c, k, &ino);
-		if (rc != TESSERA_OK) {
-			if (rc != TESSERA_ENOENT)
-				why = "inode tree read failed";
-			break;
-		}
-		records++;
-		uint32_t n = ((uint32_t)k[0] << 24) | ((uint32_t)k[1] << 16) |
-		    ((uint32_t)k[2] << 8) | (uint32_t)k[3];
-		if (n >= ls.nbits) {
-			why = "inode number beyond next_inode_no";
-			break;
-		}
-		if ((ino.mode & 0170000) == 0040000)
-			_LS_SET(ls.isdir, n);
-		if (ino.nlink == 0 && n >= TESSERA_INODE_FIRST_USER) {
-			if (nc == ccap) {
-				uint32_t *g = malloc(ccap * 2 * sizeof *g,
-				    M_TESSERA, M_WAITOK);
-				memcpy(g, cand, nc * sizeof *g);
-				free(cand, M_TESSERA);
-				cand = g;
-				ccap *= 2;
-			}
-			cand[nc++] = n;
-		}
-		rc = tessera_btree_cursor_next(c);
-		if (rc != TESSERA_OK) {
-			if (rc != TESSERA_ENOENT)
-				why = "inode tree read failed";
-			break;
-		}
-	}
-	if (c != NULL)
-		tessera_btree_cursor_free(c);
-	tessera_fs_flush_gate_exit(tmp_);
+	/* 1. Activate the barrier, THEN snapshot the dirent log and overlay:
+	 * a rename either noted into this sweep or appended before the
+	 * snapshot. */
+	mtx_lock(&tmp_->legacy_sweep_mtx);
+	tmp_->legacy_sweep = ls;
+	mtx_unlock(&tmp_->legacy_sweep_mtx);
 
-	/* 2. Replayed overlay records (dirs and candidates) and every inode
-	 * an unpublished dirent op names. Counted, then copied, so nothing
-	 * mallocs under flush_mtx. ov[] layout: (ino << 2) | isdir<<1 | cand. */
 	uint32_t nov = 0;
 	uint64_t *ov = NULL;
-	for (int pass = 0; pass < 2 && why == NULL; pass++) {
+	const uint64_t LOGBIT = (uint64_t)1 << 63;
+	for (int pass = 0; pass < 2; pass++) {
 		uint32_t cnt = 0;
 		mtx_lock(&tmp_->flush_mtx);
 		for (uint32_t b = 0; b < TESSERA_DIRTY_INODE_BUCKETS; b++) {
@@ -6583,31 +6634,137 @@ tessera_fs_sweep_legacy_orphans(struct tessera_mount *tmp_)
 		for (uint32_t b = 0; b < TESSERA_DIRENT_LOG_BUCKETS; b++) {
 			struct tessera_dirent_log_entry *de;
 			LIST_FOREACH(de, &tmp_->dirent_log[b], link) {
-				/* bit 0 AND bit 1 set = "named by the log" */
 				if (pass == 1 && cnt < nov)
 					ov[cnt] = ((uint64_t)de->inode_no << 2)
-					    | 3 | ((uint64_t)1 << 63);
+					    | LOGBIT;
 				cnt++;
 			}
 		}
 		mtx_unlock(&tmp_->flush_mtx);
 		if (pass == 0) {
-			nov = cnt + 64;   /* slack for racing inserts; extras dropped */
-			ov = malloc(nov * sizeof *ov, M_TESSERA, M_WAITOK | M_ZERO);
+			nov = cnt + 4096;
+			ov = malloc(nov * sizeof *ov, M_TESSERA,
+			    M_WAITOK | M_ZERO);
+		} else if (cnt > nov) {
+			/* The log grew past the slack between the passes: the
+			 * snapshot is incomplete, so reachability could be
+			 * under-counted. Retry next mount. */
+			why = "dirent log grew during the snapshot";
 		} else {
-			nov = cnt < nov ? cnt : nov;
+			nov = cnt;
 		}
 	}
-	for (uint32_t i = 0; i < nov && why == NULL; i++) {
-		uint64_t n = (ov[i] & ~((uint64_t)1 << 63)) >> 2;
-		if (n >= ls.nbits) {
-			why = "overlay inode number beyond next_inode_no";
+
+	/* 2. Inode tree, in batches: each batch is one short ungated cursor
+	 * (the reader epoch defers node reuse for its duration), re-seeked
+	 * at the next key so no epoch is held across the whole tree. */
+	/*
+	 * Completeness matters here more than anywhere: a directory missing
+	 * from isdir is never walked, and everything under it would look
+	 * unreachable. seek_at is only valid on an EXACT key, so each batch
+	 * resumes at the last key it read (and steps past it); if that inode
+	 * was deleted in between, the batch restarts from the first key and
+	 * skips forward instead of guessing.
+	 */
+	uint32_t last_key = 0;
+	int have_last = 0, tree_done = 0;
+	while (why == NULL && !tree_done) {
+		if (tmp_->legacy_sweep_abort) {
+			why = "unmount";
 			break;
 		}
-		if (ov[i] & ((uint64_t)1 << 63))
-			continue;               /* log names: after the dir bits */
-		if (ov[i] & 2)
-			_LS_SET(ls.isdir, n);
+		tessera_btree_cursor_t *c = NULL;
+		uint8_t k[4];
+		int rc;
+		if (have_last) {
+			uint8_t sk[4];
+			encode_inode_key(last_key, sk);
+			c = tessera_btree_seek_at(tmp_->inode_tree, sk);
+			if (c != NULL &&
+			    tessera_btree_cursor_get(c, k, NULL) == TESSERA_OK) {
+				rc = tessera_btree_cursor_next(c);
+			} else {
+				if (c != NULL)
+					tessera_btree_cursor_free(c);
+				c = tessera_btree_seek_first(tmp_->inode_tree);
+				rc = (c != NULL) ? TESSERA_OK : TESSERA_EIO;
+				while (rc == TESSERA_OK &&
+				    tessera_btree_cursor_get(c, k, NULL) ==
+				    TESSERA_OK && _inode_key_decode(k) <= last_key)
+					rc = tessera_btree_cursor_next(c);
+			}
+		} else {
+			c = tessera_btree_seek_first(tmp_->inode_tree);
+			rc = (c != NULL) ? TESSERA_OK : TESSERA_EIO;
+		}
+		if (rc != TESSERA_OK) {
+			if (rc != TESSERA_ENOENT)
+				why = "inode tree seek failed";
+			if (c != NULL)
+				tessera_btree_cursor_free(c);
+			break;
+		}
+		const int batch = tessera_legacy_sweep_batch > 0 ?
+		    tessera_legacy_sweep_batch : 1;
+		for (int i = 0; i < batch; i++) {
+			tessera_inode_record_t ino;
+			rc = tessera_btree_cursor_get(c, k, &ino);
+			if (rc != TESSERA_OK) {
+				if (rc != TESSERA_ENOENT)
+					why = "inode tree read failed";
+				tree_done = 1;
+				break;
+			}
+			uint32_t n = _inode_key_decode(k);
+			records++;
+			last_key = n;
+			have_last = 1;
+			if (n < ls->nbits) {
+				if ((ino.mode & 0170000) == 0040000) {
+					mtx_lock(&ls->lock);
+					_LS_SET(ls->isdir, n);
+					mtx_unlock(&ls->lock);
+				}
+				if (ino.nlink == 0 &&
+				    (ino.flags & TESSERA_INODE_FLAG_UNLINKED)
+				    == 0 && n >= TESSERA_INODE_FIRST_USER) {
+					if (nc == ccap) {
+						uint32_t *g = malloc(ccap * 2 *
+						    sizeof *g, M_TESSERA,
+						    M_WAITOK);
+						memcpy(g, cand, nc * sizeof *g);
+						free(cand, M_TESSERA);
+						cand = g;
+						ccap *= 2;
+					}
+					cand[nc++] = n;
+				}
+			}
+			rc = tessera_btree_cursor_next(c);
+			if (rc != TESSERA_OK) {
+				if (rc != TESSERA_ENOENT)
+					why = "inode tree read failed";
+				tree_done = 1;
+				break;
+			}
+		}
+		tessera_btree_cursor_free(c);
+	}
+	if (why == NULL && records == 0)
+		why = "inode tree empty or unreadable";
+
+	/* 3. Overlay dirs + candidates, then the roots of the walk. */
+	for (uint32_t i = 0; i < nov && why == NULL; i++) {
+		if (ov[i] & LOGBIT)
+			continue;
+		uint64_t n = ov[i] >> 2;
+		if (n >= ls->nbits)
+			continue;
+		if (ov[i] & 2) {
+			mtx_lock(&ls->lock);
+			_LS_SET(ls->isdir, n);
+			mtx_unlock(&ls->lock);
+		}
 		if ((ov[i] & 1) && n >= TESSERA_INODE_FIRST_USER) {
 			if (nc == ccap) {
 				uint32_t *g = malloc(ccap * 2 * sizeof *g,
@@ -6620,63 +6777,105 @@ tessera_fs_sweep_legacy_orphans(struct tessera_mount *tmp_)
 			cand[nc++] = (uint32_t)n;
 		}
 	}
-
-	/* 3. Namespace walk from the root directory. */
 	/* The whole argument rests on the walk actually starting: a root
 	 * that is not a known directory would mark nothing and make every
 	 * nlink=0 record look unreachable. */
-	if (why == NULL && !_LS_TEST(ls.isdir, TESSERA_INODE_ROOT_DIR))
+	if (why == NULL && !_LS_TEST(ls->isdir, TESSERA_INODE_ROOT_DIR))
 		why = "root directory record missing";
 	if (why == NULL) {
-		tessera_legacy_sweep_mark(&ls, TESSERA_INODE_ROOT_DIR);
+		mtx_lock(&ls->lock);
+		tessera_legacy_sweep_mark_locked(ls, TESSERA_INODE_ROOT_DIR, 0);
 		for (uint32_t i = 0; i < nov; i++)
-			if (ov[i] & ((uint64_t)1 << 63))
-				tessera_legacy_sweep_mark(&ls,
-				    (ov[i] & ~((uint64_t)1 << 63)) >> 2);
+			if (ov[i] & LOGBIT)
+				tessera_legacy_sweep_mark_locked(ls,
+				    (ov[i] & ~LOGBIT) >> 2, 0);
+		mtx_unlock(&ls->lock);
 	}
-	while (why == NULL && ls.sp > 0) {
-		uint32_t d = ls.stack[--ls.sp];
-		tessera_inode_record_t dino;
-		int rc = tessera_fs_inode_get(tmp_, d, &dino);
-		if (rc == TESSERA_ENOENT)
-			continue;               /* named by a log op, since gone */
-		if (rc != TESSERA_OK) {
-			why = "directory inode unreadable";
+
+	/* 4. Namespace walk. */
+	while (why == NULL) {
+		if (tmp_->legacy_sweep_abort) {
+			why = "unmount";
 			break;
 		}
-		if ((dino.mode & 0170000) != 0040000)
-			continue;
-		dirs++;
-		if (tessera_hash_is_null(dino.manifest_hash))
-			continue;               /* no manifest, no children */
-		rc = tessera_fs_dir_walk(tmp_, dino.manifest_hash,
-		    tessera_legacy_sweep_cb, &ls);
+		mtx_lock(&ls->lock);
+		if (ls->sp == 0) {
+			mtx_unlock(&ls->lock);
+			break;
+		}
+		uint32_t d = ls->stack[--ls->sp];
+		mtx_unlock(&ls->lock);
+		int rc = TESSERA_OK;
+		for (int attempt = 0; attempt < 2; attempt++) {
+			tessera_inode_record_t dino;
+			rc = tessera_fs_inode_get(tmp_, d, &dino);
+			if (rc == TESSERA_ENOENT) {
+				rc = TESSERA_OK; /* removed since: no names */
+				break;
+			}
+			if (rc != TESSERA_OK)
+				break;
+			if ((dino.mode & 0170000) != 0040000 ||
+			    tessera_hash_is_null(dino.manifest_hash))
+				break;
+			if (attempt == 0)
+				dirs++;
+			/* Re-marking on the retry is harmless: marks are
+			 * idempotent. */
+			rc = tessera_fs_dir_walk(tmp_, dino.manifest_hash,
+			    tessera_legacy_sweep_cb, ls);
+			if (rc == 0)
+				break;
+			retried++;       /* republished mid-walk? re-read */
+		}
 		if (rc != 0) {
 			printf("tessera_fs: legacy orphan sweep: directory "
 			    "inode %u unreadable (%d)\n", (unsigned)d, rc);
 			why = "a directory could not be walked";
 			break;
 		}
+		if (tessera_fault_legacy_sweep_dir_delay_ms > 0)
+			pause("tlswdly", MAX(1,
+			    hz * tessera_fault_legacy_sweep_dir_delay_ms / 1000));
+		if (dirs == 1 && tessera_fault_legacy_sweep_pause) {
+			tessera_stat_legacy_sweep_paused = 1;
+			for (int w = 0; w < 1200 &&
+			    tessera_fault_legacy_sweep_pause &&
+			    !tmp_->legacy_sweep_abort; w++)
+				pause("tlswpau", hz / 10);
+			tessera_stat_legacy_sweep_paused = 0;
+		}
 	}
-
 	if (why == NULL && dirs == 0)
 		why = "namespace walk reached no directory";
+	if (why == NULL && ls->overflow)
+		why = "walk queue overflow";
 
-	/* 4. Free unreachable nlink=0 records. */
+	/* 5. Free unreachable, unflagged nlink=0 records. The barrier stays
+	 * armed through this phase. */
 	uint32_t shown = 0;
 	char list[128];
 	int lo = 0;
 	list[0] = '\0';
 	for (uint32_t i = 0; i < nc && why == NULL; i++) {
+		if (tmp_->legacy_sweep_abort) {
+			why = "unmount";
+			break;
+		}
 		uint32_t n = cand[i];
-		if (_LS_TEST(ls.reach, n)) {
+		mtx_lock(&ls->lock);
+		int reached = _LS_TEST(ls->reach, n);
+		mtx_unlock(&ls->lock);
+		if (reached) {
 			kept++;
 			continue;
 		}
 		tessera_inode_record_t live;
 		if (tessera_fs_inode_get(tmp_, n, &live) != TESSERA_OK ||
-		    live.nlink != 0)
-			continue;       /* duplicate (tree + overlay), or gone */
+		    live.nlink != 0 ||
+		    (live.flags & TESSERA_INODE_FLAG_UNLINKED) != 0)
+			continue;       /* duplicate, gone, relinked, or now
+			                 * owned by vop_inactive */
 		found++;
 		if (shown < 8 && lo < (int)sizeof(list) - 12) {
 			lo += snprintf(list + lo, sizeof(list) - lo, " %u",
@@ -6687,39 +6886,69 @@ tessera_fs_sweep_legacy_orphans(struct tessera_mount *tmp_)
 			freed++;
 	}
 
+	mtx_lock(&tmp_->legacy_sweep_mtx);
+	tmp_->legacy_sweep = NULL;
+	mtx_unlock(&tmp_->legacy_sweep_mtx);
+
 	unsigned long ms = (unsigned long)((sbinuptime() - t0) / SBT_1MS);
 	if (ms > tessera_stat_legacy_sweep_ms)
 		tessera_stat_legacy_sweep_ms = ms;
 	if (why != NULL) {
 		tessera_stat_legacy_sweep_aborted++;
 		printf("tessera_fs: legacy orphan sweep ABANDONED (%s) after "
-		    "%ju records, %ju dirs, %lu ms — nothing freed; it retries "
-		    "next mount (fsck --repair frees them offline)\n", why,
-		    (uintmax_t)records, (uintmax_t)dirs, ms);
+		    "%ju records, %ju dirs, %lu ms — %u freed before it "
+		    "stopped; it retries next mount (fsck --repair frees them "
+		    "offline)\n", why, (uintmax_t)records, (uintmax_t)dirs, ms,
+		    freed);
 	} else {
-		tessera_stat_legacy_orphans_found += found;
-		tessera_stat_legacy_orphans_freed += freed;
-		tessera_stat_legacy_nlink0_kept += kept;
 		if (mode >= 2) {
+			tessera_fs_flush_gate_enter(tmp_);
 			tmp_->sb.feature_flags |= TESSERA_FEATURE_UNLINKED_FLAG;
 			tmp_->sb_dirty = 1;
+			tessera_fs_flush_gate_exit(tmp_);
 		}
 		printf("tessera_fs: legacy orphan sweep%s: %ju records, %ju "
 		    "dirs walked, %u unreachable nlink=0 (%u freed)%s%s, %u "
-		    "reachable nlink=0 kept, %u dirents past next_inode_no, "
-		    "%lu ms\n", mode >= 2 ? "" : " (REPORT ONLY)",
+		    "reachable nlink=0 kept, %u names past the walk's inode range, %u "
+		    "re-read, %lu ms\n", mode >= 2 ? "" : " (REPORT ONLY)",
 		    (uintmax_t)records, (uintmax_t)dirs, found, freed,
-		    found ? " ino:" : "", list, kept, ls.beyond, ms);
+		    found ? " ino:" : "", list, kept, ls->beyond, retried, ms);
 	}
+	tessera_stat_legacy_orphans_found += found;
+	tessera_stat_legacy_orphans_freed += freed;
+	tessera_stat_legacy_nlink0_kept += kept;
+	if (freed > 0 || (why == NULL && mode >= 2))
+		tessera_fs_mark_dirty(tmp_);
+	tessera_stat_legacy_sweeps_done++;
 	free(ov, M_TESSERA);
 	free(cand, M_TESSERA);
-	free(ls.stack, M_TESSERA);
-	free(ls.reach, M_TESSERA);
-	free(ls.isdir, M_TESSERA);
-	return (why == NULL ? (int)freed : 0);
+	free(ls->stack, M_TESSERA);
+	free(ls->reach, M_TESSERA);
+	free(ls->isdir, M_TESSERA);
+	mtx_destroy(&ls->lock);
+	free(ls, M_TESSERA);
 }
 #undef _LS_TEST
 #undef _LS_SET
+
+/* Queue the sweep if this volume still needs one. Mount / ro->rw only. */
+static void
+tessera_fs_legacy_sweep_kick(struct tessera_mount *tmp_)
+{
+	if (tessera_legacy_orphan_sweep == 0 ||
+	    (tmp_->sb.feature_flags & TESSERA_FEATURE_UNLINKED_FLAG))
+		return;
+	if (!tmp_->legacy_tq_init) {
+		TASK_INIT(&tmp_->legacy_task, 0, tessera_fs_legacy_sweep_task,
+		    tmp_);
+		tmp_->legacy_tq = taskqueue_create("tessera_lsweep", M_WAITOK,
+		    taskqueue_thread_enqueue, &tmp_->legacy_tq);
+		(void)taskqueue_start_threads(&tmp_->legacy_tq, 1, PRIBIO + 8,
+		    "tesslsweep");
+		tmp_->legacy_tq_init = 1;
+	}
+	(void)taskqueue_enqueue(tmp_->legacy_tq, &tmp_->legacy_task);
+}
 
 /* Full read-write journal bring-up: open + FULL replay (roots + redo) + persist
  * the rolled-forward SB + wire the deferred io. Requires device write access.
@@ -7012,6 +7241,7 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	tmp_->multi_extent_pack_count = 0;
 	mtx_init(&tmp_->flush_mtx, "tess_flush", NULL, MTX_DEF);
 	tmp_->flush_mtx_init = 1;
+	mtx_init(&tmp_->legacy_sweep_mtx, "tess_lsweep", NULL, MTX_DEF);
 	tmp_->flush_co_init = 1;
 	for (uint32_t _b = 0; _b < TESSERA_DIRTY_INODE_BUCKETS; _b++)
 		LIST_INIT(&tmp_->dirty_inodes[_b]);
@@ -7234,7 +7464,6 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	}
 	if (requested_gen == 0 && !ronly && !tmp_->readonly_snapshot) {
 		(void)tessera_fs_reap_unlinked(tmp_);
-		(void)tessera_fs_sweep_legacy_orphans(tmp_);
 	}
 
 	/* Quota domains (tessera-quotas.md). Load the persisted table from
@@ -7439,6 +7668,8 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 	 * machinery (matches the GC gate above). */
 	if (tmp_->pinscan_tq_init && !ronly)
 		(void)taskqueue_enqueue(tmp_->pinscan_tq, &tmp_->pinscan_task);
+	if (!ronly && !tmp_->readonly_snapshot && requested_gen == 0)
+		tessera_fs_legacy_sweep_kick(tmp_);
 
 	mp->mnt_data = tmp_;
 	/* B1 test hook: stash the most-recently-mounted tessera in a
@@ -7680,11 +7911,7 @@ tessera_mount_impl(struct mount *mp)
 				 * fall-through flush below drains the redo overlay to
 				 * disk so the recovery is durable. */
 				tessera_fs_journal_setup(tmp_);
-				/* Orphan recovery walks the namespace, so it runs
-				 * while MNT_RDONLY still refuses every namespace
-				 * op — no rename can move an entry mid-walk. */
 				(void)tessera_fs_reap_unlinked(tmp_);
-				(void)tessera_fs_sweep_legacy_orphans(tmp_);
 				/* Clear MNT_RDONLY ourselves — the generic mount
 				 * code leaves the flag to the fs (FFS does the same
 				 * in its MNT_UPDATE handler). Without this the mount
@@ -7693,6 +7920,7 @@ tessera_mount_impl(struct mount *mp)
 				MNT_ILOCK(mp);
 				mp->mnt_flag &= ~MNT_RDONLY;
 				MNT_IUNLOCK(mp);
+				tessera_fs_legacy_sweep_kick(tmp_);
 				/* Arm the journal-log group-commit callout the ro
 				 * mount left unarmed, so dirent-op durability now
 				 * matches a from-the-start rw mount. */
@@ -7933,6 +8161,14 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 		/* Task #33: stop the background pinscan first — it holds
 		 * private btree handles over meta_bio and takes the gate;
 		 * both must still exist while it drains. */
+		/* The legacy sweep reads trees and deletes inode records:
+		 * stop it before anything it uses goes away. */
+		if (tmp_->legacy_tq_init) {
+			tmp_->legacy_sweep_abort = 1;
+			taskqueue_drain(tmp_->legacy_tq, &tmp_->legacy_task);
+			taskqueue_free(tmp_->legacy_tq);
+			tmp_->legacy_tq_init = 0;
+		}
 		if (tmp_->pinscan_tq_init) {
 			tmp_->pinscan_abort = 1;
 			taskqueue_drain(tmp_->pinscan_tq, &tmp_->pinscan_task);
@@ -8192,6 +8428,7 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 		}
 		if (tmp_->flush_mtx_init) {
 			mtx_destroy(&tmp_->flush_mtx);
+			mtx_destroy(&tmp_->legacy_sweep_mtx);
 			tmp_->flush_mtx_init = 0;
 		}
 		if (tmp_->journal != NULL)
@@ -30176,6 +30413,10 @@ tessera_vop_rename(struct vop_rename_args *ap)
 		}
 	}
 	if (err != 0) goto release;
+
+	/* Legacy orphan sweep barrier: the move may have taken a name out of
+	 * a directory the sweep has not read into one it has. */
+	tessera_fs_legacy_sweep_note(tmp_, fn->inode_no, fvp->v_type == VDIR);
 
 	/* Namecache: the source moved away from fdvp/fromname, and any
 	 * clobbered target is unlinked — purge both so stale (parent,name)->vp
