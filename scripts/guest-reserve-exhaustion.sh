@@ -233,6 +233,11 @@ crash_stale_lines() {
 }
 
 crash_status() {
+    # Inodes whose tombstone deletes were failing just before the cut —
+    # compared with the orphans fsck finds after it.
+    dmesg | sed -n 's/.*btree_delete inode_no=\([0-9]*\) failed.*/\1/p' | sort -un > /root/rx.tomb_failed
+    cp /root/rx.tomb_failed /root/rx.tomb_failed.keep 2>/dev/null
+
     echo "band_refusals=$(( $(S meta_band_refusals) - $(cat $RUN/b0 2>/dev/null || echo 0) )) drain_failed=$(dmesg | grep -c 'drain failed') commit_extent_failed=$(S commit_extent_failed) preflight_scans=$(dmesg | grep -c 'preflight') stale_live=$(dmesg | grep -c STALE)"
 }
 
@@ -247,7 +252,7 @@ crash_verify() {
         echo "fsck_problems=$(grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem|stale|invalid|bad' $RUN/fsck)"
         return
     fi
-    echo "mount_ok=1"
+    echo "mount_ok=1 unlinked_reaped=$(S unlinked_reaped)"
     walk_err=$(find $M -type f 2>&1 >/dev/null | wc -l | tr -d ' ')
     files=$(find $M -type f 2>/dev/null | wc -l | tr -d ' ')
     keep_bad=0
@@ -265,8 +270,14 @@ crash_verify() {
         tessera-fsck $PART > $RUN/fsck 2>&1
         echo "fsck_problems=$(grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem' $RUN/fsck)"
         grep -iE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem' $RUN/fsck | sed -E 's/[0-9]{3,}/N/g' | sort | uniq -c | sort -rn | head -5 | sed 's/^/  fsck: /'
+        orph=$(sed -n 's/.*orphan inode \([0-9]*\).*/\1/p' $RUN/fsck | sort -un | tr '\n' ' ')
+        if [ -n "$orph" ]; then
+            hit=0; for o in $orph; do grep -qx "$o" /root/rx.tomb_failed.keep 2>/dev/null && hit=$((hit+1)); done
+            echo "orphans=$orph tomb_failed_before_cut=$(wc -l < /root/rx.tomb_failed.keep 2>/dev/null | tr -d ' ') orphans_with_failed_tombstone=$hit"
+            grep -E "inode ($(echo $orph | tr ' ' '|'))\b|orphan inode" $RUN/fsck | head -6 | sed 's/^/  fsck-detail: /'
+        fi
     fi
-    gpart destroy -F $DISK >/dev/null 2>&1; rm -f /root/rx.keep.sha
+    gpart destroy -F $DISK >/dev/null 2>&1; rm -f /root/rx.keep.sha /root/rx.tomb_failed.keep
 }
 
 case "${1:-}" in

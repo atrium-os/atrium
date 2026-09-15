@@ -615,6 +615,12 @@ typedef struct TESSERA_PACKED {
  * the walk's verify mode fetches anyway and counts lies. Absent = unknown =
  * fetch (every pre-existing record). */
 #define TESSERA_INODE_FLAG_MFT_LEAF    (1u << 5)
+/* The record's last name was removed (nlink went to 0 through unlink, rmdir
+ * or rename-over) and it survives only until its last reference closes.
+ * Persisted so a crash in that window leaves an orphan recovery can tell
+ * apart from a record whose nlink is merely unset: a writable mount deletes
+ * nlink==0 records carrying this flag (tessera_fs_reap_unlinked). */
+#define TESSERA_INODE_FLAG_UNLINKED    (1u << 6)
 
 /* ── B+tree node header (64 bytes) ─────────────────────────────────
  *

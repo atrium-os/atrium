@@ -1460,6 +1460,19 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, create_rollback, CTLFLAG_RD,
 /* ★ #80: dirent ops still queued when the mount was torn down. Each one is
  * a namespace change that never reached disk while its inode side may have
  * committed — i.e. a silently-produced orphan or dangling dirent. */
+static unsigned long tessera_stat_unlinked_reaped = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, unlinked_reaped, CTLFLAG_RD,
+    &tessera_stat_unlinked_reaped, 0,
+    "unlinked (nlink=0) inode records left by a crash before their last "
+    "close, freed when the volume went writable");
+static unsigned long tessera_stat_unlinked_reap_records = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, unlinked_reap_records, CTLFLAG_RD,
+    &tessera_stat_unlinked_reap_records, 0,
+    "inode records walked by the largest unlinked-orphan reap since load");
+static unsigned long tessera_stat_unlinked_reap_ms = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, unlinked_reap_ms, CTLFLAG_RD,
+    &tessera_stat_unlinked_reap_ms, 0,
+    "duration of the largest unlinked-orphan reap walk since load (ms)");
 static unsigned long tessera_stat_dirent_lost_unmount = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, dirent_lost_unmount, CTLFLAG_RD,
     &tessera_stat_dirent_lost_unmount, 0,
@@ -6241,6 +6254,138 @@ tessera_fs_journal_wire_deferred(struct tessera_mount *tmp_)
 	    &tmp_->journal_bio_deferred);
 }
 
+/*
+ * Free the inode records a crash stranded between unlink and last close.
+ *
+ * vop_remove / rmdir / rename keep the victim's record at nlink=0 so a live
+ * reference stays usable (POSIX), and vop_inactive deletes it at last close.
+ * Power loss in between leaves a durable record no name reaches and no
+ * reference will ever close — it pins its manifest and data packs forever.
+ * This is the recovery the design always assumed and never had.
+ *
+ * Runs once per transition to writable, after the full redo replay (so the
+ * overlay holds every replayed unlink): at a rw mount before mnt_data is
+ * published, and at the ro->rw upgrade. Neither can have a reference to such
+ * a record: a read-only mount cannot unlink, and a record at nlink=0 has no
+ * name to look up.
+ *
+ * SAFE BY CONSTRUCTION: only records with nlink == 0 AND
+ * TESSERA_INODE_FLAG_UNLINKED, re-checked through the overlay-aware
+ * inode_get just before the delete. A record whose nlink is merely unset
+ * (legacy seeding — getattr's `nlink ? nlink : 2`) never carries the flag,
+ * so it is left alone; fsck --repair remains the tool for those.
+ *
+ * The walk holds the flush gate (it reads the committed tree); the deletes
+ * only queue tombstones in the overlay and leave sb_dirty set, so the next
+ * flush commits them. Returns the number freed.
+ */
+static int
+tessera_fs_reap_unlinked(struct tessera_mount *tmp_)
+{
+	if (tmp_->inode_tree == NULL || !tmp_->dirty_init)
+		return (0);
+	uint32_t cap = 256, n = 0;
+	uint32_t *cand = malloc(cap * sizeof *cand, M_TESSERA, M_WAITOK);
+	int walk_err = 0;
+	uint64_t records = 0;
+	sbintime_t t0 = sbinuptime();
+
+	tessera_fs_flush_gate_enter(tmp_);
+	tessera_btree_cursor_t *c = tessera_btree_seek_first(tmp_->inode_tree);
+	while (c != NULL) {
+		uint8_t k[4];
+		tessera_inode_record_t ino;
+		int rc = tessera_btree_cursor_get(c, k, &ino);
+		if (rc != TESSERA_OK) {
+			walk_err = (rc != TESSERA_ENOENT);
+			break;
+		}
+		records++;
+		if (ino.nlink == 0 &&
+		    (ino.flags & TESSERA_INODE_FLAG_UNLINKED) != 0) {
+			if (n == cap) {
+				uint32_t *g = malloc(cap * 2 * sizeof *g,
+				    M_TESSERA, M_WAITOK);
+				memcpy(g, cand, n * sizeof *g);
+				free(cand, M_TESSERA);
+				cand = g;
+				cap *= 2;
+			}
+			cand[n++] = ((uint32_t)k[0] << 24) |
+			    ((uint32_t)k[1] << 16) | ((uint32_t)k[2] << 8) |
+			    (uint32_t)k[3];
+		}
+		rc = tessera_btree_cursor_next(c);
+		if (rc != TESSERA_OK) {
+			walk_err = (rc != TESSERA_ENOENT);
+			break;
+		}
+	}
+	if (c != NULL)
+		tessera_btree_cursor_free(c);
+	tessera_fs_flush_gate_exit(tmp_);
+
+	/* Replayed unlinks that live only in the overlay so far. Collected
+	 * under flush_mtx (no malloc there): count first, then copy. */
+	for (int pass = 0; pass < 2; pass++) {
+		uint32_t extra = 0;
+		mtx_lock(&tmp_->flush_mtx);
+		for (uint32_t b = 0; b < TESSERA_DIRTY_INODE_BUCKETS; b++) {
+			struct tessera_dirty_inode *e;
+			LIST_FOREACH(e, &tmp_->dirty_inodes[b], link) {
+				if (e->tombstone || e->rec.nlink != 0 ||
+				    (e->rec.flags & TESSERA_INODE_FLAG_UNLINKED)
+				    == 0)
+					continue;
+				if (pass == 1 && n < cap)
+					cand[n++] = e->inode_no;
+				extra++;
+			}
+		}
+		mtx_unlock(&tmp_->flush_mtx);
+		if (pass == 0) {
+			uint32_t *g = malloc((n + extra + 1) * sizeof *g,
+			    M_TESSERA, M_WAITOK);
+			memcpy(g, cand, n * sizeof *g);
+			free(cand, M_TESSERA);
+			cand = g;
+			cap = n + extra + 1;
+		}
+	}
+
+	int freed = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		/* Duplicates (tree + overlay) and a record already
+		 * tombstoned fall out here: inode_get says ENOENT. */
+		tessera_inode_record_t live;
+		if (tessera_fs_inode_get(tmp_, cand[i], &live) != TESSERA_OK)
+			continue;
+		if (live.nlink != 0 ||
+		    (live.flags & TESSERA_INODE_FLAG_UNLINKED) == 0)
+			continue;
+		if (tessera_fs_inode_delete(tmp_, cand[i]) == TESSERA_OK)
+			freed++;
+	}
+	free(cand, M_TESSERA);
+	if ((unsigned long)records >= tessera_stat_unlinked_reap_records) {
+		tessera_stat_unlinked_reap_ms =
+		    (unsigned long)((sbinuptime() - t0) / SBT_1MS);
+		tessera_stat_unlinked_reap_records = (unsigned long)records;
+	}
+	if (freed > 0) {
+		tmp_->sb_dirty = 1;
+		tessera_stat_unlinked_reaped += (unsigned long)freed;
+	}
+	if (freed > 0 || walk_err)
+		printf("tessera_fs: freed %d unlinked inode record(s) left "
+		    "by a crash before last close (%ju records scanned in "
+		    "%ju ms)%s\n", freed, (uintmax_t)records,
+		    (uintmax_t)((sbinuptime() - t0) / SBT_1MS),
+		    walk_err ? " — inode walk FAILED part-way; the rest "
+		    "are left for the next mount or fsck --repair" : "");
+	return (freed);
+}
+
 /* Full read-write journal bring-up: open + FULL replay (roots + redo) + persist
  * the rolled-forward SB + wire the deferred io. Requires device write access.
  * Used by a from-the-start rw mount and by the ro->rw upgrade — in the latter
@@ -6752,6 +6897,8 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		(void)tessera_fs_journal_replay(tmp_, /*roots_only=*/0);
 		tessera_fs_journal_wire_deferred(tmp_);
 	}
+	if (requested_gen == 0 && !ronly && !tmp_->readonly_snapshot)
+		(void)tessera_fs_reap_unlinked(tmp_);
 
 	/* Quota domains (tessera-quotas.md). Load the persisted table from
 	 * the on-disk quota tree (0 = none yet; lazy-created on first flush
@@ -7204,6 +7351,7 @@ tessera_mount_impl(struct mount *mp)
 				 * fall-through flush below drains the redo overlay to
 				 * disk so the recovery is durable. */
 				tessera_fs_journal_setup(tmp_);
+				(void)tessera_fs_reap_unlinked(tmp_);
 				/* Arm the journal-log group-commit callout the ro
 				 * mount left unarmed, so dirent-op durability now
 				 * matches a from-the-start rw mount. */
@@ -10808,8 +10956,9 @@ tessera_vop_reclaim(struct vop_reclaim_args *ap)
  *     misread as orphans;
  *   - on-disk nlink == 0: protects hardlinks (unlink of one name leaves
  *     nlink >= 1 — the file lives on).
- * A crash between unlink and last close leaves an nlink=0 orphan record;
- * fsck/recovery frees those (they are never reachable by name).
+ * A crash between unlink and last close leaves an nlink=0 orphan record
+ * flagged UNLINKED; the next writable mount frees it
+ * (tessera_fs_reap_unlinked) — it is never reachable by name.
  */
 static int
 tessera_vop_inactive(struct vop_inactive_args *ap)
@@ -10824,8 +10973,8 @@ tessera_vop_inactive(struct vop_inactive_args *ap)
 	struct tessera_mount *tmp_ = VFSTOTESSERA(vp->v_mount);
 	if (tmp_ == NULL || tmp_->inode_tree == NULL)
 		return (0);
-	/* Read-only mount can't delete; the orphan is freed by recovery on
-	 * the next writable mount. */
+	/* Read-only mount can't delete; the orphan is freed by
+	 * tessera_fs_reap_unlinked when the volume next goes writable. */
 	if (tessera_vop_rdonly(vp))
 		return (0);
 
@@ -29322,8 +29471,10 @@ tessera_fs_inode_unlink(struct tessera_mount *tmp_, uint32_t inode_no)
 	 * the last close. Keep the inode record with nlink=0 (detached from
 	 * the namespace, invisible to lookup); tessera_vop_inactive deletes
 	 * it when the last reference drops. A crash before that leaves an
-	 * nlink=0 orphan for fsck/recovery to free. */
+	 * nlink=0 orphan, which the next writable mount reaps
+	 * (tessera_fs_reap_unlinked) — the flag is how it recognises one. */
 	ino.nlink = 0;
+	ino.flags |= TESSERA_INODE_FLAG_UNLINKED;
 	{
 		struct timeval tv;
 		getmicrotime(&tv);
@@ -29376,6 +29527,7 @@ tessera_fs_inode_detach_dir(struct tessera_mount *tmp_, uint32_t inode_no)
 	if (tessera_fs_inode_get_byk(tmp_, key, &ino) != TESSERA_OK)
 		return (EIO);
 	ino.nlink = 0;
+	ino.flags |= TESSERA_INODE_FLAG_UNLINKED;
 	{
 		struct timeval tv;
 		getmicrotime(&tv);
