@@ -133,6 +133,11 @@ int tessera_volume_commit_roots(tessera_volume_t *v,
                                            * the dead-extent tree. Only
                                            * tessera-fsck --repair sets it, to
                                            * clear a root proven STALE. */
+#define TESSERA_COMMIT_FEATURE_UNLINKED 0x4u  /* set TESSERA_FEATURE_UNLINKED_FLAG:
+                                           * the caller has freed every
+                                           * unflagged nlink=0 orphan, so the
+                                           * kmod's one-time legacy sweep is
+                                           * no longer needed. */
 #define TESSERA_COMMIT_BUMP_EXACT  0x1u   /* set bump to roots->meta_reserve_bump
                                            * exactly, permitting it to LOWER —
                                            * for tessera-repack, which compacts
@@ -169,6 +174,7 @@ uint8_t         tessera_volume_active_slot_count  (const tessera_volume_t *);
 uint64_t        tessera_volume_quota_tree_root    (const tessera_volume_t *);
 uint64_t        tessera_volume_next_inode_no       (const tessera_volume_t *);
 uint64_t        tessera_volume_blob_index_root      (const tessera_volume_t *);
+uint32_t        tessera_volume_feature_flags        (const tessera_volume_t *);
 uint64_t        tessera_volume_dead_extent_root     (const tessera_volume_t *);
 
 #ifdef __cplusplus

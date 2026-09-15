@@ -103,6 +103,14 @@ pub const TESSERA_COMMIT_BUMP_EXACT: u32 = 0x1;
 /// doing nothing. tessera-fsck --repair sets it to CLEAR a stale root.
 pub const TESSERA_COMMIT_DEAD_EXTENT: u32 = 0x2;
 
+/// commit_roots_ex flag: set TESSERA_FEATURE_UNLINKED_FLAG. tessera-fsck
+/// --repair passes it once a complete pass has freed every nlink=0 orphan.
+pub const TESSERA_COMMIT_FEATURE_UNLINKED: u32 = 0x4;
+/// sb.feature_flags bit: every nlink=0 record carries TESSERA_INODE_FLAG_UNLINKED.
+pub const TESSERA_FEATURE_UNLINKED_FLAG: u32 = 1 << 3;
+/// Inode flag: last name removed, record kept until last close.
+pub const TESSERA_INODE_FLAG_UNLINKED: u32 = 1 << 6;
+
 /* ── B+tree ──────────────────────────────────────────────────── */
 
 #[repr(C)]
@@ -501,6 +509,7 @@ extern "C" {
     pub fn tessera_volume_quota_tree_root    (v: *const tessera_volume_t) -> u64;
     pub fn tessera_volume_next_inode_no      (v: *const tessera_volume_t) -> u64;
     pub fn tessera_volume_blob_index_root    (v: *const tessera_volume_t) -> u64;
+    pub fn tessera_volume_feature_flags      (v: *const tessera_volume_t) -> u32;
     /// Root of the dead-extent log (§20.2 / #114). 0 = the volume has never
     /// taken a deferred duplicate append. Every extent it names is ALLOCATED
     /// but deliberately absent from the pack registry, so any checker that

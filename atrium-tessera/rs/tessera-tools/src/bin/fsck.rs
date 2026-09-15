@@ -148,6 +148,10 @@ struct Fsck {
     // live inodes not reachable from the root dir. --repair relinks each
     // into /lost+found as "inode_<n>".
     orphans: Vec<u32>,
+    // nlink==0 records carrying TESSERA_INODE_FLAG_UNLINKED: unlinked while
+    // still open when the volume last went down. Benign when unreachable —
+    // the kmod frees them at the next writable mount.
+    unlinked_flagged: HashSet<u32>,
     /// Inodes whose OWN manifest blob is missing from every pack. The
     /// directory listing / file content is unrecoverable, so repair resets
     /// them to empty (a valid, mountable state) and lets the next pass
@@ -562,6 +566,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
     let blob_index_root = unsafe { tessera_volume_blob_index_root(v) };
     let snapshots_root = unsafe { tessera_volume_snapshots_root(v) };
     let next_inode_no = unsafe { tessera_volume_next_inode_no(v) };
+    let feature_flags = unsafe { tessera_volume_feature_flags(v) };
     let mr_start = unsafe { tessera_volume_meta_reserve_start(v) };
     let mr_len = unsafe { tessera_volume_meta_reserve_length(v) };
     let mr_bump = unsafe { tessera_volume_meta_reserve_bump(v) };
@@ -600,6 +605,7 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
         stale_rebuild: Vec::new(),
         dangling_dirents: Vec::new(),
         orphans: Vec::new(),
+        unlinked_flagged: HashSet::new(),
         dangling_manifests: Vec::new(),
         current_snapshot: None,
         snapshot_problems: BTreeMap::new(),
@@ -956,7 +962,12 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
                 let xattr = rd_hash(&val, 104);
 
                 if nlink == 0 {
-                    fsck.problem(format!("inode {ino}: nlink == 0 (live record with no links)"));
+                    if rd_u32(&val, 68) & TESSERA_INODE_FLAG_UNLINKED != 0 {
+                        // Judged in Pass C: benign if no name reaches it.
+                        fsck.unlinked_flagged.insert(ino);
+                    } else {
+                        fsck.problem(format!("inode {ino}: nlink == 0 (live record with no links)"));
+                    }
                 }
                 if mode & S_IFMT == 0 {
                     fsck.problem(format!("inode {ino}: mode 0o{mode:o} has no S_IFMT type bits"));
@@ -1193,8 +1204,29 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
         let mut orphans: Vec<u32> = fsck.inode_map.keys().copied()
             .filter(|k| !reachable.contains(k)).collect();
         orphans.sort_unstable();
+        let mut pending_unlinked = 0usize;
         for o in &orphans {
-            fsck.problem(format!("orphan inode {o} (not reachable from the root dir)"));
+            if fsck.unlinked_flagged.contains(o) {
+                pending_unlinked += 1;
+            } else {
+                fsck.problem(format!("orphan inode {o} (not reachable from the root dir)"));
+            }
+        }
+        if pending_unlinked > 0 {
+            fsck.notes.push(format!(
+                "{pending_unlinked} record(s) were unlinked while still open when the volume \
+                 went down — the next writable mount frees them (tessera_fs_reap_unlinked); \
+                 not damage"));
+        }
+        // Flagged as unlinked, yet a directory still names it: the flag
+        // would let the mount-time reaper free a live file.
+        let mut named_unlinked: Vec<u32> = fsck.unlinked_flagged.iter().copied()
+            .filter(|i| reachable.contains(i)).collect();
+        named_unlinked.sort_unstable();
+        for i in named_unlinked {
+            fsck.problem(format!("inode {i}: nlink == 0 and flagged unlinked, but a directory \
+                                  entry still names it — the next writable mount would free a \
+                                  reachable file"));
         }
         fsck.orphans = orphans.clone();
 
@@ -1543,6 +1575,11 @@ fn run(path: &str, verbose: bool, repair: bool, repair_budget: u32)
         println!("  snapshots:    {} retained ({} inodes walked)",
             fsck.snapshots, fsck.snapshot_inodes);
     }
+    if feature_flags & TESSERA_FEATURE_UNLINKED_FLAG == 0 {
+        fsck.notes.push("written by a kmod older than the UNLINKED inode flag: the next \
+                         writable mount runs a one-time background sweep for unflagged \
+                         crash orphans (a complete --repair pass makes it unnecessary)".into());
+    }
     for n in &fsck.notes {
         println!("  NOTE: {n}");
     }
@@ -1655,7 +1692,14 @@ filesystem, and this tool will not do that. Restore from backup.");
     };
     // The dead-extent root is preserved unless we explicitly opt in, so ask
     // for it only when this run actually proved that root stale.
-    let cflags = if clear_dead_extent { TESSERA_COMMIT_DEAD_EXTENT } else { 0 };
+    let mut cflags = if clear_dead_extent { TESSERA_COMMIT_DEAD_EXTENT } else { 0 };
+    // A complete pass freed every unreachable nlink=0 record, flagged or
+    // not, so the kmod's one-time legacy sweep has nothing left to find.
+    // A capped pass may not have reached them all.
+    if feature_flags & TESSERA_FEATURE_UNLINKED_FLAG == 0 && !truncated {
+        cflags |= TESSERA_COMMIT_FEATURE_UNLINKED;
+        println!("  feature: setting UNLINKED_FLAG (no legacy orphan sweep needed)");
+    }
     let rc = unsafe { tessera_volume_commit_roots_ex(v, &commit, cflags) };
     if rc == 0 {
         // #137: the new superblock is sealed — drop the ring that still

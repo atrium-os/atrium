@@ -656,6 +656,8 @@ tessera_volume_commit_roots_ex(tessera_volume_t *v,
 	 * reserve sectors for the rewritten trees); never let it regress.
 	 * With TESSERA_COMMIT_BUMP_EXACT (repack) set it exactly — repack
 	 * compacts the reserve and legitimately LOWERS the bump. */
+	if (flags & TESSERA_COMMIT_FEATURE_UNLINKED)
+		sb.feature_flags |= TESSERA_FEATURE_UNLINKED_FLAG;
 	if (flags & TESSERA_COMMIT_BUMP_EXACT)
 		sb.meta_reserve_bump = roots->meta_reserve_bump;
 	else if (roots->meta_reserve_bump > sb.meta_reserve_bump)
@@ -787,6 +789,9 @@ uint64_t tessera_volume_next_inode_no(const tessera_volume_t *v)
 
 uint64_t tessera_volume_blob_index_root(const tessera_volume_t *v)
 { return v ? v->sb.blob_index_root : 0; }
+
+uint32_t tessera_volume_feature_flags(const tessera_volume_t *v)
+{ return v ? v->sb.feature_flags : 0; }
 
 /* Root of the dead-extent log (§20.2 / #114). 0 = this volume has never taken a
  * deferred duplicate append. fsck MUST consult it: every extent it names is
