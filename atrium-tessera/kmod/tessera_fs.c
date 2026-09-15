@@ -6482,6 +6482,35 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, fault_legacy_sweep_pause, CTLFLAG_RW,
     &tessera_fault_legacy_sweep_pause, 0,
     "TEST ONLY: nonzero holds the legacy orphan sweep after it has walked "
     "the root directory (up to 120 s) — the window for a rename race");
+/* The sweep is a one-time job that competes with boot (rc scripts, sshd)
+ * for the same disk: at 100% it took 34 s of boot on the dev root and pushed
+ * ssh-up from 20 s to 51 s. It sleeps in proportion to its own busy time so
+ * it holds at most this share of wall time. */
+static int tessera_legacy_sweep_duty_pct = 25;
+SYSCTL_INT(_kern_tessera, OID_AUTO, legacy_sweep_duty_pct, CTLFLAG_RWTUN,
+    &tessera_legacy_sweep_duty_pct, 0,
+    "share of wall time the one-time legacy orphan sweep may use (1-100; "
+    "100 = unthrottled)");
+
+/* Sleep off the debt `busy` time accrued at the configured duty. Debt below
+ * 10 ms is carried, so per-directory walks of a few µs don't each pay a
+ * sleep's overhead. One sleep is capped at 1 s and the REST IS CARRIED:
+ * zeroing it (the first version) ran the sweep at ~68% while the knob said
+ * 25% — 36.8 s working in 53.7 s. */
+static void
+tessera_legacy_sweep_yield(sbintime_t *debt, sbintime_t busy)
+{
+	int duty = tessera_legacy_sweep_duty_pct;
+	if (duty >= 100 || duty <= 0)
+		return;
+	*debt += busy * (100 - duty) / duty;
+	if (*debt < 10 * SBT_1MS)
+		return;
+	sbintime_t sl = *debt < SBT_1S ? *debt : SBT_1S;
+	*debt -= sl;
+	(void)pause_sbt("tlswdty", sl, 0, 0);
+}
+
 static int tessera_legacy_sweep_batch = 4096;
 SYSCTL_INT(_kern_tessera, OID_AUTO, legacy_sweep_batch, CTLFLAG_RW,
     &tessera_legacy_sweep_batch, 0,
@@ -6604,6 +6633,7 @@ tessera_fs_legacy_sweep_task(void *arg, int pending)
 	const char *why = NULL;
 	uint64_t records = 0, dirs = 0;
 	uint32_t found = 0, freed = 0, kept = 0, retried = 0;
+	sbintime_t duty_debt = 0, busy_total = 0;
 
 	/* 1. Activate the barrier, THEN snapshot the dirent log and overlay:
 	 * a rename either noted into this sweep or appended before the
@@ -6704,6 +6734,7 @@ tessera_fs_legacy_sweep_task(void *arg, int pending)
 				tessera_btree_cursor_free(c);
 			break;
 		}
+		sbintime_t bt0 = sbinuptime();
 		const int batch = tessera_legacy_sweep_batch > 0 ?
 		    tessera_legacy_sweep_batch : 1;
 		for (int i = 0; i < batch; i++) {
@@ -6749,6 +6780,8 @@ tessera_fs_legacy_sweep_task(void *arg, int pending)
 			}
 		}
 		tessera_btree_cursor_free(c);
+		busy_total += sbinuptime() - bt0;
+		tessera_legacy_sweep_yield(&duty_debt, sbinuptime() - bt0);
 	}
 	if (why == NULL && records == 0)
 		why = "inode tree empty or unreadable";
@@ -6805,6 +6838,7 @@ tessera_fs_legacy_sweep_task(void *arg, int pending)
 		}
 		uint32_t d = ls->stack[--ls->sp];
 		mtx_unlock(&ls->lock);
+		sbintime_t dt0 = sbinuptime();
 		int rc = TESSERA_OK;
 		for (int attempt = 0; attempt < 2; attempt++) {
 			tessera_inode_record_t dino;
@@ -6834,6 +6868,8 @@ tessera_fs_legacy_sweep_task(void *arg, int pending)
 			why = "a directory could not be walked";
 			break;
 		}
+		busy_total += sbinuptime() - dt0;
+		tessera_legacy_sweep_yield(&duty_debt, sbinuptime() - dt0);
 		if (tessera_fault_legacy_sweep_dir_delay_ms > 0)
 			pause("tlswdly", MAX(1,
 			    hz * tessera_fault_legacy_sweep_dir_delay_ms / 1000));
@@ -6910,9 +6946,12 @@ tessera_fs_legacy_sweep_task(void *arg, int pending)
 		printf("tessera_fs: legacy orphan sweep%s: %ju records, %ju "
 		    "dirs walked, %u unreachable nlink=0 (%u freed)%s%s, %u "
 		    "reachable nlink=0 kept, %u names past the walk's inode range, %u "
-		    "re-read, %lu ms\n", mode >= 2 ? "" : " (REPORT ONLY)",
+		    "re-read, %lu ms (%ju ms working, duty %d%%)\n",
+		    mode >= 2 ? "" : " (REPORT ONLY)",
 		    (uintmax_t)records, (uintmax_t)dirs, found, freed,
-		    found ? " ino:" : "", list, kept, ls->beyond, retried, ms);
+		    found ? " ino:" : "", list, kept, ls->beyond, retried, ms,
+		    (uintmax_t)(busy_total / SBT_1MS),
+		    tessera_legacy_sweep_duty_pct);
 	}
 	tessera_stat_legacy_orphans_found += found;
 	tessera_stat_legacy_orphans_freed += freed;
