@@ -3274,6 +3274,16 @@ static unsigned long tessera_stat_pinscan_incomplete = 0;
  * release of frozen-tree blocks. */
 static unsigned long tessera_stat_pinscan_gc_roots_moved = 0;
 /* GC pass-3 apply cost, gated (see tessera_cas_invalidate_packs). */
+static unsigned long tessera_stat_meta_admit_flush_kicks = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, meta_admit_flush_kicks, CTLFLAG_RD,
+    &tessera_stat_meta_admit_flush_kicks, 0,
+    "flushes scheduled by a metadata admission refusal so the preflight "
+    "scan reclaims (see tessera_fs_meta_admit)");
+static unsigned long tessera_stat_commit_extent_failed = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, commit_extent_failed, CTLFLAG_RD,
+    &tessera_stat_commit_extent_failed, 0,
+    "flushes whose free-extent tree could not be written; the commit was "
+    "abandoned (sb stays dirty) instead of committing a stale extent root");
 static unsigned long tessera_stat_gc_apply_ns = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_apply_ns, CTLFLAG_RD,
     &tessera_stat_gc_apply_ns, 0,
@@ -3708,6 +3718,7 @@ struct tessera_mount {
 	 * bump pointer races the reserve ceiling. See
 	 * tessera_meta_pin_bitmap_rebuild. */
 	time_t                    pinscan_last_kick_sec;
+	time_t                    admit_kick_sec;   /* meta_admit flush kick, 1/s */
 	/* #71: when the last scan finished, and how long it took, so the
 	 * next kick can be spaced to hold a duty cycle rather than a rate. */
 	sbintime_t                pinscan_last_end;
@@ -11222,8 +11233,14 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 			if (tessera_quota_store_put(tmp_->quota_tree,
 			    &tmp_->quota_domains[i], &qroot) != TESSERA_OK)
 				qok = 0;
+		/* Mirror the handle even when a put failed: the deletes and
+		 * puts that succeeded already released their superseded nodes
+		 * (see dirty_inodes_drain's write-back). The dirty flag stays
+		 * set, so the whole set is rewritten next commit. */
+		if (tmp_->quota_tree != NULL)
+			tmp_->sb.quota_tree_root =
+			    tessera_btree_root(tmp_->quota_tree);
 		if (qok) {
-			tmp_->sb.quota_tree_root = qroot;
 			tmp_->quota_dirty = 0;
 			tmp_->quota_ndead = 0;
 		}
@@ -12062,7 +12079,21 @@ tessera_fs_dirty_inodes_drain_tombstones(struct tessera_mount *tmp_)
 			mtx_unlock(&tmp_->flush_mtx);
 		}
 	}
-	if (err == 0) tmp_->sb.inode_root = root;
+	/*
+	 * ★ Mirror the handle's root even when some entry failed. Every
+	 * mutation that SUCCEEDED before the failure has already moved the
+	 * handle's root and released the nodes it superseded; a failed one
+	 * moves nothing (core btree frees only on success). Leaving
+	 * sb.inode_root at the pre-drain root after a partial failure made the
+	 * superblock name a tree whose nodes were already freed — and since
+	 * pinscan pins from sb.inode_root, the live tree's newest nodes went
+	 * unpinned and were recycled: inode records "not in inode tree",
+	 * lookups returning another inode's record, and a cyclic tree that
+	 * pinscan walked forever (live dump, 74 levels of walk_recursive).
+	 * The failed entries stay dirty and retry; no commit follows a failed
+	 * drain, so nothing partial is made durable.
+	 */
+	tmp_->sb.inode_root = tessera_btree_root(tmp_->inode_tree);
 	return (err);
 }
 
@@ -12263,7 +12294,21 @@ tessera_fs_dirty_inodes_drain(struct tessera_mount *tmp_)
 			mtx_unlock(&tmp_->flush_mtx);
 		}
 	}
-	if (err == 0) tmp_->sb.inode_root = root;
+	/*
+	 * ★ Mirror the handle's root even when some entry failed. Every
+	 * mutation that SUCCEEDED before the failure has already moved the
+	 * handle's root and released the nodes it superseded; a failed one
+	 * moves nothing (core btree frees only on success). Leaving
+	 * sb.inode_root at the pre-drain root after a partial failure made the
+	 * superblock name a tree whose nodes were already freed — and since
+	 * pinscan pins from sb.inode_root, the live tree's newest nodes went
+	 * unpinned and were recycled: inode records "not in inode tree",
+	 * lookups returning another inode's record, and a cyclic tree that
+	 * pinscan walked forever (live dump, 74 levels of walk_recursive).
+	 * The failed entries stay dirty and retry; no commit follows a failed
+	 * drain, so nothing partial is made durable.
+	 */
+	tmp_->sb.inode_root = tessera_btree_root(tmp_->inode_tree);
 	return (err);
 }
 
@@ -14039,6 +14084,36 @@ tessera_fs_meta_admit(struct tessera_mount *tmp_)
 	    (uint64_t)tessera_meta_admit_resv) / TESSERA_META_RESV_UNIT;
 	if (mavail < mneed + (uint64_t)tessera_meta_admit_slack) {
 		tessera_stat_meta_admit_refusals++;
+		/*
+		 * ★ A refusal must itself lead to reclaim. Reclaim is
+		 * otherwise driven from commit_sb and from the flush-start
+		 * preflight — and a refused create dirties nothing, so neither
+		 * ever runs. Measured on the dev root, 2026-09-14: after a
+		 * starved stretch, 36 free and 146,159 reclaimable sectors
+		 * sat in meta_pending, every create returned ENOSPC, and the
+		 * last reclaim was 37 minutes old. One flush (an rm and a
+		 * sync) ran the preflight scan and freed 221,218 sectors.
+		 *
+		 * So schedule exactly that: a flush. sb_dirty makes it run
+		 * far enough to reach its preflight, which scans
+		 * SYNCHRONOUSLY under the gate and swaps in the same flush.
+		 *
+		 * ★ NOT a background pinscan kick. That was tried first and
+		 * broke boot: at mount the free list is empty until the first
+		 * scan, the kick set pinscan_active, every flush's preflight
+		 * then skipped its synchronous scan, and the background
+		 * scan's swap starved for the gate behind the failing flushes
+		 * — sshd and devd died of ENOSPC and the VM never came up.
+		 * Once per second at most; the flush task coalesces anyway.
+		 */
+		if (tmp_->flush_co_init && !tmp_->flush_unmounting &&
+		    tmp_->admit_kick_sec != (time_t)time_uptime) {
+			tmp_->admit_kick_sec = (time_t)time_uptime;
+			tmp_->sb_dirty = 1;
+			tessera_stat_meta_admit_flush_kicks++;
+			(void)taskqueue_enqueue(tmp_->flush_tq,
+			    &tmp_->flush_task);
+		}
 		return (ENOSPC);
 	}
 	return (0);
@@ -15684,10 +15759,25 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 		_tp = TPROF_T0();
 		int rce = tessera_commit_extent(tmp_);
 		TPROF_ADD(TPROF_FL_EXTENT, _tp);
-		if (rce != 0)
+		if (rce != 0) {
 			printf("tessera_fs: flush — commit_extent failed: %d "
 			    "(unmounting=%d sb_dirty=%d)\n",
 			    rce, tmp_->flush_unmounting, tmp_->sb_dirty);
+			/*
+			 * ★ Do NOT go on to commit_sb. This failure used to be
+			 * reported and ignored, so the superblock was committed
+			 * with sb.free_extent_root still naming the PREVIOUS
+			 * free-extent tree — one that lists as free every extent
+			 * this flush allocated. The live mount runs on the
+			 * in-memory allocator and never notices; the next mount
+			 * loads that tree and hands the same sectors out twice.
+			 * It fails exactly when the metadata reserve is at the
+			 * band. Leave sb_dirty set: the next flush retries the
+			 * whole commit once reclaim has made room.
+			 */
+			tessera_stat_commit_extent_failed++;
+			r = rce;
+		}
 	}
 	if (r == 0) {
 		_tp = TPROF_T0();

@@ -57,6 +57,7 @@ TEST_NAMES= \
     test_extent \
     test_btree \
     test_btree_guards \
+    test_btree_txn \
     test_gc \
     test_manifest \
     test_pack \

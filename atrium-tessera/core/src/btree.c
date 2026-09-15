@@ -77,6 +77,19 @@ struct tessera_btree {
 	uint32_t            value_size;
 	uint32_t            leaf_fanout;       /* max entries in a leaf */
 	uint32_t            inner_fanout;      /* max entries in an internal */
+	/*
+	 * ★ Per-operation free/alloc log (see op_begin/op_end). A mutation
+	 * frees the nodes it supersedes only once it has SUCCEEDED; until
+	 * then free_node records them here. On failure those records are
+	 * discarded and only the nodes this operation allocated are released
+	 * — nothing outside the operation can reference them.
+	 */
+	uint32_t            op_depth;
+	uint32_t            op_log_lost;       /* an append could not grow */
+	uint64_t           *op_frees;
+	uint32_t            op_frees_n, op_frees_cap;
+	uint64_t           *op_allocs;
+	uint32_t            op_allocs_n, op_allocs_cap;
 };
 
 /* ── helpers ─────────────────────────────────────────────────────── */
@@ -270,18 +283,92 @@ flush_node(const tessera_btree_t *t, uint64_t sector, uint8_t *block,
 	return (r == 0) ? TESSERA_OK : TESSERA_EIO;
 }
 
+/* Append to a per-op sector log, growing it. Returns 0, or -1 when it
+ * cannot grow (the caller then falls back to the always-safe choice). */
 static int
-alloc_node(const tessera_btree_t *t, uint64_t *out_sector)
+op_log_push(uint64_t **v, uint32_t *n, uint32_t *cap, uint64_t sector)
 {
-	int r = t->io.alloc(t->io.ctx, 1, out_sector);
-	return (r == 0) ? TESSERA_OK : TESSERA_ENOSPC;
+	if (*n == *cap) {
+		uint32_t nc = *cap ? *cap * 2 : 32;
+		uint64_t *nv = tessera_zalloc((size_t)nc * sizeof(uint64_t));
+		if (nv == NULL) return -1;
+		if (*n > 0) memcpy(nv, *v, (size_t)*n * sizeof(uint64_t));
+		if (*v != NULL) tessera_free(*v);
+		*v = nv; *cap = nc;
+	}
+	(*v)[(*n)++] = sector;
+	return 0;
 }
 
 static int
-free_node(const tessera_btree_t *t, uint64_t sector)
+alloc_node(tessera_btree_t *t, uint64_t *out_sector)
 {
+	int r = t->io.alloc(t->io.ctx, 1, out_sector);
+	if (r != 0) return TESSERA_ENOSPC;
+	if (t->op_depth > 0 &&
+	    op_log_push(&t->op_allocs, &t->op_allocs_n, &t->op_allocs_cap,
+	    *out_sector) != 0)
+		t->op_log_lost = 1;   /* unlogged: leaked if the op fails */
+	return TESSERA_OK;
+}
+
+/*
+ * Free a node. Inside a mutation this is DEFERRED to op_end: COW frees the
+ * superseded node as soon as its replacement is written, but the operation
+ * can still fail further up the tree (the parent's allocation, a root
+ * split), and the caller then keeps the OLD root — which still references
+ * every node freed so far. A platform allocator that recycles same-epoch
+ * frees immediately (the kmod's epoch sweep, exactly when the metadata
+ * reserve is exhausted) handed those nodes to another tree while they were
+ * still live: "sector N holds a inode node but was reached as snapshot",
+ * pinscan aborting on every pass, and a corrupt volume.
+ */
+static int
+free_node(tessera_btree_t *t, uint64_t sector)
+{
+	if (t->op_depth > 0) {
+		if (op_log_push(&t->op_frees, &t->op_frees_n,
+		    &t->op_frees_cap, sector) != 0)
+			t->op_log_lost = 1;   /* dropped: a leak, never a reuse */
+		return TESSERA_OK;
+	}
 	int r = t->io.free(t->io.ctx, sector, 1);
 	return (r == 0) ? TESSERA_OK : TESSERA_EIO;
+}
+
+static void
+op_begin(tessera_btree_t *t)
+{
+	if (t->op_depth++ == 0) {
+		t->op_frees_n = 0;
+		t->op_allocs_n = 0;
+		t->op_log_lost = 0;
+	}
+}
+
+/*
+ * Close a mutation. Success: release the superseded nodes. Failure: the
+ * tree keeps its old root, so every recorded free is still reachable —
+ * discard them — and release only what this operation allocated, none of
+ * which the old root can reach. (A node the operation allocated and then
+ * superseded appears in both logs; each branch frees from one log only, so
+ * nothing is released twice.)
+ */
+static int
+op_end(tessera_btree_t *t, int rc)
+{
+	if (t->op_depth == 0 || --t->op_depth > 0)
+		return rc;
+	if (rc == TESSERA_OK) {
+		for (uint32_t i = 0; i < t->op_frees_n; i++)
+			(void)t->io.free(t->io.ctx, t->op_frees[i], 1);
+	} else {
+		for (uint32_t i = 0; i < t->op_allocs_n; i++)
+			(void)t->io.free(t->io.ctx, t->op_allocs[i], 1);
+	}
+	t->op_frees_n = 0;
+	t->op_allocs_n = 0;
+	return rc;
 }
 
 /* Binary-search for the largest index i such that entries[i].key <= key.
@@ -398,6 +485,9 @@ fail:
 void
 tessera_btree_close(tessera_btree_t *t)
 {
+	if (t == NULL) return;
+	if (t->op_frees != NULL)  tessera_free(t->op_frees);
+	if (t->op_allocs != NULL) tessera_free(t->op_allocs);
 	tessera_free(t);
 }
 
@@ -751,12 +841,23 @@ out:
 	return rc;
 }
 
+static int tessera_btree_put_impl(tessera_btree_t *t, const void *key,
+    const void *value, uint64_t *out_new_root);
+
 int
 tessera_btree_put(tessera_btree_t *t, const void *key, const void *value,
                   uint64_t *out_new_root)
 {
 	if (t == NULL || key == NULL || value == NULL || out_new_root == NULL)
 		return TESSERA_EINVAL;
+	op_begin(t);
+	return op_end(t, tessera_btree_put_impl(t, key, value, out_new_root));
+}
+
+static int
+tessera_btree_put_impl(tessera_btree_t *t, const void *key, const void *value,
+                       uint64_t *out_new_root)
+{
 
 	struct put_result res;
 	memset(&res, 0, sizeof res);
@@ -1057,6 +1158,10 @@ out:
 	return rc;
 }
 
+static int batch_put_impl(tessera_btree_t *t, const void *keys,
+    const void *values, uint32_t n, uint64_t *out_new_root,
+    tessera_btree_displaced_cb_t cb, void *ctx);
+
 int
 tessera_btree_put_sorted_batch(tessera_btree_t *t, const void *keys,
                                const void *values, uint32_t n,
@@ -1085,6 +1190,16 @@ tessera_btree_put_sorted_batch_ex(tessera_btree_t *t, const void *keys,
 			return TESSERA_EINVAL;
 	}
 
+	op_begin(t);
+	return op_end(t, batch_put_impl(t, keys, values, n, out_new_root,
+	    cb, ctx));
+}
+
+static int
+batch_put_impl(tessera_btree_t *t, const void *keys, const void *values,
+               uint32_t n, uint64_t *out_new_root,
+               tessera_btree_displaced_cb_t cb, void *ctx)
+{
 	struct batch_repl repl;
 	memset(&repl, 0, sizeof repl);
 	int rc = batch_recurse(t, t->root, keys, values, n, &repl, cb, ctx);
@@ -1228,12 +1343,23 @@ out:
 	return rc;
 }
 
+static int tessera_btree_delete_impl(tessera_btree_t *t, const void *key,
+    uint64_t *out_new_root);
+
 int
 tessera_btree_delete(tessera_btree_t *t, const void *key,
                      uint64_t *out_new_root)
 {
 	if (t == NULL || key == NULL || out_new_root == NULL)
 		return TESSERA_EINVAL;
+	op_begin(t);
+	return op_end(t, tessera_btree_delete_impl(t, key, out_new_root));
+}
+
+static int
+tessera_btree_delete_impl(tessera_btree_t *t, const void *key,
+                          uint64_t *out_new_root)
+{
 	uint64_t new_root = 0;
 	int dropped = 0;
 	int r = delete_recurse(t, t->root, key, &new_root, &dropped);
