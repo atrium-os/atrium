@@ -1465,6 +1465,33 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, unlinked_reaped, CTLFLAG_RD,
     &tessera_stat_unlinked_reaped, 0,
     "unlinked (nlink=0) inode records left by a crash before their last "
     "close, freed when the volume went writable");
+/* kern.tessera.legacy_orphan_sweep (loader tunable): 0 = off, 1 = report
+ * only (count, free nothing, leave the feature bit clear), 2 = free. */
+static int tessera_legacy_orphan_sweep = 2;
+SYSCTL_INT(_kern_tessera, OID_AUTO, legacy_orphan_sweep, CTLFLAG_RWTUN,
+    &tessera_legacy_orphan_sweep, 0,
+    "one-time sweep of unflagged nlink=0 orphans from older kmods: "
+    "0=off 1=report only 2=free (see tessera_fs_sweep_legacy_orphans)");
+static unsigned long tessera_stat_legacy_orphans_found = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, legacy_orphans_found, CTLFLAG_RD,
+    &tessera_stat_legacy_orphans_found, 0,
+    "unreachable nlink=0 records found by legacy orphan sweeps");
+static unsigned long tessera_stat_legacy_orphans_freed = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, legacy_orphans_freed, CTLFLAG_RD,
+    &tessera_stat_legacy_orphans_freed, 0,
+    "unreachable nlink=0 records freed by legacy orphan sweeps");
+static unsigned long tessera_stat_legacy_nlink0_kept = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, legacy_nlink0_kept, CTLFLAG_RD,
+    &tessera_stat_legacy_nlink0_kept, 0,
+    "REACHABLE nlink=0 records (0-as-unset) the legacy sweep left alone");
+static unsigned long tessera_stat_legacy_sweep_aborted = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, legacy_sweep_aborted, CTLFLAG_RD,
+    &tessera_stat_legacy_sweep_aborted, 0,
+    "legacy orphan sweeps abandoned (walk error) — nothing freed");
+static unsigned long tessera_stat_legacy_sweep_ms = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, legacy_sweep_ms, CTLFLAG_RD,
+    &tessera_stat_legacy_sweep_ms, 0,
+    "duration of the slowest legacy orphan sweep since load (ms)");
 static unsigned long tessera_stat_unlinked_reap_records = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, unlinked_reap_records, CTLFLAG_RD,
     &tessera_stat_unlinked_reap_records, 0,
@@ -6386,6 +6413,314 @@ tessera_fs_reap_unlinked(struct tessera_mount *tmp_)
 	return (freed);
 }
 
+/*
+ * One-time: free the nlink=0 orphans that kmods older than
+ * TESSERA_INODE_FLAG_UNLINKED left behind.
+ *
+ * tessera_fs_reap_unlinked keys on the flag, which those records lack — and
+ * nlink==0 alone is not enough, because legacy seeding left LIVE records
+ * (mostly directories) with nlink 0-as-unset. The discriminator for an
+ * unflagged record is the one fsck --repair uses: nlink == 0 AND not
+ * reachable by name from the root directory. So this walks the namespace.
+ *
+ * It runs until it completes once, then sets TESSERA_FEATURE_UNLINKED_FLAG
+ * (persisted by the next commit) and never runs on that volume again —
+ * every nlink=0 record written since carries the flag. mkfs sets the bit.
+ *
+ * Same call sites and exclusion argument as tessera_fs_reap_unlinked: rw
+ * mount before mnt_data is published, and the ro->rw upgrade before
+ * MNT_RDONLY is cleared, so no namespace op can move an entry mid-walk.
+ *
+ * FAIL SAFE. Any walk error — an unreadable directory, a manifest that is
+ * not a directory, an inode number beyond the bitmap — abandons the sweep:
+ * nothing is freed and the bit stays clear. Reachability is over-counted,
+ * never under-counted: every inode named by an unpublished dirent-log op
+ * (ADD or REMOVE) counts as reachable.
+ */
+struct tessera_legacy_sweep {
+	struct tessera_mount *tmp;
+	uint8_t  *reach;
+	uint8_t  *isdir;
+	uint64_t  nbits;
+	uint32_t *stack;
+	uint32_t  sp, scap;
+	uint32_t  beyond;
+};
+
+#define _LS_TEST(bm, i) (((bm)[(i) >> 3] >> ((i) & 7)) & 1)
+#define _LS_SET(bm, i)  ((bm)[(i) >> 3] |= (uint8_t)(1 << ((i) & 7)))
+
+static void
+tessera_legacy_sweep_mark(struct tessera_legacy_sweep *ls, uint64_t ino)
+{
+	if (ino >= ls->nbits) {
+		ls->beyond++;
+		return;
+	}
+	if (_LS_TEST(ls->reach, ino))
+		return;
+	_LS_SET(ls->reach, ino);
+	if (!_LS_TEST(ls->isdir, ino))
+		return;
+	if (ls->sp == ls->scap) {
+		uint32_t *g = malloc(ls->scap * 2 * sizeof *g, M_TESSERA,
+		    M_WAITOK);
+		memcpy(g, ls->stack, ls->sp * sizeof *g);
+		free(ls->stack, M_TESSERA);
+		ls->stack = g;
+		ls->scap *= 2;
+	}
+	ls->stack[ls->sp++] = (uint32_t)ino;
+}
+
+static int
+tessera_legacy_sweep_cb(void *ctx, uint64_t child_inode, const char *name,
+    uint16_t name_len)
+{
+	(void)name; (void)name_len;
+	tessera_legacy_sweep_mark(ctx, child_inode);
+	return (0);
+}
+
+static int
+tessera_fs_sweep_legacy_orphans(struct tessera_mount *tmp_)
+{
+	const int mode = tessera_legacy_orphan_sweep;
+	if (mode == 0 || tmp_->inode_tree == NULL || !tmp_->dirty_init)
+		return (0);
+	if (tmp_->sb.feature_flags & TESSERA_FEATURE_UNLINKED_FLAG)
+		return (0);
+
+	sbintime_t t0 = sbinuptime();
+	struct tessera_legacy_sweep ls = { .tmp = tmp_ };
+	/* Inode numbers are allocated sequentially from next_inode_no; any
+	 * record at or past it (+ slack) aborts rather than being guessed. */
+	ls.nbits = tmp_->sb.next_inode_no + 4096;
+	if (ls.nbits > ((uint64_t)1 << 32) || ls.nbits / 8 > 256 * 1024 * 1024) {
+		printf("tessera_fs: legacy orphan sweep skipped — "
+		    "next_inode_no %ju too large for the bitmap\n",
+		    (uintmax_t)tmp_->sb.next_inode_no);
+		tessera_stat_legacy_sweep_aborted++;
+		return (0);
+	}
+	size_t bmb = (size_t)((ls.nbits + 7) / 8);
+	ls.reach = malloc(bmb, M_TESSERA, M_WAITOK | M_ZERO);
+	ls.isdir = malloc(bmb, M_TESSERA, M_WAITOK | M_ZERO);
+	ls.scap = 1024;
+	ls.stack = malloc(ls.scap * sizeof *ls.stack, M_TESSERA, M_WAITOK);
+	uint32_t ccap = 256, nc = 0;
+	uint32_t *cand = malloc(ccap * sizeof *cand, M_TESSERA, M_WAITOK);
+	const char *why = NULL;
+	uint64_t records = 0, dirs = 0;
+	uint32_t found = 0, freed = 0, kept = 0;
+
+	/* 1. Inode tree: directory bitmap + nlink=0 candidates. */
+	tessera_fs_flush_gate_enter(tmp_);
+	tessera_btree_cursor_t *c = tessera_btree_seek_first(tmp_->inode_tree);
+	if (c == NULL)
+		why = "inode tree seek failed";
+	while (c != NULL) {
+		uint8_t k[4];
+		tessera_inode_record_t ino;
+		int rc = tessera_btree_cursor_get(c, k, &ino);
+		if (rc != TESSERA_OK) {
+			if (rc != TESSERA_ENOENT)
+				why = "inode tree read failed";
+			break;
+		}
+		records++;
+		uint32_t n = ((uint32_t)k[0] << 24) | ((uint32_t)k[1] << 16) |
+		    ((uint32_t)k[2] << 8) | (uint32_t)k[3];
+		if (n >= ls.nbits) {
+			why = "inode number beyond next_inode_no";
+			break;
+		}
+		if ((ino.mode & 0170000) == 0040000)
+			_LS_SET(ls.isdir, n);
+		if (ino.nlink == 0 && n >= TESSERA_INODE_FIRST_USER) {
+			if (nc == ccap) {
+				uint32_t *g = malloc(ccap * 2 * sizeof *g,
+				    M_TESSERA, M_WAITOK);
+				memcpy(g, cand, nc * sizeof *g);
+				free(cand, M_TESSERA);
+				cand = g;
+				ccap *= 2;
+			}
+			cand[nc++] = n;
+		}
+		rc = tessera_btree_cursor_next(c);
+		if (rc != TESSERA_OK) {
+			if (rc != TESSERA_ENOENT)
+				why = "inode tree read failed";
+			break;
+		}
+	}
+	if (c != NULL)
+		tessera_btree_cursor_free(c);
+	tessera_fs_flush_gate_exit(tmp_);
+
+	/* 2. Replayed overlay records (dirs and candidates) and every inode
+	 * an unpublished dirent op names. Counted, then copied, so nothing
+	 * mallocs under flush_mtx. ov[] layout: (ino << 2) | isdir<<1 | cand. */
+	uint32_t nov = 0;
+	uint64_t *ov = NULL;
+	for (int pass = 0; pass < 2 && why == NULL; pass++) {
+		uint32_t cnt = 0;
+		mtx_lock(&tmp_->flush_mtx);
+		for (uint32_t b = 0; b < TESSERA_DIRTY_INODE_BUCKETS; b++) {
+			struct tessera_dirty_inode *e;
+			LIST_FOREACH(e, &tmp_->dirty_inodes[b], link) {
+				if (e->tombstone)
+					continue;
+				if (pass == 1 && cnt < nov)
+					ov[cnt] = ((uint64_t)e->inode_no << 2) |
+					    (((e->rec.mode & 0170000) ==
+					      0040000) ? 2 : 0) |
+					    (e->rec.nlink == 0 ? 1 : 0);
+				cnt++;
+			}
+		}
+		for (uint32_t b = 0; b < TESSERA_DIRENT_LOG_BUCKETS; b++) {
+			struct tessera_dirent_log_entry *de;
+			LIST_FOREACH(de, &tmp_->dirent_log[b], link) {
+				/* bit 0 AND bit 1 set = "named by the log" */
+				if (pass == 1 && cnt < nov)
+					ov[cnt] = ((uint64_t)de->inode_no << 2)
+					    | 3 | ((uint64_t)1 << 63);
+				cnt++;
+			}
+		}
+		mtx_unlock(&tmp_->flush_mtx);
+		if (pass == 0) {
+			nov = cnt + 64;   /* slack for racing inserts; extras dropped */
+			ov = malloc(nov * sizeof *ov, M_TESSERA, M_WAITOK | M_ZERO);
+		} else {
+			nov = cnt < nov ? cnt : nov;
+		}
+	}
+	for (uint32_t i = 0; i < nov && why == NULL; i++) {
+		uint64_t n = (ov[i] & ~((uint64_t)1 << 63)) >> 2;
+		if (n >= ls.nbits) {
+			why = "overlay inode number beyond next_inode_no";
+			break;
+		}
+		if (ov[i] & ((uint64_t)1 << 63))
+			continue;               /* log names: after the dir bits */
+		if (ov[i] & 2)
+			_LS_SET(ls.isdir, n);
+		if ((ov[i] & 1) && n >= TESSERA_INODE_FIRST_USER) {
+			if (nc == ccap) {
+				uint32_t *g = malloc(ccap * 2 * sizeof *g,
+				    M_TESSERA, M_WAITOK);
+				memcpy(g, cand, nc * sizeof *g);
+				free(cand, M_TESSERA);
+				cand = g;
+				ccap *= 2;
+			}
+			cand[nc++] = (uint32_t)n;
+		}
+	}
+
+	/* 3. Namespace walk from the root directory. */
+	/* The whole argument rests on the walk actually starting: a root
+	 * that is not a known directory would mark nothing and make every
+	 * nlink=0 record look unreachable. */
+	if (why == NULL && !_LS_TEST(ls.isdir, TESSERA_INODE_ROOT_DIR))
+		why = "root directory record missing";
+	if (why == NULL) {
+		tessera_legacy_sweep_mark(&ls, TESSERA_INODE_ROOT_DIR);
+		for (uint32_t i = 0; i < nov; i++)
+			if (ov[i] & ((uint64_t)1 << 63))
+				tessera_legacy_sweep_mark(&ls,
+				    (ov[i] & ~((uint64_t)1 << 63)) >> 2);
+	}
+	while (why == NULL && ls.sp > 0) {
+		uint32_t d = ls.stack[--ls.sp];
+		tessera_inode_record_t dino;
+		int rc = tessera_fs_inode_get(tmp_, d, &dino);
+		if (rc == TESSERA_ENOENT)
+			continue;               /* named by a log op, since gone */
+		if (rc != TESSERA_OK) {
+			why = "directory inode unreadable";
+			break;
+		}
+		if ((dino.mode & 0170000) != 0040000)
+			continue;
+		dirs++;
+		if (tessera_hash_is_null(dino.manifest_hash))
+			continue;               /* no manifest, no children */
+		rc = tessera_fs_dir_walk(tmp_, dino.manifest_hash,
+		    tessera_legacy_sweep_cb, &ls);
+		if (rc != 0) {
+			printf("tessera_fs: legacy orphan sweep: directory "
+			    "inode %u unreadable (%d)\n", (unsigned)d, rc);
+			why = "a directory could not be walked";
+			break;
+		}
+	}
+
+	if (why == NULL && dirs == 0)
+		why = "namespace walk reached no directory";
+
+	/* 4. Free unreachable nlink=0 records. */
+	uint32_t shown = 0;
+	char list[128];
+	int lo = 0;
+	list[0] = '\0';
+	for (uint32_t i = 0; i < nc && why == NULL; i++) {
+		uint32_t n = cand[i];
+		if (_LS_TEST(ls.reach, n)) {
+			kept++;
+			continue;
+		}
+		tessera_inode_record_t live;
+		if (tessera_fs_inode_get(tmp_, n, &live) != TESSERA_OK ||
+		    live.nlink != 0)
+			continue;       /* duplicate (tree + overlay), or gone */
+		found++;
+		if (shown < 8 && lo < (int)sizeof(list) - 12) {
+			lo += snprintf(list + lo, sizeof(list) - lo, " %u",
+			    (unsigned)n);
+			shown++;
+		}
+		if (mode >= 2 && tessera_fs_inode_delete(tmp_, n) == TESSERA_OK)
+			freed++;
+	}
+
+	unsigned long ms = (unsigned long)((sbinuptime() - t0) / SBT_1MS);
+	if (ms > tessera_stat_legacy_sweep_ms)
+		tessera_stat_legacy_sweep_ms = ms;
+	if (why != NULL) {
+		tessera_stat_legacy_sweep_aborted++;
+		printf("tessera_fs: legacy orphan sweep ABANDONED (%s) after "
+		    "%ju records, %ju dirs, %lu ms — nothing freed; it retries "
+		    "next mount (fsck --repair frees them offline)\n", why,
+		    (uintmax_t)records, (uintmax_t)dirs, ms);
+	} else {
+		tessera_stat_legacy_orphans_found += found;
+		tessera_stat_legacy_orphans_freed += freed;
+		tessera_stat_legacy_nlink0_kept += kept;
+		if (mode >= 2) {
+			tmp_->sb.feature_flags |= TESSERA_FEATURE_UNLINKED_FLAG;
+			tmp_->sb_dirty = 1;
+		}
+		printf("tessera_fs: legacy orphan sweep%s: %ju records, %ju "
+		    "dirs walked, %u unreachable nlink=0 (%u freed)%s%s, %u "
+		    "reachable nlink=0 kept, %u dirents past next_inode_no, "
+		    "%lu ms\n", mode >= 2 ? "" : " (REPORT ONLY)",
+		    (uintmax_t)records, (uintmax_t)dirs, found, freed,
+		    found ? " ino:" : "", list, kept, ls.beyond, ms);
+	}
+	free(ov, M_TESSERA);
+	free(cand, M_TESSERA);
+	free(ls.stack, M_TESSERA);
+	free(ls.reach, M_TESSERA);
+	free(ls.isdir, M_TESSERA);
+	return (why == NULL ? (int)freed : 0);
+}
+#undef _LS_TEST
+#undef _LS_SET
+
 /* Full read-write journal bring-up: open + FULL replay (roots + redo) + persist
  * the rolled-forward SB + wire the deferred io. Requires device write access.
  * Used by a from-the-start rw mount and by the ro->rw upgrade — in the latter
@@ -6897,8 +7232,10 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		(void)tessera_fs_journal_replay(tmp_, /*roots_only=*/0);
 		tessera_fs_journal_wire_deferred(tmp_);
 	}
-	if (requested_gen == 0 && !ronly && !tmp_->readonly_snapshot)
+	if (requested_gen == 0 && !ronly && !tmp_->readonly_snapshot) {
 		(void)tessera_fs_reap_unlinked(tmp_);
+		(void)tessera_fs_sweep_legacy_orphans(tmp_);
+	}
 
 	/* Quota domains (tessera-quotas.md). Load the persisted table from
 	 * the on-disk quota tree (0 = none yet; lazy-created on first flush
@@ -7337,6 +7674,17 @@ tessera_mount_impl(struct mount *mp)
 				}
 				tmp_->ronly = 0;
 				tmp_->dev_writable = 1;
+				/* Now writable: apply the dirent/inode redo records
+				 * the ro mount's roots-only replay deferred, persist
+				 * the recovered SB, and wire the redo-log io. The
+				 * fall-through flush below drains the redo overlay to
+				 * disk so the recovery is durable. */
+				tessera_fs_journal_setup(tmp_);
+				/* Orphan recovery walks the namespace, so it runs
+				 * while MNT_RDONLY still refuses every namespace
+				 * op — no rename can move an entry mid-walk. */
+				(void)tessera_fs_reap_unlinked(tmp_);
+				(void)tessera_fs_sweep_legacy_orphans(tmp_);
 				/* Clear MNT_RDONLY ourselves — the generic mount
 				 * code leaves the flag to the fs (FFS does the same
 				 * in its MNT_UPDATE handler). Without this the mount
@@ -7345,13 +7693,6 @@ tessera_mount_impl(struct mount *mp)
 				MNT_ILOCK(mp);
 				mp->mnt_flag &= ~MNT_RDONLY;
 				MNT_IUNLOCK(mp);
-				/* Now writable: apply the dirent/inode redo records
-				 * the ro mount's roots-only replay deferred, persist
-				 * the recovered SB, and wire the redo-log io. The
-				 * fall-through flush below drains the redo overlay to
-				 * disk so the recovery is durable. */
-				tessera_fs_journal_setup(tmp_);
-				(void)tessera_fs_reap_unlinked(tmp_);
 				/* Arm the journal-log group-commit callout the ro
 				 * mount left unarmed, so dirent-op durability now
 				 * matches a from-the-start rw mount. */
@@ -21355,6 +21696,42 @@ tessera_sysctl_repack_now(SYSCTL_HANDLER_ARGS)
  * keeps the reserve alive); scripts/vm-durable-pin-crash-test.sh drives it
  * deterministically with fault_commit_fail=2.
  */
+/*
+ * kern.tessera.fault_legacy_nlink0 — TEST ONLY. Write an inode number: on
+ * the most recently mounted volume, rewrite that record the way a kmod
+ * older than TESSERA_INODE_FLAG_UNLINKED would have left it — nlink 0, no
+ * UNLINKED flag — and clear TESSERA_FEATURE_UNLINKED_FLAG so the next
+ * writable mount runs the legacy sweep. On an unlinked-but-open file that
+ * is an old-kmod crash orphan; on a linked file it is a legacy 0-as-unset
+ * record the sweep must leave alone. Drives
+ * scripts/vm-legacy-orphan-crash-test.sh.
+ */
+static int
+tessera_sysctl_fault_legacy_nlink0(SYSCTL_HANDLER_ARGS)
+{
+	int ino_no = 0;
+	int err = sysctl_handle_int(oidp, &ino_no, 0, req);
+	if (err != 0 || req->newptr == NULL) return (err);
+	if (ino_no < (int)TESSERA_INODE_FIRST_USER) return (EINVAL);
+	struct tessera_mount *tmp_ = tessera_singleton_mount;
+	if (tmp_ == NULL) return (ENXIO);
+	tessera_inode_record_t ino;
+	if (tessera_fs_inode_get(tmp_, (uint32_t)ino_no, &ino) != TESSERA_OK)
+		return (ENOENT);
+	ino.nlink = 0;
+	ino.flags &= ~TESSERA_INODE_FLAG_UNLINKED;
+	if (tessera_fs_inode_put(tmp_, (uint32_t)ino_no, &ino) != TESSERA_OK)
+		return (EIO);
+	tmp_->sb.feature_flags &= ~TESSERA_FEATURE_UNLINKED_FLAG;
+	tmp_->sb_dirty = 1;
+	return (0);
+}
+SYSCTL_PROC(_kern_tessera, OID_AUTO, fault_legacy_nlink0,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+    NULL, 0, tessera_sysctl_fault_legacy_nlink0, "I",
+    "TEST ONLY: write an inode number to make it an unflagged nlink=0 "
+    "record and clear the volume's UNLINKED_FLAG feature bit");
+
 static int
 tessera_sysctl_fault_pinscan_drain(SYSCTL_HANDLER_ARGS)
 {

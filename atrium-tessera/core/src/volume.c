@@ -547,7 +547,7 @@ tessera_volume_format(const tessera_block_io_t *io,
 	memcpy(sb.magic, TESSERA_MAGIC_SUPERBLOCK, 8);
 	sb.version_major          = 1;
 	sb.version_minor          = 0;
-	sb.feature_flags          = 0;
+	sb.feature_flags          = TESSERA_FEATURE_UNLINKED_FLAG;
 	sb.incompat_flags         = (opts->hash_alg != TESSERA_HASH_ALG_SHA256)
 	    ? TESSERA_INCOMPAT_HASH_ALG : 0;
 	sb.hash_alg               = opts->hash_alg;

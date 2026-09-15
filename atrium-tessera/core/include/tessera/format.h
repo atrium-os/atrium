@@ -250,6 +250,11 @@ typedef struct TESSERA_PACKED {
 #define TESSERA_FEATURE_ENCRYPTED       (1u << 0)
 #define TESSERA_FEATURE_MULTI_LEVEL_MFT (1u << 1)
 #define TESSERA_FEATURE_BLOOM_V2        (1u << 2)
+/* Every nlink=0 record this volume can hold carries
+ * TESSERA_INODE_FLAG_UNLINKED: set by mkfs, or by the kmod once its one-time
+ * reachability sweep has freed the unflagged orphans older kmods left
+ * (tessera_fs_sweep_legacy_orphans). Compat: an older kmod ignores it. */
+#define TESSERA_FEATURE_UNLINKED_FLAG   (1u << 3)
 
 /* ── Journal header (4096 bytes) ─────────────────────────────────── */
 
