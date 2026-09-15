@@ -41,11 +41,15 @@
 #   Both counters are global, so the root contributes too; the root is
 #   healthy and idle here, and the per-run deltas are reported regardless.
 #
+# ARMS are BYPASS:TRIGGER pairs — kern.tessera.pinscan_tight_bypass and
+# kern.tessera.mark_dirty_meta_trigger (1 = staged-need trigger, 0 = the legacy
+# "(bump - meta_free) >= half the reserve" one). Default: the full 2x2.
+#
 #   sh scripts/vm-pinscan-tight-test.sh              # 3 runs per arm, 60 s churn
-#   REPS=1 SECS=30 sh scripts/vm-pinscan-tight-test.sh
+#   REPS=1 SECS=30 ARMS="1:0 1:1" sh scripts/vm-pinscan-tight-test.sh
 set -u
 BSD="$(cd "$(dirname "$0")/.." && pwd)"
-REPS=${REPS:-3}; SECS=${SECS:-60}
+REPS=${REPS:-3}; SECS=${SECS:-60}; ARMS=${ARMS:-"0:0 1:0 0:1 1:1"}
 VSSH="$BSD/scripts/vssh"
 
 KO="$BSD/atrium-tessera/kmod/tessera_fs.ko"
@@ -53,12 +57,12 @@ KO="$BSD/atrium-tessera/kmod/tessera_fs.ko"
 KMOD=$(shasum -a 256 "$KO" | cut -c1-16)
 k=$($VSSH "sha256 -q /boot/kernel/tessera_fs.ko | cut -c1-16" 2>/dev/null | tr -d '\r')
 [ "$k" = "$KMOD" ] || { echo "ABORT: guest module [$k] != tree [$KMOD]"; exit 1; }
-$VSSH "sysctl -n kern.tessera.pinscan_tight_bypass" >/dev/null 2>&1 \
-    || { echo "ABORT: guest kmod has no kern.tessera.pinscan_tight_bypass"; exit 1; }
+$VSSH "sysctl -n kern.tessera.pinscan_tight_bypass kern.tessera.mark_dirty_meta_trigger" >/dev/null 2>&1 \
+    || { echo "ABORT: guest kmod lacks pinscan_tight_bypass / mark_dirty_meta_trigger"; exit 1; }
 
-echo "=== PINSCAN TIGHT-BYPASS A/B $(date) kmod=$KMOD reps=$REPS secs=$SECS ==="
+echo "=== PINSCAN TIGHT-BYPASS / MARK_DIRTY TRIGGER A/B $(date) kmod=$KMOD reps=$REPS secs=$SECS arms=$ARMS ==="
 
-run_arm() {  # $1 = bypass (0|1)
+run_arm() {  # $1 = bypass (0|1), $2 = mark_dirty trigger (0 legacy | 1)
     timeout $((SECS + 600)) $VSSH "
 M=/mnt/scratch; DEV=/dev/vtbd2
 diskinfo -s \$DEV | grep -q '^atrium-scratch\$' || { echo REFUSING_ident; exit 2; }
@@ -69,10 +73,10 @@ i=0; while [ \$i -lt 800 ]; do mkdir \$M/d\$i; (cd \$M/d\$i && jot 500 | xargs t
 sync; sleep 8
 S(){ sysctl -n kern.tessera.\$1 2>/dev/null || echo 0; }
 OLD_DUTY=\$(S pinscan_duty_pct)
-sysctl kern.tessera.pinscan_duty_pct=1 kern.tessera.pinscan_tight_bypass=$1 >/dev/null
+sysctl kern.tessera.pinscan_duty_pct=1 kern.tessera.pinscan_tight_bypass=$1 kern.tessera.mark_dirty_meta_trigger=$2 >/dev/null
 B0=\$(S pinscan_duty_bypass_tight); H0=\$(S pinscan_duty_tight_honoured)
 R0=\$(S meta_admit_refusals); K0=\$(S pinscan_kicks); D0=\$(S pinscan_skips_duty)
-C0=\$(S sb_commits)
+C0=\$(S sb_commits); MF0=\$(S mark_dirty_meta_flushes)
 
 rm -f /root/pt.stop /root/pt.samples /root/pt.rounds.*; : > /root/pt.err
 sh -c 'while [ ! -f /root/pt.stop ]; do sysctl -n kern.tessera.mounts | grep \"^/mnt/scratch \" >> /root/pt.samples; sleep 0.2; done' &
@@ -89,7 +93,7 @@ w=0; while [ \$w -lt 4 ]; do
 done
 sleep $SECS
 touch /root/pt.stop; sleep 3; wait 2>/dev/null
-sysctl kern.tessera.pinscan_duty_pct=\$OLD_DUTY kern.tessera.pinscan_tight_bypass=1 >/dev/null
+sysctl kern.tessera.pinscan_duty_pct=\$OLD_DUTY kern.tessera.pinscan_tight_bypass=1 kern.tessera.mark_dirty_meta_trigger=1 >/dev/null
 
 MINAV=\$(sed -n 's/.*admit_avail=\([0-9]*\).*/\1/p' /root/pt.samples | sort -n | head -1)
 MAXPEND=\$(sed -n 's/.* pending=\([0-9]*\).*/\1/p' /root/pt.samples | sort -n | tail -1)
@@ -99,33 +103,57 @@ ROUNDS=\$(cat /root/pt.rounds.* 2>/dev/null | awk '{s+=\$1} END{print s+0}')
 # (bump - meta_free) * 2 >= reserve length. Count the samples in that state.
 SYNCF=\$(awk '{for(i=1;i<=NF;i++){split(\$i,a,\"=\"); v[a[1]]=a[2]} split(v[\"free\"],f,\"/\"); if ((v[\"bump\"] - f[1]) * 2 >= v[\"len\"]) n++} END{print n+0}' /root/pt.samples)
 TIGHT=\$(awk '{for(i=1;i<=NF;i++){split(\$i,a,\"=\"); v[a[1]]=a[2]} av=v[\"admit_avail\"]; if (av < v[\"pending\"] || av < v[\"soft\"]/4) t++} END{print t+0}' /root/pt.samples)
-echo \"bypass=$1 rounds=\$ROUNDS samples=\$(wc -l < /root/pt.samples | tr -d ' ') sync_flush_samples=\$SYNCF tight_samples=\$TIGHT refusing_samples=\$REFS min_avail=\$MINAV max_pending=\$MAXPEND bypass_tight=\$(( \$(S pinscan_duty_bypass_tight)-B0 )) tight_honoured=\$(( \$(S pinscan_duty_tight_honoured)-H0 )) kicks=\$(( \$(S pinscan_kicks)-K0 )) skips_duty=\$(( \$(S pinscan_skips_duty)-D0 )) admit_refusals=\$(( \$(S meta_admit_refusals)-R0 )) commits=\$(( \$(S sb_commits)-C0 )) enospc=\$(grep -ci 'no space' /root/pt.err) errs=\$(wc -l < /root/pt.err | tr -d ' ')\"
+echo \"arm=$1:$2 bypass=$1 trigger=$2 rounds=\$ROUNDS meta_flushes=\$(( \$(S mark_dirty_meta_flushes)-MF0 )) samples=\$(wc -l < /root/pt.samples | tr -d ' ') sync_flush_samples=\$SYNCF tight_samples=\$TIGHT refusing_samples=\$REFS min_avail=\$MINAV max_pending=\$MAXPEND bypass_tight=\$(( \$(S pinscan_duty_bypass_tight)-B0 )) tight_honoured=\$(( \$(S pinscan_duty_tight_honoured)-H0 )) kicks=\$(( \$(S pinscan_kicks)-K0 )) skips_duty=\$(( \$(S pinscan_skips_duty)-D0 )) admit_refusals=\$(( \$(S meta_admit_refusals)-R0 )) commits=\$(( \$(S sb_commits)-C0 )) enospc=\$(grep -ci 'no space' /root/pt.err) errs=\$(wc -l < /root/pt.err | tr -d ' ')\"
 sync; umount \$M 2>/dev/null || echo UMOUNT_FAIL
 tessera-fsck \$DEV > /root/pt.fsck 2>&1
 echo \"fsck_problems=\$(grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem' /root/pt.fsck)\"" 2>&1 | tr -d '\r'
 }
 
+# ★ FAIL FAST, AND LEAVE NOTHING BEHIND. This script drives the guest inline
+# over ssh, so a host-side interrupt used to leave its workers running, the
+# scratch volume mounted and the global tunables at duty 1% / no bypass. Record
+# the tunables first and restore them — and stop everything — on ANY exit.
+# FAIL_FAST=1 (default) stops at the first rep that fails instead of spending
+# the rest of a ~40 min run on a result already known to be bad.
+FAIL_FAST=${FAIL_FAST:-1}
+ORIG=$($VSSH "echo \$(sysctl -n kern.tessera.pinscan_duty_pct) \$(sysctl -n kern.tessera.pinscan_tight_bypass) \$(sysctl -n kern.tessera.mark_dirty_meta_trigger)" 2>/dev/null | tr -d '\r')
+set -- $ORIG
+O_DUTY=${1:-5}; O_BYP=${2:-1}; O_TRIG=${3:-1}
+guest_cleanup() {
+    timeout 240 $VSSH "touch /root/pt.stop; pkill -f 'sh -c w='; sleep 3; pkill -9 -f 'sh -c w='; \
+        sysctl kern.tessera.pinscan_duty_pct=$O_DUTY kern.tessera.pinscan_tight_bypass=$O_BYP kern.tessera.mark_dirty_meta_trigger=$O_TRIG >/dev/null 2>&1; \
+        mount | grep -q ' /mnt/scratch ' && timeout 120 umount /mnt/scratch; true" >/dev/null 2>&1
+}
+trap guest_cleanup EXIT
+trap 'exit 130' INT TERM
+
 rc=0; LOG=""
 r=1; while [ $r -le $REPS ]; do
-    for arm in 0 1; do
-        OUT=$(run_arm $arm)
+    for arm in $ARMS; do
+        OUT=$(run_arm ${arm%:*} ${arm#*:})
         echo "rep $r: $OUT" | tr '\n' ' '; echo
         LOG="$LOG
 $OUT"
         case "$OUT" in *REFUSING_ident*|*MKFS_FAIL*|*UMOUNT_FAIL*) echo "FAIL — harness could not run"; exit 1;; esac
+        echo "$OUT" | grep -q "^arm=" || { echo "FAIL — arm $arm rep $r produced no result (guest unreachable or run aborted)"; exit 1; }
         F=$(echo "$OUT" | sed -n 's/.*fsck_problems=\([0-9]*\).*/\1/p')
-        [ "${F:-1}" = 0 ] || { echo "FAIL — fsck found ${F:-?} problems (bypass=$arm rep $r)"; rc=1; }
+        [ "${F:-1}" = 0 ] || { echo "FAIL — fsck found ${F:-?} problems (arm $arm rep $r)"; rc=1; }
+        [ $rc = 0 ] || [ "$FAIL_FAST" != 1 ] || { echo "FAIL_FAST — stopping after the first failing rep"; exit 1; }
     done
     r=$((r+1))
 done
 
 sum() {  # $1 arm, $2 field
-    echo "$LOG" | grep "^bypass=$1 " | sed -n "s/.* $2=\([0-9]*\).*/\1/p" | awk '{s+=$1} END{print s+0}'
+    echo "$LOG" | grep "^arm=$1 " | sed -n "s/.* $2=\([0-9]*\).*/\1/p" | awk '{s+=$1} END{print s+0}'
 }
 echo "=== totals over $REPS rep(s) ==="
-for arm in 0 1; do
-    echo "bypass=$arm rounds=$(sum $arm rounds) sync_flush_samples=$(sum $arm sync_flush_samples) tight_samples=$(sum $arm tight_samples) refusing_samples=$(sum $arm refusing_samples) bypass_tight=$(sum $arm bypass_tight) tight_honoured=$(sum $arm tight_honoured) kicks=$(sum $arm kicks) admit_refusals=$(sum $arm admit_refusals) enospc=$(sum $arm enospc) commits=$(sum $arm commits)"
+for arm in $ARMS; do
+    echo "arm=$arm rounds=$(sum $arm rounds) meta_flushes=$(sum $arm meta_flushes) sync_flush_samples=$(sum $arm sync_flush_samples) tight_samples=$(sum $arm tight_samples) refusing_samples=$(sum $arm refusing_samples) bypass_tight=$(sum $arm bypass_tight) tight_honoured=$(sum $arm tight_honoured) kicks=$(sum $arm kicks) admit_refusals=$(sum $arm admit_refusals) enospc=$(sum $arm enospc) commits=$(sum $arm commits)"
 done
-[ "$(sum 1 bypass_tight)" -gt 0 ] || echo "WARNING — the bypass never fired: the reserve never got tight in the bypass arm, so this run is not evidence"
-[ "$(sum 0 tight_honoured)" -gt 0 ] || echo "WARNING — the control arm never honoured a quiet while tight: no evidence of what the bypass changes"
+for arm in $ARMS; do
+    case $arm in
+    1:*) [ "$(sum $arm bypass_tight)" -gt 0 ] || echo "WARNING — arm $arm: the bypass never fired, so this arm is not evidence about it";;
+    0:*) [ "$(sum $arm tight_honoured)" -gt 0 ] || echo "WARNING — arm $arm: never honoured a quiet while tight, so this arm shows nothing about the bypass";;
+    esac
+done
 exit $rc

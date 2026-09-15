@@ -1346,6 +1346,16 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, pinscan_duty_pct, CTLFLAG_RW,
  * measured against the same workload with it off (scripts/vm-pinscan-tight-
  * test.sh). 1 = bypass the duty quiet when tessera_fs_meta_tight (default).
  */
+static int tessera_mark_dirty_meta_trigger = 1;
+SYSCTL_INT(_kern_tessera, OID_AUTO, mark_dirty_meta_trigger, CTLFLAG_RW,
+    &tessera_mark_dirty_meta_trigger, 0,
+    "mark_dirty's synchronous meta-reserve flush: 1 = when available sectors "
+    "fall under twice the staged work's need (default); 0 = legacy "
+    "(bump - meta_free) >= half the reserve (test A/B only)");
+static unsigned long tessera_stat_mark_dirty_meta_flushes = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, mark_dirty_meta_flushes, CTLFLAG_RD,
+    &tessera_stat_mark_dirty_meta_flushes, 0,
+    "synchronous flushes run inline by mark_dirty's meta-reserve trigger");
 static int tessera_pinscan_tight_bypass = 1;
 SYSCTL_INT(_kern_tessera, OID_AUTO, pinscan_tight_bypass, CTLFLAG_RW,
     &tessera_pinscan_tight_bypass, 0,
@@ -5371,6 +5381,36 @@ tessera_meta_soft_length(const struct tessera_mount *tmp_)
 	if (band > cap)
 		band = cap;
 	return (len > band ? len - band : len);
+}
+
+/*
+ * Metadata sectors the allocator can hand out right now: headroom below the
+ * soft ceiling plus the recycle list. meta_pending is EXCLUDED — it becomes
+ * free only at a pinscan swap, and nothing a flush does releases it.
+ * Unlocked read of counters; callers treat it as a heuristic.
+ */
+static uint64_t
+tessera_fs_meta_avail(const struct tessera_mount *tmp_)
+{
+	uint64_t msoft = tessera_meta_soft_length(tmp_);
+	uint64_t mused = tmp_->sb.meta_reserve_bump > tmp_->sb.meta_reserve_start
+	    ? tmp_->sb.meta_reserve_bump - tmp_->sb.meta_reserve_start : 0;
+	return ((msoft > mused ? msoft - mused : 0) +
+	    (uint64_t)tmp_->meta_free_count);
+}
+
+/*
+ * Estimated metadata sectors the work staged in memory will consume when the
+ * next flush drains it (see tessera_meta_admit_resv for the measured
+ * per-object charge).
+ */
+static uint64_t
+tessera_fs_meta_staged_need(const struct tessera_mount *tmp_)
+{
+	uint64_t resv = tessera_meta_admit_resv > 0 ?
+	    (uint64_t)tessera_meta_admit_resv : 0;
+	return ((((uint64_t)tmp_->pending_manifest_count +
+	    (uint64_t)tmp_->dirty_count) * resv) / TESSERA_META_RESV_UNIT);
 }
 
 /*
@@ -11498,13 +11538,49 @@ tessera_fs_mark_dirty(struct tessera_mount *tmp_)
 			    &tmp_->flush_task);
 		return;
 	}
-	const uint64_t used = tmp_->sb.meta_reserve_bump
-	    - tmp_->sb.meta_reserve_start;
-	const uint64_t cap  = tmp_->sb.meta_reserve_length;
-	const uint64_t free = (uint64_t)tmp_->meta_free_count;
-	if (tmp_->dirty_init && cap > 0 && (used > free) &&
-	    (used - free) * 2 >= cap) {
-		(void)tessera_fs_flush(tmp_);
+	/*
+	 * ★ Meta-reserve trigger: drain synchronously once the work staged in
+	 * memory could no longer be published from what the allocator has left
+	 * — available sectors under TWICE the staged work's estimated need.
+	 *
+	 * This used to fire while (bump - meta_free) * 2 >= reserve length.
+	 * That dates from when commit_sb recycled meta_pending (88f709fe), so a
+	 * flush was how pressure got relieved. Since pinscan took recycling
+	 * over, ONLY a scan releases pending sectors, and the old test counted
+	 * them as used: once half the reserve sat in pending, EVERY mutation ran
+	 * a full synchronous flush, which released nothing and COWed more — 37%
+	 * of mutations flushing inline on a 400k-file volume under churn.
+	 * Measured with scripts/vm-pinscan-tight-test.sh (3 x 90 s per arm,
+	 * worker rounds): legacy 826 -> this 1,431 with the tight bypass on
+	 * (inline flushes 90,326 -> 0), 294 -> 1,390 with it off.
+	 *
+	 * The legacy trigger was also, by accident, the thing driving reclaim
+	 * when the reserve ran short: every one of those commits kicked a scan.
+	 * Taking it away used to run a starved volume into the band and corrupt
+	 * it — that exposed four real bugs, fixed in a920a353 (btree frees on
+	 * failure, commit_extent, sb root write-back, and admission refusals
+	 * now scheduling a flush). Reclaim is driven from commit_sb
+	 * (tessera_fs_meta_pressure_kick), from the flush preflight, and from
+	 * tessera_fs_meta_admit's refusal path.
+	 */
+	if (tmp_->dirty_init && tmp_->sb.meta_reserve_length > 0) {
+		int fire;
+		if (tessera_mark_dirty_meta_trigger == 0) {
+			/* Legacy (A/B measurement only). */
+			const uint64_t used = tmp_->sb.meta_reserve_bump
+			    - tmp_->sb.meta_reserve_start;
+			const uint64_t free = (uint64_t)tmp_->meta_free_count;
+			fire = used > free && (used - free) * 2 >=
+			    tmp_->sb.meta_reserve_length;
+		} else {
+			fire = tessera_fs_meta_avail(tmp_) <
+			    2 * (tessera_fs_meta_staged_need(tmp_) +
+			    (uint64_t)tessera_meta_admit_slack);
+		}
+		if (fire) {
+			tessera_stat_mark_dirty_meta_flushes++;
+			(void)tessera_fs_flush(tmp_);
+		}
 	}
 
 repack_arm:
@@ -14074,14 +14150,8 @@ tessera_fs_meta_admit(struct tessera_mount *tmp_)
 {
 	if (tessera_meta_admit_resv <= 0)
 		return (0);
-	uint64_t msoft = tessera_meta_soft_length(tmp_);
-	uint64_t mused = tmp_->sb.meta_reserve_bump > tmp_->sb.meta_reserve_start
-	    ? tmp_->sb.meta_reserve_bump - tmp_->sb.meta_reserve_start : 0;
-	uint64_t mavail = (msoft > mused ? msoft - mused : 0) +
-	    (uint64_t)tmp_->meta_free_count;
-	uint64_t mneed = (((uint64_t)tmp_->pending_manifest_count +
-	    (uint64_t)tmp_->dirty_count) *
-	    (uint64_t)tessera_meta_admit_resv) / TESSERA_META_RESV_UNIT;
+	uint64_t mavail = tessera_fs_meta_avail(tmp_);
+	uint64_t mneed = tessera_fs_meta_staged_need(tmp_);
 	if (mavail < mneed + (uint64_t)tessera_meta_admit_slack) {
 		tessera_stat_meta_admit_refusals++;
 		/*
@@ -16528,13 +16598,9 @@ kick:
 static int
 tessera_fs_meta_tight(struct tessera_mount *tmp_)
 {
-	uint64_t msoft = tessera_meta_soft_length(tmp_);
-	uint64_t mused = tmp_->sb.meta_reserve_bump > tmp_->sb.meta_reserve_start
-	    ? tmp_->sb.meta_reserve_bump - tmp_->sb.meta_reserve_start : 0;
-	uint64_t mavail = (msoft > mused ? msoft - mused : 0) +
-	    (uint64_t)tmp_->meta_free_count;
+	uint64_t mavail = tessera_fs_meta_avail(tmp_);
 	return (mavail < (uint64_t)tmp_->meta_pending_count ||
-	    mavail < msoft / 4);
+	    mavail < tessera_meta_soft_length(tmp_) / 4);
 }
 
 static void
