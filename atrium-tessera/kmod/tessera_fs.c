@@ -3641,6 +3641,15 @@ struct tessera_mount {
 	struct g_consumer        *cp;        /* GEOM consumer for I/O */
 	struct cdev              *dev;
 	tessera_superblock_t      sb;
+	/*
+	 * ★ The roots a crash would recover to. [0] = the superblock last
+	 * written to sectors 0/1; [1] = the roots of the last journal
+	 * ROOT_UPDATE whose transaction committed (replay rolls forward to it,
+	 * even if the SB write that followed failed). Both equal sb at mount
+	 * and after every fully successful commit_sb. pinscan pins them in
+	 * addition to the in-memory roots — see tessera_fs_pinscan_run_impl.
+	 */
+	tessera_superblock_t      durable_sb[2];
 	struct tessera_kbio_ctx   bio_ctx;
 	tessera_block_io_t        bio;          /* data zone */
 	tessera_block_io_t        meta_bio;     /* metadata reserve */
@@ -6646,6 +6655,11 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		tmp_->readonly_snapshot     = 1;
 		tmp_->snapshot_gen          = requested_gen;
 	}
+
+	/* The roots-only replay above has rolled sb forward to exactly what a
+	 * crash from here would recover to: that is the durable set. */
+	tmp_->durable_sb[0] = tmp_->sb;
+	tmp_->durable_sb[1] = tmp_->sb;
 
 	tmp_->inode_tree = tessera_btree_open(&tmp_->meta_bio,
 	    tmp_->sb.inode_root, /*tree_kind*/ 0,
@@ -11335,9 +11349,27 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 			body.next_inode_no      = tmp_->sb.next_inode_no;
 			body.meta_reserve_bump  = tmp_->sb.meta_reserve_bump;
 			body.quota_tree_root    = tmp_->sb.quota_tree_root;
-			(void)tessera_journal_append(tmp_->journal, tx,
-			    TESSERA_ROOT_UPDATE, &body, sizeof body);
-			(void)tessera_journal_tx_commit(tmp_->journal, tx);
+			if (tessera_journal_append(tmp_->journal, tx,
+			    TESSERA_ROOT_UPDATE, &body, sizeof body)
+			    == TESSERA_OK &&
+			    tessera_journal_tx_commit(tmp_->journal, tx)
+			    == TESSERA_OK) {
+				/*
+				 * ★ Replay now rolls a crash forward to these
+				 * roots even if the SB write below fails, so
+				 * they are durable from this instant: pin them
+				 * (durable_sb[1]) and close the epoch. The
+				 * epoch used to close only after the SB write;
+				 * a failure in between left this commit's
+				 * freshly allocated nodes marked "never
+				 * durable", and the epoch sweep could recycle
+				 * nodes the journal record points at.
+				 */
+				tmp_->durable_sb[1] = tmp_->sb;
+				if (tmp_->meta_epoch_bm != NULL)
+					memset(tmp_->meta_epoch_bm, 0,
+					    tmp_->meta_pin_bitmap_bytes);
+			}
 		}
 	}
 	TPROF_ADD(TPROF_SB_JREC, _sbt);
@@ -11384,6 +11416,8 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 	 * empty journal AND a stale on-disk SB — unrecoverable state. */
 	_sbt = TPROF_T0();
 	tessera_kbio_barrier(&tmp_->bio_ctx);
+	tmp_->durable_sb[0] = tmp_->sb;   /* on disk and flushed */
+	tmp_->durable_sb[1] = tmp_->sb;
 
 	/* SB durably advanced. The journal record we just appended is now
 	 * applied; checkpoint frees its sectors so the next commit doesn't
@@ -15858,7 +15892,9 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 		 * happens AFTER a commit fails, so inject the failure. Used by
 		 * scripts/vm-commit-fail-test.sh. 0 = off (default).
 		 */
-		if (tessera_fault_commit_fail)
+		if (tessera_fault_commit_fail == 1 ||
+		    (tessera_fault_commit_fail == 2 &&
+		     tmp_ == tessera_singleton_mount))
 			r = EIO;
 		else
 			r = tessera_commit_sb(tmp_);
@@ -16064,6 +16100,33 @@ tessera_fs_pinscan_run_impl(struct tessera_mount *tmp_)
 	 * the pin bitmap has to know about it. Reading the fields here is safe:
 	 * they are published under the gate at activation, and we hold it.
 	 */
+	/*
+	 * ★ Pin what a CRASH would recover to, not only what is in memory.
+	 * After a failed flush the drains that already ran have advanced the
+	 * in-memory roots and freed, into meta_pending, nodes the durable
+	 * superblock (or the last committed journal ROOT_UPDATE) still
+	 * references. Retained snapshot records cover only the inode, pack-
+	 * registry and free-extent trees, so a durable blob-index, snapshots,
+	 * quota or dead-extent node was unpinned — and meta_pending_drain,
+	 * which the flush preflight and the allocator's emergency path call
+	 * without any durable commit behind them, released it for reuse while
+	 * the on-disk superblock still pointed at it. Nodes shared with the
+	 * live trees are pruned on the second walk, so this costs little.
+	 */
+#define TESSERA_PINSCAN_D0(field, kind, ksz, vsz, tier, why) \
+	tmp_->durable_sb[0].field,
+#define TESSERA_PINSCAN_D1(field, kind, ksz, vsz, tier, why) \
+	tmp_->durable_sb[1].field,
+	/* Root values only: a whole tessera_superblock_t is 4 KiB, and two of
+	 * them on this kstack would be half of it. */
+	const uint64_t droot0[TESSERA_RESERVE_TREE_COUNT] = {
+		TESSERA_RESERVE_TREES(TESSERA_PINSCAN_D0)
+	};
+	const uint64_t droot1[TESSERA_RESERVE_TREE_COUNT] = {
+		TESSERA_RESERVE_TREES(TESSERA_PINSCAN_D1)
+	};
+#undef TESSERA_PINSCAN_D0
+#undef TESSERA_PINSCAN_D1
 	uint64_t r_gc_inode = 0, r_gc_reg = 0, r_gc_snap = 0;
 	if (tmp_->gc_scan_active) {
 		r_gc_inode = tmp_->gc_scan_inode_root;
@@ -16100,7 +16163,7 @@ tessera_fs_pinscan_run_impl(struct tessera_mount *tmp_)
 #define TESSERA_PINSCAN_ROW(field, kind, ksz, vsz, tier, why) \
 	{ tmp_->sb.field, (int)(kind), (ksz), (vsz) },
 	struct { uint64_t root; int kind; uint32_t ksz; uint32_t vsz; }
-	    roots[TESSERA_RESERVE_TREE_COUNT + 3] = {
+	    roots[3 * TESSERA_RESERVE_TREE_COUNT + 3] = {
 		TESSERA_RESERVE_TREES(TESSERA_PINSCAN_ROW)
 		/* ★ #72/#78: the in-flight GC scan's frozen roots. Not
 		 * superblock state — they are a snapshot of roots already
@@ -16116,6 +16179,17 @@ tessera_fs_pinscan_run_impl(struct tessera_mount *tmp_)
 		    TESSERA_SNAPSHOT_RECORD_SIZE },
 	};
 #undef TESSERA_PINSCAN_ROW
+	/* Durable roots that differ from the live ones go in the trailing
+	 * slots, with the live row's kind and sizes (same tree). Zero = skip. */
+	for (int t = 0; t < TESSERA_RESERVE_TREE_COUNT; t++) {
+		const int s0 = TESSERA_RESERVE_TREE_COUNT + 3 + t;
+		const int s1 = 2 * TESSERA_RESERVE_TREE_COUNT + 3 + t;
+		roots[s0] = roots[t];
+		roots[s1] = roots[t];
+		roots[s0].root = (droot0[t] != roots[t].root) ? droot0[t] : 0;
+		roots[s1].root = (droot1[t] != roots[t].root &&
+		    droot1[t] != droot0[t]) ? droot1[t] : 0;
+	}
 	for (int i = 0; i < (int)nitems(roots) && !aborted; i++) {
 		if (roots[i].root == 0) continue;
 		tessera_btree_t *t = tessera_btree_open(&tmp_->meta_bio,
@@ -21123,6 +21197,36 @@ tessera_sysctl_repack_now(SYSCTL_HANDLER_ARGS)
  * measures. Two forced scans of an unchanged volume are directly
  * comparable — that is what makes the pinscan_prune A/B a controlled one.
  */
+/*
+ * kern.tessera.fault_pinscan_drain — TEST ONLY. Write 1 to run a pin-bitmap
+ * scan and then meta_pending_drain on the most recently mounted volume: the
+ * release that the flush preflight and the allocator's emergency path perform
+ * after a failed flush. Naturally that needs a failed flush AND a tight
+ * reserve at once, which ordinary load almost never produces (the preflight
+ * keeps the reserve alive); scripts/vm-durable-pin-crash-test.sh drives it
+ * deterministically with fault_commit_fail=2.
+ */
+static int
+tessera_sysctl_fault_pinscan_drain(SYSCTL_HANDLER_ARGS)
+{
+	int go = 0;
+	int err = sysctl_handle_int(oidp, &go, 0, req);
+	if (err != 0 || req->newptr == NULL) return (err);
+	if (go == 0) return (0);
+	struct tessera_mount *tmp_ = tessera_singleton_mount;
+	if (tmp_ == NULL) return (ENXIO);
+	tessera_fs_pinscan_run(tmp_);
+	tessera_fs_flush_gate_enter(tmp_);
+	tessera_fs_meta_pending_drain(tmp_);
+	tessera_fs_flush_gate_exit(tmp_);
+	return (0);
+}
+SYSCTL_PROC(_kern_tessera, OID_AUTO, fault_pinscan_drain,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+    NULL, 0, tessera_sysctl_fault_pinscan_drain, "I",
+    "TEST ONLY: write 1 to run pinscan + meta_pending_drain on the most "
+    "recently mounted volume (the post-failed-flush release path)");
+
 static int
 tessera_sysctl_pinscan_now(SYSCTL_HANDLER_ARGS)
 {
@@ -27090,7 +27194,8 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, commit_failed_clear, CTLFLAG_RW,
 SYSCTL_INT(_kern_tessera, OID_AUTO, fault_commit_fail, CTLFLAG_RW,
     &tessera_fault_commit_fail, 0,
     "#135 TEST ONLY: 1 = make every superblock commit fail, to exercise the "
-    "cannot-commit path (sync/fsync EIO, allocations refused). 0 = off");
+    "cannot-commit path (sync/fsync EIO, allocations refused); 2 = only on the "
+    "most recently mounted volume (leaves the root committing). 0 = off");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, commit_failed, CTLFLAG_RD,
     &tessera_stat_commit_failed, 0,
     "#135: times a volume entered the cannot-commit state. NON-ZERO MEANS "

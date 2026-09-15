@@ -176,8 +176,105 @@ run() {
     rm -f $STOP
 }
 
+# ── crash variant ─────────────────────────────────────────────────────────
+# crash-arm:    volume + population + load tunables + DETACHED workers, then
+#               return — the host cuts power mid-churn (QMP quit).
+# crash-verify: after the reboot — mount (journal replay), walk the tree, count
+#               STALE reads and replay refusals, unmount, fsck, drop the
+#               partition. Tunables need no restore: the reboot reset them.
+crash_arm() {
+    SECS=${SECS:-600}; PART_MB=${PART_MB:-256}
+    DIRS=${DIRS:-40}; PER_DIR=${PER_DIR:-500}
+    diskinfo -s $DEV | grep -q '^atrium-scratch$' || { echo REFUSING_ident; exit 2; }
+    cleanup >/dev/null
+    gpart create -s gpt $DISK >/dev/null && gpart add -t freebsd-ufs -s ${PART_MB}M -i 1 $DISK >/dev/null \
+        || { echo PART_FAIL; exit 3; }
+    mkdir -p $M $RUN
+    mkfs-tessera $PART >/dev/null 2>&1 && mount -t tessera $PART $M || { echo MKFS_FAIL; exit 3; }
+    d=0; while [ $d -lt $DIRS ]; do mkdir $M/d$d; (cd $M/d$d && jot $PER_DIR | xargs touch 2>/dev/null); d=$((d+1)); done
+    # Content with a known checksum, committed before any stress: after the
+    # crash it must read back byte-exact (a recycled blob-index or registry
+    # node would lose or misdirect it).
+    mkdir -p $M/keep; i=0; while [ $i -lt 20 ]; do dd if=/dev/random of=$M/keep/f$i bs=65536 count=4 2>/dev/null; i=$((i+1)); done
+    sync; sleep 3
+    (cd $M/keep && sha256 -q f* ) > $RUN/keep.sha 2>/dev/null
+    cp $RUN/keep.sha /root/rx.keep.sha
+    # ★ The flush PREFLIGHT stays ON here even under STARVE: its pinscan +
+    # meta_pending_drain after a failed flush is the path under test, and
+    # `run`'s STARVE turned it off. Only the pressure kicks go.
+    if [ "${STARVE:-0}" = 1 ]; then
+        sysctl kern.tessera.meta_pressure_pct=0 kern.tessera.meta_pressure_pending=0 >/dev/null
+        sysctl kern.tessera.preflight=${PREFLIGHT:-1} >/dev/null
+    fi
+    if [ "${STARVE:-0}" = 1 ] || [ "${SLOW_RECLAIM:-0}" = 1 ]; then
+        sysctl kern.tessera.pinscan_duty_pct=1 >/dev/null
+        sysctl kern.tessera.pinscan_tight_bypass=0 >/dev/null 2>&1
+    fi
+    B0=$(S meta_band_refusals); echo "$B0" > $RUN/b0
+    dmesg -c >/dev/null 2>&1
+    DEADLINE=$(( $(date +%s) + SECS )); per=$(( DIRS / 4 ))
+    w=0; while [ $w -lt 4 ]; do
+        daemon -f sh -c 'w=$1; DEADLINE=$2; per=$3; PER=$4; M=/mnt/rxp; r=0
+          while [ $(date +%s) -lt $DEADLINE ]; do
+            d=$(( w * per )); e=$(( d + per ))
+            while [ $d -lt $e ]; do (cd $M/d$d 2>/dev/null && jot $PER | xargs touch -c 2>/dev/null); d=$((d+1)); done
+            d=$(( w * per ))
+            j=0; while [ $j -lt 50 ]; do echo "$w.$r.$j" > $M/d$d/n$w.$r.$j 2>/dev/null; j=$((j+1)); done
+            [ $r -gt 0 ] && { j=0; while [ $j -lt 50 ]; do rm -f $M/d$d/n$w.$((r-1)).$j; j=$((j+1)); done; }
+            sync; r=$((r+1))
+          done' $MARK $w $DEADLINE $per $PER_DIR
+        w=$((w+1))
+    done
+    echo "armed: $(pgrep -f $MARK | wc -l | tr -d ' ') workers"
+}
+
+crash_stale_lines() {
+    dmesg | grep -B2 STALE | head -${1:-12}
+}
+
+crash_status() {
+    echo "band_refusals=$(( $(S meta_band_refusals) - $(cat $RUN/b0 2>/dev/null || echo 0) )) drain_failed=$(dmesg | grep -c 'drain failed') commit_extent_failed=$(S commit_extent_failed) preflight_scans=$(dmesg | grep -c 'preflight') stale_live=$(dmesg | grep -c STALE)"
+}
+
+crash_verify() {
+    PART_MB=${PART_MB:-256}; DIRS=${DIRS:-40}; PER_DIR=${PER_DIR:-500}
+    diskinfo -s $DEV | grep -q '^atrium-scratch$' || { echo REFUSING_ident; exit 2; }
+    [ -e $PART ] || { echo "verify: no $PART after reboot"; exit 3; }
+    mkdir -p $M $RUN
+    if ! mount -t tessera $PART $M; then
+        echo "mount_ok=0"
+        tessera-fsck $PART > $RUN/fsck 2>&1
+        echo "fsck_problems=$(grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem|stale|invalid|bad' $RUN/fsck)"
+        return
+    fi
+    echo "mount_ok=1"
+    walk_err=$(find $M -type f 2>&1 >/dev/null | wc -l | tr -d ' ')
+    files=$(find $M -type f 2>/dev/null | wc -l | tr -d ' ')
+    keep_bad=0
+    if [ -f /root/rx.keep.sha ]; then
+        (cd $M/keep 2>/dev/null && sha256 -q f* ) > $RUN/keep.after 2>/dev/null
+        cmp -s /root/rx.keep.sha $RUN/keep.after || keep_bad=$(diff /root/rx.keep.sha $RUN/keep.after | grep -c '^<')
+    fi
+    miss=0; d=0; while [ $d -lt $DIRS ]; do [ -e $M/d$d/$PER_DIR ] || miss=$((miss+1)); d=$((d+1)); done
+    sleep 5; sync
+    echo "files=$files walk_errors=$walk_err keep_bad=$keep_bad survivor_missing=$miss stale=$(dmesg | grep -c STALE) pinscan_aborts=$(dmesg | grep -c 'pinscan aborted') replay_refused=$(dmesg | grep -c 'REFUSED') replay=\"$(dmesg | grep 'journal replay (full)' | tail -1 | sed 's/.*applied //')\""
+    cd /; if timeout 180 umount $M 2>/dev/null; then echo umount_ok=1; else echo umount_ok=0; fi
+    if mount | grep -q " $M "; then
+        echo "fsck_problems=SKIPPED_MOUNTED"
+    else
+        tessera-fsck $PART > $RUN/fsck 2>&1
+        echo "fsck_problems=$(grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem' $RUN/fsck)"
+        grep -iE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem' $RUN/fsck | sed -E 's/[0-9]{3,}/N/g' | sort | uniq -c | sort -rn | head -5 | sed 's/^/  fsck: /'
+    fi
+    gpart destroy -F $DISK >/dev/null 2>&1; rm -f /root/rx.keep.sha
+}
+
 case "${1:-}" in
-cleanup) cleanup ;;
-run)     run ;;
-*)       echo "usage: $0 cleanup|run"; exit 2 ;;
+cleanup)      cleanup ;;
+crash-stale)  crash_stale_lines 40 ;;
+run)          run ;;
+crash-arm)    crash_arm ;;
+crash-status) crash_status ;;
+crash-verify) crash_verify ;;
+*)            echo "usage: $0 cleanup|run|crash-arm|crash-status|crash-verify"; exit 2 ;;
 esac
