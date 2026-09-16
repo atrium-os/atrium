@@ -18,7 +18,8 @@
 #
 # HOW: guest-reserve-exhaustion.sh crash-arm builds a small volume, commits a
 # set of checksummed files, starves reclaim (STARVE=1 by default) and starts
-# churn; after CUT_AFTER seconds this script cuts power (QMP quit), relaunches
+# churn; this script polls the flush counters and cuts power (QMP quit) only
+# while flushes are failing (see the loop below), relaunches
 # the VM, and crash-verify mounts (journal replay), walks the tree, re-reads
 # the checksummed files, and fscks. Repeats CUTS times and STOPS AT THE FIRST
 # BAD CUT (fail fast).
@@ -27,10 +28,10 @@
 # intact, no walk errors, fsck clean. Dead-arm guard: the cut must have landed
 # while flushes were failing (drain_failed or band_refusals > 0 before the cut).
 #
-#   sh scripts/vm-exhaustion-crash-test.sh              # CUTS=5 CUT_AFTER=75
+#   sh scripts/vm-exhaustion-crash-test.sh   # CUTS=5 WARMUP=20 POLL=3 MAX_WAIT=600 MAX_SKIPS=$CUTS
 set -u
 BSD="$(cd "$(dirname "$0")/.." && pwd)"
-CUTS=${CUTS:-5}; CUT_AFTER=${CUT_AFTER:-75}
+CUTS=${CUTS:-5}; WARMUP=${WARMUP:-20}; POLL=${POLL:-3}; MAX_WAIT=${MAX_WAIT:-600}; MAX_SKIPS=${MAX_SKIPS:-$CUTS}; skipped=0
 VSSH="$BSD/scripts/vssh"; SOCK=/tmp/qmp.sock
 KEY="$HOME/.ssh/fresco_bsd_ed25519"
 SSHO="-i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
@@ -50,7 +51,7 @@ KO="$BSD/atrium-tessera/kmod/tessera_fs.ko"
 KMOD=$(shasum -a 256 "$KO" | cut -c1-16)
 wait_ready || { echo "FAIL — VM not reachable"; exit 1; }
 k=$(timeout 20 $VSSH "sha256 -q /boot/kernel/tessera_fs.ko | cut -c1-16" 2>/dev/null | tr -d '\r')
-echo "=== EXHAUSTION CRASH TEST $(date) guest_kmod=$k tree_kmod=$KMOD cuts=$CUTS cut_after=${CUT_AFTER}s $ENVS ==="
+echo "=== EXHAUSTION CRASH TEST $(date) guest_kmod=$k tree_kmod=$KMOD cuts=$CUTS warmup=${WARMUP}s poll=${POLL}s max_wait=${MAX_WAIT}s $ENVS ==="
 [ "$k" = "$KMOD" ] || echo "NOTE: guest module differs from the tree (baseline run against an older kmod?)"
 
 c=1
@@ -59,8 +60,44 @@ while [ $c -le $CUTS ]; do
         || { echo "FAIL — could not copy the guest script"; exit 1; }
     arm=$(timeout 900 $VSSH "$ENVS SECS=900 sh /root/guest-reserve-exhaustion.sh crash-arm" 2>&1 | tr -d '\r')
     case "$arm" in *armed:*) ;; *) echo "cut $c: FAIL — arm did not complete: $arm"; exit 1;; esac
-    sleep $CUT_AFTER
+    # Cut only WHILE flushes are failing. A fixed delay mostly landed in a
+    # healthy window (PREFLIGHT=1 run: 3 of 5 cuts saw no failure at all),
+    # so poll the counters and cut the moment one interval shows fresh
+    # band refusals AND failed drains — plus, when the preflight is on, a
+    # preflight scan within the last few intervals, so the release path is
+    # live too. Never cut blind: if that state does not arrive within
+    # MAX_WAIT the round FAILS as a dead arm.
+    sleep $WARMUP
+    waited=$WARMUP; prev=""; pre_hist="0 0 0"; armed_cut=0
+    while [ $waited -lt $MAX_WAIT ]; do
+        live=$(timeout 10 $VSSH "sh /root/guest-reserve-exhaustion.sh crash-live" 2>/dev/null | tr -d '\r' | grep '^live ')
+        if [ -n "$live" ] && [ -n "$prev" ]; then
+            g() { echo "$1" | sed -n "s/.* $2=\([0-9]*\).*/\1/p"; }
+            db=$(( $(g "$live" band) - $(g "$prev" band) ))
+            dd=$(( $(g "$live" drain) - $(g "$prev" drain) ))
+            dp=$(( $(g "$live" pre) - $(g "$prev" pre) ))
+            pre_hist="$(echo $pre_hist | cut -d' ' -f2-) $dp"
+            pre_recent=$(echo $pre_hist | tr ' ' '+' | bc)
+            if [ $db -gt 0 ] && [ $dd -gt 0 ] && { [ "${PREFLIGHT:-1}" = 0 ] || [ $pre_recent -gt 0 ]; }; then
+                armed_cut=1; break
+            fi
+        fi
+        [ -n "$live" ] && prev="$live"
+        sleep $POLL; waited=$((waited + POLL))
+    done
     st=$(timeout 30 $VSSH "sh /root/guest-reserve-exhaustion.sh crash-status" 2>/dev/null | tr -d '\r')
+    if [ $armed_cut = 0 ]; then
+        # Not a failure of the volume — the workload never reached the state
+        # under test (with the preflight on, its rescans usually keep the
+        # reserve alive). Re-arm instead of cutting blind; the run still
+        # FAILS if it cannot land CUTS real cuts.
+        skipped=$((skipped + 1))
+        echo "cut $c: SKIPPED ($skipped/$MAX_SKIPS) — flushes never failed within ${MAX_WAIT}s (${st:-no status}); re-arming, no power cut"
+        timeout 200 $VSSH "sh /root/guest-reserve-exhaustion.sh cleanup" >/dev/null 2>&1
+        [ $skipped -le $MAX_SKIPS ] || { echo "FAIL — dead arm: only $((c - 1)) of $CUTS cuts landed while flushes were failing ($skipped attempts never got there)"; exit 1; }
+        continue
+    fi
+    echo "cut $c: cutting at ${waited}s — last ${POLL}s interval: +$db refusals, +$dd failed drains; preflight scans in last 3 intervals: $pre_recent"
     power_cut_and_relaunch || { echo "cut $c: FAIL — VM did not come back after the power cut"; exit 1; }
     ver=$(timeout 1500 $VSSH "$ENVS sh /root/guest-reserve-exhaustion.sh crash-verify" 2>&1 | tr -d '\r')
     echo "cut $c: before cut: ${st:-status unavailable}"
@@ -82,9 +119,9 @@ while [ $c -le $CUTS ]; do
     s_pre=$(echo "$st" | sed -n 's/.*preflight_scans=\([0-9]*\).*/\1/p')
     if [ "${s_drain:-0}" = 0 ] && [ "${s_band:-0}" = 0 ]; then
         echo "cut $c: NOTE — flushes were not failing when power was cut; this cut does not test the gap"
-    elif [ "${s_pre:-0}" = 0 ]; then
+    elif [ "${PREFLIGHT:-1}" = 1 ] && [ "${s_pre:-0}" = 0 ]; then
         echo "cut $c: NOTE — no preflight scan+drain ran during the failures; the main release path was not exercised"
     fi
     c=$((c+1))
 done
-echo "PASS — $CUTS power cuts during reserve exhaustion, every volume replayed clean"
+echo "PASS — $CUTS power cuts, each landed while flushes were failing ($skipped attempt(s) skipped: never reached that state), every volume replayed clean"

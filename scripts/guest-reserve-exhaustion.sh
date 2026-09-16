@@ -211,6 +211,7 @@ crash_arm() {
         sysctl kern.tessera.pinscan_tight_bypass=0 >/dev/null 2>&1
     fi
     B0=$(S meta_band_refusals); echo "$B0" > $RUN/b0
+    S flush_drain_failed > $RUN/d0; S preflight_scans > $RUN/p0; S commit_extent_failed > $RUN/c0
     dmesg -c >/dev/null 2>&1
     DEADLINE=$(( $(date +%s) + SECS )); per=$(( DIRS / 4 ))
     w=0; while [ $w -lt 4 ]; do
@@ -238,7 +239,11 @@ crash_status() {
     dmesg | sed -n 's/.*btree_delete inode_no=\([0-9]*\) failed.*/\1/p' | sort -un > /root/rx.tomb_failed
     cp /root/rx.tomb_failed /root/rx.tomb_failed.keep 2>/dev/null
 
-    echo "band_refusals=$(( $(S meta_band_refusals) - $(cat $RUN/b0 2>/dev/null || echo 0) )) drain_failed=$(dmesg | grep -c 'drain failed') commit_extent_failed=$(S commit_extent_failed) preflight_scans=$(dmesg | grep -c 'preflight') stale_live=$(dmesg | grep -c STALE)"
+    # Counters, not dmesg: the message buffer wraps under a failing flush
+    # storm, so line counts plateau. Deltas from the crash-arm baselines.
+    # (kern.tessera counters are global; the root contributes too, rarely.)
+    b() { echo $(( $(S $1) - $(cat $RUN/$2 2>/dev/null || echo 0) )); }
+    echo "band_refusals=$(b meta_band_refusals b0) drain_failed=$(b flush_drain_failed d0) commit_extent_failed=$(b commit_extent_failed c0) preflight_scans=$(b preflight_scans p0) stale_live=$(dmesg | grep -c STALE)"
 }
 
 crash_verify() {
@@ -286,6 +291,8 @@ crash-stale)  crash_stale_lines 40 ;;
 run)          run ;;
 crash-arm)    crash_arm ;;
 crash-status) crash_status ;;
+crash-live)   # raw counters, one line — the host polls this to time the cut
+              echo "live band=$(S meta_band_refusals) drain=$(S flush_drain_failed) pre=$(S preflight_scans) cef=$(S commit_extent_failed)" ;;
 crash-verify) crash_verify ;;
 *)            echo "usage: $0 cleanup|run|crash-arm|crash-status|crash-verify"; exit 2 ;;
 esac

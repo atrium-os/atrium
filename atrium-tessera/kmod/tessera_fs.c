@@ -1467,6 +1467,21 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, unlinked_reaped, CTLFLAG_RD,
     "close, freed when the volume went writable");
 /* kern.tessera.legacy_orphan_sweep (loader tunable): 0 = off, 1 = report
  * only (count, free nothing, leave the feature bit clear), 2 = free. */
+/* Seconds between retries of a flush that left work staged. The flush timer
+ * is otherwise armed only by mark_dirty, and only when not already pending:
+ * once a flush FAILS (reserve exhausted), the timer is no longer pending and
+ * nothing re-arms it unless a new mutation arrives. Measured: with the
+ * workload stopped, generation, band refusals and failed drains all stood
+ * still for 180 s with 5917 inodes staged — the volume never tried again,
+ * and unmount discarded them. */
+static int tessera_flush_retry_sec = 1;
+SYSCTL_INT(_kern_tessera, OID_AUTO, flush_retry_sec, CTLFLAG_RW,
+    &tessera_flush_retry_sec, 0,
+    "seconds before retrying a flush that left work staged (0 disables)");
+static unsigned long tessera_stat_flush_retry_armed = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, flush_retry_armed, CTLFLAG_RD,
+    &tessera_stat_flush_retry_armed, 0,
+    "retries armed for a flush that could not drain everything");
 static int tessera_legacy_orphan_sweep = 2;
 SYSCTL_INT(_kern_tessera, OID_AUTO, legacy_orphan_sweep, CTLFLAG_RWTUN,
     &tessera_legacy_orphan_sweep, 0,
@@ -3330,6 +3345,49 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, meta_admit_flush_kicks, CTLFLAG_RD,
     &tessera_stat_meta_admit_flush_kicks, 0,
     "flushes scheduled by a metadata admission refusal so the preflight "
     "scan reclaims (see tessera_fs_meta_admit)");
+static unsigned long tessera_stat_drain_fail_manifests = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, drain_fail_manifests, CTLFLAG_RD,
+    &tessera_stat_drain_fail_manifests, 0,
+    "flushes whose pending-manifest drain failed (no inode drain, no commit)");
+static unsigned long tessera_stat_drain_fail_inodes = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, drain_fail_inodes, CTLFLAG_RD,
+    &tessera_stat_drain_fail_inodes, 0,
+    "flushes whose dirty-inode drain failed");
+static unsigned long tessera_stat_drain_inodes_written = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, drain_inodes_written, CTLFLAG_RD,
+    &tessera_stat_drain_inodes_written, 0,
+    "inode records written by drain batches (committed or not)");
+static unsigned long tessera_stat_drain_fail_first_chunk = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, drain_fail_first_chunk, CTLFLAG_RD,
+    &tessera_stat_drain_fail_first_chunk, 0,
+    "inode drains that failed on their FIRST chunk — zero progress made");
+static unsigned long tessera_stat_flush_drain_failed = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, flush_drain_failed, CTLFLAG_RD,
+    &tessera_stat_flush_drain_failed, 0,
+    "flushes whose pending-manifest or dirty-inode drain failed (the commit "
+    "was abandoned; in-memory roots now run ahead of the durable ones)");
+static unsigned long tessera_stat_preflight_freed = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, preflight_freed, CTLFLAG_RD,
+    &tessera_stat_preflight_freed, 0,
+    "sectors added to meta_free by preflight scans (net of the scan)");
+static unsigned long tessera_stat_preflight_unproductive = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, preflight_unproductive, CTLFLAG_RD,
+    &tessera_stat_preflight_unproductive, 0,
+    "preflight scans that added nothing to meta_free");
+static unsigned long tessera_stat_preflight_nocommit = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, preflight_nocommit, CTLFLAG_RD,
+    &tessera_stat_preflight_nocommit, 0,
+    "preflight scans with no durable commit since the previous preflight "
+    "scan on that mount");
+static unsigned long tessera_stat_preflight_ms = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, preflight_ms, CTLFLAG_RD,
+    &tessera_stat_preflight_ms, 0,
+    "total wall time spent in preflight scans (ms)");
+static unsigned long tessera_stat_preflight_scans = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, preflight_scans, CTLFLAG_RD,
+    &tessera_stat_preflight_scans, 0,
+    "synchronous meta-reserve preflight scans (pinscan + pending drain) "
+    "run by the flush");
 static unsigned long tessera_stat_commit_extent_failed = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, commit_extent_failed, CTLFLAG_RD,
     &tessera_stat_commit_extent_failed, 0,
@@ -3345,6 +3403,7 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_cas_invalidate_ns, CTLFLAG_RD,
     &tessera_stat_gc_cas_invalidate_ns, 0,
     "cumulative ns of GC pass-3 CAS cache invalidation");
 static unsigned long tessera_stat_gc_apply_delete_failed = 0;
+static unsigned long tessera_stat_gc_apply_free_skipped = 0;
 /* pass 2 read a pack header whose pack_id is not the registry entry it was sent
  * to: a stale or foreign read. The pack is KEPT. Non-zero names a coherence hole. */
 static unsigned long tessera_stat_gc_pack_id_mismatch = 0;
@@ -3765,6 +3824,7 @@ struct tessera_mount {
 	struct taskqueue         *pinscan_tq;
 	struct task               pinscan_task;
 	int                       pinscan_tq_init;
+	uint64_t                  preflight_last_gen;
 	/* One-time legacy orphan sweep (tessera_fs_legacy_sweep_task):
 	 * its queue, its unmount abort, and the live sweep the rename
 	 * barrier notes into (NULL when none is walking). */
@@ -13096,8 +13156,11 @@ tessera_fs_dirty_inodes_drain(struct tessera_mount *tmp_)
 			}
 			mtx_unlock(&tmp_->flush_mtx);
 			done += take;
+			tessera_stat_drain_inodes_written += take;
 		}
 		if (brc != 0) {
+			if (done == 0)
+				tessera_stat_drain_fail_first_chunk++;
 			/* Unmark everything not yet applied; retry next
 			 * flush with data intact. */
 			mtx_lock(&tmp_->flush_mtx);
@@ -14951,6 +15014,14 @@ tessera_fs_meta_admit(struct tessera_mount *tmp_)
 	if (tessera_meta_admit_resv <= 0)
 		return (0);
 	uint64_t mavail = tessera_fs_meta_avail(tmp_);
+	/*
+	 * ★ Doubling this for the COW peak was MEASURED and did NOT prevent
+	 * the undrainable-backlog wedge: the backlog also grows through the
+	 * REMOVE paths, which skip admission by design so unlink can unstick
+	 * a full volume (7060 staged with avail=0 either way, and ~1200 of
+	 * them appeared after the writers were killed). Left un-doubled;
+	 * the wedge needs a fix where the backlog actually comes from.
+	 */
 	uint64_t mneed = tessera_fs_meta_staged_need(tmp_);
 	if (mavail < mneed + (uint64_t)tessera_meta_admit_slack) {
 		tessera_stat_meta_admit_refusals++;
@@ -16348,13 +16419,48 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	 * mounted in that state. */
 	uint64_t _soft = tessera_meta_soft_length(tmp_);
 	uint64_t _used = tmp_->sb.meta_reserve_bump - tmp_->sb.meta_reserve_start;
+	/*
+	 * ★ The 8192-sector margin is an EARLY-WARNING threshold, not a bug.
+	 * Scaling it to this flush's staged need (capped at soft/8) was
+	 * MEASURED and is much worse: arming only once `used >= soft` means
+	 * arming inside the band, where a scan recovers almost nothing —
+	 * 4507 of 5020 scans freed 0, commits fell 48451 -> 4574 and band
+	 * refusals rose 734 -> 1,307,250 in a 180 s window. On a volume whose
+	 * whole reserve is smaller than the margin the test reduces to "keep
+	 * reclaiming whenever the free list is low", which is exactly what
+	 * keeps a small volume alive. Leave it flat.
+	 */
 	if (tessera_preflight_enable && tmp_->dirty_init &&
 	    tmp_->meta_free_count <= (uint32_t)tessera_meta_free_lowat &&
 	    (_used >= _soft || _soft - _used < 8192)) {
+		tessera_stat_preflight_scans++;
 		printf("tessera_fs: meta_reserve preflight — synchronous "
 		    "pinscan (pending=%u)\n", tmp_->meta_pending_count);
+		sbintime_t _pf0 = sbinuptime();
+		uint32_t _free0 = tmp_->meta_free_count;
+		/*
+		 * ★ MEASURED, do NOT turn this into a skip: an A/B that
+		 * skipped the scan when no commit had landed since the last
+		 * one (and pending had not grown) collapsed the volume —
+		 * 5-20x fewer scans, but commits 48.6k -> 12-21k and band
+		 * refusals 419 -> 1.3 MILLION, dirty stuck at 20k, writers
+		 * refused. In the exhausted state the commit CANNOT land
+		 * until a scan frees sectors, so "no commit since last scan"
+		 * is the state that needs the scan MOST, not proof it is
+		 * pointless.
+		 */
+		if (tmp_->sb.generation == tmp_->preflight_last_gen)
+			tessera_stat_preflight_nocommit++;
+		tmp_->preflight_last_gen = tmp_->sb.generation;
 		tessera_fs_pinscan_run(tmp_);
 		tessera_fs_meta_pending_drain(tmp_);
+		if (tmp_->meta_free_count > _free0)
+			tessera_stat_preflight_freed +=
+			    tmp_->meta_free_count - _free0;
+		else
+			tessera_stat_preflight_unproductive++;
+		tessera_stat_preflight_ms +=
+		    (unsigned long)((sbinuptime() - _pf0) / SBT_1MS);
 		/* Escalation valve (retention-economics spiral): if the
 		 * scan freed NOTHING, everything pending is legitimately
 		 * pinned by retained snapshots — and once the reserve hits
@@ -16595,6 +16701,10 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	_tp = TPROF_T0();
 	int r = tessera_fs_pending_manifests_drain(tmp_);
 	TPROF_ADD(TPROF_FL_PENDING, _tp);
+	if (r != 0) {
+		tessera_stat_flush_drain_failed++;
+		tessera_stat_drain_fail_manifests++;
+	}
 	if (r != 0)
 		printf("tessera_fs: flush — pending_manifests_drain failed: %d "
 		    "(unmounting=%d sb_dirty=%d)\n",
@@ -16603,6 +16713,10 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 		_tp = TPROF_T0();
 		r = tessera_fs_dirty_inodes_drain(tmp_);
 		TPROF_ADD(TPROF_FL_INODES, _tp);
+		if (r != 0) {
+			tessera_stat_flush_drain_failed++;
+			tessera_stat_drain_fail_inodes++;
+		}
 		if (r != 0)
 			printf("tessera_fs: flush — dirty_inodes_drain failed: "
 			    "%d (unmounting=%d sb_dirty=%d)\n",
@@ -16725,6 +16839,24 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 	tmp_->flush_in_progress = 0;
 	tmp_->flush_gate_owner  = NULL;
 	wakeup(&tmp_->flush_in_progress);
+	/*
+	 * ★ Work left staged? Come back for it. mark_dirty arms this timer
+	 * only on a NEW mutation and only when it is not already pending, so
+	 * a flush that failed (or drained only part of its batch) is the end
+	 * of the line the moment the writers stop: nothing re-arms the
+	 * callout, the reserve reclaim that runs inside the flush never runs
+	 * again, and the staged work is discarded at unmount. Retrying costs
+	 * one flush per second on a volume that is already failing, and it is
+	 * what lets a stalled volume recover once reclaim frees space.
+	 */
+	if (tessera_flush_retry_sec > 0 && tmp_->flush_co_init &&
+	    !tmp_->flush_unmounting && !callout_pending(&tmp_->flush_co) &&
+	    (tmp_->sb_dirty || tmp_->dirty_count > 0 ||
+	     tmp_->dirent_log_count > 0 || tmp_->pending_manifest_count > 0)) {
+		tessera_stat_flush_retry_armed++;
+		callout_reset(&tmp_->flush_co, hz * tessera_flush_retry_sec,
+		    tessera_fs_flush_callout, tmp_);
+	}
 	mtx_unlock(&tmp_->flush_mtx);
 	return (r);
 }
@@ -20472,8 +20604,9 @@ next_p:
 			printf("GC-TRACE free mnt=%s pass=%lu pack=%8D bh0=%8D nbh=%u\n",
 			    (tmp_->devvp && tmp_->devvp->v_rdev ? devtoname(tmp_->devvp->v_rdev) : "?"), tessera_stat_gc_scans, deads[i].pack_id, "",
 			    deads[i].bh, "", deads[i].nbh);
-		if (tessera_btree_delete(tmp_->pack_registry_tree,
-		    deads[i].pack_id, &new_pack_root) == TESSERA_OK) {
+		int _del_ok = (tessera_btree_delete(tmp_->pack_registry_tree,
+		    deads[i].pack_id, &new_pack_root) == TESSERA_OK);
+		if (_del_ok) {
 			tmp_->sb.pack_registry_root = new_pack_root;
 			memcpy(&gone_ids[(size_t)gone_n * 16u],
 			    deads[i].pack_id, 16);
@@ -20484,6 +20617,34 @@ next_p:
 				printf("GC-TRACE DELETE-FAILED pass=%lu pack=%8D start=%ju len=%ju\n",
 				    tessera_stat_gc_scans, deads[i].pack_id, "",
 				    (uintmax_t)deads[i].start, (uintmax_t)deads[i].len);
+		}
+		/*
+		 * ★★ FREE ONLY WHAT THE REGISTRY NO LONGER NAMES.
+		 *
+		 * The extent frees below used to run whatever the delete did.
+		 * A delete fails when the metadata reserve is exhausted — and
+		 * that is exactly when a GC pass runs — so the sectors went
+		 * back to the allocator while the registry entry still pointed
+		 * at them. The next write reused them, and every read through
+		 * that entry then hit foreign bytes.
+		 *
+		 * Measured on a full 256 MiB volume (rm of 2000 files):
+		 * gc_reclaimed=6694 with gc_apply_delete_failed=6694 — EVERY
+		 * delete failed and all 6694 packs were freed anyway. fsck:
+		 * 975 "pack failed to open (bad header/CRC)" plus blob_count
+		 * mismatches, on a volume that had been clean.
+		 *
+		 * Keeping the pack costs nothing but space it was already
+		 * occupying: it stays dead and the next pass reclaims it once
+		 * the reserve allows the delete to land.
+		 */
+		if (!_del_ok) {
+			tessera_stat_gc_apply_free_skipped++;
+			if (deads[i].exts != NULL) free(deads[i].exts, M_TESSERA);
+			if (deads[i].pels != NULL) free(deads[i].pels, M_TESSERA);
+			if (deads[i].bh_extra != NULL)
+				free(deads[i].bh_extra, M_TESSERA);
+			continue;
 		}
 		if (tessera_gc_trace)
 			printf("GC-TRACE extfree mnt=%s pass=%lu start=%ju len=%ju multi=%d\n",
@@ -20629,8 +20790,17 @@ next_p:
 	}
 
 	printf("tessera_fs: gc pass3 done — committing\n");
-	if (dead_count > 0 || retired > 0) {
-		if (dead_count > 0) {
+	/*
+	 * ★ Count what was actually FREED (gone_n), not what was judged dead.
+	 * With the registry delete failing under reserve exhaustion, every
+	 * pass found thousands of dead packs, freed none, and still reported
+	 * itself productive — which resets the backoff, so the GC re-ran
+	 * forever: 4,576,824 "reclaimed" with 4,576,824 delete failures in
+	 * one wedged run. A pass that frees nothing must read as unproductive
+	 * so the caller's exponential backoff engages.
+	 */
+	if (gone_n > 0 || retired > 0) {
+		if (gone_n > 0) {
 			(void)tessera_commit_extent(tmp_);
 			printf("tessera_fs: gc post commit_extent\n");
 		}
@@ -20652,9 +20822,9 @@ next_p:
 
 	if (concurrent)
 		tessera_fs_flush_gate_exit(tmp_);
-	tessera_stat_gc_reclaimed += dead_count;
+	tessera_stat_gc_reclaimed += gone_n;
 	printf("tessera_fs: gc done\n");
-	return ((int)dead_count);
+	return ((int)gone_n);
 #undef _GC_CLOSE_SCAN_TREES
 }
 
@@ -28138,6 +28308,10 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, gc_trace, CTLFLAG_RW, &tessera_gc_trace, 0,
     "DEBUG: log chunk publishes, scan begins and pack frees to the console");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_apply_delete_failed, CTLFLAG_RD,
     &tessera_stat_gc_apply_delete_failed, 0, "GC apply: registry deletes that failed");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_apply_free_skipped, CTLFLAG_RD,
+    &tessera_stat_gc_apply_free_skipped, 0,
+    "GC apply: packs left allocated because their registry delete failed "
+    "(freeing them would leave the registry naming reusable sectors)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_pack_id_mismatch, CTLFLAG_RD,
     &tessera_stat_gc_pack_id_mismatch, 0,
     "GC pass 2: pack header pack_id != registry pack_id (stale/foreign read); pack kept");
