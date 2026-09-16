@@ -3404,6 +3404,8 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_cas_invalidate_ns, CTLFLAG_RD,
     "cumulative ns of GC pass-3 CAS cache invalidation");
 static unsigned long tessera_stat_gc_apply_delete_failed = 0;
 static unsigned long tessera_stat_gc_apply_free_skipped = 0;
+static unsigned long tessera_stat_gc_delete_absent = 0;
+static unsigned long tessera_stat_gc_entry_moved = 0;
 /* pass 2 read a pack header whose pack_id is not the registry entry it was sent
  * to: a stale or foreign read. The pack is KEPT. Non-zero names a coherence hole. */
 static unsigned long tessera_stat_gc_pack_id_mismatch = 0;
@@ -20604,6 +20606,52 @@ next_p:
 			printf("GC-TRACE free mnt=%s pass=%lu pack=%8D bh0=%8D nbh=%u\n",
 			    (tmp_->devvp && tmp_->devvp->v_rdev ? devtoname(tmp_->devvp->v_rdev) : "?"), tessera_stat_gc_scans, deads[i].pack_id, "",
 			    deads[i].bh, "", deads[i].nbh);
+		/*
+		 * ★★ VERIFY, THEN FREE. Three rules collided here:
+		 *
+		 *  - freeing whatever the scan judged dead (the original) is
+		 *    wrong: a delete that fails leaves the registry naming
+		 *    sectors the allocator just took back — measured, 975
+		 *    unreadable packs (84586b60);
+		 *  - skipping the free whenever the delete is not OK is also
+		 *    wrong: ENOENT means the entry is ALREADY gone, and
+		 *    refusing to free then stops reclaim dead on a healthy
+		 *    volume — measured on the dev root, 67490 skipped, 0
+		 *    reclaimed, root stuck at 99% and unable to accept a fix;
+		 *  - but ENOENT is not proof the sectors are ours either: the
+		 *    scan ran ungated, so the entry may have been removed AND
+		 *    its extents reused since.
+		 *
+		 * So decide on the registry as it is NOW: re-read the entry.
+		 * Present and naming the same extents -> ours, delete and
+		 * free. Absent -> nothing names these sectors through this
+		 * pack_id, so the scan's extents are stale; leave them (fsck
+		 * --repair reclaims genuinely leaked space offline). Present
+		 * but different -> republished since the scan; keep it.
+		 */
+		uint8_t _regv[TESSERA_REGISTRY_ENTRY_SIZE];
+		int _grc = tessera_btree_get(tmp_->pack_registry_tree,
+		    deads[i].pack_id, _regv);
+		int _same = 0;
+		if (_grc == TESSERA_OK) {
+			tessera_registry_entry_t _re;
+			if (tessera_decode_registry_entry(_regv, &_re)
+			    == TESSERA_OK)
+				_same = (_re.start_sector == deads[i].start &&
+				    _re.length_sectors == deads[i].len);
+		}
+		if (!_same) {
+			if (_grc == TESSERA_ENOENT)
+				tessera_stat_gc_delete_absent++;
+			else
+				tessera_stat_gc_entry_moved++;
+			tessera_stat_gc_apply_free_skipped++;
+			if (deads[i].exts != NULL) free(deads[i].exts, M_TESSERA);
+			if (deads[i].pels != NULL) free(deads[i].pels, M_TESSERA);
+			if (deads[i].bh_extra != NULL)
+				free(deads[i].bh_extra, M_TESSERA);
+			continue;
+		}
 		int _del_ok = (tessera_btree_delete(tmp_->pack_registry_tree,
 		    deads[i].pack_id, &new_pack_root) == TESSERA_OK);
 		if (_del_ok) {
@@ -28308,6 +28356,15 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, gc_trace, CTLFLAG_RW, &tessera_gc_trace, 0,
     "DEBUG: log chunk publishes, scan begins and pack frees to the console");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_apply_delete_failed, CTLFLAG_RD,
     &tessera_stat_gc_apply_delete_failed, 0, "GC apply: registry deletes that failed");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_entry_moved, CTLFLAG_RD,
+    &tessera_stat_gc_entry_moved, 0,
+    "GC apply: registry entry republished at different extents since the "
+    "scan — pack kept");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_delete_absent, CTLFLAG_RD,
+    &tessera_stat_gc_delete_absent, 0,
+    "GC apply: registry entry already absent at apply time — the scan's "
+    "extents are stale, so they are NOT freed here (fsck --repair reclaims "
+    "genuinely leaked space offline)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_apply_free_skipped, CTLFLAG_RD,
     &tessera_stat_gc_apply_free_skipped, 0,
     "GC apply: packs left allocated because their registry delete failed "
