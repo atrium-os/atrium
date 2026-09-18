@@ -3105,6 +3105,22 @@ SYSCTL_INT(_kern_tessera, OID_AUTO, meta_pressure_pending, CTLFLAG_RW,
  * steady state was 2 to 4 — disabled the safety net permanently while the
  * reserve was effectively exhausted and thousands of sectors sat stranded in
  * pending. An emergency net must arm on "nearly empty", not "provably zero". */
+/* ★ RECLAIM ALLOWANCE (retry, with verify_commits armed). Space-FREEING
+ * paths may bump past the soft limit into a slice of the emergency band;
+ * ordinary writes still may not. Self-liquidating: a delete that lands frees
+ * more than it consumed. See the attempt log in the commit message. */
+static int tessera_meta_reclaim_slice_pct = 50;
+SYSCTL_INT(_kern_tessera, OID_AUTO, meta_reclaim_slice_pct, CTLFLAG_RW,
+    &tessera_meta_reclaim_slice_pct, 0,
+    "percent of the emergency band usable by space-freeing work (0 = off)");
+static int tessera_reclaim_tombstone_batch = 64;
+SYSCTL_INT(_kern_tessera, OID_AUTO, reclaim_tombstone_batch, CTLFLAG_RW,
+    &tessera_reclaim_tombstone_batch, 0,
+    "tombstones drained per flush while the reserve is exhausted (the drain "
+    "normally submits up to 4096, which can never fit the slice)");
+static unsigned long tessera_stat_meta_reclaim_allocs = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, meta_reclaim_allocs, CTLFLAG_RD,
+    &tessera_stat_meta_reclaim_allocs, 0, "allocations from the reclaim slice");
 static int tessera_meta_free_lowat = 64;
 SYSCTL_INT(_kern_tessera, OID_AUTO, meta_free_lowat, CTLFLAG_RW,
     &tessera_meta_free_lowat, 0,
@@ -3888,6 +3904,7 @@ struct tessera_mount {
 	 * epoch_snap_birth_kept stayed 0 while fsck still found 6 destroyed
 	 * snapshots. One bit per reserve sector is bounded and exact. */
 	uint8_t                  *snap_birth_bm;
+	int                       meta_reclaim_depth;
 	uint32_t                  verify_root_entries;   /* last seen */
 	int                       verify_root_seen;
 	uint32_t                  snap_birth_n;
@@ -5634,6 +5651,19 @@ tessera_meta_epoch_mark(struct tessera_mount *tmp_, uint64_t s)
  * Sectors freed from the previously-committed tree keep their normal path:
  * they stay pending until commit_sb + the pinscan drain clears them.
  */
+static void
+tessera_meta_reclaim_enter(struct tessera_mount *tmp_)
+{
+	tmp_->meta_reclaim_depth++;
+}
+
+static void
+tessera_meta_reclaim_exit(struct tessera_mount *tmp_)
+{
+	if (tmp_->meta_reclaim_depth > 0)
+		tmp_->meta_reclaim_depth--;
+}
+
 /* Is this sector a root captured by a snapshot born since the last pinscan
  * swap? Such a sector is referenced by a record the epoch sweep's own audit
  * cannot see yet — the record is not in the snapshots tree when the sweep
@@ -5986,7 +6016,17 @@ tessera_kbio_meta_alloc(void *ctx, uint64_t n, uint64_t *out_sector)
 	 * could — recycled sectors consume no new headroom, so the band never
 	 * blocks them.
 	 */
-	const uint64_t soft = tessera_meta_soft_length(tmp_);
+	uint64_t soft = tessera_meta_soft_length(tmp_);
+	if (tmp_->meta_reclaim_depth > 0 && tessera_meta_reclaim_slice_pct > 0) {
+		uint64_t band = tmp_->sb.meta_reserve_length > soft ?
+		    tmp_->sb.meta_reserve_length - soft : 0;
+		uint64_t slice = band * (uint64_t)(
+		    tessera_meta_reclaim_slice_pct > 100 ? 100 :
+		    tessera_meta_reclaim_slice_pct) / 100;
+		if (used + n > soft && used + n <= soft + slice)
+			tessera_stat_meta_reclaim_allocs++;
+		soft += slice;
+	}
 	if (used + n > soft && used + n <= tmp_->sb.meta_reserve_length) {
 		tessera_stat_meta_band_refusals++;
 		time_t _bnow = (time_t)time_uptime;
@@ -13214,6 +13254,9 @@ tessera_fs_dirty_inodes_drain_tombstones(struct tessera_mount *tmp_)
 	 * (entries stay visible/draining during the btree_delete; a
 	 * concurrent re-create sets redirty and the entry survives for
 	 * the next flush). */
+	uint32_t _cap = (tmp_->meta_reclaim_depth > 0 &&
+	    tessera_reclaim_tombstone_batch > 0) ?
+	    (uint32_t)tessera_reclaim_tombstone_batch : 0;
 	mtx_lock(&tmp_->flush_mtx);
 	tmp_->di_drain_round++;
 	const uint64_t round = tmp_->di_drain_round;
@@ -13222,10 +13265,14 @@ tessera_fs_dirty_inodes_drain_tombstones(struct tessera_mount *tmp_)
 		struct tessera_dirty_inode *x;
 		LIST_FOREACH(x, &tmp_->dirty_inodes[b], link) {
 			if (x->tombstone) {
+				if (_cap != 0 && stamped >= _cap)
+					break;
 				x->round = round;
 				stamped++;
 			}
 		}
+		if (_cap != 0 && stamped >= _cap)
+			break;
 	}
 	mtx_unlock(&tmp_->flush_mtx);
 	if (stamped == 0) return (0);
@@ -16865,6 +16912,15 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 		}
 	}
 	mtx_unlock(&tmp_->flush_mtx);
+	int _reclaiming = 0;
+	if (has_tombstones && !tmp_->readonly_snapshot &&
+	    tessera_meta_reclaim_slice_pct > 0) {
+		/* Whole flush, not just the drain: an unlink's inode half and
+		 * namespace half must land in ONE commit (funding only the
+		 * tombstone drain produced 747 dangling dirents). */
+		_reclaiming = 1;
+		tessera_meta_reclaim_enter(tmp_);
+	}
 	if (has_tombstones && !tmp_->readonly_snapshot) {
 		/* Draining tombstoned inode records from the btree is cheap
 		 * (O(tombstones · log N)) — always do it. */
@@ -17060,6 +17116,8 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 
 	TPROF_ADD(TPROF_FLUSH, _tpfl);
 
+	if (_reclaiming)
+		tessera_meta_reclaim_exit(tmp_);
 	if (r == 0)
 		tessera_fs_verify_commit(tmp_);
 	mtx_lock(&tmp_->flush_mtx);
