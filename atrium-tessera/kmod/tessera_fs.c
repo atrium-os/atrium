@@ -2458,6 +2458,8 @@ static int  tessera_cas_byte_lookup(struct tessera_cas_cache *c,
 static void tessera_cas_byte_insert(struct tessera_cas_cache *c,
     const tessera_hash_t hash, const uint8_t *bytes, uint32_t length);
 static void tessera_fs_mark_dirty(struct tessera_mount *tmp_);
+static int tessera_meta_snap_birth_pinned(const struct tessera_mount *tmp_,
+    uint64_t s);
 static void tessera_fs_flush_task(void *ctx, int pending);
 static void tessera_fs_repack_task(void *ctx, int pending);
 static int  tessera_fs_repack_pass(struct tessera_mount *tmp_,
@@ -3339,6 +3341,10 @@ static unsigned long tessera_stat_pinscan_incomplete = 0;
  * began — the bitmap never covered them. Each one is a prevented silent
  * release of frozen-tree blocks. */
 static unsigned long tessera_stat_pinscan_gc_roots_moved = 0;
+static unsigned long tessera_stat_pinscan_snaproot_unpinned = 0;
+static unsigned long tessera_stat_pinscan_late_snaps = 0;
+static unsigned long tessera_stat_epoch_snap_birth_kept = 0;
+static unsigned long tessera_stat_pinscan_late_snap_fail = 0;
 /* GC pass-3 apply cost, gated (see tessera_cas_invalidate_packs). */
 static unsigned long tessera_stat_meta_admit_flush_kicks = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, meta_admit_flush_kicks, CTLFLAG_RD,
@@ -3827,6 +3833,17 @@ struct tessera_mount {
 	struct task               pinscan_task;
 	int                       pinscan_tq_init;
 	uint64_t                  preflight_last_gen;
+	/* ★ Roots captured by snapshot records BORN since the last pinscan
+	 * swap. The epoch sweep releases on the epoch bitmap alone ("nobody
+	 * references a sector allocated and freed inside one uncommitted
+	 * flush") — which is false the moment a snapshot record written later
+	 * in that same flush roots at it. Its own audit cannot see the
+	 * record: the record is not in the snapshots tree yet when the sweep
+	 * runs. These sectors are off-limits to the sweep and the drain until
+	 * a pinscan walks the snapshots tree and pins them properly. */
+	uint64_t                  snap_birth_pins[48];
+	uint32_t                  snap_birth_n;
+	int                       snap_birth_overflow;
 	/* One-time legacy orphan sweep (tessera_fs_legacy_sweep_task):
 	 * its queue, its unmount abort, and the live sweep the rename
 	 * barrier notes into (NULL when none is walking). */
@@ -5570,6 +5587,19 @@ tessera_meta_epoch_mark(struct tessera_mount *tmp_, uint64_t s)
  * Sectors freed from the previously-committed tree keep their normal path:
  * they stay pending until commit_sb + the pinscan drain clears them.
  */
+/* Is this sector a root captured by a snapshot born since the last pinscan
+ * swap? Such a sector is referenced by a record the epoch sweep's own audit
+ * cannot see yet — the record is not in the snapshots tree when the sweep
+ * runs — so releasing it destroys that snapshot. */
+static int
+tessera_meta_snap_birth_pinned(const struct tessera_mount *tmp_, uint64_t s)
+{
+	for (uint32_t i = 0; i < tmp_->snap_birth_n; i++)
+		if (tmp_->snap_birth_pins[i] == s)
+			return (1);
+	return (0);
+}
+
 static void
 tessera_fs_meta_epoch_sweep(struct tessera_mount *tmp_)
 {
@@ -5647,6 +5677,23 @@ tessera_fs_meta_epoch_sweep(struct tessera_mount *tmp_)
 			uint64_t bit = s - mstart;
 			epoch_new = (tmp_->meta_epoch_bm[bit / 8] &
 			    (1u << (bit % 8))) != 0;
+			/*
+			 * ★★ A snapshot record written LATER IN THIS SAME
+			 * FLUSH roots at this sector, so "allocated and freed
+			 * inside one uncommitted flush = nobody's" is false
+			 * for it. The audit below cannot catch this case: the
+			 * record is not in the snapshots tree yet when the
+			 * sweep runs, which is why epoch_frees_snaproot stayed
+			 * 0 while fsck kept finding destroyed snapshots (gen
+			 * 240291 at sector 288, and others). Keep it pending
+			 * until a pinscan has walked the record.
+			 */
+			if (epoch_new &&
+			    tessera_meta_snap_birth_pinned(tmp_, s)) {
+				tessera_stat_epoch_snap_birth_kept++;
+				tmp_->meta_pending[kept++] = s;
+				continue;
+			}
 			if (epoch_new &&
 			    tmp_->meta_free_count < tmp_->meta_free_cap) {
 				/* Clear the bit: it is no longer allocated. A
@@ -12020,6 +12067,25 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 		    &new_sroot) == TESSERA_OK) {
 			tmp_->sb.snapshots_root = new_sroot;
 			tmp_->sb.snapshots_gen++;
+			/* ★ This record now references these roots. Protect
+			 * them from the epoch sweep until a pinscan has seen
+			 * the record (see snap_birth_pins). */
+			{
+				const uint64_t _br[3] = { srec.inode_root,
+				    srec.pack_registry_root,
+				    srec.free_extent_root };
+				for (int _i = 0; _i < 3; _i++) {
+					if (_br[_i] == 0)
+						continue;
+					if (tmp_->snap_birth_n >=
+					    nitems(tmp_->snap_birth_pins)) {
+						tmp_->snap_birth_overflow = 1;
+						break;
+					}
+					tmp_->snap_birth_pins[
+					    tmp_->snap_birth_n++] = _br[_i];
+				}
+			}
 			tessera_metatrace(TM_OP_SNAPSHOT_REC, 0,
 			    srec.generation, 1);
 		}
@@ -17293,6 +17359,102 @@ tessera_fs_pinscan_run_impl(struct tessera_mount *tmp_)
 		    (uintmax_t)r_gc_inode, (uintmax_t)tmp_->gc_scan_inode_root);
 		return;
 	}
+	/*
+	 * ★★ SNAPSHOTS THAT APPEARED DURING THE WALK.
+	 *
+	 * The enumeration above walked the snapshots tree as it was when the
+	 * walk STARTED (r_snap). A snapshot created since then — and one is
+	 * created per commit — is not in that version, so its roots were
+	 * never marked, and this swap would synthesise them into meta_free:
+	 * the allocator hands the sector out and the snapshot's tree is gone.
+	 * Measured with pinscan_snaproot_unpinned on committed code: 2 and 51
+	 * such roots in two runs (fsck said CLEAN in both — the sectors had
+	 * not been reused yet, which is why this bug reads as rare).
+	 *
+	 * Same class as the frozen-GC-roots guard above, but discarding the
+	 * bitmap here would be wrong: with a snapshot per commit the scan
+	 * would almost never swap and reclaim would starve. Instead COVER
+	 * them — re-read the current snapshots tree and walk only the roots
+	 * this bitmap does not already mark. That is one or two small trees
+	 * sharing nearly all nodes with the live tree, so the prune set makes
+	 * it cheap.
+	 *
+	 * Failure resolves the way every other uncertainty here does: a walk
+	 * that could not complete must not reach the swap (#102), so drop the
+	 * bitmap rather than install one that under-pins.
+	 */
+	if (tmp_->sb.snapshots_root != 0) {
+		tessera_btree_t *_st = tessera_btree_open(&tmp_->meta_bio,
+		    tmp_->sb.snapshots_root, /*kind*/ 3, /*key*/ 8,
+		    TESSERA_SNAPSHOT_RECORD_SIZE);
+		tessera_btree_cursor_t *_sc = (_st != NULL)
+		    ? tessera_btree_seek_first(_st) : NULL;
+		int _late_fail = (_st == NULL);
+		uint32_t _covered = 0;
+		while (_sc != NULL && !_late_fail) {
+			uint8_t _sk[8];
+			tessera_snapshot_record_t _sr;
+			if (tessera_btree_cursor_get(_sc, _sk, &_sr) != TESSERA_OK)
+				break;
+			const struct { uint64_t root; int kind; uint32_t ksz;
+			    uint32_t vsz; } _sroots[3] = {
+				{ _sr.inode_root, TESSERA_BTREE_KIND_INODE, 4,
+				  TESSERA_INODE_RECORD_SIZE },
+				{ _sr.pack_registry_root,
+				  TESSERA_BTREE_KIND_PACK_REG, 16,
+				  TESSERA_REGISTRY_ENTRY_SIZE },
+				{ _sr.free_extent_root,
+				  TESSERA_BTREE_KIND_FREE_EXT,
+				  /* free-extent rows: 8-byte key, 8-byte
+				   * value (reserve_trees.h) */
+				  8, 8 },
+			};
+			for (int _k = 0; _k < 3 && !_late_fail; _k++) {
+				uint64_t _r = _sroots[_k].root;
+				if (_r < mstart || _r >= mstart + mlen)
+					continue;
+				uint64_t _bit = _r - mstart;
+				if (scratch[_bit / 8] & (1u << (_bit % 8)))
+					continue;   /* already covered */
+				tessera_stat_pinscan_snaproot_unpinned++;
+				tessera_btree_t *_t = tessera_btree_open(
+				    &tmp_->meta_bio, _r, _sroots[_k].kind,
+				    _sroots[_k].ksz, _sroots[_k].vsz);
+				if (_t == NULL) { _late_fail = 1; break; }
+				if (tessera_btree_walk_nodes_ex(_t,
+				    meta_mark_visitor, meta_mark_post_visitor,
+				    &mctx) != 0)
+					_late_fail = 1;
+				tessera_btree_close(_t);
+				_covered++;
+			}
+			if (tessera_btree_cursor_next(_sc) != TESSERA_OK)
+				break;
+		}
+		if (_sc != NULL)
+			tessera_btree_cursor_free(_sc);
+		if (_st != NULL)
+			tessera_btree_close(_st);
+		if (_late_fail) {
+			tessera_stat_pinscan_late_snap_fail++;
+			tmp_->pinscan_active = 0;
+			tmp_->meta_scanwin_count = 0;
+			tessera_fs_flush_gate_exit(tmp_);
+			free(scratch, M_TESSERA);
+			if (complete != NULL) free(complete, M_TESSERA);
+			printf("tessera_fs: pinscan discarded — could not cover "
+			    "a snapshot created during the walk; installing "
+			    "this bitmap would release its tree\n");
+			return;
+		}
+		if (_covered > 0)
+			tessera_stat_pinscan_late_snaps += _covered;
+	}
+	/* This bitmap walked the snapshots tree (including any late births
+	 * covered just above), so those roots are now pinned the normal way
+	 * and the birth ring can start over. */
+	tmp_->snap_birth_n = 0;
+	tmp_->snap_birth_overflow = 0;
 	tmp_->meta_pin_watermark = bump0;
 	tessera_stat_pinscan_swaps++;
 	/* CRITICAL: sectors currently in meta_pending are unreachable
@@ -28346,6 +28508,22 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_leaf_lies, CTLFLAG_RD,
     &tessera_stat_gc_walk_leaf_lies, 0,
     "MFT_LEAF-flagged inodes whose manifest was NOT a leaf (verify mode). "
     "Must be 0; non-zero is a stale flag = a writer bypassing ino_set_mft");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, epoch_snap_birth_kept, CTLFLAG_RD,
+    &tessera_stat_epoch_snap_birth_kept, 0,
+    "epoch-sweep releases refused because a snapshot born this flush roots "
+    "at the sector (the sweep's own audit cannot see that record yet)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_late_snaps, CTLFLAG_RD,
+    &tessera_stat_pinscan_late_snaps, 0,
+    "snapshot tree roots covered at swap time because the snapshot appeared "
+    "after the walk sampled the snapshots tree");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_late_snap_fail, CTLFLAG_RD,
+    &tessera_stat_pinscan_late_snap_fail, 0,
+    "pinscans discarded because a snapshot created during the walk could not "
+    "be covered (bitmap would have under-pinned)");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_snaproot_unpinned, CTLFLAG_RD,
+    &tessera_stat_pinscan_snaproot_unpinned, 0,
+    "roots found unmarked at swap time (each one is a snapshot the walk "
+    "never saw; they are covered before the swap, see pinscan_late_snaps)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_gc_roots_moved, CTLFLAG_RD,
     &tessera_stat_pinscan_gc_roots_moved, 0,
     "pinscans discarded at swap because a GC scan froze roots after the walk "
