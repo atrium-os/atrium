@@ -23,6 +23,15 @@
 set -u
 M=/mnt/rxp
 S() { sysctl -n kern.tessera.$1 2>/dev/null || echo 0; }
+
+# ★ Snapshot-root audits ON by default. They are cheap next to this workload,
+# and the alternative was measured: every run that produced damaged snapshots
+# had them off (the probe never set them), and every run with them on happened
+# to be clean — so five instrumented runs proved nothing about a bug that
+# appears in roughly one run in three. An audit you enable by hand is an audit
+# that is off when it matters. AUDITS=0 disables.
+[ "${AUDITS:-1}" = 1 ] && sysctl kern.tessera.drain_audit_snaproots=1 \
+    kern.tessera.alloc_audit_snaproots=1 >/dev/null 2>&1
 mnt() { sysctl -n kern.tessera.mounts | awk -v m=$M '$1==m'; }
 f() { mnt | sed -n "s/.* $1=\([0-9]*\).*/\1/p"; }
 row() { printf '%-9s dirty=%-6s pending=%-5s free=%-5s avail=%-6s need=%-5s gen=%-8s band=%-9s drainf=%-6s cef=%s\n' \

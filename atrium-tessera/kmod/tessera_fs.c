@@ -3344,6 +3344,7 @@ static unsigned long tessera_stat_pinscan_gc_roots_moved = 0;
 static unsigned long tessera_stat_pinscan_snaproot_unpinned = 0;
 static unsigned long tessera_stat_pinscan_late_snaps = 0;
 static unsigned long tessera_stat_epoch_snap_birth_kept = 0;
+static unsigned long tessera_stat_snap_birth_epoch_roots = 0;
 static unsigned long tessera_stat_pinscan_late_snap_fail = 0;
 /* GC pass-3 apply cost, gated (see tessera_cas_invalidate_packs). */
 static unsigned long tessera_stat_meta_admit_flush_kicks = 0;
@@ -3841,9 +3842,13 @@ struct tessera_mount {
 	 * record: the record is not in the snapshots tree yet when the sweep
 	 * runs. These sectors are off-limits to the sweep and the drain until
 	 * a pinscan walks the snapshots tree and pins them properly. */
-	uint64_t                  snap_birth_pins[48];
+	/* ★ Bitmap, not a ring. The first version held 48 sectors and simply
+	 * STOPPED pinning on overflow: measured 19,365 birth roots in one
+	 * run, so it overflowed at once and protected almost nothing —
+	 * epoch_snap_birth_kept stayed 0 while fsck still found 6 destroyed
+	 * snapshots. One bit per reserve sector is bounded and exact. */
+	uint8_t                  *snap_birth_bm;
 	uint32_t                  snap_birth_n;
-	int                       snap_birth_overflow;
 	/* One-time legacy orphan sweep (tessera_fs_legacy_sweep_task):
 	 * its queue, its unmount abort, and the live sweep the rename
 	 * barrier notes into (NULL when none is walking). */
@@ -5594,10 +5599,13 @@ tessera_meta_epoch_mark(struct tessera_mount *tmp_, uint64_t s)
 static int
 tessera_meta_snap_birth_pinned(const struct tessera_mount *tmp_, uint64_t s)
 {
-	for (uint32_t i = 0; i < tmp_->snap_birth_n; i++)
-		if (tmp_->snap_birth_pins[i] == s)
-			return (1);
-	return (0);
+	if (tmp_->snap_birth_bm == NULL)
+		return (0);
+	const uint64_t mstart = tmp_->sb.meta_reserve_start;
+	if (s < mstart || s >= mstart + tmp_->sb.meta_reserve_length)
+		return (0);
+	uint64_t bit = s - mstart;
+	return ((tmp_->snap_birth_bm[bit / 8] & (1u << (bit % 8))) != 0);
 }
 
 static void
@@ -7752,6 +7760,8 @@ tessera_mountfs(struct vnode *devvp, struct mount *mp, uint64_t requested_gen,
 		    M_WAITOK | M_ZERO);
 		tmp_->meta_allocsrc_bm = malloc(bitmap_bytes, M_TESSERA,
 		    M_WAITOK | M_ZERO);
+		tmp_->snap_birth_bm = malloc(bitmap_bytes, M_TESSERA,
+		    M_WAITOK | M_ZERO);
 		/*
 		 * ★ 512 was USELESS: a populate makes ~108000 pack
 		 * allocations, so a 512-entry ring wrapped ~210 times and
@@ -8607,6 +8617,7 @@ tessera_unmount_impl(struct mount *mp, int mntflags)
 		if (tmp_->meta_recycled_prev_bm != NULL)
 			free(tmp_->meta_recycled_prev_bm, M_TESSERA);
 		if (tmp_->meta_epoch_bm   != NULL) free(tmp_->meta_epoch_bm, M_TESSERA);
+		if (tmp_->snap_birth_bm   != NULL) free(tmp_->snap_birth_bm, M_TESSERA);
 		/* Drain any still-dirty buffers on devvp BEFORE detaching
 		 * the GEOM consumer. tessera_kbio_write_delayed uses
 		 * bdwrite — buffers stay on devvp's bufobj.bo_dirty list
@@ -12077,13 +12088,39 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 				for (int _i = 0; _i < 3; _i++) {
 					if (_br[_i] == 0)
 						continue;
-					if (tmp_->snap_birth_n >=
-					    nitems(tmp_->snap_birth_pins)) {
-						tmp_->snap_birth_overflow = 1;
-						break;
+					/* ★ Was this root allocated in the
+					 * CURRENT uncommitted epoch? Then the
+					 * epoch sweep is entitled to release it
+					 * the moment a COW supersedes it, and the
+					 * pin below is what saves this snapshot.
+					 * Counting it says whether the hazard is
+					 * reachable at all (epoch_snap_birth_kept
+					 * stayed 0 through validation). */
+					if (tmp_->meta_epoch_bm != NULL) {
+						uint64_t _mb =
+						    tmp_->sb.meta_reserve_start;
+						if (_br[_i] >= _mb && _br[_i] < _mb +
+						    tmp_->sb.meta_reserve_length) {
+							uint64_t _eb = _br[_i] - _mb;
+							if (tmp_->meta_epoch_bm[_eb / 8] &
+							    (1u << (_eb % 8)))
+								tessera_stat_snap_birth_epoch_roots++;
+						}
 					}
-					tmp_->snap_birth_pins[
-					    tmp_->snap_birth_n++] = _br[_i];
+					if (tmp_->snap_birth_bm != NULL) {
+						uint64_t _pb =
+						    tmp_->sb.meta_reserve_start;
+						if (_br[_i] >= _pb && _br[_i] <
+						    _pb + tmp_->sb.meta_reserve_length) {
+							uint64_t _pbit =
+							    _br[_i] - _pb;
+							tmp_->snap_birth_bm[
+							    _pbit / 8] |=
+							    (uint8_t)(1u <<
+							    (_pbit % 8));
+							tmp_->snap_birth_n++;
+						}
+					}
 				}
 			}
 			tessera_metatrace(TM_OP_SNAPSHOT_REC, 0,
@@ -17453,8 +17490,10 @@ tessera_fs_pinscan_run_impl(struct tessera_mount *tmp_)
 	/* This bitmap walked the snapshots tree (including any late births
 	 * covered just above), so those roots are now pinned the normal way
 	 * and the birth ring can start over. */
+	if (tmp_->snap_birth_bm != NULL)
+		memset(tmp_->snap_birth_bm, 0,
+		    (size_t)((tmp_->sb.meta_reserve_length + 7) / 8));
 	tmp_->snap_birth_n = 0;
-	tmp_->snap_birth_overflow = 0;
 	tmp_->meta_pin_watermark = bump0;
 	tessera_stat_pinscan_swaps++;
 	/* CRITICAL: sectors currently in meta_pending are unreachable
@@ -28508,6 +28547,10 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_leaf_lies, CTLFLAG_RD,
     &tessera_stat_gc_walk_leaf_lies, 0,
     "MFT_LEAF-flagged inodes whose manifest was NOT a leaf (verify mode). "
     "Must be 0; non-zero is a stale flag = a writer bypassing ino_set_mft");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, snap_birth_epoch_roots, CTLFLAG_RD,
+    &tessera_stat_snap_birth_epoch_roots, 0,
+    "roots a newborn snapshot captured that were allocated in the CURRENT "
+    "uncommitted epoch — the population the epoch sweep could release");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, epoch_snap_birth_kept, CTLFLAG_RD,
     &tessera_stat_epoch_snap_birth_kept, 0,
     "epoch-sweep releases refused because a snapshot born this flush roots "
