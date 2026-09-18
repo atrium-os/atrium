@@ -3345,6 +3345,7 @@ static unsigned long tessera_stat_pinscan_snaproot_unpinned = 0;
 static unsigned long tessera_stat_pinscan_late_snaps = 0;
 static unsigned long tessera_stat_epoch_snap_birth_kept = 0;
 static unsigned long tessera_stat_snap_birth_epoch_roots = 0;
+static unsigned long tessera_stat_dir_walk_short = 0;
 static unsigned long tessera_stat_pinscan_late_snap_fail = 0;
 /* GC pass-3 apply cost, gated (see tessera_cas_invalidate_packs). */
 static unsigned long tessera_stat_meta_admit_flush_kicks = 0;
@@ -23274,6 +23275,8 @@ tessera_fs_dir_walk(struct tessera_mount *tmp_,
 	if (k == TESSERA_MFT_DIRECTORY) {
 		const uint8_t *body = blob + 32;
 		const size_t   blen = blob_len - 32;
+		const uint32_t declared = tessera_manifest_parser_count(p);
+		uint32_t seen = 0;
 		for (size_t off = 0; off + 10 <= blen; ) {
 			uint64_t ch;
 			uint16_t nl;
@@ -23283,7 +23286,32 @@ tessera_fs_dir_walk(struct tessera_mount *tmp_,
 			rc = cb(ctx, ch,
 			    (const char *)(body + off + 10), nl);
 			if (rc != 0) break;
+			seen++;
 			off += 10 + nl;
+		}
+		/*
+		 * ★★ A SHORT BODY IS NOT AN EMPTY DIRECTORY. The loop above
+		 * consumes entries until the bytes run out, so a truncated or
+		 * wrong-length blob yields FEWER dirents and says nothing —
+		 * and vop_remove rebuilds the parent from exactly this walk.
+		 * The rebuilt directory then silently loses every entry the
+		 * walk did not see. That is the shape of the worst damage
+		 * seen this week: a root directory republished nearly empty,
+		 * 19,640 inodes orphaned in one run.
+		 *
+		 * add_dirent maintains entry_count, so the manifest says how
+		 * many entries it should have. Disagreement means the bytes
+		 * are not the directory the header describes: fail the walk
+		 * (EIO) rather than hand a caller a short list it will treat
+		 * as the truth.
+		 */
+		if (rc == 0 && seen != declared) {
+			tessera_stat_dir_walk_short++;
+			printf("tessera_fs: dir_walk: manifest declares %u "
+			    "dirents but the body holds %u — refusing the "
+			    "walk (a rebuild from it would drop the rest)\n",
+			    declared, seen);
+			rc = EIO;
 		}
 	} else if (k == TESSERA_MFT_DIRECTORY_2L) {
 		const uint32_t nbk = tessera_manifest_parser_count(p);
@@ -23303,6 +23331,17 @@ tessera_fs_dir_walk(struct tessera_mount *tmp_,
 			}
 			const uint8_t *body = bbuf + 32;
 			const size_t   blen = blen2 - 32;
+			/* Same check per bucket: each bucket blob is itself a
+			 * flat DIRECTORY with its own entry_count. */
+			uint32_t bdecl = 0, bseen = 0;
+			{
+				tessera_manifest_parser_t *bp =
+				    tessera_manifest_parse(bbuf, blen2);
+				if (bp != NULL) {
+					bdecl = tessera_manifest_parser_count(bp);
+					tessera_manifest_parser_free(bp);
+				}
+			}
 			for (size_t off = 0; off + 10 <= blen; ) {
 				uint64_t ch;
 				uint16_t nl;
@@ -23314,7 +23353,15 @@ tessera_fs_dir_walk(struct tessera_mount *tmp_,
 				rc = cb(ctx, ch,
 				    (const char *)(body + off + 10), nl);
 				if (rc != 0) break;
+				bseen++;
 				off += 10 + nl;
+			}
+			if (rc == 0 && bseen != bdecl) {
+				tessera_stat_dir_walk_short++;
+				printf("tessera_fs: dir_walk: bucket declares "
+				    "%u dirents but holds %u — refusing\n",
+				    bdecl, bseen);
+				rc = EIO;
 			}
 			free(bbuf, M_TESSERA);
 		}
@@ -28547,6 +28594,10 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, gc_walk_leaf_lies, CTLFLAG_RD,
     &tessera_stat_gc_walk_leaf_lies, 0,
     "MFT_LEAF-flagged inodes whose manifest was NOT a leaf (verify mode). "
     "Must be 0; non-zero is a stale flag = a writer bypassing ino_set_mft");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, dir_walk_short, CTLFLAG_RD,
+    &tessera_stat_dir_walk_short, 0,
+    "directory walks refused because the body held fewer dirents than the "
+    "manifest declares (a rebuild from such a walk drops the rest)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, snap_birth_epoch_roots, CTLFLAG_RD,
     &tessera_stat_snap_birth_epoch_roots, 0,
     "roots a newborn snapshot captured that were allocated in the CURRENT "
