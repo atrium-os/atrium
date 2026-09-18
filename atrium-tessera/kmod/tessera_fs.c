@@ -3345,6 +3345,45 @@ static unsigned long tessera_stat_pinscan_snaproot_unpinned = 0;
 static unsigned long tessera_stat_pinscan_late_snaps = 0;
 static unsigned long tessera_stat_epoch_snap_birth_kept = 0;
 static unsigned long tessera_stat_snap_birth_epoch_roots = 0;
+/*
+ * ★★ PER-COMMIT NAMESPACE VERIFICATION (debug).
+ *
+ * Every wedge fix attempted this week was diagnosed HOURS later, from fsck
+ * at unmount: four mechanisms each looked right, ran for 20 minutes, and were
+ * judged by a report that arrived long after the commit that broke things —
+ * one of them had republished the root directory nearly empty and orphaned
+ * 19,640 inodes before anything noticed. This checks the invariants right
+ * after each commit, so a bad mechanism is caught at the FIRST commit it
+ * corrupts, with the state still in front of you.
+ *
+ *   0 off (default)   1 log the first violation per commit
+ *   2 log and panic   — for a bisect run where the stack is the answer
+ *
+ * Off by default because it walks the root directory per commit: fine for a
+ * probe volume, far too expensive for the dev root.
+ */
+static int tessera_verify_commits = 0;
+/* ★ RWTUN, not RW: a plain sysctl is reset by every reboot, and the tests
+ * worth verifying (crash-soak, replay-refusal) power-cycle the VM. Twice I
+ * read "0 violations" from runs where the verifier had been switched off by
+ * the first power cut — a zero from a detector that never ran. Set it in
+ * loader.conf (kern.tessera.verify_commits="1") for a crash test. */
+SYSCTL_INT(_kern_tessera, OID_AUTO, verify_commits, CTLFLAG_RWTUN,
+    &tessera_verify_commits, 0,
+    "DEBUG: verify namespace invariants after every commit (0 off, 1 log, "
+    "2 panic) — catches a corrupting commit at the commit, not at fsck");
+static int tessera_verify_root_drop_max = 64;
+SYSCTL_INT(_kern_tessera, OID_AUTO, verify_root_drop_max, CTLFLAG_RWTUN,
+    &tessera_verify_root_drop_max, 0,
+    "how many root-directory entries may vanish in ONE commit before "
+    "verify_commits calls it corruption");
+static unsigned long tessera_stat_verify_runs = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_runs, CTLFLAG_RD,
+    &tessera_stat_verify_runs, 0, "per-commit verifications performed");
+static unsigned long tessera_stat_verify_violations = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_violations, CTLFLAG_RD,
+    &tessera_stat_verify_violations, 0,
+    "per-commit verifications that found a broken invariant");
 static unsigned long tessera_stat_dir_walk_short = 0;
 static unsigned long tessera_stat_pinscan_late_snap_fail = 0;
 /* GC pass-3 apply cost, gated (see tessera_cas_invalidate_packs). */
@@ -3849,6 +3888,8 @@ struct tessera_mount {
 	 * epoch_snap_birth_kept stayed 0 while fsck still found 6 destroyed
 	 * snapshots. One bit per reserve sector is bounded and exact. */
 	uint8_t                  *snap_birth_bm;
+	uint32_t                  verify_root_entries;   /* last seen */
+	int                       verify_root_seen;
 	uint32_t                  snap_birth_n;
 	/* One-time legacy orphan sweep (tessera_fs_legacy_sweep_task):
 	 * its queue, its unmount abort, and the live sweep the rename
@@ -12407,6 +12448,115 @@ tessera_commit_sb(struct tessera_mount *tmp_)
  * when the in-memory dirty-inode set lands.
  */
 
+/*
+ * Invariants checked after a commit (see tessera_verify_commits):
+ *
+ *  1. the root directory still resolves and still has entries — the
+ *     catastrophic failure mode was a root republished nearly empty, and
+ *     nothing noticed until fsck at unmount reported 19,640 orphans;
+ *  2. its entry count did not collapse in one commit (verify_root_drop_max);
+ *  3. every entry it names resolves to an inode record — a dirent pointing
+ *     at a deleted inode is the damage a half-applied unlink produces (747
+ *     of them in one attempt);
+ *  4. any nlink==0 record it names carries UNLINKED — an unflagged one is
+ *     invisible to the mount-time reaper and lives forever.
+ *
+ * Read-only: btree_get and one directory walk. Never flushes, so it cannot
+ * recurse into the commit that called it.
+ */
+struct verify_ctx {
+	struct tessera_mount *tmp;
+	uint32_t entries;
+	uint32_t dangling;
+	uint32_t unflagged;
+	uint32_t first_bad;
+};
+
+static int
+tessera_fs_verify_cb(void *vctx, uint64_t child, const char *nm, uint16_t nl)
+{
+	struct verify_ctx *v = vctx;
+	(void)nm; (void)nl;
+	v->entries++;
+	if (child < TESSERA_INODE_FIRST_USER)
+		return (0);
+	tessera_inode_record_t ino;
+	int rc = tessera_fs_inode_get(v->tmp, (uint32_t)child, &ino);
+	if (rc != TESSERA_OK) {
+		v->dangling++;
+		if (v->first_bad == 0) v->first_bad = (uint32_t)child;
+		return (0);
+	}
+	if (ino.nlink == 0 &&
+	    (ino.flags & TESSERA_INODE_FLAG_UNLINKED) == 0) {
+		v->unflagged++;
+		if (v->first_bad == 0) v->first_bad = (uint32_t)child;
+	}
+	return (0);
+}
+
+static void
+tessera_fs_verify_commit(struct tessera_mount *tmp_)
+{
+	if (tessera_verify_commits == 0 || tmp_->inode_tree == NULL)
+		return;
+	tessera_stat_verify_runs++;
+
+	tessera_inode_record_t root;
+	if (tessera_fs_inode_get(tmp_, TESSERA_INODE_ROOT_DIR, &root)
+	    != TESSERA_OK) {
+		tessera_stat_verify_violations++;
+		printf("tessera_fs: ★ VERIFY: root directory record is GONE "
+		    "after commit gen %ju\n", (uintmax_t)tmp_->sb.generation);
+		if (tessera_verify_commits >= 2)
+			panic("tessera verify: root inode missing");
+		return;
+	}
+	if (tessera_hash_is_null(root.manifest_hash))
+		return;                 /* empty root: nothing to walk */
+
+	struct verify_ctx v = { .tmp = tmp_ };
+	int rc = tessera_fs_dir_walk(tmp_, root.manifest_hash,
+	    tessera_fs_verify_cb, &v);
+	if (rc != 0) {
+		tessera_stat_verify_violations++;
+		printf("tessera_fs: ★ VERIFY: root directory unreadable (%d) "
+		    "after commit gen %ju\n", rc,
+		    (uintmax_t)tmp_->sb.generation);
+		if (tessera_verify_commits >= 2)
+			panic("tessera verify: root dir unreadable");
+		return;
+	}
+
+	int bad = 0;
+	if (v.dangling > 0 || v.unflagged > 0) {
+		bad = 1;
+		printf("tessera_fs: ★ VERIFY: commit gen %ju left %u dangling "
+		    "dirent(s) and %u unflagged nlink=0 record(s) in the root "
+		    "directory (first bad inode %u)\n",
+		    (uintmax_t)tmp_->sb.generation, v.dangling, v.unflagged,
+		    v.first_bad);
+	}
+	if (tmp_->verify_root_seen && tessera_verify_root_drop_max > 0 &&
+	    v.entries + (uint32_t)tessera_verify_root_drop_max <
+	    tmp_->verify_root_entries) {
+		bad = 1;
+		printf("tessera_fs: ★ VERIFY: root directory went from %u to "
+		    "%u entries in ONE commit (gen %ju) — that is the shape of "
+		    "a republish that dropped entries\n",
+		    tmp_->verify_root_entries, v.entries,
+		    (uintmax_t)tmp_->sb.generation);
+	}
+	tmp_->verify_root_entries = v.entries;
+	tmp_->verify_root_seen = 1;
+	if (bad) {
+		tessera_stat_verify_violations++;
+		if (tessera_verify_commits >= 2)
+			panic("tessera verify: namespace invariant broken at "
+			    "commit gen %ju", (uintmax_t)tmp_->sb.generation);
+	}
+}
+
 static void
 tessera_fs_flush_task(void *ctx, int pending)
 {
@@ -16910,6 +17060,8 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 
 	TPROF_ADD(TPROF_FLUSH, _tpfl);
 
+	if (r == 0)
+		tessera_fs_verify_commit(tmp_);
 	mtx_lock(&tmp_->flush_mtx);
 	if (r == 0) tmp_->sb_dirty = 0;
 	/*
