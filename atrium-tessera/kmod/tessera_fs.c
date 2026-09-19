@@ -3397,6 +3397,27 @@ static unsigned long tessera_stat_verify_runs = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_runs, CTLFLAG_RD,
     &tessera_stat_verify_runs, 0, "per-commit verifications performed");
 static unsigned long tessera_stat_verify_violations = 0;
+static unsigned long tessera_stat_verify_snap_lost = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_snap_lost, CTLFLAG_RD,
+    &tessera_stat_verify_snap_lost, 0,
+    "commits after which a RETAINED snapshot's inode tree was no longer at "
+    "its recorded sector — caught at the commit, not at fsck");
+static unsigned long tessera_stat_verify_snap_unread = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_snap_unread, CTLFLAG_RD,
+    &tessera_stat_verify_snap_unread, 0,
+    "retained snapshot roots that could not be READ at the commit (IO or bad "
+    "header) — unknown, not counted as damage");
+/*
+ * TEST ONLY. Set to 1 and the next snapshot-root check is aimed at the pack
+ * registry root instead: a valid tree of the WRONG kind, which must raise
+ * verify_snap_lost exactly once. This exists because the first version of
+ * that check could not fail at all and read as "clean" for 122,707 commits.
+ */
+static int tessera_fault_verify_snap_kind = 0;
+SYSCTL_INT(_kern_tessera, OID_AUTO, fault_verify_snap_kind, CTLFLAG_RW,
+    &tessera_fault_verify_snap_kind, 0,
+    "TEST ONLY: aim the next retained-snapshot root check at a tree of "
+    "another kind, to prove the detector can fire");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_violations, CTLFLAG_RD,
     &tessera_stat_verify_violations, 0,
     "per-commit verifications that found a broken invariant");
@@ -12586,6 +12607,103 @@ tessera_fs_verify_commit(struct tessera_mount *tmp_)
 		    "a republish that dropped entries\n",
 		    tmp_->verify_root_entries, v.entries,
 		    (uintmax_t)tmp_->sb.generation);
+	}
+	/*
+	 * ★ SNAPSHOT ROOTS, checked the same way fsck checks them at unmount —
+	 * but HERE, at the commit. The residual damage ("retained snapshot gen
+	 * N: inode_root sector S no longer holds this snapshot's inode tree")
+	 * appears in roughly 1 run in 27, and every attempt to catch it has
+	 * been a post-mortem: fsck reports it 20 minutes later, by which time
+	 * the commit that reused the sector is long gone.
+	 *
+	 * ★ #102 AGAIN, in the kmod this time. The first version of this check
+	 * called tessera_btree_open() and tested for NULL — but open reads
+	 * NOTHING from disk, it only allocates a handle, so the check could
+	 * fail only on malloc failure. It ran 122,707 times, reported zero,
+	 * and in the very run where fsck found a damaged snapshot it still
+	 * reported zero: a dead arm, indistinguishable from "no damage". The
+	 * sector is only read at seek_first, which is where fsck surfaces it
+	 * too, and last_fail is what separates evidence from noise: KIND means
+	 * the sector holds a VALID node of another tree, i.e. it was freed and
+	 * reused under a live snapshot. IO/HEADER are "unknown, do nothing" —
+	 * counted, never treated as damage. Retention is 8, so this is a
+	 * handful of sector reads per commit.
+	 */
+	if (tmp_->sb.snapshots_root != 0 && tmp_->snapshots_tree != NULL) {
+		tessera_btree_cursor_t *sc =
+		    tessera_btree_seek_first(tmp_->snapshots_tree);
+		uint32_t checked = 0;
+		while (sc != NULL && checked < 64) {
+			uint8_t sk[8];
+			uint64_t root;
+			tessera_snapshot_record_t sr;
+			if (tessera_btree_cursor_get(sc, sk, &sr) != TESSERA_OK)
+				break;
+			checked++;
+			root = sr.inode_root;
+			/*
+			 * TEST ONLY: point one check at a sector that really
+			 * does hold a valid tree of another kind, so the
+			 * detector's ability to FIRE is proven rather than
+			 * assumed. Without this, "snap_lost=0" has two
+			 * readings and I have already believed the wrong one.
+			 */
+			if (tessera_fault_verify_snap_kind != 0 &&
+			    tmp_->sb.pack_registry_root != 0) {
+				tessera_fault_verify_snap_kind = 0;
+				root = tmp_->sb.pack_registry_root;
+			}
+			/*
+			 * The snapshot sharing the live root is the current
+			 * tree under another name — already verified above.
+			 */
+			if (root != 0 && root != tmp_->sb.inode_root) {
+				tessera_btree_t *it = tessera_btree_open(
+				    &tmp_->meta_bio, root,
+				    TESSERA_BTREE_KIND_INODE, 4,
+				    TESSERA_INODE_RECORD_SIZE);
+				if (it != NULL) {
+					tessera_btree_cursor_t *ic =
+					    tessera_btree_seek_first(it);
+					if (ic != NULL) {
+						tessera_btree_cursor_free(ic);
+					} else {
+						uint64_t fsec = 0;
+						uint8_t fkind = 0;
+						tessera_btree_fail_t f =
+						    tessera_btree_last_fail(it,
+						    &fsec, &fkind);
+						if (f ==
+						    TESSERA_BTREE_FAIL_KIND) {
+							bad = 1;
+							tessera_stat_verify_snap_lost++;
+							printf("tessera_fs: ★ "
+							    "VERIFY: commit gen "
+							    "%ju — retained "
+							    "snapshot gen %ju "
+							    "lost its inode "
+							    "tree: sector %ju "
+							    "now holds a tree "
+							    "of kind %u, so it "
+							    "was recycled under "
+							    "a live snapshot\n",
+							    (uintmax_t)tmp_->sb.generation,
+							    (uintmax_t)sr.generation,
+							    (uintmax_t)fsec,
+							    (unsigned)fkind);
+						} else if (f !=
+						    TESSERA_BTREE_FAIL_NONE) {
+							tessera_stat_verify_snap_unread++;
+						}
+					}
+					tessera_btree_close(it);
+				}
+			}
+			if (tessera_btree_cursor_next(sc) != TESSERA_OK)
+				break;
+		}
+		if (sc != NULL)
+			tessera_btree_cursor_free(sc);
 	}
 	tmp_->verify_root_entries = v.entries;
 	tmp_->verify_root_seen = 1;
