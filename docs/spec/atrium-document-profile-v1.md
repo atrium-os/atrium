@@ -175,7 +175,7 @@ resolution basis is stated per property. `<color>` per §3.6.
 | property | admitted values | initial | inh. |
 |---|---|---|---|
 | `display` | `block` \| `inline` \| `inline-block` \| `flex` \| `grid` \| `table` \| `table-row` \| `table-cell` \| `none` | `inline` | no |
-| `position` | `static` \| `relative` \| `absolute` | `static` | no |
+| `position` | `static` \| `relative` \| `absolute` \| `fixed` | `static` | no |
 | `top` `right` `bottom` `left` | `<length>` \| `<percentage>` \| `auto` | `auto` | no |
 | `width` `height` | `<length>` \| `<percentage>` \| `auto` \| `min-content` \| `max-content` | `auto` | no |
 | `min-width` `min-height` | `<length>` \| `<percentage>` \| `auto` | `auto` | no |
@@ -196,8 +196,29 @@ Percentages resolve against the containing block's inline size for `width`,
 `top`/`bottom`.
 
 **`box-sizing` is not a property** — `border-box` is a fixed rule (§3.1). **`float` and
-`clear` are absent.** **`position: fixed`/`sticky`** are deferred (both interact with
-scrolling and compositing). **`z-index` creates no implicit stacking context**: a
+`clear` are absent.**
+
+**`position: fixed` is admitted, under three conditions** (settled; `sticky` remains
+excluded — its threshold behaviour is a second layout mode for a use case `fixed` plus
+media queries already covers). It earns admission by the document's own rule: it breaks no
+guarantee. It is deterministic given a declared viewport (G1), independent of resource
+arrival (G2), keeps document order in the semantic tree regardless of where it paints (G5),
+and observes nothing about the host (G6). Only G3 needed anything, and that is a count.
+
+1. **The containing block is the document's own viewport — its Limen surface — never the
+   screen.** A document must not be able to position against, or reason about, anything
+   outside its surface; this is the layout-side statement of the anti-spoofing rule in the
+   hardening spec (H7).
+2. **A `transform` ancestor does NOT change it.** In CSS, a transformed ancestor silently
+   becomes the containing block for a descendant `fixed` element — one of the format's
+   most notorious action-at-a-distance surprises, and precisely what G4 exists to
+   eliminate. Here `fixed` is always against the viewport, and `transform` never changes
+   any containing block.
+3. **A fixed element may not occupy more than one third of the viewport's block size**, and
+   a document that asks for more is refused with a diagnostic (§3.12). Fixed headers
+   eating most of a phone screen is a real and unfixed plague of the web; browsers cannot
+   forbid it without breaking existing content, and we have no existing content to break.
+   Typical headers are around a tenth, so the bound is generous to anything sane. **`z-index` creates no implicit stacking context**: a
 stacking context exists only where `isolation: isolate` says so, which is why `isolation`
 is admitted at all.
 
@@ -409,6 +430,8 @@ are explicitly better than invented ones.
 | image dimension (either axis) | **16,384 px** | matches common GPU texture limits |
 | **total decoded image bytes** | **256 MiB** | the binding constraint (below) |
 | `box-shadow` blur + spread | **256 px** | bounds rasterization cost, not structure |
+| `position: fixed` elements per document | **8** | reasoned — bounds overlay stacking |
+| fixed element block size | **1/3 of viewport** | reasoned — see §3.3 |
 
 **Two of these interact deliberately.** A single 16,384 × 16,384 image decodes to about
 1 GiB, which the 256 MiB total forbids — so the dimension cap is a cheap early reject on a
@@ -587,9 +610,7 @@ property browsers can only approximate into a hard, mechanically checkable asser
    note that admitting them threatens G2 unless metrics are known before layout.
 2. **Justification quality without hyphenation.** `justify` is admitted but reads poorly
    without hyphenation; either restrict it or take on dictionaries.
-3. **Whether to admit `position: fixed`** for document headers, given its interaction
-   with scrolling and compositing in Fresco.
-4. **Re-derive the §3.12 ceilings on a representative corpus.** They are currently set
+3. **Re-derive the §3.12 ceilings on a representative corpus.** They are currently set
    from a *convenience* corpus — this source tree's documentation — which contains no
    grids, no `calc()` and no custom properties, and is not the Wikipedia/news/blog content
    the lane targets. The derivation method (p99, headroom, round to a power of two) is
