@@ -85,8 +85,11 @@ verify() {
     cd /
     timeout 180 umount $M || { echo "fsck_problems=SKIPPED_MOUNTED"; return; }
     d1=$(S legacy_sweeps_done)
-    mount -t tessera $PART $M && { sleep 3; cd /; timeout 180 umount $M; }
+    _remounted=0
+    mount -t tessera $PART $M && { _remounted=1; sleep 3; cd /; timeout 180 umount $M && _remounted=0; }
     echo "resweep=$(( $(S legacy_sweeps_done) - d1 ))"
+    # ★ Never fsck while still mounted — it fails toward FALSE POSITIVES.
+    [ $_remounted -eq 0 ] || { echo "fsck_problems=SKIPPED_MOUNTED"; return; }
     tessera-fsck $PART > /tmp/lorph.fsck 2>&1
     pat=$(tr ' ' '\n' < /root/lorph.legacy.inos | grep . | sed 's/.*/inode &[:( ]/' | paste -sd'|' -)
     probs=$(grep -iE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt' /tmp/lorph.fsck | grep -vE "$pat")

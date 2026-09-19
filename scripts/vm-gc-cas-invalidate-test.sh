@@ -81,7 +81,11 @@ DEAD=\$(dmesg | grep 'gc pass2 done' | tail -1 | sed -n 's/.* \\([0-9]*\\) dead 
 echo \"loc_inserts_fill=\$((L1-L0)) dead_packs=\$DEAD gc_wall_s=\$((t1-t0)) invalidations=\$(( \$(S cas_invalidations)-I0 )) gc_apply_ns=\$(( \$(S gc_apply_ns)-A0 )) gc_cas_invalidate_ns=\$(( \$(S gc_cas_invalidate_ns)-V0 )) \$(tr -d '\\n' < /root/gcinv.dt)\"
 bad=0; i=0; while [ \$i -lt 70000 ]; do f=\$M/c\$((i % 70))/f\$i; [ \"\$(cat \$f 2>/dev/null)\" = \"cache-fill \$i\" ] || bad=\$((bad+1)); i=\$((i+997)); done
 echo \"survivor_bad=\$bad\"
-cd /; sync; umount \$M || echo UMOUNT_FAIL
+cd /; sync
+# ★ UMOUNT_FAIL used to be reported and then fsck ran anyway. A live-volume
+# fsck fails toward FALSE POSITIVES, so a stuck umount became a fabricated
+# corruption report. Gate on it.
+umount \$M || { echo UMOUNT_FAIL; echo \"fsck_problems=SKIPPED_MOUNTED\"; exit 0; }
 tessera-fsck \$DEV > /root/gcinv.fsck 2>&1
 echo \"fsck_problems=\$(grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem' /root/gcinv.fsck)\"
 " 2>&1 | tr -d '\r')

@@ -58,7 +58,9 @@ files=$(find $M -type f 2>/dev/null | wc -l | tr -d ' ')
 adm=$(( $(S meta_admit_refusals) - a0 )); band=$(( $(S meta_band_refusals) - b0 ))
 trav=$(find $M 2>&1 >/dev/null | wc -l | tr -d ' ')
 echo "files=$files admit_refusals=$adm band_refusals=$band traversal_errors=$trav"
-umount $M
+# ★ fsck ONLY on a successfully unmounted volume: a live-volume fsck fails
+# toward FALSE POSITIVES (measured 466 -> 2 -> 2 -> 2 mounted, CLEAN unmounted).
+umount $M || { echo "fsck_problems=SKIPPED_MOUNTED"; exit 1; }
 stale=$(( $(dmesg | grep -ciE 'STALE|drain failed') - d0 ))
 fsck=$(tessera-fsck $PART 2>&1 | grep -c '^    - ')
 echo "stale_or_drain_msgs=$stale fsck_problems=$fsck"

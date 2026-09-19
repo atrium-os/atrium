@@ -79,7 +79,17 @@ echo "--- write probe"
 echo probe > $M/probe.$$ 2>&1 && echo "write_ok=1" || echo "write_ok=0"
 row post-probe
 echo "--- umount"
-cd /; t0=$(date +%s); timeout 300 umount $M && echo "umount_ok=1 took $(( $(date +%s) - t0 ))s" || echo "umount_ok=0"
-tessera-fsck /dev/vtbd2p1 > /tmp/stuck.fsck 2>&1; echo "fsck_problems=$(grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem' /tmp/stuck.fsck)"
+cd /; t0=$(date +%s)
+# ★ It was not enough to REPORT umount_ok=0 and fsck anyway: a live-volume fsck
+# fails toward false positives (measured 466 -> 2 -> 2 -> 2 mounted, CLEAN
+# unmounted), so proceeding manufactures damage reports. Gate on it.
+if timeout 300 umount $M; then
+    echo "umount_ok=1 took $(( $(date +%s) - t0 ))s"
+    tessera-fsck /dev/vtbd2p1 > /tmp/stuck.fsck 2>&1
+    echo "fsck_problems=$(grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem' /tmp/stuck.fsck)"
+else
+    echo "umount_ok=0"
+    echo "fsck_problems=SKIPPED_MOUNTED"
+fi
 grep -E "result:" /tmp/stuck.fsck | head -2 | sed 's/^/  /'
 sh /root/guest-reserve-exhaustion.sh cleanup >/dev/null 2>&1; echo cleaned

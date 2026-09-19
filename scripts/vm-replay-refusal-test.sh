@@ -144,7 +144,9 @@ res=$($VSSH "TRACE_REPLAY=${TRACE_REPLAY:-0}; $GATE
   dmesg | grep -o '[0-9]* move(s) into a lost directory undone' | tail -1 | sed 's/^/undone=/' 
   touch $M/base/new1 2>&1 && echo recreate_new1=ok
   ls $M/base >/dev/null 2>/root/rr.ls; echo \"ls_errors=\$(wc -l < /root/rr.ls | tr -d ' ')\"
-  umount $M
+  # ★ fsck ONLY on a successfully unmounted volume: a live-volume fsck fails
+  # toward FALSE POSITIVES (measured 466 -> 2 -> 2 -> 2 mounted, CLEAN unmounted).
+  umount $M || { echo \"fsck_problems=SKIPPED_MOUNTED\"; exit 0; }
   tessera-fsck $DEV > /root/rr.fsck 2>&1
   echo \"fsck_problems=\$(grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem' /root/rr.fsck)\"
   grep -E 'result:|^    - ' /root/rr.fsck | head -6 | sed 's/^/  /'

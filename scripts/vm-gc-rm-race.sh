@@ -71,7 +71,9 @@ arm(){ # label prefix trust rep
   unread=0; for f in $(find $M/sys/dev $M/sys/contrib $M/sys/arm64 -type f 2>/dev/null | head -400); do cat "$f" >/dev/null 2>&1 || unread=$((unread+1)); done
   ( cd $M/sys && find . -type f -exec sha256 -r {} + 2>/root/rd.err | sort -k2 > /root/vol.sha ); rderr=$(wc -l < /root/rd.err | tr -d ' ')
   sort -k2 /root/vol.sha > /root/v; sort -k2 /root/src.sha > /root/s; mism=$(join -j2 /root/v /root/s 2>/dev/null | awk '$2!=$3' | wc -l | tr -d ' ')
-  umount $M; tessera-fsck $DEV > /root/fsck.$1.$4.out 2>&1; fs=$(grep -ciE "dangling|problem|error|corrupt" /root/fsck.$1.$4.out)
+  # ★ fsck ONLY on a successfully unmounted volume: a live-volume fsck fails
+  # toward FALSE POSITIVES (measured 466 -> 2 -> 2 -> 2 mounted, CLEAN unmounted).
+  if umount $M; then tessera-fsck $DEV > /root/fsck.$1.$4.out 2>&1; fs=$(grep -ciE "dangling|problem|error|corrupt" /root/fsck.$1.$4.out); else fs=SKIPPED_MOUNTED; fi
   echo "ARM $1 prefix=$2 trust=$3 rep=$4: scans=$(( $(S gc_scans)-s0 )) reclaimed=$(( $(S gc_reclaimed)-r0 )) aborts=$(( $(S gc_aborts)-a0 )) id_mismatch=$(( $(S gc_pack_id_mismatch)-m0 )) | rm_errs=$(wc -l < /root/rmr.err | tr -d ' ') left_after_rm=$left UNREADABLE_leftovers=$unread survivor_read_errs=$rderr survivor_sha_mismatch=$mism fsck_lines=$fs"
   [ -s /root/rmr.err ] && { echo "   rm errors by kind:"; sed -E 's#/mnt/scratch/sys/[^:]*#PATH#' /root/rmr.err | sort | uniq -c | sort -rn | head -4 | sed 's/^/     /'; }
   [ "$fs" != 0 ] && { echo "   fsck:"; grep -iE "dangling|problem|error|corrupt" /root/fsck.$1.$4.out | head -4 | sed 's/^/     /'; }

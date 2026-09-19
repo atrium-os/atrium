@@ -64,6 +64,14 @@ if arm deferred 1; then
 fi
 
 echo
-sync; umount $M 2>/dev/null
-tessera-fsck $DEV > /root/dd.fsck 2>&1
-echo "fsck_problems=$(grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem' /root/dd.fsck)"
+# ★ Gate the fsck on the umount SUCCEEDING. fsck on a mounted volume reads a
+# moving target and invents problems: measured 466 -> 2 -> 2 -> 2 on one live
+# volume, CLEAN twice once unmounted. It fails toward FALSE POSITIVES, so an
+# unchecked umount manufactures bugs that were never there.
+sync
+if umount $M 2>/dev/null; then
+    tessera-fsck $DEV > /root/dd.fsck 2>&1
+    echo "fsck_problems=$(grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem' /root/dd.fsck)"
+else
+    echo "fsck_problems=SKIPPED_MOUNTED"
+fi

@@ -92,7 +92,10 @@ c=1; while [ $c -le $CYCLES ]; do
   res=$($VSSH "$GATE
     [ \$(sha256 -q /boot/kernel/tessera_fs.ko | cut -c1-16) = $KMOD ] || echo WRONG_KMOD
     mount -t tessera $DEV $M 2>/dev/null || echo MOUNT_FAIL
-    n=\$(find $M 2>/dev/null | wc -l | tr -d ' '); umount $M 2>/dev/null
+    n=\$(find $M 2>/dev/null | wc -l | tr -d ' ')
+    # ★ fsck only if the umount SUCCEEDED: a live-volume fsck invents
+    # problems (measured 466 -> 2 -> 2 -> 2 mounted, CLEAN unmounted).
+    umount $M 2>/dev/null || { echo \"entries=\$n fsck_problems=SKIPPED_MOUNTED\"; exit 0; }
     tessera-fsck $DEV > /root/c.fsck 2>&1
     echo \"entries=\$n fsck_problems=\$(grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem' /root/c.fsck)\"" 2>/dev/null | tr -d '\r' | tr '\n' ' ')
   case "$res" in
