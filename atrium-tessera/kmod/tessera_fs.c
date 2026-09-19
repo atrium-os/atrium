@@ -3360,6 +3360,13 @@ static unsigned long tessera_stat_pinscan_gc_roots_moved = 0;
 static unsigned long tessera_stat_pinscan_snaproot_unpinned = 0;
 static unsigned long tessera_stat_pinscan_late_snaps = 0;
 static unsigned long tessera_stat_epoch_snap_birth_kept = 0;
+static unsigned long tessera_stat_drain_snap_birth_kept = 0;
+/* ★ Is snap_birth_bm ever actually populated? snap_birth_n is per-mount and
+ * is reset at every pinscan swap, so it cannot answer that. These two survive
+ * the reset and separate "never pinned anything" from "pinned, then wiped". */
+static unsigned long tessera_stat_snap_birth_pins   = 0;
+static unsigned long tessera_stat_snap_birth_clears = 0;
+static unsigned long tessera_stat_snap_birth_live   = 0;
 static unsigned long tessera_stat_snap_birth_epoch_roots = 0;
 /*
  * ★★ PER-COMMIT NAMESPACE VERIFICATION (debug).
@@ -5482,6 +5489,38 @@ tessera_fs_meta_pending_drain(struct tessera_mount *tmp_)
 			    & (1u << (bit % 8))) {
 				pinned = 1;
 			}
+		}
+		/*
+		 * ★★★ #102 — THE THIRD CHECK, and the one this path was
+		 * missing. Both checks above are about REACHABILITY AS OF THE
+		 * LAST SCAN. Neither can see a sector that has become a
+		 * retained snapshot's root SINCE that scan, and the dangerous
+		 * sector is exactly that shape:
+		 *
+		 *   - recycled out of meta_free, so it is an OLD LOW sector,
+		 *     far below meta_pin_watermark — first check misses it;
+		 *   - it sat in meta_free when the last scan ran, so it was
+		 *     unreachable and unmarked — second check misses it;
+		 *   - it was then allocated, became part of the live inode
+		 *     tree, and a snapshot record captured it as inode_root.
+		 *
+		 * Releasing it there destroys that snapshot. snap_birth_bm is
+		 * the one structure that knows, and it was consulted ONLY in
+		 * tessera_fs_meta_epoch_sweep() — which was given this exact
+		 * guard for this exact reason, while this path never was.
+		 *
+		 * The same asymmetry explains why every audit read zero while
+		 * fsck kept finding destroyed snapshots: the audits walk the
+		 * snapshots TREE, and the record is not in it yet when the
+		 * release decision is made. See the sweep's comment about
+		 * epoch_frees_snaproot staying 0 (gen 240291 at sector 288).
+		 * Observed here as gen 14110 at sector 1181 (recycled into
+		 * kind 1) and gen 28765 at sector 1157 (kind 3) — both old low
+		 * sectors, both with every detector silent.
+		 */
+		if (!pinned && tessera_meta_snap_birth_pinned(tmp_, s)) {
+			pinned = 1;
+			tessera_stat_drain_snap_birth_kept++;
 		}
 		TSEC(s, "DRAIN decision pinned=%d (watermark=%ju bitmap=%s)",
 		    pinned, (uintmax_t)tmp_->meta_pin_watermark,
@@ -12222,6 +12261,7 @@ tessera_commit_sb(struct tessera_mount *tmp_)
 							    (uint8_t)(1u <<
 							    (_pbit % 8));
 							tmp_->snap_birth_n++;
+							tessera_stat_snap_birth_pins++;
 						}
 					}
 				}
@@ -17819,9 +17859,14 @@ tessera_fs_pinscan_run_impl(struct tessera_mount *tmp_)
 	/* This bitmap walked the snapshots tree (including any late births
 	 * covered just above), so those roots are now pinned the normal way
 	 * and the birth ring can start over. */
-	if (tmp_->snap_birth_bm != NULL)
+	if (tmp_->snap_birth_bm != NULL) {
+		if (tmp_->snap_birth_n != 0) {
+			tessera_stat_snap_birth_clears++;
+			tessera_stat_snap_birth_live = tmp_->snap_birth_n;
+		}
 		memset(tmp_->snap_birth_bm, 0,
 		    (size_t)((tmp_->sb.meta_reserve_length + 7) / 8));
+	}
 	tmp_->snap_birth_n = 0;
 	tmp_->meta_pin_watermark = bump0;
 	tessera_stat_pinscan_swaps++;
@@ -28930,6 +28975,20 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, snap_birth_epoch_roots, CTLFLAG_RD,
     &tessera_stat_snap_birth_epoch_roots, 0,
     "roots a newborn snapshot captured that were allocated in the CURRENT "
     "uncommitted epoch — the population the epoch sweep could release");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, snap_birth_pins, CTLFLAG_RD,
+    &tessera_stat_snap_birth_pins, 0,
+    "cumulative bits ever set in snap_birth_bm — 0 means the birth pin never "
+    "pinned anything and both guards that consult it are dead");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, snap_birth_clears, CTLFLAG_RD,
+    &tessera_stat_snap_birth_clears, 0,
+    "pinscan swaps that wiped a NON-EMPTY snap_birth_bm");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, snap_birth_live, CTLFLAG_RD,
+    &tessera_stat_snap_birth_live, 0,
+    "bits live in snap_birth_bm at the most recent non-empty wipe");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, drain_snap_birth_kept, CTLFLAG_RD,
+    &tessera_stat_drain_snap_birth_kept, 0,
+    "drain releases withheld because the sector is a retained snapshot's "
+    "birth root — the check the drain was missing (#102)");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, epoch_snap_birth_kept, CTLFLAG_RD,
     &tessera_stat_epoch_snap_birth_kept, 0,
     "epoch-sweep releases refused because a snapshot born this flush roots "
