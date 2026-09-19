@@ -473,21 +473,29 @@ engine** — it brings SpiderMonkey with it. And the JS engine is not independen
 selectable in practice, because the hard part is not the VM, it is binding the VM to a
 DOM. Choose the browser engine; the JS engine arrives attached.
 
-### 11.2 We do not write an engine
+### 11.2 We do not write an engine *now*
 
-**Decision: no self-written JS or browser engine.**
+**Decision: adopt a mature engine for the legacy lane today. This is a sequencing
+decision, not a permanent verdict** — see §11.8, which keeps a memory-safe engine open as
+the architecturally correct end state.
+
+Reasons it is not the thing to build first:
 
 - ECMAScript conformance is measured against test262's tens of thousands of tests. A
   credible engine is many engineer-years of the most security-sensitive code in the
-  project.
-- It contradicts the thesis. §2 says we do not build a sandbox because the jail is one;
-  writing an engine takes on the largest and most exploitable codebase in the system for
-  no architectural gain.
-- A fresh engine would be both less secure and less compatible than a mature one for
-  years. The jail protects us either way, but a buggy engine also means broken content.
+  project, and it is not currently the bottleneck — tiers 1–3 are (§5.3).
+- Nothing about the engine choice is decidable before §5.4's corpus measurement. Building
+  an engine to serve a lane whose size is unmeasured is the same error as porting Servo
+  before measuring (§11.4).
+- A fresh engine is less *compatible* than a mature one for years, and in the legacy lane
+  compatibility is the entire purpose — an incompatible legacy engine has no reason to
+  exist.
 
-This matches how the charter treats every comparable case: backend multipliers for
-toolkits, a Mesa fork rather than a rewrite.
+Note what is **not** among the reasons: that it is hard or large. This project builds
+filesystems, schedulers and compositors on the argument that doing it right matters more,
+and "too much effort" would be inconsistent with that charter. The argument here is about
+*order*, and about the legacy lane specifically being a fallback rather than the main
+path.
 
 ### 11.3 The shortlist, and what the licensing policy decides
 
@@ -645,6 +653,64 @@ Target-specific notes:
 **What does pay off is not an execution format at all.** §5.3's tiers 2 and 3 convert JS
 into *declarative states* and hash-identified substitutions — removing execution rather
 than relocating it. That is where effort aimed at "getting rid of JS" belongs.
+
+**One route is not rejected, only deferred:** changing the *pointer discipline* rather
+than the target language. See §11.8.
+
+### 11.8 Deferred, not rejected: a memory-safe engine
+
+Of the five collector bug classes in §11.6, four — missed roots and write barriers, type
+confusion while tracing, compaction pointer fixups, refcount errors — are all the same
+underlying thing: **references to heap objects that are not correctly tracked.** That
+suggests attacking the reference representation itself, and the suggestion is sound.
+
+The mechanism is *not* Rust references: the borrow checker handles static lifetimes and
+cannot express "this object is live because a collector says so". The mechanism is the
+Rust idiom for graph structures — **arena allocation with generational indices in place of
+pointers** — plus type-system-enforced rooting, of which `gc-arena`'s branded lifetimes
+(a compile error to hold a GC pointer across a collection point) is the state of the art.
+
+Mapped onto the four classes:
+
+| class | effect of arena + generational indices |
+|---|---|
+| compaction fixup | **eliminated** — no pointers to fix up; data moves, indices stay valid |
+| missed root | **downgraded from security to availability** — a freed-but-indexed object is caught by the generation counter, producing a clean error rather than a use-after-free |
+| tracing type confusion | largely eliminated — typed arenas make layout statically known |
+| refcount errors | eliminated as a *manual* class — refcounting becomes compiler-managed |
+
+It would additionally close the **buffer-overflow class that §11.6 explicitly cannot**, so
+on memory safety this is strictly better than the non-reclaiming arena, not merely
+different. And it reclaims, which non-reclaiming by definition does not — so it is the
+**only** approach that helps long-running tier-4 apps.
+
+**Why it is deferred rather than adopted:** it cannot be retrofitted. SpiderMonkey's and
+QuickJS's object models *are* raw pointers and their own collectors; changing the pointer
+discipline is rewriting the core. The existing Rust engine, **Boa**, has the right
+architecture but not the maturity — incomplete conformance and slow, suited to embedded
+scripting rather than arbitrary legacy web content, which is the one workload the legacy
+lane exists to serve.
+
+**The incremental path that makes this tractable.** An immature engine does not have to
+start in the hardest lane. **Tier 2 conversion (§4) is the ideal proving ground:** it runs
+offline, so performance is nearly irrelevant; it is retryable; and a failure degrades to
+"convert with the mature engine instead" rather than breaking someone's browsing. The bar
+there is *conformant enough to prerender real pages*, which is dramatically lower than
+*run the interactive web*. A memory-safe engine can therefore be adopted or grown in a
+place where its weaknesses are cheap, and extended toward tier 4 only as it earns it.
+
+**Re-evaluation triggers**, so that "keep it in mind" is actionable rather than a sentiment:
+
+1. **Boa's conformance against our own tier-2 corpus** reaching the level where it converts
+   pages the mature engine converts. Measured on our corpus, not on a published score.
+2. **§5.4's corpus measurement showing tier 4 is material** rather than marginal. If the
+   legacy lane carries real traffic, its security posture stops being a rounding error and
+   the case for a memory-safe engine strengthens accordingly.
+3. **A vulnerability class in the adopted engine that the jail does not adequately
+   contain** — i.e. one that reaches past a zero-capability worker. By H8.1's reasoning
+   that is the point at which engine hardening stops being low-value.
+4. **The document lane maturing** to where the engine becomes the weakest link in the
+   system rather than one risk among many.
 
 ## 12. Open questions
 
