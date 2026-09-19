@@ -518,10 +518,15 @@ cheaper, and it is precisely the instrument that produces §5.4's corpus number 
 measurement that decides whether the Servo port is worth starting at all. Building the
 expensive thing first, to discover whether it was needed, is the wrong order.
 
-Two candidates for that instrument, both MIT-class licences and comparable integration
-work: **QuickJS** (C, no JIT, small, battle-tested) or **Boa** (Rust, ~95.5% test262,
-memory-safe object model). Boa's weakness is speed, which tier 2 does not care about
-because it runs offline — see §11.8, which now favours it for this role.
+**Decision: the instrument is Boa plus a minimal DOM.** Unlicense/MIT (allowed outright,
+no per-component evaluation), ~95.5% test262, a memory-safe object model, and its one
+weakness — speed — is irrelevant to a converter that runs offline.
+
+**Build it with a thin engine boundary.** The minimal DOM is the bulk of the work and is
+engine-agnostic; keeping the embedding surface narrow means the same instrument can later
+be re-run on a different engine. That is not hypothetical tidiness — it makes the
+instrument double as the evaluation harness for §11.8's trigger 1, measuring a candidate
+engine against *our* corpus rather than against a published score.
 
 **Honest limit, to be stated with the result:** a DOM without layout fails on content
 calling `getBoundingClientRect`, `offsetWidth`, or the observer APIs — the known ceiling
@@ -715,13 +720,36 @@ per-component evaluation. Nova and Servo are both MPL-2.0, the "evaluate per-com
 bucket. brimstone's relicensing must be checked before it is considered at all.
 
 **Corrected assessment:** conformance is no longer Boa's blocker — at ~95.5% it is ahead
-of a production browser engine. Its gap is *performance*. And §11.4's proving ground is
-precisely where performance does not matter: tier-2 conversion runs offline. So the
-instrument proposed there could reasonably be **Boa plus a minimal DOM rather than QuickJS
-plus a minimal DOM** — comparable integration work, memory safety from the first day, and
-the same corpus measurement out the other end. Nova remains the one to watch on
-architecture; it is roughly where Boa's conformance was some years ago, and it is building
-the thing this section argues is correct.
+of a production browser engine. Its gap is *performance*, and §11.4's proving ground is
+precisely where performance does not matter. Hence the instrument decision there.
+
+### 11.8.1 Why Boa for the instrument when Nova has the better architecture
+
+Both statements hold, because they answer different questions, and the apparent conflict
+dissolves in three steps:
+
+1. **The instrument's job is measurement, not production.** What matters is whether it can
+   actually run real pages' JS, what it costs to integrate, and its licence. Performance
+   and long-term architecture are close to irrelevant for an offline converter that exists
+   to produce one number.
+2. **An instrument must not confound what it measures.** This is decisive. At ~80%
+   conformance with known gaps in sparse arrays and RegExp lookbehind — both ordinary in
+   real-world code — Nova would fail to convert pages for reasons that have nothing to do
+   with the pages. We could not then distinguish "this content genuinely resists tier-2
+   conversion" from "our tool is missing a feature", and §5.4's corpus number would come
+   out systematically pessimistic. We would then decide whether to undertake the single
+   largest piece of work in D6 on bad data.
+3. **Nova's architectural advantage lands in a lane the instrument is not in.** §11.8's
+   case — arena plus generational indices, type-enforced rooting — buys most where memory
+   must be *reclaimed*, i.e. long-running tier-4 apps. The instrument is ephemeral and
+   offline, so §11.6's non-reclaiming arena already removes the same bug classes there for
+   free. **Nova's edge is precisely where non-reclaiming fails, and the instrument is
+   precisely where it does not.**
+
+So: Boa now, because the measurement must be trustworthy; Nova watched, because it is
+building the right thing for the lane where our cheap trick runs out. The thin engine
+boundary in §11.4 is what keeps that from being a fork in the road — re-running the same
+instrument on Nova is how trigger 1 gets measured when the time comes.
 
 **The incremental path that makes this tractable.** An immature engine does not have to
 start in the hardest lane. **Tier 2 conversion (§4) is the ideal proving ground:** it runs
