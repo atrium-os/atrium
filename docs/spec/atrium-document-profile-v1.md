@@ -353,12 +353,72 @@ v1 admits no client-characteristic-dependent fetching.
 
 ### 3.12 Static bounds (G3)
 
-Normative ceilings, enumerated in the profile and checked by the parser and the scene-graph
-validator: maximum tree depth, node count, total decoded image bytes, individual image
-dimensions, stylesheet count and size, `calc()`/custom-property substitution depth, grid
-track count, and total document bytes. A document exceeding any ceiling is **refused with
-a diagnostic**, never truncated or clamped — a clamped document renders wrongly and
-silently, which is the failure mode this project has been bitten by repeatedly.
+Every ceiling below is normative and checked by the parser and the scene-graph validator.
+A document exceeding any of them is **refused with a diagnostic**, never truncated or
+clamped — a clamped document renders wrongly and silently, which is the failure mode this
+project has been bitten by repeatedly.
+
+**Derivation rule.** Each measured ceiling is the corpus **p99, given headroom and rounded
+up to a power of two**. p99 rather than max, because a single pathological artifact should
+not set a compatibility surface; headroom, because a ceiling that refuses real content is
+worse than one that bounds loosely — the purpose is to make resource use *finite*, not to
+make it small.
+
+#### The corpus actually used
+
+360 HTML documents and 40 stylesheets from this tree (FreeBSD contrib docs, the Lua
+manual, EDK2, generated reports), plus 95 Markdown specs under `docs/`:
+
+| measure | median | p95 | p99 | max |
+|---|---|---|---|---|
+| document bytes (HTML) | 5,510 | 64,163 | 140,121 | 564,379 |
+| elements per document | 84 | 1,407 | 2,669 | 12,594 |
+| tree depth ★ | 8 | 34 | 65 | 1,345 ★ |
+| stylesheet bytes | — | — | — | 31,024 |
+| rules per stylesheet | — | — | — | 266 |
+| table columns (Markdown) | 3 | 6 | 12 | 12 |
+
+★ **The depth figures are inflated and must not be read as structural nesting.** The
+measuring parser does not implement HTML5's implied end tags, so unclosed `<p>`/`<li>`/`<dt>`
+in legacy markup accumulate on its stack — the 1,345 outlier is the Lua manual, not a
+document nested 1,345 deep. This profile requires *well-formed* input (§2), where that
+inflation cannot occur, so the depth ceiling below is set from the median and p95 with
+generous headroom rather than from the contaminated tail.
+
+★★ **This is a convenience corpus, not a representative one.** It is source-tree
+documentation, not a sample of the Wikipedia/news/blog content the document lane targets,
+and it contains no grids, no `calc()`, and no custom properties at all. These ceilings are
+therefore **provisional**, and §8 keeps re-derivation on a representative corpus open. The
+derivation *method* above is the durable part; the numbers are the best available now and
+are explicitly better than invented ones.
+
+#### The ceilings
+
+| ceiling | value | basis |
+|---|---|---|
+| total document bytes | **4 MiB** | ~7× observed max, ~30× p99 |
+| elements per document | **65,536** | ~5× observed max, ~24× p99 |
+| tree depth | **256** | ~7× p95; set off median/p95, see ★ |
+| stylesheets per document | **16** | reasoned — no corpus signal |
+| `@import` depth | **4** | reasoned |
+| bytes per stylesheet | **1 MiB** | ~34× observed max |
+| rules per stylesheet | **16,384** | ~60× observed max |
+| `calc()` nesting depth | **16** | reasoned — hand-written `calc()` rarely exceeds 3 |
+| custom-property substitution depth | **16** | reasoned; cycles are a diagnostic regardless |
+| grid tracks per axis (incl. `repeat()` expansion) | **1,024** | reasoned — no corpus signal |
+| image dimension (either axis) | **16,384 px** | matches common GPU texture limits |
+| **total decoded image bytes** | **256 MiB** | the binding constraint (below) |
+| `box-shadow` blur + spread | **256 px** | bounds rasterization cost, not structure |
+
+**Two of these interact deliberately.** A single 16,384 × 16,384 image decodes to about
+1 GiB, which the 256 MiB total forbids — so the dimension cap is a cheap early reject on a
+header, and the decoded-bytes cap is what actually bounds memory. Stating both is not
+redundancy: the first is checkable before allocating anything.
+
+**Why refuse rather than clamp**, restated because it is the rule most likely to be
+softened under pressure: a refused document is a visible failure with a diagnostic and a
+position, and the reader knows they are not seeing the content. A clamped one renders
+plausibly and wrongly, forever, and nobody finds out.
 
 ---
 
@@ -529,5 +589,8 @@ property browsers can only approximate into a hard, mechanically checkable asser
    without hyphenation; either restrict it or take on dictionaries.
 3. **Whether to admit `position: fixed`** for document headers, given its interaction
    with scrolling and compositing in Fresco.
-4. **The exact numeric ceilings** in §3.12 — these should be derived from measurement on
-   the corpus, not guessed, and they are a compatibility surface once published.
+4. **Re-derive the §3.12 ceilings on a representative corpus.** They are currently set
+   from a *convenience* corpus — this source tree's documentation — which contains no
+   grids, no `calc()` and no custom properties, and is not the Wikipedia/news/blog content
+   the lane targets. The derivation method (p99, headroom, round to a power of two) is
+   settled; the numbers are provisional and become a compatibility surface once published.
