@@ -464,7 +464,109 @@ users to dismiss the one that matters.
 **Naming:** the Roman night watch were the *vigiles*, which fits both the convention and
 the job; `vigild` is offered as a candidate, not a decision.
 
-## 11. Open questions
+## 11. Engine selection and execution mode
+
+### 11.1 Two decisions, not one
+
+"Servo or build our own" merges two choices. **Servo is a browser engine, not a JS
+engine** — it brings SpiderMonkey with it. And the JS engine is not independently
+selectable in practice, because the hard part is not the VM, it is binding the VM to a
+DOM. Choose the browser engine; the JS engine arrives attached.
+
+### 11.2 We do not write an engine
+
+**Decision: no self-written JS or browser engine.**
+
+- ECMAScript conformance is measured against test262's tens of thousands of tests. A
+  credible engine is many engineer-years of the most security-sensitive code in the
+  project.
+- It contradicts the thesis. §2 says we do not build a sandbox because the jail is one;
+  writing an engine takes on the largest and most exploitable codebase in the system for
+  no architectural gain.
+- A fresh engine would be both less secure and less compatible than a mature one for
+  years. The jail protects us either way, but a buggy engine also means broken content.
+
+This matches how the charter treats every comparable case: backend multipliers for
+toolkits, a Mesa fork rather than a rewrite.
+
+### 11.3 The shortlist, and what the licensing policy decides
+
+| candidate | licence | verdict |
+|---|---|---|
+| **WebKit / JavaScriptCore** | LGPL | **Hard reject.** LICENSING-POLICY.md admits no LGPL anywhere in the runtime stack |
+| **Chromium / Blink / V8** | BSD-3 | Licence fine; rejected on architecture — colossal, own build system, and it assumes its own process and sandbox model, which is precisely what we are replacing |
+| **Gecko** | MPL-2.0 | Enormous, never designed for embedding |
+| **Servo** (+ SpiderMonkey) | MPL-2.0 | **Selected.** Rust, embeddable by design, actively maintained. MPL-2.0 sits in the policy's "evaluate per-component" bucket, and toolkit-backends.md already set that precedent |
+
+Servo was already position 5 of the D6 build order; this confirms it rather than changing
+it. Its weaker web-compatibility relative to Blink is tolerable *because* tiers 1–3 carry
+the reading cases (§5.3) — it is a fallback, not the main path.
+
+### 11.4 Sequencing: measure before porting the expensive thing
+
+**Do not start with Servo.** Tier 2 — prerendering SPA content in the normalizer — does
+not obviously need a browser engine. **QuickJS (MIT, no JIT, modern ES) plus a minimal
+DOM** is dramatically cheaper, and it is precisely the instrument that produces §5.4's
+corpus number — the measurement that decides whether the Servo port is worth starting at
+all. Building the expensive thing first, to discover whether it was needed, is the wrong
+order.
+
+**Honest limit, to be stated with the result:** a DOM without layout fails on content
+calling `getBoundingClientRect`, `offsetWidth`, or the observer APIs — the known ceiling
+of this approach. The number it yields is therefore a **lower bound** on what tiers 1–3
+can cover, and must be reported as one rather than as the answer.
+
+### 11.5 Execution mode: JIT off, AOT to bytecode
+
+**Decision: JIT disabled by default; ahead-of-time compilation to bytecode.**
+
+JIT is the most exploited component of any engine, which is why hardened modes in shipping
+products disable it. SpiderMonkey can run interpreter-only; QuickJS has no JIT at all.
+
+**What AOT buys, and what it does not.** It does *not* buy JIT-level performance: JIT's
+advantage comes from speculating on observed runtime types, which by definition is not
+available ahead of time, so AOT-compiled JS lands around good-interpreter level. What it
+buys is the removal of **runtime code generation** — no writable-executable mappings in
+the process running hostile code, no JIT spraying, and none of the optimizing-compiler
+type-confusion bugs that are the highest-value targets in an engine.
+
+**The realistic form is AOT to bytecode** (the Hermes/QuickJS model), not AOT to native.
+It preserves JS semantics exactly, eliminates runtime codegen, starts fast, and produces a
+compact content-addressable artifact. Native AOT for JavaScript does not reach JIT
+performance anyway, so it pays a large complexity cost for no benefit we need.
+
+**AOT is not a privilege granted to trusted origins.** That framing was considered and
+rejected:
+
+1. It reintroduces the trusted fast path that the scene-graph hardening spec eliminated —
+   trust-by-identity survives compromise, and the privileged path is what an attacker
+   reaches for.
+2. Origin trust does not track the risk. A trusted origin is compromised by a CDN
+   injection, a supply-chain package or an XSS: **trust attaches to the origin, while the
+   risk attaches to the code.**
+3. AOT needs no trust. The artifact is produced by *our* compiler in *our* jail, so its
+   safety rests on our compiler being sound, not on who authored the source.
+
+**The axis that does make sense is economic: compile by hash popularity, not by origin.**
+A framework identified by content hash compiles once and deduplicates across every site
+and user — §5.3's tier-3 insight applied to compilation. Per-deploy application bundles
+are poor candidates because compiling them is economically pointless, not because they are
+untrusted.
+
+**Requirements inherited from elsewhere in this design:**
+
+- The compiler consumes hostile input, so it runs in an **empty jail** (hardening H8.1:
+  parse where the capability set is empty), offline and separate from the executing jail.
+- Its output is a **content-addressed artifact shared between users**, which is the
+  implantation path (hardening H10.1), not the exfiltration one. AOT artifacts therefore
+  need the discipline of §5.6: **deterministic compilation**, so any artifact can be
+  independently re-derived and compared rather than trusted.
+
+**Honest limit:** this removes the code-generation class, not the engine's attack surface.
+GC and builtin bugs are untouched. The jail remains the primary boundary; this is defence
+in depth, on the same reasoning as hardening H8.1.
+
+## 12. Open questions
 
 1. **Zygote fork cost under Portcullis** — measured, not assumed, and it decides §7.6's
    origin-vs-site granularity.
