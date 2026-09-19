@@ -563,8 +563,88 @@ untrusted.
   independently re-derived and compared rather than trusted.
 
 **Honest limit:** this removes the code-generation class, not the engine's attack surface.
-GC and builtin bugs are untouched. The jail remains the primary boundary; this is defence
-in depth, on the same reasoning as hardening H8.1.
+GC and builtin bugs are untouched — see §11.6. The jail remains the primary boundary; this
+is defence in depth, on the same reasoning as hardening H8.1.
+
+### 11.6 Memory management: don't reclaim, rather than don't collect
+
+**Decision: non-reclaiming allocation in ephemeral workers; conventional GC only where
+lifetime demands it.**
+
+The garbage collector is, with the optimizing compiler, one of the two largest sources of
+exploitable bugs in any engine. It cannot be removed by changing target language: JS
+*semantics* require garbage collection — unbounded object lifetimes, cycles, closures, and
+no ownership information anywhere — so any target must implement them (§11.7).
+
+But **GC bugs are a consequence of reclaiming memory.** Where a worker is short-lived and
+bounded — a document render, a prerender conversion — it need not reclaim at all:
+
+> Make the worker ephemeral, and give the engine an allocator whose `free` is a no-op.
+
+QuickJS already accepts a custom allocator, so this is configuration, not a compiler
+project. What it buys:
+
+- **Use-after-free stops being exploitable.** The primitive is free-then-reallocate with
+  attacker-controlled data of a different type; with no reuse, a dangling pointer still
+  refers to the intact original object. The bug may remain; the exploitation path does
+  not.
+- **Collector bugs cease to exist** rather than being mitigated — no mark/sweep races, no
+  compaction pointer fixups, no premature collection from a refcount error, because
+  nothing is ever collected.
+- It introduces **no new code of our own**, which was the decisive objection to §11.7's
+  alternatives.
+
+Costs and limits, stated so this is not oversold:
+
+- **Buffer overflows are untouched.** Linear overwrites within and across arena objects
+  work exactly as before. This removes one large class, not memory unsafety.
+- **Memory grows monotonically**, bounded only by RCTL and by process exit. Fine for a
+  document parse; heavier for a large prerender, which is offline and amortised.
+- **It does not extend to long-running apps.** A tier-4 application open for hours needs a
+  real collector and keeps that surface.
+- **Marginal value scales with the capability set** (hardening H8.1, H10.1). In a
+  zero-capability worker a use-after-free yields control of a process holding nothing —
+  already the assumed state. It is worth materially more in the legacy engine jail, which
+  may hold an authenticated session, and which is also where memory pressure is highest.
+
+### 11.7 Rejected: compiling JS to native, WASM, or a custom bytecode
+
+Recorded with reasons, because a rejected option without its reasoning gets re-proposed.
+
+The motivation is sound — removing whole vulnerability classes, GC especially — but
+changing the *target* **relocates the attack surface rather than reducing it**. A JS
+engine's exploitable surface is mostly its *semantics*, not its execution strategy: the
+object model (property lookup, hidden classes, prototype chains, getters, Proxy), the
+collector, and the builtins (Array, TypedArray, RegExp — itself a compiler, JSON, String).
+Only codegen is about execution strategy, and §11.5 already removes that slice.
+
+Compiling to another target cannot delete semantics; it must implement them, and both ways
+of doing so are worse:
+
+1. **The artifact embeds a JS runtime** (the Javy / QuickJS-in-WASM shape) — the entire
+   runtime, builtin and collector surface is still present, merely recompiled.
+2. **The compiler inlines the semantics** into generated code — prototype-chain and
+   coercion bugs now live in *our* compiler's output rather than in an engine that has
+   absorbed two decades of adversarial attention. Strictly worse.
+
+Target-specific notes:
+
+- **Native.** Production systems that AOT-compile JS to native require *typed subsets*
+  (Static Hermes needs annotations; Porffor supports a subset). Unannotated web JavaScript
+  is not that language — the same dynamism wall as §5.2.
+- **WASM.** The one target that buys something real: type-checked, control-flow integrity
+  by construction, memory-safe within its linear memory, so a compromised runtime corrupts
+  only its own memory. But it is **largely redundant given an already-empty jail** — the
+  jail assumes the worker is fully compromised, and corrupting a zero-capability worker
+  yields control of a process with nothing in it, which was the assumed state already. The
+  containment lands where it is least needed, at the cost of double interpretation. Where
+  capability sets are *not* empty (the compositor, `navigatord`), no JS runs.
+- **A custom bytecode** is strictly worse than WASM: no ecosystem scrutiny, no formal
+  semantics, and our own verifier bugs to discover.
+
+**What does pay off is not an execution format at all.** §5.3's tiers 2 and 3 convert JS
+into *declarative states* and hash-identified substitutions — removing execution rather
+than relocating it. That is where effort aimed at "getting rid of JS" belongs.
 
 ## 12. Open questions
 
