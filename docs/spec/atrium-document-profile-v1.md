@@ -310,9 +310,51 @@ It is admitted, and the profile must name the casing locale explicitly rather th
 inheriting one from the host — a host locale would be an ambient input and would break G6
 and G1 together.
 
-**Excluded:** `hyphens` (needs dictionaries), `font-size-adjust`, `unicode-bidi` (UAX #9
+**Excluded:** `hyphens` (deferred — see justification, below), `font-size-adjust`, `unicode-bidi` (UAX #9
 plus `direction` is the whole model), and font-size *keywords* (`medium`, `large`, …)
 which add a UA-defined table for no expressive gain.
+
+#### Justification — total-fit, and why we can afford it
+
+Settled: **`justify` is admitted, and the line-breaking algorithm is normative.**
+Hyphenation stays deferred.
+
+The objection was that justified text without hyphenation reads badly — rivers of
+whitespace, because the breaker can only stretch inter-word spaces. That is true of the
+justification you have seen, but the dominant cause is not the missing dictionary: it is
+**greedy, first-fit line breaking**, which fills each line as far as it can and dumps the
+accumulated badness on whichever line is unlucky. Total-fit paragraph optimisation
+(Knuth–Plass) minimises badness across the *whole paragraph* and produces markedly better
+justified text with no hyphenation at all.
+
+★ **We can afford it precisely because of a constraint we already took.** Browsers lean on
+greedy breaking partly because they lay out incrementally as content streams in. This
+profile forbids progressive layout — every input is present before layout begins (§3.13),
+which is what G2 required — so the whole paragraph is available and total-fit is simply
+available to us. The same decision that removed layout shift buys better typography.
+
+**Three conditions:**
+
+1. **The algorithm and its parameters are normative**, not just "use total-fit". Badness
+   tolerance, the stretch/shrink limits of inter-word space, and the adjacent-line
+   looseness penalty all change where lines break; "Knuth–Plass" without pinned parameters
+   is not deterministic across implementations, and G1 demands bit-identical output. This
+   is the same requirement as pinning the casing locale (§3.7) and canonical encoding.
+2. **Bounded** — paragraph length and active-node count are capped (§3.12), because
+   total-fit is the one layout step whose cost is superlinear in paragraph length if left
+   unbounded.
+3. **Below a minimum measure, `justify` computes to `start`.** Set at **30 `ch`**: below
+   roughly that width no algorithm avoids rivers, and professional typesetting does not
+   justify there either. This is a specified value computation like CSS's own "computes
+   to" rules — deterministic, testable in the golden harness, and visible in the output —
+   not a silent fallback.
+
+**Hyphenation remains deferred**, and the reason is a dependency rather than a doubt: good
+hyphenation is per-language dictionaries or patterns, which is a licensing, sizing and
+correctness surface per script. Total-fit without hyphenation is better than greedy with
+it, so the deferral costs less than it appears. ★ It remains a real limit for narrow
+measures in compound-heavy languages (German, Finnish), and §1.3's honest limit on
+international text covers it.
 
 #### Web fonts — admitted, as a required input rather than an enhancement
 
@@ -485,6 +527,8 @@ are explicitly better than invented ones.
 | bytes per web font | **8 MiB** | reasoned — a full CJK face fits; no corpus signal |
 | web fonts per document | **8** | reasoned |
 | glyphs per font | **65,536** | the format's own `numGlyphs` limit |
+| characters per paragraph (total-fit input) | **65,536** | bounds the one superlinear layout step |
+| total-fit active nodes | **4,096** | reasoned — standard pruning keeps this far lower |
 
 **Two of these interact deliberately.** A single 16,384 × 16,384 image decodes to about
 1 GiB, which the 256 MiB total forbids — so the dimension cap is a cheap early reject on a
@@ -659,9 +703,7 @@ property browsers can only approximate into a hard, mechanically checkable asser
 
 ## 8. Open questions
 
-1. **Justification quality without hyphenation.** `justify` is admitted but reads poorly
-   without hyphenation; either restrict it or take on dictionaries.
-2. **Re-derive the §3.12 ceilings on a representative corpus.** They are currently set
+1. **Re-derive the §3.12 ceilings on a representative corpus.** They are currently set
    from a *convenience* corpus — this source tree's documentation — which contains no
    grids, no `calc()` and no custom properties, and is not the Wikipedia/news/blog content
    the lane targets. The derivation method (p99, headroom, round to a power of two) is
