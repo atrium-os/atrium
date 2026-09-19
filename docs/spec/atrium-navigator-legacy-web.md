@@ -723,6 +723,51 @@ bucket. brimstone's relicensing must be checked before it is considered at all.
 of a production browser engine. Its gap is *performance*, and §11.4's proving ground is
 precisely where performance does not matter. Hence the instrument decision there.
 
+### 11.8.2 Trigger 2 was the wrong measurement
+
+Trigger 2 originally read "the corpus measurement showing tier 4 is material rather than
+marginal", where the corpus number is the fraction of *pages* convertible to tiers 1–3.
+That metric is wrong, and would have been wrong in a way that hid the answer.
+
+**Page count and user stakes are different distributions.** Somebody may read a hundred
+articles and use three applications: the articles dominate any page-weighted number while
+the three applications hold the hours and all of the consequences. "95% of pages convert"
+can be simultaneously true and completely misleading about whether tier 4 matters. Basing
+an engineer-year decision on it would be a dominant-variable error.
+
+The sharpest illustration: **webmail is the root of trust for every other account**, since
+password resets land there. "Gmail is in tier 4" is not one application in a weak lane —
+it is the recovery path for everything else in the lane with the weakest memory-safety
+story. No page-weighted percentage surfaces that.
+
+**Replacement metric: an enumerated list, not a percentage.** For each high-stakes task a
+real user performs, ask: does an open protocol exist, could a native jailed app serve it,
+or is tier 4 the only path?
+
+| task | open protocol? | native path? | tier 4 required? |
+|---|---|---|---|
+| mail, calendar, contacts | IMAP / JMAP / SMTP / CalDAV | yes | **no** |
+| chat | XMPP / Matrix | yes | **no** |
+| banking portals | none | no | **yes** |
+| collaborative documents, design tools | none | no | **yes** |
+| proprietary SaaS | none | usually no | **yes** |
+
+Two conclusions follow, and they point in opposite directions:
+
+- **"Everyone uses webmail" argues for a native mail client, not a better browser engine.**
+  Mail has open protocols and is among the best candidates for exactly what the thesis
+  prescribes. Where the highest-stakes item in tier 4 has a native path, the right response
+  is to move it *out* of tier 4 rather than to harden tier 4 around it.
+- **The residue is what decides the engine question.** Banking is the sharpest case: high
+  stakes, no open protocol, and one cannot ask a bank to ship an Atrium app. If that list
+  is substantial, tier 4 is load-bearing and §11.9's gap is a principal exposure rather
+  than a footnote.
+
+This list is obtainable in days and is far more decision-relevant than a corpus
+percentage. The corpus number remains useful for a different question — whether the
+*document* lane covers ordinary reading — and should not be retired, only stopped from
+answering a question it cannot.
+
 ### 11.8.1 Why Boa for the instrument when Nova has the better architecture
 
 Both statements hold, because they answer different questions, and the apparent conflict
@@ -763,9 +808,9 @@ place where its weaknesses are cheap, and extended toward tier 4 only as it earn
 
 1. **Boa's conformance against our own tier-2 corpus** reaching the level where it converts
    pages the mature engine converts. Measured on our corpus, not on a published score.
-2. **§5.4's corpus measurement showing tier 4 is material** rather than marginal. If the
-   legacy lane carries real traffic, its security posture stops being a rounding error and
-   the case for a memory-safe engine strengthens accordingly.
+2. **The no-native-path task list (§11.8.2) coming back substantial**, especially if it
+   includes high-stakes tasks. This replaces an earlier, wrong formulation of this
+   trigger — see below.
 3. **A vulnerability class in the adopted engine that the jail does not adequately
    contain** — i.e. one that reaches past a zero-capability worker. By H8.1's reasoning
    that is the point at which engine hardening stops being low-value.
@@ -807,13 +852,66 @@ SpiderMonkey's collector and its rooting machinery is SpiderMonkey-specific.
 3. **Per-origin jails with short lives** — the exposure is bounded to one origin's session,
    which is the data that origin already holds (§7.4).
 
-### 11.9.2 The long-term fix is smaller than "write an engine"
+### 11.9.2 Binding a memory-safe engine into Servo — investigated 2026-09-19
 
-The shape of the eventual answer is **a memory-safe JS engine bound into Servo** — a new
-binding and rooting layer between an existing Rust engine and an existing Rust browser
-engine. That is a large project, but it is materially smaller than writing a browser
-engine or a conformant JS engine from scratch, and it is upstreamable rather than a
-private fork. If §11.8's triggers ever fire, this is what they should escalate to.
+The eventual answer is **a memory-safe JS engine bound into Servo**: a new binding and
+rooting layer between two existing Rust codebases, rather than a new engine. Findings from
+looking at what that actually entails:
+
+**There is an official upstream initiative, and it is low priority.** Servo has a stated
+"bring your own JS engine" goal — a Web-IDL-based interface any bindings layer could
+implement, explicitly contemplating V8 and Wasm runtimes as well. It is described as
+long-term and low-priority. So this is a direction upstream *wants*, meaning the work is
+contributable rather than a fork, but nobody is driving it. We would be.
+
+**Four categories of coupling**, per Servo's own report:
+
+1. Low-level `js::jsapi` calls "peppered" through the script crate, exposing SpiderMonkey
+   concepts such as untyped `JSObject` directly.
+2. **Garbage-collection integration** — Servo manages *Rust object lifetimes with
+   SpiderMonkey's collector* (the Josephine design).
+3. **WebIDL codegen** emitting SpiderMonkey-specific glue.
+4. The `mozjs` / `mozjs-sys` bindings plus the utilities in
+   `components/script/dom/bindings`.
+
+**Category 2 is the crux, and it is also exactly where our benefit lies.** This is not
+"swap a VM behind an interface": Servo's DOM objects are owned and traced by SpiderMonkey's
+collector, so changing engines means **re-homing the DOM's memory-management model**. That
+is the largest and riskiest part of the work — and it is precisely the part that would
+deliver the memory-safety property §11.8 is after, because it is the DOM lifetimes that
+currently depend on an unsafe collector.
+
+**Servo's own incremental path is the right on-ramp.** Upstream is progressively hiding
+SpiderMonkey APIs behind safe idiomatic Rust (the WebGPU refactor replaced unsafe
+`JSObject` returns with typed concepts). That work is useful regardless of which engine
+ever lands, is upstreamable, and produces the enumeration of SpiderMonkey interactions that
+any generic interface must be designed against. It is possible to contribute there and gain
+both leverage and knowledge without committing to the whole project.
+
+**The engine-side unknown, which must be settled before anything else:** can the candidate
+host *foreign* objects — the DOM — and trace into Rust data? Boa's `boa_gc` has
+`Trace`/`Finalize` derives for user types, which is promising but unproven at DOM scale.
+Nova's arena-and-handle design is a different shape and may make foreign hosting easier or
+harder; unknown. **This is a spike, not a port**, and it gates everything downstream.
+
+**A live data point for why this matters:** Servo 0.3 shipped SpiderMonkey updates *to fix
+memory-safety bugs*. The concern is a recurring maintenance reality, not a theoretical one.
+
+**Honest scale:** "less work than writing our own engine" remains true, and should not be
+read as "small". Re-homing the DOM lifetime model of a browser engine is a major project.
+The argument for it is that it is *bounded, upstreamable, and reuses two mature codebases*,
+where writing our own is none of those.
+
+**Recommended next steps, cheap before expensive:**
+
+1. **Unsafe-surface audit** of `boa_gc` and Nova's collector against §11.8's criterion —
+   how much `unsafe`, how concentrated, how auditable. Days.
+2. **Foreign-object hosting spike** — can Boa hold and trace a non-trivial Rust object
+   graph shaped like a DOM subtree? Days to weeks, and it decides whether the candidate is
+   viable at all.
+3. **Contribute to Servo's de-SpiderMonkey cleanup** — useful regardless, upstreamable,
+   and the fastest way to learn the true scale of categories 1 and 3.
+4. Only then estimate category 2 with evidence rather than a guess.
 
 ### 11.9.3 Why this is tolerable in the meantime
 
