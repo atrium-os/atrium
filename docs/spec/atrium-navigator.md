@@ -104,7 +104,11 @@ embed V8 and not to port a browser engine. Two goals must stay separate:
 - **Run the *existing* web** → impossible to escape the web platform (DOM, JS-as-
   specced, fetch/CSSOM); every site + framework targets it. So legacy web = **Servo,
   server-side** (§6), per the JS-free-client invariant. AOT/no-DOM does *not* serve
-  this goal — don't try.
+  this goal — don't try. *(Amended 2026-09-19: "server-side" here means **vendor**-hosted,
+  which only reaches cooperating sites — a bank will not host Servo for us. For arbitrary
+  sites the realistic placements are a localhost jail or a machine the user controls; see
+  atrium-navigator-legacy-web.md §11.9.3 for the placement matrix and the rule that an
+  operator-run rendering proxy is never a default.)*
 - **Let JS/TS developers write *Atrium* apps** → the secondary on-ramp (§3): the
   language compiles to **WASM-IR → AOT (Cranelift) → native jailed binary** (insula.md
   §3.3), binding to the **scene graph / Pergola, not a DOM**. The result is a
@@ -126,6 +130,25 @@ peak speed — traded for the simplicity + security wins above. Fully-dynamic JS
 QuickJS-on-WASM; TypeScript-subset / AssemblyScript / cleanly-compiled languages AOT
 well. The real primitive is the WASM-IR→AOT road (§3.3 of insula.md); JS is just one
 (awkward) source language on it — never a from-scratch engine.
+
+**Amended 2026-09-19 — scope of "never a from-scratch engine".** That rule governs **this
+section's lane**: to let JS/TS developers write Atrium apps, compile down the WASM-IR→AOT
+road; do not write an engine to interpret them. It stands, unchanged.
+
+It does **not** govern the *legacy* lane's embedded engine. Servo brings SpiderMonkey,
+whose architecture — raw pointers, a tracing collector owning DOM lifetimes, a JIT — is
+the one thing the rest of Atrium's memory-safety posture is built to avoid, and it is the
+single lane where none of our mitigations except the jail, JIT-off and session recycling
+apply. **Replacing it with a memory-safe engine stays live**, in decreasing order of
+preference: bind an existing memory-safe engine (Boa, Nova) into Servo; contribute to
+Servo's own "bring your own JS engine" work; or, if neither serves, build one. This is
+deferred pending evidence, **not rejected on effort** — see
+atrium-navigator-legacy-web.md §11.8 for the criteria and §11.9.2 for the investigation,
+including the finding that the hard part is re-homing the DOM's lifetime model rather than
+swapping a VM.
+
+Note the two are consistent rather than contradictory: this lane needs no engine because
+it compiles; the legacy lane needs one because it must run the web platform as specified.
 
 ## 4. Delivery, naming, distribution
 
