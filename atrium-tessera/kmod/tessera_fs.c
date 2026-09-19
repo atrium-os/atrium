@@ -1372,6 +1372,11 @@ SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_duty_bypass_tight, CTLFLAG_RD,
     "pinscan kicks that skipped the duty-cycle quiet period because the "
     "metadata reserve was tight (see tessera_fs_meta_tight)");
 static unsigned long tessera_stat_pinscan_skips_duty = 0;
+static unsigned long tessera_stat_pinscan_skips_duty_preflight = 0;
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_skips_duty_preflight, CTLFLAG_RD,
+    &tessera_stat_pinscan_skips_duty_preflight, 0,
+    "flush-preflight scans skipped on the duty cycle — the entrance that was "
+    "never gated; 0 here means the fix is not engaging");
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, pinscan_skips_duty, CTLFLAG_RD,
     &tessera_stat_pinscan_skips_duty, 0,
     "pinscan kicks refused to hold the duty cycle (#71)");
@@ -2313,6 +2318,7 @@ static void tessera_meta_pin_bitmap_rebuild(struct tessera_mount *tmp_);
 static void tessera_fs_meta_pressure_kick(struct tessera_mount *tmp_);
 static void tessera_fs_pinscan_task(void *ctx, int pending);
 static void tessera_fs_pinscan_run(struct tessera_mount *tmp_);
+static int  tessera_fs_pinscan_duty_ok(struct tessera_mount *tmp_);
 static void tessera_fs_meta_pending_drain(struct tessera_mount *tmp_);
 /* ★ pack-zone leak fix: registry_put_pending needs this to return a
  * superseded pack's extents; hoisted from ~13k lines below. */
@@ -16913,7 +16919,20 @@ tessera_fs_flush(struct tessera_mount *tmp_)
 		if (tmp_->sb.generation == tmp_->preflight_last_gen)
 			tessera_stat_preflight_nocommit++;
 		tmp_->preflight_last_gen = tmp_->sb.generation;
-		tessera_fs_pinscan_run(tmp_);
+		/*
+		 * ★ THE 26,865. This is the entrance the duty cycle never
+		 * guarded: one scan per flush, unconditionally, which measured
+		 * ~54% of wall time against a 5% target. Gate it on the same
+		 * predicate the kick uses — which keeps the tight bypass, so
+		 * an exhausted reserve still gets its scan (a commit cannot
+		 * land until one frees sectors) and only OPPORTUNISTIC
+		 * preflight scans are throttled. The drain below is NOT
+		 * gated: it is cheap and it is what actually releases.
+		 */
+		if (tessera_fs_pinscan_duty_ok(tmp_))
+			tessera_fs_pinscan_run(tmp_);
+		else
+			tessera_stat_pinscan_skips_duty_preflight++;
 		tessera_fs_meta_pending_drain(tmp_);
 		if (tmp_->meta_free_count > _free0)
 			tessera_stat_preflight_freed +=
@@ -18207,24 +18226,50 @@ tessera_meta_pin_bitmap_rebuild(struct tessera_mount *tmp_)
 	 * can release pending sectors, so when they outnumber what is left,
 	 * the scan is the cheapest thing the volume can do.
 	 */
-	if (tessera_pinscan_duty_pct > 0 && tessera_pinscan_duty_pct < 100 &&
-	    tmp_->pinscan_last_dur > 0) {
-		sbintime_t quiet = tmp_->pinscan_last_dur *
-		    ((100 / tessera_pinscan_duty_pct) - 1);
-		if (sbinuptime() < tmp_->pinscan_last_end + quiet) {
-			int tight = tessera_fs_meta_tight(tmp_);
-			if (!tight || !tessera_pinscan_tight_bypass) {
-				if (tight)
-					tessera_stat_pinscan_duty_tight_honoured++;
-				tessera_stat_pinscan_skips_duty++;
-				return;
-			}
-			tessera_stat_pinscan_duty_bypass_tight++;
-		}
-	}
+	if (!tessera_fs_pinscan_duty_ok(tmp_))
+		return;
 	tmp_->pinscan_last_kick_sec = _now;
 	tessera_stat_pinscan_kicks++;
 	(void)taskqueue_enqueue(tmp_->pinscan_tq, &tmp_->pinscan_task);
+}
+
+/*
+ * ★ THE DUTY CYCLE, SHARED — it used to live inline in the auto-re-kick path
+ * and nowhere else, so it bounded the one caller already rate-limited to 1/s
+ * and bounded nothing that mattered. Measured on a 75 s run:
+ *
+ *     pinscan_runs=27193  pinscan_kicks=328  pinscan_total_ms=40292
+ *
+ * 27,193 scans, only 328 of them kicked, ~54% of wall time spent scanning
+ * against a pinscan_duty_pct of 5. The other 26,865 entered through
+ * tessera_fs_flush's preflight, which calls pinscan_run directly and never
+ * consulted the knob. A limiter that does not cover every entrance is not a
+ * limiter, and this tree has now shipped that bug twice — see the legacy
+ * sweep, which claimed 25% duty and measured 68%.
+ *
+ * Returns 1 if a scan may proceed. The TIGHT BYPASS is preserved exactly: when
+ * the reserve is running out a commit CANNOT land until a scan frees sectors,
+ * so the duty cycle must never decide whether reclaim happens at all.
+ */
+static int
+tessera_fs_pinscan_duty_ok(struct tessera_mount *tmp_)
+{
+	if (tessera_pinscan_duty_pct <= 0 || tessera_pinscan_duty_pct >= 100 ||
+	    tmp_->pinscan_last_dur <= 0)
+		return (1);
+	sbintime_t quiet = tmp_->pinscan_last_dur *
+	    ((100 / tessera_pinscan_duty_pct) - 1);
+	if (sbinuptime() >= tmp_->pinscan_last_end + quiet)
+		return (1);
+	int tight = tessera_fs_meta_tight(tmp_);
+	if (tight && tessera_pinscan_tight_bypass) {
+		tessera_stat_pinscan_duty_bypass_tight++;
+		return (1);
+	}
+	if (tight)
+		tessera_stat_pinscan_duty_tight_honoured++;
+	tessera_stat_pinscan_skips_duty++;
+	return (0);
 }
 
 /*
