@@ -3391,7 +3391,23 @@ static unsigned long tessera_stat_snap_birth_epoch_roots = 0;
  * Off by default because it walks the root directory per commit: fine for a
  * probe volume, far too expensive for the dev root.
  */
-static int tessera_verify_commits = 0;
+/*
+ * ★ DEFAULT ON (1 = log). An audit you enable by hand is off at the moment it
+ * matters — every run that produced snapshot damage had this off, because
+ * nothing turned it on, and the one confirmed catch of the recycled-snapshot
+ * bug came from this counter rather than from fsck.
+ *
+ * Cost, MEASURED directly rather than inferred (verify_total_us/verify_runs):
+ * ~124 us per commit and 4% of wall time on a pathological workload — four
+ * writers, 300-450 commits/s, 8-9 retained snapshots — reproduced at 4% in
+ * three consecutive runs. Inferring it from commit throughput had failed: the
+ * arms measured 415/256/179 vs 343/262/291 commits/s, a ~5% mean difference
+ * inside a 2.3x spread, i.e. far below that metric's noise. A normal workload
+ * commits orders of magnitude less often, so its absolute cost is negligible.
+ *
+ * 2 (panic) stays opt-in.
+ */
+static int tessera_verify_commits = 1;
 /* ★ RWTUN, not RW: a plain sysctl is reset by every reboot, and the tests
  * worth verifying (crash-soak, replay-refusal) power-cycle the VM. Twice I
  * read "0 violations" from runs where the verifier had been switched off by
@@ -3399,16 +3415,22 @@ static int tessera_verify_commits = 0;
  * loader.conf (kern.tessera.verify_commits="1") for a crash test. */
 SYSCTL_INT(_kern_tessera, OID_AUTO, verify_commits, CTLFLAG_RWTUN,
     &tessera_verify_commits, 0,
-    "DEBUG: verify namespace invariants after every commit (0 off, 1 log, "
-    "2 panic) — catches a corrupting commit at the commit, not at fsck");
+    "verify namespace invariants after every commit (0 off, 1 log = DEFAULT, "
+    "2 panic) — catches a corrupting commit at the commit, not at fsck. "
+    "~124us/commit measured; see verify_total_us");
 static int tessera_verify_root_drop_max = 64;
 SYSCTL_INT(_kern_tessera, OID_AUTO, verify_root_drop_max, CTLFLAG_RWTUN,
     &tessera_verify_root_drop_max, 0,
     "how many root-directory entries may vanish in ONE commit before "
     "verify_commits calls it corruption");
 static unsigned long tessera_stat_verify_runs = 0;
+static unsigned long tessera_stat_verify_total_us = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_runs, CTLFLAG_RD,
     &tessera_stat_verify_runs, 0, "per-commit verifications performed");
+SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_total_us, CTLFLAG_RD,
+    &tessera_stat_verify_total_us, 0,
+    "microseconds spent in per-commit verification; divide by verify_runs "
+    "for the per-commit cost (throughput metrics cannot resolve it)");
 static unsigned long tessera_stat_verify_violations = 0;
 static unsigned long tessera_stat_verify_snap_lost = 0;
 SYSCTL_ULONG(_kern_tessera, OID_AUTO, verify_snap_lost, CTLFLAG_RD,
@@ -12608,6 +12630,15 @@ tessera_fs_verify_commit(struct tessera_mount *tmp_)
 	if (tessera_verify_commits == 0 || tmp_->inode_tree == NULL)
 		return;
 	tessera_stat_verify_runs++;
+	/*
+	 * ★ Time the pass DIRECTLY. Inferring its cost from commit throughput
+	 * failed: over 3 interleaved pairs the arms measured 415/256/179 vs
+	 * 343/262/291 commits/s — a ~5% mean difference inside a 2.3x spread,
+	 * i.e. the effect is far below the noise of the whole-system metric.
+	 * verify_total_us / verify_runs is the per-commit cost itself, and is
+	 * immune to what the rest of the volume happens to be doing.
+	 */
+	sbintime_t _vt0 = sbinuptime();
 
 	tessera_inode_record_t root;
 	if (tessera_fs_inode_get(tmp_, TESSERA_INODE_ROOT_DIR, &root)
@@ -12617,10 +12648,15 @@ tessera_fs_verify_commit(struct tessera_mount *tmp_)
 		    "after commit gen %ju\n", (uintmax_t)tmp_->sb.generation);
 		if (tessera_verify_commits >= 2)
 			panic("tessera verify: root inode missing");
+		tessera_stat_verify_total_us +=
+		    (unsigned long)((sbinuptime() - _vt0) / SBT_1US);
 		return;
 	}
-	if (tessera_hash_is_null(root.manifest_hash))
+	if (tessera_hash_is_null(root.manifest_hash)) {
+		tessera_stat_verify_total_us +=
+		    (unsigned long)((sbinuptime() - _vt0) / SBT_1US);
 		return;                 /* empty root: nothing to walk */
+	}
 
 	struct verify_ctx v = { .tmp = tmp_ };
 	int rc = tessera_fs_dir_walk(tmp_, root.manifest_hash,
@@ -12632,6 +12668,8 @@ tessera_fs_verify_commit(struct tessera_mount *tmp_)
 		    (uintmax_t)tmp_->sb.generation);
 		if (tessera_verify_commits >= 2)
 			panic("tessera verify: root dir unreadable");
+		tessera_stat_verify_total_us +=
+		    (unsigned long)((sbinuptime() - _vt0) / SBT_1US);
 		return;
 	}
 
@@ -12751,6 +12789,8 @@ tessera_fs_verify_commit(struct tessera_mount *tmp_)
 		if (sc != NULL)
 			tessera_btree_cursor_free(sc);
 	}
+	tessera_stat_verify_total_us +=
+	    (unsigned long)((sbinuptime() - _vt0) / SBT_1US);
 	tmp_->verify_root_entries = v.entries;
 	tmp_->verify_root_seen = 1;
 	if (bad) {
