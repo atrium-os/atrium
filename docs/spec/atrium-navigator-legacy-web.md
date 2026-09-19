@@ -913,12 +913,60 @@ where writing our own is none of those.
    and the fastest way to learn the true scale of categories 1 and 3.
 4. Only then estimate category 2 with evidence rather than a guess.
 
-### 11.9.3 Why this is tolerable in the meantime
+### 11.9.3 Placement does not rescue this, because we do not control the servers
+
+atrium-navigator.md §3.2's JS-free-client invariant puts the legacy engine *server-side*,
+which appears to move this gap off the user's machine. It does not, in general, because
+that clause means **vendor-hosted** (insula.md §0.6.4) — and the sites that most need tier
+4 are precisely the ones that will never cooperate. One cannot ask a bank to host Servo.
+
+The honest placement matrix:
+
+| who runs the engine jail | works for | privacy cost | where the gap sits |
+|---|---|---|---|
+| **the site's vendor** | only cooperating sites | none | vendor's server |
+| **an operator-run rendering proxy** (ours or a provider's) | any site | **sees all browsing** | operator's server |
+| **the user's own always-on machine** (home server, desktop serving a phone) | any site | none — self-hosted | user's own infrastructure |
+| **localhost jail** (default fallback) | any site | none | **the user's device** |
+
+**Policy: never default to an operator-run rendering proxy.** It works for every site and
+is genuinely useful for thin clients, but it reintroduces exactly the third party this
+architecture exists to remove — an operator who sees every page a user visits. It may be
+offered; it must be an explicit, informed opt-in, never a default and never silent.
+
+So the working answer for arbitrary existing sites is a **localhost jail by default**,
+with self-hosted placement on a machine the user controls as the better option where one
+exists — which is a real option rather than a hypothetical, since location transparency
+makes it the same binary either way.
+
+Which means §11.9's gap does sit on the user's device in the default configuration. What
+bounds it is the jail, JIT-off (§11.5) and session recycling (§11.9.1) — not placement.
+
+### 11.9.4 The adoption risk, stated
+
+The native model is a **proposal to an ecosystem that may not adopt it**. That risk is
+taken deliberately, and it is worth being explicit about how it is bounded:
+
+- **Open protocols need nobody's permission.** Mail, calendar, contacts and chat can be
+  served by native jailed apps today, against IMAP/JMAP/CalDAV/XMPP/Matrix. The
+  highest-stakes category (§11.8.2) is reachable with zero site cooperation, which makes
+  it the natural beachhead rather than a later phase.
+- **Servers under our control can serve the native way immediately**, demonstrating the
+  model end-to-end without waiting for anyone.
+- **The adoption risk is therefore concentrated in proprietary SaaS** — which is exactly
+  the residue that needs tier 4. The risk is real, but it is a known and enumerable set
+  rather than "the whole web".
+- **Tiers 1–3 must be good enough that adoption is not required for the system to be
+  worth using.** If reading the web works well without any site changing anything, the
+  proposal gets time to be adopted or not.
+
+### 11.9.5 Why this is tolerable in the meantime
 
 Not because the risk is small, but because of where it sits:
 
 - **Tier 4 is the explicitly-marked legacy lane, and the lane is visible** (§8). Its weaker
-  posture is disclosed and chosen, not hidden behind a uniform claim of safety.
+  posture is disclosed and chosen, not hidden behind a uniform claim of safety — and
+  §11.9.3 means that disclosure has to include *where the engine is running*.
 - **The thesis already answers "I want a secure interactive app": make it a native jailed
   app.** Tier 4 is a bridge for content that predates that answer, not the future the
   architecture is arguing for.
