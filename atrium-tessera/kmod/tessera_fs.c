@@ -3939,9 +3939,16 @@ struct tessera_mount {
 	 * by meta_reserve_length bits = ~32 KB for a 64 MiB reserve. */
 	/* Background pin-bitmap scan (task #33): mount starts with an
 	 * ALL-PINNED bitmap (nothing recycled = always safe) and defers
-	 * the tree walks to pinscan_tq. While pinscan_active, the meta
-	 * allocator is bump-only so sectors consumed from meta_free
-	 * can't be re-freed by the swap. */
+	 * the tree walks to pinscan_tq.
+	 *
+	 * ★ STALE UNTIL 2026-09-19: this said "while pinscan_active the meta
+	 * allocator is bump-only so sectors consumed from meta_free can't be
+	 * re-freed by the swap". Task #74 replaced that gate — see
+	 * tessera_kbio_meta_alloc: meta_free IS consumed during a scan, gated
+	 * on meta_scanwin_count < meta_scanwin_cap, and the swap skips the
+	 * recorded window. The old wording cost a session: it was read as
+	 * evidence for a "continuous scans -> bump-only -> reserve climbs"
+	 * feedback loop that does not exist. */
 	struct taskqueue         *pinscan_tq;
 	struct task               pinscan_task;
 	int                       pinscan_tq_init;
