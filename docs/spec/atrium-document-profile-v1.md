@@ -63,9 +63,10 @@ is not a document-lane concern.
 
 **Layout shift.** CLS is a genuine, measured plague, and its cause is structural: layout
 begins before the inputs to layout have arrived, so boxes move when images and fonts land.
-The profile makes this impossible rather than discouraged — replaced content **must**
-carry intrinsic dimensions or an `aspect-ratio`, and fonts are local, so there is no
-metric change to reflow around. G2 is then a testable invariant: permute resource arrival
+The profile makes this impossible rather than discouraged — every input to layout must be
+present *before* layout, so there is no metric change to reflow around: replaced content
+**must** carry intrinsic dimensions or an `aspect-ratio`, and a web font is a required
+input rather than progressive enhancement (§3.7). The general rule is §3.13's. G2 is then a testable invariant: permute resource arrival
 order, assert not just the same final layout but that **no box ever occupies two
 positions**. A browser cannot adopt this rule without breaking the existing web; we have
 no existing web to break.
@@ -309,9 +310,58 @@ It is admitted, and the profile must name the casing locale explicitly rather th
 inheriting one from the host — a host locale would be an ambient input and would break G6
 and G1 together.
 
-**Excluded:** web fonts (v1), `hyphens` (needs dictionaries), `font-size-adjust`,
-`unicode-bidi` (UAX #9 plus `direction` is the whole model), and font-size *keywords*
-(`medium`, `large`, …) which add a UA-defined table for no expressive gain.
+**Excluded:** `hyphens` (needs dictionaries), `font-size-adjust`, `unicode-bidi` (UAX #9
+plus `direction` is the whole model), and font-size *keywords* (`medium`, `large`, …)
+which add a UA-defined table for no expressive gain.
+
+#### Web fonts — admitted, as a required input rather than an enhancement
+
+Settled. The objection was G2: a font that arrives over the network mid-layout changes
+text metrics and reflows the page, which is the layout shift this profile exists to make
+impossible. Every mechanism the web offers for this (`font-display: block` / `swap` /
+`fallback` / `optional`) chooses *which* artifact you get — invisible text, or a reflow —
+because the font is treated as progressive enhancement.
+
+It is admitted here by refusing that framing. §3.13's rule already covers it: **content
+whose sizing would require unbounded measurement must arrive already measured**, and font
+metrics are exactly that class. So a web font is a **required, content-addressed input
+that must be present before layout begins**, like an image's intrinsic dimensions or a
+table's column widths. There is no partial state to be independent of, so G2 holds by
+construction — and there is no `font-display`, because it describes states that cannot
+occur.
+
+**`@font-face` descriptors admitted:** `font-family`, `src` (a content hash), `font-weight`,
+`font-style`. Nothing else.
+
+**Five conditions:**
+
+1. **Parsed and shaped in the document worker, never in the compositor.** Font parsing is
+   one of the richest remote-code-execution classes in any system, and hardening H8.1's
+   rule applies directly: parser soundness matters in proportion to the capability set of
+   the process parsing. The worker's set is empty; the compositor's holds every client's
+   rendered content, scanout and input. **Fresco therefore never receives a font file** —
+   what crosses the boundary is shaped glyph runs, not a container to parse.
+2. **One format: bare OpenType/TrueType.** No WOFF, no WOFF2. Each container is another
+   parser, and WOFF2 additionally drags in a Brotli decoder; compression is the *store's*
+   job — Tessera already compresses blobs — not something baked into the format. This is
+   the same call made for PTL5.
+3. **Static instances only.** Variable-font axes are deferred: an axis value is another
+   input that must be pinned for G1, and pinning it is equivalent to shipping the instance.
+4. **Bounded** — bytes per font, fonts per document, glyphs per font (§3.12).
+5. **No `unicode-range`, so no automatic subsetting.** Subsetting is the producer's job,
+   done once at conversion and content-addressed. The honest cost is CJK: a full CJK face
+   is large, and without range-splitting it is one large required input. ★ **A web font
+   does not rescue a bad shipped font set** — the profile's own stacks must cover the
+   scripts it claims to serve, and §1.3's limit on international text is unchanged by this
+   decision.
+
+**G6 is not weakened, and it is worth being precise about why.** The fingerprinting attack
+is enumerating *installed* fonts — measuring the host. A web font is the opposite: content
+the document brings with it, from which it learns nothing about the machine, and with no
+script to observe its own layout there is no channel to probe. The one residual is the
+possession oracle — an origin learning whether the client already held a font it did not
+re-fetch — which is the known shape from backend §5.1, governed by the existing dedup-domain
+policy rather than anything new here.
 
 ### 3.8 Paint
 
@@ -432,6 +482,9 @@ are explicitly better than invented ones.
 | `box-shadow` blur + spread | **256 px** | bounds rasterization cost, not structure |
 | `position: fixed` elements per document | **8** | reasoned — bounds overlay stacking |
 | fixed element block size | **1/3 of viewport** | reasoned — see §3.3 |
+| bytes per web font | **8 MiB** | reasoned — a full CJK face fits; no corpus signal |
+| web fonts per document | **8** | reasoned |
+| glyphs per font | **65,536** | the format's own `numGlyphs` limit |
 
 **Two of these interact deliberately.** A single 16,384 × 16,384 image decodes to about
 1 GiB, which the 256 MiB total forbids — so the dimension cap is a cheap early reject on a
@@ -606,11 +659,9 @@ property browsers can only approximate into a hard, mechanically checkable asser
 
 ## 8. Open questions
 
-1. **Web fonts.** Excluded in v1; revisit with a fingerprinting and ingest argument, and
-   note that admitting them threatens G2 unless metrics are known before layout.
-2. **Justification quality without hyphenation.** `justify` is admitted but reads poorly
+1. **Justification quality without hyphenation.** `justify` is admitted but reads poorly
    without hyphenation; either restrict it or take on dictionaries.
-3. **Re-derive the §3.12 ceilings on a representative corpus.** They are currently set
+2. **Re-derive the §3.12 ceilings on a representative corpus.** They are currently set
    from a *convenience* corpus — this source tree's documentation — which contains no
    grids, no `calc()` and no custom properties, and is not the Wikipedia/news/blog content
    the lane targets. The derivation method (p99, headroom, round to a power of two) is
