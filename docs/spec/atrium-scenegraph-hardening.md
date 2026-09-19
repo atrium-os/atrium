@@ -187,7 +187,7 @@ The Limen boundary is where clickjacking lives.
   by the child. A child that can declare its own size and position can cover chrome.
 - Input is routed by **compositor-owned geometry**, never by a client's claim about what
   it contains, and a client receives only the input actually delivered to it.
-- A document surface can never overlap trusted chrome (legacy web §10.8, profile §3.10).
+- A document surface can never overlap trusted chrome (legacy web §10.8, profile §3.14).
 
 ### H8 — The server holds every client's scene
 

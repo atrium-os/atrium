@@ -149,46 +149,189 @@ like working without granting the document a channel.
 | colour space | sRGB; compositing defined in premultiplied linear, stated normatively so G1 is reproducible across implementations |
 | text direction | per-element, UAX #9 bidi |
 
-### 3.2 Layout
+### 3.2 How to read this section
 
-| property | admitted values | notes |
-|---|---|---|
-| `display` | `block`, `inline`, `inline-block`, `flex`, `grid`, `table`*, `none` | *tables arrive **pre-measured** (§3.9); the renderer distributes declared intrinsic widths, it never measures cells |
-| `position` | `static`, `relative`, `absolute` | no `fixed`, no `sticky` in v1 (both interact with scroll/compositing) |
-| box metrics | `width`, `height`, `min-*`, `max-*`, `aspect-ratio`, `padding-*`, `margin-*`, `border-*` | |
-| `overflow` | `visible`, `hidden`, `auto`, `scroll` | |
-| flex | `flex-direction`, `flex-wrap`, `justify-content`, `align-items`, `align-self`, `align-content`, `gap`, `flex-grow`, `flex-shrink`, `flex-basis` | **`order` is excluded** — it decouples visual from reading order, which is an accessibility defect, and G5 makes that defect visible rather than ignorable |
-| grid | `grid-template-columns`/`-rows` (incl. `fr`, `minmax()`, `repeat()`), `grid-column`/`-row`, `gap`, `grid-auto-flow` | subgrid deferred |
-| `z-index` | integer, within an explicitly declared stacking context | no implicit stacking contexts created as a side effect of unrelated properties |
+**Every property is listed with its admitted values, initial value, and whether it
+inherits.** A conformance run scores against this list, so anything absent is absent by
+decision, not oversight, and a producer that emits it gets a diagnostic (§5.1).
 
-### 3.3 Typography
+Three conventions, each load-bearing:
 
-`font-family` (profile-named stacks only), `font-size`, `font-weight` (numeric, shipped
-weights only), `font-style`, `line-height` (unitless preferred), `letter-spacing`,
-`word-spacing`, `text-align` (`start`/`end`/`center`/`justify`), `text-indent`,
-`text-decoration`, `text-transform`, `white-space`, `overflow-wrap`, `tab-size`,
-`font-variant-numeric`.
+1. **Longhands only — no shorthands in v1.** `margin`, `border`, `background`, `flex`,
+   `grid-area`, `font` and friends are *excluded*. A shorthand gives one value several
+   spellings, and the hardening spec requires exactly one encoding per value for content
+   addressing to be sound; shorthand expansion is also a classic parser-differential
+   surface. Authoring tools can expand them; the profile does not parse them.
+2. **CSS-wide keywords: `inherit` and `initial` only.** `unset`, `revert` and
+   `revert-layer` are excluded — they are defined in terms of cascade origins, which is
+   the machinery §3.7 deliberately flattens.
+3. **`auto` is a distinct value, never a synonym.** Where it appears its meaning is given.
 
-Excluded: web fonts (v1 — both a fidelity requirement and an ingest/fingerprint surface,
-deserving their own argument), `hyphens` (needs dictionaries; deferred).
+`<length>` = a number with unit `px`, `em`, `rem`, `ch`, `vw`, `vh` (§3.6). `<percentage>`
+resolution basis is stated per property. `<color>` per §3.6.
 
-### 3.4 Paint
+### 3.3 Box and layout
 
-`color`, `background-color`, `background-image` (`url()` and `linear-gradient()`),
-`background-position`/`-size`/`-repeat`, `border-radius`, `box-shadow` (bounded blur
-radius), `outline`, `opacity`, `visibility`, `object-fit`, `list-style-*`,
-static 2-D `transform` (`translate`, `scale`, `rotate` — paint-level, does not affect
-layout).
+| property | admitted values | initial | inh. |
+|---|---|---|---|
+| `display` | `block` \| `inline` \| `inline-block` \| `flex` \| `grid` \| `table` \| `table-row` \| `table-cell` \| `none` | `inline` | no |
+| `position` | `static` \| `relative` \| `absolute` | `static` | no |
+| `top` `right` `bottom` `left` | `<length>` \| `<percentage>` \| `auto` | `auto` | no |
+| `width` `height` | `<length>` \| `<percentage>` \| `auto` \| `min-content` \| `max-content` | `auto` | no |
+| `min-width` `min-height` | `<length>` \| `<percentage>` \| `auto` | `auto` | no |
+| `max-width` `max-height` | `<length>` \| `<percentage>` \| `none` | `none` | no |
+| `aspect-ratio` | `<number>` \| `auto` | `auto` | no |
+| `margin-top` `-right` `-bottom` `-left` | `<length>` \| `<percentage>` \| `auto` | `0` | no |
+| `padding-top` `-right` `-bottom` `-left` | `<length>` \| `<percentage>` (non-negative) | `0` | no |
+| `border-*-width` (4) | `<length>` (non-negative) | `0` | no |
+| `border-*-style` (4) | `none` \| `solid` \| `dashed` \| `dotted` | `none` | no |
+| `border-*-color` (4) | `<color>` | `currentColor` | no |
+| `border-*-radius` (4 corners) | `<length>` \| `<percentage>` | `0` | no |
+| `overflow-x` `overflow-y` | `visible` \| `hidden` \| `auto` \| `scroll` | `visible` | no |
+| `isolation` | `isolate` \| `auto` | `auto` | no |
+| `z-index` | `<integer>` \| `auto` | `auto` | no |
 
-Excluded: `filter`, `backdrop-filter`, `mix-blend-mode`, animations, transitions.
+Percentages resolve against the containing block's inline size for `width`,
+`margin-*`, `padding-*` and `left`/`right`; against its block size for `height` and
+`top`/`bottom`.
 
-### 3.5 Values
+**`box-sizing` is not a property** — `border-box` is a fixed rule (§3.1). **`float` and
+`clear` are absent.** **`position: fixed`/`sticky`** are deferred (both interact with
+scrolling and compositing). **`z-index` creates no implicit stacking context**: a
+stacking context exists only where `isolation: isolate` says so, which is why `isolation`
+is admitted at all.
 
-Units `px`, `em`, `rem`, `%`, `fr`, `ch`, `vw`, `vh`; `calc()` with bounded nesting
-depth; custom properties with cycle detection and a bounded substitution depth; colours
-as hex, `rgb()`, `hsl()`, or profile-named.
+### 3.4 Flex
 
-### 3.6 Selectors and cascade
+| property | admitted values | initial | inh. |
+|---|---|---|---|
+| `flex-direction` | `row` \| `column` | `row` | no |
+| `flex-wrap` | `nowrap` \| `wrap` | `nowrap` | no |
+| `justify-content` | `flex-start` \| `flex-end` \| `center` \| `space-between` \| `space-around` \| `space-evenly` | `flex-start` | no |
+| `align-items` | `stretch` \| `flex-start` \| `flex-end` \| `center` \| `baseline` | `stretch` | no |
+| `align-self` | `auto` \| (as `align-items`) | `auto` | no |
+| `align-content` | (as `align-items`) | `stretch` | no |
+| `row-gap` `column-gap` | `<length>` \| `<percentage>` | `0` | no |
+| `flex-grow` `flex-shrink` | `<number>` (non-negative) | `0` / `1` | no |
+| `flex-basis` | `<length>` \| `<percentage>` \| `auto` \| `content` | `auto` | no |
+
+**Excluded: `order`, `row-reverse`, `column-reverse`, `wrap-reverse`** — all four decouple
+visual order from reading order. `order` is the well-known case; the `*-reverse` values do
+the same thing by another route, and admitting them while excluding `order` would be
+incoherent. G5 makes the resulting defect visible rather than ignorable, so the profile
+declines to create it.
+
+### 3.5 Grid
+
+| property | admitted values | initial | inh. |
+|---|---|---|---|
+| `grid-template-columns` `-rows` | `none` \| `<track-list>` | `none` | no |
+| `grid-auto-columns` `-rows` | `<track-size>` | `auto` | no |
+| `grid-auto-flow` | `row` \| `column` | `row` | no |
+| `grid-row-start` `-end` `grid-column-start` `-end` | `auto` \| `<integer>` \| `span <integer>` | `auto` | no |
+| `justify-items` `align-items` (grid) | `stretch` \| `start` \| `end` \| `center` | `stretch` | no |
+| `justify-self` `align-self` (grid) | `auto` \| (as above) | `auto` | no |
+
+`<track-size>` = `<length>` \| `<percentage>` \| `<number>fr` \| `min-content` \|
+`max-content` \| `minmax(<track-size>, <track-size>)`.
+`<track-list>` = one or more `<track-size>` or `repeat(<integer>, <track-list>)`, with the
+repeat count and total track count bounded by §3.12.
+
+**Excluded:** named grid lines and areas (a second naming system over the same geometry),
+`subgrid`, and `grid-auto-flow: dense` — dense packing reorders items relative to document
+order, the same objection as `order`.
+
+### 3.6 Values
+
+**Units.** `px`, `em`, `rem`, `ch`, `vw`, `vh`, `%`, and `fr` (grid tracks only).
+`em`/`ch` resolve against the element's own computed font; `rem` against the root's.
+
+**`calc()`** over `+ - * /` with bounded nesting depth (§3.12). Division by zero, and any
+expression mixing incompatible units, is a diagnostic rather than a clamp.
+
+**Custom properties** `--*`: inherited, substituted via `var(--name, <fallback>)`, with
+cycle detection and bounded substitution depth (§3.12). A cycle is a diagnostic.
+
+**`<color>`** = `#rgb` / `#rrggbb` / `#rrggbbaa`, `rgb()`, `rgba()`, `hsl()`, `hsla()`,
+`currentColor`, `transparent`, or a profile-named colour. All sRGB; compositing in
+premultiplied linear per §3.1. **Excluded:** system colours (they leak host configuration,
+which G6 forbids), and `color()`/wide-gamut functions in v1.
+
+**`<number>`, `<integer>`, `<percentage>`** are finite decimals; NaN and infinities have
+no syntax and are rejected at parse, which is the authoring-side half of the hardening
+spec's numeric-domain rule.
+
+### 3.7 Typography
+
+| property | admitted values | initial | inh. |
+|---|---|---|---|
+| `color` | `<color>` | profile default | **yes** |
+| `font-family` | a profile-named stack | profile default | **yes** |
+| `font-size` | `<length>` \| `<percentage>` | `16px` | **yes** |
+| `font-weight` | `100`…`900` (hundreds), limited to weights the named stack ships | `400` | **yes** |
+| `font-style` | `normal` \| `italic` | `normal` | **yes** |
+| `line-height` | `<number>` \| `<length>` \| `<percentage>` | `1.5` | **yes** |
+| `letter-spacing` `word-spacing` | `<length>` | `0` | **yes** |
+| `text-align` | `start` \| `end` \| `center` \| `justify` | `start` | **yes** |
+| `text-indent` | `<length>` \| `<percentage>` | `0` | **yes** |
+| `text-decoration-line` | `none` \| `underline` \| `line-through` | `none` | no |
+| `text-decoration-color` | `<color>` | `currentColor` | no |
+| `text-transform` | `none` \| `uppercase` \| `lowercase` \| `capitalize` | `none` | **yes** |
+| `white-space` | `normal` \| `pre` \| `pre-wrap` \| `nowrap` | `normal` | **yes** |
+| `overflow-wrap` | `normal` \| `break-word` | `normal` | **yes** |
+| `tab-size` | `<integer>` | `8` | **yes** |
+| `font-variant-numeric` | `normal` \| `tabular-nums` | `normal` | **yes** |
+| `direction` | `ltr` \| `rtl` | `ltr` | **yes** |
+
+★ **`text-transform` is locale-dependent** (Turkish dotted/dotless i, Greek final sigma).
+It is admitted, and the profile must name the casing locale explicitly rather than
+inheriting one from the host — a host locale would be an ambient input and would break G6
+and G1 together.
+
+**Excluded:** web fonts (v1), `hyphens` (needs dictionaries), `font-size-adjust`,
+`unicode-bidi` (UAX #9 plus `direction` is the whole model), and font-size *keywords*
+(`medium`, `large`, …) which add a UA-defined table for no expressive gain.
+
+### 3.8 Paint
+
+| property | admitted values | initial | inh. |
+|---|---|---|---|
+| `background-color` | `<color>` | `transparent` | no |
+| `background-image` | `none` \| `url()` \| `linear-gradient(…)` | `none` | no |
+| `background-position-x` `-y` | `<length>` \| `<percentage>` \| `left`/`center`/`right` (resp. `top`/`center`/`bottom`) | `0%` | no |
+| `background-size` | `auto` \| `cover` \| `contain` \| `<length>` \| `<percentage>` | `auto` | no |
+| `background-repeat` | `repeat` \| `repeat-x` \| `repeat-y` \| `no-repeat` | `repeat` | no |
+| `opacity` | `<number>` clamped to 0–1 | `1` | no |
+| `visibility` | `visible` \| `hidden` | `visible` | **yes** |
+| `box-shadow` | `none` \| offset-x offset-y blur spread `<color>`, blur and spread bounded by §3.12 | `none` | no |
+| `outline-width` `-style` `-color` | as the `border-*` equivalents | `0` / `none` / `currentColor` | no |
+| `object-fit` | `fill` \| `contain` \| `cover` \| `none` \| `scale-down` | `fill` | no |
+| `list-style-type` | `disc` \| `circle` \| `square` \| `decimal` \| `none` | `disc` | **yes** |
+| `list-style-position` | `inside` \| `outside` | `outside` | **yes** |
+| `transform` | `none` \| a bounded list of `translate()`, `scale()`, `rotate()` | `none` | no |
+| `transform-origin` | `<length>` \| `<percentage>` ×2 | `50% 50%` | no |
+
+`transform` is **paint-level only**: it never affects layout, so G2 cannot be disturbed by
+it. **Excluded:** `filter`, `backdrop-filter`, `mix-blend-mode`, `clip-path`, 3-D
+transforms, animations and transitions.
+
+### 3.9 Tables
+
+| property | admitted values | initial | inh. |
+|---|---|---|---|
+| `border-spacing` | `<length>` ×2 | `0` | **yes** |
+| `vertical-align` (table cells) | `top` \| `middle` \| `bottom` \| `baseline` | `baseline` | no |
+
+**`border-collapse` is absent — borders are always separate.** The collapsing-borders
+algorithm is one of the most intricate in CSS (conflict resolution across four edges of
+adjacent cells) for a purely visual effect. Column widths arrive pre-measured (§3.13).
+
+**Count: 64 property rows across §3.3–§3.9**, which is the denominator M2's conformance
+number is expressed against. Grouped longhands (`margin-top/-right/-bottom/-left`) count as
+one row; an implementation must support all four.
+
+### 3.10 Selectors and cascade
+
 
 Admitted: type, `.class`, `#id`, attribute selectors, state pseudo-classes, the child
 combinator `>`, `:is()`/`:where()` over admitted selectors.
@@ -200,7 +343,7 @@ Resolution order is: UA layer, then author layers in declared order, then source
 Specificity is retained within a layer but cannot cross one — which is what makes a
 rule's effect determinable from a bounded context (G4).
 
-### 3.7 Media queries
+### 3.11 Media queries
 
 `width`, `height`, `orientation`, `prefers-color-scheme`, `prefers-reduced-motion`,
 `prefers-contrast`, and bucketed `resolution`. **Bucketing is load-bearing**: media
@@ -208,7 +351,7 @@ queries are evaluated client-side and leak nothing to a server, but any *fetch* 
 that varies with client characteristics (a `srcset`-style mechanism) would leak them, so
 v1 admits no client-characteristic-dependent fetching.
 
-### 3.8 Static bounds (G3)
+### 3.12 Static bounds (G3)
 
 Normative ceilings, enumerated in the profile and checked by the parser and the scene-graph
 validator: maximum tree depth, node count, total decoded image bytes, individual image
@@ -219,7 +362,7 @@ silently, which is the failure mode this project has been bitten by repeatedly.
 
 ---
 
-### 3.9 Pre-measured content — the general rule
+### 3.13 Pre-measured content — the general rule
 
 Replaced content must declare intrinsic dimensions (§1.2), and tables must declare
 intrinsic column widths. These are the same rule:
@@ -251,17 +394,17 @@ Two properties make the precomputation shareable, which is what makes it worth d
   free, offline.
 
 **Cache-key consequence, load-bearing:** because intrinsic widths depend on font metrics
-— and, once §3.10 admits native controls, on widget metrics too — the normalizer's output
+— and, once §3.14 admits native controls, on widget metrics too — the normalizer's output
 identity must be keyed by **(source bytes, profile version, font set version, widget set
 version)**, not source bytes alone. A font set update silently reusing measurements
 taken against the previous metrics would produce tables that are subtly wrong everywhere
 and identical to correct ones by hash. The font set version is part of the address.
 
-A table arriving without declared column widths is **refused with a diagnostic** (§3.8),
+A table arriving without declared column widths is **refused with a diagnostic** (§3.12),
 exactly as an image without intrinsic dimensions is. The renderer contains no fallback
 measurement path — a fallback is how the unbounded algorithm creeps back in.
 
-### 3.10 Native widgets — real controls, never their authority
+### 3.14 Native widgets — real controls, never their authority
 
 The document worker's output is a Fresco scene graph, and Pergola's widgets *are* Fresco
 scene-graph nodes. So a control in a document is not an imitation of the native control,
@@ -304,7 +447,7 @@ chrome, which content has no way to observe or replicate, is a candidate additio
 defence and is flagged as unproven rather than assumed.
 
 **Determinism consequence.** Widget metrics come from the toolkit, so they feed intrinsic
-sizing exactly as font metrics do (§3.9). The normalizer's output identity therefore
+sizing exactly as font metrics do (§3.13). The normalizer's output identity therefore
 extends to **(source bytes, profile version, font set version, widget set version)** — a
 toolkit update that changed a control's metrics while reusing measurements taken against
 the old ones would produce the same silent, hash-identical wrongness that the font-set
@@ -386,5 +529,5 @@ property browsers can only approximate into a hard, mechanically checkable asser
    without hyphenation; either restrict it or take on dictionaries.
 3. **Whether to admit `position: fixed`** for document headers, given its interaction
    with scrolling and compositing in Fresco.
-4. **The exact numeric ceilings** in §3.8 — these should be derived from measurement on
+4. **The exact numeric ceilings** in §3.12 — these should be derived from measurement on
    the corpus, not guessed, and they are a compatibility surface once published.
