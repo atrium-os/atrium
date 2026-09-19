@@ -1,4 +1,19 @@
 #!/bin/sh
+
+# ★ A kill -9'd writer stops matching pgrep BEFORE it releases its vnode
+# references, so umount fails fast with EBUSY for a few seconds afterwards.
+# Measured: 4 of 8 immediate attempts failed "Device busy", and every one
+# succeeded after a 5 s grace. One attempt therefore DISCARDS GOOD RUNS (7 of
+# 25 in one campaign). Retry before believing the mount is stuck.
+tess_umount() {
+    _m=$1; _i=0
+    while [ $_i -lt 6 ]; do
+        timeout 300 umount "$_m" 2>/dev/null && return 0
+        sleep 5; _i=$((_i + 1))
+    done
+    timeout 300 umount "$_m"   # last attempt, let the error show
+}
+
 # Validate tessera-fs.md §20.2 `deferred` dedup: does it actually close the
 # §20.1 channel-1 existence oracle (free-space observable via statfs)?
 #
@@ -69,7 +84,7 @@ echo
 # volume, CLEAN twice once unmounted. It fails toward FALSE POSITIVES, so an
 # unchecked umount manufactures bugs that were never there.
 sync
-if umount $M 2>/dev/null; then
+if tess_umount $M; then
     tessera-fsck $DEV > /root/dd.fsck 2>&1
     echo "fsck_problems=$(grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem' /root/dd.fsck)"
 else

@@ -1,4 +1,18 @@
 #!/bin/sh
+
+# ★ A kill -9'd writer stops matching pgrep BEFORE it releases its vnode
+# references, so umount fails fast with EBUSY for a few seconds afterwards.
+# Measured: 4 of 8 immediate attempts failed "Device busy", and every one
+# succeeded after a 5 s grace. One attempt therefore DISCARDS GOOD RUNS.
+tess_umount() {
+    _m=$1; _i=0
+    while [ $_i -lt 6 ]; do
+        timeout 300 umount "$_m" 2>/dev/null && return 0
+        sleep 5; _i=$((_i + 1))
+    done
+    return 1
+}
+
 # Guest half of scripts/vm-reserve-exhaustion-test.sh — runs ON the dev VM.
 #
 #   guest-reserve-exhaustion.sh cleanup     kill leftovers, restore tunables,
@@ -165,7 +179,7 @@ run() {
     echo "survivor_missing=$miss"
     pkill -9 -f "$MARK" 2>/dev/null
     cd /; sync
-    if timeout 180 umount $M 2>/dev/null; then echo umount_ok=1; else echo umount_ok=0; fi
+    if tess_umount $M; then echo umount_ok=1; else echo umount_ok=0; fi
     if mount | grep -q " $M "; then
         echo "fsck_problems=SKIPPED_MOUNTED"   # never fsck a mounted volume
     else
@@ -268,7 +282,7 @@ crash_verify() {
     miss=0; d=0; while [ $d -lt $DIRS ]; do [ -e $M/d$d/$PER_DIR ] || miss=$((miss+1)); d=$((d+1)); done
     sleep 5; sync
     echo "files=$files walk_errors=$walk_err keep_bad=$keep_bad survivor_missing=$miss stale=$(dmesg | grep -c STALE) pinscan_aborts=$(dmesg | grep -c 'pinscan aborted') replay_refused=$(dmesg | grep -c 'REFUSED') replay=\"$(dmesg | grep 'journal replay (full)' | tail -1 | sed 's/.*applied //')\""
-    cd /; if timeout 180 umount $M 2>/dev/null; then echo umount_ok=1; else echo umount_ok=0; fi
+    cd /; if tess_umount $M; then echo umount_ok=1; else echo umount_ok=0; fi
     if mount | grep -q " $M "; then
         echo "fsck_problems=SKIPPED_MOUNTED"
     else

@@ -1,4 +1,19 @@
 #!/bin/sh
+
+# ★ A kill -9'd writer stops matching pgrep BEFORE it releases its vnode
+# references, so umount fails fast with EBUSY for a few seconds afterwards.
+# Measured: 4 of 8 immediate attempts failed "Device busy", and every one
+# succeeded after a 5 s grace. One attempt therefore DISCARDS GOOD RUNS (7 of
+# 25 in one campaign). Retry before believing the mount is stuck.
+tess_umount() {
+    _m=$1; _i=0
+    while [ $_i -lt 6 ]; do
+        timeout 300 umount "$_m" 2>/dev/null && return 0
+        sleep 5; _i=$((_i + 1))
+    done
+    timeout 300 umount "$_m"   # last attempt, let the error show
+}
+
 # Guest half of scripts/vm-legacy-orphan-crash-test.sh — runs ON the dev VM.
 #
 #   guest-legacy-orphan.sh arm      old-kmod-shaped orphans (unlinked while
@@ -83,10 +98,10 @@ verify() {
     dmesg | grep -E "legacy orphan sweep" | tail -2 | cut -c1-240 | sed 's/^/  dmesg: /'
     sync; sleep 7
     cd /
-    timeout 180 umount $M || { echo "fsck_problems=SKIPPED_MOUNTED"; return; }
+    tess_umount $M || { echo "fsck_problems=SKIPPED_MOUNTED"; return; }
     d1=$(S legacy_sweeps_done)
     _remounted=0
-    mount -t tessera $PART $M && { _remounted=1; sleep 3; cd /; timeout 180 umount $M && _remounted=0; }
+    mount -t tessera $PART $M && { _remounted=1; sleep 3; cd /; tess_umount $M && _remounted=0; }
     echo "resweep=$(( $(S legacy_sweeps_done) - d1 ))"
     # ★ Never fsck while still mounted — it fails toward FALSE POSITIVES.
     [ $_remounted -eq 0 ] || { echo "fsck_problems=SKIPPED_MOUNTED"; return; }

@@ -1,4 +1,19 @@
 #!/bin/sh
+
+# ★ A kill -9'd writer stops matching pgrep BEFORE it releases its vnode
+# references, so umount fails fast with EBUSY for a few seconds afterwards.
+# Measured: 4 of 8 immediate attempts failed "Device busy", and every one
+# succeeded after a 5 s grace. One attempt therefore DISCARDS GOOD RUNS (7 of
+# 25 in one campaign). Retry before believing the mount is stuck.
+tess_umount() {
+    _m=$1; _i=0
+    while [ $_i -lt 6 ]; do
+        timeout 300 umount "$_m" 2>/dev/null && return 0
+        sleep 5; _i=$((_i + 1))
+    done
+    timeout 300 umount "$_m"   # last attempt, let the error show
+}
+
 # Guest half of scripts/vm-durable-pin-crash-test.sh — runs ON the dev VM.
 #
 #   guest-durable-pin.sh arm      build, commit, then fail commits + release +
@@ -84,7 +99,7 @@ verify() {
     echo "committed_ok=$committed_ok keep_ok=$keep_ok read_errors=$read_err walk_errors=$walk_err stale=$(dmesg | grep -c STALE) pinscan_aborts=$(dmesg | grep -c 'pinscan aborted')"
     dmesg | grep STALE | head -3 | cut -c1-160 | sed 's/^/  dmesg: /'
     cd /
-    if timeout 180 umount $M; then
+    if tess_umount $M; then
         tessera-fsck $PART > /tmp/dpin.fsck 2>&1
         echo "fsck_problems=$(grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem|stale|kind' /tmp/dpin.fsck)"
         grep -iE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem|stale|kind' /tmp/dpin.fsck | sed -E 's/[0-9]{3,}/N/g' | sort | uniq -c | sort -rn | head -4 | sed 's/^/  fsck: /'

@@ -1,4 +1,19 @@
 #!/bin/sh
+
+# ★ A kill -9'd writer stops matching pgrep BEFORE it releases its vnode
+# references, so umount fails fast with EBUSY for a few seconds afterwards.
+# Measured: 4 of 8 immediate attempts failed "Device busy", and every one
+# succeeded after a 5 s grace. One attempt therefore DISCARDS GOOD RUNS (7 of
+# 25 in one campaign). Retry before believing the mount is stuck.
+tess_umount() {
+    _m=$1; _i=0
+    while [ $_i -lt 6 ]; do
+        timeout 300 umount "$_m" 2>/dev/null && return 0
+        sleep 5; _i=$((_i + 1))
+    done
+    timeout 300 umount "$_m"   # last attempt, let the error show
+}
+
 # Guest half of scripts/vm-wedge-probe-test.sh — runs ON the dev VM.
 #
 # WHAT IT PINS DOWN: what a volume does when its METADATA RESERVE is full.
@@ -83,7 +98,7 @@ cd /; t0=$(date +%s)
 # ★ It was not enough to REPORT umount_ok=0 and fsck anyway: a live-volume fsck
 # fails toward false positives (measured 466 -> 2 -> 2 -> 2 mounted, CLEAN
 # unmounted), so proceeding manufactures damage reports. Gate on it.
-if timeout 300 umount $M; then
+if tess_umount $M; then
     echo "umount_ok=1 took $(( $(date +%s) - t0 ))s"
     tessera-fsck /dev/vtbd2p1 > /tmp/stuck.fsck 2>&1
     echo "fsck_problems=$(grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem' /tmp/stuck.fsck)"
