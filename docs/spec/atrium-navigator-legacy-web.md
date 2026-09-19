@@ -513,11 +513,15 @@ the reading cases (§5.3) — it is a fallback, not the main path.
 ### 11.4 Sequencing: measure before porting the expensive thing
 
 **Do not start with Servo.** Tier 2 — prerendering SPA content in the normalizer — does
-not obviously need a browser engine. **QuickJS (MIT, no JIT, modern ES) plus a minimal
-DOM** is dramatically cheaper, and it is precisely the instrument that produces §5.4's
-corpus number — the measurement that decides whether the Servo port is worth starting at
-all. Building the expensive thing first, to discover whether it was needed, is the wrong
-order.
+not obviously need a browser engine. **A JS engine plus a minimal DOM** is dramatically
+cheaper, and it is precisely the instrument that produces §5.4's corpus number — the
+measurement that decides whether the Servo port is worth starting at all. Building the
+expensive thing first, to discover whether it was needed, is the wrong order.
+
+Two candidates for that instrument, both MIT-class licences and comparable integration
+work: **QuickJS** (C, no JIT, small, battle-tested) or **Boa** (Rust, ~95.5% test262,
+memory-safe object model). Boa's weakness is speed, which tier 2 does not care about
+because it runs offline — see §11.8, which now favours it for this role.
 
 **Honest limit, to be stated with the result:** a DOM without layout fails on content
 calling `getBoundingClientRect`, `offsetWidth`, or the observer APIs — the known ceiling
@@ -686,10 +690,38 @@ different. And it reclaims, which non-reclaiming by definition does not — so i
 
 **Why it is deferred rather than adopted:** it cannot be retrofitted. SpiderMonkey's and
 QuickJS's object models *are* raw pointers and their own collectors; changing the pointer
-discipline is rewriting the core. The existing Rust engine, **Boa**, has the right
-architecture but not the maturity — incomplete conformance and slow, suited to embedded
-scripting rather than arbitrary legacy web content, which is the one workload the legacy
-lane exists to serve.
+discipline is rewriting the core.
+
+**The candidate landscape (surveyed 2026-09-19).** Boa is not the only option, and an
+earlier draft of this section badly understated it:
+
+| engine | language | licence | test262 | notes |
+|---|---|---|---|---|
+| **Boa** | Rust | **Unlicense / MIT** | **~95.5%** (≈51k/53k), 4th on test262.fyi, above JavaScriptCore | `boa_gc` tracing collector. Self-described "experimental". Slower than JIT engines |
+| **Nova** | Rust | MPL-2.0 | ~80%; `nova_vm` 1.0.0 in March 2026 | **The architectural match**: data-oriented design, normal Rust enums carrying on-stack data or a 32-bit handle into homogeneous arenas, hot/cold split. Safepoint GC built on reborrowing — type-enforced rooting, the idea above applied to a whole engine. Explicitly "not fast"; gaps include sparse arrays, RegExp lookbehind, WASM |
+| **brimstone** | Rust | was copyleft, relicensed — **must be verified** | "effectively feature complete"; ~2× Boa's speed | **Compacting collector written in deliberately unsafe Rust**; its author states moving it to safe Rust is impractical |
+| **Kiesel** | Zig | — | — | Zig is not memory-safe in the sense this section requires |
+
+**The evaluation criterion is not the implementation language.** brimstone is the
+cautionary case: the fastest of the Rust engines, written in Rust, and yet its collector —
+exactly the component this section is about — is deliberately unsafe by design. "Written
+in Rust" does not imply the object model and collector are memory-safe. The question to
+ask of any candidate is **how much `unsafe` lives in the collector and object model, and
+whether it is concentrated and auditable** or spread through the hot path.
+
+**Licensing separates them more sharply than conformance does.** Boa's Unlicense/MIT sits
+in LICENSING-POLICY.md's allowed-outright column — the only candidate that needs no
+per-component evaluation. Nova and Servo are both MPL-2.0, the "evaluate per-component"
+bucket. brimstone's relicensing must be checked before it is considered at all.
+
+**Corrected assessment:** conformance is no longer Boa's blocker — at ~95.5% it is ahead
+of a production browser engine. Its gap is *performance*. And §11.4's proving ground is
+precisely where performance does not matter: tier-2 conversion runs offline. So the
+instrument proposed there could reasonably be **Boa plus a minimal DOM rather than QuickJS
+plus a minimal DOM** — comparable integration work, memory safety from the first day, and
+the same corpus measurement out the other end. Nova remains the one to watch on
+architecture; it is roughly where Boa's conformance was some years ago, and it is building
+the thing this section argues is correct.
 
 **The incremental path that makes this tractable.** An immature engine does not have to
 start in the hardest lane. **Tier 2 conversion (§4) is the ideal proving ground:** it runs
