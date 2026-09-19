@@ -772,6 +772,63 @@ place where its weaknesses are cheap, and extended toward tier 4 only as it earn
 4. **The document lane maturing** to where the engine becomes the weakest link in the
    system rather than one risk among many.
 
+### 11.9 The tier-4 gap, named
+
+Tier 4 is the one lane where almost none of this design's memory-safety work applies, and
+that should be stated plainly rather than discovered later.
+
+A full browser engine means Servo, Servo means SpiderMonkey, and SpiderMonkey has exactly
+the architecture §11.8 argues against: raw pointers, a tracing collector with rooting
+obligations spread through the mutator, and a JIT. Of our mitigations:
+
+| mitigation | tier 2 | tier 4 |
+|---|---|---|
+| jail (zero-capability worker) | yes | yes — but the jail holds a session (§7.4) |
+| JIT off, AOT bytecode (§11.5) | yes | yes |
+| non-reclaiming arena (§11.6) | yes | **no — the lane is long-running by definition** |
+| memory-safe object model (§11.8) | yes, via Boa | **no** |
+
+Swapping the engine does not rescue it: neither Boa nor Nova is a browser engine, and
+replacing SpiderMonkey *inside* Servo is not a drop-in — Servo's DOM objects are traced by
+SpiderMonkey's collector and its rooting machinery is SpiderMonkey-specific.
+
+### 11.9.1 What genuinely helps
+
+1. **Session recycling.** The obstacle to non-reclaiming is lifetime, not workload — so
+   shorten the lifetime. Restart the engine jail on an interval or a memory threshold and
+   reload the page, converting "long-running" into a series of ephemeral sessions and
+   making §11.6's non-reclaiming arena viable in tier 4 after all. Browsers already
+   discard and reload tabs under memory pressure, and web applications are consequently
+   reload-tolerant, because browsers reload them constantly. *Costs:* client-side state
+   that was never persisted is lost, so recycling must prefer idle moments and never
+   interrupt interaction; and the interval trades user disruption against exposure window.
+2. **JIT off by default** (§11.5), which removes the largest single class that does still
+   apply here.
+3. **Per-origin jails with short lives** — the exposure is bounded to one origin's session,
+   which is the data that origin already holds (§7.4).
+
+### 11.9.2 The long-term fix is smaller than "write an engine"
+
+The shape of the eventual answer is **a memory-safe JS engine bound into Servo** — a new
+binding and rooting layer between an existing Rust engine and an existing Rust browser
+engine. That is a large project, but it is materially smaller than writing a browser
+engine or a conformant JS engine from scratch, and it is upstreamable rather than a
+private fork. If §11.8's triggers ever fire, this is what they should escalate to.
+
+### 11.9.3 Why this is tolerable in the meantime
+
+Not because the risk is small, but because of where it sits:
+
+- **Tier 4 is the explicitly-marked legacy lane, and the lane is visible** (§8). Its weaker
+  posture is disclosed and chosen, not hidden behind a uniform claim of safety.
+- **The thesis already answers "I want a secure interactive app": make it a native jailed
+  app.** Tier 4 is a bridge for content that predates that answer, not the future the
+  architecture is arguing for.
+- **Whether it matters at all is a measurement, not a guess.** §5.4's corpus number decides
+  both whether tier 4 gets built and whether its architecture is a rounding error or the
+  system's principal exposure. If the legacy lane turns out to carry real traffic, §11.8's
+  trigger 2 fires and this stops being tolerable — by design.
+
 ## 12. Open questions
 
 1. **Zygote fork cost under Portcullis** — measured, not assumed, and it decides §7.6's
