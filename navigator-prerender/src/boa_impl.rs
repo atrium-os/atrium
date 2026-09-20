@@ -404,6 +404,7 @@ fn install_tree(o: &JsObject, ctx: &mut Context) {
     live_get(o, "nodeValue", n_node_value, ctx);
     live_get(o, "ownerDocument", n_owner_document, ctx);
     live_get(o, "outerHTML", n_outer_html, ctx);
+    live_get(o, "attributes", el_attributes, ctx);
     live_get_set(o, "innerHTML", n_inner_html, n_set_inner_html, ctx);
     for (name, f) in [
         ("cloneNode", n_clone as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
@@ -414,6 +415,7 @@ fn install_tree(o: &JsObject, ctx: &mut Context) {
         ("contains", n_contains),
         ("hasChildNodes", n_has_child_nodes),
         ("hasAttribute", n_has_attribute),
+        ("hasAttributes", has_attributes),
         ("removeAttribute", n_remove_attribute),
     ] {
         let f = NativeFunction::from_fn_ptr(f).to_js_function(ctx.realm());
@@ -1069,6 +1071,163 @@ fn dataset_desc_trap(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsRes
             .build()),
         None => JsValue::undefined(),
     })
+}
+
+/// One `Attr` node. Enough of it for the ways pages actually read an
+/// attribute back: `.name`/`.value` and the Node-flavoured aliases
+/// `.nodeName`/`.nodeValue`, which the corpus uses interchangeably.
+fn attr_obj(h: Handle, name: &str, value: &str, ctx: &mut Context) -> JsValue {
+    let owner = node_obj(h, ctx);
+    JsValue::from(ObjectInitializer::new(ctx)
+        .property(js_string!("name"), js_string!(name.to_string()), Attribute::all())
+        .property(js_string!("value"), js_string!(value.to_string()), Attribute::all())
+        .property(js_string!("nodeName"), js_string!(name.to_string()), Attribute::all())
+        .property(js_string!("nodeValue"), js_string!(value.to_string()), Attribute::all())
+        .property(js_string!("localName"), js_string!(name.to_string()), Attribute::all())
+        .property(js_string!("specified"), true, Attribute::all())
+        .property(js_string!("prefix"), JsValue::null(), Attribute::all())
+        .property(js_string!("namespaceURI"), JsValue::null(), Attribute::all())
+        .property(js_string!("ownerElement"), owner, Attribute::all())
+        .build())
+}
+
+/// `element.attributes` — a NamedNodeMap.
+///
+/// ★ IT IS ADDRESSED THREE WAYS, and a plain array serves only one. The
+/// corpus reads `attrs.length` with `attrs[i]`, AND `attrs[name]`, AND
+/// `attrs.placeholder` as a property — 713 references across those forms.
+/// So the numeric and the named lookups both go through the proxy, which is
+/// also what keeps it live against the arena.
+fn attributes_obj(h: Handle, ctx: &mut Context) -> JsValue {
+    let target = ObjectInitializer::new(ctx)
+        .property(js_string!("__h"), h as f64, Attribute::all())
+        .function(NativeFunction::from_fn_ptr(attrs_get_named), js_string!("getNamedItem"), 1)
+        .function(NativeFunction::from_fn_ptr(attrs_remove_named), js_string!("removeNamedItem"), 1)
+        .function(NativeFunction::from_fn_ptr(attrs_item), js_string!("item"), 1)
+        .build();
+    match boa_engine::object::builtins::JsProxy::builder(target.clone())
+        .get(attrs_get_trap)
+        .has(attrs_has_trap)
+        .own_keys(attrs_keys_trap)
+        .get_own_property_descriptor(attrs_desc_trap)
+        .build(ctx)
+    {
+        Ok(p) => JsValue::from(JsObject::from(p)),
+        Err(_) => JsValue::from(target),
+    }
+}
+
+fn attrs_pairs(h: Handle) -> Vec<(String, String)> {
+    with(|d| d.get(h).map(|n| n.attrs.clone()).unwrap_or_default())
+}
+
+fn attrs_handle(v: &JsValue, ctx: &mut Context) -> JsResult<Handle> {
+    let o = v.as_object()
+        .ok_or_else(|| boa_engine::JsNativeError::typ().with_message("proxy target"))?;
+    Ok(o.get(js_string!("__h"), ctx)?.as_number().unwrap_or(0.0) as Handle)
+}
+
+fn attrs_get_named(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = match handle_of(this, ctx) { Some(h) => h, None => return Ok(JsValue::null()) };
+    let want = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    Ok(match with(|d| d.attr(h, &want).map(str::to_string)) {
+        Some(v) => attr_obj(h, &want, &v, ctx),
+        None => JsValue::null(),
+    })
+}
+
+fn attrs_remove_named(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = match handle_of(this, ctx) { Some(h) => h, None => return Ok(JsValue::null()) };
+    let want = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    let old = with(|d| d.attr(h, &want).map(str::to_string));
+    if old.is_some() {
+        with(|d| { if let Some(n) = d.get_mut(h) { n.attrs.retain(|(k, _)| k != &want) }
+                   d.script_mutations += 1 });
+        record_mutation("attributes", h, &want);
+    }
+    Ok(match old { Some(v) => attr_obj(h, &want, &v, ctx), None => JsValue::null() })
+}
+
+fn attrs_item(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = match handle_of(this, ctx) { Some(h) => h, None => return Ok(JsValue::null()) };
+    let i = args.get_or_undefined(0).to_number(ctx)? as usize;
+    Ok(match attrs_pairs(h).get(i) {
+        Some((k, v)) => attr_obj(h, k, v, ctx),
+        None => JsValue::null(),
+    })
+}
+
+fn attrs_get_trap(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let target = args.get_or_undefined(0).clone();
+    let key = args.get_or_undefined(1).clone().to_property_key(ctx)?;
+    let name = key.to_string();
+    let h = attrs_handle(&target, ctx)?;
+    if name == "length" {
+        return Ok(JsValue::from(attrs_pairs(h).len() as u32));
+    }
+    // A numeric key indexes the list; anything else names an attribute.
+    if let Ok(i) = name.parse::<usize>() {
+        return Ok(match attrs_pairs(h).get(i) {
+            Some((k, v)) => attr_obj(h, k, v, ctx),
+            None => JsValue::undefined(),
+        });
+    }
+    if let Some(o) = target.as_object() {
+        if name.starts_with("__") || o.has_property(key.clone(), ctx)? {
+            return o.get(key, ctx);
+        }
+    }
+    Ok(match with(|d| d.attr(h, &name).map(str::to_string)) {
+        Some(v) => attr_obj(h, &name, &v, ctx),
+        None => JsValue::undefined(),
+    })
+}
+
+fn attrs_has_trap(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let name = args.get_or_undefined(1).clone().to_property_key(ctx)?.to_string();
+    let h = attrs_handle(args.get_or_undefined(0), ctx)?;
+    if name == "length" { return Ok(JsValue::from(true)) }
+    if let Ok(i) = name.parse::<usize>() { return Ok(JsValue::from(i < attrs_pairs(h).len())) }
+    Ok(JsValue::from(with(|d| d.attr(h, &name).is_some())))
+}
+
+/// Indices, as a browser enumerates a NamedNodeMap.
+fn attrs_keys_trap(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = attrs_handle(args.get_or_undefined(0), ctx)?;
+    let arr = boa_engine::object::builtins::JsArray::new(ctx)?;
+    for i in 0..attrs_pairs(h).len() {
+        arr.push(JsValue::from(js_string!(i.to_string())), ctx)?;
+    }
+    Ok(JsValue::from(arr))
+}
+
+fn attrs_desc_trap(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let name = args.get_or_undefined(1).clone().to_property_key(ctx)?.to_string();
+    let h = attrs_handle(args.get_or_undefined(0), ctx)?;
+    let pairs = attrs_pairs(h);
+    let found = name.parse::<usize>().ok().and_then(|i| pairs.get(i).cloned());
+    Ok(match found {
+        Some((k, v)) => {
+            let a = attr_obj(h, &k, &v, ctx);
+            JsValue::from(ObjectInitializer::new(ctx)
+                .property(js_string!("value"), a, Attribute::all())
+                .property(js_string!("writable"), false, Attribute::all())
+                .property(js_string!("enumerable"), true, Attribute::all())
+                .property(js_string!("configurable"), true, Attribute::all())
+                .build())
+        }
+        None => JsValue::undefined(),
+    })
+}
+
+fn has_attributes(this: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = match handle_of(this, ctx) { Some(h) => h, None => return Ok(JsValue::from(false)) };
+    Ok(JsValue::from(!attrs_pairs(h).is_empty()))
+}
+
+fn el_attributes(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = match handle_of(t, ctx) { Some(h) => h, None => return Ok(JsValue::undefined()) };
+    Ok(attributes_obj(h, ctx))
 }
 
 fn style_obj(h: Handle, ctx: &mut Context) -> JsValue {
