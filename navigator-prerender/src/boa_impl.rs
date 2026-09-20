@@ -1108,6 +1108,96 @@ const GLOBALS: &str = r#"
     };
     return Promise.resolve(resp);
   };
+  // ── XMLHttpRequest ──────────────────────────────────────────────────
+  //
+  // Over the same page-network seam as fetch, so the same policy applies
+  // without restating it: same-origin GET only, everything else refused and
+  // counted. XHR is the OLDER telemetry transport, so routing it anywhere
+  // else would have quietly reopened the hole fetch closed.
+  //
+  // ★ THE HARD PART IS NOT THE NETWORK, IT IS THE ORDERING. The seam is
+  // synchronous; XHR as pages use it is not. Delivering the callbacks inline
+  // from send() would run onload BEFORE the statement after send(), which is
+  // the opposite of what every async XHR caller is written against. So the
+  // request is performed at send() time (the seam gives no choice) but the
+  // callbacks are posted to the timer queue, preserving "send returns first".
+  // Synchronous XHR — open(m, u, false) — delivers inline, correctly.
+  //
+  // A refusal is reported as status 0 with an `error` event, which is what a
+  // browser reports for a blocked or failed request. That is an honest
+  // mapping rather than a special one: pages already have a code path for a
+  // network error, and inventing a fake 200 would be worse than the refusal.
+  globalThis.__xhrSends = 0;
+  function XMLHttpRequest() {
+    var self = this;
+    self.readyState = 0; self.status = 0; self.statusText = '';
+    self.responseText = ''; self.response = ''; self.responseType = '';
+    self.responseURL = ''; self.withCredentials = false; self.timeout = 0;
+    self.upload = { addEventListener: function () {}, removeEventListener: function () {} };
+    var _m = 'GET', _u = '', _async = true, _aborted = false, _handlers = {};
+
+    self.open = function (method, url, async) {
+      _m = String(method || 'GET').toUpperCase();
+      _u = String(url);
+      _async = (async === undefined) ? true : !!async;
+      _aborted = false;
+      self.readyState = 1; _emit('readystatechange');
+    };
+    self.setRequestHeader = function () {};
+    self.overrideMimeType = function () {};
+    // Response headers are not retained by the seam. Reporting none is
+    // accurate; synthesising plausible ones would not be.
+    self.getResponseHeader = function () { return null; };
+    self.getAllResponseHeaders = function () { return ''; };
+    self.abort = function () { _aborted = true; self.readyState = 0; };
+    self.addEventListener = function (t, fn) {
+      (_handlers[t] = _handlers[t] || []).push(fn);
+    };
+    self.removeEventListener = function (t, fn) {
+      var h = _handlers[t]; if (!h) return;
+      var i = h.indexOf(fn); if (i >= 0) h.splice(i, 1);
+    };
+    function _emit(type) {
+      var ev = { type: type, target: self, currentTarget: self,
+                 lengthComputable: false, loaded: 0, total: 0 };
+      var on = self['on' + type];
+      if (typeof on === 'function') { try { on.call(self, ev); } catch (e) {} }
+      var h = _handlers[type];
+      if (h) for (var i = 0; i < h.length; i++) {
+        try { h[i].call(self, ev); } catch (e) {}
+      }
+    }
+    function _settle() {
+      if (_aborted) return;
+      var r = __fetch_sync(_u, _m);
+      if (r) {
+        self.status = r.status; self.statusText = 'OK';
+        self.responseText = r.body; self.responseURL = r.url;
+        if (self.responseType === 'json') {
+          try { self.response = JSON.parse(r.body); } catch (e) { self.response = null; }
+        } else {
+          self.response = r.body;
+        }
+      } else {
+        // Refused or failed: a browser's network-error shape.
+        self.status = 0; self.statusText = '';
+        self.responseText = ''; self.response = null;
+      }
+      self.readyState = 4;
+      _emit('readystatechange');
+      _emit(self.status === 0 ? 'error' : 'load');
+      _emit('loadend');
+    }
+    self.send = function () {
+      globalThis.__xhrSends++;
+      if (_async) { setTimeout(_settle, 0); } else { _settle(); }
+    };
+  }
+  XMLHttpRequest.UNSENT = 0; XMLHttpRequest.OPENED = 1;
+  XMLHttpRequest.HEADERS_RECEIVED = 2; XMLHttpRequest.LOADING = 3;
+  XMLHttpRequest.DONE = 4;
+  globalThis.XMLHttpRequest = XMLHttpRequest;
+
   // A beacon is telemetry by definition — there is no response to use. It
   // reports success so a page's teardown path does not break, and sends
   // nothing.
