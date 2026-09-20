@@ -802,12 +802,94 @@ const GLOBALS: &str = r#"
     });
   } catch (e) {}
 
+  // `self` is how bundles detect a global context; without it a worker-aware
+  // build reaches for it before doing anything else. globalThis is the whole
+  // definition.
+  globalThis.self = globalThis;
+  globalThis.globalThis = globalThis;
+
+  // URLSearchParams, implemented over an ordered pair list because order and
+  // duplicates are both observable: getAll and toString must preserve them.
+  function __decode(s) {
+    try { return decodeURIComponent(String(s).replace(/\+/g, ' ')); }
+    catch (e) { return String(s); }
+  }
+  function __encode(s) {
+    try { return encodeURIComponent(String(s)); } catch (e) { return String(s); }
+  }
+  globalThis.URLSearchParams = function (init) {
+    var pairs = [];
+    if (typeof init === 'string') {
+      var q = init.charAt(0) === '?' ? init.slice(1) : init;
+      if (q.length) {
+        var parts = q.split('&');
+        for (var i = 0; i < parts.length; i++) {
+          if (!parts[i].length) continue;
+          var eq = parts[i].indexOf('=');
+          if (eq < 0) pairs.push([__decode(parts[i]), '']);
+          else pairs.push([__decode(parts[i].slice(0, eq)), __decode(parts[i].slice(eq + 1))]);
+        }
+      }
+    } else if (init && typeof init === 'object') {
+      if (Array.isArray(init)) {
+        for (var j = 0; j < init.length; j++) pairs.push([String(init[j][0]), String(init[j][1])]);
+      } else {
+        for (var k in init) if (Object.prototype.hasOwnProperty.call(init, k)) {
+          pairs.push([String(k), String(init[k])]);
+        }
+      }
+    }
+    this._p = pairs;
+    this.get = function (n) {
+      n = String(n);
+      for (var i = 0; i < this._p.length; i++) if (this._p[i][0] === n) return this._p[i][1];
+      return null;
+    };
+    this.getAll = function (n) {
+      n = String(n); var out = [];
+      for (var i = 0; i < this._p.length; i++) if (this._p[i][0] === n) out.push(this._p[i][1]);
+      return out;
+    };
+    this.has = function (n) { return this.get(n) !== null; };
+    this.append = function (n, v) { this._p.push([String(n), String(v)]); };
+    this.set = function (n, v) {
+      n = String(n); var done = false, out = [];
+      for (var i = 0; i < this._p.length; i++) {
+        if (this._p[i][0] !== n) { out.push(this._p[i]); continue; }
+        if (!done) { out.push([n, String(v)]); done = true; }
+      }
+      if (!done) out.push([n, String(v)]);
+      this._p = out;
+    };
+    this['delete'] = function (n) {
+      n = String(n); var out = [];
+      for (var i = 0; i < this._p.length; i++) if (this._p[i][0] !== n) out.push(this._p[i]);
+      this._p = out;
+    };
+    this.forEach = function (fn, thisArg) {
+      for (var i = 0; i < this._p.length; i++) fn.call(thisArg, this._p[i][1], this._p[i][0], this);
+    };
+    this.keys = function () { return this._p.map(function (x) { return x[0]; }); };
+    this.values = function () { return this._p.map(function (x) { return x[1]; }); };
+    this.entries = function () { return this._p.map(function (x) { return [x[0], x[1]]; }); };
+    this.toString = function () {
+      var out = [];
+      for (var i = 0; i < this._p.length; i++) {
+        out.push(__encode(this._p[i][0]) + '=' + __encode(this._p[i][1]));
+      }
+      return out.join('&');
+    };
+    Object.defineProperty(this, 'size', { get: function () { return this._p.length; },
+                                          configurable: true });
+  };
+
   function mkurl(parts) {
     if (!parts) return null;
     var u = {};
     for (var k in parts) u[k] = parts[k];
     u.toString = function () { return this.href; };
-    u.searchParams = { get: function () { return null; }, has: function () { return false; } };
+    // A real one now, built from this URL's own query string.
+    u.searchParams = new URLSearchParams(u.search || '');
     return u;
   }
   globalThis.URL = function (href, base) {
