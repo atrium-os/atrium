@@ -75,6 +75,16 @@ thread_local! {
     /// AND on the way out: engine objects must not outlive the engine.
     static ELISTENERS: RefCell<HashMap<Handle, Vec<(String, JsValue)>>> =
         RefCell::new(HashMap::new());
+    /// ★ One CSSStyleSheet object per owner element, for the life of a run.
+    ///
+    /// `document.styleSheets` is a live getter, so it rebuilds the list on
+    /// every access — and that made
+    /// `document.styleSheets[0].cssRules === document.styleSheets[0].rules`
+    /// FALSE, because the two reads produced different sheet objects. A
+    /// browser hands back the same CSSStyleSheet every time, and pages cache
+    /// rules against it. Same lesson as NODE_CACHE, and it must be cleared
+    /// the same way at both ends of a run.
+    static SHEET_CACHE: RefCell<HashMap<Handle, JsValue>> = RefCell::new(HashMap::new());
     /// (dispatches, listener invocations) on ELEMENTS.
     static DISPATCH: RefCell<(u32, u32)> = const { RefCell::new((0, 0)) };
     /// (writes applied, writes refused because they would erase the document)
@@ -190,6 +200,24 @@ struct FixedHooks;
 
 impl boa_engine::context::HostHooks for FixedHooks {
     fn local_timezone_offset_seconds(&self, _unix_time_seconds: i64) -> i32 { 0 }
+}
+
+/// ★ HOST OBJECTS MUST NOT LOOK LIKE PLAIN OBJECTS.
+///
+/// Everything here reported `[object Object]`, so jQuery's isPlainObject
+/// answered TRUE for the window, the document and every element — and
+/// `jQuery.extend(true, ...)` then descended into `window`, which contains
+/// itself, and recursed until the engine's limit stopped it. A browser
+/// reports `[object Window]` and the recursion never starts.
+///
+/// The exact tag matters less than not being "Object"; the checks pages make
+/// are inequality tests against `[object Object]`.
+fn set_tag(o: &JsObject, name: &str, ctx: &mut Context) {
+    let desc = boa_engine::property::PropertyDescriptor::builder()
+        .value(js_string!(name.to_string()))
+        .writable(false).enumerable(false).configurable(true).build();
+    let _ = o.define_property_or_throw(
+        boa_engine::JsSymbol::to_string_tag(), desc, ctx);
 }
 
 /// Wrap a host object so its misses are attributed.
@@ -416,6 +444,9 @@ fn install_tree(o: &JsObject, ctx: &mut Context) {
         ("hasChildNodes", n_has_child_nodes),
         ("hasAttribute", n_has_attribute),
         ("hasAttributes", has_attributes),
+        ("insertAdjacentElement", insert_adjacent),
+        ("insertAdjacentHTML", insert_adjacent_html),
+        ("insertAdjacentText", insert_adjacent_text),
         ("removeAttribute", n_remove_attribute),
     ] {
         let f = NativeFunction::from_fn_ptr(f).to_js_function(ctx.realm());
@@ -562,6 +593,180 @@ fn rtf_format(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
         Some(s) => JsValue::from(js_string!(s)),
         None => JsValue::null(),
     })
+}
+
+/// `element.insertAdjacentElement(position, element)`.
+///
+/// The four positions are relative to THIS element, two of them outside it —
+/// which is why this needs the parent, and is expressible only because the
+/// tree is navigable.
+fn insert_adjacent(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(this, ctx) else { return Ok(JsValue::null()) };
+    let pos = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped().to_ascii_lowercase();
+    let Some(node) = handle_of(args.get_or_undefined(1), ctx) else { return Ok(JsValue::null()) };
+    let ok = insert_adjacent_handle(h, &pos, node);
+    if !ok {
+        return Err(boa_engine::JsNativeError::syntax()
+            .with_message(format!("insertAdjacentElement: bad position '{pos}'")).into());
+    }
+    Ok(args.get_or_undefined(1).clone())
+}
+
+fn insert_adjacent_handle(h: Handle, pos: &str, node: Handle) -> bool {
+    with(|d| {
+        let parent = d.get(h).and_then(|n| n.parent);
+        let done = match pos {
+            "beforebegin" => match parent { Some(p) => d.insert_before(p, node, Some(h)), None => false },
+            "afterend" => match parent {
+                Some(p) => { let after = d.next_sibling(h); d.insert_before(p, node, after) }
+                None => false,
+            },
+            "afterbegin" => { let first = d.first_child(h); d.insert_before(h, node, first) }
+            "beforeend" => d.insert_before(h, node, None),
+            _ => return false,
+        };
+        if done { d.script_mutations += 1 }
+        // The POSITION was valid — an invalid one returned false above. The
+        // move itself can still be refused (a cycle, or no parent for the
+        // outside positions), and that is not a syntax error.
+        true
+    })
+}
+
+/// `element.insertAdjacentHTML(position, markup)` — through the real parser,
+/// like innerHTML, so there is one HTML implementation rather than two.
+fn insert_adjacent_html(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(this, ctx) else { return Ok(JsValue::undefined()) };
+    let pos = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped().to_ascii_lowercase();
+    let html = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
+    let frag = crate::parse::parse_fragment(&html);
+    let mut anchor_after: Option<Handle> = None;
+    with(|d| {
+        let root = frag.root();
+        for c in frag.children_of(root) {
+            let g = d.graft(&frag, c);
+            // Successive nodes chain after the previous one, or the run
+            // would land in reverse — the document.write lesson.
+            let p = match anchor_after {
+                Some(prev) => { let par = d.get(prev).and_then(|n| n.parent);
+                                match par { Some(par) => { let nx = d.next_sibling(prev);
+                                                           d.insert_before(par, g, nx) }
+                                            None => false } }
+                None => match pos.as_str() {
+                    "beforebegin" => match d.get(h).and_then(|n| n.parent) {
+                        Some(par) => d.insert_before(par, g, Some(h)), None => false },
+                    "afterend" => match d.get(h).and_then(|n| n.parent) {
+                        Some(par) => { let nx = d.next_sibling(h); d.insert_before(par, g, nx) }
+                        None => false },
+                    "afterbegin" => { let first = d.first_child(h); d.insert_before(h, g, first) }
+                    _ => d.insert_before(h, g, None),
+                },
+            };
+            if p { d.script_mutations += 1; anchor_after = Some(g); }
+        }
+    });
+    record_mutation("childList", h, "");
+    Ok(JsValue::undefined())
+}
+
+fn insert_adjacent_text(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(this, ctx) else { return Ok(JsValue::undefined()) };
+    let pos = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped().to_ascii_lowercase();
+    let text = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
+    let t = with(|d| d.create(Kind::Text(text)));
+    insert_adjacent_handle(h, &pos, t);
+    record_mutation("childList", h, "");
+    Ok(JsValue::undefined())
+}
+
+/// `document.title` — the text of the `<title>` element.
+fn doc_title_get(_t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let _ = ctx;
+    let s = with(|d| d.by_tag("title").first().map(|&h| d.text_content(h)).unwrap_or_default());
+    Ok(JsValue::from(js_string!(s.trim().to_string())))
+}
+
+/// Setting it creates the element if the document has none, as a browser
+/// does — a page that sets the title on a document without one still ends up
+/// with a titled artifact.
+fn doc_title_set(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let v = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    with(|d| {
+        let h = match d.by_tag("title").first().copied() {
+            Some(h) => h,
+            None => {
+                let t = d.create(Kind::Element("title".into()));
+                let parent = d.by_tag("head").first().copied()
+                    .or_else(|| d.by_tag("html").first().copied())
+                    .unwrap_or_else(|| d.root());
+                d.append(parent, t);
+                t
+            }
+        };
+        d.set_text(h, &v);
+        d.script_mutations += 1;
+    });
+    Ok(JsValue::undefined())
+}
+
+/// `document.scrollingElement` — `<html>` in standards mode, which every
+/// document this converter produces is.
+fn doc_scrolling_element(_t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = with(|d| d.by_tag("html").first().copied());
+    opt_node(h, ctx)
+}
+
+/// `document.styleSheets`.
+///
+/// ★ THIS CONVERTER DOES NOT PARSE CSS, and the list says so rather than
+/// pretending either way. Each sheet is real — it has the ownerNode, href,
+/// media and type that callers actually branch on — but `cssRules` contains
+/// ONLY rules the page inserted itself through insertRule, which are the
+/// rules we genuinely know. The source stylesheet's own rules are absent,
+/// not invented.
+///
+/// Empty rather than throwing: most corpus readers wrap `cssRules` in
+/// try/catch because CROSS-ORIGIN sheets throw SecurityError, and raising
+/// that here would assert a reason that is false. An empty list is the
+/// honest "none known", and the guarded callers handle it identically.
+fn doc_stylesheets(_t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let sheets: Vec<Handle> = with(|d| {
+        let mut v = d.by_tag("style");
+        v.extend(d.by_tag("link").into_iter().filter(|&h| {
+            d.attr(h, "rel").map(|r| r.to_ascii_lowercase().contains("stylesheet")).unwrap_or(false)
+        }));
+        v.sort_unstable();
+        v
+    });
+    let arr = boa_engine::object::builtins::JsArray::new(ctx)?;
+    for h in sheets {
+        if let Some(v) = SHEET_CACHE.with(|c| c.borrow().get(&h).cloned()) {
+            arr.push(v, ctx)?;
+            continue;
+        }
+        let owner = node_obj(h, ctx);
+        let href = with(|d| d.attr(h, "href").map(str::to_string));
+        let media = with(|d| d.attr(h, "media").map(str::to_string)).unwrap_or_default();
+        // ONE list behind both names: `rules` is an alias of `cssRules` in a
+        // browser, and code that compares them must see identity.
+        let rules = JsValue::from(boa_engine::object::builtins::JsArray::new(ctx)?);
+        let o = ObjectInitializer::new(ctx)
+            .property(js_string!("ownerNode"), owner, Attribute::all())
+            .property(js_string!("href"),
+                match href { Some(u) => JsValue::from(js_string!(u)), None => JsValue::null() },
+                Attribute::all())
+            .property(js_string!("media"), js_string!(media), Attribute::all())
+            .property(js_string!("type"), js_string!("text/css"), Attribute::all())
+            .property(js_string!("title"), JsValue::null(), Attribute::all())
+            .property(js_string!("disabled"), false, Attribute::all())
+            .property(js_string!("cssRules"), rules.clone(), Attribute::all())
+            .property(js_string!("rules"), rules.clone(), Attribute::all())
+            .build();
+        let v = JsValue::from(o);
+        SHEET_CACHE.with(|c| c.borrow_mut().insert(h, v.clone()));
+        arr.push(v, ctx)?;
+    }
+    Ok(JsValue::from(arr))
 }
 
 /// `document.createComment(data)`.
@@ -741,6 +946,10 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
                       f.to_js_function(ctx.realm()), false, ctx);
     }
     install_tree(&o, ctx);
+    set_tag(&o, match with(|d| d.node_type(h)) {
+        3 => "Text", 8 => "Comment", 11 => "DocumentFragment", 9 => "HTMLDocument",
+        _ => "HTMLElement",
+    }, ctx);
     if is_hyperlink(h) { install_hyperlink(&o, ctx); }
     let v = probed(o, "element", ctx);
     NODE_CACHE.with(|c| c.borrow_mut().insert(h, v.clone()));
@@ -989,6 +1198,7 @@ fn dataset_obj(h: Handle, ctx: &mut Context) -> JsValue {
     let target = ObjectInitializer::new(ctx)
         .property(js_string!("__h"), h as f64, Attribute::all())
         .build();
+    set_tag(&target, "DOMStringMap", ctx);
     match boa_engine::object::builtins::JsProxy::builder(target.clone())
         .get(dataset_get_trap)
         .set(dataset_set_trap)
@@ -1012,10 +1222,18 @@ fn dataset_handle(args: &[JsValue], ctx: &mut Context) -> JsResult<Handle> {
 fn dataset_get_trap(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let key = args.get_or_undefined(1).clone().to_property_key(ctx)?;
     let name = key.to_string();
-    if name.starts_with("__") {
+    // Anything the target actually carries — Symbol.toStringTag included —
+    // belongs to the target. Only bare NAMES are data-* lookups. Without
+    // this the symbol fell through to a data-* miss and the map reported
+    // [object Object], which is exactly what makes a host object look plain.
+    {
         let target = args.get_or_undefined(0).as_object()
             .ok_or_else(|| boa_engine::JsNativeError::typ().with_message("proxy target"))?;
-        return target.get(key, ctx);
+        if name.starts_with("__") || name.starts_with("Symbol(")
+            || target.has_property(key.clone(), ctx)?
+        {
+            return target.get(key, ctx);
+        }
     }
     let h = dataset_handle(args, ctx)?;
     // An ABSENT data attribute is undefined, not "". Pages branch on it.
@@ -1105,6 +1323,7 @@ fn attributes_obj(h: Handle, ctx: &mut Context) -> JsValue {
         .function(NativeFunction::from_fn_ptr(attrs_remove_named), js_string!("removeNamedItem"), 1)
         .function(NativeFunction::from_fn_ptr(attrs_item), js_string!("item"), 1)
         .build();
+    set_tag(&target, "NamedNodeMap", ctx);
     match boa_engine::object::builtins::JsProxy::builder(target.clone())
         .get(attrs_get_trap)
         .has(attrs_has_trap)
@@ -1237,6 +1456,7 @@ fn style_obj(h: Handle, ctx: &mut Context) -> JsValue {
         .function(NativeFunction::from_fn_ptr(style_get_property), js_string!("getPropertyValue"), 1)
         .function(NativeFunction::from_fn_ptr(style_remove_property), js_string!("removeProperty"), 1)
         .build();
+    set_tag(&target, "CSSStyleDeclaration", ctx);
     match boa_engine::object::builtins::JsProxy::builder(target.clone())
         .get(style_get_trap).set(style_set_trap).build(ctx)
     {
@@ -2722,6 +2942,7 @@ impl ScriptEngine for BoaEngine {
         // reintroduced by the reset that was meant to keep it clean.
         NODE_CACHE.with(|c| c.borrow_mut().clear());
         ELISTENERS.with(|m| m.borrow_mut().clear());
+        SHEET_CACHE.with(|c| c.borrow_mut().clear());
         DISPATCH.with(|c| *c.borrow_mut() = (0, 0));
         DOC_WRITE.with(|c| *c.borrow_mut() = (0, 0));
         WRITE_POS.with(|m| m.borrow_mut().clear());
@@ -2796,7 +3017,11 @@ impl ScriptEngine for BoaEngine {
                 .build();
             let _ = doc.set(js_string!("implementation"), imp, false, &mut ctx);
         }
+        set_tag(&doc, "HTMLDocument", &mut ctx);
         live_get(&doc, "scripts", doc_scripts, &mut ctx);
+        live_get(&doc, "styleSheets", doc_stylesheets, &mut ctx);
+        live_get(&doc, "scrollingElement", doc_scrolling_element, &mut ctx);
+        live_get_set(&doc, "title", doc_title_get, doc_title_set, &mut ctx);
         live_get(&doc, "defaultView", doc_default_view, &mut ctx);
         install_tree(&doc, &mut ctx);
         let doc_v = probed(doc.clone(), "document", &mut ctx);
@@ -2823,6 +3048,10 @@ impl ScriptEngine for BoaEngine {
         // It stays a PROXY over the global so the missing-API probe keeps
         // working; a proxy that only traps `get` forwards writes to the
         // target, so `window.x = 1` really does define a global.
+        {
+            let g = ctx.global_object().clone();
+            set_tag(&g, "Window", &mut ctx);
+        }
         let win_v = probed(ctx.global_object().clone(), "window", &mut ctx);
         let _ = ctx.register_global_property(js_string!("window"), win_v, Attribute::all());
 
@@ -2976,6 +3205,7 @@ impl ScriptEngine for BoaEngine {
         // A cache of engine objects must not outlive the engine.
         NODE_CACHE.with(|c| c.borrow_mut().clear());
         ELISTENERS.with(|m| m.borrow_mut().clear());
+        SHEET_CACHE.with(|c| c.borrow_mut().clear());
         DOM.with(|d| *dom = std::mem::take(&mut d.borrow_mut()));
         rep.layout_reads = LAYOUT_READS.with(|n| *n.borrow());
         let (pf, pfail) = PAGE_FETCHES.with(|c| *c.borrow());
