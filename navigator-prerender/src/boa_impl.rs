@@ -137,6 +137,14 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
     for n in ["clientHeight", "offsetHeight", "scrollHeight"] { layout_prop(&o, n, layout_h, ctx); }
     for n in ["offsetTop", "offsetLeft", "scrollTop", "scrollLeft"] { layout_prop(&o, n, layout_zero, ctx); }
     {
+        let cl = class_list_obj(h, ctx);
+        let _ = o.set(js_string!("classList"), cl, false, ctx);
+        let st = style_obj(h, ctx);
+        let _ = o.set(js_string!("style"), st, false, ctx);
+        let cn = with(|d| d.class_list(h).join(" "));
+        let _ = o.set(js_string!("className"), js_string!(cn), false, ctx);
+    }
+    {
         let f = NativeFunction::from_fn_ptr(bounding_rect);
         let _ = o.set(js_string!("getBoundingClientRect"),
                       f.to_js_function(ctx.realm()), false, ctx);
@@ -240,6 +248,154 @@ fn layout_prop(o: &JsObject, name: &str, f: fn(&JsValue, &[JsValue], &mut Contex
     let desc = boa_engine::property::PropertyDescriptor::builder()
         .get(getter).enumerable(true).configurable(true).build();
     let _ = o.define_property_or_throw(js_string!(name.to_string()), desc, ctx);
+}
+
+// --- classList and style ---------------------------------------------------
+//
+// Both are live views onto an attribute, so both read and write through the
+// arena rather than caching: a script that sets a class and then reads
+// className must see its own write, and the serialized output must carry it.
+
+fn cl_args(args: &[JsValue], ctx: &mut Context) -> Vec<String> {
+    args.iter().filter_map(|a| a.to_string(ctx).ok())
+        .map(|s| s.to_std_string_escaped())
+        .flat_map(|s| s.split_whitespace().map(str::to_string).collect::<Vec<_>>())
+        .collect()
+}
+
+fn cl_add(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    if let Some(h) = handle_of(this, ctx) {
+        let names = cl_args(args, ctx);
+        with(|d| { d.class_add(h, &names); d.script_mutations += 1 });
+    }
+    Ok(JsValue::undefined())
+}
+fn cl_remove(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    if let Some(h) = handle_of(this, ctx) {
+        let names = cl_args(args, ctx);
+        with(|d| { d.class_remove(h, &names); d.script_mutations += 1 });
+    }
+    Ok(JsValue::undefined())
+}
+fn cl_contains(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let n = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    Ok(JsValue::from(match handle_of(this, ctx) {
+        Some(h) => with(|d| d.class_list(h).iter().any(|c| *c == n)),
+        None => false,
+    }))
+}
+fn cl_toggle(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let n = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    let force = match args.get(1) {
+        Some(v) if !v.is_undefined() => Some(v.to_boolean()),
+        _ => None,
+    };
+    Ok(JsValue::from(match handle_of(this, ctx) {
+        Some(h) => with(|d| { d.script_mutations += 1; d.class_toggle(h, &n, force) }),
+        None => false,
+    }))
+}
+fn cl_value(this: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::from(js_string!(match handle_of(this, ctx) {
+        Some(h) => with(|d| d.class_list(h).join(" ")),
+        None => String::new(),
+    })))
+}
+fn cl_length(this: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::from(match handle_of(this, ctx) {
+        Some(h) => with(|d| d.class_list(h).len()) as f64,
+        None => 0.0,
+    }))
+}
+
+fn class_list_obj(h: Handle, ctx: &mut Context) -> JsValue {
+    let o = ObjectInitializer::new(ctx)
+        .property(js_string!("__h"), h as f64, Attribute::all())
+        .function(NativeFunction::from_fn_ptr(cl_add), js_string!("add"), 1)
+        .function(NativeFunction::from_fn_ptr(cl_remove), js_string!("remove"), 1)
+        .function(NativeFunction::from_fn_ptr(cl_contains), js_string!("contains"), 1)
+        .function(NativeFunction::from_fn_ptr(cl_toggle), js_string!("toggle"), 2)
+        .build();
+    layout_prop_named(&o, "value", cl_value, ctx);
+    layout_prop_named(&o, "length", cl_length, ctx);
+    JsValue::from(o)
+}
+
+/// Install a read-only accessor from any getter fn.
+fn layout_prop_named(o: &JsObject, name: &str,
+    f: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>, ctx: &mut Context) {
+    let getter = NativeFunction::from_fn_ptr(f).to_js_function(ctx.realm());
+    let desc = boa_engine::property::PropertyDescriptor::builder()
+        .get(getter).enumerable(true).configurable(true).build();
+    let _ = o.define_property_or_throw(js_string!(name.to_string()), desc, ctx);
+}
+
+/// `el.style` — a Proxy, because `el.style.display = 'none'` is a set of an
+/// ARBITRARY property name and there is no other way to intercept it.
+fn style_get_trap(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let target = args.get_or_undefined(0).as_object()
+        .ok_or_else(|| boa_engine::JsNativeError::typ().with_message("proxy target"))?;
+    let key = args.get_or_undefined(1).clone().to_property_key(ctx)?;
+    let name = key.to_string();
+    if name.starts_with("__") || target.has_property(key.clone(), ctx)? {
+        return target.get(key, ctx);
+    }
+    let h = target.get(js_string!("__h"), ctx)?.as_number().unwrap_or(0.0) as Handle;
+    if name == "cssText" {
+        return Ok(JsValue::from(js_string!(with(|d| d.attr(h, "style").unwrap_or("").to_string()))));
+    }
+    Ok(JsValue::from(js_string!(with(|d| d.style_get(h, &name)))))
+}
+
+fn style_set_trap(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let target = args.get_or_undefined(0).as_object()
+        .ok_or_else(|| boa_engine::JsNativeError::typ().with_message("proxy target"))?;
+    let name = args.get_or_undefined(1).clone().to_property_key(ctx)?.to_string();
+    let val = args.get_or_undefined(2).to_string(ctx)?.to_std_string_escaped();
+    let h = target.get(js_string!("__h"), ctx)?.as_number().unwrap_or(0.0) as Handle;
+    with(|d| {
+        if name == "cssText" { d.set_attr(h, "style", &val) } else { d.style_set(h, &name, &val) }
+        d.script_mutations += 1;
+    });
+    Ok(JsValue::from(true))
+}
+
+fn style_set_property(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let p = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    let v = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
+    if let Some(h) = handle_of(this, ctx) {
+        with(|d| { d.style_set(h, &p, &v); d.script_mutations += 1 });
+    }
+    Ok(JsValue::undefined())
+}
+fn style_get_property(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let p = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    Ok(JsValue::from(js_string!(match handle_of(this, ctx) {
+        Some(h) => with(|d| d.style_get(h, &p)),
+        None => String::new(),
+    })))
+}
+fn style_remove_property(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let p = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    if let Some(h) = handle_of(this, ctx) {
+        with(|d| { d.style_set(h, &p, ""); d.script_mutations += 1 });
+    }
+    Ok(JsValue::undefined())
+}
+
+fn style_obj(h: Handle, ctx: &mut Context) -> JsValue {
+    let target = ObjectInitializer::new(ctx)
+        .property(js_string!("__h"), h as f64, Attribute::all())
+        .function(NativeFunction::from_fn_ptr(style_set_property), js_string!("setProperty"), 2)
+        .function(NativeFunction::from_fn_ptr(style_get_property), js_string!("getPropertyValue"), 1)
+        .function(NativeFunction::from_fn_ptr(style_remove_property), js_string!("removeProperty"), 1)
+        .build();
+    match boa_engine::object::builtins::JsProxy::builder(target.clone())
+        .get(style_get_trap).set(style_set_trap).build(ctx)
+    {
+        Ok(p) => JsValue::from(JsObject::from(p)),
+        Err(_) => JsValue::from(target),
+    }
 }
 
 fn ignore(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {

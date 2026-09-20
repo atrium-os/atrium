@@ -251,3 +251,81 @@ pub fn id_index(d: &Dom) -> HashMap<String, Handle> {
     }
     m
 }
+
+// --- class and style attribute helpers -------------------------------------
+//
+// Kept in the DOM rather than the engine binding so they can be tested
+// directly, and so a second engine gets them for free.
+
+impl Dom {
+    pub fn class_list(&self, h: Handle) -> Vec<String> {
+        self.attr(h, "class")
+            .map(|c| c.split_whitespace().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn class_add(&mut self, h: Handle, names: &[String]) {
+        let mut cur = self.class_list(h);
+        for n in names {
+            if !n.is_empty() && !cur.iter().any(|c| c == n) { cur.push(n.clone()) }
+        }
+        self.set_attr(h, "class", &cur.join(" "));
+    }
+
+    pub fn class_remove(&mut self, h: Handle, names: &[String]) {
+        let cur: Vec<String> = self.class_list(h).into_iter()
+            .filter(|c| !names.iter().any(|n| n == c)).collect();
+        self.set_attr(h, "class", &cur.join(" "));
+    }
+
+    /// Returns the state after toggling.
+    pub fn class_toggle(&mut self, h: Handle, name: &str, force: Option<bool>) -> bool {
+        let has = self.class_list(h).iter().any(|c| c == name);
+        let want = force.unwrap_or(!has);
+        if want { self.class_add(h, &[name.to_string()]) }
+        else { self.class_remove(h, &[name.to_string()]) }
+        want
+    }
+
+    /// `style` attribute as declarations, in source order.
+    pub fn style_decls(&self, h: Handle) -> Vec<(String, String)> {
+        self.attr(h, "style").map(|s| s.split(';').filter_map(|d| {
+            let (k, v) = d.split_once(':')?;
+            let (k, v) = (k.trim(), v.trim());
+            if k.is_empty() || v.is_empty() { None } else { Some((k.to_ascii_lowercase(), v.to_string())) }
+        }).collect()).unwrap_or_default()
+    }
+
+    pub fn style_get(&self, h: Handle, prop: &str) -> String {
+        let p = css_name(prop);
+        self.style_decls(h).into_iter()
+            .find(|(k, _)| *k == p).map(|(_, v)| v).unwrap_or_default()
+    }
+
+    pub fn style_set(&mut self, h: Handle, prop: &str, value: &str) {
+        let p = css_name(prop);
+        let mut decls = self.style_decls(h);
+        if value.is_empty() {
+            decls.retain(|(k, _)| *k != p);
+        } else if let Some(d) = decls.iter_mut().find(|(k, _)| *k == p) {
+            d.1 = value.to_string();
+        } else {
+            decls.push((p, value.to_string()));
+        }
+        let text = decls.iter().map(|(k, v)| format!("{k}: {v}"))
+            .collect::<Vec<_>>().join("; ");
+        self.set_attr(h, "style", &text);
+    }
+}
+
+/// `backgroundColor` -> `background-color`. Scripts use both spellings, and
+/// the attribute only ever holds the hyphenated one.
+pub fn css_name(prop: &str) -> String {
+    if prop.contains('-') { return prop.to_ascii_lowercase() }
+    let mut out = String::new();
+    for c in prop.chars() {
+        if c.is_ascii_uppercase() { out.push('-'); out.push(c.to_ascii_lowercase()) }
+        else { out.push(c) }
+    }
+    out
+}
