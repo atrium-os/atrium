@@ -164,12 +164,17 @@ fn document_order_is_preserved_across_inline_and_external() {
 fn missing_apis_are_named_not_just_failed() {
     let html = "<html><body><script>\
         try { document.querySelector('p'); } catch (e) {}\
+        try { document.getElementsByClassName('x'); } catch (e) {}\
         try { document.addEventListener('x', function(){}); } catch (e) {}\
         </script></body></html>";
     let c = convert(html, &mut BoaEngine::default());
     let names: Vec<&str> = c.missing.iter().map(|(n, _)| n.as_str()).collect();
     assert!(names.contains(&"document.querySelector"), "got {names:?}");
-    assert!(names.contains(&"document.addEventListener"), "got {names:?}");
+    assert!(names.contains(&"document.getElementsByClassName"), "got {names:?}");
+    // addEventListener WAS the top missing API; implementing it must remove it
+    // from the report. This assertion is how we notice if it regresses.
+    assert!(!names.contains(&"document.addEventListener"),
+        "addEventListener is implemented now and must not be reported missing: {names:?}");
 }
 
 /// What exists must still pass through the probe untouched.
@@ -182,4 +187,60 @@ fn probe_does_not_break_working_apis() {
     assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
     assert!(c.html.contains(r#"k="v""#) && c.html.contains('t'), "got {}", c.html);
     assert!(!c.missing.iter().any(|(n, _)| n.ends_with("getElementById")));
+}
+
+/// The point of addEventListener is the FIRING. A page whose content is built
+/// in a DOMContentLoaded handler must come out with that content.
+#[test]
+fn dom_content_loaded_handler_runs_and_produces_content() {
+    let html = r#"<html><body><div id="root"></div><script>
+        document.addEventListener('DOMContentLoaded', function () {
+          var h = document.createElement('h1');
+          h.textContent = 'built on ready';
+          document.getElementById('root').appendChild(h);
+        });
+      </script></body></html>"#;
+    let c = convert(html, &mut BoaEngine::default());
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.listeners_fired >= 1, "no listener fired");
+    assert!(c.html.contains("built on ready"), "handler did not build content: {}", c.html);
+}
+
+#[test]
+fn window_onload_and_load_listeners_run() {
+    let html = r#"<html><body><div id=r></div><script>
+        window.onload = function () { document.getElementById('r').setAttribute('onload','yes'); };
+        window.addEventListener('load', function () { document.getElementById('r').setAttribute('lis','yes'); });
+      </script></body></html>"#;
+    let c = convert(html, &mut BoaEngine::default());
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.html.contains(r#"onload="yes""#), "window.onload did not run: {}", c.html);
+    assert!(c.html.contains(r#"lis="yes""#), "load listener did not run: {}", c.html);
+}
+
+/// A handler that throws must not take the conversion with it.
+#[test]
+fn a_throwing_handler_does_not_lose_the_document() {
+    let html = r#"<html><body><p>kept</p><script>
+        document.addEventListener('DOMContentLoaded', function(){ missing.thing(); });
+        document.addEventListener('DOMContentLoaded', function(){ document.body.setAttribute('second','ran'); });
+      </script></body></html>"#;
+    let c = convert(html, &mut BoaEngine::default());
+    assert!(c.html.contains("kept"));
+    assert!(c.html.contains(r#"second="ran""#), "a later handler must still run: {}", c.html);
+}
+
+/// readyState must move, since scripts branch on it.
+#[test]
+fn ready_state_progresses() {
+    let html = r#"<html><body><div id=r></div><script>
+        var seen = document.readyState;
+        document.addEventListener('DOMContentLoaded', function(){
+          document.getElementById('r').setAttribute('at-script', seen);
+          document.getElementById('r').setAttribute('at-ready', document.readyState);
+        });
+      </script></body></html>"#;
+    let c = convert(html, &mut BoaEngine::default());
+    assert!(c.html.contains(r#"at-script="loading""#), "got {}", c.html);
+    assert!(c.html.contains(r#"at-ready="interactive""#), "got {}", c.html);
 }

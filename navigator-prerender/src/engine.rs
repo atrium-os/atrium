@@ -18,6 +18,8 @@ pub struct RunReport {
     /// Properties the script asked a host object for and did not get —
     /// the missing-API report, by name.
     pub missing: Vec<(String, u32)>,
+    /// Lifecycle handlers actually invoked — registration is not the point.
+    pub listeners_fired: u32,
 }
 
 pub trait ScriptEngine {

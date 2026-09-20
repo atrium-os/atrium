@@ -21,6 +21,13 @@ thread_local! {
     /// the target does not have. The result names the missing API instead of
     /// describing the symptom.
     static MISSES: RefCell<BTreeMap<String, u32>> = RefCell::new(BTreeMap::new());
+    /// ★ Only record misses caused by PAGE script. The instrument's own
+    /// bootstrap and lifecycle passes probe for `window.onload` and
+    /// `document.onreadystatechange` with `typeof`, which are property gets —
+    /// and those promptly appeared as the top two "most-wanted APIs" in 18 of
+    /// 18 documents. A measurement that reports its own probes is measuring
+    /// itself; this flag keeps the instrument out of its own numbers.
+    static RECORDING: RefCell<bool> = const { RefCell::new(false) };
 }
 
 fn with<R>(f: impl FnOnce(&mut Dom) -> R) -> R { DOM.with(|d| f(&mut d.borrow_mut())) }
@@ -52,7 +59,10 @@ fn probe_get(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<J
         .unwrap_or_else(|| "object".into());
     let name = key.to_string();
     // Ignore engine-internal lookups; they are not APIs a page asked for.
-    if !name.starts_with("__") && !name.starts_with("Symbol(") && name != "then" {
+    let recording = RECORDING.with(|r| *r.borrow());
+    let own_probe = matches!(name.as_str(), "onreadystatechange" | "onload");
+    if recording && !own_probe && !name.starts_with("__")
+        && !name.starts_with("Symbol(") && name != "then" {
         MISSES.with(|m| *m.borrow_mut().entry(format!("{kind}.{name}")).or_default() += 1);
     }
     Ok(JsValue::undefined())
@@ -80,6 +90,11 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
         .function(NativeFunction::from_fn_ptr(get_attribute), js_string!("getAttribute"), 1)
         .function(NativeFunction::from_fn_ptr(get_text), js_string!("getText"), 0)
         .function(NativeFunction::from_fn_ptr(set_text), js_string!("setText"), 1)
+        // Element listeners are accepted and dropped: nothing in a headless
+        // conversion will ever deliver a click. Accepting them keeps a page
+        // running; pretending to deliver them would be a lie.
+        .function(NativeFunction::from_fn_ptr(ignore), js_string!("addEventListener"), 2)
+        .function(NativeFunction::from_fn_ptr(ignore), js_string!("removeEventListener"), 2)
         .build();
     install_text_accessor(&o, ctx);
     probed(o, "element", ctx)
@@ -92,6 +107,10 @@ fn install_text_accessor(o: &JsObject, ctx: &mut Context) {
     let desc = boa_engine::property::PropertyDescriptor::builder()
         .get(getter).set(setter).enumerable(true).configurable(true).build();
     let _ = o.define_property_or_throw(js_string!("textContent"), desc, ctx);
+}
+
+fn ignore(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    Ok(JsValue::undefined())
 }
 
 fn append_child(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -176,6 +195,61 @@ fn query_all(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsVa
 #[derive(Default)]
 pub struct BoaEngine;
 
+/// Installed before any page script.
+///
+/// ★ The listener list lives in JS, not in Rust. Holding JsFunction values in
+/// a thread-local would mean rooting them outside the Context and tracing them
+/// through the engine's GC by hand — exactly the coupling §11.8 identifies as
+/// the hard part of swapping engines. Keeping them in JS leaves the GC's job
+/// with the GC.
+const BOOTSTRAP: &str = r#"
+(function () {
+  var L = [];
+  globalThis.__fired = 0;
+  function add(t, f) { if (typeof f === 'function') L.push([String(t), f]); }
+  function remove(t, f) {
+    for (var i = L.length - 1; i >= 0; i--) if (L[i][0] === String(t) && L[i][1] === f) L.splice(i, 1);
+  }
+  globalThis.__fire = function (type) {
+    var ev = { type: type, target: document, currentTarget: document,
+               preventDefault: function () {}, stopPropagation: function () {} };
+    for (var i = 0; i < L.length; i++) {
+      if (L[i][0] !== type) continue;
+      try { L[i][1].call(document, ev); globalThis.__fired++; } catch (e) {}
+    }
+  };
+  document.addEventListener = add;
+  document.removeEventListener = remove;
+  if (typeof window !== 'undefined') {
+    window.addEventListener = add;
+    window.removeEventListener = remove;
+  }
+  document.readyState = 'loading';
+})();
+"#;
+
+/// Run after every script, because that is where the content usually is.
+///
+/// ★ `document.addEventListener` was the most-requested API in the corpus, and
+/// merely stubbing it would have been the wrong fix: real pages put their
+/// content-generating work inside a DOMContentLoaded callback, so a converter
+/// that registers listeners and never fires them runs every bundle and still
+/// emits an empty page. The event is the point, not the registration.
+const FIRE: &str = r#"
+(function () {
+  document.readyState = 'interactive';
+  __fire('DOMContentLoaded');
+  if (typeof document.onreadystatechange === 'function') {
+    try { document.onreadystatechange(); __fired++; } catch (e) {}
+  }
+  document.readyState = 'complete';
+  __fire('load');
+  if (typeof window !== 'undefined' && typeof window.onload === 'function') {
+    try { window.onload({ type: 'load' }); __fired++; } catch (e) {}
+  }
+})();
+"#;
+
 impl ScriptEngine for BoaEngine {
     fn name(&self) -> &'static str { "boa" }
 
@@ -222,7 +296,13 @@ impl ScriptEngine for BoaEngine {
         let _ = ctx.register_global_property(js_string!("console"), console, Attribute::all());
 
         MISSES.with(|m| m.borrow_mut().clear());
-        let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![], missing: vec![] };
+        let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![],
+            missing: vec![], listeners_fired: 0 };
+        RECORDING.with(|r| *r.borrow_mut() = false);
+        if let Err(e) = ctx.eval(Source::from_bytes(BOOTSTRAP.as_bytes())) {
+            rep.errors.push(format!("bootstrap: {e}"));
+        }
+        RECORDING.with(|r| *r.borrow_mut() = true);
         for s in scripts {
             match ctx.eval(Source::from_bytes(s.as_bytes())) {
                 Ok(_) => rep.scripts_run += 1,
@@ -235,6 +315,22 @@ impl ScriptEngine for BoaEngine {
                 }
             }
         }
+        // Lifecycle AFTER the scripts have registered their handlers. Page
+        // handlers run inside this pass, so recording stays ON for them; the
+        // FIRE script's own typeof probes are named below and filtered.
+        match ctx.eval(Source::from_bytes(FIRE.as_bytes())) {
+            Ok(_) => {
+                rep.listeners_fired = ctx
+                    .eval(Source::from_bytes(b"__fired"))
+                    .ok()
+                    .and_then(|v| v.as_number())
+                    .unwrap_or(0.0) as u32;
+            }
+            Err(e) => rep.errors.push(format!("lifecycle: {e}")),
+        }
+        // Promise jobs queued by handlers (a bundle that awaits on ready).
+        let _ = ctx.run_jobs();
+
         DOM.with(|d| *dom = std::mem::take(&mut d.borrow_mut()));
         rep.missing = MISSES.with(|m| m.borrow().iter().map(|(k, v)| (k.clone(), *v)).collect());
         rep
