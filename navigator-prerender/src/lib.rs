@@ -6,7 +6,7 @@ pub mod fetch;
 pub mod selector;
 
 use dom::Script;
-use engine::ScriptEngine;
+use engine::{ScriptEngine, ScriptSource};
 use fetch::Fetcher;
 
 pub struct Conversion {
@@ -25,6 +25,7 @@ pub struct Conversion {
     pub errors: Vec<String>,
     pub missing: Vec<(String, u32)>,
     pub listeners_fired: u32,
+    pub module_retries: u32,
 }
 
 /// Parse, run the page's scripts once, and snapshot the result.
@@ -43,16 +44,16 @@ pub fn convert_with(
 
     let (mut ext_total, mut ext_ok, mut ext_fail) = (0, 0, 0);
     let mut fetch_errors: Vec<String> = vec![];
-    let mut scripts: Vec<String> = vec![];
+    let mut scripts: Vec<ScriptSource> = vec![];
     for s in dom::scripts_in_order(&dom) {
         match s {
-            Script::Inline(src) => scripts.push(src),
-            Script::External(href) => {
+            Script::Inline { text, module } => scripts.push(ScriptSource { text, module }),
+            Script::External { href, module } => {
                 ext_total += 1;
                 match resolve(base, &href) {
                     None => { ext_fail += 1; fetch_errors.push(format!("unresolved src: {href}")); }
                     Some(abs) => match fetcher.get(&abs) {
-                        Ok(body) => { ext_ok += 1; scripts.push(body); }
+                        Ok(body) => { ext_ok += 1; scripts.push(ScriptSource { text: body, module }); }
                         Err(e) => { ext_fail += 1; fetch_errors.push(e); }
                     },
                 }
@@ -76,6 +77,7 @@ pub fn convert_with(
         scripts_failed: rep.scripts_failed,
         script_mutations: dom.script_mutations,
         listeners_fired: rep.listeners_fired,
+        module_retries: rep.module_retries,
         missing: rep.missing,
         errors: rep.errors,
     }

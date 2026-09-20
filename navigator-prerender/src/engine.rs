@@ -11,6 +11,14 @@
 
 use crate::dom::Dom;
 
+/// One script to run, and how it must be parsed.
+pub struct ScriptSource {
+    pub text: String,
+    /// Declared `type="module"`, or inferred after a classic parse failed on
+    /// module-only syntax.
+    pub module: bool,
+}
+
 pub struct RunReport {
     pub scripts_run: usize,
     pub scripts_failed: usize,
@@ -20,11 +28,13 @@ pub struct RunReport {
     pub missing: Vec<(String, u32)>,
     /// Lifecycle handlers actually invoked — registration is not the point.
     pub listeners_fired: u32,
+    /// Scripts that parsed only after being retried as modules.
+    pub module_retries: u32,
 }
 
 pub trait ScriptEngine {
     /// Name, for the report — which engine produced this conversion.
     fn name(&self) -> &'static str;
     /// Run each script in document order against the DOM, mutating it.
-    fn run(&mut self, dom: &mut Dom, scripts: &[String]) -> RunReport;
+    fn run(&mut self, dom: &mut Dom, scripts: &[ScriptSource]) -> RunReport;
 }

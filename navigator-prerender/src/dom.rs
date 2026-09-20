@@ -184,9 +184,9 @@ pub fn inline_scripts(d: &Dom) -> Vec<String> {
 /// A script the document asks for, in document order.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Script {
-    Inline(String),
+    Inline { text: String, module: bool },
     /// `src` as written; resolution against the document base happens later.
-    External(String),
+    External { href: String, module: bool },
 }
 
 /// Every script the document asks for, inline and external, IN DOCUMENT ORDER.
@@ -207,11 +207,16 @@ pub fn scripts_in_order(d: &Dom) -> Vec<Script> {
                 }
             };
             if ty_ok {
+                let module = d.attr(h, "type")
+                    .map(|t| t.trim().eq_ignore_ascii_case("module"))
+                    .unwrap_or(false);
                 if let Some(src) = d.attr(h, "src") {
-                    if !src.trim().is_empty() { out.push(Script::External(src.to_string())); }
+                    if !src.trim().is_empty() {
+                        out.push(Script::External { href: src.to_string(), module });
+                    }
                 } else {
                     let t = d.text_content(h);
-                    if !t.trim().is_empty() { out.push(Script::Inline(t)); }
+                    if !t.trim().is_empty() { out.push(Script::Inline { text: t, module }); }
                 }
             }
             return;

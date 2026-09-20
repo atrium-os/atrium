@@ -152,9 +152,9 @@ fn document_order_is_preserved_across_inline_and_external() {
         r#"<html><body><script>1</script><script src="a.js"></script><script>2</script></body></html>"#);
     let s = scripts_in_order(&d);
     assert_eq!(s.len(), 3);
-    assert!(matches!(&s[0], Script::Inline(t) if t.contains('1')));
-    assert!(matches!(&s[1], Script::External(u) if u == "a.js"));
-    assert!(matches!(&s[2], Script::Inline(t) if t.contains('2')));
+    assert!(matches!(&s[0], Script::Inline { text, .. } if text.contains('1')));
+    assert!(matches!(&s[1], Script::External { href, .. } if href == "a.js"));
+    assert!(matches!(&s[2], Script::Inline { text, .. } if text.contains('2')));
 }
 
 /// Attribution: a script reaching for an API we do not have must name it,
@@ -296,4 +296,51 @@ fn bad_selector_returns_empty_rather_than_throwing() {
     let c = convert(html, &mut BoaEngine::default());
     assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
     assert!(c.html.contains(r#"n="0""#) && c.html.contains("kept"), "got {}", c.html);
+}
+
+/// A `type="module"` script must evaluate, and its top-level body must have
+/// run by the time the conversion finishes.
+#[test]
+fn module_scripts_evaluate() {
+    let html = r#"<html><body><div id=r></div>
+      <script type="module">
+        const el = document.createElement('p');
+        el.textContent = 'from module';
+        document.getElementById('r').appendChild(el);
+        export const unused = 1;
+      </script></body></html>"#;
+    let c = convert(html, &mut BoaEngine::default());
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.html.contains("from module"), "module body did not run: {}", c.html);
+}
+
+/// A classic script carrying module-only syntax is retried as a module,
+/// because pages do mislabel their goal type and a converter should not lose
+/// the bundle over it.
+#[test]
+fn classic_script_with_export_is_retried_as_module() {
+    let html = r#"<html><body><div id=r></div>
+      <script>
+        const el = document.createElement('p');
+        el.textContent = 'retried';
+        document.getElementById('r').appendChild(el);
+        export {};
+      </script></body></html>"#;
+    let c = convert(html, &mut BoaEngine::default());
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert_eq!(c.module_retries, 1, "should have been retried as a module");
+    assert!(c.html.contains("retried"), "got {}", c.html);
+}
+
+/// A module whose import cannot be resolved is REPORTED, not silently
+/// treated as having run.
+#[test]
+fn unresolved_module_import_is_reported() {
+    let html = r#"<html><body><p>kept</p>
+      <script type="module">import x from './nowhere.js'; document.body.setAttribute('ran','1');</script>
+      </body></html>"#;
+    let c = convert(html, &mut BoaEngine::default());
+    assert_eq!(c.scripts_failed, 1, "unresolved import must not count as success");
+    assert!(c.html.contains("kept"));
+    assert!(!c.html.contains(r#"ran="1""#));
 }

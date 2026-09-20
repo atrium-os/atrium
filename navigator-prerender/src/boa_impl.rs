@@ -1,7 +1,7 @@
 //! The Boa side of the seam. Nothing outside this file knows which engine runs.
 
 use crate::dom::{Dom, Handle, Kind};
-use crate::engine::{RunReport, ScriptEngine};
+use crate::engine::{RunReport, ScriptEngine, ScriptSource};
 use boa_engine::{
     js_string, object::ObjectInitializer, property::Attribute, Context, JsArgs, JsObject,
     JsResult, JsValue, NativeFunction, Source,
@@ -229,6 +229,30 @@ fn by_tag_name(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
 #[derive(Default)]
 pub struct BoaEngine;
 
+/// Parse, link and evaluate a module, then settle its promise.
+///
+/// `load_link_evaluate` returns a promise: without draining the job queue the
+/// module's top-level body may not have run at all, and a rejection would be
+/// reported as success.
+fn run_module(ctx: &mut Context, text: &str) -> Result<(), String> {
+    let module = boa_engine::Module::parse(Source::from_bytes(text.as_bytes()), None, ctx)
+        .map_err(|e| e.to_string())?;
+    let promise = module.load_link_evaluate(ctx);
+    ctx.run_jobs().map_err(|e| e.to_string())?;
+    match promise.state() {
+        boa_engine::builtins::promise::PromiseState::Fulfilled(_) => Ok(()),
+        boa_engine::builtins::promise::PromiseState::Rejected(v) => {
+            Err(v.to_string(ctx).map(|s| s.to_std_string_escaped())
+                .unwrap_or_else(|_| "module rejected".into()))
+        }
+        // Pending after the queue drained means an import never resolved —
+        // this build has no module loader, so a bundle with real imports is
+        // reported rather than silently half-run.
+        boa_engine::builtins::promise::PromiseState::Pending =>
+            Err("module pending: unresolved import (no module loader)".into()),
+    }
+}
+
 /// Installed before any page script.
 ///
 /// ★ The listener list lives in JS, not in Rust. Holding JsFunction values in
@@ -287,7 +311,7 @@ const FIRE: &str = r#"
 impl ScriptEngine for BoaEngine {
     fn name(&self) -> &'static str { "boa" }
 
-    fn run(&mut self, dom: &mut Dom, scripts: &[String]) -> RunReport {
+    fn run(&mut self, dom: &mut Dom, scripts: &[ScriptSource]) -> RunReport {
         DOM.with(|d| *d.borrow_mut() = std::mem::take(dom));
         let mut ctx = Context::default();
 
@@ -338,20 +362,41 @@ impl ScriptEngine for BoaEngine {
 
         MISSES.with(|m| m.borrow_mut().clear());
         let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![],
-            missing: vec![], listeners_fired: 0 };
+            missing: vec![], listeners_fired: 0, module_retries: 0 };
         RECORDING.with(|r| *r.borrow_mut() = false);
         if let Err(e) = ctx.eval(Source::from_bytes(BOOTSTRAP.as_bytes())) {
             rep.errors.push(format!("bootstrap: {e}"));
         }
         RECORDING.with(|r| *r.borrow_mut() = true);
         for s in scripts {
-            match ctx.eval(Source::from_bytes(s.as_bytes())) {
-                Ok(_) => rep.scripts_run += 1,
-                Err(e) => {
+            let mut err = if s.module {
+                run_module(&mut ctx, &s.text).err()
+            } else {
+                ctx.eval(Source::from_bytes(s.text.as_bytes())).err().map(|e| e.to_string())
+            };
+            // ★ A classic script that fails on module-only syntax is retried
+            // as a module. The corpus showed bare `export` in files a page
+            // loaded as ordinary scripts (10 of them) — a converter should
+            // not lose a bundle because the page mislabelled its goal type.
+            if !s.module {
+                if let Some(msg) = &err {
+                    if msg.contains("'export'") || msg.contains("'import'") {
+                        // Count the ATTEMPT, not the success: a retry that
+                        // parses but then fails on an unresolved import is
+                        // still module syntax we would otherwise have lost,
+                        // and hiding it would understate the work done.
+                        rep.module_retries += 1;
+                        match run_module(&mut ctx, &s.text) {
+                            Ok(()) => err = None,
+                            Err(e2) => err = Some(e2),
+                        }
+                    }
+                }
+            }
+            match err {
+                None => rep.scripts_run += 1,
+                Some(msg) => {
                     rep.scripts_failed += 1;
-                    let msg = e.to_string();
-                    // The error list IS the missing-API report: a script that
-                    // reaches for an unimplemented binding fails here by name.
                     rep.errors.push(msg.chars().take(200).collect());
                 }
             }
