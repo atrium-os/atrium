@@ -77,3 +77,49 @@ fn fetch_inside_a_timer_still_lands() {
     let c = convert_with(html, Some("https://e.test/p.html"), &mut eng, &mut NoNetwork);
     assert!(c.html.contains(r#"t="late""#), "deferred fetch did not land: {}", c.html);
 }
+
+/// The policy: same-origin GET only. Telemetry is overwhelmingly cross-origin
+/// or POST, and a converter must not emit it on behalf of a reader who does
+/// not exist.
+#[test]
+fn cross_origin_and_non_get_are_refused_and_counted() {
+    let mut api = MapFetcher::default();
+    api.0.insert("https://example.test/same.json".into(), r#"{"v":1}"#.into());
+    api.0.insert("https://analytics.example.net/collect".into(), "ok".into());
+    let html = r#"<html><body><div id=r></div><script>
+        fetch('/same.json').then(function(r){ return r.json(); }).then(function(d){
+          document.getElementById('r').setAttribute('same', String(d.v));
+        });
+        fetch('https://analytics.example.net/collect').catch(function(){
+          document.getElementById('r').setAttribute('xo','refused');
+        });
+        fetch('/collect', { method: 'POST' }).catch(function(){
+          document.getElementById('r').setAttribute('post','refused');
+        });
+      </script></body></html>"#;
+    let mut eng = BoaEngine { page_fetcher: Some(Box::new(api)), ..Default::default() };
+    let c = convert_with(html, Some("https://example.test/p.html"), &mut eng, &mut NoNetwork);
+    assert!(c.html.contains(r#"same="1""#), "same-origin GET must work: {}", c.html);
+    assert!(c.html.contains(r#"xo="refused""#), "cross-origin must be refused: {}", c.html);
+    assert!(c.html.contains(r#"post="refused""#), "POST must be refused: {}", c.html);
+    assert_eq!(c.page_fetches, 1);
+    assert_eq!(c.page_blocked, 2, "both refusals must be counted");
+    assert!(c.blocked_hosts.iter().any(|(k, _)| k.contains("cross-origin")),
+        "refusals must say where they aimed: {:?}", c.blocked_hosts);
+    assert!(c.blocked_hosts.iter().any(|(k, _)| k.starts_with("POST")));
+}
+
+/// sendBeacon is telemetry by definition — there is no response to use. It
+/// reports success so a page's teardown does not break, and sends nothing.
+#[test]
+fn beacons_are_suppressed_not_sent() {
+    let html = r#"<html><body><div id=r></div><script>
+        var ok = navigator.sendBeacon('https://t.example.net/x', 'data');
+        document.getElementById('r').setAttribute('claimed', String(ok));
+      </script></body></html>"#;
+    let c = convert_with(html, Some("https://example.test/p.html"),
+                         &mut BoaEngine::default(), &mut NoNetwork);
+    assert!(c.html.contains(r#"claimed="true""#), "must not break teardown: {}", c.html);
+    assert_eq!(c.beacons_suppressed, 1, "and must be counted");
+    assert_eq!(c.page_fetches, 0, "nothing may go out");
+}

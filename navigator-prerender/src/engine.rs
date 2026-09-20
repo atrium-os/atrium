@@ -55,6 +55,10 @@ pub struct RunReport {
     /// Requests the PAGE made, as distinct from fetching its own code.
     pub page_fetches: u32,
     pub page_fetch_failures: u32,
+    /// Requests refused by the same-origin-GET policy, and where they aimed.
+    pub page_blocked: u32,
+    pub blocked_hosts: Vec<(String, u32)>,
+    pub beacons_suppressed: u32,
 }
 
 pub trait ScriptEngine {

@@ -41,7 +41,9 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
         c.observers_registered);
     println!("L\t{}", c.layout_reads);
     println!("T\t{}\t{}", c.timers_fired, c.timers_dropped);
-    println!("P\t{}\t{}", c.page_fetches, c.page_fetch_failures);
+    println!("P\t{}\t{}\t{}\t{}", c.page_fetches, c.page_fetch_failures,
+        c.page_blocked, c.beacons_suppressed);
+    for (k, n) in c.blocked_hosts.iter() { println!("B\t{n}\t{k}"); }
     println!("V\t{:?}", c.verdict);
     if let Some(f) = &c.first_error {
         println!("F\t{}", f.replace('\t', " ").replace('\n', " "));
@@ -96,6 +98,8 @@ fn main() {
     let mut layout_reads = 0u32;
     let (mut t_fired, mut t_dropped, mut t_docs) = (0u32, 0u32, 0usize);
     let (mut pf, mut pff, mut pf_docs) = (0u32, 0u32, 0usize);
+    let (mut pblk, mut pbeac) = (0u32, 0u32);
+    let mut blocked_where: BTreeMap<String, u32> = BTreeMap::new();
     let mut layout_docs = 0usize;
     let mut verdicts: BTreeMap<String, usize> = BTreeMap::new();
     let mut unattributed: Vec<String> = vec![];
@@ -127,6 +131,8 @@ fn main() {
         observers += c.observers;
         layout_reads += c.layout_reads;
         pf += c.page_fetches; pff += c.page_fetch_failures;
+        pblk += c.page_blocked; pbeac += c.beacons;
+        for (k, n) in &c.blocked_hosts { *blocked_where.entry(k.clone()).or_default() += n; }
         if c.page_fetches > 0 { pf_docs += 1; }
         t_fired += c.timers_fired; t_dropped += c.timers_dropped;
         if c.timers_fired > 0 { t_docs += 1; }
@@ -161,8 +167,12 @@ fn main() {
     println!("  some script failed {js_fail}");
     println!("  DOM actually changed by script {mutated}");
     if mod_retries > 0 { println!("  parsed as MODULE after a classic parse failed: {mod_retries}"); }
-    if pf > 0 || pff > 0 {
-        println!("  requests the PAGE made: {pf} in {pf_docs} docs ({pff} failed/refused)");
+    if pf > 0 || pff > 0 || pblk > 0 || pbeac > 0 {
+        println!("  requests the PAGE made: {pf} allowed in {pf_docs} docs, {pff} failed");
+        println!("  REFUSED by policy (same-origin GET only): {pblk}; beacons suppressed: {pbeac}");
+        let mut v: Vec<_> = blocked_where.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        for (k, n) in v.into_iter().take(10) { println!("      {n:4}  {k}"); }
     }
     if t_fired > 0 || t_dropped > 0 {
         println!("  timer callbacks fired: {t_fired} in {t_docs} docs; {t_dropped} still pending at the horizon");
@@ -283,6 +293,9 @@ pub struct Child {
     pub timers_dropped: u32,
     pub page_fetches: u32,
     pub page_fetch_failures: u32,
+    pub page_blocked: u32,
+    pub beacons: u32,
+    pub blocked_hosts: Vec<(String, u32)>,
 }
 
 fn parse_child(s: &str) -> Option<Child> {
@@ -291,7 +304,8 @@ fn parse_child(s: &str) -> Option<Child> {
         errors: vec![], missing: vec![], nulls: vec![], verdict: String::new(),
         first_error: None,
         module_retries: 0, observers: 0, layout_reads: 0,
-        timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0 };
+        timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0,
+        page_blocked: 0, beacons: 0, blocked_hosts: vec![] };
     let mut saw = false;
     for line in s.lines() {
         let f: Vec<&str> = line.split('\t').collect();
@@ -313,9 +327,14 @@ fn parse_child(s: &str) -> Option<Child> {
                 c.missing.push((f[2].to_string(), f[1].parse().unwrap_or(1)));
             }
             Some(&"L") if f.len() >= 2 => c.layout_reads = f[1].parse().unwrap_or(0),
-            Some(&"P") if f.len() >= 3 => {
+            Some(&"P") if f.len() >= 5 => {
                 c.page_fetches = f[1].parse().unwrap_or(0);
                 c.page_fetch_failures = f[2].parse().unwrap_or(0);
+                c.page_blocked = f[3].parse().unwrap_or(0);
+                c.beacons = f[4].parse().unwrap_or(0);
+            }
+            Some(&"B") if f.len() >= 3 => {
+                c.blocked_hosts.push((f[2].to_string(), f[1].parse().unwrap_or(1)));
             }
             Some(&"T") if f.len() >= 3 => {
                 c.timers_fired = f[1].parse().unwrap_or(0);

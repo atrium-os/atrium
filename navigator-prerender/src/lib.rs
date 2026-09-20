@@ -38,6 +38,9 @@ pub struct Conversion {
     pub timers_dropped: u32,
     pub page_fetches: u32,
     pub page_fetch_failures: u32,
+    pub page_blocked: u32,
+    pub blocked_hosts: Vec<(String, u32)>,
+    pub beacons_suppressed: u32,
 }
 
 /// Parse, run the page's scripts once, and snapshot the result.
@@ -157,6 +160,9 @@ pub fn convert_with(
         timers_dropped: rep.timers_dropped,
         page_fetches: rep.page_fetches,
         page_fetch_failures: rep.page_fetch_failures,
+        page_blocked: rep.page_blocked,
+        blocked_hosts: rep.blocked_hosts,
+        beacons_suppressed: rep.beacons_suppressed,
         verdict,
         missing: rep.missing,
         first_error: rep.first_error,

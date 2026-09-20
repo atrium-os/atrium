@@ -50,6 +50,9 @@ thread_local! {
     static PAGE_NET: RefCell<Option<Box<dyn crate::fetch::Fetcher>>> =
         const { RefCell::new(None) };
     static PAGE_FETCHES: RefCell<(u32, u32)> = const { RefCell::new((0, 0)) };
+    /// Requests refused by policy, and the hosts they were aimed at.
+    static PAGE_BLOCKED: RefCell<(u32, BTreeMap<String, u32>)> =
+        RefCell::new((0, BTreeMap::new()));
     /// The document's URL, so `script.src` can be reported ABSOLUTE as a
     /// browser does — webpack derives publicPath from it, and a relative
     /// value there yields the wrong base.
@@ -409,13 +412,61 @@ fn style_obj(h: Handle, ctx: &mut Context) -> JsValue {
 /// to await on, so the request is made now and handed to JS as an
 /// already-settled promise. Determinism comes from the fetch cache — a second
 /// conversion of the same document reads the same bytes.
+/// ★ THE PAGE NETWORK IS SAME-ORIGIN GET ONLY. Everything else is refused.
+///
+/// A converter that runs a page's scripts will otherwise fire its analytics:
+/// a measured 72 of 77 requests in the corpus went to third-party telemetry
+/// endpoints, sent on behalf of NOBODY — no reader existed. Worse than a
+/// browser doing it, because a conversion is amortised across many readers
+/// who never made the request, so one run speaks for all of them.
+///
+/// Structural rather than a blocklist, deliberately. A filter list is an
+/// arms race and is wrong the day it ships; origin and method are properties
+/// of the request itself. Telemetry is overwhelmingly cross-origin or POST,
+/// and content a document needs to render itself is overwhelmingly neither.
+///
+/// This will refuse some legitimate cross-origin content APIs. That is the
+/// intended trade for a privacy-motivated architecture: refusals are COUNTED
+/// and reported by host, so the cost is visible and arguable rather than
+/// assumed. The complete answer is tier-3 substitution by content hash — the
+/// analytics SDK never runs at all — and this is the structural floor beneath
+/// it.
+fn blocked(reason: &str, host: &str) {
+    PAGE_BLOCKED.with(|b| {
+        let mut b = b.borrow_mut();
+        b.0 += 1;
+        *b.1.entry(format!("{reason} {host}")).or_default() += 1;
+    });
+}
+
 fn fetch_sync(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let url = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-    let abs = match BASE.with(|b| b.borrow().clone()) {
-        Some(b) => url::Url::parse(&b).ok().and_then(|b| b.join(&url).ok())
+    let base = BASE.with(|b| b.borrow().clone());
+    let abs = match &base {
+        Some(b) => url::Url::parse(b).ok().and_then(|b| b.join(&url).ok())
             .map(|u| u.to_string()).unwrap_or(url.clone()),
         None => url.clone(),
     };
+
+    let method = args.get_or_undefined(1).to_string(ctx)
+        .map(|s| s.to_std_string_escaped().to_ascii_uppercase())
+        .unwrap_or_else(|_| "GET".into());
+    let parsed = url::Url::parse(&abs).ok();
+    let host = parsed.as_ref().and_then(|u| u.host_str()).unwrap_or("?").to_string();
+
+    if method != "GET" && method != "HEAD" {
+        blocked(&format!("{method} to"), &host);
+        return Ok(JsValue::null());
+    }
+    let same_origin = match (&base, &parsed) {
+        (Some(b), Some(u)) => url::Url::parse(b).ok()
+            .map(|b| b.origin() == u.origin()).unwrap_or(false),
+        _ => false,
+    };
+    if !same_origin {
+        blocked("cross-origin", &host);
+        return Ok(JsValue::null());
+    }
     let got = PAGE_NET.with(|n| {
         n.borrow_mut().as_mut().map(|f| f.get(&abs))
     });
@@ -836,6 +887,10 @@ const GLOBALS: &str = r#"
     };
     return Promise.resolve(resp);
   };
+  // A beacon is telemetry by definition — there is no response to use. It
+  // reports success so a page's teardown path does not break, and sends
+  // nothing.
+  globalThis.__beacons = 0;
   globalThis.Request = function (url, init) { this.url = String(url); this.init = init; };
   globalThis.Headers = function () {
     this.get = function () { return null; }; this.has = function () { return false; };
@@ -843,6 +898,7 @@ const GLOBALS: &str = r#"
   };
 
   globalThis.navigator = {
+    sendBeacon: function () { globalThis.__beacons++; return true; },
     userAgent: 'atrium-navigator-prerender/0.1',
     language: 'en', languages: ['en'], onLine: true, cookieEnabled: false
   };
@@ -987,7 +1043,8 @@ impl ScriptEngine for BoaEngine {
         let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![],
             missing: vec![], nulls: vec![], first_error: None, cause: None, listeners_fired: 0,
             module_retries: 0, observers_registered: 0, layout_reads: 0,
-            timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0 };
+            timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0,
+            page_blocked: 0, blocked_hosts: vec![], beacons_suppressed: 0 };
         RECORDING.with(|r| *r.borrow_mut() = false);
         let _ = ctx.register_global_callable(js_string!("__parse_url"), 2,
             NativeFunction::from_fn_ptr(parse_url));
@@ -995,6 +1052,7 @@ impl ScriptEngine for BoaEngine {
             NativeFunction::from_fn_ptr(fetch_sync));
         PAGE_NET.with(|n| *n.borrow_mut() = self.page_fetcher.take());
         PAGE_FETCHES.with(|c| *c.borrow_mut() = (0, 0));
+        PAGE_BLOCKED.with(|b| { let mut b = b.borrow_mut(); b.0 = 0; b.1.clear(); });
         let _ = ctx.register_global_property(js_string!("__doc_url"),
             js_string!(self.base_url.clone().unwrap_or_default()), Attribute::all());
         if let Err(e) = ctx.eval(Source::from_bytes(BOOTSTRAP.as_bytes())) {
@@ -1087,6 +1145,14 @@ impl ScriptEngine for BoaEngine {
         let (pf, pfail) = PAGE_FETCHES.with(|c| *c.borrow());
         rep.page_fetches = pf;
         rep.page_fetch_failures = pfail;
+        let (nblocked, hosts) = PAGE_BLOCKED.with(|b| {
+            let b = b.borrow();
+            (b.0, b.1.iter().map(|(k, v)| (k.clone(), *v)).collect::<Vec<_>>())
+        });
+        rep.page_blocked = nblocked;
+        rep.blocked_hosts = hosts;
+        rep.beacons_suppressed = ctx.eval(Source::from_bytes(b"__beacons")).ok()
+            .and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
         // Hand the fetcher back so a caller may reuse the engine.
         self.page_fetcher = PAGE_NET.with(|n| n.borrow_mut().take());
         rep.observers_registered = ctx
