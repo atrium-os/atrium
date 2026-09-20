@@ -16,9 +16,14 @@ fn classify_message(msg: &str) -> String {
         }
     }
     if msg.starts_with("SyntaxError: unexpected token '<'") {
-        // A script body that is HTML: an error page served where JS was
-        // expected. Not an engine gap — a fetch that returned the wrong thing.
-        return "script body is HTML, not JavaScript".to_string();
+        // ★ DO NOT CALL THIS "the body is HTML". I did, confidently, and it
+        // was wrong for every document it matched: they were classic scripts
+        // wrapped in the legacy `<!-- ... //-->` idiom, which is
+        // standardised JavaScript (Annex B.1.1) that the engine was simply
+        // not configured to accept. Enabling boa's `annex-b` feature cleared
+        // all of them. What remains under this message is genuinely
+        // unidentified, so it says so.
+        return "SyntaxError at '<' (unidentified)".to_string();
     }
     if msg.contains("not supported in this browser") {
         return "environment probe rejected us".to_string();

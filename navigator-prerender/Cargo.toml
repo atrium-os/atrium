@@ -5,7 +5,12 @@ edition = "2021"
 description = "Tier-2 conversion instrument: run a page's scripts once, headlessly, and snapshot the resulting DOM. Its output is a measurement (docs/spec/atrium-navigator-legacy-web.md §11.4)."
 
 [dependencies]
-boa_engine = "0.22"
+# ★ annex-b is NOT on by default, and without it every script wrapped in the
+# legacy `<!-- ... //-->` HTML-comment idiom is a SyntaxError. That wrapper is
+# standardised JavaScript (ECMAScript Annex B.1.1, HTML-like comments) and
+# every browser accepts it in a classic script, so refusing it made real,
+# valid pages look broken.
+boa_engine = { version = "0.22", features = ["annex-b"] }
 html5ever = "0.39"
 markup5ever_rcdom = "0.39"
 url = "2"

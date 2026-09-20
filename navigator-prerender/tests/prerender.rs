@@ -352,3 +352,38 @@ fn unresolved_module_import_is_reported() {
     assert!(c.html.contains("kept"));
     assert!(!c.html.contains(r#"ran="1""#));
 }
+
+/// ★ HTML-like comments are STANDARDISED JAVASCRIPT (Annex B.1.1), not broken
+/// markup. The `<!-- ... //-->` wrapper around a classic script is accepted by
+/// every browser, and Boa needs its `annex-b` feature turned on to match.
+/// Without it these scripts were a SyntaxError, which the report then
+/// mis-described as "script body is HTML" — the body was JavaScript all along.
+#[test]
+fn html_like_comments_are_javascript_not_markup() {
+    let html = "<html><body><div id=t></div><script type=\"text/javascript\">\n\
+        <!--\n\
+        document.getElementById('t').setAttribute('ran', '1');\n\
+        //-->\n\
+        </script></body></html>";
+    let c = convert(html, &mut BoaEngine::default());
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.html.contains(r#"ran="1""#), "{}", c.html);
+}
+
+/// ★ `<!--` is a LINE comment, not a block opener — anything after it on the
+/// same line is commented out, and the block does NOT need a closing `-->`.
+/// I got this wrong first time and wrote code on the opening line, which the
+/// engine correctly ignored; the test now pins the real semantics, including
+/// the bare `-->` closing form with no `//` guard.
+#[test]
+fn html_open_comment_is_a_line_comment() {
+    let html = "<html><body><div id=t></div><script>\n\
+        <!-- this text is commented out\n\
+        var x = 1;\n\
+        document.getElementById('t').setAttribute('x', String(x));\n\
+        -->\n\
+        </script></body></html>";
+    let c = convert(html, &mut BoaEngine::default());
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.html.contains(r#"x="1""#), "{}", c.html);
+}
