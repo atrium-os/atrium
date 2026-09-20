@@ -52,6 +52,9 @@ pub struct RunReport {
     /// Timer callbacks dispatched, and those still pending at the horizon.
     pub timers_fired: u32,
     pub timers_dropped: u32,
+    /// Requests the PAGE made, as distinct from fetching its own code.
+    pub page_fetches: u32,
+    pub page_fetch_failures: u32,
 }
 
 pub trait ScriptEngine {

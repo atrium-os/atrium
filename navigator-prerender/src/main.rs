@@ -24,7 +24,15 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
     let mut http = HttpFetcher::new(std::env::temp_dir().join("prerender-jscache"));
     let mut nonet = NoNetwork;
     let fetcher: &mut dyn Fetcher = if net { &mut http } else { &mut nonet };
-    let c = convert_with(&src, base, &mut BoaEngine::default(), fetcher);
+    // The page's own network is separate from the one that loads its code,
+    // and is only wired when the run is networked at all.
+    let mut eng = BoaEngine {
+        page_fetcher: if net {
+            Some(Box::new(HttpFetcher::new(std::env::temp_dir().join("prerender-pagecache"))))
+        } else { None },
+        ..Default::default()
+    };
+    let c = convert_with(&src, base, &mut eng, fetcher);
     // fields the parent aggregates; errors last, tab-separated
     println!("R\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         c.elements_before, c.elements_after, c.depth_after,
@@ -33,6 +41,7 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
         c.observers_registered);
     println!("L\t{}", c.layout_reads);
     println!("T\t{}\t{}", c.timers_fired, c.timers_dropped);
+    println!("P\t{}\t{}", c.page_fetches, c.page_fetch_failures);
     println!("V\t{:?}", c.verdict);
     if let Some(f) = &c.first_error {
         println!("F\t{}", f.replace('\t', " ").replace('\n', " "));
@@ -86,6 +95,7 @@ fn main() {
     let mut observers = 0u32;
     let mut layout_reads = 0u32;
     let (mut t_fired, mut t_dropped, mut t_docs) = (0u32, 0u32, 0usize);
+    let (mut pf, mut pff, mut pf_docs) = (0u32, 0u32, 0usize);
     let mut layout_docs = 0usize;
     let mut verdicts: BTreeMap<String, usize> = BTreeMap::new();
     let mut unattributed: Vec<String> = vec![];
@@ -116,6 +126,8 @@ fn main() {
         mod_retries += c.module_retries;
         observers += c.observers;
         layout_reads += c.layout_reads;
+        pf += c.page_fetches; pff += c.page_fetch_failures;
+        if c.page_fetches > 0 { pf_docs += 1; }
         t_fired += c.timers_fired; t_dropped += c.timers_dropped;
         if c.timers_fired > 0 { t_docs += 1; }
         if c.layout_reads > 0 { layout_docs += 1; }
@@ -149,6 +161,9 @@ fn main() {
     println!("  some script failed {js_fail}");
     println!("  DOM actually changed by script {mutated}");
     if mod_retries > 0 { println!("  parsed as MODULE after a classic parse failed: {mod_retries}"); }
+    if pf > 0 || pff > 0 {
+        println!("  requests the PAGE made: {pf} in {pf_docs} docs ({pff} failed/refused)");
+    }
     if t_fired > 0 || t_dropped > 0 {
         println!("  timer callbacks fired: {t_fired} in {t_docs} docs; {t_dropped} still pending at the horizon");
     }
@@ -266,6 +281,8 @@ pub struct Child {
     pub layout_reads: u32,
     pub timers_fired: u32,
     pub timers_dropped: u32,
+    pub page_fetches: u32,
+    pub page_fetch_failures: u32,
 }
 
 fn parse_child(s: &str) -> Option<Child> {
@@ -274,7 +291,7 @@ fn parse_child(s: &str) -> Option<Child> {
         errors: vec![], missing: vec![], nulls: vec![], verdict: String::new(),
         first_error: None,
         module_retries: 0, observers: 0, layout_reads: 0,
-        timers_fired: 0, timers_dropped: 0 };
+        timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0 };
     let mut saw = false;
     for line in s.lines() {
         let f: Vec<&str> = line.split('\t').collect();
@@ -296,6 +313,10 @@ fn parse_child(s: &str) -> Option<Child> {
                 c.missing.push((f[2].to_string(), f[1].parse().unwrap_or(1)));
             }
             Some(&"L") if f.len() >= 2 => c.layout_reads = f[1].parse().unwrap_or(0),
+            Some(&"P") if f.len() >= 3 => {
+                c.page_fetches = f[1].parse().unwrap_or(0);
+                c.page_fetch_failures = f[2].parse().unwrap_or(0);
+            }
             Some(&"T") if f.len() >= 3 => {
                 c.timers_fired = f[1].parse().unwrap_or(0);
                 c.timers_dropped = f[2].parse().unwrap_or(0);

@@ -45,6 +45,11 @@ thread_local! {
     static EVENTS: RefCell<Vec<(&'static str, String)>> = const { RefCell::new(Vec::new()) };
     /// How often the page read a layout metric we cannot truthfully answer.
     static LAYOUT_READS: RefCell<u32> = const { RefCell::new(0) };
+    /// The page's fetcher, parked here for the duration of a run so native
+    /// functions can reach it without capturing state the engine's GC traces.
+    static PAGE_NET: RefCell<Option<Box<dyn crate::fetch::Fetcher>>> =
+        const { RefCell::new(None) };
+    static PAGE_FETCHES: RefCell<(u32, u32)> = const { RefCell::new((0, 0)) };
     /// The document's URL, so `script.src` can be reported ABSOLUTE as a
     /// browser does — webpack derives publicPath from it, and a relative
     /// value there yields the wrong base.
@@ -398,6 +403,39 @@ fn style_obj(h: Handle, ctx: &mut Context) -> JsValue {
     }
 }
 
+/// `__fetch_sync(url)` -> { ok, status, url, body } | null.
+///
+/// Synchronous by design: the conversion is a single pass with no event loop
+/// to await on, so the request is made now and handed to JS as an
+/// already-settled promise. Determinism comes from the fetch cache — a second
+/// conversion of the same document reads the same bytes.
+fn fetch_sync(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let url = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    let abs = match BASE.with(|b| b.borrow().clone()) {
+        Some(b) => url::Url::parse(&b).ok().and_then(|b| b.join(&url).ok())
+            .map(|u| u.to_string()).unwrap_or(url.clone()),
+        None => url.clone(),
+    };
+    let got = PAGE_NET.with(|n| {
+        n.borrow_mut().as_mut().map(|f| f.get(&abs))
+    });
+    match got {
+        Some(Ok(body)) => {
+            PAGE_FETCHES.with(|c| c.borrow_mut().0 += 1);
+            let o = ObjectInitializer::new(ctx)
+                .property(js_string!("ok"), true, Attribute::all())
+                .property(js_string!("status"), 200.0, Attribute::all())
+                .property(js_string!("url"), js_string!(abs), Attribute::all())
+                .property(js_string!("body"), js_string!(body), Attribute::all())
+                .build();
+            Ok(JsValue::from(o))
+        }
+        // Both "no network configured" and "request failed" reach the page as
+        // a rejected promise, which is what a browser does on a network error.
+        _ => { PAGE_FETCHES.with(|c| c.borrow_mut().1 += 1); Ok(JsValue::null()) }
+    }
+}
+
 fn ignore(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
     Ok(JsValue::undefined())
 }
@@ -555,6 +593,13 @@ pub const TIMER_HORIZON_MS: u32 = 5000;
 
 #[derive(Default)]
 pub struct BoaEngine {
+    /// ★ The PAGE's network, deliberately separate from the one used to fetch
+    /// scripts and modules. A page calling `fetch()` makes the converter issue
+    /// requests on its behalf — the same thing a browser does, but a distinct
+    /// concern from loading the page's own code, and one a deployment may want
+    /// to refuse independently. `None` means a page cannot reach the network
+    /// at all, which is also the default for tests.
+    pub page_fetcher: Option<Box<dyn crate::fetch::Fetcher>>,
     /// Root of the mirrored module graph; Boa's loader resolves against it.
     pub module_root: Option<std::path::PathBuf>,
     /// The document's own URL.
@@ -770,6 +815,33 @@ const GLOBALS: &str = r#"
     };
   }
 
+  // fetch over one synchronous native call, handed back as a settled promise.
+  // Response is the subset pages actually use; anything else is absent and
+  // will be named by the missing-API report rather than faked.
+  globalThis.fetch = function (input, init) {
+    var url = (input && typeof input === 'object' && input.url) ? input.url : String(input);
+    var r = __fetch_sync(url, init && init.method ? String(init.method) : 'GET');
+    if (!r) return Promise.reject(new TypeError('Failed to fetch: ' + url));
+    var resp = {
+      ok: true, status: r.status, statusText: 'OK', url: r.url,
+      redirected: false, type: 'basic', bodyUsed: false,
+      headers: { get: function () { return null; }, has: function () { return false; },
+                 forEach: function () {} },
+      text: function () { return Promise.resolve(r.body); },
+      json: function () {
+        try { return Promise.resolve(JSON.parse(r.body)); }
+        catch (e) { return Promise.reject(e); }
+      },
+      clone: function () { return resp; }
+    };
+    return Promise.resolve(resp);
+  };
+  globalThis.Request = function (url, init) { this.url = String(url); this.init = init; };
+  globalThis.Headers = function () {
+    this.get = function () { return null; }; this.has = function () { return false; };
+    this.set = function () {}; this.append = function () {};
+  };
+
   globalThis.navigator = {
     userAgent: 'atrium-navigator-prerender/0.1',
     language: 'en', languages: ['en'], onLine: true, cookieEnabled: false
@@ -915,10 +987,14 @@ impl ScriptEngine for BoaEngine {
         let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![],
             missing: vec![], nulls: vec![], first_error: None, cause: None, listeners_fired: 0,
             module_retries: 0, observers_registered: 0, layout_reads: 0,
-            timers_fired: 0, timers_dropped: 0 };
+            timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0 };
         RECORDING.with(|r| *r.borrow_mut() = false);
         let _ = ctx.register_global_callable(js_string!("__parse_url"), 2,
             NativeFunction::from_fn_ptr(parse_url));
+        let _ = ctx.register_global_callable(js_string!("__fetch_sync"), 2,
+            NativeFunction::from_fn_ptr(fetch_sync));
+        PAGE_NET.with(|n| *n.borrow_mut() = self.page_fetcher.take());
+        PAGE_FETCHES.with(|c| *c.borrow_mut() = (0, 0));
         let _ = ctx.register_global_property(js_string!("__doc_url"),
             js_string!(self.base_url.clone().unwrap_or_default()), Attribute::all());
         if let Err(e) = ctx.eval(Source::from_bytes(BOOTSTRAP.as_bytes())) {
@@ -1008,6 +1084,11 @@ impl ScriptEngine for BoaEngine {
 
         DOM.with(|d| *dom = std::mem::take(&mut d.borrow_mut()));
         rep.layout_reads = LAYOUT_READS.with(|n| *n.borrow());
+        let (pf, pfail) = PAGE_FETCHES.with(|c| *c.borrow());
+        rep.page_fetches = pf;
+        rep.page_fetch_failures = pfail;
+        // Hand the fetcher back so a caller may reuse the engine.
+        self.page_fetcher = PAGE_NET.with(|n| n.borrow_mut().take());
         rep.observers_registered = ctx
             .eval(Source::from_bytes(b"__observed"))
             .ok()

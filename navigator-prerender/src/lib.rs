@@ -36,6 +36,8 @@ pub struct Conversion {
     pub layout_reads: u32,
     pub timers_fired: u32,
     pub timers_dropped: u32,
+    pub page_fetches: u32,
+    pub page_fetch_failures: u32,
 }
 
 /// Parse, run the page's scripts once, and snapshot the result.
@@ -153,6 +155,8 @@ pub fn convert_with(
         layout_reads: rep.layout_reads,
         timers_fired: rep.timers_fired,
         timers_dropped: rep.timers_dropped,
+        page_fetches: rep.page_fetches,
+        page_fetch_failures: rep.page_fetch_failures,
         verdict,
         missing: rep.missing,
         first_error: rep.first_error,
