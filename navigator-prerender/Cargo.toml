@@ -15,7 +15,10 @@ description = "Tier-2 conversion instrument: run a page's scripts once, headless
 # `Date.toString()` — a page formatting a date gets garbage rather than an
 # error. 33 of the corpus's 566 fetched scripts use Intl.
 boa_engine = { version = "0.22", features = ["annex-b", "intl_bundled"] }
+fixed_decimal = "0.7.2"
 html5ever = "0.39"
+icu_experimental = "0.6.0"
+icu_locale_core = "2.3.0"
 markup5ever_rcdom = "0.39"
 url = "2"
 

@@ -488,6 +488,75 @@ fn document_write(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult
     Ok(JsValue::undefined())
 }
 
+/// `Intl.RelativeTimeFormat`, over REAL CLDR data.
+///
+/// ★ THIS ONE HAD TO BE RIGHT OR NOT AT ALL. Its corpus uses are GUARDED
+/// feature detections —
+///
+/// ```text
+/// function(){ try { return typeof Intl != "undefined" && !!Intl.RelativeTimeFormat }
+///             catch(e) { return false } }
+/// ```
+///
+/// — so libraries already detect its absence and fall back correctly today.
+/// A hand-written English implementation would flip those guards to true and
+/// route German and French pages through English patterns, making the output
+/// WORSE than the absence. boa does not implement it and its bundled ICU data
+/// carries no relative-time markers, so the data comes from icu_experimental,
+/// which rides the same ICU 2.3 stack boa already pulls in.
+///
+/// `__rtf(locale, unit, style, numeric, value)` -> formatted string, or null
+/// when the locale or unit is unsupported, so the JS side can report the
+/// absence rather than substitute a guess.
+fn rtf_format(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    use icu_experimental::relativetime::{RelativeTimeFormatter as R, RelativeTimeFormatterOptions,
+                                         options::Numeric};
+    let locale = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    let unit = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
+    let style = args.get_or_undefined(2).to_string(ctx)?.to_std_string_escaped();
+    let numeric = args.get_or_undefined(3).to_string(ctx)?.to_std_string_escaped();
+    let value = args.get_or_undefined(4).to_number(ctx)?;
+
+    let Ok(loc) = locale.parse::<icu_locale_core::Locale>() else { return Ok(JsValue::null()) };
+    let pref = (&loc).into();
+    // The options struct is non_exhaustive, so it is built from Default.
+    let mut opts = RelativeTimeFormatterOptions::default();
+    opts.numeric = if numeric == "auto" { Numeric::Auto } else { Numeric::Always };
+    // Plural and sign live in the VALUE, so it is formatted as a decimal and
+    // the CLDR pattern decides the wording.
+    let dec = fixed_decimal::Decimal::try_from_f64(
+        value, fixed_decimal::FloatPrecision::RoundTrip)
+        .unwrap_or(fixed_decimal::Decimal::from(0));
+
+    // Unit and length pick the constructor; there is one per pair.
+    macro_rules! pick {
+        ($($u:literal => ($l:ident, $s:ident, $n:ident)),* $(,)?) => {
+            match unit.trim_end_matches('s') {
+                $($u => match style.as_str() {
+                    "short" => R::$s(pref, opts).ok().map(|f| f.format(dec).to_string()),
+                    "narrow" => R::$n(pref, opts).ok().map(|f| f.format(dec).to_string()),
+                    _ => R::$l(pref, opts).ok().map(|f| f.format(dec).to_string()),
+                },)*
+                _ => None,
+            }
+        };
+    }
+    let out = pick! {
+        "year" => (try_new_long_year, try_new_short_year, try_new_narrow_year),
+        "quarter" => (try_new_long_quarter, try_new_short_quarter, try_new_narrow_quarter),
+        "month" => (try_new_long_month, try_new_short_month, try_new_narrow_month),
+        "week" => (try_new_long_week, try_new_short_week, try_new_narrow_week),
+        "day" => (try_new_long_day, try_new_short_day, try_new_narrow_day),
+        "hour" => (try_new_long_hour, try_new_short_hour, try_new_narrow_hour),
+        "minute" => (try_new_long_minute, try_new_short_minute, try_new_narrow_minute),
+        "second" => (try_new_long_second, try_new_short_second, try_new_narrow_second),
+    };
+    Ok(match out {
+        Some(s) => JsValue::from(js_string!(s)),
+        None => JsValue::null(),
+    })
+}
+
 /// `document.createDocumentFragment()`.
 fn create_fragment(_t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let h = with(|d| d.create(Kind::Fragment));
@@ -1895,6 +1964,55 @@ const GLOBALS: &str = r#"
       Intl[n] = Wrapped;
     });
 
+    // ── Intl.RelativeTimeFormat ─────────────────────────────────────
+    //
+    // boa does not implement it. Built here over REAL CLDR data through
+    // __rtf, not hand-written patterns: its corpus uses are guarded feature
+    // detections, so libraries fall back correctly when it is missing, and an
+    // English-only implementation would flip those guards and push English
+    // wording into German and French pages — worse than the absence.
+    //
+    // If the native side cannot serve a locale or unit it returns null, and
+    // the constructor REFUSES rather than substituting a guess, leaving the
+    // page's own fallback intact.
+    if (typeof Intl.RelativeTimeFormat !== 'function' && typeof __rtf === 'function') {
+      function RelativeTimeFormat(locales, options) {
+        options = options || {};
+        var loc = locales === undefined ? __docLocale
+                : (Array.isArray(locales) ? locales[0] : locales);
+        loc = String(loc);
+        var style = String(options.style || 'long');
+        var numeric = String(options.numeric || 'always');
+        // Prove the locale works before claiming to support it.
+        if (__rtf(loc, 'day', style, numeric, -1) === null) {
+          throw new RangeError('unsupported locale: ' + loc);
+        }
+        this.format = function (value, unit) {
+          var out = __rtf(loc, String(unit), style, numeric, Number(value));
+          if (out === null) throw new RangeError('unsupported unit: ' + unit);
+          return out;
+        };
+        // Enough of formatToParts for callers that join the pieces; the
+        // literal/number split is not reconstructed, and a caller reading
+        // parts[i].type gets one honest "literal" rather than a fake split.
+        this.formatToParts = function (value, unit) {
+          return [{ type: 'literal', value: this.format(value, unit) }];
+        };
+        this.resolvedOptions = function () {
+          return { locale: loc, style: style, numeric: numeric,
+                   numberingSystem: 'latn' };
+        };
+      }
+      RelativeTimeFormat.supportedLocalesOf = function (locales) {
+        var list = locales === undefined ? [] :
+                   (Array.isArray(locales) ? locales : [locales]);
+        return list.filter(function (l) {
+          return __rtf(String(l), 'day', 'long', 'always', -1) !== null;
+        });
+      };
+      Intl.RelativeTimeFormat = RelativeTimeFormat;
+    }
+
     // The prototype methods take their locale the same way.
     function defaulted(proto, name) {
       var orig = proto && proto[name];
@@ -2430,6 +2548,8 @@ impl ScriptEngine for BoaEngine {
             NativeFunction::from_fn_ptr(take_mutations));
         let _ = ctx.register_global_callable(js_string!("__is_ancestor"), 2,
             NativeFunction::from_fn_ptr(is_ancestor));
+        let _ = ctx.register_global_callable(js_string!("__rtf"), 5,
+            NativeFunction::from_fn_ptr(rtf_format));
         PAGE_NET.with(|n| *n.borrow_mut() = self.page_fetcher.take());
         PAGE_FETCHES.with(|c| *c.borrow_mut() = (0, 0));
         PAGE_BLOCKED.with(|b| { let mut b = b.borrow_mut(); b.0 = 0; b.1.clear(); });
