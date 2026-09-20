@@ -277,6 +277,53 @@ impl Dom {
         new
     }
 
+    // ── dataset ─────────────────────────────────────────────────────
+    //
+    // `data-*` attributes seen as properties. The name mapping is the whole
+    // substance: `el.dataset.fooBar` is the attribute `data-foo-bar`, and a
+    // dash followed by a letter uppercases it on the way back. Getting that
+    // backwards silently reads the wrong attribute rather than failing.
+
+    /// `fooBar` -> `data-foo-bar`.
+    pub fn data_attr_name(prop: &str) -> String {
+        let mut out = String::from("data-");
+        for c in prop.chars() {
+            if c.is_ascii_uppercase() { out.push('-'); out.push(c.to_ascii_lowercase()) }
+            else { out.push(c) }
+        }
+        out
+    }
+
+    /// `data-foo-bar` -> `fooBar`, or None if it is not a data attribute.
+    pub fn data_prop_name(attr: &str) -> Option<String> {
+        let rest = attr.strip_prefix("data-")?;
+        let mut out = String::new();
+        let mut up = false;
+        for c in rest.chars() {
+            if c == '-' { up = true; continue }
+            if up { out.extend(c.to_uppercase()); up = false } else { out.push(c) }
+        }
+        Some(out)
+    }
+
+    pub fn data_get(&self, h: Handle, prop: &str) -> Option<String> {
+        self.attr(h, &Self::data_attr_name(prop)).map(str::to_string)
+    }
+    pub fn data_set(&mut self, h: Handle, prop: &str, val: &str) {
+        let name = Self::data_attr_name(prop);
+        self.set_attr(h, &name, val);
+    }
+    pub fn data_remove(&mut self, h: Handle, prop: &str) {
+        let name = Self::data_attr_name(prop);
+        if let Some(n) = self.get_mut(h) { n.attrs.retain(|(k, _)| k != &name) }
+    }
+    /// Every data-* property currently on the element, in attribute order.
+    pub fn data_keys(&self, h: Handle) -> Vec<String> {
+        self.get(h).map(|n| n.attrs.iter()
+            .filter_map(|(k, _)| Self::data_prop_name(k))
+            .collect()).unwrap_or_default()
+    }
+
     /// Element count, the headline metric for a conversion.
     pub fn element_count(&self) -> usize {
         self.nodes.iter().filter(|n| matches!(n.kind, Kind::Element(_))).count()

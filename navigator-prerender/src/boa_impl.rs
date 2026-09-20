@@ -428,6 +428,8 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
         let _ = o.set(js_string!("classList"), cl, false, ctx);
         let st = style_obj(h, ctx);
         let _ = o.set(js_string!("style"), st, false, ctx);
+        let ds = dataset_obj(h, ctx);
+        let _ = o.set(js_string!("dataset"), ds, false, ctx);
         let cn = with(|d| d.class_list(h).join(" "));
         let _ = o.set(js_string!("className"), js_string!(cn), false, ctx);
     }
@@ -674,6 +676,98 @@ fn style_remove_property(this: &JsValue, args: &[JsValue], ctx: &mut Context) ->
         with(|d| { d.style_set(h, &p, ""); d.script_mutations += 1 });
     }
     Ok(JsValue::undefined())
+}
+
+/// `element.dataset` — live over the arena in both directions, so a write
+/// really sets the attribute and a read really sees one set elsewhere. A
+/// snapshot object would silently diverge the moment anything called
+/// setAttribute.
+fn dataset_obj(h: Handle, ctx: &mut Context) -> JsValue {
+    let target = ObjectInitializer::new(ctx)
+        .property(js_string!("__h"), h as f64, Attribute::all())
+        .build();
+    match boa_engine::object::builtins::JsProxy::builder(target.clone())
+        .get(dataset_get_trap)
+        .set(dataset_set_trap)
+        .has(dataset_has_trap)
+        .delete_property(dataset_delete_trap)
+        .own_keys(dataset_keys_trap)
+        .get_own_property_descriptor(dataset_desc_trap)
+        .build(ctx)
+    {
+        Ok(p) => JsValue::from(JsObject::from(p)),
+        Err(_) => JsValue::from(target),
+    }
+}
+
+fn dataset_handle(args: &[JsValue], ctx: &mut Context) -> JsResult<Handle> {
+    let target = args.get_or_undefined(0).as_object()
+        .ok_or_else(|| boa_engine::JsNativeError::typ().with_message("proxy target"))?;
+    Ok(target.get(js_string!("__h"), ctx)?.as_number().unwrap_or(0.0) as Handle)
+}
+
+fn dataset_get_trap(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let key = args.get_or_undefined(1).clone().to_property_key(ctx)?;
+    let name = key.to_string();
+    if name.starts_with("__") {
+        let target = args.get_or_undefined(0).as_object()
+            .ok_or_else(|| boa_engine::JsNativeError::typ().with_message("proxy target"))?;
+        return target.get(key, ctx);
+    }
+    let h = dataset_handle(args, ctx)?;
+    // An ABSENT data attribute is undefined, not "". Pages branch on it.
+    Ok(match with(|d| d.data_get(h, &name)) {
+        Some(v) => JsValue::from(js_string!(v)),
+        None => JsValue::undefined(),
+    })
+}
+
+fn dataset_set_trap(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let name = args.get_or_undefined(1).clone().to_property_key(ctx)?.to_string();
+    let val = args.get_or_undefined(2).to_string(ctx)?.to_std_string_escaped();
+    let h = dataset_handle(args, ctx)?;
+    with(|d| { d.data_set(h, &name, &val); d.script_mutations += 1 });
+    record_mutation("attributes", h, &Dom::data_attr_name(&name));
+    Ok(JsValue::from(true))
+}
+
+fn dataset_has_trap(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let name = args.get_or_undefined(1).clone().to_property_key(ctx)?.to_string();
+    let h = dataset_handle(args, ctx)?;
+    Ok(JsValue::from(with(|d| d.data_get(h, &name)).is_some()))
+}
+
+fn dataset_delete_trap(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let name = args.get_or_undefined(1).clone().to_property_key(ctx)?.to_string();
+    let h = dataset_handle(args, ctx)?;
+    with(|d| { d.data_remove(h, &name); d.script_mutations += 1 });
+    record_mutation("attributes", h, &Dom::data_attr_name(&name));
+    Ok(JsValue::from(true))
+}
+
+/// So `Object.keys(el.dataset)` and `for...in` enumerate the real set.
+fn dataset_keys_trap(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = dataset_handle(args, ctx)?;
+    let arr = boa_engine::object::builtins::JsArray::new(ctx)?;
+    for k in with(|d| d.data_keys(h)) { arr.push(JsValue::from(js_string!(k)), ctx)?; }
+    Ok(JsValue::from(arr))
+}
+
+/// ownKeys alone is not enough for `Object.keys`: the spec filters by the
+/// descriptor's enumerable flag, so without this every key is dropped and
+/// enumeration silently returns nothing.
+fn dataset_desc_trap(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let name = args.get_or_undefined(1).clone().to_property_key(ctx)?.to_string();
+    let h = dataset_handle(args, ctx)?;
+    Ok(match with(|d| d.data_get(h, &name)) {
+        Some(v) => JsValue::from(ObjectInitializer::new(ctx)
+            .property(js_string!("value"), js_string!(v), Attribute::all())
+            .property(js_string!("writable"), true, Attribute::all())
+            .property(js_string!("enumerable"), true, Attribute::all())
+            .property(js_string!("configurable"), true, Attribute::all())
+            .build()),
+        None => JsValue::undefined(),
+    })
 }
 
 fn style_obj(h: Handle, ctx: &mut Context) -> JsValue {
@@ -1328,6 +1422,13 @@ const GLOBALS: &str = r#"
       // replaces the location object, and a getter closed over `loc` would
       // keep reporting the URL the document was fetched from after the page
       // had rewritten it.
+      // `document.location` IS `location` in a browser. A getter, not a
+      // copy: history replaces the location object, and a copy taken here
+      // would go stale exactly when a page rewrites its own URL.
+      try { Object.defineProperty(document, 'location',
+        { get: function(){ return globalThis.location; },
+          set: function(){},            // assigning it is navigation
+          configurable: true }); } catch (e) {}
       try { Object.defineProperty(document, 'URL',
         { get: function(){ return globalThis.location ? globalThis.location.href : ''; },
           configurable: true }); } catch (e) {}
