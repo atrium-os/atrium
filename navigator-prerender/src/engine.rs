@@ -51,6 +51,9 @@ pub struct RunReport {
     /// The geometry observers count registrations because they deliver
     /// nothing; this one counts deliveries because it does.
     pub mutation_records: u32,
+    /// Custom elements actually UPGRADED — constructor run and
+    /// connectedCallback fired, not merely registered.
+    pub ce_upgrades: u32,
     /// Reads of a layout metric this converter cannot truthfully answer.
     pub layout_reads: u32,
     /// Timer callbacks dispatched, and those still pending at the horizon.

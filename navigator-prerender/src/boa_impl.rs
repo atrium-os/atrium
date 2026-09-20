@@ -1088,7 +1088,7 @@ const GLOBALS: &str = r#"
       __now = t.at;
       __tfired++;
       try { t.fn(); } catch (e) {}
-      __deliverMutations(4);
+      __deliverMutations(4); __upgradePending();
       if (t.every !== null && !__cleared[t.id]) {
         // A repeating timer is rescheduled, and the same bounds apply to it.
         __timers.push({ id: t.id, at: __now + Math.max(t.every, 1), seq: ++__tseq, fn: t.fn, every: t.every });
@@ -1387,6 +1387,121 @@ const GLOBALS: &str = r#"
     };
     return Promise.resolve(resp);
   };
+  // ── HTMLElement and custom elements ─────────────────────────────────
+  //
+  // Two different needs behind one name. Most corpus uses are
+  // `x instanceof HTMLElement` — a type TEST. One is `class X extends
+  // HTMLElement` — a base CONSTRUCTOR. A stub satisfies neither.
+  //
+  // instanceof is answered with Symbol.hasInstance rather than by plumbing a
+  // prototype chain onto the node wrappers: the wrappers are host proxies, so
+  // "is this an element" is a question the arena can answer directly and
+  // exactly (nodeType), where a faked prototype chain would be a second,
+  // divergent notion of what counts as an element.
+  var __upgradeTarget = null;
+  function HTMLElement() {
+    // A browser's HTMLElement constructor returns the element being upgraded,
+    // which is how `super()` inside a custom element's constructor binds
+    // `this` to the real element. Same mechanism here.
+    if (__upgradeTarget) { return __upgradeTarget; }
+    throw new TypeError('Illegal constructor');
+  }
+  function __isNode(v, type) {
+    if (!v || typeof v !== 'object') return false;
+    try { return type ? v.nodeType === type : typeof v.nodeType === 'number'; }
+    catch (e) { return false; }
+  }
+  function __defIface(name, fn, type) {
+    try {
+      Object.defineProperty(fn, Symbol.hasInstance,
+        { value: function (v) { return __isNode(v, type); } });
+    } catch (e) {}
+    globalThis[name] = fn;
+  }
+  __defIface('HTMLElement', HTMLElement, 1);
+  __defIface('Element', function Element() {}, 1);
+  __defIface('Node', function Node() {}, 0);
+  __defIface('HTMLDivElement', function HTMLDivElement() {}, 1);
+  __defIface('HTMLAnchorElement', function HTMLAnchorElement() {}, 1);
+  __defIface('HTMLInputElement', function HTMLInputElement() {}, 1);
+  __defIface('HTMLImageElement', function HTMLImageElement() {}, 1);
+  __defIface('DocumentFragment', function DocumentFragment() {}, 11);
+
+  // An element is upgraded only once it is CONNECTED, as the spec says —
+  // connectedCallback that fires on a detached node would be a lie about
+  // where the element is. Reachability is a question the tree can now answer.
+  function __connected(el) {
+    var p = el, n = 0;
+    while (p && n++ < 1000) { if (p.nodeType === 9) return true; p = p.parentNode; }
+    return false;
+  }
+
+  var __ceRegistry = {};
+  globalThis.__ceUpgrades = 0;
+  function __upgradeOne(el, ctor) {
+    if (el.__ce) return;
+    el.__ce = true;
+    __upgradeTarget = el;
+    try { Reflect.construct(ctor, [], ctor); }
+    catch (e) { __upgradeTarget = null; return; }
+    finally { __upgradeTarget = null; }
+    // Copy the class's own methods onto the element. A real custom element IS
+    // an instance of the class; ours is a host node the constructor ran
+    // against, so without this the page could not call the methods its own
+    // class defines. `this` inside them is the element either way.
+    try {
+      var proto = ctor.prototype;
+      Object.getOwnPropertyNames(proto).forEach(function (k) {
+        if (k === 'constructor' || k in el) return;
+        try { el[k] = proto[k]; } catch (e) {}
+      });
+    } catch (e) {}
+    globalThis.__ceUpgrades++;
+    // observedAttributes: report the attributes already present, which is the
+    // initial state a browser reports on upgrade.
+    try {
+      var obs = ctor.observedAttributes;
+      if (obs && proto.attributeChangedCallback) {
+        for (var i = 0; i < obs.length; i++) {
+          var v = el.getAttribute(obs[i]);
+          if (v !== null) proto.attributeChangedCallback.call(el, obs[i], null, v);
+        }
+      }
+    } catch (e) {}
+    try { if (proto.connectedCallback) proto.connectedCallback.call(el); } catch (e) {}
+  }
+  /// Upgrade everything registered that is connected and not yet upgraded.
+  /// Called wherever mutations are delivered, so elements added by a script
+  /// or a timer are upgraded too, not only those present at define() time.
+  globalThis.__upgradePending = function () {
+    for (var name in __ceRegistry) {
+      var els = document.getElementsByTagName(name);
+      for (var i = 0; i < els.length; i++) {
+        var el = els[i];
+        if (!el.__ce && __connected(el)) __upgradeOne(el, __ceRegistry[name]);
+      }
+    }
+  };
+  globalThis.customElements = {
+    define: function (name, ctor) {
+      name = String(name).toLowerCase();
+      if (__ceRegistry[name]) throw new Error('already defined: ' + name);
+      __ceRegistry[name] = ctor;
+      globalThis.__upgradePending();
+    },
+    get: function (name) { return __ceRegistry[String(name).toLowerCase()]; },
+    getName: function (c) {
+      for (var n in __ceRegistry) if (__ceRegistry[n] === c) return n;
+      return null;
+    },
+    upgrade: function () { globalThis.__upgradePending(); },
+    whenDefined: function (name) {
+      return __ceRegistry[String(name).toLowerCase()]
+        ? Promise.resolve(__ceRegistry[String(name).toLowerCase()])
+        : new Promise(function () {});   // never settles: it never will here
+    },
+  };
+
   // ── XMLHttpRequest ──────────────────────────────────────────────────
   //
   // Over the same page-network seam as fetch, so the same policy applies
@@ -1670,7 +1785,8 @@ impl ScriptEngine for BoaEngine {
         CURRENT.with(|c| *c.borrow_mut() = None);
         let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![],
             missing: vec![], nulls: vec![], first_error: None, cause: None, listeners_fired: 0,
-            module_retries: 0, observers_registered: 0, mutation_records: 0, layout_reads: 0,
+            module_retries: 0, observers_registered: 0, mutation_records: 0,
+            ce_upgrades: 0, layout_reads: 0,
             timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0,
             page_blocked: 0, blocked_hosts: vec![], beacons_suppressed: 0 };
         RECORDING.with(|r| *r.borrow_mut() = false);
@@ -1744,7 +1860,7 @@ impl ScriptEngine for BoaEngine {
             // script also means mutations made BEFORE an observer existed are
             // already drained, so a late-registering observer is not handed
             // history it never asked for.
-            let _ = ctx.eval(Source::from_bytes(b"__deliverMutations(8)"));
+            let _ = ctx.eval(Source::from_bytes(b"__deliverMutations(8); __upgradePending()"));
         }
         // No script is executing during the lifecycle pass.
         CURRENT.with(|c| *c.borrow_mut() = None);
@@ -1763,7 +1879,7 @@ impl ScriptEngine for BoaEngine {
         }
         // Mutations made by the lifecycle handlers, delivered before the
         // timer queue opens.
-        let _ = ctx.eval(Source::from_bytes(b"__deliverMutations(8)"));
+        let _ = ctx.eval(Source::from_bytes(b"__deliverMutations(8); __upgradePending()"));
         // Promise jobs queued by handlers (a bundle that awaits on ready).
         let _ = ctx.run_jobs();
 
@@ -1812,6 +1928,9 @@ impl ScriptEngine for BoaEngine {
             .ok()
             .and_then(|v| v.as_number())
             .unwrap_or(0.0) as u32;
+        rep.ce_upgrades = ctx
+            .eval(Source::from_bytes(b"__ceUpgrades"))
+            .ok().and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
         rep.observers_registered = ctx
             .eval(Source::from_bytes(b"__observed"))
             .ok()
