@@ -31,6 +31,7 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
         c.scripts_total, c.scripts_run, c.scripts_failed, c.script_mutations,
         c.external_total, c.external_fetched, c.module_retries,
         c.observers_registered);
+    println!("V\t{:?}", c.verdict);
     for e in c.errors.iter().take(8) {
         println!("E\t{}", e.replace('\t', " ").replace('\n', " "));
     }
@@ -78,6 +79,7 @@ fn main() {
     let mut timed_out = 0usize;
     let mut mod_retries = 0u32;
     let mut observers = 0u32;
+    let mut verdicts: BTreeMap<String, usize> = BTreeMap::new();
     let mut errors: BTreeMap<String, usize> = BTreeMap::new();
     let mut missing: BTreeMap<String, u32> = BTreeMap::new();
     let mut nulls: BTreeMap<String, u32> = BTreeMap::new();
@@ -93,6 +95,9 @@ fn main() {
             timed_out += 1;
             continue;
         };
+        if c.scripts_total > 0 && !c.verdict.is_empty() {
+            *verdicts.entry(c.verdict.clone()).or_default() += 1;
+        }
         mod_retries += c.module_retries;
         observers += c.observers;
         ext_total += c.external_total;
@@ -143,6 +148,28 @@ fn main() {
         for (k, n) in v.into_iter().take(20) {
             println!("  {n:5} hits  {:2} docs  {k}", missing_docs.get(&k).copied().unwrap_or(0));
         }
+    }
+    if !verdicts.is_empty() {
+        let g = |k: &str| verdicts.get(k).copied().unwrap_or(0);
+        let (ours, browser, unknown, clean) =
+            (g("OurGap"), g("BrowserToo"), g("Unknown"), g("Clean"));
+        let scripted = ours + browser + unknown + clean;
+        println!("VERDICT, by each document's FIRST failure (later ones may cascade)");
+        println!("  clean                {clean}");
+        println!("  OUR gap              {ours}");
+        println!("  browser would fail too {browser}   <- NOT a conversion failure");
+        println!("  unattributed         {unknown}");
+        // ★ A RANGE, not a point estimate. The unattributed bucket is the
+        // uncertainty, and quoting a single percentage would bury it — every
+        // unattributed document is one that might be reachable or might be a
+        // gap, and at this sample size there are enough of them to move the
+        // answer by tens of points.
+        let lo = if scripted > 0 { (clean + browser) * 100 / scripted } else { 0 };
+        let hi = if scripted > 0 { (clean + browser + unknown) * 100 / scripted } else { 0 };
+        println!("  -> tier-2 reachable: {lo}% to {hi}%  ({}/{scripted} known, +{unknown} unattributed)",
+            clean + browser);
+        println!("  ★ heuristic, not a browser diff. The spread IS the uncertainty:");
+        println!("    shrink it by attributing the unattributed, not by adding APIs.");
     }
     if !nulls.is_empty() {
         println!("LOOKUPS THAT FOUND NOTHING (an API we DO have, returning null)");
@@ -197,6 +224,7 @@ pub struct Child {
     pub errors: Vec<String>,
     pub missing: Vec<(String, u32)>,
     pub nulls: Vec<(String, u32)>,
+    pub verdict: String,
     pub module_retries: u32,
     pub observers: u32,
 }
@@ -204,7 +232,8 @@ pub struct Child {
 fn parse_child(s: &str) -> Option<Child> {
     let mut c = Child { elements_before: 0, elements_after: 0, scripts_total: 0,
         scripts_failed: 0, script_mutations: 0, external_total: 0, external_fetched: 0,
-        errors: vec![], missing: vec![], nulls: vec![], module_retries: 0, observers: 0 };
+        errors: vec![], missing: vec![], nulls: vec![], verdict: String::new(),
+        module_retries: 0, observers: 0 };
     let mut saw = false;
     for line in s.lines() {
         let f: Vec<&str> = line.split('\t').collect();
@@ -225,6 +254,7 @@ fn parse_child(s: &str) -> Option<Child> {
             Some(&"M") if f.len() >= 3 => {
                 c.missing.push((f[2].to_string(), f[1].parse().unwrap_or(1)));
             }
+            Some(&"V") if f.len() >= 2 => c.verdict = f[1].to_string(),
             Some(&"N") if f.len() >= 3 => {
                 c.nulls.push((f[2].to_string(), f[1].parse().unwrap_or(1)));
             }

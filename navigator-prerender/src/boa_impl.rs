@@ -587,8 +587,8 @@ impl ScriptEngine for BoaEngine {
         BASE.with(|b| *b.borrow_mut() = self.base_url.clone());
         CURRENT.with(|c| *c.borrow_mut() = None);
         let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![],
-            missing: vec![], nulls: vec![], listeners_fired: 0, module_retries: 0,
-            observers_registered: 0 };
+            missing: vec![], nulls: vec![], first_error: None, listeners_fired: 0,
+            module_retries: 0, observers_registered: 0 };
         RECORDING.with(|r| *r.borrow_mut() = false);
         let _ = ctx.register_global_callable(js_string!("__parse_url"), 2,
             NativeFunction::from_fn_ptr(parse_url));
@@ -632,7 +632,9 @@ impl ScriptEngine for BoaEngine {
                 None => rep.scripts_run += 1,
                 Some(msg) => {
                     rep.scripts_failed += 1;
-                    rep.errors.push(msg.chars().take(200).collect());
+                    let short: String = msg.chars().take(200).collect();
+                    if rep.first_error.is_none() { rep.first_error = Some(short.clone()); }
+                    rep.errors.push(short);
                 }
             }
         }

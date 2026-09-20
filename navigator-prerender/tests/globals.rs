@@ -181,3 +181,33 @@ fn null_lookups_are_attributed_and_the_cause_separated() {
     assert!(names.contains(&"querySelector-no-match(.absent)"), "got {names:?}");
     assert!(names.contains(&"querySelector-UNPARSEABLE(###)"), "got {names:?}");
 }
+
+/// The control arm: a document is classified by its FIRST failure, because
+/// later ones may cascade from it.
+#[test]
+fn verdicts_separate_our_gaps_from_failures_a_browser_shares() {
+    use navigator_prerender::Verdict;
+
+    // No failure at all.
+    let clean = convert("<html><body><script>var a=1;</script></body></html>",
+                        &mut BoaEngine::default());
+    assert_eq!(clean.verdict, Verdict::Clean);
+
+    // A missing binding is ours.
+    let ours = convert("<html><body><script>noSuchGlobal.go();</script></body></html>",
+                       &mut BoaEngine::default());
+    assert_eq!(ours.verdict, Verdict::OurGap, "{:?}", ours.first_error);
+
+    // Querying for an element this page does not contain, then using the
+    // null, is what a real browser does too.
+    let browser = convert(
+        "<html><body><p>only</p><script>document.querySelector('.absent').focus();</script></body></html>",
+        &mut BoaEngine::default());
+    assert_eq!(browser.verdict, Verdict::BrowserToo, "{:?}", browser.first_error);
+
+    // A selector WE cannot parse is ours, even though the symptom is a null.
+    let unparseable = convert(
+        "<html><body><script>document.querySelector('###').focus();</script></body></html>",
+        &mut BoaEngine::default());
+    assert_eq!(unparseable.verdict, Verdict::OurGap, "{:?}", unparseable.first_error);
+}

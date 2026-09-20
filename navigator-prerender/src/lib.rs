@@ -27,6 +27,8 @@ pub struct Conversion {
     pub errors: Vec<String>,
     pub missing: Vec<(String, u32)>,
     pub nulls: Vec<(String, u32)>,
+    pub first_error: Option<String>,
+    pub verdict: Verdict,
     pub listeners_fired: u32,
     pub module_retries: u32,
     pub observers_registered: u32,
@@ -143,6 +145,8 @@ pub fn convert_with(
         module_retries: rep.module_retries,
         observers_registered: rep.observers_registered,
         missing: rep.missing,
+        verdict: classify(rep.first_error.as_deref(), &rep.nulls),
+        first_error: rep.first_error,
         nulls: rep.nulls,
         errors: rep.errors,
     }
@@ -164,4 +168,56 @@ fn resolve(base: Option<&str>, href: &str) -> Option<String> {
 /// Back-compat: convert with no network and no base.
 pub fn convert(html: &str, engine: &mut dyn ScriptEngine) -> Conversion {
     convert_with(html, None, engine, &mut fetch::NoNetwork)
+}
+
+/// What a document's conversion outcome tells us about OUR coverage.
+///
+/// ★ Only the FIRST failure is classified. Once a script has thrown, later
+/// scripts may fail because the first one never defined what they use, so
+/// counting every failure conflates one gap with its consequences.
+///
+/// ★★ This is a heuristic, not a browser diff. A true control runs the same
+/// page in a real browser and compares; that is a much larger apparatus. The
+/// label is therefore "likely", and the categories are chosen so the
+/// uncertainty lands in `Unknown` rather than being hidden inside a verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Verdict {
+    /// Every script ran.
+    #[default]
+    Clean,
+    /// The first failure is a gap in this converter.
+    OurGap,
+    /// The first failure is one a real browser would also hit — typically a
+    /// site-wide bundle querying for elements absent from this page.
+    BrowserToo,
+    /// Cannot be attributed either way.
+    Unknown,
+}
+
+fn classify(first: Option<&str>, nulls: &[(String, u32)]) -> Verdict {
+    let Some(e) = first else { return Verdict::Clean };
+    // Our selector engine failing to parse is unambiguously ours.
+    if nulls.iter().any(|(k, _)| k.starts_with("querySelector-UNPARSEABLE")) {
+        return Verdict::OurGap;
+    }
+    // A null-conversion throw, where a lookup found nothing that the document
+    // genuinely does not contain, is what a browser would also do.
+    if e.contains("cannot convert 'null' or 'undefined'")
+        && nulls.iter().any(|(k, _)| {
+            k.starts_with("querySelector-no-match") || k.starts_with("getElementById")
+        })
+    {
+        return Verdict::BrowserToo;
+    }
+    // Missing bindings, syntax we cannot parse, imports we cannot resolve.
+    if e.contains("is not defined")
+        || e.contains("not a callable")
+        || e.contains("SyntaxError")
+        || e.contains("could not open file")
+        || e.contains("bare module specifier")
+        || e.contains("module pending")
+    {
+        return Verdict::OurGap;
+    }
+    Verdict::Unknown
 }

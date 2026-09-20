@@ -34,6 +34,9 @@ pub struct RunReport {
     /// Lookups that found nothing, by API and argument — the class the
     /// missing-API report cannot see.
     pub nulls: Vec<(String, u32)>,
+    /// The FIRST script failure, which is the only one that can be classified:
+    /// everything after it may be a cascade from it.
+    pub first_error: Option<String>,
     /// Lifecycle handlers actually invoked — registration is not the point.
     pub listeners_fired: u32,
     /// Scripts that parsed only after being retried as modules.
