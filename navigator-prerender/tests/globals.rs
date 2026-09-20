@@ -253,3 +253,39 @@ fn layout_metrics_are_nominal_consistent_and_counted() {
     assert!(c.html.contains(r#"rw="1280""#), "got {}", c.html);
     assert!(c.layout_reads >= 5, "reads must be counted, got {}", c.layout_reads);
 }
+
+/// ★ The converter's timezone is UTC, not the host machine's. Boa's default
+/// hook reports the local offset of whatever box is running, so this returned
+/// -330 (IST) here and would return something else elsewhere — baking the
+/// converter's location into the artifact and making the same document
+/// convert differently on two machines. Same decision as the fixed user agent
+/// and viewport: fixed identity, the converter's and not the reader's.
+#[test]
+fn timezone_is_utc_not_the_host_machines() {
+    let html = "<html><body><div id=t></div><script>\
+        document.getElementById('t').setAttribute('tz',\
+          String(new Date(0).getTimezoneOffset()));\
+        document.getElementById('t').setAttribute('s',\
+          new Date(0).toISOString());\
+        </script></body></html>";
+    let c = convert(html, &mut BoaEngine::default());
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.html.contains(r#"tz="0""#), "host timezone leaked: {}", c.html);
+    assert!(c.html.contains(r#"s="1970-01-01T00:00:00.000Z""#), "{}", c.html);
+}
+
+/// ★ Recorded absence, so it cannot be mistaken for a gap nobody noticed:
+/// there is no `Intl`. boa 0.22.0's `intl` feature pins ICU crates at
+/// versions that were never published, so it cannot be enabled at all. 33 of
+/// the corpus's fetched scripts use Intl. This test documents the state and
+/// will fail — deliberately — the day the feature becomes available.
+#[test]
+fn intl_is_absent_and_that_is_blocked_upstream() {
+    let html = "<html><body><div id=t></div><script>\
+        document.getElementById('t').setAttribute('i', typeof Intl);\
+        </script></body></html>";
+    let c = convert(html, &mut BoaEngine::default());
+    assert!(c.html.contains(r#"i="undefined""#),
+        "Intl became available — enable boa's intl feature and revisit \
+         toLocaleDateString, which currently degrades to Date.toString: {}", c.html);
+}

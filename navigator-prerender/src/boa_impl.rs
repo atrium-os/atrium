@@ -168,6 +168,25 @@ fn is_detection_probe(full: &str) -> bool {
     )
 }
 
+/// ★ THE CONVERTER'S TIMEZONE IS UTC, NOT THE HOST MACHINE'S.
+///
+/// Boa's default hook reports the local offset of whatever machine is
+/// running, so `new Date().getTimezoneOffset()` returned -330 here (IST) and
+/// would return something else on another box — baking the converter's
+/// location into the artifact. A conversion is amortised across many
+/// readers, none of whom are in that timezone, and the same document would
+/// convert differently on two machines.
+///
+/// This is the same decision already made for the user agent and the
+/// viewport: fixed identity, the converter's and not the reader's. UTC is
+/// the only offset that is nobody's local guess.
+#[derive(Debug)]
+struct FixedHooks;
+
+impl boa_engine::context::HostHooks for FixedHooks {
+    fn local_timezone_offset_seconds(&self, _unix_time_seconds: i64) -> i32 { 0 }
+}
+
 /// Wrap a host object so its misses are attributed.
 fn probed(obj: JsObject, kind: &str, ctx: &mut Context) -> JsValue {
     let _ = obj.set(js_string!("__kind"), js_string!(kind.to_string()), false, ctx);
@@ -2227,14 +2246,16 @@ impl ScriptEngine for BoaEngine {
         DOC_WRITE.with(|c| *c.borrow_mut() = (0, 0));
         WRITE_POS.with(|m| m.borrow_mut().clear());
         DOM.with(|d| *d.borrow_mut() = std::mem::take(dom));
+        let hooks = std::rc::Rc::new(FixedHooks);
         let mut ctx = match self.module_root.as_ref()
             .and_then(|r| boa_engine::module::SimpleModuleLoader::new(r).ok())
         {
             Some(loader) => Context::builder()
                 .module_loader(std::rc::Rc::new(loader))
+                .host_hooks(hooks.clone())
                 .build()
                 .unwrap_or_default(),
-            None => Context::default(),
+            None => Context::builder().host_hooks(hooks).build().unwrap_or_default(),
         };
 
         let body = with(|d| d.by_tag("body").first().copied()).unwrap_or(0);
