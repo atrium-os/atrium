@@ -45,6 +45,13 @@ thread_local! {
     static EVENTS: RefCell<Vec<(&'static str, String)>> = const { RefCell::new(Vec::new()) };
     /// How often the page read a layout metric we cannot truthfully answer.
     static LAYOUT_READS: RefCell<u32> = const { RefCell::new(0) };
+    /// ★ Mutations, recorded as they happen. Unlike the geometry observers,
+    /// this one can be served HONESTLY: a converter has no layout to report,
+    /// but it does have real mutations. Every mutation already passes through
+    /// a host function, so the log is exact rather than inferred.
+    /// (kind, target handle, attribute name)
+    static MUTATIONS: RefCell<Vec<(&'static str, Handle, String)>> =
+        const { RefCell::new(Vec::new()) };
     /// The page's fetcher, parked here for the duration of a run so native
     /// functions can reach it without capturing state the engine's GC traces.
     static PAGE_NET: RefCell<Option<Box<dyn crate::fetch::Fetcher>>> =
@@ -275,6 +282,7 @@ fn cl_add(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsVal
     if let Some(h) = handle_of(this, ctx) {
         let names = cl_args(args, ctx);
         with(|d| { d.class_add(h, &names); d.script_mutations += 1 });
+        record_mutation("attributes", h, "class");
     }
     Ok(JsValue::undefined())
 }
@@ -282,6 +290,7 @@ fn cl_remove(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
     if let Some(h) = handle_of(this, ctx) {
         let names = cl_args(args, ctx);
         with(|d| { d.class_remove(h, &names); d.script_mutations += 1 });
+        record_mutation("attributes", h, "class");
     }
     Ok(JsValue::undefined())
 }
@@ -373,6 +382,7 @@ fn style_set_property(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> Js
     let v = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
     if let Some(h) = handle_of(this, ctx) {
         with(|d| { d.style_set(h, &p, &v); d.script_mutations += 1 });
+        record_mutation("attributes", h, "style");
     }
     Ok(JsValue::undefined())
 }
@@ -487,6 +497,48 @@ fn fetch_sync(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
     }
 }
 
+fn record_mutation(kind: &'static str, h: Handle, name: &str) {
+    MUTATIONS.with(|m| {
+        let mut m = m.borrow_mut();
+        // Bounded: a mutation-driven observer can otherwise feed itself.
+        if m.len() < 10_000 { m.push((kind, h, name.to_string())) }
+    });
+}
+
+/// Hand the pending records to JS and clear the log.
+fn take_mutations(_t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let recs = MUTATIONS.with(|m| std::mem::take(&mut *m.borrow_mut()));
+    let arr = boa_engine::object::builtins::JsArray::new(ctx)?;
+    for (kind, h, name) in recs {
+        let target = node_obj(h, ctx);
+        let o = ObjectInitializer::new(ctx)
+            .property(js_string!("type"), js_string!(kind.to_string()), Attribute::all())
+            .property(js_string!("target"), target, Attribute::all())
+            .property(js_string!("__th"), h as f64, Attribute::all())
+            .property(js_string!("attributeName"),
+                if name.is_empty() { JsValue::null() } else { JsValue::from(js_string!(name)) },
+                Attribute::all())
+            .build();
+        arr.push(JsValue::from(o), ctx)?;
+    }
+    Ok(JsValue::from(arr))
+}
+
+/// Subtree matching needs ancestry, and the arena is the only thing that
+/// knows it.
+fn is_ancestor(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let a = args.get_or_undefined(0).to_number(ctx)? as Handle;
+    let b = args.get_or_undefined(1).to_number(ctx)? as Handle;
+    Ok(JsValue::from(with(|d| {
+        let mut cur = d.get(b).and_then(|n| n.parent);
+        while let Some(p) = cur {
+            if p == a { return true }
+            cur = d.get(p).and_then(|n| n.parent);
+        }
+        false
+    })))
+}
+
 fn ignore(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
     Ok(JsValue::undefined())
 }
@@ -495,6 +547,7 @@ fn append_child(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult
     let (p, c) = (handle_of(this, ctx), handle_of(args.get_or_undefined(0), ctx));
     if let (Some(p), Some(c)) = (p, c) {
         with(|d| { if d.append(p, c) { d.script_mutations += 1; } });
+        record_mutation("childList", p, "");
     }
     Ok(args.get_or_undefined(0).clone())
 }
@@ -504,6 +557,7 @@ fn set_attribute(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResul
         let k = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
         let v = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
         with(|d| { d.set_attr(h, &k, &v); d.script_mutations += 1; });
+        record_mutation("attributes", h, &k);
     }
     Ok(JsValue::undefined())
 }
@@ -529,6 +583,7 @@ fn set_text(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
     if let Some(h) = handle_of(this, ctx) {
         let t = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
         with(|d| { d.set_text(h, &t); d.script_mutations += 1; });
+        record_mutation("characterData", h, "");
     }
     Ok(JsValue::undefined())
 }
@@ -754,6 +809,7 @@ const GLOBALS: &str = r#"
       __now = t.at;
       __tfired++;
       try { t.fn(); } catch (e) {}
+      __deliverMutations(4);
       if (t.every !== null && !__cleared[t.id]) {
         // A repeating timer is rescheduled, and the same bounds apply to it.
         __timers.push({ id: t.id, at: __now + Math.max(t.every, 1), seq: ++__tseq, fn: t.fn, every: t.every });
@@ -763,6 +819,89 @@ const GLOBALS: &str = r#"
     return __tfired;
   };
   globalThis.__timerStats = function () { return [__tfired, __tdropped]; };
+
+  // ★ THE ONE OBSERVER A CONVERTER CAN SERVE HONESTLY.
+  //
+  // ResizeObserver and IntersectionObserver report LAYOUT, which this
+  // converter does not perform, so anything it delivered would be invented —
+  // hence accept-and-never-deliver above. MutationObserver reports DOM
+  // MUTATIONS, and those are real here: every mutation goes through a host
+  // function, so the record log is exact rather than inferred. It is
+  // therefore implemented for real, not stubbed.
+  //
+  // The one place fidelity is deliberately lower than a browser's: records
+  // carry the mutated node and attribute name, but not addedNodes /
+  // removedNodes / oldValue, which the arena does not retain. Scripts that
+  // branch on those get empty lists rather than wrong ones.
+  var __mos = [];
+  globalThis.__moDelivered = 0;
+  function MutationObserver(cb) {
+    var self = this;
+    self._cb = cb; self._targets = []; self._queue = [];
+    __mos.push(self);
+    self.observe = function (target, opts) {
+      opts = opts || {};
+      // `document` is a common target and is not itself a node object here;
+      // its documentElement stands in, which observes the same subtree.
+      var h = (target && target.__h !== undefined) ? target.__h
+            : (target && target.documentElement ? target.documentElement.__h
+                                                : undefined);
+      self._targets.push({
+        h: h,
+        subtree: !!opts.subtree,
+        childList: !!opts.childList,
+        attributes: !!opts.attributes || !!opts.attributeFilter,
+        characterData: !!opts.characterData,
+        filter: opts.attributeFilter || null,
+      });
+    };
+    self.unobserve = function () {};
+    self.disconnect = function () { self._targets = []; self._queue = []; };
+    self.takeRecords = function () { var q = self._queue; self._queue = []; return q; };
+    self._match = function (r) {
+      for (var i = 0; i < self._targets.length; i++) {
+        var t = self._targets[i];
+        if (t.h === undefined) continue;
+        if (r.type === 'childList' && !t.childList) continue;
+        if (r.type === 'attributes' && !t.attributes) continue;
+        if (r.type === 'characterData' && !t.characterData) continue;
+        if (r.type === 'attributes' && t.filter &&
+            t.filter.indexOf(r.attributeName) < 0) continue;
+        if (t.h === r.__th) return true;
+        if (t.subtree && __is_ancestor(t.h, r.__th)) return true;
+      }
+      return false;
+    };
+  }
+  globalThis.MutationObserver = MutationObserver;
+  globalThis.WebKitMutationObserver = MutationObserver;
+
+  // Deliver pending records to whoever asked for them. Bounded rounds,
+  // because a callback that mutates feeds itself more records; a browser is
+  // bounded by the microtask checkpoint rather than a count, but an
+  // unbounded loop here would be a hang, not a fidelity win.
+  globalThis.__deliverMutations = function (rounds) {
+    for (var n = 0; n < (rounds || 8); n++) {
+      var recs = __take_mutations();
+      if (!recs.length) return;
+      var any = false;
+      for (var i = 0; i < __mos.length; i++) {
+        var mo = __mos[i];
+        if (!mo._targets.length) continue;
+        for (var j = 0; j < recs.length; j++) {
+          if (mo._match(recs[j])) { mo._queue.push(recs[j]); any = true; }
+        }
+      }
+      if (!any) return;
+      for (var i = 0; i < __mos.length; i++) {
+        var mo = __mos[i];
+        if (!mo._queue.length) continue;
+        var q = mo._queue; mo._queue = [];
+        globalThis.__moDelivered += q.length;
+        try { mo._cb(q, mo); } catch (e) {}
+      }
+    }
+  };
 
   var __tick = 0;
   globalThis.performance = {
@@ -1124,7 +1263,7 @@ impl ScriptEngine for BoaEngine {
         CURRENT.with(|c| *c.borrow_mut() = None);
         let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![],
             missing: vec![], nulls: vec![], first_error: None, cause: None, listeners_fired: 0,
-            module_retries: 0, observers_registered: 0, layout_reads: 0,
+            module_retries: 0, observers_registered: 0, mutation_records: 0, layout_reads: 0,
             timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0,
             page_blocked: 0, blocked_hosts: vec![], beacons_suppressed: 0 };
         RECORDING.with(|r| *r.borrow_mut() = false);
@@ -1132,9 +1271,14 @@ impl ScriptEngine for BoaEngine {
             NativeFunction::from_fn_ptr(parse_url));
         let _ = ctx.register_global_callable(js_string!("__fetch_sync"), 2,
             NativeFunction::from_fn_ptr(fetch_sync));
+        let _ = ctx.register_global_callable(js_string!("__take_mutations"), 0,
+            NativeFunction::from_fn_ptr(take_mutations));
+        let _ = ctx.register_global_callable(js_string!("__is_ancestor"), 2,
+            NativeFunction::from_fn_ptr(is_ancestor));
         PAGE_NET.with(|n| *n.borrow_mut() = self.page_fetcher.take());
         PAGE_FETCHES.with(|c| *c.borrow_mut() = (0, 0));
         PAGE_BLOCKED.with(|b| { let mut b = b.borrow_mut(); b.0 = 0; b.1.clear(); });
+        MUTATIONS.with(|m| m.borrow_mut().clear());
         let _ = ctx.register_global_property(js_string!("__doc_url"),
             js_string!(self.base_url.clone().unwrap_or_default()), Attribute::all());
         if let Err(e) = ctx.eval(Source::from_bytes(BOOTSTRAP.as_bytes())) {
@@ -1185,6 +1329,12 @@ impl ScriptEngine for BoaEngine {
                     rep.errors.push(short);
                 }
             }
+            // A browser reaches a microtask checkpoint between scripts, and
+            // that is where mutation records are delivered. Doing it per
+            // script also means mutations made BEFORE an observer existed are
+            // already drained, so a late-registering observer is not handed
+            // history it never asked for.
+            let _ = ctx.eval(Source::from_bytes(b"__deliverMutations(8)"));
         }
         // No script is executing during the lifecycle pass.
         CURRENT.with(|c| *c.borrow_mut() = None);
@@ -1201,6 +1351,9 @@ impl ScriptEngine for BoaEngine {
             }
             Err(e) => rep.errors.push(format!("lifecycle: {e}")),
         }
+        // Mutations made by the lifecycle handlers, delivered before the
+        // timer queue opens.
+        let _ = ctx.eval(Source::from_bytes(b"__deliverMutations(8)"));
         // Promise jobs queued by handlers (a bundle that awaits on ready).
         let _ = ctx.run_jobs();
 
@@ -1237,6 +1390,11 @@ impl ScriptEngine for BoaEngine {
             .and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
         // Hand the fetcher back so a caller may reuse the engine.
         self.page_fetcher = PAGE_NET.with(|n| n.borrow_mut().take());
+        rep.mutation_records = ctx
+            .eval(Source::from_bytes(b"__moDelivered"))
+            .ok()
+            .and_then(|v| v.as_number())
+            .unwrap_or(0.0) as u32;
         rep.observers_registered = ctx
             .eval(Source::from_bytes(b"__observed"))
             .ok()

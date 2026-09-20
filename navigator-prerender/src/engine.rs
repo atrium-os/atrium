@@ -47,6 +47,10 @@ pub struct RunReport {
     /// Geometry observations registered and deliberately never delivered —
     /// the visible cost of performing no layout.
     pub observers_registered: u32,
+    /// Mutation records actually DELIVERED to a MutationObserver callback.
+    /// The geometry observers count registrations because they deliver
+    /// nothing; this one counts deliveries because it does.
+    pub mutation_records: u32,
     /// Reads of a layout metric this converter cannot truthfully answer.
     pub layout_reads: u32,
     /// Timer callbacks dispatched, and those still pending at the horizon.

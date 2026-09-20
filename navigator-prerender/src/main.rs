@@ -40,6 +40,7 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
         c.external_total, c.external_fetched, c.module_retries,
         c.observers_registered);
     println!("L\t{}", c.layout_reads);
+    println!("O\t{}\t{}", c.observers_registered, c.mutation_records);
     println!("T\t{}\t{}", c.timers_fired, c.timers_dropped);
     println!("P\t{}\t{}\t{}\t{}", c.page_fetches, c.page_fetch_failures,
         c.page_blocked, c.beacons_suppressed);
@@ -96,6 +97,8 @@ fn main() {
     let mut mod_retries = 0u32;
     let mut observers = 0u32;
     let mut layout_reads = 0u32;
+    let mut mo_records = 0u32;
+    let mut mo_docs = 0usize;
     let (mut t_fired, mut t_dropped, mut t_docs) = (0u32, 0u32, 0usize);
     let (mut pf, mut pff, mut pf_docs) = (0u32, 0u32, 0usize);
     let (mut pblk, mut pbeac) = (0u32, 0u32);
@@ -130,6 +133,8 @@ fn main() {
         mod_retries += c.module_retries;
         observers += c.observers;
         layout_reads += c.layout_reads;
+        mo_records += c.mutation_records;
+        if c.mutation_records > 0 { mo_docs += 1; }
         pf += c.page_fetches; pff += c.page_fetch_failures;
         pblk += c.page_blocked; pbeac += c.beacons;
         for (k, n) in &c.blocked_hosts { *blocked_where.entry(k.clone()).or_default() += n; }
@@ -176,6 +181,9 @@ fn main() {
     }
     if t_fired > 0 || t_dropped > 0 {
         println!("  timer callbacks fired: {t_fired} in {t_docs} docs; {t_dropped} still pending at the horizon");
+    }
+    if mo_records > 0 {
+        println!("  mutation records DELIVERED (real, not invented): {mo_records} in {mo_docs} docs");
     }
     if layout_reads > 0 {
         println!("  layout metrics read (no layout exists — nominal values): {layout_reads} in {layout_docs} docs");
@@ -289,6 +297,7 @@ pub struct Child {
     pub module_retries: u32,
     pub observers: u32,
     pub layout_reads: u32,
+    pub mutation_records: u32,
     pub timers_fired: u32,
     pub timers_dropped: u32,
     pub page_fetches: u32,
@@ -303,7 +312,7 @@ fn parse_child(s: &str) -> Option<Child> {
         scripts_failed: 0, script_mutations: 0, external_total: 0, external_fetched: 0,
         errors: vec![], missing: vec![], nulls: vec![], verdict: String::new(),
         first_error: None,
-        module_retries: 0, observers: 0, layout_reads: 0,
+        module_retries: 0, observers: 0, layout_reads: 0, mutation_records: 0,
         timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0,
         page_blocked: 0, beacons: 0, blocked_hosts: vec![] };
     let mut saw = false;
@@ -327,6 +336,10 @@ fn parse_child(s: &str) -> Option<Child> {
                 c.missing.push((f[2].to_string(), f[1].parse().unwrap_or(1)));
             }
             Some(&"L") if f.len() >= 2 => c.layout_reads = f[1].parse().unwrap_or(0),
+            Some(&"O") if f.len() >= 3 => {
+                c.observers = f[1].parse().unwrap_or(0);
+                c.mutation_records = f[2].parse().unwrap_or(0);
+            }
             Some(&"P") if f.len() >= 5 => {
                 c.page_fetches = f[1].parse().unwrap_or(0);
                 c.page_fetch_failures = f[2].parse().unwrap_or(0);
