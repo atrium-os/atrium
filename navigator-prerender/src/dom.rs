@@ -155,12 +155,43 @@ fn escape(t: &str) -> String {
     t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-/// Scripts found in document order, paired with the handle they came from.
+/// Inline scripts in document order.
+///
+/// ★ The `type` filter is load-bearing and was missing at first: a real corpus
+/// run reported 9 `SyntaxError: expected token ';'` because every `<script>`
+/// without `src` was being executed — including `application/ld+json`
+/// metadata blocks, which are data, not programs. Feeding those to the engine
+/// manufactures failures that look like engine gaps and are nothing of the
+/// kind. Only script types that are actually JavaScript are run.
 pub fn inline_scripts(d: &Dom) -> Vec<String> {
     d.by_tag("script").into_iter()
         .filter(|&h| d.attr(h, "src").is_none())
+        .filter(|&h| match d.attr(h, "type") {
+            None => true,
+            Some(t) => {
+                let t = t.trim().to_ascii_lowercase();
+                let t = t.split(';').next().unwrap_or("").trim().to_string();
+                matches!(t.as_str(),
+                    "" | "text/javascript" | "application/javascript"
+                    | "text/ecmascript" | "application/ecmascript" | "module")
+            }
+        })
         .map(|h| d.text_content(h))
         .filter(|s| !s.trim().is_empty())
+        .collect()
+}
+
+/// Script elements present but NOT run, by type — what a conversion skipped.
+pub fn skipped_script_types(d: &Dom) -> Vec<String> {
+    d.by_tag("script").into_iter()
+        .filter(|&h| d.attr(h, "src").is_none())
+        .filter_map(|h| d.attr(h, "type").map(|t| t.to_string()))
+        .filter(|t| {
+            let t = t.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+            !matches!(t.as_str(),
+                "" | "text/javascript" | "application/javascript"
+                | "text/ecmascript" | "application/ecmascript" | "module")
+        })
         .collect()
 }
 

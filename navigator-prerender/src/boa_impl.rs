@@ -152,6 +152,20 @@ impl ScriptEngine for BoaEngine {
             .build();
         let _ = ctx.register_global_property(js_string!("window"), win, Attribute::all());
 
+        // `console` is a no-op sink. Named by the corpus report, and a script
+        // that logs should not be recorded as a conversion failure.
+        fn noop(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+            Ok(JsValue::undefined())
+        }
+        let console = ObjectInitializer::new(&mut ctx)
+            .function(NativeFunction::from_fn_ptr(noop), js_string!("log"), 1)
+            .function(NativeFunction::from_fn_ptr(noop), js_string!("warn"), 1)
+            .function(NativeFunction::from_fn_ptr(noop), js_string!("error"), 1)
+            .function(NativeFunction::from_fn_ptr(noop), js_string!("info"), 1)
+            .function(NativeFunction::from_fn_ptr(noop), js_string!("debug"), 1)
+            .build();
+        let _ = ctx.register_global_property(js_string!("console"), console, Attribute::all());
+
         let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![] };
         for s in scripts {
             match ctx.eval(Source::from_bytes(s.as_bytes())) {

@@ -83,3 +83,29 @@ fn inline_scripts_are_found_in_order_and_src_skipped() {
     assert_eq!(s.len(), 2);
     assert!(s[0].contains('1') && s[1].contains('2'));
 }
+
+/// A real corpus run reported 9 syntax errors that were not engine gaps at
+/// all: `application/ld+json` metadata blocks were being executed as script.
+/// Data is not a program.
+#[test]
+fn non_javascript_script_types_are_not_executed() {
+    let html = r#"<html><body>
+      <script type="application/ld+json">{"@context":"https://schema.org","name":"x"}</script>
+      <script type="text/template"><div>{{not js}}</div></script>
+      <script>document.body.setAttribute('ran','yes');</script>
+      </body></html>"#;
+    let d = navigator_prerender::parse::parse(html);
+    assert_eq!(navigator_prerender::dom::inline_scripts(&d).len(), 1,
+        "only the real script should run");
+    assert_eq!(navigator_prerender::dom::skipped_script_types(&d).len(), 2);
+    let c = convert(html, &mut BoaEngine);
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.html.contains(r#"ran="yes""#), "got: {}", c.html);
+}
+
+#[test]
+fn console_is_a_sink_not_a_failure() {
+    let html = "<html><body><script>console.log('x');console.warn('y');</script></body></html>";
+    let c = convert(html, &mut BoaEngine);
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+}
