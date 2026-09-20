@@ -484,6 +484,90 @@ fn by_name(_t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> 
     handles_to_array(hs, ctx)
 }
 
+/// The URL decomposition a hyperlink element carries: `href`, and the parts
+/// of it. Only `<a>`, `<area>`, `<link>` and `<base>` have these in a browser
+/// — on anything else they are undefined, and reporting them everywhere
+/// would answer a feature detection wrongly.
+fn is_hyperlink(h: Handle) -> bool {
+    with(|d| d.tag(h).map(|t| matches!(t.to_ascii_lowercase().as_str(),
+        "a" | "area" | "link" | "base")).unwrap_or(false))
+}
+
+/// Resolve the element's `href` against the document URL, the way a browser
+/// reports it: the PROPERTY is absolute even when the attribute is relative.
+fn hyperlink_url(h: Handle) -> Option<url::Url> {
+    let raw = with(|d| d.attr(h, "href").map(str::to_string))?;
+    let base = BASE.with(|b| b.borrow().clone());
+    match base.and_then(|b| url::Url::parse(&b).ok()) {
+        Some(b) => b.join(&raw).ok(),
+        None => url::Url::parse(&raw).ok(),
+    }
+}
+
+/// Every part is "" when there is no resolvable href, which is what a browser
+/// reports for `<a>` without one — not undefined, and not a throw.
+fn hyperlink_part(this: &JsValue, part: &str, ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(this, ctx) else { return Ok(JsValue::from(js_string!(""))) };
+    let Some(u) = hyperlink_url(h) else { return Ok(JsValue::from(js_string!(""))) };
+    let v = match part {
+        "href" => u.to_string(),
+        // Includes the colon, as the DOM says: "https:" not "https".
+        "protocol" => format!("{}:", u.scheme()),
+        "host" => match u.port() {
+            Some(p) => format!("{}:{}", u.host_str().unwrap_or(""), p),
+            None => u.host_str().unwrap_or("").to_string(),
+        },
+        "hostname" => u.host_str().unwrap_or("").to_string(),
+        "port" => u.port().map(|p| p.to_string()).unwrap_or_default(),
+        "pathname" => u.path().to_string(),
+        // Leading "?" and "#" are part of the value, and EMPTY when absent.
+        "search" => u.query().map(|q| format!("?{q}")).unwrap_or_default(),
+        "hash" => u.fragment().map(|f| format!("#{f}")).unwrap_or_default(),
+        "origin" => u.origin().ascii_serialization(),
+        _ => String::new(),
+    };
+    Ok(JsValue::from(js_string!(v)))
+}
+
+macro_rules! hyperlink_getter {
+    ($name:ident, $part:literal) => {
+        fn $name(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+            hyperlink_part(t, $part, ctx)
+        }
+    };
+}
+hyperlink_getter!(hl_href, "href");
+hyperlink_getter!(hl_protocol, "protocol");
+hyperlink_getter!(hl_host, "host");
+hyperlink_getter!(hl_hostname, "hostname");
+hyperlink_getter!(hl_port, "port");
+hyperlink_getter!(hl_pathname, "pathname");
+hyperlink_getter!(hl_search, "search");
+hyperlink_getter!(hl_hash, "hash");
+hyperlink_getter!(hl_origin, "origin");
+
+/// Assigning `href` writes the ATTRIBUTE, so the artifact carries it and the
+/// parts recompute from it. A plain property would diverge from the markup.
+fn hl_set_href(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(t, ctx) else { return Ok(JsValue::undefined()) };
+    let v = a.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    with(|d| { d.set_attr(h, "href", &v); d.script_mutations += 1 });
+    record_mutation("attributes", h, "href");
+    Ok(JsValue::undefined())
+}
+
+fn install_hyperlink(o: &JsObject, ctx: &mut Context) {
+    live_get_set(o, "href", hl_href, hl_set_href, ctx);
+    for (n, f) in [
+        ("protocol", hl_protocol as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("host", hl_host), ("hostname", hl_hostname), ("port", hl_port),
+        ("pathname", hl_pathname), ("search", hl_search), ("hash", hl_hash),
+        ("origin", hl_origin),
+    ] {
+        live_get(o, n, f, ctx);
+    }
+}
+
 fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
     if let Some(v) = NODE_CACHE.with(|c| c.borrow().get(&h).cloned()) { return v }
     let tag = with(|d| d.tag(h).map(|s| s.to_string())).unwrap_or_default();
@@ -535,6 +619,7 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
                       f.to_js_function(ctx.realm()), false, ctx);
     }
     install_tree(&o, ctx);
+    if is_hyperlink(h) { install_hyperlink(&o, ctx); }
     let v = probed(o, "element", ctx);
     NODE_CACHE.with(|c| c.borrow_mut().insert(h, v.clone()));
     v
