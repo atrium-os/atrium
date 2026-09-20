@@ -85,6 +85,11 @@ thread_local! {
     /// rules against it. Same lesson as NODE_CACHE, and it must be cleared
     /// the same way at both ends of a run.
     static SHEET_CACHE: RefCell<HashMap<Handle, JsValue>> = RefCell::new(HashMap::new());
+    /// `el.onclick = fn` — the handler SLOT, separate from addEventListener
+    /// because assigning replaces where adding appends, and reading back an
+    /// unset one must give null rather than undefined.
+    static ONHANDLERS: RefCell<HashMap<(Handle, String), JsValue>> =
+        RefCell::new(HashMap::new());
     /// (dispatches, listener invocations) on ELEMENTS.
     static DISPATCH: RefCell<(u32, u32)> = const { RefCell::new((0, 0)) };
     /// (writes applied, writes refused because they would erase the document)
@@ -883,6 +888,40 @@ fn hl_set_href(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
     Ok(JsValue::undefined())
 }
 
+/// `rel`, reflected. The PROPERTY and the ATTRIBUTE are one value: a page
+/// that sets `link.rel = 'stylesheet'` must then be found by
+/// `document.styleSheets`, which reads the attribute.
+fn rel_get(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(t, ctx) else { return Ok(JsValue::from(js_string!(""))) };
+    Ok(JsValue::from(js_string!(with(|d| d.attr(h, "rel").unwrap_or("").to_string()))))
+}
+fn rel_set(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(t, ctx) else { return Ok(JsValue::undefined()) };
+    let v = a.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    with(|d| { d.set_attr(h, "rel", &v); d.script_mutations += 1 });
+    record_mutation("attributes", h, "rel");
+    Ok(JsValue::undefined())
+}
+
+/// `element.contentWindow`.
+///
+/// ★ NULL IS THE TRUE ANSWER, and it is not the same as absent. Every corpus
+/// use is the hidden-iframe trick — `frame.contentWindow.Object.prototype`,
+/// `frame.contentWindow.document` — reaching for a PRISTINE REALM to borrow
+/// clean prototypes from. This converter creates no child browsing contexts,
+/// so there is no such realm, and null is precisely what a browser reports
+/// for a frame that has none.
+///
+/// Handing back our own window instead would be the worst option available:
+/// the caller asked for a separate realm specifically so that what it finds
+/// there is UNPATCHED, and giving it this one silently answers the opposite
+/// of the question. Several of these call sites have a fallback chain
+/// (`... : document.implementation && ...`), and null lets them take it.
+fn content_window(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let _ = handle_of(t, ctx);
+    Ok(JsValue::null())
+}
+
 fn install_hyperlink(o: &JsObject, ctx: &mut Context) {
     live_get_set(o, "href", hl_href, hl_set_href, ctx);
     for (n, f) in [
@@ -946,6 +985,21 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
                       f.to_js_function(ctx.realm()), false, ctx);
     }
     install_tree(&o, ctx);
+    install_handlers(&o, ctx);
+    {
+        let tag = with(|d| d.tag(h).map(|t| t.to_ascii_lowercase())).unwrap_or_default();
+        // `rel` belongs to the elements that have one; elsewhere its absence
+        // is the honest answer and the report will say so if a page wants it.
+        if matches!(tag.as_str(), "link" | "a" | "area" | "form") {
+            live_get_set(&o, "rel", rel_get, rel_set, ctx);
+        }
+        // Frame-ish elements have a browsing context in a browser; here they
+        // have none, which is null rather than missing.
+        if matches!(tag.as_str(), "iframe" | "frame" | "object" | "embed") {
+            live_get(&o, "contentWindow", content_window, ctx);
+            live_get(&o, "contentDocument", content_window, ctx);
+        }
+    }
     set_tag(&o, match with(|d| d.node_type(h)) {
         3 => "Text", 8 => "Comment", 11 => "DocumentFragment", 9 => "HTMLDocument",
         _ => "HTMLElement",
@@ -1588,6 +1642,92 @@ fn is_ancestor(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
     })))
 }
 
+/// Event-handler IDL attributes. A fixed list rather than a catch-all set
+/// trap: these are the names the corpus assigns (onload 177 times, onerror
+/// 172, onclick 51), and a real element exposes exactly the handlers its
+/// interface defines, so an open-ended set would answer feature detection
+/// wrongly.
+const ON_HANDLERS: &[&str] = &[
+    "onclick", "oninput", "onchange", "onsubmit", "onload", "onerror",
+    "onkeydown", "onkeyup", "onkeypress", "onfocus", "onblur", "onscroll",
+    "onmouseover", "onmouseout", "onmousedown", "onmouseup", "onmousemove",
+    "ontouchstart", "ontouchend", "onanimationend", "ontransitionend",
+    "oncontextmenu", "ondblclick", "onpaste", "oncut", "oncopy", "onwheel",
+    "onreset", "ontoggle", "onabort",
+];
+
+fn on_get(this: &JsValue, name: &str, ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(this, ctx) else { return Ok(JsValue::null()) };
+    // ★ null, not undefined: an unset handler is null in the DOM and pages
+    // compare against it.
+    Ok(ONHANDLERS.with(|m| m.borrow().get(&(h, name.to_string())).cloned())
+        .unwrap_or(JsValue::null()))
+}
+
+fn on_set(this: &JsValue, name: &str, v: &JsValue, ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(this, ctx) else { return Ok(JsValue::undefined()) };
+    ONHANDLERS.with(|m| {
+        let mut m = m.borrow_mut();
+        if v.as_callable().is_some() { m.insert((h, name.to_string()), v.clone()); }
+        else { m.remove(&(h, name.to_string())); }   // assigning null clears it
+    });
+    Ok(JsValue::undefined())
+}
+
+macro_rules! on_accessors {
+    ($($g:ident, $s:ident, $name:literal);* $(;)?) => {
+        $(
+            fn $g(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+                on_get(t, $name, ctx)
+            }
+            fn $s(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+                on_set(t, $name, a.get_or_undefined(0), ctx)
+            }
+        )*
+    };
+}
+on_accessors! {
+    g_onclick, s_onclick, "onclick"; g_oninput, s_oninput, "oninput";
+    g_onchange, s_onchange, "onchange"; g_onsubmit, s_onsubmit, "onsubmit";
+    g_onload, s_onload, "onload"; g_onerror, s_onerror, "onerror";
+    g_onkeydown, s_onkeydown, "onkeydown"; g_onkeyup, s_onkeyup, "onkeyup";
+    g_onkeypress, s_onkeypress, "onkeypress"; g_onfocus, s_onfocus, "onfocus";
+    g_onblur, s_onblur, "onblur"; g_onscroll, s_onscroll, "onscroll";
+    g_onmouseover, s_onmouseover, "onmouseover"; g_onmouseout, s_onmouseout, "onmouseout";
+    g_onmousedown, s_onmousedown, "onmousedown"; g_onmouseup, s_onmouseup, "onmouseup";
+    g_onmousemove, s_onmousemove, "onmousemove"; g_ontouchstart, s_ontouchstart, "ontouchstart";
+    g_ontouchend, s_ontouchend, "ontouchend"; g_onanimationend, s_onanimationend, "onanimationend";
+    g_ontransitionend, s_ontransitionend, "ontransitionend";
+    g_oncontextmenu, s_oncontextmenu, "oncontextmenu"; g_ondblclick, s_ondblclick, "ondblclick";
+    g_onpaste, s_onpaste, "onpaste"; g_oncut, s_oncut, "oncut"; g_oncopy, s_oncopy, "oncopy";
+    g_onwheel, s_onwheel, "onwheel"; g_onreset, s_onreset, "onreset";
+    g_ontoggle, s_ontoggle, "ontoggle"; g_onabort, s_onabort, "onabort";
+}
+
+fn install_handlers(o: &JsObject, ctx: &mut Context) {
+    type F = fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>;
+    let pairs: &[(&str, F, F)] = &[
+        ("onclick", g_onclick, s_onclick), ("oninput", g_oninput, s_oninput),
+        ("onchange", g_onchange, s_onchange), ("onsubmit", g_onsubmit, s_onsubmit),
+        ("onload", g_onload, s_onload), ("onerror", g_onerror, s_onerror),
+        ("onkeydown", g_onkeydown, s_onkeydown), ("onkeyup", g_onkeyup, s_onkeyup),
+        ("onkeypress", g_onkeypress, s_onkeypress), ("onfocus", g_onfocus, s_onfocus),
+        ("onblur", g_onblur, s_onblur), ("onscroll", g_onscroll, s_onscroll),
+        ("onmouseover", g_onmouseover, s_onmouseover), ("onmouseout", g_onmouseout, s_onmouseout),
+        ("onmousedown", g_onmousedown, s_onmousedown), ("onmouseup", g_onmouseup, s_onmouseup),
+        ("onmousemove", g_onmousemove, s_onmousemove),
+        ("ontouchstart", g_ontouchstart, s_ontouchstart), ("ontouchend", g_ontouchend, s_ontouchend),
+        ("onanimationend", g_onanimationend, s_onanimationend),
+        ("ontransitionend", g_ontransitionend, s_ontransitionend),
+        ("oncontextmenu", g_oncontextmenu, s_oncontextmenu), ("ondblclick", g_ondblclick, s_ondblclick),
+        ("onpaste", g_onpaste, s_onpaste), ("oncut", g_oncut, s_oncut), ("oncopy", g_oncopy, s_oncopy),
+        ("onwheel", g_onwheel, s_onwheel), ("onreset", g_onreset, s_onreset),
+        ("ontoggle", g_ontoggle, s_ontoggle), ("onabort", g_onabort, s_onabort),
+    ];
+    debug_assert_eq!(pairs.len(), ON_HANDLERS.len());
+    for (n, g, st) in pairs { live_get_set(o, n, *g, *st, ctx); }
+}
+
 fn el_add_listener(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let Some(h) = handle_of(this, ctx) else { return Ok(JsValue::undefined()) };
     let ty = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
@@ -1642,9 +1782,15 @@ fn el_dispatch(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
         if evo.get(js_string!("__stop"), ctx)?.to_boolean() { break }
         let here = node_obj(node, ctx);
         let _ = evo.set(js_string!("currentTarget"), here, false, ctx);
-        let fns: Vec<JsValue> = ELISTENERS.with(|m| m.borrow().get(&node)
-            .map(|v| v.iter().filter(|(t, _)| t == &ty).map(|(_, f)| f.clone()).collect())
-            .unwrap_or_default());
+        // The handler SLOT runs first, then the added listeners — the order
+        // a browser uses when both are present.
+        let mut fns: Vec<JsValue> = ONHANDLERS
+            .with(|m| m.borrow().get(&(node, format!("on{ty}"))).cloned())
+            .into_iter().collect();
+        fns.extend(ELISTENERS.with(|m| m.borrow().get(&node)
+            .map(|v| v.iter().filter(|(t, _)| t == &ty).map(|(_, f)| f.clone())
+                 .collect::<Vec<_>>())
+            .unwrap_or_default()));
         for f in fns {
             if let Some(c) = f.as_callable() {
                 // A listener that throws must not take the dispatch, or the
@@ -2942,6 +3088,7 @@ impl ScriptEngine for BoaEngine {
         // reintroduced by the reset that was meant to keep it clean.
         NODE_CACHE.with(|c| c.borrow_mut().clear());
         ELISTENERS.with(|m| m.borrow_mut().clear());
+        ONHANDLERS.with(|m| m.borrow_mut().clear());
         SHEET_CACHE.with(|c| c.borrow_mut().clear());
         DISPATCH.with(|c| *c.borrow_mut() = (0, 0));
         DOC_WRITE.with(|c| *c.borrow_mut() = (0, 0));
@@ -3205,6 +3352,7 @@ impl ScriptEngine for BoaEngine {
         // A cache of engine objects must not outlive the engine.
         NODE_CACHE.with(|c| c.borrow_mut().clear());
         ELISTENERS.with(|m| m.borrow_mut().clear());
+        ONHANDLERS.with(|m| m.borrow_mut().clear());
         SHEET_CACHE.with(|c| c.borrow_mut().clear());
         DOM.with(|d| *dom = std::mem::take(&mut d.borrow_mut()));
         rep.layout_reads = LAYOUT_READS.with(|n| *n.borrow());
