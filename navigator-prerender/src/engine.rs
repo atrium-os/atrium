@@ -49,6 +49,9 @@ pub struct RunReport {
     pub observers_registered: u32,
     /// Reads of a layout metric this converter cannot truthfully answer.
     pub layout_reads: u32,
+    /// Timer callbacks dispatched, and those still pending at the horizon.
+    pub timers_fired: u32,
+    pub timers_dropped: u32,
 }
 
 pub trait ScriptEngine {

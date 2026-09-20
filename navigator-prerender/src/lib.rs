@@ -34,6 +34,8 @@ pub struct Conversion {
     pub module_retries: u32,
     pub observers_registered: u32,
     pub layout_reads: u32,
+    pub timers_fired: u32,
+    pub timers_dropped: u32,
 }
 
 /// Parse, run the page's scripts once, and snapshot the result.
@@ -149,6 +151,8 @@ pub fn convert_with(
         module_retries: rep.module_retries,
         observers_registered: rep.observers_registered,
         layout_reads: rep.layout_reads,
+        timers_fired: rep.timers_fired,
+        timers_dropped: rep.timers_dropped,
         verdict,
         missing: rep.missing,
         first_error: rep.first_error,

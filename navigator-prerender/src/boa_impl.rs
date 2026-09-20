@@ -548,6 +548,11 @@ fn by_tag_name(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
 /// each document in its OWN PROCESS with a wall-clock deadline (see main.rs),
 /// which bounds hangs, stack overflows and runaway allocation alike, needs no
 /// feature flags, and mirrors the shipped design: one jail per document.
+/// Bounds on the timer drain. A callback cap stops a runaway rescheduler; the
+/// horizon keeps the snapshot faithful to "shortly after load".
+pub const TIMER_BUDGET: u32 = 1000;
+pub const TIMER_HORIZON_MS: u32 = 5000;
+
 #[derive(Default)]
 pub struct BoaEngine {
     /// Root of the mirrored module graph; Boa's loader resolves against it.
@@ -597,9 +602,77 @@ const GLOBALS: &str = r#"
   // common way a real timestamp reaches page content; returning wall time
   // would make conversions differ run to run and break determinism. Counting
   // satisfies both feature-detection and elapsed-time arithmetic.
+  // ★ TIMERS ON A VIRTUAL CLOCK, DRAINED UNDER A BUDGET.
+  //
+  // Two requirements pull against a real implementation. Determinism (G1)
+  // forbids wall-clock delays: the same document must convert identically
+  // every time. Termination forbids honouring a self-rescheduling timer
+  // forever — `setTimeout(loop, 100)` is a perfectly ordinary idiom and would
+  // never finish.
+  //
+  // So time is a NUMBER that only advances when a callback is dispatched,
+  // ordering is (time, insertion sequence) so it is total and reproducible,
+  // and the drain stops at whichever of two bounds comes first: a callback
+  // count, or a virtual-time HORIZON. The horizon is what makes this
+  // faithful rather than merely safe — a converter snapshots shortly after
+  // load, so a banner scheduled for +60s legitimately never runs, exactly as
+  // it would not appear in a screenshot taken at load.
+  var __timers = [], __tseq = 0, __now = 0, __tfired = 0, __tdropped = 0;
+  // ★ A timer cleared from INSIDE its own callback must stay cleared. The
+  // dispatched timer is off the queue while it runs, so __clear scans a queue
+  // it is not in and the rescheduled copy comes back — an interval that calls
+  // clearInterval(self) then ran to the budget instead of stopping. Cleared
+  // ids are remembered, not just removed.
+  var __cleared = Object.create(null);
+  function __schedule(fn, ms, repeat) {
+    if (typeof fn !== 'function') return 0;
+    var d = Number(ms); if (!isFinite(d) || d < 0) d = 0;
+    var id = ++__tseq;
+    __timers.push({ id: id, at: __now + d, seq: id, fn: fn, every: repeat ? d : null });
+    return id;
+  }
+  globalThis.setTimeout = function (fn, ms) { return __schedule(fn, ms, false); };
+  globalThis.setInterval = function (fn, ms) { return __schedule(fn, ms, true); };
+  function __clear(id) {
+    __cleared[id] = true;
+    for (var i = __timers.length - 1; i >= 0; i--) if (__timers[i].id === id) __timers.splice(i, 1);
+  }
+  globalThis.clearTimeout = __clear;
+  globalThis.clearInterval = __clear;
+  globalThis.requestAnimationFrame = function (fn) { return __schedule(fn, 16, false); };
+  globalThis.cancelAnimationFrame = __clear;
+  globalThis.queueMicrotask = function (fn) { Promise.resolve().then(fn); };
+  globalThis.requestIdleCallback = function (fn) {
+    return __schedule(function () { fn({ didTimeout: false, timeRemaining: function () { return 50; } }); }, 1, false);
+  };
+  globalThis.cancelIdleCallback = __clear;
+
+  globalThis.__drainTimers = function (maxCallbacks, horizonMs) {
+    while (__timers.length) {
+      if (__tfired >= maxCallbacks) break;
+      __timers.sort(function (a, b) { return a.at - b.at || a.seq - b.seq; });
+      var t = __timers[0];
+      if (t.at > horizonMs) break;          // beyond the snapshot horizon
+      __timers.shift();
+      if (__cleared[t.id]) continue;
+      __now = t.at;
+      __tfired++;
+      try { t.fn(); } catch (e) {}
+      if (t.every !== null && !__cleared[t.id]) {
+        // A repeating timer is rescheduled, and the same bounds apply to it.
+        __timers.push({ id: t.id, at: __now + Math.max(t.every, 1), seq: ++__tseq, fn: t.fn, every: t.every });
+      }
+    }
+    __tdropped = __timers.length;
+    return __tfired;
+  };
+  globalThis.__timerStats = function () { return [__tfired, __tdropped]; };
+
   var __tick = 0;
   globalThis.performance = {
-    now: function () { return ++__tick; },
+    // Virtual time plus a monotonic tick: reflects the clock the timers use,
+    // and still strictly increases within a single synchronous run.
+    now: function () { return __now + (++__tick) / 1000; },
     timeOrigin: 0,
     mark: function () {}, measure: function () {},
     getEntriesByName: function () { return []; },
@@ -841,7 +914,8 @@ impl ScriptEngine for BoaEngine {
         CURRENT.with(|c| *c.borrow_mut() = None);
         let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![],
             missing: vec![], nulls: vec![], first_error: None, cause: None, listeners_fired: 0,
-            module_retries: 0, observers_registered: 0, layout_reads: 0 };
+            module_retries: 0, observers_registered: 0, layout_reads: 0,
+            timers_fired: 0, timers_dropped: 0 };
         RECORDING.with(|r| *r.borrow_mut() = false);
         let _ = ctx.register_global_callable(js_string!("__parse_url"), 2,
             NativeFunction::from_fn_ptr(parse_url));
@@ -913,6 +987,24 @@ impl ScriptEngine for BoaEngine {
         }
         // Promise jobs queued by handlers (a bundle that awaits on ready).
         let _ = ctx.run_jobs();
+
+        // Then the timer queue, under its budget. Content built in a
+        // `setTimeout(fn, 0)` is an ordinary deferred-init idiom, and the
+        // DOMContentLoaded lesson applies again: registering is not the point,
+        // dispatching is.
+        let drain = format!("__drainTimers({}, {})", TIMER_BUDGET, TIMER_HORIZON_MS);
+        if let Err(e) = ctx.eval(Source::from_bytes(drain.as_bytes())) {
+            rep.errors.push(format!("timers: {e}"));
+        }
+        let _ = ctx.run_jobs();
+        if let Ok(v) = ctx.eval(Source::from_bytes(b"__timerStats()")) {
+            if let Some(o) = v.as_object() {
+                rep.timers_fired = o.get(0, &mut ctx).ok()
+                    .and_then(|x| x.as_number()).unwrap_or(0.0) as u32;
+                rep.timers_dropped = o.get(1, &mut ctx).ok()
+                    .and_then(|x| x.as_number()).unwrap_or(0.0) as u32;
+            }
+        }
 
         DOM.with(|d| *dom = std::mem::take(&mut d.borrow_mut()));
         rep.layout_reads = LAYOUT_READS.with(|n| *n.borrow());
