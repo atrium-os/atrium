@@ -13,6 +13,9 @@ pub type Handle = u32;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Kind {
     Document,
+    /// A DocumentFragment: a parentless holder whose CHILDREN are what gets
+    /// inserted. jQuery builds every template through one.
+    Fragment,
     Element(String),
     Text(String),
     Comment(String),
@@ -111,6 +114,169 @@ impl Dom {
         self.append(h, t);
     }
 
+    // ── Tree semantics ──────────────────────────────────────────────
+    //
+    // ★ The arena ALWAYS had the tree: `parent` and `children` were populated
+    // from the start. What was missing was every way to READ or RESHAPE it
+    // from script, which made this a write-mostly facade — build-only, no
+    // navigation, no cloning. Any library that feature-detects the DOM died
+    // on contact: jQuery gets four lines into its Sizzle setup and stops.
+    // These are the operations that make it a DOM rather than a builder.
+
+    /// DOM nodeType, the number libraries branch on. `document` must report 9
+    /// or jQuery's setDocument() bails and leaves its own document undefined.
+    pub fn node_type(&self, h: Handle) -> u32 {
+        match self.get(h).map(|n| &n.kind) {
+            Some(Kind::Element(_)) => 1,
+            Some(Kind::Text(_)) => 3,
+            Some(Kind::Comment(_)) => 8,
+            Some(Kind::Document) => 9,
+            Some(Kind::Fragment) => 11,
+            None => 0,
+        }
+    }
+
+    pub fn node_name(&self, h: Handle) -> String {
+        match self.get(h).map(|n| &n.kind) {
+            Some(Kind::Element(t)) => t.to_uppercase(),
+            Some(Kind::Text(_)) => "#text".into(),
+            Some(Kind::Comment(_)) => "#comment".into(),
+            Some(Kind::Document) => "#document".into(),
+            Some(Kind::Fragment) => "#document-fragment".into(),
+            None => String::new(),
+        }
+    }
+
+    pub fn children_of(&self, h: Handle) -> Vec<Handle> {
+        self.get(h).map(|n| n.children.clone()).unwrap_or_default()
+    }
+
+    /// Element children only — `children` in the DOM, as against `childNodes`.
+    pub fn element_children(&self, h: Handle) -> Vec<Handle> {
+        self.children_of(h).into_iter()
+            .filter(|&c| matches!(self.get(c).map(|n| &n.kind), Some(Kind::Element(_))))
+            .collect()
+    }
+
+    pub fn first_child(&self, h: Handle) -> Option<Handle> {
+        self.get(h)?.children.first().copied()
+    }
+    pub fn last_child(&self, h: Handle) -> Option<Handle> {
+        self.get(h)?.children.last().copied()
+    }
+
+    fn index_in_parent(&self, h: Handle) -> Option<(Handle, usize)> {
+        let p = self.get(h)?.parent?;
+        let i = self.get(p)?.children.iter().position(|&c| c == h)?;
+        Some((p, i))
+    }
+
+    pub fn next_sibling(&self, h: Handle) -> Option<Handle> {
+        let (p, i) = self.index_in_parent(h)?;
+        self.get(p)?.children.get(i + 1).copied()
+    }
+    pub fn previous_sibling(&self, h: Handle) -> Option<Handle> {
+        let (p, i) = self.index_in_parent(h)?;
+        if i == 0 { return None }
+        self.get(p)?.children.get(i - 1).copied()
+    }
+
+    /// Detach from the current parent, if any. Returns whether it moved.
+    pub fn detach(&mut self, h: Handle) -> bool {
+        let Some(p) = self.get(h).and_then(|n| n.parent) else { return false };
+        if let Some(n) = self.get_mut(p) { n.children.retain(|&c| c != h); }
+        if let Some(n) = self.get_mut(h) { n.parent = None; }
+        true
+    }
+
+    /// `insertBefore(new, ref)`. A null `before` appends, as the DOM says.
+    /// A fragment inserts its CHILDREN, not itself — the behaviour every
+    /// template-building library depends on.
+    pub fn insert_before(&mut self, parent: Handle, node: Handle, before: Option<Handle>) -> bool {
+        if parent as usize >= self.nodes.len() || node as usize >= self.nodes.len() { return false }
+        if parent == node || self.is_ancestor(node, parent) { return false }
+        if matches!(self.nodes[node as usize].kind, Kind::Fragment) {
+            let kids = self.children_of(node);
+            let mut ok = true;
+            for k in kids { ok &= self.insert_before(parent, k, before); }
+            return ok;
+        }
+        self.detach(node);
+        let at = match before {
+            Some(b) => self.get(parent).and_then(|n| n.children.iter().position(|&c| c == b))
+                .unwrap_or_else(|| self.nodes[parent as usize].children.len()),
+            None => self.nodes[parent as usize].children.len(),
+        };
+        self.nodes[node as usize].parent = Some(parent);
+        self.nodes[parent as usize].children.insert(at, node);
+        true
+    }
+
+    pub fn remove_child(&mut self, parent: Handle, child: Handle) -> bool {
+        if self.get(child).and_then(|n| n.parent) != Some(parent) { return false }
+        self.detach(child)
+    }
+
+    pub fn replace_child(&mut self, parent: Handle, new: Handle, old: Handle) -> bool {
+        let Some(i) = self.get(parent).and_then(|n| n.children.iter().position(|&c| c == old))
+            else { return false };
+        if !self.insert_before(parent, new, Some(old)) { return false }
+        let _ = i;
+        self.remove_child(parent, old)
+    }
+
+    pub fn contains(&self, anc: Handle, h: Handle) -> bool {
+        anc == h || self.is_ancestor(anc, h)
+    }
+
+    /// `cloneNode(deep)`. The clone is parentless, as the DOM requires — and
+    /// deep must actually copy the subtree: jQuery reads
+    /// `div.cloneNode(true).cloneNode(true).lastChild.checked`, so a clone
+    /// that drops children throws on the very next property.
+    pub fn clone_node(&mut self, h: Handle, deep: bool) -> Option<Handle> {
+        let src = self.get(h)?.clone();
+        let new = self.create(src.kind.clone());
+        if let Some(n) = self.get_mut(new) { n.attrs = src.attrs.clone(); }
+        if deep {
+            for c in src.children {
+                if let Some(cc) = self.clone_node(c, true) {
+                    self.append(new, cc);
+                }
+            }
+        }
+        Some(new)
+    }
+
+    /// Serialize a node's children — `innerHTML` as read.
+    pub fn inner_html(&self, h: Handle) -> String {
+        let mut s = String::new();
+        for &c in &self.get(h).map(|n| n.children.clone()).unwrap_or_default() { self.ser(c, &mut s); }
+        s
+    }
+    /// Serialize the node itself — `outerHTML`.
+    pub fn outer_html(&self, h: Handle) -> String {
+        let mut s = String::new();
+        self.ser(h, &mut s);
+        s
+    }
+
+    /// Copy a subtree out of another arena, returning the new handle here.
+    /// Used to graft parsed fragments in, so `innerHTML =` reuses the real
+    /// parser rather than a second, divergent one.
+    pub fn graft(&mut self, other: &Dom, from: Handle) -> Handle {
+        let kind = other.get(from).map(|n| n.kind.clone()).unwrap_or(Kind::Fragment);
+        let new = self.create(kind);
+        if let Some(src) = other.get(from) {
+            let attrs = src.attrs.clone();
+            if let Some(n) = self.get_mut(new) { n.attrs = attrs; }
+        }
+        for &c in &other.get(from).map(|n| n.children.clone()).unwrap_or_default() {
+            let cc = self.graft(other, c);
+            self.append(new, cc);
+        }
+        new
+    }
+
     /// Element count, the headline metric for a conversion.
     pub fn element_count(&self) -> usize {
         self.nodes.iter().filter(|n| matches!(n.kind, Kind::Element(_))).count()
@@ -136,7 +302,9 @@ impl Dom {
         match &self.nodes[h as usize].kind {
             Kind::Text(t) => s.push_str(&escape(t)),
             Kind::Comment(_) => {}
-            Kind::Document => {}
+            Kind::Document | Kind::Fragment => {
+                for &c in &self.nodes[h as usize].children { self.ser(c, s); }
+            }
             Kind::Element(tag) => {
                 s.push('<'); s.push_str(tag);
                 for (k, v) in &self.nodes[h as usize].attrs {

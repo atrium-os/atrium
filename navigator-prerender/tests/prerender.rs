@@ -166,6 +166,8 @@ fn missing_apis_are_named_not_just_failed() {
         try { var x = document.currentScript; } catch (e) {}\
         try { var y = document.getElementById('a').parentNode; } catch (e) {}\
         try { var z = document.childNodes; } catch (e) {}\
+        try { var w = document.images; } catch (e) {}\
+        try { var v = document.forms; } catch (e) {}\
         try { document.addEventListener('x', function(){}); } catch (e) {}\
         try { document.querySelector('p'); } catch (e) {}\
         try { document.getElementsByClassName('x'); } catch (e) {}\
@@ -173,14 +175,17 @@ fn missing_apis_are_named_not_just_failed() {
     let c = convert(html, &mut BoaEngine::default());
     let names: Vec<&str> = c.missing.iter().map(|(n, _)| n.as_str()).collect();
     // still missing — these are the next items the corpus report ranks
-    assert!(names.contains(&"element.parentNode"), "got {names:?}");
-    assert!(names.contains(&"document.childNodes"), "got {names:?}");
+    assert!(names.contains(&"document.images"), "got {names:?}");
+    assert!(names.contains(&"document.forms"), "got {names:?}");
     // ★ Implemented APIs must DISAPPEAR from the report. Each of these was
     // once the top entry; the assertions are how a regression gets caught,
     // and this test has now flagged its own obsolescence three times.
     for gone in ["document.addEventListener", "document.querySelector",
                  "document.getElementsByClassName", "document.currentScript",
-                 "element.classList", "element.style"] {
+                 "element.classList", "element.style",
+                 // tree semantics, added once the corpus proved that no
+                 // amount of extra GLOBALS would move the number
+                 "element.parentNode", "document.childNodes"] {
         assert!(!names.contains(&gone), "{gone} is implemented and must not be reported missing: {names:?}");
     }
 }

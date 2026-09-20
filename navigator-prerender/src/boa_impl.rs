@@ -6,7 +6,7 @@ use boa_engine::{
     js_string, object::ObjectInitializer, property::Attribute, Context, JsArgs, JsObject,
     JsResult, JsValue, NativeFunction, Source,
 };
-use std::{cell::RefCell, collections::BTreeMap};
+use std::{cell::RefCell, collections::{BTreeMap, HashMap}};
 
 // The arena lives here for the duration of a run. A thread-local keeps every
 // host function a plain fn pointer — no captured state to trace through the
@@ -52,6 +52,16 @@ thread_local! {
     /// (kind, target handle, attribute name)
     static MUTATIONS: RefCell<Vec<(&'static str, Handle, String)>> =
         const { RefCell::new(Vec::new()) };
+    /// ★ ONE WRAPPER PER HANDLE, FOR THE LIFE OF A RUN.
+    ///
+    /// node_obj() used to mint a fresh object every call, so two lookups of
+    /// the same element compared UNEQUAL. `document.body === document.body`
+    /// was false. Libraries lean on node identity constantly — jQuery's
+    /// setDocument opens with `doc == document`, event delegation walks
+    /// parents comparing against a root, and caches key on the node itself.
+    /// Identity is part of the DOM contract, not an optimisation.
+    static NODE_CACHE: RefCell<HashMap<Handle, JsValue>> =
+        RefCell::new(HashMap::new());
     /// The page's fetcher, parked here for the duration of a run so native
     /// functions can reach it without capturing state the engine's GC traces.
     static PAGE_NET: RefCell<Option<Box<dyn crate::fetch::Fetcher>>> =
@@ -118,7 +128,269 @@ fn probed(obj: JsObject, kind: &str, ctx: &mut Context) -> JsValue {
     }
 }
 
+/// A live accessor over the arena: tree shape changes under script, so these
+/// must be read at ACCESS time. A snapshot taken when the wrapper was built
+/// would be stale the moment anything moved.
+fn live_get(o: &JsObject, name: &str,
+            f: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+            ctx: &mut Context) {
+    let desc = boa_engine::property::PropertyDescriptor::builder()
+        .get(NativeFunction::from_fn_ptr(f).to_js_function(ctx.realm()))
+        .enumerable(false).configurable(true).build();
+    let _ = o.define_property_or_throw(js_string!(name.to_string()), desc, ctx);
+}
+
+fn live_get_set(o: &JsObject, name: &str,
+                g: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+                st: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>,
+                ctx: &mut Context) {
+    let desc = boa_engine::property::PropertyDescriptor::builder()
+        .get(NativeFunction::from_fn_ptr(g).to_js_function(ctx.realm()))
+        .set(NativeFunction::from_fn_ptr(st).to_js_function(ctx.realm()))
+        .enumerable(false).configurable(true).build();
+    let _ = o.define_property_or_throw(js_string!(name.to_string()), desc, ctx);
+}
+
+fn handles_to_array(hs: Vec<Handle>, ctx: &mut Context) -> JsResult<JsValue> {
+    let arr = boa_engine::object::builtins::JsArray::new(ctx)?;
+    for h in hs { let v = node_obj(h, ctx); arr.push(v, ctx)?; }
+    Ok(JsValue::from(arr))
+}
+
+fn opt_node(h: Option<Handle>, ctx: &mut Context) -> JsResult<JsValue> {
+    Ok(match h { Some(h) => node_obj(h, ctx), None => JsValue::null() })
+}
+
+fn this_h(t: &JsValue, ctx: &mut Context) -> Option<Handle> { handle_of(t, ctx) }
+
+fn n_parent(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = this_h(t, ctx); opt_node(h.and_then(|h| with(|d| d.get(h).and_then(|n| n.parent))), ctx)
+}
+fn n_parent_element(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = this_h(t, ctx)
+        .and_then(|h| with(|d| d.get(h).and_then(|n| n.parent)))
+        .filter(|&p| with(|d| d.node_type(p)) == 1);
+    opt_node(h, ctx)
+}
+fn n_child_nodes(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = this_h(t, ctx).unwrap_or(0);
+    handles_to_array(with(|d| d.children_of(h)), ctx)
+}
+fn n_children(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = this_h(t, ctx).unwrap_or(0);
+    handles_to_array(with(|d| d.element_children(h)), ctx)
+}
+fn n_first_child(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = this_h(t, ctx); opt_node(h.and_then(|h| with(|d| d.first_child(h))), ctx)
+}
+fn n_last_child(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = this_h(t, ctx); opt_node(h.and_then(|h| with(|d| d.last_child(h))), ctx)
+}
+fn n_first_el_child(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = this_h(t, ctx); opt_node(h.and_then(|h| with(|d| d.element_children(h).first().copied())), ctx)
+}
+fn n_last_el_child(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = this_h(t, ctx); opt_node(h.and_then(|h| with(|d| d.element_children(h).last().copied())), ctx)
+}
+fn n_next(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = this_h(t, ctx); opt_node(h.and_then(|h| with(|d| d.next_sibling(h))), ctx)
+}
+fn n_prev(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = this_h(t, ctx); opt_node(h.and_then(|h| with(|d| d.previous_sibling(h))), ctx)
+}
+fn n_node_type(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = this_h(t, ctx).unwrap_or(0);
+    Ok(JsValue::from(with(|d| d.node_type(h))))
+}
+fn n_node_name(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = this_h(t, ctx).unwrap_or(0);
+    Ok(JsValue::from(js_string!(with(|d| d.node_name(h)))))
+}
+fn n_node_value(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = this_h(t, ctx).unwrap_or(0);
+    Ok(match with(|d| d.get(h).map(|n| n.kind.clone())) {
+        Some(Kind::Text(s)) | Some(Kind::Comment(s)) => JsValue::from(js_string!(s)),
+        _ => JsValue::null(),
+    })
+}
+fn n_owner_document(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = this_h(t, ctx).unwrap_or(0);
+    // The document owns everything except itself, which owns nothing.
+    if with(|d| d.node_type(h)) == 9 { return Ok(JsValue::null()) }
+    Ok(ctx.global_object().get(js_string!("document"), ctx).unwrap_or(JsValue::null()))
+}
+fn n_inner_html(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = this_h(t, ctx).unwrap_or(0);
+    Ok(JsValue::from(js_string!(with(|d| d.inner_html(h)))))
+}
+fn n_outer_html(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = this_h(t, ctx).unwrap_or(0);
+    Ok(JsValue::from(js_string!(with(|d| d.outer_html(h)))))
+}
+/// `innerHTML =` goes through the REAL parser and grafts the result in. A
+/// second, hand-rolled parser here would disagree with the one that built the
+/// document, which is exactly the divergence a converter cannot afford.
+fn n_set_inner_html(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = match this_h(t, ctx) { Some(h) => h, None => return Ok(JsValue::undefined()) };
+    let html = a.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    let frag = crate::parse::parse_fragment(&html);
+    with(|d| {
+        for c in d.children_of(h) { d.detach(c); }
+        let root = frag.root();
+        for c in frag.children_of(root) {
+            let g = d.graft(&frag, c);
+            d.append(h, g);
+        }
+        d.script_mutations += 1;
+    });
+    record_mutation("childList", h, "");
+    Ok(JsValue::undefined())
+}
+fn n_clone(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = match this_h(t, ctx) { Some(h) => h, None => return Ok(JsValue::null()) };
+    let deep = a.get_or_undefined(0).to_boolean();
+    let c = with(|d| d.clone_node(h, deep));
+    opt_node(c, ctx)
+}
+fn n_insert_before(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let p = match this_h(t, ctx) { Some(h) => h, None => return Ok(JsValue::null()) };
+    let node = handle_of(a.get_or_undefined(0), ctx);
+    let before = handle_of(a.get_or_undefined(1), ctx);
+    if let Some(n) = node {
+        let ok = with(|d| { let r = d.insert_before(p, n, before); if r { d.script_mutations += 1 } r });
+        if ok { record_mutation("childList", p, ""); }
+    }
+    Ok(a.get_or_undefined(0).clone())
+}
+fn n_remove_child(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let p = match this_h(t, ctx) { Some(h) => h, None => return Ok(JsValue::null()) };
+    if let Some(c) = handle_of(a.get_or_undefined(0), ctx) {
+        let ok = with(|d| { let r = d.remove_child(p, c); if r { d.script_mutations += 1 } r });
+        if ok { record_mutation("childList", p, ""); }
+    }
+    Ok(a.get_or_undefined(0).clone())
+}
+fn n_replace_child(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let p = match this_h(t, ctx) { Some(h) => h, None => return Ok(JsValue::null()) };
+    let new = handle_of(a.get_or_undefined(0), ctx);
+    let old = handle_of(a.get_or_undefined(1), ctx);
+    if let (Some(n), Some(o)) = (new, old) {
+        let ok = with(|d| { let r = d.replace_child(p, n, o); if r { d.script_mutations += 1 } r });
+        if ok { record_mutation("childList", p, ""); }
+    }
+    Ok(a.get_or_undefined(1).clone())
+}
+fn n_remove(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    if let Some(h) = this_h(t, ctx) {
+        let p = with(|d| d.get(h).and_then(|n| n.parent));
+        let ok = with(|d| { let r = d.detach(h); if r { d.script_mutations += 1 } r });
+        if ok { if let Some(p) = p { record_mutation("childList", p, ""); } }
+    }
+    Ok(JsValue::undefined())
+}
+fn n_contains(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = match this_h(t, ctx) { Some(h) => h, None => return Ok(JsValue::from(false)) };
+    let other = handle_of(a.get_or_undefined(0), ctx);
+    Ok(JsValue::from(other.map(|o| with(|d| d.contains(h, o))).unwrap_or(false)))
+}
+fn n_has_child_nodes(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = this_h(t, ctx).unwrap_or(0);
+    Ok(JsValue::from(!with(|d| d.children_of(h)).is_empty()))
+}
+fn n_has_attribute(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = match this_h(t, ctx) { Some(h) => h, None => return Ok(JsValue::from(false)) };
+    let k = a.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    Ok(JsValue::from(with(|d| d.attr(h, &k).is_some())))
+}
+fn n_remove_attribute(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = match this_h(t, ctx) { Some(h) => h, None => return Ok(JsValue::undefined()) };
+    let k = a.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    with(|d| { if let Some(n) = d.get_mut(h) { n.attrs.retain(|(a, _)| a != &k); } d.script_mutations += 1; });
+    record_mutation("attributes", h, &k);
+    Ok(JsValue::undefined())
+}
+
+/// Install the node tree surface shared by elements, text nodes, fragments
+/// and the document itself.
+fn install_tree(o: &JsObject, ctx: &mut Context) {
+    live_get(o, "parentNode", n_parent, ctx);
+    live_get(o, "parentElement", n_parent_element, ctx);
+    live_get(o, "childNodes", n_child_nodes, ctx);
+    live_get(o, "children", n_children, ctx);
+    live_get(o, "firstChild", n_first_child, ctx);
+    live_get(o, "lastChild", n_last_child, ctx);
+    live_get(o, "firstElementChild", n_first_el_child, ctx);
+    live_get(o, "lastElementChild", n_last_el_child, ctx);
+    live_get(o, "nextSibling", n_next, ctx);
+    live_get(o, "previousSibling", n_prev, ctx);
+    live_get(o, "nodeType", n_node_type, ctx);
+    live_get(o, "nodeName", n_node_name, ctx);
+    live_get(o, "nodeValue", n_node_value, ctx);
+    live_get(o, "ownerDocument", n_owner_document, ctx);
+    live_get(o, "outerHTML", n_outer_html, ctx);
+    live_get_set(o, "innerHTML", n_inner_html, n_set_inner_html, ctx);
+    for (name, f) in [
+        ("cloneNode", n_clone as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("insertBefore", n_insert_before),
+        ("removeChild", n_remove_child),
+        ("replaceChild", n_replace_child),
+        ("remove", n_remove),
+        ("contains", n_contains),
+        ("hasChildNodes", n_has_child_nodes),
+        ("hasAttribute", n_has_attribute),
+        ("removeAttribute", n_remove_attribute),
+    ] {
+        let f = NativeFunction::from_fn_ptr(f).to_js_function(ctx.realm());
+        let _ = o.set(js_string!(name.to_string()), f, false, ctx);
+    }
+}
+
+/// `document.implementation.createHTMLDocument(title)`.
+///
+/// A real, detached document in the same arena — html/head/body actually
+/// built, not an object pretending. jQuery uses one to parse untrusted markup
+/// away from the live tree, which is a habit worth supporting rather than
+/// faking: the nodes it creates here genuinely cannot reach the page unless
+/// something grafts them in.
+fn create_html_document(_t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let (doc, body) = with(|d| {
+        let doc = d.create(Kind::Document);
+        let html = d.create(Kind::Element("html".into()));
+        let head = d.create(Kind::Element("head".into()));
+        let body = d.create(Kind::Element("body".into()));
+        d.append(doc, html);
+        d.append(html, head);
+        d.append(html, body);
+        (doc, body)
+    });
+    let o = node_obj(doc, ctx);
+    if let Some(obj) = o.as_object() {
+        let b = node_obj(body, ctx);
+        let _ = obj.set(js_string!("body"), b, false, ctx);
+        let html_h = with(|d| d.children_of(doc).first().copied()).unwrap_or(doc);
+        let de = node_obj(html_h, ctx);
+        let _ = obj.set(js_string!("documentElement"), de, false, ctx);
+    }
+    Ok(o)
+}
+
+/// `document.createDocumentFragment()`.
+fn create_fragment(_t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let h = with(|d| d.create(Kind::Fragment));
+    Ok(node_obj(h, ctx))
+}
+
+/// `document.getElementsByName(name)`.
+fn by_name(_t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let want = a.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    let hs = with(|d| (0..d.nodes.len() as Handle)
+        .filter(|&h| d.attr(h, "name") == Some(want.as_str()))
+        .collect::<Vec<_>>());
+    handles_to_array(hs, ctx)
+}
+
 fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
+    if let Some(v) = NODE_CACHE.with(|c| c.borrow().get(&h).cloned()) { return v }
     let tag = with(|d| d.tag(h).map(|s| s.to_string())).unwrap_or_default();
     let o = ObjectInitializer::new(ctx)
         .property(js_string!("__h"), h as f64, Attribute::all())
@@ -164,7 +436,10 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
         let _ = o.set(js_string!("getBoundingClientRect"),
                       f.to_js_function(ctx.realm()), false, ctx);
     }
-    probed(o, "element", ctx)
+    install_tree(&o, ctx);
+    let v = probed(o, "element", ctx);
+    NODE_CACHE.with(|c| c.borrow_mut().insert(h, v.clone()));
+    v
 }
 
 /// `textContent` as a real accessor: scripts use the property, not a method.
@@ -546,7 +821,11 @@ fn ignore(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
 fn append_child(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let (p, c) = (handle_of(this, ctx), handle_of(args.get_or_undefined(0), ctx));
     if let (Some(p), Some(c)) = (p, c) {
-        with(|d| { if d.append(p, c) { d.script_mutations += 1; } });
+        // Through insert_before so a DocumentFragment inserts its CHILDREN
+        // here too. appendChild used to call the raw arena append, which
+        // grafted the fragment NODE into the tree — it then serialized as
+        // nothing and its children never appeared.
+        with(|d| { if d.insert_before(p, c, None) { d.script_mutations += 1; } });
         record_mutation("childList", p, "");
     }
     Ok(args.get_or_undefined(0).clone())
@@ -1283,6 +1562,12 @@ impl ScriptEngine for BoaEngine {
     }
 
     fn run(&mut self, dom: &mut Dom, scripts: &[ScriptSource]) -> RunReport {
+        // ★ BEFORE any wrapper is built. Clearing it later threw away the
+        // `document.body` wrapper that had just been cached, so the next
+        // lookup minted a second object and `x.parentNode === document.body`
+        // was false — the identity bug this cache exists to prevent,
+        // reintroduced by the reset that was meant to keep it clean.
+        NODE_CACHE.with(|c| c.borrow_mut().clear());
         DOM.with(|d| *d.borrow_mut() = std::mem::take(dom));
         let mut ctx = match self.module_root.as_ref()
             .and_then(|r| boa_engine::module::SimpleModuleLoader::new(r).ok())
@@ -1296,18 +1581,28 @@ impl ScriptEngine for BoaEngine {
 
         let body = with(|d| d.by_tag("body").first().copied()).unwrap_or(0);
         let body_v = node_obj(body, &mut ctx);
+        // `document.head` — named by the corpus the moment tree semantics let
+        // MediaWiki's ResourceLoader run far enough to call
+        // `document.head.appendChild(script)`. Twelve documents, one property.
+        let head = with(|d| d.by_tag("head").first().copied()).unwrap_or(0);
+        let head_v = node_obj(head, &mut ctx);
         let doc_el = with(|d| d.by_tag("html").first().copied()).unwrap_or(0);
         let doc_el_v = node_obj(doc_el, &mut ctx);
         let doc = ObjectInitializer::new(&mut ctx)
             .function(NativeFunction::from_fn_ptr(get_element_by_id), js_string!("getElementById"), 1)
             .function(NativeFunction::from_fn_ptr(create_element), js_string!("createElement"), 1)
             .function(NativeFunction::from_fn_ptr(create_text_node), js_string!("createTextNode"), 1)
+            .function(NativeFunction::from_fn_ptr(create_fragment), js_string!("createDocumentFragment"), 0)
+            .function(NativeFunction::from_fn_ptr(by_name), js_string!("getElementsByName"), 1)
+            .property(js_string!("namespaceURI"),
+                js_string!("http://www.w3.org/1999/xhtml"), Attribute::all())
             .function(NativeFunction::from_fn_ptr(query_all), js_string!("querySelectorAll"), 1)
             .function(NativeFunction::from_fn_ptr(query_first), js_string!("querySelector"), 1)
             .function(NativeFunction::from_fn_ptr(by_class), js_string!("getElementsByClassName"), 1)
             .function(NativeFunction::from_fn_ptr(by_tag_name), js_string!("getElementsByTagName"), 1)
             .property(js_string!("body"), body_v, Attribute::all())
             .property(js_string!("documentElement"), doc_el_v, Attribute::all())
+            .property(js_string!("head"), head_v, Attribute::all())
             .property(js_string!("__h"), 0.0, Attribute::all())
             .build();
         {
@@ -1316,6 +1611,16 @@ impl ScriptEngine for BoaEngine {
                 .get(getter).enumerable(true).configurable(true).build();
             let _ = doc.define_property_or_throw(js_string!("currentScript"), desc, &mut ctx);
         }
+        // The document is a node too: nodeType 9, real children, and the
+        // same navigation every other node has.
+        {
+            let imp = ObjectInitializer::new(&mut ctx)
+                .function(NativeFunction::from_fn_ptr(create_html_document),
+                          js_string!("createHTMLDocument"), 1)
+                .build();
+            let _ = doc.set(js_string!("implementation"), imp, false, &mut ctx);
+        }
+        install_tree(&doc, &mut ctx);
         let doc_v = probed(doc.clone(), "document", &mut ctx);
         let _ = ctx.register_global_property(js_string!("document"), doc_v, Attribute::all());
 
@@ -1324,11 +1629,23 @@ impl ScriptEngine for BoaEngine {
         // the global object with `document` hung off it — enough for the
         // `window.document` / `window.onload` shapes real pages use, without
         // pretending to be a browser.
-        let doc_v2 = probed(doc, "document", &mut ctx);
-        let win = ObjectInitializer::new(&mut ctx)
-            .property(js_string!("document"), doc_v2, Attribute::all())
-            .build();
-        let win_v = probed(win, "window", &mut ctx);
+        // ★ ONE document object, not two. This used to build a SECOND proxy
+        // over the same node, so `window.document === document` was FALSE.
+        // jQuery's setDocument opens with `doc == document` where doc came
+        // from `window.document` — with two wrappers that comparison fails
+        // and the branch taken is the wrong one. Identity is observable.
+        //
+        // ★ AND `window` IS THE GLOBAL OBJECT, not a side object with
+        // `document` hung off it. It used to be its own object, so
+        // `window.jQuery = jQuery` stored a property nobody could reach:
+        // jQuery ran to completion and then `jQuery` was still not defined,
+        // because assigning to our window created no global binding. Every
+        // library that publishes itself does it exactly this way.
+        //
+        // It stays a PROXY over the global so the missing-API probe keeps
+        // working; a proxy that only traps `get` forwards writes to the
+        // target, so `window.x = 1` really does define a global.
+        let win_v = probed(ctx.global_object().clone(), "window", &mut ctx);
         let _ = ctx.register_global_property(js_string!("window"), win_v, Attribute::all());
 
         // `console` is a no-op sink. Named by the corpus report, and a script
@@ -1369,6 +1686,9 @@ impl ScriptEngine for BoaEngine {
         PAGE_FETCHES.with(|c| *c.borrow_mut() = (0, 0));
         PAGE_BLOCKED.with(|b| { let mut b = b.borrow_mut(); b.0 = 0; b.1.clear(); });
         MUTATIONS.with(|m| m.borrow_mut().clear());
+        // Wrappers belong to one run's context; carrying them across would
+        // hand the next document objects from a dead realm.
+
         let _ = ctx.register_global_property(js_string!("__doc_url"),
             js_string!(self.base_url.clone().unwrap_or_default()), Attribute::all());
         if let Err(e) = ctx.eval(Source::from_bytes(BOOTSTRAP.as_bytes())) {
@@ -1465,6 +1785,13 @@ impl ScriptEngine for BoaEngine {
             }
         }
 
+        // ★ AND AGAIN ON THE WAY OUT. These wrappers are garbage-collected
+        // objects belonging to THIS Context; left in a thread-local they
+        // outlive the realm that owns them, and the next run on the same
+        // thread trips Boa's GC — which showed up as SIGTRAP under the
+        // parallel test harness and passed cleanly with --test-threads=1.
+        // A cache of engine objects must not outlive the engine.
+        NODE_CACHE.with(|c| c.borrow_mut().clear());
         DOM.with(|d| *dom = std::mem::take(&mut d.borrow_mut()));
         rep.layout_reads = LAYOUT_READS.with(|n| *n.borrow());
         let (pf, pfail) = PAGE_FETCHES.with(|c| *c.borrow());

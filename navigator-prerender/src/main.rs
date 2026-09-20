@@ -33,6 +33,11 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
         ..Default::default()
     };
     let c = convert_with(&src, base, &mut eng, fetcher);
+    // PRERENDER_DUMP=1 prints the converted artifact itself, for inspecting
+    // a single document by hand. The parent never sets it.
+    if std::env::var("PRERENDER_DUMP").ok().as_deref() == Some("1") {
+        eprintln!("{}", c.html);
+    }
     // fields the parent aggregates; errors last, tab-separated
     println!("R\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         c.elements_before, c.elements_after, c.depth_after,

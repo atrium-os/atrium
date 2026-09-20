@@ -9,6 +9,27 @@ use crate::dom::{Dom, Handle, Kind};
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::{Handle as RcHandle, NodeData, RcDom};
 
+/// Parse an HTML FRAGMENT — the `innerHTML =` path.
+///
+/// Returned as a Dom whose root children are the fragment's top-level nodes.
+/// ★ It goes through the SAME html5ever parse as a document, with the wrapper
+/// elements stripped, rather than a second hand-rolled parser: two parsers
+/// that disagree about the same bytes is precisely the divergence a converter
+/// cannot afford, and it is the bug class this crate exists to avoid.
+pub fn parse_fragment(html: &str) -> Dom {
+    let doc = parse(&format!("<html><body>{html}</body></html>"));
+    // Lift the parsed body's children to the returned root.
+    let mut out = Dom::new();
+    let root = out.root();
+    if let Some(body) = doc.by_tag("body").first().copied() {
+        for c in doc.children_of(body) {
+            let g = out.graft(&doc, c);
+            out.append(root, g);
+        }
+    }
+    out
+}
+
 pub fn parse(html: &str) -> Dom {
     let rc = html5ever::parse_document(RcDom::default(), Default::default())
         .from_utf8()
