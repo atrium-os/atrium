@@ -62,6 +62,10 @@ pub struct RunReport {
     pub events_dispatched: u32,
     /// Listener invocations those dispatches actually produced.
     pub event_listeners_run: u32,
+    /// document.write calls applied at the running script's position.
+    pub doc_writes: u32,
+    /// document.write calls refused because they would have erased the document.
+    pub doc_writes_refused: u32,
     /// Reads of a layout metric this converter cannot truthfully answer.
     pub layout_reads: u32,
     /// Timer callbacks dispatched, and those still pending at the horizon.

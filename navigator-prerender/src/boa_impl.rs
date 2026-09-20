@@ -77,6 +77,15 @@ thread_local! {
         RefCell::new(HashMap::new());
     /// (dispatches, listener invocations) on ELEMENTS.
     static DISPATCH: RefCell<(u32, u32)> = const { RefCell::new((0, 0)) };
+    /// (writes applied, writes refused because they would erase the document)
+    static DOC_WRITE: RefCell<(u32, u32)> = const { RefCell::new((0, 0)) };
+    /// ★ The advancing insertion point, per script element.
+    ///
+    /// A browser's parser position moves forward as each write lands, so the
+    /// next write goes AFTER the previous one's output. Recomputing it from
+    /// the script element every call inserted each write before the last,
+    /// and three writes came out in reverse order.
+    static WRITE_POS: RefCell<HashMap<Handle, Handle>> = RefCell::new(HashMap::new());
     /// The page's fetcher, parked here for the duration of a run so native
     /// functions can reach it without capturing state the engine's GC traces.
     static PAGE_NET: RefCell<Option<Box<dyn crate::fetch::Fetcher>>> =
@@ -125,10 +134,38 @@ fn probe_get(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<J
     if recording && !own_probe && !name.starts_with("__")
         && !name.starts_with("Symbol(") && name != "then" {
         let full = format!("{kind}.{name}");
-        EVENTS.with(|e| e.borrow_mut().push(("missing", full.clone())));
+        // ★ A DELIBERATE PROBE IS NOT A PROXIMATE CAUSE.
+        //
+        // Cause attribution takes the LAST event before a throw, so a
+        // feature detection that is SUPPOSED to find nothing, running at
+        // bundle init just before an unrelated failure, gets blamed for it.
+        // `document.all` is the canonical case: core-js reads it to detect
+        // the IsHTMLDDA quirk and expects the absence. It ranked as the cause
+        // for two documents and was the cause of neither.
+        //
+        // Still counted as a MISS — the most-wanted list should show what
+        // pages ask for — but kept out of the causal log.
+        if !is_detection_probe(&full) {
+            EVENTS.with(|e| e.borrow_mut().push(("missing", full.clone())));
+        }
         MISSES.with(|m| *m.borrow_mut().entry(full).or_default() += 1);
     }
     Ok(JsValue::undefined())
+}
+
+/// Lookups a page makes EXPECTING to find nothing. Absence is the answer
+/// they want, so their absence explains no failure.
+fn is_detection_probe(full: &str) -> bool {
+    matches!(full,
+        // core-js and friends read this to detect the IsHTMLDDA quirk, a
+        // behaviour no JS implementation can reproduce: an object that is
+        // falsy and whose typeof is "undefined". Every non-browser host
+        // fails this probe, and that is the intended path.
+        "document.all"
+        // Vendor-prefixed fallbacks, always tried after the standard name.
+        | "window.msCrypto" | "window.webkitURL" | "window.mozRequestAnimationFrame"
+        | "window.webkitRequestAnimationFrame" | "window.msRequestAnimationFrame"
+    )
 }
 
 /// Wrap a host object so its misses are attributed.
@@ -387,6 +424,49 @@ fn create_html_document(_t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsRe
         let _ = obj.set(js_string!("documentElement"), de, false, ctx);
     }
     Ok(o)
+}
+
+/// `document.write(markup)`.
+///
+/// ★ WHERE IT WRITES IS THE WHOLE QUESTION. During parsing a browser inserts
+/// at the parser's position, which is immediately after the running script —
+/// and `currentScript` tells us exactly which element that is, so that case
+/// is served faithfully.
+///
+/// Called with no script running (from a timer, a callback, after load) a
+/// browser does something a converter must not: an implicit `document.open()`
+/// that ERASES the document and starts a new one. Reproducing that would
+/// destroy the artifact on behalf of a script that, in a real browser, would
+/// equally have destroyed the page — almost always an ad or a legacy loader.
+/// It is refused and COUNTED, so the choice is visible rather than silent.
+fn document_write(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let mut markup = String::new();
+    for a in args { markup.push_str(&a.to_string(ctx)?.to_std_string_escaped()); }
+    let Some(anchor) = CURRENT.with(|c| *c.borrow()) else {
+        DOC_WRITE.with(|c| c.borrow_mut().1 += 1);
+        return Ok(JsValue::undefined());
+    };
+    let frag = crate::parse::parse_fragment(&markup);
+    with(|d| {
+        let Some(parent) = d.get(anchor).and_then(|n| n.parent) else { return };
+        // After the script element, in order, which is where the parser was.
+        let from = WRITE_POS.with(|m| m.borrow().get(&anchor).copied()).unwrap_or(anchor);
+        let mut before = d.next_sibling(from);
+        let mut last = from;
+        let root = frag.root();
+        for c in frag.children_of(root) {
+            let g = d.graft(&frag, c);
+            d.insert_before(parent, g, before);
+            before = d.next_sibling(g);
+            last = g;
+            d.script_mutations += 1;
+        }
+        WRITE_POS.with(|m| m.borrow_mut().insert(anchor, last));
+        DOC_WRITE.with(|c| c.borrow_mut().0 += 1);
+    });
+    let parent = with(|d| d.get(anchor).and_then(|n| n.parent));
+    if let Some(p) = parent { record_mutation("childList", p, ""); }
+    Ok(JsValue::undefined())
 }
 
 /// `document.createDocumentFragment()`.
@@ -2059,6 +2139,8 @@ impl ScriptEngine for BoaEngine {
         NODE_CACHE.with(|c| c.borrow_mut().clear());
         ELISTENERS.with(|m| m.borrow_mut().clear());
         DISPATCH.with(|c| *c.borrow_mut() = (0, 0));
+        DOC_WRITE.with(|c| *c.borrow_mut() = (0, 0));
+        WRITE_POS.with(|m| m.borrow_mut().clear());
         DOM.with(|d| *d.borrow_mut() = std::mem::take(dom));
         let mut ctx = match self.module_root.as_ref()
             .and_then(|r| boa_engine::module::SimpleModuleLoader::new(r).ok())
@@ -2094,6 +2176,14 @@ impl ScriptEngine for BoaEngine {
             .property(js_string!("body"), body_v, Attribute::all())
             .property(js_string!("documentElement"), doc_el_v, Attribute::all())
             .property(js_string!("head"), head_v, Attribute::all())
+            // ★ THE HONEST REFERRER IS THE EMPTY STRING. No navigation
+            // happened: the converter fetched this document directly, which
+            // is exactly the case a browser also reports as "". Inventing a
+            // plausible referring page would be fabricating provenance, and
+            // the corpus wants it mostly to put in analytics payloads.
+            .property(js_string!("referrer"), js_string!(""), Attribute::all())
+            .function(NativeFunction::from_fn_ptr(document_write), js_string!("write"), 1)
+            .function(NativeFunction::from_fn_ptr(document_write), js_string!("writeln"), 1)
             .property(js_string!("__h"), 0.0, Attribute::all())
             .build();
         {
@@ -2163,7 +2253,8 @@ impl ScriptEngine for BoaEngine {
             missing: vec![], nulls: vec![], first_error: None, cause: None, listeners_fired: 0,
             module_retries: 0, observers_registered: 0, mutation_records: 0,
             ce_upgrades: 0, history_writes: 0, history_refused: 0,
-            events_dispatched: 0, event_listeners_run: 0, layout_reads: 0,
+            events_dispatched: 0, event_listeners_run: 0,
+            doc_writes: 0, doc_writes_refused: 0, layout_reads: 0,
             timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0,
             page_blocked: 0, blocked_hosts: vec![], beacons_suppressed: 0 };
         RECORDING.with(|r| *r.borrow_mut() = false);
@@ -2306,6 +2397,9 @@ impl ScriptEngine for BoaEngine {
             .ok()
             .and_then(|v| v.as_number())
             .unwrap_or(0.0) as u32;
+        let (dw, dwr) = DOC_WRITE.with(|c| *c.borrow());
+        rep.doc_writes = dw;
+        rep.doc_writes_refused = dwr;
         let (nd, nl) = DISPATCH.with(|c| *c.borrow());
         rep.events_dispatched = nd + ctx.eval(Source::from_bytes(b"__docDispatches")).ok()
             .and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
