@@ -162,19 +162,24 @@ fn document_order_is_preserved_across_inline_and_external() {
 /// was "TypeError: not a callable function" with no callee.
 #[test]
 fn missing_apis_are_named_not_just_failed() {
-    let html = "<html><body><script>\
+    let html = "<html><body><div id=a></div><script>\
+        try { var x = document.currentScript; } catch (e) {}\
+        try { var y = document.getElementById('a').classList; } catch (e) {}\
+        try { document.addEventListener('x', function(){}); } catch (e) {}\
         try { document.querySelector('p'); } catch (e) {}\
         try { document.getElementsByClassName('x'); } catch (e) {}\
-        try { document.addEventListener('x', function(){}); } catch (e) {}\
         </script></body></html>";
     let c = convert(html, &mut BoaEngine::default());
     let names: Vec<&str> = c.missing.iter().map(|(n, _)| n.as_str()).collect();
-    assert!(names.contains(&"document.querySelector"), "got {names:?}");
-    assert!(names.contains(&"document.getElementsByClassName"), "got {names:?}");
-    // addEventListener WAS the top missing API; implementing it must remove it
-    // from the report. This assertion is how we notice if it regresses.
-    assert!(!names.contains(&"document.addEventListener"),
-        "addEventListener is implemented now and must not be reported missing: {names:?}");
+    // still missing — these are the next items the corpus report ranks
+    assert!(names.contains(&"document.currentScript"), "got {names:?}");
+    assert!(names.contains(&"element.classList"), "got {names:?}");
+    // ★ Implemented APIs must DISAPPEAR from the report. Each of these was
+    // once the top entry; the assertions are how a regression gets caught.
+    for gone in ["document.addEventListener", "document.querySelector",
+                 "document.getElementsByClassName"] {
+        assert!(!names.contains(&gone), "{gone} is implemented and must not be reported missing: {names:?}");
+    }
 }
 
 /// What exists must still pass through the probe untouched.
@@ -243,4 +248,52 @@ fn ready_state_progresses() {
     let c = convert(html, &mut BoaEngine::default());
     assert!(c.html.contains(r#"at-script="loading""#), "got {}", c.html);
     assert!(c.html.contains(r#"at-ready="interactive""#), "got {}", c.html);
+}
+
+/// querySelector against the real engine, from both document and element.
+#[test]
+fn query_selector_works_from_document_and_element() {
+    let html = r#"<html><body>
+      <div id="a" class="box"><p class="lede">one</p><p>two</p></div>
+      <div id="b"><p class="lede">three</p></div>
+      <script>
+        var first = document.querySelector('#a p.lede');
+        first.setAttribute('hit','1');
+        var scoped = document.getElementById('b').querySelectorAll('p');
+        for (var i=0;i<scoped.length;i++) scoped[i].setAttribute('scoped', String(i));
+        var all = document.querySelectorAll('.lede');
+        document.body.setAttribute('lede-count', String(all.length));
+        var cls = document.getElementsByClassName('box');
+        document.body.setAttribute('box-count', String(cls.length));
+      </script></body></html>"#;
+    let c = convert(html, &mut BoaEngine::default());
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.html.contains(r#"hit="1""#), "descendant selector failed: {}", c.html);
+    assert!(c.html.contains(r#"scoped="0""#), "element-scoped query failed: {}", c.html);
+    assert!(c.html.contains(r#"lede-count="2""#), "got {}", c.html);
+    assert!(c.html.contains(r#"box-count="1""#), "got {}", c.html);
+    assert!(!c.missing.iter().any(|(n, _)| n.ends_with("querySelector")));
+}
+
+/// Element-scoped queries must not escape their subtree.
+#[test]
+fn element_query_is_scoped_to_its_subtree() {
+    let html = r#"<html><body><div id=a><p>in</p></div><p id=out>out</p><script>
+        var n = document.getElementById('a').querySelectorAll('p');
+        document.body.setAttribute('n', String(n.length));
+      </script></body></html>"#;
+    let c = convert(html, &mut BoaEngine::default());
+    assert!(c.html.contains(r#"n="1""#), "scope leaked: {}", c.html);
+}
+
+/// An unparseable selector loses the query, not the document.
+#[test]
+fn bad_selector_returns_empty_rather_than_throwing() {
+    let html = r#"<html><body><p>kept</p><script>
+        var n = document.querySelectorAll('###');
+        document.body.setAttribute('n', String(n.length));
+      </script></body></html>"#;
+    let c = convert(html, &mut BoaEngine::default());
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.html.contains(r#"n="0""#) && c.html.contains("kept"), "got {}", c.html);
 }

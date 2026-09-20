@@ -95,6 +95,10 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
         // running; pretending to deliver them would be a lie.
         .function(NativeFunction::from_fn_ptr(ignore), js_string!("addEventListener"), 2)
         .function(NativeFunction::from_fn_ptr(ignore), js_string!("removeEventListener"), 2)
+        .function(NativeFunction::from_fn_ptr(query_first), js_string!("querySelector"), 1)
+        .function(NativeFunction::from_fn_ptr(query_all), js_string!("querySelectorAll"), 1)
+        .function(NativeFunction::from_fn_ptr(by_class), js_string!("getElementsByClassName"), 1)
+        .function(NativeFunction::from_fn_ptr(by_tag_name), js_string!("getElementsByTagName"), 1)
         .build();
     install_text_accessor(&o, ctx);
     probed(o, "element", ctx)
@@ -172,18 +176,48 @@ fn create_text_node(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResu
     Ok(node_obj(h, ctx))
 }
 
-fn query_all(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+/// Scope for a query: the element it was called on, or the document root.
+/// Giving the `document` object the root handle lets one implementation serve
+/// both `document.querySelector` and `element.querySelector`.
+fn scope_of(this: &JsValue, ctx: &mut Context) -> Handle {
+    handle_of(this, ctx).unwrap_or(0)
+}
+
+fn run_query(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Vec<Handle>> {
     let sel = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-    // v0: type selectors only. Anything else returns empty, and the corpus
-    // report counts how often that mattered.
-    let hs = if sel.starts_with('#') {
-        with(|d| d.by_id(&sel[1..])).into_iter().collect::<Vec<_>>()
-    } else {
-        with(|d| d.by_tag(&sel))
-    };
+    let scope = scope_of(this, ctx);
+    Ok(match crate::selector::parse(&sel) {
+        Some(q) => with(|d| crate::selector::select(d, scope, &q)),
+        // An unparseable selector yields nothing rather than failing the
+        // script: a converter should lose one query, not the document.
+        None => vec![],
+    })
+}
+
+fn query_all(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let hs = run_query(this, args, ctx)?;
     let arr = boa_engine::object::builtins::JsArray::new(ctx)?;
     for h in hs { let n = node_obj(h, ctx); arr.push(n, ctx)?; }
     Ok(JsValue::from(arr))
+}
+
+fn query_first(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    Ok(match run_query(this, args, ctx)?.first() {
+        Some(&h) => node_obj(h, ctx),
+        None => JsValue::null(),
+    })
+}
+
+fn by_class(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let name = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    let sel: String = name.split_whitespace().map(|c| format!(".{c}")).collect();
+    query_all(this, &[JsValue::from(js_string!(sel))], ctx)
+}
+
+fn by_tag_name(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let name = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    let sel = if name == "*" { "*".to_string() } else { name };
+    query_all(this, &[JsValue::from(js_string!(sel))], ctx)
 }
 
 /// ★ A converter must not be hangable by the content it converts, and Boa's
@@ -259,12 +293,19 @@ impl ScriptEngine for BoaEngine {
 
         let body = with(|d| d.by_tag("body").first().copied()).unwrap_or(0);
         let body_v = node_obj(body, &mut ctx);
+        let doc_el = with(|d| d.by_tag("html").first().copied()).unwrap_or(0);
+        let doc_el_v = node_obj(doc_el, &mut ctx);
         let doc = ObjectInitializer::new(&mut ctx)
             .function(NativeFunction::from_fn_ptr(get_element_by_id), js_string!("getElementById"), 1)
             .function(NativeFunction::from_fn_ptr(create_element), js_string!("createElement"), 1)
             .function(NativeFunction::from_fn_ptr(create_text_node), js_string!("createTextNode"), 1)
             .function(NativeFunction::from_fn_ptr(query_all), js_string!("querySelectorAll"), 1)
+            .function(NativeFunction::from_fn_ptr(query_first), js_string!("querySelector"), 1)
+            .function(NativeFunction::from_fn_ptr(by_class), js_string!("getElementsByClassName"), 1)
+            .function(NativeFunction::from_fn_ptr(by_tag_name), js_string!("getElementsByTagName"), 1)
             .property(js_string!("body"), body_v, Attribute::all())
+            .property(js_string!("documentElement"), doc_el_v, Attribute::all())
+            .property(js_string!("__h"), 0.0, Attribute::all())
             .build();
         let doc_v = probed(doc.clone(), "document", &mut ctx);
         let _ = ctx.register_global_property(js_string!("document"), doc_v, Attribute::all());

@@ -3,6 +3,7 @@ pub mod parse;
 pub mod engine;
 pub mod boa_impl;
 pub mod fetch;
+pub mod selector;
 
 use dom::Script;
 use engine::ScriptEngine;
