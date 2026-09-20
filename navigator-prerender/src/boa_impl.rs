@@ -162,6 +162,11 @@ fn is_detection_probe(full: &str) -> bool {
         // falsy and whose typeof is "undefined". Every non-browser host
         // fails this probe, and that is the intended path.
         "document.all"
+        // jQuery's IE-era readiness check: `!documentElement.doScroll` IS
+        // the modern path, so absence is the answer it wants. Same shape as
+        // document.all, found the same way — it surfaced as a cause for one
+        // document and explained nothing.
+        | "element.doScroll"
         // Vendor-prefixed fallbacks, always tried after the standard name.
         | "window.msCrypto" | "window.webkitURL" | "window.mozRequestAnimationFrame"
         | "window.webkitRequestAnimationFrame" | "window.msRequestAnimationFrame"
@@ -555,6 +560,33 @@ fn rtf_format(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
         Some(s) => JsValue::from(js_string!(s)),
         None => JsValue::null(),
     })
+}
+
+/// `document.createComment(data)`.
+///
+/// ★ Recorded limit: the node is real and navigable — it has a parent,
+/// siblings, nodeType 8 and nodeValue — but the SERIALIZER drops comments,
+/// as it already does for comments that came from the source. Frameworks
+/// that use comment nodes as placeholders therefore get a working anchor to
+/// position against, and the artifact carries the positioned content without
+/// the marker. Changing that would alter every converted document, which is
+/// a separate decision from adding the constructor.
+fn create_comment(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let text = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    let h = with(|d| d.create(Kind::Comment(text)));
+    Ok(node_obj(h, ctx))
+}
+
+/// `document.scripts` — live, because scripts add scripts.
+fn doc_scripts(_t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    handles_to_array(with(|d| d.by_tag("script")), ctx)
+}
+
+/// `document.defaultView` — the window, which here IS the global object.
+/// A getter rather than a stored value: the window is registered after the
+/// document is built, so a value captured at build time would be undefined.
+fn doc_default_view(_t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    ctx.global_object().get(js_string!("window"), ctx)
 }
 
 /// `document.createDocumentFragment()`.
@@ -1922,6 +1954,119 @@ const GLOBALS: &str = r#"
     };
     return Promise.resolve(resp);
   };
+  // ── NodeFilter / TreeWalker ─────────────────────────────────────────
+  //
+  // Built on the tree itself rather than on a flattened snapshot: the walker
+  // must reflect mutations made between steps, which is the reason pages use
+  // one instead of collecting an array. Only expressible at all because the
+  // arena's navigation is exposed — parentNode, childNodes, siblings.
+  globalThis.NodeFilter = {
+    FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3,
+    SHOW_ALL: 0xFFFFFFFF, SHOW_ELEMENT: 1, SHOW_ATTRIBUTE: 2, SHOW_TEXT: 4,
+    SHOW_CDATA_SECTION: 8, SHOW_PROCESSING_INSTRUCTION: 64, SHOW_COMMENT: 128,
+    SHOW_DOCUMENT: 256, SHOW_DOCUMENT_TYPE: 512, SHOW_DOCUMENT_FRAGMENT: 1024,
+  };
+  function __TreeWalker(root, whatToShow, filter) {
+    var self = this;
+    self.root = root;
+    self.whatToShow = (whatToShow === undefined) ? 0xFFFFFFFF : (whatToShow >>> 0);
+    self.filter = filter || null;
+    self.currentNode = root;
+
+    // whatToShow is a BITMASK over (nodeType - 1), which is easy to get
+    // subtly wrong: SHOW_ELEMENT is 1 for nodeType 1, SHOW_TEXT is 4 for
+    // nodeType 3, SHOW_COMMENT is 128 for nodeType 8.
+    function shown(n) {
+      var t = n.nodeType;
+      if (!t) return false;
+      return (self.whatToShow & (1 << (t - 1))) !== 0;
+    }
+    function accept(n) {
+      if (!shown(n)) return 3;                       // SKIP: wrong type
+      if (!self.filter) return 1;
+      var f = (typeof self.filter === 'function') ? self.filter
+            : (self.filter && self.filter.acceptNode);
+      if (typeof f !== 'function') return 1;
+      try { return f.call(self.filter, n) || 1; } catch (e) { return 2; }
+    }
+    // Document order, staying inside the root's subtree.
+    function nextInOrder(n, skipChildren) {
+      if (!skipChildren) {
+        var kids = n.childNodes;
+        if (kids && kids.length) return kids[0];
+      }
+      var cur = n;
+      while (cur && cur !== self.root) {
+        var sib = cur.nextSibling;
+        if (sib) return sib;
+        cur = cur.parentNode;
+      }
+      return null;
+    }
+    function prevInOrder(n) {
+      if (n === self.root) return null;
+      var sib = n.previousSibling;
+      if (!sib) return n.parentNode;
+      // Descend to the deepest last descendant of the previous sibling.
+      var cur = sib, kids;
+      while ((kids = cur.childNodes) && kids.length) cur = kids[kids.length - 1];
+      return cur;
+    }
+    self.nextNode = function () {
+      var n = self.currentNode;
+      while (true) {
+        n = nextInOrder(n, false);
+        if (!n) return null;
+        var a = accept(n);
+        if (a === 1) { self.currentNode = n; return n; }
+        // REJECT skips the whole subtree; SKIP only the node itself.
+        if (a === 2) { n = nextInOrder(n, true); if (!n) return null;
+                       var b = accept(n);
+                       if (b === 1) { self.currentNode = n; return n; } }
+      }
+    };
+    self.previousNode = function () {
+      var n = self.currentNode;
+      while (true) {
+        n = prevInOrder(n);
+        if (!n || n === self.root) return null;
+        if (accept(n) === 1) { self.currentNode = n; return n; }
+      }
+    };
+    function firstMatching(list) {
+      for (var i = 0; i < list.length; i++) {
+        if (accept(list[i]) === 1) { self.currentNode = list[i]; return list[i]; }
+      }
+      return null;
+    }
+    self.firstChild = function () { return firstMatching(self.currentNode.childNodes || []); };
+    self.lastChild = function () {
+      var k = (self.currentNode.childNodes || []).slice().reverse();
+      return firstMatching(k);
+    };
+    self.nextSibling = function () {
+      var n = self.currentNode.nextSibling;
+      while (n) { if (accept(n) === 1) { self.currentNode = n; return n; } n = n.nextSibling; }
+      return null;
+    };
+    self.previousSibling = function () {
+      var n = self.currentNode.previousSibling;
+      while (n) { if (accept(n) === 1) { self.currentNode = n; return n; } n = n.previousSibling; }
+      return null;
+    };
+    self.parentNode = function () {
+      var n = self.currentNode.parentNode;
+      while (n && n !== self.root.parentNode) {
+        if (accept(n) === 1) { self.currentNode = n; return n; }
+        n = n.parentNode;
+      }
+      return null;
+    };
+  }
+  document.createTreeWalker = function (root, whatToShow, filter) {
+    return new __TreeWalker(root || document, whatToShow, filter);
+  };
+
   // ── Intl default locale ─────────────────────────────────────────────
   //
   // ★ THE DEFAULT LOCALE IS THE DOCUMENT'S, NOT THE HOST MACHINE'S.
@@ -2448,6 +2593,15 @@ impl ScriptEngine for BoaEngine {
             .function(NativeFunction::from_fn_ptr(create_element), js_string!("createElement"), 1)
             .function(NativeFunction::from_fn_ptr(create_text_node), js_string!("createTextNode"), 1)
             .function(NativeFunction::from_fn_ptr(create_fragment), js_string!("createDocumentFragment"), 0)
+            .function(NativeFunction::from_fn_ptr(create_comment), js_string!("createComment"), 1)
+            // ★ THE DOCUMENT REPORTS ITSELF AS VISIBLE. There is no viewport
+            // here, so neither answer is observed fact — but the two are not
+            // symmetric. A page told it is hidden DEFERS exactly the work a
+            // converter exists to capture: lazy renders, deferred fetches,
+            // animations that never start. "visible" is the state the
+            // artifact represents, and the state that yields content.
+            .property(js_string!("hidden"), false, Attribute::all())
+            .property(js_string!("visibilityState"), js_string!("visible"), Attribute::all())
             .function(NativeFunction::from_fn_ptr(by_name), js_string!("getElementsByName"), 1)
             .property(js_string!("namespaceURI"),
                 js_string!("http://www.w3.org/1999/xhtml"), Attribute::all())
@@ -2483,6 +2637,8 @@ impl ScriptEngine for BoaEngine {
                 .build();
             let _ = doc.set(js_string!("implementation"), imp, false, &mut ctx);
         }
+        live_get(&doc, "scripts", doc_scripts, &mut ctx);
+        live_get(&doc, "defaultView", doc_default_view, &mut ctx);
         install_tree(&doc, &mut ctx);
         let doc_v = probed(doc.clone(), "document", &mut ctx);
         let _ = ctx.register_global_property(js_string!("document"), doc_v, Attribute::all());
