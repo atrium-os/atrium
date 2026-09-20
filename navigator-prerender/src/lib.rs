@@ -119,6 +119,7 @@ pub fn convert_with(
     }
 
     engine.set_module_root(&mirror_root);
+    engine.set_base_url(base);
     let mut rep = engine.run(&mut dom, &scripts);
     // The fetch cache persists; the mirror is scratch for this conversion.
     let _ = std::fs::remove_dir_all(&mirror_root);

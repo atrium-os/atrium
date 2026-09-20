@@ -113,6 +113,35 @@ fn install_text_accessor(o: &JsObject, ctx: &mut Context) {
     let _ = o.define_property_or_throw(js_string!("textContent"), desc, ctx);
 }
 
+/// `__parse_url(href, base?)` -> parts object, or null.
+/// Parsing in Rust keeps one URL implementation rather than a JS reimplementation
+/// that would disagree with the one used to resolve scripts.
+fn parse_url(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let href = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    let base = args.get_or_undefined(1);
+    let parsed = if base.is_undefined() || base.is_null() {
+        url::Url::parse(&href).ok()
+    } else {
+        let b = base.to_string(ctx)?.to_std_string_escaped();
+        url::Url::parse(&b).ok().and_then(|b| b.join(&href).ok())
+    };
+    let Some(u) = parsed else { return Ok(JsValue::null()) };
+    let o = ObjectInitializer::new(ctx)
+        .property(js_string!("href"), js_string!(u.as_str().to_string()), Attribute::all())
+        .property(js_string!("protocol"), js_string!(format!("{}:", u.scheme())), Attribute::all())
+        .property(js_string!("hostname"), js_string!(u.host_str().unwrap_or("").to_string()), Attribute::all())
+        .property(js_string!("host"), js_string!(match u.port() {
+            Some(p) => format!("{}:{p}", u.host_str().unwrap_or("")),
+            None => u.host_str().unwrap_or("").to_string() }), Attribute::all())
+        .property(js_string!("port"), js_string!(u.port().map(|p| p.to_string()).unwrap_or_default()), Attribute::all())
+        .property(js_string!("pathname"), js_string!(u.path().to_string()), Attribute::all())
+        .property(js_string!("search"), js_string!(u.query().map(|q| format!("?{q}")).unwrap_or_default()), Attribute::all())
+        .property(js_string!("hash"), js_string!(u.fragment().map(|f| format!("#{f}")).unwrap_or_default()), Attribute::all())
+        .property(js_string!("origin"), js_string!(u.origin().ascii_serialization()), Attribute::all())
+        .build();
+    Ok(JsValue::from(o))
+}
+
 fn ignore(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
     Ok(JsValue::undefined())
 }
@@ -230,6 +259,8 @@ fn by_tag_name(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
 pub struct BoaEngine {
     /// Root of the mirrored module graph; Boa's loader resolves against it.
     pub module_root: Option<std::path::PathBuf>,
+    /// The document's own URL.
+    pub base_url: Option<String>,
 }
 
 /// Parse, link and evaluate a module, then settle its promise.
@@ -260,6 +291,89 @@ fn run_module(ctx: &mut Context, text: &str, path: Option<&std::path::Path>) -> 
             Err("module pending: unresolved import (no module loader)".into()),
     }
 }
+
+
+/// Browser globals, defined in JS over one native URL helper.
+///
+/// Every one is DETERMINISTIC, because G1 requires the same bytes in to give
+/// the same bytes out and these are the usual routes by which a clock, a
+/// random source or host state leaks into a page.
+const GLOBALS: &str = r#"
+(function () {
+  // ★ A MONOTONIC COUNTER, NOT A CLOCK. performance.now() is the single most
+  // common way a real timestamp reaches page content; returning wall time
+  // would make conversions differ run to run and break determinism. Counting
+  // satisfies both feature-detection and elapsed-time arithmetic.
+  var __tick = 0;
+  globalThis.performance = {
+    now: function () { return ++__tick; },
+    timeOrigin: 0,
+    mark: function () {}, measure: function () {},
+    getEntriesByName: function () { return []; },
+    getEntriesByType: function () { return []; }
+  };
+
+  // ★ Storage that is ALWAYS EMPTY and NEVER PERSISTS is not a capability:
+  // no data enters from anywhere, none survives the conversion, and every
+  // reader of the artifact gets the identical result. What a converter must
+  // not do is manufacture state — so this starts empty every time, which is
+  // also what makes it deterministic.
+  function Store() {
+    var m = Object.create(null);
+    return {
+      getItem: function (k) { k = String(k); return k in m ? m[k] : null; },
+      setItem: function (k, v) { m[String(k)] = String(v); },
+      removeItem: function (k) { delete m[String(k)]; },
+      clear: function () { m = Object.create(null); },
+      key: function (i) { var ks = Object.keys(m); return i < ks.length ? ks[i] : null; },
+      get length() { return Object.keys(m).length; }
+    };
+  }
+  globalThis.localStorage = Store();
+  globalThis.sessionStorage = Store();
+
+  // Same reasoning: "there are no cookies" rather than a cookie jar. Writes
+  // are accepted and dropped so a script that sets one does not throw.
+  try {
+    Object.defineProperty(document, 'cookie', {
+      get: function () { return ''; }, set: function () {}, configurable: true
+    });
+  } catch (e) {}
+
+  function mkurl(parts) {
+    if (!parts) return null;
+    var u = {};
+    for (var k in parts) u[k] = parts[k];
+    u.toString = function () { return this.href; };
+    u.searchParams = { get: function () { return null; }, has: function () { return false; } };
+    return u;
+  }
+  globalThis.URL = function (href, base) {
+    var p = __parse_url(String(href), base === undefined ? undefined : String(base));
+    if (!p) throw new TypeError('Invalid URL: ' + href);
+    return mkurl(p);
+  };
+
+  if (typeof __doc_url === 'string' && __doc_url) {
+    var loc = mkurl(__parse_url(__doc_url));
+    if (loc) {
+      // Read-only: assigning location.href is navigation, which a converter
+      // must never perform.
+      loc.assign = function () {}; loc.replace = function () {}; loc.reload = function () {};
+      globalThis.location = loc;
+      if (typeof window !== 'undefined') { window.location = loc; }
+      try { Object.defineProperty(document, 'URL', { get: function(){ return loc.href; }, configurable: true }); } catch (e) {}
+    }
+  }
+
+  // Fixed identity: the converter's, not the reader's. A real user agent
+  // string would be host state leaking into the artifact.
+  globalThis.navigator = {
+    userAgent: 'atrium-navigator-prerender/0.1',
+    language: 'en', languages: ['en'], onLine: true, cookieEnabled: false
+  };
+})();
+"#;
 
 /// Installed before any page script.
 ///
@@ -323,6 +437,10 @@ impl ScriptEngine for BoaEngine {
         self.module_root = Some(root.to_path_buf());
     }
 
+    fn set_base_url(&mut self, url: Option<&str>) {
+        self.base_url = url.map(str::to_string);
+    }
+
     fn run(&mut self, dom: &mut Dom, scripts: &[ScriptSource]) -> RunReport {
         DOM.with(|d| *d.borrow_mut() = std::mem::take(dom));
         let mut ctx = match self.module_root.as_ref()
@@ -384,8 +502,15 @@ impl ScriptEngine for BoaEngine {
         let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![],
             missing: vec![], listeners_fired: 0, module_retries: 0 };
         RECORDING.with(|r| *r.borrow_mut() = false);
+        let _ = ctx.register_global_callable(js_string!("__parse_url"), 2,
+            NativeFunction::from_fn_ptr(parse_url));
+        let _ = ctx.register_global_property(js_string!("__doc_url"),
+            js_string!(self.base_url.clone().unwrap_or_default()), Attribute::all());
         if let Err(e) = ctx.eval(Source::from_bytes(BOOTSTRAP.as_bytes())) {
             rep.errors.push(format!("bootstrap: {e}"));
+        }
+        if let Err(e) = ctx.eval(Source::from_bytes(GLOBALS.as_bytes())) {
+            rep.errors.push(format!("globals: {e}"));
         }
         RECORDING.with(|r| *r.borrow_mut() = true);
         for s in scripts {

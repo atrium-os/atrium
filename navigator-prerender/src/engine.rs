@@ -41,5 +41,7 @@ pub trait ScriptEngine {
     /// Run each script in document order against the DOM, mutating it.
     /// Root of the mirrored module graph for this document.
     fn set_module_root(&mut self, _root: &std::path::Path) {}
+    /// The document's own URL, for `location` and relative `URL` resolution.
+    fn set_base_url(&mut self, _url: Option<&str>) {}
     fn run(&mut self, dom: &mut Dom, scripts: &[ScriptSource]) -> RunReport;
 }
