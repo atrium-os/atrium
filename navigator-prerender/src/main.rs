@@ -31,6 +31,7 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
         c.scripts_total, c.scripts_run, c.scripts_failed, c.script_mutations,
         c.external_total, c.external_fetched, c.module_retries,
         c.observers_registered);
+    println!("L\t{}", c.layout_reads);
     println!("V\t{:?}", c.verdict);
     if let Some(f) = &c.first_error {
         println!("F\t{}", f.replace('\t', " ").replace('\n', " "));
@@ -82,6 +83,8 @@ fn main() {
     let mut timed_out = 0usize;
     let mut mod_retries = 0u32;
     let mut observers = 0u32;
+    let mut layout_reads = 0u32;
+    let mut layout_docs = 0usize;
     let mut verdicts: BTreeMap<String, usize> = BTreeMap::new();
     let mut unattributed: Vec<String> = vec![];
     let mut errors: BTreeMap<String, usize> = BTreeMap::new();
@@ -110,6 +113,8 @@ fn main() {
         }
         mod_retries += c.module_retries;
         observers += c.observers;
+        layout_reads += c.layout_reads;
+        if c.layout_reads > 0 { layout_docs += 1; }
         ext_total += c.external_total;
         ext_ok += c.external_fetched;
         ext_fail += c.external_total - c.external_fetched;
@@ -140,6 +145,9 @@ fn main() {
     println!("  some script failed {js_fail}");
     println!("  DOM actually changed by script {mutated}");
     if mod_retries > 0 { println!("  parsed as MODULE after a classic parse failed: {mod_retries}"); }
+    if layout_reads > 0 {
+        println!("  layout metrics read (no layout exists — nominal values): {layout_reads} in {layout_docs} docs");
+    }
     if observers > 0 {
         println!("  geometry observations registered, never delivered: {observers}  (no layout — see GLOBALS)");
     }
@@ -248,6 +256,7 @@ pub struct Child {
     pub first_error: Option<String>,
     pub module_retries: u32,
     pub observers: u32,
+    pub layout_reads: u32,
 }
 
 fn parse_child(s: &str) -> Option<Child> {
@@ -255,7 +264,7 @@ fn parse_child(s: &str) -> Option<Child> {
         scripts_failed: 0, script_mutations: 0, external_total: 0, external_fetched: 0,
         errors: vec![], missing: vec![], nulls: vec![], verdict: String::new(),
         first_error: None,
-        module_retries: 0, observers: 0 };
+        module_retries: 0, observers: 0, layout_reads: 0 };
     let mut saw = false;
     for line in s.lines() {
         let f: Vec<&str> = line.split('\t').collect();
@@ -276,6 +285,7 @@ fn parse_child(s: &str) -> Option<Child> {
             Some(&"M") if f.len() >= 3 => {
                 c.missing.push((f[2].to_string(), f[1].parse().unwrap_or(1)));
             }
+            Some(&"L") if f.len() >= 2 => c.layout_reads = f[1].parse().unwrap_or(0),
             Some(&"V") if f.len() >= 2 => c.verdict = f[1].to_string(),
             Some(&"F") if f.len() >= 2 => c.first_error = Some(f[1].to_string()),
             Some(&"N") if f.len() >= 3 => {

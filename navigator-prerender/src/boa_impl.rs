@@ -43,6 +43,8 @@ thread_local! {
     /// before the first failure is the causal one, and that needs a sequence,
     /// not a tally.
     static EVENTS: RefCell<Vec<(&'static str, String)>> = const { RefCell::new(Vec::new()) };
+    /// How often the page read a layout metric we cannot truthfully answer.
+    static LAYOUT_READS: RefCell<u32> = const { RefCell::new(0) };
     /// The document's URL, so `script.src` can be reported ABSOLUTE as a
     /// browser does — webpack derives publicPath from it, and a relative
     /// value there yields the wrong base.
@@ -131,6 +133,14 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
         let _ = o.set(js_string!("src"), js_string!(abs), false, ctx);
     }
     install_text_accessor(&o, ctx);
+    for n in ["clientWidth", "offsetWidth", "scrollWidth"] { layout_prop(&o, n, layout_w, ctx); }
+    for n in ["clientHeight", "offsetHeight", "scrollHeight"] { layout_prop(&o, n, layout_h, ctx); }
+    for n in ["offsetTop", "offsetLeft", "scrollTop", "scrollLeft"] { layout_prop(&o, n, layout_zero, ctx); }
+    {
+        let f = NativeFunction::from_fn_ptr(bounding_rect);
+        let _ = o.set(js_string!("getBoundingClientRect"),
+                      f.to_js_function(ctx.realm()), false, ctx);
+    }
     probed(o, "element", ctx)
 }
 
@@ -170,6 +180,66 @@ fn parse_url(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsVa
         .property(js_string!("origin"), js_string!(u.origin().ascii_serialization()), Attribute::all())
         .build();
     Ok(JsValue::from(o))
+}
+
+/// ★ LAYOUT METRICS ARE FICTION, AND THE QUESTION IS WHICH FICTION HURTS LEAST.
+///
+/// This converter performs no layout, so clientHeight and its relatives have
+/// no true answer. Three options, none of them honest:
+///
+///   - absent (what we did): the script throws on `undefined.foo` and the
+///     WHOLE script's content is lost, including everything it would have
+///     built before touching layout;
+///   - zero: a script told an element has no height routinely collapses or
+///     hides it, so the artifact is silently missing content;
+///   - a generous, self-consistent box: the script proceeds and content
+///     survives, at the cost of any geometry-dependent decision being made on
+///     numbers that are not real.
+///
+/// The third is chosen because this converter's output is laid out LATER by
+/// the real renderer: erring toward "everything is visible and nothing
+/// overflows" leaves that decision to the thing that can actually make it.
+/// scroll* equals client* deliberately, so no script concludes it must
+/// truncate or paginate.
+///
+/// Every read is counted (`layout_reads`) so the reach of the fiction is
+/// measured rather than assumed.
+const NOMINAL_W: f64 = 1280.0;
+const NOMINAL_H: f64 = 600.0;
+
+fn layout_w(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    LAYOUT_READS.with(|n| *n.borrow_mut() += 1);
+    Ok(JsValue::from(NOMINAL_W))
+}
+fn layout_h(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    LAYOUT_READS.with(|n| *n.borrow_mut() += 1);
+    Ok(JsValue::from(NOMINAL_H))
+}
+fn layout_zero(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
+    LAYOUT_READS.with(|n| *n.borrow_mut() += 1);
+    Ok(JsValue::from(0.0))
+}
+fn bounding_rect(_t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    LAYOUT_READS.with(|n| *n.borrow_mut() += 1);
+    let o = ObjectInitializer::new(ctx)
+        .property(js_string!("x"), 0.0, Attribute::all())
+        .property(js_string!("y"), 0.0, Attribute::all())
+        .property(js_string!("top"), 0.0, Attribute::all())
+        .property(js_string!("left"), 0.0, Attribute::all())
+        .property(js_string!("width"), NOMINAL_W, Attribute::all())
+        .property(js_string!("height"), NOMINAL_H, Attribute::all())
+        .property(js_string!("right"), NOMINAL_W, Attribute::all())
+        .property(js_string!("bottom"), NOMINAL_H, Attribute::all())
+        .build();
+    Ok(JsValue::from(o))
+}
+
+/// Install a read-only accessor backed by one of the layout getters.
+fn layout_prop(o: &JsObject, name: &str, f: fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>, ctx: &mut Context) {
+    let getter = NativeFunction::from_fn_ptr(f).to_js_function(ctx.realm());
+    let desc = boa_engine::property::PropertyDescriptor::builder()
+        .get(getter).enumerable(true).configurable(true).build();
+    let _ = o.define_property_or_throw(js_string!(name.to_string()), desc, ctx);
 }
 
 fn ignore(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
@@ -458,6 +528,19 @@ const GLOBALS: &str = r#"
 
   // Fixed identity: the converter's, not the reader's. A real user agent
   // string would be host state leaking into the artifact.
+  // Same nominal viewport as the element metrics, for consistency.
+  globalThis.innerWidth = 1280; globalThis.innerHeight = 600;
+  globalThis.devicePixelRatio = 1;
+  globalThis.scrollX = 0; globalThis.scrollY = 0;
+  if (typeof window !== 'undefined') {
+    window.innerWidth = 1280; window.innerHeight = 600;
+    window.devicePixelRatio = 1; window.scrollX = 0; window.scrollY = 0;
+    window.scrollTo = function () {}; window.matchMedia = function (q) {
+      return { matches: false, media: String(q), addListener: function(){}, removeListener: function(){},
+               addEventListener: function(){}, removeEventListener: function(){} };
+    };
+  }
+
   globalThis.navigator = {
     userAgent: 'atrium-navigator-prerender/0.1',
     language: 'en', languages: ['en'], onLine: true, cookieEnabled: false
@@ -597,11 +680,12 @@ impl ScriptEngine for BoaEngine {
         MISSES.with(|m| m.borrow_mut().clear());
         NULLS.with(|n| n.borrow_mut().clear());
         EVENTS.with(|e| e.borrow_mut().clear());
+        LAYOUT_READS.with(|n| *n.borrow_mut() = 0);
         BASE.with(|b| *b.borrow_mut() = self.base_url.clone());
         CURRENT.with(|c| *c.borrow_mut() = None);
         let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![],
             missing: vec![], nulls: vec![], first_error: None, cause: None, listeners_fired: 0,
-            module_retries: 0, observers_registered: 0 };
+            module_retries: 0, observers_registered: 0, layout_reads: 0 };
         RECORDING.with(|r| *r.borrow_mut() = false);
         let _ = ctx.register_global_callable(js_string!("__parse_url"), 2,
             NativeFunction::from_fn_ptr(parse_url));
@@ -675,6 +759,7 @@ impl ScriptEngine for BoaEngine {
         let _ = ctx.run_jobs();
 
         DOM.with(|d| *dom = std::mem::take(&mut d.borrow_mut()));
+        rep.layout_reads = LAYOUT_READS.with(|n| *n.borrow());
         rep.observers_registered = ctx
             .eval(Source::from_bytes(b"__observed"))
             .ok()

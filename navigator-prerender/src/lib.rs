@@ -33,6 +33,7 @@ pub struct Conversion {
     pub listeners_fired: u32,
     pub module_retries: u32,
     pub observers_registered: u32,
+    pub layout_reads: u32,
 }
 
 /// Parse, run the page's scripts once, and snapshot the result.
@@ -147,6 +148,7 @@ pub fn convert_with(
         listeners_fired: rep.listeners_fired,
         module_retries: rep.module_retries,
         observers_registered: rep.observers_registered,
+        layout_reads: rep.layout_reads,
         verdict,
         missing: rep.missing,
         first_error: rep.first_error,

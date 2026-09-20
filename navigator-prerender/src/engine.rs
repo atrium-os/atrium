@@ -47,6 +47,8 @@ pub struct RunReport {
     /// Geometry observations registered and deliberately never delivered —
     /// the visible cost of performing no layout.
     pub observers_registered: u32,
+    /// Reads of a layout metric this converter cannot truthfully answer.
+    pub layout_reads: u32,
 }
 
 pub trait ScriptEngine {

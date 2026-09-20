@@ -230,3 +230,26 @@ fn attribution_uses_the_proximate_cause_not_a_tally() {
         "a tally would have said OurGap; cause was {:?}", c.cause);
     assert_eq!(c.cause.as_ref().map(|(k, _)| k.as_str()), Some("no-match"));
 }
+
+/// Layout metrics are fiction; the test pins WHICH fiction — a generous,
+/// self-consistent box that errs toward content being visible, with scroll*
+/// equal to client* so nothing concludes it must truncate.
+#[test]
+fn layout_metrics_are_nominal_consistent_and_counted() {
+    let html = "<html><body><div id=r>x</div><script>\
+        var e = document.getElementById('r');\
+        e.setAttribute('ch', String(e.clientHeight));\
+        e.setAttribute('sh', String(e.scrollHeight));\
+        e.setAttribute('cw', String(e.clientWidth));\
+        var rect = e.getBoundingClientRect();\
+        e.setAttribute('rw', String(rect.width));\
+        e.setAttribute('overflows', String(e.scrollHeight > e.clientHeight));\
+        </script></body></html>";
+    let c = convert(html, &mut BoaEngine::default());
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.html.contains(r#"overflows="false""#),
+        "scroll must equal client so nothing truncates: {}", c.html);
+    assert!(!c.html.contains(r#"ch="0""#), "zero height makes scripts hide content: {}", c.html);
+    assert!(c.html.contains(r#"rw="1280""#), "got {}", c.html);
+    assert!(c.layout_reads >= 5, "reads must be counted, got {}", c.layout_reads);
+}
