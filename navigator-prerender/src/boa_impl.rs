@@ -1853,6 +1853,64 @@ const GLOBALS: &str = r#"
     };
     return Promise.resolve(resp);
   };
+  // ── Intl default locale ─────────────────────────────────────────────
+  //
+  // ★ THE DEFAULT LOCALE IS THE DOCUMENT'S, NOT THE HOST MACHINE'S.
+  //
+  // boa resolves an omitted locale with sys_locale::get_locale(), so
+  // `(1234.5).toLocaleString()` formatted as en-IN here purely because this
+  // machine is Indian English — the same host-state leak as the timezone,
+  // and one that enabling Intl would otherwise have INTRODUCED.
+  //
+  // The fix is better than merely pinning a constant: a document declares
+  // its own language, and a German page's dates should read German no matter
+  // where the conversion ran. `<html lang>` is that declaration. Absent one,
+  // en-US — a fixed choice, recorded, rather than whatever the converter's
+  // operating system happens to be set to.
+  //
+  // boa offers no hook for this, so the defaulting is applied at the JS
+  // boundary: an omitted locale becomes the document's, and an EXPLICIT
+  // locale is always passed through untouched.
+  if (typeof Intl === 'object' && Intl) {
+    var __docLocale = 'en-US';
+    try {
+      var lang = document.documentElement && document.documentElement.getAttribute('lang');
+      if (lang && String(lang).trim()) __docLocale = String(lang).trim();
+    } catch (e) {}
+    globalThis.__docLocale = __docLocale;
+
+    ['NumberFormat', 'DateTimeFormat', 'Collator', 'PluralRules',
+     'ListFormat', 'Segmenter', 'DisplayNames'].forEach(function (n) {
+      var Orig = Intl[n];
+      if (typeof Orig !== 'function') return;
+      function Wrapped(locales, options) {
+        return new Orig(locales === undefined ? __docLocale : locales, options);
+      }
+      Wrapped.prototype = Orig.prototype;
+      if (typeof Orig.supportedLocalesOf === 'function') {
+        Wrapped.supportedLocalesOf = function () {
+          return Orig.supportedLocalesOf.apply(Orig, arguments);
+        };
+      }
+      Intl[n] = Wrapped;
+    });
+
+    // The prototype methods take their locale the same way.
+    function defaulted(proto, name) {
+      var orig = proto && proto[name];
+      if (typeof orig !== 'function') return;
+      proto[name] = function (locales, options) {
+        return orig.call(this, locales === undefined ? __docLocale : locales, options);
+      };
+    }
+    defaulted(Number.prototype, 'toLocaleString');
+    defaulted(Date.prototype, 'toLocaleString');
+    defaulted(Date.prototype, 'toLocaleDateString');
+    defaulted(Date.prototype, 'toLocaleTimeString');
+    defaulted(String.prototype, 'localeCompare');
+    defaulted(Array.prototype, 'toLocaleString');
+  }
+
   // ── Event ───────────────────────────────────────────────────────────
   //
   // The corpus constructs events 296 times and DISPATCHES them 383, so a

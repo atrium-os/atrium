@@ -10,12 +10,11 @@ description = "Tier-2 conversion instrument: run a page's scripts once, headless
 # standardised JavaScript (ECMAScript Annex B.1.1, HTML-like comments) and
 # every browser accepts it in a classic script, so refusing it made real,
 # valid pages look broken.
-# ★ `intl` is OFF and CANNOT be turned on: boa 0.22.0's intl feature pins
-# icu_list/icu_locale ~2.3.0, and crates.io has only 2.0.0 — the feature does
-# not resolve. So there is no `Intl` object, and `toLocaleDateString`
-# silently degrades to the full Date toString rather than failing. 33 of the
-# corpus's 566 fetched scripts use Intl. Blocked upstream, not a choice.
-boa_engine = { version = "0.22", features = ["annex-b"] }
+# intl_bundled ships ICU data in the binary. Without it there is NO `Intl`
+# object, and `toLocaleDateString` silently degrades to the full
+# `Date.toString()` — a page formatting a date gets garbage rather than an
+# error. 33 of the corpus's 566 fetched scripts use Intl.
+boa_engine = { version = "0.22", features = ["annex-b", "intl_bundled"] }
 html5ever = "0.39"
 markup5ever_rcdom = "0.39"
 url = "2"

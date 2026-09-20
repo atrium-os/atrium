@@ -274,18 +274,73 @@ fn timezone_is_utc_not_the_host_machines() {
     assert!(c.html.contains(r#"s="1970-01-01T00:00:00.000Z""#), "{}", c.html);
 }
 
-/// ★ Recorded absence, so it cannot be mistaken for a gap nobody noticed:
-/// there is no `Intl`. boa 0.22.0's `intl` feature pins ICU crates at
-/// versions that were never published, so it cannot be enabled at all. 33 of
-/// the corpus's fetched scripts use Intl. This test documents the state and
-/// will fail — deliberately — the day the feature becomes available.
+/// ★ Intl exists. It was reported "blocked upstream" on the strength of a
+/// STALE local crates.io index — icu_list 2.3.0 is published, and
+/// `intl_bundled` builds fine once the index is refreshed. Without it there
+/// is no Intl at all and toLocaleDateString silently degrades to
+/// `Date.toString()`, so a page formatting a date gets garbage.
 #[test]
-fn intl_is_absent_and_that_is_blocked_upstream() {
+fn intl_is_present_and_really_formats() {
     let html = "<html><body><div id=t></div><script>\
-        document.getElementById('t').setAttribute('i', typeof Intl);\
+        document.getElementById('t').setAttribute('a', typeof Intl);\
+        document.getElementById('t').setAttribute('b', new Intl.NumberFormat('de-DE').format(1234.5));\
+        document.getElementById('t').setAttribute('c', new Intl.DateTimeFormat('en-GB').format(new Date(0)));\
+        document.getElementById('t').setAttribute('d', 'i'.toLocaleUpperCase('tr'));\
         </script></body></html>";
     let c = convert(html, &mut BoaEngine::default());
-    assert!(c.html.contains(r#"i="undefined""#),
-        "Intl became available — enable boa's intl feature and revisit \
-         toLocaleDateString, which currently degrades to Date.toString: {}", c.html);
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.html.contains(r#"a="object""#), "{}", c.html);
+    // Real ICU data, not a stub: German grouping, British date order, and
+    // the Turkish dotted capital I.
+    assert!(c.html.contains(r#"b="1.234,5""#), "{}", c.html);
+    assert!(c.html.contains(r#"c="01/01/1970""#), "{}", c.html);
+    assert!(c.html.contains("d=\"\u{130}\""), "{}", c.html);
+}
+
+/// ★ An omitted locale resolves to the DOCUMENT's, never the host machine's.
+/// boa asks sys_locale, so this formatted as en-IN purely because the
+/// developer's machine is — a host-state leak that enabling Intl would
+/// otherwise have introduced. A German page's numbers should read German
+/// wherever the conversion runs.
+#[test]
+fn omitted_locale_comes_from_the_document_not_the_host() {
+    let html = "<html lang=\"de-DE\"><body><div id=t></div><script>\
+        document.getElementById('t').setAttribute('n', (1234.5).toLocaleString());\
+        document.getElementById('t').setAttribute('l', new Intl.NumberFormat().resolvedOptions().locale);\
+        </script></body></html>";
+    let c = convert(html, &mut BoaEngine::default());
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.html.contains(r#"n="1.234,5""#), "document lang ignored: {}", c.html);
+    // ★ RECORDED DIVERGENCE: resolvedOptions().locale reports ICU's
+    // MINIMIZED tag ("de"), where a browser echoes the full "de-DE". The
+    // formatting is identical; only the reported tag differs. Asserted as it
+    // actually behaves so the difference is documented rather than papered
+    // over — I expected "de-DE" and was wrong about the engine, not the code.
+    assert!(c.html.contains(r#"l="de""#), "{}", c.html);
+}
+
+/// With no lang declared the default is a FIXED en-US — a recorded choice,
+/// not whatever the converter's OS is set to.
+#[test]
+fn without_a_declared_language_the_default_is_fixed() {
+    let html = "<html><body><div id=t></div><script>\
+        document.getElementById('t').setAttribute('l', new Intl.DateTimeFormat().resolvedOptions().locale);\
+        document.getElementById('t').setAttribute('z', new Intl.DateTimeFormat().resolvedOptions().timeZone);\
+        </script></body></html>";
+    let c = convert(html, &mut BoaEngine::default());
+    assert!(c.html.contains(r#"l="en-US""#), "host locale leaked: {}", c.html);
+    assert!(c.html.contains(r#"z="utc""#), "host timezone leaked: {}", c.html);
+}
+
+/// An EXPLICIT locale is always passed through untouched — the defaulting
+/// must never override what the page actually asked for.
+#[test]
+fn an_explicit_locale_is_never_overridden() {
+    let html = "<html lang=\"de-DE\"><body><div id=t></div><script>\
+        document.getElementById('t').setAttribute('n', (1234.5).toLocaleString('en-US'));\
+        document.getElementById('t').setAttribute('m', new Intl.NumberFormat('fr-FR').resolvedOptions().locale);\
+        </script></body></html>";
+    let c = convert(html, &mut BoaEngine::default());
+    assert!(c.html.contains(r#"n="1,234.5""#), "{}", c.html);
+    assert!(c.html.contains(r#"m="fr""#), "minimized tag — see the note above: {}", c.html);
 }
