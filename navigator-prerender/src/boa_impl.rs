@@ -28,6 +28,12 @@ thread_local! {
     /// 18 documents. A measurement that reports its own probes is measuring
     /// itself; this flag keeps the instrument out of its own numbers.
     static RECORDING: RefCell<bool> = const { RefCell::new(false) };
+    /// The `<script>` element currently executing, for `document.currentScript`.
+    static CURRENT: RefCell<Option<Handle>> = const { RefCell::new(None) };
+    /// The document's URL, so `script.src` can be reported ABSOLUTE as a
+    /// browser does — webpack derives publicPath from it, and a relative
+    /// value there yields the wrong base.
+    static BASE: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 fn with<R>(f: impl FnOnce(&mut Dom) -> R) -> R { DOM.with(|d| f(&mut d.borrow_mut())) }
@@ -100,6 +106,15 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
         .function(NativeFunction::from_fn_ptr(by_class), js_string!("getElementsByClassName"), 1)
         .function(NativeFunction::from_fn_ptr(by_tag_name), js_string!("getElementsByTagName"), 1)
         .build();
+    // `src` as a browser reports it: absolute against the document URL.
+    if let Some(raw) = with(|d| d.attr(h, "src").map(str::to_string)) {
+        let abs = BASE.with(|b| b.borrow().clone())
+            .and_then(|b| url::Url::parse(&b).ok())
+            .and_then(|b| b.join(&raw).ok())
+            .map(|u| u.to_string())
+            .unwrap_or(raw);
+        let _ = o.set(js_string!("src"), js_string!(abs), false, ctx);
+    }
     install_text_accessor(&o, ctx);
     probed(o, "element", ctx)
 }
@@ -186,6 +201,17 @@ fn set_text(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
         with(|d| { d.set_text(h, &t); d.script_mutations += 1; });
     }
     Ok(JsValue::undefined())
+}
+
+/// `document.currentScript` — the element being executed, or null.
+///
+/// Null for modules, as the specification requires, and null outside script
+/// execution (a DOMContentLoaded handler sees null, not the last script).
+fn current_script(_t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    Ok(match CURRENT.with(|c| *c.borrow()) {
+        Some(h) => node_obj(h, ctx),
+        None => JsValue::null(),
+    })
 }
 
 fn get_element_by_id(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -469,6 +495,12 @@ impl ScriptEngine for BoaEngine {
             .property(js_string!("documentElement"), doc_el_v, Attribute::all())
             .property(js_string!("__h"), 0.0, Attribute::all())
             .build();
+        {
+            let getter = NativeFunction::from_fn_ptr(current_script).to_js_function(ctx.realm());
+            let desc = boa_engine::property::PropertyDescriptor::builder()
+                .get(getter).enumerable(true).configurable(true).build();
+            let _ = doc.define_property_or_throw(js_string!("currentScript"), desc, &mut ctx);
+        }
         let doc_v = probed(doc.clone(), "document", &mut ctx);
         let _ = ctx.register_global_property(js_string!("document"), doc_v, Attribute::all());
 
@@ -499,6 +531,8 @@ impl ScriptEngine for BoaEngine {
         let _ = ctx.register_global_property(js_string!("console"), console, Attribute::all());
 
         MISSES.with(|m| m.borrow_mut().clear());
+        BASE.with(|b| *b.borrow_mut() = self.base_url.clone());
+        CURRENT.with(|c| *c.borrow_mut() = None);
         let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![],
             missing: vec![], listeners_fired: 0, module_retries: 0 };
         RECORDING.with(|r| *r.borrow_mut() = false);
@@ -514,6 +548,8 @@ impl ScriptEngine for BoaEngine {
         }
         RECORDING.with(|r| *r.borrow_mut() = true);
         for s in scripts {
+            // Per spec, currentScript is null while a MODULE evaluates.
+            CURRENT.with(|c| *c.borrow_mut() = if s.module { None } else { s.element });
             let mut err = if s.module {
                 run_module(&mut ctx, &s.text, s.path.as_deref()).err()
             } else {
@@ -546,6 +582,8 @@ impl ScriptEngine for BoaEngine {
                 }
             }
         }
+        // No script is executing during the lifecycle pass.
+        CURRENT.with(|c| *c.borrow_mut() = None);
         // Lifecycle AFTER the scripts have registered their handlers. Page
         // handlers run inside this pass, so recording stays ON for them; the
         // FIRE script's own typeof probes are named below and filtered.

@@ -20,6 +20,8 @@ pub struct ScriptSource {
     /// Declared `type="module"`, or inferred after a classic parse failed on
     /// module-only syntax.
     pub module: bool,
+    /// The `<script>` element this came from, for `document.currentScript`.
+    pub element: Option<crate::dom::Handle>,
 }
 
 pub struct RunReport {

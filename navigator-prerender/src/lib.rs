@@ -62,7 +62,7 @@ pub fn convert_with(
     let mut scripts: Vec<ScriptSource> = vec![];
     for s in dom::scripts_in_order(&dom) {
         match s {
-            Script::Inline { text, module } => {
+            Script::Inline { text, module, element } => {
                 // An inline module is written into the document's own
                 // directory in the mirror, so ITS relative imports resolve
                 // exactly as the page intends.
@@ -87,9 +87,9 @@ pub fn convert_with(
                             std::fs::write(&p, &text).ok().map(|_| p)
                         })
                 } else { None };
-                scripts.push(ScriptSource { text, module, path });
+                scripts.push(ScriptSource { text, module, path, element: Some(element) });
             }
-            Script::External { href, module } => {
+            Script::External { href, module, element } => {
                 ext_total += 1;
                 match resolve(base, &href) {
                     None => { ext_fail += 1; fetch_errors.push(format!("unresolved src: {href}")); }
@@ -102,13 +102,13 @@ pub fn convert_with(
                                 Some(path) => {
                                     ext_ok += 1;
                                     let text = std::fs::read_to_string(&path).unwrap_or_default();
-                                    scripts.push(ScriptSource { text, module: true, path: Some(path) });
+                                    scripts.push(ScriptSource { text, module: true, path: Some(path), element: Some(element) });
                                 }
                                 None => ext_fail += 1,
                             }
                         } else {
                             match fetcher.get(&abs) {
-                                Ok(body) => { ext_ok += 1; scripts.push(ScriptSource { text: body, module, path: None }); }
+                                Ok(body) => { ext_ok += 1; scripts.push(ScriptSource { text: body, module, path: None, element: Some(element) }); }
                                 Err(e) => { ext_fail += 1; fetch_errors.push(e); }
                             }
                         }

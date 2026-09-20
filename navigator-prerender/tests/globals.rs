@@ -94,3 +94,52 @@ fn navigator_is_fixed_not_host_derived() {
     let c = run(html);
     assert!(c.html.contains("atrium-navigator-prerender"), "got {}", c.html);
 }
+
+/// currentScript must point at the executing element, and its src must be
+/// ABSOLUTE as a browser reports it — webpack derives publicPath from it.
+#[test]
+fn current_script_points_at_the_running_element() {
+    use navigator_prerender::fetch::MapFetcher;
+    let mut f = MapFetcher::default();
+    f.0.insert("https://example.test/assets/app.js".into(),
+        "document.body.setAttribute('src', document.currentScript.src);\
+         document.body.setAttribute('tag', document.currentScript.tagName);".into());
+    let html = r#"<html><body><script src="/assets/app.js"></script></body></html>"#;
+    let c = convert_with(html, Some("https://example.test/page.html"),
+                         &mut BoaEngine::default(), &mut f);
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.html.contains(r#"src="https://example.test/assets/app.js""#),
+        "src must be absolute: {}", c.html);
+    assert!(c.html.contains(r#"tag="SCRIPT""#), "got {}", c.html);
+}
+
+/// Null for a module, as the spec requires, and null once scripts are done.
+#[test]
+fn current_script_is_null_for_modules_and_after_scripts() {
+    let html = r#"<html><body><div id=r></div>
+      <script type="module">
+        document.getElementById('r').setAttribute('in-module', String(document.currentScript));
+      </script>
+      <script>
+        document.addEventListener('DOMContentLoaded', function () {
+          document.getElementById('r').setAttribute('in-handler', String(document.currentScript));
+        });
+      </script></body></html>"#;
+    let c = convert(html, &mut BoaEngine::default());
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.html.contains(r#"in-module="null""#), "module must see null: {}", c.html);
+    assert!(c.html.contains(r#"in-handler="null""#), "handler must see null: {}", c.html);
+}
+
+/// An inline script still gets an element, just one with no src.
+#[test]
+fn current_script_for_inline_has_no_src() {
+    let html = "<html><body><div id=r></div><script>\
+        document.getElementById('r').setAttribute('t', document.currentScript.tagName);\
+        document.getElementById('r').setAttribute('s', String(document.currentScript.src));\
+        </script></body></html>";
+    let c = convert(html, &mut BoaEngine::default());
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.html.contains(r#"t="SCRIPT""#), "got {}", c.html);
+    assert!(c.html.contains(r#"s="undefined""#), "inline has no src: {}", c.html);
+}
