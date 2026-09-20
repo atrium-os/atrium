@@ -479,43 +479,49 @@ make it small.
 
 #### The corpus actually used
 
-360 HTML documents and 40 stylesheets from this tree (FreeBSD contrib docs, the Lua
-manual, EDK2, generated reports), plus 95 Markdown specs under `docs/`:
+**24 real web documents**, fetched for this purpose: Wikipedia articles, MDN, W3C and IETF
+specifications, language and database documentation (Rust, Python, Go, PostgreSQL, SQLite,
+nginx, bash, curl, the Linux and FreeBSD handbooks), blogs, and news/forum front pages.
+This is the content class the document lane targets, rather than the source-tree
+documentation an earlier revision used.
 
 | measure | median | p95 | p99 | max |
 |---|---|---|---|---|
-| document bytes (HTML) | 5,510 | 64,163 | 140,121 | 564,379 |
-| elements per document | 84 | 1,407 | 2,669 | 12,594 |
-| tree depth ★ | 8 | 34 | 65 | 1,345 ★ |
-| stylesheet bytes | — | — | — | 31,024 |
-| rules per stylesheet | — | — | — | 266 |
-| table columns (Markdown) | 3 | 6 | 12 | 12 |
+| document bytes | 142,913 | 1,525,929 | 2,033,807 | 2,033,807 |
+| elements per document | 1,740 | 16,014 | 19,415 | 19,415 |
+| tree depth ★ | 15 | 35 | 158 | 158 |
 
-★ **The depth figures are inflated and must not be read as structural nesting.** The
-measuring parser does not implement HTML5's implied end tags, so unclosed `<p>`/`<li>`/`<dt>`
-in legacy markup accumulate on its stack — the 1,345 outlier is the Lua manual, not a
-document nested 1,345 deep. This profile requires *well-formed* input (§2), where that
-inflation cannot occur, so the depth ceiling below is set from the median and p95 with
-generous headroom rather than from the contaminated tail.
+For contrast, a source-tree corpus (360 local HTML files) measured a median of **84**
+elements against this corpus's **1,740** — a twentyfold difference, and the reason the
+earlier numbers were withdrawn. Ceilings set against local documentation would have been
+far too tight for the web.
 
-★★ **This is a convenience corpus, not a representative one.** It is source-tree
-documentation, not a sample of the Wikipedia/news/blog content the document lane targets,
-and it contains no grids, no `calc()`, and no custom properties at all. These ceilings are
-therefore **provisional**, and §8 keeps re-derivation on a representative corpus open. The
-derivation *method* above is the durable part; the numbers are the best available now and
-are explicitly better than invented ones.
+★ **The depth figures are still an upper bound, not structural nesting.** The measuring
+parser does not implement HTML5's implied end tags, so unclosed elements in lenient markup
+accumulate on its stack. The profile requires well-formed input (§2), where that inflation
+cannot occur.
+
+★★ **n = 24, so "p99" is the maximum.** The derivation rule prefers p99 precisely so one
+pathological artifact cannot set a compatibility surface — and at this sample size the two
+coincide, so that protection is not yet operating. The ceilings below are consequently set
+with a **4× headroom factor** on that value, and a larger corpus remains wanted (§8) before
+these are treated as fixed.
+
+**No corpus signal at all** for stylesheet size and count (this corpus's CSS is external
+and was not fetched), grid track counts, `calc()` nesting or custom-property depth. Those
+ceilings are marked *reasoned* below and are not dressed up as measurements.
 
 #### The ceilings
 
 | ceiling | value | basis |
 |---|---|---|
-| total document bytes | **4 MiB** | ~7× observed max, ~30× p99 |
-| elements per document | **65,536** | ~5× observed max, ~24× p99 |
-| tree depth | **256** | ~7× p95; set off median/p95, see ★ |
+| total document bytes | **8 MiB** | 4× the 2.03 MiB p99/max |
+| elements per document | **131,072** | 4× the 19,415 p99/max, rounded up to 2^17 |
+| tree depth | **1,024** | 4× the 158 p99/max; the previous 256 left only 1.6× |
 | stylesheets per document | **16** | reasoned — no corpus signal |
 | `@import` depth | **4** | reasoned |
-| bytes per stylesheet | **1 MiB** | ~34× observed max |
-| rules per stylesheet | **16,384** | ~60× observed max |
+| bytes per stylesheet | **1 MiB** | reasoned — this corpus's CSS is external, not fetched |
+| rules per stylesheet | **16,384** | reasoned — as above |
 | `calc()` nesting depth | **16** | reasoned — hand-written `calc()` rarely exceeds 3 |
 | custom-property substitution depth | **16** | reasoned; cycles are a diagnostic regardless |
 | grid tracks per axis (incl. `repeat()` expansion) | **1,024** | reasoned — no corpus signal |
@@ -703,8 +709,10 @@ property browsers can only approximate into a hard, mechanically checkable asser
 
 ## 8. Open questions
 
-1. **Re-derive the §3.12 ceilings on a representative corpus.** They are currently set
-   from a *convenience* corpus — this source tree's documentation — which contains no
-   grids, no `calc()` and no custom properties, and is not the Wikipedia/news/blog content
-   the lane targets. The derivation method (p99, headroom, round to a power of two) is
-   settled; the numbers are provisional and become a compatibility surface once published.
+1. **Widen the §3.12 corpus.** The ceilings are now set from 24 real web documents rather
+   than source-tree documentation, which corrected them substantially (elements 65,536 →
+   131,072; depth 256 → 1,024). But n = 24 means "p99" is the maximum, so the rule's own
+   protection against a single artifact setting the surface is not yet operating, and the
+   corpus still carries no external CSS, no grids, no `calc()` and no custom properties.
+   The method is settled; the numbers are provisional until the sample is large enough for
+   p99 to mean p99.
