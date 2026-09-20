@@ -70,6 +70,7 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
         c.observers_registered);
     println!("L\t{}", c.layout_reads);
     println!("O\t{}\t{}\t{}", c.observers_registered, c.mutation_records, c.ce_upgrades);
+    println!("H\t{}\t{}", c.history_writes, c.history_refused);
     println!("T\t{}\t{}", c.timers_fired, c.timers_dropped);
     println!("P\t{}\t{}\t{}\t{}", c.page_fetches, c.page_fetch_failures,
         c.page_blocked, c.beacons_suppressed);
@@ -134,6 +135,7 @@ fn main() {
     let mut layout_reads = 0u32;
     let mut mo_records = 0u32;
     let mut ce_up = 0u32;
+    let mut hist_w = 0u32; let mut hist_r = 0u32; let mut hist_docs = 0usize;
     let mut ce_docs = 0usize;
     let mut mo_docs = 0usize;
     let (mut t_fired, mut t_dropped, mut t_docs) = (0u32, 0u32, 0usize);
@@ -193,6 +195,8 @@ fn main() {
         layout_reads += c.layout_reads;
         mo_records += c.mutation_records;
         ce_up += c.ce_upgrades;
+        hist_w += c.history_writes; hist_r += c.history_refused;
+        if c.history_writes > 0 { hist_docs += 1; }
         if c.ce_upgrades > 0 { ce_docs += 1; }
         if c.mutation_records > 0 { mo_docs += 1; }
         pf += c.page_fetches; pff += c.page_fetch_failures;
@@ -241,6 +245,10 @@ fn main() {
     }
     if t_fired > 0 || t_dropped > 0 {
         println!("  timer callbacks fired: {t_fired} in {t_docs} docs; {t_dropped} still pending at the horizon");
+    }
+    if hist_w > 0 || hist_r > 0 {
+        println!("  same-document history writes: {hist_w} in {hist_docs} docs; \
+                  {hist_r} navigations REFUSED (would leave the document)");
     }
     if ce_up > 0 {
         println!("  custom elements UPGRADED (constructor + connectedCallback): {ce_up} in {ce_docs} docs");
@@ -371,6 +379,8 @@ pub struct Child {
     pub layout_reads: u32,
     pub mutation_records: u32,
     pub ce_upgrades: u32,
+    pub history_writes: u32,
+    pub history_refused: u32,
     pub cause: Option<(String, String)>,
     pub timers_fired: u32,
     pub timers_dropped: u32,
@@ -386,7 +396,7 @@ fn parse_child(s: &str) -> Option<Child> {
         scripts_failed: 0, script_mutations: 0, external_total: 0, external_fetched: 0,
         errors: vec![], missing: vec![], nulls: vec![], verdict: String::new(),
         first_error: None,
-        module_retries: 0, observers: 0, layout_reads: 0, mutation_records: 0, ce_upgrades: 0,
+        module_retries: 0, observers: 0, layout_reads: 0, mutation_records: 0, ce_upgrades: 0, history_writes: 0, history_refused: 0,
         cause: None,
         timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0,
         page_blocked: 0, beacons: 0, blocked_hosts: vec![] };
@@ -409,6 +419,10 @@ fn parse_child(s: &str) -> Option<Child> {
             Some(&"E") if f.len() >= 2 => c.errors.push(f[1].to_string()),
             Some(&"M") if f.len() >= 3 => {
                 c.missing.push((f[2].to_string(), f[1].parse().unwrap_or(1)));
+            }
+            Some(&"H") if f.len() >= 3 => {
+                c.history_writes = f[1].parse().unwrap_or(0);
+                c.history_refused = f[2].parse().unwrap_or(0);
             }
             Some(&"C") if f.len() >= 3 => c.cause = Some((f[1].to_string(), f[2].to_string())),
             Some(&"L") if f.len() >= 2 => c.layout_reads = f[1].parse().unwrap_or(0),

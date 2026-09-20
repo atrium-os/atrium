@@ -54,6 +54,10 @@ pub struct RunReport {
     /// Custom elements actually UPGRADED — constructor run and
     /// connectedCallback fired, not merely registered.
     pub ce_upgrades: u32,
+    /// Same-document history writes (pushState + replaceState) the page made.
+    pub history_writes: u32,
+    /// Navigations refused because they would leave the document.
+    pub history_refused: u32,
     /// Reads of a layout metric this converter cannot truthfully answer.
     pub layout_reads: u32,
     /// Timer callbacks dispatched, and those still pending at the horizon.

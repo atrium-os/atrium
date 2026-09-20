@@ -1324,9 +1324,97 @@ const GLOBALS: &str = r#"
       loc.assign = function () {}; loc.replace = function () {}; loc.reload = function () {};
       globalThis.location = loc;
       if (typeof window !== 'undefined') { window.location = loc; }
-      try { Object.defineProperty(document, 'URL', { get: function(){ return loc.href; }, configurable: true }); } catch (e) {}
+      // ★ Reads the CURRENT location, not the one captured here. history
+      // replaces the location object, and a getter closed over `loc` would
+      // keep reporting the URL the document was fetched from after the page
+      // had rewritten it.
+      try { Object.defineProperty(document, 'URL',
+        { get: function(){ return globalThis.location ? globalThis.location.href : ''; },
+          configurable: true }); } catch (e) {}
     }
   }
+
+  // ── history ─────────────────────────────────────────────────────────
+  //
+  // The corpus asks for replaceState (66 references), pushState (40), state
+  // (35), scrollRestoration (21) and go (10). All of it is SAME-DOCUMENT
+  // navigation, which is the one kind of navigation a converter can honestly
+  // perform: no request, no new document, just a URL and a state object the
+  // page manages itself.
+  //
+  // ★ IT REALLY DOES MOVE `location`. Accepting a pushState and then
+  // reporting the old URL would be worse than refusing: a script that pushes
+  // and then builds links or fetch paths from location would compute them
+  // against a URL its own code believes it has left. The artifact records
+  // where the page put itself.
+  //
+  // What it will NOT do is leave the document. back() past our first entry,
+  // forward() past the last, and go(0) are all real navigations or reloads;
+  // they are refused and COUNTED rather than faked.
+  (function () {
+    var start = globalThis.location ? globalThis.location.href
+              : (typeof __doc_url === 'string' ? __doc_url : '');
+    var entries = [ { url: start, state: null } ];
+    var idx = 0;
+    globalThis.__histWrites = 0;
+    globalThis.__histRefused = 0;
+
+    function apply() {
+      var p = __parse_url(entries[idx].url);
+      if (!p) return;
+      var nu = mkurl(p);
+      nu.assign = function () {}; nu.replace = function () {}; nu.reload = function () {};
+      globalThis.location = nu;
+    }
+    function resolve(url) {
+      if (url === undefined || url === null || url === '') return entries[idx].url;
+      var p = __parse_url(String(url), entries[idx].url);
+      return p ? p.href : entries[idx].url;
+    }
+    function sameOrigin(href) {
+      var a = __parse_url(href), b = __parse_url(entries[idx].url);
+      return !!(a && b) && a.origin === b.origin;
+    }
+    function write(state, url, replace) {
+      var target = resolve(url);
+      if (!sameOrigin(target)) {
+        // A browser throws here; cross-origin history writing is not a thing.
+        throw new Error("SecurityError: history " +
+          (replace ? "replaceState" : "pushState") + " to a different origin");
+      }
+      if (replace) { entries[idx] = { url: target, state: state }; }
+      else { entries = entries.slice(0, idx + 1);
+             entries.push({ url: target, state: state }); idx = entries.length - 1; }
+      globalThis.__histWrites++;
+      apply();
+    }
+    globalThis.history = {
+      get length() { return entries.length; },
+      get state() { return entries[idx].state; },
+      scrollRestoration: 'auto',
+      pushState: function (state, title, url) { write(state, url, false); },
+      replaceState: function (state, title, url) { write(state, url, true); },
+      back: function () { this.go(-1); },
+      forward: function () { this.go(1); },
+      go: function (n) {
+        n = (n === undefined) ? 0 : (n | 0);
+        var t = idx + n;
+        // go(0) is a reload; anything outside our own entries leaves the
+        // document. Both are navigations this converter must not perform.
+        if (n === 0 || t < 0 || t >= entries.length) { globalThis.__histRefused++; return; }
+        idx = t;
+        apply();
+        // Going back to an entry WE pushed is genuinely same-document, so
+        // popstate here is real rather than invented.
+        var st = entries[idx].state;
+        __fire('popstate', { state: st });
+        if (typeof globalThis.onpopstate === 'function') {
+          try { globalThis.onpopstate({ type: 'popstate', state: st }); globalThis.__fired++; }
+          catch (e) {}
+        }
+      },
+    };
+  })();
 
   // ★ GEOMETRY OBSERVERS ACCEPT AND NEVER DELIVER.
   //
@@ -1625,9 +1713,10 @@ const BOOTSTRAP: &str = r#"
   function remove(t, f) {
     for (var i = L.length - 1; i >= 0; i--) if (L[i][0] === String(t) && L[i][1] === f) L.splice(i, 1);
   }
-  globalThis.__fire = function (type) {
+  globalThis.__fire = function (type, extra) {
     var ev = { type: type, target: document, currentTarget: document,
                preventDefault: function () {}, stopPropagation: function () {} };
+    if (extra) for (var k in extra) ev[k] = extra[k];
     for (var i = 0; i < L.length; i++) {
       if (L[i][0] !== type) continue;
       try { L[i][1].call(document, ev); globalThis.__fired++; } catch (e) {}
@@ -1786,7 +1875,7 @@ impl ScriptEngine for BoaEngine {
         let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![],
             missing: vec![], nulls: vec![], first_error: None, cause: None, listeners_fired: 0,
             module_retries: 0, observers_registered: 0, mutation_records: 0,
-            ce_upgrades: 0, layout_reads: 0,
+            ce_upgrades: 0, history_writes: 0, history_refused: 0, layout_reads: 0,
             timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0,
             page_blocked: 0, blocked_hosts: vec![], beacons_suppressed: 0 };
         RECORDING.with(|r| *r.borrow_mut() = false);
@@ -1928,6 +2017,10 @@ impl ScriptEngine for BoaEngine {
             .ok()
             .and_then(|v| v.as_number())
             .unwrap_or(0.0) as u32;
+        rep.history_writes = ctx.eval(Source::from_bytes(b"__histWrites")).ok()
+            .and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
+        rep.history_refused = ctx.eval(Source::from_bytes(b"__histRefused")).ok()
+            .and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
         rep.ce_upgrades = ctx
             .eval(Source::from_bytes(b"__ceUpgrades"))
             .ok().and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
