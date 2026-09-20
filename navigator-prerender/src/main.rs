@@ -6,6 +6,30 @@
 use navigator_prerender::{boa_impl::BoaEngine, convert_with, fetch::{Fetcher, HttpFetcher, NoNetwork}};
 use std::{collections::BTreeMap, fs, path::{Path, PathBuf}};
 
+/// Name the cause from the message, for failures that recorded no event.
+fn classify_message(msg: &str) -> String {
+    if let Some(rest) = msg.strip_prefix("ReferenceError: ") {
+        if let Some(name) = rest.split(" is not defined").next() {
+            if !name.is_empty() && name.len() < 60 {
+                return format!("missing global {name}");
+            }
+        }
+    }
+    if msg.starts_with("SyntaxError: unexpected token '<'") {
+        // A script body that is HTML: an error page served where JS was
+        // expected. Not an engine gap — a fetch that returned the wrong thing.
+        return "script body is HTML, not JavaScript".to_string();
+    }
+    if msg.contains("not supported in this browser") {
+        return "environment probe rejected us".to_string();
+    }
+    if msg.starts_with("SyntaxError") { return "SyntaxError (parse)".to_string() }
+    if msg.contains("could not open file") || msg.contains("bare module specifier") {
+        return "module resolution".to_string()
+    }
+    "UNATTRIBUTED".to_string()
+}
+
 fn collect(p: &Path, out: &mut Vec<PathBuf>) {
     if p.is_dir() {
         if let Ok(rd) = fs::read_dir(p) {
@@ -51,6 +75,12 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
         c.page_blocked, c.beacons_suppressed);
     for (k, n) in c.blocked_hosts.iter() { println!("B\t{n}\t{k}"); }
     println!("V\t{:?}", c.verdict);
+    // The PROXIMATE CAUSE of the first failure: the last recorded event
+    // before the throw. A symptom bucket like "null or undefined" is useless
+    // without it — the message names what broke, this names why.
+    if let Some((kind, what)) = &c.cause {
+        println!("C\t{kind}\t{}", what.replace('\t', " "));
+    }
     if let Some(f) = &c.first_error {
         println!("F\t{}", f.replace('\t', " ").replace('\n', " "));
     }
@@ -113,6 +143,9 @@ fn main() {
     let mut layout_docs = 0usize;
     let mut verdicts: BTreeMap<String, usize> = BTreeMap::new();
     let mut unattributed: Vec<String> = vec![];
+    // First failures bucketed by PROXIMATE CAUSE rather than by message.
+    let mut causes: BTreeMap<String, usize> = BTreeMap::new();
+    let mut cause_docs: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut errors: BTreeMap<String, usize> = BTreeMap::new();
     let mut missing: BTreeMap<String, u32> = BTreeMap::new();
     let mut nulls: BTreeMap<String, u32> = BTreeMap::new();
@@ -136,6 +169,24 @@ fn main() {
                         f.chars().take(120).collect::<String>(), name));
                 }
             }
+        }
+        // ★ Attribute the first failure by CAUSE. The message buckets are
+        // symptoms: 51 occurrences of "cannot convert null or undefined to
+        // object" is one sentence covering ten unrelated gaps, and reading it
+        // as a single item is what sends you building the wrong thing.
+        if c.first_error.is_some() {
+            let key = match &c.cause {
+                Some((k, what)) if k == "missing" => format!("missing {what}"),
+                Some((k, what)) if k == "no-match" => format!("no-match {what}"),
+                Some((k, what)) => format!("{k} {what}"),
+                // ★ No recorded event does NOT mean unattributed. A bare
+                // global lookup never touches a host object, so nothing is
+                // logged — but the MESSAGE names the cause outright. Reading
+                // these as "unattributed" overstated the unknown by 8 docs.
+                None => classify_message(c.first_error.as_deref().unwrap_or("")),
+            };
+            *causes.entry(key.clone()).or_default() += 1;
+            cause_docs.entry(key).or_default().push(name.clone());
         }
         mod_retries += c.module_retries;
         observers += c.observers;
@@ -203,6 +254,15 @@ fn main() {
     if observers > 0 {
         println!("  geometry observations registered, never delivered: {observers}  (no layout — see GLOBALS)");
     }
+    if !causes.is_empty() {
+        println!("FIRST FAILURES BY PROXIMATE CAUSE (what to build, ranked by documents)");
+        println!("  the message buckets are symptoms; one message can cover many gaps.");
+        let mut v: Vec<_> = causes.iter().collect();
+        v.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        for (k, n) in v.into_iter().take(30) {
+            println!("   {n:3} docs  {k}");
+        }
+    }
     println!("external scripts  referenced={ext_total} fetched={ext_ok} failed={ext_fail}{}",
         if net { "" } else { "   (network OFF — set PRERENDER_NET=1)" });
 
@@ -258,7 +318,7 @@ fn main() {
         println!("  means the document genuinely lacks it.");
         let mut v: Vec<_> = nulls.into_iter().collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        for (k, n) in v.into_iter().take(15) { println!("  {n:5}  {k}"); }
+        for (k, n) in v.into_iter().take(30) { println!("  {n:5}  {k}"); }
     }
     if !errors.is_empty() {
         println!("script failures (symptoms; the lists above say what to build):");
@@ -311,6 +371,7 @@ pub struct Child {
     pub layout_reads: u32,
     pub mutation_records: u32,
     pub ce_upgrades: u32,
+    pub cause: Option<(String, String)>,
     pub timers_fired: u32,
     pub timers_dropped: u32,
     pub page_fetches: u32,
@@ -326,6 +387,7 @@ fn parse_child(s: &str) -> Option<Child> {
         errors: vec![], missing: vec![], nulls: vec![], verdict: String::new(),
         first_error: None,
         module_retries: 0, observers: 0, layout_reads: 0, mutation_records: 0, ce_upgrades: 0,
+        cause: None,
         timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0,
         page_blocked: 0, beacons: 0, blocked_hosts: vec![] };
     let mut saw = false;
@@ -348,6 +410,7 @@ fn parse_child(s: &str) -> Option<Child> {
             Some(&"M") if f.len() >= 3 => {
                 c.missing.push((f[2].to_string(), f[1].parse().unwrap_or(1)));
             }
+            Some(&"C") if f.len() >= 3 => c.cause = Some((f[1].to_string(), f[2].to_string())),
             Some(&"L") if f.len() >= 2 => c.layout_reads = f[1].parse().unwrap_or(0),
             Some(&"O") if f.len() >= 3 => {
                 c.observers = f[1].parse().unwrap_or(0);
