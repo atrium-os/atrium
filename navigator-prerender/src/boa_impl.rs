@@ -62,6 +62,21 @@ thread_local! {
     /// Identity is part of the DOM contract, not an optimisation.
     static NODE_CACHE: RefCell<HashMap<Handle, JsValue>> =
         RefCell::new(HashMap::new());
+    /// ★ ELEMENT LISTENERS ARE NO LONGER DROPPED.
+    ///
+    /// They were, on the grounds that nothing headless will ever deliver a
+    /// click — which is true of USER events and false of the page's own
+    /// `dispatchEvent`. A page dispatching an event to itself is not an
+    /// interaction we would have to invent; it is code the page runs, and
+    /// the corpus does it 383 times. Storing them is what makes dispatch
+    /// real instead of a stub.
+    ///
+    /// Holds JsValues, so like NODE_CACHE it must be cleared on the way in
+    /// AND on the way out: engine objects must not outlive the engine.
+    static ELISTENERS: RefCell<HashMap<Handle, Vec<(String, JsValue)>>> =
+        RefCell::new(HashMap::new());
+    /// (dispatches, listener invocations) on ELEMENTS.
+    static DISPATCH: RefCell<(u32, u32)> = const { RefCell::new((0, 0)) };
     /// The page's fetcher, parked here for the duration of a run so native
     /// functions can reach it without capturing state the engine's GC traces.
     static PAGE_NET: RefCell<Option<Box<dyn crate::fetch::Fetcher>>> =
@@ -403,8 +418,9 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
         // Element listeners are accepted and dropped: nothing in a headless
         // conversion will ever deliver a click. Accepting them keeps a page
         // running; pretending to deliver them would be a lie.
-        .function(NativeFunction::from_fn_ptr(ignore), js_string!("addEventListener"), 2)
-        .function(NativeFunction::from_fn_ptr(ignore), js_string!("removeEventListener"), 2)
+        .function(NativeFunction::from_fn_ptr(el_add_listener), js_string!("addEventListener"), 2)
+        .function(NativeFunction::from_fn_ptr(el_dispatch), js_string!("dispatchEvent"), 1)
+        .function(NativeFunction::from_fn_ptr(el_remove_listener), js_string!("removeEventListener"), 2)
         .function(NativeFunction::from_fn_ptr(query_first), js_string!("querySelector"), 1)
         .function(NativeFunction::from_fn_ptr(query_all), js_string!("querySelectorAll"), 1)
         .function(NativeFunction::from_fn_ptr(by_class), js_string!("getElementsByClassName"), 1)
@@ -906,6 +922,83 @@ fn is_ancestor(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
         }
         false
     })))
+}
+
+fn el_add_listener(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(this, ctx) else { return Ok(JsValue::undefined()) };
+    let ty = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    let f = args.get_or_undefined(1).clone();
+    if f.as_callable().is_some() {
+        ELISTENERS.with(|m| m.borrow_mut().entry(h).or_default().push((ty, f)));
+    }
+    Ok(JsValue::undefined())
+}
+
+fn el_remove_listener(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(this, ctx) else { return Ok(JsValue::undefined()) };
+    let ty = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    let f = args.get_or_undefined(1).clone();
+    ELISTENERS.with(|m| {
+        if let Some(v) = m.borrow_mut().get_mut(&h) {
+            v.retain(|(t, g)| !(t == &ty && JsValue::strict_equals(g, &f)));
+        }
+    });
+    Ok(JsValue::undefined())
+}
+
+/// `el.dispatchEvent(event)` — a real dispatch, because the page is talking
+/// to itself. The event walks the target then its ANCESTORS when it bubbles,
+/// which is only expressible because the tree is navigable; it then reaches
+/// the document and window listeners. Returns `!defaultPrevented`, as the
+/// DOM says, and pages branch on that.
+fn el_dispatch(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(this, ctx) else { return Ok(JsValue::from(true)) };
+    let ev = args.get_or_undefined(0).clone();
+    let Some(evo) = ev.as_object() else { return Ok(JsValue::from(true)) };
+    let evo = evo.clone();
+    let ty = evo.get(js_string!("type"), ctx)?.to_string(ctx)?.to_std_string_escaped();
+    let bubbles = evo.get(js_string!("bubbles"), ctx)?.to_boolean();
+
+    DISPATCH.with(|c| c.borrow_mut().0 += 1);
+    let target = node_obj(h, ctx);
+    let _ = evo.set(js_string!("target"), target.clone(), false, ctx);
+    let _ = evo.set(js_string!("srcElement"), target, false, ctx);
+    let _ = evo.set(js_string!("eventPhase"), 2.0, false, ctx);
+
+    // The propagation path: the target, then ancestors while it bubbles.
+    let mut path = vec![h];
+    if bubbles {
+        let mut cur = with(|d| d.get(h).and_then(|n| n.parent));
+        while let Some(p) = cur {
+            path.push(p);
+            cur = with(|d| d.get(p).and_then(|n| n.parent));
+        }
+    }
+    for node in path {
+        if evo.get(js_string!("__stop"), ctx)?.to_boolean() { break }
+        let here = node_obj(node, ctx);
+        let _ = evo.set(js_string!("currentTarget"), here, false, ctx);
+        let fns: Vec<JsValue> = ELISTENERS.with(|m| m.borrow().get(&node)
+            .map(|v| v.iter().filter(|(t, _)| t == &ty).map(|(_, f)| f.clone()).collect())
+            .unwrap_or_default());
+        for f in fns {
+            if let Some(c) = f.as_callable() {
+                // A listener that throws must not take the dispatch, or the
+                // page, with it — a browser reports and continues.
+                DISPATCH.with(|c| c.borrow_mut().1 += 1);
+                let _ = c.call(&node_obj(node, ctx), &[ev.clone()], ctx);
+            }
+        }
+    }
+    // Document- and window-level listeners live on the JS side; hand them the
+    // SAME event object rather than a second one built to look like it.
+    if !evo.get(js_string!("__stop"), ctx)?.to_boolean() {
+        let g = ctx.global_object();
+        if let Ok(f) = g.get(js_string!("__fireExisting"), ctx) {
+            if let Some(c) = f.as_callable() { let _ = c.call(&JsValue::undefined(), &[ev.clone()], ctx); }
+        }
+    }
+    Ok(JsValue::from(!evo.get(js_string!("defaultPrevented"), ctx)?.to_boolean()))
 }
 
 fn ignore(_t: &JsValue, _a: &[JsValue], _c: &mut Context) -> JsResult<JsValue> {
@@ -1576,6 +1669,73 @@ const GLOBALS: &str = r#"
     };
     return Promise.resolve(resp);
   };
+  // ── Event ───────────────────────────────────────────────────────────
+  //
+  // The corpus constructs events 296 times and DISPATCHES them 383, so a
+  // constructor without a dispatch would be a stub of the smaller half.
+  //
+  // ★ A PAGE DISPATCHING TO ITSELF IS HONESTLY SERVABLE. Element listeners
+  // used to be accepted and dropped, on the grounds that nothing headless
+  // delivers a click — true of USER events, false of the page's own
+  // dispatchEvent, which is just code the page runs. The line is between
+  // events we would have to INVENT (a click, a scroll, a resize) and events
+  // the page itself raises. The first are still never fired; the second now
+  // are, for real.
+  function __mkEvent(type, init, detail) {
+    init = init || {};
+    this.type = String(type);
+    this.bubbles = !!init.bubbles;
+    this.cancelable = !!init.cancelable;
+    this.composed = !!init.composed;
+    this.detail = (detail !== undefined) ? detail
+                : (init.detail !== undefined ? init.detail : null);
+    this.defaultPrevented = false;
+    this.target = null; this.currentTarget = null; this.srcElement = null;
+    this.eventPhase = 0;
+    this.__stop = false;
+    this.timeStamp = (globalThis.performance && performance.now) ? performance.now() : 0;
+    this.isTrusted = false;   // a script-made event never is
+    this.preventDefault = function () { if (this.cancelable) this.defaultPrevented = true; };
+    this.stopPropagation = function () { this.__stop = true; };
+    this.stopImmediatePropagation = function () { this.__stop = true; };
+    this.composedPath = function () { return this.target ? [this.target] : []; };
+    this.initEvent = function (t, b, c) {
+      this.type = String(t); this.bubbles = !!b; this.cancelable = !!c;
+    };
+    this.initCustomEvent = function (t, b, c, d) {
+      this.initEvent(t, b, c); this.detail = d;
+    };
+  }
+  function Event(type, init) { __mkEvent.call(this, type, init); }
+  function CustomEvent(type, init) { __mkEvent.call(this, type, init); }
+  __defIfaceLike('Event', Event);
+  __defIfaceLike('CustomEvent', CustomEvent);
+  // Aliases pages construct by name; all carry the same shape here, and the
+  // report will name any that turn out to need more.
+  ['MouseEvent', 'KeyboardEvent', 'FocusEvent', 'InputEvent', 'PointerEvent',
+   'TouchEvent', 'UIEvent', 'PopStateEvent', 'MessageEvent', 'HashChangeEvent',
+   'ErrorEvent', 'ProgressEvent', 'SubmitEvent', 'WheelEvent', 'DragEvent',
+   'AnimationEvent', 'TransitionEvent', 'StorageEvent', 'CloseEvent'
+  ].forEach(function (n) {
+    function E(type, init) { __mkEvent.call(this, type, init); }
+    __defIfaceLike(n, E);
+  });
+  // The legacy path: createEvent + initEvent, 91 and 29 references.
+  document.createEvent = function (kind) {
+    var e = new Event('', {});
+    e.__legacyKind = String(kind);
+    return e;
+  };
+  // document and window dispatch to their own listeners. `window` is the
+  // global here, so one implementation serves both.
+  globalThis.__docDispatches = 0;
+  document.dispatchEvent = function (ev) {
+    globalThis.__docDispatches++;
+    __fireExisting(ev);
+    return !ev.defaultPrevented;
+  };
+  globalThis.dispatchEvent = document.dispatchEvent;
+
   // ── HTMLElement and custom elements ─────────────────────────────────
   //
   // Two different needs behind one name. Most corpus uses are
@@ -1600,6 +1760,7 @@ const GLOBALS: &str = r#"
     try { return type ? v.nodeType === type : typeof v.nodeType === 'number'; }
     catch (e) { return false; }
   }
+  function __defIfaceLike(name, fn) { globalThis[name] = fn; }
   function __defIface(name, fn, type) {
     try {
       Object.defineProperty(fn, Symbol.hasInstance,
@@ -1814,6 +1975,7 @@ const BOOTSTRAP: &str = r#"
   function remove(t, f) {
     for (var i = L.length - 1; i >= 0; i--) if (L[i][0] === String(t) && L[i][1] === f) L.splice(i, 1);
   }
+  globalThis.__dispatchRan = 0;
   globalThis.__fire = function (type, extra) {
     var ev = { type: type, target: document, currentTarget: document,
                preventDefault: function () {}, stopPropagation: function () {} };
@@ -1821,6 +1983,28 @@ const BOOTSTRAP: &str = r#"
     for (var i = 0; i < L.length; i++) {
       if (L[i][0] !== type) continue;
       try { L[i][1].call(document, ev); globalThis.__fired++; } catch (e) {}
+    }
+  };
+  /// Deliver an event object the page already built, rather than
+  /// manufacturing a second one that merely looks like it: listeners compare
+  /// `e.target`, read `e.detail`, and call `e.preventDefault()`, and all of
+  /// that has to land on the object the page is holding.
+  globalThis.__fireExisting = function (ev) {
+    var type = ev && ev.type;
+    for (var i = 0; i < L.length; i++) {
+      if (L[i][0] !== type) continue;
+      if (ev.__stop) break;
+      try { ev.currentTarget = document; } catch (e) {}
+      // Counted as a DISPATCH listener as well as a lifecycle one: these
+      // run because the page dispatched, and reporting 0 while they ran
+      // would misdescribe the mechanism as inert.
+      try { L[i][1].call(document, ev); globalThis.__fired++;
+            globalThis.__dispatchRan++; } catch (e) {}
+    }
+    var on = globalThis['on' + type];
+    if (typeof on === 'function') {
+      try { on.call(document, ev); globalThis.__fired++;
+            globalThis.__dispatchRan++; } catch (e) {}
     }
   };
   document.addEventListener = add;
@@ -1873,6 +2057,8 @@ impl ScriptEngine for BoaEngine {
         // was false — the identity bug this cache exists to prevent,
         // reintroduced by the reset that was meant to keep it clean.
         NODE_CACHE.with(|c| c.borrow_mut().clear());
+        ELISTENERS.with(|m| m.borrow_mut().clear());
+        DISPATCH.with(|c| *c.borrow_mut() = (0, 0));
         DOM.with(|d| *d.borrow_mut() = std::mem::take(dom));
         let mut ctx = match self.module_root.as_ref()
             .and_then(|r| boa_engine::module::SimpleModuleLoader::new(r).ok())
@@ -1976,7 +2162,8 @@ impl ScriptEngine for BoaEngine {
         let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![],
             missing: vec![], nulls: vec![], first_error: None, cause: None, listeners_fired: 0,
             module_retries: 0, observers_registered: 0, mutation_records: 0,
-            ce_upgrades: 0, history_writes: 0, history_refused: 0, layout_reads: 0,
+            ce_upgrades: 0, history_writes: 0, history_refused: 0,
+            events_dispatched: 0, event_listeners_run: 0, layout_reads: 0,
             timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0,
             page_blocked: 0, blocked_hosts: vec![], beacons_suppressed: 0 };
         RECORDING.with(|r| *r.borrow_mut() = false);
@@ -2098,6 +2285,7 @@ impl ScriptEngine for BoaEngine {
         // parallel test harness and passed cleanly with --test-threads=1.
         // A cache of engine objects must not outlive the engine.
         NODE_CACHE.with(|c| c.borrow_mut().clear());
+        ELISTENERS.with(|m| m.borrow_mut().clear());
         DOM.with(|d| *dom = std::mem::take(&mut d.borrow_mut()));
         rep.layout_reads = LAYOUT_READS.with(|n| *n.borrow());
         let (pf, pfail) = PAGE_FETCHES.with(|c| *c.borrow());
@@ -2118,6 +2306,11 @@ impl ScriptEngine for BoaEngine {
             .ok()
             .and_then(|v| v.as_number())
             .unwrap_or(0.0) as u32;
+        let (nd, nl) = DISPATCH.with(|c| *c.borrow());
+        rep.events_dispatched = nd + ctx.eval(Source::from_bytes(b"__docDispatches")).ok()
+            .and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
+        rep.event_listeners_run = nl + ctx.eval(Source::from_bytes(b"__dispatchRan")).ok()
+            .and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
         rep.history_writes = ctx.eval(Source::from_bytes(b"__histWrites")).ok()
             .and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
         rep.history_refused = ctx.eval(Source::from_bytes(b"__histRefused")).ok()

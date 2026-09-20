@@ -58,6 +58,10 @@ pub struct RunReport {
     pub history_writes: u32,
     /// Navigations refused because they would leave the document.
     pub history_refused: u32,
+    /// Events the page dispatched ITSELF (never a synthesised user event).
+    pub events_dispatched: u32,
+    /// Listener invocations those dispatches actually produced.
+    pub event_listeners_run: u32,
     /// Reads of a layout metric this converter cannot truthfully answer.
     pub layout_reads: u32,
     /// Timer callbacks dispatched, and those still pending at the horizon.
