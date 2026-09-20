@@ -33,6 +33,9 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
     for e in c.errors.iter().take(8) {
         println!("E\t{}", e.replace('\t', " ").replace('\n', " "));
     }
+    for (name, n) in c.missing.iter() {
+        println!("M\t{n}\t{name}");
+    }
     std::process::exit(0);
 }
 
@@ -70,6 +73,8 @@ fn main() {
     let (mut ext_total, mut ext_ok, mut ext_fail) = (0usize, 0usize, 0usize);
     let mut timed_out = 0usize;
     let mut errors: BTreeMap<String, usize> = BTreeMap::new();
+    let mut missing: BTreeMap<String, u32> = BTreeMap::new();
+    let mut missing_docs: BTreeMap<String, usize> = BTreeMap::new();
     let mut elems = vec![];
 
     for f in &files {
@@ -89,6 +94,10 @@ fn main() {
             with_js += 1;
             if c.scripts_failed == 0 { js_ok += 1 } else { js_fail += 1 }
             if c.script_mutations > 0 { mutated += 1 }
+            for (name, n) in &c.missing {
+                *missing.entry(name.clone()).or_default() += n;
+                *missing_docs.entry(name.clone()).or_default() += 1;
+            }
             for e in &c.errors {
                 // bucket by the leading phrase so the report names the gap
                 let key: String = e.split(':').take(2).collect::<Vec<_>>().join(":");
@@ -111,8 +120,18 @@ fn main() {
     if !elems.is_empty() {
         println!("elements  median={} p95={} max={}", pct(0.5), pct(0.95), elems.last().unwrap());
     }
+    if !missing.is_empty() {
+        println!("MOST-WANTED APIs (what scripts asked a host object for and did not get)");
+        println!("  a miss is not automatically a gap: feature-detection probes deliberately");
+        println!("  hit absent properties. Frequency still ranks the work.");
+        let mut v: Vec<_> = missing.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        for (k, n) in v.into_iter().take(20) {
+            println!("  {n:5} hits  {:2} docs  {k}", missing_docs.get(&k).copied().unwrap_or(0));
+        }
+    }
     if !errors.is_empty() {
-        println!("top script failures (the missing-API report):");
+        println!("script failures (symptoms; the list above says what to build):");
         let mut v: Vec<_> = errors.into_iter().collect();
         v.sort_by(|a, b| b.1.cmp(&a.1));
         for (k, n) in v.into_iter().take(12) { println!("  {n:5}  {k}"); }
@@ -153,12 +172,13 @@ pub struct Child {
     pub external_total: usize,
     pub external_fetched: usize,
     pub errors: Vec<String>,
+    pub missing: Vec<(String, u32)>,
 }
 
 fn parse_child(s: &str) -> Option<Child> {
     let mut c = Child { elements_before: 0, elements_after: 0, scripts_total: 0,
         scripts_failed: 0, script_mutations: 0, external_total: 0, external_fetched: 0,
-        errors: vec![] };
+        errors: vec![], missing: vec![] };
     let mut saw = false;
     for line in s.lines() {
         let f: Vec<&str> = line.split('\t').collect();
@@ -174,6 +194,9 @@ fn parse_child(s: &str) -> Option<Child> {
                 c.external_fetched = f[9].parse().unwrap_or(0);
             }
             Some(&"E") if f.len() >= 2 => c.errors.push(f[1].to_string()),
+            Some(&"M") if f.len() >= 3 => {
+                c.missing.push((f[2].to_string(), f[1].parse().unwrap_or(1)));
+            }
             _ => {}
         }
     }

@@ -6,7 +6,7 @@ use boa_engine::{
     js_string, object::ObjectInitializer, property::Attribute, Context, JsArgs, JsObject,
     JsResult, JsValue, NativeFunction, Source,
 };
-use std::cell::RefCell;
+use std::{cell::RefCell, collections::BTreeMap};
 
 // The arena lives here for the duration of a run. A thread-local keeps every
 // host function a plain fn pointer — no captured state to trace through the
@@ -14,6 +14,13 @@ use std::cell::RefCell;
 // swapping engines. Single-threaded and short-lived by construction.
 thread_local! {
     static DOM: RefCell<Dom> = RefCell::new(Dom::new());
+    /// ★ ATTRIBUTION. Boa reports "not a callable function" without naming the
+    /// callee, so the largest failure bucket in a corpus run could not direct
+    /// any work. Rather than parse error text, record what the script ASKED
+    /// FOR: every host object is a Proxy whose `get` trap notes any property
+    /// the target does not have. The result names the missing API instead of
+    /// describing the symptom.
+    static MISSES: RefCell<BTreeMap<String, u32>> = RefCell::new(BTreeMap::new());
 }
 
 fn with<R>(f: impl FnOnce(&mut Dom) -> R) -> R { DOM.with(|d| f(&mut d.borrow_mut())) }
@@ -23,6 +30,44 @@ fn handle_of(v: &JsValue, ctx: &mut Context) -> Option<Handle> {
     let o = v.as_object()?;
     let h = o.get(js_string!("__h"), ctx).ok()?;
     h.as_number().map(|n| n as Handle)
+}
+
+/// The `get` trap: pass through what exists, record what does not.
+///
+/// Note a miss is not automatically a gap — `if (el.foo)` feature-detection
+/// deliberately probes for absent properties. Frequency still ranks the work
+/// correctly, and the report says so rather than overclaiming.
+fn probe_get(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let target = args.get_or_undefined(0).as_object().ok_or_else(|| {
+        boa_engine::JsNativeError::typ().with_message("proxy target")
+    })?;
+    let key_v = args.get_or_undefined(1).clone();
+    let key = key_v.to_property_key(ctx)?;
+    if target.has_property(key.clone(), ctx)? {
+        return target.get(key, ctx);
+    }
+    let kind = target.get(js_string!("__kind"), ctx)
+        .ok()
+        .and_then(|v| v.as_string().map(|s| s.to_std_string_escaped()))
+        .unwrap_or_else(|| "object".into());
+    let name = key.to_string();
+    // Ignore engine-internal lookups; they are not APIs a page asked for.
+    if !name.starts_with("__") && !name.starts_with("Symbol(") && name != "then" {
+        MISSES.with(|m| *m.borrow_mut().entry(format!("{kind}.{name}")).or_default() += 1);
+    }
+    Ok(JsValue::undefined())
+}
+
+/// Wrap a host object so its misses are attributed.
+fn probed(obj: JsObject, kind: &str, ctx: &mut Context) -> JsValue {
+    let _ = obj.set(js_string!("__kind"), js_string!(kind.to_string()), false, ctx);
+    match boa_engine::object::builtins::JsProxy::builder(obj.clone())
+        .get(probe_get)
+        .build(ctx)
+    {
+        Ok(p) => JsValue::from(JsObject::from(p)),
+        Err(_) => JsValue::from(obj),
+    }
 }
 
 fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
@@ -37,7 +82,7 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
         .function(NativeFunction::from_fn_ptr(set_text), js_string!("setText"), 1)
         .build();
     install_text_accessor(&o, ctx);
-    JsValue::from(o)
+    probed(o, "element", ctx)
 }
 
 /// `textContent` as a real accessor: scripts use the property, not a method.
@@ -147,17 +192,20 @@ impl ScriptEngine for BoaEngine {
             .function(NativeFunction::from_fn_ptr(query_all), js_string!("querySelectorAll"), 1)
             .property(js_string!("body"), body_v, Attribute::all())
             .build();
-        let _ = ctx.register_global_property(js_string!("document"), doc.clone(), Attribute::all());
+        let doc_v = probed(doc.clone(), "document", &mut ctx);
+        let _ = ctx.register_global_property(js_string!("document"), doc_v, Attribute::all());
 
         // `window` was the single most common missing binding in the first
         // corpus run, so the instrument's own report earned it a place. It is
         // the global object with `document` hung off it — enough for the
         // `window.document` / `window.onload` shapes real pages use, without
         // pretending to be a browser.
+        let doc_v2 = probed(doc, "document", &mut ctx);
         let win = ObjectInitializer::new(&mut ctx)
-            .property(js_string!("document"), doc, Attribute::all())
+            .property(js_string!("document"), doc_v2, Attribute::all())
             .build();
-        let _ = ctx.register_global_property(js_string!("window"), win, Attribute::all());
+        let win_v = probed(win, "window", &mut ctx);
+        let _ = ctx.register_global_property(js_string!("window"), win_v, Attribute::all());
 
         // `console` is a no-op sink. Named by the corpus report, and a script
         // that logs should not be recorded as a conversion failure.
@@ -173,7 +221,8 @@ impl ScriptEngine for BoaEngine {
             .build();
         let _ = ctx.register_global_property(js_string!("console"), console, Attribute::all());
 
-        let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![] };
+        MISSES.with(|m| m.borrow_mut().clear());
+        let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![], missing: vec![] };
         for s in scripts {
             match ctx.eval(Source::from_bytes(s.as_bytes())) {
                 Ok(_) => rep.scripts_run += 1,
@@ -187,6 +236,7 @@ impl ScriptEngine for BoaEngine {
             }
         }
         DOM.with(|d| *dom = std::mem::take(&mut d.borrow_mut()));
+        rep.missing = MISSES.with(|m| m.borrow().iter().map(|(k, v)| (k.clone(), *v)).collect());
         rep
     }
 }

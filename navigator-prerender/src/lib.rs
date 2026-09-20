@@ -22,6 +22,7 @@ pub struct Conversion {
     pub scripts_failed: usize,
     pub script_mutations: u64,
     pub errors: Vec<String>,
+    pub missing: Vec<(String, u32)>,
 }
 
 /// Parse, run the page's scripts once, and snapshot the result.
@@ -72,6 +73,7 @@ pub fn convert_with(
         scripts_run: rep.scripts_run,
         scripts_failed: rep.scripts_failed,
         script_mutations: dom.script_mutations,
+        missing: rep.missing,
         errors: rep.errors,
     }
 }

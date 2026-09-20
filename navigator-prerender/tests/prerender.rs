@@ -156,3 +156,30 @@ fn document_order_is_preserved_across_inline_and_external() {
     assert!(matches!(&s[1], Script::External(u) if u == "a.js"));
     assert!(matches!(&s[2], Script::Inline(t) if t.contains('2')));
 }
+
+/// Attribution: a script reaching for an API we do not have must name it,
+/// not merely fail. Before this, the largest failure bucket in a corpus run
+/// was "TypeError: not a callable function" with no callee.
+#[test]
+fn missing_apis_are_named_not_just_failed() {
+    let html = "<html><body><script>\
+        try { document.querySelector('p'); } catch (e) {}\
+        try { document.addEventListener('x', function(){}); } catch (e) {}\
+        </script></body></html>";
+    let c = convert(html, &mut BoaEngine::default());
+    let names: Vec<&str> = c.missing.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"document.querySelector"), "got {names:?}");
+    assert!(names.contains(&"document.addEventListener"), "got {names:?}");
+}
+
+/// What exists must still pass through the probe untouched.
+#[test]
+fn probe_does_not_break_working_apis() {
+    let html = "<html><body><div id=a></div><script>\
+        var d=document.getElementById('a'); d.setAttribute('k','v'); d.textContent='t';\
+        </script></body></html>";
+    let c = convert(html, &mut BoaEngine::default());
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.html.contains(r#"k="v""#) && c.html.contains('t'), "got {}", c.html);
+    assert!(!c.missing.iter().any(|(n, _)| n.ends_with("getElementById")));
+}

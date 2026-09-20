@@ -15,6 +15,9 @@ pub struct RunReport {
     pub scripts_run: usize,
     pub scripts_failed: usize,
     pub errors: Vec<String>,
+    /// Properties the script asked a host object for and did not get —
+    /// the missing-API report, by name.
+    pub missing: Vec<(String, u32)>,
 }
 
 pub trait ScriptEngine {
