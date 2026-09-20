@@ -211,3 +211,22 @@ fn verdicts_separate_our_gaps_from_failures_a_browser_shares() {
         &mut BoaEngine::default());
     assert_eq!(unparseable.verdict, Verdict::OurGap, "{:?}", unparseable.first_error);
 }
+
+/// Attribution must be CAUSAL: the last event before the throw decides, not a
+/// document-wide tally. A miss recorded by an unrelated script that ran fine
+/// must not outvote the real proximate cause.
+#[test]
+fn attribution_uses_the_proximate_cause_not_a_tally() {
+    use navigator_prerender::Verdict;
+    // An earlier, harmless miss, then a throw caused by a no-match lookup.
+    let html = "<html><body><p>only</p><script>\
+        var ignored = document.childNodes;\
+        document.querySelector('.absent').focus();\
+        </script></body></html>";
+    let c = convert(html, &mut BoaEngine::default());
+    assert!(c.missing.iter().any(|(n, _)| n == "document.childNodes"),
+        "the harmless miss must still be recorded: {:?}", c.missing);
+    assert_eq!(c.verdict, Verdict::BrowserToo,
+        "a tally would have said OurGap; cause was {:?}", c.cause);
+    assert_eq!(c.cause.as_ref().map(|(k, _)| k.as_str()), Some("no-match"));
+}

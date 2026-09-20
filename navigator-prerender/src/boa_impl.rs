@@ -37,6 +37,12 @@ thread_local! {
     /// came back empty, and with what argument, turns 14 identical symptoms
     /// into named queries.
     static NULLS: RefCell<BTreeMap<String, u32>> = RefCell::new(BTreeMap::new());
+    /// ★ The same two signals, IN ORDER. Document-wide counts cannot say which
+    /// event caused a given throw — a miss recorded by an unrelated script
+    /// that ran fine will outvote the real proximate cause. The last event
+    /// before the first failure is the causal one, and that needs a sequence,
+    /// not a tally.
+    static EVENTS: RefCell<Vec<(&'static str, String)>> = const { RefCell::new(Vec::new()) };
     /// The document's URL, so `script.src` can be reported ABSOLUTE as a
     /// browser does — webpack derives publicPath from it, and a relative
     /// value there yields the wrong base.
@@ -76,7 +82,9 @@ fn probe_get(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<J
     let own_probe = matches!(name.as_str(), "onreadystatechange" | "onload");
     if recording && !own_probe && !name.starts_with("__")
         && !name.starts_with("Symbol(") && name != "then" {
-        MISSES.with(|m| *m.borrow_mut().entry(format!("{kind}.{name}")).or_default() += 1);
+        let full = format!("{kind}.{name}");
+        EVENTS.with(|e| e.borrow_mut().push(("missing", full.clone())));
+        MISSES.with(|m| *m.borrow_mut().entry(full).or_default() += 1);
     }
     Ok(JsValue::undefined())
 }
@@ -225,7 +233,11 @@ fn current_script(_t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<J
 fn note_null(api: &str, arg: &str) {
     if !RECORDING.with(|r| *r.borrow()) { return }
     let arg: String = arg.chars().take(60).collect();
-    NULLS.with(|n| *n.borrow_mut().entry(format!("{api}({arg})")).or_default() += 1);
+    let full = format!("{api}({arg})");
+    EVENTS.with(|e| e.borrow_mut().push((
+        if api.starts_with("querySelector-UNPARSEABLE") { "ours" } else { "no-match" },
+        full.clone())));
+    NULLS.with(|n| *n.borrow_mut().entry(full).or_default() += 1);
 }
 
 fn get_element_by_id(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -584,10 +596,11 @@ impl ScriptEngine for BoaEngine {
 
         MISSES.with(|m| m.borrow_mut().clear());
         NULLS.with(|n| n.borrow_mut().clear());
+        EVENTS.with(|e| e.borrow_mut().clear());
         BASE.with(|b| *b.borrow_mut() = self.base_url.clone());
         CURRENT.with(|c| *c.borrow_mut() = None);
         let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![],
-            missing: vec![], nulls: vec![], first_error: None, listeners_fired: 0,
+            missing: vec![], nulls: vec![], first_error: None, cause: None, listeners_fired: 0,
             module_retries: 0, observers_registered: 0 };
         RECORDING.with(|r| *r.borrow_mut() = false);
         let _ = ctx.register_global_callable(js_string!("__parse_url"), 2,
@@ -633,7 +646,12 @@ impl ScriptEngine for BoaEngine {
                 Some(msg) => {
                     rep.scripts_failed += 1;
                     let short: String = msg.chars().take(200).collect();
-                    if rep.first_error.is_none() { rep.first_error = Some(short.clone()); }
+                    if rep.first_error.is_none() {
+                        rep.first_error = Some(short.clone());
+                        // The last thing that happened before this throw.
+                        rep.cause = EVENTS.with(|e| e.borrow().last().cloned())
+                            .map(|(k, n)| (k.to_string(), n));
+                    }
                     rep.errors.push(short);
                 }
             }

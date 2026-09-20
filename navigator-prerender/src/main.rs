@@ -32,6 +32,9 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
         c.external_total, c.external_fetched, c.module_retries,
         c.observers_registered);
     println!("V\t{:?}", c.verdict);
+    if let Some(f) = &c.first_error {
+        println!("F\t{}", f.replace('\t', " ").replace('\n', " "));
+    }
     for e in c.errors.iter().take(8) {
         println!("E\t{}", e.replace('\t', " ").replace('\n', " "));
     }
@@ -80,6 +83,7 @@ fn main() {
     let mut mod_retries = 0u32;
     let mut observers = 0u32;
     let mut verdicts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut unattributed: Vec<String> = vec![];
     let mut errors: BTreeMap<String, usize> = BTreeMap::new();
     let mut missing: BTreeMap<String, u32> = BTreeMap::new();
     let mut nulls: BTreeMap<String, u32> = BTreeMap::new();
@@ -97,6 +101,12 @@ fn main() {
         };
         if c.scripts_total > 0 && !c.verdict.is_empty() {
             *verdicts.entry(c.verdict.clone()).or_default() += 1;
+            if c.verdict == "Unknown" {
+                if let Some(f) = &c.first_error {
+                    unattributed.push(format!("{}\n        in {}",
+                        f.chars().take(120).collect::<String>(), name));
+                }
+            }
         }
         mod_retries += c.module_retries;
         observers += c.observers;
@@ -168,8 +178,18 @@ fn main() {
         let hi = if scripted > 0 { (clean + browser + unknown) * 100 / scripted } else { 0 };
         println!("  -> tier-2 reachable: {lo}% to {hi}%  ({}/{scripted} known, +{unknown} unattributed)",
             clean + browser);
-        println!("  ★ heuristic, not a browser diff. The spread IS the uncertainty:");
-        println!("    shrink it by attributing the unattributed, not by adding APIs.");
+        if unknown == 0 {
+            println!("  ★ every failure attributed; the spread is closed. Still a");
+            println!("    heuristic, not a browser diff — a real control runs the same");
+            println!("    page in a browser and compares DOMs.");
+        } else {
+            println!("  ★ heuristic, not a browser diff. The spread IS the uncertainty:");
+            println!("    shrink it by attributing the unattributed, not by adding APIs.");
+        }
+    }
+    if !unattributed.is_empty() {
+        println!("UNATTRIBUTED first failures (the bucket that sets the spread)");
+        for u in unattributed.iter().take(10) { println!("  {u}"); }
     }
     if !nulls.is_empty() {
         println!("LOOKUPS THAT FOUND NOTHING (an API we DO have, returning null)");
@@ -225,6 +245,7 @@ pub struct Child {
     pub missing: Vec<(String, u32)>,
     pub nulls: Vec<(String, u32)>,
     pub verdict: String,
+    pub first_error: Option<String>,
     pub module_retries: u32,
     pub observers: u32,
 }
@@ -233,6 +254,7 @@ fn parse_child(s: &str) -> Option<Child> {
     let mut c = Child { elements_before: 0, elements_after: 0, scripts_total: 0,
         scripts_failed: 0, script_mutations: 0, external_total: 0, external_fetched: 0,
         errors: vec![], missing: vec![], nulls: vec![], verdict: String::new(),
+        first_error: None,
         module_retries: 0, observers: 0 };
     let mut saw = false;
     for line in s.lines() {
@@ -255,6 +277,7 @@ fn parse_child(s: &str) -> Option<Child> {
                 c.missing.push((f[2].to_string(), f[1].parse().unwrap_or(1)));
             }
             Some(&"V") if f.len() >= 2 => c.verdict = f[1].to_string(),
+            Some(&"F") if f.len() >= 2 => c.first_error = Some(f[1].to_string()),
             Some(&"N") if f.len() >= 3 => {
                 c.nulls.push((f[2].to_string(), f[1].parse().unwrap_or(1)));
             }

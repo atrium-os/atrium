@@ -28,6 +28,7 @@ pub struct Conversion {
     pub missing: Vec<(String, u32)>,
     pub nulls: Vec<(String, u32)>,
     pub first_error: Option<String>,
+    pub cause: Option<(String, String)>,
     pub verdict: Verdict,
     pub listeners_fired: u32,
     pub module_retries: u32,
@@ -128,6 +129,8 @@ pub fn convert_with(
     // The fetch cache persists; the mirror is scratch for this conversion.
     let _ = std::fs::remove_dir_all(&mirror_root);
     rep.errors.extend(fetch_errors);
+    // Computed before the struct consumes the fields it reads.
+    let verdict = classify(rep.first_error.as_deref(), rep.cause.as_ref());
     Conversion {
         html: dom.serialize(),
         engine: engine.name(),
@@ -144,9 +147,10 @@ pub fn convert_with(
         listeners_fired: rep.listeners_fired,
         module_retries: rep.module_retries,
         observers_registered: rep.observers_registered,
+        verdict,
         missing: rep.missing,
-        verdict: classify(rep.first_error.as_deref(), &rep.nulls),
         first_error: rep.first_error,
+        cause: rep.cause,
         nulls: rep.nulls,
         errors: rep.errors,
     }
@@ -194,22 +198,12 @@ pub enum Verdict {
     Unknown,
 }
 
-fn classify(first: Option<&str>, nulls: &[(String, u32)]) -> Verdict {
+fn classify(first: Option<&str>, cause: Option<&(String, String)>) -> Verdict {
     let Some(e) = first else { return Verdict::Clean };
-    // Our selector engine failing to parse is unambiguously ours.
-    if nulls.iter().any(|(k, _)| k.starts_with("querySelector-UNPARSEABLE")) {
-        return Verdict::OurGap;
-    }
-    // A null-conversion throw, where a lookup found nothing that the document
-    // genuinely does not contain, is what a browser would also do.
-    if e.contains("cannot convert 'null' or 'undefined'")
-        && nulls.iter().any(|(k, _)| {
-            k.starts_with("querySelector-no-match") || k.starts_with("getElementById")
-        })
-    {
-        return Verdict::BrowserToo;
-    }
-    // Missing bindings, syntax we cannot parse, imports we cannot resolve.
+    // An environment probe reporting that we are not a usable browser is, by
+    // its own account, our gap.
+    if e.contains("not supported in this browser") { return Verdict::OurGap; }
+    // Unambiguously ours, whatever preceded them.
     if e.contains("is not defined")
         || e.contains("not a callable")
         || e.contains("SyntaxError")
@@ -218,6 +212,17 @@ fn classify(first: Option<&str>, nulls: &[(String, u32)]) -> Verdict {
         || e.contains("module pending")
     {
         return Verdict::OurGap;
+    }
+    // ★ For a null/undefined throw, the PROXIMATE CAUSE decides — the last
+    // recorded event before it, not a document-wide tally. A tally let a miss
+    // from an unrelated script outvote the real cause and misclassified a
+    // genuine browser-too failure as ours.
+    if e.contains("cannot convert 'null' or 'undefined'") {
+        return match cause.map(|(k, _)| k.as_str()) {
+            Some("no-match") => Verdict::BrowserToo,
+            Some("missing") | Some("ours") => Verdict::OurGap,
+            _ => Verdict::Unknown,
+        };
     }
     Verdict::Unknown
 }
