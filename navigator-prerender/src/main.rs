@@ -26,10 +26,11 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
     let fetcher: &mut dyn Fetcher = if net { &mut http } else { &mut nonet };
     let c = convert_with(&src, base, &mut BoaEngine::default(), fetcher);
     // fields the parent aggregates; errors last, tab-separated
-    println!("R\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+    println!("R\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         c.elements_before, c.elements_after, c.depth_after,
         c.scripts_total, c.scripts_run, c.scripts_failed, c.script_mutations,
-        c.external_total, c.external_fetched, c.module_retries);
+        c.external_total, c.external_fetched, c.module_retries,
+        c.observers_registered);
     for e in c.errors.iter().take(8) {
         println!("E\t{}", e.replace('\t', " ").replace('\n', " "));
     }
@@ -73,6 +74,7 @@ fn main() {
     let (mut ext_total, mut ext_ok, mut ext_fail) = (0usize, 0usize, 0usize);
     let mut timed_out = 0usize;
     let mut mod_retries = 0u32;
+    let mut observers = 0u32;
     let mut errors: BTreeMap<String, usize> = BTreeMap::new();
     let mut missing: BTreeMap<String, u32> = BTreeMap::new();
     let mut missing_docs: BTreeMap<String, usize> = BTreeMap::new();
@@ -88,6 +90,7 @@ fn main() {
             continue;
         };
         mod_retries += c.module_retries;
+        observers += c.observers;
         ext_total += c.external_total;
         ext_ok += c.external_fetched;
         ext_fail += c.external_total - c.external_fetched;
@@ -117,6 +120,9 @@ fn main() {
     println!("  some script failed {js_fail}");
     println!("  DOM actually changed by script {mutated}");
     if mod_retries > 0 { println!("  parsed as MODULE after a classic parse failed: {mod_retries}"); }
+    if observers > 0 {
+        println!("  geometry observations registered, never delivered: {observers}  (no layout — see GLOBALS)");
+    }
     println!("external scripts  referenced={ext_total} fetched={ext_ok} failed={ext_fail}{}",
         if net { "" } else { "   (network OFF — set PRERENDER_NET=1)" });
 
@@ -177,12 +183,13 @@ pub struct Child {
     pub errors: Vec<String>,
     pub missing: Vec<(String, u32)>,
     pub module_retries: u32,
+    pub observers: u32,
 }
 
 fn parse_child(s: &str) -> Option<Child> {
     let mut c = Child { elements_before: 0, elements_after: 0, scripts_total: 0,
         scripts_failed: 0, script_mutations: 0, external_total: 0, external_fetched: 0,
-        errors: vec![], missing: vec![], module_retries: 0 };
+        errors: vec![], missing: vec![], module_retries: 0, observers: 0 };
     let mut saw = false;
     for line in s.lines() {
         let f: Vec<&str> = line.split('\t').collect();
@@ -197,6 +204,7 @@ fn parse_child(s: &str) -> Option<Child> {
                 c.external_total = f[8].parse().unwrap_or(0);
                 c.external_fetched = f[9].parse().unwrap_or(0);
                 if f.len() >= 11 { c.module_retries = f[10].parse().unwrap_or(0); }
+                if f.len() >= 12 { c.observers = f[11].parse().unwrap_or(0); }
             }
             Some(&"E") if f.len() >= 2 => c.errors.push(f[1].to_string()),
             Some(&"M") if f.len() >= 3 => {

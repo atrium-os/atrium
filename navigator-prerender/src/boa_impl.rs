@@ -392,6 +392,29 @@ const GLOBALS: &str = r#"
     }
   }
 
+  // ★ GEOMETRY OBSERVERS ACCEPT AND NEVER DELIVER.
+  //
+  // ResizeObserver and IntersectionObserver report layout, and this converter
+  // performs no layout — so any box it handed a callback would be fiction.
+  // That is not a harmless fiction either: a script told an element is 0x0
+  // routinely collapses or hides it, which would make the conversion WORSE
+  // than not firing at all. Real implementations deliver one initial
+  // observation on observe(); we deliberately do not.
+  //
+  // Registrations are counted so the cost of that choice is visible rather
+  // than assumed — see `observers_registered` in the report.
+  globalThis.__observed = 0;
+  function GeometryObserver(cb) {
+    this._cb = cb;
+    this.observe = function () { globalThis.__observed++; };
+    this.unobserve = function () {};
+    this.disconnect = function () {};
+    this.takeRecords = function () { return []; };
+  }
+  globalThis.ResizeObserver = GeometryObserver;
+  globalThis.IntersectionObserver = GeometryObserver;
+  globalThis.PerformanceObserver = GeometryObserver;
+
   // Fixed identity: the converter's, not the reader's. A real user agent
   // string would be host state leaking into the artifact.
   globalThis.navigator = {
@@ -534,7 +557,7 @@ impl ScriptEngine for BoaEngine {
         BASE.with(|b| *b.borrow_mut() = self.base_url.clone());
         CURRENT.with(|c| *c.borrow_mut() = None);
         let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![],
-            missing: vec![], listeners_fired: 0, module_retries: 0 };
+            missing: vec![], listeners_fired: 0, module_retries: 0, observers_registered: 0 };
         RECORDING.with(|r| *r.borrow_mut() = false);
         let _ = ctx.register_global_callable(js_string!("__parse_url"), 2,
             NativeFunction::from_fn_ptr(parse_url));
@@ -601,6 +624,11 @@ impl ScriptEngine for BoaEngine {
         let _ = ctx.run_jobs();
 
         DOM.with(|d| *dom = std::mem::take(&mut d.borrow_mut()));
+        rep.observers_registered = ctx
+            .eval(Source::from_bytes(b"__observed"))
+            .ok()
+            .and_then(|v| v.as_number())
+            .unwrap_or(0.0) as u32;
         rep.missing = MISSES.with(|m| m.borrow().iter().map(|(k, v)| (k.clone(), *v)).collect());
         rep
     }

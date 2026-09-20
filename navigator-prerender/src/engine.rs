@@ -35,6 +35,9 @@ pub struct RunReport {
     pub listeners_fired: u32,
     /// Scripts that parsed only after being retried as modules.
     pub module_retries: u32,
+    /// Geometry observations registered and deliberately never delivered —
+    /// the visible cost of performing no layout.
+    pub observers_registered: u32,
 }
 
 pub trait ScriptEngine {

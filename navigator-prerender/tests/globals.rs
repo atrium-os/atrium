@@ -143,3 +143,24 @@ fn current_script_for_inline_has_no_src() {
     assert!(c.html.contains(r#"t="SCRIPT""#), "got {}", c.html);
     assert!(c.html.contains(r#"s="undefined""#), "inline has no src: {}", c.html);
 }
+
+/// Geometry observers must be constructible and register, but never deliver:
+/// there is no layout here, so any box handed to a callback is fiction, and
+/// a script told an element is 0x0 routinely hides it.
+#[test]
+fn geometry_observers_accept_but_never_fire() {
+    let html = "<html><body><div id=r>kept</div><script>\
+        var fired = 0;\
+        var ro = new ResizeObserver(function(){ fired++; });\
+        ro.observe(document.getElementById('r'));\
+        var io = new IntersectionObserver(function(){ fired++; });\
+        io.observe(document.getElementById('r'));\
+        document.getElementById('r').setAttribute('fired', String(fired));\
+        ro.disconnect();\
+        </script></body></html>";
+    let c = convert(html, &mut BoaEngine::default());
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.html.contains(r#"fired="0""#), "must not deliver: {}", c.html);
+    assert!(c.html.contains("kept"), "content must survive: {}", c.html);
+    assert_eq!(c.observers_registered, 2, "registrations must be counted");
+}
