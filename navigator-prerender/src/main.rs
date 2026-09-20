@@ -37,6 +37,9 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
     for (name, n) in c.missing.iter() {
         println!("M\t{n}\t{name}");
     }
+    for (name, n) in c.nulls.iter() {
+        println!("N\t{n}\t{}", name.replace('\t', " "));
+    }
     std::process::exit(0);
 }
 
@@ -77,6 +80,7 @@ fn main() {
     let mut observers = 0u32;
     let mut errors: BTreeMap<String, usize> = BTreeMap::new();
     let mut missing: BTreeMap<String, u32> = BTreeMap::new();
+    let mut nulls: BTreeMap<String, u32> = BTreeMap::new();
     let mut missing_docs: BTreeMap<String, usize> = BTreeMap::new();
     let mut elems = vec![];
 
@@ -99,6 +103,7 @@ fn main() {
             with_js += 1;
             if c.scripts_failed == 0 { js_ok += 1 } else { js_fail += 1 }
             if c.script_mutations > 0 { mutated += 1 }
+            for (name, n) in &c.nulls { *nulls.entry(name.clone()).or_default() += n; }
             for (name, n) in &c.missing {
                 *missing.entry(name.clone()).or_default() += n;
                 *missing_docs.entry(name.clone()).or_default() += 1;
@@ -139,8 +144,17 @@ fn main() {
             println!("  {n:5} hits  {:2} docs  {k}", missing_docs.get(&k).copied().unwrap_or(0));
         }
     }
+    if !nulls.is_empty() {
+        println!("LOOKUPS THAT FOUND NOTHING (an API we DO have, returning null)");
+        println!("  the missing-API report cannot see this class: the property was");
+        println!("  never missing. `-UNPARSEABLE` is our selector gap; `-no-match`");
+        println!("  means the document genuinely lacks it.");
+        let mut v: Vec<_> = nulls.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        for (k, n) in v.into_iter().take(15) { println!("  {n:5}  {k}"); }
+    }
     if !errors.is_empty() {
-        println!("script failures (symptoms; the list above says what to build):");
+        println!("script failures (symptoms; the lists above say what to build):");
         let mut v: Vec<_> = errors.into_iter().collect();
         v.sort_by(|a, b| b.1.cmp(&a.1));
         for (k, n) in v.into_iter().take(12) { println!("  {n:5}  {k}"); }
@@ -182,6 +196,7 @@ pub struct Child {
     pub external_fetched: usize,
     pub errors: Vec<String>,
     pub missing: Vec<(String, u32)>,
+    pub nulls: Vec<(String, u32)>,
     pub module_retries: u32,
     pub observers: u32,
 }
@@ -189,7 +204,7 @@ pub struct Child {
 fn parse_child(s: &str) -> Option<Child> {
     let mut c = Child { elements_before: 0, elements_after: 0, scripts_total: 0,
         scripts_failed: 0, script_mutations: 0, external_total: 0, external_fetched: 0,
-        errors: vec![], missing: vec![], module_retries: 0, observers: 0 };
+        errors: vec![], missing: vec![], nulls: vec![], module_retries: 0, observers: 0 };
     let mut saw = false;
     for line in s.lines() {
         let f: Vec<&str> = line.split('\t').collect();
@@ -209,6 +224,9 @@ fn parse_child(s: &str) -> Option<Child> {
             Some(&"E") if f.len() >= 2 => c.errors.push(f[1].to_string()),
             Some(&"M") if f.len() >= 3 => {
                 c.missing.push((f[2].to_string(), f[1].parse().unwrap_or(1)));
+            }
+            Some(&"N") if f.len() >= 3 => {
+                c.nulls.push((f[2].to_string(), f[1].parse().unwrap_or(1)));
             }
             _ => {}
         }

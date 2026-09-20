@@ -31,6 +31,9 @@ pub struct RunReport {
     /// Properties the script asked a host object for and did not get —
     /// the missing-API report, by name.
     pub missing: Vec<(String, u32)>,
+    /// Lookups that found nothing, by API and argument — the class the
+    /// missing-API report cannot see.
+    pub nulls: Vec<(String, u32)>,
     /// Lifecycle handlers actually invoked — registration is not the point.
     pub listeners_fired: u32,
     /// Scripts that parsed only after being retried as modules.

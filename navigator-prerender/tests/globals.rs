@@ -164,3 +164,20 @@ fn geometry_observers_accept_but_never_fire() {
     assert!(c.html.contains("kept"), "content must survive: {}", c.html);
     assert_eq!(c.observers_registered, 2, "registrations must be counted");
 }
+
+/// A lookup that finds nothing is attributed with its argument, and the two
+/// causes are kept apart: a selector WE cannot parse is our gap, one that
+/// parses and matches nothing is the document's.
+#[test]
+fn null_lookups_are_attributed_and_the_cause_separated() {
+    let html = "<html><body><p>only</p><script>\
+        try { document.getElementById('nope').x = 1; } catch (e) {}\
+        try { document.querySelector('.absent'); } catch (e) {}\
+        try { document.querySelector('###'); } catch (e) {}\
+        </script></body></html>";
+    let c = convert(html, &mut BoaEngine::default());
+    let names: Vec<&str> = c.nulls.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"getElementById(nope)"), "got {names:?}");
+    assert!(names.contains(&"querySelector-no-match(.absent)"), "got {names:?}");
+    assert!(names.contains(&"querySelector-UNPARSEABLE(###)"), "got {names:?}");
+}

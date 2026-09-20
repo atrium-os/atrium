@@ -26,6 +26,7 @@ pub struct Conversion {
     pub script_mutations: u64,
     pub errors: Vec<String>,
     pub missing: Vec<(String, u32)>,
+    pub nulls: Vec<(String, u32)>,
     pub listeners_fired: u32,
     pub module_retries: u32,
     pub observers_registered: u32,
@@ -142,6 +143,7 @@ pub fn convert_with(
         module_retries: rep.module_retries,
         observers_registered: rep.observers_registered,
         missing: rep.missing,
+        nulls: rep.nulls,
         errors: rep.errors,
     }
 }

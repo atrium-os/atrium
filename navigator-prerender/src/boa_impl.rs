@@ -30,6 +30,13 @@ thread_local! {
     static RECORDING: RefCell<bool> = const { RefCell::new(false) };
     /// The `<script>` element currently executing, for `document.currentScript`.
     static CURRENT: RefCell<Option<Handle>> = const { RefCell::new(None) };
+    /// ★ A SECOND attribution channel. The missing-API report cannot see this
+    /// class at all: `cannot convert 'null' or 'undefined' to object` means an
+    /// API we DO implement returned nothing where a browser would have found
+    /// something, so the property was never missing. Recording which lookup
+    /// came back empty, and with what argument, turns 14 identical symptoms
+    /// into named queries.
+    static NULLS: RefCell<BTreeMap<String, u32>> = RefCell::new(BTreeMap::new());
     /// The document's URL, so `script.src` can be reported ABSOLUTE as a
     /// browser does — webpack derives publicPath from it, and a relative
     /// value there yields the wrong base.
@@ -214,9 +221,19 @@ fn current_script(_t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<J
     })
 }
 
+/// Note a lookup that found nothing, with its argument.
+fn note_null(api: &str, arg: &str) {
+    if !RECORDING.with(|r| *r.borrow()) { return }
+    let arg: String = arg.chars().take(60).collect();
+    NULLS.with(|n| *n.borrow_mut().entry(format!("{api}({arg})")).or_default() += 1);
+}
+
 fn get_element_by_id(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let id = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-    Ok(match with(|d| d.by_id(&id)) { Some(h) => node_obj(h, ctx), None => JsValue::null() })
+    Ok(match with(|d| d.by_id(&id)) {
+        Some(h) => node_obj(h, ctx),
+        None => { note_null("getElementById", &id); JsValue::null() }
+    })
 }
 
 fn create_element(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -257,9 +274,21 @@ fn query_all(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
 }
 
 fn query_first(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    Ok(match run_query(this, args, ctx)?.first() {
+    let hs = run_query(this, args, ctx)?;
+    Ok(match hs.first() {
         Some(&h) => node_obj(h, ctx),
-        None => JsValue::null(),
+        None => {
+            let sel = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+            // Separate the two causes: a selector we could not parse is OUR
+            // gap, one that parsed and matched nothing is the document's.
+            let api = if crate::selector::parse(&sel).is_some() {
+                "querySelector-no-match"
+            } else {
+                "querySelector-UNPARSEABLE"
+            };
+            note_null(api, &sel);
+            JsValue::null()
+        }
     })
 }
 
@@ -554,10 +583,12 @@ impl ScriptEngine for BoaEngine {
         let _ = ctx.register_global_property(js_string!("console"), console, Attribute::all());
 
         MISSES.with(|m| m.borrow_mut().clear());
+        NULLS.with(|n| n.borrow_mut().clear());
         BASE.with(|b| *b.borrow_mut() = self.base_url.clone());
         CURRENT.with(|c| *c.borrow_mut() = None);
         let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![],
-            missing: vec![], listeners_fired: 0, module_retries: 0, observers_registered: 0 };
+            missing: vec![], nulls: vec![], listeners_fired: 0, module_retries: 0,
+            observers_registered: 0 };
         RECORDING.with(|r| *r.borrow_mut() = false);
         let _ = ctx.register_global_callable(js_string!("__parse_url"), 2,
             NativeFunction::from_fn_ptr(parse_url));
@@ -630,6 +661,7 @@ impl ScriptEngine for BoaEngine {
             .and_then(|v| v.as_number())
             .unwrap_or(0.0) as u32;
         rep.missing = MISSES.with(|m| m.borrow().iter().map(|(k, v)| (k.clone(), *v)).collect());
+        rep.nulls = NULLS.with(|n| n.borrow().iter().map(|(k, v)| (k.clone(), *v)).collect());
         rep
     }
 }
