@@ -122,6 +122,13 @@ fn query_all(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsVa
     Ok(JsValue::from(arr))
 }
 
+/// ★ A converter must not be hangable by the content it converts, and Boa's
+/// instruction budget is gated behind its `fuzz` feature — which drags
+/// `arbitrary` into two crates to obtain a counter. The driver instead runs
+/// each document in its OWN PROCESS with a wall-clock deadline (see main.rs),
+/// which bounds hangs, stack overflows and runaway allocation alike, needs no
+/// feature flags, and mirrors the shipped design: one jail per document.
+#[derive(Default)]
 pub struct BoaEngine;
 
 impl ScriptEngine for BoaEngine {

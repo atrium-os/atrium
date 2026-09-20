@@ -8,6 +8,7 @@ description = "Tier-2 conversion instrument: run a page's scripts once, headless
 boa_engine = "0.22"
 html5ever = "0.39"
 markup5ever_rcdom = "0.39"
+url = "2"
 
 [[bin]]
 name = "prerender"

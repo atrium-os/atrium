@@ -3,7 +3,7 @@
 //! Usage: prerender <file-or-dir>...
 //! The output is a measurement, not a rendering — see spec §11.4.
 
-use navigator_prerender::{boa_impl::BoaEngine, convert};
+use navigator_prerender::{boa_impl::BoaEngine, convert_with, fetch::{Fetcher, HttpFetcher, NoNetwork}};
 use std::{collections::BTreeMap, fs, path::{Path, PathBuf}};
 
 fn collect(p: &Path, out: &mut Vec<PathBuf>) {
@@ -16,20 +16,74 @@ fn collect(p: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Convert exactly one document and print one machine-readable line. The
+/// directory driver invokes this in a child process so a pathological
+/// document cannot take the corpus run with it.
+fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
+    let src = fs::read_to_string(file).unwrap_or_default();
+    let mut http = HttpFetcher::new(std::env::temp_dir().join("prerender-jscache"));
+    let mut nonet = NoNetwork;
+    let fetcher: &mut dyn Fetcher = if net { &mut http } else { &mut nonet };
+    let c = convert_with(&src, base, &mut BoaEngine::default(), fetcher);
+    // fields the parent aggregates; errors last, tab-separated
+    println!("R\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        c.elements_before, c.elements_after, c.depth_after,
+        c.scripts_total, c.scripts_run, c.scripts_failed, c.script_mutations,
+        c.external_total, c.external_fetched);
+    for e in c.errors.iter().take(8) {
+        println!("E\t{}", e.replace('\t', " ").replace('\n', " "));
+    }
+    std::process::exit(0);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(|s| s == "--one").unwrap_or(false) {
+        let file = args.get(1).cloned().unwrap_or_default();
+        let base = args.get(2).filter(|s| !s.is_empty()).cloned();
+        let net = std::env::var("PRERENDER_NET").ok().as_deref() == Some("1");
+        run_one(&file, base.as_deref(), net);
+    }
     if args.is_empty() { eprintln!("usage: prerender <file-or-dir>..."); std::process::exit(2); }
     let mut files = vec![];
     for a in &args { collect(Path::new(a), &mut files); }
     files.sort();
 
+    // A manifest maps each saved file to the URL it came from, which is what
+    // makes relative `src` resolvable. Without it the run is inline-only, and
+    // says so rather than pretending to have measured external script.
+    let mut base: BTreeMap<String, String> = BTreeMap::new();
+    for a in &args {
+        let m = Path::new(a).join("manifest.tsv");
+        if let Ok(t) = fs::read_to_string(&m) {
+            for line in t.lines() {
+                if let Some((f, u)) = line.split_once('\t') {
+                    base.insert(f.trim().to_string(), u.trim().to_string());
+                }
+            }
+        }
+    }
+    let net = std::env::var("PRERENDER_NET").ok().as_deref() == Some("1");
+
+    let exe = std::env::current_exe().expect("exe");
     let (mut with_js, mut js_ok, mut js_fail, mut mutated) = (0usize, 0usize, 0usize, 0usize);
+    let (mut ext_total, mut ext_ok, mut ext_fail) = (0usize, 0usize, 0usize);
+    let mut timed_out = 0usize;
     let mut errors: BTreeMap<String, usize> = BTreeMap::new();
     let mut elems = vec![];
 
     for f in &files {
         let Ok(src) = fs::read_to_string(f) else { continue };
-        let c = convert(&src, &mut BoaEngine);
+        let _ = &src;
+        let name = f.file_name().unwrap().to_string_lossy().to_string();
+        let b = base.get(&name).cloned().unwrap_or_default();
+        let Some(c) = convert_in_child(&exe, f, &b, net, DEADLINE) else {
+            timed_out += 1;
+            continue;
+        };
+        ext_total += c.external_total;
+        ext_ok += c.external_fetched;
+        ext_fail += c.external_total - c.external_fetched;
         elems.push(c.elements_after);
         if c.scripts_total > 0 {
             with_js += 1;
@@ -46,10 +100,14 @@ fn main() {
     elems.sort();
     let pct = |q: f64| elems.get(((elems.len() as f64) * q) as usize).copied().unwrap_or(0);
     println!("documents            {}", files.len());
+    if timed_out > 0 { println!("  TIMED OUT / crashed {timed_out}  (child killed at {DEADLINE:?})"); }
     println!("  with inline script {with_js}");
     println!("  scripts all ran    {js_ok}");
     println!("  some script failed {js_fail}");
     println!("  DOM actually changed by script {mutated}");
+    println!("external scripts  referenced={ext_total} fetched={ext_ok} failed={ext_fail}{}",
+        if net { "" } else { "   (network OFF — set PRERENDER_NET=1)" });
+
     if !elems.is_empty() {
         println!("elements  median={} p95={} max={}", pct(0.5), pct(0.95), elems.last().unwrap());
     }
@@ -59,4 +117,65 @@ fn main() {
         v.sort_by(|a, b| b.1.cmp(&a.1));
         for (k, n) in v.into_iter().take(12) { println!("  {n:5}  {k}"); }
     }
+}
+
+const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run one document in a child process, killing it at the deadline.
+fn convert_in_child(
+    exe: &Path, file: &Path, base: &str, net: bool, deadline: std::time::Duration,
+) -> Option<Child> {
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new(exe);
+    cmd.arg("--one").arg(file).arg(base).stdout(Stdio::piped()).stderr(Stdio::null());
+    if net { cmd.env("PRERENDER_NET", "1"); }
+    let mut ch = cmd.spawn().ok()?;
+    let start = std::time::Instant::now();
+    loop {
+        match ch.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if start.elapsed() > deadline => { let _ = ch.kill(); let _ = ch.wait(); return None; }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(_) => return None,
+        }
+    }
+    let out = ch.wait_with_output().ok()?;
+    parse_child(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// What the parent needs back from a child run.
+pub struct Child {
+    pub elements_before: usize,
+    pub elements_after: usize,
+    pub scripts_total: usize,
+    pub scripts_failed: usize,
+    pub script_mutations: u64,
+    pub external_total: usize,
+    pub external_fetched: usize,
+    pub errors: Vec<String>,
+}
+
+fn parse_child(s: &str) -> Option<Child> {
+    let mut c = Child { elements_before: 0, elements_after: 0, scripts_total: 0,
+        scripts_failed: 0, script_mutations: 0, external_total: 0, external_fetched: 0,
+        errors: vec![] };
+    let mut saw = false;
+    for line in s.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        match f.first() {
+            Some(&"R") if f.len() >= 10 => {
+                saw = true;
+                c.elements_before = f[1].parse().unwrap_or(0);
+                c.elements_after = f[2].parse().unwrap_or(0);
+                c.scripts_total = f[4].parse().unwrap_or(0);
+                c.scripts_failed = f[6].parse().unwrap_or(0);
+                c.script_mutations = f[7].parse().unwrap_or(0);
+                c.external_total = f[8].parse().unwrap_or(0);
+                c.external_fetched = f[9].parse().unwrap_or(0);
+            }
+            Some(&"E") if f.len() >= 2 => c.errors.push(f[1].to_string()),
+            _ => {}
+        }
+    }
+    saw.then_some(c)
 }

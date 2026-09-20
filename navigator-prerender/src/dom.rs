@@ -181,6 +181,48 @@ pub fn inline_scripts(d: &Dom) -> Vec<String> {
         .collect()
 }
 
+/// A script the document asks for, in document order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Script {
+    Inline(String),
+    /// `src` as written; resolution against the document base happens later.
+    External(String),
+}
+
+/// Every script the document asks for, inline and external, IN DOCUMENT ORDER.
+///
+/// Order matters: an external bundle usually defines what a later inline
+/// script calls, so running inline-only (as the first version did) both misses
+/// the content SPAs generate and manufactures failures in scripts whose
+/// dependencies never loaded.
+pub fn scripts_in_order(d: &Dom) -> Vec<Script> {
+    fn go(d: &Dom, h: Handle, out: &mut Vec<Script>) {
+        if d.tag(h).map(|t| t.eq_ignore_ascii_case("script")).unwrap_or(false) {
+            let ty_ok = match d.attr(h, "type") {
+                None => true,
+                Some(t) => {
+                    let t = t.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+                    matches!(t.as_str(), "" | "text/javascript" | "application/javascript"
+                        | "text/ecmascript" | "application/ecmascript" | "module")
+                }
+            };
+            if ty_ok {
+                if let Some(src) = d.attr(h, "src") {
+                    if !src.trim().is_empty() { out.push(Script::External(src.to_string())); }
+                } else {
+                    let t = d.text_content(h);
+                    if !t.trim().is_empty() { out.push(Script::Inline(t)); }
+                }
+            }
+            return;
+        }
+        for &c in &d.nodes[h as usize].children { go(d, c, out); }
+    }
+    let mut out = vec![];
+    go(d, d.root(), &mut out);
+    out
+}
+
 /// Script elements present but NOT run, by type — what a conversion skipped.
 pub fn skipped_script_types(d: &Dom) -> Vec<String> {
     d.by_tag("script").into_iter()

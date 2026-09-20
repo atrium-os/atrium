@@ -109,3 +109,50 @@ fn console_is_a_sink_not_a_failure() {
     let c = convert(html, &mut BoaEngine);
     assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
 }
+
+/// External script, deterministically: the fetcher seam means a test can
+/// exercise the whole path with no network. `NoNetwork` is the default
+/// elsewhere precisely so no test can silently acquire one.
+#[test]
+fn external_script_is_fetched_resolved_and_run_in_order() {
+    use navigator_prerender::{convert_with, fetch::MapFetcher};
+    let mut f = MapFetcher::default();
+    f.0.insert("https://example.test/js/app.js".into(),
+               "var made = document.createElement('p'); made.textContent='from bundle'; \
+                document.body.appendChild(made);".into());
+    let html = r#"<html><body><script src="/js/app.js"></script>
+        <script>document.body.setAttribute('after','inline');</script></body></html>"#;
+    let c = convert_with(html, Some("https://example.test/page.html"), &mut BoaEngine::default(), &mut f);
+    assert_eq!(c.external_total, 1);
+    assert_eq!(c.external_fetched, 1);
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.html.contains("from bundle"), "external script did not run: {}", c.html);
+    assert!(c.html.contains(r#"after="inline""#), "inline script must still run: {}", c.html);
+}
+
+/// A `src` that cannot be resolved is reported, never guessed at.
+#[test]
+fn unresolvable_src_is_reported_not_guessed() {
+    use navigator_prerender::{convert_with, fetch::MapFetcher};
+    let mut f = MapFetcher::default();
+    let html = r#"<html><body><p>kept</p><script src="/app.js"></script></body></html>"#;
+    let c = convert_with(html, None, &mut BoaEngine::default(), &mut f); // no base
+    assert_eq!(c.external_total, 1);
+    assert_eq!(c.external_fetched, 0);
+    assert!(c.errors.iter().any(|e| e.contains("unresolved")), "{:?}", c.errors);
+    assert!(c.html.contains("kept"));
+}
+
+/// Document order across inline and external must be preserved: a bundle
+/// usually defines what a later inline script calls.
+#[test]
+fn document_order_is_preserved_across_inline_and_external() {
+    use navigator_prerender::dom::{scripts_in_order, Script};
+    let d = navigator_prerender::parse::parse(
+        r#"<html><body><script>1</script><script src="a.js"></script><script>2</script></body></html>"#);
+    let s = scripts_in_order(&d);
+    assert_eq!(s.len(), 3);
+    assert!(matches!(&s[0], Script::Inline(t) if t.contains('1')));
+    assert!(matches!(&s[1], Script::External(u) if u == "a.js"));
+    assert!(matches!(&s[2], Script::Inline(t) if t.contains('2')));
+}
