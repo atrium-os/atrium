@@ -14,6 +14,9 @@ use crate::dom::Dom;
 /// One script to run, and how it must be parsed.
 pub struct ScriptSource {
     pub text: String,
+    /// Where this module lives in the mirror, if it is one. Boa resolves
+    /// relative specifiers against it.
+    pub path: Option<std::path::PathBuf>,
     /// Declared `type="module"`, or inferred after a classic parse failed on
     /// module-only syntax.
     pub module: bool,
@@ -36,5 +39,7 @@ pub trait ScriptEngine {
     /// Name, for the report — which engine produced this conversion.
     fn name(&self) -> &'static str;
     /// Run each script in document order against the DOM, mutating it.
+    /// Root of the mirrored module graph for this document.
+    fn set_module_root(&mut self, _root: &std::path::Path) {}
     fn run(&mut self, dom: &mut Dom, scripts: &[ScriptSource]) -> RunReport;
 }

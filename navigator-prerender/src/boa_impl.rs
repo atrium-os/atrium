@@ -227,16 +227,24 @@ fn by_tag_name(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
 /// which bounds hangs, stack overflows and runaway allocation alike, needs no
 /// feature flags, and mirrors the shipped design: one jail per document.
 #[derive(Default)]
-pub struct BoaEngine;
+pub struct BoaEngine {
+    /// Root of the mirrored module graph; Boa's loader resolves against it.
+    pub module_root: Option<std::path::PathBuf>,
+}
 
 /// Parse, link and evaluate a module, then settle its promise.
 ///
 /// `load_link_evaluate` returns a promise: without draining the job queue the
 /// module's top-level body may not have run at all, and a rejection would be
 /// reported as success.
-fn run_module(ctx: &mut Context, text: &str) -> Result<(), String> {
-    let module = boa_engine::Module::parse(Source::from_bytes(text.as_bytes()), None, ctx)
-        .map_err(|e| e.to_string())?;
+fn run_module(ctx: &mut Context, text: &str, path: Option<&std::path::Path>) -> Result<(), String> {
+    // Giving the source its mirrored path is what lets relative specifiers
+    // resolve: Boa's loader joins them against it.
+    let src = match path {
+        Some(p) => Source::from_bytes(text.as_bytes()).with_path(p),
+        None => Source::from_bytes(text.as_bytes()),
+    };
+    let module = boa_engine::Module::parse(src, None, ctx).map_err(|e| e.to_string())?;
     let promise = module.load_link_evaluate(ctx);
     ctx.run_jobs().map_err(|e| e.to_string())?;
     match promise.state() {
@@ -311,9 +319,21 @@ const FIRE: &str = r#"
 impl ScriptEngine for BoaEngine {
     fn name(&self) -> &'static str { "boa" }
 
+    fn set_module_root(&mut self, root: &std::path::Path) {
+        self.module_root = Some(root.to_path_buf());
+    }
+
     fn run(&mut self, dom: &mut Dom, scripts: &[ScriptSource]) -> RunReport {
         DOM.with(|d| *d.borrow_mut() = std::mem::take(dom));
-        let mut ctx = Context::default();
+        let mut ctx = match self.module_root.as_ref()
+            .and_then(|r| boa_engine::module::SimpleModuleLoader::new(r).ok())
+        {
+            Some(loader) => Context::builder()
+                .module_loader(std::rc::Rc::new(loader))
+                .build()
+                .unwrap_or_default(),
+            None => Context::default(),
+        };
 
         let body = with(|d| d.by_tag("body").first().copied()).unwrap_or(0);
         let body_v = node_obj(body, &mut ctx);
@@ -370,7 +390,7 @@ impl ScriptEngine for BoaEngine {
         RECORDING.with(|r| *r.borrow_mut() = true);
         for s in scripts {
             let mut err = if s.module {
-                run_module(&mut ctx, &s.text).err()
+                run_module(&mut ctx, &s.text, s.path.as_deref()).err()
             } else {
                 ctx.eval(Source::from_bytes(s.text.as_bytes())).err().map(|e| e.to_string())
             };
@@ -386,7 +406,7 @@ impl ScriptEngine for BoaEngine {
                         // still module syntax we would otherwise have lost,
                         // and hiding it would understate the work done.
                         rep.module_retries += 1;
-                        match run_module(&mut ctx, &s.text) {
+                        match run_module(&mut ctx, &s.text, s.path.as_deref()) {
                             Ok(()) => err = None,
                             Err(e2) => err = Some(e2),
                         }

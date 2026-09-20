@@ -14,7 +14,7 @@ fn spa_shell_becomes_static_content() {
         p.textContent = 'Body text';
         r.appendChild(p);
       </script></body></html>"#;
-    let c = convert(html, &mut BoaEngine);
+    let c = convert(html, &mut BoaEngine::default());
     assert_eq!(c.scripts_failed, 0, "errors: {:?}", c.errors);
     assert!(c.html.contains("Hello from script"), "got: {}", c.html);
     assert!(c.html.contains(r#"class="lede""#), "got: {}", c.html);
@@ -27,7 +27,7 @@ fn textcontent_reads_back() {
     let html = "<html><body><div id=a>original</div><script>\
         var d=document.getElementById('a'); d.textContent = d.textContent + ' + appended';\
         </script></body></html>";
-    let c = convert(html, &mut BoaEngine);
+    let c = convert(html, &mut BoaEngine::default());
     assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
     assert!(c.html.contains("original + appended"), "got: {}", c.html);
 }
@@ -38,7 +38,7 @@ fn query_and_attributes() {
         var ps=document.querySelectorAll('p');\
         for (var i=0;i<ps.length;i++) ps[i].setAttribute('data-i', String(i));\
         </script></body></html>";
-    let c = convert(html, &mut BoaEngine);
+    let c = convert(html, &mut BoaEngine::default());
     assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
     assert!(c.html.contains(r#"data-i="0""#) && c.html.contains(r#"data-i="1""#), "got: {}", c.html);
 }
@@ -48,7 +48,7 @@ fn query_and_attributes() {
 #[test]
 fn script_failure_keeps_the_document() {
     let html = "<html><body><p>static</p><script>noSuchApi.doThing();</script></body></html>";
-    let c = convert(html, &mut BoaEngine);
+    let c = convert(html, &mut BoaEngine::default());
     assert_eq!(c.scripts_failed, 1);
     assert!(!c.errors.is_empty());
     assert!(c.html.contains("static"), "got: {}", c.html);
@@ -60,9 +60,9 @@ fn conversion_is_deterministic() {
     let html = "<html><body><div id=r></div><script>\
         for(var i=0;i<20;i++){var e=document.createElement('span');e.textContent='n'+i;\
         document.getElementById('r').appendChild(e);}</script></body></html>";
-    let a = convert(html, &mut BoaEngine).html;
-    let b = convert(html, &mut BoaEngine).html;
-    let c = convert(html, &mut BoaEngine).html;
+    let a = convert(html, &mut BoaEngine::default()).html;
+    let b = convert(html, &mut BoaEngine::default()).html;
+    let c = convert(html, &mut BoaEngine::default()).html;
     assert_eq!(a, b); assert_eq!(b, c);
 }
 
@@ -98,7 +98,7 @@ fn non_javascript_script_types_are_not_executed() {
     assert_eq!(navigator_prerender::dom::inline_scripts(&d).len(), 1,
         "only the real script should run");
     assert_eq!(navigator_prerender::dom::skipped_script_types(&d).len(), 2);
-    let c = convert(html, &mut BoaEngine);
+    let c = convert(html, &mut BoaEngine::default());
     assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
     assert!(c.html.contains(r#"ran="yes""#), "got: {}", c.html);
 }
@@ -106,7 +106,7 @@ fn non_javascript_script_types_are_not_executed() {
 #[test]
 fn console_is_a_sink_not_a_failure() {
     let html = "<html><body><script>console.log('x');console.warn('y');</script></body></html>";
-    let c = convert(html, &mut BoaEngine);
+    let c = convert(html, &mut BoaEngine::default());
     assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
 }
 
