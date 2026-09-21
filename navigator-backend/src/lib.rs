@@ -15,10 +15,12 @@
 pub mod apply;
 pub mod document;
 pub mod ingest;
+pub mod jailed;
 pub mod limits;
 pub mod navigatord;
 pub mod reverse;
 pub mod session;
+pub mod wire;
 pub use ingest::ingest;
 pub use limits::Limits;
 

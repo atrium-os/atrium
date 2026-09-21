@@ -105,6 +105,12 @@ pub enum Expiry {
 pub enum Status {
     Open,
     Expired(Expiry),
+    /// ★ The worker holding this session died — crashed, hung past its
+    /// deadline, or sent something the host could not parse. Distinct from
+    /// `Expired`, which is the system reclaiming an abandoned session on
+    /// purpose: one is an offer to reopen, the other is a fault a reader
+    /// should be told about and an operator should see.
+    Failed,
     /// Never existed, or expired so long ago it is no longer remembered.
     Unknown,
 }

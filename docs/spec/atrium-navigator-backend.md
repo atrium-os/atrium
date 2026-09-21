@@ -415,6 +415,53 @@ End to end on real converter output: **98 sessions opened, 259 navigations, 259 
 blocked** — driving every trigger the broker itself offered, rather than a list the test
 invented.
 
+### 4.7 The document worker, and what "jailed" does not yet mean
+
+`JailedHost` implements `DocumentHost` by running **one worker process per document**, with
+a pipe as its only channel. The broker holds capabilities and never parses; the worker
+parses and holds nothing — it opens no files, makes no network calls, holds no store
+handle, and refuses a second document outright, because a worker that multiplexed sessions
+would put two documents in one address space and reintroduce exactly the sharing Site
+Isolation had to be retrofitted elsewhere to undo.
+
+The broker did not change to gain this. The same requests over the same events produce, on
+the corpus, the same numbers as the in-process host: **98 sessions, 259 navigations, 259
+rewinds**. That is what the §4.6 seam was built to be able to say.
+
+**What is NOT true yet, and must not be read as if it were.** `Confinement::None` is
+*process isolation* — separate address space, separate crash domain, one document per
+process. Those are real, and they are not a jail: no capability restriction, no filesystem
+or network removal. "It is jailed" is not a uniform claim; a jail is a capability *set*, and
+a host that said "jailed" while running a bare subprocess would be the most dangerous
+comment in the tree. So the only constructor that produces it is named
+`unconfined_for_testing`, a host reports `is_confined()` honestly, and
+`require_confinement()` exists for a deployment that must refuse to start rather than run
+open.
+
+**Why the jail is not wired, rather than wired badly.** Portcullis today launches
+*applications*: `portcullis launch <app-tree>` reads a signed `atrium.toml`, builds a
+jail.conf section, and starts a long-lived jail. It has no "run this executable confined and
+hand me its stdin/stdout" mode — which is precisely what a process-per-document host needs.
+**That mode is a Portcullis-side change and is the next real step.** Inventing an invocation
+here would produce a host that claims confinement and silently provides none, which is worse
+than having neither. `Confinement::Launcher` takes the command explicitly and this crate
+asserts nothing about what any given launcher confines.
+
+**The pipe from a worker is untrusted input to the one process holding capabilities.** Spec
+§2 jails the worker *because we assume it can be compromised*, so everything it writes back
+is attacker-controlled — the length prefix included. Every read is bounded before a byte is
+allocated (frame payloads and the header line alike, since a peer that never sends a newline
+is a denial of service costing one byte a second). A reply the host does not recognise is a
+failure, never a value to fall back on. And the memory budget is charged from bytes the
+*broker* measured before spawning: a worker asked how large it is could answer zero, and the
+limit protecting the broker would be set by the thing it protects against.
+
+Three failures a worker can inflict, each survivable and each named: it **dies** (reported
+as `Status::Failed`, distinct from an expiry, which is the system reclaiming an abandoned
+session on purpose), it **hangs** (killed at a per-request deadline — a pipe has no read
+timeout, so a reader thread makes "bound every request" a mechanism rather than a comment),
+or it **lies** (retired, not believed).
+
 ### 4.5 Recording format version 2
 
 `atrium-navigator-recording/2` adds one field: an insert's `index`, the position the markup
