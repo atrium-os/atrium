@@ -488,22 +488,56 @@ platforms. Eleven further hosts refused the fetch, which is itself a fact about 
 |---|---|---|---|---|
 | document bytes | 100,063 | 1,187,554 | 1,569,024 | 2,033,807 |
 | elements per document | 1,097 | 16,014 | 25,577 | 27,839 |
-| tree depth ★ | 14 | 48 | 158 | 173 |
+| tree depth ★ (lenient-markup upper bound) | 14 | 48 | 158 | 173 |
+| tree depth — structural, HTML5 parser | 14 | 30 | 35 | 40 |
 
 ★ Depth remains an upper bound rather than structural nesting: the measuring parser does
 not implement HTML5's implied end tags, so unclosed elements in lenient markup accumulate
-on its stack. The profile requires well-formed input (§2), where that cannot occur.
+on its stack. The profile requires well-formed input (§2), where that cannot occur — which
+is why the STRUCTURAL row is the one the ceiling is derived from. Both are kept because the
+gap between them is the measurement of how lenient the real web's markup is, and it is
+large: 158 against 35 at p99, while the medians agree exactly.
 
 **At n = 104, p99 is finally distinct from the maximum**, so the derivation rule's own
 protection — prefer p99 so one pathological document cannot set a compatibility surface —
 is now actually operating. It was not at n = 24, where the two coincided.
 
-★★ **The ceilings below were set from a 24-document corpus and are UNCHANGED by this one.**
-Every measure stayed within 5–6× headroom (bytes 5.4×, elements 5.1×, depth 6.5×). That is
-the outcome worth recording: a fourfold headroom factor over p99 absorbed a fourfold
-increase in corpus size without needing revision, which is weak evidence the rule is
-calibrated rather than lucky. An earlier *source-tree* corpus was a different matter — its
-median of 84 elements against the web's 1,097 would have set every ceiling far too tight.
+★★ **The ceilings below were set from a 24-document corpus and the byte and element
+ceilings are UNCHANGED by this one.** Both reproduce exactly on re-measurement: bytes p99
+1,567,731 (5.4× headroom), elements p99 25,527 (5.1×). A fourfold headroom factor over p99
+absorbed a fourfold increase in corpus size without needing revision, which is weak evidence
+the rule is calibrated rather than lucky. An earlier *source-tree* corpus was a different
+matter — its median of 84 elements against the web's 1,097 would have set every ceiling far
+too tight.
+
+★★★ **The depth ceiling was derived from the wrong one of two honest numbers.** The 158
+above is a real measurement, and the ★ footnote says exactly what it is: an upper bound
+from a parser without HTML5's implied end tags, inflated by unclosed elements in lenient
+markup. The mistake was using it as the basis for a ceiling anyway — including rejecting an
+earlier 256 for leaving "only 1.6×" over it.
+
+Re-measured over the same 104 documents with the converter's real HTML5 parser, where
+implied end tags apply, **structural depth is p99 35, max 40** (median 14 — identical to
+the naive figure, since the two only diverge in the tail, which is precisely where a
+ceiling is set).
+
+Structural depth is the right basis here, and the footnote's own reasoning says why: the
+inflation comes from non-conformance that §2 forbids, so a *conforming* document's depth is
+the parsed number. Setting the bound from the lenient-markup upper bound buys headroom
+against documents the profile already refuses.
+
+Applying the derivation rule to the structural number — 5–6× of 35, rounded up to a power
+of two — gives **256** at 7.3× headroom: comfortably inside the rule, and exactly the value
+rejected on the strength of the other figure. 1,024 is 29× and far outside the 5–6× pattern
+the rule produces everywhere else, and a looser bound on nesting is a weaker G3 guarantee.
+**The ceiling is therefore tightened to 256.**
+
+A second corpus (n=67, commerce and app-shaped pages — see the legacy-web spec §5.4.1a)
+independently supports it: max structural depth 44, well inside 256. Deep nesting is not
+where web documents are extreme; element count and byte size are.
+
+*The lesson is not that the measurement was sloppy — it was labelled honestly. It is that a
+number carrying a caveat should not be fed to a rule that does not carry it.*
 
 **Still no corpus signal** for stylesheet size and count (this corpus's CSS is external and
 was not fetched), grid track counts, `calc()` nesting or custom-property depth. Those
@@ -514,8 +548,8 @@ remain marked *reasoned*.
 | ceiling | value | basis |
 |---|---|---|
 | total document bytes | **8 MiB** | 5.4× the 1.57 MiB p99 (n=104) |
-| elements per document | **131,072** | 5.1× the 25,577 p99 (n=104), 2^17 |
-| tree depth | **1,024** | 6.5× the 158 p99 (n=104); an earlier 256 left only 1.6× |
+| elements per document | **131,072** | 5.1× the 25,527 p99 (n=104), 2^17 |
+| tree depth | **256** | 7.3× the 35 p99 (n=104, n=67), 2^8 — see the correction below |
 | stylesheets per document | **16** | reasoned — no corpus signal |
 | `@import` depth | **4** | reasoned |
 | bytes per stylesheet | **1 MiB** | reasoned — this corpus's CSS is external, not fetched |
