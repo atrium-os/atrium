@@ -171,3 +171,51 @@ fn every_recorded_transition_applies_to_its_own_document() {
         "transitions failed against the document they were recorded on:\n  {}",
         failures.join("\n  "));
 }
+
+/// ★★ EVERY REAL TRANSITION THAT CAN BE REVERSED MUST REVERSE EXACTLY.
+///
+/// Apply it, undo it, and the document must serialize to the bytes it had
+/// before. This is the claim a reader's "back" depends on, checked against
+/// recordings the converter actually produced rather than hand-built ones.
+///
+/// It also reports how many transitions are reversible for free. That number
+/// decides whether a session's history costs a few strings per step or a
+/// whole document per step, and it is a MEASUREMENT — the design assumed
+/// attribute-only transitions dominate, and this is where the assumption is
+/// either confirmed or refuted.
+#[test]
+fn every_reversible_transition_restores_its_document_exactly() {
+    let Ok(dir) = std::env::var("NAVIGATOR_RECORDINGS") else {
+        eprintln!("SKIPPED: set NAVIGATOR_RECORDINGS to a directory of emitted recordings");
+        return;
+    };
+    use navigator_backend::document::Document;
+    let (mut reversible, mut not) = (0usize, 0usize);
+    let mut failures = vec![];
+    for e in std::fs::read_dir(&dir).expect("readable directory").flatten() {
+        let p = e.path();
+        if p.extension().map(|x| x != "json").unwrap_or(true) { continue }
+        let bytes = std::fs::read(&p).expect("readable file");
+        let Ok(r) = ingest(&bytes, &Limits::default()) else { continue };
+        let base = Document::accept(&r.document).expect("inside the profile");
+        let before = base.dom.serialize();
+        for t in &r.transitions {
+            if !t.anchored { continue }
+            let Ok(inv) = t.inverse() else { not += 1; continue };
+            let Ok(mut after) = base.applied(t) else { continue };
+            match after.apply(&inv) {
+                Ok(()) if after.dom.serialize() == before => reversible += 1,
+                Ok(()) => failures.push(format!(
+                    "{}: {} undid to a DIFFERENT document", p.display(), t.trigger)),
+                Err(why) => failures.push(format!(
+                    "{}: {} would not undo: {why}", p.display(), t.trigger)),
+            }
+        }
+    }
+    let total = reversible + not;
+    assert!(total > 0, "no transitions examined — this test checked nothing");
+    eprintln!("{reversible}/{total} recorded transitions reverse exactly and for free; \
+               {not} need a snapshot");
+    assert!(failures.is_empty(), "reversal did not restore the document:\n  {}",
+        failures.join("\n  "));
+}

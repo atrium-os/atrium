@@ -16,6 +16,7 @@ pub mod apply;
 pub mod document;
 pub mod ingest;
 pub mod limits;
+pub mod reverse;
 pub use ingest::ingest;
 pub use limits::Limits;
 

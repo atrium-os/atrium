@@ -250,6 +250,41 @@ Measured: all 264 anchored transitions in the main corpus and both in the advers
 apply cleanly to the documents they were recorded against — every precondition holds,
 every path resolves, and no result leaves the profile.
 
+### 4.4 Going back
+
+A reader moving back through states needs the state they were actually in, not one
+reconstructed from a recording that may not describe it. **Reversibility is not uniform,
+and the format is what limits it:**
+
+- An `attribute` effect records both sides, so its inverse is exact — swap `from` and `to`.
+  The reversal is then applied through the ordinary path, preconditions and profile check
+  included. An undo that skipped them would be the one operation in the backend that trusts
+  a recording, acting on a document that has already been modified once.
+- `remove` records only a path. What was there — subtree, attributes, position among
+  siblings — is not in the recording, so an inverse would have to invent a document.
+- `insert` records a parent and markup but not *where* under that parent it went (§4.3), so
+  nothing can identify what to take back out.
+
+The last two **refuse** rather than approximate, and a transition mixing an invertible
+effect with one that is not has no inverse at all: a partial inverse undoes half a step,
+and the reader cannot tell.
+
+**History pays only where the debt is owed.** A step with an exact inverse stores the
+inverse — a handful of strings. A step without one stores the document that preceded it.
+Snapshotting every state would be simpler and would make the common case pay for the rare
+one.
+
+How common: **257 of 264 anchored transitions in the main corpus (97%) reverse exactly and
+for free**, and both in the adversarial corpus. Seven need a snapshot. That is the same
+shape as the finding that most recorded transitions are attribute-only, and it is measured
+rather than assumed — it is the number that decides whether a session's history costs
+strings per step or a document per step.
+
+Reversal is verified by **byte equality** on the serialized document, against recordings the
+converter actually produced. A weaker assertion — "the attribute is false again" — passes on
+a document that has also quietly gained or lost something else, which is the failure an undo
+path actually has.
+
 ---
 
 ## 5. The store is Tessera
