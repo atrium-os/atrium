@@ -641,6 +641,32 @@ This is the second measure in this section — with grid tracks — whose bound 
 something outside the document. The derivation rule assumes the document contains what is
 being bounded, and twice it does not.
 
+#### `position: fixed` elements, and a ceiling that survives measurement
+
+Measured by extracting every selector whose rule sets `position: fixed` and running it
+against the parsed document with this project's own selector engine, across both corpora:
+103 documents use `position: fixed` at all.
+
+| p50 | p90 | p95 | p99 | max |
+|---|---|---|---|---|
+| 1 | 6 | **7** | 35 | 142 |
+
+**The ceiling of 8 sits just above p95 and is approximately right.** Four documents (3% of
+those using it) exceed it on this count.
+
+★ **But the measure is an UPPER BOUND, and the rule must not be applied to its tail.** It
+overstates for three compounding reasons: there is no cascade, so a later rule overriding
+`position` back to `static` is not seen; `@media` variants are counted together although
+they are never simultaneously active — instagram.com has three such rules outside media
+queries and five inside; and hidden overlays are counted although nothing stacks. Applying
+5–6× to the inflated p99 of 35 would give 256, which is precisely the error made with tree
+depth: deriving a bound from a number that carries a caveat the rule does not carry.
+
+So **8 stands**, as the only measurable-from-documents ceiling in this section that survived
+contact with measurement unchanged. A precise figure needs cascade resolution, media-query
+evaluation and visibility — three things this converter deliberately does not do, so the
+number above is the best available and is labelled as a bound rather than a count.
+
 #### The ceilings
 
 | ceiling | value | basis |
@@ -659,7 +685,7 @@ being bounded, and twice it does not.
 | image dimension (either axis) | **16,384 px** | matches common GPU texture limits |
 | **total decoded image bytes** | **256 MiB** | the binding constraint (below) |
 | `box-shadow` blur + spread | **256 px** | bounds rasterization cost, not structure |
-| `position: fixed` elements per document | **8** | reasoned — bounds overlay stacking |
+| `position: fixed` elements per document | **8** | validated at p95=7 of an upper-bound measure (n=103) — see below |
 | fixed element block size | **1/3 of viewport** | reasoned — see §3.3 |
 | bytes per web font | **8 MiB** | validated: max observed 6.17 MiB (n=220). A full CJK face fits, as reasoned |
 | declared `@font-face` per document | **512** | 6.0× the 85 p99 (n=84 docs) — was 8, BELOW THE MEDIAN of 9 |
