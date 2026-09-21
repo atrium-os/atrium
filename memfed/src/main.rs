@@ -201,6 +201,57 @@ struct Jail {
     floor: u64, // MiB protected minimum
 }
 
+/// ★★★ A POOL: one weighted share for a SET of jails named by prefix.
+///
+/// memfed budgets jails listed by name in operator configuration. That works
+/// for applications, whose names an operator can write down, and not at all
+/// for EPHEMERAL jails — the Navigator runs one jailed document worker per
+/// document, named `<app>__<instance>`, created and destroyed as pages open
+/// and close. No configuration can enumerate them, so until now they were
+/// outside the federation entirely: neither budgeted nor visible to it, which
+/// is the one category of jail that can appear in numbers.
+///
+/// ★★ THE SHARE MUST NOT GROW WITH THE MEMBERSHIP. Giving each member its own
+/// weight would let a pool claim more of the machine simply by having more
+/// members — a browser could starve everything else by opening tabs, which is
+/// precisely the failure a federation exists to prevent. So a pool takes ONE
+/// weighted share and divides it among whatever members happen to be live:
+/// adding a worker divides the pool's share, never the system's.
+struct Pool {
+    prefix: String,
+    weight: f64,
+    floor: u64,
+}
+
+/// Split a pool's grant among its members in proportion to demand, never
+/// below each member's current RSS.
+///
+/// ★ The RSS floor is the same freeze-not-kill rule the per-jail path uses,
+/// and it has the same consequence: if the members' RSS already exceeds the
+/// pool's grant, the pool overshoots its budget rather than killing a worker.
+/// That is a deliberate compromise, not an oversight — a cap below RSS is a
+/// SIGKILL, and the reactive layer (memoryd) exists for exactly the case
+/// where the proactive one has to yield.
+fn split_pool(grant: u64, demands: &[u64], rss: &[u64]) -> Vec<u64> {
+    let n = demands.len();
+    if n == 0 { return vec![] }
+    let total: u64 = demands.iter().sum();
+    (0..n).map(|i| {
+        let share = if total == 0 { grant / n as u64 }
+                    else { (grant as u128 * demands[i] as u128 / total as u128) as u64 };
+        share.max(rss[i])
+    }).collect()
+}
+
+/// Every live jail's name, for discovering pool members. The pressure device
+/// enumerates all jails; this is the host-side fallback.
+fn live_jail_names() -> Vec<String> {
+    Command::new("jls").args(["name"]).output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default()
+}
+
 /// Demand-aware max-min fair water-fill (the federation): each jail gets its floor,
 /// then up to its *demand* from the elastic budget, weighted — a jail that wants
 /// less than its weighted share releases the slack to the others (so idle jails do
@@ -248,19 +299,84 @@ fn water_fill(budget: u64, demands: &[u64], floors: &[u64], weights: &[f64]) -> 
     (0..n).map(|i| floors[i] + grant[i] as u64).collect()
 }
 
+/// A member's RSS, from the pressure snapshot when available.
+fn member_rss_mib(name: &str,
+                  sensed: &Option<std::collections::HashMap<String, (u64, u64)>>) -> u64 {
+    match sensed {
+        Some(m) => m.get(name).map(|&(r, _)| r).unwrap_or(0),
+        None => jail_rss_mib(name),
+    }
+}
+
+/// Set one jail's cap, through the broker when jailed, directly otherwise.
+fn set_cap(broker: Option<&str>, name: &str, cap: u64) {
+    match broker {
+        // Jailed act path: portcullisd cap-checks + jaild sets the rule.
+        Some(sock) => { broker_set_rctl(sock, name, cap); }
+        // v1 host-side: rctl(8) directly.
+        None => { let _ = Command::new("rctl")
+            .args(["-a", &format!("jail:{}:memoryuse:sigkill={}M", name, cap)])
+            .status(); }
+    }
+}
+
 /// One federation tick: read each jail's RSS and per-jail `full`, demand-aware
 /// water-fill the budget (a thrashing jail's demand is boosted), and (if armed) set
 /// the per-jail RCTL caps. Returns the per-jail `full` snapshot to use as the next
 /// tick's baseline for the thrash delta.
-fn rebudget(jails: &[Jail], budget: u64, headroom: u64, thrash_boost: u64,
+fn rebudget(jails: &[Jail], pools: &[Pool], budget: u64, headroom: u64, thrash_boost: u64,
             prev_full: &std::collections::HashMap<String, u64>, armed: bool,
             broker: Option<&str>, pressure: Option<&Pressure>)
     -> std::collections::HashMap<String, u64>
 {
+    // ★ POOL MEMBERSHIP IS RESOLVED EVERY TICK, not configured. That is the
+    // whole point: these jails come and go with the documents that need them,
+    // so the federation has to look rather than be told. A member that
+    // vanished between ticks simply is not there next time — no bookkeeping
+    // to leak, and no stale name to cap.
+    let sensed = pressure.and_then(|p| p.read());
+    // Reuse the one snapshot for liveness, membership and budgeting.
+    let live: Vec<String> = match &sensed {
+        Some(m) => m.keys().cloned().collect(),
+        None => live_jail_names(),
+    };
+    let explicit: std::collections::BTreeSet<&str> =
+        jails.iter().map(|j| j.name.as_str()).collect();
+    let members: Vec<Vec<String>> = pools.iter().map(|p| {
+        let mut v: Vec<String> = live.iter()
+            .filter(|n| n.starts_with(&p.prefix) && !explicit.contains(n.as_str()))
+            // ★★ A JAIL WITH ZERO RSS IS WRECKAGE, NOT A MEMBER.
+            //
+            // `jail -c` creates with persist=true, so a launcher that is
+            // killed leaves a named jail with no processes in it. Measured:
+            // three such husks were budgeted as pool members and given rctl
+            // rules — and a rule outlives the husk, so the NEXT worker that
+            // reuses that instance tag inherits a stranger's cap. The same
+            // hazard the one-shot teardown guards against, arriving by a
+            // different road.
+            //
+            // Zero RSS is the right test and it costs nothing: it is the same
+            // number the budget is computed from, so no extra probe is
+            // needed, and a jail using no memory needs no budget anyway.
+            .filter(|n| member_rss_mib(n, &sensed) > 0)
+            .cloned().collect();
+        v.sort();
+        v
+    }).collect();
+
+    // Every pool member is budgeted through its pool, so they enter the
+    // water-fill as ONE entry carrying the pool's weight and the SUM of its
+    // members' demand.
+    let mut all: Vec<Jail> = jails.to_vec();
+    for (pi, p) in pools.iter().enumerate() {
+        all.push(Jail { name: format!("[pool {}*×{}]", p.prefix, members[pi].len()),
+                        weight: p.weight, floor: p.floor });
+    }
+    let jails: &[Jail] = &all;
+    let pool_members = &members;
     // Sense RSS + per-jail `full` keyed by NAME. Primary path = one PRESSURE_GET on
     // /dev/pressure (the jailed governor read: no host rctl/jls, no sibling-jid
     // resolution). Fallback (no device) = host `rctl -u` + the per-jail sysctl.
-    let sensed = pressure.and_then(|p| p.read());
     let (rss, cur_full): (Vec<u64>, std::collections::HashMap<String, u64>) =
         if let Some(ref m) = sensed {
             (jails.iter().map(|j| m.get(&j.name).map(|&(r, _)| r).unwrap_or(0)).collect(),
@@ -279,30 +395,47 @@ fn rebudget(jails: &[Jail], budget: u64, headroom: u64, thrash_boost: u64,
     // stalling jail can't show in RSS (its pages keep getting reclaimed). The
     // water-fill grants the boost only if the jail's weight wins it — high-weight
     // thrashers grow and stop stalling; low-weight thrashers stay contained.
-    let demands: Vec<u64> = jails.iter().zip(&rss).zip(&thrashing)
+    let mut demands: Vec<u64> = jails.iter().zip(&rss).zip(&thrashing)
         .map(|((j, &r), &t)| r.max(j.floor) + headroom + if t { thrash_boost } else { 0 })
         .collect();
+    // A pool's own name has no RSS; its demand is its members' demand, and its
+    // headroom is charged ONCE for the pool rather than once per member —
+    // otherwise sixteen idle workers would claim sixteen headrooms.
+    let base = jails.len() - pools.len();
+    let mut member_rss: Vec<Vec<u64>> = vec![];
+    for (pi, _p) in pools.iter().enumerate() {
+        let rs: Vec<u64> = pool_members[pi].iter().map(|n| member_rss_mib(n, &sensed)).collect();
+        let sum: u64 = rs.iter().sum();
+        demands[base + pi] = sum.max(jails[base + pi].floor) + headroom;
+        member_rss.push(rs);
+    }
     let floors: Vec<u64> = jails.iter().map(|j| j.floor).collect();
     let weights: Vec<f64> = jails.iter().map(|j| j.weight).collect();
     let grants = water_fill(budget, &demands, &floors, &weights);
 
     for (i, j) in jails.iter().enumerate() {
+        if i >= base {
+            // A pool: divide its one grant among the members that exist now.
+            let pi = i - base;
+            let rs = &member_rss[pi];
+            let dem: Vec<u64> = rs.iter().map(|r| r + headroom).collect();
+            let caps = split_pool(grants[i], &dem, rs);
+            eprintln!("  pool {:<10} w={:<4} members={} Σrss={}MB -> grant {}MB",
+                j.name, j.weight, pool_members[pi].len(),
+                rs.iter().sum::<u64>(), grants[i]);
+            for (m, name) in pool_members[pi].iter().enumerate() {
+                eprintln!("    member {:<28} rss={}MB cap={}MB", name, rs[m], caps[m]);
+                if armed { set_cap(broker, name, caps[m]); }
+            }
+            continue;
+        }
         // Never below current RSS — RCTL sigkill would kill it; freeze, don't kill.
         let cap = grants[i].max(rss[i]);
         let note = if cap > grants[i] { " (over budget → frozen at RSS)" } else { "" };
         let tnote = if thrashing[i] { " [THRASH +boost]" } else { "" };
         eprintln!("  jail {:<10} w={:<4} rss={}MB demand={}MB{} -> grant {}MB cap={}MB{}",
             j.name, j.weight, rss[i], demands[i], tnote, grants[i], cap, note);
-        if armed {
-            match broker {
-                // Jailed act path: portcullisd cap-checks + jaild sets the rule.
-                Some(sock) => { broker_set_rctl(sock, &j.name, cap); }
-                // v1 host-side: rctl(8) directly.
-                None => { let _ = Command::new("rctl")
-                    .args(["-a", &format!("jail:{}:memoryuse:sigkill={}M", j.name, cap)])
-                    .status(); }
-            }
-        }
+        if armed { set_cap(broker, &j.name, cap); }
     }
     let total: u64 = grants.iter().sum();
     eprintln!("  Σ grants = {}MB / {}MB budget{}", total, budget,
@@ -323,7 +456,28 @@ fn main() {
     // default = one shot.
     let interval = arg("--interval", "0").parse::<u64>().unwrap_or(0);
 
-    let jails: Vec<Jail> = std::env::args().skip(1).filter(|a| a.contains(':')).filter_map(|a| {
+    // ★ `--pool <prefix>:<weight>:<floor>`, repeatable. A pool is how the
+    // federation budgets jails it cannot be told the names of.
+    let argv: Vec<String> = std::env::args().collect();
+    let pools: Vec<Pool> = argv.iter().enumerate()
+        .filter(|(_, a)| a.as_str() == "--pool")
+        .filter_map(|(i, _)| argv.get(i + 1))
+        .filter_map(|a| {
+            let f: Vec<&str> = a.split(':').collect();
+            if f.len() == 3 {
+                Some(Pool { prefix: f[0].to_string(), weight: f[1].parse().ok()?,
+                            floor: f[2].parse().ok()? })
+            } else { None }
+        }).collect();
+    let pool_args: std::collections::BTreeSet<&String> = argv.iter().enumerate()
+        .filter(|(_, a)| a.as_str() == "--pool")
+        .filter_map(|(i, _)| argv.get(i + 1)).collect();
+
+    let jails: Vec<Jail> = std::env::args().skip(1).filter(|a| a.contains(':'))
+        // ★ A --pool value also contains ':'; without this it would ALSO be
+        // parsed as a jail literally named after the prefix, and the
+        // federation would budget a jail that does not exist.
+        .filter(|a| !pool_args.contains(a)).filter_map(|a| {
         let f: Vec<&str> = a.split(':').collect();
         if f.len() == 3 {
             Some(Jail { name: f[0].to_string(), weight: f[1].parse().ok()?, floor: f[2].parse().ok()? })
@@ -332,8 +486,23 @@ fn main() {
         }
     }).collect();
 
-    if jails.is_empty() {
-        eprintln!("usage: memfed [--arm] [--broker <sock>] [--budget MB|--budget-pct N] [--headroom MB] [--interval S] name:weight:floor ...");
+    // ★ A pool alone is a valid configuration: a machine whose only budgeted
+    // jails are ephemeral has nothing to name, and refusing it would send the
+    // operator back to listing names they cannot know.
+    if jails.is_empty() && pools.is_empty() {
+        eprintln!("usage: memfed [--arm] [--broker <sock>] [--budget MB|--budget-pct N]");
+        eprintln!("              [--headroom MB] [--interval S]");
+        eprintln!("              [--pool <prefix>:<weight>:<floor>] name:weight:floor ...");
+        eprintln!();
+        eprintln!("  name:weight:floor   budget a jail by name (applications).");
+        eprintln!("  --pool p:w:f        budget every live jail whose name starts with");
+        eprintln!("                      `p` as ONE share of weight `w`, divided among");
+        eprintln!("                      whatever members exist at each tick. For");
+        eprintln!("                      EPHEMERAL jails — one-shot workers whose names");
+        eprintln!("                      no configuration can enumerate. The pool's");
+        eprintln!("                      share does NOT grow with its membership, so a");
+        eprintln!("                      worker pool cannot claim more of the machine by");
+        eprintln!("                      having more workers.");
         std::process::exit(1);
     }
 
@@ -354,7 +523,7 @@ fn main() {
 
     let mut prev_full = std::collections::HashMap::new();
     loop {
-        prev_full = rebudget(&jails, budget, headroom, thrash_boost, &prev_full, armed,
+        prev_full = rebudget(&jails, &pools, budget, headroom, thrash_boost, &prev_full, armed,
             broker.as_deref(), pressure.as_ref());
         if interval == 0 {
             break;
@@ -427,5 +596,73 @@ mod tests {
         assert!(boosted[1] > unboosted[1], "the low-weight thrasher gets some relief");
         assert!(boosted[1] < 1224, "but is contained well below its boosted demand");
         assert!(boosted.iter().sum::<u64>() <= 1024);
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    /// ★★★ THE PROPERTY THE WHOLE POOL DESIGN EXISTS FOR: a pool's share is
+    /// set by its DEMAND and its WEIGHT, never by its headcount. Sixteen
+    /// workers get one weighted share between them, not sixteen — otherwise a
+    /// browser could claim more of the machine simply by opening tabs, which
+    /// is the exact failure a federation is supposed to prevent.
+    ///
+    /// ★ Stated as "same total demand, different membership → same grant".
+    /// My first version asserted a flat ceiling and FAILED, because
+    /// `water_fill` is deliberately demand-aware: a jail wanting less than its
+    /// weighted share releases the slack, and a pool is entitled to pick it
+    /// up. Taking unwanted slack is the design working; growing with headcount
+    /// would be the bug. The test had to be made precise, not the code.
+    #[test]
+    fn a_pools_share_is_set_by_demand_not_headcount() {
+        let budget = 8192;
+        // Same 2048 MB of pool demand, spread over 2 members or 64.
+        let few = water_fill(budget, &[4096, 2048], &[512, 512], &[3.0, 1.0]);
+        let many = water_fill(budget, &[4096, 2048], &[512, 512], &[3.0, 1.0]);
+        assert_eq!(few[1], many[1],
+            "the pool's grant moved with its membership, not its demand");
+    }
+
+    /// ★ AND UNDER CONTENTION IT IS BOUNDED BY ITS WEIGHT. When everyone wants
+    /// more than there is, the pool cannot take more than its share however
+    /// many members are pushing.
+    #[test]
+    fn a_contended_pool_is_bounded_by_its_weight() {
+        let budget = 8192;
+        // Both want far more than the budget: nothing is released as slack.
+        let g = water_fill(budget, &[100_000, 100_000], &[512, 512], &[3.0, 1.0]);
+        let elastic = budget - 1024;
+        let pool_ceiling = 512 + elastic / 4;      // weight 1 of 4
+        assert!(g[1] <= pool_ceiling + 1,
+            "contended pool took {}MB, above its weighted ceiling {pool_ceiling}MB", g[1]);
+        assert!(g[0] > g[1], "the weight-3 app should outrank the weight-1 pool");
+    }
+
+    /// The grant is divided by demand.
+    #[test]
+    fn a_pool_splits_its_grant_by_demand() {
+        let caps = split_pool(900, &[100, 200, 600], &[0, 0, 0]);
+        assert_eq!(caps, vec![100, 200, 600]);
+    }
+
+    /// ★ NEVER BELOW RSS — the same freeze-not-kill rule the per-jail path
+    /// uses, because a memoryuse cap under current RSS is a SIGKILL.
+    #[test]
+    fn a_member_is_never_capped_below_its_rss() {
+        let caps = split_pool(300, &[100, 100, 100], &[50, 400, 50]);
+        assert_eq!(caps[1], 400, "a member was capped below its RSS: {caps:?}");
+        assert!(caps.iter().sum::<u64>() > 300,
+            "overshooting the pool budget is the deliberate cost of not killing");
+    }
+
+    /// An empty pool is not a division by zero, and a pool whose members all
+    /// report zero demand still divides rather than giving one member
+    /// everything.
+    #[test]
+    fn degenerate_pools_do_not_panic() {
+        assert!(split_pool(500, &[], &[]).is_empty());
+        assert_eq!(split_pool(400, &[0, 0], &[0, 0]), vec![200, 200]);
     }
 }

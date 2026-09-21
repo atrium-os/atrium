@@ -213,6 +213,37 @@ the two ideas unify.
 - **A `memoryd`** (or fold into an existing daemon) running the §4 loop, taking the
   posture broadcast alongside `power_policy`.
 
+  - **EPHEMERAL jails are budgeted as a POOL — `memfed --pool <prefix>:<weight>:<floor>`
+    (BUILT + verified in-VM).** The by-name configuration above works for applications,
+    whose names an operator can write down, and not at all for jails created per unit of
+    work: the Navigator runs one jailed document worker *per document*
+    (`<app>__<instance>`), created and destroyed as pages open and close. No configuration
+    can enumerate them, so they sat outside the federation entirely — neither budgeted by
+    it nor visible to it, and they are the one category of jail that arrives in numbers.
+
+    A pool takes **one** weighted share for the whole set and divides it among whatever
+    members are live at each tick. ★ **The share must not grow with the membership** — per
+    member weights would let a browser claim more of the machine simply by opening tabs,
+    which is precisely the failure a federation exists to prevent. Adding a worker divides
+    the pool's share, never the system's. Membership is resolved every tick rather than
+    configured, because these jails come and go: there is no registry to leak and no stale
+    name to cap.
+
+    Within a pool the grant is split by demand, each member floored at its current RSS —
+    the same freeze-not-kill rule, with the same honest consequence that a pool whose
+    members' RSS already exceeds its grant overshoots rather than killing one.
+
+    ★ **A member with zero RSS is excluded, and that is not tidiness.** `jail -c` creates
+    with `persist=true`, so a killed launcher leaves a named, process-less husk; measured,
+    three such husks were budgeted and given rctl rules, and *a rule outlives the husk*, so
+    the next worker reusing that instance tag would have inherited a stranger's cap. Zero
+    RSS is the right test and free: it is the same number the budget is computed from, and
+    a jail using no memory needs no budget.
+
+    Verified in-VM: three live worker jails discovered by prefix, budgeted as one pool
+    (grant 576 MB of a 4 GB budget, 192 MB each), rules set through the ordinary act path;
+    three husks from a killed launcher budgeted as **zero** members.
+
 ## 7. Coherence invariants
 
 1. **Cap hard (physics), posture soft.** Performance under a tight RAM cap still
