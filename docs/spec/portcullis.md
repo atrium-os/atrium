@@ -1220,28 +1220,75 @@ sees of itself, and a document worker should not be able to read which slot it w
 
 *Implemented, with tests (`portcullis-jail/tests/instances.rs`).*
 
-### 6.5.2 What remains: the piped one-shot launch path
+### 6.5.2 `portcullis exec` — the piped one-shot launch path
 
-Not yet implemented — and it is FreeBSD-side work that cannot be verified on a macOS host,
-so it is specified here rather than written blind.
+**Implemented and verified in the FreeBSD VM.** `portcullis exec [--instance <tag>]
+[--tmpfs-size <n>] <app-id|app-tree>` runs an app's entry in a one-shot jail whose
+stdin/stdout/stderr are the calling process's own — so a broker that spawned it with pipes
+talks to the jailed process directly.
 
-- **Per-instance root.** `/var/lib/atrium/jails/<id>` and the overlay at
-  `/var/lib/atrium/overlays/<id>` are per-app. A one-shot worker needs its own root
-  (`…/jails/<id>__<tag>`) and, since it holds no state worth keeping, **no persistent
-  overlay at all** — a tmpfs upper layer, discarded at exit. That also removes the
-  `arm_overlay_dedup` path and its quota ioctl from this lane.
-- **Stdio is already solved.** `launch_with_stdio` passes the caller's fds to `jail(8)`
-  through SCM_RIGHTS, and `jail -c -f` accepts arbitrary `Stdio`. Pipes work today; no
-  kernel-level work is needed. The cost is the `/bin/sh -c` that `exec.start` implies, which
-  argues for the `jaild` `CreateJail` + `ExecSpec` route (real `execve`, `pdfork`, procdesc
-  reaping) once `ExecSpec` can carry caller-supplied fds.
-- **Teardown must converge per instance.** `full_teardown`'s 16-pass unmount loop is
-  mandatory; a worker pool churns jails far faster than app launches do, so a leaked mount
-  compounds instead of being noticed once.
-- **The capability set needs no new mechanism.** A manifest with no `[capabilities]` already
-  renders `ip4/ip6 = disable`, `allow.raw_sockets = false`, and zero mounts. The document
-  worker's manifest is therefore a short one, which is the point: it declares nothing
-  because it needs nothing.
+Four differences from `launch`, each deliberate:
+
+- **Per-instance name and root** (§6.5.1), so many run concurrently from one app.
+- **No persistent overlay.** The writable layer is tmpfs, discarded with the jail. A worker
+  holds nothing worth keeping, and a lane that churns jails must not accumulate on-disk
+  overlays for something else to garbage-collect.
+- **Signatures are `Demand::Required`** (§6.5.3), not merely default-checked.
+- **A live jail with the same name is refused, not cleaned up.**
+
+Stdio needed no new mechanism: `jail -c -f` inherits the caller's descriptors.
+
+**Three things only running it revealed.**
+
+1. **tmpfs on the jail root MASKS the tree, it does not layer over it.** The first version
+   mounted the read-only nullfs and then tmpfs at the same point; every mount succeeded, and
+   the jail booted with an empty root and `exec /bin/sh: No such file or directory`. The
+   upper layer must be mounted *outside* the root and **unionfs**'d over it. A stacking
+   filesystem and a second mount at the same mountpoint are indistinguishable in `mount -p`.
+2. **jail(8) chdirs into the run user's home inside the jail**, taken from the host's passwd
+   because `exec.system_jail_user` is set. Without that directory existing in the jail's
+   namespace, `exec.start` fails before the entry runs. It is created empty in the tmpfs
+   layer.
+3. **A duplicate instance tag killed a live reader.** The pre-teardown exists to recover the
+   leftovers of a run that *died* — stacking a fresh nullfs on an abandoned pile is how a
+   mount stack becomes unrecoverable without a reboot — but it cannot tell a dead jail from
+   a running one, and measured against a live one it sent the first reader's process
+   SIGTERM and then failed anyway. Both lost, for a reason neither could act on. Liveness is
+   now checked with `jls` first and a duplicate is refused, naming the jid.
+
+**One fidelity limit, stated rather than implied:** `jail(8)` collapses every nonzero
+`exec.start` status to 1, so `exec` reports success or failure and **not** the child's exit
+code. Measured, not assumed: a child exiting 7 makes `jail(8)` exit 1.
+
+**Verified in the VM** (FreeBSD 16.0-CURRENT, aarch64, cross-built on the host):
+
+| | result |
+|---|---|
+| unsigned manifest, no publishers | refused — `Demand::Required` holds |
+| signed manifest, publisher installed | verified, jail created, entry ran |
+| pipe round trip | host `stdin` → jailed process → host `stdout` |
+| two concurrent instances | two live jails, distinct names and roots |
+| duplicate live tag | refused, first jail unharmed |
+| host filesystem visible to the jail | `/etc`, `/usr`, `/var`, `/home` absent; only the tree, `/dev`, and the created home |
+| writes | land in tmpfs, gone on the next run; the app tree is untouched |
+| stale mounts from a killed run | recovered and cleaned |
+| after exit | no jails, no mounts, no roots, no upper dirs |
+
+**Still open:** this is the CLI path. `portcullisd` integration (so the broker asks the
+daemon rather than spawning a setuid-ish CLI) and the `jaild` `CreateJail`/`ExecSpec` route
+with caller-supplied fds — real `execve`, `pdfork` reaping, no intervening `/bin/sh` — remain
+as described in §6.5.4.
+
+### 6.5.4 Why `jaild` is the better eventual target
+
+`jail -c -f` starts the entry through `/bin/sh -c` via `exec.start`, which costs a shell in
+every jail and makes argv quoting the caller's problem. `jaild`'s `CreateJail` already does
+`pdfork` + `jail_set(JAIL_CREATE|JAIL_ATTACH)` + `execve` and returns a **procdesc**, which
+gives clean async reaping with no `wait` races. It needs one extension: `ExecSpec` carries
+`path/argv/env/uid/gid` and no stdio, forcing the child's descriptors to `/dev/null` and a
+log file. Caller-supplied fds over `SCM_RIGHTS` — the machinery `portcullis_ipc::recv_fds`
+and `send_frame_with_fds` already provide in both directions — is the natural extension
+point.
 
 ### 6.5.3 The trust gate: `require_signatures`
 

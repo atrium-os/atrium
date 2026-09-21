@@ -14,6 +14,7 @@ use std::process::{Command, ExitCode};
 use portcullis_jail::{build, jail_name_from_app_id, BuildOpts};
 
 mod daemon;
+mod piped;
 
 fn usage() -> ! {
     eprintln!("\
@@ -44,6 +45,15 @@ usage:
             - If it looks like an app id (lowercase + dots/hyphens),
               resolved to /var/lib/atrium/apps/<id>/.
             - Otherwise treated as a path.
+
+    portcullis exec [--instance <tag>] [--tmpfs-size <n>] <app-id|app-tree>
+        Run the app's entry in a ONE-SHOT jail whose stdio is this
+        process's own, so a parent that spawned portcullis with pipes
+        talks to the jailed process directly. Each --instance gets its
+        own jail name and root, so many may run at once from one app;
+        the writable layer is tmpfs and is discarded on exit.
+        Signatures are REQUIRED on this path. Exits 0/1 only:
+        jail(8) collapses the child's exit code.
 
     portcullis status
         List installed apps and which jails are currently running.
@@ -124,6 +134,11 @@ fn main() -> ExitCode {
             }
             let Some(t) = tree else { usage() };
             cmd_launch(t, dry_run, no_prompt)
+        }
+        "exec" => {
+            /* A one-shot jail wired to this process's pipes — the worker-pool
+             * shape, as distinct from `launch`'s application shape. */
+            return piped::cmd_exec(&args[2..]);
         }
         "status" => {
             if args.len() != 2 { usage(); }
