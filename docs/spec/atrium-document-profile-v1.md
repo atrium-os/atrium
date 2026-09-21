@@ -578,9 +578,51 @@ stylesheets per document were fetched, so per-sheet statistics under-sample the 
 with the most; the per-document COUNT is taken from the markup and is exact. Unreachable
 stylesheets were skipped, which biases the sample toward CSS that still serves.
 
-**Still no corpus signal** for `@import` depth, grid track counts, `calc()` nesting or
-custom-property depth. Those remain marked *reasoned* — and on this evidence, "reasoned"
-should be read as "unvalidated", not as "conservative".
+#### The remaining reasoned ceilings, validated
+
+The same 968 stylesheets answer most of what was left. Two ceilings were right, one was
+wrong in the same direction as the stylesheet count, and one resists static measurement
+for a reason worth recording.
+
+| ceiling | p50 | p95 | p99 | max | verdict |
+|---|---|---|---|---|---|
+| `calc()` nesting depth (n=8,503 calls) | 2 | 3 | 4 | 7 | **16 stands** — 4.0× p99, refuses nothing |
+| custom-property substitution depth (n=196) | 1 | 5 | 6 | 6 | **16 stands** — 2.7× p99, refuses nothing |
+| grid tracks per axis, static (n=1,874) | 2 | 11 | 13 | 25 | see below |
+| declared `@font-face` per document (n=84) | **9** | 48 | 85 | 117 | **8 was below the MEDIAN** |
+| bytes per web font (n=220) | 34,466 | 1,247,087 | 5,327,528 | 6,171,772 | **8 MiB stands** |
+
+★★★ **`8` web fonts per document was below the median of documents that use any.** The
+same failure as the stylesheet count and a worse instance of it: more than half of
+font-using documents declare more faces than the ceiling allowed. A family shipped at eight
+weights in two styles is sixteen `@font-face` rules before anyone has been extravagant.
+Corrected to 512 by the rule.
+
+★ **And `bytes per web font` was right, for a reason the rule would have got wrong.** The
+distribution is bimodal — a Latin subset is ~34 KB and a full CJK face is ~6 MB — so p99
+lands inside the CJK mode and 5–6× of it would give 32 MiB. The reasoned basis, "a full CJK
+face must fit", is the correct constraint, and the corpus confirms it at 6.17 MiB observed
+maximum. **The derivation rule is for unimodal measures; applied here it would have loosened
+a correct ceiling fourfold.** Recorded because the rule is otherwise used without comment.
+
+**Grid tracks resist static measurement, and that is the finding.** Counted statically the
+corpus is tiny — p99 13, max 25 against a ceiling of 1,024. But 12% of `repeat()` uses are
+`auto-fill` or `auto-fit`, whose track count is a function of the VIEWPORT and the minimum
+track size, not of the stylesheet: `repeat(auto-fill, minmax(1px, 1fr))` at 1280 px is 1,280
+tracks. The ceiling is not bounding what authors write, it is bounding what the layout
+engine expands — so the static p99 is the wrong basis and 1,024 stands on the viewport
+argument. **A ceiling whose input is not in the document cannot be derived from a corpus of
+documents**, and that is now stated rather than left as "no corpus signal".
+
+`@import` depth remains genuinely unmeasured: only 17 of 400 sheets use `@import` at all,
+and measuring nesting DEPTH means resolving each chain, which this pass did not do.
+Prevalence is now known; depth is not.
+
+★★ **The font ceilings need a total, for the same reason the stylesheet ceilings did.** 512
+faces of 8 MiB each is 4 GiB. This corpus cannot supply the number — only a sample of font
+files was fetched, so per-document totals are not trustworthy — so **64 MiB is reasoned and
+flagged as the one gap left**, rather than given a measured-looking value it has not
+earned.
 
 #### The ceilings
 
@@ -590,20 +632,21 @@ should be read as "unvalidated", not as "conservative".
 | elements per document | **131,072** | 5.1× the 25,527 p99 (n=104), 2^17 |
 | tree depth | **256** | 7.3× the 35 p99 (n=104, n=67), 2^8 — see the correction below |
 | stylesheets per document | **256** | 6.0× the 43 p99 (n=157 docs), 2^8 — was 16, which REFUSED real documents |
-| `@import` depth | **4** | reasoned — still no corpus signal |
+| `@import` depth | **4** | reasoned — `@import` is used by 17 of 400 sheets; DEPTH needs chain resolution |
 | bytes per stylesheet | **4 MiB** | 5.5× the 746 KiB p99 (n=968 sheets), 2^22 |
 | rules per stylesheet | **32,768** | 5.9× the 5,588 p99 (n=968 sheets), 2^15 |
 | **total stylesheet bytes** | **16 MiB** | the binding constraint (below); 8.8× the 1.82 MiB p99 |
-| `calc()` nesting depth | **16** | reasoned — hand-written `calc()` rarely exceeds 3 |
-| custom-property substitution depth | **16** | reasoned; cycles are a diagnostic regardless |
-| grid tracks per axis (incl. `repeat()` expansion) | **1,024** | reasoned — no corpus signal |
+| `calc()` nesting depth | **16** | 4.0× the 4 p99 (n=8,503 calls), max 7 — measured |
+| custom-property substitution depth | **16** | 2.7× the 6 p99 (n=196 sheets), max 6 — measured; cycles are a diagnostic regardless |
+| grid tracks per axis (incl. `repeat()` expansion) | **1,024** | static p99 13, max 25 (n=1,874) — but 12% of `repeat()` is `auto-fill`/`auto-fit`, which the VIEWPORT expands |
 | image dimension (either axis) | **16,384 px** | matches common GPU texture limits |
 | **total decoded image bytes** | **256 MiB** | the binding constraint (below) |
 | `box-shadow` blur + spread | **256 px** | bounds rasterization cost, not structure |
 | `position: fixed` elements per document | **8** | reasoned — bounds overlay stacking |
 | fixed element block size | **1/3 of viewport** | reasoned — see §3.3 |
-| bytes per web font | **8 MiB** | reasoned — a full CJK face fits; no corpus signal |
-| web fonts per document | **8** | reasoned |
+| bytes per web font | **8 MiB** | validated: max observed 6.17 MiB (n=220). A full CJK face fits, as reasoned |
+| declared `@font-face` per document | **512** | 6.0× the 85 p99 (n=84 docs) — was 8, BELOW THE MEDIAN of 9 |
+| **total web font bytes** | **64 MiB** | reasoned — the binding constraint, and the one gap this corpus cannot fill |
 | glyphs per font | **65,536** | the format's own `numGlyphs` limit |
 | characters per paragraph (total-fit input) | **65,536** | bounds the one superlinear layout step |
 | total-fit active nodes | **4,096** | reasoned — standard pruning keeps this far lower |
@@ -781,7 +824,10 @@ property browsers can only approximate into a hard, mechanically checkable asser
 
 ## 8. Open questions
 
-1. **Stylesheet, grid and custom-property ceilings still have no corpus signal.** The
-   document ceilings are now measured against 104 real web documents and held unchanged at
-   that scale, but this corpus's CSS is external and was never fetched, and it exercises no
-   grids, no `calc()` and no custom properties. Those four ceilings remain reasoned.
+1. ~~**Stylesheet, grid and custom-property ceilings still have no corpus signal.**~~
+   **Resolved** — the CSS was fetched (968 stylesheets over 171 documents) and it does
+   exercise grids, `calc()` and custom properties, contrary to the assumption here. Three
+   ceilings were corrected, two validated, and two remain genuinely unmeasured:
+   `@import` DEPTH (prevalence now known: 17 of 400 sheets) and total web font bytes.
+   Grid tracks are a third kind — bounded by viewport expansion rather than by anything in
+   the document, so no corpus of documents can derive them.
