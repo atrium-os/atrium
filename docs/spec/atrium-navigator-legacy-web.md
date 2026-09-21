@@ -177,6 +177,23 @@ obtain relative to the engine itself.
 from `navigator-prerender` over a 104-document corpus of real sites (85 with script).
 It is reported by the converter itself, so it can be re-run rather than believed.
 
+> **Reproducing these numbers.** The corpus is not in this tree — it is fetched pages, and
+> checking it in would pin content that changes. Every figure below is printed by the
+> converter's own corpus driver, so the claim and its evidence are the same program:
+>
+> ```
+> cd navigator-prerender
+> cargo build --release
+> PRERENDER_EXPLORE=1 PRERENDER_NET=1 ./target/release/prerender <corpus-dir>
+> ```
+>
+> The driver reads `manifest.tsv` in that directory (`filename<TAB>url`) to resolve each
+> document's own URL. Numbers quoted here are from a 104-document corpus; a different
+> corpus will give different numbers, and the shape of the finding is what should be
+> compared, not the digits. **Nothing in this tree verifies these figures**, so treat them
+> as a dated measurement rather than an invariant — they are stated with the corpus size
+> beside them for exactly that reason.
+
 **Tier 2's prerender half completes on 82–84% of scripted documents.** That is the
 fraction whose scripts all run without a gap in our host environment — the number §5.4
 implicitly asked for, and on its own it reads as an endorsement of tier 2.
