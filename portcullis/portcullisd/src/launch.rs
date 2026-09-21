@@ -122,6 +122,7 @@ pub fn launch_with_stdio(
          * concurrent jail here would share both. Concurrency belongs to the
          * one-shot piped path, which gets its own root per instance. */
         instance: None,
+        persist: true,
     };
 
     /* Mount overlay once; both setup and runtime jails see the same

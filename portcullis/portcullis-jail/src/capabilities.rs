@@ -239,6 +239,7 @@ mod tests {
             user_name:    "alice".into(),
             devfs_ruleset: 99,
             instance: None,
+            persist: true,
         }
     }
 

@@ -1463,6 +1463,35 @@ Verified in the VM after the merge: the 98-document corpus through daemon-create
 (98/259/259), the direct CLI lane, and stale-mount recovery all unchanged, with no jails,
 mounts or upper directories left behind.
 
+### 6.5.2f `persist = false` — the husk, fixed at the cause
+
+`jail -c` creates with `persist = true` because the application path needs the jail to
+outlive nothing in particular: jail(8) holds it while `exec.start` runs and the launcher
+removes it afterwards. For a **unit of work** that is wrong, and the wrongness had already
+been patched around twice before the cause was addressed:
+
+- A launcher that is **killed** never reaches its teardown, and the kernel keeps a named,
+  process-less jail forever. That husk poisons its instance tag, so the next worker with
+  that tag is refused (§6.5.2) — patch one: reclaim a process-less jail instead of refusing.
+- `memfed` then discovered the husks as pool members, budgeted them, and pinned rctl rules
+  to them — and **a rule outlives the husk**, so the next worker reusing the tag inherits a
+  stranger's cap (§6.5.2e) — patch two: exclude zero-RSS members.
+
+`BuildOpts::persist` makes it a choice, and the one-shot lane takes `false`. The jail is
+then removed the moment its last process exits, so killing the launcher cleans up **by
+construction**: the worker sees EOF on the pipe that died with its parent, exits, and the
+jail goes with it. Measured on the same machine that produced the husks — after a SIGKILL of
+the launcher, with no teardown running at all, the jail was gone once its process ended.
+
+Both earlier patches stay. They are no longer the only defence, but a jail whose worker is
+still running when its launcher dies is a real state, and reclaiming rather than refusing is
+still the right answer for it.
+
+**What `persist = false` does NOT fix: the mounts.** A SIGKILLed launcher still leaves its
+nullfs/tmpfs/unionfs stack — measured at 24 mounts — because teardown is the only thing that
+unwinds them. That is what the pre-run convergent teardown (§6.5.2) exists for, and it is
+why that pre-teardown is not redundant with this change.
+
 ### 6.5.2e Memory limits for ephemeral jails — an integration gap, not a missing knob
 
 Bounding how *many* one-shot jails exist (§6.5.2b) says nothing about how much memory any

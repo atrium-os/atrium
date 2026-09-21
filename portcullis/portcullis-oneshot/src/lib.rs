@@ -206,6 +206,10 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         user_name: spec.user_name.clone(),
         devfs_ruleset: 99,
         instance: instance.clone(),
+        // ★ A unit of work, so the jail dies with its processes — see
+        // BuildOpts::persist. This is what stops a killed launcher from
+        // leaving a husk that poisons its instance tag.
+        persist: false,
     };
     let jc = match build(&manifest, &opts) {
         Ok(jc) => jc,

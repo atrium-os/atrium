@@ -330,6 +330,7 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
         user_name:    std::env::var("USER").unwrap_or_else(|_| "atrium".into()),
         devfs_ruleset: 99,             /* Phase 4 manages allocation */
         instance: None,                /* one jail per app on this path */
+        persist: true,
     };
 
     let jc = match build(&manifest, &opts) {

@@ -24,6 +24,7 @@ fn opts(instance: Option<&str>) -> BuildOpts {
         user_name: "alice".into(),
         devfs_ruleset: 99,
         instance: instance.map(str::to_string),
+        persist: true,
     }
 }
 
@@ -99,4 +100,23 @@ fn a_manifest_with_no_capabilities_renders_a_closed_jail() {
     assert!(conf.contains("ip6 = disable"), "{conf}");
     assert!(conf.contains("allow.raw_sockets = false"), "{conf}");
     assert!(jc.mounts.is_empty(), "a closed jail mounted something: {:?}", jc.mounts);
+}
+
+/// ★★ A UNIT OF WORK MUST NOT OUTLIVE ITS PROCESSES.
+///
+/// With `persist = true` a launcher that is killed never reaches its
+/// teardown, and the kernel keeps a named, process-less jail forever — a husk
+/// that poisons its instance tag for the next worker and that the memory
+/// federation budgets and pins an rctl rule to. Both were found and patched
+/// around separately before the cause was fixed. An application still wants
+/// persistence, so it is a choice and both sides are pinned.
+#[test]
+fn a_one_shot_jail_does_not_persist_and_an_application_does() {
+    let mut o = opts(Some("1"));
+    o.persist = false;
+    let conf = build(&manifest("org.atrium.worker"), &o).expect("builds").render_jail_conf();
+    assert!(conf.contains("persist = false"), "a one-shot jail would outlive its work: {conf}");
+
+    let conf = build(&manifest("org.atrium.notes"), &opts(None)).expect("builds").render_jail_conf();
+    assert!(conf.contains("persist = true"), "an application lost its persistence: {conf}");
 }

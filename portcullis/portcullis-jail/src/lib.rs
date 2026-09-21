@@ -65,6 +65,23 @@ pub struct BuildOpts {
     /// sees of itself, and a document worker should not be able to read which
     /// slot it was given.
     pub instance: Option<String>,
+    /// ★★ WHETHER THE JAIL OUTLIVES ITS PROCESSES.
+    ///
+    /// `true` is right for an application: jail(8) must keep the jail while
+    /// `exec.start` runs, and the launcher removes it afterwards.
+    ///
+    /// `false` is right for a unit of work, and fixes a whole class of
+    /// wreckage rather than working around it. With `persist = true` a
+    /// launcher that is KILLED never reaches its teardown, and the kernel
+    /// keeps a named, process-less jail forever — a husk that poisons its
+    /// instance tag for the next worker, and that the memory federation
+    /// happily budgets and pins an rctl rule to. Both of those were found and
+    /// patched around separately before the cause was addressed here. With
+    /// `persist = false` the jail is removed the moment its last process
+    /// exits, so killing the launcher cleans up by construction: the worker
+    /// sees EOF on the pipe that died with its parent, exits, and the jail
+    /// goes with it.
+    pub persist: bool,
 }
 
 /// Jail name for one instance of an app.
@@ -101,7 +118,7 @@ pub fn build(manifest: &Manifest, opts: &BuildOpts) -> Result<JailConfig, BuildE
 
     /* Defaults every Atrium jail wants. */
     jc.set("host.hostname", Value::String(manifest.app.id.clone()));
-    jc.set("persist",       Value::Bool(true));
+    jc.set("persist",       Value::Bool(opts.persist));
     jc.set("mount.devfs",   Value::Bool(true));
     jc.set("devfs_ruleset", Value::Number(opts.devfs_ruleset as i64));
     jc.set("exec.clean",    Value::Bool(true));

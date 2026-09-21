@@ -213,8 +213,16 @@ say "$STAGE"
          rm -f /root/e2e-unsigned/atrium.toml.sig
          sed -i '' -e 's/^id = .*/id = \"test.e2e.unsigned\"/' /root/e2e-unsigned/atrium.toml 2>/dev/null ||
          sed -i -e 's/^id = .*/id = \"test.e2e.unsigned\"/' /root/e2e-unsigned/atrium.toml" >/dev/null 2>&1
+# ★★ A TRANSPORT FAILURE MUST NOT READ AS A SECURITY FINDING. This reported
+# "an UNSIGNED bundle was not refused" when what actually happened was
+# `Connection timed out during banner exchange` — ssh never reached the VM, so
+# the output was empty and the case matched nothing. A harness that cannot
+# tell "the product did not refuse" from "I could not ask" is worse than no
+# harness: it manufactures exactly the alarm nobody should ignore.
 UNS=$("$VSSH" "export PORTCULLIS_SOCKET=$SOCK
-    $BIN/portcullis exec --daemon --instance u /root/e2e-unsigned < /dev/null 2>&1 | tail -1")
+    $BIN/portcullis exec --daemon --instance u /root/e2e-unsigned < /dev/null 2>&1 | tail -1") \
+    || die "could not reach the VM to test the unsigned refusal (transport, not product)"
+[ -n "$UNS" ] || die "the unsigned-bundle check produced NO output — treat as unreached, not as a pass"
 case "$UNS" in
     *REFUSED*|*not\ signed*|*trust*) echo "  unsigned refused" ;;
     *) die "an UNSIGNED bundle was not refused: $UNS" ;;
@@ -231,7 +239,9 @@ DUP=$("$VSSH" "export PORTCULLIS_SOCKET=$SOCK
         $BIN/portcullis exec --daemon --instance dup $APP_ID >/dev/null 2>&1 &
     sleep 3
     $BIN/portcullis exec --daemon --instance dup $APP_ID < /dev/null 2>&1 | tail -1
-    wait")
+    wait") \
+    || die "could not reach the VM to test the duplicate refusal (transport, not product)"
+[ -n "$DUP" ] || die "the duplicate-instance check produced NO output — treat as unreached, not as a pass"
 case "$DUP" in
     *already\ running*) echo "  duplicate instance refused" ;;
     *) die "a duplicate live instance tag was not refused: $DUP" ;;
