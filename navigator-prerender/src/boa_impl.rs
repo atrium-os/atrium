@@ -2161,6 +2161,75 @@ fn run_injected_scripts(ctx: &mut Context, errors: &mut Vec<String>) -> (u32, u3
 /// either — they are shared through a content-addressed store, so there is
 /// no session to damage.
 const MAX_PROBES: usize = 64;
+/// Caps on what one transition may carry. A recording is an ANNOTATION on the
+/// tier 1 document; a transition that shipped a whole page would quietly turn
+/// it back into a second artifact.
+const MAX_EFFECTS: usize = 32;
+const MAX_INSERT_BYTES: usize = 16 * 1024;
+
+/// What one probe actually did, expressed against the PRE-probe document so
+/// it can be replayed there.
+///
+/// ★ Handles are stable across the probe — new nodes take handles beyond the
+/// old arena's length, and existing ones keep theirs — so the diff is a
+/// direct comparison rather than a tree match. That is a property of the
+/// arena, and it is why this is cheap.
+fn diff_effects(before: &Dom, after: &Dom) -> Vec<crate::engine::Effect> {
+    use crate::engine::Effect;
+    let mut out = vec![];
+    let mut dropped = 0usize;
+    let old_len = before.nodes.len() as Handle;
+
+    // Attribute writes on nodes that exist in tier 1.
+    for h in 0..old_len {
+        if !before.connected(h) { continue }
+        let (b, a) = (&before.nodes[h as usize], &after.nodes[h as usize]);
+        if b.attrs == a.attrs { continue }
+        let names: std::collections::BTreeSet<&String> =
+            b.attrs.iter().map(|(k, _)| k).chain(a.attrs.iter().map(|(k, _)| k)).collect();
+        for name in names {
+            let from = b.attrs.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+            let to = a.attrs.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+            if from == to { continue }
+            if out.len() >= MAX_EFFECTS { dropped += 1; continue }
+            out.push(Effect::Attribute {
+                target: before.node_path(h), name: name.clone(), from, to,
+            });
+        }
+    }
+
+    // Nodes removed from the tier 1 document.
+    for h in 0..old_len {
+        if before.connected(h) && !after.connected(h) {
+            // Only the TOP of a removed subtree: listing every descendant
+            // would bury the one fact a replay needs.
+            let parent_gone = before.get(h).and_then(|n| n.parent)
+                .map(|p| before.connected(p) && !after.connected(p)).unwrap_or(false);
+            if parent_gone { continue }
+            if out.len() >= MAX_EFFECTS { dropped += 1; continue }
+            out.push(Effect::Remove { target: before.node_path(h) });
+        }
+    }
+
+    // Nodes inserted under a tier 1 node, serialized as content.
+    for h in old_len..after.nodes.len() as Handle {
+        if !after.connected(h) { continue }
+        let Some(p) = after.get(h).and_then(|n| n.parent) else { continue };
+        // Only roots of inserted subtrees: a child whose parent is also new
+        // travels inside its parent's HTML.
+        if p >= old_len { continue }
+        let html = after.outer_html(h);
+        if html.trim().is_empty() { continue }
+        if out.len() >= MAX_EFFECTS || html.len() > MAX_INSERT_BYTES {
+            dropped += 1;
+            continue;
+        }
+        out.push(Effect::Insert { parent: before.node_path(p), html });
+    }
+
+    if dropped > 0 { out.push(Effect::Truncated { dropped }) }
+    out
+}
 
 fn explore_states(ctx: &mut Context, parser_nodes: Handle) -> (Vec<crate::engine::Transition>, u32) {
     use crate::engine::Transition;
@@ -2215,16 +2284,21 @@ fn explore_states(ctx: &mut Context, parser_nodes: Handle) -> (Vec<crate::engine
         let _ = ctx.eval(Source::from_bytes(b"__deliverMutations(4); __drainTimers(50, 500)"));
         let _ = ctx.run_jobs();
 
-        let (els1, txt1, attrs1) = DOM.with(|d| {
+        let (els1, txt1, attrs1, effects) = DOM.with(|d| {
             let d = d.borrow();
             (d.element_count() as i64,
              d.visible_text(d.root()).split_whitespace().map(str::len).sum::<usize>() as i64,
-             d.nodes.iter().map(|n| n.attrs.len()).sum::<usize>())
+             d.nodes.iter().map(|n| n.attrs.len()).sum::<usize>(),
+             diff_effects(&before, &d))
         });
         // Restore. The probe is an observation, not an edit.
         DOM.with(|d| *d.borrow_mut() = before);
 
-        let changed = els1 != els0 || txt1 != txt0 || attrs1 != attrs0;
+        // ★ The EFFECTS decide, not the counters. A class toggle leaves
+        // element and text counts identical while being exactly the
+        // transition worth recording — counting alone would have discarded
+        // the commonest kind of menu on the web.
+        let changed = !effects.is_empty();
         if changed {
             out.push(Transition {
                 trigger: path,
@@ -2233,6 +2307,7 @@ fn explore_states(ctx: &mut Context, parser_nodes: Handle) -> (Vec<crate::engine
                 elements_added: els1 - els0,
                 text_delta: txt1 - txt0,
                 attributes_changed: attrs1.abs_diff(attrs0) as u32,
+                effects,
             });
         }
     }

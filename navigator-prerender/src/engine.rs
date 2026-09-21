@@ -108,6 +108,28 @@ pub trait ScriptEngine {
 /// that survives re-parsing and summarises the effect. Carrying the mutated
 /// subtree would make this a second artifact, and then we would be back to
 /// publishing what the scripts produced.
+/// One observable EFFECT of a transition, in a form that can be replayed
+/// against the tier 1 document.
+///
+/// ★ The distinction between these is the whole practical point. A menu that
+/// opens by toggling a class needs NO content captured — the content is
+/// already in the tier 1 document, merely hidden — and the transition is one
+/// attribute write. A panel that inserts new nodes has to carry them. Lumping
+/// both into "something changed" would force every transition to ship a
+/// subtree it mostly does not need.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Effect {
+    /// An attribute written on a node that exists in tier 1.
+    Attribute { target: String, name: String, from: Option<String>, to: Option<String> },
+    /// Nodes inserted under a node that exists in tier 1, as serialized HTML.
+    Insert { parent: String, html: String },
+    /// A node that exists in tier 1 was removed.
+    Remove { target: String },
+    /// The effect was too large to record; the count says how much was
+    /// dropped, so a truncated recording is never mistaken for a small one.
+    Truncated { dropped: usize },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Transition {
     /// Path to the trigger, as `#id` or a positional `tag:n>tag:n` chain.
@@ -121,4 +143,16 @@ pub struct Transition {
     pub elements_added: i64,
     pub text_delta: i64,
     pub attributes_changed: u32,
+    /// What actually happened, replayable against the tier 1 document.
+    pub effects: Vec<Effect>,
+}
+
+impl Transition {
+    /// A transition whose every effect is an attribute write needs no content
+    /// carried with it: whatever it reveals is already in the tier 1
+    /// document. This is the cheap, wholly-expressible case.
+    pub fn is_attribute_only(&self) -> bool {
+        !self.effects.is_empty()
+            && self.effects.iter().all(|e| matches!(e, Effect::Attribute { .. }))
+    }
 }

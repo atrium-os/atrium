@@ -82,8 +82,11 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
     println!("J\t{}\t{}", c.injected_scripts_run, c.injected_scripts_refused);
     println!("X\t{}\t{}", c.text_before, c.text_after);
     println!("Z\t{}", c.removals_refused);
-    println!("S\t{}\t{}\t{}", c.interactive_found, c.transitions.len(),
-        c.transitions.iter().filter(|t| t.anchored).count());
+    println!("S\t{}\t{}\t{}\t{}\t{}", c.interactive_found, c.transitions.len(),
+        c.transitions.iter().filter(|t| t.anchored).count(),
+        c.transitions.iter().filter(|t| t.is_attribute_only()).count(),
+        c.transitions.iter().filter(|t| t.effects.iter()
+            .any(|e| matches!(e, navigator_prerender::Effect::Truncated { .. }))).count());
     // The POLICY's verdict travels with the measurements, so the parent can
     // report what would be published without re-deriving it.
     {
@@ -178,6 +181,7 @@ fn main() {
     let mut gains: Vec<(i64, String)> = vec![];
     let mut demoted: Vec<String> = vec![];
     let (mut inter, mut trans, mut anch, mut trans_docs) = (0u32, 0u32, 0u32, 0usize);
+    let (mut attr_only, mut trunc) = (0u32, 0u32);
     let mut tier2_kept = 0usize;
 
     for f in &files {
@@ -253,6 +257,7 @@ fn main() {
         ext_fail += c.external_total - c.external_fetched;
         elems.push(c.elements_after);
         inter += c.interactive_found; trans += c.transitions; anch += c.transitions_anchored;
+        attr_only += c.transitions_attr_only; trunc += c.transitions_truncated;
         if c.transitions > 0 { trans_docs += 1; }
         if c.scripts_total > 0 {
             gains.push((c.text_after as i64 - c.text_before as i64, name.clone()));
@@ -358,6 +363,8 @@ fn main() {
         println!("  interactive elements found {inter}");
         println!("  transitions recorded {trans} in {trans_docs} docs; \
                   {anch} anchored to the tier 1 document");
+        println!("  of those, {attr_only} are ATTRIBUTE-ONLY — the content they");
+        println!("  reveal is already in tier 1, so they carry nothing; {trunc} truncated");
     }
     if tier2_kept > 0 || !demoted.is_empty() {
         println!("TIER POLICY (never emit an artifact worse than the input)");
@@ -488,6 +495,8 @@ pub struct Child {
     pub interactive_found: u32,
     pub transitions: u32,
     pub transitions_anchored: u32,
+    pub transitions_attr_only: u32,
+    pub transitions_truncated: u32,
     pub tier: String,
     pub tier_reason: String,
     pub cause: Option<(String, String)>,
@@ -512,6 +521,7 @@ fn parse_child(s: &str) -> Option<Child> {
         text_before: 0, text_after: 0,
         removals_refused: 0,
         interactive_found: 0, transitions: 0, transitions_anchored: 0,
+        transitions_attr_only: 0, transitions_truncated: 0,
         tier: String::new(), tier_reason: String::new(),
         cause: None,
         timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0,
@@ -537,10 +547,12 @@ fn parse_child(s: &str) -> Option<Child> {
                 c.missing.push((f[2].to_string(), f[1].parse().unwrap_or(1)));
             }
             Some(&"Z") if f.len() >= 2 => c.removals_refused = f[1].parse().unwrap_or(0),
-            Some(&"S") if f.len() >= 4 => {
+            Some(&"S") if f.len() >= 6 => {
                 c.interactive_found = f[1].parse().unwrap_or(0);
                 c.transitions = f[2].parse().unwrap_or(0);
                 c.transitions_anchored = f[3].parse().unwrap_or(0);
+                c.transitions_attr_only = f[4].parse().unwrap_or(0);
+                c.transitions_truncated = f[5].parse().unwrap_or(0);
             }
             Some(&"Y") if f.len() >= 3 => {
                 c.tier = f[1].to_string();

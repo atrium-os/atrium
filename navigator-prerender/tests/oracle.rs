@@ -161,3 +161,111 @@ fn the_recording_is_reproducible() {
     assert_eq!(a.transitions, b.transitions);
     assert!(a.transitions.len() == 2, "{:?}", a.transitions);
 }
+
+use navigator_prerender::Effect;
+
+/// ★ THE COMMONEST MENU ON THE WEB IS A CLASS TOGGLE, and it needs NO content
+/// captured: whatever it reveals is already in the tier 1 document, merely
+/// hidden. The transition is one attribute write, wholly replayable.
+#[test]
+fn a_class_toggle_is_recorded_as_an_attribute_write_only() {
+    let c = explore(r#"<html><body>
+      <button id=toggle>Menu</button>
+      <nav id=menu class="nav hidden"><a href=/a>One</a><a href=/b>Two</a></nav>
+      <script>
+        document.getElementById('toggle').addEventListener('click', function () {
+          document.getElementById('menu').classList.remove('hidden');
+        });
+      </script></body></html>"#);
+    assert_eq!(c.transitions.len(), 1, "{:?}", c.transitions);
+    let t = &c.transitions[0];
+    assert!(t.is_attribute_only(), "{:?}", t.effects);
+    match &t.effects[0] {
+        Effect::Attribute { target, name, from, to } => {
+            assert_eq!(target, "#menu");
+            assert_eq!(name, "class");
+            assert_eq!(from.as_deref(), Some("nav hidden"));
+            assert_eq!(to.as_deref(), Some("nav"));
+        }
+        other => panic!("expected an attribute write, got {other:?}"),
+    }
+}
+
+/// ★ And it is recorded even though element and text counts are IDENTICAL —
+/// counting alone would have discarded the commonest case entirely.
+#[test]
+fn a_toggle_is_recorded_despite_unchanged_counts() {
+    let c = explore(r#"<html><body>
+      <button id=b>x</button><div id=p class=a>content</div>
+      <script>
+        document.getElementById('b').addEventListener('click', function () {
+          document.getElementById('p').setAttribute('class', 'a open');
+        });
+      </script></body></html>"#);
+    assert_eq!(c.transitions.len(), 1);
+    assert_eq!(c.transitions[0].elements_added, 0);
+    assert_eq!(c.transitions[0].text_delta, 0);
+    assert!(c.transitions[0].is_attribute_only());
+}
+
+/// Content that does NOT exist until the click has to be carried, anchored to
+/// where it belongs in the tier 1 document.
+#[test]
+fn inserted_content_is_captured_with_its_anchor() {
+    let c = explore(r#"<html><body>
+      <button id=more>More</button><div id=panel></div>
+      <script>
+        document.getElementById('more').addEventListener('click', function () {
+          document.getElementById('panel').innerHTML = '<p class=x>revealed</p>';
+        });
+      </script></body></html>"#);
+    let t = &c.transitions[0];
+    assert!(!t.is_attribute_only());
+    let ins: Vec<_> = t.effects.iter().filter_map(|e| match e {
+        Effect::Insert { parent, html } => Some((parent.as_str(), html.as_str())),
+        _ => None,
+    }).collect();
+    assert_eq!(ins.len(), 1, "{:?}", t.effects);
+    assert_eq!(ins[0].0, "#panel", "anchored where it belongs");
+    assert_eq!(ins[0].1, r#"<p class="x">revealed</p>"#);
+}
+
+/// A removal names only the TOP of the removed subtree: listing every
+/// descendant would bury the one fact a replay needs.
+#[test]
+fn a_removal_names_only_the_subtree_root() {
+    let c = explore(r#"<html><body>
+      <button id=b>hide</button>
+      <div id=box><p>one</p><p>two</p></div>
+      <script>
+        document.getElementById('b').addEventListener('click', function () {
+          document.getElementById('box').remove();
+        });
+      </script></body></html>"#);
+    let t = &c.transitions[0];
+    let rm: Vec<_> = t.effects.iter().filter_map(|e| match e {
+        Effect::Remove { target } => Some(target.as_str()), _ => None,
+    }).collect();
+    assert_eq!(rm, vec!["#box"], "{:?}", t.effects);
+}
+
+/// ★ A recording is an ANNOTATION on the tier 1 document. A transition that
+/// shipped a whole page would quietly turn it back into a second artifact, so
+/// oversized effects are dropped and the drop is COUNTED — a truncated
+/// recording must never be mistaken for a small one.
+#[test]
+fn oversized_effects_are_truncated_and_say_so() {
+    let c = explore(r#"<html><body>
+      <button id=b>x</button><div id=p></div>
+      <script>
+        document.getElementById('b').addEventListener('click', function () {
+          var big = new Array(4000).join('some长 repeated filler text ');
+          document.getElementById('p').innerHTML = '<p>' + big + '</p>';
+        });
+      </script></body></html>"#);
+    let t = &c.transitions[0];
+    assert!(t.effects.iter().any(|e| matches!(e, Effect::Truncated { .. })),
+        "oversized insert must be reported as truncated: {:?}", t.effects);
+    assert!(!t.effects.iter().any(|e| matches!(e, Effect::Insert { .. })),
+        "and must not be carried");
+}
