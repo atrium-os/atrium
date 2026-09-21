@@ -16,6 +16,9 @@ pub mod jaild_client;
 /// It lives in `portcullis-trust` so the CLI and `atrium-launch` share it
 /// rather than each carrying their own answer (they did).
 pub use portcullis_trust as manifest_trust;
+/// Rate and concurrency limits for the one-shot jail path — the first daemon
+/// verb a program calls in a loop rather than a person clicking something.
+pub mod ratelimit;
 pub mod supervisor;
 pub mod system_services;
 pub mod volumes_client;

@@ -1332,6 +1332,51 @@ last row is the point: the same unprivileged user, asked to create a jail direct
 refused — `mkdir /var/lib/atrium/jails/…: Permission denied`. The privilege is in the
 daemon, and that is now a demonstrated property rather than a described one.
 
+### 6.5.2b Rate and concurrency limits on `ExecInstance`
+
+**`ExecInstance` is the first daemon verb a program calls in a loop.** `Launch` is driven by
+a person clicking something; a worker pool is driven by pages opening. Nothing on that path
+restrained it: a client could ask for jails as fast as the daemon could make them, and the
+only thing in the way was the *client's* own session bound — a limit held by the thing being
+limited.
+
+Two exhaustions, so two limits:
+
+- **Concurrency** bounds what exists at once — each one-shot jail carries a tmpfs and a mount
+  stack. Per user (32) with a host ceiling behind it (64): per-user alone multiplies by
+  adding users, global alone lets one client starve everyone.
+- **Rate** bounds churn. A client that creates and destroys in a tight loop holds almost
+  nothing at any instant and still saturates the daemon, `jail(8)` and the mount table. A
+  token bucket: burst 32, sustained 8/s.
+
+**Derived from measurement.** The Navigator's corpus creates 98 jails back to back in 58.7s
+— **1.67 jails/second** sustained, bursting to 16 when a broker opens every session it is
+allowed. The defaults are several times that and orders of magnitude below what a loop asks
+for.
+
+Three details that are the difference between a limit and a nuisance:
+
+- **Limited before the fd handshake.** Answering `ReadyForFds` first would have the client
+  send three descriptors the daemon is about to refuse — a refusal that still costs the
+  caller work is one a loop can use as a service.
+- **A refusal does not spend a token.** A client at its concurrency limit that retries would
+  otherwise exhaust its rate budget too, punished twice for one condition.
+- **The slot is an RAII guard.** A leaked count is permanent — it lowers the limit for the
+  daemon's life with nothing to show why, and the machine slowly refuses work it could do.
+  Tested against a panicking holder.
+
+The clock is monotonic, not wall: a rate limit measured against a clock NTP can step
+backwards is one that can be widened by changing the time.
+
+**Measured in the VM:**
+
+| | result |
+|---|---|
+| the 98-document corpus | **unaffected** — 98/259/259, same 58.7s |
+| 60-iteration create/destroy loop | 38 ran, **22 rate-limited** |
+| 40 concurrent requests, limit 32 | **exactly 8 refused**, per-user limit named |
+| after all of it | no jails, no mounts, daemon alive |
+
 ### 6.5.3 The trust gate: `require_signatures`
 
 Two findings surfaced while designing the worker lane. Neither was caused by it; both were

@@ -36,6 +36,13 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
+
+/// ★ ONE LIMITER FOR THE WHOLE DAEMON, process-wide rather than per
+/// connection: the point is to bound what all clients together can create,
+/// and a limiter that a client got a fresh copy of by reconnecting would
+/// bound nothing at all.
+static LIMITER: std::sync::LazyLock<Arc<Mutex<portcullisd::ratelimit::Limiter>>> =
+    std::sync::LazyLock::new(|| Arc::new(Mutex::new(portcullisd::ratelimit::Limiter::default())));
 use std::thread;
 
 use portcullis_ipc::{
@@ -298,7 +305,7 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             Err(e) => return Err(e),
         };
         if let Request::ExecInstance { app_id, instance, tmpfs_mb } = req {
-            handle_exec_instance(app_id, instance, tmpfs_mb, &owner,
+            handle_exec_instance(app_id, instance, tmpfs_mb, &owner, &LIMITER,
                                  &mut writer, &reader)?;
             continue;
         }
@@ -409,9 +416,24 @@ fn handle_exec_instance(
     instance: Option<String>,
     tmpfs_mb: u32,
     user:     &str,
+    limiter:  &Arc<Mutex<portcullisd::ratelimit::Limiter>>,
     writer:   &mut UnixStream,
     reader:   &BufReader<UnixStream>,
 ) -> std::io::Result<()> {
+    /* ★ LIMITED BEFORE THE FD HANDSHAKE, not after. Answering ReadyForFds
+     * first would have the client send three descriptors the daemon is about
+     * to refuse, and a refusal that still costs the caller work is a refusal
+     * a loop can use as a service. */
+    let slot = match portcullisd::ratelimit::Slot::acquire(limiter, user, now_millis()) {
+        Ok(s) => s,
+        Err(why) => {
+            eprintln!("portcullisd: rate-limited {user}: {why}");
+            return write_response(writer, &Response::LaunchFailed {
+                stage: "ratelimit".into(), message: why.to_string(),
+            });
+        }
+    };
+
     write_response(writer, &Response::ReadyForFds)?;
 
     if !reader.buffer().is_empty() {
@@ -451,7 +473,20 @@ fn handle_exec_instance(
         portcullis_oneshot::OneShot::Failed(why) =>
             Response::LaunchFailed { stage: "oneshot".into(), message: why },
     };
+    // The slot is held for the jail's whole life — `run_with_stdio` blocks
+    // until the entry exits — and released here, or by the guard's Drop on
+    // any early return or panic above.
+    drop(slot);
     write_response(writer, &resp)
+}
+
+/// Monotonic milliseconds for the limiter. ★ Monotonic, not wall clock: a
+/// rate limit measured against a clock NTP can step backwards is a rate limit
+/// that can be widened by changing the time.
+fn now_millis() -> u64 {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
 
 fn handle_launch(
