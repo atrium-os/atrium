@@ -90,6 +90,60 @@ structures, not by screenshotting — the property a conventional browser engine
 have, and the reason "build the backend properly first" is achievable here rather than
 aspirational.
 
+### 4.0 What the converter hands over: the recording
+
+The pure function above takes *bytes*. For the legacy lane it takes something slightly
+richer, and leaving that undocumented would make the converter's output a private format
+between two components that are built years apart. `navigator-prerender` emits it today as
+`atrium-navigator-recording/1`.
+
+A recording is **one document plus a table of what a reader can do to it**:
+
+```json
+{ "format": "atrium-navigator-recording/1",
+  "url": "https://example.test/page",
+  "tier": 1,
+  "tier_reason": "conversion removed reader-visible content",
+  "measurements": { "elements": 1183, "text_before": 14654, "text_after": 5063,
+                    "scripts_total": 70, "scripts_failed": 0,
+                    "interactive_found": 42, "transitions_dropped": 3 },
+  "transitions": [
+    { "trigger": "#menu-toggle", "event": "click", "anchored": true,
+      "attribute_only": true,
+      "effects": [ { "kind": "attribute", "target": "#menu", "name": "class",
+                     "from": "nav hidden", "to": "nav" } ] } ],
+  "document": "<html>…" }
+```
+
+Four properties of it are load-bearing, and each was learned rather than designed:
+
+**The tier and its reason travel with the bytes.** The converter measures and a policy
+decides (legacy-web spec §5.4.2); publishing the chosen document without saying which
+pipeline produced it would make a demoted artifact indistinguishable from a successful
+conversion of a page that happens to be short.
+
+**93% of transitions carry no content.** Their effect is a single attribute write, because
+what they reveal is already in the document — the commonest interactive element on the web
+is a class toggle. The backend does not need a second DOM to make a menu work; it needs to
+apply one attribute. This is what makes the §5 interaction vocabulary cheap enough to be
+worth having.
+
+**`anchored` says whether a transition can be replayed at all.** A trigger the page's own
+scripts created does not exist in a tier 1 document, and a positional path may address a
+different node there. Unanchored transitions are reported rather than dropped, and a
+demotion keeps only the anchored, id-addressed ones — with the discarded count in
+`transitions_dropped`, because a recording that silently lost half its entries looks
+identical to a page with little to do.
+
+**Field order is fixed and the bytes are reproducible.** The same document converts to the
+same recording, which is what lets Tessera key it by content hash (§5). That required
+making the clock, `Math.random` and `crypto` deterministic — real entropy in any one of
+them defeats dedup as thoroughly as all three.
+
+The validator (§4.2) applies to the `document` field exactly as it would to any other scene
+graph input; the transition table is subject to the same treatment, since a recording
+arriving from a shared store is no more trusted than the page it came from.
+
 ### 4.1 Hermetic rendering (design in from M0, painful to retrofit)
 
 Golden-file tests are worthless if the output is not byte-stable. Hermetic mode pins:
