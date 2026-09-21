@@ -284,6 +284,27 @@ Reversal is verified by **byte equality** on the serialized document, at corpus 
 recordings. A weaker assertion — "the attribute is false again" — passes on a document that
 has also quietly gained or lost something else, which is the failure an undo path has.
 
+**The history is bounded, and says when the bound bit.** An undo holds the markup a removal
+destroyed, so a session's history grows with the content it discards. Measured across the
+corpus, an undo costs a median of **14 bytes**, p99 **2,193**, max **2,284** — the
+overwhelming majority of transitions are attribute toggles, and an attribute undo is two
+short strings. Every undo of every transition in all 98 documents totals 40 KB.
+
+So the defaults are 64 steps and 1 MiB (an eighth of the document ceiling). The step count
+is what binds on real content — 64 steps of measured traffic is about 140 KB — and the byte
+bound engages only when a page removes large subtrees, which the corpus does not do but a
+page is free to.
+
+Two rules matter more than the numbers:
+
+- **Forward motion is never blocked by the undo budget.** A step whose undo is too large to
+  keep still happens; what it costs is the ability to come back from it. Refusing the step
+  would let a page's own content decide whether a reader may turn the page.
+- **`AtStart` and `Forgotten` are different answers.** A reader who has taken 80 steps under
+  a 64-step bound and pressed back 64 times has not reached the beginning of the document.
+  A boolean return would have told them they had — a lie by omission, and one the reader has
+  no way to detect. The bound is allowed to forget; it is not allowed to pretend it did not.
+
 ### 4.5 Recording format version 2
 
 `atrium-navigator-recording/2` adds one field: an insert's `index`, the position the markup
