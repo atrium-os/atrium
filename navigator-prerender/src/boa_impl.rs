@@ -509,6 +509,105 @@ fn n_remove(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue>
     }
     Ok(JsValue::undefined())
 }
+/// ParentNode.append / prepend and ChildNode.before / after / replaceWith.
+///
+/// They take any number of nodes OR STRINGS, and a string becomes a text
+/// node — that is the whole convenience, and dropping it would silently lose
+/// text a page appended.
+fn coerce_nodes(args: &[JsValue], ctx: &mut Context) -> JsResult<Vec<Handle>> {
+    let mut out = vec![];
+    for a in args {
+        if let Some(h) = handle_of(a, ctx) { out.push(h) }
+        else {
+            let t = a.to_string(ctx)?.to_std_string_escaped();
+            out.push(with(|d| d.create(Kind::Text(t))));
+        }
+    }
+    Ok(out)
+}
+
+fn n_append(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = this_h(t, ctx) else { return Ok(JsValue::undefined()) };
+    for n in coerce_nodes(a, ctx)? {
+        with(|d| { if d.insert_before(h, n, None) { d.script_mutations += 1 } });
+    }
+    record_mutation("childList", h, "");
+    Ok(JsValue::undefined())
+}
+
+fn n_prepend(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = this_h(t, ctx) else { return Ok(JsValue::undefined()) };
+    // Prepended in ORDER, so each goes before the one already first.
+    let mut before = with(|d| d.first_child(h));
+    for n in coerce_nodes(a, ctx)? {
+        with(|d| { if d.insert_before(h, n, before) { d.script_mutations += 1 } });
+        before = with(|d| d.next_sibling(n));
+    }
+    record_mutation("childList", h, "");
+    Ok(JsValue::undefined())
+}
+
+fn n_before(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = this_h(t, ctx) else { return Ok(JsValue::undefined()) };
+    for n in coerce_nodes(a, ctx)? { insert_adjacent_handle(h, "beforebegin", n); }
+    Ok(JsValue::undefined())
+}
+
+fn n_after(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = this_h(t, ctx) else { return Ok(JsValue::undefined()) };
+    // Reversed, because each insert lands immediately after THIS element and
+    // would otherwise reverse the run.
+    for n in coerce_nodes(a, ctx)?.into_iter().rev() {
+        insert_adjacent_handle(h, "afterend", n);
+    }
+    Ok(JsValue::undefined())
+}
+
+fn n_replace_with(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = this_h(t, ctx) else { return Ok(JsValue::undefined()) };
+    for n in coerce_nodes(a, ctx)?.into_iter().rev() {
+        insert_adjacent_handle(h, "afterend", n);
+    }
+    with(|d| { d.detach(h); d.script_mutations += 1 });
+    Ok(JsValue::undefined())
+}
+
+/// Reflected string attributes, the plain ones with no resolution or
+/// per-element meaning beyond their name.
+fn reflected_get(t: &JsValue, attr: &str, ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(t, ctx) else { return Ok(JsValue::from(js_string!(""))) };
+    Ok(JsValue::from(js_string!(with(|d| d.attr(h, attr).unwrap_or("").to_string()))))
+}
+fn reflected_set(t: &JsValue, attr: &str, v: &JsValue, ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(t, ctx) else { return Ok(JsValue::undefined()) };
+    let s = v.to_string(ctx)?.to_std_string_escaped();
+    with(|d| { d.set_attr(h, attr, &s); d.script_mutations += 1 });
+    record_mutation("attributes", h, attr);
+    Ok(JsValue::undefined())
+}
+macro_rules! reflected {
+    ($($g:ident, $s:ident, $a:literal);* $(;)?) => { $(
+        fn $g(t: &JsValue, _x: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+            reflected_get(t, $a, c)
+        }
+        fn $s(t: &JsValue, x: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
+            reflected_set(t, $a, x.get_or_undefined(0), c)
+        }
+    )* };
+}
+reflected! {
+    g_dir, s_dir, "dir"; g_nonce, s_nonce, "nonce"; g_lang, s_lang, "lang";
+    g_title_a, s_title_a, "title"; g_alt, s_alt, "alt"; g_name, s_name, "name";
+    g_type, s_type, "type"; g_placeholder, s_placeholder, "placeholder";
+}
+
+/// `select.options` — its option elements, live.
+fn el_options(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(t, ctx) else { return Ok(JsValue::undefined()) };
+    let opts = with(|d| d.by_tag("option").into_iter().filter(|&o| d.contains(h, o)).collect());
+    html_collection(opts, ctx)
+}
+
 fn n_contains(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let h = match this_h(t, ctx) { Some(h) => h, None => return Ok(JsValue::from(false)) };
     let other = handle_of(a.get_or_undefined(0), ctx);
@@ -561,6 +660,8 @@ fn install_tree(o: &JsObject, ctx: &mut Context) {
         ("hasChildNodes", n_has_child_nodes),
         ("hasAttribute", n_has_attribute),
         ("hasAttributes", has_attributes),
+        ("append", n_append), ("prepend", n_prepend),
+        ("before", n_before), ("after", n_after), ("replaceWith", n_replace_with),
         ("insertAdjacentElement", insert_adjacent),
         ("insertAdjacentHTML", insert_adjacent_html),
         ("insertAdjacentText", insert_adjacent_text),
@@ -1115,6 +1216,13 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
     }
     install_tree(&o, ctx);
     install_handlers(&o, ctx);
+    for (n, g, st) in [
+        ("dir", g_dir as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>, s_dir as fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>),
+        ("nonce", g_nonce, s_nonce), ("lang", g_lang, s_lang),
+        ("title", g_title_a, s_title_a), ("alt", g_alt, s_alt),
+        ("name", g_name, s_name), ("type", g_type, s_type),
+        ("placeholder", g_placeholder, s_placeholder),
+    ] { live_get_set(&o, n, g, st, ctx); }
     {
         let tag = with(|d| d.tag(h).map(|t| t.to_ascii_lowercase())).unwrap_or_default();
         // `rel` belongs to the elements that have one; elsewhere its absence
@@ -1123,6 +1231,7 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
                                  | "progress" | "meter" | "param" | "li" | "data") {
             live_get_set(&o, "value", value_get, value_set, ctx);
         }
+        if tag == "select" { live_get(&o, "options", el_options, ctx); }
         if matches!(tag.as_str(), "link" | "a" | "area" | "form") {
             live_get_set(&o, "rel", rel_get, rel_set, ctx);
         }
@@ -1301,6 +1410,57 @@ fn cl_length(this: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsVa
     }))
 }
 
+/// ★ AN ARRAY-LIKE HOST COLLECTION MUST ALSO BE ITERABLE.
+///
+/// NamedNodeMap and DOMTokenList are both iterable in a browser, and ours
+/// were not: `[...el.attributes]` and `for (const c of el.classList)` both
+/// threw "value with type `object` is not iterable", which is the first
+/// failure of a corpus document. Borrowing Array's own iterator is exactly
+/// right rather than a shim — these ARE array-like (length plus numeric
+/// indices), so Array.prototype's iterator reads them correctly, and the
+/// same goes for forEach.
+fn make_array_like(target: &JsObject, ctx: &mut Context) {
+    let ap = ctx.intrinsics().constructors().array().prototype();
+    for key in [boa_engine::JsSymbol::iterator().into(),
+                boa_engine::property::PropertyKey::from(js_string!("forEach")),
+                boa_engine::property::PropertyKey::from(js_string!("entries")),
+                boa_engine::property::PropertyKey::from(js_string!("keys")),
+                boa_engine::property::PropertyKey::from(js_string!("values"))]
+    {
+        if let Ok(f) = ap.get(key.clone(), ctx) {
+            let desc = boa_engine::property::PropertyDescriptor::builder()
+                .value(f).writable(true).enumerable(false).configurable(true).build();
+            let _ = target.define_property_or_throw(key, desc, ctx);
+        }
+    }
+}
+
+/// `classList[i]` — the nth class, live.
+fn cl_get_trap(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let target = args.get_or_undefined(0).as_object()
+        .ok_or_else(|| boa_engine::JsNativeError::typ().with_message("proxy target"))?
+        .clone();
+    let key = args.get_or_undefined(1).clone().to_property_key(ctx)?;
+    let name = key.to_string();
+    if let Ok(i) = name.parse::<usize>() {
+        let h = target.get(js_string!("__h"), ctx)?.as_number().unwrap_or(0.0) as Handle;
+        return Ok(match with(|d| d.class_list(h)).get(i) {
+            Some(c) => JsValue::from(js_string!(c.clone())),
+            None => JsValue::undefined(),
+        });
+    }
+    target.get(key, ctx)
+}
+
+fn cl_item(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(this, ctx) else { return Ok(JsValue::null()) };
+    let i = args.get_or_undefined(0).to_number(ctx)? as usize;
+    Ok(match with(|d| d.class_list(h)).get(i) {
+        Some(c) => JsValue::from(js_string!(c.clone())),
+        None => JsValue::null(),
+    })
+}
+
 fn class_list_obj(h: Handle, ctx: &mut Context) -> JsValue {
     let o = ObjectInitializer::new(ctx)
         .property(js_string!("__h"), h as f64, Attribute::all())
@@ -1311,7 +1471,20 @@ fn class_list_obj(h: Handle, ctx: &mut Context) -> JsValue {
         .build();
     layout_prop_named(&o, "value", cl_value, ctx);
     layout_prop_named(&o, "length", cl_length, ctx);
-    JsValue::from(o)
+    {
+        let f = NativeFunction::from_fn_ptr(cl_item).to_js_function(ctx.realm());
+        let _ = o.set(js_string!("item"), f, false, ctx);
+    }
+    make_array_like(&o, ctx);
+    set_tag(&o, "DOMTokenList", ctx);
+    // A proxy so `classList[0]` is the LIVE nth class rather than a value
+    // captured when the wrapper was built.
+    match boa_engine::object::builtins::JsProxy::builder(o.clone())
+        .get(cl_get_trap).build(ctx)
+    {
+        Ok(p) => JsValue::from(JsObject::from(p)),
+        Err(_) => JsValue::from(o),
+    }
 }
 
 /// Install a read-only accessor from any getter fn.
@@ -1510,6 +1683,7 @@ fn attributes_obj(h: Handle, ctx: &mut Context) -> JsValue {
         .function(NativeFunction::from_fn_ptr(attrs_remove_named), js_string!("removeNamedItem"), 1)
         .function(NativeFunction::from_fn_ptr(attrs_item), js_string!("item"), 1)
         .build();
+    make_array_like(&target, ctx);
     set_tag(&target, "NamedNodeMap", ctx);
     match boa_engine::object::builtins::JsProxy::builder(target.clone())
         .get(attrs_get_trap)
@@ -3063,6 +3237,31 @@ const GLOBALS: &str = r#"
     if (h !== undefined) el.setAttribute('height', String(h));
     return el;
   };
+  // `window.frames` is the window's own frame list — EMPTY here, because
+  // this converter creates no child browsing contexts. Empty is the true
+  // answer and matches contentWindow being null.
+  globalThis.frames = [];
+  globalThis.length = 0;
+  // ★ These must be the WINDOW, which is the proxy over the global — not the
+  // raw global object. Assigning globalThis made `window.top === window`
+  // false, and top/parent/self are compared for identity constantly (it is
+  // how a page detects being framed).
+  (function () {
+    var w = globalThis.window || globalThis;
+    globalThis.top = w; globalThis.parent = w; globalThis.self = w;
+  })();
+  // Node-flavoured timer aliases some bundles reach for.
+  globalThis.setImmediate = function (fn) { return setTimeout(fn, 0); };
+  globalThis.clearImmediate = function (id) { return clearTimeout(id); };
+  ['Document', 'HTMLAreaElement', 'HTMLHeadElement', 'HTMLBodyElement',
+   'DOMParser', 'XMLSerializer', 'Range', 'AbortController', 'AbortSignal'
+  ].forEach(function (n) { if (!globalThis[n]) globalThis[n] = function () {}; });
+  try {
+    Object.defineProperty(globalThis.Document, Symbol.hasInstance, {
+      value: function (v) { try { return !!v && v.nodeType === 9; } catch (e) { return false; } }
+    });
+  } catch (e) {}
+
   globalThis.Audio = function Audio(src) {
     var el = document.createElement('audio');
     if (src !== undefined) el.setAttribute('src', String(src));

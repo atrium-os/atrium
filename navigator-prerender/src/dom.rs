@@ -86,11 +86,37 @@ impl Dom {
         }
     }
 
-    pub fn by_id(&self, id: &str) -> Option<Handle> {
-        (0..self.nodes.len() as Handle).find(|&h| self.attr(h, "id") == Some(id))
+    /// ★ IS THIS NODE STILL IN THE DOCUMENT?
+    ///
+    /// The arena keeps detached nodes — one removed, or created and never
+    /// inserted — and document-wide lookups scanned ALL of them. So
+    /// `document.getElementById('x')` still found an element after
+    /// `replaceWith` removed it, and a `createElement('form')` that was never
+    /// inserted showed up in `document.forms`. A document-level query has to
+    /// mean "in the document".
+    pub fn connected(&self, h: Handle) -> bool {
+        let mut cur = Some(h);
+        let mut guard = 0;
+        while let Some(n) = cur {
+            if n == self.root() { return true }
+            guard += 1;
+            if guard > 10_000 { return false }
+            cur = self.get(n).and_then(|x| x.parent);
+        }
+        false
     }
 
+    pub fn by_id(&self, id: &str) -> Option<Handle> {
+        (0..self.nodes.len() as Handle)
+            .find(|&h| self.attr(h, "id") == Some(id) && self.connected(h))
+    }
     pub fn by_tag(&self, tag: &str) -> Vec<Handle> {
+        self.by_tag_anywhere(tag).into_iter().filter(|&h| self.connected(h)).collect()
+    }
+
+    /// Every element with the tag, CONNECTED OR NOT — for the few callers
+    /// that mean the arena rather than the document.
+    pub fn by_tag_anywhere(&self, tag: &str) -> Vec<Handle> {
         (0..self.nodes.len() as Handle)
             .filter(|&h| self.tag(h).map(|t| t.eq_ignore_ascii_case(tag)).unwrap_or(false))
             .collect()

@@ -8,10 +8,16 @@ fn attr(html: &str, name: &str) -> String {
     c.html[i..].split('"').next().unwrap().to_string()
 }
 
+/// ★ `self`, `window`, `top` and `parent` are all the SAME object — which
+/// is what pages compare (it is how a page detects being framed). They are
+/// the window PROXY, not the bare global: the proxy is what reports missing
+/// `window.x` lookups. So `self === globalThis` is false here where a browser
+/// says true — a recorded divergence, and the narrower one, since nothing in
+/// the corpus compares against globalThis itself.
 #[test]
-fn self_is_the_global() {
+fn self_is_the_window() {
     assert_eq!(attr("<html><body><div id=r></div><script>\
-        document.getElementById('r').setAttribute('t', String(self === globalThis));\
+        document.getElementById('r').setAttribute('t', String(self === window));\
         </script></body></html>", "t"), "true");
 }
 
