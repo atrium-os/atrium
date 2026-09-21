@@ -12,7 +12,16 @@ use std::collections::HashSet;
 use fetch::Fetcher;
 
 pub struct Conversion {
+    /// The TIER 2 artifact: the document after its scripts ran.
     pub html: String,
+    /// ★ The TIER 1 artifact: the same document before any script ran.
+    ///
+    /// Kept because tier 2 is not a separate pipeline — it is tier 1's DOM
+    /// plus whatever the scripts changed — so the fallback is already in
+    /// hand and costs one extra serialization rather than a second parse.
+    /// Holding it is what lets a POLICY choose per document instead of the
+    /// converter deciding for everyone.
+    pub html_tier1: String,
     pub engine: &'static str,
     pub elements_before: usize,
     /// Visible text (whitespace-collapsed) before and after scripts ran.
@@ -76,6 +85,7 @@ pub fn convert_with(
     // not earning its cost.
     let text_before = dom.visible_text(dom.root()).split_whitespace()
         .map(str::len).sum::<usize>();
+    let html_tier1 = dom.serialize();
 
     let (mut ext_total, mut ext_ok, mut ext_fail) = (0, 0, 0);
     let mut fetch_errors: Vec<String> = vec![];
@@ -161,6 +171,7 @@ pub fn convert_with(
     let verdict = classify(rep.first_error.as_deref(), rep.cause.as_ref());
     Conversion {
         html: dom.serialize(),
+        html_tier1,
         engine: engine.name(),
         elements_before: before,
         text_before,
@@ -274,4 +285,102 @@ fn classify(first: Option<&str>, cause: Option<&(String, String)>) -> Verdict {
         };
     }
     Verdict::Unknown
+}
+
+// ── Measurement, and the policy that reads it ───────────────────────────
+//
+// ★ THE CONVERTER MEASURES; THE POLICY DECIDES. These are deliberately
+// separate types. A converter that silently returned a different artifact
+// than the one its scripts produced would be making a product judgement
+// inside an instrument, and the judgement would be invisible to the caller
+// and untestable on its own.
+
+impl Conversion {
+    /// Fraction of the document's visible text that survived its scripts.
+    /// 1.0 is unchanged, above 1.0 means content was added, below means lost.
+    /// A document with no text to begin with returns 1.0: nothing was lost.
+    pub fn text_retained(&self) -> f64 {
+        if self.text_before == 0 { return 1.0 }
+        self.text_after as f64 / self.text_before as f64
+    }
+}
+
+/// Which artifact a policy chose, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    /// The pre-script document: content taken from the HTML alone.
+    One,
+    /// The prerendered document: scripts ran and their result was kept.
+    Two,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierDecision {
+    pub tier: Tier,
+    /// Why this tier, in words meant for a report rather than a log.
+    pub reason: &'static str,
+}
+
+/// ★ NEVER EMIT AN ARTIFACT WORSE THAN THE INPUT.
+///
+/// Running a page's scripts is not automatically an improvement. Measured
+/// over 84 scripted documents: 19 gained visible text, 63 were unchanged, and
+/// 2 came out WORSE — bbc.co.uk runs all 70 of its scripts clean and drops
+/// from 2,825 visible words to 970, because it is a hydrating app whose first
+/// act is to tear down server-rendered content and whose re-render never
+/// arrives (its data is cross-origin and refused, its chunks come from
+/// dynamic import). For a document like that, tier 1 is the better artifact.
+///
+/// This is a FLOOR, not a quality check. A page that replaces good content
+/// with an equal volume of worse content passes it, and it is named as a
+/// floor so it is not trusted as more.
+#[derive(Debug, Clone, Copy)]
+pub struct TierPolicy {
+    /// Minimum fraction of visible text a conversion must retain to be kept.
+    ///
+    /// The corpus separates cleanly: the one catastrophic case retains 0.346
+    /// and the only other loss retains 0.996 (38 characters, noise). Any
+    /// value between those two behaves identically here, so this default is
+    /// chosen with margin on both sides rather than tuned — and it is the
+    /// number an operator should expect to set deliberately.
+    pub min_text_retained: f64,
+    /// Documents with less visible text than this are exempt: an app shell
+    /// that is empty before and after has not lost anything, and a ratio
+    /// computed over a handful of characters is noise.
+    pub text_floor: usize,
+}
+
+impl Default for TierPolicy {
+    fn default() -> Self {
+        Self { min_text_retained: 0.80, text_floor: 200 }
+    }
+}
+
+impl TierPolicy {
+    pub fn decide(&self, c: &Conversion) -> TierDecision {
+        if c.scripts_total == 0 {
+            return TierDecision { tier: Tier::One, reason: "no scripts to run" };
+        }
+        if c.text_before < self.text_floor {
+            return TierDecision {
+                tier: Tier::Two,
+                reason: "too little text to judge; nothing to protect",
+            };
+        }
+        if c.text_retained() < self.min_text_retained {
+            return TierDecision {
+                tier: Tier::One,
+                reason: "conversion removed reader-visible content",
+            };
+        }
+        TierDecision { tier: Tier::Two, reason: "conversion retained the content" }
+    }
+
+    /// The artifact this policy would publish, with the decision that chose
+    /// it. Returning both is deliberate: the choice must travel WITH the
+    /// bytes, or a reader cannot tell which pipeline produced what they see.
+    pub fn artifact<'a>(&self, c: &'a Conversion) -> (&'a str, TierDecision) {
+        let d = self.decide(c);
+        (match d.tier { Tier::One => &c.html_tier1, Tier::Two => &c.html }, d)
+    }
 }

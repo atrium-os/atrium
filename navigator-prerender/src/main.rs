@@ -80,6 +80,12 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
     println!("W\t{}\t{}", c.doc_writes, c.doc_writes_refused);
     println!("J\t{}\t{}", c.injected_scripts_run, c.injected_scripts_refused);
     println!("X\t{}\t{}", c.text_before, c.text_after);
+    // The POLICY's verdict travels with the measurements, so the parent can
+    // report what would be published without re-deriving it.
+    {
+        let (_, d) = navigator_prerender::TierPolicy::default().artifact(&c);
+        println!("Y\t{:?}\t{}", d.tier, d.reason);
+    }
     println!("T\t{}\t{}", c.timers_fired, c.timers_dropped);
     println!("P\t{}\t{}\t{}\t{}", c.page_fetches, c.page_fetch_failures,
         c.page_blocked, c.beacons_suppressed);
@@ -166,6 +172,8 @@ fn main() {
     let mut missing_docs: BTreeMap<String, usize> = BTreeMap::new();
     let mut elems = vec![];
     let mut gains: Vec<(i64, String)> = vec![];
+    let mut demoted: Vec<String> = vec![];
+    let mut tier2_kept = 0usize;
 
     for f in &files {
         let Ok(src) = fs::read_to_string(f) else { continue };
@@ -241,6 +249,11 @@ fn main() {
         elems.push(c.elements_after);
         if c.scripts_total > 0 {
             gains.push((c.text_after as i64 - c.text_before as i64, name.clone()));
+            match c.tier.as_str() {
+                "Two" => tier2_kept += 1,
+                "One" => demoted.push(format!("{name}  ({})", c.tier_reason)),
+                _ => {}
+            }
         }
         if c.scripts_total > 0 {
             with_js += 1;
@@ -332,6 +345,13 @@ fn main() {
         // A document that LOSES text is the dangerous case: the converter ran
         // and made the artifact worse than not converting at all.
         for (d, n) in shrank.iter().take(5) { println!("     LOST  {d:+8}  {n}"); }
+    }
+    if tier2_kept > 0 || !demoted.is_empty() {
+        println!("TIER POLICY (never emit an artifact worse than the input)");
+        println!("  the converter MEASURES; this policy DECIDES. Defaults: keep");
+        println!("  tier 2 unless it retained under 80% of the visible text.");
+        println!("   tier 2 published {tier2_kept}   DEMOTED to tier 1 {}", demoted.len());
+        for n in demoted.iter().take(5) { println!("     tier 1  {n}"); }
     }
     println!("external scripts  referenced={ext_total} fetched={ext_ok} failed={ext_fail}{}",
         if net { "" } else { "   (network OFF — set PRERENDER_NET=1)" });
@@ -451,6 +471,8 @@ pub struct Child {
     pub injected_scripts_refused: u32,
     pub text_before: usize,
     pub text_after: usize,
+    pub tier: String,
+    pub tier_reason: String,
     pub cause: Option<(String, String)>,
     pub timers_fired: u32,
     pub timers_dropped: u32,
@@ -471,6 +493,7 @@ fn parse_child(s: &str) -> Option<Child> {
         doc_writes: 0, doc_writes_refused: 0,
         injected_scripts_run: 0, injected_scripts_refused: 0,
         text_before: 0, text_after: 0,
+        tier: String::new(), tier_reason: String::new(),
         cause: None,
         timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0,
         page_blocked: 0, beacons: 0, blocked_hosts: vec![] };
@@ -493,6 +516,10 @@ fn parse_child(s: &str) -> Option<Child> {
             Some(&"E") if f.len() >= 2 => c.errors.push(f[1].to_string()),
             Some(&"M") if f.len() >= 3 => {
                 c.missing.push((f[2].to_string(), f[1].parse().unwrap_or(1)));
+            }
+            Some(&"Y") if f.len() >= 3 => {
+                c.tier = f[1].to_string();
+                c.tier_reason = f[2].to_string();
             }
             Some(&"X") if f.len() >= 3 => {
                 c.text_before = f[1].parse().unwrap_or(0);
