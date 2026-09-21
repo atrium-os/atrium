@@ -1,0 +1,14 @@
+[package]
+name = "portcullis-mounts"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+description = "Mount mechanics shared by every jail lane: enumerate what is mounted under a root, create mountpoints jail(8) will not, and unmount convergently. One copy, because the three that existed had drifted to three different qualities."
+
+[lib]
+name = "portcullis_mounts"
+path = "src/lib.rs"
+
+[dependencies]
+portcullis-jail = { path = "../portcullis-jail" }

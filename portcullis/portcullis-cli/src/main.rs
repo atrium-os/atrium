@@ -594,14 +594,20 @@ fn run(cmd: &str, args: &[&str]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Tear down a jail's union mount. Order matters: unionfs first
-/// (upper layer), then nullfs (lower). Also unmount devfs if jail
-/// still has it mounted at <jail-path>/dev.
+/// Tear down a jail's mounts, convergently.
+///
+/// ★★ THIS PATH HAD THE ORIGINAL, AND KEPT IT. It used to unmount `dev`, then
+/// the jail path twice (unionfs, nullfs), and nothing else — which is exactly
+/// the version portcullisd's launch path was debugged away from, because
+/// capability mounts live UNDER the jail path and held the whole stack busy.
+/// The fix landed there and never reached here: the local fallback is only
+/// taken when the daemon is down, so its mount piles accumulated on the one
+/// path nobody was watching.
+///
+/// Now the same convergent unwind as everywhere else, from one crate.
 fn teardown(jail_path: &Path) {
-    let dev = jail_path.join("dev");
-    let _ = umount(&dev);   /* devfs from mount.devfs in jail.conf */
-    let _ = umount(jail_path);  /* unionfs */
-    let _ = umount(jail_path);  /* nullfs */
+    let left = portcullis_mounts::converge(&[jail_path], portcullis_mounts::Force::No);
+    portcullis_mounts::warn_survivors("portcullis", &left);
 }
 
 /// Map a daemon LaunchReply to a CLI ExitCode. Used by the

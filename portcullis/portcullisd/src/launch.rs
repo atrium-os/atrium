@@ -305,21 +305,7 @@ fn clone_manifest_with(
 /// → a regular-file mountpoint. Writes land in the unionfs overlay, leaving the
 /// read-only app tree untouched. Mirrors the existing dev/ + home/ creation above.
 fn ensure_mountpoints(jc: &JailConfig) -> Result<(), LaunchError> {
-    for m in &jc.mounts {
-        if let Some(parent) = m.dst.parent() {
-            fs::create_dir_all(parent).map_err(|e| LaunchError::Failed(
-                "mount", format!("mkdir mountpoint parent {}: {e}", parent.display())))?;
-        }
-        let src_is_dir = fs::metadata(&m.src).map(|md| md.is_dir()).unwrap_or(false);
-        if src_is_dir {
-            fs::create_dir_all(&m.dst).map_err(|e| LaunchError::Failed(
-                "mount", format!("mkdir mountpoint {}: {e}", m.dst.display())))?;
-        } else if !m.dst.exists() {
-            fs::File::create(&m.dst).map_err(|e| LaunchError::Failed(
-                "mount", format!("touch mountpoint {}: {e}", m.dst.display())))?;
-        }
-    }
-    Ok(())
+    portcullis_mounts::ensure_mountpoints(jc).map_err(|e| LaunchError::Failed("mount", e))
 }
 
 /// Run one jail-c against `jail_path`, capture exit, jail -r before
@@ -367,78 +353,36 @@ fn run_one_jail(
     Ok(code)
 }
 
-/// Every mount point at or under `root`, DEEPEST FIRST.
-///
-/// Parsed from `mount -p` (fstab-style; field 2 is the mount point) rather than
-/// assumed, because the set is not fixed: it is the overlay pair plus whatever
-/// capability mounts this app's manifest asked for. Sorting by path length puts
-/// nested mounts ahead of the parents that contain them.
-fn mounts_under(root: &Path) -> Vec<PathBuf> {
-    let out = match Command::new("mount").arg("-p").output() {
-        Ok(o) => o.stdout,
-        Err(_) => return Vec::new(),
-    };
-    let mut v: Vec<PathBuf> = String::from_utf8_lossy(&out)
-        .lines()
-        .filter_map(|l| l.split_whitespace().nth(1))
-        .map(PathBuf::from)
-        .filter(|p| p == root || p.starts_with(root))
-        .collect();
-    v.sort_by_key(|p| std::cmp::Reverse(p.as_os_str().len()));
-    v
-}
-
 /// Final teardown: optional jail -r (idempotent if already removed), then
-/// unmount everything the launch mounted — deepest first.
+/// unmount everything the launch mounted — deepest first, convergently.
 ///
-/// It used to unmount `dev`, then the jail path twice (unionfs, nullfs), and
-/// nothing else. But the capability mounts live UNDER the jail path
-/// (<jail>/atrium/sockets/fresco, .../forum-ctl, …), so they held the overlay
-/// busy and the whole stack survived:
+/// The mechanics moved to `portcullis-mounts` when the one-shot lane turned
+/// out to have a near-copy of them and the CLI's fallback a worse one. The
+/// history is worth keeping here because it is why the loop has the shape it
+/// does: capability mounts live UNDER the jail path
+/// (<jail>/atrium/sockets/fresco, …), so they held the overlay busy and the
+/// whole stack survived —
 ///
 ///     umount: unmount of /var/lib/atrium/jails/<app> failed: Device busy
 ///
 /// `jail -r` is documented to drop a jail's own mounts and demonstrably does
-/// not always. Each relaunch then stacked a fresh set on top of the survivors —
-/// 12 mounts with no jail running, no process, no open file.
+/// not always. Each relaunch then stacked a fresh set on top of the
+/// survivors: 12 mounts with no jail running, no process, no open file.
 ///
 /// ★ And a stacked pile cannot be cleaned up afterwards by path: a path
-/// resolves through the topmost layer, so buried mounts answer
-/// "not a file system root directory" and are reachable only by fsid. So the
-/// fix has to be to never leave the pile, not to clean it up later.
+/// resolves through the topmost layer, so buried mounts answer "not a file
+/// system root directory" and are reachable only by fsid. So the fix has to
+/// be never to leave the pile, not to clean it up later.
 ///
-/// Re-enumerating each pass (rather than unmounting a list captured once) is
-/// what makes it converge: unmounting a layer can reveal another mounted at the
-/// same path underneath it.
+/// ★ NOT forced, unlike the one-shot lane: an application's mounts may be
+/// genuinely busy, and forcing would take a filesystem away from something
+/// still using it. This path reports survivors instead.
 fn full_teardown(jail_path: &Path, jail_name: Option<&str>) {
     if let Some(n) = jail_name {
         let _ = Command::new("jail").arg("-r").arg(n).status();
     }
-    for _ in 0..16 {
-        let ms = mounts_under(jail_path);
-        if ms.is_empty() {
-            break;
-        }
-        let before = ms.len();
-        for m in &ms {
-            let _ = umount_silent(m);
-        }
-        /* No progress means the rest is genuinely held (a live process, a
-         * wedged fs) — stop rather than spin; the check below reports it. */
-        if mounts_under(jail_path).len() == before {
-            break;
-        }
-    }
-    /* Gate on the mounts being GONE, not on having called umount. A silent
-     * leak here is invisible until the stack is unrecoverable. */
-    let left = mounts_under(jail_path);
-    if !left.is_empty() {
-        eprintln!("portcullisd: WARNING {} mount(s) still under {} after teardown \
-                   — a relaunch will stack on top of them:", left.len(), jail_path.display());
-        for m in left.iter().take(6) {
-            eprintln!("portcullisd:   {}", m.display());
-        }
-    }
+    let left = portcullis_mounts::converge(&[jail_path], portcullis_mounts::Force::No);
+    portcullis_mounts::warn_survivors("portcullisd", &left);
 }
 
 /// Resolve the dedicated per-app uid the app executes as (PRIVILEGE INVARIANT,

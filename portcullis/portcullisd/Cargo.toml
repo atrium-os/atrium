@@ -50,6 +50,7 @@ portcullis-policy   = { path = "../portcullis-policy" }
 portcullis-sig      = { path = "../portcullis-sig" }
 portcullis-trust    = { path = "../portcullis-trust" }
 portcullis-oneshot  = { path = "../portcullis-oneshot" }
+portcullis-mounts   = { path = "../portcullis-mounts" }
 portcullis-peer     = { path = "../portcullis-peer" }
 portcullis-ipc      = { path = "../portcullis-ipc" }
 portcullis-protocol = { path = "../portcullis-protocol" }

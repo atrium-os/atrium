@@ -190,33 +190,13 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         teardown(&jail_path, &jail_name);
         return OneShot::Failed(e.to_string());
     }
-    // ★★ MOUNTPOINTS MUST EXIST BEFORE jail(8) RUNS — it does not create
-    // them. Without this a worker that legitimately declares a capability
-    // (a renderer wanting the font set, say) dies at mount time with
-    // `mount: …/home: No such file or directory`, and the whole argument for
-    // allowing capability-bearing workers on this lane collapses into
-    // "capability-less only, by accident of an unimplemented step".
-    //
-    // Dir-or-file is decided by stat'ing the SOURCE, as the application path
-    // does: a nullfs mount of a file onto a directory fails, and the reverse
-    // too.
-    for m in &jc.mounts {
-        if let Some(parent) = m.dst.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                teardown(&jail_path, &jail_name);
-                return OneShot::Failed(format!("mkdir {}: {e}", parent.display()));
-            }
-        }
-        let src_is_dir = std::fs::metadata(&m.src).map(|md| md.is_dir()).unwrap_or(false);
-        let made = if src_is_dir {
-            std::fs::create_dir_all(&m.dst)
-        } else if !m.dst.exists() {
-            std::fs::File::create(&m.dst).map(|_| ())
-        } else { Ok(()) };
-        if let Err(e) = made {
-            teardown(&jail_path, &jail_name);
-            return OneShot::Failed(format!("mountpoint {}: {e}", m.dst.display()));
-        }
+    // ★ Mountpoints jail(8) will not create. Shared with the application
+    // path: the two had grown separate copies of the same three lines, and
+    // the lane that lacked it supported capability-bearing workers only in
+    // principle.
+    if let Err(e) = portcullis_mounts::ensure_mountpoints(&jc) {
+        teardown(&jail_path, &jail_name);
+        return OneShot::Failed(e);
     }
 
     for dir in ["dev", user_home.trim_start_matches('/')] {
@@ -344,50 +324,23 @@ fn sh(cmd: &str, args: &[&str]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Every mount at or under `root`, deepest first — the only safe unmount order
-/// for a stack.
-fn mounts_under(root: &Path) -> Vec<PathBuf> {
-    let out = match Command::new("mount").arg("-p").output() {
-        Ok(o) => o.stdout,
-        Err(_) => return Vec::new(),
-    };
-    let root = root.to_string_lossy().to_string();
-    let mut v: Vec<PathBuf> = String::from_utf8_lossy(&out).lines()
-        .filter_map(|l| l.split_whitespace().nth(1).map(str::to_string))
-        .filter(|p| *p == root || p.starts_with(&format!("{root}/")))
-        .map(PathBuf::from)
-        .collect();
-    v.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
-    v
-}
-
-/// ★ CONVERGENT, AND IT SAYS SO WHEN IT FAILS. A worker pool churns jails far
-/// faster than app launches do, so a leaked mount does not get noticed once —
-/// it compounds. Repeating until the set is empty is the only way to unwind a
-/// stack whose members can be busy in any order; giving up silently would
-/// leave a root that the NEXT run mounts on top of.
+/// Stop the jail and unwind its mounts.
+///
+/// ★ TWO ROOTS. The writable layer is mounted OUTSIDE the jail root, so a
+/// teardown that swept only the root left one tmpfs per run alive in
+/// /var/run — invisible to anyone looking at the jail, and accumulating
+/// exactly as fast as the pool churns.
+///
+/// ★ Force, unlike the application path: by this point the jail is gone and
+/// nothing should hold these mounts, so forcing costs nothing and guarantees
+/// the next run does not stack on a survivor.
 fn teardown(jail_path: &Path, jail_name: &str) {
     let _ = Command::new("jail").arg("-r").arg(jail_name)
         .stderr(std::process::Stdio::null()).status();
     let upper = upper_dir(jail_name);
-    // ★ BOTH TREES. The writable layer is mounted outside the jail root, so a
-    // teardown that swept only under the root would leave one tmpfs per run
-    // alive in /var/run — invisible to anyone looking at the jail, and
-    // accumulating exactly as fast as the pool churns.
-    for _ in 0..16 {
-        let mut mounts = mounts_under(jail_path);
-        mounts.extend(mounts_under(&upper));
-        if mounts.is_empty() { break }
-        for m in mounts {
-            let _ = Command::new("umount").arg("-f").arg(&m)
-                .stderr(std::process::Stdio::null()).status();
-        }
-    }
-    let mut left = mounts_under(jail_path);
-    left.extend(mounts_under(&upper));
-    if !left.is_empty() {
-        eprintln!("portcullis: WARNING {} mounts survive under {} / {}: {:?}",
-                  left.len(), jail_path.display(), upper.display(), left);
-    }
+    let left = portcullis_mounts::converge(
+        &[jail_path, upper.as_path()], portcullis_mounts::Force::Yes);
+    portcullis_mounts::warn_survivors("portcullis", &left);
     let _ = std::fs::remove_dir(&upper);
 }
+

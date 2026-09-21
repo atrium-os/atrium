@@ -1425,6 +1425,44 @@ step". Dir-or-file is decided by stat'ing the source, as the application path do
 | after `policy revoke` | refused again |
 | the 98-document corpus | unaffected — 98/259/259 |
 
+### 6.5.2d One copy of the mount mechanics
+
+Three lanes had three copies of "unmount everything under this root", at **three different
+qualities** — which is worse than three identical ones, because the weakest was on the path
+nobody watches:
+
+| lane | what it had |
+|---|---|
+| `portcullisd` application launch | the good one: re-enumerate each pass, stop on no progress, warn about survivors |
+| the one-shot lane | a near-copy: convergent, but spun all 16 passes, and knew about a second root the others did not |
+| the CLI's local fallback | **the original**: unmount `dev`, then the jail path twice, and hope |
+
+The first got that way by being debugged — capability mounts live *under* the jail path, so
+they held the overlay busy and every relaunch stacked a fresh set on the survivors (12
+mounts with no jail, no process, no open file). That fix never reached the CLI fallback,
+which is taken only when the daemon is down.
+
+`portcullis-mounts` is their **union, not their intersection**. Every behaviour any of them
+had is kept, and the two differences that were real became parameters rather than being
+averaged away:
+
+- **Force.** A one-shot worker's jail is gone by teardown time and nothing should hold its
+  mounts, so forcing costs nothing and guarantees the next run does not stack. An
+  application's mounts may be genuinely busy, and forcing there takes a filesystem away from
+  something still using it — that path asks politely and reports what survived.
+- **Multiple roots.** The one-shot writable layer is mounted outside the jail root; sweeping
+  only the root left one tmpfs per run alive in `/var/run`.
+
+The parsing is separated from running `mount(8)` so it can be tested on a host with none of
+these filesystems — and the subtle part is the prefix rule, not the subprocess:
+`Path::starts_with` is component-wise, so `…/app-sibling` is **not** under `…/app`. A string
+prefix test would have swept another jail's stack into this one's teardown. That case is now
+a test.
+
+Verified in the VM after the merge: the 98-document corpus through daemon-created jails
+(98/259/259), the direct CLI lane, and stale-mount recovery all unchanged, with no jails,
+mounts or upper directories left behind.
+
 ### 6.5.3 The trust gate: `require_signatures`
 
 Two findings surfaced while designing the worker lane. Neither was caused by it; both were
