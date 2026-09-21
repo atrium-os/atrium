@@ -238,6 +238,7 @@ mod tests {
             user_home:    PathBuf::from("/home/alice"),
             user_name:    "alice".into(),
             devfs_ruleset: 99,
+            instance: None,
         }
     }
 

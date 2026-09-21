@@ -117,6 +117,11 @@ pub fn launch_with_stdio(
         user_home:    user_home.clone(),
         user_name:    run_as_user.clone(),
         devfs_ruleset: 99,
+        /* Named launches stay single-instance: this path owns
+         * /var/lib/atrium/jails/<id> and one persistent overlay, so a second
+         * concurrent jail here would share both. Concurrency belongs to the
+         * one-shot piped path, which gets its own root per instance. */
+        instance: None,
     };
 
     /* Mount overlay once; both setup and runtime jails see the same

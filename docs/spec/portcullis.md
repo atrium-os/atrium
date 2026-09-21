@@ -1192,6 +1192,72 @@ alongside the parser, with one test per row.
 └─────────────────────────────────────────────────────────────┘
 ```
 
+## 6.5 One-shot piped jails — a jail per unit of work
+
+Everything above assumes a jail is an **application**: one per app id, long-lived, attached
+to a persistent overlay, single-instance by default. That is the right shape for a notes
+app and the wrong shape for a **worker pool**.
+
+The Navigator's backend needs one jailed document worker *per document*
+([atrium-navigator-backend.md](atrium-navigator-backend.md) §2: "one jail per document is
+the default, not a mitigation"), talking over a pipe, living exactly as long as the document
+is open. Sixteen open pages are sixteen concurrent jails **of the same app**. Three things
+in the current design stand in the way.
+
+### 6.5.1 Names must carry an instance — and the failure was silent
+
+`jail_name_from_app_id` derives the name from the app id alone. Two concurrent workers get
+the same name, and **`jail -c` on an existing name does not fail — it reconfigures the
+running jail**. Two documents would have ended up inside one jail, sharing the boundary each
+was supposed to have to itself, with nothing logged and every test green.
+
+`BuildOpts::instance` fixes this: `Some(tag)` yields `<id>__<tag>`, `None` reproduces the
+old name byte-for-byte so no existing launch changes. The tag is sanitized to
+`[A-Za-z0-9_]`, because **FreeBSD reads a dot in a jail name as hierarchy** (`a.b` is a
+child jail of `a`) — a tag taken from a url, a uuid or a path would turn a naming
+convenience into a nesting bug. The **hostname does not take the tag**: it is what the app
+sees of itself, and a document worker should not be able to read which slot it was given.
+
+*Implemented, with tests (`portcullis-jail/tests/instances.rs`).*
+
+### 6.5.2 What remains: the piped one-shot launch path
+
+Not yet implemented — and it is FreeBSD-side work that cannot be verified on a macOS host,
+so it is specified here rather than written blind.
+
+- **Per-instance root.** `/var/lib/atrium/jails/<id>` and the overlay at
+  `/var/lib/atrium/overlays/<id>` are per-app. A one-shot worker needs its own root
+  (`…/jails/<id>__<tag>`) and, since it holds no state worth keeping, **no persistent
+  overlay at all** — a tmpfs upper layer, discarded at exit. That also removes the
+  `arm_overlay_dedup` path and its quota ioctl from this lane.
+- **Stdio is already solved.** `launch_with_stdio` passes the caller's fds to `jail(8)`
+  through SCM_RIGHTS, and `jail -c -f` accepts arbitrary `Stdio`. Pipes work today; no
+  kernel-level work is needed. The cost is the `/bin/sh -c` that `exec.start` implies, which
+  argues for the `jaild` `CreateJail` + `ExecSpec` route (real `execve`, `pdfork`, procdesc
+  reaping) once `ExecSpec` can carry caller-supplied fds.
+- **Teardown must converge per instance.** `full_teardown`'s 16-pass unmount loop is
+  mandatory; a worker pool churns jails far faster than app launches do, so a leaked mount
+  compounds instead of being noticed once.
+- **The capability set needs no new mechanism.** A manifest with no `[capabilities]` already
+  renders `ip4/ip6 = disable`, `allow.raw_sockets = false`, and zero mounts. The document
+  worker's manifest is therefore a short one, which is the point: it declares nothing
+  because it needs nothing.
+
+### 6.5.3 Two trust findings, recorded because this lane makes them worse
+
+Neither is caused by the above; both are load-bearing for it.
+
+1. **Manifest trust fails open when unconfigured.** `manifest_trust::verify` warns and
+   returns `Ok` when `/etc/atrium/publishers` is empty — the default on a fresh machine. A
+   worker pool launching jails continuously makes an unsigned-manifest window a standing
+   condition rather than a one-off. The fix is a `require_signatures` setting that a
+   deployment can turn on and a jailed-worker lane can *demand*, not a silent change of
+   default that would stop every dev box from launching anything.
+2. **The CLI's local fallback path has no trust gate at all.** `cmd_launch`'s
+   explicit-path branch (daemon offline) builds and runs `jail -c` from whatever
+   `atrium.toml` sits at the given path — no signature check, unlike the daemon path which
+   checks twice. It is a development convenience that reads as a launch path.
+
 ## 7. Capability policy + prompts
 
 User policy at `/var/db/atrium/<user>/policy.toml`:

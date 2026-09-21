@@ -45,6 +45,45 @@ pub struct BuildOpts {
     /// devfs ruleset id assigned to this jail. Caller manages
     /// allocation across all jails on the host.
     pub devfs_ruleset: u32,
+    /// ★★ AN INSTANCE TAG, for apps that run MORE THAN ONE JAIL AT A TIME.
+    ///
+    /// Jail names were derived from the app id alone, which silently assumes
+    /// one live jail per app. That holds for a desktop application and fails
+    /// completely for a worker pool: the Navigator's backend runs one jailed
+    /// document worker PER DOCUMENT (atrium-navigator-backend.md §2, "one
+    /// jail per document is the default, not a mitigation"), so sixteen open
+    /// pages are sixteen concurrent jails of the same app. Without a
+    /// per-instance name they collide on the jail name, and `jail -c` on an
+    /// existing name reconfigures the running jail instead of creating one —
+    /// two documents would end up sharing a jail, which is the exact property
+    /// the design exists to prevent.
+    ///
+    /// `None` reproduces the single-instance name exactly, so nothing that
+    /// launches an ordinary app changes.
+    ///
+    /// The HOSTNAME deliberately does not take the tag: it is what the app
+    /// sees of itself, and a document worker should not be able to read which
+    /// slot it was given.
+    pub instance: Option<String>,
+}
+
+/// Jail name for one instance of an app.
+///
+/// ★ The tag is sanitized the same way the id is. A caller that passed a
+/// dotted or slashed instance tag would otherwise produce a name jail(8)
+/// reads as a HIERARCHY — `a.b` is a child jail of `a` — turning a naming
+/// convenience into a nesting bug.
+pub fn jail_name_for_instance(app_id: &str, instance: Option<&str>) -> String {
+    let base = jail_name_from_app_id(app_id);
+    match instance {
+        None => base,
+        Some(tag) => {
+            let tag: String = tag.chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            format!("{base}__{tag}")
+        }
+    }
 }
 
 /// FreeBSD jail names use dots as hierarchy separators. Atrium app
@@ -57,7 +96,7 @@ pub fn jail_name_from_app_id(app_id: &str) -> String {
 /// Build a JailConfig from a parsed manifest. Pure transformation;
 /// no I/O.
 pub fn build(manifest: &Manifest, opts: &BuildOpts) -> Result<JailConfig, BuildError> {
-    let jail_name = jail_name_from_app_id(&manifest.app.id);
+    let jail_name = jail_name_for_instance(&manifest.app.id, opts.instance.as_deref());
     let mut jc = JailConfig::new(jail_name, opts.root_path.clone());
 
     /* Defaults every Atrium jail wants. */
