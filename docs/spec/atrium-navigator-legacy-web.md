@@ -263,6 +263,24 @@ will serve a challenge page rather than content to any converter that does not e
 JavaScript at fetch time and present a browser's fingerprint.** It is not a conversion
 problem, it is an access problem, and it arrives before any of this spec's machinery runs.
 
+*The obvious confound was tested and ruled out.* The fetcher advertised a research
+user-agent, which could plausibly have CAUSED the challenges. Re-fetching five of the
+challenged URLs with a current Chrome user-agent returned a challenge every time, with zero
+words of content. So the trigger is not the UA string — it is TLS fingerprint, header
+shape, IP reputation, or headless detection, none of which a polite string fixes. The first
+corpus, fetched identically, was not challenged at all: the split is by site category, not
+by fetcher.
+
+**And this has an architectural consequence, not just an operational one.** The obvious
+workaround — fetch using the reader's own connection, session or address — would defeat the
+property that makes the CAS store worth having. A conversion is shared because it is
+anonymous and identical for everyone (§4, tessera-fs.md §20). A conversion that needed the
+reader's identity to be *obtained* could not be shared, so every reader would pay the full
+conversion cost and the dedup argument for this whole design would not apply to exactly the
+sites that are hardest to convert. **Challenged sites are therefore not merely harder; they
+are outside the economics of the architecture**, and that is a scope decision rather than
+an engineering task.
+
 *Caveat on the caveat:* these 67 were chosen adversarially rather than sampled, so their
 proportions are not the web's. What transfers is the direction — tier 2 does not rescue
 this population either — not the percentages.
@@ -1152,7 +1170,12 @@ Not because the risk is small, but because of where it sits:
    not needed for reading, but it is needed before anyone authors anything interactive.
 5. **Remote placement policy** — when, if ever, a remote engine jail is offered by default,
    given it reintroduces a third party who sees browsing.
-6. **Where the data-access boundary sits for hydrating pages** — §5.4.1 shows the reading
+6. **Whether challenged sites are in scope at all** — §5.4.1a: a third of commercial
+   fetches return a bot challenge to any plain HTTP GET, regardless of user-agent, and the
+   only known workaround (fetch as the reader) destroys the shareability that justifies the
+   CAS design. Deciding this is deciding how much of the commercial web the Navigator
+   claims to serve.
+7. **Where the data-access boundary sits for hydrating pages** — §5.4.1 shows the reading
    lane's remaining loss is cross-origin data a page needs to rebuild what it tore down,
    not engine fidelity. Relaxing it for same-site data would recover those documents and
    reintroduce a privacy cost; refusing it makes tier 1 the answer for that population.
