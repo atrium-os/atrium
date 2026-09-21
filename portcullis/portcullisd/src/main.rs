@@ -305,8 +305,8 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             Err(e) => return Err(e),
         };
         if let Request::ExecInstance { app_id, instance, tmpfs_mb } = req {
-            handle_exec_instance(app_id, instance, tmpfs_mb, &owner, &LIMITER,
-                                 &mut writer, &reader)?;
+            handle_exec_instance(app_id, instance, tmpfs_mb, &owner, &shared,
+                                 &LIMITER, &mut writer, &reader)?;
             continue;
         }
         if let Request::Launch { app_id, bypass_policy } = req {
@@ -411,11 +411,45 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
 /// `Demand::Required`: a worker pool launches continuously, so "unsigned is
 /// allowed while trust is unconfigured" would be a standing condition rather
 /// than a fresh machine's grace period.
+///
+/// ★★★ THE POLICY QUESTION, SETTLED: **no prompt, and no ungranted
+/// capability either.**
+///
+/// This lane skipped the policy gate entirely, which left the signature as
+/// the only check — so a signed manifest declaring `network = "full"` and
+/// `filesystem = ["~/Documents"]` would have received all of it, unasked, on
+/// a path built for workers that need nothing. Installing a signed app was
+/// therefore equivalent to granting it everything it declared, provided it
+/// was launched this way rather than the other.
+///
+/// The two obvious answers are both wrong:
+///
+///   - **Prompt, like `Launch`.** There is nobody to ask. A broker opens
+///     sixteen workers because sixteen pages are open; a tty prompt per
+///     worker is not a consent mechanism, it is a hang. And "non-tty gets a
+///     refusal" would mean the lane cannot work at all.
+///   - **Require the manifest to declare NO capabilities.** Tempting, since
+///     that is the case the lane was built for — but a rendering worker
+///     legitimately wants the font set, and a rule that forbids it forces
+///     every future worker back onto the application path it does not fit.
+///
+/// So: the delta is computed exactly as `Launch` computes it, and a non-empty
+/// one is a REFUSAL rather than a prompt, naming what must be granted first.
+/// A worker declaring nothing has an empty delta and runs with no setup at
+/// all — the common case stays frictionless — while a worker that wants
+/// something gets it only after a human has already said yes through
+/// `portcullis policy grant`.
+///
+/// ★ AND THERE IS NO `bypass_policy` HERE, deliberately. `Launch` has one for
+/// development (`--no-prompt`); on a path a program drives in a loop, a
+/// bypass flag is not a developer convenience but a permanent hole with a
+/// friendly name.
 fn handle_exec_instance(
     app_id:   String,
     instance: Option<String>,
     tmpfs_mb: u32,
     user:     &str,
+    shared:   &Mutex<Tenants>,
     limiter:  &Arc<Mutex<portcullisd::ratelimit::Limiter>>,
     writer:   &mut UnixStream,
     reader:   &BufReader<UnixStream>,
@@ -433,6 +467,52 @@ fn handle_exec_instance(
             });
         }
     };
+
+    /* ★ The capability gate, BEFORE the fd handshake for the same reason the
+     * rate limit is: a refusal that first makes the client hand over three
+     * descriptors has charged it for nothing.
+     *
+     * The signature is checked again inside portcullis_oneshot — this read is
+     * for the capabilities, and the gate there is the one that decides. */
+    let tree = std::path::PathBuf::from("/var/lib/atrium/apps").join(&app_id);
+    let text = match std::fs::read_to_string(tree.join("atrium.toml")) {
+        Ok(t) => t,
+        Err(e) => return write_response(writer, &Response::LaunchFailed {
+            stage: "manifest".into(), message: format!("read {}: {e}", tree.display()),
+        }),
+    };
+    let manifest = match portcullis_toml::Manifest::from_str(&text) {
+        Ok(m) => m,
+        Err(e) => return write_response(writer, &Response::LaunchFailed {
+            stage: "manifest".into(), message: format!("parse error: {e:?}"),
+        }),
+    };
+    let current_hash = hash_manifest(text.as_bytes());
+    let delta = {
+        let mut st = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let tp = match st.get_or_load(user) {
+            Ok(tp) => tp,
+            Err(e) => return write_response(writer, &Response::Error {
+                message: format!("policy load for {user}: {e}"),
+            }),
+        };
+        let prior = tp.policy.grants.get(&app_id);
+        compute_delta(&manifest.capabilities,
+                      prior.map(|g| &g.capabilities),
+                      prior.map(|g| g.manifest_hash.as_str()),
+                      &current_hash)
+    };
+    if !delta.is_empty() {
+        let why = format!(
+            "{} needs capabilities that are not granted: {}. \
+             There is nobody to prompt on this path — grant them first with \
+             `portcullis policy grant {}`, or launch it as an application.",
+            app_id, delta.describe().join("; "), app_id);
+        eprintln!("portcullisd: REFUSED {app_id} on the one-shot lane — {why}");
+        return write_response(writer, &Response::LaunchFailed {
+            stage: "policy".into(), message: why,
+        });
+    }
 
     write_response(writer, &Response::ReadyForFds)?;
 

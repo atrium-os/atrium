@@ -190,6 +190,35 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         teardown(&jail_path, &jail_name);
         return OneShot::Failed(e.to_string());
     }
+    // ★★ MOUNTPOINTS MUST EXIST BEFORE jail(8) RUNS — it does not create
+    // them. Without this a worker that legitimately declares a capability
+    // (a renderer wanting the font set, say) dies at mount time with
+    // `mount: …/home: No such file or directory`, and the whole argument for
+    // allowing capability-bearing workers on this lane collapses into
+    // "capability-less only, by accident of an unimplemented step".
+    //
+    // Dir-or-file is decided by stat'ing the SOURCE, as the application path
+    // does: a nullfs mount of a file onto a directory fails, and the reverse
+    // too.
+    for m in &jc.mounts {
+        if let Some(parent) = m.dst.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                teardown(&jail_path, &jail_name);
+                return OneShot::Failed(format!("mkdir {}: {e}", parent.display()));
+            }
+        }
+        let src_is_dir = std::fs::metadata(&m.src).map(|md| md.is_dir()).unwrap_or(false);
+        let made = if src_is_dir {
+            std::fs::create_dir_all(&m.dst)
+        } else if !m.dst.exists() {
+            std::fs::File::create(&m.dst).map(|_| ())
+        } else { Ok(()) };
+        if let Err(e) = made {
+            teardown(&jail_path, &jail_name);
+            return OneShot::Failed(format!("mountpoint {}: {e}", m.dst.display()));
+        }
+    }
+
     for dir in ["dev", user_home.trim_start_matches('/')] {
         if dir.is_empty() { continue }
         if let Err(e) = std::fs::create_dir_all(jail_path.join(dir)) {

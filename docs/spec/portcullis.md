@@ -1377,6 +1377,54 @@ backwards is one that can be widened by changing the time.
 | 40 concurrent requests, limit 32 | **exactly 8 refused**, per-user limit named |
 | after all of it | no jails, no mounts, daemon alive |
 
+### 6.5.2c The policy question for the one-shot lane, settled
+
+`ExecInstance` skipped the policy gate entirely, leaving the signature as the only check. So
+a signed manifest declaring `network = "full"` and `filesystem = ["~/Documents"]` would have
+received all of it, unasked, on a path built for workers that need nothing — installing a
+signed app was effectively granting it everything it declared, provided it was launched this
+way rather than the other.
+
+**Settled: no prompt, and no ungranted capability either.**
+
+Both obvious answers are wrong:
+
+- **Prompt, like `Launch`.** There is nobody to ask. A broker opens sixteen workers because
+  sixteen pages are open; a tty prompt per worker is not a consent mechanism, it is a hang.
+  And "non-tty gets a refusal" means the lane cannot work at all.
+- **Require the manifest to declare nothing.** Tempting — that is the case the lane was
+  built for — but a rendering worker legitimately wants the font set, and forbidding it
+  forces every future worker back onto the application path it does not fit.
+
+So the delta is computed exactly as `Launch` computes it, and a non-empty one is a
+**refusal** rather than a prompt, naming what must be granted and how. A worker declaring
+nothing has an empty delta and runs with **no setup at all**; a worker that wants something
+gets it only after a human has already said yes through `portcullis policy grant`.
+
+**There is no `bypass_policy` here, deliberately.** `Launch` has one for development
+(`--no-prompt`). On a path a program drives in a loop, a bypass flag is not a developer
+convenience but a permanent hole with a friendly name.
+
+The gate runs **before the fd handshake**, like the rate limit: a refusal that first makes
+the client hand over three descriptors has charged it for nothing.
+
+**This also exposed an unimplemented step.** Granting the capabilities got the greedy worker
+past policy and straight into `mount: …/home: No such file or directory` — the one-shot path
+never created mountpoints, which `jail(8)` does not do for itself. Without that fix the lane
+would have supported capability-bearing workers only in principle, and the argument for
+allowing them would have collapsed into "capability-less only, by accident of a missing
+step". Dir-or-file is decided by stat'ing the source, as the application path does.
+
+**Measured in the VM:**
+
+| | result |
+|---|---|
+| capability-less worker | runs, zero setup |
+| signed worker wanting network + `~/Documents` | **refused**, both capabilities named, with the grant command |
+| same worker after `policy grant` | runs |
+| after `policy revoke` | refused again |
+| the 98-document corpus | unaffected — 98/259/259 |
+
 ### 6.5.3 The trust gate: `require_signatures`
 
 Two findings surfaced while designing the worker lane. Neither was caused by it; both were
