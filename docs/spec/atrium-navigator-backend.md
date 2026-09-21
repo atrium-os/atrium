@@ -508,6 +508,41 @@ jail configuration (`/etc`, `/usr`, `/var`, `/home` absent; writes land in tmpfs
 the app tree untouched) — not by probing from the Navigator's own worker, which speaks only
 the frame protocol and cannot be asked what it sees.
 
+### 4.7b Fuzzing the hostile-input boundary
+
+§7 requires the validator to be "small, total, and fuzzed with reached-coverage reported".
+The harness lives in `tests/fuzz.rs` and is deterministic, seeded and dependency-free — in
+the spirit of `scripts/core-fuzz.sh`'s REPLAY half, since a fuzz run you cannot re-run is a
+story rather than a test. It runs in the ordinary suite.
+
+**It does not report how many inputs it tried. It reports what it REACHED, and fails if the
+set is short.** Every rejection the validator can emit and every note it can raise must have
+been produced by a generated input. This project has already been lied to by an execution
+count — 27.8M execs at coverage 2, a harness that never reached the code it was aimed at.
+
+That assertion is load-bearing in both directions: a variant the fuzzer never reaches is
+either dead code or a blind generator, and a variant that *stops* being reachable after a
+refactor fails here instead of silently narrowing coverage.
+
+**It caught its own generator twice, which is the point:**
+
+- `NotAnObject` was never produced. Every seed is a JSON object, and byte-level mutation
+  essentially never turns one into a valid non-object. Not dead code — a blind generator.
+  Fixed with whole-value replacement.
+- `TransitionsTruncated` was never raised, because mutation cannot build 4,097 well-formed
+  transitions. Fixed by constructing an oversized table. The honest response to an
+  unreachable assertion is to teach the generator, not to stop asking.
+- And only 9 transitions ever applied, because the effect-rich seed legitimately fails
+  (it removes a node and then operates on it, and apply is all-or-nothing), so the undo path
+  was barely entered. A seed that cleanly applies took it to 462.
+
+Under test: `ingest` (untrusted JSON), `Document::accept` (untrusted HTML), `applied` and the
+undo path (untrusted effects), and `wire::read_frame` — whose length prefix is written by a
+worker that is jailed precisely because it may be compromised.
+
+**The harness itself is verified**: a panic planted in `ingest` is caught at round 11 and the
+input printed, so a finding becomes a regression test rather than a rerun.
+
 ### 4.5 Recording format version 2
 
 `atrium-navigator-recording/2` adds one field: an insert's `index`, the position the markup
