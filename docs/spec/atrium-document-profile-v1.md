@@ -539,9 +539,48 @@ where web documents are extreme; element count and byte size are.
 *The lesson is not that the measurement was sloppy — it was labelled honestly. It is that a
 number carrying a caveat should not be fed to a rule that does not carry it.*
 
-**Still no corpus signal** for stylesheet size and count (this corpus's CSS is external and
-was not fetched), grid track counts, `calc()` nesting or custom-property depth. Those
-remain marked *reasoned*.
+#### The stylesheet ceilings, measured — and one of them refused real documents
+
+The CSS was external and unfetched when these ceilings were set, so all three were
+*reasoned*. It has now been fetched: every `<style>` block and every `<link
+rel=stylesheet>` across both corpora, 968 stylesheets over 157 documents that have any.
+
+| measure | p50 | p95 | p99 | max | old ceiling | verdict |
+|---|---|---|---|---|---|---|
+| stylesheets per document | 3 | 33 | 43 | 52 | 16 | **below p95 — refuses real documents** |
+| bytes per stylesheet | 1,833 | 243,985 | 764,380 | 6,821,866 | 1 MiB | 1.4× p99, outside the rule |
+| rules per stylesheet | 14 | 2,114 | 5,588 | 91,965 | 16,384 | 2.9× p99, outside the rule |
+
+★★★ **`16` stylesheets per document was not merely tight, it was below the 95th
+percentile.** A conforming-document ceiling that refuses the median-plus-one-sigma of the
+real web is not a bound, it is a bug: it would have rejected a large minority of ordinary
+pages on a measure nobody had looked at. Reasoned ceilings are guesses, and this is what a
+guess looks like when it is wrong by an order of magnitude in the *tight* direction — the
+direction the derivation rule exists to prevent, and the one that does not announce itself
+because nothing crashes.
+
+Applying the rule to the measurements gives 256, 4 MiB and 32,768, all at 5.5–6.0×
+headroom — back inside the 5–6× band every measured ceiling sits in.
+
+★★ **And the three together need a fourth, or they are not a bound at all.** 256
+stylesheets of 4 MiB each is a gigabyte, which is exactly the decompression-bomb shape G3
+exists to refuse — the individual ceilings look reasonable and their product does not. This
+is the same structure the image ceilings already use, where per-image dimensions are a cheap
+early reject and **total decoded bytes** is the constraint that actually binds. Measured
+across the same 157 documents, total stylesheet bytes are p50 92 KiB, p95 1.02 MiB, p99
+1.82 MiB, max 6.64 MiB; the rule gives **16 MiB**, and no document in either corpus comes
+close. The per-sheet and per-document counts stay as cheap early rejects.
+
+*Caveats, because these are now normative.* Rule counting is approximate: it counts
+declaration blocks, so an `@media` wrapper contributes its inner blocks rather than itself,
+which is the count a rule budget cares about but not a parse. At most ten linked
+stylesheets per document were fetched, so per-sheet statistics under-sample the documents
+with the most; the per-document COUNT is taken from the markup and is exact. Unreachable
+stylesheets were skipped, which biases the sample toward CSS that still serves.
+
+**Still no corpus signal** for `@import` depth, grid track counts, `calc()` nesting or
+custom-property depth. Those remain marked *reasoned* — and on this evidence, "reasoned"
+should be read as "unvalidated", not as "conservative".
 
 #### The ceilings
 
@@ -550,10 +589,11 @@ remain marked *reasoned*.
 | total document bytes | **8 MiB** | 5.4× the 1.57 MiB p99 (n=104) |
 | elements per document | **131,072** | 5.1× the 25,527 p99 (n=104), 2^17 |
 | tree depth | **256** | 7.3× the 35 p99 (n=104, n=67), 2^8 — see the correction below |
-| stylesheets per document | **16** | reasoned — no corpus signal |
-| `@import` depth | **4** | reasoned |
-| bytes per stylesheet | **1 MiB** | reasoned — this corpus's CSS is external, not fetched |
-| rules per stylesheet | **16,384** | reasoned — as above |
+| stylesheets per document | **256** | 6.0× the 43 p99 (n=157 docs), 2^8 — was 16, which REFUSED real documents |
+| `@import` depth | **4** | reasoned — still no corpus signal |
+| bytes per stylesheet | **4 MiB** | 5.5× the 746 KiB p99 (n=968 sheets), 2^22 |
+| rules per stylesheet | **32,768** | 5.9× the 5,588 p99 (n=968 sheets), 2^15 |
+| **total stylesheet bytes** | **16 MiB** | the binding constraint (below); 8.8× the 1.82 MiB p99 |
 | `calc()` nesting depth | **16** | reasoned — hand-written `calc()` rarely exceeds 3 |
 | custom-property substitution depth | **16** | reasoned; cycles are a diagnostic regardless |
 | grid tracks per axis (incl. `repeat()` expansion) | **1,024** | reasoned — no corpus signal |
