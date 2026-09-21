@@ -1,6 +1,7 @@
 pub mod artifact;
 pub mod dom;
 pub mod parse;
+pub mod profile;
 pub mod engine;
 pub mod boa_impl;
 pub mod fetch;
@@ -31,6 +32,8 @@ pub struct Conversion {
     /// ★ Set when the ORIGIN refused rather than served: a challenge page,
     /// not the site. `None` for an ordinary document.
     pub origin_refusal: Option<&'static str>,
+    /// Document Profile v1 ceilings this document exceeds, if any.
+    pub profile_violations: Vec<profile::Violation>,
     /// Removals refused by protected-subtree execution (experiment).
     pub removals_refused: u32,
     /// ★ What the page DOES when acted on, learned by running its JS as an
@@ -117,6 +120,10 @@ pub fn convert_with_opts(
     let text_before = dom.visible_text(dom.root()).split_whitespace()
         .map(str::len).sum::<usize>();
     let html_tier1 = dom.serialize();
+    // ★ Checked on the PARSED document, before scripts run. A profile
+    // violation is a property of what was served, not of what our conversion
+    // made of it.
+    let profile_violations = profile::check(&dom, html.len());
     let origin_refusal = detect_origin_refusal(&dom);
     // ★ Always recorded, because ANCHORING needs it too: a transition is
     // replayable against tier 1 only if its trigger came from the parser.
@@ -224,6 +231,7 @@ pub fn convert_with_opts(
         elements_before: before,
         text_before,
         origin_refusal,
+        profile_violations,
         text_after: dom.visible_text(dom.root()).split_whitespace()
             .map(str::len).sum::<usize>(),
         removals_refused: dom.removals_refused,

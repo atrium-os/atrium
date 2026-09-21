@@ -118,6 +118,9 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
         let (_, d) = navigator_prerender::TierPolicy::default().artifact(&c);
         println!("Y\t{:?}\t{}", d.tier, d.reason);
         println!("Q\t{}", c.origin_refusal.unwrap_or(""));
+        for v in &c.profile_violations {
+            println!("V2\t{}\t{}\t{}", v.ceiling, v.measured, v.allowed);
+        }
     }
     println!("T\t{}\t{}", c.timers_fired, c.timers_dropped);
     println!("P\t{}\t{}\t{}\t{}", c.page_fetches, c.page_fetch_failures,
@@ -209,6 +212,7 @@ fn main() {
     let mut gains: Vec<(i64, String)> = vec![];
     let mut demoted: Vec<String> = vec![];
     let mut refused: Vec<String> = vec![];
+    let mut viol: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut empty: Vec<String> = vec![];
     let (mut inter, mut trans, mut anch, mut trans_docs) = (0u32, 0u32, 0u32, 0usize);
     let (mut attr_only, mut trunc) = (0u32, 0u32);
@@ -313,6 +317,9 @@ fn main() {
             // but only one is the origin saying no — and claiming to know
             // which would be inventing a diagnosis.
             empty.push(name.clone());
+        }
+        for (ceiling, m, a) in &c.violations {
+            viol.entry(ceiling.clone()).or_default().push(format!("{name} ({m} > {a})"));
         }
         elems.push(c.elements_after);
         inter += c.interactive_found; trans += c.transitions; anch += c.transitions_anchored;
@@ -424,6 +431,15 @@ fn main() {
         // A document that LOSES text is the dangerous case: the converter ran
         // and made the artifact worse than not converting at all.
         for (d, n) in shrank.iter().take(5) { println!("     LOST  {d:+8}  {n}"); }
+    }
+    if !viol.is_empty() {
+        let n: usize = viol.values().map(|v| v.len()).sum();
+        println!("DOCUMENT PROFILE v1 — {n} ceiling violations");
+        println!("  the profile calls these normative and checked; now something checks them");
+        for (ceiling, docs) in &viol {
+            println!("   {ceiling}: {} docs", docs.len());
+            for d in docs.iter().take(2) { println!("      {d}"); }
+        }
     }
     if !refused.is_empty() {
         println!("REFUSED BY ORIGIN (a challenge page is not the site — spec §5.4.1b)");
@@ -586,6 +602,7 @@ pub struct Child {
     pub transitions_attr_only: u32,
     pub transitions_truncated: u32,
     pub origin_refusal: String,
+    pub violations: Vec<(String, usize, usize)>,
     pub tier: String,
     pub tier_reason: String,
     pub cause: Option<(String, String)>,
@@ -611,7 +628,8 @@ fn parse_child(s: &str) -> Option<Child> {
         removals_refused: 0,
         interactive_found: 0, transitions: 0, transitions_anchored: 0,
         transitions_attr_only: 0, transitions_truncated: 0,
-        origin_refusal: String::new(), tier: String::new(), tier_reason: String::new(),
+        origin_refusal: String::new(), violations: vec![],
+        tier: String::new(), tier_reason: String::new(),
         cause: None,
         timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0,
         page_blocked: 0, beacons: 0, blocked_hosts: vec![] };
@@ -644,6 +662,8 @@ fn parse_child(s: &str) -> Option<Child> {
                 c.transitions_truncated = f[5].parse().unwrap_or(0);
             }
             Some(&"Q") if f.len() >= 2 => c.origin_refusal = f[1].to_string(),
+            Some(&"V2") if f.len() >= 4 => c.violations.push((f[1].to_string(),
+                f[2].parse().unwrap_or(0), f[3].parse().unwrap_or(0))),
             Some(&"Y") if f.len() >= 3 => {
                 c.tier = f[1].to_string();
                 c.tier_reason = f[2].to_string();
