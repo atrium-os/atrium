@@ -266,6 +266,104 @@ fn handles_to_array(hs: Vec<Handle>, ctx: &mut Context) -> JsResult<JsValue> {
     Ok(JsValue::from(arr))
 }
 
+/// ★ A LIST OF NODES MUST NOT SAY "[object Array]".
+///
+/// Libraries validate their input with
+/// `toString.call(x) === "[object NodeList]" || "[object HTMLCollection]"`
+/// and THROW when it matches neither — "String, HTMLElement, HTMLCollection,
+/// or NodeList" is a real message in the corpus. Our plain arrays were being
+/// rejected by exactly that check.
+///
+/// The list keeps Array's own methods, because NodeList.prototype is built
+/// on Array.prototype: reparenting gives the right tag and satisfies
+/// `NodeList.prototype.isPrototypeOf(list)` without taking forEach away.
+///
+/// Recorded divergence: `Array.isArray` still answers true, where a browser
+/// says false. That is an internal slot, not reachable from here, and no
+/// corpus site tests it.
+fn tag_list(v: JsValue, name: &str, ctx: &mut Context) -> JsValue {
+    let proto = ctx.global_object()
+        .get(js_string!(name.to_string()), ctx).ok()
+        .and_then(|c| c.as_object().and_then(|o| o.get(js_string!("prototype"), ctx).ok()))
+        .and_then(|p| p.as_object().map(|o| o.clone()));
+    if let (Some(o), Some(p)) = (v.as_object(), proto) {
+        o.set_prototype(Some(p));
+    }
+    v
+}
+
+fn node_list(hs: Vec<Handle>, ctx: &mut Context) -> JsResult<JsValue> {
+    let v = handles_to_array(hs, ctx)?;
+    Ok(tag_list(v, "NodeList", ctx))
+}
+
+fn html_collection(hs: Vec<Handle>, ctx: &mut Context) -> JsResult<JsValue> {
+    let v = handles_to_array(hs, ctx)?;
+    Ok(tag_list(v, "HTMLCollection", ctx))
+}
+
+/// `document.createElementNS(namespace, qualifiedName)`.
+///
+/// ★ The name keeps its CASE. SVG and MathML have camelCase element names —
+/// linearGradient, clipPath, foreignObject — where HTML parsing lowercases
+/// everything. Lowercasing here would produce elements no SVG renderer
+/// recognises, in a document the converter then serializes.
+fn create_element_ns(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let ns = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    let name = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
+    let h = with(|d| d.create(Kind::Element(name)));
+    let v = node_obj(h, ctx);
+    if let Some(o) = v.as_object() {
+        let desc = boa_engine::property::PropertyDescriptor::builder()
+            .value(js_string!(ns)).writable(false).enumerable(true).configurable(true).build();
+        let _ = o.define_property_or_throw(js_string!("namespaceURI"), desc, ctx);
+    }
+    Ok(v)
+}
+
+/// `element.value` — what a form control currently holds.
+///
+/// ★ Recorded divergence, and a deliberate one: a browser keeps the assigned
+/// value as separate "dirty" state and does NOT write the attribute, so its
+/// own serialization loses it. This converter WRITES THE ATTRIBUTE, because
+/// the artifact is what a reader sees and a field a script filled in should
+/// still be filled in when they read it.
+fn value_get(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(t, ctx) else { return Ok(JsValue::from(js_string!(""))) };
+    let tag = with(|d| d.tag(h).map(|t| t.to_ascii_lowercase())).unwrap_or_default();
+    let out = match tag.as_str() {
+        // A textarea's value is its CONTENT, not an attribute.
+        "textarea" => with(|d| d.text_content(h)),
+        "select" => with(|d| {
+            // The selected option, or the first — what a browser reports for
+            // a select nobody has touched.
+            let opts: Vec<Handle> = d.by_tag("option").into_iter()
+                .filter(|&o| d.contains(h, o)).collect();
+            let chosen = opts.iter().find(|&&o| d.attr(o, "selected").is_some())
+                .or_else(|| opts.first()).copied();
+            chosen.map(|o| d.attr(o, "value").map(str::to_string)
+                            .unwrap_or_else(|| d.text_content(o)))
+                  .unwrap_or_default()
+        }),
+        _ => with(|d| d.attr(h, "value").unwrap_or("").to_string()),
+    };
+    Ok(JsValue::from(js_string!(out)))
+}
+
+fn value_set(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(t, ctx) else { return Ok(JsValue::undefined()) };
+    let v = a.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    let tag = with(|d| d.tag(h).map(|t| t.to_ascii_lowercase())).unwrap_or_default();
+    if tag == "textarea" {
+        with(|d| { d.set_text(h, &v); d.script_mutations += 1 });
+        record_mutation("characterData", h, "");
+    } else {
+        with(|d| { d.set_attr(h, "value", &v); d.script_mutations += 1 });
+        record_mutation("attributes", h, "value");
+    }
+    Ok(JsValue::undefined())
+}
+
 fn opt_node(h: Option<Handle>, ctx: &mut Context) -> JsResult<JsValue> {
     Ok(match h { Some(h) => node_obj(h, ctx), None => JsValue::null() })
 }
@@ -283,11 +381,11 @@ fn n_parent_element(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<
 }
 fn n_child_nodes(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let h = this_h(t, ctx).unwrap_or(0);
-    handles_to_array(with(|d| d.children_of(h)), ctx)
+    node_list(with(|d| d.children_of(h)), ctx)
 }
 fn n_children(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let h = this_h(t, ctx).unwrap_or(0);
-    handles_to_array(with(|d| d.element_children(h)), ctx)
+    html_collection(with(|d| d.element_children(h)), ctx)
 }
 fn n_first_child(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let h = this_h(t, ctx); opt_node(h.and_then(|h| with(|d| d.first_child(h))), ctx)
@@ -791,7 +889,7 @@ fn create_comment(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult
 
 /// `document.scripts` — live, because scripts add scripts.
 fn doc_scripts(_t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    handles_to_array(with(|d| d.by_tag("script")), ctx)
+    html_collection(with(|d| d.by_tag("script")), ctx)
 }
 
 /// `document.defaultView` — the window, which here IS the global object.
@@ -990,6 +1088,10 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
         let tag = with(|d| d.tag(h).map(|t| t.to_ascii_lowercase())).unwrap_or_default();
         // `rel` belongs to the elements that have one; elsewhere its absence
         // is the honest answer and the report will say so if a page wants it.
+        if matches!(tag.as_str(), "input" | "textarea" | "select" | "option" | "button"
+                                 | "progress" | "meter" | "param" | "li" | "data") {
+            live_get_set(&o, "value", value_get, value_set, ctx);
+        }
         if matches!(tag.as_str(), "link" | "a" | "area" | "form") {
             live_get_set(&o, "rel", rel_get, rel_set, ctx);
         }
@@ -1926,9 +2028,23 @@ fn run_query(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Ve
 
 fn query_all(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let hs = run_query(this, args, ctx)?;
-    let arr = boa_engine::object::builtins::JsArray::new(ctx)?;
-    for h in hs { let n = node_obj(h, ctx); arr.push(n, ctx)?; }
-    Ok(JsValue::from(arr))
+    node_list(hs, ctx)
+}
+
+/// getElementsBy* return an HTMLCollection where querySelectorAll returns a
+/// NodeList, and libraries test for the two by name.
+fn by_class(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let name = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    let sel: String = name.split_whitespace().map(|c| format!(".{c}")).collect();
+    let hs = run_query(this, &[JsValue::from(js_string!(sel))], ctx)?;
+    html_collection(hs, ctx)
+}
+
+fn by_tag_name(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let name = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    let sel = if name == "*" { "*".to_string() } else { name };
+    let hs = run_query(this, &[JsValue::from(js_string!(sel))], ctx)?;
+    html_collection(hs, ctx)
 }
 
 fn query_first(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -1948,18 +2064,6 @@ fn query_first(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
             JsValue::null()
         }
     })
-}
-
-fn by_class(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let name = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-    let sel: String = name.split_whitespace().map(|c| format!(".{c}")).collect();
-    query_all(this, &[JsValue::from(js_string!(sel))], ctx)
-}
-
-fn by_tag_name(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let name = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-    let sel = if name == "*" { "*".to_string() } else { name };
-    query_all(this, &[JsValue::from(js_string!(sel))], ctx)
 }
 
 /// ★ A converter must not be hangable by the content it converts, and Boa's
@@ -2807,6 +2911,39 @@ const GLOBALS: &str = r#"
   __defIface('HTMLImageElement', function HTMLImageElement() {}, 1);
   __defIface('DocumentFragment', function DocumentFragment() {}, 11);
 
+  // ★ Node LISTS need real identities too. Libraries validate input with
+  // `toString.call(x) === "[object NodeList]"` and throw otherwise, and some
+  // use `NodeList.prototype.isPrototypeOf(x)`. Both prototypes are built on
+  // Array.prototype so the lists keep forEach, map and iteration.
+  function __listType(name) {
+    function T() {}
+    T.prototype = Object.create(Array.prototype);
+    try {
+      Object.defineProperty(T.prototype, Symbol.toStringTag,
+        { value: name, configurable: true });
+    } catch (e) {}
+    T.prototype.item = function (i) { return this[i] === undefined ? null : this[i]; };
+    globalThis[name] = T;
+  }
+  __listType('NodeList');
+  __listType('HTMLCollection');
+
+  // `new Image(w, h)` is an <img>. Note it never FETCHES here: the corpus
+  // uses it almost entirely as a tracking pixel (`new Image(1,1); img.src =
+  // beacon`), and this converter loads no images, so the request simply does
+  // not happen — the same outcome the network policy reaches deliberately.
+  globalThis.Image = function Image(w, h) {
+    var el = document.createElement('img');
+    if (w !== undefined) el.setAttribute('width', String(w));
+    if (h !== undefined) el.setAttribute('height', String(h));
+    return el;
+  };
+  globalThis.Audio = function Audio(src) {
+    var el = document.createElement('audio');
+    if (src !== undefined) el.setAttribute('src', String(src));
+    return el;
+  };
+
   // An element is upgraded only once it is CONNECTED, as the spec says —
   // connectedCallback that fires on a detached node would be a lie about
   // where the element is. Reachability is a question the tree can now answer.
@@ -3121,6 +3258,7 @@ impl ScriptEngine for BoaEngine {
             .function(NativeFunction::from_fn_ptr(create_text_node), js_string!("createTextNode"), 1)
             .function(NativeFunction::from_fn_ptr(create_fragment), js_string!("createDocumentFragment"), 0)
             .function(NativeFunction::from_fn_ptr(create_comment), js_string!("createComment"), 1)
+            .function(NativeFunction::from_fn_ptr(create_element_ns), js_string!("createElementNS"), 2)
             // ★ THE DOCUMENT REPORTS ITSELF AS VISIBLE. There is no viewport
             // here, so neither answer is observed fact — but the two are not
             // symmetric. A page told it is hidden DEFERS exactly the work a
