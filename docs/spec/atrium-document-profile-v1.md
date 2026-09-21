@@ -614,15 +614,32 @@ engine expands — so the static p99 is the wrong basis and 1,024 stands on the 
 argument. **A ceiling whose input is not in the document cannot be derived from a corpus of
 documents**, and that is now stated rather than left as "no corpus signal".
 
-`@import` depth remains genuinely unmeasured: only 17 of 400 sheets use `@import` at all,
-and measuring nesting DEPTH means resolving each chain, which this pass did not do.
-Prevalence is now known; depth is not.
+`@import` depth is now measured: the chains were resolved by fetching each imported sheet,
+and **maximum depth is 2** across the 20 documents that use `@import` at all (p95 is 1). The
+reasoned ceiling of 4 stands at 2× the observed maximum.
 
-★★ **The font ceilings need a total, for the same reason the stylesheet ceilings did.** 512
-faces of 8 MiB each is 4 GiB. This corpus cannot supply the number — only a sample of font
-files was fetched, so per-document totals are not trustworthy — so **64 MiB is reasoned and
-flagged as the one gap left**, rather than given a measured-looking value it has not
-earned.
+★★★ **The font ceilings need a total — and it CANNOT be a document ceiling, which took a
+measurement to discover.** 512 faces of 8 MiB is 4 GiB, so by the stylesheet argument a
+total is required. A draft of this section proposed 64 MiB. Measuring it refuted the
+proposal: declared font bytes are p50 298 KiB, p95 1.27 MiB, but **p99 77 MiB and max 270
+MiB** — the maximum being ruby-lang.org, which declares 57 faces of full Japanese coverage.
+A 64 MiB ceiling would have refused an ordinary language-project homepage, which is exactly
+the failure this section diagnosed two ceilings earlier.
+
+The reason the stylesheet argument does not transfer: **`@font-face` is a CONDITIONAL
+declaration and a `<link rel=stylesheet>` is not.** Every declared stylesheet is fetched;
+declared faces are fetched only when some element actually uses that family, weight and
+style — and, where `unicode-range` is present (19 of 70 documents here), only for the
+subsets the text needs. The declared sum bounds nothing a reader will ever download.
+
+So total font bytes is **not a document property** and no corpus of documents can derive it.
+It belongs where the fetching happens: a render-time budget on fonts actually requested,
+enforced by whatever does the requesting. This converter requests none at all. Recorded as a
+non-ceiling rather than left as an unfilled gap, because the gap was the wrong shape.
+
+This is the second measure in this section — with grid tracks — whose bound is set by
+something outside the document. The derivation rule assumes the document contains what is
+being bounded, and twice it does not.
 
 #### The ceilings
 
@@ -632,7 +649,7 @@ earned.
 | elements per document | **131,072** | 5.1× the 25,527 p99 (n=104), 2^17 |
 | tree depth | **256** | 7.3× the 35 p99 (n=104, n=67), 2^8 — see the correction below |
 | stylesheets per document | **256** | 6.0× the 43 p99 (n=157 docs), 2^8 — was 16, which REFUSED real documents |
-| `@import` depth | **4** | reasoned — `@import` is used by 17 of 400 sheets; DEPTH needs chain resolution |
+| `@import` depth | **4** | validated: chains resolved, max depth 2 (n=20 docs that use it) |
 | bytes per stylesheet | **4 MiB** | 5.5× the 746 KiB p99 (n=968 sheets), 2^22 |
 | rules per stylesheet | **32,768** | 5.9× the 5,588 p99 (n=968 sheets), 2^15 |
 | **total stylesheet bytes** | **16 MiB** | the binding constraint (below); 8.8× the 1.82 MiB p99 |
@@ -646,7 +663,7 @@ earned.
 | fixed element block size | **1/3 of viewport** | reasoned — see §3.3 |
 | bytes per web font | **8 MiB** | validated: max observed 6.17 MiB (n=220). A full CJK face fits, as reasoned |
 | declared `@font-face` per document | **512** | 6.0× the 85 p99 (n=84 docs) — was 8, BELOW THE MEDIAN of 9 |
-| **total web font bytes** | **64 MiB** | reasoned — the binding constraint, and the one gap this corpus cannot fill |
+| **total web font bytes** | **not a document ceiling** | see below — declared bytes bound nothing; the budget belongs at render time |
 | glyphs per font | **65,536** | the format's own `numGlyphs` limit |
 | characters per paragraph (total-fit input) | **65,536** | bounds the one superlinear layout step |
 | total-fit active nodes | **4,096** | reasoned — standard pruning keeps this far lower |
@@ -828,6 +845,7 @@ property browsers can only approximate into a hard, mechanically checkable asser
    **Resolved** — the CSS was fetched (968 stylesheets over 171 documents) and it does
    exercise grids, `calc()` and custom properties, contrary to the assumption here. Three
    ceilings were corrected, two validated, and two remain genuinely unmeasured:
-   `@import` DEPTH (prevalence now known: 17 of 400 sheets) and total web font bytes.
-   Grid tracks are a third kind — bounded by viewport expansion rather than by anything in
-   the document, so no corpus of documents can derive them.
+   `position: fixed` element counts and the total-fit node budget. `@import` depth is now
+   measured (max 2). Grid tracks and total font bytes are a third kind — bounded by the
+   viewport and by what a renderer chooses to fetch, neither of which is in the document,
+   so no corpus of documents can derive them.
