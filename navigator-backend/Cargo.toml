@@ -1,0 +1,14 @@
+[package]
+name = "navigator-backend"
+version = "0.1.0"
+edition = "2021"
+description = "Consumes atrium-navigator-recording/1: the converter's output, ingested as UNTRUSTED input (docs/spec/atrium-navigator-backend.md §4.0, §4.2)."
+
+[dependencies]
+# ★ A mature parser rather than a hand-written one, deliberately. The emitter
+# in navigator-prerender is hand-written because field ORDER must be fixed for
+# content-addressing; a parser has no such requirement and every reason to be
+# something already attacked by other people. This input is untrusted by rule
+# (spec §4.2), including when it comes from our own converter — a recording
+# arrives from a shared store, and the store does not vouch for it.
+serde_json = "1"
