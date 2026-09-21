@@ -626,13 +626,74 @@ pub fn devfs_mount(_t: &str, _r: u32) -> io::Result<()> {
 /// Drop privileges to (gid, uid) in the calling process.
 /// Order matters: setgid before setuid.
 pub fn drop_privileges(uid: u32, gid: u32) -> io::Result<()> {
-    // SAFETY: setgid/setuid are leaf syscalls with no memory.
+    // ★★★ `setgroups` FIRST — IT WAS MISSING, AND THIS IS THE TCB.
+    //
+    // jaild runs as root, whose supplementary groups are wheel(0) and
+    // operator(5). `setgid` + `setuid` change the real/effective ids and leave
+    // the supplementary list exactly as it was, so every process jaild ever
+    // exec'd into a jail — every "dropped" service at uid 1001 or 50090 —
+    // still carried wheel and operator. On FreeBSD `operator` owns the raw
+    // disk devices; `wheel` gates su and a long tail of files. The
+    // uid/gid fields looked dropped and the credential was not.
+    //
+    // Order is load-bearing: setgroups needs privilege, so it must precede
+    // setuid, and setgid must too. The list is exactly {gid} — correct under
+    // both the historical semantics (groups[0] is the egid) and FreeBSD 15+'s
+    // (setgroups no longer touches the egid).
+    //
+    // SAFETY: leaf syscalls; the groups array outlives the call.
     unsafe {
+        let groups = [gid as libc::gid_t];
+        if libc::setgroups(1, groups.as_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
         if libc::setgid(gid) != 0 {
             return Err(io::Error::last_os_error());
         }
         if libc::setuid(uid) != 0 {
             return Err(io::Error::last_os_error());
+        }
+    }
+    verify_dropped(uid, gid)
+}
+
+/// ★★ A PRIVILEGE DROP THAT DOES NOT CHECK ITSELF IS A PRIVILEGE DROP THAT
+/// CAN BE WRONG FOREVER. The bug above survived precisely because nothing
+/// looked at the result: the ids were right, so everything downstream
+/// assumed the credential was.
+///
+/// So the drop is verified from the inside, and a failure is FATAL to the
+/// exec — the child exits rather than running with anything left over. That
+/// makes the check permanent defence, not a one-time audit: a future edit
+/// that reorders these calls, or a platform whose setgroups behaves
+/// differently, fails loudly at the first launch instead of silently at the
+/// first compromise.
+pub fn verify_dropped(uid: u32, gid: u32) -> io::Result<()> {
+    let bad = |why: String| Err(io::Error::new(io::ErrorKind::PermissionDenied,
+        format!("privilege drop incomplete: {why}")));
+    // SAFETY: getters with no side effects; the buffer is sized by the kernel's
+    // own answer to the first call.
+    unsafe {
+        let (ru, eu) = (libc::getuid(), libc::geteuid());
+        let (rg, eg) = (libc::getgid(), libc::getegid());
+        if ru != uid || eu != uid { return bad(format!("uid real={ru} effective={eu}, want {uid}")) }
+        if rg != gid || eg != gid { return bad(format!("gid real={rg} effective={eg}, want {gid}")) }
+
+        let n = libc::getgroups(0, std::ptr::null_mut());
+        if n < 0 { return Err(io::Error::last_os_error()) }
+        let mut buf = vec![0 as libc::gid_t; n as usize];
+        let n = libc::getgroups(n, buf.as_mut_ptr());
+        if n < 0 { return Err(io::Error::last_os_error()) }
+        let extra: Vec<u32> = buf[..n as usize].iter().map(|&g| g as u32)
+            .filter(|&g| g != gid).collect();
+        if !extra.is_empty() {
+            return bad(format!("supplementary groups {extra:?} survived (want only {gid})"));
+        }
+
+        // And root must not be regainable. If this succeeds, something above
+        // left a saved-set id behind, and the whole drop was theatre.
+        if uid != 0 && libc::setuid(0) == 0 {
+            return bad("setuid(0) succeeded after the drop".into());
         }
     }
     Ok(())
@@ -995,3 +1056,41 @@ fn is_safe_cidr(s: &str) -> bool {
         && s.matches('/').count() <= 1
 }
 
+
+#[cfg(test)]
+mod privilege_drop_tests {
+    use super::*;
+
+    /// ★ The self-check must DETECT leftover supplementary groups — the exact
+    /// residue the missing `setgroups` left behind (wheel and operator, measured
+    /// on the VM). Exercised here without root by asking it to verify the test
+    /// process's own credential: a normal user belongs to several groups, so
+    /// the check must refuse. If this process happens to hold only its primary
+    /// group, there is nothing to detect and the test says so rather than
+    /// passing vacuously.
+    #[test]
+    fn the_self_check_refuses_a_credential_with_extra_groups() {
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        let mut buf = vec![0 as libc::gid_t; n.max(0) as usize];
+        let n = unsafe { libc::getgroups(n, buf.as_mut_ptr()) };
+        let extra = buf[..n.max(0) as usize].iter().filter(|&&g| g != gid).count();
+        if extra == 0 {
+            eprintln!("SKIPPED: this process holds only its primary group; nothing to detect");
+            return;
+        }
+        let err = verify_dropped(uid, gid).expect_err(
+            "a credential carrying extra supplementary groups must be refused");
+        assert!(err.to_string().contains("supplementary groups"), "{err}");
+    }
+
+    /// And it must refuse a uid that does not match — the check is not only
+    /// about groups.
+    #[test]
+    fn the_self_check_refuses_a_wrong_uid() {
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let err = verify_dropped(uid.wrapping_add(1), gid)
+            .expect_err("a mismatched uid must be refused");
+        assert!(err.to_string().contains("uid"), "{err}");
+    }
+}

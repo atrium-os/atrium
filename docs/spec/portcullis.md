@@ -1776,6 +1776,50 @@ Concretely:
   manifest's content hash. Any change forces a re-prompt — apps
   can't silently expand their permissions across upgrades.
 
+### 9.1a jaild's privilege drop kept root's supplementary groups — FIXED
+
+**Found:** `ffi::drop_privileges` called `setgid` then `setuid` and **never `setgroups`**.
+jaild runs as root, whose supplementary groups are `wheel`(0) and `operator`(5), and
+`setgid`/`setuid` change the real and effective ids while leaving the supplementary list
+exactly as it was. So every process jaild ever exec'd into a jail — every "dropped" service
+at uid 1001 or 50090 — still carried wheel and operator. On FreeBSD `operator` owns the raw
+disk devices and `wheel` gates `su` and a long tail of files. The uid and gid fields looked
+dropped; the credential was not. Surfaced while mapping jaild for the one-shot lane, not by
+any test — nothing in the tree ever looked at a child's groups.
+
+**Proven live, not inferred**, by an A/B on the VM with two isolated jaild instances on
+their own sockets (the installed daemon untouched), each exec'ing into a jail as 1001:1001:
+
+| jaild | child's own verdict |
+|---|---|
+| self-check, **without** `setgroups` | `supplementary groups [0, 5] survived (want only 1001)` |
+| self-check, **with** `setgroups` | drop passed; proceeds to `execve` |
+
+**Fixed:** `setgroups(1, [gid])` first — it needs privilege, so it must precede `setuid`,
+and the list `{gid}` is correct under both the historical semantics and FreeBSD 15+'s where
+`setgroups` no longer touches the egid.
+
+**And the drop now verifies itself, fatally.** `verify_dropped` checks real and effective
+uid and gid, that no supplementary group other than the target survived, and that
+`setuid(0)` fails afterwards. A failure exits the child rather than letting it run with
+anything left over. The bug survived precisely because nothing looked at the result, so the
+check is permanent defence rather than a one-time audit: a future edit that reorders the
+calls, or a platform whose `setgroups` behaves differently, fails loudly at the first launch
+instead of silently at the first compromise.
+
+Deployed to the dev VM's installed jaild and re-verified through the real socket.
+
+**Two harness defects found on the way.** `atrium-portcullisd-jclient` closed the procdesc
+the instant it arrived, and because jaild pdforks without `PD_DAEMON` that *kills the child*
+— so nothing about a child launched through it could ever be observed. It now honours
+`ATRIUM_JCLIENT_HOLD=<secs>`. And the child's stderr goes to `/var/log/atrium/<name>.log`,
+which is where the verdict above was read.
+
+**Other gaps the same survey found, recorded not fixed:** jaild does not validate `gid` at
+all; `Tmpfs` mounts have no size option and no validator check; create-time mounts are never
+unmounted by `RemoveJail`; exec'd jails' state records accumulate with no dedup; and rctl
+rules set through `SetRctl` are never removed.
+
 ### 9.2 Out of scope
 
 - **App-as-trojan.** A user-granted app can use its capabilities

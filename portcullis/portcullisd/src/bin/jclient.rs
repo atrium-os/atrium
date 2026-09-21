@@ -131,8 +131,18 @@ fn main() -> ExitCode {
             println!("{}", serde_json::to_string_pretty(&resp).unwrap_or_default());
             if let Some(fd) = fd {
                 eprintln!("[procdesc fd received: {fd}]");
-                /* Real client would EVFILT_PROCDESC + retain.
-                 * Smoke client just closes immediately. */
+                /* ★ Closing the procdesc KILLS the child: jaild pdforks
+                 * without PD_DAEMON and hands the only lifecycle handle to
+                 * us. Closing it at once, as this did, meant nothing about
+                 * the child could be observed — it was killed a few
+                 * microseconds after it began setting itself up, and whatever
+                 * it would have logged was a race. ATRIUM_JCLIENT_HOLD=<secs>
+                 * keeps it alive long enough to report. */
+                if let Some(secs) = std::env::var("ATRIUM_JCLIENT_HOLD").ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    std::thread::sleep(std::time::Duration::from_secs(secs));
+                }
                 let _ = unsafe_close(fd);
             }
             match resp {
