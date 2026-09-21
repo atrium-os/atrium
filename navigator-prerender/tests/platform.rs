@@ -123,3 +123,52 @@ fn legacy_detection_globals_are_not_causes() {
         "a legacy probe must not be the cause; got {:?}", c.cause);
     assert_eq!(c.verdict, Verdict::BrowserToo);
 }
+
+/// ★★ A CONVERSION MUST BE REPRODUCIBLE, because it feeds a content-addressed
+/// store: the same input has to produce the same bytes or dedup is defeated.
+/// Seeding `crypto` alone was not enough — the CLOCK and `Math.random` were
+/// still live, and four corpus documents hashed differently on every run.
+#[test]
+fn the_clock_is_fixed_not_the_hosts() {
+    let c = run(r#"<html><body><div id=t></div><script>
+      document.body.setAttribute('data-r', [
+        Date.now(), new Date().toISOString(), new Date().getFullYear()
+      ].join('|'));
+    </script></body></html>"#);
+    assert_eq!(r(&c), "1767225600000|2026-01-01T00:00:00.000Z|2026");
+}
+
+#[test]
+fn math_random_is_seeded_not_entropic() {
+    let html = r#"<html><body><div id=t></div><script>
+      var picks = [];
+      for (var i = 0; i < 5; i++) picks.push(Math.random().toFixed(6));
+      document.body.setAttribute('data-r', picks.join(','));
+    </script></body></html>"#;
+    let a = run(html);
+    let b = run(html);
+    assert_eq!(r(&a), r(&b), "the same document must randomise identically");
+    // Still a spread of values, not a constant: a page choosing between
+    // options must not always get the first one.
+    let joined = r(&a);
+    let vals: Vec<&str> = joined.split(',').collect();
+    assert!(vals.iter().collect::<std::collections::HashSet<_>>().len() > 1,
+        "a seeded stream must still vary within a run: {:?}", vals);
+}
+
+/// ★ Reproducibility is a property of the WHOLE conversion, so the check that
+/// matters is over the artifact, not over one API.
+#[test]
+fn the_whole_artifact_reproduces_including_stamped_time_and_random_choices() {
+    let html = r#"<html><body>
+      <input id=stamp type=hidden><span id=pick></span>
+      <script>
+        document.getElementById('stamp').setAttribute('value', String(Date.now()));
+        var options = ['alpha', 'beta', 'gamma', 'delta'];
+        document.getElementById('pick').textContent =
+          options[Math.floor(Math.random() * options.length)];
+      </script></body></html>"#;
+    let a = run(html);
+    let b = run(html);
+    assert_eq!(a.html, b.html, "the artifact itself must be byte-identical");
+}

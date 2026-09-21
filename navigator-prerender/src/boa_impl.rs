@@ -209,6 +209,35 @@ fn is_detection_probe(full: &str) -> bool {
     )
 }
 
+/// ★★ THE CONVERTER'S CLOCK IS FIXED, NOT THE HOST'S.
+///
+/// A conversion feeds a content-addressed store, so the same input must
+/// produce the same bytes — the reason `crypto` is seeded from the document
+/// URL rather than from entropy. The clock was left real, and it defeated
+/// that for every page that stamps the time: four corpus documents write
+/// `Date.now()` into their output (an Akismet field, a cache-buster) and so
+/// hashed differently on every single run, exactly as real entropy would
+/// have. Determinism is not a property you can have in one place.
+///
+/// The value is a CHOICE and a visible one: an artifact has no meaningful
+/// "now", because it is read long after it is made. A page computing
+/// "3 hours ago" is wrong either way; with a real clock it is wrong AND
+/// unstable. `BoaEngine::clock_millis` lets a deployment pin it to the fetch
+/// time instead, at the cost of the dedup property.
+pub const CONVERSION_EPOCH_MS: i64 = 1_767_225_600_000; // 2026-01-01T00:00:00Z
+
+#[derive(Debug, Clone, Copy)]
+struct FixedClock(i64);
+
+impl boa_engine::context::Clock for FixedClock {
+    fn now(&self) -> boa_engine::context::time::JsInstant {
+        // Constant, which satisfies the engine's monotonicity requirement
+        // (non-decreasing) without introducing a second source of drift.
+        boa_engine::context::time::JsInstant::new(self.0 as u64 / 1000, 0)
+    }
+    fn system_time_millis(&self) -> i64 { self.0 }
+}
+
 /// ★ THE CONVERTER'S TIMEZONE IS UTC, NOT THE HOST MACHINE'S.
 ///
 /// Boa's default hook reports the local offset of whatever machine is
@@ -2495,6 +2524,9 @@ pub struct BoaEngine {
     /// to refuse independently. `None` means a page cannot reach the network
     /// at all, which is also the default for tests.
     pub page_fetcher: Option<Box<dyn crate::fetch::Fetcher>>,
+    /// Wall-clock time reported to the page, fixed so conversions are
+    /// reproducible. See `CONVERSION_EPOCH_MS`.
+    pub clock_millis: i64,
     /// ★ Run the page's JS as an ORACLE after the normal pass: probe the
     /// elements it wired for interaction, record what each one DOES, and
     /// revert every probe. Off by default — exploration simulates a user,
@@ -3402,6 +3434,13 @@ const GLOBALS: &str = r#"
   };
   globalThis.crypto = __cryptoObj;
 
+  // ★ Math.random IS THE SAME PROBLEM AS crypto, and seeding one without the
+  // other left the job half done: git-scm.com picks a tagline at random, so
+  // its artifact hashed differently on every run — the dedup property gone
+  // for a page that merely wanted variety. Same seeded stream, same reason.
+  // Pages that randomise for display now make one stable choice.
+  Math.random = function () { return __rand_u32() / 4294967296; };
+
   // Scroll position: fixed at the origin, like the viewport it belongs to.
   globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;
   globalThis.scrollBy = function () {}; globalThis.scroll = function () {};
@@ -3767,15 +3806,19 @@ impl ScriptEngine for BoaEngine {
         WRITE_POS.with(|m| m.borrow_mut().clear());
         DOM.with(|d| *d.borrow_mut() = std::mem::take(dom));
         let hooks = std::rc::Rc::new(FixedHooks);
+        let clock = std::rc::Rc::new(FixedClock(
+            if self.clock_millis == 0 { CONVERSION_EPOCH_MS } else { self.clock_millis }));
         let mut ctx = match self.module_root.as_ref()
             .and_then(|r| boa_engine::module::SimpleModuleLoader::new(r).ok())
         {
             Some(loader) => Context::builder()
                 .module_loader(std::rc::Rc::new(loader))
                 .host_hooks(hooks.clone())
+                .clock(clock.clone())
                 .build()
                 .unwrap_or_default(),
-            None => Context::builder().host_hooks(hooks).build().unwrap_or_default(),
+            None => Context::builder().host_hooks(hooks).clock(clock)
+                .build().unwrap_or_default(),
         };
 
         let body = with(|d| d.by_tag("body").first().copied()).unwrap_or(0);
