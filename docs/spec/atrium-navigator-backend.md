@@ -305,6 +305,45 @@ Two rules matter more than the numbers:
   A boolean return would have told them they had — a lie by omission, and one the reader has
   no way to detect. The bound is allowed to forget; it is not allowed to pretend it did not.
 
+### 4.4a How many sessions may exist
+
+A session is one recording being read: the published document, the document as the reader
+has changed it, and the history that gets them back. Nothing bounded how many could exist,
+so "open recordings until the process dies" was a supported operation — and the memory is
+not the caller's own, it is documents, which come from untrusted input.
+
+**Derived from the corpus:** a document is a median of 97 KiB, p99 1.5 MiB, max 2.0 MiB,
+against the profile's 8 MiB ceiling. A session's floor is about twice its document. The
+defaults are **16 sessions and 64 MiB**. The count alone would be a promise the process
+cannot keep — 16 sessions at the 8 MiB ceiling is 256 MiB — which is why there is a byte
+budget too; at measured sizes those same 16 sessions cost about 3 MiB. Verified against the
+corpus's **sixteen heaviest** documents opened at once, the adversarial ordering: they fit
+in 51% of the budget.
+
+**Refusal, not eviction.** Silently discarding a session resets a reader's place with no
+signal they can act on — they return to a tab and it has forgotten where they were.
+Refusing to open a new one is visible and recoverable: the caller can close something. An
+automatic policy would need a measurement of real reader behaviour that does not exist yet,
+and guessing one here would bury the guess where it is hardest to find.
+
+**Mechanism here, policy with the caller.** `Sessions` refuses to exceed a bound and evicts
+exactly what it is told to evict; it never chooses *which* session a reader should lose,
+because it cannot know which window is in front of them. That is `navigatord`'s question —
+the same split the converter and the tier policy already use.
+
+Two things the errors have to get right:
+
+- **Each refusal names its bound.** A caller told "too many sessions" closes one; a caller
+  told "out of memory" may close several and still fail because the next document is simply
+  too large. One merged error would make the right response unguessable.
+- **The profile refusal comes first.** A caller told it is out of memory will close sessions
+  to make room for a document that was never going to open.
+
+A session's cost is measured as it moves, not fixed at its base — a reader who expands every
+collapsed section holds more than was published. It is recomputed once per navigation rather
+than per query, because measuring means serializing the tree, and doing it lazily made
+opening one session cost a serialization of every other session's document.
+
 ### 4.5 Recording format version 2
 
 `atrium-navigator-recording/2` adds one field: an insert's `index`, the position the markup

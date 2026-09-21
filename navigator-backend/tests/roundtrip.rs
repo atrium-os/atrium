@@ -219,3 +219,46 @@ fn every_recorded_transition_reverses_exactly() {
     assert!(failures.is_empty(), "reversal did not restore the document:\n  {}",
         failures.join("\n  "));
 }
+
+/// ★★ THE DEFAULT SESSION BOUND AGAINST REAL DOCUMENTS.
+///
+/// The bound was derived from the corpus's document sizes, so the corpus is
+/// where it has to be checked. Opening the LARGEST recordings first is the
+/// adversarial ordering: if a realistic set of heavy documents cannot be held
+/// at once, the default is wrong — and a bound that only works on the median
+/// is a bound that fails when a reader has several news sites open.
+#[test]
+fn the_default_session_bound_holds_the_corpus_heaviest_documents() {
+    let Ok(dir) = std::env::var("NAVIGATOR_RECORDINGS") else {
+        eprintln!("SKIPPED: set NAVIGATOR_RECORDINGS to a directory of emitted recordings");
+        return;
+    };
+    use navigator_backend::session::{SessionLimits, Sessions};
+    let mut recs: Vec<navigator_backend::Recording> = vec![];
+    for e in std::fs::read_dir(&dir).expect("readable directory").flatten() {
+        let p = e.path();
+        if p.extension().map(|x| x != "json").unwrap_or(true) { continue }
+        let bytes = std::fs::read(&p).expect("readable file");
+        if let Ok(r) = ingest(&bytes, &Limits::default()) { recs.push(r) }
+    }
+    assert!(!recs.is_empty(), "no recordings — this test checked nothing");
+    recs.sort_by_key(|r| std::cmp::Reverse(r.document.len()));
+
+    let limits = SessionLimits::default();
+    let mut s = Sessions::new(limits);
+    let mut opened = 0;
+    let mut refused = None;
+    for r in recs.iter().take(limits.max_sessions) {
+        match s.open(r) {
+            Ok(_) => opened += 1,
+            Err(why) => { refused = Some(format!("{}: {why}", r.url)); break }
+        }
+    }
+    eprintln!("{opened} of the heaviest documents open at once, {} bytes \
+               ({}% of the budget)",
+              s.bytes(), s.bytes() * 100 / limits.max_total_bytes);
+    assert!(refused.is_none(),
+        "the default bound cannot hold {} heavy documents: {}",
+        limits.max_sessions, refused.unwrap());
+    assert_eq!(opened, limits.max_sessions.min(recs.len()));
+}
