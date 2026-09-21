@@ -249,7 +249,7 @@ fn the_default_session_bound_holds_the_corpus_heaviest_documents() {
     let mut opened = 0;
     let mut refused = None;
     for r in recs.iter().take(limits.max_sessions) {
-        match s.open(r) {
+        match s.open(r, 0) {
             Ok(_) => opened += 1,
             Err(why) => { refused = Some(format!("{}: {why}", r.url)); break }
         }

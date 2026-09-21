@@ -44,6 +44,16 @@ pub struct SessionLimits {
     /// Across every open session: documents, current state, and history.
     pub max_total_bytes: usize,
     pub history: HistoryLimits,
+    /// No interaction for this long and the reader has walked away.
+    pub max_idle_ms: Millis,
+    /// ★ A hard cap regardless of activity. Idleness alone is not enough:
+    /// anything that touches a session on a timer — a poll, a keep-alive, a
+    /// page that moves itself — keeps it alive forever, and "forever" is not
+    /// a lifetime.
+    pub max_age_ms: Millis,
+    /// How many expired ids to remember, so a returning reader can be told
+    /// their session EXPIRED rather than that it never existed.
+    pub remember_expired: usize,
 }
 
 impl Default for SessionLimits {
@@ -52,8 +62,51 @@ impl Default for SessionLimits {
             max_sessions: 16,
             max_total_bytes: 64 * 1024 * 1024,
             history: HistoryLimits::default(),
+            max_idle_ms: 30 * 60 * 1000,
+            max_age_ms: 8 * 60 * 60 * 1000,
+            remember_expired: 64,
         }
     }
+}
+
+/// Milliseconds from any fixed origin the caller likes, required to be
+/// monotonic.
+///
+/// ★★ THE LIBRARY NEVER READS A CLOCK. Every entry point that could expire a
+/// session takes `now` from the caller. Three reasons, and the third is the
+/// one that matters:
+///
+///   - A test that has to sleep to prove an expiry is a slow test that will
+///     eventually be a flaky one; here expiry is exact and instant.
+///   - The converter already had to make its clock injectable to get
+///     byte-reproducible output, and a second component reaching for wall
+///     time would undo that lesson locally.
+///   - `navigatord` owns the session lifecycle, so it owns the clock. A
+///     library that read the system clock would be making a policy decision —
+///     which clock, monotonic or not, whose idea of "now" — inside a module
+///     whose whole discipline is to leave those to the caller.
+pub type Millis = u64;
+
+/// Why a session is no longer open — the distinction a returning reader needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expiry {
+    /// No interaction for `max_idle_ms`.
+    Idle,
+    /// Open for `max_age_ms`, however active.
+    Age,
+}
+
+/// ★ `Expired` AND `Unknown` ARE DIFFERENT, for the same reason `Forgotten`
+/// and `AtStart` are: a reader whose session timed out should be told it
+/// timed out and offered it back, not told their id is meaningless. The
+/// distinction fades — only the most recent expiries are remembered — and
+/// that boundary is visible rather than pretended away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Status {
+    Open,
+    Expired(Expiry),
+    /// Never existed, or expired so long ago it is no longer remembered.
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +154,8 @@ pub struct Session {
     /// document. A document only changes when the reader moves it, which is
     /// exactly when this is updated.
     current_bytes: usize,
+    opened_at: Millis,
+    last_seen: Millis,
 }
 
 impl Session {
@@ -133,6 +188,22 @@ impl Session {
     pub fn bytes(&self) -> usize {
         self.base_bytes + self.current_bytes + self.history.cost().undo_bytes
     }
+
+    pub fn opened_at(&self) -> Millis { self.opened_at }
+    pub fn last_seen(&self) -> Millis { self.last_seen }
+
+    /// Whether this session has run out, and which way.
+    ///
+    /// ★ `saturating_sub` on both: a caller whose clock goes backwards — a
+    /// wall clock stepped by NTP, a test that rewinds — must not have every
+    /// session read as infinitely old or infinitely fresh. Going backwards is
+    /// treated as no time passing, which is the conservative direction: a
+    /// session stays open rather than vanishing under a reader.
+    pub fn expired(&self, now: Millis, limits: &SessionLimits) -> Option<Expiry> {
+        if now.saturating_sub(self.opened_at) >= limits.max_age_ms { return Some(Expiry::Age) }
+        if now.saturating_sub(self.last_seen) >= limits.max_idle_ms { return Some(Expiry::Idle) }
+        None
+    }
 }
 
 /// Every open session, and the budget they share.
@@ -140,6 +211,8 @@ pub struct Sessions {
     limits: SessionLimits,
     open: HashMap<SessionId, Session>,
     next: SessionId,
+    /// Recently expired ids, oldest first, bounded by `remember_expired`.
+    expired: std::collections::VecDeque<(SessionId, Expiry)>,
 }
 
 impl Default for Sessions {
@@ -148,20 +221,70 @@ impl Default for Sessions {
 
 impl Sessions {
     pub fn new(limits: SessionLimits) -> Self {
-        Sessions { limits, open: HashMap::new(), next: 1 }
+        Sessions { limits, open: HashMap::new(), next: 1, expired: Default::default() }
+    }
+
+    pub fn limits(&self) -> &SessionLimits { &self.limits }
+
+    /// Close every session that has run out, returning what was closed.
+    ///
+    /// ★ CALLER-DRIVEN, like eviction. There is no background thread here and
+    /// no clock; a library that spawned one would be deciding on a runtime
+    /// for its embedder. `open` sweeps before it refuses, so an abandoned
+    /// session never blocks a new one on its own, but a caller that wants
+    /// memory back while idle has to ask.
+    pub fn expire(&mut self, now: Millis) -> Vec<(SessionId, Expiry)> {
+        let limits = self.limits;
+        let done: Vec<(SessionId, Expiry)> = self.open.iter()
+            .filter_map(|(&id, s)| s.expired(now, &limits).map(|e| (id, e)))
+            .collect();
+        for &(id, why) in &done {
+            self.open.remove(&id);
+            self.expired.push_back((id, why));
+        }
+        while self.expired.len() > self.limits.remember_expired { self.expired.pop_front(); }
+        done
+    }
+
+    /// Whether a session is open, expired, or unheard of.
+    pub fn status(&self, id: SessionId) -> Status {
+        if self.open.contains_key(&id) { return Status::Open }
+        match self.expired.iter().find(|(e, _)| *e == id) {
+            Some(&(_, why)) => Status::Expired(why),
+            None => Status::Unknown,
+        }
+    }
+
+    /// Mark a session as interacted with. A reader who is merely LOOKING at a
+    /// page produces no mutation, so the caller has to say so — the library
+    /// cannot see attention.
+    pub fn touch(&mut self, id: SessionId, now: Millis) -> bool {
+        match self.open.get_mut(&id) {
+            Some(s) => { s.last_seen = s.last_seen.max(now); true }
+            None => false,
+        }
     }
 
     pub fn len(&self) -> usize { self.open.len() }
     pub fn is_empty(&self) -> bool { self.open.is_empty() }
     pub fn get(&self, id: SessionId) -> Option<&Session> { self.open.get(&id) }
-    pub fn get_mut(&mut self, id: SessionId) -> Option<&mut Session> { self.open.get_mut(&id) }
+    /// Mutable access, which counts as interaction and so takes the clock.
+    pub fn get_mut(&mut self, id: SessionId, now: Millis) -> Option<&mut Session> {
+        let s = self.open.get_mut(&id)?;
+        s.last_seen = s.last_seen.max(now);
+        Some(s)
+    }
     pub fn ids(&self) -> impl Iterator<Item = SessionId> + '_ { self.open.keys().copied() }
 
     /// Total bytes held by every open session.
     pub fn bytes(&self) -> usize { self.open.values().map(Session::bytes).sum() }
 
     /// Open a recording, or refuse and say which bound stopped it.
-    pub fn open(&mut self, r: &Recording) -> Result<SessionId, OpenError> {
+    pub fn open(&mut self, r: &Recording, now: Millis) -> Result<SessionId, OpenError> {
+        // ★ SWEEP BEFORE REFUSING. Turning a reader away because of a session
+        // they abandoned an hour ago would be the bound working against the
+        // person it protects.
+        self.expire(now);
         if self.open.len() >= self.limits.max_sessions {
             return Err(OpenError::TooManySessions {
                 open: self.open.len(), allowed: self.limits.max_sessions,
@@ -192,6 +315,8 @@ impl Sessions {
             // the parser normalizes — so it is measured, not assumed.
             current_bytes: doc.dom.serialize().len(),
             history: History::with_limits(doc, self.limits.history),
+            opened_at: now,
+            last_seen: now,
         });
         Ok(id)
     }

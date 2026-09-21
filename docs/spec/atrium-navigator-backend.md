@@ -344,6 +344,38 @@ collapsed section holds more than was published. It is recomputed once per navig
 than per query, because measuring means serializing the tree, and doing it lazily made
 opening one session cost a serialization of every other session's document.
 
+### 4.4b How long a session lives
+
+Bounding how many sessions exist does not bound how long one lives. A reader who closes a
+laptop mid-article leaves a session holding a document indefinitely, and nothing reclaimed it.
+
+**Two bounds, because one is not enough.** An idle timeout (default 30 minutes) catches the
+reader who walked away. A maximum age (default 8 hours) catches what idleness cannot:
+anything touching a session on a timer — a poll, a keep-alive, a page that moves itself — is
+never idle, and *never idle* would mean *never reclaimed*.
+
+**These two numbers are not derived, and should not be mistaken for the others here.** The
+byte and count bounds come from corpus measurement; there is no corpus of reader behaviour,
+so 30 minutes and 8 hours are conventional. What would change them is telemetry from real
+sessions, which does not exist and is not being invented to justify a number.
+
+**The library never reads a clock.** Every entry point that can expire a session takes `now`
+from the caller. Tests are then exact and instant rather than sleeping; the converter already
+had to make its clock injectable for byte-reproducible output, and a second component
+reaching for wall time would undo that lesson locally; and `navigatord` owns the lifecycle,
+so it owns the clock. A backwards step — NTP moving a wall clock — reads as no time passing,
+which keeps a session open rather than vanishing it under a reader.
+
+Expiry is caller-driven like eviction: there is no background thread, because a library that
+spawned one would be choosing a runtime for its embedder. But **`open` sweeps before it
+refuses** — turning a reader away because of a session they abandoned an hour ago would be
+the bound working against the person it protects.
+
+**An expired session is not an unknown one.** A returning reader is told "that timed out"
+and offered it back, not "no such thing" — the same distinction as `Forgotten` versus
+`AtStart` in §4.4. The memory of expiries is itself bounded (default 64), so it cannot become
+the leak it was added to explain; past that boundary the answer honestly becomes `Unknown`.
+
 ### 4.5 Recording format version 2
 
 `atrium-navigator-recording/2` adds one field: an insert's `index`, the position the markup
