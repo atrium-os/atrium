@@ -74,7 +74,7 @@ pub fn convert_with(
     // before and after is the cheapest honest proxy: a converter that runs
     // everything cleanly and produces no more content than the parser did is
     // not earning its cost.
-    let text_before = dom.text_content(dom.root()).split_whitespace()
+    let text_before = dom.visible_text(dom.root()).split_whitespace()
         .map(str::len).sum::<usize>();
 
     let (mut ext_total, mut ext_ok, mut ext_fail) = (0, 0, 0);
@@ -164,7 +164,7 @@ pub fn convert_with(
         engine: engine.name(),
         elements_before: before,
         text_before,
-        text_after: dom.text_content(dom.root()).split_whitespace()
+        text_after: dom.visible_text(dom.root()).split_whitespace()
             .map(str::len).sum::<usize>(),
         elements_after: dom.element_count(),
         depth_after: dom.max_depth(),

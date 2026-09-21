@@ -45,8 +45,16 @@ pub fn scan_imports(src: &str) -> Vec<String> {
     let mut i = 0;
     while i < b.len() {
         // `from` followed by a quoted string, or `import '…'`
-        let is_from = b[i..].starts_with(&['f', 'r', 'o', 'm']);
-        let is_imp = b[i..].starts_with(&['i', 'm', 'p', 'o', 'r', 't']);
+        // ★ WORD BOUNDARY. This matched `from` and `import` as bare
+        // SUBSTRINGS, so minified code produced garbage specifiers — bbc.co.uk
+        // yielded a "module" URL of
+        // `https://static.files.bbci.co.uk/core/.concat(arguments.length%3E0...`
+        // and several of raw program text. Lexing JavaScript with substring
+        // search finds words inside identifiers, properties and strings.
+        let prev_ident = i > 0 && (b[i - 1].is_alphanumeric()
+            || b[i - 1] == '_' || b[i - 1] == '$' || b[i - 1] == '.');
+        let is_from = !prev_ident && b[i..].starts_with(&['f', 'r', 'o', 'm']);
+        let is_imp = !prev_ident && b[i..].starts_with(&['i', 'm', 'p', 'o', 'r', 't']);
         if is_from || is_imp {
             let mut j = i + if is_from { 4 } else { 6 };
             while j < b.len() && b[j].is_whitespace() { j += 1 }
@@ -57,7 +65,16 @@ pub fn scan_imports(src: &str) -> Vec<String> {
                 while k < b.len() && b[k] != q { k += 1 }
                 if k < b.len() {
                     let spec: String = b[st..k].iter().collect();
-                    if !spec.is_empty() { out.push(spec) }
+                    // A specifier is a PATH, not an expression. Anything
+                    // carrying program syntax came from a dynamic import()
+                    // whose argument is computed, and cannot be resolved
+                    // statically by anyone — so it is skipped rather than
+                    // fetched as nonsense.
+                    let plausible = !spec.is_empty()
+                        && spec.len() < 512
+                        && !spec.contains(|c: char| c.is_whitespace())
+                        && !spec.contains(['(', ')', '{', '}', ';', ',', '`']);
+                    if plausible { out.push(spec) }
                     i = k + 1;
                     continue;
                 }

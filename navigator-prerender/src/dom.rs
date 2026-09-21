@@ -122,6 +122,28 @@ impl Dom {
             .collect()
     }
 
+    /// ★ VISIBLE text: what a READER would see.
+    ///
+    /// `text_content` descends into everything, including `<script>` and
+    /// `<style>`, whose text nodes hold source code. Measuring content gain
+    /// with it measured JAVASCRIPT — on bbc.co.uk it reported a 9,698
+    /// character LOSS while the visible words went 2,829 -> 2,832 with none
+    /// missing. A metric that counts the program as content will rank a page
+    /// by how much script it ships.
+    pub fn visible_text(&self, h: Handle) -> String {
+        let mut out = String::new();
+        self.walk_visible(h, &mut out);
+        out
+    }
+    fn walk_visible(&self, h: Handle, out: &mut String) {
+        match &self.nodes[h as usize].kind {
+            Kind::Text(t) => out.push_str(t),
+            Kind::Element(tag) if matches!(tag.to_ascii_lowercase().as_str(),
+                "script" | "style" | "noscript" | "template" | "title") => {}
+            _ => for &c in &self.nodes[h as usize].children { self.walk_visible(c, out) },
+        }
+    }
+
     pub fn text_content(&self, h: Handle) -> String {
         let mut out = String::new();
         self.walk_text(h, &mut out);
@@ -351,8 +373,17 @@ impl Dom {
     }
 
     /// Element count, the headline metric for a conversion.
+    ///
+    /// ★ CONNECTED elements only. Counting the arena reported bbc.co.uk as
+    /// growing 4,184 -> 8,388 elements while its document was being emptied:
+    /// the page had created thousands of nodes it never attached, and
+    /// detached most of what the parser built. An "elements after" that
+    /// counts orphans says a conversion grew when it shrank.
     pub fn element_count(&self) -> usize {
-        self.nodes.iter().filter(|n| matches!(n.kind, Kind::Element(_))).count()
+        (0..self.nodes.len() as Handle)
+            .filter(|&h| matches!(self.nodes[h as usize].kind, Kind::Element(_)))
+            .filter(|&h| self.connected(h))
+            .count()
     }
 
     pub fn max_depth(&self) -> usize {
