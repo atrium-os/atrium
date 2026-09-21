@@ -137,3 +137,49 @@ fn the_choice_is_returned_alongside_the_artifact() {
     assert_eq!(d.tier, Tier::One);
     assert!(!d.reason.is_empty(), "a decision without a reason is not inspectable");
 }
+
+// ── Origin refusal (spec §5.4.1b) ───────────────────────────────────────
+
+/// ★ A CHALLENGE PAGE IS NOT THE SITE. Converting one publishes an artifact
+/// that looks like a successful conversion of a document reading "Just a
+/// moment...", which is worse than publishing nothing.
+#[test]
+fn an_interstitial_challenge_is_marked_refused() {
+    let c = run("<html><head><title>Just a moment...</title></head>\
+        <body><div class=cf-browser-verification>Checking your browser before \
+        accessing the site.</div></body></html>");
+    assert_eq!(c.origin_refusal, Some("interstitial challenge"));
+}
+
+#[test]
+fn an_access_denial_is_marked_refused() {
+    let c = run("<html><head><title>Denied</title></head>\
+        <body><h1>Access to this page has been denied</h1></body></html>");
+    assert_eq!(c.origin_refusal, Some("origin denied access"));
+}
+
+/// ★★ THE PRECISION RISK, AND THE REASON THE RULE NEEDS TWO CONDITIONS. An
+/// article ABOUT captchas contains the word "captcha"; a news story about
+/// Cloudflare quotes its interstitial verbatim. A marker alone must never
+/// decide, or the converter refuses to publish exactly the documents that
+/// discuss the thing.
+#[test]
+fn an_article_about_challenges_is_not_a_challenge() {
+    let c = run(&format!("<html><head><title>How CAPTCHAs work</title></head><body>\
+        <article><p>{}</p><p>Cloudflare's interstitial says \"Just a moment...\" \
+        while it runs its checks, and some sites show \"Access denied\" instead. \
+        Are you a robot? The question is harder than it looks.</p></article>\
+        </body></html>",
+        "Real prose about bot detection, long enough that this is plainly a document \
+         with an article behind it rather than a wall with a sentence on it. ".repeat(4)));
+    assert_eq!(c.origin_refusal, None,
+        "a document that DISCUSSES challenges must still be published");
+}
+
+/// An ordinary document is not a refusal, obviously — pinned because the
+/// cheap version of this rule would fire on anything short.
+#[test]
+fn a_short_ordinary_document_is_not_a_refusal() {
+    let c = run("<html><head><title>Notes</title></head><body><p>A brief note.</p></body></html>");
+    assert_eq!(c.origin_refusal, None);
+}

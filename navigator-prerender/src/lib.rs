@@ -28,6 +28,9 @@ pub struct Conversion {
     /// Visible text (whitespace-collapsed) before and after scripts ran.
     pub text_before: usize,
     pub text_after: usize,
+    /// ★ Set when the ORIGIN refused rather than served: a challenge page,
+    /// not the site. `None` for an ordinary document.
+    pub origin_refusal: Option<&'static str>,
     /// Removals refused by protected-subtree execution (experiment).
     pub removals_refused: u32,
     /// ★ What the page DOES when acted on, learned by running its JS as an
@@ -114,6 +117,7 @@ pub fn convert_with_opts(
     let text_before = dom.visible_text(dom.root()).split_whitespace()
         .map(str::len).sum::<usize>();
     let html_tier1 = dom.serialize();
+    let origin_refusal = detect_origin_refusal(&dom);
     // ★ Always recorded, because ANCHORING needs it too: a transition is
     // replayable against tier 1 only if its trigger came from the parser.
     // Protection is the separate, opt-in thing.
@@ -219,6 +223,7 @@ pub fn convert_with_opts(
         engine: engine.name(),
         elements_before: before,
         text_before,
+        origin_refusal,
         text_after: dom.visible_text(dom.root()).split_whitespace()
             .map(str::len).sum::<usize>(),
         removals_refused: dom.removals_refused,
@@ -433,3 +438,44 @@ impl TierPolicy {
 }
 
 pub use engine::{Effect, Transition};
+
+/// ★ A CHALLENGE PAGE IS NOT THE SITE, and converting one produces an
+/// artifact that looks like a successful conversion of a document reading
+/// "Just a moment...". Spec §5.4.1b: surface the refusal instead.
+///
+/// ★★ THE RULE IS DELIBERATELY CONSERVATIVE, because the obvious version is
+/// wrong: an article ABOUT CAPTCHAs contains the word "captcha", and a news
+/// story about Cloudflare quotes its interstitial. So a marker alone never
+/// decides. A challenge page is also EMPTY — it has no article behind it —
+/// and requiring both means a real document can carry any of these phrases
+/// without being mistaken for a wall.
+fn detect_origin_refusal(dom: &dom::Dom) -> Option<&'static str> {
+    const MARKERS: &[(&str, &str)] = &[
+        ("just a moment", "interstitial challenge"),
+        ("cf-browser-verification", "interstitial challenge"),
+        ("cf_chl_", "interstitial challenge"),
+        ("attention required!", "interstitial challenge"),
+        ("checking your browser before", "interstitial challenge"),
+        ("access to this page has been denied", "origin denied access"),
+        ("access denied", "origin denied access"),
+        ("you have been blocked", "origin denied access"),
+        ("are you a robot", "bot check"),
+        ("verify you are human", "bot check"),
+        ("enable javascript and cookies to continue", "bot check"),
+    ];
+    // The whole point: a document with real content is not a wall, whatever
+    // words it happens to contain.
+    let visible = dom.visible_text(dom.root());
+    if visible.split_whitespace().map(str::len).sum::<usize>() >= 200 {
+        return None;
+    }
+    let hay = visible.to_ascii_lowercase();
+    let title = dom.by_tag("title").first().map(|&h| dom.text_content(h))
+        .unwrap_or_default().to_ascii_lowercase();
+    for (needle, reason) in MARKERS {
+        if title.contains(needle) || hay.contains(needle) {
+            return Some(reason);
+        }
+    }
+    None
+}

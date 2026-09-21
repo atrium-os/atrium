@@ -271,15 +271,53 @@ shape, IP reputation, or headless detection, none of which a polite string fixes
 corpus, fetched identically, was not challenged at all: the split is by site category, not
 by fetcher.
 
-**And this has an architectural consequence, not just an operational one.** The obvious
-workaround — fetch using the reader's own connection, session or address — would defeat the
-property that makes the CAS store worth having. A conversion is shared because it is
-anonymous and identical for everyone (§4, tessera-fs.md §20). A conversion that needed the
-reader's identity to be *obtained* could not be shared, so every reader would pay the full
-conversion cost and the dedup argument for this whole design would not apply to exactly the
-sites that are hardest to convert. **Challenged sites are therefore not merely harder; they
-are outside the economics of the architecture**, and that is a scope decision rather than
-an engineering task.
+**What this costs the architecture — stated more carefully than at first.** An earlier
+draft of this section claimed that fetching as the reader would destroy the dedup property
+outright. That was too strong, and the correction matters for §5.4.1b. Artifacts are keyed
+by the hash of the INPUT BYTES, so if two readers obtain the same bytes they share the same
+artifact: what reader-side fetching loses is *fetch*-once-serve-many, not
+*convert*-once-serve-many — and conversion, which runs the page's JavaScript, is the
+expensive half. Dedup survives reader-side fetching for any page that is not personalised.
+
+What does not survive is unattended conversion. A challenged site cannot be converted ahead
+of a reader asking for it, by anyone, because nothing in the pipeline can obtain the bytes.
+
+### 5.4.1b Settled: challenged sites, and what the Navigator will not do
+
+The comfortable answer would be that challenged sites are transactional and a reading-first
+system need not claim them. The evidence refuses it. Of the 22 challenged in §5.4.1a, about
+half are exactly the reading a document browser exists for: Stack Overflow answers, AP and
+NPR and Economist articles, wikiHow, BBC Good Food recipes, Khan Academy, Consumer Reports.
+Declining them is declining a large part of the point.
+
+**The decision has three parts.**
+
+**1. The Navigator identifies itself honestly and does not impersonate a browser.** Matching
+Chrome's TLS fingerprint and header order would get past most of these walls today. It is
+rejected on two grounds, and the second is the one that settles it: it is an arms race with
+a well-funded other side, so it fails eventually anyway; and it is a lie told by software
+on the reader's behalf to a server that asked a direct question. A system whose entire
+argument is *the reader's agent works for the reader* cannot start by misrepresenting who
+is calling.
+
+**2. A refusal is surfaced, never silently converted.** A challenge page is not the site,
+and converting one produces an artifact that looks like a successful conversion of a page
+that says "Just a moment...". The converter must detect the shape and mark the artifact
+REFUSED-BY-ORIGIN, so the reader is told the site declined rather than shown a blank
+document. This is the same discipline as §5.4.2's floor: never publish something that looks
+like a result and is not.
+
+**3. Reader-assisted import is the supported path, and it is not a workaround.** Where the
+reader can already see a page in a browser they have, that page's bytes can be handed to
+the converter. No impersonation is involved — the reader fetched it, as themselves, and is
+entitled to it. Conversion then proceeds normally and the artifact dedups by content hash
+like any other. This is strictly weaker than automatic conversion and should be described
+that way: it does not scale to crawling, and it requires an act by the reader.
+
+**What this means for scope.** The Navigator serves the open web automatically, and the
+challenged fraction on the reader's own request. It does not pretend to be Chrome, and it
+does not pretend a challenge page is a document. The cost is honest and visible: some sites
+will not work without the reader's involvement, and a few will not work at all.
 
 *Caveat on the caveat:* these 67 were chosen adversarially rather than sampled, so their
 proportions are not the web's. What transfers is the direction — tier 2 does not rescue
@@ -1170,11 +1208,11 @@ Not because the risk is small, but because of where it sits:
    not needed for reading, but it is needed before anyone authors anything interactive.
 5. **Remote placement policy** — when, if ever, a remote engine jail is offered by default,
    given it reintroduces a third party who sees browsing.
-6. **Whether challenged sites are in scope at all** — §5.4.1a: a third of commercial
-   fetches return a bot challenge to any plain HTTP GET, regardless of user-agent, and the
-   only known workaround (fetch as the reader) destroys the shareability that justifies the
-   CAS design. Deciding this is deciding how much of the commercial web the Navigator
-   claims to serve.
+6. ~~**Whether challenged sites are in scope at all**~~ — **settled in §5.4.1b**: serve the
+   open web automatically and the challenged fraction by reader-assisted import; identify
+   honestly and never impersonate a browser; surface a refusal instead of converting the
+   challenge page. What remains open is the *detection* rule for marking an artifact
+   REFUSED-BY-ORIGIN, which is a matter of evidence rather than principle.
 7. **Where the data-access boundary sits for hydrating pages** — §5.4.1 shows the reading
    lane's remaining loss is cross-origin data a page needs to rebuild what it tore down,
    not engine fidelity. Relaxing it for same-site data would recover those documents and

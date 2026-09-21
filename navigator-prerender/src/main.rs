@@ -116,6 +116,7 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
     {
         let (_, d) = navigator_prerender::TierPolicy::default().artifact(&c);
         println!("Y\t{:?}\t{}", d.tier, d.reason);
+        println!("Q\t{}", c.origin_refusal.unwrap_or(""));
     }
     println!("T\t{}\t{}", c.timers_fired, c.timers_dropped);
     println!("P\t{}\t{}\t{}\t{}", c.page_fetches, c.page_fetch_failures,
@@ -206,6 +207,8 @@ fn main() {
     let mut lossy: Vec<String> = vec![];
     let mut gains: Vec<(i64, String)> = vec![];
     let mut demoted: Vec<String> = vec![];
+    let mut refused: Vec<String> = vec![];
+    let mut empty: Vec<String> = vec![];
     let (mut inter, mut trans, mut anch, mut trans_docs) = (0u32, 0u32, 0u32, 0usize);
     let (mut attr_only, mut trunc) = (0u32, 0u32);
     let mut tier2_kept = 0usize;
@@ -300,6 +303,16 @@ fn main() {
         ext_total += c.external_total;
         ext_ok += c.external_fetched;
         ext_fail += c.external_total - c.external_fetched;
+        if !c.origin_refusal.is_empty() {
+            refused.push(format!("{name}  ({})", c.origin_refusal));
+        } else if c.text_before < 200 && c.text_after < 200 {
+            // ★ NOT called a refusal. An empty document is AMBIGUOUS: it is
+            // either an app shell whose content is fetched, or a challenge
+            // delivered entirely by script. Both leave nothing to publish,
+            // but only one is the origin saying no — and claiming to know
+            // which would be inventing a diagnosis.
+            empty.push(name.clone());
+        }
         elems.push(c.elements_after);
         inter += c.interactive_found; trans += c.transitions; anch += c.transitions_anchored;
         attr_only += c.transitions_attr_only; trunc += c.transitions_truncated;
@@ -410,6 +423,18 @@ fn main() {
         // A document that LOSES text is the dangerous case: the converter ran
         // and made the artifact worse than not converting at all.
         for (d, n) in shrank.iter().take(5) { println!("     LOST  {d:+8}  {n}"); }
+    }
+    if !refused.is_empty() {
+        println!("REFUSED BY ORIGIN (a challenge page is not the site — spec §5.4.1b)");
+        println!("  {} documents; converting one would publish an artifact that looks", refused.len());
+        println!("  like a successful conversion of a page saying \"Just a moment...\"");
+        for n in refused.iter().take(4) { println!("     {n}"); }
+    }
+    if !empty.is_empty() {
+        println!("NO DOCUMENT TO PUBLISH ({} docs: app shell, or a challenge", empty.len());
+        println!("  delivered by script — indistinguishable from outside, and not");
+        println!("  claimed as a refusal because only one of them is the origin saying no)");
+        for n in empty.iter().take(4) { println!("     {n}"); }
     }
     if inter > 0 {
         println!("STATE RECORDING (JS run as an ORACLE; every probe reverted)");
@@ -559,6 +584,7 @@ pub struct Child {
     pub transitions_anchored: u32,
     pub transitions_attr_only: u32,
     pub transitions_truncated: u32,
+    pub origin_refusal: String,
     pub tier: String,
     pub tier_reason: String,
     pub cause: Option<(String, String)>,
@@ -584,7 +610,7 @@ fn parse_child(s: &str) -> Option<Child> {
         removals_refused: 0,
         interactive_found: 0, transitions: 0, transitions_anchored: 0,
         transitions_attr_only: 0, transitions_truncated: 0,
-        tier: String::new(), tier_reason: String::new(),
+        origin_refusal: String::new(), tier: String::new(), tier_reason: String::new(),
         cause: None,
         timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0,
         page_blocked: 0, beacons: 0, blocked_hosts: vec![] };
@@ -616,6 +642,7 @@ fn parse_child(s: &str) -> Option<Child> {
                 c.transitions_attr_only = f[4].parse().unwrap_or(0);
                 c.transitions_truncated = f[5].parse().unwrap_or(0);
             }
+            Some(&"Q") if f.len() >= 2 => c.origin_refusal = f[1].to_string(),
             Some(&"Y") if f.len() >= 3 => {
                 c.tier = f[1].to_string();
                 c.tier_reason = f[2].to_string();
