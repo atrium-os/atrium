@@ -141,7 +141,12 @@ fn current_script_for_inline_has_no_src() {
     let c = convert(html, &mut BoaEngine::default());
     assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
     assert!(c.html.contains(r#"t="SCRIPT""#), "got {}", c.html);
-    assert!(c.html.contains(r#"s="undefined""#), "inline has no src: {}", c.html);
+    // ★ A browser reports the EMPTY STRING for a script with no src
+    // attribute, not undefined — `src` reflects, and a reflected URL
+    // attribute that is absent reads as "". This expectation encoded our
+    // older approximation, where src was a stored property that simply did
+    // not exist; the test was wrong, not the change.
+    assert!(c.html.contains(r#"s="""#), "inline src should be empty: {}", c.html);
 }
 
 /// Geometry observers must be constructible and register, but never deliver:

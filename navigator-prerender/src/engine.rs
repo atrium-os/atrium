@@ -66,6 +66,10 @@ pub struct RunReport {
     pub doc_writes: u32,
     /// document.write calls refused because they would have erased the document.
     pub doc_writes_refused: u32,
+    /// Scripts the page INJECTED at runtime and this converter executed.
+    pub injected_scripts_run: u32,
+    /// Injected scripts refused because they load third-party code.
+    pub injected_scripts_refused: u32,
     /// Reads of a layout metric this converter cannot truthfully answer.
     pub layout_reads: u32,
     /// Timer callbacks dispatched, and those still pending at the horizon.

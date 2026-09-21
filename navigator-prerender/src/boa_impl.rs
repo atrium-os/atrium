@@ -101,6 +101,10 @@ thread_local! {
     /// artifact may be treated as a secret. That is already true of a
     /// converted page: everything in it is public by construction.
     static RNG: RefCell<u64> = const { RefCell::new(0) };
+    /// Script elements already executed, so the dynamic sweep runs each at
+    /// most once however many times it passes over the document.
+    static EXECUTED: RefCell<std::collections::HashSet<Handle>> =
+        RefCell::new(std::collections::HashSet::new());
     /// (dispatches, listener invocations) on ELEMENTS.
     static DISPATCH: RefCell<(u32, u32)> = const { RefCell::new((0, 0)) };
     /// (writes applied, writes refused because they would erase the document)
@@ -1118,6 +1122,29 @@ fn hl_set_href(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
     Ok(JsValue::undefined())
 }
 
+/// `src`, reflected: the attribute is the truth, the property reports it
+/// resolved against the document URL.
+fn src_get(t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(t, ctx) else { return Ok(JsValue::from(js_string!(""))) };
+    let Some(raw) = with(|d| d.attr(h, "src").map(str::to_string)) else {
+        return Ok(JsValue::from(js_string!("")));
+    };
+    let abs = BASE.with(|b| b.borrow().clone())
+        .and_then(|b| url::Url::parse(&b).ok())
+        .and_then(|b| b.join(&raw).ok())
+        .map(|u| u.to_string())
+        .unwrap_or(raw);
+    Ok(JsValue::from(js_string!(abs)))
+}
+
+fn src_set(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(t, ctx) else { return Ok(JsValue::undefined()) };
+    let v = a.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    with(|d| { d.set_attr(h, "src", &v); d.script_mutations += 1 });
+    record_mutation("attributes", h, "src");
+    Ok(JsValue::undefined())
+}
+
 /// `rel`, reflected. The PROPERTY and the ATTRIBUTE are one value: a page
 /// that sets `link.rel = 'stylesheet'` must then be found by
 /// `document.styleSheets`, which reads the attribute.
@@ -1186,15 +1213,12 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
         .function(NativeFunction::from_fn_ptr(by_class), js_string!("getElementsByClassName"), 1)
         .function(NativeFunction::from_fn_ptr(by_tag_name), js_string!("getElementsByTagName"), 1)
         .build();
-    // `src` as a browser reports it: absolute against the document URL.
-    if let Some(raw) = with(|d| d.attr(h, "src").map(str::to_string)) {
-        let abs = BASE.with(|b| b.borrow().clone())
-            .and_then(|b| url::Url::parse(&b).ok())
-            .and_then(|b| b.join(&raw).ok())
-            .map(|u| u.to_string())
-            .unwrap_or(raw);
-        let _ = o.set(js_string!("src"), js_string!(abs), false, ctx);
-    }
+    // ★ `src` REFLECTS, it is not a stored string. It used to be set once
+    // from the attribute at wrapper-build time, so `script.src = url` wrote a
+    // plain JS property the DOM never saw — and the injected-script sweep,
+    // which reads the attribute, could not tell an external script from an
+    // empty one. Reading still reports the ABSOLUTE url, as a browser does.
+    live_get_set(&o, "src", src_get, src_set, ctx);
     install_text_accessor(&o, ctx);
     for n in ["clientWidth", "offsetWidth", "scrollWidth"] { layout_prop(&o, n, layout_w, ctx); }
     for n in ["clientHeight", "offsetHeight", "scrollHeight"] { layout_prop(&o, n, layout_h, ctx); }
@@ -2033,6 +2057,54 @@ fn install_handlers(o: &JsObject, ctx: &mut Context) {
     ];
     debug_assert_eq!(pairs.len(), ON_HANDLERS.len());
     for (n, g, st) in pairs { live_get_set(o, n, *g, *st, ctx); }
+}
+
+/// ★ SCRIPTS THE PAGE INJECTS AT RUNTIME.
+///
+/// A page that builds `document.createElement('script')` and appends it is
+/// running code, and nothing here executed it — so every global such a script
+/// defines was missing, which is most of what the cause list had left
+/// (window.gl, window.session, window.useNuxtApp and the rest are all
+/// page-owned globals set exactly this way).
+///
+/// ★★ INLINE ONLY, AND THAT IS A POLICY DECISION, NOT A SHORTCUT. Inspecting
+/// what the corpus actually injects settles it: the src-bearing ones are
+/// overwhelmingly third-party TAG LOADERS — tag.crsspxl.com, ad tags,
+/// analytics bootstraps. Fetching those would execute tracker code on behalf
+/// of a reader who never asked, and reopen from the inside exactly the hole
+/// the page-network policy closes from the outside. They are refused and
+/// COUNTED, like every other refusal here.
+///
+/// Returns (ran, refused).
+fn run_injected_scripts(ctx: &mut Context, errors: &mut Vec<String>) -> (u32, u32) {
+    let (mut ran, mut refused) = (0, 0);
+    let pending: Vec<Handle> = with(|d| d.by_tag("script")).into_iter()
+        .filter(|h| EXECUTED.with(|e| !e.borrow().contains(h)))
+        .collect();
+    for h in pending {
+        EXECUTED.with(|e| { e.borrow_mut().insert(h); });
+        if with(|d| d.attr(h, "src").is_some()) { refused += 1; continue }
+        // The same type filter the static pass uses: JSON-LD is data.
+        let ok_type = with(|d| match d.attr(h, "type") {
+            None => true,
+            Some(t) => {
+                let t = t.trim().to_ascii_lowercase();
+                let t = t.split(';').next().unwrap_or("").trim().to_string();
+                matches!(t.as_str(), "" | "text/javascript" | "application/javascript"
+                    | "text/ecmascript" | "application/ecmascript" | "module")
+            }
+        });
+        if !ok_type { continue }
+        let text = with(|d| d.text_content(h));
+        if text.trim().is_empty() { continue }
+        CURRENT.with(|c| *c.borrow_mut() = Some(h));
+        if let Err(e) = ctx.eval(Source::from_bytes(text.as_bytes())) {
+            errors.push(format!("injected script: {}", e.to_string().chars().take(160)
+                .collect::<String>()));
+        } else { ran += 1 }
+        CURRENT.with(|c| *c.borrow_mut() = None);
+    }
+    (ran, refused)
 }
 
 /// One step of xorshift64*, enough for the uses the corpus makes of
@@ -3553,6 +3625,7 @@ impl ScriptEngine for BoaEngine {
         SHEET_CACHE.with(|c| c.borrow_mut().clear());
         DISPATCH.with(|c| *c.borrow_mut() = (0, 0));
         DOC_WRITE.with(|c| *c.borrow_mut() = (0, 0));
+        EXECUTED.with(|e| e.borrow_mut().clear());
         WRITE_POS.with(|m| m.borrow_mut().clear());
         DOM.with(|d| *d.borrow_mut() = std::mem::take(dom));
         let hooks = std::rc::Rc::new(FixedHooks);
@@ -3692,7 +3765,8 @@ impl ScriptEngine for BoaEngine {
             module_retries: 0, observers_registered: 0, mutation_records: 0,
             ce_upgrades: 0, history_writes: 0, history_refused: 0,
             events_dispatched: 0, event_listeners_run: 0,
-            doc_writes: 0, doc_writes_refused: 0, layout_reads: 0,
+            doc_writes: 0, doc_writes_refused: 0,
+            injected_scripts_run: 0, injected_scripts_refused: 0, layout_reads: 0,
             timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0,
             page_blocked: 0, blocked_hosts: vec![], beacons_suppressed: 0 };
         RECORDING.with(|r| *r.borrow_mut() = false);
@@ -3726,6 +3800,8 @@ impl ScriptEngine for BoaEngine {
         }
         RECORDING.with(|r| *r.borrow_mut() = true);
         for s in scripts {
+            // Already run by the static pass: the sweep must not repeat it.
+            if let Some(h) = s.element { EXECUTED.with(|e| { e.borrow_mut().insert(h); }); }
             // Per spec, currentScript is null while a MODULE evaluates.
             CURRENT.with(|c| *c.borrow_mut() = if s.module { None } else { s.element });
             let mut err = if s.module {
@@ -3798,11 +3874,29 @@ impl ScriptEngine for BoaEngine {
         // `setTimeout(fn, 0)` is an ordinary deferred-init idiom, and the
         // DOMContentLoaded lesson applies again: registering is not the point,
         // dispatching is.
+        // ★ Interleaved with the timer queue, because each feeds the other:
+        // an injected script registers timers, and a timer injects scripts.
+        // Bounded rounds — a page that injects a script from a script would
+        // otherwise never settle.
         let drain = format!("__drainTimers({}, {})", TIMER_BUDGET, TIMER_HORIZON_MS);
-        if let Err(e) = ctx.eval(Source::from_bytes(drain.as_bytes())) {
-            rep.errors.push(format!("timers: {e}"));
+        for round in 0..8 {
+            // ★ INJECTED SCRIPTS FIRST. A browser runs one the moment it is
+            // appended, which is BEFORE any timer the page had already set.
+            // Sweeping after the drain instead let a `setTimeout` read a
+            // global the injected script had not defined yet — the exact
+            // ordering the mechanism exists to get right.
+            let (ran, refused) = run_injected_scripts(&mut ctx, &mut rep.errors);
+            rep.injected_scripts_run += ran;
+            rep.injected_scripts_refused += refused;
+            let _ = ctx.run_jobs();
+            let _ = ctx.eval(Source::from_bytes(b"__deliverMutations(8); __upgradePending()"));
+            if let Err(e) = ctx.eval(Source::from_bytes(drain.as_bytes())) {
+                rep.errors.push(format!("timers: {e}"));
+            }
+            let _ = ctx.run_jobs();
+            // Settled once a full round adds nothing new.
+            if ran == 0 && refused == 0 && round > 0 { break }
         }
-        let _ = ctx.run_jobs();
         if let Ok(v) = ctx.eval(Source::from_bytes(b"__timerStats()")) {
             if let Some(o) = v.as_object() {
                 rep.timers_fired = o.get(0, &mut ctx).ok()
