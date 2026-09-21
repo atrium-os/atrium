@@ -37,6 +37,13 @@ SCP_OPTS="-i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o
 TARGET="aarch64-unknown-freebsd"
 APP_ID="org.atrium.navigator.worker"
 SOCK="/tmp/pd-e2e.sock"
+# ★ ITS OWN STAGING DIRECTORY, not /root. The first committed run of this
+# script failed at `scp portcullisd` because a daemon started BY HAND earlier
+# in the session still held /root/portcullisd open — ETXTBSY, which scp
+# reports as "lost connection". A harness that shares a path with whatever a
+# human last did there is a harness whose result depends on the room being
+# tidy. It owns this directory and nothing else writes to it.
+BIN="/root/navigator-e2e"
 QUICK=0
 RECDIR=""
 
@@ -105,13 +112,13 @@ stage() {
     [ -f "$src" ] || die "missing build output: $src"
     h=$(shasum -a 256 "$src" | cut -d' ' -f1)
     # Remove first: a running binary is ETXTBSY and scp fails half-way.
-    "$VSSH" "rm -f /root/$name" >/dev/null 2>&1
+    "$VSSH" "mkdir -p $BIN && rm -f $BIN/$name" >/dev/null 2>&1
     # shellcheck disable=SC2086
-    scp $SCP_OPTS "$src" "root@localhost:/root/$name" >/dev/null 2>&1 \
-        || die "scp $name"
-    g=$("$VSSH" "sha256 -q /root/$name" 2>/dev/null)
+    scp $SCP_OPTS "$src" "root@localhost:$BIN/$name" >/dev/null 2>&1 \
+        || die "scp $name (a binary held open elsewhere reports as 'lost connection')"
+    g=$("$VSSH" "sha256 -q $BIN/$name" 2>/dev/null)
     [ "$h" = "$g" ] || die "$name hash mismatch: host=$h guest=$g (a stale binary would have been measured)"
-    "$VSSH" "chmod +x /root/$name" >/dev/null 2>&1
+    "$VSSH" "chmod +x $BIN/$name" >/dev/null 2>&1
     echo "  $name ok"
 }
 stage "$ROOT/portcullis/target/$TARGET/debug/portcullis"        portcullis
@@ -128,10 +135,10 @@ say "$STAGE  (signed; opifex resolves the lib closure)"
     openssl ec -in /root/e2e-key.pem -pubout -out /root/e2e-pub.pem 2>/dev/null
     mkdir -p /etc/atrium/publishers && cp /root/e2e-pub.pem /etc/atrium/publishers/e2e.pem
     rm -rf /root/e2e-bundle && mkdir -p /root/e2e-bundle/bin
-    cp /root/navigator-worker /root/e2e-bundle/bin/navigator-worker
+    cp $BIN/navigator-worker /root/e2e-bundle/bin/navigator-worker
     printf '[app]\nid = \"$APP_ID\"\nname = \"Navigator document worker\"\nversion = \"1\"\nentry = \"bin/navigator-worker\"\n' > /root/e2e-bundle/atrium.toml
     openssl dgst -sha256 -sign /root/e2e-key.pem -out /root/e2e-bundle/atrium.toml.sig /root/e2e-bundle/atrium.toml
-    /root/opifex install /root/e2e-bundle" >/dev/null 2>&1 \
+    $BIN/opifex install /root/e2e-bundle" >/dev/null 2>&1 \
     || die "could not build/sign/install the worker bundle"
 "$VSSH" "test -x /var/lib/atrium/apps/$APP_ID/bin/navigator-worker" \
     || die "the installed bundle has no entry binary"
@@ -169,7 +176,7 @@ STAGE="daemon"
 say "$STAGE"
 "$VSSH" "pkill -f 'portcullisd --socket $SOCK' >/dev/null 2>&1
          rm -f $SOCK
-         /root/portcullisd --socket $SOCK > /root/e2e-pd.log 2>&1 &
+         $BIN/portcullisd --socket $SOCK > /root/e2e-pd.log 2>&1 &
          sleep 2
          pgrep -f 'portcullisd --socket $SOCK' > /dev/null" \
     || die "portcullisd did not start: $("$VSSH" "cat /root/e2e-pd.log" 2>/dev/null)"
@@ -179,7 +186,7 @@ echo "  up on $SOCK"
 STAGE="corpus"
 say "$STAGE  (one jail per document, created by portcullisd)"
 OUT=$("$VSSH" "export PORTCULLIS_SOCKET=$SOCK
-    /root/jailed_corpus /root/e2e-rec $APP_ID /root/portcullis exec --daemon --instance '{instance}' 2>/dev/null")
+    $BIN/jailed_corpus /root/e2e-rec $APP_ID $BIN/portcullis exec --daemon --instance '{instance}' 2>/dev/null")
 echo "$OUT" | sed 's/^/  /'
 echo "$OUT" | grep -q '^OK$' || die "corpus run did not report OK"
 # ★ Gate on the NUMBERS, not on the word OK: a run that opened nothing also
@@ -207,7 +214,7 @@ say "$STAGE"
          sed -i '' -e 's/^id = .*/id = \"test.e2e.unsigned\"/' /root/e2e-unsigned/atrium.toml 2>/dev/null ||
          sed -i -e 's/^id = .*/id = \"test.e2e.unsigned\"/' /root/e2e-unsigned/atrium.toml" >/dev/null 2>&1
 UNS=$("$VSSH" "export PORTCULLIS_SOCKET=$SOCK
-    /root/portcullis exec --daemon --instance u /root/e2e-unsigned < /dev/null 2>&1 | tail -1")
+    $BIN/portcullis exec --daemon --instance u /root/e2e-unsigned < /dev/null 2>&1 | tail -1")
 case "$UNS" in
     *REFUSED*|*not\ signed*|*trust*) echo "  unsigned refused" ;;
     *) die "an UNSIGNED bundle was not refused: $UNS" ;;
@@ -221,9 +228,9 @@ esac
 DUP=$("$VSSH" "export PORTCULLIS_SOCKET=$SOCK
     F=\$(ls /root/e2e-rec/*.json | head -1); LEN=\$(wc -c < \"\$F\" | tr -d ' ')
     ( printf 'OPEN %s\\n' \"\$LEN\"; cat \"\$F\"; sleep 6 ) |
-        /root/portcullis exec --daemon --instance dup $APP_ID >/dev/null 2>&1 &
+        $BIN/portcullis exec --daemon --instance dup $APP_ID >/dev/null 2>&1 &
     sleep 3
-    /root/portcullis exec --daemon --instance dup $APP_ID < /dev/null 2>&1 | tail -1
+    $BIN/portcullis exec --daemon --instance dup $APP_ID < /dev/null 2>&1 | tail -1
     wait")
 case "$DUP" in
     *already\ running*) echo "  duplicate instance refused" ;;
