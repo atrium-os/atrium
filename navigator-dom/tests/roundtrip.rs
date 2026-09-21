@@ -115,3 +115,20 @@ fn a_div_is_not_foreign_content() {
     assert!(!d.is_foreign(div));
     assert!(matches!(d.get(div).map(|n| &n.kind), Some(Kind::Element(t)) if t == "div"));
 }
+
+/// Grafting carries the namespace flag, not just the attributes.
+#[test]
+fn grafting_preserves_foreign_content() {
+    let frag = navigator_dom::parse_fragment(r#"<svg viewBox="0 0 4 4"></svg>"#);
+    let svg = frag.by_tag("svg").first().copied().expect("the svg");
+    assert!(frag.is_foreign(svg), "fragment parsing must mark it");
+
+    let mut host = navigator_dom::parse("<html><body><div id=h></div></body></html>");
+    let target = host.by_id("h").unwrap();
+    let g = host.graft(&frag, svg);
+    host.append(target, g);
+    assert!(host.is_foreign(g), "graft dropped the namespace");
+    host.set_attr(g, "preserveAspectRatio", "none");
+    assert_eq!(host.attr(g, "preserveAspectRatio"), Some("none"));
+    assert!(host.serialize().contains(r#"viewBox="0 0 4 4""#), "{}", host.serialize());
+}

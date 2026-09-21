@@ -396,7 +396,12 @@ impl Dom {
         let new = self.create(kind);
         if let Some(src) = other.get(from) {
             let attrs = src.attrs.clone();
-            if let Some(n) = self.get_mut(new) { n.attrs = attrs; }
+            // ★ `foreign` travels with the node. Grafting an SVG subtree into
+            // another tree without it leaves nodes whose attribute names a
+            // later set_attr would lowercase — `viewBox` silently becoming
+            // `viewbox` only in documents that had been grafted.
+            let foreign = src.foreign;
+            if let Some(n) = self.get_mut(new) { n.attrs = attrs; n.foreign = foreign; }
         }
         for &c in &other.get(from).map(|n| n.children.clone()).unwrap_or_default() {
             let cc = self.graft(other, c);

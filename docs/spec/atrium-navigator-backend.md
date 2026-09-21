@@ -212,6 +212,44 @@ inside the profile. A validator that refused everything would pass every refusal
 written, and this project has already shipped a profile checker that checked nothing while
 two whole corpora reported clean.
 
+### 4.3 Replaying a transition
+
+Applying a transition's effects is the first operation in the backend that *changes*
+anything a reader will see, so it is the one that has to refuse.
+
+**Application is atomic.** A transition is one observed step of a state machine: the
+converter triggered something, diffed the tree, and recorded the whole difference.
+Applying part of it produces a document nobody ever observed and nothing ever validated —
+a menu marked open whose contents were never inserted. That is worse than refusing,
+because it looks like a rendered page. Every effect is therefore checked before any effect
+lands, the work happens on a copy, and the copy replaces the document only if all of it
+succeeded. The copy *is* the mechanism: an undo log would put the correctness of a refusal
+in the code path that runs only when something has already gone wrong.
+
+**Four refusals, each naming itself:**
+
+- *Unresolved trigger* — the transition was not recorded against this document at all.
+  Reported as itself rather than as whatever its effects happen to fail on first.
+- *Unresolved target* — an effect names a node this document does not have.
+- *Failed precondition* — every attribute effect records what it replaces. A document that
+  does not hold that value is not the document this was recorded against; the refusal
+  carries both values so a caller can tell a stale recording from a tampered one. This is
+  the check that makes a recording from a shared store safe to replay at all.
+- *Incomplete* — the recording says effects were dropped when it was made, so it does not
+  describe a complete step and cannot be replayed into one.
+
+And the profile is re-checked on the **result**. Per-effect limits do not subsume it: 64
+effects of 16 KiB of markup each is megabytes of growth, and the ceiling is a property of
+the document, not of any single edit.
+
+**Position is not recorded.** An `insert` names its parent, not its index among siblings,
+so replay appends. Where ordering matters this is a fidelity loss, and it is stated here
+rather than discovered later — the recording format would have to carry an index to fix it.
+
+Measured: all 264 anchored transitions in the main corpus and both in the adversarial one
+apply cleanly to the documents they were recorded against — every precondition holds,
+every path resolves, and no result leaves the profile.
+
 ---
 
 ## 5. The store is Tessera

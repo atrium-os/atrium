@@ -124,3 +124,50 @@ fn every_emitted_document_is_inside_the_profile() {
         "the backend refuses documents its own converter emits:\n  {}",
         refused.join("\n  "));
 }
+
+/// ★★ EVERY RECORDED TRANSITION MUST APPLY TO ITS OWN DOCUMENT.
+///
+/// `tests/apply.rs` proves the refusals fire on hand-built cases. This is the
+/// arm that can falsify the design: these transitions were recorded by the
+/// converter against exactly these documents, so every precondition must
+/// hold, every path must resolve, and the result must stay inside the
+/// profile. A failure here means the replay model disagrees with what the
+/// converter actually observed — which is a bug in one of them, never a
+/// reason to loosen the check.
+#[test]
+fn every_recorded_transition_applies_to_its_own_document() {
+    let Ok(dir) = std::env::var("NAVIGATOR_RECORDINGS") else {
+        eprintln!("SKIPPED: set NAVIGATOR_RECORDINGS to a directory of emitted recordings");
+        return;
+    };
+    use navigator_backend::document::Document;
+    let (mut applied, mut skipped_unanchored, mut skipped_incomplete) = (0, 0, 0);
+    let mut failures = vec![];
+    for e in std::fs::read_dir(&dir).expect("readable directory").flatten() {
+        let p = e.path();
+        if p.extension().map(|x| x != "json").unwrap_or(true) { continue }
+        let bytes = std::fs::read(&p).expect("readable file");
+        let Ok(r) = ingest(&bytes, &Limits::default()) else { continue };
+        let base = Document::accept(&r.document).expect("inside the profile");
+        for t in &r.transitions {
+            // Unanchored transitions name nodes the page's own scripts made;
+            // they are reported by the converter precisely because they
+            // cannot be replayed against a tier 1 document.
+            if !t.anchored { skipped_unanchored += 1; continue }
+            if t.effects.iter().any(|e| matches!(e, navigator_backend::Effect::Truncated { .. })) {
+                skipped_incomplete += 1;
+                continue;
+            }
+            match base.applied(t) {
+                Ok(_) => applied += 1,
+                Err(why) => failures.push(format!("{}: {} -> {why}", p.display(), t.trigger)),
+            }
+        }
+    }
+    eprintln!("applied {applied} recorded transitions \
+               ({skipped_unanchored} unanchored, {skipped_incomplete} incomplete, skipped)");
+    assert!(applied > 0, "no transitions were applied — this test checked nothing");
+    assert!(failures.is_empty(),
+        "transitions failed against the document they were recorded on:\n  {}",
+        failures.join("\n  "));
+}

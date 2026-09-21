@@ -12,6 +12,7 @@
 //! separate answer from *what does it render to*, because the two fail for
 //! different reasons and a caller needs to tell them apart.
 
+pub mod apply;
 pub mod document;
 pub mod ingest;
 pub mod limits;
