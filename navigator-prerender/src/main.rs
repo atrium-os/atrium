@@ -65,6 +65,7 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
     // and is only wired when the run is networked at all.
     let mut eng = BoaEngine {
         explore: std::env::var("PRERENDER_EXPLORE").ok().as_deref() == Some("1"),
+        same_site_network: std::env::var("PRERENDER_SAME_SITE").ok().as_deref() == Some("1"),
         page_fetcher: if net {
             Some(Box::new(HttpFetcher::new(std::env::temp_dir().join("prerender-pagecache"))))
         } else { None },

@@ -101,6 +101,9 @@ thread_local! {
     /// artifact may be treated as a secret. That is already true of a
     /// converted page: everything in it is public by construction.
     static RNG: RefCell<u64> = const { RefCell::new(0) };
+    /// Whether the page network admits same-SITE requests as well as
+    /// same-origin ones. Off by default; see spec open question 7.
+    static SAME_SITE: RefCell<bool> = const { RefCell::new(false) };
     /// Script elements already executed, so the dynamic sweep runs each at
     /// most once however many times it passes over the document.
     static EXECUTED: RefCell<std::collections::HashSet<Handle>> =
@@ -1907,6 +1910,25 @@ fn style_obj(h: Handle, ctx: &mut Context) -> JsValue {
 /// assumed. The complete answer is tier-3 substitution by content hash — the
 /// analytics SDK never runs at all — and this is the structural floor beneath
 /// it.
+/// The registrable domain, approximately.
+///
+/// ★ APPROXIMATELY, AND THAT IS THE PROBLEM WITH SAME-SITE. Doing this
+/// correctly needs the Public Suffix List, because `foo.co.uk` and
+/// `foo.github.io` are registrable while `co.uk` and `github.io` are not.
+/// This handles the common multi-part suffixes and will be WRONG for others
+/// — which is itself evidence for the decision: a boundary that cannot be
+/// computed without a downloaded, drifting list is a weaker boundary than one
+/// that can be computed from the URL alone.
+fn registrable(host: &str) -> String {
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() < 3 { return host.to_ascii_lowercase() }
+    let last_two = format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1]);
+    const MULTI: &[&str] = &["co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "co.jp",
+                             "co.nz", "co.za", "com.br", "github.io", "co.in"];
+    let take = if MULTI.contains(&last_two.as_str()) { 3 } else { 2 };
+    parts[parts.len().saturating_sub(take)..].join(".").to_ascii_lowercase()
+}
+
 fn blocked(reason: &str, host: &str) {
     PAGE_BLOCKED.with(|b| {
         let mut b = b.borrow_mut();
@@ -1934,12 +1956,24 @@ fn fetch_sync(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
         blocked(&format!("{method} to"), &host);
         return Ok(JsValue::null());
     }
-    let same_origin = match (&base, &parsed) {
-        (Some(b), Some(u)) => url::Url::parse(b).ok()
-            .map(|b| b.origin() == u.origin()).unwrap_or(false),
+    // ★ SAME-ORIGIN or SAME-SITE, and the difference is the whole of spec
+    // open question 7. A hydrating page's data commonly lives one label over
+    // — bbc.co.uk fetching idcta.api.bbc.co.uk — which is same SITE and
+    // different ORIGIN, so the stricter rule refuses exactly the request the
+    // page needs to rebuild what it tore down. Relaxing it is measurable, so
+    // it is measured rather than argued.
+    let allowed = match (&base, &parsed) {
+        (Some(b), Some(u)) => url::Url::parse(b).ok().map(|b| {
+            if b.origin() == u.origin() { return true }
+            if !SAME_SITE.with(|f| *f.borrow()) { return false }
+            match (b.host_str(), u.host_str()) {
+                (Some(bh), Some(uh)) => registrable(bh) == registrable(uh),
+                _ => false,
+            }
+        }).unwrap_or(false),
         _ => false,
     };
-    if !same_origin {
+    if !allowed {
         blocked("cross-origin", &host);
         return Ok(JsValue::null());
     }
@@ -2601,6 +2635,9 @@ pub struct BoaEngine {
     pub page_fetcher: Option<Box<dyn crate::fetch::Fetcher>>,
     /// Wall-clock time reported to the page, fixed so conversions are
     /// reproducible. See `CONVERSION_EPOCH_MS`.
+    /// Admit same-SITE page requests, not only same-origin. Spec open
+    /// question 7: measurable, so measure it.
+    pub same_site_network: bool,
     pub clock_millis: i64,
     /// ★ Run the page's JS as an ORACLE after the normal pass: probe the
     /// elements it wired for interaction, record what each one DOES, and
@@ -4069,6 +4106,7 @@ impl ScriptEngine for BoaEngine {
         let _ = ctx.register_global_callable(js_string!("__rand_u32"), 0,
             NativeFunction::from_fn_ptr(rand_u32));
         seed_rng(self.base_url.as_deref());
+        SAME_SITE.with(|f| *f.borrow_mut() = self.same_site_network);
         PAGE_NET.with(|n| *n.borrow_mut() = self.page_fetcher.take());
         PAGE_FETCHES.with(|c| *c.borrow_mut() = (0, 0));
         PAGE_BLOCKED.with(|b| { let mut b = b.borrow_mut(); b.0 = 0; b.1.clear(); });

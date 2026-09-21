@@ -323,6 +323,51 @@ will not work without the reader's involvement, and a few will not work at all.
 proportions are not the web's. What transfers is the direction — tier 2 does not rescue
 this population either — not the percentages.
 
+### 5.4.1c Settled: the page network stays SAME-ORIGIN
+
+Open question 7 asked where the data boundary sits for hydrating pages, since §5.4.1 shows
+their loss is data access rather than engine fidelity. The candidate relaxation was
+concrete: admit same-**site** requests, not merely same-**origin**. It is the obvious move,
+because a hydrating page's data commonly lives one label over — `bbc.co.uk` fetching
+`idcta.api.bbc.co.uk` is same site, different origin, and the stricter rule refuses exactly
+the request the page needs.
+
+It was implemented behind a flag and measured on both corpora rather than argued.
+
+| | same-origin | same-site |
+|---|---|---|
+| corpus 1 — page requests admitted | 88 | **1,082** |
+| corpus 1 — documents gaining content | 19 | 19 |
+| corpus 1 — documents demoted to tier 1 | 1 | 1 |
+| corpus 2 — page requests admitted | 54 | 62 |
+| corpus 2 — documents gaining content | 6 | 7 |
+| corpus 2 — documents demoted to tier 1 | 2 | 2 |
+
+**It buys one marginal document and admits twelve times the traffic.** Not one document is
+rescued from demotion. bbc.co.uk — the case that motivated the question — is not recovered
+at all: its text still falls from 14,654 characters to 5,063.
+
+**And the traffic it admits is the wrong kind.** 989 of the 1,082 requests come from a
+single document, to a single first-party host, in a burst that produces no content
+whatsoever. That is the shape of telemetry, not of data a page renders. The reason is
+structural rather than incidental: **first-party analytics lives on same-site subdomains
+precisely because third-party blocking does not reach there.** Same-site is the boundary
+modern tracking is built to sit inside, so relaxing to it concedes the most while gaining
+the least.
+
+There is a second reason, weaker but pointing the same way. Same-site cannot be computed
+from a URL — it needs the Public Suffix List, a downloaded file that drifts, and a boundary
+that depends on a fetched list is weaker than one computable from the URL alone.
+
+**Settled: the page network remains same-origin GET.** The hydrating population is not
+recovered by a boundary we would be willing to move, and the boundary that would recover it
+is the one we are least willing to move. For that population the answer is tier 1 (§5.4.2)
+and, where the reader wants more, reader-assisted import (§5.4.1b) — the same answer open
+question 6 reached from the other side, which is some evidence it is the right shape.
+
+*The flag stays in the code, off by default, so the measurement can be repeated rather than
+believed.*
+
 ### 5.4.2 Never emit an artifact worse than the input
 
 Because tier 2 is tier 1's DOM plus whatever the scripts changed, both artifacts are in
@@ -1213,8 +1258,8 @@ Not because the risk is small, but because of where it sits:
    honestly and never impersonate a browser; surface a refusal instead of converting the
    challenge page. What remains open is the *detection* rule for marking an artifact
    REFUSED-BY-ORIGIN, which is a matter of evidence rather than principle.
-7. **Where the data-access boundary sits for hydrating pages** — §5.4.1 shows the reading
-   lane's remaining loss is cross-origin data a page needs to rebuild what it tore down,
-   not engine fidelity. Relaxing it for same-site data would recover those documents and
-   reintroduce a privacy cost; refusing it makes tier 1 the answer for that population.
-   This is now the decision that matters, and it is a policy one.
+7. ~~**Where the data-access boundary sits for hydrating pages**~~ — **settled in
+   §5.4.1c**: the page network stays same-origin GET. Measured, the same-site relaxation
+   buys one marginal document, rescues none from demotion, and admits 12x the traffic —
+   989 requests of which come from one document to one first-party host and produce no
+   content at all.

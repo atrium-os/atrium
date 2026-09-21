@@ -123,3 +123,69 @@ fn beacons_are_suppressed_not_sent() {
     assert_eq!(c.beacons_suppressed, 1, "and must be counted");
     assert_eq!(c.page_fetches, 0, "nothing may go out");
 }
+
+/// ★ SPEC §5.4.1c: the page network stays SAME-ORIGIN. The same-site
+/// relaxation is implemented behind a flag so the measurement can be
+/// repeated, and these pin both sides of it — the boundary is the decision,
+/// so it should be impossible to move by accident.
+#[test]
+fn a_same_site_subdomain_is_refused_by_default() {
+    let mut api = MapFetcher::default();
+    api.0.insert("https://api.example.test/data".into(), r#"{"v":1}"#.into());
+    let html = r#"<html><body><div id=r>base</div><script>
+        fetch('https://api.example.test/data').then(function () {
+          document.getElementById('r').setAttribute('ok','1');
+        }).catch(function () {
+          document.getElementById('r').setAttribute('refused','1');
+        });
+      </script></body></html>"#;
+    let mut eng = BoaEngine { page_fetcher: Some(Box::new(api)), ..Default::default() };
+    let c = convert_with(html, Some("https://www.example.test/p.html"),
+                         &mut eng, &mut NoNetwork);
+    assert_eq!(c.page_fetches, 0, "same site is not same origin");
+    assert!(c.page_blocked >= 1, "and the refusal is counted");
+    assert!(c.html.contains(r#"refused="1""#), "{}", c.html);
+}
+
+#[test]
+fn the_same_site_relaxation_works_when_explicitly_enabled() {
+    let mut api = MapFetcher::default();
+    api.0.insert("https://api.example.test/data".into(), r#"{"v":1}"#.into());
+    let html = r#"<html><body><div id=r>base</div><script>
+        fetch('https://api.example.test/data').then(function (x) { return x.text(); })
+          .then(function (t) { document.getElementById('r').textContent = t; });
+      </script></body></html>"#;
+    let mut eng = BoaEngine {
+        page_fetcher: Some(Box::new(api)),
+        same_site_network: true,
+        ..Default::default()
+    };
+    let c = convert_with(html, Some("https://www.example.test/p.html"),
+                         &mut eng, &mut NoNetwork);
+    assert_eq!(c.page_fetches, 1);
+    // Serialized, so the quotes are escaped — the content is there, spelt
+    // as the artifact spells it.
+    assert!(c.html.contains("{&quot;v&quot;:1}"), "{}", c.html);
+}
+
+/// ★ And a DIFFERENT site is refused either way — the relaxation widens the
+/// boundary by one label, not into the open.
+#[test]
+fn a_different_site_is_refused_even_with_the_relaxation() {
+    let mut api = MapFetcher::default();
+    api.0.insert("https://tracker.other.test/collect".into(), "1".into());
+    let html = r#"<html><body><div id=r></div><script>
+        fetch('https://tracker.other.test/collect').catch(function () {
+          document.getElementById('r').setAttribute('refused','1');
+        });
+      </script></body></html>"#;
+    let mut eng = BoaEngine {
+        page_fetcher: Some(Box::new(api)),
+        same_site_network: true,
+        ..Default::default()
+    };
+    let c = convert_with(html, Some("https://www.example.test/p.html"),
+                         &mut eng, &mut NoNetwork);
+    assert_eq!(c.page_fetches, 0);
+    assert!(c.html.contains(r#"refused="1""#), "{}", c.html);
+}
