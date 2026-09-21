@@ -109,6 +109,27 @@ pub enum Status {
     Unknown,
 }
 
+/// Why a reader's click did nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NavigateError {
+    /// ★ The recording has no transition for this trigger. Distinct from a
+    /// refusal: nothing was wrong with the document, the page simply never
+    /// did anything here when the converter tried it.
+    NoSuchTrigger { trigger: String },
+    /// There is one, and applying it was refused.
+    Refused(ApplyError),
+}
+
+impl std::fmt::Display for NavigateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NavigateError::NoSuchTrigger { trigger } =>
+                write!(f, "nothing recorded for {trigger:?}"),
+            NavigateError::Refused(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenError {
     /// The count bound. Names both numbers so a caller can say what to close.
@@ -140,6 +161,18 @@ impl std::fmt::Display for OpenError {
 
 pub type SessionId = u64;
 
+fn effect_bytes(e: &crate::Effect) -> usize {
+    use crate::Effect::*;
+    match e {
+        Attribute { target, name, from, to } => target.len() + name.len()
+            + from.as_ref().map_or(0, String::len) + to.as_ref().map_or(0, String::len),
+        Insert { parent, html, .. } => parent.len() + html.len(),
+        Remove { target } => target.len(),
+        RemoveRange { parent, .. } => parent.len(),
+        Truncated { .. } => 0,
+    }
+}
+
 /// One recording being read.
 pub struct Session {
     pub url: String,
@@ -154,8 +187,15 @@ pub struct Session {
     /// document. A document only changes when the reader moves it, which is
     /// exactly when this is updated.
     current_bytes: usize,
+    /// Fixed at open: the transition table does not change.
+    transitions_bytes: usize,
     opened_at: Millis,
     last_seen: Millis,
+    /// ★ THE TRANSITION TABLE STAYS WITH THE SESSION. A reader clicks an
+    /// element; something has to turn that into the transition the converter
+    /// recorded for it. Dropping the table at open time made a session able
+    /// to hold a document and unable to do anything with it.
+    transitions: Vec<Transition>,
 }
 
 impl Session {
@@ -187,6 +227,28 @@ impl Session {
     /// base would drift further from the truth the longer a session lived.
     pub fn bytes(&self) -> usize {
         self.base_bytes + self.current_bytes + self.history.cost().undo_bytes
+            + self.transitions_bytes
+    }
+
+    pub fn transitions(&self) -> &[Transition] { &self.transitions }
+
+    /// The transition a trigger names, if this recording has one.
+    ///
+    /// ★ ANCHORED ONLY. An unanchored transition addresses a node the page's
+    /// own scripts created, which is not in the published document — the
+    /// converter reports them so the loss is visible, and offering one to a
+    /// reader would produce a refusal at apply time for a reason the reader
+    /// could do nothing about.
+    pub fn transition_for(&self, trigger: &str) -> Option<&Transition> {
+        self.transitions.iter().find(|t| t.anchored && t.trigger == trigger)
+    }
+
+    /// Take the transition a trigger names.
+    pub fn navigate(&mut self, trigger: &str) -> Result<(), NavigateError> {
+        let t = self.transition_for(trigger)
+            .ok_or_else(|| NavigateError::NoSuchTrigger { trigger: trigger.to_string() })?
+            .clone();
+        self.go(&t).map_err(NavigateError::Refused)
     }
 
     pub fn opened_at(&self) -> Millis { self.opened_at }
@@ -298,7 +360,11 @@ impl Sessions {
         let doc = Document::accept(&r.document).map_err(OpenError::OutsideProfile)?;
 
         // Charged at twice the document: the published copy and the reader's.
-        let needed = r.document.len() * 2;
+        let transitions_bytes: usize = r.transitions.iter()
+            .map(|t| t.trigger.len() + t.event.len()
+                 + t.effects.iter().map(effect_bytes).sum::<usize>())
+            .sum();
+        let needed = r.document.len() * 2 + transitions_bytes;
         let used = self.bytes();
         let available = self.limits.max_total_bytes.saturating_sub(used);
         if needed > available {
@@ -314,6 +380,8 @@ impl Sessions {
             // serialization can differ in length from the recorded bytes —
             // the parser normalizes — so it is measured, not assumed.
             current_bytes: doc.dom.serialize().len(),
+            transitions: r.transitions.clone(),
+            transitions_bytes,
             history: History::with_limits(doc, self.limits.history),
             opened_at: now,
             last_seen: now,

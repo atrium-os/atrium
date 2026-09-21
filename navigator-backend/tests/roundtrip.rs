@@ -262,3 +262,63 @@ fn the_default_session_bound_holds_the_corpus_heaviest_documents() {
         limits.max_sessions, refused.unwrap());
     assert_eq!(opened, limits.max_sessions.min(recs.len()));
 }
+
+/// ★★ THE WHOLE PIPE, ON REAL BYTES. Converter output goes in as bytes, and a
+/// reader's clicks come out as scenes — through the control plane only, with
+/// nothing in this test reaching past it into a document.
+///
+/// Everything before this proved a layer. This proves they are connected: a
+/// recording that ingests, holds a document inside the profile, and carries
+/// transitions whose triggers resolve is still useless if the broker cannot
+/// turn a click into one of them.
+#[test]
+fn the_broker_drives_real_recordings_end_to_end() {
+    let Ok(dir) = std::env::var("NAVIGATOR_RECORDINGS") else {
+        eprintln!("SKIPPED: set NAVIGATOR_RECORDINGS to a directory of emitted recordings");
+        return;
+    };
+    use navigator_backend::navigatord::{Event, InProcessHost, Navigatord, Request};
+    use navigator_backend::reverse::Back;
+
+    let mut n = Navigatord::new(InProcessHost::default());
+    n.tick(1_000);
+    let (mut opened, mut navigated, mut rewound, mut blocked) = (0, 0, 0, 0);
+    for e in std::fs::read_dir(&dir).expect("readable directory").flatten() {
+        let p = e.path();
+        if p.extension().map(|x| x != "json").unwrap_or(true) { continue }
+        let bytes = std::fs::read(&p).expect("readable file");
+
+        let session = match n.handle(Request::OpenSession { recording: bytes }).pop() {
+            Some(Event::SessionOpened { session, triggers }) => {
+                opened += 1;
+                // Drive every trigger the broker itself offered — not a list
+                // this test invented, which could quietly drift from what a
+                // reader would actually be shown.
+                for trigger in triggers {
+                    match n.handle(Request::Navigate { session, trigger: trigger.clone() })
+                        .pop()
+                    {
+                        Some(Event::SceneReady { .. }) => navigated += 1,
+                        Some(Event::Blocked { why, .. }) => {
+                            blocked += 1;
+                            panic!("{}: offered {trigger} then refused it: {why}", p.display());
+                        }
+                        other => panic!("{}: {other:?}", p.display()),
+                    }
+                    match n.handle(Request::Back { session }).pop() {
+                        Some(Event::Rewound { how: Back::Stepped, .. }) => rewound += 1,
+                        other => panic!("{}: could not go back: {other:?}", p.display()),
+                    }
+                }
+                session
+            }
+            Some(Event::Blocked { why, .. }) => panic!("{}: refused: {why}", p.display()),
+            other => panic!("{}: {other:?}", p.display()),
+        };
+        n.handle(Request::Close { session });
+    }
+    eprintln!("broker: {opened} sessions, {navigated} navigations, {rewound} rewinds, \
+               {blocked} blocked");
+    assert!(opened > 0 && navigated > 0, "this test checked nothing");
+    assert_eq!(navigated, rewound, "every navigation must be reversible");
+}

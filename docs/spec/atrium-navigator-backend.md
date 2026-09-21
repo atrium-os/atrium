@@ -376,6 +376,45 @@ and offered it back, not "no such thing" — the same distinction as `Forgotten`
 `AtStart` in §4.4. The memory of expiries is itself bounded (default 64), so it cannot become
 the leak it was added to explain; past that boundary the answer honestly becomes `Unknown`.
 
+### 4.6 The broker, and the seam that makes §1 testable
+
+`navigatord` drives sessions through the control-plane vocabulary of §3: `OpenSession`,
+`Navigate`, `Back`, `Close`, `Report` in; `SessionOpened`, `SceneReady`, `Rewound`,
+`Closed`, `Expired`, `Blocked`, `NoSuchSession`, `Report` out.
+
+**The broker names no document type.** It cannot call the parser, hold a DOM, or read a
+recording's bytes, because it never sees any of those types — everything that does lives
+behind a `DocumentHost` trait. §2's rule that the broker holds authority but never parses
+stops being a discipline someone must remember and becomes something the type system
+enforces. The test suite drives it only through requests and events, which is §1's claim
+("delete the UI and neither the security posture nor the test suite changes") written down
+as tests; a suite that poked at internals would pass equally against a broker with no seam.
+A second host implementation that owns no parser at all is exercised in the tests, which is
+the cheap half of the proof.
+
+**What is not true yet:** `InProcessHost` runs in this process. There is no jail, no pipe,
+no separate address space. The seam is real; the *isolation* is not, and will not be until a
+host spawns a Portcullis jail and talks to it over a pipe. What exists today buys that the
+swap changes one implementation and no broker logic.
+
+Three behaviours are load-bearing:
+
+- **Refusals are events, not returned errors.** A broker that returned `Result` to its UI
+  would let a caller check the happy path and drop the rest; as events, a refusal travels
+  the same channel as a success and carries a reason meant for a person.
+- **A request is a moment in time.** `handle_at` takes the arrival time, so an expiry can
+  fall due *because* a request arrived, and is delivered *alongside* that request's answer
+  rather than instead of it. Expiries also reach the UI unprompted on a tick — a UI that
+  learned of one only by failing a navigation would show a reader a page that is already
+  gone and then take it away under them.
+- **Only anchored triggers are offered.** An unanchored transition addresses a node the
+  page's own scripts made, which is not in the published document; offering it would produce
+  a refusal the reader could do nothing about.
+
+End to end on real converter output: **98 sessions opened, 259 navigations, 259 rewinds, 0
+blocked** — driving every trigger the broker itself offered, rather than a list the test
+invented.
+
 ### 4.5 Recording format version 2
 
 `atrium-navigator-recording/2` adds one field: an insert's `index`, the position the markup
