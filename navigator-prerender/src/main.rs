@@ -459,8 +459,17 @@ fn main() {
         // answer by tens of points.
         let lo = if scripted > 0 { (clean + browser) * 100 / scripted } else { 0 };
         let hi = if scripted > 0 { (clean + browser + unknown) * 100 / scripted } else { 0 };
-        println!("  -> tier-2 reachable: {lo}% to {hi}%  ({}/{scripted} known, +{unknown} unattributed)",
+        // ★ NOT THE HEADLINE, AND LABELLED SO. This counts documents whose
+        // scripts all RAN. It was the headline for most of this crate's life
+        // and it is the wrong thing to decide on: measured against content,
+        // only 19 of 85 documents gain anything from running them and the
+        // median gains nothing. A number that reads as an endorsement while
+        // the thing it endorses does nothing for three quarters of the corpus
+        // should not be the first thing anyone sees.
+        println!("  -> scripts completed on: {lo}% to {hi}%  ({}/{scripted} known, +{unknown} unattributed)",
             clean + browser);
+        println!("     ^ NOT a measure of artifact quality — see CONTENT GAIN above,");
+        println!("       which is the number that decides whether tier 2 earns its cost.");
         if unknown == 0 {
             println!("  ★ every failure attributed; the spread is closed. Still a");
             println!("    heuristic, not a browser diff — a real control runs the same");

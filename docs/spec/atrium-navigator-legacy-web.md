@@ -228,6 +228,45 @@ conversion that improves layout or ordering without adding words counts as no ch
 the 19 gains are not uniform — one document accounts for 92,432 of the 95,858 characters
 added. The verdict split is a heuristic, not a browser diff (§4).
 
+### 5.4.1a A second corpus, chosen to break the finding
+
+The first corpus is dominated by technical documentation — Wikipedia, W3C, RFCs, language
+docs — which is the most static content on the web, so "tier 1 is enough" could easily be
+an artifact of *what was measured*. A second corpus of 67 pages was fetched deliberately
+from the populations most likely to contradict it: commerce, civic services, forums,
+recipes, listings, non-English news, and app-shaped sites.
+
+It splits into three populations, and keeping them apart is what makes it readable:
+
+| population | n | grew | unchanged | worse | net text |
+|---|---|---|---|---|---|
+| **bot-wall** — a challenge page, not the site | 22 | 1 | 19 | 2 | −6,447 |
+| **app shell** — real page, no content in the HTML | 7 | 0 | 7 | 0 | 0 |
+| **document** — genuine content | 38 | 5 | 31 | 2 | −6,863 |
+
+**The finding survives contact with the population chosen to break it.** Of 38 genuine
+documents, 33 are unchanged or worse for running their scripts, and the net text change is
+NEGATIVE. That is a stronger result than the first corpus (66 of 85), on exactly the
+content where tier 2 was expected to earn its keep.
+
+**The app shells are the honest exception, and they are population 2 of §3.** Seven
+documents have no content in the HTML at all: tier 1 has nothing to publish, and tier 2
+produces nothing either, because what they need is cross-origin, authenticated data this
+converter refuses. Neither tier works. This is the same boundary as open question 6, met
+from the other direction — and it is the clearest statement of what a reading-first system
+does *not* cover.
+
+**A methodological finding that is also a product one.** A third of these fetches returned
+a bot challenge to a plain GET. That is a property of fetching without a browser — and the
+Navigator's converter fetches exactly that way. **A meaningful fraction of commercial sites
+will serve a challenge page rather than content to any converter that does not execute
+JavaScript at fetch time and present a browser's fingerprint.** It is not a conversion
+problem, it is an access problem, and it arrives before any of this spec's machinery runs.
+
+*Caveat on the caveat:* these 67 were chosen adversarially rather than sampled, so their
+proportions are not the web's. What transfers is the direction — tier 2 does not rescue
+this population either — not the percentages.
+
 ### 5.4.2 Never emit an artifact worse than the input
 
 Because tier 2 is tier 1's DOM plus whatever the scripts changed, both artifacts are in
