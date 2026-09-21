@@ -1,3 +1,4 @@
+pub mod artifact;
 pub mod dom;
 pub mod parse;
 pub mod engine;

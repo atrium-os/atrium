@@ -35,6 +35,10 @@ fn classify_message(msg: &str) -> String {
     "UNATTRIBUTED".to_string()
 }
 
+fn name_of(p: &Path) -> String {
+    p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+}
+
 fn collect(p: &Path, out: &mut Vec<PathBuf>) {
     if p.is_dir() {
         if let Ok(rd) = fs::read_dir(p) {
@@ -49,7 +53,11 @@ fn collect(p: &Path, out: &mut Vec<PathBuf>) {
 /// directory driver invokes this in a child process so a pathological
 /// document cannot take the corpus run with it.
 fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
-    let src = fs::read_to_string(file).unwrap_or_default();
+    // The child reads lossily for the same reason, and an unreadable file
+    // becomes an empty document rather than a silent success: `unwrap_or_default`
+    // here turned a gzip blob into a clean conversion of nothing.
+    let src = fs::read(file).map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
     let mut http = HttpFetcher::new(std::env::temp_dir().join("prerender-jscache"));
     let mut nonet = NoNetwork;
     let fetcher: &mut dyn Fetcher = if net { &mut http } else { &mut nonet };
@@ -63,6 +71,22 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
         ..Default::default()
     };
     let c = convert_with(&src, base, &mut eng, fetcher);
+    // PRERENDER_EMIT_DIR writes the publishable recording — the chosen
+    // document plus the transition table — one JSON file per input.
+    if let Ok(dir) = std::env::var("PRERENDER_EMIT_DIR") {
+        let policy = navigator_prerender::TierPolicy::default();
+        let json = navigator_prerender::artifact::emit(base, &c, &policy);
+        let stem = std::path::Path::new(file).file_stem()
+            .map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "doc".into());
+        // ★ Not `let _ =`. A silently-dropped write is how two recordings
+        // went missing from a corpus run and looked like a converter bug.
+        let path = std::path::Path::new(&dir).join(format!("{stem}.json"));
+        if let Err(e) = fs::create_dir_all(&dir) {
+            eprintln!("emit: cannot create {dir}: {e}");
+        } else if let Err(e) = fs::write(&path, json) {
+            eprintln!("emit: cannot write {}: {e}", path.display());
+        }
+    }
     // PRERENDER_DUMP=1 prints the converted artifact itself, for inspecting
     // a single document by hand. The parent never sets it.
     if std::env::var("PRERENDER_DUMP").ok().as_deref() == Some("1") {
@@ -178,6 +202,8 @@ fn main() {
     let mut nulls: BTreeMap<String, u32> = BTreeMap::new();
     let mut missing_docs: BTreeMap<String, usize> = BTreeMap::new();
     let mut elems = vec![];
+    let mut unreadable: Vec<String> = vec![];
+    let mut lossy: Vec<String> = vec![];
     let mut gains: Vec<(i64, String)> = vec![];
     let mut demoted: Vec<String> = vec![];
     let (mut inter, mut trans, mut anch, mut trans_docs) = (0u32, 0u32, 0u32, 0usize);
@@ -185,7 +211,26 @@ fn main() {
     let mut tier2_kept = 0usize;
 
     for f in &files {
-        let Ok(src) = fs::read_to_string(f) else { continue };
+        // ★ NOT a silent skip. `read_to_string` fails on any document that
+        // is not valid UTF-8, and `else { continue }` dropped two of this
+        // corpus's 104 files without a word: one gzip-encoded, one Latin-1.
+        // Every measurement in this crate's history was therefore over 102
+        // documents while the report said 104.
+        //
+        // A Latin-1 page is real content and converts fine lossily; a binary
+        // one is not a document at all. Both are COUNTED and named.
+        let Ok(bytes) = fs::read(f) else { unreadable.push(name_of(f)); continue };
+        if bytes.starts_with(&[0x1f, 0x8b]) || bytes.starts_with(b"\x89PNG") {
+            unreadable.push(name_of(f));
+            continue;
+        }
+        let src = match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                lossy.push(name_of(f));
+                String::from_utf8_lossy(e.as_bytes()).into_owned()
+            }
+        };
         let _ = &src;
         let name = f.file_name().unwrap().to_string_lossy().to_string();
         let b = base.get(&name).cloned().unwrap_or_default();
@@ -287,6 +332,14 @@ fn main() {
     elems.sort();
     let pct = |q: f64| elems.get(((elems.len() as f64) * q) as usize).copied().unwrap_or(0);
     println!("documents            {}", files.len());
+    if !unreadable.is_empty() {
+        println!("  NOT A DOCUMENT      {} (binary; skipped, and said so)", unreadable.len());
+        for n in unreadable.iter().take(3) { println!("      {n}"); }
+    }
+    if !lossy.is_empty() {
+        println!("  decoded LOSSILY     {} (not UTF-8; converted anyway)", lossy.len());
+        for n in lossy.iter().take(3) { println!("      {n}"); }
+    }
     if timed_out > 0 { println!("  TIMED OUT / crashed {timed_out}  (child killed at {DEADLINE:?})"); }
     println!("  with inline script {with_js}");
     println!("  scripts all ran    {js_ok}");
