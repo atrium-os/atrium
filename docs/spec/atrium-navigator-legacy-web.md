@@ -171,6 +171,116 @@ fraction is usable under tier 1, then tier 1+2, then tier 1+2+3. That number dec
 whether the largest single piece of work in D6 is worth starting, and it is cheap to
 obtain relative to the engine itself.
 
+### 5.4.1 The experiment, run — and what it says
+
+§5.4 asked for a concrete number and deferred a decision on it. The number now exists,
+from `navigator-prerender` over a 104-document corpus of real sites (85 with script).
+It is reported by the converter itself, so it can be re-run rather than believed.
+
+**Tier 2's prerender half completes on 82–84% of scripted documents.** That is the
+fraction whose scripts all run without a gap in our host environment — the number §5.4
+implicitly asked for, and on its own it reads as an endorsement of tier 2.
+
+**It is the wrong number to decide on.** "Every script ran" is not "the artifact is
+better". Measuring the visible text a conversion actually adds:
+
+| outcome of running the scripts | documents |
+|---|---|
+| more content than the raw HTML | 19 |
+| no change | 64 |
+| **less** content — tier 1 is better | 2 |
+
+So **tier 1 alone is adequate or better for 66 of 85 scripted documents**, and the median
+document gains nothing from tier 2 at all. The two regressions are hydrating apps that
+tear down server-rendered content and rebuild it emptier; for those, converting is worse
+than not converting, which §5.4 did not anticipate and which the tier model must handle
+(see §5.4.2).
+
+**What this says about the engine decision.** The case for tier 4 is population 3 —
+genuine applications — and nothing here weakens or strengthens that. What it does settle
+is the case for tier 4 *as a way to rescue documents*: it would not. The one document
+that loses its content runs all 70 of its scripts **cleanly**; engine fidelity is not its
+constraint. What it lacks is cross-origin data our privacy boundary refuses. A better
+engine fails identically. **The remaining gap in the reading lane is a data-access
+boundary, not an execution one**, and that is a policy question rather than an
+engineering one.
+
+*Caveats, because the number will be quoted:* the corpus is 104 documents chosen for
+breadth, not sampled from traffic; "usable" here is measured as visible text, so a
+conversion that improves layout or ordering without adding words counts as no change; and
+the 19 gains are not uniform — one document accounts for 92,432 of the 95,858 characters
+added. The verdict split is a heuristic, not a browser diff (§4).
+
+### 5.4.2 Never emit an artifact worse than the input
+
+Because tier 2 is tier 1's DOM plus whatever the scripts changed, both artifacts are in
+hand at the end of a conversion and the choice costs one extra serialization. The
+converter therefore **measures and does not decide**: it reports the document before and
+after, the visible text of each, and the transitions it recorded. A separate policy
+chooses, with a threshold an operator sets.
+
+The default keeps tier 2 unless it retained under 80% of the visible text. On this corpus
+that demotes exactly one document. The threshold is far from both edges — the
+catastrophic case retains 0.346 and the only other loss retains 0.996 — so it is chosen
+with margin rather than tuned.
+
+Two exemptions are as load-bearing as the rule: a document with almost no visible text has
+lost nothing when a ratio over a handful of characters swings, and a document with no
+scripts has no tier 2 to publish.
+
+This is a **floor, not a quality check**. A page that replaces good content with an equal
+volume of worse content passes it.
+
+### 5.4.3 The state recorder: JS as an oracle, not a producer
+
+§5.3's tier 2 has a second half — recording observable states — and the measurement above
+changes how cheap it is.
+
+The page's own code is the only thing that knows which of its elements do something. So it
+is run, and **its output is discarded**: what survives is a description of what each
+interactive element *does*, expressed against the tier 1 document. Candidates are not
+guessed; they are the handlers the page actually registered. Every probe is reverted, and
+the artifact is byte-identical to one produced without exploring — verified against a
+control arm, not asserted.
+
+**93% of recorded transitions are a single attribute write.** Over the corpus: 314
+transitions across 30 documents, 266 anchored to the tier 1 document, and 291 of them
+carrying no content at all — because the content they reveal is *already in the tier 1
+document, merely hidden*. The commonest interactive element on the web is a class toggle.
+
+This matters for §5.3's stated limits. The combinatorial blow-up it warns about is real for
+*exploration*, but the **recording** is small: for 93% of transitions it is a node path, an
+attribute name, and a value, which is already expressible in the §5 vocabulary. Only the
+remaining 7% need content carried, and that is bounded (32 effects and 16 KiB per
+transition, with overflow counted rather than dropped silently).
+
+**Safety, which is not optional here.** Exploration *simulates a user*, which prerendering
+does not, and a simulated click must not be able to act. Four invariants:
+
+1. **No credentials, ever.** Conversions are shared through the CAS store, so they are
+   anonymous by construction; there is no session to damage.
+2. **The page network is CLOSED during exploration** — not restricted to same-origin GET.
+   Destructive GETs exist (`/delete?id=`), and closing the channel costs nothing because
+   tier 2 excludes data-dependent states by definition (§5.3).
+3. **Navigation is refused** — `location.assign` is a no-op and history cannot leave the
+   document.
+4. **Exploration is a separate opt-in mode.** Prerendering runs the page's own code;
+   exploration acts on the reader's behalf, and the two deserve different permissions.
+
+### 5.4.4 A refuted alternative: protected-subtree execution
+
+Recorded so it is not re-proposed. The idea was to make hydration non-destructive *by
+construction*: mark parser-produced nodes un-removable, so a page may add, decorate and
+reorder the server's markup but never destroy it.
+
+It works, and it is the wrong answer. It rescues the one regression — but the rescued
+content then appears **twice**, because the client re-render is added alongside the
+original it meant to replace. And the cost lands on documents that were healthy: one
+gained 935 duplicated words, its code samples printed twice. It fires on 12 documents, of
+which one had a problem. It does not prevent the failure, it exchanges missing content for
+duplicated content. The tier 1 fallback of §5.4.2 is strictly better for the case it was
+built to rescue.
+
 ### 5.5 WebAssembly is a better cage, not a translation
 
 A recurring hope is that WASM offers a way out. It does not, for a simple factual reason:
@@ -986,3 +1096,8 @@ Not because the risk is small, but because of where it sits:
    not needed for reading, but it is needed before anyone authors anything interactive.
 5. **Remote placement policy** — when, if ever, a remote engine jail is offered by default,
    given it reintroduces a third party who sees browsing.
+6. **Where the data-access boundary sits for hydrating pages** — §5.4.1 shows the reading
+   lane's remaining loss is cross-origin data a page needs to rebuild what it tore down,
+   not engine fidelity. Relaxing it for same-site data would recover those documents and
+   reintroduce a privacy cost; refusing it makes tier 1 the answer for that population.
+   This is now the decision that matters, and it is a policy one.
