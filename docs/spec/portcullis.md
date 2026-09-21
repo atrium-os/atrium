@@ -1243,20 +1243,55 @@ so it is specified here rather than written blind.
   worker's manifest is therefore a short one, which is the point: it declares nothing
   because it needs nothing.
 
-### 6.5.3 Two trust findings, recorded because this lane makes them worse
+### 6.5.3 The trust gate: `require_signatures`
 
-Neither is caused by the above; both are load-bearing for it.
+Two findings surfaced while designing the worker lane. Neither was caused by it; both were
+load-bearing for it, and both are now fixed.
 
-1. **Manifest trust fails open when unconfigured.** `manifest_trust::verify` warns and
-   returns `Ok` when `/etc/atrium/publishers` is empty — the default on a fresh machine. A
-   worker pool launching jails continuously makes an unsigned-manifest window a standing
-   condition rather than a one-off. The fix is a `require_signatures` setting that a
-   deployment can turn on and a jailed-worker lane can *demand*, not a silent change of
-   default that would stop every dev box from launching anything.
-2. **The CLI's local fallback path has no trust gate at all.** `cmd_launch`'s
-   explicit-path branch (daemon offline) builds and runs `jail -c` from whatever
-   `atrium.toml` sits at the given path — no signature check, unlike the daemon path which
-   checks twice. It is a development convenience that reads as a launch path.
+**1. Manifest trust failed open when unconfigured.** `verify` warned and returned `Ok` when
+`/etc/atrium/publishers` was empty — the default on a fresh machine. Defensible for a
+developer box, where enforcement begins the moment the first key is installed; indefensible
+for a lane that launches jails continuously, where an unsigned-manifest window stops being a
+one-off and becomes a standing condition.
+
+Two mechanisms now, because these are two different questions:
+
+| | who decides | where |
+|---|---|---|
+| `require_signatures` | the **operator** | `/etc/atrium/trust.toml`, default `false` |
+| `Demand::Required` | the **caller** | per launch, in code |
+
+A caller can demand more than the operator configured; **it can never demand less.** The
+jailed-worker lane will pass `Demand::Required`, so a worker pool cannot run unsigned even
+on a machine that still allows it for ordinary apps.
+
+The default stays `false` so upgrading a machine does not change its behaviour — flipping it
+would stop every developer box from launching anything, which is a decision an operator
+takes, not a side effect of a release.
+
+**A malformed `trust.toml` fails closed.** An absent file is a decision (the documented
+default); an unparsable one is an accident, and reading an accident as permission is the same
+fail-open bug one level up — silently, since the machine would keep launching exactly as
+before. A file that parses but omits the key keeps the default; only a broken one is treated
+as an error.
+
+And the setting governs the **unconfigured case only**. Once publisher keys are installed, an
+unsigned manifest is refused whatever `require_signatures` says: the setting must never become
+a way to weaken a configured machine.
+
+**2. Two other launch vectors disagreed with the gate — and with each other.** The module
+claimed to be "shared by every user-app launch vector so the check is uniform, not copied per
+path", while living private inside the daemon binary. In fact `atrium-launch` carried a second
+copy that **refused** on empty publishers, the daemon's **allowed**, and the CLI's local
+fallback (explicit path, daemon offline) had **no gate at all** — it built and ran `jail -c`
+from whatever `atrium.toml` sat at the given path.
+
+The gate is now its own crate, `portcullis-trust`, reachable by all three. `atrium-launch`
+passes `Demand::Required`, keeping its stricter behaviour deliberately rather than as an
+accident of having been written separately; the CLI fallback passes `Demand::PolicyDefault`,
+so an unconfigured machine behaves exactly as before and an operator who sets
+`require_signatures` gets it enforced there too. A module that says it is shared has to be
+reachable by the things that must share it.
 
 ## 7. Capability policy + prompts
 

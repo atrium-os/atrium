@@ -577,6 +577,7 @@ dependencies = [
  "portcullis-peer",
  "portcullis-policy",
  "portcullis-toml",
+ "portcullis-trust",
 ]
 
 [[package]]
@@ -649,6 +650,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "portcullis-trust"
+version = "0.1.0"
+dependencies = [
+ "portcullis-sig",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "portcullisd"
 version = "0.1.0"
 dependencies = [
@@ -667,6 +677,7 @@ dependencies = [
  "portcullis-protocol",
  "portcullis-sig",
  "portcullis-toml",
+ "portcullis-trust",
  "serde",
  "serde_json",
  "sockmux",

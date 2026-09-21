@@ -20,10 +20,10 @@
 
 use jaild::protocol::{CreateJailRequest, EnvPair, ExecSpec, NetworkConfig, Request, Response};
 use portcullisd::jaild_client::Client;
+use portcullisd::manifest_trust;
 use std::process::exit;
 
 const JAILD_SOCK: &str = "/var/run/atrium/jaild.sock";
-const PUBLISHERS: &str = "/etc/atrium/publishers";
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
@@ -36,15 +36,24 @@ fn main() {
     let argv: Vec<String> = a[6..].to_vec();
 
     // 1. VERIFY the manifest signature (trusted publisher) — the trust root.
+    //
+    // ★ THROUGH THE SHARED GATE. This carried its own copy of the check, and
+    // the two had already drifted: this one refused when no publishers were
+    // installed, while portcullisd's warned and allowed. Two answers to "is an
+    // unsigned manifest acceptable here" is one answer too many, and the
+    // stricter copy is not automatically the one a given path gets.
+    //
+    // `Demand::Required` keeps this path's stricter behaviour explicitly,
+    // rather than as an accident of having been written separately.
     let manifest = std::fs::read(manifest_p).unwrap_or_else(|e| { eprintln!("launch: read {manifest_p}: {e}"); exit(2); });
-    let sig = read_sig(sig_p);
-    let keys = load_publishers(PUBLISHERS);
-    if keys.is_empty() {
-        eprintln!("launch: REFUSED — no trusted publishers in {PUBLISHERS}");
-        exit(1);
-    }
-    if let Err(e) = portcullis_sig::verify_trusted(&manifest, &sig, &keys) {
-        eprintln!("launch: REFUSED — manifest not signed by a trusted publisher ({e:?})");
+    let tree = std::path::Path::new(manifest_p).parent().unwrap_or(std::path::Path::new("."));
+    let text = String::from_utf8_lossy(&manifest).into_owned();
+    // The gate reads the signature from <tree>/atrium.toml.sig itself.
+    let _ = sig_p;
+    if let Err(e) = manifest_trust::Trust::load()
+        .verify(tree, &text, manifest_trust::Demand::Required)
+    {
+        eprintln!("launch: REFUSED — {e}");
         exit(1);
     }
     eprintln!("launch: manifest verified (trusted publisher) for {app_id}");
@@ -104,26 +113,3 @@ fn main() {
     }
 }
 
-fn read_sig(p: &str) -> Vec<u8> {
-    let raw = std::fs::read(p).unwrap_or_default();
-    if let Ok(s) = std::str::from_utf8(&raw) {
-        if let Ok(der) = portcullis_sig::sig_from_base64(s) {
-            return der;
-        }
-    }
-    raw
-}
-
-fn load_publishers(dir: &str) -> Vec<String> {
-    let mut v = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for e in rd.flatten() {
-            if e.path().extension().and_then(|x| x.to_str()) == Some("pem") {
-                if let Ok(p) = std::fs::read_to_string(e.path()) {
-                    v.push(p);
-                }
-            }
-        }
-    }
-    v
-}

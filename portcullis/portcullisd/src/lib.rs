@@ -12,6 +12,10 @@
 pub mod host_mount;
 pub mod init_phase;
 pub mod jaild_client;
+/// The manifest trust gate, re-exported so existing call sites keep working.
+/// It lives in `portcullis-trust` so the CLI and `atrium-launch` share it
+/// rather than each carrying their own answer (they did).
+pub use portcullis_trust as manifest_trust;
 pub mod supervisor;
 pub mod system_services;
 pub mod volumes_client;

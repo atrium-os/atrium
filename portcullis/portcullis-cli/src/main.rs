@@ -458,6 +458,25 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
      * daemon doesn't have a way to find it — daemon only knows
      * APPS_DIR-installed apps. Falls through to local launch. */
 
+    /* ★★ THE TRUST GATE, ON THE PATH THAT DID NOT HAVE ONE.
+     *
+     * This local fallback built and ran `jail -c` from whatever atrium.toml
+     * sat at the given path, with no signature check at all — while the
+     * daemon path checked twice. A development convenience that reads as a
+     * launch path is a launch path.
+     *
+     * Demand::PolicyDefault, deliberately: on an unconfigured machine this
+     * keeps working exactly as it did, because breaking every developer's
+     * explicit-path launch is not a security improvement anyone would keep.
+     * An operator who sets require_signatures gets it enforced HERE too,
+     * which is the whole reason the setting exists. */
+    if let Err(e) = portcullis_trust::Trust::load()
+        .verify(&tree, &text, portcullis_trust::Demand::PolicyDefault)
+    {
+        eprintln!("portcullis: REFUSED — {e}");
+        return ExitCode::from(1);
+    }
+
     /* Approved (or bypassed) and daemon offline: set up overlay
      * mounts, run jail, tear down — same as before this commit. */
     let app_id = manifest.app.id.clone();

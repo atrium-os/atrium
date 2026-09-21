@@ -1,0 +1,18 @@
+[package]
+name = "portcullis-trust"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+description = "The manifest trust GATE: the decision layer over portcullis-sig. Owns the trusted-publisher set, the require_signatures setting, and the rule for what an unconfigured machine may launch. A separate crate so every launch vector shares one gate — the daemon, atrium-launch and the CLI each had their own answer before this existed."
+
+[lib]
+name = "portcullis_trust"
+path = "src/lib.rs"
+
+[dependencies]
+portcullis-sig = { path = "../portcullis-sig" }
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

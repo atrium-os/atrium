@@ -45,7 +45,7 @@ use portcullis_ipc::{
 use portcullis_policy::{compute_delta, hash_manifest, now_iso8601, Grant, Policy};
 
 mod launch;
-mod manifest_trust;
+use portcullisd::manifest_trust;
 #[cfg(feature = "pam")]
 mod pam;
 
