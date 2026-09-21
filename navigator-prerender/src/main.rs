@@ -180,7 +180,7 @@ fn main() {
     let exe = std::env::current_exe().expect("exe");
     let (mut with_js, mut js_ok, mut js_fail, mut mutated) = (0usize, 0usize, 0usize, 0usize);
     let (mut ext_total, mut ext_ok, mut ext_fail) = (0usize, 0usize, 0usize);
-    let mut timed_out = 0usize;
+    let mut timed_out_names: Vec<String> = vec![];
     let mut mod_retries = 0u32;
     let mut observers = 0u32;
     let mut layout_reads = 0u32;
@@ -243,7 +243,11 @@ fn main() {
         let name = f.file_name().unwrap().to_string_lossy().to_string();
         let b = base.get(&name).cloned().unwrap_or_default();
         let Some(c) = convert_in_child(&exe, f, &b, net, DEADLINE) else {
-            timed_out += 1;
+            // ★ NAMED, not just counted. Four documents produced no recording
+            // in one run and the count alone could not say which — the answer
+            // took a single-document re-run to get back. A tally that makes
+            // you reproduce the run to identify its members is half a report.
+            timed_out_names.push(name.clone());
             continue;
         };
         if c.scripts_total > 0 && !c.verdict.is_empty() {
@@ -361,7 +365,10 @@ fn main() {
         println!("  decoded LOSSILY     {} (not UTF-8; converted anyway)", lossy.len());
         for n in lossy.iter().take(3) { println!("      {n}"); }
     }
-    if timed_out > 0 { println!("  TIMED OUT / crashed {timed_out}  (child killed at {DEADLINE:?})"); }
+    if !timed_out_names.is_empty() {
+        println!("  TIMED OUT / crashed {}  (child killed at {DEADLINE:?})", timed_out_names.len());
+        for n in timed_out_names.iter().take(6) { println!("      {n}"); }
+    }
     println!("  with inline script {with_js}");
     println!("  scripts all ran    {js_ok}");
     println!("  some script failed {js_fail}");

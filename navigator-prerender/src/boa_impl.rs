@@ -364,7 +364,13 @@ fn html_collection(hs: Vec<Handle>, ctx: &mut Context) -> JsResult<JsValue> {
 fn create_element_ns(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let ns = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
     let name = args.get_or_undefined(1).to_string(ctx)?.to_std_string_escaped();
-    let h = with(|d| d.create(Kind::Element(name)));
+    let h = with(|d| {
+        let h = d.create(Kind::Element(name));
+        // ★ And its ATTRIBUTE names keep their case for the same reason the
+        // element name does: `viewBox`, `gradientUnits`, `preserveAspectRatio`.
+        d.set_foreign(h, ns != "http://www.w3.org/1999/xhtml");
+        h
+    });
     let v = node_obj(h, ctx);
     if let Some(o) = v.as_object() {
         let desc = boa_engine::property::PropertyDescriptor::builder()
@@ -664,7 +670,7 @@ fn n_has_attribute(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<Js
 fn n_remove_attribute(t: &JsValue, a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let h = match this_h(t, ctx) { Some(h) => h, None => return Ok(JsValue::undefined()) };
     let k = a.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
-    with(|d| { if let Some(n) = d.get_mut(h) { n.attrs.retain(|(a, _)| a != &k); } d.script_mutations += 1; });
+    with(|d| { d.remove_attr(h, &k); d.script_mutations += 1; });
     record_mutation("attributes", h, &k);
     Ok(JsValue::undefined())
 }
@@ -1780,8 +1786,7 @@ fn attrs_remove_named(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> Js
     let want = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
     let old = with(|d| d.attr(h, &want).map(str::to_string));
     if old.is_some() {
-        with(|d| { if let Some(n) = d.get_mut(h) { n.attrs.retain(|(k, _)| k != &want) }
-                   d.script_mutations += 1 });
+        with(|d| { d.remove_attr(h, &want); d.script_mutations += 1 });
         record_mutation("attributes", h, &want);
     }
     Ok(match old { Some(v) => attr_obj(h, &want, &v, ctx), None => JsValue::null() })

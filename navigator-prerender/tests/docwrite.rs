@@ -70,7 +70,12 @@ fn a_write_that_would_erase_the_document_is_refused_and_counted() {
     assert_eq!(c.doc_writes, 0);
     assert_eq!(c.doc_writes_refused, 1, "the refusal must be counted");
     assert!(c.html.contains(">kept<"), "the document must survive: {}", c.html);
-    assert!(!c.html.contains("too late</b>"), "{}", c.html);
+    // ★ Scoped PAST the script, because script text is no longer escaped on
+    // serialization — the string this asserts the absence of appears verbatim
+    // in the source of the script that was refused. A whole-document
+    // `contains` here tests the test, not the converter.
+    let body = c.html.rsplit_once("</script>").map(|(_, t)| t).unwrap_or(&c.html);
+    assert!(!body.contains("too late</b>"), "{}", c.html);
 }
 
 /// The honest referrer is empty: no navigation happened, which is exactly

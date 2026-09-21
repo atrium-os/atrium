@@ -1157,15 +1157,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "navigator-dom"
+version = "0.1.0"
+dependencies = [
+ "html5ever",
+ "markup5ever_rcdom",
+]
+
+[[package]]
 name = "navigator-prerender"
 version = "0.1.0"
 dependencies = [
  "boa_engine",
  "fixed_decimal",
- "html5ever",
  "icu_experimental",
  "icu_locale_core",
- "markup5ever_rcdom",
+ "navigator-dom",
  "url",
 ]
 

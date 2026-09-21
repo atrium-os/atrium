@@ -56,7 +56,12 @@ fn convert(rc: &RcHandle, dom: &mut Dom, parent: Handle) {
         }
     };
     let h = dom.create(kind);
-    if let NodeData::Element { attrs, .. } = &rc.data {
+    if let NodeData::Element { name, attrs, .. } = &rc.data {
+        // ★ Mark foreign content BEFORE any attribute lands, because marking
+        // it is what stops the attribute's name from being lowercased. An SVG
+        // `viewBox` set on a node still flagged HTML arrives as `viewbox` and
+        // the graphic breaks.
+        dom.set_foreign(h, name.ns != html5ever::ns!(html));
         for a in attrs.borrow().iter() {
             dom.set_attr(h, &a.name.local.to_string(), &a.value.to_string());
         }

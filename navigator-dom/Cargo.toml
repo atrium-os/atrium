@@ -1,0 +1,9 @@
+[package]
+name = "navigator-dom"
+version = "0.1.0"
+edition = "2021"
+description = "The arena DOM and HTML parser shared by the Navigator's converter and backend: one tree, one parser, one notion of what a document is."
+
+[dependencies]
+html5ever = "0.39"
+markup5ever_rcdom = "0.39"

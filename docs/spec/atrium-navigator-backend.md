@@ -144,6 +144,34 @@ The validator (§4.2) applies to the `document` field exactly as it would to any
 graph input; the transition table is subject to the same treatment, since a recording
 arriving from a shared store is no more trusted than the page it came from.
 
+**One parser, and serialize→reparse is a fixed point.** The converter serializes its DOM
+into `document`; the backend re-parses those bytes and walks the tree positionally to
+resolve a recorded trigger. Two parsers would eventually disagree about the same bytes, so
+there is exactly one — the `navigator-dom` crate, shared by both sides. That is necessary
+but not sufficient: the serializer must also be the parser's inverse, or the tree the
+backend walks is not the tree the converter measured.
+
+It was not, and the failure was silent in exactly the way that matters — triggers that
+simply did not resolve, on 12 of 19 for one document, with nothing logged. Three causes,
+all found by re-parsing the corpus's own recordings and comparing round 1 to round 2:
+
+- `<script>` and `<style>` text was HTML-escaped on output, so `(()=>{` returned as
+  `(()=&gt;{` and then `(()=&amp;gt;{`. Embedded JavaScript was corrupted and every
+  document grew about 250 KB per round.
+- `<noscript>` is raw text too when scripting is enabled, which it is here; same defect,
+  smaller. `<textarea>` and `<title>` are deliberately *not* in that set: they are
+  escapable raw text, where entities are decoded on parse and must be re-escaped on output.
+- Attribute names ran the other way. HTML parsing lowercases them; the converter's DOM kept
+  whatever case a script assigned, so a `tabIndex="-1"` it wrote came back as
+  `tabindex="-1"`. The DOM now lowercases attribute names on HTML elements, as
+  `setAttribute` does — and exempts foreign content, because SVG's `viewBox` is not
+  `viewbox` and lowercasing it breaks the graphic silently.
+
+With those closed, all 103 recordings in the corpus are fixed points and every recorded
+trigger resolves. The property is worth stating as a requirement rather than a bug fix:
+**a recording's `document` must parse to a tree that serializes back to the same bytes.**
+A converter that cannot meet it is emitting a document its own reader cannot navigate.
+
 ### 4.1 Hermetic rendering (design in from M0, painful to retrofit)
 
 Golden-file tests are worthless if the output is not byte-stable. Hermetic mode pins:

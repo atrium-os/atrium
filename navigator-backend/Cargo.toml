@@ -12,3 +12,8 @@ description = "Consumes atrium-navigator-recording/1: the converter's output, in
 # (spec §4.2), including when it comes from our own converter — a recording
 # arrives from a shared store, and the store does not vouch for it.
 serde_json = "1"
+# ★ The SAME parser the converter used. A recording carries serialized HTML,
+# so the backend re-parses what the converter already parsed; two parsers
+# would eventually disagree about the same bytes, and a disagreement between
+# the producer of an artifact and its renderer is not found by testing either.
+navigator-dom = { path = "../navigator-dom" }

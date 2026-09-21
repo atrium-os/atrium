@@ -27,6 +27,8 @@ pub struct Node {
     pub attrs: Vec<(String, String)>,
     pub parent: Option<Handle>,
     pub children: Vec<Handle>,
+    /// SVG or MathML content, where attribute-name case is significant.
+    pub foreign: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -51,7 +53,7 @@ pub struct Dom {
 impl Dom {
     pub fn new() -> Self {
         let mut d = Dom::default();
-        d.nodes.push(Node { kind: Kind::Document, attrs: vec![], parent: None, children: vec![] });
+        d.nodes.push(Node { kind: Kind::Document, attrs: vec![], parent: None, children: vec![], foreign: false });
         d
     }
     pub fn root(&self) -> Handle { 0 }
@@ -59,7 +61,7 @@ impl Dom {
     pub fn get_mut(&mut self, h: Handle) -> Option<&mut Node> { self.nodes.get_mut(h as usize) }
 
     pub fn create(&mut self, kind: Kind) -> Handle {
-        self.nodes.push(Node { kind, attrs: vec![], parent: None, children: vec![] });
+        self.nodes.push(Node { kind, attrs: vec![], parent: None, children: vec![], foreign: false });
         (self.nodes.len() - 1) as Handle
     }
 
@@ -87,15 +89,57 @@ impl Dom {
         match &self.get(h)?.kind { Kind::Element(t) => Some(t), _ => None }
     }
 
+    /// ★ ATTRIBUTE NAMES ARE LOWERCASED ON HTML ELEMENTS — AND ONLY THERE.
+    ///
+    /// This is DOM behaviour (`setAttribute` lowercases for elements in the
+    /// HTML namespace), but the reason it is load-bearing here is the round
+    /// trip: the converter serializes its DOM into a recording and the backend
+    /// re-parses those bytes with this same parser. html5ever lowercases
+    /// attribute names on parse. So an element carrying a script-assigned
+    /// `tabIndex` serialized to `tabIndex="-1"` and came back as
+    /// `tabindex="-1"` — serialize->reparse was not idempotent, and the
+    /// backend's positional walk into the tree diverged from the converter's.
+    ///
+    /// Foreign content is exempt because case is SIGNIFICANT there: SVG's
+    /// `viewBox` is not `viewbox`, and lowercasing it silently breaks the
+    /// graphic. html5ever already hands us the adjusted spelling for foreign
+    /// attributes, so the rule is simply "don't touch them".
+    fn attr_name(&self, h: Handle, name: &str) -> String {
+        match self.get(h) {
+            Some(n) if !n.foreign => name.to_ascii_lowercase(),
+            _ => name.to_string(),
+        }
+    }
+
     pub fn attr(&self, h: Handle, name: &str) -> Option<&str> {
-        self.get(h)?.attrs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+        let want = self.attr_name(h, name);
+        self.get(h)?.attrs.iter().find(|(k, _)| *k == want).map(|(_, v)| v.as_str())
     }
 
     pub fn set_attr(&mut self, h: Handle, name: &str, val: &str) {
+        let name = self.attr_name(h, name);
         if let Some(n) = self.get_mut(h) {
-            if let Some(a) = n.attrs.iter_mut().find(|(k, _)| k == name) { a.1 = val.to_string(); }
-            else { n.attrs.push((name.to_string(), val.to_string())); }
+            if let Some(a) = n.attrs.iter_mut().find(|(k, _)| *k == name) { a.1 = val.to_string(); }
+            else { n.attrs.push((name, val.to_string())); }
         }
+    }
+
+    /// Removal has to normalize the same way, or `removeAttribute('tabIndex')`
+    /// would silently miss the `tabindex` that `setAttribute('tabIndex')`
+    /// stored — the asymmetry is exactly the silent-drop shape.
+    pub fn remove_attr(&mut self, h: Handle, name: &str) {
+        let name = self.attr_name(h, name);
+        if let Some(n) = self.get_mut(h) { n.attrs.retain(|(k, _)| *k != name); }
+    }
+
+    /// Mark a node as foreign content (SVG or MathML), exempting its attribute
+    /// names from lowercasing.
+    pub fn set_foreign(&mut self, h: Handle, foreign: bool) {
+        if let Some(n) = self.get_mut(h) { n.foreign = foreign; }
+    }
+
+    pub fn is_foreign(&self, h: Handle) -> bool {
+        self.get(h).map(|n| n.foreign).unwrap_or(false)
     }
 
     /// ★ IS THIS NODE STILL IN THE DOCUMENT?
@@ -463,12 +507,37 @@ impl Dom {
         s
     }
     fn ser(&self, h: Handle, s: &mut String) {
+        self.ser_in(h, s, false)
+    }
+
+    /// ★★ RAW-TEXT ELEMENTS MUST NOT BE ESCAPED, and getting this wrong is
+    /// not cosmetic. `<script>` and `<style>` hold raw text: the parser does
+    /// not decode entities inside them, so escaping on the way out means the
+    /// next parse sees the escape SEQUENCE as literal characters. A script
+    /// containing `()=>{}` was serialized as `()=&gt;{}`, reparsed as the
+    /// literal text `&gt;`, and re-serialized as `&amp;gt;` — corrupted
+    /// JavaScript, and a document that grows on every round trip (measured:
+    /// 1.94 MB → 2.19 MB → 2.44 MB on one corpus page).
+    ///
+    /// Found by building the consumer: the converter alone never re-read its
+    /// own output, so nothing could notice.
+    fn ser_in(&self, h: Handle, s: &mut String, raw: bool) {
         const VOID: &[&str] = &["area","base","br","col","embed","hr","img","input","link","meta","source","track","wbr"];
+        // `noscript` belongs here because we parse — and the converter runs —
+        // with scripting ENABLED, and the spec makes noscript raw text in that
+        // mode. Escaping it grew the document every round: a recorded
+        // `&lt;iframe` came back as `&amp;lt;iframe`, then `&amp;amp;lt;`.
+        // `textarea` and `title` are deliberately absent: they are ESCAPABLE
+        // raw text, where entities are decoded on parse and so must be
+        // re-escaped on the way out.
+        const RAW_TEXT: &[&str] =
+            &["script", "style", "xmp", "iframe", "noembed", "noframes", "noscript"];
         match &self.nodes[h as usize].kind {
+            Kind::Text(t) if raw => s.push_str(t),
             Kind::Text(t) => s.push_str(&escape(t)),
             Kind::Comment(_) => {}
             Kind::Document | Kind::Fragment => {
-                for &c in &self.nodes[h as usize].children { self.ser(c, s); }
+                for &c in &self.nodes[h as usize].children { self.ser_in(c, s, false); }
             }
             Kind::Element(tag) => {
                 s.push('<'); s.push_str(tag);
@@ -477,7 +546,8 @@ impl Dom {
                 }
                 s.push('>');
                 if VOID.contains(&tag.as_str()) { return; }
-                for &c in &self.nodes[h as usize].children { self.ser(c, s); }
+                let child_raw = RAW_TEXT.contains(&tag.to_ascii_lowercase().as_str());
+                for &c in &self.nodes[h as usize].children { self.ser_in(c, s, child_raw); }
                 s.push_str("</"); s.push_str(tag); s.push('>');
             }
         }

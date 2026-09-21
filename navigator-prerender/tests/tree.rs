@@ -178,7 +178,10 @@ fn create_html_document_is_detached_and_real() {
         d.body.childNodes.length + '/' + d.nodeType + '/' + (d === document));
     </script></body></html>"#);
     assert_eq!(r(&c), "2/9/false");
-    assert!(!c.html.contains("<form>"), "detached document leaked into the artifact: {}", c.html);
+    // Scoped past the script: the markup string is in the source that built
+    // the detached document, and script text serializes verbatim.
+    let body = c.html.rsplit_once("</script>").map(|(_, t)| t).unwrap_or(&c.html);
+    assert!(!body.contains("<form>"), "detached document leaked into the artifact: {}", c.html);
 }
 
 /// A cycle would make serialization non-terminating, so the arena refuses it.

@@ -1,6 +1,8 @@
 pub mod artifact;
-pub mod dom;
-pub mod parse;
+// ★ Re-exported rather than re-implemented: `crate::dom::…` and
+// `crate::parse::…` resolve exactly as before, so extracting these cost no
+// churn at the call sites — which is the point of doing it this way round.
+pub use navigator_dom::{dom, parse};
 pub mod profile;
 pub mod engine;
 pub mod boa_impl;
