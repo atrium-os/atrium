@@ -27,6 +27,8 @@ pub struct Conversion {
     /// Visible text (whitespace-collapsed) before and after scripts ran.
     pub text_before: usize,
     pub text_after: usize,
+    /// Removals refused by protected-subtree execution (experiment).
+    pub removals_refused: u32,
     pub elements_after: usize,
     pub depth_after: usize,
     pub scripts_total: usize,
@@ -76,6 +78,25 @@ pub fn convert_with(
     engine: &mut dyn ScriptEngine,
     fetcher: &mut dyn Fetcher,
 ) -> Conversion {
+    // The CLI's convenience switch for the experiment; callers that want it
+    // deterministically should use `convert_with_opts` and pass the flag.
+    let protect = std::env::var("PRERENDER_PROTECT").ok().as_deref() == Some("1");
+    convert_with_opts(html, base, engine, fetcher, protect)
+}
+
+/// `convert_with`, with the protected-subtree experiment under explicit
+/// control rather than an environment variable.
+///
+/// ★ It is a PARAMETER because two tests toggling one env var in parallel
+/// raced, and each saw the other's setting — a test that reads global
+/// process state is not isolated, however careful it looks.
+pub fn convert_with_opts(
+    html: &str,
+    base: Option<&str>,
+    engine: &mut dyn ScriptEngine,
+    fetcher: &mut dyn Fetcher,
+    protect_parser_nodes: bool,
+) -> Conversion {
     let mut dom = parse::parse(html);
     let before = dom.element_count();
     // ★ THE QUESTION TIER 2 ACTUALLY HAS TO ANSWER is not "did the scripts
@@ -86,6 +107,10 @@ pub fn convert_with(
     let text_before = dom.visible_text(dom.root()).split_whitespace()
         .map(str::len).sum::<usize>();
     let html_tier1 = dom.serialize();
+    if protect_parser_nodes {
+        dom.parser_nodes = dom.nodes.len() as dom::Handle;
+        dom.protect_parser_nodes = true;
+    }
 
     let (mut ext_total, mut ext_ok, mut ext_fail) = (0, 0, 0);
     let mut fetch_errors: Vec<String> = vec![];
@@ -177,6 +202,7 @@ pub fn convert_with(
         text_before,
         text_after: dom.visible_text(dom.root()).split_whitespace()
             .map(str::len).sum::<usize>(),
+        removals_refused: dom.removals_refused,
         elements_after: dom.element_count(),
         depth_after: dom.max_depth(),
         scripts_total: scripts.len(),

@@ -80,6 +80,7 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
     println!("W\t{}\t{}", c.doc_writes, c.doc_writes_refused);
     println!("J\t{}\t{}", c.injected_scripts_run, c.injected_scripts_refused);
     println!("X\t{}\t{}", c.text_before, c.text_after);
+    println!("Z\t{}", c.removals_refused);
     // The POLICY's verdict travels with the measurements, so the parent can
     // report what would be published without re-deriving it.
     {
@@ -471,6 +472,7 @@ pub struct Child {
     pub injected_scripts_refused: u32,
     pub text_before: usize,
     pub text_after: usize,
+    pub removals_refused: u32,
     pub tier: String,
     pub tier_reason: String,
     pub cause: Option<(String, String)>,
@@ -493,6 +495,7 @@ fn parse_child(s: &str) -> Option<Child> {
         doc_writes: 0, doc_writes_refused: 0,
         injected_scripts_run: 0, injected_scripts_refused: 0,
         text_before: 0, text_after: 0,
+        removals_refused: 0,
         tier: String::new(), tier_reason: String::new(),
         cause: None,
         timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0,
@@ -517,6 +520,7 @@ fn parse_child(s: &str) -> Option<Child> {
             Some(&"M") if f.len() >= 3 => {
                 c.missing.push((f[2].to_string(), f[1].parse().unwrap_or(1)));
             }
+            Some(&"Z") if f.len() >= 2 => c.removals_refused = f[1].parse().unwrap_or(0),
             Some(&"Y") if f.len() >= 3 => {
                 c.tier = f[1].to_string();
                 c.tier_reason = f[2].to_string();

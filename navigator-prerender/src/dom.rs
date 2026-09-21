@@ -34,6 +34,18 @@ pub struct Dom {
     pub nodes: Vec<Node>,
     /// Mutations applied by script, the number this instrument exists to report.
     pub script_mutations: u64,
+    /// ★ EXPERIMENT: protected-subtree execution.
+    ///
+    /// Parser-produced nodes occupy handles `0..parser_nodes`, because the
+    /// arena hands them out in order and every later node was created by
+    /// script. When protection is on, a script may ADD, decorate and reorder,
+    /// but may not REMOVE what the server sent — making hydration
+    /// non-destructive by construction instead of detecting the damage
+    /// afterwards.
+    pub protect_parser_nodes: bool,
+    pub parser_nodes: Handle,
+    /// Removals refused by that rule, so the cost is measured not assumed.
+    pub removals_refused: u32,
 }
 
 impl Dom {
@@ -157,6 +169,17 @@ impl Dom {
     }
 
     pub fn set_text(&mut self, h: Handle, text: &str) {
+        // Replacing an element's text REMOVES its children. If any of them
+        // are the server's, that is a destruction and the whole assignment
+        // is refused — a partial one would leave the page in a state neither
+        // it nor we intended.
+        if self.protect_parser_nodes {
+            let doomed = self.get(h).map(|n| n.children.clone()).unwrap_or_default();
+            if doomed.iter().any(|&c| self.is_protected(c)) {
+                self.removals_refused += 1;
+                return;
+            }
+        }
         if let Some(n) = self.get_mut(h) { n.children.clear(); }
         let t = self.create(Kind::Text(text.to_string()));
         self.append(h, t);
@@ -229,8 +252,21 @@ impl Dom {
         self.get(p)?.children.get(i - 1).copied()
     }
 
-    /// Detach from the current parent, if any. Returns whether it moved.
+    /// Is this node the server's rather than the script's?
+    pub fn is_protected(&self, h: Handle) -> bool {
+        self.protect_parser_nodes && h < self.parser_nodes
+    }
+
+    /// Detach as a REMOVAL — subject to protection.
     pub fn detach(&mut self, h: Handle) -> bool {
+        if self.is_protected(h) { self.removals_refused += 1; return false }
+        self.detach_for_move(h)
+    }
+
+    /// Detach as part of a MOVE. Never protected: the node stays in the
+    /// document, and blocking reordering would break pages that legitimately
+    /// rearrange the server's own markup without destroying it.
+    pub fn detach_for_move(&mut self, h: Handle) -> bool {
         let Some(p) = self.get(h).and_then(|n| n.parent) else { return false };
         if let Some(n) = self.get_mut(p) { n.children.retain(|&c| c != h); }
         if let Some(n) = self.get_mut(h) { n.parent = None; }
@@ -249,7 +285,7 @@ impl Dom {
             for k in kids { ok &= self.insert_before(parent, k, before); }
             return ok;
         }
-        self.detach(node);
+        self.detach_for_move(node);
         let at = match before {
             Some(b) => self.get(parent).and_then(|n| n.children.iter().position(|&c| c == b))
                 .unwrap_or_else(|| self.nodes[parent as usize].children.len()),
