@@ -29,7 +29,7 @@ pub struct Node {
     pub children: Vec<Handle>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Dom {
     pub nodes: Vec<Node>,
     /// Mutations applied by script, the number this instrument exists to report.
@@ -406,6 +406,31 @@ impl Dom {
         self.get(h).map(|n| n.attrs.iter()
             .filter_map(|(k, _)| Self::data_prop_name(k))
             .collect()).unwrap_or_default()
+    }
+
+    /// A stable path to a node, for naming a trigger in a recording that
+    /// will be replayed against the TIER 1 document rather than this one.
+    ///
+    /// An id when there is one, because it survives re-parsing; otherwise
+    /// positional, which survives only if the document does not change —
+    /// which is exactly the condition under which the recording is valid.
+    pub fn node_path(&self, h: Handle) -> String {
+        if let Some(id) = self.attr(h, "id") {
+            if !id.trim().is_empty() { return format!("#{id}") }
+        }
+        let mut parts: Vec<String> = vec![];
+        let mut cur = h;
+        while let Some(p) = self.get(cur).and_then(|n| n.parent) {
+            let tag = self.tag(cur).unwrap_or("node").to_string();
+            let nth = self.get(p).map(|n| n.children.iter()
+                .filter(|&&c| self.tag(c) == self.tag(cur))
+                .position(|&c| c == cur).unwrap_or(0)).unwrap_or(0);
+            parts.push(format!("{tag}:{nth}"));
+            cur = p;
+            if parts.len() > 32 { break }
+        }
+        parts.reverse();
+        parts.join(">")
     }
 
     /// Element count, the headline metric for a conversion.

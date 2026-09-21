@@ -29,6 +29,12 @@ pub struct Conversion {
     pub text_after: usize,
     /// Removals refused by protected-subtree execution (experiment).
     pub removals_refused: u32,
+    /// ★ What the page DOES when acted on, learned by running its JS as an
+    /// oracle and discarding the result. Empty unless the engine was asked
+    /// to explore.
+    pub transitions: Vec<engine::Transition>,
+    /// Interactive elements found — the denominator for `transitions`.
+    pub interactive_found: u32,
     pub elements_after: usize,
     pub depth_after: usize,
     pub scripts_total: usize,
@@ -107,10 +113,11 @@ pub fn convert_with_opts(
     let text_before = dom.visible_text(dom.root()).split_whitespace()
         .map(str::len).sum::<usize>();
     let html_tier1 = dom.serialize();
-    if protect_parser_nodes {
-        dom.parser_nodes = dom.nodes.len() as dom::Handle;
-        dom.protect_parser_nodes = true;
-    }
+    // ★ Always recorded, because ANCHORING needs it too: a transition is
+    // replayable against tier 1 only if its trigger came from the parser.
+    // Protection is the separate, opt-in thing.
+    dom.parser_nodes = dom.nodes.len() as dom::Handle;
+    dom.protect_parser_nodes = protect_parser_nodes;
 
     let (mut ext_total, mut ext_ok, mut ext_fail) = (0, 0, 0);
     let mut fetch_errors: Vec<String> = vec![];
@@ -203,6 +210,8 @@ pub fn convert_with_opts(
         text_after: dom.visible_text(dom.root()).split_whitespace()
             .map(str::len).sum::<usize>(),
         removals_refused: dom.removals_refused,
+        transitions: rep.transitions,
+        interactive_found: rep.interactive_found,
         elements_after: dom.element_count(),
         depth_after: dom.max_depth(),
         scripts_total: scripts.len(),
@@ -410,3 +419,5 @@ impl TierPolicy {
         (match d.tier { Tier::One => &c.html_tier1, Tier::Two => &c.html }, d)
     }
 }
+
+pub use engine::Transition;

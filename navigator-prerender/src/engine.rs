@@ -69,6 +69,12 @@ pub struct RunReport {
     /// Scripts the page INJECTED at runtime and this converter executed.
     pub injected_scripts_run: u32,
     /// Injected scripts refused because they load third-party code.
+    /// ★ What the page DOES when a reader acts on it — recorded by running
+    /// its JS as an ORACLE rather than as a producer. See `explore`.
+    pub transitions: Vec<Transition>,
+    /// Interactive elements found, whether or not probing them changed
+    /// anything: the denominator for the transitions above.
+    pub interactive_found: u32,
     pub injected_scripts_refused: u32,
     /// Reads of a layout metric this converter cannot truthfully answer.
     pub layout_reads: u32,
@@ -93,4 +99,26 @@ pub trait ScriptEngine {
     /// The document's own URL, for `location` and relative `URL` resolution.
     fn set_base_url(&mut self, _url: Option<&str>) {}
     fn run(&mut self, dom: &mut Dom, scripts: &[ScriptSource]) -> RunReport;
+}
+
+/// One observable state transition: a trigger, and what it did.
+///
+/// ★ Deliberately a DESCRIPTION, not a DOM. The recording is meant to be
+/// replayed against the tier 1 document, so it names the element by a path
+/// that survives re-parsing and summarises the effect. Carrying the mutated
+/// subtree would make this a second artifact, and then we would be back to
+/// publishing what the scripts produced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Transition {
+    /// Path to the trigger, as `#id` or a positional `tag:n>tag:n` chain.
+    pub trigger: String,
+    /// The event that caused it.
+    pub event: String,
+    /// Whether the trigger exists in the TIER 1 document. A transition on an
+    /// element the scripts themselves created cannot be replayed there, and
+    /// saying so is more useful than dropping it.
+    pub anchored: bool,
+    pub elements_added: i64,
+    pub text_delta: i64,
+    pub attributes_changed: u32,
 }

@@ -2110,6 +2110,108 @@ fn run_injected_scripts(ctx: &mut Context, errors: &mut Vec<String>) -> (u32, u3
     (ran, refused)
 }
 
+/// ★★ JS AS AN ORACLE, NOT AS A PRODUCER.
+///
+/// The page's own code is the only thing that knows which of its elements do
+/// something and what they do. So it is run — and then its OUTPUT IS THROWN
+/// AWAY. What survives is a description: this element, this event, this much
+/// changed. The tier 1 document plus those annotations is the artifact; the
+/// DOM the scripts built never ships.
+///
+/// ★ EVERY PROBE IS REVERTED. The arena is cloned before the event is
+/// dispatched and restored after, so exploring cannot leave the document in
+/// a state no reader would have reached — and the handles are unchanged by
+/// the restore, which keeps the node-wrapper cache and the listener maps
+/// valid.
+///
+/// ★★ AND THE NETWORK IS CLOSED WHILE IT RUNS, not merely restricted to
+/// same-origin GET. Exploration SIMULATES A USER, which prerendering does
+/// not, and a simulated click must not be able to reach anything: destructive
+/// GETs exist (`/delete?id=`). It costs nothing, because tier 2 excludes
+/// data-dependent states by definition. Conversions carry no credentials
+/// either — they are shared through a content-addressed store, so there is
+/// no session to damage.
+const MAX_PROBES: usize = 64;
+
+fn explore_states(ctx: &mut Context, parser_nodes: Handle) -> (Vec<crate::engine::Transition>, u32) {
+    use crate::engine::Transition;
+    // Elements the page itself wired for interaction. Nothing is guessed:
+    // these are the handlers it actually registered.
+    let mut candidates: Vec<(Handle, String)> = vec![];
+    ELISTENERS.with(|m| {
+        for (h, v) in m.borrow().iter() {
+            for (ty, _) in v {
+                if matches!(ty.as_str(), "click" | "change" | "input" | "submit" | "toggle") {
+                    candidates.push((*h, ty.clone()));
+                }
+            }
+        }
+    });
+    ONHANDLERS.with(|m| {
+        for ((h, name), _) in m.borrow().iter() {
+            if let Some(ty) = name.strip_prefix("on") {
+                if matches!(ty, "click" | "change" | "input" | "submit" | "toggle") {
+                    candidates.push((*h, ty.to_string()));
+                }
+            }
+        }
+    });
+    candidates.retain(|(h, _)| with(|d| d.connected(*h)));
+    // Deterministic order: the same document must explore the same way, or
+    // the recording is not reproducible and the CAS store sees churn.
+    candidates.sort();
+    candidates.dedup();
+    let found = candidates.len() as u32;
+    candidates.truncate(MAX_PROBES);
+
+    // Close the page network for the whole exploration.
+    let saved_net = PAGE_NET.with(|n| n.borrow_mut().take());
+
+    let mut out = vec![];
+    for (h, ty) in candidates {
+        let before = DOM.with(|d| d.borrow().clone());
+        let (els0, txt0) = (before.element_count() as i64,
+            before.visible_text(before.root()).split_whitespace().map(str::len).sum::<usize>() as i64);
+        let attrs0 = before.nodes.iter().map(|n| n.attrs.len()).sum::<usize>();
+        let path = before.node_path(h);
+        let anchored = h < parser_nodes;
+
+        let target = node_obj(h, ctx);
+        let script = format!("(function(t){{ try {{ t.dispatchEvent(new Event({ty:?}, \
+            {{ bubbles: true, cancelable: true }})); }} catch (e) {{}} }})", ty = ty);
+        if let Ok(f) = ctx.eval(Source::from_bytes(script.as_bytes())) {
+            if let Some(c) = f.as_callable() { let _ = c.call(&JsValue::undefined(), &[target], ctx); }
+        }
+        let _ = ctx.run_jobs();
+        let _ = ctx.eval(Source::from_bytes(b"__deliverMutations(4); __drainTimers(50, 500)"));
+        let _ = ctx.run_jobs();
+
+        let (els1, txt1, attrs1) = DOM.with(|d| {
+            let d = d.borrow();
+            (d.element_count() as i64,
+             d.visible_text(d.root()).split_whitespace().map(str::len).sum::<usize>() as i64,
+             d.nodes.iter().map(|n| n.attrs.len()).sum::<usize>())
+        });
+        // Restore. The probe is an observation, not an edit.
+        DOM.with(|d| *d.borrow_mut() = before);
+
+        let changed = els1 != els0 || txt1 != txt0 || attrs1 != attrs0;
+        if changed {
+            out.push(Transition {
+                trigger: path,
+                event: ty,
+                anchored,
+                elements_added: els1 - els0,
+                text_delta: txt1 - txt0,
+                attributes_changed: attrs1.abs_diff(attrs0) as u32,
+            });
+        }
+    }
+
+    PAGE_NET.with(|n| *n.borrow_mut() = saved_net);
+    (out, found)
+}
+
 /// One step of xorshift64*, enough for the uses the corpus makes of
 /// getRandomValues and randomUUID (ids and cache-busting keys).
 fn rand_u32(_t: &JsValue, _a: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
@@ -2393,6 +2495,11 @@ pub struct BoaEngine {
     /// to refuse independently. `None` means a page cannot reach the network
     /// at all, which is also the default for tests.
     pub page_fetcher: Option<Box<dyn crate::fetch::Fetcher>>,
+    /// ★ Run the page's JS as an ORACLE after the normal pass: probe the
+    /// elements it wired for interaction, record what each one DOES, and
+    /// revert every probe. Off by default — exploration simulates a user,
+    /// which prerendering does not, and that deserves an explicit opt-in.
+    pub explore: bool,
     /// Root of the mirrored module graph; Boa's loader resolves against it.
     pub module_root: Option<std::path::PathBuf>,
     /// The document's own URL.
@@ -3791,7 +3898,8 @@ impl ScriptEngine for BoaEngine {
         LAYOUT_READS.with(|n| *n.borrow_mut() = 0);
         BASE.with(|b| *b.borrow_mut() = self.base_url.clone());
         CURRENT.with(|c| *c.borrow_mut() = None);
-        let mut rep = RunReport { scripts_run: 0, scripts_failed: 0, errors: vec![],
+        let mut rep = RunReport { transitions: vec![], interactive_found: 0,
+            scripts_run: 0, scripts_failed: 0, errors: vec![],
             missing: vec![], nulls: vec![], first_error: None, cause: None, listeners_fired: 0,
             module_retries: 0, observers_registered: 0, mutation_records: 0,
             ce_upgrades: 0, history_writes: 0, history_refused: 0,
@@ -3943,6 +4051,16 @@ impl ScriptEngine for BoaEngine {
         // thread trips Boa's GC — which showed up as SIGTRAP under the
         // parallel test harness and passed cleanly with --test-threads=1.
         // A cache of engine objects must not outlive the engine.
+        // ★ BEFORE the teardown, not after. Exploration reads the listener
+        // maps to know which elements the page wired — clearing them first
+        // left it with nothing to probe and reporting zero interactive
+        // elements on pages full of them.
+        if self.explore {
+            let parser_nodes = DOM.with(|d| d.borrow().parser_nodes);
+            let (t, found) = explore_states(&mut ctx, parser_nodes);
+            rep.transitions = t;
+            rep.interactive_found = found;
+        }
         NODE_CACHE.with(|c| c.borrow_mut().clear());
         ELISTENERS.with(|m| m.borrow_mut().clear());
         ONHANDLERS.with(|m| m.borrow_mut().clear());
