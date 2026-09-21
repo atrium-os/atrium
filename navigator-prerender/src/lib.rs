@@ -160,7 +160,18 @@ pub fn convert_with_opts(
                                     }
                                 }
                             }
-                            std::fs::write(&p, &text).ok().map(|_| p)
+                            // ★ A failed mirror write used to yield None
+                            // silently, and the inline module then ran with
+                            // no path — failing later for a reason that had
+                            // nothing to do with the page. Recorded instead.
+                            match std::fs::write(&p, &text) {
+                                Ok(()) => Some(p),
+                                Err(e) => {
+                                    fetch_errors.push(format!(
+                                        "module mirror write failed for {}: {e}", p.display()));
+                                    None
+                                }
+                            }
                         })
                 } else { None };
                 scripts.push(ScriptSource { text, module, path, element: Some(element) });

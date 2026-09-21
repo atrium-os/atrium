@@ -172,3 +172,53 @@ fn the_whole_artifact_reproduces_including_stamped_time_and_random_choices() {
     let b = run(html);
     assert_eq!(a.html, b.html, "the artifact itself must be byte-identical");
 }
+
+/// ★★ THE CONVERTER'S OWN MACHINERY IS NOT THE PAGE'S TO REMOVE. These
+/// internals live on the global object where page code can see them, and a
+/// page that deletes globals it does not recognise — or one that is simply
+/// hostile — could disable mutation delivery, custom-element upgrades and the
+/// timer drain. `delete __upgradePending` even made `customElements.define`
+/// THROW, so the page's own script failed and the failure was attributed to
+/// the PAGE rather than to us.
+#[test]
+fn a_page_cannot_disable_the_converters_machinery() {
+    let c = run(r#"<html><body><div id=t></div><script>
+      delete globalThis.__deliverMutations;
+      delete globalThis.__upgradePending;
+      delete globalThis.__drainTimers;
+      globalThis.__rand_u32 = function () { return 0; };
+
+      var seen = 0;
+      new MutationObserver(function (r) { seen += r.length; })
+        .observe(document.getElementById('t'), { childList: true });
+      document.getElementById('t').appendChild(document.createElement('p'));
+
+      class Late extends HTMLElement { connectedCallback() { this.textContent = 'upgraded'; } }
+      customElements.define('x-late', Late);
+      document.body.appendChild(document.createElement('x-late'));
+
+      setTimeout(function () {
+        document.body.setAttribute('data-r',
+          seen + '|' + (Math.random() > 0) + '|' + document.querySelector('x-late').textContent);
+      }, 0);
+    </script></body></html>"#);
+    assert_eq!(c.scripts_failed, 0, "the page's own script must not fail: {:?}", c.errors);
+    // Mutations still delivered, timers still drained, the element upgraded,
+    // and Math.random still draws from OUR stream rather than the page's stub.
+    assert_eq!(r(&c), "1|true|upgraded");
+}
+
+/// Counters are deliberately left writable — this code increments them, and a
+/// page corrupting one costs a metric rather than a conversion. Worth pinning
+/// so the distinction is a decision rather than an oversight.
+#[test]
+fn counters_stay_writable_while_functions_are_sealed() {
+    let c = run(r#"<html><body><div id=t></div><script>
+      var fnBefore = typeof __deliverMutations;
+      try { delete globalThis.__deliverMutations; } catch (e) {}
+      var fnAfter = typeof __deliverMutations;
+      globalThis.__fired = 999;                 // a counter: allowed
+      document.body.setAttribute('data-r', fnBefore + '|' + fnAfter + '|' + __fired);
+    </script></body></html>"#);
+    assert_eq!(r(&c), "function|function|999");
+}

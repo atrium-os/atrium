@@ -3638,7 +3638,7 @@ const GLOBALS: &str = r#"
   /// Upgrade everything registered that is connected and not yet upgraded.
   /// Called wherever mutations are delivered, so elements added by a script
   /// or a timer are upgraded too, not only those present at define() time.
-  globalThis.__upgradePending = function () {
+  function __upgradeAll() {
     for (var name in __ceRegistry) {
       var els = document.getElementsByTagName(name);
       for (var i = 0; i < els.length; i++) {
@@ -3646,26 +3646,55 @@ const GLOBALS: &str = r#"
         if (!el.__ce && __connected(el)) __upgradeOne(el, __ceRegistry[name]);
       }
     }
-  };
+  }
+  globalThis.__upgradePending = __upgradeAll;
   globalThis.customElements = {
     define: function (name, ctor) {
       name = String(name).toLowerCase();
       if (__ceRegistry[name]) throw new Error('already defined: ' + name);
       __ceRegistry[name] = ctor;
-      globalThis.__upgradePending();
+      // ★ Through the captured reference, not the global. A page that
+      // deletes `__upgradePending` used to make define() THROW, failing the
+      // page's own script — and the failure was then attributed to the page.
+      __upgradeAll();
     },
     get: function (name) { return __ceRegistry[String(name).toLowerCase()]; },
     getName: function (c) {
       for (var n in __ceRegistry) if (__ceRegistry[n] === c) return n;
       return null;
     },
-    upgrade: function () { globalThis.__upgradePending(); },
+    upgrade: function () { __upgradeAll(); },
     whenDefined: function (name) {
       return __ceRegistry[String(name).toLowerCase()]
         ? Promise.resolve(__ceRegistry[String(name).toLowerCase()])
         : new Promise(function () {});   // never settles: it never will here
     },
   };
+
+  // ★★ THE CONVERTER'S OWN MACHINERY IS NOT THE PAGE'S TO REMOVE.
+  //
+  // These internals live on the global object where page code can see them,
+  // and a page that deletes globals it does not recognise — or one that is
+  // simply hostile — could disable mutation delivery, custom-element
+  // upgrades and the timer drain. Worse, `delete __upgradePending` made
+  // `customElements.define` throw, so the page's own script failed and the
+  // failure was attributed to the PAGE rather than to us.
+  //
+  // Sealing makes delete and reassignment no-ops in sloppy mode and throw in
+  // strict mode, which is the browser's own behaviour for non-configurable
+  // properties. COUNTERS are deliberately left writable: this code increments
+  // them, and a page corrupting one costs a metric rather than a conversion.
+  ['__deliverMutations', '__upgradePending', '__drainTimers', '__timerStats',
+   '__fire', '__fireExisting', '__rand_u32', '__take_mutations', '__is_ancestor',
+   '__parse_url', '__fetch_sync', '__rtf', '__docLocale'
+  ].forEach(function (n) {
+    var v = globalThis[n];
+    if (v === undefined) return;
+    try {
+      Object.defineProperty(globalThis, n,
+        { value: v, writable: false, configurable: false, enumerable: false });
+    } catch (e) {}
+  });
 
   // ── XMLHttpRequest ──────────────────────────────────────────────────
   //
