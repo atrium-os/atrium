@@ -1463,6 +1463,44 @@ Verified in the VM after the merge: the 98-document corpus through daemon-create
 (98/259/259), the direct CLI lane, and stale-mount recovery all unchanged, with no jails,
 mounts or upper directories left behind.
 
+### 6.5.2e Memory limits for ephemeral jails — an integration gap, not a missing knob
+
+Bounding how *many* one-shot jails exist (§6.5.2b) says nothing about how much memory any
+one of them may take. The obvious fix — pin a static `rctl` cap in this lane — is wrong, and
+the reason is worth recording because it is not obvious from inside the lane.
+
+**`memoryuse` is RSS, and RSS can only be enforced by killing.** You cannot cleanly fail a
+page fault, so rctl offers `sigkill`/`sigterm` for it and `deny` only for virtual and swap
+([atrium-memory-pressure.md](atrium-memory-pressure.md)). There is no soft version of this
+knob.
+
+**And Atrium already has the adaptive answer.** `memfed` water-fills RAM across jails by
+weight and pushes each one's `memoryuse` cap dynamically, **never below current RSS**, so an
+over-budget jail is *frozen rather than killed* — and it acts through the jaild broker,
+because a jailed governor cannot rctl a sibling. A constant pinned by this lane would not
+merely duplicate that; it would **fight** it, killing a worker the federation would have
+spared.
+
+**So the real gap is integration, not a missing limit:** `memfed` budgets jails **by name**
+from operator configuration, and one-shot worker jails have ephemeral names
+(`<id>__<instance>`) that no configuration can enumerate. Ephemeral jails are therefore
+outside the memory federation entirely — they are neither budgeted by it nor visible to it.
+
+Two ways to close it, both larger than a flag:
+
+1. **Register ephemeral jails with the federation** — have the daemon that creates them tell
+   `memfed` (weight, lifecycle tier), so a worker pool is budgeted as a pool rather than as
+   an unbounded set of strangers.
+2. **Create them through `jaild`** (§6.5.4), after which they are jails jaild knows and
+   `SetRctl` applies to them like any other — which also removes the direct `rctl(8)`
+   shellout this lane would otherwise need.
+
+Until then `--memory <MiB>` exists as a deliberate, **opt-in** safety net for a deployment
+whose jails the federation cannot see, and `--require-memory-limit` refuses to run uncapped
+rather than pretending. Note that `kern.racct.enable` is a **loader tunable**: a machine that
+did not boot with it cannot enforce any cap until it reboots, so this is a fact to report
+and never something to switch on underneath an operator.
+
 ### 6.5.3 The trust gate: `require_signatures`
 
 Two findings surfaced while designing the worker lane. Neither was caused by it; both were

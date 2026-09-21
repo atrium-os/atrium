@@ -541,6 +541,15 @@ fn handle_exec_instance(
         target: app_id.clone(),
         instance,
         tmpfs_mb,
+        // ★ NO STATIC CAP. A constant here would fight `memfed`, which
+        // budgets jails dynamically and never sets a cap below current RSS so
+        // an over-budget jail is frozen rather than killed. `memoryuse` is
+        // RSS and RSS caps can only kill, so a number pinned here would kill
+        // a worker the federation would have spared. The gap that remains is
+        // that memfed budgets BY NAME and these jail names are ephemeral —
+        // portcullis.md §6.5.2e.
+        memory_mb: None,
+        require_memory_limit: false,
         // The home jail(8) chdirs into is resolved from this user's passwd
         // inside portcullis_oneshot — see Spec::user_name.
         user_name: user.to_string(),

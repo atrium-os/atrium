@@ -46,6 +46,32 @@ pub struct Spec {
     pub instance: Option<String>,
     /// Size of the discarded writable layer.
     pub tmpfs_mb: u32,
+    /// ★★★ AN OPT-IN STATIC MEMORY CAP — AND `None` IS THE RIGHT DEFAULT.
+    ///
+    /// `memoryuse` is RSS, and RSS can only be enforced by KILLING: you
+    /// cannot cleanly fail a page fault, so rctl offers `sigkill`/`sigterm`
+    /// for it and `deny` only for virtual/swap (atrium-memory-pressure.md
+    /// §"the per-jail HARD CAP"). There is no soft version of this knob.
+    ///
+    /// ★ AND ATRIUM ALREADY HAS THE ADAPTIVE ANSWER. `memfed` water-fills RAM
+    /// across jails by weight and pushes each one's `memoryuse` cap
+    /// dynamically, **never below current RSS**, so an over-budget jail is
+    /// frozen rather than killed — and it acts through the jaild broker, not
+    /// by shelling rctl wherever it happens to be convenient. A static number
+    /// set here does not merely duplicate that: it FIGHTS it, because a cap
+    /// this lane pins can kill a worker memfed would have frozen.
+    ///
+    /// So the steady-state answer for a worker jail is the federation, not a
+    /// constant. This stays as a deliberate safety net for a deployment whose
+    /// jails the federation cannot see — see the gap in portcullis.md §6.5.2e
+    /// — and it is off unless someone asks for it.
+    pub memory_mb: Option<u64>,
+    /// ★ Refuse to run rather than run UNCAPPED when the kernel cannot
+    /// enforce a limit. Off by default so an existing machine keeps working —
+    /// the same shape as `require_signatures` — because a deployment that
+    /// cares must be able to demand it, and one that does not must not be
+    /// broken by a release.
+    pub require_memory_limit: bool,
     /// The user the entry runs as. ★ Its home is RESOLVED from the host's
     /// passwd, not supplied: `exec.system_jail_user` makes jail(8) chdir into
     /// that user's passwd home inside the jail, so any other answer creates
@@ -54,6 +80,43 @@ pub struct Spec {
     /// only because root's `$HOME` happens to match, and the second was simply
     /// wrong — measured, as `chdir /root: No such file or directory`.
     pub user_name: String,
+}
+
+/// Whether the kernel can enforce an rctl rule at all.
+///
+/// ★ `kern.racct.enable` is a LOADER TUNABLE, not a runtime switch: a machine
+/// that did not boot with it cannot be given resource limits without a
+/// reboot. So this is a fact to report, never something to "turn on" — and a
+/// caller that silently proceeded would be running a worker pool it believes
+/// is capped and is not.
+pub fn racct_enabled() -> bool {
+    std::process::Command::new("sysctl").arg("-n").arg("kern.racct.enable")
+        .output().ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Apply a memoryuse cap to a jail. Returns whether one is now in force.
+///
+/// ★ `sigkill`, matching jaild's own rule (`jaild/src/ffi.rs`): a worker that
+/// exceeds its cap is killed, not merely denied an allocation. A denied
+/// allocation inside a parser is an error path that hostile input chose, and
+/// the broker already survives a worker dying — it is the failure mode the
+/// whole design is built around.
+/// ★ NOTE THE LAYERING VIOLATION THIS ACCEPTS. Atrium's privsep design has
+/// jaild as the single actor for rctl — a jailed governor cannot rctl another
+/// jail, so `SetRctl` is brokered. This lane creates its jails with `jail -c`
+/// directly, and jaild refuses to set a rule on a jail it did not create
+/// ("rctl.unknown_jail"), so brokering is not available here yet. It becomes
+/// available when the lane moves to jaild's `CreateJail` (portcullis.md
+/// §6.5.4), which is the same change that removes the intervening `/bin/sh`.
+/// Recorded rather than quietly shelled out.
+fn apply_memory_cap(jail_name: &str, mb: u64) -> Result<(), String> {
+    let rule = format!("jail:{jail_name}:memoryuse:sigkill={mb}M");
+    let out = std::process::Command::new("rctl").arg("-a").arg(&rule)
+        .output().map_err(|e| format!("rctl: {e}"))?;
+    if out.status.success() { return Ok(()) }
+    Err(format!("rctl -a {rule}: {}", String::from_utf8_lossy(&out.stderr).trim()))
 }
 
 /// The passwd home of `user`, which is where jail(8) will chdir.
@@ -232,6 +295,27 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
     // exiting 7 makes jail(8) exit 1. Success and failure survive; the code
     // does not, and the usage text says so rather than implying a fidelity
     // this path cannot provide.
+    // ★ The cap goes on AFTER the jail exists and BEFORE anything runs in it:
+    // an rctl rule names a jail, so there is nothing to name until `jail -c`
+    // has created it — but `jail -c` also runs the entry. The jail is created
+    // by the same command that starts the entry, so the rule is applied to
+    // the NAME, which rctl accepts ahead of the jail existing. Applying it
+    // here means a worker is capped from its first instruction.
+    if let Some(mb) = spec.memory_mb {
+        if racct_enabled() {
+            if let Err(e) = apply_memory_cap(&jail_name, mb) {
+                teardown(&jail_path, &jail_name);
+                return OneShot::Failed(format!("memory cap: {e}"));
+            }
+        } else if spec.require_memory_limit {
+            teardown(&jail_path, &jail_name);
+            return OneShot::Refused(
+                "a memory limit was required but kern.racct.enable is 0; \
+                 RACCT is a loader tunable, so this machine cannot enforce one \
+                 until it reboots with kern.racct.enable=1".into());
+        }
+    }
+
     let mut cmd = Command::new("jail");
     cmd.arg("-q").arg("-c").arg("-f").arg(&conf_path).arg(&jail_name);
     if let Some([sin, sout, serr]) = stdio {
@@ -338,6 +422,12 @@ fn teardown(jail_path: &Path, jail_name: &str) {
     let _ = Command::new("jail").arg("-r").arg(jail_name)
         .stderr(std::process::Stdio::null()).status();
     let upper = upper_dir(jail_name);
+    // ★ Remove the rctl rule with the jail. Rules are keyed by NAME, and the
+    // name is reused by the next worker with that instance tag: a rule left
+    // behind would silently apply someone else's cap to it, and rules
+    // accumulate in the kernel with nothing to show for them.
+    let _ = Command::new("rctl").arg("-r").arg(format!("jail:{jail_name}:memoryuse:"))
+        .stderr(std::process::Stdio::null()).status();
     let left = portcullis_mounts::converge(
         &[jail_path, upper.as_path()], portcullis_mounts::Force::Yes);
     portcullis_mounts::warn_survivors("portcullis", &left);

@@ -29,6 +29,18 @@ usage:
                   descriptors, instead of creating it here. The privilege
                   then lives in the daemon and this process needs none.
 
+        --memory <MiB>            a STATIC per-jail memoryuse cap via rctl.
+                                  Off by default: memoryuse is RSS, RSS caps
+                                  can only KILL, and memfed already budgets
+                                  jails dynamically (never below current RSS,
+                                  so it freezes rather than kills). Use this
+                                  only where the federation cannot see the
+                                  jail.
+        --require-memory-limit    refuse to run UNCAPPED. Needs a machine
+                                  booted with kern.racct.enable=1; RACCT is a
+                                  loader tunable, so a machine without it
+                                  cannot be capped until it reboots.
+
         Exits 0 if the jailed process succeeded, 1 if it did not.
         NOT the child's own code: jail(8) collapses every nonzero
         exec.start status to 1, so success and failure are
@@ -39,11 +51,20 @@ usage:
 pub fn cmd_exec(args: &[String]) -> ExitCode {
     let (mut instance, mut tmpfs_mb, mut target, mut via_daemon) =
         (None::<String>, 64u32, None::<String>, false);
+    let mut memory_mb: Option<u64> = None;
+    let mut require_memory_limit = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--instance" => { i += 1; instance = args.get(i).cloned(); }
             "--daemon" => via_daemon = true,
+            "--require-memory-limit" => require_memory_limit = true,
+            "--memory" => {
+                i += 1;
+                memory_mb = match args.get(i).and_then(|s| s.parse().ok()) {
+                    Some(n) => Some(n), None => usage(),
+                };
+            }
             "--tmpfs-size" => {
                 i += 1;
                 tmpfs_mb = match args.get(i).and_then(|s| s.parse().ok()) {
@@ -78,6 +99,8 @@ pub fn cmd_exec(args: &[String]) -> ExitCode {
         target,
         instance,
         tmpfs_mb,
+        memory_mb,
+        require_memory_limit,
         user_name: std::env::var("USER").unwrap_or_else(|_| "root".into()),
     };
     match portcullis_oneshot::run(&spec) {
