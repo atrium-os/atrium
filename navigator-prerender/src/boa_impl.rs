@@ -90,6 +90,17 @@ thread_local! {
     /// unset one must give null rather than undefined.
     static ONHANDLERS: RefCell<HashMap<(Handle, String), JsValue>> =
         RefCell::new(HashMap::new());
+    /// ★ RANDOMNESS IS SEEDED FROM THE DOCUMENT, NOT THE MACHINE.
+    ///
+    /// A converter whose output feeds a content-addressed store must produce
+    /// the SAME artifact from the same input — real entropy would give every
+    /// conversion a different hash and defeat dedup entirely. So this is a
+    /// deterministic stream seeded by the document URL.
+    ///
+    /// It is therefore NOT cryptographically random, and nothing in an
+    /// artifact may be treated as a secret. That is already true of a
+    /// converted page: everything in it is public by construction.
+    static RNG: RefCell<u64> = const { RefCell::new(0) };
     /// (dispatches, listener invocations) on ELEMENTS.
     static DISPATCH: RefCell<(u32, u32)> = const { RefCell::new((0, 0)) };
     /// (writes applied, writes refused because they would erase the document)
@@ -183,6 +194,9 @@ fn is_detection_probe(full: &str) -> bool {
         // document and explained nothing.
         | "element.doScroll"
         // Vendor-prefixed fallbacks, always tried after the standard name.
+        // Legacy browser-detection globals: every one is read hoping for
+        // absence, and `window.opera` has not existed since 2013.
+        | "window.opera" | "window.trustedTypes" | "window.chrome"
         | "window.msCrypto" | "window.webkitURL" | "window.mozRequestAnimationFrame"
         | "window.webkitRequestAnimationFrame" | "window.msRequestAnimationFrame"
     )
@@ -885,6 +899,23 @@ fn create_comment(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult
     let text = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
     let h = with(|d| d.create(Kind::Comment(text)));
     Ok(node_obj(h, ctx))
+}
+
+/// `document.forms` — live, like every other collection here.
+fn doc_forms(_t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    html_collection(with(|d| d.by_tag("form")), ctx)
+}
+
+fn doc_images(_t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    html_collection(with(|d| d.by_tag("img")), ctx)
+}
+
+fn doc_links(_t: &JsValue, _a: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    html_collection(with(|d| {
+        let mut v = d.by_tag("a"); v.extend(d.by_tag("area"));
+        v.retain(|&h| d.attr(h, "href").is_some());
+        v.sort_unstable(); v
+    }), ctx)
 }
 
 /// `document.scripts` — live, because scripts add scripts.
@@ -1828,6 +1859,29 @@ fn install_handlers(o: &JsObject, ctx: &mut Context) {
     ];
     debug_assert_eq!(pairs.len(), ON_HANDLERS.len());
     for (n, g, st) in pairs { live_get_set(o, n, *g, *st, ctx); }
+}
+
+/// One step of xorshift64*, enough for the uses the corpus makes of
+/// getRandomValues and randomUUID (ids and cache-busting keys).
+fn rand_u32(_t: &JsValue, _a: &[JsValue], _ctx: &mut Context) -> JsResult<JsValue> {
+    let v = RNG.with(|r| {
+        let mut x = *r.borrow();
+        if x == 0 { x = 0x9E3779B97F4A7C15 }
+        x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+        *r.borrow_mut() = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D) >> 32
+    });
+    Ok(JsValue::from(v as u32))
+}
+
+fn seed_rng(base: Option<&str>) {
+    // FNV-1a over the document URL: same document, same stream.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in base.unwrap_or("about:blank").bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    RNG.with(|r| *r.borrow_mut() = h | 1);
 }
 
 fn el_add_listener(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
@@ -2928,6 +2982,77 @@ const GLOBALS: &str = r#"
   __listType('NodeList');
   __listType('HTMLCollection');
 
+  // ★ A SPECIFIC INTERFACE MUST BE SPECIFIC. `x instanceof HTMLScriptElement`
+  // has to be true for a <script> and FALSE for a <div>; answering from
+  // nodeType alone would make every element every interface, which is a
+  // worse lie than the absence it replaces.
+  function __defTagIface(name, tag) {
+    function T() {}
+    try {
+      Object.defineProperty(T, Symbol.hasInstance, { value: function (v) {
+        if (!v || typeof v !== 'object') return false;
+        try { return v.nodeType === 1 && v.tagName === tag; } catch (e) { return false; }
+      } });
+    } catch (e) {}
+    T.prototype = {};
+    globalThis[name] = T;
+  }
+  [['HTMLScriptElement','SCRIPT'], ['HTMLLinkElement','LINK'],
+   ['HTMLStyleElement','STYLE'], ['HTMLFormElement','FORM'],
+   ['HTMLIFrameElement','IFRAME'], ['HTMLCanvasElement','CANVAS'],
+   ['HTMLTemplateElement','TEMPLATE'], ['HTMLSelectElement','SELECT'],
+   ['HTMLTextAreaElement','TEXTAREA'], ['HTMLButtonElement','BUTTON'],
+   ['HTMLTableElement','TABLE'], ['HTMLVideoElement','VIDEO'],
+   ['HTMLAudioElement','AUDIO'], ['HTMLSpanElement','SPAN'],
+   ['HTMLParagraphElement','P'], ['HTMLUListElement','UL'],
+   ['HTMLOptionElement','OPTION'], ['HTMLMetaElement','META']
+  ].forEach(function (p) { __defTagIface(p[0], p[1]); });
+
+  // Shapes that exist so a `typeof`/instanceof check can answer, and that
+  // this converter never produces instances of.
+  ['CSSStyleSheet', 'CSSRule', 'CSSStyleRule', 'StyleSheetList',
+   'DOMTokenList', 'DOMStringMap', 'Attr', 'CharacterData'
+  ].forEach(function (n) { if (!globalThis[n]) globalThis[n] = function () {}; });
+
+  // ★ crypto is DETERMINISTIC here, seeded from the document URL. A
+  // converter feeding a content-addressed store must produce the same
+  // artifact from the same input; real entropy would give every conversion a
+  // different hash and defeat dedup. It follows that these values are NOT
+  // cryptographically random and nothing in an artifact may be a secret —
+  // which is already true of a converted page.
+  var __cryptoObj = {
+    getRandomValues: function (arr) {
+      if (!arr || typeof arr.length !== 'number') {
+        throw new TypeError('getRandomValues expects a typed array');
+      }
+      for (var i = 0; i < arr.length; i++) arr[i] = __rand_u32();
+      return arr;
+    },
+    randomUUID: function () {
+      var h = '';
+      for (var i = 0; i < 32; i++) h += (__rand_u32() & 15).toString(16);
+      // Version 4, variant 1 — the shape callers parse.
+      return h.slice(0, 8) + '-' + h.slice(8, 12) + '-4' + h.slice(13, 16) + '-' +
+             ((parseInt(h[16], 16) & 3) | 8).toString(16) + h.slice(17, 20) + '-' +
+             h.slice(20, 32);
+    },
+    // subtle is async and real cryptography; absent rather than faked, so a
+    // page that needs it finds out instead of trusting a stub.
+    subtle: undefined,
+  };
+  globalThis.crypto = __cryptoObj;
+
+  // Scroll position: fixed at the origin, like the viewport it belongs to.
+  globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;
+  globalThis.scrollBy = function () {}; globalThis.scroll = function () {};
+  // A fixed screen, for the same reason the user agent is fixed: the
+  // reader's display is not the converter's to report.
+  globalThis.screen = {
+    width: 1280, height: 800, availWidth: 1280, availHeight: 800,
+    colorDepth: 24, pixelDepth: 24,
+    orientation: { type: 'landscape-primary', angle: 0 },
+  };
+
   // `new Image(w, h)` is an <img>. Note it never FETCHES here: the corpus
   // uses it almost entirely as a tracking pixel (`new Image(1,1); img.src =
   // beacon`), and this converter loads no images, so the request simply does
@@ -3305,6 +3430,9 @@ impl ScriptEngine for BoaEngine {
         set_tag(&doc, "HTMLDocument", &mut ctx);
         live_get(&doc, "scripts", doc_scripts, &mut ctx);
         live_get(&doc, "styleSheets", doc_stylesheets, &mut ctx);
+        live_get(&doc, "forms", doc_forms, &mut ctx);
+        live_get(&doc, "images", doc_images, &mut ctx);
+        live_get(&doc, "links", doc_links, &mut ctx);
         live_get(&doc, "scrollingElement", doc_scrolling_element, &mut ctx);
         live_get_set(&doc, "title", doc_title_get, doc_title_set, &mut ctx);
         live_get(&doc, "defaultView", doc_default_view, &mut ctx);
@@ -3379,6 +3507,9 @@ impl ScriptEngine for BoaEngine {
             NativeFunction::from_fn_ptr(is_ancestor));
         let _ = ctx.register_global_callable(js_string!("__rtf"), 5,
             NativeFunction::from_fn_ptr(rtf_format));
+        let _ = ctx.register_global_callable(js_string!("__rand_u32"), 0,
+            NativeFunction::from_fn_ptr(rand_u32));
+        seed_rng(self.base_url.as_deref());
         PAGE_NET.with(|n| *n.borrow_mut() = self.page_fetcher.take());
         PAGE_FETCHES.with(|c| *c.borrow_mut() = (0, 0));
         PAGE_BLOCKED.with(|b| { let mut b = b.borrow_mut(); b.0 = 0; b.1.clear(); });

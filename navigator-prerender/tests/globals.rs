@@ -220,11 +220,11 @@ fn attribution_uses_the_proximate_cause_not_a_tally() {
     use navigator_prerender::Verdict;
     // An earlier, harmless miss, then a throw caused by a no-match lookup.
     let html = "<html><body><p>only</p><script>\
-        var ignored = document.images;\
+        var ignored = document.fonts;\
         document.querySelector('.absent').focus();\
         </script></body></html>";
     let c = convert(html, &mut BoaEngine::default());
-    assert!(c.missing.iter().any(|(n, _)| n == "document.images"),
+    assert!(c.missing.iter().any(|(n, _)| n == "document.fonts"),
         "the harmless miss must still be recorded: {:?}", c.missing);
     assert_eq!(c.verdict, Verdict::BrowserToo,
         "a tally would have said OurGap; cause was {:?}", c.cause);

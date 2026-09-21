@@ -186,7 +186,17 @@ fn main() {
         // object" is one sentence covering ten unrelated gaps, and reading it
         // as a single item is what sends you building the wrong thing.
         if c.first_error.is_some() {
-            let key = match &c.cause {
+            let msg = c.first_error.as_deref().unwrap_or("");
+            // ★ A ReferenceError NAMES ITS OWN CAUSE, and the message beats
+            // the event log. The proximate cause is the last thing recorded
+            // before the throw, which for a bare global lookup is whatever
+            // harmless probe ran just before it — that is how `window.$`
+            // and `window.CSS` kept surfacing as causes for documents whose
+            // real failures were `pageYOffset` and `File`. When the message
+            // is this specific, nothing else is better evidence.
+            let key = if msg.starts_with("ReferenceError: ") {
+                classify_message(msg)
+            } else { match &c.cause {
                 Some((k, what)) if k == "missing" => format!("missing {what}"),
                 Some((k, what)) if k == "no-match" => format!("no-match {what}"),
                 Some((k, what)) => format!("{k} {what}"),
@@ -194,8 +204,8 @@ fn main() {
                 // global lookup never touches a host object, so nothing is
                 // logged — but the MESSAGE names the cause outright. Reading
                 // these as "unattributed" overstated the unknown by 8 docs.
-                None => classify_message(c.first_error.as_deref().unwrap_or("")),
-            };
+                None => classify_message(msg),
+            } };
             *causes.entry(key.clone()).or_default() += 1;
             cause_docs.entry(key).or_default().push(name.clone());
         }
