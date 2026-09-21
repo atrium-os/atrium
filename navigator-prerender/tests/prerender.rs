@@ -390,3 +390,30 @@ fn html_open_comment_is_a_line_comment() {
     assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
     assert!(c.html.contains(r#"x="1""#), "{}", c.html);
 }
+
+/// ★ THE QUESTION TIER 2 ACTUALLY HAS TO ANSWER is not "did the scripts run"
+/// but "is the artifact better than the raw HTML". A conversion that runs
+/// cleanly and adds nothing has not earned its cost, and one that REMOVES
+/// text has made things worse than not converting at all — so the numbers
+/// that answer it are carried on every Conversion.
+#[test]
+fn content_gain_is_measured_not_assumed() {
+    // A page whose content only exists after its script runs: the case tier
+    // 2 exists for.
+    let built = convert(
+        "<html><body><div id=r></div><script>\
+         document.getElementById('r').textContent = 'generated content here';\
+         </script></body></html>", &mut BoaEngine::default());
+    assert!(built.text_after > built.text_before,
+        "{} -> {}", built.text_before, built.text_after);
+
+    // And the dangerous case, which the corpus really contains: a script
+    // that tears content down without replacing it.
+    let lost = convert(
+        "<html><body><div id=r>server rendered text</div><script>\
+         document.getElementById('r').textContent = '';\
+         </script></body></html>", &mut BoaEngine::default());
+    assert!(lost.text_after < lost.text_before,
+        "a teardown must be visible as a LOSS: {} -> {}",
+        lost.text_before, lost.text_after);
+}

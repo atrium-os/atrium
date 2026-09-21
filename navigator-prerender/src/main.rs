@@ -79,6 +79,7 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
     println!("D\t{}\t{}", c.events_dispatched, c.event_listeners_run);
     println!("W\t{}\t{}", c.doc_writes, c.doc_writes_refused);
     println!("J\t{}\t{}", c.injected_scripts_run, c.injected_scripts_refused);
+    println!("X\t{}\t{}", c.text_before, c.text_after);
     println!("T\t{}\t{}", c.timers_fired, c.timers_dropped);
     println!("P\t{}\t{}\t{}\t{}", c.page_fetches, c.page_fetch_failures,
         c.page_blocked, c.beacons_suppressed);
@@ -164,6 +165,7 @@ fn main() {
     let mut nulls: BTreeMap<String, u32> = BTreeMap::new();
     let mut missing_docs: BTreeMap<String, usize> = BTreeMap::new();
     let mut elems = vec![];
+    let mut gains: Vec<(i64, String)> = vec![];
 
     for f in &files {
         let Ok(src) = fs::read_to_string(f) else { continue };
@@ -238,6 +240,9 @@ fn main() {
         ext_fail += c.external_total - c.external_fetched;
         elems.push(c.elements_after);
         if c.scripts_total > 0 {
+            gains.push((c.text_after as i64 - c.text_before as i64, name.clone()));
+        }
+        if c.scripts_total > 0 {
             with_js += 1;
             if c.scripts_failed == 0 { js_ok += 1 } else { js_fail += 1 }
             if c.script_mutations > 0 { mutated += 1 }
@@ -309,6 +314,24 @@ fn main() {
         for (k, n) in v.into_iter().take(30) {
             println!("   {n:3} docs  {k}");
         }
+    }
+    if !gains.is_empty() {
+        gains.sort();
+        let grew = gains.iter().filter(|(d, _)| *d > 0).count();
+        let shrank: Vec<_> = gains.iter().filter(|(d, _)| *d < 0).collect();
+        let flat = gains.len() - grew - shrank.len();
+        let total: i64 = gains.iter().map(|(d, _)| *d).sum();
+        let median = gains[gains.len() / 2].0;
+        println!("CONTENT GAIN (visible text added by running the scripts)");
+        println!("  the question tier 2 has to answer: is the artifact better");
+        println!("  than the raw HTML? Running cleanly and adding nothing is not.");
+        println!("   grew {grew}   unchanged {flat}   SHRANK {}   of {} scripted docs",
+            shrank.len(), gains.len());
+        println!("   total {total:+} chars, median {median:+}");
+        for (d, n) in gains.iter().rev().take(3) { println!("     best  {d:+8}  {n}"); }
+        // A document that LOSES text is the dangerous case: the converter ran
+        // and made the artifact worse than not converting at all.
+        for (d, n) in shrank.iter().take(5) { println!("     LOST  {d:+8}  {n}"); }
     }
     println!("external scripts  referenced={ext_total} fetched={ext_ok} failed={ext_fail}{}",
         if net { "" } else { "   (network OFF — set PRERENDER_NET=1)" });
@@ -426,6 +449,8 @@ pub struct Child {
     pub doc_writes_refused: u32,
     pub injected_scripts_run: u32,
     pub injected_scripts_refused: u32,
+    pub text_before: usize,
+    pub text_after: usize,
     pub cause: Option<(String, String)>,
     pub timers_fired: u32,
     pub timers_dropped: u32,
@@ -445,6 +470,7 @@ fn parse_child(s: &str) -> Option<Child> {
         events_dispatched: 0, event_listeners_run: 0,
         doc_writes: 0, doc_writes_refused: 0,
         injected_scripts_run: 0, injected_scripts_refused: 0,
+        text_before: 0, text_after: 0,
         cause: None,
         timers_fired: 0, timers_dropped: 0, page_fetches: 0, page_fetch_failures: 0,
         page_blocked: 0, beacons: 0, blocked_hosts: vec![] };
@@ -467,6 +493,10 @@ fn parse_child(s: &str) -> Option<Child> {
             Some(&"E") if f.len() >= 2 => c.errors.push(f[1].to_string()),
             Some(&"M") if f.len() >= 3 => {
                 c.missing.push((f[2].to_string(), f[1].parse().unwrap_or(1)));
+            }
+            Some(&"X") if f.len() >= 3 => {
+                c.text_before = f[1].parse().unwrap_or(0);
+                c.text_after = f[2].parse().unwrap_or(0);
             }
             Some(&"J") if f.len() >= 3 => {
                 c.injected_scripts_run = f[1].parse().unwrap_or(0);

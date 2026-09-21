@@ -196,6 +196,9 @@ fn is_detection_probe(full: &str) -> bool {
         // the modern path, so absence is the answer it wants. Same shape as
         // document.all, found the same way — it surfaced as a cause for one
         // document and explained nothing.
+        // IE version detection: `void 0 === document.documentMode` IS the
+        // modern branch, so absence is the answer every caller wants.
+        | "document.documentMode"
         | "element.doScroll"
         // Vendor-prefixed fallbacks, always tried after the standard name.
         // Legacy browser-detection globals: every one is read hoping for
@@ -2374,6 +2377,10 @@ fn query_first(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
 /// feature flags, and mirrors the shipped design: one jail per document.
 /// Bounds on the timer drain. A callback cap stops a runaway rescheduler; the
 /// horizon keeps the snapshot faithful to "shortly after load".
+// Measured, not guessed: raising this to 20000 fires 8x more callbacks
+// (3473 -> 26646 across the corpus) and changes the content gain by
+// NOTHING - same 22 documents grow, same total, same headline. The
+// budget is not the constraint.
 pub const TIMER_BUDGET: u32 = 1000;
 pub const TIMER_HORIZON_MS: u32 = 5000;
 
@@ -3333,6 +3340,30 @@ const GLOBALS: &str = r#"
       value: function (v) { try { return !!v && v.nodeType === 9; } catch (e) { return false; } }
     });
   } catch (e) {}
+
+  // Blob and File are DATA CONTAINERS — size, type, name — with no behaviour
+  // to fake. The corpus uses them for `instanceof File` guards and for
+  // wrapping bytes before an upload that this converter never performs.
+  // Reading them back is async I/O (FileReader, blob.text()), which stays
+  // ABSENT so a page that needs real bytes finds out.
+  globalThis.Blob = function Blob(parts, options) {
+    parts = parts || [];
+    var n = 0;
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i];
+      n += (p && typeof p.size === 'number') ? p.size : String(p).length;
+    }
+    this.size = n;
+    this.type = (options && options.type) ? String(options.type) : '';
+    this.slice = function () { return new Blob([], { type: this.type }); };
+  };
+  globalThis.File = function File(parts, name, options) {
+    Blob.call(this, parts, options);
+    this.name = String(name === undefined ? '' : name);
+    this.lastModified = 0;
+  };
+  File.prototype = Object.create(Blob.prototype);
+  File.prototype.constructor = File;
 
   globalThis.Audio = function Audio(src) {
     var el = document.createElement('audio');

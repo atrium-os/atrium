@@ -15,6 +15,9 @@ pub struct Conversion {
     pub html: String,
     pub engine: &'static str,
     pub elements_before: usize,
+    /// Visible text (whitespace-collapsed) before and after scripts ran.
+    pub text_before: usize,
+    pub text_after: usize,
     pub elements_after: usize,
     pub depth_after: usize,
     pub scripts_total: usize,
@@ -66,6 +69,13 @@ pub fn convert_with(
 ) -> Conversion {
     let mut dom = parse::parse(html);
     let before = dom.element_count();
+    // ★ THE QUESTION TIER 2 ACTUALLY HAS TO ANSWER is not "did the scripts
+    // run" but "is the artifact better than the raw HTML". Text length
+    // before and after is the cheapest honest proxy: a converter that runs
+    // everything cleanly and produces no more content than the parser did is
+    // not earning its cost.
+    let text_before = dom.text_content(dom.root()).split_whitespace()
+        .map(str::len).sum::<usize>();
 
     let (mut ext_total, mut ext_ok, mut ext_fail) = (0, 0, 0);
     let mut fetch_errors: Vec<String> = vec![];
@@ -153,6 +163,9 @@ pub fn convert_with(
         html: dom.serialize(),
         engine: engine.name(),
         elements_before: before,
+        text_before,
+        text_after: dom.text_content(dom.root()).split_whitespace()
+            .map(str::len).sum::<usize>(),
         elements_after: dom.element_count(),
         depth_after: dom.max_depth(),
         scripts_total: scripts.len(),
