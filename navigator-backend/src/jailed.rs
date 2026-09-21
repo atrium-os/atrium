@@ -49,8 +49,16 @@ use std::time::Duration;
 pub enum Confinement {
     /// A bare child process. Process isolation only — NOT a jail.
     None,
-    /// Wrap the worker in a confining command: the worker's path and
-    /// arguments are appended to `program` + `args`.
+    /// Wrap the worker in a confining command: the worker's path is appended
+    /// to `program` + `args`.
+    ///
+    /// ★ An `{instance}` token in `args` is replaced with this session's id.
+    /// A confining launcher that creates one jail per unit of work needs a
+    /// DISTINCT name per spawn — `portcullis exec --instance {instance}` —
+    /// and a static argument list cannot provide one. Without it every worker
+    /// would ask for the same jail name, and `jail -c` on an existing name
+    /// reconfigures the running jail rather than failing, so two documents
+    /// would quietly share one.
     Launcher { program: String, args: Vec<String> },
 }
 
@@ -62,6 +70,9 @@ pub struct WorkerConfig {
     /// pathological, or compromised and stalling on purpose — must not hang
     /// the broker, which is the process every other session depends on.
     pub deadline: Duration,
+    /// How long a retiring worker gets to exit on end-of-input before it is
+    /// killed. A launcher needs this window to tear its jail down.
+    pub shutdown_grace: Duration,
 }
 
 impl WorkerConfig {
@@ -73,6 +84,7 @@ impl WorkerConfig {
             worker: worker.into(),
             confinement: Confinement::None,
             deadline: Duration::from_secs(10),
+            shutdown_grace: Duration::from_secs(5),
         }
     }
 
@@ -83,6 +95,7 @@ impl WorkerConfig {
             worker: worker.into(),
             confinement: Confinement::Launcher { program: program.into(), args },
             deadline: Duration::from_secs(10),
+            shutdown_grace: Duration::from_secs(5),
         }
     }
 
@@ -100,12 +113,13 @@ impl WorkerConfig {
         matches!(self.confinement, Confinement::Launcher { .. })
     }
 
-    fn command(&self) -> Command {
+    fn command(&self, instance: SessionId) -> Command {
         match &self.confinement {
             Confinement::None => Command::new(&self.worker),
             Confinement::Launcher { program, args } => {
                 let mut c = Command::new(program);
-                c.args(args).arg(&self.worker);
+                c.args(args.iter().map(|a| a.replace("{instance}", &instance.to_string())));
+                c.arg(&self.worker);
                 c
             }
         }
@@ -114,7 +128,8 @@ impl WorkerConfig {
 
 struct Worker {
     child: Child,
-    stdin: ChildStdin,
+    /// `Option` so it can be DROPPED to signal end-of-input; see `kill`.
+    stdin: Option<ChildStdin>,
     frames: Receiver<Result<Frame, String>>,
     /// ★ Charged from what the BROKER measured, never from what the worker
     /// reports. A compromised worker asked for its size would answer zero,
@@ -134,7 +149,8 @@ struct Worker {
 
 impl Worker {
     fn request(&mut self, f: &Frame, deadline: Duration) -> Result<Frame, String> {
-        write_frame(&mut self.stdin, f).map_err(|e| e.to_string())?;
+        let stdin = self.stdin.as_mut().ok_or("worker input is closed")?;
+        write_frame(stdin, f).map_err(|e| e.to_string())?;
         match self.frames.recv_timeout(deadline) {
             Ok(Ok(frame)) => Ok(frame),
             Ok(Err(e)) => Err(e),
@@ -172,11 +188,37 @@ impl JailedHost {
     /// Stop a worker. ★ Killed, not merely dropped: dropping the pipes leaves
     /// a worker stuck mid-parse running forever, and the whole point of a
     /// deadline is that something dies at the end of it.
+    /// ★★ CLOSE FIRST, KILL SECOND.
+    ///
+    /// SIGKILLing the child was wrong the moment the child became a
+    /// *launcher*. `portcullis exec` creates a jail and tears it down when
+    /// its work finishes; killed outright, its teardown never runs, and
+    /// because a jail is created with `persist = true` the jail object and
+    /// its mounts outlive it. Measured: one retired worker left a named,
+    /// process-less jail behind, and the next session with that instance tag
+    /// was refused because the husk still answered to the name.
+    ///
+    /// Closing stdin is end-of-input, which the worker already treats as "the
+    /// host went away" and exits on. That lets the launcher finish normally.
+    /// The kill stays as the backstop for a worker that ignores EOF — a
+    /// compromised one will — so this is a shutdown with a deadline, not a
+    /// request and a hope.
     fn kill(&mut self, id: SessionId) -> bool {
-        match self.workers.remove(&id) {
-            Some(mut w) => { let _ = w.child.kill(); let _ = w.child.wait(); true }
-            None => false,
+        let Some(mut w) = self.workers.remove(&id) else { return false };
+        drop(w.stdin.take());
+        let grace = std::time::Instant::now();
+        loop {
+            match w.child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) if grace.elapsed() < self.config.shutdown_grace => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                _ => break,
+            }
         }
+        let _ = w.child.kill();
+        let _ = w.child.wait();
+        true
     }
 
     /// Stop a worker AND record why, for a reader who comes back to it.
@@ -225,8 +267,16 @@ impl DocumentHost for JailedHost {
             return Err(format!("session needs {charged} bytes, {available} left in the budget"));
         }
 
-        let mut child = self.config.command()
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        let id = self.next + 1;
+        let mut child = self.config.command(id)
+            // ★ stderr is INHERITED, not piped. Piping it and never reading
+            // it threw away every word a failing worker said — and worse,
+            // a worker chatty enough to fill the pipe buffer would block
+            // forever on a write nobody was draining, which reads from the
+            // broker's side as a hang with no explanation. The worker's
+            // stderr is diagnostics for whoever is running the broker, so it
+            // goes where the broker's own stderr goes.
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| format!("cannot start worker {:?}: {e}", self.config.worker))?;
         let stdin = child.stdin.take().ok_or("worker has no stdin")?;
@@ -247,10 +297,9 @@ impl DocumentHost for JailedHost {
             }
         });
 
-        let id = self.next + 1;
         self.next = id;
         self.workers.insert(id, Worker {
-            child, stdin, frames, charged, opened_at: now, last_seen: now,
+            child, stdin: Some(stdin), frames, charged, opened_at: now, last_seen: now,
             triggers: vec![],
         });
 

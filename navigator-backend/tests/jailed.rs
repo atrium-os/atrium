@@ -160,6 +160,7 @@ fn a_worker_that_never_answers_is_killed_at_the_deadline() {
             args: vec!["-c".into(), "sleep 30".into()],
         },
         deadline: Duration::from_millis(300),
+        shutdown_grace: Duration::from_secs(2),
     };
     let mut host = JailedHost::new(cfg, SessionLimits::default());
     let started = std::time::Instant::now();
@@ -263,6 +264,7 @@ fn a_worker_that_sends_nonsense_is_retired_not_trusted() {
         worker: "/bin/cat".into(),
         confinement: Confinement::None,
         deadline: Duration::from_secs(5),
+        shutdown_grace: Duration::from_secs(2),
     };
     let mut host = JailedHost::new(cfg, SessionLimits::default());
     let why = host.open(&recording("https://a.test/"), NOW)
@@ -344,4 +346,38 @@ fn the_corpus_runs_through_worker_processes() {
     eprintln!("workers: {opened} sessions, {navigated} navigations, {rewound} rewinds");
     assert!(opened > 0 && navigated > 0, "this test checked nothing");
     assert_eq!(navigated, rewound);
+}
+
+/// ★★ A LAUNCHER GETS A DISTINCT NAME PER SPAWN. A confining launcher that
+/// makes one jail per unit of work needs one, and a static argument list
+/// cannot give it: every worker would ask for the same jail name, and
+/// `jail -c` on an existing name reconfigures the running jail instead of
+/// failing — two documents quietly sharing one.
+#[test]
+fn the_launcher_receives_a_distinct_instance_per_session() {
+    // `sh -c 'echo "$@" >>LOG; exec WORKER' --` records the argv it was
+    // handed, then becomes the real worker, so the session still works.
+    let log = std::env::temp_dir().join(format!("nav-instance-{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&log);
+    let script = format!("echo \"$1\" >> {} ; shift ; exec \"$@\"", log.display());
+    let cfg = WorkerConfig {
+        worker: WORKER.into(),
+        confinement: Confinement::Launcher {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script, "sh".into(), "{instance}".into()],
+        },
+        deadline: Duration::from_secs(5),
+        shutdown_grace: Duration::from_secs(2),
+    };
+    let mut host = JailedHost::new(cfg, SessionLimits::default());
+    let a = host.open(&recording("https://a.test/"), NOW).expect("opens");
+    let b = host.open(&recording("https://b.test/"), NOW).expect("opens");
+    assert_ne!(a, b);
+
+    let seen = std::fs::read_to_string(&log).expect("the launcher ran");
+    let tags: Vec<&str> = seen.lines().collect();
+    assert_eq!(tags.len(), 2, "expected one tag per spawn: {tags:?}");
+    assert_ne!(tags[0], tags[1], "both workers asked for the same jail: {tags:?}");
+    assert!(tags.contains(&a.to_string().as_str()), "{tags:?} vs session {a}");
+    let _ = std::fs::remove_file(&log);
 }

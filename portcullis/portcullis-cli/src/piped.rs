@@ -143,9 +143,21 @@ pub fn cmd_exec(args: &[String]) -> ExitCode {
     // name a caller needs to fix it. Distinctness is the caller's to own —
     // this just stops it being silently violated.
     if let Some(jid) = running_jid(&jail_name) {
-        eprintln!("portcullis: REFUSED — jail {jail_name} is already running (jid {jid}); \
-                   instance tags must be distinct while they overlap");
-        return ExitCode::from(1);
+        // ★★ AN EMPTY JAIL IS A HUSK, NOT AN INSTANCE. `persist = true` keeps
+        // a jail object alive after its processes are gone, so a launcher
+        // that was SIGKILLed — which is exactly what a broker does to a
+        // worker it is retiring — leaves a named, process-less jail and its
+        // mounts behind. Refusing on that would make one killed worker
+        // poison its instance tag until a human noticed; measured, it did.
+        //
+        // So: processes inside decide. Some means a live instance and a
+        // genuine duplicate; none means wreckage this run should clear.
+        if jailed_process_count(jid) > 0 {
+            eprintln!("portcullis: REFUSED — jail {jail_name} is already running (jid {jid}); \
+                       instance tags must be distinct while they overlap");
+            return ExitCode::from(1);
+        }
+        eprintln!("portcullis: reclaiming abandoned jail {jail_name} (jid {jid}, no processes)");
     }
 
     // Now safe: anything left under this name belongs to a run that is gone.
@@ -182,12 +194,21 @@ pub fn cmd_exec(args: &[String]) -> ExitCode {
     // stdio is inherited: no .stdin()/.stdout() calls, deliberately. When the
     // caller spawned us with pipes, the jailed process reads and writes them.
     //
+    // ★★ `-q` IS LOAD-BEARING, NOT COSMETIC. jail(8) prints "<name>: created"
+    // and "<name>: removed" on STDOUT, and stdout here is the caller's pipe —
+    // the same one the jailed process speaks its protocol on. Measured: a
+    // broker reading length-prefixed frames got
+    // `malformed frame: bad length in "org_atrium_navigator_worker__1: created"`
+    // and the session never opened. Anything this command emits on stdout is
+    // indistinguishable from the payload; everything it has to say goes to
+    // stderr instead.
+    //
     // ★ The status below is jail(8)'s, not the entry's. Measured: a child
     // exiting 7 makes jail(8) exit 1. Success and failure survive; the code
     // does not, and the usage text says so rather than implying a fidelity
     // this path cannot provide.
     let status = Command::new("jail")
-        .arg("-c").arg("-f").arg(&conf_path).arg(&jail_name)
+        .arg("-q").arg("-c").arg("-f").arg(&conf_path).arg(&jail_name)
         .status();
 
     let code = match status {
@@ -208,6 +229,19 @@ fn running_jid(name: &str) -> Option<u32> {
     let out = Command::new("jls").arg("-j").arg(name).arg("jid").output().ok()?;
     if !out.status.success() { return None }
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// How many processes are inside a jail. Zero means the jail object outlived
+/// whatever it was created for.
+fn jailed_process_count(jid: u32) -> usize {
+    match Command::new("ps").arg("-J").arg(jid.to_string()).arg("-o").arg("pid=").output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).lines()
+            .filter(|l| !l.trim().is_empty()).count(),
+        // ★ Unknown reads as OCCUPIED. If the process table cannot be read,
+        // the safe assumption is that something is in there — tearing down a
+        // jail that might hold a live reader is the worse mistake.
+        Err(_) => 1,
+    }
 }
 
 fn resolve_tree(target: &str) -> PathBuf {

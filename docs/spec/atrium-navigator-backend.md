@@ -462,6 +462,52 @@ session on purpose), it **hangs** (killed at a per-request deadline — a pipe h
 timeout, so a reader thread makes "bound every request" a mechanism rather than a comment),
 or it **lies** (retired, not believed).
 
+### 4.7a Measured: the corpus through real FreeBSD jails
+
+`Confinement::Launcher` pointed at `portcullis exec --instance {instance}` (portcullis.md
+§6.5.2), on FreeBSD 16.0-CURRENT aarch64, everything cross-built on the host and staged by
+scp. The worker is an installed, **signed** app whose manifest declares no capabilities at
+all — no network, no mounts — with its library closure resolved into the tree by `opifex`.
+
+| host | sessions | navigations | rewinds | failures | wall |
+|---|---|---|---|---|---|
+| in-process | 98 | 259 | 259 | 0 | 78 s |
+| worker processes, unconfined | 98 | 259 | 259 | 0 | 56 s |
+| **worker processes, jailed** | **98** | **259** | **259** | **0** | **59 s** |
+
+98 jails created and destroyed, and afterwards **no jails, no mounts and no roots left
+behind**. The broker is unchanged across all three rows: that is what the `DocumentHost`
+seam was for.
+
+**Three bugs this found, none visible without running it.**
+
+1. **A launcher's chatter corrupts the protocol.** `jail(8)` prints `<name>: created` on
+   *stdout* — the same pipe the worker speaks frames on. The broker read it as a length
+   prefix and reported `malformed frame: bad length in "…: created"`. Anything a launcher
+   emits on stdout is indistinguishable from payload; `jail -q` is load-bearing, and
+   everything `portcullis exec` has to say goes to stderr.
+2. **SIGKILLing a launcher leaks its jail.** `JailedHost` killed a retiring worker outright,
+   so `portcullis exec`'s teardown never ran, and because a jail is created with
+   `persist = true` the jail object and its mounts outlived it — after which the next
+   session with that instance tag was refused, because the husk still answered to the name.
+   Retirement now closes stdin first (the worker already exits on end-of-input), giving the
+   launcher a bounded window to tear its jail down, with the kill as the backstop for a
+   worker that ignores EOF. And `portcullis exec` treats a **process-less** jail as wreckage
+   to reclaim rather than an instance to refuse, so one killed worker cannot poison its tag
+   until a human notices.
+3. **Piped stderr that nobody reads is worse than no stderr.** The host piped the worker's
+   stderr and never drained it, so every word a failing worker said was discarded — and a
+   worker chatty enough to fill the pipe buffer would have blocked forever on a write with
+   no reader, which from the broker's side is a hang with no explanation. It is inherited
+   now.
+
+**What this does and does not prove.** It proves the mechanism end to end: signed manifest,
+one jail per document, pipe protocol across the boundary, bounded requests, clean teardown
+at scale. The *confinement* itself was verified separately with a shell app inside the same
+jail configuration (`/etc`, `/usr`, `/var`, `/home` absent; writes land in tmpfs and vanish;
+the app tree untouched) — not by probing from the Navigator's own worker, which speaks only
+the frame protocol and cannot be asked what it sees.
+
 ### 4.5 Recording format version 2
 
 `atrium-navigator-recording/2` adds one field: an insert's `index`, the position the markup
