@@ -192,6 +192,26 @@ and rejects rather than clamps. This validator is the one place in the broker th
 consumes hostile input: it must be small, total (no recursion without a depth bound), and
 fuzzed with reached-coverage reported (§7).
 
+**The document inside a recording gets the same treatment, and the split is: the converter
+reports, the backend refuses.** Both read the Document Profile's ceilings from one place
+(`navigator-dom`'s `profile` module), because a renderer that refuses documents its own
+converter happily emits is not a safety property, it is a broken pipeline. What differs is
+the decision. The converter still holds the document and can say *which* ceiling a real
+page broke — that is how three of the ceilings were corrected — so it reports and
+continues. The backend is promising G3, boundedness, about a document from a shared store;
+a document outside the profile is exactly the one for which no bound was ever established,
+so it refuses.
+
+Order matters. Bytes are bounded during ingest, before parsing; element and depth ceilings
+need a tree, and building a tree from unbounded bytes to discover whether the bytes were
+bounded is the check defeating itself.
+
+Every refusal test is paired with an acceptance test, and the acceptance arm runs at corpus
+scale: all 99 recordings from the main corpus and all 67 from the adversarial one are
+inside the profile. A validator that refused everything would pass every refusal test ever
+written, and this project has already shipped a profile checker that checked nothing while
+two whole corpora reported clean.
+
 ---
 
 ## 5. The store is Tessera

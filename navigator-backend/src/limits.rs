@@ -11,8 +11,9 @@ pub struct Limits {
     /// The whole recording. The converter's largest real output is ~1 MiB of
     /// document plus a small table; the corpus maximum document is 2 MiB.
     pub max_total_bytes: usize,
-    /// The embedded document. Matches the profile's own document ceiling, so
-    /// a recording cannot smuggle in a document the profile would refuse.
+    /// The embedded document. ★ Read FROM the profile rather than copied to
+    /// match it: this is the ceiling a renderer will later refuse on, and two
+    /// numbers that must agree are one number that will eventually not.
     pub max_document_bytes: usize,
     pub max_transitions: usize,
     pub max_effects_per_transition: usize,
@@ -26,7 +27,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_total_bytes: 16 * 1024 * 1024,
-            max_document_bytes: 8 * 1024 * 1024,
+            max_document_bytes: navigator_dom::profile::MAX_DOCUMENT_BYTES,
             max_transitions: 4096,
             max_effects_per_transition: 64,
             max_string_bytes: 64 * 1024,

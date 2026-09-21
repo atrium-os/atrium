@@ -85,3 +85,42 @@ fn triggers_recorded_by_the_converter_resolve_in_the_backend() {
     let pct = resolved * 100 / total;
     assert!(pct >= 90, "only {pct}% of triggers resolve — the ends have drifted");
 }
+
+/// ★★ THE ACCEPTANCE ARM AT CORPUS SCALE.
+///
+/// `tests/profile.rs` proves the backend refuses documents outside the
+/// profile. On its own that is the cheaper half of the claim: a validator
+/// that refused everything would pass it. This is the half that costs
+/// something — every document the converter actually emitted must be one the
+/// backend will render.
+///
+/// A failure here is not "tighten the test". It means either the converter is
+/// emitting documents its own renderer refuses, or a ceiling is wrong; three
+/// of the profile's ceilings were corrected because a measurement like this
+/// one disagreed with the prose.
+#[test]
+fn every_emitted_document_is_inside_the_profile() {
+    let Ok(dir) = std::env::var("NAVIGATOR_RECORDINGS") else {
+        eprintln!("SKIPPED: set NAVIGATOR_RECORDINGS to a directory of emitted recordings");
+        return;
+    };
+    use navigator_backend::document::Document;
+    let mut n = 0;
+    let mut refused = vec![];
+    for e in std::fs::read_dir(&dir).expect("readable directory").flatten() {
+        let p = e.path();
+        if p.extension().map(|x| x != "json").unwrap_or(true) { continue }
+        let bytes = std::fs::read(&p).expect("readable file");
+        let Ok(r) = ingest(&bytes, &Limits::default()) else { continue };
+        n += 1;
+        if let Err(v) = Document::accept(&r.document) {
+            let why: Vec<String> = v.iter().map(|v| v.to_string()).collect();
+            refused.push(format!("{}: {}", p.display(), why.join(", ")));
+        }
+    }
+    assert!(n > 0, "no recordings found in {dir} — this test checked nothing");
+    eprintln!("{n} emitted documents, {} refused by the profile", refused.len());
+    assert!(refused.is_empty(),
+        "the backend refuses documents its own converter emits:\n  {}",
+        refused.join("\n  "));
+}

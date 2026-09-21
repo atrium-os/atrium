@@ -12,12 +12,29 @@
 //! hand-rolled one, for exactly this reason. Extracting it makes the rule
 //! hold across crates rather than only within one.
 //!
-//! The crate deliberately contains no policy: no ceilings, no profile, no
-//! decisions about what a document may be. Those differ between a converter
-//! and a renderer, and only the TREE is common.
+//! ★ THE PROFILE IS HERE TOO, AND I SAID IT WOULD NOT BE.
+//!
+//! When this crate was split out it carried a line claiming it "deliberately
+//! contains no policy: no ceilings, no profile". That was wrong, and the
+//! distinction it missed is worth keeping:
+//!
+//!   - The Document Profile's ceilings are a CONTRACT. They are normative in
+//!     the spec, and both sides must read the same numbers from the same
+//!     place — a converter that emits a document its renderer will refuse has
+//!     produced nothing. That is the parser argument again, applied to a
+//!     different shared fact, so `profile` lives here.
+//!   - What to DO about a document outside the profile is policy, and that
+//!     stays with each side. The converter reports violations while it still
+//!     holds the document and can say which one; the backend refuses to
+//!     render it. Neither decision belongs in this crate.
+//!
+//! So the rule is not "no policy" but "no DECISIONS": shared facts here,
+//! shared measurements here, and every choice made by the crate that has to
+//! live with it.
 
 pub mod dom;
 pub mod parse;
+pub mod profile;
 
 pub use dom::{Dom, Handle, Kind, Node};
 pub use parse::{parse, parse_fragment};
