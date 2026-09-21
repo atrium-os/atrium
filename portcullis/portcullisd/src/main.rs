@@ -297,6 +297,11 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
+        if let Request::ExecInstance { app_id, instance, tmpfs_mb } = req {
+            handle_exec_instance(app_id, instance, tmpfs_mb, &owner,
+                                 &mut writer, &reader)?;
+            continue;
+        }
         if let Request::Launch { app_id, bypass_policy } = req {
             /* `owner`, not `user`: see the inheritance note above. This is both
              * whose policy authorizes the launch and who the launched app is
@@ -380,6 +385,75 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
 /// Launch handler with SCM_RIGHTS fd handoff (see Phase 4.4 step 2).
 /// Adds per-user policy lookup and `exec.jail_user = <user>` so the
 /// app runs as the connecting user inside its per-app jail.
+/// One-shot, per-instance, pipe-wired launch — the worker-pool lifecycle.
+///
+/// ★★ DELIBERATELY NOT `handle_launch` WITH A FLAG. It skips the policy
+/// prompt, the per-app uid allocation, the persistent overlay and the
+/// first-run setup — not because those are inconvenient here but because none
+/// of them means anything for a jail that exists for one document and is
+/// discarded. Threading a boolean through `launch_with_stdio` to switch half
+/// of it off would leave the two lifecycles entangled in the one function
+/// that must never be wrong.
+///
+/// ★ It runs the SAME code as `portcullis exec` — `portcullis_oneshot::run` —
+/// so the daemon and the CLI cannot drift about what a one-shot jail is. The
+/// trust gate already taught this crate what three copies of one decision
+/// costs.
+///
+/// The signature requirement is inside `portcullis_oneshot`, and is
+/// `Demand::Required`: a worker pool launches continuously, so "unsigned is
+/// allowed while trust is unconfigured" would be a standing condition rather
+/// than a fresh machine's grace period.
+fn handle_exec_instance(
+    app_id:   String,
+    instance: Option<String>,
+    tmpfs_mb: u32,
+    user:     &str,
+    writer:   &mut UnixStream,
+    reader:   &BufReader<UnixStream>,
+) -> std::io::Result<()> {
+    write_response(writer, &Response::ReadyForFds)?;
+
+    if !reader.buffer().is_empty() {
+        return write_response(writer, &Response::LaunchFailed {
+            stage: "fdpass".into(),
+            message: "protocol violation: data buffered before fd handoff".into(),
+        });
+    }
+    let fds = match portcullis_ipc::recv_fds(reader.get_ref(), 3) {
+        Ok(v) => v,
+        Err(e) => return write_response(writer, &Response::LaunchFailed {
+            stage: "fdpass".into(), message: format!("recv_fds: {e}"),
+        }),
+    };
+    if fds.len() != 3 {
+        return write_response(writer, &Response::LaunchFailed {
+            stage: "fdpass".into(),
+            message: format!("expected 3 fds, got {}", fds.len()),
+        });
+    }
+    let mut it = fds.into_iter();
+    let stdio = [it.next().unwrap(), it.next().unwrap(), it.next().unwrap()];
+
+    let spec = portcullis_oneshot::Spec {
+        target: app_id.clone(),
+        instance,
+        tmpfs_mb,
+        // The home jail(8) chdirs into is resolved from this user's passwd
+        // inside portcullis_oneshot — see Spec::user_name.
+        user_name: user.to_string(),
+    };
+    let resp = match portcullis_oneshot::run_with_stdio(&spec, Some(stdio)) {
+        portcullis_oneshot::OneShot::Exit { ok } =>
+            Response::LaunchExit { code: Some(if ok { 0 } else { 1 }) },
+        portcullis_oneshot::OneShot::Refused(why) =>
+            Response::LaunchFailed { stage: "refused".into(), message: why },
+        portcullis_oneshot::OneShot::Failed(why) =>
+            Response::LaunchFailed { stage: "oneshot".into(), message: why },
+    };
+    write_response(writer, &resp)
+}
+
 fn handle_launch(
     app_id:        String,
     bypass_policy: bool,
@@ -918,6 +992,13 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
             s.cache.remove(user);
             Response::Ok
         }
+        /* Both launch verbs are routed in serve(), which holds the fd-passing
+         * socket this handler does not. Reaching here means that routing was
+         * removed — refuse rather than fall through to something that cannot
+         * receive the caller's descriptors. */
+        Request::ExecInstance { .. } => Response::Error {
+            message: "ExecInstance must be routed through the fd-passing path".into(),
+        },
         Request::Launch { .. } => Response::Error {
             /* Caught by serve() before reaching here. */
             message: "internal: Launch must go through handle_launch".into(),

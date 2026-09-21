@@ -1,0 +1,17 @@
+[package]
+name = "portcullis-oneshot"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+description = "One-shot jails wired to a caller's pipes: per-instance name and root, tmpfs upper layer, required signatures, convergent teardown. A crate rather than a CLI subcommand so the daemon and the CLI run the SAME implementation — the launch path already learned what two copies of one gate costs."
+
+[lib]
+name = "portcullis_oneshot"
+path = "src/lib.rs"
+
+[dependencies]
+portcullis-jail  = { path = "../portcullis-jail" }
+portcullis-toml  = { path = "../portcullis-toml" }
+portcullis-trust = { path = "../portcullis-trust" }
+libc = "0.2"

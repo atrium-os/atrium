@@ -15,6 +15,7 @@ members = [
     "sockmux",
     "portcullis-sig",
     "portcullis-trust",
+    "portcullis-oneshot",
     "portcullis-peer",
     "atrium-volumes",
     "ostiarius",

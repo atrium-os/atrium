@@ -120,6 +120,30 @@ pub enum Request {
         bypass_policy: bool,
     },
 
+    /// Run an installed app in a ONE-SHOT jail wired to the caller's stdio.
+    ///
+    /// ★★ A SEPARATE REQUEST, NOT A FLAG ON `Launch`, because it is a
+    /// different lifecycle rather than a variant of the same one. `Launch` is
+    /// an application: one jail per app id, a persistent overlay, a dedicated
+    /// per-app uid, first-run setup, single-instance. This is a unit of work:
+    /// a per-instance jail and root, a tmpfs upper layer discarded at exit,
+    /// no overlay and no first-run, many concurrently from one app. Folding
+    /// them together would put a boolean in the middle of the launch path
+    /// deciding which half of it to skip.
+    ///
+    /// `instance` must be distinct across concurrent runs; the caller owns
+    /// that. Signatures are REQUIRED on this path whatever the machine is
+    /// configured for, because a worker pool launches continuously.
+    ///
+    /// Stdio handoff is identical to `Launch`: the daemon answers
+    /// `ReadyForFds`, the client sends three descriptors over SCM_RIGHTS, and
+    /// the jailed entry speaks on them directly.
+    ExecInstance {
+        app_id:   String,
+        instance: Option<String>,
+        tmpfs_mb: u32,
+    },
+
     /// "What may I launch?" — the installed-app catalog, for the launcher UI
     /// (Forum's dock). Requires the caller's manifest to hold `app-launch`.
     ///

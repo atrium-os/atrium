@@ -18,3 +18,4 @@ portcullis-policy = { path = "../portcullis-policy" }
 portcullis-ipc    = { path = "../portcullis-ipc" }
 portcullis-peer   = { path = "../portcullis-peer" }
 portcullis-trust  = { path = "../portcullis-trust" }
+portcullis-oneshot = { path = "../portcullis-oneshot" }

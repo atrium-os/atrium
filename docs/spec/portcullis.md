@@ -1290,6 +1290,48 @@ log file. Caller-supplied fds over `SCM_RIGHTS` — the machinery `portcullis_ip
 and `send_frame_with_fds` already provide in both directions — is the natural extension
 point.
 
+### 6.5.2a `Request::ExecInstance` — the daemon creates the jail
+
+`portcullis exec --daemon` asks **portcullisd** to create the jail and hands it the caller's
+three descriptors over `SCM_RIGHTS` — the same handshake `Launch` already uses
+(`ReadyForFds` → `send_fds` → `LaunchExit`). The calling process creates no jail, mounts
+nothing, and needs no privilege.
+
+**A separate request, not a flag on `Launch`.** They are different lifecycles, not variants
+of one. `Launch` is an *application*: one jail per app id, a persistent overlay, a dedicated
+per-app uid, first-run setup, single-instance. `ExecInstance` is a *unit of work*: a
+per-instance jail and root, a tmpfs upper layer discarded at exit, no overlay, no first-run,
+many concurrently from one app. Folding them together would put a boolean in the middle of
+the launch path deciding which half of itself to skip.
+
+**One implementation, two callers.** The operation lives in `portcullis-oneshot`; the CLI
+parses arguments into it and the daemon calls it after receiving the descriptors. The trust
+gate already taught this tree what three copies of one decision cost (§6.5.3), so the
+daemon does not get its own.
+
+`--daemon` **does not fall back.** If portcullisd is not running it refuses, because
+quietly creating the jail in the calling process would grant exactly the privilege the
+caller asked to avoid — and would do it without saying so.
+
+**The run user's home is resolved from passwd, not supplied.** `exec.system_jail_user` makes
+jail(8) chdir into that user's passwd home *inside* the jail, so any other answer creates
+the wrong directory and the entry dies before it runs. The CLI previously passed `$HOME`
+(right only because root's `$HOME` happens to match) and the daemon's first version
+constructed `/home/<user>` (simply wrong — `chdir /root: No such file or directory`).
+
+**Measured in the VM**, with the Navigator's 98-recording corpus, one jail per document:
+
+| broker runs as | jails created by | sessions | navs | rewinds | failures |
+|---|---|---|---|---|---|
+| root | the CLI itself | 98 | 259 | 259 | 0 |
+| root | **portcullisd** | 98 | 259 | 259 | 0 |
+| **uid 1001, unprivileged** | **portcullisd** | 98 | 259 | 259 | 0 |
+
+No jails, mounts or roots left behind in any row, and the daemon survived all three. The
+last row is the point: the same unprivileged user, asked to create a jail directly, is
+refused — `mkdir /var/lib/atrium/jails/…: Permission denied`. The privilege is in the
+daemon, and that is now a demonstrated property rather than a described one.
+
 ### 6.5.3 The trust gate: `require_signatures`
 
 Two findings surfaced while designing the worker lane. Neither was caused by it; both were

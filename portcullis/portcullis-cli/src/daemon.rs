@@ -208,3 +208,44 @@ pub fn ping() -> DaemonResult<()> {
         other => Err(io::Error::other(format!("unexpected ping reply: {other:?}"))),
     }
 }
+
+/// Ask the daemon to run an app in a one-shot jail on OUR descriptors.
+///
+/// ★ The privilege stays in the daemon. This process creates no jail, mounts
+/// nothing and needs no root — it hands over three file descriptors and waits.
+/// That is the difference between `exec` and `exec --daemon`, and the reason
+/// the daemon variant is the one a broker should use.
+pub fn exec_instance(app_id: &str, instance: Option<&str>, tmpfs_mb: u32)
+    -> DaemonResult<bool>
+{
+    let Some(mut s) = opened()? else { return Ok(None) };
+    write_request(&mut s, &Request::ExecInstance {
+        app_id: app_id.into(),
+        instance: instance.map(str::to_string),
+        tmpfs_mb,
+    })?;
+    match read_response(&mut s)? {
+        Response::ReadyForFds => {}
+        Response::LaunchFailed { stage, message } =>
+            return Err(io::Error::other(format!("{stage}: {message}"))),
+        Response::Error { message } => return Err(io::Error::other(message)),
+        other => return Err(io::Error::other(format!("unexpected reply: {other:?}"))),
+    }
+    let stdio_fds = [
+        std::io::stdin().as_raw_fd(),
+        std::io::stdout().as_raw_fd(),
+        std::io::stderr().as_raw_fd(),
+    ];
+    send_fds(&s, &stdio_fds)?;
+    match read_response(&mut s)? {
+        // ★ jail(8) collapses nonzero exec.start statuses to 1, so this is
+        // success-or-not and never the child's own code. Said here as well as
+        // in the usage text because a caller reading only this would
+        // otherwise assume the code survived.
+        Response::LaunchExit { code } => Ok(Some(code == Some(0))),
+        Response::LaunchFailed { stage, message } =>
+            Err(io::Error::other(format!("{stage}: {message}"))),
+        Response::Error { message } => Err(io::Error::other(message)),
+        other => Err(io::Error::other(format!("unexpected reply: {other:?}"))),
+    }
+}

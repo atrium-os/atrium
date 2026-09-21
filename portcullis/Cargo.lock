@@ -573,6 +573,7 @@ version = "0.1.0"
 dependencies = [
  "portcullis-ipc",
  "portcullis-jail",
+ "portcullis-oneshot",
  "portcullis-overlay",
  "portcullis-peer",
  "portcullis-policy",
@@ -597,6 +598,16 @@ version = "0.1.0"
 dependencies = [
  "portcullis-toml",
  "thiserror",
+]
+
+[[package]]
+name = "portcullis-oneshot"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "portcullis-jail",
+ "portcullis-toml",
+ "portcullis-trust",
 ]
 
 [[package]]
@@ -671,6 +682,7 @@ dependencies = [
  "log",
  "portcullis-ipc",
  "portcullis-jail",
+ "portcullis-oneshot",
  "portcullis-overlay",
  "portcullis-peer",
  "portcullis-policy",
