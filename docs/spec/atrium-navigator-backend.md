@@ -95,12 +95,12 @@ aspirational.
 The pure function above takes *bytes*. For the legacy lane it takes something slightly
 richer, and leaving that undocumented would make the converter's output a private format
 between two components that are built years apart. `navigator-prerender` emits it today as
-`atrium-navigator-recording/1`.
+`atrium-navigator-recording/2` (§4.5 covers the version bump and what version 1 still guarantees).
 
 A recording is **one document plus a table of what a reader can do to it**:
 
 ```json
-{ "format": "atrium-navigator-recording/1",
+{ "format": "atrium-navigator-recording/2",
   "url": "https://example.test/page",
   "tier": 1,
   "tier_reason": "conversion removed reader-visible content",
@@ -253,37 +253,64 @@ every path resolves, and no result leaves the profile.
 ### 4.4 Going back
 
 A reader moving back through states needs the state they were actually in, not one
-reconstructed from a recording that may not describe it. **Reversibility is not uniform,
-and the format is what limits it:**
+reconstructed from a recording that may not describe it.
 
-- An `attribute` effect records both sides, so its inverse is exact — swap `from` and `to`.
-  The reversal is then applied through the ordinary path, preconditions and profile check
-  included. An undo that skipped them would be the one operation in the backend that trusts
-  a recording, acting on a document that has already been modified once.
-- `remove` records only a path. What was there — subtree, attributes, position among
-  siblings — is not in the recording, so an inverse would have to invent a document.
-- `insert` records a parent and markup but not *where* under that parent it went (§4.3), so
-  nothing can identify what to take back out.
+**The undo is derived from the document, not from the recording.** Everything an inverse
+needs is present at the moment the effect is applied: a removal is about to destroy a
+subtree that is right there, and an insertion chooses the position it lands at.
+`applied_with_undo` reads it from the one source that cannot be wrong, and **every**
+transition is exactly reversible — no fallback, no unreversible cases.
 
-The last two **refuse** rather than approximate, and a transition mixing an invertible
-effect with one that is not has no inverse at all: a partial inverse undoes half a step,
-and the reader cannot tell.
+This replaced an earlier design that read the inverse out of the transition. That one could
+invert an `attribute` effect (both sides are recorded) but not a `remove` (only a path is),
+so a history kept a whole-document snapshot for those steps — measured at 7 of the corpus's
+264 anchored transitions.
 
-**History pays only where the debt is owed.** A step with an exact inverse stores the
-inverse — a handful of strings. A step without one stores the document that preceded it.
-Snapshotting every state would be simpler and would make the common case pay for the rare
-one.
+The obvious fix was to record more: put the removed markup in the recording. **That is the
+wrong fix, and the reason generalises.** It would add a second copy of a derivable fact to
+untrusted input, where it can disagree with the document — and a consumer holding two
+versions of what used to be at a path must choose one with nothing to choose on. Derivable
+facts do not belong in an untrusted format. The evidence is direct: **version 1 recordings,
+which carry neither removed markup nor insert positions, reverse 264/264.**
 
-How common: **257 of 264 anchored transitions in the main corpus (97%) reverse exactly and
-for free**, and both in the adversarial corpus. Seven need a snapshot. That is the same
-shape as the finding that most recorded transitions are attribute-only, and it is measured
-rather than assumed — it is the number that decides whether a session's history costs
-strings per step or a document per step.
+An undo goes back through the ordinary path — preconditions, profile check, atomicity — with
+one exception: the trigger is not required to resolve. That check asks whether a transition
+was recorded against this document, which is already answered for an undo built from it, and
+a step that removes its own trigger (a tab control replaced by the panel it opens) must
+still be undoable.
 
-Reversal is verified by **byte equality** on the serialized document, against recordings the
-converter actually produced. A weaker assertion — "the attribute is false again" — passes on
-a document that has also quietly gained or lost something else, which is the failure an undo
-path actually has.
+Reversal is verified by **byte equality** on the serialized document, at corpus scale:
+259/259 on the main corpus, 2/2 on the adversarial one, and 264/264 on the older version 1
+recordings. A weaker assertion — "the attribute is false again" — passes on a document that
+has also quietly gained or lost something else, which is the failure an undo path has.
+
+### 4.5 Recording format version 2
+
+`atrium-navigator-recording/2` adds one field: an insert's `index`, the position the markup
+occupies among its parent's children.
+
+**It is not there for reversibility** (§4.4 gets that from the document) **but for
+fidelity.** Version 1 recorded only the parent, so a replay could do nothing but append: a
+row the page inserted into the middle of a list came back at the end, and no error reported
+it. Real corpus recordings carry indices of 51 and 3 — inserts that version 1 silently moved.
+
+Position is the one thing here that genuinely cannot be derived, because replay chooses
+where to put the markup. That is the test a new field has to pass.
+
+Version 1 is still accepted: recordings live in a content-addressed store and do not
+disappear when the producer moves on. A version 1 insert carries `index: None` — **absent,
+not defaulted to a plausible zero** — so it appends, and a consumer can tell which guarantee
+it is getting. An out-of-range index clamps rather than refusing, degrading to the version 1
+behaviour instead of dropping content.
+
+The version was bumped rather than the field added compatibly because a consumer that read a
+version 1 recording and assumed the field was merely missing would produce a document
+differing from the recorded one, with nothing to signal it.
+
+**The format is closed under inversion.** Every effect kind's inverse is expressible in it —
+`insert` inverts to `remove-range` (take `count` nodes back out at `index`), which inverts
+back to `insert`. That is what lets an undo be an ordinary transition, validated and applied
+by the ordinary path, rather than a second and less examined mechanism.
 
 ---
 

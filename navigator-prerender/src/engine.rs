@@ -121,8 +121,16 @@ pub trait ScriptEngine {
 pub enum Effect {
     /// An attribute written on a node that exists in tier 1.
     Attribute { target: String, name: String, from: Option<String>, to: Option<String> },
-    /// Nodes inserted under a node that exists in tier 1, as serialized HTML.
-    Insert { parent: String, html: String },
+    /// Nodes inserted under a node that exists in tier 1, as serialized HTML,
+    /// with the position they occupy among that parent's children.
+    ///
+    /// ★ The index is what makes replay FAITHFUL rather than merely
+    /// plausible. Without it a replay appends, so a page that inserted a row
+    /// into the middle of a list rendered it at the end — a difference no
+    /// error would ever report. It is measured against the AFTER tree, which
+    /// is why removals are applied before insertions: by then the indices
+    /// mean what they meant when they were recorded.
+    Insert { parent: String, index: usize, html: String },
     /// A node that exists in tier 1 was removed.
     Remove { target: String },
     /// The effect was too large to record; the count says how much was

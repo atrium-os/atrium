@@ -57,7 +57,7 @@ fn an_attribute_effect_with_no_new_value_removes_it() {
 fn an_insert_lands_under_its_parent() {
     let mut d = doc();
     d.apply(&transition(vec![Effect::Insert {
-        parent: "#m".into(), html: "<a href=\"/x\">New</a>".into(),
+        parent: "#m".into(), index: None, html: "<a href=\"/x\">New</a>".into(),
     }])).expect("must apply");
     let out = d.dom.serialize();
     assert!(out.contains("<a href=\"/x\">New</a>"), "{out}");
@@ -114,7 +114,7 @@ fn a_failed_precondition_also_leaves_the_document_untouched() {
     let mut d = doc();
     let before = d.dom.serialize();
     let _ = d.apply(&transition(vec![
-        Effect::Insert { parent: "#m".into(), html: "<b>first</b>".into() },
+        Effect::Insert { parent: "#m".into(), index: None, html: "<b>first</b>".into() },
         Effect::Attribute {
             target: "#m".into(), name: "aria-expanded".into(),
             from: Some("wrong".into()), to: Some("true".into()),
@@ -166,7 +166,7 @@ fn an_insert_that_pushes_the_document_out_of_the_profile_is_refused() {
     let before = d.dom.serialize();
     let depth = navigator_dom::profile::MAX_DEPTH + 10;
     let html = format!("{}{}", "<div>".repeat(depth), "</div>".repeat(depth));
-    let e = d.apply(&transition(vec![Effect::Insert { parent: "#m".into(), html }]))
+    let e = d.apply(&transition(vec![Effect::Insert { parent: "#m".into(), index: None, html }]))
         .expect_err("must be refused");
     assert!(matches!(e, ApplyError::OutsideProfile(_)), "{e}");
     assert_eq!(d.dom.serialize(), before);

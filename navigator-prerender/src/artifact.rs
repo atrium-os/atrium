@@ -10,7 +10,17 @@
 
 use crate::{Conversion, Effect, Tier, TierPolicy};
 
-pub const FORMAT: &str = "atrium-navigator-recording/1";
+/// ★ VERSION 2 adds `index` to an insert: the position the inserted markup
+/// occupies among its parent's children. Version 1 recorded only the parent,
+/// so a replay could do nothing but append — a row inserted into the middle
+/// of a list came back at the end, silently.
+///
+/// Bumped rather than added compatibly because this is a content-addressed
+/// store: a consumer that read a `/1` recording and assumed the field was
+/// merely absent would produce a document that differs from the recorded one
+/// with nothing to signal it. The version is how a consumer knows which
+/// guarantee it is getting.
+pub const FORMAT: &str = "atrium-navigator-recording/2";
 
 /// ★ WHICH TRANSITIONS SURVIVE DEPENDS ON WHICH DOCUMENT IS PUBLISHED.
 ///
@@ -87,9 +97,9 @@ fn effect_json(e: &Effect) -> String {
         Effect::Attribute { target, name, from, to } => format!(
             "{{ \"kind\": \"attribute\", \"target\": {}, \"name\": {}, \"from\": {}, \"to\": {} }}",
             json_str(target), json_str(name), json_opt(from.as_deref()), json_opt(to.as_deref())),
-        Effect::Insert { parent, html } => format!(
-            "{{ \"kind\": \"insert\", \"parent\": {}, \"html\": {} }}",
-            json_str(parent), json_str(html)),
+        Effect::Insert { parent, index, html } => format!(
+            "{{ \"kind\": \"insert\", \"parent\": {}, \"index\": {}, \"html\": {} }}",
+            json_str(parent), index, json_str(html)),
         Effect::Remove { target } =>
             format!("{{ \"kind\": \"remove\", \"target\": {} }}", json_str(target)),
         Effect::Truncated { dropped } =>

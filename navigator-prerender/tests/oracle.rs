@@ -222,7 +222,7 @@ fn inserted_content_is_captured_with_its_anchor() {
     let t = &c.transitions[0];
     assert!(!t.is_attribute_only());
     let ins: Vec<_> = t.effects.iter().filter_map(|e| match e {
-        Effect::Insert { parent, html } => Some((parent.as_str(), html.as_str())),
+        Effect::Insert { parent, html, .. } => Some((parent.as_str(), html.as_str())),
         _ => None,
     }).collect();
     assert_eq!(ins.len(), 1, "{:?}", t.effects);
@@ -268,4 +268,36 @@ fn oversized_effects_are_truncated_and_say_so() {
         "oversized insert must be reported as truncated: {:?}", t.effects);
     assert!(!t.effects.iter().any(|e| matches!(e, Effect::Insert { .. })),
         "and must not be carried");
+}
+
+/// ★ VERSION 2 OF THE RECORDING FORMAT: an insert records WHERE it went.
+///
+/// Version 1 recorded only the parent, so a replay could do nothing but
+/// append — a row inserted into the middle of a list came back at the end,
+/// with nothing to report the difference. The index is measured against the
+/// AFTER tree, which is why removals are applied before insertions on replay:
+/// by then the indices mean what they meant when they were recorded.
+#[test]
+fn an_insert_records_the_position_it_landed_at() {
+    let c = explore(r#"<html><body><ul id="l"><li>a</li><li>b</li><li>c</li></ul>
+      <button id="go">go</button><script>
+        document.getElementById('go').addEventListener('click', function () {
+          var ul = document.getElementById('l');
+          var li = document.createElement('li');
+          li.textContent = 'inserted';
+          ul.insertBefore(li, ul.children[1]);
+        });
+      </script></body></html>"#);
+
+    let inserts: Vec<(&usize, &str)> = c.transitions.iter()
+        .flat_map(|t| &t.effects)
+        .filter_map(|e| match e {
+            Effect::Insert { index, html, .. } => Some((index, html.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(inserts.len(), 1, "expected one insert, got {inserts:?}");
+    assert!(inserts[0].1.contains("inserted"), "{:?}", inserts[0]);
+    assert_eq!(*inserts[0].0, 1,
+        "the insert went between the first and second item, not at the end: {inserts:?}");
 }

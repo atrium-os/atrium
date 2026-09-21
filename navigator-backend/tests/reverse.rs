@@ -1,25 +1,26 @@
 //! ★ GOING BACK MUST REACH THE STATE THE READER WAS ACTUALLY IN.
 //!
-//! The strong form of that claim is byte equality: apply a transition, undo
-//! it, and the document must serialize to exactly what it did before. Weaker
-//! assertions — "the attribute is false again" — pass on a document that has
-//! also quietly gained or lost something else, which is the failure mode an
-//! undo path actually has.
+//! The strong form is byte equality: take a step, undo it, and the document
+//! must serialize to exactly what it did before. Weaker assertions — "the
+//! attribute is false again" — pass on a document that has also quietly
+//! gained or lost something else, which is the failure an undo path has.
 //!
-//! ★★ And reversibility is NOT uniform. Attribute effects record both sides
-//! and invert exactly; Remove and Insert do not carry what would be needed,
-//! and the tests below pin that they REFUSE rather than approximate. A
-//! plausible-looking inverse for a Remove would have to invent a subtree, and
-//! the reader would never know the difference.
+//! ★★ EVERY transition is reversible, including removals, because the undo is
+//! derived from the document while the effect is applied rather than read out
+//! of the recording. The subtree a removal destroys is in the document at the
+//! moment it is destroyed; that is where it comes from. Tests that once
+//! asserted a removal COULD NOT be inverted are gone, and the ones below take
+//! their place — the earlier design had `History` snapshotting a whole
+//! document for those steps.
 
 use navigator_backend::apply::ApplyError;
 use navigator_backend::document::Document;
-use navigator_backend::reverse::{History, NotInvertible};
+use navigator_backend::reverse::History;
 use navigator_backend::{Effect, Transition};
 
 fn doc() -> Document {
     Document::parse(
-        r#"<html><body><button id="t">Menu</button><nav id="m" aria-expanded="false" class="shut"><span id="old">x</span></nav></body></html>"#,
+        r#"<html><body><button id="t">Menu</button><nav id="m" aria-expanded="false" class="shut"><span id="a">A</span><span id="b">B</span><span id="c">C</span></nav></body></html>"#,
     )
 }
 
@@ -34,154 +35,199 @@ fn attr(name: &str, from: Option<&str>, to: Option<&str>) -> Effect {
     }
 }
 
-/// The round trip, asserted on bytes.
-#[test]
-fn applying_then_undoing_restores_the_document_exactly() {
-    let mut d = doc();
+/// Apply, undo, compare bytes. The shape of every test here.
+fn round_trip(effects: Vec<Effect>) {
+    let d = doc();
     let before = d.dom.serialize();
-    let step = t(vec![attr("aria-expanded", Some("false"), Some("true"))]);
-    d.apply(&step).expect("applies");
-    assert_ne!(d.dom.serialize(), before, "the step must actually change something");
-    d.apply(&step.inverse().expect("invertible")).expect("undoes");
-    assert_eq!(d.dom.serialize(), before, "undo did not restore the document");
+    let step = t(effects);
+    let (after, undo) = d.applied_with_undo(&step).expect("applies");
+    assert_ne!(after.dom.serialize(), before, "the step must actually change something");
+    let back = after.undone(&undo).expect("undoes");
+    assert_eq!(back.dom.serialize(), before, "undo did not restore the document");
 }
 
-/// Adding an attribute inverts to removing it, and the other way round — the
-/// `None` cases are where an inverse most easily becomes an empty string.
 #[test]
-fn adding_and_removing_an_attribute_invert_each_other() {
-    let mut d = doc();
+fn an_attribute_change_reverses() {
+    round_trip(vec![attr("aria-expanded", Some("false"), Some("true"))]);
+}
+
+#[test]
+fn adding_an_attribute_reverses_to_removing_it() {
+    round_trip(vec![attr("data-open", None, Some("1"))]);
+}
+
+#[test]
+fn removing_an_attribute_reverses_to_adding_it() {
+    round_trip(vec![attr("class", Some("shut"), None)]);
+}
+
+/// ★★ THE CASE THE OLD DESIGN COULD NOT DO. The removed subtree — its
+/// markup, its parent, its position among siblings — is read from the
+/// document as it is being removed.
+#[test]
+fn a_removal_reverses_exactly() {
+    round_trip(vec![Effect::Remove { target: "#b".into() }]);
+}
+
+/// And it goes back to the same POSITION, not just back into the parent.
+/// Restoring `B` after `C` would satisfy any test that only asked whether the
+/// node was present.
+#[test]
+fn a_removal_reverses_to_the_same_position() {
+    let d = doc();
     let before = d.dom.serialize();
-    let add = t(vec![attr("data-open", None, Some("1"))]);
-    d.apply(&add).expect("applies");
-    let m = d.dom.by_id("m").unwrap();
-    assert_eq!(d.dom.attr(m, "data-open"), Some("1"));
-    d.apply(&add.inverse().expect("invertible")).expect("undoes");
-    let m = d.dom.by_id("m").unwrap();
-    assert_eq!(d.dom.attr(m, "data-open"), None, "inverse left an empty attribute");
-    assert_eq!(d.dom.serialize(), before);
+    let (after, undo) = d.applied_with_undo(&t(vec![Effect::Remove { target: "#b".into() }]))
+        .expect("applies");
+    assert!(after.dom.by_id("b").is_none(), "the removal must have happened");
+    let back = after.undone(&undo).expect("undoes");
+    assert_eq!(back.dom.serialize(), before, "B came back in the wrong place");
 }
 
-/// ★ The inverse is checked by the same precondition machinery. Undoing a
-/// step that was never taken must be refused, not silently applied.
 #[test]
-fn an_inverse_applied_to_the_wrong_state_is_refused() {
-    let mut d = doc();
-    let step = t(vec![attr("aria-expanded", Some("false"), Some("true"))]);
-    let inv = step.inverse().expect("invertible");
-    // Never applied `step`, so the document is still "false" and the
-    // inverse's precondition ("true") cannot hold.
-    let e = d.apply(&inv).expect_err("must be refused");
-    assert!(matches!(e, ApplyError::PreconditionFailed { .. }), "{e}");
+fn an_insert_reverses() {
+    round_trip(vec![Effect::Insert {
+        parent: "#m".into(), index: Some(1), html: "<span id=\"n\">N</span>".into(),
+    }]);
 }
 
-/// Multi-effect transitions come back in reverse order.
+/// A fragment with several roots comes back out as a whole.
 #[test]
-fn a_multi_effect_transition_inverts_in_reverse_order() {
-    let step = t(vec![
+fn a_multi_root_insert_reverses() {
+    round_trip(vec![Effect::Insert {
+        parent: "#m".into(), index: Some(0),
+        html: "<span>1</span><span>2</span><span>3</span>".into(),
+    }]);
+}
+
+/// A transition mixing all three kinds reverses as one step.
+#[test]
+fn a_mixed_transition_reverses() {
+    round_trip(vec![
         attr("aria-expanded", Some("false"), Some("true")),
-        attr("class", Some("shut"), Some("open")),
+        Effect::Remove { target: "#a".into() },
+        Effect::Insert { parent: "#m".into(), index: Some(1), html: "<i>x</i>".into() },
     ]);
-    let inv = step.inverse().expect("invertible");
-    match (&inv.effects[0], &inv.effects[1]) {
-        (Effect::Attribute { name: a, .. }, Effect::Attribute { name: b, .. }) => {
-            assert_eq!(a, "class", "inverse must undo the last effect first");
-            assert_eq!(b, "aria-expanded");
-        }
-        other => panic!("wrong shape: {other:?}"),
-    }
+}
+
+// ---- position ---------------------------------------------------------
+
+/// ★ VERSION 2's REASON TO EXIST. An insert lands where the page put it, not
+/// at the end. Under version 1 this document came back with `N` after `C`,
+/// and nothing reported a difference.
+#[test]
+fn an_insert_lands_at_its_recorded_position() {
+    let mut d = doc();
+    d.apply(&t(vec![Effect::Insert {
+        parent: "#m".into(), index: Some(1), html: "<span id=\"n\">N</span>".into(),
+    }])).expect("applies");
+    let ids: Vec<String> = d.dom.children_of(d.dom.by_id("m").unwrap()).iter()
+        .filter_map(|&h| d.dom.attr(h, "id").map(str::to_string)).collect();
+    assert_eq!(ids, vec!["a", "n", "b", "c"], "inserted in the wrong place");
+}
+
+/// ★ A version 1 recording carries no position, and appends — the older
+/// behaviour, reached honestly because the field is absent rather than
+/// defaulted to a plausible zero.
+#[test]
+fn an_insert_without_a_position_appends() {
+    let mut d = doc();
+    d.apply(&t(vec![Effect::Insert {
+        parent: "#m".into(), index: None, html: "<span id=\"n\">N</span>".into(),
+    }])).expect("applies");
+    let ids: Vec<String> = d.dom.children_of(d.dom.by_id("m").unwrap()).iter()
+        .filter_map(|&h| d.dom.attr(h, "id").map(str::to_string)).collect();
+    assert_eq!(ids, vec!["a", "b", "c", "n"]);
+}
+
+/// An index past the end is clamped rather than refused: it degrades to the
+/// version 1 behaviour instead of losing the content entirely.
+#[test]
+fn an_out_of_range_position_clamps_instead_of_failing() {
+    let mut d = doc();
+    d.apply(&t(vec![Effect::Insert {
+        parent: "#m".into(), index: Some(999), html: "<span id=\"n\">N</span>".into(),
+    }])).expect("must not fail");
+    let ids: Vec<String> = d.dom.children_of(d.dom.by_id("m").unwrap()).iter()
+        .filter_map(|&h| d.dom.attr(h, "id").map(str::to_string)).collect();
+    assert_eq!(ids, vec!["a", "b", "c", "n"]);
+}
+
+/// `remove-range` is a first-class effect, so an undo is an ordinary
+/// transition that could be written down and read back.
+#[test]
+fn remove_range_takes_out_exactly_its_range() {
+    let mut d = doc();
+    d.apply(&t(vec![Effect::RemoveRange {
+        parent: "#m".into(), index: 1, count: 2,
+    }])).expect("applies");
+    let ids: Vec<String> = d.dom.children_of(d.dom.by_id("m").unwrap()).iter()
+        .filter_map(|&h| d.dom.attr(h, "id").map(str::to_string)).collect();
+    assert_eq!(ids, vec!["a"], "wrong range removed");
+}
+
+#[test]
+fn a_remove_range_past_the_end_is_refused() {
     let mut d = doc();
     let before = d.dom.serialize();
-    d.apply(&step).expect("applies");
-    d.apply(&inv).expect("undoes");
+    let e = d.apply(&t(vec![Effect::RemoveRange { parent: "#m".into(), index: 2, count: 5 }]))
+        .expect_err("must be refused");
+    assert!(matches!(e, ApplyError::TargetUnresolved { .. }), "{e}");
     assert_eq!(d.dom.serialize(), before);
-}
-
-/// ★★ WHAT CANNOT BE INVERTED SAYS SO. The recording carries a path for a
-/// Remove and nothing else, so restoring it would mean inventing a subtree.
-#[test]
-fn a_remove_has_no_inverse_and_does_not_pretend_to() {
-    let step = t(vec![Effect::Remove { target: "#old".into() }]);
-    let e = step.inverse().expect_err("must refuse");
-    assert!(matches!(e, NotInvertible::RemovedContentNotRecorded { .. }), "{e}");
-    assert!(!step.is_invertible());
-}
-
-/// And an Insert, because the recording does not say where under the parent
-/// the markup went — replay appends, so there is nothing to identify.
-#[test]
-fn an_insert_has_no_inverse_either() {
-    let step = t(vec![Effect::Insert { parent: "#m".into(), html: "<b>x</b>".into() }]);
-    let e = step.inverse().expect_err("must refuse");
-    assert!(matches!(e, NotInvertible::InsertExtentNotRecorded { .. }), "{e}");
-}
-
-/// A transition that mixes an invertible effect with one that is not has no
-/// inverse at all — a partial inverse would undo half a step.
-#[test]
-fn a_mixed_transition_has_no_partial_inverse() {
-    let step = t(vec![
-        attr("aria-expanded", Some("false"), Some("true")),
-        Effect::Remove { target: "#old".into() },
-    ]);
-    assert!(step.inverse().is_err(), "a partial inverse is worse than none");
 }
 
 // ---- History ----------------------------------------------------------
 
-/// History `back()` restores exactly, through an invertible step.
 #[test]
-fn history_goes_back_through_an_invertible_step() {
-    let mut h = History::new(doc());
-    let before = h.document().dom.serialize();
-    h.go(&t(vec![attr("aria-expanded", Some("false"), Some("true"))])).expect("goes");
-    assert_eq!(h.depth(), 1);
-    assert!(h.back().expect("comes back"));
-    assert_eq!(h.document().dom.serialize(), before);
-    assert_eq!(h.depth(), 0);
-    assert_eq!(h.cost().snapshots, 0, "an invertible step must not cost a snapshot");
-}
-
-/// ★ And through one that is NOT invertible, by snapshot — the reader gets
-/// the same guarantee, the session just pays for it.
-#[test]
-fn history_goes_back_through_a_removal_by_snapshot() {
-    let mut h = History::new(doc());
-    let before = h.document().dom.serialize();
-    h.go(&t(vec![Effect::Remove { target: "#old".into() }])).expect("goes");
-    assert!(h.document().dom.by_id("old").is_none(), "the step must have happened");
-    assert_eq!(h.cost().snapshots, 1, "a non-invertible step must cost one");
-    assert!(h.back().expect("comes back"));
-    assert_eq!(h.document().dom.serialize(), before, "snapshot did not restore exactly");
-}
-
-/// Several steps, forward and all the way back.
-#[test]
-fn history_unwinds_a_mixed_sequence_to_the_start() {
+fn history_goes_back_through_any_step() {
     let mut h = History::new(doc());
     let start = h.document().dom.serialize();
     h.go(&t(vec![attr("aria-expanded", Some("false"), Some("true"))])).expect("1");
-    h.go(&t(vec![Effect::Insert { parent: "#m".into(), html: "<b>new</b>".into() }])).expect("2");
-    h.go(&t(vec![attr("class", Some("shut"), Some("open"))])).expect("3");
-    let c = h.cost();
-    assert_eq!((c.steps, c.inverses, c.snapshots), (3, 2, 1),
-        "only the insert should have cost a snapshot");
+    h.go(&t(vec![Effect::Remove { target: "#b".into() }])).expect("2");
+    h.go(&t(vec![Effect::Insert { parent: "#m".into(), index: Some(0), html: "<i>x</i>".into() }])).expect("3");
+    assert_eq!(h.depth(), 3);
 
     while h.back().expect("unwinds") {}
-    assert_eq!(h.document().dom.serialize(), start);
+    assert_eq!(h.document().dom.serialize(), start, "the unwind did not reach the start");
     assert_eq!(h.depth(), 0);
 }
 
-/// Back at the start is not an error — it is the reader being at the start.
+/// ★ The undo carries only what it must: the markup a removal destroyed. It
+/// is not a snapshot of the document, which is what the earlier design paid
+/// for these steps.
+#[test]
+fn an_undo_costs_the_removed_markup_not_the_document() {
+    let mut h = History::new(doc());
+    let document_size = h.document().dom.serialize().len();
+    h.go(&t(vec![Effect::Remove { target: "#b".into() }])).expect("goes");
+    let cost = h.cost();
+    assert_eq!(cost.steps, 1);
+    assert!(cost.undo_bytes > 0, "the removed markup has to be kept somewhere");
+    assert!(cost.undo_bytes < document_size / 2,
+        "undo cost {} approaches a snapshot of {document_size}", cost.undo_bytes);
+}
+
+/// ★★ A step that removes its OWN trigger must still be undoable. The trigger
+/// check asks whether a transition was recorded against this document, which
+/// is already answered for an undo built from it — and a tab control replaced
+/// by the panel it opens is a real shape.
+#[test]
+fn a_step_that_removes_its_trigger_can_still_be_undone() {
+    let mut h = History::new(doc());
+    let start = h.document().dom.serialize();
+    h.go(&t(vec![Effect::Remove { target: "#t".into() }])).expect("goes");
+    assert!(h.document().dom.by_id("t").is_none(), "the trigger must be gone");
+    assert!(h.back().expect("must still be undoable"));
+    assert_eq!(h.document().dom.serialize(), start);
+}
+
 #[test]
 fn back_at_the_beginning_is_false_not_an_error() {
     let mut h = History::new(doc());
     assert!(!h.back().expect("must not be an error"));
 }
 
-/// ★ A REFUSED STEP MUST NOT GROW THE HISTORY. A history that recorded a step
-/// that did not happen would send the reader back to a state they were never
-/// in — the same all-or-nothing rule apply follows.
+/// A refused step must not grow the history, or "back" would reach a state
+/// the reader was never in.
 #[test]
 fn a_refused_step_leaves_the_history_untouched() {
     let mut h = History::new(doc());

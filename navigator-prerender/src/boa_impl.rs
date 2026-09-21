@@ -2263,7 +2263,8 @@ fn diff_effects(before: &Dom, after: &Dom) -> Vec<crate::engine::Effect> {
             dropped += 1;
             continue;
         }
-        out.push(Effect::Insert { parent: before.node_path(p), html });
+        let index = after.children_of(p).iter().position(|&c| c == h).unwrap_or(0);
+        out.push(Effect::Insert { parent: before.node_path(p), index, html });
     }
 
     if dropped > 0 { out.push(Effect::Truncated { dropped }) }

@@ -20,7 +20,7 @@ pub fn ingest(bytes: &[u8], limits: &Limits) -> Result<Recording, Reject> {
     let obj = v.as_object().ok_or(Reject::NotAnObject)?;
 
     match obj.get("format").and_then(Value::as_str) {
-        Some(FORMAT) => {}
+        Some(FORMAT) | Some(crate::FORMAT_V1) => {}
         Some(other) => return Err(Reject::WrongFormat { found: other.to_string() }),
         None => return Err(Reject::MissingField("format")),
     }
@@ -168,9 +168,20 @@ fn effect(v: &Value, limits: &Limits, notes: &mut Vec<Note>)
                     allowed: limits.max_insert_bytes,
                 });
             }
+            // ★ Absent is NOT zero. A version 1 recording has no position,
+            // and defaulting it to the front would place content somewhere
+            // the page never put it — the exact failure appending at least
+            // makes visible.
+            let index = match o.get("index") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(v.as_u64().ok_or(Reject::BadField {
+                    field: "index", why: "not a non-negative integer",
+                })? as usize),
+            };
             Some(Effect::Insert {
                 parent: bounded_str(o.get("parent"), "parent", limits)?
                     .ok_or(Reject::MissingField("parent"))?,
+                index,
                 html,
             })
         }
@@ -178,6 +189,32 @@ fn effect(v: &Value, limits: &Limits, notes: &mut Vec<Note>)
             target: bounded_str(o.get("target"), "target", limits)?
                 .ok_or(Reject::MissingField("target"))?,
         }),
+        // ★ Parsed, not merely skipped, so the format is genuinely closed
+        // under inversion: an undo is an ordinary transition that can be
+        // written down, sent, stored and read back like any other.
+        "remove-range" => {
+            let num = |k: &'static str| -> Result<usize, Reject> {
+                o.get(k).and_then(Value::as_u64)
+                    .ok_or(Reject::BadField { field: k, why: "not a non-negative integer" })
+                    .map(|v| v as usize)
+            };
+            let count = num("count")?;
+            // A range is bounded by the same number that bounds a
+            // transition's effects: an unbounded count is an unbounded
+            // deletion described in a few bytes.
+            if count > limits.max_effects_per_transition {
+                return Err(Reject::TooLarge {
+                    what: "remove-range count", measured: count,
+                    allowed: limits.max_effects_per_transition,
+                });
+            }
+            Some(Effect::RemoveRange {
+                parent: bounded_str(o.get("parent"), "parent", limits)?
+                    .ok_or(Reject::MissingField("parent"))?,
+                index: num("index")?,
+                count,
+            })
+        }
         "truncated" => Some(Effect::Truncated {
             dropped: o.get("dropped").and_then(Value::as_u64).unwrap_or(0),
         }),

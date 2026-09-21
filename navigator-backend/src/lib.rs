@@ -73,7 +73,18 @@ impl Transition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     Attribute { target: String, name: String, from: Option<String>, to: Option<String> },
-    Insert { parent: String, html: String },
+    /// ★ `index` is the position the markup occupies among the parent's
+    /// children. `None` means a version 1 recording, which did not carry it —
+    /// replay can only append, and says so rather than guessing a position.
+    Insert { parent: String, index: Option<usize>, html: String },
+    /// The inverse of an insert: take `count` nodes back out, starting at
+    /// `index` under `parent`.
+    ///
+    /// ★★ THIS EXISTS SO THE FORMAT IS CLOSED UNDER INVERSION. Every effect
+    /// kind's inverse is expressible in the same format, which is what lets an
+    /// undo travel through the ordinary apply path — preconditions, profile
+    /// check and all — instead of down a second, less examined one.
+    RemoveRange { parent: String, index: usize, count: usize },
     Remove { target: String },
     Truncated { dropped: u64 },
 }
@@ -114,4 +125,11 @@ impl std::fmt::Display for Reject {
     }
 }
 
-pub const FORMAT: &str = "atrium-navigator-recording/1";
+/// The version this backend writes and prefers.
+pub const FORMAT: &str = "atrium-navigator-recording/2";
+/// ★ Still accepted. Recordings live in a content-addressed store, so old
+/// ones do not disappear when the producer moves on. A `/1` recording is
+/// honoured exactly as far as it goes: its inserts carry no position, so they
+/// append, and the consumer can tell because the field is `None` rather than
+/// a plausible zero.
+pub const FORMAT_V1: &str = "atrium-navigator-recording/1";
