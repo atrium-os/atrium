@@ -19,6 +19,13 @@ use navigator_style::token::Pos;
 use navigator_style::values::{Calc, Color, Rgba, V};
 use std::collections::BTreeMap;
 
+/// Rows (profile §3.3–§3.9) the layout READS. A non-initial value in any
+/// other row is counted as unimplemented on every element that has one —
+/// so a property the layout ignores can never be dropped silently (§5.1).
+/// Value-level gaps inside a read row (flex as block, italic without an
+/// italic face, …) are counted where they occur.
+pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 32, 33, 34, 35, 36, 37, 39, 41, 42, 43, 44, 49, 50];
+
 pub struct HtmlOut {
     pub scene: Scene,
     pub report: Report,
@@ -99,6 +106,7 @@ pub fn render_html(html: &str, fonts: &FontSet, env: &Env) -> HtmlOut {
     diagnostics.extend(styled.diagnostics);
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new() };
+    cx.count_unread_rows();
     // The root element is the initial containing block's only child.
     let root = dom.element_children(dom.root()).into_iter().next();
     let h = match root { Some(r) => cx.block(r, 0, 0, u(env.width_px)), None => 0 };
@@ -116,6 +124,29 @@ struct Line { lh: U, underline: Option<u32>, strike: Option<u32> }
 impl<'a> Cx<'a> {
     fn st(&self, h: Handle) -> Option<&'a Style> { self.styles.get(h as usize).and_then(|s| s.as_ref()) }
     fn count(&mut self, what: &'static str) { *self.unimplemented.entry(what).or_default() += 1 }
+
+    /// Every element with a non-initial value in a row the layout does not
+    /// read — keyed by the row's first longhand.
+    fn count_unread_rows(&mut self) {
+        use navigator_style::values::{grammar, parse_value, Specified, ROWS};
+        let props = navigator_style::cascade::longhands();
+        let unread: Vec<(usize, &'static str, V)> = props.iter().enumerate().filter_map(|(i, p)| {
+            let row = ROWS.iter().find(|r| r.props.contains(p))?;
+            if READ_ROWS.contains(&row.id) { return None }
+            let (_, init, _) = grammar(p)?;
+            let Ok(Specified::Value(v)) = parse_value(p, &navigator_style::token::tokenize(init), &[]) else { return None };
+            Some((i, row.props[0], v))
+        }).collect();
+        for s in self.styles.iter().flatten() {
+            for (i, first, init) in &unread {
+                // Lengths are computed to px; the initial 0px compares equal.
+                if &s.values[*i] != init {
+                    let key: &'static str = Box::leak(format!("row {first}… (not implemented)").into_boxed_str());
+                    *self.unimplemented.entry(key).or_default() += 1;
+                }
+            }
+        }
+    }
 
     fn is_block_level(&self, h: Handle) -> bool {
         match self.st(h) { Some(s) => matches!(kw(s, "display"), "block" | "flex" | "grid" | "table" | "table-row" | "table-cell"), None => false }
@@ -163,6 +194,9 @@ impl<'a> Cx<'a> {
         }
         let _ = mr;
         let (bx, by) = (x + ml.unwrap_or(0), y + mt);
+        if kw(s, "position") == "relative" && (matches!(s.get("top"), V::Pct(_)) || matches!(s.get("bottom"), V::Pct(_))) {
+            self.count("top/bottom: % (no definite containing height; 0)")
+        }
         let (rel_dx, rel_dy) = if kw(s, "position") == "relative" {
             (len(s.get("left"), cb_w).or_else(|| len(s.get("right"), cb_w).map(|r| -r)).unwrap_or(0),
              len(s.get("top"), 0).or_else(|| len(s.get("bottom"), 0).map(|b| -b)).unwrap_or(0))
@@ -194,6 +228,9 @@ impl<'a> Cx<'a> {
             V::Pct(_) => { self.count("height: % (no definite containing height; auto)"); auto_h }
             v => len(v, 0).unwrap_or(auto_h),
         };
+        for p in ["max-height", "min-height"] {
+            if matches!(s.get(p), V::Pct(_)) { self.count("min/max-height: % (no definite containing height; ignored)") }
+        }
         if let Some(mx) = len(s.get("max-height"), 0).filter(|_| !matches!(s.get("max-height"), V::Pct(_))) { hgt = hgt.min(mx) }
         if let Some(mn) = len(s.get("min-height"), 0).filter(|_| !matches!(s.get("min-height"), V::Pct(_))) { hgt = hgt.max(mn) }
         // Paint: background over the border box, then borders.
@@ -229,6 +266,7 @@ impl<'a> Cx<'a> {
         let weight = match s.get("font-weight") { V::Int(w) => *w, _ => 400 };
         if weight != 400 && weight != 700 { self.count("font-weight not shipped (nearest used)") }
         let em = kw(s, "font-style") == "italic";
+        if em { self.count("font-style: italic (no italic face shipped; drawn upright)") }
         let size = u(s.font_size_px);
         let lh = match s.get("line-height") {
             V::Num(n) => u(s.font_size_px * n),
@@ -445,6 +483,14 @@ mod tests {
         let o = render(r#"<style>.f { display: flex } .p { position: absolute }</style><div class="f">a</div><div class="p">b</div>"#);
         assert!(o.unimplemented.contains_key("display: flex (laid out as block)"));
         assert!(o.unimplemented.contains_key("position: absolute/fixed (skipped)"));
+    }
+
+    /// The control for count_unread_rows: a property the layout never reads
+    /// must show up, and its initial value must not.
+    #[test]
+    fn an_unread_property_is_counted_and_its_initial_value_is_not() {
+        let o = render(r#"<style>.a { opacity: 0.5 } .b { opacity: 1 }</style><div class="a">x</div><div class="b">y</div>"#);
+        assert_eq!(o.unimplemented.get("row opacity… (not implemented)"), Some(&1), "{:?}", o.unimplemented);
     }
 
     #[test]

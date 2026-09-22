@@ -978,6 +978,52 @@ green tick.
 The M0 Markdown path stays; it becomes one more input grammar in front of the same
 layout.
 
+### 8.3 M2 progress — the number, first reading (2026-09-22)
+
+**CONFORMANCE: exercised 24/64, matched 13/64.** Printed by `nsg-conformance`; the
+matched set is pinned by a test so it cannot fall silently.
+
+- **Built:**
+  - `navigator-style`: tokenizer, the 64-row grammar, selectors, sheets, cascade; 34
+    tests.
+  - `navigator-render::html`: block and inline layout, box paint; 8 tests.
+  - The conformance harness.
+  - `nsg-raster` (review tooling, feature-gated).
+- **Matched (13):**
+  - box rows: margin, padding, border-width, border-color;
+  - type rows: color, font-family, font-size, font-weight, line-height,
+    text-decoration-line, text-decoration-color, text-transform;
+  - paint rows: background-color.
+
+  Every golden was **looked at** before it was trusted. One apparent miss (a red 1 px
+  underline that read as dark next to dark text) was settled by reading the pixels,
+  which were exactly `#cf222e`, not by eye.
+- **Exercised, not matched (11), and why:**
+  - display (flex/grid/table laid out as block, inline-block skipped);
+  - position (absolute/fixed skipped);
+  - insets (`%` top/bottom);
+  - width/height (`%` height, min/max-content);
+  - min-/max-size (`%` heights);
+  - border-style (dashed/dotted drawn solid);
+  - font-style (no italic face ships);
+  - text-align (justify);
+  - white-space (pre-wrap);
+  - background-image (not painted).
+- **Not yet exercised (40):** everything the layout does not read (flex, grid, tables,
+  radius, overflow, spacing, lists, shadow, transform, …).
+
+**Honesty machinery, each part tested:**
+1. A row counts as exercised only when its fixtures declare **every** admitted value,
+   checked against the grammar table. The control drops one keyword and the row falls
+   out.
+2. The layout lists the rows it reads (`READ_ROWS`). A non-initial value in any other
+   row is counted as unimplemented on every element that has it, so an ignored property
+   cannot be silently dropped. Control: `opacity: 0.5` is counted, and `opacity: 1` is
+   not.
+3. Value-level gaps inside a read row are counted where they occur, including three
+   found by re-reading the code after that rule existed: a `%` top/bottom resolved
+   against 0, and `%` min/max-height silently ignored.
+
 ## 9. What this reuses
 
 Almost none of this is new infrastructure; it is composition, which is the point of the

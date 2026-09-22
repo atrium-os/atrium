@@ -30,6 +30,10 @@ name = "nsg-render"
 path = "src/main.rs"
 
 [[bin]]
+name = "nsg-conformance"
+path = "src/bin/nsg-conformance.rs"
+
+[[bin]]
 name = "nsg-raster"
 path = "src/bin/nsg-raster.rs"
 required-features = ["raster"]

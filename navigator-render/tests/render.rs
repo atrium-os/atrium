@@ -59,3 +59,18 @@ fn a_narrower_viewport_wraps_into_more_lines() {
     let (narrow, wide) = (lines(400), lines(1600));
     assert!(narrow > wide && wide >= 1, "narrow {narrow} wide {wide}");
 }
+
+/// ★ The conformance number cannot fall silently. The rows matched today are
+/// listed here; a golden that stops matching, or a fixture that starts
+/// raising a diagnostic, fails this test instead of quietly lowering the
+/// number. Raise the list when a row is newly matched (after reviewing its
+/// golden with nsg-raster).
+#[test]
+fn matched_conformance_rows_stay_matched() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance");
+    let fonts = FontSet::load().expect("pinned font set");
+    let rows = navigator_render::conformance::run(&dir, &fonts, false);
+    let matched: Vec<u8> = rows.iter().filter(|r| r.matched).map(|r| r.id).collect();
+    assert_eq!(matched, vec![8, 9, 10, 12, 32, 33, 34, 35, 37, 41, 42, 43, 49]);
+    assert_eq!(rows.iter().filter(|r| r.exercised).count(), 24);
+}

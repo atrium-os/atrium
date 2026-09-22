@@ -11,6 +11,7 @@
 //! run, drawn upright); images render their alt text; raw HTML is skipped and
 //! counted; code blocks do not wrap (overflow is counted).
 
+pub mod conformance;
 pub mod fontset;
 pub mod html;
 pub mod nsg;
