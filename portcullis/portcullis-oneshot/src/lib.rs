@@ -147,6 +147,16 @@ pub fn run(spec: &Spec) -> OneShot { run_with_stdio(spec, None) }
 /// speak on. Handing jaild the daemon's own would send a worker's protocol frames to the system
 /// log and leave the broker waiting forever.
 pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> OneShot {
+    // ★ This lane builds the instance root and reads the machine's identity
+    // secret in THIS process, so it needs root — and says so first. Without
+    // it an unprivileged caller was told "host identity: Permission denied",
+    // which reads like a broken install rather than the wrong lane.
+    // SAFETY: geteuid cannot fail.
+    if unsafe { libc::geteuid() } != 0 {
+        return OneShot::Refused(
+            "a one-shot jail is created by root; an unprivileged caller asks \
+             portcullisd (`portcullis exec --daemon`, portcullis.md §6.5.2a)".into());
+    }
     let target = spec.target.as_str();
     let instance = spec.instance.clone();
     let tmpfs_mb = spec.tmpfs_mb;

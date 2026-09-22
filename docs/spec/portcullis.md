@@ -1307,7 +1307,10 @@ does not keep one record per worker.
   meant a uid-0 worker — what turned §9.1b's `/dev` exposure into a read of the host's disk.
   Refused in the lane with the reason (jaild's uid policy would refuse it too). The daemon
   path uses the peer's credentials; the direct CLI needs root and so requires an explicit
-  `--user <name>` — never `$USER`, which `su -m` leaves as root.
+  `--user <name>` — never `$USER`, which `su -m` leaves as root. A non-root caller of the
+  direct lane is refused **first**, naming `--daemon`; it used to fail later, with
+  `host identity: Permission denied` from reading the root-only secret, which read like a
+  broken install.
 
 **What the lane cannot express is refused, not dropped:** capability device grants and any
 network. A capability that silently did not apply would be a worker running without what its
