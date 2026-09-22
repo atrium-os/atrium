@@ -58,17 +58,38 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
     // here turned a gzip blob into a clean conversion of nothing.
     let src = fs::read(file).map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
+    // PRERENDER_FETCHD="<program> <args…>" routes EVERY fetch of this
+    // conversion — script loading and the page's own network — through one
+    // navigator-fetchd (backend §8.1), typically
+    //   "portcullis exec --daemon --instance conv-{instance} org.atrium.navigator.fetcher"
+    // so the network is held by a jailed, capability-mode process and never
+    // by the converter. `{instance}` becomes this process's pid, one fetcher
+    // jail per conversion. Unset: the measurement instrument's curl + cache.
+    let fetchd = if net { std::env::var("PRERENDER_FETCHD").ok() } else { None }.map(|cmd| {
+        let pid = std::process::id().to_string();
+        let words: Vec<String> = cmd.split_whitespace().map(|w| w.replace("{instance}", &pid)).collect();
+        let f = navigator_prerender::fetch::FetchdFetcher::spawn(&words[0], &words[1..])
+            .unwrap_or_else(|e| { eprintln!("PRERENDER_FETCHD {cmd:?}: {e}"); std::process::exit(1) });
+        navigator_prerender::fetch::SharedFetcher(std::rc::Rc::new(std::cell::RefCell::new(f)))
+    });
     let mut http = HttpFetcher::new(std::env::temp_dir().join("prerender-jscache"));
     let mut nonet = NoNetwork;
-    let fetcher: &mut dyn Fetcher = if net { &mut http } else { &mut nonet };
+    let mut shared = fetchd.clone();
+    let fetcher: &mut dyn Fetcher = match (&mut shared, net) {
+        (Some(f), _) => f,
+        (None, true) => &mut http,
+        (None, false) => &mut nonet,
+    };
     // The page's own network is separate from the one that loads its code,
     // and is only wired when the run is networked at all.
     let mut eng = BoaEngine {
         explore: std::env::var("PRERENDER_EXPLORE").ok().as_deref() == Some("1"),
         same_site_network: std::env::var("PRERENDER_SAME_SITE").ok().as_deref() == Some("1"),
-        page_fetcher: if net {
-            Some(Box::new(HttpFetcher::new(std::env::temp_dir().join("prerender-pagecache"))))
-        } else { None },
+        page_fetcher: match (&fetchd, net) {
+            (Some(f), _) => Some(Box::new(f.clone()) as Box<dyn Fetcher>),
+            (None, true) => Some(Box::new(HttpFetcher::new(std::env::temp_dir().join("prerender-pagecache")))),
+            (None, false) => None,
+        },
         ..Default::default()
     };
     let c = convert_with(&src, base, &mut eng, fetcher);
@@ -123,6 +144,10 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
         }
     }
     println!("T\t{}\t{}", c.timers_fired, c.timers_dropped);
+    if let Some(f) = &fetchd {
+        let f = f.0.borrow();
+        println!("G\t{}\t{}", f.requests, f.bytes_fetched());
+    }
     println!("P\t{}\t{}\t{}\t{}", c.page_fetches, c.page_fetch_failures,
         c.page_blocked, c.beacons_suppressed);
     for (k, n) in c.blocked_hosts.iter() { println!("B\t{n}\t{k}"); }
