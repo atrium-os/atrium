@@ -10,9 +10,10 @@
 //! font f<i> <address> "<name>" <weight>
 //! clip c<i> <x> <y> <w> <h>
 //! group g<i> <alpha> [p<parent>]
-//! rect <x> <y> <w> <h> <rrggbbaa> [r<tl>,<tr>,<br>,<bl>] [b<ring>] [c<i>] [g<i>]
-//! run f<i> <size> <rrggbbaa> <x> <y> <em 0|1> <gid>:<dx>,<dy> … "<text>" [c<i>] [g<i>]
-//! link <x> <y> <w> <h> "<href>" [c<i>]
+//! xform x<i> <a> <b> <c> <d> <e> <f>   (a-d in 1/65536, e f in 1/64 px)
+//! rect <x> <y> <w> <h> <rrggbbaa> [r<tl>,<tr>,<br>,<bl>] [b<ring>] [c<i>] [g<i>] [x<i>]
+//! run f<i> <size> <rrggbbaa> <x> <y> <em 0|1> <gid>:<dx>,<dy> … "<text>" [c<i>] [g<i>] [x<i>]
+//! link <x> <y> <w> <h> "<href>" [c<i>] [x<i>]
 //! ```
 
 use crate::fontset::FontSet;
@@ -47,6 +48,10 @@ pub fn write(scene: &Scene, fonts: &FontSet) -> String {
     for (i, c) in scene.clips.iter().enumerate() {
         let _ = writeln!(o, "clip c{i} {} {} {} {}", c.0, c.1, c.2, c.3);
     }
+    // Transforms are composed with their ancestors', like clips.
+    for (i, m) in scene.xforms.iter().enumerate() {
+        let _ = writeln!(o, "xform x{i} {} {} {} {} {} {}", m[0], m[1], m[2], m[3], m[4], m[5]);
+    }
     for (i, g) in scene.groups.iter().enumerate() {
         let _ = write!(o, "group g{i} {}", g.0);
         if let Some(p) = g.1 { let _ = write!(o, " p{p}"); }
@@ -57,10 +62,11 @@ pub fn write(scene: &Scene, fonts: &FontSet) -> String {
     debug_assert_eq!(scene.link_attrs.len(), scene.links.len());
     // A node's clip and group, written only when it has one, so a document
     // with neither is byte-identical to NSG without them.
-    let attrs = |o: &mut String, a: Option<&(Option<u32>, Option<u32>)>| {
-        if let Some((c, g)) = a {
+    let attrs = |o: &mut String, a: Option<&crate::Attrs>| {
+        if let Some((c, g, t)) = a {
             if let Some(c) = c { let _ = write!(o, " c{c}"); }
             if let Some(g) = g { let _ = write!(o, " g{g}"); }
+            if let Some(t) = t { let _ = write!(o, " x{t}"); }
         }
     };
     for &(kind, i) in &scene.order {
@@ -85,7 +91,7 @@ pub fn write(scene: &Scene, fonts: &FontSet) -> String {
                 let l = &scene.links[i];
                 let _ = write!(o, "link {} {} {} {} {}", l.x, l.y, l.w, l.h, quote(&l.href));
                 // A link's group would not change where it is: only its clip can.
-                let la = scene.link_attrs.get(i).map(|a| (a.0, None));
+                let la = scene.link_attrs.get(i).map(|a| (a.0, None, a.2));
                 attrs(&mut o, la.as_ref());
                 o.push('\n');
             }

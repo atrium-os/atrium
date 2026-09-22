@@ -76,7 +76,13 @@ pub struct Link { pub x: U, pub y: U, pub w: U, pub h: U, pub href: String }
 /// ★ These are FLAT attributes of a node, not begin/end markers, because
 /// `order` is re-sorted for painting (stacking contexts): a push/pop pair
 /// could not survive that, and an index on the node does.
-pub type Attrs = (Option<u32>, Option<u32>);
+pub type Attrs = (Option<u32>, Option<u32>, Option<u32>);
+
+/// A 2D affine transform, already composed with its ancestors'.
+/// `a b c d` are scalars in **1/65536**, `e f` are a translation in 1/64 px:
+/// `x' = a·x + c·y + e`, `y' = b·x + d·y + f`.
+pub const XF_ONE: i64 = 65536;
+pub type Xform = [i64; 6];
 
 #[derive(Debug, Default)]
 pub struct Scene {
@@ -90,6 +96,11 @@ pub struct Scene {
     /// Clip rectangles, each already intersected with its ancestors', so a
     /// node needs only one index and a reader needs no stack.
     pub clips: Vec<(U, U, U, U)>,
+    /// Paint-level transforms (profile §3.8: they never affect layout).
+    /// During layout these are LOCAL matrices; `resolve_xforms` composes each
+    /// with its ancestors' once every box's size is known.
+    pub xforms: Vec<Xform>,
+    pub xform_parents: Vec<Option<u32>>,
     /// Opacity groups: (alpha 0-255, the group this one composites into).
     /// Nested groups keep a parent, because compositing them is not the same
     /// as multiplying the alphas.
@@ -129,6 +140,62 @@ impl Scene {
     pub(crate) fn group(&mut self, alpha: u32) -> u32 {
         self.groups.push((alpha, self.cur.1));
         self.groups.len() as u32 - 1
+    }
+    /// A transform. ★ It cannot be composed with its ancestor's HERE: a
+    /// box's matrix needs its own height, which is known only after its
+    /// children have been laid out — so an ancestor's matrix is still a
+    /// placeholder while its descendants are declaring theirs. The local
+    /// matrix and the parent are recorded, and `resolve_xforms` composes
+    /// them at the end.
+    pub(crate) fn xform(&mut self, m: Xform) -> u32 {
+        self.xforms.push(m);
+        self.xform_parents.push(self.cur.2);
+        self.xforms.len() as u32 - 1
+    }
+    /// Compose every transform with its ancestors', outermost first, so each
+    /// one is absolute and a reader needs no stack (as with clips).
+    pub(crate) fn resolve_xforms(&mut self) {
+        for i in 0..self.xforms.len() {
+            let mut chain = vec![];
+            let mut p = self.xform_parents[i];
+            while let Some(j) = p { chain.push(j as usize); p = self.xform_parents[j as usize] }
+            for j in chain { self.xforms[i] = compose(self.xforms[j], self.xforms[i]) }
+        }
+    }
+}
+
+/// Sine and cosine of an angle in DEGREES, without libm.
+///
+/// ★ `f64::sin` is NOT specified to be correctly rounded, and two platforms'
+/// libm can differ in the last bits — which would make NSG machine-dependent,
+/// the one thing it must never be. IEEE-754 `+`, `*` and `/` ARE specified,
+/// so a fixed polynomial evaluated in f64 gives the same bits everywhere.
+///
+/// Exact quadrant reduction in degrees first (so 90, 180, 270 are exact),
+/// then a Taylor series to x^13 on |x| <= pi/4, where its error is ~3e-14 —
+/// far below
+/// the 1/65536 the matrix is rounded to.
+pub fn sin_cos_deg(deg: f64) -> (f64, f64) {
+    // Reduce to [0, 360) exactly, in degrees.
+    let d = deg - 360.0 * (deg / 360.0).floor();
+    let (q, r) = ((d / 90.0).floor() as i64 % 4, d - 90.0 * (d / 90.0).floor());
+    // r in [0, 90); fold to [0, 45] so the series is only ever used there.
+    let (s45, c45) = {
+        let x = (if r <= 45.0 { r } else { 90.0 - r }) * (std::f64::consts::PI / 180.0);
+        let x2 = x * x;
+        // sin x = x - x^3/3! + x^5/5! - ... + x^13/13!
+        let sin = x * (1.0 - x2 * (1.0 / 6.0 - x2 * (1.0 / 120.0 - x2 * (1.0 / 5040.0 - x2 * (1.0 / 362880.0
+                     - x2 * (1.0 / 39916800.0 - x2 * (1.0 / 6227020800.0)))))));
+        // cos x = 1 - x^2/2! + x^4/4! - ... + x^12/12!
+        let cos = 1.0 - x2 * (0.5 - x2 * (1.0 / 24.0 - x2 * (1.0 / 720.0 - x2 * (1.0 / 40320.0
+                     - x2 * (1.0 / 3628800.0 - x2 * (1.0 / 479001600.0))))));
+        if r <= 45.0 { (sin, cos) } else { (cos, sin) }
+    };
+    match q {
+        0 => (s45, c45),
+        1 => (c45, -s45),
+        2 => (-s45, -c45),
+        _ => (-c45, s45),
     }
 }
 
@@ -532,3 +599,37 @@ fn flow(sh: &Shaper, atoms: &[Atom], left: U, avail: U, mut y: U, marker: Option
 }
 
 fn run_end(r: &Run) -> U { r.x + r.glyphs.last().map(|g| g.1).unwrap_or(0) }
+
+#[cfg(test)]
+mod trig_tests {
+    use super::sin_cos_deg;
+
+    /// The values a rotation must get exactly right, and the quadrants.
+    #[test]
+    fn sin_cos_matches_the_known_angles() {
+        let near = |a: f64, b: f64, what: &str| assert!((a - b).abs() < 1e-12, "{what}: {a} vs {b}");
+        for (deg, s, c) in [(0.0, 0.0, 1.0), (30.0, 0.5, 0.75f64.sqrt()), (45.0, 0.5f64.sqrt(), 0.5f64.sqrt()),
+                            (60.0, 0.75f64.sqrt(), 0.5), (90.0, 1.0, 0.0), (120.0, 0.75f64.sqrt(), -0.5),
+                            (180.0, 0.0, -1.0), (270.0, -1.0, 0.0), (360.0, 0.0, 1.0), (-90.0, -1.0, 0.0)] {
+            let (gs, gc) = sin_cos_deg(deg);
+            near(gs, s, &format!("sin {deg}"));
+            near(gc, c, &format!("cos {deg}"));
+        }
+        // The identity every angle must satisfy, across the whole circle.
+        for i in -720..720 {
+            let (s, c) = sin_cos_deg(i as f64 / 2.0);
+            near(s * s + c * c, 1.0, "s^2 + c^2");
+        }
+    }
+}
+
+/// `outer` applied AFTER `inner`, in the same fixed point.
+pub fn compose(outer: Xform, inner: Xform) -> Xform {
+    let m = |a: i64, b: i64| scale(a, b, XF_ONE);
+    [m(outer[0], inner[0]) + m(outer[2], inner[1]),
+     m(outer[1], inner[0]) + m(outer[3], inner[1]),
+     m(outer[0], inner[2]) + m(outer[2], inner[3]),
+     m(outer[1], inner[2]) + m(outer[3], inner[3]),
+     m(outer[0], inner[4]) + m(outer[2], inner[5]) + outer[4],
+     m(outer[1], inner[4]) + m(outer[3], inner[5]) + outer[5]]
+}

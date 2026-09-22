@@ -980,7 +980,7 @@ layout.
 
 ### 8.3 M2 progress — the number, first reading (2026-09-22)
 
-**CONFORMANCE: exercised 56/64, matched 54/64** (13 on first reading; see the updates
+**CONFORMANCE: exercised 58/64, matched 56/64** (13 on first reading; see the updates
 below). Printed by `nsg-conformance`; the
 matched set is pinned by a test so it cannot fall silently.
 
@@ -1254,6 +1254,31 @@ Every `display` value the profile admits is now laid out; nothing in §3.3 is co
   different `TZ` and `LANG`. The corpus has also grown since the M0 gate (111 → 118), so
   this is not a like-for-like comparison with `4a99561…e121c`, and the VM leg has NOT
   been re-run for 0.2.
+
+**Update — transforms, matched 54 → 56 (rows 61, 62).**
+- **NSG gains `xform x<i> <a> <b> <c> <d> <e> <f>`** and a trailing `x<i>` on the nodes
+  it applies to. `a`–`d` are scalars in **1/65536**, `e`/`f` a translation in 1/64 px.
+  Like a clip, each is written already composed with its ancestors'.
+- ★ **`f64::sin` is not usable here.** IEEE-754 specifies `+`, `*` and `/`, but NOT the
+  libm transcendentals, so two platforms' `sin` can differ in the last bits — and NSG
+  would stop being machine-independent, which is the one thing it must never be. The
+  renderer reduces the angle to a quadrant in DEGREES (so 90/180/270 are exact) and
+  evaluates a Taylor series to x¹³ in plain f64: error ~3e-14, far below the 1/65536 the
+  matrix is rounded to. Pinned against the known angles and `s² + c² = 1` over the
+  circle.
+- **A transform cannot be composed when it is declared.** Its matrix needs the box's own
+  height for a percentage origin, which is not known until the children are laid out —
+  so while a box's descendants declare their transforms, the ancestor's is still a
+  placeholder. The local matrices and their parents are recorded, and one pass at the end
+  composes them. (The first attempt composed at declaration time and silently produced a
+  child matrix equal to the child's own, which the nested test caught.)
+- **Layout is untouched** (profile §3.8): the test asserts the box's rect keeps its
+  original coordinates and only the node's attribute changes. A transformed box does open
+  a stacking context.
+- The review rasterizer paints a transformed node into a layer of its own and
+  **inverse-maps** it into place — exact for rotation, and it reuses every painter
+  unchanged.
+- M0 corpus digest, unchanged by this (no transform in the Markdown lane): `457a130a…`.
 
 ## 9. What this reuses
 

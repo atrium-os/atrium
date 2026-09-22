@@ -15,6 +15,21 @@ struct Canvas {
     clip: Option<(i64, i64, i64, i64)>,
 }
 
+/// Where a device pixel came from before the transform: the inverse map, in
+/// 1/64 px. Painting is done by walking the DESTINATION pixels of the
+/// transformed bounding box and asking what was there, which needs no
+/// polygon rasterizer and gets rotation right.
+fn invert(m: &navigator_render::Xform) -> Option<[f64; 6]> {
+    let k = navigator_render::XF_ONE as f64;
+    let (a, b, c, d) = (m[0] as f64 / k, m[1] as f64 / k, m[2] as f64 / k, m[3] as f64 / k);
+    let (e, f) = (m[4] as f64, m[5] as f64);
+    let det = a * d - b * c;
+    if det.abs() < 1e-9 { return None }
+    // Inverse of [a c e; b d f].
+    let (ia, ib, ic, id) = (d / det, -b / det, -c / det, a / det);
+    Some([ia, ib, ic, id, -(ia * e + ic * f), -(ib * e + id * f)])
+}
+
 impl Canvas {
     fn new(w: usize, h: usize) -> Self { Canvas { w, h, px: vec![[1.0, 1.0, 1.0, 1.0]; w * h], clip: None } }
     /// A transparent canvas the same size: an opacity group is painted here
@@ -37,6 +52,78 @@ impl Canvas {
         let p = &mut self.px[y as usize * self.w + x as usize];
         for i in 0..3 { p[i] = c[i] * a + p[i] * (1.0 - a) }
         p[3] = a + p[3] * (1.0 - a);
+    }
+}
+
+
+/// Paint ONE node with no transform of its own. Factored out so the
+/// transform path can render a node into a layer and map it into place.
+fn paint_one(cv: &mut Canvas, scene: &Scene, fonts: &FontSet, ctx: &mut swash::scale::ScaleContext, kind: u8, i: usize) {
+    match kind {
+        0 => {
+            let r = &scene.rects[i];
+            if r.radii != [0; 4] || r.ring != 0 {
+                // Rounded and/or ringed: 4×4 supersampling of the test.
+                let inside_at = |sx: f32, sy: f32, inset: f32, radii: [f32; 4]| {
+                    let (x0, y0) = (r.x as f32 + inset, r.y as f32 + inset);
+                    let (x1, y1) = ((r.x + r.w) as f32 - inset, (r.y + r.h) as f32 - inset);
+                    if sx < x0 || sx >= x1 || sy < y0 || sy >= y1 { return false }
+                    // Corner: top-left, top-right, bottom-right, bottom-left.
+                    let (i, cx, cy) = if sx < x0 + radii[0] && sy < y0 + radii[0] { (0, x0 + radii[0], y0 + radii[0]) }
+                        else if sx > x1 - radii[1] && sy < y0 + radii[1] { (1, x1 - radii[1], y0 + radii[1]) }
+                        else if sx > x1 - radii[2] && sy > y1 - radii[2] { (2, x1 - radii[2], y1 - radii[2]) }
+                        else if sx < x0 + radii[3] && sy > y1 - radii[3] { (3, x0 + radii[3], y1 - radii[3]) }
+                        else { return true };
+                    let rad = radii[i];
+                    rad <= 0.0 || (sx - cx).powi(2) + (sy - cy).powi(2) <= rad * rad
+                };
+                let outer = r.radii.map(|v| v.min(r.w / 2).min(r.h / 2) as f32);
+                let ring = r.ring as f32;
+                let inner = r.radii.map(|v| (v - r.ring).max(0).min((r.w - 2 * r.ring).max(0) / 2).min((r.h - 2 * r.ring).max(0) / 2) as f32);
+                let inside = |sx: f32, sy: f32| inside_at(sx, sy, 0.0, outer)
+                    && !(ring > 0.0 && inside_at(sx, sy, ring, inner));
+                for py in (r.y / PX)..=((r.y + r.h) / PX) {
+                    for px in (r.x / PX)..=((r.x + r.w) / PX) {
+                        let mut n = 0;
+                        for j in 0..4 { for k in 0..4 {
+                            if inside((px * PX) as f32 + (k as f32 + 0.5) * 16.0, (py * PX) as f32 + (j as f32 + 0.5) * 16.0) { n += 1 }
+                        } }
+                        if n > 0 { cv.blend(px, py, r.rgba, n as f32 / 16.0) }
+                    }
+                }
+                return;
+            }
+            // Coverage-exact on 1/64 px edges.
+            let (x0, y0, x1, y1) = (r.x, r.y, r.x + r.w, r.y + r.h);
+            for py in (y0 / PX)..=((y1 - 1).max(y0) / PX) {
+                let cy = ((y1.min((py + 1) * PX) - y0.max(py * PX)).max(0)) as f32 / PX as f32;
+                for px in (x0 / PX)..=((x1 - 1).max(x0) / PX) {
+                    let cx = ((x1.min((px + 1) * PX) - x0.max(px * PX)).max(0)) as f32 / PX as f32;
+                    cv.blend(px, py, r.rgba, cx * cy);
+                }
+            }
+        }
+        1 => {
+            let r = &scene.runs[i];
+            let face = &fonts.faces[r.face];
+            let Some(font) = swash::FontRef::from_index(&face.bytes, 0) else { return };
+            let mut scaler = ctx.builder(font).size(r.size as f32 / PX as f32).hint(false).build();
+            for &(gid, dx, dy) in &r.glyphs {
+                let (gx, gy) = (r.x + dx, r.y + dy);
+                let off = swash::zeno::Vector::new((gx % PX) as f32 / PX as f32, 0.0);
+                let Some(img) = swash::scale::Render::new(&[swash::scale::Source::Outline])
+                    .format(swash::zeno::Format::Alpha).offset(off)
+                    .render(&mut scaler, swash::GlyphId::from(gid)) else { return };
+                let (ox, oy) = (gx / PX + img.placement.left as i64, gy / PX - img.placement.top as i64);
+                for yy in 0..img.placement.height as i64 {
+                    for xx in 0..img.placement.width as i64 {
+                        let a = img.data[(yy * img.placement.width as i64 + xx) as usize];
+                        if a > 0 { cv.blend(ox + xx, oy + yy, r.rgba, a as f32 / 255.0) }
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -72,75 +159,39 @@ fn paint(scene: &Scene, fonts: &FontSet) -> Canvas {
             let l = stack.last().map(|(_, c)| c.layer()).unwrap_or_else(|| cv.layer());
             stack.push((id, l));
         }
+        // A transform is painted by rendering the node into a layer of its
+        // own and inverse-mapping it into place: exact for rotation, and it
+        // reuses every painter below unchanged.
+        let xf = match kind { 0 => scene.rect_attrs.get(i), 1 => scene.run_attrs.get(i), _ => None }
+            .and_then(|a| a.2).and_then(|x| scene.xforms.get(x as usize));
+        if let Some(m) = xf {
+            if let Some(inv) = invert(m) {
+                let mut layer = match stack.last() { Some((_, c)) => c.layer(), None => cv.layer() };
+                layer.clip = None;
+                paint_one(&mut layer, scene, fonts, &mut ctx, kind, i);
+                let dst: &mut Canvas = match stack.last_mut() { Some((_, c)) => c, None => &mut cv };
+                let clip = clip_of(kind, i).and_then(|c| scene.clips.get(c as usize))
+                    .map(|&(x, y, w, h)| (x / PX, y / PX, (x + w) / PX, (y + h) / PX));
+                for py in 0..dst.h as i64 {
+                    for px in 0..dst.w as i64 {
+                        if let Some((x0, y0, x1, y1)) = clip { if px < x0 || py < y0 || px >= x1 || py >= y1 { continue } }
+                        let (dx, dy) = ((px * PX) as f64 + 32.0, (py * PX) as f64 + 32.0);
+                        let (sx, sy) = (inv[0] * dx + inv[2] * dy + inv[4], inv[1] * dx + inv[3] * dy + inv[5]);
+                        let (ix, iy) = ((sx / PX as f64).floor() as i64, (sy / PX as f64).floor() as i64);
+                        if ix < 0 || iy < 0 || ix >= layer.w as i64 || iy >= layer.h as i64 { continue }
+                        let src = layer.px[iy as usize * layer.w + ix as usize];
+                        if src[3] <= 0.0 { continue }
+                        let p = &mut dst.px[py as usize * dst.w + px as usize];
+                        for k in 0..3 { p[k] = src[k] / src[3].max(1e-6) * src[3] + p[k] * (1.0 - src[3]) }
+                        p[3] = src[3] + p[3] * (1.0 - src[3]);
+                    }
+                }
+                continue;
+            }
+        }
         let cvr: &mut Canvas = match stack.last_mut() { Some((_, c)) => c, None => &mut cv };
         cvr.clip = clip_of(kind, i).and_then(|c| scene.clips.get(c as usize)).map(|&(x, y, w, h)| (x / PX, y / PX, (x + w) / PX, (y + h) / PX));
-        let cv = cvr;
-        match kind {
-            0 => {
-                let r = &scene.rects[i];
-                if r.radii != [0; 4] || r.ring != 0 {
-                    // Rounded and/or ringed: 4×4 supersampling of the test.
-                    let inside_at = |sx: f32, sy: f32, inset: f32, radii: [f32; 4]| {
-                        let (x0, y0) = (r.x as f32 + inset, r.y as f32 + inset);
-                        let (x1, y1) = ((r.x + r.w) as f32 - inset, (r.y + r.h) as f32 - inset);
-                        if sx < x0 || sx >= x1 || sy < y0 || sy >= y1 { return false }
-                        // Corner: top-left, top-right, bottom-right, bottom-left.
-                        let (i, cx, cy) = if sx < x0 + radii[0] && sy < y0 + radii[0] { (0, x0 + radii[0], y0 + radii[0]) }
-                            else if sx > x1 - radii[1] && sy < y0 + radii[1] { (1, x1 - radii[1], y0 + radii[1]) }
-                            else if sx > x1 - radii[2] && sy > y1 - radii[2] { (2, x1 - radii[2], y1 - radii[2]) }
-                            else if sx < x0 + radii[3] && sy > y1 - radii[3] { (3, x0 + radii[3], y1 - radii[3]) }
-                            else { return true };
-                        let rad = radii[i];
-                        rad <= 0.0 || (sx - cx).powi(2) + (sy - cy).powi(2) <= rad * rad
-                    };
-                    let outer = r.radii.map(|v| v.min(r.w / 2).min(r.h / 2) as f32);
-                    let ring = r.ring as f32;
-                    let inner = r.radii.map(|v| (v - r.ring).max(0).min((r.w - 2 * r.ring).max(0) / 2).min((r.h - 2 * r.ring).max(0) / 2) as f32);
-                    let inside = |sx: f32, sy: f32| inside_at(sx, sy, 0.0, outer)
-                        && !(ring > 0.0 && inside_at(sx, sy, ring, inner));
-                    for py in (r.y / PX)..=((r.y + r.h) / PX) {
-                        for px in (r.x / PX)..=((r.x + r.w) / PX) {
-                            let mut n = 0;
-                            for j in 0..4 { for k in 0..4 {
-                                if inside((px * PX) as f32 + (k as f32 + 0.5) * 16.0, (py * PX) as f32 + (j as f32 + 0.5) * 16.0) { n += 1 }
-                            } }
-                            if n > 0 { cv.blend(px, py, r.rgba, n as f32 / 16.0) }
-                        }
-                    }
-                    continue;
-                }
-                // Coverage-exact on 1/64 px edges.
-                let (x0, y0, x1, y1) = (r.x, r.y, r.x + r.w, r.y + r.h);
-                for py in (y0 / PX)..=((y1 - 1).max(y0) / PX) {
-                    let cy = ((y1.min((py + 1) * PX) - y0.max(py * PX)).max(0)) as f32 / PX as f32;
-                    for px in (x0 / PX)..=((x1 - 1).max(x0) / PX) {
-                        let cx = ((x1.min((px + 1) * PX) - x0.max(px * PX)).max(0)) as f32 / PX as f32;
-                        cv.blend(px, py, r.rgba, cx * cy);
-                    }
-                }
-            }
-            1 => {
-                let r = &scene.runs[i];
-                let face = &fonts.faces[r.face];
-                let Some(font) = swash::FontRef::from_index(&face.bytes, 0) else { continue };
-                let mut scaler = ctx.builder(font).size(r.size as f32 / PX as f32).hint(false).build();
-                for &(gid, dx, dy) in &r.glyphs {
-                    let (gx, gy) = (r.x + dx, r.y + dy);
-                    let off = swash::zeno::Vector::new((gx % PX) as f32 / PX as f32, 0.0);
-                    let Some(img) = swash::scale::Render::new(&[swash::scale::Source::Outline])
-                        .format(swash::zeno::Format::Alpha).offset(off)
-                        .render(&mut scaler, swash::GlyphId::from(gid)) else { continue };
-                    let (ox, oy) = (gx / PX + img.placement.left as i64, gy / PX - img.placement.top as i64);
-                    for yy in 0..img.placement.height as i64 {
-                        for xx in 0..img.placement.width as i64 {
-                            let a = img.data[(yy * img.placement.width as i64 + xx) as usize];
-                            if a > 0 { cv.blend(ox + xx, oy + yy, r.rgba, a as f32 / 255.0) }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
+        paint_one(cvr, scene, fonts, &mut ctx, kind, i);
     }
     // Any group still open at the end composites now.
     while let Some((id, layer)) = stack.pop() {

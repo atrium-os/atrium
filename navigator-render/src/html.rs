@@ -11,12 +11,12 @@
 //! where they occur. Every `display` value in the profile is laid out.
 
 use crate::fontset::{Family, FontSet};
-use crate::{scale, Link, Rect, Report, Run, Scene, Shaper, Style as FontStyle, PX, U};
+use crate::{scale, Link, Rect, Report, Run, Scene, Shaper, Style as FontStyle, Xform, PX, U, XF_ONE};
 use navigator_dom::{Dom, Handle, Kind};
 use navigator_style::cascade::{cascade, Env, Style};
 use navigator_style::sheet::{parse_sheet, Diagnostic, Stylesheet};
 use navigator_style::token::Pos;
-use navigator_style::values::{Calc, Color, Rgba, V};
+use navigator_style::values::{Calc, Color, Rgba, Tf, V};
 use std::collections::BTreeMap;
 
 /// Rows (profile §3.3–§3.9) the layout READS. A non-initial value in any
@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 /// so a property the layout ignores can never be dropped silently (§5.1).
 /// Value-level gaps inside a read row (flex as block, italic without an
 /// italic face, …) are counted where they occur.
-pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 54, 55, 57, 59, 60, 63, 64];
+pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 54, 55, 57, 59, 60, 61, 62, 63, 64];
 
 pub struct HtmlOut {
     pub scene: Scene,
@@ -158,6 +158,7 @@ pub fn render_html(html: &str, fonts: &FontSet, env: &Env) -> HtmlOut {
     let h = match root { Some(r) => cx.block(r, 0, 0, u(env.width_px), Some(u(env.height_px)), (None, None)), None => 0 };
     cx.scene.height = h.max(u(env.height_px));
     cx.scene.order = restack(&cx.scene.order, &cx.contexts, &cx.hoists);
+    cx.scene.resolve_xforms();
     diagnostics.extend(cx.diagnostics);
     HtmlOut { scene: cx.scene, report: cx.report, diagnostics, unimplemented: cx.unimplemented }
 }
@@ -262,7 +263,9 @@ impl<'a> Cx<'a> {
             .is_some_and(|ps| matches!(kw(ps, "display"), "flex" | "grid"));
         let z = match s.get("z-index") { V::Int(i) if z_applies => Some(*i), _ => None };
         let isolated = kw(s, "isolation") == "isolate";
-        let opens_context = z.is_some() || isolated;
+        // A transformed box is a stacking context (CSS Transforms 1 §3).
+        let transformed = !matches!(s.get("transform"), V::Kw(_));
+        let opens_context = z.is_some() || isolated || transformed;
         let ctx_start = self.scene.order.len();
         let side = |p: &str| len(s.get(p), cb_w);
         let vpct = |p: &str| -> Option<U> { match s.get(p) { V::Pct(_) => cb_h.and_then(|b| len(s.get(p), b)), v => len(v, cb_h.unwrap_or(0)) } };
@@ -363,6 +366,23 @@ impl<'a> Cx<'a> {
             let id = self.scene.group(alpha);
             self.scene.cur.1 = Some(id);
         }
+        // ★ transform is PAINT-LEVEL ONLY (profile §3.8), so it is an
+        // attribute of the painted nodes and changes no geometry — and a
+        // transformed ancestor does NOT become the containing block of a
+        // `fixed` descendant (the profile removes that rule deliberately).
+        //
+        // The matrix needs the box's HEIGHT for a percentage origin, which is
+        // not known until the children have been laid out. The declaration is
+        // by index, so it is pushed now, referenced by the subtree, and
+        // filled in at the end.
+        let xf_id = match s.get("transform") {
+            V::Transform(list) if !list.is_empty() => {
+                let id = self.scene.xform([XF_ONE, 0, 0, XF_ONE, 0, 0]);
+                self.scene.cur.2 = Some(id);
+                Some((id, list.clone()))
+            }
+            _ => None,
+        };
         let saved_cb = self.pos_cb;
         if positioned {
             // ★ The containing block of an absolutely positioned descendant
@@ -463,6 +483,13 @@ impl<'a> Cx<'a> {
             for c in self.contexts.iter_mut().filter(|c| c.1 >= bg_slot) { c.1 += painted; c.2 += painted }
             for h in self.hoists.iter_mut().filter(|h| h.0 >= bg_slot) { h.0 += painted; h.1 += painted }
         }
+        if let Some((id, list)) = xf_id {
+            let origin = match s.get("transform-origin") {
+                V::Pair(a, b) => (len(a, w).unwrap_or(w / 2), len(b, hgt).unwrap_or(hgt / 2)),
+                _ => (w / 2, hgt / 2),
+            };
+            self.scene.xforms[id as usize] = transform_matrix(&list, w, hgt, (bx + origin.0, by + origin.1));
+        }
         self.scene.cur = saved_attrs;
         if positioned { self.pos_cb = saved_cb }
         if opens_context { self.contexts.push((z.unwrap_or(0), ctx_start, self.scene.order.len(), painted)) }
@@ -562,13 +589,14 @@ impl<'a> Cx<'a> {
 
     fn measure(&mut self, h: Handle, cb_w: U, cb_h: Option<U>, force: (Option<U>, Option<U>)) -> U {
         let (o, r, n, l) = (self.scene.order.len(), self.scene.rects.len(), self.scene.runs.len(), self.scene.links.len());
-        let (cl, gr, cur) = (self.scene.clips.len(), self.scene.groups.len(), self.scene.cur);
+        let (cl, gr, cur, xf) = (self.scene.clips.len(), self.scene.groups.len(), self.scene.cur, self.scene.xforms.len());
         let (links, counts, marker, report) = (self.links.len(), self.unimplemented.clone(), self.marker.clone(), self.report.clone());
         let (ctx, hoi) = (self.contexts.len(), self.hoists.len());
         let hgt = self.block(h, 0, 0, cb_w, cb_h, force);
         self.scene.order.truncate(o); self.scene.rects.truncate(r); self.scene.runs.truncate(n); self.scene.links.truncate(l);
         self.scene.rect_attrs.truncate(r); self.scene.run_attrs.truncate(n); self.scene.link_attrs.truncate(l);
         self.scene.clips.truncate(cl); self.scene.groups.truncate(gr); self.scene.cur = cur;
+        self.scene.xforms.truncate(xf); self.scene.xform_parents.truncate(xf);
         self.links.truncate(links); self.unimplemented = counts; self.marker = marker; self.report = report;
         self.contexts.truncate(ctx); self.hoists.truncate(hoi);
         hgt
@@ -1694,9 +1722,9 @@ mod tests {
         // The child is clipped and grouped; the box's own border is grouped
         // but NOT clipped by its own clip.
         let red = o.scene.rects.iter().position(|r| r.rgba == 0xff0000ff).expect("child");
-        assert_eq!(o.scene.rect_attrs[red], (Some(0), Some(0)));
+        assert_eq!(o.scene.rect_attrs[red], (Some(0), Some(0), None));
         let border = o.scene.rects.iter().position(|r| r.rgba == 0x000000ff).expect("border");
-        assert_eq!(o.scene.rect_attrs[border], (None, Some(0)));
+        assert_eq!(o.scene.rect_attrs[border], (None, Some(0), None));
         // The geometry is untouched: clipping is the consumer's job, so the
         // child keeps its full size and the reader can see what was cut.
         assert_eq!(boxes(&o, 0xff0000ff), vec![(15, 0, 300, 90)]);
@@ -1711,6 +1739,47 @@ mod tests {
         // The inner clip is already intersected with the outer one, so a
         // reader needs no stack: 50..200, not 50..250.
         assert_eq!(o.scene.clips, vec![(0, 0, 200 * 64, 100 * 64), (50 * 64, 0, 150 * 64, 30 * 64)]);
+    }
+
+    /// transform is paint-level: the geometry does not move, the node gets a
+    /// matrix. Checked against values that must be exact.
+    #[test]
+    fn transform_is_a_matrix_on_the_node_not_a_move() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .t { width: 100px; height: 40px; background-color: #ff0000;
+                 transform-origin: 0px 0px; transform: translate(10px, 5px) }</style>
+            <div class="t"></div>"#);
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 100, 40)], "the box itself does not move");
+        assert_eq!(o.scene.xforms, vec![[XF_ONE, 0, 0, XF_ONE, 10 * 64, 5 * 64]]);
+        let red = o.scene.rects.iter().position(|r| r.rgba == 0xff0000ff).expect("box");
+        assert_eq!(o.scene.rect_attrs[red].2, Some(0));
+
+        // A quarter turn about the box's centre: the matrix is exact.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .t { width: 100px; height: 100px; background-color: #ff0000; transform: rotate(90deg) }</style>
+            <div class="t"></div>"#);
+        // rotate 90 about (50, 50): (x, y) -> (100 - y, x).
+        assert_eq!(o.scene.xforms, vec![[0, XF_ONE, -XF_ONE, 0, 100 * 64, 0]]);
+
+        // transform-origin as a percentage of the box.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .t { width: 100px; height: 40px; background-color: #ff0000; transform-origin: 100% 100%; transform: scale(2, 2) }</style>
+            <div class="t"></div>"#);
+        // Scaling by 2 about (100, 40): (x, y) -> (2x - 100, 2y - 40).
+        assert_eq!(o.scene.xforms, vec![[2 * XF_ONE, 0, 0, 2 * XF_ONE, -100 * 64, -40 * 64]]);
+    }
+
+    /// A nested transform is composed with its ancestor's, so a reader needs
+    /// no stack — the same rule as clips.
+    #[test]
+    fn nested_transforms_are_composed() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .a { width: 100px; height: 100px; transform-origin: 0px 0px; transform: translate(10px, 0px) }
+            .b { width: 50px; height: 50px; background-color: #ff0000; transform-origin: 0px 0px; transform: translate(5px, 0px) }</style>
+            <div class="a"><div class="b"></div></div>"#);
+        assert_eq!(o.scene.xforms, vec![[XF_ONE, 0, 0, XF_ONE, 10 * 64, 0], [XF_ONE, 0, 0, XF_ONE, 15 * 64, 0]]);
+        let red = o.scene.rects.iter().position(|r| r.rgba == 0xff0000ff).expect("box");
+        assert_eq!(o.scene.rect_attrs[red].2, Some(1));
     }
 
     #[test]
@@ -1731,8 +1800,8 @@ mod tests {
     /// must show up, and its initial value must not.
     #[test]
     fn an_unread_property_is_counted_and_its_initial_value_is_not() {
-        let o = render(r#"<style>.a { transform: translate(2px, 2px) } .b { transform: none }</style><div class="a">x</div><div class="b">y</div>"#);
-        assert_eq!(o.unimplemented.get("row transform… (not implemented)"), Some(&1), "{:?}", o.unimplemented);
+        let o = render(r#"<style>.a { box-shadow: 1px 1px 2px 0px #000000 } .b { box-shadow: none }</style><div class="a">x</div><div class="b">y</div>"#);
+        assert_eq!(o.unimplemented.get("row box-shadow… (not implemented)"), Some(&1), "{:?}", o.unimplemented);
     }
 
     /// CSS automatic minimum size: a flex item does not shrink below its
@@ -1906,6 +1975,31 @@ fn restack(order: &[(u8, usize)], real: &[(i64, usize, usize, usize)], hoist: &[
         ord.then(ka.1.cmp(&kb.1)).then(a.cmp(b))
     });
     idx.into_iter().map(|i| order[i]).collect()
+}
+
+/// The matrix for a `transform` list, about `origin` (absolute, 1/64 px).
+///
+/// The functions apply left to right, so the leftmost is the OUTERMOST:
+/// `translate(…) rotate(…)` rotates first and then translates the result.
+/// Percentages in `translate()` are of the box's own size (CSS Transforms 1).
+fn transform_matrix(list: &[Tf], w: U, h: U, origin: (U, U)) -> Xform {
+    let mut m: Xform = [XF_ONE, 0, 0, XF_ONE, 0, 0];
+    for tf in list {
+        let step: Xform = match tf {
+            Tf::Translate(a, b) => [XF_ONE, 0, 0, XF_ONE, len(a, w).unwrap_or(0), len(b, h).unwrap_or(0)],
+            Tf::Scale(sx, sy) => [(sx * XF_ONE as f64).round() as i64, 0, 0, (sy * XF_ONE as f64).round() as i64, 0, 0],
+            Tf::Rotate(deg) => {
+                let (sin, cos) = crate::sin_cos_deg(*deg);
+                let (s, c) = ((sin * XF_ONE as f64).round() as i64, (cos * XF_ONE as f64).round() as i64);
+                [c, s, -s, c, 0, 0]
+            }
+        };
+        m = crate::compose(m, step);
+    }
+    // About the origin: translate there, transform, translate back.
+    let to = [XF_ONE, 0, 0, XF_ONE, origin.0, origin.1];
+    let back = [XF_ONE, 0, 0, XF_ONE, -origin.0, -origin.1];
+    crate::compose(crate::compose(to, m), back)
 }
 
 fn size_tracks(tracks: &[navigator_style::values::Track], avail: Option<U>, gap: U, mins: &[U], maxs: &[U]) -> Vec<U> {
