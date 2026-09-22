@@ -222,10 +222,20 @@ say "$STAGE"
 LJ=$("$VSSH" "jls name | grep -cE 'navigator[-_]worker'" | tr -d ' ')
 LM=$("$VSSH" "mount -p | grep -cE 'navigator[-_]worker'" | tr -d ' ')
 LU=$("$VSSH" "ls /var/run/portcullis-exec 2>/dev/null | wc -l" | tr -d ' ')
+# ★★ DYING jails and jaild's ZOMBIES too. `jls` without -d lists only live
+# jails, so a jail held in `dying` by a zombie that nobody reaped passed this
+# check while 100 accumulated per run (a pdfork child needs PD_NOWAITPID since
+# upstream bcdb6ba94d08). And the zombie count is `ps -o ppid -o stat` — the
+# `-o ppid=,stat=` form prints ONE column, so a check written that way can
+# only ever read 0 (it did, for a day).
+LD=$("$VSSH" "jls -d name | grep -cE 'navigator[-_]worker'" | tr -d ' ')
+LZ=$("$VSSH" "ps -ax -o ppid -o stat | awk -v j=\$(pgrep -f 'atrium-jaild serve') '\$1==j && \$2 ~ /Z/' | wc -l" | tr -d ' ')
 [ "${LJ:-0}" = 0 ] || die "$LJ jails leaked"
+[ "${LD:-0}" = 0 ] || die "$LD jails left DYING (held by unreaped processes)"
+[ "${LZ:-0}" = 0 ] || die "$LZ zombie children of jaild (nobody reaped them)"
 [ "${LM:-0}" = 0 ] || die "$LM mounts leaked"
 [ "${LU:-0}" = 0 ] || die "$LU writable layers leaked in /var/run/portcullis-exec"
-echo "  no jails, no mounts, no upper dirs"
+echo "  no jails (live or dying), no zombies, no mounts, no upper dirs"
 
 # ---- stage 10: the refusals must still refuse ------------------------------
 STAGE="refusals"

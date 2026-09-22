@@ -117,6 +117,9 @@ pub struct JailCreateSpec<'a> {
     /// `true` = pass `ip4=JAIL_SYS_INHERIT` (share the host's addresses),
     /// overriding `ip4_addr`. Validator-gated to the inherit allowlist.
     pub ip4_inherit:    bool,
+    /// `vnet=new` with no interfaces (NetworkConfig::Isolated). Excludes
+    /// every ip4 setting — the kernel refuses IP restrictions on a vnet jail.
+    pub isolated:       bool,
     /// `host.hostname` — always set (empty is no hostname at all).
     pub hostname:       &'a str,
     /// `host.hostid` / `host.hostuuid` — the synthetic identity (§9.1c).
@@ -157,7 +160,7 @@ pub fn create_persistent_jail(spec: &JailCreateSpec) -> io::Result<CreatedJail> 
     if spec.devfs_ruleset != 0 {
         iob.add_u32("devfs_ruleset", spec.devfs_ruleset);
     }
-    iob.add_network(spec.ip4_addr, spec.ip4_inherit)?;
+    iob.add_network(spec.ip4_addr, spec.ip4_inherit, spec.isolated)?;
     iob.add_host_identity(spec)?;
     let mut errmsg = vec![0u8; 256];
     iob.add_buf("errmsg", &mut errmsg);
@@ -219,15 +222,35 @@ pub struct PdforkOutcome {
     pub procdesc_fd:  libc::c_int,
 }
 
+/// `PD_NOWAITPID` from <sys/procdesc.h> (not yet in the libc crate).
+#[cfg(target_os = "freebsd")]
+const PD_NOWAITPID: libc::c_int = 0x0000_0004;
+
 #[cfg(target_os = "freebsd")]
 pub fn pdfork() -> io::Result<PdforkOutcome> {
-    let mut fd: libc::c_int = -1;
-    // SAFETY: pdfork writes to *fd in the parent, leaves it
-    // alone in the child. fd lives on this stack frame.
+    // ★★★ PD_NOWAITPID: THE PROCDESC HOLDER ALONE REAPS. jaild hands every
+    // child's procdesc to its caller and never waitpid()s. Upstream
+    // bcdb6ba94d08 ("processes: add zombie references", 2026-07-15, arrived
+    // with the 2026-09 resync) made a pdfork child need BOTH its procdesc
+    // closed AND its parent's waitpid() before it is reaped — unless forked
+    // with PD_NOWAITPID. Without it every child jaild ever made stayed a
+    // zombie parented to jaild, and each zombie held its jail in `dying`:
+    // measured 100 zombies and 100 dying jails after one corpus run.
+    // (libcasper adopted the same flag upstream, for the same reason.)
+    //
     // ★ PD_CLOEXEC: the procdesc is jaild's until it is sent to the caller, and
-    // it must never be inherited by anything jaild forks in the meantime — an
-    // extra holder keeps the child a zombie after its real owner lets go.
-    let pid = unsafe { libc::pdfork(&mut fd, libc::PD_CLOEXEC) };
+    // must never be inherited by anything jaild forks in the meantime.
+    let flags = libc::PD_CLOEXEC | PD_NOWAITPID;
+    let mut fd: libc::c_int = -1;
+    // SAFETY: pdfork writes to *fd in the parent, leaves it alone in the
+    // child. fd lives on this stack frame.
+    let mut pid = unsafe { libc::pdfork(&mut fd, flags) };
+    if pid < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+        // A kernel older than the zombie-reference change rejects the flag —
+        // and on such a kernel closing the procdesc already reaps, so the
+        // flag is not needed there.
+        pid = unsafe { libc::pdfork(&mut fd, libc::PD_CLOEXEC) };
+    }
     if pid < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -250,7 +273,7 @@ pub fn jail_create_and_attach(spec: &JailCreateSpec) -> io::Result<i32> {
     if spec.devfs_ruleset != 0 {
         iob.add_u32("devfs_ruleset", spec.devfs_ruleset);
     }
-    iob.add_network(spec.ip4_addr, spec.ip4_inherit)?;
+    iob.add_network(spec.ip4_addr, spec.ip4_inherit, spec.isolated)?;
     iob.add_host_identity(spec)?;
     let mut errmsg = vec![0u8; 256];
     iob.add_buf("errmsg", &mut errmsg);
@@ -411,7 +434,13 @@ impl IovBuilder {
 
     /// Add the network configuration to the iovec: `ip4=inherit`,
     /// `ip4=disable`, or `ip4.addr=<struct in_addr>`.
-    fn add_network(&mut self, ip4_addr: Option<&str>, inherit: bool) -> io::Result<()> {
+    fn add_network(&mut self, ip4_addr: Option<&str>, inherit: bool, isolated: bool) -> io::Result<()> {
+        if isolated {
+            /* `vnet=new`: JAIL_SYS_NEW = 1. Nothing is moved in, so the jail's
+             * stack has only its own lo0 — no host interface or MAC to read. */
+            self.add_i32("vnet", 1);
+            return Ok(());
+        }
         if inherit {
             /* `ip4=inherit`: JAIL_SYS_INHERIT = 2 (per <sys/jail.h>: DISABLE=0,
              * NEW=1, INHERIT=2). The jail shares the host's IPv4 addresses.

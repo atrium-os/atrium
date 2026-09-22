@@ -95,6 +95,9 @@ fn validate_network(net: &NetworkConfig, name: &str, policy: &Policy) -> Result<
                 })
             }
         }
+        /* Isolated: an own vnet with nothing in it — strictly less than
+         * Disable exposes, so always permitted. */
+        NetworkConfig::Isolated => Ok(()),
         NetworkConfig::Disable => {
             /* Always permitted. policy.network.allow_disable is
              * documented as "always true" in the policy schema;

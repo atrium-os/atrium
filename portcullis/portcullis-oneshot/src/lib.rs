@@ -222,7 +222,7 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
     // CreateJail carries nullfs mounts, a devfs ruleset and no network; a
     // capability needing more would otherwise run without it and report
     // success.
-    let mounts = match jaild_mounts(&jc, &jail_path) {
+    let mounts = match jaild_mounts(&jc, &jail_path, manifest.capabilities.network) {
         Ok(m) => m,
         Err(e) => return OneShot::Refused(e),
     };
@@ -301,7 +301,9 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         children_max:  0,
         mounts,
         devfs_ruleset: portcullis_jail::APP_DEVFS_RULESET,
-        network:       jaild::protocol::NetworkConfig::Disable,
+        // ★ Isolated, not Disable: an own empty vnet, so the worker cannot
+        // list the host's interfaces or read its real MAC (§9.1c).
+        network:       jaild::protocol::NetworkConfig::Isolated,
         exec: Some(jaild::protocol::ExecSpec {
             path:  entry.clone(),
             argv:  vec![entry],
@@ -365,17 +367,20 @@ fn passwd_name(uid: u32) -> Option<String> {
 /// grants (per-mount devfs rules) and any network — never dropped: a
 /// capability that silently does not apply is a worker running without what
 /// its manifest says it has.
-fn jaild_mounts(jc: &portcullis_jail::JailConfig, root: &Path)
+fn jaild_mounts(jc: &portcullis_jail::JailConfig, root: &Path,
+                network: Option<portcullis_toml::NetworkCap>)
     -> Result<Vec<jaild::protocol::MountSpec>, String>
 {
     use jaild::protocol::{MountKind, MountSpec};
-    use portcullis_jail::Value;
     if !jc.devfs_actions.is_empty() {
         return Err("device capabilities are not supported on the one-shot lane yet \
                     (jaild cannot apply per-jail devfs grants)".into());
     }
-    let net_off = jc.params.iter().any(|(k, v)| k == "ip4" && matches!(v, Value::Symbolic(s) if s == "disable"))
-        && !jc.params.iter().any(|(k, _)| k == "vnet" || k == "ip4.addr");
+    // ★ Decided from the manifest's capability, not by pattern-matching the
+    // rendered jail params: the params changed shape (ip4=disable → vnet=new)
+    // and a match on the old shape would have refused every worker — or, the
+    // other way round, admitted a networked one.
+    let net_off = matches!(network, None | Some(portcullis_toml::NetworkCap::None));
     if !net_off {
         return Err("network capabilities are not supported on the one-shot lane yet".into());
     }

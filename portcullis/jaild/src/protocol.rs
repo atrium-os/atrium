@@ -322,7 +322,17 @@ pub struct EnvPair {
 pub enum NetworkConfig {
     /// No network access. `ip4=disable` on the jail; processes
     /// inside cannot `socket(AF_INET, ...)`. Default.
+    ///
+    /// ★ But the jail still shares the host's network STACK, so it can list
+    /// the host's interfaces — and read their real MACs (portcullis.md §9.1c).
+    /// Right for Atrium's own services; apps get [`NetworkConfig::Isolated`].
     Disable,
+    /// No network, AND no view of the host's: `vnet=new` with nothing moved
+    /// in, so the jail's stack holds only its own `lo0` (down). No host
+    /// interface, address or MAC is visible (portcullis.md §9.1c). What every
+    /// app without a network capability gets. (vnet and `ip4=disable` cannot
+    /// be combined — the kernel refuses IP restrictions on a vnet jail.)
+    Isolated,
     /// A specific 127.x.x.x address aliased on the host's lo0.
     /// `addr` is in CIDR form (e.g. "127.10.0.5/32"). Must
     /// match (CIDR-contained-in) one of

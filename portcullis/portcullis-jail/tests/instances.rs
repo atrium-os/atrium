@@ -91,14 +91,18 @@ fn the_hostname_does_not_leak_the_instance() {
 
 /// ★ And the minimal capability set is the DEFAULT, not something a worker
 /// manifest has to remember to ask for: a manifest with no [capabilities]
-/// renders with networking disabled and no mounts at all. That is what makes
-/// a document worker's manifest a short one.
+/// renders with no network and no mounts at all. That is what makes a document
+/// worker's manifest a short one.
+///
+/// ★ "No network" is an own, EMPTY vnet — not ip4=disable, which left the jail
+/// on the host's stack able to read the host's interfaces and MACs (§9.1c).
+/// And no ip4/ip6 setting may appear: the kernel refuses them on a vnet jail.
 #[test]
 fn a_manifest_with_no_capabilities_renders_a_closed_jail() {
     let jc = build(&manifest("org.atrium.worker"), &opts(Some("1"))).expect("builds");
     let conf = jc.render_jail_conf();
-    assert!(conf.contains("ip4 = disable"), "{conf}");
-    assert!(conf.contains("ip6 = disable"), "{conf}");
+    assert!(conf.contains("vnet = new"), "{conf}");
+    assert!(!conf.contains("ip4") && !conf.contains("ip6"), "{conf}");
     assert!(conf.contains("allow.raw_sockets = false"), "{conf}");
     assert!(jc.mounts.is_empty(), "a closed jail mounted something: {:?}", jc.mounts);
 }

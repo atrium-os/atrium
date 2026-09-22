@@ -1331,16 +1331,32 @@ close-on-exec now.
 | check | result |
 |---|---|
 | corpus | 98 sessions / 259 navs / 259 rewinds / 0 failures, 58.4 s (jail(8) lane: 59.2 s) |
-| leaks | no jails, mounts or upper dirs; jaild state: 0 worker records; 0 zombies (sampled every 4 s through a run) |
+| leaks | no jails, mounts or upper dirs; jaild state: 0 worker records — **but see the correction below: every worker was left a zombie holding a `dying` jail** |
 | refusals | unsigned, duplicate live instance, **root caller** — all refused |
 | exit status | malformed frame → CLI exits **2** (the worker's code); jail(8) reported 1 |
 | process | jail on devfs ruleset 22; parent of the worker is `atrium-jaild` — no `/bin/sh` |
 
-One observation is recorded **unexplained**: once, right after the first full run on this
-lane, ~100 finished workers were zombies under jaild; they were gone minutes later and never
-reappeared in four controlled runs (direct CLI, daemon ×3, 10-document corpus, full corpus
-sampled every 4 s). The procdesc inheritance above is a mechanism that delays reaping, and is
-fixed; it is not proven to be what that was.
+**★★★ CORRECTION (same day) — the "0 zombies" above was a DEAD ARM, and the leak was real.**
+The counter was `ps -o ppid=,stat=`: with `=` the comma-list is ONE column, so `$2` never
+existed and the check could only print 0. The first observation — ~100 zombies under jaild,
+read with a correctly-formed `ps` — was the true one; "they did not reproduce" was the broken
+counter. They reproduced on every run, and each zombie held its jail in `dying` (`jls`
+without `-d` does not list those, so the harness's leak check passed too).
+
+**Cause: a resync behaviour change.** Upstream `bcdb6ba94d08` (2026-07-15, "processes: add
+zombie references") made a `pdfork` child need BOTH its procdesc closed AND its parent's
+`waitpid()` before it is reaped — unless forked with `PD_NOWAITPID`. jaild gives the
+procdesc holder the whole lifecycle and never waits, so after the resync every child it made
+(every one-shot worker, every service restart) stayed a zombie. Closing the last procdesc of a
+zombie was observed NOT to reap it (`jclient` holding the only procdesc, then exiting). **Fix:**
+`pdfork(PD_CLOEXEC | PD_NOWAITPID)` — the flag that states jaild's actual contract; libcasper
+adopted it upstream for the same reason — with a fallback for kernels that predate the flag
+(where closing already reaps). **Verified:** counter positive-controlled (a deliberate zombie
+reads 1); after the fix, jclient execs and a full corpus run leave **0 zombies, 0 dying
+jails**. The harness now fails on dying jails and on jaild zombies.
+
+The close-on-exec fixes above stand on their own (a procdesc inherited by an unrelated
+command is a real extra holder), but they were not the cause.
 
 ### 6.5.2a `Request::ExecInstance` — the daemon creates the jail
 
@@ -1995,10 +2011,24 @@ unchanged (98/259/259/0).
 (`dev`, the run user's home, capability mountpoints — the daemon's launch made all three) and
 failed at `mount.devfs: …/dev: No such file or directory` before the jail existed. Fixed.
 
-**STILL OPEN — the MAC.** A non-vnet jail still lists the host's interfaces and their real
-MACs. Hiding them needs each jail on its own network stack (vnet): loopback-only for apps
-without network, and an epair with a MAC derived like the hostid for apps with it. Until
-then the real MAC is the one host identifier a jailed app can still read.
+**The MAC — hidden for apps without network (2026-09-22).** A non-vnet jail lists the host's
+interfaces and their real MACs, so "no network" is now an own, EMPTY vnet (`vnet=new`,
+nothing moved in): the jail's stack holds only its own `lo0`. jail(8) lane:
+`NetworkCap::None` → `vnet = new` (vnet refuses any ip4/ip6 setting — "vnet jails cannot have
+IP address restrictions"); jaild lane: new `NetworkConfig::Isolated`, used by every one-shot
+(`Disable` stays for Atrium's own services). Verified: one-shot and launched jails show
+interfaces `lo0` only, 0 `ether` lines. Cost: ~47 ms per create+remove against ~1 ms (measured,
+20 each); invisible at corpus scale (98 docs: 58.3 s vs 59.2 s).
+
+**Found on the way — the `loopback` capability never worked.** It set `ip4.addr`/`ip6.addr` on a
+vnet jail, which the kernel refuses; its unit test pinned exactly that recipe and passed. Now:
+`vnet = new` plus `exec.created` = `ifconfig -j <jail> lo0 inet 127.0.0.1/8 up …` (on the host,
+after creation, before the app starts). Verified: a signed loopback app launches with its own
+`lo0` UP on 127.0.0.1.
+
+**STILL OPEN — apps WITH the `full` network capability** share the host's stack
+(`vnet = inherit`) and still see the real MAC. Closing it needs an epair per jail with a MAC
+derived like the hostid, and routing/NAT for it.
 
 ### 9.2 Out of scope
 

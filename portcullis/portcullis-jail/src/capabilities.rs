@@ -175,23 +175,27 @@ pub fn apply_fonts(path: &str, mode: &str, jc: &mut JailConfig, _opts: &BuildOpt
 }
 
 pub fn apply_network(net: NetworkCap, jc: &mut JailConfig) {
-    /* FreeBSD jail.conf vnet legal values: new | inherit | disable.
-     * For "no network" the canonical recipe is just disabling the
-     * IP stacks; no vnet directive needed (default vnet=disable
-     * means jail shares host's stack but ip4=disable / ip6=disable
-     * leave it with no usable addresses). */
+    /* ★★ Both non-full modes are `vnet=new`: an own network stack with nothing
+     * moved in. The old "no network" recipe (ip4=disable, ip6=disable) left the
+     * jail on the HOST's stack, where it could still list the host's
+     * interfaces and read their real MACs — a machine fingerprint
+     * (portcullis.md §9.1c). And vnet cannot be combined with ip4/ip6
+     * settings at all: "vnet jails cannot have IP address restrictions". */
     match net {
         NetworkCap::None => {
-            jc.set("ip4", Value::Symbolic("disable".into()));
-            jc.set("ip6", Value::Symbolic("disable".into()));
+            /* Only the jail's own lo0, down. Nothing to reach, nothing to read. */
+            jc.set("vnet", Value::Symbolic("new".into()));
             jc.set("allow.raw_sockets", Value::Bool(false));
         }
         NetworkCap::Loopback => {
-            /* Per-jail loopback via fresh VNET — jail can't reach
-             * host's other interfaces, only its own 127/8. */
-            jc.set("vnet",     Value::Symbolic("new".into()));
-            jc.set("ip4.addr", Value::String("127.0.0.1".into()));
-            jc.set("ip6.addr", Value::String("::1".into()));
+            /* ★ The jail's OWN lo0, brought up from the host after creation
+             * and before the app starts (jail(8) runs exec.created there).
+             * The previous recipe set ip4.addr/ip6.addr on a vnet jail, which
+             * the kernel refuses — measured: this capability never launched. */
+            jc.set("vnet", Value::Symbolic("new".into()));
+            jc.set("exec.created", Value::String(format!(
+                "ifconfig -j {n} lo0 inet 127.0.0.1/8 up && ifconfig -j {n} lo0 inet6 ::1/128",
+                n = jc.name)));
             jc.set("allow.raw_sockets", Value::Bool(false));
         }
         NetworkCap::Full => {
@@ -336,23 +340,33 @@ mod tests {
         assert!(j.mounts[0].dst.ends_with("usr/share/myapp"));
     }
 
+    /// ★ No network = an own, empty vnet: no host interface or MAC visible.
+    /// And NO ip4/ip6 settings — the kernel refuses them on a vnet jail.
     #[test]
-    fn network_none_disables_ip_no_vnet() {
+    fn network_none_is_an_empty_vnet() {
         let mut j = jc();
         apply_network(NetworkCap::None, &mut j);
-        assert!(j.has_set("ip4"));
-        assert!(j.has_set("ip6"));
-        /* vnet directive intentionally absent — disabling ip4/ip6
-         * is the FreeBSD-canonical no-network recipe. */
-        assert!(!j.has_set("vnet"));
+        let vnet = j.params.iter().find(|(k, _)| k == "vnet").unwrap();
+        assert!(matches!(&vnet.1, Value::Symbolic(s) if s == "new"));
+        for k in ["ip4", "ip6", "ip4.addr", "ip6.addr"] {
+            assert!(!j.has_set(k), "{k} set on a vnet jail — jail(8) refuses it");
+        }
     }
 
+    /// ★ Loopback = an own vnet whose lo0 is configured from the host after
+    /// creation. The old test pinned ip4.addr on a vnet jail — the exact
+    /// recipe the kernel refuses — and passed while the capability could
+    /// never launch.
     #[test]
-    fn network_loopback_creates_vnet_and_assigns_loopback() {
+    fn network_loopback_brings_up_the_jails_own_lo0() {
         let mut j = jc();
         apply_network(NetworkCap::Loopback, &mut j);
-        let ip4 = j.params.iter().find(|(k, _)| k == "ip4.addr").unwrap();
-        assert!(matches!(&ip4.1, Value::String(s) if s == "127.0.0.1"));
+        let vnet = j.params.iter().find(|(k, _)| k == "vnet").unwrap();
+        assert!(matches!(&vnet.1, Value::Symbolic(s) if s == "new"));
+        assert!(!j.has_set("ip4.addr") && !j.has_set("ip6.addr"));
+        let c = j.params.iter().find(|(k, _)| k == "exec.created").unwrap();
+        assert!(matches!(&c.1, Value::String(s)
+            if s.contains(&format!("ifconfig -j {} lo0 inet 127.0.0.1/8 up", j.name))), "{:?}", c.1);
     }
 
     #[test]

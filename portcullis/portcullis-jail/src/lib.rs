@@ -224,7 +224,7 @@ pub fn build(manifest: &Manifest, opts: &BuildOpts) -> Result<JailConfig, BuildE
     }
 
     /* Network defaults to "none" if no capability set it. */
-    if !jc.has_set("ip4") && !jc.has_set("vnet") {
+    if !jc.has_set("vnet") {
         capabilities::apply_network(portcullis_toml::NetworkCap::None, &mut jc);
     }
 
