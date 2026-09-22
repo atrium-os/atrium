@@ -773,8 +773,11 @@ and trust) · RCTL/memoryd (resource bounds) · Laminar (scheduling, energy attr
 1. ~~**Per-document jail launch cost.**~~ **ANSWERED (§4.7c): ~25 ms to open, ~26 ms to
    close, per document; navigation unaffected. The one-jail-per-document default stands,
    and per-site jail reuse is not built.** Reopen if p99 open grows with concurrency.
-2. **Web fonts.** Excluded from Profile v1; they are both a layout-fidelity requirement
-   and a fingerprinting/ingest surface, and deserve their own argument.
+2. ~~**Web fonts.**~~ **SETTLED in atrium-document-profile-v1.md ("Web fonts — admitted, as
+   a required input").** Content-addressed, present before layout, parsed and shaped
+   only in the worker, and one canonical form (bare sfnt), produced by the converter's
+   decode → subset → sanitize step. This entry was stale; §6's "web fonts are a later
+   addition" is superseded by it.
 3. **Where HTTP freshness lives.** Content addressing gives integrity and offline but
    not "is this still the current page at this name" — a Nomenclator question, not a
    store question.

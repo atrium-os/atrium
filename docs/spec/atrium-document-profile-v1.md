@@ -383,10 +383,39 @@ occur.
    the process parsing. The worker's set is empty; the compositor's holds every client's
    rendered content, scanout and input. **Fresco therefore never receives a font file** —
    what crosses the boundary is shaped glyph runs, not a container to parse.
-2. **One format: bare OpenType/TrueType.** No WOFF, no WOFF2. Each container is another
-   parser, and WOFF2 additionally drags in a Brotli decoder; compression is the *store's*
-   job — Tessera already compresses blobs — not something baked into the format. This is
-   the same call made for PTL5.
+2. **One canonical form: bare OpenType/TrueType (sfnt).** The store, the worker and the
+   render tests see exactly one kind of font file. WOFF and WOFF2 are *transport
+   encodings* of the same tables. Compression is the store's job, since Tessera already
+   compresses blobs. This is the same call made for PTL5.
+
+   **The producer (the converter, jailed) turns what it fetches into that form:**
+   - **decode**: WOFF (zlib) and WOFF2 (Brotli plus the glyf/loca and hmtx transforms);
+   - **subset** (condition 5): this requires decoding anyway, so the decoder exists
+     whatever this rule says;
+   - **sanitize**: re-serialize with only the tables the profile admits;
+   - **content-address** the result.
+
+   EOT and anything else is refused. Where `src` lists alternatives, the producer takes
+   the best one it can decode.
+
+   ★ **Why, stated precisely, because the first version of this condition overstated
+   it.** Excluding WOFF2 is *not* the main security measure. WOFF2 does add a Brotli
+   decoder, the outline-reconstruction code and a decompression-bomb risk, and all
+   three have real bug histories. But decoding yields an ordinary OpenType font that is
+   parsed exactly like a `.ttf`, and the dangerous code lives in the OpenType tables
+   themselves: CFF charstrings, TrueType hinting bytecode, GSUB/GPOS. A bare font carries
+   all of that. The large mitigations are elsewhere:
+   - condition 1 (parse in the empty-capability worker, never in Fresco);
+   - memory-safe parsers, so most bug classes become a panic in a disposable process;
+   - the producer's **sanitize** step, which is where malformed tables are actually
+     neutralised.
+
+   What this condition buys is **one form** (dedup, golden tests, one consumer path) and
+   **decoding once per document** in the converter's jail instead of on every view.
+
+   **Cost:** the store holds larger files than the wire carried. WOFF2's outline transform
+   usually beats general-purpose compression; by how much, on this corpus, is unmeasured.
+   (Decided with the user, 2026-09-22.)
 3. **Static instances only.** Variable-font axes are deferred: an axis value is another
    input that must be pinned for G1, and pinning it is equivalent to shipping the instance.
 4. **Bounded** — bytes per font, fonts per document, glyphs per font (§3.12).
