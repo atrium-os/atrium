@@ -13,7 +13,7 @@
 //! ("timeout waiting for reply") and jaild accepted the daemon's connection
 //! 54 s later, the instant the bootstrap logged "all services retired".
 
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, OwnedFd};
 
 use sockmux::{LengthPrefixed, Mux};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -115,15 +115,17 @@ pub fn serve(
             }
             return None;
         }
-        Some(LengthPrefixed::new(stream, protocol::MAX_FRAME_BYTES))
+        /* Up to 3 descriptors per request: a one-shot's stdio (ExecSpec::stdio).
+         * Every other request must carry none — dispatch refuses them. */
+        Some(LengthPrefixed::new(stream, protocol::MAX_FRAME_BYTES).with_fds(3))
     };
 
     loop {
         /* One request per connection per round. */
         for fd in mux.next_round(&mut admit)? {
             let Some(conn) = mux.session_mut(fd) else { continue };
-            let served = match conn.take_frame() {
-                Ok(Some(body)) => serve_request(conn.stream(), &body, policy,
+            let served = match conn.take_frame_with_fds() {
+                Ok(Some((body, fds))) => serve_request(conn.stream(), &body, fds, policy,
                     dry_run, &mut state, state_path),
                 Ok(None) => Ok(()),
                 Err(e) => Err(JaildError::Io(e)),
@@ -140,6 +142,7 @@ pub fn serve(
 fn serve_request(
     stream:     &UnixStream,
     body:       &[u8],
+    fds:        Vec<OwnedFd>,
     policy:     &Policy,
     dry_run:    bool,
     state:      &mut PersistentState,
@@ -158,7 +161,7 @@ fn serve_request(
     /* dispatch returns any fds to pass via SCM_RIGHTS:
      * CreateJail-with-exec → [procdesc]; ExecInJail →
      * [procdesc, pty_master]; everything else → []. */
-    let (resp, fds_to_attach) = dispatch(req, policy, dry_run, state, state_path);
+    let (resp, fds_to_attach) = dispatch(req, fds, policy, dry_run, state, state_path);
     let sent = send_response(stream.as_raw_fd(), &resp, &fds_to_attach);
 
     /* Our copies are no longer needed once sent — the kernel keeps
@@ -171,16 +174,40 @@ fn serve_request(
 
 fn dispatch(
     req:        Request,
+    fds:        Vec<OwnedFd>,
     policy:     &Policy,
     dry_run:    bool,
     state:      &mut PersistentState,
     state_path: &Path,
 ) -> (Response, Vec<i32>) {
+    /* ★ Descriptors are accepted for exactly one request shape — a CreateJail
+     * whose exec asks for the caller's stdio — and then exactly three. Any
+     * other request carrying them is refused rather than having them quietly
+     * closed: a caller that sent a pipe is waiting on it. */
+    let wants_stdio = matches!(&req,
+        Request::CreateJail(r) if r.exec.as_ref().is_some_and(|e| e.stdio));
+    let stdio: Option<[OwnedFd; 3]> = if wants_stdio {
+        match <[OwnedFd; 3]>::try_from(fds) {
+            Ok(three) => Some(three),
+            Err(v) => return (Response::PolicyDenied {
+                rule:   "exec.stdio.fd_count".into(),
+                detail: format!("exec.stdio needs exactly 3 descriptors (stdin, stdout, \
+                                 stderr) on the request; got {}", v.len()),
+            }, Vec::new()),
+        }
+    } else if !fds.is_empty() {
+        return (Response::PolicyDenied {
+            rule:   "fds.unexpected".into(),
+            detail: format!("{} descriptor(s) sent with a request that takes none", fds.len()),
+        }, Vec::new());
+    } else {
+        None
+    };
     match req {
         Request::Ping => (Response::Ok, Vec::new()),
 
         Request::CreateJail(spec) => {
-            match handle_create(&spec, policy, dry_run, state, state_path) {
+            match handle_create(&spec, stdio, policy, dry_run, state, state_path) {
                 Ok(CreateOutcome { resp, procdesc_fd }) => {
                     (Response::JailCreated(resp), procdesc_fd.into_iter().collect())
                 }
@@ -662,6 +689,7 @@ fn handle_remove(
 
 fn handle_create(
     req:        &CreateJailRequest,
+    stdio:      Option<[OwnedFd; 3]>,
     policy:     &Policy,
     dry_run:    bool,
     state:      &mut PersistentState,
@@ -793,7 +821,7 @@ fn handle_create(
 
     if let Some(exec) = &req.exec {
         return handle_create_with_exec(
-            req, exec, lo0_alias, ip4_addr_no_cidr, ip4_inherit, state, state_path,
+            req, exec, stdio, lo0_alias, ip4_addr_no_cidr, ip4_inherit, state, state_path,
             policy.mount_sources.max_tmpfs_mb,
         );
     }
@@ -841,6 +869,7 @@ fn handle_create(
 fn handle_create_with_exec(
     req:         &CreateJailRequest,
     exec:        &ExecSpec,
+    stdio:       Option<[OwnedFd; 3]>,
     lo0_alias:   Option<String>,
     ip4_addr:    Option<String>,
     ip4_inherit: bool,
@@ -887,6 +916,19 @@ fn handle_create_with_exec(
          * stdout+stderr to a per-service log (/dev/null fallback);
          * this also rescues the child's own diagnostics below. */
         ffi::redirect_child_stdio(&format!("/var/log/atrium/{}.log", req.name));
+        /* ★ A one-shot's stdio is its CALLER's (ExecSpec::stdio): replaces the
+         * log redirect above — which stays first, so a failure here still has
+         * somewhere to be reported. Before jail_attach, while the child is
+         * still root in the host, like every other fd setup. */
+        if let Some(fds) = &stdio {
+            use std::os::unix::io::AsRawFd;
+            if let Err(e) = ffi::install_child_stdio(
+                [fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd()])
+            {
+                eprintln!("jaild-child: install caller stdio: {e}");
+                ffi::child_exit(105);
+            }
+        }
 
         for (src, dst, kind, size_mb) in &resolved_mounts {
             /* nullfs / tmpfs need the destination dir to exist —
@@ -942,6 +984,9 @@ fn handle_create_with_exec(
     }
 
     /* ====== parent ====== */
+    /* The child holds the caller's stdio now; jaild's copies must go, or the
+     * broker's end would never see EOF when the worker exits. */
+    drop(stdio);
     info!("jaild: pdfork ok pid={} pdfd={} lo0_alias={:?}",
         pdf.pid, pdf.procdesc_fd, lo0_alias);
 

@@ -150,6 +150,13 @@ allowed_prefixes = [
     "/usr/local/sbin/atrium-",
     "/usr/local/share/atrium/apps/",   # installed Atrium apps
 ]
+# ★ One-shot INSTANCE ROOTS (portcullis.md §6.5.4): a jail named `app-...` whose
+# root is exactly <instance_root_dir>/<name> runs the entry of an app tree
+# portcullis signature-verified and mounted there, so its entry may be any
+# absolute path inside that tree (no `..`) rather than one of the prefixes
+# above. The only kind of jail that may also take its caller's stdio
+# (ExecSpec.stdio). Remove the line to turn the rule off.
+instance_root_dir = "/var/lib/atrium/jails"
 
 
 # ---------------------------------------------------------------

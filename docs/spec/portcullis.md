@@ -1279,16 +1279,68 @@ daemon rather than spawning a setuid-ish CLI) and the `jaild` `CreateJail`/`Exec
 with caller-supplied fds — real `execve`, `pdfork` reaping, no intervening `/bin/sh` — remain
 as described in §6.5.4.
 
-### 6.5.4 Why `jaild` is the better eventual target
+### 6.5.4 The one-shot lane runs on `jaild` — DONE (2026-09-22)
 
-`jail -c -f` starts the entry through `/bin/sh -c` via `exec.start`, which costs a shell in
-every jail and makes argv quoting the caller's problem. `jaild`'s `CreateJail` already does
-`pdfork` + `jail_set(JAIL_CREATE|JAIL_ATTACH)` + `execve` and returns a **procdesc**, which
-gives clean async reaping with no `wait` races. It needs one extension: `ExecSpec` carries
-`path/argv/env/uid/gid` and no stdio, forcing the child's descriptors to `/dev/null` and a
-log file. Caller-supplied fds over `SCM_RIGHTS` — the machinery `portcullis_ipc::recv_fds`
-and `send_frame_with_fds` already provide in both directions — is the natural extension
-point.
+`jail -c -f` started the entry through `/bin/sh -c` via `exec.start` — a shell in every jail,
+argv quoting as the caller's problem, `-q` load-bearing so jail(8)'s chatter stayed off the
+caller's pipe, and every nonzero exit collapsed to 1. The lane now asks **jaild**:
+`portcullis-oneshot` still builds the root (read-only tree, tmpfs upper, union) and then
+sends `CreateJail` with `exec.stdio = true` and the caller's three descriptors riding on the
+same `sendmsg`. jaild `pdfork`s, mounts the jail's devfs (ruleset 22, checked loaded —
+§9.1b), `dup2`s the descriptors onto 0/1/2, `jail_set(CREATE|ATTACH)`s, drops privilege
+(verified — §9.1a) and `execve`s the entry. It returns a procdesc; the lane waits on it with
+`EVFILT_PROCDESC` (an already-exited worker reports at registration — `sys_procdesc.c`, no
+race) and reports the worker's **own** exit status, then sends `RemoveJail` so jaild's state
+does not keep one record per worker.
+
+**Two decisions, made explicitly:**
+
+- **Entry path trust = the verified tree.** jaild execs service binaries only under
+  `exec_paths.allowed_prefixes`; a signed bundle's entry is wherever its manifest says. So
+  jaild trusts an entry anywhere inside the tree **only** for a one-shot *instance root*:
+  a jail named `app-…` whose root is **exactly** `<exec_paths.instance_root_dir>/<name>`
+  (component-wise equality; a deeper path or another jail's root gets no trust) — and the
+  path must still be absolute with no `..`. Only an instance root may take the caller's
+  stdio. Names are `app-<id>--<tag>` (`portcullis_jail::jaild_instance_name`), jaild-valid by
+  construction; too long is refused, never truncated.
+- **Root callers are refused.** A worker runs as whoever asked for it, and a root caller
+  meant a uid-0 worker — what turned §9.1b's `/dev` exposure into a read of the host's disk.
+  Refused in the lane with the reason (jaild's uid policy would refuse it too). The daemon
+  path uses the peer's credentials; the direct CLI needs root and so requires an explicit
+  `--user <name>` — never `$USER`, which `su -m` leaves as root.
+
+**What the lane cannot express is refused, not dropped:** capability device grants and any
+network. A capability that silently did not apply would be a worker running without what its
+manifest says it has.
+
+**Descriptors on a TCB socket.** `sockmux` (jaild's multiplexer) receives SCM_RIGHTS now:
+close-on-exec from receipt (`MSG_CMSG_CLOEXEC`), bounded per connection (3 for jaild, 0 for
+atrium-volumes), assigned to the frame whose **bytes** they arrived with (a pipelined plain
+request cannot take the next one's), and never silently dropped — a frame taken as plain that
+carried descriptors is an error. jaild refuses descriptors on any request but a stdio exec
+(`fds.unexpected`) and anything but exactly three there (`exec.stdio.fd_count`).
+
+**Found on the way, fixed:** the procdesc was received **without** close-on-exec (jaild's
+client) and created **without** `PD_CLOEXEC` (jaild). A caller serving several one-shots
+forks `mount`/`umount`/`jls` for each, and every such child inherited the other workers'
+procdescs — and a zombie is reaped only when its *last* descriptor closes. Both ends are
+close-on-exec now.
+
+**Measured in the VM,** broker as uid 1001 (`navtest`), through portcullisd:
+
+| check | result |
+|---|---|
+| corpus | 98 sessions / 259 navs / 259 rewinds / 0 failures, 58.4 s (jail(8) lane: 59.2 s) |
+| leaks | no jails, mounts or upper dirs; jaild state: 0 worker records; 0 zombies (sampled every 4 s through a run) |
+| refusals | unsigned, duplicate live instance, **root caller** — all refused |
+| exit status | malformed frame → CLI exits **2** (the worker's code); jail(8) reported 1 |
+| process | jail on devfs ruleset 22; parent of the worker is `atrium-jaild` — no `/bin/sh` |
+
+One observation is recorded **unexplained**: once, right after the first full run on this
+lane, ~100 finished workers were zombies under jaild; they were gone minutes later and never
+reappeared in four controlled runs (direct CLI, daemon ×3, 10-document corpus, full corpus
+sampled every 4 s). The procdesc inheritance above is a mechanism that delays reaping, and is
+fixed; it is not proven to be what that was.
 
 ### 6.5.2a `Request::ExecInstance` — the daemon creates the jail
 

@@ -96,6 +96,7 @@ fn main() -> ExitCode {
                     }],
                     uid:  1001,
                     gid:  1001,
+                    stdio: false,
                 }),
             })
         }

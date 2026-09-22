@@ -32,6 +32,7 @@
 
 #![deny(unsafe_code)]
 
+mod fdrecv;
 mod framed;
 mod kqueue;
 

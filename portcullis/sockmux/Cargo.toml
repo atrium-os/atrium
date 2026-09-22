@@ -12,3 +12,4 @@ log  = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
+libc = "0.2"

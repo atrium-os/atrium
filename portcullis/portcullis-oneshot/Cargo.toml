@@ -15,4 +15,5 @@ portcullis-jail  = { path = "../portcullis-jail" }
 portcullis-toml  = { path = "../portcullis-toml" }
 portcullis-trust = { path = "../portcullis-trust" }
 portcullis-mounts = { path = "../portcullis-mounts" }
+jaild = { path = "../jaild" }
 libc = "0.2"

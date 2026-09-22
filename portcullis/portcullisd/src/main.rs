@@ -555,8 +555,9 @@ fn handle_exec_instance(
         user_name: user.to_string(),
     };
     let resp = match portcullis_oneshot::run_with_stdio(&spec, Some(stdio)) {
-        portcullis_oneshot::OneShot::Exit { ok } =>
-            Response::LaunchExit { code: Some(if ok { 0 } else { 1 }) },
+        // The worker's own status (jaild reaps it); None = killed by a signal.
+        portcullis_oneshot::OneShot::Exit { code, .. } =>
+            Response::LaunchExit { code },
         portcullis_oneshot::OneShot::Refused(why) =>
             Response::LaunchFailed { stage: "refused".into(), message: why },
         portcullis_oneshot::OneShot::Failed(why) =>

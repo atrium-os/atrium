@@ -216,7 +216,7 @@ pub fn ping() -> DaemonResult<()> {
 /// That is the difference between `exec` and `exec --daemon`, and the reason
 /// the daemon variant is the one a broker should use.
 pub fn exec_instance(app_id: &str, instance: Option<&str>, tmpfs_mb: u32)
-    -> DaemonResult<bool>
+    -> DaemonResult<Option<i32>>
 {
     let Some(mut s) = opened()? else { return Ok(None) };
     write_request(&mut s, &Request::ExecInstance {
@@ -242,7 +242,8 @@ pub fn exec_instance(app_id: &str, instance: Option<&str>, tmpfs_mb: u32)
         // success-or-not and never the child's own code. Said here as well as
         // in the usage text because a caller reading only this would
         // otherwise assume the code survived.
-        Response::LaunchExit { code } => Ok(Some(code == Some(0))),
+        // The worker's own status; None = it died on a signal.
+        Response::LaunchExit { code } => Ok(Some(code)),
         Response::LaunchFailed { stage, message } =>
             Err(io::Error::other(format!("{stage}: {message}"))),
         Response::Error { message } => Err(io::Error::other(message)),

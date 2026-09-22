@@ -120,3 +120,21 @@ fn a_one_shot_jail_does_not_persist_and_an_application_does() {
     let conf = build(&manifest("org.atrium.notes"), &opts(None)).expect("builds").render_jail_conf();
     assert!(conf.contains("persist = true"), "an application lost its persistence: {conf}");
 }
+
+/// ★ The jaild-lane name is jaild-valid by construction: lowercase, digits and
+/// `-` only, `app-` prefix, id and tag joined by `--`.
+#[test]
+fn jaild_instance_names_are_jaild_valid() {
+    use portcullis_jail::jaild_instance_name;
+    let n = jaild_instance_name("org.atrium.Navigator.worker", Some("doc_7")).unwrap();
+    assert_eq!(n, "app-org-atrium-navigator-worker--doc-7");
+    assert!(n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'), "{n}");
+    assert_eq!(jaild_instance_name("org.x", None).unwrap(), "app-org-x--0");
+}
+
+/// Too long is refused, never truncated — a truncated name could be another app's.
+#[test]
+fn an_overlong_jaild_instance_name_is_refused() {
+    let long = "org.".to_string() + &"x".repeat(70);
+    assert!(portcullis_jail::jaild_instance_name(&long, Some("1")).is_none());
+}

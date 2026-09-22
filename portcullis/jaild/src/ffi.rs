@@ -202,7 +202,10 @@ pub fn pdfork() -> io::Result<PdforkOutcome> {
     let mut fd: libc::c_int = -1;
     // SAFETY: pdfork writes to *fd in the parent, leaves it
     // alone in the child. fd lives on this stack frame.
-    let pid = unsafe { libc::pdfork(&mut fd, 0) };
+    // ★ PD_CLOEXEC: the procdesc is jaild's until it is sent to the caller, and
+    // it must never be inherited by anything jaild forks in the meantime — an
+    // extra holder keeps the child a zombie after its real owner lets go.
+    let pid = unsafe { libc::pdfork(&mut fd, libc::PD_CLOEXEC) };
     if pid < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -889,6 +892,34 @@ pub fn close_fd(fd: i32) -> io::Result<()> {
 pub fn child_exit(code: i32) -> ! {
     // SAFETY: _exit is the safest call there is; never returns.
     unsafe { libc::_exit(code); }
+}
+
+/// Make the caller's three descriptors this process's stdin/stdout/stderr.
+///
+/// ★ Two-step, because the received descriptors may themselves BE 0, 1 or 2:
+/// jaild is daemonized, and a descriptor received into a freed low slot would
+/// be clobbered by an earlier `dup2` in a one-step version (dup2(fd_a, 0)
+/// overwriting a received stdout that happened to live at 0). So each is first
+/// copied above 2, then placed. `dup2` clears close-on-exec on the target, so
+/// 0/1/2 survive the execve while the received originals (close-on-exec from
+/// receipt) do not. Async-signal-safe: fcntl/dup2/close only — for the
+/// post-pdfork child.
+pub fn install_child_stdio(fds: [libc::c_int; 3]) -> io::Result<()> {
+    let mut high = [-1; 3];
+    for i in 0..3 {
+        // SAFETY: plain fd syscalls.
+        let d = unsafe { libc::fcntl(fds[i], libc::F_DUPFD_CLOEXEC, 3) };
+        if d < 0 { return Err(io::Error::last_os_error()) }
+        high[i] = d;
+    }
+    for (i, d) in high.iter().enumerate() {
+        // SAFETY: plain fd syscalls.
+        if unsafe { libc::dup2(*d, i as libc::c_int) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        unsafe { libc::close(*d) };
+    }
+    Ok(())
 }
 
 /// Give the pdfork-child VALID stdin/stdout/stderr before it execve's the

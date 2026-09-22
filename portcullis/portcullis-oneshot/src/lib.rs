@@ -29,10 +29,13 @@
 //!     unconfigured" from a one-off into a standing condition, so this path
 //!     asks for `Demand::Required` whatever the machine is set to.
 //!
-//! Stdio needs no mechanism: `jail -c -f` inherits this process's descriptors,
-//! and when the caller is a broker those descriptors are pipes.
+//! ★★ jaild creates the jail and runs the entry (portcullis.md §6.5.4): the
+//! caller's three descriptors ride on the CreateJail request over SCM_RIGHTS
+//! and the child dup2s them onto 0/1/2, then execve's the entry directly — no
+//! jail.conf, no jail(8), no intervening /bin/sh. jaild returns a process
+//! descriptor, which is how this crate waits for the worker and learns its real
+//! exit status. Root callers are refused: a worker never runs as uid 0.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -72,13 +75,9 @@ pub struct Spec {
     /// cares must be able to demand it, and one that does not must not be
     /// broken by a release.
     pub require_memory_limit: bool,
-    /// The user the entry runs as. ★ Its home is RESOLVED from the host's
-    /// passwd, not supplied: `exec.system_jail_user` makes jail(8) chdir into
-    /// that user's passwd home inside the jail, so any other answer creates
-    /// the wrong directory and the entry dies before it runs. The CLI used to
-    /// pass `$HOME` and the daemon guessed `/home/<user>`; the first was right
-    /// only because root's `$HOME` happens to match, and the second was simply
-    /// wrong — measured, as `chdir /root: No such file or directory`.
+    /// The user the entry runs as — its uid, gid and HOME are RESOLVED from
+    /// the host's passwd, never supplied by the caller. ★ Must not be root:
+    /// a one-shot worker never runs as uid 0 inside its jail (refused).
     pub user_name: String,
 }
 
@@ -119,27 +118,14 @@ fn apply_memory_cap(jail_name: &str, mb: u64) -> Result<(), String> {
     Err(format!("rctl -a {rule}: {}", String::from_utf8_lossy(&out.stderr).trim()))
 }
 
-/// The passwd home of `user`, which is where jail(8) will chdir.
-fn passwd_home(user: &str) -> String {
-    let Ok(cuser) = std::ffi::CString::new(user) else { return "/".into() };
-    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut buf = vec![0 as libc::c_char; 4096];
-    let mut result: *mut libc::passwd = std::ptr::null_mut();
-    let r = unsafe {
-        libc::getpwnam_r(cuser.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
-    };
-    if r != 0 || result.is_null() { return "/".into() }
-    let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
-    dir.to_string_lossy().into_owned()
-}
-
 /// Why a one-shot run did not happen. `Exit` is the jailed process's own
 /// outcome and is not a failure of this crate.
 #[derive(Debug)]
 pub enum OneShot {
-    /// The jailed entry ran; `ok` is whether it succeeded. ★ Not a code:
-    /// jail(8) collapses every nonzero exec.start status to 1.
-    Exit { ok: bool },
+    /// The jailed entry ran; `ok` is whether it exited 0. `code` is its own
+    /// exit status (None if it died on a signal) — jaild reaps the worker
+    /// itself, so this is no longer jail(8)'s collapse of every failure to 1.
+    Exit { ok: bool, code: Option<i32> },
     Refused(String),
     Failed(String),
 }
@@ -147,12 +133,9 @@ pub enum OneShot {
 const APPS_DIR: &str = "/var/lib/atrium/apps";
 const JAILS_DIR: &str = "/var/lib/atrium/jails";
 
-/// Run `spec` in a one-shot jail whose stdio is this process's own.
-///
-/// ★ Stdio needs no mechanism here: the jail's entry inherits this process's
-/// descriptors. When the caller spawned us with pipes — a broker, or the
-/// daemon holding a client's fds received over SCM_RIGHTS — the jailed
-/// process reads and writes them directly.
+/// Run `spec` in a one-shot jail whose stdio is this process's own: jaild is
+/// handed this process's 0/1/2, so when the caller spawned us with pipes the
+/// jailed process reads and writes them directly.
 pub fn run(spec: &Spec) -> OneShot { run_with_stdio(spec, None) }
 
 /// As `run`, but give the jailed entry these descriptors instead of this
@@ -161,7 +144,7 @@ pub fn run(spec: &Spec) -> OneShot { run_with_stdio(spec, None) }
 /// ★ THE DAEMON NEEDS THIS AND THE CLI DOES NOT. When `portcullisd` creates
 /// the jail, its own stdio is the daemon log — the client's descriptors
 /// arrived over SCM_RIGHTS and are what the jailed process must actually
-/// speak on. Inheriting would send a worker's protocol frames to the system
+/// speak on. Handing jaild the daemon's own would send a worker's protocol frames to the system
 /// log and leave the broker waiting forever.
 pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> OneShot {
     let target = spec.target.as_str();
@@ -187,33 +170,53 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         Err(e) => return OneShot::Failed(format!("{}: {e:?}", manifest_path.display())),
     };
 
-    let jail_name = portcullis_jail::jail_name_for_instance(
-        &manifest.app.id, instance.as_deref());
+    // ★ The jaild-lane name: jaild-valid by construction, and the last
+    // component of the root — jaild trusts a one-shot's entry only when its
+    // root is exactly /var/lib/atrium/jails/<name> (policy instance_root_dir).
+    let Some(jail_name) = portcullis_jail::jaild_instance_name(
+        &manifest.app.id, instance.as_deref()) else {
+        return OneShot::Refused(format!(
+            "app id {:?} with instance {:?} makes a jail name over jaild's 64-byte limit",
+            manifest.app.id, instance));
+    };
     let jail_path = PathBuf::from(JAILS_DIR).join(&jail_name);
 
-    // ★ jail(8) CHDIRS INTO THE RUN USER'S HOME inside the jail, taken from
-    // the HOST's passwd because exec.system_jail_user is set. A worker needs
-    // no home, but it gets one anyway: without the directory existing in the
-    // jail's namespace, exec.start fails with `chdir: No such file or
-    // directory` before the entry ever runs. Created empty in the tmpfs upper
-    // layer, so it costs nothing and vanishes with the jail.
-    let user_home = passwd_home(&spec.user_name);
+    // ★★ A WORKER NEVER RUNS AS ROOT IN ITS JAIL (portcullis.md §6.5.4). The
+    // entry runs as whoever called, and a root caller used to mean a uid-0
+    // worker — exactly what turned the /dev exposure of §9.1b into a read of
+    // the host's disk. Refused here with the reason; jaild's uid policy would
+    // refuse it anyway, with a less useful message.
+    let Some(pw) = passwd_entry(&spec.user_name) else {
+        return OneShot::Failed(format!("no passwd entry for {:?}", spec.user_name));
+    };
+    if pw.uid == 0 {
+        return OneShot::Refused(
+            "one-shot workers never run as root inside their jail; call from an \
+             unprivileged user (portcullis.md §6.5.4)".into());
+    }
 
     let opts = BuildOpts {
         root_path: jail_path.clone(),
         host_sockets: PathBuf::from("/atrium/sockets"),
-        user_home: PathBuf::from(&user_home),
+        user_home: PathBuf::from(&pw.home),
         user_name: spec.user_name.clone(),
         devfs_ruleset: portcullis_jail::APP_DEVFS_RULESET,
         instance: instance.clone(),
         // ★ A unit of work, so the jail dies with its processes — see
-        // BuildOpts::persist. This is what stops a killed launcher from
-        // leaving a husk that poisons its instance tag.
+        // BuildOpts::persist. (jaild's exec path creates with persist=0.)
         persist: false,
     };
     let jc = match build(&manifest, &opts) {
         Ok(jc) => jc,
         Err(e) => return OneShot::Failed(format!("build: {e}")),
+    };
+    // ★★ What this lane cannot express is REFUSED, never dropped. jaild's
+    // CreateJail carries nullfs mounts, a devfs ruleset and no network; a
+    // capability needing more would otherwise run without it and report
+    // success.
+    let mounts = match jaild_mounts(&jc, &jail_path) {
+        Ok(m) => m,
+        Err(e) => return OneShot::Refused(e),
     };
 
     // ★★ A LIVE JAIL WITH THIS NAME IS A REFUSAL, NOT SOMETHING TO CLEAN UP.
@@ -230,15 +233,9 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
     // name a caller needs to fix it. Distinctness is the caller's to own —
     // this just stops it being silently violated.
     if let Some(jid) = running_jid(&jail_name) {
-        // ★★ AN EMPTY JAIL IS A HUSK, NOT AN INSTANCE. `persist = true` keeps
-        // a jail object alive after its processes are gone, so a launcher
-        // that was SIGKILLed — which is exactly what a broker does to a
-        // worker it is retiring — leaves a named, process-less jail and its
-        // mounts behind. Refusing on that would make one killed worker
-        // poison its instance tag until a human noticed; measured, it did.
-        //
-        // So: processes inside decide. Some means a live instance and a
-        // genuine duplicate; none means wreckage this run should clear.
+        // ★★ AN EMPTY JAIL IS A HUSK, NOT AN INSTANCE. Processes inside
+        // decide: some means a live instance and a genuine duplicate; none
+        // means wreckage this run should clear.
         if jailed_process_count(jid) > 0 {
             return OneShot::Refused(format!(
                 "jail {jail_name} is already running (jid {jid}); \
@@ -257,61 +254,16 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         teardown(&jail_path, &jail_name);
         return OneShot::Failed(e.to_string());
     }
-    // ★ Mountpoints jail(8) will not create. Shared with the application
-    // path: the two had grown separate copies of the same three lines, and
-    // the lane that lacked it supported capability-bearing workers only in
-    // principle.
+    // ★ File mountpoints (sockets) must exist as FILES before the mount; jaild
+    // creates only directories. Shared with the application path.
     if let Err(e) = portcullis_mounts::ensure_mountpoints(&jc) {
         teardown(&jail_path, &jail_name);
         return OneShot::Failed(e);
     }
-    // ★★★ Refuse a devfs that would hide nothing — see ensure_devfs_isolation.
-    // A Refusal, not a Failure: the machine is misconfigured in a way that
-    // makes running this jail unsafe, and retrying will not change that.
-    if let Err(e) = portcullis_mounts::ensure_devfs_isolation(&jc) {
-        teardown(&jail_path, &jail_name);
-        return OneShot::Refused(e);
-    }
 
-    for dir in ["dev", user_home.trim_start_matches('/')] {
-        if dir.is_empty() { continue }
-        if let Err(e) = std::fs::create_dir_all(jail_path.join(dir)) {
-            teardown(&jail_path, &jail_name);
-            return OneShot::Failed(format!("mkdir {dir}: {e}"));
-        }
-    }
-
-    let conf_path = std::env::temp_dir()
-        .join(format!("portcullis-exec-{}-{}.conf", std::process::id(), jail_name));
-    if let Err(e) = std::fs::File::create(&conf_path)
-        .and_then(|mut f| f.write_all(jc.render_jail_conf().as_bytes()))
-    {
-        teardown(&jail_path, &jail_name);
-        return OneShot::Failed(format!("write {}: {e}", conf_path.display()));
-    }
-
-    // stdio is inherited: no .stdin()/.stdout() calls, deliberately. When the
-    // caller spawned us with pipes, the jailed process reads and writes them.
-    //
-    // ★★ `-q` IS LOAD-BEARING, NOT COSMETIC. jail(8) prints "<name>: created"
-    // and "<name>: removed" on STDOUT, and stdout here is the caller's pipe —
-    // the same one the jailed process speaks its protocol on. Measured: a
-    // broker reading length-prefixed frames got
-    // `malformed frame: bad length in "org_atrium_navigator_worker__1: created"`
-    // and the session never opened. Anything this command emits on stdout is
-    // indistinguishable from the payload; everything it has to say goes to
-    // stderr instead.
-    //
-    // ★ The status below is jail(8)'s, not the entry's. Measured: a child
-    // exiting 7 makes jail(8) exit 1. Success and failure survive; the code
-    // does not, and the usage text says so rather than implying a fidelity
-    // this path cannot provide.
-    // ★ The cap goes on AFTER the jail exists and BEFORE anything runs in it:
-    // an rctl rule names a jail, so there is nothing to name until `jail -c`
-    // has created it — but `jail -c` also runs the entry. The jail is created
-    // by the same command that starts the entry, so the rule is applied to
-    // the NAME, which rctl accepts ahead of the jail existing. Applying it
-    // here means a worker is capped from its first instruction.
+    // ★ An opt-in static cap, by NAME, before the jail exists — rctl accepts
+    // a rule ahead of its jail, so the worker is capped from its first
+    // instruction. See Spec::memory_mb for why this is off by default.
     if let Some(mb) = spec.memory_mb {
         if racct_enabled() {
             if let Err(e) = apply_memory_cap(&jail_name, mb) {
@@ -327,23 +279,204 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         }
     }
 
-    let mut cmd = Command::new("jail");
-    cmd.arg("-q").arg("-c").arg("-f").arg(&conf_path).arg(&jail_name);
-    if let Some([sin, sout, serr]) = stdio {
-        cmd.stdin(std::process::Stdio::from(sin));
-        cmd.stdout(std::process::Stdio::from(sout));
-        cmd.stderr(std::process::Stdio::from(serr));
-    }
-    let status = cmd.status();
+    // ★★ jaild creates the jail and execs the entry itself (portcullis.md
+    // §6.5.4): pdfork + jail_set(CREATE|ATTACH) + a real execve of the entry,
+    // with the caller's stdio dup2'd onto 0/1/2. No jail.conf, no jail(8), no
+    // intervening /bin/sh — and no `-q` to remember, because nothing but the
+    // worker ever writes to the caller's pipe. The devfs ruleset is checked
+    // loaded by jaild (§9.1b), and the exit status is the worker's own rather
+    // than jail(8)'s collapse of every failure to 1.
+    let entry = format!("/{}", manifest.entry());
+    let req = jaild::protocol::Request::CreateJail(jaild::protocol::CreateJailRequest {
+        name:          jail_name.clone(),
+        path:          jail_path.to_string_lossy().into_owned(),
+        children_max:  0,
+        mounts,
+        devfs_ruleset: portcullis_jail::APP_DEVFS_RULESET,
+        network:       jaild::protocol::NetworkConfig::Disable,
+        exec: Some(jaild::protocol::ExecSpec {
+            path:  entry.clone(),
+            argv:  vec![entry],
+            env:   clean_env(&pw),
+            uid:   pw.uid,
+            gid:   pw.gid,
+            stdio: true,
+        }),
+    });
+    let outcome = run_via_jaild(&req, stdio);
 
-    let outcome = match status {
-        Ok(s) => OneShot::Exit { ok: s.success() },
-        Err(e) => OneShot::Failed(format!("jail: {e}")),
-    };
-
-    let _ = std::fs::remove_file(&conf_path);
+    jaild_remove(&jail_name);
     teardown(&jail_path, &jail_name);
     outcome
+}
+
+const JAILD_SOCK: &str = "/var/run/atrium/jaild.sock";
+
+/// The caller's user, as the jail will run it.
+struct PwEntry { uid: u32, gid: u32, home: String }
+
+fn passwd_entry(user: &str) -> Option<PwEntry> {
+    let cuser = std::ffi::CString::new(user).ok()?;
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 4096];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let r = unsafe {
+        libc::getpwnam_r(cuser.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
+    };
+    if r != 0 || result.is_null() { return None }
+    let home = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) }.to_string_lossy().into_owned();
+    Some(PwEntry { uid: pwd.pw_uid, gid: pwd.pw_gid, home })
+}
+
+/// The environment jail(8)'s `exec.clean` gave the entry — HOME, USER,
+/// LOGNAME, SHELL and a system PATH — and nothing inherited from the caller.
+fn clean_env(pw: &PwEntry) -> Vec<jaild::protocol::EnvPair> {
+    let user = passwd_name(pw.uid).unwrap_or_default();
+    [("HOME", pw.home.clone()), ("USER", user.clone()), ("LOGNAME", user),
+     ("SHELL", "/bin/sh".into()),
+     ("PATH", "/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin".into())]
+        .into_iter()
+        .map(|(k, v)| jaild::protocol::EnvPair { key: k.into(), value: v })
+        .collect()
+}
+
+fn passwd_name(uid: u32) -> Option<String> {
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 4096];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let r = unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+    if r != 0 || result.is_null() { return None }
+    Some(unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) }.to_string_lossy().into_owned())
+}
+
+/// Translate the build's capability mounts into jaild's. ★ Anything jaild's
+/// CreateJail cannot carry is an error for the caller to refuse — device
+/// grants (per-mount devfs rules) and any network — never dropped: a
+/// capability that silently does not apply is a worker running without what
+/// its manifest says it has.
+fn jaild_mounts(jc: &portcullis_jail::JailConfig, root: &Path)
+    -> Result<Vec<jaild::protocol::MountSpec>, String>
+{
+    use jaild::protocol::{MountKind, MountSpec};
+    use portcullis_jail::Value;
+    if !jc.devfs_actions.is_empty() {
+        return Err("device capabilities are not supported on the one-shot lane yet \
+                    (jaild cannot apply per-jail devfs grants)".into());
+    }
+    let net_off = jc.params.iter().any(|(k, v)| k == "ip4" && matches!(v, Value::Symbolic(s) if s == "disable"))
+        && !jc.params.iter().any(|(k, _)| k == "vnet" || k == "ip4.addr");
+    if !net_off {
+        return Err("network capabilities are not supported on the one-shot lane yet".into());
+    }
+    jc.mounts.iter().map(|m| {
+        if m.fstype != "nullfs" {
+            return Err(format!("{} mount at {} is not supported on the one-shot lane",
+                               m.fstype, m.dst.display()));
+        }
+        let rel = m.dst.strip_prefix(root).map_err(|_| format!(
+            "mount destination {} is outside the jail root", m.dst.display()))?;
+        Ok(MountSpec {
+            source:  m.src.to_string_lossy().into_owned(),
+            dest:    format!("/{}", rel.display()),
+            kind:    if m.opts.iter().any(|o| o == "ro") { MountKind::RoNullfs } else { MountKind::RwNullfs },
+            size_mb: None,
+        })
+    }).collect()
+}
+
+/// Ask jaild to create the jail and run the entry on `stdio` (this process's
+/// own when `None`), then wait for it.
+///
+/// ★★ Our copies of the caller's descriptors are dropped the moment the
+/// request is sent. The worker holds its own now; if this process kept the
+/// stdout write end, the broker reading it would never see EOF when the worker
+/// exits — it would wait on us instead.
+fn run_via_jaild(req: &jaild::protocol::Request, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> OneShot {
+    use jaild::protocol::Response;
+    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+    let mut client = match jaild::client::Client::connect(JAILD_SOCK) {
+        Ok(c) => c,
+        Err(e) => return OneShot::Failed(format!(
+            "connect {JAILD_SOCK}: {e} — one-shot jails are created by atrium-jaild")),
+    };
+    let sent = match &stdio {
+        Some([i, o, e]) => client.send_with_fds(req, &[i.as_fd(), o.as_fd(), e.as_fd()], 1),
+        None => client.send_with_fds(req, &[std::io::stdin().as_fd(),
+                                            std::io::stdout().as_fd(),
+                                            std::io::stderr().as_fd()], 1),
+    };
+    drop(stdio);
+    let (resp, got) = match sent {
+        Ok(x) => x,
+        Err(e) => return OneShot::Failed(format!("jaild: {e}")),
+    };
+    // Owned at once, so every path below closes what jaild handed over.
+    let mut got: Vec<OwnedFd> = got.into_iter()
+        .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }).collect();
+    match resp {
+        Response::JailCreated(r) if r.procdesc_attached => {
+            let Some(pd) = got.pop() else {
+                return OneShot::Failed("jaild said a procdesc was attached; none arrived".into());
+            };
+            match wait_procdesc(&pd) {
+                Ok(status) => {
+                    let code = libc::WIFEXITED(status).then(|| libc::WEXITSTATUS(status));
+                    OneShot::Exit { ok: code == Some(0), code }
+                }
+                Err(e) => OneShot::Failed(format!("wait for worker: {e}")),
+            }
+        }
+        Response::PolicyDenied { rule, detail } =>
+            OneShot::Refused(format!("jaild refused ({rule}): {detail}")),
+        Response::SyscallFailed { name, errno, msg } =>
+            OneShot::Failed(format!("jaild: {name} failed (errno {errno}): {msg}")),
+        other => OneShot::Failed(format!("jaild: unexpected reply {other:?}")),
+    }
+}
+
+/// Block until the process behind `pd` exits; its wait(2)-style status.
+///
+/// ★ No race with an early exit: registering EVFILT_PROCDESC on a process
+/// that has already exited reports NOTE_EXIT at once, with the status
+/// (sys_procdesc.c, "initial test after registration").
+#[cfg(target_os = "freebsd")]
+fn wait_procdesc(pd: &std::os::fd::OwnedFd) -> std::io::Result<i32> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let kq = unsafe { libc::kqueue() };
+    if kq < 0 { return Err(std::io::Error::last_os_error()) }
+    let kq = unsafe { OwnedFd::from_raw_fd(kq) };
+    let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
+    ev.ident = pd.as_raw_fd() as usize;
+    ev.filter = libc::EVFILT_PROCDESC;
+    ev.flags = libc::EV_ADD | libc::EV_ONESHOT;
+    ev.fflags = libc::NOTE_EXIT;
+    loop {
+        let mut out: libc::kevent = unsafe { std::mem::zeroed() };
+        let n = unsafe { libc::kevent(kq.as_raw_fd(), &ev, 1, &mut out, 1, std::ptr::null()) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted { continue }
+            return Err(e);
+        }
+        if n == 1 && out.fflags & libc::NOTE_EXIT != 0 {
+            return Ok(out.data as i32);
+        }
+    }
+}
+
+#[cfg(not(target_os = "freebsd"))]
+fn wait_procdesc(_pd: &std::os::fd::OwnedFd) -> std::io::Result<i32> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "procdesc: FreeBSD only"))
+}
+
+/// Drop jaild's record of the jail. The jail itself is already gone (it was
+/// created persist=0 and its only process exited); this keeps jaild's state
+/// from accumulating one record per worker. Best-effort: a failure leaves a
+/// stale record, not a live jail.
+fn jaild_remove(name: &str) {
+    if let Ok(mut c) = jaild::client::Client::connect(JAILD_SOCK) {
+        let _ = c.send(&jaild::protocol::Request::RemoveJail { jid: None, name: Some(name.into()) });
+    }
 }
 
 /// The jid of a live jail with this name, if any. `jls` is the kernel's own

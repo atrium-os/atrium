@@ -37,6 +37,11 @@ SCP_OPTS="-i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o
 TARGET="aarch64-unknown-freebsd"
 APP_ID="org.atrium.navigator.worker"
 SOCK="/tmp/pd-e2e.sock"
+# ★★ The broker runs UNPRIVILEGED. One-shot workers never run as root inside
+# their jail (portcullis.md §6.5.4), and a worker runs as whoever asked for it,
+# so a root broker is refused by design. The privilege lives in portcullisd and
+# jaild; the broker needs none — which is the point of the lane.
+BROKER_USER="${BROKER_USER:-navtest}"
 # ★ ITS OWN STAGING DIRECTORY, not /root. The first committed run of this
 # script failed at `scp portcullisd` because a daemon started BY HAND earlier
 # in the session still held /root/portcullisd open — ETXTBSY, which scp
@@ -171,6 +176,20 @@ GUESTN=$("$VSSH" "ls /root/e2e-rec/*.json 2>/dev/null | wc -l" | tr -d ' ')
 [ "$HOSTN" = "$GUESTN" ] || die "staged $GUESTN recordings, expected $HOSTN"
 echo "  $GUESTN recordings"
 
+# The broker's own copy of what it runs, in ITS home: /root is 0700, and an
+# unprivileged broker that could read root's staging area would be testing a
+# different machine from the one that ships.
+"$VSSH" "id $BROKER_USER" >/dev/null 2>&1 \
+    || die "broker user $BROKER_USER does not exist in the guest (pw useradd $BROKER_USER -m)"
+BH=$("$VSSH" "getent passwd $BROKER_USER | cut -d: -f6" | tr -d '\r')
+[ -n "$BH" ] || die "no home for $BROKER_USER"
+BW="$BH/e2e"
+"$VSSH" "rm -rf $BW && mkdir -p $BW/rec && cp $BIN/jailed_corpus $BIN/portcullis $BW/ &&
+         cp /root/e2e-rec/*.json $BW/rec/ && chown -R $BROKER_USER $BW" >/dev/null 2>&1 \
+    || die "could not stage the broker's copy in $BW"
+AS_BROKER="su -m $BROKER_USER -c"
+echo "  broker runs as $BROKER_USER (uid $("$VSSH" "id -u $BROKER_USER" | tr -d '\r'))"
+
 # ---- stage 7: the daemon ---------------------------------------------------
 STAGE="daemon"
 say "$STAGE"
@@ -186,7 +205,7 @@ echo "  up on $SOCK"
 STAGE="corpus"
 say "$STAGE  (one jail per document, created by portcullisd)"
 OUT=$("$VSSH" "export PORTCULLIS_SOCKET=$SOCK
-    $BIN/jailed_corpus /root/e2e-rec $APP_ID $BIN/portcullis exec --daemon --instance '{instance}' 2>/dev/null")
+    $AS_BROKER \"$BW/jailed_corpus $BW/rec $APP_ID $BW/portcullis exec --daemon --instance '{instance}' 2>/dev/null\"")
 echo "$OUT" | sed 's/^/  /'
 echo "$OUT" | grep -q '^OK$' || die "corpus run did not report OK"
 # ★ Gate on the NUMBERS, not on the word OK: a run that opened nothing also
@@ -197,8 +216,11 @@ SESS=$(echo "$OUT" | sed -n 's/^\([0-9]*\) sessions.*/\1/p')
 # ---- stage 9: leaks are assertions ----------------------------------------
 STAGE="leaks"
 say "$STAGE"
-LJ=$("$VSSH" "jls name | grep -c navigator_worker" | tr -d ' ')
-LM=$("$VSSH" "mount -p | grep -c navigator_worker" | tr -d ' ')
+# ★ Both name forms: jail(8)-lane org_atrium_navigator_worker__N and jaild-lane
+# app-org-atrium-navigator-worker--N. A pattern for only one of them makes the
+# leak check pass whatever the other lane left behind.
+LJ=$("$VSSH" "jls name | grep -cE 'navigator[-_]worker'" | tr -d ' ')
+LM=$("$VSSH" "mount -p | grep -cE 'navigator[-_]worker'" | tr -d ' ')
 LU=$("$VSSH" "ls /var/run/portcullis-exec 2>/dev/null | wc -l" | tr -d ' ')
 [ "${LJ:-0}" = 0 ] || die "$LJ jails leaked"
 [ "${LM:-0}" = 0 ] || die "$LM mounts leaked"
@@ -219,8 +241,9 @@ say "$STAGE"
 # the output was empty and the case matched nothing. A harness that cannot
 # tell "the product did not refuse" from "I could not ask" is worse than no
 # harness: it manufactures exactly the alarm nobody should ignore.
+"$VSSH" "rm -rf $BW/unsigned && cp -r /root/e2e-unsigned $BW/unsigned && chown -R $BROKER_USER $BW/unsigned" >/dev/null 2>&1
 UNS=$("$VSSH" "export PORTCULLIS_SOCKET=$SOCK
-    $BIN/portcullis exec --daemon --instance u /root/e2e-unsigned < /dev/null 2>&1 | tail -1") \
+    $AS_BROKER \"$BW/portcullis exec --daemon --instance u $BW/unsigned < /dev/null 2>&1 | tail -1\"") \
     || die "could not reach the VM to test the unsigned refusal (transport, not product)"
 [ -n "$UNS" ] || die "the unsigned-bundle check produced NO output — treat as unreached, not as a pass"
 case "$UNS" in
@@ -234,17 +257,27 @@ esac
 # check reported nothing at all rather than failing. A valid OPEN frame plus
 # a held-open pipe keeps it blocked on its next read.
 DUP=$("$VSSH" "export PORTCULLIS_SOCKET=$SOCK
-    F=\$(ls /root/e2e-rec/*.json | head -1); LEN=\$(wc -c < \"\$F\" | tr -d ' ')
+    F=\$(ls $BW/rec/*.json | head -1); LEN=\$(wc -c < \"\$F\" | tr -d ' ')
     ( printf 'OPEN %s\\n' \"\$LEN\"; cat \"\$F\"; sleep 6 ) |
-        $BIN/portcullis exec --daemon --instance dup $APP_ID >/dev/null 2>&1 &
+        $AS_BROKER \"$BW/portcullis exec --daemon --instance dup $APP_ID\" >/dev/null 2>&1 &
     sleep 3
-    $BIN/portcullis exec --daemon --instance dup $APP_ID < /dev/null 2>&1 | tail -1
+    $AS_BROKER \"$BW/portcullis exec --daemon --instance dup $APP_ID\" < /dev/null 2>&1 | tail -1
     wait") \
     || die "could not reach the VM to test the duplicate refusal (transport, not product)"
 [ -n "$DUP" ] || die "the duplicate-instance check produced NO output — treat as unreached, not as a pass"
 case "$DUP" in
     *already\ running*) echo "  duplicate instance refused" ;;
     *) die "a duplicate live instance tag was not refused: $DUP" ;;
+esac
+
+# ★ A ROOT caller must be refused: its worker would run as uid 0 in the jail.
+ROOTC=$("$VSSH" "export PORTCULLIS_SOCKET=$SOCK
+    $BIN/portcullis exec --daemon --instance r $APP_ID < /dev/null 2>&1 | tail -1") \
+    || die "could not reach the VM to test the root refusal (transport, not product)"
+[ -n "$ROOTC" ] || die "the root-caller check produced NO output — treat as unreached, not as a pass"
+case "$ROOTC" in
+    *never\ run\ as\ root*) echo "  root caller refused" ;;
+    *) die "a ROOT caller was not refused: $ROOTC" ;;
 esac
 
 say "PASS  ($GUESTN documents, $GUESTN jails, no leaks, refusals intact)"

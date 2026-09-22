@@ -38,7 +38,7 @@ pub enum BuildError {
 /// every app and every one-shot worker saw the host's entire /dev — raw disks,
 /// mem/kmem, bpf (measured 2026-09-22; a root process in such a jail read the
 /// host's disk). The number now names a ruleset that exists, and callers refuse
-/// to create a jail if it is not loaded (`portcullis_mounts::devfs_ruleset_has_rules`).
+/// to create a jail if it is not loaded (`portcullis_mounts::ensure_devfs_isolation`, and jaild itself).
 pub const APP_DEVFS_RULESET: u32 = 22;
 
 /// Inputs the builder needs that aren't in the manifest.
@@ -115,6 +115,30 @@ pub fn jail_name_for_instance(app_id: &str, instance: Option<&str>) -> String {
             format!("{base}__{tag}")
         }
     }
+}
+
+/// The jaild-lane name for a one-shot instance: `app-<id>--<tag>`.
+///
+/// jaild accepts only `[a-z0-9-]`, a known prefix and at most 64 bytes
+/// (jaild/src/validator.rs), and its one-shot rule trusts an `app-` jail whose
+/// root is exactly `/var/lib/atrium/jails/<name>` — so the name IS the root's
+/// last component, and must be jaild-valid by construction rather than
+/// rejected at the socket. Every other character becomes `-`; the `--`
+/// separates id from tag. `None` when the result would exceed jaild's limit —
+/// refused, never truncated, because a truncated name could collide with
+/// another app's.
+///
+/// ★ Two ids that differ only in punctuation (`org.a-b`, `org.a.b`) map to one
+/// name. A collision is refused as "already running" at creation, never merged.
+pub fn jaild_instance_name(app_id: &str, instance: Option<&str>) -> Option<String> {
+    let clean = |s: &str| -> String {
+        s.chars().map(|c| {
+            let c = c.to_ascii_lowercase();
+            if c.is_ascii_lowercase() || c.is_ascii_digit() { c } else { '-' }
+        }).collect()
+    };
+    let name = format!("app-{}--{}", clean(app_id), clean(instance.unwrap_or("0")));
+    (name.len() <= 64).then_some(name)
 }
 
 /// FreeBSD jail names use dots as hierarchy separators. Atrium app

@@ -33,9 +33,22 @@ pub fn validate_create(
         validate_mount(m, policy)?;
     }
     if let Some(exec) = &req.exec {
-        validate_exec(exec, policy)?;
+        validate_exec(exec, policy, is_instance_root(req, policy))?;
     }
     Ok(())
+}
+
+/// Whether `req` is a one-shot INSTANCE ROOT: an `app-` jail whose root is
+/// exactly `<exec_paths.instance_root_dir>/<name>`. See
+/// `jaild_policy::ExecPaths::instance_root_dir`.
+///
+/// ★ Exact equality, component-wise — not "under the dir". A root one level
+/// deeper, or one whose last component is not the jail's own name, is some
+/// other jail's tree or a path the caller chose, and gets no trust from this.
+pub fn is_instance_root(req: &CreateJailRequest, policy: &Policy) -> bool {
+    let Some(dir) = policy.exec_paths.instance_root_dir.as_deref() else { return false };
+    req.name.starts_with("app-")
+        && std::path::Path::new(&req.path) == std::path::Path::new(dir).join(&req.name)
 }
 
 fn validate_network(net: &NetworkConfig, name: &str, policy: &Policy) -> Result<(), JaildError> {
@@ -300,12 +313,38 @@ fn validate_mount(m: &MountSpec, policy: &Policy) -> Result<(), JaildError> {
     Ok(())
 }
 
-fn validate_exec(exec: &ExecSpec, policy: &Policy) -> Result<(), JaildError> {
-    /* Path prefix allow-list. */
-    if !policy.exec_paths.allowed_prefixes.iter().any(|p| exec.path.starts_with(p)) {
+fn validate_exec(exec: &ExecSpec, policy: &Policy, instance_root: bool) -> Result<(), JaildError> {
+    if instance_root {
+        /* A one-shot's entry: anywhere inside the verified tree it runs in —
+         * but a plain absolute path. execve resolves it after jail_attach, so
+         * it can only name something under the jail root; `..` is refused
+         * anyway so the rule reads the way it behaves. */
+        if !exec.path.starts_with('/')
+            || exec.path.split('/').any(|c| c == "..")
+            || exec.path.contains('\0')
+        {
+            return Err(JaildError::PolicyViolation {
+                rule:   "exec.path.instance_invalid",
+                detail: format!("instance entry {:?} must be an absolute path with no '..'",
+                                exec.path),
+            });
+        }
+    } else if !policy.exec_paths.allowed_prefixes.iter().any(|p| exec.path.starts_with(p)) {
+        /* Path prefix allow-list. */
         return Err(JaildError::PolicyViolation {
             rule:   "exec.path.not_allowed",
             detail: format!("exec path {:?} not in policy.exec_paths.allowed_prefixes", exec.path),
+        });
+    }
+
+    /* ★ Only a one-shot instance takes its caller's stdio. A service's
+     * descriptors are jaild's to choose (a log file); letting any jail be
+     * handed arbitrary descriptors would widen every service's surface for a
+     * feature exactly one lane needs. */
+    if exec.stdio && !instance_root {
+        return Err(JaildError::PolicyViolation {
+            rule:   "exec.stdio.not_instance",
+            detail: "only a one-shot instance root may take the caller's stdio".into(),
         });
     }
 
@@ -518,6 +557,93 @@ mod tests {
         validate_create(&req, &p).unwrap();
     }
 
+    fn instance_req(name: &str, path: &str, entry: &str, stdio: bool) -> CreateJailRequest {
+        CreateJailRequest {
+            name:          name.into(),
+            path:          path.into(),
+            children_max:  0,
+            mounts:        vec![],
+            devfs_ruleset: 22,
+            network:       NetworkConfig::Disable,
+            exec:          Some(ExecSpec {
+                path: entry.into(),
+                argv: vec![entry.rsplit('/').next().unwrap().into()],
+                env:  vec![],
+                uid:  1001,
+                gid:  1001,
+                stdio,
+            }),
+        }
+    }
+
+    /// ★ A one-shot instance root runs its signed tree's entry wherever the
+    /// manifest put it, and may take its caller's stdio.
+    #[test]
+    fn an_instance_root_runs_its_trees_entry_with_caller_stdio() {
+        let p = load_sample_policy();
+        let r = instance_req("app-org-atrium-navigator-worker--1",
+            "/var/lib/atrium/jails/app-org-atrium-navigator-worker--1",
+            "/bin/navigator-worker", true);
+        assert!(is_instance_root(&r, &p));
+        validate_create(&r, &p).unwrap();
+    }
+
+    /// ★★ The trust is for EXACTLY <dir>/<own name>. Anything else — another
+    /// jail's root, a deeper path, a non-app name — falls back to the prefix
+    /// list, and /bin/... is not on it.
+    #[test]
+    fn only_an_exact_instance_root_gets_the_entry_rule() {
+        let p = load_sample_policy();
+        for (name, path) in [
+            ("app-w--1",   "/var/lib/atrium/jails/app-w--2"),        // someone else's root
+            ("app-w--1",   "/var/lib/atrium/jails/app-w--1/sub"),    // deeper
+            ("atrium-w",   "/var/lib/atrium/jails/atrium-w"),        // not an app instance
+        ] {
+            let r = instance_req(name, path, "/bin/navigator-worker", false);
+            assert!(!is_instance_root(&r, &p), "{name} at {path}");
+            match validate_create(&r, &p) {
+                Err(JaildError::PolicyViolation { rule: "exec.path.not_allowed" | "path.not_in_allowlist", .. }) => {}
+                other => panic!("{name} at {path}: {other:?}"),
+            }
+        }
+    }
+
+    /// An instance entry is still a plain absolute path.
+    #[test]
+    fn an_instance_entry_must_be_absolute_without_dotdot() {
+        let p = load_sample_policy();
+        for entry in ["bin/w", "/bin/../../../usr/sbin/w"] {
+            let r = instance_req("app-w--1", "/var/lib/atrium/jails/app-w--1", entry, false);
+            match validate_create(&r, &p) {
+                Err(JaildError::PolicyViolation { rule: "exec.path.instance_invalid", .. }) => {}
+                other => panic!("{entry}: {other:?}"),
+            }
+        }
+    }
+
+    /// ★ Only an instance may take the caller's descriptors: a service asking
+    /// for stdio is refused even with an allowed binary.
+    #[test]
+    fn a_service_may_not_take_caller_stdio() {
+        let p = load_sample_policy();
+        let r = instance_req("atrium-svc", "/var/lib/atrium/jails/atrium-svc",
+            "/usr/local/bin/atrium-svc", true);
+        match validate_create(&r, &p) {
+            Err(JaildError::PolicyViolation { rule: "exec.stdio.not_instance", .. }) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// ★ uid 0 is refused for an instance too — a root caller's worker never
+    /// runs as root in its jail (the decision behind portcullis.md §6.5.4).
+    #[test]
+    fn an_instance_may_not_run_as_root() {
+        let p = load_sample_policy();
+        let mut r = instance_req("app-w--1", "/var/lib/atrium/jails/app-w--1", "/bin/w", true);
+        if let Some(e) = r.exec.as_mut() { e.uid = 0; e.gid = 0; }
+        assert!(validate_create(&r, &p).is_err());
+    }
+
     #[test]
     fn create_request_bad_name_rejected() {
         let p = load_sample_policy();
@@ -654,6 +780,7 @@ mod tests {
             env:  vec![],
             uid:  1001,
             gid:  1001,
+            stdio: false,
         });
         validate_create(&r, &p).unwrap();
     }
@@ -668,6 +795,7 @@ mod tests {
             env:  vec![],
             uid:  1001,
             gid:  1001,
+            stdio: false,
         });
         let err = validate_create(&r, &p).unwrap_err();
         assert!(matches!(err,
@@ -684,6 +812,7 @@ mod tests {
             env:  vec![],
             uid:  1001,
             gid:  1001,
+            stdio: false,
         });
         let err = validate_create(&r, &p).unwrap_err();
         assert!(matches!(err,
@@ -700,6 +829,7 @@ mod tests {
             env:  vec![EnvPair { key: "EVIL_VAR".into(), value: "x".into() }],
             uid:  1001,
             gid:  1001,
+            stdio: false,
         });
         let err = validate_create(&r, &p).unwrap_err();
         assert!(matches!(err,
@@ -719,6 +849,7 @@ mod tests {
             }],
             uid:  1001,
             gid:  1001,
+            stdio: false,
         });
         validate_create(&r, &p).unwrap();
     }
@@ -863,6 +994,7 @@ mod tests {
             env:  vec![],
             uid:  100, // below min_user_uid=1000 and not system
             gid:  100,
+            stdio: false,
         });
         let err = validate_create(&r, &p).unwrap_err();
         assert!(matches!(err,
@@ -876,6 +1008,7 @@ mod tests {
             argv: vec!["atrium-frescod".into()],
             env:  vec![],
             uid, gid,
+            stdio: false,
         });
         r
     }

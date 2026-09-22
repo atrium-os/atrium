@@ -281,6 +281,14 @@ pub struct ExecSpec {
     pub env:  Vec<EnvPair>,
     pub uid:  u32,
     pub gid:  u32,
+    /// ★ The process's stdin/stdout/stderr are the CALLER's: exactly three
+    /// descriptors ride on this request's frame (SCM_RIGHTS, in that order)
+    /// and the child dup2s them onto 0/1/2 instead of jaild's per-jail log.
+    /// How a one-shot worker speaks its protocol to the broker that asked for
+    /// it (portcullis.md §6.5.4). Only an instance root may set it — see
+    /// `jaild_policy::ExecPaths::instance_root_dir`.
+    #[serde(default)]
+    pub stdio: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

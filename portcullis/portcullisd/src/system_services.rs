@@ -459,6 +459,7 @@ impl ServiceManifest {
                     key:   p.key.clone(),
                     value: p.value.clone(),
                 }).collect(),
+                stdio: false,
             }),
         }
     }

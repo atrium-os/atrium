@@ -245,6 +245,7 @@ fn main() -> ExitCode {
                     key:   p.key.clone(),
                     value: p.value.clone(),
                 }).collect(),
+                stdio: false,
             };
             let client = match &mut driver {
                 Driver::Once(c)      => c,

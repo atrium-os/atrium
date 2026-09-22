@@ -80,6 +80,7 @@ fn main() {
             env: vec![EnvPair { key: "PATH".into(), value: "/bin:/usr/bin".into() }],
             uid,
             gid: uid,
+            stdio: false,
         }),
     });
     let mut c = match Client::connect(JAILD_SOCK) {

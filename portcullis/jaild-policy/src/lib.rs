@@ -118,6 +118,16 @@ pub struct DevfsRulesets {
 pub struct ExecPaths {
     #[serde(default)]
     pub allowed_prefixes: Vec<String>,
+    /// ★ One-shot INSTANCE ROOTS (portcullis.md §6.5.4). A jail whose root is
+    /// exactly `<instance_root_dir>/<name>`, with an `app-` name, runs the
+    /// entry of an app tree that portcullis signature-verified and mounted
+    /// there — so its entry may be any absolute path INSIDE that tree, not
+    /// just one under `allowed_prefixes` (which describe where service
+    /// binaries live, and a signed bundle's entry is wherever its manifest
+    /// says). Also the only kind of jail that may take the caller's stdio.
+    /// Absent = rule off.
+    #[serde(default)]
+    pub instance_root_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
