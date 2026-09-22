@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 /// so a property the layout ignores can never be dropped silently (§5.1).
 /// Value-level gaps inside a read row (flex as block, italic without an
 /// italic face, …) are counted where they occur.
-pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 17, 18, 19, 20, 21, 22, 23, 24, 25, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 55, 57, 59, 60, 63, 64];
+pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 55, 57, 59, 60, 63, 64];
 
 pub struct HtmlOut {
     pub scene: Scene,
@@ -204,7 +204,6 @@ impl<'a> Cx<'a> {
         let part = std::mem::take(&mut self.table_part);
         match kw(s, "display") {
             "none" => return 0,
-            "grid" => self.count("display: grid (laid out as block)"),
             "table-row" | "table-cell" if !part => self.count("display: table-row/-cell outside a table (laid out as block)"),
             _ => {}
         }
@@ -292,7 +291,9 @@ impl<'a> Cx<'a> {
         let mut cy = by + bt + pt + std::mem::take(&mut self.content_dy);
         // Children: block-level children stack; runs of inline content
         // between them form anonymous block boxes of line boxes.
-        if kw(s, "display") == "table" {
+        if kw(s, "display") == "grid" {
+            cy += self.grid(h, s, content_x, cy, content_w, child_cb_h);
+        } else if kw(s, "display") == "table" {
             cy += self.table(h, s, content_x, cy, content_w);
         } else if kw(s, "display") == "flex" {
             cy += self.flex(h, s, content_x, cy, content_w, child_cb_h);
@@ -570,6 +571,151 @@ impl<'a> Cx<'a> {
             lines.iter().map(|r| items[r.clone()].iter().map(|i| i.main + i.m_start + i.m_end).sum::<U>()
                 + main_gap * (r.len() as U).saturating_sub(1)).max().unwrap_or(0)
         }
+    }
+
+    /// Grid layout (profile §3.5; CSS Grid without named lines, `subgrid` or
+    /// dense packing — the profile excludes all three). Lays the items out in
+    /// the container's content box at (x, y), `w` wide; returns the height.
+    fn grid(&mut self, h: Handle, s: &Style, x: U, y: U, w: U, cb_h: Option<U>) -> U {
+        use navigator_style::values::{GridLine, Track};
+        let tracks_of = |v: &V| -> Vec<Track> { match v { V::Tracks(t) => t.clone(), _ => vec![] } };
+        let cols_tpl = tracks_of(s.get("grid-template-columns"));
+        let rows_tpl = tracks_of(s.get("grid-template-rows"));
+        let auto_col = match s.get("grid-auto-columns") { V::Track(t) => t.clone(), _ => Track::Auto };
+        let auto_row = match s.get("grid-auto-rows") { V::Track(t) => t.clone(), _ => Track::Auto };
+        let flow_row = kw(s, "grid-auto-flow") != "column";
+        let cgap = len(s.get("column-gap"), w).unwrap_or(0);
+        let rgap = len(s.get("row-gap"), cb_h.unwrap_or(0)).unwrap_or(0);
+
+        struct GItem { h: Handle, col: (usize, usize), row: (usize, usize), justify: String, align: String }
+        let line = |v: &V| -> GridLine { match v { V::Line(l) => *l, _ => GridLine::Auto } };
+        let mut raw = vec![];
+        for c in self.dom.children_of(h) {
+            match self.dom.get(c).map(|n| &n.kind) {
+                Some(Kind::Text(t)) if !t.trim().is_empty() => { self.count("grid: loose text in a grid container (not an item)"); continue }
+                Some(Kind::Element(_)) => {}
+                _ => continue,
+            }
+            let Some(cs) = self.st(c) else { continue };
+            if kw(cs, "display") == "none" { continue }
+            if matches!(kw(cs, "position"), "absolute" | "fixed") { self.count("position: absolute/fixed (skipped)"); continue }
+            let pick = |own: &str, parent: &str| -> String {
+                match kw(cs, own) { "auto" | "" => match kw(s, parent) { "" => "stretch", a => a }, a => a }.to_string()
+            };
+            raw.push((c, line(cs.get("grid-column-start")), line(cs.get("grid-column-end")),
+                      line(cs.get("grid-row-start")), line(cs.get("grid-row-end")),
+                      pick("justify-self", "justify-items"), pick("align-self", "align-items")));
+        }
+        // Placement. A definite line is 1-based; `span n` sizes the area.
+        let span_of = |a: GridLine, b: GridLine| -> (Option<usize>, usize) {
+            match (a, b) {
+                (GridLine::Line(s0), GridLine::Line(e)) if e > s0 => (Some((s0 - 1).max(0) as usize), (e - s0) as usize),
+                (GridLine::Line(s0), GridLine::Span(n)) => (Some((s0 - 1).max(0) as usize), n.max(1) as usize),
+                (GridLine::Line(s0), _) => (Some((s0 - 1).max(0) as usize), 1),
+                (GridLine::Auto, GridLine::Line(e)) if e > 1 => (Some((e - 2).max(0) as usize), 1),
+                (GridLine::Auto, GridLine::Span(n)) => (None, n.max(1) as usize),
+                _ => (None, 1),
+            }
+        };
+        let fixed_len = if flow_row { cols_tpl.len().max(1) } else { rows_tpl.len().max(1) };
+        let mut occupied: Vec<Vec<bool>> = vec![];
+        let mut items: Vec<GItem> = vec![];
+        let (mut cursor_major, mut cursor_minor) = (0usize, 0usize);
+        for (c, cs0, ce, rs, re, justify, align) in raw {
+            let (cstart, cspan) = span_of(cs0, ce);
+            let (rstart, rspan) = span_of(rs, re);
+            // Major axis = the flow axis; minor = the fixed one.
+            let (mut major, mut minor, mspan, nspan) = if flow_row {
+                (rstart, cstart, rspan, cspan)
+            } else {
+                (cstart, rstart, cspan, rspan)
+            };
+            // Auto placement: the first free slot at or after the cursor. A
+            // definite minor position (e.g. a column) still needs a free
+            // MAJOR position searched for it — that is a whole row of items
+            // landing on top of each other if it is skipped.
+            if major.is_none() {
+                let fixed_minor = minor;
+                let (mut mj, mut mn) = (cursor_major, fixed_minor.unwrap_or(cursor_minor));
+                loop {
+                    if mn + nspan > fixed_len {
+                        if fixed_minor.is_some() { mj += 1 } else { mj += 1; mn = 0 }
+                        continue;
+                    }
+                    let free = (0..mspan).all(|a| (0..nspan).all(|b| !*occupied.get(mj + a).and_then(|r: &Vec<bool>| r.get(mn + b)).unwrap_or(&false)));
+                    if free { break }
+                    match fixed_minor { Some(_) => mj += 1, None => mn += 1 }
+                }
+                major = Some(mj); minor = Some(mn);
+                cursor_major = mj; cursor_minor = mn + nspan;
+            }
+            let (mj, mn) = (major.unwrap_or(0), minor.unwrap_or(0));
+            while occupied.len() < mj + mspan { occupied.push(vec![false; fixed_len]) }
+            for a in 0..mspan { for b in 0..nspan {
+                let row = &mut occupied[mj + a];
+                while row.len() <= mn + b { row.push(false) }
+                row[mn + b] = true;
+            } }
+            let (col, row) = if flow_row { ((mn, nspan), (mj, mspan)) } else { ((mj, mspan), (mn, nspan)) };
+            items.push(GItem { h: c, col, row, justify, align });
+        }
+        // Track lists, extended with implicit tracks where items reach past.
+        let need = |tpl: &[Track], auto: &Track, n: usize| -> Vec<Track> {
+            let mut v = tpl.to_vec();
+            while v.len() < n { v.push(auto.clone()) }
+            if v.is_empty() { v.push(auto.clone()) }
+            v
+        };
+        let ncols = items.iter().map(|i| i.col.0 + i.col.1).max().unwrap_or(0).max(cols_tpl.len());
+        let nrows = items.iter().map(|i| i.row.0 + i.row.1).max().unwrap_or(0).max(rows_tpl.len());
+        let coltracks = need(&cols_tpl, &auto_col, ncols);
+        let rowtracks = need(&rows_tpl, &auto_row, nrows);
+        // Column sizes: intrinsic contributions come from single-track items.
+        let mut cmin = vec![0 as U; coltracks.len()];
+        let mut cmax = vec![0 as U; coltracks.len()];
+        for it in &items {
+            if it.col.1 != 1 { continue }
+            let (mn, mx) = self.intrinsic(it.h);
+            let cs = self.st(it.h).expect("styled");
+            let frame = len(cs.get("padding-left"), w).unwrap_or(0) + len(cs.get("padding-right"), w).unwrap_or(0);
+            cmin[it.col.0] = cmin[it.col.0].max(mn + frame);
+            cmax[it.col.0] = cmax[it.col.0].max(mx + frame);
+        }
+        let cols = size_tracks(&coltracks, Some(w), cgap, &cmin, &cmax);
+        // Row sizes: content heights measured at the item's column width.
+        let mut rmin = vec![0 as U; rowtracks.len()];
+        for it in &items {
+            if it.row.1 != 1 { continue }
+            let cw: U = (it.col.0..it.col.0 + it.col.1).map(|i| cols.get(i).copied().unwrap_or(0)).sum::<U>() + cgap * (it.col.1 as U - 1);
+            let hgt = self.measure(it.h, cw, None, (Some(cw), None));
+            rmin[it.row.0] = rmin[it.row.0].max(hgt);
+        }
+        let rows = size_tracks(&rowtracks, cb_h, rgap, &rmin, &rmin);
+        // Place.
+        let pos = |sizes: &[U], gap: U, i: usize| -> U { sizes[..i.min(sizes.len())].iter().sum::<U>() + gap * i as U };
+        for it in &items {
+            let ax = x + pos(&cols, cgap, it.col.0);
+            let ay = y + pos(&rows, rgap, it.row.0);
+            let aw = (it.col.0..it.col.0 + it.col.1).map(|i| cols.get(i).copied().unwrap_or(0)).sum::<U>() + cgap * (it.col.1 as U - 1);
+            let ah = (it.row.0..it.row.0 + it.row.1).map(|i| rows.get(i).copied().unwrap_or(0)).sum::<U>() + rgap * (it.row.1 as U - 1);
+            // A definite specified size wins over the intrinsic one: an empty
+            // box with `width: 40px` is 40 wide, not 0.
+            let specified_w = { let cs = self.st(it.h).expect("styled"); len(cs.get("width"), aw) };
+            let iw = match it.justify.as_str() {
+                "stretch" => specified_w.unwrap_or(aw),
+                _ => specified_w.unwrap_or_else(|| self.intrinsic_outer_w(it.h, aw)).min(aw),
+            };
+            let specified_h = { let cs = self.st(it.h).expect("styled"); match cs.get("height") { V::Kw(_) => None, V::Pct(_) => len(cs.get("height"), ah), v => len(v, 0) } };
+            let ih = match it.align.as_str() {
+                "stretch" => specified_h.unwrap_or(ah),
+                _ => specified_h.unwrap_or_else(|| self.measure(it.h, iw, None, (Some(iw), None))).min(ah),
+            };
+            let dx = match it.justify.as_str() { "end" => aw - iw, "center" => (aw - iw) / 2, _ => 0 };
+            let dy = match it.align.as_str() { "end" => ah - ih, "center" => (ah - ih) / 2, _ => 0 };
+            let forced_h = (it.align == "stretch" || specified_h.is_some()).then_some(ih);
+            self.block(it.h, ax + dx, ay + dy, iw, Some(ah), (Some(iw), forced_h));
+        }
+        rows.iter().sum::<U>() + rgap * (rows.len() as U).saturating_sub(1)
     }
 
     /// Table layout, separate borders (profile §3.9: `border-collapse` is
@@ -1130,8 +1276,8 @@ mod tests {
 
     #[test]
     fn unimplemented_layout_is_counted_not_faked() {
-        let o = render(r#"<style>.f { display: grid } .p { position: absolute }</style><div class="f">a</div><div class="p">b</div>"#);
-        assert!(o.unimplemented.contains_key("display: grid (laid out as block)"));
+        let o = render(r#"<style>.f { display: inline-block } .p { position: absolute }</style><span class="f">a</span><div class="p">b</div>"#);
+        assert!(o.unimplemented.contains_key("inline-block (skipped)"));
         assert!(o.unimplemented.contains_key("position: absolute/fixed (skipped)"));
     }
 
@@ -1157,6 +1303,59 @@ mod tests {
         let ew = boxes(&without, 0xff0000ff)[0].2;
         assert_eq!(ew, 50, "control: two empty items share the shrink equally");
         assert!(aw > 50, "the word keeps its item from shrinking to 50 (got {aw})");
+    }
+
+    #[test]
+    fn grid_places_sizes_and_spans() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 620px; grid-template-columns: 100px 1fr 1fr; column-gap: 10px; row-gap: 5px }
+            .g > div { height: 20px }
+            .a { background-color: #ff0000 } .b { background-color: #00ff00 } .c { background-color: #0000ff }
+            .d { background-color: #ffff00; grid-column-start: 2; grid-column-end: span 2 }</style>
+            <div class="g"><div class="a"></div><div class="b"></div><div class="c"></div><div class="d"></div></div>"#);
+        // 620 = 100 + 2×10 gaps + two fr tracks of 250 each.
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 100, 20)]);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(110, 0, 250, 20)]);
+        assert_eq!(boxes(&o, 0x0000ffff), vec![(370, 0, 250, 20)]);
+        // Second row, spanning both fr columns and the gap between them.
+        assert_eq!(boxes(&o, 0xffff00ff), vec![(110, 25, 510, 20)]);
+    }
+
+    #[test]
+    fn grid_stretches_auto_tracks() {
+        // `none` template: one implicit `auto` column, which must grow to the
+        // container width (Grid §12.8) or the item is invisible.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 300px; grid-template-columns: none }
+            .g > div { height: 10px; background-color: #ff0000 }</style>
+            <div class="g"><div></div></div>"#);
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 300, 10)]);
+        // Two auto tracks share it, minus the gap.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 310px; column-gap: 10px; grid-template-columns: auto auto }
+            .g > div { height: 10px; background-color: #ff0000 }</style>
+            <div class="g"><div></div><div></div></div>"#);
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 150, 10), (160, 0, 150, 10)]);
+        // Control: an `fr` track takes the free space instead, and the fixed
+        // track beside it keeps its own width.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 300px; grid-template-columns: 100px 1fr }
+            .g > div { height: 10px; background-color: #ff0000 }</style>
+            <div class="g"><div></div><div></div></div>"#);
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 100, 10), (100, 0, 200, 10)]);
+    }
+
+    #[test]
+    fn grid_alignment_and_auto_rows() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 300px; grid-template-columns: 150px 150px; grid-auto-rows: 60px; align-items: center; justify-items: end }
+            .g > div { width: 40px; height: 20px; background-color: #ff0000 }
+            /* stretch applies only to an AUTO size (CSS Box Alignment); with a
+               specified 40×20 it would behave as start. */
+            .g > .s { align-self: stretch; justify-self: stretch; background-color: #00ff00; width: auto; height: auto }</style>
+            <div class="g"><div></div><div class="s"></div></div>"#);
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(110, 20, 40, 20)], "end + centre inside a 150×60 area");
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(150, 0, 150, 60)], "stretch fills its area");
     }
 
     #[test]
@@ -1206,4 +1405,50 @@ fn edge(t: U, sx: U, sy: U, length: U, horiz: bool, style: &str, rgba: u32) -> V
         }
         _ => vec![seg(0, length, 0)],
     }
+}
+
+/// Size one axis of a grid: bases from the track kinds and the items'
+/// intrinsic contributions, then `fr` shares whatever space is left.
+fn size_tracks(tracks: &[navigator_style::values::Track], avail: Option<U>, gap: U, mins: &[U], maxs: &[U]) -> Vec<U> {
+    use navigator_style::values::Track;
+    fn base(t: &Track, avail: Option<U>, mn: U, mx: U) -> U {
+        match t {
+            Track::Len(l) => u(l.v),
+            Track::Pct(p) => avail.map(|a| u(a as f64 / PX as f64 * p / 100.0)).unwrap_or(0),
+            Track::Fr(_) => 0,
+            Track::MinContent => mn,
+            Track::MaxContent | Track::Auto => mx,
+            Track::MinMax(a, b) => base(a, avail, mn, mx).max(base(b, avail, mn, mx).min(avail.unwrap_or(U::MAX))),
+        }
+    }
+    let mut sizes: Vec<U> = tracks.iter().enumerate()
+        .map(|(i, t)| base(t, avail, mins.get(i).copied().unwrap_or(0), maxs.get(i).copied().unwrap_or(0))).collect();
+    let fr: f64 = tracks.iter().map(|t| match t { Track::Fr(f) => *f, _ => 0.0 }).sum();
+    if fr > 0.0 {
+        if let Some(a) = avail {
+            let used: U = sizes.iter().sum::<U>() + gap * (tracks.len() as U).saturating_sub(1);
+            let free = (a - used).max(0);
+            for (i, t) in tracks.iter().enumerate() {
+                if let Track::Fr(f) = t { sizes[i] = u(free as f64 / PX as f64 * f / fr) }
+            }
+        }
+    } else if let Some(a) = avail {
+        // Grid §12.8 "Stretch auto Tracks". The profile admits no
+        // content-distribution property for a grid container (§3.5), so the
+        // distribution is always the initial `normal` and auto-max tracks
+        // always share what is left over. Without this an implicit `auto`
+        // column (`grid-template-columns: none`) is zero wide and every item
+        // in it disappears.
+        let is_auto = |t: &Track| match t { Track::Auto => true, Track::MinMax(_, b) => matches!(**b, Track::Auto), _ => false };
+        let auto: Vec<usize> = tracks.iter().enumerate().filter(|(_, t)| is_auto(t)).map(|(i, _)| i).collect();
+        if !auto.is_empty() {
+            let used: U = sizes.iter().sum::<U>() + gap * (tracks.len() as U).saturating_sub(1);
+            let free = (a - used).max(0);
+            let share = free / auto.len() as U;
+            for (n, &i) in auto.iter().enumerate() {
+                sizes[i] += if n + 1 == auto.len() { free - share * (auto.len() as U - 1) } else { share };
+            }
+        }
+    }
+    sizes
 }

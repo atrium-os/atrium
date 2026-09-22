@@ -980,7 +980,7 @@ layout.
 
 ### 8.3 M2 progress — the number, first reading (2026-09-22)
 
-**CONFORMANCE: exercised 46/64, matched 42/64** (13 on first reading; see the updates
+**CONFORMANCE: exercised 52/64, matched 48/64** (13 on first reading; see the updates
 below). Printed by `nsg-conformance`; the
 matched set is pinned by a test so it cannot fall silently.
 
@@ -1143,6 +1143,30 @@ leaves a width `auto` is refused with a diagnostic and not laid out**
 - The two dotted-border goldens changed **notation only** (`r96` → `r96,96,96,96`),
   proven by diffing with the radius fields stripped before re-blessing — after a first
   attempt compared them through the MARKDOWN renderer and showed an empty scene.
+
+**Update — grid, matched 42 → 48 (rows 26-31), exercised 46 → 52.**
+- Placement is one pass over the items in document order: a definite line is honoured,
+  everything else is auto-placed at the first free slot at or after the cursor.
+  **A definite MINOR position still needs its MAJOR axis searched** — skipping that
+  search stacked a whole row of items on top of each other at row 0.
+- Track sizing: bases by track kind (length, percentage, `min-content`, `max-content`,
+  `auto`, `minmax()`, `repeat()`), then `fr` shares the free space.
+- **Grid §12.8 "Stretch auto Tracks" applies unconditionally.** The profile admits no
+  content-distribution property for a grid container (§3.5 has no grid `justify-content`),
+  so the distribution is always the initial `normal`. Without this rule an implicit
+  `auto` column — `grid-template-columns: none`, the row's own initial value — is zero
+  wide and **every item in it is invisible**, which is what the first render of the
+  fixture showed.
+- Alignment: `justify-items`/`align-items` with `-self` overrides. **A definite specified
+  size beats the intrinsic one** — an empty `width: 40px` item was being aligned as if it
+  were 0 wide.
+- Two of the faults found in review were in the TESTS, not the layout: `stretch` was
+  expected to override a specified size (CSS applies it only to `auto`), and `.g > div`
+  out-specified `.s`. A fixture that cannot show what it certifies is a fault:
+  `29-grid-lines` needed a third explicit row before a two-row span was more than a
+  claim, and it was settled by reading 54 px out of the NSG, not by looking at it.
+- The review PNGs were first rasterized from the `.nsg` files instead of the fixtures,
+  which renders the golden's TEXT as a document. It looks like a render. It is not one.
 
 ## 9. What this reuses
 

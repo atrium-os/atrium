@@ -1,0 +1,14 @@
+<html><body>
+<style>.g { display: grid; width: 420px; margin-bottom: 12px; background-color: #f6f8fa; column-gap: 6px; row-gap: 6px } .g > div { height: 24px; background-color: #0969da } .g > .x { background-color: #cf222e }
+.n { grid-template-columns: none } .len { grid-template-columns: 100px 200px } .pct { grid-template-columns: 25% 25% }
+.fr { grid-template-columns: 1fr 2fr } .mm { grid-template-columns: minmax(60px, 120px) 1fr } .rep { grid-template-columns: repeat(4, 1fr) }
+.mc { grid-template-columns: min-content max-content 1fr; color: #ffffff } .rows { grid-template-columns: 120px; grid-template-rows: 40px 16px }</style>
+<div class="g n"><div></div><div class="x"></div></div>
+<div class="g len"><div></div><div class="x"></div></div>
+<div class="g pct"><div></div><div class="x"></div></div>
+<div class="g fr"><div></div><div class="x"></div></div>
+<div class="g mm"><div></div><div class="x"></div></div>
+<div class="g rep"><div></div><div class="x"></div><div></div><div class="x"></div></div>
+<div class="g mc"><div>min</div><div class="x">max content here</div><div></div></div>
+<div class="g rows"><div></div><div class="x"></div></div>
+</body></html>
