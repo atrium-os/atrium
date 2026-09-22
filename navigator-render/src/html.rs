@@ -5,10 +5,10 @@
 //! outer height is margin-top + height + margin-bottom, always, and the
 //! next block starts right after it.
 //!
-//! ★ WHAT IS NOT LAID OUT YET IS COUNTED, NOT FAKED. Inline-blocks are
-//! skipped and counted, as is loose text directly inside a flex or grid
-//! container. `unimplemented` is the list of what the conformance number
-//! cannot yet claim.
+//! ★ WHAT IS NOT LAID OUT YET IS COUNTED, NOT FAKED. `unimplemented` is the
+//! list of what the conformance number cannot yet claim — today: background
+//! images, italic (no italic face ships), and the value-level gaps noted
+//! where they occur. Every `display` value in the profile is laid out.
 
 use crate::fontset::{Family, FontSet};
 use crate::{scale, Link, Rect, Report, Run, Scene, Shaper, Style as FontStyle, PX, U};
@@ -168,7 +168,10 @@ enum Item { Word(String, FontStyle, Line), Space(FontStyle, Line), Break,
             Tab(FontStyle, Line),
             /// Preserved spaces (pre-wrap): placed like a word, but they HANG
             /// at a line end instead of wrapping.
-            PreSpace(String, FontStyle, Line) }
+            PreSpace(String, FontStyle, Line),
+            /// An atomic inline: an `inline-block`, which wraps like one word
+            /// and is laid out as a block once its place on the line is known.
+            Atomic(Handle, FontStyle, Line) }
 
 /// Per-item line metrics and decoration.
 #[derive(Clone, Copy)]
@@ -222,6 +225,17 @@ impl<'a> Cx<'a> {
     /// `force` = (border-box width, border-box height) imposed by a flex
     /// container on its item; `None` lets the box size itself.
     fn block(&mut self, h: Handle, x: U, y: U, cb_w: U, cb_h: Option<U>, force: (Option<U>, Option<U>)) -> U {
+        // ★ A TEXT handle here is an anonymous block box: a run of loose text
+        // inside a flex or grid container, which CSS wraps in an anonymous
+        // item. It has no style of its own — it inherits, and since it paints
+        // no background or border, using the container's style is exactly
+        // right (CSS 2 §9.2.1.1: anonymous boxes inherit, nothing else).
+        if matches!(self.dom.get(h).map(|n| &n.kind), Some(Kind::Text(_))) {
+            let Some(ps) = self.dom.get(h).and_then(|n| n.parent).and_then(|p| self.st(p)) else { return 0 };
+            let mut items = vec![];
+            self.collect_inline(h, &mut items, ps);
+            return self.lines(items, x, y, force.0.unwrap_or(cb_w), ps);
+        }
         let Some(s) = self.st(h) else { return 0 };
         let part = std::mem::take(&mut self.table_part);
         match kw(s, "display") {
@@ -516,8 +530,7 @@ impl<'a> Cx<'a> {
         let found = self.baseline_probe.take().flatten();
         self.baseline_probe = saved;
         found.unwrap_or_else(|| {
-            let cs = self.st(h).expect("styled");
-            outer - len(cs.get("margin-bottom"), cb_w).unwrap_or(0)
+            outer - self.st(h).and_then(|cs| len(cs.get("margin-bottom"), cb_w)).unwrap_or(0)
         })
     }
 
@@ -551,7 +564,20 @@ impl<'a> Cx<'a> {
         let mut items: Vec<It> = vec![];
         for c in self.dom.children_of(h) {
             match self.dom.get(c).map(|n| &n.kind) {
-                Some(Kind::Text(t)) if !t.trim().is_empty() => { self.count("flex: loose text in a flex container (not an item)"); continue }
+                // ★ CSS wraps a run of loose text in an ANONYMOUS item. It
+                // has no style of its own, so every flex property takes its
+                // initial value: no grow, shrink 1, basis from the content,
+                // no margins, and the container's `align-items`.
+                Some(Kind::Text(t)) if !t.trim().is_empty() => {
+                    let base = self.content_main(c, row, w);
+                    let min = if row { self.intrinsic(c).0 } else { base };
+                    items.push(It { h: c, base, hypo: base.max(min), grow: 0.0, shrink: 1.0, min, max: U::MAX,
+                                    main: base.max(min), cross: 0, m_start: 0, m_end: 0, c_start: 0, c_end: 0,
+                                    align: match kw(s, "align-items") { "flex-start" | "start" => "start", "flex-end" | "end" => "end",
+                                                                        "center" => "center", "baseline" => "baseline", _ => "stretch" },
+                                    cross_auto: true });
+                    continue;
+                }
                 Some(Kind::Element(_)) => {}
                 _ => continue,
             }
@@ -694,7 +720,7 @@ impl<'a> Cx<'a> {
                 // The item's own margins are applied here, so it is placed
                 // with them zeroed: lay out at the margin box's corner minus
                 // the margin the block would add.
-                let (ml, mt) = { let cs = self.st(i.h).expect("styled"); (len(cs.get("margin-left"), w).unwrap_or(0), len(cs.get("margin-top"), w).unwrap_or(0)) };
+                let (ml, mt) = self.st(i.h).map(|cs| (len(cs.get("margin-left"), w).unwrap_or(0), len(cs.get("margin-top"), w).unwrap_or(0))).unwrap_or((0, 0));
                 self.block(i.h, ix - ml, iy - mt, fw + ml, None, (Some(fw), Some(fh)));
                 mpos = m0 + i.main + i.m_end + main_gap + between;
             }
@@ -728,7 +754,14 @@ impl<'a> Cx<'a> {
         let mut raw = vec![];
         for c in self.dom.children_of(h) {
             match self.dom.get(c).map(|n| &n.kind) {
-                Some(Kind::Text(t)) if !t.trim().is_empty() => { self.count("grid: loose text in a grid container (not an item)"); continue }
+                // ★ CSS wraps a run of loose text in an ANONYMOUS item: no
+                // style, so it is auto-placed in one cell and aligned by the
+                // container alone.
+                Some(Kind::Text(t)) if !t.trim().is_empty() => {
+                    let g = |p: &str| match kw(s, p) { "" => "stretch".to_string(), a => a.to_string() };
+                    raw.push((c, GridLine::Auto, GridLine::Auto, GridLine::Auto, GridLine::Auto, g("justify-items"), g("align-items")));
+                    continue;
+                }
                 Some(Kind::Element(_)) => {}
                 _ => continue,
             }
@@ -813,8 +846,7 @@ impl<'a> Cx<'a> {
         for it in &items {
             if it.col.1 != 1 { continue }
             let (mn, mx) = self.intrinsic(it.h);
-            let cs = self.st(it.h).expect("styled");
-            let frame = len(cs.get("padding-left"), w).unwrap_or(0) + len(cs.get("padding-right"), w).unwrap_or(0);
+            let frame = self.st(it.h).map(|cs| len(cs.get("padding-left"), w).unwrap_or(0) + len(cs.get("padding-right"), w).unwrap_or(0)).unwrap_or(0);
             cmin[it.col.0] = cmin[it.col.0].max(mn + frame);
             cmax[it.col.0] = cmax[it.col.0].max(mx + frame);
         }
@@ -837,12 +869,12 @@ impl<'a> Cx<'a> {
             let ah = (it.row.0..it.row.0 + it.row.1).map(|i| rows.get(i).copied().unwrap_or(0)).sum::<U>() + rgap * (it.row.1 as U - 1);
             // A definite specified size wins over the intrinsic one: an empty
             // box with `width: 40px` is 40 wide, not 0.
-            let specified_w = { let cs = self.st(it.h).expect("styled"); len(cs.get("width"), aw) };
+            let specified_w = self.st(it.h).and_then(|cs| len(cs.get("width"), aw));
             let iw = match it.justify.as_str() {
                 "stretch" => specified_w.unwrap_or(aw),
                 _ => specified_w.unwrap_or_else(|| self.intrinsic_outer_w(it.h, aw)).min(aw),
             };
-            let specified_h = { let cs = self.st(it.h).expect("styled"); match cs.get("height") { V::Kw(_) => None, V::Pct(_) => len(cs.get("height"), ah), v => len(v, 0) } };
+            let specified_h = self.st(it.h).and_then(|cs| match cs.get("height") { V::Kw(_) => None, V::Pct(_) => len(cs.get("height"), ah), v => len(v, 0) });
             let ih = match it.align.as_str() {
                 "stretch" => specified_h.unwrap_or(ah),
                 _ => specified_h.unwrap_or_else(|| self.measure(it.h, iw, None, (Some(iw), None))).min(ah),
@@ -944,15 +976,42 @@ impl<'a> Cx<'a> {
     /// a row, its laid-out height in a column), as a border-box size.
     fn content_main(&mut self, h: Handle, row: bool, cb_w: U) -> U {
         if row { self.intrinsic_outer_w(h, cb_w) } else {
-            let cs = self.st(h).expect("styled");
-            let m = len(cs.get("margin-top"), cb_w).unwrap_or(0) + len(cs.get("margin-bottom"), cb_w).unwrap_or(0);
+            let m = self.st(h).map(|cs| len(cs.get("margin-top"), cb_w).unwrap_or(0) + len(cs.get("margin-bottom"), cb_w).unwrap_or(0)).unwrap_or(0);
             self.measure(h, cb_w, None, (None, None)) - m
         }
     }
 
     /// Max-content border-box width of `h` (its width if definite).
+    /// Margin-box width of an atomic inline: its border box (a specified
+    /// `width` INCLUDES padding and border here — border-box is the profile's
+    /// fixed rule) plus its horizontal margins. `cb_w` of 0 asks for the
+    /// intrinsic answer, which is what `intrinsic` needs.
+    fn atomic_outer_w(&mut self, h: Handle, cb_w: U) -> U {
+        let Some(cs) = self.st(h) else { return 0 };
+        let px = |p: &str| len(cs.get(p), cb_w).unwrap_or(0);
+        let (ml, mr) = (px("margin-left"), px("margin-right"));
+        let border = |side: &str| if kw(cs, &format!("border-{side}-style")) == "none" { 0 } else { px(&format!("border-{side}-width")) };
+        let frame = px("padding-left") + px("padding-right") + border("left") + border("right");
+        let mut bw = match cs.get("width") {
+            V::Kw("min-content") => self.intrinsic(h).0 + frame,
+            V::Kw("max-content") => self.intrinsic(h).1 + frame,
+            V::Kw(_) => {
+                // Shrink-to-fit inside what the line has room for.
+                let avail = (cb_w - ml - mr - frame).max(0);
+                let (mn, mx) = self.intrinsic(h);
+                frame + if cb_w > 0 { mx.min(avail).max(mn.min(avail)) } else { mx }
+            }
+            v => len(v, cb_w).unwrap_or(0),
+        };
+        if let Some(m) = len(cs.get("max-width"), cb_w) { bw = bw.min(m) }
+        if let Some(m) = len(cs.get("min-width"), cb_w) { bw = bw.max(m) }
+        bw.max(frame) + ml + mr
+    }
+
     fn intrinsic_outer_w(&mut self, h: Handle, cb_w: U) -> U {
-        let cs = self.st(h).expect("styled");
+        // An anonymous block box around loose text has no style and no box
+        // decoration: its outer width IS its content width.
+        let Some(cs) = self.st(h) else { return self.intrinsic(h).1.min(cb_w.max(0)) };
         if let Some(wd) = len(cs.get("width"), cb_w) { return wd }
         let b = |side: &str| if kw(cs, &format!("border-{side}-style")) == "none" { 0 } else { len(cs.get(&format!("border-{side}-width")), 0).unwrap_or(0) };
         let frame = len(cs.get("padding-left"), cb_w).unwrap_or(0) + len(cs.get("padding-right"), cb_w).unwrap_or(0) + b("left") + b("right");
@@ -965,10 +1024,15 @@ impl<'a> Cx<'a> {
     /// collecting them (link table, counters) rolled back.
     fn intrinsic(&mut self, h: Handle) -> (U, U) {
         let (links, counts) = (self.links.len(), self.unimplemented.clone());
-        let Some(s) = self.st(h) else { return (0, 0) };
         let (mut mn, mut mx) = (0, 0);
         let mut items = vec![];
-        for c in self.dom.children_of(h) {
+        // An anonymous block box around a run of loose text (see `block`).
+        let anon = matches!(self.dom.get(h).map(|n| &n.kind), Some(Kind::Text(_)));
+        let s = match if anon { self.dom.get(h).and_then(|n| n.parent).and_then(|p| self.st(p)) } else { self.st(h) } {
+            Some(s) => s, None => return (0, 0),
+        };
+        if anon { self.collect_inline(h, &mut items, s) }
+        for c in if anon { vec![] } else { self.dom.children_of(h) } {
             if self.is_block_level(c) {
                 let Some(cs) = self.st(c) else { continue };
                 let px = |p: &str| len(cs.get(p), 0).unwrap_or(0);
@@ -992,6 +1056,11 @@ impl<'a> Cx<'a> {
                     line += w;
                 }
                 Item::Space(st, _) => line += self.sh.shape(" ", st, &mut self.report).iter().map(|p| p.width).sum::<U>(),
+                Item::Atomic(ah, ..) => {
+                    let w = self.atomic_outer_w(*ah, 0);
+                    mn = mn.max(w);
+                    line += w;
+                }
                 Item::Tab(st, l) => {
                     let sp: U = self.sh.shape(" ", st, &mut self.report).iter().map(|p| p.width).sum();
                     let stop = (sp * l.tab as U).max(1);
@@ -1048,7 +1117,8 @@ impl<'a> Cx<'a> {
                 let Some(s) = self.st(h) else { return };
                 match kw(s, "display") {
                     "none" => return,
-                    "inline-block" => { self.count("inline-block (skipped)"); return }
+                    // An atomic inline: measured and placed by `lines`.
+                    "inline-block" => { let (st, l) = self.font_style(s); out.push(Item::Atomic(h, st, l)); return }
                     _ => {}
                 }
                 if tag == "br" { out.push(Item::Break); return }
@@ -1057,7 +1127,7 @@ impl<'a> Cx<'a> {
                 for c in self.dom.children_of(h) { self.collect_inline(c, out, s) }
                 if let Some(li) = link {
                     for it in &mut out[before..] {
-                        if let Item::Word(_, st, _) | Item::Space(st, _) = it { st.link = Some(li) }
+                        if let Item::Word(_, st, _) | Item::Space(st, _) | Item::Atomic(_, st, _) = it { st.link = Some(li) }
                     }
                 }
             }
@@ -1144,7 +1214,13 @@ impl<'a> Cx<'a> {
             if outside { outside_marker = Some((text, st)) }
             else { items.insert(0, Item::Space(st.clone(), line)); items.insert(0, Item::Word(text, st, line)) }
         }
-        struct Placed { x: U, st: FontStyle, line: Line, pieces: Vec<crate::Piece>, gap: bool }
+        struct Placed { x: U, st: FontStyle, line: Line, pieces: Vec<crate::Piece>, gap: bool,
+                        /// How far this item advances the line: the shaped
+                        /// width, or an atomic inline's margin-box width.
+                        adv: U,
+                        /// An atomic inline: (handle, border-box width,
+                        /// baseline from its top margin edge, outer height).
+                        atomic: Option<(Handle, U, U, U)> }
         let mut lines: Vec<Vec<Placed>> = vec![vec![]];
         // Whether each line was ended by a forced break (never justified).
         let mut forced: Vec<bool> = vec![false];
@@ -1169,8 +1245,29 @@ impl<'a> Cx<'a> {
                     // ★ Preserved spaces HANG at a line end (pre-wrap): they
                     // never push the line past the edge, and never wrap.
                     if cx + ww > w && !lines.last().expect("line").is_empty() { pending = None; continue }
-                    lines.last_mut().expect("line").push(Placed { x: cx, st, line: l, pieces, gap: false });
+                    lines.last_mut().expect("line").push(Placed { x: cx, st, line: l, pieces, gap: false, adv: ww, atomic: None });
                     cx += ww;
+                    pending = None;
+                }
+                Item::Atomic(ah, st, l) => {
+                    // An atomic inline wraps as ONE unbreakable unit; it is
+                    // sized against the line, then laid out for real only
+                    // once alignment has fixed where the line starts.
+                    let adv = self.atomic_outer_w(ah, w);
+                    let cs = self.st(ah).expect("styled");
+                    let (ml, mr) = (len(cs.get("margin-left"), w).unwrap_or(0), len(cs.get("margin-right"), w).unwrap_or(0));
+                    let bw = (adv - ml - mr).max(0);
+                    let sw = match (&pending, lines.last().map(|l| l.is_empty())) {
+                        (Some((ps, _)), Some(false)) => self.sh.shape(" ", ps, &mut self.report).iter().map(|p| p.width).sum(),
+                        _ => 0,
+                    };
+                    let wrap = cx + sw + adv > w && !lines.last().expect("line").is_empty();
+                    if wrap { lines.push(vec![]); forced.push(false); cx = 0 } else { cx += sw }
+                    let asc = self.baseline(ah, w, (Some(bw), None));
+                    let outer_h = self.measure(ah, w, None, (Some(bw), None));
+                    lines.last_mut().expect("line").push(Placed { x: cx, st, line: l, pieces: vec![], gap: !wrap && sw > 0,
+                                                                  adv, atomic: Some((ah, bw, asc, outer_h)) });
+                    cx += adv;
                     pending = None;
                 }
                 Item::Word(text, st, l) => {
@@ -1198,7 +1295,7 @@ impl<'a> Cx<'a> {
                             let chunk: String = chars[i..j].iter().collect();
                             let pieces = self.sh.shape(&chunk, &st, &mut self.report);
                             let cw: U = pieces.iter().map(|p| p.width).sum();
-                            lines.last_mut().expect("line").push(Placed { x: cx, st: st.clone(), line: l, pieces, gap: false });
+                            lines.last_mut().expect("line").push(Placed { x: cx, st: st.clone(), line: l, pieces, gap: false, adv: cw, atomic: None });
                             cx += cw;
                             i = j;
                             if i < chars.len() { lines.push(vec![]); forced.push(false); cx = 0 }
@@ -1207,7 +1304,7 @@ impl<'a> Cx<'a> {
                         continue;
                     }
                     if ww > w { self.report.overflow_lines += 1 }
-                    lines.last_mut().expect("line").push(Placed { x: cx, st, line: l, pieces, gap: !wrap && sw > 0 });
+                    lines.last_mut().expect("line").push(Placed { x: cx, st, line: l, pieces, gap: !wrap && sw > 0, adv: ww, atomic: None });
                     cx += ww;
                     pending = None;
                 }
@@ -1221,10 +1318,21 @@ impl<'a> Cx<'a> {
                 let (st, l) = self.font_style(block);
                 let _ = st; yy += l.lh; continue
             }
-            let lh = line.iter().map(|p| p.line.lh).max().unwrap_or(0);
-            let base = line.iter().map(|p| { let (a, d) = self.sh.asc_desc(&p.st); (p.line.lh - a - d) / 2 + a }).max().unwrap_or(0);
+            // Ascent above the baseline and descent below it, per item: for
+            // text, half-leading around the font's own metrics; for an atomic
+            // inline, its baseline and what is under it (CSS 2 §10.8).
+            let metrics: Vec<(U, U)> = line.iter().map(|p| match p.atomic {
+                Some((_, _, asc, outer)) => (asc, outer - asc),
+                None => { let (a, d) = self.sh.asc_desc(&p.st); let asc = (p.line.lh - a - d) / 2 + a; (asc, p.line.lh - asc) }
+            }).collect();
+            let base = metrics.iter().map(|m| m.0).max().unwrap_or(0);
+            // The line box holds every item: at least each item's own line
+            // height, and always enough for the tallest ascent plus the
+            // deepest descent.
+            let lh = line.iter().map(|p| if p.atomic.is_some() { 0 } else { p.line.lh }).max().unwrap_or(0)
+                .max(base + metrics.iter().map(|m| m.1).max().unwrap_or(0));
             let last = line.last().expect("non-empty");
-            let used = last.x + last.pieces.iter().map(|p| p.width).sum::<U>();
+            let used = last.x + last.adv;
             // ★ justify: the free space goes into the collapsible spaces of
             // every line except the block's last and those ended by <br>.
             // Integer division; the remainder goes one unit at a time to the
@@ -1262,6 +1370,12 @@ impl<'a> Cx<'a> {
                 // already fixed), nothing is painted, and hidden text is not
                 // hit-testable, so it contributes no link region either.
                 if p.line.hidden { continue }
+                if let Some((ah, bw, asc, _)) = p.atomic {
+                    // Its margin-box origin: the baseline of this line, minus
+                    // the box's own baseline.
+                    self.block(ah, px, yy + base - asc, w, None, (Some(bw), None));
+                    px += p.adv;
+                }
                 for piece in &p.pieces {
                     self.scene.run(Run { face: piece.face, size: p.st.size, rgba: p.st.rgba, x: px, y: yy + base, em: p.st.em,
                                          glyphs: piece.glyphs.clone(), text: piece.text.clone() });
@@ -1413,8 +1527,61 @@ mod tests {
 
     #[test]
     fn unimplemented_layout_is_counted_not_faked() {
-        let o = render(r#"<style>.f { display: inline-block }</style><span class="f">a</span>"#);
-        assert!(o.unimplemented.contains_key("inline-block (skipped)"));
+        // A property the layout reads but cannot paint is still counted.
+        let o = render(r#"<style>div { background-image: linear-gradient(#ff0000, #00ff00) }</style><div>x</div>"#);
+        assert!(o.unimplemented.contains_key("background-image (not painted)"), "{:?}", o.unimplemented);
+    }
+
+    #[test]
+    fn loose_text_becomes_an_anonymous_flex_item() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .f { display: flex; width: 400px; column-gap: 10px }
+            .i { width: 50px; height: 12px; background-color: #ff0000 }</style>
+            <div class="f">loose<div class="i"></div></div>"#);
+        // The control: the same text wrapped in an explicit item. An
+        // anonymous item must place the red box in exactly the same spot.
+        let c = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .f { display: flex; width: 400px; column-gap: 10px }
+            .i { width: 50px; height: 12px; background-color: #ff0000 }</style>
+            <div class="f"><div>loose</div><div class="i"></div></div>"#);
+        assert_eq!(boxes(&o, 0xff0000ff), boxes(&c, 0xff0000ff));
+        assert_eq!(o.scene.runs[0].x, c.scene.runs[0].x);
+        assert_eq!(boxes(&o, 0xff0000ff).len(), 1);
+        assert!(boxes(&o, 0xff0000ff)[0].0 > 0, "the box follows the text, it does not start the line");
+    }
+
+    #[test]
+    fn an_inline_block_sits_on_the_baseline_and_raises_the_line() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            p { font-size: 16px; line-height: 20px; margin-top: 0px }
+            .ib { display: inline-block; width: 60px; height: 30px; background-color: #ff0000 }
+            .after { background-color: #00ff00; width: 40px; height: 8px }</style>
+            <p>a<span class="ib"></span>b</p><div class="after"></div>"#);
+        let ib = boxes(&o, 0xff0000ff);
+        assert_eq!(ib.len(), 1);
+        assert_eq!((ib[0].2, ib[0].3), (60, 30), "it keeps its own size");
+        // An empty inline-block has no line box of its own, so its baseline
+        // is its bottom margin edge: it sits ON the text baseline.
+        let baseline = o.scene.runs[0].y;
+        assert_eq!(ib[0].1 * 64 + 30 * 64, baseline, "bottom edge on the baseline");
+        // The text after it is on the same line, to its right.
+        assert!(o.scene.runs[1].x >= (ib[0].0 + 60) * 64, "the text after follows the box");
+        // The line box grew to hold it: the next block starts below.
+        assert!(boxes(&o, 0x00ff00ff)[0].1 >= 30, "line grew past the 20px line-height");
+    }
+
+    #[test]
+    fn an_inline_block_wraps_as_one_unit() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            p { width: 100px; font-size: 16px }
+            .ib { display: inline-block; width: 80px; height: 10px; background-color: #ff0000 }</style>
+            <p>wordy<span class="ib"></span></p>"#);
+        let ib = boxes(&o, 0xff0000ff);
+        // It does not fit beside the word, and it does not break: it wraps
+        // whole onto the next line.
+        assert_eq!(ib.len(), 1);
+        assert_eq!(ib[0].0, 0, "at the start of the second line");
+        assert!(ib[0].1 * 64 > o.scene.runs[0].y, "below the first line");
     }
 
     #[test]

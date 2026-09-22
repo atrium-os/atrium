@@ -980,7 +980,7 @@ layout.
 
 ### 8.3 M2 progress — the number, first reading (2026-09-22)
 
-**CONFORMANCE: exercised 54/64, matched 51/64** (13 on first reading; see the updates
+**CONFORMANCE: exercised 54/64, matched 52/64** (13 on first reading; see the updates
 below). Printed by `nsg-conformance`; the
 matched set is pinned by a test so it cannot fall silently.
 
@@ -1200,6 +1200,32 @@ leaves a width `auto` is refused with a diagnostic and not laid out**
 - A test that used `div div` proved nothing for a while: the profile does not admit the
   descendant combinator, so the rule was refused and every box stayed static. **Read the
   diagnostics before reading the result.**
+
+**Update — inline-block and anonymous items, matched 51 → 52 (row 1, `display`).**
+Every `display` value the profile admits is now laid out; nothing in §3.3 is counted.
+- **`inline-block` is an atomic inline**: it wraps as one unbreakable unit, is sized
+  shrink-to-fit against what the line has room for, and is laid out as a block only once
+  alignment has fixed where its line starts. Its baseline is its last line box's, or its
+  bottom margin edge when it has none — so an EMPTY inline-block sits ON the text
+  baseline, which is the case the test pins.
+- The line box now takes the tallest ascent plus the deepest descent, not just the
+  largest `line-height`, or an inline-block taller than the text would overlap the block
+  after it.
+- **Loose text in a flex or grid container becomes an anonymous item**, which CSS
+  requires and documents rely on. The implementation is one line of insight rather than a
+  synthetic node: a TEXT handle reaching `block()` IS an anonymous block box, laid out
+  with its parent's style. That is exactly right, because an anonymous box inherits and
+  paints no background or border of its own (CSS 2 §9.2.1.1) — and `intrinsic`,
+  `measure` and `baseline` then work on it unchanged.
+- The test for it is an equivalence: the same text wrapped in an explicit `<div>` must
+  place the next item at the identical coordinates. It does.
+- Anonymous boxes have no style, so six `expect("styled")` sites became explicit
+  "no decoration" fallbacks.
+- ★ The row-1 fixture certified nothing for months: every value rendered as a bare line
+  of text, so `flex`, `grid`, `table` and `inline-block` were indistinguishable from
+  `block` in the picture. Rewritten so each value is visible — which immediately showed
+  two empty flex items 0 px wide. That was the FIXTURE (an empty `width: auto` item in a
+  row really is 0 wide), not the layout.
 
 ## 9. What this reuses
 

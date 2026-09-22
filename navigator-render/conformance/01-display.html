@@ -1,7 +1,18 @@
 <html><body>
 <style>
-.b { display: block; background-color: #ddf4ff } .i { display: inline; color: #cf222e } .ib { display: inline-block }
-.f { display: flex } .g { display: grid } .t { display: table } .tc2 { width: 120px } .tr { display: table-row } .tc { display: table-cell } .n { display: none }
-</style><div class="b">block <span class="i">inline</span></div><div class="f">flex</div><div class="g">grid</div>
-<div class="t"><div class="tr"><div class="tc tc2">cell</div></div></div><div class="n">hidden</div><div><span class="ib">ib</span></div>
+.b { display: block; background-color: #ddf4ff; margin-bottom: 8px }
+.i { display: inline; color: #cf222e }
+.ib { display: inline-block; width: 90px; height: 20px; background-color: #0969da; color: #ffffff }
+.f { display: flex; column-gap: 8px; background-color: #f6f8fa; margin-bottom: 8px }
+.g { display: grid; grid-template-columns: 120px 60px; column-gap: 8px; background-color: #f6f8fa; margin-bottom: 8px }
+.cell { width: 60px; height: 18px; background-color: #2da44e } .cell2 { width: 60px; height: 18px; background-color: #8250df }
+.t { display: table; margin-bottom: 8px } .tr { display: table-row } .tc { display: table-cell; width: 110px; background-color: #fff8c5 }
+.n { display: none }
+</style>
+<div class="b">block, full width, with an <span class="i">inline</span> span in its own colour</div>
+<div>text before <span class="ib">inline-block</span> text after</div>
+<div class="f">loose<div class="cell"></div><div class="cell2"></div></div>
+<div class="g">loose<div class="cell"></div><div class="cell2"></div></div>
+<div class="t"><div class="tr"><div class="tc">cell one</div><div class="tc">cell two</div></div></div>
+<div class="n">display: none — never painted</div>
 </body></html>
