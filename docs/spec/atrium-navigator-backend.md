@@ -948,6 +948,36 @@ discovered live, so each arm walks what the network served at that minute.
 Cross-building `ring` needs a C compiler for the target: Homebrew clang with
 `--target=aarch64-unknown-freebsd --sysroot=sysroot` (see `navigator-fetch/Cargo.toml`).
 
+### 8.2 M2 — plan (2026-09-22)
+
+**The renderer's input is a profile-conformant document, not a web page.** The profile
+(atrium-document-profile-v1.md §6) puts tolerance in a separate, jailed **normalizer**;
+the renderer is strict, and anything outside the profile is a diagnostic with a source
+position (§5.1), never a silent recovery. So M2 is two things: a strict renderer, and
+**a curated conformance suite**.
+
+**The number.** The denominator is the profile's **64 property rows** (§3.3–§3.9). A row
+counts as *exercised* when fixtures cover all its admitted values, and as *matched* when
+those fixtures' NSG equals a reviewed golden. The report prints both counts, never a
+green tick.
+
+**Built in layers, each raising the number:**
+1. **M2.1 `navigator-style`:**
+   - a CSS tokenizer and parser (own code: the profile's grammar is small, and the parser
+     is a hostile-input surface whose bounds we want to own; `cssparser` is MPL-2.0,
+     case-by-case under the licensing policy);
+   - the 64-row value grammar;
+   - admitted selectors (no descendant combinator);
+   - diagnostics with positions;
+   - then cascade (UA layer, author source order, specificity within a layer), inheritance,
+     initial values, and computed style.
+2. **M2.2:** block and inline layout with the fixed box rules (`border-box`, no margin
+   collapsing, no floats), and paint of backgrounds and borders into NSG.
+3. **M2.3+:** flex, grid, tables, the remaining paint rows, and the semantic tree (§4).
+
+The M0 Markdown path stays; it becomes one more input grammar in front of the same
+layout.
+
 ## 9. What this reuses
 
 Almost none of this is new infrastructure; it is composition, which is the point of the
