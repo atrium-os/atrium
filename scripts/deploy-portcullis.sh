@@ -90,6 +90,18 @@ for f in "$BSD/portcullis/jaild/etc/atrium-jaild" \
         && printf '  %-34s ok\n' "$(basename "$f")" || { printf '  %-34s COPY FAILED\n' "$(basename "$f")"; rc=1; }
 done
 
+echo "=== devfs rulesets -> /usr/local/etc/atrium/devfs.rules ==="
+# ★★ Before any daemon starts: jaild and portcullis refuse a jail whose devfs
+# ruleset has no rules (portcullis.md §9.1b), so deploying the daemons without
+# the rules would fail every service that asks for 20/21/22 — correctly, but
+# for a reason this script can prevent. Loaded now and on every boot.
+scp $SSHOPT -P 2222 "$BSD/etc/atrium.devfs.rules" root@localhost:/root/atrium.devfs.rules >/dev/null 2>&1 \
+  && g 'mkdir -p /usr/local/etc/atrium &&
+        install -m 644 /root/atrium.devfs.rules /usr/local/etc/atrium/devfs.rules &&
+        sysrc -q devfs_rulesets="/etc/defaults/devfs.rules /etc/devfs.rules /usr/local/etc/atrium/devfs.rules" >/dev/null &&
+        service devfs restart >/dev/null &&
+        for id in 20 21 22; do [ -n "$(devfs rule -s $id show)" ] || exit 1; done' >/dev/null 2>&1 \
+  && echo "  rulesets 20 21 22 loaded" || { echo "  devfs rulesets FAILED to load"; rc=1; }
 echo "=== config -> /etc/atrium ==="
 g 'mkdir -p /etc/atrium/services.d /var/db/atrium /var/log/atrium' >/dev/null 2>&1
 scp $SSHOPT -P 2222 "$BSD/etc/jaild.policy.toml" "$BSD/etc/volumes.policy.toml" \
