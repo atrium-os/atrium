@@ -5,3 +5,4 @@ edition = "2021"
 description = "M2.1: the Atrium Document Profile's CSS — tokenizer, strict parser, the 64-row property grammar, admitted selectors, diagnostics with positions."
 
 [dependencies]
+navigator-dom = { path = "../navigator-dom" }
