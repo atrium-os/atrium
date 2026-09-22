@@ -351,6 +351,12 @@ pub enum NetworkConfig {
     /// host end joins interface group `atrium`, where pf blocks app->host and
     /// app->app; jaild refuses this unless those rules are loaded.
     Routed { mac: String },
+    /// An own stack with ONLY a working loopback (the `loopback` capability):
+    /// vnet=new, its own `lo0` up on 127.0.0.1/::1, nothing else — no
+    /// interface to the host or anything beyond it. Configured before the app
+    /// runs (the same create-persistent → configure → attach sequence as
+    /// `Routed`); no /30, no pf needed, since there is no path out.
+    Loopback,
     /// A specific 127.x.x.x address aliased on the host's lo0.
     /// `addr` is in CIDR form (e.g. "127.10.0.5/32"). Must
     /// match (CIDR-contained-in) one of

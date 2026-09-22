@@ -857,10 +857,10 @@ fn handle_create(
      * configured, and only then does a child attach and exec. The plain exec
      * path creates and attaches in one step in the child, which would start
      * the app before its network existed. */
-    let pre_created = if let NetworkConfig::Routed { mac } = &req.network {
-        Some(create_routed(req, mac, state, state_path)?)
-    } else {
-        None
+    let pre_created = match &req.network {
+        NetworkConfig::Routed { mac } => Some(create_routed(req, mac, state, state_path)?),
+        NetworkConfig::Loopback => Some(create_loopback(req)?),
+        _ => None,
     };
 
     if let Some(exec) = &req.exec {
@@ -999,6 +999,38 @@ fn release_routed(jail_name: &str, state: &mut PersistentState, state_path: &Pat
     }
 }
 
+/// The (persistent, for now) jail for `Loopback`: an own vnet whose lo0 is
+/// brought up before anything runs. Returns the jid.
+fn create_loopback(req: &CreateJailRequest) -> Result<i32, JaildError> {
+    let sys = |name: &'static str, e: std::io::Error| JaildError::Syscall {
+        name, errno: e.raw_os_error().unwrap_or(-1), msg: format!("{e}"),
+    };
+    let jid = ffi::create_persistent_jail(&isolated_spec(req)).map_err(|e| sys("jail_set", e))?.jid;
+    if let Err(e) = crate::routed::configure_loopback(&req.name) {
+        let _ = ffi::remove_jail(jid);
+        return Err(sys("ifconfig", e));
+    }
+    info!("jaild: loopback-only stack for {} jid={jid}", req.name);
+    Ok(jid)
+}
+
+/// The persistent vnet=new jail both pre-networked modes start from.
+fn isolated_spec(req: &CreateJailRequest) -> JailCreateSpec<'_> {
+    JailCreateSpec {
+        name:          &req.name,
+        path:          &req.path,
+        persist:       1,   // until a process is in it; cleared after the exec
+        children_max:  req.children_max as i32,
+        devfs_ruleset: req.devfs_ruleset,
+        ip4_addr:      None,
+        ip4_inherit:   false,
+        isolated:      true, // vnet=new
+        hostname:      req.hostname.as_deref().unwrap_or(&req.name),
+        hostid:        req.hostid,
+        hostuuid:      req.hostuuid.as_deref(),
+    }
+}
+
 /// Build a Routed jail's network and the (persistent, for now) jail around it.
 /// Returns the jid. Every failure unwinds what was made before it.
 fn create_routed(
@@ -1012,20 +1044,7 @@ fn create_routed(
         name, errno: e.raw_os_error().unwrap_or(-1), msg: format!("{e}"),
     };
     let (slot, a, b) = allocate_host_end()(state)?;
-    let spec = JailCreateSpec {
-        name:          &req.name,
-        path:          &req.path,
-        persist:       1,   // until a process is in it; cleared after the exec
-        children_max:  req.children_max as i32,
-        devfs_ruleset: req.devfs_ruleset,
-        ip4_addr:      None,
-        ip4_inherit:   false,
-        isolated:      true, // vnet=new; the epair end is moved in next
-        hostname:      req.hostname.as_deref().unwrap_or(&req.name),
-        hostid:        req.hostid,
-        hostuuid:      req.hostuuid.as_deref(),
-    };
-    let jid = match ffi::create_persistent_jail(&spec) {
+    let jid = match ffi::create_persistent_jail(&isolated_spec(req)) {
         Ok(c) => c.jid,
         Err(e) => { let _ = routed::destroy(&a); return Err(sys("jail_set", e)); }
     };

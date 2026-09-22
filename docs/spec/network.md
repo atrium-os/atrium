@@ -141,8 +141,13 @@ passes including the refusal stage the livelock had killed.
 **Correction:** commit 28bc210a's message quotes "E2E 98/259/259/0", but that harness run had
 FAILED at its refusals stage (the livelock above cut ssh); only the corpus stage had passed.
 
-**Still open:** the one-shot `loopback` capability (refused on that lane), and step 5
-(atrium-netd per-app anchors).
+**One-shot `loopback` — DONE.** jaild `NetworkConfig::Loopback`: an own vnet whose `lo0` is
+brought up (127.0.0.1, ::1, short MSL) before the app runs, via the same
+create-persistent → configure → attach sequence as `Routed`; no /30, no pf needed. Verified with a
+signed loopback one-shot: interfaces `lo0` only, a TCP round-trip over 127.0.0.1 works, the
+outside is unreachable, nothing left afterwards.
+
+**Still open:** step 5 (atrium-netd per-app anchors).
 
 ## 1. Principle
 

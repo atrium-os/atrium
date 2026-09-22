@@ -219,10 +219,11 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         Err(e) => return OneShot::Failed(format!("build: {e}")),
     };
     // ★★ What this lane cannot express is REFUSED, never dropped. jaild's
-    // CreateJail carries nullfs mounts, a devfs ruleset and no network; a
+    // CreateJail carries nullfs mounts and a devfs ruleset, but no per-jail
+    // devfs grants; a
     // capability needing more would otherwise run without it and report
     // success.
-    let mounts = match jaild_mounts(&jc, &jail_path, manifest.capabilities.network) {
+    let mounts = match jaild_mounts(&jc, &jail_path) {
         Ok(m) => m,
         Err(e) => return OneShot::Refused(e),
     };
@@ -378,21 +379,13 @@ fn passwd_name(uid: u32) -> Option<String> {
 /// grants (per-mount devfs rules) and any network — never dropped: a
 /// capability that silently does not apply is a worker running without what
 /// its manifest says it has.
-fn jaild_mounts(jc: &portcullis_jail::JailConfig, root: &Path,
-                network: Option<portcullis_toml::NetworkCap>)
+fn jaild_mounts(jc: &portcullis_jail::JailConfig, root: &Path)
     -> Result<Vec<jaild::protocol::MountSpec>, String>
 {
     use jaild::protocol::{MountKind, MountSpec};
     if !jc.devfs_actions.is_empty() {
         return Err("device capabilities are not supported on the one-shot lane yet \
                     (jaild cannot apply per-jail devfs grants)".into());
-    }
-    // ★ Decided from the manifest's capability, not by pattern-matching the
-    // rendered jail params. `full` is served (as a Routed stack — see
-    // jaild_network); `loopback` is not yet: Isolated keeps lo0 down, and a
-    // loopback worker would silently have none.
-    if matches!(network, Some(portcullis_toml::NetworkCap::Loopback)) {
-        return Err("the loopback network capability is not supported on the one-shot lane yet".into());
     }
     jc.mounts.iter().map(|m| {
         if m.fstype != "nullfs" {
@@ -419,6 +412,8 @@ fn jaild_network(cap: Option<portcullis_toml::NetworkCap>, id: &portcullis_ident
     match cap {
         Some(portcullis_toml::NetworkCap::Full) =>
             jaild::protocol::NetworkConfig::Routed { mac: id.mac.clone() },
+        Some(portcullis_toml::NetworkCap::Loopback) =>
+            jaild::protocol::NetworkConfig::Loopback,
         _ => jaild::protocol::NetworkConfig::Isolated,
     }
 }

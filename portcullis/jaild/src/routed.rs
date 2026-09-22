@@ -99,6 +99,16 @@ pub fn configure_app_end(jail: &str, b: &str, mac: &str, slot: u32) -> io::Resul
     Ok(())
 }
 
+/// Bring up a jail's OWN loopback (127.0.0.1/8 and ::1) — the whole network
+/// of a `loopback`-capability jail. Short MSL for the same reason as a routed
+/// stack: its TIME_WAIT would only keep the dying jail pinned.
+pub fn configure_loopback(jail: &str) -> io::Result<()> {
+    sh("ifconfig", &["-j", jail, "lo0", "inet", "127.0.0.1/8", "up"])?;
+    sh("ifconfig", &["-j", jail, "lo0", "inet6", "::1/128"])?;
+    sh("sysctl", &["-j", jail, "net.inet.tcp.msl=1000"])?;
+    Ok(())
+}
+
 /// Destroy the pair (destroying either end destroys both).
 pub fn destroy(a: &str) -> io::Result<()> {
     sh("ifconfig", &[a, "destroy"]).map(|_| ())

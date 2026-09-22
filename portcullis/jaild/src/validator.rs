@@ -98,6 +98,9 @@ fn validate_network(net: &NetworkConfig, name: &str, policy: &Policy) -> Result<
         /* Isolated: an own vnet with nothing in it — strictly less than
          * Disable exposes, so always permitted. */
         NetworkConfig::Isolated => Ok(()),
+        /* Loopback: an own vnet whose only live interface is its own lo0 —
+         * nothing reachable beyond the jail, so always permitted. */
+        NetworkConfig::Loopback => Ok(()),
         /* Routed: the MAC must be the derived kind — locally administered
          * unicast — so a caller cannot hand a jail the real NIC's address
          * (portcullis.md §9.1c). pf being loaded is checked at create time,
