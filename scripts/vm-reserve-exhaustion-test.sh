@@ -48,7 +48,8 @@ HANGDUMP=${HANGDUMP:-}
 
 KO="$BSD/atrium-tessera/kmod/tessera_fs.ko"
 KMOD=$(shasum -a 256 "$KO" | cut -c1-16)
-k=$($VSSH "sha256 -q /boot/kernel/tessera_fs.ko | cut -c1-16" 2>/dev/null | tr -d '\r')
+. "$BSD/scripts/lib/guest-ident.sh"   # GUEST_KMOD_HASH: the LOADED module, only on Laminar/RLC/tessera root
+k=$($VSSH "$GUEST_KMOD_HASH" 2>/dev/null | tr -d '\r')
 echo "=== RESERVE-EXHAUSTION TEST $(date) guest_kmod=$k tree_kmod=$KMOD secs=$SECS part_mb=${PART_MB:-256} workload=${WORKLOAD:-bulk} starve=${STARVE:-0} slow_reclaim=${SLOW_RECLAIM:-0} trigger=${TRIGGER:-0} ==="
 [ "$k" = "$KMOD" ] || echo "NOTE: guest module differs from the tree (baseline run against an older kmod?)"
 

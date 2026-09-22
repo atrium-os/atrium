@@ -39,7 +39,8 @@ VSSH="$BSD/scripts/vssh"
 
 KO="$BSD/atrium-tessera/kmod/tessera_fs.ko"
 KMOD=$(shasum -a 256 "$KO" | cut -c1-16)
-k=$($VSSH "sha256 -q /boot/kernel/tessera_fs.ko | cut -c1-16" 2>/dev/null | tr -d '\r')
+. "$BSD/scripts/lib/guest-ident.sh"   # GUEST_KMOD_HASH: the LOADED module, only on Laminar/RLC/tessera root
+k=$($VSSH "$GUEST_KMOD_HASH" 2>/dev/null | tr -d '\r')
 echo "=== GC CAS-INVALIDATE TEST $(date) guest_kmod=$k tree_kmod=$KMOD n=$N ==="
 [ "$k" = "$KMOD" ] || echo "NOTE: guest module differs from the tree (A/B against an older kmod?)"
 

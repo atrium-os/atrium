@@ -59,7 +59,8 @@ relaunch(){
 GATE="diskinfo -s $DEV | grep -q '^atrium-scratch\$' || { echo REFUSING_ident; exit 2; }"
 
 wait_ready || exit 1
-k=$($VSSH "sha256 -q /boot/kernel/tessera_fs.ko | cut -c1-16" | tr -d '\r')
+. "$BSD/scripts/lib/guest-ident.sh"   # GUEST_KMOD_HASH: the LOADED module, only on Laminar/RLC/tessera root
+k=$($VSSH "$GUEST_KMOD_HASH" | tr -d '\r')
 [ "$k" = "$KMOD" ] || { echo "ABORT: guest module [$k] != tree [$KMOD]"; exit 1; }
 echo "=== REPLAY-REFUSAL TEST $(date) kmod=$KMOD ==="
 

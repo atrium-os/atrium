@@ -28,7 +28,8 @@ VSSH="$BSD/scripts/vssh"
 KO="$BSD/atrium-tessera/kmod/tessera_fs.ko"
 [ -f "$KO" ] || { echo "no $KO — build it first"; exit 1; }
 KMOD=$(shasum -a 256 "$KO" | cut -c1-16)
-k=$($VSSH "sha256 -q /boot/kernel/tessera_fs.ko | cut -c1-16" 2>/dev/null | tr -d '\r')
+. "$BSD/scripts/lib/guest-ident.sh"   # GUEST_KMOD_HASH: the LOADED module, only on Laminar/RLC/tessera root
+k=$($VSSH "$GUEST_KMOD_HASH" 2>/dev/null | tr -d '\r')
 [ "$k" = "$KMOD" ] || { echo "ABORT: guest module [$k] != tree [$KMOD]"; exit 1; }
 
 echo "=== SPARSE-EXTEND TEST $(date) kmod=$KMOD ==="

@@ -78,7 +78,7 @@ arm(){ # label prefix trust rep
   [ -s /root/rmr.err ] && { echo "   rm errors by kind:"; sed -E 's#/mnt/scratch/sys/[^:]*#PATH#' /root/rmr.err | sort | uniq -c | sort -rn | head -4 | sed 's/^/     /'; }
   [ "$fs" != 0 ] && { echo "   fsck:"; grep -iE "dangling|problem|error|corrupt" /root/fsck.$1.$4.out | head -4 | sed 's/^/     /'; }
 }
-echo "=== rm-race $(date) kmod=$(sha256 -q /boot/kernel/tessera_fs.ko | cut -c1-16) ==="
+echo "=== rm-race $(date) kmod=$(sha256 -q "$(kldstat -v | sed -n 's/.* tessera_fs.ko (\(.*\))$/\1/p' | head -1)" | cut -c1-16) ==="
 arm old 0 0 1
 arm old 0 0 2
 arm new 1 1 1

@@ -67,7 +67,8 @@ slowssh() {
         -p 2222 root@localhost "$@"
 }
 
-k=$($VSSH "sha256 -q /boot/kernel/tessera_fs.ko | cut -c1-16" 2>/dev/null | tr -d '\r')
+. "$BSD/scripts/lib/guest-ident.sh"   # GUEST_KMOD_HASH: the LOADED module, only on Laminar/RLC/tessera root
+k=$($VSSH "$GUEST_KMOD_HASH" 2>/dev/null | tr -d '\r')
 [ "$k" = "$KMOD" ] || { echo "ABORT: guest module [$k] != tree [$KMOD]"; exit 1; }
 echo "=== LOOKUP-DEADLOCK SOAK $(date) kmod=$KMOD dur=${DURATION}s ==="
 echo "    traversals=$TRAVERSALS churners=$CHURNERS dirs=$DIRS files=$FILES -> $OUT"

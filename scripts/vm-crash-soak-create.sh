@@ -56,7 +56,8 @@ relaunch(){
 GATE="diskinfo -s $DEV | grep -q '^atrium-scratch\$' || { echo REFUSING_ident; exit 2; }"
 
 wait_ready || exit 1
-k=$($VSSH "sha256 -q /boot/kernel/tessera_fs.ko | cut -c1-16" | tr -d '\r')
+. "$BSD/scripts/lib/guest-ident.sh"   # GUEST_KMOD_HASH: the LOADED module, only on Laminar/RLC/tessera root
+k=$($VSSH "$GUEST_KMOD_HASH" | tr -d '\r')
 [ "$k" = "$KMOD" ] || { echo "ABORT: guest module [$k] != expected [$KMOD]"; exit 1; }
 echo "=== CREATE-SOAK $(date) kmod=$KMOD cycles=$CYCLES kernel=$($VSSH 'uname -i' | tr -d '\r') ==="
 
@@ -89,8 +90,10 @@ c=1; while [ $c -le $CYCLES ]; do
   case "$out" in *MOUNT_FAIL*|*REFUSING*) echo "cycle $c: MOUNT FAILED [$out]"; fail=$((fail+1));; esac
   echo "cycle $c: $out— POWER CUT"
   if ! relaunch; then echo "  cycle $c: BOOT FAILED"; fail=$((fail+1)); break; fi
+  # Re-prove after EVERY cut: a boot can fall back to another kernel or root.
+  k=$($VSSH "$GUEST_KMOD_HASH" 2>/dev/null | tr -d '\r')
+  [ "$k" = "$KMOD" ] || { echo "  cycle $c: ABORT — not our code after the cut [$k]"; exit 1; }
   res=$($VSSH "$GATE
-    [ \$(sha256 -q /boot/kernel/tessera_fs.ko | cut -c1-16) = $KMOD ] || echo WRONG_KMOD
     mount -t tessera $DEV $M 2>/dev/null || echo MOUNT_FAIL
     n=\$(find $M 2>/dev/null | wc -l | tr -d ' ')
     # ★ fsck only if the umount SUCCEEDED: a live-volume fsck invents
@@ -99,7 +102,7 @@ c=1; while [ $c -le $CYCLES ]; do
     tessera-fsck $DEV > /root/c.fsck 2>&1
     echo \"entries=\$n fsck_problems=\$(grep -ciE 'dangling|orphan|nlink|leaked|overlap|missing|neither|corrupt|problem' /root/c.fsck)\"" 2>/dev/null | tr -d '\r' | tr '\n' ' ')
   case "$res" in
-    *WRONG_KMOD*|*REFUSING*) echo "  cycle $c: ABORT [$res]"; exit 1;;
+    *REFUSING*) echo "  cycle $c: ABORT [$res]"; exit 1;;
     *MOUNT_FAIL*) echo "  cycle $c: RECOVERY MOUNT FAILED [$res]"; fail=$((fail+1));;
     *"fsck_problems=0 "*) echo "  cycle $c: fsck CLEAN $res";;
     *) echo "  cycle $c: FSCK-DIRTY $res"; $VSSH "grep -iE 'dangling|orphan|nlink|leaked|missing|neither|corrupt|problem|result' /root/c.fsck | head -6" 2>/dev/null | sed 's/^/     /'; fail=$((fail+1)); [ $fail -ge 3 ] && { echo "stopping after 3"; break; };;

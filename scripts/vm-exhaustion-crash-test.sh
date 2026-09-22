@@ -50,7 +50,8 @@ power_cut_and_relaunch() {
 KO="$BSD/atrium-tessera/kmod/tessera_fs.ko"
 KMOD=$(shasum -a 256 "$KO" | cut -c1-16)
 wait_ready || { echo "FAIL — VM not reachable"; exit 1; }
-k=$(timeout 20 $VSSH "sha256 -q /boot/kernel/tessera_fs.ko | cut -c1-16" 2>/dev/null | tr -d '\r')
+. "$BSD/scripts/lib/guest-ident.sh"   # GUEST_KMOD_HASH: the LOADED module, only on Laminar/RLC/tessera root
+k=$(timeout 20 $VSSH "$GUEST_KMOD_HASH" 2>/dev/null | tr -d '\r')
 echo "=== EXHAUSTION CRASH TEST $(date) guest_kmod=$k tree_kmod=$KMOD cuts=$CUTS warmup=${WARMUP}s poll=${POLL}s max_wait=${MAX_WAIT}s $ENVS ==="
 [ "$k" = "$KMOD" ] || echo "NOTE: guest module differs from the tree (baseline run against an older kmod?)"
 

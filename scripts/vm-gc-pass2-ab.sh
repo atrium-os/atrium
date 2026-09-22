@@ -42,7 +42,7 @@ arm() {   # $1 = arm label, $2 = prefix knob value
 	echo "   whole-pass: rd_ops=$(( $(S disk_rd_ops)-ro0 )) rd_MiB=$(( ($(S disk_rd_bytes)-rb0)/1048576 ))"
 }
 
-echo "=== #133 A/B start $(date) kmod=$(sha256 -q /boot/kernel/tessera_fs.ko | cut -c1-16) ==="
+echo "=== #133 A/B start $(date) kmod=$(sha256 -q "$(kldstat -v | sed -n 's/.* tessera_fs.ko (\(.*\))$/\1/p' | head -1)" | cut -c1-16) ==="
 echo "volume: $(df -h / | tail -1)"
 echo "--- Phase A: false-dead check (control first) ---"
 seed A

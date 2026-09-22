@@ -33,7 +33,8 @@ power_cut_and_relaunch() {
 }
 
 wait_ready || { echo "FAIL — VM not reachable"; exit 1; }
-k=$(timeout 20 $VSSH "sha256 -q /boot/kernel/tessera_fs.ko | cut -c1-16" 2>/dev/null | tr -d '\r')
+. "$BSD/scripts/lib/guest-ident.sh"   # GUEST_KMOD_HASH: the LOADED module, only on Laminar/RLC/tessera root
+k=$(timeout 20 $VSSH "$GUEST_KMOD_HASH" 2>/dev/null | tr -d '\r')
 echo "=== UNLINKED-ORPHAN CRASH TEST $(date) guest_kmod=$k rounds=$ROUNDS N=$N ==="
 
 r=1

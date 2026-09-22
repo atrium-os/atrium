@@ -30,7 +30,8 @@ for f in guest-wedge-probe.sh guest-reserve-exhaustion.sh; do
     timeout 60 scp $SSHO -P 2222 "$BSD/scripts/$f" root@localhost:/root/$f >/dev/null \
         || { echo "FAIL — could not copy $f"; exit 1; }
 done
-echo "=== WEDGE PROBE $(date) kmod=$(timeout 20 $VSSH 'sha256 -q /boot/kernel/tessera_fs.ko | cut -c1-16' | tr -d '\r') STARVE=$STARVE PART_MB=$PART_MB NDEL=$NDEL ==="
+. "$BSD/scripts/lib/guest-ident.sh"   # GUEST_KMOD_HASH: the LOADED module, only on Laminar/RLC/tessera root
+echo "=== WEDGE PROBE $(date) kmod=$(timeout 20 $VSSH "$GUEST_KMOD_HASH" | tr -d '\r') STARVE=$STARVE PART_MB=$PART_MB NDEL=$NDEL ==="
 timeout 3300 $VSSH "STARVE=$STARVE PART_MB=$PART_MB NDEL=$NDEL WAIT_S=$WAIT_S sh /root/guest-wedge-probe.sh" 2>&1 | tr -d '\r'
 timeout 30 $VSSH "sysctl kern.tessera.pinscan_late_snaps kern.tessera.pinscan_late_snap_fail \
     kern.tessera.epoch_snap_birth_kept kern.tessera.flush_retry_armed \

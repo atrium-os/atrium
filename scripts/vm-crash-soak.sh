@@ -61,10 +61,16 @@ relaunch(){
 }
 GATE="diskinfo -s $DEV | grep -q '^atrium-scratch\$' || { echo REFUSING_ident; exit 2; }"
 
+# ★★ What is RUNNING, re-proved after EVERY cut — not a file on disk, once.
+# The loaded module's hash, on Laminar with RLC on and a Tessera root; a boot
+# that falls back to anything else aborts the soak. See lib/guest-ident.sh.
+. "$BSD/scripts/lib/guest-ident.sh"   # GUEST_IDENT, ident_ok
+IDENT=$GUEST_IDENT
+
 wait_ready || exit 1
-k=$($VSSH 'sha256 -q /boot/kernel/tessera_fs.ko | cut -c1-16' | tr -d '\r')
-[ "$k" = "$KMOD" ] || { echo "ABORT: guest module [$k] != expected [$KMOD]"; exit 1; }
-echo "=== SOAK $(date) kmod=$KMOD cycles=$CYCLES per=$PER kernel=$($VSSH 'uname -i; sysctl -n kern.sched.name' | tr '\n' '/') ==="
+id=$($VSSH "$IDENT" | tr -d '\r')
+ident_ok "$id" || { echo "ABORT: not running our code — expected kmod=$KMOD on Laminar/RLC/tessera-root, got [$id]"; exit 1; }
+echo "=== SOAK $(date) cycles=$CYCLES per=$PER $id ==="
 
 $VSSH "$GATE; mount | grep -q ' $M ' && umount $M; mkdir -p $M
   mkfs-tessera $DEV >/dev/null 2>&1 && mount -t tessera $DEV $M || { echo mkfs_fail; exit 3; }
@@ -95,8 +101,9 @@ c=1; while [ $c -le $CYCLES ]; do
   # ---- the cut
   if ! relaunch; then echo "  cycle $c: BOOT FAILED after cut"; bootfail=$((bootfail+1)); fail=$((fail+1)); break; fi
   # ---- recovery + oracle
+  id=$($VSSH "$IDENT" 2>/dev/null | tr -d '\r')
+  ident_ok "$id" || { echo "  cycle $c: ABORT — booted something that is not our code [$id]"; exit 1; }
   res=$($VSSH "$GATE
-    [ \$(sha256 -q /boot/kernel/tessera_fs.ko | cut -c1-16) = $KMOD ] || echo WRONG_KMOD
     mount -t tessera $DEV $M 2>/dev/null || echo MOUNT_FAIL
     n=\$(ls $M 2>/dev/null | wc -l | tr -d ' ')
     # ★ fsck ONLY on a successfully unmounted volume: a live-volume fsck fails
@@ -105,7 +112,7 @@ c=1; while [ $c -le $CYCLES ]; do
     tessera-fsck $DEV > /root/soak.fsck 2>&1
     echo \"recovered_entries=\$n fsck_problem_lines=\$(grep -ciE 'dangling|orphan|leaked|overlap|missing|neither|corrupt|problem' /root/soak.fsck) root_commit_failed=\$(sysctl -n kern.tessera.commit_failed)\"" 2>/dev/null | tr -d '\r' | tr '\n' ' ')
   case "$res" in
-    *WRONG_KMOD*|*REFUSING*) echo "  cycle $c: ABORT [$res]"; exit 1;;
+    *REFUSING*) echo "  cycle $c: ABORT [$res]"; exit 1;;
   esac
   case "$res" in
     *MOUNT_FAIL*) echo "  cycle $c: RECOVERY MOUNT FAILED [$res]"; recfail=$((recfail+1)); fail=$((fail+1));;
