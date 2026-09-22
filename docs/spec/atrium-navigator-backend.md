@@ -980,7 +980,7 @@ layout.
 
 ### 8.3 M2 progress — the number, first reading (2026-09-22)
 
-**CONFORMANCE: exercised 42/64, matched 38/64** (13 on first reading; see the updates
+**CONFORMANCE: exercised 44/64, matched 40/64** (13 on first reading; see the updates
 below). Printed by `nsg-conformance`; the
 matched set is pinned by a test so it cannot fall silently.
 
@@ -1113,6 +1113,23 @@ Three of the four problems in this batch were **fixtures, not the renderer**: a 
 short to contain its own child, white text on white, and a font set that cannot show the
 property. Each was found by looking, and two were settled by reading the NSG rather than
 the picture.
+
+**Update — tables, matched 38 → 40** (`border-spacing`, `vertical-align`; `display:
+table/-row/-cell`). Separate borders only, as the profile has no `border-collapse`.
+
+★ **Column widths are declared, never measured.** §3.13 requires it and forbids a
+fallback path, so the first row's cells give the columns and **a table whose first row
+leaves a width `auto` is refused with a diagnostic and not laid out**
+(`table.column-width-undeclared`). Tested both ways.
+
+- Rows are as tall as their tallest cell; cell boxes fill the row (separate-borders
+  model), and `vertical-align` positions the CONTENT inside that height — including
+  `baseline`, where cells of very different font sizes share one baseline.
+- **Decision:** the HTML parser inserts `<tbody>`, but the profile's `display` has no
+  `table-row-group`, so elements between a table and its rows are flattened.
+- The "table part outside a table" counter fires only for a STRAY part in normal flow —
+  it first fired for every cell the table itself placed, which would have made the rows
+  permanently unmatched.
 
 ## 9. What this reuses
 

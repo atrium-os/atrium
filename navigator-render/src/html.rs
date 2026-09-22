@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 /// so a property the layout ignores can never be dropped silently (§5.1).
 /// Value-level gaps inside a read row (flex as block, italic without an
 /// italic face, …) are counted where they occur.
-pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 17, 18, 19, 20, 21, 22, 23, 24, 25, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 55, 57, 59, 60];
+pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 17, 18, 19, 20, 21, 22, 23, 24, 25, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 55, 57, 59, 60, 63, 64];
 
 pub struct HtmlOut {
     pub scene: Scene,
@@ -90,6 +90,13 @@ struct Cx<'a> {
     baseline_probe: Option<Option<U>>,
     /// text-indent for the next first line of a block container.
     indent: Option<U>,
+    /// Extra offset of the next block's content inside its box (table cells,
+    /// where vertical-align positions the content within the row's height).
+    content_dy: U,
+    /// Set while a table lays out one of its own cells, so the "table part
+    /// outside a table" counter fires only for a STRAY part in normal flow.
+    table_part: bool,
+    diagnostics: Vec<Diagnostic>,
 }
 
 pub fn render_html(html: &str, fonts: &FontSet, env: &Env) -> HtmlOut {
@@ -122,13 +129,14 @@ pub fn render_html(html: &str, fonts: &FontSet, env: &Env) -> HtmlOut {
     let styled = cascade(&dom, &sheets, env);
     diagnostics.extend(styled.diagnostics);
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
-                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None };
+                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, content_dy: 0, table_part: false, diagnostics: vec![] };
     cx.count_unread_rows();
     // The root element is the initial containing block's only child.
     let root = dom.element_children(dom.root()).into_iter().next();
     // The root's containing block is the viewport: definite in both axes.
     let h = match root { Some(r) => cx.block(r, 0, 0, u(env.width_px), Some(u(env.height_px)), (None, None)), None => 0 };
     cx.scene.height = h.max(u(env.height_px));
+    diagnostics.extend(cx.diagnostics);
     HtmlOut { scene: cx.scene, report: cx.report, diagnostics, unimplemented: cx.unimplemented }
 }
 
@@ -193,10 +201,11 @@ impl<'a> Cx<'a> {
     /// container on its item; `None` lets the box size itself.
     fn block(&mut self, h: Handle, x: U, y: U, cb_w: U, cb_h: Option<U>, force: (Option<U>, Option<U>)) -> U {
         let Some(s) = self.st(h) else { return 0 };
+        let part = std::mem::take(&mut self.table_part);
         match kw(s, "display") {
             "none" => return 0,
             "grid" => self.count("display: grid (laid out as block)"),
-            "table" | "table-row" | "table-cell" => self.count("display: table* (laid out as block)"),
+            "table-row" | "table-cell" if !part => self.count("display: table-row/-cell outside a table (laid out as block)"),
             _ => {}
         }
         match kw(s, "position") {
@@ -274,10 +283,12 @@ impl<'a> Cx<'a> {
         let content_w = (w - frame).max(0);
         // text-indent (inherited) applies to this container's first line.
         self.indent = len(s.get("text-indent"), content_w).filter(|v| *v != 0);
-        let mut cy = by + bt + pt;
+        let mut cy = by + bt + pt + std::mem::take(&mut self.content_dy);
         // Children: block-level children stack; runs of inline content
         // between them form anonymous block boxes of line boxes.
-        if kw(s, "display") == "flex" {
+        if kw(s, "display") == "table" {
+            cy += self.table(h, s, content_x, cy, content_w);
+        } else if kw(s, "display") == "flex" {
             cy += self.flex(h, s, content_x, cy, content_w, child_cb_h);
         } else {
             let mut inline: Vec<Item> = vec![];
@@ -528,6 +539,91 @@ impl<'a> Cx<'a> {
             lines.iter().map(|r| items[r.clone()].iter().map(|i| i.main + i.m_start + i.m_end).sum::<U>()
                 + main_gap * (r.len() as U).saturating_sub(1)).max().unwrap_or(0)
         }
+    }
+
+    /// Table layout, separate borders (profile §3.9: `border-collapse` is
+    /// absent, borders are always separate).
+    ///
+    /// ★ COLUMN WIDTHS ARE DECLARED, NEVER MEASURED (§3.13). The first row's
+    /// cells give the columns; a table whose first row has an `auto` width is
+    /// REFUSED with a diagnostic and not laid out. There is deliberately no
+    /// fallback measurement path — that is how the unbounded algorithm creeps
+    /// back in.
+    ///
+    /// The parser inserts `<tbody>`, and the profile's `display` has no
+    /// `table-row-group`, so elements between the table and its rows are
+    /// flattened (decision).
+    fn table(&mut self, h: Handle, s: &Style, x: U, y: U, w: U) -> U {
+        let (sx, sy) = match s.get("border-spacing") {
+            V::Pair(a, b) => (len(a, w).unwrap_or(0), len(b, 0).unwrap_or(0)),
+            _ => (0, 0),
+        };
+        // Rows, flattening any wrapper the parser inserted.
+        let mut rows = vec![];
+        let mut stack: Vec<Handle> = self.dom.element_children(h).into_iter().rev().collect();
+        while let Some(c) = stack.pop() {
+            match self.st(c).map(|cs| kw(cs, "display")) {
+                Some("table-row") => rows.push(c),
+                Some("none") => {}
+                _ => for g in self.dom.element_children(c).into_iter().rev() { stack.push(g) },
+            }
+        }
+        let cells_of = |this: &Self, r: Handle| -> Vec<Handle> {
+            this.dom.element_children(r).into_iter()
+                .filter(|c| this.st(*c).map(|cs| kw(cs, "display")) == Some("table-cell")).collect()
+        };
+        let Some(first) = rows.first().copied() else { return 0 };
+        let mut cols: Vec<U> = vec![];
+        for c in cells_of(self, first) {
+            let cs = self.st(c).expect("styled");
+            match len(cs.get("width"), w) {
+                Some(cw) => cols.push(cw),
+                None => {
+                    self.diagnostics.push(Diagnostic { pos: Pos { line: 0, col: 0 }, code: "table.column-width-undeclared",
+                        msg: "a table's first row must declare every column width (§3.13: content that would need unbounded measurement arrives measured); table refused".into() });
+                    return 0;
+                }
+            }
+        }
+        if cols.is_empty() { return 0 }
+        let mut cy = y + sy;
+        for r in rows {
+            let cells = cells_of(self, r);
+            // Natural heights first: the row is as tall as its tallest cell.
+            let nat: Vec<U> = cells.iter().enumerate()
+                .map(|(i, c)| { let cw = *cols.get(i).unwrap_or(cols.last().expect("non-empty")); self.table_part = true; self.measure(*c, cw, None, (Some(cw), None)) })
+                .collect();
+            let row_h = nat.iter().copied().max().unwrap_or(0);
+            // Baselines, for cells aligned on one (the row's shared baseline).
+            let bases: Vec<Option<U>> = cells.iter().enumerate().map(|(i, c)| {
+                let cs = self.st(*c).expect("styled");
+                (kw(cs, "vertical-align") == "baseline").then(|| {
+                    let cw = *cols.get(i).unwrap_or(cols.last().expect("non-empty"));
+                    self.table_part = true;
+                    self.baseline(*c, cw, (Some(cw), None))
+                })
+            }).collect();
+            let max_b = bases.iter().flatten().copied().max().unwrap_or(0);
+            let mut cx = x + sx;
+            for (i, c) in cells.iter().enumerate() {
+                let cw = *cols.get(i).unwrap_or(cols.last().expect("non-empty"));
+                let cs = self.st(*c).expect("styled");
+                // vertical-align positions the CONTENT inside the row's height;
+                // the cell box itself fills the row (separate-borders model).
+                self.content_dy = match kw(cs, "vertical-align") {
+                    "middle" => (row_h - nat[i]) / 2,
+                    "bottom" => row_h - nat[i],
+                    "baseline" => max_b - bases[i].unwrap_or(0),
+                    _ => 0,
+                };
+                self.table_part = true;
+                self.block(*c, cx, cy, cw, Some(row_h), (Some(cw), Some(row_h)));
+                self.content_dy = 0;
+                cx += cw + sx;
+            }
+            cy += row_h + sy;
+        }
+        cy - y
     }
 
     /// An item's content size along the main axis (its max-content width in
@@ -1030,6 +1126,22 @@ mod tests {
         let ew = boxes(&without, 0xff0000ff)[0].2;
         assert_eq!(ew, 50, "control: two empty items share the shrink equally");
         assert!(aw > 50, "the word keeps its item from shrinking to 50 (got {aw})");
+    }
+
+    #[test]
+    fn a_table_uses_declared_columns_and_refuses_undeclared_ones() {
+        let css = r#"<style>body { margin-left: 0px; margin-top: 0px }
+            table { border-spacing: 10px 6px } td { padding-top: 0px; padding-right: 0px; padding-bottom: 0px; padding-left: 0px;
+            background-color: #0000ff; height: 20px }</style>"#;
+        let o = render(&format!(r#"{css}<table><tr><td style2="" class="a"></td><td class="b"></td></tr><tr><td></td><td></td></tr></table>
+            <style>.a {{ width: 80px }} .b {{ width: 120px }}</style>"#));
+        let b = boxes(&o, 0x0000ffff);
+        assert_eq!(b, vec![(10, 6, 80, 20), (100, 6, 120, 20), (10, 32, 80, 20), (100, 32, 120, 20)],
+                   "columns from the first row; spacing around and between cells");
+        // No declared width in the first row: refused with a diagnostic.
+        let bad = render(&format!(r#"{css}<table><tr><td></td></tr></table>"#));
+        assert!(bad.diagnostics.iter().any(|d| d.code == "table.column-width-undeclared"));
+        assert!(boxes(&bad, 0x0000ffff).is_empty(), "refused, not laid out");
     }
 
     #[test]
