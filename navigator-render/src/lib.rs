@@ -70,6 +70,14 @@ pub struct Run {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Link { pub x: U, pub y: U, pub w: U, pub h: U, pub href: String }
 
+/// What a node is clipped by and which opacity group it belongs to, as
+/// indices into the scene's `clips` and `groups`.
+///
+/// ★ These are FLAT attributes of a node, not begin/end markers, because
+/// `order` is re-sorted for painting (stacking contexts): a push/pop pair
+/// could not survive that, and an index on the node does.
+pub type Attrs = (Option<u32>, Option<u32>);
+
 #[derive(Debug, Default)]
 pub struct Scene {
     pub width: U,
@@ -79,12 +87,49 @@ pub struct Scene {
     pub links: Vec<Link>,
     /// Draw order across the three kinds: (kind, index). 0 rect, 1 run, 2 link.
     pub order: Vec<(u8, usize)>,
+    /// Clip rectangles, each already intersected with its ancestors', so a
+    /// node needs only one index and a reader needs no stack.
+    pub clips: Vec<(U, U, U, U)>,
+    /// Opacity groups: (alpha 0-255, the group this one composites into).
+    /// Nested groups keep a parent, because compositing them is not the same
+    /// as multiplying the alphas.
+    pub groups: Vec<(u32, Option<u32>)>,
+    /// Parallel to `rects` / `runs` / `links`: pushed by the same method that
+    /// pushes the node, so they cannot come apart.
+    pub rect_attrs: Vec<Attrs>,
+    pub run_attrs: Vec<Attrs>,
+    pub link_attrs: Vec<Attrs>,
+    /// The clip and group a node created now belongs to.
+    pub(crate) cur: Attrs,
 }
 
 impl Scene {
-    pub(crate) fn rect(&mut self, r: Rect) { self.order.push((0, self.rects.len())); self.rects.push(r) }
-    pub(crate) fn run(&mut self, r: Run) { self.order.push((1, self.runs.len())); self.runs.push(r) }
-    pub(crate) fn link(&mut self, l: Link) { self.order.push((2, self.links.len())); self.links.push(l) }
+    pub(crate) fn rect(&mut self, r: Rect) { self.order.push((0, self.rects.len())); self.rects.push(r); self.rect_attrs.push(self.cur) }
+    pub(crate) fn run(&mut self, r: Run) { self.order.push((1, self.runs.len())); self.runs.push(r); self.run_attrs.push(self.cur) }
+    pub(crate) fn link(&mut self, l: Link) { self.order.push((2, self.links.len())); self.links.push(l); self.link_attrs.push(self.cur) }
+    /// A rect painted into a slot reserved earlier (a box's own background,
+    /// which is decided only after its children are laid out).
+    pub(crate) fn insert_rect(&mut self, slot: usize, r: Rect) {
+        self.order.insert(slot, (0, self.rects.len()));
+        self.rects.push(r);
+        self.rect_attrs.push(self.cur);
+    }
+    /// A clip rectangle, intersected with whatever is already in force.
+    pub(crate) fn clip(&mut self, x: U, y: U, w: U, h: U) -> u32 {
+        let (x, y, w, h) = match self.cur.0.and_then(|i| self.clips.get(i as usize).copied()) {
+            Some((px, py, pw, ph)) => {
+                let (x0, y0) = (x.max(px), y.max(py));
+                (x0, y0, (x + w).min(px + pw) - x0, (y + h).min(py + ph) - y0)
+            }
+            None => (x, y, w, h),
+        };
+        self.clips.push((x, y, w.max(0), h.max(0)));
+        self.clips.len() as u32 - 1
+    }
+    pub(crate) fn group(&mut self, alpha: u32) -> u32 {
+        self.groups.push((alpha, self.cur.1));
+        self.groups.len() as u32 - 1
+    }
 }
 
 /// Round-half-away-from-zero of `v * num / den`, in integers.

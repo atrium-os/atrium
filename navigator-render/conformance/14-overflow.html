@@ -1,0 +1,14 @@
+<html><body>
+<style>.box { width: 160px; height: 40px; background-color: #eaeef2; margin-bottom: 10px }
+.big { width: 260px; height: 70px; background-color: #0969da; color: #ffffff }
+.v { overflow-x: visible; overflow-y: visible }
+.h { overflow-x: hidden; overflow-y: hidden }
+.a { overflow-x: auto; overflow-y: auto }
+.s { overflow-x: scroll; overflow-y: scroll }
+.xy { overflow-x: hidden; overflow-y: visible }</style>
+<div class="box v"><div class="big">visible: spills out</div></div>
+<div class="box h"><div class="big">hidden: cut at the padding box</div></div>
+<div class="box a"><div class="big">auto: same in a static scene</div></div>
+<div class="box s"><div class="big">scroll: same in a static scene</div></div>
+<div class="box xy"><div class="big">x hidden + y visible: both clip</div></div>
+</body></html>

@@ -210,8 +210,8 @@ shipped UI fonts. It cannot carry a document.
   order.
 
 **The serialization is text**, one node per line, so a golden diff reads as a layout
-change. `nsg 0.1` heads the file, followed by `viewport`, `font`, `rect`, `run` and
-`link` lines. Each run carries its source text too, so a reader of a diff can see what
+change. `nsg 0.2` heads the file, followed by `viewport`, `font`, `clip`, `group`,
+`rect`, `run` and `link` lines. Each run carries its source text too, so a reader of a diff can see what
 moved.
 
 **The M0 gate:** the repo's own Markdown (the corpus) produces **byte-identical NSG over
@@ -980,7 +980,7 @@ layout.
 
 ### 8.3 M2 progress — the number, first reading (2026-09-22)
 
-**CONFORMANCE: exercised 54/64, matched 52/64** (13 on first reading; see the updates
+**CONFORMANCE: exercised 56/64, matched 54/64** (13 on first reading; see the updates
 below). Printed by `nsg-conformance`; the
 matched set is pinned by a test so it cannot fall silently.
 
@@ -1226,6 +1226,34 @@ Every `display` value the profile admits is now laid out; nothing in §3.3 is co
   `block` in the picture. Rewritten so each value is visible — which immediately showed
   two empty flex items 0 px wide. That was the FIXTURE (an empty `width: auto` item in a
   row really is 0 wide), not the layout.
+
+**Update — overflow and opacity, matched 52 → 54 (rows 14, 54); NSG 0.2.**
+- **NSG gains two declaration lines and two optional node attributes**:
+  `clip c<i> <x> <y> <w> <h>`, `group g<i> <alpha> [p<parent>]`, and a trailing `c<i>` /
+  `g<i>` on the nodes that have them.
+- ★ **They are FLAT attributes, not begin/end markers.** `order` is re-sorted for
+  painting (stacking contexts), and a push/pop pair could not survive that re-sort; an
+  index on the node does. For the same reason a clip is written ALREADY INTERSECTED with
+  its ancestors', so a reader needs no stack.
+- **The geometry is not clipped — the consumer clips.** A clipped child keeps its full
+  size in the scene, so a reader of the NSG can still see what was cut off.
+- `overflow` clips to the box's PADDING box; the box's own border and background are
+  outside its own clip. ★ Per CSS Overflow 3 §3 `visible` computes to `auto` when the
+  other axis is not visible, so **one non-visible axis clips both** — there is no
+  clipping in x alone.
+- **`auto` and `scroll` clip exactly as `hidden` does.** NSG carries no scroll offset: a
+  document scene is the initial, unscrolled state, and scrolling is a chrome concern.
+  Nothing is counted for it, because the scene is not wrong — it is the top of the box.
+- **`opacity` makes a GROUP**, composited once. Multiplying the alpha into each node
+  instead would let overlapping children show through each other, which is the case the
+  fixture is built to show: at `opacity: 0.5` the overlap of two boxes stays uniform.
+- Every one of the 52 existing goldens changed **by the version line only**, proven by
+  diffing with the first line stripped before re-blessing.
+- **The M0 corpus digest moves with the NSG version.** Today's host run:
+  `457a130a…a798a4` over **118** documents, identical across 3 runs and a fourth under a
+  different `TZ` and `LANG`. The corpus has also grown since the M0 gate (111 → 118), so
+  this is not a like-for-like comparison with `4a99561…e121c`, and the VM leg has NOT
+  been re-run for 0.2.
 
 ## 9. What this reuses
 

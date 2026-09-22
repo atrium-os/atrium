@@ -9,16 +9,34 @@
 use navigator_render::{fontset::FontSet, html::render_html, render, Options, Scene, PX};
 use navigator_style::cascade::Env;
 
-struct Canvas { w: usize, h: usize, px: Vec<[f32; 4]> }
+struct Canvas {
+    w: usize, h: usize, px: Vec<[f32; 4]>,
+    /// The clip rectangle in force, in whole pixels (x0, y0, x1, y1).
+    clip: Option<(i64, i64, i64, i64)>,
+}
 
 impl Canvas {
-    fn new(w: usize, h: usize) -> Self { Canvas { w, h, px: vec![[1.0, 1.0, 1.0, 1.0]; w * h] } }
+    fn new(w: usize, h: usize) -> Self { Canvas { w, h, px: vec![[1.0, 1.0, 1.0, 1.0]; w * h], clip: None } }
+    /// A transparent canvas the same size: an opacity group is painted here
+    /// and composited once, which is what makes group opacity different from
+    /// multiplying each node's alpha.
+    fn layer(&self) -> Self { Canvas { w: self.w, h: self.h, px: vec![[0.0; 4]; self.w * self.h], clip: self.clip } }
+    fn over(&mut self, layer: &Canvas, alpha: f32) {
+        for (dst, src) in self.px.iter_mut().zip(layer.px.iter()) {
+            let a = src[3] * alpha;
+            if a <= 0.0 { continue }
+            for i in 0..3 { dst[i] = src[i] / src[3].max(1e-6) * a + dst[i] * (1.0 - a) }
+            dst[3] = a + dst[3] * (1.0 - a);
+        }
+    }
     fn blend(&mut self, x: i64, y: i64, rgba: u32, cover: f32) {
         if x < 0 || y < 0 || x as usize >= self.w || y as usize >= self.h { return }
+        if let Some((x0, y0, x1, y1)) = self.clip { if x < x0 || y < y0 || x >= x1 || y >= y1 { return } }
         let a = (rgba & 0xff) as f32 / 255.0 * cover;
         let c = [(rgba >> 24) as f32 / 255.0, ((rgba >> 16) & 0xff) as f32 / 255.0, ((rgba >> 8) & 0xff) as f32 / 255.0];
         let p = &mut self.px[y as usize * self.w + x as usize];
         for i in 0..3 { p[i] = c[i] * a + p[i] * (1.0 - a) }
+        p[3] = a + p[3] * (1.0 - a);
     }
 }
 
@@ -26,7 +44,37 @@ fn paint(scene: &Scene, fonts: &FontSet) -> Canvas {
     let (w, h) = ((scene.width / PX) as usize, (scene.height / PX) as usize);
     let mut cv = Canvas::new(w.max(1), h.max(1));
     let mut ctx = swash::scale::ScaleContext::new();
+    // Opacity groups, innermost last: each is a layer of its own, composited
+    // into its parent when the last node belonging to it has been painted.
+    let mut stack: Vec<(u32, Canvas)> = vec![];
+    let group_of = |kind: u8, i: usize| -> Option<u32> {
+        match kind { 0 => scene.rect_attrs.get(i), 1 => scene.run_attrs.get(i), _ => None }.and_then(|a| a.1)
+    };
+    let clip_of = |kind: u8, i: usize| -> Option<u32> {
+        match kind { 0 => scene.rect_attrs.get(i), 1 => scene.run_attrs.get(i), _ => None }.and_then(|a| a.0)
+    };
+    // The chain of groups a node is in, outermost first.
+    let chain = |g: Option<u32>| -> Vec<u32> {
+        let (mut out, mut cur) = (vec![], g);
+        while let Some(i) = cur { out.push(i); cur = scene.groups.get(i as usize).and_then(|g| g.1) }
+        out.reverse();
+        out
+    };
     for &(kind, i) in &scene.order {
+        // Close the groups this node is not in, then open the ones it is.
+        let want = chain(group_of(kind, i));
+        while stack.len() > want.len() || stack.last().is_some_and(|(id, _)| !want.contains(id)) {
+            let (id, layer) = stack.pop().expect("group");
+            let alpha = scene.groups.get(id as usize).map(|g| g.0).unwrap_or(255) as f32 / 255.0;
+            match stack.last_mut() { Some((_, parent)) => parent.over(&layer, alpha), None => cv.over(&layer, alpha) }
+        }
+        for id in want.into_iter().skip(stack.len()) {
+            let l = stack.last().map(|(_, c)| c.layer()).unwrap_or_else(|| cv.layer());
+            stack.push((id, l));
+        }
+        let cvr: &mut Canvas = match stack.last_mut() { Some((_, c)) => c, None => &mut cv };
+        cvr.clip = clip_of(kind, i).and_then(|c| scene.clips.get(c as usize)).map(|&(x, y, w, h)| (x / PX, y / PX, (x + w) / PX, (y + h) / PX));
+        let cv = cvr;
         match kind {
             0 => {
                 let r = &scene.rects[i];
@@ -93,6 +141,11 @@ fn paint(scene: &Scene, fonts: &FontSet) -> Canvas {
             }
             _ => {}
         }
+    }
+    // Any group still open at the end composites now.
+    while let Some((id, layer)) = stack.pop() {
+        let alpha = scene.groups.get(id as usize).map(|g| g.0).unwrap_or(255) as f32 / 255.0;
+        match stack.last_mut() { Some((_, parent)) => parent.over(&layer, alpha), None => cv.over(&layer, alpha) }
     }
     cv
 }

@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 /// so a property the layout ignores can never be dropped silently (§5.1).
 /// Value-level gaps inside a read row (flex as block, italic without an
 /// italic face, …) are counted where they occur.
-pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 55, 57, 59, 60, 63, 64];
+pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 54, 55, 57, 59, 60, 63, 64];
 
 pub struct HtmlOut {
     pub scene: Scene,
@@ -337,6 +337,32 @@ impl<'a> Cx<'a> {
                 self.marker = Some((t, st, line, kw(s, "list-style-position") == "outside"));
             }
         }
+        // ★ overflow: anything but `visible` clips this box's CONTENT and its
+        // descendants to its PADDING box (CSS Overflow 3). The box's own
+        // border and background are NOT clipped, so the clip is dropped again
+        // before they are painted. A definite height is needed for the
+        // vertical edge; without one there is nothing to clip against yet.
+        let saved_attrs = self.scene.cur;
+        // ★ Per CSS Overflow 3 §3, `visible` computes to `auto` when the
+        // OTHER axis is not visible — so one non-visible axis clips both, and
+        // there is no such thing as clipping in x alone.
+        let clips = kw(s, "overflow-x") != "visible" || kw(s, "overflow-y") != "visible";
+        if clips {
+            let ch = definite.map(|d| (d - bt - bb).max(0)).unwrap_or(U::MAX / 4);
+            let id = self.scene.clip(bx + bl, by + bt, (w - bl - br).max(0), ch);
+            self.scene.cur.0 = Some(id);
+            if ["border-top-left-radius", "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius"]
+                .iter().any(|p| len(s.get(p), w).unwrap_or(0) > 0) { self.count("overflow clip on a rounded box (clipped square)") }
+        }
+        // ★ opacity < 1 makes a GROUP: the box and everything in it are
+        // painted together and then composited once, which is why the alpha
+        // cannot simply be multiplied into each node (overlapping children
+        // would show through each other).
+        let alpha = match s.get("opacity") { V::Num(o) => (o.clamp(0.0, 1.0) * 255.0).round() as u32, _ => 255 };
+        if alpha < 255 {
+            let id = self.scene.group(alpha);
+            self.scene.cur.1 = Some(id);
+        }
         let saved_cb = self.pos_cb;
         if positioned {
             // ★ The containing block of an absolutely positioned descendant
@@ -371,6 +397,8 @@ impl<'a> Cx<'a> {
             cy += self.lines(inline, content_x, cy, content_w, s);
         }
         let content_h = cy - (by + bt + pt);
+        // The box's own border and background are outside its own clip.
+        self.scene.cur.0 = saved_attrs.0;
         let hgt = definite.unwrap_or_else(|| clamp(content_h + pt + pb + bt + bb));
         // Paint: background over the border box, then borders — unless
         // visibility: hidden, which keeps the box and paints none of it.
@@ -427,10 +455,7 @@ impl<'a> Cx<'a> {
             }
         }
         let painted = paint.len();
-        for (i, r) in paint.into_iter().enumerate() {
-            self.scene.order.insert(bg_slot + i, (0, self.scene.rects.len()));
-            self.scene.rects.push(r);
-        }
+        for (i, r) in paint.into_iter().enumerate() { self.scene.insert_rect(bg_slot + i, r) }
         // ★ Inserting this box's background at the slot reserved before the
         // children SHIFTS every entry after it, so the ranges the children
         // recorded no longer point at what they painted. Move them.
@@ -438,6 +463,7 @@ impl<'a> Cx<'a> {
             for c in self.contexts.iter_mut().filter(|c| c.1 >= bg_slot) { c.1 += painted; c.2 += painted }
             for h in self.hoists.iter_mut().filter(|h| h.0 >= bg_slot) { h.0 += painted; h.1 += painted }
         }
+        self.scene.cur = saved_attrs;
         if positioned { self.pos_cb = saved_cb }
         if opens_context { self.contexts.push((z.unwrap_or(0), ctx_start, self.scene.order.len(), painted)) }
         else if positioned { self.hoists.push((ctx_start, self.scene.order.len())) }
@@ -536,10 +562,13 @@ impl<'a> Cx<'a> {
 
     fn measure(&mut self, h: Handle, cb_w: U, cb_h: Option<U>, force: (Option<U>, Option<U>)) -> U {
         let (o, r, n, l) = (self.scene.order.len(), self.scene.rects.len(), self.scene.runs.len(), self.scene.links.len());
+        let (cl, gr, cur) = (self.scene.clips.len(), self.scene.groups.len(), self.scene.cur);
         let (links, counts, marker, report) = (self.links.len(), self.unimplemented.clone(), self.marker.clone(), self.report.clone());
         let (ctx, hoi) = (self.contexts.len(), self.hoists.len());
         let hgt = self.block(h, 0, 0, cb_w, cb_h, force);
         self.scene.order.truncate(o); self.scene.rects.truncate(r); self.scene.runs.truncate(n); self.scene.links.truncate(l);
+        self.scene.rect_attrs.truncate(r); self.scene.run_attrs.truncate(n); self.scene.link_attrs.truncate(l);
+        self.scene.clips.truncate(cl); self.scene.groups.truncate(gr); self.scene.cur = cur;
         self.links.truncate(links); self.unimplemented = counts; self.marker = marker; self.report = report;
         self.contexts.truncate(ctx); self.hoists.truncate(hoi);
         hgt
@@ -1650,6 +1679,40 @@ mod tests {
         assert_eq!(order(&auto), vec![0xff0000ff, 0x00ff00ff], "auto: the red child joins the root context and paints under");
     }
 
+    /// Clipping and group opacity are ATTRIBUTES of a node, so they survive
+    /// the re-sort that painting order does.
+    #[test]
+    fn overflow_clips_to_the_padding_box_and_opacity_groups() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .box { width: 100px; height: 40px; padding-left: 10px; border-left-width: 5px; border-left-style: solid;
+                   border-left-color: #000000; overflow-x: hidden; overflow-y: hidden; opacity: 0.5 }
+            .big { width: 300px; height: 90px; background-color: #ff0000 }</style>
+            <div class="box"><div class="big"></div></div>"#);
+        // The clip is the padding box: inside the border, NOT inside padding.
+        assert_eq!(o.scene.clips, vec![(5 * 64, 0, 95 * 64, 40 * 64)]);
+        assert_eq!(o.scene.groups, vec![(128, None)]);
+        // The child is clipped and grouped; the box's own border is grouped
+        // but NOT clipped by its own clip.
+        let red = o.scene.rects.iter().position(|r| r.rgba == 0xff0000ff).expect("child");
+        assert_eq!(o.scene.rect_attrs[red], (Some(0), Some(0)));
+        let border = o.scene.rects.iter().position(|r| r.rgba == 0x000000ff).expect("border");
+        assert_eq!(o.scene.rect_attrs[border], (None, Some(0)));
+        // The geometry is untouched: clipping is the consumer's job, so the
+        // child keeps its full size and the reader can see what was cut.
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(15, 0, 300, 90)]);
+    }
+
+    #[test]
+    fn nested_clips_are_intersected_at_build_time() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .a { width: 200px; height: 100px; overflow-x: hidden; overflow-y: hidden }
+            .b { margin-left: 50px; width: 200px; height: 30px; overflow-x: hidden; overflow-y: hidden }</style>
+            <div class="a"><div class="b"><div></div></div></div>"#);
+        // The inner clip is already intersected with the outer one, so a
+        // reader needs no stack: 50..200, not 50..250.
+        assert_eq!(o.scene.clips, vec![(0, 0, 200 * 64, 100 * 64), (50 * 64, 0, 150 * 64, 30 * 64)]);
+    }
+
     #[test]
     fn z_index_orders_painting() {
         // Tree order would paint red last; z-index puts it under both, and
@@ -1668,8 +1731,8 @@ mod tests {
     /// must show up, and its initial value must not.
     #[test]
     fn an_unread_property_is_counted_and_its_initial_value_is_not() {
-        let o = render(r#"<style>.a { opacity: 0.5 } .b { opacity: 1 }</style><div class="a">x</div><div class="b">y</div>"#);
-        assert_eq!(o.unimplemented.get("row opacity… (not implemented)"), Some(&1), "{:?}", o.unimplemented);
+        let o = render(r#"<style>.a { transform: translate(2px, 2px) } .b { transform: none }</style><div class="a">x</div><div class="b">y</div>"#);
+        assert_eq!(o.unimplemented.get("row transform… (not implemented)"), Some(&1), "{:?}", o.unimplemented);
     }
 
     /// CSS automatic minimum size: a flex item does not shrink below its

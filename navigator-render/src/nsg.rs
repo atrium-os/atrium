@@ -8,9 +8,11 @@
 //! nsg 0.1
 //! viewport <w> <h>
 //! font f<i> <address> "<name>" <weight>
-//! rect <x> <y> <w> <h> <rrggbbaa> [r<tl>,<tr>,<br>,<bl>] [b<ring>]
-//! run f<i> <size> <rrggbbaa> <x> <y> <em 0|1> <gid>:<dx>,<dy> … "<text>"
-//! link <x> <y> <w> <h> "<href>"
+//! clip c<i> <x> <y> <w> <h>
+//! group g<i> <alpha> [p<parent>]
+//! rect <x> <y> <w> <h> <rrggbbaa> [r<tl>,<tr>,<br>,<bl>] [b<ring>] [c<i>] [g<i>]
+//! run f<i> <size> <rrggbbaa> <x> <y> <em 0|1> <gid>:<dx>,<dy> … "<text>" [c<i>] [g<i>]
+//! link <x> <y> <w> <h> "<href>" [c<i>]
 //! ```
 
 use crate::fontset::FontSet;
@@ -35,11 +37,32 @@ fn quote(s: &str) -> String {
 
 pub fn write(scene: &Scene, fonts: &FontSet) -> String {
     let mut o = String::new();
-    o.push_str("nsg 0.1\n");
+    o.push_str("nsg 0.2\n");
     let _ = writeln!(o, "viewport {} {}", scene.width, scene.height);
     for (i, f) in fonts.faces.iter().enumerate() {
         let _ = writeln!(o, "font f{i} {} {} {}", f.address, quote(f.name), f.weight);
     }
+    // Clips are already intersected with their ancestors', so each line is
+    // absolute and a reader needs no stack.
+    for (i, c) in scene.clips.iter().enumerate() {
+        let _ = writeln!(o, "clip c{i} {} {} {} {}", c.0, c.1, c.2, c.3);
+    }
+    for (i, g) in scene.groups.iter().enumerate() {
+        let _ = write!(o, "group g{i} {}", g.0);
+        if let Some(p) = g.1 { let _ = write!(o, " p{p}"); }
+        o.push('\n');
+    }
+    debug_assert_eq!(scene.rect_attrs.len(), scene.rects.len());
+    debug_assert_eq!(scene.run_attrs.len(), scene.runs.len());
+    debug_assert_eq!(scene.link_attrs.len(), scene.links.len());
+    // A node's clip and group, written only when it has one, so a document
+    // with neither is byte-identical to NSG without them.
+    let attrs = |o: &mut String, a: Option<&(Option<u32>, Option<u32>)>| {
+        if let Some((c, g)) = a {
+            if let Some(c) = c { let _ = write!(o, " c{c}"); }
+            if let Some(g) = g { let _ = write!(o, " g{g}"); }
+        }
+    };
     for &(kind, i) in &scene.order {
         match kind {
             0 => {
@@ -47,15 +70,25 @@ pub fn write(scene: &Scene, fonts: &FontSet) -> String {
                 let _ = write!(o, "rect {} {} {} {} {:08x}", r.x, r.y, r.w, r.h, r.rgba);
                 if r.radii != [0; 4] { let _ = write!(o, " r{},{},{},{}", r.radii[0], r.radii[1], r.radii[2], r.radii[3]); }
                 if r.ring != 0 { let _ = write!(o, " b{}", r.ring); }
+                attrs(&mut o, scene.rect_attrs.get(i));
                 o.push('\n');
             }
             1 => {
                 let r = &scene.runs[i];
                 let _ = write!(o, "run f{} {} {:08x} {} {} {}", r.face, r.size, r.rgba, r.x, r.y, r.em as u8);
                 for (g, dx, dy) in &r.glyphs { let _ = write!(o, " {g}:{dx},{dy}"); }
-                let _ = writeln!(o, " {}", quote(&r.text));
+                let _ = write!(o, " {}", quote(&r.text));
+                attrs(&mut o, scene.run_attrs.get(i));
+                o.push('\n');
             }
-            _ => { let l = &scene.links[i]; let _ = writeln!(o, "link {} {} {} {} {}", l.x, l.y, l.w, l.h, quote(&l.href)); }
+            _ => {
+                let l = &scene.links[i];
+                let _ = write!(o, "link {} {} {} {} {}", l.x, l.y, l.w, l.h, quote(&l.href));
+                // A link's group would not change where it is: only its clip can.
+                let la = scene.link_attrs.get(i).map(|a| (a.0, None));
+                attrs(&mut o, la.as_ref());
+                o.push('\n');
+            }
         }
     }
     o
