@@ -258,11 +258,12 @@ fn unsafe_socket_reader(socket_fd: i32) -> std::os::unix::net::UnixStream {
 /// for a point-to-point epair for `jail_name` carrying `mac`. Returns
 /// `(epair_b, app_addr, host_addr)`; the caller hands `epair_b` to jail(8) as
 /// `vnet.interface` and MUST call [`release_net`] when the jail is gone.
-pub fn allocate_net(socket: &Path, jail_name: &str, mac: &str)
+pub fn allocate_net(socket: &Path, jail_name: &str, mac: &str,
+                    grants: Option<crate::protocol::NetGrants>)
     -> Result<(String, String, String), String>
 {
     let mut c = Client::connect(socket).map_err(|e| format!("connect {}: {e}", socket.display()))?;
-    match c.send(&Request::AllocateNet { jail_name: jail_name.into(), mac: mac.into() }) {
+    match c.send(&Request::AllocateNet { jail_name: jail_name.into(), mac: mac.into(), grants }) {
         Ok((Response::NetAllocated { epair_b, app_addr, host_addr }, _)) => Ok((epair_b, app_addr, host_addr)),
         Ok((Response::PolicyDenied { rule, detail }, _)) => Err(format!("jaild refused ({rule}): {detail}")),
         Ok((other, _)) => Err(format!("jaild: unexpected reply {other:?}")),

@@ -107,6 +107,7 @@ pub fn serve(
             .filter(|n| ffi::jail_id_by_name(&n.jail_name).is_none())
             .cloned().collect();
         for n in &gone {
+            crate::routed::release_grants(&n.jail_name, n.slot, &n.tables);
             let _ = crate::routed::destroy(&n.epair_a);
             info!("jaild: reconcile released /30 slot {} of vanished jail {}", n.slot, n.jail_name);
         }
@@ -267,8 +268,8 @@ fn dispatch(
 
         Request::SetRctl(req) => (handle_set_rctl(req, policy, dry_run, state), Vec::new()),
 
-        Request::AllocateNet { jail_name, mac } =>
-            (handle_allocate_net(&jail_name, &mac, dry_run, state, state_path), Vec::new()),
+        Request::AllocateNet { jail_name, mac, grants } =>
+            (handle_allocate_net(&jail_name, &mac, grants.as_ref(), dry_run, state, state_path), Vec::new()),
 
         Request::ReleaseNet { jail_name } => {
             release_routed(&jail_name, state, state_path);
@@ -858,7 +859,8 @@ fn handle_create(
      * path creates and attaches in one step in the child, which would start
      * the app before its network existed. */
     let pre_created = match &req.network {
-        NetworkConfig::Routed { mac } => Some(create_routed(req, mac, state, state_path)?),
+        NetworkConfig::Routed { mac, grants } =>
+            Some(create_routed(req, mac, grants.as_ref(), state, state_path)?),
         NetworkConfig::Loopback => Some(create_loopback(req)?),
         _ => None,
     };
@@ -946,6 +948,7 @@ fn allocate_host_end() -> impl Fn(&PersistentState) -> Result<(u32, String, Stri
 fn handle_allocate_net(
     jail_name:  &str,
     mac:        &str,
+    grants:     Option<&crate::protocol::NetGrants>,
     dry_run:    bool,
     state:      &mut PersistentState,
     state_path: &Path,
@@ -961,6 +964,11 @@ fn handle_allocate_net(
     if !crate::routed::valid_mac(mac) {
         return Response::PolicyDenied { rule: "network.routed.mac".into(),
             detail: format!("mac {mac:?} is not a lowercase locally-administered unicast address") };
+    }
+    if let Some(g) = grants {
+        if let Err(detail) = crate::routed::validate_grants(g) {
+            return Response::PolicyDenied { rule: "network.routed.grants".into(), detail };
+        }
     }
     if state.routed_nets.iter().any(|n| n.jail_name == jail_name) {
         return Response::PolicyDenied { rule: "network.routed.duplicate".into(),
@@ -978,8 +986,17 @@ fn handle_allocate_net(
             return Response::SyscallFailed { name: name.into(), errno, msg },
         Err(e) => return Response::Error { detail: e.to_string() },
     };
+    let tables = match crate::routed::apply_grants(jail_name, &a, slot, grants) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::routed::release_grants(jail_name, slot, &[]);
+            let _ = crate::routed::destroy(&a);
+            return Response::SyscallFailed { name: "pfctl".into(),
+                errno: e.raw_os_error().unwrap_or(-1), msg: e.to_string() };
+        }
+    };
     state.routed_nets.push(crate::state::RoutedNet {
-        jail_name: jail_name.into(), slot, epair_a: a.clone(),
+        jail_name: jail_name.into(), slot, epair_a: a.clone(), tables,
     });
     if let Err(e) = state.save(state_path) { warn!("jaild: state save after AllocateNet: {e}"); }
     let (host_addr, app_addr) = crate::routed::slot_addrs(slot);
@@ -991,6 +1008,7 @@ fn handle_allocate_net(
 fn release_routed(jail_name: &str, state: &mut PersistentState, state_path: &Path) {
     if let Some(i) = state.routed_nets.iter().position(|n| n.jail_name == jail_name) {
         let n = state.routed_nets.remove(i);
+        crate::routed::release_grants(jail_name, n.slot, &n.tables);
         if let Err(e) = crate::routed::destroy(&n.epair_a) {
             warn!("jaild: release {jail_name}: destroy {}: {e}", n.epair_a);
         }
@@ -1036,6 +1054,7 @@ fn isolated_spec(req: &CreateJailRequest) -> JailCreateSpec<'_> {
 fn create_routed(
     req:        &CreateJailRequest,
     mac:        &str,
+    grants:     Option<&crate::protocol::NetGrants>,
     state:      &mut PersistentState,
     state_path: &Path,
 ) -> Result<i32, JaildError> {
@@ -1053,8 +1072,18 @@ fn create_routed(
         let _ = routed::destroy(&a);
         return Err(sys("ifconfig", e));
     }
+    /* The app's pf anchor and consent tables — before anything runs in it. */
+    let tables = match routed::apply_grants(&req.name, &a, slot, grants) {
+        Ok(t) => t,
+        Err(e) => {
+            routed::release_grants(&req.name, slot, &[]);
+            let _ = ffi::remove_jail(jid);
+            let _ = routed::destroy(&a);
+            return Err(sys("pfctl", e));
+        }
+    };
     state.routed_nets.push(crate::state::RoutedNet {
-        jail_name: req.name.clone(), slot, epair_a: a.clone(),
+        jail_name: req.name.clone(), slot, epair_a: a.clone(), tables,
     });
     if let Err(e) = state.save(state_path) { warn!("jaild: state save after routed net: {e}"); }
     let (host, app) = routed::slot_addrs(slot);

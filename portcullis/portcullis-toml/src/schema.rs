@@ -86,7 +86,8 @@ pub struct Capabilities {
     pub open_uri:   Option<bool>,
     pub audio:      Option<bool>,
     pub filesystem: Option<Vec<String>>,
-    pub network:    Option<NetworkCap>,
+    /// A mode string or a table of finer grants — see crate::network.
+    pub network:    Option<crate::network::NetworkSpec>,
     pub fonts:      Option<FontsCap>,
     #[serde(rename = "tessera-cas-read")]
     pub tessera_cas_read: Option<bool>,         /* restricted: services only */
@@ -225,7 +226,7 @@ pub fn merge_capabilities(base: &Capabilities, ovr: &Capabilities) -> Capabiliti
         open_uri:         ovr.open_uri.or(base.open_uri),
         audio:            ovr.audio.or(base.audio),
         filesystem:       ovr.filesystem.clone().or_else(|| base.filesystem.clone()),
-        network:          ovr.network.or(base.network),
+        network:          ovr.network.clone().or(base.network.clone()),
         fonts:            ovr.fonts.clone().or_else(|| base.fonts.clone()),
         tessera_cas_read: ovr.tessera_cas_read.or(base.tessera_cas_read),
         usb_hid:          ovr.usb_hid.or(base.usb_hid),
@@ -292,10 +293,10 @@ mod merge_tests {
         let mut base = Capabilities::default();
         base.clipboard = Some(true);
         let mut ovr = Capabilities::default();
-        ovr.network = Some(NetworkCap::Full);
+        ovr.network = Some(crate::network::NetworkSpec::Mode(NetworkCap::Full));
         let m = merge_capabilities(&base, &ovr);
         assert_eq!(m.clipboard, Some(true));
-        assert_eq!(m.network, Some(NetworkCap::Full));
+        assert_eq!(m.network.as_ref().map(|n| n.mode()), Some(NetworkCap::Full));
     }
 
     #[test]
@@ -303,11 +304,11 @@ mod merge_tests {
         /* Bidirectional: setup phase deliberately strips runtime's
          * loopback in favor of "no network at all" during setup. */
         let mut base = Capabilities::default();
-        base.network = Some(NetworkCap::Loopback);
+        base.network = Some(crate::network::NetworkSpec::Mode(NetworkCap::Loopback));
         let mut ovr = Capabilities::default();
-        ovr.network = Some(NetworkCap::None);
+        ovr.network = Some(crate::network::NetworkSpec::Mode(NetworkCap::None));
         let m = merge_capabilities(&base, &ovr);
-        assert_eq!(m.network, Some(NetworkCap::None));
+        assert_eq!(m.network.as_ref().map(|n| n.mode()), Some(NetworkCap::None));
     }
 
     #[test]

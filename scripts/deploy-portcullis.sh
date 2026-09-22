@@ -120,7 +120,8 @@ kldstat -q -m pf || kldload pf
 sysctl -q net.inet.ip.forwarding=1 >/dev/null
 pfctl -f /usr/local/etc/atrium/pf.conf 2>/dev/null && pfctl -e >/dev/null 2>&1
 pfctl -s rules | grep -q "block drop in quick on atrium inet from any to (self)" || exit 1
-pfctl -s rules | grep -q "block drop in quick on atrium inet from any to 100.64.0.0/16" || exit 1
+pfctl -s rules | grep -q "anchor \"atrium/\*\"" || exit 1
+pfctl -s rules | grep -qx "block drop in quick on atrium all" || exit 1
 pfctl -s info | grep -q "Status: Enabled" || exit 1' >/tmp/pfdeploy.log 2>&1 \
   && echo "  pf enabled, isolation rules loaded, forwarding on (and at boot)" \
   || { echo "  pf isolation FAILED: $(tail -1 /tmp/pfdeploy.log)"; rc=1; }

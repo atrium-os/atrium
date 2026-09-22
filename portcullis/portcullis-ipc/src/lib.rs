@@ -364,7 +364,7 @@ mod tests {
     fn roundtrip_authorize_request() {
         let mut caps = Capabilities::default();
         caps.clipboard = Some(true);
-        caps.network   = Some(NetworkCap::Loopback);
+        caps.network   = Some(portcullis_toml::NetworkSpec::Mode(NetworkCap::Loopback));
         let req = Request::Authorize {
             app_id:        "org.atrium.edit".into(),
             manifest_hash: "sha256:abc".into(),

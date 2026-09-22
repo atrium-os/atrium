@@ -574,7 +574,12 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
     const JAILD_SOCK: &str = "/var/run/atrium/jaild.sock";
     let networked = jc.needs_routed_net.clone();
     if let Some(mac) = &networked {
-        match jaild::client::allocate_net(std::path::Path::new(JAILD_SOCK), &jc.name, mac)
+        let grants = match &jc.routed_net_spec {
+            Some((id, spec)) => portcullis_oneshot::net_grants(spec, id),
+            None => Ok(None),
+        };
+        match grants
+            .and_then(|g| jaild::client::allocate_net(std::path::Path::new(JAILD_SOCK), &jc.name, mac, g))
             .and_then(|(b, app, host)| jc.attach_routed_net(&b, &app, &host))
         {
             Ok(()) => {

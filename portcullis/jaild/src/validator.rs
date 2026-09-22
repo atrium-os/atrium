@@ -105,13 +105,18 @@ fn validate_network(net: &NetworkConfig, name: &str, policy: &Policy) -> Result<
          * unicast — so a caller cannot hand a jail the real NIC's address
          * (portcullis.md §9.1c). pf being loaded is checked at create time,
          * not here: it is machine state, not request shape. */
-        NetworkConfig::Routed { mac } => {
-            if crate::routed::valid_mac(mac) { Ok(()) } else {
-                Err(JaildError::PolicyViolation {
+        NetworkConfig::Routed { mac, grants } => {
+            if !crate::routed::valid_mac(mac) {
+                return Err(JaildError::PolicyViolation {
                     rule:   "network.routed.mac",
                     detail: format!("mac {mac:?} is not a lowercase locally-administered unicast address"),
-                })
+                });
             }
+            if let Some(g) = grants {
+                crate::routed::validate_grants(g).map_err(|detail| JaildError::PolicyViolation {
+                    rule: "network.routed.grants", detail })?;
+            }
+            Ok(())
         }
         NetworkConfig::Disable => {
             /* Always permitted. policy.network.allow_disable is

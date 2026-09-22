@@ -800,7 +800,9 @@ else
     kldstat -q -m pf || kldload pf
     sysctl -q net.inet.ip.forwarding=1 >/dev/null
     pfctl -f /usr/local/etc/atrium/pf.conf 2>/dev/null && pfctl -e >/dev/null 2>&1
-    pfctl -s rules | grep -q "block drop in quick on atrium inet from any to (self)" \
+    { pfctl -s rules | grep -q "block drop in quick on atrium inet from any to (self)" &&
+      pfctl -s rules | grep -q 'anchor "atrium/\*"' &&
+      pfctl -s rules | grep -qx "block drop in quick on atrium all"; } \
         || { echo "  FATAL: the atrium isolation rules did not load"; exit 1; }
     echo "  pf enabled with isolation rules, NAT via $E (and at every boot)"
 fi

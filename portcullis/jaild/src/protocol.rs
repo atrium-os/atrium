@@ -95,7 +95,12 @@ pub enum Request {
     /// end; the caller hands `epair_b` to jail(8) as `vnet.interface` and
     /// configures the app end (the `mac`, the address, the route) from the
     /// host before the app runs. Refused unless pf isolation is loaded.
-    AllocateNet { jail_name: String, mac: String },
+    AllocateNet {
+        jail_name: String,
+        mac: String,
+        #[serde(default)]
+        grants: Option<NetGrants>,
+    },
 
     /// Release what [`Request::AllocateNet`] made for `jail_name`: destroy
     /// the epair, free the /30. Idempotent.
@@ -350,7 +355,13 @@ pub enum NetworkConfig {
     /// app's derived, locally-administered address, never the real NIC's. The
     /// host end joins interface group `atrium`, where pf blocks app->host and
     /// app->app; jaild refuses this unless those rules are loaded.
-    Routed { mac: String },
+    Routed {
+        mac: String,
+        /// Finer grants (network.md §0.1). `None` = outbound anywhere — what
+        /// `network = "full"` means — still never the host or another app.
+        #[serde(default)]
+        grants: Option<NetGrants>,
+    },
     /// An own stack with ONLY a working loopback (the `loopback` capability):
     /// vnet=new, its own `lo0` up on 127.0.0.1/::1, nothing else — no
     /// interface to the host or anything beyond it. Configured before the app
@@ -572,4 +583,41 @@ mod tests {
             other => panic!("wrong variant: {other:?}"),
         }
     }
+}
+
+/// ★ Structured per-app network grants (network.md §0.1). jaild renders the
+/// app's pf anchor FROM these — it never loads rule text a caller wrote — and
+/// validates every field, so a caller can narrow an app's reach but cannot
+/// write a rule that reaches the host or another app without that app's
+/// consent (a peer grant only ever names a consent TABLE).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct NetGrants {
+    /// This app's consent key — 16 lowercase hex, from its app id — naming the
+    /// tables its `inbound` ports publish its address in.
+    pub app_key: String,
+    #[serde(default)]
+    pub outbound_any: bool,
+    #[serde(default)]
+    pub outbound: Vec<NetDest>,
+    #[serde(default)]
+    pub peers: Vec<NetPeer>,
+    #[serde(default)]
+    pub inbound: Vec<u16>,
+}
+
+/// An outbound destination, already resolved: an IPv4 CIDR (`a.b.c.d/n`).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct NetDest {
+    pub cidr: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub udp: bool,
+}
+
+/// Another app this one may dial: that app's consent key and the port.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct NetPeer {
+    pub app_key: String,
+    pub port: u16,
 }

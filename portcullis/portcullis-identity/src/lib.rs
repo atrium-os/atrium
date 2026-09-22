@@ -119,6 +119,15 @@ pub fn load_or_create_secret(path: &Path) -> io::Result<[u8; 32]> {
     }
 }
 
+/// The consent key naming an app's inbound pf tables (network.md §0.1):
+/// 16 hex of SHA-256 over a domain label and the app id. No machine secret —
+/// the DIALER must derive the same key from the target's app id — and table
+/// names are only visible to root on the host anyway.
+pub fn consent_key(app_id: &str) -> String {
+    let d = Sha256::new().chain_update(b"atrium-consent/v1\0").chain_update(app_id.as_bytes()).finalize();
+    d[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// The identity for `app_id` on this machine.
 pub fn for_app(app_id: &str) -> io::Result<HostIdentity> {
     Ok(derive(&load_or_create_secret(Path::new(SECRET_PATH))?, app_id))
@@ -190,6 +199,15 @@ mod tests {
         assert_eq!(a.mac, derive(&S1, "org.x.cad").mac);
         assert_ne!(a.mac, derive(&S1, "org.y.eda").mac);
         assert_ne!(a.mac, derive(&S2, "org.x.cad").mac);
+    }
+
+    #[test]
+    fn consent_keys_are_stable_hex16_per_app() {
+        let k = consent_key("org.atrium.db");
+        assert_eq!(k.len(), 16);
+        assert!(k.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_eq!(k, consent_key("org.atrium.db"));
+        assert_ne!(k, consent_key("org.atrium.web"));
     }
 
     #[test]

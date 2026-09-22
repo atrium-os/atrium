@@ -61,6 +61,10 @@ pub struct RoutedNet {
     pub slot:      u32,
     /// The host end (`epairNa`); destroying it destroys the pair.
     pub epair_a:   String,
+    /// Consent tables this app's address was published in (its `inbound`),
+    /// withdrawn on release (network.md §0.1).
+    #[serde(default)]
+    pub tables:    Vec<String>,
 }
 
 impl PersistentState {

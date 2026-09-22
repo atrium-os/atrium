@@ -53,6 +53,9 @@ pub struct JailConfig {
     /// a config still pending is refused (portcullis_mounts::ensure_network_ready),
     /// never run on the host's stack.
     pub needs_routed_net: Option<String>,
+    /// The app's id and `network` spec for that network — what the launcher
+    /// turns into jaild grants (network.md §0.1). Set by build() with the MAC.
+    pub routed_net_spec: Option<(String, portcullis_toml::NetworkSpec)>,
     /// Set by [`JailConfig::attach_routed_net`].
     pub routed_net_attached: bool,
 }
@@ -66,6 +69,7 @@ impl JailConfig {
             mounts: Vec::new(),
             devfs_actions: Vec::new(),
             needs_routed_net: None,
+            routed_net_spec: None,
             routed_net_attached: false,
         }
     }

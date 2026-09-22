@@ -7,17 +7,23 @@
 # Every networked app sits on its own point-to-point /30 from 100.64.0.0/16;
 # the host end of each app's epair is in interface group `atrium`.
 #
-# ★★ The two blocks are LOAD-BEARING: measured without them, an app reached the
+# ★★ The blocks are LOAD-BEARING: measured without them, an app reached the
 # host's sshd through its own gateway address. jaild refuses to create a
-# networked jail unless both are loaded (jaild/src/routed.rs isolation_loaded).
+# networked jail unless the host block, the anchor point and the final block
+# are all loaded (jaild/src/routed.rs isolation_loaded).
 ext_if = "EXT_IF"
 
 set skip on lo0
 nat on $ext_if inet from 100.64.0.0/16 to any -> ($ext_if)
 
-# An app never reaches the host itself — any of the host's addresses.
+# An app never reaches the host itself — any of the host's addresses. First,
+# so no per-app grant can undo it.
 block in quick on atrium inet from any to (self)
-# Nor another app: every app is on its own /30, so this is all routed traffic.
-block in quick on atrium inet from any to 100.64.0.0/16
+# Each networked app's grants, rendered by jaild from structured grants
+# (network.md §0.1): consented peers, then that app's own block to
+# 100.64.0.0/16, then its outbound passes. All `quick`.
+anchor "atrium/*"
+# Everything else from an app: denied — including other apps.
+block in quick on atrium
 
 pass all

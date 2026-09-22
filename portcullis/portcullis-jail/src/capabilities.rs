@@ -41,8 +41,8 @@ pub fn apply_all(
             apply_filesystem(p, jc, opts)?;
         }
     }
-    if let Some(net) = caps.network {
-        apply_network(net, jc);
+    if let Some(net) = &caps.network {
+        apply_network(net.mode(), jc);
     }
     if let Some(fonts) = &caps.fonts {
         for p in &fonts.paths {

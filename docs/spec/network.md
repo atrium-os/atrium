@@ -201,6 +201,35 @@ periodic re-resolution belongs).
 **Refused, not ignored:** `lan_alias`, `expose`, `mdns` — a manifest asking for them fails to
 parse with the reason, so an app never runs believing it has them.
 
+**BUILT and verified (2026-09-22).** `portcullis_toml::NetworkSpec` (string or table; refusals
+with reasons; serialize→parse fixed point); `portcullis_oneshot::net_grants` (hostnames → IPv4
+/32s at launch, an unresolvable name refuses the launch; peers → consent keys,
+`portcullis_identity::consent_key`); jaild `NetGrants` on `Routed` and `AllocateNet`, shape-validated,
+anchor rendered by jaild (`routed::render_anchor`: peers → the app's own 100.64/16 block →
+outbound), consent tables filled on launch and emptied on release; base ruleset now host-block →
+`anchor "atrium/*"` → final app block. VM, both the one-shot and jail(8) lanes:
+
+| app | result |
+|---|---|
+| `network = "full"` | internet allowed, host blocked (regression) |
+| `outbound = ["example.com:80"]` | example.com allowed (DNS via auto-granted resolver), 1.1.1.1 blocked, host blocked |
+| client, `peers = [server:8080, server:9090]`; server `inbound = [8080]` | 8080 ALLOWED, 9090 blocked (never consented) |
+| stranger, `outbound = "any"`, no peers | both server ports blocked — "any" never reaches an app |
+| after exit | no jail, anchor, epair or slot; the consent table emptied |
+
+The pf semantics this relies on were proven first, with a control: `quick` inside an anchor ends
+evaluation; an anchor sees main-ruleset tables; the per-anchor app block stops a 0/0 outbound from
+reaching a listening peer. Release also KILLS the app's states: a flushed anchor is freed only once
+no state from its rules lives (measured: ~90 s of TCP close timeouts), and states keyed on a
+released address would otherwise match the next app handed that /30.
+
+**V1 limits (open):**
+- **No peer discovery.** An app cannot learn a peer's current address (the test found it from the
+  host). Needs a name service or a hosts entry written at launch — atrium-netd territory.
+- **Policy grants the MODE.** The user's grant is `none`/`loopback`/`full`; a `full` grant covers
+  any narrower table, and the table's destinations are enforced at launch, not shown in the prompt.
+- **Hostnames resolve once, at launch**; re-resolution belongs to atrium-netd.
+
 ## 1. Principle
 
 > **A jail's network access is a capability the user grants

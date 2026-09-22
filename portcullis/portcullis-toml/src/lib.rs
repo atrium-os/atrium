@@ -14,6 +14,7 @@
 //! library, suitable for the CLI, future portcullisd, and IDE
 //! tooling that wants to lint atrium.toml files.
 
+pub mod network;
 pub mod schema;
 pub mod validate;
 
@@ -24,6 +25,7 @@ pub use schema::{
     SupervisionSection,
 };
 pub use validate::{validate, Report};
+pub use network::{Dest, NetworkGrants, NetworkSpec, Outbound, Peer, Proto};
 
 /// Parse + validate in one call. Returns the parsed manifest plus a
 /// validation report; the report may have warnings even on success.

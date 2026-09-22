@@ -329,7 +329,13 @@ fn run_one_jail(
     let mut jc = jc.clone();
     let networked = jc.needs_routed_net.clone();
     if let Some(mac) = &networked {
-        let (b, app, host) = jaild::client::allocate_net(Path::new(JAILD_SOCK), &jc.name, mac)
+        /* The app's finer grants (network.md §0.1), hostnames resolved now. */
+        let grants = match &jc.routed_net_spec {
+            Some((id, spec)) => portcullis_oneshot::net_grants(spec, id)
+                .map_err(|e| LaunchError::Failed("network", e))?,
+            None => None,
+        };
+        let (b, app, host) = jaild::client::allocate_net(Path::new(JAILD_SOCK), &jc.name, mac, grants)
             .map_err(|e| LaunchError::Failed("network", e))?;
         jc.attach_routed_net(&b, &app, &host).map_err(|e| LaunchError::Failed("network", e))?;
         /* Names resolve through the host's resolvers, over NAT. Written into the

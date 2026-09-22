@@ -1,5 +1,5 @@
 # network must be one of "none" | "loopback" | "full".
-# EXPECT_ERROR: unknown variant
+# EXPECT_ERROR: expected "none", "loopback", "full" or a table
 [app]
 id      = "org.example.x"
 name    = "X"

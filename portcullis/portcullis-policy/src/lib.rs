@@ -313,8 +313,11 @@ pub fn compute_delta(
         }
     }
 
-    if let Some(req_net) = requested.network {
-        let granted_net = g.and_then(|c| c.network).unwrap_or(NetworkCap::None);
+    // V1: the MODE is what the user grants (network.md §0.1); a `full` grant
+    // covers any narrower table, whose destinations are enforced at launch.
+    if let Some(req_net) = requested.network.as_ref().map(|n| n.mode()) {
+        let granted_net = g.and_then(|c| c.network.as_ref().map(|n| n.mode()))
+            .unwrap_or(NetworkCap::None);
         if net_level(req_net) > net_level(granted_net) {
             d.network_upgrade = Some(req_net);
         }
@@ -337,7 +340,7 @@ mod tests {
             open_uri:   None,
             audio:      Some(true),
             filesystem: Some(vec!["~/Documents".into(), "~/Projects".into()]),
-            network:    Some(NetworkCap::Loopback),
+            network:    Some(portcullis_toml::NetworkSpec::Mode(NetworkCap::Loopback)),
             fonts:      None,
             tessera_cas_read: None,
             usb_hid:    None,
@@ -393,9 +396,9 @@ mod tests {
     #[test]
     fn delta_network_downgrade_is_not_in_delta() {
         let mut req = caps_full();
-        req.network = Some(NetworkCap::None);
+        req.network = Some(portcullis_toml::NetworkSpec::Mode(NetworkCap::None));
         let mut g = Capabilities::default();
-        g.network = Some(NetworkCap::Full);
+        g.network = Some(portcullis_toml::NetworkSpec::Mode(NetworkCap::Full));
         let d = compute_delta(&req, Some(&g), None, "h");
         assert!(d.network_upgrade.is_none());
     }

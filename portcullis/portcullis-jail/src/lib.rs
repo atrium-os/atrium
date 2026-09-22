@@ -226,6 +226,8 @@ pub fn build(manifest: &Manifest, opts: &BuildOpts) -> Result<JailConfig, BuildE
     /* The app's derived MAC for a pending network (never the real NIC's). */
     if jc.needs_routed_net.is_some() {
         jc.needs_routed_net = Some(opts.host_identity.mac.clone());
+        jc.routed_net_spec = manifest.capabilities.network.clone()
+            .map(|s| (manifest.app.id.clone(), s));
     }
 
     /* Network defaults to "none" if no capability set it. */

@@ -265,7 +265,8 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
     }
     // A networked worker resolves names through the host's resolvers (reached
     // over NAT). Written into the discarded tmpfs layer, never the signed tree.
-    if matches!(manifest.capabilities.network, Some(portcullis_toml::NetworkCap::Full)) {
+    let net_mode = manifest.capabilities.network.as_ref().map(|n| n.mode());
+    if matches!(net_mode, Some(portcullis_toml::NetworkCap::Full)) {
         let etc = jail_path.join("etc");
         if let Err(e) = std::fs::create_dir_all(&etc)
             .and_then(|_| std::fs::copy("/etc/resolv.conf", etc.join("resolv.conf")).map(|_| ()))
@@ -306,6 +307,10 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
     // worker ever writes to the caller's pipe. The devfs ruleset is checked
     // loaded by jaild (§9.1b), and the exit status is the worker's own rather
     // than jail(8)'s collapse of every failure to 1.
+    let network = match jaild_network(manifest.capabilities.network.as_ref(), &manifest.app.id, &host_identity) {
+        Ok(n) => n,
+        Err(e) => { teardown(&jail_path, &jail_name); return OneShot::Refused(format!("network: {e}")); }
+    };
     let entry = format!("/{}", manifest.entry());
     let req = jaild::protocol::Request::CreateJail(jaild::protocol::CreateJailRequest {
         name:          jail_name.clone(),
@@ -315,7 +320,7 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         devfs_ruleset: portcullis_jail::APP_DEVFS_RULESET,
         // ★ Isolated, not Disable: an own empty vnet, so the worker cannot
         // list the host's interfaces or read its real MAC (§9.1c).
-        network:       jaild_network(manifest.capabilities.network, &host_identity),
+        network,
         exec: Some(jaild::protocol::ExecSpec {
             path:  entry.clone(),
             argv:  vec![entry],
@@ -403,19 +408,63 @@ fn jaild_mounts(jc: &portcullis_jail::JailConfig, root: &Path)
     }).collect()
 }
 
+/// Turn a manifest's `network` into the structured grants jaild renders
+/// (network.md §0.1). `Ok(None)` for `network = "full"` (outbound anywhere).
+///
+/// ★ Hostnames are resolved HERE, once, at launch, to IPv4 /32s — jaild never
+/// sees a name. A name that does not resolve REFUSES the launch rather than
+/// running the app with a silently shorter allow-list.
+pub fn net_grants(spec: &portcullis_toml::NetworkSpec, app_id: &str)
+    -> Result<Option<jaild::protocol::NetGrants>, String>
+{
+    use jaild::protocol::{NetDest, NetGrants, NetPeer};
+    let Some(g) = spec.grants() else { return Ok(None) };
+    let mut out = NetGrants {
+        app_key: portcullis_identity::consent_key(app_id),
+        inbound: g.inbound.clone(),
+        peers: g.peers.iter().map(|p| NetPeer {
+            app_key: portcullis_identity::consent_key(&p.app_id), port: p.port }).collect(),
+        ..Default::default()
+    };
+    match &g.outbound {
+        portcullis_toml::Outbound::Any => out.outbound_any = true,
+        portcullis_toml::Outbound::List(list) => for d in list {
+            let udp = d.proto == portcullis_toml::Proto::Udp;
+            let cidrs: Vec<String> = if d.host.contains('/') {
+                vec![d.host.clone()]
+            } else if d.host.parse::<std::net::Ipv4Addr>().is_ok() {
+                vec![format!("{}/32", d.host)]
+            } else {
+                use std::net::ToSocketAddrs;
+                let v4: Vec<String> = (d.host.as_str(), 0).to_socket_addrs()
+                    .map_err(|e| format!("outbound {:?}: cannot resolve: {e}", d.host))?
+                    .filter_map(|a| match a.ip() { std::net::IpAddr::V4(ip) => Some(format!("{ip}/32")), _ => None })
+                    .collect();
+                if v4.is_empty() { return Err(format!("outbound {:?}: no IPv4 address", d.host)) }
+                v4
+            };
+            for cidr in cidrs { out.outbound.push(NetDest { cidr, port: d.port, udp }) }
+        },
+    }
+    Ok(Some(out))
+}
+
 /// The jail's network (network.md §0). Every worker gets its OWN stack:
 /// `Isolated` (only a down lo0) without the capability, `Routed` with it — a
 /// point-to-point epair carrying the app's derived MAC, never the real NIC's.
-fn jaild_network(cap: Option<portcullis_toml::NetworkCap>, id: &portcullis_identity::HostIdentity)
-    -> jaild::protocol::NetworkConfig
+fn jaild_network(spec: Option<&portcullis_toml::NetworkSpec>, app_id: &str,
+                 id: &portcullis_identity::HostIdentity)
+    -> Result<jaild::protocol::NetworkConfig, String>
 {
-    match cap {
-        Some(portcullis_toml::NetworkCap::Full) =>
-            jaild::protocol::NetworkConfig::Routed { mac: id.mac.clone() },
+    Ok(match spec.map(|s| s.mode()) {
+        Some(portcullis_toml::NetworkCap::Full) => jaild::protocol::NetworkConfig::Routed {
+            mac: id.mac.clone(),
+            grants: net_grants(spec.expect("mode came from it"), app_id)?,
+        },
         Some(portcullis_toml::NetworkCap::Loopback) =>
             jaild::protocol::NetworkConfig::Loopback,
         _ => jaild::protocol::NetworkConfig::Isolated,
-    }
+    })
 }
 
 /// Ask jaild to create the jail and run the entry on `stdio` (this process's

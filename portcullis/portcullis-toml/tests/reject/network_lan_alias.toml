@@ -1,0 +1,11 @@
+# A capability that cannot be enforced yet is REFUSED, never ignored (network.md §0.1).
+# EXPECT_ERROR: network.lan_alias
+[app]
+id = "org.example.lan"
+name = "LAN"
+version = "1"
+entry = "bin/x"
+
+[capabilities.network]
+outbound = "any"
+lan_alias = true
