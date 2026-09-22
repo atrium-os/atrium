@@ -1692,6 +1692,47 @@ The CLI dev mode (`--allow-all`) bypasses prompts for development.
 A trusted-installer mode (`--policy /etc/atrium/policy.toml`)
 pre-grants for headless deployments.
 
+### 7.1 The trusted-installer grant — BUILT (2026-09-22)
+
+A headless component has nobody to prompt: the Navigator's fetcher, launched by a
+broker. The per-user policy cannot help, because `/var/db/atrium/<user>/` is root-owned
+**on purpose**: a user process that could write its own policy could grant itself
+anything. So the installer grants, in `/etc/atrium/policy.toml`:
+
+    portcullis policy grant  --system <app-id>     # root
+    portcullis policy revoke --system <app-id>
+
+**Three rules, each tested:**
+1. **A grant that could be forged is not a grant.** `load_system` refuses the file unless
+   it, and every directory above it, is root-owned and not group/other-writable. The
+   refusal is not silent: the launch error says "the system policy was not used: …",
+   and `grant --system` reads its own write back through the same check, reporting
+   "written, but NOT EFFECTIVE" rather than succeeding at nothing.
+2. **It pins the exact manifest.** A system grant covers a launch only when its manifest
+   hash is the current one. A changed manifest was approved by nobody, so it is simply
+   not covered. (A *user* grant re-prompts on a change; a system grant has nobody to
+   re-prompt.)
+3. **One decision everywhere.** `portcullis_policy::decide` (user grant first, then
+   system) is used by every check: the daemon's one-shot lane, `Launch`, `Authorize`,
+   the CLI's fallback and `policy check`. No path can consult one policy and forget
+   the other.
+
+**Verified in the VM, daemon lane, fetcher launched as uid 1001:**
+
+| arm | result |
+|---|---|
+| no system grant | refused ("needs … full network access") |
+| `grant --system`: file `-rw-r--r-- root wheel` | **runs**; the M1 gate passes inside the jail; the daemon logs "authorized by System policy" |
+| file made `664` | refused, with "system policy was not used: … must be owned by root and not group/other-writable" |
+| mode restored | runs |
+| manifest re-signed with a version bump | refused (hash no longer matches) |
+| original manifest reinstalled | runs |
+| `revoke --system` | refused |
+
+**The direct lane consults no policy at all.** It requires a root caller, and root can
+write any policy file, so that is root's authority, not a grant. (An earlier note that
+the in-jail fetcher run used "root's own grant" was wrong: nothing read it.)
+
 ## 8. Integration with existing Atrium pieces
 
 ### 8.1 Tessera

@@ -844,13 +844,10 @@ fn check_authorization(
     }
     let policy_path = portcullis_policy::Policy::user_path(&current_user());
     let policy = portcullis_policy::Policy::load(&policy_path)?;
-    let prior = policy.grants.get(app_id);
-    let delta = portcullis_policy::compute_delta(
-        requested,
-        prior.map(|g| &g.capabilities),
-        prior.map(|g| g.manifest_hash.as_str()),
-        manifest_hash,
-    );
+    let system = portcullis_policy::Policy::load_system(std::path::Path::new(portcullis_policy::SYSTEM_PATH));
+    let d = portcullis_policy::decide(app_id, requested, manifest_hash, &policy, system.as_ref());
+    if let Some(why) = &d.system_unusable { eprintln!("portcullis: system policy unusable: {why}") }
+    let delta = d.delta;
     if delta.is_empty() {
         Ok(None)
     } else {
@@ -964,16 +961,15 @@ fn policy_diff(args: &[String]) -> ExitCode {
     };
 
     let current_hash = portcullis_policy::hash_manifest(text.as_bytes());
-    let prior        = policy.grants.get(id);
-    let delta = portcullis_policy::compute_delta(
-        &manifest.capabilities,
-        prior.map(|g| &g.capabilities),
-        prior.map(|g| g.manifest_hash.as_str()),
-        &current_hash,
-    );
+    // The same decision a launch makes — user grant, then installer grant.
+    let system = portcullis_policy::Policy::load_system(std::path::Path::new(portcullis_policy::SYSTEM_PATH));
+    let d = portcullis_policy::decide(id, &manifest.capabilities, &current_hash, &policy, system.as_ref());
+    if let Some(why) = &d.system_unusable { eprintln!("system policy unusable: {why}") }
+    let delta = d.delta;
 
     if delta.is_empty() {
-        println!("{id}: all requested capabilities already granted");
+        println!("{id}: all requested capabilities already granted ({:?} policy)",
+                 d.by.expect("an empty delta names its source"));
         return ExitCode::SUCCESS;
     }
     println!("{id} wants:");
@@ -985,8 +981,9 @@ fn policy_diff(args: &[String]) -> ExitCode {
 }
 
 fn policy_grant(args: &[String]) -> ExitCode {
+    if args.len() == 2 && args[0] == "--system" { return policy_grant_system(&args[1]) }
     if args.len() != 1 {
-        eprintln!("usage: portcullis policy grant <app-id>");
+        eprintln!("usage: portcullis policy grant [--system] <app-id>");
         return ExitCode::from(2);
     }
     let id = &args[0];
@@ -1134,9 +1131,59 @@ fn cmd_daemon(args: &[String]) -> ExitCode {
     }
 }
 
+/// The trusted-installer grant (portcullis.md §7): pins the CURRENT
+/// manifest, for every user, in the root-owned system policy.
+///
+/// ★ Verified by reading it back through `load_system` — the same refusal
+/// rules a launch applies. A grant written somewhere the loader will not
+/// trust (not root-owned, group/other-writable) would be a grant that
+/// silently does nothing; it is reported as a failure instead.
+fn policy_grant_system(id: &str) -> ExitCode {
+    let (text, manifest) = match load_app_manifest(id) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("{e}"); return ExitCode::from(1); }
+    };
+    let path = std::path::Path::new(portcullis_policy::SYSTEM_PATH);
+    let mut policy = match portcullis_policy::Policy::load_system(path) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("{}: {e}", path.display()); return ExitCode::from(1); }
+    };
+    policy.grants.insert(id.to_string(), portcullis_policy::Grant {
+        manifest_hash: portcullis_policy::hash_manifest(text.as_bytes()),
+        granted_at:    portcullis_policy::now_iso8601(),
+        capabilities:  manifest.capabilities.clone(),
+    });
+    if let Err(e) = policy.save_system(path) {
+        eprintln!("save {}: {e} (the system policy is root's to write)", path.display());
+        return ExitCode::from(1);
+    }
+    match portcullis_policy::Policy::load_system(path) {
+        Ok(p) if p.grants.contains_key(id) => {
+            println!("granted (system, this manifest only) all capabilities to {id} → {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Ok(_) => { eprintln!("{}: grant did not read back", path.display()); ExitCode::from(1) }
+        Err(e) => { eprintln!("written, but NOT EFFECTIVE: {e}"); ExitCode::from(1) }
+    }
+}
+
 fn policy_revoke(args: &[String]) -> ExitCode {
+    if args.len() == 2 && args[0] == "--system" {
+        let path = std::path::Path::new(portcullis_policy::SYSTEM_PATH);
+        let mut policy = match portcullis_policy::Policy::load_system(path) {
+            Ok(p) => p,
+            Err(e) => { eprintln!("{}: {e}", path.display()); return ExitCode::from(1); }
+        };
+        if policy.grants.remove(&args[1]).is_none() {
+            eprintln!("no system grant to revoke for {}", args[1]);
+            return ExitCode::from(1);
+        }
+        if let Err(e) = policy.save_system(path) { eprintln!("save {}: {e}", path.display()); return ExitCode::from(1) }
+        println!("revoked system grant for {}", args[1]);
+        return ExitCode::SUCCESS;
+    }
     if args.len() != 1 {
-        eprintln!("usage: portcullis policy revoke <app-id>");
+        eprintln!("usage: portcullis policy revoke [--system] <app-id>");
         return ExitCode::from(2);
     }
     let id = &args[0];

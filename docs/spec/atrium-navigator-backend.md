@@ -883,12 +883,13 @@ needs a grant and "there is nobody to prompt on this path". But `navtest` cannot
 grant either, because `/var/db/atrium/<user>/` is root-owned. That matches §7: a user
 process that could write its own policy could grant itself capabilities. The mechanism
 §7 names for this case, the trusted-installer policy (`/etc/atrium/policy.toml`
-pre-grants), is not built. The in-jail run therefore used the direct lane (root caller,
-`--user navtest`, root's own grant). Building the installer grant is a prerequisite for
-the broker to launch the fetcher unattended.
+pre-grants), was not built. The in-jail run therefore used the direct lane (root caller,
+`--user navtest`). That lane consults no policy at all, so an earlier "root's own grant"
+here was wrong. **Since built** (portcullis.md §7.1): with
+`portcullis policy grant --system org.atrium.navigator.fetcher`, the daemon lane launches
+the fetcher unattended as uid 1001, and the gate passes inside the jail.
 
 **Not yet:**
-- the trusted-installer grant above;
 - the converter's `Fetcher` seam implemented against `navigator-fetchd`;
 - a per-host request count for the report (legacy-web §5.4.1d, rule 4).
 

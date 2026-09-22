@@ -326,6 +326,110 @@ pub fn compute_delta(
     d
 }
 
+// ── system (trusted-installer) policy ─────────────────────────────
+
+/// The installer's grants: portcullis.md §7's "trusted-installer mode", for
+/// components nobody is present to approve — the Navigator's fetcher, a
+/// headless service. Written by root (`portcullis policy grant --system`).
+pub const SYSTEM_PATH: &str = "/etc/atrium/policy.toml";
+
+/// Who authorized a launch — for the audit line, and so a test can tell a
+/// user grant from an installer grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantSource { User, System }
+
+/// The outcome of checking a launch against both policies.
+#[derive(Debug)]
+pub struct Decision {
+    /// Empty iff authorized. When neither policy covers the launch, this is
+    /// the USER's delta — what a prompt would ask them — not the system's.
+    pub delta: CapabilityDelta,
+    pub by: Option<GrantSource>,
+    /// Why the system policy was not consulted, if it could not be.
+    pub system_unusable: Option<String>,
+}
+
+impl Policy {
+    /// Load the system policy, refusing one that is not the installer's.
+    ///
+    /// ★ A GRANT THAT COULD BE FORGED IS NOT A GRANT. The file and every
+    /// directory above it must be owned by root and not writable by group or
+    /// other, or anyone who can write there could grant any app anything.
+    /// Missing file → empty policy (the normal case).
+    pub fn load_system(path: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = match fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e),
+        };
+        let check = |p: &Path, m: &fs::Metadata| -> io::Result<()> {
+            if m.uid() != 0 || m.mode() & 0o022 != 0 {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!(
+                    "{} must be owned by root and not group/other-writable \
+                     (uid {}, mode {:o}) — the system policy is ignored", p.display(), m.uid(), m.mode() & 0o7777)));
+            }
+            Ok(())
+        };
+        if !meta.is_file() {
+            return Err(io::Error::other(format!("{} is not a regular file", path.display())));
+        }
+        check(path, &meta)?;
+        let mut dir = path.parent();
+        while let Some(d) = dir {
+            if d.as_os_str().is_empty() { break }
+            check(d, &fs::metadata(d)?)?;
+            dir = d.parent();
+        }
+        Self::load(path)
+    }
+
+    /// Persist the system policy: root-owned, 0644, atomically.
+    pub fn save_system(&self, path: &Path) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+        let body = toml::to_string_pretty(self).map_err(io::Error::other)?;
+        let tmp = path.with_extension("toml.tmp");
+        fs::write(&tmp, body)?;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644))?;
+        fs::rename(&tmp, path)
+    }
+}
+
+/// Is this launch authorized — by the user, or by the installer?
+///
+/// The user's grant is consulted first, with the usual rule (a changed
+/// manifest re-prompts). The system grant covers a launch only when its
+/// manifest hash is EXACTLY the current one: an installer approved that
+/// manifest, and a different manifest was not approved by anyone. So a
+/// system grant never "re-prompts" — it simply stops applying.
+pub fn decide(
+    app_id: &str,
+    requested: &Capabilities,
+    current_hash: &str,
+    user: &Policy,
+    system: Result<&Policy, &io::Error>,
+) -> Decision {
+    let prior = user.grants.get(app_id);
+    let delta = compute_delta(requested, prior.map(|g| &g.capabilities),
+                              prior.map(|g| g.manifest_hash.as_str()), current_hash);
+    if delta.is_empty() {
+        return Decision { delta, by: Some(GrantSource::User), system_unusable: None };
+    }
+    let system = match system {
+        Ok(p) => p,
+        Err(e) => return Decision { delta, by: None, system_unusable: Some(e.to_string()) },
+    };
+    if let Some(g) = system.grants.get(app_id) {
+        if g.manifest_hash == current_hash
+            && compute_delta(requested, Some(&g.capabilities), Some(&g.manifest_hash), current_hash).is_empty()
+        {
+            return Decision { delta: CapabilityDelta::default(), by: Some(GrantSource::System), system_unusable: None };
+        }
+    }
+    Decision { delta, by: None, system_unusable: None }
+}
+
 // ── tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -432,5 +536,74 @@ mod tests {
         assert_eq!(h1, h2);
         assert!(h1.starts_with("sha256:"));
         assert_ne!(h1, hash_manifest(b"world"));
+    }
+
+    // ---- system policy + decide ----
+
+    fn grant(caps: Capabilities, hash: &str) -> Grant {
+        Grant { manifest_hash: hash.into(), granted_at: "t".into(), capabilities: caps }
+    }
+    fn net_full() -> Capabilities {
+        let mut c = caps_full();
+        c.network = Some(portcullis_toml::NetworkSpec::Mode(NetworkCap::Full));
+        c
+    }
+
+    #[test]
+    fn a_system_grant_authorizes_what_no_user_granted() {
+        let mut sys = Policy::default();
+        sys.grants.insert("org.x".into(), grant(net_full(), "sha256:m1"));
+        let d = decide("org.x", &net_full(), "sha256:m1", &Policy::default(), Ok(&sys));
+        assert!(d.delta.is_empty());
+        assert_eq!(d.by, Some(GrantSource::System));
+    }
+
+    #[test]
+    fn a_system_grant_does_not_cover_a_changed_manifest() {
+        let mut sys = Policy::default();
+        sys.grants.insert("org.x".into(), grant(net_full(), "sha256:m1"));
+        let d = decide("org.x", &net_full(), "sha256:m2", &Policy::default(), Ok(&sys));
+        assert!(!d.delta.is_empty(), "an installer approved m1, not m2");
+        assert_eq!(d.by, None);
+    }
+
+    #[test]
+    fn a_system_grant_does_not_cover_more_than_it_granted() {
+        let mut sys = Policy::default();
+        sys.grants.insert("org.x".into(), grant(caps_full() /* loopback */, "sha256:m1"));
+        let d = decide("org.x", &net_full(), "sha256:m1", &Policy::default(), Ok(&sys));
+        assert!(d.delta.network_upgrade.is_some());
+    }
+
+    #[test]
+    fn the_user_grant_is_consulted_first() {
+        let mut user = Policy::default();
+        user.grants.insert("org.x".into(), grant(net_full(), "sha256:m1"));
+        let d = decide("org.x", &net_full(), "sha256:m1", &user, Ok(&Policy::default()));
+        assert_eq!(d.by, Some(GrantSource::User));
+    }
+
+    #[test]
+    fn an_unusable_system_policy_grants_nothing_and_says_why() {
+        let e = io::Error::other("not root-owned");
+        let d = decide("org.x", &net_full(), "sha256:m1", &Policy::default(), Err(&e));
+        assert!(!d.delta.is_empty());
+        assert!(d.system_unusable.unwrap().contains("not root-owned"));
+    }
+
+    #[test]
+    fn a_group_writable_system_policy_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("pp-sys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("policy.toml");
+        std::fs::write(&f, "").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o664)).unwrap();
+        // Not root-owned either (tests do not run as root) — refused whichever
+        // check fires first; the point is that it is refused, not trusted.
+        assert!(Policy::load_system(&f).is_err());
+        // Control: a missing file is an empty policy, not an error.
+        assert!(Policy::load_system(&dir.join("absent.toml")).unwrap().grants.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

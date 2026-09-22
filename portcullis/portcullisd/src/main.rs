@@ -49,7 +49,7 @@ use portcullis_ipc::{
     read_request, write_response, GovSignal, Request, Response, PROTO_VERSION,
     SERVICE_SOCKET_PATH, SOCKET_PATH,
 };
-use portcullis_policy::{compute_delta, hash_manifest, now_iso8601, Grant, Policy};
+use portcullis_policy::{decide, hash_manifest, now_iso8601, Grant, Policy, SYSTEM_PATH};
 
 mod launch;
 use portcullisd::manifest_trust;
@@ -496,18 +496,21 @@ fn handle_exec_instance(
                 message: format!("policy load for {user}: {e}"),
             }),
         };
-        let prior = tp.policy.grants.get(&app_id);
-        compute_delta(&manifest.capabilities,
-                      prior.map(|g| &g.capabilities),
-                      prior.map(|g| g.manifest_hash.as_str()),
-                      &current_hash)
+        let system = Policy::load_system(std::path::Path::new(SYSTEM_PATH));
+        let d = decide(&app_id, &manifest.capabilities, &current_hash, &tp.policy, system.as_ref());
+        if let Some(why) = &d.system_unusable { eprintln!("portcullisd: system policy unusable: {why}") }
+        if let Some(by) = d.by { eprintln!("portcullisd: {app_id} authorized by {by:?} policy (one-shot lane, user {user})") }
+        d
     };
+    let (delta, system_unusable) = (delta.delta, delta.system_unusable);
     if !delta.is_empty() {
         let why = format!(
             "{} needs capabilities that are not granted: {}. \
              There is nobody to prompt on this path — grant them first with \
-             `portcullis policy grant {}`, or launch it as an application.",
-            app_id, delta.describe().join("; "), app_id);
+             `portcullis policy grant {}` (or, for a headless component, \
+             `portcullis policy grant --system {}` as root), or launch it as an application.{}",
+            app_id, delta.describe().join("; "), app_id, app_id,
+            system_unusable.map(|w| format!(" (The system policy was not used: {w}.)")).unwrap_or_default());
         eprintln!("portcullisd: REFUSED {app_id} on the one-shot lane — {why}");
         return write_response(writer, &Response::LaunchFailed {
             stage: "policy".into(), message: why,
@@ -652,13 +655,10 @@ fn handle_launch(
                 message: format!("policy load for {user}: {e}"),
             }),
         };
-        let prior = tp.policy.grants.get(&app_id);
-        let delta = compute_delta(
-            &manifest.capabilities,
-            prior.map(|g| &g.capabilities),
-            prior.map(|g| g.manifest_hash.as_str()),
-            &current_hash,
-        );
+        let system = Policy::load_system(std::path::Path::new(SYSTEM_PATH));
+        let d = decide(&app_id, &manifest.capabilities, &current_hash, &tp.policy, system.as_ref());
+        if let Some(why) = &d.system_unusable { eprintln!("portcullisd: system policy unusable: {why}") }
+        let delta = d.delta;
         drop(s);
         if !delta.is_empty() {
             return write_response(writer, &Response::LaunchNeedsApproval {
@@ -1060,13 +1060,10 @@ fn handle(req: Request, user: &str, shared: &Mutex<Tenants>) -> Response {
                     message: format!("policy load for {user}: {e}"),
                 },
             };
-            let prior = tp.policy.grants.get(&app_id);
-            let delta = compute_delta(
-                &requested,
-                prior.map(|g| &g.capabilities),
-                prior.map(|g| g.manifest_hash.as_str()),
-                &manifest_hash,
-            );
+            let system = Policy::load_system(std::path::Path::new(SYSTEM_PATH));
+            let d = decide(&app_id, &requested, &manifest_hash, &tp.policy, system.as_ref());
+            if let Some(why) = &d.system_unusable { eprintln!("portcullisd: system policy unusable: {why}") }
+            let delta = d.delta;
             if delta.is_empty() {
                 Response::Authorized
             } else {
