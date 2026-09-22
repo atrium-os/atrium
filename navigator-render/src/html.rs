@@ -11,7 +11,7 @@
 //! where they occur. Every `display` value in the profile is laid out.
 
 use crate::fontset::{Family, FontSet};
-use crate::{scale, Link, Rect, Report, Run, Scene, Shaper, Style as FontStyle, Xform, PX, U, XF_ONE};
+use crate::{scale, Link, Rect, Report, Run, Scene, Shadow, Shaper, Style as FontStyle, Xform, PX, U, XF_ONE};
 use navigator_dom::{Dom, Handle, Kind};
 use navigator_style::cascade::{cascade, Env, Style};
 use navigator_style::sheet::{parse_sheet, Diagnostic, Stylesheet};
@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 /// so a property the layout ignores can never be dropped silently (§5.1).
 /// Value-level gaps inside a read row (flex as block, italic without an
 /// italic face, …) are counted where they occur.
-pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 54, 55, 57, 59, 60, 61, 62, 63, 64];
+pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 54, 55, 56, 57, 59, 60, 61, 62, 63, 64];
 
 pub struct HtmlOut {
     pub scene: Scene,
@@ -474,8 +474,27 @@ impl<'a> Cx<'a> {
                 for r in edge(ow, sx, sy, length, horiz, ostyle, oc) { self.scene.rect(r) }
             }
         }
-        let painted = paint.len();
-        for (i, r) in paint.into_iter().enumerate() { self.scene.insert_rect(bg_slot + i, r) }
+        let n_paint = paint.len();
+        // ★ The shadow goes BEHIND the box, so it is inserted at the slot
+        // first and the box's own rects land after it. The spread inflates
+        // the box on every side, and the corner radii with it (CSS Backgrounds
+        // 3 §6.2: shadow radius = box radius + spread, floored at 0).
+        let mut slot = bg_slot;
+        if !hidden {
+            if let V::Shadow { x: sx, y: sy, blur, spread, color } = s.get("box-shadow") {
+                let sp = u(spread.v);
+                let current = match s.get("color") { V::Color(c) => rgba(c, 0x000000ff), _ => 0x000000ff };
+                let sh = Shadow { x: bx + u(sx.v) - sp, y: by + u(sy.v) - sp, w: w + 2 * sp, h: hgt + 2 * sp,
+                                  rgba: rgba(color, current), blur: u(blur.v).max(0),
+                                  radii: radii.map(|r| if r > 0 { (r + sp).max(0) } else { 0 }) };
+                if sh.w > 0 && sh.h > 0 && sh.rgba & 0xff != 0 {
+                    self.scene.insert_shadow(slot, sh);
+                    slot += 1;
+                }
+            }
+        }
+        for (i, r) in paint.into_iter().enumerate() { self.scene.insert_rect(slot + i, r) }
+        let painted = n_paint + (slot - bg_slot);
         // ★ Inserting this box's background at the slot reserved before the
         // children SHIFTS every entry after it, so the ranges the children
         // recorded no longer point at what they painted. Move them.
@@ -1782,6 +1801,29 @@ mod tests {
         assert_eq!(o.scene.rect_attrs[red].2, Some(1));
     }
 
+    /// A shadow is a node of its own, BEHIND the box, inflated by the
+    /// spread on every side — corner radii included.
+    #[test]
+    fn box_shadow_is_a_node_behind_the_box() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .s { width: 100px; height: 40px; background-color: #ffffff; border-top-left-radius: 8px;
+                 box-shadow: 4px 6px 10px 2px #0000007f }</style>
+            <div class="s"></div>"#);
+        assert_eq!(o.scene.shadows.len(), 1);
+        let sh = &o.scene.shadows[0];
+        // Offset by (4, 6), inflated by the 2px spread on every side.
+        assert_eq!((sh.x, sh.y, sh.w, sh.h), (2 * 64, 4 * 64, 104 * 64, 44 * 64));
+        assert_eq!((sh.blur, sh.rgba), (10 * 64, 0x0000007f));
+        // radius + spread, and a square corner stays square.
+        assert_eq!(sh.radii, [10 * 64, 0, 0, 0]);
+        // It paints before the box's own background.
+        let first = o.scene.order.first().copied();
+        assert_eq!(first, Some((3, 0)), "the shadow is painted first: {:?}", o.scene.order);
+        // visibility: hidden paints neither the box nor its shadow.
+        let h = render(r#"<style>.s { width: 100px; height: 40px; visibility: hidden; box-shadow: 4px 6px 10px 2px #000000 }</style><div class="s"></div>"#);
+        assert!(h.scene.shadows.is_empty());
+    }
+
     #[test]
     fn z_index_orders_painting() {
         // Tree order would paint red last; z-index puts it under both, and
@@ -1800,8 +1842,8 @@ mod tests {
     /// must show up, and its initial value must not.
     #[test]
     fn an_unread_property_is_counted_and_its_initial_value_is_not() {
-        let o = render(r#"<style>.a { box-shadow: 1px 1px 2px 0px #000000 } .b { box-shadow: none }</style><div class="a">x</div><div class="b">y</div>"#);
-        assert_eq!(o.unimplemented.get("row box-shadow… (not implemented)"), Some(&1), "{:?}", o.unimplemented);
+        let o = render(r#"<style>.a { object-fit: cover } .b { object-fit: fill }</style><div class="a">x</div><div class="b">y</div>"#);
+        assert_eq!(o.unimplemented.get("row object-fit… (not implemented)"), Some(&1), "{:?}", o.unimplemented);
     }
 
     /// CSS automatic minimum size: a flex item does not shrink below its

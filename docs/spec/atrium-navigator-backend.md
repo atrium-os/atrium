@@ -980,7 +980,7 @@ layout.
 
 ### 8.3 M2 progress — the number, first reading (2026-09-22)
 
-**CONFORMANCE: exercised 58/64, matched 56/64** (13 on first reading; see the updates
+**CONFORMANCE: exercised 59/64, matched 57/64** (13 on first reading; see the updates
 below). Printed by `nsg-conformance`; the
 matched set is pinned by a test so it cannot fall silently.
 
@@ -1287,6 +1287,17 @@ Every `display` value the profile admits is now laid out; nothing in §3.3 is co
   `--corpus` now prints: **same input digest, different output digest = the renderer
   changed; both different = the corpus was edited.** Today, over 118 documents:
   input `7e3631ef…`, output `970ad79f…`.
+
+**Update — box-shadow, matched 56 → 57 (row 56).**
+- **NSG gains a fourth node kind**: `shadow <x> <y> <w> <h> <rgba> <blur> [r<radii>]`,
+  carrying the shadow's own rectangle — the box offset by the shadow's offset and
+  inflated by its spread on every side, with each non-zero corner radius grown by the
+  spread (CSS Backgrounds 3 §6.2). A separate node, so the existing attributes (clip,
+  group, transform) and the painting-order sort apply to it unchanged.
+- It is inserted at the slot reserved for the box's background, **before** it, so a
+  shadow paints behind its own box. `visibility: hidden` paints neither.
+- Blur is left to the consumer, as rasterization always is; the review rasterizer
+  approximates it with three box passes at sigma = blur / 2.
 
 ## 9. What this reuses
 

@@ -14,6 +14,7 @@
 //! rect <x> <y> <w> <h> <rrggbbaa> [r<tl>,<tr>,<br>,<bl>] [b<ring>] [c<i>] [g<i>] [x<i>]
 //! run f<i> <size> <rrggbbaa> <x> <y> <em 0|1> <gid>:<dx>,<dy> … "<text>" [c<i>] [g<i>] [x<i>]
 //! link <x> <y> <w> <h> "<href>" [c<i>] [x<i>]
+//! shadow <x> <y> <w> <h> <rrggbbaa> <blur> [r<tl>,<tr>,<br>,<bl>] [c<i>] [g<i>] [x<i>]
 //! ```
 
 use crate::fontset::FontSet;
@@ -85,6 +86,13 @@ pub fn write(scene: &Scene, fonts: &FontSet) -> String {
                 for (g, dx, dy) in &r.glyphs { let _ = write!(o, " {g}:{dx},{dy}"); }
                 let _ = write!(o, " {}", quote(&r.text));
                 attrs(&mut o, scene.run_attrs.get(i));
+                o.push('\n');
+            }
+            3 => {
+                let sh = &scene.shadows[i];
+                let _ = write!(o, "shadow {} {} {} {} {:08x} {}", sh.x, sh.y, sh.w, sh.h, sh.rgba, sh.blur);
+                if sh.radii != [0; 4] { let _ = write!(o, " r{},{},{},{}", sh.radii[0], sh.radii[1], sh.radii[2], sh.radii[3]); }
+                attrs(&mut o, scene.shadow_attrs.get(i));
                 o.push('\n');
             }
             _ => {

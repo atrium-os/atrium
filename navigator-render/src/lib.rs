@@ -70,6 +70,11 @@ pub struct Run {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Link { pub x: U, pub y: U, pub w: U, pub h: U, pub href: String }
 
+/// A box shadow: the box's own rect, offset and inflated by the spread,
+/// blurred by `blur` and painted BEHIND the box (profile §3.8, one shadow).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shadow { pub x: U, pub y: U, pub w: U, pub h: U, pub rgba: u32, pub blur: U, pub radii: [U; 4] }
+
 /// What a node is clipped by and which opacity group it belongs to, as
 /// indices into the scene's `clips` and `groups`.
 ///
@@ -91,7 +96,8 @@ pub struct Scene {
     pub rects: Vec<Rect>,
     pub runs: Vec<Run>,
     pub links: Vec<Link>,
-    /// Draw order across the three kinds: (kind, index). 0 rect, 1 run, 2 link.
+    pub shadows: Vec<Shadow>,
+    /// Draw order: (kind, index). 0 rect, 1 run, 2 link, 3 shadow.
     pub order: Vec<(u8, usize)>,
     /// Clip rectangles, each already intersected with its ancestors', so a
     /// node needs only one index and a reader needs no stack.
@@ -110,14 +116,23 @@ pub struct Scene {
     pub rect_attrs: Vec<Attrs>,
     pub run_attrs: Vec<Attrs>,
     pub link_attrs: Vec<Attrs>,
+    pub shadow_attrs: Vec<Attrs>,
     /// The clip and group a node created now belongs to.
-    pub(crate) cur: Attrs,
+    /// Public only so review tooling can build a scene of one node.
+    pub cur: Attrs,
 }
 
 impl Scene {
     pub(crate) fn rect(&mut self, r: Rect) { self.order.push((0, self.rects.len())); self.rects.push(r); self.rect_attrs.push(self.cur) }
     pub(crate) fn run(&mut self, r: Run) { self.order.push((1, self.runs.len())); self.runs.push(r); self.run_attrs.push(self.cur) }
     pub(crate) fn link(&mut self, l: Link) { self.order.push((2, self.links.len())); self.links.push(l); self.link_attrs.push(self.cur) }
+    /// A shadow painted into a slot reserved earlier — it goes BEHIND the
+    /// box, so it is inserted before the box's own background.
+    pub(crate) fn insert_shadow(&mut self, slot: usize, sh: Shadow) {
+        self.order.insert(slot, (3, self.shadows.len()));
+        self.shadows.push(sh);
+        self.shadow_attrs.push(self.cur);
+    }
     /// A rect painted into a slot reserved earlier (a box's own background,
     /// which is decided only after its children are laid out).
     pub(crate) fn insert_rect(&mut self, slot: usize, r: Rect) {

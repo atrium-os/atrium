@@ -6,7 +6,7 @@
 //! canonical font bytes the scene names (web-font condition 2a), at the run's
 //! sub-pixel position.
 
-use navigator_render::{fontset::FontSet, html::render_html, render, Options, Scene, PX};
+use navigator_render::{fontset::FontSet, html::render_html, render, Options, Rect, Scene, PX};
 use navigator_style::cascade::Env;
 
 struct Canvas {
@@ -123,7 +123,50 @@ fn paint_one(cv: &mut Canvas, scene: &Scene, fonts: &FontSet, ctx: &mut swash::s
                 }
             }
         }
+        3 => {
+            let sh = &scene.shadows[i];
+            // The shadow is painted into a layer of its own and blurred
+            // there: three box passes are a close enough Gaussian for a
+            // review render, with sigma = blur / 2 as CSS specifies.
+            let mut layer = Canvas { w: cv.w, h: cv.h, px: vec![[0.0; 4]; cv.w * cv.h], clip: None };
+            let mut sub = Scene { width: scene.width, height: scene.height, ..Default::default() };
+            sub.order.push((0, 0));
+            sub.rects.push(Rect { x: sh.x, y: sh.y, w: sh.w, h: sh.h, rgba: sh.rgba, radii: sh.radii, ring: 0 });
+            sub.rect_attrs.push((None, None, None));
+            paint_one(&mut layer, &sub, fonts, ctx, 0, 0);
+            let sigma = sh.blur as f64 / PX as f64 / 2.0;
+            if sigma > 0.0 {
+                let bw = ((sigma * 3.0 * (2.0 * std::f64::consts::PI).sqrt() / 4.0 + 0.5) as usize).max(1);
+                for _ in 0..3 { box_blur(&mut layer, bw) }
+            }
+            for y in 0..cv.h as i64 {
+                for x in 0..cv.w as i64 {
+                    let src = layer.px[y as usize * layer.w + x as usize];
+                    if src[3] > 0.0 { cv.blend(x, y, sh.rgba & !0xff | 0xff, src[3]) }
+                }
+            }
+        }
         _ => {}
+    }
+}
+
+/// One box-blur pass, horizontal then vertical, over the alpha channel.
+fn box_blur(cv: &mut Canvas, r: usize) {
+    let (w, h) = (cv.w, cv.h);
+    let mut tmp = vec![[0.0f32; 4]; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let (mut a, mut n) = (0.0f32, 0.0f32);
+            for k in x.saturating_sub(r)..=(x + r).min(w - 1) { a += cv.px[y * w + k][3]; n += 1.0 }
+            tmp[y * w + x] = [0.0, 0.0, 0.0, a / n];
+        }
+    }
+    for x in 0..w {
+        for y in 0..h {
+            let (mut a, mut n) = (0.0f32, 0.0f32);
+            for k in y.saturating_sub(r)..=(y + r).min(h - 1) { a += tmp[k * w + x][3]; n += 1.0 }
+            cv.px[y * w + x] = [0.0, 0.0, 0.0, a / n];
+        }
     }
 }
 
