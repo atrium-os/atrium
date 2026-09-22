@@ -157,7 +157,7 @@ Then re-run this script."
     ok "xcode command line tools"
 
     missing=''
-    for f in llvm bmake python3 git; do
+    for f in llvm lld bmake python3 git; do
         brew --prefix "$f" >/dev/null 2>&1 || missing="$missing $f"
     done
     if [ -n "$missing" ]; then
@@ -370,20 +370,32 @@ Expected contents:
     ok "installed bmake by hand around the macOS test failures (v$(echo "$out" | tail -1))"
 }
 
+# Every make.py build runs through here. Xcode 27's libc++ no longer builds
+# LLVM 21 (RDFGraph.cpp trips a static_assert), so Apple clang cannot be the host
+# compiler for the bootstrap toolchain. Setting XCC alone is not enough: make.py
+# still picks the host compiler from /usr/bin. --host-bindir moves the host side
+# to Homebrew's LLVM, and XCC/XCXX/XCPP/XLD do the same for the cross side.
+fbsd_make() {
+    L=$(brew --prefix llvm)/bin
+    ( cd "$FBSD_SRC" && env MAKEOBJDIRPREFIX="$OBJDIR" \
+        XCC="$L/clang" XCXX="$L/clang++" XCPP="$L/clang-cpp" \
+        XLD="$(brew --prefix lld)/bin/ld.lld" \
+        python3 tools/build/make.py --host-bindir="$L" --host-compiler-type=clang \
+        TARGET=arm64 TARGET_ARCH=aarch64 "$@" )
+}
+
 ph_kernel() {
     ensure_bmake
     # kernel-toolchain first: buildkernel needs config(8) and the cross tools,
     # and without it the failure is a confusing "config: command not found".
     head_ "building the kernel toolchain (~6 min)"
-    ( cd "$FBSD_SRC" && env MAKEOBJDIRPREFIX="$OBJDIR" python3 tools/build/make.py \
-        TARGET=arm64 TARGET_ARCH=aarch64 -j"$JOBS" kernel-toolchain ) \
+    fbsd_make -j"$JOBS" kernel-toolchain \
         > "$LOGS/kernel-toolchain.log" 2>&1 \
         || die "kernel-toolchain failed" "See $LOGS/kernel-toolchain.log"
     ok "kernel toolchain"
 
     head_ "cross-building the FreeBSD kernel (~2-3 min)"
-    ( cd "$FBSD_SRC" && env MAKEOBJDIRPREFIX="$OBJDIR" python3 tools/build/make.py \
-        TARGET=arm64 TARGET_ARCH=aarch64 -j"$JOBS" buildkernel KERNCONF=GENERIC ) \
+    fbsd_make -j"$JOBS" buildkernel KERNCONF=GENERIC \
         > "$LOGS/buildkernel.log" 2>&1 \
         || die "buildkernel failed" "See $LOGS/buildkernel.log"
 
@@ -406,9 +418,8 @@ ph_kmod() {
     kd="$REPO/atrium-tessera/kmod"
     head_ "cross-building tessera_fs.ko"
     rm -f "$kd/tessera_fs.ko"
-    ( cd "$FBSD_SRC" && env MAKEOBJDIRPREFIX="$OBJDIR" python3 tools/build/make.py \
-        TARGET=arm64 TARGET_ARCH=aarch64 buildenv \
-        BUILDENV_SHELL="/bin/sh -c 'cd $kd && make -j$JOBS SYSDIR=$FBSD_SRC/sys'" ) \
+    fbsd_make buildenv \
+        BUILDENV_SHELL="/bin/sh -c 'cd $kd && make -j$JOBS SYSDIR=$FBSD_SRC/sys'" \
         > "$LOGS/kmod.log" 2>&1 \
         || die "tessera_fs.ko build failed" "See $LOGS/kmod.log"
     [ -f "$kd/tessera_fs.ko" ] || die "kmod build exited 0 but produced no .ko" "See $LOGS/kmod.log"
