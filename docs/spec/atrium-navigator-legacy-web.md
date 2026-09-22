@@ -368,6 +368,48 @@ question 6 reached from the other side, which is some evidence it is the right s
 *The flag stays in the code, off by default, so the measurement can be repeated rather than
 believed.*
 
+### 5.4.1d Settled: the converter's OWN subresources — typed cross-origin GET
+
+§5.4.1c governs requests a page's *scripts* make. It says nothing about the converter's
+own fetches of the stylesheets and fonts a document declares, which the document lane
+needs in order to be laid out at all (Profile v1 admits web fonts as required inputs).
+Measured on the 171-document corpora, with the stylesheets and fonts already fetched for
+the profile's ceilings:
+
+| | cross-origin | documents where ALL of them are cross-origin |
+|---|---|---|
+| linked stylesheets | 204 of 634 | **25 of 133** documents with linked CSS |
+| `@font-face` sources | 602 of 1,140 | **35 of 80** font-using documents |
+
+Same-origin would give GitHub and every Discourse forum no CSS at all. The cross-origin
+hosts are overwhelmingly the site's **own** CDN (`githubassets`, `cdninstagram`, `guim`,
+`bbci`, `scdn`, `elpais`), which same-*site* would not rescue either. The main genuine third
+party is Google Fonts.
+
+**Settled (user, 2026-09-22): the converter may GET stylesheets and fonts from any
+origin, under structural rules:**
+
+1. **Only what the document declares:** `<link rel=stylesheet>` (and inline `<style>`),
+   `@import` (depth ≤ 4), `@font-face src`. Never a URL a script computes, and never a
+   `url()` of any other kind through this path.
+2. **GET, no credentials, no Referer, no cookies accepted.** The CDN learns that the
+   document was converted, and by which address. It learns that **once per conversion,
+   which is shared by every reader of it**, not once per reader as a browser would report.
+3. **Typed:** a response is kept only if it canonicalizes as a font (`navigator-fonts`) or
+   is accepted as CSS. Anything else is discarded and counted. A beacon endpoint yields
+   nothing usable.
+4. **Counted and reported by host**, like every page-network refusal, so the traffic is
+   visible rather than assumed.
+5. **Through the `Fetcher` seam**: in the shipped design, the brokered fetcher (backend
+   §2) is the only holder of network.
+
+**No blocklist**, for the reason §5.4.1c's code gives: a filter list is an arms race and
+is wrong the day it ships. Declared-only plus typed responses is the structural floor, and
+it is the same shape as the page-network rule rather than an exception to it.
+(Recorded explicitly because the option first put to the user mentioned a tracker
+blocklist; the tree has none and deliberately so. Adding one on top is a separate
+decision.)
+
 ### 5.4.2 Never emit an artifact worse than the input
 
 Because tier 2 is tier 1's DOM plus whatever the scripts changed, both artifacts are in

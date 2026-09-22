@@ -488,13 +488,21 @@ occur.
 4. **Bounded** — bytes per font, fonts per document, glyphs per font (§3.12).
 5. **No `unicode-range`, so no automatic subsetting.** Subsetting is the producer's job,
    done once at conversion and content-addressed.
-   ★ **Open: RANGE-SPLIT families.** Web-font services ship one family as several faces
-   split by `unicode-range` (13 of the 20 variable fonts above have no Latin glyphs at
-   all, so they are slices). The producer cannot drop the ranges without deciding what
-   replaces them, and `allsorts` cannot merge faces. The candidates are keeping each
-   slice as its own face, with the worker selecting by `cmap` coverage (which is
-   `unicode-range` decided by the font rather than the descriptor), or merging. It will
-   be decided after measuring how common it is. The honest cost is CJK: a full CJK face
+   **Range-split families — settled (user, 2026-09-22): keep the NEEDED slices, as
+   separate faces.** Web-font services ship one family as several faces split by
+   `unicode-range`. Measured:
+   - 15 of the 84 font-using documents have such a family: 50 families, always **7**
+     slices each (Google Fonts' latin, latin-ext, cyrillic, cyrillic-ext, greek,
+     greek-ext, vietnamese);
+   - the document's own text needs **1** slice at p50, 2 at p90, and 4 at most.
+
+   The producer therefore keeps only the slices whose range the document's characters
+   fall in. Each is canonicalized as its own face, and the worker picks a face within
+   the family by `cmap` coverage. That is `unicode-range` decided by the font's own
+   table instead of a descriptor the producer would have to trust. There is no merging:
+   `allsorts` cannot merge faces, and a merger would be new code on hostile input. (The
+   text measure counts every character in the document, not only those the family
+   styles, so it is an upper bound.) The honest cost is CJK: a full CJK face
    is large, and without range-splitting it is one large required input. ★ **A web font
    does not rescue a bad shipped font set** — the profile's own stacks must cover the
    scripts it claims to serve, and §1.3's limit on international text is unchanged by this
