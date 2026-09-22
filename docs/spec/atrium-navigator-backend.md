@@ -1278,7 +1278,12 @@ Every `display` value the profile admits is now laid out; nothing in §3.3 is co
 - The review rasterizer paints a transformed node into a layer of its own and
   **inverse-maps** it into place — exact for rotation, and it reuses every painter
   unchanged.
-- M0 corpus digest, unchanged by this (no transform in the Markdown lane): `457a130a…`.
+- ★ **The corpus digest is not a regression signal, and I misread it as one.** The corpus
+  IS the repo's tracked Markdown, including this file — so editing a spec changes the
+  digest, and a run before an edit can never be compared with a run after it. What the
+  gate actually proves is that **two runs over the same corpus agree**, which they do
+  (`9a5576a3…`, twice, after this edit). A digest worth quoting across time needs a
+  FROZEN corpus; that is a follow-up, not something the live repo can give.
 
 ## 9. What this reuses
 
