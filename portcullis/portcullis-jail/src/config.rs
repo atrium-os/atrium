@@ -84,6 +84,10 @@ impl JailConfig {
     /// stdout through, and on the daemon lane that is the caller's pipe —
     /// `route` printed "add net default: gateway …" into the app's output
     /// (measured), the same corruption `jail -q` was added for.
+    ///
+    /// ★ And a 1 s MSL in the app's own stack (per-vnet; the host keeps 30 s):
+    /// TIME_WAIT in a stack that is destroyed at exit protects nothing, and it
+    /// kept the jail dying — root pinned — for 2×30 s (measured).
     pub fn attach_routed_net(&mut self, epair_b: &str, app_addr: &str, host_addr: &str) -> Result<(), String> {
         let Some(mac) = self.needs_routed_net.clone() else {
             return Err(format!("jail {} did not ask for a network", self.name));
@@ -92,7 +96,8 @@ impl JailConfig {
         self.set("exec.created", Value::String(format!(
             "ifconfig {epair_b} vnet {n} && ifconfig -j {n} {epair_b} ether {mac} \
              && ifconfig -j {n} {epair_b} inet {app_addr}/30 up \
-             && ifconfig -j {n} lo0 inet 127.0.0.1/8 up && route -q -j {n} add default {host_addr}")));
+             && ifconfig -j {n} lo0 inet 127.0.0.1/8 up && route -q -j {n} add default {host_addr} \
+             && sysctl -j {n} net.inet.tcp.msl=1000 >/dev/null")));
         self.routed_net_attached = true;
         Ok(())
     }

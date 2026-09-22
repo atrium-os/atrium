@@ -108,6 +108,36 @@ pub fn converge(roots: &[&Path], force: Force) -> Vec<PathBuf> {
     under(roots)
 }
 
+/// Wait (bounded) until no jail named `name` exists, dying ones included.
+///
+/// ★★ A DYING JAIL PINS ITS ROOT. It holds a reference to the root vnode until
+/// it is finally freed, so its mounts cannot be unmounted — and a teardown that
+/// tried anyway left the pile STACKED: measured, a relaunch inside the window
+/// left 4 mounts on one app root. A networked jail dies slowly (TCP TIME_WAIT
+/// in its own stack held one for 2×MSL = 60 s), so every teardown waits here
+/// between `jail -r` and unmounting. Returns false at the deadline; the caller
+/// then reports survivors rather than guessing.
+pub fn wait_jail_gone(name: &str, timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        let exists = Command::new("jls").args(["-d", "-j", name, "jid"])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false);
+        if !exists { return true }
+        if start.elapsed() >= timeout {
+            eprintln!("portcullis: jail {name} is still dying after {}s — its mounts \
+                       stay pinned until it is freed", timeout.as_secs());
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// How long a teardown waits for a dying jail. App stacks run with a 1 s MSL
+/// (TIME_WAIT 2 s — network.md §0), so this is several times the expected
+/// worst case, not a guess at it.
+pub const JAIL_GONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Report survivors. ★ Gate on the mounts being GONE, not on having called
 /// umount: a silent leak is invisible until the stack is unrecoverable.
 pub fn warn_survivors(who: &str, survivors: &[PathBuf]) {

@@ -618,6 +618,9 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
      * exit), then umount in reverse order — and the network after the jail
      * is gone, so its epair end has come home to be destroyed. */
     let _ = Command::new("jail").arg("-r").arg(&jc.name).status();
+    /* ★★ A dying jail pins its root, and its epair end only comes home when it
+     * is freed: wait for it before releasing the network or unmounting. */
+    portcullis_mounts::wait_jail_gone(&jc.name, portcullis_mounts::JAIL_GONE_TIMEOUT);
     release(&jc.name);
     teardown(&jail_path);
 

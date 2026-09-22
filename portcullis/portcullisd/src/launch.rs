@@ -377,6 +377,8 @@ fn run_one_jail_inner(
      * (mount.devfs, capability mounts) without touching the
      * overarching overlay union. */
     let _ = Command::new("jail").arg("-r").arg(&jc.name).status();
+    /* ★★ A dying jail pins its root; unmount only once it is gone. */
+    portcullis_mounts::wait_jail_gone(&jc.name, portcullis_mounts::JAIL_GONE_TIMEOUT);
     let _ = umount(&jail_path.join("dev"));
 
     let code = match status {

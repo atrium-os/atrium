@@ -603,6 +603,9 @@ fn sh(cmd: &str, args: &[&str]) -> std::io::Result<()> {
 fn teardown(jail_path: &Path, jail_name: &str) {
     let _ = Command::new("jail").arg("-r").arg(jail_name)
         .stderr(std::process::Stdio::null()).status();
+    // ★★ A dying jail pins its root: unmounting before it is gone stacks the
+    // pile (portcullis_mounts::wait_jail_gone).
+    portcullis_mounts::wait_jail_gone(jail_name, portcullis_mounts::JAIL_GONE_TIMEOUT);
     let upper = upper_dir(jail_name);
     // ★ Remove the rctl rule with the jail. Rules are keyed by NAME, and the
     // name is reused by the next worker with that instance tag: a rule left

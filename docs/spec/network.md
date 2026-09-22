@@ -109,8 +109,19 @@ nothing can fall back to the host's stack. Two jail(8) facts learned by measurem
 there is quiet (`route -q` — `route` printed into the app's output). Verified with a CLI
 `portcullis launch` of the same signed test app: same MAC as the one-shot lane
 (`be:b2:7c:ac:62:b5` — one identity per app across lanes), internet allowed, host blocked both
-ways, epair and slot released. A networked jail can stay `dying` for a while after exit (seen up
-to ~90 s, then gone; absent in a controlled rerun) — transient, not accumulating.
+ways, epair and slot released.
+
+**★★ Dying networked jails pinned their roots — FIXED.** A networked jail stayed `dying` after
+exit for **exactly 2×MSL = 60 s** whenever the app closed a TCP connection first (reproduced
+deterministically with an app that does; the TIME_WAIT lives in the app's OWN stack). I first
+called an observation of this "transient"; it was not harmless: a dying jail holds its root vnode,
+so a relaunch inside the window could not unmount the previous layers and **stacked 4 mounts on
+the app root** (measured). Two fixes: every app stack runs with `net.inet.tcp.msl=1000` (per-vnet —
+the host keeps 30 s; TIME_WAIT in a stack destroyed at exit protects nothing), and every teardown
+(daemon launch, CLI launch, one-shot) waits, bounded (`portcullis_mounts::wait_jail_gone`, 10 s),
+for the jail to be gone before unmounting or releasing its network. Verified: 3 back-to-back
+launches and 3 back-to-back one-shots of the close-first app — 2–3 s each, no dying jail after
+return, no stacked mounts, no warnings, no epairs or slots left.
 **Not exercised:** the daemon's `launch` path (shares the functions; this VM runs no
 user-facing portcullisd socket).
 

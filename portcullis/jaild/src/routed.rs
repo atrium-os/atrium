@@ -91,6 +91,11 @@ pub fn configure_app_end(jail: &str, b: &str, mac: &str, slot: u32) -> io::Resul
     sh("ifconfig", &["-j", jail, b, "inet", &format!("{app}/30"), "up"])?;
     sh("ifconfig", &["-j", jail, "lo0", "inet", "127.0.0.1/8", "up"])?;
     sh("route", &["-q", "-j", jail, "add", "default", &host])?;
+    // ★ A 1 s MSL in the APP's stack only (net.inet.tcp.msl is per-vnet; the
+    // host's stays 30 s). The stack is destroyed when the app exits, so TIME_WAIT
+    // after that protects nothing — and while it lasts it keeps the jail dying
+    // and its root pinned: 2×30 s, measured. 2×1 s bounds that.
+    sh("sysctl", &["-j", jail, "net.inet.tcp.msl=1000"])?;
     Ok(())
 }
 
