@@ -122,8 +122,14 @@ the host keeps 30 s; TIME_WAIT in a stack destroyed at exit protects nothing), a
 for the jail to be gone before unmounting or releasing its network. Verified: 3 back-to-back
 launches and 3 back-to-back one-shots of the close-first app — 2–3 s each, no dying jail after
 return, no stacked mounts, no warnings, no epairs or slots left.
-**Not exercised:** the daemon's `launch` path (shares the functions; this VM runs no
-user-facing portcullisd socket).
+**Daemon `launch` path — exercised (2026-09-22).** A signed `network = "full"` app launched
+THROUGH portcullisd (`PORTCULLIS_SOCKET` override; `launch_with_stdio → run_one_jail`) as the
+unprivileged `navtest`: run as its dedicated per-app uid (`atrium-app-50000`), own epair, the same
+derived MAC as the other lanes, internet allowed, host blocked both ways; nothing left afterwards.
+It exposed one defect, fixed: the daemon and CLI launch ran `jail -c` without `-q` while handing it
+the caller's stdout, so the app's output began with jail(8)'s "<name>: created" — the corruption
+the one-shot lane had already fixed. Now `jail -q -c`, and the post-exit `jail -r` safety net is
+quiet (its "not found" is expected).
 
 **★★★ A KERNEL LIVELOCK this exposed — Laminar priority inheritance was a no-op (FIXED,
 atrium-os cb93bfeffce1).** Per-app vnets mean every jail exit destroys a vnet, and

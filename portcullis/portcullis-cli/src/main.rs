@@ -610,14 +610,16 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
         return ExitCode::from(1);
     }
     let status = Command::new("jail")
-        .arg("-c").arg("-f").arg(&conf_path).arg(&jc.name)
+        // -q: jail(8)'s "<name>: created" goes to stdout — the app's stream.
+        .arg("-q").arg("-c").arg("-f").arg(&conf_path).arg(&jc.name)
         .status();
     let _ = fs::remove_file(&conf_path);
 
     /* Teardown: jail -r (idempotent if already removed by exec.start
      * exit), then umount in reverse order — and the network after the jail
      * is gone, so its epair end has come home to be destroyed. */
-    let _ = Command::new("jail").arg("-r").arg(&jc.name).status();
+    let _ = Command::new("jail").arg("-q").arg("-r").arg(&jc.name)
+        .stderr(std::process::Stdio::null()).status();
     /* ★★ A dying jail pins its root, and its epair end only comes home when it
      * is freed: wait for it before releasing the network or unmounting. */
     portcullis_mounts::wait_jail_gone(&jc.name, portcullis_mounts::JAIL_GONE_TIMEOUT);

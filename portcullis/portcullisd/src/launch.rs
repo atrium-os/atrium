@@ -365,7 +365,12 @@ fn run_one_jail_inner(
                    format!("write {}: {e}", conf_path.display())));
     }
     let mut cmd = Command::new("jail");
-    cmd.arg("-c").arg("-f").arg(&conf_path).arg(&jc.name);
+    /* ★★ `-q`: jail(8) prints "<name>: created" on STDOUT, and stdout here is
+     * the CALLER's (received over SCM_RIGHTS) — the app's own output stream.
+     * Measured 2026-09-22: a daemon launch's output began with
+     * "test_e2e_nettest: created". The one-shot lane hit the same corruption
+     * and fixed it the same way. */
+    cmd.arg("-q").arg("-c").arg("-f").arg(&conf_path).arg(&jc.name);
     if let Some([sin, sout, serr]) = stdio {
         cmd.stdin (Stdio::from(sin));
         cmd.stdout(Stdio::from(sout));
@@ -376,7 +381,10 @@ fn run_one_jail_inner(
     /* Per-jail teardown: jail -r releases the jail's specific mounts
      * (mount.devfs, capability mounts) without touching the
      * overarching overlay union. */
-    let _ = Command::new("jail").arg("-r").arg(&jc.name).status();
+    /* The jail usually removed itself when its last process exited, so this
+     * is a safety net; its "not found" is expected, not news for the log. */
+    let _ = Command::new("jail").arg("-q").arg("-r").arg(&jc.name)
+        .stderr(Stdio::null()).status();
     /* ★★ A dying jail pins its root; unmount only once it is gone. */
     portcullis_mounts::wait_jail_gone(&jc.name, portcullis_mounts::JAIL_GONE_TIMEOUT);
     let _ = umount(&jail_path.join("dev"));
@@ -424,7 +432,8 @@ fn run_one_jail_inner(
 /// still using it. This path reports survivors instead.
 fn full_teardown(jail_path: &Path, jail_name: Option<&str>) {
     if let Some(n) = jail_name {
-        let _ = Command::new("jail").arg("-r").arg(n).status();
+        let _ = Command::new("jail").arg("-q").arg("-r").arg(n)
+            .stderr(Stdio::null()).status();
     }
     let left = portcullis_mounts::converge(&[jail_path], portcullis_mounts::Force::No);
     portcullis_mounts::warn_survivors("portcullisd", &left);
