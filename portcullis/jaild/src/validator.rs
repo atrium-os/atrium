@@ -35,6 +35,34 @@ pub fn validate_create(
     if let Some(exec) = &req.exec {
         validate_exec(exec, policy, is_instance_root(req, policy))?;
     }
+    validate_host_identity(req)?;
+    Ok(())
+}
+
+/// The synthetic host identity (portcullis.md §9.1c): a plain DNS-ish
+/// hostname, a non-zero hostid, and a lowercase 8-4-4-4-12 UUID. Values only —
+/// jaild cannot tell a synthetic identity from a real one, so this checks the
+/// shape; that callers never pass the real one is portcullis_identity's job.
+fn validate_host_identity(req: &CreateJailRequest) -> Result<(), JaildError> {
+    let bad = |rule: &'static str, detail: String| Err(JaildError::PolicyViolation { rule, detail });
+    if let Some(h) = &req.hostname {
+        let ok = !h.is_empty() && h.len() <= 255
+            && !h.starts_with(['-', '.'])
+            && h.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.');
+        if !ok { return bad("host.hostname", format!("hostname {h:?} is not a plain DNS-style name")) }
+    }
+    if req.hostid == Some(0) {
+        return bad("host.hostid", "hostid 0 is what an unconfigured jail reports; not an identity".into());
+    }
+    if let Some(u) = &req.hostuuid {
+        let shape = u.len() == 36 && u.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_digit() || ('a'..='f').contains(&c),
+        });
+        if !shape || u == "00000000-0000-0000-0000-000000000000" {
+            return bad("host.hostuuid", format!("hostuuid {u:?} is not a lowercase non-zero UUID"));
+        }
+    }
     Ok(())
 }
 
@@ -553,6 +581,9 @@ mod tests {
             devfs_ruleset: 0,
             network:       NetworkConfig::Disable,
             exec:          None,
+            hostname: None,
+            hostid: None,
+            hostuuid: None,
         };
         validate_create(&req, &p).unwrap();
     }
@@ -573,6 +604,9 @@ mod tests {
                 gid:  1001,
                 stdio,
             }),
+            hostname: None,
+            hostid: None,
+            hostuuid: None,
         }
     }
 
@@ -644,6 +678,34 @@ mod tests {
         assert!(validate_create(&r, &p).is_err());
     }
 
+    /// ★ The host identity is checked for SHAPE: hostid 0 and the zero UUID
+    /// are what an unconfigured jail reports, so they are refused as values.
+    #[test]
+    fn host_identity_shape_is_enforced() {
+        let p = load_sample_policy();
+        let base = || instance_req("app-w--1", "/var/lib/atrium/jails/app-w--1", "/bin/w", true);
+        let mut ok = base();
+        ok.hostname = Some("org.atrium.navigator.worker".into());
+        ok.hostid = Some(0x1234_5678);
+        ok.hostuuid = Some("8a1b2c3d-4e5f-8a1b-9c2d-3e4f5a6b7c8d".into());
+        validate_create(&ok, &p).unwrap();
+        for (h, id, u, rule) in [
+            (Some("-bad"), None, None, "host.hostname"),
+            (Some("a b"), None, None, "host.hostname"),
+            (None, Some(0), None, "host.hostid"),
+            (None, None, Some("00000000-0000-0000-0000-000000000000"), "host.hostuuid"),
+            (None, None, Some("8A1B2C3D-4E5F-8A1B-9C2D-3E4F5A6B7C8D"), "host.hostuuid"),
+            (None, None, Some("not-a-uuid"), "host.hostuuid"),
+        ] {
+            let mut r = base();
+            r.hostname = h.map(Into::into); r.hostid = id; r.hostuuid = u.map(Into::into);
+            match validate_create(&r, &p) {
+                Err(JaildError::PolicyViolation { rule: got, .. }) if got == rule => {}
+                other => panic!("{h:?}/{id:?}/{u:?}: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn create_request_bad_name_rejected() {
         let p = load_sample_policy();
@@ -655,6 +717,9 @@ mod tests {
             devfs_ruleset: 0,
             network:       NetworkConfig::Disable,
             exec:          None,
+            hostname: None,
+            hostid: None,
+            hostuuid: None,
         };
         let err = validate_create(&req, &p).unwrap_err();
         match err {
@@ -672,6 +737,9 @@ mod tests {
             devfs_ruleset: 0,
             network:       NetworkConfig::Disable,
             exec:          None,
+            hostname: None,
+            hostid: None,
+            hostuuid: None,
         }
     }
 

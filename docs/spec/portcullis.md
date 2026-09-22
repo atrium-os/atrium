@@ -1949,6 +1949,57 @@ the union therefore counted as no progress and `converge` stopped. The normal ex
 happened to avoid it, so no earlier failure had ever exercised it. Layers are now counted
 individually, and the one-shot teardown removes the (empty) jail root on every exit.
 
+### 9.1c Host identity — synthetic, per app, never the real machine's
+
+**Found (2026-09-22), prompted by "what does a licence manager see?".** Measured inside a
+jail made the way jaild made them:
+
+| identifier | host | jail (before) |
+|---|---|---|
+| hostname | `atrium-devroot` | empty |
+| `kern.hostid` (`gethostid(3)`) | `1333810599` | `0` |
+| `kern.hostuuid` | `94544ab3-…` | all zeros |
+| Ethernet MAC | `52:54:00:12:34:56` | **the host's, visible** (non-vnet jail) |
+
+Two failures at once: host-keyed software (FlexLM's `lmhostid` and kin) got a hostid of 0 —
+the same on every machine, so either refused or no longer node-locked — while the one thing a
+jail *could* read, the MAC, is a stable machine-wide fingerprint every app can correlate on.
+
+**Decided (user): every app gets a SYNTHETIC identity, and no capability exposes the real
+one.** `portcullis-identity` derives it as `HMAC-SHA256(machine secret, app id)` with a
+domain label: **stable** (same app, same machine → same values across launches and reboots,
+so a licence activated against it keeps working), **machine-bound** (the secret is per
+machine), **per app** (two apps cannot compare notes), and **unrelated to real hardware**.
+hostid is never 0; the UUID is RFC 9562 version 8. The secret is 32 random bytes at
+`/var/db/atrium/host-identity.key`, root, 0600, created on first use; a file of the wrong
+size, owner or mode is refused, not repaired — repairing would silently re-key every app and
+void every licence bound to it.
+
+**Wired so it cannot be forgotten.** `BuildOpts::host_identity` is REQUIRED — a launch path
+without it does not compile — and emits `host.hostid`/`host.hostuuid` beside
+`host.hostname` (= app id). jaild's `CreateJailRequest` carries `hostname`/`hostid`/`hostuuid`
+(shape-validated: DNS-style name, hostid ≠ 0, lowercase non-zero UUID; `host.hostid` passed
+as the kernel's `unsigned long`); jaild does no crypto, and its hostname defaults to the jail
+name so no jail is left nameless. The one-shot lane uses the app id — not the instance tag —
+so every worker of an app is the same "machine" to it. Session jails derive from
+`session:<user>`; a real session `create` refuses without the real identity rather than use
+the render-only placeholder.
+
+**Verified in the VM:** one-shot jails (jaild lane) and a `portcullis launch` (jail(8) lane)
+of the same app report the same `org.atrium.navigator.worker` / `2469032643` /
+`6a79b4fb-…-8617-…`, identical across instances and nothing in common with the host's; inside
+a jail `hostname`, `kern.hostid` and `kern.hostuuid` return the jail's values; corpus E2E
+unchanged (98/259/259/0).
+
+**Found on the way:** the CLI's `launch` created none of the mountpoints jail(8) needs
+(`dev`, the run user's home, capability mountpoints — the daemon's launch made all three) and
+failed at `mount.devfs: …/dev: No such file or directory` before the jail existed. Fixed.
+
+**STILL OPEN — the MAC.** A non-vnet jail still lists the host's interfaces and their real
+MACs. Hiding them needs each jail on its own network stack (vnet): loopback-only for apps
+without network, and an epair with a MAC derived like the hostid for apps with it. Until
+then the real MAC is the one host identifier a jailed app can still read.
+
 ### 9.2 Out of scope
 
 - **App-as-trojan.** A user-granted app can use its capabilities

@@ -25,6 +25,7 @@ fn opts(instance: Option<&str>) -> BuildOpts {
         devfs_ruleset: portcullis_jail::APP_DEVFS_RULESET,
         instance: instance.map(str::to_string),
         persist: true,
+        host_identity: portcullis_identity::derive(&[7u8; 32], "org.atrium.test"),
     }
 }
 

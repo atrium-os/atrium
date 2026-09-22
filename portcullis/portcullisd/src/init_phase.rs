@@ -100,6 +100,9 @@ pub fn run_init(
         network:       NetworkConfig::Disable,
         mounts,
         exec:          Some(init_exec),
+        hostname: None,
+        hostid: None,
+        hostuuid: None,
     });
 
     info!("{}: running init for volume {} (jail={})",

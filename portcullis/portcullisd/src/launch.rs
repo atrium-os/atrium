@@ -111,6 +111,11 @@ pub fn launch_with_stdio(
         Some(h) => h,
         None    => PathBuf::from("/nonexistent"),
     };
+    /* ★ The app's synthetic host identity (portcullis.md §9.1c) — derived from
+     * the BASE app id, so the setup phase below sees the same hostid/UUID the
+     * app will: a licence registered during setup must still match at run. */
+    let host_identity = portcullis_identity::for_app(&manifest.app.id)
+        .map_err(|e| LaunchError::Failed("identity", e.to_string()))?;
     let opts = BuildOpts {
         root_path:    jail_path.clone(),
         host_sockets: PathBuf::from("/atrium/sockets"),
@@ -123,6 +128,7 @@ pub fn launch_with_stdio(
          * one-shot piped path, which gets its own root per instance. */
         instance: None,
         persist: true,
+        host_identity,
     };
 
     /* Mount overlay once; both setup and runtime jails see the same

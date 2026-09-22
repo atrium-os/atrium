@@ -96,6 +96,12 @@ pub struct BuildOpts {
     /// sees EOF on the pipe that died with its parent, exits, and the jail
     /// goes with it.
     pub persist: bool,
+    /// ★★★ The host identity the jail reports — synthetic, per app, never the
+    /// real machine's (portcullis_identity; portcullis.md §9.1c). REQUIRED, not
+    /// defaulted: a launch path that forgot it would run apps with hostid 0 and
+    /// a zero UUID, and making it a compile error is how every entrance is
+    /// covered.
+    pub host_identity: portcullis_identity::HostIdentity,
 }
 
 /// Jail name for one instance of an app.
@@ -156,6 +162,8 @@ pub fn build(manifest: &Manifest, opts: &BuildOpts) -> Result<JailConfig, BuildE
 
     /* Defaults every Atrium jail wants. */
     jc.set("host.hostname", Value::String(manifest.app.id.clone()));
+    jc.set("host.hostid",   Value::Number(opts.host_identity.hostid as i64));
+    jc.set("host.hostuuid", Value::String(opts.host_identity.hostuuid.clone()));
     jc.set("persist",       Value::Bool(opts.persist));
     jc.set("mount.devfs",   Value::Bool(true));
     jc.set("devfs_ruleset", Value::Number(opts.devfs_ruleset as i64));

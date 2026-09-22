@@ -331,6 +331,17 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
         devfs_ruleset: portcullis_jail::APP_DEVFS_RULESET,
         instance: None,                /* one jail per app on this path */
         persist: true,
+        /* ★ Synthetic, per app (portcullis.md §9.1c). A dry run only RENDERS
+         * the config, so it must not create the root-only machine secret on
+         * whatever machine renders it — it shows a placeholder, labelled. */
+        host_identity: if dry_run {
+            portcullis_identity::derive(&[0u8; 32], "dry-run placeholder — not this machine's identity")
+        } else {
+            match portcullis_identity::for_app(&manifest.app.id) {
+                Ok(id) => id,
+                Err(e) => { eprintln!("portcullis: host identity: {e}"); return ExitCode::from(1) }
+            }
+        },
     };
 
     let jc = match build(&manifest, &opts) {
@@ -527,6 +538,26 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
                                      jail_path.to_str().unwrap()]) {
         eprintln!("unionfs mount: {e}");
         let _ = umount(&jail_path);
+        return ExitCode::from(1);
+    }
+
+    /* ★ Mountpoints jail(8) needs and will not create — the same three the
+     * daemon's launch (portcullisd/src/launch.rs) makes. This path had none of
+     * them and failed at `mount.devfs: …/dev: No such file or directory` before
+     * the jail ever existed (found 2026-09-22 checking the host identity on
+     * this lane). App trees ship no /dev and no home; writes land in the
+     * overlay. */
+    let home_in_jail = jail_path.join(opts2.user_home.strip_prefix("/").unwrap_or(&opts2.user_home));
+    for d in [jail_path.join("dev"), home_in_jail] {
+        if let Err(e) = fs::create_dir_all(&d) {
+            eprintln!("mkdir {}: {e}", d.display());
+            teardown(&jail_path);
+            return ExitCode::from(1);
+        }
+    }
+    if let Err(e) = portcullis_mounts::ensure_mountpoints(&jc) {
+        eprintln!("portcullis: {e}");
+        teardown(&jail_path);
         return ExitCode::from(1);
     }
 

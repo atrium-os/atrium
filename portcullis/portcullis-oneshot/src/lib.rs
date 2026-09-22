@@ -195,6 +195,13 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
              unprivileged user (portcullis.md §6.5.4)".into());
     }
 
+    // ★ The app's synthetic host identity (portcullis.md §9.1c): per APP, not
+    // per instance — every worker of one app is the same "machine" to it, and
+    // the tag stays out of what the worker can read about itself.
+    let host_identity = match portcullis_identity::for_app(&manifest.app.id) {
+        Ok(id) => id,
+        Err(e) => return OneShot::Failed(format!("host identity: {e}")),
+    };
     let opts = BuildOpts {
         root_path: jail_path.clone(),
         host_sockets: PathBuf::from("/atrium/sockets"),
@@ -205,6 +212,7 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         // ★ A unit of work, so the jail dies with its processes — see
         // BuildOpts::persist. (jaild's exec path creates with persist=0.)
         persist: false,
+        host_identity: host_identity.clone(),
     };
     let jc = match build(&manifest, &opts) {
         Ok(jc) => jc,
@@ -302,6 +310,9 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
             gid:   pw.gid,
             stdio: true,
         }),
+        hostname: Some(manifest.app.id.clone()),
+        hostid:   Some(host_identity.hostid),
+        hostuuid: Some(host_identity.hostuuid.clone()),
     });
     let outcome = run_via_jaild(&req, stdio);
 

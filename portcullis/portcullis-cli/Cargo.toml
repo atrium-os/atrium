@@ -11,6 +11,7 @@ name = "portcullis"
 path = "src/main.rs"
 
 [dependencies]
+portcullis-identity = { path = "../portcullis-identity" }
 portcullis-toml   = { path = "../portcullis-toml" }
 portcullis-jail   = { path = "../portcullis-jail" }
 portcullis-overlay = { path = "../portcullis-overlay" }

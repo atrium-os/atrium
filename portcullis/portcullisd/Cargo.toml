@@ -43,6 +43,7 @@ default = ["pam"]
 pam = []
 
 [dependencies]
+portcullis-identity = { path = "../portcullis-identity" }
 portcullis-toml     = { path = "../portcullis-toml" }
 portcullis-jail     = { path = "../portcullis-jail" }
 portcullis-overlay  = { path = "../portcullis-overlay" }

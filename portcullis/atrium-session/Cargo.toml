@@ -11,6 +11,7 @@ name = "atrium-session"
 path = "src/main.rs"
 
 [dependencies]
+portcullis-identity = { path = "../portcullis-identity" }
 portcullis-jail = { path = "../portcullis-jail" }
 portcullis-mounts = { path = "../portcullis-mounts" }
 libc            = "0.2"

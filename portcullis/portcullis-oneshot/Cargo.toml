@@ -11,6 +11,7 @@ name = "portcullis_oneshot"
 path = "src/lib.rs"
 
 [dependencies]
+portcullis-identity = { path = "../portcullis-identity" }
 portcullis-jail  = { path = "../portcullis-jail" }
 portcullis-toml  = { path = "../portcullis-toml" }
 portcullis-trust = { path = "../portcullis-trust" }

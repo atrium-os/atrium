@@ -63,6 +63,9 @@ fn main() -> ExitCode {
                 devfs_ruleset: devfs_ruleset_env(),
                 network:       NetworkConfig::Disable,
                 exec:          None,
+                hostname: None,
+                hostid: None,
+                hostuuid: None,
             })
         }
         "remove" => {
@@ -98,6 +101,9 @@ fn main() -> ExitCode {
                     gid:  1001,
                     stdio: false,
                 }),
+                hostname: None,
+                hostid: None,
+                hostuuid: None,
             })
         }
         "attach" => {

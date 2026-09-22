@@ -235,6 +235,19 @@ pub struct CreateJailRequest {
     /// is responsible for an eventual `RemoveJail`.
     #[serde(default)]
     pub exec: Option<ExecSpec>,
+
+    /// ★★★ The HOST IDENTITY the jail reports (portcullis.md §9.1c): synthetic,
+    /// per app, never the real machine's. Without these a jail reports an
+    /// empty hostname, hostid 0 and a zero UUID — identical everywhere, which
+    /// breaks host-keyed software (licence managers) and is no identity at
+    /// all. `hostname` defaults to the jail name; hostid/hostuuid are set only
+    /// when given (the caller derives them — jaild does no crypto).
+    #[serde(default)]
+    pub hostname: Option<String>,
+    #[serde(default)]
+    pub hostid:   Option<u32>,
+    #[serde(default)]
+    pub hostuuid: Option<String>,
 }
 
 /// One mount applied inside a jail. `source` is a path on the host
@@ -508,6 +521,9 @@ mod tests {
             devfs_ruleset: 0,
             network:       NetworkConfig::Disable,
             exec:          None,
+            hostname: None,
+            hostid: None,
+            hostuuid: None,
         });
         let bytes = serde_json::to_vec(&req).unwrap();
         let back: Request = serde_json::from_slice(&bytes).unwrap();

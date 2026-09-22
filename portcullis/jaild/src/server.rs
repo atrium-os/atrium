@@ -834,6 +834,9 @@ fn handle_create(
         devfs_ruleset:  req.devfs_ruleset,
         ip4_addr:       ip4_addr_no_cidr.as_deref(),
         ip4_inherit,
+        hostname:       req.hostname.as_deref().unwrap_or(&req.name),
+        hostid:         req.hostid,
+        hostuuid:       req.hostuuid.as_deref(),
     };
     let created = ffi::create_persistent_jail(&spec).map_err(|e| {
         /* Roll back the lo0 alias if jail_set failed. */
@@ -961,6 +964,9 @@ fn handle_create_with_exec(
             devfs_ruleset:  req.devfs_ruleset,
             ip4_addr:       ip4_addr.as_deref(),
             ip4_inherit,
+            hostname:       req.hostname.as_deref().unwrap_or(&req.name),
+            hostid:         req.hostid,
+            hostuuid:       req.hostuuid.as_deref(),
         };
         if let Err(e) = ffi::jail_create_and_attach(&spec) {
             eprintln!("jaild-child: jail_create_and_attach: {e}");

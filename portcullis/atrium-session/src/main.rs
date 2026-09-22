@@ -104,8 +104,15 @@ fn valid_user(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
 }
 
+/// For paths that never create a jail (render prints it; destroy needs only the
+/// name): a labelled placeholder, so rendering never creates the root-only
+/// machine secret on whatever machine renders.
+fn placeholder_identity() -> portcullis_identity::HostIdentity {
+    portcullis_identity::derive(&[0u8; 32], "placeholder — not this machine's identity")
+}
+
 fn cmd_render(user: &str) -> ExitCode {
-    let jc = build_session_jail(user);
+    let jc = build_session_jail(user, &placeholder_identity());
     println!("# session jail for {user} ──────────────────────");
     print!("{}", jc.render_jail_conf());
     println!();
@@ -116,7 +123,14 @@ fn cmd_render(user: &str) -> ExitCode {
 
 fn cmd_create(user: &str) -> ExitCode {
     let layout = SessionLayout::for_user(user);
-    let jc = build_session_jail(user);
+    // ★ A real create REFUSES without the real per-user identity. Falling back
+    // to a placeholder would give every machine's session the same "machine",
+    // silently — the fallback this identity exists to remove.
+    let id = match portcullis_identity::for_app(&format!("session:{user}")) {
+        Ok(id) => id,
+        Err(e) => { eprintln!("atrium-session: host identity: {e}"); return ExitCode::from(1) }
+    };
+    let jc = build_session_jail(user, &id);
 
     /* Idempotent: if a session jail with this name is already
      * running, do nothing. Lets `enter` call `create` blindly. */
@@ -339,7 +353,7 @@ fn cmd_enter(user: &str) -> ExitCode {
 }
 
 fn cmd_destroy(user: &str) -> ExitCode {
-    let jc = build_session_jail(user);
+    let jc = build_session_jail(user, &placeholder_identity());
     let _ = Command::new("jail").arg("-r").arg(&jc.name).status();
     SessionLayout::for_user(user).umount_all_silent();
     println!("session jail '{}' destroyed", jc.name);
@@ -499,12 +513,16 @@ echo 'Atrium session jail. `apps` lists installed apps; `./apps/<id>/<id>` runs 
     }
 }
 
-fn build_session_jail(user: &str) -> JailConfig {
+fn build_session_jail(user: &str, id: &portcullis_identity::HostIdentity) -> JailConfig {
     let layout = SessionLayout::for_user(user);
     let name = format!("session_{user}");
     let mut jc = JailConfig::new(name, layout.jail.clone());
 
     jc.set("host.hostname",          Value::String(format!("{user}-session")));
+    /* ★ Synthetic host identity (portcullis.md §9.1c), per USER session —
+     * never the machine's real hostid/UUID. */
+    jc.set("host.hostid",            Value::Number(id.hostid as i64));
+    jc.set("host.hostuuid",          Value::String(id.hostuuid.clone()));
     jc.set("persist",                Value::Bool(true));
     jc.set("mount.devfs",            Value::Bool(true));
     jc.set("devfs_ruleset",          Value::Number(SESSION_DEVFS_RULESET));
@@ -580,7 +598,7 @@ mod tests {
 
     #[test]
     fn build_session_jail_renders() {
-        let jc = build_session_jail("alice");
+        let jc = build_session_jail("alice", &portcullis_identity::derive(&[7u8; 32], "session:alice"));
         let conf = jc.render_jail_conf();
         assert!(conf.contains("session_alice"));
         assert!(conf.contains("alice-session"));

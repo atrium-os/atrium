@@ -117,6 +117,27 @@ pub struct JailCreateSpec<'a> {
     /// `true` = pass `ip4=JAIL_SYS_INHERIT` (share the host's addresses),
     /// overriding `ip4_addr`. Validator-gated to the inherit allowlist.
     pub ip4_inherit:    bool,
+    /// `host.hostname` — always set (empty is no hostname at all).
+    pub hostname:       &'a str,
+    /// `host.hostid` / `host.hostuuid` — the synthetic identity (§9.1c).
+    pub hostid:         Option<u32>,
+    pub hostuuid:       Option<&'a str>,
+}
+
+impl IovBuilder {
+    /// The host.* parameters. ★ `host.hostid` is an `unsigned long` in the
+    /// kernel (kern_jail.c copies `sizeof(unsigned long)`), so it is passed as
+    /// 8 native bytes — a 4-byte value would be rejected or misread.
+    fn add_host_identity(&mut self, spec: &JailCreateSpec) -> io::Result<()> {
+        self.add_string("host.hostname", spec.hostname)?;
+        if let Some(id) = spec.hostid {
+            self.add_bytes("host.hostid", (id as libc::c_ulong).to_ne_bytes().to_vec());
+        }
+        if let Some(u) = spec.hostuuid {
+            self.add_string("host.hostuuid", u)?;
+        }
+        Ok(())
+    }
 }
 
 /// Result of a successful `jail_set(JAIL_CREATE)`. The `jid` is
@@ -137,6 +158,7 @@ pub fn create_persistent_jail(spec: &JailCreateSpec) -> io::Result<CreatedJail> 
         iob.add_u32("devfs_ruleset", spec.devfs_ruleset);
     }
     iob.add_network(spec.ip4_addr, spec.ip4_inherit)?;
+    iob.add_host_identity(spec)?;
     let mut errmsg = vec![0u8; 256];
     iob.add_buf("errmsg", &mut errmsg);
     let jid = iob.run(JAIL_CREATE, &errmsg)?;
@@ -229,6 +251,7 @@ pub fn jail_create_and_attach(spec: &JailCreateSpec) -> io::Result<i32> {
         iob.add_u32("devfs_ruleset", spec.devfs_ruleset);
     }
     iob.add_network(spec.ip4_addr, spec.ip4_inherit)?;
+    iob.add_host_identity(spec)?;
     let mut errmsg = vec![0u8; 256];
     iob.add_buf("errmsg", &mut errmsg);
     iob.run(JAIL_CREATE | JAIL_ATTACH, &errmsg)

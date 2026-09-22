@@ -1,0 +1,14 @@
+[package]
+name        = "portcullis-identity"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+description = "The synthetic host identity a jailed app sees: a stable per-app hostid and host UUID derived from a root-only machine secret — never the real machine's."
+
+[dependencies]
+sha2 = "0.10"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

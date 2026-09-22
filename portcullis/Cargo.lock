@@ -80,6 +80,7 @@ name = "atrium-session"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "portcullis-identity",
  "portcullis-jail",
  "portcullis-mounts",
 ]
@@ -572,6 +573,7 @@ dependencies = [
 name = "portcullis-cli"
 version = "0.1.0"
 dependencies = [
+ "portcullis-identity",
  "portcullis-ipc",
  "portcullis-jail",
  "portcullis-mounts",
@@ -581,6 +583,15 @@ dependencies = [
  "portcullis-policy",
  "portcullis-toml",
  "portcullis-trust",
+]
+
+[[package]]
+name = "portcullis-identity"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -598,6 +609,7 @@ dependencies = [
 name = "portcullis-jail"
 version = "0.1.0"
 dependencies = [
+ "portcullis-identity",
  "portcullis-toml",
  "thiserror",
 ]
@@ -615,6 +627,7 @@ version = "0.1.0"
 dependencies = [
  "jaild",
  "libc",
+ "portcullis-identity",
  "portcullis-jail",
  "portcullis-mounts",
  "portcullis-toml",
@@ -691,6 +704,7 @@ dependencies = [
  "jaild-policy",
  "libc",
  "log",
+ "portcullis-identity",
  "portcullis-ipc",
  "portcullis-jail",
  "portcullis-mounts",

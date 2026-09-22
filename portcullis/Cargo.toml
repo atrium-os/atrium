@@ -17,6 +17,7 @@ members = [
     "portcullis-trust",
     "portcullis-oneshot",
     "portcullis-mounts",
+    "portcullis-identity",
     "portcullis-peer",
     "atrium-volumes",
     "ostiarius",

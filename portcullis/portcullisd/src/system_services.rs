@@ -461,6 +461,9 @@ impl ServiceManifest {
                 }).collect(),
                 stdio: false,
             }),
+            hostname: None,
+            hostid: None,
+            hostuuid: None,
         }
     }
 }
