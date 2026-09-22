@@ -34,6 +34,9 @@ pub const SECRET_PATH: &str = "/var/db/atrium/host-identity.key";
 /// Domain label: a derivation for any other purpose must never collide with
 /// this one, even from the same secret and input.
 const DOMAIN: &[u8] = b"atrium-host-identity/v1\0";
+/// The MAC has its own label, so it shares no bits with the hostid/UUID —
+/// knowing one tells an app nothing about the other.
+const MAC_DOMAIN: &[u8] = b"atrium-host-mac/v1\0";
 
 /// What a jail is told about its host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +45,10 @@ pub struct HostIdentity {
     pub hostid: u32,
     /// `host.hostuuid` — RFC 9562 layout, version 8 (vendor-specific).
     pub hostuuid: String,
+    /// The MAC of the app's own interface when it has network (network.md
+    /// §0): locally administered, unicast (`x2:…`), so it can never collide
+    /// with a vendor-assigned address — and never the real NIC's.
+    pub mac: String,
 }
 
 /// Derive the identity for `app_id` from the machine secret. Pure.
@@ -58,7 +65,11 @@ pub fn derive(secret: &[u8; 32], app_id: &str) -> HostIdentity {
     // managers commonly treat it as "no hostid".
     let raw = u32::from_be_bytes([mac[16], mac[17], mac[18], mac[19]]);
     let hostid = if raw == 0 { 1 } else { raw };
-    HostIdentity { hostid, hostuuid }
+    let m = hmac_sha256(secret, &[MAC_DOMAIN, app_id.as_bytes()].concat());
+    // Locally administered (bit 1 set), unicast (bit 0 clear).
+    let b0 = (m[0] & 0xfc) | 0x02;
+    let mac = format!("{b0:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[1], m[2], m[3], m[4], m[5]);
+    HostIdentity { hostid, hostuuid, mac }
 }
 
 /// HMAC-SHA256 (RFC 2104) over `sha2`, so the one hash crate the tree already
@@ -167,6 +178,19 @@ mod tests {
         assert_eq!(hex, OPENSSL_HMAC_07_HELLO);
     }
     const OPENSSL_HMAC_07_HELLO: &str = "290af183d08286ae740dfed386724985dc666de6350a8df2e8520307ae2503ed";
+
+    /// The MAC: locally administered unicast, stable, per app, per machine.
+    #[test]
+    fn the_mac_is_locally_administered_unicast_and_per_app() {
+        let a = derive(&S1, "org.x.cad");
+        let first = u8::from_str_radix(&a.mac[0..2], 16).unwrap();
+        assert_eq!(first & 0x01, 0, "multicast bit set: {}", a.mac);
+        assert_eq!(first & 0x02, 0x02, "not locally administered: {}", a.mac);
+        assert_eq!(a.mac.len(), 17);
+        assert_eq!(a.mac, derive(&S1, "org.x.cad").mac);
+        assert_ne!(a.mac, derive(&S1, "org.y.eda").mac);
+        assert_ne!(a.mac, derive(&S2, "org.x.cad").mac);
+    }
 
     #[test]
     fn a_secret_that_is_not_root_only_is_refused() {

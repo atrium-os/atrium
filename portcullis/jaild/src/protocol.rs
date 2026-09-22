@@ -333,6 +333,12 @@ pub enum NetworkConfig {
     /// app without a network capability gets. (vnet and `ip4=disable` cannot
     /// be combined — the kernel refuses IP restrictions on a vnet jail.)
     Isolated,
+    /// ★ An own stack WITH network (network.md §0): vnet=new plus one end of a
+    /// point-to-point epair on a /30 that jaild allocates, carrying `mac` — the
+    /// app's derived, locally-administered address, never the real NIC's. The
+    /// host end joins interface group `atrium`, where pf blocks app->host and
+    /// app->app; jaild refuses this unless those rules are loaded.
+    Routed { mac: String },
     /// A specific 127.x.x.x address aliased on the host's lo0.
     /// `addr` is in CIDR form (e.g. "127.10.0.5/32"). Must
     /// match (CIDR-contained-in) one of

@@ -693,6 +693,9 @@ ph_stage() {
     # unconditionally, never as an optional extra.
     cp "$REPO/etc/atrium.devfs.rules" "$DIST/etc/" \
         || die "cannot stage etc/atrium.devfs.rules" "Every Atrium jail depends on it."
+    # And the pf isolation rules every networked app depends on (network.md §0).
+    cp "$REPO/etc/atrium.pf" "$DIST/etc/" \
+        || die "cannot stage etc/atrium.pf" "Every networked Atrium app depends on it."
     k=$(cat "$STATE/kernel.path" 2>/dev/null)
     [ -n "$k" ] && [ -f "$k" ] && cp "$k" "$DIST/boot/kernel"
     cp "$REPO/atrium-tessera/kmod/tessera_fs.ko" "$DIST/kmod/" 2>/dev/null
@@ -780,6 +783,27 @@ for id in 20 21 22; do
         || { echo "  FATAL: devfs ruleset $id did not load"; exit 1; }
 done
 echo "  loaded rulesets 20 21 22 (and on every boot via devfs_rulesets)"
+
+echo "== pf isolation =="
+# jaild refuses to create a networked jail unless pf is enabled with the app->host
+# and app->app blocks loaded (network.md §0). NAT goes out the default-route
+# interface. An operator's own pf ruleset is not replaced — refused, with why.
+E=$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')
+cur=$(sysrc -n pf_rules 2>/dev/null)
+if [ -z "$E" ]; then
+    echo "  SKIPPED: no default route to NAT through; networked apps will be refused"
+elif [ -n "$cur" ] && [ "$cur" != /usr/local/etc/atrium/pf.conf ] && [ -s "$cur" ]; then
+    echo "  SKIPPED: pf_rules is $cur (an operator ruleset); add etc/atrium.pf's rules to it"
+else
+    sed "s/EXT_IF/$E/" "$D/etc/atrium.pf" > /usr/local/etc/atrium/pf.conf
+    sysrc -q pf_enable=YES pf_rules=/usr/local/etc/atrium/pf.conf gateway_enable=YES >/dev/null
+    kldstat -q -m pf || kldload pf
+    sysctl -q net.inet.ip.forwarding=1 >/dev/null
+    pfctl -f /usr/local/etc/atrium/pf.conf 2>/dev/null && pfctl -e >/dev/null 2>&1
+    pfctl -s rules | grep -q "block drop in quick on atrium inet from any to (self)" \
+        || { echo "  FATAL: the atrium isolation rules did not load"; exit 1; }
+    echo "  pf enabled with isolation rules, NAT via $E (and at every boot)"
+fi
 
 echo "== userspace =="
 mkdir -p /usr/local/bin

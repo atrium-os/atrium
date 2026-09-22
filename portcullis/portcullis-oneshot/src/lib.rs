@@ -262,6 +262,17 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         teardown(&jail_path, &jail_name);
         return OneShot::Failed(e.to_string());
     }
+    // A networked worker resolves names through the host's resolvers (reached
+    // over NAT). Written into the discarded tmpfs layer, never the signed tree.
+    if matches!(manifest.capabilities.network, Some(portcullis_toml::NetworkCap::Full)) {
+        let etc = jail_path.join("etc");
+        if let Err(e) = std::fs::create_dir_all(&etc)
+            .and_then(|_| std::fs::copy("/etc/resolv.conf", etc.join("resolv.conf")).map(|_| ()))
+        {
+            teardown(&jail_path, &jail_name);
+            return OneShot::Failed(format!("resolv.conf for a networked worker: {e}"));
+        }
+    }
     // ★ File mountpoints (sockets) must exist as FILES before the mount; jaild
     // creates only directories. Shared with the application path.
     if let Err(e) = portcullis_mounts::ensure_mountpoints(&jc) {
@@ -303,7 +314,7 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         devfs_ruleset: portcullis_jail::APP_DEVFS_RULESET,
         // ★ Isolated, not Disable: an own empty vnet, so the worker cannot
         // list the host's interfaces or read its real MAC (§9.1c).
-        network:       jaild::protocol::NetworkConfig::Isolated,
+        network:       jaild_network(manifest.capabilities.network, &host_identity),
         exec: Some(jaild::protocol::ExecSpec {
             path:  entry.clone(),
             argv:  vec![entry],
@@ -377,12 +388,11 @@ fn jaild_mounts(jc: &portcullis_jail::JailConfig, root: &Path,
                     (jaild cannot apply per-jail devfs grants)".into());
     }
     // ★ Decided from the manifest's capability, not by pattern-matching the
-    // rendered jail params: the params changed shape (ip4=disable → vnet=new)
-    // and a match on the old shape would have refused every worker — or, the
-    // other way round, admitted a networked one.
-    let net_off = matches!(network, None | Some(portcullis_toml::NetworkCap::None));
-    if !net_off {
-        return Err("network capabilities are not supported on the one-shot lane yet".into());
+    // rendered jail params. `full` is served (as a Routed stack — see
+    // jaild_network); `loopback` is not yet: Isolated keeps lo0 down, and a
+    // loopback worker would silently have none.
+    if matches!(network, Some(portcullis_toml::NetworkCap::Loopback)) {
+        return Err("the loopback network capability is not supported on the one-shot lane yet".into());
     }
     jc.mounts.iter().map(|m| {
         if m.fstype != "nullfs" {
@@ -398,6 +408,19 @@ fn jaild_mounts(jc: &portcullis_jail::JailConfig, root: &Path,
             size_mb: None,
         })
     }).collect()
+}
+
+/// The jail's network (network.md §0). Every worker gets its OWN stack:
+/// `Isolated` (only a down lo0) without the capability, `Routed` with it — a
+/// point-to-point epair carrying the app's derived MAC, never the real NIC's.
+fn jaild_network(cap: Option<portcullis_toml::NetworkCap>, id: &portcullis_identity::HostIdentity)
+    -> jaild::protocol::NetworkConfig
+{
+    match cap {
+        Some(portcullis_toml::NetworkCap::Full) =>
+            jaild::protocol::NetworkConfig::Routed { mac: id.mac.clone() },
+        _ => jaild::protocol::NetworkConfig::Isolated,
+    }
 }
 
 /// Ask jaild to create the jail and run the entry on `stdio` (this process's

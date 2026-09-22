@@ -102,6 +102,28 @@ scp $SSHOPT -P 2222 "$BSD/etc/atrium.devfs.rules" root@localhost:/root/atrium.de
         service devfs restart >/dev/null &&
         for id in 20 21 22; do [ -n "$(devfs rule -s $id show)" ] || exit 1; done' >/dev/null 2>&1 \
   && echo "  rulesets 20 21 22 loaded" || { echo "  devfs rulesets FAILED to load"; rc=1; }
+echo "=== pf isolation -> /usr/local/etc/atrium/pf.conf ==="
+# ★★ Before any daemon starts: jaild refuses a networked jail unless these
+# rules are loaded (network.md §0) — without them an app reached the host.
+scp $SSHOPT -P 2222 "$BSD/etc/atrium.pf" root@localhost:/root/atrium.pf >/dev/null 2>&1 \
+  && g 'mkdir -p /usr/local/etc/atrium
+E=$(route -n get default 2>/dev/null | awk '"'"'/interface:/{print $2}'"'"')
+[ -n "$E" ] || { echo "no default route: cannot pick the NAT interface"; exit 1; }
+cur=$(sysrc -n pf_rules 2>/dev/null)
+case "$cur" in ""|/etc/pf.conf|/usr/local/etc/atrium/pf.conf) ;;
+  *) echo "pf_rules is $cur — an operator ruleset; add the atrium rules to it by hand"; exit 1;;
+esac
+[ "$cur" = /etc/pf.conf ] && [ -s /etc/pf.conf ] && { echo "/etc/pf.conf exists — an operator ruleset; add the atrium rules to it by hand"; exit 1; }
+sed "s/EXT_IF/$E/" /root/atrium.pf > /usr/local/etc/atrium/pf.conf
+sysrc -q pf_enable=YES pf_rules=/usr/local/etc/atrium/pf.conf gateway_enable=YES >/dev/null
+kldstat -q -m pf || kldload pf
+sysctl -q net.inet.ip.forwarding=1 >/dev/null
+pfctl -f /usr/local/etc/atrium/pf.conf 2>/dev/null && pfctl -e >/dev/null 2>&1
+pfctl -s rules | grep -q "block drop in quick on atrium inet from any to (self)" || exit 1
+pfctl -s rules | grep -q "block drop in quick on atrium inet from any to 100.64.0.0/16" || exit 1
+pfctl -s info | grep -q "Status: Enabled" || exit 1' >/tmp/pfdeploy.log 2>&1 \
+  && echo "  pf enabled, isolation rules loaded, forwarding on (and at boot)" \
+  || { echo "  pf isolation FAILED: $(tail -1 /tmp/pfdeploy.log)"; rc=1; }
 echo "=== config -> /etc/atrium ==="
 g 'mkdir -p /etc/atrium/services.d /var/db/atrium /var/log/atrium' >/dev/null 2>&1
 scp $SSHOPT -P 2222 "$BSD/etc/jaild.policy.toml" "$BSD/etc/volumes.policy.toml" \

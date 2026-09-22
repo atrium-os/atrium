@@ -98,6 +98,18 @@ fn validate_network(net: &NetworkConfig, name: &str, policy: &Policy) -> Result<
         /* Isolated: an own vnet with nothing in it — strictly less than
          * Disable exposes, so always permitted. */
         NetworkConfig::Isolated => Ok(()),
+        /* Routed: the MAC must be the derived kind — locally administered
+         * unicast — so a caller cannot hand a jail the real NIC's address
+         * (portcullis.md §9.1c). pf being loaded is checked at create time,
+         * not here: it is machine state, not request shape. */
+        NetworkConfig::Routed { mac } => {
+            if crate::routed::valid_mac(mac) { Ok(()) } else {
+                Err(JaildError::PolicyViolation {
+                    rule:   "network.routed.mac",
+                    detail: format!("mac {mac:?} is not a lowercase locally-administered unicast address"),
+                })
+            }
+        }
         NetworkConfig::Disable => {
             /* Always permitted. policy.network.allow_disable is
              * documented as "always true" in the policy schema;

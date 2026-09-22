@@ -168,6 +168,18 @@ pub fn create_persistent_jail(spec: &JailCreateSpec) -> io::Result<CreatedJail> 
     Ok(CreatedJail { jid })
 }
 
+/// Set or clear `persist` on a live jail (`jail_set(JAIL_UPDATE)`). Clearing
+/// it on a jail with no processes removes the jail.
+pub fn set_persist(jid: i32, persist: bool) -> io::Result<()> {
+    let mut iob = IovBuilder::new();
+    iob.add_i32("jid", jid);
+    // Same integer form create_persistent_jail uses for "persist".
+    iob.add_i32("persist", persist as i32);
+    let mut errmsg = vec![0u8; 256];
+    iob.add_buf("errmsg", &mut errmsg);
+    iob.run(JAIL_UPDATE, &errmsg).map(|_| ())
+}
+
 /// Tear down a jail by jid. Idempotent at the wrapper level: ENOENT
 /// (jid already gone) is folded to `Ok`. Other errors propagate.
 pub fn remove_jail(jid: i32) -> io::Result<()> {

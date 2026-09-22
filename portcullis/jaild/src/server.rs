@@ -98,6 +98,24 @@ pub fn serve(
         }
     }
 
+    /* Routed networks whose jail no longer exists (jaild restarted after the
+     * jail died, or the host rebooted): destroy the pair if it is still there
+     * and free the slot, so /30s do not leak across restarts. */
+    if !dry_run {
+        let before = state.routed_nets.len();
+        let gone: Vec<crate::state::RoutedNet> = state.routed_nets.iter()
+            .filter(|n| ffi::jail_id_by_name(&n.jail_name).is_none())
+            .cloned().collect();
+        for n in &gone {
+            let _ = crate::routed::destroy(&n.epair_a);
+            info!("jaild: reconcile released /30 slot {} of vanished jail {}", n.slot, n.jail_name);
+        }
+        state.routed_nets.retain(|n| !gone.iter().any(|g| g.jail_name == n.jail_name));
+        if state.routed_nets.len() != before {
+            if let Err(e) = state.save(state_path) { warn!("jaild: state save after net reconcile: {e}"); }
+        }
+    }
+
     let mut mux: Mux<LengthPrefixed> = Mux::new(listener.try_clone()?)?;
     let mut admit = |stream: UnixStream| -> Option<LengthPrefixed> {
         let peer_uid = peer_uid(&stream).unwrap_or(u32::MAX);
@@ -627,6 +645,20 @@ fn handle_remove(
         }
     }
 
+    /* ★ A Routed jail's network: destroy its epair and free the /30. The jail
+     * is gone (or going), so its end has returned to the host's vnet, and
+     * destroying the host end takes both. */
+    if let Some(name) = name.clone().or_else(|| record_idx.map(|i| state.jails[i].name.clone())) {
+        if let Some(i) = state.routed_nets.iter().position(|n| n.jail_name == name) {
+            let n = state.routed_nets.remove(i);
+            if let Err(e) = crate::routed::destroy(&n.epair_a) {
+                warn!("jaild: RemoveJail {name}: destroy {}: {e}", n.epair_a);
+            }
+            info!("jaild: RemoveJail {name}: released /30 slot {} ({})", n.slot, n.epair_a);
+            if let Err(e) = state.save(state_path) { warn!("jaild: state save after net release: {e}"); }
+        }
+    }
+
     /* Drop the lo0 alias if any. */
     if let Some(addr) = alias_addr {
         if let Err(e) = ffi::ifconfig_lo0_alias_del(&addr) {
@@ -819,11 +851,30 @@ fn handle_create(
             req.devfs_ruleset);
     }
 
+    /* ★★ A networked jail's own stack (network.md §0) is built BEFORE anything
+     * runs in it: the jail is created persistent, its interface moved in and
+     * configured, and only then does a child attach and exec. The plain exec
+     * path creates and attaches in one step in the child, which would start
+     * the app before its network existed. */
+    let pre_created = if let NetworkConfig::Routed { mac } = &req.network {
+        Some(create_routed(req, mac, state, state_path)?)
+    } else {
+        None
+    };
+
     if let Some(exec) = &req.exec {
         return handle_create_with_exec(
             req, exec, stdio, lo0_alias, ip4_addr_no_cidr, ip4_inherit, state, state_path,
-            policy.mount_sources.max_tmpfs_mb,
+            policy.mount_sources.max_tmpfs_mb, pre_created,
         );
+    }
+    if let Some(jid) = pre_created {
+        state.add(&req.name, jid, None, &req.path);
+        if let Err(e) = state.save(state_path) { warn!("jaild: state save after routed create: {e}"); }
+        return Ok(CreateOutcome {
+            resp: CreateJailResponse { jid, pid: 0, procdesc_attached: false },
+            procdesc_fd: None,
+        });
     }
 
     let spec = JailCreateSpec {
@@ -870,6 +921,58 @@ fn handle_create(
     })
 }
 
+/// Build a Routed jail's network and the (persistent, for now) jail around it.
+/// Returns the jid. Every failure unwinds what was made before it.
+fn create_routed(
+    req:        &CreateJailRequest,
+    mac:        &str,
+    state:      &mut PersistentState,
+    state_path: &Path,
+) -> Result<i32, JaildError> {
+    use crate::routed;
+    routed::isolation_loaded().map_err(|why| JaildError::PolicyViolation {
+        rule:   "network.routed.isolation_not_loaded",
+        detail: format!("{why} — a networked jail would reach the host and other jails"),
+    })?;
+    let slot = state.free_slot().ok_or(JaildError::PolicyViolation {
+        rule:   "network.routed.no_slot",
+        detail: "every /30 in 100.64.0.0/16 is allocated".into(),
+    })?;
+    let sys = |name: &'static str, e: std::io::Error| JaildError::Syscall {
+        name, errno: e.raw_os_error().unwrap_or(-1), msg: format!("{e}"),
+    };
+    let (a, b) = routed::create_host_end(slot).map_err(|e| sys("epair", e))?;
+    let spec = JailCreateSpec {
+        name:          &req.name,
+        path:          &req.path,
+        persist:       1,   // until a process is in it; cleared after the exec
+        children_max:  req.children_max as i32,
+        devfs_ruleset: req.devfs_ruleset,
+        ip4_addr:      None,
+        ip4_inherit:   false,
+        isolated:      true, // vnet=new; the epair end is moved in next
+        hostname:      req.hostname.as_deref().unwrap_or(&req.name),
+        hostid:        req.hostid,
+        hostuuid:      req.hostuuid.as_deref(),
+    };
+    let jid = match ffi::create_persistent_jail(&spec) {
+        Ok(c) => c.jid,
+        Err(e) => { let _ = routed::destroy(&a); return Err(sys("jail_set", e)); }
+    };
+    if let Err(e) = routed::configure_app_end(&req.name, &b, mac, slot) {
+        let _ = ffi::remove_jail(jid);
+        let _ = routed::destroy(&a);
+        return Err(sys("ifconfig", e));
+    }
+    state.routed_nets.push(crate::state::RoutedNet {
+        jail_name: req.name.clone(), slot, epair_a: a.clone(),
+    });
+    if let Err(e) = state.save(state_path) { warn!("jaild: state save after routed net: {e}"); }
+    let (host, app) = routed::slot_addrs(slot);
+    info!("jaild: routed net for {} jid={jid}: {b} {app}/30 via {host} (host end {a})", req.name);
+    Ok(jid)
+}
+
 fn handle_create_with_exec(
     req:         &CreateJailRequest,
     exec:        &ExecSpec,
@@ -880,6 +983,7 @@ fn handle_create_with_exec(
     state:       &mut PersistentState,
     state_path:  &Path,
     tmpfs_ceiling: u64,
+    pre_created: Option<i32>,
 ) -> Result<CreateOutcome, JaildError> {
     /* Pre-resolve mount targets into absolute paths under the jail
      * root so the child can apply them with a single nmount per
@@ -970,8 +1074,13 @@ fn handle_create_with_exec(
             hostid:         req.hostid,
             hostuuid:       req.hostuuid.as_deref(),
         };
-        if let Err(e) = ffi::jail_create_and_attach(&spec) {
-            eprintln!("jaild-child: jail_create_and_attach: {e}");
+        let attached = match pre_created {
+            // A Routed jail already exists, network and all: just join it.
+            Some(jid) => ffi::jail_attach(jid),
+            None => ffi::jail_create_and_attach(&spec).map(|_| ()),
+        };
+        if let Err(e) = attached {
+            eprintln!("jaild-child: attach: {e}");
             ffi::child_exit(102);
         }
         if let Err(e) = ffi::drop_privileges(exec.uid, exec.gid) {
@@ -995,6 +1104,15 @@ fn handle_create_with_exec(
     /* The child holds the caller's stdio now; jaild's copies must go, or the
      * broker's end would never see EOF when the worker exits. */
     drop(stdio);
+    /* ★ A pre-created (Routed) jail was made persistent so it could be
+     * networked before anything ran in it. Clear that now, so it dies with its
+     * processes exactly like a create-and-attach jail. If the child has
+     * already exited, clearing persist on an empty jail removes it at once. */
+    if let Some(jid) = pre_created {
+        if let Err(e) = ffi::set_persist(jid, false) {
+            warn!("jaild: clear persist on jid {jid}: {e} — jail will outlive its process");
+        }
+    }
     info!("jaild: pdfork ok pid={} pdfd={} lo0_alias={:?}",
         pdf.pid, pdf.procdesc_fd, lo0_alias);
 
@@ -1002,7 +1120,7 @@ fn handle_create_with_exec(
      * (looks up the jail's chroot path) and for lo0-alias
      * cleanup at RemoveJail. Exec'd jails use jid sentinel 0;
      * handle_remove special-cases this. */
-    state.add_exec(&req.name, 0, lo0_alias, &req.path, exec.uid, exec.gid);
+    state.add_exec(&req.name, pre_created.unwrap_or(0), lo0_alias, &req.path, exec.uid, exec.gid);
     if let Err(e) = state.save(state_path) {
         warn!("jaild: state save after exec'd-jail create: {e}");
     }

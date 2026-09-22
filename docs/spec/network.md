@@ -87,7 +87,20 @@ are load-bearing, and whatever creates a networked app must refuse if they are n
 4. `etc/atrium.pf` + forwarding, installed and loaded by bootstrap/deploy, like the devfs rules.
 5. atrium-netd (per-app anchors for §4's finer grants) — after the plumbing is proven.
 
-Until step 3, apps granted network still use `vnet = inherit` and see the real MAC.
+**Progress (2026-09-22):** steps 1, 2 and 4 are DONE, and the one-shot lane of step 3.
+`HostIdentity::mac`; jaild `NetworkConfig::Routed { mac }` (allocates the /30, creates and
+configures both ends, creates the jail persistent → networks it → attaches the child → clears
+persist; releases the epair and slot on RemoveJail; reconciles vanished jails' slots at startup;
+refuses `network.routed.isolation_not_loaded` unless pf is enabled with both blocks and
+forwarding on); `etc/atrium.pf` installed and loaded at boot by deploy and bootstrap (an operator
+ruleset is never replaced). A signed one-shot with `network = "full"`, run for real through
+jaild in the VM: interfaces `lo0 epair0b`, MAC `be:b2:7c:ac:62:b5` (derived, identical across
+runs; the host's is `52:54:00:12:34:56`), gateway `100.64.0.1`, internet ALLOWED, host via its
+gateway and via its real address both blocked; afterwards no epair, no slot, no dying jail.
+
+**Still open:** step 3 for the jail(8) app-launch lane (apps granted `full` still use
+`vnet = inherit` and see the real MAC until they take their network from jaild), and the
+one-shot `loopback` capability (refused on that lane). Step 5 (atrium-netd) not started.
 
 ## 1. Principle
 

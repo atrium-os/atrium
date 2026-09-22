@@ -2026,9 +2026,11 @@ vnet jail, which the kernel refuses; its unit test pinned exactly that recipe an
 after creation, before the app starts). Verified: a signed loopback app launches with its own
 `lo0` UP on 127.0.0.1.
 
-**STILL OPEN — apps WITH the `full` network capability** share the host's stack
-(`vnet = inherit`) and still see the real MAC. Closing it needs an epair per jail with a MAC
-derived like the hostid, and routing/NAT for it.
+**Apps WITH network (2026-09-22):** decided and built per network.md §0 — an own stack with a
+point-to-point epair carrying a MAC derived like the hostid (`HostIdentity::mac`), NAT out,
+pf blocking app→host and app→app. Done for one-shots (verified in the VM: derived MAC,
+internet allowed, host blocked). **Still open:** apps launched through the jail(8) lane with
+`full` still use `vnet = inherit` and see the real MAC.
 
 ### 9.2 Out of scope
 

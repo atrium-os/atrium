@@ -49,6 +49,25 @@ pub struct PersistentState {
     /// was created. See `docs/spec/storage.md` §6.2.
     #[serde(default)]
     pub runtime_mounts: Vec<RuntimeMount>,
+    /// Point-to-point networks allocated to jails (network.md §0): which /30
+    /// slot and which epair. Freed on RemoveJail; reconciled at startup.
+    #[serde(default)]
+    pub routed_nets: Vec<RoutedNet>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RoutedNet {
+    pub jail_name: String,
+    pub slot:      u32,
+    /// The host end (`epairNa`); destroying it destroys the pair.
+    pub epair_a:   String,
+}
+
+impl PersistentState {
+    /// The lowest /30 slot no jail holds.
+    pub fn free_slot(&self) -> Option<u32> {
+        (0..crate::routed::SLOTS).find(|s| !self.routed_nets.iter().any(|n| n.slot == *s))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -99,6 +118,7 @@ impl PersistentState {
             written_at_unix: now_unix(),
             jails: Vec::new(),
             runtime_mounts: Vec::new(),
+            routed_nets: Vec::new(),
         }
     }
 

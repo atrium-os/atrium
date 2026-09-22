@@ -1,0 +1,23 @@
+# Atrium pf base ruleset — per-app network isolation (docs/spec/network.md §0).
+#
+# Installed as /usr/local/etc/atrium/pf.conf with ext_if filled in from the
+# default route, and loaded at boot (pf_enable, pf_rules, gateway_enable) by
+# scripts/bootstrap-atrium.sh and scripts/deploy-portcullis.sh.
+#
+# Every networked app sits on its own point-to-point /30 from 100.64.0.0/16;
+# the host end of each app's epair is in interface group `atrium`.
+#
+# ★★ The two blocks are LOAD-BEARING: measured without them, an app reached the
+# host's sshd through its own gateway address. jaild refuses to create a
+# networked jail unless both are loaded (jaild/src/routed.rs isolation_loaded).
+ext_if = "EXT_IF"
+
+set skip on lo0
+nat on $ext_if inet from 100.64.0.0/16 to any -> ($ext_if)
+
+# An app never reaches the host itself — any of the host's addresses.
+block in quick on atrium inet from any to (self)
+# Nor another app: every app is on its own /30, so this is all routed traffic.
+block in quick on atrium inet from any to 100.64.0.0/16
+
+pass all

@@ -33,6 +33,7 @@ pub mod client;
 pub mod error;
 pub mod ffi;
 pub mod protocol;
+pub mod routed;
 pub mod server;
 pub mod state;
 pub mod validator;
