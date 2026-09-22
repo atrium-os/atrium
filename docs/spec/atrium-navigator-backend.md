@@ -575,6 +575,29 @@ is not built. Two caveats bound the claim. It is a VM number and a first measure
 floor. And the p99 open (~80 ms, with rare outliers near 200 ms) has not been decomposed; a
 p99 that grows with concurrent sessions would reopen the question.
 
+**Where the 25 ms goes: the vnet, not the jail.** A jail is near-native. What a one-shot
+jail pays for is the empty per-app network stack it gets for isolation and MAC hiding
+(portcullis.md §9.1c, network.md §0). Measured primitives, averaged over 30–40 rounds:
+
+| primitive | cost |
+|---|---|
+| fork+exec `/usr/bin/true` (baseline) | 0.4 ms |
+| jail create + remove, no vnet | 1.3 ms (mostly two `jail(8)` execs) |
+| **jail create + remove, `vnet=new`** | **~70 ms: create 14.5, destroy 54** |
+| nullfs / tmpfs / devfs mount + unmount | 1.7 / 1.1 / 1.9 ms |
+
+Work inside the jail is unaffected (navigate: 6.7 ms in every arm).
+
+**Decided (user): not optimised now.** It is a one-time cost per document, in the tens of
+milliseconds, and invisible to a reader. It becomes visible only when many jails start or
+stop together, such as a burst at init. If that ever matters, the levers are known:
+
+1. No vnet for jails without network access, with the kernel hiding link-layer addresses
+   from non-vnet jails.
+2. A cheaper vnet teardown, by profiling the 54 ms. It is unmeasured whether Laminar
+   contributes; that needs an A/B against ULE.
+3. Taking the destroy off any waiting path.
+
 **Found by the measurement, fixed:**
 
 1. **Navigation cost the worker 16 ms p50 (30 ms p90) per step**, in every arm and
