@@ -385,18 +385,20 @@ occur.
    what crosses the boundary is shaped glyph runs, not a container to parse.
 2. **One canonical form: bare OpenType/TrueType (sfnt).** The store, the worker and the
    render tests see exactly one kind of font file. WOFF and WOFF2 are *transport
-   encodings* of the same tables. Compression is the store's job, since Tessera already
-   compresses blobs. This is the same call made for PTL5.
+   encodings* of the same tables. This is the same call made for PTL5.
 
    **The producer (the converter, jailed) turns what it fetches into that form:**
    - **decode**: WOFF (zlib) and WOFF2 (Brotli plus the glyf/loca and hmtx transforms);
+   - **pin** a variable font to a static instance (condition 3);
    - **subset** (condition 5): this requires decoding anyway, so the decoder exists
      whatever this rule says;
-   - **sanitize**: re-serialize with only the tables the profile admits;
+   - **sanitize**: keep only the tables the profile admits, and drop hinting
+     (condition 2a);
    - **content-address** the result.
 
-   EOT and anything else is refused. Where `src` lists alternatives, the producer takes
-   the best one it can decode.
+   EOT and anything else is refused. EOT is an Internet Explorer relic; the 9 EOT files
+   in the corpus are all icon-font kits, which normally list WOFF or WOFF2 sources too.
+   Where `src` lists alternatives, the producer takes the best one it can decode.
 
    ★ **Why, stated precisely, because the first version of this condition overstated
    it.** Excluding WOFF2 is *not* the main security measure. WOFF2 does add a Brotli
@@ -413,14 +415,59 @@ occur.
    What this condition buys is **one form** (dedup, golden tests, one consumer path) and
    **decoding once per document** in the converter's jail instead of on every view.
 
-   **Cost:** the store holds larger files than the wire carried. WOFF2's outline transform
-   usually beats general-purpose compression; by how much, on this corpus, is unmeasured.
+   **Cost, measured, and a premise corrected.** An earlier version said "compression is the
+   store's job — Tessera already compresses blobs". **It does not.** Tessera v1 reserves
+   `compressed_size` and always writes 0 (tessera-fs.md; `pack.c`). So the canonical form
+   is stored at its decoded size. Over the corpus's WOFF2 fonts:
+
+   | | bytes |
+   |---|---|
+   | wire (WOFF2) | 5.0 MB |
+   | decoded sfnt (what is stored today) | 17.0 MB (**3.4×**) |
+   | decoded + zstd-3 (if the store compressed) | 7.3 MB (1.5×) |
+   | decoded + zstd-19 | 6.4 MB (1.3×) |
+
+   **Accepted for now** (user, 2026-09-22). Fonts are small beside everything else a
+   document brings, and store compression benefits every blob rather than just fonts. It
+   is a Tessera item, not a reason to keep a transport encoding.
+
+   **Measured feasibility** (185 fonts fetched from the corpus; decoded with `allsorts`,
+   Apache-2.0; every result re-parsed by `ttf-parser`, a different parser from the one that
+   wrote it):
+   - **176/176** WOFF2 (131), WOFF (6) and TTF/OTF (39) fonts decode, with no panics and
+     no re-parse failures;
+   - the 9 EOT files are refused;
+   - the largest decoded font is 6.17 MiB, so condition 4's 8 MiB holds for the canonical
+     form too.
+
+2a. **No hinting for web fonts.** TrueType hinting is a virtual machine executing programs
+   the font supplies (`fpgm`, `prep`, glyph instructions). **85% of the corpus's web fonts
+   (149/176) carry such programs.** That is the most dangerous code path a hostile font
+   reaches. The producer drops the hinting tables (`fpgm`, `prep`, `cvt `, and the
+   hint-only `hdmx`, `LTSH`, `VDMX`), and the worker renders web fonts **unhinted**. The
+   difference is negligible at the densities Atrium targets. The *shipped* font set is
+   trusted data and may stay hinted (fresco-text hints today).
    (Decided with the user, 2026-09-22.)
-3. **Static instances only.** Variable-font axes are deferred: an axis value is another
-   input that must be pinned for G1, and pinning it is equivalent to shipping the instance.
+3. **Static instances only — produced by PINNING, not by refusing.** An axis value is
+   another input that must be pinned for G1, and pinning it is equivalent to shipping the
+   instance. So the producer does exactly that: `wght` comes from the `@font-face`'s
+   declared `font-weight`, clamped to the axis range; every other axis takes its default.
+   The worker only ever sees static fonts.
+   **Measured:** 20 of 176 corpus fonts (11%) are variable (`wght`; `opsz,wght`), and **all
+   20 pin** to a static font with the same glyph count. The control: 400 and 700 instances
+   differ in glyph width wherever the font has a Latin `H` (7 of 20; the rest are
+   non-Latin range slices). Refusing variable fonts would have lost 11% of fonts.
+   (Decided with the user, 2026-09-22.)
 4. **Bounded** — bytes per font, fonts per document, glyphs per font (§3.12).
 5. **No `unicode-range`, so no automatic subsetting.** Subsetting is the producer's job,
-   done once at conversion and content-addressed. The honest cost is CJK: a full CJK face
+   done once at conversion and content-addressed.
+   ★ **Open: RANGE-SPLIT families.** Web-font services ship one family as several faces
+   split by `unicode-range` (13 of the 20 variable fonts above have no Latin glyphs at
+   all, so they are slices). The producer cannot drop the ranges without deciding what
+   replaces them, and `allsorts` cannot merge faces. The candidates are keeping each
+   slice as its own face, with the worker selecting by `cmap` coverage (which is
+   `unicode-range` decided by the font rather than the descriptor), or merging. It will
+   be decided after measuring how common it is. The honest cost is CJK: a full CJK face
    is large, and without range-splitting it is one large required input. ★ **A web font
    does not rescue a bad shipped font set** — the profile's own stacks must cover the
    scripts it claims to serve, and §1.3's limit on international text is unchanged by this
@@ -716,7 +763,7 @@ number above is the best available and is labelled as a bound rather than a coun
 | `box-shadow` blur + spread | **256 px** | bounds rasterization cost, not structure |
 | `position: fixed` elements per document | **8** | validated at p95=7 of an upper-bound measure (n=103) — see below |
 | fixed element block size | **1/3 of viewport** | reasoned — see §3.3 |
-| bytes per web font | **8 MiB** | validated: max observed 6.17 MiB (n=220). A full CJK face fits, as reasoned |
+| bytes per web font | **8 MiB** | validated: max observed 6.17 MiB (n=220). A full CJK face fits, as reasoned. Applies to the CANONICAL (decoded) bytes; max decoded is also 6.17 MiB (n=176) |
 | declared `@font-face` per document | **512** | 6.0× the 85 p99 (n=84 docs) — was 8, BELOW THE MEDIAN of 9 |
 | **total web font bytes** | **not a document ceiling** | see below — declared bytes bound nothing; the budget belongs at render time |
 | glyphs per font | **65,536** | the format's own `numGlyphs` limit |
