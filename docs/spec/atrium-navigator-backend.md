@@ -69,7 +69,7 @@ composed into the chrome by **Limen**. Document pixels never round-trip through 
 process, and chrome and document are separate Fresco subtrees with separate trust: the
 `<iframe>` replacement, used for the top-level document too.
 
-**Headless mode** substitutes "serialize the scene graph to OTL on stdout" for "attach
+**Headless mode** substitutes "serialize the scene graph to NSG on stdout" for "attach
 to Fresco". That single substitution is what makes the whole backend testable without a
 display server, and it is the only difference between the test configuration and the
 shipping one.
@@ -78,7 +78,7 @@ shipping one.
 
 ## 4. The scene graph is the boundary
 
-Fresco is a retained **scene-graph** server and OTL is a serialized scene graph, so the
+Fresco is a retained **scene-graph** server and NSG (the Navigator Scene Graph, §4.1a) is a serialized scene graph, so the
 document pipeline is a pure function:
 
 ```
@@ -182,6 +182,78 @@ every map or set that reaches layout.
 **Byte-stability is M0's gate, before any real content support** — three runs on two
 machines, identical bytes. A pipeline that is nondeterministic at M0 stays that way, and
 every later golden test inherits the flakiness.
+
+### 4.1a NSG, and M0: Markdown → NSG
+
+**NSG — the Navigator Scene Graph.** It is the serialized scene graph that headless mode
+writes and golden tests compare. (Earlier drafts called it "OTL", which collides with
+Orbis's tile format, magic `OTL1`. Renamed with the user, 2026-09-22.)
+
+**What a node carries is decided by who may parse fonts.** Web fonts are parsed and
+shaped only in the worker, and Fresco never receives a web font file (Profile v1, web
+fonts, condition 1). Layout must also measure text in order to break lines. So the worker
+**shapes**, and NSG carries **shaped glyph runs**: the font by content address, size,
+colour, and glyph ids with positions. Rasterizing glyphs is a separate, later stage.
+Fresco's `OP_TEXT_RUN_INSTALL`, which shapes a string server-side by font *name*, suits
+shipped UI fonts. It cannot carry a document.
+
+**Hermetic by construction, not by care:**
+- **Integer geometry.** Every position and size is an integer in **1/64 px**. Shaping
+  returns integer font units, and scaling is integer arithmetic with one stated rounding
+  rule. There is no float formatting in the output, so there is none to differ between
+  machines.
+- **A pinned font set.** The shipped fonts go through the same canonicalization as web
+  fonts (`navigator-fonts`: static, unhinted, sanitized), and the renderer **refuses to
+  start** if a font's canonical address differs from the pinned constant. A font change
+  is therefore a visible version bump, never a silent drift.
+- **A fixed viewport**, no clock, no network, no randomness, and output in document
+  order.
+
+**The serialization is text**, one node per line, so a golden diff reads as a layout
+change. `nsg 0.1` heads the file, followed by `viewport`, `font`, `rect`, `run` and
+`link` lines. Each run carries its source text too, so a reader of a diff can see what
+moved.
+
+**The M0 gate:** the repo's own Markdown (the corpus) produces **byte-identical NSG over
+3 runs on 2 machines**: macOS (host) and FreeBSD (the VM, Laminar, cross-built).
+
+**M0's Markdown** is CommonMark via `pulldown-cmark` (MIT): headings, paragraphs,
+strong, emphasis, code spans and blocks, lists, block quotes, links, thematic breaks
+and tables. Images are out of scope, since they need the fetcher and intrinsic sizes.
+Line breaking is greedy at break opportunities; total-fit (the profile's paragraph
+algorithm) comes later, and the NSG does not change when it lands, only the positions do.
+
+**M0 — PASSED (2026-09-22), `navigator-render`.** `nsg-render --corpus` over the repo's
+111 tracked Markdown files gives digest `4a99561…e121c` on:
+- **3 runs on the host** (macOS, aarch64), plus a fourth under a different `TZ` and `LANG`;
+- **3 runs in the VM** (FreeBSD 16-CURRENT, Laminar, Tessera root, cross-built,
+  hash-verified at the destination).
+
+The VM also re-derived all six pinned font addresses; the renderer refuses to start
+otherwise. **Controls:**
+- changing one character in one file changes exactly that file's hash and the digest;
+- the golden test fails on a doctored golden;
+- a narrower viewport produces more lines, so layout is not a constant.
+
+The first control was itself broken the first time: macOS `sed` does not support the
+GNU-only `0,/re/` address, so the "changed" file was identical. The control reported
+that, which is why it exists.
+
+**Honest limits of the gate.** Both machines are aarch64. An x86-64 run was not
+possible, since Rosetta is not installed on the host and installing it is a system
+change. Integer-only geometry is what makes cross-ISA agreement *expected*; it is not
+*demonstrated*.
+
+What the corpus exercised that M0 does not render faithfully, counted by the renderer:
+- 1,724 emphasis runs drawn upright (no italic face in the set);
+- 432 lines over the viewport (code blocks do not wrap);
+- 68 raw-HTML fragments skipped;
+- 125 glyphs no face has, **all emoji** (✅ ×113, 🟡 🚫 ⏸ ⬜ 🔒 🚧). Colour emoji is outside
+  Profile v1.
+
+Speed: about 20 ms per document on the host. DejaVu, the fallback for ★, lives in
+`test-assets/` without its licence file; it must move to `fonts/` with its licence
+before this set ships.
 
 ### 4.2 The scene graph is untrusted input
 
@@ -727,12 +799,12 @@ schedule. It is not part of Profile v1.
 
 Everything here runs headless, in CI, with no display server.
 
-- **Golden scene-graph tests.** Fixture → OTL → compare. Gated on §4.1 determinism.
+- **Golden scene-graph tests.** Fixture → NSG → compare. Gated on §4.1 determinism.
 - **Profile conformance.** A curated corpus, reported as a **number**, not pass/fail: a
   checker with no coverage figure passes vacuously, and "all green" against three
   fixtures has told us nothing here before.
 - **Parser fuzzing.** Reuse the two-phase `scripts/core-fuzz.sh` shape for the HTML, CSS
-  and OTL-validator parsers. Report **coverage actually reached**, never exec count — a
+  and NSG-validator parsers. Report **coverage actually reached**, never exec count — a
   fuzzer that runs is not a fuzzer that tests.
 - **Capability assertions, tested with the syscall.** A worker fixture that *attempts*
   filesystem and network access, asserting refusal at the syscall rather than trusting
@@ -750,7 +822,7 @@ Everything here runs headless, in CI, with no display server.
 
 | | milestone | gate |
 |---|---|---|
-| **M0** | Markdown → OTL, hermetic | byte-identical output, 3 runs × 2 machines |
+| **M0** | Markdown → NSG, hermetic | byte-identical output, 3 runs × 2 machines |
 | **M1** | jailed fetcher | fetcher's filesystem access refused **at the syscall**, asserted by test |
 | **M2** | Document Profile v1 (HTML + CSS) | curated corpus with a reported conformance **number** |
 | **M3** | per-document jail + graph validator | worker capabilities == none; validator fuzzed with reached-coverage reported; **per-document jail launch cost measured**, not assumed |
