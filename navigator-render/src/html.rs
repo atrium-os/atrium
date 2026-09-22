@@ -5,10 +5,10 @@
 //! outer height is margin-top + height + margin-bottom, always, and the
 //! next block starts right after it.
 //!
-//! ★ WHAT IS NOT LAID OUT YET IS COUNTED, NOT FAKED. flex, grid and table
-//! containers lay out as blocks and are counted; positioned boxes other than
-//! `relative`, and inline-blocks, are skipped and counted. `unimplemented`
-//! is the list of what the conformance number cannot yet claim.
+//! ★ WHAT IS NOT LAID OUT YET IS COUNTED, NOT FAKED. Inline-blocks are
+//! skipped and counted, as is loose text directly inside a flex or grid
+//! container. `unimplemented` is the list of what the conformance number
+//! cannot yet claim.
 
 use crate::fontset::{Family, FontSet};
 use crate::{scale, Link, Rect, Report, Run, Scene, Shaper, Style as FontStyle, PX, U};
@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 /// so a property the layout ignores can never be dropped silently (§5.1).
 /// Value-level gaps inside a read row (flex as block, italic without an
 /// italic face, …) are counted where they occur.
-pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 55, 57, 59, 60, 63, 64];
+pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 55, 57, 59, 60, 63, 64];
 
 pub struct HtmlOut {
     pub scene: Scene,
@@ -96,6 +96,25 @@ struct Cx<'a> {
     /// Set while a table lays out one of its own cells, so the "table part
     /// outside a table" counter fires only for a STRAY part in normal flow.
     table_part: bool,
+    /// The initial containing block: the viewport, which is also the
+    /// containing block of every `position: fixed` box (NSG has no scroll
+    /// offset, so fixed and absolute differ only in which block they use).
+    viewport: (U, Option<U>),
+    /// The padding box of the nearest positioned ancestor — the containing
+    /// block of an `absolute` descendant (x, y, w, h).
+    pos_cb: (U, U, U, Option<U>),
+    /// Set by `abs_box` so the one `block()` call it makes lays the box out
+    /// instead of diverting it again.
+    placing_abs: bool,
+    /// Set by `abs_box`: the border-box origin `block()` must use instead of
+    /// the one normal flow would give it.
+    abs_origin: Option<(U, U)>,
+    /// Stacking contexts, as ranges of `scene.order`, pushed when the box
+    /// that opened one finishes painting (so: post-order).
+    contexts: Vec<(i64, usize, usize, usize)>,
+    /// Ranges of `scene.order` painted by a positioned box with
+    /// `z-index: auto` — layer 6, but NOT a stacking context.
+    hoists: Vec<(usize, usize)>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -129,13 +148,16 @@ pub fn render_html(html: &str, fonts: &FontSet, env: &Env) -> HtmlOut {
     let styled = cascade(&dom, &sheets, env);
     diagnostics.extend(styled.diagnostics);
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
-                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, content_dy: 0, table_part: false, diagnostics: vec![] };
+                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, content_dy: 0, table_part: false,
+                      viewport: (u(env.width_px), Some(u(env.height_px))), pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))),
+                      placing_abs: false, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
     cx.count_unread_rows();
     // The root element is the initial containing block's only child.
     let root = dom.element_children(dom.root()).into_iter().next();
     // The root's containing block is the viewport: definite in both axes.
     let h = match root { Some(r) => cx.block(r, 0, 0, u(env.width_px), Some(u(env.height_px)), (None, None)), None => 0 };
     cx.scene.height = h.max(u(env.height_px));
+    cx.scene.order = restack(&cx.scene.order, &cx.contexts, &cx.hoists);
     diagnostics.extend(cx.diagnostics);
     HtmlOut { scene: cx.scene, report: cx.report, diagnostics, unimplemented: cx.unimplemented }
 }
@@ -207,10 +229,27 @@ impl<'a> Cx<'a> {
             "table-row" | "table-cell" if !part => self.count("display: table-row/-cell outside a table (laid out as block)"),
             _ => {}
         }
-        match kw(s, "position") {
-            "absolute" | "fixed" => { self.count("position: absolute/fixed (skipped)"); return 0 }
-            _ => {}
+        let positioned = kw(s, "position") != "static";
+        if matches!(kw(s, "position"), "absolute" | "fixed") && !std::mem::take(&mut self.placing_abs) {
+            // Out of flow: it takes no room where it was written.
+            self.abs_box(h, x, y);
+            return 0;
         }
+        // ★ Painting order. The profile admits `position`, `z-index` and
+        // `isolation` and nothing else that stacks, so a box opens a
+        // stacking context when it is positioned or isolated; `z-index: auto`
+        // on a positioned box counts as z = 0, which paints it above the
+        // in-flow content around it (CSS 2 §9.9.1 layer 6). The deviation
+        // from CSS is that a z-index INSIDE such a box stays nested instead
+        // of joining the outer context, and that is counted, not hidden.
+        // z-index applies to a positioned box and to a flex or grid item
+        // (CSS Position 4 §6); on anything else it is ignored, as in CSS.
+        let z_applies = positioned || self.dom.get(h).and_then(|n| n.parent).and_then(|p| self.st(p))
+            .is_some_and(|ps| matches!(kw(ps, "display"), "flex" | "grid"));
+        let z = match s.get("z-index") { V::Int(i) if z_applies => Some(*i), _ => None };
+        let isolated = kw(s, "isolation") == "isolate";
+        let opens_context = z.is_some() || isolated;
+        let ctx_start = self.scene.order.len();
         let side = |p: &str| len(s.get(p), cb_w);
         let vpct = |p: &str| -> Option<U> { match s.get(p) { V::Pct(_) => cb_h.and_then(|b| len(s.get(p), b)), v => len(v, cb_h.unwrap_or(0)) } };
         let (bt, br, bb, bl) = ["border-top", "border-right", "border-bottom", "border-left"].map(|b| {
@@ -245,6 +284,8 @@ impl<'a> Cx<'a> {
              vpct("top").or_else(|| vpct("bottom").map(|b| -b)).unwrap_or(0))
         } else { (0, 0) };
         let (bx, by) = (bx + rel_dx, by + rel_dy);
+        // `abs_box` has already decided where this box goes.
+        let (bx, by) = self.abs_origin.take().unwrap_or((bx, by));
         // A definite height is known BEFORE the children, so they can resolve
         // their own percentages against it.
         let clamp = |v: U| {
@@ -281,6 +322,12 @@ impl<'a> Cx<'a> {
                 let (st, line) = self.font_style(s);
                 self.marker = Some((t, st, line, kw(s, "list-style-position") == "outside"));
             }
+        }
+        let saved_cb = self.pos_cb;
+        if positioned {
+            // ★ The containing block of an absolutely positioned descendant
+            // is this box's PADDING box, not its content box.
+            self.pos_cb = (bx + bl, by + bt, (w - bl - br).max(0), definite.map(|d| (d - bt - bb).max(0)));
         }
         // Paint the background BEFORE the children: reserve its slot now.
         let bg_slot = self.scene.order.len();
@@ -365,11 +412,97 @@ impl<'a> Cx<'a> {
                 for r in edge(ow, sx, sy, length, horiz, ostyle, oc) { self.scene.rect(r) }
             }
         }
+        let painted = paint.len();
         for (i, r) in paint.into_iter().enumerate() {
             self.scene.order.insert(bg_slot + i, (0, self.scene.rects.len()));
             self.scene.rects.push(r);
         }
+        // ★ Inserting this box's background at the slot reserved before the
+        // children SHIFTS every entry after it, so the ranges the children
+        // recorded no longer point at what they painted. Move them.
+        if painted > 0 {
+            for c in self.contexts.iter_mut().filter(|c| c.1 >= bg_slot) { c.1 += painted; c.2 += painted }
+            for h in self.hoists.iter_mut().filter(|h| h.0 >= bg_slot) { h.0 += painted; h.1 += painted }
+        }
+        if positioned { self.pos_cb = saved_cb }
+        if opens_context { self.contexts.push((z.unwrap_or(0), ctx_start, self.scene.order.len(), painted)) }
+        else if positioned { self.hoists.push((ctx_start, self.scene.order.len())) }
         mt + hgt + mb
+    }
+
+    /// An `absolute` or `fixed` box: sized and placed against its containing
+    /// block (the padding box of the nearest positioned ancestor, or the
+    /// viewport), then laid out by `block()` at that origin. It is out of
+    /// flow, so it returns nothing to the height of what contained it.
+    ///
+    /// `static_x`/`static_y` are where normal flow would have put it, which
+    /// is what an `auto` offset resolves to (CSS 2 §10.3.7).
+    fn abs_box(&mut self, h: Handle, static_x: U, static_y: U) {
+        let Some(s) = self.st(h) else { return };
+        let (cbx, cby, cbw, cbh) = if kw(s, "position") == "fixed" {
+            (0, 0, self.viewport.0, self.viewport.1)
+        } else { self.pos_cb };
+        let h_off = |p: &str| len(s.get(p), cbw);
+        let v_off = |p: &str| -> Option<U> { match s.get(p) { V::Pct(_) => cbh.and_then(|b| len(s.get(p), b)), v => len(v, 0) } };
+        let (left, right) = (h_off("left"), h_off("right"));
+        let (top, bottom) = (v_off("top"), v_off("bottom"));
+        let (ml, mr) = (h_off("margin-left").unwrap_or(0), h_off("margin-right").unwrap_or(0));
+        let (mt, mb) = (h_off("margin-top").unwrap_or(0), h_off("margin-bottom").unwrap_or(0));
+        let (bt, br, bb, bl) = ["border-top", "border-right", "border-bottom", "border-left"].map(|b| {
+            if kw(s, &format!("{b}-style")) == "none" { 0 } else { len(s.get(&format!("{b}-width")), cbw).unwrap_or(0) }
+        }).into();
+        let frame = bl + br + h_off("padding-left").unwrap_or(0) + h_off("padding-right").unwrap_or(0);
+        let (mn, mx) = self.intrinsic(h);
+        let mut w = match s.get("width") {
+            V::Kw("min-content") => mn + frame,
+            V::Kw("max-content") => mx + frame,
+            V::Kw(_) => match (left, right) {
+                // Both offsets definite: the width is what is left between them.
+                (Some(l), Some(r)) => (cbw - l - r - ml - mr).max(frame),
+                // Otherwise shrink-to-fit against what is available.
+                _ => {
+                    let avail = (cbw - left.or(right).unwrap_or(0) - ml - mr - frame).max(0);
+                    frame + mx.min(avail).max(mn.min(avail))
+                }
+            },
+            v => len(v, cbw).unwrap_or(0),
+        };
+        if let Some(m) = h_off("max-width") { w = w.min(m) }
+        if let Some(m) = h_off("min-width") { w = w.max(m) }
+        w = w.max(frame);
+        // A definite height only when both offsets are given and `height` is
+        // auto; otherwise the content decides and `block()` clamps it.
+        let forced_h = match (top, bottom, s.get("height")) {
+            (Some(t), Some(b), V::Kw(_)) => cbh.map(|ch| (ch - t - b - mt - mb).max(bt + bb)),
+            _ => None,
+        };
+        if (bottom.is_some() && top.is_none() || right.is_some() && left.is_none()) && cbh.is_none() && bottom.is_some() {
+            self.count("bottom against an indefinite containing block (treated as auto)");
+        }
+        let x = match (left, right) {
+            (Some(l), _) => cbx + l + ml,
+            (None, Some(r)) => cbx + cbw - r - mr - w,
+            _ => static_x + ml,
+        };
+        let y = match (top, bottom) {
+            (Some(t), _) => cby + t + mt,
+            (None, Some(b)) => match cbh {
+                // The box must be measured before it can be placed from the
+                // bottom edge: `measure` rolls the trial layout back whole.
+                Some(ch) => {
+                    self.placing_abs = true;
+                    let outer = self.measure(h, cbw, cbh, (Some(w), forced_h));
+                    cby + ch - b - mb - (outer - mt - mb)
+                }
+                None => static_y + mt,
+            },
+            _ => static_y + mt,
+        };
+        self.abs_origin = Some((x, y));
+        self.placing_abs = true;
+        self.block(h, 0, 0, cbw, cbh, (Some(w), forced_h));
+        self.abs_origin = None;
+        self.placing_abs = false;
     }
 
     /// Lay `h` out somewhere the reader never sees, and return its outer
@@ -391,9 +524,11 @@ impl<'a> Cx<'a> {
     fn measure(&mut self, h: Handle, cb_w: U, cb_h: Option<U>, force: (Option<U>, Option<U>)) -> U {
         let (o, r, n, l) = (self.scene.order.len(), self.scene.rects.len(), self.scene.runs.len(), self.scene.links.len());
         let (links, counts, marker, report) = (self.links.len(), self.unimplemented.clone(), self.marker.clone(), self.report.clone());
+        let (ctx, hoi) = (self.contexts.len(), self.hoists.len());
         let hgt = self.block(h, 0, 0, cb_w, cb_h, force);
         self.scene.order.truncate(o); self.scene.rects.truncate(r); self.scene.runs.truncate(n); self.scene.links.truncate(l);
         self.links.truncate(links); self.unimplemented = counts; self.marker = marker; self.report = report;
+        self.contexts.truncate(ctx); self.hoists.truncate(hoi);
         hgt
     }
 
@@ -422,7 +557,8 @@ impl<'a> Cx<'a> {
             }
             let Some(cs) = self.st(c) else { continue };
             if kw(cs, "display") == "none" { continue }
-            if matches!(kw(cs, "position"), "absolute" | "fixed") { self.count("position: absolute/fixed (skipped)"); continue }
+            // Out of flow: not an item, placed against its containing block.
+            if matches!(kw(cs, "position"), "absolute" | "fixed") { self.abs_box(c, x, y); continue }
             let px = |p: &str, basis: U| len(cs.get(p), basis);
             let (mw, mh) = (["margin-left", "margin-right"], ["margin-top", "margin-bottom"]);
             let (mm, cm) = if row { (mw, mh) } else { (mh, mw) };
@@ -598,7 +734,8 @@ impl<'a> Cx<'a> {
             }
             let Some(cs) = self.st(c) else { continue };
             if kw(cs, "display") == "none" { continue }
-            if matches!(kw(cs, "position"), "absolute" | "fixed") { self.count("position: absolute/fixed (skipped)"); continue }
+            // Out of flow: not an item, placed against its containing block.
+            if matches!(kw(cs, "position"), "absolute" | "fixed") { self.abs_box(c, x, y); continue }
             let pick = |own: &str, parent: &str| -> String {
                 match kw(cs, own) { "auto" | "" => match kw(s, parent) { "" => "stretch", a => a }, a => a }.to_string()
             };
@@ -1276,9 +1413,88 @@ mod tests {
 
     #[test]
     fn unimplemented_layout_is_counted_not_faked() {
-        let o = render(r#"<style>.f { display: inline-block } .p { position: absolute }</style><span class="f">a</span><div class="p">b</div>"#);
+        let o = render(r#"<style>.f { display: inline-block }</style><span class="f">a</span>"#);
         assert!(o.unimplemented.contains_key("inline-block (skipped)"));
-        assert!(o.unimplemented.contains_key("position: absolute/fixed (skipped)"));
+    }
+
+    #[test]
+    fn absolute_boxes_are_placed_against_their_containing_block() {
+        // The containing block is the nearest POSITIONED ancestor's padding
+        // box: 20px border + 10px padding in from the relative box at (0, 0).
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .r { position: relative; width: 300px; height: 200px; padding-left: 10px; padding-top: 10px;
+                 border-left-width: 20px; border-top-width: 20px; border-left-style: solid; border-top-style: solid;
+                 border-left-color: #000000; border-top-color: #000000 }
+            .a { position: absolute; left: 5px; top: 5px; width: 40px; height: 10px; background-color: #ff0000 }
+            .b { position: absolute; right: 0px; bottom: 0px; width: 40px; height: 10px; background-color: #00ff00 }
+            .f { position: fixed; left: 0px; top: 0px; width: 40px; height: 10px; background-color: #0000ff }</style>
+            <div class="r"><div class="a"></div><div class="b"></div><div class="f"></div></div>"#);
+        // Padding box starts at (20, 20) and is 280 x 180.
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(25, 25, 40, 10)]);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(260, 190, 40, 10)]);
+        // `fixed` uses the viewport, not the positioned ancestor.
+        assert_eq!(boxes(&o, 0x0000ffff), vec![(0, 0, 40, 10)]);
+    }
+
+    #[test]
+    fn an_absolute_box_takes_no_room_and_shrinks_to_fit() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            div { height: 10px } .a { background-color: #ff0000 } .b { background-color: #00ff00 }
+            .p { position: absolute; background-color: #0000ff; height: 10px }</style>
+            <div class="a"></div><div class="p">ab</div><div class="b"></div>"#);
+        // The absolute box is out of flow: `b` sits directly under `a`.
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(0, 10, 792, 10)]); // 800 less body's right margin
+        // With no offsets it stays at its static position, shrink-to-fit
+        // around its text rather than filling the containing block.
+        let p = boxes(&o, 0x0000ffff);
+        assert_eq!(p.len(), 1);
+        assert_eq!((p[0].0, p[0].1), (0, 10));
+        assert!(p[0].2 > 0 && p[0].2 < 100, "shrink-to-fit, not 800: {}", p[0].2);
+    }
+
+    /// The case that says whether `z-index: auto` was treated as a stacking
+    /// context: a negative-z descendant of a positioned `z-index: auto` box
+    /// belongs to the OUTER context, so it paints below the in-flow content —
+    /// not above it, which is where nesting would put it.
+    #[test]
+    fn z_index_auto_does_not_trap_its_descendants() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .s { width: 200px; height: 20px; background-color: #00ff00 }
+            .p { position: relative; z-index: auto; width: 200px; height: 20px; background-color: #0000ff }
+            .c { position: absolute; left: 0px; top: 0px; width: 200px; height: 20px; z-index: -1; background-color: #ff0000 }</style>
+            <div><div class="s"></div><div class="p"><div class="c"></div></div></div>"#);
+        let order: Vec<u32> = o.scene.order.iter().filter(|(k, _)| *k == 0).map(|(_, i)| o.scene.rects[*i].rgba).collect();
+        // red (z = -1, outer context) · green (in flow) · blue (layer 6).
+        assert_eq!(order, vec![0xff0000ff, 0x00ff00ff, 0x0000ffff]);
+    }
+
+    /// `isolation: isolate` must be visibly different from `auto`: it makes
+    /// a stacking context, so a negative-z child paints above the isolating
+    /// box's own background instead of disappearing behind it.
+    #[test]
+    fn isolation_contains_a_negative_child() {
+        let css = r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .box { width: 100px; height: 20px; background-color: #00ff00 }
+            .u { position: relative; z-index: -1; width: 100px; height: 20px; background-color: #ff0000 }</style>"#;
+        let iso = render(&format!(r#"{css}<style>.box {{ isolation: isolate }}</style><div class="box"><div class="u"></div></div>"#));
+        let auto = render(&format!(r#"{css}<style>.box {{ isolation: auto }}</style><div class="box"><div class="u"></div></div>"#));
+        let order = |o: &HtmlOut| -> Vec<u32> { o.scene.order.iter().filter(|(k, _)| *k == 0).map(|(_, i)| o.scene.rects[*i].rgba).collect() };
+        assert_eq!(order(&iso), vec![0x00ff00ff, 0xff0000ff], "isolate: the red child is inside, so it paints over");
+        assert_eq!(order(&auto), vec![0xff0000ff, 0x00ff00ff], "auto: the red child joins the root context and paints under");
+    }
+
+    #[test]
+    fn z_index_orders_painting() {
+        // Tree order would paint red last; z-index puts it under both, and
+        // the negative one under the in-flow content of the context.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .u { position: relative; z-index: -1; width: 10px; height: 10px; background-color: #00ffff }
+            .a { position: absolute; left: 0px; top: 0px; width: 10px; height: 10px; z-index: 2; background-color: #ff0000 }
+            .b { position: absolute; left: 0px; top: 0px; width: 10px; height: 10px; z-index: 5; background-color: #00ff00 }
+            .c { position: absolute; left: 0px; top: 0px; width: 10px; height: 10px; z-index: 3; background-color: #0000ff }</style>
+            <div><div class="u"></div><div class="a"></div><div class="b"></div><div class="c"></div></div>"#);
+        let order: Vec<u32> = o.scene.order.iter().filter(|(k, _)| *k == 0).map(|(_, i)| o.scene.rects[*i].rgba).collect();
+        assert_eq!(order, vec![0x00ffffff, 0xff0000ff, 0x0000ffff, 0x00ff00ff]);
     }
 
     /// The control for count_unread_rows: a property the layout never reads
@@ -1409,6 +1625,59 @@ fn edge(t: U, sx: U, sy: U, length: U, horiz: bool, style: &str, rgba: u32) -> V
 
 /// Size one axis of a grid: bases from the track kinds and the items'
 /// intrinsic contributions, then `fr` shares whatever space is left.
+/// Painting order, as CSS 2 §9.9.1 reduced to what the profile admits
+/// (`position`, `z-index`, `isolation` — no floats, no opacity groups, no
+/// blend modes).
+///
+/// A box paints its subtree contiguously, so both inputs are RANGES of
+/// `order`:
+/// - `real` — stacking contexts: a positioned box with a `z-index`, or an
+///   `isolation: isolate` box. They nest, and a `z-index` is compared only
+///   among the children of the same one.
+/// - `hoist` — positioned boxes with `z-index: auto`. CSS does NOT make
+///   these stacking contexts: they paint in layer 6 (above the in-flow
+///   content around them) but their z-indexed descendants belong to the
+///   enclosing context, NOT to them. Nesting them would trap those
+///   descendants, which is why this is not simply a context with z = 0.
+///
+/// Every entry gets a key — the chain of enclosing context z values, then
+/// 1 if a `hoist` range holds it — and the sort is stable, so ties keep
+/// tree order.
+fn restack(order: &[(u8, usize)], real: &[(i64, usize, usize, usize)], hoist: &[(usize, usize)]) -> Vec<(u8, usize)> {
+    if real.is_empty() && hoist.is_empty() { return order.to_vec() }
+    let key = |i: usize| -> (Vec<i64>, u8) {
+        let mut chain: Vec<&(i64, usize, usize, usize)> = real.iter().filter(|c| i >= c.1 && i < c.2).collect();
+        // Outer ranges first: they start earlier, and on a tie they end later.
+        chain.sort_by_key(|c| (c.1, std::cmp::Reverse(c.2)));
+        let innermost = chain.last().copied();
+        let inner = innermost.map(|c| c.1).unwrap_or(0);
+        let rank = hoist.iter().any(|h| i >= h.0 && i < h.1 && h.0 >= inner) as u8;
+        let mut ks: Vec<i64> = chain.into_iter().map(|c| c.0).collect();
+        // ★ The context root's OWN background and borders are layer 1: they
+        // paint BEFORE its negative-z children, not with the content around
+        // them. Without this an `isolation: isolate` box is indistinguishable
+        // from `auto`, because the negative child hides under the background
+        // either way.
+        if innermost.is_some_and(|c| i < c.1 + c.3) { ks.push(i64::MIN) }
+        (ks, rank)
+    };
+    let keys: Vec<(Vec<i64>, u8)> = (0..order.len()).map(key).collect();
+    let mut idx: Vec<usize> = (0..order.len()).collect();
+    idx.sort_by(|a, b| {
+        let (ka, kb) = (&keys[*a], &keys[*b]);
+        for (x, y) in ka.0.iter().zip(kb.0.iter()) { if x != y { return x.cmp(y) } }
+        // One chain is a prefix of the other: the shorter is the parent's own
+        // content, which paints after a negative child and before the rest.
+        let ord = match ka.0.len().cmp(&kb.0.len()) {
+            std::cmp::Ordering::Less => if kb.0[ka.0.len()] < 0 { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less },
+            std::cmp::Ordering::Greater => if ka.0[kb.0.len()] < 0 { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater },
+            std::cmp::Ordering::Equal => std::cmp::Ordering::Equal,
+        };
+        ord.then(ka.1.cmp(&kb.1)).then(a.cmp(b))
+    });
+    idx.into_iter().map(|i| order[i]).collect()
+}
+
 fn size_tracks(tracks: &[navigator_style::values::Track], avail: Option<U>, gap: U, mins: &[U], maxs: &[U]) -> Vec<U> {
     use navigator_style::values::Track;
     fn base(t: &Track, avail: Option<U>, mn: U, mx: U) -> U {

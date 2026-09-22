@@ -980,7 +980,7 @@ layout.
 
 ### 8.3 M2 progress — the number, first reading (2026-09-22)
 
-**CONFORMANCE: exercised 52/64, matched 48/64** (13 on first reading; see the updates
+**CONFORMANCE: exercised 54/64, matched 51/64** (13 on first reading; see the updates
 below). Printed by `nsg-conformance`; the
 matched set is pinned by a test so it cannot fall silently.
 
@@ -1167,6 +1167,39 @@ leaves a width `auto` is refused with a diagnostic and not laid out**
   claim, and it was settled by reading 54 px out of the NSG, not by looking at it.
 - The review PNGs were first rasterized from the `.nsg` files instead of the fixtures,
   which renders the golden's TEXT as a document. It looks like a render. It is not one.
+
+**Update — positioning and painting order, matched 48 → 51 (rows 2, 15, 16).**
+- **`absolute`/`fixed`** are placed against their containing block — the PADDING box of
+  the nearest positioned ancestor, the viewport for `fixed` (NSG has no scroll offset, so
+  that is the only difference between the two). Offsets that are `auto` fall back to the
+  static position; `left` and `right` together give the width, one alone gives
+  shrink-to-fit; `top` and `bottom` together give the height. A box placed from the
+  BOTTOM edge must be measured before it can be placed, which `measure` already does by
+  rolling a trial layout back whole.
+- **Painting order** is CSS 2 §9.9.1 reduced to what the profile admits. Every entry in
+  the scene gets a key — the chain of enclosing stacking-context `z-index`es — and the
+  final sort is stable, so ties keep tree order.
+- ★ **`z-index: auto` is NOT a stacking context.** A positioned box with `z-index: auto`
+  paints in layer 6, above the in-flow content around it, but its z-indexed descendants
+  belong to the ENCLOSING context. Treating it as a context with z = 0 is the easy
+  version and it traps them; the test that says which you built is a negative-z
+  descendant of a `z-index: auto` box, which must paint BELOW its parent's in-flow
+  siblings.
+- ★ **A stacking context's own background is layer 1**, before its negative-z children —
+  not part of the content around them. Without that rule `isolation: isolate` renders
+  identically to `auto` (the negative child hides behind the background either way), and
+  the fixture for row 15 cannot show what it certifies.
+- **Inserting a box's background shifts every entry recorded after it.** The background
+  slot is reserved before the children and filled after, so the ranges the children
+  recorded stop pointing at what they painted. The symptom was a paint order exactly
+  reversed; the fix moves the recorded ranges.
+- Row 3's golden changed by ONE line and gained no new content: a `position: relative`
+  box now paints above the in-flow content around it, which is layer 6. Diffing it
+  through the `nsg-render` CLI instead of the conformance harness showed a false wall of
+  changes, because that tool renders at a different viewport.
+- A test that used `div div` proved nothing for a while: the profile does not admit the
+  descendant combinator, so the rule was refused and every box stayed static. **Read the
+  diagnostics before reading the result.**
 
 ## 9. What this reuses
 
