@@ -1,0 +1,21 @@
+[package]
+name = "navigator-fetch"
+version = "0.1.0"
+edition = "2021"
+description = "M1: the Navigator's fetcher — the only component with network, and one that cannot touch a file. Capsicum capability mode + casper cap_net on FreeBSD."
+
+# Cross-building for aarch64-unknown-freebsd: `ring` compiles C and assembly,
+# which macOS's clang cannot target. Use Homebrew LLVM with the repo sysroot:
+#   CC_aarch64_unknown_freebsd=/opt/homebrew/opt/llvm/bin/clang
+#   CFLAGS_aarch64_unknown_freebsd="--target=aarch64-unknown-freebsd --sysroot=<repo>/sysroot"
+#   AR_aarch64_unknown_freebsd=/opt/homebrew/opt/llvm/bin/llvm-ar
+# The binary links libcasper, libcap_net and libnv from the base system.
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+url = "2"
+libc = "0.2"
+
+[[bin]]
+name = "navigator-fetchd"
+path = "src/bin/navigator-fetchd.rs"

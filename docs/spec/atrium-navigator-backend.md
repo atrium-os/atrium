@@ -832,6 +832,48 @@ Everything here runs headless, in CI, with no display server.
 
 ---
 
+### 8.1 M1 — PASSED (2026-09-22): `navigator-fetch`
+
+The fetcher can reach the network and cannot name a file. That is enforced by the
+kernel, not by the code's good behaviour.
+
+**Mechanism, FreeBSD-native: Capsicum + casper.** At startup, and only then, the fetcher
+does everything that needs a global name:
+1. reads the system trust store (`/etc/ssl/cert.pem`) into `rustls`;
+2. forks casper's `system.net` service, limited to resolving names on **ports 80 and 443
+   only**, and to connecting only to addresses **it resolved** (`CAPNET_CONNECTDNS`);
+3. calls `cap_enter()`. It refuses to serve unless `cap_getmode()` confirms the mode.
+
+After that, a request is: resolve and connect via casper, TLS (`rustls` + `ring`), then one
+bounded HTTP/1.1 GET. The GET sends no cookies, Referer or credentials; asks for
+`identity` encoding and refuses a compressed body; allows 64 KiB of headers and 8 MiB of
+body; times out after 20 s; and follows at most 5 redirects, never https→http.
+
+**Gate, run in the VM as uid 1001** (`navigator-fetchd --gate`):
+
+| probe after `cap_enter` | result |
+|---|---|
+| `open` of the trust store, `/etc/passwd`, `/`, `/tmp/…`; `open(O_CREAT)`; `stat(/etc)`; `openat(AT_FDCWD, …)` | all **ECAPMODE** (errno 94): refused before any lookup, not ENOENT or EACCES |
+| direct `connect()` | **ECAPMODE** |
+| casper connect to an address it did not resolve | refused (ENOTCAPABLE) |
+| casper resolve on port 8443 | refused by casper's own limit, not only by ours |
+| https fetch through casper + TLS | 200 |
+
+**Controls:**
+- the same trust store is readable *before* `cap_enter`;
+- a `--gate-control` arm that skips `cap_enter` opens the same files, so every gate row
+  would fail without the mode (the check reads the mode, not a constant);
+- serve mode: https and http 200, `file://` refused, an unresolvable host fails cleanly.
+
+**Not yet:**
+- the fetcher inside a Portcullis jail with network grants; the jail would add network
+  isolation on top of the syscall refusal;
+- the converter's `Fetcher` seam implemented against `navigator-fetchd`;
+- a per-host request count for the report (legacy-web §5.4.1d, rule 4).
+
+Cross-building `ring` needs a C compiler for the target: Homebrew clang with
+`--target=aarch64-unknown-freebsd --sysroot=sysroot` (see `navigator-fetch/Cargo.toml`).
+
 ## 9. What this reuses
 
 Almost none of this is new infrastructure; it is composition, which is the point of the
