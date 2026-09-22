@@ -3,6 +3,7 @@
 //!   navigator-fetchd [--trust <pem>]        serve: one URL per stdin line,
 //!                                           one framed response per URL
 //!   navigator-fetchd --gate [--trust <pem>] M1's gate, printed as a table
+//!                                           (also: a `--gate` line on stdin)
 //!
 //! Output frame per URL: `ok <status> <redirects> <body-len> <final-url>\n`
 //! then exactly body-len bytes; or `err <reason>\n`.
@@ -72,6 +73,10 @@ fn main() {
         let Ok(url) = line else { break };
         let url = url.trim();
         if url.is_empty() { continue }
+        // The gate, on request, from the serving process itself — so it can
+        // be run where the fetcher actually runs (a jail launches the entry
+        // with no arguments).
+        if url == "--gate" { let _ = out.flush(); run_gate(&net, &tls, &trust, before); continue }
         match fetch(&net, &tls, url) {
             Ok(f) => {
                 let _ = writeln!(out, "ok {} {} {} {}", f.response.status, f.redirects, f.response.body.len(), f.url);

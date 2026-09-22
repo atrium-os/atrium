@@ -865,9 +865,30 @@ body; times out after 20 s; and follows at most 5 redirects, never https→http.
   would fail without the mode (the check reads the mode, not a constant);
 - serve mode: https and http 200, `file://` refused, an unresolvable host fails cleanly.
 
+**And inside a jail (same day).** The fetcher ships as a signed bundle,
+`org.atrium.navigator.fetcher`: `network = "full"`, its own copy of the trust store, and
+its library closure (libcasper, libcap_net, libnv…) resolved by `opifex`. Launched through
+the one-shot lane as uid 1001, the whole gate passes **from inside the jail**. The run:
+- the jail was `app-org-atrium-navigator-fetcher--f1`, with its own `vnet`;
+- three `navtest` processes: the fetcher and casper's two;
+- the fetch went out through the routed epair and the per-app pf anchor;
+- afterwards there were no jails, epairs or anchors.
+
+So the layers compose: the jail decides what network exists at all, and capability mode
+decides that nothing in the process can name a file or an address.
+
+**Gap found: a headless component cannot be granted through the daemon lane.** The first
+attempt used `portcullis exec --daemon`, which was correctly refused: a networked app
+needs a grant and "there is nobody to prompt on this path". But `navtest` cannot save a
+grant either, because `/var/db/atrium/<user>/` is root-owned. That matches §7: a user
+process that could write its own policy could grant itself capabilities. The mechanism
+§7 names for this case, the trusted-installer policy (`/etc/atrium/policy.toml`
+pre-grants), is not built. The in-jail run therefore used the direct lane (root caller,
+`--user navtest`, root's own grant). Building the installer grant is a prerequisite for
+the broker to launch the fetcher unattended.
+
 **Not yet:**
-- the fetcher inside a Portcullis jail with network grants; the jail would add network
-  isolation on top of the syscall refusal;
+- the trusted-installer grant above;
 - the converter's `Fetcher` seam implemented against `navigator-fetchd`;
 - a per-host request count for the report (legacy-web §5.4.1d, rule 4).
 
