@@ -345,6 +345,9 @@ impl<'a> Cx<'a> {
             let used = last.x + last.pieces.iter().map(|p| p.width).sum::<U>();
             let shift = match align { "center" => (w - used) / 2, "end" => w - used, _ => 0 }.max(0);
             let mut link_span: Option<(usize, U, U)> = None;
+            // Decorations span the gaps between words of one decorated run
+            // (CSS draws one line under `<a>link with a region</a>`, not four).
+            let mut deco: Vec<(u32, U, U, U, U)> = vec![]; // (colour, y, x0, x1, thickness)
             for p in &line {
                 let mut px = x + shift + p.x;
                 let start = px;
@@ -355,8 +358,14 @@ impl<'a> Cx<'a> {
                     px += piece.width;
                 }
                 let thick = (p.st.size / 16).max(PX);
-                if let Some(c) = p.line.underline { self.scene.rect(Rect { x: start, y: yy + base + thick, w: px - start, h: thick, rgba: c }) }
-                if let Some(c) = p.line.strike { self.scene.rect(Rect { x: start, y: yy + base - scale(p.st.size, 1, 3), w: px - start, h: thick, rgba: c }) }
+                for (c, dy) in [(p.line.underline, thick), (p.line.strike, -scale(p.st.size, 1, 3))] {
+                    let Some(c) = c else { continue };
+                    let yline = yy + base + dy;
+                    match deco.iter_mut().find(|d| d.0 == c && d.1 == yline && d.4 == thick) {
+                        Some(d) => d.3 = px,
+                        None => deco.push((c, yline, start, px, thick)),
+                    }
+                }
                 match (p.st.link, &mut link_span) {
                     (Some(i), Some((j, _, x1))) if *j == i => *x1 = px,
                     (Some(i), span) => {
@@ -367,6 +376,7 @@ impl<'a> Cx<'a> {
                 }
             }
             if let Some((j, x0, x1)) = link_span.take() { self.scene.link(Link { x: x0, y: yy, w: x1 - x0, h: lh, href: self.links[j].clone() }) }
+            for (c, yline, x0, x1, t) in deco { self.scene.rect(Rect { x: x0, y: yline, w: x1 - x0, h: t, rgba: c }) }
             yy += lh;
         }
         yy - y
@@ -420,6 +430,14 @@ mod tests {
         assert_eq!(o.scene.links.len(), 1);
         assert_eq!(o.scene.links[0].href, "https://x.example/");
         assert!(rects(&o).iter().any(|r| r.rgba == 0x0969daff), "the UA underlines links");
+    }
+
+    #[test]
+    fn an_underline_spans_the_spaces_of_its_run() {
+        let o = render(r#"<p><a href="x">link with a region</a> plain</p>"#);
+        let under: Vec<&Rect> = rects(&o).into_iter().filter(|r| r.rgba == 0x0969daff).collect();
+        assert_eq!(under.len(), 1, "one continuous underline, not one per word");
+        assert_eq!(under[0].w, o.scene.links[0].w, "it spans exactly the link's text");
     }
 
     #[test]

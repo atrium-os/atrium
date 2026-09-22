@@ -12,6 +12,12 @@ pulldown-cmark = { version = "0.13", default-features = false }
 rustybuzz = "0.20"
 ttf-parser = "0.25"
 blake3 = { version = "1", features = ["pure"] }
+# Review tooling only (nsg-raster): never in the worker's build.
+swash = { version = "0.1", optional = true }
+png = { version = "0.17", optional = true }
+
+[features]
+raster = ["dep:swash", "dep:png"]
 
 # navigator-fonts vendors a one-line fix to pathfinder_simd (see its
 # vendor/README.md); a dependent crate must repeat the patch, because
@@ -22,3 +28,8 @@ pathfinder_simd = { path = "../navigator-fonts/vendor/pathfinder_simd" }
 [[bin]]
 name = "nsg-render"
 path = "src/main.rs"
+
+[[bin]]
+name = "nsg-raster"
+path = "src/bin/nsg-raster.rs"
+required-features = ["raster"]
