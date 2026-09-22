@@ -8,7 +8,7 @@
 //! nsg 0.1
 //! viewport <w> <h>
 //! font f<i> <address> "<name>" <weight>
-//! rect <x> <y> <w> <h> <rrggbbaa>
+//! rect <x> <y> <w> <h> <rrggbbaa> [r<radius>]
 //! run f<i> <size> <rrggbbaa> <x> <y> <em 0|1> <gid>:<dx>,<dy> … "<text>"
 //! link <x> <y> <w> <h> "<href>"
 //! ```
@@ -42,7 +42,12 @@ pub fn write(scene: &Scene, fonts: &FontSet) -> String {
     }
     for &(kind, i) in &scene.order {
         match kind {
-            0 => { let r = &scene.rects[i]; let _ = writeln!(o, "rect {} {} {} {} {:08x}", r.x, r.y, r.w, r.h, r.rgba); }
+            0 => {
+                let r = &scene.rects[i];
+                let _ = write!(o, "rect {} {} {} {} {:08x}", r.x, r.y, r.w, r.h, r.rgba);
+                if r.radius != 0 { let _ = write!(o, " r{}", r.radius); }
+                o.push('\n');
+            }
             1 => {
                 let r = &scene.runs[i];
                 let _ = write!(o, "run f{} {} {:08x} {} {} {}", r.face, r.size, r.rgba, r.x, r.y, r.em as u8);

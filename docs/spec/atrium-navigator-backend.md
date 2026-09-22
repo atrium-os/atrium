@@ -980,7 +980,8 @@ layout.
 
 ### 8.3 M2 progress — the number, first reading (2026-09-22)
 
-**CONFORMANCE: exercised 24/64, matched 13/64.** Printed by `nsg-conformance`; the
+**CONFORMANCE: exercised 24/64, matched 20/64** (was 13 on first reading; see the update
+below). Printed by `nsg-conformance`; the
 matched set is pinned by a test so it cannot fall silently.
 
 - **Built:**
@@ -1023,6 +1024,30 @@ matched set is pinned by a test so it cannot fall silently.
 3. Value-level gaps inside a read row are counted where they occur, including three
    found by re-reading the code after that rule existed: a `%` top/bottom resolved
    against 0, and `%` min/max-height silently ignored.
+
+**Update — matched 13 → 20:**
+- **Percentage heights, insets and min/max** resolve against a *definite* containing
+  height, which is passed down from the viewport. Against an indefinite one they behave
+  as `auto`, which is CSS 2.1 §10.5 and was wrongly counted as a gap before.
+- **`min-content`/`max-content`** come from a measuring pass: the widest unbreakable
+  word, and the unwrapped line.
+- **justify** puts the free space in the collapsible spaces of every line except the
+  last and `<br>`-ended ones (integer division, remainder to the first gaps).
+- **pre-wrap** preserves spaces and newlines, wraps at space boundaries, and trailing
+  spaces hang.
+- **dashed and dotted borders:** dashes 3t on and 2t off; dots are round (NSG `rect`
+  gained an optional `r<radius>`, written only when non-zero, so the M0 golden is
+  unchanged).
+
+**Found in review, not by tests:**
+- **`nowrap` wrapped.** It flushed a word at every space, so every space was a break
+  opportunity; a test now pins one line.
+- **Two fixtures could not show what they certified:** empty boxes for the intrinsic
+  widths, and justify on one word, which is the last line and is never justified. Both
+  were strengthened before blessing.
+- **A stale review binary.** The feature-gated `nsg-raster` was not rebuilt by
+  `cargo run`, so a fixed bug still showed in a PNG drawn by old code. The review tool
+  is rebuilt before every review.
 
 ## 9. What this reuses
 

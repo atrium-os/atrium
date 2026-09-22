@@ -30,6 +30,27 @@ fn paint(scene: &Scene, fonts: &FontSet) -> Canvas {
         match kind {
             0 => {
                 let r = &scene.rects[i];
+                if r.radius > 0 {
+                    // Rounded: 4×4 supersampling of the rounded-rect test.
+                    let rad = r.radius.min(r.w / 2).min(r.h / 2) as f32;
+                    let inside = |sx: f32, sy: f32| {
+                        let (x0, y0, x1, y1) = (r.x as f32, r.y as f32, (r.x + r.w) as f32, (r.y + r.h) as f32);
+                        if sx < x0 || sx >= x1 || sy < y0 || sy >= y1 { return false }
+                        let cx = sx.clamp(x0 + rad, x1 - rad);
+                        let cy = sy.clamp(y0 + rad, y1 - rad);
+                        (sx - cx).powi(2) + (sy - cy).powi(2) <= rad * rad
+                    };
+                    for py in (r.y / PX)..=((r.y + r.h) / PX) {
+                        for px in (r.x / PX)..=((r.x + r.w) / PX) {
+                            let mut n = 0;
+                            for j in 0..4 { for k in 0..4 {
+                                if inside((px * PX) as f32 + (k as f32 + 0.5) * 16.0, (py * PX) as f32 + (j as f32 + 0.5) * 16.0) { n += 1 }
+                            } }
+                            if n > 0 { cv.blend(px, py, r.rgba, n as f32 / 16.0) }
+                        }
+                    }
+                    continue;
+                }
                 // Coverage-exact on 1/64 px edges.
                 let (x0, y0, x1, y1) = (r.x, r.y, r.x + r.w, r.y + r.h);
                 for py in (y0 / PX)..=((y1 - 1).max(y0) / PX) {

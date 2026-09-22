@@ -109,13 +109,17 @@ pub fn render_html(html: &str, fonts: &FontSet, env: &Env) -> HtmlOut {
     cx.count_unread_rows();
     // The root element is the initial containing block's only child.
     let root = dom.element_children(dom.root()).into_iter().next();
-    let h = match root { Some(r) => cx.block(r, 0, 0, u(env.width_px)), None => 0 };
+    // The root's containing block is the viewport: definite in both axes.
+    let h = match root { Some(r) => cx.block(r, 0, 0, u(env.width_px), Some(u(env.height_px))), None => 0 };
     cx.scene.height = h.max(u(env.height_px));
     HtmlOut { scene: cx.scene, report: cx.report, diagnostics, unimplemented: cx.unimplemented }
 }
 
 #[derive(Clone)]
-enum Item { Word(String, FontStyle, Line), Space(FontStyle, Line), Break }
+enum Item { Word(String, FontStyle, Line), Space(FontStyle, Line), Break,
+            /// Preserved spaces (pre-wrap): placed like a word, but they HANG
+            /// at a line end instead of wrapping.
+            PreSpace(String, FontStyle, Line) }
 
 /// Per-item line metrics and decoration.
 #[derive(Clone, Copy)]
@@ -152,9 +156,15 @@ impl<'a> Cx<'a> {
         match self.st(h) { Some(s) => matches!(kw(s, "display"), "block" | "flex" | "grid" | "table" | "table-row" | "table-cell"), None => false }
     }
 
-    /// Lay out a block-level box at (x, y) in a containing block `cb_w` wide.
-    /// Returns its OUTER height (margins included, never collapsed).
-    fn block(&mut self, h: Handle, x: U, y: U, cb_w: U) -> U {
+    /// Lay out a block-level box at (x, y) in a containing block `cb_w` wide
+    /// whose height is `cb_h` when DEFINITE. Returns its OUTER height
+    /// (margins included, never collapsed).
+    ///
+    /// Percentages of the containing block's height (height, min/max-height,
+    /// top/bottom) resolve against `cb_h`; when it is indefinite, CSS 2.1
+    /// §10.5 makes them `auto` (none / no offset) — which is correct
+    /// behaviour, not a gap, and is not counted as one.
+    fn block(&mut self, h: Handle, x: U, y: U, cb_w: U, cb_h: Option<U>) -> U {
         let Some(s) = self.st(h) else { return 0 };
         match kw(s, "display") {
             "none" => return 0,
@@ -168,44 +178,50 @@ impl<'a> Cx<'a> {
             _ => {}
         }
         let side = |p: &str| len(s.get(p), cb_w);
+        let vpct = |p: &str| -> Option<U> { match s.get(p) { V::Pct(_) => cb_h.and_then(|b| len(s.get(p), b)), v => len(v, cb_h.unwrap_or(0)) } };
         let (bt, br, bb, bl) = ["border-top", "border-right", "border-bottom", "border-left"].map(|b| {
             if kw(s, &format!("{b}-style")) == "none" { 0 } else { len(s.get(&format!("{b}-width")), cb_w).unwrap_or(0) }
         }).into();
         let (pt, pr, pb, pl) = (side("padding-top").unwrap_or(0), side("padding-right").unwrap_or(0),
                                 side("padding-bottom").unwrap_or(0), side("padding-left").unwrap_or(0));
-        let (mut ml, mut mr) = (side("margin-left"), side("margin-right"));
+        let (mut ml, mr) = (side("margin-left"), side("margin-right"));
         let (mt, mb) = (side("margin-top").unwrap_or(0), side("margin-bottom").unwrap_or(0));
         // ★ border-box: `width` INCLUDES padding and border (§3.1).
+        let frame = bl + br + pl + pr;
         let specified_w = match s.get("width") {
-            V::Kw("min-content") | V::Kw("max-content") => { self.count("width: min/max-content (treated as auto)"); None }
+            V::Kw("min-content") => Some(self.intrinsic(h).0 + frame),
+            V::Kw("max-content") => Some(self.intrinsic(h).1 + frame),
             v => len(v, cb_w),
         };
         let mut w = specified_w.unwrap_or_else(|| cb_w - ml.unwrap_or(0) - mr.unwrap_or(0));
         if let Some(mx) = len(s.get("max-width"), cb_w) { w = w.min(mx) }
         if let Some(mn) = len(s.get("min-width"), cb_w) { w = w.max(mn) }
-        w = w.max(bl + br + pl + pr);
+        w = w.max(frame);
         // Auto margins take what is left; both auto centres.
         let free = cb_w - w - ml.unwrap_or(0) - mr.unwrap_or(0);
         match (ml, mr) {
-            (None, None) => { ml = Some(free / 2); mr = Some(free - free / 2) }
+            (None, None) => ml = Some(free / 2),
             (None, Some(_)) => ml = Some(free),
-            (Some(_), None) => mr = Some(free),
             _ => {}
         }
-        let _ = mr;
         let (bx, by) = (x + ml.unwrap_or(0), y + mt);
-        if kw(s, "position") == "relative" && (matches!(s.get("top"), V::Pct(_)) || matches!(s.get("bottom"), V::Pct(_))) {
-            self.count("top/bottom: % (no definite containing height; 0)")
-        }
         let (rel_dx, rel_dy) = if kw(s, "position") == "relative" {
             (len(s.get("left"), cb_w).or_else(|| len(s.get("right"), cb_w).map(|r| -r)).unwrap_or(0),
-             len(s.get("top"), 0).or_else(|| len(s.get("bottom"), 0).map(|b| -b)).unwrap_or(0))
+             vpct("top").or_else(|| vpct("bottom").map(|b| -b)).unwrap_or(0))
         } else { (0, 0) };
         let (bx, by) = (bx + rel_dx, by + rel_dy);
+        // A definite height is known BEFORE the children, so they can resolve
+        // their own percentages against it.
+        let clamp = |v: U| {
+            let v = match vpct("max-height") { Some(mx) if !matches!(s.get("max-height"), V::Kw(_)) => v.min(mx), _ => v };
+            match vpct("min-height") { Some(mn) if !matches!(s.get("min-height"), V::Kw(_)) => v.max(mn), _ => v }
+        };
+        let definite = match s.get("height") { V::Kw(_) => None, V::Pct(_) => cb_h.and_then(|b| len(s.get("height"), b)), v => len(v, 0) }.map(clamp);
+        let child_cb_h = definite.map(|d| (d - pt - pb - bt - bb).max(0));
         // Paint the background BEFORE the children: reserve its slot now.
         let bg_slot = self.scene.order.len();
         let content_x = bx + bl + pl;
-        let content_w = (w - bl - br - pl - pr).max(0);
+        let content_w = (w - frame).max(0);
         let mut cy = by + bt + pt;
         // Children: block-level children stack; runs of inline content
         // between them form anonymous block boxes of line boxes.
@@ -213,46 +229,88 @@ impl<'a> Cx<'a> {
         for c in self.dom.children_of(h) {
             if self.is_block_level(c) {
                 cy += self.lines(std::mem::take(&mut inline), content_x, cy, content_w, s);
-                cy += self.block(c, content_x, cy, content_w);
+                cy += self.block(c, content_x, cy, content_w, child_cb_h);
             } else {
                 self.collect_inline(c, &mut inline, s);
             }
         }
         cy += self.lines(inline, content_x, cy, content_w, s);
         let content_h = cy - (by + bt + pt);
-        let auto_h = content_h + pt + pb + bt + bb;
-        let mut hgt = match s.get("height") {
-            V::Kw(_) => auto_h,
-            // A percentage height needs a definite containing block height,
-            // which block flow does not have (CSS resolves it to auto).
-            V::Pct(_) => { self.count("height: % (no definite containing height; auto)"); auto_h }
-            v => len(v, 0).unwrap_or(auto_h),
-        };
-        for p in ["max-height", "min-height"] {
-            if matches!(s.get(p), V::Pct(_)) { self.count("min/max-height: % (no definite containing height; ignored)") }
-        }
-        if let Some(mx) = len(s.get("max-height"), 0).filter(|_| !matches!(s.get("max-height"), V::Pct(_))) { hgt = hgt.min(mx) }
-        if let Some(mn) = len(s.get("min-height"), 0).filter(|_| !matches!(s.get("min-height"), V::Pct(_))) { hgt = hgt.max(mn) }
+        let hgt = definite.unwrap_or_else(|| clamp(content_h + pt + pb + bt + bb));
         // Paint: background over the border box, then borders.
         let mut paint = vec![];
         let bg = color_of(s, "background-color");
-        if bg & 0xff != 0 { paint.push(Rect { x: bx, y: by, w, h: hgt, rgba: bg }) }
+        if bg & 0xff != 0 { paint.push(Rect { x: bx, y: by, w, h: hgt, rgba: bg, radius: 0 }) }
         if !matches!(s.get("background-image"), V::Kw("none")) { self.count("background-image (not painted)") }
-        for (side_w, rect, style_p, color_p) in [
-            (bt, Rect { x: bx, y: by, w, h: bt, rgba: 0 }, "border-top-style", "border-top-color"),
-            (bb, Rect { x: bx, y: by + hgt - bb, w, h: bb, rgba: 0 }, "border-bottom-style", "border-bottom-color"),
-            (bl, Rect { x: bx, y: by + bt, w: bl, h: hgt - bt - bb, rgba: 0 }, "border-left-style", "border-left-color"),
-            (br, Rect { x: bx + w - br, y: by + bt, w: br, h: hgt - bt - bb, rgba: 0 }, "border-right-style", "border-right-color"),
+        // (side width, x, y, length, horizontal?, style, colour)
+        for (t, sx, sy, length, horiz, style_p, color_p) in [
+            (bt, bx, by, w, true, "border-top-style", "border-top-color"),
+            (bb, bx, by + hgt - bb, w, true, "border-bottom-style", "border-bottom-color"),
+            (bl, bx, by + bt, hgt - bt - bb, false, "border-left-style", "border-left-color"),
+            (br, bx + w - br, by + bt, hgt - bt - bb, false, "border-right-style", "border-right-color"),
         ] {
-            if side_w <= 0 { continue }
-            if kw(s, style_p) != "solid" { self.count("border-style dashed/dotted (drawn solid)") }
-            paint.push(Rect { rgba: color_of(s, color_p), ..rect });
+            if t <= 0 || length <= 0 { continue }
+            let rgba = color_of(s, color_p);
+            let seg = |at: U, n: U, radius: U| if horiz { Rect { x: sx + at, y: sy, w: n, h: t, rgba, radius } }
+                                              else { Rect { x: sx, y: sy + at, w: t, h: n, rgba, radius } };
+            match kw(s, style_p) {
+                // Dashes 3t long with 2t gaps; dots t across (round: radius
+                // t/2) with t gaps. Both start at the side's origin and are
+                // clipped at its end — one stated rule, no fitting.
+                style @ ("dashed" | "dotted") => {
+                    let (on, off, r) = if style == "dashed" { (3 * t, 2 * t, 0) } else { (t, t, t / 2) };
+                    let mut at = 0;
+                    while at < length { paint.push(seg(at, on.min(length - at), r)); at += on + off }
+                }
+                _ => paint.push(seg(0, length, 0)),
+            }
         }
         for (i, r) in paint.into_iter().enumerate() {
             self.scene.order.insert(bg_slot + i, (0, self.scene.rects.len()));
             self.scene.rects.push(r);
         }
         mt + hgt + mb
+    }
+
+    /// (min-content, max-content) width of `h`'s CONTENT box: the widest
+    /// unbreakable word, and the widest line when nothing wraps. Measured by
+    /// shaping the same items layout would place — with the side effects of
+    /// collecting them (link table, counters) rolled back.
+    fn intrinsic(&mut self, h: Handle) -> (U, U) {
+        let (links, counts) = (self.links.len(), self.unimplemented.clone());
+        let Some(s) = self.st(h) else { return (0, 0) };
+        let (mut mn, mut mx) = (0, 0);
+        let mut items = vec![];
+        for c in self.dom.children_of(h) {
+            if self.is_block_level(c) {
+                let Some(cs) = self.st(c) else { continue };
+                let px = |p: &str| len(cs.get(p), 0).unwrap_or(0);
+                let frame = px("padding-left") + px("padding-right") + px("margin-left") + px("margin-right")
+                    + if kw(cs, "border-left-style") == "none" { 0 } else { px("border-left-width") }
+                    + if kw(cs, "border-right-style") == "none" { 0 } else { px("border-right-width") };
+                let (a, b) = match cs.get("width") { V::Len(l) => { let w = u(l.v); (w, w) } _ => self.intrinsic(c) };
+                mn = mn.max(a + frame);
+                mx = mx.max(b + frame);
+            } else {
+                self.collect_inline(c, &mut items, s);
+            }
+        }
+        let mut line = 0;
+        for it in &items {
+            match it {
+                Item::Break => { mx = mx.max(line); line = 0 }
+                Item::Word(t, st, _) | Item::PreSpace(t, st, _) => {
+                    let w: U = self.sh.shape(t, st, &mut self.report).iter().map(|p| p.width).sum();
+                    if matches!(it, Item::Word(..)) { mn = mn.max(w) }
+                    line += w;
+                }
+                Item::Space(st, _) => line += self.sh.shape(" ", st, &mut self.report).iter().map(|p| p.width).sum::<U>(),
+            }
+        }
+        mx = mx.max(line).max(mn);
+        self.links.truncate(links);
+        self.unimplemented = counts;
+        (mn, mx)
     }
 
     fn font_style(&mut self, s: &Style) -> (FontStyle, Line) {
@@ -320,22 +378,53 @@ impl<'a> Cx<'a> {
             _ => t.to_string(),
         };
         match kw(s, "white-space") {
-            "pre" | "pre-wrap" => {
-                if kw(s, "white-space") == "pre-wrap" { self.count("white-space: pre-wrap (not wrapped)") }
+            "pre" => {
                 for (i, l) in t.split('\n').enumerate() {
                     if i > 0 { out.push(Item::Break) }
                     if !l.is_empty() { out.push(Item::Word(l.replace('\t', "        "), st.clone(), line)) }
                 }
             }
-            ws => {
-                let nowrap = ws == "nowrap";
+            // pre-wrap: spaces and newlines preserved, but lines wrap — at the
+            // boundaries between runs of spaces and runs of anything else.
+            "pre-wrap" => {
+                for (i, l) in t.split('\n').enumerate() {
+                    if i > 0 { out.push(Item::Break) }
+                    let mut run = String::new();
+                    let mut in_space = false;
+                    for ch in l.chars() {
+                        let sp = ch == ' ' || ch == '\t';
+                        if sp != in_space && !run.is_empty() {
+                            let r = std::mem::take(&mut run);
+                            out.push(if in_space { Item::PreSpace(r, st.clone(), line) } else { Item::Word(r, st.clone(), line) });
+                        }
+                        in_space = sp;
+                        if ch == '\t' { run.push_str("        ") } else { run.push(ch) }
+                    }
+                    if !run.is_empty() { out.push(if in_space { Item::PreSpace(run, st.clone(), line) } else { Item::Word(run, st.clone(), line) }) }
+                }
+            }
+            // ★ nowrap: whitespace collapses exactly as in `normal`, but it
+            // is NOT a break opportunity — the whole run is one unbreakable
+            // word. (It used to flush a word at every space, which made every
+            // space breakable: a nowrap line wrapped. Found reviewing a golden.)
+            "nowrap" => {
+                let mut run = String::new();
+                for ch in t.chars() {
+                    if ch.is_whitespace() {
+                        let at_start = run.is_empty() && matches!(out.last(), Some(Item::Space(..)) | Some(Item::Break) | None);
+                        if !at_start && !run.ends_with(' ') { run.push(' ') }
+                    } else { run.push(ch) }
+                }
+                if !run.is_empty() { out.push(Item::Word(run, st, line)) }
+            }
+            _ => {
                 let mut word = String::new();
                 for ch in t.chars() {
                     if ch.is_whitespace() {
                         if !word.is_empty() { out.push(Item::Word(std::mem::take(&mut word), st.clone(), line)) }
                         // Collapse: at most one space, never at a line start.
                         if !matches!(out.last(), Some(Item::Space(..)) | Some(Item::Break) | None) {
-                            if nowrap { word.push(' ') } else { out.push(Item::Space(st.clone(), line)) }
+                            out.push(Item::Space(st.clone(), line))
                         }
                     } else { word.push(ch) }
                 }
@@ -347,13 +436,25 @@ impl<'a> Cx<'a> {
     /// Greedy line breaking of `items` into line boxes; returns their height.
     fn lines(&mut self, items: Vec<Item>, x: U, y: U, w: U, block: &Style) -> U {
         if items.iter().all(|i| matches!(i, Item::Space(..))) { return 0 }
-        struct Placed { x: U, st: FontStyle, line: Line, pieces: Vec<crate::Piece> }
+        struct Placed { x: U, st: FontStyle, line: Line, pieces: Vec<crate::Piece>, gap: bool }
         let mut lines: Vec<Vec<Placed>> = vec![vec![]];
+        // Whether each line was ended by a forced break (never justified).
+        let mut forced: Vec<bool> = vec![false];
         let (mut cx, mut pending): (U, Option<(FontStyle, Line)>) = (0, None);
         for it in items {
             match it {
-                Item::Break => { lines.push(vec![]); cx = 0; pending = None }
+                Item::Break => { *forced.last_mut().expect("line") = true; lines.push(vec![]); forced.push(false); cx = 0; pending = None }
                 Item::Space(st, l) => pending = Some((st, l)),
+                Item::PreSpace(text, st, l) => {
+                    let pieces = self.sh.shape(&text, &st, &mut self.report);
+                    let ww: U = pieces.iter().map(|p| p.width).sum();
+                    // ★ Preserved spaces HANG at a line end (pre-wrap): they
+                    // never push the line past the edge, and never wrap.
+                    if cx + ww > w && !lines.last().expect("line").is_empty() { pending = None; continue }
+                    lines.last_mut().expect("line").push(Placed { x: cx, st, line: l, pieces, gap: false });
+                    cx += ww;
+                    pending = None;
+                }
                 Item::Word(text, st, l) => {
                     let pieces = self.sh.shape(&text, &st, &mut self.report);
                     let ww: U = pieces.iter().map(|p| p.width).sum();
@@ -361,18 +462,19 @@ impl<'a> Cx<'a> {
                         (Some((ps, _)), Some(false)) => self.sh.shape(" ", ps, &mut self.report).iter().map(|p| p.width).sum(),
                         _ => 0,
                     };
-                    if cx + sw + ww > w && !lines.last().expect("line").is_empty() { lines.push(vec![]); cx = 0 } else { cx += sw }
+                    let wrap = cx + sw + ww > w && !lines.last().expect("line").is_empty();
+                    if wrap { lines.push(vec![]); forced.push(false); cx = 0 } else { cx += sw }
                     if ww > w { self.report.overflow_lines += 1 }
-                    lines.last_mut().expect("line").push(Placed { x: cx, st, line: l, pieces });
+                    lines.last_mut().expect("line").push(Placed { x: cx, st, line: l, pieces, gap: !wrap && sw > 0 });
                     cx += ww;
                     pending = None;
                 }
             }
         }
         let align = kw(block, "text-align");
-        if align == "justify" { self.count("text-align: justify (laid out as start)") }
+        let n_lines = lines.len();
         let mut yy = y;
-        for line in lines {
+        for (li, mut line) in lines.into_iter().enumerate() {
             if line.is_empty() {
                 let (st, l) = self.font_style(block);
                 let _ = st; yy += l.lh; continue
@@ -381,6 +483,21 @@ impl<'a> Cx<'a> {
             let base = line.iter().map(|p| { let (a, d) = self.sh.asc_desc(&p.st); (p.line.lh - a - d) / 2 + a }).max().unwrap_or(0);
             let last = line.last().expect("non-empty");
             let used = last.x + last.pieces.iter().map(|p| p.width).sum::<U>();
+            // ★ justify: the free space goes into the collapsible spaces of
+            // every line except the block's last and those ended by <br>.
+            // Integer division; the remainder goes one unit at a time to the
+            // first gaps — one stated rule, reproducible.
+            if align == "justify" && li + 1 < n_lines && !forced[li] {
+                let gaps = line.iter().filter(|p| p.gap).count() as U;
+                let free = w - used;
+                if gaps > 0 && free > 0 {
+                    let (each, mut rem, mut add) = (free / gaps, free % gaps, 0);
+                    for p in line.iter_mut() {
+                        if p.gap { add += each + if rem > 0 { rem -= 1; 1 } else { 0 } }
+                        p.x += add;
+                    }
+                }
+            }
             let shift = match align { "center" => (w - used) / 2, "end" => w - used, _ => 0 }.max(0);
             let mut link_span: Option<(usize, U, U)> = None;
             // Decorations span the gaps between words of one decorated run
@@ -414,7 +531,7 @@ impl<'a> Cx<'a> {
                 }
             }
             if let Some((j, x0, x1)) = link_span.take() { self.scene.link(Link { x: x0, y: yy, w: x1 - x0, h: lh, href: self.links[j].clone() }) }
-            for (c, yline, x0, x1, t) in deco { self.scene.rect(Rect { x: x0, y: yline, w: x1 - x0, h: t, rgba: c }) }
+            for (c, yline, x0, x1, t) in deco { self.scene.rect(Rect { x: x0, y: yline, w: x1 - x0, h: t, rgba: c, radius: 0 }) }
             yy += lh;
         }
         yy - y
@@ -459,6 +576,25 @@ mod tests {
         let runs: Vec<&Run> = o.scene.runs.iter().collect();
         assert!(runs.iter().map(|r| r.y).collect::<std::collections::BTreeSet<_>>().len() > 3, "several lines");
         assert!(runs.iter().all(|r| r.x > 8 * PX), "centred lines start right of the left edge");
+    }
+
+    #[test]
+    fn nowrap_never_wraps_and_justify_fills_all_but_the_last_line() {
+        let long = "never wraps even past the edge of a narrow box at all";
+        let o = render(&format!("<style>p {{ width: 150px; white-space: nowrap }}</style><p>{long}</p>"));
+        let ys: std::collections::BTreeSet<U> = o.scene.runs.iter().map(|r| r.y).collect();
+        assert_eq!(ys.len(), 1, "nowrap stays on one line");
+        let o = render(&format!("<style>p {{ width: 300px; text-align: justify }}</style><p>{}</p>", "word ".repeat(40)));
+        let mut lines: BTreeMap<U, (U, U)> = BTreeMap::new();
+        for r in &o.scene.runs {
+            let right = r.x + r.glyphs.last().map(|g| g.1).unwrap_or(0);
+            let e = lines.entry(r.y).or_insert((r.x, right)); e.0 = e.0.min(r.x); e.1 = e.1.max(right);
+        }
+        let rights: Vec<U> = lines.values().map(|v| v.1).collect();
+        assert!(rights.len() > 2);
+        let full = &rights[..rights.len() - 1];
+        assert!(full.windows(2).all(|w| (w[0] - w[1]).abs() <= 2 * PX), "justified lines end together: {full:?}");
+        assert!(rights.last().unwrap() < &full[0], "the last line is not justified");
     }
 
     #[test]

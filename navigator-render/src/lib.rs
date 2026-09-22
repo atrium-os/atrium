@@ -44,7 +44,10 @@ pub struct Report {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Rect { pub x: U, pub y: U, pub w: U, pub h: U, pub rgba: u32 }
+pub struct Rect { pub x: U, pub y: U, pub w: U, pub h: U, pub rgba: u32,
+                  /// Corner radius; 0 = square (written only when non-zero, so NSG
+                  /// without rounded boxes is byte-identical to before it existed).
+                  pub radius: U }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Run {
@@ -245,7 +248,7 @@ impl<'a> Layout<'a> {
             Event::Rule => {
                 self.flush();
                 let y = self.y + 8 * PX;
-                self.scene.rect(Rect { x: self.left(), y, w: self.avail(), h: 2 * PX, rgba: RULE });
+                self.scene.rect(Rect { x: self.left(), y, w: self.avail(), h: 2 * PX, rgba: RULE, radius: 0 });
                 self.y = y + 2 * PX + 16 * PX;
             }
             Event::Html(_) | Event::InlineHtml(_) => self.report.html_skipped += 1,
@@ -309,7 +312,7 @@ impl<'a> Layout<'a> {
                 self.indent -= 16 * PX;
                 self.pop();
                 if let Some(top) = self.quotes.pop() {
-                    self.scene.rect(Rect { x: self.left(), y: top, w: 4 * PX, h: self.y - top, rgba: QUOTE_BAR });
+                    self.scene.rect(Rect { x: self.left(), y: top, w: 4 * PX, h: self.y - top, rgba: QUOTE_BAR, radius: 0 });
                 }
             }
             TagEnd::CodeBlock => self.code_block(),
@@ -331,7 +334,7 @@ impl<'a> Layout<'a> {
         let lines: Vec<&str> = src.strip_suffix('\n').unwrap_or(&src).split('\n').collect();
         let pad = 8 * PX;
         let top = self.y;
-        self.scene.rect(Rect { x: self.left(), y: top, w: self.avail(), h: lines.len() as U * lh + 2 * pad, rgba: CODE_BG });
+        self.scene.rect(Rect { x: self.left(), y: top, w: self.avail(), h: lines.len() as U * lh + 2 * pad, rgba: CODE_BG, radius: 0 });
         let mut y = top + pad;
         for line in lines {
             let mut x = self.left() + pad;
@@ -374,12 +377,12 @@ impl<'a> Layout<'a> {
                 bottom = bottom.max(y + pad);
             }
             for c in 0..=ncols {
-                self.scene.rect(Rect { x: left + c * colw, y: top, w: PX, h: bottom - top, rgba: RULE });
+                self.scene.rect(Rect { x: left + c * colw, y: top, w: PX, h: bottom - top, rgba: RULE, radius: 0 });
             }
-            self.scene.rect(Rect { x: left, y: top, w: ncols * colw, h: PX, rgba: RULE });
+            self.scene.rect(Rect { x: left, y: top, w: ncols * colw, h: PX, rgba: RULE, radius: 0 });
             self.y = bottom;
         }
-        self.scene.rect(Rect { x: left, y: self.y, w: ncols * colw, h: PX, rgba: RULE });
+        self.scene.rect(Rect { x: left, y: self.y, w: ncols * colw, h: PX, rgba: RULE, radius: 0 });
         self.y += 16 * PX;
     }
 }
