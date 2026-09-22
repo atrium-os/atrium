@@ -24,6 +24,11 @@ fn main() -> ExitCode {
         Some("--corpus") => {
             let list = std::fs::read_to_string(args.get(2).expect("list file")).expect("readable list");
             let mut all = blake3::Hasher::new();
+            // ★ Hash the INPUTS too. The corpus is the live repo, so editing
+            // any document moves the output digest; without an input digest
+            // beside it, an edit is indistinguishable from a renderer
+            // regression — which is exactly the mistake this prints against.
+            let mut inputs = blake3::Hasher::new();
             let mut total = Report::default();
             let mut n = 0;
             for path in list.lines().filter(|l| !l.is_empty()) {
@@ -31,6 +36,8 @@ fn main() -> ExitCode {
                     Ok(b) => String::from_utf8_lossy(&b).into_owned(),
                     Err(e) => { eprintln!("{path}: {e}"); return ExitCode::FAILURE }
                 };
+                inputs.update(blake3::hash(md.as_bytes()).as_bytes());
+                inputs.update(path.as_bytes());
                 let (scene, r) = render(&md, &fonts, &opts);
                 let out = nsg::write(&scene, &fonts);
                 let h = blake3::hash(out.as_bytes());
@@ -41,7 +48,9 @@ fn main() -> ExitCode {
                 total.em_upright += r.em_upright;
                 n += 1;
             }
-            println!("corpus {n} documents digest {}", all.finalize().to_hex());
+            // Same input digest + different output digest = the renderer
+            // changed. Both different = the corpus was edited.
+            println!("corpus {n} documents input {} digest {}", inputs.finalize().to_hex(), all.finalize().to_hex());
             eprintln!("report: {total:?}");
             ExitCode::SUCCESS
         }

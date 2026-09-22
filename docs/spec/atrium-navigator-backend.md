@@ -1283,7 +1283,10 @@ Every `display` value the profile admits is now laid out; nothing in §3.3 is co
   digest, and a run before an edit can never be compared with a run after it. What the
   gate actually proves is that **two runs over the same corpus agree**, which they do
   (`9a5576a3…`, twice, after this edit). A digest worth quoting across time needs a
-  FROZEN corpus; that is a follow-up, not something the live repo can give.
+  FROZEN corpus — or an INPUT digest beside the output one, which is what
+  `--corpus` now prints: **same input digest, different output digest = the renderer
+  changed; both different = the corpus was edited.** Today, over 118 documents:
+  input `7e3631ef…`, output `970ad79f…`.
 
 ## 9. What this reuses
 
