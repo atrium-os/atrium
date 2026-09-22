@@ -97,9 +97,15 @@ const CODE_BG: u32 = 0xf6f8faff;
 const QUOTE_BAR: u32 = 0xd0d7deff;
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Style { pub(crate) family: Family, pub(crate) bold: bool, pub(crate) em: bool, pub(crate) size: U, pub(crate) rgba: u32, pub(crate) link: Option<usize> }
+pub(crate) struct Style { pub(crate) family: Family, pub(crate) bold: bool, pub(crate) em: bool, pub(crate) size: U, pub(crate) rgba: u32, pub(crate) link: Option<usize>,
+    /// letter-spacing / word-spacing, added after each glyph / each space.
+    pub(crate) ls: U, pub(crate) ws: U,
+    /// font-variant-numeric: tabular-nums (the OpenType `tnum` feature).
+    pub(crate) tnum: bool }
 
 enum Atom { Word(String, Style), Space(Style), Break }
+
+const TNUM: [rustybuzz::Feature; 1] = [rustybuzz::Feature { tag: rustybuzz::ttf_parser::Tag::from_bytes(b"tnum"), value: 1, start: 0, end: u32::MAX }];
 
 pub(crate) struct Shaper<'a> {
     fonts: &'a FontSet,
@@ -139,16 +145,22 @@ impl<'a> Shaper<'a> {
             let mut buf = rustybuzz::UnicodeBuffer::new();
             buf.push_str(&s);
             buf.guess_segment_properties();
-            let out = rustybuzz::shape(&self.hb[face], &[], buf);
+            let feats: &[rustybuzz::Feature] = if st.tnum { &TNUM } else { &[] };
+            let out = rustybuzz::shape(&self.hb[face], feats, buf);
             let upem = self.fonts.faces[face].upem;
-            let (mut pen, mut glyphs) = (0i64, vec![]);
+            let (mut pen, mut glyphs, mut extra) = (0i64, vec![], 0 as U);
             for (info, pos) in out.glyph_infos().iter().zip(out.glyph_positions()) {
                 glyphs.push((info.glyph_id as u16,
-                             scale(pen + pos.x_offset as i64, st.size, upem),
+                             scale(pen + pos.x_offset as i64, st.size, upem) + extra,
                              -scale(pos.y_offset as i64, st.size, upem)));
                 pen += pos.x_advance as i64;
+                // Spacing is added AFTER each glyph (and after each space for
+                // word-spacing), in 1/64 px, outside the font-unit pen so the
+                // integer scaling of the shaped advances is untouched.
+                extra += st.ls;
+                if s.as_bytes().get(info.cluster as usize) == Some(&b' ') { extra += st.ws }
             }
-            Piece { face, glyphs, width: scale(pen, st.size, upem), text: s }
+            Piece { face, glyphs, width: scale(pen, st.size, upem) + extra, text: s }
         }).collect()
     }
 
@@ -193,7 +205,7 @@ struct Table { rows: Vec<Vec<Vec<Atom>>>, head_rows: usize, in_head: bool }
 
 pub fn render(md: &str, fonts: &FontSet, opts: &Options) -> (Scene, Report) {
     let margin = 32 * PX;
-    let base = Style { family: Family::Sans, bold: false, em: false, size: 16 * PX, rgba: TEXT, link: None };
+    let base = Style { family: Family::Sans, bold: false, em: false, size: 16 * PX, rgba: TEXT, link: None, ls: 0, ws: 0, tnum: false };
     let mut l = Layout {
         sh: Shaper::new(fonts), scene: Scene { width: opts.width_px * PX, ..Default::default() },
         report: Report::default(), links: vec![], width: opts.width_px * PX, margin, y: margin,
@@ -329,7 +341,7 @@ impl<'a> Layout<'a> {
 
     fn code_block(&mut self) {
         let Some(src) = self.code.take() else { return };
-        let st = Style { family: Family::Mono, bold: false, em: false, size: 14 * PX, rgba: TEXT, link: None };
+        let st = Style { family: Family::Mono, bold: false, em: false, size: 14 * PX, rgba: TEXT, link: None, ls: 0, ws: 0, tnum: false };
         let (asc, lh) = self.sh.metrics(&st);
         let lines: Vec<&str> = src.strip_suffix('\n').unwrap_or(&src).split('\n').collect();
         let pad = 8 * PX;

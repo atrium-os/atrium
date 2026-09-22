@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 /// so a property the layout ignores can never be dropped silently (§5.1).
 /// Value-level gaps inside a read row (flex as block, italic without an
 /// italic face, …) are counted where they occur.
-pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 17, 18, 19, 20, 21, 22, 23, 24, 25, 32, 33, 34, 35, 36, 37, 39, 41, 42, 43, 44, 49, 50, 59, 60];
+pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 17, 18, 19, 20, 21, 22, 23, 24, 25, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 55, 57, 59, 60];
 
 pub struct HtmlOut {
     pub scene: Scene,
@@ -88,6 +88,8 @@ struct Cx<'a> {
     /// `Some(None)` while probing for a box's first baseline; the first line
     /// box laid out records its baseline (absolute y) here.
     baseline_probe: Option<Option<U>>,
+    /// text-indent for the next first line of a block container.
+    indent: Option<U>,
 }
 
 pub fn render_html(html: &str, fonts: &FontSet, env: &Env) -> HtmlOut {
@@ -120,7 +122,7 @@ pub fn render_html(html: &str, fonts: &FontSet, env: &Env) -> HtmlOut {
     let styled = cascade(&dom, &sheets, env);
     diagnostics.extend(styled.diagnostics);
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
-                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None };
+                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None };
     cx.count_unread_rows();
     // The root element is the initial containing block's only child.
     let root = dom.element_children(dom.root()).into_iter().next();
@@ -132,13 +134,21 @@ pub fn render_html(html: &str, fonts: &FontSet, env: &Env) -> HtmlOut {
 
 #[derive(Clone)]
 enum Item { Word(String, FontStyle, Line), Space(FontStyle, Line), Break,
+            /// A tab in preserved white space: advance to the next tab stop.
+            Tab(FontStyle, Line),
             /// Preserved spaces (pre-wrap): placed like a word, but they HANG
             /// at a line end instead of wrapping.
             PreSpace(String, FontStyle, Line) }
 
 /// Per-item line metrics and decoration.
 #[derive(Clone, Copy)]
-struct Line { lh: U, underline: Option<u32>, strike: Option<u32> }
+struct Line { lh: U, underline: Option<u32>, strike: Option<u32>,
+               /// visibility: hidden — takes its space, paints nothing.
+               hidden: bool,
+               /// overflow-wrap: break-word.
+               break_word: bool,
+               /// tab-size, in spaces.
+               tab: i64 }
 
 impl<'a> Cx<'a> {
     fn st(&self, h: Handle) -> Option<&'a Style> { self.styles.get(h as usize).and_then(|s| s.as_ref()) }
@@ -262,6 +272,8 @@ impl<'a> Cx<'a> {
         let bg_slot = self.scene.order.len();
         let content_x = bx + bl + pl;
         let content_w = (w - frame).max(0);
+        // text-indent (inherited) applies to this container's first line.
+        self.indent = len(s.get("text-indent"), content_w).filter(|v| *v != 0);
         let mut cy = by + bt + pt;
         // Children: block-level children stack; runs of inline content
         // between them form anonymous block boxes of line boxes.
@@ -281,7 +293,9 @@ impl<'a> Cx<'a> {
         }
         let content_h = cy - (by + bt + pt);
         let hgt = definite.unwrap_or_else(|| clamp(content_h + pt + pb + bt + bb));
-        // Paint: background over the border box, then borders.
+        // Paint: background over the border box, then borders — unless
+        // visibility: hidden, which keeps the box and paints none of it.
+        let hidden = kw(s, "visibility") == "hidden";
         let mut paint = vec![];
         let bg = color_of(s, "background-color");
         if bg & 0xff != 0 { paint.push(Rect { x: bx, y: by, w, h: hgt, rgba: bg, radius: 0 }) }
@@ -294,19 +308,18 @@ impl<'a> Cx<'a> {
             (br, bx + w - br, by + bt, hgt - bt - bb, false, "border-right-style", "border-right-color"),
         ] {
             if t <= 0 || length <= 0 { continue }
-            let rgba = color_of(s, color_p);
-            let seg = |at: U, n: U, radius: U| if horiz { Rect { x: sx + at, y: sy, w: n, h: t, rgba, radius } }
-                                              else { Rect { x: sx, y: sy + at, w: t, h: n, rgba, radius } };
-            match kw(s, style_p) {
-                // Dashes 3t long with 2t gaps; dots t across (round: radius
-                // t/2) with t gaps. Both start at the side's origin and are
-                // clipped at its end — one stated rule, no fitting.
-                style @ ("dashed" | "dotted") => {
-                    let (on, off, r) = if style == "dashed" { (3 * t, 2 * t, 0) } else { (t, t, t / 2) };
-                    let mut at = 0;
-                    while at < length { paint.push(seg(at, on.min(length - at), r)); at += on + off }
-                }
-                _ => paint.push(seg(0, length, 0)),
+            paint.extend(edge(t, sx, sy, length, horiz, kw(s, style_p), color_of(s, color_p)));
+        }
+        if hidden { paint.clear() }
+        // Outline: outside the border box, never affecting layout, painted
+        // after the content (CSS paints outlines last).
+        let ow = len(s.get("outline-width"), 0).unwrap_or(0);
+        let ostyle = kw(s, "outline-style");
+        if !hidden && ow > 0 && ostyle != "none" {
+            let oc = color_of(s, "outline-color");
+            let (ox, oy, owid, ohgt) = (bx - ow, by - ow, w + 2 * ow, hgt + 2 * ow);
+            for (sx, sy, length, horiz) in [(ox, oy, owid, true), (ox, oy + ohgt - ow, owid, true), (ox, oy + ow, ohgt - 2 * ow, false), (ox + owid - ow, oy + ow, ohgt - 2 * ow, false)] {
+                for r in edge(ow, sx, sy, length, horiz, ostyle, oc) { self.scene.rect(r) }
             }
         }
         for (i, r) in paint.into_iter().enumerate() {
@@ -569,6 +582,11 @@ impl<'a> Cx<'a> {
                     line += w;
                 }
                 Item::Space(st, _) => line += self.sh.shape(" ", st, &mut self.report).iter().map(|p| p.width).sum::<U>(),
+                Item::Tab(st, l) => {
+                    let sp: U = self.sh.shape(" ", st, &mut self.report).iter().map(|p| p.width).sum();
+                    let stop = (sp * l.tab as U).max(1);
+                    line = (line / stop + 1) * stop;
+                }
             }
         }
         mx = mx.max(line).max(mn);
@@ -599,8 +617,13 @@ impl<'a> Cx<'a> {
         let color = color_of(s, "color");
         let deco = color_of(s, "text-decoration-color");
         let line = Line { lh, underline: (kw(s, "text-decoration-line") == "underline").then_some(deco),
-                          strike: (kw(s, "text-decoration-line") == "line-through").then_some(deco) };
-        (FontStyle { family, bold: weight >= 600, em, size, rgba: color, link: None }, line)
+                          strike: (kw(s, "text-decoration-line") == "line-through").then_some(deco),
+                          hidden: kw(s, "visibility") == "hidden",
+                          break_word: kw(s, "overflow-wrap") == "break-word",
+                          tab: match s.get("tab-size") { V::Int(n) => (*n).clamp(0, 64), _ => 8 } };
+        let sp = |p: &str| match s.get(p) { V::Len(l) => u(l.v), V::Calc(c) => calc_eval(c, 0).map(u).unwrap_or(0), _ => 0 };
+        (FontStyle { family, bold: weight >= 600, em, size, rgba: color, link: None,
+                     ls: sp("letter-spacing"), ws: sp("word-spacing"), tnum: kw(s, "font-variant-numeric") == "tabular-nums" }, line)
     }
 
     /// Turn an inline-level node (and its inline descendants) into items.
@@ -645,7 +668,10 @@ impl<'a> Cx<'a> {
             "pre" => {
                 for (i, l) in t.split('\n').enumerate() {
                     if i > 0 { out.push(Item::Break) }
-                    if !l.is_empty() { out.push(Item::Word(l.replace('\t', "        "), st.clone(), line)) }
+                    for (j, seg) in l.split('\t').enumerate() {
+                        if j > 0 { out.push(Item::Tab(st.clone(), line)) }
+                        if !seg.is_empty() { out.push(Item::Word(seg.to_string(), st.clone(), line)) }
+                    }
                 }
             }
             // pre-wrap: spaces and newlines preserved, but lines wrap — at the
@@ -656,13 +682,14 @@ impl<'a> Cx<'a> {
                     let mut run = String::new();
                     let mut in_space = false;
                     for ch in l.chars() {
-                        let sp = ch == ' ' || ch == '\t';
-                        if sp != in_space && !run.is_empty() {
+                        let sp = ch == ' ';
+                        if (sp != in_space || ch == '\t') && !run.is_empty() {
                             let r = std::mem::take(&mut run);
                             out.push(if in_space { Item::PreSpace(r, st.clone(), line) } else { Item::Word(r, st.clone(), line) });
                         }
+                        if ch == '\t' { out.push(Item::Tab(st.clone(), line)); in_space = false; continue }
                         in_space = sp;
-                        if ch == '\t' { run.push_str("        ") } else { run.push(ch) }
+                        run.push(ch);
                     }
                     if !run.is_empty() { out.push(if in_space { Item::PreSpace(run, st.clone(), line) } else { Item::Word(run, st.clone(), line) }) }
                 }
@@ -711,9 +738,19 @@ impl<'a> Cx<'a> {
         let mut lines: Vec<Vec<Placed>> = vec![vec![]];
         // Whether each line was ended by a forced break (never justified).
         let mut forced: Vec<bool> = vec![false];
-        let (mut cx, mut pending): (U, Option<(FontStyle, Line)>) = (0, None);
+        // text-indent: the first line of the block container starts in.
+        let first_indent = self.indent.take().unwrap_or(0);
+        let (mut cx, mut pending): (U, Option<(FontStyle, Line)>) = (first_indent, None);
         for it in items {
             match it {
+                Item::Tab(st, l) => {
+                    // Tab stops: multiples of tab-size × the space's advance,
+                    // measured from the line's start (exact for any font).
+                    let sp: U = self.sh.shape(" ", &st, &mut self.report).iter().map(|p| p.width).sum();
+                    let stop = (sp * l.tab as U).max(1);
+                    cx = (cx / stop + 1) * stop;
+                    pending = None;
+                }
                 Item::Break => { *forced.last_mut().expect("line") = true; lines.push(vec![]); forced.push(false); cx = 0; pending = None }
                 Item::Space(st, l) => pending = Some((st, l)),
                 Item::PreSpace(text, st, l) => {
@@ -735,6 +772,30 @@ impl<'a> Cx<'a> {
                     };
                     let wrap = cx + sw + ww > w && !lines.last().expect("line").is_empty();
                     if wrap { lines.push(vec![]); forced.push(false); cx = 0 } else { cx += sw }
+                    if ww > w && l.break_word {
+                        // overflow-wrap: break-word — a word wider than a whole
+                        // line breaks between characters, greedily.
+                        let chars: Vec<char> = text.chars().collect();
+                        let mut i = 0;
+                        while i < chars.len() {
+                            let mut j = i + 1;
+                            while j < chars.len() {
+                                let t: String = chars[i..j + 1].iter().collect();
+                                let tw: U = self.sh.shape(&t, &st, &mut self.report).iter().map(|p| p.width).sum();
+                                if cx + tw > w { break }
+                                j += 1;
+                            }
+                            let chunk: String = chars[i..j].iter().collect();
+                            let pieces = self.sh.shape(&chunk, &st, &mut self.report);
+                            let cw: U = pieces.iter().map(|p| p.width).sum();
+                            lines.last_mut().expect("line").push(Placed { x: cx, st: st.clone(), line: l, pieces, gap: false });
+                            cx += cw;
+                            i = j;
+                            if i < chars.len() { lines.push(vec![]); forced.push(false); cx = 0 }
+                        }
+                        pending = None;
+                        continue;
+                    }
                     if ww > w { self.report.overflow_lines += 1 }
                     lines.last_mut().expect("line").push(Placed { x: cx, st, line: l, pieces, gap: !wrap && sw > 0 });
                     cx += ww;
@@ -787,6 +848,10 @@ impl<'a> Cx<'a> {
             for p in &line {
                 let mut px = x + shift + p.x;
                 let start = px;
+                // visibility: hidden — the space is taken (positions are
+                // already fixed), nothing is painted, and hidden text is not
+                // hit-testable, so it contributes no link region either.
+                if p.line.hidden { continue }
                 for piece in &p.pieces {
                     self.scene.run(Run { face: piece.face, size: p.st.size, rgba: p.st.rgba, x: px, y: yy + base, em: p.st.em,
                                          glyphs: piece.glyphs.clone(), text: piece.text.clone() });
@@ -978,5 +1043,23 @@ mod tests {
         let o = render(r#"<style>nav a { color: red } p { margin: 0 }</style><p>x</p>"#);
         let codes: Vec<&str> = o.diagnostics.iter().map(|d| d.code).collect();
         assert!(codes.contains(&"selector.unadmitted") && codes.contains(&"property.shorthand"), "{codes:?}");
+    }
+}
+
+/// One side of a border or outline, `t` thick: solid, or dashes 3t long with
+/// 2t gaps, or round dots t across with t gaps — starting at the side's
+/// origin and clipped at its end (one stated rule, no fitting).
+fn edge(t: U, sx: U, sy: U, length: U, horiz: bool, style: &str, rgba: u32) -> Vec<Rect> {
+    let seg = |at: U, n: U, radius: U| if horiz { Rect { x: sx + at, y: sy, w: n, h: t, rgba, radius } }
+                                      else { Rect { x: sx, y: sy + at, w: t, h: n, rgba, radius } };
+    match style {
+        "dashed" | "dotted" => {
+            let (on, off, r) = if style == "dashed" { (3 * t, 2 * t, 0) } else { (t, t, t / 2) };
+            let mut out = vec![];
+            let mut at = 0;
+            while at < length { out.push(seg(at, on.min(length - at), r)); at += on + off }
+            out
+        }
+        _ => vec![seg(0, length, 0)],
     }
 }

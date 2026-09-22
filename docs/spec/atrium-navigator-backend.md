@@ -980,7 +980,7 @@ layout.
 
 ### 8.3 M2 progress — the number, first reading (2026-09-22)
 
-**CONFORMANCE: exercised 35/64, matched 31/64** (13 on first reading; see the updates
+**CONFORMANCE: exercised 42/64, matched 38/64** (13 on first reading; see the updates
 below). Printed by `nsg-conformance`; the
 matched set is pinned by a test so it cannot fall silently.
 
@@ -1087,6 +1087,32 @@ Decisions and findings:
   correct CSS. Checked against the NSG's widths before any code was changed for it.
 - **Loose text directly in a flex container** is not made into an anonymous item yet;
   it is counted.
+
+**Update — text and paint rows, matched 31 → 38** (letter/word-spacing, text-indent,
+overflow-wrap, tab-size, font-variant-numeric, visibility, outline):
+- **Spacing** is added after each glyph (and after each space for word-spacing) in
+  1/64 px, outside the font-unit pen, so the integer scaling of shaped advances is
+  untouched.
+- **Tabs** advance to the next stop, a multiple of `tab-size` × the space advance
+  measured from the line start — position-based, so it is exact in proportional fonts
+  too, not a fixed number of spaces.
+- **`overflow-wrap: break-word`** breaks a word wider than a whole line between
+  characters, greedily.
+- **`visibility: hidden`** keeps the box and its space, paints neither background,
+  border nor text, and makes its text non-hit-testable — while a descendant that sets
+  `visible` still paints.
+- **Outlines** paint outside the border box after the content, sharing the border's
+  dash/dot geometry.
+- ★ **`font-variant-numeric: tabular-nums` is satisfied, not exercised.** Every shipped
+  face already has tabular figures ('1' and '8' have equal advances) and none carries a
+  `tnum`/`pnum` feature, so `normal` and `tabular-nums` render identically — which is
+  correct. The `tnum` feature is passed to the shaper for web fonts that carry it, and
+  that path is **unverified**: no shipped face can exercise it.
+
+Three of the four problems in this batch were **fixtures, not the renderer**: a box too
+short to contain its own child, white text on white, and a font set that cannot show the
+property. Each was found by looking, and two were settled by reading the NSG rather than
+the picture.
 
 ## 9. What this reuses
 
