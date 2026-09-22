@@ -155,6 +155,52 @@ outside is unreachable, nothing left afterwards.
 
 **Still open:** step 5 (atrium-netd per-app anchors).
 
+## 0.1 Finer grants on the per-app stack (V1, 2026-09-22)
+
+§4's intent stands — default-deny, composable per-app grants, pf enforcing — mapped onto §0's
+plumbing. Where this differs from §4 it says why.
+
+**Manifest.** The string form stays: `network = "none" | "loopback" | "full"` (`full` = outbound
+anywhere). The table form grants less:
+
+```toml
+[capabilities.network]
+outbound = ["github.com:443", "1.1.1.1:53/udp", "10.0.0.0/8"]   # or "any"
+peers    = ["org.atrium.db:5432"]      # other apps this one may dial (app id : port)
+inbound  = [8080]                      # ports other apps may dial on this one
+```
+
+A destination is `host[:port][/tcp|/udp]` or `cidr[:port][/proto]`; no port = all ports, default
+proto tcp. Any network grant also brings the app's own loopback up.
+
+**Peering needs BOTH sides.** A reaches B's port P only if A lists `B:P` in `peers` AND B lists
+P in `inbound`. Stricter than §4, where one side's `peer_jails` sufficed and a missing
+`peer_ports` meant "all ports": consent belongs to the side being reached. App IDs, not jail-name
+globs — a glob grants to apps that do not exist yet.
+
+**Enforcement.** jaild renders each networked app's pf anchor `atrium/<jail>` from STRUCTURED
+grants and never loads caller-supplied rule text: the launcher resolves hostnames and sends
+addresses/ports/protocols; jaild refuses any destination in the host's own addresses or in
+100.64.0.0/16 (the only way to another app is a peer grant). Peer consent is a pf TABLE per
+(app, inbound port) — `atrium_p_<app>_<port>` — filled with the app's address when it launches
+declaring that port and emptied when it goes; a dialer's rule targets the table, so an app that is
+not running, or never agreed to the port, simply matches nothing. Base ruleset order:
+
+```pf
+block in quick on atrium inet from any to (self)   # never the host
+anchor "atrium/*"                                  # per-app pass-quick grants
+block in quick on atrium                           # everything else from apps
+pass all
+```
+
+**DNS.** An app with a restricted `outbound` gets its resolvers (port 53, udp+tcp) added
+automatically, or no hostname would ever resolve. Hostnames are resolved ONCE, at launch; an app
+whose destinations move behind DNS keeps the addresses it launched with (atrium-netd, §5, is where
+periodic re-resolution belongs).
+
+**Refused, not ignored:** `lan_alias`, `expose`, `mdns` — a manifest asking for them fails to
+parse with the reason, so an app never runs believing it has them.
+
 ## 1. Principle
 
 > **A jail's network access is a capability the user grants
