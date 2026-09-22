@@ -71,6 +71,6 @@ fn matched_conformance_rows_stay_matched() {
     let fonts = FontSet::load().expect("pinned font set");
     let rows = navigator_render::conformance::run(&dir, &fonts, false);
     let matched: Vec<u8> = rows.iter().filter(|r| r.matched).map(|r| r.id).collect();
-    assert_eq!(matched, vec![3, 4, 5, 6, 8, 9, 10, 11, 12, 32, 33, 34, 35, 37, 39, 41, 42, 43, 44, 49, 59, 60]);
-    assert_eq!(rows.iter().filter(|r| r.exercised).count(), 26);
+    assert_eq!(matched, vec![3, 4, 5, 6, 8, 9, 10, 11, 12, 17, 18, 19, 20, 21, 22, 23, 24, 25, 32, 33, 34, 35, 37, 39, 41, 42, 43, 44, 49, 59, 60]);
+    assert_eq!(rows.iter().filter(|r| r.exercised).count(), 35);
 }

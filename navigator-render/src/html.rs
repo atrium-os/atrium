@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 /// so a property the layout ignores can never be dropped silently (§5.1).
 /// Value-level gaps inside a read row (flex as block, italic without an
 /// italic face, …) are counted where they occur.
-pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 32, 33, 34, 35, 36, 37, 39, 41, 42, 43, 44, 49, 50, 59, 60];
+pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 17, 18, 19, 20, 21, 22, 23, 24, 25, 32, 33, 34, 35, 36, 37, 39, 41, 42, 43, 44, 49, 50, 59, 60];
 
 pub struct HtmlOut {
     pub scene: Scene,
@@ -85,6 +85,9 @@ struct Cx<'a> {
     /// A list item's marker, waiting for the first line box its content
     /// produces (which may be inside a nested block).
     marker: Option<(String, FontStyle, Line, bool)>,
+    /// `Some(None)` while probing for a box's first baseline; the first line
+    /// box laid out records its baseline (absolute y) here.
+    baseline_probe: Option<Option<U>>,
 }
 
 pub fn render_html(html: &str, fonts: &FontSet, env: &Env) -> HtmlOut {
@@ -105,15 +108,24 @@ pub fn render_html(html: &str, fonts: &FontSet, env: &Env) -> HtmlOut {
                 msg: format!("<link rel=stylesheet href={:?}>: external stylesheets are supplied inputs; none given", dom.attr(h, "href").unwrap_or("")) });
         }
     }
+    // ★ Inline `style` attributes are not in the profile's cascade (§3.10 has
+    // UA and author layers only). Reported, never silently ignored — a
+    // normalizer can rewrite them into rules.
+    for (i, n) in dom.nodes.iter().enumerate() {
+        if matches!(n.kind, Kind::Element(_)) && n.attrs.iter().any(|(k, _)| k == "style") {
+            diagnostics.push(Diagnostic { pos: Pos { line: 0, col: 0 }, code: "input.style-attribute",
+                msg: format!("<{} style=…> (node {i}): inline style attributes are not admitted; use a <style> rule", dom.tag(i as Handle).unwrap_or("?")) });
+        }
+    }
     let styled = cascade(&dom, &sheets, env);
     diagnostics.extend(styled.diagnostics);
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
-                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None };
+                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None };
     cx.count_unread_rows();
     // The root element is the initial containing block's only child.
     let root = dom.element_children(dom.root()).into_iter().next();
     // The root's containing block is the viewport: definite in both axes.
-    let h = match root { Some(r) => cx.block(r, 0, 0, u(env.width_px), Some(u(env.height_px))), None => 0 };
+    let h = match root { Some(r) => cx.block(r, 0, 0, u(env.width_px), Some(u(env.height_px)), (None, None)), None => 0 };
     cx.scene.height = h.max(u(env.height_px));
     HtmlOut { scene: cx.scene, report: cx.report, diagnostics, unimplemented: cx.unimplemented }
 }
@@ -167,11 +179,12 @@ impl<'a> Cx<'a> {
     /// top/bottom) resolve against `cb_h`; when it is indefinite, CSS 2.1
     /// §10.5 makes them `auto` (none / no offset) — which is correct
     /// behaviour, not a gap, and is not counted as one.
-    fn block(&mut self, h: Handle, x: U, y: U, cb_w: U, cb_h: Option<U>) -> U {
+    /// `force` = (border-box width, border-box height) imposed by a flex
+    /// container on its item; `None` lets the box size itself.
+    fn block(&mut self, h: Handle, x: U, y: U, cb_w: U, cb_h: Option<U>, force: (Option<U>, Option<U>)) -> U {
         let Some(s) = self.st(h) else { return 0 };
         match kw(s, "display") {
             "none" => return 0,
-            "flex" => self.count("display: flex (laid out as block)"),
             "grid" => self.count("display: grid (laid out as block)"),
             "table" | "table-row" | "table-cell" => self.count("display: table* (laid out as block)"),
             _ => {}
@@ -200,6 +213,7 @@ impl<'a> Cx<'a> {
         if let Some(mx) = len(s.get("max-width"), cb_w) { w = w.min(mx) }
         if let Some(mn) = len(s.get("min-width"), cb_w) { w = w.max(mn) }
         w = w.max(frame);
+        if let Some(fw) = force.0 { w = fw.max(frame) }
         // Auto margins take what is left; both auto centres.
         let free = cb_w - w - ml.unwrap_or(0) - mr.unwrap_or(0);
         match (ml, mr) {
@@ -219,7 +233,7 @@ impl<'a> Cx<'a> {
             let v = match vpct("max-height") { Some(mx) if !matches!(s.get("max-height"), V::Kw(_)) => v.min(mx), _ => v };
             match vpct("min-height") { Some(mn) if !matches!(s.get("min-height"), V::Kw(_)) => v.max(mn), _ => v }
         };
-        let definite = match s.get("height") { V::Kw(_) => None, V::Pct(_) => cb_h.and_then(|b| len(s.get("height"), b)), v => len(v, 0) }.map(clamp);
+        let definite = force.1.or_else(|| match s.get("height") { V::Kw(_) => None, V::Pct(_) => cb_h.and_then(|b| len(s.get("height"), b)), v => len(v, 0) }.map(clamp));
         let child_cb_h = definite.map(|d| (d - pt - pb - bt - bb).max(0));
         // ★ List markers belong to `li` (the profile admits list-style-* but not
         // display: list-item): typed by the inherited list-style-type,
@@ -251,16 +265,20 @@ impl<'a> Cx<'a> {
         let mut cy = by + bt + pt;
         // Children: block-level children stack; runs of inline content
         // between them form anonymous block boxes of line boxes.
-        let mut inline: Vec<Item> = vec![];
-        for c in self.dom.children_of(h) {
-            if self.is_block_level(c) {
-                cy += self.lines(std::mem::take(&mut inline), content_x, cy, content_w, s);
-                cy += self.block(c, content_x, cy, content_w, child_cb_h);
-            } else {
-                self.collect_inline(c, &mut inline, s);
+        if kw(s, "display") == "flex" {
+            cy += self.flex(h, s, content_x, cy, content_w, child_cb_h);
+        } else {
+            let mut inline: Vec<Item> = vec![];
+            for c in self.dom.children_of(h) {
+                if self.is_block_level(c) {
+                    cy += self.lines(std::mem::take(&mut inline), content_x, cy, content_w, s);
+                    cy += self.block(c, content_x, cy, content_w, child_cb_h, (None, None));
+                } else {
+                    self.collect_inline(c, &mut inline, s);
+                }
             }
+            cy += self.lines(inline, content_x, cy, content_w, s);
         }
-        cy += self.lines(inline, content_x, cy, content_w, s);
         let content_h = cy - (by + bt + pt);
         let hgt = definite.unwrap_or_else(|| clamp(content_h + pt + pb + bt + bb));
         // Paint: background over the border box, then borders.
@@ -296,6 +314,226 @@ impl<'a> Cx<'a> {
             self.scene.rects.push(r);
         }
         mt + hgt + mb
+    }
+
+    /// Lay `h` out somewhere the reader never sees, and return its outer
+    /// height: every effect on the scene, links and counters is rolled back.
+    /// First baseline of `h` laid out at its margin-box origin, measured from
+    /// that origin; a box with no line boxes synthesizes one from the bottom
+    /// of its border box (CSS Box Alignment).
+    fn baseline(&mut self, h: Handle, cb_w: U, force: (Option<U>, Option<U>)) -> U {
+        let saved = self.baseline_probe.replace(None);
+        let outer = self.measure(h, cb_w, None, force);
+        let found = self.baseline_probe.take().flatten();
+        self.baseline_probe = saved;
+        found.unwrap_or_else(|| {
+            let cs = self.st(h).expect("styled");
+            outer - len(cs.get("margin-bottom"), cb_w).unwrap_or(0)
+        })
+    }
+
+    fn measure(&mut self, h: Handle, cb_w: U, cb_h: Option<U>, force: (Option<U>, Option<U>)) -> U {
+        let (o, r, n, l) = (self.scene.order.len(), self.scene.rects.len(), self.scene.runs.len(), self.scene.links.len());
+        let (links, counts, marker, report) = (self.links.len(), self.unimplemented.clone(), self.marker.clone(), self.report.clone());
+        let hgt = self.block(h, 0, 0, cb_w, cb_h, force);
+        self.scene.order.truncate(o); self.scene.rects.truncate(r); self.scene.runs.truncate(n); self.scene.links.truncate(l);
+        self.links.truncate(links); self.unimplemented = counts; self.marker = marker; self.report = report;
+        hgt
+    }
+
+    /// Flex layout (profile §3.4; CSS Flexbox §9 without `order` or any
+    /// `*-reverse` — the profile removes them so visual order is reading
+    /// order). Lays the items out inside the container's content box at
+    /// (x, y), `w` wide, and returns the content height used.
+    ///
+    /// Items are the element children; a run of loose text between them is
+    /// not an item here and is counted. Margins of items are honoured as
+    /// fixed lengths (`auto` margins are treated as 0 and counted).
+    fn flex(&mut self, h: Handle, s: &Style, x: U, y: U, w: U, cb_h: Option<U>) -> U {
+        let row = kw(s, "flex-direction") != "column";
+        let wrap = kw(s, "flex-wrap") == "wrap";
+        let main_gap = len(s.get(if row { "column-gap" } else { "row-gap" }), if row { w } else { cb_h.unwrap_or(0) }).unwrap_or(0);
+        let cross_gap = len(s.get(if row { "row-gap" } else { "column-gap" }), if row { cb_h.unwrap_or(0) } else { w }).unwrap_or(0);
+        let main_avail = if row { Some(w) } else { cb_h };
+        struct It { h: Handle, base: U, hypo: U, grow: f64, shrink: f64, min: U, max: U, main: U, cross: U,
+                    m_start: U, m_end: U, c_start: U, c_end: U, align: &'static str, cross_auto: bool }
+        let mut items: Vec<It> = vec![];
+        for c in self.dom.children_of(h) {
+            match self.dom.get(c).map(|n| &n.kind) {
+                Some(Kind::Text(t)) if !t.trim().is_empty() => { self.count("flex: loose text in a flex container (not an item)"); continue }
+                Some(Kind::Element(_)) => {}
+                _ => continue,
+            }
+            let Some(cs) = self.st(c) else { continue };
+            if kw(cs, "display") == "none" { continue }
+            if matches!(kw(cs, "position"), "absolute" | "fixed") { self.count("position: absolute/fixed (skipped)"); continue }
+            let px = |p: &str, basis: U| len(cs.get(p), basis);
+            let (mw, mh) = (["margin-left", "margin-right"], ["margin-top", "margin-bottom"]);
+            let (mm, cm) = if row { (mw, mh) } else { (mh, mw) };
+            for p in mw.iter().chain(mh.iter()) { if matches!(cs.get(p), V::Kw("auto")) { self.count("flex: auto margins (as 0)") } }
+            let m = |p: &str| px(p, w).unwrap_or(0);
+            let main_prop = if row { "width" } else { "height" };
+            let basis_of = |this: &mut Self| -> U {
+                match cs.get("flex-basis") {
+                    V::Kw("content") => this.content_main(c, row, w),
+                    V::Kw(_) => match (cs.get(main_prop), row) {
+                        (V::Kw(_), _) => this.content_main(c, row, w),
+                        (V::Pct(_), false) if cb_h.is_none() => this.content_main(c, row, w),
+                        (v, true) => len(v, w).unwrap_or_else(|| this.content_main(c, row, w)),
+                        (v, false) => len(v, cb_h.unwrap_or(0)).unwrap_or_else(|| this.content_main(c, row, w)),
+                    },
+                    v => len(v, main_avail.unwrap_or(0)).unwrap_or(0),
+                }
+            };
+            let base = basis_of(self);
+            let (minp, maxp) = if row { ("min-width", "max-width") } else { ("min-height", "max-height") };
+            // ★ min-width/min-height `auto` on a flex item is CSS's AUTOMATIC
+            // MINIMUM SIZE: min(specified size if definite, content's
+            // min-content size) — an item never shrinks below its content.
+            // (Treating auto as 0 let a row squeeze text out of its box.)
+            let min = match cs.get(minp) {
+                V::Kw("auto") => {
+                    let content_min = if row {
+                        let b = |side: &str| if kw(cs, &format!("border-{side}-style")) == "none" { 0 } else { len(cs.get(&format!("border-{side}-width")), 0).unwrap_or(0) };
+                        self.intrinsic(c).0 + len(cs.get("padding-left"), w).unwrap_or(0) + len(cs.get("padding-right"), w).unwrap_or(0) + b("left") + b("right")
+                    } else { self.content_main(c, false, w) };
+                    let specified = if row { len(cs.get("width"), w) } else { match cs.get("height") { V::Pct(_) => None, v => len(v, 0) } };
+                    specified.map(|sp| sp.min(content_min)).unwrap_or(content_min)
+                }
+                _ => px(minp, main_avail.unwrap_or(0)).unwrap_or(0),
+            };
+            let max = px(maxp, main_avail.unwrap_or(0)).unwrap_or(U::MAX);
+            let hypo = base.clamp(min, max.max(min));
+            let num = |p: &str| match cs.get(p) { V::Num(n) => *n, _ => 0.0 };
+            let align = match kw(cs, "align-self") { "auto" | "" => kw(s, "align-items"), a => a };
+            let cross_prop = if row { "height" } else { "width" };
+            items.push(It { h: c, base, hypo, grow: num("flex-grow"), shrink: num("flex-shrink"), min, max,
+                            main: hypo, cross: 0, m_start: m(mm[0]), m_end: m(mm[1]), c_start: m(cm[0]), c_end: m(cm[1]),
+                            align: match align { "flex-start" | "start" => "start", "flex-end" | "end" => "end", "center" => "center",
+                                                 "baseline" => "baseline", _ => "stretch" },
+                            cross_auto: matches!(cs.get(cross_prop), V::Kw("auto")) });
+        }
+        // Lines.
+        let limit = main_avail.unwrap_or(U::MAX);
+        let mut lines: Vec<std::ops::Range<usize>> = vec![];
+        let (mut start, mut used) = (0usize, 0 as U);
+        for (i, it) in items.iter().enumerate() {
+            let outer = it.hypo + it.m_start + it.m_end;
+            let add = if i > start { main_gap + outer } else { outer };
+            if wrap && i > start && used.saturating_add(add) > limit { lines.push(start..i); start = i; used = outer } else { used += add }
+        }
+        if start < items.len() || items.is_empty() { lines.push(start..items.len()) }
+        // Resolve flexible lengths per line (one pass, then clamp).
+        for r in &lines {
+            let outer: U = items[r.clone()].iter().map(|i| i.hypo + i.m_start + i.m_end).sum::<U>() + main_gap * (r.len() as U).saturating_sub(1);
+            let Some(avail) = main_avail else { continue };
+            let free = avail - outer;
+            if free > 0 {
+                let g: f64 = items[r.clone()].iter().map(|i| i.grow).sum();
+                if g > 0.0 { for i in &mut items[r.clone()] { i.main = (i.hypo + u(free as f64 / PX as f64 * i.grow / g.max(1.0))).clamp(i.min, i.max.max(i.min)) } }
+            } else if free < 0 {
+                let sb: f64 = items[r.clone()].iter().map(|i| i.shrink * i.base as f64).sum();
+                if sb > 0.0 { for i in &mut items[r.clone()] { i.main = (i.hypo + u(free as f64 / PX as f64 * (i.shrink * i.base as f64) / sb)).clamp(i.min, i.max.max(i.min)) } }
+            }
+        }
+        // Cross sizes: measured at the resolved main size.
+        for i in &mut items {
+            i.cross = if row { self.measure(i.h, i.main, None, (Some(i.main), None)) - i.c_start - i.c_end }
+                      else { self.intrinsic_outer_w(i.h, w) };
+        }
+        let container_cross = if row { cb_h } else { Some(w) };
+        let line_cross: Vec<U> = lines.iter().map(|r| {
+            let m = items[r.clone()].iter().map(|i| i.cross + i.c_start + i.c_end).max().unwrap_or(0);
+            // A single line in a container of definite cross size fills it.
+            if lines.len() == 1 && !wrap { container_cross.unwrap_or(m) } else { m }
+        }).collect();
+        // align-content: distribute the lines in the cross axis.
+        let total: U = line_cross.iter().sum::<U>() + cross_gap * (lines.len() as U).saturating_sub(1);
+        let (mut cpos, cstep, cstretch) = match (container_cross, lines.len() > 1 || wrap) {
+            (Some(cc), true) if cc > total => {
+                let free = cc - total;
+                match kw(s, "align-content") { "flex-end" => (free, 0, 0), "center" => (free / 2, 0, 0),
+                    "stretch" => (0, 0, free / lines.len() as U), _ => (0, 0, 0) }
+            }
+            _ => (0, 0, 0),
+        };
+        // align-content: baseline on a flex container that is not itself in
+        // a baseline-sharing group falls back to `start` (CSS Box Alignment):
+        // laying it out as flex-start IS the specified behaviour.
+        let jc = kw(s, "justify-content");
+        for (li, r) in lines.iter().enumerate() {
+            let lc = line_cross[li] + cstretch;
+            let used: U = items[r.clone()].iter().map(|i| i.main + i.m_start + i.m_end).sum::<U>() + main_gap * (r.len() as U).saturating_sub(1);
+            let free = main_avail.map(|a| a - used).unwrap_or(0).max(0);
+            let n = r.len() as U;
+            // Baseline alignment (row lines only — in a column the item's
+            // baseline is not in the cross axis, and CSS falls back to start).
+            let mut bl: Vec<(usize, U)> = vec![];
+            if row {
+                for idx in r.clone() {
+                    if items[idx].align == "baseline" {
+                        let (hh, main, cross) = (items[idx].h, items[idx].main, items[idx].cross);
+                        let b = self.baseline(hh, main, (Some(main), Some(cross)));
+                        bl.push((idx, b));
+                    }
+                }
+            }
+            let max_b = bl.iter().map(|x| x.1).max().unwrap_or(0);
+            let (mut mpos, between) = match jc {
+                "flex-end" => (free, 0), "center" => (free / 2, 0),
+                "space-between" if n > 1 => (0, free / (n - 1)),
+                "space-around" if n > 0 => (free / n / 2, free / n),
+                "space-evenly" if n > 0 => (free / (n + 1), free / (n + 1)),
+                _ => (0, 0),
+            };
+            for idx in r.clone() {
+                let i = &items[idx];
+                let slot = lc - i.c_start - i.c_end;
+                let (cross, coff) = match i.align {
+                    "stretch" if i.cross_auto => (slot, 0),
+                    "end" => (i.cross, slot - i.cross),
+                    "center" => (i.cross, (slot - i.cross) / 2),
+                    "baseline" => (i.cross, bl.iter().find(|x| x.0 == idx).map(|x| max_b - x.1).unwrap_or(0)),
+                    _ => (i.cross, 0),
+                };
+                let m0 = mpos + i.m_start;
+                let c0 = cpos + i.c_start + coff;
+                let (ix, iy, fw, fh) = if row { (x + m0, y + c0, i.main, cross) } else { (x + c0, y + m0, cross, i.main) };
+                // The item's own margins are applied here, so it is placed
+                // with them zeroed: lay out at the margin box's corner minus
+                // the margin the block would add.
+                let (ml, mt) = { let cs = self.st(i.h).expect("styled"); (len(cs.get("margin-left"), w).unwrap_or(0), len(cs.get("margin-top"), w).unwrap_or(0)) };
+                self.block(i.h, ix - ml, iy - mt, fw + ml, None, (Some(fw), Some(fh)));
+                mpos = m0 + i.main + i.m_end + main_gap + between;
+            }
+            cpos += lc + cross_gap + cstep;
+        }
+        let _ = cstep;
+        // Content height: a row container is as tall as its lines stacked in
+        // the cross axis; a column container as its longest line's main extent.
+        if row { total.max(0) } else {
+            lines.iter().map(|r| items[r.clone()].iter().map(|i| i.main + i.m_start + i.m_end).sum::<U>()
+                + main_gap * (r.len() as U).saturating_sub(1)).max().unwrap_or(0)
+        }
+    }
+
+    /// An item's content size along the main axis (its max-content width in
+    /// a row, its laid-out height in a column), as a border-box size.
+    fn content_main(&mut self, h: Handle, row: bool, cb_w: U) -> U {
+        if row { self.intrinsic_outer_w(h, cb_w) } else {
+            let cs = self.st(h).expect("styled");
+            let m = len(cs.get("margin-top"), cb_w).unwrap_or(0) + len(cs.get("margin-bottom"), cb_w).unwrap_or(0);
+            self.measure(h, cb_w, None, (None, None)) - m
+        }
+    }
+
+    /// Max-content border-box width of `h` (its width if definite).
+    fn intrinsic_outer_w(&mut self, h: Handle, cb_w: U) -> U {
+        let cs = self.st(h).expect("styled");
+        if let Some(wd) = len(cs.get("width"), cb_w) { return wd }
+        let b = |side: &str| if kw(cs, &format!("border-{side}-style")) == "none" { 0 } else { len(cs.get(&format!("border-{side}-width")), 0).unwrap_or(0) };
+        let frame = len(cs.get("padding-left"), cb_w).unwrap_or(0) + len(cs.get("padding-right"), cb_w).unwrap_or(0) + b("left") + b("right");
+        (self.intrinsic(h).1 + frame).min(cb_w.max(0))
     }
 
     /// (min-content, max-content) width of `h`'s CONTENT box: the widest
@@ -532,6 +770,7 @@ impl<'a> Cx<'a> {
                 }
             }
             let shift = match align { "center" => (w - used) / 2, "end" => w - used, _ => 0 }.max(0);
+            if let Some(None) = self.baseline_probe { self.baseline_probe = Some(Some(yy + base)) }
             if let Some((text, st)) = outside_marker.take() {
                 let pieces = self.sh.shape(&text, &st, &mut self.report);
                 let mw: U = pieces.iter().map(|p| p.width).sum();
@@ -639,6 +878,47 @@ mod tests {
         assert!(rights.last().unwrap() < &full[0], "the last line is not justified");
     }
 
+    fn boxes(o: &HtmlOut, rgba: u32) -> Vec<(U, U, U, U)> {
+        rects(o).into_iter().filter(|r| r.rgba == rgba).map(|r| (r.x / PX, r.y / PX, r.w / PX, r.h / PX)).collect()
+    }
+
+    #[test]
+    fn flex_row_grows_and_justifies() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px; margin-right: 0px }
+            .f { display: flex; width: 600px; column-gap: 10px }
+            .a { width: 100px; height: 20px; background-color: #ff0000 }
+            .b { flex-grow: 1; height: 20px; background-color: #00ff00 }
+            .c { width: 100px; height: 20px; background-color: #0000ff }</style>
+            <div class="f"><div class="a"></div><div class="b"></div><div class="c"></div></div>"#);
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 100, 20)]);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(110, 0, 380, 20)], "grows into the free space, gaps honoured");
+        assert_eq!(boxes(&o, 0x0000ffff), vec![(500, 0, 100, 20)]);
+    }
+
+    #[test]
+    fn flex_column_and_stretch() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .f { display: flex; flex-direction: column; width: 300px; row-gap: 5px }
+            .a { height: 30px; background-color: #ff0000 }
+            .b { height: 20px; width: 100px; align-self: center; background-color: #00ff00 }</style>
+            <div class="f"><div class="a"></div><div class="b"></div></div>"#);
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 300, 30)], "stretch fills the cross axis");
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(100, 35, 100, 20)], "centred on the cross axis, after the gap");
+    }
+
+    #[test]
+    fn flex_wrap_breaks_lines_and_shrink_takes_back() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .w { display: flex; flex-wrap: wrap; width: 250px }
+            .w > div { width: 100px; height: 10px; background-color: #ff0000 }
+            .s { display: flex; width: 150px; margin-top: 10px }
+            .s > div { width: 100px; flex-shrink: 1; height: 10px; background-color: #0000ff }</style>
+            <div class="w"><div></div><div></div><div></div></div><div class="s"><div></div><div></div></div>"#);
+        let red = boxes(&o, 0xff0000ff);
+        assert_eq!(red, vec![(0, 0, 100, 10), (100, 0, 100, 10), (0, 10, 100, 10)], "third item wraps");
+        assert_eq!(boxes(&o, 0x0000ffff), vec![(0, 30, 75, 10), (75, 30, 75, 10)], "equal shrink of equal bases");
+    }
+
     #[test]
     fn inline_styles_links_and_decoration() {
         let o = render(r#"<p>plain <strong>bold</strong> <a href="https://x.example/">link</a></p>"#);
@@ -658,8 +938,8 @@ mod tests {
 
     #[test]
     fn unimplemented_layout_is_counted_not_faked() {
-        let o = render(r#"<style>.f { display: flex } .p { position: absolute }</style><div class="f">a</div><div class="p">b</div>"#);
-        assert!(o.unimplemented.contains_key("display: flex (laid out as block)"));
+        let o = render(r#"<style>.f { display: grid } .p { position: absolute }</style><div class="f">a</div><div class="p">b</div>"#);
+        assert!(o.unimplemented.contains_key("display: grid (laid out as block)"));
         assert!(o.unimplemented.contains_key("position: absolute/fixed (skipped)"));
     }
 
@@ -669,6 +949,28 @@ mod tests {
     fn an_unread_property_is_counted_and_its_initial_value_is_not() {
         let o = render(r#"<style>.a { opacity: 0.5 } .b { opacity: 1 }</style><div class="a">x</div><div class="b">y</div>"#);
         assert_eq!(o.unimplemented.get("row opacity… (not implemented)"), Some(&1), "{:?}", o.unimplemented);
+    }
+
+    /// CSS automatic minimum size: a flex item does not shrink below its
+    /// content's min-content width. Control: an EMPTY item in the same
+    /// position does shrink — so the clamp is caused by the content.
+    #[test]
+    fn a_flex_item_does_not_shrink_below_its_content() {
+        let css = r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .f { display: flex; width: 100px } .f > div { flex-basis: 100px; height: 10px }
+            .a { background-color: #ff0000 } .b { background-color: #0000ff }</style>"#;
+        let with = render(&format!(r#"{css}<div class="f"><div class="a">Unbreakableword</div><div class="b"></div></div>"#));
+        let without = render(&format!(r#"{css}<div class="f"><div class="a"></div><div class="b"></div></div>"#));
+        let aw = boxes(&with, 0xff0000ff)[0].2;
+        let ew = boxes(&without, 0xff0000ff)[0].2;
+        assert_eq!(ew, 50, "control: two empty items share the shrink equally");
+        assert!(aw > 50, "the word keeps its item from shrinking to 50 (got {aw})");
+    }
+
+    #[test]
+    fn an_inline_style_attribute_is_reported_not_ignored() {
+        let o = render(r#"<p style="color: red">x</p>"#);
+        assert!(o.diagnostics.iter().any(|d| d.code == "input.style-attribute"));
     }
 
     #[test]

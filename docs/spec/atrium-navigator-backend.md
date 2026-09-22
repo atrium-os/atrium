@@ -980,7 +980,7 @@ layout.
 
 ### 8.3 M2 progress — the number, first reading (2026-09-22)
 
-**CONFORMANCE: exercised 26/64, matched 22/64** (13 on first reading; see the updates
+**CONFORMANCE: exercised 35/64, matched 31/64** (13 on first reading; see the updates
 below). Printed by `nsg-conformance`; the
 matched set is pinned by a test so it cannot fall silently.
 
@@ -1058,6 +1058,35 @@ not `display: list-item`, so it never says what carries a marker. **`li` carries
 
 This interpretation should be written into the profile itself (§3.8) when it is next
 revised.
+
+**Update — flexbox, matched 22 → 31 (all nine §3.4 rows).** CSS Flexbox §9 without
+`order` or `*-reverse`:
+- flex base sizes from `flex-basis` (length, `%`, `auto` → the main size or content,
+  `content` → max-content);
+- lines under `flex-wrap` with gaps;
+- grow by `flex-grow` and shrink by `flex-shrink` × base, then clamp;
+- `justify-content`, `align-items`/`align-self` (including stretch of auto cross sizes)
+  and `align-content`;
+- items laid out at a forced border-box size, with heights measured by a scratch layout
+  that is rolled back.
+
+Decisions and findings:
+- **Baseline alignment** uses each item's first line box. A box without one
+  synthesizes it from the bottom of its border box. **`align-content: baseline`** on a
+  flex container that is not in a baseline-sharing group falls back to `start` per CSS
+  Box Alignment, so laying it out as flex-start is the specified behaviour.
+- **Automatic minimum size:** a flex item's `min-width`/`min-height: auto` is
+  min(definite specified size, min-content), so items never shrink below their
+  content. It was 0, found in review. It is proven by a unit test with a control (an
+  empty item in the same place does shrink) and by fixture 21.
+- **An inline `style` attribute is a diagnostic** (`input.style-attribute`). The
+  profile's cascade has no inline layer, and it had been silently ignored; found when a
+  fixture accidentally carried `style=""`.
+- **A review misdiagnosis, recorded:** fixture 21's overflowing text looked like a
+  shrink bug, but the items were fixed-width by specificity, and the overflow was
+  correct CSS. Checked against the NSG's widths before any code was changed for it.
+- **Loose text directly in a flex container** is not made into an anonymous item yet;
+  it is counted.
 
 ## 9. What this reuses
 
