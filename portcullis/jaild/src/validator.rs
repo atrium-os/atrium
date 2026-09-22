@@ -271,9 +271,30 @@ fn validate_mount(m: &MountSpec, policy: &Policy) -> Result<(), JaildError> {
             }
         }
         MountKind::Tmpfs => {
-            /* tmpfs has no source, no allow-list. Always
-             * acceptable; the only resource cap is the
-             * (eventual) per-jail rctl in V1b. */
+            /* ★★ tmpfs has no source, so it had no check at all — and it was
+             * mounted with no size, so it was unbounded RAM. A per-jail rctl
+             * does not cover it: tmpfs pages belong to the filesystem, not to
+             * any process's RSS, so a memoryuse cap never sees them.
+             *
+             * Absent → the policy ceiling (applied at mount time). Explicit →
+             * must be positive and within it. Refused rather than clamped: a
+             * caller asking for more than it may have should learn so, not
+             * receive something smaller than it believes it has. */
+            if let Some(mb) = m.size_mb {
+                if mb == 0 {
+                    return Err(JaildError::PolicyViolation {
+                        rule:   "mount.tmpfs.zero_size",
+                        detail: format!("tmpfs at {:?} asks for 0 MiB", m.dest),
+                    });
+                }
+                if mb > policy.mount_sources.max_tmpfs_mb {
+                    return Err(JaildError::PolicyViolation {
+                        rule:   "mount.tmpfs.too_large",
+                        detail: format!("tmpfs at {:?} asks for {mb} MiB; the ceiling is {} MiB",
+                                        m.dest, policy.mount_sources.max_tmpfs_mb),
+                    });
+                }
+            }
         }
     }
     Ok(())
@@ -340,6 +361,31 @@ fn validate_exec(exec: &ExecSpec, policy: &Policy) -> Result<(), JaildError> {
             detail: format!(
                 "uid {} not in user range {}..={} and not in allowed_system_uids",
                 exec.uid, policy.uid.min_user_uid, policy.uid.max_user_uid),
+        });
+    }
+
+    /* ★★★ gid: the SAME rule, which the policy always said it would be.
+     *
+     * The schema has carried a REQUIRED `[gid]` section — "mirrors uid table"
+     * — since it was written, and this validator never read it. So a request
+     * could name gid 0 and the child would run with wheel as its primary
+     * group; and once `drop_privileges` was fixed to call setgroups({gid}),
+     * that became the child's ONLY group. The uid check was guarding one half
+     * of the credential and the other half walked past it.
+     *
+     * The user range is the uid range, as the section's own comment says:
+     * FreeBSD gives per-user groups the uid's number, and every gid in use
+     * (1001, 1099, 50000, 50090-50094) sits inside it. System groups need an
+     * explicit entry, exactly as system uids do. */
+    let gid_in_user_range = exec.gid >= policy.uid.min_user_uid
+                         && exec.gid <= policy.uid.max_user_uid;
+    let gid_in_system     = policy.gid.allowed_system_gids.iter().any(|g| *g == exec.gid);
+    if !gid_in_user_range && !gid_in_system {
+        return Err(JaildError::PolicyViolation {
+            rule:   "exec.gid.not_allowed",
+            detail: format!(
+                "gid {} not in user range {}..={} and not in allowed_system_gids",
+                exec.gid, policy.uid.min_user_uid, policy.uid.max_user_uid),
         });
     }
 
@@ -511,6 +557,7 @@ mod tests {
             source: "/usr/local/lib".into(),
             dest:   "usr/local/lib".into(),
             kind:   MountKind::RoNullfs,
+            size_mb: None,
         });
         validate_create(&r, &p).unwrap();
     }
@@ -523,6 +570,7 @@ mod tests {
             source: "/etc/master.passwd.bak".into(),
             dest:   "etc".into(),
             kind:   MountKind::RoNullfs,
+            size_mb: None,
         });
         let err = validate_create(&r, &p).unwrap_err();
         match err {
@@ -539,6 +587,7 @@ mod tests {
             source: "/usr/local/lib".into(),
             dest:   "../escape".into(),
             kind:   MountKind::RoNullfs,
+            size_mb: None,
         });
         let err = validate_create(&r, &p).unwrap_err();
         assert!(matches!(err,
@@ -553,6 +602,7 @@ mod tests {
             source: "ignored".into(),
             dest:   "tmp".into(),
             kind:   MountKind::Tmpfs,
+            size_mb: None,
         });
         validate_create(&r, &p).unwrap();
     }
@@ -566,6 +616,7 @@ mod tests {
             source: "/var/lib/atrium/storage/jails/mysqld/data".into(),
             dest:   "var/db/mysql".into(),
             kind:   MountKind::RwNullfs,
+            size_mb: None,
         });
         validate_create(&r, &p).unwrap();
 
@@ -575,6 +626,7 @@ mod tests {
             source: "/var/lib/something-else/x".into(),
             dest:   "x".into(),
             kind:   MountKind::RwNullfs,
+            size_mb: None,
         });
         assert!(validate_create(&r2, &p).is_err());
     }
@@ -587,6 +639,7 @@ mod tests {
             source: "/usr/home/girivs".into(),
             dest:   "home/girivs".into(),
             kind:   MountKind::RwNullfs,
+            size_mb: None,
         });
         validate_create(&r, &p).unwrap();
     }
@@ -814,6 +867,100 @@ mod tests {
         let err = validate_create(&r, &p).unwrap_err();
         assert!(matches!(err,
             JaildError::PolicyViolation { rule: "exec.uid.not_allowed", .. }));
+    }
+
+    fn exec_as(uid: u32, gid: u32) -> CreateJailRequest {
+        let mut r = req_default();
+        r.exec = Some(ExecSpec {
+            path: "/usr/local/bin/atrium-frescod".into(),
+            argv: vec!["atrium-frescod".into()],
+            env:  vec![],
+            uid, gid,
+        });
+        r
+    }
+
+    /// ★★★ THE HOLE: a valid uid with gid 0. The uid check passed, the gid was
+    /// never looked at, and after `drop_privileges` gained its setgroups({gid})
+    /// the child's only group would have been wheel.
+    #[test]
+    fn exec_rejects_gid_zero_with_an_otherwise_valid_uid() {
+        let p = load_sample_policy();
+        let err = validate_create(&exec_as(1001, 0), &p).unwrap_err();
+        assert!(matches!(err,
+            JaildError::PolicyViolation { rule: "exec.gid.not_allowed", .. }),
+            "gid 0 (wheel) was accepted: {err:?}");
+    }
+
+    /// And operator — the group that owns raw disk devices on FreeBSD.
+    #[test]
+    fn exec_rejects_the_operator_group() {
+        let p = load_sample_policy();
+        assert!(validate_create(&exec_as(1001, 5), &p).is_err(), "gid 5 (operator) was accepted");
+    }
+
+    /// ★ The counterweight: every gid actually in use must still pass, or this
+    /// check breaks the services it exists to protect.
+    #[test]
+    fn exec_accepts_every_gid_the_shipped_manifests_use() {
+        let p = load_sample_policy();
+        for (uid, gid) in [(1001, 1001), (1099, 1099), (50000, 50000),
+                           (50090, 50090), (50094, 50094)] {
+            validate_create(&exec_as(uid, gid), &p)
+                .unwrap_or_else(|e| panic!("uid {uid} gid {gid} refused: {e:?}"));
+        }
+    }
+
+    /// A system gid is admitted exactly when it is listed, as system uids are.
+    #[test]
+    fn exec_admits_a_system_gid_only_when_allowlisted() {
+        let mut p = load_sample_policy();
+        assert!(validate_create(&exec_as(1001, 66), &p).is_err());
+        p.gid.allowed_system_gids = vec![66];
+        validate_create(&exec_as(1001, 66), &p).expect("an allowlisted system gid");
+    }
+
+    fn tmpfs(size_mb: Option<u64>) -> MountSpec {
+        MountSpec { source: "tmpfs".into(), dest: "tmp".into(),
+                    kind: MountKind::Tmpfs, size_mb }
+    }
+
+    /// ★★ tmpfs is RAM, and had no check at all. A per-jail rctl does not
+    /// cover it — tmpfs pages belong to the filesystem, not to any process's
+    /// RSS — so an oversized request has to be refused here or nowhere.
+    #[test]
+    fn a_tmpfs_above_the_ceiling_is_refused() {
+        let p = load_sample_policy();
+        let too_big = p.mount_sources.max_tmpfs_mb + 1;
+        let err = validate_mount_for_runtime(&p, &tmpfs(Some(too_big))).unwrap_err();
+        assert!(matches!(err,
+            JaildError::PolicyViolation { rule: "mount.tmpfs.too_large", .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_zero_sized_tmpfs_is_refused() {
+        let p = load_sample_policy();
+        let err = validate_mount_for_runtime(&p, &tmpfs(Some(0))).unwrap_err();
+        assert!(matches!(err,
+            JaildError::PolicyViolation { rule: "mount.tmpfs.zero_size", .. }), "{err:?}");
+    }
+
+    /// ★ The counterweight: no size is ACCEPTED, because it gets the ceiling
+    /// at mount time rather than "unbounded". Every existing caller omits it,
+    /// and refusing them would break the services this protects.
+    #[test]
+    fn an_unsized_tmpfs_is_accepted_and_one_within_the_ceiling_too() {
+        let p = load_sample_policy();
+        validate_mount_for_runtime(&p, &tmpfs(None)).expect("unsized → gets the ceiling");
+        validate_mount_for_runtime(&p, &tmpfs(Some(p.mount_sources.max_tmpfs_mb)))
+            .expect("exactly the ceiling is allowed");
+    }
+
+    /// The ceiling defaults when a policy file predates it, so an upgrade does
+    /// not refuse every tmpfs on the machine.
+    #[test]
+    fn the_tmpfs_ceiling_has_a_default_for_older_policy_files() {
+        assert_eq!(load_sample_policy().mount_sources.max_tmpfs_mb, 256);
     }
 }
 

@@ -396,6 +396,7 @@ fn capability_mounts(m: &ServiceManifest) -> Vec<MountSpec> {
             source: "/var/run/atrium/caps/portcullisd/".into(),
             dest:   "/atrium/sockets/portcullisd/".into(),
             kind:   MountKind::RoNullfs,
+            size_mb: None,
         });
     }
     out
@@ -421,6 +422,11 @@ fn resolve_volumes(
                     source: format!("tmpfs::{}/{}", m.name, v.name),
                     dest:   v.mount_at.clone(),
                     kind:   MountKind::Tmpfs,
+                    // A manifest volume states no size today, so it gets
+                    // jaild's policy ceiling — bounded, where it used to be
+                    // all of RAM. A per-volume `size_mb` in the manifest is
+                    // the natural next step once a service needs less.
+                    size_mb: None,
                 });
             }
             ManifestVolumeKind::Persistent => {
@@ -455,6 +461,7 @@ fn resolve_volumes(
                     source: host_path.clone(),
                     dest:   v.mount_at.clone(),
                     kind:   MountKind::RwNullfs,
+                    size_mb: None,
                 });
                 host_paths.push((v.name.clone(), host_path));
             }

@@ -132,6 +132,9 @@ pub struct AttachMountRequest {
     /// Path inside the jail's chroot. e.g. `/var/projects`.
     pub dest:       String,
     pub mount_kind: MountKind,
+    /// tmpfs only; see `MountSpec::size_mb`.
+    #[serde(default)]
+    pub size_mb:    Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -242,6 +245,11 @@ pub struct MountSpec {
     pub source: String,
     pub dest:   String,
     pub kind:   MountKind,
+    /// tmpfs only: the filesystem's size in MiB. `None` gets the policy's
+    /// ceiling (`mount_sources.max_tmpfs_mb`) — never "unbounded". Ignored for
+    /// nullfs, which has no size of its own.
+    #[serde(default)]
+    pub size_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -254,7 +262,9 @@ pub enum MountKind {
     /// `policy.mount_sources.rw_paths` or match an
     /// `rw_patterns` glob.
     RwNullfs,
-    /// tmpfs mount; `source` is ignored (use any string).
+    /// tmpfs mount; `source` is ignored (use any string). Always SIZED:
+    /// tmpfs is RAM, and an unsized one is a way for any jail to take all of
+    /// it — see `MountSpec::size_mb`.
     Tmpfs,
 }
 

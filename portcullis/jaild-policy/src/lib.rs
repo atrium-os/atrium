@@ -86,7 +86,17 @@ pub struct MountSources {
     /// allocator daemon producing the paths.
     #[serde(default)]
     pub rw_subtrees: Vec<String>,
+    /// ★ The largest tmpfs any jail may mount, in MiB, and the size given to
+    /// one that does not ask. tmpfs is RAM-backed and was mounted with no
+    /// options at all, so every tmpfs jaild created could grow until the
+    /// machine ran out — reachable by any caller that could name a jail.
+    /// 256 MiB is generous for the scratch volumes it is used for and far
+    /// below what a runaway would take.
+    #[serde(default = "default_max_tmpfs_mb")]
+    pub max_tmpfs_mb: u64,
 }
+
+fn default_max_tmpfs_mb() -> u64 { 256 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DevfsRulesets {

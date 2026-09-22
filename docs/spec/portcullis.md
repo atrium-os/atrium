@@ -1815,10 +1815,25 @@ the instant it arrived, and because jaild pdforks without `PD_DAEMON` that *kill
 `ATRIUM_JCLIENT_HOLD=<secs>`. And the child's stderr goes to `/var/log/atrium/<name>.log`,
 which is where the verdict above was read.
 
-**Other gaps the same survey found, recorded not fixed:** jaild does not validate `gid` at
-all; `Tmpfs` mounts have no size option and no validator check; create-time mounts are never
-unmounted by `RemoveJail`; exec'd jails' state records accumulate with no dedup; and rctl
-rules set through `SetRctl` are never removed.
+**Two of the gaps the same survey found are now fixed:**
+
+- **`gid` is validated.** The policy schema had carried a *required* `[gid]` section —
+  "mirrors uid table" — since it was written, and the validator never read it. A request
+  could name gid 0, and after the `setgroups({gid})` fix that would have been the child's
+  *only* group: wheel. The rule is now the uid rule: inside the user range or explicitly in
+  `allowed_system_gids`. Every gid in use (1001, 1099, 50000, 50090–50094) passes; 0 and 5 are
+  refused.
+- **Every jaild tmpfs is sized.** tmpfs was mounted with no options at all, and an unsized
+  tmpfs means *"all currently available memory"* (tmpfs(5)) — measured on the VM, an unsized
+  mount reported exactly the free RAM at that instant (123 MiB, = 31,679 free pages). A
+  per-jail rctl does not cover it: tmpfs pages belong to the filesystem, not to any process's
+  RSS. Now an explicit size must be positive and within `mount_sources.max_tmpfs_mb`
+  (default 256), and an absent size gets that ceiling rather than "unbounded" — so every
+  existing caller, none of which passes a size, keeps working. Verified by A/B: the same
+  unsized attach mounts at 256 MiB with the fix.
+
+**Still open:** create-time mounts are never unmounted by `RemoveJail`; exec'd jails' state
+records accumulate with no dedup; and rctl rules set through `SetRctl` are never removed.
 
 ### 9.2 Out of scope
 

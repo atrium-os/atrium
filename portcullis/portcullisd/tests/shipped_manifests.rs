@@ -65,6 +65,7 @@ fn shipped_smoke_manifests_pass_the_shipped_policy() {
                 source: "/var/run/atrium/caps/portcullisd/".into(),
                 dest:   "/atrium/sockets/portcullisd/".into(),
                 kind:   jaild::protocol::MountKind::RoNullfs,
+                size_mb: None,
             });
         }
         if let Err(e) = validate_create(&req, &p) {

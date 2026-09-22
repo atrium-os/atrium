@@ -112,6 +112,7 @@ fn main() -> ExitCode {
                 source:     rest[1].clone(),
                 dest:       rest[2].clone(),
                 mount_kind: kind,
+                size_mb:    None,
             })
         }
         "detach" => {

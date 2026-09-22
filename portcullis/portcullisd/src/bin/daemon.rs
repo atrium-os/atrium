@@ -354,6 +354,9 @@ fn handle_attach(
             ProtoKind::RwNullfs => JaildKind::RwNullfs,
             ProtoKind::Tmpfs    => JaildKind::Tmpfs,
         },
+        /* The aqueduct-side request carries no size yet, so a tmpfs attached
+         * through here gets jaild's policy ceiling — bounded either way. */
+        size_mb:    None,
     });
     jaild_round_trip(jaild_path, &jaild_req)
 }
