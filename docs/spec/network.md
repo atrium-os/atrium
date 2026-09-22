@@ -27,6 +27,68 @@ Companion specs:
 - [`service-management.md`](service-management.md) §6 —
   `atrium-net`'s place in the GUI-mediator daemon table.
 
+## 0. DECIDED 2026-09-22 — every app on its own stack: vnet + a point-to-point epair
+
+**This supersedes the alias model in §2–§3** (IP aliases on the host's `lo0`/`atrium0` with the
+jail sharing the host's network stack). That model was never built, and it cannot meet a
+requirement decided since: **a jailed app never learns the real machine's identity**
+(portcullis.md §9.1c). A jail on the host's stack can list the host's interfaces and read their
+real MACs — measured. The capability model of §4 (default-deny, per-app grants, pf enforcing)
+stands; what changes is the plumbing under it.
+
+**The model.** Every app gets its own network stack (`vnet=new`):
+
+| app's capability | its stack holds |
+|---|---|
+| none (default) | only its own `lo0`, down — nothing to reach, nothing to read |
+| `loopback` | its own `lo0` up on 127.0.0.1/::1 (configured from the host after creation) |
+| network | its own `lo0` plus ONE end of an epair, with a **per-app derived MAC** (`02:…`, locally administered, stable, from the same machine secret as the hostid) and a **point-to-point /30** from `100.64.0.0/16`: host end `.1`, app `.2`, default route via `.1` |
+
+**Point-to-point, not a bridge.** Each app's epair is its own /30, so apps share no layer 2 at
+all — no ARP between them, no spoofing a neighbour's address on a shared segment. Any traffic
+between apps has to be ROUTED through the host, where pf sees it. The host ends of every epair
+join one interface group, `atrium`, so the policy is written once against the group.
+
+**Enforcement: pf on the host, default-deny.** The base ruleset (loaded at boot):
+
+```pf
+set skip on lo0
+nat on <egress> inet from 100.64.0.0/16 to any -> (<egress>)
+block in quick on atrium inet from any to (self)           # an app never reaches the host
+block in quick on atrium inet from any to 100.64.0.0/16    # nor another app
+pass all
+```
+
+Per-app grants (§4: `outbound`, `peer_jails`, …) become per-app anchors in front of these
+blocks — atrium-netd's job, unchanged in intent.
+
+**Measured in the VM (2026-09-22, by hand, before any code):**
+
+| check | result |
+|---|---|
+| what the app sees | `lo0` + its epair, MAC `02:a7:10:00:00:01`; the host's `52:54:00:12:34:56` invisible |
+| app → internet (DNS + TCP through NAT) | allowed — fetched example.com |
+| app → host, via its gateway and via the host's real address | blocked |
+| app → another app (a real listener) | blocked **with** the rule, ALLOWED **without** it, blocked again when restored — the rule is what isolates |
+| cost | ~47 ms per vnet jail create+remove vs ~1 ms (vnet alone; epair adds its own) |
+
+Without the block rules an app reached the host's sshd on its gateway address — so the rules
+are load-bearing, and whatever creates a networked app must refuse if they are not loaded
+(the same fail-closed shape as the devfs rulesets, portcullis.md §9.1b).
+
+**Plan (in order):**
+
+1. `portcullis-identity`: a per-app MAC, derived with its own domain label.
+2. jaild: the network broker (§2 already gives it address allocation) — allocate a /30, create
+   the epair, configure the host end (`.1`, group `atrium`), create the jail with
+   `vnet.interface`, configure the app end (MAC, address, route) before the app runs, release
+   everything on removal. Refuse if pf is not enabled with the base rules loaded.
+3. Both launch lanes ask jaild for the network — one allocator, never two.
+4. `etc/atrium.pf` + forwarding, installed and loaded by bootstrap/deploy, like the devfs rules.
+5. atrium-netd (per-app anchors for §4's finer grants) — after the plumbing is proven.
+
+Until step 3, apps granted network still use `vnet = inherit` and see the real MAC.
+
 ## 1. Principle
 
 > **A jail's network access is a capability the user grants
