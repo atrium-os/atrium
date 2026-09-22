@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 /// so a property the layout ignores can never be dropped silently (§5.1).
 /// Value-level gaps inside a read row (flex as block, italic without an
 /// italic face, …) are counted where they occur.
-pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 32, 33, 34, 35, 36, 37, 39, 41, 42, 43, 44, 49, 50];
+pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 32, 33, 34, 35, 36, 37, 39, 41, 42, 43, 44, 49, 50, 59, 60];
 
 pub struct HtmlOut {
     pub scene: Scene,
@@ -82,6 +82,9 @@ struct Cx<'a> {
     report: Report,
     links: Vec<String>,
     unimplemented: BTreeMap<&'static str, usize>,
+    /// A list item's marker, waiting for the first line box its content
+    /// produces (which may be inside a nested block).
+    marker: Option<(String, FontStyle, Line, bool)>,
 }
 
 pub fn render_html(html: &str, fonts: &FontSet, env: &Env) -> HtmlOut {
@@ -105,7 +108,7 @@ pub fn render_html(html: &str, fonts: &FontSet, env: &Env) -> HtmlOut {
     let styled = cascade(&dom, &sheets, env);
     diagnostics.extend(styled.diagnostics);
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
-                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new() };
+                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None };
     cx.count_unread_rows();
     // The root element is the initial containing block's only child.
     let root = dom.element_children(dom.root()).into_iter().next();
@@ -218,6 +221,29 @@ impl<'a> Cx<'a> {
         };
         let definite = match s.get("height") { V::Kw(_) => None, V::Pct(_) => cb_h.and_then(|b| len(s.get("height"), b)), v => len(v, 0) }.map(clamp);
         let child_cb_h = definite.map(|d| (d - pt - pb - bt - bb).max(0));
+        // ★ List markers belong to `li` (the profile admits list-style-* but not
+        // display: list-item): typed by the inherited list-style-type,
+        // numbered among its `li` siblings from `<ol start>`.
+        if self.dom.tag(h) == Some("li") {
+            let ty = kw(s, "list-style-type");
+            let text = match ty {
+                "disc" => Some("\u{2022}".to_string()),
+                "circle" => Some("\u{25E6}".to_string()),
+                "square" => Some("\u{25AA}".to_string()),
+                "decimal" => {
+                    let parent = self.dom.get(h).and_then(|n| n.parent);
+                    let start: i64 = parent.and_then(|p| self.dom.attr(p, "start")).and_then(|v| v.trim().parse().ok()).unwrap_or(1);
+                    let before = parent.map(|p| self.dom.element_children(p).into_iter().take_while(|c| *c != h)
+                        .filter(|c| self.dom.tag(*c) == Some("li")).count()).unwrap_or(0) as i64;
+                    Some(format!("{}.", start + before))
+                }
+                _ => None,
+            };
+            if let Some(t) = text {
+                let (st, line) = self.font_style(s);
+                self.marker = Some((t, st, line, kw(s, "list-style-position") == "outside"));
+            }
+        }
         // Paint the background BEFORE the children: reserve its slot now.
         let bg_slot = self.scene.order.len();
         let content_x = bx + bl + pl;
@@ -434,8 +460,15 @@ impl<'a> Cx<'a> {
     }
 
     /// Greedy line breaking of `items` into line boxes; returns their height.
-    fn lines(&mut self, items: Vec<Item>, x: U, y: U, w: U, block: &Style) -> U {
+    fn lines(&mut self, mut items: Vec<Item>, x: U, y: U, w: U, block: &Style) -> U {
         if items.iter().all(|i| matches!(i, Item::Space(..))) { return 0 }
+        // A pending list marker: `inside` is the first inline item; `outside`
+        // hangs left of the first line box, on its baseline.
+        let mut outside_marker = None;
+        if let Some((text, st, line, outside)) = self.marker.take() {
+            if outside { outside_marker = Some((text, st)) }
+            else { items.insert(0, Item::Space(st.clone(), line)); items.insert(0, Item::Word(text, st, line)) }
+        }
         struct Placed { x: U, st: FontStyle, line: Line, pieces: Vec<crate::Piece>, gap: bool }
         let mut lines: Vec<Vec<Placed>> = vec![vec![]];
         // Whether each line was ended by a forced break (never justified).
@@ -499,6 +532,15 @@ impl<'a> Cx<'a> {
                 }
             }
             let shift = match align { "center" => (w - used) / 2, "end" => w - used, _ => 0 }.max(0);
+            if let Some((text, st)) = outside_marker.take() {
+                let pieces = self.sh.shape(&text, &st, &mut self.report);
+                let mw: U = pieces.iter().map(|p| p.width).sum();
+                let mut mx = x - mw - st.size / 2;
+                for piece in pieces {
+                    self.scene.run(Run { face: piece.face, size: st.size, rgba: st.rgba, x: mx, y: yy + base, em: st.em, glyphs: piece.glyphs, text: piece.text });
+                    mx += piece.width;
+                }
+            }
             let mut link_span: Option<(usize, U, U)> = None;
             // Decorations span the gaps between words of one decorated run
             // (CSS draws one line under `<a>link with a region</a>`, not four).

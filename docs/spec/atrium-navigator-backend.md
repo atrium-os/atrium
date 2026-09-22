@@ -980,7 +980,7 @@ layout.
 
 ### 8.3 M2 progress — the number, first reading (2026-09-22)
 
-**CONFORMANCE: exercised 24/64, matched 20/64** (was 13 on first reading; see the update
+**CONFORMANCE: exercised 26/64, matched 22/64** (13 on first reading; see the updates
 below). Printed by `nsg-conformance`; the
 matched set is pinned by a test so it cannot fall silently.
 
@@ -1048,6 +1048,16 @@ matched set is pinned by a test so it cannot fall silently.
 - **A stale review binary.** The feature-gated `nsg-raster` was not rebuilt by
   `cargo run`, so a fixed bug still showed in a PNG drawn by old code. The review tool
   is rebuilt before every review.
+
+**Update — lists, matched 20 → 22.** **Decision:** the profile admits `list-style-*` but
+not `display: list-item`, so it never says what carries a marker. **`li` carries it**:
+- typed by the inherited `list-style-type` (disc •, circle ◦, square ▪, decimal);
+- numbered among its `li` siblings from `<ol start>`;
+- `outside` hangs left of the first line box, on its baseline, even when that line is
+  inside a nested block; `inside` is the first inline item and wraps with the text.
+
+This interpretation should be written into the profile itself (§3.8) when it is next
+revised.
 
 ## 9. What this reuses
 
