@@ -16,8 +16,8 @@
 # REQUIRES (commission once per host):
 #   1. _frescod system uid (e.g. `pw useradd _frescod -u 50092 -d /nonexistent
 #      -s /usr/sbin/nologin`); 50092 is in jaild.policy's user-uid range.
-#   2. The atrium_gpu devfs ruleset (etc/atrium-frescod.devfs.rules ->
-#      /etc/devfs.rules, `service devfs restart`); id 21 in jaild.policy
+#   2. The atrium_gpu devfs ruleset (etc/atrium.devfs.rules, installed and
+#      loaded at boot by scripts/bootstrap-atrium.sh); id 21 in jaild.policy
 #      [devfs_rulesets].allowed_ids.
 #   3. The per-cap socket dirs owned by _frescod so it can bind:
 #      `mkdir -p /atrium/sockets/fresco /atrium/sockets/fresco-wm &&

@@ -328,7 +328,7 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
                           .map(PathBuf::from)
                           .unwrap_or_else(|| PathBuf::from("/")),
         user_name:    std::env::var("USER").unwrap_or_else(|_| "atrium".into()),
-        devfs_ruleset: 99,             /* Phase 4 manages allocation */
+        devfs_ruleset: portcullis_jail::APP_DEVFS_RULESET,
         instance: None,                /* one jail per app on this path */
         persist: true,
     };
@@ -527,6 +527,13 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
                                      jail_path.to_str().unwrap()]) {
         eprintln!("unionfs mount: {e}");
         let _ = umount(&jail_path);
+        return ExitCode::from(1);
+    }
+
+    /* ★★★ Refuse a devfs that would hide nothing — see ensure_devfs_isolation. */
+    if let Err(e) = portcullis_mounts::ensure_devfs_isolation(&jc) {
+        eprintln!("portcullis: {e}");
+        teardown(&jail_path);
         return ExitCode::from(1);
     }
 

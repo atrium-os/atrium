@@ -29,6 +29,18 @@ pub enum BuildError {
     Internal(&'static str),
 }
 
+/// The devfs ruleset every portcullis app and one-shot jail is mounted with:
+/// `atrium_app` in etc/atrium.devfs.rules — hide the host's /dev, unhide the
+/// basics and the pty/fd set.
+///
+/// ★★★ This was the literal 99, "Phase 4 manages allocation", and no ruleset 99
+/// was ever defined. A devfs mounted with an unloaded ruleset hides NOTHING, so
+/// every app and every one-shot worker saw the host's entire /dev — raw disks,
+/// mem/kmem, bpf (measured 2026-09-22; a root process in such a jail read the
+/// host's disk). The number now names a ruleset that exists, and callers refuse
+/// to create a jail if it is not loaded (`portcullis_mounts::devfs_ruleset_has_rules`).
+pub const APP_DEVFS_RULESET: u32 = 22;
+
 /// Inputs the builder needs that aren't in the manifest.
 pub struct BuildOpts {
     /// On-host path to the per-jail tree (rootfs union mount root).
@@ -42,8 +54,10 @@ pub struct BuildOpts {
     /// The name the app process RUNS AS — the dedicated, non-root per-app uid's
     /// account (not the human; see portcullis.md §9.0). Drives `exec.jail_user`.
     pub user_name:    String,
-    /// devfs ruleset id assigned to this jail. Caller manages
-    /// allocation across all jails on the host.
+    /// devfs ruleset id this jail's /dev is mounted with — normally
+    /// [`APP_DEVFS_RULESET`]. Capability device grants are NOT folded into it:
+    /// `build` applies them to this jail's own devfs mount (see there), so one
+    /// shared ruleset serves every app.
     pub devfs_ruleset: u32,
     /// ★★ AN INSTANCE TAG, for apps that run MORE THAN ONE JAIL AT A TIME.
     ///
@@ -153,6 +167,29 @@ pub fn build(manifest: &Manifest, opts: &BuildOpts) -> Result<JailConfig, BuildE
 
     /* Apply each declared capability. */
     capabilities::apply_all(&manifest.capabilities, &mut jc, opts)?;
+
+    /* ★★ Capability device grants, applied to THIS jail's devfs mount.
+     *
+     * Capabilities have always recorded devfs actions (audio unhides dsp*,
+     * input unhides input/event*, …) and nothing ever applied them: the
+     * per-jail rules were rendered by render_devfs_rules and never loaded, and
+     * the ruleset the jail was mounted with (99) did not exist. Apps got their
+     * devices only because nothing was hidden at all. With a real baseline
+     * ruleset those grants must actually happen, per jail.
+     *
+     * `devfs -m <mnt> rule apply <rule>` applies one rule to one mount without
+     * adding it to any ruleset, so no ruleset numbers are allocated per app.
+     * exec.prestart, because jail(8) mounts devfs BEFORE prestart and creates
+     * the jail AFTER it (usr.sbin/jail/jail.c, create sequence): the grants are
+     * in place before anything can run inside. `&&` so a rule that fails to
+     * apply fails the launch rather than starting an app without its device. */
+    if !jc.devfs_actions.is_empty() {
+        let dev = opts.root_path.join("dev");
+        let cmds: Vec<String> = jc.devfs_actions.iter()
+            .map(|a| format!("devfs -m {} rule apply {}", dev.display(), a.line))
+            .collect();
+        jc.set("exec.prestart", Value::String(cmds.join(" && ")));
+    }
 
     /* Network defaults to "none" if no capability set it. */
     if !jc.has_set("ip4") && !jc.has_set("vnet") {

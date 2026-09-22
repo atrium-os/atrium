@@ -121,20 +121,24 @@ allowed = [
     "atrium-input",      # baseline + input/event*
     "atrium-tty",        # baseline + a specific allocated tty
 ]
-# Numeric ruleset ids these names map to in /etc/devfs.rules.
-# jail_set takes a number; the names above are operator
-# documentation. Empty here means "no devfs_ruleset may be set"
-# (jails inherit the host devfs). Populate this list once the
-# operator has actual ruleset blocks defined; sample numbering:
-#   5 = atrium-baseline    6 = atrium-gpu
-#   7 = atrium-input       8 = atrium-tty
+# Numeric ruleset ids jaild may mount a jail's devfs with. The rulesets
+# themselves live in etc/atrium.devfs.rules (installed and loaded at boot by
+# scripts/bootstrap-atrium.sh); jail_set takes a number, the names above are
+# operator documentation.
 #
-# 4 = devfsrules_jail (FreeBSD-standard jail /dev: null/zero/random/
-#     tty, NO kmem/mem/pci/gpu) — session apps' per-jail devfs (the
-#     §9.1 isolation fix; ostiarius SESSION_DEVFS_RULESET). 20 = the
-#     memory-governor ruleset (basics + /dev/pressure). 21 = atrium_gpu
-#     (basics + gpu0/display0/hidraw*) — the jailed non-root frescod.
-allowed_ids = [4, 20, 21]
+# ★★★ jaild also REFUSES an allowed id whose ruleset the kernel does not have
+# loaded (no rules). Mounting devfs with an unloaded ruleset number succeeds
+# and hides NOTHING — measured 2026-09-22, a jail on unloaded ruleset 20/21/99
+# saw the host's raw disks, mem/kmem and bpf. Being on this list is necessary,
+# not sufficient.
+#
+#  4 = devfsrules_jail (FreeBSD-standard, /etc/defaults/devfs.rules) — session
+#      apps' per-jail devfs (ostiarius SESSION_DEVFS_RULESET).
+# 20 = atrium_governor — basics + /dev/pressure (memoryd, memfed).
+# 21 = atrium_gpu      — basics + gpu0/display0/hidraw* (the non-root frescod).
+# 22 = atrium_app      — basics + pty/fd; portcullis apps and one-shot workers,
+#      with each capability's unhide rules applied to that jail's own mount.
+allowed_ids = [4, 20, 21, 22]
 
 
 # ---------------------------------------------------------------

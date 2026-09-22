@@ -81,6 +81,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "portcullis-jail",
+ "portcullis-mounts",
 ]
 
 [[package]]

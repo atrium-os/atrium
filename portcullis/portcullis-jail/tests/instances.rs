@@ -22,7 +22,7 @@ fn opts(instance: Option<&str>) -> BuildOpts {
         host_sockets: PathBuf::from("/atrium/sockets"),
         user_home: PathBuf::from("/home/alice"),
         user_name: "alice".into(),
-        devfs_ruleset: 99,
+        devfs_ruleset: portcullis_jail::APP_DEVFS_RULESET,
         instance: instance.map(str::to_string),
         persist: true,
     }

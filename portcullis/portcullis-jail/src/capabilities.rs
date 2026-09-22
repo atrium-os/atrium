@@ -237,7 +237,7 @@ mod tests {
             host_sockets: PathBuf::from("/atrium/sockets"),
             user_home:    PathBuf::from("/home/alice"),
             user_name:    "alice".into(),
-            devfs_ruleset: 99,
+            devfs_ruleset: crate::APP_DEVFS_RULESET,
             instance: None,
             persist: true,
         }

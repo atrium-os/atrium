@@ -742,6 +742,39 @@ fn handle_create(
     }
 
     if req.devfs_ruleset != 0 {
+        /* ★★★ FAIL CLOSED on a ruleset the kernel does not have. The policy
+         * allow-list says which ids MAY be used; it cannot say whether the
+         * operator ever loaded them, and a devfs mounted with an unloaded id
+         * hides nothing — the jail gets the host's whole /dev, raw disks and
+         * kmem included (measured; see ffi::devfs_ruleset_has_rules). Refusing
+         * here turns "forgot to install atrium.devfs.rules" from a silent
+         * isolation failure into a jail that does not start and says why. */
+        match ffi::devfs_ruleset_has_rules(req.devfs_ruleset) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Some(addr) = &lo0_alias {
+                    let _ = ffi::ifconfig_lo0_alias_del(addr);
+                }
+                return Err(JaildError::PolicyViolation {
+                    rule:   "devfs_ruleset.not_loaded",
+                    detail: format!(
+                        "devfs ruleset {} has no rules loaded in the kernel; a devfs \
+                         mounted with it would expose the host's entire /dev. Install \
+                         etc/atrium.devfs.rules and `service devfs restart`",
+                        req.devfs_ruleset),
+                });
+            }
+            Err(e) => {
+                if let Some(addr) = &lo0_alias {
+                    let _ = ffi::ifconfig_lo0_alias_del(addr);
+                }
+                return Err(JaildError::Syscall {
+                    name:  "devfs rule show",
+                    errno: e.raw_os_error().unwrap_or(-1),
+                    msg:   format!("cannot verify devfs ruleset {}: {e}", req.devfs_ruleset),
+                });
+            }
+        }
         let devdir = format!("{}/dev", req.path.trim_end_matches('/'));
         let _ = std::fs::create_dir_all(&devdir);
         if let Err(e) = ffi::devfs_mount(&devdir, req.devfs_ruleset) {

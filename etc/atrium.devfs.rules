@@ -1,0 +1,52 @@
+# Atrium devfs rulesets — installed as /usr/local/etc/atrium/devfs.rules and
+# listed in rc.conf's devfs_rulesets, so rc.d/devfs loads it at every boot.
+# (scripts/bootstrap-atrium.sh does both.)
+#
+# ★★★ A RULESET THAT IS NOT LOADED HIDES NOTHING. Mounting devfs with a ruleset
+# number the kernel has never been given succeeds, and the kernel quietly
+# creates an EMPTY ruleset for it — so the jail sees the host's entire /dev.
+# Measured 2026-09-22: ruleset 99 (every portcullis app + one-shot worker), 20
+# (memoryd/memfed) and 21 (frescod) were all unloaded — 20 and 21 each had an
+# "append this to /etc/devfs.rules by hand" file that nothing ever did, and 99
+# was a placeholder with no definition at all — and a jail on any of them
+# saw 64 host nodes: mem, kmem, bpf, pci, devctl and the raw disks. A process
+# running as root inside such a jail read the host's disk directly.
+# jaild and portcullis now REFUSE to create a jail whose ruleset has no rules,
+# so forgetting this file fails loudly instead of silently exposing /dev.
+#
+# The numeric ids must match jaild.policy.toml [devfs_rulesets].allowed_ids.
+
+# The jailed memory governor (atrium-memoryd / atrium-memfed): the basics plus
+# /dev/pressure, readable (0644) inside the jail's own devfs so the non-root
+# governor uid can open it for PRESSURE_GET and the kqueue edge. The host's
+# /dev/pressure stays 0640 root:wheel.
+[atrium_governor=20]
+add include $devfsrules_hide_all
+add include $devfsrules_unhide_basic
+add path pressure unhide
+add path pressure mode 0644
+
+# The jailed, NON-ROOT compositor (frescod). Baseline plus the GPU, display and
+# HID input nodes, made openable (0666) inside frescod's own devfs instance so
+# the non-root _frescod uid can use them. The atrium-gpu-amd kmod gates only on
+# node permissions (no priv_check), so this grant alone lets frescod run without
+# root. The host's nodes stay 0600 root:wheel — these rules change only this
+# jail's devfs mount.
+[atrium_gpu=21]
+add include $devfsrules_hide_all
+add include $devfsrules_unhide_basic
+add path 'atrium-gpu0' unhide
+add path 'atrium-gpu0' mode 0666
+add path 'atrium-display0' unhide
+add path 'atrium-display0' mode 0666
+add path 'hidraw*' unhide
+add path 'hidraw*' mode 0666
+
+# Every portcullis app and one-shot worker: hide the whole host /dev, then the
+# nodes any process needs (null/zero/random, the pty/fd set). Capabilities add
+# to this PER JAIL — portcullis applies each capability's unhide rules to that
+# jail's own devfs mount — so this ruleset never grows to fit one app.
+[atrium_app=22]
+add include $devfsrules_hide_all
+add include $devfsrules_unhide_basic
+add include $devfsrules_unhide_login

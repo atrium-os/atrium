@@ -618,6 +618,25 @@ pub fn devfs_mount(target: &str, ruleset: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether the kernel holds ruleset `id` WITH AT LEAST ONE RULE.
+///
+/// ★★★ Being listed is not enough. Mounting devfs with a ruleset number the
+/// kernel has never been given SUCCEEDS: `devfs_ruleset_use` creates the
+/// ruleset empty and takes a reference, so from then on it is listed — while
+/// hiding nothing. Measured 2026-09-22: jails on unloaded rulesets 20/21/99 saw
+/// all 64 host nodes (raw disks, mem/kmem, bpf) and a root process in one read
+/// the host's disk. So the question is "does it have rules", which is what
+/// `devfs rule -s N show` answers (DEVFSIO_RGETNEXT from rule 0: ENOENT for a
+/// missing OR empty ruleset). Shelled rather than a raw ioctl because the ioctl
+/// takes `struct devfs_rule`, whose layout would have to be mirrored exactly —
+/// the same reason this module already shells `rctl` and `ifconfig`.
+pub fn devfs_ruleset_has_rules(id: u32) -> io::Result<bool> {
+    let out = std::process::Command::new("devfs")
+        .args(["rule", "-s", &id.to_string(), "show"])
+        .output()?;
+    Ok(out.status.success() && !out.stdout.iter().all(|b| b.is_ascii_whitespace()))
+}
+
 #[cfg(not(target_os = "freebsd"))]
 pub fn nullfs_mount(_s: &str, _t: &str, _ro: bool) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "nmount: FreeBSD only"))

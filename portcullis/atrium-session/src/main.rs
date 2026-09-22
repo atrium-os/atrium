@@ -42,10 +42,15 @@ use portcullis_jail::{JailConfig, Value};
 
 const SESSIONS_DIR: &str = "/var/lib/atrium/sessions";
 const APPS_DIR:     &str = "/var/lib/atrium/apps";
-/// devfs ruleset for session jails. Picked above portcullis-jail's
-/// default (99) so the two coexist while we don't have ruleset
-/// allocation. Phase 4.5 will manage these centrally.
-const SESSION_DEVFS_RULESET: i64 = 100;
+/// devfs ruleset for session jails: 4, FreeBSD's standard `devfsrules_jail`
+/// (/etc/defaults/devfs.rules, always loaded) — the same one ostiarius gives
+/// session apps.
+///
+/// ★★★ This was 100, "picked above portcullis-jail's default (99)", and neither
+/// number was ever a defined ruleset. A devfs mounted with an unloaded ruleset
+/// hides NOTHING: a session jail saw the host's raw disks, mem/kmem and bpf
+/// (measured 2026-09-22). create now refuses an unloaded ruleset outright.
+const SESSION_DEVFS_RULESET: i64 = 4;
 
 fn usage() -> ! {
     eprintln!("\
@@ -260,6 +265,13 @@ fn cmd_create(user: &str) -> ExitCode {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(layout.jail.join("tmp"),
                 std::fs::Permissions::from_mode(0o1777));
+
+    /* ★★★ Refuse a devfs that would hide nothing — see ensure_devfs_isolation. */
+    if let Err(e) = portcullis_mounts::ensure_devfs_isolation(&jc) {
+        eprintln!("atrium-session: {e}");
+        layout.umount_all_silent();
+        return ExitCode::from(1);
+    }
 
     /* 6. Write the jail.conf and run jail -c. */
     let conf_path = std::env::temp_dir().join(format!("atrium-session-{user}.conf"));

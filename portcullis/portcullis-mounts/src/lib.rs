@@ -62,8 +62,16 @@ pub fn parse_mounts(output: &str, roots: &[&Path]) -> Vec<PathBuf> {
         .filter(|p| roots.iter().any(|r| p == *r || p.starts_with(r)))
         .collect();
     // Deepest first: nested mounts ahead of the parents containing them.
+    //
+    // ★★ NOT deduplicated. A one-shot jail root is TWO mounts at ONE path —
+    // the read-only tree and the union over it — and each entry is one layer
+    // to pop (`umount <path>` always takes the topmost). Deduplicating made
+    // `converge` count paths instead of layers, so a pass that DID remove the
+    // union looked like no progress (2 paths before, 2 after) and it gave up
+    // with the tree and the tmpfs still mounted. Measured 2026-09-22: every
+    // early exit after the mounts leaked both; the normal exit path happened
+    // to avoid it, so nothing had ever exercised it until the devfs refusal.
     v.sort_by_key(|p| std::cmp::Reverse(p.as_os_str().len()));
-    v.dedup();
     v
 }
 
@@ -109,6 +117,41 @@ pub fn warn_survivors(who: &str, survivors: &[PathBuf]) {
     for m in survivors.iter().take(6) {
         eprintln!("{who}:   {}", m.display());
     }
+}
+
+/// Refuse a jail whose devfs would hide nothing. Call immediately before every
+/// `jail -c`.
+///
+/// ★★★ A ruleset the kernel has not loaded does not fail the mount — the
+/// kernel creates it EMPTY and the jail gets the host's entire /dev. Measured
+/// 2026-09-22: every app and one-shot worker (ruleset 99, never defined) and
+/// every session jail (100, likewise) saw raw disks, mem/kmem and bpf, and a
+/// root process in one read the host's disk. So "has rules" is checked, not
+/// "exists": once any jail has mounted an unloaded number, it is listed.
+/// Same check as jaild's own (jaild/src/ffi.rs), for the jail(8) paths jaild
+/// does not see.
+pub fn ensure_devfs_isolation(jc: &JailConfig) -> Result<(), String> {
+    use portcullis_jail::Value;
+    let devfs = jc.params.iter().any(|(k, v)| k == "mount.devfs" && matches!(v, Value::Bool(true)));
+    if !devfs { return Ok(()) }
+    let id = jc.params.iter().find_map(|(k, v)| match (k.as_str(), v) {
+        ("devfs_ruleset", Value::Number(n)) => Some(*n),
+        _ => None,
+    });
+    // ★ mount.devfs with NO ruleset, or 0, is the host's full /dev — the same
+    // exposure by another name, so it is refused too.
+    let Some(id) = id.filter(|n| *n > 0) else {
+        return Err(format!("jail {} mounts devfs with no ruleset: it would see the \
+                            host's entire /dev", jc.name));
+    };
+    let out = Command::new("devfs").args(["rule", "-s", &id.to_string(), "show"]).output()
+        .map_err(|e| format!("cannot verify devfs ruleset {id}: {e}"))?;
+    if out.status.success() && !out.stdout.iter().all(|b| b.is_ascii_whitespace()) {
+        return Ok(());
+    }
+    Err(format!("devfs ruleset {id} has no rules loaded in the kernel; jail {} would \
+                 see the host's entire /dev. Install etc/atrium.devfs.rules and \
+                 `service devfs restart`", jc.name))
 }
 
 /// Create the destinations a jail's mounts need. ★ `jail(8)` does not create
@@ -201,5 +244,54 @@ devfs /var/lib/atrium/jails/app/dev devfs rw 0 0
     fn an_empty_or_garbled_table_selects_nothing() {
         assert!(parse_mounts("", &[Path::new("/x")]).is_empty());
         assert!(parse_mounts("garbage\nalso garbage\n", &[Path::new("/x")]).is_empty());
+    }
+
+    /// ★★ Two mounts at one path are two layers, and both must be counted —
+    /// otherwise popping the top one reads as "no progress" and teardown stops
+    /// with the bottom one (and anything it pins) still mounted.
+    #[test]
+    fn stacked_mounts_at_one_path_are_each_counted() {
+        let t = "\
+/var/lib/atrium/apps/w /var/lib/atrium/jails/w nullfs ro 0 0
+tmpfs /var/run/portcullis-exec/w tmpfs rw 0 0
+/var/run/portcullis-exec/w /var/lib/atrium/jails/w unionfs rw 0 0
+";
+        let roots = [Path::new("/var/lib/atrium/jails/w"), Path::new("/var/run/portcullis-exec/w")];
+        let v = parse_mounts(t, &roots);
+        assert_eq!(v.len(), 3, "each layer is one entry: {v:?}");
+        assert_eq!(v.iter().filter(|p| p.ends_with("jails/w")).count(), 2, "{v:?}");
+    }
+
+    fn jail(devfs: bool, ruleset: Option<i64>) -> JailConfig {
+        use portcullis_jail::Value;
+        let mut jc = JailConfig::new("t".into(), PathBuf::from("/j"));
+        jc.set("mount.devfs", Value::Bool(devfs));
+        if let Some(n) = ruleset { jc.set("devfs_ruleset", Value::Number(n)); }
+        jc
+    }
+
+    /// ★★ devfs with no ruleset, or ruleset 0, is the host's full /dev under
+    /// another name — refused without asking the kernel anything.
+    #[test]
+    fn a_devfs_with_no_ruleset_is_refused() {
+        let e = ensure_devfs_isolation(&jail(true, None)).unwrap_err();
+        assert!(e.contains("no ruleset"), "{e}");
+        let e = ensure_devfs_isolation(&jail(true, Some(0))).unwrap_err();
+        assert!(e.contains("no ruleset"), "{e}");
+    }
+
+    /// A jail that mounts no devfs has nothing to isolate.
+    #[test]
+    fn no_devfs_mount_needs_no_ruleset() {
+        assert!(ensure_devfs_isolation(&jail(false, None)).is_ok());
+    }
+
+    /// ★ Unverifiable is refused, not assumed fine. Off FreeBSD there is no
+    /// `devfs(8)`, which is exactly the "cannot tell" case — the check must
+    /// fail closed there, never open.
+    #[cfg(not(target_os = "freebsd"))]
+    #[test]
+    fn a_ruleset_that_cannot_be_verified_is_refused() {
+        assert!(ensure_devfs_isolation(&jail(true, Some(22))).is_err());
     }
 }

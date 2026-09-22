@@ -502,7 +502,7 @@ jail set.
     `_memoryd` uid, reading `/dev/pressure` via the `PRESSURE_GET` ioctl, reaping
     via `--broker`. Launched by the v2 supervisor (`atrium-portcullisd-bootstrap`)
     from `services.d`, NOT root rc.d. Reproducible artifacts: `memoryd/etc/
-    services.d/50-atrium-memoryd.toml` + `memoryd/etc/atrium-governor.devfs.rules`.
+    services.d/50-atrium-memoryd.toml` + `etc/atrium.devfs.rules` (ruleset 20).
   - **MECHANISM = jaild** (rank 1, the sole privileged broker): grew
     `Reap(jail, ReapSignal)` and `SetRctl(jail, memoryuse_mb)`, double-gated
     (jaild-created-only + `[resource_control]` policy). **DONE + verified:** a

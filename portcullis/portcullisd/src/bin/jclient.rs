@@ -60,7 +60,7 @@ fn main() -> ExitCode {
                 path:          rest[1].clone(),
                 children_max:  rest.get(2).and_then(|s| s.parse().ok()).unwrap_or(0),
                 mounts:        vec![],
-                devfs_ruleset: 0,
+                devfs_ruleset: devfs_ruleset_env(),
                 network:       NetworkConfig::Disable,
                 exec:          None,
             })
@@ -85,7 +85,7 @@ fn main() -> ExitCode {
                 path,
                 children_max:  0,
                 mounts:        vec![],
-                devfs_ruleset: 0,
+                devfs_ruleset: devfs_ruleset_env(),
                 network:       NetworkConfig::Disable,
                 exec: Some(ExecSpec {
                     path: bin,
@@ -170,4 +170,12 @@ fn unsafe_close(fd: i32) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `ATRIUM_JCLIENT_DEVFS=<id>` sets the request's devfs ruleset (default 0).
+/// For proving jaild's fail-closed check: an unloaded id must be refused with
+/// `devfs_ruleset.not_loaded`, a loaded one must mount a /dev that hides the
+/// host's.
+fn devfs_ruleset_env() -> u32 {
+    std::env::var("ATRIUM_JCLIENT_DEVFS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
 }

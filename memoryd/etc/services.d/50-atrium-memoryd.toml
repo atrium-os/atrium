@@ -18,8 +18,8 @@
 #   1. _memoryd system uid (e.g. `pw useradd _memoryd -u 50090 -d /nonexistent
 #      -s /usr/sbin/nologin`), and that uid in jaild.policy.toml
 #      [uid].allowed_system_uids.
-#   2. The governor devfs ruleset (etc/atrium-governor.devfs.rules -> /etc/devfs.rules,
-#      `service devfs restart`), and its id in jaild.policy.toml
+#   2. The governor devfs ruleset (etc/atrium.devfs.rules, installed and loaded at
+#      boot by scripts/bootstrap-atrium.sh), and its id in jaild.policy.toml
 #      [devfs_rulesets].allowed_ids.
 #   3. jaild.policy.toml mount_sources: a rw_pattern "/var/lib/atrium/jails/*" for
 #      the jail root, and ro_paths for the rootfs nullfs sources

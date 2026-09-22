@@ -19,8 +19,8 @@
 # 50-atrium-memoryd.toml:
 #   1. _memfed system uid (e.g. `pw useradd _memfed -u 50091 -d /nonexistent
 #      -s /usr/sbin/nologin`); 50091 is in jaild.policy's user-uid range.
-#   2. The governor devfs ruleset 20 (etc/atrium-governor.devfs.rules ->
-#      /etc/devfs.rules, `service devfs restart`) — grants /dev/pressure;
+#   2. The governor devfs ruleset 20 (etc/atrium.devfs.rules, installed and
+#      loaded at boot by scripts/bootstrap-atrium.sh) — grants /dev/pressure;
 #      already commissioned for memoryd, and id 20 is in jaild.policy
 #      [devfs_rulesets].allowed_ids.
 #   3. The portcullisd serve daemon running (for the runtime GovernSetRctl)

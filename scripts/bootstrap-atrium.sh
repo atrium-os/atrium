@@ -686,7 +686,13 @@ and set ATRIUM_VM_IMAGE_URL to the -ufs.qcow2.xz that is actually there."
 }
 
 ph_stage() {
-    rm -rf "$DIST"; mkdir -p "$DIST/bin" "$DIST/boot" "$DIST/kmod"
+    rm -rf "$DIST"; mkdir -p "$DIST/bin" "$DIST/boot" "$DIST/kmod" "$DIST/etc"
+    # The devfs rulesets every jail is mounted with. Without them loaded,
+    # jaild and portcullis refuse to create any jail (a devfs with an unloaded
+    # ruleset would show the jail the host's whole /dev) — so this is staged
+    # unconditionally, never as an optional extra.
+    cp "$REPO/etc/atrium.devfs.rules" "$DIST/etc/" \
+        || die "cannot stage etc/atrium.devfs.rules" "Every Atrium jail depends on it."
     k=$(cat "$STATE/kernel.path" 2>/dev/null)
     [ -n "$k" ] && [ -f "$k" ] && cp "$k" "$DIST/boot/kernel"
     cp "$REPO/atrium-tessera/kmod/tessera_fs.ko" "$DIST/kmod/" 2>/dev/null
@@ -760,6 +766,20 @@ if [ -f "$D/kmod/tessera_fs.ko" ]; then
     grep -q '^nullfs_load' /boot/loader.conf 2>/dev/null || echo 'nullfs_load="YES"' >> /boot/loader.conf
     echo "  installed tessera_fs.ko + ensured nullfs_load=YES"
 fi
+
+echo "== devfs rulesets =="
+# rc.d/devfs loads every file in devfs_rulesets at boot; `service devfs
+# restart` loads them now. jaild and portcullis refuse a jail whose ruleset has
+# no rules, so an Atrium jail cannot start until this has run.
+mkdir -p /usr/local/etc/atrium
+install -m 644 "$D/etc/atrium.devfs.rules" /usr/local/etc/atrium/devfs.rules
+sysrc -q devfs_rulesets="/etc/defaults/devfs.rules /etc/devfs.rules /usr/local/etc/atrium/devfs.rules" >/dev/null
+service devfs restart >/dev/null
+for id in 20 21 22; do
+    [ -n "$(devfs rule -s $id show 2>/dev/null)" ] \
+        || { echo "  FATAL: devfs ruleset $id did not load"; exit 1; }
+done
+echo "  loaded rulesets 20 21 22 (and on every boot via devfs_rulesets)"
 
 echo "== userspace =="
 mkdir -p /usr/local/bin

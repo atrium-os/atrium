@@ -1835,6 +1835,68 @@ which is where the verdict above was read.
 **Still open:** create-time mounts are never unmounted by `RemoveJail`; exec'd jails' state
 records accumulate with no dedup; and rctl rules set through `SetRctl` are never removed.
 
+### 9.1b Jails saw the host's entire /dev — unloaded devfs rulesets — FIXED
+
+**Found (2026-09-22), while scoping the move of the one-shot lane onto jaild.** Four devfs
+ruleset numbers were in use and **none of them was ever loaded into the kernel**:
+
+| ruleset | used by | defined where |
+|---|---|---|
+| 99 | every portcullis app launch and every one-shot worker | nowhere — "Phase 4 manages allocation" |
+| 100 | `atrium-session` user session jails | nowhere — "picked above 99" |
+| 20 | memoryd, memfed (via jaild) | a file saying "append this to /etc/devfs.rules by hand" |
+| 21 | frescod (via jaild) | the same, a second file |
+
+**A ruleset the kernel has not loaded does not fail the mount.** `devfs_ruleset_use` creates
+it *empty* and takes a reference, so the mount succeeds and hides nothing. Measured on the VM:
+a devfs mounted with ruleset 99 showed **64 host nodes** — `mem`, `kmem`, `bpf`, `pci`,
+`devctl`, `klog` and the raw disks — the same inside a real `jail(8)` with those parameters,
+and **a root process in that jail read the host's disk** (`dd if=/dev/vtbd2`, the scratch
+disk, read-only). Unprivileged workers were held back only by node permissions (disks are
+`root:operator 0640` — the group §9.1a's missing `setgroups` had been leaking).
+
+A second defect hid behind the first: **capability device grants were computed and never
+applied.** `audio`, `usb-hid`, `camera`, `graphics` record devfs unhide actions, and
+`render_devfs_rules` rendered them, and nothing ever loaded the result. Apps had their devices
+only because nothing was hidden at all.
+
+**Fixed, in three layers:**
+
+- **Fail closed at every mount site.** jaild (`devfs_ruleset.not_loaded`) and the four
+  `jail -c` paths in portcullis (`portcullis_mounts::ensure_devfs_isolation`: daemon launch,
+  CLI launch, one-shot, atrium-session) refuse a jail whose ruleset has **no rules** — not
+  "is not listed", because once any jail has mounted an unloaded number it *is* listed. They
+  also refuse `mount.devfs` with no ruleset or 0. Forgetting the rules file is now a jail that
+  does not start and says why, instead of a silent exposure.
+- **One rules file, installed and loaded.** `etc/atrium.devfs.rules` defines 20
+  (`atrium_governor`), 21 (`atrium_gpu`) and 22 (`atrium_app`: hide all, unhide the basics and
+  the pty/fd set). `scripts/bootstrap-atrium.sh` installs it, adds it to `devfs_rulesets` so
+  rc.d/devfs loads it on every boot, loads it immediately and checks all three loaded.
+  Apps and one-shots use 22 (`portcullis_jail::APP_DEVFS_RULESET`); session jails use
+  FreeBSD's standard 4 (`devfsrules_jail`), matching ostiarius.
+- **Capability grants applied per jail.** `build` emits `exec.prestart` =
+  `devfs -m <root>/dev rule apply <rule> && …` for each grant. `rule apply` changes one mount
+  without adding to any ruleset, so no per-app ruleset numbers are allocated; `prestart`
+  because jail(8) mounts devfs before it and creates the jail after it, so the grant is in
+  place before anything runs; `&&` so a grant that fails fails the launch.
+
+**Verified on the VM, both directions:**
+
+| check | before rules loaded | after |
+|---|---|---|
+| jaild CreateJail, ruleset 21 | refused `devfs_ruleset.not_loaded`, nothing left | created; `/dev` = 4 nodes; vtbd0/kmem/bpf hidden |
+| jaild CreateJail, ruleset 22 | — | created; 8 nodes; vtbd0/kmem/bpf hidden |
+| `portcullis exec` one-shot | refused with the reason; 0 mounts, 0 dirs left | live worker's `/dev`: `fd null random stderr stdin stdout urandom zero` |
+| Navigator corpus E2E | refused | 98 sessions / 259 navs / 259 rewinds / 0 failures, 59.2 s (was 59.3 s) |
+| per-mount grant | — | `rule apply path 'bpf*' unhide` on a ruleset-22 mount reveals bpf there only; ruleset 22 still 3 rules |
+
+**A teardown leak the refusal exposed.** The first refused run left the read-only tree and the
+tmpfs upper layer mounted. `portcullis_mounts::parse_mounts` de-duplicated mount *paths*, but a
+one-shot root is two mounts at one path (the tree and the union over it); a pass that removed
+the union therefore counted as no progress and `converge` stopped. The normal exit path
+happened to avoid it, so no earlier failure had ever exercised it. Layers are now counted
+individually, and the one-shot teardown removes the (empty) jail root on every exit.
+
 ### 9.2 Out of scope
 
 - **App-as-trojan.** A user-granted app can use its capabilities

@@ -204,7 +204,7 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         host_sockets: PathBuf::from("/atrium/sockets"),
         user_home: PathBuf::from(&user_home),
         user_name: spec.user_name.clone(),
-        devfs_ruleset: 99,
+        devfs_ruleset: portcullis_jail::APP_DEVFS_RULESET,
         instance: instance.clone(),
         // ★ A unit of work, so the jail dies with its processes — see
         // BuildOpts::persist. This is what stops a killed launcher from
@@ -264,6 +264,13 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
     if let Err(e) = portcullis_mounts::ensure_mountpoints(&jc) {
         teardown(&jail_path, &jail_name);
         return OneShot::Failed(e);
+    }
+    // ★★★ Refuse a devfs that would hide nothing — see ensure_devfs_isolation.
+    // A Refusal, not a Failure: the machine is misconfigured in a way that
+    // makes running this jail unsafe, and retrying will not change that.
+    if let Err(e) = portcullis_mounts::ensure_devfs_isolation(&jc) {
+        teardown(&jail_path, &jail_name);
+        return OneShot::Refused(e);
     }
 
     for dir in ["dev", user_home.trim_start_matches('/')] {
@@ -336,7 +343,6 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
 
     let _ = std::fs::remove_file(&conf_path);
     teardown(&jail_path, &jail_name);
-    let _ = std::fs::remove_dir(&jail_path);
     outcome
 }
 
@@ -436,5 +442,10 @@ fn teardown(jail_path: &Path, jail_name: &str) {
         &[jail_path, upper.as_path()], portcullis_mounts::Force::Yes);
     portcullis_mounts::warn_survivors("portcullis", &left);
     let _ = std::fs::remove_dir(&upper);
+    // ★ The root too, on EVERY exit — only the normal path used to remove it,
+    // so each refused or failed run left an empty directory behind.
+    // `remove_dir` removes only an empty directory, so a root that still has a
+    // mount (or anything else) in it is left for the warning above to explain.
+    let _ = std::fs::remove_dir(jail_path);
 }
 

@@ -116,7 +116,7 @@ pub fn launch_with_stdio(
         host_sockets: PathBuf::from("/atrium/sockets"),
         user_home:    user_home.clone(),
         user_name:    run_as_user.clone(),
-        devfs_ruleset: 99,
+        devfs_ruleset: portcullis_jail::APP_DEVFS_RULESET,
         /* Named launches stay single-instance: this path owns
          * /var/lib/atrium/jails/<id> and one persistent overlay, so a second
          * concurrent jail here would share both. Concurrency belongs to the
@@ -316,6 +316,9 @@ fn run_one_jail(
     jail_path: &Path,
     stdio:     Option<[OwnedFd; 3]>,
 ) -> Result<Option<i32>, LaunchError> {
+    /* ★★★ Refuse a devfs that would hide nothing — see ensure_devfs_isolation. */
+    portcullis_mounts::ensure_devfs_isolation(jc)
+        .map_err(|e| LaunchError::Failed("devfs", e))?;
     let conf_path = std::env::temp_dir().join(format!(
         "portcullisd-{}-{}.conf", std::process::id(), jc.name));
     if let Err(e) = fs::write(&conf_path, jc.render_jail_conf()) {
