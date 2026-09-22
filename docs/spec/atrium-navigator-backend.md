@@ -543,6 +543,64 @@ worker that is jailed precisely because it may be compromised.
 **The harness itself is verified**: a panic planted in `ingest` is caught at round 11 and the
 input printed, so a finding becomes a regression test rather than a rerun.
 
+### 4.7c Measured: what one jail per document costs (M3, open question 1)
+
+§10 q1 made one-jail-per-document conditional on launch being cheap. It is measured now, not
+assumed. `jailed_corpus` reports per-request distributions; the harness is
+`scripts/navigator-launch-cost.sh` (guest, root). The whole corpus goes through three arms,
+**interleaved** A B C × 3 so drift lands on every arm equally:
+
+- **A**: unconfined worker processes (the baseline: spawn + parse, no jail);
+- **B**: the jaild one-shot lane called directly by root;
+- **C**: the same lane through portcullisd, with the broker as uid 1001.
+
+Each arm counts jids before and after, so it proves its own shape: **0 jails in A, 98 in B
+and C, every run**. Release builds throughout (a debug build's open is 73 ms at p50 against
+28 ms, so debug numbers answer a different question). FreeBSD 16.0-CURRENT aarch64 under
+HVF, 4 vCPU, Laminar, Tessera root.
+
+| ms, p50 / p90 / mean | open | navigate | close |
+|---|---|---|---|
+| A unconfined | 3.7 / 23.8 / 8.7 | 6.8 / 13.2 / 6.7 | 1.0 / 3.3 / 1.9 |
+| B jaild lane, direct | 28.2 / 51.1 / 33.9 | 6.7 / 12.9 / 6.6 | 24.7 / 33.7 / 28.4 |
+| C jaild lane via portcullisd | 28.6 / 49.2 / 34.0 | 7.0 / 13.1 / 6.8 | 24.0 / 33.0 / 27.7 |
+
+(Averages of the three runs' per-run statistics, final binaries.)
+
+**Answer: a jail costs ~25 ms to open and ~26 ms to close, per document; keep the default.**
+Navigation is unaffected: a pipe round trip adds nothing measurable. The daemon hop is noise
+(B ≈ C). Only open is on a reader's path, and 25 ms sits beside a page fetch that is
+typically hundreds of milliseconds. The per-site jail-reuse fallback is **not needed** and
+is not built. Two caveats bound the claim. It is a VM number and a first measurement, not a
+floor. And the p99 open (~80 ms, with rare outliers near 200 ms) has not been decomposed; a
+p99 that grows with concurrent sessions would reopen the question.
+
+**Found by the measurement, fixed:**
+
+1. **Navigation cost the worker 16 ms p50 (30 ms p90) per step**, in every arm and
+   in-process too. The broker's transport was not the cause. The cause was `apply`, which
+   built the entire document as a string after every transition *only to take its length*
+   for the profile's byte ceiling. That was 64% of an apply; the whole-tree clone is the
+   next 19%. Fixed:
+   - `Dom::serialized_len()` runs the real serializer into a counting sink, so the count is
+     the same code path, not a second serializer to keep in agreement.
+   - Escaping is single-pass with no allocation. The four chained `replace`s built four
+     strings per text node.
+
+   Result: 6.8 ms p50 (2.4×), and the corpus completes in 4.4 s against 10.5 s. Every
+   serialized state of the corpus (616 documents: base, each applied transition, each
+   rewind) is **byte-identical** to the old serializer, and the diff was positive-controlled
+   with a planted byte.
+2. **Every close stalled the broker ≥ 20 ms.** Retirement slept a fixed 20 ms before its
+   first check on the worker, and the broker is single-threaded, so each close blocked
+   every session. Now a backoff from 1 ms, capped at 5 ms. Unconfined close: 20.0 → 1.0 ms
+   p50. Jailed close falls to its real teardown time (~24 ms). Teardown still runs
+   synchronously in the broker; moving it off the request path is the remaining step.
+3. **The direct lane gave a non-root caller the wrong reason.** It failed with
+   `host identity: Permission denied`, reading the root-only identity secret, before it
+   reached anything that said "this lane needs root". It now refuses first, and names
+   `--daemon`.
+
 ### 4.5 Recording format version 2
 
 `atrium-navigator-recording/2` adds one field: an insert's `index`, the position the markup
@@ -689,10 +747,9 @@ and trust) · RCTL/memoryd (resource bounds) · Laminar (scheduling, energy attr
 
 ## 10. Open questions
 
-1. **Per-document jail launch cost.** The one-jail-per-document default is only viable
-   if launch is cheap. M3 measures it; if it is not, the fallback is jail reuse *within*
-   a top-level site, which weakens the isolation story and must be argued explicitly
-   rather than slid into.
+1. ~~**Per-document jail launch cost.**~~ **ANSWERED (§4.7c): ~25 ms to open, ~26 ms to
+   close, per document; navigation unaffected. The one-jail-per-document default stands,
+   and per-site jail reuse is not built.** Reopen if p99 open grows with concurrency.
 2. **Web fonts.** Excluded from Profile v1; they are both a layout-fidelity requirement
    and a fingerprinting/ingest surface, and deserve their own argument.
 3. **Where HTTP freshness lives.** Content addressing gives integrity and offline but

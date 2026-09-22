@@ -132,3 +132,25 @@ fn grafting_preserves_foreign_content() {
     assert_eq!(host.attr(g, "preserveAspectRatio"), Some("none"));
     assert!(host.serialize().contains(r#"viewBox="0 0 4 4""#), "{}", host.serialize());
 }
+
+/// ★ `serialized_len` is what the profile's byte ceiling is checked against
+/// after every applied transition, so it must be the length of what
+/// `serialize` would produce — never an estimate. Every branch that writes
+/// differently is covered: escaped text and attributes (all four entities),
+/// raw text left alone, void elements, comments dropped, multibyte text.
+#[test]
+fn serialized_len_is_exactly_the_serialized_length() {
+    for html in [
+        "",
+        "<p>plain</p>",
+        r#"<p title="a&b<c>d&quot;e">x &amp; y &lt; z &gt; w "q"</p>"#,
+        "<script>if (a < b && c > d) { s = \"&amp;\" }</script>",
+        "<style>a > b { content: \"&\" }</style><noscript><iframe></noscript>",
+        "<br><img src=x alt='<>'><input value=\"&\">",
+        "<!-- gone --><div>é — 日本 &nbsp;</div>",
+        "<textarea>&lt;kept escaped&gt;</textarea><title>a & b</title>",
+    ] {
+        let d = navigator_dom::parse(html);
+        assert_eq!(d.serialized_len(), d.serialize().len(), "{html:?}");
+    }
+}

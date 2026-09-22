@@ -158,13 +158,12 @@ impl Document {
         // not subsume it: 64 effects of 64 KiB each is 4 MiB of growth, and
         // the document ceiling is 8 MiB.
         //
-        // This serializes the whole tree to measure its bytes, which is the
-        // expensive part of applying a transition — replaying all 264 of the
-        // corpus's anchored transitions takes tens of seconds, dominated by
-        // this and by the clone above. Both are stated rather than optimised
-        // because neither is on a reader's path yet; when one is, the number
-        // to beat is measured rather than guessed.
-        let v = profile::check(&next.dom, next.dom.serialize().len());
+        // The byte count comes from `serialized_len`, which runs the real
+        // serializer into a counter. It used to build the whole document to
+        // take its length: that was 64% of an apply, and an apply IS a
+        // navigation in the worker — 16 ms p50 per step on the VM, on the
+        // reader's path. The clone above is the next cost (19%).
+        let v = profile::check(&next.dom, next.dom.serialized_len());
         if !v.is_empty() { return Err(ApplyError::OutsideProfile(v)) }
         let inverse = Transition {
             trigger: t.trigger.clone(), event: t.event.clone(),

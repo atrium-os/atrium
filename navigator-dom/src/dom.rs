@@ -508,11 +508,31 @@ impl Dom {
 
     pub fn serialize(&self) -> String {
         let mut s = String::new();
-        for &c in &self.nodes[self.root() as usize].children { self.ser(c, &mut s); }
+        self.ser_root(&mut s);
         s
     }
+
+    /// `serialize().len()`, without building the string.
+    ///
+    /// ★ THE SAME CODE, NOT A SECOND IMPLEMENTATION. The profile ceiling on
+    /// document bytes is checked after every applied transition, and building
+    /// a whole document to take its length was most of what a navigation cost
+    /// (64% of an apply, measured over the corpus). A separate counting walk
+    /// would be one more serializer to keep in agreement with this one — the
+    /// failure `serialize` has already had twice — so the count runs through
+    /// `ser_in` itself, into a sink that keeps only the total.
+    pub fn serialized_len(&self) -> usize {
+        let mut n = Count(0);
+        self.ser_root(&mut n);
+        n.0
+    }
+
     fn ser(&self, h: Handle, s: &mut String) {
         self.ser_in(h, s, false)
+    }
+
+    fn ser_root(&self, s: &mut impl Sink) {
+        for &c in &self.nodes[self.root() as usize].children { self.ser_in(c, s, false); }
     }
 
     /// ★★ RAW-TEXT ELEMENTS MUST NOT BE ESCAPED, and getting this wrong is
@@ -526,7 +546,7 @@ impl Dom {
     ///
     /// Found by building the consumer: the converter alone never re-read its
     /// own output, so nothing could notice.
-    fn ser_in(&self, h: Handle, s: &mut String, raw: bool) {
+    fn ser_in(&self, h: Handle, s: &mut impl Sink, raw: bool) {
         const VOID: &[&str] = &["area","base","br","col","embed","hr","img","input","link","meta","source","track","wbr"];
         // `noscript` belongs here because we parse — and the converter runs —
         // with scripting ENABLED, and the spec makes noscript raw text in that
@@ -538,29 +558,48 @@ impl Dom {
         const RAW_TEXT: &[&str] =
             &["script", "style", "xmp", "iframe", "noembed", "noframes", "noscript"];
         match &self.nodes[h as usize].kind {
-            Kind::Text(t) if raw => s.push_str(t),
-            Kind::Text(t) => s.push_str(&escape(t)),
+            Kind::Text(t) if raw => s.put(t),
+            Kind::Text(t) => escape_into(t, s),
             Kind::Comment(_) => {}
             Kind::Document | Kind::Fragment => {
                 for &c in &self.nodes[h as usize].children { self.ser_in(c, s, false); }
             }
             Kind::Element(tag) => {
-                s.push('<'); s.push_str(tag);
+                s.put("<"); s.put(tag);
                 for (k, v) in &self.nodes[h as usize].attrs {
-                    s.push(' '); s.push_str(k); s.push_str("=\""); s.push_str(&escape(v)); s.push('"');
+                    s.put(" "); s.put(k); s.put("=\""); escape_into(v, s); s.put("\"");
                 }
-                s.push('>');
+                s.put(">");
                 if VOID.contains(&tag.as_str()) { return; }
-                let child_raw = RAW_TEXT.contains(&tag.to_ascii_lowercase().as_str());
+                let child_raw = RAW_TEXT.iter().any(|r| r.eq_ignore_ascii_case(tag));
                 for &c in &self.nodes[h as usize].children { self.ser_in(c, s, child_raw); }
-                s.push_str("</"); s.push_str(tag); s.push('>');
+                s.put("</"); s.put(tag); s.put(">");
             }
         }
     }
 }
 
-fn escape(t: &str) -> String {
-    t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+/// Where serialized bytes go: a `String` to keep them, a `Count` to measure.
+trait Sink { fn put(&mut self, s: &str); }
+impl Sink for String { fn put(&mut self, s: &str) { self.push_str(s) } }
+struct Count(usize);
+impl Sink for Count { fn put(&mut self, s: &str) { self.0 += s.len() } }
+
+/// `&`, `<`, `>` and `"` as entities, in one pass and without allocating —
+/// the four chained `replace` calls this replaces built four strings per text
+/// node and attribute value. Unescaped runs are written whole.
+fn escape_into(t: &str, s: &mut impl Sink) {
+    let mut from = 0;
+    for (i, b) in t.bytes().enumerate() {
+        let rep = match b {
+            b'&' => "&amp;", b'<' => "&lt;", b'>' => "&gt;", b'"' => "&quot;",
+            _ => continue,
+        };
+        s.put(&t[from..i]);
+        s.put(rep);
+        from = i + 1;
+    }
+    s.put(&t[from..]);
 }
 
 /// Inline scripts in document order.

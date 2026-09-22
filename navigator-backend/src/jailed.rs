@@ -207,11 +207,20 @@ impl JailedHost {
         let Some(mut w) = self.workers.remove(&id) else { return false };
         drop(w.stdin.take());
         let grace = std::time::Instant::now();
+        // ★ Backoff from 1 ms, not a fixed 20. The broker is single-threaded,
+        // so this wait stalls every other session; a fixed first sleep made
+        // EVERY close cost at least 20 ms (measured: unconfined close p50 =
+        // 20.0 ms, a worker that had exited within the first millisecond;
+        // 1.0 ms after).
+        let mut nap = Duration::from_millis(1);
         loop {
             match w.child.try_wait() {
                 Ok(Some(_)) => return true,
                 Ok(None) if grace.elapsed() < self.config.shutdown_grace => {
-                    std::thread::sleep(Duration::from_millis(20));
+                    std::thread::sleep(nap);
+                    // Capped low: a jailed teardown takes ~25-30 ms, and a
+                    // doubling that ran on to 16 ms added up to 15 ms to it.
+                    nap = (nap * 2).min(Duration::from_millis(5));
                 }
                 _ => break,
             }
