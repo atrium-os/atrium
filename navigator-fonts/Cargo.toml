@@ -1,0 +1,26 @@
+[package]
+name = "navigator-fonts"
+version = "0.1.0"
+edition = "2021"
+description = "The producer's web-font step: any fetched font -> one canonical, pinned, unhinted, sanitized sfnt with a content address (Document Profile v1, web fonts)."
+
+[dependencies]
+# ★ default-features OFF: the default pulls C zlib (libz-sys) into the decoder
+# of hostile input. flate2_rust is miniz_oxide — memory-safe, and no C build in
+# the FreeBSD cross-compile.
+allsorts = { version = "0.17", default-features = false, features = ["flate2_rust"] }
+ttf-parser = "0.25"
+brotli-decompressor = "5"
+miniz_oxide = "0.8"
+# `pure`: no C/assembly — nothing for the FreeBSD cross-build to compile with cc.
+blake3 = { version = "1", features = ["pure"] }
+# Forces the scalar backend; see vendor/pathfinder_simd/src/lib.rs (ATRIUM PATCH).
+pathfinder_simd = { version = "0.5.6", features = ["pf-no-simd"] }
+
+[dev-dependencies]
+brotli = "8"
+miniz_oxide = "0.8"
+allsorts = { version = "0.17", default-features = false, features = ["flate2_rust"] }
+
+[patch.crates-io]
+pathfinder_simd = { path = "vendor/pathfinder_simd" }

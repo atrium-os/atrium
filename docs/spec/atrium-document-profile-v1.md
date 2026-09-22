@@ -440,6 +440,33 @@ occur.
    - the largest decoded font is 6.17 MiB, so condition 4's 8 MiB holds for the canonical
      form too.
 
+   **BUILT: `navigator-fonts`** (`canonicalize(bytes, declared) -> Canonical | Refusal`).
+   The pipeline is preflight → decode → pin → sanitize → re-validate → `blake3:` address.
+
+   Verified over the 185 corpus fonts, on the host and in the VM (FreeBSD, Laminar,
+   `panic = abort`): **176 canonical, 0 failures, 9 EOT refused.** "Verified" means checks
+   the step itself does not use:
+   - deterministic on a second run;
+   - every mapped code point keeps its glyph;
+   - all 303,388 glyph outlines of the 156 static fonts are identical to the source's;
+   - **0 instruction bytes remain**, counted by a separate `glyf` walker that finds
+     3.0 MB of instructions in the sources. That is the positive control: the walker is
+     not reading nothing.
+
+   The same face served as TTF, WOFF and WOFF2 gets **one address**, which is the point
+   of the canonical form. Two things found in the decoder, both handled in this crate:
+   - **Decompression bombs.** `allsorts` inflates WOFF2's Brotli block and WOFF's zlib
+     tables unbounded, trusting nothing in the header. A preflight inflates both through a
+     hard 8 MiB limit first; a 64 MiB bomb, a few KB on the wire, is refused before the
+     decoder runs.
+   - **`allsorts`' glyf writer does not compact coordinates.** Re-encoding doubled the
+     corpus and pushed ten CJK fonts past 8 MiB. Instructions are therefore removed at the
+     byte level: each glyph is parsed as a check, then emitted as its original encoding
+     minus the instruction block, so the output can only shrink.
+
+   Not yet wired: the converter does not fetch stylesheets or fonts, so nothing calls
+   this yet.
+
 2a. **No hinting for web fonts.** TrueType hinting is a virtual machine executing programs
    the font supplies (`fpgm`, `prep`, glyph instructions). **85% of the corpus's web fonts
    (149/176) carry such programs.** That is the most dangerous code path a hostile font
