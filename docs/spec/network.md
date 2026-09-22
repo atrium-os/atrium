@@ -125,6 +125,22 @@ return, no stacked mounts, no warnings, no epairs or slots left.
 **Not exercised:** the daemon's `launch` path (shares the functions; this VM runs no
 user-facing portcullisd socket).
 
+**★★★ A KERNEL LIVELOCK this exposed — Laminar priority inheritance was a no-op (FIXED,
+atrium-os cb93bfeffce1).** Per-app vnets mean every jail exit destroys a vnet, and
+`vnet_destroy → if_detach → epoch_wait_preempt` depends on the scheduler running the
+priority-lent lock holder that blocks the net epoch. Laminar's `sched_priority` never re-queued a
+QUEUED thread ("re-insert … added in commit A.3d", never landed), so a lent holder stayed in the
+vruntime array behind the waiter. ddb showed `sshd-session` RUNQ at priority 1 on CPU 1, the rx
+ithread blocked on its `tcpinp` lock inside the epoch, the waiter re-picked every yield, three
+CPUs idle: all incoming traffic stopped (it is how ssh to the VM died). Reproducer: guest→host TCP
+stream + 300 vnet jails created/destroyed — Laminar livelocked in 5 s (×2), ULE finished in ~25 s,
+Laminar with the stream alone was fine. Fixed by re-queuing on a priority change (with a
+`kern.sched.prio_requeues` counter): 3/3 reproducer runs complete, counter 6→406, corpus E2E
+passes including the refusal stage the livelock had killed.
+
+**Correction:** commit 28bc210a's message quotes "E2E 98/259/259/0", but that harness run had
+FAILED at its refusals stage (the livelock above cut ssh); only the corpus stage had passed.
+
 **Still open:** the one-shot `loopback` capability (refused on that lane), and step 5
 (atrium-netd per-app anchors).
 
