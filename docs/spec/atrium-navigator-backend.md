@@ -889,8 +889,60 @@ here was wrong. **Since built** (portcullis.md §7.1): with
 `portcullis policy grant --system org.atrium.navigator.fetcher`, the daemon lane launches
 the fetcher unattended as uid 1001, and the gate passes inside the jail.
 
+**The converter fetches through it (same day).** `PRERENDER_FETCHD="<cmd…>"` routes
+every fetch of a conversion through one `navigator-fetchd`: script loading and the page's
+own same-origin network, which share one process. Typically the command is
+`portcullis exec --daemon --instance conv-{instance} org.atrium.navigator.fetcher`, so each
+conversion gets its own jailed fetcher, launched unattended under the system grant
+(portcullis.md §7.1). The client (`FetchdFetcher`) treats the reply as untrusted input:
+- the header line is bounded, and a stated body over 8 MiB is refused unread;
+- a lying length marks the fetcher broken rather than desyncing the stream;
+- a URL with a line break is refused **before sending**, since the protocol is one
+  request per line and the page would otherwise choose a second request;
+- non-2xx is a failure, as with the instrument's `curl -f`;
+- shutdown is bounded: end-of-input, a 5 s grace for the launcher's jail teardown,
+  then kill.
+
+**Measured in the VM, all 104 documents of corpus 1, as uid 1001:**
+
+| arm | external scripts |
+|---|---|
+| direct `curl` (control) | referenced 469, fetched **467**, failed 2 |
+| through `navigator-fetchd` | referenced 528, fetched **526**, failed 2 |
+
+The fetcher arm used 103 unattended launches under the system grant, with at most 3
+fetcher jails at once. Referenced counts differ because module import graphs are
+discovered live, so each arm walks what the network served at that minute.
+
+**Getting that run clean found three bugs:**
+1. **Harness, and the lesson again.** The first full run had `/tmp` (a 20 MB tmpfs) fill
+   up mid-copy, taking `manifest.tsv` with it, so every number was wrong. And an ad-hoc
+   harness checked jails, epairs and anchors but **not mounts**, which the committed E2E
+   checks; the leak below had been present in earlier runs that reported clean.
+2. **A daemon stopped mid-teardown leaks its one-shot instances, forever.** Teardown
+   removes the jail, then unmounts the instance root. The harness stopped portcullisd as
+   soon as the converter returned, and six instances were caught in between: roots with
+   nullfs + tmpfs + unionfs mounts, three with process-less jails and routed nets. Because
+   instance tags are unique (a pid), the reclaim-on-reuse path never met them. **Fix:**
+   `portcullis_oneshot::reclaim_abandoned`, run at portcullisd start (after the bind),
+   tears down `app-…--…` instance roots whose jail is gone or empty and which are older
+   than 60 s. The age guard is for the direct lane, which builds roots outside the
+   daemon.
+3. **jaild kept records of vanished jails.** Its startup reconcile freed a vanished routed
+   jail's `/30` but kept the jail record, so the state file grew by one record per such
+   jail. **Fix:** the same reconcile drops records whose name no longer resolves to the
+   same jid.
+
+**Verified:**
+- stopping the daemon at once reproduces the leak (1 root, 3 mounts); after 60 s, a
+  restarted portcullisd reports "reclaimed abandoned one-shot instance" and the machine
+  is at zero;
+- the redeployed jaild pruned the three real stale records;
+- **control:** the same batch with the daemon stopped 15 s later leaks nothing, so the
+  leak is the interrupted teardown, not the conversions;
+- the corpus E2E is unchanged (98 documents, no leaks).
+
 **Not yet:**
-- the converter's `Fetcher` seam implemented against `navigator-fetchd`;
 - a per-host request count for the report (legacy-web §5.4.1d, rule 4).
 
 Cross-building `ring` needs a C compiler for the target: Homebrew clang with

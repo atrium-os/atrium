@@ -115,6 +115,22 @@ pub fn serve(
         if state.routed_nets.len() != before {
             if let Err(e) = state.save(state_path) { warn!("jaild: state save after net reconcile: {e}"); }
         }
+
+        /* ★ And the JAIL records of jails that no longer exist. The net
+         * reconcile above freed the /30 of a vanished routed jail but left its
+         * record, so every jail a stopped caller never RemoveJail'd stayed in
+         * the state file forever (measured: three one-shot fetcher jails whose
+         * portcullisd was stopped mid-teardown). Matched by name AND jid — a
+         * name alone could be a new jail that reuses it. */
+        let before = state.jails.len();
+        state.jails.retain(|j| {
+            let live = ffi::jail_id_by_name(&j.name).is_some_and(|jid| jid == j.jid);
+            if !live { info!("jaild: reconcile dropped record of vanished jail {} (jid {})", j.name, j.jid) }
+            live
+        });
+        if state.jails.len() != before {
+            if let Err(e) = state.save(state_path) { warn!("jaild: state save after jail reconcile: {e}"); }
+        }
     }
 
     let mut mux: Mux<LengthPrefixed> = Mux::new(listener.try_clone()?)?;

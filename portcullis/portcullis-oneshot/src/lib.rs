@@ -572,6 +572,41 @@ fn jaild_remove(name: &str) {
     }
 }
 
+/// ★★ RECLAIM WHAT A STOPPED DAEMON LEFT BEHIND.
+///
+/// A one-shot jail is torn down by whoever launched it: jail removed, then
+/// its mounts. Stop that process in between — portcullisd stopped, or
+/// crashed, mid-teardown — and the wreckage stays: instance-root mounts
+/// (nullfs + tmpfs + unionfs), sometimes a process-less jail. Instance tags
+/// are usually unique (a pid), so the reclaim-on-reuse path in `run` never
+/// meets them again. Measured: six such roots after runs whose harness
+/// stopped portcullisd as soon as the last conversion returned.
+///
+/// Swept at daemon start. An instance root (`app-…--…` under the jails
+/// directory) is wreckage when its jail is gone or holds no process AND it is
+/// older than `min_age` — the age guard is for the direct lane, which builds
+/// roots outside the daemon and may be mid-launch right now. Returns what was
+/// reclaimed.
+pub fn reclaim_abandoned(min_age: std::time::Duration) -> Vec<String> {
+    let mut reclaimed = vec![];
+    let Ok(rd) = std::fs::read_dir(JAILS_DIR) else { return reclaimed };
+    let now = std::time::SystemTime::now();
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("app-") && name.contains("--")) { continue }
+        let old_enough = e.metadata().and_then(|m| m.modified()).ok()
+            .and_then(|t| now.duration_since(t).ok()).is_some_and(|age| age >= min_age);
+        if !old_enough { continue }
+        if let Some(jid) = running_jid(&name) {
+            if jailed_process_count(jid) > 0 { continue }
+        }
+        teardown(&e.path(), &name);
+        jaild_remove(&name);
+        reclaimed.push(name);
+    }
+    reclaimed
+}
+
 /// The jid of a live jail with this name, if any. `jls` is the kernel's own
 /// answer; tracking liveness in a file would be a second source of truth that
 /// a killed process could leave wrong.

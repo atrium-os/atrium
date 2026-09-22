@@ -112,6 +112,12 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // ★ Reclaim one-shot instances a previous daemon was stopped in the
+    // middle of tearing down (portcullis_oneshot::reclaim_abandoned). Only
+    // after the bind: a daemon that cannot start must not sweep.
+    for name in portcullis_oneshot::reclaim_abandoned(std::time::Duration::from_secs(60)) {
+        eprintln!("portcullisd: reclaimed abandoned one-shot instance {name}");
+    }
     /* World-connectable: any user on the host can connect. Per-user
      * authorization happens inside the daemon via getpeereid + per-
      * tenant policy lookup; the socket itself is just a rendezvous
