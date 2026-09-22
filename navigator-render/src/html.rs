@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 /// so a property the layout ignores can never be dropped silently (§5.1).
 /// Value-level gaps inside a read row (flex as block, italic without an
 /// italic face, …) are counted where they occur.
-pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 17, 18, 19, 20, 21, 22, 23, 24, 25, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 55, 57, 59, 60, 63, 64];
+pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 17, 18, 19, 20, 21, 22, 23, 24, 25, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 55, 57, 59, 60, 63, 64];
 
 pub struct HtmlOut {
     pub scene: Scene,
@@ -252,7 +252,13 @@ impl<'a> Cx<'a> {
             let v = match vpct("max-height") { Some(mx) if !matches!(s.get("max-height"), V::Kw(_)) => v.min(mx), _ => v };
             match vpct("min-height") { Some(mn) if !matches!(s.get("min-height"), V::Kw(_)) => v.max(mn), _ => v }
         };
-        let definite = force.1.or_else(|| match s.get("height") { V::Kw(_) => None, V::Pct(_) => cb_h.and_then(|b| len(s.get("height"), b)), v => len(v, 0) }.map(clamp));
+        let definite = force.1.or_else(|| match s.get("height") { V::Kw(_) => None, V::Pct(_) => cb_h.and_then(|b| len(s.get("height"), b)), v => len(v, 0) }.map(clamp))
+            // aspect-ratio: with a definite width and an auto height, the
+            // height follows the ratio (CSS Sizing 4).
+            .or_else(|| match s.get("aspect-ratio") {
+                V::Num(r) if *r > 0.0 => Some(clamp(u(w as f64 / PX as f64 / r))),
+                _ => None,
+            });
         let child_cb_h = definite.map(|d| (d - pt - pb - bt - bb).max(0));
         // ★ List markers belong to `li` (the profile admits list-style-* but not
         // display: list-item): typed by the inherited list-style-type,
@@ -308,8 +314,19 @@ impl<'a> Cx<'a> {
         // visibility: hidden, which keeps the box and paints none of it.
         let hidden = kw(s, "visibility") == "hidden";
         let mut paint = vec![];
+        // ★ border-radius: four corners, then CSS's overlap clamp — if two
+        // radii on a side exceed it, ALL radii scale by the same factor.
+        let mut radii = [0 as U; 4];
+        for (i, p) in ["border-top-left-radius", "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius"].iter().enumerate() {
+            radii[i] = len(s.get(p), w).unwrap_or(0).max(0);
+        }
+        if radii != [0; 4] {
+            let pairs = [(radii[0] + radii[1], w), (radii[3] + radii[2], w), (radii[0] + radii[3], hgt), (radii[1] + radii[2], hgt)];
+            let f = pairs.iter().filter(|(sum, _)| *sum > 0).map(|(sum, side)| (*side as f64 / *sum as f64).min(1.0)).fold(1.0f64, f64::min);
+            if f < 1.0 { for r in &mut radii { *r = (*r as f64 * f) as U } }
+        }
         let bg = color_of(s, "background-color");
-        if bg & 0xff != 0 { paint.push(Rect { x: bx, y: by, w, h: hgt, rgba: bg, radius: 0 }) }
+        if bg & 0xff != 0 { paint.push(Rect { x: bx, y: by, w, h: hgt, rgba: bg, radii, ring: 0 }) }
         if !matches!(s.get("background-image"), V::Kw("none")) { self.count("background-image (not painted)") }
         // (side width, x, y, length, horizontal?, style, colour)
         for (t, sx, sy, length, horiz, style_p, color_p) in [
@@ -320,6 +337,20 @@ impl<'a> Cx<'a> {
         ] {
             if t <= 0 || length <= 0 { continue }
             paint.extend(edge(t, sx, sy, length, horiz, kw(s, style_p), color_of(s, color_p)));
+        }
+        // A rounded box with a UNIFORM border is one ring node; a rounded box
+        // with sides that differ cannot be, so its corners stay square and
+        // that is counted rather than drawn wrong.
+        if radii != [0; 4] && bt > 0 {
+            let uniform = [br, bb, bl].iter().all(|x| *x == bt)
+                && ["border-top-style", "border-right-style", "border-bottom-style", "border-left-style"].iter().all(|p| kw(s, p) == "solid")
+                && ["border-top-color", "border-right-color", "border-bottom-color", "border-left-color"].windows(2).all(|w| color_of(s, w[0]) == color_of(s, w[1]));
+            if uniform {
+                paint.retain(|r| r.ring != 0 || r.radii != [0; 4]);
+                paint.push(Rect { x: bx, y: by, w, h: hgt, rgba: color_of(s, "border-top-color"), radii, ring: bt });
+            } else {
+                self.count("border-radius with sides that differ (corners squared)");
+            }
         }
         if hidden { paint.clear() }
         // Outline: outside the border box, never affecting layout, painted
@@ -973,7 +1004,7 @@ impl<'a> Cx<'a> {
                 }
             }
             if let Some((j, x0, x1)) = link_span.take() { self.scene.link(Link { x: x0, y: yy, w: x1 - x0, h: lh, href: self.links[j].clone() }) }
-            for (c, yline, x0, x1, t) in deco { self.scene.rect(Rect { x: x0, y: yline, w: x1 - x0, h: t, rgba: c, radius: 0 }) }
+            for (c, yline, x0, x1, t) in deco { self.scene.rect(Rect { x: x0, y: yline, w: x1 - x0, h: t, rgba: c, radii: [0; 4], ring: 0 }) }
             yy += lh;
         }
         yy - y
@@ -1162,8 +1193,9 @@ mod tests {
 /// 2t gaps, or round dots t across with t gaps — starting at the side's
 /// origin and clipped at its end (one stated rule, no fitting).
 fn edge(t: U, sx: U, sy: U, length: U, horiz: bool, style: &str, rgba: u32) -> Vec<Rect> {
-    let seg = |at: U, n: U, radius: U| if horiz { Rect { x: sx + at, y: sy, w: n, h: t, rgba, radius } }
-                                      else { Rect { x: sx, y: sy + at, w: t, h: n, rgba, radius } };
+    let seg = |at: U, n: U, radius: U| { let radii = [radius; 4];
+        if horiz { Rect { x: sx + at, y: sy, w: n, h: t, rgba, radii, ring: 0 } }
+        else { Rect { x: sx, y: sy + at, w: t, h: n, rgba, radii, ring: 0 } } };
     match style {
         "dashed" | "dotted" => {
             let (on, off, r) = if style == "dashed" { (3 * t, 2 * t, 0) } else { (t, t, t / 2) };

@@ -980,7 +980,7 @@ layout.
 
 ### 8.3 M2 progress — the number, first reading (2026-09-22)
 
-**CONFORMANCE: exercised 44/64, matched 40/64** (13 on first reading; see the updates
+**CONFORMANCE: exercised 46/64, matched 42/64** (13 on first reading; see the updates
 below). Printed by `nsg-conformance`; the
 matched set is pinned by a test so it cannot fall silently.
 
@@ -1130,6 +1130,19 @@ leaves a width `auto` is refused with a diagnostic and not laid out**
 - The "table part outside a table" counter fires only for a STRAY part in normal flow —
   it first fired for every cell the table itself placed, which would have made the rows
   permanently unmatched.
+
+**Update — border-radius and aspect-ratio, matched 40 → 42.**
+- **NSG gained two rect fields**, both written only when non-zero so every existing
+  golden stays byte-identical: per-corner `r<tl>,<tr>,<br>,<bl>` and `b<ring>`, a band
+  inside the rect's edge. A rounded box with a UNIFORM border is one ring node; a box
+  whose sides differ cannot be, so its corners stay square and that is counted.
+- Radii take CSS's overlap clamp: when two radii on a side exceed it, ALL radii scale by
+  the same factor (a 200 px radius on a 220×60 box becomes a pill).
+- **`aspect-ratio`** gives the height when the width is definite and the height is auto;
+  an explicit height wins.
+- The two dotted-border goldens changed **notation only** (`r96` → `r96,96,96,96`),
+  proven by diffing with the radius fields stripped before re-blessing — after a first
+  attempt compared them through the MARKDOWN renderer and showed an empty scene.
 
 ## 9. What this reuses
 

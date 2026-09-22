@@ -30,16 +30,26 @@ fn paint(scene: &Scene, fonts: &FontSet) -> Canvas {
         match kind {
             0 => {
                 let r = &scene.rects[i];
-                if r.radius > 0 {
-                    // Rounded: 4×4 supersampling of the rounded-rect test.
-                    let rad = r.radius.min(r.w / 2).min(r.h / 2) as f32;
-                    let inside = |sx: f32, sy: f32| {
-                        let (x0, y0, x1, y1) = (r.x as f32, r.y as f32, (r.x + r.w) as f32, (r.y + r.h) as f32);
+                if r.radii != [0; 4] || r.ring != 0 {
+                    // Rounded and/or ringed: 4×4 supersampling of the test.
+                    let inside_at = |sx: f32, sy: f32, inset: f32, radii: [f32; 4]| {
+                        let (x0, y0) = (r.x as f32 + inset, r.y as f32 + inset);
+                        let (x1, y1) = ((r.x + r.w) as f32 - inset, (r.y + r.h) as f32 - inset);
                         if sx < x0 || sx >= x1 || sy < y0 || sy >= y1 { return false }
-                        let cx = sx.clamp(x0 + rad, x1 - rad);
-                        let cy = sy.clamp(y0 + rad, y1 - rad);
-                        (sx - cx).powi(2) + (sy - cy).powi(2) <= rad * rad
+                        // Corner: top-left, top-right, bottom-right, bottom-left.
+                        let (i, cx, cy) = if sx < x0 + radii[0] && sy < y0 + radii[0] { (0, x0 + radii[0], y0 + radii[0]) }
+                            else if sx > x1 - radii[1] && sy < y0 + radii[1] { (1, x1 - radii[1], y0 + radii[1]) }
+                            else if sx > x1 - radii[2] && sy > y1 - radii[2] { (2, x1 - radii[2], y1 - radii[2]) }
+                            else if sx < x0 + radii[3] && sy > y1 - radii[3] { (3, x0 + radii[3], y1 - radii[3]) }
+                            else { return true };
+                        let rad = radii[i];
+                        rad <= 0.0 || (sx - cx).powi(2) + (sy - cy).powi(2) <= rad * rad
                     };
+                    let outer = r.radii.map(|v| v.min(r.w / 2).min(r.h / 2) as f32);
+                    let ring = r.ring as f32;
+                    let inner = r.radii.map(|v| (v - r.ring).max(0).min((r.w - 2 * r.ring).max(0) / 2).min((r.h - 2 * r.ring).max(0) / 2) as f32);
+                    let inside = |sx: f32, sy: f32| inside_at(sx, sy, 0.0, outer)
+                        && !(ring > 0.0 && inside_at(sx, sy, ring, inner));
                     for py in (r.y / PX)..=((r.y + r.h) / PX) {
                         for px in (r.x / PX)..=((r.x + r.w) / PX) {
                             let mut n = 0;
