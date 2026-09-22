@@ -573,6 +573,7 @@ dependencies = [
 name = "portcullis-cli"
 version = "0.1.0"
 dependencies = [
+ "jaild",
  "portcullis-identity",
  "portcullis-ipc",
  "portcullis-jail",

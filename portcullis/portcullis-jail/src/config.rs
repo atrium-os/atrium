@@ -31,6 +31,7 @@ pub struct DevfsAction {
     pub line: String,
 }
 
+#[derive(Debug, Clone)]
 pub struct JailConfig {
     pub name:      String,
     pub root_path: PathBuf,
@@ -44,6 +45,16 @@ pub struct JailConfig {
 
     pub mounts:        Vec<MountSpec>,
     pub devfs_actions: Vec<DevfsAction>,
+
+    /// ★ The `full` network capability's pending network (network.md §0):
+    /// `Some(mac)` when this jail needs a point-to-point epair from jaild,
+    /// carrying the app's derived MAC. Not rendered — whoever runs `jail -c`
+    /// asks jaild for the allocation and calls [`JailConfig::attach_routed_net`];
+    /// a config still pending is refused (portcullis_mounts::ensure_network_ready),
+    /// never run on the host's stack.
+    pub needs_routed_net: Option<String>,
+    /// Set by [`JailConfig::attach_routed_net`].
+    pub routed_net_attached: bool,
 }
 
 impl JailConfig {
@@ -54,7 +65,36 @@ impl JailConfig {
             set_keys: HashSet::new(),
             mounts: Vec::new(),
             devfs_actions: Vec::new(),
+            needs_routed_net: None,
+            routed_net_attached: false,
         }
+    }
+
+    /// Give this jail the network jaild allocated for it. `exec.created` —
+    /// which jail(8) runs on the host after creation and before the app starts
+    /// — moves `epair_b` into the jail's vnet, then sets the derived MAC, the
+    /// address, its own loopback and the default route.
+    ///
+    /// ★ NOT `vnet.interface`: jail(8) moves that interface AFTER exec.created
+    /// (usr.sbin/jail/jail.c: IP_EXEC_CREATED, IP_ZFS_DATASET,
+    /// IP_VNET_INTERFACE, IP_EXEC_START), so configuring it from exec.created
+    /// failed with the interface not yet in the jail — measured.
+    ///
+    /// ★ Every command here is QUIET (`route -q`): jail(8) passes exec.created's
+    /// stdout through, and on the daemon lane that is the caller's pipe —
+    /// `route` printed "add net default: gateway …" into the app's output
+    /// (measured), the same corruption `jail -q` was added for.
+    pub fn attach_routed_net(&mut self, epair_b: &str, app_addr: &str, host_addr: &str) -> Result<(), String> {
+        let Some(mac) = self.needs_routed_net.clone() else {
+            return Err(format!("jail {} did not ask for a network", self.name));
+        };
+        let n = self.name.clone();
+        self.set("exec.created", Value::String(format!(
+            "ifconfig {epair_b} vnet {n} && ifconfig -j {n} {epair_b} ether {mac} \
+             && ifconfig -j {n} {epair_b} inet {app_addr}/30 up \
+             && ifconfig -j {n} lo0 inet 127.0.0.1/8 up && route -q -j {n} add default {host_addr}")));
+        self.routed_net_attached = true;
+        Ok(())
     }
 
     pub fn set(&mut self, key: &str, value: Value) -> &mut Self {

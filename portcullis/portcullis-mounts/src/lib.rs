@@ -154,6 +154,18 @@ pub fn ensure_devfs_isolation(jc: &JailConfig) -> Result<(), String> {
                  `service devfs restart`", jc.name))
 }
 
+/// Refuse a jail whose `full` network was never attached. ★ Call before every
+/// `jail -c`, beside [`ensure_devfs_isolation`]: build() no longer puts a
+/// networked app on the host's stack, so an unattached config would run with
+/// no network at all — or, if someone "fixed" it by hand, on the host's.
+pub fn ensure_network_ready(jc: &JailConfig) -> Result<(), String> {
+    if jc.needs_routed_net.is_some() && !jc.routed_net_attached {
+        return Err(format!("jail {} needs its network from jaild (AllocateNet) \
+                            before it can start", jc.name));
+    }
+    Ok(())
+}
+
 /// Create the destinations a jail's mounts need. ★ `jail(8)` does not create
 /// mountpoints; without this a capability mount fails with "No such file or
 /// directory" after everything else has succeeded.

@@ -199,10 +199,14 @@ pub fn apply_network(net: NetworkCap, jc: &mut JailConfig) {
             jc.set("allow.raw_sockets", Value::Bool(false));
         }
         NetworkCap::Full => {
-            /* Inherit host's VNET — jail sees real interfaces.
-             * pf rules at the host enforce any further restriction. */
-            jc.set("vnet", Value::Symbolic("inherit".into()));
+            /* ★★ An own stack with a point-to-point epair from jaild (network.md
+             * §0) — NOT `vnet = inherit`, which put the app on the host's stack
+             * where it could read the real MACs and reach the host. The epair is
+             * attached by whoever runs jail -c (it needs jaild); until then the
+             * config is refused. The MAC is filled in by build(). */
+            jc.set("vnet", Value::Symbolic("new".into()));
             jc.set("allow.raw_sockets", Value::Bool(false));
+            jc.needs_routed_net = Some(String::new());
         }
     }
 }
@@ -370,11 +374,13 @@ mod tests {
     }
 
     #[test]
-    fn network_full_inherits_host_vnet() {
+    fn network_full_is_an_own_stack_pending_a_routed_net() {
         let mut j = jc();
         apply_network(NetworkCap::Full, &mut j);
         let vnet = j.params.iter().find(|(k, _)| k == "vnet").unwrap();
-        assert!(matches!(&vnet.1, Value::Symbolic(s) if s == "inherit"));
+        assert!(matches!(&vnet.1, Value::Symbolic(s) if s == "new"), "never inherit the host stack");
+        assert!(j.needs_routed_net.is_some());
+        assert!(!j.has_set("vnet.interface"), "attached only once jaild has allocated it");
     }
 
     #[test]

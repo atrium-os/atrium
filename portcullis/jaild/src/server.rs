@@ -266,6 +266,14 @@ fn dispatch(
         Request::Reap(req) => (handle_reap(req, policy, dry_run, state), Vec::new()),
 
         Request::SetRctl(req) => (handle_set_rctl(req, policy, dry_run, state), Vec::new()),
+
+        Request::AllocateNet { jail_name, mac } =>
+            (handle_allocate_net(&jail_name, &mac, dry_run, state, state_path), Vec::new()),
+
+        Request::ReleaseNet { jail_name } => {
+            release_routed(&jail_name, state, state_path);
+            (Response::Ok, Vec::new())
+        }
     }
 }
 
@@ -649,14 +657,7 @@ fn handle_remove(
      * is gone (or going), so its end has returned to the host's vnet, and
      * destroying the host end takes both. */
     if let Some(name) = name.clone().or_else(|| record_idx.map(|i| state.jails[i].name.clone())) {
-        if let Some(i) = state.routed_nets.iter().position(|n| n.jail_name == name) {
-            let n = state.routed_nets.remove(i);
-            if let Err(e) = crate::routed::destroy(&n.epair_a) {
-                warn!("jaild: RemoveJail {name}: destroy {}: {e}", n.epair_a);
-            }
-            info!("jaild: RemoveJail {name}: released /30 slot {} ({})", n.slot, n.epair_a);
-            if let Err(e) = state.save(state_path) { warn!("jaild: state save after net release: {e}"); }
-        }
+        release_routed(&name, state, state_path);
     }
 
     /* Drop the lo0 alias if any. */
@@ -921,6 +922,83 @@ fn handle_create(
     })
 }
 
+/// Allocate a /30 and create the epair with its host end configured — the one
+/// allocator for both lanes (network.md §0). Refuses unless pf isolation is
+/// loaded. Returns (slot, a, b); the caller records it.
+fn allocate_host_end() -> impl Fn(&PersistentState) -> Result<(u32, String, String), JaildError> {
+    |state: &PersistentState| {
+        crate::routed::isolation_loaded().map_err(|why| JaildError::PolicyViolation {
+            rule:   "network.routed.isolation_not_loaded",
+            detail: format!("{why} — a networked jail would reach the host and other jails"),
+        })?;
+        let slot = state.free_slot().ok_or(JaildError::PolicyViolation {
+            rule:   "network.routed.no_slot",
+            detail: "every /30 in 100.64.0.0/16 is allocated".into(),
+        })?;
+        let (a, b) = crate::routed::create_host_end(slot).map_err(|e| JaildError::Syscall {
+            name: "epair", errno: e.raw_os_error().unwrap_or(-1), msg: format!("{e}"),
+        })?;
+        Ok((slot, a, b))
+    }
+}
+
+/// `AllocateNet` for a jail jaild does not create (the jail(8) lane).
+fn handle_allocate_net(
+    jail_name:  &str,
+    mac:        &str,
+    dry_run:    bool,
+    state:      &mut PersistentState,
+    state_path: &Path,
+) -> Response {
+    /* The name is only a key here (jaild never touches this jail), but it
+     * reaches ifconfig/route arguments on the caller's side: keep it plain. */
+    let name_ok = !jail_name.is_empty() && jail_name.len() <= 64
+        && jail_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !name_ok {
+        return Response::PolicyDenied { rule: "network.routed.name".into(),
+            detail: format!("jail name {jail_name:?} is not [A-Za-z0-9_-]{{1,64}}") };
+    }
+    if !crate::routed::valid_mac(mac) {
+        return Response::PolicyDenied { rule: "network.routed.mac".into(),
+            detail: format!("mac {mac:?} is not a lowercase locally-administered unicast address") };
+    }
+    if state.routed_nets.iter().any(|n| n.jail_name == jail_name) {
+        return Response::PolicyDenied { rule: "network.routed.duplicate".into(),
+            detail: format!("{jail_name} already holds a network; ReleaseNet it first") };
+    }
+    if dry_run {
+        return Response::NetAllocated { epair_b: "epair99b".into(),
+            app_addr: "100.64.0.2".into(), host_addr: "100.64.0.1".into() };
+    }
+    let (slot, a, b) = match allocate_host_end()(state) {
+        Ok(x) => x,
+        Err(JaildError::PolicyViolation { rule, detail }) =>
+            return Response::PolicyDenied { rule: rule.into(), detail },
+        Err(JaildError::Syscall { name, errno, msg }) =>
+            return Response::SyscallFailed { name: name.into(), errno, msg },
+        Err(e) => return Response::Error { detail: e.to_string() },
+    };
+    state.routed_nets.push(crate::state::RoutedNet {
+        jail_name: jail_name.into(), slot, epair_a: a.clone(),
+    });
+    if let Err(e) = state.save(state_path) { warn!("jaild: state save after AllocateNet: {e}"); }
+    let (host_addr, app_addr) = crate::routed::slot_addrs(slot);
+    info!("jaild: AllocateNet {jail_name}: slot {slot} {a}/{b} {app_addr}/30 via {host_addr}");
+    Response::NetAllocated { epair_b: b, app_addr, host_addr }
+}
+
+/// Destroy a jail's epair and free its /30, if it holds one. Idempotent.
+fn release_routed(jail_name: &str, state: &mut PersistentState, state_path: &Path) {
+    if let Some(i) = state.routed_nets.iter().position(|n| n.jail_name == jail_name) {
+        let n = state.routed_nets.remove(i);
+        if let Err(e) = crate::routed::destroy(&n.epair_a) {
+            warn!("jaild: release {jail_name}: destroy {}: {e}", n.epair_a);
+        }
+        info!("jaild: released /30 slot {} of {jail_name} ({})", n.slot, n.epair_a);
+        if let Err(e) = state.save(state_path) { warn!("jaild: state save after release: {e}"); }
+    }
+}
+
 /// Build a Routed jail's network and the (persistent, for now) jail around it.
 /// Returns the jid. Every failure unwinds what was made before it.
 fn create_routed(
@@ -930,18 +1008,10 @@ fn create_routed(
     state_path: &Path,
 ) -> Result<i32, JaildError> {
     use crate::routed;
-    routed::isolation_loaded().map_err(|why| JaildError::PolicyViolation {
-        rule:   "network.routed.isolation_not_loaded",
-        detail: format!("{why} — a networked jail would reach the host and other jails"),
-    })?;
-    let slot = state.free_slot().ok_or(JaildError::PolicyViolation {
-        rule:   "network.routed.no_slot",
-        detail: "every /30 in 100.64.0.0/16 is allocated".into(),
-    })?;
     let sys = |name: &'static str, e: std::io::Error| JaildError::Syscall {
         name, errno: e.raw_os_error().unwrap_or(-1), msg: format!("{e}"),
     };
-    let (a, b) = routed::create_host_end(slot).map_err(|e| sys("epair", e))?;
+    let (slot, a, b) = allocate_host_end()(state)?;
     let spec = JailCreateSpec {
         name:          &req.name,
         path:          &req.path,

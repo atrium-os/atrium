@@ -98,9 +98,24 @@ jaild in the VM: interfaces `lo0 epair0b`, MAC `be:b2:7c:ac:62:b5` (derived, ide
 runs; the host's is `52:54:00:12:34:56`), gateway `100.64.0.1`, internet ALLOWED, host via its
 gateway and via its real address both blocked; afterwards no epair, no slot, no dying jail.
 
-**Still open:** step 3 for the jail(8) app-launch lane (apps granted `full` still use
-`vnet = inherit` and see the real MAC until they take their network from jaild), and the
-one-shot `loopback` capability (refused on that lane). Step 5 (atrium-netd) not started.
+**Step 3 for the jail(8) lane — DONE (2026-09-22).** `vnet = inherit` is gone: `full` builds
+`vnet = new` and records a pending network (`JailConfig::needs_routed_net`, the app's MAC).
+Whoever runs `jail -c` asks jaild (`AllocateNet { jail_name, mac }` → epair end + /30), attaches
+it (`attach_routed_net`), and `ReleaseNet`s it after the jail is gone, on every exit path;
+`portcullis_mounts::ensure_network_ready` refuses a config whose network was never attached, so
+nothing can fall back to the host's stack. Two jail(8) facts learned by measurement: it moves
+`vnet.interface` AFTER `exec.created`, so `exec.created` moves the epair itself
+(`ifconfig epairNb vnet <jail>`); and it passes `exec.created`'s stdout through, so every command
+there is quiet (`route -q` — `route` printed into the app's output). Verified with a CLI
+`portcullis launch` of the same signed test app: same MAC as the one-shot lane
+(`be:b2:7c:ac:62:b5` — one identity per app across lanes), internet allowed, host blocked both
+ways, epair and slot released. A networked jail can stay `dying` for a while after exit (seen up
+to ~90 s, then gone; absent in a controlled rerun) — transient, not accumulating.
+**Not exercised:** the daemon's `launch` path (shares the functions; this VM runs no
+user-facing portcullisd socket).
+
+**Still open:** the one-shot `loopback` capability (refused on that lane), and step 5
+(atrium-netd per-app anchors).
 
 ## 1. Principle
 

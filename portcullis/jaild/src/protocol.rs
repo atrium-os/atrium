@@ -89,6 +89,18 @@ pub enum Request {
     /// SCM_RIGHTS: `[procdesc, pty_master]`.
     ExecInJail(ExecInJailRequest),
 
+    /// ★ A point-to-point network for a jail jaild does NOT create — the
+    /// jail(8) app-launch lane (network.md §0, step 3). jaild stays the one
+    /// allocator: it picks the /30, creates the epair and configures the host
+    /// end; the caller hands `epair_b` to jail(8) as `vnet.interface` and
+    /// configures the app end (the `mac`, the address, the route) from the
+    /// host before the app runs. Refused unless pf isolation is loaded.
+    AllocateNet { jail_name: String, mac: String },
+
+    /// Release what [`Request::AllocateNet`] made for `jail_name`: destroy
+    /// the epair, free the /30. Idempotent.
+    ReleaseNet { jail_name: String },
+
     /// Health check. Returns `Response::Ok` if jaild is alive.
     Ping,
 }
@@ -366,6 +378,9 @@ impl Default for NetworkConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
+    /// A network allocated by [`Request::AllocateNet`].
+    NetAllocated { epair_b: String, app_addr: String, host_addr: String },
+
     /// Generic "your request succeeded with no payload" (Ping,
     /// RemoveJail).
     Ok,

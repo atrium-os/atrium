@@ -52,8 +52,8 @@ usage:
         talks to the jailed process directly. Each --instance gets its
         own jail name and root, so many may run at once from one app;
         the writable layer is tmpfs and is discarded on exit.
-        Signatures are REQUIRED on this path. Exits 0/1 only:
-        jail(8) collapses the child's exit code.
+        Signatures are REQUIRED on this path. Exits with the worker's
+        own code (jaild reaps it). See `portcullis exec` for --user.
 
     portcullis status
         List installed apps and which jails are currently running.
@@ -513,7 +513,7 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
     /* Rebuild the JailConfig with the unionfs path as jail.path
      * (overrides BuildOpts.root_path which we set to tree above). */
     let opts2 = BuildOpts { root_path: jail_path.clone(), ..opts };
-    let jc = match build(&manifest, &opts2) {
+    let mut jc = match build(&manifest, &opts2) {
         Ok(j) => j,
         Err(e) => { eprintln!("build error: {e}"); return ExitCode::from(1); }
     };
@@ -568,11 +568,44 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    /* ★★ A `full` network comes from jaild, the one allocator (network.md §0) —
+     * a point-to-point epair with the app's derived MAC, never the host's stack.
+     * Released on every path out once allocated. */
+    const JAILD_SOCK: &str = "/var/run/atrium/jaild.sock";
+    let networked = jc.needs_routed_net.clone();
+    if let Some(mac) = &networked {
+        match jaild::client::allocate_net(std::path::Path::new(JAILD_SOCK), &jc.name, mac)
+            .and_then(|(b, app, host)| jc.attach_routed_net(&b, &app, &host))
+        {
+            Ok(()) => {
+                let etc = jail_path.join("etc");
+                let _ = fs::create_dir_all(&etc);
+                let _ = fs::copy("/etc/resolv.conf", etc.join("resolv.conf"));
+            }
+            Err(e) => {
+                eprintln!("portcullis: network: {e}");
+                jaild::client::release_net(std::path::Path::new(JAILD_SOCK), &jc.name);
+                teardown(&jail_path);
+                return ExitCode::from(1);
+            }
+        }
+    }
+    let release = |name: &str| if networked.is_some() {
+        jaild::client::release_net(std::path::Path::new(JAILD_SOCK), name);
+    };
+    if let Err(e) = portcullis_mounts::ensure_network_ready(&jc) {
+        eprintln!("portcullis: {e}");
+        release(&jc.name);
+        teardown(&jail_path);
+        return ExitCode::from(1);
+    }
+
     /* Write jail.conf, run jail -c. */
     let conf_path = std::env::temp_dir().join(format!("portcullis-{}.conf",
         std::process::id()));
     if let Err(e) = fs::write(&conf_path, jc.render_jail_conf()) {
         eprintln!("write {}: {e}", conf_path.display());
+        release(&jc.name);
         teardown(&jail_path);
         return ExitCode::from(1);
     }
@@ -582,8 +615,10 @@ fn cmd_launch(tree_arg: &str, dry_run: bool, no_prompt: bool) -> ExitCode {
     let _ = fs::remove_file(&conf_path);
 
     /* Teardown: jail -r (idempotent if already removed by exec.start
-     * exit), then umount in reverse order. */
+     * exit), then umount in reverse order — and the network after the jail
+     * is gone, so its epair end has come home to be destroyed. */
     let _ = Command::new("jail").arg("-r").arg(&jc.name).status();
+    release(&jc.name);
     teardown(&jail_path);
 
     match status {

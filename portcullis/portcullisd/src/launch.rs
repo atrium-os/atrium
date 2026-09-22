@@ -322,9 +322,42 @@ fn run_one_jail(
     jail_path: &Path,
     stdio:     Option<[OwnedFd; 3]>,
 ) -> Result<Option<i32>, LaunchError> {
+    /* ★★ A `full` network comes from jaild, the one allocator (network.md §0):
+     * a point-to-point epair with the app's derived MAC — never the host's
+     * stack. Allocated for THIS jail and released when it is gone, on every
+     * path out of here. */
+    let mut jc = jc.clone();
+    let networked = jc.needs_routed_net.clone();
+    if let Some(mac) = &networked {
+        let (b, app, host) = jaild::client::allocate_net(Path::new(JAILD_SOCK), &jc.name, mac)
+            .map_err(|e| LaunchError::Failed("network", e))?;
+        jc.attach_routed_net(&b, &app, &host).map_err(|e| LaunchError::Failed("network", e))?;
+        /* Names resolve through the host's resolvers, over NAT. Written into the
+         * overlay, never the signed tree. */
+        let etc = jail_path.join("etc");
+        let _ = fs::create_dir_all(&etc);
+        let _ = fs::copy("/etc/resolv.conf", etc.join("resolv.conf"));
+    }
+    let outcome = run_one_jail_inner(&jc, jail_path, stdio);
+    if networked.is_some() {
+        jaild::client::release_net(Path::new(JAILD_SOCK), &jc.name);
+    }
+    outcome
+}
+
+const JAILD_SOCK: &str = "/var/run/atrium/jaild.sock";
+
+fn run_one_jail_inner(
+    jc:        &JailConfig,
+    jail_path: &Path,
+    stdio:     Option<[OwnedFd; 3]>,
+) -> Result<Option<i32>, LaunchError> {
     /* ★★★ Refuse a devfs that would hide nothing — see ensure_devfs_isolation. */
     portcullis_mounts::ensure_devfs_isolation(jc)
         .map_err(|e| LaunchError::Failed("devfs", e))?;
+    /* ★★ And a networked config whose network was never attached. */
+    portcullis_mounts::ensure_network_ready(jc)
+        .map_err(|e| LaunchError::Failed("network", e))?;
     let conf_path = std::env::temp_dir().join(format!(
         "portcullisd-{}-{}.conf", std::process::id(), jc.name));
     if let Err(e) = fs::write(&conf_path, jc.render_jail_conf()) {

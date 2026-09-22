@@ -253,3 +253,27 @@ fn recvmsg_with_fds(socket_fd: i32, out: &mut [u8], max_fds: usize) -> io::Resul
 fn unsafe_socket_reader(socket_fd: i32) -> std::os::unix::net::UnixStream {
     raw::dup_to_stream(socket_fd)
 }
+
+/// The jail(8) lane's network (network.md §0): ask jaild — the one allocator —
+/// for a point-to-point epair for `jail_name` carrying `mac`. Returns
+/// `(epair_b, app_addr, host_addr)`; the caller hands `epair_b` to jail(8) as
+/// `vnet.interface` and MUST call [`release_net`] when the jail is gone.
+pub fn allocate_net(socket: &Path, jail_name: &str, mac: &str)
+    -> Result<(String, String, String), String>
+{
+    let mut c = Client::connect(socket).map_err(|e| format!("connect {}: {e}", socket.display()))?;
+    match c.send(&Request::AllocateNet { jail_name: jail_name.into(), mac: mac.into() }) {
+        Ok((Response::NetAllocated { epair_b, app_addr, host_addr }, _)) => Ok((epair_b, app_addr, host_addr)),
+        Ok((Response::PolicyDenied { rule, detail }, _)) => Err(format!("jaild refused ({rule}): {detail}")),
+        Ok((other, _)) => Err(format!("jaild: unexpected reply {other:?}")),
+        Err(e) => Err(format!("jaild: {e}")),
+    }
+}
+
+/// Release what [`allocate_net`] made. Best-effort and idempotent: a failure
+/// leaves an epair jaild's startup reconcile will reclaim, never a live jail.
+pub fn release_net(socket: &Path, jail_name: &str) {
+    if let Ok(mut c) = Client::connect(socket) {
+        let _ = c.send(&Request::ReleaseNet { jail_name: jail_name.into() });
+    }
+}

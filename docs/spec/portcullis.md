@@ -2029,8 +2029,9 @@ after creation, before the app starts). Verified: a signed loopback app launches
 **Apps WITH network (2026-09-22):** decided and built per network.md §0 — an own stack with a
 point-to-point epair carrying a MAC derived like the hostid (`HostIdentity::mac`), NAT out,
 pf blocking app→host and app→app. Done for one-shots (verified in the VM: derived MAC,
-internet allowed, host blocked). **Still open:** apps launched through the jail(8) lane with
-`full` still use `vnet = inherit` and see the real MAC.
+internet allowed, host blocked) and for apps launched through the jail(8) lane (same MAC per
+app on both lanes; network.md §0 step 3). `vnet = inherit` is gone: no jailed app reads the
+host's MAC or hostid any more.
 
 ### 9.2 Out of scope
 

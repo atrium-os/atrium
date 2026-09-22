@@ -90,7 +90,7 @@ pub fn configure_app_end(jail: &str, b: &str, mac: &str, slot: u32) -> io::Resul
     sh("ifconfig", &["-j", jail, b, "ether", mac])?;
     sh("ifconfig", &["-j", jail, b, "inet", &format!("{app}/30"), "up"])?;
     sh("ifconfig", &["-j", jail, "lo0", "inet", "127.0.0.1/8", "up"])?;
-    sh("route", &["-j", jail, "add", "default", &host])?;
+    sh("route", &["-q", "-j", jail, "add", "default", &host])?;
     Ok(())
 }
 

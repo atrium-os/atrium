@@ -21,3 +21,4 @@ portcullis-peer   = { path = "../portcullis-peer" }
 portcullis-trust  = { path = "../portcullis-trust" }
 portcullis-oneshot = { path = "../portcullis-oneshot" }
 portcullis-mounts = { path = "../portcullis-mounts" }
+jaild = { path = "../jaild" }
