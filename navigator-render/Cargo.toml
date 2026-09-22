@@ -6,6 +6,8 @@ description = "The document lane's pure function: Markdown + viewport + pinned f
 
 [dependencies]
 navigator-fonts = { path = "../navigator-fonts" }
+navigator-style = { path = "../navigator-style" }
+navigator-dom = { path = "../navigator-dom" }
 pulldown-cmark = { version = "0.13", default-features = false }
 rustybuzz = "0.20"
 ttf-parser = "0.25"

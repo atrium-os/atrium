@@ -12,6 +12,7 @@
 //! counted; code blocks do not wrap (overflow is counted).
 
 pub mod fontset;
+pub mod html;
 pub mod nsg;
 
 use fontset::{Family, FontSet};
@@ -73,9 +74,9 @@ pub struct Scene {
 }
 
 impl Scene {
-    fn rect(&mut self, r: Rect) { self.order.push((0, self.rects.len())); self.rects.push(r) }
-    fn run(&mut self, r: Run) { self.order.push((1, self.runs.len())); self.runs.push(r) }
-    fn link(&mut self, l: Link) { self.order.push((2, self.links.len())); self.links.push(l) }
+    pub(crate) fn rect(&mut self, r: Rect) { self.order.push((0, self.rects.len())); self.rects.push(r) }
+    pub(crate) fn run(&mut self, r: Run) { self.order.push((1, self.runs.len())); self.runs.push(r) }
+    pub(crate) fn link(&mut self, l: Link) { self.order.push((2, self.links.len())); self.links.push(l) }
 }
 
 /// Round-half-away-from-zero of `v * num / den`, in integers.
@@ -92,21 +93,21 @@ const CODE_BG: u32 = 0xf6f8faff;
 const QUOTE_BAR: u32 = 0xd0d7deff;
 
 #[derive(Clone, Debug, PartialEq)]
-struct Style { family: Family, bold: bool, em: bool, size: U, rgba: u32, link: Option<usize> }
+pub(crate) struct Style { pub(crate) family: Family, pub(crate) bold: bool, pub(crate) em: bool, pub(crate) size: U, pub(crate) rgba: u32, pub(crate) link: Option<usize> }
 
 enum Atom { Word(String, Style), Space(Style), Break }
 
-struct Shaper<'a> {
+pub(crate) struct Shaper<'a> {
     fonts: &'a FontSet,
     tt: Vec<ttf_parser::Face<'a>>,
     hb: Vec<rustybuzz::Face<'a>>,
 }
 
 /// A shaped piece of one face: glyphs positioned from its own origin.
-struct Piece { face: usize, glyphs: Vec<(u16, U, U)>, width: U, text: String }
+pub(crate) struct Piece { pub(crate) face: usize, pub(crate) glyphs: Vec<(u16, U, U)>, pub(crate) width: U, pub(crate) text: String }
 
 impl<'a> Shaper<'a> {
-    fn new(fonts: &'a FontSet) -> Self {
+    pub(crate) fn new(fonts: &'a FontSet) -> Self {
         let tt = fonts.faces.iter().map(|f| ttf_parser::Face::parse(&f.bytes, 0).expect("pinned")).collect();
         let hb = fonts.faces.iter().map(|f| rustybuzz::Face::from_slice(&f.bytes, 0).expect("pinned")).collect();
         Shaper { fonts, tt, hb }
@@ -115,7 +116,7 @@ impl<'a> Shaper<'a> {
     /// Split `text` by the first face in the stack that has each character,
     /// then shape each piece. Characters no face has go to the primary face
     /// and are counted as .notdef.
-    fn shape(&self, text: &str, st: &Style, report: &mut Report) -> Vec<Piece> {
+    pub(crate) fn shape(&self, text: &str, st: &Style, report: &mut Report) -> Vec<Piece> {
         let stack = self.fonts.stack(st.family, st.bold);
         let mut segs: Vec<(usize, String)> = vec![];
         for ch in text.chars() {
@@ -148,12 +149,18 @@ impl<'a> Shaper<'a> {
     }
 
     /// Ascent and line height for a style, from its primary face.
-    fn metrics(&self, st: &Style) -> (U, U) {
+    pub(crate) fn metrics(&self, st: &Style) -> (U, U) {
         let f = &self.fonts.faces[self.fonts.stack(st.family, st.bold)[0]];
         let asc = scale(f.ascent, st.size, f.upem);
         let desc = scale(-f.descent, st.size, f.upem);
         let lh = st.size * 3 / 2;
         (asc + (lh - asc - desc) / 2, lh)
+    }
+
+    /// Ascent and descent (both positive) of a style's primary face.
+    pub(crate) fn asc_desc(&self, st: &Style) -> (U, U) {
+        let f = &self.fonts.faces[self.fonts.stack(st.family, st.bold)[0]];
+        (scale(f.ascent, st.size, f.upem), scale(-f.descent, st.size, f.upem))
     }
 }
 
