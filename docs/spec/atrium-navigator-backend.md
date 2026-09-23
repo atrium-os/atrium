@@ -1694,10 +1694,14 @@ labels came out as "View menu" and "View sidebar" written across the page. Such 
 now set aside and placed after the line it was written in, taking that line's origin as
 its static position.
 
-★ **Wikipedia's table of contents overlaps the article title**, and did so before any of
-this session's work (checked against the parent commit in the same tree, same binary
-rebuild). Earlier in this log "renders as the site itself looks" was too generous about
-doc01; the overlap is OPEN.
+★★ **Wikipedia's table of contents overlapped the article title — a `max-height` on a
+clipping box is an upper bound.** The TOC lives in `max-height: calc(100vh - 48px);
+overflow-y: auto`. The clip was built from the box's DEFINITE height, which `max-height`
+is not, so the clip was unbounded and all 1390 px of contents painted straight over the
+article below. A `max-height` now bounds the clip even when the height is auto — the box
+may end up shorter, but nothing can be painted past that line. (It had been wrong since
+before this session; verified by rebuilding the parent commit in the same tree. Earlier
+in this log, "renders as the site itself looks" was too generous about doc01.)
 
 ★ **Two renderer tests had been failing for hours** — a stale sample golden and a pinned
 `nsg 0.1` header — behind `grep -c "test result: ok"`, which counts the suites that passed

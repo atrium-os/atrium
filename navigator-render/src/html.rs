@@ -512,7 +512,17 @@ impl<'a> Cx<'a> {
         // there is no such thing as clipping in x alone.
         let clips = kw(s, "overflow-x") != "visible" || kw(s, "overflow-y") != "visible";
         if clips {
-            let ch = definite.map(|d| (d - bt - bb).max(0)).unwrap_or(U::MAX / 4);
+            // ★ A `max-height` clips too. It is not a definite height — the
+            // box may end up shorter — but it is an upper bound the content
+            // cannot be painted past, and a clipping box is exactly where
+            // that matters. Ignoring it let Wikipedia's table of contents,
+            // held in `max-height: calc(100vh - 48px); overflow-y: auto`,
+            // paint its whole 1390 px over the article title below it.
+            let bound = match vpct("max-height") {
+                Some(mx) if !matches!(s.get("max-height"), V::Kw(_)) => Some(mx),
+                _ => None,
+            };
+            let ch = definite.or(bound).map(|d| (d - bt - bb).max(0)).unwrap_or(U::MAX / 4);
             let id = self.scene.clip(bx + bl, by + bt, (w - bl - br).max(0), ch);
             self.scene.cur.0 = Some(id);
             if ["border-top-left-radius", "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius"]
@@ -2162,6 +2172,27 @@ mod tests {
         assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 100, 20)]);
         assert_eq!(boxes(&o, 0x00ff00ff), vec![(110, 0, 380, 20)], "grows into the free space, gaps honoured");
         assert_eq!(boxes(&o, 0x0000ffff), vec![(500, 0, 100, 20)]);
+    }
+
+    /// ★ A `max-height` on a clipping box is an upper bound the content
+    /// cannot be painted past, even though the box is not definite-height.
+    /// Ignoring it let Wikipedia's table of contents — held in
+    /// `max-height: calc(100vh - 48px); overflow-y: auto` — paint its whole
+    /// 1390 px straight over the article title below it.
+    #[test]
+    fn a_max_height_clips_a_scrolling_box() {
+        let tall = "<p>x</p>".repeat(40);
+        let src = format!(r#"<style>body {{ margin-left: 0px; margin-top: 0px }}
+            .box {{ max-height: 100px; overflow-x: hidden; overflow-y: auto }}</style>
+            <div class="box">{tall}</div>"#);
+        let o = render(&src);
+        let clip = o.scene.clips.iter().map(|c| c.3).max().expect("the box clips");
+        assert!(clip <= 100 * PX, "the clip stops at max-height, not at the content: {}", clip / PX);
+        // Control: without `overflow` there is no clip at all, and the same
+        // content is painted in full.
+        let c = render(&src.replace("overflow-x: hidden; overflow-y: auto", "color: #000000"));
+        assert!(c.scene.clips.is_empty(), "the control must not clip");
+        assert!(c.scene.runs.len() >= o.scene.runs.len(), "the control keeps at least as much");
     }
 
     /// ★ An absolutely positioned INLINE element is out of flow: it is
