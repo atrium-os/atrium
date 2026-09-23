@@ -212,3 +212,45 @@ fn the_root_keeps_its_attributes() {
     assert!(out.contains(r#"dir="rtl""#), "{out}");
     assert!(out.contains("js dark"), "{out}");
 }
+
+/// ★ `display: contents` is a STRUCTURAL instruction, not a value: the
+/// element generates no box and its children take its place. The normalizer
+/// carries it out on the DOM, which is why the profile needs no such value.
+#[test]
+fn display_contents_splices_the_children_into_the_parent() {
+    let src = r#"<html><head><style>
+      .wrap { display: contents }
+      .a { color: #ff0000 } .b { color: #00ff00 }
+    </style></head><body><div class="outer"><div class="wrap"><p class="a">one</p><p class="b">two</p></div></div></body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    assert!(!out.contains("display: contents"), "never emitted: {out}");
+    assert!(report.dropped.keys().any(|k| k.contains("children took its place")), "{:?}", report.dropped);
+    // Both children survive, and the wrapper's own box is gone.
+    assert!(out.contains("color: #ff0000") && out.contains("color: #00ff00"), "{out}");
+    let wrap_at = out.find("class=\"wrap");
+    assert!(wrap_at.is_none(), "the wrapper element is gone: {out}");
+    assert!(refusals(&out).is_empty());
+}
+
+/// ★ Named grid areas resolve to NUMBERED lines, which the profile admits.
+/// Without it every child lands in the same cell — rustdoc's breadcrumb
+/// rendered on top of its search box.
+#[test]
+fn named_grid_areas_become_numbered_lines() {
+    let src = r#"<html><head><style>
+      .g { display: grid; grid-template-areas: "crumbs crumbs" "title toolbar"; grid-template-columns: 100px 100px }
+      .c { grid-area: crumbs } .t { grid-area: title } .b { grid-area: toolbar }
+      .x { grid-area: nowhere }
+    </style></head><body><div class="g">
+      <div class="c">a</div><div class="t">b</div><div class="b">c</div><div class="x">d</div>
+    </div></body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    assert!(!out.contains("grid-template-areas"), "never emitted: {out}");
+    assert!(!out.contains("grid-area"), "never emitted: {out}");
+    // crumbs spans both columns of row 1; toolbar is row 2, column 2.
+    assert!(out.contains("grid-column-end: 3") && out.contains("grid-row-end: 2"), "crumbs spans the row: {out}");
+    assert!(out.contains("grid-column-start: 2") && out.contains("grid-row-start: 2"), "toolbar is row 2 col 2: {out}");
+    // A name no template defines is reported, not guessed.
+    assert!(report.dropped.keys().any(|k| k.contains("nowhere")), "{:?}", report.dropped);
+    assert!(refusals(&out).is_empty());
+}

@@ -54,6 +54,7 @@ pub struct Report {
 
 impl Report {
     fn drop(&mut self, why: impl Into<String>) { *self.dropped.entry(why.into()).or_default() += 1 }
+    fn drop_n(&mut self, why: impl Into<String>, n: usize) { *self.dropped.entry(why.into()).or_default() += n }
 }
 
 /// One element's resolved declarations, in cascade order.
@@ -221,12 +222,78 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         }
     }
 
+    // ★ Resolve named areas into the numeric lines the profile admits.
+    // Both halves are in `resolved` now: the container's template and each
+    // child's area name.
+    let templates: BTreeMap<Handle, Vec<Vec<String>>> = resolved.iter()
+        .filter(|((_, st, m), _)| st.is_empty() && m.is_empty())
+        .filter_map(|((h, ..), props)| props.get("grid-template-areas").map(|(_, v)| (*h, parse_areas(v))))
+        .collect();
+    let named: Vec<(Handle, String)> = resolved.iter()
+        .filter(|((_, st, m), _)| st.is_empty() && m.is_empty())
+        .filter_map(|((h, ..), props)| props.get("grid-area-name").map(|(_, v)| (*h, v.trim().to_string())))
+        .collect();
+    let mut placed = 0usize;
+    for (h, name) in named {
+        let parent = dom.get(h).and_then(|n| n.parent);
+        let rect = parent.and_then(|p| templates.get(&p)).and_then(|t| area_rect(t, &name));
+        let slot = resolved.entry((h, String::new(), String::new())).or_default();
+        slot.remove("grid-area-name");
+        if let Some((r0, r1, c0, c1)) = rect {
+            let pri: Priority = (false, (0, 1, 0), usize::MAX - 1);
+            for (k, v) in [("grid-row-start", r0), ("grid-row-end", r1), ("grid-column-start", c0), ("grid-column-end", c1)] {
+                slot.insert(k.to_string(), (pri, v.to_string()));
+            }
+            placed += 1;
+        } else {
+            report.drop(format!("grid-area `{name}` (no template names it)"));
+        }
+    }
+    if placed > 0 { report.drop_n("named grid areas resolved to numbered lines", placed) }
+    for (_, props) in resolved.iter_mut() { props.remove("grid-template-areas"); }
+
+    // ★ `display: contents` elements generate no box: their children take
+    // their place. Doing it here, on the DOM, is exactly what the value
+    // means — and it is why the profile needs no such value.
+    let mut contents: Vec<Handle> = resolved.iter()
+        .filter(|((_, state, media), props)| state.is_empty() && media.is_empty()
+            && props.get("display").is_some_and(|(_, v)| v == "contents"))
+        .map(|((h, ..), _)| *h).collect();
+    contents.sort_unstable();
+    for h in &contents {
+        // Its own declarations describe a box that does not exist.
+        resolved.retain(|(e, ..), _| e != h);
+    }
+    let spliced = contents.len();
+    if spliced > 0 { report.drop_n("display: contents (children took its place)", spliced) }
+    for h in contents.into_iter().rev() {
+        let Some(parent) = dom.get(h).and_then(|n| n.parent) else { continue };
+        let kids = dom.get(h).map(|n| n.children.clone()).unwrap_or_default();
+        if let Some(p) = dom.get_mut(parent) {
+            if let Some(at) = p.children.iter().position(|c| *c == h) {
+                p.children.splice(at..=at, kids.iter().copied());
+            }
+        }
+        for k in kids { if let Some(n) = dom.get_mut(k) { n.parent = Some(parent) } }
+    }
+
     // 5. Emit: one class per distinct block, so elements that resolved to the
     //    same declarations share a rule instead of each getting their own.
     let mut blocks: BTreeMap<(String, String, Block), String> = BTreeMap::new();
+    let mut dropped_late: Vec<String> = vec![];
     let mut per_element: BTreeMap<Handle, Vec<String>> = BTreeMap::new();
     for ((h, state, media), props) in resolved {
-        let mut b: Vec<(String, String)> = props.into_iter().map(|(p, (_, v))| (p, v)).collect();
+        // ★ THE LAST GATE. Nothing leaves here that the profile would refuse,
+        // whatever path it took to get this far — a `display: contents` that
+        // survived because it was inside a media query and so could not be
+        // spliced, or a value some expansion produced. One check at the exit
+        // is worth more than trusting every entrance.
+        let mut b: Vec<(String, String)> = props.into_iter().map(|(p, (_, v))| (p, v))
+            .filter(|(p, v)| {
+                if value::admits(p, v) { return true }
+                dropped_late.push(format!("value `{p}: {v}` (refused at the exit)"));
+                false
+            }).collect();
         b.sort();
         if b.is_empty() { continue }
         let n = blocks.len();
@@ -251,6 +318,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
             out.push_str("}\n");
         }
     }
+    for d in dropped_late { report.drop(d) }
     report.rules_out = blocks.len();
     report.elements_styled = per_element.len();
 
@@ -345,6 +413,33 @@ fn resolve(base: &str, target: &str) -> Option<String> {
         Some(i) => Some(format!("{}{}", &base[..i + 1], target)),
         None => Some(target.to_string()),
     }
+}
+
+/// `"a a" "b c"` → rows of cell names. `.` is an empty cell.
+fn parse_areas(v: &str) -> Vec<Vec<String>> {
+    let mut rows = vec![];
+    for row in v.split('"').skip(1).step_by(2) {
+        let cells: Vec<String> = row.split_whitespace().map(str::to_string).collect();
+        if !cells.is_empty() { rows.push(cells) }
+    }
+    rows
+}
+
+/// The 1-based line rectangle a name covers: (row start, row end, column
+/// start, column end). CSS requires the area to be rectangular; a name that
+/// is not gets the bounding box, which is what a browser resolves it to
+/// after its own error handling.
+fn area_rect(rows: &[Vec<String>], name: &str) -> Option<(usize, usize, usize, usize)> {
+    let (mut r0, mut r1, mut c0, mut c1) = (usize::MAX, 0usize, usize::MAX, 0usize);
+    for (r, cells) in rows.iter().enumerate() {
+        for (c, cell) in cells.iter().enumerate() {
+            if cell == name {
+                r0 = r0.min(r); r1 = r1.max(r);
+                c0 = c0.min(c); c1 = c1.max(c);
+            }
+        }
+    }
+    (r0 != usize::MAX).then(|| (r0 + 1, r1 + 2, c0 + 1, c1 + 2))
 }
 
 fn uses_var(v: &[Token]) -> bool {
@@ -458,6 +553,12 @@ fn to_longhands(name: &str, value: &[Token], inputs: &Inputs, report: &mut Repor
     let text = css::write_tokens(value).trim().to_string();
     if text.is_empty() { return vec![] }
     // Already a longhand the profile knows?
+    // `grid-area: <name>` is a name, not four lines; keep it whole.
+    if name == "grid-area" && text.split(['/', ' ']).filter(|x| !x.trim().is_empty()).count() == 1
+        && !text.trim().chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return vec![("grid-area-name".to_string(), text)];
+    }
+    if name == "grid-template-areas" { return vec![(name.to_string(), text)] }
     let pairs: Vec<(String, String)> = if navigator_style::values::grammar(name).is_some() {
         vec![(name.to_string(), text)]
     } else {
@@ -470,6 +571,21 @@ fn to_longhands(name: &str, value: &[Token], inputs: &Inputs, report: &mut Repor
     // an honest mapping, and drop the rest WITH ITS VALUE. Nothing the
     // renderer can refuse leaves this function.
     pairs.into_iter().filter_map(|(p, v)| {
+        // ★ `display: contents` is not a value the profile has — it is a
+        // STRUCTURAL instruction: generate no box, and let the children take
+        // this element's place in its parent. The normalizer can carry that
+        // out literally (see `splice_contents`), so it is kept here as a
+        // marker rather than dropped. 1510 elements in a 29-document corpus.
+        if p == "display" && v == "contents" { return Some((p, v)) }
+        // ★ NAMED GRID AREAS. The profile places items by NUMBER, and modern
+        // layouts name them: `grid-template-areas` on the container plus
+        // `grid-area: toolbar` on each child. The mapping from a name to a
+        // rectangle of lines is static, so the normalizer can do it — but it
+        // needs both halves, so they are carried here as markers and resolved
+        // once the whole cascade is known. Without it every child lands in
+        // the same cell: rustdoc's breadcrumb rendered on top of its search
+        // box.
+        if p == "grid-template-areas" || p == "grid-area-name" { return Some((p, v)) }
         // ★ An image the input has not measured cannot be painted (§3.13),
         // and the renderer says so. The normalizer must decide it HERE, the
         // same way it decides for an `<img>`, or it ships a document that
@@ -506,6 +622,12 @@ fn admitted_media(q: &str) -> Option<String> {
     let q = q.strip_prefix("all and ").unwrap_or(&q).trim().to_string();
     if q == "screen" || q == "all" || q.is_empty() { return Some(String::new()) }
     if !q.starts_with('(') { return None }
+    // ★ RANGE SYNTAX (Media Queries 4): `(width <= 1044px)` is how modern
+    // sheets are written, and the profile's parser only knows `max-width`.
+    // Dropping it drops every rule inside — MDN hides its mobile menu in
+    // `@media (width <= 1044px)`, so the menu rendered, at one character per
+    // line, on every page.
+    if let Some(range) = from_range(&q) { return Some(range) }
     // Only the features the profile's own parser admits.
     let inner = q.trim_matches(|c| c == '(' || c == ')');
     let name = inner.split(':').next().unwrap_or("").trim();
@@ -524,6 +646,55 @@ fn admitted_media(q: &str) -> Option<String> {
         "prefers-color-scheme" | "prefers-reduced-motion" | "orientation" => Some(q),
         _ => None,
     }
+}
+
+/// `(width <= 1044px)`, `(400px < height < 900px)` and the rest, rewritten
+/// into the profile's `min-`/`max-` features.
+///
+/// A STRICT comparison is not the same as the profile's inclusive one, so
+/// it is nudged by 0.02px — smaller than any device pixel, and honest about
+/// which side of the boundary the rule falls on.
+fn from_range(q: &str) -> Option<String> {
+    let inner = q.trim().trim_start_matches('(').trim_end_matches(')').trim();
+    if !inner.contains('<') && !inner.contains('>') { return None }
+    let toks: Vec<&str> = inner.split_whitespace().collect();
+    let feature = |s: &str| matches!(s, "width" | "height");
+    let eps = 0.02;
+    let num = |s: &str| -> Option<f64> { s.strip_suffix("px")?.parse().ok() };
+    let out = match toks.as_slice() {
+        // `width <= 1044px`
+        [f, op, v] if feature(f) => {
+            let n = num(v)?;
+            match *op {
+                "<=" => format!("(max-{f}: {n}px)"),
+                "<" => format!("(max-{f}: {}px)", n - eps),
+                ">=" => format!("(min-{f}: {n}px)"),
+                ">" => format!("(min-{f}: {}px)", n + eps),
+                "=" => format!("(min-{f}: {n}px) and (max-{f}: {n}px)"),
+                _ => return None,
+            }
+        }
+        // `1044px >= width`, the same thing written the other way round.
+        [v, op, f] if feature(f) => {
+            let n = num(v)?;
+            match *op {
+                ">=" => format!("(max-{f}: {n}px)"),
+                ">" => format!("(max-{f}: {}px)", n - eps),
+                "<=" => format!("(min-{f}: {n}px)"),
+                "<" => format!("(min-{f}: {}px)", n + eps),
+                _ => return None,
+            }
+        }
+        // `400px <= width <= 900px`
+        [lo, op1, f, op2, hi] if feature(f) => {
+            let (lo, hi) = (num(lo)?, num(hi)?);
+            let min = match *op1 { "<=" => lo, "<" => lo + eps, _ => return None };
+            let max = match *op2 { "<=" => hi, "<" => hi - eps, _ => return None };
+            format!("(min-{f}: {min}px) and (max-{f}: {max}px)")
+        }
+        _ => return None,
+    };
+    Some(out)
 }
 
 /// `calc(640px - 1px)` and friends, in absolute px. Anything else — a

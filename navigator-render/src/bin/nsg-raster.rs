@@ -111,6 +111,9 @@ fn paint_one(cv: &mut Canvas, scene: &Scene, fonts: &FontSet, ctx: &mut swash::s
         }
         1 => {
             let r = &scene.runs[i];
+            // A zero-size run is not a small run: scaling by zero is how a
+            // rasterizer ends up drawing at the font's native units.
+            if r.size <= 0 { return }
             let face = &fonts.faces[r.face];
             let Some(font) = swash::FontRef::from_index(&face.bytes, 0) else { return };
             let mut scaler = ctx.builder(font).size(r.size as f32 / PX as f32).hint(false).build();

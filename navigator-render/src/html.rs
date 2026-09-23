@@ -1567,7 +1567,13 @@ impl<'a> Cx<'a> {
         let line = Line { lh, underline: (kw(s, "text-decoration-line") == "underline").then_some(deco),
                           strike: (kw(s, "text-decoration-line") == "line-through").then_some(deco),
                           hidden: kw(s, "visibility") == "hidden",
-                          break_word: kw(s, "overflow-wrap") == "break-word",
+                          // ★ `overflow-wrap` only applies WHERE BREAKING IS
+                          // ALLOWED (CSS Text 3 §5.5). Under `nowrap` there is
+                          // no such place, so break-word must not smuggle one
+                          // in — MDN's nav buttons are `nowrap` inside a narrow
+                          // box, and breaking them rendered one character per
+                          // line, vertically, down the page.
+                          break_word: kw(s, "overflow-wrap") == "break-word" && kw(s, "white-space") != "nowrap",
                           tab: match s.get("tab-size") { V::Int(n) => (*n).clamp(0, 64), _ => 8 } };
         let sp = |p: &str| match s.get(p) { V::Len(l) => u(l.v), V::Calc(c) => calc_eval(c, 0).map(u).unwrap_or(0), _ => 0 };
         (FontStyle { family, bold: weight >= 600, em, size, rgba: color, link: None,
@@ -1935,6 +1941,13 @@ impl<'a> Cx<'a> {
                 // already fixed), nothing is painted, and hidden text is not
                 // hit-testable, so it contributes no link region either.
                 if p.line.hidden { continue }
+                // ★ `font-size: 0` paints nothing and takes no space — it is
+                // how pages hide text from sight while keeping it for a
+                // screen reader. Emitting the run anyway put rustdoc's
+                // hidden "Copy item path" into the scene, and a consumer
+                // scaling glyphs by zero drew them at the font's own units:
+                // a grey blob 450 px across.
+                if p.st.size <= 0 { continue }
                 if let Some((ah, bw, asc, _)) = p.atomic {
                     // Its margin-box origin: the baseline of this line, minus
                     // the box's own baseline.
@@ -2010,6 +2023,31 @@ mod tests {
         let runs: Vec<&Run> = o.scene.runs.iter().collect();
         assert!(runs.iter().map(|r| r.y).collect::<std::collections::BTreeSet<_>>().len() > 3, "several lines");
         assert!(runs.iter().all(|r| r.x > 8 * PX), "centred lines start right of the left edge");
+    }
+
+    #[test]
+    /// ★ `font-size: 0` is how a page hides text from sight while keeping it
+    /// for a screen reader. It paints nothing and takes no space.
+    #[test]
+    fn zero_size_text_is_not_painted() {
+        let o = render(r#"<style>.h { font-size: 0 }</style><p>seen<span class="h">hidden</span></p>"#);
+        let texts: Vec<&str> = o.scene.runs.iter().map(|r| r.text.as_str()).collect();
+        assert!(texts.contains(&"seen"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("hidden")), "zero-size text is not in the scene: {texts:?}");
+    }
+
+    /// ★ `overflow-wrap: break-word` applies only where breaking is allowed.
+    /// Under `nowrap` there is nowhere, so a long word in a narrow box
+    /// OVERFLOWS — it does not break into one character per line.
+    #[test]
+    fn nowrap_beats_break_word() {
+        let o = render(r#"<style>p { width: 12px; white-space: nowrap; overflow-wrap: break-word }</style><p>HTML</p>"#);
+        let ys: Vec<U> = o.scene.runs.iter().map(|r| r.y).collect();
+        assert_eq!(ys.len(), 1, "one run, one line: {ys:?}");
+        // Control: the same box WITHOUT nowrap does break, so the test is
+        // about nowrap and not about the width.
+        let c = render(r#"<style>p { width: 12px; overflow-wrap: break-word }</style><p>HTML</p>"#);
+        assert!(c.scene.runs.len() > 1, "break-word alone still breaks: {}", c.scene.runs.len());
     }
 
     #[test]

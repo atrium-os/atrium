@@ -63,7 +63,7 @@ impl Style {
 pub const UA_CSS: &str = "
 html, body, main, article, section, nav, aside, header, footer, div, p, h1, h2, h3, h4, h5, h6,
 ul, ol, li, dl, dt, dd, figure, figcaption, blockquote, pre, details, summary, form, fieldset, hr, address,
-center, dir, menu, legend, search, hgroup, optgroup, marquee
+center, dir, menu, legend, search, hgroup, marquee
   { display: block }
 head, script, style, title, meta, link, template { display: none }
 /* ★ `noscript` is RAW TEXT when scripting is enabled, so its markup parses
@@ -71,6 +71,12 @@ head, script, style, title, meta, link, template { display: none }
    fallback is both redundant and, displayed, literal angle brackets on the
    page. */
 noscript { display: none }
+/* ★ A `<select>`'s options are the CONTENT OF A CONTROL, not of the page: a
+   browser shows the selected one inside the widget. The profile has no
+   controls yet (§3.14), so dumping every option as body text is strictly
+   worse than showing none — FreeBSD's man page rendered its whole version
+   dropdown, 200 releases, as a paragraph. */
+option, optgroup, datalist { display: none }
 table { display: table; border-spacing: 2px 2px }
 tr { display: table-row }
 td, th { display: table-cell; padding-top: 1px; padding-right: 1px; padding-bottom: 1px; padding-left: 1px }
