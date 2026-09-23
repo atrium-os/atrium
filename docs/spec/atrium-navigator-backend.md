@@ -1583,6 +1583,41 @@ sidebar or menu toggled open by script rendered closed. `checked`, `selected`, `
 its whole page layout drops — and they are as bounded and deterministic as `calc()` is.
 Admitting them is a Profile v1 change, so it is the user's call, not this file's.
 
+**Six more documents (2026-09-23), six more bugs**, the count again unmoved at 29/29:
+- **`nowrap` beats `break-word`.** `overflow-wrap` applies only where breaking is allowed
+  (CSS Text 3 §5.5), and under `nowrap` there is nowhere. MDN's nav buttons rendered one
+  character per line, vertically down the page.
+- ★ **`display: contents` is a STRUCTURAL instruction, not a value.** The element
+  generates no box and its children take its place, so the normalizer carries it out on
+  the DOM — 1510 elements in 29 documents — and the profile needs no such value.
+- **Media range syntax.** `@media (width <= 1044px)` is how modern sheets are written and
+  the profile's parser knows only `max-width`, so every rule inside was dropped, including
+  the `display: none` that hides MDN's mobile menu. Translated, with a 0.02 px nudge for
+  strict comparisons so the boundary falls on the honest side.
+- ★ **Named grid areas resolve to numbered lines.** `grid-template-areas` plus
+  `grid-area: toolbar` is a static mapping, so the normalizer computes it; without it
+  every child lands in the same cell, and rustdoc's breadcrumb rendered on top of its
+  search box.
+- **A `<select>`'s options are the content of a CONTROL, not of the page.** With no
+  controls yet (§3.14), dumping every option as body text is strictly worse than showing
+  none: FreeBSD's man page rendered its whole version dropdown, 200 releases, as a
+  paragraph.
+- **`font-size: 0` paints nothing.** It is how a page hides text from sight while keeping
+  it for a screen reader; emitting the run anyway put rustdoc's hidden "Copy item path"
+  into the scene, and a consumer scaling glyphs by zero drew them at the font's own
+  units — a grey blob 450 px across.
+
+**The normalizer gained an exit gate**: every declaration is checked against the profile's
+grammar on the way out, whatever path it took to get there. One check at the exit is worth
+more than trusting every entrance.
+
+**Known limit.** MDN's app shell still overlaps: its layout interleaves `position: sticky`,
+`!important` grid overrides and container queries. The CONTENT renders readably; the shell
+needs its own investigation. Everything else reviewed — Wikipedia, the W3C and WHATWG
+specs, the Rust book, rustdoc, Hacker News, lobste.rs, danluu, Joel on Software, the Rust
+blog, GitHub, freebsd.org, the FreeBSD man page, the GNU coreutils manual, info.cern.ch —
+renders as the site itself looks.
+
 ★ **Two renderer tests had been failing for hours** — a stale sample golden and a pinned
 `nsg 0.1` header — behind `grep -c "test result: ok"`, which counts the suites that passed
 and cannot see one that failed. Counted properly: **505 tests, 0 failures, six crates**.
