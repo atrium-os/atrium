@@ -163,7 +163,18 @@ pub fn render_html_with(html: &str, fonts: &FontSet, env: &Env, subs: &Subresour
     let root = dom.element_children(dom.root()).into_iter().next();
     // The root's containing block is the viewport: definite in both axes.
     let h = match root { Some(r) => cx.block(r, 0, 0, u(env.width_px), Some(u(env.height_px)), (None, None)), None => 0 };
-    cx.scene.height = h.max(u(env.height_px));
+    // ★ The scene's extent is what a reader can scroll to, and that is the
+    // CONTENT, not the root box. Wikipedia sets `html { height: 100% }`,
+    // which makes the root box exactly one viewport tall while 14,000 nodes
+    // sit below it — taking the root's height alone reported a 600 px
+    // document and the review render showed only its first screen.
+    let bottom = cx.scene.rects.iter().map(|r| r.y + r.h)
+        .chain(cx.scene.runs.iter().map(|r| r.y))
+        .chain(cx.scene.images.iter().map(|i| i.area.y + i.area.h))
+        .chain(cx.scene.shadows.iter().map(|s| s.y + s.h))
+        .chain(cx.scene.grads.iter().map(|g| g.area.y + g.area.h))
+        .max().unwrap_or(0);
+    cx.scene.height = h.max(u(env.height_px)).max(bottom);
     cx.scene.order = restack(&cx.scene.order, &cx.contexts, &cx.hoists);
     cx.scene.resolve_xforms();
     diagnostics.extend(cx.diagnostics);
@@ -388,6 +399,13 @@ impl<'a> Cx<'a> {
         if let Some(mn) = len(s.get("min-width"), cb_w) { w = w.max(mn) }
         w = w.max(frame);
         if let Some(fw) = force.0 { w = fw.max(frame) }
+        // ★ CSS 2.1 §17.5.2: a table's used width is the GREATER of its
+        // specified width and its MINIMUM content width. Clamping the
+        // columns to a narrower specified width instead is what left a
+        // 330 px image hanging 28 px outside a 310 px infobox.
+        if kw(s, "display") == "table" {
+            if let Some(min) = self.table_min_content(h, s, cb_w) { w = w.max(min + frame) }
+        }
         // Auto margins take what is left; both auto centres.
         let free = cb_w - w - ml.unwrap_or(0) - mr.unwrap_or(0);
         match (ml, mr) {
@@ -750,9 +768,17 @@ impl<'a> Cx<'a> {
     /// A replaced element: `<img src>` resolved through the input's
     /// subresources. ★ §3.13 again — an undeclared image is refused, never
     /// measured here.
+    /// ★ The DECLARED size counts even when no bytes are in hand — the same
+    /// rule `replaced` uses, and it must be the same rule, because this is
+    /// what MEASURES the box. Consulting only the subresource map made an
+    /// image 0 wide during offline table pre-measurement (which is run
+    /// without one), so its column came out too narrow and the image
+    /// overflowed the cell at render time.
     fn replaced_size(&self, h: Handle) -> Option<(U, U)> {
         if self.dom.tag(h) != Some("img") { return None }
+        let declared = |n: &str| self.dom.attr(h, n).and_then(|v| v.trim().parse::<f64>().ok()).map(u);
         self.subs.get(self.dom.attr(h, "src").unwrap_or("")).map(|(_, w, hh)| (*w, *hh))
+            .or_else(|| declared("width").zip(declared("height")))
     }
 
     fn replaced(&mut self, h: Handle) -> Option<(String, U, U)> {
@@ -800,6 +826,39 @@ impl<'a> Cx<'a> {
         // Centred, which is `object-position: 50% 50%` — the profile has no
         // object-position row, so it is a fixed rule.
         (cx + (cw - tw) / 2, cy + (ch - th) / 2, tw, th)
+    }
+
+    /// The narrowest a table can be: its declared column minimums plus the
+    /// spacing around and between them. `None` when the columns are not
+    /// declared, in which case the table is refused anyway (§3.13).
+    fn table_min_content(&mut self, h: Handle, s: &Style, cb_w: U) -> Option<U> {
+        let (sx, _) = match s.get("border-spacing") {
+            V::Pair(a, b) => (len(a, cb_w).unwrap_or(0), len(b, 0).unwrap_or(0)),
+            _ => (0, 0),
+        };
+        // The first row, flattening any wrapper — the same walk the layout does.
+        let mut stack: Vec<Handle> = self.dom.element_children(h).into_iter().rev().collect();
+        let mut first = None;
+        while let Some(c) = stack.pop() {
+            match self.st(c).map(|cs| kw(cs, "display")) {
+                Some("table-row") => { first = Some(c); break }
+                Some("none") => {}
+                _ => for g in self.dom.element_children(c).into_iter().rev() { stack.push(g) },
+            }
+        }
+        let cells: Vec<Handle> = self.dom.element_children(first?).into_iter()
+            .filter(|c| self.st(*c).map(|cs| kw(cs, "display")) == Some("table-cell")).collect();
+        if cells.is_empty() { return None }
+        let mut total = sx * (cells.len() as U + 1);
+        for c in &cells {
+            let cs = self.st(*c)?;
+            total += match (len(cs.get("width"), cb_w), len(cs.get("min-width"), cb_w)) {
+                (Some(w), _) => w,
+                (None, Some(m)) => m,
+                _ => return None,
+            };
+        }
+        Some(total)
     }
 
     /// CSS background geometry: `background-size` gives the tile, then
@@ -865,6 +924,11 @@ impl<'a> Cx<'a> {
 
     fn measure(&mut self, h: Handle, cb_w: U, cb_h: Option<U>, force: (Option<U>, Option<U>)) -> U {
         let (o, r, n, l) = (self.scene.order.len(), self.scene.rects.len(), self.scene.runs.len(), self.scene.links.len());
+        // ★ Every node kind, not just the three that existed when this was
+        // written. `order` alone being rolled back hides it — the scene
+        // still renders correctly, and quietly carries orphan nodes that
+        // nothing points at.
+        let (sh, gr_n, im) = (self.scene.shadows.len(), self.scene.grads.len(), self.scene.images.len());
         let (cl, gr, cur, xf) = (self.scene.clips.len(), self.scene.groups.len(), self.scene.cur, self.scene.xforms.len());
         let diags = self.diagnostics.len();
         let (links, counts, marker, report) = (self.links.len(), self.unimplemented.clone(), self.marker.clone(), self.report.clone());
@@ -872,6 +936,9 @@ impl<'a> Cx<'a> {
         let hgt = self.block(h, 0, 0, cb_w, cb_h, force);
         self.scene.order.truncate(o); self.scene.rects.truncate(r); self.scene.runs.truncate(n); self.scene.links.truncate(l);
         self.scene.rect_attrs.truncate(r); self.scene.run_attrs.truncate(n); self.scene.link_attrs.truncate(l);
+        self.scene.shadows.truncate(sh); self.scene.shadow_attrs.truncate(sh);
+        self.scene.grads.truncate(gr_n); self.scene.grad_attrs.truncate(gr_n);
+        self.scene.images.truncate(im); self.scene.image_attrs.truncate(im);
         self.scene.clips.truncate(cl); self.scene.groups.truncate(gr); self.scene.cur = cur;
         self.scene.xforms.truncate(xf); self.scene.xform_parents.truncate(xf);
         // A trial layout must leave no diagnostics behind: the real one

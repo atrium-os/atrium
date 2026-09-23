@@ -22,6 +22,24 @@ pub struct Sheet { pub href: String, pub media: String, pub text: String }
 #[derive(Debug, Clone, PartialEq)]
 pub struct Image { pub src: String, pub width: u32, pub height: u32, pub address: String }
 
+/// Where fetched bytes are kept, named by their content address. A
+/// stand-in for Tessera's CAS with the same two properties that matter: the
+/// name IS the hash, so a byte that changes changes the name, and a second
+/// document referencing the same image costs nothing.
+pub fn blob_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("PRERENDER_BLOB_DIR").map(std::path::PathBuf::from)
+}
+
+fn store(address: &str, bytes: &[u8]) {
+    let Some(dir) = blob_dir() else { return };
+    let Some(hex) = address.strip_prefix("blake3:") else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join(hex);
+    // Content-addressed: if it is there, it is already the right bytes.
+    if path.exists() { return }
+    let _ = std::fs::write(path, bytes);
+}
+
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Subresources {
     pub sheets: Vec<Sheet>,
@@ -70,8 +88,11 @@ pub fn collect(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher) -> Subr
         let Some(abs) = resolve(&src) else { out.failed.push((src, "cannot resolve".into())); continue };
         match fetcher.get_bytes(&abs) {
             Ok(bytes) => match intrinsic_size(&bytes).or_else(|| declared("width").zip(declared("height"))) {
-                Some((w, ht)) => out.images.push(Image { src, width: w, height: ht,
-                                                         address: format!("blake3:{}", blake3::hash(&bytes).to_hex()) }),
+                Some((w, ht)) => {
+                    let address = format!("blake3:{}", blake3::hash(&bytes).to_hex());
+                    store(&address, &bytes);
+                    out.images.push(Image { src, width: w, height: ht, address });
+                }
                 None => out.failed.push((src, "no intrinsic size in the header".into())),
             },
             Err(e) => match declared("width").zip(declared("height")) {

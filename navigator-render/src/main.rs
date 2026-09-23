@@ -3,7 +3,8 @@
 //!                                 a digest over all of them — what the M0
 //!                                 gate compares across runs and machines.
 //! nsg-render --pins               canonical addresses of the font set (to pin)
-//! nsg-render --corpus-html <dir>  render every .html through the PROFILE
+//! nsg-render --corpus-html <dir> [--recordings <dir>]
+//!                                 render every .html through the PROFILE
 //!                                 renderer and report what each document
 //!                                 refuses — M2's corpus leg. The number it
 //!                                 prints is "documents that render with no
@@ -31,6 +32,12 @@ fn main() -> ExitCode {
             use navigator_style::cascade::Env;
             use std::collections::BTreeMap;
             let dir = args.get(2).expect("directory");
+            // ★ The subresource map comes from the converter's RECORDING —
+            // `src -> (content address, intrinsic size)`. Without it an
+            // image lays out and reserves its space but cannot be painted,
+            // because a scene node names bytes by address and nothing here
+            // would know which bytes.
+            let recordings = args.iter().position(|a| a == "--recordings").and_then(|i| args.get(i + 1));
             let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir).expect("readable dir")
                 .flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "html")).collect();
             files.sort();
@@ -39,9 +46,15 @@ fn main() -> ExitCode {
             let mut codes: BTreeMap<String, (usize, usize)> = BTreeMap::new(); // code -> (hits, docs)
             let mut unimpl: BTreeMap<String, (usize, usize)> = BTreeMap::new();
             let mut total = Report::default();
+            let mut painted = 0usize;
             for f in &files {
                 let html = std::fs::read_to_string(f).unwrap_or_default();
-                let o = navigator_render::html::render_html(&html, &fonts, &env);
+                let subs = recordings.map(|r| {
+                    let stem = f.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                    navigator_render::conformance::subresources_from_recording(&std::path::Path::new(r).join(format!("{stem}.json")))
+                }).unwrap_or_default();
+                painted += subs.len();
+                let o = navigator_render::html::render_html_with(&html, &fonts, &env, &subs);
                 n += 1;
                 let mut per: BTreeMap<String, usize> = BTreeMap::new();
                 for d in &o.diagnostics {
@@ -59,6 +72,7 @@ fn main() -> ExitCode {
                     per.keys().cloned().collect::<Vec<_>>().join(","));
             }
             println!("\nCORPUS: {clean}/{n} documents render with NO refusal");
+            if recordings.is_some() { println!("subresources supplied: {painted} images") }
             println!("refusals, by code (hits / documents):");
             let mut v: Vec<_> = codes.into_iter().collect();
             v.sort_by_key(|(_, (h, _))| std::cmp::Reverse(*h));
@@ -102,6 +116,17 @@ fn main() -> ExitCode {
             println!("corpus {n} documents input {} digest {}", inputs.finalize().to_hex(), all.finalize().to_hex());
             eprintln!("report: {total:?}");
             ExitCode::SUCCESS
+        }
+        // A single HTML document, through the profile renderer.
+        Some(path) if path.ends_with(".html") => {
+            let html = std::fs::read_to_string(path).expect("readable");
+            let rec = args.iter().position(|a| a == "--recording").and_then(|i| args.get(i + 1));
+            let subs = rec.map(|r| navigator_render::conformance::subresources_from_recording(std::path::Path::new(r))).unwrap_or_default();
+            let env = navigator_style::cascade::Env::default();
+            let o = navigator_render::html::render_html_with(&html, &fonts, &env, &subs);
+            for d in &o.diagnostics { eprintln!("{} {}", d.code, d.msg) }
+            print!("{}", nsg::write(&o.scene, &fonts));
+            return ExitCode::SUCCESS;
         }
         Some(path) => {
             let md = String::from_utf8_lossy(&std::fs::read(path).expect("readable")).into_owned();

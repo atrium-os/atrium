@@ -129,6 +129,31 @@ pub fn subresource_files(fixture: &Path) -> std::collections::BTreeMap<String, s
     out
 }
 
+/// `src -> (address, width, height)` out of a recording — the same fields
+/// the normalizer read, for the other half of the job: it needed the SIZE to
+/// lay out, this needs the ADDRESS to paint.
+pub fn subresources_from_recording(path: &std::path::Path) -> crate::Subresources {
+    let mut out = crate::Subresources::new();
+    let Ok(json) = std::fs::read_to_string(path) else { return out };
+    // One object per line-ish: the emitter writes them one per line.
+    for line in json.lines() {
+        let line = line.trim();
+        if !line.starts_with("{ \"src\"") { continue }
+        let field = |k: &str| -> Option<String> {
+            let at = line.find(&format!("\"{k}\": "))? + k.len() + 4;
+            let rest = &line[at..];
+            if let Some(r) = rest.strip_prefix('"') { Some(r[..r.find('"')?].to_string()) }
+            else { Some(rest[..rest.find([',', ' ', '}'])?].to_string()) }
+        };
+        let (Some(src), Some(a), Some(w), Some(h)) = (field("src"), field("address"), field("width"), field("height")) else { continue };
+        if a.is_empty() { continue }
+        let (Ok(w), Ok(h)) = (w.parse::<i64>(), h.parse::<i64>()) else { continue };
+        out.insert(src, (a, w * 64, h * 64));
+    }
+    out
+}
+
+
 pub fn run(dir: &Path, fonts: &FontSet, bless: bool) -> Vec<RowResult> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir).map(|rd| rd.flatten().map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "html")).collect()).unwrap_or_default();
