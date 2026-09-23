@@ -980,7 +980,7 @@ layout.
 
 ### 8.3 M2 progress — the number, first reading (2026-09-22)
 
-**CONFORMANCE: exercised 59/64, matched 57/64** (13 on first reading; see the updates
+**CONFORMANCE: exercised 62/64, matched 57/64** (13 on first reading; see the updates
 below). Printed by `nsg-conformance`; the
 matched set is pinned by a test so it cannot fall silently.
 
@@ -1298,6 +1298,21 @@ Every `display` value the profile admits is now laid out; nothing in §3.3 is co
   shadow paints behind its own box. `visibility: hidden` paints neither.
 - Blur is left to the consumer, as rasterization always is; the review rasterizer
   approximates it with three box passes at sigma = blur / 2.
+
+**Update — gradients (rows 50-53 exercised, none matched yet).**
+- **NSG gains `grad`**, a linear gradient over a `Tiling`: where it is painted (the
+  border box), where the first tile goes, how big it is and how it repeats. Every stop
+  carries an explicit position in 1/1024, because the renderer resolves CSS's implicit
+  even distribution — a reader never has to.
+- Fixed rules, since the profile admits neither `background-origin` nor
+  `background-clip`: the POSITIONING area is the padding box, the PAINTED area is the
+  border box.
+- ★ **Rows 51-53 are exercised and deliberately NOT matched.** A gradient has no
+  intrinsic size, so its tile always fills the area's height — which makes
+  `background-position-y` unobservable, `repeat-y` identical to `no-repeat` and
+  `repeat` identical to `repeat-x`. Two of four values in row 53 render the same either
+  way. The goldens were blessed, reviewed, found unable to show what they certify, and
+  **withdrawn**; these rows wait for `url()` and a real intrinsic size.
 
 ## 9. What this reuses
 

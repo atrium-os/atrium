@@ -11,7 +11,7 @@
 //! where they occur. Every `display` value in the profile is laid out.
 
 use crate::fontset::{Family, FontSet};
-use crate::{scale, Link, Rect, Report, Run, Scene, Shadow, Shaper, Style as FontStyle, Xform, PX, U, XF_ONE};
+use crate::{scale, Grad, Link, Rect, Report, Run, Scene, Shadow, Shaper, Style as FontStyle, Xform, PX, U, XF_ONE};
 use navigator_dom::{Dom, Handle, Kind};
 use navigator_style::cascade::{cascade, Env, Style};
 use navigator_style::sheet::{parse_sheet, Diagnostic, Stylesheet};
@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 /// so a property the layout ignores can never be dropped silently (§5.1).
 /// Value-level gaps inside a read row (flex as block, italic without an
 /// italic face, …) are counted where they occur.
-pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 54, 55, 56, 57, 59, 60, 61, 62, 63, 64];
+pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 51, 52, 53, 54, 55, 56, 57, 59, 60, 61, 62, 63, 64];
 
 pub struct HtmlOut {
     pub scene: Scene,
@@ -437,7 +437,21 @@ impl<'a> Cx<'a> {
         }
         let bg = color_of(s, "background-color");
         if bg & 0xff != 0 { paint.push(Rect { x: bx, y: by, w, h: hgt, rgba: bg, radii, ring: 0 }) }
-        if !matches!(s.get("background-image"), V::Kw("none")) { self.count("background-image (not painted)") }
+        // ★ The background image goes OVER the background colour and under
+        // everything else, so it is inserted at the box's own slot, after the
+        // colour. Its positioning area is the PADDING box (CSS's
+        // background-origin default); it is painted over the whole border box
+        // (the background-clip default). Neither property is in the profile,
+        // so both are fixed rules here.
+        let bg_image = match s.get("background-image") {
+            V::Gradient { angle_deg, stops } => {
+                let pad = (bx + bl, by + bt, (w - bl - br).max(0), (hgt - bt - bb).max(0));
+                let area = self.tiling(s, (bx, by, w, hgt), pad, None);
+                Some(Grad { area, angle: (angle_deg * 64.0).round() as i64, stops: resolve_stops(stops, s) })
+            }
+            V::Url(_) => { self.count("background-image: url() (no subresource supplied)"); None }
+            _ => None,
+        };
         // (side width, x, y, length, horizontal?, style, colour)
         for (t, sx, sy, length, horiz, style_p, color_p) in [
             (bt, bx, by, w, true, "border-top-style", "border-top-color"),
@@ -494,7 +508,11 @@ impl<'a> Cx<'a> {
             }
         }
         for (i, r) in paint.into_iter().enumerate() { self.scene.insert_rect(slot + i, r) }
-        let painted = n_paint + (slot - bg_slot);
+        slot += n_paint;
+        if let Some(g) = bg_image {
+            if !hidden && g.area.w > 0 && g.area.h > 0 { self.scene.insert_grad(slot, g); slot += 1 }
+        }
+        let painted = slot - bg_slot;
         // ★ Inserting this box's background at the slot reserved before the
         // children SHIFTS every entry after it, so the ranges the children
         // recorded no longer point at what they painted. Move them.
@@ -589,6 +607,52 @@ impl<'a> Cx<'a> {
         self.block(h, 0, 0, cbw, cbh, (Some(w), forced_h));
         self.abs_origin = None;
         self.placing_abs = false;
+    }
+
+    /// CSS background geometry: `background-size` gives the tile, then
+    /// `background-position-x/y` place it in the POSITIONING area (the
+    /// padding box), and `background-repeat` says how it tiles over the
+    /// PAINTED area (the border box).
+    ///
+    /// `intrinsic` is the image's own size, or `None` for a gradient — which
+    /// has no intrinsic size, so `auto` is the positioning area itself.
+    fn tiling(&mut self, s: &Style, paint: (U, U, U, U), pos_area: (U, U, U, U), intrinsic: Option<(U, U)>) -> crate::Tiling {
+        let (ax, ay, aw, ah) = pos_area;
+        let (iw, ih) = intrinsic.unwrap_or((aw, ah));
+        let (tw, th) = match s.get("background-size") {
+            V::Kw("cover") | V::Kw("contain") if iw > 0 && ih > 0 => {
+                // Scale to fit or to fill, keeping the ratio, in integers.
+                let (nw, nh) = (aw as i128 * ih as i128, ah as i128 * iw as i128);
+                let cover = kw(s, "background-size") == "cover";
+                if (nw > nh) == cover { (aw, (aw as i128 * ih as i128 / iw as i128) as U) }
+                else { ((ah as i128 * iw as i128 / ih as i128) as U, ah) }
+            }
+            V::Kw(_) => (iw, ih),
+            // One value sizes the WIDTH; the height follows the ratio, and a
+            // gradient has none, so it takes the area's height.
+            v => {
+                let tw = len(v, aw).unwrap_or(iw).max(0);
+                let th = if intrinsic.is_some() && iw > 0 { (tw as i128 * ih as i128 / iw as i128) as U } else { ah };
+                (tw, th)
+            }
+        };
+        // P% puts the point P% across the tile at P% across the area.
+        let place = |v: &V, area: U, tile: U, is_x: bool| -> U {
+            match v {
+                V::Kw(k) => match *k {
+                    "right" | "bottom" => area - tile,
+                    "center" => (area - tile) / 2,
+                    _ => 0,
+                },
+                V::Pct(p) => scale(area - tile, (*p * 1024.0).round() as i64, 102400),
+                v => len(v, area).unwrap_or(0) * if is_x { 1 } else { 1 },
+            }
+        };
+        let repeat = match kw(s, "background-repeat") { "no-repeat" => 0, "repeat-x" => 1, "repeat-y" => 2, _ => 3 };
+        crate::Tiling { x: paint.0, y: paint.1, w: paint.2, h: paint.3,
+                        tx: ax + place(s.get("background-position-x"), aw, tw, true),
+                        ty: ay + place(s.get("background-position-y"), ah, th, false),
+                        tw: tw.max(1), th: th.max(1), repeat }
     }
 
     /// Lay `h` out somewhere the reader never sees, and return its outer
@@ -1604,8 +1668,8 @@ mod tests {
     #[test]
     fn unimplemented_layout_is_counted_not_faked() {
         // A property the layout reads but cannot paint is still counted.
-        let o = render(r#"<style>div { background-image: linear-gradient(#ff0000, #00ff00) }</style><div>x</div>"#);
-        assert!(o.unimplemented.contains_key("background-image (not painted)"), "{:?}", o.unimplemented);
+        let o = render(r#"<style>div { background-image: url(cat.png) }</style><div>x</div>"#);
+        assert!(o.unimplemented.contains_key("background-image: url() (no subresource supplied)"), "{:?}", o.unimplemented);
     }
 
     #[test]
@@ -1822,6 +1886,40 @@ mod tests {
         // visibility: hidden paints neither the box nor its shadow.
         let h = render(r#"<style>.s { width: 100px; height: 40px; visibility: hidden; box-shadow: 4px 6px 10px 2px #000000 }</style><div class="s"></div>"#);
         assert!(h.scene.shadows.is_empty());
+    }
+
+    /// A gradient is a tiled paint source: the tile comes from
+    /// `background-size`, its place from `background-position-*`, and the
+    /// painted area is the border box while the POSITIONING area is the
+    /// padding box.
+    #[test]
+    fn background_gradient_geometry() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { width: 200px; height: 100px; border-left-width: 10px; border-left-style: solid; border-left-color: #000000;
+                 background-image: linear-gradient(to right, #ff0000, #0000ff) }</style>
+            <div class="g"></div>"#);
+        let g = &o.scene.grads[0];
+        // Painted over the whole border box; the tile fills the padding box,
+        // which starts 10px in and is 190 wide.
+        assert_eq!((g.area.x, g.area.y, g.area.w, g.area.h), (0, 0, 200 * 64, 100 * 64));
+        assert_eq!((g.area.tx, g.area.ty, g.area.tw, g.area.th), (10 * 64, 0, 190 * 64, 100 * 64));
+        assert_eq!(g.angle, 90 * 64, "to right");
+        assert_eq!(g.stops, vec![(0xff0000ff, 0), (0x0000ffff, 1024)]);
+
+        // size, position and repeat.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { width: 200px; height: 100px; background-size: 50px; background-position-x: 100%; background-position-y: center;
+                 background-repeat: no-repeat; background-image: linear-gradient(#ff0000, #00ff00, #0000ff) }</style>
+            <div class="g"></div>"#);
+        let g = &o.scene.grads[0];
+        // A gradient has no intrinsic ratio, so one value sizes the width and
+        // the height stays the area's.
+        assert_eq!((g.area.tw, g.area.th), (50 * 64, 100 * 64));
+        // 100% across: the tile's right edge on the area's right edge.
+        assert_eq!((g.area.tx, g.area.ty), (150 * 64, 0));
+        assert_eq!(g.area.repeat, 0);
+        // The middle stop with no position gets the even share.
+        assert_eq!(g.stops, vec![(0xff0000ff, 0), (0x00ff00ff, 512), (0x0000ffff, 1024)]);
     }
 
     #[test]
@@ -2042,6 +2140,36 @@ fn transform_matrix(list: &[Tf], w: U, h: U, origin: (U, U)) -> Xform {
     let to = [XF_ONE, 0, 0, XF_ONE, origin.0, origin.1];
     let back = [XF_ONE, 0, 0, XF_ONE, -origin.0, -origin.1];
     crate::compose(crate::compose(to, m), back)
+}
+
+/// CSS gradient stops with every position made explicit: a stop with no
+/// position takes 0% (first), 100% (last) or an even share of the gap
+/// between its positioned neighbours. Positions are in 1/1024.
+fn resolve_stops(stops: &[navigator_style::values::Stop], s: &Style) -> Vec<(u32, i64)> {
+    let current = match s.get("color") { V::Color(c) => rgba(c, 0x000000ff), _ => 0x000000ff };
+    let n = stops.len();
+    let mut at: Vec<Option<i64>> = stops.iter().map(|st| st.at.map(|p| (p * 1024.0 / 100.0).round() as i64)).collect();
+    if n > 0 {
+        if at[0].is_none() { at[0] = Some(0) }
+        if at[n - 1].is_none() { at[n - 1] = Some(1024) }
+    }
+    let mut i = 0;
+    while i < n {
+        if at[i].is_some() { i += 1; continue }
+        // The run of unpositioned stops between two positioned ones.
+        let (start, mut end) = (i, i);
+        while end < n && at[end].is_none() { end += 1 }
+        let (a, b) = (at[start - 1].expect("positioned"), at[end].expect("positioned"));
+        for k in start..end { at[k] = Some(a + (b - a) * (k - start + 1) as i64 / (end - start + 1) as i64) }
+        i = end;
+    }
+    // A position never goes backwards (CSS clamps to the previous one).
+    let mut last = i64::MIN;
+    stops.iter().zip(at).map(|(st, p)| {
+        let p = p.expect("resolved").max(last);
+        last = p;
+        (rgba(&st.color, current), p)
+    }).collect()
 }
 
 fn size_tracks(tracks: &[navigator_style::values::Track], avail: Option<U>, gap: U, mins: &[U], maxs: &[U]) -> Vec<U> {

@@ -146,6 +146,43 @@ fn paint_one(cv: &mut Canvas, scene: &Scene, fonts: &FontSet, ctx: &mut swash::s
                 }
             }
         }
+        4 => {
+            let g = &scene.grads[i];
+            let (a, k) = (&g.area, 1024.0f64);
+            let (rad, l) = {
+                let deg = g.angle as f64 / 64.0;
+                let (sin, cos) = navigator_render::sin_cos_deg(deg);
+                // CSS's gradient line: through the tile's centre, long enough
+                // that the corners map to 0 and 1.
+                ((sin, cos), (a.tw as f64 * sin.abs() + a.th as f64 * cos.abs()).max(1.0))
+            };
+            for py in (a.y / PX)..((a.y + a.h) / PX) {
+                for px in (a.x / PX)..((a.x + a.w) / PX) {
+                    // Into tile space, wrapping only on the axes that repeat.
+                    let (mut sx, mut sy) = ((px * PX - a.tx) as f64, (py * PX - a.ty) as f64);
+                    if a.repeat & 1 != 0 { sx = sx.rem_euclid(a.tw as f64) } else if sx < 0.0 || sx >= a.tw as f64 { continue }
+                    if a.repeat & 2 != 0 { sy = sy.rem_euclid(a.th as f64) } else if sy < 0.0 || sy >= a.th as f64 { continue }
+                    let (cx, cy) = (a.tw as f64 / 2.0, a.th as f64 / 2.0);
+                    let t = (((sx - cx) * rad.0 - (sy - cy) * rad.1) / l + 0.5).clamp(0.0, 1.0) * k;
+                    // The pair of stops around t.
+                    let mut col = g.stops.first().map(|s| s.0).unwrap_or(0);
+                    for w in g.stops.windows(2) {
+                        let ((c0, p0), (c1, p1)) = (w[0], w[1]);
+                        if t >= p0 as f64 && t <= p1 as f64 {
+                            let f = if p1 > p0 { (t - p0 as f64) / (p1 - p0) as f64 } else { 0.0 };
+                            let mix = |sh: u32| {
+                                let (a0, a1) = (((c0 >> sh) & 0xff) as f64, ((c1 >> sh) & 0xff) as f64);
+                                (a0 + (a1 - a0) * f).round() as u32
+                            };
+                            col = mix(24) << 24 | mix(16) << 16 | mix(8) << 8 | mix(0);
+                            break;
+                        }
+                        if t > p1 as f64 { col = c1 }
+                    }
+                    cv.blend(px, py, col, 1.0);
+                }
+            }
+        }
         _ => {}
     }
 }

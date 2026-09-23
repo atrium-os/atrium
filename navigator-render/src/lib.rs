@@ -70,6 +70,22 @@ pub struct Run {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Link { pub x: U, pub y: U, pub w: U, pub h: U, pub href: String }
 
+/// A tiled paint source over an area: where it is painted (`x y w h`, the
+/// border box), where the first tile goes and how big it is, and how it
+/// repeats. The same geometry serves a gradient and (later) an image, since
+/// CSS sizes and tiles both the same way.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Tiling { pub x: U, pub y: U, pub w: U, pub h: U, pub tx: U, pub ty: U, pub tw: U, pub th: U,
+                    /// 0 none, 1 x, 2 y, 3 both.
+                    pub repeat: u8 }
+
+/// A linear gradient painted over a `Tiling`. The angle is in 1/64 degree,
+/// clockwise from "to top" as CSS defines it, and every stop carries an
+/// explicit position in 1/1024 of the gradient line — the renderer resolves
+/// CSS's implicit even distribution, so a reader never has to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Grad { pub area: Tiling, pub angle: i64, pub stops: Vec<(u32, i64)> }
+
 /// A box shadow: the box's own rect, offset and inflated by the spread,
 /// blurred by `blur` and painted BEHIND the box (profile §3.8, one shadow).
 #[derive(Clone, Debug, PartialEq)]
@@ -97,7 +113,8 @@ pub struct Scene {
     pub runs: Vec<Run>,
     pub links: Vec<Link>,
     pub shadows: Vec<Shadow>,
-    /// Draw order: (kind, index). 0 rect, 1 run, 2 link, 3 shadow.
+    pub grads: Vec<Grad>,
+    /// Draw order: (kind, index). 0 rect, 1 run, 2 link, 3 shadow, 4 grad.
     pub order: Vec<(u8, usize)>,
     /// Clip rectangles, each already intersected with its ancestors', so a
     /// node needs only one index and a reader needs no stack.
@@ -117,6 +134,7 @@ pub struct Scene {
     pub run_attrs: Vec<Attrs>,
     pub link_attrs: Vec<Attrs>,
     pub shadow_attrs: Vec<Attrs>,
+    pub grad_attrs: Vec<Attrs>,
     /// The clip and group a node created now belongs to.
     /// Public only so review tooling can build a scene of one node.
     pub cur: Attrs,
@@ -126,6 +144,13 @@ impl Scene {
     pub(crate) fn rect(&mut self, r: Rect) { self.order.push((0, self.rects.len())); self.rects.push(r); self.rect_attrs.push(self.cur) }
     pub(crate) fn run(&mut self, r: Run) { self.order.push((1, self.runs.len())); self.runs.push(r); self.run_attrs.push(self.cur) }
     pub(crate) fn link(&mut self, l: Link) { self.order.push((2, self.links.len())); self.links.push(l); self.link_attrs.push(self.cur) }
+    /// A gradient painted into a slot reserved earlier — a background goes
+    /// over the box's background colour and under everything else.
+    pub(crate) fn insert_grad(&mut self, slot: usize, g: Grad) {
+        self.order.insert(slot, (4, self.grads.len()));
+        self.grads.push(g);
+        self.grad_attrs.push(self.cur);
+    }
     /// A shadow painted into a slot reserved earlier — it goes BEHIND the
     /// box, so it is inserted before the box's own background.
     pub(crate) fn insert_shadow(&mut self, slot: usize, sh: Shadow) {
