@@ -123,6 +123,13 @@ struct Cx<'a> {
     /// Set by `abs_box` so the one `block()` call it makes lays the box out
     /// instead of diverting it again.
     placing_abs: bool,
+    /// ★ Out-of-flow boxes met while gathering INLINE content. An absolutely
+    /// positioned element is blockified (CSS Display 3 §2.7) and takes no
+    /// room in the line, so it cannot be flattened into it — doing that
+    /// poured Joel on Software's two `.screen-reader-text` labels, each
+    /// `width: 1px; overflow: hidden`, across the page as visible text.
+    /// They are placed after the line box that would have held them.
+    pending_abs: Vec<Handle>,
     /// Set by `abs_box`: the border-box origin `block()` must use instead of
     /// the one normal flow would give it.
     abs_origin: Option<(U, U)>,
@@ -173,7 +180,7 @@ pub fn render_html_with(html: &str, fonts: &FontSet, env: &Env, subs: &Subresour
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]),
                       viewport: (u(env.width_px), Some(u(env.height_px))), pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))),
-                      subs, placing_abs: false, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
+                      subs, placing_abs: false, pending_abs: vec![], abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
     cx.promoted = promote_block_in_inline(&dom, &styled.styles);
     cx.count_unread_rows();
     // The root element is the initial containing block's only child.
@@ -225,7 +232,7 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None,
                       indent: None, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), viewport: (u(env.width_px), Some(u(env.height_px))),
                       pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))), subs: &Subresources::new(),
-                      placing_abs: false, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
+                      placing_abs: false, pending_abs: vec![], abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
     // (cell handle, min, max) for every first-row cell of every table.
     let mut decls: Vec<(Handle, U, U)> = vec![];
     for t in 0..dom.nodes.len() as Handle {
@@ -562,13 +569,17 @@ impl<'a> Cx<'a> {
             let mut inline: Vec<Item> = vec![];
             for c in self.dom.children_of(h) {
                 if self.is_block_level(c) {
+                    let ly = cy;
                     cy += self.lines(std::mem::take(&mut inline), content_x, cy, content_w, s);
+                    self.place_pending_abs(content_x, ly);
                     cy += self.block(c, content_x, cy, content_w, child_cb_h, (None, None));
                 } else {
                     self.collect_inline(c, &mut inline, s);
                 }
             }
+            let ly = cy;
             cy += self.lines(inline, content_x, cy, content_w, s);
+            self.place_pending_abs(content_x, ly);
         }
         let content_h = cy - (by + bt + pt);
         // The box's own border and background are outside its own clip.
@@ -966,7 +977,12 @@ impl<'a> Cx<'a> {
         let diags = self.diagnostics.len();
         let (links, counts, marker, report) = (self.links.len(), self.unimplemented.clone(), self.marker.clone(), self.report.clone());
         let (ctx, hoi) = (self.contexts.len(), self.hoists.len());
+        // A trial layout collects and places its OWN out-of-flow boxes (and
+        // then throws them away with the rest of the scene); it must not
+        // consume the ones the real pass is still holding.
+        let pend = std::mem::take(&mut self.pending_abs);
         let hgt = self.block(h, 0, 0, cb_w, cb_h, force);
+        self.pending_abs = pend;
         self.scene.order.truncate(o); self.scene.rects.truncate(r); self.scene.runs.truncate(n); self.scene.links.truncate(l);
         self.scene.rect_attrs.truncate(r); self.scene.run_attrs.truncate(n); self.scene.link_attrs.truncate(l);
         self.scene.shadows.truncate(sh); self.scene.shadow_attrs.truncate(sh);
@@ -1507,7 +1523,7 @@ impl<'a> Cx<'a> {
     /// shaping the same items layout would place — with the side effects of
     /// collecting them (link table, counters) rolled back.
     fn intrinsic(&mut self, h: Handle) -> (U, U) {
-        let (links, counts) = (self.links.len(), self.unimplemented.clone());
+        let (links, counts, pend) = (self.links.len(), self.unimplemented.clone(), self.pending_abs.len());
         let (mut mn, mut mx) = (0, 0);
         let mut items = vec![];
         // An anonymous block box around a run of loose text (see `block`).
@@ -1553,6 +1569,7 @@ impl<'a> Cx<'a> {
             let mn_out = if wrap { mins.into_iter().max().unwrap_or(0) } else { smn + total_gap };
             self.links.truncate(links);
             self.unimplemented = counts;
+            self.pending_abs.truncate(pend);
             return (mn_out, (smx + total_gap).max(mn_out));
         }
         for c in if anon { vec![] } else { self.dom.children_of(h) } {
@@ -1594,6 +1611,7 @@ impl<'a> Cx<'a> {
         mx = mx.max(line).max(mn);
         self.links.truncate(links);
         self.unimplemented = counts;
+        self.pending_abs.truncate(pend);
         (mn, mx)
     }
 
@@ -1634,6 +1652,12 @@ impl<'a> Cx<'a> {
     }
 
     /// Turn an inline-level node (and its inline descendants) into items.
+    /// Lay out the out-of-flow boxes `collect_inline` set aside, at the
+    /// static position of the line box they were written in.
+    fn place_pending_abs(&mut self, x: U, y: U) {
+        while let Some(h) = self.pending_abs.pop() { self.abs_box(h, x, y) }
+    }
+
     fn collect_inline(&mut self, h: Handle, out: &mut Vec<Item>, parent: &Style) {
         match self.dom.get(h).map(|n| &n.kind) {
             Some(Kind::Text(t)) => {
@@ -1643,12 +1667,13 @@ impl<'a> Cx<'a> {
             Some(Kind::Element(tag)) => {
                 let tag = tag.clone();
                 let Some(s) = self.st(h) else { return };
-                match kw(s, "display") {
-                    "none" => return,
-                    // An atomic inline: measured and placed by `lines`.
-                    "inline-block" => { let (st, l) = self.font_style(s); out.push(Item::Atomic(h, st, l)); return }
-                    _ => {}
-                }
+                if kw(s, "display") == "none" { return }
+                // ★ Out of flow: it is not part of this line. Placed once the
+                // line box it was written in has been laid out, so its static
+                // position is that line's origin.
+                if matches!(kw(s, "position"), "absolute" | "fixed") { self.pending_abs.push(h); return }
+                // An atomic inline: measured and placed by `lines`.
+                if kw(s, "display") == "inline-block" { let (st, l) = self.font_style(s); out.push(Item::Atomic(h, st, l)); return }
                 // ★ A replaced element is an atomic inline whatever its
                 // `display` says (short of `none`): it has no inline content
                 // to flow, only a box of its own declared size.
@@ -2139,6 +2164,28 @@ mod tests {
         assert_eq!(boxes(&o, 0x0000ffff), vec![(500, 0, 100, 20)]);
     }
 
+    /// ★ An absolutely positioned INLINE element is out of flow: it is
+    /// blockified (CSS Display 3 §2.7) and contributes nothing to the line.
+    /// Flattening it into the line instead ignored its own width and
+    /// `overflow`, which is the whole `.screen-reader-text` idiom — Joel on
+    /// Software's two `width: 1px; overflow: hidden` labels came out as
+    /// "View menu" and "View sidebar" written across the page.
+    #[test]
+    fn an_absolutely_positioned_inline_leaves_the_line() {
+        let src = r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .hidden { position: absolute; width: 1px; height: 1px;
+                      overflow-x: hidden; overflow-y: hidden }</style>
+            <div>visible<span class="hidden">SECRET</span></div>"#;
+        let x_of = |o: &HtmlOut, t: &str| o.scene.runs.iter().find(|r| r.text == t).map(|r| r.x);
+        let o = render(src);
+        // Out of flow: it starts at the line's ORIGIN, not after the text —
+        // and its own 1px box, which is what hides it, now applies.
+        assert_eq!(x_of(&o, "SECRET"), Some(0), "the out-of-flow box left the line");
+        // Control: in flow, the same span sits after "visible" on the line.
+        let c = render(&src.replace("position: absolute;", ""));
+        assert!(x_of(&c, "SECRET").unwrap() > 0, "the control must place it in the line");
+    }
+
     /// ★ A flex item's intrinsic width stops at a child's DEFINITE width.
     /// Measuring past one sized GitHub's collapsed file-tree pane
     /// (`width: 0`) at the max-content of the tree inside it: 446 px of
@@ -2518,7 +2565,7 @@ mod tests {
                           report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None,
                           baseline_probe: None, indent: None, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]),
                           viewport: (0, None), pos_cb: (0, 0, 0, None), subs: &Subresources::new(),
-                          placing_abs: false, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
+                          placing_abs: false, pending_abs: vec![], abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
         cx.count_rows_outside(&held_out);
         // The non-initial value is counted once; the initial one is not.
         assert_eq!(cx.unimplemented.get("row text-align… (not implemented)"), Some(&1), "{:?}", cx.unimplemented);

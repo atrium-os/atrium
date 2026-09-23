@@ -1685,6 +1685,20 @@ came out underlined, stacked one per line, colourless, and the whole page squeez
   collapses it — at the max-content width of the tree inside: 446 px of empty space,
   with the README squeezed into the remaining 353.
 
+**doc21 (Joel on Software), one more bug — and it is the `.screen-reader-text`
+idiom.** ★★ **An absolutely positioned INLINE element is out of flow.** It is blockified
+(CSS Display 3 §2.7) and contributes nothing to the line, but `collect_inline` flattened
+it into one — so its own `width: 1px; height: 1px; overflow: hidden`, which is the entire
+mechanism of the visually-hidden idiom used on every accessible site, never applied. Two
+labels came out as "View menu" and "View sidebar" written across the page. Such a box is
+now set aside and placed after the line it was written in, taking that line's origin as
+its static position.
+
+★ **Wikipedia's table of contents overlaps the article title**, and did so before any of
+this session's work (checked against the parent commit in the same tree, same binary
+rebuild). Earlier in this log "renders as the site itself looks" was too generous about
+doc01; the overlap is OPEN.
+
 ★ **Two renderer tests had been failing for hours** — a stale sample golden and a pinned
 `nsg 0.1` header — behind `grep -c "test result: ok"`, which counts the suites that passed
 and cannot see one that failed. Counted properly: **505 tests, 0 failures, six crates**.
