@@ -201,6 +201,9 @@ fn calc_px(c: &Calc, b: &Base) -> Calc {
         Calc::Num(_) | Calc::Pct(_) => c.clone(),
         Calc::Add(x, y) => Calc::Add(r(x), r(y)), Calc::Sub(x, y) => Calc::Sub(r(x), r(y)),
         Calc::Mul(x, y) => Calc::Mul(r(x), r(y)), Calc::Div(x, y) => Calc::Div(r(x), r(y)),
+        Calc::Min(v) => Calc::Min(v.iter().map(|x| calc_px(x, b)).collect()),
+        Calc::Max(v) => Calc::Max(v.iter().map(|x| calc_px(x, b)).collect()),
+        Calc::Clamp(x, y, z) => Calc::Clamp(r(x), r(y), r(z)),
     }
 }
 
@@ -223,6 +226,12 @@ fn calc_eval_px(c: &Calc) -> Option<f64> {
         Calc::Num(n) => *n, Calc::Len(l) => l.v, Calc::Pct(_) => return None,
         Calc::Add(a, b) => calc_eval_px(a)? + calc_eval_px(b)?, Calc::Sub(a, b) => calc_eval_px(a)? - calc_eval_px(b)?,
         Calc::Mul(a, b) => calc_eval_px(a)? * calc_eval_px(b)?, Calc::Div(a, b) => calc_eval_px(a)? / calc_eval_px(b)?,
+        // ★ One unresolvable argument makes the whole comparison
+        // unresolvable: `min(10px, 50%)` is not 10px until the percentage is
+        // known, and answering early would be a guess.
+        Calc::Min(v) => v.iter().map(calc_eval_px).collect::<Option<Vec<_>>>()?.into_iter().fold(f64::INFINITY, f64::min),
+        Calc::Max(v) => v.iter().map(calc_eval_px).collect::<Option<Vec<_>>>()?.into_iter().fold(f64::NEG_INFINITY, f64::max),
+        Calc::Clamp(lo, val, hi) => calc_eval_px(val)?.clamp(calc_eval_px(lo)?, calc_eval_px(hi)?.max(calc_eval_px(lo)?)),
     })
 }
 

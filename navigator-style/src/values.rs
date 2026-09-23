@@ -19,7 +19,13 @@ pub struct Rgba { pub r: u8, pub g: u8, pub b: u8, pub a: u8 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Calc { Num(f64), Len(Length), Pct(f64), Add(Box<Calc>, Box<Calc>), Sub(Box<Calc>, Box<Calc>),
-                Mul(Box<Calc>, Box<Calc>), Div(Box<Calc>, Box<Calc>) }
+                Mul(Box<Calc>, Box<Calc>), Div(Box<Calc>, Box<Calc>),
+                /// `min()`, `max()`, `clamp(min, val, max)` — admitted since
+                /// they are as bounded and deterministic as the rest of
+                /// `calc()`: a fixed argument list, no content dependence,
+                /// and the same nesting ceiling. Modern CSS cannot be read
+                /// without them (§3.11).
+                Min(Vec<Calc>), Max(Vec<Calc>), Clamp(Box<Calc>, Box<Calc>, Box<Calc>) }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Track { Len(Length), Pct(f64), Fr(f64), MinContent, MaxContent, Auto, MinMax(Box<Track>, Box<Track>) }
@@ -351,6 +357,10 @@ fn color(cv: &Cv) -> R<Color> {
 
 /// `calc()`: + - * / with the usual precedence, depth-bounded, and type-checked
 /// so that `1px + 2` is a diagnostic, not a guess (§3.6).
+/// A bound on `min()`/`max()` arguments, for the same reason every other
+/// ceiling exists: the cost has to be stated, not discovered.
+pub const MAX_CALC_ARGS: usize = 32;
+
 fn calc(args: &[Cv], depth: usize) -> R<Calc> {
     if depth > MAX_CALC_DEPTH { return Err(format!("calc() nested deeper than {MAX_CALC_DEPTH} (§3.12)")) }
     #[derive(Clone, Copy, PartialEq)] enum K { Num, Len }
@@ -361,6 +371,19 @@ fn calc(args: &[Cv], depth: usize) -> R<Calc> {
             Calc::Mul(a, b) => { let (x, y) = (kind(a)?, kind(b)?); if x == K::Len && y == K::Len { return Err("calc() multiplies two lengths".into()) } if x == K::Len || y == K::Len { K::Len } else { K::Num } }
             Calc::Div(a, b) => { if kind(b)? != K::Num { return Err("calc() divides by a length".into()) }
                 if let Calc::Num(z) = **b { if z == 0.0 { return Err("calc() divides by zero".into()) } } kind(a)? }
+            // Every argument must be the same kind, as with `+`: comparing a
+            // length with a number has no meaning.
+            Calc::Min(v) | Calc::Max(v) => {
+                let mut it = v.iter().map(kind);
+                let first = it.next().ok_or("min()/max() needs an argument")??;
+                for k in it { if k? != first { return Err("min()/max() compares a number with a length".into()) } }
+                first
+            }
+            Calc::Clamp(a, b, c) => {
+                let (x, y, z) = (kind(a)?, kind(b)?, kind(c)?);
+                if x != y || y != z { return Err("clamp() compares a number with a length".into()) }
+                x
+            }
         })
     }
     let mut pos = 0;
@@ -392,6 +415,20 @@ fn calc(args: &[Cv], depth: usize) -> R<Calc> {
             Cv::T(Tok::Percentage(v)) => Ok(Calc::Pct(finite(*v)?)),
             Cv::T(Tok::Dimension { .. }) => Ok(Calc::Len(length(c)?)),
             Cv::F(f, inner) if f.is_empty() || f == "calc" => calc(inner, d + 1),
+            Cv::F(f, inner) if f == "min" || f == "max" || f == "clamp" => {
+                let parts: Vec<Vec<Cv>> = inner.split(|c| matches!(c, Cv::T(Tok::Comma))).map(|g| g.to_vec()).collect();
+                if parts.iter().any(|g| g.is_empty()) { return Err(format!("{f}() has an empty argument")) }
+                if parts.len() > MAX_CALC_ARGS { return Err(format!("{f}() takes at most {MAX_CALC_ARGS} arguments (§3.11)")) }
+                let args: Vec<Calc> = parts.iter().map(|g| calc(g, d + 1)).collect::<R<Vec<_>>>()?;
+                match f.as_str() {
+                    "min" => Ok(Calc::Min(args)),
+                    "max" => Ok(Calc::Max(args)),
+                    _ => {
+                        let [lo, val, hi]: [Calc; 3] = args.try_into().map_err(|_| "clamp() takes exactly three arguments".to_string())?;
+                        Ok(Calc::Clamp(Box::new(lo), Box::new(val), Box::new(hi)))
+                    }
+                }
+            }
             _ => Err("unexpected token in calc()".into()),
         }
     }
@@ -448,7 +485,13 @@ fn atom(a: A, cvs: &[Cv], webfonts: &[String]) -> R<V> {
             if let Cv::T(Tok::Ident(i)) = c { if let Some(k) = list.iter().find(|k| k.eq_ignore_ascii_case(i)) { return Ok(V::Kw(k)) } }
             Err("keyword not admitted".into()) }
         A::Len | A::LenNonNeg => { let c = one(cvs)?;
-            if let Cv::F(f, args) = c { if f == "calc" { return Ok(V::Calc(Box::new(calc(args, 1)?))) } }
+            if let Cv::F(f, _) = c {
+                if matches!(f.as_str(), "calc" | "min" | "max" | "clamp") {
+                    // `min(…)` is a value in its own right, not only inside
+                    // `calc()`; wrapping it lets one parser serve both.
+                    return Ok(V::Calc(Box::new(calc(std::slice::from_ref(c), 1)?)));
+                }
+            }
             let l = length(c)?; if a == A::LenNonNeg && l.v < 0.0 { return Err("negative value not admitted".into()) } Ok(V::Len(l)) }
         A::Pct | A::PctNonNeg => { match one(cvs)? { Cv::T(Tok::Percentage(p)) => { let p = finite(*p)?;
             if a == A::PctNonNeg && p < 0.0 { return Err("negative value not admitted".into()) } Ok(V::Pct(p)) } _ => Err("expected a percentage".into()) } }
@@ -638,6 +681,22 @@ mod tests {
         assert!(p("grid-template-columns", "repeat(2000, 1px)").unwrap_err().contains("1024"));
         assert_eq!(val("grid-row-start", "span 2"), V::Line(GridLine::Span(2)));
         assert!(p("grid-row-start", "header").is_err());
+    }
+
+    /// ★ min()/max()/clamp() are admitted inside calc() and on their own
+    /// (§3.11): they are as bounded and deterministic as the rest of calc,
+    /// and modern CSS cannot be read without them.
+    #[test]
+    fn min_max_clamp() {
+        assert!(matches!(val("width", "min(300px, 80vw)"), V::Calc(_)));
+        assert!(matches!(val("width", "max(10px, 2em)"), V::Calc(_)));
+        assert!(matches!(val("width", "clamp(10px, 50%, 100px)"), V::Calc(_)));
+        assert!(matches!(val("width", "calc(min(300px, 80vw) + 4px)"), V::Calc(_)));
+        // Type checking still applies: a number is not a length.
+        assert!(p("width", "min(10px, 2)").unwrap_err().contains("compares"));
+        assert!(p("width", "clamp(10px, 2, 100px)").unwrap_err().contains("compares"));
+        assert!(p("width", "clamp(10px, 20px)").unwrap_err().contains("three"));
+        assert!(p("width", "min()").is_err());
     }
 
     #[test]

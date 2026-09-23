@@ -46,6 +46,14 @@ fn calc_eval(c: &Calc, basis: U) -> Option<f64> {
         Calc::Sub(a, b) => calc_eval(a, basis)? - calc_eval(b, basis)?,
         Calc::Mul(a, b) => calc_eval(a, basis)? * calc_eval(b, basis)?,
         Calc::Div(a, b) => calc_eval(a, basis)? / calc_eval(b, basis)?,
+        // Percentages are resolved here, so unlike the cascade's evaluator
+        // every argument is answerable and the comparison is exact.
+        Calc::Min(v) => v.iter().map(|x| calc_eval(x, basis)).collect::<Option<Vec<_>>>()?.into_iter().fold(f64::INFINITY, f64::min),
+        Calc::Max(v) => v.iter().map(|x| calc_eval(x, basis)).collect::<Option<Vec<_>>>()?.into_iter().fold(f64::NEG_INFINITY, f64::max),
+        Calc::Clamp(lo, val, hi) => {
+            let (lo, hi) = (calc_eval(lo, basis)?, calc_eval(hi, basis)?);
+            calc_eval(val, basis)?.clamp(lo, hi.max(lo))
+        }
     })
 }
 

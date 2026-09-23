@@ -268,8 +268,19 @@ order, the same objection as `order`.
 **Units.** `px`, `em`, `rem`, `ch`, `vw`, `vh`, `%`, and `fr` (grid tracks only).
 `em`/`ch` resolve against the element's own computed font; `rem` against the root's.
 
-**`calc()`** over `+ - * /` with bounded nesting depth (§3.12). Division by zero, and any
-expression mixing incompatible units, is a diagnostic rather than a clamp.
+**`calc()`** over `+ - * /` with bounded nesting depth (§3.12), and **`min()`, `max()`
+and `clamp()`** — both inside `calc()` and as values in their own right, with at most 32
+arguments. Division by zero, and any expression mixing incompatible units — including a
+comparison between a number and a length — is a diagnostic rather than a clamp.
+
+> ★ **Why the comparison functions are admitted (2026-09-23).** They were excluded on the
+> reading that fewer functions is a smaller surface. That was wrong twice over. They are
+> exactly as bounded and deterministic as the arithmetic already admitted: a fixed
+> argument list, no recursion past the same nesting ceiling, no dependence on content or
+> on anything the renderer measures. And excluding them does not make documents simpler —
+> it makes them unreadable: one `--sidebar-width: min(…, 80vw)` drops mdBook's entire page
+> layout, and the corpus is full of the same shape. A rule that refuses what it cannot
+> justify refusing costs the reader the page.
 
 **Custom properties** `--*`: inherited, substituted via `var(--name, <fallback>)`, with
 cycle detection and bounded substitution depth (§3.12). A cycle is a diagnostic.
