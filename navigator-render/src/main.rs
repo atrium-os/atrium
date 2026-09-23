@@ -44,7 +44,10 @@ fn main() -> ExitCode {
                 let o = navigator_render::html::render_html(&html, &fonts, &env);
                 n += 1;
                 let mut per: BTreeMap<String, usize> = BTreeMap::new();
-                for d in &o.diagnostics { *per.entry(d.code.to_string()).or_default() += 1 }
+                for d in &o.diagnostics {
+                    *per.entry(d.code.to_string()).or_default() += 1;
+                    if std::env::var_os("NSG_CORPUS_DETAIL").is_some() { println!("D\t{}\t{}", d.code, d.msg) }
+                }
                 for (k, v) in &per { let e = codes.entry(k.clone()).or_default(); e.0 += v; e.1 += 1 }
                 for (k, v) in &o.unimplemented { let e = unimpl.entry(k.to_string()).or_default(); e.0 += v; e.1 += 1 }
                 if o.diagnostics.is_empty() { clean += 1 }

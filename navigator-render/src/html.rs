@@ -170,6 +170,83 @@ pub fn render_html_with(html: &str, fonts: &FontSet, env: &Env, subs: &Subresour
     HtmlOut { scene: cx.scene, report: cx.report, diagnostics, unimplemented: cx.unimplemented }
 }
 
+/// ★ §3.13's offline half: measure every table column's min-content and
+/// max-content width and DECLARE them on the first row's cells, so the
+/// renderer never has to. This lives here because the measurement must use
+/// the same shaper and the same pinned font set the renderer uses — which is
+/// also why the font set version belongs in the normalizer's cache key.
+///
+/// Returns the rewritten HTML and how many columns were measured.
+pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usize) {
+    let dom = navigator_dom::parse(html);
+    let mut sheets: Vec<Stylesheet> = vec![];
+    for h in dom.by_tag_anywhere("style") {
+        let p = parse_sheet(&dom.text_content(h));
+        if p.refused.is_none() { sheets.push(p.sheet) }
+    }
+    let styled = cascade(&dom, &sheets, env);
+    let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
+                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None,
+                      indent: None, content_dy: 0, table_part: false, viewport: (u(env.width_px), Some(u(env.height_px))),
+                      pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))), subs: &Subresources::new(),
+                      placing_abs: false, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
+    // (cell handle, min, max) for every first-row cell of every table.
+    let mut decls: Vec<(Handle, U, U)> = vec![];
+    for t in 0..dom.nodes.len() as Handle {
+        if cx.st(t).map(|cs| kw(cs, "display")) != Some("table") { continue }
+        // Rows, flattening any wrapper — the same walk the layout does.
+        let mut rows = vec![];
+        let mut stack: Vec<Handle> = dom.element_children(t).into_iter().rev().collect();
+        while let Some(c) = stack.pop() {
+            match cx.st(c).map(|cs| kw(cs, "display")) {
+                Some("table-row") => rows.push(c),
+                Some("none") => {}
+                _ => for g in dom.element_children(c).into_iter().rev() { stack.push(g) },
+            }
+        }
+        // Collected up front: the measuring loop needs `cx` mutably.
+        let rows_cells: Vec<Vec<Handle>> = rows.iter().map(|r| dom.element_children(*r).into_iter()
+            .filter(|c| cx.st(*c).map(|cs| kw(cs, "display")) == Some("table-cell")).collect()).collect();
+        let Some(first_cells) = rows_cells.first().cloned() else { continue };
+        let ncols = first_cells.len();
+        if ncols == 0 { continue }
+        // ★ Every row decides the column, not just the first: a header cell
+        // is often the SHORTEST text in its column.
+        let mut mins = vec![0 as U; ncols];
+        let mut maxs = vec![0 as U; ncols];
+        for cells in &rows_cells {
+            for (i, c) in cells.iter().copied().enumerate().take(ncols) {
+                let (mn, mx) = cx.intrinsic(c);
+                let pad = cx.st(c).map(|cs| {
+                    let p = |n: &str| len(cs.get(n), 0).unwrap_or(0);
+                    let b = |n: &str| if kw(cs, &format!("border-{n}-style")) == "none" { 0 } else { p(&format!("border-{n}-width")) };
+                    p("padding-left") + p("padding-right") + b("left") + b("right")
+                }).unwrap_or(0);
+                mins[i] = mins[i].max(mn + pad);
+                maxs[i] = maxs[i].max(mx + pad);
+            }
+        }
+        for (i, c) in first_cells.into_iter().enumerate() {
+            decls.push((c, mins[i], maxs[i].max(mins[i])));
+        }
+    }
+    let n = decls.len();
+    if n == 0 { return (html.to_string(), 0) }
+    // Emit as a stylesheet rather than inline styles: the profile has no
+    // inline style attribute, and the normalizer has just removed them all.
+    let mut css = String::new();
+    let mut dom2 = navigator_dom::parse(html);
+    for (k, (h, mn, mx)) in decls.into_iter().enumerate() {
+        let cls = format!("tc{k}");
+        let existing = dom2.attr(h, "class").unwrap_or("").to_string();
+        dom2.set_attr(h, "class", &format!("{existing} {cls}").trim().to_string());
+        let _ = &mut css;
+        css.push_str(&format!(".{cls} {{ min-width: {}px; max-width: {}px }}\n", mn as f64 / PX as f64, mx as f64 / PX as f64));
+    }
+    let body = dom2.serialize();
+    (format!("<html><head><style>\n{css}</style></head>{body}</html>\n"), n)
+}
+
 #[derive(Clone)]
 enum Item { Word(String, FontStyle, Line), Space(FontStyle, Line), Break,
             /// A tab in preserved white space: advance to the next tab stop.
@@ -562,7 +639,7 @@ impl<'a> Cx<'a> {
             if !hidden && im.area.w > 0 && im.area.h > 0 { self.scene.insert_image(slot, im); slot += 1 }
         }
         // The replaced content itself, fitted into the content box.
-        if let Some((addr, iw, ih)) = repl {
+        if let Some((addr, iw, ih)) = repl.filter(|(a, ..)| !a.is_empty()) {
             let content = (bx + bl + pl, by + bt + pt, (w - frame).max(0), (hgt - pt - pb - bt - bb).max(0));
             let fit = match kw(s, "object-fit") { "contain" => "contain", "cover" => "cover", "none" => "none", "scale-down" => "scale-down", _ => "fill" };
             let (tx, ty, tw, th) = Self::object_tile(fit, content, (iw, ih));
@@ -681,13 +758,23 @@ impl<'a> Cx<'a> {
     fn replaced(&mut self, h: Handle) -> Option<(String, U, U)> {
         if self.dom.tag(h) != Some("img") { return None }
         let src = self.dom.attr(h, "src").unwrap_or("").to_string();
+        // ★ §1.2 says replaced content CARRIES its intrinsic dimensions, and
+        // `width`/`height` on the element is how a document carries them.
+        // The subresource map is a separate thing: it names the BYTES. So an
+        // image whose size is declared lays out and holds its space — no
+        // layout shift — even when the bytes were not supplied, and that is
+        // counted rather than refused.
+        let declared = |n: &str| self.dom.attr(h, n).and_then(|v| v.trim().parse::<f64>().ok()).map(|v| u(v));
         match self.subs.get(&src) {
             Some((a, w, hh)) => Some((a.clone(), *w, *hh)),
-            None => {
-                self.diagnostics.push(Diagnostic { pos: Pos { line: 0, col: 0 }, code: "input.subresource-not-supplied",
-                    msg: format!("<img src={src:?}>: no subresource declared; §3.13 admits no measurement path") });
-                None
-            }
+            None => match (declared("width"), declared("height")) {
+                (Some(w), Some(hh)) => { self.count("image bytes not supplied (space reserved)"); Some((String::new(), w, hh)) }
+                _ => {
+                    self.diagnostics.push(Diagnostic { pos: Pos { line: 0, col: 0 }, code: "input.subresource-not-supplied",
+                        msg: format!("<img src={src:?}>: no intrinsic size declared and no subresource supplied; §3.13 admits no measurement path") });
+                    None
+                }
+            },
         }
     }
 
@@ -1168,20 +1255,63 @@ impl<'a> Cx<'a> {
             this.dom.element_children(r).into_iter()
                 .filter(|c| this.st(*c).map(|cs| kw(cs, "display")) == Some("table-cell")).collect()
         };
+        // ★ §3.13: the columns arrive MEASURED. A first-row cell declares
+        // either an exact `width`, or the pair `min-width`/`max-width` — the
+        // column's min-content and max-content widths, which the normalizer
+        // measured offline. The pair is distributed into the available inline
+        // size by the SAME track sizer grid uses, which is what §3.13 means
+        // by "the same shape as resolving grid tracks of
+        // minmax(min-content, max-content)": the expensive half is
+        // precomputed, the viewport-dependent half stays here.
         let Some(first) = rows.first().copied() else { return 0 };
-        let mut cols: Vec<U> = vec![];
-        for c in cells_of(self, first) {
-            let cs = self.st(c).expect("styled");
-            match len(cs.get("width"), w) {
-                Some(cw) => cols.push(cw),
-                None => {
+        let first_cells = cells_of(self, first);
+        let avail = (w - sx * (first_cells.len() as U + 1)).max(0);
+        let mut tracks: Vec<navigator_style::values::Track> = vec![];
+        let (mut mins, mut maxs): (Vec<U>, Vec<U>) = (vec![], vec![]);
+        // Which columns may take leftover space: only the MEASURED ones. An
+        // exact `width` is exact — growing it was the first bug here.
+        let mut flexible: Vec<bool> = vec![];
+        for c in &first_cells {
+            let cs = self.st(*c).expect("styled");
+            let exact = len(cs.get("width"), w);
+            let (mn, mx) = (len(cs.get("min-width"), w), len(cs.get("max-width"), w));
+            match (exact, mn, mx) {
+                (Some(cw), _, _) => { tracks.push(navigator_style::values::Track::Len(navigator_style::values::Length { v: cw as f64 / PX as f64, unit: navigator_style::values::Unit::Px })); mins.push(cw); maxs.push(cw); flexible.push(false) }
+                (None, Some(a), Some(b)) => {
+                    tracks.push(navigator_style::values::Track::MinMax(
+                        Box::new(navigator_style::values::Track::MinContent),
+                        Box::new(navigator_style::values::Track::MaxContent)));
+                    mins.push(a); maxs.push(b.max(a)); flexible.push(true);
+                }
+                _ => {
                     self.diagnostics.push(Diagnostic { pos: Pos { line: 0, col: 0 }, code: "table.column-width-undeclared",
-                        msg: "a table's first row must declare every column width (§3.13: content that would need unbounded measurement arrives measured); table refused".into() });
+                        msg: "a table's first row must declare every column width — an exact `width`, or `min-width`/`max-width` (§3.13: content that would need unbounded measurement arrives measured); table refused".into() });
                     return 0;
                 }
             }
         }
-        if cols.is_empty() { return 0 }
+        if tracks.is_empty() { return 0 }
+        let mut cols: Vec<U> = size_tracks(&tracks, Some(avail), sx, &mins, &maxs);
+        // Share what is left over among the columns that can still grow,
+        // so a measured table fills its box instead of hugging its text.
+        // ★ Leftover space is only taken when the TABLE's own width says so.
+        // A `width: auto` table shrink-wraps its measured columns — spreading
+        // the leftover equally made a one-character column 281 px wide. When
+        // the width IS specified, the excess goes proportionally to each
+        // column's max-content, which is how the wide column stays wide.
+        let stretch = !matches!(s.get("width"), V::Kw(_));
+        let used: U = cols.iter().sum::<U>();
+        let free = avail - used;
+        let targets: Vec<usize> = (0..cols.len()).filter(|i| flexible[*i]).collect();
+        let total_max: U = targets.iter().map(|i| maxs[*i]).sum();
+        if stretch && free > 0 && !targets.is_empty() && total_max > 0 {
+            let mut given = 0;
+            for (n, i) in targets.iter().enumerate() {
+                let add = if n + 1 == targets.len() { free - given } else { (free as i128 * maxs[*i] as i128 / total_max as i128) as U };
+                cols[*i] += add;
+                given += add;
+            }
+        }
         let mut cy = y + sy;
         for r in rows {
             let cells = cells_of(self, r);
@@ -2137,6 +2267,30 @@ mod tests {
         assert_eq!(g.area.repeat, 0);
         // The middle stop with no position gets the even share.
         assert_eq!(g.stops, vec![(0xff0000ff, 0), (0x00ff00ff, 512), (0x0000ffff, 1024)]);
+    }
+
+    /// §3.13's two halves, together: `premeasure_tables` declares the
+    /// columns offline, and the layout then distributes them — so a table
+    /// that would have been REFUSED renders, and its columns follow the
+    /// content rather than being equal.
+    #[test]
+    fn premeasure_makes_a_refused_table_render() {
+        let src = r#"<style>table { display: table } tr { display: table-row } td { display: table-cell }</style>
+            <table><tr><td>x</td><td>a much longer cell than the first</td></tr></table>"#;
+        let fonts = FontSet::load().unwrap();
+        // Control: undeclared columns are refused, and nothing is painted.
+        let before = render(src);
+        assert!(before.diagnostics.iter().any(|d| d.code == "table.column-width-undeclared"));
+        let (fixed, n) = premeasure_tables(src, &fonts, &Env::default());
+        assert_eq!(n, 2, "two columns measured");
+        let after = render_html(&fixed, &fonts, &Env::default());
+        assert!(after.diagnostics.is_empty(), "{:?}", after.diagnostics);
+        // The measured columns are not equal: the second holds more text.
+        let runs: Vec<&crate::Run> = after.scene.runs.iter().collect();
+        assert!(runs.len() >= 2);
+        let first_x = runs[0].x;
+        let second_x = runs.iter().map(|r| r.x).filter(|x| *x > first_x).min().expect("second column");
+        assert!(second_x - first_x < 200 * 64, "the narrow column stays narrow: {}", (second_x - first_x) / 64);
     }
 
     #[test]

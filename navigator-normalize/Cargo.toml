@@ -1,0 +1,19 @@
+[package]
+name = "navigator-normalize"
+version = "0.1.0"
+edition = "2021"
+description = "The normalizer (Atrium Document Profile v1 §6): accepts real-world HTML and emits a profile-conformant document, or fails. Tolerance lives here so the renderer stays strict."
+
+[dependencies]
+navigator-dom = { path = "../navigator-dom" }
+navigator-style = { path = "../navigator-style" }
+navigator-render = { path = "../navigator-render" }
+
+# navigator-fonts vendors a one-line fix to pathfinder_simd; a dependent
+# crate must repeat the patch, because [patch] only applies at the build root.
+[patch.crates-io]
+pathfinder_simd = { path = "../navigator-fonts/vendor/pathfinder_simd" }
+
+[[bin]]
+name = "navigator-normalize"
+path = "src/main.rs"
