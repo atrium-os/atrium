@@ -1552,6 +1552,37 @@ BYTES so paint never fetches. 139 of the corpus's images paint.
 feature-gated and `cargo build --release` does not rebuild it — the same stale-review-tool
 trap this file already records.
 
+**Six documents reviewed by eye (2026-09-23), five bugs.** None of them moved the refusal
+count, which stayed at 29/29 throughout:
+- ★ **Block-in-inline.** An inline box holding block-level content was flattened into one
+  line box, so **Hacker News — whose whole page is wrapped in `<center>` — rendered as a
+  single paragraph**. An inline element containing block content is promoted to
+  block-level, in one bottom-up pass so it stays O(n).
+- **`<noscript>` is RAW TEXT when scripting is enabled.** Adding it to the UA block list
+  put a literal `<iframe src="toc.html">` on the Rust book's page. The converter ran the
+  scripts, so the fallback is `display: none`.
+- ★ **Logical properties.** `padding-block` alone appears **5024 times** in 29 documents,
+  and mdBook's page layout hangs on one `margin-inline-start`. The normalizer maps them to
+  physical ones; dropping them as "unknown" silently removes the layout.
+- ★ **A state belongs to the element it is written on.** `#t:checked ~ .p` styles the
+  SIBLING, so emitting `:checked` on the sibling names a state it can never have. Static
+  states are decided from the DOM; a dynamic one on a non-subject compound is refused and
+  reported. `:visited` is always false — a document has no history, and claiming one would
+  leak what the reader has read.
+- **The normalizer discarded the root's attributes**, by wrapping the serialized body in a
+  hardcoded `<html>`. `lang` and `dir` decide language and base direction.
+
+**A snapshot has to carry interactive state.** HTML deliberately does not reflect
+`input.checked` into the attribute — the attribute is the default, the property is the
+state — but the converter's output is a STATIC document and CSS reads `:checked`. A
+sidebar or menu toggled open by script rendered closed. `checked`, `selected`, `open` and
+`disabled` now reflect into the snapshot.
+
+★ **Open, and a profile question:** `min()`, `max()` and `clamp()` are not admitted inside
+`calc()`. Modern CSS uses them constantly — mdBook's `--sidebar-width: min(…, 80vw)` means
+its whole page layout drops — and they are as bounded and deterministic as `calc()` is.
+Admitting them is a Profile v1 change, so it is the user's call, not this file's.
+
 ★ **Two renderer tests had been failing for hours** — a stale sample golden and a pinned
 `nsg 0.1` header — behind `grep -c "test result: ok"`, which counts the suites that passed
 and cannot see one that failed. Counted properly: **505 tests, 0 failures, six crates**.
