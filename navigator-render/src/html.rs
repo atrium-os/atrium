@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 /// so a property the layout ignores can never be dropped silently (§5.1).
 /// Value-level gaps inside a read row (flex as block, italic without an
 /// italic face, …) are counted where they occur.
-pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64];
+pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64];
 
 pub struct HtmlOut {
     pub scene: Scene,
@@ -197,12 +197,18 @@ impl<'a> Cx<'a> {
 
     /// Every element with a non-initial value in a row the layout does not
     /// read — keyed by the row's first longhand.
-    fn count_unread_rows(&mut self) {
+    fn count_unread_rows(&mut self) { self.count_rows_outside(READ_ROWS) }
+
+    /// ★ Every row is read today, so nothing calls this with a gap in real
+    /// use — which is exactly why it takes the read set as an argument: the
+    /// control can still hand it one, and the mechanism that would catch the
+    /// NEXT unread row stays tested instead of silently passing.
+    fn count_rows_outside(&mut self, read: &[u8]) {
         use navigator_style::values::{grammar, parse_value, Specified, ROWS};
         let props = navigator_style::cascade::longhands();
         let unread: Vec<(usize, &'static str, V)> = props.iter().enumerate().filter_map(|(i, p)| {
             let row = ROWS.iter().find(|r| r.props.contains(p))?;
-            if READ_ROWS.contains(&row.id) { return None }
+            if read.contains(&row.id) { return None }
             let (_, init, _) = grammar(p)?;
             let Ok(Specified::Value(v)) = parse_value(p, &navigator_style::token::tokenize(init), &[]) else { return None };
             Some((i, row.props[0], v))
@@ -1466,6 +1472,12 @@ impl<'a> Cx<'a> {
             else { items.insert(0, Item::Space(st.clone(), line)); items.insert(0, Item::Word(text, st, line)) }
         }
         struct Placed { x: U, st: FontStyle, line: Line, pieces: Vec<crate::Piece>, gap: bool,
+                        /// Width of the collapsible space folded in BEFORE
+                        /// this item. Bidi needs it as an item of its own,
+                        /// because reordering moves what is between words.
+                        gap_w: U,
+                        /// Bidi embedding level (UAX#9); 0 until resolved.
+                        level: u8,
                         /// How far this item advances the line: the shaped
                         /// width, or an atomic inline's margin-box width.
                         adv: U,
@@ -1496,7 +1508,7 @@ impl<'a> Cx<'a> {
                     // ★ Preserved spaces HANG at a line end (pre-wrap): they
                     // never push the line past the edge, and never wrap.
                     if cx + ww > w && !lines.last().expect("line").is_empty() { pending = None; continue }
-                    lines.last_mut().expect("line").push(Placed { x: cx, st, line: l, pieces, gap: false, adv: ww, atomic: None });
+                    lines.last_mut().expect("line").push(Placed { x: cx, st, line: l, pieces, gap: false, gap_w: 0, level: 0, adv: ww, atomic: None });
                     cx += ww;
                     pending = None;
                 }
@@ -1517,6 +1529,7 @@ impl<'a> Cx<'a> {
                     let asc = self.baseline(ah, w, (Some(bw), None));
                     let outer_h = self.measure(ah, w, None, (Some(bw), None));
                     lines.last_mut().expect("line").push(Placed { x: cx, st, line: l, pieces: vec![], gap: !wrap && sw > 0,
+                                                                  gap_w: if wrap { 0 } else { sw }, level: 0,
                                                                   adv, atomic: Some((ah, bw, asc, outer_h)) });
                     cx += adv;
                     pending = None;
@@ -1546,7 +1559,7 @@ impl<'a> Cx<'a> {
                             let chunk: String = chars[i..j].iter().collect();
                             let pieces = self.sh.shape(&chunk, &st, &mut self.report);
                             let cw: U = pieces.iter().map(|p| p.width).sum();
-                            lines.last_mut().expect("line").push(Placed { x: cx, st: st.clone(), line: l, pieces, gap: false, adv: cw, atomic: None });
+                            lines.last_mut().expect("line").push(Placed { x: cx, st: st.clone(), line: l, pieces, gap: false, gap_w: 0, level: 0, adv: cw, atomic: None });
                             cx += cw;
                             i = j;
                             if i < chars.len() { lines.push(vec![]); forced.push(false); cx = 0 }
@@ -1555,13 +1568,20 @@ impl<'a> Cx<'a> {
                         continue;
                     }
                     if ww > w { self.report.overflow_lines += 1 }
-                    lines.last_mut().expect("line").push(Placed { x: cx, st, line: l, pieces, gap: !wrap && sw > 0, adv: ww, atomic: None });
+                    lines.last_mut().expect("line").push(Placed { x: cx, st, line: l, pieces, gap: !wrap && sw > 0, gap_w: if wrap { 0 } else { sw }, level: 0, adv: ww, atomic: None });
                     cx += ww;
                     pending = None;
                 }
             }
         }
-        let align = kw(block, "text-align");
+        // `direction` gives the line's base level and maps start/end to an
+        // edge (profile row 48; CSS Writing Modes).
+        let base_rtl = kw(block, "direction") == "rtl";
+        let align = match (kw(block, "text-align"), base_rtl) {
+            ("start", true) | ("end", false) => "end",
+            ("start", false) | ("end", true) => "start",
+            (a, _) => a,
+        };
         let n_lines = lines.len();
         let mut yy = y;
         for (li, mut line) in lines.into_iter().enumerate() {
@@ -1580,6 +1600,84 @@ impl<'a> Cx<'a> {
             // The line box holds every item: at least each item's own line
             // height, and always enough for the tallest ascent plus the
             // deepest descent.
+            // ★ Bidi (UAX#9). Only a line that needs it is touched, so an
+            // LTR document's goldens cannot move — and that is the control:
+            // every existing golden must stay byte-identical.
+            if base_rtl || line.iter().any(|p| p.pieces.iter().any(|pc| pc.text.chars().any(is_rtl))) {
+                // The line's text in logical order, with each folded space
+                // made an item of its own: reordering moves what is BETWEEN
+                // words, so a space cannot stay glued to one of them.
+                let mut logical = String::new();
+                let mut spans: Vec<(bool, usize, usize)> = vec![]; // (is the space, start, end)
+                for p in &line {
+                    if p.gap_w > 0 { let st = logical.len(); logical.push(' '); spans.push((true, st, logical.len())) }
+                    let st = logical.len();
+                    for pc in &p.pieces { logical.push_str(&pc.text) }
+                    if p.atomic.is_some() { logical.push('\u{fffc}') } // object replacement: neutral, like an image
+                    spans.push((false, st, logical.len()));
+                }
+                let info = unicode_bidi::BidiInfo::new(&logical, Some(if base_rtl { unicode_bidi::Level::rtl() } else { unicode_bidi::Level::ltr() }));
+                let level_at = |i: usize| info.levels.get(i).map(|l| l.number()).unwrap_or(0);
+                // Rebuild the line with the spaces as items, each carrying
+                // its own level. A word whose own text spans two levels is
+                // split and re-shaped at the boundary — itemization, which a
+                // real engine does before shaping.
+                let mut rebuilt: Vec<Placed> = vec![];
+                let mut src = line.into_iter();
+                let mut iter = spans.into_iter();
+                while let Some((is_space, st, en)) = iter.next() {
+                    // A space span is handled with the word it preceded,
+                    // which carries its width.
+                    if is_space { continue }
+                    let p = src.next().expect("one span per placed");
+                    if p.gap_w > 0 {
+                        let sp = self.sh.shape(" ", &p.st, &mut self.report);
+                        rebuilt.push(Placed { x: 0, st: p.st.clone(), line: p.line, pieces: sp, gap: p.gap, gap_w: 0,
+                                              level: level_at(st.saturating_sub(1)), adv: p.gap_w, atomic: None });
+                    }
+                    // Level runs inside this item's own text.
+                    let text: String = p.pieces.iter().map(|pc| pc.text.clone()).collect();
+                    let mut runs: Vec<(u8, String)> = vec![];
+                    for (off, ch) in text.char_indices() {
+                        let l = level_at(st + off);
+                        match runs.last_mut() {
+                            Some((rl, s0)) if *rl == l => s0.push(ch),
+                            _ => runs.push((l, ch.to_string())),
+                        }
+                    }
+                    if runs.len() <= 1 || p.atomic.is_some() {
+                        rebuilt.push(Placed { level: level_at(st), gap: false, gap_w: 0, ..p });
+                    } else {
+                        for (l, t) in runs {
+                            let pieces = self.sh.shape(&t, &p.st, &mut self.report);
+                            let adv = pieces.iter().map(|pc| pc.width).sum();
+                            rebuilt.push(Placed { x: 0, st: p.st.clone(), line: p.line, pieces, gap: false, gap_w: 0, level: l, adv, atomic: None });
+                        }
+                    }
+                    let _ = en;
+                }
+                // L2: from the highest level down to the lowest odd one,
+                // reverse every contiguous run at or above it.
+                let max = rebuilt.iter().map(|p| p.level).max().unwrap_or(0);
+                let min_odd = rebuilt.iter().map(|p| p.level).filter(|l| l % 2 == 1).min().unwrap_or(max + 1);
+                let mut lvl = max;
+                while lvl >= min_odd && lvl > 0 {
+                    let mut i = 0;
+                    while i < rebuilt.len() {
+                        if rebuilt[i].level >= lvl {
+                            let mut j = i;
+                            while j < rebuilt.len() && rebuilt[j].level >= lvl { j += 1 }
+                            rebuilt[i..j].reverse();
+                            i = j;
+                        } else { i += 1 }
+                    }
+                    lvl -= 1;
+                }
+                // Visual order fixed: lay the advances out left to right.
+                let mut px = if li == 0 { first_indent } else { 0 };
+                for p in &mut rebuilt { p.x = px; px += p.adv }
+                line = rebuilt;
+            }
             let lh = line.iter().map(|p| if p.atomic.is_some() { 0 } else { p.line.lh }).max().unwrap_or(0)
                 .max(base + metrics.iter().map(|m| m.1).max().unwrap_or(0));
             let last = line.last().expect("non-empty");
@@ -2059,11 +2157,23 @@ mod tests {
     /// must show up, and its initial value must not.
     #[test]
     fn an_unread_property_is_counted_and_its_initial_value_is_not() {
-        // `direction` is the last row the layout does not read; when bidi
-        // lands, this control needs a row that is deliberately left unread,
-        // or it silently stops testing anything.
-        let o = render(r#"<style>.a { direction: rtl } .b { direction: ltr }</style><div class="a">x</div><div class="b">y</div>"#);
-        assert_eq!(o.unimplemented.get("row direction… (not implemented)"), Some(&1), "{:?}", o.unimplemented);
+        // Every row is read now, so the control supplies its own read set
+        // with one row (39, text-align) held out. Without this the test
+        // would pass while testing nothing.
+        let dom = navigator_dom::parse(r#"<style>.a { text-align: center } .b { text-align: start }</style><div class="a">x</div><div class="b">y</div>"#);
+        let sheets: Vec<_> = dom.by_tag_anywhere("style").into_iter()
+            .map(|h| navigator_style::sheet::parse_sheet(&dom.text_content(h)).sheet).collect();
+        let styled = cascade(&dom, &sheets, &Env::default());
+        let fonts = FontSet::load().unwrap();
+        let held_out: Vec<u8> = READ_ROWS.iter().copied().filter(|r| *r != 39).collect();
+        let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(&fonts), scene: Scene::default(),
+                          report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None,
+                          baseline_probe: None, indent: None, content_dy: 0, table_part: false,
+                          viewport: (0, None), pos_cb: (0, 0, 0, None), subs: &Subresources::new(),
+                          placing_abs: false, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
+        cx.count_rows_outside(&held_out);
+        // The non-initial value is counted once; the initial one is not.
+        assert_eq!(cx.unimplemented.get("row text-align… (not implemented)"), Some(&1), "{:?}", cx.unimplemented);
     }
 
     /// CSS automatic minimum size: a flex item does not shrink below its
@@ -2292,6 +2402,11 @@ fn resolve_stops(stops: &[navigator_style::values::Stop], s: &Style) -> Vec<(u32
         last = p;
         (rgba(&st.color, current), p)
     }).collect()
+}
+
+/// Right-to-left by Unicode bidi class: what makes a line need reordering.
+fn is_rtl(c: char) -> bool {
+    matches!(unicode_bidi::bidi_class(c), unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL)
 }
 
 fn size_tracks(tracks: &[navigator_style::values::Track], avail: Option<U>, gap: U, mins: &[U], maxs: &[U]) -> Vec<U> {

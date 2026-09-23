@@ -980,7 +980,7 @@ layout.
 
 ### 8.3 M2 progress — the number, first reading (2026-09-22)
 
-**CONFORMANCE: exercised 63/64, matched 63/64** (13 on first reading; see the updates
+**CONFORMANCE: exercised 64/64, matched 64/64 — COMPLETE (2026-09-23)** (13 on first reading; see the updates
 below). Printed by `nsg-conformance`; the
 matched set is pinned by a test so it cannot fall silently.
 
@@ -1368,6 +1368,30 @@ Every `display` value the profile admits is now laid out; nothing in §3.3 is co
   over 118 documents — the output moved because the repo's own prose is full of emphasis
   that is now genuinely italic.
 - Only row 48 (`direction`) is left.
+
+**Update — bidi, matched 63 → 64 (row 48). THE NUMBER IS COMPLETE: 64/64 exercised,
+64/64 matched.**
+- Full UAX#9 through `unicode-bidi` (MIT/Apache-2.0): `direction` gives the paragraph's
+  base level, each line's items are resolved to embedding levels, reordered by rule L2
+  (reverse every contiguous run at or above each level, highest down to the lowest odd
+  one), and `text-align: start`/`end` map to the base direction's edges.
+- **A folded space becomes an item of its own** when a line needs reordering. Spaces are
+  normally folded into the following word's offset, which is fine going one way, but
+  reordering moves what is BETWEEN words — a space glued to a word ends up on its far
+  side and shifts the line.
+- A word whose own text spans two levels is **split and re-shaped** at the boundary,
+  which is itemization: what a real engine does before shaping, not after.
+- ★ **The control is that LTR output cannot move.** Only a line with RTL content or an
+  RTL base is touched, and all 63 existing goldens stayed BYTE-IDENTICAL across the
+  restructure — no re-blessing, so the claim is checked rather than asserted.
+- Verified by reading coordinates out of the NSG, not by looking: in an LTR paragraph the
+  first logical Hebrew word sits to the RIGHT of the second; in an RTL paragraph the
+  leading Latin run is pinned to the right edge and stays internally LTR; and a number
+  inside an Arabic run stays LTR.
+- ★ **The unread-row control had to be rescued.** It worked by naming a row the layout
+  did not read — and there is no such row left, so it would have passed while testing
+  nothing. `count_rows_outside` now takes the read set, and the test hands it one with a
+  row held out.
 
 ## 9. What this reuses
 

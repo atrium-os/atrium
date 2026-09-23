@@ -15,6 +15,7 @@ blake3 = { version = "1", features = ["pure"] }
 # Review tooling only (nsg-raster): never in the worker's build.
 swash = { version = "0.1", optional = true }
 png = { version = "0.17", optional = true }
+unicode-bidi = "0.3.18"
 
 [features]
 raster = ["dep:swash", "dep:png"]
