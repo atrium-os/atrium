@@ -254,3 +254,36 @@ fn named_grid_areas_become_numbered_lines() {
     assert!(report.dropped.keys().any(|k| k.contains("nowhere")), "{:?}", report.dropped);
     assert!(refusals(&out).is_empty());
 }
+
+/// ★ Named grid lines are written by every real track list and the profile
+/// places by number. Dropping the declaration over the names left MDN's page
+/// with one implicit column and its sidebar on top of its content.
+#[test]
+fn named_grid_lines_are_stripped_not_refused() {
+    let src = r#"<html><head><style>
+      .g { display: grid; grid-template-columns: [full-start side-start] 200px [side-end body-start] minmax(0, 1fr) [body-end full-end] }
+    </style></head><body><div class="g"><div>a</div><div>b</div></div></body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    assert!(out.contains("grid-template-columns: 200px minmax(0, 1fr)"), "tracks kept, names gone: {out}");
+    assert!(refusals(&out).is_empty());
+}
+
+/// ★ A media feature written with `calc()` over absolute units is
+/// computable, and dropping it renders the wrong layout entirely: MDN
+/// switches to its mobile layout at
+/// `(width < calc(1rem * 2 + (15rem + 2rem) * 2 + 31rem))` = 1072px.
+#[test]
+fn a_media_query_with_calc_is_folded() {
+    let src = r#"<html><head><style>
+      @media (width < calc(1rem * 2 + (15rem + 2rem) * 2 + 31rem)) { p { color: #ff0000 } }
+      @media (width >= calc(50rem)) { p { color: #00ff00 } }
+      @media (width < calc(50% + 10px)) { p { color: #0000ff } }
+    </style></head><body><p>x</p></body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    assert!(out.contains("max-width: 1071.98px"), "1072px, strict: {out}");
+    assert!(out.contains("min-width: 800px"), "50rem: {out}");
+    // A percentage depends on what the query is deciding, so it is dropped.
+    assert!(!out.contains("#0000ff"), "{out}");
+    assert!(report.dropped.keys().any(|k| k.contains("@media")), "{:?}", report.dropped);
+    assert!(refusals(&out).is_empty());
+}

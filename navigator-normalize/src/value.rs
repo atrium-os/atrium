@@ -80,9 +80,36 @@ pub fn repair(prop: &str, value: &str) -> Option<String> {
                       .replace("translatex(", "translate(").replace("translatey(", "translate(");
             if t == lv { return None } else { t }
         }
+        // ★ NAMED GRID LINES. `[full-start] minmax(…,1fr) [content-start] …`
+        // is how a real track list is written, and the profile places by
+        // NUMBER. The names are only ever referenced by name, and those
+        // references are resolved separately, so dropping the brackets keeps
+        // every track and loses nothing the profile can use. Dropping the
+        // whole declaration instead left MDN's page with one implicit column
+        // and its sidebar on top of its content.
+        "grid-template-columns" | "grid-template-rows" => {
+            let stripped = strip_line_names(v);
+            if stripped.trim() == v.trim() { return None }
+            stripped
+        }
         _ => convert_units(&lv)?,
     };
     admits(prop, &out).then_some(out)
+}
+
+/// Remove `[name other-name]` groups from a track list.
+fn strip_line_names(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut depth = 0usize;
+    for c in v.chars() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Units the profile does not admit, converted to ones it does: `pt`, `pc`,

@@ -222,36 +222,6 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         }
     }
 
-    // ★ Resolve named areas into the numeric lines the profile admits.
-    // Both halves are in `resolved` now: the container's template and each
-    // child's area name.
-    let templates: BTreeMap<Handle, Vec<Vec<String>>> = resolved.iter()
-        .filter(|((_, st, m), _)| st.is_empty() && m.is_empty())
-        .filter_map(|((h, ..), props)| props.get("grid-template-areas").map(|(_, v)| (*h, parse_areas(v))))
-        .collect();
-    let named: Vec<(Handle, String)> = resolved.iter()
-        .filter(|((_, st, m), _)| st.is_empty() && m.is_empty())
-        .filter_map(|((h, ..), props)| props.get("grid-area-name").map(|(_, v)| (*h, v.trim().to_string())))
-        .collect();
-    let mut placed = 0usize;
-    for (h, name) in named {
-        let parent = dom.get(h).and_then(|n| n.parent);
-        let rect = parent.and_then(|p| templates.get(&p)).and_then(|t| area_rect(t, &name));
-        let slot = resolved.entry((h, String::new(), String::new())).or_default();
-        slot.remove("grid-area-name");
-        if let Some((r0, r1, c0, c1)) = rect {
-            let pri: Priority = (false, (0, 1, 0), usize::MAX - 1);
-            for (k, v) in [("grid-row-start", r0), ("grid-row-end", r1), ("grid-column-start", c0), ("grid-column-end", c1)] {
-                slot.insert(k.to_string(), (pri, v.to_string()));
-            }
-            placed += 1;
-        } else {
-            report.drop(format!("grid-area `{name}` (no template names it)"));
-        }
-    }
-    if placed > 0 { report.drop_n("named grid areas resolved to numbered lines", placed) }
-    for (_, props) in resolved.iter_mut() { props.remove("grid-template-areas"); }
-
     // ★ `display: contents` elements generate no box: their children take
     // their place. Doing it here, on the DOM, is exactly what the value
     // means — and it is why the profile needs no such value.
@@ -276,6 +246,58 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         }
         for k in kids { if let Some(n) = dom.get_mut(k) { n.parent = Some(parent) } }
     }
+
+    // ★ Resolve named areas into the numeric lines the profile admits —
+    // PER MEDIA CONTEXT. A responsive page keeps its whole layout in the
+    // media queries: MDN's mobile template lives in
+    // `@media (width < 1072px)`, and resolving only the base context left an
+    // 800px viewport rendering the DESKTOP layout, sidebars and all.
+    let mut templates: BTreeMap<(Handle, String), Vec<Vec<String>>> = BTreeMap::new();
+    let mut named: Vec<(Handle, String, String)> = vec![];
+    for ((h, st, media), props) in resolved.iter() {
+        if !st.is_empty() { continue }
+        if let Some((_, v)) = props.get("grid-template-areas") { templates.insert((*h, media.clone()), parse_areas(v)); }
+        if let Some((_, v)) = props.get("grid-area-name") { named.push((*h, media.clone(), v.trim().to_string())); }
+    }
+    // A child placed in the base context also needs placing in every context
+    // where its container's template DIFFERS.
+    let contexts: Vec<String> = templates.keys().map(|(_, m)| m.clone())
+        .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    let mut want: Vec<(Handle, String, String)> = vec![];
+    for (h, media, name) in &named {
+        want.push((*h, media.clone(), name.clone()));
+        if media.is_empty() {
+            let parent = dom.get(*h).and_then(|n| n.parent);
+            for ctx in &contexts {
+                if ctx.is_empty() { continue }
+                if parent.is_some_and(|p| templates.contains_key(&(p, ctx.clone()))) {
+                    want.push((*h, ctx.clone(), name.clone()));
+                }
+            }
+        }
+    }
+    let mut placed = 0usize;
+    let mut unplaced: Vec<String> = vec![];
+    for (h, media, name) in want {
+        let parent = dom.get(h).and_then(|n| n.parent);
+        let rect = parent.and_then(|p| templates.get(&(p, media.clone())).or_else(|| templates.get(&(p, String::new()))))
+            .and_then(|t| area_rect(t, &name));
+        let slot = resolved.entry((h, String::new(), media)).or_default();
+        slot.remove("grid-area-name");
+        match rect {
+            Some((r0, r1, c0, c1)) => {
+                let pri: Priority = (false, (0, 1, 0), usize::MAX - 1);
+                for (k, v) in [("grid-row-start", r0), ("grid-row-end", r1), ("grid-column-start", c0), ("grid-column-end", c1)] {
+                    slot.insert(k.to_string(), (pri, v.to_string()));
+                }
+                placed += 1;
+            }
+            None => unplaced.push(format!("grid-area `{name}` (no template names it)")),
+        }
+    }
+    for u in unplaced { report.drop(u) }
+    if placed > 0 { report.drop_n("named grid areas resolved to numbered lines", placed) }
+    for (_, props) in resolved.iter_mut() { props.remove("grid-template-areas"); }
 
     // 5. Emit: one class per distinct block, so elements that resolved to the
     //    same declarations share a rule instead of each getting their own.
@@ -655,64 +677,174 @@ fn admitted_media(q: &str) -> Option<String> {
 /// it is nudged by 0.02px — smaller than any device pixel, and honest about
 /// which side of the boundary the rule falls on.
 fn from_range(q: &str) -> Option<String> {
-    let inner = q.trim().trim_start_matches('(').trim_end_matches(')').trim();
+    // ★ Exactly ONE paren each side. `trim_end_matches(')')` is greedy and
+    // ate the `calc(…)`'s own closing paren, which left the expression
+    // unbalanced and the whole query unparsed.
+    let t = q.trim();
+    let inner = t.strip_prefix('(').unwrap_or(t);
+    let inner = inner.strip_suffix(')').unwrap_or(inner).trim();
     if !inner.contains('<') && !inner.contains('>') { return None }
-    let toks: Vec<&str> = inner.split_whitespace().collect();
+    // ★ Split on the operators at paren depth 0 — a `calc()` on either side
+    // contains spaces and parentheses of its own, so splitting on whitespace
+    // (which is what this did first) takes the query apart in the wrong
+    // place and drops it.
+    let (mut parts, mut ops, mut cur, mut depth) = (vec![], vec![], String::new(), 0usize);
+    let ch: Vec<char> = inner.chars().collect();
+    let mut i = 0;
+    while i < ch.len() {
+        match ch[i] {
+            '(' => { depth += 1; cur.push('(') }
+            ')' => { depth = depth.saturating_sub(1); cur.push(')') }
+            '<' | '>' | '=' if depth == 0 => {
+                let mut op = ch[i].to_string();
+                if ch.get(i + 1) == Some(&'=') { op.push('='); i += 1 }
+                parts.push(cur.trim().to_string());
+                ops.push(op);
+                cur = String::new();
+            }
+            c => cur.push(c),
+        }
+        i += 1;
+    }
+    parts.push(cur.trim().to_string());
+
     let feature = |s: &str| matches!(s, "width" | "height");
     let eps = 0.02;
-    let num = |s: &str| -> Option<f64> { s.strip_suffix("px")?.parse().ok() };
-    let out = match toks.as_slice() {
-        // `width <= 1044px`
-        [f, op, v] if feature(f) => {
-            let n = num(v)?;
-            match *op {
+    match (parts.as_slice(), ops.as_slice()) {
+        // `width <= 1044px`, or the same written backwards.
+        ([a, b], [op]) => {
+            let (f, n, op) = if feature(a) { (a.as_str(), len_px(b)?, op.clone()) }
+                             else if feature(b) { (b.as_str(), len_px(a)?, flip(op)) }
+                             else { return None };
+            Some(match op.as_str() {
                 "<=" => format!("(max-{f}: {n}px)"),
                 "<" => format!("(max-{f}: {}px)", n - eps),
                 ">=" => format!("(min-{f}: {n}px)"),
                 ">" => format!("(min-{f}: {}px)", n + eps),
                 "=" => format!("(min-{f}: {n}px) and (max-{f}: {n}px)"),
                 _ => return None,
-            }
-        }
-        // `1044px >= width`, the same thing written the other way round.
-        [v, op, f] if feature(f) => {
-            let n = num(v)?;
-            match *op {
-                ">=" => format!("(max-{f}: {n}px)"),
-                ">" => format!("(max-{f}: {}px)", n - eps),
-                "<=" => format!("(min-{f}: {n}px)"),
-                "<" => format!("(min-{f}: {}px)", n + eps),
-                _ => return None,
-            }
+            })
         }
         // `400px <= width <= 900px`
-        [lo, op1, f, op2, hi] if feature(f) => {
-            let (lo, hi) = (num(lo)?, num(hi)?);
-            let min = match *op1 { "<=" => lo, "<" => lo + eps, _ => return None };
-            let max = match *op2 { "<=" => hi, "<" => hi - eps, _ => return None };
-            format!("(min-{f}: {min}px) and (max-{f}: {max}px)")
+        ([lo, f, hi], [op1, op2]) if feature(f) => {
+            let (lo, hi) = (len_px(lo)?, len_px(hi)?);
+            let min = match op1.as_str() { "<=" => lo, "<" => lo + eps, _ => return None };
+            let max = match op2.as_str() { "<=" => hi, "<" => hi - eps, _ => return None };
+            Some(format!("(min-{f}: {min}px) and (max-{f}: {max}px)"))
         }
-        _ => return None,
-    };
+        _ => None,
+    }
+}
+
+/// `1044px`, `50rem`, or a `calc()` over them.
+fn len_px(v: &str) -> Option<f64> {
+    let v = v.trim();
+    if v.starts_with("calc(") { return fold_px(v) }
+    if let Some(n) = v.strip_suffix("px") { return n.trim().parse().ok() }
+    if let Some(n) = v.strip_suffix("rem") { return n.trim().parse::<f64>().ok().map(|x| x * 16.0) }
+    None
+}
+
+/// `a < b` read from the other side is `b > a`.
+fn flip(op: &str) -> String {
+    match op { "<" => ">", "<=" => ">=", ">" => "<", ">=" => "<=", other => other }.to_string()
+}
+
+/// `calc(…)` in a MEDIA FEATURE, folded to px.
+///
+/// ★ A media query is evaluated against the viewport, and the only units it
+/// can hold that this can answer are ABSOLUTE ones: `px`, and the
+/// root-relative `rem`, which is 16px because the profile's root font size
+/// is (§3.6). A percentage or a viewport unit would make the answer depend
+/// on what the query is deciding, so those return `None` and the query is
+/// dropped rather than guessed.
+///
+/// MDN switches to its mobile layout at
+/// `(width < calc(1rem * 2 + (15rem + 2rem) * 2 + 31rem))` — 1072px. Without
+/// an evaluator that query is dropped, and an 800px viewport renders the
+/// DESKTOP layout: two sidebars and a 48rem column in 800px.
+fn fold_px(v: &str) -> Option<f64> {
+    let inner = v.trim().strip_prefix("calc(")?.strip_suffix(')')?;
+    let toks = calc_tokens(inner)?;
+    let mut pos = 0usize;
+    let out = calc_sum(&toks, &mut pos)?;
+    (pos == toks.len()).then_some(out)
+}
+
+fn calc_tokens(s: &str) -> Option<Vec<String>> {
+    let mut out = vec![];
+    let mut cur = String::new();
+    for c in s.chars() {
+        match c {
+            '(' | ')' | '+' | '*' | '/' => {
+                if !cur.trim().is_empty() { out.push(cur.trim().to_string()) }
+                cur.clear();
+                out.push(c.to_string());
+            }
+            // `-` is a subtraction only when it stands alone; `-5px` is a
+            // number, and CSS requires the spaces that make this decidable.
+            '-' if cur.trim().is_empty() => { out.push("-".into()); cur.clear() }
+            ' ' => { if !cur.trim().is_empty() { out.push(cur.trim().to_string()) } cur.clear() }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() { out.push(cur.trim().to_string()) }
     Some(out)
 }
 
-/// `calc(640px - 1px)` and friends, in absolute px. Anything else — a
-/// percentage, a font-relative unit, a division by a length — is not a
-/// constant and returns `None`.
-fn fold_px(v: &str) -> Option<f64> {
-    let inner = v.trim().strip_prefix("calc(")?.strip_suffix(')')?;
-    let mut total = 0.0f64;
-    let mut sign = 1.0f64;
-    for tok in inner.split_whitespace() {
-        match tok {
-            "+" => sign = 1.0,
-            "-" => sign = -1.0,
-            t => {
-                let n: f64 = t.strip_suffix("px").or(Some(t).filter(|x| **x == *"0"))?.parse().ok()?;
-                total += sign * n;
-            }
+fn calc_sum(t: &[String], p: &mut usize) -> Option<f64> {
+    let mut v = calc_prod(t, p)?;
+    while let Some(op) = t.get(*p) {
+        match op.as_str() {
+            "+" => { *p += 1; v += calc_prod(t, p)? }
+            "-" => { *p += 1; v -= calc_prod(t, p)? }
+            _ => break,
         }
     }
-    Some(total)
+    Some(v)
+}
+
+fn calc_prod(t: &[String], p: &mut usize) -> Option<f64> {
+    let mut v = calc_atom(t, p)?;
+    while let Some(op) = t.get(*p) {
+        match op.as_str() {
+            "*" => { *p += 1; v *= calc_atom(t, p)? }
+            "/" => { *p += 1; let d = calc_atom(t, p)?; if d == 0.0 { return None } v /= d }
+            _ => break,
+        }
+    }
+    Some(v)
+}
+
+fn calc_atom(t: &[String], p: &mut usize) -> Option<f64> {
+    let tok = t.get(*p)?.clone();
+    *p += 1;
+    if tok == "(" {
+        let v = calc_sum(t, p)?;
+        if t.get(*p)? != ")" { return None }
+        *p += 1;
+        return Some(v);
+    }
+    if tok == "-" { return Some(-calc_atom(t, p)?) }
+    if let Some(n) = tok.strip_suffix("px") { return n.parse().ok() }
+    if let Some(n) = tok.strip_suffix("rem") { return n.parse::<f64>().ok().map(|v| v * 16.0) }
+    tok.parse().ok()
+}
+
+#[cfg(test)]
+mod media_tests {
+    /// Media Queries 4 range syntax, including `calc()` over absolute units.
+    #[test]
+    fn range_and_calc() {
+        let m = |q| super::admitted_media(q);
+        assert_eq!(m("(width <= 1044px)").as_deref(), Some("(max-width: 1044px)"));
+        assert_eq!(m("(width >= calc(50rem))").as_deref(), Some("(min-width: 800px)"));
+        assert_eq!(m("(400px <= width <= 900px)").as_deref(), Some("(min-width: 400px) and (max-width: 900px)"));
+        // ★ The one that mattered: MDN's mobile switch.
+        assert_eq!(m("(width < calc(1rem * 2 + (15rem + 2rem) * 2 + 31rem))").as_deref(),
+                   Some("(max-width: 1071.98px)"), "strict `<`, nudged off the boundary");
+        // A viewport-relative or percentage bound cannot be answered here.
+        assert_eq!(m("(width < calc(50% + 10px))"), None);
+        assert_eq!(m("(min-resolution: 2dppx)"), None);
+    }
 }

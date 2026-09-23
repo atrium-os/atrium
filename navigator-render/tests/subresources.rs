@@ -142,3 +142,63 @@ fn noscript_is_not_shown() {
     assert!(!text.contains("iframe"), "the fallback must not be painted: {text:?}");
     assert!(text.contains("real"));
 }
+
+/// ★ An `fr` inside `minmax()` is still flexible. `minmax(0, 1fr)` is the
+/// most common way to write "one flexible column", and treating only a
+/// top-level `fr` as flexible made it a ZERO-WIDE track — which is how a
+/// whole page came out overlapping in an 800 px viewport.
+#[test]
+fn an_fr_inside_minmax_takes_the_free_space() {
+    let fonts = FontSet::load().expect("pinned font set");
+    let env = Env::default();
+    let one = |css: &str| -> i64 {
+        let o = render_html(&format!(r#"<html><head><style>body {{ margin: 0 }}
+            .g {{ display: grid; width: 400px; grid-template-columns: {css} }}
+            .i {{ background-color: #ff0000; height: 10px }}</style></head>
+            <body><div class="g"><div class="i">x</div></div></body></html>"#), &fonts, &env);
+        o.scene.rects.iter().find(|r| r.rgba == 0xff0000ff).expect("item").w / 64
+    };
+    assert_eq!(one("minmax(0, 1fr)"), 400, "a flexible column fills the grid");
+    assert_eq!(one("1fr"), 400, "and so does a bare fr");
+    // The minimum is respected: a column cannot shrink below it.
+    assert_eq!(one("minmax(500px, 1fr)"), 500, "the minimum wins over the share");
+    // Control: a fixed column does NOT take the free space.
+    assert_eq!(one("100px"), 100, "a fixed column stays fixed");
+}
+
+/// ★ A flexible ROW in a container with no definite height has no free
+/// space to take a fraction of, so it sizes to its content (CSS Grid
+/// §12.7.1). Returning zero gave a page-tall row a height of zero, and
+/// every section below it was painted on top of the one above.
+#[test]
+fn a_flexible_row_with_no_definite_height_sizes_to_content() {
+    let fonts = FontSet::load().expect("pinned font set");
+    let env = Env::default();
+    let o = render_html(r#"<html><head><style>body { margin-top: 0px; margin-left: 0px }
+        .g { display: grid; grid-template-rows: min-content 1fr min-content }
+        .a { height: 20px; background-color: #ff0000 }
+        .b { height: 300px; background-color: #00ff00 }
+        .c { height: 20px; background-color: #0000ff }</style></head>
+        <body><div class="g"><div class="a"></div><div class="b"></div><div class="c"></div></div></body></html>"#,
+        &fonts, &env);
+    let at = |rgba: u32| o.scene.rects.iter().find(|r| r.rgba == rgba).map(|r| (r.y / 64, r.h / 64)).expect("box");
+    assert_eq!(at(0xff0000ff), (0, 20));
+    assert_eq!(at(0x00ff00ff), (20, 300), "the flexible row is as tall as its content");
+    assert_eq!(at(0x0000ffff), (320, 20), "and what follows is BELOW it, not on top");
+}
+
+/// ★ A track list holds lengths, and they are converted like any other
+/// length. Missing that read `minmax(15rem, 1fr)` as fifteen PIXELS — every
+/// em/rem grid on the web sized at a sixteenth of its intended value.
+#[test]
+fn track_lengths_are_converted_to_px() {
+    let fonts = FontSet::load().expect("pinned font set");
+    let env = Env::default();
+    let o = render_html(r#"<html><head><style>body { margin-top: 0px; margin-left: 0px }
+        .g { display: grid; width: 600px; grid-template-columns: 10rem minmax(5rem, 1fr) }
+        .a { background-color: #ff0000; height: 10px } .b { background-color: #00ff00; height: 10px }</style></head>
+        <body><div class="g"><div class="a"></div><div class="b"></div></div></body></html>"#, &fonts, &env);
+    let w = |rgba: u32| o.scene.rects.iter().find(|r| r.rgba == rgba).expect("box").w / 64;
+    assert_eq!(w(0xff0000ff), 160, "10rem is 160px, not 10px");
+    assert_eq!(w(0x00ff00ff), 440, "and the flexible column takes the rest");
+}

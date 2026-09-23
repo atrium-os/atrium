@@ -107,6 +107,11 @@ struct Cx<'a> {
     /// Elements whose `display` is inline but which contain block-level
     /// content, computed once bottom-up (see `is_block_level`).
     promoted: Vec<bool>,
+    /// ★ REVIEW TOOLING, off unless asked for: every block box, so a person
+    /// can ask WHICH ELEMENT is where. The scene says what was painted; it
+    /// cannot say which element painted it, and that is the question every
+    /// layout investigation starts from.
+    pub boxes: Option<Vec<(Handle, U, U, U, U)>>,
     subs: &'a Subresources,
     /// The initial containing block: the viewport, which is also the
     /// containing block of every `position: fixed` box (NSG has no scroll
@@ -166,7 +171,7 @@ pub fn render_html_with(html: &str, fonts: &FontSet, env: &Env, subs: &Subresour
     let styled = cascade(&dom, &sheets, env);
     diagnostics.extend(styled.diagnostics);
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
-                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, content_dy: 0, table_part: false, promoted: vec![],
+                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]),
                       viewport: (u(env.width_px), Some(u(env.height_px))), pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))),
                       subs, placing_abs: false, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
     cx.promoted = promote_block_in_inline(&dom, &styled.styles);
@@ -190,6 +195,14 @@ pub fn render_html_with(html: &str, fonts: &FontSet, env: &Env, subs: &Subresour
     cx.scene.order = restack(&cx.scene.order, &cx.contexts, &cx.hoists);
     cx.scene.resolve_xforms();
     diagnostics.extend(cx.diagnostics);
+    if let Some(v) = &cx.boxes {
+        for (h, x, y, w, ht) in v {
+            let tag = dom.tag(*h).unwrap_or("?");
+            let id = dom.attr(*h, "id").map(|i| format!("#{i}")).unwrap_or_default();
+            let class = dom.attr(*h, "class").unwrap_or("");
+            eprintln!("BOX {tag}{id} [{class}] x={} y={} w={} h={}", x / 64, y / 64, w / 64, ht / 64);
+        }
+    }
     HtmlOut { scene: cx.scene, report: cx.report, diagnostics, unimplemented: cx.unimplemented }
 }
 
@@ -210,7 +223,7 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
     let styled = cascade(&dom, &sheets, env);
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None,
-                      indent: None, content_dy: 0, table_part: false, promoted: vec![], viewport: (u(env.width_px), Some(u(env.height_px))),
+                      indent: None, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), viewport: (u(env.width_px), Some(u(env.height_px))),
                       pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))), subs: &Subresources::new(),
                       placing_abs: false, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
     // (cell handle, min, max) for every first-row cell of every table.
@@ -703,6 +716,7 @@ impl<'a> Cx<'a> {
             self.scene.xforms[id as usize] = transform_matrix(&list, w, hgt, (bx + origin.0, by + origin.1));
         }
         self.scene.cur = saved_attrs;
+        if let Some(v) = self.boxes.as_mut() { v.push((h, bx, by, w, hgt)) }
         if positioned { self.pos_cb = saved_cb }
         if opens_context { self.contexts.push((z.unwrap_or(0), ctx_start, self.scene.order.len(), painted)) }
         else if positioned { self.hoists.push((ctx_start, self.scene.order.len())) }
@@ -1502,6 +1516,34 @@ impl<'a> Cx<'a> {
             Some(s) => s, None => return (0, 0),
         };
         if anon { self.collect_inline(h, &mut items, s) }
+        // ★ A ROW FLEX CONTAINER is as wide as its items TOGETHER, not as
+        // wide as its widest one: they sit side by side. Taking the max —
+        // which is right for stacked blocks — measured MDN's breadcrumb as
+        // one crumb wide, and the rest was clipped away.
+        if !anon && kw(s, "display") == "flex" && kw(s, "flex-direction") != "column" {
+            let gap = len(s.get("column-gap"), 0).unwrap_or(0);
+            let kids: Vec<Handle> = self.dom.element_children(h).into_iter()
+                .filter(|c| self.st(*c).is_some_and(|cs| kw(cs, "display") != "none")).collect();
+            let (mut smn, mut smx) = (0, 0);
+            for c in &kids {
+                let (a, b) = self.intrinsic(*c);
+                let frame = self.st(*c).map(|cs| {
+                    let px = |p: &str| len(cs.get(p), 0).unwrap_or(0);
+                    px("padding-left") + px("padding-right") + px("margin-left") + px("margin-right")
+                        + if kw(cs, "border-left-style") == "none" { 0 } else { px("border-left-width") }
+                        + if kw(cs, "border-right-style") == "none" { 0 } else { px("border-right-width") }
+                }).unwrap_or(0);
+                smn += a + frame;
+                smx += b + frame;
+            }
+            let total_gap = gap * (kids.len() as U).saturating_sub(1);
+            // Wrapping lets the line break, so the minimum is one item.
+            let wrap = kw(s, "flex-wrap") == "wrap";
+            let mn_out = if wrap { kids.iter().map(|c| self.intrinsic(*c).0).max().unwrap_or(0) } else { smn + total_gap };
+            self.links.truncate(links);
+            self.unimplemented = counts;
+            return (mn_out, (smx + total_gap).max(mn_out));
+        }
         for c in if anon { vec![] } else { self.dom.children_of(h) } {
             if self.is_block_level(c) {
                 let Some(cs) = self.st(c) else { continue };
@@ -2446,7 +2488,7 @@ mod tests {
         let held_out: Vec<u8> = READ_ROWS.iter().copied().filter(|r| *r != 39).collect();
         let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(&fonts), scene: Scene::default(),
                           report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None,
-                          baseline_probe: None, indent: None, content_dy: 0, table_part: false, promoted: vec![],
+                          baseline_probe: None, indent: None, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]),
                           viewport: (0, None), pos_cb: (0, 0, 0, None), subs: &Subresources::new(),
                           placing_abs: false, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
         cx.count_rows_outside(&held_out);
@@ -2714,44 +2756,112 @@ fn is_rtl(c: char) -> bool {
 
 fn size_tracks(tracks: &[navigator_style::values::Track], avail: Option<U>, gap: U, mins: &[U], maxs: &[U]) -> Vec<U> {
     use navigator_style::values::Track;
-    fn base(t: &Track, avail: Option<U>, mn: U, mx: U) -> U {
+    // ★ A track has TWO sizing functions, and they are not interchangeable:
+    // the minimum gives its BASE size, the maximum gives a GROWTH LIMIT it
+    // may expand to if there is room. Taking the maximum as the base — which
+    // this did — makes `minmax(0, 48rem)` claim 768px of an 800px grid
+    // before anything else is sized, and the other columns collapse to
+    // nothing. (CSS Grid §12.4-12.6.)
+    let pct = |p: f64| avail.map(|a| u(a as f64 / PX as f64 * p / 100.0)).unwrap_or(0);
+    fn get(v: &[U], i: usize) -> U { v.get(i).copied().unwrap_or(0) }
+    let base = |t: &Track, i: usize| -> U {
         match t {
             Track::Len(l) => u(l.v),
-            Track::Pct(p) => avail.map(|a| u(a as f64 / PX as f64 * p / 100.0)).unwrap_or(0),
-            Track::Fr(_) => 0,
-            Track::MinContent => mn,
-            Track::MaxContent | Track::Auto => mx,
-            Track::MinMax(a, b) => base(a, avail, mn, mx).max(base(b, avail, mn, mx).min(avail.unwrap_or(U::MAX))),
+            Track::Pct(p) => pct(*p),
+            Track::MinContent => get(mins, i),
+            // `auto` as a MINIMUM is the min-content size.
+            Track::Auto => get(mins, i),
+            Track::MaxContent => get(maxs, i),
+            // With indefinite free space a flexible track sizes to its
+            // content (§12.7.1); with definite space it starts at zero and
+            // takes its share below.
+            Track::Fr(_) => if avail.is_none() { get(maxs, i) } else { 0 },
+            Track::MinMax(a, _) => match &**a {
+                Track::Len(l) => u(l.v),
+                Track::Pct(p) => pct(*p),
+                Track::MinContent | Track::Auto => get(mins, i),
+                Track::MaxContent => get(maxs, i),
+                _ => 0,
+            },
         }
+    };
+    let limit = |t: &Track, i: usize| -> U {
+        match t {
+            Track::Len(l) => u(l.v),
+            Track::Pct(p) => pct(*p),
+            Track::MinContent => get(mins, i),
+            Track::MaxContent | Track::Auto => get(maxs, i),
+            Track::Fr(_) => U::MAX / 4,
+            Track::MinMax(_, b) => match &**b {
+                Track::Len(l) => u(l.v),
+                Track::Pct(p) => pct(*p),
+                Track::MinContent => get(mins, i),
+                Track::MaxContent | Track::Auto => get(maxs, i),
+                Track::Fr(_) => U::MAX / 4,
+                _ => get(maxs, i),
+            },
+        }
+    };
+    let flex_of = |t: &Track| -> Option<f64> {
+        match t {
+            Track::Fr(f) => Some(*f),
+            Track::MinMax(_, b) => match **b { Track::Fr(f) => Some(f), _ => None },
+            _ => None,
+        }
+    };
+
+    let mut sizes: Vec<U> = tracks.iter().enumerate().map(|(i, t)| base(t, i)).collect();
+    let limits: Vec<U> = tracks.iter().enumerate().map(|(i, t)| limit(t, i).max(sizes[i])).collect();
+    let Some(a) = avail else { return sizes };
+    let gaps = gap * (tracks.len() as U).saturating_sub(1);
+
+    // §12.5 maximize tracks: grow bases toward their growth limits, equally,
+    // until the space runs out or every track has reached its limit. Only
+    // tracks with a FINITE limit take part — a flexible one is handled next.
+    let mut free = a - sizes.iter().sum::<U>() - gaps;
+    let finite: Vec<usize> = (0..tracks.len()).filter(|i| flex_of(&tracks[*i]).is_none()).collect();
+    while free > 0 {
+        let growable: Vec<usize> = finite.iter().copied().filter(|i| limits[*i] > sizes[*i]).collect();
+        if growable.is_empty() { break }
+        let share = (free / growable.len() as U).max(1);
+        let mut spent = 0;
+        for i in growable {
+            let step = share.min(limits[i] - sizes[i]).min(free - spent);
+            sizes[i] += step;
+            spent += step;
+            if spent >= free { break }
+        }
+        if spent == 0 { break }
+        free -= spent;
     }
-    let mut sizes: Vec<U> = tracks.iter().enumerate()
-        .map(|(i, t)| base(t, avail, mins.get(i).copied().unwrap_or(0), maxs.get(i).copied().unwrap_or(0))).collect();
-    let fr: f64 = tracks.iter().map(|t| match t { Track::Fr(f) => *f, _ => 0.0 }).sum();
+
+    // §12.6 expand flexible tracks: what is left goes to the `fr` tracks, in
+    // proportion, and never below the base each already has.
+    let fr: f64 = tracks.iter().filter_map(flex_of).sum();
     if fr > 0.0 {
-        if let Some(a) = avail {
-            let used: U = sizes.iter().sum::<U>() + gap * (tracks.len() as U).saturating_sub(1);
-            let free = (a - used).max(0);
-            for (i, t) in tracks.iter().enumerate() {
-                if let Track::Fr(f) = t { sizes[i] = u(free as f64 / PX as f64 * f / fr) }
+        let fixed: U = (0..tracks.len()).filter(|i| flex_of(&tracks[*i]).is_none()).map(|i| sizes[i]).sum();
+        let for_flex = (a - fixed - gaps).max(0);
+        for (i, t) in tracks.iter().enumerate() {
+            if let Some(f) = flex_of(t) {
+                sizes[i] = sizes[i].max(u(for_flex as f64 / PX as f64 * f / fr));
             }
         }
-    } else if let Some(a) = avail {
-        // Grid §12.8 "Stretch auto Tracks". The profile admits no
-        // content-distribution property for a grid container (§3.5), so the
-        // distribution is always the initial `normal` and auto-max tracks
-        // always share what is left over. Without this an implicit `auto`
-        // column (`grid-template-columns: none`) is zero wide and every item
-        // in it disappears.
+    } else {
+        // §12.8 stretch auto tracks: with no flexible track to absorb it,
+        // whatever is left is shared by the `auto` ones. The profile admits
+        // no content-distribution property for a grid (§3.5), so the
+        // distribution is always the initial `normal` and this always
+        // applies.
         let is_auto = |t: &Track| match t { Track::Auto => true, Track::MinMax(_, b) => matches!(**b, Track::Auto), _ => false };
         let auto: Vec<usize> = tracks.iter().enumerate().filter(|(_, t)| is_auto(t)).map(|(i, _)| i).collect();
-        if !auto.is_empty() {
-            let used: U = sizes.iter().sum::<U>() + gap * (tracks.len() as U).saturating_sub(1);
-            let free = (a - used).max(0);
-            let share = free / auto.len() as U;
+        let left = (a - sizes.iter().sum::<U>() - gaps).max(0);
+        if !auto.is_empty() && left > 0 {
+            let share = left / auto.len() as U;
             for (n, &i) in auto.iter().enumerate() {
-                sizes[i] += if n + 1 == auto.len() { free - share * (auto.len() as U - 1) } else { share };
+                sizes[i] += if n + 1 == auto.len() { left - share * (auto.len() as U - 1) } else { share };
             }
         }
     }
     sizes
 }
+
