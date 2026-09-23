@@ -3,6 +3,12 @@
 //!                                 a digest over all of them — what the M0
 //!                                 gate compares across runs and machines.
 //! nsg-render --pins               canonical addresses of the font set (to pin)
+//! nsg-render --corpus-html <dir>  render every .html through the PROFILE
+//!                                 renderer and report what each document
+//!                                 refuses — M2's corpus leg. The number it
+//!                                 prints is "documents that render with no
+//!                                 refusal at all", which is a different and
+//!                                 harder claim than the 64/64 row number.
 
 use navigator_render::{fontset::FontSet, nsg, render, Options, Report};
 use std::process::ExitCode;
@@ -21,6 +27,46 @@ fn main() -> ExitCode {
     };
     let opts = Options::default();
     match args.get(1).map(String::as_str) {
+        Some("--corpus-html") => {
+            use navigator_style::cascade::Env;
+            use std::collections::BTreeMap;
+            let dir = args.get(2).expect("directory");
+            let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir).expect("readable dir")
+                .flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "html")).collect();
+            files.sort();
+            let env = Env::default();
+            let (mut clean, mut n) = (0usize, 0usize);
+            let mut codes: BTreeMap<String, (usize, usize)> = BTreeMap::new(); // code -> (hits, docs)
+            let mut unimpl: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+            let mut total = Report::default();
+            for f in &files {
+                let html = std::fs::read_to_string(f).unwrap_or_default();
+                let o = navigator_render::html::render_html(&html, &fonts, &env);
+                n += 1;
+                let mut per: BTreeMap<String, usize> = BTreeMap::new();
+                for d in &o.diagnostics { *per.entry(d.code.to_string()).or_default() += 1 }
+                for (k, v) in &per { let e = codes.entry(k.clone()).or_default(); e.0 += v; e.1 += 1 }
+                for (k, v) in &o.unimplemented { let e = unimpl.entry(k.to_string()).or_default(); e.0 += v; e.1 += 1 }
+                if o.diagnostics.is_empty() { clean += 1 }
+                total.notdef += o.report.notdef; total.overflow_lines += o.report.overflow_lines;
+                total.em_upright += o.report.em_upright;
+                println!("{:<24} {:>6} nodes  {:>4} refusals  {:>3} unimplemented  {}",
+                    f.file_name().unwrap().to_string_lossy(), o.scene.order.len(), o.diagnostics.len(),
+                    o.unimplemented.values().sum::<usize>(),
+                    per.keys().cloned().collect::<Vec<_>>().join(","));
+            }
+            println!("\nCORPUS: {clean}/{n} documents render with NO refusal");
+            println!("refusals, by code (hits / documents):");
+            let mut v: Vec<_> = codes.into_iter().collect();
+            v.sort_by_key(|(_, (h, _))| std::cmp::Reverse(*h));
+            for (k, (h, d)) in v { println!("  {h:>7} hits {d:>4} docs  {k}") }
+            println!("unimplemented, by kind (hits / documents):");
+            let mut v: Vec<_> = unimpl.into_iter().collect();
+            v.sort_by_key(|(_, (h, _))| std::cmp::Reverse(*h));
+            for (k, (h, d)) in v { println!("  {h:>7} hits {d:>4} docs  {k}") }
+            eprintln!("report: {total:?}");
+            return ExitCode::SUCCESS;
+        }
         Some("--corpus") => {
             let list = std::fs::read_to_string(args.get(2).expect("list file")).expect("readable list");
             let mut all = blake3::Hasher::new();

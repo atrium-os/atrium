@@ -824,7 +824,7 @@ Everything here runs headless, in CI, with no display server.
 |---|---|---|
 | **M0** | Markdown → NSG, hermetic | byte-identical output, 3 runs × 2 machines |
 | **M1** | jailed fetcher | fetcher's filesystem access refused **at the syscall**, asserted by test |
-| **M2** | Document Profile v1 (HTML + CSS) | curated corpus with a reported conformance **number** — number **64/64 as of 2026-09-23**; the CORPUS leg (real documents through the profile renderer) is not yet run |
+| **M2** | Document Profile v1 (HTML + CSS) | curated corpus with a reported conformance **number** — rows **64/64**, corpus **1/29 documents refuse nothing** (§8.4). The renderer is complete; the NORMALIZER is what is missing |
 | **M3** | per-document jail + graph validator | worker capabilities == none; validator fuzzed with reached-coverage reported; **per-document jail launch cost measured**, not assumed |
 | **M4** | navigation state machine + history in Tessera | back/forward/session-restore driven headlessly |
 | **M5** | UI attach (Pergola chrome + Limen document surface) | **UI deleted ⇒ suite still green** |
@@ -1401,6 +1401,55 @@ Every `display` value the profile admits is now laid out; nothing in §3.3 is co
   did not read — and there is no such row left, so it would have passed while testing
   nothing. `count_rows_outside` now takes the read set, and the test hands it one with a
   row held out.
+
+### 8.4 M2's CORPUS leg — first reading (2026-09-23)
+
+`nsg-render --corpus-html <dir>` renders every document through the profile renderer and
+prints what each one refuses. Over **29 real pages** fetched on 2026-09-23 (Wikipedia,
+MDN, WHATWG, W3C, rustdoc, FreeBSD docs, blogs, HN/lobste.rs, and info.cern.ch) and
+converted by `navigator-prerender` (19 tier 2, 10 tier 1):
+
+> **CORPUS: 1/29 documents render with NO refusal. 0 unimplemented counts, corpus-wide.**
+
+★ **The two numbers say opposite-looking things and both are true.** The renderer
+implements everything Profile v1 admits — that is the 64/64 and the zero unimplemented
+counts. Real documents are not written in Profile v1 — that is the 1/29. **The gap is
+the normalizer (§6), which does not exist.** The refusal histogram IS its specification:
+
+| hits | docs | code | whose job |
+|---|---|---|---|
+| 1726 | 3 | `value.var-invalid` | normalizer: resolve custom properties |
+| 1215 | 21 | `input.style-attribute` | normalizer: rewrite inline styles into rules |
+| 795 | 11 | `selector.unadmitted` | normalizer: flatten descendant combinators — the hard one |
+| 201 | 10 | `property.shorthand` | normalizer: expand to longhands |
+| 172 | 25 | `input.stylesheet-not-supplied` | CONVERTER: it does not supply external CSS at all |
+| 131 | 19 | `input.subresource-not-supplied` | converter: declare intrinsic sizes (§3.13) |
+| 126 | 14 | `table.column-width-undeclared` | normalizer: pre-measure columns (§3.13) |
+| 74 | 5 | `property.unknown` | genuinely outside the 64 rows; must be dropped |
+| 65 | 2 | `important.excluded` | normalizer: cascade `!important` away |
+| 42 | 10 | `value.invalid` | mixed |
+| 29 | 8 | `media.unadmitted` | normalizer: evaluate and flatten `@media` |
+| 27 | 4 | `at-rule.unadmitted` | normalizer: flatten or drop |
+
+★ **These are a LOWER BOUND.** `input.stylesheet-not-supplied` fires on 25 of 29
+documents, which means most of the corpus's CSS never reached the renderer — nearly every
+other count above comes from inline `<style>` blocks alone. Supply the external sheets and
+the numbers go UP, not down.
+
+**What refusals cost is presentation, not content.** A refusal drops a declaration; it
+never stops the document. The W3C flexbox spec refuses 1071 times and still renders as a
+readable, correctly structured document in UA defaults; the WHATWG HTML spec (5 refusals,
+both "not supplied") renders with correct nested lists and links; info.cern.ch (1990, no
+CSS) is the one document that refuses nothing. The renderer is not the bottleneck.
+
+**Reproducing:** the corpus is not in this tree (fetched pages change). Assemble a
+directory of saved pages with a `manifest.tsv`, then:
+
+```
+PRERENDER_EMIT_DIR=<emitted> PRERENDER_EXPLORE=1 prerender <corpus>
+# extract each recording's "document" field into <converted>/*.html
+nsg-render --corpus-html <converted>
+```
 
 ## 9. What this reuses
 
