@@ -824,7 +824,7 @@ Everything here runs headless, in CI, with no display server.
 |---|---|---|
 | **M0** | Markdown → NSG, hermetic | byte-identical output, 3 runs × 2 machines |
 | **M1** | jailed fetcher | fetcher's filesystem access refused **at the syscall**, asserted by test |
-| **M2** | Document Profile v1 (HTML + CSS) | curated corpus with a reported conformance **number** — rows **64/64**, corpus **1/29 documents refuse nothing** (§8.4). The renderer is complete; the NORMALIZER is what is missing |
+| **M2** | Document Profile v1 (HTML + CSS) | curated corpus with a reported conformance **number** — rows **64/64**, corpus **29/29 after the normalizer** (§8.4 measured 1/29 raw, §8.5 closed it). Converter must still carry stylesheets and image sizes |
 | **M3** | per-document jail + graph validator | worker capabilities == none; validator fuzzed with reached-coverage reported; **per-document jail launch cost measured**, not assumed |
 | **M4** | navigation state machine + history in Tessera | back/forward/session-restore driven headlessly |
 | **M5** | UI attach (Pergola chrome + Limen document surface) | **UI deleted ⇒ suite still green** |
@@ -1450,6 +1450,60 @@ PRERENDER_EMIT_DIR=<emitted> PRERENDER_EXPLORE=1 prerender <corpus>
 # extract each recording's "document" field into <converted>/*.html
 nsg-render --corpus-html <converted>
 ```
+
+### 8.5 The normalizer — M2's corpus leg CLOSED (2026-09-23)
+
+`navigator-normalize` is Profile v1 §6's component: it accepts real-world HTML and emits
+a profile-conformant document. Over the same 29 documents §8.4 measured:
+
+> **1/29 → 29/29 documents render with NO refusal**, with each page's real external
+> stylesheets applied.
+
+**The design decision.** It **resolves the cascade itself** and emits one flat class per
+distinct declaration block. It does NOT rewrite each unadmitted construct into an
+admitted one — impossible in general for a descendant combinator. It evaluates the
+selector, keeps the result, and throws the selector away. Eleven kinds of unadmitted
+selector, `!important`, shorthands, `var()`, `@media`, `@import` and inline `style=`
+attributes collapse into that one move, which is why the 692 descendant combinators cost
+no more than the 3 `+` combinators.
+
+**The gate is the profile itself** (§6: "its output is checkable"): every test renders the
+OUTPUT and asserts zero refusals, each with a control showing the input IS refused first.
+The normalizer also checks each declaration against the profile's own grammar before
+emitting it, so `value.invalid` from the renderer is impossible by construction.
+
+★ **Three bugs the RENDER found, none of which a refusal count would have shown.** All
+29 documents were already at zero refusals when each was found:
+- **Custom properties taken as "the last `--x` in the file"** pick up whatever a
+  `@media (prefers-color-scheme: dark)` block set, and **every page rendered in its dark
+  palette**. They belong in the cascade, per element and per media context, inheriting;
+  and a base rule using `var()` must be **re-resolved in each context whose customs
+  differ**, since that is how dark mode reaches `background: var(--bg)`.
+- **A `<link media="…">` conditions the whole sheet.** Ignoring the attribute applies a
+  dark-mode or print stylesheet unconditionally.
+- **`@import` is where the real CSS usually is.** The W3C's stylesheet for a spec is 123
+  bytes: one `@import "base.css"`. A strict parser drops the at-rule, and the page renders
+  exactly as if the sheet had never been fetched — which is what "29/29, no refusals" looked
+  like for an hour.
+
+**Renderer changes this needed**, both of them §3.13 finally landing in full:
+- A table's first row may declare `min-width`/`max-width` per column — the min-content and
+  max-content widths, measured offline by `premeasure_tables` with the pinned font set —
+  and the layout distributes them with the SAME track sizer grid uses. An exact `width`
+  still means exact; only measured columns take leftover space, and only when the table's
+  own width asks for it.
+- An `<img>` carrying `width`/`height` **has declared its intrinsic dimensions** (§1.2).
+  The subresource map names the BYTES, which is a different thing: an image whose size is
+  declared but whose bytes were not supplied reserves its space — no layout shift — and is
+  counted, not refused.
+
+**What it drops, it reports**, by reason and count: properties outside the 64 rows
+(`float`, `cursor`, `transition`), pseudo-element content, layered backgrounds, images
+whose intrinsic size the input never declared. Silence would be the only real failure.
+
+**Still open:** the converter does not carry stylesheets or image sizes in its recording —
+they were supplied here by sidecars the harness fetched. That is the last piece of the
+lane, and it is converter work, not renderer or normalizer work.
 
 ## 9. What this reuses
 
