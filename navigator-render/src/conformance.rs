@@ -13,7 +13,7 @@
 //! exercised-but-not-matched, which is the honest state of most rows today.
 
 use crate::fontset::FontSet;
-use crate::html::render_html;
+use crate::html::{render_html, render_html_with};
 use crate::nsg;
 use navigator_style::cascade::Env;
 use navigator_style::sheet::parse_sheet;
@@ -91,6 +91,44 @@ fn style_text(html: &str) -> Vec<String> {
     dom.by_tag_anywhere("style").into_iter().map(|h| dom.text_content(h)).collect()
 }
 
+/// `NN-name.subs`: one `<url> <path-relative-to-the-fixture>` per line.
+pub fn subresources(fixture: &Path) -> crate::Subresources {
+    let mut out = crate::Subresources::new();
+    let Ok(text) = std::fs::read_to_string(fixture.with_extension("subs")) else { return out };
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let mut it = line.split_whitespace();
+        let (Some(url), Some(rel)) = (it.next(), it.next()) else { continue };
+        let path = fixture.parent().unwrap_or(Path::new(".")).join(rel);
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let (w, h) = png_size(&bytes).unwrap_or((0, 0));
+        out.insert(url.to_string(), (format!("blake3:{}", blake3::hash(&bytes).to_hex()), w * 64, h * 64));
+    }
+    out
+}
+
+/// Width and height from a PNG header. The renderer never does this — the
+/// INPUT declares sizes (§3.13); this is the conformance harness standing in
+/// for the converter that would normally have measured them.
+fn png_size(b: &[u8]) -> Option<(i64, i64)> {
+    if b.len() < 24 || &b[..8] != b"\x89PNG\r\n\x1a\n" || &b[12..16] != b"IHDR" { return None }
+    let n = |i: usize| i64::from(u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]));
+    Some((n(16), n(20)))
+}
+
+/// The same manifest, as address -> file: what a REVIEW tool needs and the
+/// renderer never does.
+pub fn subresource_files(fixture: &Path) -> std::collections::BTreeMap<String, std::path::PathBuf> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(text) = std::fs::read_to_string(fixture.with_extension("subs")) else { return out };
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let mut it = line.split_whitespace();
+        let (Some(_url), Some(rel)) = (it.next(), it.next()) else { continue };
+        let path = fixture.parent().unwrap_or(Path::new(".")).join(rel);
+        if let Ok(bytes) = std::fs::read(&path) { out.insert(format!("blake3:{}", blake3::hash(&bytes).to_hex()), path); }
+    }
+    out
+}
+
 pub fn run(dir: &Path, fonts: &FontSet, bless: bool) -> Vec<RowResult> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir).map(|rd| rd.flatten().map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "html")).collect()).unwrap_or_default();
@@ -104,7 +142,12 @@ pub fn run(dir: &Path, fonts: &FontSet, bless: bool) -> Vec<RowResult> {
         for f in &mine {
             let html = std::fs::read_to_string(f).unwrap_or_default();
             css.extend(style_text(&html));
-            let o = render_html(&html, fonts, &Env::default());
+            // Subresources a fixture declares, beside it: one line each,
+            // `<url> <path>`. The address is the blake3 of the bytes and the
+            // intrinsic size is read from the file, so a fixture cannot
+            // declare a size the image does not have.
+            let subs = subresources(f);
+            let o = render_html_with(&html, fonts, &Env::default(), &subs);
             let name = f.file_name().unwrap().to_string_lossy().to_string();
             for d in &o.diagnostics { problems.push(format!("{name}: diagnostic {} {}", d.code, d.msg)) }
             for (k, n) in &o.unimplemented { problems.push(format!("{name}: unimplemented ×{n} {k}")) }

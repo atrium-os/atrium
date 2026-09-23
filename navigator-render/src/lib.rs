@@ -79,6 +79,20 @@ pub struct Tiling { pub x: U, pub y: U, pub w: U, pub h: U, pub tx: U, pub ty: U
                     /// 0 none, 1 x, 2 y, 3 both.
                     pub repeat: u8 }
 
+/// A raster image painted over a `Tiling`, named by its CONTENT ADDRESS —
+/// the renderer never sees the bytes, only the address and the intrinsic
+/// size that §3.13 requires the input to declare.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Image { pub area: Tiling, pub address: String,
+                   /// How the source fills its tile: `object-fit` (row 58).
+                   pub fit: &'static str }
+
+/// The subresources a document's input supplies, by URL: content address and
+/// intrinsic size in 1/64 px. ★ There is NO fallback measurement path
+/// (profile §3.13) — an image the input does not declare is a diagnostic,
+/// never a guess.
+pub type Subresources = std::collections::BTreeMap<String, (String, U, U)>;
+
 /// A linear gradient painted over a `Tiling`. The angle is in 1/64 degree,
 /// clockwise from "to top" as CSS defines it, and every stop carries an
 /// explicit position in 1/1024 of the gradient line — the renderer resolves
@@ -114,7 +128,8 @@ pub struct Scene {
     pub links: Vec<Link>,
     pub shadows: Vec<Shadow>,
     pub grads: Vec<Grad>,
-    /// Draw order: (kind, index). 0 rect, 1 run, 2 link, 3 shadow, 4 grad.
+    pub images: Vec<Image>,
+    /// Draw order: (kind, index). 0 rect, 1 run, 2 link, 3 shadow, 4 grad, 5 image.
     pub order: Vec<(u8, usize)>,
     /// Clip rectangles, each already intersected with its ancestors', so a
     /// node needs only one index and a reader needs no stack.
@@ -135,6 +150,7 @@ pub struct Scene {
     pub link_attrs: Vec<Attrs>,
     pub shadow_attrs: Vec<Attrs>,
     pub grad_attrs: Vec<Attrs>,
+    pub image_attrs: Vec<Attrs>,
     /// The clip and group a node created now belongs to.
     /// Public only so review tooling can build a scene of one node.
     pub cur: Attrs,
@@ -144,6 +160,11 @@ impl Scene {
     pub(crate) fn rect(&mut self, r: Rect) { self.order.push((0, self.rects.len())); self.rects.push(r); self.rect_attrs.push(self.cur) }
     pub(crate) fn run(&mut self, r: Run) { self.order.push((1, self.runs.len())); self.runs.push(r); self.run_attrs.push(self.cur) }
     pub(crate) fn link(&mut self, l: Link) { self.order.push((2, self.links.len())); self.links.push(l); self.link_attrs.push(self.cur) }
+    pub(crate) fn insert_image(&mut self, slot: usize, im: Image) {
+        self.order.insert(slot, (5, self.images.len()));
+        self.images.push(im);
+        self.image_attrs.push(self.cur);
+    }
     /// A gradient painted into a slot reserved earlier — a background goes
     /// over the box's background colour and under everything else.
     pub(crate) fn insert_grad(&mut self, slot: usize, g: Grad) {

@@ -58,7 +58,8 @@ impl Canvas {
 
 /// Paint ONE node with no transform of its own. Factored out so the
 /// transform path can render a node into a layer and map it into place.
-fn paint_one(cv: &mut Canvas, scene: &Scene, fonts: &FontSet, ctx: &mut swash::scale::ScaleContext, kind: u8, i: usize) {
+fn paint_one(cv: &mut Canvas, scene: &Scene, fonts: &FontSet, ctx: &mut swash::scale::ScaleContext, kind: u8, i: usize,
+             assets: &std::collections::BTreeMap<String, std::path::PathBuf>) {
     match kind {
         0 => {
             let r = &scene.rects[i];
@@ -133,7 +134,7 @@ fn paint_one(cv: &mut Canvas, scene: &Scene, fonts: &FontSet, ctx: &mut swash::s
             sub.order.push((0, 0));
             sub.rects.push(Rect { x: sh.x, y: sh.y, w: sh.w, h: sh.h, rgba: sh.rgba, radii: sh.radii, ring: 0 });
             sub.rect_attrs.push((None, None, None));
-            paint_one(&mut layer, &sub, fonts, ctx, 0, 0);
+            paint_one(&mut layer, &sub, fonts, ctx, 0, 0, assets);
             let sigma = sh.blur as f64 / PX as f64 / 2.0;
             if sigma > 0.0 {
                 let bw = ((sigma * 3.0 * (2.0 * std::f64::consts::PI).sqrt() / 4.0 + 0.5) as usize).max(1);
@@ -183,6 +184,31 @@ fn paint_one(cv: &mut Canvas, scene: &Scene, fonts: &FontSet, ctx: &mut swash::s
                 }
             }
         }
+        5 => {
+            let im = &scene.images[i];
+            let a = &im.area;
+            let Some(path) = assets.get(&im.address) else { return };
+            let Ok(file) = std::fs::File::open(path) else { return };
+            let Ok(mut reader) = png::Decoder::new(file).read_info() else { return };
+            let mut buf = vec![0; reader.output_buffer_size()];
+            let Ok(info) = reader.next_frame(&mut buf) else { return };
+            let (iw, ih, ch) = (info.width as i64, info.height as i64, info.color_type.samples());
+            for py in (a.y / PX)..((a.y + a.h) / PX) {
+                for px in (a.x / PX)..((a.x + a.w) / PX) {
+                    let (mut sx, mut sy) = ((px * PX - a.tx) as f64, (py * PX - a.ty) as f64);
+                    if a.repeat & 1 != 0 { sx = sx.rem_euclid(a.tw as f64) } else if sx < 0.0 || sx >= a.tw as f64 { continue }
+                    if a.repeat & 2 != 0 { sy = sy.rem_euclid(a.th as f64) } else if sy < 0.0 || sy >= a.th as f64 { continue }
+                    // Nearest sample of the source inside the tile.
+                    let (ux, uy) = ((sx / a.tw as f64 * iw as f64) as i64, (sy / a.th as f64 * ih as f64) as i64);
+                    if ux < 0 || uy < 0 || ux >= iw || uy >= ih { continue }
+                    let o = ((uy * iw + ux) as usize) * ch;
+                    if o + ch > buf.len() { continue }
+                    let (r, g, b) = (buf[o] as u32, buf[o + 1.min(ch - 1)] as u32, buf[o + 2.min(ch - 1)] as u32);
+                    let al = if ch == 4 { buf[o + 3] as f32 / 255.0 } else { 1.0 };
+                    cv.blend(px, py, r << 24 | g << 16 | b << 8 | 0xff, al);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -207,7 +233,7 @@ fn box_blur(cv: &mut Canvas, r: usize) {
     }
 }
 
-fn paint(scene: &Scene, fonts: &FontSet) -> Canvas {
+fn paint(scene: &Scene, fonts: &FontSet, assets: &std::collections::BTreeMap<String, std::path::PathBuf>) -> Canvas {
     let (w, h) = ((scene.width / PX) as usize, (scene.height / PX) as usize);
     let mut cv = Canvas::new(w.max(1), h.max(1));
     let mut ctx = swash::scale::ScaleContext::new();
@@ -248,7 +274,7 @@ fn paint(scene: &Scene, fonts: &FontSet) -> Canvas {
             if let Some(inv) = invert(m) {
                 let mut layer = match stack.last() { Some((_, c)) => c.layer(), None => cv.layer() };
                 layer.clip = None;
-                paint_one(&mut layer, scene, fonts, &mut ctx, kind, i);
+                paint_one(&mut layer, scene, fonts, &mut ctx, kind, i, assets);
                 let dst: &mut Canvas = match stack.last_mut() { Some((_, c)) => c, None => &mut cv };
                 let clip = clip_of(kind, i).and_then(|c| scene.clips.get(c as usize))
                     .map(|&(x, y, w, h)| (x / PX, y / PX, (x + w) / PX, (y + h) / PX));
@@ -271,7 +297,7 @@ fn paint(scene: &Scene, fonts: &FontSet) -> Canvas {
         }
         let cvr: &mut Canvas = match stack.last_mut() { Some((_, c)) => c, None => &mut cv };
         cvr.clip = clip_of(kind, i).and_then(|c| scene.clips.get(c as usize)).map(|&(x, y, w, h)| (x / PX, y / PX, (x + w) / PX, (y + h) / PX));
-        paint_one(cvr, scene, fonts, &mut ctx, kind, i);
+        paint_one(cvr, scene, fonts, &mut ctx, kind, i, assets);
     }
     // Any group still open at the end composites now.
     while let Some((id, layer)) = stack.pop() {
@@ -286,16 +312,21 @@ fn main() {
     if a.len() < 3 { eprintln!("usage: nsg-raster <file.html|file.md> <out.png> [width_px]"); std::process::exit(2) }
     let width: i64 = a.get(3).and_then(|w| w.parse().ok()).unwrap_or(800);
     let fonts = FontSet::load().expect("pinned font set");
+    let mut assets: std::collections::BTreeMap<String, std::path::PathBuf> = Default::default();
     let src = std::fs::read_to_string(&a[1]).expect("readable input");
     let scene = if a[1].ends_with(".md") {
         render(&src, &fonts, &Options { width_px: width }).0
     } else {
-        let o = render_html(&src, &fonts, &Env { width_px: width as f64, ..Env::default() });
+        let subs = navigator_render::conformance::subresources(std::path::Path::new(&a[1]));
+        // The review tool needs the BYTES the renderer never sees, to show
+        // what the scene refers to: address -> file, from the same manifest.
+        assets = navigator_render::conformance::subresource_files(std::path::Path::new(&a[1]));
+        let o = navigator_render::html::render_html_with(&src, &fonts, &Env { width_px: width as f64, ..Env::default() }, &subs);
         for d in &o.diagnostics { eprintln!("diagnostic {} {}: {}", d.pos, d.code, d.msg) }
         for (k, n) in &o.unimplemented { eprintln!("unimplemented ×{n}: {k}") }
         o.scene
     };
-    let cv = paint(&scene, &fonts);
+    let cv = paint(&scene, &fonts, &assets);
     let file = std::fs::File::create(&a[2]).expect("writable output");
     let mut enc = png::Encoder::new(std::io::BufWriter::new(file), cv.w as u32, cv.h as u32);
     enc.set_color(png::ColorType::Rgb);

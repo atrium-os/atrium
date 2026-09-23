@@ -16,6 +16,7 @@
 //! link <x> <y> <w> <h> "<href>" [c<i>] [x<i>]
 //! shadow <x> <y> <w> <h> <rrggbbaa> <blur> [r<tl>,<tr>,<br>,<bl>] [c<i>] [g<i>] [x<i>]
 //! grad <x> <y> <w> <h> t<tx>,<ty>,<tw>,<th> <repeat> <angle 1/64 deg> <rrggbbaa>@<pos 1/1024> …
+//! image <address> <x> <y> <w> <h> t<tx>,<ty>,<tw>,<th> <repeat> <fit>
 //! ```
 
 use crate::fontset::FontSet;
@@ -87,6 +88,13 @@ pub fn write(scene: &Scene, fonts: &FontSet) -> String {
                 for (g, dx, dy) in &r.glyphs { let _ = write!(o, " {g}:{dx},{dy}"); }
                 let _ = write!(o, " {}", quote(&r.text));
                 attrs(&mut o, scene.run_attrs.get(i));
+                o.push('\n');
+            }
+            5 => {
+                let im = &scene.images[i];
+                let a = &im.area;
+                let _ = write!(o, "image {} {} {} {} {} t{},{},{},{} {} {}", im.address, a.x, a.y, a.w, a.h, a.tx, a.ty, a.tw, a.th, a.repeat, im.fit);
+                attrs(&mut o, scene.image_attrs.get(i));
                 o.push('\n');
             }
             4 => {

@@ -980,7 +980,7 @@ layout.
 
 ### 8.3 M2 progress — the number, first reading (2026-09-22)
 
-**CONFORMANCE: exercised 62/64, matched 57/64** (13 on first reading; see the updates
+**CONFORMANCE: exercised 62/64, matched 61/64** (13 on first reading; see the updates
 below). Printed by `nsg-conformance`; the
 matched set is pinned by a test so it cannot fall silently.
 
@@ -1313,6 +1313,22 @@ Every `display` value the profile admits is now laid out; nothing in §3.3 is co
   `repeat` identical to `repeat-x`. Two of four values in row 53 render the same either
   way. The goldens were blessed, reviewed, found unable to show what they certify, and
   **withdrawn**; these rows wait for `url()` and a real intrinsic size.
+
+**Update — background images, matched 57 → 61 (rows 50-53).**
+- **NSG gains `image <address> …`**, the same `Tiling` a gradient uses. The renderer
+  never sees image BYTES: a node names the content address, and the input supplies
+  `url -> (address, intrinsic width, height)`.
+- ★ **§3.13 has no fallback measurement path, and this is where that bites.** An image
+  the input does not declare is **refused with a diagnostic** and nothing is painted —
+  the renderer never opens a file, never decodes a header, never guesses. The conformance
+  harness stands in for the converter: it reads each fixture's `NN-name.subs` manifest,
+  hashes the bytes for the address and takes the intrinsic size from the PNG header, so a
+  fixture cannot declare a size the image does not have.
+- ★ **With a real intrinsic size, rows 51-53 can finally show what they certify** — the
+  reason they were withheld one commit ago. `background-position-y` moves the mark,
+  `repeat-y` is a column rather than a full-height wash, `cover` crops and `contain`
+  leaves a sliver. The test image is a 40×20 PNG with a blue top-left corner, a red L and
+  a green bottom-right block, so any flip, crop or tile is obvious.
 
 ## 9. What this reuses
 

@@ -11,7 +11,7 @@
 //! where they occur. Every `display` value in the profile is laid out.
 
 use crate::fontset::{Family, FontSet};
-use crate::{scale, Grad, Link, Rect, Report, Run, Scene, Shadow, Shaper, Style as FontStyle, Xform, PX, U, XF_ONE};
+use crate::{scale, Grad, Link, Rect, Report, Run, Scene, Shadow, Shaper, Style as FontStyle, Subresources, Xform, PX, U, XF_ONE};
 use navigator_dom::{Dom, Handle, Kind};
 use navigator_style::cascade::{cascade, Env, Style};
 use navigator_style::sheet::{parse_sheet, Diagnostic, Stylesheet};
@@ -96,6 +96,7 @@ struct Cx<'a> {
     /// Set while a table lays out one of its own cells, so the "table part
     /// outside a table" counter fires only for a STRAY part in normal flow.
     table_part: bool,
+    subs: &'a Subresources,
     /// The initial containing block: the viewport, which is also the
     /// containing block of every `position: fixed` box (NSG has no scroll
     /// offset, so fixed and absolute differ only in which block they use).
@@ -119,6 +120,12 @@ struct Cx<'a> {
 }
 
 pub fn render_html(html: &str, fonts: &FontSet, env: &Env) -> HtmlOut {
+    render_html_with(html, fonts, env, &Subresources::new())
+}
+
+/// With the subresources the input supplies (profile §3.13): a document that
+/// references one it does not declare gets a diagnostic, never a guess.
+pub fn render_html_with(html: &str, fonts: &FontSet, env: &Env, subs: &Subresources) -> HtmlOut {
     let dom = navigator_dom::parse(html);
     let mut diagnostics = vec![];
     // Stylesheets: every <style>, in document order, one author layer each
@@ -150,7 +157,7 @@ pub fn render_html(html: &str, fonts: &FontSet, env: &Env) -> HtmlOut {
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, content_dy: 0, table_part: false,
                       viewport: (u(env.width_px), Some(u(env.height_px))), pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))),
-                      placing_abs: false, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
+                      subs, placing_abs: false, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
     cx.count_unread_rows();
     // The root element is the initial containing block's only child.
     let root = dom.element_children(dom.root()).into_iter().next();
@@ -449,7 +456,26 @@ impl<'a> Cx<'a> {
                 let area = self.tiling(s, (bx, by, w, hgt), pad, None);
                 Some(Grad { area, angle: (angle_deg * 64.0).round() as i64, stops: resolve_stops(stops, s) })
             }
-            V::Url(_) => { self.count("background-image: url() (no subresource supplied)"); None }
+            V::Url(_) => None,
+            _ => None,
+        };
+        // An image background: the same tiling, sized from the DECLARED
+        // intrinsic size (§3.13 — there is no measurement path here).
+        let bg_url = match s.get("background-image") {
+            V::Url(u) => match self.subs.get(u.as_str()) {
+                Some((addr, iw, ih)) => {
+                    let (addr, iw, ih) = (addr.clone(), *iw, *ih);
+                    let pad = (bx + bl, by + bt, (w - bl - br).max(0), (hgt - bt - bb).max(0));
+                    let area = self.tiling(s, (bx, by, w, hgt), pad, Some((iw, ih)));
+                    Some(crate::Image { area, address: addr, fit: "fill" })
+                }
+                None => {
+                    let u = u.clone();
+                    self.diagnostics.push(Diagnostic { pos: Pos { line: 0, col: 0 }, code: "input.subresource-not-supplied",
+                        msg: format!("background-image: url({u}): no subresource declared; §3.13 admits no measurement path") });
+                    None
+                }
+            },
             _ => None,
         };
         // (side width, x, y, length, horizontal?, style, colour)
@@ -511,6 +537,9 @@ impl<'a> Cx<'a> {
         slot += n_paint;
         if let Some(g) = bg_image {
             if !hidden && g.area.w > 0 && g.area.h > 0 { self.scene.insert_grad(slot, g); slot += 1 }
+        }
+        if let Some(im) = bg_url {
+            if !hidden && im.area.w > 0 && im.area.h > 0 { self.scene.insert_image(slot, im); slot += 1 }
         }
         let painted = slot - bg_slot;
         // ★ Inserting this box's background at the slot reserved before the
@@ -1668,8 +1697,17 @@ mod tests {
     #[test]
     fn unimplemented_layout_is_counted_not_faked() {
         // A property the layout reads but cannot paint is still counted.
-        let o = render(r#"<style>div { background-image: url(cat.png) }</style><div>x</div>"#);
-        assert!(o.unimplemented.contains_key("background-image: url() (no subresource supplied)"), "{:?}", o.unimplemented);
+        let o = render(r#"<style>div { font-style: italic }</style><div>x</div>"#);
+        assert!(o.unimplemented.keys().any(|k| k.starts_with("font-style: italic")), "{:?}", o.unimplemented);
+    }
+
+    /// ★ §3.13: there is no measurement path. An image the input does not
+    /// declare is REFUSED with a diagnostic, never guessed at.
+    #[test]
+    fn an_undeclared_subresource_is_refused() {
+        let o = render(r#"<style>div { width: 50px; height: 50px; background-image: url(cat.png) }</style><div>x</div>"#);
+        assert!(o.diagnostics.iter().any(|d| d.code == "input.subresource-not-supplied"), "{:?}", o.diagnostics);
+        assert!(o.scene.images.is_empty(), "nothing is painted for it");
     }
 
     #[test]
