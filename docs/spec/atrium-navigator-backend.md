@@ -1611,9 +1611,34 @@ Admitting them is a Profile v1 change, so it is the user's call, not this file's
 grammar on the way out, whatever path it took to get there. One check at the exit is worth
 more than trusting every entrance.
 
-**Known limit.** MDN's app shell still overlaps: its layout interleaves `position: sticky`,
-`!important` grid overrides and container queries. The CONTENT renders readably; the shell
-needs its own investigation. Everything else reviewed — Wikipedia, the W3C and WHATWG
+**MDN's app shell — six bugs (2026-09-23), one of them general.** Chased with a new
+`NSG_DUMP_BOXES` review mode, because the scene says what was painted and never which
+element painted it, which is the question a layout investigation starts from.
+- ★★ **Track lists were never converted to px.** Every other value type is converted in
+  the cascade; `V::Tracks` was missed, so `minmax(15rem, 1fr)` was read as fifteen
+  PIXELS. MDN's 48rem content column came out 48px wide — **every em/rem grid on the web
+  was sized at a sixteenth of its intended value**. The conformance fixtures are written
+  in px, so 64/64 could not see it.
+- ★ **A track has TWO sizing functions and they are not interchangeable**: the minimum
+  gives the base size, the maximum a growth limit. Taking the maximum as the base made
+  `minmax(0, 48rem)` claim 768px of an 800px grid before anything else was sized.
+  Rewritten as CSS Grid §12.4-12.8.
+- An `fr` inside `minmax()` is still flexible, and a flexible track with INDEFINITE free
+  space sizes to its content (§12.7.1) — returning zero gave a page-tall row a height of
+  zero and every section below it was painted on top of the one above.
+- **A row flex container is as wide as its items TOGETHER.** `intrinsic` took the max,
+  which is right for stacked blocks and wrong here: the breadcrumb measured as one crumb
+  wide and the rest was clipped.
+- **`display: contents` must be spliced BEFORE named areas are resolved**, or a child's
+  parent is still the box that generates none — MDN's header, body and right sidebar sit
+  inside a `display: contents` `<main>` and so never found the grid's template. Named
+  areas resolve per MEDIA CONTEXT too, since a responsive page keeps its layout there.
+
+**Previously recorded as a known limit; now resolved.** The note below is kept because the
+shape of the mistake is worth keeping: the shell overlapped  and I attributed it to
+`position: sticky`, `!important` overrides and container queries — a guess from reading
+the stylesheet rather than measuring the boxes. Not one of those was the cause. Everything
+reviewed — Wikipedia, the W3C and WHATWG
 specs, the Rust book, rustdoc, Hacker News, lobste.rs, danluu, Joel on Software, the Rust
 blog, GitHub, freebsd.org, the FreeBSD man page, the GNU coreutils manual, info.cern.ch —
 renders as the site itself looks.
