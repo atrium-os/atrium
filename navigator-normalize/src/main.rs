@@ -29,6 +29,42 @@ fn sidecars(doc: &std::path::Path) -> Inputs {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
+    // ★ The whole lane, from one file: converter recording in, profile
+    // document out. The normalizer fetches nothing — everything it needs
+    // travelled in the recording.
+    if a.len() >= 4 && a[1] == "--recordings" {
+        let (src, dst) = (std::path::Path::new(&a[2]), std::path::Path::new(&a[3]));
+        std::fs::create_dir_all(dst).expect("output directory");
+        let fonts = navigator_render::fontset::FontSet::load().expect("pinned font set");
+        let env = navigator_style::cascade::Env::default();
+        let mut files: Vec<_> = std::fs::read_dir(src).expect("input directory").flatten()
+            .map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect();
+        files.sort();
+        let mut total = std::collections::BTreeMap::<String, usize>::new();
+        let (mut ok, mut sheets, mut images) = (0usize, 0usize, 0usize);
+        for f in &files {
+            let json = std::fs::read_to_string(f).unwrap_or_default();
+            let r = match navigator_normalize::recording::parse(&json) {
+                Ok(r) => r,
+                Err(e) => { println!("{}: {e}", f.display()); continue }
+            };
+            sheets += r.inputs.stylesheets.len();
+            images += r.inputs.images.len();
+            let (out, rep) = normalize_and_measure(&r.document, &r.inputs, &fonts, &env);
+            let name = f.file_stem().expect("stem").to_string_lossy().to_string();
+            std::fs::write(dst.join(format!("{name}.html")), out).expect("write");
+            println!("{:<22} {:>3} sheets {:>4} images {:>5} rules in {:>5} out {:>4} columns",
+                name, r.inputs.stylesheets.len(), r.inputs.images.len(), rep.rules_in, rep.rules_out, rep.columns_measured);
+            for (k, v) in rep.dropped { *total.entry(k).or_default() += v }
+            ok += 1;
+        }
+        println!("\n{ok} recordings: {sheets} stylesheets, {images} measured images");
+        let mut v: Vec<_> = total.into_iter().collect();
+        v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        println!("dropped, by reason:");
+        for (k, n) in v.iter().take(20) { println!("  {n:>7}  {k}") }
+        return;
+    }
     let fonts = navigator_render::fontset::FontSet::load().expect("pinned font set");
     let env = navigator_style::cascade::Env::default();
     if a.len() >= 4 && a[1] == "--dir" {

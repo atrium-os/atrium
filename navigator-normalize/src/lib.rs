@@ -19,6 +19,7 @@
 
 pub mod css;
 pub mod expand;
+pub mod recording;
 pub mod sel;
 pub mod value;
 
@@ -28,12 +29,16 @@ use std::collections::BTreeMap;
 
 /// What the input supplies besides the HTML. ★ The normalizer has NO
 /// capabilities (§6): stylesheets and intrinsic sizes are handed to it.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Inputs {
     /// `href` → stylesheet text, for every `<link rel=stylesheet>`.
     pub stylesheets: BTreeMap<String, String>,
     /// `src` → (intrinsic width px, height px), for every image.
     pub images: BTreeMap<String, (u32, u32)>,
+    /// `href` → the `media` attribute of the `<link>` that named it. A sheet
+    /// fetched under a condition must be APPLIED under it (§3.11), or a
+    /// dark-mode stylesheet lands on every reader.
+    pub stylesheet_media: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default)]
@@ -88,7 +93,12 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
             Some(text) => {
                 let text = text.clone();
                 let text = expand_imports(&text, &href, inputs, 0, &mut report);
-                let media = dom.attr(h, "media").unwrap_or("").to_string();
+                // The document's own attribute, or the one the converter
+                // recorded when it fetched the sheet.
+                let media = dom.attr(h, "media").map(str::to_string)
+                    .filter(|m| !m.is_empty())
+                    .or_else(|| inputs.stylesheet_media.get(&href).cloned())
+                    .unwrap_or_default();
                 css::parse_in_media(&text, &media, &mut order, &mut sheet)
             }
             None => report.drop("stylesheet not supplied by the input"),
@@ -462,6 +472,10 @@ fn to_longhands(name: &str, value: &[Token], inputs: &Inputs, report: &mut Repor
                 }
             }
         }
+        if v.contains("var(") {
+            report.drop("unresolved custom property (a cycle, or deeper than the limit)");
+            return None;
+        }
         if value::admits(&p, &v) { return Some((p, v)) }
         match value::repair(&p, &v) {
             Some(fixed) => Some((p, fixed)),
@@ -485,7 +499,38 @@ fn admitted_media(q: &str) -> Option<String> {
     let inner = q.trim_matches(|c| c == '(' || c == ')');
     let name = inner.split(':').next().unwrap_or("").trim();
     match name {
-        "min-width" | "max-width" | "min-height" | "max-height" | "prefers-color-scheme" | "prefers-reduced-motion" | "orientation" => Some(q),
+        "min-width" | "max-width" | "min-height" | "max-height" => {
+            // ★ A media feature takes a plain length; real sheets write
+            // `calc(640px - 1px)`. It is constant-foldable, so fold it —
+            // dropping the query would drop a whole responsive breakpoint.
+            let value = inner.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
+            match fold_px(value) {
+                Some(px) => Some(format!("({name}: {px}px)")),
+                None if value.contains("calc(") => None,
+                None => Some(q),
+            }
+        }
+        "prefers-color-scheme" | "prefers-reduced-motion" | "orientation" => Some(q),
         _ => None,
     }
+}
+
+/// `calc(640px - 1px)` and friends, in absolute px. Anything else — a
+/// percentage, a font-relative unit, a division by a length — is not a
+/// constant and returns `None`.
+fn fold_px(v: &str) -> Option<f64> {
+    let inner = v.trim().strip_prefix("calc(")?.strip_suffix(')')?;
+    let mut total = 0.0f64;
+    let mut sign = 1.0f64;
+    for tok in inner.split_whitespace() {
+        match tok {
+            "+" => sign = 1.0,
+            "-" => sign = -1.0,
+            t => {
+                let n: f64 = t.strip_suffix("px").or(Some(t).filter(|x| **x == *"0"))?.parse().ok()?;
+                total += sign * n;
+            }
+        }
+    }
+    Some(total)
 }

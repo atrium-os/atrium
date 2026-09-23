@@ -23,6 +23,8 @@ navigator-dom = { path = "../navigator-dom" }
 icu_experimental = "0.6.0"
 icu_locale_core = "2.3.0"
 url = "2"
+# The content address a subresource travels by (§3.13 + Tessera CAS).
+blake3 = { version = "1", features = ["pure"] }
 
 [[bin]]
 name = "prerender"

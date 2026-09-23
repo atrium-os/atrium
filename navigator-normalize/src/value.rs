@@ -10,8 +10,15 @@ use navigator_style::token::tokenize;
 use navigator_style::values::{grammar, parse_value, Specified};
 
 /// Does the profile accept this value for this property?
+///
+/// ★ `Unresolved` — a value still holding `var()` — is NOT accepted. The
+/// normalizer's job is to resolve custom properties; one that survives means
+/// the substitution gave up (a cycle, or a chain past the depth limit), and
+/// emitting it hands the renderer something it will refuse. Wikipedia
+/// defines `--font-size-medium: var(--font-size-small)` and the reverse in
+/// different scopes, which merges into a cycle here.
 pub fn admits(prop: &str, value: &str) -> bool {
-    grammar(prop).is_some() && matches!(parse_value(prop, &tokenize(value), &[]), Ok(Specified::Value(_) | Specified::Inherit | Specified::Initial | Specified::Unresolved(_)))
+    grammar(prop).is_some() && matches!(parse_value(prop, &tokenize(value), &[]), Ok(Specified::Value(_) | Specified::Inherit | Specified::Initial))
 }
 
 /// Map a real-world value onto one the profile admits, or `None`.

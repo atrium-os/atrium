@@ -20,7 +20,12 @@ use crate::{Conversion, Effect, Tier, TierPolicy};
 /// merely absent would produce a document that differs from the recorded one
 /// with nothing to signal it. The version is how a consumer knows which
 /// guarantee it is getting.
-pub const FORMAT: &str = "atrium-navigator-recording/2";
+/// v3 adds `stylesheets` and `images`: what the normalizer needs and cannot
+/// fetch for itself (Profile v1 §6 — it has no capabilities — and §3.13 —
+/// there is no measurement path later in the lane). A v2 reader that ignores
+/// unknown fields still reads a v3 recording; the bump is so a reader can
+/// TELL, rather than infer it from a field's absence.
+pub const FORMAT: &str = "atrium-navigator-recording/3";
 
 /// ★ WHICH TRANSITIONS SURVIVE DEPENDS ON WHICH DOCUMENT IS PUBLISHED.
 ///
@@ -87,6 +92,21 @@ pub fn emit(url: Option<&str>, c: &Conversion, policy: &TierPolicy) -> String {
     }
     s.push_str(if kept.is_empty() { "],\n" } else { "\n  ],\n" });
 
+    // The subresources, in the order they were found.
+    s.push_str("  \"stylesheets\": [");
+    for (i, sh) in c.subresources.sheets.iter().enumerate() {
+        s.push_str(if i == 0 { "\n" } else { ",\n" });
+        s.push_str(&format!("    {{ \"href\": {}, \"media\": {}, \"text\": {} }}",
+            json_str(&sh.href), json_str(&sh.media), json_str(&sh.text)));
+    }
+    s.push_str(if c.subresources.sheets.is_empty() { "],\n" } else { "\n  ],\n" });
+    s.push_str("  \"images\": [");
+    for (i, im) in c.subresources.images.iter().enumerate() {
+        s.push_str(if i == 0 { "\n" } else { ",\n" });
+        s.push_str(&format!("    {{ \"src\": {}, \"width\": {}, \"height\": {}, \"address\": {} }}",
+            json_str(&im.src), im.width, im.height, json_str(&im.address)));
+    }
+    s.push_str(if c.subresources.images.is_empty() { "],\n" } else { "\n  ],\n" });
     s.push_str(&format!("  \"document\": {}\n", json_str(document)));
     s.push_str("}\n");
     s

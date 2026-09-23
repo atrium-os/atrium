@@ -1,3 +1,4 @@
+pub mod subresource;
 pub mod artifact;
 // ★ Re-exported rather than re-implemented: `crate::dom::…` and
 // `crate::parse::…` resolve exactly as before, so extracting these cost no
@@ -15,6 +16,12 @@ use std::collections::HashSet;
 use fetch::Fetcher;
 
 pub struct Conversion {
+    /// ★ What the NORMALIZER will need and cannot fetch for itself: the
+    /// document's stylesheets (with `@import` followed) and every image's
+    /// intrinsic size and content address. Without these the normalizer
+    /// emits a document with no styling and no images — which is exactly
+    /// what the first corpus run through it looked like.
+    pub subresources: subresource::Subresources,
     /// The TIER 2 artifact: the document after its scripts ran.
     pub html: String,
     /// ★ The TIER 1 artifact: the same document before any script ran.
@@ -223,9 +230,14 @@ pub fn convert_with_opts(
     // The fetch cache persists; the mirror is scratch for this conversion.
     let _ = std::fs::remove_dir_all(&mirror_root);
     rep.errors.extend(fetch_errors);
+    // ★ Subresources are collected from the FINAL document — after scripts
+    // ran — because that is the document the normalizer will be handed, and
+    // a script may well have added the stylesheet or the image.
+    let subresources = subresource::collect(&dom, base, fetcher);
     // Computed before the struct consumes the fields it reads.
     let verdict = classify(rep.first_error.as_deref(), rep.cause.as_ref());
     Conversion {
+        subresources,
         html: dom.serialize(),
         html_tier1,
         engine: engine.name(),

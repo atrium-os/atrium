@@ -10,6 +10,13 @@ use std::{collections::HashMap, fs, path::PathBuf, process::Command};
 
 pub trait Fetcher {
     fn get(&mut self, url: &str) -> Result<String, String>;
+    /// ★ RAW bytes. An image's intrinsic size lives in its header, and a
+    /// header read through a lossy UTF-8 conversion is not the header. The
+    /// default exists so a text-only fetcher still compiles; every fetcher
+    /// that can serve an image overrides it.
+    fn get_bytes(&mut self, url: &str) -> Result<Vec<u8>, String> {
+        self.get(url).map(String::into_bytes)
+    }
     /// Bytes actually pulled over the wire, for the report.
     fn bytes_fetched(&self) -> u64 { 0 }
 }
@@ -50,6 +57,11 @@ impl HttpFetcher {
         let _ = fs::create_dir_all(&cache);
         Self { cache, max_bytes: 8_000_000, timeout_s: 20, fetched: 0, from_cache: 0, bytes: 0 }
     }
+    fn key_ext(url: &str, ext: &str) -> String {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in url.as_bytes() { h ^= *b as u64; h = h.wrapping_mul(0x100000001b3); }
+        format!("{h:016x}.{ext}")
+    }
     fn key(url: &str) -> String {
         // FNV-1a: a stable name, no dependency, and collisions are harmless
         // here because a miss just re-fetches.
@@ -81,6 +93,24 @@ impl Fetcher for HttpFetcher {
         self.bytes += body.len() as u64;
         let _ = fs::write(&path, &body);
         Ok(body)
+    }
+    fn get_bytes(&mut self, url: &str) -> Result<Vec<u8>, String> {
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err(format!("unsupported scheme: {url}"));
+        }
+        let path = self.cache.join(Self::key_ext(url, "bin"));
+        if let Ok(b) = fs::read(&path) { self.from_cache += 1; return Ok(b) }
+        let out = Command::new("curl")
+            .args(["-fsSL", "--max-time", &self.timeout_s.to_string(),
+                   "--max-filesize", &self.max_bytes.to_string(),
+                   "-A", "atrium-navigator-corpus/0.1 (measurement)", url])
+            .output()
+            .map_err(|e| format!("curl: {e}"))?;
+        if !out.status.success() { return Err(format!("fetch failed: {url}")); }
+        self.fetched += 1;
+        self.bytes += out.stdout.len() as u64;
+        let _ = fs::write(&path, &out.stdout);
+        Ok(out.stdout)
     }
     fn bytes_fetched(&self) -> u64 { self.bytes }
 }
@@ -122,14 +152,13 @@ impl FetchdFetcher {
         Ok(FetchdFetcher { child, stdin, stdout, bytes: 0, requests: 0, broken: None })
     }
 
-    fn fail(&mut self, why: String) -> Result<String, String> {
+    fn fail<T>(&mut self, why: String) -> Result<T, String> {
         self.broken = Some(why.clone());
         Err(why)
     }
-}
 
-impl Fetcher for FetchdFetcher {
-    fn get(&mut self, url: &str) -> Result<String, String> {
+    /// The body as it came off the wire. `get` is this, decoded.
+    fn get_raw(&mut self, url: &str) -> Result<Vec<u8>, String> {
         use std::io::{BufRead, Read, Write};
         if let Some(b) = &self.broken { return Err(format!("fetcher unusable: {b}")) }
         // ★ One request per line, so a URL that carries a line break would
@@ -160,8 +189,15 @@ impl Fetcher for FetchdFetcher {
         self.bytes += len as u64;
         // Same contract as HttpFetcher's `curl -f`: an HTTP error is a failure.
         if !(200..300).contains(&status) { return Err(format!("fetch {url}: HTTP {status}")) }
-        Ok(String::from_utf8_lossy(&body).into_owned())
+        Ok(body)
     }
+}
+
+impl Fetcher for FetchdFetcher {
+    fn get(&mut self, url: &str) -> Result<String, String> {
+        self.get_raw(url).map(|b| String::from_utf8_lossy(&b).into_owned())
+    }
+    fn get_bytes(&mut self, url: &str) -> Result<Vec<u8>, String> { self.get_raw(url) }
     fn bytes_fetched(&self) -> u64 { self.bytes }
 }
 
@@ -193,6 +229,7 @@ impl Drop for FetchdFetcher {
 pub struct SharedFetcher(pub std::rc::Rc<std::cell::RefCell<FetchdFetcher>>);
 impl Fetcher for SharedFetcher {
     fn get(&mut self, url: &str) -> Result<String, String> { self.0.borrow_mut().get(url) }
+    fn get_bytes(&mut self, url: &str) -> Result<Vec<u8>, String> { self.0.borrow_mut().get_bytes(url) }
     fn bytes_fetched(&self) -> u64 { self.0.borrow().bytes_fetched() }
 }
 

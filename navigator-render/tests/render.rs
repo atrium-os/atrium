@@ -31,10 +31,11 @@ fn rendering_is_deterministic() {
 fn nsg_is_integers_only_in_a_closed_vocabulary() {
     let out = nsg_of(SAMPLE, 800);
     let mut lines = out.lines();
-    assert_eq!(lines.next(), Some("nsg 0.1"));
+    assert_eq!(lines.next(), Some("nsg 0.2"));
     for l in lines {
         let kw = l.split(' ').next().unwrap();
-        assert!(["viewport", "font", "rect", "run", "link"].contains(&kw), "unknown node {l:?}");
+        assert!(["viewport", "font", "clip", "group", "xform", "rect", "run", "link", "shadow", "grad", "image"].contains(&kw),
+                "unknown node {l:?}");
         // Everything before the first quoted string is structure: no floats.
         let structure = l.split('"').next().unwrap();
         assert!(!structure.contains('.'), "non-integer in {l:?}");
