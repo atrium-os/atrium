@@ -824,7 +824,7 @@ Everything here runs headless, in CI, with no display server.
 |---|---|---|
 | **M0** | Markdown → NSG, hermetic | byte-identical output, 3 runs × 2 machines |
 | **M1** | jailed fetcher | fetcher's filesystem access refused **at the syscall**, asserted by test |
-| **M2** | Document Profile v1 (HTML + CSS) | curated corpus with a reported conformance **number** |
+| **M2** | Document Profile v1 (HTML + CSS) | curated corpus with a reported conformance **number** — number **64/64 as of 2026-09-23**; the CORPUS leg (real documents through the profile renderer) is not yet run |
 | **M3** | per-document jail + graph validator | worker capabilities == none; validator fuzzed with reached-coverage reported; **per-document jail launch cost measured**, not assumed |
 | **M4** | navigation state machine + history in Tessera | back/forward/session-restore driven headlessly |
 | **M5** | UI attach (Pergola chrome + Limen document surface) | **UI deleted ⇒ suite still green** |
@@ -974,6 +974,15 @@ green tick.
 2. **M2.2:** block and inline layout with the fixed box rules (`border-box`, no margin
    collapsing, no floats), and paint of backgrounds and borders into NSG.
 3. **M2.3+:** flex, grid, tables, the remaining paint rows, and the semantic tree (§4).
+
+**Where M2 stands (2026-09-23).** Every one of the profile's 64 property rows is
+exercised and matched (§8.3). ★ **That is not all of M2's gate.** The gate reads
+"curated corpus with a reported conformance number", and the corpus leg has NOT been run:
+the number comes from fixtures written to exercise each row, which is a different claim
+from real documents rendering correctly. The converter already produces 98 real documents
+(§8.1); putting them through the profile renderer and reporting what refuses is the next
+step, and it is the one that will find what the fixtures could not. The semantic tree
+(§4) is also still open.
 
 The M0 Markdown path stays; it becomes one more input grammar in front of the same
 layout.
