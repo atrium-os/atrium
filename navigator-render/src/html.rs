@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 /// so a property the layout ignores can never be dropped silently (§5.1).
 /// Value-level gaps inside a read row (flex as block, italic without an
 /// italic face, …) are counted where they occur.
-pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 51, 52, 53, 54, 55, 56, 57, 59, 60, 61, 62, 63, 64];
+pub const READ_ROWS: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64];
 
 pub struct HtmlOut {
     pub scene: Scene,
@@ -275,6 +275,8 @@ impl<'a> Cx<'a> {
         let opens_context = z.is_some() || isolated || transformed;
         let ctx_start = self.scene.order.len();
         let side = |p: &str| len(s.get(p), cb_w);
+        let repl = self.replaced(h);
+        let Some(s) = self.st(h) else { return 0 };
         let vpct = |p: &str| -> Option<U> { match s.get(p) { V::Pct(_) => cb_h.and_then(|b| len(s.get(p), b)), v => len(v, cb_h.unwrap_or(0)) } };
         let (bt, br, bb, bl) = ["border-top", "border-right", "border-bottom", "border-left"].map(|b| {
             if kw(s, &format!("{b}-style")) == "none" { 0 } else { len(s.get(&format!("{b}-width")), cb_w).unwrap_or(0) }
@@ -289,7 +291,15 @@ impl<'a> Cx<'a> {
             V::Kw("min-content") => Some(self.intrinsic(h).0 + frame),
             V::Kw("max-content") => Some(self.intrinsic(h).1 + frame),
             v => len(v, cb_w),
-        };
+        }
+        // A replaced box with an auto width takes the declared intrinsic one,
+        // or follows the ratio from a specified height (CSS Sizing 3 §5.2).
+        .or_else(|| repl.as_ref().map(|(_, iw, ih)| {
+            match (match s.get("height") { V::Kw(_) => None, V::Pct(_) => cb_h.and_then(|b| len(s.get("height"), b)), v => len(v, 0) }, *ih) {
+                (Some(hh), ih) if ih > 0 => frame + (hh as i128 * *iw as i128 / ih as i128) as U,
+                _ => frame + *iw,
+            }
+        }));
         let mut w = specified_w.unwrap_or_else(|| cb_w - ml.unwrap_or(0) - mr.unwrap_or(0));
         if let Some(mx) = len(s.get("max-width"), cb_w) { w = w.min(mx) }
         if let Some(mn) = len(s.get("min-width"), cb_w) { w = w.max(mn) }
@@ -322,7 +332,11 @@ impl<'a> Cx<'a> {
             .or_else(|| match s.get("aspect-ratio") {
                 V::Num(r) if *r > 0.0 => Some(clamp(u(w as f64 / PX as f64 / r))),
                 _ => None,
-            });
+            })
+            .or_else(|| repl.as_ref().map(|(_, iw, ih)| {
+                let content = (w - frame).max(0);
+                clamp(pt + pb + bt + bb + if *iw > 0 { (content as i128 * *ih as i128 / *iw as i128) as U } else { *ih })
+            }));
         let child_cb_h = definite.map(|d| (d - pt - pb - bt - bb).max(0));
         // ★ List markers belong to `li` (the profile admits list-style-* but not
         // display: list-item): typed by the inherited list-style-type,
@@ -541,6 +555,18 @@ impl<'a> Cx<'a> {
         if let Some(im) = bg_url {
             if !hidden && im.area.w > 0 && im.area.h > 0 { self.scene.insert_image(slot, im); slot += 1 }
         }
+        // The replaced content itself, fitted into the content box.
+        if let Some((addr, iw, ih)) = repl {
+            let content = (bx + bl + pl, by + bt + pt, (w - frame).max(0), (hgt - pt - pb - bt - bb).max(0));
+            let fit = match kw(s, "object-fit") { "contain" => "contain", "cover" => "cover", "none" => "none", "scale-down" => "scale-down", _ => "fill" };
+            let (tx, ty, tw, th) = Self::object_tile(fit, content, (iw, ih));
+            if !hidden && content.2 > 0 && content.3 > 0 {
+                self.scene.insert_image(slot, crate::Image {
+                    area: crate::Tiling { x: content.0, y: content.1, w: content.2, h: content.3, tx, ty, tw: tw.max(1), th: th.max(1), repeat: 0 },
+                    address: addr, fit });
+                slot += 1;
+            }
+        }
         let painted = slot - bg_slot;
         // ★ Inserting this box's background at the slot reserved before the
         // children SHIFTS every entry after it, so the ranges the children
@@ -638,6 +664,51 @@ impl<'a> Cx<'a> {
         self.placing_abs = false;
     }
 
+    /// A replaced element: `<img src>` resolved through the input's
+    /// subresources. ★ §3.13 again — an undeclared image is refused, never
+    /// measured here.
+    fn replaced_size(&self, h: Handle) -> Option<(U, U)> {
+        if self.dom.tag(h) != Some("img") { return None }
+        self.subs.get(self.dom.attr(h, "src").unwrap_or("")).map(|(_, w, hh)| (*w, *hh))
+    }
+
+    fn replaced(&mut self, h: Handle) -> Option<(String, U, U)> {
+        if self.dom.tag(h) != Some("img") { return None }
+        let src = self.dom.attr(h, "src").unwrap_or("").to_string();
+        match self.subs.get(&src) {
+            Some((a, w, hh)) => Some((a.clone(), *w, *hh)),
+            None => {
+                self.diagnostics.push(Diagnostic { pos: Pos { line: 0, col: 0 }, code: "input.subresource-not-supplied",
+                    msg: format!("<img src={src:?}>: no subresource declared; §3.13 admits no measurement path") });
+                None
+            }
+        }
+    }
+
+    /// `object-fit` (row 58): how the source fills the content box. Returns
+    /// the tile, which the content box then clips — so `cover` needs no
+    /// special case in a reader.
+    fn object_tile(fit: &str, (cx, cy, cw, ch): (U, U, U, U), (iw, ih): (U, U)) -> (U, U, U, U) {
+        if iw <= 0 || ih <= 0 { return (cx, cy, cw, ch) }
+        let ratio = |target_w: U| (target_w as i128 * ih as i128 / iw as i128) as U;
+        let (tw, th) = match fit {
+            "fill" => (cw, ch),
+            "none" => (iw, ih),
+            "contain" | "scale-down" => {
+                let (fw, fh) = if ratio(cw) <= ch { (cw, ratio(cw)) } else { ((ch as i128 * iw as i128 / ih as i128) as U, ch) };
+                // scale-down never ENLARGES: it is the smaller of none and contain.
+                if fit == "scale-down" && iw <= fw { (iw, ih) } else { (fw, fh) }
+            }
+            _ => {
+                // cover: the smaller side reaches the box, the other overflows.
+                if ratio(cw) >= ch { (cw, ratio(cw)) } else { ((ch as i128 * iw as i128 / ih as i128) as U, ch) }
+            }
+        };
+        // Centred, which is `object-position: 50% 50%` — the profile has no
+        // object-position row, so it is a fixed rule.
+        (cx + (cw - tw) / 2, cy + (ch - th) / 2, tw, th)
+    }
+
     /// CSS background geometry: `background-size` gives the tile, then
     /// `background-position-x/y` place it in the POSITIONING area (the
     /// padding box), and `background-repeat` says how it tiles over the
@@ -702,6 +773,7 @@ impl<'a> Cx<'a> {
     fn measure(&mut self, h: Handle, cb_w: U, cb_h: Option<U>, force: (Option<U>, Option<U>)) -> U {
         let (o, r, n, l) = (self.scene.order.len(), self.scene.rects.len(), self.scene.runs.len(), self.scene.links.len());
         let (cl, gr, cur, xf) = (self.scene.clips.len(), self.scene.groups.len(), self.scene.cur, self.scene.xforms.len());
+        let diags = self.diagnostics.len();
         let (links, counts, marker, report) = (self.links.len(), self.unimplemented.clone(), self.marker.clone(), self.report.clone());
         let (ctx, hoi) = (self.contexts.len(), self.hoists.len());
         let hgt = self.block(h, 0, 0, cb_w, cb_h, force);
@@ -709,6 +781,9 @@ impl<'a> Cx<'a> {
         self.scene.rect_attrs.truncate(r); self.scene.run_attrs.truncate(n); self.scene.link_attrs.truncate(l);
         self.scene.clips.truncate(cl); self.scene.groups.truncate(gr); self.scene.cur = cur;
         self.scene.xforms.truncate(xf); self.scene.xform_parents.truncate(xf);
+        // A trial layout must leave no diagnostics behind: the real one
+        // re-emits whatever it finds.
+        self.diagnostics.truncate(diags);
         self.links.truncate(links); self.unimplemented = counts; self.marker = marker; self.report = report;
         self.contexts.truncate(ctx); self.hoists.truncate(hoi);
         hgt
@@ -1164,12 +1239,16 @@ impl<'a> Cx<'a> {
         let mut bw = match cs.get("width") {
             V::Kw("min-content") => self.intrinsic(h).0 + frame,
             V::Kw("max-content") => self.intrinsic(h).1 + frame,
-            V::Kw(_) => {
-                // Shrink-to-fit inside what the line has room for.
-                let avail = (cb_w - ml - mr - frame).max(0);
-                let (mn, mx) = self.intrinsic(h);
-                frame + if cb_w > 0 { mx.min(avail).max(mn.min(avail)) } else { mx }
-            }
+            V::Kw(_) => match self.replaced_size(h) {
+                // A replaced box is not shrink-to-fit: it is its own size.
+                Some((iw, _)) => frame + iw,
+                None => {
+                    // Shrink-to-fit inside what the line has room for.
+                    let avail = (cb_w - ml - mr - frame).max(0);
+                    let (mn, mx) = self.intrinsic(h);
+                    frame + if cb_w > 0 { mx.min(avail).max(mn.min(avail)) } else { mx }
+                }
+            },
             v => len(v, cb_w).unwrap_or(0),
         };
         if let Some(m) = len(cs.get("max-width"), cb_w) { bw = bw.min(m) }
@@ -1290,6 +1369,10 @@ impl<'a> Cx<'a> {
                     "inline-block" => { let (st, l) = self.font_style(s); out.push(Item::Atomic(h, st, l)); return }
                     _ => {}
                 }
+                // ★ A replaced element is an atomic inline whatever its
+                // `display` says (short of `none`): it has no inline content
+                // to flow, only a box of its own declared size.
+                if tag == "img" { let (st, l) = self.font_style(s); out.push(Item::Atomic(h, st, l)); return }
                 if tag == "br" { out.push(Item::Break); return }
                 let link = (tag == "a").then(|| self.dom.attr(h, "href")).flatten().map(|href| { self.links.push(href.to_string()); self.links.len() - 1 });
                 let before = out.len();
@@ -1978,8 +2061,11 @@ mod tests {
     /// must show up, and its initial value must not.
     #[test]
     fn an_unread_property_is_counted_and_its_initial_value_is_not() {
-        let o = render(r#"<style>.a { object-fit: cover } .b { object-fit: fill }</style><div class="a">x</div><div class="b">y</div>"#);
-        assert_eq!(o.unimplemented.get("row object-fit… (not implemented)"), Some(&1), "{:?}", o.unimplemented);
+        // `direction` is the last row the layout does not read; when bidi
+        // lands, this control needs a row that is deliberately left unread,
+        // or it silently stops testing anything.
+        let o = render(r#"<style>.a { direction: rtl } .b { direction: ltr }</style><div class="a">x</div><div class="b">y</div>"#);
+        assert_eq!(o.unimplemented.get("row direction… (not implemented)"), Some(&1), "{:?}", o.unimplemented);
     }
 
     /// CSS automatic minimum size: a flex item does not shrink below its

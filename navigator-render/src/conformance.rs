@@ -13,7 +13,7 @@
 //! exercised-but-not-matched, which is the honest state of most rows today.
 
 use crate::fontset::FontSet;
-use crate::html::{render_html, render_html_with};
+use crate::html::render_html_with;
 use crate::nsg;
 use navigator_style::cascade::Env;
 use navigator_style::sheet::parse_sheet;

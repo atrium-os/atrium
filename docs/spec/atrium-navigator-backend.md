@@ -980,7 +980,7 @@ layout.
 
 ### 8.3 M2 progress — the number, first reading (2026-09-22)
 
-**CONFORMANCE: exercised 62/64, matched 61/64** (13 on first reading; see the updates
+**CONFORMANCE: exercised 63/64, matched 62/64** (13 on first reading; see the updates
 below). Printed by `nsg-conformance`; the
 matched set is pinned by a test so it cannot fall silently.
 
@@ -1329,6 +1329,23 @@ Every `display` value the profile admits is now laid out; nothing in §3.3 is co
   `repeat-y` is a column rather than a full-height wash, `cover` crops and `contain`
   leaves a sliver. The test image is a 40×20 PNG with a blue top-left corner, a red L and
   a green bottom-right block, so any flip, crop or tile is obvious.
+
+**Update — `<img>` and object-fit, matched 61 → 62 (row 58).**
+- **A replaced element is an atomic inline** whatever its `display` says: it has no
+  inline content to flow, only a box of its declared size. So `<img>` reuses the
+  inline-block machinery exactly.
+- Replaced sizing (CSS Sizing 3 §5.2): an auto width takes the declared intrinsic width,
+  or follows the ratio from a specified height, and the same for the height — which is
+  the profile's anti-CLS rule (§1.2) made concrete, because both are known before layout.
+- **`object-fit` is resolved into the tile**, so a reader needs no special case: `cover`
+  produces a tile LARGER than the content box, which the paint area then clips, and
+  `scale-down` is the smaller of `none` and `contain`. Centring is fixed, since the
+  profile has no `object-position` row.
+- ★ **A trial layout must leave no diagnostics behind.** `measure` rolled back the scene
+  and the counters but not the diagnostics, so an undeclared image would have been
+  reported once per probe.
+- Only rows 36 (`font-style`, which needs an italic face in the pinned set) and 48
+  (`direction`, which needs bidi) remain unmatched.
 
 ## 9. What this reuses
 

@@ -6,7 +6,7 @@
 //! canonical font bytes the scene names (web-font condition 2a), at the run's
 //! sub-pixel position.
 
-use navigator_render::{fontset::FontSet, html::render_html, render, Options, Rect, Scene, PX};
+use navigator_render::{fontset::FontSet, render, Options, Rect, Scene, PX};
 use navigator_style::cascade::Env;
 
 struct Canvas {
