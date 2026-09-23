@@ -164,3 +164,51 @@ fn an_import_is_followed() {
     let (out, _) = normalize(src, &inputs);
     assert!(out.contains("color: #0969da"), "the imported rule must land:\n{out}");
 }
+
+/// ★ Logical properties are how modern CSS is written — `padding-block`
+/// appears 5024 times in a 29-document corpus — and the profile's rows are
+/// physical. Dropping them as "unknown" silently removes the layout.
+#[test]
+fn logical_properties_become_physical_ones() {
+    let src = r#"<html><head><style>
+      p { margin-inline-start: 10px; padding-block: 4px 8px; inline-size: 50px }
+    </style></head><body><p>x</p></body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    for want in ["margin-left: 10px", "padding-top: 4px", "padding-bottom: 8px", "width: 50px"] {
+        assert!(out.contains(want), "missing {want} in {out}");
+    }
+    assert!(refusals(&out).is_empty());
+}
+
+/// ★ A state belongs to the element it is written on. `#t:checked ~ .p` styles
+/// the SIBLING, so emitting `:checked` on the sibling names a state it can
+/// never have — and `:checked` is decidable from the DOM anyway.
+#[test]
+fn a_static_state_is_resolved_and_a_misplaced_one_is_refused() {
+    let src = r#"<html><head><style>
+      #t:checked ~ .p { margin-left: 30px }
+      #u:checked ~ .q { margin-left: 40px }
+      #v:hover ~ .r { margin-left: 50px }
+    </style></head><body>
+      <input id="t" type="checkbox" checked><div class="p">a</div>
+      <input id="u" type="checkbox"><div class="q">b</div>
+      <input id="v" type="checkbox"><div class="r">c</div>
+    </body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    assert!(out.contains("margin-left: 30px"), "a checked sibling applies: {out}");
+    assert!(!out.contains("margin-left: 40px"), "an unchecked one does not: {out}");
+    assert!(!out.contains("margin-left: 50px"), "a dynamic state on a sibling cannot be expressed: {out}");
+    assert!(report.dropped.keys().any(|k| k.contains("dynamic state")), "{:?}", report.dropped);
+    assert!(refusals(&out).is_empty());
+}
+
+/// The root's own attributes carry meaning — `lang` and `dir` decide language
+/// and base direction, and the page's cascade keys on its classes.
+#[test]
+fn the_root_keeps_its_attributes() {
+    let src = r#"<html lang="fr" dir="rtl" class="js dark"><body><p>x</p></body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    assert!(out.contains(r#"lang="fr""#), "{out}");
+    assert!(out.contains(r#"dir="rtl""#), "{out}");
+    assert!(out.contains("js dark"), "{out}");
+}

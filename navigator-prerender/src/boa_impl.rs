@@ -630,6 +630,36 @@ fn reflected_set(t: &JsValue, attr: &str, v: &JsValue, ctx: &mut Context) -> JsR
     record_mutation("attributes", h, attr);
     Ok(JsValue::undefined())
 }
+/// ★ A BOOLEAN property, reflected into the attribute's PRESENCE.
+///
+/// HTML deliberately does not reflect `input.checked` into the `checked`
+/// attribute — the attribute is the DEFAULT, the property is the current
+/// state. But this converter's output is a SNAPSHOT, and the profile has no
+/// scripting: whatever state the scripts settled on has to be in the markup
+/// or it is lost. CSS reads it too (`:checked ~ .page-wrapper`), so a menu
+/// or sidebar toggled open by script renders closed without this.
+fn boolean_get(t: &JsValue, attr: &str, ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(t, ctx) else { return Ok(JsValue::from(false)) };
+    Ok(JsValue::from(with(|d| d.attr(h, attr).is_some())))
+}
+fn boolean_set(t: &JsValue, attr: &str, v: &JsValue, ctx: &mut Context) -> JsResult<JsValue> {
+    let Some(h) = handle_of(t, ctx) else { return Ok(JsValue::undefined()) };
+    let on = v.to_boolean();
+    with(|d| { if on { d.set_attr(h, attr, "") } else { d.remove_attr(h, attr) } d.script_mutations += 1 });
+    record_mutation("attributes", h, attr);
+    Ok(JsValue::undefined())
+}
+macro_rules! boolean_prop {
+    ($($g:ident, $s:ident, $a:literal);* $(;)?) => { $(
+        fn $g(t: &JsValue, _x: &[JsValue], c: &mut Context) -> JsResult<JsValue> { boolean_get(t, $a, c) }
+        fn $s(t: &JsValue, x: &[JsValue], c: &mut Context) -> JsResult<JsValue> { boolean_set(t, $a, x.get_or_undefined(0), c) }
+    )* };
+}
+boolean_prop! {
+    g_checked, s_checked, "checked"; g_selected, s_selected, "selected";
+    g_disabled, s_disabled, "disabled"; g_open, s_open, "open";
+}
+
 macro_rules! reflected {
     ($($g:ident, $s:ident, $a:literal);* $(;)?) => { $(
         fn $g(t: &JsValue, _x: &[JsValue], c: &mut Context) -> JsResult<JsValue> {
@@ -1295,6 +1325,14 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
         if matches!(tag.as_str(), "input" | "textarea" | "select" | "option" | "button"
                                  | "progress" | "meter" | "param" | "li" | "data") {
             live_get_set(&o, "value", value_get, value_set, ctx);
+        }
+        // Interactive state the SNAPSHOT has to carry, because CSS reads it
+        // and the profile has no scripting to set it again.
+        if matches!(tag.as_str(), "input") { live_get_set(&o, "checked", g_checked, s_checked, ctx) }
+        if matches!(tag.as_str(), "option") { live_get_set(&o, "selected", g_selected, s_selected, ctx) }
+        if matches!(tag.as_str(), "details" | "dialog") { live_get_set(&o, "open", g_open, s_open, ctx) }
+        if matches!(tag.as_str(), "input" | "button" | "select" | "textarea" | "option" | "optgroup" | "fieldset") {
+            live_get_set(&o, "disabled", g_disabled, s_disabled, ctx)
         }
         if tag == "select" { live_get(&o, "options", el_options, ctx); }
         if matches!(tag.as_str(), "link" | "a" | "area" | "form") {

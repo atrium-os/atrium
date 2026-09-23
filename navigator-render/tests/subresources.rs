@@ -111,3 +111,34 @@ fn a_table_grows_past_a_specified_width_rather_than_overflowing() {
     let t2 = o2.scene.rects.iter().find(|r| r.rgba == 0xeeeeeeff).expect("table background");
     assert_eq!(t2.w, 100 * 64, "a table that fits keeps its specified width");
 }
+
+/// ★ BLOCK-IN-INLINE. An inline box holding block-level content cannot stay
+/// inline — flattening it pours the whole subtree into one line box. Hacker
+/// News wraps its entire page in `<center>`; a `<span>` around a `<div>` is
+/// the same shape.
+#[test]
+fn an_inline_wrapper_around_block_content_does_not_flatten_it() {
+    let fonts = FontSet::load().expect("pinned font set");
+    let env = Env::default();
+    let o = render_html(r#"<html><body><span><div>one</div><div>two</div></span></body></html>"#, &fonts, &env);
+    let ys: Vec<i64> = o.scene.runs.iter().map(|r| r.y).collect();
+    assert_eq!(ys.len(), 2);
+    assert!(ys[0] != ys[1], "the two blocks must be on separate lines: {ys:?}");
+    // Control: genuinely inline content stays on one line.
+    let c = render_html(r#"<html><body><span><span>one</span><span>two</span></span></body></html>"#, &fonts, &env);
+    let cys: Vec<i64> = c.scene.runs.iter().map(|r| r.y).collect();
+    assert_eq!(cys[0], cys[1], "inline content shares a line: {cys:?}");
+}
+
+/// `<noscript>` is RAW TEXT when scripting is enabled, so its markup parses
+/// as a text node — and the converter ran the scripts, so showing it puts
+/// literal angle brackets on the page.
+#[test]
+fn noscript_is_not_shown() {
+    let fonts = FontSet::load().expect("pinned font set");
+    let o = render_html(r#"<html><body><noscript><iframe src="toc.html"></iframe></noscript><p>real</p></body></html>"#,
+                        &fonts, &Env::default());
+    let text: String = o.scene.runs.iter().map(|r| r.text.clone()).collect();
+    assert!(!text.contains("iframe"), "the fallback must not be painted: {text:?}");
+    assert!(text.contains("real"));
+}

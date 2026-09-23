@@ -242,16 +242,39 @@ fn add_spec(s: &Simple, out: &mut (u32, u32, u32)) {
     }
 }
 
-/// Every state named anywhere in the selector, in order — what the emitted
-/// rule must carry (`:hover`, `:focus`, …).
-pub fn states(c: &Complex) -> Vec<String> {
+/// States the DOM can decide by itself. `:checked` is an attribute, not a
+/// mood; so are `:disabled` and `:link`. Only the genuinely dynamic ones
+/// have to travel into the emitted rule.
+pub fn is_static_state(n: &str) -> bool {
+    matches!(n, "checked" | "disabled" | "enabled" | "link" | "visited" | "read-only" | "read-write" | "required" | "optional" | "default" | "indeterminate")
+}
+
+/// The dynamic states on the SUBJECT compound — the element the rule
+/// actually styles.
+///
+/// ★ A dynamic state on any OTHER compound cannot be represented: in
+/// `#toggle:checked ~ .page-wrapper` the state belongs to the checkbox and
+/// the declarations belong to its sibling, so emitting `.nN:hover` on the
+/// sibling names a mood the sibling never has. `subject_states` returns the
+/// representable ones and `misplaced_state` names the rest.
+pub fn subject_states(c: &Complex) -> Vec<String> {
     let mut v = vec![];
-    for (_, compound) in &c.0 {
+    if let Some((_, compound)) = c.0.last() {
         for s in compound {
-            if let Simple::State(n) = s { if !v.contains(n) { v.push(n.clone()) } }
+            if let Simple::State(n) = s { if !is_static_state(n) && !v.contains(n) { v.push(n.clone()) } }
         }
     }
     v
+}
+
+pub fn misplaced_state(c: &Complex) -> Option<String> {
+    for (i, (_, compound)) in c.0.iter().enumerate() {
+        if i + 1 == c.0.len() { continue }
+        for s in compound {
+            if let Simple::State(n) = s { if !is_static_state(n) { return Some(n.clone()) } }
+        }
+    }
+    None
 }
 
 pub fn has_pseudo_element(c: &Complex) -> bool {
@@ -328,11 +351,25 @@ impl<'a> Matcher<'a> {
                     Op::Contains => !value.is_empty() && v.contains(&value),
                 }
             }
-            // ★ A state cannot be decided statically, and pretending it is
-            // false would silently drop every :hover rule. The rule is kept
-            // and the state travels with it (see `states`), so the element
-            // matches HERE and the renderer decides at paint time.
-            Simple::State(_) => true,
+            // ★ A DYNAMIC state cannot be decided statically, and pretending
+            // it is false would silently drop every :hover rule: the element
+            // matches here and the state travels with the rule. A STATIC one
+            // is just an attribute, and the DOM answers it now — which is how
+            // `#toggle:checked ~ .page-wrapper` gets its margin.
+            Simple::State(n) => match n.as_str() {
+                "checked" => self.dom.attr(h, "checked").is_some() || self.dom.attr(h, "selected").is_some(),
+                "disabled" => self.dom.attr(h, "disabled").is_some(),
+                "enabled" => self.dom.attr(h, "disabled").is_none(),
+                "required" => self.dom.attr(h, "required").is_some(),
+                "optional" => self.dom.attr(h, "required").is_none(),
+                "read-only" => self.dom.attr(h, "readonly").is_some(),
+                "read-write" => self.dom.attr(h, "readonly").is_none(),
+                "link" => tag.eq_ignore_ascii_case("a") && self.dom.attr(h, "href").is_some(),
+                // Never visited: a document has no history, and claiming one
+                // would leak what the reader has read.
+                "visited" => false,
+                _ => true,
+            },
             Simple::PseudoElement(_) => false,
             Simple::Not(l) => !l.iter().any(|c| self.matches(h, c)),
             Simple::Is(l) => l.iter().any(|c| self.matches(h, c)),

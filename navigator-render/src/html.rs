@@ -96,6 +96,9 @@ struct Cx<'a> {
     /// Set while a table lays out one of its own cells, so the "table part
     /// outside a table" counter fires only for a STRAY part in normal flow.
     table_part: bool,
+    /// Elements whose `display` is inline but which contain block-level
+    /// content, computed once bottom-up (see `is_block_level`).
+    promoted: Vec<bool>,
     subs: &'a Subresources,
     /// The initial containing block: the viewport, which is also the
     /// containing block of every `position: fixed` box (NSG has no scroll
@@ -155,9 +158,10 @@ pub fn render_html_with(html: &str, fonts: &FontSet, env: &Env, subs: &Subresour
     let styled = cascade(&dom, &sheets, env);
     diagnostics.extend(styled.diagnostics);
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
-                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, content_dy: 0, table_part: false,
+                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, content_dy: 0, table_part: false, promoted: vec![],
                       viewport: (u(env.width_px), Some(u(env.height_px))), pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))),
                       subs, placing_abs: false, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
+    cx.promoted = promote_block_in_inline(&dom, &styled.styles);
     cx.count_unread_rows();
     // The root element is the initial containing block's only child.
     let root = dom.element_children(dom.root()).into_iter().next();
@@ -198,7 +202,7 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
     let styled = cascade(&dom, &sheets, env);
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None,
-                      indent: None, content_dy: 0, table_part: false, viewport: (u(env.width_px), Some(u(env.height_px))),
+                      indent: None, content_dy: 0, table_part: false, promoted: vec![], viewport: (u(env.width_px), Some(u(env.height_px))),
                       pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))), subs: &Subresources::new(),
                       placing_abs: false, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
     // (cell handle, min, max) for every first-row cell of every table.
@@ -313,7 +317,14 @@ impl<'a> Cx<'a> {
     }
 
     fn is_block_level(&self, h: Handle) -> bool {
-        match self.st(h) { Some(s) => matches!(kw(s, "display"), "block" | "flex" | "grid" | "table" | "table-row" | "table-cell"), None => false }
+        let own = match self.st(h) { Some(s) => matches!(kw(s, "display"), "block" | "flex" | "grid" | "table" | "table-row" | "table-cell"), None => false };
+        // ★ BLOCK-IN-INLINE. An inline box holding block-level content
+        // cannot stay inline: CSS breaks it into anonymous blocks, and
+        // flattening it instead pours the whole subtree into one line box.
+        // Hacker News wraps its entire page in `<center>`; an unknown or
+        // inline wrapper around a table is the general case, and it turned
+        // every story into one run of text.
+        own || self.promoted.get(h as usize).copied().unwrap_or(false)
     }
 
     /// Lay out a block-level box at (x, y) in a containing block `cb_w` wide
@@ -2389,7 +2400,7 @@ mod tests {
         let held_out: Vec<u8> = READ_ROWS.iter().copied().filter(|r| *r != 39).collect();
         let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(&fonts), scene: Scene::default(),
                           report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None,
-                          baseline_probe: None, indent: None, content_dy: 0, table_part: false,
+                          baseline_probe: None, indent: None, content_dy: 0, table_part: false, promoted: vec![],
                           viewport: (0, None), pos_cb: (0, 0, 0, None), subs: &Subresources::new(),
                           placing_abs: false, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
         cx.count_rows_outside(&held_out);
@@ -2535,6 +2546,31 @@ fn edge(t: U, sx: U, sy: U, length: U, horiz: bool, style: &str, rgba: u32) -> V
 /// Every entry gets a key — the chain of enclosing context z values, then
 /// 1 if a `hoist` range holds it — and the sort is stable, so ties keep
 /// tree order.
+/// One bottom-up pass: an element is promoted when its own `display` is not
+/// block-level but a child is (or was itself promoted). Doing this once is
+/// what keeps it O(n) — asking the question per element while laying out
+/// would walk the same subtrees again and again.
+fn promote_block_in_inline(dom: &Dom, styles: &[Option<Style>]) -> Vec<bool> {
+    let n = dom.nodes.len();
+    let mut promoted = vec![false; n];
+    let blockish = |h: Handle| -> bool {
+        styles.get(h as usize).and_then(|s| s.as_ref())
+            .is_some_and(|s| matches!(kw(s, "display"), "block" | "flex" | "grid" | "table" | "table-row" | "table-cell"))
+    };
+    // Children always have a higher index than their parent (the arena is
+    // filled as the document is parsed), so one reverse pass suffices.
+    for h in (0..n as Handle).rev() {
+        let Some(node) = dom.get(h) else { continue };
+        if !matches!(node.kind, Kind::Element(_)) { continue }
+        let display_none = styles.get(h as usize).and_then(|s| s.as_ref()).is_some_and(|s| kw(s, "display") == "none");
+        if display_none || blockish(h) { continue }
+        if dom.element_children(h).into_iter().any(|c| blockish(c) || promoted[c as usize]) {
+            promoted[h as usize] = true;
+        }
+    }
+    promoted
+}
+
 fn restack(order: &[(u8, usize)], real: &[(i64, usize, usize, usize)], hoist: &[(usize, usize)]) -> Vec<(u8, usize)> {
     if real.is_empty() && hoist.is_empty() { return order.to_vec() }
     let key = |i: usize| -> (Vec<i64>, u8) {

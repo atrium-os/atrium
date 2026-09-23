@@ -145,7 +145,11 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         for c in &list {
             if sel::has_pseudo_element(c) { report.drop("pseudo-element (no generated content in the profile)"); continue }
             let spec = sel::specificity(c);
-            let states = sel::states(c);
+            let states = sel::subject_states(c);
+            if let Some(bad) = sel::misplaced_state(c) {
+                report.drop(format!("dynamic state `:{bad}` on something other than the styled element"));
+                continue;
+            }
             // ★ A state the profile does not admit cannot be emitted: the
             // matcher treats every unknown pseudo-class as a state, so
             // `:-moz-placeholder` would otherwise travel into the output and
@@ -285,8 +289,15 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         }
     }
 
+    // ★ The ROOT's own attributes survive. Wrapping the serialized body in a
+    // hardcoded `<html>` threw away `lang` and `dir` — which decide language
+    // and base direction — and the classes the page's own cascade keys on.
+    let root_attrs = dom.element_children(dom.root()).first().map(|h| {
+        ["lang", "dir", "class", "id"].iter().filter_map(|a| dom.attr(*h, a).map(|v| format!(" {a}=\"{}\"", v.replace('"', "&quot;"))))
+            .collect::<String>()
+    }).unwrap_or_default();
     let body = dom.serialize();
-    let doc = format!("<html><head><style>\n{out}</style></head>{body}</html>\n");
+    let doc = format!("<html{root_attrs}><head><style>\n{out}</style></head>{body}</html>\n");
     (doc, report)
 }
 

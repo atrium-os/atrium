@@ -50,11 +50,71 @@ fn is_color(s: &str) -> bool {
 
 const BORDER_STYLES: &[&str] = &["none", "hidden", "solid", "dashed", "dotted", "double", "groove", "ridge", "inset", "outset"];
 
+/// ★ LOGICAL properties → physical ones. The profile's rows are physical
+/// (§3.3), and modern CSS is written logically: `padding-block` alone
+/// appears 5024 times in a 29-document corpus, and mdBook's entire page
+/// layout hangs on one `margin-inline-start`. Dropping them as "unknown"
+/// silently removes the layout.
+///
+/// The mapping assumes a horizontal, left-to-right writing mode — which is
+/// what the profile's `direction: ltr` default gives. A document that sets
+/// `direction: rtl` would need inline-start and inline-end swapped, and that
+/// is a real limitation rather than an oversight.
+fn logical(name: &str) -> Option<Vec<&'static str>> {
+    Some(match name {
+        "margin-inline-start" => vec!["margin-left"],
+        "margin-inline-end" => vec!["margin-right"],
+        "margin-block-start" => vec!["margin-top"],
+        "margin-block-end" => vec!["margin-bottom"],
+        "padding-inline-start" => vec!["padding-left"],
+        "padding-inline-end" => vec!["padding-right"],
+        "padding-block-start" => vec!["padding-top"],
+        "padding-block-end" => vec!["padding-bottom"],
+        "inset-inline-start" => vec!["left"],
+        "inset-inline-end" => vec!["right"],
+        "inset-block-start" => vec!["top"],
+        "inset-block-end" => vec!["bottom"],
+        "inline-size" => vec!["width"],
+        "block-size" => vec!["height"],
+        "min-inline-size" => vec!["min-width"],
+        "max-inline-size" => vec!["max-width"],
+        "min-block-size" => vec!["min-height"],
+        "max-block-size" => vec!["max-height"],
+        "border-inline-start-width" => vec!["border-left-width"],
+        "border-inline-end-width" => vec!["border-right-width"],
+        "border-block-start-width" => vec!["border-top-width"],
+        "border-block-end-width" => vec!["border-bottom-width"],
+        "border-inline-start-style" => vec!["border-left-style"],
+        "border-inline-end-style" => vec!["border-right-style"],
+        "border-block-start-style" => vec!["border-top-style"],
+        "border-block-end-style" => vec!["border-bottom-style"],
+        "border-inline-start-color" => vec!["border-left-color"],
+        "border-inline-end-color" => vec!["border-right-color"],
+        "border-block-start-color" => vec!["border-top-color"],
+        "border-block-end-color" => vec!["border-bottom-color"],
+        // The two-value forms: one value for both sides, two for each.
+        "margin-inline" => vec!["margin-left", "margin-right"],
+        "margin-block" => vec!["margin-top", "margin-bottom"],
+        "padding-inline" => vec!["padding-left", "padding-right"],
+        "padding-block" => vec!["padding-top", "padding-bottom"],
+        "inset-inline" => vec!["left", "right"],
+        "inset-block" => vec!["top", "bottom"],
+        _ => return None,
+    })
+}
+
 /// Expand `name: value` into longhand pairs. An unknown shorthand returns
 /// `None`, and the caller drops it — reported, never guessed.
 pub fn expand(name: &str, value: &[Token]) -> Option<Vec<(String, String)>> {
     let p = parts(value);
     let whole = write_tokens(value).trim().to_string();
+    if let Some(targets) = logical(name) {
+        return Some(match (targets.len(), p.len()) {
+            (2, 2) => vec![(targets[0].into(), p[0].clone()), (targets[1].into(), p[1].clone())],
+            (2, _) => targets.iter().map(|t| ((*t).to_string(), whole.clone())).collect(),
+            _ => vec![(targets[0].into(), whole.clone())],
+        });
+    }
     let one = |n: &str, v: &str| Some(vec![(n.to_string(), v.to_string())]);
     match name {
         "margin" | "padding" => {
