@@ -1525,6 +1525,33 @@ so nothing in the chain fetches or measures out of turn:
   written `calc(640px - 1px)` is **constant-folded** rather than dropping a whole
   responsive breakpoint.
 
+**Images paint (2026-09-23).** The converter writes each fetched image into a
+content-addressed store (a stand-in for Tessera CAS: the name IS the hash, so a second
+document referencing the same image costs nothing), the recording names the address, and
+the renderer's subresource map is built from the recording — `src -> (address, intrinsic
+size)`. The document declares the SIZE so layout never waits; the recording names the
+BYTES so paint never fetches. 139 of the corpus's images paint.
+
+★ **Four bugs, three of them found by LOOKING at the render:**
+- **The scene's extent was the root box, not the content.** Wikipedia sets
+  `html, body { height: 100% }`, so the extent said 600 px while 14,000 nodes sat below
+  it. The extent is what a reader can scroll to, which is the content.
+- **`measure` rolled back rects, runs and links but not shadows, gradients or images.**
+  The scene still rendered correctly and quietly carried orphan nodes that nothing
+  pointed at — found by a test that counted nodes, not by anything visual.
+- **Measurement and layout disagreed about a replaced box.** `replaced_size` consulted
+  only the subresource map, so during offline table pre-measurement — which runs without
+  one — an image measured 0 wide and its column came out too narrow. The DECLARED
+  `width`/`height` is the contract (§1.2); both paths must read it.
+- **CSS 2.1 §17.5.2: a table's used width is the GREATER of its specified width and its
+  minimum content width.** Clamping the columns to a narrower specified width instead
+  left a 330 px image hanging 28 px outside a 310 px infobox. The user saw it in the
+  render and reported it twice before I stopped guessing and measured the rects.
+
+★ **The first of those fixes did not appear at all**, because `nsg-raster` is
+feature-gated and `cargo build --release` does not rebuild it — the same stale-review-tool
+trap this file already records.
+
 ★ **Two renderer tests had been failing for hours** — a stale sample golden and a pinned
 `nsg 0.1` header — behind `grep -c "test result: ok"`, which counts the suites that passed
 and cannot see one that failed. Counted properly: **505 tests, 0 failures, six crates**.
