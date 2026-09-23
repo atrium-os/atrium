@@ -40,6 +40,10 @@ pub struct Report {
     /// Lines wider than the viewport (unbreakable words, code).
     pub overflow_lines: usize,
     /// Runs marked emphasis but drawn with the upright face.
+    /// Italic asked for, but the face that had the glyph is upright — the
+    /// DejaVu fallback ships no italic. It counts a SUBSTITUTION, not a
+    /// missing feature: since the italic faces landed, this is 0 for text
+    /// the Plex faces cover.
     pub em_upright: usize,
 }
 
@@ -304,7 +308,7 @@ impl<'a> Shaper<'a> {
     /// then shape each piece. Characters no face has go to the primary face
     /// and are counted as .notdef.
     pub(crate) fn shape(&self, text: &str, st: &Style, report: &mut Report) -> Vec<Piece> {
-        let stack = self.fonts.stack(st.family, st.bold);
+        let stack = self.fonts.stack_of(st.family, st.bold, st.em);
         let mut segs: Vec<(usize, String)> = vec![];
         for ch in text.chars() {
             let face = if ch.is_whitespace() || ch.is_control() { stack[0] } else {
@@ -313,6 +317,8 @@ impl<'a> Shaper<'a> {
                     stack[0]
                 })
             };
+            // Italic asked for, upright delivered: the fallback ships none.
+            if st.em && !self.fonts.faces[face].italic { report.em_upright += 1 }
             match segs.last_mut() {
                 Some((f, s)) if *f == face => s.push(ch),
                 _ => segs.push((face, ch.to_string())),
@@ -343,7 +349,7 @@ impl<'a> Shaper<'a> {
 
     /// Ascent and line height for a style, from its primary face.
     pub(crate) fn metrics(&self, st: &Style) -> (U, U) {
-        let f = &self.fonts.faces[self.fonts.stack(st.family, st.bold)[0]];
+        let f = &self.fonts.faces[self.fonts.stack_of(st.family, st.bold, st.em)[0]];
         let asc = scale(f.ascent, st.size, f.upem);
         let desc = scale(-f.descent, st.size, f.upem);
         let lh = st.size * 3 / 2;
@@ -352,7 +358,7 @@ impl<'a> Shaper<'a> {
 
     /// Ascent and descent (both positive) of a style's primary face.
     pub(crate) fn asc_desc(&self, st: &Style) -> (U, U) {
-        let f = &self.fonts.faces[self.fonts.stack(st.family, st.bold)[0]];
+        let f = &self.fonts.faces[self.fonts.stack_of(st.family, st.bold, st.em)[0]];
         (scale(f.ascent, st.size, f.upem), scale(-f.descent, st.size, f.upem))
     }
 }
@@ -470,7 +476,7 @@ impl<'a> Layout<'a> {
                 };
                 self.marker = Some(m);
             }
-            Tag::Emphasis => { self.report.em_upright += 1; self.push(|s| s.em = true) }
+            Tag::Emphasis => self.push(|s| s.em = true),
             Tag::Strong => self.push(|s| s.bold = true),
             Tag::Strikethrough => self.push(|_| {}),
             Tag::Link { dest_url, .. } => {

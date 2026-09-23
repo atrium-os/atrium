@@ -1333,7 +1333,6 @@ impl<'a> Cx<'a> {
         let weight = match s.get("font-weight") { V::Int(w) => *w, _ => 400 };
         if weight != 400 && weight != 700 { self.count("font-weight not shipped (nearest used)") }
         let em = kw(s, "font-style") == "italic";
-        if em { self.count("font-style: italic (no italic face shipped; drawn upright)") }
         let size = u(s.font_size_px);
         let lh = match s.get("line-height") {
             V::Num(n) => u(s.font_size_px * n),
@@ -1631,7 +1630,6 @@ impl<'a> Cx<'a> {
                 for piece in &p.pieces {
                     self.scene.run(Run { face: piece.face, size: p.st.size, rgba: p.st.rgba, x: px, y: yy + base, em: p.st.em,
                                          glyphs: piece.glyphs.clone(), text: piece.text.clone() });
-                    if p.st.em { self.report.em_upright += 1 }
                     px += piece.width;
                 }
                 let thick = (p.st.size / 16).max(PX);
@@ -1780,8 +1778,8 @@ mod tests {
     #[test]
     fn unimplemented_layout_is_counted_not_faked() {
         // A property the layout reads but cannot paint is still counted.
-        let o = render(r#"<style>div { font-style: italic }</style><div>x</div>"#);
-        assert!(o.unimplemented.keys().any(|k| k.starts_with("font-style: italic")), "{:?}", o.unimplemented);
+        let o = render(r#"<style>div { border-top-left-radius: 8px; overflow-x: hidden; overflow-y: hidden; width: 30px; height: 30px }</style><div>x</div>"#);
+        assert!(o.unimplemented.contains_key("overflow clip on a rounded box (clipped square)"), "{:?}", o.unimplemented);
     }
 
     /// ★ §3.13: there is no measurement path. An image the input does not

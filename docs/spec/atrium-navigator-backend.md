@@ -980,7 +980,7 @@ layout.
 
 ### 8.3 M2 progress — the number, first reading (2026-09-22)
 
-**CONFORMANCE: exercised 63/64, matched 62/64** (13 on first reading; see the updates
+**CONFORMANCE: exercised 63/64, matched 63/64** (13 on first reading; see the updates
 below). Printed by `nsg-conformance`; the
 matched set is pinned by a test so it cannot fall silently.
 
@@ -1346,6 +1346,28 @@ Every `display` value the profile admits is now laid out; nothing in §3.3 is co
   reported once per probe.
 - Only rows 36 (`font-style`, which needs an italic face in the pinned set) and 48
   (`direction`, which needs bidi) remain unmatched.
+
+**Update — italic faces, matched 62 → 63 (row 36); FONT SET VERSION BUMP.**
+- The pinned set gains four faces: **IBM Plex Sans Italic** (variable, one file for 400
+  and 700) and **IBM Plex Mono Italic / Bold Italic** (OFL 1.1, unmodified upstream).
+  Real letterforms, never a shear — a sheared sans is not an italic, and prose uses
+  emphasis constantly.
+- ★ **Mono needed BOTH italic files.** Mono has no weight axis, so instancing the regular
+  italic at 700 returns the same bytes: a "bold" that is not bold. The canonical address
+  said so — the two entries had one address between them, which is exactly the kind of
+  lie content addressing is supposed to catch.
+- The italic stack falls back **upright** rather than losing a glyph: Plex italic, then
+  Plex upright, then DejaVu (which ships no italic). A substitution is counted in
+  `report.em_upright`, whose old meaning — "italic drawn upright", then always true — was
+  retired with the counter it justified.
+- **A font-set change changes every golden, by design.** All 62 re-blessed, verified to
+  differ ONLY in the `font` declaration lines and the mechanical face renumbering
+  (DejaVu moved from f4/f5 to f8/f9), with a script rather than by eye.
+- **The font set version is part of the normalizer's cache key** (profile §3.13), so this
+  is a deliberate version bump. Corpus after it: input `c4f3aa0c…`, output `59b464bf…`
+  over 118 documents — the output moved because the repo's own prose is full of emphasis
+  that is now genuinely italic.
+- Only row 48 (`direction`) is left.
 
 ## 9. What this reuses
 

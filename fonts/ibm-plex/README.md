@@ -17,6 +17,11 @@ so the OFL Reserved Font Name clause does not apply.
 - `IBMPlexSans.ttf` — IBM Plex Sans, **variable** font (weight + width axes; default
   instance is Regular 400). One file covers the 100–700 range the design uses.
 - `IBMPlexMono-Regular.ttf`, `IBMPlexMono-Bold.ttf` — static IBM Plex Mono instances.
+- `IBMPlexSans-Italic.ttf` — IBM Plex Sans Italic, **variable** (upstream
+  `IBMPlexSans-Italic[wdth,wght].ttf`); one file covers italic 400 and 700.
+- `IBMPlexMono-Italic.ttf`, `IBMPlexMono-BoldItalic.ttf` — static Mono italics. Both are
+  needed: Mono has no weight axis, so instancing the regular italic at 700 returns the
+  SAME bytes — a "bold" that is not bold, and the canonical address says so.
 - `OFL.txt` — the license + IBM copyright (ship alongside the fonts).
 
 ## Source
