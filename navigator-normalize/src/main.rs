@@ -62,7 +62,7 @@ fn main() {
         let mut v: Vec<_> = total.into_iter().collect();
         v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
         println!("dropped, by reason:");
-        for (k, n) in v.iter().take(20) { println!("  {n:>7}  {k}") }
+        for (k, n) in v.iter().take(if std::env::var_os("NORMALIZE_ALL_DROPS").is_some() { usize::MAX } else { 20 }) { println!("  {n:>7}  {k}") }
         return;
     }
     let fonts = navigator_render::fontset::FontSet::load().expect("pinned font set");

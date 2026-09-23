@@ -1525,21 +1525,32 @@ impl<'a> Cx<'a> {
             let kids: Vec<Handle> = self.dom.element_children(h).into_iter()
                 .filter(|c| self.st(*c).is_some_and(|cs| kw(cs, "display") != "none")).collect();
             let (mut smn, mut smx) = (0, 0);
+            let mut mins: Vec<U> = vec![];
             for c in &kids {
-                let (a, b) = self.intrinsic(*c);
+                // ★ A child with a DEFINITE width is that wide — its content
+                // does not get a vote. Recursing past it measured GitHub's
+                // file-tree pane, whose own `width: 0` collapses it, at the
+                // max-content width of the tree inside: 446 px of empty
+                // space, and the README squeezed into 353 of the 800.
+                // The profile is border-box, so only the margins are outside.
+                let cw = self.st(*c).and_then(|cs| match cs.get("width") { V::Len(l) => Some(u(l.v)), _ => None });
+                let (a, b) = match cw { Some(w) => (w, w), None => self.intrinsic(*c) };
                 let frame = self.st(*c).map(|cs| {
                     let px = |p: &str| len(cs.get(p), 0).unwrap_or(0);
-                    px("padding-left") + px("padding-right") + px("margin-left") + px("margin-right")
-                        + if kw(cs, "border-left-style") == "none" { 0 } else { px("border-left-width") }
-                        + if kw(cs, "border-right-style") == "none" { 0 } else { px("border-right-width") }
+                    px("margin-left") + px("margin-right") + if cw.is_some() { 0 } else {
+                        px("padding-left") + px("padding-right")
+                            + if kw(cs, "border-left-style") == "none" { 0 } else { px("border-left-width") }
+                            + if kw(cs, "border-right-style") == "none" { 0 } else { px("border-right-width") }
+                    }
                 }).unwrap_or(0);
                 smn += a + frame;
                 smx += b + frame;
+                mins.push(a + frame);
             }
             let total_gap = gap * (kids.len() as U).saturating_sub(1);
             // Wrapping lets the line break, so the minimum is one item.
             let wrap = kw(s, "flex-wrap") == "wrap";
-            let mn_out = if wrap { kids.iter().map(|c| self.intrinsic(*c).0).max().unwrap_or(0) } else { smn + total_gap };
+            let mn_out = if wrap { mins.into_iter().max().unwrap_or(0) } else { smn + total_gap };
             self.links.truncate(links);
             self.unimplemented = counts;
             return (mn_out, (smx + total_gap).max(mn_out));
@@ -2126,6 +2137,23 @@ mod tests {
         assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 100, 20)]);
         assert_eq!(boxes(&o, 0x00ff00ff), vec![(110, 0, 380, 20)], "grows into the free space, gaps honoured");
         assert_eq!(boxes(&o, 0x0000ffff), vec![(500, 0, 100, 20)]);
+    }
+
+    /// ★ A flex item's intrinsic width stops at a child's DEFINITE width.
+    /// Measuring past one sized GitHub's collapsed file-tree pane
+    /// (`width: 0`) at the max-content of the tree inside it: 446 px of
+    /// empty space, with the README squeezed into 353 of the 800.
+    #[test]
+    fn a_definite_width_caps_a_flex_items_intrinsic_width() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px; margin-right: 0px }
+            .row { display: flex; width: 800px }
+            .main { flex-basis: 0; flex-grow: 1; height: 20px; background-color: #ff0000 }
+            .wrap { display: flex; width: auto; height: 20px; background-color: #00ff00 }
+            .pane { width: 0px }</style>
+            <div class="row"><div class="main"></div>
+            <div class="wrap"><div class="pane">a very long piece of text indeed</div></div></div>"#);
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 800, 20)], "the sized pane leaves all the room to the content");
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(800, 0, 0, 20)]);
     }
 
     #[test]

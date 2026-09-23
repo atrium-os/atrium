@@ -24,12 +24,18 @@ pub struct Rule {
     pub order: usize,
     /// `Some(query)` when the rule came from an `@media` block, as written.
     pub media: Option<String>,
+    /// The cascade layer this rule is in, by declaration order. `None` is
+    /// unlayered, which OUTRANKS every layer (CSS Cascade 5 §6.4.4).
+    pub layer: Option<usize>,
     pub pos: Pos,
 }
 
 #[derive(Debug, Default)]
 pub struct Sheet {
     pub rules: Vec<Rule>,
+    /// Layer names in declaration order — from `@layer a, b;` statements and
+    /// from the first block of each name.
+    pub layers: Vec<String>,
     /// `@font-face` blocks, kept verbatim: the profile admits them.
     pub font_faces: Vec<Vec<Decl>>,
     /// What was dropped, and why — the normalizer reports rather than hides.
@@ -70,6 +76,14 @@ pub fn declarations(t: &[Token]) -> Vec<Decl> {
         if i >= t.len() { break }
         // name
         let name = match &t[i].tok {
+            // ★ A CUSTOM property's name is CASE-SENSITIVE (CSS Variables 1
+            // §2): `--fgColor-default` and `--fgcolor-default` are different
+            // properties. Lowercasing it here made every camelCase design
+            // token unresolvable — and silently, because a `var()` with no
+            // definition and no fallback leaves an EMPTY value, which looks
+            // like a declaration that was never written. GitHub's buttons
+            // lost their colour, their background and their border that way.
+            Tok::Ident(n) if n.starts_with("--") => n.clone(),
             Tok::Ident(n) => n.to_ascii_lowercase(),
             Tok::Semicolon => { i += 1; continue }
             _ => { // skip to the next semicolon at depth 0
@@ -137,6 +151,10 @@ pub fn parse_in_media(src: &str, media: &str, order: &mut usize, sheet: &mut She
 }
 
 fn parse_rules(t: &[Token], order: &mut usize, sheet: &mut Sheet, media: Option<&str>) {
+    parse_rules_in(t, order, sheet, media, None)
+}
+
+fn parse_rules_in(t: &[Token], order: &mut usize, sheet: &mut Sheet, media: Option<&str>, layer: Option<usize>) {
     let mut i = 0;
     while i < t.len() {
         i = skip_ws(t, i);
@@ -151,23 +169,54 @@ fn parse_rules(t: &[Token], order: &mut usize, sheet: &mut Sheet, media: Option<
                 while j < t.len() && !matches!(t[j].tok, Tok::LBrace | Tok::Semicolon) { j += 1 }
                 let prelude = write_tokens(&t[start..j]);
                 if j < t.len() && t[j].tok == Tok::Semicolon {
-                    sheet.dropped.push(("at-rule", format!("@{name} {prelude}")));
+                    // `@layer a, b;` only DECLARES an order; it carries no
+                    // rules, and that order is what later blocks rank by.
+                    if name == "layer" {
+                        for n in prelude.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+                            if !sheet.layers.iter().any(|x| x == n) { sheet.layers.push(n.to_string()) }
+                        }
+                    } else {
+                        sheet.dropped.push(("at-rule", format!("@{name} {prelude}")));
+                    }
                     i = j + 1;
                     continue;
                 }
                 let (inner, next) = block(t, j);
                 match name.as_str() {
+                    // ★ A CASCADE LAYER holds ordinary rules; only their
+                    // PRECEDENCE differs. Dropping the at-rule drops every
+                    // rule inside it — and GitHub's Primer, Bootstrap 5.3+
+                    // and Tailwind v4 put their whole stylesheet in layers,
+                    // so `a { text-decoration: none }` never reached the
+                    // cascade and every button came out underlined.
+                    "layer" => {
+                        let lname = prelude.trim().to_string();
+                        let idx = if lname.is_empty() { layer } else {
+                            Some(match sheet.layers.iter().position(|x| *x == lname) {
+                                Some(i) => i,
+                                None => { sheet.layers.push(lname); sheet.layers.len() - 1 }
+                            })
+                        };
+                        parse_rules_in(&inner, order, sheet, media, idx)
+                    }
+                    // `@scope` and `@container` bodies are ordinary rules
+                    // too; their CONDITION is what this cannot honour, so
+                    // the rules are kept and the condition is reported.
+                    "scope" | "container" => {
+                        sheet.dropped.push(("at-rule-condition", format!("@{name} {}", prelude.trim())));
+                        parse_rules_in(&inner, order, sheet, media, layer)
+                    }
                     // Nested rules, conditioned on the query.
                     // A nested `@media` inside a conditioned sheet keeps the
                     // outer condition too: both must hold.
                     "media" => {
                         let inner_q = prelude.trim();
                         let combined = match media { Some(outer) => format!("{outer} and {inner_q}"), None => inner_q.to_string() };
-                        parse_rules(&inner, order, sheet, Some(&combined))
+                        parse_rules_in(&inner, order, sheet, Some(&combined), layer)
                     }
                     // @supports: take the branch, since the profile decides
                     // what is supported, not the page.
-                    "supports" => parse_rules(&inner, order, sheet, media),
+                    "supports" => parse_rules_in(&inner, order, sheet, media, layer),
                     "font-face" => sheet.font_faces.push(declarations(&inner)),
                     _ => sheet.dropped.push(("at-rule", format!("@{name} {}", prelude.trim()))),
                 }
@@ -192,7 +241,7 @@ fn parse_rules(t: &[Token], order: &mut usize, sheet: &mut Sheet, media: Option<
                 let (inner, next) = block(t, j);
                 let decls = declarations(&inner);
                 if !decls.is_empty() {
-                    sheet.rules.push(Rule { selector, decls, order: *order, media: media.map(str::to_string), pos: t[start].pos });
+                    sheet.rules.push(Rule { selector, decls, order: *order, media: media.map(str::to_string), layer, pos: t[start].pos });
                     *order += 1;
                 }
                 i = next;

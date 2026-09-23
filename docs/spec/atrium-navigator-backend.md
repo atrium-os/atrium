@@ -1657,6 +1657,34 @@ guidelines, RFC 2616, GitHub, Unicode TR9), one bug.**
   error while loading" is GITHUB's OWN message, because its React file tree never ran in
   the converter. A converter fidelity limit, not a rendering one.
 
+**GitHub, looked at properly: four bugs, and none of them was GitHub's.** The buttons
+came out underlined, stacked one per line, colourless, and the whole page squeezed into
+353 of 800 px. Each had an ordinary cause, and each is general.
+- ★★★ **A custom property's name is CASE-SENSITIVE** (CSS Variables 1 §2). The normalizer
+  lowercased every declaration name, so `--fgColor-default` and `--button-default-fgColor-rest`
+  — and every other camelCase design token in Primer, and in anything else built on
+  design tokens — resolved to nothing. And it failed SILENTLY: a `var()` with no
+  definition and no fallback left an EMPTY value, which reads exactly like a declaration
+  nobody wrote. GitHub's buttons lost their colour, their background and their border,
+  and the page header its black bar. `var()` with no definition and no fallback is now
+  kept as-is so the drop is REPORTED, per §6's rule that nothing goes missing quietly.
+- ★★ **Cascade layers were dropped with their contents.** Primer, Bootstrap 5.3+ and
+  Tailwind v4 wrap their whole stylesheet in `@layer`, so dropping the at-rule drops the
+  stylesheet: `a { text-decoration: none }` never reached the cascade. The normalizer now
+  parses `@layer` (both the statement that fixes the order and the block), and ranks by
+  CSS Cascade 5 §6.4.4 — unlayered wins, later layer beats earlier, and `!important`
+  reverses all of it.
+- ★ **A ROW of same-direction floats is a horizontal strip.** The profile has no floats
+  and never will, but block-stacking a float row is simply wrong. When every in-flow
+  element child of a parent floats the same way and the parent holds no text of its own,
+  the normalizer lays them out as `inline-block`, which puts them in the same places. A
+  lone float beside text is NOT a strip — the text is meant to wrap — and keeps being
+  dropped; so does a floated `td`, because CSS 2.1 §9.7 says float does not apply there.
+- ★★ **A flex item's intrinsic width must stop at a child's definite width.** Measuring
+  past one sized GitHub's collapsed file-tree pane — whose own `width: 0` is what
+  collapses it — at the max-content width of the tree inside: 446 px of empty space,
+  with the README squeezed into the remaining 353.
+
 ★ **Two renderer tests had been failing for hours** — a stale sample golden and a pinned
 `nsg 0.1` header — behind `grep -c "test result: ok"`, which counts the suites that passed
 and cannot see one that failed. Counted properly: **505 tests, 0 failures, six crates**.

@@ -303,3 +303,88 @@ fn a_masked_box_paints_neither_fill_nor_image() {
     assert!(report.dropped.keys().any(|k| k.contains("masked box")), "{:?}", report.dropped);
     assert!(refusals(&out).is_empty());
 }
+
+/// ★ A ROW of same-direction floats is a horizontal strip and becomes one;
+/// a float with unfloated company is not, and keeps being dropped. Without
+/// the first half GitHub's Watch/Fork/Star buttons stacked one per line.
+#[test]
+fn a_float_row_becomes_a_strip_but_a_lone_float_does_not() {
+    let row = r#"<html><head><style>
+      li { float: left }
+    </style></head><body><ul><li>a</li><li>b</li><li>c</li></ul></body></html>"#;
+    let (out, report) = normalize(row, &Inputs::default());
+    assert!(out.contains("display: inline-block"), "the strip is laid out in a line: {out}");
+    assert!(report.dropped.keys().any(|k| k.contains("float row")), "{:?}", report.dropped);
+
+    // Counterweight: one floated image beside text is NOT a strip — the text
+    // is meant to wrap around it, which inline-block would not do.
+    let lone = r#"<html><head><style>
+      .fig { float: left }
+    </style></head><body><div><span class="fig">img</span><p>text</p></div></body></html>"#;
+    let (out, report) = normalize(lone, &Inputs::default());
+    assert!(!out.contains("display: inline-block"), "a lone float is not promoted: {out}");
+    assert!(report.dropped.keys().any(|k| k.contains("not a row")), "{:?}", report.dropped);
+    assert!(refusals(&out).is_empty());
+}
+
+/// ★ CASCADE LAYERS. Primer, Bootstrap 5.3+ and Tailwind v4 put their whole
+/// stylesheet inside `@layer`, so dropping the at-rule drops the stylesheet:
+/// GitHub's `a { text-decoration: none }` never reached the cascade and
+/// every button came out underlined.
+#[test]
+fn cascade_layers_are_honoured_not_dropped() {
+    let src = r##"<html><head><style>
+      @layer base, theme;
+      @layer base { a { color: #ff0000 } p { color: #ff0000 } }
+      @layer theme { a { color: #00ff00 } }
+      a.later { color: #0000ff }
+    </style></head><body><a class="later" href="#">x</a><p>y</p></body></html>"##;
+    let (out, _) = normalize(src, &Inputs::default());
+    // The rules inside the layers survive at all…
+    assert!(out.contains("color: #ff0000"), "layered rules are kept: {out}");
+    // …a later layer beats an earlier one…
+    assert!(!out.contains("color: #ff0000; ") || out.contains("#00ff00"), "{out}");
+    // …and an UNLAYERED declaration beats both, however specific they are.
+    assert!(out.contains("color: #0000ff"), "unlayered wins: {out}");
+    assert!(refusals(&out).is_empty());
+}
+
+/// For `!important` the layer order reverses: unlayered important is the
+/// weakest, and an earlier layer beats a later one.
+#[test]
+fn important_reverses_the_layer_order() {
+    let src = r#"<html><head><style>
+      @layer first, second;
+      @layer first { p { color: #ff0000 !important } }
+      @layer second { p { color: #00ff00 !important } }
+      p { color: #0000ff !important }
+    </style></head><body><p>x</p></body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    assert!(out.contains("color: #ff0000"), "the EARLIER layer wins for important: {out}");
+    assert!(!out.contains("#0000ff"), "unlayered important is the weakest: {out}");
+}
+
+/// ★ A CUSTOM PROPERTY NAME IS CASE-SENSITIVE. Every modern design-token
+/// sheet is camelCase (`--fgColor-default`, `--button-default-fgColor-rest`),
+/// and lowercasing the name made all of them unresolvable — silently, since
+/// a `var()` with no definition and no fallback left an EMPTY value that
+/// read like a declaration nobody wrote. GitHub's buttons lost their colour,
+/// their background and their border to this.
+#[test]
+fn a_camelcase_custom_property_resolves_and_a_missing_one_is_reported() {
+    let src = r#"<html data-mode="light"><head><style>
+      [data-mode=light] { --control-fgColor-rest: #25292e;
+                          --button-default-fgColor-rest: var(--control-fgColor-rest) }
+      .btn { color: var(--button-default-fgColor-rest, var(--color-btn-text)) }
+    </style></head><body><a class="btn" href="/x">f</a></body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    assert!(out.contains("color: #25292e"), "the camelCase token resolves through its chain: {out}");
+
+    // Counterweight: an undefined property with no fallback is DROPPED and
+    // SAID SO, rather than leaving an empty declaration behind.
+    let src = r#"<html><head><style>.btn { color: var(--nobody-defines-this) }</style></head>
+                 <body><a class="btn" href="/x">f</a></body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    assert!(!out.contains("color:"), "{out}");
+    assert!(report.dropped.keys().any(|k| k.contains("unresolved custom property")), "{:?}", report.dropped);
+}

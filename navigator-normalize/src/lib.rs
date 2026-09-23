@@ -61,8 +61,25 @@ impl Report {
 #[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Block(Vec<(String, String)>);
 
-/// The winning declaration for a property: (important, specificity, order).
-type Priority = (bool, (u32, u32, u32), usize);
+/// The winning declaration for a property:
+/// (important, LAYER RANK, specificity, source order).
+///
+/// ★ The layer rank sits ABOVE specificity, because a cascade layer is not
+/// a tie-breaker — an unlayered declaration beats a layered one however
+/// specific the layered one is (CSS Cascade 5 §6.4.4). And for `!important`
+/// the order REVERSES: unlayered important is the weakest, and an earlier
+/// layer beats a later one.
+type Priority = (bool, usize, (u32, u32, u32), usize);
+
+/// Where a rule's layer ranks, for normal and for important declarations.
+fn layer_rank(layer: Option<usize>, layers: usize, important: bool) -> usize {
+    match (layer, important) {
+        (None, false) => usize::MAX,   // unlayered wins
+        (None, true) => 0,             // …except when important: then weakest
+        (Some(i), false) => i + 1,     // later layer wins
+        (Some(i), true) => layers.saturating_sub(i), // earlier layer wins
+    }
+}
 
 /// The whole job: normalize, then PRE-MEASURE (§3.13). Measurement needs the
 /// pinned font set, which is why it takes one — and why the font set version
@@ -183,7 +200,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
                 for d in &rule.decls {
                     let value = substitute(&d.value, scope, 0);
                     for (prop, v) in to_longhands(&d.name, &value, inputs, &mut report) {
-                        let pri: Priority = (d.important, spec, rule.order);
+                        let pri: Priority = (d.important, layer_rank(rule.layer, sheet.layers.len(), d.important), spec, rule.order);
                         match slot.get(&prop) {
                             Some((old, _)) if *old > pri => {}
                             _ => { slot.insert(prop, (pri, v)); }
@@ -201,7 +218,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
                             if alt == value { continue }
                             let mut block = BTreeMap::new();
                             for (prop, v) in to_longhands(&d.name, &alt, inputs, &mut report) {
-                                block.insert(prop, ((d.important, spec, rule.order), v));
+                                block.insert(prop, ((d.important, layer_rank(rule.layer, sheet.layers.len(), d.important), spec, rule.order), v));
                             }
                             if !block.is_empty() { pending.push((ctx.clone(), block)) }
                         }
@@ -229,7 +246,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         for d in &decls {
             let value = substitute(&d.value, &scope, 0);
             for (prop, v) in to_longhands(&d.name, &value, inputs, &mut report) {
-                let pri: Priority = (d.important, (u32::MAX, 0, 0), usize::MAX);
+                let pri: Priority = (d.important, usize::MAX, (u32::MAX, 0, 0), usize::MAX);
                 slot.insert(prop, (pri, v));
             }
         }
@@ -270,6 +287,55 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         for k in kids { if let Some(n) = dom.get_mut(k) { n.parent = Some(parent) } }
     }
 
+    // ★ FLOAT ROWS. The profile has no floats, and dropping `float` left
+    // GitHub's three repository-action buttons stacked one per line: they are
+    // `<li float:left>` inside a `<ul>`. When EVERY in-flow element child of a
+    // parent floats the same way and the parent holds no text of its own,
+    // those children are a horizontal strip, and `inline-block` lays them out
+    // in the same places. That condition is the whole point: a single image
+    // floated into a paragraph is NOT a strip — text is meant to wrap around
+    // it, which inline-block would not do — so it keeps being dropped.
+    let mut float_of: BTreeMap<Handle, String> = BTreeMap::new();
+    for ((h, st, media), props) in resolved.iter() {
+        if !st.is_empty() || !media.is_empty() { continue }
+        if let Some((_, v)) = props.get("float-marker") { float_of.insert(*h, v.clone()); }
+    }
+    let mut rows = 0usize;
+    let mut lone = 0usize;
+    let parents: Vec<Handle> = float_of.keys()
+        .filter_map(|h| dom.get(*h).and_then(|n| n.parent))
+        .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    let mut strip: Vec<Handle> = vec![];
+    for p in parents {
+        let kids = dom.element_children(p);
+        // Only the children that generate a box in flow count.
+        let inflow: Vec<Handle> = kids.into_iter()
+            .filter(|k| resolved.get(&(*k, String::new(), String::new()))
+                .and_then(|pr| pr.get("display")).map(|(_, v)| v != "none").unwrap_or(true))
+            .collect();
+        // CSS 2.1 §9.7: float does not apply to an internal table element.
+        // A stylesheet that floats `td` is describing nothing, and taking it
+        // for a strip would dismantle the table.
+        const TABLE: [&str; 9] = ["td", "th", "tr", "thead", "tbody", "tfoot", "caption", "col", "colgroup"];
+        if inflow.iter().any(|k| dom.tag(*k).is_some_and(|t| TABLE.contains(&t))) { continue }
+        let dirs: Vec<&str> = inflow.iter().map(|k| float_of.get(k).map(String::as_str).unwrap_or("none")).collect();
+        let all_left = dirs.len() >= 2 && dirs.iter().all(|d| *d == "left");
+        let has_text = dom.children_of(p).iter().any(|c|
+            dom.get(*c).is_some_and(|n| matches!(n.kind, Kind::Text(ref t) if !t.trim().is_empty())));
+        if all_left && !has_text { rows += 1; strip.extend(inflow) } else { lone += dirs.iter().filter(|d| **d != "none").count() }
+    }
+    for h in strip {
+        let slot = resolved.entry((h, String::new(), String::new())).or_default();
+        let keep = slot.get("display").map(|(_, v)| matches!(v.as_str(), "flex" | "grid" | "inline-flex" | "inline-grid" | "table")).unwrap_or(false);
+        if !keep {
+            let pri: Priority = (false, usize::MAX, (0, 1, 0), usize::MAX - 1);
+            slot.insert("display".to_string(), (pri, "inline-block".to_string()));
+        }
+    }
+    if rows > 0 { report.drop_n("float row laid out as inline-block", rows) }
+    if lone > 0 { report.drop_n("property `float` (not a row; dropped)", lone) }
+    for (_, props) in resolved.iter_mut() { props.remove("float-marker"); }
+
     // ★ Resolve named areas into the numeric lines the profile admits —
     // PER MEDIA CONTEXT. A responsive page keeps its whole layout in the
     // media queries: MDN's mobile template lives in
@@ -309,7 +375,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         slot.remove("grid-area-name");
         match rect {
             Some((r0, r1, c0, c1)) => {
-                let pri: Priority = (false, (0, 1, 0), usize::MAX - 1);
+                let pri: Priority = (false, usize::MAX, (0, 1, 0), usize::MAX - 1);
                 for (k, v) in [("grid-row-start", r0), ("grid-row-end", r1), ("grid-column-start", c0), ("grid-column-end", c1)] {
                     slot.insert(k.to_string(), (pri, v.to_string()));
                 }
@@ -522,7 +588,7 @@ fn resolve_customs(sheet: &css::Sheet, els: &[Handle], m: &sel::Matcher, dom: &D
                 if !m.matches(*h, c) { continue }
                 let slot = own.entry((*h, media.clone())).or_default();
                 for d in rule.decls.iter().filter(|d| d.name.starts_with("--")) {
-                    let pri: Priority = (d.important, spec, rule.order);
+                    let pri: Priority = (d.important, layer_rank(rule.layer, sheet.layers.len(), d.important), spec, rule.order);
                     match slot.get(&d.name) {
                         Some((old, _)) if *old > pri => {}
                         _ => { slot.insert(d.name.clone(), (pri, d.value.clone())); }
@@ -582,6 +648,12 @@ fn substitute(value: &[Token], custom: &BTreeMap<String, Vec<Token>>, depth: usi
                 let fallback: Vec<Token> = comma.map(|c| inner[c + 1..].to_vec()).unwrap_or_default();
                 match custom.get(&name) {
                     Some(v) => out.extend(substitute(v, custom, depth + 1)),
+                    // ★ No definition AND no fallback is not "the empty
+                    // value": it makes the declaration invalid. Substituting
+                    // nothing left a declaration that had simply vanished,
+                    // with no diagnostic — the failure read as a rule nobody
+                    // wrote. Keep the `var()` so the drop is REPORTED.
+                    None if comma.is_none() => out.extend(value[i..j].iter().cloned()),
                     None => out.extend(substitute(&fallback, custom, depth + 1)),
                 }
                 i = j;
@@ -604,6 +676,15 @@ fn to_longhands(name: &str, value: &[Token], inputs: &Inputs, report: &mut Repor
         return vec![("grid-area-name".to_string(), text)];
     }
     if name == "grid-template-areas" { return vec![(name.to_string(), text)] }
+    // ★ `float` is not in the profile, but a ROW of same-direction floats is
+    // the pre-flexbox idiom for a horizontal strip, and block-stacking it is
+    // simply wrong: GitHub's Watch/Fork/Star buttons came out one per line.
+    // Carried as a marker and decided on the DOM, where the siblings are
+    // visible (see the float row repair). `none` is carried too, or a later
+    // `float: none` could not cancel an earlier `float: left`.
+    if name == "float" && matches!(text.as_str(), "left" | "right" | "none") {
+        return vec![("float-marker".to_string(), text)];
+    }
     let pairs: Vec<(String, String)> = if navigator_style::values::grammar(name).is_some() {
         vec![(name.to_string(), text)]
     } else {
@@ -630,7 +711,7 @@ fn to_longhands(name: &str, value: &[Token], inputs: &Inputs, report: &mut Repor
         // once the whole cascade is known. Without it every child lands in
         // the same cell: rustdoc's breadcrumb rendered on top of its search
         // box.
-        if p == "grid-template-areas" || p == "grid-area-name" { return Some((p, v)) }
+        if p == "grid-template-areas" || p == "grid-area-name" || p == "float-marker" { return Some((p, v)) }
         // ★ An image the input has not measured cannot be painted (§3.13),
         // and the renderer says so. The normalizer must decide it HERE, the
         // same way it decides for an `<img>`, or it ships a document that
