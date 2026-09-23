@@ -1501,9 +1501,33 @@ emitting it, so `value.invalid` from the renderer is impossible by construction.
 (`float`, `cursor`, `transition`), pseudo-element content, layered backgrounds, images
 whose intrinsic size the input never declared. Silence would be the only real failure.
 
-**Still open:** the converter does not carry stylesheets or image sizes in its recording —
-they were supplied here by sidecars the harness fetched. That is the last piece of the
-lane, and it is converter work, not renderer or normalizer work.
+**The lane is closed (2026-09-23).** The converter now carries what the normalizer needs,
+so nothing in the chain fetches or measures out of turn:
+
+> **converter recording (`atrium-navigator-recording/3`) → normalizer → renderer:
+> 29/29 documents, zero refusals, no sidecars.** 167 stylesheets and 140 measured images
+> travel in the 29 recordings.
+
+- **`@import` is followed** to the profile's depth, keyed as the importing sheet names it
+  — an import keyed by ABSOLUTE url while the normalizer resolves it RELATIVE to the href
+  as written is a lookup that misses, and the CSS goes silently absent.
+- **A `<link media="…">` travels with its sheet**, so a dark-mode stylesheet stays
+  conditional.
+- **Image intrinsic sizes come from the image's own header** (PNG, JPEG, GIF, WebP, and
+  SVG by attribute or `viewBox`), and the bytes are named by **content address**, so the
+  renderer paints from CAS without anyone re-fetching. An image the document already
+  declares needs no fetch; one whose bytes cannot be had still reserves its space when the
+  size was declared. `Fetcher::get_bytes` exists because a header read through a lossy
+  UTF-8 conversion is not a header.
+- Two value-level rules the corpus forced: **nothing still holding `var()` is ever
+  emitted** (Wikipedia defines `--font-size-medium: var(--font-size-small)` and the
+  reverse in different scopes, which merges into a cycle here), and a media feature
+  written `calc(640px - 1px)` is **constant-folded** rather than dropping a whole
+  responsive breakpoint.
+
+★ **Two renderer tests had been failing for hours** — a stale sample golden and a pinned
+`nsg 0.1` header — behind `grep -c "test result: ok"`, which counts the suites that passed
+and cannot see one that failed. Counted properly: **505 tests, 0 failures, six crates**.
 
 ## 9. What this reuses
 
