@@ -287,3 +287,19 @@ fn a_media_query_with_calc_is_folded() {
     assert!(report.dropped.keys().any(|k| k.contains("@media")), "{:?}", report.dropped);
     assert!(refusals(&out).is_empty());
 }
+
+/// ★ A masked box is drawn THROUGH its mask: the colour is the ink, the
+/// mask is the shape. With no mask in the profile, painting the fill
+/// unmasked turns every icon into a solid square.
+#[test]
+fn a_masked_box_paints_neither_fill_nor_image() {
+    let src = r#"<html><head><style>
+      .icon { background-color: #404244; mask-image: url(chevron.svg); width: 10px; height: 10px }
+      .plain { background-color: #404244; width: 10px; height: 10px }
+    </style></head><body><span class="icon"></span><span class="plain"></span></body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    // The plain box keeps its colour; the masked one does not.
+    assert_eq!(out.matches("background-color: #404244").count(), 1, "only the unmasked box is filled:\n{out}");
+    assert!(report.dropped.keys().any(|k| k.contains("masked box")), "{:?}", report.dropped);
+    assert!(refusals(&out).is_empty());
+}

@@ -126,6 +126,9 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     type Key = (Handle, String, String);
     let mut resolved: BTreeMap<Key, BTreeMap<String, (Priority, String)>> = BTreeMap::new();
 
+    // Elements drawn through a mask (see below).
+    let mut masked: std::collections::BTreeSet<Handle> = Default::default();
+
     // Media contexts that define custom properties: a base rule using
     // `var()` must be re-resolved in each of them.
     let var_contexts: Vec<String> = custom.keys().map(|(_, m)| m.clone())
@@ -167,6 +170,16 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
                 let empty = BTreeMap::new();
                 let scope = custom.get(&(*h, media.clone())).or_else(|| custom.get(&(*h, String::new()))).unwrap_or(&empty);
                 let mut pending: Vec<(String, BTreeMap<String, (Priority, String)>)> = vec![];
+                for d in &rule.decls {
+                    // ★ A MASKED box is drawn THROUGH its mask: the colour is
+                    // the ink, the mask is the shape. The profile admits no
+                    // mask, and painting the fill unmasked turns every icon
+                    // into a solid square — Wikipedia's logo and search icon
+                    // came out as two black blocks. Better to paint nothing.
+                    if d.name.contains("mask") && !css::write_tokens(&d.value).trim().eq_ignore_ascii_case("none") {
+                        masked.insert(*h);
+                    }
+                }
                 for d in &rule.decls {
                     let value = substitute(&d.value, scope, 0);
                     for (prop, v) in to_longhands(&d.name, &value, inputs, &mut report) {
@@ -221,6 +234,16 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
             }
         }
     }
+
+    // A masked element paints neither its background colour nor its image:
+    // without the mask both are the wrong shape.
+    let mut unmasked = 0usize;
+    for ((h, ..), props) in resolved.iter_mut() {
+        if !masked.contains(h) { continue }
+        let had = props.remove("background-color").is_some() | props.remove("background-image").is_some();
+        if had { unmasked += 1 }
+    }
+    if unmasked > 0 { report.drop_n("background of a masked box (no mask in the profile)", unmasked) }
 
     // ★ `display: contents` elements generate no box: their children take
     // their place. Doing it here, on the DOM, is exactly what the value

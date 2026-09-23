@@ -1643,6 +1643,20 @@ specs, the Rust book, rustdoc, Hacker News, lobste.rs, danluu, Joel on Software,
 blog, GitHub, freebsd.org, the FreeBSD man page, the GNU coreutils manual, info.cern.ch —
 renders as the site itself looks.
 
+**Six more documents (Wikipedia's bidi article, the W3C grid spec, the Rust API
+guidelines, RFC 2616, GitHub, Unicode TR9), one bug.**
+- ★ **A masked box is drawn THROUGH its mask**: the colour is the ink, the mask is the
+  shape. The profile admits no mask, and painting the fill unmasked turns every icon into
+  a solid square — Wikipedia's logo and search icon came out as two black blocks. The
+  normalizer now drops the background of a masked box and says so, because painting
+  nothing is closer to the page than painting a black square.
+- Unicode TR9 renders its bordered two-column table from offline pre-measurement, and its
+  Devanagari editor name shows tofu: an honest coverage gap in the pinned font set,
+  counted as `notdef`.
+- GitHub renders its header, breadcrumb and action buttons; the "Uh oh! There was an
+  error while loading" is GITHUB's OWN message, because its React file tree never ran in
+  the converter. A converter fidelity limit, not a rendering one.
+
 ★ **Two renderer tests had been failing for hours** — a stale sample golden and a pinned
 `nsg 0.1` header — behind `grep -c "test result: ok"`, which counts the suites that passed
 and cannot see one that failed. Counted properly: **505 tests, 0 failures, six crates**.
