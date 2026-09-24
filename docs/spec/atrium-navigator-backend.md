@@ -1721,6 +1721,28 @@ bugs, all general.** With these, all 29 corpus documents have been looked at.
   which rendered as a grey column on white. The body's own box now paints nothing and
   the canvas fill spans the whole document.
 
+**Wikipedia's contents at 800 px — two bugs, one in each stage before the renderer.**
+Real Wikipedia hides the sidebar contents below 1120 px, behind a button; the lane
+showed them above the article. The hiding rule is
+`@media screen and (max-width: calc(1120px - 1px)) { .client-js .vector-sticky-pinned-container { display: none } }`,
+and neither half of it reached the renderer.
+- ★★★ **The converter: `className` was a SNAPSHOT, not a reflection of the class
+  attribute.** `el.className = "x"` set a plain JS property and never touched the
+  element. Wikipedia's first inline script, `document.documentElement.className =
+  "client-js …"`, ran with zero errors and left `client-nojs` in every Wikipedia
+  recording — so no `.client-js` rule ever applied. The same silent drop took the
+  classes off every element a script built with `className`: mdBook's code-block
+  buttons, rustdoc's search container (an empty bordered box at the end of the page,
+  now gone), WordPress's live regions. Seven of 29 recordings changed.
+- ★★ **The normalizer: a greedy paren trim, surviving in a second place.**
+  `trim_matches('(' | ')')` ate the closing paren of `calc(1120px - 1px)`, and the
+  query was dropped with every rule in it — 18 of Wikipedia's narrow-layout blocks. It
+  had already been fixed once, in the range-syntax path. Queries are now split on `and`
+  at paren depth zero and each part admitted on its own, which also admits compound
+  breakpoints (`(min-width: …) and (max-width: …)`) and the doubled prefixes
+  concatenated sheets leave (`screen and all and (…)`). One refused part still refuses
+  the whole query.
+
 ★ **Two renderer tests had been failing for hours** — a stale sample golden and a pinned
 `nsg 0.1` header — behind `grep -c "test result: ok"`, which counts the suites that passed
 and cannot see one that failed. Counted properly: **505 tests, 0 failures, six crates**.

@@ -85,3 +85,26 @@ fn style_methods_and_csstext() {
     assert!(c.html.contains("margin-top: 8px"), "got {}", c.html);
     assert!(!c.html.contains("color: red"), "removeProperty failed: {}", c.html);
 }
+
+/// ★ `className` REFLECTS the class attribute. As a snapshot data property an
+/// assignment changed only the JS object: Wikipedia's first inline script,
+/// `document.documentElement.className = "client-js …"`, ran without error and
+/// left `client-nojs` in the recording, so every `.client-js` rule — including
+/// the one that hides the sidebar contents below 1120 px — never applied.
+#[test]
+fn class_name_assignment_reaches_the_serialized_html() {
+    let html = "<html class='client-nojs'><body><div id=a class='one'></div><script>\
+        document.documentElement.className = 'client-js skin';\
+        var e = document.getElementById('a');\
+        e.className = 'two';\
+        e.setAttribute('seen', e.className);\
+        e.classList.add('three');\
+        e.setAttribute('after', e.className);\
+        </script></body></html>";
+    let c = run(html);
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.html.contains(r#"class="client-js skin""#), "the ROOT's class changed: {}", c.html);
+    assert!(!c.html.contains("client-nojs"), "{}", c.html);
+    // It reads its own write, and a classList change shows through it.
+    assert!(c.html.contains(r#"seen="two""#) && c.html.contains(r#"after="two three""#), "{}", c.html);
+}

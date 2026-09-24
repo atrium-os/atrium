@@ -743,19 +743,56 @@ fn admitted_media(q: &str) -> Option<String> {
     let q = q.trim().to_ascii_lowercase();
     // `screen`, `all` and a bare feature query are fine; `print` is not.
     if q.contains("print") || q.contains("speech") { return None }
-    let q = q.trim_start_matches("only ").trim().to_string();
-    let q = q.strip_prefix("screen and ").unwrap_or(&q).trim().to_string();
-    let q = q.strip_prefix("all and ").unwrap_or(&q).trim().to_string();
-    if q == "screen" || q == "all" || q.is_empty() { return Some(String::new()) }
-    if !q.starts_with('(') { return None }
+    // A comma list is an OR the profile's queries cannot say; `not` negates.
+    if depth0_split(&q, ",").len() > 1 { return None }
+    // ★ A query is media types and features joined by `and`, and each part is
+    // admitted ON ITS OWN. Stripping one `screen and ` prefix and then reading
+    // the rest as ONE feature dropped every compound breakpoint —
+    // `(min-width: …) and (max-width: …)` — and every doubled prefix a
+    // concatenated stylesheet leaves behind (`screen and all and (…)`).
+    let mut feats: Vec<String> = vec![];
+    for part in depth0_split(&q, " and ") {
+        let part = part.trim();
+        let part = part.strip_prefix("only ").unwrap_or(part).trim();
+        if part == "screen" || part == "all" || part.is_empty() { continue }
+        feats.push(admitted_feature(part)?);
+    }
+    Some(feats.join(" and "))
+}
+
+/// Split at `sep` where no parenthesis is open.
+fn depth0_split<'a>(q: &'a str, sep: &str) -> Vec<&'a str> {
+    let (mut out, mut depth, mut last, b) = (vec![], 0i32, 0usize, q.as_bytes());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ if depth == 0 && q[i..].starts_with(sep) => { out.push(&q[last..i]); i += sep.len(); last = i; continue }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(&q[last..]);
+    out
+}
+
+/// One parenthesized media feature, in the form the profile admits.
+fn admitted_feature(q: &str) -> Option<String> {
+    if !q.starts_with('(') || !q.ends_with(')') { return None }
     // ★ RANGE SYNTAX (Media Queries 4): `(width <= 1044px)` is how modern
     // sheets are written, and the profile's parser only knows `max-width`.
     // Dropping it drops every rule inside — MDN hides its mobile menu in
     // `@media (width <= 1044px)`, so the menu rendered, at one character per
     // line, on every page.
-    if let Some(range) = from_range(&q) { return Some(range) }
-    // Only the features the profile's own parser admits.
-    let inner = q.trim_matches(|c| c == '(' || c == ')');
+    if let Some(range) = from_range(q) { return Some(range) }
+    // ★ EXACTLY ONE paren each side. `trim_matches` is greedy and ate the
+    // closing paren of a `calc(…)` value — `(max-width:calc(1120px - 1px))`
+    // became `max-width:calc(1120px - 1px`, failed to fold, and 18 of
+    // Wikipedia's narrow-layout blocks were dropped: the ones that hide the
+    // sidebar contents below 1120 px. The same greedy trim had already been
+    // fixed once, in the range path.
+    let inner = &q[1..q.len() - 1];
     let name = inner.split(':').next().unwrap_or("").trim();
     match name {
         "min-width" | "max-width" | "min-height" | "max-height" => {
@@ -766,10 +803,10 @@ fn admitted_media(q: &str) -> Option<String> {
             match fold_px(value) {
                 Some(px) => Some(format!("({name}: {px}px)")),
                 None if value.contains("calc(") => None,
-                None => Some(q),
+                None => Some(q.to_string()),
             }
         }
-        "prefers-color-scheme" | "prefers-reduced-motion" | "orientation" => Some(q),
+        "prefers-color-scheme" | "prefers-reduced-motion" | "orientation" => Some(q.to_string()),
         _ => None,
     }
 }
@@ -950,5 +987,24 @@ mod media_tests {
         // A viewport-relative or percentage bound cannot be answered here.
         assert_eq!(m("(width < calc(50% + 10px))"), None);
         assert_eq!(m("(min-resolution: 2dppx)"), None);
+    }
+
+    /// ★ Wikipedia's own shapes. The first had its `calc()`'s closing paren
+    /// eaten by a greedy trim; the others were read as ONE feature.
+    #[test]
+    fn compound_queries_and_calc_values() {
+        let m = |q| super::admitted_media(q);
+        assert_eq!(m("screen and (max-width:calc(1120px - 1px))").as_deref(), Some("(max-width: 1119px)"));
+        assert_eq!(m("screen and (min-width:calc(640px - 1px)) and (max-width:calc(1680px - 1px))").as_deref(),
+                   Some("(min-width: 639px) and (max-width: 1679px)"));
+        // Doubled prefixes, from concatenated sheets.
+        assert_eq!(m("screen and all and (max-width:calc(640px - 1px))").as_deref(), Some("(max-width: 639px)"));
+        assert_eq!(m("screen and screen and (prefers-color-scheme:dark)").as_deref(), Some("(prefers-color-scheme:dark)"));
+        // Counterweights: one refused part refuses the whole query; so do
+        // print, a comma list, and a negation.
+        assert_eq!(m("screen and (max-width: 600px) and (hover: hover)"), None);
+        assert_eq!(m("print and (max-width: 600px)"), None);
+        assert_eq!(m("(max-width: 600px), (orientation: portrait)"), None);
+        assert_eq!(m("not all and (max-width: 600px)"), None);
     }
 }

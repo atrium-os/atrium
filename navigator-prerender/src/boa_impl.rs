@@ -674,6 +674,7 @@ reflected! {
     g_dir, s_dir, "dir"; g_nonce, s_nonce, "nonce"; g_lang, s_lang, "lang";
     g_title_a, s_title_a, "title"; g_alt, s_alt, "alt"; g_name, s_name, "name";
     g_type, s_type, "type"; g_placeholder, s_placeholder, "placeholder";
+    g_class_name, s_class_name, "class";
 }
 
 /// `select.options` — its option elements, live.
@@ -1301,8 +1302,13 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
         let _ = o.set(js_string!("style"), st, false, ctx);
         let ds = dataset_obj(h, ctx);
         let _ = o.set(js_string!("dataset"), ds, false, ctx);
-        let cn = with(|d| d.class_list(h).join(" "));
-        let _ = o.set(js_string!("className"), js_string!(cn), false, ctx);
+        // ★ `className` REFLECTS the class attribute; it is not a snapshot.
+        // As a plain data property, `el.className = "x"` changed only the JS
+        // object and never the element — Wikipedia's first inline script,
+        // `document.documentElement.className = "client-js …"`, ran without
+        // error and left `client-nojs` in the recording, so every rule scoped
+        // to `.client-js` (the one that hides the sidebar contents below
+        // 1120 px among them) never applied.
     }
     {
         let f = NativeFunction::from_fn_ptr(bounding_rect);
@@ -1317,6 +1323,7 @@ fn node_obj(h: Handle, ctx: &mut Context) -> JsValue {
         ("title", g_title_a, s_title_a), ("alt", g_alt, s_alt),
         ("name", g_name, s_name), ("type", g_type, s_type),
         ("placeholder", g_placeholder, s_placeholder),
+        ("className", g_class_name, s_class_name),
     ] { live_get_set(&o, n, g, st, ctx); }
     {
         let tag = with(|d| d.tag(h).map(|t| t.to_ascii_lowercase())).unwrap_or_default();
