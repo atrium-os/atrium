@@ -147,7 +147,10 @@ pub fn subresources_from_recording(path: &std::path::Path) -> crate::Subresource
         };
         let (Some(src), Some(a), Some(w), Some(h)) = (field("src"), field("address"), field("width"), field("height")) else { continue };
         if a.is_empty() { continue }
-        let (Ok(w), Ok(h)) = (w.parse::<i64>(), h.parse::<i64>()) else { continue };
+        // A missing natural dimension is `null`: 0 here, and the element's
+        // own declaration (width / height / natural-ratio) decides layout.
+        let num = |v: &str| if v == "null" { Some(0) } else { v.parse::<i64>().ok() };
+        let (Some(w), Some(h)) = (num(&w), num(&h)) else { continue };
         out.insert(src, (a, w * 64, h * 64));
     }
     out

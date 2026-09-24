@@ -108,7 +108,7 @@ fn what_cannot_be_represented_is_reported() {
 fn a_measured_image_is_kept() {
     let src = r#"<html><body><img src="cat.png"></body></html>"#;
     let mut inputs = Inputs::default();
-    inputs.images.insert("cat.png".into(), (40, 20));
+    inputs.images.insert("cat.png".into(), (40, 20).into());
     let (out, _) = normalize(src, &inputs);
     assert!(out.contains("width=\"40\""), "{out}");
     assert!(out.contains("height=\"20\""), "{out}");
@@ -518,4 +518,27 @@ fn the_webkit_prefixed_box_sizing_is_an_alias() {
         <body><div class="b">x</div></body></html>"#;
     let (out, _) = normalize(src, &Inputs::default());
     assert!(out.contains("width: 300px") && !out.contains("320px"), "{out}");
+}
+
+/// ★ An image declares only the natural sizing it HAS. A width-only SVG
+/// arrives with `width` and `natural-ratio="none"`, no height, and lays out
+/// the way a browser does: its width kept under `max-height`.
+#[test]
+fn an_image_declares_only_the_natural_sizing_it_has() {
+    let fonts = FontSet::load().expect("pinned font set");
+    let mut inputs = Inputs::default();
+    inputs.images.insert("w100.svg".into(), navigator_normalize::ImageSize { width: Some(100), height: None, ratio: None });
+    inputs.images.insert("icon.svg".into(), navigator_normalize::ImageSize { width: None, height: None, ratio: Some((1, 1)) });
+    inputs.images.insert("photo.png".into(), (200, 100).into());
+    let src = r#"<html><head><style>img { display: block; background-color: #ff0000 } .m { max-height: 70px }</style></head>
+        <body><img class="m" src="w100.svg" width="999"><img src="icon.svg"><img src="photo.png"></body></html>"#;
+    let (out, _) = normalize(src, &inputs);
+    assert!(out.contains(r#"src="w100.svg" width="100" natural-ratio="none""#) || (out.contains(r#"width="100""#) && out.contains(r#"natural-ratio="none""#)), "{out}");
+    assert!(!out.contains("999"), "the natural declaration replaces the attribute: {out}");
+    assert!(out.contains(r#"natural-ratio="1/1""#), "{out}");
+    assert!(out.contains(r#"width="200""#) && out.contains(r#"height="100""#), "{out}");
+    let o = render_html(&out, &fonts, &Env::default());
+    assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+    let sizes: Vec<(i64, i64)> = o.scene.rects.iter().filter(|r| r.rgba == 0xff0000ff).map(|r| (r.w / 64, r.h / 64)).collect();
+    assert_eq!(sizes, vec![(100, 70), (150, 150), (200, 100)], "width kept; ratio alone in 300×150; a raster image its own size");
 }

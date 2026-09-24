@@ -387,6 +387,27 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
     (dom2.serialize(), n)
 }
 
+/// An image's natural sizing (CSS Images 3 §5.1): each part optional.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Natural { w: Option<U>, h: Option<U>, ratio: Option<(U, U)> }
+
+/// CSS 2.1 §10.4's table: min/max on a replaced element whose width AND
+/// height are auto, resolved so the RATIO survives where it can.
+fn constrain_ratio(w: U, h: U, (mnw, mxw): (U, U), (mnh, mxh): (U, U)) -> (U, U) {
+    let mul = |a: U, b: U, c: U| (a as i128 * b as i128 / c.max(1) as i128) as U;
+    match (w > mxw, w < mnw, h > mxh, h < mnh) {
+        (true, _, true, _) => if mxw as i128 * h as i128 <= mxh as i128 * w as i128 { (mxw, mnh.max(mul(mxw, h, w))) } else { (mnw.max(mul(mxh, w, h)), mxh) },
+        (_, true, _, true) => if mnw as i128 * h as i128 <= mnh as i128 * w as i128 { (mxw.min(mul(mnh, w, h)), mnh) } else { (mnw, mxh.min(mul(mnw, h, w))) },
+        (_, true, true, _) => (mnw, mxh),
+        (true, _, _, true) => (mxw, mnh),
+        (true, ..) => (mxw, mnh.max(mul(mxw, h, w))),
+        (_, true, ..) => (mnw, mxh.min(mul(mnw, h, w))),
+        (_, _, true, _) => (mnw.max(mul(mxh, w, h)), mxh),
+        (_, _, _, true) => (mxw.min(mul(mnh, w, h)), mnh),
+        _ => (w, h),
+    }
+}
+
 #[derive(Clone)]
 enum Item { Word(String, FontStyle, Line), Space(FontStyle, Line), Break,
             /// A tab in preserved white space: advance to the next tab stop.
@@ -522,14 +543,14 @@ impl<'a> Cx<'a> {
             V::Kw("max-content") => Some(self.intrinsic(h).1 + frame),
             v => len(v, cb_w),
         }
-        // A replaced box with an auto width takes the declared intrinsic one,
-        // or follows the ratio from a specified height (CSS Sizing 3 §5.2).
-        .or_else(|| repl.as_ref().map(|(_, iw, ih)| {
-            match (match s.get("height") { V::Kw(_) => None, V::Pct(_) => cb_h.and_then(|b| len(s.get("height"), b)), v => len(v, 0) }, *ih) {
-                (Some(hh), ih) if ih > 0 => frame + (hh as i128 * *iw as i128 / ih as i128) as U,
-                _ => frame + *iw,
-            }
-        }));
+        ;
+        // ★ A replaced box is sized JOINTLY — width, height, natural size,
+        // ratio and min/max together (CSS 2.1 §10.3.2, §10.4, §10.6.2; CSS
+        // Images 3 §5). One computation, used for both axes below.
+        let repl_used = repl.as_ref().map(|(_, nat)| Self::replaced_used(s, nat, cb_w, cb_h, frame, bt + bb + pt + pb));
+        let specified_w = if repl.is_some() && !matches!(s.get("width"), V::Kw("min-content") | V::Kw("max-content")) {
+            repl_used.map(|(w, _)| w)
+        } else { specified_w };
         let mut w = specified_w.unwrap_or_else(|| cb_w - ml.unwrap_or(0) - mr.unwrap_or(0));
         if let Some(mx) = len(s.get("max-width"), cb_w) { w = w.min(mx) }
         if let Some(mn) = len(s.get("min-width"), cb_w) { w = w.max(mn) }
@@ -563,17 +584,14 @@ impl<'a> Cx<'a> {
             let v = match vpct("max-height") { Some(mx) if !matches!(s.get("max-height"), V::Kw(_)) => v.min(mx), _ => v };
             match vpct("min-height") { Some(mn) if !matches!(s.get("min-height"), V::Kw(_)) => v.max(mn), _ => v }
         };
-        let definite = force.1.or_else(|| match s.get("height") { V::Kw(_) => None, V::Pct(_) => cb_h.and_then(|b| len(s.get("height"), b)), v => len(v, 0) }.map(clamp))
+        let definite = force.1.or(repl_used.map(|(_, hh)| hh)).or_else(|| match s.get("height") { V::Kw(_) => None, V::Pct(_) => cb_h.and_then(|b| len(s.get("height"), b)), v => len(v, 0) }.map(clamp))
             // aspect-ratio: with a definite width and an auto height, the
             // height follows the ratio (CSS Sizing 4).
             .or_else(|| match s.get("aspect-ratio") {
                 V::Num(r) if *r > 0.0 => Some(clamp(u(w as f64 / PX as f64 / r))),
                 _ => None,
             })
-            .or_else(|| repl.as_ref().map(|(_, iw, ih)| {
-                let content = (w - frame).max(0);
-                clamp(pt + pb + bt + bb + if *iw > 0 { (content as i128 * *ih as i128 / *iw as i128) as U } else { *ih })
-            }));
+;
         // ★ A border box is never smaller than its padding and border: the
         // content box cannot go negative (CSS Box Sizing 3 §3). Width had
         // this floor; height did not, so WPT's box-sizing-026 — `height:
@@ -813,8 +831,15 @@ impl<'a> Cx<'a> {
             if !hidden && im.area.w > 0 && im.area.h > 0 { self.scene.insert_image(slot, im); slot += 1 }
         }
         // The replaced content itself, fitted into the content box.
-        if let Some((addr, iw, ih)) = repl.filter(|(a, ..)| !a.is_empty()) {
+        if let Some((addr, nat)) = repl.filter(|(a, ..)| !a.is_empty()) {
             let content = (bx + bl + pl, by + bt + pt, (w - frame).max(0), (hgt - pt - pb - bt - bb).max(0));
+            // `object-fit` needs a natural size; an image without one (or
+            // without a ratio) simply fills its box.
+            let (iw, ih) = match (nat.w, nat.h, nat.ratio) {
+                (Some(a), Some(b), Some(_)) => (a, b),
+                (_, _, Some((rw, rh))) => (rw, rh),
+                _ => (content.2, content.3),
+            };
             let fit = match kw(s, "object-fit") { "contain" => "contain", "cover" => "cover", "none" => "none", "scale-down" => "scale-down", _ => "fill" };
             let (tx, ty, tw, th) = Self::object_tile(fit, content, (iw, ih));
             if !hidden && content.2 > 0 && content.3 > 0 {
@@ -960,34 +985,119 @@ impl<'a> Cx<'a> {
     /// image 0 wide during offline table pre-measurement (which is run
     /// without one), so its column came out too narrow and the image
     /// overflowed the cell at render time.
+    /// The CONTENT-box size of a replaced element laid out with nothing
+    /// around it — its contribution to a line or an intrinsic size.
     fn replaced_size(&self, h: Handle) -> Option<(U, U)> {
-        if self.dom.tag(h) != Some("img") { return None }
-        let declared = |n: &str| self.dom.attr(h, n).and_then(|v| v.trim().parse::<f64>().ok()).map(u);
-        self.subs.get(self.dom.attr(h, "src").unwrap_or("")).map(|(_, w, hh)| (*w, *hh))
-            .or_else(|| declared("width").zip(declared("height")))
+        let (_, nat) = self.natural(h)?;
+        let s = self.st(h)?;
+        let px = |p: &str| len(s.get(p), 0).unwrap_or(0);
+        let bd = |side: &str| if kw(s, &format!("border-{side}-style")) == "none" { 0 } else { px(&format!("border-{side}-width")) };
+        let fh = px("padding-left") + px("padding-right") + bd("left") + bd("right");
+        let fv = px("padding-top") + px("padding-bottom") + bd("top") + bd("bottom");
+        let (w, hh) = Self::replaced_used(s, &nat, 0, None, fh, fv);
+        Some(((w - fh).max(0), (hh - fv).max(0)))
     }
 
-    fn replaced(&mut self, h: Handle) -> Option<(String, U, U)> {
+    /// ★ An image's NATURAL sizing (CSS Images 3 §5.1): a width, a height and
+    /// a ratio, EACH of which may be absent. The document declares them on
+    /// the element — `width`, `height`, and `natural-ratio` (`W/H` or `none`)
+    /// — and the subresource map names the bytes. Both dimensions and no
+    /// `natural-ratio` means the ratio is theirs; one dimension alone means
+    /// none. An SVG that states only `width="100"` has no ratio, and giving
+    /// it one shrank its width under `max-height` where a browser keeps it.
+    fn natural(&self, h: Handle) -> Option<(String, Natural)> {
+        if self.dom.tag(h) != Some("img") { return None }
+        let src = self.dom.attr(h, "src").unwrap_or("");
+        let dim = |n: &str| self.dom.attr(h, n).and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| *v > 0.0).map(u);
+        let (w, hh) = (dim("width"), dim("height"));
+        let ratio_attr = self.dom.attr(h, "natural-ratio").map(str::trim);
+        let sub = self.subs.get(src);
+        let addr = sub.map(|(a, ..)| a.clone()).unwrap_or_default();
+        let declared = w.is_some() || hh.is_some() || ratio_attr.is_some();
+        let nat = if declared {
+            let ratio = match ratio_attr {
+                Some("none") => None,
+                Some(r) => r.split_once('/').and_then(|(a, b)| Some((a.trim().parse::<f64>().ok()?, b.trim().parse::<f64>().ok()?)))
+                    .filter(|(a, b)| *a > 0.0 && *b > 0.0).map(|(a, b)| (u(a), u(b))),
+                None => w.zip(hh),
+            };
+            Natural { w, h: hh, ratio }
+        } else {
+            // Undeclared on the element: the subresource map's size, both
+            // dimensions, hence a ratio.
+            let (_, sw, sh) = sub?;
+            let (sw, sh) = (Some(*sw).filter(|v| *v > 0), Some(*sh).filter(|v| *v > 0));
+            Natural { w: sw, h: sh, ratio: sw.zip(sh) }
+        };
+        Some((addr, nat))
+    }
+
+    fn replaced(&mut self, h: Handle) -> Option<(String, Natural)> {
         if self.dom.tag(h) != Some("img") { return None }
         let src = self.dom.attr(h, "src").unwrap_or("").to_string();
-        // ★ §1.2 says replaced content CARRIES its intrinsic dimensions, and
-        // `width`/`height` on the element is how a document carries them.
-        // The subresource map is a separate thing: it names the BYTES. So an
-        // image whose size is declared lays out and holds its space — no
-        // layout shift — even when the bytes were not supplied, and that is
-        // counted rather than refused.
-        let declared = |n: &str| self.dom.attr(h, n).and_then(|v| v.trim().parse::<f64>().ok()).map(|v| u(v));
-        match self.subs.get(&src) {
-            Some((a, w, hh)) => Some((a.clone(), *w, *hh)),
-            None => match (declared("width"), declared("height")) {
-                (Some(w), Some(hh)) => { self.count("image bytes not supplied (space reserved)"); Some((String::new(), w, hh)) }
-                _ => {
-                    self.diagnostics.push(Diagnostic { pos: Pos { line: 0, col: 0 }, code: "input.subresource-not-supplied",
-                        msg: format!("<img src={src:?}>: no intrinsic size declared and no subresource supplied; §3.13 admits no measurement path") });
-                    None
-                }
-            },
+        // ★ §1.2 says replaced content CARRIES its natural sizing, on the
+        // element. The subresource map is a separate thing: it names the
+        // BYTES. So a declared image lays out and holds its space — no layout
+        // shift — even when the bytes were not supplied, and that is counted
+        // rather than refused.
+        match self.natural(h) {
+            Some((addr, nat)) => {
+                if addr.is_empty() { self.count("image bytes not supplied (space reserved)") }
+                Some((addr, nat))
+            }
+            None => {
+                self.diagnostics.push(Diagnostic { pos: Pos { line: 0, col: 0 }, code: "input.subresource-not-supplied",
+                    msg: format!("<img src={src:?}>: no natural size declared and no subresource supplied; §3.13 admits no measurement path") });
+                None
+            }
         }
+    }
+
+    /// ★ The used BORDER-BOX size of a replaced element, width and height
+    /// together: specified sizes first, then the ratio, then the natural
+    /// size, then the default object size 300×150 (CSS 2.1 §10.3.2, §10.6.2;
+    /// CSS Images 3 §5.3), with min/max applied by CSS 2.1 §10.4's
+    /// ratio-preserving table when both sizes are auto and there is a ratio,
+    /// and to each axis alone otherwise. All the profile's sizes are
+    /// border-box, so the frame comes off first and goes back on last.
+    fn replaced_used(s: &Style, nat: &Natural, cb_w: U, cb_h: Option<U>, fh: U, fv: U) -> (U, U) {
+        let hv = |p: &str| -> Option<U> { match s.get(p) { V::Kw(_) => None, V::Pct(_) => cb_h.and_then(|b| len(s.get(p), b)), v => len(v, 0) } };
+        let wv = |p: &str| -> Option<U> { match s.get(p) { V::Kw(_) => None, V::Pct(_) if cb_w <= 0 => None, v => len(v, cb_w) } };
+        let (sw, sh) = (wv("width").map(|v| (v - fh).max(0)), hv("height").map(|v| (v - fv).max(0)));
+        let mnw = wv("min-width").map(|v| (v - fh).max(0)).unwrap_or(0);
+        let mxw = wv("max-width").map(|v| (v - fh).max(0)).unwrap_or(U::MAX / 4).max(mnw);
+        let mnh = hv("min-height").map(|v| (v - fv).max(0)).unwrap_or(0);
+        let mxh = hv("max-height").map(|v| (v - fv).max(0)).unwrap_or(U::MAX / 4).max(mnh);
+        let r_h = |w: U| nat.ratio.map(|(rw, rh)| (w as i128 * rh as i128 / rw.max(1) as i128) as U);
+        let r_w = |h: U| nat.ratio.map(|(rw, rh)| (h as i128 * rw as i128 / rh.max(1) as i128) as U);
+        let (dw, dh) = (u(300.0), u(150.0));
+        let (w, h) = match (sw, sh) {
+            (Some(w), Some(h)) => (w.clamp(mnw, mxw), h.clamp(mnh, mxh)),
+            // One given: the other follows the ratio from its USED value.
+            (Some(w), None) => { let w = w.clamp(mnw, mxw); (w, r_h(w).or(nat.h).unwrap_or(dh).clamp(mnh, mxh)) }
+            (None, Some(h)) => { let h = h.clamp(mnh, mxh); (r_w(h).or(nat.w).unwrap_or(dw).clamp(mnw, mxw), h) }
+            (None, None) => {
+                let (w, h) = match (nat.w, nat.h, nat.ratio) {
+                    (Some(w), Some(h), _) => (w, h),
+                    (Some(w), None, Some(_)) => (w, r_h(w).unwrap_or(dh)),
+                    (None, Some(h), Some(_)) => (r_w(h).unwrap_or(dw), h),
+                    (Some(w), None, None) => (w, dh),
+                    (None, Some(h), None) => (dw, h),
+                    // A ratio alone: the largest box of that ratio inside the
+                    // default object size (CSS Images 3 §5.3, `contain`).
+                    (None, None, Some((rw, rh))) => {
+                        if dw as i128 * rh as i128 <= dh as i128 * rw as i128 { (dw, (dw as i128 * rh as i128 / rw.max(1) as i128) as U) }
+                        else { ((dh as i128 * rw as i128 / rh.max(1) as i128) as U, dh) }
+                    }
+                    (None, None, None) => (dw, dh),
+                };
+                match nat.ratio {
+                    Some(_) if w > 0 && h > 0 => constrain_ratio(w, h, (mnw, mxw), (mnh, mxh)),
+                    _ => (w.clamp(mnw, mxw), h.clamp(mnh, mxh)),
+                }
+            }
+        };
+        (w + fh, h + fv)
     }
 
     /// `object-fit` (row 58): how the source fills the content box. Returns
@@ -2424,6 +2534,34 @@ mod tests {
         assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 100, 20)]);
         assert_eq!(boxes(&o, 0x00ff00ff), vec![(110, 0, 380, 20)], "grows into the free space, gaps honoured");
         assert_eq!(boxes(&o, 0x0000ffff), vec![(500, 0, 100, 20)]);
+    }
+
+    /// ★ NATURAL SIZING with optional parts (CSS Images 3 §5). A width with
+    /// no height and no ratio keeps its width under `max-height`; a ratio
+    /// alone fills the default object size; a ratio survives min/max by
+    /// CSS 2.1 §10.4; and an image declaring nothing is still refused.
+    #[test]
+    fn images_size_from_whatever_natural_sizing_they_declare() {
+        let img = |attrs: &str, css: &str| {
+            let o = render(&format!(r#"<style>body {{ margin-left: 0px; margin-top: 0px }} img {{ display: block; background-color: #ff0000; {css} }}</style>
+                <img src="a.png" {attrs}>"#));
+            let b = boxes(&o, 0xff0000ff).first().map(|r| (r.2, r.3)).unwrap_or((0, 0));
+            (b, o.diagnostics.len())
+        };
+        // WPT's w100.svg: width 100, no height, no ratio. Under max-height
+        // 70 a browser keeps the width; a (100, 150) ratio would shrink it.
+        assert_eq!(img(r#"width="100""#, "max-height: 70px").0, (100, 70));
+        // No constraint: the missing height is the default 150.
+        assert_eq!(img(r#"width="100""#, "").0, (100, 150));
+        // A ratio alone: the largest 2:1 box inside 300×150.
+        assert_eq!(img(r#"natural-ratio="2/1""#, "").0, (300, 150));
+        assert_eq!(img(r#"natural-ratio="1/1""#, "").0, (150, 150));
+        // Both dimensions: their ratio, kept by §10.4 under max-width.
+        assert_eq!(img(r#"width="200" height="100""#, "max-width: 100px").0, (100, 50));
+        // …unless the declaration says there is none.
+        assert_eq!(img(r#"width="200" height="100" natural-ratio="none""#, "max-width: 100px").0, (100, 100));
+        // Declaring nothing is still refused (§3.13).
+        assert_eq!(img("", "").1, 1);
     }
 
     /// ★ Absolutely positioned auto margins (CSS 2.1 §10.3.7, §10.6.4): with

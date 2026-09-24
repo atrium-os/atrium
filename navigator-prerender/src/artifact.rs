@@ -103,8 +103,12 @@ pub fn emit(url: Option<&str>, c: &Conversion, policy: &TierPolicy) -> String {
     s.push_str("  \"images\": [");
     for (i, im) in c.subresources.images.iter().enumerate() {
         s.push_str(if i == 0 { "\n" } else { ",\n" });
-        s.push_str(&format!("    {{ \"src\": {}, \"width\": {}, \"height\": {}, \"address\": {} }}",
-            json_str(&im.src), im.width, im.height, json_str(&im.address)));
+        // A missing natural dimension is `null`, and the ratio is explicit:
+        // `W/H`, or `none` when the image has no ratio.
+        let num = |v: Option<u32>| v.map(|n| n.to_string()).unwrap_or_else(|| "null".into());
+        let ratio = im.natural.ratio.map(|(a, b)| format!("{a}/{b}")).unwrap_or_else(|| "none".into());
+        s.push_str(&format!("    {{ \"src\": {}, \"width\": {}, \"height\": {}, \"ratio\": {}, \"address\": {} }}",
+            json_str(&im.src), num(im.natural.width), num(im.natural.height), json_str(&ratio), json_str(&im.address)));
     }
     s.push_str(if c.subresources.images.is_empty() { "],\n" } else { "\n  ],\n" });
     s.push_str(&format!("  \"document\": {}\n", json_str(document)));

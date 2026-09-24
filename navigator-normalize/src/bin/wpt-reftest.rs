@@ -110,10 +110,6 @@ fn resolve(root: &Path, from: &Path, href: &str) -> Option<PathBuf> {
     Some(match href.strip_prefix('/') { Some(r) => root.join(r), None => from.parent()?.join(href) })
 }
 
-/// The CONVERTER's image sizing — the oracle must size images exactly as
-/// the lane does, or it measures its own parser.
-fn image_size(bytes: &[u8]) -> Option<(u32, u32)> { navigator_prerender::subresource::intrinsic_size(bytes) }
-
 struct Loaded {
     html: String,
     inputs: Inputs,
@@ -168,10 +164,10 @@ fn load(root: &Path, file: &Path) -> Option<Loaded> {
     let mut assets = BTreeMap::new();
     for (raw, path) in urls {
         let Ok(bytes) = std::fs::read(&path) else { continue };
-        let Some((w, h)) = image_size(&bytes) else { continue };
+        let Some(n) = navigator_prerender::subresource::natural_size(&bytes) else { continue };
         let address = format!("blake3:{}", blake3::hash(&bytes).to_hex());
-        inputs.images.insert(raw.clone(), (w, h));
-        subs.insert(raw, (address.clone(), w as i64 * 64, h as i64 * 64));
+        inputs.images.insert(raw.clone(), navigator_normalize::ImageSize { width: n.width, height: n.height, ratio: n.ratio });
+        subs.insert(raw, (address.clone(), n.width.unwrap_or(0) as i64 * 64, n.height.unwrap_or(0) as i64 * 64));
         assets.insert(address, path);
     }
     Some(Loaded { html, inputs, subs, assets, css })

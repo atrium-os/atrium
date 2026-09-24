@@ -40,8 +40,15 @@ pub fn parse(json: &str) -> Result<Recording, String> {
     }
     for obj in objects_in_array(json, "\"images\"") {
         let Some(src) = string_field(&obj, "\"src\"") else { continue };
-        let (Some(w), Some(h)) = (number_field(&obj, "\"width\""), number_field(&obj, "\"height\"")) else { continue };
-        r.inputs.images.insert(src.clone(), (w as u32, h as u32));
+        // Either dimension may be `null`; the ratio is `W/H` or `none`, and
+        // an older recording without the field implies it from both sizes.
+        let (w, h) = (number_field(&obj, "\"width\"").map(|v| v as u32), number_field(&obj, "\"height\"").map(|v| v as u32));
+        let ratio = match string_field(&obj, "\"ratio\"").as_deref() {
+            Some("none") => None,
+            Some(r) => r.split_once('/').and_then(|(a, b)| Some((a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?))),
+            None => w.zip(h),
+        };
+        r.inputs.images.insert(src.clone(), crate::ImageSize { width: w, height: h, ratio });
         if let Some(a) = string_field(&obj, "\"address\"").filter(|a| !a.is_empty()) { r.addresses.insert(src, a); }
     }
     Ok(r)

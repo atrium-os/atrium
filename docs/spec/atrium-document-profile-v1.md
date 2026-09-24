@@ -853,11 +853,28 @@ plausibly and wrongly, forever, and nobody finds out.
 
 ### 3.13 Pre-measured content — the general rule
 
-Replaced content must declare intrinsic dimensions (§1.2), and tables must declare
+Replaced content must declare its natural sizing (§1.2), and tables must declare
 intrinsic column widths. These are the same rule:
 
 > **Content whose sizing would require unbounded measurement must arrive
 > already measured.**
+
+**An image's declaration (settled 2026-09-24).** CSS Images 3 §5.1 gives an image a
+natural width, a natural height and a natural aspect ratio, **each of which may be
+absent**: a raster image has all three; an SVG may state a width alone (no ratio), only a
+`viewBox` (a ratio and no size), or nothing. The declaration says exactly what is there,
+on the `<img>`: `width` and/or `height` in px, and `natural-ratio` — `W/H` or `none` —
+whenever the two dimensions are not both present (both, with no `natural-ratio`, means
+their ratio). An image declaring none of the three is **unmeasured and refused**; one
+declaring `natural-ratio="none"` alone is measured, and has no natural size.
+
+Layout then follows CSS exactly: specified sizes first, then the ratio, then the natural
+size, then the default object size 300×150 — a ratio alone fills the largest box of that
+ratio inside it (CSS 2.1 §10.3.2, §10.6.2; CSS Images 3 §5.3). `min-*`/`max-*` apply by
+CSS 2.1 §10.4's ratio-preserving table when both sizes are `auto` and there is a ratio,
+and to each axis alone otherwise. A pair of dimensions always implied a ratio, so a
+width-only SVG under `max-height` lost width that a browser keeps; and a `viewBox` alone
+was taken as a SIZE, which it is not.
 
 Auto table layout is the canonical unbounded measurement: every cell's content must be
 measured to derive each column's min-content and max-content width, and the cost scales

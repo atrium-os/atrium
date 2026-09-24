@@ -35,9 +35,11 @@ fn every_format_the_corpus_contains_reports_its_own_size() {
     webp.extend([49, 0, 0]);   // (height - 1)
     assert_eq!(intrinsic_size(&webp), Some((100, 50)));
 
-    // SVG carries its size in the markup, by attribute or by viewBox.
+    // SVG carries its size in the markup by attribute. A viewBox alone is a
+    // RATIO, not a size (CSS Images 3 §5.1) — it used to be read as 24×24.
     assert_eq!(intrinsic_size(br#"<svg xmlns="..." width="16" height="9"></svg>"#), Some((16, 9)));
-    assert_eq!(intrinsic_size(br#"<svg xmlns="..." viewBox="0 0 24 24"></svg>"#), Some((24, 24)));
+    assert_eq!(intrinsic_size(br#"<svg xmlns="..." viewBox="0 0 24 24"></svg>"#), None);
+    assert_eq!(navigator_prerender::subresource::natural_size(br#"<svg xmlns="..." viewBox="0 0 24 24"></svg>"#).and_then(|n| n.ratio), Some((1, 1)));
 
     // ★ The control: a format with no header we understand is REPORTED as
     // unmeasured, never guessed at.
@@ -72,7 +74,7 @@ fn an_image_is_measured_and_addressed_and_a_failure_is_reported() {
     f.0.insert("https://example.com/logo.svg".into(), r#"<svg width="64" height="32"></svg>"#.into());
     let out = collect(&dom, Some("https://example.com/"), &mut f);
     assert_eq!(out.images.len(), 1);
-    assert_eq!((out.images[0].width, out.images[0].height), (64, 32));
+    assert_eq!((out.images[0].natural.width, out.images[0].natural.height), (Some(64), Some(32)));
     assert!(out.images[0].address.starts_with("blake3:"), "the bytes are named by content: {:?}", out.images[0]);
     // The one that could not be fetched is REPORTED, not silently missing.
     assert_eq!(out.failed.len(), 1);
@@ -87,20 +89,36 @@ fn a_declared_size_survives_a_failed_fetch() {
     let mut f = MapFetcher::default();
     let out = collect(&dom, Some("https://example.com/"), &mut f);
     assert_eq!(out.images.len(), 1);
-    assert_eq!((out.images[0].width, out.images[0].height), (10, 4));
+    assert_eq!((out.images[0].natural.width, out.images[0].natural.height), (Some(10), Some(4)));
     assert_eq!(out.images[0].address, "", "no bytes, so no address — the space is still reserved");
 }
 
-/// ★ An SVG's size comes from its ROOT element, and a missing dimension
-/// (with no viewBox) takes the default object size, 300×150 (CSS Images 3).
+/// ★ An SVG's natural sizing comes from its ROOT element, each part
+/// optional (CSS Images 3 §5.1): a width alone has NO ratio, a viewBox alone
+/// is a ratio with no size, and nothing at all is measured-as-nothing.
 #[test]
-fn svg_intrinsic_size_reads_the_root_and_defaults_a_missing_dimension() {
-    use navigator_prerender::subresource::intrinsic_size;
+fn svg_natural_sizing_reads_the_root_and_keeps_absent_parts_absent() {
+    use navigator_prerender::subresource::{natural_size, intrinsic_size, Natural};
+    let n = |b: &[u8]| natural_size(b).expect("an image");
     // WPT's support/w100.svg: a width and nothing else.
-    assert_eq!(intrinsic_size(br#"<svg style="background: green" xmlns="http://www.w3.org/2000/svg" width="100"></svg>"#), Some((100, 150)));
-    assert_eq!(intrinsic_size(br#"<svg xmlns="http://www.w3.org/2000/svg" height="40"></svg>"#), Some((300, 40)));
-    // A nested element's width is not the image's.
-    assert_eq!(intrinsic_size(br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="999" height="999"/></svg>"#), Some((20, 10)));
-    assert_eq!(intrinsic_size(br#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="999" height="999"/></svg>"#), None,
-               "no root dimensions at all: unsized, as before");
+    assert_eq!(n(br#"<svg style="background: green" xmlns="http://www.w3.org/2000/svg" width="100"></svg>"#),
+               Natural { width: Some(100), height: None, ratio: None });
+    // An icon: a viewBox only.
+    assert_eq!(n(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 12"></svg>"#),
+               Natural { width: None, height: None, ratio: Some((2, 1)) });
+    // Both: their ratio. A nested element's size is not the image's.
+    assert_eq!(n(br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="999" height="999"/></svg>"#),
+               Natural { width: Some(20), height: Some(10), ratio: Some((2, 1)) });
+    // A relative length is no natural size.
+    assert_eq!(n(br#"<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="2em"></svg>"#),
+               Natural { width: None, height: None, ratio: None });
+    // The Rust book's diagram: 1000×1300 is exactly 10/13, not 769/1000.
+    assert_eq!(n(br#"<svg viewBox="0.00 0.00 1000.00 1300.00" xmlns="http://www.w3.org/2000/svg"></svg>"#).ratio, Some((10, 13)));
+    assert_eq!(n(br#"<svg viewBox="0 0 1038 1342" xmlns="http://www.w3.org/2000/svg"></svg>"#).ratio, Some((519, 671)));
+    // Nothing declared: measured, and natural size none.
+    assert_eq!(n(br#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="999" height="999"/></svg>"#),
+               Natural { width: None, height: None, ratio: None });
+    // The both-dimensions view is empty unless both are there.
+    assert_eq!(intrinsic_size(br#"<svg xmlns="http://www.w3.org/2000/svg" width="100"></svg>"#), None);
+    assert_eq!(intrinsic_size(br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"></svg>"#), Some((20, 10)));
 }

@@ -20,7 +20,7 @@ fn sidecars(doc: &std::path::Path) -> Inputs {
         for line in t.lines() {
             let mut it = line.split('\t');
             if let (Some(src), Some(w), Some(h)) = (it.next(), it.next(), it.next()) {
-                if let (Ok(w), Ok(h)) = (w.parse(), h.parse()) { inputs.images.insert(src.to_string(), (w, h)); }
+                if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) { inputs.images.insert(src.to_string(), (w, h).into()); }
             }
         }
     }

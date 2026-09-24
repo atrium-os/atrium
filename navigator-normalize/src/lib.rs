@@ -34,11 +34,20 @@ pub struct Inputs {
     /// `href` → stylesheet text, for every `<link rel=stylesheet>`.
     pub stylesheets: BTreeMap<String, String>,
     /// `src` → (intrinsic width px, height px), for every image.
-    pub images: BTreeMap<String, (u32, u32)>,
+    pub images: BTreeMap<String, ImageSize>,
     /// `href` → the `media` attribute of the `<link>` that named it. A sheet
     /// fetched under a condition must be APPLIED under it (§3.11), or a
     /// dark-mode stylesheet lands on every reader.
     pub stylesheet_media: BTreeMap<String, String>,
+}
+
+/// ★ An image's NATURAL sizing (CSS Images 3 §5.1), each part optional —
+/// a width alone, a ratio alone, or nothing, as well as the usual pair.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ImageSize { pub width: Option<u32>, pub height: Option<u32>, pub ratio: Option<(u32, u32)> }
+
+impl From<(u32, u32)> for ImageSize {
+    fn from((w, h): (u32, u32)) -> Self { ImageSize { width: Some(w), height: Some(h), ratio: Some((w, h)) } }
 }
 
 #[derive(Debug, Default)]
@@ -571,7 +580,26 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     for h in imgs {
         let src = dom.attr(h, "src").unwrap_or("").to_string();
         match inputs.images.get(&src) {
-            Some((w, ht)) => { dom.set_attr(h, "width", &w.to_string()); dom.set_attr(h, "height", &ht.to_string()); }
+            // ★ Only the parts the image HAS are declared. Both dimensions
+            // imply their ratio; anything else says its ratio outright —
+            // `natural-ratio="W/H"`, or `none` — so the renderer never
+            // invents one (an SVG with `width="100"` alone has none).
+            Some(n) => {
+                dom.remove_attr(h, "width");
+                dom.remove_attr(h, "height");
+                if let Some(w) = n.width { dom.set_attr(h, "width", &w.to_string()) }
+                if let Some(ht) = n.height { dom.set_attr(h, "height", &ht.to_string()) }
+                let implied = n.width.zip(n.height);
+                let same_ratio = match (implied, n.ratio) {
+                    (Some((w, ht)), Some((a, b))) => w as u64 * b as u64 == ht as u64 * a as u64,
+                    (None, None) => false,
+                    _ => false,
+                };
+                if !same_ratio {
+                    let r = n.ratio.map(|(a, b)| format!("{a}/{b}")).unwrap_or_else(|| "none".into());
+                    dom.set_attr(h, "natural-ratio", &r);
+                }
+            }
             None => { detach(&mut dom, h); report.drop("image without a declared intrinsic size"); }
         }
     }
@@ -837,7 +865,8 @@ fn to_longhands(name: &str, value: &[Token], inputs: &Inputs, report: &mut Repor
         if p == "background-image" {
             if let Some(url) = v.strip_prefix("url(").and_then(|x| x.strip_suffix(')')) {
                 let url = url.trim().trim_matches(['"', '\'']);
-                if !inputs.images.contains_key(url) {
+                // Tiling needs both natural dimensions.
+                if !inputs.images.get(url).is_some_and(|n| n.width.is_some() && n.height.is_some()) {
                     report.drop("background image without a declared intrinsic size");
                     return Some((p, "none".to_string()));
                 }
