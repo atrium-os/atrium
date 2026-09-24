@@ -93,12 +93,23 @@ struct MvkAccel {
     blas_addrs: Vec<u64>,
     /// Buffers/memory backing the BLASes (live for the scene's lifetime).
     #[allow(dead_code)] owned: Vec<(vk::Buffer, vk::DeviceMemory)>,
-    /// In-flight BLAS builds (`add_scene_blases_async`): fence, command
-    /// buffer, first BLAS index, count. Drained by `poll_scene_blases`.
-    pending: Vec<(vk::Fence, vk::CommandBuffer, u32, u32)>,
+    /// In-flight BLAS builds (`add_scene_blases_async`). Drained by
+    /// `poll_scene_blases`, which also frees the build inputs.
+    pending: Vec<PendingBuild>,
     /// Buffers/memory backing the current TLAS (instances, storage, scratch)
     /// — replaced on rebuild.
     tlas_owned: Vec<(vk::Buffer, vk::DeviceMemory)>,
+}
+
+/// One in-flight batch of BLAS builds: its fence + command buffer, the
+/// index range it produces, and the buffers only the build reads
+/// (vertex input, scratch), freed once the fence signals.
+struct PendingBuild {
+    fence: vk::Fence,
+    cb: vk::CommandBuffer,
+    first: u32,
+    #[allow(dead_code)] count: u32,
+    transient: Vec<(vk::Buffer, vk::DeviceMemory)>,
 }
 
 /// One TLAS instance for [`MoltenVkBackend::build_scene_tlas`]: which BLAS
@@ -243,6 +254,13 @@ pub struct MoltenVkBackend {
     /// VK_KHR_acceleration_structure device function loader (BLAS/TLAS build +
     /// device-address queries). `Some` iff `ray_query`.
     as_device: Option<khr::acceleration_structure::Device>,
+    /// VK_EXT_external_memory_host loader (`Some` when the device offers
+    /// it): page-aligned host memory bound as a buffer WITHOUT a copy —
+    /// MoltenVK wraps it with `newBufferWithBytesNoCopy`, which on unified
+    /// memory means the GPU reads the caller's own pages.
+    host_import: Option<ash::ext::external_memory_host::Device>,
+    /// `minImportedHostPointerAlignment` (the host page size; 0 = no import).
+    host_page: u64,
     /// Built scene acceleration structures, keyed by ResourceId. A dispatch
     /// binding that resolves here is written as an AS descriptor, not a buffer.
     accels: Mutex<HashMap<u32, MvkAccel>>,
@@ -443,6 +461,13 @@ impl MoltenVkBackend {
             device_exts.push(khr::ray_query::NAME.as_ptr());
             device_exts.push(khr::deferred_host_operations::NAME.as_ptr());
         }
+        // VK_EXT_external_memory_host (enumerated normally — only the AS /
+        // ray-query pair is hidden by the loader): lets a BLAS build read
+        // page-aligned host memory in place instead of a copied upload.
+        let host_import_ok = device_ext_present(&instance, physical, ash::ext::external_memory_host::NAME);
+        if host_import_ok {
+            device_exts.push(ash::ext::external_memory_host::NAME.as_ptr());
+        }
 
         // Feature chain enabled at device creation. AS requires bufferDeviceAddress
         // + descriptorIndexing (core 1.2). Kept alive until create_device returns.
@@ -538,6 +563,15 @@ impl MoltenVkBackend {
         } else {
             None
         };
+        let (host_import, host_page) = if host_import_ok {
+            let mut hp = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut hp);
+            unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
+            (Some(ash::ext::external_memory_host::Device::new(&instance, &device)),
+             hp.min_imported_host_pointer_alignment.max(4096))
+        } else {
+            (None, 0)
+        };
 
         Ok(Self {
             submissions: AtomicU64::new(0),
@@ -564,6 +598,8 @@ impl MoltenVkBackend {
             total_gpu_ns: AtomicU64::new(0),
             ray_query,
             as_device,
+            host_import,
+            host_page,
             accels: Mutex::new(HashMap::new()),
             compute_accel_binds: Mutex::new(HashMap::new()),
             stalled: std::sync::atomic::AtomicBool::new(false),
@@ -631,6 +667,75 @@ impl MoltenVkBackend {
             std::ptr::null_mut()
         };
         Ok((buf, mem, mapped))
+    }
+
+    unsafe fn free_buffers(&self, bufs: Vec<(vk::Buffer, vk::DeviceMemory)>) {
+        for (b, m) in bufs {
+            self.device.destroy_buffer(b, None);
+            self.device.free_memory(m, None);
+        }
+    }
+
+    /// Whether a block at `ptr` can be bound in place: the extension is
+    /// present and the pointer is page-aligned. The import covers whole
+    /// pages, so the block's last page must be mapped to its end (true of
+    /// any page-aligned mmap / posix_memalign allocation of ≥ `len`).
+    pub fn can_import_host(&self, ptr: *const u8, len: u64) -> bool {
+        self.host_import.is_some() && self.host_page > 0
+            && (ptr as u64) % self.host_page == 0 && len > 0
+    }
+
+    /// Bind a page-aligned host block as a device-address buffer WITHOUT
+    /// copying (VK_EXT_external_memory_host; MoltenVK →
+    /// `newBufferWithBytesNoCopy`). The import is `len` rounded up to whole
+    /// pages. The caller's memory must stay mapped and unchanged until every
+    /// GPU use of the buffer has completed; `free_memory` releases only the
+    /// Vulkan side.
+    unsafe fn make_imported_buffer(&self, ptr: *const u8, len: u64, usage: vk::BufferUsageFlags)
+        -> Result<(vk::Buffer, vk::DeviceMemory), String>
+    {
+        let emh = self.host_import.as_ref().ok_or_else(|| "host import unsupported".to_string())?;
+        if !self.can_import_host(ptr, len) {
+            return Err(format!("host import: {ptr:?} is not page-aligned ({} B pages)", self.host_page));
+        }
+        let len = len.div_ceil(self.host_page) * self.host_page;
+        let dev = &self.device;
+        let ht = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
+        let mut props = vk::MemoryHostPointerPropertiesEXT::default();
+        (emh.fp().get_memory_host_pointer_properties_ext)(dev.handle(), ht, ptr as *const _, &mut props)
+            .result().map_err(|e| format!("host pointer properties: {e:?}"))?;
+        let mut ext = vk::ExternalMemoryBufferCreateInfo::default().handle_types(ht);
+        let bci = vk::BufferCreateInfo::default()
+            .size(len)
+            .usage(usage | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut ext);
+        let buf = dev.create_buffer(&bci, None).map_err(|e| format!("imported buffer create: {e:?}"))?;
+        let req = dev.get_buffer_memory_requirements(buf);
+        if req.size > len {
+            dev.destroy_buffer(buf, None);
+            return Err(format!("imported buffer needs {} B, host block is {len}", req.size));
+        }
+        let mt = self.find_mem_type(req.memory_type_bits & props.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            vk::MemoryPropertyFlags::empty())
+            .ok_or_else(|| "imported buffer: no host-visible memory type".to_string())?;
+        let mut flags = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let mut imp = vk::ImportMemoryHostPointerInfoEXT::default().handle_type(ht).host_pointer(ptr as *mut _);
+        let ai = vk::MemoryAllocateInfo::default()
+            .allocation_size(len)
+            .memory_type_index(mt)
+            .push_next(&mut flags)
+            .push_next(&mut imp);
+        let mem = match dev.allocate_memory(&ai, None) {
+            Ok(m) => m,
+            Err(e) => { dev.destroy_buffer(buf, None); return Err(format!("host memory import: {e:?}")); }
+        };
+        if let Err(e) = dev.bind_buffer_memory(buf, mem, 0) {
+            dev.destroy_buffer(buf, None); dev.free_memory(mem, None);
+            return Err(format!("imported buffer bind: {e:?}"));
+        }
+        Ok((buf, mem))
     }
 
     unsafe fn buffer_address(&self, buf: vk::Buffer) -> u64 {
@@ -748,6 +853,16 @@ impl MoltenVkBackend {
     /// skips — a fork follow-up before any AS-churning use.)
     pub fn build_scene_tlas(&self, tlas_id: ResourceId, blases: &[&[f32]],
                             instances: &[SceneInstance]) -> Result<(), String> {
+        self.build_scene_tlas_from(tlas_id, blases, instances, false)
+    }
+
+    /// `build_scene_tlas` with the vertex upload policy explicit. With
+    /// `import_host` every page-aligned slice (`can_import_host`; its last
+    /// page mapped to the end) is bound in place — no copy, the GPU reads
+    /// the caller's pages through unified memory — and only has to outlive
+    /// this call (the builds are waited on). Other slices are copied.
+    pub fn build_scene_tlas_from(&self, tlas_id: ResourceId, blases: &[&[f32]],
+                                 instances: &[SceneInstance], import_host: bool) -> Result<(), String> {
         let asd = self.as_device.as_ref()
             .ok_or_else(|| "ray-query not available on this device".to_string())?;
         if blases.is_empty() {
@@ -773,9 +888,12 @@ impl MoltenVkBackend {
             as_props.min_acceleration_structure_scratch_offset_alignment.max(256) as u64;
 
         let mut owned_all = owned;
+        let mut transient = Vec::new();
         let mut blas_handles: Vec<vk::AccelerationStructureKHR> = Vec::with_capacity(blases.len());
         let mut blas_addrs: Vec<u64> = Vec::with_capacity(blases.len());
-        let stats = unsafe { self.build_blases(asd, blases, scratch_align, &mut owned_all, &mut blas_handles, &mut blas_addrs, None)? };
+        let stats = unsafe { self.build_blases(asd, blases, scratch_align, &mut owned_all, &mut transient, &mut blas_handles, &mut blas_addrs, None, import_host)? };
+        // Synchronous builds: the inputs are done with once build_blases returns.
+        unsafe { self.free_buffers(transient) };
         let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: blas_handles, blas_addrs, owned: owned_all, tlas_owned: Vec::new(), pending: Vec::new() };
         self.accels.lock().unwrap().insert(tlas_id.raw(), accel);
         eprintln!("build_scene_tlas: {stats}");
@@ -791,11 +909,19 @@ impl MoltenVkBackend {
     /// stay valid.
     /// Build BLASes for `blases` (batched submits), appending handles,
     /// addresses and owned buffers. Returns a stats line.
+    /// `owned` receives the BLAS storage (lives with the scene); `transient`
+    /// receives the build-only buffers (vertex input, scratch), which the
+    /// caller frees once the builds have completed. With `import_host` a
+    /// page-aligned vertex slice is bound in place (no copy); anything else
+    /// is copied into a fresh host-visible buffer.
     unsafe fn build_blases(&self, asd: &ash::khr::acceleration_structure::Device, blases: &[&[f32]], scratch_align: u64,
                            owned: &mut Vec<(vk::Buffer, vk::DeviceMemory)>,
+                           transient: &mut Vec<(vk::Buffer, vk::DeviceMemory)>,
                            blas_handles: &mut Vec<vk::AccelerationStructureKHR>, blas_addrs: &mut Vec<u64>,
-                           fences: Option<&mut Vec<(vk::Fence, vk::CommandBuffer)>>) -> Result<String, String> {
+                           fences: Option<&mut Vec<(vk::Fence, vk::CommandBuffer)>>,
+                           import_host: bool) -> Result<String, String> {
         let mut fences = fences;
+        let mut imported = 0usize;
         let align_up = |a: u64, al: u64| (a + al - 1) & !(al - 1);
         let mut blas_bytes_total = 0u64;
         let mut vbytes_total = 0u64;
@@ -814,11 +940,19 @@ impl MoltenVkBackend {
             let vbytes = (vertices.len() * 4) as u64;
             vbytes_total += vbytes;
             tri_total += tri_count as u64;
-            let (vbuf, vmem, vmap) = self.make_as_buffer(vbytes,
-                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
-                true)?;
-            owned.push((vbuf, vmem));
-            std::ptr::copy_nonoverlapping(vertices.as_ptr() as *const u8, vmap, vbytes as usize);
+            let vusage = vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
+            let vptr = vertices.as_ptr() as *const u8;
+            let vbuf = if import_host && self.can_import_host(vptr, vbytes) {
+                let (vbuf, vmem) = self.make_imported_buffer(vptr, vbytes, vusage)?;
+                transient.push((vbuf, vmem));
+                imported += 1;
+                vbuf
+            } else {
+                let (vbuf, vmem, vmap) = self.make_as_buffer(vbytes, vusage, true)?;
+                transient.push((vbuf, vmem));
+                std::ptr::copy_nonoverlapping(vptr, vmap, vbytes as usize);
+                vbuf
+            };
             let vaddr = self.buffer_address(vbuf);
 
             let tri = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
@@ -852,7 +986,7 @@ impl MoltenVkBackend {
             let (bscratch, bscratch_mem, _) = self.make_as_buffer(
                 bsz.build_scratch_size + scratch_align,
                 vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
-            owned.push((bscratch, bscratch_mem));
+            transient.push((bscratch, bscratch_mem));
             let blas = asd.create_acceleration_structure(
                 &vk::AccelerationStructureCreateInfoKHR::default()
                     .buffer(blas_buf).size(bsz.acceleration_structure_size)
@@ -895,7 +1029,7 @@ impl MoltenVkBackend {
             pending.clear();
         }
         drop(geos);
-        Ok(format!("{} BLAS ({} tris), {:.1} MB verts (BLAS {:.2} MB)", blases.len(), tri_total, vbytes_total as f64 / 1e6, blas_bytes_total as f64 / 1e6))
+        Ok(format!("{} BLAS ({} tris), {:.1} MB verts ({imported} bound in place) (BLAS {:.2} MB)", blases.len(), tri_total, vbytes_total as f64 / 1e6, blas_bytes_total as f64 / 1e6))
     }
 
     /// Append BLASes to an existing scene (streaming / lazy detail): builds
@@ -918,7 +1052,9 @@ impl MoltenVkBackend {
         let acc = accels.get_mut(&tlas_id.raw()).ok_or_else(|| "add_scene_blases: unknown scene".to_string())?;
         let first = acc.blases.len() as u32;
         let (mut owned, mut handles, mut addrs) = (std::mem::take(&mut acc.owned), std::mem::take(&mut acc.blases), std::mem::take(&mut acc.blas_addrs));
-        let res = unsafe { self.build_blases(asd, blases, scratch_align, &mut owned, &mut handles, &mut addrs, None) };
+        let mut transient = Vec::new();
+        let res = unsafe { self.build_blases(asd, blases, scratch_align, &mut owned, &mut transient, &mut handles, &mut addrs, None, false) };
+        unsafe { self.free_buffers(transient) };
         acc.owned = owned; acc.blases = handles; acc.blas_addrs = addrs;
         res.map(|_| first)
     }
@@ -927,6 +1063,15 @@ impl MoltenVkBackend {
     /// submitted: the GPU builds them while frames render. The new indices
     /// must not be instanced until `poll_scene_blases` reports them done.
     pub fn add_scene_blases_async(&self, tlas_id: ResourceId, blases: &[&[f32]]) -> Result<u32, String> {
+        self.add_scene_blases_async_from(tlas_id, blases, false)
+    }
+
+    /// `add_scene_blases_async` with the upload policy explicit. With
+    /// `import_host`, a page-aligned slice (last page mapped to its end) is
+    /// bound in place and MUST stay valid and unchanged until
+    /// `poll_scene_blases` has reported this call's first index done (the
+    /// GPU reads it meanwhile).
+    pub fn add_scene_blases_async_from(&self, tlas_id: ResourceId, blases: &[&[f32]], import_host: bool) -> Result<u32, String> {
         let asd = self.as_device.as_ref()
             .ok_or_else(|| "ray-query not available on this device".to_string())?;
         for (i, v) in blases.iter().enumerate() {
@@ -943,9 +1088,17 @@ impl MoltenVkBackend {
         let first = acc.blases.len() as u32;
         let (mut owned, mut handles, mut addrs) = (std::mem::take(&mut acc.owned), std::mem::take(&mut acc.blases), std::mem::take(&mut acc.blas_addrs));
         let mut fences = Vec::new();
-        let res = unsafe { self.build_blases(asd, blases, scratch_align, &mut owned, &mut handles, &mut addrs, Some(&mut fences)) };
+        let mut transient = Vec::new();
+        let res = unsafe { self.build_blases(asd, blases, scratch_align, &mut owned, &mut transient, &mut handles, &mut addrs, Some(&mut fences), import_host) };
         acc.owned = owned; acc.blases = handles; acc.blas_addrs = addrs;
-        for (f, cb) in fences { acc.pending.push((f, cb, first, blases.len() as u32)); }
+        // The inputs go with the LAST batch: one queue, in-order fences, so
+        // when it signals every earlier batch of this call is done too.
+        let n = fences.len();
+        for (i, (f, cb)) in fences.into_iter().enumerate() {
+            let t = if i + 1 == n { std::mem::take(&mut transient) } else { Vec::new() };
+            acc.pending.push(PendingBuild { fence: f, cb, first, count: blases.len() as u32, transient: t });
+        }
+        if !transient.is_empty() { unsafe { self.free_buffers(transient) }; }
         res.map(|_| first)
     }
 
@@ -957,13 +1110,17 @@ impl MoltenVkBackend {
         let dev = &self.device;
         let mut done = Vec::new();
         let mut keep = Vec::with_capacity(acc.pending.len());
-        for (fence, cb, first, count) in acc.pending.drain(..) {
-            let signalled = unsafe { dev.get_fence_status(fence) }.map_err(|e| format!("fence status: {e:?}"))?;
+        for pb in acc.pending.drain(..) {
+            let signalled = unsafe { dev.get_fence_status(pb.fence) }.map_err(|e| format!("fence status: {e:?}"))?;
             if signalled {
-                unsafe { dev.destroy_fence(fence, None); dev.free_command_buffers(self.cmd_pool, &[cb]); }
-                done.push(first);
+                unsafe {
+                    dev.destroy_fence(pb.fence, None);
+                    dev.free_command_buffers(self.cmd_pool, &[pb.cb]);
+                    self.free_buffers(pb.transient);
+                }
+                done.push(pb.first);
             } else {
-                keep.push((fence, cb, first, count));
+                keep.push(pb);
             }
         }
         acc.pending = keep;
@@ -2607,11 +2764,15 @@ fn host_supports_portability_subset(
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
 ) -> bool {
+    device_ext_present(instance, physical, khr::portability_subset::NAME)
+}
+
+/// Whether the physical device enumerates device extension `want`.
+fn device_ext_present(instance: &ash::Instance, physical: vk::PhysicalDevice, want: &std::ffi::CStr) -> bool {
     let exts = match unsafe { instance.enumerate_device_extension_properties(physical) } {
         Ok(v)  => v,
         Err(_) => return false,
     };
-    let want = khr::portability_subset::NAME;
     exts.iter().any(|p| {
         p.extension_name_as_c_str().map(|s| s == want).unwrap_or(false)
     })
