@@ -88,8 +88,14 @@ struct MvkAccel {
     tlas:  vk::AccelerationStructureKHR,
     /// The BLASes this TLAS instances (kept alive with the TLAS).
     #[allow(dead_code)] blases: Vec<vk::AccelerationStructureKHR>,
-    /// Every buffer/memory backing the BLASes, TLAS, scratch and instances.
+    /// Their device addresses (the TLAS instance references), so the TLAS
+    /// alone can be rebuilt over a new instance set (`rebuild_scene_tlas`).
+    blas_addrs: Vec<u64>,
+    /// Buffers/memory backing the BLASes (live for the scene's lifetime).
     #[allow(dead_code)] owned: Vec<(vk::Buffer, vk::DeviceMemory)>,
+    /// Buffers/memory backing the current TLAS (instances, storage, scratch)
+    /// — replaced on rebuild.
+    tlas_owned: Vec<(vk::Buffer, vk::DeviceMemory)>,
 }
 
 /// One TLAS instance for [`MoltenVkBackend::build_scene_tlas`]: which BLAS
@@ -803,6 +809,51 @@ impl MoltenVkBackend {
                         .acceleration_structure(blas)));
             }
 
+            let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: blas_handles, blas_addrs, owned, tlas_owned: Vec::new() };
+            let stats = format!("{} BLAS ({} tris), {:.1} MB verts", blases.len(), tri_total, vbytes_total as f64 / 1e6);
+            self.accels.lock().unwrap().insert(tlas_id.raw(), accel);
+            eprintln!("build_scene_tlas: {stats} (BLAS {:.2} MB)", blas_bytes_total as f64 / 1e6);
+        }
+        self.rebuild_scene_tlas(tlas_id, instances)
+    }
+
+    /// Rebuild ONLY the top-level structure of scene `tlas_id` over a new
+    /// instance set (the BLASes stay): distance-LOD re-instancing as the
+    /// camera moves. The previous TLAS and its buffers are destroyed first —
+    /// frames are synchronous (the previous frame's fence was waited on), so
+    /// nothing in flight references it. Through the MoltenVK fork the freed
+    /// TLAS slot is reused by the new one (free-list), so BLAS slot indices
+    /// stay valid.
+    pub fn rebuild_scene_tlas(&self, tlas_id: ResourceId, instances: &[SceneInstance]) -> Result<(), String> {
+        let asd = self.as_device.as_ref()
+            .ok_or_else(|| "ray-query not available on this device".to_string())?;
+        let mut as_props = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
+        let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut as_props);
+        unsafe { self.instance.get_physical_device_properties2(self.physical, &mut p2) };
+        let scratch_align =
+            as_props.min_acceleration_structure_scratch_offset_alignment.max(256) as u64;
+        let align_up = |a: u64, al: u64| (a + al - 1) & !(al - 1);
+        let (blas_addrs, old_tlas, old_owned) = {
+            let mut accels = self.accels.lock().unwrap();
+            let a = accels.get_mut(&tlas_id.raw()).ok_or_else(|| format!("scene {tlas_id} not built"))?;
+            for inst in instances {
+                if inst.blas as usize >= a.blas_addrs.len() {
+                    return Err(format!("instance references BLAS {} of {}", inst.blas, a.blas_addrs.len()));
+                }
+            }
+            let old = std::mem::replace(&mut a.tlas, vk::AccelerationStructureKHR::null());
+            (a.blas_addrs.clone(), old, std::mem::take(&mut a.tlas_owned))
+        };
+        unsafe {
+            let _guard_idle = ();
+            if old_tlas != vk::AccelerationStructureKHR::null() {
+                asd.destroy_acceleration_structure(old_tlas, None);
+                for (b, m) in old_owned {
+                    self.device.destroy_buffer(b, None);
+                    self.device.free_memory(m, None);
+                }
+            }
+            let mut owned: Vec<(vk::Buffer, vk::DeviceMemory)> = Vec::new();
             // ---- instances ----
             let mut inst_bytes = vec![0u8; instances.len() * 64];
             for (i, inst) in instances.iter().enumerate() {
@@ -874,15 +925,12 @@ impl MoltenVkBackend {
                 asd.cmd_build_acceleration_structures(cb, &[tbi], &[&[trange]]);
             })?;
 
-            let as_mb = (blas_bytes_total + tsz.acceleration_structure_size
-                + tsz.build_scratch_size + inst_bytes.len() as u64 + vbytes_total) as f64 / 1e6;
-            eprintln!("build_scene_tlas: {} BLAS ({} tris), {} instances, AS+inst+verts = {:.1} MB \
-                       (BLAS {:.2} / TLAS {:.2} MB)", blases.len(), tri_total, instances.len(), as_mb,
-                      blas_bytes_total as f64 / 1e6,
-                      tsz.acceleration_structure_size as f64 / 1e6);
-
-            self.accels.lock().unwrap().insert(tlas_id.raw(),
-                MvkAccel { tlas, blases: blas_handles, owned });
+            let mut accels = self.accels.lock().unwrap();
+            let a = accels.get_mut(&tlas_id.raw()).unwrap();
+            a.tlas = tlas;
+            a.tlas_owned = owned;
+            log::debug!("rebuild_scene_tlas: {} instances, TLAS {:.2} MB", instances.len(),
+                        tsz.acceleration_structure_size as f64 / 1e6);
         }
         Ok(())
     }
@@ -2619,6 +2667,53 @@ mod tests {
         assert!(!fresh.is_stalled());
         std::mem::forget(be);
         std::env::remove_var("AQUEDUCT_GPU_WAIT_MS");
+    }
+
+    /// Three BLASes and many instances: the ray (from (0,0,-1) along +z)
+    /// must reach the ONE instance of BLAS 2 placed under it (t=1) through
+    /// 20 000 decoy instances of BLAS 0 parked far away and one BLAS-1
+    /// instance behind it (t=3); then, with BLAS 1 under the ray and BLAS 2
+    /// behind, t must be 1 again with custom index 5. Guards the fork's
+    /// instance→BLAS slot resolution beyond two BLASes and the
+    /// large-instance-count path Orbis's tree inventory uses.
+    #[test]
+    fn three_blas_many_instances_resolve() {
+        use aqueduct_gpu::frame::FrameBuilder;
+        use aqueduct_gpu::ids::IdNamespace;
+        let Some(be) = try_init() else { return; };
+        if !be.has_ray_query() { return; }
+        let tri_at = |z: f32| -> [f32; 9] { [-0.5, -0.5, z,  0.5, -0.5, z,  0.0, 0.5, z] };
+        let (a, b, c) = (tri_at(0.0), tri_at(0.0), tri_at(0.0));
+        let xf = |dx: f32, dz: f32| [1.0, 0.0, 0.0, dx,  0.0, 1.0, 0.0, 0.0,  0.0, 0.0, 1.0, dz];
+        const RQ_SPV: &[u8] = include_bytes!("test_ray_query.comp.spv");
+        let pipe = ResourceId::new(IdNamespace::IcdRuntime, 0xD1);
+        be.create_compute_pipeline_rt(pipe, RQ_SPV, 2, 0, &[0]).expect("rt pipeline");
+        let res = ResourceId::new(IdNamespace::IcdRuntime, 0xD2);
+        be.buffer_created(res, 16);
+        for (k, near_blas, far_blas, want_custom) in [(0u32, 2u32, 1u32, 9u32), (1, 1, 2, 5)] {
+            let mut inst: Vec<SceneInstance> = (0..20_000)
+                .map(|i| SceneInstance { blas: 0, custom_index: 1, transform: xf(100.0 + i as f32 * 0.01, 0.0) })
+                .collect();
+            inst.push(SceneInstance { blas: far_blas, custom_index: 7, transform: xf(0.0, 2.0) });
+            inst.push(SceneInstance { blas: near_blas, custom_index: want_custom, transform: xf(0.0, 0.0) });
+            let tlas = ResourceId::new(IdNamespace::IcdRuntime, 0xD8 + k);
+            be.build_scene_tlas(tlas, &[&a, &b, &c], &inst).expect("build scene");
+            be.buffer_write(res, 0, &[0u8; 16]).expect("zero");
+            let mut fb = FrameBuilder::new(4096);
+            fb.push(FrameOp::BindPipeline, &pipe.raw().to_le_bytes()).unwrap();
+            fb.push_bind_storage_buffers(&[(1, res.raw())]).unwrap();
+            be.bind_compute_accel(0, tlas);
+            fb.push_dispatch(aqueduct_gpu::frame::DispatchCmd { group_count_x: 1, group_count_y: 1, group_count_z: 1 }).unwrap();
+            assert!(be.submit_frame(ResourceId::new(IdNamespace::IcdRuntime, 0xD3), 1, fb.as_bytes()));
+            let out = be.buffer_read_bytes(res, 0, 16).expect("readback");
+            let hit = u32::from_le_bytes(out[0..4].try_into().unwrap());
+            let t = f32::from_le_bytes(out[4..8].try_into().unwrap());
+            let custom = u32::from_le_bytes(out[12..16].try_into().unwrap());
+            eprintln!("3-BLAS scene {k}: hit={hit} t={t:.3} custom={custom} (want t 1, custom {want_custom})");
+            assert_eq!(hit, 1, "scene {k}");
+            assert!((t - 1.0).abs() < 0.2, "scene {k}: t={t}");
+            assert_eq!(custom, want_custom, "scene {k}: wrong instance resolved");
+        }
     }
 
     /// Tier-3 level-1: a render-pass clear + image→buffer readback runs
