@@ -1021,6 +1021,89 @@ property browsers can only approximate into a hard, mechanically checkable asser
 
 ---
 
+## 7a. Exclusion audit (2026-09-24)
+
+The profile's opening rule is that a feature is excluded only where admitting it would
+break a guarantee. This audit
+holds every exclusion to that rule. Each is tagged with the guarantee it protects, or
+**none: cost** where the only reason is implementation effort — and "none: cost" is a
+backlog, not a decision. Evidence is from the 78-document corpus (Wikipedia, MDN, W3C and
+WHATWG specs, rustdoc, GitHub, government, news in five languages, commerce, academic,
+forums): the normalizer's count of declarations it had to drop, unless noted.
+
+### A. Protects a guarantee — kept
+
+| exclusion | guarantee | note |
+|---|---|---|
+| `<script>`, `<canvas>`, event handlers | G6, G1 | the measurement vehicle for fingerprinting |
+| `<iframe>`/`<object>`/`<embed>` | composition | Limen composes, at the jail boundary |
+| system colours; host media features (`hover`, `pointer`, `device-*`) | G6 | they report the machine |
+| `@import` beyond a bounded depth | G3 | |
+| `<base>` | G4 | ambient rewriting of every link |
+| animations and transitions (71,275 drops) | G1 | a static reading renders the initial state; nothing is lost |
+| `order`, `*-reverse`, `grid-auto-flow: dense` (289) | G5 | visual order diverging from reading order; the one exclusion here worth re-arguing |
+| unbounded measurement (tables, images) | G2, G3 | not excluded — moved offline (§3.13) |
+
+### B. Outside the profile but COMPILED by the producer — nothing is lost
+
+Shorthands, `!important`, the descendant combinator, cascade layers, `var()`, logical
+properties, named grid lines/areas, media-query range syntax, `display: contents`,
+float ROWS (as inline-block), and — from 2026-09-24 — `box-sizing` (§3.3; 1,725 sizes in
+28 documents). The renderer stays small; the normalizer carries the cascade.
+`unset` (646 drops) and font-size keywords belong here and are **not yet compiled**.
+
+### C. None: cost — the backlog, by evidence
+
+| feature | evidence | what it costs a reader today |
+|---|---|---|
+| generated content, `::before`/`::after` | 95,698 | separators (Wikipedia's "·"), breadcrumb arrows, quotes, icon glyphs; many are empty clearfixes — the subset with text or counters is what matters |
+| margin collapsing | not a property; affects every document with adjacent block margins; unmeasured | vertical rhythm: gaps up to twice the author's. G4 argues against collapsing IN the renderer; the producer can compile it to literal margins, like box-sizing |
+| floats beside text (not rows) | 1,400 + 818 `clear` | Wikipedia's infobox and thumbnails come out full-width, the text below instead of beside |
+| masks | 2,577 | icons painted through a mask; today the box paints nothing |
+| `box-shadow` lists, spread, inset | 1,665 | shadows missing |
+| `overflow-wrap: anywhere` | 1,667 | long URLs overflow instead of breaking; near-free to admit |
+| `font-variant` | 1,270 | small caps render as regular |
+| counters | 1,013 | ordered lists styled by counters lose their numbers |
+| `text-overflow: ellipsis` | 905 | truncated text is cut, not ellipsised |
+| `border-collapse` | 895 | tables draw doubled borders |
+| `hyphens` | 791 | deferred on a dependency (dictionaries), §3.7 |
+| `word-break` | 780 | CJK and code break differently |
+| `line-clamp` | 519 | clamped previews show every line instead of the first few |
+| paint effects: `clip-path` 344, `mix-blend-mode` 201, `filter` 21, `backdrop-filter` 12 | 578 | decorative |
+| `object-position` | 188 | image crops anchored at the centre |
+| `position: sticky` | 111 | the element stays in flow |
+| `text-shadow` | 94 | |
+| `rowspan` | 44 cells in 3 documents (attribute; §3.9) | the next table decision |
+| multi-column layout | 33 | |
+| `text-decoration-thickness`/`-offset`/`-skip-ink` | 51,218 | cosmetic, cheap |
+
+### D. Irrelevant to a static reading — the drop is correct
+
+Scroll behaviour and snapping (63,884), `cursor` (4,486), `user-select` (14,342), print
+pagination (`break-*`, `widows`, `orphans`: 11,886), font smoothing (2,890), `appearance`
+(1,398), and hover/focus states on elements other than the one styled (3,856).
+
+### E. Not exclusions at all: producer GAPS
+
+The profile can say these; the normalizer loses them. They are bugs, ranked first because
+they cost no profile decision:
+
+| gap | evidence |
+|---|---|
+| a custom property whose value is `initial` substitutes the fallback BESIDE it (`color: initial #a4cefe`) | 15,972 |
+| a media query LIST (an OR: `screen, print`) is refused, though the renderer evaluates lists | ~7,800 of 14,627 refused queries |
+| selectors not understood (`:lang()` and others) | 4,886 |
+| HTML presentational attributes (`width`/`height` on tables and cells) | 3,179 |
+| unresolved custom properties (cycles or depth — to be checked) | 1,898 |
+| colour spellings (`#rgba`) | 1,135 |
+| `background-position` and `font` shorthands | 765 + 623 |
+| `unset` | 646 |
+
+**Order of work:** section E, then margin collapsing and floats (compiled by the producer
+where they can be, like box-sizing), then generated content with text and counters, then
+the cheap rows of C by count. Each admission is checked against the guarantees before it
+lands.
+
 ## 8. Open questions
 
 1. ~~**Stylesheet, grid and custom-property ceilings still have no corpus signal.**~~
