@@ -632,6 +632,16 @@ impl<'a> Cx<'a> {
         // OTHER axis is not visible — so one non-visible axis clips both, and
         // there is no such thing as clipping in x alone.
         let clips = kw(s, "overflow-x") != "visible" || kw(s, "overflow-y") != "visible";
+        // ★ The ROOT's overflow belongs to the VIEWPORT (CSS Overflow 3 §3.3),
+        // and so does the body's when the root's is `visible`: the page
+        // scrolls, it is not cut. Clipping the root box instead cut Nature's
+        // whole article — `html { height: 100%; overflow-y: scroll }` — to
+        // one screen, and Apple's store page the same way.
+        let root = self.dom.element_children(self.dom.root()).into_iter().next();
+        let to_viewport = Some(h) == root || (self.dom.tag(h) == Some("body") && root.is_some_and(|r|
+            self.dom.get(h).and_then(|n| n.parent) == Some(r)
+            && self.st(r).is_some_and(|rs| kw(rs, "overflow-x") == "visible" && kw(rs, "overflow-y") == "visible")));
+        let clips = clips && !to_viewport;
         if clips {
             // ★ A `max-height` clips too. It is not a definite height — the
             // box may end up shorter — but it is an upper bound the content
@@ -2626,6 +2636,20 @@ mod tests {
         let x = |t: &str| o.scene.runs.iter().find(|r| r.text == t).map(|r| r.x).unwrap();
         assert!(x("Submit") - x("Search") > 50 * PX, "each link is as wide as its word plus padding");
         assert!(x("Donate") - x("Submit") > 50 * PX);
+    }
+
+    /// ★ The root's (and body's) overflow applies to the VIEWPORT: a page
+    /// with `html { height: 100%; overflow-y: scroll }` scrolls; it is not
+    /// cut to one screen. A div with the same style IS clipped (control).
+    #[test]
+    fn root_overflow_scrolls_the_viewport_instead_of_clipping() {
+        let long = "<p>line</p>".repeat(80);
+        let o = render(&format!("<style>html {{ height: 100%; overflow-y: scroll }}</style>{long}<p>LAST</p>"));
+        let last = o.scene.runs.iter().position(|r| r.text == "LAST").expect("text");
+        assert!(o.scene.run_attrs[last].0.is_none(), "the last line is not clipped away by the root");
+        let c = render(&format!("<style>div {{ height: 300px; overflow-y: scroll }}</style><div>{long}<p>LAST</p></div>"));
+        let last = c.scene.runs.iter().position(|r| r.text == "LAST").expect("text");
+        assert!(c.scene.run_attrs[last].0.is_some(), "an ordinary box with the same style DOES clip");
     }
 
     /// ★ HTML's own hiding: `[hidden]` and a closed `<dialog>` are not

@@ -91,6 +91,8 @@ tr { display: table-row }
 td, th { display: table-cell; padding-top: 1px; padding-right: 1px; padding-bottom: 1px; padding-left: 1px }
 th { font-weight: 700 }
 img { display: inline-block }
+/* An inline <svg> is a replaced-like box: its width/height hints size it. */
+svg { display: inline-block }
 body { margin-top: 8px; margin-right: 8px; margin-bottom: 8px; margin-left: 8px }
 h1 { font-size: 2em; font-weight: 700; margin-top: 0.67em; margin-bottom: 0.67em }
 h2 { font-size: 1.5em; font-weight: 700; margin-top: 0.83em; margin-bottom: 0.83em }

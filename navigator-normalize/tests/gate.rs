@@ -531,14 +531,161 @@ fn an_image_declares_only_the_natural_sizing_it_has() {
     inputs.images.insert("icon.svg".into(), navigator_normalize::ImageSize { width: None, height: None, ratio: Some((1, 1)) });
     inputs.images.insert("photo.png".into(), (200, 100).into());
     let src = r#"<html><head><style>img { display: block; background-color: #ff0000 } .m { max-height: 70px }</style></head>
-        <body><img class="m" src="w100.svg" width="999"><img src="icon.svg"><img src="photo.png"></body></html>"#;
+        <body><img class="m" src="w100.svg"><img src="icon.svg"><img src="photo.png"></body></html>"#;
     let (out, _) = normalize(src, &inputs);
     assert!(out.contains(r#"src="w100.svg" width="100" natural-ratio="none""#) || (out.contains(r#"width="100""#) && out.contains(r#"natural-ratio="none""#)), "{out}");
-    assert!(!out.contains("999"), "the natural declaration replaces the attribute: {out}");
     assert!(out.contains(r#"natural-ratio="1/1""#), "{out}");
     assert!(out.contains(r#"width="200""#) && out.contains(r#"height="100""#), "{out}");
     let o = render_html(&out, &fonts, &Env::default());
     assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
     let sizes: Vec<(i64, i64)> = o.scene.rects.iter().filter(|r| r.rgba == 0xff0000ff).map(|r| (r.w / 64, r.h / 64)).collect();
     assert_eq!(sizes, vec![(100, 70), (150, 150), (200, 100)], "width kept; ratio alone in 300×150; a raster image its own size");
+}
+
+/// ★ CSS Variables 1: a custom property of `initial` is the guaranteed-
+/// invalid value, and a property referencing it is invalid too, so `var()`
+/// takes its fallback. The postcss light-dark polyfill depends on it; taking
+/// `initial` literally produced `color: initial #a4cefe` (15,972 drops).
+#[test]
+fn a_guaranteed_invalid_custom_property_falls_back() {
+    let src = r#"<html><head><style>
+      :root { --csstools-color-scheme--light: initial }
+      @media (prefers-color-scheme: dark) { :root { --csstools-color-scheme--light: ; } }
+      p { --toggle: var(--csstools-color-scheme--light) #000000; color: var(--toggle, #a4cefe) }
+      em { --a: var(--b); --b: var(--a); color: var(--a, #00aa00) }
+    </style></head><body><p>x <em>y</em></p></body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    let base: Vec<&str> = out.lines().take_while(|l| !l.starts_with("@media")).collect();
+    assert!(base.iter().any(|l| l.contains("color: #a4cefe")), "light: the toggle is invalid, so the fallback wins:\n{out}");
+    assert!(out.contains("color: #000000"), "dark: the toggle is ` #000000`:\n{out}");
+    assert!(base.iter().any(|l| l.contains("color: #00aa00")), "a cycle is invalid, so the fallback wins:\n{out}");
+    assert!(!out.contains("initial #"), "{out}");
+    assert!(!report.dropped.keys().any(|k| k.contains("initial")), "{:?}", report.dropped);
+    assert!(refusals(&out).is_empty());
+}
+
+/// ★ A media query LIST is an OR, and the renderer evaluates lists:
+/// `screen, print` applies everywhere; `print` leaves an OR; the output of
+/// every form must still be accepted by the profile.
+#[test]
+fn media_query_lists_are_admitted_member_by_member() {
+    let src = r#"<html><head><style>
+      @media screen, print { p { color: #111111 } }
+      @media print, (max-width: 2000px) { em { color: #222222 } }
+      @media (max-width: 100px), (orientation: landscape) { b { color: #333333 } }
+      @media only print, only all and (prefers-color-scheme: no-preference) { i { color: #444444 } }
+    </style></head><body><p>a <em>b</em> <b>c</b> <i>d</i></p></body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    let r = refusals(&out);
+    assert!(r.is_empty(), "the profile accepts what the normalizer emits: {r:?}\n{out}");
+    let base: Vec<&str> = out.lines().take_while(|l| !l.starts_with("@media")).collect();
+    assert!(base.iter().any(|l| l.contains("#111111")), "screen, print: unconditional\n{out}");
+    assert!(out.contains("#222222") && out.contains("#333333"), "{out}");
+    assert!(!out.contains("#444444"), "an obsolete value never matches, so its rules go: {out}");
+    assert!(!report.dropped.keys().any(|k| k.contains("screen, print")), "{:?}", report.dropped);
+}
+
+/// ★ Static pseudo-classes the normalizer can decide from the DOM:
+/// `:lang()` (4,749 drops in the corpus), `:dir()`, `:nth-of-type()` (which
+/// was counted as `:nth-child`), and `:where()`, whose specificity is ZERO.
+#[test]
+fn static_selectors_lang_dir_nth_of_type_and_where() {
+    let src = r#"<html lang="en-GB"><head><style>
+      :lang(en) .a { color: #111111 }
+      :lang(fr) .a { color: #990000 }
+      :lang("*-GB") .gb { color: #121212 }
+      .r:dir(ltr) { color: #990000 }
+      .r:dir(rtl) { color: #222222 }
+      /* (`:dir(ltr) .r` would ALSO match here, via <html>: a descendant
+         selector tests every ancestor, in a browser too.) */
+      li:nth-of-type(2) { color: #333333 }
+      :where(.w) { color: #990000 }
+      p { color: #444444 }
+      :-webkit-any(.k) { color: #555555 }
+    </style></head><body>
+      <p class="a">en</p><p class="gb">gb</p>
+      <div dir="rtl"><span class="r">rtl</span></div>
+      <ul><h2>not an li</h2><li>one</li><li class="second">two</li></ul>
+      <p class="w">where</p><span class="k">k</span>
+    </body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    assert!(!report.dropped.keys().any(|k| k.contains("not understood")), "{:?}", report.dropped);
+    assert!(!out.contains("#990000"), "no rule for the wrong language or direction, and :where() loses to `p`:\n{out}");
+    for c in ["#111111", "#121212", "#222222", "#333333", "#444444", "#555555"] { assert!(out.contains(c), "missing {c}:\n{out}") }
+    // nth-of-type counts only <li>: the second <li> is `.second`, not the first.
+    let o = render_html(&out, &FontSet::load().unwrap(), &Env::default());
+    let color_of = |t: &str| o.scene.runs.iter().find(|r| r.text == t).map(|r| r.rgba).unwrap();
+    assert_eq!(color_of("two"), 0x333333ff, "the second li");
+    assert_ne!(color_of("one"), 0x333333ff, "the first li is not nth-of-type(2), though it is nth-child(2)");
+    assert_eq!(color_of("where"), 0x444444ff, "`p` beats a zero-specificity :where(.w)");
+    assert!(refusals(&out).is_empty());
+}
+
+/// ★ PRESENTATIONAL HINTS (HTML §15), below every author rule: a legacy
+/// table's `width`/`bgcolor`/`cellpadding`/`border`/`align`/`valign`, and an
+/// `<img>`'s own `width`/`height` — which a browser shows at that size.
+#[test]
+fn presentational_attributes_become_css_below_author_rules() {
+    let fonts = FontSet::load().expect("pinned font set");
+    let mut inputs = Inputs::default();
+    inputs.images.insert("big.png".into(), (400, 200).into());
+    let src = r##"<html><head><style>.author { background-color: #00ff00 }</style></head><body bgcolor="#ffffee">
+      <table width="300" cellpadding="5" border="1" bgcolor="ff0000">
+        <tr><td align="center" valign="top" width="100">a</td><td class="author" bgcolor="#0000ff">b</td></tr>
+      </table>
+      <img src="big.png" width="100" height="50">
+    </body></html>"##;
+    let (out, report) = normalize_and_measure(src, &inputs, &fonts, &Env::default());
+    assert!(!report.dropped.keys().any(|k| k.starts_with("presentational attribute `")), "{:?}", report.dropped);
+    for want in ["background-color: #ffffee", "background-color: #ff0000", "text-align: center", "vertical-align: top",
+                 "padding-left: 5px", "border-left-width: 1px"] {
+        assert!(out.contains(want), "missing {want}:\n{out}");
+    }
+    // An author rule beats the hint: the cell is green, not blue.
+    assert!(out.contains("background-color: #00ff00") && !out.contains("#0000ff"), "{out}");
+    assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+    // The image is shown at the AUTHOR's size, not its natural 400×200.
+    assert!(out.contains("width: 100px") && out.contains("height: 50px"), "{out}");
+}
+
+/// ★ Colour spellings the profile can say once expanded: `#rgba` (3,820
+/// drops) and `light-dark()` (868) — light in the base, dark under
+/// `prefers-color-scheme: dark`, exactly where a dark reader looks for it.
+#[test]
+fn rgba_hex_and_light_dark_colours_are_compiled() {
+    let fonts = FontSet::load().expect("pinned font set");
+    let src = r##"<html><head><style>
+      p { color: light-dark(#0d0f12, #f2f5fa); border-top-color: #f008 }
+      em { background-color: #0000 }
+    </style></head><body><p>x <em>y</em></p></body></html>"##;
+    let (out, report) = normalize(src, &Inputs::default());
+    assert!(out.contains("border-top-color: #ff000088") && out.contains("background-color: #00000000"), "{out}");
+    let base: Vec<&str> = out.lines().take_while(|l| !l.starts_with("@media")).collect();
+    assert!(base.iter().any(|l| l.contains("color: #0d0f12")), "light in the base:\n{out}");
+    assert!(!report.dropped.keys().any(|k| k.contains("light-dark") || k.contains("#f008") || k.contains("#0000`")), "{:?}", report.dropped);
+    assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+    // A DARK reader gets the dark value.
+    let dark = Env { dark: true, ..Env::default() };
+    let o = render_html(&out, &fonts, &dark);
+    assert_eq!(o.scene.runs.iter().find(|r| r.text == "x").map(|r| r.rgba), Some(0xf2f5faff), "dark:\n{out}");
+    let l = render_html(&out, &fonts, &Env::default());
+    assert_eq!(l.scene.runs.iter().find(|r| r.text == "x").map(|r| r.rgba), Some(0x0d0f12ff));
+}
+
+/// ★ Inline SVG: the outer <svg>'s width/height size its box (≈1,900 icons
+/// in the corpus had theirs dropped and collapsed to nothing), and every
+/// attribute INSIDE it — geometry, not presentation — is kept.
+#[test]
+fn inline_svg_keeps_its_geometry_and_reserves_its_box() {
+    let fonts = FontSet::load().expect("pinned font set");
+    let src = r#"<html><head><style>svg { background-color: #ff0000 }</style></head><body>
+      <p>icon <svg width="24" height="20" viewBox="0 0 24 20"><rect x="2" y="3" width="10" height="7"/></svg> after</p></body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    assert!(out.contains(r#"width="10""#) && out.contains(r#"height="7""#), "the rect keeps its geometry: {out}");
+    assert!(out.contains("width: 24px") && out.contains("height: 20px"), "the svg's box: {out}");
+    assert!(!report.dropped.keys().any(|k| k.starts_with("presentational attribute `")), "{:?}", report.dropped);
+    assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+    let o = render_html(&out, &fonts, &Env::default());
+    let red: Vec<(i64, i64)> = o.scene.rects.iter().filter(|r| r.rgba == 0xff0000ff).map(|r| (r.w / 64, r.h / 64)).collect();
+    assert_eq!(red, vec![(24, 20)], "the icon reserves 24×20");
 }

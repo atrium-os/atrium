@@ -208,6 +208,19 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
                 }
                 for d in &rule.decls {
                     let value = substitute(&d.value, scope, 0);
+                    // ★ `light-dark(L, D)` (CSS Color 5): the LIGHT value here,
+                    // and the dark one in a `prefers-color-scheme: dark`
+                    // block below — the same shape the dark-mode custom
+                    // properties already compile to.
+                    let dark_value = has_light_dark(&value).then(|| pick_light_dark(&value, true));
+                    let value = pick_light_dark(&value, false);
+                    if let (Some(dv), true) = (&dark_value, media.is_empty()) {
+                        let mut block = BTreeMap::new();
+                        for (prop, v) in to_longhands(&d.name, dv, inputs, &mut report) {
+                            block.insert(prop, ((d.important, layer_rank(rule.layer, sheet.layers.len(), d.important), spec, rule.order), v));
+                        }
+                        if !block.is_empty() { pending.push(("(prefers-color-scheme: dark)".to_string(), block)) }
+                    }
                     for (prop, v) in to_longhands(&d.name, &value, inputs, &mut report) {
                         let pri: Priority = (d.important, layer_rank(rule.layer, sheet.layers.len(), d.important), spec, rule.order);
                         match slot.get(&prop) {
@@ -223,7 +236,8 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
                     if media.is_empty() && uses_var(&d.value) {
                         for ctx in &var_contexts {
                             let Some(cs) = custom.get(&(*h, ctx.clone())) else { continue };
-                            let alt = substitute(&d.value, cs, 0);
+                            // light-dark() picks its side by THIS context.
+                            let alt = pick_light_dark(&substitute(&d.value, cs, 0), ctx.contains("prefers-color-scheme: dark"));
                             if alt == value { continue }
                             let mut block = BTreeMap::new();
                             for (prop, v) in to_longhands(&d.name, &alt, inputs, &mut report) {
@@ -253,7 +267,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         let scope = scope.clone();
         let slot = resolved.entry((*h, String::new(), String::new())).or_default();
         for d in &decls {
-            let value = substitute(&d.value, &scope, 0);
+            let value = pick_light_dark(&substitute(&d.value, &scope, 0), false);
             for (prop, v) in to_longhands(&d.name, &value, inputs, &mut report) {
                 let pri: Priority = (d.important, usize::MAX, (u32::MAX, 0, 0), usize::MAX);
                 slot.insert(prop, (pri, v));
@@ -294,6 +308,118 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
             }
         }
         for k in kids { if let Some(n) = dom.get_mut(k) { n.parent = Some(parent) } }
+    }
+
+    // ★ PRESENTATIONAL HINTS (HTML §15 "Rendering"; CSS Cascade 5 puts them
+    // in their own origin, BELOW every author rule). `<td width=100>`,
+    // `bgcolor`, `align`, `valign`, `cellpadding`, `<table border>`, an
+    // `<img>`'s own width and height: each maps to a CSS declaration, and
+    // was dropped instead — 4,288 of them in the corpus, plus every `<img
+    // width height>`, which the natural-size declaration overwrote. A hint
+    // goes in only where no author rule set that property.
+    let mut translated: std::collections::BTreeSet<(Handle, &'static str)> = Default::default();
+    {
+        let len = |v: &str| -> Option<String> {
+            let v = v.trim();
+            if let Some(p) = v.strip_suffix('%') { return p.trim().parse::<f64>().ok().filter(|n| *n >= 0.0).map(|n| format!("{n}%")) }
+            let num: String = v.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+            num.parse::<f64>().ok().filter(|n| *n >= 0.0).map(|n| format!("{n}px"))
+        };
+        let color = |v: &str| -> Option<String> {
+            let v = v.trim();
+            if v.starts_with('#') && v.len() > 1 { return Some(v.to_ascii_lowercase()) }
+            if (v.len() == 6 || v.len() == 3) && v.chars().all(|c| c.is_ascii_hexdigit()) { return Some(format!("#{}", v.to_ascii_lowercase())) }
+            v.chars().all(|c| c.is_ascii_alphabetic()).then(|| v.to_ascii_lowercase()).filter(|x| !x.is_empty())
+        };
+        // The nearest <table> above a cell, for the attributes a table
+        // passes down (cellpadding, border).
+        let table_of = |h: Handle| -> Option<Handle> {
+            let mut cur = dom.get(h).and_then(|n| n.parent);
+            while let Some(x) = cur {
+                if dom.tag(x) == Some("table") { return Some(x) }
+                cur = dom.get(x).and_then(|n| n.parent);
+            }
+            None
+        };
+        let mut hints: Vec<(Handle, &str, String)> = vec![];
+        for h in &els {
+            let tag = dom.tag(*h).unwrap_or("").to_ascii_lowercase();
+            let a = |n: &str| dom.attr(*h, n).map(str::to_string);
+            let mut hint = |attr: &'static str, prop: &'static str, v: Option<String>| {
+                if let Some(v) = v { hints.push((*h, prop, v)); translated.insert((*h, attr)); }
+            };
+            let t = tag.as_str();
+            // An inline <svg>'s width/height are presentation attributes too:
+            // the icon's box. Only the OUTER svg — shapes inside it keep their
+            // own geometry, untouched (below).
+            let outer_svg = t == "svg" && !dom.get(*h).and_then(|n| n.parent).is_some_and(|p| dom.is_foreign(p));
+            if matches!(t, "table" | "td" | "th" | "col" | "img" | "hr") || outer_svg { hint("width", "width", a("width").and_then(|v| len(&v))) }
+            if matches!(t, "table" | "td" | "th" | "tr" | "img") || outer_svg { hint("height", "height", a("height").and_then(|v| len(&v))) }
+            if matches!(t, "body" | "table" | "tr" | "td" | "th") { hint("bgcolor", "background-color", a("bgcolor").and_then(|v| color(&v))) }
+            if t == "body" { hint("text", "color", a("text").and_then(|v| color(&v))) }
+            if let Some(al) = a("align").map(|v| v.trim().to_ascii_lowercase()) {
+                match (t, al.as_str()) {
+                    ("td" | "th" | "tr" | "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "thead" | "tbody" | "tfoot" | "caption",
+                     "left" | "right" | "center" | "justify") => hint("align", "text-align", Some(al.clone())),
+                    ("table" | "img", "left" | "right") => hint("align", "float-marker", Some(al.clone())),
+                    ("table" | "hr", "center") => { hint("align", "margin-left", Some("auto".into())); hint("align", "margin-right", Some("auto".into())) }
+                    ("img", "top" | "middle" | "bottom" | "baseline") => hint("align", "vertical-align", Some(al.clone())),
+                    ("img", "absmiddle") => hint("align", "vertical-align", Some("middle".into())),
+                    _ => {}
+                }
+            }
+            if matches!(t, "td" | "th" | "tr") {
+                hint("valign", "vertical-align", a("valign").map(|v| v.trim().to_ascii_lowercase()).filter(|v| matches!(v.as_str(), "top" | "middle" | "bottom" | "baseline")));
+            }
+            if matches!(t, "td" | "th") && a("nowrap").is_some() { hint("nowrap", "white-space", Some("nowrap".into())) }
+            if t == "table" { hint("cellspacing", "border-spacing", a("cellspacing").and_then(|v| len(&v)).map(|v| format!("{v} {v}"))) }
+            if t == "img" {
+                let px = |n: &str| a(n).and_then(|v| len(&v)).filter(|v| v.ends_with("px"));
+                if let Some(b) = px("border") { for side in ["top", "right", "bottom", "left"] {
+                    hints.push((*h, ["border-top-width", "border-right-width", "border-bottom-width", "border-left-width"][["top", "right", "bottom", "left"].iter().position(|x| *x == side).unwrap()], b.clone()));
+                    hints.push((*h, ["border-top-style", "border-right-style", "border-bottom-style", "border-left-style"][["top", "right", "bottom", "left"].iter().position(|x| *x == side).unwrap()], "solid".into()));
+                } translated.insert((*h, "border")); }
+                if let Some(v) = px("hspace") { hints.push((*h, "margin-left", v.clone())); hints.push((*h, "margin-right", v)); translated.insert((*h, "hspace")); }
+                if let Some(v) = px("vspace") { hints.push((*h, "margin-top", v.clone())); hints.push((*h, "margin-bottom", v)); translated.insert((*h, "vspace")); }
+            }
+            if t == "table" {
+                // `border` with no value is `border=1`; 0 draws nothing.
+                let b = a("border").map(|v| if v.trim().is_empty() { "1px".to_string() } else { len(&v).unwrap_or_default() });
+                if let Some(b) = b.filter(|b| b.ends_with("px") && b != "0px") {
+                    for (w, st, c) in [("border-top-width", "border-top-style", "border-top-color"), ("border-right-width", "border-right-style", "border-right-color"),
+                                       ("border-bottom-width", "border-bottom-style", "border-bottom-color"), ("border-left-width", "border-left-style", "border-left-color")] {
+                        hints.push((*h, w, b.clone())); hints.push((*h, st, "solid".into())); hints.push((*h, c, "#808080".into()));
+                    }
+                    translated.insert((*h, "border"));
+                }
+                if a("cellpadding").is_some() || a("border").is_some() { translated.insert((*h, "cellpadding")); }
+            }
+            // What a table passes to its own cells: `cellpadding`, and a 1px
+            // border on every cell when the table has one.
+            if matches!(t, "td" | "th") {
+                if let Some(tb) = table_of(*h) {
+                    if let Some(p) = dom.attr(tb, "cellpadding").and_then(|v| len(v)) {
+                        for side in ["padding-top", "padding-right", "padding-bottom", "padding-left"] { hints.push((*h, side, p.clone())) }
+                    }
+                    let tb_border = dom.attr(tb, "border").map(|v| v.trim().is_empty() || len(v).is_some_and(|b| b != "0px")).unwrap_or(false);
+                    if tb_border {
+                        for (w, st, c) in [("border-top-width", "border-top-style", "border-top-color"), ("border-right-width", "border-right-style", "border-right-color"),
+                                           ("border-bottom-width", "border-bottom-style", "border-bottom-color"), ("border-left-width", "border-left-style", "border-left-color")] {
+                            hints.push((*h, w, "1px".into())); hints.push((*h, st, "solid".into())); hints.push((*h, c, "#808080".into()));
+                        }
+                    }
+                }
+            }
+        }
+        let mut n = 0usize;
+        for (h, prop, v) in hints {
+            let slot = resolved.entry((h, String::new(), String::new())).or_default();
+            // Below EVERY author declaration: only where none exists.
+            if slot.contains_key(prop) { continue }
+            slot.insert(prop.to_string(), ((false, 0, (0, 0, 0), 0), v));
+            n += 1;
+        }
+        if n > 0 { report.drop_n("presentational attribute translated to CSS", n) }
     }
 
     // ★ FLOAT ROWS. The profile has no floats, and dropping `float` left
@@ -561,9 +687,19 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     for h in &els {
         dom.remove_attr(*h, "style");
         // Presentational attributes the profile does not admit.
-        for a in ["align", "valign", "bgcolor", "border", "cellpadding", "cellspacing", "width", "height", "hspace", "vspace"] {
+        // ★ SVG (foreign content) keeps EVERY attribute: `width` on a <rect>
+        // is geometry, not a presentational hint, and stripping it destroyed
+        // the drawing.
+        if dom.is_foreign(*h) { continue }
+        for a in ["align", "valign", "bgcolor", "border", "cellpadding", "cellspacing", "width", "height", "hspace", "vspace", "nowrap", "text"] {
+            // An <img>'s width/height are replaced by its NATURAL declaration below.
             if dom.tag(*h) == Some("img") && (a == "width" || a == "height") { continue }
-            if dom.attr(*h, a).is_some() { dom.remove_attr(*h, a); report.drop(format!("presentational attribute `{a}`")); }
+            if a == "text" && dom.tag(*h) != Some("body") { continue }
+            if dom.attr(*h, a).is_some() {
+                dom.remove_attr(*h, a);
+                // Reported only when nothing carried its meaning forward.
+                if !translated.contains(&(*h, a)) { report.drop(format!("presentational attribute `{a}`")) }
+            }
         }
     }
     detach_all(&mut dom, "style");
@@ -757,11 +893,63 @@ fn resolve_customs(sheet: &css::Sheet, els: &[Handle], m: &sel::Matcher, dom: &D
     out
 }
 
-/// Replace every `var(--x, fallback)` with its value, to a bounded depth.
-fn substitute(value: &[Token], custom: &BTreeMap<String, Vec<Token>>, depth: usize) -> Vec<Token> {
-    if depth > 16 || !value.iter().any(|t| matches!(&t.tok, Tok::Function(f) if f.eq_ignore_ascii_case("var"))) {
-        return value.to_vec();
+fn has_light_dark(v: &[Token]) -> bool {
+    v.iter().any(|t| matches!(&t.tok, Tok::Function(f) if f.eq_ignore_ascii_case("light-dark")))
+}
+
+/// Every `light-dark(L, D)` replaced by L (or by D when `dark`).
+fn pick_light_dark(v: &[Token], dark: bool) -> Vec<Token> {
+    let mut out = vec![];
+    let mut i = 0;
+    while i < v.len() {
+        match &v[i].tok {
+            Tok::Function(f) if f.eq_ignore_ascii_case("light-dark") => {
+                let (mut d, mut j) = (1usize, i + 1);
+                let mut args: Vec<Vec<Token>> = vec![vec![]];
+                while j < v.len() && d > 0 {
+                    match &v[j].tok {
+                        Tok::LParen | Tok::Function(_) => { d += 1; args.last_mut().unwrap().push(v[j].clone()) }
+                        Tok::RParen => { d -= 1; if d > 0 { args.last_mut().unwrap().push(v[j].clone()) } }
+                        Tok::Comma if d == 1 => args.push(vec![]),
+                        _ => args.last_mut().unwrap().push(v[j].clone()),
+                    }
+                    j += 1;
+                }
+                let pick = args.get(if dark { 1 } else { 0 }).cloned().unwrap_or_default();
+                let pick: Vec<Token> = pick.into_iter().skip_while(|t| t.tok == Tok::Whitespace).collect();
+                out.extend(pick_light_dark(&pick, dark));
+                i = j;
+            }
+            _ => { out.push(v[i].clone()); i += 1 }
+        }
     }
+    out
+}
+
+/// Replace every `var(--x, fallback)` with its value, to a bounded depth.
+/// An INVALID result (see `resolve_var`) is returned as the original tokens,
+/// so the declaration is dropped AND reported downstream.
+fn substitute(value: &[Token], custom: &BTreeMap<String, Vec<Token>>, depth: usize) -> Vec<Token> {
+    resolve_var(value, custom, depth).unwrap_or_else(|| value.to_vec())
+}
+
+/// ★ CSS Variables 1, exactly. A custom property is treated as UNDEFINED
+/// — so `var()` takes its fallback — when its value is `initial` (the
+/// guaranteed-invalid value, §2.2) or when it is itself invalid at
+/// computed-value time: it references an undefined property with no
+/// fallback, or a cycle, or nests past the depth bound (§3). `None` means
+/// the whole value is invalid.
+///
+/// The postcss light-dark polyfill is built on this: it sets
+/// `--csstools-color-scheme--light: initial`, so a toggle property that
+/// references it becomes invalid and `var(--toggle, <light>)` falls back to
+/// the light colour. Substituting the word `initial` literally produced
+/// `color: initial #a4cefe` — 15,972 dropped declarations in the corpus.
+fn resolve_var(value: &[Token], custom: &BTreeMap<String, Vec<Token>>, depth: usize) -> Option<Vec<Token>> {
+    if !value.iter().any(|t| matches!(&t.tok, Tok::Function(f) if f.eq_ignore_ascii_case("var"))) {
+        return Some(value.to_vec());
+    }
+    if depth > 16 { return None }
     let mut out = vec![];
     let mut i = 0;
     while i < value.len() {
@@ -781,23 +969,21 @@ fn substitute(value: &[Token], custom: &BTreeMap<String, Vec<Token>>, depth: usi
                 let sig: Vec<&Token> = inner.iter().filter(|t| t.tok != Tok::Whitespace).collect();
                 let name = match sig.first().map(|t| &t.tok) { Some(Tok::Ident(n)) => n.clone(), _ => String::new() };
                 let comma = inner.iter().position(|t| t.tok == Tok::Comma);
-                let fallback: Vec<Token> = comma.map(|c| inner[c + 1..].to_vec()).unwrap_or_default();
-                match custom.get(&name) {
-                    Some(v) => out.extend(substitute(v, custom, depth + 1)),
-                    // ★ No definition AND no fallback is not "the empty
-                    // value": it makes the declaration invalid. Substituting
-                    // nothing left a declaration that had simply vanished,
-                    // with no diagnostic — the failure read as a rule nobody
-                    // wrote. Keep the `var()` so the drop is REPORTED.
-                    None if comma.is_none() => out.extend(value[i..j].iter().cloned()),
-                    None => out.extend(substitute(&fallback, custom, depth + 1)),
+                // The referenced property's value, if it is defined AND valid.
+                let defined = custom.get(&name)
+                    .filter(|v| !css::write_tokens(v).trim().eq_ignore_ascii_case("initial"))
+                    .and_then(|v| resolve_var(v, custom, depth + 1));
+                match (defined, comma) {
+                    (Some(v), _) => out.extend(v),
+                    (None, Some(c)) => out.extend(resolve_var(&inner[c + 1..], custom, depth + 1)?),
+                    (None, None) => return None,
                 }
                 i = j;
             }
             _ => { out.push(value[i].clone()); i += 1 }
         }
     }
-    out
+    Some(out)
 }
 
 /// A declaration as longhands the profile admits, or nothing.
@@ -888,10 +1074,20 @@ fn to_longhands(name: &str, value: &[Token], inputs: &Inputs, report: &mut Repor
 /// `None`, in which case the rules inside it are dropped.
 fn admitted_media(q: &str) -> Option<String> {
     let q = q.trim().to_ascii_lowercase();
+    // ★ A comma LIST is an OR, and the renderer evaluates lists. Each member
+    // is admitted on its own: one that can never match on a screen (`print`)
+    // simply leaves the OR, and one that always matches makes the whole
+    // query unconditional. Refusing every list dropped ~7,800 declarations —
+    // `@media screen, print { … }` is how a stylesheet says "everywhere".
+    let members = depth0_split(&q, ",");
+    if members.len() > 1 {
+        let admitted: Vec<String> = members.iter().filter_map(|m| admitted_media(m)).collect();
+        if admitted.is_empty() { return None }
+        if admitted.iter().any(|m| m.is_empty()) { return Some(String::new()) }
+        return Some(admitted.join(", "));
+    }
     // `screen`, `all` and a bare feature query are fine; `print` is not.
     if q.contains("print") || q.contains("speech") { return None }
-    // A comma list is an OR the profile's queries cannot say; `not` negates.
-    if depth0_split(&q, ",").len() > 1 { return None }
     // ★ A query is media types and features joined by `and`, and each part is
     // admitted ON ITS OWN. Stripping one `screen and ` prefix and then reading
     // the rest as ONE feature dropped every compound breakpoint —
@@ -981,7 +1177,19 @@ fn admitted_feature(q: &str) -> Option<String> {
         // true (a colour scheme, an orientation), to no condition at all.
         "prefers-reduced-motion" if !inner.contains(':') => Some("(prefers-reduced-motion: reduce)".into()),
         "prefers-color-scheme" | "orientation" if !inner.contains(':') => Some(String::new()),
-        "prefers-color-scheme" | "prefers-reduced-motion" | "orientation" => Some(q.to_string()),
+        // ★ The VALUE is checked too, not only the name: an unknown value
+        // makes the query never match in a browser, and here it would reach
+        // the renderer and be refused. `prefers-color-scheme: no-preference`
+        // was removed from the spec, and a real sheet still ships it.
+        "prefers-color-scheme" | "prefers-reduced-motion" | "orientation" => {
+            let v = inner.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
+            let ok = match name {
+                "prefers-color-scheme" => matches!(v, "light" | "dark"),
+                "prefers-reduced-motion" => matches!(v, "no-preference" | "reduce"),
+                _ => matches!(v, "portrait" | "landscape"),
+            };
+            ok.then(|| format!("({name}: {v})"))
+        }
         _ => None,
     }
 }
@@ -1174,12 +1382,18 @@ mod media_tests {
                    Some("(min-width: 639px) and (max-width: 1679px)"));
         // Doubled prefixes, from concatenated sheets.
         assert_eq!(m("screen and all and (max-width:calc(640px - 1px))").as_deref(), Some("(max-width: 639px)"));
-        assert_eq!(m("screen and screen and (prefers-color-scheme:dark)").as_deref(), Some("(prefers-color-scheme:dark)"));
+        assert_eq!(m("screen and screen and (prefers-color-scheme:dark)").as_deref(), Some("(prefers-color-scheme: dark)"));
         // Counterweights: one refused part refuses the whole query; so do
         // print, a comma list, and a negation.
         assert_eq!(m("screen and (max-width: 600px) and (hover: hover)"), None);
         assert_eq!(m("print and (max-width: 600px)"), None);
-        assert_eq!(m("(max-width: 600px), (orientation: portrait)"), None);
+        // A LIST is an OR: members admitted one by one.
+        assert_eq!(m("screen, print").as_deref(), Some(""), "`screen` alone matches: unconditional");
+        assert_eq!(m("print, (max-width: 600px)").as_deref(), Some("(max-width: 600px)"), "print leaves the OR");
+        assert_eq!(m("(max-width: 600px), (orientation: portrait)").as_deref(), Some("(max-width: 600px), (orientation: portrait)"));
+        assert_eq!(m("print, speech"), None, "nothing left: refused");
+        assert_eq!(m("only print, only all and (prefers-color-scheme: no-preference)"), None, "an obsolete value never matches");
+        assert_eq!(m("(prefers-color-scheme: light), print").as_deref(), Some("(prefers-color-scheme: light)"));
         assert_eq!(m("not all and (max-width: 600px)"), None);
         // ★ From the 96-document run: an unexpanded Sass function and a
         // negative bound are dropped, never passed through to be refused…

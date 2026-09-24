@@ -1116,6 +1116,21 @@ they cost no profile decision:
 | `background-position` and `font` shorthands | 765 + 623 |
 | `unset` | 646 |
 
+**Status of E (2026-09-24, same day):** fixed — `initial` and invalid-at-computed-value
+custom properties (15,972 → 0; empty custom values kept too, which the light-dark
+polyfill needs for dark mode), media query LISTS admitted member by member (and feature
+VALUES checked: an obsolete `prefers-color-scheme: no-preference` never matches),
+selectors (5,162 → 363: `:lang()`, `:dir()`, `:nth-last-of-type()`, vendor `:is()` aliases;
+and two bugs — `:nth-of-type` was counted as `:nth-child`, and `:where()` carried its
+arguments' specificity instead of zero), presentational attributes (4,288 → 175, now
+3,767 hints translated below every author rule, including an `<img>`'s and an inline
+`<svg>`'s own width/height; attributes inside SVG are geometry and are kept), and colour
+spellings (`#rgba` and `light-dark()` → 0). Admitting media lists let whole stylesheets
+through that had been dropped — Apple's store page had rendered with no author CSS at all
+— and exposed a renderer bug: the root's `overflow` clipped the page instead of applying
+to the viewport. Remaining in E: `unset`, the `font` and `background-position`
+shorthands, unresolved custom properties (1,677, to be checked for real cycles).
+
 **Order of work:** section E, then margin collapsing and floats (compiled by the producer
 where they can be, like box-sizing), then generated content with text and counters, then
 the cheap rows of C by count. Each admission is checked against the guarantees before it

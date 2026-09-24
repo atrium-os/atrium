@@ -23,6 +23,17 @@ pub enum Simple {
     State(String),
     Not(Vec<Complex>),
     Is(Vec<Complex>),
+    /// `:where()` — matches like `:is()`, with ZERO specificity. Parsed as
+    /// `:is()` it took its arguments' specificity, and a zero-specificity
+    /// reset (the whole point of `:where`) beat ordinary rules.
+    Where(Vec<Complex>),
+    /// `:lang(en, "fr-*")`: static — an element's language is its nearest
+    /// `lang` attribute.
+    Lang(Vec<String>),
+    /// `:dir(rtl)`: static — the nearest `dir` attribute.
+    Dir(bool),
+    NthOfType(i64, i64),
+    NthLastOfType(i64, i64),
     Has(Vec<Complex>),
     /// `:nth-child(an+b)`, and the simple positional forms as (a, b).
     NthChild(i64, i64),
@@ -157,12 +168,28 @@ fn parse_compound(t: &[Token], mut i: usize) -> R<(Vec<Simple>, usize)> {
                         }
                         out.push(match f.as_str() {
                             "not" => Simple::Not(parse_list(&inner)?),
-                            "is" | "matches" | "any" => Simple::Is(parse_list(&inner)?),
-                            "where" => Simple::Is(parse_list(&inner)?),
+                            "is" | "matches" | "any" | "-webkit-any" | "-moz-any" => Simple::Is(parse_list(&inner)?),
+                            "where" => Simple::Where(parse_list(&inner)?),
+                            "lang" => {
+                                let tags: Vec<String> = inner.iter().filter_map(|t| match &t.tok {
+                                    Tok::Ident(v) | Tok::Str(v) => Some(v.to_ascii_lowercase()),
+                                    _ => None,
+                                }).collect();
+                                if tags.is_empty() { return Err(":lang() with no language".into()) }
+                                Simple::Lang(tags)
+                            }
+                            "dir" => match inner.iter().find_map(|t| if let Tok::Ident(v) = &t.tok { Some(v.to_ascii_lowercase()) } else { None }).as_deref() {
+                                Some("rtl") => Simple::Dir(true),
+                                Some("ltr") => Simple::Dir(false),
+                                _ => return Err(":dir() takes ltr or rtl".into()),
+                            },
                             "has" => Simple::Has(parse_list(&inner)?),
                             "nth-child" => { let (a, b) = parse_nth(&inner)?; Simple::NthChild(a, b) }
                             "nth-last-child" => { let (a, b) = parse_nth(&inner)?; Simple::NthLastChild(a, b) }
-                            "nth-of-type" => { let (a, b) = parse_nth(&inner)?; Simple::NthChild(a, b) }
+                            // ★ Counted among siblings OF THE SAME TYPE; it was
+                            // parsed as `:nth-child` and counted all of them.
+                            "nth-of-type" => { let (a, b) = parse_nth(&inner)?; Simple::NthOfType(a, b) }
+                            "nth-last-of-type" => { let (a, b) = parse_nth(&inner)?; Simple::NthLastOfType(a, b) }
                             other => return Err(format!(":{other}() is not understood")),
                         });
                         i = j;
@@ -230,7 +257,9 @@ fn add_spec(s: &Simple, out: &mut (u32, u32, u32)) {
         Simple::Id(_) => out.0 += 1,
         Simple::Class(_) | Simple::Attr { .. } | Simple::State(_) | Simple::NthChild(..)
         | Simple::NthLastChild(..) | Simple::FirstOfType | Simple::LastOfType
-        | Simple::OnlyChild | Simple::Root | Simple::Empty => out.1 += 1,
+        | Simple::OnlyChild | Simple::Root | Simple::Empty
+        | Simple::Lang(_) | Simple::Dir(_) | Simple::NthOfType(..) | Simple::NthLastOfType(..) => out.1 += 1,
+        Simple::Where(_) => {}
         Simple::Type(_) => out.2 += 1,
         Simple::Universal | Simple::PseudoElement(_) => {}
         // :not() and :is() take the specificity of their most specific branch.
@@ -372,7 +401,42 @@ impl<'a> Matcher<'a> {
             },
             Simple::PseudoElement(_) => false,
             Simple::Not(l) => !l.iter().any(|c| self.matches(h, c)),
-            Simple::Is(l) => l.iter().any(|c| self.matches(h, c)),
+            Simple::Is(l) | Simple::Where(l) => l.iter().any(|c| self.matches(h, c)),
+            Simple::Lang(tags) => {
+                // The nearest `lang` (or `xml:lang`) on the element or above.
+                let mut cur = Some(h);
+                let mut lang = String::new();
+                while let Some(x) = cur {
+                    if let Some(v) = self.dom.attr(x, "lang").or_else(|| self.dom.attr(x, "xml:lang")) { lang = v.trim().to_ascii_lowercase(); break }
+                    cur = self.dom.get(x).and_then(|n| n.parent);
+                }
+                !lang.is_empty() && tags.iter().any(|t| {
+                    // `*-CH` (Selectors 4 extended range): any language, that region.
+                    if let Some(sub) = t.strip_prefix("*-") { lang.split('-').skip(1).any(|p| p == sub) }
+                    else { lang == *t || lang.starts_with(&format!("{t}-")) }
+                })
+            }
+            Simple::Dir(rtl) => {
+                let mut cur = Some(h);
+                let mut dir = "ltr".to_string();
+                while let Some(x) = cur {
+                    if let Some(v) = self.dom.attr(x, "dir") {
+                        let v = v.trim().to_ascii_lowercase();
+                        if v == "rtl" || v == "ltr" { dir = v; break }
+                    }
+                    cur = self.dom.get(x).and_then(|n| n.parent);
+                }
+                (dir == "rtl") == *rtl
+            }
+            Simple::NthOfType(a, b) => {
+                let st = self.same_type(h);
+                nth_ok(st.iter().position(|x| *x == h).map(|i| i as i64 + 1).unwrap_or(1), *a, *b)
+            }
+            Simple::NthLastOfType(a, b) => {
+                let st = self.same_type(h);
+                let i = st.iter().position(|x| *x == h).unwrap_or(0);
+                nth_ok((st.len() - i) as i64, *a, *b)
+            }
             Simple::Has(l) => self.descendants(h).into_iter().any(|d| l.iter().any(|c| self.matches(d, c))),
             Simple::Root => self.dom.get(h).and_then(|n| n.parent).is_some_and(|p| p == self.dom.root()),
             Simple::Empty => self.dom.children_of(h).is_empty(),

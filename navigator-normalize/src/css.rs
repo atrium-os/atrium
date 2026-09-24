@@ -129,7 +129,11 @@ pub fn declarations(t: &[Token]) -> Vec<Decl> {
             }
         }
         while value.last().map(|t| t.tok == Tok::Whitespace).unwrap_or(false) { value.pop(); }
-        if !value.is_empty() { out.push(Decl { name, value, important }) }
+        // ★ An EMPTY custom property is valid (CSS Variables 1: the value is
+        // `<declaration-value>?`) and it is how the light-dark polyfill turns
+        // dark mode ON — `--csstools-color-scheme--light: ;`. Dropping it left
+        // every dark-mode colour on the page at its light value.
+        if !value.is_empty() || name.starts_with("--") { out.push(Decl { name, value, important }) }
     }
     out
 }
