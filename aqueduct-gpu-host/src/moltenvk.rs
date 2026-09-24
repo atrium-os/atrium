@@ -93,6 +93,9 @@ struct MvkAccel {
     blas_addrs: Vec<u64>,
     /// Buffers/memory backing the BLASes (live for the scene's lifetime).
     #[allow(dead_code)] owned: Vec<(vk::Buffer, vk::DeviceMemory)>,
+    /// In-flight BLAS builds (`add_scene_blases_async`): fence, command
+    /// buffer, first BLAS index, count. Drained by `poll_scene_blases`.
+    pending: Vec<(vk::Fence, vk::CommandBuffer, u32, u32)>,
     /// Buffers/memory backing the current TLAS (instances, storage, scratch)
     /// — replaced on rebuild.
     tlas_owned: Vec<(vk::Buffer, vk::DeviceMemory)>,
@@ -682,6 +685,34 @@ impl MoltenVkBackend {
         Ok(())
     }
 
+    /// Record + submit one command buffer and return its fence WITHOUT
+    /// waiting (streaming builds that run while frames render). The caller
+    /// polls the fence and then frees both via `finish_submit`.
+    unsafe fn submit_no_wait<F: FnOnce(vk::CommandBuffer)>(&self, rec: F)
+        -> Result<(vk::Fence, vk::CommandBuffer), String>
+    {
+        let dev = &self.device;
+        let cb = dev.allocate_command_buffers(
+            &vk::CommandBufferAllocateInfo::default()
+                .command_pool(self.cmd_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1))
+            .map_err(|e| format!("AS cmd alloc: {e:?}"))?[0];
+        dev.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))
+            .map_err(|e| format!("AS cmd begin: {e:?}"))?;
+        rec(cb);
+        dev.end_command_buffer(cb).map_err(|e| format!("AS cmd end: {e:?}"))?;
+        let cbs = [cb];
+        let si = vk::SubmitInfo::default().command_buffers(&cbs);
+        let _guard = self.submit_lock.lock().unwrap();
+        let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None)
+            .map_err(|e| format!("AS fence: {e:?}"))?;
+        dev.queue_submit(self._queue, &[si], fence)
+            .map_err(|e| format!("AS submit: {e:?}"))?;
+        Ok((fence, cb))
+    }
+
     /// Wait budget for GPU work (ns): `AQUEDUCT_GPU_WAIT_MS` or `default_ms`.
     fn wait_timeout_ns(default_ms: u64) -> u64 {
         std::env::var("AQUEDUCT_GPU_WAIT_MS").ok().and_then(|v| v.parse::<u64>().ok())
@@ -744,8 +775,8 @@ impl MoltenVkBackend {
         let mut owned_all = owned;
         let mut blas_handles: Vec<vk::AccelerationStructureKHR> = Vec::with_capacity(blases.len());
         let mut blas_addrs: Vec<u64> = Vec::with_capacity(blases.len());
-        let stats = unsafe { self.build_blases(asd, blases, scratch_align, &mut owned_all, &mut blas_handles, &mut blas_addrs)? };
-        let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: blas_handles, blas_addrs, owned: owned_all, tlas_owned: Vec::new() };
+        let stats = unsafe { self.build_blases(asd, blases, scratch_align, &mut owned_all, &mut blas_handles, &mut blas_addrs, None)? };
+        let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: blas_handles, blas_addrs, owned: owned_all, tlas_owned: Vec::new(), pending: Vec::new() };
         self.accels.lock().unwrap().insert(tlas_id.raw(), accel);
         eprintln!("build_scene_tlas: {stats}");
         self.rebuild_scene_tlas(tlas_id, instances)
@@ -762,7 +793,9 @@ impl MoltenVkBackend {
     /// addresses and owned buffers. Returns a stats line.
     unsafe fn build_blases(&self, asd: &ash::khr::acceleration_structure::Device, blases: &[&[f32]], scratch_align: u64,
                            owned: &mut Vec<(vk::Buffer, vk::DeviceMemory)>,
-                           blas_handles: &mut Vec<vk::AccelerationStructureKHR>, blas_addrs: &mut Vec<u64>) -> Result<String, String> {
+                           blas_handles: &mut Vec<vk::AccelerationStructureKHR>, blas_addrs: &mut Vec<u64>,
+                           fences: Option<&mut Vec<(vk::Fence, vk::CommandBuffer)>>) -> Result<String, String> {
+        let mut fences = fences;
         let align_up = |a: u64, al: u64| (a + al - 1) & !(al - 1);
         let mut blas_bytes_total = 0u64;
         let mut vbytes_total = 0u64;
@@ -833,11 +866,15 @@ impl MoltenVkBackend {
                 .primitive_count(tri_count);
             pending.push((bbi, brange));
             if pending.len() >= BATCH {
-                self.one_time_submit(|cb| {
+                let rec = |cb: vk::CommandBuffer| {
                     for (b, r) in &pending {
                         asd.cmd_build_acceleration_structures(cb, &[*b], &[&[*r]]);
                     }
-                })?;
+                };
+                match fences.as_deref_mut() {
+                    Some(f) => f.push(self.submit_no_wait(rec)?),
+                    None => self.one_time_submit(rec)?,
+                }
                 pending.clear();
             }
             blas_handles.push(blas);
@@ -846,11 +883,15 @@ impl MoltenVkBackend {
                     .acceleration_structure(blas)));
         }
         if !pending.is_empty() {
-            self.one_time_submit(|cb| {
+            let rec = |cb: vk::CommandBuffer| {
                 for (b, r) in &pending {
                     asd.cmd_build_acceleration_structures(cb, &[*b], &[&[*r]]);
                 }
-            })?;
+            };
+            match fences.as_deref_mut() {
+                Some(f) => f.push(self.submit_no_wait(rec)?),
+                None => self.one_time_submit(rec)?,
+            }
             pending.clear();
         }
         drop(geos);
@@ -877,9 +918,56 @@ impl MoltenVkBackend {
         let acc = accels.get_mut(&tlas_id.raw()).ok_or_else(|| "add_scene_blases: unknown scene".to_string())?;
         let first = acc.blases.len() as u32;
         let (mut owned, mut handles, mut addrs) = (std::mem::take(&mut acc.owned), std::mem::take(&mut acc.blases), std::mem::take(&mut acc.blas_addrs));
-        let res = unsafe { self.build_blases(asd, blases, scratch_align, &mut owned, &mut handles, &mut addrs) };
+        let res = unsafe { self.build_blases(asd, blases, scratch_align, &mut owned, &mut handles, &mut addrs, None) };
         acc.owned = owned; acc.blases = handles; acc.blas_addrs = addrs;
         res.map(|_| first)
+    }
+
+    /// Like `add_scene_blases` but returns as soon as the builds are
+    /// submitted: the GPU builds them while frames render. The new indices
+    /// must not be instanced until `poll_scene_blases` reports them done.
+    pub fn add_scene_blases_async(&self, tlas_id: ResourceId, blases: &[&[f32]]) -> Result<u32, String> {
+        let asd = self.as_device.as_ref()
+            .ok_or_else(|| "ray-query not available on this device".to_string())?;
+        for (i, v) in blases.iter().enumerate() {
+            if v.len() % 9 != 0 || v.is_empty() {
+                return Err(format!("add_scene_blases_async: BLAS {i} vertex data is not whole triangles"));
+            }
+        }
+        let mut as_props = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
+        let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut as_props);
+        unsafe { self.instance.get_physical_device_properties2(self.physical, &mut p2) };
+        let scratch_align = as_props.min_acceleration_structure_scratch_offset_alignment.max(256) as u64;
+        let mut accels = self.accels.lock().unwrap();
+        let acc = accels.get_mut(&tlas_id.raw()).ok_or_else(|| "add_scene_blases_async: unknown scene".to_string())?;
+        let first = acc.blases.len() as u32;
+        let (mut owned, mut handles, mut addrs) = (std::mem::take(&mut acc.owned), std::mem::take(&mut acc.blases), std::mem::take(&mut acc.blas_addrs));
+        let mut fences = Vec::new();
+        let res = unsafe { self.build_blases(asd, blases, scratch_align, &mut owned, &mut handles, &mut addrs, Some(&mut fences)) };
+        acc.owned = owned; acc.blases = handles; acc.blas_addrs = addrs;
+        for (f, cb) in fences { acc.pending.push((f, cb, first, blases.len() as u32)); }
+        res.map(|_| first)
+    }
+
+    /// Poll in-flight async BLAS builds; returns the first index of every
+    /// batch that has completed (its BLASes may now be instanced).
+    pub fn poll_scene_blases(&self, tlas_id: ResourceId) -> Result<Vec<u32>, String> {
+        let mut accels = self.accels.lock().unwrap();
+        let acc = accels.get_mut(&tlas_id.raw()).ok_or_else(|| "poll_scene_blases: unknown scene".to_string())?;
+        let dev = &self.device;
+        let mut done = Vec::new();
+        let mut keep = Vec::with_capacity(acc.pending.len());
+        for (fence, cb, first, count) in acc.pending.drain(..) {
+            let signalled = unsafe { dev.get_fence_status(fence) }.map_err(|e| format!("fence status: {e:?}"))?;
+            if signalled {
+                unsafe { dev.destroy_fence(fence, None); dev.free_command_buffers(self.cmd_pool, &[cb]); }
+                done.push(first);
+            } else {
+                keep.push((fence, cb, first, count));
+            }
+        }
+        acc.pending = keep;
+        Ok(done)
     }
 
     /// Rebuild the scene TLAS over the stored BLASes for a new instance
