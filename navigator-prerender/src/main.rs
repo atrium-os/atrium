@@ -95,7 +95,15 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
     let c = convert_with(&src, base, &mut eng, fetcher);
     // PRERENDER_EMIT_DIR writes the publishable recording — the chosen
     // document plus the transition table — one JSON file per input.
-    if let Ok(dir) = std::env::var("PRERENDER_EMIT_DIR") {
+    // ★ A challenge page is the ORIGIN refusing, not the site (§5.4.1b). The
+    // batch report already said so — and the recording was written anyway,
+    // because the emit path never read the verdict: four "Just a moment…"
+    // pages were published as if they were Stack Overflow and B&H.
+    let emit_dir = std::env::var("PRERENDER_EMIT_DIR").ok();
+    if let (Some(_), Some(why)) = (&emit_dir, c.origin_refusal) {
+        eprintln!("emit: {file}: refused by origin ({why}); no recording written");
+    }
+    if let Some(dir) = emit_dir.filter(|_| c.origin_refusal.is_none()) {
         let policy = navigator_prerender::TierPolicy::default();
         let json = navigator_prerender::artifact::emit(base, &c, &policy);
         let stem = std::path::Path::new(file).file_stem()

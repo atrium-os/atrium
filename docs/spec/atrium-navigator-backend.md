@@ -1743,6 +1743,44 @@ and neither half of it reached the renderer.
   concatenated sheets leave (`screen and all and (…)`). One refused part still refuses
   the whole query.
 
+**The corpus widened to 96, with a flagger instead of eyes.** `nsg-flag` (review
+tooling, `navigator_render::flag`) renders every normalized document in a CHILD process
+with a time limit and measures the geometric symptoms every reviewed bug had shown: text
+over text, text crossing the canvas edge, text sliced by a clip, all text in a strip of
+the page, and far less text painted than the document holds. Each check has a positive
+AND a quiet control. Of the 96 fetched documents, 78 render: 12 did not convert within
+30 s, and 6 are an origin's bot check (the converter's verdict), plus FT's, which its
+conservative detector correctly declines to call (the page has a footer).
+- ★★★ **A renderer HANG on a 6 KB page.** An item placed past the explicit grid (FT's
+  `dt`/`dd` in columns 1 and 2, no template) never found a slot: the fixed axis was
+  sized from the template alone, and the placement search advanced the row forever. The
+  implicit grid is now sized first (CSS Grid §8.5). A per-document jail bounds the blast
+  radius; it does not make an infinite loop acceptable.
+- ★★ **The converter published challenge pages.** `origin_refusal` was set and reported
+  — and the recording written anyway, because the emit path never read it. Six "Just a
+  moment…" pages (Stack Overflow, Super User, B&H, AP News, The Economist, timeanddate)
+  would have been published as the sites.
+- ★★ **HTML's own hiding was missing from the UA sheet**: no `[hidden]`, no closed
+  `<dialog>`. arXiv's closed citation modal greyed out the whole abstract page.
+- ★★ **Bare text in a flex container is an anonymous flex item.** The row-flex intrinsic
+  width summed element children only, so arXiv's header links — `display: flex` anchors
+  holding bare text — measured zero and piled onto each other.
+- ★ **A table cell's `width` is a floor, not a cap** (CSS 2.1 §17.5.2.2). The profile
+  reads a first-row width as exact, so the normalizer now folds the author's width into
+  the measured pair: the W3C specs' `th { width: 3em }` held their property tables'
+  header column to 48 px, and "Initial:" painted over its value.
+- ★ **Media queries, three more ways.** A boolean feature (`(prefers-reduced-motion)`)
+  is rewritten to the value it stands for; an unexpanded Sass function
+  (`getbreakpointdownvalue(48em)`) or a negative bound is dropped, never passed through
+  to be refused; and the `and`-splitter, rewritten earlier the same day, panicked on the
+  first query holding a multi-byte character — the corpus caught my own regression.
+
+Result, 78 documents: refusals 2 → 0, overlaps 16 → 9, crossing the edge 14 → 13, hangs
+1 → 0. OPEN, each needing more than a patch: `colspan` is not in the profile, and a
+first row that spans (every Wikipedia navbox) declares too few columns — a profile
+decision; horizontal carousels (TikTok, Spiegel) stack their slides; Asahi's content is
+shifted off the left edge; outside list markers at a zero-padding edge (Hacker News).
+
 ★ **Two renderer tests had been failing for hours** — a stale sample golden and a pinned
 `nsg 0.1` header — behind `grep -c "test result: ok"`, which counts the suites that passed
 and cannot see one that failed. Counted properly: **505 tests, 0 failures, six crates**.

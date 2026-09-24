@@ -284,6 +284,18 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
                 }).unwrap_or(0);
                 mins[i] = mins[i].max(mn + pad);
                 maxs[i] = maxs[i].max(mx + pad);
+                // ★ A cell's own `width` is a FLOOR in automatic table layout
+                // (CSS 2.1 §17.5.2.2), never a cap: the column is at least
+                // its content's min-content. The profile reads a first-row
+                // `width` as EXACT, so the author's value is folded into the
+                // measured pair here and the exact reading switched off below.
+                // Leaving it in let the W3C specs' `th { width: 3em }` hold
+                // their property tables' header column to 48 px, and
+                // "Initial:" and "Inherited:" painted over their values.
+                if let Some(cw) = cx.st(c).and_then(|cs| match cs.get("width") { V::Len(_) => len(cs.get("width"), 0), _ => None }) {
+                    mins[i] = mins[i].max(cw);
+                    maxs[i] = maxs[i].max(cw);
+                }
             }
         }
         for (i, c) in first_cells.into_iter().enumerate() {
@@ -301,10 +313,19 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
         let existing = dom2.attr(h, "class").unwrap_or("").to_string();
         dom2.set_attr(h, "class", &format!("{existing} {cls}").trim().to_string());
         let _ = &mut css;
-        css.push_str(&format!(".{cls} {{ min-width: {}px; max-width: {}px }}\n", mn as f64 / PX as f64, mx as f64 / PX as f64));
+        css.push_str(&format!(".{cls} {{ width: auto; min-width: {}px; max-width: {}px }}\n", mn as f64 / PX as f64, mx as f64 / PX as f64));
     }
-    let body = dom2.serialize();
-    (format!("<html><head><style>\n{css}</style></head>{body}</html>\n"), n)
+    // ★ AFTER the document's own stylesheet, so that on equal specificity the
+    // measured declarations win — `width: auto` must beat the author's
+    // `width`, which is already folded in above.
+    let style = dom2.create(Kind::Element("style".into()));
+    let text = dom2.create(Kind::Text(css));
+    dom2.append(style, text);
+    let head = dom2.by_tag_anywhere("head").into_iter().next()
+        .or_else(|| dom2.by_tag_anywhere("body").into_iter().next())
+        .unwrap_or(dom2.root());
+    dom2.append(head, style);
+    (dom2.serialize(), n)
 }
 
 #[derive(Clone)]
@@ -1267,7 +1288,18 @@ impl<'a> Cx<'a> {
                 _ => (None, 1),
             }
         };
-        let fixed_len = if flow_row { cols_tpl.len().max(1) } else { rows_tpl.len().max(1) };
+        // ★ The IMPLICIT grid first (CSS Grid §8.5): the fixed axis has as
+        // many tracks as the template names OR as any item's definite
+        // position and span reaches, whichever is more. Using the template's
+        // count alone made the search below spin forever — an item placed
+        // in column 2 of a one-column grid never fits, so the loop advanced
+        // the row without end. FT's error page (`dt` in column 1, `dd` in
+        // column 2, no template) hung the renderer outright.
+        let tpl_len = if flow_row { cols_tpl.len() } else { rows_tpl.len() };
+        let fixed_len = raw.iter().map(|(_, cs0, ce, rs, re, ..)| {
+            let (start, span) = if flow_row { span_of(*cs0, *ce) } else { span_of(*rs, *re) };
+            start.unwrap_or(0) + span
+        }).max().unwrap_or(0).max(tpl_len).max(1);
         let mut occupied: Vec<Vec<bool>> = vec![];
         let mut items: Vec<GItem> = vec![];
         let (mut cursor_major, mut cursor_minor) = (0usize, 0usize);
@@ -1583,8 +1615,18 @@ impl<'a> Cx<'a> {
         // one crumb wide, and the rest was clipped away.
         if !anon && kw(s, "display") == "flex" && kw(s, "flex-direction") != "column" {
             let gap = len(s.get("column-gap"), 0).unwrap_or(0);
-            let kids: Vec<Handle> = self.dom.element_children(h).into_iter()
-                .filter(|c| self.st(*c).is_some_and(|cs| kw(cs, "display") != "none")).collect();
+            // ★ A run of text directly inside a flex container is an
+            // ANONYMOUS flex item (CSS Flexbox §4) and counts like any other.
+            // Summing element children only measured arXiv's header links —
+            // `display: flex` anchors holding bare text — at zero, so each
+            // was its 20 px of padding and the words piled onto each other.
+            let kids: Vec<Handle> = self.dom.children_of(h).into_iter()
+                .filter(|c| match self.dom.get(*c).map(|n| &n.kind) {
+                    Some(Kind::Text(t)) => !t.trim().is_empty(),
+                    Some(Kind::Element(_)) => self.st(*c).is_some_and(|cs| kw(cs, "display") != "none"
+                        && !matches!(kw(cs, "position"), "absolute" | "fixed")),
+                    _ => false,
+                }).collect();
             let (mut smn, mut smx) = (0, 0);
             let mut mins: Vec<U> = vec![];
             for c in &kids {
@@ -2228,6 +2270,51 @@ mod tests {
         assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 100, 20)]);
         assert_eq!(boxes(&o, 0x00ff00ff), vec![(110, 0, 380, 20)], "grows into the free space, gaps honoured");
         assert_eq!(boxes(&o, 0x0000ffff), vec![(500, 0, 100, 20)]);
+    }
+
+    /// ★ Bare text inside a flex container is an anonymous flex item and
+    /// counts toward the container's intrinsic width.
+    #[test]
+    fn text_in_a_flex_item_counts_toward_its_width() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            nav { display: flex } a { display: flex; padding-left: 10px; padding-right: 10px; white-space: nowrap }</style>
+            <nav><a href="x">Search</a><a href="y">Submit</a><a href="z">Donate</a></nav>"#);
+        let x = |t: &str| o.scene.runs.iter().find(|r| r.text == t).map(|r| r.x).unwrap();
+        assert!(x("Submit") - x("Search") > 50 * PX, "each link is as wide as its word plus padding");
+        assert!(x("Donate") - x("Submit") > 50 * PX);
+    }
+
+    /// ★ HTML's own hiding: `[hidden]` and a closed `<dialog>` are not
+    /// painted, and author CSS still overrides them (as in a browser).
+    #[test]
+    fn hidden_elements_and_closed_dialogs_are_not_painted() {
+        let o = render(r#"<p>shown</p><div hidden="true">modal</div><dialog>closed</dialog><dialog open>opened</dialog>
+            <style>.force { display: block }</style><div class="force" hidden>author-wins</div>"#);
+        let text: Vec<&str> = o.scene.runs.iter().map(|r| r.text.as_str()).collect();
+        assert!(text.contains(&"shown") && text.contains(&"opened"), "{text:?}");
+        assert!(!text.contains(&"modal") && !text.contains(&"closed"), "{text:?}");
+        assert!(text.contains(&"author-wins"), "author display beats the UA [hidden] rule: {text:?}");
+    }
+
+    /// ★ An item placed past the explicit grid GROWS the grid (CSS Grid
+    /// §8.5). Sizing the fixed axis from the template alone left an item in
+    /// column 2 of a one-column grid with no slot, and the placement search
+    /// spun forever — FT's error page hung the renderer. Run on a thread so a
+    /// regression fails this test instead of hanging the suite.
+    #[test]
+    fn an_item_past_the_explicit_grid_grows_it_and_does_not_hang() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+                .g { display: grid; column-gap: 10px }
+                .a { grid-column-start: 1 } .b { grid-column-start: 2 }</style>
+                <div class="g"><div class="a">key</div><div class="b">value</div><div class="a">k2</div><div class="b">v2</div></div>"#);
+            let x = |t: &str| o.scene.runs.iter().find(|r| r.text == t).map(|r| (r.x, r.y)).unwrap();
+            let _ = tx.send((x("key"), x("value"), x("k2"), x("v2")));
+        });
+        let (key, value, k2, v2) = rx.recv_timeout(std::time::Duration::from_secs(10)).expect("placement terminates");
+        assert!(value.0 > key.0 && value.1 == key.1, "value sits BESIDE its key, in column 2");
+        assert!(k2.1 > key.1 && v2.1 == k2.1 && v2.0 == value.0, "the second pair is the next row");
     }
 
     /// ★ THE CANVAS: with no root background, the BODY's paints the whole

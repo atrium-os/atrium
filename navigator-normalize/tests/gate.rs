@@ -388,3 +388,30 @@ fn a_camelcase_custom_property_resolves_and_a_missing_one_is_reported() {
     assert!(!out.contains("color:"), "{out}");
     assert!(report.dropped.keys().any(|k| k.contains("unresolved custom property")), "{:?}", report.dropped);
 }
+
+/// ★ A table cell's `width` is a FLOOR in automatic table layout (CSS 2.1
+/// §17.5.2.2), not a cap. The W3C specs declare `th { width: 3em }` on their
+/// property tables; taken as exact, the header column was 48 px and
+/// "Initial:" and "Inherited:" painted over the values beside them.
+#[test]
+fn a_cells_declared_width_is_a_floor_not_a_cap() {
+    let fonts = FontSet::load().expect("pinned font set");
+    let src = |w: &str| format!(r#"<html><head><style>
+      table {{ border-collapse: collapse }} th {{ width: {w} }}
+    </style></head><body><table><tr><th>Inheritedness:</th><td>no</td></tr></table></body></html>"#);
+    let col0 = |out: &str| -> f64 {
+        let rule = out.split(".tc0 {").nth(1).expect("column measured");
+        rule.split("min-width: ").nth(1).unwrap().split("px").next().unwrap().parse().unwrap()
+    };
+    let (narrow, _) = normalize_and_measure(&src("10px"), &Inputs::default(), &fonts, &Env::default());
+    assert!(col0(&narrow) > 60.0, "the word decides, not the 10px: {}", col0(&narrow));
+    assert!(narrow.contains("width: auto"), "the exact reading is switched off: {narrow}");
+    // What the reader sees: the value starts AFTER the header's word ends.
+    let o = render_html(&narrow, &fonts, &Env::default());
+    let run = |t: &str| o.scene.runs.iter().find(|r| r.text == t).map(|r| r.x).expect(t);
+    assert!(run("no") > run("Inheritedness:") + 60 * 64, "the value is not painted under the header");
+    // Control: an author width WIDER than the content still holds.
+    let (wide, _) = normalize_and_measure(&src("300px"), &Inputs::default(), &fonts, &Env::default());
+    assert_eq!(col0(&wide), 300.0);
+    assert!(refusals(&narrow).is_empty() && refusals(&wide).is_empty());
+}

@@ -755,9 +755,19 @@ fn admitted_media(q: &str) -> Option<String> {
         let part = part.trim();
         let part = part.strip_prefix("only ").unwrap_or(part).trim();
         if part == "screen" || part == "all" || part.is_empty() { continue }
-        feats.push(admitted_feature(part)?);
+        let f = admitted_feature(part)?;
+        if !f.is_empty() { feats.push(f) }
     }
     Some(feats.join(" and "))
+}
+
+/// A single non-negative length the profile's media parser reads: a number
+/// and one of `px`, `em`, `rem`.
+fn plain_length(v: &str) -> bool {
+    let v = v.trim();
+    let unit_at = v.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(v.len());
+    let (num, unit) = v.split_at(unit_at);
+    matches!(unit, "px" | "em" | "rem") && num.parse::<f64>().is_ok_and(|n| n >= 0.0)
 }
 
 /// Split at `sep` where no parenthesis is open.
@@ -768,7 +778,11 @@ fn depth0_split<'a>(q: &'a str, sep: &str) -> Vec<&'a str> {
         match b[i] {
             b'(' => depth += 1,
             b')' => depth -= 1,
-            _ if depth == 0 && q[i..].starts_with(sep) => { out.push(&q[last..i]); i += sep.len(); last = i; continue }
+            // ★ Compare BYTES. Slicing `q[i..]` panicked on the first real
+            // query holding a multi-byte character (`screen\u{FFFD}…`, from
+            // a mis-decoded sheet); an ASCII separator can only match at a
+            // character boundary, so the slices below stay valid.
+            _ if depth == 0 && b[i..].starts_with(sep.as_bytes()) => { out.push(&q[last..i]); i += sep.len(); last = i; continue }
             _ => {}
         }
         i += 1;
@@ -801,11 +815,25 @@ fn admitted_feature(q: &str) -> Option<String> {
             // dropping the query would drop a whole responsive breakpoint.
             let value = inner.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
             match fold_px(value) {
-                Some(px) => Some(format!("({name}: {px}px)")),
-                None if value.contains("calc(") => None,
-                None => Some(q.to_string()),
+                Some(px) if px >= 0.0 => Some(format!("({name}: {px}px)")),
+                Some(_) => None,
+                // ★ Only a plain non-negative length passes through as written.
+                // "Anything that is not a calc()" used to pass: ScienceDirect
+                // ships `(max-width: getbreakpointdownvalue(48em))`, an
+                // unexpanded Sass function, and it reached the renderer —
+                // which refused the whole document. A browser treats such a
+                // query as never matching; dropping it (reported) is the same.
+                None if plain_length(value) => Some(format!("({name}: {value})")),
+                None => None,
             }
         }
+        // ★ The BOOLEAN form `(prefers-reduced-motion)` means "anything but
+        // the feature's 'none' value" (Media Queries 4 §2.4.4); the profile's
+        // parser takes only `name: value`, and Figma's sheet was refused for
+        // it. Rewritten to the value it stands for — or, where every value is
+        // true (a colour scheme, an orientation), to no condition at all.
+        "prefers-reduced-motion" if !inner.contains(':') => Some("(prefers-reduced-motion: reduce)".into()),
+        "prefers-color-scheme" | "orientation" if !inner.contains(':') => Some(String::new()),
         "prefers-color-scheme" | "prefers-reduced-motion" | "orientation" => Some(q.to_string()),
         _ => None,
     }
@@ -1006,5 +1034,17 @@ mod media_tests {
         assert_eq!(m("print and (max-width: 600px)"), None);
         assert_eq!(m("(max-width: 600px), (orientation: portrait)"), None);
         assert_eq!(m("not all and (max-width: 600px)"), None);
+        // ★ From the 96-document run: an unexpanded Sass function and a
+        // negative bound are dropped, never passed through to be refused…
+        assert_eq!(m("(max-width: getbreakpointdownvalue(48em))"), None);
+        assert_eq!(m("(max-width: calc(0px - 1px))"), None);
+        assert_eq!(m("(min-width: 48em)").as_deref(), Some("(min-width: 48em)"), "a plain em length passes");
+        // …and the boolean form becomes the value it stands for.
+        assert_eq!(m("(prefers-reduced-motion)").as_deref(), Some("(prefers-reduced-motion: reduce)"));
+        assert_eq!(m("screen and (orientation)").as_deref(), Some(""), "always true: no condition");
+        assert_eq!(m("(prefers-color-scheme) and (max-width: 600px)").as_deref(), Some("(max-width: 600px)"));
+        // A mis-decoded sheet: refused, never a panic.
+        assert_eq!(m("screen\u{FFFD}\u{FFFD} and (max-width: 600px)"), None);
+        assert_eq!(m("screen and (max-width: 600px) and (\u{e9}t\u{e9}: 1)"), None);
     }
 }

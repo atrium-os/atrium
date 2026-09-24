@@ -77,6 +77,13 @@ noscript { display: none }
    worse than showing none — FreeBSD's man page rendered its whole version
    dropdown, 200 releases, as a paragraph. */
 option, optgroup, datalist { display: none }
+/* ★ HTML's own hiding: the `hidden` attribute and a closed <dialog>. The UA
+   sheet had neither, so every element a page marks hidden rendered — arXiv's
+   closed citation modal covered the whole abstract page in grey. Author CSS
+   still overrides these, exactly as in a browser. */
+[hidden] { display: none }
+dialog { display: none }
+dialog[open] { display: block }
 table { display: table; border-spacing: 2px 2px }
 tr { display: table-row }
 td, th { display: table-cell; padding-top: 1px; padding-right: 1px; padding-bottom: 1px; padding-left: 1px }
