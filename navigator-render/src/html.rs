@@ -130,6 +130,10 @@ struct Cx<'a> {
     /// `width: 1px; overflow: hidden`, across the page as visible text.
     /// They are placed after the line box that would have held them.
     pending_abs: Vec<Handle>,
+    /// ★ The element whose background colour became the CANVAS's (CSS
+    /// Backgrounds 3 §2.11.2): the root's, or — when the root has none —
+    /// the body's. Its own box does not paint that colour again.
+    canvas_src: Option<Handle>,
     /// Set by `abs_box`: the border-box origin `block()` must use instead of
     /// the one normal flow would give it.
     abs_origin: Option<(U, U)>,
@@ -180,11 +184,23 @@ pub fn render_html_with(html: &str, fonts: &FontSet, env: &Env, subs: &Subresour
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]),
                       viewport: (u(env.width_px), Some(u(env.height_px))), pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))),
-                      subs, placing_abs: false, pending_abs: vec![], abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
+                      subs, placing_abs: false, pending_abs: vec![], canvas_src: None, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
     cx.promoted = promote_block_in_inline(&dom, &styled.styles);
     cx.count_unread_rows();
     // The root element is the initial containing block's only child.
     let root = dom.element_children(dom.root()).into_iter().next();
+    // ★ THE CANVAS. The root's background paints the whole canvas, not the
+    // root box; when the root has none, the BODY's is used instead and the
+    // body's own box paints nothing (CSS Backgrounds 3 §2.11.2). Without
+    // this, example.com — `body { background: #eee; width: 60vw }` — came
+    // out as a grey column on white instead of a grey page.
+    let body = root.and_then(|r| dom.element_children(r).into_iter().find(|c| dom.tag(*c) == Some("body")));
+    let bg_of = |h: Handle| styled.styles.get(h as usize).and_then(|s| s.as_ref()).map(|s| color_of(s, "background-color")).unwrap_or(0);
+    cx.canvas_src = [root, body].into_iter().flatten().find(|h| bg_of(*h) & 0xff != 0);
+    let canvas = cx.canvas_src.map(|src| {
+        cx.scene.rect(Rect { x: 0, y: 0, w: u(env.width_px), h: 0, rgba: bg_of(src), radii: [0; 4], ring: 0 });
+        cx.scene.rects.len() - 1
+    });
     // The root's containing block is the viewport: definite in both axes.
     let h = match root { Some(r) => cx.block(r, 0, 0, u(env.width_px), Some(u(env.height_px)), (None, None)), None => 0 };
     // ★ The scene's extent is what a reader can scroll to, and that is the
@@ -199,6 +215,7 @@ pub fn render_html_with(html: &str, fonts: &FontSet, env: &Env, subs: &Subresour
         .chain(cx.scene.grads.iter().map(|g| g.area.y + g.area.h))
         .max().unwrap_or(0);
     cx.scene.height = h.max(u(env.height_px)).max(bottom);
+    if let Some(i) = canvas { cx.scene.rects[i].h = cx.scene.height }
     cx.scene.order = restack(&cx.scene.order, &cx.contexts, &cx.hoists);
     cx.scene.resolve_xforms();
     diagnostics.extend(cx.diagnostics);
@@ -232,7 +249,7 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None,
                       indent: None, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), viewport: (u(env.width_px), Some(u(env.height_px))),
                       pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))), subs: &Subresources::new(),
-                      placing_abs: false, pending_abs: vec![], abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
+                      placing_abs: false, pending_abs: vec![], canvas_src: None, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
     // (cell handle, min, max) for every first-row cell of every table.
     let mut decls: Vec<(Handle, U, U)> = vec![];
     for t in 0..dom.nodes.len() as Handle {
@@ -611,7 +628,7 @@ impl<'a> Cx<'a> {
             if f < 1.0 { for r in &mut radii { *r = (*r as f64 * f) as U } }
         }
         let bg = color_of(s, "background-color");
-        if bg & 0xff != 0 { paint.push(Rect { x: bx, y: by, w, h: hgt, rgba: bg, radii, ring: 0 }) }
+        if bg & 0xff != 0 && self.canvas_src != Some(h) { paint.push(Rect { x: bx, y: by, w, h: hgt, rgba: bg, radii, ring: 0 }) }
         // ★ The background image goes OVER the background colour and under
         // everything else, so it is inserted at the box's own slot, after the
         // colour. Its positioning area is the PADDING box (CSS's
@@ -1492,6 +1509,24 @@ impl<'a> Cx<'a> {
     /// `width` INCLUDES padding and border here — border-box is the profile's
     /// fixed rule) plus its horizontal margins. `cb_w` of 0 asks for the
     /// intrinsic answer, which is what `intrinsic` needs.
+    /// The MIN-content outer width of an atomic inline, when that differs
+    /// from its max-content one: an `auto`-width box that is not replaced,
+    /// whose own content can wrap. `None` means its width is fixed (a length,
+    /// `max-content`, or a replaced element's own size).
+    fn atomic_min_outer_w(&mut self, h: Handle) -> Option<U> {
+        let cs = self.st(h)?;
+        if !matches!(cs.get("width"), V::Kw(k) if *k != "max-content") { return None }
+        if self.replaced_size(h).is_some() { return None }
+        let px = |p: &str| len(cs.get(p), 0).unwrap_or(0);
+        let (ml, mr) = (px("margin-left"), px("margin-right"));
+        let border = |side: &str| if kw(cs, &format!("border-{side}-style")) == "none" { 0 } else { px(&format!("border-{side}-width")) };
+        let frame = px("padding-left") + px("padding-right") + border("left") + border("right");
+        let mut bw = frame + self.intrinsic(h).0;
+        if let Some(m) = len(cs.get("max-width"), 0) { bw = bw.min(m) }
+        if let Some(m) = len(cs.get("min-width"), 0) { bw = bw.max(m) }
+        Some(bw.max(frame) + ml + mr)
+    }
+
     fn atomic_outer_w(&mut self, h: Handle, cb_w: U) -> U {
         let Some(cs) = self.st(h) else { return 0 };
         let px = |p: &str| len(cs.get(p), cb_w).unwrap_or(0);
@@ -1608,7 +1643,13 @@ impl<'a> Cx<'a> {
                 Item::Space(st, _) => line += self.sh.shape(" ", st, &mut self.report).iter().map(|p| p.width).sum::<U>(),
                 Item::Atomic(ah, ..) => {
                     let w = self.atomic_outer_w(*ah, 0);
-                    mn = mn.max(w);
+                    // ★ A shrink-to-fit inline-block wraps INSIDE itself, so
+                    // its min-content contribution is its own min-content,
+                    // not its max-content. Taking the max made every
+                    // inline-block an unbreakable slab: MDN's table-of-contents
+                    // link "Visual layout of table contents" set the whole
+                    // column's minimum at 234 px, 26 more than it had.
+                    mn = mn.max(self.atomic_min_outer_w(*ah).unwrap_or(w));
                     line += w;
                 }
                 Item::Tab(st, l) => {
@@ -2022,7 +2063,14 @@ impl<'a> Cx<'a> {
             // Decorations span the gaps between words of one decorated run
             // (CSS draws one line under `<a>link with a region</a>`, not four).
             let mut deco: Vec<(u32, U, U, U, U)> = vec![]; // (colour, y, x0, x1, thickness)
-            for p in &line {
+            // ★ Decorations extend only over CONTIGUOUS decorated items. The
+            // index of the item each open decoration last covered: an item
+            // without that decoration in between ends it. Matching on colour
+            // alone bridged two links on one line into one underline running
+            // through the plain text between them — MDN's "CSS property sets
+            // how the content of a replaced element", all underlined.
+            let mut deco_last: Vec<usize> = vec![];
+            for (pi, p) in line.iter().enumerate() {
                 let mut px = x + shift + p.x;
                 let start = px;
                 // visibility: hidden — the space is taken (positions are
@@ -2048,12 +2096,20 @@ impl<'a> Cx<'a> {
                     px += piece.width;
                 }
                 let thick = (p.st.size / 16).max(PX);
-                for (c, dy) in [(p.line.underline, thick), (p.line.strike, -scale(p.st.size, 1, 3))] {
+                // ★ A decoration is NOT drawn across an atomic inline (CSS
+                // Text Decoration 3 §2.1): an inline-block's own text is
+                // decorated by its own line boxes, inside it. Drawing the line
+                // across the whole margin box as well underlined MDN's table
+                // of contents through each link's padding — "_Try it_".
+                let (under, strike) = if p.atomic.is_some() { (None, None) } else { (p.line.underline, p.line.strike) };
+                for (c, dy) in [(under, thick), (strike, -scale(p.st.size, 1, 3))] {
                     let Some(c) = c else { continue };
                     let yline = yy + base + dy;
-                    match deco.iter_mut().find(|d| d.0 == c && d.1 == yline && d.4 == thick) {
-                        Some(d) => d.3 = px,
-                        None => deco.push((c, yline, start, px, thick)),
+                    let open = deco.iter().zip(&deco_last)
+                        .position(|(d, last)| d.0 == c && d.1 == yline && d.4 == thick && last + 1 == pi);
+                    match open {
+                        Some(k) => { deco[k].3 = px; deco_last[k] = pi }
+                        None => { deco.push((c, yline, start, px, thick)); deco_last.push(pi) }
                     }
                 }
                 match (p.st.link, &mut link_span) {
@@ -2172,6 +2228,76 @@ mod tests {
         assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 100, 20)]);
         assert_eq!(boxes(&o, 0x00ff00ff), vec![(110, 0, 380, 20)], "grows into the free space, gaps honoured");
         assert_eq!(boxes(&o, 0x0000ffff), vec![(500, 0, 100, 20)]);
+    }
+
+    /// ★ THE CANVAS: with no root background, the BODY's paints the whole
+    /// canvas and its own box paints nothing (CSS Backgrounds 3 §2.11.2).
+    /// example.com is `body { background: #eee; width: 60vw }` — a grey
+    /// page, not a grey column on white.
+    #[test]
+    fn the_body_background_paints_the_canvas() {
+        let src = r#"<style>body { background-color: #eeeeee; width: 300px; margin-left: 100px }</style>
+            <body><p>x</p></body>"#;
+        let o = render(src);
+        let grey = boxes(&o, 0xeeeeeeff);
+        assert_eq!(grey.len(), 1, "one canvas fill, not the canvas AND the body box: {grey:?}");
+        assert_eq!((grey[0].0, grey[0].1, grey[0].2), (0, 0, 800), "it covers the canvas, not the 300 px body");
+        assert!(grey[0].3 >= 600, "at least one viewport tall");
+        // Control: the same colour on an ordinary element stays on its box.
+        let c = render(&src.replace("body { background-color: #eeeeee;", "p { background-color: #eeeeee } body {"));
+        let p = boxes(&c, 0xeeeeeeff);
+        assert_eq!((p.len(), p[0].0, p[0].2), (1, 100, 300), "a <p> keeps its own box: {p:?}");
+    }
+
+    /// ★ Two links on one line get two underlines: the plain text between
+    /// them is not decorated, however alike the links are.
+    #[test]
+    fn plain_text_between_two_links_is_not_underlined() {
+        let o = render(r##"<style>body { margin-left: 0px; margin-top: 0px }</style>
+            <p>The <a href="#a">first</a> plain words between <a href="#b">second link</a> end.</p>"##);
+        let under: Vec<_> = rects(&o).into_iter().filter(|r| r.rgba == 0x0969daff).collect();
+        assert_eq!(under.len(), 2, "one underline per link, none across the gap: {under:?}");
+        let plain = o.scene.runs.iter().find(|r| r.text.contains("plain")).expect("plain text").x;
+        assert!(under.iter().all(|u| u.x + u.w <= plain || u.x > plain), "no underline crosses the plain text");
+    }
+
+    /// ★ An auto-width inline-block wraps inside itself, so its min-content
+    /// contribution is its OWN min-content. Treating it as an unbreakable
+    /// slab at its max-content width pushed MDN's table of contents 26 px
+    /// out of its column.
+    #[test]
+    fn an_inline_block_contributes_its_min_content_not_its_max() {
+        let src = r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .row { display: flex; width: 120px }
+            .nav { background-color: #ff0000; height: 10px }
+            .ib { display: inline-block }</style>
+            <div class="row"><div class="nav"><span class="ib">several short words that wrap</span></div></div>"#;
+        let o = render(src);
+        let nav = boxes(&o, 0xff0000ff);
+        assert_eq!(nav.len(), 1);
+        assert!(nav[0].2 <= 120, "the item shrinks into its 120 px line: {}", nav[0].2);
+        // Control: an unbreakable word of the same length does NOT fit, and
+        // the item keeps its min-content width, overflowing.
+        let c = render(&src.replace("several short words that wrap", "severalshortwordsthatcannotwrap"));
+        assert!(boxes(&c, 0xff0000ff)[0].2 > 120, "the control really is wider than the line");
+    }
+
+    /// ★ An inline-block's underline is under its TEXT, drawn by its own
+    /// line boxes — never across its padding by the line that holds it.
+    #[test]
+    fn an_inline_block_link_is_underlined_under_its_text_only() {
+        let src = r##"<style>body { margin-left: 0px; margin-top: 0px }
+            a { display: inline-block; padding-left: 20px; padding-right: 20px; color: #0969da }</style>
+            <div><a href="#x">Try it</a></div>"##;
+        let o = render(src);
+        let under: Vec<_> = rects(&o).into_iter().filter(|r| r.rgba == 0x0969daff).collect();
+        let run = o.scene.runs.iter().find(|r| r.text.contains("Try")).expect("the link text");
+        assert_eq!(under.len(), 1, "exactly one underline: {under:?}");
+        assert_eq!(under[0].x, run.x, "it starts where the text does, inside the padding");
+        // Control: the same link INLINE (padding is still there) is underlined
+        // once as well — the change is about atomic inlines only.
+        let c = render(&src.replace("display: inline-block; ", ""));
+        assert_eq!(rects(&c).into_iter().filter(|r| r.rgba == 0x0969daff).count(), 1);
     }
 
     /// ★ A `max-height` on a clipping box is an upper bound the content
@@ -2596,7 +2722,7 @@ mod tests {
                           report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None,
                           baseline_probe: None, indent: None, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]),
                           viewport: (0, None), pos_cb: (0, 0, 0, None), subs: &Subresources::new(),
-                          placing_abs: false, pending_abs: vec![], abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
+                          placing_abs: false, pending_abs: vec![], canvas_src: None, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
         cx.count_rows_outside(&held_out);
         // The non-initial value is counted once; the initial one is not.
         assert_eq!(cx.unimplemented.get("row text-align… (not implemented)"), Some(&1), "{:?}", cx.unimplemented);

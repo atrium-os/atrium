@@ -1703,6 +1703,24 @@ may end up shorter, but nothing can be painted past that line. (It had been wron
 before this session; verified by rebuilding the parent commit in the same tree. Earlier
 in this log, "renders as the site itself looks" was too generous about doc01.)
 
+**The last seven unreviewed documents (Wikipedia ×2, MDN ×3, danluu, example.com): four
+bugs, all general.** With these, all 29 corpus documents have been looked at.
+- ★ **A decoration is not drawn across an atomic inline** (CSS Text Decoration 3 §2.1).
+  An inline-block's text is underlined by its own line boxes; the line holding it ALSO
+  drew one across its whole margin box, so every MDN table-of-contents link came out
+  underlined through its padding — "_Try it_".
+- ★★ **An inline-block's min-content contribution is its OWN min-content.** It wraps
+  inside itself; measuring it as an unbreakable slab at its max-content width set the
+  minimum of MDN's contents column by its longest entry, 26 px wider than the column.
+- ★ **A decoration extends only over contiguous decorated items.** Matching open
+  underlines by colour alone bridged two links on one line into one underline through
+  the plain text between them: "CSS property sets how the content of a replaced element",
+  all underlined.
+- ★★ **The canvas takes the root's background, or the body's** (CSS Backgrounds 3
+  §2.11.2). example.com is `body { background: #eee; width: 60vw }` — a grey PAGE,
+  which rendered as a grey column on white. The body's own box now paints nothing and
+  the canvas fill spans the whole document.
+
 ★ **Two renderer tests had been failing for hours** — a stale sample golden and a pinned
 `nsg 0.1` header — behind `grep -c "test result: ok"`, which counts the suites that passed
 and cannot see one that failed. Counted properly: **505 tests, 0 failures, six crates**.
