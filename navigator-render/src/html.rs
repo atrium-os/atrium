@@ -250,10 +250,12 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
                       indent: None, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), viewport: (u(env.width_px), Some(u(env.height_px))),
                       pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))), subs: &Subresources::new(),
                       placing_abs: false, pending_abs: vec![], canvas_src: None, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
-    // (cell handle, min, max) for every first-row cell of every table.
-    let mut decls: Vec<(Handle, U, U)> = vec![];
+    // (table, per-column (min, max), its first row's cells) for every table.
+    let mut tables: Vec<(Handle, Vec<(U, U)>, Vec<Handle>)> = vec![];
     for t in 0..dom.nodes.len() as Handle {
-        if cx.st(t).map(|cs| kw(cs, "display")) != Some("table") { continue }
+        let Some(ts) = cx.st(t) else { continue };
+        if kw(ts, "display") != "table" { continue }
+        let sx = match ts.get("border-spacing") { V::Pair(a, _) => len(a, 0).unwrap_or(0), _ => 0 };
         // Rows, flattening any wrapper — the same walk the layout does.
         let mut rows = vec![];
         let mut stack: Vec<Handle> = dom.element_children(t).into_iter().rev().collect();
@@ -267,57 +269,114 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
         // Collected up front: the measuring loop needs `cx` mutably.
         let rows_cells: Vec<Vec<Handle>> = rows.iter().map(|r| dom.element_children(*r).into_iter()
             .filter(|c| cx.st(*c).map(|cs| kw(cs, "display")) == Some("table-cell")).collect()).collect();
-        let Some(first_cells) = rows_cells.first().cloned() else { continue };
-        let ncols = first_cells.len();
+        // ★ COLSPAN: a row has as many columns as its cells' spans add up
+        // to, and the table as many as its widest row.
+        let ncols = rows_cells.iter().map(|cells| cells.iter().map(|c| cx.colspan(*c)).sum::<usize>()).max().unwrap_or(0);
         if ncols == 0 { continue }
-        // ★ Every row decides the column, not just the first: a header cell
-        // is often the SHORTEST text in its column.
         let mut mins = vec![0 as U; ncols];
         let mut maxs = vec![0 as U; ncols];
+        // Author `<col>` widths are floors, like a cell's (below).
+        let author_cols = cx.column_decls(t).ok().unwrap_or_default().into_iter()
+            .filter(|c| dom.tag(*c) == Some("col")).collect::<Vec<_>>();
+        for (i, c) in author_cols.iter().enumerate().take(ncols) {
+            if let Some(cw) = cx.st(*c).and_then(|cs| match cs.get("width") { V::Len(_) => len(cs.get("width"), 0), _ => None }) {
+                mins[i] = mins[i].max(cw); maxs[i] = maxs[i].max(cw);
+            }
+        }
+        // (first column, span, min, max) of every SPANNING cell, settled
+        // after the single-column cells have set their columns.
+        let mut spanning: Vec<(usize, usize, U, U)> = vec![];
         for cells in &rows_cells {
-            for (i, c) in cells.iter().copied().enumerate().take(ncols) {
+            let mut k = 0usize;
+            for c in cells.iter().copied() {
+                let n = cx.colspan(c).min(ncols.saturating_sub(k)).max(1);
+                if k >= ncols { break }
                 let (mn, mx) = cx.intrinsic(c);
                 let pad = cx.st(c).map(|cs| {
                     let p = |n: &str| len(cs.get(n), 0).unwrap_or(0);
                     let b = |n: &str| if kw(cs, &format!("border-{n}-style")) == "none" { 0 } else { p(&format!("border-{n}-width")) };
                     p("padding-left") + p("padding-right") + b("left") + b("right")
                 }).unwrap_or(0);
-                mins[i] = mins[i].max(mn + pad);
-                maxs[i] = maxs[i].max(mx + pad);
                 // ★ A cell's own `width` is a FLOOR in automatic table layout
-                // (CSS 2.1 §17.5.2.2), never a cap: the column is at least
-                // its content's min-content. The profile reads a first-row
-                // `width` as EXACT, so the author's value is folded into the
-                // measured pair here and the exact reading switched off below.
-                // Leaving it in let the W3C specs' `th { width: 3em }` hold
-                // their property tables' header column to 48 px, and
-                // "Initial:" and "Inherited:" painted over their values.
-                if let Some(cw) = cx.st(c).and_then(|cs| match cs.get("width") { V::Len(_) => len(cs.get("width"), 0), _ => None }) {
-                    mins[i] = mins[i].max(cw);
-                    maxs[i] = maxs[i].max(cw);
+                // (CSS 2.1 §17.5.2.2), never a cap: the column is at least its
+                // content's min-content. Taken as exact, the W3C specs'
+                // `th { width: 3em }` held their property tables' header
+                // column to 48 px and "Initial:" painted over its value.
+                let floor = cx.st(c).and_then(|cs| match cs.get("width") { V::Len(_) => len(cs.get("width"), 0), _ => None }).unwrap_or(0);
+                let (mn, mx) = ((mn + pad).max(floor), (mx + pad).max(floor));
+                if n == 1 {
+                    mins[k] = mins[k].max(mn);
+                    maxs[k] = maxs[k].max(mx);
+                } else {
+                    spanning.push((k, n, mn, mx));
+                }
+                k += n;
+            }
+        }
+        // ★ A spanning cell that needs more than its columns give (with the
+        // spacing between them) spreads the shortfall over those columns
+        // (CSS 2.1 §17.5.2.2), narrowest spans first so the wider ones see
+        // the columns the narrower ones already grew.
+        spanning.sort_by_key(|x| x.1);
+        for (k, n, mn, mx) in spanning {
+            let inner = sx * (n as U - 1);
+            for (want, v) in [(mn, &mut mins), (mx, &mut maxs)] {
+                let have: U = v[k..k + n].iter().sum::<U>() + inner;
+                if want > have {
+                    let short = want - have;
+                    for (j, slot) in v[k..k + n].iter_mut().enumerate() {
+                        *slot += short / n as U + if j == n - 1 { short % n as U } else { 0 };
+                    }
                 }
             }
         }
-        for (i, c) in first_cells.into_iter().enumerate() {
-            decls.push((c, mins[i], maxs[i].max(mins[i])));
-        }
+        for i in 0..ncols { maxs[i] = maxs[i].max(mins[i]) }
+        tables.push((t, mins.into_iter().zip(maxs).collect(), rows_cells.first().cloned().unwrap_or_default()));
     }
-    let n = decls.len();
+    let n: usize = tables.iter().map(|(_, c, _)| c.len()).sum();
     if n == 0 { return (html.to_string(), 0) }
-    // Emit as a stylesheet rather than inline styles: the profile has no
-    // inline style attribute, and the normalizer has just removed them all.
+    // ★ Emitted as `<col>` DECLARATIONS, one per column, in a `<colgroup>`
+    // that replaces any the author wrote: first-row cells cannot declare
+    // the columns of a table whose first row spans. The measured values go
+    // in a stylesheet placed AFTER the document's own (the profile has no
+    // inline style attribute).
     let mut css = String::new();
     let mut dom2 = navigator_dom::parse(html);
-    for (k, (h, mn, mx)) in decls.into_iter().enumerate() {
-        let cls = format!("tc{k}");
-        let existing = dom2.attr(h, "class").unwrap_or("").to_string();
-        dom2.set_attr(h, "class", &format!("{existing} {cls}").trim().to_string());
-        let _ = &mut css;
-        css.push_str(&format!(".{cls} {{ width: auto; min-width: {}px; max-width: {}px }}\n", mn as f64 / PX as f64, mx as f64 / PX as f64));
+    let mut k = 0usize;
+    for (t, cols, first) in tables {
+        // ★ `<col>` survives parsing only inside a real `<table>`: a CSS
+        // table (a `div` or `ul` with `display: table`) loses it, and fell
+        // back to undeclared columns — Wikipedia's portal box was refused.
+        // Such a table declares on its first row's cells instead, which it
+        // always can: a CSS table's cells never span.
+        if dom2.tag(t) != Some("table") {
+            for (c, (mn, mx)) in first.into_iter().zip(cols) {
+                let existing = dom2.attr(c, "class").unwrap_or("").to_string();
+                dom2.set_attr(c, "class", format!("{existing} tc{k}").trim());
+                // `width: auto`: the author's width is already folded in as
+                // a floor, and a first-row width would otherwise be EXACT.
+                css.push_str(&format!(".tc{k} {{ width: auto; min-width: {}px; max-width: {}px }}\n", mn as f64 / PX as f64, mx as f64 / PX as f64));
+                k += 1;
+            }
+            continue;
+        }
+        for c in dom2.element_children(t) {
+            if matches!(dom2.tag(c), Some("col") | Some("colgroup")) {
+                if let Some(p) = dom2.get_mut(t) { p.children.retain(|x| *x != c) }
+            }
+        }
+        let group = dom2.create(Kind::Element("colgroup".into()));
+        for (mn, mx) in cols {
+            let col = dom2.create(Kind::Element("col".into()));
+            dom2.set_attr(col, "class", &format!("tc{k}"));
+            css.push_str(&format!(".tc{k} {{ min-width: {}px; max-width: {}px }}\n", mn as f64 / PX as f64, mx as f64 / PX as f64));
+            dom2.append(group, col);
+            k += 1;
+        }
+        // First, before any row: where HTML puts a colgroup.
+        dom2.append(t, group);
+        if let Some(p) = dom2.get_mut(t) { let g = p.children.pop().unwrap(); p.children.insert(0, g) }
     }
-    // ★ AFTER the document's own stylesheet, so that on equal specificity the
-    // measured declarations win — `width: auto` must beat the author's
-    // `width`, which is already folded in above.
     let style = dom2.create(Kind::Element("style".into()));
     let text = dom2.create(Kind::Text(css));
     dom2.append(style, text);
@@ -920,6 +979,46 @@ impl<'a> Cx<'a> {
         (cx + (cw - tw) / 2, cy + (ch - th) / 2, tw, th)
     }
 
+    /// A cell's `colspan`: HTML's parsing rules (a positive integer, at most
+    /// 1000), 1 when absent or invalid.
+    fn colspan(&self, c: Handle) -> usize {
+        // Only an HTML table cell spans; a CSS table's cells cannot.
+        if !matches!(self.dom.tag(c), Some("td") | Some("th")) { return 1 }
+        self.dom.attr(c, "colspan").and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 1).map(|n| n.min(1000)).unwrap_or(1)
+    }
+
+    /// ★ The elements that DECLARE a table's columns (§3.13): its `<col>`s,
+    /// direct or inside a `<colgroup>`, one per column — or, when it has
+    /// none, the cells of its first row. The second form cannot describe a
+    /// first row that SPANS (every Wikipedia navbox opens with one title
+    /// cell across both columns), so such a table must use `<col>`.
+    fn column_decls(&self, h: Handle) -> Result<Vec<Handle>, &'static str> {
+        let mut cols = vec![];
+        for c in self.dom.element_children(h) {
+            match self.dom.tag(c) {
+                Some("col") => cols.push(c),
+                Some("colgroup") => cols.extend(self.dom.element_children(c).into_iter().filter(|g| self.dom.tag(*g) == Some("col"))),
+                _ => {}
+            }
+        }
+        if !cols.is_empty() { return Ok(cols) }
+        let mut stack: Vec<Handle> = self.dom.element_children(h).into_iter().rev().collect();
+        while let Some(c) = stack.pop() {
+            match self.st(c).map(|cs| kw(cs, "display")) {
+                Some("table-row") => {
+                    let cells: Vec<Handle> = self.dom.element_children(c).into_iter()
+                        .filter(|x| self.st(*x).map(|cs| kw(cs, "display")) == Some("table-cell")).collect();
+                    if cells.iter().any(|x| self.colspan(*x) > 1) { return Err("spanning first row") }
+                    return Ok(cells);
+                }
+                Some("none") => {}
+                _ => for g in self.dom.element_children(c).into_iter().rev() { stack.push(g) },
+            }
+        }
+        Ok(vec![])
+    }
+
     /// The narrowest a table can be: its declared column minimums plus the
     /// spacing around and between them. `None` when the columns are not
     /// declared, in which case the table is refused anyway (§3.13).
@@ -928,18 +1027,7 @@ impl<'a> Cx<'a> {
             V::Pair(a, b) => (len(a, cb_w).unwrap_or(0), len(b, 0).unwrap_or(0)),
             _ => (0, 0),
         };
-        // The first row, flattening any wrapper — the same walk the layout does.
-        let mut stack: Vec<Handle> = self.dom.element_children(h).into_iter().rev().collect();
-        let mut first = None;
-        while let Some(c) = stack.pop() {
-            match self.st(c).map(|cs| kw(cs, "display")) {
-                Some("table-row") => { first = Some(c); break }
-                Some("none") => {}
-                _ => for g in self.dom.element_children(c).into_iter().rev() { stack.push(g) },
-            }
-        }
-        let cells: Vec<Handle> = self.dom.element_children(first?).into_iter()
-            .filter(|c| self.st(*c).map(|cs| kw(cs, "display")) == Some("table-cell")).collect();
+        let cells = self.column_decls(h).ok()?;
         if cells.is_empty() { return None }
         let mut total = sx * (cells.len() as U + 1);
         for c in &cells {
@@ -1438,8 +1526,16 @@ impl<'a> Cx<'a> {
         // by "the same shape as resolving grid tracks of
         // minmax(min-content, max-content)": the expensive half is
         // precomputed, the viewport-dependent half stays here.
-        let Some(first) = rows.first().copied() else { return 0 };
-        let first_cells = cells_of(self, first);
+        if rows.is_empty() { return 0 }
+        let first_cells = match self.column_decls(h) {
+            Ok(c) if !c.is_empty() => c,
+            Ok(_) => return 0,
+            Err(_) => {
+                self.diagnostics.push(Diagnostic { pos: Pos { line: 0, col: 0 }, code: "table.column-width-undeclared",
+                    msg: "a table whose first row spans columns must declare its columns with <col> elements (§3.13); table refused".into() });
+                return 0;
+            }
+        };
         let avail = (w - sx * (first_cells.len() as U + 1)).max(0);
         let mut tracks: Vec<navigator_style::values::Track> = vec![];
         let (mut mins, mut maxs): (Vec<U>, Vec<U>) = (vec![], vec![]);
@@ -1490,24 +1586,48 @@ impl<'a> Cx<'a> {
         let mut cy = y + sy;
         for r in rows {
             let cells = cells_of(self, r);
+            // ★ Each cell takes the next `colspan` columns, and its width is
+            // theirs together with the spacing between them. A cell past the
+            // declared columns keeps the old fallback (the last column's
+            // width) and is counted, not silently squeezed.
+            let mut k = 0usize;
+            let mut widths: Vec<U> = vec![];
+            let mut starts: Vec<usize> = vec![];
+            for c in &cells {
+                if self.dom.attr(*c, "rowspan").and_then(|v| v.trim().parse::<usize>().ok()).is_some_and(|n| n > 1) {
+                    self.count("rowspan (the cell occupies one row)");
+                }
+                let n = self.colspan(*c);
+                starts.push(k);
+                if k >= cols.len() {
+                    self.count("table cell past the declared columns");
+                    widths.push(*cols.last().expect("non-empty"));
+                } else {
+                    let end = (k + n).min(cols.len());
+                    widths.push(cols[k..end].iter().sum::<U>() + sx * (end - k - 1) as U);
+                }
+                k += n;
+            }
             // Natural heights first: the row is as tall as its tallest cell.
             let nat: Vec<U> = cells.iter().enumerate()
-                .map(|(i, c)| { let cw = *cols.get(i).unwrap_or(cols.last().expect("non-empty")); self.table_part = true; self.measure(*c, cw, None, (Some(cw), None)) })
+                .map(|(i, c)| { let cw = widths[i]; self.table_part = true; self.measure(*c, cw, None, (Some(cw), None)) })
                 .collect();
             let row_h = nat.iter().copied().max().unwrap_or(0);
             // Baselines, for cells aligned on one (the row's shared baseline).
             let bases: Vec<Option<U>> = cells.iter().enumerate().map(|(i, c)| {
                 let cs = self.st(*c).expect("styled");
                 (kw(cs, "vertical-align") == "baseline").then(|| {
-                    let cw = *cols.get(i).unwrap_or(cols.last().expect("non-empty"));
+                    let cw = widths[i];
                     self.table_part = true;
                     self.baseline(*c, cw, (Some(cw), None))
                 })
             }).collect();
             let max_b = bases.iter().flatten().copied().max().unwrap_or(0);
-            let mut cx = x + sx;
+            // Column i's left edge, so a cell starts where its first column does.
+            let col_x = |i: usize| -> U { x + sx + cols[..i.min(cols.len())].iter().sum::<U>() + sx * i.min(cols.len()) as U };
             for (i, c) in cells.iter().enumerate() {
-                let cw = *cols.get(i).unwrap_or(cols.last().expect("non-empty"));
+                let cw = widths[i];
+                let cx = if starts[i] < cols.len() { col_x(starts[i]) } else { col_x(cols.len()) };
                 let cs = self.st(*c).expect("styled");
                 // vertical-align positions the CONTENT inside the row's height;
                 // the cell box itself fills the row (separate-borders model).
@@ -1520,7 +1640,6 @@ impl<'a> Cx<'a> {
                 self.table_part = true;
                 self.block(*c, cx, cy, cw, Some(row_h), (Some(cw), Some(row_h)));
                 self.content_dy = 0;
-                cx += cw + sx;
             }
             cy += row_h + sy;
         }
@@ -2270,6 +2389,29 @@ mod tests {
         assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 100, 20)]);
         assert_eq!(boxes(&o, 0x00ff00ff), vec![(110, 0, 380, 20)], "grows into the free space, gaps honoured");
         assert_eq!(boxes(&o, 0x0000ffff), vec![(500, 0, 100, 20)]);
+    }
+
+    /// ★ COLSPAN. A navbox: one title cell across both columns, then label
+    /// and list side by side. Columns are declared by `<col>`, because a
+    /// first row that spans cannot declare them.
+    #[test]
+    fn a_spanning_title_row_and_col_declared_columns() {
+        let src = r#"<style>body { margin-left: 0px; margin-top: 0px }
+            table { border-spacing: 10px 0px } .c0 { width: 100px } .c1 { width: 300px }
+            .t { background-color: #ff0000 } .l { background-color: #00ff00 } .v { background-color: #0000ff }</style>
+            <table><colgroup><col class="c0"><col class="c1"></colgroup>
+            <tr><th class="t" colspan="2">Title</th></tr>
+            <tr><th class="l">People</th><td class="v">Bob Fabry, Keith Bostic</td></tr></table>"#;
+        let o = render(src);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let (t, l, v) = (boxes(&o, 0xff0000ff), boxes(&o, 0x00ff00ff), boxes(&o, 0x0000ffff));
+        assert_eq!((t[0].0, t[0].2), (10, 100 + 10 + 300), "the title spans both columns AND the spacing between them");
+        assert_eq!((l[0].0, l[0].2), (10, 100));
+        assert_eq!((v[0].0, v[0].2), (10 + 100 + 10, 300), "the list sits beside its label, in column 2");
+        // Control: the same table without <col> cannot declare its columns
+        // from a first row that spans, and is refused — not guessed at.
+        let c = render(&src.replace(r#"<colgroup><col class="c0"><col class="c1"></colgroup>"#, ""));
+        assert!(c.diagnostics.iter().any(|d| d.code == "table.column-width-undeclared" && d.msg.contains("<col>")), "{:?}", c.diagnostics);
     }
 
     /// ★ Bare text inside a flex container is an anonymous flex item and

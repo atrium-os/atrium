@@ -129,7 +129,8 @@ bounded depth, `<base>` (ambient rewriting of every link).
 **Structural and semantic elements** are the core of the subset, and they are what feeds
 G5: sectioning (`article`, `section`, `nav`, `aside`, `header`, `footer`, `main`),
 headings `h1`–`h6`, `p`, lists, `figure`/`figcaption`, `blockquote`, `table` and its
-parts, `a`, `img`, inline emphasis and code, `details`/`summary`, and definition lists.
+parts (including `colgroup`/`col` and a cell's `colspan`, §3.9), `a`, `img`, inline
+emphasis and code, `details`/`summary`, and definition lists.
 
 **Forms** exist but hold no authority. A document may *declare* a form; submission is a
 user-initiated action performed by `navigatord`, not by the document — the document has
@@ -561,6 +562,22 @@ transforms, animations and transitions.
 algorithm is one of the most intricate in CSS (conflict resolution across four edges of
 adjacent cells) for a purely visual effect. Column widths arrive pre-measured (§3.13).
 
+**`colspan` is admitted** (added 2026-09-24). A cell with `colspan="n"` (HTML's parsing:
+a positive integer, at most 1000; anything else is 1) occupies the next *n* columns of its
+row, and its border box is their widths together with the `border-spacing` between them.
+Real reference content depends on it — every Wikipedia navbox opens with one title cell
+across two columns — and it costs the renderer a running column index, nothing more: the
+measurement that spanning cells complicate (how a span's content shares out over its
+columns) happens offline, in the producer (§3.13). A cell past the declared columns is laid
+out at the last column's width and counted as unimplemented, never silently squeezed.
+
+**`rowspan` is NOT admitted.** A cell's `rowspan` is ignored (the cell occupies one row)
+and counted as unimplemented. Unlike `colspan`, it makes a row's column positions depend on
+every row above it — the one piece of table layout that is not local to a row. In the
+78-document corpus, `colspan > 1` appears on 153 cells in 9 documents; `rowspan > 1` on
+44 cells in 3 (36 of them in one W3C specification). Admitting it is the next table
+decision, and should be taken on that evidence.
+
 **Count: 64 property rows across §3.3–§3.9**, which is the denominator M2's conformance
 number is expressed against. Grouped longhands (`margin-top/-right/-bottom/-left`) count as
 one row; an implementation must support all four.
@@ -842,6 +859,17 @@ with the document rather than with the viewport. Rather than exclude tables — 
 reference content depends on them — the measurement moves **offline**, into the
 normalizer or any other conforming producer (§6). A conforming table carries, per column,
 a declared `min-content` and `max-content` width.
+
+**Where the declaration lives.** Preferably on `<col>` elements — one per column, directly
+in the `table` or inside a `<colgroup>` — each carrying either an exact `width` or the pair
+`min-width`/`max-width`. A table with no `<col>` may instead declare on its FIRST ROW's
+cells, one per column; that form cannot describe a first row that spans, so a table whose
+first row has a `colspan` greater than 1 and no `<col>` elements is **refused** (§3.12). In
+the producer, a spanning cell's min- and max-content that its columns (plus the spacing
+between them) do not already cover is shared equally over those columns, narrowest spans
+first; and a cell's or `<col>`'s own author `width` is a floor under its column, never a
+cap (CSS 2.1 §17.5.2.2) — the profile's reading of a declared width as exact belongs to the
+declaration, not to the author's CSS.
 
 The renderer then performs a **bounded, deterministic distribution** of those declared
 widths into the available inline size — the same shape as resolving grid tracks of

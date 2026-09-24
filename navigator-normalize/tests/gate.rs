@@ -405,7 +405,7 @@ fn a_cells_declared_width_is_a_floor_not_a_cap() {
     };
     let (narrow, _) = normalize_and_measure(&src("10px"), &Inputs::default(), &fonts, &Env::default());
     assert!(col0(&narrow) > 60.0, "the word decides, not the 10px: {}", col0(&narrow));
-    assert!(narrow.contains("width: auto"), "the exact reading is switched off: {narrow}");
+    assert!(narrow.contains(r#"<col class="tc0">"#), "the columns are declared by <col>, not by the cells: {narrow}");
     // What the reader sees: the value starts AFTER the header's word ends.
     let o = render_html(&narrow, &fonts, &Env::default());
     let run = |t: &str| o.scene.runs.iter().find(|r| r.text == t).map(|r| r.x).expect(t);
@@ -414,4 +414,59 @@ fn a_cells_declared_width_is_a_floor_not_a_cap() {
     let (wide, _) = normalize_and_measure(&src("300px"), &Inputs::default(), &fonts, &Env::default());
     assert_eq!(col0(&wide), 300.0);
     assert!(refusals(&narrow).is_empty() && refusals(&wide).is_empty());
+}
+
+/// ★ COLSPAN, end to end. Every Wikipedia navbox opens with a title cell
+/// across both columns; declared from the first row, the table had ONE
+/// column, and every later row's list cell ran off the canvas. The
+/// normalizer now declares columns with `<col>` and settles spanning cells.
+#[test]
+fn a_navbox_with_a_spanning_title_row_is_declared_and_fits() {
+    let fonts = FontSet::load().expect("pinned font set");
+    let words = "Bob Fabry, Keith Bostic, Bill Joy, Marshall Kirk McKusick, Kirk McKusick ".repeat(3);
+    let src = format!(r#"<html><head><style>table {{ width: 100% }}</style></head><body><table>
+        <tr><th colspan="2">Berkeley Software Distribution</th></tr>
+        <tr><th>People</th><td>{words}</td></tr>
+        <tr><th>Companies</th><td>Sleepycat</td></tr></table></body></html>"#);
+    // Control: the raw document cannot be laid out by the profile.
+    assert!(!refusals(&src).is_empty(), "the control must be refused");
+    let (out, report) = normalize_and_measure(&src, &Inputs::default(), &fonts, &Env::default());
+    assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+    assert_eq!(report.columns_measured, 2, "two columns, though the first row has one cell");
+    assert_eq!(out.matches("<col class=").count(), 2, "{out}");
+    let o = render_html(&out, &fonts, &Env::default());
+    let run = |t: &str| o.scene.runs.iter().find(|r| r.text.starts_with(t)).expect(t).clone();
+    let (people, bob) = (run("People"), run("Bob"));
+    assert!(bob.x > people.x && bob.y == people.y, "the list sits BESIDE its label");
+    assert!(o.scene.runs.iter().all(|r| r.x < 800 * 64), "nothing starts past the canvas edge");
+
+    // A spanning cell wider than its columns makes them grow to fit it.
+    let wide = r#"<html><body><table><tr><td>a</td><td>b</td></tr>
+        <tr><td colspan="2">averyveryverylongunbreakablewordthatneedsroom</td></tr></table></body></html>"#;
+    let (out, _) = normalize_and_measure(wide, &Inputs::default(), &fonts, &Env::default());
+    let min = |k: usize| -> f64 { out.split(&format!(".tc{k} {{")).nth(1).unwrap().split("min-width: ").nth(1).unwrap()
+        .split("px").next().unwrap().parse().unwrap() };
+    assert!(min(0) + min(1) > 250.0, "the two columns together hold the long word: {} + {}", min(0), min(1));
+}
+
+/// ★ A CSS table (`display: table` on a `div` or `ul`) cannot hold `<col>` —
+/// the HTML parser drops it outside a real `<table>` — so its columns are
+/// declared on its first row's cells. Inserting `<col>` there left
+/// Wikipedia's portal box with undeclared columns, and it was refused. And
+/// `colspan` means nothing on a `div`: only an HTML cell spans.
+#[test]
+fn a_css_table_declares_on_its_first_row_and_does_not_span() {
+    let fonts = FontSet::load().expect("pinned font set");
+    let src = r#"<html><head><style>
+      .t { display: table } .r { display: table-row } .c { display: table-cell }
+    </style></head><body><div class="t">
+      <div class="r"><div class="c" colspan="2">left heading</div><div class="c">right</div></div>
+      <div class="r"><div class="c">a</div><div class="c">b</div></div></div></body></html>"#;
+    let (out, report) = normalize_and_measure(src, &Inputs::default(), &fonts, &Env::default());
+    assert!(refusals(&out).is_empty(), "{:?}\n{out}", refusals(&out));
+    assert_eq!(report.columns_measured, 2, "two columns: the div's colspan does not count");
+    assert!(!out.contains("<col"), "no <col> outside a real table: {out}");
+    let o = render_html(&out, &fonts, &Env::default());
+    let x = |t: &str| o.scene.runs.iter().find(|r| r.text == t).expect(t).x;
+    assert_eq!(x("right"), x("b"), "`right` is in column 2, above `b` — the div did not span");
 }

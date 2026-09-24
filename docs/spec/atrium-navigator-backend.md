@@ -1781,6 +1781,19 @@ first row that spans (every Wikipedia navbox) declares too few columns — a pro
 decision; horizontal carousels (TikTok, Spiegel) stack their slides; Asahi's content is
 shifted off the left edge; outside list markers at a zero-padding edge (Hacker News).
 
+**`colspan` admitted to the profile (2026-09-24)** — see profile §3.9 and §3.13. The
+renderer places each cell at a running column index and gives a spanning cell its
+columns' widths plus the spacing between them; columns are declared by `<col>` (a first
+row that spans cannot declare them, and without `<col>` such a table is refused). The
+producer settles a spanning cell's shortfall over its columns. Two corrections found by
+the corpus, not the tests: `<col>` survives parsing only inside a real `<table>`, so a CSS
+table (a `div`/`ul` with `display: table`) still declares on its first row — Wikipedia's
+portal box and a W3C layout table were REFUSED until it did; and only an HTML cell
+spans, so `colspan` on a `div` is ignored. 153 spanning cells in 9 of 78 documents;
+Wikipedia's navboxes now render as the site does, less the `::after` separators.
+78 documents: 0 refused; crossing the edge 13 → 10. `rowspan` stays out (44 cells in 3
+documents), a decision recorded with its numbers.
+
 ★ **Two renderer tests had been failing for hours** — a stale sample golden and a pinned
 `nsg 0.1` header — behind `grep -c "test result: ok"`, which counts the suites that passed
 and cannot see one that failed. Counted properly: **505 tests, 0 failures, six crates**.

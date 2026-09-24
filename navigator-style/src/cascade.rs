@@ -85,6 +85,8 @@ option, optgroup, datalist { display: none }
 dialog { display: none }
 dialog[open] { display: block }
 table { display: table; border-spacing: 2px 2px }
+/* Column DECLARATIONS (§3.13): read by the table, never laid out. */
+colgroup, col { display: none }
 tr { display: table-row }
 td, th { display: table-cell; padding-top: 1px; padding-right: 1px; padding-bottom: 1px; padding-left: 1px }
 th { font-weight: 700 }
