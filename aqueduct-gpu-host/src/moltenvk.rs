@@ -732,7 +732,7 @@ impl MoltenVkBackend {
                 return Err(format!("instance {i} references BLAS {} of {}", inst.blas, blases.len()));
             }
         }
-        let mut owned: Vec<(vk::Buffer, vk::DeviceMemory)> = Vec::new();
+        let owned: Vec<(vk::Buffer, vk::DeviceMemory)> = Vec::new();
 
         // Scratch alignment from the AS properties.
         let mut as_props = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
@@ -740,80 +740,14 @@ impl MoltenVkBackend {
         unsafe { self.instance.get_physical_device_properties2(self.physical, &mut p2) };
         let scratch_align =
             as_props.min_acceleration_structure_scratch_offset_alignment.max(256) as u64;
-        let align_up = |a: u64, al: u64| (a + al - 1) & !(al - 1);
 
-        unsafe {
-            let mut blas_handles: Vec<vk::AccelerationStructureKHR> = Vec::with_capacity(blases.len());
-            let mut blas_addrs: Vec<u64> = Vec::with_capacity(blases.len());
-            let mut blas_bytes_total = 0u64;
-            let mut vbytes_total = 0u64;
-            let mut tri_total = 0u64;
-            for vertices in blases {
-                let tri_count = (vertices.len() / 9) as u32;
-                let vert_count = (vertices.len() / 3) as u32;
-                let vbytes = (vertices.len() * 4) as u64;
-                vbytes_total += vbytes;
-                tri_total += tri_count as u64;
-                let (vbuf, vmem, vmap) = self.make_as_buffer(vbytes,
-                    vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
-                    true)?;
-                owned.push((vbuf, vmem));
-                std::ptr::copy_nonoverlapping(vertices.as_ptr() as *const u8, vmap, vbytes as usize);
-                let vaddr = self.buffer_address(vbuf);
-
-                let tri = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
-                    .vertex_format(vk::Format::R32G32B32_SFLOAT)
-                    .vertex_data(vk::DeviceOrHostAddressConstKHR { device_address: vaddr })
-                    .vertex_stride(12)
-                    .max_vertex(vert_count - 1)
-                    .index_type(vk::IndexType::NONE_KHR);
-                let bgeo = vk::AccelerationStructureGeometryKHR::default()
-                    .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
-                    .flags(vk::GeometryFlagsKHR::OPAQUE)
-                    .geometry(vk::AccelerationStructureGeometryDataKHR { triangles: tri });
-                let bgeos = [bgeo];
-                let mut bbi = vk::AccelerationStructureBuildGeometryInfoKHR::default()
-                    .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-                    .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
-                    .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-                    .geometries(&bgeos);
-                let mut bsz = vk::AccelerationStructureBuildSizesInfoKHR::default();
-                asd.get_acceleration_structure_build_sizes(
-                    vk::AccelerationStructureBuildTypeKHR::DEVICE, &bbi, &[tri_count], &mut bsz);
-                blas_bytes_total += bsz.acceleration_structure_size;
-
-                let (blas_buf, blas_mem, _) = self.make_as_buffer(bsz.acceleration_structure_size,
-                    vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR, false)?;
-                owned.push((blas_buf, blas_mem));
-                let (bscratch, bscratch_mem, _) = self.make_as_buffer(
-                    bsz.build_scratch_size + scratch_align,
-                    vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
-                owned.push((bscratch, bscratch_mem));
-                let blas = asd.create_acceleration_structure(
-                    &vk::AccelerationStructureCreateInfoKHR::default()
-                        .buffer(blas_buf).size(bsz.acceleration_structure_size)
-                        .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL), None)
-                    .map_err(|e| format!("create BLAS: {e:?}"))?;
-                bbi = bbi.dst_acceleration_structure(blas)
-                    .scratch_data(vk::DeviceOrHostAddressKHR {
-                        device_address: align_up(self.buffer_address(bscratch), scratch_align),
-                    });
-                let brange = vk::AccelerationStructureBuildRangeInfoKHR::default()
-                    .primitive_count(tri_count);
-                self.one_time_submit(|cb| {
-                    asd.cmd_build_acceleration_structures(cb, &[bbi], &[&[brange]]);
-                })?;
-                blas_handles.push(blas);
-                blas_addrs.push(asd.get_acceleration_structure_device_address(
-                    &vk::AccelerationStructureDeviceAddressInfoKHR::default()
-                        .acceleration_structure(blas)));
-            }
-
-            let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: blas_handles, blas_addrs, owned, tlas_owned: Vec::new() };
-            let stats = format!("{} BLAS ({} tris), {:.1} MB verts", blases.len(), tri_total, vbytes_total as f64 / 1e6);
-            self.accels.lock().unwrap().insert(tlas_id.raw(), accel);
-            eprintln!("build_scene_tlas: {stats} (BLAS {:.2} MB)", blas_bytes_total as f64 / 1e6);
-        }
+        let mut owned_all = owned;
+        let mut blas_handles: Vec<vk::AccelerationStructureKHR> = Vec::with_capacity(blases.len());
+        let mut blas_addrs: Vec<u64> = Vec::with_capacity(blases.len());
+        let stats = unsafe { self.build_blases(asd, blases, scratch_align, &mut owned_all, &mut blas_handles, &mut blas_addrs)? };
+        let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: blas_handles, blas_addrs, owned: owned_all, tlas_owned: Vec::new() };
+        self.accels.lock().unwrap().insert(tlas_id.raw(), accel);
+        eprintln!("build_scene_tlas: {stats}");
         self.rebuild_scene_tlas(tlas_id, instances)
     }
 
@@ -824,6 +758,133 @@ impl MoltenVkBackend {
     /// nothing in flight references it. Through the MoltenVK fork the freed
     /// TLAS slot is reused by the new one (free-list), so BLAS slot indices
     /// stay valid.
+    /// Build BLASes for `blases` (batched submits), appending handles,
+    /// addresses and owned buffers. Returns a stats line.
+    unsafe fn build_blases(&self, asd: &ash::khr::acceleration_structure::Device, blases: &[&[f32]], scratch_align: u64,
+                           owned: &mut Vec<(vk::Buffer, vk::DeviceMemory)>,
+                           blas_handles: &mut Vec<vk::AccelerationStructureKHR>, blas_addrs: &mut Vec<u64>) -> Result<String, String> {
+        let align_up = |a: u64, al: u64| (a + al - 1) & !(al - 1);
+        let mut blas_bytes_total = 0u64;
+        let mut vbytes_total = 0u64;
+        let mut tri_total = 0u64;
+        // Builds are recorded in BATCHES of one command buffer + one fence
+        // wait each: a per-BLAS submit costs ~6 ms of round trip, which at
+        // a thousand BLASes (per-cell building LOD) was 8 s of startup.
+        // The geometry structs the build infos point into live in `geos`
+        // (pre-sized: no reallocation moves them under the pointers).
+        const BATCH: usize = 32;
+        let mut geos: Vec<[vk::AccelerationStructureGeometryKHR<'_>; 1]> = Vec::with_capacity(blases.len());
+        let mut pending: Vec<(vk::AccelerationStructureBuildGeometryInfoKHR<'_>, vk::AccelerationStructureBuildRangeInfoKHR)> = Vec::with_capacity(BATCH);
+        for vertices in blases {
+            let tri_count = (vertices.len() / 9) as u32;
+            let vert_count = (vertices.len() / 3) as u32;
+            let vbytes = (vertices.len() * 4) as u64;
+            vbytes_total += vbytes;
+            tri_total += tri_count as u64;
+            let (vbuf, vmem, vmap) = self.make_as_buffer(vbytes,
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+                true)?;
+            owned.push((vbuf, vmem));
+            std::ptr::copy_nonoverlapping(vertices.as_ptr() as *const u8, vmap, vbytes as usize);
+            let vaddr = self.buffer_address(vbuf);
+
+            let tri = vk::AccelerationStructureGeometryTrianglesDataKHR::default()
+                .vertex_format(vk::Format::R32G32B32_SFLOAT)
+                .vertex_data(vk::DeviceOrHostAddressConstKHR { device_address: vaddr })
+                .vertex_stride(12)
+                .max_vertex(vert_count - 1)
+                .index_type(vk::IndexType::NONE_KHR);
+            let bgeo = vk::AccelerationStructureGeometryKHR::default()
+                .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
+                .flags(vk::GeometryFlagsKHR::OPAQUE)
+                .geometry(vk::AccelerationStructureGeometryDataKHR { triangles: tri });
+            geos.push([bgeo]);
+            // Detached reference into the pre-sized Vec (its storage never
+            // moves) so later pushes don't conflict with the borrow the
+            // build info holds.
+            let bgeos: &[vk::AccelerationStructureGeometryKHR<'_>; 1] = &*geos.as_ptr().add(geos.len() - 1);
+            let mut bbi = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+                .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+                .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+                .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+                .geometries(bgeos);
+            let mut bsz = vk::AccelerationStructureBuildSizesInfoKHR::default();
+            asd.get_acceleration_structure_build_sizes(
+                vk::AccelerationStructureBuildTypeKHR::DEVICE, &bbi, &[tri_count], &mut bsz);
+            blas_bytes_total += bsz.acceleration_structure_size;
+
+            let (blas_buf, blas_mem, _) = self.make_as_buffer(bsz.acceleration_structure_size,
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR, false)?;
+            owned.push((blas_buf, blas_mem));
+            let (bscratch, bscratch_mem, _) = self.make_as_buffer(
+                bsz.build_scratch_size + scratch_align,
+                vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
+            owned.push((bscratch, bscratch_mem));
+            let blas = asd.create_acceleration_structure(
+                &vk::AccelerationStructureCreateInfoKHR::default()
+                    .buffer(blas_buf).size(bsz.acceleration_structure_size)
+                    .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL), None)
+                .map_err(|e| format!("create BLAS: {e:?}"))?;
+            bbi = bbi.dst_acceleration_structure(blas)
+                .scratch_data(vk::DeviceOrHostAddressKHR {
+                    device_address: align_up(self.buffer_address(bscratch), scratch_align),
+                });
+            let brange = vk::AccelerationStructureBuildRangeInfoKHR::default()
+                .primitive_count(tri_count);
+            pending.push((bbi, brange));
+            if pending.len() >= BATCH {
+                self.one_time_submit(|cb| {
+                    for (b, r) in &pending {
+                        asd.cmd_build_acceleration_structures(cb, &[*b], &[&[*r]]);
+                    }
+                })?;
+                pending.clear();
+            }
+            blas_handles.push(blas);
+            blas_addrs.push(asd.get_acceleration_structure_device_address(
+                &vk::AccelerationStructureDeviceAddressInfoKHR::default()
+                    .acceleration_structure(blas)));
+        }
+        if !pending.is_empty() {
+            self.one_time_submit(|cb| {
+                for (b, r) in &pending {
+                    asd.cmd_build_acceleration_structures(cb, &[*b], &[&[*r]]);
+                }
+            })?;
+            pending.clear();
+        }
+        drop(geos);
+        Ok(format!("{} BLAS ({} tris), {:.1} MB verts (BLAS {:.2} MB)", blases.len(), tri_total, vbytes_total as f64 / 1e6, blas_bytes_total as f64 / 1e6))
+    }
+
+    /// Append BLASes to an existing scene (streaming / lazy detail): builds
+    /// them and returns the index of the first new BLAS. The TLAS is not
+    /// rebuilt here — call `rebuild_scene_tlas` with instances that reference
+    /// the new indices.
+    pub fn add_scene_blases(&self, tlas_id: ResourceId, blases: &[&[f32]]) -> Result<u32, String> {
+        let asd = self.as_device.as_ref()
+            .ok_or_else(|| "ray-query not available on this device".to_string())?;
+        for (i, v) in blases.iter().enumerate() {
+            if v.len() % 9 != 0 || v.is_empty() {
+                return Err(format!("add_scene_blases: BLAS {i} vertex data is not whole triangles"));
+            }
+        }
+        let mut as_props = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
+        let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut as_props);
+        unsafe { self.instance.get_physical_device_properties2(self.physical, &mut p2) };
+        let scratch_align = as_props.min_acceleration_structure_scratch_offset_alignment.max(256) as u64;
+        let mut accels = self.accels.lock().unwrap();
+        let acc = accels.get_mut(&tlas_id.raw()).ok_or_else(|| "add_scene_blases: unknown scene".to_string())?;
+        let first = acc.blases.len() as u32;
+        let (mut owned, mut handles, mut addrs) = (std::mem::take(&mut acc.owned), std::mem::take(&mut acc.blases), std::mem::take(&mut acc.blas_addrs));
+        let res = unsafe { self.build_blases(asd, blases, scratch_align, &mut owned, &mut handles, &mut addrs) };
+        acc.owned = owned; acc.blases = handles; acc.blas_addrs = addrs;
+        res.map(|_| first)
+    }
+
+    /// Rebuild the scene TLAS over the stored BLASes for a new instance
+    /// list (the BLASes persist; only the TLAS and its instance buffer are
+    /// replaced). Used for LOD re-instancing and streamed-in cells.
     pub fn rebuild_scene_tlas(&self, tlas_id: ResourceId, instances: &[SceneInstance]) -> Result<(), String> {
         let asd = self.as_device.as_ref()
             .ok_or_else(|| "ray-query not available on this device".to_string())?;
