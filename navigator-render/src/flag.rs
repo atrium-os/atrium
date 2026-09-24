@@ -87,7 +87,10 @@ pub fn flag(scene: &Scene, fonts: &FontSet, doc_text_chars: usize) -> Flags {
         let (clip, group, xform) = scene.run_attrs.get(i).copied().unwrap_or((None, None, None));
         if xform.is_some() { f.transformed += 1; continue }
         if r.rgba & 0xff == 0 || group_alpha(scene, group) == 0 || r.size <= 0 || r.glyphs.is_empty() { continue }
-        if r.text.trim().is_empty() { continue }
+        // Nothing to see: whitespace, or only ZERO-WIDTH characters (ZWSP,
+        // ZWNJ, ZWJ, word joiner, BOM), which shape to no ink — Coursera's
+        // `\u{200b}` and Goodreads' `\u{200c}` were reported as overlaps.
+        if r.text.chars().all(|c| c.is_whitespace() || matches!(c, '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}')) { continue }
         let Some(face) = fonts.faces.get(r.face) else { continue };
         let ff = face.parse();
         let upem = face.upem.max(1);
@@ -189,6 +192,13 @@ mod tests {
         assert!(good.overlaps.is_empty(), "wrapped lines of a paragraph are not overlaps: {:?}",
                 good.overlaps.iter().take(3).map(|o| (&good.vis.iter().find(|v| v.run == o.0).unwrap().text)).collect::<Vec<_>>());
         assert!(good.verdicts().is_empty(), "{:?}", good.verdicts());
+    }
+
+    #[test]
+    fn zero_width_characters_are_not_text_for_overlap() {
+        let f = run("<style>.a { position: absolute; left: 10px; top: 10px }</style>\
+            <div class=\"a\">\u{200b}</div><div class=\"a\">Level: Beginner</div>");
+        assert!(f.overlaps.is_empty(), "{:?}", f.overlaps);
     }
 
     #[test]

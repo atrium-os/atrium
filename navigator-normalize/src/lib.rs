@@ -336,6 +336,114 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     if lone > 0 { report.drop_n("property `float` (not a row; dropped)", lone) }
     for (_, props) in resolved.iter_mut() { props.remove("float-marker"); }
 
+    // ★ BOX-SIZING, compiled away. The profile's boxes are all border-box;
+    // CSS's default is content-box, where `width` excludes padding and
+    // border. So for every element whose EFFECTIVE box-sizing is content-box
+    // (following `inherit` up the tree, for the `* { box-sizing: inherit }`
+    // idiom), each size is rewritten to the border-box size that means the
+    // same thing: `width: 300px; padding: 0 20px` becomes `width: 340px`,
+    // and `width: 50%` with em padding becomes `calc(50% + 2em)`. Per media
+    // context, because padding and width change at breakpoints. The UA's own
+    // padding counts too — a `<ul>`'s 40 px is padding like any other.
+    {
+        let mut ua_sheet = css::Sheet::default();
+        let mut ua_order = 0usize;
+        css::parse(navigator_style::cascade::UA_CSS, &mut ua_order, &mut ua_sheet);
+        const FRAME: [&str; 12] = ["padding-left", "padding-right", "padding-top", "padding-bottom",
+            "border-left-width", "border-right-width", "border-top-width", "border-bottom-width",
+            "border-left-style", "border-right-style", "border-top-style", "border-bottom-style"];
+        let mut ua: BTreeMap<Handle, BTreeMap<String, String>> = BTreeMap::new();
+        for rule in &ua_sheet.rules {
+            let Ok(list) = sel::parse_list(&rule.selector) else { continue };
+            for h in &els {
+                if !list.iter().any(|c| m.matches(*h, c)) { continue }
+                for d in rule.decls.iter().filter(|d| FRAME.contains(&d.name.as_str())) {
+                    ua.entry(*h).or_default().insert(d.name.clone(), css::write_tokens(&d.value).trim().to_string());
+                }
+            }
+        }
+        let get = |h: Handle, ctx: &str, p: &str| -> Option<String> {
+            resolved.get(&(h, String::new(), ctx.to_string())).and_then(|x| x.get(p)).map(|(_, v)| v.clone())
+                .or_else(|| resolved.get(&(h, String::new(), String::new())).and_then(|x| x.get(p)).map(|(_, v)| v.clone()))
+                .or_else(|| if p == "box-sizing-marker" { None } else { ua.get(&h).and_then(|x| x.get(p)).cloned() })
+        };
+        let parent_el = |h: Handle| dom.get(h).and_then(|n| n.parent)
+            .filter(|p| matches!(dom.get(*p).map(|n| &n.kind), Some(Kind::Element(_))));
+        let content_box = |h: Handle, ctx: &str| -> bool {
+            let mut cur = Some(h);
+            while let Some(x) = cur {
+                match get(x, ctx, "box-sizing-marker").as_deref() {
+                    Some("border-box") => return false,
+                    Some("inherit") => cur = parent_el(x),
+                    _ => return true, // content-box, initial, unset, revert, or nothing
+                }
+            }
+            true
+        };
+        let is_zero = |v: &str| matches!(v.trim(), "0" | "0px" | "0%" | "0em" | "0rem");
+        let border_px = |v: &str| match v.trim() { "thin" => "1px".to_string(), "medium" => "3px".to_string(), "thick" => "5px".to_string(), x => x.to_string() };
+        let mut updates: Vec<(Handle, String, String, String)> = vec![];
+        let mut skipped = 0usize;
+        let mut contexts: BTreeMap<Handle, Vec<String>> = BTreeMap::new();
+        for (h, st, media) in resolved.keys() {
+            if st.is_empty() { contexts.entry(*h).or_default().push(media.clone()) }
+        }
+        for (h, ctxs) in &contexts {
+            for ctx in ctxs {
+                if !content_box(*h, ctx) { continue }
+                let frame = |sides: [&str; 2]| -> Vec<String> {
+                    let mut t = vec![];
+                    for side in sides {
+                        if let Some(p) = get(*h, ctx, &format!("padding-{side}")) { if !is_zero(&p) { t.push(p) } }
+                        let style = get(*h, ctx, &format!("border-{side}-style")).unwrap_or_else(|| "none".into());
+                        if style != "none" && style != "hidden" {
+                            if let Some(b) = get(*h, ctx, &format!("border-{side}-width")) { let b = border_px(&b); if !is_zero(&b) { t.push(b) } }
+                        }
+                    }
+                    t
+                };
+                let (hf, vf) = (frame(["left", "right"]), frame(["top", "bottom"]));
+                if hf.is_empty() && vf.is_empty() { continue }
+                let column_parent = parent_el(*h).and_then(|p| get(p, ctx, "flex-direction")).is_some_and(|d| d.starts_with("column"));
+                let props: [(&str, bool); 7] = [("width", false), ("min-width", false), ("max-width", false),
+                    ("height", true), ("min-height", true), ("max-height", true), ("flex-basis", column_parent)];
+                for (prop, vertical) in props {
+                    let terms = if vertical { &vf } else { &hf };
+                    if terms.is_empty() { continue }
+                    // Only a size THIS context states or inherits from the base.
+                    let Some(v) = get(*h, ctx, prop) else { continue };
+                    let v = v.trim().to_string();
+                    let sized = v.starts_with(|c: char| c.is_ascii_digit() || c == '.')
+                        || ["calc(", "min(", "max(", "clamp("].iter().any(|f| v.starts_with(f));
+                    if !sized { continue } // auto, none, fit-content, …
+                    // A vertical percentage padding resolves against the WIDTH;
+                    // added to a height percentage it would resolve against the
+                    // height instead. Left as written, and counted.
+                    if vertical && terms.iter().any(|t| t.contains('%')) { skipped += 1; continue }
+                    let base = if v == "0" { "0px".to_string() } else { v.clone() };
+                    let px = |x: &str| x.strip_suffix("px").and_then(|n| n.parse::<f64>().ok());
+                    let new = match (px(&base), terms.iter().map(|t| px(t)).collect::<Option<Vec<f64>>>()) {
+                        (Some(a), Some(ts)) => format!("{}px", a + ts.iter().sum::<f64>()),
+                        _ => {
+                            let inner = base.strip_prefix("calc(").and_then(|x| x.strip_suffix(')')).map(|x| format!("({x})")).unwrap_or(base.clone());
+                            format!("calc({inner} + {})", terms.join(" + "))
+                        }
+                    };
+                    updates.push((*h, ctx.clone(), prop.to_string(), new));
+                }
+            }
+        }
+        let converted = updates.len();
+        for (h, ctx, prop, v) in updates {
+            let slot = resolved.entry((h, String::new(), ctx)).or_default();
+            let pri: Priority = slot.get(&prop).map(|(p, _)| *p).unwrap_or((false, usize::MAX, (0, 1, 0), usize::MAX - 1));
+            slot.insert(prop, (pri, v));
+        }
+        if converted > 0 { report.drop_n("content-box size compiled to border-box", converted) }
+        if skipped > 0 { report.drop_n("content-box height with a percentage vertical padding (left as written)", skipped) }
+        for (_, props) in resolved.iter_mut() { props.remove("box-sizing-marker"); }
+    }
+
     // ★ Resolve named areas into the numeric lines the profile admits —
     // PER MEDIA CONTEXT. A responsive page keeps its whole layout in the
     // media queries: MDN's mobile template lives in
@@ -682,6 +790,16 @@ fn to_longhands(name: &str, value: &[Token], inputs: &Inputs, report: &mut Repor
     // Carried as a marker and decided on the DOM, where the siblings are
     // visible (see the float row repair). `none` is carried too, or a later
     // `float: none` could not cancel an earlier `float: left`.
+    // ★ `box-sizing` is not in the profile — every box there is border-box —
+    // but the AUTHOR's content-box sizes must still come out the size the
+    // author meant. Carried as a marker and compiled below (see the
+    // box-sizing pass), never dropped: dropping it made every padded
+    // content-box box narrower by its padding, silently, on most pages.
+    // `-webkit-box-sizing` is still an ALIAS in Chrome and Safari: a page
+    // that sets only the prefixed form means it.
+    if (name == "box-sizing" || name == "-webkit-box-sizing") && matches!(text.as_str(), "content-box" | "border-box" | "inherit" | "initial" | "unset" | "revert") {
+        return vec![("box-sizing-marker".to_string(), text)];
+    }
     if name == "float" && matches!(text.as_str(), "left" | "right" | "none") {
         return vec![("float-marker".to_string(), text)];
     }
@@ -711,7 +829,7 @@ fn to_longhands(name: &str, value: &[Token], inputs: &Inputs, report: &mut Repor
         // once the whole cascade is known. Without it every child lands in
         // the same cell: rustdoc's breadcrumb rendered on top of its search
         // box.
-        if p == "grid-template-areas" || p == "grid-area-name" || p == "float-marker" { return Some((p, v)) }
+        if p == "grid-template-areas" || p == "grid-area-name" || p == "float-marker" || p == "box-sizing-marker" { return Some((p, v)) }
         // ★ An image the input has not measured cannot be painted (§3.13),
         // and the renderer says so. The normalizer must decide it HERE, the
         // same way it decides for an `<img>`, or it ships a document that

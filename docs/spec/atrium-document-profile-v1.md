@@ -197,7 +197,13 @@ Percentages resolve against the containing block's inline size for `width`,
 `margin-*`, `padding-*` and `left`/`right`; against its block size for `height` and
 `top`/`bottom`.
 
-**`box-sizing` is not a property** — `border-box` is a fixed rule (§3.1). **`float` and
+**`box-sizing` is not a property** — `border-box` is a fixed rule (§3.1). A producer must
+therefore COMPILE an author's content-box sizes (CSS's default) into the border-box sizes
+that mean the same thing: `width: 300px; padding: 0 20px` becomes `width: 340px`, and a
+percentage with em padding becomes `calc(50% + 1em + 1em)`, per media context and counting
+the UA's own padding. Dropping the property instead — as the normalizer did until
+2026-09-24 — made every padded content-box box narrower by its padding; in the 78-document
+corpus that was 1,725 sizes in 28 documents. **`float` and
 `clear` are absent.**
 
 **`position: fixed` is admitted, under three conditions** (settled; `sticky` remains

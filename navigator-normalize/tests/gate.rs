@@ -412,7 +412,9 @@ fn a_cells_declared_width_is_a_floor_not_a_cap() {
     assert!(run("no") > run("Inheritedness:") + 60 * 64, "the value is not painted under the header");
     // Control: an author width WIDER than the content still holds.
     let (wide, _) = normalize_and_measure(&src("300px"), &Inputs::default(), &fonts, &Env::default());
-    assert_eq!(col0(&wide), 300.0);
+    // 302, not 300: the author wrote a CONTENT-box width, and the UA gives a
+    // cell 1px of padding each side — the border box a browser draws.
+    assert_eq!(col0(&wide), 302.0);
     assert!(refusals(&narrow).is_empty() && refusals(&wide).is_empty());
 }
 
@@ -469,4 +471,51 @@ fn a_css_table_declares_on_its_first_row_and_does_not_span() {
     let o = render_html(&out, &fonts, &Env::default());
     let x = |t: &str| o.scene.runs.iter().find(|r| r.text == t).expect(t).x;
     assert_eq!(x("right"), x("b"), "`right` is in column 2, above `b` — the div did not span");
+}
+
+/// ★ BOX-SIZING, compiled away. The profile is border-box everywhere; CSS's
+/// default is content-box. Dropping `box-sizing` (51,846 times across the
+/// corpus) made every padded content-box box narrower by its padding.
+#[test]
+fn content_box_sizes_are_compiled_to_border_box() {
+    let fonts = FontSet::load().expect("pinned font set");
+    let norm = |css: &str, body: &str| normalize(&format!("<html><head><style>{css}</style></head><body>{body}</body></html>"), &Inputs::default()).0;
+
+    // The default: content-box. 300 + 20 + 20 + 2 (border) = 342.
+    let out = norm(".b { width: 300px; padding-left: 20px; padding-right: 20px; border-left: 2px solid #000; background-color: #ff0000 }",
+                   r#"<div class="b">x</div>"#);
+    assert!(out.contains("width: 342px"), "{out}");
+    let o = render_html(&out, &fonts, &Env::default());
+    let red: Vec<_> = o.scene.rects.iter().filter(|r| r.rgba == 0xff0000ff).collect();
+    assert_eq!(red[0].w, 342 * 64, "the box is the size the author meant");
+
+    // Border-box, directly and through the `inherit` idiom: left as written.
+    for css in ["* { box-sizing: border-box }", "html { box-sizing: border-box } *, *::before { box-sizing: inherit }"] {
+        let out = norm(&format!("{css} .b {{ width: 300px; padding-left: 20px }}"), r#"<div class="b">x</div>"#);
+        assert!(out.contains("width: 300px") && !out.contains("320px"), "{css}: {out}");
+    }
+    // A percentage with em padding becomes calc().
+    let out = norm(".b { width: 50%; padding-left: 1em; padding-right: 1em }", r#"<div class="b">x</div>"#);
+    assert!(out.contains("width: calc(50% + 1em + 1em)"), "{out}");
+    // The UA's own padding counts: a <ul> has 40px on the left.
+    let out = norm("ul { width: 300px }", "<ul><li>x</li></ul>");
+    assert!(out.contains("width: 340px"), "{out}");
+    // A breakpoint that changes only the padding still gets its own width.
+    let out = norm(".b { width: 300px; padding-left: 10px } @media (max-width: 900px) { .b { padding-left: 30px } }",
+                   r#"<div class="b">x</div>"#);
+    assert!(out.contains("width: 310px") && out.contains("width: 330px"), "{out}");
+    // Keywords are not sizes: auto stays auto.
+    let out = norm(".b { width: auto; padding-left: 10px }", r#"<div class="b">x</div>"#);
+    assert!(!out.contains("calc(auto"), "{out}");
+    assert!(refusals(&out).is_empty());
+}
+
+/// `-webkit-box-sizing` is an alias in Chrome and Safari; a page that sets
+/// only the prefixed form is border-box there.
+#[test]
+fn the_webkit_prefixed_box_sizing_is_an_alias() {
+    let src = r#"<html><head><style>.b { -webkit-box-sizing: border-box; width: 300px; padding-left: 20px }</style></head>
+        <body><div class="b">x</div></body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    assert!(out.contains("width: 300px") && !out.contains("320px"), "{out}");
 }
