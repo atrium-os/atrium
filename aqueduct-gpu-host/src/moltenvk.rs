@@ -240,6 +240,10 @@ pub struct MoltenVkBackend {
     /// Per-binding acceleration-structure stash for the next Dispatch (mirror
     /// of `compute_binds` for the AS descriptor type).
     compute_accel_binds: Mutex<HashMap<u32, u32>>,
+    /// Set once a submission timed out: the queue may be wedged, so the
+    /// owner should stop using this backend (and must not wait on it —
+    /// `Drop` skips device_wait_idle when set).
+    stalled: std::sync::atomic::AtomicBool,
 }
 
 /// Construction errors for [`MoltenVkBackend::new`]. Each variant
@@ -553,8 +557,12 @@ impl MoltenVkBackend {
             as_device,
             accels: Mutex::new(HashMap::new()),
             compute_accel_binds: Mutex::new(HashMap::new()),
+            stalled: std::sync::atomic::AtomicBool::new(false),
         })
     }
+
+    /// True once any submission has timed out (queue possibly wedged).
+    pub fn is_stalled(&self) -> bool { self.stalled.load(Ordering::Relaxed) }
 
     /// Whether HW ray-query (VK_KHR_acceleration_structure + VK_KHR_ray_query)
     /// is available on this device. The instanced-mesh path checks this and
@@ -640,12 +648,38 @@ impl MoltenVkBackend {
         let cbs = [cb];
         let si = vk::SubmitInfo::default().command_buffers(&cbs);
         let _guard = self.submit_lock.lock().unwrap();
-        dev.queue_submit(self._queue, &[si], vk::Fence::null())
+        // Bounded wait: a fence with a timeout, never queue_wait_idle. A GPU
+        // stall (an enqueued-but-never-committed Metal command buffer wedges
+        // the whole queue with no watchdog and no error) must surface as an
+        // error the caller can act on, not an infinite block on the main
+        // thread. AQUEDUCT_GPU_WAIT_MS overrides the default 30 s.
+        let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None)
+            .map_err(|e| format!("AS fence: {e:?}"))?;
+        dev.queue_submit(self._queue, &[si], fence)
             .map_err(|e| format!("AS submit: {e:?}"))?;
-        dev.queue_wait_idle(self._queue)
-            .map_err(|e| format!("AS wait: {e:?}"))?;
+        let res = dev.wait_for_fences(&[fence], true, Self::wait_timeout_ns(30_000));
+        match res {
+            Ok(()) => {}
+            Err(vk::Result::TIMEOUT) => {
+                // Still in flight (or wedged): neither the fence nor the
+                // command buffer may be freed under it — leak both.
+                self.stalled.store(true, Ordering::Relaxed);
+                return Err(format!(
+                    "GPU stall: acceleration-structure build did not complete within {} ms \
+                     (queue wedged or GPU contended); the backend must be replaced",
+                    Self::wait_timeout_ns(30_000) / 1_000_000));
+            }
+            Err(e) => return Err(format!("AS wait: {e:?}")),
+        }
+        dev.destroy_fence(fence, None);
         dev.free_command_buffers(self.cmd_pool, &cbs);
         Ok(())
+    }
+
+    /// Wait budget for GPU work (ns): `AQUEDUCT_GPU_WAIT_MS` or `default_ms`.
+    fn wait_timeout_ns(default_ms: u64) -> u64 {
+        std::env::var("AQUEDUCT_GPU_WAIT_MS").ok().and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(default_ms) * 1_000_000
     }
 
     /// Build a scene acceleration structure: one BLAS from a triangle-list
@@ -1074,6 +1108,12 @@ impl MoltenVkBackend {
 
 impl Drop for MoltenVkBackend {
     fn drop(&mut self) {
+        // A wedged queue never goes idle: skip the wait (and the resource
+        // teardown that needs it) and let the process reclaim on exit.
+        if self.stalled.load(Ordering::Relaxed) {
+            log::warn!("MoltenVk drop: backend stalled — skipping device_wait_idle and teardown");
+            return;
+        }
         // SAFETY: all handles were created via ash; destroy resources
         // before the device, and the device before the instance.
         unsafe {
@@ -1273,6 +1313,9 @@ impl Backend for MoltenVkBackend {
         let _guard = self.submit_lock.lock().unwrap();
         match self.record_and_submit(frame_buf) {
             Ok(()) => true,
+            // A stall is the one failure the caller must see: the frame never
+            // completed and the backend should be replaced.
+            Err(vk::Result::TIMEOUT) => false,
             Err(e) => { log::warn!("MoltenVk submit_frame: {e:?}"); true }
         }
     }
@@ -1713,10 +1756,19 @@ impl MoltenVkBackend {
         let fence = unsafe { dev.create_fence(&vk::FenceCreateInfo::default(), None)? };
         let cbs = [cb];
         let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+        // Bounded: a frame that does not complete within the wait budget
+        // (default 10 s) returns TIMEOUT instead of freezing the caller; the
+        // caller treats it as a lost device and recreates the backend. The
+        // command buffer and fence are leaked on timeout (still in flight).
         let res = unsafe {
             dev.queue_submit(self._queue, &[submit], fence)
-                .and_then(|_| dev.wait_for_fences(&[fence], true, u64::MAX))
+                .and_then(|_| dev.wait_for_fences(&[fence], true, Self::wait_timeout_ns(10_000)))
         };
+        if res == Err(vk::Result::TIMEOUT) {
+            log::error!("MoltenVk submit_frame: GPU stall — frame did not complete within the wait budget");
+            self.stalled.store(true, Ordering::Relaxed);
+            return Err(vk::Result::TIMEOUT);
+        }
         // Read the two timestamps back (the fence guarantees completion)
         // and record the modeled-vs-measured ground-truth exec time.
         if timing && res.is_ok() {
@@ -2520,6 +2572,53 @@ mod tests {
             assert!((t - want_t).abs() < 0.2, "scene {k}: t={t} want {want_t}");
             assert_eq!(custom, want_custom, "scene {k}: committed instance custom index");
         }
+    }
+
+    /// A Metal queue wedge, reproduced deliberately: a submission that waits
+    /// on a semaphore nobody signals never completes and trips no watchdog
+    /// (the shape of the Orbis acceleration-structure hang). The bounded
+    /// wait must return TIMEOUT within its budget, the backend must report
+    /// itself stalled, and a FRESH backend must keep working while the
+    /// wedged one is leaked (never waited on).
+    #[test]
+    fn wedged_queue_is_bounded_and_recoverable() {
+        use aqueduct_gpu::ids::IdNamespace;
+        let Some(be) = try_init() else { return; };
+        std::env::set_var("AQUEDUCT_GPU_WAIT_MS", "300");
+        let dev = &be.device;
+        unsafe {
+            let sem = dev.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap();
+            let cb = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default()
+                .command_pool(be.cmd_pool).level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1)).unwrap()[0];
+            dev.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+            dev.end_command_buffer(cb).unwrap();
+            let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+            let cbs = [cb];
+            let sems = [sem];
+            let stages = [vk::PipelineStageFlags::TOP_OF_PIPE];
+            let si = vk::SubmitInfo::default()
+                .wait_semaphores(&sems).wait_dst_stage_mask(&stages).command_buffers(&cbs);
+            dev.queue_submit(be._queue, &[si], fence).unwrap();
+            let t0 = std::time::Instant::now();
+            let r = dev.wait_for_fences(&[fence], true, MoltenVkBackend::wait_timeout_ns(300));
+            assert_eq!(r, Err(vk::Result::TIMEOUT), "a never-signalled wait must time out, not hang");
+            assert!(t0.elapsed().as_secs_f64() < 5.0, "timed out late: {:?}", t0.elapsed());
+        }
+        // Every later submission on the wedged queue also times out — and
+        // submit_frame reports it instead of blocking.
+        let fence_id = ResourceId::new(IdNamespace::IcdRuntime, 0xC1);
+        let t1 = std::time::Instant::now();
+        assert!(!be.submit_frame(fence_id, 1, &[]), "submit_frame on a wedged queue must report false");
+        assert!(t1.elapsed().as_secs_f64() < 5.0);
+        assert!(be.is_stalled());
+        // Recovery: a fresh device/queue works while the wedged one is leaked.
+        let fresh = MoltenVkBackend::new().expect("fresh backend");
+        assert!(fresh.submit_frame(fence_id, 1, &[]), "fresh backend must submit");
+        assert!(!fresh.is_stalled());
+        std::mem::forget(be);
+        std::env::remove_var("AQUEDUCT_GPU_WAIT_MS");
     }
 
     /// Tier-3 level-1: a render-pass clear + image→buffer readback runs
