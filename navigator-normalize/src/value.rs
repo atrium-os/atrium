@@ -25,6 +25,13 @@ pub fn admits(prop: &str, value: &str) -> bool {
 pub fn repair(prop: &str, value: &str) -> Option<String> {
     let v = value.trim();
     let lv = v.to_ascii_lowercase();
+    // ★ `unset` is `inherit` for an inherited property and `initial` for the
+    // rest (CSS Cascade 4 §7.3) — both of which the profile admits, so it
+    // compiles exactly. 747 declarations had been dropped for the keyword.
+    if lv == "unset" {
+        let (_, _, inherited) = navigator_style::values::grammar(prop)?;
+        return Some((if inherited { "inherit" } else { "initial" }).to_string()).filter(|x| admits(prop, x));
+    }
     // ★ `#rgba`, the 4-digit hex colour (CSS Color 4): the profile spells
     // colours `#rgb`, `#rrggbb` or `#rrggbbaa`, so it is expanded digit by
     // digit — `#0000` is transparent black. 3,820 declarations in the corpus

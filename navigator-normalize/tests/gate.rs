@@ -689,3 +689,41 @@ fn inline_svg_keeps_its_geometry_and_reserves_its_box() {
     let red: Vec<(i64, i64)> = o.scene.rects.iter().filter(|r| r.rgba == 0xff0000ff).map(|r| (r.w / 64, r.h / 64)).collect();
     assert_eq!(red, vec![(24, 20)], "the icon reserves 24×20");
 }
+
+/// `unset` is `inherit` for an inherited property and `initial` otherwise.
+#[test]
+fn unset_compiles_to_inherit_or_initial() {
+    let src = r#"<html><head><style>
+      div { color: #ff0000; margin-left: 30px } p { color: unset; margin-left: unset }
+    </style></head><body><div><p>x</p></div></body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    assert!(out.contains("color: inherit") && out.contains("margin-left: initial"), "{out}");
+    assert!(!report.dropped.keys().any(|k| k.contains("unset")), "{:?}", report.dropped);
+    assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+}
+
+/// The `font` shorthand RESETS what it covers, and `background-position`
+/// follows CSS's one- and two-value rules (1,388 declarations dropped before).
+#[test]
+fn font_and_background_position_shorthands_expand() {
+    let src = r#"<html><head><style>
+      div { font-weight: 700; font-style: italic }
+      p { font: 16px/1.5 "IBM Plex Sans", sans-serif }
+      em { font: italic bold 12px serif }
+      b { font: inherit }
+      .a { background-position: top }
+      .b { background-position: right 10px }
+      .c { background-position: bottom left }
+    </style></head><body><div><p>x <em>y</em> <b>z</b></p></div>
+      <span class="a">a</span><span class="b">b</span><span class="c">c</span></body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    assert!(!report.dropped.keys().any(|k| k == "property `font`" || k == "property `background-position`"), "{:?}", report.dropped);
+    // The shorthand reset the div's bold/italic on the <p>.
+    let p_rule = out.lines().find(|l| l.contains("font-size: 16px")).expect("p's block");
+    assert!(p_rule.contains("font-weight: 400") && p_rule.contains("font-style: normal") && p_rule.contains("line-height: 1.5"), "{p_rule}");
+    assert!(out.contains("font-weight: 700") && out.contains("font-style: italic") && out.contains("font-size: 12px"), "{out}");
+    for (x, y) in [("50%", "0%"), ("100%", "10px"), ("0%", "100%")] {
+        assert!(out.contains(&format!("background-position-x: {x}; background-position-y: {y}")), "missing {x} {y}:\n{out}");
+    }
+    assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+}

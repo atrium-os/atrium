@@ -1128,8 +1128,12 @@ arguments' specificity instead of zero), presentational attributes (4,288 → 17
 spellings (`#rgba` and `light-dark()` → 0). Admitting media lists let whole stylesheets
 through that had been dropped — Apple's store page had rendered with no author CSS at all
 — and exposed a renderer bug: the root's `overflow` clipped the page instead of applying
-to the viewport. Remaining in E: `unset`, the `font` and `background-position`
-shorthands, unresolved custom properties (1,677, to be checked for real cycles).
+to the viewport. Then, the same day: `unset` compiled to `inherit`/`initial` by the property's inheritance
+(747 → 0), and the `font` and `background-position` shorthands expanded — `font` resetting
+what it covers, as a shorthand must (3,967 → 20 and 891 → 13). The remaining unresolved
+custom properties (1,677) were sampled and are genuine: defined only under classes the
+page's own script adds (rustdoc's `digits-N`), or undefined with no fallback — a browser
+drops them too. Section E is closed.
 
 **Order of work:** section E, then margin collapsing and floats (compiled by the producer
 where they can be, like box-sizing), then generated content with text and counters, then

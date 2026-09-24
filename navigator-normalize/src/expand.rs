@@ -186,6 +186,64 @@ pub fn expand(name: &str, value: &[Token]) -> Option<Vec<(String, String)>> {
             out.push(("background-position-y".into(), py.unwrap_or_else(|| "0%".into())));
             Some(out)
         }
+        // ★ Two shorthands the corpus uses and the profile has longhands for
+        // (765 and 623 declarations dropped before).
+        "background-position" => {
+            if value.iter().any(|t| t.tok == Tok::Comma) || p.is_empty() || p.len() > 2 { return None }
+            let kw = |x: &str| x.to_ascii_lowercase();
+            let vertical = |x: &str| matches!(kw(x).as_str(), "top" | "bottom");
+            let horizontal = |x: &str| matches!(kw(x).as_str(), "left" | "right");
+            let (x, y) = match p.len() {
+                // One value: a vertical keyword sets Y; anything else sets X.
+                1 if vertical(&p[0]) => ("center".to_string(), kw(&p[0])),
+                1 => (if is_len(&p[0]) { p[0].clone() } else { kw(&p[0]) }, "center".to_string()),
+                // Two: X then Y, unless the keywords say otherwise (`top left`).
+                _ if vertical(&p[0]) || horizontal(&p[1]) => (kw(&p[1]), kw(&p[0])),
+                _ => (p[0].clone(), p[1].clone()),
+            };
+            let pct = |v: String| match v.as_str() { "left" | "top" => "0%".to_string(), "center" => "50%".to_string(), "right" | "bottom" => "100%".to_string(), _ => v };
+            Some(vec![("background-position-x".into(), pct(x)), ("background-position-y".into(), pct(y))])
+        }
+        "font" => {
+            // `font: inherit` (a CSS-wide keyword) sets every longhand to it;
+            // a lone SYSTEM font (`caption`, `menu`, …) describes the host: refused.
+            if p.len() == 1 {
+                let k = p[0].to_ascii_lowercase();
+                if !matches!(k.as_str(), "inherit" | "initial" | "unset") { return None }
+                return Some(["font-style", "font-weight", "font-size", "line-height", "font-family"].iter().map(|l| (l.to_string(), k.clone())).collect());
+            }
+            let (mut style, mut weight) = ("normal".to_string(), "400".to_string());
+            let mut i = 0;
+            // Optional style / variant / weight / stretch, in any order.
+            while i < p.len() {
+                let x = p[i].to_ascii_lowercase();
+                match x.as_str() {
+                    "normal" => {}
+                    "italic" | "oblique" => style = x.clone(),
+                    "bold" => weight = "700".into(), "bolder" => weight = "700".into(), "lighter" => weight = "400".into(),
+                    "small-caps" | "ultra-condensed" | "extra-condensed" | "condensed" | "semi-condensed"
+                    | "semi-expanded" | "expanded" | "extra-expanded" | "ultra-expanded" => {}
+                    _ if x.parse::<f64>().is_ok() && !x.contains('.') && x.len() == 3 => weight = x.clone(),
+                    _ => break,
+                }
+                i += 1;
+            }
+            // The size, required; `/line-height` attached or as separate tokens.
+            let sz = p.get(i)?.clone();
+            let (size, mut lh) = match sz.split_once('/') { Some((a, b)) => (a.to_string(), Some(b.to_string()).filter(|b| !b.is_empty())), None => (sz, None) };
+            i += 1;
+            if lh.is_none() && p.get(i).map(|x| x.as_str()) == Some("/") { lh = p.get(i + 1).cloned(); i += 2 }
+            else if lh.is_none() && p.get(i).is_some_and(|x| x.starts_with('/')) { lh = Some(p[i][1..].to_string()); i += 1 }
+            let family = p[i..].join(" ");
+            if family.trim().is_empty() { return None }
+            // A shorthand RESETS what it covers: `font: 16px serif` makes bold
+            // text normal again.
+            Some(vec![
+                ("font-style".into(), style), ("font-weight".into(), weight),
+                ("font-size".into(), size), ("line-height".into(), lh.unwrap_or_else(|| "normal".into())),
+                ("font-family".into(), family),
+            ])
+        }
         "overflow" => {
             let s = if p.len() == 1 { [p[0].clone(), p[0].clone()] } else if p.len() == 2 { [p[0].clone(), p[1].clone()] } else { return None };
             Some(vec![("overflow-x".into(), s[0].clone()), ("overflow-y".into(), s[1].clone())])
@@ -251,25 +309,6 @@ pub fn expand(name: &str, value: &[Token]) -> Option<Vec<(String, String)>> {
             if f.len() != 4 { return None }
             Some(vec![("grid-row-start".into(), f[0].clone()), ("grid-column-start".into(), f[1].clone()),
                       ("grid-row-end".into(), f[2].clone()), ("grid-column-end".into(), f[3].clone())])
-        }
-        "font" => {
-            // Only the `[style] [weight] size[/line-height] family` form.
-            let joined = p.join(" ");
-            let (size_part, family) = {
-                let idx = p.iter().position(|x| is_len(x) || x.contains('/'))?;
-                (p[idx].clone(), p[idx + 1..].join(" "))
-            };
-            let (size, lh) = match size_part.split_once('/') { Some((s, l)) => (s.to_string(), Some(l.to_string())), None => (size_part, None) };
-            let mut out = vec![("font-size".into(), size)];
-            if let Some(l) = lh { out.push(("line-height".into(), l)) }
-            if !family.is_empty() { out.push(("font-family".into(), family)) }
-            for x in &p {
-                let lx = x.to_ascii_lowercase();
-                if lx == "italic" || lx == "oblique" { out.push(("font-style".into(), "italic".into())) }
-                if lx == "bold" || lx == "700" { out.push(("font-weight".into(), "700".into())) }
-            }
-            let _ = joined;
-            Some(out)
         }
         "place-items" | "place-content" | "place-self" => {
             let what = name.strip_prefix("place-")?;
