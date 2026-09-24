@@ -90,3 +90,17 @@ fn a_declared_size_survives_a_failed_fetch() {
     assert_eq!((out.images[0].width, out.images[0].height), (10, 4));
     assert_eq!(out.images[0].address, "", "no bytes, so no address — the space is still reserved");
 }
+
+/// ★ An SVG's size comes from its ROOT element, and a missing dimension
+/// (with no viewBox) takes the default object size, 300×150 (CSS Images 3).
+#[test]
+fn svg_intrinsic_size_reads_the_root_and_defaults_a_missing_dimension() {
+    use navigator_prerender::subresource::intrinsic_size;
+    // WPT's support/w100.svg: a width and nothing else.
+    assert_eq!(intrinsic_size(br#"<svg style="background: green" xmlns="http://www.w3.org/2000/svg" width="100"></svg>"#), Some((100, 150)));
+    assert_eq!(intrinsic_size(br#"<svg xmlns="http://www.w3.org/2000/svg" height="40"></svg>"#), Some((300, 40)));
+    // A nested element's width is not the image's.
+    assert_eq!(intrinsic_size(br#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="999" height="999"/></svg>"#), Some((20, 10)));
+    assert_eq!(intrinsic_size(br#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="999" height="999"/></svg>"#), None,
+               "no root dimensions at all: unsized, as before");
+}

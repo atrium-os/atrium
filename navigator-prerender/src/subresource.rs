@@ -181,15 +181,29 @@ pub fn intrinsic_size(b: &[u8]) -> Option<(u32, u32)> {
     // SVG: its size is in the markup, as `width`/`height` or a `viewBox`.
     let head = &b[..b.len().min(4096)];
     let text = String::from_utf8_lossy(head);
-    if text.contains("<svg") {
+    if let Some(start) = text.find("<svg") {
+        // ★ Only the ROOT element's attributes. Searching the whole file
+        // took the first `width="` anywhere — a nested rect's, as often as
+        // not — as the image's width.
+        let tag = &text[start..start + text[start..].find('>').unwrap_or(text.len() - start)];
         let attr = |name: &str| -> Option<f64> {
-            let at = text.find(&format!("{name}=\""))? + name.len() + 2;
-            let rest = &text[at..];
-            let end = rest.find('"')?;
+            let at = [format!(" {name}=\""), format!(" {name}='")].iter().find_map(|k| tag.find(k.as_str()).map(|i| i + k.len()))?;
+            let rest = &tag[at..];
+            let end = rest.find(['"', '\''])?;
             rest[..end].trim().trim_end_matches("px").parse().ok()
         };
-        if let (Some(w), Some(h)) = (attr("width"), attr("height")) {
-            if w > 0.0 && h > 0.0 { return Some((w.round() as u32, h.round() as u32)) }
+        let (w, h) = (attr("width").filter(|v| *v > 0.0), attr("height").filter(|v| *v > 0.0));
+        if let (Some(w), Some(h)) = (w, h) { return Some((w.round() as u32, h.round() as u32)) }
+        // ★ One dimension and no viewBox: CSS Images 3's default sizing
+        // fills the missing one from the default object size, 300×150.
+        // WPT's box-sizing tests use exactly this (`width="100"` alone),
+        // and the image was dropped as unsized.
+        if !tag.contains("viewBox") {
+            match (w, h) {
+                (Some(w), None) => return Some((w.round() as u32, 150)),
+                (None, Some(h)) => return Some((300, h.round() as u32)),
+                _ => {}
+            }
         }
         if let Some(at) = text.find("viewBox=\"") {
             let rest = &text[at + 9..];

@@ -8,6 +8,16 @@ description = "The normalizer (Atrium Document Profile v1 §6): accepts real-wor
 navigator-dom = { path = "../navigator-dom" }
 navigator-style = { path = "../navigator-style" }
 navigator-render = { path = "../navigator-render" }
+# Review tooling only (wpt-reftest): content addresses for test images.
+blake3 = { version = "1", features = ["pure"], optional = true }
+# …and the converter's own image sizing, so the oracle and the lane agree.
+navigator-prerender = { path = "../navigator-prerender", optional = true }
+png = { version = "0.17", optional = true }
+
+[features]
+# The WPT reftest oracle: renders test and reference to PIXELS, which needs
+# the review-only rasterizer. Never in the worker's build.
+wpt = ["navigator-render/raster", "dep:blake3", "dep:navigator-prerender", "dep:png"]
 
 # navigator-fonts vendors a one-line fix to pathfinder_simd; a dependent
 # crate must repeat the patch, because [patch] only applies at the build root.
@@ -17,3 +27,8 @@ pathfinder_simd = { path = "../navigator-fonts/vendor/pathfinder_simd" }
 [[bin]]
 name = "navigator-normalize"
 path = "src/main.rs"
+
+[[bin]]
+name = "wpt-reftest"
+path = "src/bin/wpt-reftest.rs"
+required-features = ["wpt"]

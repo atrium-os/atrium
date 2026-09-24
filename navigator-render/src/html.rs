@@ -574,6 +574,12 @@ impl<'a> Cx<'a> {
                 let content = (w - frame).max(0);
                 clamp(pt + pb + bt + bb + if *iw > 0 { (content as i128 * *ih as i128 / *iw as i128) as U } else { *ih })
             }));
+        // ★ A border box is never smaller than its padding and border: the
+        // content box cannot go negative (CSS Box Sizing 3 §3). Width had
+        // this floor; height did not, so WPT's box-sizing-026 — `height:
+        // 10px` with 50 px borders — painted its borders over each other.
+        let vframe = pt + pb + bt + bb;
+        let definite = definite.map(|d| d.max(vframe));
         let child_cb_h = definite.map(|d| (d - pt - pb - bt - bb).max(0));
         // ★ List markers belong to `li` (the profile admits list-style-* but not
         // display: list-item): typed by the inherited list-style-type,
@@ -691,7 +697,7 @@ impl<'a> Cx<'a> {
         let content_h = cy - (by + bt + pt);
         // The box's own border and background are outside its own clip.
         self.scene.cur.0 = saved_attrs.0;
-        let hgt = definite.unwrap_or_else(|| clamp(content_h + pt + pb + bt + bb));
+        let hgt = definite.unwrap_or_else(|| clamp(content_h + pt + pb + bt + bb).max(vframe));
         // Paint: background over the border box, then borders — unless
         // visibility: hidden, which keeps the box and paints none of it.
         let hidden = kw(s, "visibility") == "hidden";
@@ -857,8 +863,11 @@ impl<'a> Cx<'a> {
         let v_off = |p: &str| -> Option<U> { match s.get(p) { V::Pct(_) => cbh.and_then(|b| len(s.get(p), b)), v => len(v, 0) } };
         let (left, right) = (h_off("left"), h_off("right"));
         let (top, bottom) = (v_off("top"), v_off("bottom"));
-        let (ml, mr) = (h_off("margin-left").unwrap_or(0), h_off("margin-right").unwrap_or(0));
-        let (mt, mb) = (h_off("margin-top").unwrap_or(0), h_off("margin-bottom").unwrap_or(0));
+        // `None` is `auto`; resolved below, once the box's size is known.
+        let (mla, mra) = (h_off("margin-left"), h_off("margin-right"));
+        let (mta, mba) = (h_off("margin-top"), h_off("margin-bottom"));
+        let (mut ml, mut mr) = (mla.unwrap_or(0), mra.unwrap_or(0));
+        let (mut mt, mut mb) = (mta.unwrap_or(0), mba.unwrap_or(0));
         let (bt, br, bb, bl) = ["border-top", "border-right", "border-bottom", "border-left"].map(|b| {
             if kw(s, &format!("{b}-style")) == "none" { 0 } else { len(s.get(&format!("{b}-width")), cbw).unwrap_or(0) }
         }).into();
@@ -881,6 +890,32 @@ impl<'a> Cx<'a> {
         if let Some(m) = h_off("max-width") { w = w.min(m) }
         if let Some(m) = h_off("min-width") { w = w.max(m) }
         w = w.max(frame);
+        // ★ AUTO MARGINS (CSS 2.1 §10.3.7): with both offsets AND the width
+        // given, an auto margin takes what is left — both auto split it,
+        // which is the `left: 0; right: 0; margin: auto` centring idiom.
+        // Taken as 0, WPT's box-sizing-003 put its square 25 px off.
+        if let (Some(l), Some(r), false) = (left, right, matches!(s.get("width"), V::Kw("auto"))) {
+            let free = cbw - l - r - w - ml - mr;
+            match (mla.is_none(), mra.is_none()) {
+                (true, true) if free >= 0 => { ml = free / 2; mr = free - free / 2 }
+                (true, true) => mr = free, // negative: the start margin stays 0
+                (true, false) => ml = free,
+                (false, true) => mr = free,
+                _ => {}
+            }
+        }
+        // …and vertically (§10.6.4), when the height is given too.
+        let spec_h = match s.get("height") { V::Pct(_) => cbh.and_then(|b| len(s.get("height"), b)), V::Kw(_) => None, v => len(v, 0) };
+        if let (Some(t), Some(b), Some(hh), Some(ch)) = (top, bottom, spec_h, cbh) {
+            let hh = hh.max(bt + bb + v_off("padding-top").unwrap_or(0) + v_off("padding-bottom").unwrap_or(0));
+            let free = ch - t - b - hh - mt - mb;
+            match (mta.is_none(), mba.is_none()) {
+                (true, true) => { mt = free / 2; mb = free - free / 2 }
+                (true, false) => mt = free,
+                (false, true) => mb = free,
+                _ => {}
+            }
+        }
         // A definite height only when both offsets are given and `height` is
         // auto; otherwise the content decides and `block()` clamps it.
         let forced_h = match (top, bottom, s.get("height")) {
@@ -2389,6 +2424,35 @@ mod tests {
         assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 100, 20)]);
         assert_eq!(boxes(&o, 0x00ff00ff), vec![(110, 0, 380, 20)], "grows into the free space, gaps honoured");
         assert_eq!(boxes(&o, 0x0000ffff), vec![(500, 0, 100, 20)]);
+    }
+
+    /// ★ Absolutely positioned auto margins (CSS 2.1 §10.3.7, §10.6.4): with
+    /// both offsets and the size given, they take what is left — the
+    /// centring idiom. Found by WPT's box-sizing-003.
+    #[test]
+    fn absolute_auto_margins_take_the_remaining_space() {
+        let src = r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .cb { position: relative; width: 400px; height: 200px }
+            .c { position: absolute; left: 0px; right: 0px; top: 0px; bottom: 0px; width: 100px; height: 50px;
+                 margin-left: auto; margin-right: auto; margin-top: auto; margin-bottom: auto; background-color: #ff0000 }</style>
+            <div class="cb"><div class="c"></div></div>"#;
+        let o = render(src);
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(150, 75, 100, 50)], "centred both ways");
+        // Control: with zero margins it sits at the corner.
+        let c = render(&src.replace("margin-left: auto; margin-right: auto; margin-top: auto; margin-bottom: auto;", ""));
+        assert_eq!(boxes(&c, 0xff0000ff), vec![(0, 0, 100, 50)]);
+    }
+
+    /// ★ A border box is never smaller than its padding and border — in
+    /// height as well as width. Found by WPT's box-sizing-026.
+    #[test]
+    fn a_border_box_is_at_least_its_frame_vertically() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .b { width: 10px; height: 10px; border-top-width: 50px; border-bottom-width: 50px; border-left-width: 50px; border-right-width: 50px;
+                 border-top-style: solid; border-bottom-style: solid; border-left-style: solid; border-right-style: solid;
+                 border-top-color: #00ff00; border-bottom-color: #00ff00; border-left-color: #00ff00; border-right-color: #00ff00 }
+            .after { height: 10px; background-color: #ff0000 }</style><div class="b"></div><div class="after"></div>"#);
+        assert_eq!(boxes(&o, 0xff0000ff)[0].1, 100, "the next box starts below a 100px-tall border box, not 10px");
     }
 
     /// ★ COLSPAN. A navbox: one title cell across both columns, then label

@@ -1794,6 +1794,28 @@ Wikipedia's navboxes now render as the site does, less the `::after` separators.
 78 documents: 0 refused; crossing the edge 13 → 10. `rowspan` stays out (44 cells in 3
 documents), a decision recorded with its numbers.
 
+**An oracle: the Web Platform Tests (2026-09-24).** `wpt-reftest` (navigator-normalize,
+feature `wpt`) runs WPT's CSS reftests through the real lane — normalizer → profile
+renderer → pixels at 800×600 — on both the test and its reference, and compares pixels
+within the test's own declared tolerance. No browser is needed: a reftest's reference is
+the expected rendering, written in simpler CSS. Its controls (an identical pair passes, a
+red/green pair fails on exactly its 5,000 px, a `mismatch` pair passes) run first. Tests the
+oracle cannot judge fairly are skipped WITH the reason: they run script (the next step is
+to pass them through the converter, as the lane does), need the Ahem test font, or use a
+non-PNG image — the review rasterizer paints PNG only, which is also why SVG logos were
+blank in every corpus review. WPT lives at `~/src/wpt` as a sparse clone (12 directories,
+~12 MB), BSD-3-Clause, never committed here.
+
+First findings, all fixed: absolutely positioned boxes ignored auto margins (CSS 2.1
+§10.3.7/§10.6.4 — the `left: 0; right: 0; margin: auto` centring idiom); a border box could
+be shorter than its own borders (the height half of the non-negative content box); `.xht`
+references were read as HTML, so CDATA-wrapped CSS vanished; and the converter sized an
+SVG from the first `width=` anywhere in the file and dropped a width-only SVG, where CSS's
+default object size gives 150 px of height. `css-ui`: 56 → 65 pass of 88 evaluable, no
+regressions; box-sizing: 4 of 4 evaluable (19 need SVG painting). OPEN, a profile question:
+an image declaration is (width, height), which always implies a ratio; a width-only SVG has
+none, so under `max-height` we shrink its width where a browser keeps it.
+
 ★ **Two renderer tests had been failing for hours** — a stale sample golden and a pinned
 `nsg 0.1` header — behind `grep -c "test result: ok"`, which counts the suites that passed
 and cannot see one that failed. Counted properly: **505 tests, 0 failures, six crates**.

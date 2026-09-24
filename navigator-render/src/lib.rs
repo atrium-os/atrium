@@ -16,6 +16,8 @@ pub mod flag;
 pub mod fontset;
 pub mod html;
 pub mod nsg;
+#[cfg(feature = "raster")]
+pub mod raster;
 
 use fontset::{Family, FontSet};
 use pulldown_cmark::{Event, HeadingLevel, Options as MdOptions, Parser, Tag, TagEnd};
