@@ -96,9 +96,42 @@ struct MvkAccel {
     /// In-flight BLAS builds (`add_scene_blases_async`). Drained by
     /// `poll_scene_blases`, which also frees the build inputs.
     pending: Vec<PendingBuild>,
-    /// Buffers/memory backing the current TLAS (instances, storage, scratch)
-    /// — replaced on rebuild.
-    tlas_owned: Vec<(vk::Buffer, vk::DeviceMemory)>,
+    /// Buffers backing the current TLAS (instances, storage, scratch).
+    tlas_owned: Option<TlasBufs>,
+    /// The previous TLAS's buffers, kept for the next rebuild (a rebuild
+    /// that fits reuses them instead of three allocations + a map).
+    tlas_spare: Option<TlasBufs>,
+    /// An async TLAS rebuild in flight (`rebuild_scene_tlas_async`); swapped
+    /// in by `poll_scene_tlas`.
+    tlas_pending: Option<PendingTlas>,
+}
+
+/// The three buffers of one TLAS build: the mapped instance array, the
+/// structure's storage and the build scratch, each with its capacity so a
+/// later build can reuse the set.
+struct TlasBufs {
+    inst: vk::Buffer, inst_mem: vk::DeviceMemory, inst_map: *mut u8, inst_cap: u64,
+    store: vk::Buffer, store_mem: vk::DeviceMemory, store_cap: u64,
+    scratch: vk::Buffer, scratch_mem: vk::DeviceMemory, scratch_cap: u64,
+}
+unsafe impl Send for TlasBufs {}
+impl TlasBufs {
+    fn fits(&self, inst: u64, store: u64, scratch: u64) -> bool {
+        inst <= self.inst_cap && store <= self.store_cap && scratch <= self.scratch_cap
+    }
+    fn pairs(&self) -> [(vk::Buffer, vk::DeviceMemory); 3] {
+        [(self.inst, self.inst_mem), (self.store, self.store_mem), (self.scratch, self.scratch_mem)]
+    }
+}
+
+/// A TLAS being built while frames trace the current one.
+struct PendingTlas {
+    fence: vk::Fence,
+    cb: vk::CommandBuffer,
+    tlas: vk::AccelerationStructureKHR,
+    owned: TlasBufs,
+    size: u64,
+    instances: u32,
 }
 
 /// One in-flight batch of BLAS builds: its fence + command buffer, the
@@ -894,7 +927,7 @@ impl MoltenVkBackend {
         let stats = unsafe { self.build_blases(asd, blases, scratch_align, &mut owned_all, &mut transient, &mut blas_handles, &mut blas_addrs, None, import_host)? };
         // Synchronous builds: the inputs are done with once build_blases returns.
         unsafe { self.free_buffers(transient) };
-        let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: blas_handles, blas_addrs, owned: owned_all, tlas_owned: Vec::new(), pending: Vec::new() };
+        let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: blas_handles, blas_addrs, owned: owned_all, tlas_owned: None, tlas_spare: None, pending: Vec::new(), tlas_pending: None };
         self.accels.lock().unwrap().insert(tlas_id.raw(), accel);
         eprintln!("build_scene_tlas: {stats}");
         self.rebuild_scene_tlas(tlas_id, instances)
@@ -1129,116 +1162,222 @@ impl MoltenVkBackend {
 
     /// Rebuild the scene TLAS over the stored BLASes for a new instance
     /// list (the BLASes persist; only the TLAS and its instance buffer are
-    /// replaced). Used for LOD re-instancing and streamed-in cells.
+    /// replaced) and WAIT for it. Used at startup; frames use
+    /// `rebuild_scene_tlas_async` + `poll_scene_tlas`.
     pub fn rebuild_scene_tlas(&self, tlas_id: ResourceId, instances: &[SceneInstance]) -> Result<(), String> {
         let asd = self.as_device.as_ref()
             .ok_or_else(|| "ray-query not available on this device".to_string())?;
-        let mut as_props = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
-        let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut as_props);
-        unsafe { self.instance.get_physical_device_properties2(self.physical, &mut p2) };
-        let scratch_align =
-            as_props.min_acceleration_structure_scratch_offset_alignment.max(256) as u64;
-        let align_up = |a: u64, al: u64| (a + al - 1) & !(al - 1);
         let (blas_addrs, old_tlas, old_owned) = {
             let mut accels = self.accels.lock().unwrap();
             let a = accels.get_mut(&tlas_id.raw()).ok_or_else(|| format!("scene {tlas_id} not built"))?;
-            for inst in instances {
-                if inst.blas as usize >= a.blas_addrs.len() {
-                    return Err(format!("instance references BLAS {} of {}", inst.blas, a.blas_addrs.len()));
+            Self::check_instances(a, instances)?;
+            if let Some(p) = a.tlas_pending.take() {
+                // An async rebuild is in flight: let it finish, then discard it.
+                unsafe {
+                    let _ = self.device.wait_for_fences(&[p.fence], true, Self::wait_timeout_ns(30_000));
+                    self.device.destroy_fence(p.fence, None);
+                    self.device.free_command_buffers(self.cmd_pool, &[p.cb]);
+                    asd.destroy_acceleration_structure(p.tlas, None);
+                    self.free_buffers(p.owned.pairs().to_vec());
                 }
             }
             let old = std::mem::replace(&mut a.tlas, vk::AccelerationStructureKHR::null());
-            (a.blas_addrs.clone(), old, std::mem::take(&mut a.tlas_owned))
+            (a.blas_addrs.clone(), old, a.tlas_owned.take())
         };
         unsafe {
-            let _guard_idle = ();
+            // Frames are synchronous (the previous frame's fence was waited
+            // on), so nothing in flight references the old TLAS. Its
+            // buffers become the spare set for this build.
             if old_tlas != vk::AccelerationStructureKHR::null() {
                 asd.destroy_acceleration_structure(old_tlas, None);
-                for (b, m) in old_owned {
-                    self.device.destroy_buffer(b, None);
-                    self.device.free_memory(m, None);
+            }
+            let spare = {
+                let mut accels = self.accels.lock().unwrap();
+                let a = accels.get_mut(&tlas_id.raw()).unwrap();
+                if let Some(o) = old_owned {
+                    if let Some(s) = a.tlas_spare.replace(o) { self.free_buffers(s.pairs().to_vec()); }
                 }
-            }
-            let mut owned: Vec<(vk::Buffer, vk::DeviceMemory)> = Vec::new();
-            // ---- instances ----
-            let mut inst_bytes = vec![0u8; instances.len() * 64];
-            for (i, inst) in instances.iter().enumerate() {
-                let o = i * 64;
-                // transform: 12 f32 row-major 3x4
-                std::ptr::copy_nonoverlapping(inst.transform.as_ptr() as *const u8,
-                    inst_bytes[o..].as_mut_ptr(), 48);
-                // instanceCustomIndex(24) | mask(8=0xFF)
-                inst_bytes[o + 48..o + 52]
-                    .copy_from_slice(&((inst.custom_index & 0xFFFFFF) | (0xFFu32 << 24)).to_le_bytes());
-                // sbtOffset(24)=0 | flags(8)=0
-                inst_bytes[o + 52..o + 56].copy_from_slice(&0u32.to_le_bytes());
-                // accelerationStructureReference = the instanced BLAS
-                inst_bytes[o + 56..o + 64]
-                    .copy_from_slice(&blas_addrs[inst.blas as usize].to_le_bytes());
-            }
-            let (ibuf, imem, imap) = self.make_as_buffer(inst_bytes.len() as u64,
-                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR, true)?;
-            owned.push((ibuf, imem));
-            std::ptr::copy_nonoverlapping(inst_bytes.as_ptr(), imap, inst_bytes.len());
-            let iaddr = self.buffer_address(ibuf);
-
-            // ---- TLAS sizes + storage + build ----
-            let tgeo = vk::AccelerationStructureGeometryKHR::default()
-                .geometry_type(vk::GeometryTypeKHR::INSTANCES)
-                .flags(vk::GeometryFlagsKHR::OPAQUE)
-                .geometry(vk::AccelerationStructureGeometryDataKHR {
-                    instances: vk::AccelerationStructureGeometryInstancesDataKHR::default()
-                        .data(vk::DeviceOrHostAddressConstKHR { device_address: iaddr }),
-                });
-            let tgeos = [tgeo];
-            let inst_count = instances.len() as u32;
-            // PREFER_FAST_BUILD for the TLAS (not FAST_TRACE). Two distinct hang
-            // causes were found and separated: (1) the deterministic ~32k-65k band
-            // hang was a buffer-overflow BUG (UserID instance-descriptor stride,
-            // fixed in MoltenVK MVKCmdAccelerationStructure) — flag-independent;
-            // (2) an INTERMITTENT hang at extreme counts (1M ~1/3) is the FAST_TRACE
-            // optimization itself — its heavier SAH build (~50 ms vs ~30 ms at 1M)
-            // stays marginal against the GPU watchdog. FAST_BUILD is reliable across
-            // 33k..1M (5/5 at 1M) and, since instance traversal is already near-free,
-            // costs nothing at render time. So FAST_BUILD is the default.
-            let mut tbi = vk::AccelerationStructureBuildGeometryInfoKHR::default()
-                .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
-                .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_BUILD)
-                .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-                .geometries(&tgeos);
-            let mut tsz = vk::AccelerationStructureBuildSizesInfoKHR::default();
-            asd.get_acceleration_structure_build_sizes(
-                vk::AccelerationStructureBuildTypeKHR::DEVICE, &tbi, &[inst_count], &mut tsz);
-            let (tlas_buf, tlas_mem, _) = self.make_as_buffer(tsz.acceleration_structure_size,
-                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR, false)?;
-            owned.push((tlas_buf, tlas_mem));
-            let (tscratch, tscratch_mem, _) = self.make_as_buffer(
-                tsz.build_scratch_size + scratch_align,
-                vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
-            owned.push((tscratch, tscratch_mem));
-            let tlas = asd.create_acceleration_structure(
-                &vk::AccelerationStructureCreateInfoKHR::default()
-                    .buffer(tlas_buf).size(tsz.acceleration_structure_size)
-                    .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL), None)
-                .map_err(|e| format!("create TLAS: {e:?}"))?;
-            tbi = tbi.dst_acceleration_structure(tlas)
-                .scratch_data(vk::DeviceOrHostAddressKHR {
-                    device_address: align_up(self.buffer_address(tscratch), scratch_align),
-                });
-            let trange = vk::AccelerationStructureBuildRangeInfoKHR::default()
-                .primitive_count(inst_count);
-            self.one_time_submit(|cb| {
-                asd.cmd_build_acceleration_structures(cb, &[tbi], &[&[trange]]);
-            })?;
-
+                a.tlas_spare.take()
+            };
+            let (tlas, owned, fence_cb, size) = self.submit_tlas_build(asd, &blas_addrs, instances, spare, true)?;
+            debug_assert!(fence_cb.is_none());
             let mut accels = self.accels.lock().unwrap();
             let a = accels.get_mut(&tlas_id.raw()).unwrap();
             a.tlas = tlas;
-            a.tlas_owned = owned;
-            log::debug!("rebuild_scene_tlas: {} instances, TLAS {:.2} MB", instances.len(),
-                        tsz.acceleration_structure_size as f64 / 1e6);
+            a.tlas_owned = Some(owned);
+            log::debug!("rebuild_scene_tlas: {} instances, TLAS {:.2} MB", instances.len(), size as f64 / 1e6);
         }
         Ok(())
+    }
+
+    /// Submit a TLAS rebuild WITHOUT waiting: the new TLAS is built while
+    /// frames keep tracing the current one, and `poll_scene_tlas` swaps it
+    /// in once the fence signals. Returns `Ok(false)` (nothing submitted)
+    /// while a previous async rebuild is still in flight — the caller keeps
+    /// its instance list dirty and retries after a poll.
+    pub fn rebuild_scene_tlas_async(&self, tlas_id: ResourceId, instances: &[SceneInstance]) -> Result<bool, String> {
+        let asd = self.as_device.as_ref()
+            .ok_or_else(|| "ray-query not available on this device".to_string())?;
+        let blas_addrs = {
+            let accels = self.accels.lock().unwrap();
+            let a = accels.get(&tlas_id.raw()).ok_or_else(|| format!("scene {tlas_id} not built"))?;
+            Self::check_instances(a, instances)?;
+            if a.tlas_pending.is_some() { return Ok(false); }
+            a.blas_addrs.clone()
+        };
+        let spare = self.accels.lock().unwrap().get_mut(&tlas_id.raw()).unwrap().tlas_spare.take();
+        let (tlas, owned, fence_cb, size) = unsafe { self.submit_tlas_build(asd, &blas_addrs, instances, spare, false)? };
+        let (fence, cb) = fence_cb.expect("async build returns its fence");
+        let mut accels = self.accels.lock().unwrap();
+        let a = accels.get_mut(&tlas_id.raw()).unwrap();
+        a.tlas_pending = Some(PendingTlas { fence, cb, tlas, owned, size, instances: instances.len() as u32 });
+        Ok(true)
+    }
+
+    /// Poll the in-flight async TLAS rebuild of scene `tlas_id`: when its
+    /// fence has signalled, the new TLAS replaces the current one (which is
+    /// destroyed — frames are synchronous, nothing references it) and
+    /// `Ok(true)` is returned. `Ok(false)` = nothing swapped (none in
+    /// flight, or still building).
+    pub fn poll_scene_tlas(&self, tlas_id: ResourceId) -> Result<bool, String> {
+        let asd = self.as_device.as_ref()
+            .ok_or_else(|| "ray-query not available on this device".to_string())?;
+        let mut accels = self.accels.lock().unwrap();
+        let a = accels.get_mut(&tlas_id.raw()).ok_or_else(|| format!("scene {tlas_id} not built"))?;
+        let Some(p) = a.tlas_pending.as_ref() else { return Ok(false) };
+        let signalled = unsafe { self.device.get_fence_status(p.fence) }.map_err(|e| format!("TLAS fence status: {e:?}"))?;
+        if !signalled { return Ok(false); }
+        let p = a.tlas_pending.take().unwrap();
+        let old = std::mem::replace(&mut a.tlas, p.tlas);
+        let old_owned = std::mem::replace(&mut a.tlas_owned, Some(p.owned));
+        unsafe {
+            self.device.destroy_fence(p.fence, None);
+            self.device.free_command_buffers(self.cmd_pool, &[p.cb]);
+            if old != vk::AccelerationStructureKHR::null() {
+                asd.destroy_acceleration_structure(old, None);
+            }
+            if let Some(o) = old_owned {
+                if let Some(s) = a.tlas_spare.replace(o) { self.free_buffers(s.pairs().to_vec()); }
+            }
+        }
+        log::debug!("poll_scene_tlas: swapped in {} instances, TLAS {:.2} MB", p.instances, p.size as f64 / 1e6);
+        Ok(true)
+    }
+
+    fn check_instances(a: &MvkAccel, instances: &[SceneInstance]) -> Result<(), String> {
+        for inst in instances {
+            if inst.blas as usize >= a.blas_addrs.len() {
+                return Err(format!("instance references BLAS {} of {}", inst.blas, a.blas_addrs.len()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode + submit one TLAS build over `instances` (BLAS references
+    /// resolved through `blas_addrs`). `spare` = a retired buffer set to
+    /// reuse when it fits (else it is freed and a new set allocated).
+    /// `wait` = block on the fence (nothing returned to free); otherwise
+    /// the fence + command buffer come back for the caller to poll.
+    /// Returns the new TLAS, the buffer set backing it and its storage size.
+    unsafe fn submit_tlas_build(&self, asd: &ash::khr::acceleration_structure::Device, blas_addrs: &[u64],
+                                instances: &[SceneInstance], spare: Option<TlasBufs>, wait: bool)
+        -> Result<(vk::AccelerationStructureKHR, TlasBufs, Option<(vk::Fence, vk::CommandBuffer)>, u64), String>
+    {
+        let mut as_props = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
+        let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut as_props);
+        self.instance.get_physical_device_properties2(self.physical, &mut p2);
+        let scratch_align =
+            as_props.min_acceleration_structure_scratch_offset_alignment.max(256) as u64;
+        let align_up = |a: u64, al: u64| (a + al - 1) & !(al - 1);
+        let inst_count = instances.len() as u32;
+        let inst_bytes = (instances.len() as u64 * 64).max(64);
+
+        // ---- sizes (the instance address only affects the build, not the
+        // sizes, so query with a null address first) ----
+        // PREFER_FAST_BUILD for the TLAS (not FAST_TRACE). Two distinct hang
+        // causes were found and separated: (1) the deterministic ~32k-65k band
+        // hang was a buffer-overflow BUG (UserID instance-descriptor stride,
+        // fixed in MoltenVK MVKCmdAccelerationStructure) — flag-independent;
+        // (2) an INTERMITTENT hang at extreme counts (1M ~1/3) is the FAST_TRACE
+        // optimization itself — its heavier SAH build (~50 ms vs ~30 ms at 1M)
+        // stays marginal against the GPU watchdog. FAST_BUILD is reliable across
+        // 33k..1M (5/5 at 1M) and, since instance traversal is already near-free,
+        // costs nothing at render time. So FAST_BUILD is the default.
+        let geo_with = |addr: u64| vk::AccelerationStructureGeometryKHR::default()
+            .geometry_type(vk::GeometryTypeKHR::INSTANCES)
+            .flags(vk::GeometryFlagsKHR::OPAQUE)
+            .geometry(vk::AccelerationStructureGeometryDataKHR {
+                instances: vk::AccelerationStructureGeometryInstancesDataKHR::default()
+                    .data(vk::DeviceOrHostAddressConstKHR { device_address: addr }),
+            });
+        let flags = vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_BUILD;
+        let tgeos0 = [geo_with(0)];
+        let tbi0 = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+            .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
+            .flags(flags)
+            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+            .geometries(&tgeos0);
+        let mut tsz = vk::AccelerationStructureBuildSizesInfoKHR::default();
+        asd.get_acceleration_structure_build_sizes(
+            vk::AccelerationStructureBuildTypeKHR::DEVICE, &tbi0, &[inst_count], &mut tsz);
+        let store_bytes = tsz.acceleration_structure_size;
+        let scratch_bytes = tsz.build_scratch_size + scratch_align;
+
+        // ---- buffers: the spare set when it fits, else a fresh one ----
+        let bufs = match spare {
+            Some(sp) if sp.fits(inst_bytes, store_bytes, scratch_bytes) => sp,
+            other => {
+                if let Some(sp) = other { self.free_buffers(sp.pairs().to_vec()); }
+                let (inst, inst_mem, inst_map) = self.make_as_buffer(inst_bytes,
+                    vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR, true)?;
+                let (store, store_mem, _) = self.make_as_buffer(store_bytes,
+                    vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR, false)?;
+                let (scratch, scratch_mem, _) = self.make_as_buffer(scratch_bytes,
+                    vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
+                TlasBufs { inst, inst_mem, inst_map, inst_cap: inst_bytes,
+                           store, store_mem, store_cap: store_bytes,
+                           scratch, scratch_mem, scratch_cap: scratch_bytes }
+            }
+        };
+
+        // ---- instances, encoded straight into the mapped buffer ----
+        // (host-coherent: visible to the build on submit)
+        for (i, inst) in instances.iter().enumerate() {
+            let o = bufs.inst_map.add(i * 64);
+            // transform: 12 f32 row-major 3x4
+            std::ptr::copy_nonoverlapping(inst.transform.as_ptr() as *const u8, o, 48);
+            // instanceCustomIndex(24) | mask(8=0xFF)
+            std::ptr::copy_nonoverlapping(((inst.custom_index & 0xFFFFFF) | (0xFFu32 << 24)).to_le_bytes().as_ptr(), o.add(48), 4);
+            // sbtOffset(24)=0 | flags(8)=0
+            std::ptr::copy_nonoverlapping(0u32.to_le_bytes().as_ptr(), o.add(52), 4);
+            // accelerationStructureReference = the instanced BLAS
+            std::ptr::copy_nonoverlapping(blas_addrs[inst.blas as usize].to_le_bytes().as_ptr(), o.add(56), 8);
+        }
+        let iaddr = self.buffer_address(bufs.inst);
+
+        // ---- TLAS + build ----
+        let tlas = asd.create_acceleration_structure(
+            &vk::AccelerationStructureCreateInfoKHR::default()
+                .buffer(bufs.store).size(store_bytes)
+                .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL), None)
+            .map_err(|e| format!("create TLAS: {e:?}"))?;
+        let tgeos = [geo_with(iaddr)];
+        let tbi = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+            .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
+            .flags(flags)
+            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+            .geometries(&tgeos)
+            .dst_acceleration_structure(tlas)
+            .scratch_data(vk::DeviceOrHostAddressKHR {
+                device_address: align_up(self.buffer_address(bufs.scratch), scratch_align),
+            });
+        let trange = vk::AccelerationStructureBuildRangeInfoKHR::default()
+            .primitive_count(inst_count);
+        let rec = |cb: vk::CommandBuffer| {
+            asd.cmd_build_acceleration_structures(cb, &[tbi], &[&[trange]]);
+        };
+        let fence_cb = if wait { self.one_time_submit(rec)?; None } else { Some(self.submit_no_wait(rec)?) };
+        Ok((tlas, bufs, fence_cb, store_bytes))
     }
 
     /// Stage an acceleration-structure binding for the next `Dispatch`.
