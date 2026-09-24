@@ -104,6 +104,16 @@ struct MvkAccel {
     /// An async TLAS rebuild in flight (`rebuild_scene_tlas_async`); swapped
     /// in by `poll_scene_tlas`.
     tlas_pending: Option<PendingTlas>,
+    /// The scene's instance array (64 B Vulkan instance records, one per
+    /// slot): the source of truth every TLAS build reads. Patched per slot
+    /// by `update_scene_instance`; a build copies only the slots changed
+    /// since its buffer set was last synced.
+    inst_shadow: Vec<u8>,
+    /// Slots changed since the oldest live buffer set was synced.
+    inst_log: Vec<u32>,
+    /// Bumped by `set_scene_instances` (a buffer set with another
+    /// generation re-copies the whole array).
+    inst_gen: u64,
 }
 
 /// The three buffers of one TLAS build: the mapped instance array, the
@@ -113,6 +123,10 @@ struct TlasBufs {
     inst: vk::Buffer, inst_mem: vk::DeviceMemory, inst_map: *mut u8, inst_cap: u64,
     store: vk::Buffer, store_mem: vk::DeviceMemory, store_cap: u64,
     scratch: vk::Buffer, scratch_mem: vk::DeviceMemory, scratch_cap: u64,
+    /// Instance-array generation this set's `inst` mirrors (0 = never).
+    gen: u64,
+    /// Position in `inst_log` up to which `inst` has been patched.
+    synced: usize,
 }
 unsafe impl Send for TlasBufs {}
 impl TlasBufs {
@@ -927,7 +941,7 @@ impl MoltenVkBackend {
         let stats = unsafe { self.build_blases(asd, blases, scratch_align, &mut owned_all, &mut transient, &mut blas_handles, &mut blas_addrs, None, import_host)? };
         // Synchronous builds: the inputs are done with once build_blases returns.
         unsafe { self.free_buffers(transient) };
-        let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: blas_handles, blas_addrs, owned: owned_all, tlas_owned: None, tlas_spare: None, pending: Vec::new(), tlas_pending: None };
+        let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: blas_handles, blas_addrs, owned: owned_all, tlas_owned: None, tlas_spare: None, pending: Vec::new(), tlas_pending: None, inst_shadow: Vec::new(), inst_log: Vec::new(), inst_gen: 0 };
         self.accels.lock().unwrap().insert(tlas_id.raw(), accel);
         eprintln!("build_scene_tlas: {stats}");
         self.rebuild_scene_tlas(tlas_id, instances)
@@ -1165,12 +1179,82 @@ impl MoltenVkBackend {
     /// replaced) and WAIT for it. Used at startup; frames use
     /// `rebuild_scene_tlas_async` + `poll_scene_tlas`.
     pub fn rebuild_scene_tlas(&self, tlas_id: ResourceId, instances: &[SceneInstance]) -> Result<(), String> {
+        self.set_scene_instances(tlas_id, instances)?;
+        self.rebuild_scene_tlas_slots(tlas_id)
+    }
+
+    /// Replace the scene's whole instance array (slot i = `instances[i]`).
+    /// Nothing is built: follow with `rebuild_scene_tlas_slots[_async]`.
+    pub fn set_scene_instances(&self, tlas_id: ResourceId, instances: &[SceneInstance]) -> Result<(), String> {
+        let mut accels = self.accels.lock().unwrap();
+        let a = accels.get_mut(&tlas_id.raw()).ok_or_else(|| format!("scene {tlas_id} not built"))?;
+        Self::check_instances(a, instances)?;
+        a.inst_shadow.clear();
+        a.inst_shadow.resize(instances.len() * 64, 0);
+        for (i, inst) in instances.iter().enumerate() {
+            Self::encode_instance(&mut a.inst_shadow[i * 64..i * 64 + 64], inst, &a.blas_addrs);
+        }
+        a.inst_log.clear();
+        a.inst_gen += 1;
+        Ok(())
+    }
+
+    /// Patch one slot of the scene's instance array (LOD switch, streamed
+    /// cell): only this slot is re-copied at the next build. Nothing is
+    /// built until `rebuild_scene_tlas_slots[_async]`.
+    pub fn update_scene_instance(&self, tlas_id: ResourceId, slot: u32, inst: &SceneInstance) -> Result<(), String> {
+        let mut accels = self.accels.lock().unwrap();
+        let a = accels.get_mut(&tlas_id.raw()).ok_or_else(|| format!("scene {tlas_id} not built"))?;
+        Self::check_instances(a, std::slice::from_ref(inst))?;
+        let n = a.inst_shadow.len() / 64;
+        if slot as usize >= n {
+            return Err(format!("update_scene_instance: slot {slot} of {n}"));
+        }
+        let o = slot as usize * 64;
+        Self::encode_instance(&mut a.inst_shadow[o..o + 64], inst, &a.blas_addrs);
+        a.inst_log.push(slot);
+        Ok(())
+    }
+
+    /// Number of instance slots in the scene's array.
+    pub fn scene_instance_count(&self, tlas_id: ResourceId) -> usize {
+        self.accels.lock().unwrap().get(&tlas_id.raw()).map_or(0, |a| a.inst_shadow.len() / 64)
+    }
+
+    /// One Vulkan instance record (VkAccelerationStructureInstanceKHR).
+    fn encode_instance(dst: &mut [u8], inst: &SceneInstance, blas_addrs: &[u64]) {
+        // transform: 12 f32 row-major 3x4
+        for (k, v) in inst.transform.iter().enumerate() { dst[k * 4..k * 4 + 4].copy_from_slice(&v.to_le_bytes()); }
+        // instanceCustomIndex(24) | mask(8=0xFF)
+        dst[48..52].copy_from_slice(&((inst.custom_index & 0xFFFFFF) | (0xFFu32 << 24)).to_le_bytes());
+        // sbtOffset(24)=0 | flags(8)=0
+        dst[52..56].copy_from_slice(&0u32.to_le_bytes());
+        // accelerationStructureReference = the instanced BLAS
+        dst[56..64].copy_from_slice(&blas_addrs[inst.blas as usize].to_le_bytes());
+    }
+
+    /// Drop the head of the change log every live buffer set has applied.
+    fn compact_inst_log(a: &mut MvkAccel) {
+        let mut sets: Vec<&mut TlasBufs> = Vec::new();
+        if let Some(b) = a.tlas_owned.as_mut() { sets.push(b); }
+        if let Some(b) = a.tlas_spare.as_mut() { sets.push(b); }
+        if let Some(p) = a.tlas_pending.as_mut() { sets.push(&mut p.owned); }
+        let gen = a.inst_gen;
+        let min = sets.iter().filter(|b| b.gen == gen).map(|b| b.synced).min().unwrap_or(a.inst_log.len());
+        let min = min.min(a.inst_log.len());
+        if min == 0 { return; }
+        a.inst_log.drain(..min);
+        for b in sets { if b.gen == gen { b.synced -= min; } }
+    }
+
+    /// Rebuild the scene TLAS over the instance array as it stands
+    /// (`set_scene_instances` / `update_scene_instance`) and WAIT for it.
+    pub fn rebuild_scene_tlas_slots(&self, tlas_id: ResourceId) -> Result<(), String> {
         let asd = self.as_device.as_ref()
             .ok_or_else(|| "ray-query not available on this device".to_string())?;
-        let (blas_addrs, old_tlas, old_owned) = {
+        let (old_tlas, old_owned) = {
             let mut accels = self.accels.lock().unwrap();
             let a = accels.get_mut(&tlas_id.raw()).ok_or_else(|| format!("scene {tlas_id} not built"))?;
-            Self::check_instances(a, instances)?;
             if let Some(p) = a.tlas_pending.take() {
                 // An async rebuild is in flight: let it finish, then discard it.
                 unsafe {
@@ -1182,7 +1266,7 @@ impl MoltenVkBackend {
                 }
             }
             let old = std::mem::replace(&mut a.tlas, vk::AccelerationStructureKHR::null());
-            (a.blas_addrs.clone(), old, a.tlas_owned.take())
+            (old, a.tlas_owned.take())
         };
         unsafe {
             // Frames are synchronous (the previous frame's fence was waited
@@ -1191,21 +1275,21 @@ impl MoltenVkBackend {
             if old_tlas != vk::AccelerationStructureKHR::null() {
                 asd.destroy_acceleration_structure(old_tlas, None);
             }
-            let spare = {
-                let mut accels = self.accels.lock().unwrap();
-                let a = accels.get_mut(&tlas_id.raw()).unwrap();
-                if let Some(o) = old_owned {
-                    if let Some(s) = a.tlas_spare.replace(o) { self.free_buffers(s.pairs().to_vec()); }
-                }
-                a.tlas_spare.take()
-            };
-            let (tlas, owned, fence_cb, size) = self.submit_tlas_build(asd, &blas_addrs, instances, spare, true)?;
-            debug_assert!(fence_cb.is_none());
+            // The lock is held through the (waited) submit: nothing else
+            // touches the scene meanwhile, and the instance array is not
+            // cloned.
             let mut accels = self.accels.lock().unwrap();
             let a = accels.get_mut(&tlas_id.raw()).unwrap();
+            if let Some(o) = old_owned {
+                if let Some(s) = a.tlas_spare.replace(o) { self.free_buffers(s.pairs().to_vec()); }
+            }
+            let spare = a.tlas_spare.take();
+            let (tlas, owned, fence_cb, size) = self.submit_tlas_build(asd, &a.inst_shadow, a.inst_gen, &a.inst_log, spare, true)?;
+            debug_assert!(fence_cb.is_none());
             a.tlas = tlas;
             a.tlas_owned = Some(owned);
-            log::debug!("rebuild_scene_tlas: {} instances, TLAS {:.2} MB", instances.len(), size as f64 / 1e6);
+            Self::compact_inst_log(a);
+            log::debug!("rebuild_scene_tlas: {} instances, TLAS {:.2} MB", a.inst_shadow.len() / 64, size as f64 / 1e6);
         }
         Ok(())
     }
@@ -1216,21 +1300,29 @@ impl MoltenVkBackend {
     /// while a previous async rebuild is still in flight — the caller keeps
     /// its instance list dirty and retries after a poll.
     pub fn rebuild_scene_tlas_async(&self, tlas_id: ResourceId, instances: &[SceneInstance]) -> Result<bool, String> {
+        if self.accels.lock().unwrap().get(&tlas_id.raw()).map_or(false, |a| a.tlas_pending.is_some()) {
+            return Ok(false);
+        }
+        self.set_scene_instances(tlas_id, instances)?;
+        self.rebuild_scene_tlas_slots_async(tlas_id)
+    }
+
+    /// `rebuild_scene_tlas_slots` without waiting (see
+    /// `rebuild_scene_tlas_async` for the protocol): the build reads the
+    /// instance array as patched so far; later patches go to the next
+    /// build.
+    pub fn rebuild_scene_tlas_slots_async(&self, tlas_id: ResourceId) -> Result<bool, String> {
         let asd = self.as_device.as_ref()
             .ok_or_else(|| "ray-query not available on this device".to_string())?;
-        let blas_addrs = {
-            let accels = self.accels.lock().unwrap();
-            let a = accels.get(&tlas_id.raw()).ok_or_else(|| format!("scene {tlas_id} not built"))?;
-            Self::check_instances(a, instances)?;
-            if a.tlas_pending.is_some() { return Ok(false); }
-            a.blas_addrs.clone()
-        };
-        let spare = self.accels.lock().unwrap().get_mut(&tlas_id.raw()).unwrap().tlas_spare.take();
-        let (tlas, owned, fence_cb, size) = unsafe { self.submit_tlas_build(asd, &blas_addrs, instances, spare, false)? };
-        let (fence, cb) = fence_cb.expect("async build returns its fence");
         let mut accels = self.accels.lock().unwrap();
-        let a = accels.get_mut(&tlas_id.raw()).unwrap();
-        a.tlas_pending = Some(PendingTlas { fence, cb, tlas, owned, size, instances: instances.len() as u32 });
+        let a = accels.get_mut(&tlas_id.raw()).ok_or_else(|| format!("scene {tlas_id} not built"))?;
+        if a.tlas_pending.is_some() { return Ok(false); }
+        if a.inst_shadow.is_empty() { return Err("rebuild_scene_tlas_slots_async: no instances set".into()); }
+        let spare = a.tlas_spare.take();
+        let (tlas, owned, fence_cb, size) = unsafe { self.submit_tlas_build(asd, &a.inst_shadow, a.inst_gen, &a.inst_log, spare, false)? };
+        let (fence, cb) = fence_cb.expect("async build returns its fence");
+        a.tlas_pending = Some(PendingTlas { fence, cb, tlas, owned, size, instances: (a.inst_shadow.len() / 64) as u32 });
+        Self::compact_inst_log(a);
         Ok(true)
     }
 
@@ -1260,6 +1352,7 @@ impl MoltenVkBackend {
                 if let Some(s) = a.tlas_spare.replace(o) { self.free_buffers(s.pairs().to_vec()); }
             }
         }
+        Self::compact_inst_log(a);
         log::debug!("poll_scene_tlas: swapped in {} instances, TLAS {:.2} MB", p.instances, p.size as f64 / 1e6);
         Ok(true)
     }
@@ -1279,8 +1372,8 @@ impl MoltenVkBackend {
     /// `wait` = block on the fence (nothing returned to free); otherwise
     /// the fence + command buffer come back for the caller to poll.
     /// Returns the new TLAS, the buffer set backing it and its storage size.
-    unsafe fn submit_tlas_build(&self, asd: &ash::khr::acceleration_structure::Device, blas_addrs: &[u64],
-                                instances: &[SceneInstance], spare: Option<TlasBufs>, wait: bool)
+    unsafe fn submit_tlas_build(&self, asd: &ash::khr::acceleration_structure::Device,
+                                shadow: &[u8], gen: u64, log: &[u32], spare: Option<TlasBufs>, wait: bool)
         -> Result<(vk::AccelerationStructureKHR, TlasBufs, Option<(vk::Fence, vk::CommandBuffer)>, u64), String>
     {
         let mut as_props = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
@@ -1289,8 +1382,8 @@ impl MoltenVkBackend {
         let scratch_align =
             as_props.min_acceleration_structure_scratch_offset_alignment.max(256) as u64;
         let align_up = |a: u64, al: u64| (a + al - 1) & !(al - 1);
-        let inst_count = instances.len() as u32;
-        let inst_bytes = (instances.len() as u64 * 64).max(64);
+        let inst_count = (shadow.len() / 64) as u32;
+        let inst_bytes = (shadow.len() as u64).max(64);
 
         // ---- sizes (the instance address only affects the build, not the
         // sizes, so query with a null address first) ----
@@ -1336,23 +1429,25 @@ impl MoltenVkBackend {
                     vk::BufferUsageFlags::STORAGE_BUFFER, true)?;
                 TlasBufs { inst, inst_mem, inst_map, inst_cap: inst_bytes,
                            store, store_mem, store_cap: store_bytes,
-                           scratch, scratch_mem, scratch_cap: scratch_bytes }
+                           scratch, scratch_mem, scratch_cap: scratch_bytes, gen: 0, synced: 0 }
             }
         };
+        let mut bufs = bufs;
 
-        // ---- instances, encoded straight into the mapped buffer ----
-        // (host-coherent: visible to the build on submit)
-        for (i, inst) in instances.iter().enumerate() {
-            let o = bufs.inst_map.add(i * 64);
-            // transform: 12 f32 row-major 3x4
-            std::ptr::copy_nonoverlapping(inst.transform.as_ptr() as *const u8, o, 48);
-            // instanceCustomIndex(24) | mask(8=0xFF)
-            std::ptr::copy_nonoverlapping(((inst.custom_index & 0xFFFFFF) | (0xFFu32 << 24)).to_le_bytes().as_ptr(), o.add(48), 4);
-            // sbtOffset(24)=0 | flags(8)=0
-            std::ptr::copy_nonoverlapping(0u32.to_le_bytes().as_ptr(), o.add(52), 4);
-            // accelerationStructureReference = the instanced BLAS
-            std::ptr::copy_nonoverlapping(blas_addrs[inst.blas as usize].to_le_bytes().as_ptr(), o.add(56), 8);
+        // ---- instance array: bring this set's mapped copy up to date ----
+        // (host-coherent: visible to the build on submit). Another
+        // generation or a fresh set = the whole array; otherwise only the
+        // slots logged since this set was last synced.
+        if bufs.gen != gen {
+            std::ptr::copy_nonoverlapping(shadow.as_ptr(), bufs.inst_map, shadow.len());
+        } else {
+            for &slot in &log[bufs.synced.min(log.len())..] {
+                let o = slot as usize * 64;
+                std::ptr::copy_nonoverlapping(shadow.as_ptr().add(o), bufs.inst_map.add(o), 64);
+            }
         }
+        bufs.gen = gen;
+        bufs.synced = log.len();
         let iaddr = self.buffer_address(bufs.inst);
 
         // ---- TLAS + build ----
