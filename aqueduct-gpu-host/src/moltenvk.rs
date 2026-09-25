@@ -303,6 +303,9 @@ pub struct MoltenVkBackend {
     timestamp_period_ns: f32,
     /// Last measured GPU exec time, nanoseconds (0 until first timed frame).
     last_gpu_ns: AtomicU64,
+    /// Per-dispatch GPU time of the last timed frame, ns, in dispatch order
+    /// (a timestamp after every compute dispatch, up to `DISPATCH_STAMPS`).
+    last_dispatch_ns: Mutex<Vec<u64>>,
     /// Cumulative measured GPU exec time across all timed frames, ns.
     total_gpu_ns: AtomicU64,
     /// Whether VK_KHR_acceleration_structure + VK_KHR_ray_query were enabled at
@@ -621,7 +624,7 @@ impl MoltenVkBackend {
         let timestamps_ok = timestamp_period_ns > 0.0 && valid_bits > 0;
         let query_pool = if timestamps_ok {
             let qpi = vk::QueryPoolCreateInfo::default()
-                .query_type(vk::QueryType::TIMESTAMP).query_count(2);
+                .query_type(vk::QueryType::TIMESTAMP).query_count(2 + DISPATCH_STAMPS);
             unsafe { device.create_query_pool(&qpi, None) }
                 .unwrap_or(vk::QueryPool::null())
         } else {
@@ -689,6 +692,7 @@ impl MoltenVkBackend {
             query_pool,
             timestamp_period_ns,
             last_gpu_ns: AtomicU64::new(0),
+            last_dispatch_ns: Mutex::new(Vec::new()),
             total_gpu_ns: AtomicU64::new(0),
             ray_query,
             as_device,
@@ -1654,6 +1658,14 @@ impl MoltenVkBackend {
         self.last_gpu_ns.load(Ordering::Relaxed) as f64 * 1e-9
     }
 
+    /// Per-dispatch GPU time of the last timed frame, seconds, in dispatch
+    /// order (empty without timestamps). Dispatch k's span runs from the
+    /// previous stamp (frame top for k = 0) to the stamp after it, so the
+    /// values sum to the frame's exec time up to the last stamped dispatch.
+    pub fn measured_dispatch_times_s(&self) -> Vec<f64> {
+        self.last_dispatch_ns.lock().unwrap().iter().map(|&ns| ns as f64 * 1e-9).collect()
+    }
+
     /// Cumulative measured GPU exec time across all timed frames, seconds.
     pub fn total_gpu_time_s(&self) -> f64 {
         self.total_gpu_ns.load(Ordering::Relaxed) as f64 * 1e-9
@@ -1740,6 +1752,9 @@ impl MoltenVkBackend {
         )
     }
 }
+
+/// Timestamp slots after every compute dispatch of a frame (per-pass GPU time).
+const DISPATCH_STAMPS: u32 = 64;
 
 impl Drop for MoltenVkBackend {
     fn drop(&mut self) {
@@ -1982,9 +1997,10 @@ impl MoltenVkBackend {
         // Measured GPU exec time (D-M6): reset the pool + stamp the top of
         // the pipe before any work; stamp the bottom just before close.
         let timing = self.query_pool != vk::QueryPool::null();
+        let mut n_stamped = 0u32;
         if timing {
             unsafe {
-                dev.cmd_reset_query_pool(cb, self.query_pool, 0, 2);
+                dev.cmd_reset_query_pool(cb, self.query_pool, 0, 2 + DISPATCH_STAMPS);
                 dev.cmd_write_timestamp(
                     cb, vk::PipelineStageFlags::TOP_OF_PIPE, self.query_pool, 0);
             }
@@ -2320,6 +2336,12 @@ impl MoltenVkBackend {
                                 &push_bytes[..n]);
                         }
                         dev.cmd_dispatch(cb, gx, gy, gz);
+                        // Per-dispatch GPU time: a stamp after each dispatch.
+                        if timing && n_stamped < DISPATCH_STAMPS {
+                            dev.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                                self.query_pool, 2 + n_stamped);
+                            n_stamped += 1;
+                        }
                         // Make the writes visible to host readback
                         // (HOST_COHERENT memory + queue-wait below)
                         // AND to any chained compute dispatch in
@@ -2408,16 +2430,25 @@ impl MoltenVkBackend {
         // Read the two timestamps back (the fence guarantees completion)
         // and record the modeled-vs-measured ground-truth exec time.
         if timing && res.is_ok() {
-            let mut ts = [0u64; 2];
+            let mut ts = vec![0u64; 2 + n_stamped as usize];
             let got = unsafe {
                 dev.get_query_pool_results(
                     self.query_pool, 0, &mut ts, vk::QueryResultFlags::TYPE_64)
             };
             if got.is_ok() {
+                let period = self.timestamp_period_ns as f64;
                 let delta = ts[1].saturating_sub(ts[0]);
-                let ns = (delta as f64 * self.timestamp_period_ns as f64) as u64;
+                let ns = (delta as f64 * period) as u64;
                 self.last_gpu_ns.store(ns, Ordering::Relaxed);
                 self.total_gpu_ns.fetch_add(ns, Ordering::Relaxed);
+                let mut per = Vec::with_capacity(n_stamped as usize);
+                let mut prev = ts[0];
+                for k in 0..n_stamped as usize {
+                    let t = ts[2 + k];
+                    per.push((t.saturating_sub(prev) as f64 * period) as u64);
+                    prev = t;
+                }
+                *self.last_dispatch_ns.lock().unwrap() = per;
             }
         }
         unsafe {
