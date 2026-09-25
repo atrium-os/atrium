@@ -1,22 +1,59 @@
 #!/bin/sh
-# Shut the Fresco VM down cleanly.
+# Shut the dev VM down cleanly — whichever one is running: the Fresco VM
+# (run-vm.sh) or the Tessera dev-root VM (run-vm-tessera.sh). Both run our
+# qemu build; matching only `fresco-shmem` left a two-day-old dev-root VM
+# reported as "no qemu running".
 #
 # Issues `shutdown -p now` over SSH and waits for QEMU to exit on
 # its own. Only escalates to SIGKILL if QEMU is genuinely stuck
 # after a generous deadline (60 s — covers the worst-case syncer
 # drain + softdep flush). The previous "sleep 5 && pkill -9" pattern
 # corrupted UFS softdep state mid-flush more than once.
+#
+# Refuses (exit 2) when:
+#   - more than one VM is running: vssh reaches only one of them, so the
+#     wrong guest could be halted while we wait on the other;
+#   - a crash/soak harness owns the VM: the harness relaunches qemu, so a
+#     guest shutdown just starts another run. Stop the harness instead.
 
 set -eu
 
-QEMU_PID=$(pgrep -f 'qemu-system-aarch64.*fresco-shmem' | head -1 || true)
-if [ -z "${QEMU_PID:-}" ]; then
-    echo "vshutdown: no Fresco qemu running"
+PIDS=$(pgrep -f 'qemu-build/build/qemu-system-aarch64' || true)
+if [ -z "$PIDS" ]; then
+    echo "vshutdown: no dev VM running"
     exit 0
 fi
+if [ "$(echo "$PIDS" | wc -l | tr -d ' ')" -gt 1 ]; then
+    echo "vshutdown: more than one VM running ($(echo $PIDS)); vssh would reach only one — stop them by hand" >&2
+    exit 2
+fi
+QEMU_PID=$PIDS
+
+# Walk up the parents: a harness script anywhere above qemu owns it.
+p=$(ps -o ppid= -p "$QEMU_PID" | tr -d ' ')
+while [ -n "$p" ] && [ "$p" -gt 1 ]; do
+    cmd=$(ps -o command= -p "$p" || true)
+    # Only the PROGRAM counts — the interpreter and its script, the first
+    # two words of the FIRST line — never text elsewhere in an argument (a
+    # shell whose multi-line -c string mentions a harness is not one).
+    for w in $(echo "$cmd" | awk 'NR == 1 {print $1, $2}'); do
+        case "$(basename -- "$w")" in
+            vm-*-test.sh|vm-crash-soak*.sh)
+                echo "vshutdown: qemu $QEMU_PID belongs to a harness (pid $p: $(basename -- "$w")); stop the harness, not the guest" >&2
+                exit 2 ;;
+        esac
+    done
+    p=$(ps -o ppid= -p "$p" | tr -d ' ')
+done
+
+case "$(ps -o command= -p "$QEMU_PID")" in
+    *fresco-shmem*) echo "vshutdown: Fresco VM (pid $QEMU_PID)" ;;
+    *tessera-devroot*) echo "vshutdown: Tessera dev-root VM (pid $QEMU_PID)" ;;
+    *) echo "vshutdown: VM pid $QEMU_PID" ;;
+esac
 
 # Politely ask the guest to halt.
-"$(dirname "$0")/vssh" 'shutdown -p now' >/dev/null 2>&1 || true
+VSSH_CONNECT_TIMEOUT=30 "$(dirname "$0")/vssh" 'sync; shutdown -p now' >/dev/null 2>&1 || true
 
 # Wait for QEMU's process to exit on its own (it does so when the
 # guest powers off cleanly).
@@ -30,7 +67,7 @@ while kill -0 "$QEMU_PID" 2>/dev/null; do
             echo "vshutdown: still alive, SIGKILL" >&2
             kill -KILL "$QEMU_PID" 2>/dev/null || true
         fi
-        break
+        exit 1
     fi
     sleep 1
 done

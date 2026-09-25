@@ -311,7 +311,7 @@ Two channels:
 > `cp` is far gentler on p9fs than concurrent execve mmap faults.
 
 ### Shutdown
-**Always use `~/src/bsd/scripts/vshutdown`.** It issues `shutdown -p now`, waits for QEMU to exit on its own (up to 60 s), and only escalates to SIGKILL if genuinely stuck.
+**Always use `~/src/bsd/scripts/vshutdown`.** It finds whichever dev VM is running (Fresco or Tessera dev-root — any qemu from `external/qemu-build`), issues `shutdown -p now`, waits for QEMU to exit on its own (up to 60 s), and only escalates (SIGTERM, then SIGKILL; exit 1) if genuinely stuck. It refuses (exit 2) when more than one VM runs — `vssh` reaches only one — or when a `vm-*-test.sh` / crash-soak harness owns the VM: the harness would relaunch it, so stop the harness instead. `VSSH_CONNECT_TIMEOUT=30 vssh …` raises vssh's 3 s connect timeout (ssh keeps the first `-o`, so passing `-o ConnectTimeout` after it does nothing).
 
 The dev VM root is on **ZFS** (since the 2026-05-09 rebuild — see §11 *Dev VM rebuild milestone*). ZFS imports cleanly after any unclean shutdown — no fsck, no qcow2 corruption from mid-write `kill -9`. The historical "UFS softdep flush + SIGKILL = lost cargo caches" failure mode is gone. `pkill -f qemu-system-aarch64` is now a safe-ish recovery, though `vshutdown` is still preferred for in-flight write hygiene.
 
