@@ -18,6 +18,7 @@
 //! background. Silence would be the only real failure.
 
 pub mod css;
+mod collapse;
 pub mod expand;
 pub mod recording;
 pub mod sel;
@@ -78,7 +79,7 @@ struct Block(Vec<(String, String)>);
 /// specific the layered one is (CSS Cascade 5 §6.4.4). And for `!important`
 /// the order REVERSES: unlayered important is the weakest, and an earlier
 /// layer beats a later one.
-type Priority = (bool, usize, (u32, u32, u32), usize);
+pub(crate) type Priority = (bool, usize, (u32, u32, u32), usize);
 
 /// Where a rule's layer ranks, for normal and for important declarations.
 fn layer_rank(layer: Option<usize>, layers: usize, important: bool) -> usize {
@@ -481,22 +482,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     // context, because padding and width change at breakpoints. The UA's own
     // padding counts too — a `<ul>`'s 40 px is padding like any other.
     {
-        let mut ua_sheet = css::Sheet::default();
-        let mut ua_order = 0usize;
-        css::parse(navigator_style::cascade::UA_CSS, &mut ua_order, &mut ua_sheet);
-        const FRAME: [&str; 12] = ["padding-left", "padding-right", "padding-top", "padding-bottom",
-            "border-left-width", "border-right-width", "border-top-width", "border-bottom-width",
-            "border-left-style", "border-right-style", "border-top-style", "border-bottom-style"];
-        let mut ua: BTreeMap<Handle, BTreeMap<String, String>> = BTreeMap::new();
-        for rule in &ua_sheet.rules {
-            let Ok(list) = sel::parse_list(&rule.selector) else { continue };
-            for h in &els {
-                if !list.iter().any(|c| m.matches(*h, c)) { continue }
-                for d in rule.decls.iter().filter(|d| FRAME.contains(&d.name.as_str())) {
-                    ua.entry(*h).or_default().insert(d.name.clone(), css::write_tokens(&d.value).trim().to_string());
-                }
-            }
-        }
+        let ua = ua_values(&els, &m);
         let get = |h: Handle, ctx: &str, p: &str| -> Option<String> {
             resolved.get(&(h, String::new(), ctx.to_string())).and_then(|x| x.get(p)).map(|(_, v)| v.clone())
                 .or_else(|| resolved.get(&(h, String::new(), String::new())).and_then(|x| x.get(p)).map(|(_, v)| v.clone()))
@@ -578,6 +564,9 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         if skipped > 0 { report.drop_n("content-box height with a percentage vertical padding (left as written)", skipped) }
         for (_, props) in resolved.iter_mut() { props.remove("box-sizing-marker"); }
     }
+
+    // ★ MARGIN COLLAPSING, compiled into literal margins (see `collapse`).
+    collapse::compile(&mut resolved, &dom, &ua_values(&els, &m), &mut report);
 
     // ★ Resolve named areas into the numeric lines the profile admits —
     // PER MEDIA CONTEXT. A responsive page keeps its whole layout in the
@@ -891,6 +880,25 @@ fn resolve_customs(sheet: &css::Sheet, els: &[Handle], m: &sel::Matcher, dom: &D
         }
     }
     out
+}
+
+/// Every UA-sheet declaration that applies to each element, by source order
+/// (the UA sheet is simple enough that order alone decides).
+fn ua_values(els: &[Handle], m: &sel::Matcher) -> BTreeMap<Handle, BTreeMap<String, String>> {
+    let mut ua_sheet = css::Sheet::default();
+    let mut ua_order = 0usize;
+    css::parse(navigator_style::cascade::UA_CSS, &mut ua_order, &mut ua_sheet);
+    let mut ua: BTreeMap<Handle, BTreeMap<String, String>> = BTreeMap::new();
+    for rule in &ua_sheet.rules {
+        let Ok(list) = sel::parse_list(&rule.selector) else { continue };
+        for h in els {
+            if !list.iter().any(|c| m.matches(*h, c)) { continue }
+            for d in &rule.decls {
+                ua.entry(*h).or_default().insert(d.name.clone(), css::write_tokens(&d.value).trim().to_string());
+            }
+        }
+    }
+    ua
 }
 
 fn has_light_dark(v: &[Token]) -> bool {

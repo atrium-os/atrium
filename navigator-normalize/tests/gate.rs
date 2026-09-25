@@ -82,7 +82,7 @@ fn a_state_rule_keeps_its_state() {
 
 #[test]
 fn shorthands_expand_to_the_right_sides() {
-    let src = r#"<html><head><style>p { margin: 1px 2px 3px }</style></head><body><p>x</p></body></html>"#;
+    let src = r#"<html><head><style>body { padding: 1px } p { margin: 1px 2px 3px }</style></head><body><p>x</p></body></html>"#;
     let (out, _) = normalize(src, &Inputs::default());
     for want in ["margin-top: 1px", "margin-right: 2px", "margin-bottom: 3px", "margin-left: 2px"] {
         assert!(out.contains(want), "missing {want} in {out}");
@@ -343,7 +343,7 @@ fn cascade_layers_are_honoured_not_dropped() {
     // The rules inside the layers survive at all…
     assert!(out.contains("color: #ff0000"), "layered rules are kept: {out}");
     // …a later layer beats an earlier one…
-    assert!(!out.contains("color: #ff0000; ") || out.contains("#00ff00"), "{out}");
+    assert!(out.contains(".n1 { color: #0000ff }"), "the link's only colour is the unlayered one: {out}");
     // …and an UNLAYERED declaration beats both, however specific they are.
     assert!(out.contains("color: #0000ff"), "unlayered wins: {out}");
     assert!(refusals(&out).is_empty());
@@ -726,4 +726,104 @@ fn font_and_background_position_shorthands_expand() {
         assert!(out.contains(&format!("background-position-x: {x}; background-position-y: {y}")), "missing {x} {y}:\n{out}");
     }
     assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+}
+
+/// ★ Margins collapse (CSS 2.1 §8.3.1), compiled into literal margins: the
+/// renderer never collapses, so each case is measured on the RENDERED
+/// geometry — and a control renders the same page un-normalized, where the
+/// margins add up.
+#[test]
+fn adjoining_margins_are_collapsed_into_literal_margins() {
+    let fonts = FontSet::load().expect("pinned font set");
+    let page = |css: &str, body: &str| format!("<html><head><style>body {{ margin: 0 }} .a {{ background-color: #ff0000; height: 10px }} .b {{ background-color: #0000ff; height: 10px }} {css}</style></head><body>{body}</body></html>");
+    let y = |html: &str, rgba: u32| {
+        let o = render_html(html, &fonts, &Env::default());
+        o.scene.rects.iter().find(|r| r.rgba == rgba).map(|r| r.y / 64).expect("box painted")
+    };
+    let blue_y = |css: &str, body: &str| {
+        let src = page(css, body);
+        let (out, _) = normalize(&src, &Inputs::default());
+        assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+        (y(&out, 0x0000ffff), y(&src, 0x0000ffff))
+    };
+    // Siblings: the larger margin wins. Control: literal margins add.
+    let (got, control) = blue_y(".a { margin-bottom: 20px } .b { margin-top: 30px }", r#"<div class="a"></div><div class="b"></div>"#);
+    assert_eq!(got, 40);
+    assert!(control >= 60, "un-normalized, the margins add: {control}");
+    // A negative margin subtracts from the largest positive.
+    assert_eq!(blue_y(".a { margin-bottom: 20px } .b { margin-top: -5px }", r#"<div class="a"></div><div class="b"></div>"#).0, 25);
+    // em is the element's OWN font size: 1em at 20px beside 1em at 10px.
+    assert_eq!(blue_y(".a { margin-bottom: 1em; font-size: 20px } .b { margin-top: 1em; font-size: 10px }", r#"<div class="a"></div><div class="b"></div>"#).0, 30);
+    // A first child's margin escapes a parent with no top border/padding…
+    assert_eq!(blue_y(".p { margin-top: 10px } .b { margin-top: 25px }", r#"<div class="p"><div class="b"></div></div>"#).0, 25);
+    // …and stays inside one that has padding (control for the escape rule).
+    assert_eq!(blue_y(".p { margin-top: 10px; padding-top: 1px } .b { margin-top: 25px }", r#"<div class="p"><div class="b"></div></div>"#).0, 36);
+    // A flex item's margin never collapses with its container's.
+    assert_eq!(blue_y(".p { display: flex; margin-top: 10px } .b { margin-top: 25px; width: 10px }", r#"<div class="p"><div class="b"></div></div>"#).0, 35);
+    // An empty box is transparent: its own margins join the chain.
+    assert_eq!(blue_y(".a { margin-bottom: 10px } .e { margin: 40px 0 } .b { margin-top: 5px }", r#"<div class="a"></div><div class="e"></div><div class="b"></div>"#).0, 50);
+    // Nested empty boxes: EVERY margin inside joins the chain. max(2, 14) + min(-4) = 10.
+    assert_eq!(blue_y(".c1 { margin: 2px } .c2 { margin: -4px 0 } .c3 { margin: 0 0 14px }",
+        r#"<div class="c1"><div class="c2"><div class="c3"></div></div></div><div class="b"></div>"#).0, 10);
+    // A last child's bottom margin escapes too.
+    assert_eq!(blue_y(".p .a { margin-bottom: 30px } .b { margin-top: 10px }", r#"<div class="p"><div class="a"></div></div><div class="b"></div>"#).0, 40);
+    // A line of text separates: nothing collapses across it.
+    let (got, _) = blue_y(".a { margin-bottom: 20px } .b { margin-top: 30px }", r#"<div class="a"></div>text<div class="b"></div>"#);
+    assert!(got > 60, "text between: {got}");
+}
+
+/// Percentages cannot be added up in the normalizer: they stay symbolic, in
+/// the one expression CSS defines for the collapsed value.
+#[test]
+fn a_percentage_margin_chain_stays_symbolic() {
+    let src = r#"<html><head><style>.a { margin-bottom: 5% } .b { margin-top: 10px }</style></head>
+        <body><div class="a">x</div><div class="b">y</div></body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    assert!(out.contains("max(0px, 5%, 10px)"), "{out}");
+    assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+}
+
+/// ★ A statically positioned box sits AFTER the margins before it have
+/// collapsed; the compiled margins must keep it there. And a block inside an
+/// inline joins the outer flow, margins and all.
+#[test]
+fn collapsing_keeps_static_positions_and_sees_blocks_in_inlines() {
+    let fonts = FontSet::load().expect("pinned font set");
+    let y = |html: &str, rgba: u32| render_html(html, &fonts, &Env::default()).scene.rects.iter().find(|r| r.rgba == rgba).map(|r| r.y / 64).expect("painted");
+    // p (16px margins) · abs box · green box: both land 16px below p.
+    let src = r#"<html><head><style>body { margin: 0 } p { margin: 16px 0; height: 20px }
+        .abs { position: absolute; width: 10px; height: 10px; background-color: #ff0000 } .g { height: 10px; background-color: #00ff00 }</style></head>
+        <body><p></p><div class="abs"></div><div class="g"></div></body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    assert_eq!((y(&out, 0xff0000ff), y(&out, 0x00ff00ff)), (52, 52), "{out}");
+    // The same with the abs box LAST: the escaping chain must not double.
+    let src = r#"<html><head><style>body { margin: 0 } p { margin: 16px 0; height: 20px }
+        .abs { position: absolute; width: 10px; height: 10px; background-color: #ff0000 }</style></head>
+        <body><p></p><div class="abs"></div></body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    assert_eq!(y(&out, 0xff0000ff), 52, "{out}");
+    // <span><div 20px><div 100px>: one 100px gap, collapsed through the span.
+    let src = r#"<html><head><style>body { margin: 0 } .g { height: 10px; background-color: #00ff00 }</style></head>
+        <body><div><span><div style="margin-top: 20px"></div><div class="g" style="margin-top: 100px"></div>text</span></div></body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    assert_eq!(y(&out, 0x00ff00ff), 100, "{out}");
+    // max-height separates a parent's bottom from its last child's margin.
+    let src = r#"<html><head><style>body { margin: 0 } .p { max-height: 50px } .c { height: 60px; margin-bottom: 10px } .g { height: 10px; background-color: #00ff00 }</style></head>
+        <body><div class="p"><div class="c"></div></div><div class="g"></div></body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    assert_eq!(y(&out, 0x00ff00ff), 50, "the margin stays inside the clamped parent: {out}");
+}
+
+/// An empty box holding an absolutely positioned child sits after the
+/// margins before it (§8.3.1), and so does the child.
+#[test]
+fn an_empty_box_holding_an_abspos_child_keeps_its_place() {
+    let fonts = FontSet::load().expect("pinned font set");
+    let src = r#"<html><head><style>body { margin: 0 } p { margin: 16px 0; height: 20px } .r { position: relative }
+        .a { position: absolute; width: 10px; height: 10px; background-color: #ff0000 }</style></head>
+        <body><p></p><div class="r"><div class="a"></div></div></body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    let o = render_html(&out, &fonts, &Env::default());
+    let y = o.scene.rects.iter().find(|r| r.rgba == 0xff0000ff).map(|r| r.y / 64);
+    assert_eq!(y, Some(52), "{out}");
 }

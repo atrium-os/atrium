@@ -560,8 +560,14 @@ impl<'a> Cx<'a> {
         // specified width and its MINIMUM content width. Clamping the
         // columns to a narrower specified width instead is what left a
         // 330 px image hanging 28 px outside a 310 px infobox.
+        // An AUTO-width table is as wide as its columns want, up to what is
+        // available: min(available, max-content) — never the whole line,
+        // which painted a five-column table's background 780 px wide.
         if kw(s, "display") == "table" {
-            if let Some(min) = self.table_min_content(h, s, cb_w) { w = w.max(min + frame) }
+            if specified_w.is_none() && force.0.is_none() {
+                if let Some(max) = self.table_content(h, s, cb_w, true) { w = w.min(max + frame) }
+            }
+            if let Some(min) = self.table_content(h, s, cb_w, false) { w = w.max(min + frame) }
         }
         // Auto margins take what is left; both auto centres.
         let free = cb_w - w - ml.unwrap_or(0) - mr.unwrap_or(0);
@@ -1177,7 +1183,9 @@ impl<'a> Cx<'a> {
     /// The narrowest a table can be: its declared column minimums plus the
     /// spacing around and between them. `None` when the columns are not
     /// declared, in which case the table is refused anyway (§3.13).
-    fn table_min_content(&mut self, h: Handle, s: &Style, cb_w: U) -> Option<U> {
+    /// The table's min-content (or, with `max`, max-content) width from its
+    /// declared columns, spacing included.
+    fn table_content(&mut self, h: Handle, s: &Style, cb_w: U, max: bool) -> Option<U> {
         let (sx, _) = match s.get("border-spacing") {
             V::Pair(a, b) => (len(a, cb_w).unwrap_or(0), len(b, 0).unwrap_or(0)),
             _ => (0, 0),
@@ -1187,9 +1195,9 @@ impl<'a> Cx<'a> {
         let mut total = sx * (cells.len() as U + 1);
         for c in &cells {
             let cs = self.st(*c)?;
-            total += match (len(cs.get("width"), cb_w), len(cs.get("min-width"), cb_w)) {
-                (Some(w), _) => w,
-                (None, Some(m)) => m,
+            total += match (len(cs.get("width"), cb_w), len(cs.get("min-width"), cb_w), len(cs.get("max-width"), cb_w)) {
+                (Some(w), _, _) => w,
+                (None, Some(m), x) => if max { x.unwrap_or(m).max(m) } else { m },
                 _ => return None,
             };
         }
@@ -1730,10 +1738,12 @@ impl<'a> Cx<'a> {
         let free = avail - used;
         let targets: Vec<usize> = (0..cols.len()).filter(|i| flexible[*i]).collect();
         let total_max: U = targets.iter().map(|i| maxs[*i]).sum();
-        if stretch && free > 0 && !targets.is_empty() && total_max > 0 {
+        // Columns with no max-content at all (empty cells) share it EQUALLY.
+        if stretch && free > 0 && !targets.is_empty() {
             let mut given = 0;
             for (n, i) in targets.iter().enumerate() {
-                let add = if n + 1 == targets.len() { free - given } else { (free as i128 * maxs[*i] as i128 / total_max as i128) as U };
+                let share = if total_max > 0 { free as i128 * maxs[*i] as i128 / total_max as i128 } else { free as i128 / targets.len() as i128 };
+                let add = if n + 1 == targets.len() { free - given } else { share as U };
                 cols[*i] += add;
                 given += add;
             }
@@ -1937,9 +1947,15 @@ impl<'a> Cx<'a> {
             if self.is_block_level(c) {
                 let Some(cs) = self.st(c) else { continue };
                 let px = |p: &str| len(cs.get(p), 0).unwrap_or(0);
-                let frame = px("padding-left") + px("padding-right") + px("margin-left") + px("margin-right")
+                // Border-box: a DEFINITE width already holds the padding and
+                // border; only the margins are outside it. Adding the frame
+                // again measured a 220 px box as 240 once tables stopped
+                // filling the line and started wrapping their columns.
+                let definite = matches!(cs.get("width"), V::Len(_));
+                let frame = px("margin-left") + px("margin-right") + if definite { 0 } else {
+                    px("padding-left") + px("padding-right")
                     + if kw(cs, "border-left-style") == "none" { 0 } else { px("border-left-width") }
-                    + if kw(cs, "border-right-style") == "none" { 0 } else { px("border-right-width") };
+                    + if kw(cs, "border-right-style") == "none" { 0 } else { px("border-right-width") } };
                 let (a, b) = match cs.get("width") { V::Len(l) => { let w = u(l.v); (w, w) } _ => self.intrinsic(c) };
                 mn = mn.max(a + frame);
                 mx = mx.max(b + frame);
@@ -3266,6 +3282,21 @@ mod tests {
         let bad = render(&format!(r#"{css}<table><tr><td></td></tr></table>"#));
         assert!(bad.diagnostics.iter().any(|d| d.code == "table.column-width-undeclared"));
         assert!(boxes(&bad, 0x0000ffff).is_empty(), "refused, not laid out");
+    }
+
+    /// CSS 2.1 §17.5.2.2: an AUTO-width table is as wide as its columns
+    /// want (never the whole line), and a SPECIFIED width is shared out even
+    /// when every column is empty — equally, since none has content to weigh.
+    #[test]
+    fn an_auto_table_shrink_wraps_and_empty_columns_share_a_specified_width() {
+        let css = r#"<style>body { margin-left: 0px; margin-top: 0px } table { border-spacing: 0px 0px; background-color: #ff0000 }
+            td { padding-top: 0px; padding-right: 0px; padding-bottom: 0px; padding-left: 0px; height: 20px }
+            .d { background-color: #0000ff; height: 10px }
+            .c { min-width: 50px; max-width: 50px } .w { width: 300px } .e { min-width: 0px; max-width: 0px }</style>"#;
+        let o = render(&format!(r#"{css}<table><colgroup><col class="c"><col class="c"></colgroup><tr><td></td><td></td></tr></table>"#));
+        assert_eq!(boxes(&o, 0xff0000ff)[0].2, 100, "two 50 px columns: a 100 px table, not 800");
+        let o = render(&format!(r#"{css}<table class="w"><colgroup><col class="e"><col class="e"></colgroup><tr><td><div class="d"></div></td><td></td></tr></table>"#));
+        assert_eq!(boxes(&o, 0x0000ffff)[0].2, 150, "300 px shared equally by two empty columns");
     }
 
     #[test]

@@ -117,11 +117,17 @@ struct Loaded {
     assets: BTreeMap<String, PathBuf>,
     /// Every stylesheet's text, for the skip checks.
     css: String,
+    /// Files the document references that are not in the checkout (the
+    /// clone is sparse). A missing image paints nothing on EITHER side, so
+    /// comparing would measure the checkout: a blank test "matched" a blank
+    /// reference whose black square was never fetched.
+    missing: Vec<String>,
 }
 
 /// A document and everything it references, as a recording would carry it.
 fn load(root: &Path, file: &Path) -> Option<Loaded> {
     let mut html = std::fs::read_to_string(file).ok()?;
+    let mut missing: Vec<String> = vec![];
     // ★ WPT serves `.xht` as XHTML, where `<![CDATA[ … ]]>` inside <style> is
     // plain text; parsed as HTML the markers corrupt the first rule, and a
     // reference's only rule vanished. The lane has no XHTML mode (a
@@ -148,7 +154,7 @@ fn load(root: &Path, file: &Path) -> Option<Loaded> {
         if !rel.split_whitespace().any(|r| r == "stylesheet") { continue }
         let Some(href) = dom.attr(h, "href") else { continue };
         let Some(path) = resolve(root, file, href) else { continue };
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let Ok(text) = std::fs::read_to_string(&path) else { missing.push(href.to_string()); continue };
         url_re(&text, &path, &mut urls);
         css.push_str(&text);
         inputs.stylesheets.insert(href.to_string(), text);
@@ -163,19 +169,19 @@ fn load(root: &Path, file: &Path) -> Option<Loaded> {
     let mut subs = navigator_render::Subresources::new();
     let mut assets = BTreeMap::new();
     for (raw, path) in urls {
-        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(bytes) = std::fs::read(&path) else { missing.push(raw); continue };
         let Some(n) = navigator_prerender::subresource::natural_size(&bytes) else { continue };
         let address = format!("blake3:{}", blake3::hash(&bytes).to_hex());
         inputs.images.insert(raw.clone(), navigator_normalize::ImageSize { width: n.width, height: n.height, ratio: n.ratio });
         subs.insert(raw, (address.clone(), n.width.unwrap_or(0) as i64 * 64, n.height.unwrap_or(0) as i64 * 64));
         assets.insert(address, path);
     }
-    Some(Loaded { html, inputs, subs, assets, css })
+    Some(Loaded { html, inputs, subs, assets, css, missing })
 }
 
 /// Normalize, render and paint one document; the 800×600 viewport as RGB,
 /// and what the normalizer dropped.
-fn pixels(l: &Loaded, fonts: &FontSet) -> (Vec<u8>, BTreeMap<String, usize>, usize) {
+fn pixels(l: &Loaded, fonts: &FontSet) -> (Vec<u8>, BTreeMap<String, usize>, usize, String) {
     let env = Env::default();
     let (doc, report) = normalize_and_measure(&l.html, &l.inputs, fonts, &env);
     let o = navigator_render::html::render_html_with(&doc, fonts, &env, &l.subs);
@@ -187,7 +193,7 @@ fn pixels(l: &Loaded, fonts: &FontSet) -> (Vec<u8>, BTreeMap<String, usize>, usi
         let n = W.min(cv.w) * 3;
         out[y * W * 3..y * W * 3 + n].copy_from_slice(&rgb[y * cv.w * 3..y * cv.w * 3 + n]);
     }
-    (out, report.dropped, o.diagnostics.len())
+    (out, report.dropped, o.diagnostics.len(), doc)
 }
 
 /// `<meta name=fuzzy content="maxDifference=0-2;totalPixels=0-100">`, in its
@@ -230,6 +236,7 @@ fn one(root: &Path, test: &Path, save: Option<&Path>) -> (String, String) {
     let Some(rpath) = resolve(root, test, &href) else { return ("SKIP:no-ref".into(), href) };
     let Some(r) = load(root, &rpath) else { return ("ERROR".into(), format!("reference unreadable: {href}")) };
     for (what, doc) in [("test", &t), ("reference", &r)] {
+        if let Some(m) = doc.missing.first() { return ("SKIP:missing-file".into(), format!("{what}: {m}")) }
         // The REVIEW rasterizer decodes PNG only; an SVG, GIF or JPEG image
         // would be laid out but never painted, and the comparison would
         // measure the tool. Skipped, and labelled as the tool's limit.
@@ -241,8 +248,8 @@ fn one(root: &Path, test: &Path, save: Option<&Path>) -> (String, String) {
         if doc.html.to_ascii_lowercase().contains("<script") { return ("SKIP:script".into(), what.into()) }
     }
     let fonts = FontSet::load().expect("pinned font set");
-    let (a, drops_t, ref_t) = pixels(&t, &fonts);
-    let (b, drops_r, ref_r) = pixels(&r, &fonts);
+    let (a, drops_t, ref_t, doc_t) = pixels(&t, &fonts);
+    let (b, drops_r, ref_r, doc_r) = pixels(&r, &fonts);
     let (maxd_ok, total_ok) = fuzzy(&t.html);
     let (mut differ, mut maxd) = (0usize, 0u8);
     for (p, q) in a.chunks(3).zip(b.chunks(3)) {
@@ -257,6 +264,8 @@ fn one(root: &Path, test: &Path, save: Option<&Path>) -> (String, String) {
         let _ = std::fs::create_dir_all(dir);
         save_png(&dir.join(format!("{stem}.test.png")), &a);
         save_png(&dir.join(format!("{stem}.ref.png")), &b);
+        let _ = std::fs::write(dir.join(format!("{stem}.test.html")), &doc_t);
+        let _ = std::fs::write(dir.join(format!("{stem}.ref.html")), &doc_r);
     }
     // What only the test lost — the likeliest reasons for a failure.
     let mut only: Vec<String> = drops_t.keys().filter(|k| !drops_r.contains_key(*k)).cloned().collect();

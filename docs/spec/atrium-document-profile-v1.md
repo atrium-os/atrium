@@ -72,7 +72,9 @@ positions**. A browser cannot adopt this rule without breaking the existing web;
 no existing web to break.
 
 **Margin collapsing.** Universally regretted, a perennial source of "why is there a gap".
-Margins in this profile are literal and never collapse.
+Margins in this profile are literal and never collapse. An author's stylesheet written for
+collapsing is compiled into literal margins by the producer (§7a), so a reader sees the
+author's rhythm while every margin in the profile document still means exactly what it says.
 
 **Floats and the containing-block maze.** Excluded. Flex and grid cover the layouts floats
 were pressed into, without the block-formatting-context rules that make float behaviour
@@ -898,7 +900,11 @@ The renderer then performs a **bounded, deterministic distribution** of those de
 widths into the available inline size — the same shape as resolving grid tracks of
 `minmax(min-content, max-content)`. This keeps tables responsive: the expensive,
 content-dependent half is precomputed, while the viewport-dependent half stays at render
-time where it belongs.
+time where it belongs. The table's own width follows CSS 2.1 §17.5.2.2: an `auto` table is
+as wide as its columns' max-content (with spacing), capped by what is available and never
+below their min-content; a specified width is never below the min-content either, and its
+excess is shared by the measured columns in proportion to their max-content — equally when
+none has any.
 
 Two properties make the precomputation shareable, which is what makes it worth doing:
 
@@ -1074,7 +1080,7 @@ float ROWS (as inline-block), and — from 2026-09-24 — `box-sizing` (§3.3; 1
 | feature | evidence | what it costs a reader today |
 |---|---|---|
 | generated content, `::before`/`::after` | 95,698 | separators (Wikipedia's "·"), breadcrumb arrows, quotes, icon glyphs; many are empty clearfixes — the subset with text or counters is what matters |
-| margin collapsing | not a property; affects every document with adjacent block margins; unmeasured | vertical rhythm: gaps up to twice the author's. G4 argues against collapsing IN the renderer; the producer can compile it to literal margins, like box-sizing |
+| ~~margin collapsing~~ | **compiled** (2026-09-25): 140,430 margins rewritten over 85 documents | was: gaps up to twice the author's. Now the producer collapses each chain of adjoining margins into literal ones (below); the renderer still never collapses |
 | floats beside text (not rows) | 1,400 + 818 `clear` | Wikipedia's infobox and thumbnails come out full-width, the text below instead of beside |
 | masks | 2,577 | icons painted through a mask; today the box paints nothing |
 | `box-shadow` lists, spread, inset | 1,665 | shadows missing |
@@ -1134,6 +1140,22 @@ what it covers, as a shorthand must (3,967 → 20 and 891 → 13). The remaining
 custom properties (1,677) were sampled and are genuine: defined only under classes the
 page's own script adds (rustdoc's `digits-N`), or undefined with no fallback — a browser
 drops them too. Section E is closed.
+
+**Margin collapsing is compiled (2026-09-25).** The normalizer finds every chain of
+adjoining vertical margins (CSS 2.1 §8.3.1: sibling to sibling, parent to first or last
+child when no border, padding, height or formatting-context boundary separates them, and
+through empty boxes and all their empty descendants; a block inside an inline joins the
+outer flow) and writes the collapsed value — the largest positive plus the most negative —
+on the chain's outermost margin, zeroing the rest. `em` resolves against each box's own
+font size; `%` and `rem` stay symbolic as `calc(max(0px, …) + min(0px, …))`. One subtlety
+decides correctness: a statically positioned box (an absolute box with `top` and `bottom`
+auto, or an empty box holding one) is placed AFTER the margins before it, so that part of
+the chain is pinned literally in front of it and the anchor carries only the rest. The
+renderer is unchanged — every margin in a profile document is still literal (G4). Pages
+lost their doubled gaps: the Rust book 1,656 px shorter, Wikipedia's FreeBSD article
+694 px. Measuring it also exposed two table bugs (an auto-width table filled the line; a
+specified width was not shared by empty columns) and a double-counted border in the
+intrinsic width of a definite-width block.
 
 **Order of work:** section E, then margin collapsing and floats (compiled by the producer
 where they can be, like box-sizing), then generated content with text and counters, then

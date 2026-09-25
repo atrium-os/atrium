@@ -1820,6 +1820,28 @@ none, so under `max-height` we shrink its width where a browser keeps it.
 `nsg 0.1` header — behind `grep -c "test result: ok"`, which counts the suites that passed
 and cannot see one that failed. Counted properly: **505 tests, 0 failures, six crates**.
 
+**Margin collapsing compiled; the oracle stops measuring the checkout (2026-09-25).** The
+normalizer now collapses margins into literal ones (profile §7a, `collapse.rs`); the
+renderer is unchanged. Against the last commit, over css-ui and CSS2 margin-padding-clear,
+normal-flow, positioning, floats-clear and tables: **860 → 906 pass, 56 fixed, 10 lost** —
+and all 10 lost were ACCIDENTAL passes involving floats: `padding-applies-to-*` compares a
+table to a `float: left` reference, and both used to fill the line, so they matched.
+CSS2's margin-collapse tests: 5 → 14. Corpus flag verdicts unchanged over 85 documents;
+140,430 margins rewritten; the Rust book 1,656 px shorter. The oracle caught three of my
+own mistakes before they landed: an absolute box with auto offsets is placed AFTER the
+margins before it (so that part of a chain is pinned in front of it); an empty box's empty
+descendants collapse through it too; `max-height` separates a parent's bottom margin.
+
+★ **22 baseline passes measured files that were never fetched.** WPT's CSS2 `support/`
+directory is outside the sparse clone, so a reference's `black96x96.png` painted nothing —
+and a test that ALSO painted nothing (a zero-width table cell) "matched" it. `wpt-reftest`
+now skips a test whose test or reference names a missing file (`SKIP:missing-file`,
+454 over these directories) instead of comparing; `--save` also writes both normalized
+documents. The fix to the zero-width cell exposed renderer bugs: an auto-width table
+filled its line instead of shrink-wrapping (CSS 2.1 §17.5.2.2), a specified table width
+went unshared when every column was empty, and a definite-width block's border was counted
+twice in its container's intrinsic width.
+
 ## 9. What this reuses
 
 Almost none of this is new infrastructure; it is composition, which is the point of the
