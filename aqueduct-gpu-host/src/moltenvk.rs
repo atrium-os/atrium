@@ -1225,6 +1225,23 @@ impl MoltenVkBackend {
         Ok(done)
     }
 
+    /// A second TLAS ("view") over the SAME BLASes as scene `scene`, with
+    /// its own instance list — e.g. every object at its coarsest level for
+    /// secondary rays. The view owns no BLAS (the scene keeps them; scenes
+    /// are never freed) and is built synchronously here; rebuild it later
+    /// with the `rebuild_scene_tlas*` calls under `view`.
+    pub fn add_scene_view(&self, scene: ResourceId, view: ResourceId, instances: &[SceneInstance]) -> Result<(), String> {
+        let blas_addrs = {
+            let accels = self.accels.lock().unwrap();
+            accels.get(&scene.raw()).ok_or_else(|| format!("scene {scene} not built"))?.blas_addrs.clone()
+        };
+        let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: Vec::new(), blas_addrs, owned: Vec::new(),
+                               tlas_owned: None, tlas_spare: None, pending: Vec::new(), tlas_pending: None,
+                               inst_shadow: Vec::new(), inst_log: Vec::new(), inst_gen: 0 };
+        self.accels.lock().unwrap().insert(view.raw(), accel);
+        self.rebuild_scene_tlas(view, instances)
+    }
+
     /// Rebuild the scene TLAS over the stored BLASes for a new instance
     /// list (the BLASes persist; only the TLAS and its instance buffer are
     /// replaced) and WAIT for it. Used at startup; frames use
