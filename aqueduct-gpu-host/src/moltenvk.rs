@@ -260,6 +260,16 @@ pub struct MoltenVkBackend {
     /// Command pool (transient, resettable) for per-submit command
     /// buffers. Guarded by `submit_lock`.
     cmd_pool: vk::CommandPool,
+    /// Queue + pool for acceleration-structure builds: a SECOND queue
+    /// family when the device offers one (MoltenVK exposes several, each
+    /// its own Metal command queue), so builds overlap frames on the GPU
+    /// instead of sitting in front of the next frame on the one queue. The
+    /// host orders everything through fences (a build's outputs are used
+    /// only after its fence was observed), so no cross-queue semaphores.
+    /// Same as the main queue/pool when there is no second family or
+    /// AQUEDUCT_GPU_SINGLE_QUEUE is set.
+    build_queue: vk::Queue,
+    build_pool: vk::CommandPool,
     /// Physical-device memory properties, cached for memory-type
     /// selection.
     mem_props: vk::PhysicalDeviceMemoryProperties,
@@ -469,7 +479,19 @@ impl MoltenVkBackend {
         let q_create = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
             .queue_priorities(&priorities);
-        let q_creates = [q_create];
+        let mut q_creates = vec![q_create];
+        // A second family with compute for acceleration-structure builds.
+        let build_family: Option<u32> = if std::env::var_os("AQUEDUCT_GPU_SINGLE_QUEUE").is_some() { None } else {
+            unsafe { instance.get_physical_device_queue_family_properties(physical) }
+                .iter().enumerate()
+                .find(|(i, f)| *i as u32 != queue_family && f.queue_count > 0 && f.queue_flags.contains(vk::QueueFlags::COMPUTE))
+                .map(|(i, _)| i as u32)
+        };
+        if let Some(bf) = build_family {
+            q_creates.push(vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(bf)
+                .queue_priorities(&priorities));
+        }
 
         // MoltenVK requires VK_KHR_portability_subset on the device
         // (when present in the physical-device extensions). Querying
@@ -545,6 +567,7 @@ impl MoltenVkBackend {
             }
         };
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
+        let build_queue = build_family.map_or(queue, |bf| unsafe { device.get_device_queue(bf, 0) });
 
         // Command pool for per-submit command buffers (transient +
         // individually resettable).
@@ -557,6 +580,28 @@ impl MoltenVkBackend {
             Err(e) => {
                 unsafe { device.destroy_device(None); instance.destroy_instance(None); }
                 return Err(MoltenVkError::Vulkan(e));
+            }
+        };
+        // Command pools are per queue family: the build queue needs its own.
+        let build_pool = match build_family {
+            None => cmd_pool,
+            Some(bf) => {
+                let bpi = vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(bf)
+                    .flags(vk::CommandPoolCreateFlags::TRANSIENT | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+                match unsafe { device.create_command_pool(&bpi, None) } {
+                    Ok(p) => {
+                        log::info!("acceleration-structure builds on queue family {bf} (main {queue_family})");
+                        if std::env::var_os("AQUEDUCT_GPU_LOG").is_some() {
+                            eprintln!("aqueduct-gpu-host: acceleration-structure builds on queue family {bf} (main {queue_family})");
+                        }
+                        p
+                    }
+                    Err(e) => {
+                        unsafe { device.destroy_command_pool(cmd_pool, None); device.destroy_device(None); instance.destroy_instance(None); }
+                        return Err(MoltenVkError::Vulkan(e));
+                    }
+                }
             }
         };
 
@@ -631,6 +676,8 @@ impl MoltenVkBackend {
             instance,
             _entry: entry,
             cmd_pool,
+            build_queue,
+            build_pool,
             mem_props,
             images: Mutex::new(HashMap::new()),
             buffers: Mutex::new(HashMap::new()),
@@ -790,14 +837,14 @@ impl MoltenVkBackend {
             &vk::BufferDeviceAddressInfo::default().buffer(buf))
     }
 
-    /// Run a one-time command buffer to completion on the backend queue.
+    /// Run a one-time command buffer to completion on the build queue.
     unsafe fn one_time_submit<F: FnOnce(vk::CommandBuffer)>(&self, rec: F)
         -> Result<(), String>
     {
         let dev = &self.device;
         let cb = dev.allocate_command_buffers(
             &vk::CommandBufferAllocateInfo::default()
-                .command_pool(self.cmd_pool)
+                .command_pool(self.build_pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
                 .command_buffer_count(1))
             .map_err(|e| format!("AS cmd alloc: {e:?}"))?[0];
@@ -816,7 +863,7 @@ impl MoltenVkBackend {
         // thread. AQUEDUCT_GPU_WAIT_MS overrides the default 30 s.
         let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None)
             .map_err(|e| format!("AS fence: {e:?}"))?;
-        dev.queue_submit(self._queue, &[si], fence)
+        dev.queue_submit(self.build_queue, &[si], fence)
             .map_err(|e| format!("AS submit: {e:?}"))?;
         let res = dev.wait_for_fences(&[fence], true, Self::wait_timeout_ns(30_000));
         match res {
@@ -833,7 +880,7 @@ impl MoltenVkBackend {
             Err(e) => return Err(format!("AS wait: {e:?}")),
         }
         dev.destroy_fence(fence, None);
-        dev.free_command_buffers(self.cmd_pool, &cbs);
+        dev.free_command_buffers(self.build_pool, &cbs);
         Ok(())
     }
 
@@ -846,7 +893,7 @@ impl MoltenVkBackend {
         let dev = &self.device;
         let cb = dev.allocate_command_buffers(
             &vk::CommandBufferAllocateInfo::default()
-                .command_pool(self.cmd_pool)
+                .command_pool(self.build_pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
                 .command_buffer_count(1))
             .map_err(|e| format!("AS cmd alloc: {e:?}"))?[0];
@@ -860,7 +907,7 @@ impl MoltenVkBackend {
         let _guard = self.submit_lock.lock().unwrap();
         let fence = dev.create_fence(&vk::FenceCreateInfo::default(), None)
             .map_err(|e| format!("AS fence: {e:?}"))?;
-        dev.queue_submit(self._queue, &[si], fence)
+        dev.queue_submit(self.build_queue, &[si], fence)
             .map_err(|e| format!("AS submit: {e:?}"))?;
         Ok((fence, cb))
     }
@@ -1162,7 +1209,7 @@ impl MoltenVkBackend {
             if signalled {
                 unsafe {
                     dev.destroy_fence(pb.fence, None);
-                    dev.free_command_buffers(self.cmd_pool, &[pb.cb]);
+                    dev.free_command_buffers(self.build_pool, &[pb.cb]);
                     self.free_buffers(pb.transient);
                 }
                 done.push(pb.first);
@@ -1260,7 +1307,7 @@ impl MoltenVkBackend {
                 unsafe {
                     let _ = self.device.wait_for_fences(&[p.fence], true, Self::wait_timeout_ns(30_000));
                     self.device.destroy_fence(p.fence, None);
-                    self.device.free_command_buffers(self.cmd_pool, &[p.cb]);
+                    self.device.free_command_buffers(self.build_pool, &[p.cb]);
                     asd.destroy_acceleration_structure(p.tlas, None);
                     self.free_buffers(p.owned.pairs().to_vec());
                 }
@@ -1344,7 +1391,7 @@ impl MoltenVkBackend {
         let old_owned = std::mem::replace(&mut a.tlas_owned, Some(p.owned));
         unsafe {
             self.device.destroy_fence(p.fence, None);
-            self.device.free_command_buffers(self.cmd_pool, &[p.cb]);
+            self.device.free_command_buffers(self.build_pool, &[p.cb]);
             if old != vk::AccelerationStructureKHR::null() {
                 asd.destroy_acceleration_structure(old, None);
             }
@@ -1731,6 +1778,7 @@ impl Drop for MoltenVkBackend {
             if self.query_pool != vk::QueryPool::null() {
                 self.device.destroy_query_pool(self.query_pool, None);
             }
+            if self.build_pool != self.cmd_pool { self.device.destroy_command_pool(self.build_pool, None); }
             self.device.destroy_command_pool(self.cmd_pool, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
