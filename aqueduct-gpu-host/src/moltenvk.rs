@@ -168,7 +168,8 @@ pub struct SceneInstance {
     /// Index into the `blases` slice passed to `build_scene_tlas`.
     pub blas: u32,
     /// 24-bit instance custom index (`RayQuery::CommittedInstanceID()` in
-    /// the kernel); the mask is always 0xFF.
+    /// the kernel) in the low 24 bits; the high 8 bits are the instance
+    /// mask a ray's cull mask is ANDed with (0 = 0xFF, visible to every ray).
     pub custom_index: u32,
     /// Row-major 3×4 object-to-world transform.
     pub transform: [f32; 12],
@@ -1361,8 +1362,9 @@ impl MoltenVkBackend {
     fn encode_instance(dst: &mut [u8], inst: &SceneInstance, blas_addrs: &[u64]) {
         // transform: 12 f32 row-major 3x4
         for (k, v) in inst.transform.iter().enumerate() { dst[k * 4..k * 4 + 4].copy_from_slice(&v.to_le_bytes()); }
-        // instanceCustomIndex(24) | mask(8=0xFF)
-        dst[48..52].copy_from_slice(&((inst.custom_index & 0xFFFFFF) | (0xFFu32 << 24)).to_le_bytes());
+        // instanceCustomIndex(24) | mask(8): the caller's high byte, 0 = 0xFF
+        let mask = match inst.custom_index >> 24 { 0 => 0xFF, m => m };
+        dst[48..52].copy_from_slice(&((inst.custom_index & 0xFFFFFF) | (mask << 24)).to_le_bytes());
         // sbtOffset(24)=0 | flags(8)=0
         dst[52..56].copy_from_slice(&0u32.to_le_bytes());
         // accelerationStructureReference = the instanced BLAS
