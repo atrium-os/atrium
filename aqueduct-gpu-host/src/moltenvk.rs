@@ -96,6 +96,14 @@ struct MvkAccel {
     /// In-flight BLAS builds (`add_scene_blases_async`). Drained by
     /// `poll_scene_blases`, which also frees the build inputs.
     pending: Vec<PendingBuild>,
+    /// Refit this scene's TLAS at the start of the next frame's command
+    /// buffer (`refit_scene_tlas_inline`).
+    inline_refit: bool,
+    /// The TLAS an in-frame refit replaced (the refit's source) and its
+    /// buffers, until that frame completes: kept HERE so the change-log
+    /// compaction counts its sync position (a set it cannot see had the log
+    /// trimmed under it and, back as the spare, missed patches — stale LODs).
+    tlas_retired: Option<(vk::AccelerationStructureKHR, TlasBufs)>,
     /// BLAS indices released by `free_scene_blas`, reused by the next
     /// single-BLAS `add_scene_blases_async_from` (so a streamed scene's
     /// index range — and the caller's per-BLAS tables — stay bounded).
@@ -375,6 +383,10 @@ struct Swap {
 struct Pending {
     fence: vk::Fence,
     cb: vk::CommandBuffer,
+    /// Scenes whose TLAS an in-frame refit replaced (`MvkAccel::tlas_retired`):
+    /// the frame reads the old one (the refit's source), so it is destroyed
+    /// and its buffers become the spare set when the frame completes.
+    retire: Vec<u32>,
     trash: Vec<(vk::RenderPass, vk::Framebuffer, vk::ImageView)>,
     timing: bool,
     n_stamped: u32,
@@ -1065,7 +1077,7 @@ impl MoltenVkBackend {
         let stats = unsafe { self.build_blases(asd, blases, scratch_align, &mut owned_all, &mut transient, &mut blas_handles, &mut blas_addrs, None, import_host)? };
         // Synchronous builds: the inputs are done with once build_blases returns.
         unsafe { self.free_buffers(transient) };
-        let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: blas_handles, blas_addrs, owned: owned_all, tlas_owned: None, tlas_spare: None, pending: Vec::new(), free_slots: Vec::new(), tlas_pending: None, inst_shadow: Vec::new(), inst_log: Vec::new(), inst_gen: 0 };
+        let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: blas_handles, blas_addrs, owned: owned_all, tlas_owned: None, tlas_spare: None, pending: Vec::new(), inline_refit: false, tlas_retired: None, free_slots: Vec::new(), tlas_pending: None, inst_shadow: Vec::new(), inst_log: Vec::new(), inst_gen: 0 };
         self.accels.lock().unwrap().insert(tlas_id.raw(), accel);
         eprintln!("build_scene_tlas: {stats}");
         self.rebuild_scene_tlas(tlas_id, instances)
@@ -1347,7 +1359,7 @@ impl MoltenVkBackend {
             accels.get(&scene.raw()).ok_or_else(|| format!("scene {scene} not built"))?.blas_addrs.clone()
         };
         let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: Vec::new(), blas_addrs, owned: Vec::new(),
-                               tlas_owned: None, tlas_spare: None, pending: Vec::new(), free_slots: Vec::new(), tlas_pending: None,
+                               tlas_owned: None, tlas_spare: None, pending: Vec::new(), inline_refit: false, tlas_retired: None, free_slots: Vec::new(), tlas_pending: None,
                                inst_shadow: Vec::new(), inst_log: Vec::new(), inst_gen: 0 };
         self.accels.lock().unwrap().insert(view.raw(), accel);
         self.rebuild_scene_tlas(view, instances)
@@ -1419,6 +1431,7 @@ impl MoltenVkBackend {
         if let Some(b) = a.tlas_owned.as_mut() { sets.push(b); }
         if let Some(b) = a.tlas_spare.as_mut() { sets.push(b); }
         if let Some(p) = a.tlas_pending.as_mut() { sets.push(&mut p.owned); }
+        if let Some((_, b)) = a.tlas_retired.as_mut() { sets.push(b); }
         let gen = a.inst_gen;
         let min = sets.iter().filter(|b| b.gen == gen).map(|b| b.synced).min().unwrap_or(a.inst_log.len());
         let min = min.min(a.inst_log.len());
@@ -1464,7 +1477,7 @@ impl MoltenVkBackend {
                 if let Some(s) = a.tlas_spare.replace(o) { self.free_buffers(s.pairs().to_vec()); }
             }
             let spare = a.tlas_spare.take();
-            let (tlas, owned, fence_cb, size) = self.submit_tlas_build(asd, &a.inst_shadow, a.inst_gen, &a.inst_log, spare, true, None)?;
+            let (tlas, owned, fence_cb, size) = self.submit_tlas_build(asd, &a.inst_shadow, a.inst_gen, &a.inst_log, spare, true, None, None)?;
             debug_assert!(fence_cb.is_none());
             a.tlas = tlas;
             a.tlas_owned = Some(owned);
@@ -1505,6 +1518,19 @@ impl MoltenVkBackend {
         self.tlas_slots_async(tlas_id, true)
     }
 
+    /// Refit scene `tlas_id`'s TLAS INSIDE the next frame's command buffer,
+    /// before its dispatches (which then bind the new TLAS): the refit's GPU
+    /// time lands in that one frame instead of competing from the build
+    /// queue with whichever frames it overlaps (+8 ms on a frame for a
+    /// ~3.4 ms refit). False while an async build is in flight (retry).
+    pub fn refit_scene_tlas_inline(&self, tlas_id: ResourceId) -> Result<bool, String> {
+        let mut accels = self.accels.lock().unwrap();
+        let a = accels.get_mut(&tlas_id.raw()).ok_or_else(|| format!("scene {tlas_id} not built"))?;
+        if a.tlas_pending.is_some() || a.tlas == vk::AccelerationStructureKHR::null() { return Ok(false); }
+        a.inline_refit = true;
+        Ok(true)
+    }
+
     fn tlas_slots_async(&self, tlas_id: ResourceId, refit: bool) -> Result<bool, String> {
         let asd = self.as_device.as_ref()
             .ok_or_else(|| "ray-query not available on this device".to_string())?;
@@ -1514,7 +1540,7 @@ impl MoltenVkBackend {
         if a.inst_shadow.is_empty() { return Err("rebuild_scene_tlas_slots_async: no instances set".into()); }
         let src = if refit && a.tlas != vk::AccelerationStructureKHR::null() { Some(a.tlas) } else { None };
         let spare = a.tlas_spare.take();
-        let (tlas, owned, fence_cb, size) = unsafe { self.submit_tlas_build(asd, &a.inst_shadow, a.inst_gen, &a.inst_log, spare, false, src)? };
+        let (tlas, owned, fence_cb, size) = unsafe { self.submit_tlas_build(asd, &a.inst_shadow, a.inst_gen, &a.inst_log, spare, false, src, None)? };
         let (fence, cb) = fence_cb.expect("async build returns its fence");
         a.tlas_pending = Some(PendingTlas { fence, cb, tlas, owned, size, instances: (a.inst_shadow.len() / 64) as u32 });
         Self::compact_inst_log(a);
@@ -1569,7 +1595,7 @@ impl MoltenVkBackend {
     /// Returns the new TLAS, the buffer set backing it and its storage size.
     unsafe fn submit_tlas_build(&self, asd: &ash::khr::acceleration_structure::Device,
                                 shadow: &[u8], gen: u64, log: &[u32], spare: Option<TlasBufs>, wait: bool,
-                                refit_src: Option<vk::AccelerationStructureKHR>)
+                                refit_src: Option<vk::AccelerationStructureKHR>, into: Option<vk::CommandBuffer>)
         -> Result<(vk::AccelerationStructureKHR, TlasBufs, Option<(vk::Fence, vk::CommandBuffer)>, u64), String>
     {
         let mut as_props = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
@@ -1673,7 +1699,7 @@ impl MoltenVkBackend {
         let rec = |cb: vk::CommandBuffer| {
             asd.cmd_build_acceleration_structures(cb, &[tbi], &[&[trange]]);
         };
-        let fence_cb = if wait { self.one_time_submit(rec)?; None } else { Some(self.submit_no_wait(rec)?) };
+        let fence_cb = if let Some(cb) = into { rec(cb); None } else if wait { self.one_time_submit(rec)?; None } else { Some(self.submit_no_wait(rec)?) };
         Ok((tlas, bufs, fence_cb, store_bytes))
     }
 
@@ -2386,6 +2412,38 @@ impl MoltenVkBackend {
             }
         }
 
+        // In-frame TLAS refits (refit_scene_tlas_inline): recorded first, the
+        // new TLAS swapped in before any dispatch binds it; the old one
+        // (the refit's source) retires when this frame completes.
+        let mut retire: Vec<u32> = Vec::new();
+        if let Some(asd) = self.as_device.as_ref() {
+            let mut accels = self.accels.lock().unwrap();
+            for (key, a) in accels.iter_mut() {
+                if !a.inline_refit { continue; }
+                a.inline_refit = false;
+                if a.tlas_pending.is_some() || a.tlas_retired.is_some() || a.inst_shadow.is_empty() { continue; }
+                let src = a.tlas;
+                let spare = a.tlas_spare.take();
+                match unsafe { self.submit_tlas_build(asd, &a.inst_shadow, a.inst_gen, &a.inst_log, spare, false, Some(src), Some(cb)) } {
+                    Ok((tlas, owned, _, _)) => {
+                        let old_owned = std::mem::replace(&mut a.tlas_owned, Some(owned));
+                        a.tlas = tlas;
+                        if let Some(o) = old_owned { a.tlas_retired = Some((src, o)); retire.push(*key); }
+                        Self::compact_inst_log(a);
+                    }
+                    Err(e) => log::warn!("in-frame TLAS refit: {e}"),
+                }
+            }
+            if !retire.is_empty() {
+                let barrier = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR)
+                    .dst_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR | vk::AccessFlags::SHADER_READ);
+                unsafe {
+                    dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                        vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[barrier], &[], &[]);
+                }
+            }
+        }
         let mut images = self.images.lock().unwrap();
         let buffers = self.buffers.lock().unwrap();
         let mut pipelines = self.pipelines.lock().unwrap();
@@ -2842,7 +2900,7 @@ impl MoltenVkBackend {
                 *a = ([0.0; 4], 0);
             }
         }
-        let p = Pending { fence, cb, trash, timing, n_stamped };
+        let p = Pending { fence, cb, retire, trash, timing, n_stamped };
         if self.async_frames.load(Ordering::Relaxed) {
             *self.pending.lock().unwrap() = Some(p);
             return Ok(());
@@ -2909,6 +2967,18 @@ impl MoltenVkBackend {
             }
             dev.destroy_fence(p.fence, None);
             dev.free_command_buffers(self.cmd_pool, &[p.cb]);
+        }
+        // TLASes an in-frame refit replaced: destroyed now, their buffers the
+        // scene's next spare set.
+        if !p.retire.is_empty() {
+            let mut accels = self.accels.lock().unwrap();
+            for key in p.retire {
+                let Some(a) = accels.get_mut(&key) else { continue };
+                let Some((old, bufs)) = a.tlas_retired.take() else { continue };
+                if let Some(asd) = self.as_device.as_ref() { unsafe { asd.destroy_acceleration_structure(old, None); } }
+                if let Some(s) = a.tlas_spare.replace(bufs) { unsafe { self.free_buffers(s.pairs().to_vec()); } }
+                Self::compact_inst_log(a);
+            }
         }
         res
     }
