@@ -96,6 +96,10 @@ struct MvkAccel {
     /// In-flight BLAS builds (`add_scene_blases_async`). Drained by
     /// `poll_scene_blases`, which also frees the build inputs.
     pending: Vec<PendingBuild>,
+    /// BLAS indices released by `free_scene_blas`, reused by the next
+    /// single-BLAS `add_scene_blases_async_from` (so a streamed scene's
+    /// index range — and the caller's per-BLAS tables — stay bounded).
+    free_slots: Vec<u32>,
     /// Buffers backing the current TLAS (instances, storage, scratch).
     tlas_owned: Option<TlasBufs>,
     /// The previous TLAS's buffers, kept for the next rebuild (a rebuild
@@ -1061,7 +1065,7 @@ impl MoltenVkBackend {
         let stats = unsafe { self.build_blases(asd, blases, scratch_align, &mut owned_all, &mut transient, &mut blas_handles, &mut blas_addrs, None, import_host)? };
         // Synchronous builds: the inputs are done with once build_blases returns.
         unsafe { self.free_buffers(transient) };
-        let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: blas_handles, blas_addrs, owned: owned_all, tlas_owned: None, tlas_spare: None, pending: Vec::new(), tlas_pending: None, inst_shadow: Vec::new(), inst_log: Vec::new(), inst_gen: 0 };
+        let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: blas_handles, blas_addrs, owned: owned_all, tlas_owned: None, tlas_spare: None, pending: Vec::new(), free_slots: Vec::new(), tlas_pending: None, inst_shadow: Vec::new(), inst_log: Vec::new(), inst_gen: 0 };
         self.accels.lock().unwrap().insert(tlas_id.raw(), accel);
         eprintln!("build_scene_tlas: {stats}");
         self.rebuild_scene_tlas(tlas_id, instances)
@@ -1257,6 +1261,15 @@ impl MoltenVkBackend {
         let mut fences = Vec::new();
         let mut transient = Vec::new();
         let res = unsafe { self.build_blases(asd, blases, scratch_align, &mut owned, &mut transient, &mut handles, &mut addrs, Some(&mut fences), import_host) };
+        // One BLAS into a freed slot: build_blases appended it; move it down.
+        let mut first = first;
+        if res.is_ok() && blases.len() == 1 && handles.len() == first as usize + 1 {
+            if let Some(slot) = acc.free_slots.pop() {
+                let s = slot as usize;
+                handles.swap_remove(s); addrs.swap_remove(s); owned.swap_remove(s);
+                first = slot;
+            }
+        }
         acc.owned = owned; acc.blases = handles; acc.blas_addrs = addrs;
         // The inputs go with the LAST batch: one queue, in-order fences, so
         // when it signals every earlier batch of this call is done too.
@@ -1267,6 +1280,35 @@ impl MoltenVkBackend {
         }
         if !transient.is_empty() { unsafe { self.free_buffers(transient) }; }
         res.map(|_| first)
+    }
+
+    /// Destroy BLAS `idx` of scene `tlas_id` and free its storage; the index
+    /// is reused by a later single-BLAS `add_scene_blases_async_from`. The
+    /// caller guarantees nothing references it any more: no instance of the
+    /// live TLAS (nor of one being built), no view, and no frame in flight
+    /// (views copy BLAS addresses when built — a view rebuilt later must not
+    /// name a freed index). Its build must have completed.
+    pub fn free_scene_blas(&self, tlas_id: ResourceId, idx: u32) -> Result<(), String> {
+        let asd = self.as_device.as_ref().ok_or_else(|| "ray-query not available on this device".to_string())?;
+        let mut accels = self.accels.lock().unwrap();
+        let acc = accels.get_mut(&tlas_id.raw()).ok_or_else(|| "free_scene_blas: unknown scene".to_string())?;
+        let i = idx as usize;
+        if i >= acc.blases.len() || acc.blases[i] == vk::AccelerationStructureKHR::null() {
+            return Err(format!("free_scene_blas: BLAS {idx} is not live"));
+        }
+        if acc.pending.iter().any(|p| idx >= p.first && idx < p.first + p.count) {
+            return Err(format!("free_scene_blas: BLAS {idx} is still building"));
+        }
+        unsafe {
+            asd.destroy_acceleration_structure(acc.blases[i], None);
+            let (b, m) = acc.owned[i];
+            self.free_buffers(vec![(b, m)]);
+        }
+        acc.blases[i] = vk::AccelerationStructureKHR::null();
+        acc.blas_addrs[i] = 0;
+        acc.owned[i] = (vk::Buffer::null(), vk::DeviceMemory::null());
+        acc.free_slots.push(idx);
+        Ok(())
     }
 
     /// Poll in-flight async BLAS builds; returns the first index of every
@@ -1305,7 +1347,7 @@ impl MoltenVkBackend {
             accels.get(&scene.raw()).ok_or_else(|| format!("scene {scene} not built"))?.blas_addrs.clone()
         };
         let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: Vec::new(), blas_addrs, owned: Vec::new(),
-                               tlas_owned: None, tlas_spare: None, pending: Vec::new(), tlas_pending: None,
+                               tlas_owned: None, tlas_spare: None, pending: Vec::new(), free_slots: Vec::new(), tlas_pending: None,
                                inst_shadow: Vec::new(), inst_log: Vec::new(), inst_gen: 0 };
         self.accels.lock().unwrap().insert(view.raw(), accel);
         self.rebuild_scene_tlas(view, instances)
