@@ -1464,7 +1464,7 @@ impl MoltenVkBackend {
                 if let Some(s) = a.tlas_spare.replace(o) { self.free_buffers(s.pairs().to_vec()); }
             }
             let spare = a.tlas_spare.take();
-            let (tlas, owned, fence_cb, size) = self.submit_tlas_build(asd, &a.inst_shadow, a.inst_gen, &a.inst_log, spare, true)?;
+            let (tlas, owned, fence_cb, size) = self.submit_tlas_build(asd, &a.inst_shadow, a.inst_gen, &a.inst_log, spare, true, None)?;
             debug_assert!(fence_cb.is_none());
             a.tlas = tlas;
             a.tlas_owned = Some(owned);
@@ -1492,14 +1492,29 @@ impl MoltenVkBackend {
     /// instance array as patched so far; later patches go to the next
     /// build.
     pub fn rebuild_scene_tlas_slots_async(&self, tlas_id: ResourceId) -> Result<bool, String> {
+        self.tlas_slots_async(tlas_id, false)
+    }
+
+    /// `rebuild_scene_tlas_slots_async` as a REFIT of the current TLAS: the
+    /// patched instances re-read into the old hierarchy, bounds recomputed —
+    /// several times cheaper than a build. Right when instances keep their
+    /// places (LOD swaps: the bounds barely move); the caller rebuilds now
+    /// and then so the hierarchy never drifts far. Same protocol and swap as
+    /// the rebuild (the result goes to the spare buffers).
+    pub fn refit_scene_tlas_slots_async(&self, tlas_id: ResourceId) -> Result<bool, String> {
+        self.tlas_slots_async(tlas_id, true)
+    }
+
+    fn tlas_slots_async(&self, tlas_id: ResourceId, refit: bool) -> Result<bool, String> {
         let asd = self.as_device.as_ref()
             .ok_or_else(|| "ray-query not available on this device".to_string())?;
         let mut accels = self.accels.lock().unwrap();
         let a = accels.get_mut(&tlas_id.raw()).ok_or_else(|| format!("scene {tlas_id} not built"))?;
         if a.tlas_pending.is_some() { return Ok(false); }
         if a.inst_shadow.is_empty() { return Err("rebuild_scene_tlas_slots_async: no instances set".into()); }
+        let src = if refit && a.tlas != vk::AccelerationStructureKHR::null() { Some(a.tlas) } else { None };
         let spare = a.tlas_spare.take();
-        let (tlas, owned, fence_cb, size) = unsafe { self.submit_tlas_build(asd, &a.inst_shadow, a.inst_gen, &a.inst_log, spare, false)? };
+        let (tlas, owned, fence_cb, size) = unsafe { self.submit_tlas_build(asd, &a.inst_shadow, a.inst_gen, &a.inst_log, spare, false, src)? };
         let (fence, cb) = fence_cb.expect("async build returns its fence");
         a.tlas_pending = Some(PendingTlas { fence, cb, tlas, owned, size, instances: (a.inst_shadow.len() / 64) as u32 });
         Self::compact_inst_log(a);
@@ -1553,7 +1568,8 @@ impl MoltenVkBackend {
     /// the fence + command buffer come back for the caller to poll.
     /// Returns the new TLAS, the buffer set backing it and its storage size.
     unsafe fn submit_tlas_build(&self, asd: &ash::khr::acceleration_structure::Device,
-                                shadow: &[u8], gen: u64, log: &[u32], spare: Option<TlasBufs>, wait: bool)
+                                shadow: &[u8], gen: u64, log: &[u32], spare: Option<TlasBufs>, wait: bool,
+                                refit_src: Option<vk::AccelerationStructureKHR>)
         -> Result<(vk::AccelerationStructureKHR, TlasBufs, Option<(vk::Fence, vk::CommandBuffer)>, u64), String>
     {
         let mut as_props = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
@@ -1583,7 +1599,11 @@ impl MoltenVkBackend {
                 instances: vk::AccelerationStructureGeometryInstancesDataKHR::default()
                     .data(vk::DeviceOrHostAddressConstKHR { device_address: addr }),
             });
-        let flags = vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_BUILD;
+        // ALLOW_UPDATE: every TLAS can be the source of a refit (a camera
+        // move changes which BLAS instances point at, never their number;
+        // a refit re-reads them and recomputes bounds in one pass — the full
+        // build of ~860 k instances stole ~10 ms from a frame every rebuild).
+        let flags = vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_BUILD | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE;
         let tgeos0 = [geo_with(0)];
         let tbi0 = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
@@ -1594,7 +1614,7 @@ impl MoltenVkBackend {
         asd.get_acceleration_structure_build_sizes(
             vk::AccelerationStructureBuildTypeKHR::DEVICE, &tbi0, &[inst_count], &mut tsz);
         let store_bytes = tsz.acceleration_structure_size;
-        let scratch_bytes = tsz.build_scratch_size + scratch_align;
+        let scratch_bytes = tsz.build_scratch_size.max(tsz.update_scratch_size) + scratch_align;
 
         // ---- buffers: the spare set when it fits, else a fresh one ----
         let bufs = match spare {
@@ -1637,10 +1657,12 @@ impl MoltenVkBackend {
                 .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL), None)
             .map_err(|e| format!("create TLAS: {e:?}"))?;
         let tgeos = [geo_with(iaddr)];
+        let mode = if refit_src.is_some() { vk::BuildAccelerationStructureModeKHR::UPDATE } else { vk::BuildAccelerationStructureModeKHR::BUILD };
         let tbi = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
             .flags(flags)
-            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+            .mode(mode)
+            .src_acceleration_structure(refit_src.unwrap_or(vk::AccelerationStructureKHR::null()))
             .geometries(&tgeos)
             .dst_acceleration_structure(tlas)
             .scratch_data(vk::DeviceOrHostAddressKHR {
@@ -1978,6 +2000,20 @@ impl MoltenVkBackend {
     /// Recreate the swapchain for a new window size (also after OUT_OF_DATE).
     pub fn recreate_swapchain(&self, w: u32, h: u32) -> Result<(), String> {
         let (si, sd) = (self.surface_i.as_ref().ok_or("no surface ext")?, self.swap_d.as_ref().ok_or("no swapchain ext")?);
+        // A resize to the extent the swapchain already has (macOS sends one
+        // or two right after the window appears) is a no-op: rebuilding
+        // waited for the in-flight frame — the first one, slow while the GPU
+        // warms up — and stalled the viewer ~0.25 s at startup.
+        {
+            let g = self.swap.lock().unwrap();
+            if let Some(sw) = g.as_ref() {
+                if sw.swapchain != vk::SwapchainKHR::null() && !sw.stale {
+                    let caps = unsafe { si.get_physical_device_surface_capabilities(self.physical, sw.surface) }.map_err(|e| format!("{e:?}"))?;
+                    let want = if caps.current_extent.width != u32::MAX { caps.current_extent } else { vk::Extent2D { width: w.max(1), height: h.max(1) } };
+                    if want == sw.extent { return Ok(()); }
+                }
+            }
+        }
         self.wait_pending().map_err(|e| format!("{e:?}"))?;
         unsafe { let _ = self.device.queue_wait_idle(self._queue); }
         let mut g = self.swap.lock().unwrap();
@@ -2326,6 +2362,7 @@ impl MoltenVkBackend {
         // The previous frame (async mode) must be complete before this one
         // resets the descriptor pool, the query pool and per-frame buffers.
         self.wait_pending()?;
+        let t_rec = std::time::Instant::now();
         let dev = &self.device;
         let alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(self.cmd_pool)
@@ -2685,22 +2722,21 @@ impl MoltenVkBackend {
                                 self.query_pool, 2 + n_stamped);
                             n_stamped += 1;
                         }
-                        // Make the writes visible to host readback
-                        // (HOST_COHERENT memory + queue-wait below)
-                        // AND to any chained compute dispatch in
-                        // the same frame (multi-kernel pipelines:
-                        // G-buffer pass -> resolve pass).
+                        // Make the writes visible to any chained compute
+                        // dispatch in the same frame (multi-kernel
+                        // pipelines: G-buffer pass -> resolve pass).
+                        // Host visibility is ONE barrier at the end of the
+                        // frame: MoltenVK answers every barrier with a
+                        // HOST destination by walking every resource on
+                        // the device (MVKDevice::applyMemoryBarrier) — with
+                        // thousands of BLAS buffers, ~40 per-dispatch host
+                        // barriers were 80 % of vkQueueSubmit (1.6–2.1 ms).
                         let barrier = vk::MemoryBarrier::default()
                             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                            .dst_access_mask(
-                                vk::AccessFlags::HOST_READ
-                                    | vk::AccessFlags::SHADER_READ
-                                    | vk::AccessFlags::SHADER_WRITE,
-                            );
+                            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
                         dev.cmd_pipeline_barrier(cb,
                             vk::PipelineStageFlags::COMPUTE_SHADER,
-                            vk::PipelineStageFlags::HOST
-                                | vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
                             vk::DependencyFlags::empty(),
                             &[barrier], &[], &[]);
                     }
@@ -2746,9 +2782,20 @@ impl MoltenVkBackend {
         }
         end_rp!();
         // Window present: the output buffer → the acquired swapchain image.
+        let t_pres = std::time::Instant::now();
         let present = self.record_present(cb, &buffers);
+        let ms_present_rec = t_pres.elapsed().as_secs_f64() * 1e3;
         drop(pipelines); drop(buffers); drop(images);
 
+        // Everything the frame wrote, visible to host readback after the
+        // fence (HOST_COHERENT memory): one barrier for the whole frame.
+        unsafe {
+            let barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ);
+            dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(), &[barrier], &[], &[]);
+        }
         if timing {
             unsafe {
                 dev.cmd_write_timestamp(
@@ -2756,6 +2803,8 @@ impl MoltenVkBackend {
             }
         }
         unsafe { dev.end_command_buffer(cb)?; }
+        let ms_record = t_rec.elapsed().as_secs_f64() * 1e3 - ms_present_rec;
+        let t_sub = std::time::Instant::now();
         let fence = unsafe { dev.create_fence(&vk::FenceCreateInfo::default(), None)? };
         let cbs = [cb];
         let (wait_s, signal_s) = match present { Some((_, _, a, d)) => (vec![a], vec![d]), None => (vec![], vec![]) };
@@ -2764,6 +2813,8 @@ impl MoltenVkBackend {
             .wait_semaphores(&wait_s).wait_dst_stage_mask(if wait_s.is_empty() { &[] } else { &wait_stage })
             .signal_semaphores(&signal_s);
         unsafe { dev.queue_submit(self._queue, &[submit], fence)?; }
+        let ms_submit = t_sub.elapsed().as_secs_f64() * 1e3;
+        let t_qp = std::time::Instant::now();
         // Present right away: the present engine waits on the render-done
         // semaphore on the GPU, not the CPU.
         if let (Some((idx, sc, _, done)), Some(sd)) = (present, self.swap_d.as_ref()) {
@@ -2775,6 +2826,20 @@ impl MoltenVkBackend {
                     if let Some(sw) = self.swap.lock().unwrap().as_mut() { sw.stale = true; }
                 }
                 Err(e) => log::warn!("MoltenVk present: {e:?}"),
+            }
+        }
+        let ms_qpresent = t_qp.elapsed().as_secs_f64() * 1e3;
+        // AQUEDUCT_FRAME_PROF: record / present record (acquire + blit) /
+        // queue submit / queue present, averaged over 120 frames.
+        if std::env::var_os("AQUEDUCT_FRAME_PROF").is_some() {
+            static ACC: Mutex<([f64; 4], u32)> = Mutex::new(([0.0; 4], 0));
+            let mut a = ACC.lock().unwrap();
+            for (k, v) in [ms_record, ms_present_rec, ms_submit, ms_qpresent].into_iter().enumerate() { a.0[k] += v; }
+            a.1 += 1;
+            if a.1 == 120 {
+                eprintln!("frame-prof: record {:.2} | present record (acquire+blit) {:.2} | queue submit {:.2} | queue present {:.2} ms",
+                    a.0[0] / 120.0, a.0[1] / 120.0, a.0[2] / 120.0, a.0[3] / 120.0);
+                *a = ([0.0; 4], 0);
             }
         }
         let p = Pending { fence, cb, trash, timing, n_stamped };
