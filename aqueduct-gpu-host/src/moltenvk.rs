@@ -331,6 +331,48 @@ pub struct MoltenVkBackend {
     /// owner should stop using this backend (and must not wait on it —
     /// `Drop` skips device_wait_idle when set).
     stalled: std::sync::atomic::AtomicBool,
+    /// Window presentation (`attach_metal_layer`): the surface/swapchain
+    /// loaders (`Some` when the instance and device offer them) and the
+    /// attached swapchain.
+    surface_i: Option<khr::surface::Instance>,
+    metal_i: Option<ash::ext::metal_surface::Instance>,
+    swap_d: Option<khr::swapchain::Device>,
+    swap: Mutex<Option<Swap>>,
+    /// The submitted frame not yet waited for (`set_async_frames(true)`):
+    /// its fence, command buffer and transient objects. Every entry point
+    /// that reuses per-frame state (the next record, buffer reads/writes)
+    /// waits for it first.
+    pending: Mutex<Option<Pending>>,
+    async_frames: std::sync::atomic::AtomicBool,
+}
+
+/// An attached CAMetalLayer swapchain; the frame's output buffer is copied
+/// to `stage` (RGBA8) and blitted to the acquired image (BGRA8: the blit
+/// swizzles and scales) at the end of the frame's command buffer.
+struct Swap {
+    surface: vk::SurfaceKHR,
+    swapchain: vk::SwapchainKHR,
+    images: Vec<vk::Image>,
+    extent: vk::Extent2D,
+    /// Acquire semaphores (a ring) and one render-done semaphore per image.
+    acquire: Vec<vk::Semaphore>,
+    done: Vec<vk::Semaphore>,
+    ring: usize,
+    stage: Option<(vk::Image, vk::DeviceMemory, u32, u32)>,
+    /// The buffer presented at the end of the next frame: (buffer id, w, h),
+    /// tightly packed RGBA8 rows.
+    src: Option<(u32, u32, u32)>,
+    mode: vk::PresentModeKHR,
+    stale: bool,
+}
+
+/// A submitted, not-yet-completed frame.
+struct Pending {
+    fence: vk::Fence,
+    cb: vk::CommandBuffer,
+    trash: Vec<(vk::RenderPass, vk::Framebuffer, vk::ImageView)>,
+    timing: bool,
+    n_stamped: u32,
 }
 
 /// Construction errors for [`MoltenVkBackend::new`]. Each variant
@@ -424,7 +466,17 @@ impl MoltenVkBackend {
         // MoltenVK requires the portability-enumeration extension &
         // flag to be advertised. On non-Apple hosts this is harmless.
         let portability_ext_name = khr::portability_enumeration::NAME;
-        let extension_ptrs = [portability_ext_name.as_ptr()];
+        let mut extension_ptrs = vec![portability_ext_name.as_ptr()];
+        // Window presentation (VK_KHR_surface + VK_EXT_metal_surface) when the
+        // loader offers it: harmless for headless users, and lets a viewer
+        // attach a CAMetalLayer swapchain instead of reading every frame back.
+        let inst_exts = unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
+        let has_inst = |want: &std::ffi::CStr| inst_exts.iter().any(|e| e.extension_name_as_c_str().map(|n| n == want).unwrap_or(false));
+        let present_ok = has_inst(khr::surface::NAME) && has_inst(ash::ext::metal_surface::NAME);
+        if present_ok {
+            extension_ptrs.push(khr::surface::NAME.as_ptr());
+            extension_ptrs.push(ash::ext::metal_surface::NAME.as_ptr());
+        }
 
         let mut create_flags = vk::InstanceCreateFlags::empty();
         // The constant only exists when the portability extension is
@@ -536,6 +588,10 @@ impl MoltenVkBackend {
         // VK_EXT_external_memory_host (enumerated normally — only the AS /
         // ray-query pair is hidden by the loader): lets a BLAS build read
         // page-aligned host memory in place instead of a copied upload.
+        let swapchain_ok = present_ok && device_ext_present(&instance, physical, khr::swapchain::NAME);
+        if swapchain_ok {
+            device_exts.push(khr::swapchain::NAME.as_ptr());
+        }
         let host_import_ok = device_ext_present(&instance, physical, ash::ext::external_memory_host::NAME);
         if host_import_ok {
             device_exts.push(ash::ext::external_memory_host::NAME.as_ptr());
@@ -668,7 +724,19 @@ impl MoltenVkBackend {
             (None, 0)
         };
 
+        let (surface_i, metal_i, swap_d) = if swapchain_ok {
+            (Some(khr::surface::Instance::new(&entry, &instance)),
+             Some(ash::ext::metal_surface::Instance::new(&entry, &instance)),
+             Some(khr::swapchain::Device::new(&instance, &device)))
+        } else { (None, None, None) };
+
         Ok(Self {
+            surface_i,
+            metal_i,
+            swap_d,
+            swap: Mutex::new(None),
+            pending: Mutex::new(None),
+            async_frames: std::sync::atomic::AtomicBool::new(false),
             submissions: AtomicU64::new(0),
             physical,
             vendor,
@@ -1651,6 +1719,8 @@ impl MoltenVkBackend {
     pub fn buffer_write(&self, buffer_id: ResourceId, offset: u64, data: &[u8])
         -> Result<(), String>
     {
+        // A frame still in flight may read this buffer (async frames).
+        self.wait_pending().map_err(|e| format!("frame wait: {e:?}"))?;
         let buffers = self.buffers.lock().unwrap();
         let b = buffers.get(&buffer_id.raw())
             .ok_or_else(|| format!("buffer {buffer_id} not registered"))?;
@@ -1773,6 +1843,211 @@ impl MoltenVkBackend {
 /// Timestamp slots after every compute dispatch of a frame (per-pass GPU time).
 const DISPATCH_STAMPS: u32 = 64;
 
+// ─── Window presentation (CAMetalLayer swapchain) ─────────────────────────
+impl MoltenVkBackend {
+    /// Whether a swapchain can be attached (surface + swapchain extensions).
+    pub fn can_present(&self) -> bool { self.swap_d.is_some() }
+
+    /// Attach a CAMetalLayer (`layer`: a `CAMetalLayer *`) as the present
+    /// target, `w × h` pixels. The frame's output buffer is shown with
+    /// `set_present_source`; no CPU readback is involved.
+    /// `AQUEDUCT_PRESENT=immediate` asks for an uncapped present mode.
+    pub fn attach_metal_layer(&self, layer: *const std::ffi::c_void, w: u32, h: u32) -> Result<(), String> {
+        let metal = self.metal_i.as_ref().ok_or("no VK_EXT_metal_surface")?;
+        self.wait_pending().map_err(|e| format!("{e:?}"))?;
+        self.detach_present();
+        let info = vk::MetalSurfaceCreateInfoEXT::default().layer(layer as *const vk::CAMetalLayer);
+        let surface = unsafe { metal.create_metal_surface(&info, None) }.map_err(|e| format!("metal surface: {e:?}"))?;
+        let si = self.surface_i.as_ref().unwrap();
+        let ok = unsafe { si.get_physical_device_surface_support(self.physical, self._queue_family, surface) }.unwrap_or(false);
+        if !ok { unsafe { si.destroy_surface(surface, None) }; return Err("queue family cannot present to the surface".into()); }
+        let modes = unsafe { si.get_physical_device_surface_present_modes(self.physical, surface) }.unwrap_or_default();
+        let want_immediate = std::env::var("AQUEDUCT_PRESENT").map(|v| v == "immediate").unwrap_or(false);
+        let mode = if want_immediate && modes.contains(&vk::PresentModeKHR::IMMEDIATE) { vk::PresentModeKHR::IMMEDIATE } else { vk::PresentModeKHR::FIFO };
+        *self.swap.lock().unwrap() = Some(Swap {
+            surface, swapchain: vk::SwapchainKHR::null(), images: Vec::new(), extent: vk::Extent2D { width: w, height: h },
+            acquire: Vec::new(), done: Vec::new(), ring: 0, stage: None, src: None, mode, stale: true,
+        });
+        self.recreate_swapchain(w, h)
+    }
+
+    /// The buffer shown at the end of the next frame (tightly packed RGBA8,
+    /// `w × h`), or None to present nothing.
+    pub fn set_present_source(&self, buffer_id: Option<ResourceId>, w: u32, h: u32) {
+        if let Some(sw) = self.swap.lock().unwrap().as_mut() {
+            sw.src = buffer_id.map(|b| (b.raw(), w, h));
+        }
+    }
+
+    /// Debug: `AQUEDUCT_PRESENT_DUMP=<file.ppm>` — read the image just
+    /// presented back from the swapchain (BGRA) and write it as a PPM: the
+    /// check that the window shows what the frame buffer holds (swizzle,
+    /// orientation, scale). Synchronous; call between frames.
+    pub fn dump_presented(&self, path: &str) -> Result<(), String> {
+        self.wait_pending().map_err(|e| format!("{e:?}"))?;
+        unsafe { let _ = self.device.queue_wait_idle(self._queue); }
+        let g = self.swap.lock().unwrap();
+        let sw = g.as_ref().ok_or("no swapchain")?;
+        // Every swapchain image (the last presented one among them), as
+        // <path>.<k>.ppm.
+        let (w, h) = (sw.extent.width, sw.extent.height);
+        let dev = &self.device;
+        for (k, &img) in sw.images.iter().enumerate() {
+            unsafe {
+                let size = (w as u64) * (h as u64) * 4;
+                let bi = vk::BufferCreateInfo::default().size(size).usage(vk::BufferUsageFlags::TRANSFER_DST);
+                let buf = dev.create_buffer(&bi, None).map_err(|e| format!("{e:?}"))?;
+                let req = dev.get_buffer_memory_requirements(buf);
+                let ti = self.find_mem_type(req.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT, vk::MemoryPropertyFlags::empty()).ok_or("no host mem")?;
+                let mem = dev.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ti), None).map_err(|e| format!("{e:?}"))?;
+                dev.bind_buffer_memory(buf, mem, 0).map_err(|e| format!("{e:?}"))?;
+                let cb = dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(self.cmd_pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)).map_err(|e| format!("{e:?}"))?[0];
+                dev.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).map_err(|e| format!("{e:?}"))?;
+                let range = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1);
+                let b = |from, to| vk::ImageMemoryBarrier::default().image(img).subresource_range(range).old_layout(from).new_layout(to)
+                    .src_access_mask(vk::AccessFlags::MEMORY_READ).dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED);
+                dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[b(vk::ImageLayout::PRESENT_SRC_KHR, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)]);
+                let copy = vk::BufferImageCopy::default().buffer_row_length(w).buffer_image_height(h)
+                    .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
+                    .image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
+                dev.cmd_copy_image_to_buffer(cb, img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buf, &[copy]);
+                dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::DependencyFlags::empty(), &[], &[], &[b(vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR)]);
+                dev.end_command_buffer(cb).map_err(|e| format!("{e:?}"))?;
+                let cbs = [cb];
+                dev.queue_submit(self._queue, &[vk::SubmitInfo::default().command_buffers(&cbs)], vk::Fence::null()).map_err(|e| format!("{e:?}"))?;
+                let _ = dev.queue_wait_idle(self._queue);
+                let ptr = dev.map_memory(mem, 0, size, vk::MemoryMapFlags::empty()).map_err(|e| format!("{e:?}"))? as *const u8;
+                let px = std::slice::from_raw_parts(ptr, size as usize);
+                let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+                for p in px.chunks_exact(4) { ppm.extend_from_slice(&[p[2], p[1], p[0]]); } // BGRA → RGB
+                let _ = std::fs::write(format!("{path}.{k}.ppm"), &ppm);
+                dev.unmap_memory(mem);
+                dev.free_command_buffers(self.cmd_pool, &cbs);
+                dev.destroy_buffer(buf, None);
+                dev.free_memory(mem, None);
+            }
+        }
+        Ok(())
+    }
+
+    /// Recreate the swapchain for a new window size (also after OUT_OF_DATE).
+    pub fn recreate_swapchain(&self, w: u32, h: u32) -> Result<(), String> {
+        let (si, sd) = (self.surface_i.as_ref().ok_or("no surface ext")?, self.swap_d.as_ref().ok_or("no swapchain ext")?);
+        self.wait_pending().map_err(|e| format!("{e:?}"))?;
+        unsafe { let _ = self.device.queue_wait_idle(self._queue); }
+        let mut g = self.swap.lock().unwrap();
+        let sw = g.as_mut().ok_or("no surface attached")?;
+        let caps = unsafe { si.get_physical_device_surface_capabilities(self.physical, sw.surface) }.map_err(|e| format!("{e:?}"))?;
+        let fmts = unsafe { si.get_physical_device_surface_formats(self.physical, sw.surface) }.map_err(|e| format!("{e:?}"))?;
+        // UNORM, not SRGB: the frame is already sRGB-encoded by the tonemap.
+        let fmt = fmts.iter().find(|f| f.format == vk::Format::B8G8R8A8_UNORM).or(fmts.first()).copied().ok_or("no surface format")?;
+        let extent = if caps.current_extent.width != u32::MAX { caps.current_extent } else { vk::Extent2D { width: w.max(1), height: h.max(1) } };
+        let n = (caps.min_image_count + 1).min(if caps.max_image_count > 0 { caps.max_image_count } else { u32::MAX });
+        let old = sw.swapchain;
+        let ci = vk::SwapchainCreateInfoKHR::default()
+            .surface(sw.surface).min_image_count(n).image_format(fmt.format).image_color_space(fmt.color_space)
+            .image_extent(extent).image_array_layers(1)
+            .image_usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_sharing_mode(vk::SharingMode::EXCLUSIVE).pre_transform(caps.current_transform)
+            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE).present_mode(sw.mode).clipped(true).old_swapchain(old);
+        let sc = unsafe { sd.create_swapchain(&ci, None) }.map_err(|e| format!("swapchain: {e:?}"))?;
+        unsafe {
+            if old != vk::SwapchainKHR::null() { sd.destroy_swapchain(old, None); }
+            for s in sw.acquire.drain(..).chain(sw.done.drain(..)) { self.device.destroy_semaphore(s, None); }
+        }
+        sw.swapchain = sc;
+        sw.images = unsafe { sd.get_swapchain_images(sc) }.map_err(|e| format!("{e:?}"))?;
+        sw.extent = extent;
+        for _ in 0..sw.images.len() + 1 { sw.acquire.push(unsafe { self.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }.map_err(|e| format!("{e:?}"))?); }
+        for _ in 0..sw.images.len() { sw.done.push(unsafe { self.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }.map_err(|e| format!("{e:?}"))?); }
+        sw.stale = false;
+        log::info!("MoltenVk present: swapchain {}×{} {:?} ×{} {:?}", extent.width, extent.height, fmt.format, sw.images.len(), sw.mode);
+        Ok(())
+    }
+
+    fn detach_present(&self) {
+        let mut g = self.swap.lock().unwrap();
+        if let Some(sw) = g.take() {
+            unsafe {
+                let _ = self.device.queue_wait_idle(self._queue);
+                if let Some((img, mem, _, _)) = sw.stage { self.device.destroy_image(img, None); self.device.free_memory(mem, None); }
+                for s in sw.acquire.iter().chain(sw.done.iter()) { self.device.destroy_semaphore(*s, None); }
+                if let Some(sd) = self.swap_d.as_ref() { if sw.swapchain != vk::SwapchainKHR::null() { sd.destroy_swapchain(sw.swapchain, None); } }
+                if let Some(si) = self.surface_i.as_ref() { si.destroy_surface(sw.surface, None); }
+            }
+        }
+    }
+
+    /// Record the present copy at the end of a frame: the source buffer →
+    /// the RGBA8 stage image → blit (swizzle, scale) into the acquired
+    /// swapchain image, left in PRESENT_SRC. Returns (image index, swapchain,
+    /// acquire semaphore, render-done semaphore) for the submit and present.
+    fn record_present(&self, cb: vk::CommandBuffer, buffers: &HashMap<u32, MvkBuffer>)
+        -> Option<(u32, vk::SwapchainKHR, vk::Semaphore, vk::Semaphore)>
+    {
+        let sd = self.swap_d.as_ref()?;
+        let mut g = self.swap.lock().unwrap();
+        let sw = g.as_mut()?;
+        let (src, w, h) = sw.src?;
+        if sw.stale || sw.swapchain == vk::SwapchainKHR::null() { return None; }
+        let buf = buffers.get(&src)?.buffer;
+        let dev = &self.device;
+        // The stage image, (re)made at the source size.
+        if sw.stage.map_or(true, |s| s.2 != w || s.3 != h) {
+            unsafe {
+                if let Some((img, mem, _, _)) = sw.stage.take() { dev.destroy_image(img, None); dev.free_memory(mem, None); }
+                let ii = vk::ImageCreateInfo::default().image_type(vk::ImageType::TYPE_2D).format(vk::Format::R8G8B8A8_UNORM)
+                    .extent(vk::Extent3D { width: w, height: h, depth: 1 }).mip_levels(1).array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1).tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC)
+                    .initial_layout(vk::ImageLayout::UNDEFINED);
+                let img = dev.create_image(&ii, None).ok()?;
+                let req = dev.get_image_memory_requirements(img);
+                let ti = self.find_mem_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL, vk::MemoryPropertyFlags::empty())?;
+                let mem = dev.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ti), None).ok()?;
+                dev.bind_image_memory(img, mem, 0).ok()?;
+                sw.stage = Some((img, mem, w, h));
+            }
+        }
+        let stage = sw.stage.unwrap().0;
+        let acq = sw.acquire[sw.ring % sw.acquire.len()];
+        let idx = match unsafe { sd.acquire_next_image(sw.swapchain, 1_000_000_000, acq, vk::Fence::null()) } {
+            Ok((i, _)) => i,
+            Err(e) => { sw.stale = true; log::warn!("MoltenVk present: acquire {e:?}"); return None; }
+        };
+        sw.ring += 1;
+        let target = sw.images[idx as usize];
+        let range = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1);
+        let layers = vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1);
+        let barrier = |img, from, to, sa, da| vk::ImageMemoryBarrier::default().image(img).subresource_range(range)
+            .old_layout(from).new_layout(to).src_access_mask(sa).dst_access_mask(da)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED);
+        unsafe {
+            let bb = vk::BufferMemoryBarrier::default().buffer(buf).offset(0).size(vk::WHOLE_SIZE)
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED);
+            dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[bb],
+                &[barrier(stage, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE),
+                  barrier(target, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE)]);
+            let copy = vk::BufferImageCopy::default().buffer_offset(0).buffer_row_length(w).buffer_image_height(h)
+                .image_subresource(layers).image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
+            dev.cmd_copy_buffer_to_image(cb, buf, stage, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[copy]);
+            dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[],
+                &[barrier(stage, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::TRANSFER_READ)]);
+            let (ew, eh) = (sw.extent.width as i32, sw.extent.height as i32);
+            let blit = vk::ImageBlit::default().src_subresource(layers).dst_subresource(layers)
+                .src_offsets([vk::Offset3D::default(), vk::Offset3D { x: w as i32, y: h as i32, z: 1 }])
+                .dst_offsets([vk::Offset3D::default(), vk::Offset3D { x: ew, y: eh, z: 1 }]);
+            let filter = if w as i32 == ew && h as i32 == eh { vk::Filter::NEAREST } else { vk::Filter::LINEAR };
+            dev.cmd_blit_image(cb, stage, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, target, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], filter);
+            dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::DependencyFlags::empty(), &[], &[],
+                &[barrier(target, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty())]);
+        }
+        Some((idx, sw.swapchain, acq, sw.done[idx as usize]))
+    }
+}
+
 impl Drop for MoltenVkBackend {
     fn drop(&mut self) {
         // A wedged queue never goes idle: skip the wait (and the resource
@@ -1783,6 +2058,8 @@ impl Drop for MoltenVkBackend {
         }
         // SAFETY: all handles were created via ash; destroy resources
         // before the device, and the device before the instance.
+        let _ = self.wait_pending();
+        self.detach_present();
         unsafe {
             let _ = self.device.device_wait_idle();
             for (_, cp) in self.compute_pipelines.lock().unwrap().drain() {
@@ -1939,6 +2216,8 @@ impl Backend for MoltenVkBackend {
     fn buffer_read_bytes(&self, buffer_id: ResourceId, offset: u64, size: u64)
         -> Result<Vec<u8>, String>
     {
+        // The frame writing it may still be in flight (async frames).
+        self.wait_pending().map_err(|e| format!("frame wait: {e:?}"))?;
         let buffers = self.buffers.lock().unwrap();
         let b = buffers.get(&buffer_id.raw())
             .ok_or_else(|| format!("buffer {buffer_id} not registered"))?;
@@ -2000,6 +2279,9 @@ impl MoltenVkBackend {
     /// Record + submit one frame's clear/copy ops. Errors are returned
     /// (logged by the caller); the frame is still "consumed".
     fn record_and_submit(&self, frame_buf: &[u8]) -> Result<(), vk::Result> {
+        // The previous frame (async mode) must be complete before this one
+        // resets the descriptor pool, the query pool and per-frame buffers.
+        self.wait_pending()?;
         let dev = &self.device;
         let alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(self.cmd_pool)
@@ -2419,6 +2701,8 @@ impl MoltenVkBackend {
             }
         }
         end_rp!();
+        // Window present: the output buffer → the acquired swapchain image.
+        let present = self.record_present(cb, &buffers);
         drop(pipelines); drop(buffers); drop(images);
 
         if timing {
@@ -2430,15 +2714,55 @@ impl MoltenVkBackend {
         unsafe { dev.end_command_buffer(cb)?; }
         let fence = unsafe { dev.create_fence(&vk::FenceCreateInfo::default(), None)? };
         let cbs = [cb];
-        let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+        let (wait_s, signal_s) = match present { Some((_, _, a, d)) => (vec![a], vec![d]), None => (vec![], vec![]) };
+        let wait_stage = [vk::PipelineStageFlags::TRANSFER];
+        let submit = vk::SubmitInfo::default().command_buffers(&cbs)
+            .wait_semaphores(&wait_s).wait_dst_stage_mask(if wait_s.is_empty() { &[] } else { &wait_stage })
+            .signal_semaphores(&signal_s);
+        unsafe { dev.queue_submit(self._queue, &[submit], fence)?; }
+        // Present right away: the present engine waits on the render-done
+        // semaphore on the GPU, not the CPU.
+        if let (Some((idx, sc, _, done)), Some(sd)) = (present, self.swap_d.as_ref()) {
+            let scs = [sc]; let idxs = [idx]; let waits = [done];
+            let pi = vk::PresentInfoKHR::default().wait_semaphores(&waits).swapchains(&scs).image_indices(&idxs);
+            match unsafe { sd.queue_present(self._queue, &pi) } {
+                Ok(false) => {}
+                Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    if let Some(sw) = self.swap.lock().unwrap().as_mut() { sw.stale = true; }
+                }
+                Err(e) => log::warn!("MoltenVk present: {e:?}"),
+            }
+        }
+        let p = Pending { fence, cb, trash, timing, n_stamped };
+        if self.async_frames.load(Ordering::Relaxed) {
+            *self.pending.lock().unwrap() = Some(p);
+            return Ok(());
+        }
+        self.finish(p)
+    }
+
+    /// Wait for the frame submitted in async mode (no-op when none), read its
+    /// GPU timestamps and free its transient objects.
+    pub fn wait_pending(&self) -> Result<(), vk::Result> {
+        let p = self.pending.lock().unwrap().take();
+        match p { Some(p) => self.finish(p), None => Ok(()) }
+    }
+
+    /// Async frames: `submit_frame` returns once the frame is submitted, and
+    /// the next record / buffer read or write (or `wait_pending`) waits for
+    /// it — the CPU prepares frame N+1 while the GPU runs frame N.
+    pub fn set_async_frames(&self, on: bool) {
+        if !on { let _ = self.wait_pending(); }
+        self.async_frames.store(on, Ordering::Relaxed);
+    }
+
+    fn finish(&self, p: Pending) -> Result<(), vk::Result> {
+        let dev = &self.device;
         // Bounded: a frame that does not complete within the wait budget
         // (default 10 s) returns TIMEOUT instead of freezing the caller; the
         // caller treats it as a lost device and recreates the backend. The
         // command buffer and fence are leaked on timeout (still in flight).
-        let res = unsafe {
-            dev.queue_submit(self._queue, &[submit], fence)
-                .and_then(|_| dev.wait_for_fences(&[fence], true, Self::wait_timeout_ns(10_000)))
-        };
+        let res = unsafe { dev.wait_for_fences(&[p.fence], true, Self::wait_timeout_ns(10_000)) };
         if res == Err(vk::Result::TIMEOUT) {
             log::error!("MoltenVk submit_frame: GPU stall — frame did not complete within the wait budget");
             self.stalled.store(true, Ordering::Relaxed);
@@ -2446,8 +2770,8 @@ impl MoltenVkBackend {
         }
         // Read the two timestamps back (the fence guarantees completion)
         // and record the modeled-vs-measured ground-truth exec time.
-        if timing && res.is_ok() {
-            let mut ts = vec![0u64; 2 + n_stamped as usize];
+        if p.timing && res.is_ok() {
+            let mut ts = vec![0u64; 2 + p.n_stamped as usize];
             let got = unsafe {
                 dev.get_query_pool_results(
                     self.query_pool, 0, &mut ts, vk::QueryResultFlags::TYPE_64)
@@ -2458,9 +2782,9 @@ impl MoltenVkBackend {
                 let ns = (delta as f64 * period) as u64;
                 self.last_gpu_ns.store(ns, Ordering::Relaxed);
                 self.total_gpu_ns.fetch_add(ns, Ordering::Relaxed);
-                let mut per = Vec::with_capacity(n_stamped as usize);
+                let mut per = Vec::with_capacity(p.n_stamped as usize);
                 let mut prev = ts[0];
-                for k in 0..n_stamped as usize {
+                for k in 0..p.n_stamped as usize {
                     let t = ts[2 + k];
                     per.push((t.saturating_sub(prev) as f64 * period) as u64);
                     prev = t;
@@ -2469,13 +2793,13 @@ impl MoltenVkBackend {
             }
         }
         unsafe {
-            for (rp, fb, view) in trash {
+            for (rp, fb, view) in p.trash {
                 dev.destroy_framebuffer(fb, None);
                 dev.destroy_render_pass(rp, None);
                 dev.destroy_image_view(view, None);
             }
-            dev.destroy_fence(fence, None);
-            dev.free_command_buffers(self.cmd_pool, &cbs);
+            dev.destroy_fence(p.fence, None);
+            dev.free_command_buffers(self.cmd_pool, &[p.cb]);
         }
         res
     }
