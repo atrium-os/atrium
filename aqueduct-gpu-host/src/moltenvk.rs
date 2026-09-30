@@ -99,6 +99,17 @@ impl MvkBuffer {
     }
 }
 
+static SETTLE_FULL_NS: AtomicU64 = AtomicU64::new(0);
+static SETTLE_FULL_N: AtomicU64 = AtomicU64::new(0);
+static SETTLE_RING_NS: AtomicU64 = AtomicU64::new(0);
+
+/// A per-slot staging buffer for `buffer_write_staged` (host-visible, mapped).
+#[derive(Clone, Copy)]
+struct Staging { buffer: vk::Buffer, memory: vk::DeviceMemory, mapped: *mut u8, cap: u64 }
+// SAFETY: the mapped pointer is used only under the backend's locks, for the backend's lifetime.
+unsafe impl Send for Staging {}
+unsafe impl Sync for Staging {}
+
 /// A GPU object a frame in flight may still use: destroyed when the newest
 /// frame submitted at the time of the request has completed.
 enum Grave { Accel(vk::AccelerationStructureKHR), Buffers(Vec<(vk::Buffer, vk::DeviceMemory)>), Image(vk::Image, vk::DeviceMemory) }
@@ -340,6 +351,11 @@ pub struct MoltenVkBackend {
     frame_seq: AtomicU64,
     /// Objects deferred while no frame was pending at the moment of the next submit.
     graveyard: Mutex<Vec<Grave>>,
+    /// Writes queued for the next frame's command buffer (`buffer_write_staged`):
+    /// copied from a per-slot staging buffer at the start of the frame, in
+    /// queue order — no wait for the frame in flight, no race with it.
+    staged: Mutex<Vec<(u32, u64, Vec<u8>)>>,
+    staging: Mutex<[Option<Staging>; 2]>,
 
     /// 2-slot TIMESTAMP query pool for measured GPU exec time (null if the
     /// device/queue doesn't support timestamps). Reused per submit —
@@ -791,6 +807,8 @@ impl MoltenVkBackend {
             pending: Mutex::new(std::collections::VecDeque::new()),
             frame_seq: AtomicU64::new(0),
             graveyard: Mutex::new(Vec::new()),
+            staged: Mutex::new(Vec::new()),
+            staging: Mutex::new([None, None]),
             async_frames: std::sync::atomic::AtomicBool::new(false),
             submissions: AtomicU64::new(0),
             physical,
@@ -1846,6 +1864,14 @@ impl MoltenVkBackend {
         // wait for that one; any other buffer may be read by the frame in
         // flight: wait for all.
         let ring = self.buffers.lock().unwrap().get(&buffer_id.raw()).map_or(false, |b| b.ring.is_some());
+        // AQUEDUCT_FRAME_PROF: which non-ring buffers are written while a frame is in flight (each such write is a full wait).
+        if !ring && std::env::var_os("AQUEDUCT_FRAME_PROF").is_some() && !self.pending.lock().unwrap().is_empty() {
+            static SEEN: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap();
+            match seen.iter_mut().find(|e| e.0 == buffer_id.raw()) { Some(e) => e.1 += 1, None => seen.push((buffer_id.raw(), 1)) }
+            let total: u32 = seen.iter().map(|e| e.1).sum();
+            if total % 240 == 0 { eprintln!("full-wait writes: {:?}", seen.iter().map(|e| format!("{:#x}×{}", e.0, e.1)).collect::<Vec<_>>()); }
+        }
         self.settle(if ring { 1 } else { 0 }).map_err(|e| format!("frame wait: {e:?}"))?;
         let mut buffers = self.buffers.lock().unwrap();
         let b = buffers.get_mut(&buffer_id.raw())
@@ -2219,6 +2245,7 @@ impl Drop for MoltenVkBackend {
                 if let Some(h) = img.image { self.device.destroy_image(h, None); }
                 if let Some(m) = img.memory { self.device.free_memory(m, None); }
             }
+            for s in self.staging.lock().unwrap().iter_mut() { if let Some(sg) = s.take() { self.device.unmap_memory(sg.memory); self.device.destroy_buffer(sg.buffer, None); self.device.free_memory(sg.memory, None); } }
             for (_, b) in self.buffers.lock().unwrap().drain() {
                 if let Some(r) = b.ring { self.device.unmap_memory(r.memory); self.device.destroy_buffer(r.buffer, None); self.device.free_memory(r.memory, None); }
                 self.device.unmap_memory(b.memory);
@@ -2489,6 +2516,37 @@ impl MoltenVkBackend {
         }
         let mut images = self.images.lock().unwrap();
         let buffers = self.buffers.lock().unwrap();
+        // Staged writes: through this slot's staging buffer (the frame two back
+        // is done with it), copied before any dispatch reads the targets.
+        let staged = std::mem::take(&mut *self.staged.lock().unwrap());
+        if !staged.is_empty() {
+            let total: u64 = staged.iter().map(|w| w.2.len() as u64).sum();
+            let mut st = self.staging.lock().unwrap();
+            if st[slot].map_or(true, |sg| sg.cap < total) {
+                if let Some(sg) = st[slot].take() { unsafe { dev.unmap_memory(sg.memory); dev.destroy_buffer(sg.buffer, None); dev.free_memory(sg.memory, None); } }
+                let cap = total.max(1 << 20).next_power_of_two();
+                let info = vk::BufferCreateInfo::default().size(cap).usage(vk::BufferUsageFlags::TRANSFER_SRC).sharing_mode(vk::SharingMode::EXCLUSIVE);
+                let buffer = unsafe { dev.create_buffer(&info, None) }?;
+                let req = unsafe { dev.get_buffer_memory_requirements(buffer) };
+                let mt = self.mem_type(req.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT).ok_or(vk::Result::ERROR_OUT_OF_HOST_MEMORY)?;
+                let memory = unsafe { dev.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(mt), None) }?;
+                unsafe { dev.bind_buffer_memory(buffer, memory, 0)?; }
+                let mapped = unsafe { dev.map_memory(memory, 0, req.size, vk::MemoryMapFlags::empty()) }? as *mut u8;
+                st[slot] = Some(Staging { buffer, memory, mapped, cap });
+            }
+            let Staging { buffer: sbuf, mapped: smap, .. } = st[slot].unwrap();
+            let mut at = 0u64;
+            for (id, off, data) in &staged {
+                let Some(b) = buffers.get(id) else { continue };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), smap.add(at as usize), data.len());
+                    dev.cmd_copy_buffer(cb, sbuf, b.buffer, &[vk::BufferCopy { src_offset: at, dst_offset: *off, size: data.len() as u64 }]);
+                }
+                at += data.len() as u64;
+            }
+            let barrier = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            unsafe { dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[barrier], &[], &[]); }
+        }
         let mut pipelines = self.pipelines.lock().unwrap();
         let compute_pipelines = self.compute_pipelines.lock().unwrap();
         // Per-dispatch descriptor sets: size the pool to THIS
@@ -2939,8 +2997,9 @@ impl MoltenVkBackend {
             for (k, v) in [ms_record, ms_present_rec, ms_submit, ms_qpresent].into_iter().enumerate() { a.0[k] += v; }
             a.1 += 1;
             if a.1 == 120 {
-                eprintln!("frame-prof: record {:.2} | present record (acquire+blit) {:.2} | queue submit {:.2} | queue present {:.2} ms",
-                    a.0[0] / 120.0, a.0[1] / 120.0, a.0[2] / 120.0, a.0[3] / 120.0);
+                eprintln!("frame-prof: record {:.2} | present record (acquire+blit) {:.2} | queue submit {:.2} | queue present {:.2} ms | waits per frame: full {:.2} ms ({:.1} calls), ring/record {:.2} ms",
+                    a.0[0] / 120.0, a.0[1] / 120.0, a.0[2] / 120.0, a.0[3] / 120.0,
+                    SETTLE_FULL_NS.swap(0, Ordering::Relaxed) as f64 * 1e-6 / 120.0, SETTLE_FULL_N.swap(0, Ordering::Relaxed) as f64 / 120.0, SETTLE_RING_NS.swap(0, Ordering::Relaxed) as f64 * 1e-6 / 120.0);
                 *a = ([0.0; 4], 0);
             }
         }
@@ -2969,10 +3028,17 @@ impl MoltenVkBackend {
         static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let cap = *CAP.get_or_init(|| std::env::var("AQUEDUCT_FRAMES_IN_FLIGHT").ok().and_then(|v| v.parse().ok()).unwrap_or(2usize).clamp(1, 2));
         let max_in_flight = max_in_flight.min(cap - 1);
-        loop {
-            let p = { let mut q = self.pending.lock().unwrap(); if q.len() <= max_in_flight { return Ok(()); } q.pop_front() };
-            match p { Some(p) => self.finish(p)?, None => return Ok(()) }
+        let t0 = std::time::Instant::now();
+        let r = loop {
+            let p = { let mut q = self.pending.lock().unwrap(); if q.len() <= max_in_flight { break Ok(()); } q.pop_front() };
+            match p { Some(p) => if let Err(e) = self.finish(p) { break Err(e) }, None => break Ok(()) }
+        };
+        // AQUEDUCT_FRAME_PROF: the wall time spent waiting here, by kind (full waits are the serial points).
+        if std::env::var_os("AQUEDUCT_FRAME_PROF").is_some() {
+            let ns = t0.elapsed().as_nanos() as u64;
+            if max_in_flight == 0 { SETTLE_FULL_NS.fetch_add(ns, Ordering::Relaxed); SETTLE_FULL_N.fetch_add(1, Ordering::Relaxed); } else { SETTLE_RING_NS.fetch_add(ns, Ordering::Relaxed); }
         }
+        r
     }
 
     /// Destroy `g` once every frame now in flight has completed; at once when none is.
@@ -3003,6 +3069,18 @@ impl MoltenVkBackend {
                 while a.tlas_spares.len() > 2 { let s = a.tlas_spares.remove(0); unsafe { self.free_buffers(s.pairs().to_vec()); } }
             }
         }
+    }
+
+    /// Queue a write for the NEXT frame's command buffer: the bytes go to a
+    /// staging buffer and a copy is recorded at the frame's start, so the
+    /// write neither waits for the frame in flight nor races it — for the
+    /// occasional patch of a buffer the device reads or writes (object
+    /// tables on a LOD change, the cloud volume). Visible from that frame on.
+    pub fn buffer_write_staged(&self, buffer_id: ResourceId, offset: u64, data: &[u8]) -> Result<(), String> {
+        let size = self.buffers.lock().unwrap().get(&buffer_id.raw()).map(|b| b.size).ok_or_else(|| format!("buffer {buffer_id} not registered"))?;
+        if offset + data.len() as u64 > size { return Err(format!("write end {} exceeds size {size}", offset + data.len() as u64)); }
+        if !data.is_empty() { self.staged.lock().unwrap().push((buffer_id.raw(), offset, data.to_vec())); }
+        Ok(())
     }
 
     /// Make `buffer_id` a per-frame ring buffer: a second backing buffer, so
@@ -3086,6 +3164,15 @@ impl MoltenVkBackend {
                 let period = self.timestamp_period_ns as f64;
                 let delta = ts[1].saturating_sub(ts[0]);
                 let ns = (delta as f64 * period) as u64;
+                // AQUEDUCT_FRAME_PROF: the GPU's idle gap between this frame's top
+                // stamp and the previous frame's bottom stamp (same clock), averaged.
+                if std::env::var_os("AQUEDUCT_FRAME_PROF").is_some() {
+                    static GAP: Mutex<(u64, f64, f64, u32)> = Mutex::new((0, 0.0, 0.0, 0));   // last bottom, gap sum, span sum, n
+                    let mut g = GAP.lock().unwrap();
+                    if g.0 != 0 && ts[0] > g.0 { g.1 += (ts[0] - g.0) as f64 * period * 1e-6; g.2 += ns as f64 * 1e-6; g.3 += 1; }
+                    g.0 = ts[1];
+                    if g.3 == 120 { eprintln!("gpu-gap: idle between frames {:.2} ms, busy per frame {:.2} ms (120 frames)", g.1 / 120.0, g.2 / 120.0); g.1 = 0.0; g.2 = 0.0; g.3 = 0; }
+                }
                 self.last_gpu_ns.store(ns, Ordering::Relaxed);
                 self.total_gpu_ns.fetch_add(ns, Ordering::Relaxed);
                 let mut per = Vec::with_capacity(p.n_stamped as usize);
