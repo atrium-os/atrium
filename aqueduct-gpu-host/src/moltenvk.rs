@@ -1681,7 +1681,12 @@ impl MoltenVkBackend {
         // move changes which BLAS instances point at, never their number;
         // a refit re-reads them and recomputes bounds in one pass — the full
         // build of ~860 k instances stole ~10 ms from a frame every rebuild).
-        let flags = vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_BUILD | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE;
+        // AQUEDUCT_TLAS_FAST_TRACE=1: the SAH build for the A/B of traversal cost on
+        // a dense scene (2026-09-30: with ~1 M tree, grass and building instances
+        // the kernel's rays paid ~3 ms a frame that the instance-level BVH could hide).
+        static FAST_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let fast_trace = *FAST_TRACE.get_or_init(|| std::env::var("AQUEDUCT_TLAS_FAST_TRACE").map_or(false, |v| v == "1"));
+        let flags = (if fast_trace { vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE } else { vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_BUILD }) | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE;
         let tgeos0 = [geo_with(0)];
         let tbi0 = vk::AccelerationStructureBuildGeometryInfoKHR::default()
             .ty(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
