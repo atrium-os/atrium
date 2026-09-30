@@ -368,6 +368,8 @@ pub struct MoltenVkBackend {
     timestamp_period_ns: f32,
     /// Last measured GPU exec time, nanoseconds (0 until first timed frame).
     last_gpu_ns: AtomicU64,
+    /// The in-frame TLAS refits' GPU time in the last timed frame (top stamp to the stamp after them), ns.
+    last_refit_ns: AtomicU64,
     /// Per-dispatch GPU time of the last timed frame, ns, in dispatch order
     /// (a timestamp after every compute dispatch, up to `DISPATCH_STAMPS`).
     last_dispatch_ns: Mutex<Vec<u64>>,
@@ -750,7 +752,7 @@ impl MoltenVkBackend {
         let timestamps_ok = timestamp_period_ns > 0.0 && valid_bits > 0;
         let query_pool = if timestamps_ok {
             let qpi = vk::QueryPoolCreateInfo::default()
-                .query_type(vk::QueryType::TIMESTAMP).query_count(2 * (2 + DISPATCH_STAMPS));   // one range per frame slot
+                .query_type(vk::QueryType::TIMESTAMP).query_count(2 * (3 + DISPATCH_STAMPS));   // one range per frame slot: top, bottom, after the TLAS refits, per dispatch
             unsafe { device.create_query_pool(&qpi, None) }
                 .unwrap_or(vk::QueryPool::null())
         } else {
@@ -833,6 +835,7 @@ impl MoltenVkBackend {
             query_pool,
             timestamp_period_ns,
             last_gpu_ns: AtomicU64::new(0),
+            last_refit_ns: AtomicU64::new(0),
             last_dispatch_ns: Mutex::new(Vec::new()),
             total_gpu_ns: AtomicU64::new(0),
             ray_query,
@@ -1899,6 +1902,9 @@ impl MoltenVkBackend {
         self.last_gpu_ns.load(Ordering::Relaxed) as f64 * 1e-9
     }
 
+    /// The in-frame TLAS refits' GPU time of the last timed frame, seconds.
+    pub fn measured_refit_time_s(&self) -> f64 { self.last_refit_ns.load(Ordering::Relaxed) as f64 * 1e-9 }
+
     /// Per-dispatch GPU time of the last timed frame, seconds, in dispatch
     /// order (empty without timestamps). Dispatch k's span runs from the
     /// previous stamp (frame top for k = 0) to the stamp after it, so the
@@ -2453,7 +2459,7 @@ impl MoltenVkBackend {
         self.settle(1)?;
         let seq = self.frame_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let slot = (seq % 2) as usize;
-        let q0 = slot as u32 * (2 + DISPATCH_STAMPS);
+        let q0 = slot as u32 * (3 + DISPATCH_STAMPS);
         // Ring buffers: the side this frame binds takes the other side's
         // content where no write has done so since the flip.
         for b in self.buffers.lock().unwrap().values_mut() { if b.ring.is_some() { b.sync_ring(); } }
@@ -2475,7 +2481,7 @@ impl MoltenVkBackend {
         let mut n_stamped = 0u32;
         if timing {
             unsafe {
-                dev.cmd_reset_query_pool(cb, self.query_pool, q0, 2 + DISPATCH_STAMPS);
+                dev.cmd_reset_query_pool(cb, self.query_pool, q0, 3 + DISPATCH_STAMPS);
                 dev.cmd_write_timestamp(
                     cb, vk::PipelineStageFlags::TOP_OF_PIPE, self.query_pool, q0);
             }
@@ -2514,6 +2520,8 @@ impl MoltenVkBackend {
                 }
             }
         }
+        // The stamp after the refits: their GPU time is their own bucket, not the first dispatch's.
+        if timing { unsafe { dev.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.query_pool, q0 + 2); } }
         let mut images = self.images.lock().unwrap();
         let buffers = self.buffers.lock().unwrap();
         // Staged writes: through this slot's staging buffer (the frame two back
@@ -2879,7 +2887,7 @@ impl MoltenVkBackend {
                         // Per-dispatch GPU time: a stamp after each dispatch.
                         if timing && n_stamped < DISPATCH_STAMPS {
                             dev.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                                self.query_pool, q0 + 2 + n_stamped);
+                                self.query_pool, q0 + 3 + n_stamped);
                             n_stamped += 1;
                         }
                         // Make the writes visible to any chained compute
@@ -3155,10 +3163,10 @@ impl MoltenVkBackend {
         // Read the two timestamps back (the fence guarantees completion)
         // and record the modeled-vs-measured ground-truth exec time.
         if p.timing && res.is_ok() {
-            let mut ts = vec![0u64; 2 + p.n_stamped as usize];
+            let mut ts = vec![0u64; 3 + p.n_stamped as usize];
             let got = unsafe {
                 dev.get_query_pool_results(
-                    self.query_pool, p.slot as u32 * (2 + DISPATCH_STAMPS), &mut ts, vk::QueryResultFlags::TYPE_64)
+                    self.query_pool, p.slot as u32 * (3 + DISPATCH_STAMPS), &mut ts, vk::QueryResultFlags::TYPE_64)
             };
             if got.is_ok() {
                 let period = self.timestamp_period_ns as f64;
@@ -3175,10 +3183,11 @@ impl MoltenVkBackend {
                 }
                 self.last_gpu_ns.store(ns, Ordering::Relaxed);
                 self.total_gpu_ns.fetch_add(ns, Ordering::Relaxed);
+                self.last_refit_ns.store((ts[2].saturating_sub(ts[0]) as f64 * period) as u64, Ordering::Relaxed);
                 let mut per = Vec::with_capacity(p.n_stamped as usize);
-                let mut prev = ts[0];
+                let mut prev = ts[2];
                 for k in 0..p.n_stamped as usize {
-                    let t = ts[2 + k];
+                    let t = ts[3 + k];
                     per.push((t.saturating_sub(prev) as f64 * period) as u64);
                     prev = t;
                 }
