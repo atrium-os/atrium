@@ -71,7 +71,37 @@ struct MvkBuffer {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     mapped: *mut u8,
+    /// A per-frame buffer's second side (`buffer_ring`): the CPU writes one
+    /// side while the frame in flight reads the other, so a write never
+    /// waits for the GPU. `side` is the side the next frame binds and the
+    /// CPU writes now (0 = the primary, 1 = the alt); `dirty` after a flip
+    /// until that side has been brought up to date from the other.
+    ring: Option<RingSide>,
 }
+
+struct RingSide { buffer: vk::Buffer, memory: vk::DeviceMemory, mapped: *mut u8, side: u8, dirty: bool,
+                  /// The device writes this buffer (statistics the CPU reads back): no host-side sync between the sides.
+                  device_written: bool }
+
+impl MvkBuffer {
+    /// The VkBuffer a frame recorded now binds, and the CPU writes.
+    fn bound(&self) -> vk::Buffer { match &self.ring { Some(r) if r.side == 1 => r.buffer, _ => self.buffer } }
+    fn write_ptr(&self) -> *mut u8 { match &self.ring { Some(r) if r.side == 1 => r.mapped, _ => self.mapped } }
+    fn other_ptr(&self) -> *mut u8 { match &self.ring { Some(r) if r.side == 1 => self.mapped, Some(r) => r.mapped, None => self.mapped } }
+    /// After a flip: the write side takes the other side's content (the last
+    /// complete state) before any new write lands on it.
+    fn sync_ring(&mut self) {
+        let (size, src, dst) = (self.size as usize, self.other_ptr(), self.write_ptr());
+        if let Some(r) = self.ring.as_mut() {
+            if r.dirty && !r.device_written && !src.is_null() && !dst.is_null() { unsafe { std::ptr::copy_nonoverlapping(src, dst, size); } }
+            r.dirty = false;
+        }
+    }
+}
+
+/// A GPU object a frame in flight may still use: destroyed when the newest
+/// frame submitted at the time of the request has completed.
+enum Grave { Accel(vk::AccelerationStructureKHR), Buffers(Vec<(vk::Buffer, vk::DeviceMemory)>), Image(vk::Image, vk::DeviceMemory) }
 
 // SAFETY: the raw `mapped` pointer is only dereferenced under the
 // backend's `submit_lock`/map lifetime; the VkBuffer + memory are owned
@@ -99,11 +129,12 @@ struct MvkAccel {
     /// Refit this scene's TLAS at the start of the next frame's command
     /// buffer (`refit_scene_tlas_inline`).
     inline_refit: bool,
-    /// The TLAS an in-frame refit replaced (the refit's source) and its
-    /// buffers, until that frame completes: kept HERE so the change-log
-    /// compaction counts its sync position (a set it cannot see had the log
-    /// trimmed under it and, back as the spare, missed patches — stale LODs).
-    tlas_retired: Option<(vk::AccelerationStructureKHR, TlasBufs)>,
+    /// TLASes a refit or swap replaced and their buffers, each with the
+    /// sequence number of the newest frame that may read it; back as spares
+    /// when that frame completes. Kept HERE so the change-log compaction
+    /// counts their sync positions (a set it cannot see had the log trimmed
+    /// under it and, back as the spare, missed patches — stale LODs).
+    tlas_retired: Vec<(u64, vk::AccelerationStructureKHR, TlasBufs)>,
     /// BLAS indices released by `free_scene_blas`, reused by the next
     /// single-BLAS `add_scene_blases_async_from` (so a streamed scene's
     /// index range — and the caller's per-BLAS tables — stay bounded).
@@ -112,7 +143,8 @@ struct MvkAccel {
     tlas_owned: Option<TlasBufs>,
     /// The previous TLAS's buffers, kept for the next rebuild (a rebuild
     /// that fits reuses them instead of three allocations + a map).
-    tlas_spare: Option<TlasBufs>,
+    /// Buffer sets no frame uses, for the next build (at most two kept).
+    tlas_spares: Vec<TlasBufs>,
     /// An async TLAS rebuild in flight (`rebuild_scene_tlas_async`); swapped
     /// in by `poll_scene_tlas`.
     tlas_pending: Option<PendingTlas>,
@@ -301,9 +333,13 @@ pub struct MoltenVkBackend {
     compute_binds: Mutex<HashMap<u32, u32>>,
     /// Descriptor pool for per-dispatch sets; reset at the top of
     /// every `record_and_submit`.
-    desc_pool: std::sync::Mutex<(vk::DescriptorPool, u32)>,
+    desc_pool: std::sync::Mutex<[(vk::DescriptorPool, u32); 2]>,
     /// Serialises command-buffer record + submit (one graphics queue).
     submit_lock: Mutex<()>,
+    /// Frames submitted so far (the sequence number of the next is +1).
+    frame_seq: AtomicU64,
+    /// Objects deferred while no frame was pending at the moment of the next submit.
+    graveyard: Mutex<Vec<Grave>>,
 
     /// 2-slot TIMESTAMP query pool for measured GPU exec time (null if the
     /// device/queue doesn't support timestamps). Reused per submit —
@@ -351,11 +387,11 @@ pub struct MoltenVkBackend {
     metal_i: Option<ash::ext::metal_surface::Instance>,
     swap_d: Option<khr::swapchain::Device>,
     swap: Mutex<Option<Swap>>,
-    /// The submitted frame not yet waited for (`set_async_frames(true)`):
-    /// its fence, command buffer and transient objects. Every entry point
-    /// that reuses per-frame state (the next record, buffer reads/writes)
-    /// waits for it first.
-    pending: Mutex<Option<Pending>>,
+    /// The submitted frames not yet waited for (`set_async_frames(true)`),
+    /// oldest first — at most two in flight: the next record waits for the
+    /// frame two back (whose slot it reuses), a write to a ring buffer for
+    /// the same, a write to any other buffer and every read for all of them.
+    pending: Mutex<std::collections::VecDeque<Pending>>,
     async_frames: std::sync::atomic::AtomicBool,
 }
 
@@ -383,10 +419,11 @@ struct Swap {
 struct Pending {
     fence: vk::Fence,
     cb: vk::CommandBuffer,
-    /// Scenes whose TLAS an in-frame refit replaced (`MvkAccel::tlas_retired`):
-    /// the frame reads the old one (the refit's source), so it is destroyed
-    /// and its buffers become the spare set when the frame completes.
-    retire: Vec<u32>,
+    /// Which of the two per-frame slots (descriptor pool, query range) this frame uses, and its sequence number.
+    slot: usize,
+    seq: u64,
+    /// Objects to destroy once this frame has completed (`defer`).
+    graveyard: Vec<Grave>,
     trash: Vec<(vk::RenderPass, vk::Framebuffer, vk::ImageView)>,
     timing: bool,
     n_stamped: u32,
@@ -697,7 +734,7 @@ impl MoltenVkBackend {
         let timestamps_ok = timestamp_period_ns > 0.0 && valid_bits > 0;
         let query_pool = if timestamps_ok {
             let qpi = vk::QueryPoolCreateInfo::default()
-                .query_type(vk::QueryType::TIMESTAMP).query_count(2 + DISPATCH_STAMPS);
+                .query_type(vk::QueryType::TIMESTAMP).query_count(2 * (2 + DISPATCH_STAMPS));   // one range per frame slot
             unsafe { device.create_query_pool(&qpi, None) }
                 .unwrap_or(vk::QueryPool::null())
         } else {
@@ -718,11 +755,10 @@ impl MoltenVkBackend {
         let dp_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(64)
             .pool_sizes(&pool_sizes);
-        let desc_pool = std::sync::Mutex::new((
-            unsafe { device.create_descriptor_pool(&dp_info, None) }
-                .unwrap_or(vk::DescriptorPool::null()),
-            64,
-        ));
+        let desc_pool = std::sync::Mutex::new([
+            (unsafe { device.create_descriptor_pool(&dp_info, None) }.unwrap_or(vk::DescriptorPool::null()), 64),
+            (unsafe { device.create_descriptor_pool(&dp_info, None) }.unwrap_or(vk::DescriptorPool::null()), 64),
+        ]);
 
         // VK_KHR_acceleration_structure device functions (build/query). Only
         // meaningful when ray-query was enabled above.
@@ -752,7 +788,9 @@ impl MoltenVkBackend {
             metal_i,
             swap_d,
             swap: Mutex::new(None),
-            pending: Mutex::new(None),
+            pending: Mutex::new(std::collections::VecDeque::new()),
+            frame_seq: AtomicU64::new(0),
+            graveyard: Mutex::new(Vec::new()),
             async_frames: std::sync::atomic::AtomicBool::new(false),
             submissions: AtomicU64::new(0),
             physical,
@@ -1077,7 +1115,7 @@ impl MoltenVkBackend {
         let stats = unsafe { self.build_blases(asd, blases, scratch_align, &mut owned_all, &mut transient, &mut blas_handles, &mut blas_addrs, None, import_host)? };
         // Synchronous builds: the inputs are done with once build_blases returns.
         unsafe { self.free_buffers(transient) };
-        let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: blas_handles, blas_addrs, owned: owned_all, tlas_owned: None, tlas_spare: None, pending: Vec::new(), inline_refit: false, tlas_retired: None, free_slots: Vec::new(), tlas_pending: None, inst_shadow: Vec::new(), inst_log: Vec::new(), inst_gen: 0 };
+        let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: blas_handles, blas_addrs, owned: owned_all, tlas_owned: None, tlas_spares: Vec::new(), pending: Vec::new(), inline_refit: false, tlas_retired: Vec::new(), free_slots: Vec::new(), tlas_pending: None, inst_shadow: Vec::new(), inst_log: Vec::new(), inst_gen: 0 };
         self.accels.lock().unwrap().insert(tlas_id.raw(), accel);
         eprintln!("build_scene_tlas: {stats}");
         self.rebuild_scene_tlas(tlas_id, instances)
@@ -1311,11 +1349,10 @@ impl MoltenVkBackend {
         if acc.pending.iter().any(|p| idx >= p.first && idx < p.first + p.count) {
             return Err(format!("free_scene_blas: BLAS {idx} is still building"));
         }
-        unsafe {
-            asd.destroy_acceleration_structure(acc.blases[i], None);
-            let (b, m) = acc.owned[i];
-            self.free_buffers(vec![(b, m)]);
-        }
+        // A frame in flight may still trace it: destroyed when that frame completes.
+        let _ = asd;
+        self.defer(Grave::Accel(acc.blases[i]));
+        self.defer(Grave::Buffers(vec![acc.owned[i]]));
         acc.blases[i] = vk::AccelerationStructureKHR::null();
         acc.blas_addrs[i] = 0;
         acc.owned[i] = (vk::Buffer::null(), vk::DeviceMemory::null());
@@ -1359,7 +1396,7 @@ impl MoltenVkBackend {
             accels.get(&scene.raw()).ok_or_else(|| format!("scene {scene} not built"))?.blas_addrs.clone()
         };
         let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: Vec::new(), blas_addrs, owned: Vec::new(),
-                               tlas_owned: None, tlas_spare: None, pending: Vec::new(), inline_refit: false, tlas_retired: None, free_slots: Vec::new(), tlas_pending: None,
+                               tlas_owned: None, tlas_spares: Vec::new(), pending: Vec::new(), inline_refit: false, tlas_retired: Vec::new(), free_slots: Vec::new(), tlas_pending: None,
                                inst_shadow: Vec::new(), inst_log: Vec::new(), inst_gen: 0 };
         self.accels.lock().unwrap().insert(view.raw(), accel);
         self.rebuild_scene_tlas(view, instances)
@@ -1429,9 +1466,9 @@ impl MoltenVkBackend {
     fn compact_inst_log(a: &mut MvkAccel) {
         let mut sets: Vec<&mut TlasBufs> = Vec::new();
         if let Some(b) = a.tlas_owned.as_mut() { sets.push(b); }
-        if let Some(b) = a.tlas_spare.as_mut() { sets.push(b); }
+        for b in a.tlas_spares.iter_mut() { sets.push(b); }
         if let Some(p) = a.tlas_pending.as_mut() { sets.push(&mut p.owned); }
-        if let Some((_, b)) = a.tlas_retired.as_mut() { sets.push(b); }
+        for (_, _, b) in a.tlas_retired.iter_mut() { sets.push(b); }
         let gen = a.inst_gen;
         let min = sets.iter().filter(|b| b.gen == gen).map(|b| b.synced).min().unwrap_or(a.inst_log.len());
         let min = min.min(a.inst_log.len());
@@ -1473,10 +1510,8 @@ impl MoltenVkBackend {
             // cloned.
             let mut accels = self.accels.lock().unwrap();
             let a = accels.get_mut(&tlas_id.raw()).unwrap();
-            if let Some(o) = old_owned {
-                if let Some(s) = a.tlas_spare.replace(o) { self.free_buffers(s.pairs().to_vec()); }
-            }
-            let spare = a.tlas_spare.take();
+            if let Some(o) = old_owned { self.retire_bufs(a, vk::AccelerationStructureKHR::null(), o); }
+            let spare = a.tlas_spares.pop();
             let (tlas, owned, fence_cb, size) = self.submit_tlas_build(asd, &a.inst_shadow, a.inst_gen, &a.inst_log, spare, true, None, None)?;
             debug_assert!(fence_cb.is_none());
             a.tlas = tlas;
@@ -1539,7 +1574,7 @@ impl MoltenVkBackend {
         if a.tlas_pending.is_some() { return Ok(false); }
         if a.inst_shadow.is_empty() { return Err("rebuild_scene_tlas_slots_async: no instances set".into()); }
         let src = if refit && a.tlas != vk::AccelerationStructureKHR::null() { Some(a.tlas) } else { None };
-        let spare = a.tlas_spare.take();
+        let spare = a.tlas_spares.pop();
         let (tlas, owned, fence_cb, size) = unsafe { self.submit_tlas_build(asd, &a.inst_shadow, a.inst_gen, &a.inst_log, spare, false, src, None)? };
         let (fence, cb) = fence_cb.expect("async build returns its fence");
         a.tlas_pending = Some(PendingTlas { fence, cb, tlas, owned, size, instances: (a.inst_shadow.len() / 64) as u32 });
@@ -1553,7 +1588,7 @@ impl MoltenVkBackend {
     /// `Ok(true)` is returned. `Ok(false)` = nothing swapped (none in
     /// flight, or still building).
     pub fn poll_scene_tlas(&self, tlas_id: ResourceId) -> Result<bool, String> {
-        let asd = self.as_device.as_ref()
+        let _asd = self.as_device.as_ref()
             .ok_or_else(|| "ray-query not available on this device".to_string())?;
         let mut accels = self.accels.lock().unwrap();
         let a = accels.get_mut(&tlas_id.raw()).ok_or_else(|| format!("scene {tlas_id} not built"))?;
@@ -1566,13 +1601,9 @@ impl MoltenVkBackend {
         unsafe {
             self.device.destroy_fence(p.fence, None);
             self.device.free_command_buffers(self.build_pool, &[p.cb]);
-            if old != vk::AccelerationStructureKHR::null() {
-                asd.destroy_acceleration_structure(old, None);
-            }
-            if let Some(o) = old_owned {
-                if let Some(s) = a.tlas_spare.replace(o) { self.free_buffers(s.pairs().to_vec()); }
-            }
         }
+        // The old TLAS may still be read by a frame in flight: it retires with it.
+        match old_owned { Some(o) => self.retire_bufs(a, old, o), None => if old != vk::AccelerationStructureKHR::null() { self.defer(Grave::Accel(old)); } }
         Self::compact_inst_log(a);
         log::debug!("poll_scene_tlas: swapped in {} instances, TLAS {:.2} MB", p.instances, p.size as f64 / 1e6);
         Ok(true)
@@ -1811,21 +1842,26 @@ impl MoltenVkBackend {
     pub fn buffer_write(&self, buffer_id: ResourceId, offset: u64, data: &[u8])
         -> Result<(), String>
     {
-        // A frame still in flight may read this buffer (async frames).
-        self.wait_pending().map_err(|e| format!("frame wait: {e:?}"))?;
-        let buffers = self.buffers.lock().unwrap();
-        let b = buffers.get(&buffer_id.raw())
+        // A ring buffer's write side is read only by the frame two back:
+        // wait for that one; any other buffer may be read by the frame in
+        // flight: wait for all.
+        let ring = self.buffers.lock().unwrap().get(&buffer_id.raw()).map_or(false, |b| b.ring.is_some());
+        self.settle(if ring { 1 } else { 0 }).map_err(|e| format!("frame wait: {e:?}"))?;
+        let mut buffers = self.buffers.lock().unwrap();
+        let b = buffers.get_mut(&buffer_id.raw())
             .ok_or_else(|| format!("buffer {buffer_id} not registered"))?;
         let end = offset + data.len() as u64;
         if end > b.size {
             return Err(format!("write end {end} exceeds size {}", b.size));
         }
-        if b.mapped.is_null() {
+        b.sync_ring();
+        let dst = b.write_ptr();
+        if dst.is_null() {
             return Err("buffer memory not mapped".to_string());
         }
         unsafe {
             std::ptr::copy_nonoverlapping(
-                data.as_ptr(), b.mapped.add(offset as usize), data.len());
+                data.as_ptr(), dst.add(offset as usize), data.len());
         }
         Ok(())
     }
@@ -2174,15 +2210,17 @@ impl Drop for MoltenVkBackend {
                 self.device.destroy_descriptor_set_layout(cp.dset_layout, None);
                 self.device.destroy_shader_module(cp.module, None);
             }
-            let pool = self.desc_pool.lock().unwrap().0;
-            if pool != vk::DescriptorPool::null() {
-                self.device.destroy_descriptor_pool(pool, None);
+            for (pool, _) in self.desc_pool.lock().unwrap().iter() {
+                if *pool != vk::DescriptorPool::null() {
+                    self.device.destroy_descriptor_pool(*pool, None);
+                }
             }
             for (_, img) in self.images.lock().unwrap().drain() {
                 if let Some(h) = img.image { self.device.destroy_image(h, None); }
                 if let Some(m) = img.memory { self.device.free_memory(m, None); }
             }
             for (_, b) in self.buffers.lock().unwrap().drain() {
+                if let Some(r) = b.ring { self.device.unmap_memory(r.memory); self.device.destroy_buffer(r.buffer, None); self.device.free_memory(r.memory, None); }
                 self.device.unmap_memory(b.memory);
                 self.device.destroy_buffer(b.buffer, None);
                 self.device.free_memory(b.memory, None);
@@ -2263,10 +2301,7 @@ impl Backend for MoltenVkBackend {
 
     fn image_destroyed(&self, image_id: ResourceId) {
         if let Some(img) = self.images.lock().unwrap().remove(&image_id.raw()) {
-            unsafe {
-                if let Some(h) = img.image { self.device.destroy_image(h, None); }
-                if let Some(m) = img.memory { self.device.free_memory(m, None); }
-            }
+            if let (Some(h), Some(m)) = (img.image, img.memory) { self.defer(Grave::Image(h, m)); }
         }
     }
 
@@ -2305,17 +2340,17 @@ impl Backend for MoltenVkBackend {
             self.device.map_memory(memory, 0, req.size, vk::MemoryMapFlags::empty())
         }.map(|p| p as *mut u8).unwrap_or(std::ptr::null_mut());
         self.buffers.lock().unwrap().insert(buffer_id.raw(), MvkBuffer {
-            size, buffer, memory, mapped,
+            size, buffer, memory, mapped, ring: None,
         });
     }
 
     fn buffer_destroyed(&self, buffer_id: ResourceId) {
         if let Some(b) = self.buffers.lock().unwrap().remove(&buffer_id.raw()) {
-            unsafe {
-                self.device.unmap_memory(b.memory);
-                self.device.destroy_buffer(b.buffer, None);
-                self.device.free_memory(b.memory, None);
-            }
+            // A frame in flight may still read it: freed when it completes.
+            let mut v = vec![(b.buffer, b.memory)];
+            unsafe { self.device.unmap_memory(b.memory); }
+            if let Some(r) = b.ring { unsafe { self.device.unmap_memory(r.memory); } v.push((r.buffer, r.memory)); }
+            self.defer(Grave::Buffers(v));
         }
     }
 
@@ -2385,9 +2420,16 @@ impl MoltenVkBackend {
     /// Record + submit one frame's clear/copy ops. Errors are returned
     /// (logged by the caller); the frame is still "consumed".
     fn record_and_submit(&self, frame_buf: &[u8]) -> Result<(), vk::Result> {
-        // The previous frame (async mode) must be complete before this one
-        // resets the descriptor pool, the query pool and per-frame buffers.
-        self.wait_pending()?;
+        // Two frames in flight: the frame two back must be complete before
+        // this one reuses its slot (descriptor pool, query range) and the
+        // ring buffers' side it read; the previous frame keeps running.
+        self.settle(1)?;
+        let seq = self.frame_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let slot = (seq % 2) as usize;
+        let q0 = slot as u32 * (2 + DISPATCH_STAMPS);
+        // Ring buffers: the side this frame binds takes the other side's
+        // content where no write has done so since the flip.
+        for b in self.buffers.lock().unwrap().values_mut() { if b.ring.is_some() { b.sync_ring(); } }
         let t_rec = std::time::Instant::now();
         let dev = &self.device;
         let alloc = vk::CommandBufferAllocateInfo::default()
@@ -2406,9 +2448,9 @@ impl MoltenVkBackend {
         let mut n_stamped = 0u32;
         if timing {
             unsafe {
-                dev.cmd_reset_query_pool(cb, self.query_pool, 0, 2 + DISPATCH_STAMPS);
+                dev.cmd_reset_query_pool(cb, self.query_pool, q0, 2 + DISPATCH_STAMPS);
                 dev.cmd_write_timestamp(
-                    cb, vk::PipelineStageFlags::TOP_OF_PIPE, self.query_pool, 0);
+                    cb, vk::PipelineStageFlags::TOP_OF_PIPE, self.query_pool, q0);
             }
         }
 
@@ -2421,14 +2463,15 @@ impl MoltenVkBackend {
             for (key, a) in accels.iter_mut() {
                 if !a.inline_refit { continue; }
                 a.inline_refit = false;
-                if a.tlas_pending.is_some() || a.tlas_retired.is_some() || a.inst_shadow.is_empty() { continue; }
+                if a.tlas_pending.is_some() || a.inst_shadow.is_empty() { continue; }
                 let src = a.tlas;
-                let spare = a.tlas_spare.take();
+                let spare = a.tlas_spares.pop();
                 match unsafe { self.submit_tlas_build(asd, &a.inst_shadow, a.inst_gen, &a.inst_log, spare, false, Some(src), Some(cb)) } {
                     Ok((tlas, owned, _, _)) => {
                         let old_owned = std::mem::replace(&mut a.tlas_owned, Some(owned));
                         a.tlas = tlas;
-                        if let Some(o) = old_owned { a.tlas_retired = Some((src, o)); retire.push(*key); }
+                        // The source is read by THIS frame (and any older one): it retires when this frame completes.
+                        if let Some(o) = old_owned { a.tlas_retired.push((seq, src, o)); retire.push(*key); }
                         Self::compact_inst_log(a);
                     }
                     Err(e) => log::warn!("in-frame TLAS refit: {e}"),
@@ -2465,7 +2508,8 @@ impl MoltenVkBackend {
             n.max(64)
         };
         let desc_pool = {
-            let mut pool = self.desc_pool.lock().unwrap();
+            let mut pools = self.desc_pool.lock().unwrap();
+            let pool = &mut pools[slot];
             if n_dispatch > pool.1 && pool.0 != vk::DescriptorPool::null() {
                 unsafe { dev.destroy_descriptor_pool(pool.0, None) };
                 // Storage buffers for every binding; plus acceleration-structure
@@ -2706,7 +2750,7 @@ impl MoltenVkBackend {
                         .iter()
                         .filter_map(|(binding, buf_id)| {
                             buffers.get(buf_id).map(|b|
-                                (*binding, b.buffer, b.size))
+                                (*binding, b.bound(), b.size))
                         })
                         .collect();
                     let infos: Vec<vk::DescriptorBufferInfo> = resolved
@@ -2777,7 +2821,7 @@ impl MoltenVkBackend {
                         // Per-dispatch GPU time: a stamp after each dispatch.
                         if timing && n_stamped < DISPATCH_STAMPS {
                             dev.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                                self.query_pool, 2 + n_stamped);
+                                self.query_pool, q0 + 2 + n_stamped);
                             n_stamped += 1;
                         }
                         // Make the writes visible to any chained compute
@@ -2857,7 +2901,7 @@ impl MoltenVkBackend {
         if timing {
             unsafe {
                 dev.cmd_write_timestamp(
-                    cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.query_pool, 1);
+                    cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.query_pool, q0 + 1);
             }
         }
         unsafe { dev.end_command_buffer(cb)?; }
@@ -2900,19 +2944,114 @@ impl MoltenVkBackend {
                 *a = ([0.0; 4], 0);
             }
         }
-        let p = Pending { fence, cb, retire, trash, timing, n_stamped };
+        let _ = &retire;
+        // Ring buffers flip: the next frame binds and the CPU writes the other side.
+        for b in self.buffers.lock().unwrap().values_mut() { if let Some(r) = b.ring.as_mut() { r.side ^= 1; r.dirty = true; } }
+        let graveyard = std::mem::take(&mut *self.graveyard.lock().unwrap());
+        let p = Pending { fence, cb, slot, seq, graveyard, trash, timing, n_stamped };
         if self.async_frames.load(Ordering::Relaxed) {
-            *self.pending.lock().unwrap() = Some(p);
+            self.pending.lock().unwrap().push_back(p);
             return Ok(());
         }
         self.finish(p)
     }
 
-    /// Wait for the frame submitted in async mode (no-op when none), read its
-    /// GPU timestamps and free its transient objects.
-    pub fn wait_pending(&self) -> Result<(), vk::Result> {
-        let p = self.pending.lock().unwrap().take();
-        match p { Some(p) => self.finish(p), None => Ok(()) }
+    /// Wait for every frame submitted in async mode (no-op when none), read
+    /// their GPU timestamps and free their transient objects.
+    pub fn wait_pending(&self) -> Result<(), vk::Result> { self.settle(0) }
+
+    /// Finish the oldest frames in flight until at most `max_in_flight`
+    /// remain: 1 before recording the next frame or writing a ring buffer
+    /// (the frame two back is done, its slot and its ring side are free),
+    /// 0 before a read or a write to a buffer the in-flight frame may use.
+    pub fn settle(&self, max_in_flight: usize) -> Result<(), vk::Result> {
+        // AQUEDUCT_FRAMES_IN_FLIGHT=1 serialises the frames again (the A/B for the overlap).
+        static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let cap = *CAP.get_or_init(|| std::env::var("AQUEDUCT_FRAMES_IN_FLIGHT").ok().and_then(|v| v.parse().ok()).unwrap_or(2usize).clamp(1, 2));
+        let max_in_flight = max_in_flight.min(cap - 1);
+        loop {
+            let p = { let mut q = self.pending.lock().unwrap(); if q.len() <= max_in_flight { return Ok(()); } q.pop_front() };
+            match p { Some(p) => self.finish(p)?, None => return Ok(()) }
+        }
+    }
+
+    /// Destroy `g` once every frame now in flight has completed; at once when none is.
+    fn defer(&self, g: Grave) {
+        let mut q = self.pending.lock().unwrap();
+        match q.back_mut() {
+            Some(back) => back.graveyard.push(g),
+            None => unsafe {
+                match g {
+                    Grave::Accel(h) => { if let Some(asd) = self.as_device.as_ref() { asd.destroy_acceleration_structure(h, None); } }
+                    Grave::Buffers(v) => self.free_buffers(v),
+                    Grave::Image(i, m) => { self.device.destroy_image(i, None); self.device.free_memory(m, None); }
+                }
+            },
+        }
+    }
+
+    /// A scene's replaced TLAS (`old`, may be null) and its buffers retire
+    /// with the newest frame in flight (a frame may still read them); with
+    /// none in flight the buffers are spares at once.
+    fn retire_bufs(&self, a: &mut MvkAccel, old: vk::AccelerationStructureKHR, bufs: TlasBufs) {
+        let newest = self.pending.lock().unwrap().back().map(|p| p.seq);
+        match newest {
+            Some(seq) => a.tlas_retired.push((seq, old, bufs)),
+            None => {
+                if old != vk::AccelerationStructureKHR::null() { if let Some(asd) = self.as_device.as_ref() { unsafe { asd.destroy_acceleration_structure(old, None); } } }
+                a.tlas_spares.push(bufs);
+                while a.tlas_spares.len() > 2 { let s = a.tlas_spares.remove(0); unsafe { self.free_buffers(s.pairs().to_vec()); } }
+            }
+        }
+    }
+
+    /// Make `buffer_id` a per-frame ring buffer: a second backing buffer, so
+    /// the CPU writes the side the next frame binds while the frame in
+    /// flight reads the other, and `buffer_write` never waits for the GPU
+    /// (only for the frame two back). For buffers the host rewrites every
+    /// frame and the device only reads (params, light tiles, mover state);
+    /// a sparse write reaches the other side at the next flip, when the
+    /// write side is brought up to date from it first.
+    pub fn buffer_ring(&self, buffer_id: ResourceId) -> Result<(), String> { self.buffer_ring_with(buffer_id, false) }
+
+    /// A ring buffer the DEVICE writes each frame (adaptation statistics):
+    /// the CPU reads the frame-two-back's side with `buffer_read_ring`
+    /// without waiting for the frame in flight; no host-side sync.
+    pub fn buffer_ring_device(&self, buffer_id: ResourceId) -> Result<(), String> { self.buffer_ring_with(buffer_id, true) }
+
+    fn buffer_ring_with(&self, buffer_id: ResourceId, device_written: bool) -> Result<(), String> {
+        self.settle(0).map_err(|e| format!("frame wait: {e:?}"))?;
+        let mut buffers = self.buffers.lock().unwrap();
+        let b = buffers.get_mut(&buffer_id.raw()).ok_or_else(|| format!("buffer {buffer_id} not registered"))?;
+        if b.ring.is_some() { return Ok(()); }
+        let info = vk::BufferCreateInfo::default().size(b.size)
+            .usage(vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::STORAGE_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe { self.device.create_buffer(&info, None) }.map_err(|e| format!("ring create: {e:?}"))?;
+        let req = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+        let mt = self.mem_type(req.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT).ok_or("ring: no host-visible memory")?;
+        let memory = unsafe { self.device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(mt), None) }.map_err(|e| format!("ring alloc: {e:?}"))?;
+        unsafe { self.device.bind_buffer_memory(buffer, memory, 0).map_err(|e| format!("ring bind: {e:?}"))?; }
+        let mapped = unsafe { self.device.map_memory(memory, 0, req.size, vk::MemoryMapFlags::empty()) }.map(|p| p as *mut u8).map_err(|e| format!("ring map: {e:?}"))?;
+        if !b.mapped.is_null() { unsafe { std::ptr::copy_nonoverlapping(b.mapped, mapped, b.size as usize); } }
+        b.ring = Some(RingSide { buffer, memory, mapped, side: 0, dirty: false, device_written });
+        Ok(())
+    }
+
+    /// Read a ring buffer's side the frame two back wrote (the side the
+    /// next frame binds): waits for that frame only, never for the one in flight.
+    pub fn buffer_read_ring(&self, buffer_id: ResourceId, offset: u64, size: u64) -> Result<Vec<u8>, String> {
+        self.settle(1).map_err(|e| format!("frame wait: {e:?}"))?;
+        let buffers = self.buffers.lock().unwrap();
+        let b = buffers.get(&buffer_id.raw()).ok_or_else(|| format!("buffer {buffer_id} not registered"))?;
+        if b.ring.is_none() { drop(buffers); return self.buffer_read_bytes(buffer_id, offset, size); }
+        let end = offset.checked_add(size).ok_or("offset+size overflow")?;
+        if end > b.size { return Err(format!("read end {end} exceeds buffer size {}", b.size)); }
+        let src = b.write_ptr();
+        if src.is_null() { return Err("buffer memory not mapped".into()); }
+        let mut out = vec![0u8; size as usize];
+        unsafe { std::ptr::copy_nonoverlapping(src.add(offset as usize), out.as_mut_ptr(), size as usize); }
+        Ok(out)
     }
 
     /// Async frames: `submit_frame` returns once the frame is submitted, and
@@ -2941,7 +3080,7 @@ impl MoltenVkBackend {
             let mut ts = vec![0u64; 2 + p.n_stamped as usize];
             let got = unsafe {
                 dev.get_query_pool_results(
-                    self.query_pool, 0, &mut ts, vk::QueryResultFlags::TYPE_64)
+                    self.query_pool, p.slot as u32 * (2 + DISPATCH_STAMPS), &mut ts, vk::QueryResultFlags::TYPE_64)
             };
             if got.is_ok() {
                 let period = self.timestamp_period_ns as f64;
@@ -2968,16 +3107,31 @@ impl MoltenVkBackend {
             dev.destroy_fence(p.fence, None);
             dev.free_command_buffers(self.cmd_pool, &[p.cb]);
         }
-        // TLASes an in-frame refit replaced: destroyed now, their buffers the
-        // scene's next spare set.
-        if !p.retire.is_empty() {
+        // TLASes a refit or swap replaced, retired with this frame or an older
+        // one: destroyed now, their buffers the scene's spares (two kept).
+        {
             let mut accels = self.accels.lock().unwrap();
-            for key in p.retire {
-                let Some(a) = accels.get_mut(&key) else { continue };
-                let Some((old, bufs)) = a.tlas_retired.take() else { continue };
-                if let Some(asd) = self.as_device.as_ref() { unsafe { asd.destroy_acceleration_structure(old, None); } }
-                if let Some(s) = a.tlas_spare.replace(bufs) { unsafe { self.free_buffers(s.pairs().to_vec()); } }
+            for a in accels.values_mut() {
+                if a.tlas_retired.is_empty() { continue; }
+                let mut keep = Vec::new();
+                for (seq, old, bufs) in a.tlas_retired.drain(..) {
+                    if seq > p.seq { keep.push((seq, old, bufs)); continue; }
+                    if old != vk::AccelerationStructureKHR::null() { if let Some(asd) = self.as_device.as_ref() { unsafe { asd.destroy_acceleration_structure(old, None); } } }
+                    a.tlas_spares.push(bufs);
+                    while a.tlas_spares.len() > 2 { let s = a.tlas_spares.remove(0); unsafe { self.free_buffers(s.pairs().to_vec()); } }
+                }
+                a.tlas_retired = keep;
                 Self::compact_inst_log(a);
+            }
+        }
+        // Objects deferred while this frame (or an older one) was in flight.
+        for g in p.graveyard {
+            unsafe {
+                match g {
+                    Grave::Accel(h) => { if let Some(asd) = self.as_device.as_ref() { asd.destroy_acceleration_structure(h, None); } }
+                    Grave::Buffers(v) => self.free_buffers(v),
+                    Grave::Image(i, m) => { dev.destroy_image(i, None); dev.free_memory(m, None); }
+                }
             }
         }
         res
