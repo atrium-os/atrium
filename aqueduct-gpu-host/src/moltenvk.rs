@@ -140,6 +140,10 @@ struct MvkAccel {
     /// Refit this scene's TLAS at the start of the next frame's command
     /// buffer (`refit_scene_tlas_inline`).
     inline_refit: bool,
+    /// A full build (not a refit) of this scene's TLAS inside the next frame's
+    /// command buffer: for an instance array whose COUNT changed since the last
+    /// build (a refit over a different count is invalid).
+    inline_build: bool,
     /// TLASes a refit or swap replaced and their buffers, each with the
     /// sequence number of the newest frame that may read it; back as spares
     /// when that frame completes. Kept HERE so the change-log compaction
@@ -1136,7 +1140,7 @@ impl MoltenVkBackend {
         let stats = unsafe { self.build_blases(asd, blases, scratch_align, &mut owned_all, &mut transient, &mut blas_handles, &mut blas_addrs, None, import_host)? };
         // Synchronous builds: the inputs are done with once build_blases returns.
         unsafe { self.free_buffers(transient) };
-        let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: blas_handles, blas_addrs, owned: owned_all, tlas_owned: None, tlas_spares: Vec::new(), pending: Vec::new(), inline_refit: false, tlas_retired: Vec::new(), free_slots: Vec::new(), tlas_pending: None, inst_shadow: Vec::new(), inst_log: Vec::new(), inst_gen: 0 };
+        let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: blas_handles, blas_addrs, owned: owned_all, tlas_owned: None, tlas_spares: Vec::new(), pending: Vec::new(), inline_refit: false, inline_build: false, tlas_retired: Vec::new(), free_slots: Vec::new(), tlas_pending: None, inst_shadow: Vec::new(), inst_log: Vec::new(), inst_gen: 0 };
         self.accels.lock().unwrap().insert(tlas_id.raw(), accel);
         eprintln!("build_scene_tlas: {stats}");
         self.rebuild_scene_tlas(tlas_id, instances)
@@ -1417,7 +1421,7 @@ impl MoltenVkBackend {
             accels.get(&scene.raw()).ok_or_else(|| format!("scene {scene} not built"))?.blas_addrs.clone()
         };
         let accel = MvkAccel { tlas: vk::AccelerationStructureKHR::null(), blases: Vec::new(), blas_addrs, owned: Vec::new(),
-                               tlas_owned: None, tlas_spares: Vec::new(), pending: Vec::new(), inline_refit: false, tlas_retired: Vec::new(), free_slots: Vec::new(), tlas_pending: None,
+                               tlas_owned: None, tlas_spares: Vec::new(), pending: Vec::new(), inline_refit: false, inline_build: false, tlas_retired: Vec::new(), free_slots: Vec::new(), tlas_pending: None,
                                inst_shadow: Vec::new(), inst_log: Vec::new(), inst_gen: 0 };
         self.accels.lock().unwrap().insert(view.raw(), accel);
         self.rebuild_scene_tlas(view, instances)
@@ -1474,8 +1478,11 @@ impl MoltenVkBackend {
     fn encode_instance(dst: &mut [u8], inst: &SceneInstance, blas_addrs: &[u64]) {
         // transform: 12 f32 row-major 3x4
         for (k, v) in inst.transform.iter().enumerate() { dst[k * 4..k * 4 + 4].copy_from_slice(&v.to_le_bytes()); }
-        // instanceCustomIndex(24) | mask(8): the caller's high byte, 0 = 0xFF
-        let mask = match inst.custom_index >> 24 { 0 => 0xFF, m => m };
+        // instanceCustomIndex(24) | mask(8): the caller's high byte, 0 = 0xFF,
+        // 0xFF = mask 0 — an instance no ray ever hits (a hidden object kept
+        // in place: its tiny box stays spatially coherent with the live ones,
+        // where a box parked far away degraded the BVH for every ray).
+        let mask = match inst.custom_index >> 24 { 0 => 0xFF, 0xFF => 0, m => m };
         dst[48..52].copy_from_slice(&((inst.custom_index & 0xFFFFFF) | (mask << 24)).to_le_bytes());
         // sbtOffset(24)=0 | flags(8)=0
         dst[52..56].copy_from_slice(&0u32.to_le_bytes());
@@ -1584,6 +1591,18 @@ impl MoltenVkBackend {
         let a = accels.get_mut(&tlas_id.raw()).ok_or_else(|| format!("scene {tlas_id} not built"))?;
         if a.tlas_pending.is_some() || a.tlas == vk::AccelerationStructureKHR::null() { return Ok(false); }
         a.inline_refit = true;
+        Ok(true)
+    }
+
+    /// Build scene `tlas_id`'s TLAS INSIDE the next frame's command buffer
+    /// over the current instance array, whatever its count (the per-frame
+    /// path for a scene whose instance count changes: the movers' TLAS
+    /// holds exactly the live cars). Same swap and retire as the inline refit.
+    pub fn rebuild_scene_tlas_inline(&self, tlas_id: ResourceId) -> Result<bool, String> {
+        let mut accels = self.accels.lock().unwrap();
+        let a = accels.get_mut(&tlas_id.raw()).ok_or_else(|| format!("scene {tlas_id} not built"))?;
+        if a.tlas_pending.is_some() { return Ok(false); }
+        a.inline_build = true;
         Ok(true)
     }
 
@@ -2499,12 +2518,15 @@ impl MoltenVkBackend {
         if let Some(asd) = self.as_device.as_ref() {
             let mut accels = self.accels.lock().unwrap();
             for (key, a) in accels.iter_mut() {
-                if !a.inline_refit { continue; }
-                a.inline_refit = false;
+                if !a.inline_refit && !a.inline_build { continue; }
+                let full = a.inline_build;
+                a.inline_refit = false; a.inline_build = false;
                 if a.tlas_pending.is_some() || a.inst_shadow.is_empty() { continue; }
                 let src = a.tlas;
                 let spare = a.tlas_spares.pop();
-                match unsafe { self.submit_tlas_build(asd, &a.inst_shadow, a.inst_gen, &a.inst_log, spare, false, Some(src), Some(cb)) } {
+                // A full build ignores the source (its count may differ); the old TLAS still retires with this frame.
+                let refit_src = if full || src == vk::AccelerationStructureKHR::null() { None } else { Some(src) };
+                match unsafe { self.submit_tlas_build(asd, &a.inst_shadow, a.inst_gen, &a.inst_log, spare, false, refit_src, Some(cb)) } {
                     Ok((tlas, owned, _, _)) => {
                         let old_owned = std::mem::replace(&mut a.tlas_owned, Some(owned));
                         a.tlas = tlas;
