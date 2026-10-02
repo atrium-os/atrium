@@ -224,6 +224,63 @@ static FRAMES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(2);
 /// The instance mask written FORCE_NO_OPAQUE (`set_nonopaque_instance_mask`).
 static NONOPAQUE_MASK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+/// MoltenVK's `vkSetWorkgroupSizeMVK` (its own export).
+type SetWorkgroupSizeMvk = extern "C" fn(vk::ShaderModule, u32, u32, u32);
+
+/// A symbol of the libMoltenVK image this process has loaded (the Vulkan
+/// loader opens the ICD privately, so it is not in the global namespace):
+/// the image found by name among the loaded ones, reopened NOLOAD.
+fn moltenvk_symbol(name: &std::ffi::CStr) -> Option<*mut std::ffi::c_void> {
+    extern "C" {
+        fn _dyld_image_count() -> u32;
+        fn _dyld_get_image_name(i: u32) -> *const std::ffi::c_char;
+        fn dlopen(p: *const std::ffi::c_char, m: i32) -> *mut std::ffi::c_void;
+        fn dlsym(h: *mut std::ffi::c_void, s: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+    }
+    const RTLD_LAZY: i32 = 1;
+    const RTLD_NOLOAD: i32 = 0x10;
+    unsafe {
+        for i in 0.._dyld_image_count() {
+            let n = _dyld_get_image_name(i);
+            if n.is_null() { continue; }
+            if std::ffi::CStr::from_ptr(n).to_bytes().ends_with(b"libMoltenVK.dylib") {
+                let h = dlopen(n, RTLD_LAZY | RTLD_NOLOAD);
+                if h.is_null() { return None; }
+                let f = dlsym(h, name.as_ptr());
+                return (!f.is_null()).then_some(f);
+            }
+        }
+    }
+    None
+}
+
+/// Native kernels (`set_native_kernels`, before `new`).
+static NATIVE_KERNELS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// An MSL compute kernel for MoltenVK's direct-MSL path
+/// ([`MoltenVkBackend::create_compute_pipeline_msl`]): entry `main0`, the
+/// push constants at `[[buffer(0)]]` and binding b at `[[buffer(b + 1)]]`
+/// (MoltenVK's discrete binding for aqueduct's layouts), `threads` the
+/// threadgroup size (its [numthreads]).
+#[derive(Clone, Copy, Debug)]
+pub struct MslKernel<'a> {
+    /// The kernel: MSL source, or a library compiled from it (`metallib`,
+    /// with the caller's compile options — e.g. fast maths for one kernel).
+    pub code: MslCode<'a>,
+    /// The threadgroup size (x, y, z).
+    pub threads: [u32; 3],
+}
+
+/// [`MslKernel`] code: source (MoltenVK compiles it at pipeline creation with
+/// its own options) or a compiled Metal library.
+#[derive(Clone, Copy, Debug)]
+pub enum MslCode<'a> {
+    /// MSL source text.
+    Source(&'a str),
+    /// A `.metallib` (xcrun metal + metallib).
+    Library(&'a [u8]),
+}
+
 /// One TLAS instance for [`MoltenVkBackend::build_scene_tlas`]: which BLAS
 /// it instances, its 24-bit custom index (readable in the kernel as the
 /// ray query's committed instance ID — e.g. an attribute-table base), and a
@@ -436,6 +493,13 @@ pub struct MoltenVkBackend {
     /// Whether VK_KHR_acceleration_structure + VK_KHR_ray_query were enabled at
     /// device creation (HW ray-tracing for the instanced-mesh path available).
     ray_query: bool,
+    /// Native kernels are on (`set_native_kernels`, MoltenVK, discrete
+    /// binding): MoltenVK's workgroup-size setter for MSL modules.
+    native_wg: Option<SetWorkgroupSizeMvk>,
+    /// A 64-byte buffer copied within after each timed dispatch when native
+    /// kernels are on (`record`): it ends MoltenVK's compute encoder, where
+    /// its deferred timestamps land (lazily created).
+    timing_break: Mutex<Option<(vk::Buffer, vk::DeviceMemory)>>,
     /// VK_KHR_acceleration_structure device function loader (BLAS/TLAS build +
     /// device-address queries). `Some` iff `ray_query`.
     as_device: Option<khr::acceleration_structure::Device>,
@@ -1053,15 +1117,38 @@ impl MoltenVkBackend {
             extension_ptrs.push(ash::ext::metal_surface::NAME.as_ptr());
         }
 
+        // Native kernels (set_native_kernels): MoltenVK's discrete binding
+        // (no Metal argument buffers), so an MSL kernel's [[buffer(n)]] slots
+        // are fixed — push constants at 0, binding b at b + 1 for aqueduct's
+        // layouts (set 0 of bindings 0..n-1, one push range). Requested per
+        // instance through VK_EXT_layer_settings, MoltenVK's configuration
+        // extension; other drivers never see it. Measured on the M4 Max: no
+        // slower than argument buffers (orbis docs/METAL-BACKEND.md).
+        let want_native = NATIVE_KERNELS.load(Ordering::Relaxed);
+        let ls_ok = want_native && has_inst(ash::ext::layer_settings::NAME);
+        if want_native && !ls_ok {
+            eprintln!("aqueduct: native kernels requested, but the instance has no VK_EXT_layer_settings: SPIR-V kernels only");
+        }
+        if ls_ok { extension_ptrs.push(ash::ext::layer_settings::NAME.as_ptr()); }
+        let no_argbuf = 0u32.to_le_bytes();
+        let mut ls_setting = [vk::LayerSettingEXT::default()
+            .layer_name(c"MoltenVK")
+            .setting_name(c"MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS")
+            .ty(vk::LayerSettingTypeEXT::UINT32)
+            .values(&no_argbuf)];
+        ls_setting[0].value_count = 1;   // `values` counts bytes
+        let mut ls_info = vk::LayerSettingsCreateInfoEXT::default().settings(&ls_setting);
+
         let mut create_flags = vk::InstanceCreateFlags::empty();
         // The constant only exists when the portability extension is
         // present; ash exposes it unconditionally so we set it.
         create_flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
 
-        let create_info = vk::InstanceCreateInfo::default()
+        let mut create_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .flags(create_flags)
             .enabled_extension_names(&extension_ptrs);
+        if ls_ok { create_info = create_info.push_next(&mut ls_info); }
 
         // SAFETY: structs are all stack-built with correct lifetimes.
         let instance = unsafe { entry.create_instance(&create_info, None)? };
@@ -1103,6 +1190,24 @@ impl MoltenVkBackend {
                     "no graphics+transfer queue family on any device".into(),
                 )
             })?;
+
+        // Native kernels need MoltenVK itself (the driver, not just the
+        // setting) and its vkSetWorkgroupSizeMVK: an MSL module carries no
+        // workgroup size. The function is MoltenVK's own export, not a Vulkan
+        // entry point, so it is looked up in the loaded libMoltenVK image.
+        let set_wg = if ls_ok {
+            let mut drv = vk::PhysicalDeviceDriverProperties::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut drv);
+            unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
+            if drv.driver_id != vk::DriverId::MOLTENVK {
+                eprintln!("aqueduct: native kernels: the driver is not MoltenVK ({:?}): SPIR-V kernels only", drv.driver_id);
+                None
+            } else {
+                let f = moltenvk_symbol(c"vkSetWorkgroupSizeMVK");
+                if f.is_none() { eprintln!("aqueduct: native kernels: vkSetWorkgroupSizeMVK not found in the loaded MoltenVK: SPIR-V kernels only"); }
+                f.map(|p| unsafe { std::mem::transmute::<*mut std::ffi::c_void, SetWorkgroupSizeMvk>(p) })
+            }
+        } else { None };
 
         // ── Create logical device ─────────────────────────────────
         let priorities = [1.0_f32];
@@ -1423,6 +1528,8 @@ impl MoltenVkBackend {
             last_dispatch_ns: Mutex::new(Vec::new()),
             total_gpu_ns: AtomicU64::new(0),
             ray_query,
+            native_wg: set_wg,
+            timing_break: Mutex::new(None),
             as_device,
             host_import,
             host_page,
@@ -2400,6 +2507,45 @@ impl MoltenVkBackend {
         push_size: u32,
         as_bindings: &[u32],
     ) -> Result<(), String> {
+        self.create_compute_pipeline_msl(pipeline_id, cs_spirv, None, ssbo_count, push_size, as_bindings)
+    }
+
+    /// The 64-byte buffer of the per-dispatch encoder break (native kernels
+    /// only; created on first use).
+    fn timing_break_buffer(&self) -> Option<vk::Buffer> {
+        self.native_wg?;
+        let mut g = self.timing_break.lock().ok()?;
+        if g.is_none() {
+            match unsafe { self.make_as_buffer(64, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST, false) } {
+                Ok((b, m, _)) => *g = Some((b, m)),
+                Err(e) => { eprintln!("aqueduct: timing break buffer: {e}"); return None; }
+            }
+        }
+        g.map(|(b, _)| b)
+    }
+
+    /// Native kernels: on before [`new`](Self::new), compute pipelines given
+    /// an [`MslKernel`] use it on MoltenVK (its direct-MSL path) instead of
+    /// translating their SPIR-V; any other driver, or MoltenVK without the
+    /// layer-settings extension, takes the SPIR-V (printed once at start).
+    /// Turns MoltenVK's argument buffers off for the instance.
+    pub fn set_native_kernels(on: bool) { NATIVE_KERNELS.store(on, Ordering::Relaxed); }
+
+    /// True when MSL kernels are in use (native kernels on, on MoltenVK).
+    pub fn native_kernels(&self) -> bool { self.native_wg.is_some() }
+
+    /// Like [`create_compute_pipeline_rt`](Self::create_compute_pipeline_rt),
+    /// with the kernel's MSL for MoltenVK when native kernels are on (the
+    /// SPIR-V is used otherwise and must be the same kernel).
+    pub fn create_compute_pipeline_msl(
+        &self,
+        pipeline_id: ResourceId,
+        cs_spirv: &[u8],
+        msl_kernel: Option<MslKernel>,
+        ssbo_count: u32,
+        push_size: u32,
+        as_bindings: &[u32],
+    ) -> Result<(), String> {
         if cs_spirv.len() % 4 != 0 {
             return Err("SPIR-V length not word-aligned".into());
         }
@@ -2407,41 +2553,50 @@ impl MoltenVkBackend {
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         let dev = &self.device;
-        // AQUEDUCT_MSL_OVERRIDE=<a.spv>=<b.metal>[;…] — the native-Metal spike
-        // (orbis docs/METAL-BACKEND.md): a compute pipeline whose SPIR-V equals
-        // a.spv gets b.metal instead (MSL source, kernel `main0`, Metal slots as
-        // MoltenVK assigns them with MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0),
-        // through MoltenVK's direct-MSL path; threadgroup size from
-        // AQUEDUCT_MSL_TG (default 8,8,1). Diagnostic only.
-        let msl: Option<Vec<u32>> = std::env::var("AQUEDUCT_MSL_OVERRIDE").ok().and_then(|spec| {
+        // The MSL, when native kernels are on: the caller's, or for A/Bs
+        // AQUEDUCT_MSL_OVERRIDE=<a.spv>=<b.metal>[;…] (a pipeline whose SPIR-V
+        // equals a.spv gets b.metal; threadgroup size AQUEDUCT_MSL_TG, default
+        // 8,8,1). MoltenVK's direct-MSL path: the magic word 0x19960412, then
+        // the source, NUL-terminated.
+        let override_src: Option<(Vec<u8>, [u32; 3])> = std::env::var("AQUEDUCT_MSL_OVERRIDE").ok().and_then(|spec| {
             spec.split(';').find_map(|pair| {
                 let (spv, metal) = pair.split_once('=')?;
                 (std::fs::read(spv).ok()? == cs_spirv).then(|| std::fs::read(metal).ok()).flatten()
             })
         }).map(|src| {
-            let mut bytes = 0x1996_0412u32.to_le_bytes().to_vec();
-            bytes.extend_from_slice(&src);
-            bytes.push(0);
+            let tg: Vec<u32> = std::env::var("AQUEDUCT_MSL_TG").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).filter(|v: &Vec<u32>| v.len() == 3).unwrap_or(vec![8, 8, 1]);
+            (src, [tg[0], tg[1], tg[2]])
+        });
+        if override_src.is_some() && self.native_wg.is_none() {
+            return Err("AQUEDUCT_MSL_OVERRIDE needs native kernels (MoltenVkBackend::set_native_kernels before new; MoltenVK with VK_EXT_layer_settings)".into());
+        }
+        // (bytes, is source, threads); MoltenVK's magic words: 0x19960412
+        // source (NUL-terminated), 0x19981215 a compiled library.
+        let native: Option<(&[u8], bool, [u32; 3])> = match (&override_src, msl_kernel) {
+            (Some((src, tg)), _) => Some((src.as_slice(), true, *tg)),
+            (None, Some(k)) if self.native_wg.is_some() => Some(match k.code {
+                MslCode::Source(t) => (t.as_bytes(), true, k.threads),
+                MslCode::Library(b) => (b, false, k.threads),
+            }),
+            _ => None,
+        };
+        let msl: Option<Vec<u32>> = native.map(|(code, is_src, _)| {
+            let magic: u32 = if is_src { 0x1996_0412 } else { 0x1998_1215 };
+            let mut bytes = magic.to_le_bytes().to_vec();
+            bytes.extend_from_slice(code);
+            if is_src { bytes.push(0); }
             while bytes.len() % 4 != 0 { bytes.push(0); }
-            eprintln!("aqueduct: MSL override for a {}-byte SPIR-V module ({} bytes of MSL)", cs_spirv.len(), src.len());
             bytes.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()
         });
+        if override_src.is_some() {
+            eprintln!("aqueduct: MSL override for a {}-byte SPIR-V module", cs_spirv.len());
+        }
         let words = msl.as_ref().unwrap_or(&words);
         unsafe {
             let module = dev.create_shader_module(
                 &vk::ShaderModuleCreateInfo::default().code(words), None)
                 .map_err(|e| format!("shader module: {e:?}"))?;
-            if msl.is_some() {
-                extern "C" { fn dlopen(p: *const std::ffi::c_char, m: i32) -> *mut std::ffi::c_void; fn dlsym(h: *mut std::ffi::c_void, s: *const std::ffi::c_char) -> *mut std::ffi::c_void; }
-                const RTLD_LAZY: i32 = 1; const RTLD_NOLOAD: i32 = 0x10;
-                let lib = std::env::var("VK_DRIVER_FILES").ok()
-                    .and_then(|j| std::path::Path::new(&j).parent().map(|d| d.join("libMoltenVK.dylib")))
-                    .map(|p| std::ffi::CString::new(p.to_string_lossy().as_bytes()).unwrap());
-                let h = lib.map_or(std::ptr::null_mut(), |p| dlopen(p.as_ptr(), RTLD_LAZY | RTLD_NOLOAD));
-                let f = if h.is_null() { std::ptr::null_mut() } else { dlsym(h, c"vkSetWorkgroupSizeMVK".as_ptr()) };
-                if f.is_null() { return Err("MSL override: vkSetWorkgroupSizeMVK not found (set VK_DRIVER_FILES to the MoltenVK ICD)".into()); }
-                let tg: Vec<u32> = std::env::var("AQUEDUCT_MSL_TG").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).filter(|v: &Vec<u32>| v.len() == 3).unwrap_or(vec![8, 8, 1]);
-                let set: extern "C" fn(vk::ShaderModule, u32, u32, u32) = std::mem::transmute(f);
+            if let (Some((_, _, tg)), Some(set)) = (native, self.native_wg) {
                 set(module, tg[0], tg[1], tg[2]);
             }
             let bindings: Vec<vk::DescriptorSetLayoutBinding> =
@@ -3911,6 +4066,17 @@ impl MoltenVkBackend {
                             dev.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                                 self.query_pool, q0 + 3 + n_stamped);
                             n_stamped += 1;
+                            // Native kernels (discrete binding): MoltenVK keeps
+                            // consecutive dispatches in one Metal compute
+                            // encoder and lands every deferred timestamp at its
+                            // end — the whole frame's compute read as one pass.
+                            // An aligned 16-byte copy ends the encoder after each
+                            // dispatch: MoltenVK copies aligned buffers with a
+                            // blit encoder (a fill runs as a compute kernel in
+                            // the same encoder, so it does not).
+                            if let Some(tb) = self.timing_break_buffer() {
+                                dev.cmd_copy_buffer(cb, tb, tb, &[vk::BufferCopy { src_offset: 0, dst_offset: 32, size: 16 }]);
+                            }
                         }
                         // Make the writes visible to any chained compute
                         // dispatch in the same frame (multi-kernel
