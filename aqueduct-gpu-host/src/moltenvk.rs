@@ -326,6 +326,10 @@ pub struct MoltenVkBackend {
     /// tagged with its frame's sequence number and its actual on-screen time
     /// read back (`present_timings`) — the latency probe.
     disp_timing: Option<ash::google::display_timing::Device>,
+    /// The present timings read back so far, not yet taken by
+    /// `present_timings` (the backend reads the extension's history once per
+    /// frame: it paces the generated frames by it, and the read consumes it).
+    timings: Mutex<std::collections::VecDeque<(u32, u64)>>,
 
     /// VkInstance. Stays alive until `Drop`.
     instance: ash::Instance,
@@ -449,6 +453,30 @@ struct Swap {
     /// The buffer presented at the end of the next frame: (buffer id, w, h),
     /// tightly packed RGBA8 rows.
     src: Option<(u32, u32, u32)>,
+    /// A generated frame shown before the real one (frame interpolation,
+    /// `set_present_pre`): its buffer id (same size and layout as `src`) and
+    /// the base frame period (ns) the two are paced by.
+    pre: Option<(u32, u64)>,
+    /// The generated frames' last actual on-screen time (ns, host clock) —
+    /// the cadence the next pair is scheduled on.
+    last_gen_actual: u64,
+    /// The real frames' last on-screen time and the smoothed interval between
+    /// them (ns): the base period the pair is paced by — measured, since the
+    /// GPU time alone (25 ms against a 37 ms frame-to-frame period) put every
+    /// slot in the past and the two images went out a vsync apart.
+    last_real_actual: u64,
+    real_period: u64,
+    /// Each pair's present time (host ns) by frame, and the smoothed delay
+    /// from it to the generated frame on screen: the real frame is scheduled
+    /// at its own present time + that delay + half a period — anchored to the
+    /// frame itself, so a late frame does not push every later one (a cadence
+    /// from the last frame shown drifted to 87 ms).
+    submitted: std::collections::VecDeque<(u32, u64)>,
+    gen_delay: u64,
+    /// The last pair's present call (host ns) and the smoothed interval
+    /// between them: the base frame period the pair is paced by.
+    last_submit: u64,
+    submit_period: u64,
     mode: vk::PresentModeKHR,
     stale: bool,
 }
@@ -858,6 +886,7 @@ impl MoltenVkBackend {
             export_metal,
             host_split: Mutex::new(None),
             disp_timing,
+            timings: Mutex::new(std::collections::VecDeque::new()),
             _queue_family: queue_family,
             instance,
             _entry: entry,
@@ -1987,10 +2016,52 @@ impl MoltenVkBackend {
     /// (VK_GOOGLE_display_timing; MoltenVK's MTLDrawable.presentedTime):
     /// (present id = the frame's sequence number, ns on the host clock of
     /// `host_time_ns`). Empty without the extension or a swapchain.
+    /// Generated frames (`set_present_pre`) carry the frame's id with the
+    /// high bit set.
     pub fn present_timings(&self) -> Vec<(u32, u64)> {
-        let Some(dt) = self.disp_timing.as_ref() else { return Vec::new() };
-        let sc = match self.swap.lock().unwrap().as_ref() { Some(s) if s.swapchain != vk::SwapchainKHR::null() => s.swapchain, _ => return Vec::new() };
-        unsafe { dt.get_past_presentation_timing(sc) }.map(|v| v.iter().filter(|t| t.actual_present_time > 0).map(|t| (t.present_id, t.actual_present_time)).collect()).unwrap_or_default()
+        self.poll_timings();
+        self.timings.lock().unwrap().drain(..).collect()
+    }
+
+    /// Read the extension's history into `timings` (kept to 256), and note
+    /// the generated frames' last on-screen time.
+    fn poll_timings(&self) {
+        let Some(dt) = self.disp_timing.as_ref() else { return };
+        let mut g = self.swap.lock().unwrap();
+        let Some(sw) = g.as_mut() else { return };
+        if sw.swapchain == vk::SwapchainKHR::null() { return; }
+        let Ok(v) = (unsafe { dt.get_past_presentation_timing(sw.swapchain) }) else { return };
+        let mut t = self.timings.lock().unwrap();
+        for p in v.iter().filter(|p| p.actual_present_time > 0) {
+            if p.present_id & 0x8000_0000 != 0 {
+                sw.last_gen_actual = sw.last_gen_actual.max(p.actual_present_time);
+                let id = p.present_id & 0x7fff_ffff;
+                if let Some(&(_, t)) = sw.submitted.iter().find(|s| s.0 == id) {
+                    if p.actual_present_time > t {
+                        let d = (p.actual_present_time - t).min(300_000_000);
+                        sw.gen_delay = if sw.gen_delay == 0 { d } else { (sw.gen_delay * 7 + d) / 8 };
+                    }
+                }
+            }
+            else if p.actual_present_time > sw.last_real_actual {
+                if sw.last_real_actual > 0 {
+                    let d = (p.actual_present_time - sw.last_real_actual).clamp(4_000_000, 200_000_000);
+                    sw.real_period = if sw.real_period == 0 { d } else { (sw.real_period * 7 + d) / 8 };
+                }
+                sw.last_real_actual = p.actual_present_time;
+            }
+            t.push_back((p.present_id, p.actual_present_time));
+        }
+        while t.len() > 256 { t.pop_front(); }
+    }
+
+    /// Frame interpolation's present: before each frame's own image, present
+    /// `buffer` (the generated in-between frame, laid out as the present
+    /// source), the two paced half of `period_ns` apart. None: one image a frame.
+    pub fn set_present_pre(&self, buffer_id: Option<ResourceId>, period_ns: u64) {
+        if let Some(sw) = self.swap.lock().unwrap().as_mut() {
+            sw.pre = buffer_id.map(|b| (b.raw(), period_ns));
+        }
     }
 
     /// The display's refresh period (ns), when known.
@@ -2161,7 +2232,7 @@ impl MoltenVkBackend {
         let mode = if want_immediate && modes.contains(&vk::PresentModeKHR::IMMEDIATE) { vk::PresentModeKHR::IMMEDIATE } else { vk::PresentModeKHR::FIFO };
         *self.swap.lock().unwrap() = Some(Swap {
             surface, swapchain: vk::SwapchainKHR::null(), images: Vec::new(), extent: vk::Extent2D { width: w, height: h },
-            acquire: Vec::new(), done: Vec::new(), ring: 0, stage: None, src: None, mode, stale: true,
+            acquire: Vec::new(), done: Vec::new(), ring: 0, stage: None, src: None, pre: None, last_gen_actual: 0, last_real_actual: 0, real_period: 0, submitted: std::collections::VecDeque::new(), gen_delay: 0, last_submit: 0, submit_period: 0, mode, stale: true,
         });
         self.recreate_swapchain(w, h)
     }
@@ -2268,7 +2339,7 @@ impl MoltenVkBackend {
         sw.swapchain = sc;
         sw.images = unsafe { sd.get_swapchain_images(sc) }.map_err(|e| format!("{e:?}"))?;
         sw.extent = extent;
-        for _ in 0..sw.images.len() + 1 { sw.acquire.push(unsafe { self.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }.map_err(|e| format!("{e:?}"))?); }
+        for _ in 0..2 * sw.images.len() + 2 { sw.acquire.push(unsafe { self.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }.map_err(|e| format!("{e:?}"))?); }
         for _ in 0..sw.images.len() { sw.done.push(unsafe { self.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }.map_err(|e| format!("{e:?}"))?); }
         sw.stale = false;
         log::info!("MoltenVk present: swapchain {}×{} {:?} ×{} {:?}", extent.width, extent.height, fmt.format, sw.images.len(), sw.mode);
@@ -2292,8 +2363,11 @@ impl MoltenVkBackend {
     /// the RGBA8 stage image → blit (swizzle, scale) into the acquired
     /// swapchain image, left in PRESENT_SRC. Returns (image index, swapchain,
     /// acquire semaphore, render-done semaphore) for the submit and present.
+    /// The frame's presents, in order: (image index, swapchain, acquire
+    /// semaphore, render-done semaphore, generated) — the generated frame
+    /// first when `set_present_pre` is on, then the frame's own.
     fn record_present(&self, cb: vk::CommandBuffer, buffers: &HashMap<u32, MvkBuffer>)
-        -> Option<(u32, vk::SwapchainKHR, vk::Semaphore, vk::Semaphore)>
+        -> Option<Vec<(u32, vk::SwapchainKHR, vk::Semaphore, vk::Semaphore, bool)>>
     {
         let sd = self.swap_d.as_ref()?;
         let mut g = self.swap.lock().unwrap();
@@ -2320,10 +2394,15 @@ impl MoltenVkBackend {
             }
         }
         let stage = sw.stage.unwrap().0;
+        let mut srcs: Vec<(vk::Buffer, bool)> = Vec::new();
+        if let Some((pid, _)) = sw.pre { if let Some(b) = buffers.get(&pid) { srcs.push((b.buffer, true)); } }
+        srcs.push((buf, false));
+        let mut out = Vec::new();
+        for (buf, gen) in srcs {
         let acq = sw.acquire[sw.ring % sw.acquire.len()];
         let idx = match unsafe { sd.acquire_next_image(sw.swapchain, 1_000_000_000, acq, vk::Fence::null()) } {
             Ok((i, _)) => i,
-            Err(e) => { sw.stale = true; log::warn!("MoltenVk present: acquire {e:?}"); return None; }
+            Err(e) => { sw.stale = true; log::warn!("MoltenVk present: acquire {e:?}"); return if out.is_empty() { None } else { Some(out) }; }
         };
         sw.ring += 1;
         let target = sw.images[idx as usize];
@@ -2353,7 +2432,9 @@ impl MoltenVkBackend {
             dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::DependencyFlags::empty(), &[], &[],
                 &[barrier(target, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty())]);
         }
-        Some((idx, sw.swapchain, acq, sw.done[idx as usize]))
+        out.push((idx, sw.swapchain, acq, sw.done[idx as usize], gen));
+        }
+        Some(out)
     }
 }
 
@@ -3136,6 +3217,7 @@ impl MoltenVkBackend {
         end_rp!();
         // Window present: the output buffer → the acquired swapchain image.
         let t_pres = std::time::Instant::now();
+        if self.swap.lock().unwrap().as_ref().map_or(false, |sw| sw.pre.is_some()) { self.poll_timings(); }
         let present = self.record_present(cb, &buffers);
         let ms_present_rec = t_pres.elapsed().as_secs_f64() * 1e3;
         drop(pipelines); drop(buffers); drop(images);
@@ -3160,28 +3242,57 @@ impl MoltenVkBackend {
         let t_sub = std::time::Instant::now();
         let fence = unsafe { dev.create_fence(&vk::FenceCreateInfo::default(), None)? };
         let cbs = [cb];
-        let (wait_s, signal_s) = match present { Some((_, _, a, d)) => (vec![a], vec![d]), None => (vec![], vec![]) };
-        let wait_stage = [vk::PipelineStageFlags::TRANSFER];
+        let (wait_s, signal_s): (Vec<vk::Semaphore>, Vec<vk::Semaphore>) = match present.as_ref() {
+            Some(v) => (v.iter().map(|p| p.2).collect(), v.iter().map(|p| p.3).collect()),
+            None => (vec![], vec![]),
+        };
+        let wait_stage = vec![vk::PipelineStageFlags::TRANSFER; wait_s.len()];
         let submit = vk::SubmitInfo::default().command_buffers(&cbs)
-            .wait_semaphores(&wait_s).wait_dst_stage_mask(if wait_s.is_empty() { &[] } else { &wait_stage })
+            .wait_semaphores(&wait_s).wait_dst_stage_mask(&wait_stage)
             .signal_semaphores(&signal_s);
         unsafe { dev.queue_submit(self._queue, &[submit], fence)?; }
         let ms_submit = t_sub.elapsed().as_secs_f64() * 1e3;
         let t_qp = std::time::Instant::now();
         // Present right away: the present engine waits on the render-done
         // semaphore on the GPU, not the CPU.
-        if let (Some((idx, sc, _, done)), Some(sd)) = (present, self.swap_d.as_ref()) {
-            let scs = [sc]; let idxs = [idx]; let waits = [done];
-            let times = [vk::PresentTimeGOOGLE::default().present_id(seq as u32)];
-            let mut pt = vk::PresentTimesInfoGOOGLE::default().times(&times);
-            let mut pi = vk::PresentInfoKHR::default().wait_semaphores(&waits).swapchains(&scs).image_indices(&idxs);
-            if self.disp_timing.is_some() { pi = pi.push_next(&mut pt); }
-            match unsafe { sd.queue_present(self._queue, &pi) } {
-                Ok(false) => {}
-                Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                    if let Some(sw) = self.swap.lock().unwrap().as_mut() { sw.stale = true; }
+        // A generated frame (frame interpolation) and the frame's own are
+        // paced half a base period apart on a steady cadence: the generated
+        // one a period after the last generated one showed, its real frame
+        // half a period after that (a frame that is late shows when ready).
+        if let (Some(list), Some(sd)) = (present, self.swap_d.as_ref()) {
+            // Pacing by MINIMUM DURATIONS (the MoltenVK fork's bit 63 →
+            // presentAfterMinimumDuration:): the generated frame at least half
+            // a base period after the previous image shown, its real frame at
+            // least half a period after it — no display time is predicted. The
+            // base period is the smoothed interval between the frames' presents
+            // (a cadence from the last frame shown, and a delay measured from
+            // the present, both fed back into the swapchain's back-pressure and
+            // drifted to 87–130 ms).
+            let now = Self::host_time_ns();
+            let half = self.swap.lock().unwrap().as_mut().map_or(0, |sw| {
+                if sw.pre.is_none() { sw.last_submit = 0; return 0; }
+                if sw.last_submit > 0 {
+                    let d = (now.saturating_sub(sw.last_submit)).clamp(4_000_000, 200_000_000);
+                    sw.submit_period = if sw.submit_period == 0 { d } else { (sw.submit_period * 7 + d) / 8 };
                 }
-                Err(e) => log::warn!("MoltenVk present: {e:?}"),
+                sw.last_submit = now;
+                sw.submit_period / 2
+            });
+            let paced = if half > 0 { (1u64 << 63) | half } else { 0 };
+            for (idx, sc, _, done, gen) in list {
+                let scs = [sc]; let idxs = [idx]; let waits = [done];
+                let (id, at) = if gen { (seq as u32 | 0x8000_0000, paced) } else { (seq as u32 & 0x7fff_ffff, paced) };
+                let times = [vk::PresentTimeGOOGLE::default().present_id(id).desired_present_time(at)];
+                let mut pt = vk::PresentTimesInfoGOOGLE::default().times(&times);
+                let mut pi = vk::PresentInfoKHR::default().wait_semaphores(&waits).swapchains(&scs).image_indices(&idxs);
+                if self.disp_timing.is_some() { pi = pi.push_next(&mut pt); }
+                match unsafe { sd.queue_present(self._queue, &pi) } {
+                    Ok(false) => {}
+                    Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                        if let Some(sw) = self.swap.lock().unwrap().as_mut() { sw.stale = true; }
+                    }
+                    Err(e) => log::warn!("MoltenVk present: {e:?}"),
+                }
             }
         }
         let ms_qpresent = t_qp.elapsed().as_secs_f64() * 1e3;
