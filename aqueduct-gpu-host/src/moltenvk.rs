@@ -40,7 +40,7 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use ash::{vk, Entry};
 use ash::khr;
@@ -217,6 +217,9 @@ struct PendingBuild {
     #[allow(dead_code)] count: u32,
     transient: Vec<(vk::Buffer, vk::DeviceMemory)>,
 }
+
+/// Frames in flight when AQUEDUCT_FRAMES_IN_FLIGHT is unset (`set_frames_in_flight`).
+static FRAMES_IN_FLIGHT: AtomicUsize = AtomicUsize::new(2);
 
 /// The instance mask written FORCE_NO_OPAQUE (`set_nonopaque_instance_mask`).
 static NONOPAQUE_MASK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
@@ -2022,6 +2025,11 @@ impl MoltenVkBackend {
         (!d.mtl_device.is_null() && !q.mtl_command_queue.is_null()).then(|| (d.mtl_device as *mut _, q.mtl_command_queue as *mut _))
     }
 
+    /// Frames in flight: 2 overlaps CPU and GPU (throughput), 1 waits for the
+    /// previous frame first (a base frame less input-to-photon latency).
+    /// AQUEDUCT_FRAMES_IN_FLIGHT overrides.
+    pub fn set_frames_in_flight(&self, n: usize) { FRAMES_IN_FLIGHT.store(n.clamp(1, 2), Ordering::Relaxed); }
+
     /// The FrameOp::HostSplit callback: at the op the frame's commands so far
     /// are submitted (committed on the queue — MoltenVK submits
     /// synchronously), then `f(id)` runs on the submitting thread — work it
@@ -3212,9 +3220,13 @@ impl MoltenVkBackend {
     /// (the frame two back is done, its slot and its ring side are free),
     /// 0 before a read or a write to a buffer the in-flight frame may use.
     pub fn settle(&self, max_in_flight: usize) -> Result<(), vk::Result> {
-        // AQUEDUCT_FRAMES_IN_FLIGHT=1 serialises the frames again (the A/B for the overlap).
-        static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let cap = *CAP.get_or_init(|| std::env::var("AQUEDUCT_FRAMES_IN_FLIGHT").ok().and_then(|v| v.parse().ok()).unwrap_or(2usize).clamp(1, 2));
+        // Frames in flight: 2 (CPU and GPU overlap: throughput) or 1 (the frame
+        // after waits for this one: a base frame less latency, measured 85 →
+        // 58 ms at 30 fps for 10 % of the rate). AQUEDUCT_FRAMES_IN_FLIGHT
+        // wins over set_frames_in_flight.
+        static ENV_CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let cap = ENV_CAP.get_or_init(|| std::env::var("AQUEDUCT_FRAMES_IN_FLIGHT").ok().and_then(|v| v.parse().ok()).map(|v: usize| v.clamp(1, 2)))
+            .unwrap_or_else(|| FRAMES_IN_FLIGHT.load(Ordering::Relaxed).clamp(1, 2));
         let max_in_flight = max_in_flight.min(cap - 1);
         let t0 = std::time::Instant::now();
         let r = loop {
