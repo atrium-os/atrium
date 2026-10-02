@@ -2612,6 +2612,26 @@ impl MoltenVkBackend {
                 }
             }
         }
+        // The in-frame builds and refits in their OWN command buffer, submitted
+        // ahead of the frame's dispatches: in one command buffer MoltenVK does
+        // not order the acceleration-structure encoder's writes before the
+        // compute encoders' ray queries (the barrier above notwithstanding) —
+        // the rays read a half-built TLAS. In the Orbis viewer every movers
+        // TLAS build (the car count changed: most frames) drew a frame without
+        // cars, a TLAS built every frame showed none at all, and a traversal
+        // of a half-built hierarchy is a candidate for the GPU hangs
+        // (kIOGPUCommandBufferCallbackErrorHang) (2026-10-02). Queue order
+        // across command buffers holds. AQUEDUCT_TLAS_SAME_CB=1: the old way.
+        if !retire.is_empty() && std::env::var_os("AQUEDUCT_TLAS_SAME_CB").is_none() {
+            unsafe {
+                dev.end_command_buffer(cb)?;
+                let cbs = [cb];
+                dev.queue_submit(self._queue, &[vk::SubmitInfo::default().command_buffers(&cbs)], vk::Fence::null())?;
+            }
+            split_cbs.push(cb);
+            cb = unsafe { dev.allocate_command_buffers(&alloc)? }[0];
+            unsafe { dev.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?; }
+        }
         // The stamp after the refits: their GPU time is their own bucket, not the first dispatch's.
         if timing { unsafe { dev.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.query_pool, q0 + 2); } }
         let mut images = self.images.lock().unwrap();
