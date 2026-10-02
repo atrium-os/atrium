@@ -319,6 +319,10 @@ pub struct MoltenVkBackend {
     export_metal: Option<vk::PFN_vkExportMetalObjectsEXT>,
     /// The FrameOp::HostSplit callback (`set_host_split`).
     host_split: Mutex<Option<Box<dyn Fn(u32) + Send + Sync>>>,
+    /// VK_GOOGLE_display_timing, when the device has it: every present is
+    /// tagged with its frame's sequence number and its actual on-screen time
+    /// read back (`present_timings`) — the latency probe.
+    disp_timing: Option<ash::google::display_timing::Device>,
 
     /// VkInstance. Stays alive until `Drop`.
     instance: ash::Instance,
@@ -681,6 +685,10 @@ impl MoltenVkBackend {
         }
         // VK_EXT_metal_objects: the Metal objects behind Vulkan ones
         // (`metal_device_queue`, `metal_buffer`).
+        let disp_timing_ok = device_ext_present(&instance, physical, ash::google::display_timing::NAME);
+        if disp_timing_ok {
+            device_exts.push(ash::google::display_timing::NAME.as_ptr());
+        }
         let metal_objects_ok = device_ext_present(&instance, physical, vk::EXT_METAL_OBJECTS_NAME);
         if metal_objects_ok {
             device_exts.push(vk::EXT_METAL_OBJECTS_NAME.as_ptr());
@@ -724,6 +732,7 @@ impl MoltenVkBackend {
                 .map(|f| unsafe { std::mem::transmute::<_, vk::PFN_vkExportMetalObjectsEXT>(f) })
         } else { None };
         let build_queue = build_family.map_or(queue, |bf| unsafe { device.get_device_queue(bf, 0) });
+        let disp_timing = if disp_timing_ok { Some(ash::google::display_timing::Device::new(&instance, &device)) } else { None };
 
         // Command pool for per-submit command buffers (transient +
         // individually resettable).
@@ -845,6 +854,7 @@ impl MoltenVkBackend {
             _queue: queue,
             export_metal,
             host_split: Mutex::new(None),
+            disp_timing,
             _queue_family: queue_family,
             instance,
             _entry: entry,
@@ -1968,6 +1978,35 @@ impl MoltenVkBackend {
     /// values sum to the frame's exec time up to the last stamped dispatch.
     pub fn measured_dispatch_times_s(&self) -> Vec<f64> {
         self.last_dispatch_ns.lock().unwrap().iter().map(|&ns| ns as f64 * 1e-9).collect()
+    }
+
+    /// The frames' actual on-screen times since the last call
+    /// (VK_GOOGLE_display_timing; MoltenVK's MTLDrawable.presentedTime):
+    /// (present id = the frame's sequence number, ns on the host clock of
+    /// `host_time_ns`). Empty without the extension or a swapchain.
+    pub fn present_timings(&self) -> Vec<(u32, u64)> {
+        let Some(dt) = self.disp_timing.as_ref() else { return Vec::new() };
+        let sc = match self.swap.lock().unwrap().as_ref() { Some(s) if s.swapchain != vk::SwapchainKHR::null() => s.swapchain, _ => return Vec::new() };
+        unsafe { dt.get_past_presentation_timing(sc) }.map(|v| v.iter().filter(|t| t.actual_present_time > 0).map(|t| (t.present_id, t.actual_present_time)).collect()).unwrap_or_default()
+    }
+
+    /// The display's refresh period (ns), when known.
+    pub fn refresh_ns(&self) -> Option<u64> {
+        let dt = self.disp_timing.as_ref()?;
+        let sc = match self.swap.lock().unwrap().as_ref() { Some(s) if s.swapchain != vk::SwapchainKHR::null() => s.swapchain, _ => return None };
+        unsafe { dt.get_refresh_cycle_duration(sc) }.ok().map(|r| r.refresh_duration)
+    }
+
+    /// The sequence number of the frame last submitted (its present id).
+    pub fn frame_seq_last(&self) -> u64 { self.frame_seq.load(Ordering::Relaxed) }
+
+    /// Now on the host clock the present times use (mach_absolute_time in
+    /// ns — CACurrentMediaTime's, MTLDrawable.presentedTime's).
+    pub fn host_time_ns() -> u64 {
+        extern "C" { fn mach_absolute_time() -> u64; fn mach_timebase_info(info: *mut [u32; 2]) -> i32; }
+        static TB: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+        let (n, d) = *TB.get_or_init(|| { let mut i = [0u32; 2]; unsafe { mach_timebase_info(&mut i) }; (i[0].max(1), i[1].max(1)) });
+        (unsafe { mach_absolute_time() } as u128 * n as u128 / d as u128) as u64
     }
 
     /// The `id<MTLDevice>` and the frame queue's `id<MTLCommandQueue>`
@@ -3125,7 +3164,10 @@ impl MoltenVkBackend {
         // semaphore on the GPU, not the CPU.
         if let (Some((idx, sc, _, done)), Some(sd)) = (present, self.swap_d.as_ref()) {
             let scs = [sc]; let idxs = [idx]; let waits = [done];
-            let pi = vk::PresentInfoKHR::default().wait_semaphores(&waits).swapchains(&scs).image_indices(&idxs);
+            let times = [vk::PresentTimeGOOGLE::default().present_id(seq as u32)];
+            let mut pt = vk::PresentTimesInfoGOOGLE::default().times(&times);
+            let mut pi = vk::PresentInfoKHR::default().wait_semaphores(&waits).swapchains(&scs).image_indices(&idxs);
+            if self.disp_timing.is_some() { pi = pi.push_next(&mut pt); }
             match unsafe { sd.queue_present(self._queue, &pi) } {
                 Ok(false) => {}
                 Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
