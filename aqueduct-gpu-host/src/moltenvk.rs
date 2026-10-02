@@ -317,6 +317,8 @@ pub struct MoltenVkBackend {
     /// it: the Metal objects behind the device, the frame queue and a
     /// buffer's memory, for Metal-side passes (MetalFX) on the same queue.
     export_metal: Option<vk::PFN_vkExportMetalObjectsEXT>,
+    /// The FrameOp::HostSplit callback (`set_host_split`).
+    host_split: Mutex<Option<Box<dyn Fn(u32) + Send + Sync>>>,
 
     /// VkInstance. Stays alive until `Drop`.
     instance: ash::Instance,
@@ -448,6 +450,8 @@ struct Swap {
 struct Pending {
     fence: vk::Fence,
     cb: vk::CommandBuffer,
+    /// The command buffers before a HostSplit, submitted earlier in the frame.
+    split_cbs: Vec<vk::CommandBuffer>,
     /// Which of the two per-frame slots (descriptor pool, query range) this frame uses, and its sequence number.
     slot: usize,
     seq: u64,
@@ -840,6 +844,7 @@ impl MoltenVkBackend {
             device,
             _queue: queue,
             export_metal,
+            host_split: Mutex::new(None),
             _queue_family: queue_family,
             instance,
             _entry: entry,
@@ -1978,6 +1983,13 @@ impl MoltenVkBackend {
         (!d.mtl_device.is_null() && !q.mtl_command_queue.is_null()).then(|| (d.mtl_device as *mut _, q.mtl_command_queue as *mut _))
     }
 
+    /// The FrameOp::HostSplit callback: at the op the frame's commands so far
+    /// are submitted (committed on the queue — MoltenVK submits
+    /// synchronously), then `f(id)` runs on the submitting thread — work it
+    /// commits on the frame queue (`metal_device_queue`) runs after them and
+    /// before the rest of the frame. It must not call back into the backend.
+    pub fn set_host_split(&self, f: Option<Box<dyn Fn(u32) + Send + Sync>>) { *self.host_split.lock().unwrap() = f; }
+
     /// The `id<MTLBuffer>` behind a buffer's memory (its primary side),
     /// unretained: valid while the buffer lives.
     pub fn metal_buffer(&self, buffer_id: ResourceId) -> Option<*mut std::ffi::c_void> {
@@ -2545,11 +2557,12 @@ impl MoltenVkBackend {
             .command_pool(self.cmd_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
-        let cb = unsafe { dev.allocate_command_buffers(&alloc)? }[0];
+        let mut cb = unsafe { dev.allocate_command_buffers(&alloc)? }[0];
         unsafe {
             dev.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
         }
+        let mut split_cbs: Vec<vk::CommandBuffer> = Vec::new();
 
         // Measured GPU exec time (D-M6): reset the pool + stamp the top of
         // the pipe before any work; stamp the bottom just before close.
@@ -3024,6 +3037,32 @@ impl MoltenVkBackend {
                             vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buf.buffer, &[copy]);
                     }
                 }
+                FrameOp::HostSplit => {
+                    let hs = self.host_split.lock().unwrap();
+                    let Some(f) = hs.as_ref() else { continue; };
+                    let id = if body.len() >= 4 { u32::from_le_bytes(body[0..4].try_into().unwrap()) } else { 0 };
+                    end_rp!();
+                    // Submit what is recorded (no fence, no semaphores: the
+                    // frame's fence and the present ride on the last part),
+                    // run the host's work, continue in a new command buffer.
+                    unsafe {
+                        let barrier = vk::MemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+                            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::HOST_READ);
+                        dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS,
+                            vk::DependencyFlags::empty(), &[barrier], &[], &[]);
+                        dev.end_command_buffer(cb)?;
+                        let cbs = [cb];
+                        dev.queue_submit(self._queue, &[vk::SubmitInfo::default().command_buffers(&cbs)], vk::Fence::null())?;
+                    }
+                    split_cbs.push(cb);
+                    f(id);
+                    cb = unsafe { dev.allocate_command_buffers(&alloc)? }[0];
+                    unsafe {
+                        dev.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default()
+                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+                    }
+                }
                 _ => { /* other ops: not yet modelled on tier-3 */ }
             }
         }
@@ -3094,7 +3133,7 @@ impl MoltenVkBackend {
         // Ring buffers flip: the next frame binds and the CPU writes the other side.
         for b in self.buffers.lock().unwrap().values_mut() { if let Some(r) = b.ring.as_mut() { r.side ^= 1; r.dirty = true; } }
         let graveyard = std::mem::take(&mut *self.graveyard.lock().unwrap());
-        let p = Pending { fence, cb, slot, seq, graveyard, trash, timing, n_stamped };
+        let p = Pending { fence, cb, split_cbs, slot, seq, graveyard, trash, timing, n_stamped };
         if self.async_frames.load(Ordering::Relaxed) {
             self.pending.lock().unwrap().push_back(p);
             return Ok(());
@@ -3281,6 +3320,7 @@ impl MoltenVkBackend {
             }
             dev.destroy_fence(p.fence, None);
             dev.free_command_buffers(self.cmd_pool, &[p.cb]);
+            if !p.split_cbs.is_empty() { dev.free_command_buffers(self.cmd_pool, &p.split_cbs); }
         }
         // TLASes a refit or swap replaced, retired with this frame or an older
         // one: destroyed now, their buffers the scene's spares (two kept).

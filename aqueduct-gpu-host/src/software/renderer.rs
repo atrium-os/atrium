@@ -782,7 +782,8 @@ impl<'a> TinySkiaRenderer<'a> {
                 | FrameOp::CopyImgToBuf
                 | FrameOp::Blit
                 | FrameOp::FillBuffer
-                | FrameOp::PipelineBarrier => {
+                | FrameOp::PipelineBarrier
+                | FrameOp::HostSplit => {
                     // Phase 1.3c-rect: not yet implemented. Subsequent
                     // commits add these in priority order: SetScissor
                     // (compositor uses it for partial redraw),

@@ -322,6 +322,13 @@ pub enum FrameOp {
 
     /// Pipeline-barrier between stages and resources.
     PipelineBarrier = 0x0070,
+
+    /// Split the frame for host work on the same queue: the host ends and
+    /// submits the commands so far, runs its registered split callback with
+    /// the body's `id: u32` (e.g. a Metal pass encoded on the queue the
+    /// MoltenVK host exports), then records the rest of the frame into a
+    /// new command buffer. Hosts without a callback ignore it.
+    HostSplit       = 0x0090,
 }
 
 impl FrameOp {
@@ -368,6 +375,7 @@ impl FrameOp {
             0x0062 => FrameOp::Blit,
             0x0063 => FrameOp::FillBuffer,
             0x0070 => FrameOp::PipelineBarrier,
+            0x0090 => FrameOp::HostSplit,
             _ => return None,
         })
     }
