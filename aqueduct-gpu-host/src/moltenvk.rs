@@ -218,6 +218,9 @@ struct PendingBuild {
     transient: Vec<(vk::Buffer, vk::DeviceMemory)>,
 }
 
+/// The instance mask written FORCE_NO_OPAQUE (`set_nonopaque_instance_mask`).
+static NONOPAQUE_MASK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 /// One TLAS instance for [`MoltenVkBackend::build_scene_tlas`]: which BLAS
 /// it instances, its 24-bit custom index (readable in the kernel as the
 /// ray query's committed instance ID — e.g. an attribute-table base), and a
@@ -1474,6 +1477,13 @@ impl MoltenVkBackend {
         self.accels.lock().unwrap().get(&tlas_id.raw()).map_or(0, |a| a.inst_shadow.len() / 64)
     }
 
+    /// Instances whose mask equals `m` are written FORCE_NO_OPAQUE: a ray
+    /// query without forced flags then commits every other instance's
+    /// (opaque) triangles in hardware and returns only these as candidates —
+    /// one traversal for solid geometry and alpha-tested cards together.
+    /// 0 (the default) flags none. Set before the TLASes are built.
+    pub fn set_nonopaque_instance_mask(m: u8) { NONOPAQUE_MASK.store(m, std::sync::atomic::Ordering::Relaxed); }
+
     /// One Vulkan instance record (VkAccelerationStructureInstanceKHR).
     fn encode_instance(dst: &mut [u8], inst: &SceneInstance, blas_addrs: &[u64]) {
         // transform: 12 f32 row-major 3x4
@@ -1484,8 +1494,11 @@ impl MoltenVkBackend {
         // where a box parked far away degraded the BVH for every ray).
         let mask = match inst.custom_index >> 24 { 0 => 0xFF, 0xFF => 0, m => m };
         dst[48..52].copy_from_slice(&((inst.custom_index & 0xFFFFFF) | (mask << 24)).to_le_bytes());
-        // sbtOffset(24)=0 | flags(8)=0
-        dst[52..56].copy_from_slice(&0u32.to_le_bytes());
+        // sbtOffset(24)=0 | flags(8): FORCE_NO_OPAQUE (0x08) for the
+        // non-opaque mask (set_nonopaque_instance_mask), else 0.
+        let no = NONOPAQUE_MASK.load(std::sync::atomic::Ordering::Relaxed) as u32;
+        let flags: u32 = if no != 0 && mask == no { 0x08 } else { 0 };
+        dst[52..56].copy_from_slice(&(flags << 24).to_le_bytes());
         // accelerationStructureReference = the instanced BLAS
         dst[56..64].copy_from_slice(&blas_addrs[inst.blas as usize].to_le_bytes());
     }
