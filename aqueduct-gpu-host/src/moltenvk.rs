@@ -473,10 +473,6 @@ struct Swap {
     /// from the last frame shown drifted to 87 ms).
     submitted: std::collections::VecDeque<(u32, u64)>,
     gen_delay: u64,
-    /// The last pair's present call (host ns) and the smoothed interval
-    /// between them: the base frame period the pair is paced by.
-    last_submit: u64,
-    submit_period: u64,
     mode: vk::PresentModeKHR,
     stale: bool,
 }
@@ -2032,6 +2028,13 @@ impl MoltenVkBackend {
         if sw.swapchain == vk::SwapchainKHR::null() { return; }
         let Ok(v) = (unsafe { dt.get_past_presentation_timing(sw.swapchain) }) else { return };
         let mut t = self.timings.lock().unwrap();
+        // AQUEDUCT_PRESENT_LOG=1: every entry the extension returns, shown or
+        // not (actual 0 = the drawable was dropped), on the host clock.
+        if std::env::var_os("AQUEDUCT_PRESENT_LOG").is_some() {
+            for p in &v {
+                eprintln!("present-shown {:#x} actual {} desired {:#x} earliest {} margin {}", p.present_id, p.actual_present_time, p.desired_present_time, p.earliest_present_time, p.present_margin);
+            }
+        }
         for p in v.iter().filter(|p| p.actual_present_time > 0) {
             if p.present_id & 0x8000_0000 != 0 {
                 sw.last_gen_actual = sw.last_gen_actual.max(p.actual_present_time);
@@ -2232,7 +2235,7 @@ impl MoltenVkBackend {
         let mode = if want_immediate && modes.contains(&vk::PresentModeKHR::IMMEDIATE) { vk::PresentModeKHR::IMMEDIATE } else { vk::PresentModeKHR::FIFO };
         *self.swap.lock().unwrap() = Some(Swap {
             surface, swapchain: vk::SwapchainKHR::null(), images: Vec::new(), extent: vk::Extent2D { width: w, height: h },
-            acquire: Vec::new(), done: Vec::new(), ring: 0, stage: None, src: None, pre: None, last_gen_actual: 0, last_real_actual: 0, real_period: 0, submitted: std::collections::VecDeque::new(), gen_delay: 0, last_submit: 0, submit_period: 0, mode, stale: true,
+            acquire: Vec::new(), done: Vec::new(), ring: 0, stage: None, src: None, pre: None, last_gen_actual: 0, last_real_actual: 0, real_period: 0, submitted: std::collections::VecDeque::new(), gen_delay: 0, mode, stale: true,
         });
         self.recreate_swapchain(w, h)
     }
@@ -3268,20 +3271,24 @@ impl MoltenVkBackend {
             // (a cadence from the last frame shown, and a delay measured from
             // the present, both fed back into the swapchain's back-pressure and
             // drifted to 87–130 ms).
-            let now = Self::host_time_ns();
-            let half = self.swap.lock().unwrap().as_mut().map_or(0, |sw| {
-                if sw.pre.is_none() { sw.last_submit = 0; return 0; }
-                if sw.last_submit > 0 {
-                    let d = (now.saturating_sub(sw.last_submit)).clamp(4_000_000, 200_000_000);
-                    sw.submit_period = if sw.submit_period == 0 { d } else { (sw.submit_period * 7 + d) / 8 };
-                }
-                sw.last_submit = now;
-                sw.submit_period / 2
-            });
+            // The base period is the HOST's hint (the viewer: its smoothed GPU
+            // frame time), never a time the pacing itself shapes: holding the
+            // real frame delays the next acquire, so a period measured between
+            // submits grew with every hold (66 → 91 ms between images, 10 fps
+            // shown, 2026-10-02).
+            let half = self.swap.lock().unwrap().as_ref().and_then(|sw| sw.pre).map_or(0, |p| p.1.clamp(8_000_000, 200_000_000) / 2);
             let paced = if half > 0 { (1u64 << 63) | half } else { 0 };
             for (idx, sc, _, done, gen) in list {
                 let scs = [sc]; let idxs = [idx]; let waits = [done];
-                let (id, at) = if gen { (seq as u32 | 0x8000_0000, paced) } else { (seq as u32 & 0x7fff_ffff, paced) };
+                // The real frame FOLLOWS its generated one (bit 62): shown at the
+                // generated frame's actual on-screen time plus half a period —
+                // with minimum durations alone both landed on one refresh and
+                // the generated frame was on screen 6–8 µs (2026-10-02).
+                let follow = if paced != 0 { 1u64 << 62 } else { 0 };
+                let (id, at) = if gen { (seq as u32 | 0x8000_0000, paced) } else { (seq as u32 & 0x7fff_ffff, paced | follow) };
+                if std::env::var_os("AQUEDUCT_PRESENT_LOG").is_some() {
+                    eprintln!("present-call {id:#x} at {} paced {:#x}", Self::host_time_ns(), at);
+                }
                 let times = [vk::PresentTimeGOOGLE::default().present_id(id).desired_present_time(at)];
                 let mut pt = vk::PresentTimesInfoGOOGLE::default().times(&times);
                 let mut pi = vk::PresentInfoKHR::default().wait_semaphores(&waits).swapchains(&scs).image_indices(&idxs);
