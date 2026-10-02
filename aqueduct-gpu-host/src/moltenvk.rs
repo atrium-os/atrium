@@ -470,22 +470,6 @@ struct Swap {
     /// `set_present_pre`): its buffer id (same size and layout as `src`) and
     /// the base frame period (ns) the two are paced by.
     pre: Option<(u32, u64)>,
-    /// The generated frames' last actual on-screen time (ns, host clock) —
-    /// the cadence the next pair is scheduled on.
-    last_gen_actual: u64,
-    /// The real frames' last on-screen time and the smoothed interval between
-    /// them (ns): the base period the pair is paced by — measured, since the
-    /// GPU time alone (25 ms against a 37 ms frame-to-frame period) put every
-    /// slot in the past and the two images went out a vsync apart.
-    last_real_actual: u64,
-    real_period: u64,
-    /// Each pair's present time (host ns) by frame, and the smoothed delay
-    /// from it to the generated frame on screen: the real frame is scheduled
-    /// at its own present time + that delay + half a period — anchored to the
-    /// frame itself, so a late frame does not push every later one (a cadence
-    /// from the last frame shown drifted to 87 ms).
-    submitted: std::collections::VecDeque<(u32, u64)>,
-    gen_delay: u64,
     mode: vk::PresentModeKHR,
     stale: bool,
 }
@@ -508,24 +492,23 @@ const FG_SLOTS: usize = 3;
 
 /// How frame interpolation's two images per frame are paced: the generated
 /// frame half a period after the previous real one, its real frame half a
-/// period after it. AQUEDUCT_PACER=present_wait|mvk|none chooses; the default
-/// is `HostTimed` where the driver has VK_KHR_present_wait, else `None`
-/// (logged).
+/// period after it. AQUEDUCT_PACER=host|none chooses; the default is
+/// `HostTimed` where the driver has VK_KHR_present_id + VK_KHR_present_wait,
+/// else `None` (logged).
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum PacerKind {
-    /// Standard Vulkan: the present thread TIMES ITS PRESENT CALLS half a
-    /// period apart (the display latency is about constant, so the images
-    /// reach the screen the same distance apart), with VK_KHR_present_id +
-    /// VK_KHR_present_wait as back-pressure only (the present two back must
-    /// be on screen). Waiting for each image to show and then sleeping half a
-    /// period put the whole present-to-screen latency into every step: 78 ms
-    /// a pair against a 38 ms frame (2026-10-02). Any driver with the two.
+    /// Standard Vulkan: the present thread TIMES ITS PRESENT CALLS — the
+    /// generated image as soon as it is blitted, the real one half a period
+    /// after the frame's hand-off, either at least a quarter period after the
+    /// previous call (the display latency is about constant, so the images
+    /// reach the screen the same distance apart). VK_KHR_present_wait is
+    /// back-pressure only (the present three back must be on screen).
+    /// Waiting for each image to show and then sleeping half a period put the
+    /// whole present-to-screen latency into every step (78 ms a pair against a
+    /// 38 ms frame, 2026-10-02). It replaced the MoltenVK fork's present
+    /// patches (bits 63/62 of desiredPresentTime), which measured worse:
+    /// 96.7 ms against 80, uneven intervals.
     HostTimed,
-    /// The MoltenVK fork's private convention: bits 63/62 of
-    /// VK_GOOGLE_display_timing's desiredPresentTime (a minimum duration; the
-    /// real frame follows its generated one's on-screen time). macOS with the
-    /// fork only — on another driver the value is an absolute time far ahead.
-    MoltenVkFork,
     /// Both images presented as soon as they are ready: the generated one
     /// may never be seen (measured 6–8 µs on screen, 2026-10-02).
     None,
@@ -618,6 +601,8 @@ struct FgCtx {
     present_wait: Option<khr::present_wait::Device>,
 }
 
+// The profiler laps (`lap!`) reset their clock after the last lap too.
+#[allow(unused_assignments)]
 fn fg_present_thread(c: FgCtx) {
     let ql = || c.qlock.lock().unwrap_or_else(|e| e.into_inner());
     let sl = || c.slock.lock().unwrap_or_else(|e| e.into_inner());
@@ -751,7 +736,6 @@ fn fg_present_thread(c: FgCtx) {
                     // half a period: for the generated frame the previous real
                     // one, for the real frame its generated one.
                     let kid = next_id; next_id += 1;
-                    let mut at = 0u64;
                     match c.pacer {
                         PacerKind::HostTimed => {
                             // Back-pressure: the present three back is on screen.
@@ -778,15 +762,16 @@ fn fg_present_thread(c: FgCtx) {
                             sleep_until(target);
                             lap!(7);
                         }
-                        PacerKind::MoltenVkFork => at = (1u64 << 63) | half | if gen { 0 } else { 1u64 << 62 },
                         PacerKind::None => {}
                     }
                     last_call = Some(MoltenVkBackend::host_time_ns());
                     ids.push_back((sc, kid));
                     while ids.len() > 4 { ids.pop_front(); }
-                    if c.log { eprintln!("present-call {id:#x} at {} paced {:#x}", MoltenVkBackend::host_time_ns(), at); }
+                    if c.log { eprintln!("present-call {id:#x} at {}", MoltenVkBackend::host_time_ns()); }
                     let (scs, idxs) = ([sc], [idx]);
-                    let times = [vk::PresentTimeGOOGLE::default().present_id(id).desired_present_time(at)];
+                    // VK_GOOGLE_display_timing tags the present for the latency
+                    // probe only (no desired time).
+                    let times = [vk::PresentTimeGOOGLE::default().present_id(id).desired_present_time(0)];
                     let mut pt = vk::PresentTimesInfoGOOGLE::default().times(&times);
                     let kids = [kid];
                     let mut pid = vk::PresentIdKHR::default().present_ids(&kids);
@@ -1149,7 +1134,6 @@ impl MoltenVkBackend {
         let present_queue = if fam_count >= 2 { unsafe { device.get_device_queue(queue_family, 1) } } else { queue };
         let present_wait = present_wait_ok.then(|| khr::present_wait::Device::new(&instance, &device));
         let pacer = match std::env::var("AQUEDUCT_PACER").ok().as_deref() {
-            Some("mvk") => PacerKind::MoltenVkFork,
             Some("none") => PacerKind::None,
             Some("host") | None if present_wait.is_some() => PacerKind::HostTimed,
             Some(other) => { log::warn!("AQUEDUCT_PACER={other}: not available here — no pacing"); PacerKind::None }
@@ -2425,8 +2409,7 @@ impl MoltenVkBackend {
         self.timings.lock().unwrap().drain(..).collect()
     }
 
-    /// Read the extension's history into `timings` (kept to 256), and note
-    /// the generated frames' last on-screen time.
+    /// Read the extension's history into `timings` (kept to 256).
     fn poll_timings(&self) {
         let Some(dt) = self.disp_timing.as_ref() else { return };
         let mut g = self.swap.lock().unwrap();
@@ -2442,23 +2425,6 @@ impl MoltenVkBackend {
             }
         }
         for p in v.iter().filter(|p| p.actual_present_time > 0) {
-            if p.present_id & 0x8000_0000 != 0 {
-                sw.last_gen_actual = sw.last_gen_actual.max(p.actual_present_time);
-                let id = p.present_id & 0x7fff_ffff;
-                if let Some(&(_, t)) = sw.submitted.iter().find(|s| s.0 == id) {
-                    if p.actual_present_time > t {
-                        let d = (p.actual_present_time - t).min(300_000_000);
-                        sw.gen_delay = if sw.gen_delay == 0 { d } else { (sw.gen_delay * 7 + d) / 8 };
-                    }
-                }
-            }
-            else if p.actual_present_time > sw.last_real_actual {
-                if sw.last_real_actual > 0 {
-                    let d = (p.actual_present_time - sw.last_real_actual).clamp(4_000_000, 200_000_000);
-                    sw.real_period = if sw.real_period == 0 { d } else { (sw.real_period * 7 + d) / 8 };
-                }
-                sw.last_real_actual = p.actual_present_time;
-            }
             t.push_back((p.present_id, p.actual_present_time));
         }
         while t.len() > 256 { t.pop_front(); }
@@ -2641,7 +2607,7 @@ impl MoltenVkBackend {
         let mode = if want_immediate && modes.contains(&vk::PresentModeKHR::IMMEDIATE) { vk::PresentModeKHR::IMMEDIATE } else { vk::PresentModeKHR::FIFO };
         *self.swap.lock().unwrap() = Some(Swap {
             surface, swapchain: vk::SwapchainKHR::null(), images: Vec::new(), extent: vk::Extent2D { width: w, height: h },
-            acquire: Vec::new(), done: Vec::new(), ring: 0, stage: None, src: None, pre: None, last_gen_actual: 0, last_real_actual: 0, real_period: 0, submitted: std::collections::VecDeque::new(), gen_delay: 0, mode, stale: true,
+            acquire: Vec::new(), done: Vec::new(), ring: 0, stage: None, src: None, pre: None, mode, stale: true,
         });
         self.recreate_swapchain(w, h)
     }
@@ -2869,7 +2835,7 @@ impl MoltenVkBackend {
                     pacer: self.pacer, present_wait: self.present_wait.clone(),
                 };
                 match self.pacer {
-                    PacerKind::None => log::warn!("MoltenVk present thread: NO PACING — the driver has no VK_KHR_present_wait and AQUEDUCT_PACER=mvk was not set; generated frames may never be seen"),
+                    PacerKind::None => log::warn!("MoltenVk present thread: NO PACING — the driver has no VK_KHR_present_id + VK_KHR_present_wait (or AQUEDUCT_PACER=none); generated frames may never be seen"),
                     k => log::info!("MoltenVk present thread: pacer {k:?}"),
                 }
                 match std::thread::Builder::new().name("aqueduct-present".into()).spawn(move || fg_present_thread(ctx)) {
@@ -3816,41 +3782,18 @@ impl MoltenVkBackend {
 
         let t_qp = std::time::Instant::now();
         // Present right away: the present engine waits on the render-done
-        // semaphore on the GPU, not the CPU.
-        // A generated frame (frame interpolation) and the frame's own are
-        // paced half a base period apart on a steady cadence: the generated
-        // one a period after the last generated one showed, its real frame
-        // half a period after that (a frame that is late shows when ready).
+        // semaphore on the GPU, not the CPU. With a generated frame this is
+        // only the fallback when the present thread is off or gone
+        // (AQUEDUCT_PRESENT_THREAD=0): both images go out unpaced — the pacer
+        // lives in the present thread.
         if let (Some(list), Some(sd)) = (present, self.swap_d.as_ref()) {
-            // Pacing by MINIMUM DURATIONS (the MoltenVK fork's bit 63 →
-            // presentAfterMinimumDuration:): the generated frame at least half
-            // a base period after the previous image shown, its real frame at
-            // least half a period after it — no display time is predicted. The
-            // base period is the smoothed interval between the frames' presents
-            // (a cadence from the last frame shown, and a delay measured from
-            // the present, both fed back into the swapchain's back-pressure and
-            // drifted to 87–130 ms).
-            // The base period is the HOST's hint (the viewer: its smoothed GPU
-            // frame time), never a time the pacing itself shapes: holding the
-            // real frame delays the next acquire, so a period measured between
-            // submits grew with every hold (66 → 91 ms between images, 10 fps
-            // shown, 2026-10-02).
-            let half = self.swap.lock().unwrap().as_ref().and_then(|sw| sw.pre).map_or(0, |p| p.1.clamp(8_000_000, 200_000_000) / 2);
-            // Only the MoltenVK fork understands these bits; on any other
-            // pacer this fallback presents both images unpaced.
-            let paced = if half > 0 && self.pacer == PacerKind::MoltenVkFork { (1u64 << 63) | half } else { 0 };
             for (idx, sc, _, done, gen) in list {
                 let scs = [sc]; let idxs = [idx]; let waits = [done];
-                // The real frame FOLLOWS its generated one (bit 62): shown at the
-                // generated frame's actual on-screen time plus half a period —
-                // with minimum durations alone both landed on one refresh and
-                // the generated frame was on screen 6–8 µs (2026-10-02).
-                let follow = if paced != 0 { 1u64 << 62 } else { 0 };
-                let (id, at) = if gen { (seq as u32 | 0x8000_0000, paced) } else { (seq as u32 & 0x7fff_ffff, paced | follow) };
+                let id = if gen { seq as u32 | 0x8000_0000 } else { seq as u32 & 0x7fff_ffff };
                 if std::env::var_os("AQUEDUCT_PRESENT_LOG").is_some() {
-                    eprintln!("present-call {id:#x} at {} paced {:#x}", Self::host_time_ns(), at);
+                    eprintln!("present-call {id:#x} at {}", Self::host_time_ns());
                 }
-                let times = [vk::PresentTimeGOOGLE::default().present_id(id).desired_present_time(at)];
+                let times = [vk::PresentTimeGOOGLE::default().present_id(id).desired_present_time(0)];
                 let mut pt = vk::PresentTimesInfoGOOGLE::default().times(&times);
                 let mut pi = vk::PresentInfoKHR::default().wait_semaphores(&waits).swapchains(&scs).image_indices(&idxs);
                 if self.disp_timing.is_some() { pi = pi.push_next(&mut pt); }
