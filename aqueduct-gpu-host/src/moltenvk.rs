@@ -2404,10 +2404,43 @@ impl MoltenVkBackend {
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         let dev = &self.device;
+        // AQUEDUCT_MSL_OVERRIDE=<a.spv>=<b.metal>[;…] — the native-Metal spike
+        // (orbis docs/METAL-BACKEND.md): a compute pipeline whose SPIR-V equals
+        // a.spv gets b.metal instead (MSL source, kernel `main0`, Metal slots as
+        // MoltenVK assigns them with MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0),
+        // through MoltenVK's direct-MSL path; threadgroup size from
+        // AQUEDUCT_MSL_TG (default 8,8,1). Diagnostic only.
+        let msl: Option<Vec<u32>> = std::env::var("AQUEDUCT_MSL_OVERRIDE").ok().and_then(|spec| {
+            spec.split(';').find_map(|pair| {
+                let (spv, metal) = pair.split_once('=')?;
+                (std::fs::read(spv).ok()? == cs_spirv).then(|| std::fs::read(metal).ok()).flatten()
+            })
+        }).map(|src| {
+            let mut bytes = 0x1996_0412u32.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&src);
+            bytes.push(0);
+            while bytes.len() % 4 != 0 { bytes.push(0); }
+            eprintln!("aqueduct: MSL override for a {}-byte SPIR-V module ({} bytes of MSL)", cs_spirv.len(), src.len());
+            bytes.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()
+        });
+        let words = msl.as_ref().unwrap_or(&words);
         unsafe {
             let module = dev.create_shader_module(
-                &vk::ShaderModuleCreateInfo::default().code(&words), None)
+                &vk::ShaderModuleCreateInfo::default().code(words), None)
                 .map_err(|e| format!("shader module: {e:?}"))?;
+            if msl.is_some() {
+                extern "C" { fn dlopen(p: *const std::ffi::c_char, m: i32) -> *mut std::ffi::c_void; fn dlsym(h: *mut std::ffi::c_void, s: *const std::ffi::c_char) -> *mut std::ffi::c_void; }
+                const RTLD_LAZY: i32 = 1; const RTLD_NOLOAD: i32 = 0x10;
+                let lib = std::env::var("VK_DRIVER_FILES").ok()
+                    .and_then(|j| std::path::Path::new(&j).parent().map(|d| d.join("libMoltenVK.dylib")))
+                    .map(|p| std::ffi::CString::new(p.to_string_lossy().as_bytes()).unwrap());
+                let h = lib.map_or(std::ptr::null_mut(), |p| dlopen(p.as_ptr(), RTLD_LAZY | RTLD_NOLOAD));
+                let f = if h.is_null() { std::ptr::null_mut() } else { dlsym(h, c"vkSetWorkgroupSizeMVK".as_ptr()) };
+                if f.is_null() { return Err("MSL override: vkSetWorkgroupSizeMVK not found (set VK_DRIVER_FILES to the MoltenVK ICD)".into()); }
+                let tg: Vec<u32> = std::env::var("AQUEDUCT_MSL_TG").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect()).filter(|v: &Vec<u32>| v.len() == 3).unwrap_or(vec![8, 8, 1]);
+                let set: extern "C" fn(vk::ShaderModule, u32, u32, u32) = std::mem::transmute(f);
+                set(module, tg[0], tg[1], tg[2]);
+            }
             let bindings: Vec<vk::DescriptorSetLayoutBinding> =
                 (0..ssbo_count).map(|b| {
                     let ty = if as_bindings.contains(&b) {
@@ -2440,8 +2473,9 @@ impl MoltenVkBackend {
             // slangc names the SPIR-V entry "main" regardless of
             // the source function name (the -entry flag selects
             // WHICH function, not its exported name).
-            let entry = std::ffi::CStr::from_bytes_with_nul(b"main\0")
-                .unwrap();
+            // (A direct-MSL module is looked up by exactly this name, and `main`
+            // is not a legal Metal kernel name: the override's kernel is `main0`.)
+            let entry = if msl.is_some() { c"main0" } else { std::ffi::CStr::from_bytes_with_nul(b"main\0").unwrap() };
             let stage = vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(module)
