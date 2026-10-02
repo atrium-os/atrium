@@ -546,6 +546,9 @@ enum PacerKind {
 /// fence) and the render thread's waits for the queue lock.
 static FG_PROF: Mutex<([u64; 10], u32)> = Mutex::new(([0; 10], 0));
 static QLOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+/// The render thread's wait for a parked pair after its frame completed
+/// (fg_direct): the cost of pacing the render loop to the display chain.
+static FG_DIRECT_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 fn fg_prof_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("AQUEDUCT_PRESENT_PROF").is_some())
@@ -875,8 +878,8 @@ fn fg_present_thread(c: FgCtx) {
             a.1 += 1;
             if a.1 == 120 {
                 let m = |k: usize| a.0[k] as f64 / 120.0 * 1e-6;
-                eprintln!("present-prof: wait job {:.1} | acquire gen {:.1} real {:.1} | submits {:.2} | pacing: back-pressure {:.1} timer {:.1} | present gen {:.2} real {:.2} | blit fences {:.1} ms | period {:.1} ms | direct {}/120 | render-thread queue-lock waits {:.2} ms/frame",
-                    m(0), m(1), m(2), m(3), m(8), m(7), m(4), m(5), m(6), period_ns as f64 * 1e-6, a.0[9], QLOCK_WAIT_NS.swap(0, Ordering::Relaxed) as f64 / 120.0 * 1e-6);
+                eprintln!("present-prof: wait job {:.1} | acquire gen {:.1} real {:.1} | submits {:.2} | pacing: back-pressure {:.1} timer {:.1} | present gen {:.2} real {:.2} | blit fences {:.1} ms | period {:.1} ms | direct {}/120 | render waits for drawables {:.2} ms/frame | render-thread queue-lock waits {:.2} ms/frame",
+                    m(0), m(1), m(2), m(3), m(8), m(7), m(4), m(5), m(6), period_ns as f64 * 1e-6, a.0[9], FG_DIRECT_WAIT_NS.swap(0, Ordering::Relaxed) as f64 / 120.0 * 1e-6, QLOCK_WAIT_NS.swap(0, Ordering::Relaxed) as f64 / 120.0 * 1e-6);
                 *a = ([0; 10], 0);
             }
         }
@@ -3063,12 +3066,17 @@ impl MoltenVkBackend {
         let Some(sh) = self.fgp.lock().unwrap().shared.clone() else { return };
         let Some((sc, images, ext)) = ({ let g = self.swap.lock().unwrap(); g.as_ref().and_then(|sw| (!sw.stale).then(|| (sw.swapchain, sw.images.clone(), sw.extent))) }) else { return };
         let dev = &self.device;
-        // Wait for a parked pair only while the frame is still on the GPU (free
-        // time), not after: the pair's second drawable frees when the previous
-        // real frame is ON SCREEN — half a period after the previous hand-off
-        // plus ~20 ms through the compositor in a window — which is about when
-        // this frame completes. Waiting past it (4, 12 ms) cost the render loop
-        // and still mostly missed (2026-10-02); a miss goes staged.
+        // Wait for a parked pair while the frame is on the GPU (free time) and,
+        // once it is done, up to half a period + 10 ms more: the pair's second
+        // drawable frees when the previous real frame is ON SCREEN (half a
+        // period after the previous hand-off plus the present-to-screen time:
+        // ~20 ms windowed, ~8 fullscreen). Waiting here, before the next frame
+        // is submitted, keeps the blit between the frames and paces the render
+        // loop to the display chain, like vsync back-pressure. Falling back to
+        // staged at once let the staged job take the drawables as they freed,
+        // so the next frame missed too and the direct path never recovered
+        // (0/120, fullscreen, 2026-10-02). Staged stays as the safety net.
+        let mut done_at: Option<std::time::Instant> = None;
         let pair = {
             let t0 = std::time::Instant::now();
             let mut q = sh.q.lock().unwrap();
@@ -3077,14 +3085,19 @@ impl MoltenVkBackend {
                 if q.parked.len() >= 2 { let a = q.parked.remove(0); let b = q.parked.remove(0); sh.cv.notify_all(); break Some((a, b)); }
                 if q.dead || q.quit { break None; }
                 let frame_done = unsafe { dev.get_fence_status(frame_fence) }.unwrap_or(true);
-                let limit = if frame_done { 0 } else { 120 };
-                if t0.elapsed() >= std::time::Duration::from_millis(limit) {
+                if frame_done && done_at.is_none() { done_at = Some(std::time::Instant::now()); }
+                // The grace runs from the frame's completion; the frame itself
+                // gets a generous bound (a frame never takes 500 ms here).
+                let grace = std::time::Duration::from_millis((j.half_ns / 1_000_000 + 10).min(60));
+                let out = done_at.map_or(t0.elapsed() >= std::time::Duration::from_millis(500), |d| d.elapsed() >= grace);
+                if out {
                     if fg_prof_on() { eprintln!("fg-direct miss: parked {} outstanding {} busy {} jobs {} after {:.1} ms (frame done {frame_done})", q.parked.len(), q.outstanding, q.busy, q.jobs.len(), t0.elapsed().as_secs_f64() * 1e3); }
                     break None;
                 }
                 q = sh.cv.wait_timeout(q, std::time::Duration::from_millis(1)).unwrap().0;
             }
         };
+        if let Some(d) = done_at { FG_DIRECT_WAIT_NS.fetch_add(d.elapsed().as_nanos() as u64, Ordering::Relaxed); }
         let Some((g0, r0)) = pair else { return };
         let (cb, fence) = { let f = self.fgp.lock().unwrap(); (f.slots[j.slot].cb, f.slots[j.slot].fence) };
         let range = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1);
