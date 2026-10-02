@@ -313,6 +313,10 @@ pub struct MoltenVkBackend {
     /// VK_QUEUE_TRANSFER_BIT`). Held for later `vkQueueSubmit` calls.
     _queue: vk::Queue,
     _queue_family: u32,
+    /// vkExportMetalObjectsEXT (VK_EXT_metal_objects), when the device has
+    /// it: the Metal objects behind the device, the frame queue and a
+    /// buffer's memory, for Metal-side passes (MetalFX) on the same queue.
+    export_metal: Option<vk::PFN_vkExportMetalObjectsEXT>,
 
     /// VkInstance. Stays alive until `Drop`.
     instance: ash::Instance,
@@ -671,6 +675,12 @@ impl MoltenVkBackend {
         if swapchain_ok {
             device_exts.push(khr::swapchain::NAME.as_ptr());
         }
+        // VK_EXT_metal_objects: the Metal objects behind Vulkan ones
+        // (`metal_device_queue`, `metal_buffer`).
+        let metal_objects_ok = device_ext_present(&instance, physical, vk::EXT_METAL_OBJECTS_NAME);
+        if metal_objects_ok {
+            device_exts.push(vk::EXT_METAL_OBJECTS_NAME.as_ptr());
+        }
         let host_import_ok = device_ext_present(&instance, physical, ash::ext::external_memory_host::NAME);
         if host_import_ok {
             device_exts.push(ash::ext::external_memory_host::NAME.as_ptr());
@@ -705,6 +715,10 @@ impl MoltenVkBackend {
             }
         };
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
+        let export_metal: Option<vk::PFN_vkExportMetalObjectsEXT> = if metal_objects_ok {
+            unsafe { instance.get_device_proc_addr(device.handle(), c"vkExportMetalObjectsEXT".as_ptr()) }
+                .map(|f| unsafe { std::mem::transmute::<_, vk::PFN_vkExportMetalObjectsEXT>(f) })
+        } else { None };
         let build_queue = build_family.map_or(queue, |bf| unsafe { device.get_device_queue(bf, 0) });
 
         // Command pool for per-submit command buffers (transient +
@@ -825,6 +839,7 @@ impl MoltenVkBackend {
             generation,
             device,
             _queue: queue,
+            export_metal,
             _queue_family: queue_family,
             instance,
             _entry: entry,
@@ -1948,6 +1963,30 @@ impl MoltenVkBackend {
     /// values sum to the frame's exec time up to the last stamped dispatch.
     pub fn measured_dispatch_times_s(&self) -> Vec<f64> {
         self.last_dispatch_ns.lock().unwrap().iter().map(|&ns| ns as f64 * 1e-9).collect()
+    }
+
+    /// The `id<MTLDevice>` and the frame queue's `id<MTLCommandQueue>`
+    /// (VK_EXT_metal_objects), unretained: valid while the backend lives.
+    /// A Metal command buffer committed on that queue after a frame's
+    /// submission runs after it (one queue, commit order).
+    pub fn metal_device_queue(&self) -> Option<(*mut std::ffi::c_void, *mut std::ffi::c_void)> {
+        let f = self.export_metal?;
+        let mut q = vk::ExportMetalCommandQueueInfoEXT::default().queue(self._queue);
+        let mut d = vk::ExportMetalDeviceInfoEXT::default();
+        let mut info = vk::ExportMetalObjectsInfoEXT::default().push_next(&mut d).push_next(&mut q);
+        unsafe { f(self.device.handle(), &mut info) };
+        (!d.mtl_device.is_null() && !q.mtl_command_queue.is_null()).then(|| (d.mtl_device as *mut _, q.mtl_command_queue as *mut _))
+    }
+
+    /// The `id<MTLBuffer>` behind a buffer's memory (its primary side),
+    /// unretained: valid while the buffer lives.
+    pub fn metal_buffer(&self, buffer_id: ResourceId) -> Option<*mut std::ffi::c_void> {
+        let f = self.export_metal?;
+        let mem = self.buffers.lock().unwrap().get(&buffer_id.raw())?.memory;
+        let mut b = vk::ExportMetalBufferInfoEXT::default().memory(mem);
+        let mut info = vk::ExportMetalObjectsInfoEXT::default().push_next(&mut b);
+        unsafe { f(self.device.handle(), &mut info) };
+        (!b.mtl_buffer.is_null()).then(|| b.mtl_buffer as *mut _)
     }
 
     /// Cumulative measured GPU exec time across all timed frames, seconds.
