@@ -285,6 +285,29 @@ struct MvkPipelineVk {
     fs:          vk::ShaderModule,
 }
 
+/// The GPU sync point handed to the host-split callback (`set_host_split`):
+/// the host's own command stream (Metal, through VK_EXT_metal_objects) must
+/// wait until `event` reaches `wait` before its first read and set it to
+/// `signal` after its last write; the frame's next Vulkan work waits for
+/// `signal`. `event` is an `id<MTLSharedEvent>` (0: no sync available — the
+/// two streams are then unordered; logged).
+///
+/// Without it, MoltenVK's command buffers and the host's on the same Metal
+/// queue overlapped (MoltenVK's resources are untracked): the MetalFX output
+/// was read before it was written and every frame showed the previous one,
+/// and the interpolator read the display image before it was written — its
+/// in-between frame went half a frame BACK (measured 2026-10-02, a 3 m/s
+/// strafe: +16 px against native, generated +8 px the wrong way).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HostSync {
+    /// `id<MTLSharedEvent>` as an integer (0: no sync).
+    pub event: u64,
+    /// Wait for this value before the first read.
+    pub wait: u64,
+    /// Set this value after the last write.
+    pub signal: u64,
+}
+
 /// Tier-3 Vulkan backend. Wraps a loaded `VkInstance` + `VkDevice`.
 ///
 /// One instance per host endpoint; `submit_frame` is internally
@@ -328,7 +351,11 @@ pub struct MoltenVkBackend {
     /// buffer's memory, for Metal-side passes (MetalFX) on the same queue.
     export_metal: Option<vk::PFN_vkExportMetalObjectsEXT>,
     /// The FrameOp::HostSplit callback (`set_host_split`).
-    host_split: Mutex<Option<Box<dyn Fn(u32) + Send + Sync>>>,
+    host_split: Mutex<Option<Box<dyn Fn(u32, HostSync) -> bool + Send + Sync>>>,
+    /// The host splits' timeline semaphore and its MTLSharedEvent (HostSync),
+    /// and the last value handed out.
+    split_sync: Option<(vk::Semaphore, u64)>,
+    split_val: AtomicU64,
     /// VK_GOOGLE_display_timing, when the device has it: every present is
     /// tagged with its frame's sequence number and its actual on-screen time
     /// read back (`present_timings`) — the latency probe.
@@ -1049,15 +1076,18 @@ impl MoltenVkBackend {
         // chain and, when present, request the extensions unconditionally.
         let mut as_query = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
         let mut rq_query = vk::PhysicalDeviceRayQueryFeaturesKHR::default();
+        let mut tl_query = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
         let mut pid_query = vk::PhysicalDevicePresentIdFeaturesKHR::default();
         let mut pw_query = vk::PhysicalDevicePresentWaitFeaturesKHR::default();
         let mut feat_query = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut as_query)
             .push_next(&mut rq_query)
             .push_next(&mut pid_query)
-            .push_next(&mut pw_query);
+            .push_next(&mut pw_query)
+            .push_next(&mut tl_query);
         unsafe { instance.get_physical_device_features2(physical, &mut feat_query) };
         let (pid_feature, pw_feature) = (pid_query.present_id == vk::TRUE, pw_query.present_wait == vk::TRUE);
+        let timeline_ok = tl_query.timeline_semaphore == vk::TRUE;
         let ray_query = as_query.acceleration_structure == vk::TRUE
             && rq_query.ray_query == vk::TRUE;
 
@@ -1101,7 +1131,8 @@ impl MoltenVkBackend {
         // + descriptorIndexing (core 1.2). Kept alive until create_device returns.
         let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(ray_query)
-            .descriptor_indexing(ray_query);
+            .descriptor_indexing(ray_query)
+            .timeline_semaphore(timeline_ok);
         let mut as_feat = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
             .acceleration_structure(ray_query);
         let mut rq_feat = vk::PhysicalDeviceRayQueryFeaturesKHR::default()
@@ -1110,9 +1141,9 @@ impl MoltenVkBackend {
         let mut device_create = vk::DeviceCreateInfo::default()
             .queue_create_infos(&q_creates)
             .enabled_extension_names(&device_exts);
+        device_create = device_create.push_next(&mut v12);
         if ray_query {
             device_create = device_create
-                .push_next(&mut v12)
                 .push_next(&mut as_feat)
                 .push_next(&mut rq_feat);
         }
@@ -1144,6 +1175,24 @@ impl MoltenVkBackend {
                 .map(|f| unsafe { std::mem::transmute::<_, vk::PFN_vkExportMetalObjectsEXT>(f) })
         } else { None };
         let build_queue = build_family.map_or(queue, |bf| unsafe { device.get_device_queue(bf, 0) });
+        // The host splits' sync (HostSync): a timeline semaphore exported as
+        // an MTLSharedEvent.
+        let split_sync: Option<(vk::Semaphore, u64)> = match (export_metal, timeline_ok) {
+            (Some(f), true) => unsafe {
+                let mut tci = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE).initial_value(0);
+                let mut eci = vk::ExportMetalObjectCreateInfoEXT::default().export_object_type(vk::ExportMetalObjectTypeFlagsEXT::METAL_SHARED_EVENT);
+                match device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut tci).push_next(&mut eci), None) {
+                    Ok(sem) => {
+                        let mut ev = vk::ExportMetalSharedEventInfoEXT::default().semaphore(sem);
+                        let mut info = vk::ExportMetalObjectsInfoEXT::default().push_next(&mut ev);
+                        f(device.handle(), &mut info);
+                        if ev.mtl_shared_event.is_null() { device.destroy_semaphore(sem, None); None } else { Some((sem, ev.mtl_shared_event as u64)) }
+                    }
+                    Err(_) => None,
+                }
+            },
+            _ => None,
+        };
         let disp_timing = if disp_timing_ok { Some(ash::google::display_timing::Device::new(&instance, &device)) } else { None };
 
         // Command pool for per-submit command buffers (transient +
@@ -1271,6 +1320,8 @@ impl MoltenVkBackend {
             present_wait,
             export_metal,
             host_split: Mutex::new(None),
+            split_sync,
+            split_val: AtomicU64::new(0),
             disp_timing,
             timings: Mutex::new(std::collections::VecDeque::new()),
             _queue_family: queue_family,
@@ -2481,7 +2532,10 @@ impl MoltenVkBackend {
     /// synchronously), then `f(id)` runs on the submitting thread — work it
     /// commits on the frame queue (`metal_device_queue`) runs after them and
     /// before the rest of the frame. It must not call back into the backend.
-    pub fn set_host_split(&self, f: Option<Box<dyn Fn(u32) + Send + Sync>>) { *self.host_split.lock().unwrap() = f; }
+    /// The callback returns whether its work signals the HostSync (false:
+    /// nothing encoded — the backend signals instead, so the frame never
+    /// waits on it).
+    pub fn set_host_split(&self, f: Option<Box<dyn Fn(u32, HostSync) -> bool + Send + Sync>>) { *self.host_split.lock().unwrap() = f; }
 
     /// The `id<MTLBuffer>` behind a buffer's memory (its primary side),
     /// unretained: valid while the buffer lives.
@@ -2974,6 +3028,7 @@ impl Drop for MoltenVkBackend {
         self.detach_present();
         unsafe {
             let _ = self.device.device_wait_idle();
+            if let Some((sem, _)) = self.split_sync { self.device.destroy_semaphore(sem, None); }
             for (_, cp) in self.compute_pipelines.lock().unwrap().drain() {
                 self.device.destroy_pipeline(cp.pipeline, None);
                 self.device.destroy_pipeline_layout(cp.layout, None);
@@ -3213,6 +3268,9 @@ impl MoltenVkBackend {
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
         }
         let mut split_cbs: Vec<vk::CommandBuffer> = Vec::new();
+        // The last host split's signal value: the next Vulkan submit of the
+        // frame waits for it (HostSync).
+        let mut split_wait: Option<u64> = None;
 
         // Measured GPU exec time (D-M6): reset the pool + stamp the top of
         // the pipe before any work; stamp the bottom just before close.
@@ -3722,11 +3780,42 @@ impl MoltenVkBackend {
                         dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS,
                             vk::DependencyFlags::empty(), &[barrier], &[], &[]);
                         dev.end_command_buffer(cb)?;
-                        let cbs = [cb];
-                        { let _q = self.ql(); dev.queue_submit(self._queue, &[vk::SubmitInfo::default().command_buffers(&cbs)], vk::Fence::null()) }?;
                     }
+                    let cbs = [cb];
+                    // The sync point: this part signals v − 1 (and waits for the
+                    // previous split's host work), the host's work waits for v − 1
+                    // and signals v, the frame's next part waits for v.
+                    let sync = match self.split_sync {
+                        Some((sem, ev)) => {
+                            let v = self.split_val.fetch_add(2, Ordering::Relaxed) + 2;
+                            let (ws, wv): (Vec<vk::Semaphore>, Vec<u64>) = split_wait.map_or((vec![], vec![]), |w| (vec![sem], vec![w]));
+                            let wst = vec![vk::PipelineStageFlags::ALL_COMMANDS; ws.len()];
+                            let (ss, sv) = ([sem], [v - 1]);
+                            let mut tsi = vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&wv).signal_semaphore_values(&sv);
+                            let si = vk::SubmitInfo::default().command_buffers(&cbs).wait_semaphores(&ws).wait_dst_stage_mask(&wst)
+                                .signal_semaphores(&ss).push_next(&mut tsi);
+                            { let _q = self.ql(); unsafe { dev.queue_submit(self._queue, &[si], vk::Fence::null()) } }?;
+                            Some((sem, HostSync { event: ev, wait: v - 1, signal: v }))
+                        }
+                        None => {
+                            static ONCE: std::sync::Once = std::sync::Once::new();
+                            ONCE.call_once(|| log::warn!("MoltenVk host split: NO SYNC (no VK_EXT_metal_objects shared event or timeline semaphores) — the host's Metal work and the frame's are unordered"));
+                            { let _q = self.ql(); unsafe { dev.queue_submit(self._queue, &[vk::SubmitInfo::default().command_buffers(&cbs)], vk::Fence::null()) } }?;
+                            None
+                        }
+                    };
                     split_cbs.push(cb);
-                    f(id);
+                    let signalled = f(id, sync.map_or(HostSync::default(), |s| s.1));
+                    if let Some((sem, hs)) = sync {
+                        if !signalled {
+                            // Nothing encoded: signal v on the queue after this part.
+                            let (ss, sv) = ([sem], [hs.signal]);
+                            let mut tsi = vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&sv);
+                            let si = vk::SubmitInfo::default().signal_semaphores(&ss).push_next(&mut tsi);
+                            { let _q = self.ql(); unsafe { dev.queue_submit(self._queue, &[si], vk::Fence::null()) } }?;
+                        }
+                        split_wait = Some(hs.signal);
+                    }
                     cb = unsafe { dev.allocate_command_buffers(&alloc)? }[0];
                     unsafe {
                         dev.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default()
@@ -3773,10 +3862,19 @@ impl MoltenVkBackend {
             None => (vec![], vec![]),
         };
 
-        let wait_stage = vec![vk::PipelineStageFlags::TRANSFER; wait_s.len()];
-        let submit = vk::SubmitInfo::default().command_buffers(&cbs)
+        let mut wait_s = wait_s;
+        let mut wait_stage = vec![vk::PipelineStageFlags::TRANSFER; wait_s.len()];
+        // The last host split's work before this part (HostSync); binary
+        // semaphores' values in the timeline info are ignored.
+        let mut wait_vals = vec![0u64; wait_s.len()];
+        if let (Some(w), Some((sem, _))) = (split_wait, self.split_sync) {
+            wait_s.push(sem); wait_stage.push(vk::PipelineStageFlags::ALL_COMMANDS); wait_vals.push(w);
+        }
+        let mut tsi = vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&wait_vals);
+        let mut submit = vk::SubmitInfo::default().command_buffers(&cbs)
             .wait_semaphores(&wait_s).wait_dst_stage_mask(&wait_stage)
             .signal_semaphores(&signal_s);
+        if split_wait.is_some() { submit = submit.push_next(&mut tsi); }
         { let _q = self.ql(); unsafe { dev.queue_submit(self._queue, &[submit], fence)?; } }
         let ms_submit = t_sub.elapsed().as_secs_f64() * 1e3;
 
