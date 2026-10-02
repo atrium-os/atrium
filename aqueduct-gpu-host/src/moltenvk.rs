@@ -566,6 +566,12 @@ struct FgJob {
     /// the render loop never waits for the display, so pacing cannot feed
     /// back into it.
     t_ready: u64,
+    /// The two drawables (generated, real) the frame's own command buffer
+    /// already blitted into — taken from the thread's parked ones; the thread
+    /// only times their presents. None: the staged path (the thread blits).
+    direct: Option<[(vk::SwapchainKHR, u32); 2]>,
+    /// Signalled when the direct blit is done (null: staged).
+    blit_fence: vk::Fence,
 }
 
 #[derive(Default)]
@@ -585,6 +591,20 @@ struct FgQueue {
     /// slowed the pacing into more drops (2026-10-02).
     last_ready: u64,
     period_ns: u64,
+    /// Drawables the thread acquired ahead (fence waited, CAMetalDrawable
+    /// fetched) for the next frame's tail to blit into in its own command
+    /// buffer. Blits on the thread's queue waited behind the next frame's
+    /// render (34–36 ms a pair, 2026-10-02); in the frame they cost nothing.
+    parked: Vec<(vk::SwapchainKHR, u32)>,
+    /// Drawables acquired and not yet presented (parked, taken by a frame, or
+    /// held by the thread). One is always on screen, so at most two can be:
+    /// acquiring a third blocked in nextDrawable until its 1 s timeout while
+    /// the pair that would free one waited behind it (2026-10-02).
+    outstanding: u32,
+    /// On quit, present the parked drawables (frame generation turned off:
+    /// the inline path needs them back; a core swapchain cannot release an
+    /// acquired image unpresented). Otherwise they go with the swapchain.
+    present_parked: bool,
 }
 
 struct FgShared {
@@ -595,6 +615,10 @@ struct FgShared {
 struct FgSlot {
     gen: (vk::Image, vk::DeviceMemory),
     real: (vk::Image, vk::DeviceMemory),
+    /// The between-frames blit into parked drawables (`fg_direct`): its
+    /// command buffer (frame pool, render thread only) and fence.
+    cb: vk::CommandBuffer,
+    fence: vk::Fence,
 }
 
 #[derive(Default)]
@@ -634,7 +658,8 @@ fn fg_present_thread(c: FgCtx) {
     let ql = || c.qlock.lock().unwrap_or_else(|e| e.into_inner());
     let sl = || c.slock.lock().unwrap_or_else(|e| e.into_inner());
     let dev = &c.dev;
-    // Per image of the pair: a command buffer and a fence; one acquire fence.
+    // Per image of the pair (staged path): a command buffer and a fence; one
+    // acquire fence.
     let setup = unsafe {
         dev.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(c.qfam)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
@@ -662,13 +687,35 @@ fn fg_present_thread(c: FgCtx) {
     let barrier = |img, from, to, sa, da| vk::ImageMemoryBarrier::default().image(img).subresource_range(range)
         .old_layout(from).new_layout(to).src_access_mask(sa).dst_access_mask(da)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED);
-    let mut tw = std::time::Instant::now();
-    // Standard pacer state: present ids (strictly increasing per swapchain),
-    // the last real frame's (swapchain, id), the hand-off period.
-    let mut next_id: u64 = 1;
-    let mut last_call: Option<u64> = None;
-    let mut ids: std::collections::VecDeque<(vk::SwapchainKHR, u64)> = std::collections::VecDeque::new();
-    let mut period_ns: u64;
+    // The swapchain's handles: not recreated or destroyed while this thread
+    // runs (recreate and detach stop it first).
+    let handles = || {
+        let g = c.swap.lock().unwrap();
+        g.as_ref().and_then(|sw| (!sw.stale && sw.swapchain != vk::SwapchainKHR::null()).then(|| (sw.swapchain, sw.images.clone(), sw.done.clone(), sw.extent)))
+    };
+    // One drawable: acquired with a FENCE, waited here, unlocked (MoltenVK's
+    // submit blocks the calling thread until an acquire semaphore signals),
+    // and its CAMetalDrawable fetched now (MoltenVK takes it lazily, at the
+    // first use of the texture — inside a submit; 8–12 ms a frame).
+    let acquire_one = |sc: vk::SwapchainKHR, images: &[vk::Image]| -> Option<u32> {
+        let t0 = MoltenVkBackend::host_time_ns();
+        let idx = match unsafe { c.sd.acquire_next_image(sc, 1_000_000_000, vk::Semaphore::null(), acq_fence) } {
+            Ok((i, _)) => i,
+            Err(e) => { log::warn!("MoltenVk present thread: acquire {e:?}"); return None; }
+        };
+        let w = unsafe { dev.wait_for_fences(&[acq_fence], true, 1_000_000_000) };
+        unsafe { let _ = dev.reset_fences(&[acq_fence]); }
+        if let Err(e) = w { log::warn!("MoltenVk present thread: acquire fence {e:?}"); return None; }
+        if let Some(f) = c.export_metal {
+            let mut ti = vk::ExportMetalTextureInfoEXT::default().image(images[idx as usize]).plane(vk::ImageAspectFlags::PLANE_0);
+            let mut info = vk::ExportMetalObjectsInfoEXT::default().push_next(&mut ti);
+            let t1 = MoltenVkBackend::host_time_ns();
+            unsafe { f(dev.handle(), &mut info) };
+            if c.log { eprintln!("acquire-one idx {idx} acquire+fence {:.1} ms drawable {:.1} ms", (t1 - t0) as f64 * 1e-6, (MoltenVkBackend::host_time_ns() - t1) as f64 * 1e-6); }
+        }
+        Some(idx)
+    };
+    let mark_stale = || { if let Some(sw) = c.swap.lock().unwrap().as_mut() { sw.stale = true; } };
     // A precise wait: the OS sleep overshoots by milliseconds (macOS
     // coalesces timers — two half-period sleeps took 47–50 ms against a 40 ms
     // frame, 2026-10-02), so sleep to 1.5 ms short and yield the rest.
@@ -678,145 +725,146 @@ fn fg_present_thread(c: FgCtx) {
         let left = t - now;
         if left > 2_000_000 { std::thread::sleep(std::time::Duration::from_nanos(left - 1_500_000)); } else { std::thread::yield_now(); }
     };
+    // Pacer state: present ids (strictly increasing per swapchain), the last
+    // present call, recent (swapchain, id) for the back-pressure.
+    let mut next_id: u64 = 1;
+    let mut last_call: Option<u64> = None;
+    let mut ids: std::collections::VecDeque<(vk::SwapchainKHR, u64)> = std::collections::VecDeque::new();
+    let mut tw = std::time::Instant::now();
     loop {
+        // Keep two drawables parked for the next frame's tail.
+        loop {
+            {
+                let q = c.sh.q.lock().unwrap();
+                if q.quit || !q.jobs.is_empty() || q.parked.len() >= 2 || q.outstanding >= 2 { break; }
+            }
+            let Some((sc, images, _, _)) = handles() else { break };
+            match acquire_one(sc, &images) {
+                Some(idx) => { let mut q = c.sh.q.lock().unwrap(); q.parked.push((sc, idx)); q.outstanding += 1; c.sh.cv.notify_all(); }
+                None => { mark_stale(); break; }
+            }
+        }
         let mut pr = [0u64; 10];
         let job = {
             let mut q = c.sh.q.lock().unwrap();
-            while q.jobs.is_empty() && !q.quit { q = c.sh.cv.wait(q).unwrap(); }
+            while q.jobs.is_empty() && !q.quit && (q.parked.len() >= 2 || q.outstanding >= 2 || handles().is_none()) { q = c.sh.cv.wait_timeout(q, std::time::Duration::from_millis(200)).unwrap().0; }
+            if q.jobs.is_empty() && !q.quit { continue; }   // top up again
             let Some(job) = q.jobs.pop_front() else { break };
             q.busy = true;
             job
         };
         pr[0] = tw.elapsed().as_nanos() as u64;
+        pr[9] = job.direct.is_some() as u64;
         let half = job.half_ns;
-        period_ns = 2 * half;
+        let period_ns = 2 * half;
         let mut t = std::time::Instant::now();
         macro_rules! lap { ($k:expr) => {{ pr[$k] += t.elapsed().as_nanos() as u64; t = std::time::Instant::now(); }}; }
         let mut stale = false;
         let mut submitted = [false; 2];
-        // The swapchain's handles: it is not recreated or destroyed while a
-        // job is in hand (recreate/detach drain this thread first).
-        let h = {
-            let g = c.swap.lock().unwrap();
-            g.as_ref().and_then(|sw| {
-                if sw.stale || sw.swapchain == vk::SwapchainKHR::null() { return None; }
-                Some((sw.swapchain, sw.images.clone(), sw.done.clone(), sw.extent))
-            })
-        };
-        if let Some((sc, images, done, ext)) = h {
-            // The generated frame first, presented before the real one is
-            // acquired: with three drawables, the real frame's drawable is free
-            // only once the generated one is on screen (acquiring both first
-            // waited 13 + 33 ms a pair, 2026-10-02).
+        let mut gen_call: Option<u64> = None;
+        if let Some((sc, images, done, ext)) = handles() {
             for (k, (src, gen)) in [(job.gen, true), (job.real, false)].into_iter().enumerate() {
-                t = std::time::Instant::now();
-                let idx = match unsafe { c.sd.acquire_next_image(sc, 1_000_000_000, vk::Semaphore::null(), acq_fence) } {
-                    Ok((i, _)) => i,
-                    Err(e) => { log::warn!("MoltenVk present thread: acquire {e:?}"); stale = true; break; }
+                // The drawable: the one the frame already blitted into (direct),
+                // else a parked one or a new one, blitted here (staged).
+                let (idx, waits): (u32, Vec<vk::Semaphore>) = if let Some(d) = job.direct.filter(|d| d[k].0 == sc) {
+                    if gen {
+                        t = std::time::Instant::now();
+                        let r = unsafe { dev.wait_for_fences(&[job.blit_fence], true, 1_000_000_000) };
+                        if r.is_err() { log::warn!("MoltenVk present thread: direct blit fence {r:?}"); }
+                        lap!(6);
+                    }
+                    (d[k].1, vec![])
+                } else {
+                    t = std::time::Instant::now();
+                    let parked = { let mut q = c.sh.q.lock().unwrap(); q.parked.iter().position(|p| p.0 == sc).map(|i| q.parked.remove(i).1) };
+                    let fresh = if parked.is_none() { acquire_one(sc, &images) } else { None };
+                    if fresh.is_some() { c.sh.q.lock().unwrap().outstanding += 1; }
+                    let Some(idx) = parked.or(fresh) else { stale = true; break };
+                    lap!(if gen { 1 } else { 2 });
+                    let target = images[idx as usize];
+                    let cb = cbs[k];
+                    unsafe {
+                        let _ = dev.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty());
+                        let _ = dev.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT));
+                        let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                        dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[],
+                            &[barrier(target, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE)]);
+                        let (ew, eh) = (ext.width as i32, ext.height as i32);
+                        let blit = vk::ImageBlit::default().src_subresource(layers).dst_subresource(layers)
+                            .src_offsets([vk::Offset3D::default(), vk::Offset3D { x: job.w as i32, y: job.h as i32, z: 1 }])
+                            .dst_offsets([vk::Offset3D::default(), vk::Offset3D { x: ew, y: eh, z: 1 }]);
+                        let filter = if job.w as i32 == ew && job.h as i32 == eh { vk::Filter::NEAREST } else { vk::Filter::LINEAR };
+                        dev.cmd_blit_image(cb, src, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, target, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], filter);
+                        dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::DependencyFlags::empty(), &[], &[],
+                            &[barrier(target, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty())]);
+                        let _ = dev.end_command_buffer(cb);
+                        let one = [cb];
+                        let sig = [done[idx as usize]];
+                        let si = vk::SubmitInfo::default().command_buffers(&one).signal_semaphores(&sig);
+                        let sub = { let _g = sl(); dev.queue_submit(c.queue, &[si], fences[k]) };
+                        lap!(3);
+                        if let Err(e) = sub { log::error!("MoltenVk present thread: submit {e:?}"); stale = true; break; }
+                        submitted[k] = true;
+                        // Not waited: on this queue the blit runs behind the next
+                        // frame's long dispatches (34–36 ms a pair); waiting made
+                        // one missed frame miss the next ones too. The staged
+                        // path is the fallback; the direct path is the norm.
+                    }
+                    (idx, vec![done[idx as usize]])
                 };
-                let w = unsafe { dev.wait_for_fences(&[acq_fence], true, 1_000_000_000) };
-                unsafe { let _ = dev.reset_fences(&[acq_fence]); }
-                if let Err(e) = w { log::warn!("MoltenVk present thread: acquire fence {e:?}"); stale = true; break; }
-                // MoltenVK takes the CAMetalDrawable lazily: the first use of the
-                // image's texture calls [layer nextDrawable], which waits for a
-                // free drawable — inside vkQueueSubmit, under the queue lock
-                // (8–12 ms a frame, 2026-10-02). Asking for the texture here
-                // takes that wait on this thread, unlocked.
-                if let Some(f) = c.export_metal {
-                    let mut ti = vk::ExportMetalTextureInfoEXT::default().image(images[idx as usize]).plane(vk::ImageAspectFlags::PLANE_0);
-                    let mut info = vk::ExportMetalObjectsInfoEXT::default().push_next(&mut ti);
-                    unsafe { f(dev.handle(), &mut info) };
-                }
-                lap!(if gen { 1 } else { 2 });
-                let target = images[idx as usize];
-                let cb = cbs[k];
-                unsafe {
-                    let _ = dev.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty());
-                    let _ = dev.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT));
-                    // The staged images are complete (handed over after their
-                    // frame's fence); the barrier makes their writes visible.
-                    let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-                    dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[],
-                        &[barrier(target, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE)]);
-                    let (ew, eh) = (ext.width as i32, ext.height as i32);
-                    let blit = vk::ImageBlit::default().src_subresource(layers).dst_subresource(layers)
-                        .src_offsets([vk::Offset3D::default(), vk::Offset3D { x: job.w as i32, y: job.h as i32, z: 1 }])
-                        .dst_offsets([vk::Offset3D::default(), vk::Offset3D { x: ew, y: eh, z: 1 }]);
-                    let filter = if job.w as i32 == ew && job.h as i32 == eh { vk::Filter::NEAREST } else { vk::Filter::LINEAR };
-                    dev.cmd_blit_image(cb, src, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, target, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], filter);
-                    dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::DependencyFlags::empty(), &[], &[],
-                        &[barrier(target, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty())]);
-                    let _ = dev.end_command_buffer(cb);
-                    let one = [cb];
-                    let sig = [done[idx as usize]];
-                    let si = vk::SubmitInfo::default().command_buffers(&one).signal_semaphores(&sig);
-                    let sub = { let _g = sl(); dev.queue_submit(c.queue, &[si], fences[k]) };
-                    lap!(3);
-                    if let Err(e) = sub { log::error!("MoltenVk present thread: submit {e:?}"); stale = true; break; }
-                    submitted[k] = true;
-                    // The generated frame (the LEAD): at least half a period after
-                    // the previous image; its real frame FOLLOWS (MoltenVK fork bit
-                    // 62): at the generated frame's actual on-screen time plus
-                    // half a period.
-                    let id = if gen { job.seq as u32 | 0x8000_0000 } else { job.seq as u32 & 0x7fff_ffff };
-                    // Pacing. The anchor is the image this one must follow by
-                    // half a period: for the generated frame the previous real
-                    // one, for the real frame its generated one.
-                    let kid = next_id; next_id += 1;
-                    match c.pacer {
-                        PacerKind::HostTimed => {
-                            // Back-pressure: the present three back is on screen.
-                            // (Two back waited on every image: MoltenVK reports a
-                            // present ~12 ms after its on-screen time, 2026-10-02.)
-                            if ids.len() >= 3 && ids[ids.len() - 3].0 == sc {
-                                if let Some(pw) = c.present_wait.as_ref() {
-                                    let r = pw.wait_for_present(sc, ids[ids.len() - 3].1, 100_000_000);
-                                    if r.is_err() && c.log { eprintln!("present-wait {:?}", r); }
-                                }
-                            }
-                            lap!(8);
-                            // Anchored to the frame's hand-off, not to the previous
-                            // call (spacing each call half a period after the last
-                            // let overheads accumulate: the cycle outgrew the frame
-                            // and the mailbox dropped frames, 2026-10-02): the
-                            // generated frame as soon as it is ready, its real
-                            // frame half a period after the hand-off — half a
-                            // frame of added latency, never more. Either at least a
-                            // quarter period after the previous call, so bunched
-                            // frames do not land on one refresh.
-                            let floor = last_call.map_or(0, |lc| lc + half / 2);
-                            let target = if gen { floor } else { floor.max(job.t_ready + half) };
-                            sleep_until(target);
-                            lap!(7);
+                let id = if gen { job.seq as u32 | 0x8000_0000 } else { job.seq as u32 & 0x7fff_ffff };
+                let kid = next_id; next_id += 1;
+                if c.pacer == PacerKind::HostTimed {
+                    // Back-pressure: the present three back is on screen.
+                    // (Two back waited on every image: MoltenVK reports a
+                    // present ~12 ms after its on-screen time, 2026-10-02.)
+                    if ids.len() >= 3 && ids[ids.len() - 3].0 == sc {
+                        if let Some(pw) = c.present_wait.as_ref() {
+                            let r = unsafe { pw.wait_for_present(sc, ids[ids.len() - 3].1, 100_000_000) };
+                            if r.is_err() && c.log { eprintln!("present-wait {:?}", r); }
                         }
-                        PacerKind::None => {}
                     }
-                    last_call = Some(MoltenVkBackend::host_time_ns());
-                    ids.push_back((sc, kid));
-                    while ids.len() > 4 { ids.pop_front(); }
-                    if c.log { eprintln!("present-call {id:#x} at {}", MoltenVkBackend::host_time_ns()); }
-                    let (scs, idxs) = ([sc], [idx]);
-                    // VK_GOOGLE_display_timing tags the present for the latency
-                    // probe only (no desired time).
-                    let times = [vk::PresentTimeGOOGLE::default().present_id(id).desired_present_time(0)];
-                    let mut pt = vk::PresentTimesInfoGOOGLE::default().times(&times);
-                    let kids = [kid];
-                    let mut pid = vk::PresentIdKHR::default().present_ids(&kids);
-                    let mut pi = vk::PresentInfoKHR::default().wait_semaphores(&sig).swapchains(&scs).image_indices(&idxs);
-                    if c.timing { pi = pi.push_next(&mut pt); }
-                    if c.present_wait.is_some() { pi = pi.push_next(&mut pid); }
-                    let r = { let _g = ql(); c.sd.queue_present(c.queue, &pi) };
-                    lap!(if gen { 4 } else { 5 });
-                    match r {
-                        Ok(false) => {}
-                        Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => { stale = true; break; }
-                        Err(e) => log::warn!("MoltenVk present thread: present {e:?}"),
-                    }
+                    lap!(8);
+                    // The generated frame as soon as it is ready; its real
+                    // frame half a period after the generated one's present
+                    // call (and after the hand-off + half). Not spaced from the
+                    // previous call: overheads accumulated, the cycle outgrew
+                    // the frame and the mailbox dropped frames (2026-10-02).
+                    // Either at least a quarter period after the previous call,
+                    // so bunched frames do not land on one refresh.
+                    let floor = last_call.map_or(0, |lc| lc + half / 2);
+                    let target = if gen { floor } else { floor.max(gen_call.unwrap_or(job.t_ready) + half) };
+                    sleep_until(target);
+                    lap!(7);
+                }
+                last_call = Some(MoltenVkBackend::host_time_ns());
+                if gen { gen_call = last_call; }
+                ids.push_back((sc, kid));
+                while ids.len() > 4 { ids.pop_front(); }
+                if c.log { eprintln!("present-call {id:#x} at {}", MoltenVkBackend::host_time_ns()); }
+                let (scs, idxs) = ([sc], [idx]);
+                // VK_GOOGLE_display_timing tags the present for the latency
+                // probe only (no desired time).
+                let times = [vk::PresentTimeGOOGLE::default().present_id(id).desired_present_time(0)];
+                let mut pt = vk::PresentTimesInfoGOOGLE::default().times(&times);
+                let kids = [kid];
+                let mut pid = vk::PresentIdKHR::default().present_ids(&kids);
+                let mut pi = vk::PresentInfoKHR::default().wait_semaphores(&waits).swapchains(&scs).image_indices(&idxs);
+                if c.timing { pi = pi.push_next(&mut pt); }
+                if c.present_wait.is_some() { pi = pi.push_next(&mut pid); }
+                let r = { let _g = ql(); unsafe { c.sd.queue_present(c.queue, &pi) } };
+                { let mut q = c.sh.q.lock().unwrap(); q.outstanding = q.outstanding.saturating_sub(1); }
+                lap!(if gen { 4 } else { 5 });
+                match r {
+                    Ok(false) => {}
+                    Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => { stale = true; break; }
+                    Err(e) => log::warn!("MoltenVk present thread: present {e:?}"),
                 }
             }
         }
-        if stale { if let Some(sw) = c.swap.lock().unwrap().as_mut() { sw.stale = true; } }
-        // The slot is free once the blits have read it.
+        if stale { mark_stale(); }
+        // The slot is free once the blits have read it (direct: the frame's
+        // fence already said so).
         t = std::time::Instant::now();
         let waitf: Vec<vk::Fence> = (0..2).filter(|&k| submitted[k]).map(|k| fences[k]).collect();
         let r = if waitf.is_empty() { Ok(()) } else { unsafe { dev.wait_for_fences(&waitf, true, MoltenVkBackend::wait_timeout_ns(5_000)) } };
@@ -827,8 +875,8 @@ fn fg_present_thread(c: FgCtx) {
             a.1 += 1;
             if a.1 == 120 {
                 let m = |k: usize| a.0[k] as f64 / 120.0 * 1e-6;
-                eprintln!("present-prof: wait job {:.1} | acquire gen {:.1} real {:.1} | submits {:.2} | pacing: back-pressure {:.1} timer {:.1} | present gen {:.2} real {:.2} | blit fences {:.1} ms | period {:.1} ms | render-thread queue-lock waits {:.2} ms/frame",
-                    m(0), m(1), m(2), m(3), m(8), m(7), m(4), m(5), m(6), period_ns as f64 * 1e-6, QLOCK_WAIT_NS.swap(0, Ordering::Relaxed) as f64 / 120.0 * 1e-6);
+                eprintln!("present-prof: wait job {:.1} | acquire gen {:.1} real {:.1} | submits {:.2} | pacing: back-pressure {:.1} timer {:.1} | present gen {:.2} real {:.2} | blit fences {:.1} ms | period {:.1} ms | direct {}/120 | render-thread queue-lock waits {:.2} ms/frame",
+                    m(0), m(1), m(2), m(3), m(8), m(7), m(4), m(5), m(6), period_ns as f64 * 1e-6, a.0[9], QLOCK_WAIT_NS.swap(0, Ordering::Relaxed) as f64 / 120.0 * 1e-6);
                 *a = ([0; 10], 0);
             }
         }
@@ -844,6 +892,33 @@ fn fg_present_thread(c: FgCtx) {
         q.used[job.slot] = false;
         q.busy = false;
         c.sh.cv.notify_all();
+    }
+    // Quit. Frame generation off: hand the parked drawables back by presenting
+    // them (a core swapchain cannot release an acquired image unpresented); a
+    // recreate or detach drops them with the swapchain instead.
+    let (parked, present) = { let mut q = c.sh.q.lock().unwrap(); (std::mem::take(&mut q.parked), q.present_parked) };
+    if present && !parked.is_empty() {
+        if let Some((sc, images, _, _)) = handles() {
+            let cb = cbs[0];
+            let mine: Vec<u32> = parked.iter().filter(|p| p.0 == sc).map(|p| p.1).collect();
+            unsafe {
+                let _ = dev.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty());
+                let _ = dev.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT));
+                let bs: Vec<vk::ImageMemoryBarrier> = mine.iter().map(|&i| barrier(images[i as usize], vk::ImageLayout::UNDEFINED, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::empty(), vk::AccessFlags::empty())).collect();
+                dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::DependencyFlags::empty(), &[], &[], &bs);
+                let _ = dev.end_command_buffer(cb);
+                let one = [cb];
+                let ok = { let _g = sl(); dev.queue_submit(c.queue, &[vk::SubmitInfo::default().command_buffers(&one)], fences[0]) }.is_ok()
+                    && dev.wait_for_fences(&[fences[0]], true, 1_000_000_000).is_ok();
+                if ok {
+                    for i in mine {
+                        let (scs, idxs) = ([sc], [i]);
+                        let pi = vk::PresentInfoKHR::default().swapchains(&scs).image_indices(&idxs);
+                        let _ = { let _g = ql(); c.sd.queue_present(c.queue, &pi) };
+                    }
+                }
+            }
+        }
     }
     unsafe {
         for f in fences { dev.destroy_fence(f, None); }
@@ -2744,7 +2819,9 @@ impl MoltenVkBackend {
                 }
             }
         }
-        self.fg_drain();
+        // The present thread holds acquired drawables of this swapchain: stop
+        // it (they go with the old swapchain); it restarts on the next frame.
+        self.fg_stop(false);
         self.wait_pending().map_err(|e| format!("{e:?}"))?;
         unsafe { let _q = self.ql(); let _ = self.device.queue_wait_idle(self._queue); }
         let mut g = self.swap.lock().unwrap();
@@ -2778,7 +2855,7 @@ impl MoltenVkBackend {
     }
 
     fn detach_present(&self) {
-        self.fg_stop();
+        self.fg_stop(false);
         let mut g = self.swap.lock().unwrap();
         if let Some(sw) = g.take() {
             unsafe {
@@ -2814,9 +2891,9 @@ impl MoltenVkBackend {
 
     /// Stop and join the present thread (it finishes what it holds first) and
     /// free the staging slots.
-    fn fg_stop(&self) {
+    fn fg_stop(&self, present_parked: bool) {
         let (sh, th) = { let mut f = self.fgp.lock().unwrap(); (f.shared.take(), f.thread.take()) };
-        if let Some(sh) = sh.as_ref() { sh.q.lock().unwrap().quit = true; sh.cv.notify_all(); }
+        if let Some(sh) = sh.as_ref() { let mut q = sh.q.lock().unwrap(); q.quit = true; q.present_parked = present_parked; sh.cv.notify_all(); }
         if let Some(t) = th { let _ = t.join(); }
         self.fg_free_slots();
     }
@@ -2826,6 +2903,8 @@ impl MoltenVkBackend {
         unsafe {
             for s in f.slots.drain(..) {
                 for (img, mem) in [s.gen, s.real] { self.device.destroy_image(img, None); self.device.free_memory(mem, None); }
+            self.device.destroy_fence(s.fence, None);
+            self.device.free_command_buffers(self.cmd_pool, &[s.cb]);
             }
         }
         f.w = 0; f.h = 0;
@@ -2870,7 +2949,10 @@ impl MoltenVkBackend {
             self.fg_free_slots();
             let mut slots = Vec::new();
             for _ in 0..FG_SLOTS {
-                slots.push(FgSlot { gen: self.fg_image(w, h)?, real: self.fg_image(w, h)? });
+                let cb = unsafe { self.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(self.cmd_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.ok()?[0];
+                let fence = unsafe { self.device.create_fence(&vk::FenceCreateInfo::default(), None) }.ok()?;
+                slots.push(FgSlot { gen: self.fg_image(w, h)?, real: self.fg_image(w, h)?, cb, fence });
             }
             let mut f = self.fgp.lock().unwrap();
             f.slots = slots; f.w = w; f.h = h;
@@ -2932,7 +3014,80 @@ impl MoltenVkBackend {
                     &[barrier(img, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::TRANSFER_READ)]);
             }
         }
-        Some(FgJob { slot: k, gen: gen_img, real: real_img, w, h, seq: 0, half_ns: period.clamp(8_000_000, 200_000_000) / 2, t_ready: 0 })
+        Some(FgJob { slot: k, gen: gen_img, real: real_img, w, h, seq: 0, half_ns: period.clamp(8_000_000, 200_000_000) / 2, t_ready: 0, direct: None, blit_fence: vk::Fence::null() })
+    }
+
+    /// Frame interpolation, between frames: with the frame's fence not yet
+    /// waited, take two parked drawables (waiting while the GPU still works
+    /// on the frame) and submit, on the frame queue, the blit of the staged
+    /// images into them — it runs as the frame ends, before the next frame's
+    /// work. Recorded in the frame's own tail the drawables were not free yet
+    /// (4 needed, a CAMetalLayer has 3); blitted on the present thread's queue
+    /// they waited behind the next frame's long dispatches (34–36 ms a pair,
+    /// 2026-10-02). No parked pair in time: the job stays staged.
+    fn fg_direct(&self, j: &mut FgJob, frame_fence: vk::Fence) {
+        let Some(sh) = self.fgp.lock().unwrap().shared.clone() else { return };
+        let Some((sc, images, ext)) = ({ let g = self.swap.lock().unwrap(); g.as_ref().and_then(|sw| (!sw.stale).then(|| (sw.swapchain, sw.images.clone(), sw.extent))) }) else { return };
+        let dev = &self.device;
+        // Wait for a parked pair only while the frame is still on the GPU (free
+        // time), not after: the pair's second drawable frees when the previous
+        // real frame is ON SCREEN — half a period after the previous hand-off
+        // plus ~20 ms through the compositor in a window — which is about when
+        // this frame completes. Waiting past it (4, 12 ms) cost the render loop
+        // and still mostly missed (2026-10-02); a miss goes staged.
+        let pair = {
+            let t0 = std::time::Instant::now();
+            let mut q = sh.q.lock().unwrap();
+            loop {
+                q.parked.retain(|p| p.0 == sc);
+                if q.parked.len() >= 2 { let a = q.parked.remove(0); let b = q.parked.remove(0); sh.cv.notify_all(); break Some((a, b)); }
+                if q.dead || q.quit { break None; }
+                let frame_done = unsafe { dev.get_fence_status(frame_fence) }.unwrap_or(true);
+                let limit = if frame_done { 0 } else { 120 };
+                if t0.elapsed() >= std::time::Duration::from_millis(limit) {
+                    if fg_prof_on() { eprintln!("fg-direct miss: parked {} outstanding {} busy {} jobs {} after {:.1} ms (frame done {frame_done})", q.parked.len(), q.outstanding, q.busy, q.jobs.len(), t0.elapsed().as_secs_f64() * 1e3); }
+                    break None;
+                }
+                q = sh.cv.wait_timeout(q, std::time::Duration::from_millis(1)).unwrap().0;
+            }
+        };
+        let Some((g0, r0)) = pair else { return };
+        let (cb, fence) = { let f = self.fgp.lock().unwrap(); (f.slots[j.slot].cb, f.slots[j.slot].fence) };
+        let range = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1);
+        let layers = vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1);
+        let barrier = |img, from, to, sa, da| vk::ImageMemoryBarrier::default().image(img).subresource_range(range)
+            .old_layout(from).new_layout(to).src_access_mask(sa).dst_access_mask(da)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED);
+        let ok = unsafe {
+            let _ = dev.reset_fences(&[fence]);
+            let _ = dev.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty());
+            let _ = dev.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT));
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            let to_dst: Vec<vk::ImageMemoryBarrier> = [g0.1, r0.1].iter().map(|&i| barrier(images[i as usize], vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE)).collect();
+            dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &to_dst);
+            let (ew, eh) = (ext.width as i32, ext.height as i32);
+            let filter = if j.w as i32 == ew && j.h as i32 == eh { vk::Filter::NEAREST } else { vk::Filter::LINEAR };
+            for (src, idx) in [(j.gen, g0.1), (j.real, r0.1)] {
+                let blit = vk::ImageBlit::default().src_subresource(layers).dst_subresource(layers)
+                    .src_offsets([vk::Offset3D::default(), vk::Offset3D { x: j.w as i32, y: j.h as i32, z: 1 }])
+                    .dst_offsets([vk::Offset3D::default(), vk::Offset3D { x: ew, y: eh, z: 1 }]);
+                dev.cmd_blit_image(cb, src, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, images[idx as usize], vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], filter);
+            }
+            let to_present: Vec<vk::ImageMemoryBarrier> = [g0.1, r0.1].iter().map(|&i| barrier(images[i as usize], vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty())).collect();
+            dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::DependencyFlags::empty(), &[], &[], &to_present);
+            let _ = dev.end_command_buffer(cb);
+            let one = [cb];
+            let _q = self.ql();
+            dev.queue_submit(self._queue, &[vk::SubmitInfo::default().command_buffers(&one)], fence).is_ok()
+        };
+        if ok {
+            j.direct = Some([g0, r0]);
+            j.blit_fence = fence;
+        } else {
+            // Not submitted: the drawables go back to the parked list.
+            let mut q = sh.q.lock().unwrap();
+            q.parked.insert(0, r0); q.parked.insert(0, g0);
+        }
     }
 
     /// Record the present copy at the end of a frame: the source buffer →
@@ -3833,7 +3988,13 @@ impl MoltenVkBackend {
         // otherwise (or as its fallback) present on this thread — after the
         // present thread has finished, so the two never interleave.
         let fg_job = self.fg_record_staged(cb, &buffers);
-        let present = if fg_job.is_some() { None } else { self.fg_drain(); self.record_present(cb, &buffers) };
+        // Frame generation off with the thread still running (it failed or was
+        // switched off): stop it, presenting its parked drawables, before the
+        // inline path acquires.
+        let present = if fg_job.is_some() { None } else {
+            if self.fgp.lock().unwrap().shared.is_some() { self.fg_stop(true); }
+            self.record_present(cb, &buffers)
+        };
         let ms_present_rec = t_pres.elapsed().as_secs_f64() * 1e3;
         drop(pipelines); drop(buffers); drop(images);
 
@@ -4068,6 +4229,8 @@ impl MoltenVkBackend {
         // (default 10 s) returns TIMEOUT instead of freezing the caller; the
         // caller treats it as a lost device and recreates the backend. The
         // command buffer and fence are leaked on timeout (still in flight).
+        let mut p = p;
+        if let Some(j) = p.fg.as_mut() { if self.pacer == PacerKind::HostTimed { self.fg_direct(j, p.fence); } }
         let res = unsafe { dev.wait_for_fences(&[p.fence], true, Self::wait_timeout_ns(10_000)) };
         if res == Err(vk::Result::TIMEOUT) {
             log::error!("MoltenVk submit_frame: GPU stall — frame did not complete within the wait budget");
