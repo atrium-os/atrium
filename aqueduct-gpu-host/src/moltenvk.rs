@@ -254,6 +254,57 @@ fn moltenvk_symbol(name: &std::ffi::CStr) -> Option<*mut std::ffi::c_void> {
     None
 }
 
+/// Kernel capture for the native-Metal replay (orbis docs/METAL-BACKEND.md),
+/// diagnostic only: AQUEDUCT_CAPTURE=<dir>,<pipeline id>,<frame seq>. Every
+/// BLAS built is appended to <dir>/blas.bin, keyed by its device address
+/// (the TLAS instance records' reference); at that frame's dispatch of that
+/// pipeline the push constants, the bound buffers before and after the
+/// dispatch (GPU copies; buffers over 512 MB, read-only inputs, from their
+/// mapping), and each bound TLAS's instance records go beside it, listed in
+/// manifest.txt.
+struct KernelCapture { dir: std::path::PathBuf, pipeline: u32, frame: u64, geo: Mutex<CaptureGeo> }
+struct CaptureGeo { file: Option<std::io::BufWriter<std::fs::File>>, off: u64, by_addr: HashMap<u64, (u64, u64)> }
+static KCAP: std::sync::OnceLock<Option<KernelCapture>> = std::sync::OnceLock::new();
+fn kernel_capture() -> Option<&'static KernelCapture> {
+    KCAP.get_or_init(|| {
+        let spec = std::env::var("AQUEDUCT_CAPTURE").ok()?;
+        let mut it = spec.split(',');
+        let dir = std::path::PathBuf::from(it.next()?);
+        let p = it.next()?.trim();
+        let pipeline = match p.strip_prefix("0x") { Some(h) => u32::from_str_radix(h, 16).ok()?, None => p.parse().ok()? };
+        let frame = it.next()?.trim().parse().ok()?;
+        if let Err(e) = std::fs::create_dir_all(&dir) { eprintln!("aqueduct: kernel capture: {}: {e}", dir.display()); return None; }
+        eprintln!("aqueduct: kernel capture armed: pipeline {pipeline:#x} at frame {frame} -> {}", dir.display());
+        Some(KernelCapture { dir, pipeline, frame, geo: Mutex::new(CaptureGeo { file: None, off: 0, by_addr: HashMap::new() }) })
+    }).as_ref()
+}
+impl KernelCapture {
+    fn add_blas(&self, addr: u64, v: &[f32]) {
+        use std::io::Write;
+        let mut g = self.geo.lock().unwrap();
+        if g.file.is_none() {
+            match std::fs::File::create(self.dir.join("blas.bin")) {
+                Ok(f) => g.file = Some(std::io::BufWriter::with_capacity(1 << 24, f)),
+                Err(e) => { eprintln!("aqueduct: kernel capture: blas.bin: {e}"); return; }
+            }
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+        let off = g.off;
+        if let Some(f) = g.file.as_mut() { if let Err(e) = f.write_all(bytes) { eprintln!("aqueduct: kernel capture: blas.bin: {e}"); return; } }
+        g.off += bytes.len() as u64;
+        g.by_addr.insert(addr, (off, v.len() as u64));
+    }
+}
+/// One captured dispatch, written out after its frame completes.
+struct CapRec {
+    pipeline: u32, frame: u64, push: Vec<u8>, groups: [u32; 3],
+    /// (binding, size, pre copy, post copy, or the guest mapping for a large input)
+    bufs: Vec<(u32, u64, *mut u8, *mut u8, *mut u8)>,
+    /// (binding, instance records, note)
+    tlas: Vec<(u32, Vec<u8>, String)>,
+    temps: Vec<(vk::Buffer, vk::DeviceMemory)>,
+}
+
 /// Native kernels (`set_native_kernels`, before `new`).
 static NATIVE_KERNELS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1948,6 +1999,7 @@ impl MoltenVkBackend {
             blas_addrs.push(asd.get_acceleration_structure_device_address(
                 &vk::AccelerationStructureDeviceAddressInfoKHR::default()
                     .acceleration_structure(blas)));
+            if let Some(c) = kernel_capture() { c.add_blas(*blas_addrs.last().unwrap(), vertices); }
         }
         if !pending.is_empty() {
             let rec = |cb: vk::CommandBuffer| {
@@ -2508,6 +2560,41 @@ impl MoltenVkBackend {
         as_bindings: &[u32],
     ) -> Result<(), String> {
         self.create_compute_pipeline_msl(pipeline_id, cs_spirv, None, ssbo_count, push_size, as_bindings)
+    }
+
+    /// Writes a captured dispatch (`AQUEDUCT_CAPTURE`) after its frame completed.
+    fn write_capture(c: &KernelCapture, rec: &CapRec) {
+        use std::io::Write;
+        let w = |name: &str, bytes: &[u8]| if let Err(e) = std::fs::write(c.dir.join(name), bytes) { eprintln!("aqueduct: kernel capture: {name}: {e}"); };
+        let mut man = format!("# aqueduct kernel capture (orbis docs/METAL-BACKEND.md)\npipeline {:#x}\nframe {}\ngroups {} {} {}\npush push.bin {}\n",
+            rec.pipeline, rec.frame, rec.groups[0], rec.groups[1], rec.groups[2], rec.push.len());
+        w("push.bin", &rec.push);
+        for &(binding, size, pre, post, guest) in &rec.bufs {
+            let sl = |p: *mut u8| unsafe { std::slice::from_raw_parts(p as *const u8, size as usize) };
+            if !guest.is_null() {
+                w(&format!("buf{binding}_in.bin"), sl(guest));
+                man += &format!("buffer {binding} {size} buf{binding}_in.bin -\n");
+            } else {
+                w(&format!("buf{binding}_in.bin"), sl(pre));
+                w(&format!("buf{binding}_out.bin"), sl(post));
+                man += &format!("buffer {binding} {size} buf{binding}_in.bin buf{binding}_out.bin\n");
+            }
+        }
+        for (binding, inst, note) in &rec.tlas {
+            w(&format!("tlas{binding}.bin"), inst);
+            man += &format!("tlas {binding} {} tlas{binding}.bin # {note}\n", inst.len() / 64);
+        }
+        let mut g = c.geo.lock().unwrap();
+        if let Some(f) = g.file.as_mut() { let _ = f.flush(); }
+        let mut idx = Vec::with_capacity(g.by_addr.len() * 24);
+        for (addr, (off, n)) in &g.by_addr { for v in [*addr, *off, *n] { idx.extend_from_slice(&v.to_le_bytes()); } }
+        w("blas_index.bin", &idx);
+        man += &format!("blas blas.bin blas_index.bin {} # (address, byte offset, f32 count) per BLAS; non-indexed xyz triangles, opaque geometry\n", g.by_addr.len());
+        man += "instances 64-byte VkAccelerationStructureInstanceKHR: row-major 3x4, customIndex|mask<<24, sbt|flags<<24 (0x8 = force non-opaque), BLAS address\n";
+        man += "slots push constants [[buffer(0)]], binding b [[buffer(b+1)]] (msl.py)\n";
+        w("manifest.txt", man.as_bytes());
+        let _ = std::io::stderr().flush();
+        eprintln!("aqueduct: kernel capture written: {} ({} buffers, {} TLAS, {} BLAS)", c.dir.display(), rec.bufs.len(), rec.tlas.len(), g.by_addr.len());
     }
 
     /// The 64-byte buffer of the per-dispatch encoder break (native kernels
@@ -3609,6 +3696,8 @@ impl MoltenVkBackend {
         self.settle(1)?;
         let seq = self.frame_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let slot = (seq % 2) as usize;
+        let cap_cfg = kernel_capture().filter(|c| c.frame == seq);
+        let mut cap: Option<CapRec> = None;
         let q0 = slot as u32 * (3 + DISPATCH_STAMPS);
         // Ring buffers: the side this frame binds takes the other side's
         // content where no write has done so since the flip.
@@ -4047,6 +4136,38 @@ impl MoltenVkBackend {
                             }
                         }
                     }
+                    // Kernel capture: the inputs as this dispatch sees them.
+                    if let Some(c) = cap_cfg.filter(|c| c.pipeline & 0x0FFF_FFFF == pid & 0x0FFF_FFFF && cap.is_none()) {   // the local id (ResourceId's low 28 bits)
+                        let mut rec = CapRec { pipeline: pid, frame: seq, push: push_bytes[..push_bytes.len().min(cp.push_size as usize)].to_vec(),
+                                               groups: [gx, gy, gz], bufs: Vec::new(), tlas: Vec::new(), temps: Vec::new() };
+                        let to_xfer = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                        unsafe { dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[to_xfer], &[], &[]); }
+                        for (binding, buf_id) in &binds {
+                            let Some(b) = buffers.get(buf_id) else { continue };
+                            if b.size > 512 << 20 { rec.bufs.push((*binding, b.size, std::ptr::null_mut(), std::ptr::null_mut(), b.write_ptr())); continue; }
+                            let mk = || unsafe { self.make_as_buffer(b.size, vk::BufferUsageFlags::TRANSFER_DST, true) };
+                            match (mk(), mk()) {
+                                (Ok((pre, pm, pp)), Ok((post, qm, qp))) => {
+                                    unsafe { dev.cmd_copy_buffer(cb, b.bound(), pre, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: b.size }]); }
+                                    rec.temps.push((pre, pm)); rec.temps.push((post, qm));
+                                    rec.bufs.push((*binding, b.size, pp, qp, std::ptr::null_mut()));
+                                }
+                                _ => eprintln!("aqueduct: kernel capture: no memory for binding {binding} ({} MB)", b.size >> 20),
+                            }
+                        }
+                        let back = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_READ).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+                        unsafe { dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[back], &[], &[]); }
+                        let accels = self.accels.lock().unwrap();
+                        for (binding, accel_id) in stream_accel_binds.iter() {
+                            if !cp.as_bindings.contains(binding) { continue; }
+                            if let Some(acc) = accels.get(accel_id) {
+                                rec.tlas.push((*binding, acc.inst_shadow.clone(), format!("accel {accel_id:#x} async_pending {} next_inline_build {} next_inline_refit {}",
+                                    acc.tlas_pending.is_some(), acc.inline_build, acc.inline_refit)));
+                            }
+                        }
+                        let _ = c;
+                        cap = Some(rec);
+                    }
                     unsafe {
                         dev.cmd_bind_pipeline(cb,
                             vk::PipelineBindPoint::COMPUTE, cp.pipeline);
@@ -4095,6 +4216,23 @@ impl MoltenVkBackend {
                             vk::PipelineStageFlags::COMPUTE_SHADER,
                             vk::DependencyFlags::empty(),
                             &[barrier], &[], &[]);
+                    }
+                    // Kernel capture: this dispatch's outputs.
+                    if let Some(rec) = cap.as_ref().filter(|r| r.frame == seq && r.pipeline == pid && !r.temps.is_empty()) {
+                        let to_xfer = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                        unsafe { dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[to_xfer], &[], &[]); }
+                        let mut k = 0;
+                        for (binding, buf_id) in &binds {
+                            let Some(b) = buffers.get(buf_id) else { continue };
+                            if b.size > 512 << 20 { continue; }
+                            let _ = binding;
+                            if let Some(&(post, _)) = rec.temps.get(2 * k + 1) {
+                                unsafe { dev.cmd_copy_buffer(cb, b.bound(), post, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: b.size }]); }
+                            }
+                            k += 1;
+                        }
+                        let back = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_READ).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+                        unsafe { dev.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[back], &[], &[]); }
                     }
                 }
                 FrameOp::CopyImgToBuf => {
@@ -4250,6 +4388,11 @@ impl MoltenVkBackend {
             .signal_semaphores(&signal_s);
         if split_wait.is_some() { submit = submit.push_next(&mut tsi); }
         { let _q = self.ql(); unsafe { dev.queue_submit(self._queue, &[submit], fence)?; } }
+        if let Some(rec) = cap.take() {
+            { let _q = self.ql(); unsafe { dev.queue_wait_idle(self._queue)?; } }
+            if let Some(c) = kernel_capture() { Self::write_capture(c, &rec); }
+            for (b, m) in rec.temps { unsafe { dev.destroy_buffer(b, None); dev.free_memory(m, None); } }
+        }
         let ms_submit = t_sub.elapsed().as_secs_f64() * 1e3;
 
         let t_qp = std::time::Instant::now();
