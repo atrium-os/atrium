@@ -140,7 +140,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     let els: Vec<Handle> = (0..dom.nodes.len() as Handle)
         .filter(|h| matches!(dom.get(*h).map(|n| &n.kind), Some(Kind::Element(_)))).collect();
     let matcher_dom = navigator_dom::parse(html); // a stable copy to match against
-    let m = sel::Matcher { dom: &matcher_dom };
+    let m = sel::Matcher::new(&matcher_dom);
 
     // ★ Custom properties go through the CASCADE, per element and per media
     // context, and then inherit. Taking the last `--x` in the file instead —
@@ -276,6 +276,8 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
             }
         }
     }
+
+    clip_pass(&mut resolved, &mut report);
 
     // A masked element paints neither its background colour nor its image:
     // without the mask both are the wrong shape.
@@ -1053,6 +1055,28 @@ fn to_longhands(name: &str, value: &[Token], inputs: &Inputs, report: &mut Repor
     if name == "float" && matches!(text.as_str(), "left" | "right" | "none") {
         return vec![("float-marker".to_string(), text)];
     }
+    // ★ The VISUALLY-HIDDEN idiom: a 1px box, `clip: rect(0 0 0 0)` and
+    // `clip-path: inset(50%)`. The profile has no clipping, so both used to
+    // be dropped and the 1px box drew its text anyway: Folha's "Salvar
+    // artigos" drop-down was painted over its masthead. An EMPTY clip is not
+    // a shape, though, it is "paint nothing", and that the profile can say.
+    // Carried as a marker and decided once the cascade is known, because
+    // `clip` only clips a positioned box (see the clip pass). Any other clip
+    // is still a shape the profile cannot draw, and is still dropped.
+    if name == "clip" {
+        match clip_rect_is_empty(&text) {
+            Some(true) => return vec![("clip-marker".to_string(), "empty".to_string())],
+            Some(false) => return vec![("clip-marker".to_string(), "auto".to_string())],
+            None => {}
+        }
+    }
+    if name == "clip-path" || name == "-webkit-clip-path" {
+        match clip_path_is_empty(&text) {
+            Some(true) => return vec![("clip-path-marker".to_string(), "empty".to_string())],
+            Some(false) => return vec![("clip-path-marker".to_string(), "none".to_string())],
+            None => {}
+        }
+    }
     let pairs: Vec<(String, String)> = if navigator_style::values::grammar(name).is_some() {
         vec![(name.to_string(), text)]
     } else {
@@ -1079,7 +1103,8 @@ fn to_longhands(name: &str, value: &[Token], inputs: &Inputs, report: &mut Repor
         // once the whole cascade is known. Without it every child lands in
         // the same cell: rustdoc's breadcrumb rendered on top of its search
         // box.
-        if p == "grid-template-areas" || p == "grid-area-name" || p == "float-marker" || p == "box-sizing-marker" { return Some((p, v)) }
+        if p == "grid-template-areas" || p == "grid-area-name" || p == "float-marker" || p == "box-sizing-marker"
+            || p == "clip-marker" || p == "clip-path-marker" { return Some((p, v)) }
         // ★ An image the input has not measured cannot be painted (§3.13),
         // and the renderer says so. The normalizer must decide it HERE, the
         // same way it decides for an `<img>`, or it ships a document that
@@ -1444,4 +1469,92 @@ mod media_tests {
         assert_eq!(m("screen\u{FFFD}\u{FFFD} and (max-width: 600px)"), None);
         assert_eq!(m("screen and (max-width: 600px) and (\u{e9}t\u{e9}: 1)"), None);
     }
+}
+
+/// `clip: rect(t, r, b, l)` (commas optional): `Some(true)` when the rect
+/// encloses nothing, `Some(false)` for `auto` or a non-empty rect, `None`
+/// when it is not understood. `auto` in a side means that edge of the box,
+/// which for this purpose is "not empty on that axis".
+pub(crate) fn clip_rect_is_empty(v: &str) -> Option<bool> {
+    let v = v.trim().to_ascii_lowercase();
+    if v == "auto" || v == "initial" || v == "unset" { return Some(false) }
+    let inner = v.strip_prefix("rect(")?.strip_suffix(')')?;
+    let sides: Vec<Option<f64>> = inner.split([',', ' ']).filter(|x| !x.trim().is_empty())
+        .map(|x| { let x = x.trim(); if x == "auto" { None } else { x.trim_end_matches("px").parse::<f64>().ok().map(Some).unwrap_or(Some(f64::NAN)) } })
+        .collect();
+    if sides.len() != 4 || sides.iter().flatten().any(|x| x.is_nan()) { return None }
+    let (t, r, b, l) = (sides[0], sides[1], sides[2], sides[3]);
+    let v_empty = matches!((t, b), (Some(t), Some(b)) if b <= t);
+    let h_empty = matches!((l, r), (Some(l), Some(r)) if r <= l);
+    Some(v_empty || h_empty)
+}
+
+/// `clip-path`: `Some(true)` for a region that encloses nothing (`inset()`
+/// meeting in the middle, a zero circle), `Some(false)` for `none`, `None`
+/// for any real shape.
+pub(crate) fn clip_path_is_empty(v: &str) -> Option<bool> {
+    let v = v.trim().to_ascii_lowercase();
+    if v == "none" || v == "initial" || v == "unset" { return Some(false) }
+    let pct = |x: &str| x.trim().strip_suffix('%').and_then(|n| n.trim().parse::<f64>().ok());
+    if let Some(inner) = v.strip_prefix("inset(").and_then(|x| x.strip_suffix(')')) {
+        let inner = inner.split(" round ").next().unwrap_or("");
+        let p: Vec<f64> = inner.split_whitespace().map(pct).collect::<Option<Vec<_>>>()?;
+        let (t, r, b, l) = match p.as_slice() {
+            [a] => (*a, *a, *a, *a),
+            [a, b] => (*a, *b, *a, *b),
+            [a, b, c] => (*a, *b, *c, *b),
+            [a, b, c, d] => (*a, *b, *c, *d),
+            _ => return None,
+        };
+        return (t + b >= 100.0 || l + r >= 100.0).then_some(true);
+    }
+    if let Some(inner) = v.strip_prefix("circle(").and_then(|x| x.strip_suffix(')')) {
+        let r = inner.split_whitespace().next().unwrap_or("");
+        return matches!(r, "0" | "0px" | "0%").then_some(true);
+    }
+    None
+}
+
+/// Resolve the clip markers. An empty `clip` hides a box only when it is
+/// absolutely positioned (CSS 2.1 §11.1.2); an empty `clip-path` hides any
+/// box. "Hidden" here is `visibility: hidden`: the box keeps its place and
+/// paints nothing, and its descendants inherit that. (A descendant that sets
+/// `visibility: visible` would show, where the clip would still hide it; no
+/// visually-hidden helper does that.) A state or media slot that turns the
+/// clip back off (`:focus { clip: auto }`) turns visibility back on there.
+fn clip_pass(resolved: &mut BTreeMap<(Handle, String, String), BTreeMap<String, (Priority, String)>>, report: &mut Report) {
+    let keys: Vec<(Handle, String, String)> = resolved.iter()
+        .filter(|(_, p)| p.contains_key("clip-marker") || p.contains_key("clip-path-marker"))
+        .map(|(k, _)| k.clone()).collect();
+    let mut hidden = 0usize;
+    for key in keys {
+        let base = (key.0, String::new(), String::new());
+        let get = |r: &BTreeMap<(Handle, String, String), BTreeMap<String, (Priority, String)>>, p: &str| {
+            r.get(&key).and_then(|x| x.get(p)).or_else(|| r.get(&base).and_then(|x| x.get(p))).cloned()
+        };
+        let positioned = get(resolved, "position").is_some_and(|(_, v)| v == "absolute" || v == "fixed");
+        let clip = get(resolved, "clip-marker");
+        let path = get(resolved, "clip-path-marker");
+        let empty_clip = clip.as_ref().filter(|(_, v)| v == "empty" && positioned);
+        let empty_path = path.as_ref().filter(|(_, v)| v == "empty");
+        let base_hid = resolved.get(&base).is_some_and(|b| {
+            let pos = b.get("position").is_some_and(|(_, v)| v == "absolute" || v == "fixed");
+            b.get("clip-marker").is_some_and(|(_, v)| v == "empty" && pos) || b.get("clip-path-marker").is_some_and(|(_, v)| v == "empty")
+        });
+        let slot = resolved.get_mut(&key).expect("key from the map");
+        let own_vis = slot.get("visibility").map(|(p, _)| *p);
+        match empty_clip.or(empty_path) {
+            Some((pri, _)) => {
+                if own_vis.is_none_or(|o| o <= *pri) { slot.insert("visibility".into(), (*pri, "hidden".into())); hidden += 1 }
+            }
+            None if key != base && base_hid => {
+                // This slot clears the clip the base slot set.
+                let lifted = slot.get("clip-marker").or_else(|| slot.get("clip-path-marker")).map(|(p, _)| *p);
+                if let (Some(pri), None) = (lifted, own_vis) { slot.insert("visibility".into(), (pri, "visible".into())); }
+            }
+            None => {}
+        }
+    }
+    for (_, props) in resolved.iter_mut() { props.remove("clip-marker"); props.remove("clip-path-marker"); }
+    if hidden > 0 { report.drop_n("empty clip compiled to `visibility: hidden`", hidden) }
 }

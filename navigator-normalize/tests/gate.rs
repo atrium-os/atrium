@@ -827,3 +827,50 @@ fn an_empty_box_holding_an_abspos_child_keeps_its_place() {
     let y = o.scene.rects.iter().find(|r| r.rgba == 0xff0000ff).map(|r| r.y / 64);
     assert_eq!(y, Some(52), "{out}");
 }
+
+/// The visually-hidden idiom: `:not(:focus)` is about the element AT REST,
+/// where nothing has focus, so the rule applies. It used to read the state
+/// as "on" inside `:not()` and drop the rule, putting NHS's skip link on
+/// top of its cookie banner.
+#[test]
+fn a_negated_dynamic_state_holds_at_rest() {
+    let src = r#"<html><head><style>
+      .skip { position: absolute; top: 16px; padding: 8px }
+      .skip:not(:active):not(:focus) { width: 1px !important; height: 1px !important; overflow: hidden !important; padding: 0 !important }
+      .menu:not(:hover) .tip { margin-left: 70px }
+    </style></head><body>
+      <a class="skip" href="/m">Skip to main content</a>
+      <div class="menu"><span class="tip">t</span></div>
+    </body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    assert!(out.contains("width: 1px"), "the hiding rule applies at rest: {out}");
+    assert!(out.contains("padding-top: 0"), "and beats the base padding: {out}");
+    assert!(out.contains("margin-left: 70px"), "a negated state on an ancestor holds at rest too: {out}");
+    assert!(refusals(&out).is_empty());
+}
+
+/// An EMPTY clip paints nothing, and the profile can say that even though
+/// it has no clipping: Folha's hidden "Salvar artigos" drop-down was drawn
+/// over its masthead. A real clip shape is still dropped, and `clip` on a
+/// box that is not positioned does nothing, as in CSS.
+#[test]
+fn an_empty_clip_hides_and_a_real_one_is_dropped() {
+    let src = r#"<html><head><style>
+      .vh { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0) }
+      .vh:focus { clip: auto }
+      .cp { clip-path: inset(50%) }
+      .flow { clip: rect(0, 0, 0, 0) }
+      .shape { clip-path: circle(40%) }
+    </style></head><body>
+      <a class="vh" href="/x">hidden one</a>
+      <p class="cp">hidden two</p>
+      <p class="flow">shown, not positioned</p>
+      <p class="shape">shown, a real shape</p>
+    </body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    let hidden = out.matches("visibility: hidden").count();
+    assert_eq!(hidden, 2, "the two empty clips hide, the others do not: {out}");
+    assert!(out.contains("visibility: visible"), "focus lifts the clip: {out}");
+    assert!(report.dropped.keys().any(|k| k.contains("clip-path")), "the circle is still dropped: {:?}", report.dropped);
+    assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+}

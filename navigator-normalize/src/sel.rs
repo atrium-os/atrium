@@ -310,9 +310,19 @@ pub fn has_pseudo_element(c: &Complex) -> bool {
     c.0.iter().any(|(_, cp)| cp.iter().any(|s| matches!(s, Simple::PseudoElement(_))))
 }
 
-pub struct Matcher<'a> { pub dom: &'a Dom }
+/// ★ `negated` counts the `:not()` the matcher is inside. A dynamic state
+/// on the subject travels with the rule, so at the top level it matches; but
+/// inside `:not()` that would turn `:not(:focus)` into "never" and drop the
+/// rule outright. The rule is about the element AT REST, where nothing is
+/// focused, hovered or active, so there a dynamic state is false. That is
+/// how the visually-hidden idiom (`.skip-link:not(:focus)`) keeps its link
+/// out of the masthead. The cost: the rule stays on in the state too, so a
+/// focused skip link stays hidden. A document has no focus ring to show it.
+pub struct Matcher<'a> { pub dom: &'a Dom, negated: std::cell::Cell<u32> }
 
 impl<'a> Matcher<'a> {
+    pub fn new(dom: &'a Dom) -> Self { Matcher { dom, negated: std::cell::Cell::new(0) } }
+
     pub fn matches(&self, h: Handle, c: &Complex) -> bool {
         if c.0.is_empty() { return false }
         self.match_from(h, c, c.0.len() - 1)
@@ -397,10 +407,15 @@ impl<'a> Matcher<'a> {
                 // Never visited: a document has no history, and claiming one
                 // would leak what the reader has read.
                 "visited" => false,
-                _ => true,
+                _ => self.negated.get() == 0,
             },
             Simple::PseudoElement(_) => false,
-            Simple::Not(l) => !l.iter().any(|c| self.matches(h, c)),
+            Simple::Not(l) => {
+                self.negated.set(self.negated.get() + 1);
+                let any = l.iter().any(|c| self.matches(h, c));
+                self.negated.set(self.negated.get() - 1);
+                !any
+            }
             Simple::Is(l) | Simple::Where(l) => l.iter().any(|c| self.matches(h, c)),
             Simple::Lang(tags) => {
                 // The nearest `lang` (or `xml:lang`) on the element or above.
