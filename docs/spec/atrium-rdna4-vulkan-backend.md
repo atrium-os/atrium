@@ -107,7 +107,7 @@ Pipeline:
 9. **Encode** with `atrium-rdna4-isa`, emitting a shader binary plus metadata
    (register counts, scratch, LDS, user-SGPR layout).
 
-**Host architecture.** The compiler and command builder are pure Rust and run on any host, so the oracle harness runs on the x86_64 box. Tier-2, however, only generates aarch64 code today (the Cranelift backend enables aarch64 triples only, and the bespoke backend is arm64). Tier-2 cross-checks therefore run on arm64 hosts (the Mac) until Tier-2 gains an x86_64 target; Cranelift already supports x86_64, so that is mostly enabling the triple and fixing what breaks.
+**Host architecture.** The compiler and command builder are pure Rust and run on any host, so the oracle harness runs on the x86_64 box. Tier-2 runs there too: on x86_64 hosts it compiles through the Cranelift backend (`Target::X86_64Linux` / `X86_64FreeBSD`, x86-64-v3 baseline), while the bespoke backend stays aarch64-only. On x86_64 the Tier-2 differential suites compare the SPIR-V interpreter against Cranelift and keep their pinned values; the bespoke-vs-Cranelift comparison runs on arm64 hosts (the Mac).
 
 **Graphics stages.** RDNA4 has no legacy vertex-shader hardware path: all
 geometry runs as NGG primitive shaders, which export positions and primitives
