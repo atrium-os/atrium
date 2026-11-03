@@ -27,6 +27,7 @@ pub mod value;
 use navigator_dom::{Dom, Handle, Kind};
 use navigator_style::token::{tokenize, Tok, Token};
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 /// What the input supplies besides the HTML. ★ The normalizer has NO
 /// capabilities (§6): stylesheets and intrinsic sizes are handed to it.
@@ -194,7 +195,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
                 if !m.matches(*h, c) { continue }
                 let key = (*h, state.clone(), media.clone());
                 let slot = resolved.entry(key).or_default();
-                let empty = BTreeMap::new();
+                let empty: Rc<Customs> = Rc::default();
                 let scope = custom.get(&(*h, media.clone())).or_else(|| custom.get(&(*h, String::new()))).unwrap_or(&empty);
                 let mut pending: Vec<(String, BTreeMap<String, (Priority, String)>)> = vec![];
                 for d in &rule.decls {
@@ -263,7 +264,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     for h in &els {
         let Some(style) = dom.attr(*h, "style").map(str::to_string) else { continue };
         let decls = css::declarations(&tokenize(&style));
-        let empty = BTreeMap::new();
+        let empty: Rc<Customs> = Rc::default();
         let scope = custom.get(&(*h, String::new())).unwrap_or(&empty);
         let scope = scope.clone();
         let slot = resolved.entry((*h, String::new(), String::new())).or_default();
@@ -832,10 +833,13 @@ fn detach(dom: &mut Dom, h: Handle) {
 /// INHERITED down the tree — which is what makes a `:root { --bg }` reach
 /// the elements that use it, and what keeps a dark-mode override inside its
 /// own media context.
+/// An element's custom properties: name -> value tokens, shared.
+type Customs = BTreeMap<String, Rc<Vec<Token>>>;
+
 fn resolve_customs(sheet: &css::Sheet, els: &[Handle], m: &sel::Matcher, dom: &Dom)
-    -> BTreeMap<(Handle, String), BTreeMap<String, Vec<Token>>> {
+    -> BTreeMap<(Handle, String), Rc<Customs>> {
     // Winners per (element, media), by the same priority rule as any property.
-    let mut own: BTreeMap<(Handle, String), BTreeMap<String, (Priority, Vec<Token>)>> = BTreeMap::new();
+    let mut own: BTreeMap<(Handle, String), BTreeMap<String, (Priority, Rc<Vec<Token>>)>> = BTreeMap::new();
     let mut medias: Vec<String> = vec![String::new()];
     for rule in &sheet.rules {
         if !rule.decls.iter().any(|d| d.name.starts_with("--")) { continue }
@@ -852,30 +856,54 @@ fn resolve_customs(sheet: &css::Sheet, els: &[Handle], m: &sel::Matcher, dom: &D
                     let pri: Priority = (d.important, layer_rank(rule.layer, sheet.layers.len(), d.important), spec, rule.order);
                     match slot.get(&d.name) {
                         Some((old, _)) if *old > pri => {}
-                        _ => { slot.insert(d.name.clone(), (pri, d.value.clone())); }
+                        _ => { slot.insert(d.name.clone(), (pri, Rc::new(d.value.clone()))); }
                     }
                 }
             }
         }
     }
     // Inherit: an element sees its ancestors' customs, its own winning.
-    let mut out: BTreeMap<(Handle, String), BTreeMap<String, Vec<Token>>> = BTreeMap::new();
+    //
+    // ★ The inherited map is SHARED, not copied. An element that declares no
+    // custom property of its own sees exactly its parent's map, so it holds
+    // the parent's `Rc`. Only an element with its own declarations pays for
+    // a copy, and that copy shares every token list through `Rc` too.
+    // Copying the whole chain into every element — which is what this did —
+    // is elements × custom properties × media contexts: GitHub's page
+    // (Primer defines thousands of `--` properties on `:root`) took 14 GB
+    // and was OOM-killed on a 16 GB machine.
+    let mut out: BTreeMap<(Handle, String), Rc<Customs>> = BTreeMap::new();
+    let mut ctxs: Vec<String> = vec![];
     for media in &medias {
+        ctxs.clear();
+        ctxs.push(String::new());
+        if !media.is_empty() { ctxs.push(media.clone()) }
+        let mut memo: BTreeMap<Handle, Rc<Customs>> = BTreeMap::new();
+        let empty: Rc<Customs> = Rc::new(BTreeMap::new());
         for h in els {
-            // The chain from the root down to this element.
-            let mut chain = vec![*h];
-            let mut cur = *h;
-            while let Some(p) = dom.get(cur).and_then(|n| n.parent) { chain.push(p); cur = p }
-            chain.reverse();
-            let mut map: BTreeMap<String, Vec<Token>> = BTreeMap::new();
-            for a in chain {
+            // Walk up to the nearest ancestor already resolved (or the root).
+            let mut chain = vec![];
+            let mut cur = Some(*h);
+            let mut base = empty.clone();
+            while let Some(c) = cur {
+                if let Some(m) = memo.get(&c) { base = m.clone(); break }
+                chain.push(c);
+                cur = dom.get(c).and_then(|n| n.parent);
+            }
+            // Then resolve back down, root-most first.
+            for a in chain.into_iter().rev() {
+                let mut map = base.clone();
                 // A media-conditioned custom overrides the base one here.
-                for ctx in [String::new(), media.clone()] {
-                    if let Some(w) = own.get(&(a, ctx)) {
-                        for (k, (_, v)) in w { map.insert(k.clone(), v.clone()); }
+                for ctx in &ctxs {
+                    if let Some(w) = own.get(&(a, ctx.clone())) {
+                        let m = Rc::make_mut(&mut map);
+                        for (k, (_, v)) in w { m.insert(k.clone(), v.clone()); }
                     }
                 }
+                memo.insert(a, map.clone());
+                base = map;
             }
+            let map = memo.get(h).cloned().unwrap_or_else(|| empty.clone());
             if !map.is_empty() { out.insert((*h, media.clone()), map); }
         }
     }
@@ -937,7 +965,7 @@ fn pick_light_dark(v: &[Token], dark: bool) -> Vec<Token> {
 /// Replace every `var(--x, fallback)` with its value, to a bounded depth.
 /// An INVALID result (see `resolve_var`) is returned as the original tokens,
 /// so the declaration is dropped AND reported downstream.
-fn substitute(value: &[Token], custom: &BTreeMap<String, Vec<Token>>, depth: usize) -> Vec<Token> {
+fn substitute(value: &[Token], custom: &Customs, depth: usize) -> Vec<Token> {
     resolve_var(value, custom, depth).unwrap_or_else(|| value.to_vec())
 }
 
@@ -953,7 +981,7 @@ fn substitute(value: &[Token], custom: &BTreeMap<String, Vec<Token>>, depth: usi
 /// references it becomes invalid and `var(--toggle, <light>)` falls back to
 /// the light colour. Substituting the word `initial` literally produced
 /// `color: initial #a4cefe` — 15,972 dropped declarations in the corpus.
-fn resolve_var(value: &[Token], custom: &BTreeMap<String, Vec<Token>>, depth: usize) -> Option<Vec<Token>> {
+fn resolve_var(value: &[Token], custom: &Customs, depth: usize) -> Option<Vec<Token>> {
     if !value.iter().any(|t| matches!(&t.tok, Tok::Function(f) if f.eq_ignore_ascii_case("var"))) {
         return Some(value.to_vec());
     }
