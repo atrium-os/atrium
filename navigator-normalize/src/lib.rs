@@ -41,6 +41,54 @@ pub struct Inputs {
     /// fetched under a condition must be APPLIED under it (§3.11), or a
     /// dark-mode stylesheet lands on every reader.
     pub stylesheet_media: BTreeMap<String, String>,
+    /// What one document may cost. See `Budget`.
+    pub budget: Budget,
+}
+
+/// ★ WORK BUDGETS. The normalizer reads hostile input, and its worst cases
+/// are not exotic: GitHub's custom-property cascade once took more than
+/// 14 GB. A jail's memory and CPU caps are the outer wall, but a kill loses
+/// the whole page and says nothing. These budgets are the inner one: when a
+/// document goes over, the normalizer stops doing THAT work, drops what it
+/// could not finish, and says so in the report, and the rest of the page is
+/// still normalized.
+///
+/// Every budget counts WORK, never time. The output is content-addressed, so
+/// the same input must give the same document on a fast machine and a slow
+/// one; a time limit would make the result depend on the hardware.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Budget {
+    /// Total bytes of CSS read, across `<style>`, linked sheets and imports.
+    /// Sheets past it are not read.
+    pub css_bytes: usize,
+    /// Elements in the document. Past it the document is passed through
+    /// unstyled: its text survives, its layout does not.
+    pub elements: usize,
+    /// Selector-matching steps (one compound tested against one element).
+    /// Rules past it are dropped.
+    pub match_steps: u64,
+    /// Tokens one `var()` substitution may produce. A value past it is
+    /// invalid, as a cycle is (the "billion laughs" of custom properties).
+    pub var_tokens: usize,
+    /// Tokens produced by all `var()` substitution in the document.
+    pub var_steps: u64,
+}
+
+impl Default for Budget {
+    /// Sized from the corpus (2026-11-03): the most expensive page in each
+    /// unit uses under a quarter of it. CSS 7.0 MB (edX), elements 48k (a
+    /// long Wikipedia table), matching 65M steps (GitHub), var() 7.5M
+    /// tokens (Notion).
+    fn default() -> Self {
+        Budget { css_bytes: 32 << 20, elements: 200_000, match_steps: 500_000_000, var_tokens: 8192, var_steps: 64_000_000 }
+    }
+}
+
+thread_local! {
+    /// (tokens left in the document's var() budget, per-value cap). Set at
+    /// the start of each `normalize`, so `resolve_var` keeps its signature.
+    static VAR_BUDGET: std::cell::Cell<(u64, usize)> = const { std::cell::Cell::new((u64::MAX, usize::MAX)) };
+    static VAR_EXHAUSTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// ★ An image's NATURAL sizing (CSS Images 3 §5.1), each part optional —
@@ -61,7 +109,13 @@ pub struct Report {
     pub columns_measured: usize,
     /// What could not be represented, by reason, with a count.
     pub dropped: BTreeMap<String, usize>,
+    /// What the document cost against its `Budget`.
+    pub spent: Spent,
 }
+
+/// Work done, in the units `Budget` counts.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Spent { pub css_bytes: usize, pub elements: usize, pub match_steps: u64, pub var_steps: u64 }
 
 impl Report {
     fn drop(&mut self, why: impl Into<String>) { *self.dropped.entry(why.into()).or_default() += 1 }
@@ -106,12 +160,22 @@ pub fn normalize_and_measure(html: &str, inputs: &Inputs, fonts: &navigator_rend
 pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     let mut dom = navigator_dom::parse(html);
     let mut report = Report::default();
+    let budget = inputs.budget;
+    VAR_BUDGET.with(|b| b.set((budget.var_steps, budget.var_tokens)));
+    VAR_EXHAUSTED.with(|b| b.set(false));
+    let mut css_left = budget.css_bytes;
+    let mut take_css = |text: &str, report: &mut Report| -> bool {
+        if text.len() > css_left { report.drop("stylesheet past the CSS budget (not read)"); return false }
+        css_left -= text.len();
+        true
+    };
 
     // 1. Collect CSS: every <style>, every supplied <link>, in document order.
     let mut sheet = css::Sheet::default();
     let mut order = 0usize;
     for h in dom.by_tag_anywhere("style") {
         let text = expand_imports(&dom.text_content(h), "", inputs, 0, &mut report);
+        if !take_css(&text, &mut report) { continue }
         css::parse(&text, &mut order, &mut sheet);
     }
     for h in dom.by_tag_anywhere("link") {
@@ -122,6 +186,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
             Some(text) => {
                 let text = text.clone();
                 let text = expand_imports(&text, &href, inputs, 0, &mut report);
+                if !take_css(&text, &mut report) { continue }
                 // The document's own attribute, or the one the converter
                 // recorded when it fetched the sheet.
                 let media = dom.attr(h, "media").map(str::to_string)
@@ -133,6 +198,8 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
             None => report.drop("stylesheet not supplied by the input"),
         }
     }
+    drop(take_css);
+    let css_left_final = css_left;
     for (what, _) in &sheet.dropped { report.drop(format!("@{what} not representable")) }
     report.rules_in = sheet.rules.len();
 
@@ -140,7 +207,13 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     let els: Vec<Handle> = (0..dom.nodes.len() as Handle)
         .filter(|h| matches!(dom.get(*h).map(|n| &n.kind), Some(Kind::Element(_)))).collect();
     let matcher_dom = navigator_dom::parse(html); // a stable copy to match against
-    let m = sel::Matcher::new(&matcher_dom);
+    let m = sel::Matcher::new(&matcher_dom).with_budget(budget.match_steps);
+    // Past the element budget the cascade is not attempted: every rule
+    // would be matched against every element. The text is kept.
+    if els.len() > budget.elements {
+        report.drop_n("rule not applied: document past the element budget", sheet.rules.len());
+        sheet.rules.clear();
+    }
 
     // ★ Custom properties go through the CASCADE, per element and per media
     // context, and then inherit. Taking the last `--x` in the file instead —
@@ -162,7 +235,11 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     let var_contexts: Vec<String> = custom.keys().map(|(_, m)| m.clone())
         .filter(|m| !m.is_empty()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
 
-    for rule in &sheet.rules {
+    for (ri, rule) in sheet.rules.iter().enumerate() {
+        if m.exhausted() {
+            report.drop_n("rule not applied: selector-matching budget spent", sheet.rules.len() - ri);
+            break;
+        }
         let list = match sel::parse_list(&rule.selector) {
             Ok(l) => l,
             Err(e) => { report.drop(format!("selector not understood: {e}")); continue }
@@ -686,6 +763,13 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     }
     for d in dropped_late { report.drop(d) }
     report.rules_out = blocks.len();
+    report.spent = Spent {
+        css_bytes: budget.css_bytes - css_left_final,
+        elements: els.len(),
+        match_steps: m.steps(),
+        var_steps: budget.var_steps - VAR_BUDGET.with(|b| b.get().0),
+    };
+    if VAR_EXHAUSTED.with(|b| b.get()) { report.drop("var() substitution past the document's budget (declarations dropped)") }
     report.elements_styled = per_element.len();
 
     // 6. Rewrite the document: generated classes on, `style=` off, `<link>`
@@ -1008,7 +1092,14 @@ fn resolve_var(value: &[Token], custom: &Customs, depth: usize) -> Option<Vec<To
         return Some(value.to_vec());
     }
     if depth > 16 { return None }
+    let (_, cap) = VAR_BUDGET.with(|b| b.get());
     let mut out = vec![];
+    // Charge what this call produced against the document's budget, and
+    // refuse a value past the per-value cap.
+    let over = |out: &Vec<Token>| -> bool {
+        if out.len() > cap { return true }
+        false
+    };
     let mut i = 0;
     while i < value.len() {
         match &value[i].tok {
@@ -1031,11 +1122,21 @@ fn resolve_var(value: &[Token], custom: &Customs, depth: usize) -> Option<Vec<To
                 let defined = custom.get(&name)
                     .filter(|v| !css::write_tokens(v).trim().eq_ignore_ascii_case("initial"))
                     .and_then(|v| resolve_var(v, custom, depth + 1));
-                match (defined, comma) {
-                    (Some(v), _) => out.extend(v),
-                    (None, Some(c)) => out.extend(resolve_var(&inner[c + 1..], custom, depth + 1)?),
+                let got = match (defined, comma) {
+                    (Some(v), _) => v,
+                    (None, Some(c)) => resolve_var(&inner[c + 1..], custom, depth + 1)?,
                     (None, None) => return None,
-                }
+                };
+                let spent = VAR_BUDGET.with(|b| {
+                    let (left, cap) = b.get();
+                    let n = got.len() as u64;
+                    if n > left { return false }
+                    b.set((left - n, cap));
+                    true
+                });
+                if !spent { VAR_EXHAUSTED.with(|b| b.set(true)); return None }
+                out.extend(got);
+                if over(&out) { return None }
                 i = j;
             }
             _ => { out.push(value[i].clone()); i += 1 }

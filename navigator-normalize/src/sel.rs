@@ -318,10 +318,18 @@ pub fn has_pseudo_element(c: &Complex) -> bool {
 /// how the visually-hidden idiom (`.skip-link:not(:focus)`) keeps its link
 /// out of the masthead. The cost: the rule stays on in the state too, so a
 /// focused skip link stays hidden. A document has no focus ring to show it.
-pub struct Matcher<'a> { pub dom: &'a Dom, negated: std::cell::Cell<u32> }
+pub struct Matcher<'a> { pub dom: &'a Dom, negated: std::cell::Cell<u32>, steps: std::cell::Cell<u64>, limit: u64 }
 
 impl<'a> Matcher<'a> {
-    pub fn new(dom: &'a Dom) -> Self { Matcher { dom, negated: std::cell::Cell::new(0) } }
+    pub fn new(dom: &'a Dom) -> Self { Matcher { dom, negated: std::cell::Cell::new(0), steps: std::cell::Cell::new(0), limit: u64::MAX } }
+
+    /// At most `limit` compound tests (see `Budget::match_steps`). Past it
+    /// every match answers false, and `exhausted` says so.
+    pub fn with_budget(mut self, limit: u64) -> Self { self.limit = limit; self }
+
+    pub fn exhausted(&self) -> bool { self.steps.get() >= self.limit }
+
+    pub fn steps(&self) -> u64 { self.steps.get() }
 
     pub fn matches(&self, h: Handle, c: &Complex) -> bool {
         if c.0.is_empty() { return false }
@@ -367,6 +375,9 @@ impl<'a> Matcher<'a> {
     }
 
     fn match_compound(&self, h: Handle, compound: &[Simple]) -> bool {
+        let n = self.steps.get();
+        if n >= self.limit { return false }
+        self.steps.set(n + 1);
         compound.iter().all(|s| self.match_simple(h, s))
     }
 

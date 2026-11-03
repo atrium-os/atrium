@@ -55,6 +55,10 @@ fn main() {
             std::fs::write(dst.join(format!("{name}.html")), out).expect("write");
             println!("{:<22} {:>3} sheets {:>4} images {:>5} rules in {:>5} out {:>4} columns",
                 name, r.inputs.stylesheets.len(), r.inputs.images.len(), rep.rules_in, rep.rules_out, rep.columns_measured);
+            if std::env::var_os("NORMALIZE_SPENT").is_some() {
+                let sp = rep.spent;
+                eprintln!("spent {name}: css {} elements {} match {} var {}", sp.css_bytes, sp.elements, sp.match_steps, sp.var_steps);
+            }
             for (k, v) in rep.dropped { *total.entry(k).or_default() += v }
             ok += 1;
         }
@@ -85,6 +89,10 @@ fn main() {
             std::fs::write(dst.join(f.file_name().expect("name")), out).expect("write");
             println!("{:<22} {:>5} rules in {:>5} out {:>6} styled {:>4} columns measured",
                 f.file_name().unwrap().to_string_lossy(), rep.rules_in, rep.rules_out, rep.elements_styled, rep.columns_measured);
+            if std::env::var_os("NORMALIZE_SPENT").is_some() {
+                let sp = rep.spent;
+                eprintln!("spent {}: css {} elements {} match {} var {}", f.display(), sp.css_bytes, sp.elements, sp.match_steps, sp.var_steps);
+            }
             for (k, v) in rep.dropped { *total.entry(k).or_default() += v }
         }
         println!("\ndropped, by reason:");
