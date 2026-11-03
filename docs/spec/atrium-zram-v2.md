@@ -1,8 +1,11 @@
 # atrium-zram v2: hardening the compressed-RAM tier
 
-> **Status:** design, 2026-11-03. Nothing in the kmod has changed yet. The
-> measurements in §3 come from a Linux host used as a stand-in. They still have
-> to be repeated in the FreeBSD VM (§7) before increment 2 lands.
+> **Status (2026-11-03):** increment 1 (counters, §4.6) is **built and
+> verified in the FreeBSD VM**, together with BIO_DELETE support and a selftest
+> fix. The first FreeBSD run (§3.1) found a v1 problem bigger than any in the
+> original list: **pages freed by the VM stay in the store** (§1 item 7, fixed
+> by §4.0, which needs a kernel change). The §3 numbers come from a Linux host
+> used as a stand-in. §3.1 covers what has been confirmed on FreeBSD so far.
 >
 > **Decision context (Shankar, 2026-11-03).** Atrium gets macOS-style compressed
 > main memory, and it must work in the Mac VM, which has no GPU. Using spare GPU
@@ -48,7 +51,20 @@ the parent spec).
    and a disk partition swapped on, about half the evicted pages go straight to
    disk.
 6. **Thin observability.** Only `kern.zram.phys_bytes` is exposed. There is no
-   logical size, no page counts by state, and no failure count.
+   logical size, no page counts by state, and no failure count. *(Fixed by
+   increment 1.)*
+7. **Freed swap is never released (found in-VM, §3.1).** FreeBSD's swap pager
+   frees a swap block without telling the device. Linux has
+   `swap_slot_free_notify` for this, and FreeBSD has no equivalent. So a page
+   stays compressed in RAM after its process exits, until something reuses its
+   block. Measured: after a 1.9 GB workload exited, `swapinfo` showed 107 MB in
+   use while the store still held 1.7 GB logical in **0.96 GB of kernel
+   memory**. On a long-running desktop this is the dominant cost of the tier.
+   `swapon -E` does not help: it trims the whole device once, at swapon.
+8. **The selftest used live slots 0–2.** With the device swapped on, slot 2 can
+   hold a real swapped-out page (the swap pager reserves only the first
+   `BBSIZE`), so running the selftest could corrupt a process's memory. *(Fixed:
+   it now uses private slots.)*
 
 ## 2. What macOS does that matters, and what doesn't
 
@@ -113,7 +129,62 @@ Caveats: these are Linux processes on x86, and the Navigator documents are local
 docs pages, not the real corpus. FreeBSD's jemalloc and the aarch64 build may
 differ. §7 repeats the measurements in the VM.
 
+### 3.1 First FreeBSD run (cloud VM, 2026-11-03)
+
+Setup: stock FreeBSD 16.0-CURRENT arm64 under QEMU TCG (`scripts/cloud-vm.sh`)
+with 2 GB RAM, so it has no Atrium kernel and no PSI. The v1 kmod plus
+increment 1 was built in the guest with `-Werror` and loaded, the disk swap was
+turned off, and `/dev/zram0` was the only swap device. The workload was 30
+cross-built `navigator-worker`s each holding one document, plus `fill` (`atrium-zram/test/fill.c`, built in the guest with `cc`): 1.9 GB
+of real file contents (binaries, libraries, text from `/usr` and
+`/boot/kernel`) held in anonymous memory with a 10 % hot set, for 300 s. It was
+recorded with `memprobe watch`.
+
+- **Counters agree with the kernel.** `orig_bytes` was 1014.5 MiB while
+  `swapinfo` showed 1013 MiB, and the selftest passed with swap live. A `dd`
+  round-trip of 200 random and 50 zero pages matched, and `trim(8)` of 100 pages
+  freed exactly 100 slots.
+- **Allocator waste confirmed.** At peak the store held 1354 MiB logical in 518
+  MiB of compressed data, but `vmstat -m` showed **727 MiB** of `malloc(9)`
+  memory (excluding the 12 MiB slot table). Rounding cost **29 %** of the
+  footprint, in line with the 27–35 % predicted in §3. The effective ratio is
+  2.61× on data but **1.95×** on real memory. The kernel's histogram shows why:
+  about half the compressed pages landed at 1–2.5 KiB, where zones round up to 2048 or 4096.
+- **`M_NOWAIT` failures are real.** `fail_nomem` = 356: under pressure, 356
+  swap-outs failed because `malloc` had nothing to give. Increment 2's reserve
+  (§4.2) is required, not just nice to have.
+- **Freed swap stays resident** (§1 item 7). After the workload exited, the
+  store still held 1696 MiB logical / 961 MB of kernel memory against 107 MB of
+  swap in use, and `deletes` stayed at 0.
+- **Navigator workers on FreeBSD:** jemalloc leaves most heap regions partly
+  resident, so the probe needs `--fault-partial` (§7). 42.5 MB resident anon
+  across 30 workers: 6.7 % zero, **35.7 % same-filled** with a non-zero byte, and
+  4.9× LZ4 on the rest. The same-filled share is almost certainly -CURRENT's
+  debug malloc junk-filling freed memory. A release build (`MALLOC_PRODUCTION`)
+  won't show it, so don't plan around it.
+- TCG makes timings meaningless here (memprobe reported ~80 µs per LZ4 page),
+  so per-page cost still needs the Mac VM (HVF) or hardware.
+
 ## 4. Design
+
+### 4.0 Swap-free notification (fixes §1 item 7; needs the kernel)
+
+A leaf module cannot see a swap block being freed, so this is the one piece that
+needs a kernel change, on the atrium-os `freebsd-src` branch alongside
+`kern_pressure.c`. In `swap_pager.c`, when `swp_pager_freeswapspace` returns a
+range to a device's blist, queue a `BIO_DELETE` for that range to the device's
+GEOM consumer. Do it only for devices whose provider reports
+`GEOM::candelete`, which zram's `DISKFLAG_CANDELETE` does. Batch the ranges and
+send them from a taskqueue, never from the freeing context, which may hold the
+object lock. This is the same design as Linux's `swap_slot_free_notify`, done
+through FreeBSD's ordinary BIO interface. It also gives disk swap on SSDs online
+TRIM, which FreeBSD lacks today.
+
+The kmod side is done: `BIO_DELETE` frees every slot the range covers and
+counts it in `kern.zram.deletes`. Verify with `deletes` rising and `orig_bytes`
+falling back to `swapinfo`'s figure after a workload exits.
+
+### 4.1–4.8: inside the module
 
 Unchanged from v1: it is a `disk(9)` device that the rc.d script swaps on; the
 SAME / COMP / RAW states stay; it is TCB-loaded and never apps-loadable; and the
@@ -222,7 +293,8 @@ Two small consumers:
 
 | # | increment | verify (in the VM) |
 |---|---|---|
-| 1 | §4.6 counters | `memprobe watch` shows `zram_orig_mb` and `zram_phys_mb` under a build. The counters agree with `swapinfo`. |
+| 0 | §4.0 swap-free notification (kernel, atrium-os branch) | After a workload exits, `orig_bytes` returns to within 1 % of `swapinfo`, and `deletes` rises. |
+| 1 | §4.6 counters + `BIO_DELETE` + selftest on private slots | **DONE, verified in-VM 2026-11-03** (§3.1): `orig_bytes` matches `swapinfo` to 0.1 %, `trim(8)` frees exact slot counts, and the selftest is safe with swap live. |
 | 2 | §4.2 packed allocator + §4.4 limit | Selftest extended with 10k random-size objects, alloc/free, and a bitmap audit. `dd` round-trip. A build under a RAM cap: `pool_bytes / orig_bytes` within 5 % of memprobe's *packed* prediction. |
 | 3 | §4.3 per-CPU contexts + §4.1 hashed locks | 4 parallel `dd` streams scale. Under a 4-job build with zram, lower PSI `full` than v1 at the same cap. |
 | 4 | §4.1 dynamic sizing, lazy table | Wired memory at load drops by the table size. A disksize tunable over RAM works. |
@@ -261,8 +333,12 @@ memprobe snapshot --all --min-mb 20 --hist
 
 On FreeBSD the probe attaches with `ptrace` and reads **only fully resident**
 anonymous regions, because reading a non-resident page would fault a fresh zero
-page into the target. The *coverage* line reports what it skipped.
-`--fault-partial` reads everything, but it perturbs the target. The kernel
+page into the target. The *coverage* line reports what it skipped. jemalloc
+leaves most heap regions partly resident (only 0.4 of 42 MB was read for the
+Navigator workers), so in practice use `--fault-partial`. It reads everything,
+then subtracts the faulted-in pages, which are never-touched zeros, from the
+zero count. That estimate is exact when nothing is swapped. It still grows the
+target's RSS, so probe before a pressure run, not during one. The kernel
 counters from increment 1 are the ground truth for what actually reaches the
 store.
 

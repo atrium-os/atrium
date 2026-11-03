@@ -59,8 +59,11 @@ atrium_zram_start()
 	if checkyesno atrium_zram_swap; then
 		# Idempotent — only swapon if it is not already a swap device.
 		if ! swapinfo | grep -q "${atrium_zram_dev}"; then
-			echo "atrium_zram: swapon ${atrium_zram_dev}"
-			swapon "${atrium_zram_dev}" || echo "atrium_zram: swapon failed"
+			# -E: BIO_DELETE the whole device at swapon, so nothing stale
+			# survives a re-swapon. (It is NOT online trim: FreeBSD's swap
+			# pager does not report freed blocks; atrium-zram-v2.md §4.0.)
+			echo "atrium_zram: swapon -E ${atrium_zram_dev}"
+			swapon -E "${atrium_zram_dev}" || echo "atrium_zram: swapon failed"
 		fi
 	fi
 	echo "atrium_zram: ${atrium_zram_dev} ready"

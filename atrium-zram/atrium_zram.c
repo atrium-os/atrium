@@ -25,6 +25,7 @@
 #include <sys/malloc.h>
 #include <sys/module.h>
 #include <sys/mutex.h>
+#include <sys/sbuf.h>
 #include <sys/sysctl.h>
 #include <geom/geom_disk.h>
 
@@ -63,6 +64,46 @@ static struct mtx	 zram_mtx;	/* serializes the shared contexts (per-CPU = refine
 static uint64_t		 zram_phys_bytes;	/* total physical bytes the store holds */
 static struct disk	*zram_disk;	/* /dev/zram0 — the swap block device */
 
+/*
+ * Counters (atrium-zram-v2.md §4.6, increment 1). All updated under zram_mtx.
+ * Gauges describe what the store holds NOW (they fall when a slot is freed or
+ * overwritten); event counters only grow.
+ *
+ * ★ Measured in-VM (2026-11-03): FreeBSD's swap pager never tells the device
+ * when it frees a swap block, so after a process exits its pages stay
+ * compressed here until the block is reused: a 1.9 GB fill left 1.7 GB logical
+ * / 0.96 GB of kernel memory held with swapinfo showing 107 MB used. The
+ * gauges report that truthfully. The fix is a free-notification from
+ * swap_pager (atrium-zram-v2.md §4.0); the device already honours BIO_DELETE
+ * for it, and `swapon -E` uses it to clear the whole device at swapon.
+ */
+#define	ZRAM_HIST_BUCKET	256
+#define	ZRAM_HIST_LEN		(ZRAM_PAGE / ZRAM_HIST_BUCKET + 1)	/* last = RAW */
+static uint64_t	zram_pages_same, zram_pages_comp, zram_pages_raw;	/* gauges */
+static uint64_t	zram_hist[ZRAM_HIST_LEN];				/* gauge */
+static uint64_t	zram_reads, zram_writes, zram_deletes;			/* events, pages */
+static uint64_t	zram_fail_nomem, zram_fail_io;				/* events */
+
+static void
+zram_count(const struct zram_slot *s, int dir)
+{
+	switch (s->state) {
+	case ZRAM_SAME:
+		zram_pages_same += dir;
+		break;
+	case ZRAM_COMP:
+		zram_pages_comp += dir;
+		zram_hist[s->len / ZRAM_HIST_BUCKET] += dir;
+		break;
+	case ZRAM_RAW:
+		zram_pages_raw += dir;
+		zram_hist[ZRAM_HIST_LEN - 1] += dir;
+		break;
+	default:
+		break;
+	}
+}
+
 /* Is the page all one byte (zero or same-filled)? Returns the fill byte if so. */
 static bool
 zram_same_filled(const uint8_t *p, uint8_t *fill)
@@ -80,6 +121,7 @@ zram_same_filled(const uint8_t *p, uint8_t *fill)
 static void
 zram_free_slot(struct zram_slot *s)
 {
+	zram_count(s, -1);
 	if (s->buf != NULL) {
 		zram_phys_bytes -= s->len;
 		free(s->buf, M_ZRAM);
@@ -92,10 +134,9 @@ zram_free_slot(struct zram_slot *s)
 /* Store `page` at slot `idx`. Same-filled -> tag (0 bytes); else compress; if it
  * doesn't shrink, store raw. Returns 0, or ENOMEM. Caller holds nothing. */
 static int
-zram_store(uint32_t idx, const void *page)
+zram_store(struct zram_slot *s, const void *page)
 {
 	static char comp[ZRAM_PAGE + 512]; /* >= ZSTD_compressBound(4096)=4174; guarded by mtx */
-	struct zram_slot *s = &zram_slots[idx];
 	uint8_t fill;
 	size_t clen;
 	int err = 0;
@@ -111,29 +152,30 @@ zram_store(uint32_t idx, const void *page)
 	clen = ZSTD_compressCCtx(zram_cctx, comp, sizeof(comp), page, ZRAM_PAGE, ZRAM_LEVEL);
 	if (!ZSTD_isError(clen) && clen < ZRAM_PAGE) {
 		s->buf = malloc(clen, M_ZRAM, M_NOWAIT);
-		if (s->buf == NULL) { err = ENOMEM; goto out; }
+		if (s->buf == NULL) { zram_fail_nomem++; err = ENOMEM; goto out; }
 		memcpy(s->buf, comp, clen);
 		s->state = ZRAM_COMP;
 		s->len = clen;
 	} else {
 		/* incompressible (or codec error) → store verbatim. */
 		s->buf = malloc(ZRAM_PAGE, M_ZRAM, M_NOWAIT);
-		if (s->buf == NULL) { err = ENOMEM; goto out; }
+		if (s->buf == NULL) { zram_fail_nomem++; err = ENOMEM; goto out; }
 		memcpy(s->buf, page, ZRAM_PAGE);
 		s->state = ZRAM_RAW;
 		s->len = ZRAM_PAGE;
 	}
 	zram_phys_bytes += s->len;
 out:
+	zram_count(s, +1);	/* SAME, COMP or RAW; a failed store left it EMPTY */
+	zram_writes++;
 	mtx_unlock(&zram_mtx);
 	return (err);
 }
 
 /* Load slot `idx` into `page` (exactly ZRAM_PAGE bytes). 0, or EIO/ENOENT. */
 static int
-zram_load(uint32_t idx, void *page)
+zram_load(struct zram_slot *s, void *page)
 {
-	struct zram_slot *s = &zram_slots[idx];
 	size_t r;
 	int err = 0;
 
@@ -147,15 +189,45 @@ zram_load(uint32_t idx, void *page)
 		break;
 	case ZRAM_COMP:
 		r = ZSTD_decompressDCtx(zram_dctx, page, ZRAM_PAGE, s->buf, s->len);
-		if (ZSTD_isError(r) || r != ZRAM_PAGE)
+		if (ZSTD_isError(r) || r != ZRAM_PAGE) {
+			zram_fail_io++;
 			err = EIO;
+		}
 		break;
 	default:
 		/* never-written block reads as zeros (standard block-device / swap). */
 		memset(page, 0, ZRAM_PAGE);
 	}
+	zram_reads++;
 	mtx_unlock(&zram_mtx);
 	return (err);
+}
+
+/*
+ * BIO_DELETE: the swap pager freed these blocks (swapon -E). Free every slot
+ * the range fully covers, so the store stops holding pages nobody can read
+ * again. A partial page at either end is left alone, which is always safe.
+ */
+static void
+zram_delete(struct bio *bp)
+{
+	off_t first, end;
+	uint32_t idx;
+
+	first = howmany(bp->bio_offset, ZRAM_PAGE);
+	end = (bp->bio_offset + bp->bio_length) / ZRAM_PAGE;
+	if (end > ZRAM_NSLOTS)
+		end = ZRAM_NSLOTS;
+	mtx_lock(&zram_mtx);
+	for (idx = first; idx < end; idx++) {
+		if (zram_slots[idx].state != ZRAM_EMPTY) {
+			zram_free_slot(&zram_slots[idx]);
+			zram_deletes++;
+		}
+	}
+	mtx_unlock(&zram_mtx);
+	bp->bio_resid = 0;
+	biofinish(bp, NULL, 0);
 }
 
 /*
@@ -171,6 +243,10 @@ zram_strategy(struct bio *bp)
 	uint32_t idx;
 	int err = 0;
 
+	if (bp->bio_cmd == BIO_DELETE) {
+		zram_delete(bp);
+		return;
+	}
 	if (bp->bio_cmd != BIO_READ && bp->bio_cmd != BIO_WRITE) {
 		biofinish(bp, NULL, EOPNOTSUPP);
 		return;
@@ -184,7 +260,8 @@ zram_strategy(struct bio *bp)
 		idx = (uint32_t)((bp->bio_offset + off) / ZRAM_PAGE);
 		if (idx >= ZRAM_NSLOTS) { err = EINVAL; break; }
 		err = (bp->bio_cmd == BIO_READ) ?
-		    zram_load(idx, data + off) : zram_store(idx, data + off);
+		    zram_load(&zram_slots[idx], data + off) :
+		    zram_store(&zram_slots[idx], data + off);
 		if (err != 0)
 			break;
 	}
@@ -197,41 +274,51 @@ zram_strategy(struct bio *bp)
 static int
 zram_selftest(SYSCTL_HANDLER_ARGS)
 {
+	/*
+	 * Private slots, never the device's: with /dev/zram0 swapped on, any
+	 * table slot may hold a live swapped-out page, and v1's use of slots
+	 * 0..2 here could overwrite one (the swap pager reserves only the
+	 * first BBSIZE of the device).
+	 */
+	struct zram_slot t[3];
 	char *p, *back, res[160];
 	int i, fails = 0;
 	uint64_t before;
 
+	memset(t, 0, sizeof(t));
 	p = malloc(ZRAM_PAGE, M_ZRAM, M_WAITOK);
 	back = malloc(ZRAM_PAGE, M_ZRAM, M_WAITOK);
 	before = zram_phys_bytes;
 
 	/* slot 0: all-zero -> SAME, 0 physical bytes. */
 	memset(p, 0, ZRAM_PAGE);
-	zram_store(0, p);
-	if (zram_load(0, back) != 0 || memcmp(p, back, ZRAM_PAGE) != 0) fails++;
+	zram_store(&t[0], p);
+	if (zram_load(&t[0], back) != 0 || memcmp(p, back, ZRAM_PAGE) != 0) fails++;
 
 	/* slot 1: half-zero + low-entropy -> COMP. */
 	memset(p, 0, ZRAM_PAGE);
 	for (i = ZRAM_PAGE / 2; i < ZRAM_PAGE; i++) p[i] = (char)(i & 0x1f);
-	zram_store(1, p);
-	if (zram_load(1, back) != 0 || memcmp(p, back, ZRAM_PAGE) != 0) fails++;
+	zram_store(&t[1], p);
+	if (zram_load(&t[1], back) != 0 || memcmp(p, back, ZRAM_PAGE) != 0) fails++;
 
 	/* slot 2: random -> incompressible -> RAW fallback. */
 	arc4random_buf(p, ZRAM_PAGE);
-	zram_store(2, p);
-	if (zram_load(2, back) != 0 || memcmp(p, back, ZRAM_PAGE) != 0) fails++;
+	zram_store(&t[2], p);
+	if (zram_load(&t[2], back) != 0 || memcmp(p, back, ZRAM_PAGE) != 0) fails++;
 
 	snprintf(res, sizeof(res),
 	    "%s | 3 pages (zero/compressible/random) = 12288 logical -> %ju physical bytes "
 	    "[slot0=%s slot1=%s(%u) slot2=%s(%u)]",
 	    fails ? "FAIL" : "OK round-trips", (uintmax_t)(zram_phys_bytes - before),
-	    "SAME", zram_slots[1].state == ZRAM_COMP ? "COMP" : "?", zram_slots[1].len,
-	    zram_slots[2].state == ZRAM_RAW ? "RAW" : "?", zram_slots[2].len);
+	    "SAME", t[1].state == ZRAM_COMP ? "COMP" : "?", t[1].len,
+	    t[2].state == ZRAM_RAW ? "RAW" : "?", t[2].len);
 
 	/* leave the store clean for repeat reads. */
-	zram_free_slot(&zram_slots[0]);
-	zram_free_slot(&zram_slots[1]);
-	zram_free_slot(&zram_slots[2]);
+	mtx_lock(&zram_mtx);
+	zram_free_slot(&t[0]);
+	zram_free_slot(&t[1]);
+	zram_free_slot(&t[2]);
+	mtx_unlock(&zram_mtx);
 	free(p, M_ZRAM);
 	free(back, M_ZRAM);
 	return (sysctl_handle_string(oidp, res, sizeof(res), req));
@@ -244,6 +331,60 @@ SYSCTL_PROC(_kern_zram, OID_AUTO, selftest,
     zram_selftest, "A", "Store+load zero/compressible/random pages, verify + report");
 SYSCTL_U64(_kern_zram, OID_AUTO, phys_bytes, CTLFLAG_RD, &zram_phys_bytes, 0,
     "Physical bytes the compressed store currently holds");
+
+/* Logical bytes held = every non-empty slot is one page the VM swapped out. */
+static int
+zram_orig_bytes(SYSCTL_HANDLER_ARGS)
+{
+	uint64_t v;
+
+	mtx_lock(&zram_mtx);
+	v = (zram_pages_same + zram_pages_comp + zram_pages_raw) * ZRAM_PAGE;
+	mtx_unlock(&zram_mtx);
+	return (sysctl_handle_64(oidp, &v, 0, req));
+}
+SYSCTL_PROC(_kern_zram, OID_AUTO, orig_bytes,
+    CTLTYPE_U64 | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0, zram_orig_bytes, "QU",
+    "Logical (uncompressed) bytes the store currently holds");
+SYSCTL_U64(_kern_zram, OID_AUTO, pages_same, CTLFLAG_RD, &zram_pages_same, 0,
+    "Pages held as a fill byte (zero or same-filled), 0 data bytes");
+SYSCTL_U64(_kern_zram, OID_AUTO, pages_comp, CTLFLAG_RD, &zram_pages_comp, 0,
+    "Pages held compressed");
+SYSCTL_U64(_kern_zram, OID_AUTO, pages_raw, CTLFLAG_RD, &zram_pages_raw, 0,
+    "Pages held verbatim (did not compress below a page)");
+SYSCTL_U64(_kern_zram, OID_AUTO, reads, CTLFLAG_RD, &zram_reads, 0,
+    "Pages read (swap-ins), since load");
+SYSCTL_U64(_kern_zram, OID_AUTO, writes, CTLFLAG_RD, &zram_writes, 0,
+    "Pages written (swap-outs), since load");
+SYSCTL_U64(_kern_zram, OID_AUTO, deletes, CTLFLAG_RD, &zram_deletes, 0,
+    "Held pages freed by BIO_DELETE (swap trim), since load");
+SYSCTL_U64(_kern_zram, OID_AUTO, fail_nomem, CTLFLAG_RD, &zram_fail_nomem, 0,
+    "Stores that failed for lack of memory, since load");
+SYSCTL_U64(_kern_zram, OID_AUTO, fail_io, CTLFLAG_RD, &zram_fail_io, 0,
+    "Loads that failed to decompress, since load");
+
+/* "<bucket upper bound>:<pages> ..." for COMP pages, then RAW:<pages>. */
+static int
+zram_hist_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	uint64_t h[ZRAM_HIST_LEN];
+	struct sbuf sb;
+	int i, error;
+
+	mtx_lock(&zram_mtx);
+	memcpy(h, zram_hist, sizeof(h));
+	mtx_unlock(&zram_mtx);
+	sbuf_new_for_sysctl(&sb, NULL, 256, req);
+	for (i = 0; i < ZRAM_HIST_LEN - 1; i++)
+		sbuf_printf(&sb, "%d:%ju ", (i + 1) * ZRAM_HIST_BUCKET, (uintmax_t)h[i]);
+	sbuf_printf(&sb, "RAW:%ju", (uintmax_t)h[ZRAM_HIST_LEN - 1]);
+	error = sbuf_finish(&sb);
+	sbuf_delete(&sb);
+	return (error);
+}
+SYSCTL_PROC(_kern_zram, OID_AUTO, hist,
+    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0, zram_hist_sysctl, "A",
+    "Compressed-size histogram of held pages (256-byte buckets, then RAW)");
 
 static int
 zram_modevent(module_t mod __unused, int type, void *data __unused)
@@ -267,6 +408,8 @@ zram_modevent(module_t mod __unused, int type, void *data __unused)
 		zram_disk->d_sectorsize = ZRAM_PAGE;
 		zram_disk->d_mediasize = (off_t)ZRAM_NSLOTS * ZRAM_PAGE;
 		zram_disk->d_maxsize = ZRAM_PAGE * 16;
+		zram_disk->d_flags = DISKFLAG_CANDELETE;	/* swapon -E trims into us */
+		zram_disk->d_delmaxsize = (off_t)ZRAM_NSLOTS * ZRAM_PAGE;
 		disk_create(zram_disk, DISK_VERSION);
 		printf("atrium_zram: /dev/zram0 ready (%d pages = %juMB, pre-allocated zstd)\n",
 		    ZRAM_NSLOTS, (uintmax_t)((off_t)ZRAM_NSLOTS * ZRAM_PAGE >> 20));

@@ -106,7 +106,15 @@ fn snapshot(o: &Opts, an: &mut Analyzer) -> (Vec<ProcResult>, Vec<String>) {
     for (pid, name) in targets(o) {
         let mut st = Stats::new();
         match platform::for_each_anon_page(pid, &ropts, &mut |p| an.page(&mut st, p)) {
-            Ok(cov) => res.push(ProcResult { pid, name, stats: st, cov }),
+            Ok(cov) => {
+                // Pages the read faulted in were never touched: they read as
+                // zero and were not resident before, so they are not part of
+                // what the store would see. (Estimate: exact with no swap.)
+                let f = (cov.faulted / PAGE as u64).min(st.zero);
+                st.zero -= f;
+                st.pages -= f;
+                res.push(ProcResult { pid, name, stats: st, cov })
+            }
             Err(e) => errs.push(format!("{pid} {name}: {e}")),
         }
     }
@@ -151,6 +159,7 @@ fn report(o: &Opts, res: &[ProcResult], w: &mut dyn Write) -> std::io::Result<()
         cov.read += r.cov.read;
         cov.skipped += r.cov.skipped;
         cov.swapped += r.cov.swapped;
+        cov.faulted += r.cov.faulted;
         if mb(r.stats.logical_bytes()) < o.min_mb {
             continue;
         }
@@ -188,10 +197,11 @@ fn report(o: &Opts, res: &[ProcResult], w: &mut dyn Write) -> std::io::Result<()
     )?;
     writeln!(
         w,
-        "coverage: read {:.1} MB, skipped {:.1} MB (partially resident, FreeBSD), already swapped {:.1} MB",
+        "coverage: read {:.1} MB, skipped {:.1} MB (partially resident, FreeBSD), already swapped {:.1} MB, faulted-in zero {:.1} MB (excluded)",
         mb(cov.read),
         mb(cov.skipped),
-        mb(cov.swapped)
+        mb(cov.swapped),
+        mb(cov.faulted)
     )?;
     if o.sample > 1 {
         writeln!(w, "sampled 1 page in {}", o.sample)?;

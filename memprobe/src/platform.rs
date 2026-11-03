@@ -33,6 +33,10 @@ pub struct Coverage {
     pub skipped: u64,
     /// Bytes already in swap (Linux pagemap tells us; not read).
     pub swapped: u64,
+    /// FreeBSD `--fault-partial`: non-resident bytes the read faulted in.
+    /// They are never-touched anonymous pages, so they read as zero; the
+    /// caller subtracts them from the zero-page count.
+    pub faulted: u64,
 }
 
 pub fn list_procs() -> Vec<(i32, String)> {
@@ -152,7 +156,9 @@ mod imp {
     use std::process::Command;
 
     pub fn list_procs() -> Vec<(i32, String)> {
-        let out = Command::new("ps").args(["-axo", "pid=,comm="]).output();
+        let out = // BSD ps takes everything after `=` as the header, so "pid=,comm=" would
+        // print one column; each field needs its own -o.
+        Command::new("ps").args(["-ax", "-o", "pid=", "-o", "comm="]).output();
         let mut v = Vec::new();
         if let Ok(o) = out {
             for line in String::from_utf8_lossy(&o.stdout).lines() {
@@ -246,9 +252,12 @@ mod imp {
             if vr.resident_pages == 0 {
                 continue;
             }
-            if vr.resident_pages < n && !opts.fault_partial {
-                cov.skipped += vr.resident_pages * PAGE;
-                continue;
+            if vr.resident_pages < n {
+                if !opts.fault_partial {
+                    cov.skipped += vr.resident_pages * PAGE;
+                    continue;
+                }
+                cov.faulted += (n - vr.resident_pages) * PAGE / sample;
             }
             for i in 0..n {
                 idx += 1;
