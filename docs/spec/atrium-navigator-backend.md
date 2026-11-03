@@ -826,7 +826,7 @@ Everything here runs headless, in CI, with no display server.
 | **M1** | jailed fetcher | fetcher's filesystem access refused **at the syscall**, asserted by test |
 | **M2** | Document Profile v1 (HTML + CSS) | curated corpus with a reported conformance **number** — rows **64/64**, corpus **29/29 after the normalizer** (§8.4 measured 1/29 raw, §8.5 closed it). Converter must still carry stylesheets and image sizes |
 | **M3** | per-document jail + graph validator | worker capabilities == none; validator fuzzed with reached-coverage reported; **per-document jail launch cost measured**, not assumed — **PASSED** (§8.6) |
-| **M4** | navigation state machine + history in Tessera | back/forward/session-restore driven headlessly — done in-process and through the jailed host unconfined (§4.4, §8.7, §8.8); a real-jail run and a store on a Tessera volume are open |
+| **M4** | navigation state machine + history in Tessera | back/forward/session-restore driven headlessly — done in-process and through the jailed host, in a real jail (§4.4, §8.7, §8.8); a store on a Tessera volume is open |
 | **M5** | UI attach (Pergola chrome + Limen document surface) | **UI deleted ⇒ suite still green** |
 | **M6** | app-launch path (`atrium-app://` → Nomenclator → Opifex → jail) | trial-launch consent gesture; signature verified before launch |
 
@@ -1926,8 +1926,17 @@ Tested unconfined in `tests/jailed.rs`. `examples/jailed_corpus` now saves every
 that navigated, closes it, restores it, and checks that the restored session saves to the
 same address. So `navigator-jail-e2e.sh` exercises restore inside a real jail.
 
-**Still open for M4:** a real-jail run of the above, and `DirStore` pointed at a directory
-on a Tessera volume. Both need the VM.
+**Real jail, 2026-11-03 (7f45ab3).** The run used `navigator-jail-e2e.sh` in a FreeBSD
+16-CURRENT arm64 VM under TCG, with no KVM, so timings are about 70x slower than native.
+The launcher was confined, the broker ran as an unprivileged user, and portcullisd created
+one jail per document. Result: 1 session, 1 navigation, 1 rewind, 1 restore, 0 failures.
+The restored session saved to the same address. Open took 3.6 s, restore 2.9 s (a fresh
+jail plus the replay), and close 1.1 s.
+
+The run left nothing behind: no jails (live or dying), no zombies, no mounts, no upper
+directories. The refusals still held: unsigned, duplicate instance, and root caller.
+
+**Still open for M4:** `DirStore` pointed at a directory on a Tessera volume.
 
 ## 9. What this reuses
 
