@@ -141,8 +141,10 @@ vsync stall (stop submitting), nothing more.
   the clients replay.
 - **GPU/display**: per-fd context teardown on process exit is
   GPU ABI invariant I5 (gpu-isolation.md); the new instance
-  re-opens `/dev/atrium-display0` and re-modesets. Scanout shows
-  the splash/last-frame per driver policy during the gap.
+  re-opens `/dev/atrium-display0` and commits without a modeset.
+  The display module keeps the last latched frame on screen during
+  the gap, and sealed shared buffers deposited with the supervisor
+  survive the restart (GPU ABI v2.1 §10.2).
 
 ## 4. WM checkpoint
 

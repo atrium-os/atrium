@@ -18,7 +18,8 @@
 > per-queue fences (§5.5, §5.7), syncobj error state (§5.6), revocable doorbells
 > (§5.9), the memory-lifetime rule (§5.11), the kernel's validation duties
 > (§5.12), sealed buffers for content-addressed sharing (§5.13), scanout by fd and the display lease (§7), the concrete fault model
-> (§10), and the implementation-status table (§18). Sections marked
+> (§10, including the escalation ladder, broker crash and display reset in
+> §10.1–10.3), and the implementation-status table (§18). Sections marked
 > *(unchanged in 2.1)* carry over from v2 as written.
 
 > **Status.** Specification. `atrium-gpu-amd` (developed against the gpusim
@@ -650,7 +651,7 @@ Display cdev is treated as a "vendor" for this purpose: a BO produced by `atrium
 Display is on a separate cdev (`/dev/atrium/display<N>`) specified in [`atrium-display-architecture.md`](atrium-display-architecture.md). 2.1 fixes the parts of the interface that belong to this ABI:
 
 - **Scanout by object, never by address.** The atomic commit takes a `bo_fd` or a `share_fd` per plane. The display module resolves it, checks size, pitch, format and tiling against the plane (§5.12) and pins the backing for as long as it is on screen; the BO's free is deferred until it has been flipped away (§5.11). The `atrium-gpu-amd` path that writes a userspace-supplied `{vram_offset, size}` into the scanout registers, and the `BO_EXPORT_SCANOUT` ioctl that feeds it, are retired.
-- **Ownership is a lease.** One process holds the display at a time: the broker (frescod) opens `/dev/atrium/display<N>` exclusively, and a second open fails with `EBUSY`. A test harness or a VT-switch takes it only through the broker. There is no DRM-master-style ambient grant.
+- **Ownership is a lease.** One process holds the display at a time: the broker (frescod) opens `/dev/atrium/display<N>` exclusively, and a second open fails with `EBUSY`. A test harness or a VT-switch takes it only through the broker. There is no DRM-master-style ambient grant. When the holder's fd closes the last frame stays on screen until the next holder commits (§10.2).
 - **Fences.** A commit takes an optional in-fence (`syncobj_fd`, value) that the display module waits on before latching, and an out-fence (`syncobj_fd`, value) it signals when the previous buffer is released.
 - **vblank and hotplug** are kqueue events on the display fd (vblank-wait ioctl retired).
 
@@ -744,6 +745,43 @@ No Wayland surface, no dma-buf, no separate event fd. Two fds and a counter valu
 - **Who may reset.** `QUEUE_RESET` on one's own `queue_fd`; `DEVICE_RESET` only on `control_fd` (§5.10). No unprivileged ioctl clears another tenant's in-flight work.
 - **Fault info.** The faulting context can read a fault record (faulting VA, engine, type) via `QUEUE_QUERY_FAULT`; other contexts see only the error code. A devcoredump-style capture is control-only.
 - **Invariant.** Every signal point ever accepted is eventually signalled or errored. No waiter can be left behind by a fault, a reset, a queue close or a driver detach.
+
+
+### 10.1 Escalation ladder (firmware and engine hangs)
+
+The kernel never waits on firmware without a bound. Every firmware message (MES on AMD) has a timeout, and a timeout moves recovery one rung down. Each rung is tried once per incident.
+
+| Rung | Action | Trigger | ABI effect |
+|---|---|---|---|
+| 0 | Remove and reset the one queue | watchdog, fault interrupt | That queue's points error (`ERR_HANG`/`ERR_FAULT`); nothing else changes |
+| 1 | Reset the engine and reload its scheduling firmware | firmware does not answer `REMOVE_QUEUE` within 100 ms, or rung 0 fails | Device lost: every queue errors with `ERR_RESET`, lost generation increments |
+| 2 | Function-level PCI reset (or the vendor's bus-level reset), full re-initialisation and firmware load | rung 1 fails or times out | As rung 1; VRAM contents assumed lost |
+| 3 | Detach | rung 2 fails | Every fd on the device returns `ENXIO`; every outstanding point errors with `ERR_DEVICE_GONE`; the cdev is destroyed. The kernel stays up |
+
+**Reset budget.** If the device needs rung 1 or worse more than a set number of times in a window (default 3 in 10 minutes, settable by the broker with `SCHED`), the kernel stops recovering and goes to rung 3. A device that cannot stay up is worse than no device.
+
+**Falling back to the CPU.** When the broker sees rung 3 (or decides on its own that the GPU is unreliable), it switches rendering to the Tier-2 CPU path and keeps the desktop running. This is the case a Linux driver cannot take and Atrium can: the system does not need the GPU to work.
+
+Nothing in the ladder holds a lock that a waiter or the fence-retire path needs, so `SYNCOBJ_WAIT` and kqueue keep reporting progress, errors included, throughout.
+
+### 10.2 Broker crash
+
+In production every client context belongs to the broker (§4.1), so a broker crash closes them all. The kernel handles that as an ordinary close of each context: queues are removed, outstanding points error, memory is released at its retire point (§5.11). Apps recover through Fresco client replay (`fresco-recovery.md` §3). Two things are added so the restart is fast and invisible:
+
+- **The display holds the last frame.** When the display lease holder's fd closes, the display module keeps its own reference to the buffers last latched on each plane and keeps scanning them out. It drops them on the next commit from a new lease holder. Vblank continues; no modeset happens during the gap.
+- **Sealed shared buffers can outlive the broker.** Sealed BOs (§5.13) are immutable, so they are safe to hand to anyone who already had them. The broker deposits their `share_fd`s with its Portcullis supervisor (the supervisor's fd store), and the restarted broker takes them back and re-imports them. Fonts, glyph atlases and shader binaries are then available without re-upload; anything not deposited is reloaded from Tessera by hash. `control_fd` is never deposited: the new broker opens the node again.
+
+The kernel keeps no other broker state across the crash. Scene, window and slot state is the client-replay contract's job, and WM state is the WM checkpoint (`fresco-recovery.md` §4).
+
+### 10.3 Reset while the display is flipping
+
+Rendering and display are separate blocks, and recovery treats them separately:
+
+- **Rung 0 and rung 1 do not touch the display block.** Scanout continues from whatever is latched.
+- **A commit whose in-fence errors is dropped.** The previous buffer stays on screen, and the commit's out-fence errors with the same code, so the broker knows the frame never showed.
+- **Rung 2 resets the display too.** Afterwards the display module re-applies its last committed mode and planes from its own copy. Planes whose buffers lived in VRAM are marked lost and show the boot framebuffer contents (the `atrium_bootfb` splash) until the broker commits a new frame.
+- **The display fd reports it.** A `ATRIUM_DISPLAY_NOTE_RESET` kqueue event (with the device's new lost generation) tells the lease holder to re-render and commit.
+- **Rung 3** leaves the display on the firmware or boot framebuffer if the platform has one; otherwise the screen goes dark and the broker reports the failure through Tier-2 on whatever output remains.
 
 ---
 
@@ -939,6 +977,7 @@ Estimated calendar time to (6): 2-3 years of focused work with a small team. Est
 | Real allocators | VRAM bump allocator; 32 MiB VA per VM | §5.3 |
 | `struct_size`, `int32_t` fds | Missing / `uint32_t` | §8 |
 | Per-jail quota | None | §4.2 |
+| Watchdog, escalation ladder, reset budget, display hold-last-frame | No watchdog; reset clears pending work without signalling; no display reset handling | §10.1–10.3 |
 | Fuzz and isolation tests (§10.5) | None; `test_gpu_isolation.c` does not exist | §10.5 |
 | Real-silicon backend | Firmware load, MES, VM context and display programmed through gpusim-only registers | review §A5 |
 
