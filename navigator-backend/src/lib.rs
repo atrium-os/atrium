@@ -138,3 +138,10 @@ pub const FORMAT: &str = "atrium-navigator-recording/2";
 /// append, and the consumer can tell because the field is `None` rather than
 /// a plausible zero.
 pub const FORMAT_V1: &str = "atrium-navigator-recording/1";
+/// ★ What the converter writes now: `/2` plus `stylesheets` and `images`,
+/// the inputs the NORMALIZER needs and cannot fetch for itself. The backend
+/// replays transitions and needs neither, so a `/3` recording is read
+/// exactly as a `/2` one and the two fields are left alone (they still count
+/// against `max_total_bytes`). Refusing it meant every fresh recording was
+/// "unknown format" the moment it reached the jailed lane.
+pub const FORMAT_V3: &str = "atrium-navigator-recording/3";

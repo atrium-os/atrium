@@ -148,3 +148,23 @@ fn a_transition_without_a_trigger_is_refused() {
     assert_eq!(ingest(json.as_bytes(), &Limits::default()),
                Err(Reject::MissingField("trigger")));
 }
+
+/// What the converter writes today: `/2` plus the normalizer's inputs. The
+/// backend reads it as `/2` and leaves those fields alone. Every fresh
+/// recording was refused as "unknown format" before this.
+#[test]
+fn a_v3_recording_is_read_as_v2() {
+    let json = r##"{"format":"atrium-navigator-recording/3","url":"https://a.test/","tier":2,
+      "tier_reason":"","measurements":{},
+      "stylesheets":[{"href":"https://a.test/s.css","text":"p{color:red}"}],
+      "images":{"https://a.test/i.png":{"width":4,"height":4}},
+      "transitions":[{"trigger":"#t","event":"click","anchored":true,
+        "effects":[{"kind":"attribute","target":"#m","name":"class","from":"a","to":"b"}]}],
+      "document":"<html><body><button id=\"t\">t</button><nav id=\"m\" class=\"a\"></nav></body></html>"}"##;
+    let r = ingest(json.as_bytes(), &Limits::default()).expect("a /3 recording is accepted");
+    assert_eq!(r.transitions.len(), 1);
+    assert!(matches!(r.tier, Tier::Two));
+    // The extra fields still count toward the size limit.
+    let tight = Limits { max_total_bytes: json.len() - 1, ..Limits::default() };
+    assert!(matches!(ingest(json.as_bytes(), &tight), Err(Reject::TooLarge { .. })));
+}

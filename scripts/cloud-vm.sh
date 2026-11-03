@@ -174,12 +174,6 @@ EOF
     PRERENDER_EMIT_DIR="$VMDIR/rec" "$ROOT/navigator-prerender/target/release/prerender" \
         "$VMDIR/rec-src/e2e-fixture.html" >/dev/null 2>&1
     [ -f "$VMDIR/rec/e2e-fixture.json" ] || die "prerender wrote no recording"
-    # ★★ KNOWN MISMATCH (2026-11-03): prerender emits recording/3 but
-    # navigator-backend accepts only /1 and /2, so the worker refuses every
-    # fresh recording with `unknown format`. /3 only ADDS fields a /2 reader
-    # ignores (artifact.rs), so the label is rewritten here to exercise the
-    # jail lane. Remove this once the backend accepts /3.
-    sed -i 's#"atrium-navigator-recording/3"#"atrium-navigator-recording/2"#' "$VMDIR/rec/e2e-fixture.json"
     sh "$ROOT/scripts/navigator-jail-e2e.sh" --quick --recordings "$VMDIR/rec"
 }
 

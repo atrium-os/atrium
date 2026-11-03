@@ -20,7 +20,7 @@ pub fn ingest(bytes: &[u8], limits: &Limits) -> Result<Recording, Reject> {
     let obj = v.as_object().ok_or(Reject::NotAnObject)?;
 
     match obj.get("format").and_then(Value::as_str) {
-        Some(FORMAT) | Some(crate::FORMAT_V1) => {}
+        Some(FORMAT) | Some(crate::FORMAT_V1) | Some(crate::FORMAT_V3) => {}
         Some(other) => return Err(Reject::WrongFormat { found: other.to_string() }),
         None => return Err(Reject::MissingField("format")),
     }
