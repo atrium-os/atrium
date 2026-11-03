@@ -933,7 +933,7 @@ past crash stays a seed.
 - **`atrium-vk-icd` / `aqueduct-gpu-host`** — the Vulkan front end. A Tier-3 backend that targets this ABI directly (building vendor command blobs, binding with `VM_BIND`, submitting on queues) is the native GPU path. No such backend exists yet.
 - **Mesa (optional).** A `winsys/atrium_amdgpu` port of radv onto `atrium-gpu-rs`/a C shim remains possible, and the ABI keeps Mesa's winsys contract in mind (principle 1, POD blobs). It is a fallback if writing our own RDNA4 command generation proves too costly, not the plan. Rough size if taken: 3–6 engineer-months per vendor plus WSI.
 
-Which of the last two becomes the first real-GPU Vulkan driver is open (§13p).
+The first real-GPU Vulkan driver is our own (§13p, `atrium-rdna4-vulkan-backend.md`); Mesa is the fallback.
 
 ---
 
@@ -994,7 +994,7 @@ n. **VMID pressure.** Hardware has 15–16 VMIDs; 2.1 decouples VMs from VMIDs (
 
 o. **Render-target compression.** Off in 2.1 (§5.3). Revisit once a real-silicon backend can measure the bandwidth and energy gain for frescod and 3D workloads. Defining it needs: clearing compression state on allocation (I5), a validated `VM_BIND` flag where compression is a page-table bit (RDNA4), the layout carried as a modifier on `share_fd`, display validation of scanout-capable layouts, refusal of CPU mappings of compressed BOs, and a policy against compressing surfaces whose compression ratio would leak another app's or origin's pixels (the "GPU.zip" side channel).
 
-p. **First real-GPU Vulkan driver.** A Tier-3 backend in `atrium-vk-icd` that builds RDNA4 command blobs itself, or a radv winsys port. Decide before §17 step 6; the ABI serves both.
+p. **First real-GPU Vulkan driver.** *Resolved 2026-11-03:* our own RDNA4 backend, no Mesa, as a Tier-3 `Backend` in `aqueduct-gpu-host` with a compiler on the atrium-spv IR. Design: [`atrium-rdna4-vulkan-backend.md`](atrium-rdna4-vulkan-backend.md). A radv winsys port stays the fallback.
 ---
 
 ## 14. Comparison: this ABI vs DRM uAPI vs Vulkan
