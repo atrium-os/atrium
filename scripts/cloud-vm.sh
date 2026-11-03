@@ -166,12 +166,17 @@ e2e() {
     mkdir -p "$VMDIR/rec-src" "$VMDIR/rec"
     cat > "$VMDIR/rec-src/e2e-fixture.html" <<'EOF'
 <!doctype html><html><head><title>Atrium e2e fixture</title>
-<style>body{font-family:sans-serif;margin:2em} h1{color:#234}</style></head>
+<style>body{font-family:sans-serif;margin:2em} h1{color:#234} nav.shut{display:none}</style></head>
 <body><h1>Atrium jail e2e</h1><p>A small synthetic document for <a href="https://example.org/">the quick lane</a>.</p>
-<ul><li>one</li><li>two</li></ul><script>document.querySelector('p').textContent += ' (script ran)';</script></body></html>
+<button id="menu">Menu</button><nav id="nav" class="shut"><a href="/one">one</a></nav>
+<ul><li>one</li><li>two</li></ul><script>document.querySelector('p').textContent += ' (script ran)';
+document.getElementById('menu').addEventListener('click', function () { var n = document.getElementById('nav'); n.className = n.className === 'shut' ? 'open' : 'shut'; });</script></body></html>
 EOF
     (cd "$ROOT/navigator-prerender" && cargo build --quiet --release --bin prerender 2>/dev/null) || die "prerender build"
-    PRERENDER_EMIT_DIR="$VMDIR/rec" "$ROOT/navigator-prerender/target/release/prerender" \
+    # ★ EXPLORE, so the menu's click is recorded as a transition: without
+    # one the worker is never asked to navigate, save or restore, and the
+    # e2e would pass having exercised only open and close.
+    PRERENDER_EXPLORE=1 PRERENDER_EMIT_DIR="$VMDIR/rec" "$ROOT/navigator-prerender/target/release/prerender" \
         "$VMDIR/rec-src/e2e-fixture.html" >/dev/null 2>&1
     [ -f "$VMDIR/rec/e2e-fixture.json" ] || die "prerender wrote no recording"
     sh "$ROOT/scripts/navigator-jail-e2e.sh" --quick --recordings "$VMDIR/rec"
