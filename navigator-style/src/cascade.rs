@@ -52,7 +52,19 @@ pub struct Styled {
 /// Every longhand, in row order — the index of a value in `Style::values`.
 pub fn longhands() -> Vec<&'static str> { ROWS.iter().flat_map(|r| r.props.iter().copied()).collect() }
 
-pub fn index_of(prop: &str) -> Option<usize> { longhands().iter().position(|p| *p == prop) }
+/// ★ Computed once. `Style::get` runs for every property read during layout,
+/// and building the whole longhand list and scanning it on each call was most
+/// of a render's time: on GitHub's repository page (doc23), whose nested flex
+/// and grid lay subtrees out many times over, the allocator alone was the
+/// hottest frame.
+pub fn index_of(prop: &str) -> Option<usize> {
+    static INDEX: std::sync::OnceLock<std::collections::HashMap<&'static str, usize>> = std::sync::OnceLock::new();
+    INDEX.get_or_init(|| {
+        let mut m = std::collections::HashMap::new();
+        for (i, p) in longhands().into_iter().enumerate() { m.entry(p).or_insert(i); }
+        m
+    }).get(prop).copied()
+}
 
 impl Style {
     pub fn get(&self, prop: &str) -> &V { &self.values[index_of(prop).expect("a profile longhand")] }

@@ -295,7 +295,23 @@ pub(crate) struct Shaper<'a> {
     fonts: &'a FontSet,
     tt: Vec<ttf_parser::Face<'a>>,
     hb: Vec<rustybuzz::Face<'a>>,
+    /// ★ Shaping results by (face, tabular figures, text), in font units.
+    ///
+    /// Intrinsic sizing measures a subtree by laying it out, and a measure
+    /// nested inside another measure lays its subtree out again, so the same
+    /// run is shaped once per enclosing measure. On GitHub's repository page
+    /// (doc23: flex and grid nested many levels deep) that is the same text
+    /// shaped thousands of times, and the render took longer than the
+    /// corpus's 120 s limit. Shaping depends only on the face, the features
+    /// and the text, so the result is cached here and everything that depends
+    /// on the style (size, letter- and word-spacing) is applied per call,
+    /// exactly as before.
+    cache: std::cell::RefCell<std::collections::HashMap<(usize, bool, String), std::rc::Rc<Vec<Shaped>>>>,
 }
+
+/// One glyph as the shaper returned it, in font units: id, x and y offset,
+/// x advance, and the byte offset of its cluster in the text.
+type Shaped = (u16, i32, i32, i32, u32);
 
 /// A shaped piece of one face: glyphs positioned from its own origin.
 pub(crate) struct Piece { pub(crate) face: usize, pub(crate) glyphs: Vec<(u16, U, U)>, pub(crate) width: U, pub(crate) text: String }
@@ -304,7 +320,7 @@ impl<'a> Shaper<'a> {
     pub(crate) fn new(fonts: &'a FontSet) -> Self {
         let tt = fonts.faces.iter().map(|f| ttf_parser::Face::parse(&f.bytes, 0).expect("pinned")).collect();
         let hb = fonts.faces.iter().map(|f| rustybuzz::Face::from_slice(&f.bytes, 0).expect("pinned")).collect();
-        Shaper { fonts, tt, hb }
+        Shaper { fonts, tt, hb, cache: Default::default() }
     }
 
     /// Split `text` by the first face in the stack that has each character,
@@ -328,23 +344,33 @@ impl<'a> Shaper<'a> {
             }
         }
         segs.into_iter().map(|(face, s)| {
-            let mut buf = rustybuzz::UnicodeBuffer::new();
-            buf.push_str(&s);
-            buf.guess_segment_properties();
-            let feats: &[rustybuzz::Feature] = if st.tnum { &TNUM } else { &[] };
-            let out = rustybuzz::shape(&self.hb[face], feats, buf);
+            let key = (face, st.tnum, s);
+            let cached = self.cache.borrow().get(&key).cloned();
+            let shaped = cached.unwrap_or_else(|| {
+                let mut buf = rustybuzz::UnicodeBuffer::new();
+                buf.push_str(&key.2);
+                buf.guess_segment_properties();
+                let feats: &[rustybuzz::Feature] = if st.tnum { &TNUM } else { &[] };
+                let out = rustybuzz::shape(&self.hb[face], feats, buf);
+                let v: Vec<Shaped> = out.glyph_infos().iter().zip(out.glyph_positions())
+                    .map(|(i, p)| (i.glyph_id as u16, p.x_offset, p.y_offset, p.x_advance, i.cluster)).collect();
+                let v = std::rc::Rc::new(v);
+                self.cache.borrow_mut().insert(key.clone(), v.clone());
+                v
+            });
+            let s = key.2;
             let upem = self.fonts.faces[face].upem;
             let (mut pen, mut glyphs, mut extra) = (0i64, vec![], 0 as U);
-            for (info, pos) in out.glyph_infos().iter().zip(out.glyph_positions()) {
-                glyphs.push((info.glyph_id as u16,
-                             scale(pen + pos.x_offset as i64, st.size, upem) + extra,
-                             -scale(pos.y_offset as i64, st.size, upem)));
-                pen += pos.x_advance as i64;
+            for &(gid, x_offset, y_offset, x_advance, cluster) in shaped.iter() {
+                glyphs.push((gid,
+                             scale(pen + x_offset as i64, st.size, upem) + extra,
+                             -scale(y_offset as i64, st.size, upem)));
+                pen += x_advance as i64;
                 // Spacing is added AFTER each glyph (and after each space for
                 // word-spacing), in 1/64 px, outside the font-unit pen so the
                 // integer scaling of the shaped advances is untouched.
                 extra += st.ls;
-                if s.as_bytes().get(info.cluster as usize) == Some(&b' ') { extra += st.ws }
+                if s.as_bytes().get(cluster as usize) == Some(&b' ') { extra += st.ws }
             }
             Piece { face, glyphs, width: scale(pen, st.size, upem) + extra, text: s }
         }).collect()
