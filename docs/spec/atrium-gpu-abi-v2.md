@@ -17,7 +17,7 @@
 > fixed VMIDs (§5.2), validated `VM_BIND` (§5.4), real queue objects with
 > per-queue fences (§5.5, §5.7), syncobj error state (§5.6), revocable doorbells
 > (§5.9), the memory-lifetime rule (§5.11), the kernel's validation duties
-> (§5.12), scanout by fd and the display lease (§7), the concrete fault model
+> (§5.12), sealed buffers for content-addressed sharing (§5.13), scanout by fd and the display lease (§7), the concrete fault model
 > (§10), and the implementation-status table (§18). Sections marked
 > *(unchanged in 2.1)* carry over from v2 as written.
 
@@ -587,8 +587,37 @@ Principle 12 in list form. Every vendor module must check these itself; a simula
 | `SUBMIT` | blob range mapped in this VM and readable by the GPU; size ≤ `max_blob`; in-flight under `max_inflight` | `EFAULT` / `E2BIG` / `EAGAIN` |
 | `mmap` | offset is one this fd handed out, length within that object | `EACCES` / `EINVAL` |
 | Display commit | buffer is a BO/share of a size, pitch, format and tiling the plane accepts; BO pinned for scanout (§7) | `EINVAL` |
+| Sealed BO | bind only `READ_ONLY`; no writable mmap or `BO_WRITE`; no seal with live writable bindings | `EACCES` / `EBUSY` |
 | Authority | control-only ioctl on a client context | `EPERM` |
 | Quota | allocation within the jail's record | `EDQUOT` |
+
+### 5.13 Sealed buffers and content-addressed sharing (new in 2.1)
+
+Isolation means no context can write to, or reach, memory that is not its own. It does not require a private copy per context. One physical buffer may be bound into many VMs if no binding can change it. Sealing makes that a kernel guarantee, so content-addressed dedup (Tessera, the aqueduct CAS) can share GPU memory across apps without weakening I1–I5.
+
+```
+ATRIUM_GPU_BO_SEAL       (on bo_fd)
+
+struct atrium_gpu_bo_seal {
+    uint32_t struct_size;
+    uint32_t flags;               /* must be 0 */
+    int32_t  wait_syncobj_fd;     /* -1, or seal once this point signals */
+    uint32_t _pad;
+    uint64_t wait_value;
+};
+```
+
+- **Seal once, forever.** After `BO_SEAL` the BO's contents are immutable for the life of the storage. The seal travels with the storage, so every `bo_fd` and `share_fd` that refers to it sees it, and `BO_QUERY` reports `SEALED`. There is no unseal.
+- **What the kernel enforces.** A sealed BO can be bound only with the `READ_ONLY` bind flag, and the kernel writes read-only GPU page-table entries for it (`EACCES` on a writable bind). CPU mappings are read-only (`EACCES` on `PROT_WRITE`); existing writable mappings are revoked through the device pager at seal time. `BO_WRITE` fails with `EACCES`. A BO cannot be sealed while it has a writable binding (`EBUSY`): unbind it first, or pass a wait point so the seal applies after the producing work retires (§5.11).
+- **Not scanout, not shared with writers.** A BO created with `SCANOUT`, or one still imported writable elsewhere, cannot be sealed (`EBUSY`).
+- **Hashing stays in userspace.** The kernel never hashes, never compares contents and never merges pages on its own (no KSM-style scanning). The broker or Tessera keys sealed BOs by content hash and hands out `share_fd`s for them. The kernel's only job is to make the seal hold.
+- **Accounting.** A sealed shared BO is charged once, to the record of the context that created it, normally the broker's shared pool (§4.2), not to every importer.
+
+What is allowed to be deduplicated is a policy for the sharing service, and it is normative:
+
+- **Public, immutable content only.** Shader binaries and pipeline caches, fonts and glyph atlases, icons, engine and package assets. Never framebuffers, render targets, or any buffer whose contents an app produced from its own data.
+- **Proven possession.** A context may be handed the shared copy of H only if its trust domain has already proven it holds H (the `aqueduct.md` §6.6 rule). Otherwise it gets a private copy, and the load time must not depend on whether H was already resident. This closes the dedup timing oracle (one app learning what another is using).
+- **Physical side channels remain.** A read-only page table does not stop Rowhammer-style bit flips in shared DRAM, or cache-timing observation of another tenant's reads. That is why the content rule above excludes anything secret. Platforms with ECC or TRR reduce the first; nothing in this ABI removes the second.
 
 ---
 
