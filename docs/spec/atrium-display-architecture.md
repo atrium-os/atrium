@@ -7,6 +7,13 @@ ABI [`atrium-gpu-abi-v2.md`](atrium-gpu-abi-v2.md), and the AMD module design
 [`atrium-gpu-amd-design.md`](atrium-gpu-amd-design.md). The functional/timing
 model is the gpusim repo (separate).
 
+> **Amended 2026-11-03 for GPU ABI v2.1** (`atrium-gpu-abi-v2.md` §7, §6.4,
+> §10.2–10.4). Where this document and §7.1 below disagree with the older text,
+> §7.1 wins. In short: scanout takes a `bo_fd`/`share_fd`, never a VRAM offset;
+> the display is leased per plane; the last frame stays up when the lease holder
+> dies; resets and resume re-apply the last committed state and post a reset
+> event; output CRC readback is a capability.
+
 This captures the architecture of the **display** half of the GPU stack — the
 block that drives a monitor — and the first milestone (`D-display-1`). The
 short version: the display is a *decoupled engine* that scans out a *shared BO*,
@@ -40,6 +47,9 @@ Two earlier decisions make the seam almost free:
   DMA-reads the FB every refresh, so it is VRAM-resident, and the display reads
   it by **VRAM offset** (it does not walk GPUVM — it has its own simple
   scanout-address path; it takes the offsets from the BO's `pages[]`).
+  *(2.1: the hardware reads by VRAM address, but the ABI never carries one.
+  Userspace passes the BO fd; the display module resolves the address itself,
+  §7.1.)*
 
 The scanout FB is therefore a VRAM-resident BO shared by fd. The whole memory
 story is already built.
@@ -155,6 +165,41 @@ Essential objects (load-bearing for real hardware, kept from KMS): **connector**
 an output), **plane** (primary / overlay / cursor layers). The **encoder** is
 collapsed into the CRTC for now (add it when modeling DP link training /
 bandwidth limits — §8).
+
+
+### 7.1 v2.1 amendments (normative)
+
+- **Scanout by object.** Each plane in an atomic commit names a `bo_fd` or a
+  `share_fd`. The display module resolves it to the BO, checks size, pitch,
+  format, modifier and tiling against the plane (GPU ABI §5.12), pins the
+  backing while it is latched, and releases it only after it has been flipped
+  away (GPU ABI §5.11). `ATRIUM_GPU_IOC_BO_EXPORT_SCANOUT` and every ioctl field
+  that carries `{vram_offset, size}` are retired.
+- **Per-plane leases.** Opening `/dev/atrium-display<N>` is exclusive to the
+  broker (devfs, `EBUSY` on a second open). The broker holds every plane by
+  default and may lease a single plane to a separate owner (a fd scoped to that
+  plane, with its own fences). This is the hook for a GPU-independent "safe"
+  plane (GPU ABI §6.4 rules 5 and 6). The `WM/shell` policy layer of §12.5 is
+  unaffected: it drives the broker, not the device.
+- **Hold the last frame.** When a lease holder's fd closes, the display module
+  keeps scanning out what was last latched on its planes until the next holder
+  commits. No modeset happens during the gap (GPU ABI §10.2).
+- **Fences.** In-fence and out-fence are `(syncobj_fd, value)` pairs. A commit
+  whose in-fence is errored is dropped: the previous buffer stays on screen and
+  the out-fence carries the same error (GPU ABI §10.3).
+- **Reset and resume.** After a GPU rung-2 reset or a resume, the module
+  re-applies its last committed mode and planes. Planes whose BOs were lost show
+  the boot framebuffer until the next commit. The display fd posts
+  `ATRIUM_DISPLAY_NOTE_RESET` (with the GPU's new lost generation) through
+  kqueue. Rung 0 and rung 1 GPU recovery never touch the display block.
+- **Output CRC.** Where the hardware computes a CRC of what the pipe actually
+  sent, it is exposed as a display capability and read per frame through the
+  display fd, so a monitor process can check that what is on screen matches
+  what was committed.
+- **Header.** The display ABI gets its own `include/atrium/display_abi_v2.h`
+  following the same rules as the GPU header (`struct_size` first, `int32_t`
+  fds, no implicit padding). Until it lands, `atrium-gpu-amd/atrium_display_abi.h`
+  is the intermediate surface.
 
 ## 8. The output topology — connectors, encoders, PHYs (HDMI / DP / USB-C)
 
