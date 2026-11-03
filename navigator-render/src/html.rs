@@ -569,8 +569,12 @@ impl<'a> Cx<'a> {
             }
             if let Some(min) = self.table_content(h, s, cb_w, false) { w = w.max(min + frame) }
         }
-        // Auto margins take what is left; both auto centres.
-        let free = cb_w - w - ml.unwrap_or(0) - mr.unwrap_or(0);
+        // Auto margins take what is left; both auto centres. ★ Never less
+        // than nothing (CSS 2.1 §10.3.3): a box WIDER than its containing
+        // block treats auto margins as 0 and overflows on the right. Centring
+        // it anyway pushed Asahi's 1024px min-width page half off the left
+        // edge, where no scrolling reaches.
+        let free = (cb_w - w - ml.unwrap_or(0) - mr.unwrap_or(0)).max(0);
         match (ml, mr) {
             (None, None) => ml = Some(free / 2),
             (None, Some(_)) => ml = Some(free),
@@ -1361,7 +1365,19 @@ impl<'a> Cx<'a> {
             // MINIMUM SIZE: min(specified size if definite, content's
             // min-content size) — an item never shrinks below its content.
             // (Treating auto as 0 let a row squeeze text out of its box.)
+            // ★ …unless the item is a SCROLL CONTAINER (Flexbox §4.5):
+            // `overflow` other than visible (or clip) makes the automatic
+            // minimum 0, which is the whole point of `overflow: hidden` on a
+            // flex item. Without it TikTok's 38rem newsroom column would not
+            // shrink and ran 270 words off the right edge.
+            // ROWS only, for now: in a column the item's height is shared
+            // out of a container height this renderer often has to guess
+            // (a stretched item in an auto-height row), and a zero minimum
+            // there let edX's clamped testimonials collapse to one line.
+            // CSS says the same of columns; that waits on definite heights.
+            let scroller = row && ["overflow-x", "overflow-y"].iter().any(|p| !matches!(kw(cs, p), "visible" | "clip" | ""));
             let min = match cs.get(minp) {
+                V::Kw("auto") if scroller => 0,
                 V::Kw("auto") => {
                     let content_min = if row {
                         let b = |side: &str| if kw(cs, &format!("border-{side}-style")) == "none" { 0 } else { len(cs.get(&format!("border-{side}-width")), 0).unwrap_or(0) };
@@ -2507,6 +2523,29 @@ mod tests {
         let blue = r.iter().find(|r| r.rgba == 0x0000ffff).expect("blue box");
         assert_eq!(blue.y, (50 + 30 + 20) * PX, "margins add, never collapse (§3.1)");
         assert_eq!(blue.w, 800 * PX, "auto width fills the containing block");
+    }
+
+    #[test]
+    fn auto_margins_never_push_an_overwide_box_off_the_left() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-right: 0px; margin-top: 0px }
+            .c { min-width: 1024px; width: 100%; margin-left: auto; margin-right: auto; height: 10px }
+            .d { width: 100px; height: 10px; background-color: #00ff00 }</style><div class="c"><div class="d"></div></div>"#);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(0, 0, 100, 10)]);
+    }
+
+    #[test]
+    fn a_scrolling_flex_item_shrinks_below_its_content() {
+        let src = |ov: &str| format!(r#"<style>body {{ margin-left: 0px; margin-top: 0px }}
+            .r {{ display: flex; width: 300px }}
+            .a {{ flex-basis: 200px; flex-shrink: 0; height: 10px; background-color: #ff0000 }}
+            .b {{ flex-basis: 400px; flex-shrink: 1; height: 10px; background-color: #00ff00; {ov} }}
+            .w {{ width: 250px; height: 1px }}</style>
+            <div class="r"><div class="a"></div><div class="b"><div class="w"></div></div></div>"#);
+        let o = render(&src("overflow-x: hidden; overflow-y: hidden"));
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(200, 0, 100, 10)]);
+        // Control: a visible item keeps its 250px content width.
+        let c = render(&src(""));
+        assert_eq!(boxes(&c, 0x00ff00ff), vec![(200, 0, 250, 10)]);
     }
 
     #[test]
