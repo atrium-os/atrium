@@ -101,6 +101,8 @@ Pipeline:
 9. **Encode** with `atrium-rdna4-isa`, emitting a shader binary plus metadata
    (register counts, scratch, LDS, user-SGPR layout).
 
+**Host architecture.** The compiler and command builder are pure Rust and run on any host, so the oracle harness runs on the x86_64 box. Tier-2, however, only generates aarch64 code today (the Cranelift backend enables aarch64 triples only, and the bespoke backend is arm64). Tier-2 cross-checks therefore run on arm64 hosts (the Mac) until Tier-2 gains an x86_64 target; Cranelift already supports x86_64, so that is mostly enabling the triple and fixing what breaks.
+
 **Graphics stages.** RDNA4 has no legacy vertex-shader hardware path: all
 geometry runs as NGG primitive shaders, which export positions and primitives
 themselves. The compiler therefore emits the vertex stage as an NGG shader
@@ -181,13 +183,13 @@ The loop:
    gpusim's instruction-semantics tests. This is the main mechanism for making
    gpusim execute RDNA4 encodings faithfully rather than approximately.
 
-**Transport to the R9700.** Depends on the box's OS (§10 q1):
+**Transport to the R9700.** The box runs Ubuntu on x86_64, and the provider offers IPMI, so Atrium can later be booted on it natively. Two phases:
 
-- **Linux with the stock amdgpu driver:** the harness uses the amdgpu kernel
+- **Now — Ubuntu with the stock amdgpu driver:** the harness uses the amdgpu kernel
   interface only as a way to run our blobs and read back results. It tests the
   compiler and command generation, not our kernel driver. This is test
   tooling and never ships.
-- **FreeBSD with `atrium-gpu-amd`:** the same harness runs through ABI v2.1 and
+- **Later — Atrium booted natively over IPMI, with `atrium-gpu-amd`:** once Atrium runs on x86_64 (it has only been tested on arm64 so far), the same harness runs through ABI v2.1 and
   also tests the kernel driver on silicon (firmware loaded locally; ABI §13m
   only blocks *redistribution*).
 
@@ -200,7 +202,7 @@ The loop:
 | M2 | **Compiler breadth.** Divergent control flow, loops, LDS, atomics, subgroup ops, spilling; the `atrium-spv-tests` corpus as cases | Corpus green on all three oracles |
 | M3 | **Images and samplers** in compute | Texture fetch and sample cases green |
 | M4 | **Graphics.** NGG vertex stage, fragment shaders, rasteriser state, blending, depth | fresco-vulkan `HeadlessRenderer` renders a frame matching Tier-2 |
-| M5 | **In the broker.** `RoutingBackend` uses `tier3_rdna4` as Tier-3 on Atrium; present by fd; device-lost fallback to Tier-2 | frescod composites a desktop on gpusim and (with FreeBSD on the box) on the R9700 |
+| M5 | **In the broker.** (Native runs on the R9700 need Atrium's x86_64 port.) `RoutingBackend` uses `tier3_rdna4` as Tier-3 on Atrium; present by fd; device-lost fallback to Tier-2 | frescod composites a desktop on gpusim and (with FreeBSD on the box) on the R9700 |
 | M6 | **Performance.** Scheduling, occupancy tuning, pipeline caching in sealed BOs | Measured against the router's cost model |
 
 Dependencies: M0–M3 need only `atrium-gpu-rs` on the v2.1 header and gpusim.
@@ -232,8 +234,8 @@ If the compiler core stalls at M2, two exits, in order of preference:
 
 ## 10. Open questions
 
-1. **What OS runs on the R9700 box**, and can FreeBSD be installed on it?
-   Decides the transport in §6.
+1. *Resolved:* the R9700 box runs Ubuntu x86_64 with IPMI. Linux transport now;
+   native Atrium boot once the x86_64 port is mature (§6, §7 M5).
 2. **gpusim's current ISA coverage.** gpusim lives in a separate repo; its
    shader-execution fidelity needs an audit before M1 relies on it.
 3. **Pipeline cache format.** Compiled binaries keyed by (SPIR-V hash, pipeline
