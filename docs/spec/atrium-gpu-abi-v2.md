@@ -1,19 +1,38 @@
-# Atrium GPU ABI v2 — Draft for Review
+# Atrium GPU ABI v2.1
 
-> **CANONICAL (2026-06-19).** This is the canonical GPU ABI. All backends
+> **CANONICAL.** This is the canonical GPU ABI. All backends
 > (`atrium-gpu-amd`, `atrium-virtio-gpu`, Carillon) and `atrium-gpu-rs` converge
-> to it — see [`gpu-abi-reconciliation.md`](gpu-abi-reconciliation.md) for the
-> decision, lineage, and migration plan. **Amendments adopted there** (the working
-> `atrium-gpu-amd` implementation refined the draft): the syncobj fd is itself
-> `EVFILT_READ`-able (no separate `SYNCOBJ_EVENTFD`); `BO_CREATE` is on `device_fd`
-> (VM-agnostic until `VM_BIND`); ioctl group is `'A'`; display vblank is kqueue-only
-> (`WAIT_VBLANK` retired). Display lives in [`atrium-display-architecture.md`](atrium-display-architecture.md).
+> to it. See [`gpu-abi-reconciliation.md`](gpu-abi-reconciliation.md) for the
+> lineage and migration plan. Display lives in
+> [`atrium-display-architecture.md`](atrium-display-architecture.md); §7 here
+> fixes how buffers and authority cross into it.
 
-> **Status.** Draft. Intended audience: FreeBSD-CURRENT contributors, OpenBSD/NetBSD/DragonFly graphics maintainers, Mesa userspace authors familiar with the libdrm vendor backends. Not yet implemented end-to-end; v0.1 (the virtio-gpu skeleton at `atrium-kmod/atrium_virtio_gpu.c`) is the only consumer of an earlier, much smaller version of this surface today. Separately, a from-scratch AMD bring-up driver (`atrium-gpu-amd`, developed against the gpusim functional model) implements a smaller intermediate ABI — integer handles, kernel-mediated submit, blocking fence-wait, MSI-X completion — that is expected to converge to this surface; that work is what grounds the user-mode-queue (§5.9) and energy-telemetry (§5.10) additions in this revision. The intent of v2 is to lock in the long-term shape *before* a second vendor ports.
+> **Revision 2.1 (2026-11-03).** Folds in the reconciliation decisions
+> (D-1: the syncobj fd itself is the kqueue source, `SYNCOBJ_EVENTFD` is gone;
+> D-2: BOs are created on the device fd and are VM-agnostic until `VM_BIND`;
+> ioctl group `'A'`; kqueue-only vblank). It also settles the design gaps found
+> by [`../reviews/2026-11-03-gpu-kernel-and-tier2-review.md`](../reviews/2026-11-03-gpu-kernel-and-tier2-review.md)
+> §A2. New or rewritten in 2.1: principles 12–14 (§3), the access and authority
+> model (§4.1), resource accounting per jail (§4.2), process contexts instead of
+> fixed VMIDs (§5.2), validated `VM_BIND` (§5.4), real queue objects with
+> per-queue fences (§5.5, §5.7), syncobj error state (§5.6), revocable doorbells
+> (§5.9), the memory-lifetime rule (§5.11), the kernel's validation duties
+> (§5.12), scanout by fd and the display lease (§7), the concrete fault model
+> (§10), and the implementation-status table (§18). Sections marked
+> *(unchanged in 2.1)* carry over from v2 as written.
+
+> **Status.** Specification. `atrium-gpu-amd` (developed against the gpusim
+> functional model) is the reference implementation and implements part of it;
+> §18 maps what exists against this text. Intended audience: Atrium kernel and
+> userspace authors first, then FreeBSD-CURRENT contributors, the other BSDs'
+> graphics maintainers, and Mesa winsys authors.
 >
-> **Companion.** Read `drm-research-findings.md` first if you want the source-grounded background. This document is the design that falls out of those findings. See `atrium-gpu-driver-architecture.md` for the driver-architecture stance and the rationale behind the user-mode-queue (§5.9) and energy-telemetry (§5.10) additions folded into this revision.
+> **Companion.** `drm-research-findings.md` (background),
+> `atrium-gpu-driver-architecture.md` (driver stance), `atrium-gpu-amd-design.md`
+> (the AMD module), `gpu-isolation.md` (the isolation invariants and the
+> attestation gate this ABI must satisfy).
 >
-> **One-line summary.** A small, BSD-native, vendor-per-cdev kernel ABI for GPU work, with Vulkan as the only userspace ABI it targets. POD-blob submits, timeline-only sync, VM_BIND from day one, kernel-mediated *or* capability-scoped user-mode-queue submission, Capsicum-friendly, optional read-only energy telemetry, no shared kernel framework, no Linux DRM concepts inherited.
+> **One-line summary.** A small, BSD-native, vendor-per-cdev kernel ABI for GPU work, with Vulkan as the only userspace API it targets. POD-blob submits, timeline-only sync, VM_BIND from day one, per-queue fences with deferred frees, kernel-mediated *or* capability-scoped user-mode-queue submission, a brokered control/client authority split, per-jail resource accounting, Capsicum-friendly, optional read-only energy telemetry, no shared kernel framework, no Linux DRM concepts inherited.
 
 ---
 
@@ -96,6 +115,14 @@ These are non-negotiable. Every concrete decision below is a consequence of one 
 
 11. **User-mode submission is capability-scoped.** Where hardware supports user-mode queues — userspace rings a hardware doorbell directly, bypassing the `SUBMIT` ioctl (AMD MES on GFX11/GFX12, Intel GuC, Apple ASC) — the submit-side authority is expressed as a *capability*, never as ambient power. A queue's doorbell is an MMIO page scoped to that queue's VM (its own VMID + page tables), so mapping it into a process grants exactly the ability to kick *that one isolated queue* and nothing else. The kernel keeps ownership of VM_BIND, queue/MQD setup, the hand-off to scheduler firmware, preemption, and reset. This is the Capsicum/Portcullis-native expression of "let userspace submit without a syscall": passing a `queue_fd` (with its mapped doorbell) over `SCM_RIGHTS` is a scoped grant to a sandbox or jail, not a privilege escalation. Kernel-mediated `SUBMIT` (§5.7) remains the baseline and the fallback for hardware without user queues.
 
+
+
+12. **The kernel validates everything it programs into hardware.** Every address, size, offset, engine id, mode and buffer reference that the kernel writes into a register, a page table, a queue descriptor or a firmware message is checked by the kernel first. A device model's referee (gpusim) or a firmware check is a second line, never the first: on silicon nothing else is checking. The opaque *contents* of a submit blob are the one deliberate exception (principle 5), and they are contained by the VM (I1–I3 of `gpu-isolation.md`), not by inspection.
+
+13. **Authority is brokered and split.** Opening the device node grants *control* authority (device reset, scheduler weights, power gating, quotas, minting clients). Running GPU work needs only *client* authority. Clients never open the node: a broker that holds the control fd mints restricted client fds (§4.1) and hands them over `SCM_RIGHTS`. The kernel enforces the split itself; Capsicum's `cap_ioctls_limit` narrows further but is not what makes it safe. **The default deployment gives no app a client fd at all**: apps reach the GPU through the aqueduct-gpu protocol to a trusted daemon (frescod, `aqueduct-gpu-host`), and jails plus devfs rulesets keep them off the device node. A direct client fd for an app exists only for testing and development, never in production (§4.1).
+
+14. **A jail is the accounting unit; a VM is the isolation unit.** Isolation between GPU contexts is a property of the driver and the GPU MMU: jail boundaries do not apply to device DMA. What jails *are* good for is deciding who may hold a client fd and charging resource use. Every client context carries the jail id it was minted for, and the kernel enforces that jail's quotas (§4.2).
+
 ---
 
 ## 4. Object model
@@ -104,23 +131,79 @@ The ABI exposes seven object kinds. Each is a file descriptor.
 
 | Object | What it represents | Created by | Lifetime ends |
 |---|---|---|---|
-| `device_fd` | A specific GPU device | `open("/dev/atrium/gpu/<vendor><N>")` | Last `close()` |
-| `vm_fd` | A GPU virtual address space, per-process | `ATRIUM_GPU_VM_CREATE` ioctl on `device_fd` | Last `close()` |
-| `bo_fd` | A buffer object resident in some heap | `ATRIUM_GPU_BO_CREATE` on `vm_fd`, *or* `ATRIUM_GPU_BO_IMPORT_FD` on `vm_fd` | Last `close()` (refcounted across cross-process sharing) |
-| `queue_fd` | A submission queue (one hardware engine, one priority) | `ATRIUM_GPU_QUEUE_CREATE` on `vm_fd` | Last `close()` |
-| `syncobj_fd` | A timeline semaphore (monotonic 64-bit counter) | `ATRIUM_GPU_SYNCOBJ_CREATE` on `device_fd` | Last `close()` |
-| `share_fd` | A vendor-neutral handle to a buffer's backing storage, suitable for cross-device sharing | `ATRIUM_GPU_BO_EXPORT_SHARE` on `bo_fd` | Last `close()` (refcounts the underlying storage) |
-| `event_fd` | A kqueue-readable fd that signals when a syncobj timeline passes a given value | `ATRIUM_GPU_SYNCOBJ_EVENTFD` on `syncobj_fd` | Last `close()` |
+| `control_fd` | Control authority over one GPU device | `open("/dev/atrium/gpu/<vendor><N>")` by the broker only (devfs-restricted) | Last `close()` |
+| `device_fd` | A *client* context on one GPU device: the handle every client op goes through, carrying the jail id and quotas it was minted with | `ATRIUM_GPU_CLIENT_OPEN` on `control_fd` | Last `close()` |
+| `vm_fd` | A GPU virtual address space | `ATRIUM_GPU_VM_CREATE` on `device_fd` | Last `close()`, then deferred until its queues' work retires (§5.11) |
+| `bo_fd` | A buffer object resident in some heap; VM-agnostic until bound | `ATRIUM_GPU_BO_CREATE` on `device_fd`, *or* `ATRIUM_GPU_BO_IMPORT_SHARE` on `device_fd` | Last `close()`, then deferred until no in-flight work can reach it (§5.11) |
+| `queue_fd` | A submission queue (one engine, one priority) in one VM, with its own fence slot and, for user-mode queues, its own doorbell page | `ATRIUM_GPU_QUEUE_CREATE` on `vm_fd` | Last `close()`: the queue is unmapped from the hardware/firmware, outstanding signal points are completed or errored (§10), doorbell mappings are revoked |
+| `syncobj_fd` | A timeline semaphore (monotonic 64-bit counter plus an error word). Itself `EVFILT_READ`-able | `ATRIUM_GPU_SYNCOBJ_CREATE` on `device_fd` | Last `close()` |
+| `share_fd` | A vendor-neutral handle to a buffer's backing storage, for cross-process, cross-device and display import | `ATRIUM_GPU_BO_EXPORT_SHARE` on `bo_fd` | Last `close()` (refcounts the underlying storage) |
+
+*2.1 changes:* `event_fd` is removed (D-1: the syncobj fd is the kqueue source, with the threshold in the kevent `data` field). `BO_CREATE` and `BO_IMPORT_SHARE` move to `device_fd` (D-2). `control_fd` is new and the old "open the node" `device_fd` becomes a minted client context (§4.1).
 
 Lifetime rules:
 
-- Closing `device_fd` does *not* implicitly destroy `vm_fd`s, `bo_fd`s, etc. that derive from it — those have their own refcounts. A closed `device_fd` simply cannot be used to issue new operations.
-- Closing `vm_fd` releases all bindings in that VM. The bound BOs survive (refcounted via their own fds); they just stop being mapped at that VM's virtual addresses.
-- Closing `bo_fd` decrements the buffer's refcount. The buffer is freed when the count reaches zero across all process refs (including imported `share_fd`s and ongoing GPU work pinning it).
-- Closing `queue_fd` waits for all in-flight submissions on it to either complete or fault, then frees the queue. (Long-running compute is the open question here; see §13.)
-- Closing `syncobj_fd` while submissions still wait on it is well-defined: those waits abort with `EBADF` reported via the queue's fault stream. Signaling a closed syncobj is silently dropped.
+- Closing `device_fd` does *not* destroy objects derived from it; they hold their own references to the client context. A context's quotas stay charged until its last object is gone.
+- Closing `vm_fd` releases all bindings in that VM once in-flight work on its queues has retired (§5.11). The bound BOs survive through their own fds.
+- Closing `bo_fd` drops a reference. Backing storage is freed when the count reaches zero across all fds, imports and display scanouts **and** no submitted work can still reach it (§5.11).
+- Closing `queue_fd` unmaps the queue, signals or errors its outstanding signal points (§10), and revokes its doorbell mapping (§5.9).
+- Closing `syncobj_fd` while submissions still signal it is well-defined: the signal is dropped. Waiters on other fds of the same syncobj are unaffected.
 
-All fds are inherited by `fork()` per POSIX. All fds (other than `device_fd` and `vm_fd`, which are device- and process-bound respectively) can be transported across processes via `SCM_RIGHTS` over a Unix socket; the receiving process can use them on its own `device_fd` (subject to vendor compatibility — see §6).
+All fds are inherited by `fork()` per POSIX. All fds except `control_fd` can be transported across processes via `SCM_RIGHTS`. A received fd keeps the authority and accounting it was minted with: it does not become the receiver's jail's resource. `control_fd` is not `DFLAG_PASSABLE`: control authority cannot be delegated by fd passing, only by opening the node, which devfs restricts.
+
+### 4.1 Access and authority
+
+Three levels of authority, enforced by the kernel on every ioctl:
+
+| Level | Holder | Can do |
+|---|---|---|
+| **Control** | The GPU broker: the process that owns the device node (frescod's broker in the single-GPU desktop; `aqueduct-gpu-host` for headless) | `CLIENT_OPEN`, `SET_QUOTA`, `DEVICE_RESET`, scheduler weights and deadline windows (`SCHED`), power gating (`POWERGATE`), device-wide telemetry, plus everything a client can do |
+| **Client** | Holders of a minted `device_fd` | VM, BO, queue, syncobj, bind, submit, share, per-context telemetry, queue reset of *its own* queues |
+| **None** | Everyone else | Nothing: they cannot open the node |
+
+```
+ATRIUM_GPU_CLIENT_OPEN   (on control_fd, returns device_fd)
+
+struct atrium_gpu_client_open {
+    uint32_t struct_size;
+    uint32_t flags;               /* ATRIUM_GPU_CLIENT_* (e.g. ALLOW_USER_QUEUES) */
+    int32_t  jail_id;             /* accounting jail; 0 = the broker's own */
+    uint32_t sched_weight;        /* firmware time-slice weight (0 = default) */
+    struct atrium_gpu_quota quota;/* §4.2; zero fields = device default */
+    int32_t  out_device_fd;
+    uint32_t _pad;
+};
+```
+
+Rules:
+
+- A control-only ioctl issued on a client `device_fd` fails with `EPERM`. The check is a field on the kernel's context object, not a Capsicum right, so it holds whether or not the receiver entered capability mode.
+- The broker may further narrow a client fd with `cap_ioctls_limit()` before handing it out (for example, removing `QUEUE_MAP` from a client that must not use user-mode queues). That is defence in depth.
+- **Default deployment (no direct grants):** apps hold no `device_fd`. They speak aqueduct-gpu to the broker, which is the only GPU client. Jails, devfs rulesets (`atrium.devfs.rules`) and Portcullis keep apps off the node. In this mode the kernel ABI's attack surface is the broker, and per-app isolation inside the broker is the shader sandbox (`aqueduct-gpu.md` §11) plus one VM per app inside the broker's context.
+- **Direct grant: test and development only.** A client `device_fd` handed to an app is for driver bring-up, conformance runs and Tier-3 experiments, never a production path. It exists only when the broker runs with an explicit test policy (`[gpu] direct_grant = "test"` in `jaild.policy.toml`, refused when the policy is `production`) or inside a dev jail (`atrium-devjail.md`), and Portcullis still refuses it unless the bound driver passes `gpu-isolation.md`'s attestation gate. Production images ship with no path that mints a client fd for an app.
+
+### 4.2 Resource accounting per jail
+
+Every client context carries the `jail_id` it was minted for. All contexts with the same `jail_id` on a device share one accounting record.
+
+```
+struct atrium_gpu_quota {
+    uint64_t vram_bytes;          /* device-local heap */
+    uint64_t system_bytes;        /* host (GTT) heap */
+    uint64_t va_bytes;            /* total VA reservable across this jail's VMs */
+    uint32_t max_vms;
+    uint32_t max_queues;
+    uint32_t max_syncobjs;
+    uint32_t max_inflight;        /* outstanding signal points across queues */
+};
+
+ATRIUM_GPU_SET_QUOTA     (on control_fd)
+ATRIUM_GPU_QUERY_USAGE   (on device_fd: own jail; on control_fd: any jail_id)
+```
+
+- Allocation beyond quota fails with `EDQUOT`. Nothing is reclaimed from a jail behind its back (no eviction in V1, §13h).
+- GPU time is charged through the scheduler weight given at `CLIENT_OPEN`, enforced by firmware time-slicing (principle 7). The kernel does not meter per-submit time.
+- When a jail is destroyed, its contexts keep working until their fds close: the kernel does not revoke on jail teardown. The broker is responsible for closing what it minted, and `QUERY_USAGE` lets it audit.
 
 ---
 
@@ -133,7 +216,7 @@ Numbers shown are illustrative and will be assigned via the FreeBSD ioctl conven
 ### 5.1 Device discovery and capabilities
 
 ```
-ATRIUM_GPU_QUERY_CAPS    (on device_fd)
+ATRIUM_GPU_QUERY_CAPS    (on device_fd or control_fd)
 
 struct atrium_gpu_caps_query {
     uint32_t struct_size;
@@ -169,6 +252,8 @@ Defined cap IDs (initial set; extensible):
 | `SUBMIT_FEATURES` | bitmap | Submit options (user-mode queues, long-running compute, indirect dispatch, ...) |
 | `VULKAN_EXTENSIONS` | array of strings | Vulkan extensions the driver can support |
 | `TELEMETRY` | bitmap | Read-only energy/utilization telemetry available (§5.10) |
+| `LOST_GENERATION` | `uint64_t` | Device reset generation; a change means `VK_ERROR_DEVICE_LOST` (§10). *New in 2.1* |
+| `LIMITS` | struct | `max_blob`, per-call array limits, the context's quota (§4.2, §5.12). *New in 2.1* |
 
 TLV is chosen over a fixed struct because new caps will be added over the device's lifetime and old userspace must skip them cleanly.
 
@@ -180,22 +265,29 @@ ATRIUM_GPU_VM_CREATE     (on device_fd, returns vm_fd)
 struct atrium_gpu_vm_create {
     uint32_t struct_size;
     uint32_t flags;               /* ATRIUM_GPU_VM_FLAG_* */
-    uint64_t va_size;             /* requested VA span (0 = device default) */
+    uint64_t va_size;             /* requested VA span (0 = device default); charged to va_bytes */
     int32_t  out_vm_fd;           /* set by kernel */
     uint32_t _pad;
 };
 ```
 
-A VM is *per-process*. Two processes that open the same device get independent VMs. A VM is *not* a Vulkan instance; one Vulkan logical device typically maps to one VM, but multiple VMs per process are allowed (e.g., one Vulkan backend driver per process can create one VM, and so on).
+A VM is an isolated GPU address space. One client may create several (up to its `max_vms` quota); the broker in the default deployment creates one per app it serves.
+
+**A VM is not a hardware VMID.** Hardware has a small fixed number of address-space slots (16 VMIDs on AMD, a handful of contexts on others). The ABI never ties a VM to one permanently, so the number of VMs is bounded by quota and memory, not by hardware slots:
+
+- On firmware-scheduled hardware (AMD MES, Intel GuC, Apple ASC) a VM is registered with the firmware as a *process context* (page-table base, process quantum, priority) when its first queue is created, and the firmware assigns and switches hardware slots itself.
+- On hardware without that, the vendor module assigns a VMID when a queue is made runnable and may steal an idle one (with a TLB flush) when it needs it. This is the vendor module's business and invisible to the ABI.
+
+Whatever the mechanism, a VM's queues only ever execute under that VM's page tables (I1).
 
 ### 5.3 BO lifecycle
 
 ```
-ATRIUM_GPU_BO_CREATE     (on vm_fd, returns bo_fd)
+ATRIUM_GPU_BO_CREATE     (on device_fd, returns bo_fd)
 
 struct atrium_gpu_bo_create {
     uint32_t struct_size;
-    uint32_t flags;               /* ATRIUM_GPU_BO_FLAG_* */
+    uint32_t flags;               /* ATRIUM_GPU_BO_FLAG_* (CPU_ACCESS, SCANOUT, ...) */
     uint64_t size;                /* bytes */
     uint64_t alignment;           /* bytes; 0 = device default */
     uint32_t heap_mask;           /* OR of acceptable heap indices */
@@ -205,7 +297,7 @@ struct atrium_gpu_bo_create {
 };
 ```
 
-`heap_mask` is a bitmap over the heap indices reported by `QUERY_CAPS`. The kernel picks any heap whose bit is set; userspace expresses preference by setting only the desired bits. Zero is invalid.
+A BO is created on the client context (D-2) and belongs to no VM until `VM_BIND`. `heap_mask` is a bitmap over the heap indices reported by `QUERY_CAPS`; the kernel picks any permitted heap with room under the jail's quota and fails with `EDQUOT` or `ENOMEM` otherwise. Zero is invalid. New BOs are zero-filled (I5).
 
 ```
 ATRIUM_GPU_BO_MMAP_INFO  (on bo_fd)
@@ -218,9 +310,11 @@ struct atrium_gpu_bo_mmap_info {
 };
 ```
 
-Userspace then calls `mmap()` on the *device_fd* (not the bo_fd) with the returned offset. The device cdev's `d_mmap_single` resolves the offset back to the BO via a `vm_object_t` the vendor driver constructs.
+Userspace then calls `mmap()` on the *device_fd* with the returned offset. The cdev's `d_mmap_single` resolves the offset to the BO's `vm_object_t` (a device-pager object), so the kernel can **revoke** CPU mappings (invalidate the pager's pages) when the BO's backing moves or is lost on device reset. System-heap BOs are always mappable; device-local BOs are mappable only when the device exposes them through a CPU-visible BAR and the BO was created with `CPU_ACCESS` (`ENOTSUP` otherwise; populate them with a GPU copy from a System staging BO).
 
-This mirrors Linux's GEM mmap-via-fake-offset trick but uses BSD's `vm_object_t` directly, which is exactly the right abstraction for "object of pages with custom pager." No equivalent of Linux's `vma_offset_manager` is needed — the offset is the BO's identity within the device fd.
+Copy ioctls (`BO_WRITE`/`BO_READ`) remain as a bring-up convenience and for tests. Production paths use the mapping.
+
+**Allocator requirements (normative for every vendor module):** device-local memory and each VM's VA space are managed with an allocator that frees and reuses (FreeBSD `vmem(9)` arenas are the reference choice). Bump-only allocators are not conformant: a long-running compositor must not exhaust VRAM or VA by allocating per frame.
 
 ### 5.4 VM_BIND
 
@@ -233,7 +327,7 @@ struct atrium_gpu_vm_bind_op {
     int32_t  bo_fd;               /* MAP/REMAP only; -1 for UNMAP */
     uint32_t _pad;
     uint64_t bo_offset;           /* byte offset into BO */
-    uint64_t va;                  /* GPU virtual address */
+    uint64_t va;                  /* GPU VA; 0 = kernel picks (MAP only); out: actual VA */
     uint64_t length;              /* bytes */
 };
 
@@ -242,15 +336,29 @@ struct atrium_gpu_vm_bind {
     uint32_t op_count;
     uint64_t ops_ptr;             /* user array of struct atrium_gpu_vm_bind_op */
     int32_t  signal_syncobj_fd;   /* syncobj signaled when ops complete; -1 = sync */
+    uint32_t _pad;
     uint64_t signal_value;        /* timeline value to write */
     uint32_t wait_count;
+    uint32_t _pad2;
     uint64_t wait_ptr;            /* user array of (syncobj_fd, value) deps */
 };
 ```
 
-A bind operation is async by default. The caller provides an output syncobj+value to wait on; the kernel signals it once all listed ops complete on the device side. If `signal_syncobj_fd == -1`, the call blocks until done. Multiple ops in a single ioctl execute as a transaction: either all bind / unbind / remap, or none (on per-op error, the kernel rolls back and reports which op failed).
+A bind operation is async by default. The caller provides an output syncobj+value to wait on; the kernel signals it once all listed ops complete on the device side. If `signal_syncobj_fd == -1`, the call blocks until done. Ops in one ioctl are a transaction: all apply or none (the kernel rolls back and reports the failing op index).
 
-Sparse bindings are advertised via `BIND_FEATURES` capability; if absent, sparse flags return `ENOTSUP`.
+**Validation (2.1, normative).** For each op the kernel checks, before touching a page table:
+
+- `va`, `bo_offset` and `length` are multiples of the `ADDRESS_SPACE` cap's `va_align`, `length > 0`, and `[va, va+length)` lies inside the VM's address window. Otherwise `EINVAL`.
+- `[bo_offset, bo_offset+length)` lies inside the BO. Otherwise `EINVAL`.
+- `MAP` does not overlap an existing mapping in this VM (`EEXIST`); replacing a mapping is `REMAP`, which is explicit.
+- `UNMAP`/`REMAP` cover exactly existing mappings (no partial unmaps in V1; `EINVAL`).
+- `va == 0` on `MAP` allocates from the VM's VA arena (§5.3 allocator rule) and returns the VA in the op.
+
+Unmapped VA and the BO's binding reference are released only after the VM's in-flight work has retired (§5.11), so a running submission never sees its translation pulled away or reused.
+
+The kernel batches page-table updates and flushes the TLB once per bind call, not per page.
+
+Sparse bindings are advertised via `BIND_FEATURES`; if absent, sparse flags return `ENOTSUP`.
 
 ### 5.5 Queue lifecycle
 
@@ -261,13 +369,22 @@ struct atrium_gpu_queue_create {
     uint32_t struct_size;
     uint32_t family_id;           /* index into QUEUE_FAMILIES caps */
     uint32_t priority;            /* device-defined; 0 = default */
-    uint32_t flags;
+    uint32_t flags;               /* ATRIUM_GPU_QUEUE_FLAG_USER_MODE, ... */
     int32_t  out_queue_fd;
     uint32_t _pad;
 };
+
+ATRIUM_GPU_QUEUE_RESET   (on queue_fd)   /* recover this queue only, §10 */
 ```
 
-A queue is bound to one VM at creation. Submissions on the queue may reference any address bound in that VM. Queues from different VMs cannot share submissions (would require cross-VM page-table coordination, which we explicitly punt to the per-vendor module's discretion if it wants to optimize).
+A queue belongs to one VM for its whole life. 2.1 makes the queue a real, private object:
+
+- **Its own hardware state.** Each queue has its own queue descriptor (MQD on AMD), ring and, for user-mode queues, its own doorbell page. Creating or submitting to one queue never reprograms another queue's descriptor, base or VM. On firmware-scheduled hardware the kernel registers the queue with the firmware (MES `ADD_QUEUE` on AMD) under the VM's process context (§5.2) and removes it on close.
+- **Its own fence.** Each queue has a kernel-owned *fence slot*: a 64-bit monotonic sequence number in memory that the GPU writes when work completes (§5.7). Completion is identified by `(queue, seqno)`, never by counting interrupts.
+- **Its own lock.** The kernel serializes everything that touches one queue's hardware state, its signal-point list and its doorbell under a per-queue lock. Different queues proceed in parallel.
+- **Counted.** Creation is charged to `max_queues` (§4.2). There is no fixed device-wide queue count in the ABI; hardware limits are the vendor module's to multiplex.
+
+Queues from different VMs cannot share submissions.
 
 ### 5.6 Syncobj lifecycle
 
@@ -287,40 +404,37 @@ ATRIUM_GPU_SYNCOBJ_SIGNAL  (on syncobj_fd, host-side signal)
 struct atrium_gpu_syncobj_signal {
     uint32_t struct_size;
     uint32_t _reserved;
-    uint64_t value;               /* set counter to this value (must be > current) */
+    uint64_t value;               /* raise the counter to this value; lower values are ignored */
 };
 
 ATRIUM_GPU_SYNCOBJ_WAIT    (on syncobj_fd, blocking host-side wait)
 
 struct atrium_gpu_syncobj_wait {
     uint32_t struct_size;
-    uint32_t flags;               /* ATRIUM_GPU_WAIT_ANY (one of N), default = all */
+    uint32_t flags;
     uint64_t value;               /* wait until counter >= value */
-    int64_t  timeout_ns;          /* -1 = forever */
+    int64_t  timeout_ns;          /* -1 = forever; 0 = poll */
 };
 
-ATRIUM_GPU_SYNCOBJ_QUERY   (on syncobj_fd, non-blocking poll)
+ATRIUM_GPU_SYNCOBJ_QUERY   (on syncobj_fd, non-blocking)
 
 struct atrium_gpu_syncobj_query {
     uint32_t struct_size;
     uint32_t _reserved;
     uint64_t out_current_value;
-};
-
-ATRIUM_GPU_SYNCOBJ_EVENTFD (on syncobj_fd, returns event_fd)
-
-struct atrium_gpu_syncobj_eventfd {
-    uint32_t struct_size;
-    uint32_t _reserved;
-    uint64_t value;               /* threshold to fire on */
-    int32_t  out_event_fd;
+    uint32_t out_error;           /* 0, or ATRIUM_GPU_ERR_* of the first errored point */
     uint32_t _pad;
+    uint64_t out_error_value;     /* timeline value at which that error occurred */
 };
 ```
 
-`event_fd` is the kqueue integration point. Userspace registers it with `EVFILT_READ`; the kernel fires the event when the syncobj's counter reaches or exceeds `value`. Reading from `event_fd` returns a `uint64_t` of the current value; subsequent reads after the threshold has been passed return immediately.
+**kqueue (D-1).** The syncobj fd is itself the kqueue source. Register it with `EVFILT_READ` and put the threshold in the kevent `data` field; the event fires when the counter reaches or passes it. On return, `data` holds the current value and `fflags` carries `ATRIUM_GPU_NOTE_ERROR` if an error has been recorded at or below the threshold. kqueue registrations are per-process, so a syncobj fd received over `SCM_RIGHTS` is registered fresh by the receiver (resolves v2 §13f).
 
-This is how Mesa's WSI integrates with a kqueue-driven compositor like frescod: each frame's "render done" signal is a syncobj `event_fd` registered alongside the socket fd and the input pipes.
+**Error state (2.1).** When work that would signal a point is aborted (a fault, a hang, a queue or device reset; §10), the kernel still advances the counter to that value, so no waiter hangs, and records the error and the value. `SYNCOBJ_WAIT` then returns `EIO` for any `value >= out_error_value`. The error is sticky for the life of the syncobj.
+
+**Waits are interruptible.** `SYNCOBJ_WAIT` sleeps with signal catching and returns `EINTR`/`ERESTART` normally. Timeouts are 64-bit nanoseconds; no tick arithmetic that can overflow.
+
+This is how a kqueue-driven compositor like frescod folds GPU completion, socket traffic, input and vblank into one `kevent()`.
 
 ### 5.7 SUBMIT
 
@@ -336,22 +450,26 @@ struct atrium_gpu_submit_dep {
 struct atrium_gpu_submit {
     uint32_t struct_size;
     uint32_t flags;
-    uint64_t blob_ptr;            /* user pointer to POD command blob */
-    uint64_t blob_size;
+    uint64_t blob_va;             /* GPU VA of the command blob, bound in this queue's VM */
+    uint64_t blob_size;           /* bytes; <= SUBMIT_FEATURES.max_blob */
     uint64_t in_dep_ptr;          /* array of dep structs to wait on */
     uint32_t in_dep_count;
-    uint32_t _pad;
+    uint32_t deadline_ns;         /* frame deadline hint for the firmware scheduler; 0 = none */
     uint64_t out_dep_ptr;         /* array of dep structs to signal */
     uint32_t out_dep_count;
     uint32_t _pad2;
+    uint64_t out_seqno;           /* the (queue, seqno) this submission retires at */
 };
 ```
 
-The `blob` is opaque to the kernel. It is a vendor-specific command stream — the bytes the GPU will execute, formatted however the vendor's hardware expects. Userspace constructs the blob using vendor-specific knowledge baked into Mesa's vendor backend; the kernel's job is to validate basic structure, hand off to the hardware/firmware, and signal completion.
+The blob is opaque to the kernel: a vendor-specific command stream built by userspace. 2.1 fixes *how* it reaches the hardware so that opacity, completion and isolation all hold:
 
-The blob is required to be self-contained: no pointers (only GPU virtual addresses, which were established via VM_BIND), no relocations, no fixups. This is what enables transparent virtio-gpu transport — the blob is just bytes on the wire.
+- **The blob is executed by reference.** Userspace writes the blob into a BO bound in the queue's VM and passes its VA. The kernel validates that `[blob_va, blob_va+blob_size)` is mapped in this VM, then appends to the queue's **kernel-owned ring** exactly two things: a reference to the blob (an indirect-buffer packet on AMD) and a fence write of the next sequence number to the queue's fence slot, with an interrupt. The kernel never parses the blob and userspace never writes the kernel ring. The blob executes under the queue's VM, so it can reach only that VM's mappings (I1–I3); privileged state is unreachable from an indirect buffer (I4).
+- **Completion is identified.** The submission's signal points (`out_dep`s) are recorded against `(queue, seqno)`. On the interrupt the kernel reads each signalling queue's fence slot and retires *every* signal point with `seqno <= fence`, in any order across queues. There is no fixed-size global completion list; `max_inflight` (§4.2) bounds it and a submit beyond it fails with `EAGAIN` rather than being accepted and never signalled.
+- **Dependencies.** In-deps from the same device whose producer is already submitted become GPU-side waits on the producer queue's fence slot where the hardware supports it; any other in-dep is waited for by the kernel before the blob is placed in the ring. Either way the queue lock is not held while waiting.
+- **The deadline is per submission**, carried in the queue's descriptor or the firmware message for that submit. It is never staged in a device-global register.
 
-The `in_dep` / `out_dep` arrays specify the sync graph. The kernel waits for all `in_dep` syncobj-timeline-value pairs to reach their value before dispatching the submission, and signals all `out_dep` pairs when the submission completes (or aborts due to fault — see §10).
+On firmware-scheduled hardware the ring above belongs to the queue's descriptor that the firmware runs; on simpler hardware it is the vendor module's per-queue ring. The ABI is the same.
 
 ### 5.8 Cross-process buffer sharing
 
@@ -365,27 +483,25 @@ struct atrium_gpu_bo_export_share {
     uint32_t _pad;
 };
 
-ATRIUM_GPU_BO_IMPORT_SHARE (on vm_fd, returns bo_fd)
+ATRIUM_GPU_BO_IMPORT_SHARE (on device_fd, returns bo_fd)
 
 struct atrium_gpu_bo_import_share {
     uint32_t struct_size;
-    uint32_t _reserved;
+    uint32_t flags;
     int32_t  share_fd;
-    uint32_t _pad;
     int32_t  out_bo_fd;
-    uint32_t _pad2;
 };
 ```
 
-`share_fd` is **vendor-neutral**. It is a handle to a buffer's backing storage with a vendor-tagged header the importing driver inspects to decide how to map. A buffer exported by `atrium-amdgpu` and imported by `atrium-amdgpu` is zero-cost (the import is a refcount bump). A buffer exported by one vendor and imported by another is supported only if both vendors agree on a common storage representation — typically dma-buf-equivalent shared physical pages — and is otherwise rejected with `ENOTSUP`.
+`share_fd` is **vendor-neutral**. It is a handle to a buffer's backing storage with a vendor-tagged header the importing driver inspects to decide how to map. A buffer exported and imported by the same vendor module is zero-cost (a refcount bump). A buffer exported by one vendor and imported by another is supported only if both agree on a common storage representation (§6.2, §13b) and is otherwise rejected with `ENOTSUP`.
 
-The `share_fd` is what travels across processes via `SCM_RIGHTS` over a Unix socket. The compositor protocol (e.g., aqueduct's CLASS_DISPLAY) carries `share_fd`s as the substrate for any cross-process buffer reference. A frescod scanout BO is just a `share_fd` exported by the producer and imported by the display cdev.
+*2.1 changes:* import moves from `vm_fd` to `device_fd` (D-2): an imported BO is VM-agnostic like a created one and is bound with `VM_BIND`. An imported BO is charged to the **exporter's** accounting record, not the importer's (§4.2), so a compositor importing every client's frames does not exhaust its own quota; the importer's reference still delays the free (§5.11). The intermediate `BO_EXPORT_SCANOUT` ioctl of `atrium-gpu-amd` is retired: the display device imports a `share_fd` (or a `bo_fd`) like any other importer (§7). No ioctl anywhere in the ABI takes a raw VRAM offset.
 
-This is the dma-buf concept, redesigned: smaller surface (one export, one import, no attach/detach lifecycle), explicit vendor identification, no implicit fence carriage. Synchronization is always via separate `syncobj_fd`s passed alongside.
+The `share_fd` is what travels across processes via `SCM_RIGHTS`. The compositor protocol (aqueduct CLASS_DISPLAY) carries `share_fd`s as the substrate for any cross-process buffer reference. Synchronization is always via separate `syncobj_fd`s passed alongside; there is no implicit fence carriage.
 
 ### 5.9 User-mode queues (direct doorbell submission)
 
-`SUBMIT` (§5.7) is the baseline: one ioctl per submission. On hardware with firmware-scheduled user-mode queues (AMD MES on GFX11/GFX12, Intel GuC, Apple ASC), userspace can instead ring a hardware doorbell directly and skip the syscall on the submit hot path. This matters for two reasons specific to Atrium: it removes per-submit syscall/scheduler overhead the Tier-2/3 energy router cannot otherwise reclaim, and — see principle 11 — it expresses GPU-submit authority as a scoped capability rather than ambient power. It is advertised by the `USER_QUEUE` bit of `SUBMIT_FEATURES`; absent it, the ioctls below return `ENOTSUP` and userspace uses §5.7.
+`SUBMIT` (§5.7) is the baseline: one ioctl per submission. On hardware with firmware-scheduled user-mode queues (AMD MES on GFX11/GFX12, Intel GuC, Apple ASC), userspace can instead ring a hardware doorbell directly and skip the syscall on the submit hot path. It is advertised by the `USER_QUEUE` bit of `SUBMIT_FEATURES` **and** requires the client context to have been minted with `ATRIUM_GPU_CLIENT_ALLOW_USER_QUEUES` (§4.1); otherwise the ioctls below return `ENOTSUP` or `EPERM` and userspace uses §5.7. Because apps hold no client fd in production (§4.1), in production this is a broker-internal fast path.
 
 A user-mode queue is requested at creation (`ATRIUM_GPU_QUEUE_CREATE` with `flags |= ATRIUM_GPU_QUEUE_FLAG_USER_MODE`) and then mapped:
 
@@ -395,44 +511,84 @@ ATRIUM_GPU_QUEUE_MAP     (on queue_fd)
 struct atrium_gpu_queue_map {
     uint32_t struct_size;
     uint32_t _reserved;
-    uint64_t out_ring_offset;     /* mmap(device_fd) offset: command ring */
-    uint64_t out_ring_size;       /* ring bytes */
-    uint64_t out_doorbell_offset; /* mmap(device_fd) offset: doorbell page */
-    uint64_t out_doorbell_size;   /* doorbell page bytes */
+    uint64_t out_ring_offset;     /* mmap(queue_fd) offset: command ring */
+    uint64_t out_ring_size;
+    uint64_t out_doorbell_offset; /* mmap(queue_fd) offset: this queue's doorbell page */
+    uint64_t out_doorbell_size;
     uint64_t out_wptr_offset;     /* write-pointer location (ring-relative) */
-    uint32_t out_doorbell_index;  /* this queue's slot within the doorbell page */
-    uint32_t _pad;
 };
 ```
 
-Userspace `mmap`s the ring and the doorbell page off `device_fd` (the same `d_mmap_single` path as `BO_MMAP_INFO`, §5.3), writes a POD command blob (§5.7's format and opacity rules, unchanged) into the ring at the write pointer, advances the write pointer, and writes the doorbell to kick the engine. **Completion is unchanged**: the blob's trailing fence packet signals a `syncobj` timeline, observed via `SYNCOBJ_EVENTFD` → kqueue exactly as in §5.7. Only the submit *path* moves to userspace; the *completion* path stays on the existing fd/kqueue machinery, so a frescod-style compositor (§5.6, §9) is unaffected.
+*2.1 changes (resolves §13k):*
 
-What stays in the kernel (non-negotiable, principle 11): VM_BIND and memory validation, queue/MQD setup and its hand-off to the scheduler firmware, preemption, and hang/reset (§10). Userspace owns only its own ring contents and write pointer.
+- **Mapped from `queue_fd`, not `device_fd`.** Each queue has its own `d_mmap_single` device pager. The only doorbell offset `mmap` accepts is that queue's own page; any other offset fails with `EACCES`. Raw doorbell-BAR mapping through `device_fd` does not exist.
+- **One queue per doorbell page.** The hardware doorbell page is the unit of authority, so one page grants exactly one queue. Vendors whose hardware packs several doorbells per page assign at most one *user-mode* queue per page and leave the rest unused.
+- **Revocable.** On `QUEUE_RESET`, device reset or `close(queue_fd)` the kernel removes the queue from the firmware, then invalidates the pager's pages (`cdev_pager_free_page`/`pmap_remove`). A later access faults, and the fault handler returns `SIGBUS`; a queue re-created after reset is mapped afresh.
+- **Hang detection without seeing submissions.** The kernel cannot count user-mode submissions, so the watchdog (§10) watches the queue's fence slot against its write pointer: a queue whose write pointer is ahead of its fence for longer than the watchdog period is hung. Its signal points are errored like a kernel-submitted queue's.
+- **Frees never trust userspace fences.** A user-mode queue's fence slot is writable by work the user built, so it cannot gate memory reuse. Freeing VA or backing storage reachable from a user-mode queue's VM waits for the firmware to preempt or remove the queue (§5.11).
 
-**Security model.** The doorbell page is MMIO scoped to this queue's VM — its own VMID and page tables (§5.5). Mapping it grants exactly the authority to kick *this* queue, which can reach only addresses bound in *this* VM. So a `queue_fd` (carrying its mapped doorbell) passed to a sandboxed or jailed process via `SCM_RIGHTS` is a *scoped capability*: that process can submit GPU work in one isolated address space and nothing more. There is no ambient "submit to the GPU" authority anywhere in the ABI — which is what makes user-mode submission safe under `cap_enter()` and under Portcullis default-deny jails. The capability *is* the mapped doorbell.
+What stays in the kernel (principle 11): VM_BIND and memory validation, queue/MQD setup and its hand-off to the scheduler firmware, preemption, and hang/reset (§10). Userspace owns only its own ring contents and write pointer. Completion is unchanged: signal points on syncobjs, observed via kqueue on the syncobj fd (§5.6).
 
-### 5.10 Energy telemetry (read-only)
+**Security model.** The doorbell page is scoped to one queue, and the queue runs in one VM. Mapping it grants exactly the authority to kick *this* queue, which can reach only addresses bound in *this* VM. A `queue_fd` passed over `SCM_RIGHTS` is a scoped capability, and it stops working when the kernel revokes it.
 
-Atrium routes work between a software renderer (Tier-2) and the GPU (Tier-3) under an energy policy (`energy-policy.md`). For that router to decide whether using the GPU is worth its energy, it needs a cheap, read-only sample of GPU state. This is the only place the ABI exposes anything power-adjacent, and it is strictly *observational*.
+### 5.10 Energy telemetry and control-only device ioctls
 
 ```
-ATRIUM_GPU_QUERY_TELEMETRY  (on device_fd)
+ATRIUM_GPU_QUERY_TELEMETRY  (on device_fd: own context; on control_fd: whole device)
 
 struct atrium_gpu_telemetry {
     uint32_t struct_size;
     uint32_t _reserved;
-    uint64_t busy_ns;             /* monotonic engine-busy time, all queues */
+    uint64_t busy_ns;             /* monotonic engine-busy time for the scope */
     uint64_t sample_ns;           /* monotonic wall time of this sample */
-    uint32_t queue_depth;         /* submissions in flight across queues */
-    uint32_t power_state;         /* vendor-normalized 0=idle .. N=max */
+    uint32_t queue_depth;         /* submissions in flight in the scope */
+    uint32_t power_state;         /* vendor-normalized 0=idle .. N=max (control_fd only; 0 on device_fd) */
     uint32_t tier_cost_hint;      /* normalized energy/op estimate (vs Tier-2) */
     uint32_t flags;
 };
 ```
 
-`busy_ns` over elapsed `sample_ns` gives a utilization fraction; `tier_cost_hint` is the vendor's normalized estimate of GPU energy-per-unit-work on the *same scale* the router uses for the Tier-2 software path, so the two are directly comparable. Advertised by the `TELEMETRY` cap; absent it, `ENOTSUP`.
+`busy_ns` over elapsed `sample_ns` gives a utilization fraction; `tier_cost_hint` is on the same scale the Tier-2 software path reports, so the energy router (`energy-policy.md`) can compare them. Advertised by the `TELEMETRY` cap; absent it, `ENOTSUP`. Telemetry is read-only and advisory: the router samples it and drives nothing.
 
-This is **read-only and advisory**. Per the energy policy's "coordinated, not coupled" rule, intent flows one way only: the router *samples* telemetry to make routing decisions; there is no ioctl that lets it drive the driver's power state (that remains the vendor module's own business, §12). Telemetry is observation, not a power-management *control* surface. It exists because — unlike a Linux driver — an Atrium GPU driver lives in a system that can choose *not to use the GPU at all*, and that choice needs data.
+*2.1 change:* a client sees its own context's numbers only. Device-wide numbers and the power state are control-only, because another tenant's busy time is a side channel.
+
+The device-level knobs that `atrium-gpu-amd` exposes today as unprivileged ioctls are **control-only** (`EPERM` on a client `device_fd`):
+
+| ioctl | On | Purpose |
+|---|---|---|
+| `ATRIUM_GPU_DEVICE_RESET` | `control_fd` | Full device reset (§10) |
+| `ATRIUM_GPU_SCHED` | `control_fd` | Scheduler policy: weights, deadline window, priorities per context |
+| `ATRIUM_GPU_POWERGATE` | `control_fd` | Power gating policy; the broker's channel for the energy policy |
+| `ATRIUM_GPU_SET_QUOTA` | `control_fd` | §4.2 |
+
+A client can reset only its own queues (`QUEUE_RESET` on its `queue_fd`).
+
+### 5.11 Memory lifetime versus in-flight work (new in 2.1)
+
+The kernel never frees or reuses memory that submitted work can still reach. This is the rule `atrium-gpu-amd` breaks today (a BO freed while a submission still references it), and the one every allocator in the vendor module must follow.
+
+- **Per-VM high-water mark.** Each VM records, per queue, the last `seqno` submitted on it. That pair set is the VM's *retire point*.
+- **Deferred free.** When the last reference to a BO, a binding or a VM goes away, the kernel moves the backing (VRAM range, system pages, VA range, page-table pages) to a deferred list tagged with the current retire point of every VM it was bound in. The fence-retire path (§5.7) releases entries whose retire point has passed. Nothing is returned to an allocator before that.
+- **Unbind.** `VM_BIND` with `UNMAP` updates the page tables and flushes the TLB immediately, so new work cannot reach the range, but the VA range and the backing are released only at the retire point (§5.4).
+- **User-mode queues.** For a VM with a user-mode queue, the retire point is "the firmware has preempted or removed every user-mode queue of this VM", never a value read from a user-writable fence slot (§5.9).
+- **Reset.** After a queue or device reset the kernel knows nothing more will execute from the reset queues, so their pending deferred entries are released at once.
+- **Accounting.** Deferred memory stays charged to its jail until it is actually released, so a client cannot exceed its quota by free-and-reallocate churn.
+
+### 5.12 What the kernel validates (new in 2.1)
+
+Principle 12 in list form. Every vendor module must check these itself; a simulator referee or an IOMMU is a second line, never the first. Each line is a test case in `tests/gpu/` (§18).
+
+| Input | Check | Error |
+|---|---|---|
+| Every struct | `struct_size` ≥ the 2.0 size and ≤ a page; `_pad`/`_reserved` zero; unknown `flags` bits zero | `EINVAL` |
+| Every fd field | is an fd of the expected object kind, on the same device (or a valid `share_fd`) | `EBADF` / `EINVAL` |
+| Counts × sizes | no overflow; arrays fit the per-call limits in `QUERY_CAPS` | `EINVAL` / `E2BIG` |
+| `VM_BIND` | §5.4 list (alignment, window, BO range, overlap, exact unmap) | `EINVAL` / `EEXIST` / `ENOENT` |
+| `SUBMIT` | blob range mapped in this VM and readable by the GPU; size ≤ `max_blob`; in-flight under `max_inflight` | `EFAULT` / `E2BIG` / `EAGAIN` |
+| `mmap` | offset is one this fd handed out, length within that object | `EACCES` / `EINVAL` |
+| Display commit | buffer is a BO/share of a size, pitch, format and tiling the plane accepts; BO pinned for scanout (§7) | `EINVAL` |
+| Authority | control-only ioctl on a client context | `EPERM` |
+| Quota | allocation within the jail's record | `EDQUOT` |
 
 ---
 
@@ -447,7 +603,7 @@ A client process produces frames into a `bo_fd` it allocated; the compositor pro
 1. Client: `BO_CREATE`, `VM_BIND` into its VM, render via `SUBMIT`, signal `syncobj` on completion.
 2. Client: `BO_EXPORT_SHARE` produces `share_fd`; `SYNCOBJ` is already an fd.
 3. Client: send `share_fd` + `syncobj_fd` + timeline value over aqueduct (via `SCM_RIGHTS`).
-4. Compositor: receive both fds. `BO_IMPORT_SHARE` into its VM (zero-copy on same vendor). `SYNCOBJ_EVENTFD` → kqueue.
+4. Compositor: receive both fds. `BO_IMPORT_SHARE` on its `device_fd` and `VM_BIND` into its VM (zero-copy on same vendor). Register the syncobj fd with kqueue, threshold in `data` (§5.6).
 5. Compositor: when kqueue fires, the BO is ready for use as a texture in the next composite pass.
 
 No dma-buf, no Wayland-style explicit-sync extension, no separate fence-fd protocol. Just two fds and a counter value.
@@ -462,13 +618,14 @@ Display cdev is treated as a "vendor" for this purpose: a BO produced by `atrium
 
 ## 7. Display ABI summary
 
-Display is on a separate cdev (`/dev/atrium/display<N>`) and is specified in its own document. The interaction with the GPU ABI is purely via `share_fd`:
+Display is on a separate cdev (`/dev/atrium/display<N>`) specified in [`atrium-display-architecture.md`](atrium-display-architecture.md). 2.1 fixes the parts of the interface that belong to this ABI:
 
-- Display cdev's atomic-commit ioctl takes `share_fd`s as scanout sources.
-- Display cdev signals page-flip completion via a `syncobj_fd` it owns.
-- Display cdev exposes vsync/vblank events via `event_fd` (kqueue-readable).
+- **Scanout by object, never by address.** The atomic commit takes a `bo_fd` or a `share_fd` per plane. The display module resolves it, checks size, pitch, format and tiling against the plane (§5.12) and pins the backing for as long as it is on screen; the BO's free is deferred until it has been flipped away (§5.11). The `atrium-gpu-amd` path that writes a userspace-supplied `{vram_offset, size}` into the scanout registers, and the `BO_EXPORT_SCANOUT` ioctl that feeds it, are retired.
+- **Ownership is a lease.** One process holds the display at a time: the broker (frescod) opens `/dev/atrium/display<N>` exclusively, and a second open fails with `EBUSY`. A test harness or a VT-switch takes it only through the broker. There is no DRM-master-style ambient grant.
+- **Fences.** A commit takes an optional in-fence (`syncobj_fd`, value) that the display module waits on before latching, and an out-fence (`syncobj_fd`, value) it signals when the previous buffer is released.
+- **vblank and hotplug** are kqueue events on the display fd (vblank-wait ioctl retired).
 
-No display configuration touches the GPU cdev. No GPU operation touches the display cdev. They share buffer fds; that is the entire interface.
+No display configuration touches the GPU cdev. No GPU operation touches the display cdev. They share buffer and syncobj fds; that is the entire interface.
 
 ---
 
@@ -486,86 +643,94 @@ We do not version the ABI as a single monolithic number except as a coarse compa
 
 The "uAPI is forever" lesson from DRM (findings §1.8) applies in full: once an ioctl ships with stable userspace consumers, its signature is permanent. New behavior goes through new mechanisms, not by redefining old ones.
 
+
+*2.1 additions.* Layer 1 only works if the structs carry it. Two rules are mandatory before any out-of-tree consumer (Mesa winsys, `atrium-gpu-rs`) links against the ABI:
+
+- Every input struct begins with `uint32_t struct_size`, including the ones `atrium-gpu-amd` defines today without it. The kernel rejects a size below the 2.0 layout.
+- Every fd field is `int32_t`, and `-1` means "none". The intermediate ABI's `uint32_t` fd fields are converted in the same change.
+
 ---
 
 ## 9. Worked example: a Vulkan frame on this ABI
 
-Pseudocode for a Mesa Vulkan backend rendering one frame and presenting to a Fresco compositor:
+Pseudocode for a Vulkan backend rendering one frame and presenting to a Fresco compositor. In production the "client" below is the broker acting for an app (§4.1); in a test or dev jail it can be the app itself.
 
 ```c
-/* one-time setup */
-device_fd  = open("/dev/atrium/gpu/amdgpu0", O_RDWR);
+/* broker, one-time */
+control_fd = open("/dev/atrium/gpu/amdgpu0", O_RDWR);      /* devfs: broker only */
+ioctl(control_fd, ATRIUM_GPU_CLIENT_OPEN, &(struct atrium_gpu_client_open){
+    .struct_size = sizeof(...), .jail_id = app_jid, .quota = app_quota });
+device_fd = co.out_device_fd;
+
+/* client, one-time */
 ioctl(device_fd, ATRIUM_GPU_QUERY_CAPS, &caps);
+vm_fd    = /* ATRIUM_GPU_VM_CREATE on device_fd */;
+queue_fd = /* ATRIUM_GPU_QUEUE_CREATE on vm_fd */;
+frame_done = /* ATRIUM_GPU_SYNCOBJ_CREATE on device_fd */;
 
-vm_fd      = ioctl(device_fd, ATRIUM_GPU_VM_CREATE, &vm_args);
-queue_fd   = ioctl(vm_fd, ATRIUM_GPU_QUEUE_CREATE, &q_args);
+/* allocate and bind (BO is VM-agnostic until bound) */
+image_bo = /* ATRIUM_GPU_BO_CREATE on device_fd */;
+cmd_bo   = /* ATRIUM_GPU_BO_CREATE on device_fd, CPU_ACCESS */;
+ioctl(vm_fd, ATRIUM_GPU_VM_BIND, &bind_args);   /* image_va, cmd_va */
+cmd = mmap(NULL, cmd_size, PROT_WRITE, MAP_SHARED, cmd_bo, cmd_mmap_offset);
 
-/* per-frame */
-swapchain_bo_fd = ioctl(vm_fd, ATRIUM_GPU_BO_CREATE, &bo_args);
-ioctl(vm_fd, ATRIUM_GPU_BO_MMAP_INFO, ...);  /* if app needs CPU access */
-
-/* bind into VM (async, signals bind_done timeline value) */
-ioctl(vm_fd, ATRIUM_GPU_VM_BIND, &bind_args);
-
-/* build vendor command blob in user memory; reference VM addresses */
-build_command_blob(blob, swapchain_bo_va, ...);
-
-/* submit; wait on bind_done, signal frame_done on completion */
-ioctl(queue_fd, ATRIUM_GPU_SUBMIT, &submit_args);
+/* per frame */
+build_command_blob(cmd, image_va, ...);
+ioctl(queue_fd, ATRIUM_GPU_SUBMIT, &(struct atrium_gpu_submit){
+    .blob_va = cmd_va, .blob_size = n,
+    .out_dep_ptr = &(struct atrium_gpu_submit_dep){ frame_done, ++frame },
+    .out_dep_count = 1 });
 
 /* hand to compositor */
-share_fd = ioctl(swapchain_bo_fd, ATRIUM_GPU_BO_EXPORT_SHARE, ...);
-sendmsg(aqueduct_socket, SCM_RIGHTS={share_fd, frame_done_syncobj_fd}, ...);
-
-close(share_fd);  /* compositor holds its own ref now */
+share_fd = /* ATRIUM_GPU_BO_EXPORT_SHARE on image_bo */;
+sendmsg(aqueduct_socket, SCM_RIGHTS={share_fd, frame_done}, frame);
+close(share_fd);
 ```
 
-The compositor side, in frescod-equivalent code:
+The compositor side:
 
 ```c
-/* recvmsg returns share_fd + frame_done_syncobj_fd from client */
+/* recvmsg returns share_fd + frame_done + value */
+bo_fd = /* ATRIUM_GPU_BO_IMPORT_SHARE on the compositor's device_fd */;
+ioctl(comp_vm_fd, ATRIUM_GPU_VM_BIND, ...);
 
-bo_fd = ioctl(vm_fd, ATRIUM_GPU_BO_IMPORT_SHARE, &import_args);
-
-/* register completion */
-event_fd = ioctl(frame_done_syncobj_fd, ATRIUM_GPU_SYNCOBJ_EVENTFD,
-    &{.value = expected_value});
-EV_SET(&kev, event_fd, EVFILT_READ, EV_ADD, 0, 0, ...);
+EV_SET(&kev, frame_done, EVFILT_READ, EV_ADD, 0, value, NULL);   /* threshold in data */
 kevent(kq, &kev, 1, NULL, 0, NULL);
 
-/* in main event loop, when kqueue fires this fd: client's frame is ready */
-/* compositor uses bo_fd as a texture in its next composite SUBMIT */
+/* when it fires: if (kev.fflags & ATRIUM_GPU_NOTE_ERROR) drop the frame;
+   else use bo_fd as a texture in the next composite SUBMIT */
 ```
 
-There is no Wayland surface, no dma-buf, no explicit-sync extension. The compositor protocol carries fds; the kernel does the rest.
+No Wayland surface, no dma-buf, no separate event fd. Two fds and a counter value.
 
 ---
 
 ## 10. Hang recovery and fault model
 
-The hardest part of any GPU ABI. Brief sketch:
+*Rewritten in 2.1; the v2 text was a sketch.*
 
-- A submission may fault (page fault, shader trap, hardware hang). The vendor module detects this via interrupts or completion polling.
-- On fault: all outstanding `out_dep` syncobjs for the faulted submission are signaled with their target value but the timeline carries an *aborted* flag, queryable via a new cap.
-- Subsequent submissions on the same queue are aborted with the same fault status until the queue is reset.
-- Queue reset is initiated by closing `queue_fd` and creating a new one. The vendor module determines whether this requires a full device reset (some hardware does, some doesn't); userspace is told via `QUERY_CAPS` what scope of reset is implied.
-- Vulkan's device-lost semantics map cleanly: a faulted queue's Vulkan device transitions to `VK_ERROR_DEVICE_LOST`; the application must recreate the device, which closes all fds and starts over.
-
-The Asahi v2 + Xe approach to hang recovery (per-firmware-context isolation, devcoredump capture, fault-info to userspace) is the model to inherit; this section will be filled in detail when first vendor port forces the question.
+- **Detection.** Each queue has a watchdog. A kernel-submitted queue is hung when its fence slot has not advanced past an outstanding `seqno` for the watchdog period; a user-mode queue when its write pointer has stayed ahead of its fence for that period (§5.9). Default period 2 s, configurable per context by the broker (`SCHED`); compute contexts that need long-running work get a longer period or the long-running flag (§13a). Page faults and shader traps reported by interrupt are detected immediately.
+- **Queue reset first.** The kernel removes the faulting queue from the hardware or firmware (MES `REMOVE_QUEUE` on AMD), resets only it, and errors its outstanding signal points with `ATRIUM_GPU_ERR_FAULT`, `ERR_HANG` or `ERR_RESET` (§5.6): the counter advances so no waiter hangs, and `SYNCOBJ_WAIT` returns `EIO`. The queue's later submits fail with `EIO` until the owner calls `QUEUE_RESET` or recreates it. Other queues, other VMs and other jails keep running.
+- **Device reset only when queue reset fails.** If the firmware cannot remove the queue, the kernel resets the device. Every queue on the device has its outstanding points errored with `ERR_RESET`, the device's *lost generation* counter increments, and VRAM-resident BOs whose contents did not survive are marked lost (`BO_QUERY` reports it). Every client sees the new generation in `QUERY_CAPS` and maps it to `VK_ERROR_DEVICE_LOST`; contexts that were not running can continue after re-uploading lost BOs.
+- **Who may reset.** `QUEUE_RESET` on one's own `queue_fd`; `DEVICE_RESET` only on `control_fd` (§5.10). No unprivileged ioctl clears another tenant's in-flight work.
+- **Fault info.** The faulting context can read a fault record (faulting VA, engine, type) via `QUEUE_QUERY_FAULT`; other contexts see only the error code. A devcoredump-style capture is control-only.
+- **Invariant.** Every signal point ever accepted is eventually signalled or errored. No waiter can be left behind by a fault, a reset, a queue close or a driver detach.
 
 ---
 
 ## 10.5 ioctl-surface hardening (added 2026-06-10; attestation gate)
 
-This ABI is reachable from any jail granted `gpu` — so the ioctl
-boundary is, alongside the Tessera VFS, the platform's primary
-kernel attack surface. Two adversarial inputs deserve explicit
+In production this ABI is reachable only by the GPU broker (§4.1);
+in test and dev jails it is reachable by whatever holds a direct
+grant. Either way the ioctl boundary is, alongside the Tessera VFS,
+the platform's primary kernel attack surface, and a compromised
+broker must not be able to escalate through it. Two adversarial inputs deserve explicit
 fuzzing, and passing them is part of the isolation attestation
 (gpu-isolation.md), not optional hardening:
 
 - **The ioctl structs themselves.** Every ioctl takes a
   `struct_size`-prefixed struct with embedded user pointers,
-  counts, and fds (`atrium_gpu_submit` has `blob_ptr`/`blob_size`,
+  counts, and fds (`atrium_gpu_submit` has `blob_va`/`blob_size`,
   `in_dep_count`/`out_dep_count`, fd arrays). A syscall-level
   fuzzer drives each ioctl with malformed sizes, overflowing
   counts, hostile pointers, bad/foreign fds, and torn concurrent
@@ -643,6 +808,20 @@ k. **User-mode queue preemption and doorbell granularity (§5.9).** With userspa
 
 l. **Telemetry units and sampling cost (§5.10).** `tier_cost_hint` must be normalized to the *same* scale the Tier-2 software renderer reports, or the router cannot compare them. Defining that shared unit (energy-per-op? a core-ms-equivalent?) is a cross-subsystem question owned jointly with the energy policy. Also: the cost of sampling itself must be negligible (no MMIO storm), or telemetry defeats its own purpose.
 
+
+**Resolved in 2.1:**
+
+- **(d)** The ioctl group is `'A'` (reconciliation decision; `atrium-gpu-amd` already uses it).
+- **(f)** There is no `event_fd`. kqueue registrations are per process, so a syncobj fd received over `SCM_RIGHTS` is registered fresh by the receiver (§5.6).
+- **(h)** No eviction in V1. Allocation beyond a jail's quota fails with `EDQUOT` (§4.2). Transparent migration with fence ordering stays the direction if eviction is added.
+- **(k)** One user-mode queue per doorbell page, mapped from its `queue_fd`, revoked by pager invalidation on reset or close, hang detected from write pointer versus fence, frees never gated on user-writable fences (§5.9, §5.11).
+
+**New in 2.1:**
+
+m. **Firmware licensing.** Real RDNA hardware needs AMD's signed binary firmware (MES, PSP, SMU, CP microcode). `LICENSING-POLICY.md` must say whether Atrium images may ship redistributable binary firmware, or whether the user fetches it at install. This blocks any real-silicon release, not the ABI.
+
+n. **VMID pressure.** Hardware has 15–16 VMIDs; 2.1 decouples VMs from VMIDs (§5.2) and relies on the firmware to assign them on demand. The fallback for hardware or firmware that does not do this (kernel-side VMID stealing with a TLB flush) needs a design if such a target appears.
+
 ---
 
 ## 14. Comparison: this ABI vs DRM uAPI vs Vulkan
@@ -656,9 +835,9 @@ l. **Telemetry units and sampling cost (§5.10).** `tier_cost_hint` must be norm
 | Submit shape | varies; per-driver | `vkQueueSubmit` with cmd buffers | POD blob: ioctl, or user-mode doorbell (§5.9) |
 | Bind model | per-submit BO list (legacy) or VM_BIND | `vkBindBufferMemory` etc. | `VM_BIND` ioctl, async |
 | Display | KMS in same fd as GPU | WSI extension | separate cdev, separate fd |
-| Master concept | DRM-Master | n/a | none (filesystem perms + Capsicum) |
+| Master concept | DRM-Master | n/a | `control_fd` held by the broker; clients get minted `device_fd`s (§4.1) |
 | Versioning | per-driver `DRM_VERSION` | `VkApplicationInfo.apiVersion` | `struct_size` + cap TLV |
-| Event delivery | DRM event queue + poll | callback / fence wait | kqueue via `event_fd` |
+| Event delivery | DRM event queue + poll | callback / fence wait | kqueue on the `syncobj_fd` itself |
 
 Atrium's choices are mostly Vulkan's (the API we're serving) translated into BSD primitives (fds, kqueue). DRM was an intermediate layer designed for X11-era assumptions; we collapse it.
 
@@ -711,6 +890,28 @@ This document is a draft for review. Expected sequence:
 6. **End-to-end demo.** frescod runs with a real AMD GPU on FreeBSD via Atrium GPU ABI. No drm-kmod in the stack.
 
 Estimated calendar time to (6): 2-3 years of focused work with a small team. Estimated to subsequent vendor (Intel via Xe-architectural-port): another 2-3 years overlapping.
+
+---
+
+## 18. Implementation status against 2.1 (as of 2026-11-03)
+
+`atrium-gpu-amd` implements the intermediate ABI described in the Status note. The gap to 2.1, with evidence, is in [`../reviews/2026-11-03-gpu-kernel-and-tier2-review.md`](../reviews/2026-11-03-gpu-kernel-and-tier2-review.md) §A. In order of what to do first:
+
+| 2.1 requirement | `atrium-gpu-amd` today | Section |
+|---|---|---|
+| Per-queue state, own ring, own lock | Every submit reprograms shared GFX queue 0 / compute queue 1, unlocked | §5.5 |
+| Deferred free | BO, VA and page tables freed while work may be in flight | §5.11 |
+| Doorbell mapped per queue, revocable | `mmap` of any doorbell-BAR offset from the device fd | §5.9 |
+| Scanout by object | Raw `{vram_offset, size}` written to scanout registers | §7 |
+| Control/client split | Reset, scheduler and power gating callable by any opener | §4.1, §5.10 |
+| Per-queue fence retirement | Global FIFO popped by completion count; drops beyond 16 pending | §5.7 |
+| Syncobj error state, interruptible 64-bit waits | Uninterruptible tick-based waits; reset clears pending without signalling | §5.6, §10 |
+| Validated `VM_BIND` | User VA unchecked, no overlap check | §5.4 |
+| Real allocators | VRAM bump allocator; 32 MiB VA per VM | §5.3 |
+| `struct_size`, `int32_t` fds | Missing / `uint32_t` | §8 |
+| Per-jail quota | None | §4.2 |
+| Fuzz and isolation tests (§10.5) | None; `test_gpu_isolation.c` does not exist | §10.5 |
+| Real-silicon backend | Firmware load, MES, VM context and display programmed through gpusim-only registers | review §A5 |
 
 ---
 

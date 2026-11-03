@@ -14,6 +14,27 @@ This doc nails down what isolation the kernel GPU driver must enforce
 before Portcullis will grant `gpu` to any app, and how that requirement
 is validated.
 
+> **Amended 2026-11-03 (GPU ABI v2.1, `atrium-gpu-abi-v2.md` §4.1).**
+> Jails cannot isolate GPU DMA; only the driver and the GPU MMU can. What
+> jails, devfs and Capsicum *can* do is decide who reaches the driver, so
+> the access model is now:
+>
+> - **Production: no app holds a GPU fd.** The GPU broker (frescod's
+>   broker, or `aqueduct-gpu-host` headless) is the only process that
+>   opens the device node (devfs ruleset). Apps reach the GPU through
+>   aqueduct-gpu. The kernel splits authority into a non-passable
+>   `control_fd` (broker) and minted client `device_fd`s carrying a jail
+>   id and quota.
+> - **Direct grants (the `gpu` capability below) are for testing and
+>   development only**: driver bring-up, conformance, Tier-3 experiments.
+>   They need an explicit test policy (`[gpu] direct_grant = "test"` in
+>   `jaild.policy.toml`, refused under `production`) or a dev jail, *and*
+>   the attestation gate below. Production images have no path that
+>   mints a client fd for an app.
+> - The invariants I1–I5 still apply in full: in production they protect
+>   the broker's per-app VMs from each other and bound what a compromised
+>   broker can reach.
+
 ## Threat model
 
 A direct-GPU app can:
@@ -89,6 +110,7 @@ property of the driver + hardware.
 | Driver | Isolation provider | Status |
 |--------|-------------------|--------|
 | **`atrium-virtio-gpu`** (D0, current) | layered: kmod per-fd handle table + virtio-gpu spec context ownership + host venus per-VkInstance + Metal/Apple IOMMU on M4 Max | **Verified by smoke test** (see below) |
+| **`atrium-gpu-amd`** (RDNA4, from scratch, against gpusim; the ABI v2.1 reference) | per-VM page tables in the GPU MMU, enforced today partly by the gpusim referee | **Not attested.** Five isolation breaks found 2026-11-03 (`docs/reviews/2026-11-03-gpu-kernel-and-tier2-review.md` §A3); `test_gpu_isolation.c` does not exist yet. Must not appear in `[gpu_drivers.attested]`. |
 | **`atrium-asahi`** (D5+ Apple Silicon native) | Apple GPU per-context page tables + AGX MMU; kernel driver manages page tables; user shaders go through the AGX user command ring | **Spec-only; gated on D5 driver landing** |
 | **`atrium-amdgpu`** (D5+ AMD discrete) | AMDGPU MMU per-VMID; kernel driver manages VMIDs and page tables; user shaders go through MEC (Micro Engine Compute) user queues | **Spec-only; gated on D5+ driver landing** |
 | **`atrium-i915`** (D5+ Intel) | Intel PPGTT (per-process graphics translation tables); kernel manages PPGTT; user shaders go through user-mode command rings | **Spec-only; gated on D5+ driver landing** |

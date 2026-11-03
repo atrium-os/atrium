@@ -5,6 +5,12 @@
 > It does not restate the ABIs — it points at the canonical specs, resolves the
 > contradictions between the surfaces that exist today, and lays out the migration.
 
+> **2026-11-03:** the §4 deltas (D-1 syncobj fd is the kqueue source, D-2 BOs on
+> `device_fd`, group `'A'`, kqueue-only vblank) are now folded into the spec itself,
+> which is revised to **v2.1** (`atrium-gpu-abi-v2.md`). 2.1 also adds the
+> control/client authority split, per-jail quotas, per-queue fences, deferred free,
+> revocable doorbells and scanout by fd; its §18 lists what `atrium-gpu-amd` still lacks.
+
 ## 0. Why this document
 
 Several GPU/display ABI surfaces were written and implemented at different points:
