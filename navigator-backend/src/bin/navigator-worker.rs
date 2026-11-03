@@ -14,51 +14,52 @@
 //! It is deliberately not a library: everything here is I/O and dispatch, and
 //! the logic it dispatches to is tested directly in the crate.
 
-use navigator_backend::document::Document;
-use navigator_backend::reverse::{Back, Forward, History};
+use navigator_backend::reverse::{Back, Forward};
+use navigator_backend::session::{SessionId, SessionLimits, Sessions, Trail};
 use navigator_backend::wire::*;
-use navigator_backend::{ingest, Limits, Transition};
+use navigator_backend::{ingest, Limits};
 use std::io::{BufReader, Write};
 
+/// ★ A `Sessions` holding at most ONE session: the same code the in-process
+/// host runs, so navigation, the trail a save needs, and restore's replay
+/// cannot drift apart between the two hosts. The worker has no clock, so it
+/// passes 0; expiry is the broker's job, decided on the broker's clock.
 struct Worker {
-    history: Option<History>,
-    transitions: Vec<Transition>,
+    sessions: Sessions,
+    id: Option<SessionId>,
 }
 
 impl Worker {
     fn open(&mut self, recording: &[u8]) -> Result<String, String> {
-        if self.history.is_some() {
+        if self.id.is_some() {
             // ★ Refused rather than replaced. A worker holding a second
             // document is the thing this design exists to prevent, and a
             // silent replacement would make it look like it worked.
             return Err("this worker already holds a document".into());
         }
         let r = ingest(recording, &Limits::default()).map_err(|e| e.to_string())?;
-        let doc = Document::accept(&r.document)
-            .map_err(|v| v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", "))?;
-        self.transitions = r.transitions;
-        self.history = Some(History::new(doc));
+        self.id = Some(self.sessions.open(&r, 0).map_err(|e| e.to_string())?);
         Ok(self.triggers())
     }
 
+    fn session(&mut self) -> Result<&mut navigator_backend::session::Session, String> {
+        let id = self.id.ok_or("no document")?;
+        self.sessions.get_mut(id, 0).ok_or_else(|| "no document".to_string())
+    }
+
     fn triggers(&self) -> String {
-        self.transitions.iter().filter(|t| t.anchored)
+        let Some(s) = self.id.and_then(|id| self.sessions.get(id)) else { return String::new() };
+        s.transitions().iter().filter(|t| t.anchored)
             .map(|t| t.trigger.as_str()).collect::<Vec<_>>().join("\n")
     }
 
     fn navigate(&mut self, trigger: &str) -> Result<String, String> {
-        let t = self.transitions.iter()
-            .find(|t| t.anchored && t.trigger == trigger)
-            .ok_or_else(|| format!("nothing recorded for {trigger:?}"))?
-            .clone();
-        let h = self.history.as_mut().ok_or("no document")?;
-        h.go(&t).map_err(|e| e.to_string())?;
+        self.session()?.navigate(trigger).map_err(|e| e.to_string())?;
         Ok(String::new())
     }
 
     fn back(&mut self) -> Result<String, String> {
-        let h = self.history.as_mut().ok_or("no document")?;
-        Ok(match h.back().map_err(|e| e.to_string())? {
+        Ok(match self.session()?.back().map_err(|e| e.to_string())? {
             Back::Stepped => "stepped",
             Back::AtStart => "at-start",
             Back::Forgotten => "forgotten",
@@ -66,26 +67,34 @@ impl Worker {
     }
 
     fn forward(&mut self) -> Result<String, String> {
-        let h = self.history.as_mut().ok_or("no document")?;
-        Ok(match h.forward().map_err(|e| e.to_string())? {
+        Ok(match self.session()?.forward().map_err(|e| e.to_string())? {
             Forward::Stepped => "stepped",
             Forward::AtEnd => "at-end",
         }.to_string())
+    }
+
+    fn save(&mut self) -> Result<Vec<u8>, String> {
+        let t = self.session()?.trail().map_err(|e| format!("cannot save: {e}"))?;
+        Ok(t.to_json())
+    }
+
+    fn restore(&mut self, payload: &[u8]) -> Result<String, String> {
+        let t = Trail::from_json(payload)?;
+        self.session()?.replay(&t).map_err(|e| e.to_string())?;
+        Ok(String::new())
     }
 
     /// What this worker holds. ★ The host does NOT trust this for its budget
     /// — a compromised worker would simply report zero — it charges what it
     /// measured locally before sending. This is for reporting to a person.
     fn size(&self) -> String {
-        let n = self.history.as_ref()
-            .map(|h| h.document().dom.serialize().len() + h.cost().undo_bytes)
-            .unwrap_or(0);
+        let n = self.id.and_then(|id| self.sessions.get(id)).map(|s| s.bytes()).unwrap_or(0);
         n.to_string()
     }
 }
 
 fn main() {
-    let mut w = Worker { history: None, transitions: vec![] };
+    let mut w = Worker { sessions: Sessions::new(SessionLimits { max_sessions: 1, ..SessionLimits::default() }), id: None };
     let mut input = BufReader::new(std::io::stdin());
     let mut output = std::io::stdout();
     loop {
@@ -104,6 +113,8 @@ fn main() {
         };
         let answer = match f.tag.as_str() {
             REQ_OPEN => w.open(&f.payload),
+            REQ_SAVE => w.save().map(|b| String::from_utf8_lossy(&b).into_owned()),
+            REQ_RESTORE => w.restore(&f.payload),
             REQ_NAVIGATE => w.navigate(&f.text()),
             REQ_BACK => w.back(),
             REQ_FORWARD => w.forward(),

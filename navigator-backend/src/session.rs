@@ -275,6 +275,30 @@ pub struct Saved {
     pub document: String,
 }
 
+/// ★ A session's own half of a saved record: everything but where its
+/// recording lives. The WORKER can produce and replay this; only the broker,
+/// which holds the store, knows the recording's address. Splitting it is
+/// what lets a worker with no capabilities take part in save and restore.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trail {
+    pub url: String,
+    pub steps: Vec<usize>,
+    pub ahead: Vec<usize>,
+    pub document: String,
+}
+
+impl Trail {
+    pub fn into_saved(self, recording: String) -> Saved {
+        Saved { url: self.url, recording, steps: self.steps, ahead: self.ahead, document: self.document }
+    }
+}
+
+impl Saved {
+    pub fn trail(&self) -> Trail {
+        Trail { url: self.url.clone(), steps: self.steps.clone(), ahead: self.ahead.clone(), document: self.document.clone() }
+    }
+}
+
 /// The digest a saved session is checked against.
 pub fn digest(bytes: &[u8]) -> String { blake3::hash(bytes).to_hex().to_string() }
 
@@ -322,6 +346,37 @@ impl Session {
             self.remeasure()
         }
         Ok(r)
+    }
+
+    /// This session's half of a saved record (see `Trail`).
+    pub fn trail(&self) -> Result<Trail, NotRestorable> {
+        Ok(Trail {
+            url: self.url.clone(), steps: self.trail.clone()?, ahead: self.ahead.clone(),
+            document: digest(self.history.document().dom.serialize().as_bytes()),
+        })
+    }
+
+    /// ★ Replay a trail onto this FRESHLY OPENED session: the steps, then
+    /// the steps backed out of, taken and backed out of again, and the
+    /// result checked against the digest. Errors leave the session in an
+    /// unspecified state; the caller closes it.
+    pub fn replay(&mut self, t: &Trail) -> Result<(), RestoreError> {
+        if t.steps.len() + t.ahead.len() > MAX_TRAIL { return Err(RestoreError::TrailTooLong) }
+        let n = self.transitions.len();
+        if let Some(&bad) = t.steps.iter().chain(&t.ahead).find(|&&i| i >= n || !self.transitions[i].anchored) {
+            return Err(RestoreError::NoSuchStep { index: bad });
+        }
+        for (at, &i) in t.steps.iter().chain(t.ahead.iter().rev()).enumerate() {
+            self.go_index(i).map_err(|why| RestoreError::Replay { at, why })?;
+        }
+        for _ in 0..t.ahead.len() {
+            match self.back() {
+                Ok(Back::Stepped) => {}
+                _ => return Err(RestoreError::Diverged),
+            }
+        }
+        if digest(self.document().dom.serialize().as_bytes()) != t.document { return Err(RestoreError::Diverged) }
+        Ok(())
     }
 
     /// What it takes to bring this session back, given its recording's
@@ -532,30 +587,14 @@ impl Sessions {
     /// same rule, which can differ from a session whose backs and steps were
     /// interleaved.
     pub fn restore(&mut self, r: &Recording, saved: &Saved, now: Millis) -> Result<SessionId, RestoreError> {
-        if saved.steps.len() + saved.ahead.len() > MAX_TRAIL {
-            return Err(RestoreError::TrailTooLong);
-        }
+        let t = saved.trail();
+        if t.steps.len() + t.ahead.len() > MAX_TRAIL { return Err(RestoreError::TrailTooLong) }
         let n = r.transitions.len();
-        if let Some(&bad) = saved.steps.iter().chain(&saved.ahead)
-            .find(|&&i| i >= n || !r.transitions[i].anchored) {
+        if let Some(&bad) = t.steps.iter().chain(&t.ahead).find(|&&i| i >= n || !r.transitions[i].anchored) {
             return Err(RestoreError::NoSuchStep { index: bad });
         }
         let id = self.open(r, now).map_err(RestoreError::Open)?;
-        let result = (|| {
-            let s = self.open.get_mut(&id).expect("just opened");
-            for (at, &i) in saved.steps.iter().chain(saved.ahead.iter().rev()).enumerate() {
-                s.go_index(i).map_err(|why| RestoreError::Replay { at, why })?;
-            }
-            for _ in 0..saved.ahead.len() {
-                match s.back() {
-                    Ok(Back::Stepped) => {}
-                    _ => return Err(RestoreError::Diverged),
-                }
-            }
-            let got = digest(s.document().dom.serialize().as_bytes());
-            if got != saved.document { return Err(RestoreError::Diverged) }
-            Ok(())
-        })();
+        let result = self.open.get_mut(&id).expect("just opened").replay(&t);
         match result {
             Ok(()) => Ok(id),
             Err(e) => { self.close(id); Err(e) }
@@ -598,6 +637,55 @@ pub const SAVED_FORMAT: &str = "atrium-navigator-session/1";
 /// indexes of up to 20 digits plus the fixed fields fit with room to spare.
 pub const MAX_SAVED_BYTES: usize = 128 * 1024;
 
+/// The worker's answer to SAVE, and the broker's payload for RESTORE.
+pub const TRAIL_FORMAT: &str = "atrium-navigator-trail/1";
+
+impl Trail {
+    pub fn to_json(&self) -> Vec<u8> {
+        serde_json::json!({
+            "format": TRAIL_FORMAT, "url": self.url, "steps": self.steps, "ahead": self.ahead, "document": self.document,
+        }).to_string().into_bytes()
+    }
+
+    /// ★ UNTRUSTED in both directions: the broker reads it from a worker
+    /// that may be compromised, and the worker reads it from a store. Same
+    /// rules as `Saved::from_json`.
+    pub fn from_json(bytes: &[u8]) -> Result<Trail, String> {
+        let (url, steps, ahead, document) = parse_record(bytes, TRAIL_FORMAT, false)?;
+        Ok(Trail { url, steps, ahead, document })
+    }
+}
+
+/// Shared strict parse of the two record shapes. Returns the recording
+/// address too when `with_recording`.
+fn parse_record(bytes: &[u8], format: &str, with_recording: bool) -> Result<(String, Vec<usize>, Vec<usize>, String), String> {
+    parse_record_full(bytes, format, with_recording).map(|(u, _, s, a, d)| (u, s, a, d))
+}
+
+fn hex64(s: String, k: &str) -> Result<String, String> {
+    if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) { Ok(s) }
+    else { Err(format!("{k:?} is not a BLAKE3 hex digest")) }
+}
+
+fn parse_record_full(bytes: &[u8], format: &str, with_recording: bool) -> Result<(String, String, Vec<usize>, Vec<usize>, String), String> {
+    if bytes.len() > MAX_SAVED_BYTES {
+        return Err(format!("saved session is {} bytes, over the {MAX_SAVED_BYTES} limit", bytes.len()));
+    }
+    let v: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| format!("not a saved session: {e}"))?;
+    let o = v.as_object().ok_or("a saved session is a JSON object")?;
+    let text = |k: &str| o.get(k).and_then(|x| x.as_str()).map(str::to_string)
+        .ok_or_else(|| format!("saved session has no {k:?}"));
+    if text("format")? != format { return Err(format!("not {format}")) }
+    let list = |k: &str| -> Result<Vec<usize>, String> {
+        let a = o.get(k).and_then(|x| x.as_array()).ok_or_else(|| format!("saved session has no {k:?}"))?;
+        if a.len() > MAX_TRAIL { return Err(format!("{k:?} has more than {MAX_TRAIL} entries")) }
+        a.iter().map(|x| x.as_u64().map(|n| n as usize).ok_or_else(|| format!("{k:?} holds a non-index")))
+            .collect()
+    };
+    let recording = if with_recording { hex64(text("recording")?, "recording")? } else { String::new() };
+    Ok((text("url")?, recording, list("steps")?, list("ahead")?, hex64(text("document")?, "document")?))
+}
+
 impl Saved {
     pub fn to_json(&self) -> Vec<u8> {
         serde_json::json!({
@@ -609,26 +697,7 @@ impl Saved {
     /// ★ UNTRUSTED, like a recording: bounded before parsing, every field
     /// typed, nothing defaulted. A missing field is a refusal, not a zero.
     pub fn from_json(bytes: &[u8]) -> Result<Saved, String> {
-        if bytes.len() > MAX_SAVED_BYTES {
-            return Err(format!("saved session is {} bytes, over the {MAX_SAVED_BYTES} limit", bytes.len()));
-        }
-        let v: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| format!("not a saved session: {e}"))?;
-        let o = v.as_object().ok_or("a saved session is a JSON object")?;
-        let text = |k: &str| o.get(k).and_then(|x| x.as_str()).map(str::to_string)
-            .ok_or_else(|| format!("saved session has no {k:?}"));
-        if text("format")? != SAVED_FORMAT { return Err(format!("not {SAVED_FORMAT}")) }
-        let list = |k: &str| -> Result<Vec<usize>, String> {
-            let a = o.get(k).and_then(|x| x.as_array()).ok_or_else(|| format!("saved session has no {k:?}"))?;
-            if a.len() > MAX_TRAIL { return Err(format!("{k:?} has more than {MAX_TRAIL} entries")) }
-            a.iter().map(|x| x.as_u64().map(|n| n as usize).ok_or_else(|| format!("{k:?} holds a non-index")))
-                .collect()
-        };
-        let hex64 = |s: String, k: &str| if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) { Ok(s) }
-            else { Err(format!("{k:?} is not a BLAKE3 hex digest")) };
-        Ok(Saved {
-            url: text("url")?, recording: hex64(text("recording")?, "recording")?,
-            steps: list("steps")?, ahead: list("ahead")?,
-            document: hex64(text("document")?, "document")?,
-        })
+        let (url, recording, steps, ahead, document) = parse_record_full(bytes, SAVED_FORMAT, true)?;
+        Ok(Saved { url, recording, steps, ahead, document })
     }
 }

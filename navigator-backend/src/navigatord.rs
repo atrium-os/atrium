@@ -124,6 +124,9 @@ pub struct Navigatord<H: DocumentHost> {
 impl<H: DocumentHost> Navigatord<H> {
     pub fn new(host: H) -> Self { Navigatord { host, now: 0 } }
 
+    /// The host, for an operator (or a test) inspecting it.
+    pub fn host(&self) -> &H { &self.host }
+
     /// Advance the clock, expiring whatever has run out.
     ///
     /// ★ Expiry events are emitted here, unprompted, rather than discovered

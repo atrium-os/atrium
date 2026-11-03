@@ -104,5 +104,9 @@ pub const REQ_BACK: &str = "BACK";
 pub const REQ_FORWARD: &str = "FWD";
 pub const REQ_TRIGGERS: &str = "TRIG";
 pub const REQ_BYTES: &str = "SIZE";
+/// The worker's half of a saved session: answers a `session::Trail` as JSON.
+pub const REQ_SAVE: &str = "SAVE";
+/// Replay a `session::Trail` onto the document this worker just opened.
+pub const REQ_RESTORE: &str = "RSTR";
 pub const RSP_OK: &str = "OK";
 pub const RSP_ERR: &str = "ERR";

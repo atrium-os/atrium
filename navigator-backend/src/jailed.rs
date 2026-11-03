@@ -169,11 +169,23 @@ pub struct JailedHost {
     /// worker crashed from one whose id never existed.
     gone: Vec<(SessionId, Status)>,
     next: SessionId,
+    /// Where recordings and saved sessions go, if anywhere. ★ The STORE is
+    /// the broker's capability, never a worker's: a worker answers its trail
+    /// and replays one, and only this side reads or writes the store.
+    store: Option<Box<dyn crate::store::Store>>,
+    /// Each open session's recording address, in `store`.
+    recordings: HashMap<SessionId, String>,
 }
 
 impl JailedHost {
     pub fn new(config: WorkerConfig, limits: crate::session::SessionLimits) -> Self {
-        JailedHost { config, limits, workers: HashMap::new(), gone: vec![], next: 0 }
+        JailedHost { config, limits, workers: HashMap::new(), gone: vec![], next: 0, store: None, recordings: HashMap::new() }
+    }
+
+    /// With a store, so sessions can be saved and restored.
+    pub fn with_store(mut self, store: Box<dyn crate::store::Store>) -> Self {
+        self.store = Some(store);
+        self
     }
 
     pub fn is_confined(&self) -> bool { self.config.is_confined() }
@@ -204,6 +216,7 @@ impl JailedHost {
     /// compromised one will — so this is a shutdown with a deadline, not a
     /// request and a hope.
     fn kill(&mut self, id: SessionId) -> bool {
+        self.recordings.remove(&id);
         let Some(mut w) = self.workers.remove(&id) else { return false };
         drop(w.stdin.take());
         let grace = std::time::Instant::now();
@@ -317,6 +330,14 @@ impl DocumentHost for JailedHost {
                 let triggers: Vec<String> = list.lines()
                     .filter(|l| !l.is_empty()).map(str::to_string).collect();
                 if let Some(w) = self.workers.get_mut(&id) { w.triggers = triggers }
+                // ★ Stored at OPEN, from the bytes the broker holds, as the
+                // in-process host does: at save time they are gone.
+                if let Some(store) = &mut self.store {
+                    match store.put(recording) {
+                        Ok(a) => { self.recordings.insert(id, a); }
+                        Err(why) => { self.kill(id); return Err(format!("could not store the recording: {why}")) }
+                    }
+                }
                 Ok(id)
             }
             Err(why) => {
@@ -332,6 +353,35 @@ impl DocumentHost for JailedHost {
 
     fn navigate(&mut self, id: SessionId, trigger: &str, now: Millis) -> Result<(), String> {
         self.ask(id, Frame::new(REQ_NAVIGATE, trigger.as_bytes()), now).map(|_| ())
+    }
+
+    /// ★ The worker answers its TRAIL, which the broker parses strictly (it
+    /// is a possibly compromised process talking) and completes with the
+    /// recording's address, which only the broker knows. A lying worker can
+    /// at worst save a trail that will not replay: restore checks every step
+    /// and the final digest, and refuses.
+    fn save(&mut self, id: SessionId) -> Result<String, String> {
+        if self.store.is_none() { return Err("this host has no store to save sessions to".into()) }
+        let recording = self.recordings.get(&id).cloned().ok_or("this session's recording was not stored")?;
+        let reply = self.ask(id, Frame::new(REQ_SAVE, ""), 0)?;
+        let trail = crate::session::Trail::from_json(reply.as_bytes())
+            .map_err(|e| format!("worker sent a bad trail: {e}"))?;
+        let saved = trail.into_saved(recording);
+        self.store.as_mut().expect("checked").put(&saved.to_json())
+    }
+
+    /// Open a fresh worker on the stored recording, then hand it the trail
+    /// to replay. Any failure closes that worker: a half-restored session is
+    /// never handed to a reader.
+    fn restore(&mut self, saved: &str, now: Millis) -> Result<SessionId, String> {
+        let store = self.store.as_ref().ok_or("this host has no store to restore sessions from")?;
+        let record = crate::session::Saved::from_json(&store.get(saved)?)?;
+        let bytes = store.get(&record.recording)?;
+        let id = self.open(&bytes, now)?;
+        match self.ask(id, Frame::new(REQ_RESTORE, record.trail().to_json()), now) {
+            Ok(_) => Ok(id),
+            Err(why) => { self.kill(id); Err(why) }
+        }
     }
 
     fn forward(&mut self, id: SessionId, now: Millis) -> Result<Forward, String> {

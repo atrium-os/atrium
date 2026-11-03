@@ -826,7 +826,7 @@ Everything here runs headless, in CI, with no display server.
 | **M1** | jailed fetcher | fetcher's filesystem access refused **at the syscall**, asserted by test |
 | **M2** | Document Profile v1 (HTML + CSS) | curated corpus with a reported conformance **number** — rows **64/64**, corpus **29/29 after the normalizer** (§8.4 measured 1/29 raw, §8.5 closed it). Converter must still carry stylesheets and image sizes |
 | **M3** | per-document jail + graph validator | worker capabilities == none; validator fuzzed with reached-coverage reported; **per-document jail launch cost measured**, not assumed — **PASSED** (§8.6) |
-| **M4** | navigation state machine + history in Tessera | back/forward/session-restore driven headlessly — done in-process (§4.4, §8.7, §8.8); the jailed host and a store on a Tessera volume are open |
+| **M4** | navigation state machine + history in Tessera | back/forward/session-restore driven headlessly — done in-process and through the jailed host unconfined (§4.4, §8.7, §8.8); a real-jail run and a store on a Tessera volume are open |
 | **M5** | UI attach (Pergola chrome + Limen document surface) | **UI deleted ⇒ suite still green** |
 | **M6** | app-launch path (`atrium-app://` → Nomenclator → Opifex → jail) | trial-launch consent gesture; signature verified before launch |
 
@@ -1908,8 +1908,26 @@ a saved session outlives its expiry and comes back with forward and back intact.
 forgotten. A replay under the same limits forgets by the same rule, which can differ from a
 session whose steps and backs were interleaved.
 
-**Still open for M4:** restore through the jailed host (a worker request to replay a trail),
-and `DirStore` pointed at a directory on a Tessera volume. Both need the VM.
+**Through the jailed host (2026-11-03).** The worker holds no store, so a saved record is
+split in two. A `Trail` (url, steps, ahead, document digest; `atrium-navigator-trail/1`) is
+the worker's half: `SAVE` answers it, and `RSTR` replays one onto the document the worker
+has just opened. The recording's address is the broker's half, because only the broker
+holds the store. `JailedHost` stores the recording at open, as the in-process host does. On
+save it parses the worker's trail strictly (the worker may be compromised) and completes
+the record. On restore it starts a fresh worker on the stored recording and sends it the
+trail. Any failure closes that worker.
+
+A lying worker can at worst save a trail that will not replay, and restore refuses that at
+the first bad step or at the digest. The worker now runs the same `Sessions` code as the
+in-process host (with one session), so navigation, the trail and the replay cannot drift
+apart between the two hosts.
+
+Tested unconfined in `tests/jailed.rs`. `examples/jailed_corpus` now saves every session
+that navigated, closes it, restores it, and checks that the restored session saves to the
+same address. So `navigator-jail-e2e.sh` exercises restore inside a real jail.
+
+**Still open for M4:** a real-jail run of the above, and `DirStore` pointed at a directory
+on a Tessera volume. Both need the VM.
 
 ## 9. What this reuses
 

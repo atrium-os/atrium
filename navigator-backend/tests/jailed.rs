@@ -388,3 +388,100 @@ fn the_launcher_receives_a_distinct_instance_per_session() {
     assert!(tags.contains(&a.to_string().as_str()), "{tags:?} vs session {a}");
     let _ = std::fs::remove_file(&log);
 }
+
+// ---- save and restore across the process boundary -----------------------
+
+/// Three anchored steps that compose, as in tests/restore.rs.
+fn three_steps() -> Vec<u8> {
+    br##"{"format":"atrium-navigator-recording/3","url":"https://a.test/","tier":2,
+         "tier_reason":"","measurements":{},"stylesheets":[],"images":{},
+         "transitions":[
+           {"trigger":"#menu","event":"click","anchored":true,
+            "effects":[{"kind":"attribute","target":"#nav","name":"class","from":"shut","to":"open"}]},
+           {"trigger":"#mark","event":"click","anchored":true,
+            "effects":[{"kind":"attribute","target":"#nav","name":"data-mark","from":null,"to":"1"}]},
+           {"trigger":"#panel","event":"click","anchored":true,
+            "effects":[{"kind":"attribute","target":"#p","name":"hidden","from":"","to":null}]}],
+         "document":"<html><body><button id=\"menu\">m</button><button id=\"mark\">k</button><button id=\"panel\">p</button><nav id=\"nav\" class=\"shut\"></nav><div id=\"p\" hidden=\"\">x</div></body></html>"}"##.to_vec()
+}
+
+fn stored_broker() -> Navigatord<JailedHost> {
+    let host = host().with_store(Box::new(navigator_backend::store::MemoryStore::default()));
+    let mut n = Navigatord::new(host);
+    n.tick(NOW);
+    n
+}
+
+fn opened_from(ev: Vec<Event>) -> SessionId {
+    match ev.as_slice() {
+        [Event::SessionOpened { session, .. }] => *session,
+        other => panic!("did not open: {other:?}"),
+    }
+}
+
+fn saved_from(ev: Vec<Event>) -> String {
+    match ev.as_slice() {
+        [Event::Saved { saved, .. }] => saved.clone(),
+        other => panic!("did not save: {other:?}"),
+    }
+}
+
+/// ★ The worker holds no store, so a jailed save is two halves: the worker
+/// answers its trail, the broker adds the recording's address and stores the
+/// record. Restore is a fresh worker plus a replay. The reader gets back the
+/// same position, with the same forward and back, after their worker is gone.
+#[test]
+fn a_jailed_session_is_saved_and_restored_in_a_fresh_worker() {
+    let mut n = stored_broker();
+    let s = opened_from(n.handle(Request::OpenSession { recording: three_steps() }));
+    for t in ["#menu", "#mark", "#panel"] {
+        assert!(matches!(n.handle(Request::Navigate { session: s, trigger: t.into() }).as_slice(), [Event::SceneReady { .. }]));
+    }
+    assert!(matches!(n.handle(Request::Back { session: s }).as_slice(), [Event::Rewound { how: Back::Stepped, .. }]));
+    let saved = saved_from(n.handle(Request::Save { session: s }));
+    let old_pid = n.host().worker_pid(s).expect("still open");
+
+    // The reader goes away: the worker expires.
+    let later = NOW + 9 * 60 * 60 * 1000;
+    assert!(n.tick(later).iter().any(|e| matches!(e, Event::Expired { session, .. } if *session == s)));
+    assert_eq!(n.host().open_count(), 0);
+
+    let r = opened_from(n.handle(Request::Restore { saved }));
+    assert_ne!(n.host().worker_pid(r), Some(old_pid), "a fresh worker serves the restored session");
+    // One step ahead (the panel), then back through mark and menu to the start.
+    assert!(matches!(n.handle(Request::Forward { session: r }).as_slice(), [Event::Advanced { how: Forward::Stepped, .. }]));
+    assert!(matches!(n.handle(Request::Forward { session: r }).as_slice(), [Event::Advanced { how: Forward::AtEnd, .. }]));
+    for how in [Back::Stepped, Back::Stepped, Back::Stepped, Back::AtStart] {
+        match n.handle(Request::Back { session: r }).as_slice() {
+            [Event::Rewound { how: h, .. }] => assert_eq!(*h, how),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+/// A record that does not replay to the document it names is refused, and
+/// the worker opened for it is gone: no half-restored session reaches a
+/// reader.
+#[test]
+fn a_jailed_restore_that_diverges_is_refused_and_its_worker_closed() {
+    use navigator_backend::session::Saved;
+    use navigator_backend::store::{MemoryStore, Store};
+    let mut store = MemoryStore::default();
+    let rec = store.put(&three_steps()).unwrap();
+    let bad = Saved { url: "https://a.test/".into(), recording: rec, steps: vec![0], ahead: vec![], document: "0".repeat(64) };
+    let addr = store.put(&bad.to_json()).unwrap();
+    let mut n = Navigatord::new(host().with_store(Box::new(store)));
+    n.tick(NOW);
+    match n.handle(Request::Restore { saved: addr }).as_slice() {
+        [Event::Blocked { session: None, why }] => assert!(why.contains("different document"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(n.host().open_count(), 0, "the worker opened for the restore was left running");
+}
+
+#[test]
+fn a_jailed_host_without_a_store_says_it_cannot_save() {
+    let mut n = broker();
+    let s = open(&mut n);
+    assert!(matches!(n.handle(Request::Save { session: s }).as_slice(), [Event::Blocked { .. }]));
+}

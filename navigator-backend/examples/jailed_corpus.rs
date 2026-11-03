@@ -40,7 +40,10 @@ fn main() {
     println!("confinement: {}", if confined { "LAUNCHER (see spec §6.5.2)" }
                                 else { "none — process isolation only, NOT a jail" });
 
-    let mut n = Navigatord::new(JailedHost::new(cfg, SessionLimits::default()));
+    // A store, so every session is also saved and restored (M4, spec §8.8).
+    let host = JailedHost::new(cfg, SessionLimits::default())
+        .with_store(Box::new(navigator_backend::store::MemoryStore::default()));
+    let mut n = Navigatord::new(host);
     n.tick(1_000);
 
     let mut files: Vec<_> = std::fs::read_dir(&dir).expect("readable directory")
@@ -49,7 +52,7 @@ fn main() {
         .collect();
     files.sort();
 
-    let (mut opened, mut navigated, mut rewound) = (0u32, 0u32, 0u32);
+    let (mut opened, mut navigated, mut rewound, mut restored) = (0u32, 0u32, 0u32, 0u32);
     let mut failures: Vec<String> = vec![];
     let started = std::time::Instant::now();
     // ★ Per-session costs, because a total wall time cannot answer the M3
@@ -57,7 +60,7 @@ fn main() {
     // launch + jail + worker start + the first parse; close is the launcher's
     // teardown. The unconfined arm is the same minus the jail, so the jail's
     // price is the difference between arms — never a number from one arm.
-    let (mut open_ms, mut nav_ms, mut close_ms) = (vec![], vec![], vec![]);
+    let (mut open_ms, mut nav_ms, mut close_ms, mut restore_ms) = (vec![], vec![], vec![], vec![]);
 
     for p in &files {
         let bytes = std::fs::read(p).expect("readable file");
@@ -70,6 +73,7 @@ fn main() {
             Some(Event::Blocked { why, .. }) => { failures.push(format!("{name}: {why}")); continue }
             other => { failures.push(format!("{name}: {other:?}")); continue }
         };
+        let first = triggers.first().cloned();
         for trigger in triggers {
             let t = std::time::Instant::now();
             let ev = n.handle(Request::Navigate { session, trigger: trigger.clone() }).pop();
@@ -83,14 +87,42 @@ fn main() {
                 other => failures.push(format!("{name}: back -> {other:?}")),
             }
         }
+        // ★ SAVE AND RESTORE through a fresh worker. The broker cannot see a
+        // worker's document, so the check is that the restored session saves
+        // to the SAME record: same steps, same ahead, same document digest,
+        // hence the same content address.
+        let session = match first {
+            Some(t) => {
+                n.handle(Request::Navigate { session, trigger: t });
+                match n.handle(Request::Save { session }).pop() {
+                    Some(Event::Saved { saved, .. }) => {
+                        n.handle(Request::Close { session });
+                        let t = std::time::Instant::now();
+                        match n.handle(Request::Restore { saved: saved.clone() }).pop() {
+                            Some(Event::SessionOpened { session: r, .. }) => {
+                                restore_ms.push(t.elapsed().as_secs_f64() * 1e3);
+                                match n.handle(Request::Save { session: r }).pop() {
+                                    Some(Event::Saved { saved: again, .. }) if again == saved => restored += 1,
+                                    other => failures.push(format!("{name}: restored session saves differently: {other:?}")),
+                                }
+                                r
+                            }
+                            other => { failures.push(format!("{name}: restore -> {other:?}")); continue }
+                        }
+                    }
+                    other => { failures.push(format!("{name}: save -> {other:?}")); session }
+                }
+            }
+            None => session,
+        };
         let t = std::time::Instant::now();
         n.handle(Request::Close { session });
         close_ms.push(t.elapsed().as_secs_f64() * 1e3);
     }
 
-    println!("{opened} sessions, {navigated} navigations, {rewound} rewinds, \
+    println!("{opened} sessions, {navigated} navigations, {rewound} rewinds, {restored} restores, \
               {} failures, {:.1}s", failures.len(), started.elapsed().as_secs_f64());
-    for (what, v) in [("open", &mut open_ms), ("navigate", &mut nav_ms), ("close", &mut close_ms)] {
+    for (what, v) in [("open", &mut open_ms), ("navigate", &mut nav_ms), ("restore", &mut restore_ms), ("close", &mut close_ms)] {
         println!("{}", dist(what, v));
     }
     for f in failures.iter().take(10) { println!("  {f}"); }
