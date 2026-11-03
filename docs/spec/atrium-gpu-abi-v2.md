@@ -315,6 +315,8 @@ Userspace then calls `mmap()` on the *device_fd* with the returned offset. The c
 
 Copy ioctls (`BO_WRITE`/`BO_READ`) remain as a bring-up convenience and for tests. Production paths use the mapping.
 
+**Compression (2.1, normative).** Lossless render-target compression (AMD DCC/HTILE and equivalents) is **off**: the kernel never sets a compression page-table bit or allocates compression metadata, and no modifier advertised in `QUERY_CAPS` is a compressed layout. A later revision defines it (§13o). Block-compressed texture *formats* (BC, ASTC, ETC2) are ordinary data to the kernel and are unaffected.
+
 **Allocator requirements (normative for every vendor module):** device-local memory and each VM's VA space are managed with an allocator that frees and reuses (FreeBSD `vmem(9)` arenas are the reference choice). Bump-only allocators are not conformant: a long-running compositor must not exhaust VRAM or VA by allocating per frame.
 
 ### 5.4 VM_BIND
@@ -889,6 +891,8 @@ m. **Firmware licensing.** Real RDNA hardware needs AMD's signed binary firmware
 
 n. **VMID pressure.** Hardware has 15–16 VMIDs; 2.1 decouples VMs from VMIDs (§5.2) and relies on the firmware to assign them on demand. The fallback for hardware or firmware that does not do this (kernel-side VMID stealing with a TLB flush) needs a design if such a target appears.
 
+
+o. **Render-target compression.** Off in 2.1 (§5.3). Revisit once a real-silicon backend can measure the bandwidth and energy gain for frescod and 3D workloads. Defining it needs: clearing compression state on allocation (I5), a validated `VM_BIND` flag where compression is a page-table bit (RDNA4), the layout carried as a modifier on `share_fd`, display validation of scanout-capable layouts, refusal of CPU mappings of compressed BOs, and a policy against compressing surfaces whose compression ratio would leak another app's or origin's pixels (the "GPU.zip" side channel).
 ---
 
 ## 14. Comparison: this ABI vs DRM uAPI vs Vulkan
