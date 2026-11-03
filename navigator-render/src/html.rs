@@ -130,6 +130,18 @@ struct Cx<'a> {
     /// `width: 1px; overflow: hidden`, across the page as visible text.
     /// They are placed after the line box that would have held them.
     pending_abs: Vec<Handle>,
+    /// ★ Absolutely positioned boxes whose placement needs the HEIGHT of a
+    /// containing block that is still being laid out (`bottom` without
+    /// `top`, a percentage `top` or `height`, both offsets with an auto
+    /// height). CSS lays them out once that size is known (CSS 2 §10.6.4);
+    /// placed at their static position instead, Spiegel's featured-teaser
+    /// overlay (`bottom: 0` in an auto-height card) fell below the card and
+    /// over the carousel. Queued with their static position; the positioned
+    /// ancestor drains its share when its own height is final.
+    deferred_abs: Vec<(Handle, U, U)>,
+    /// A positioned ancestor with an auto height is open: it will drain
+    /// `deferred_abs` when it finishes.
+    cb_open: bool,
     /// ★ The element whose background colour became the CANVAS's (CSS
     /// Backgrounds 3 §2.11.2): the root's, or — when the root has none —
     /// the body's. Its own box does not paint that colour again.
@@ -184,7 +196,7 @@ pub fn render_html_with(html: &str, fonts: &FontSet, env: &Env, subs: &Subresour
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]),
                       viewport: (u(env.width_px), Some(u(env.height_px))), pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))),
-                      subs, placing_abs: false, pending_abs: vec![], canvas_src: None, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
+                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
     cx.promoted = promote_block_in_inline(&dom, &styled.styles);
     cx.count_unread_rows();
     // The root element is the initial containing block's only child.
@@ -249,7 +261,7 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None,
                       indent: None, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), viewport: (u(env.width_px), Some(u(env.height_px))),
                       pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))), subs: &Subresources::new(),
-                      placing_abs: false, pending_abs: vec![], canvas_src: None, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
+                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
     // (table, per-column (min, max), its first row's cells) for every table.
     let mut tables: Vec<(Handle, Vec<(U, U)>, Vec<Handle>)> = vec![];
     for t in 0..dom.nodes.len() as Handle {
@@ -701,6 +713,9 @@ impl<'a> Cx<'a> {
             // is this box's PADDING box, not its content box.
             self.pos_cb = (bx + bl, by + bt, (w - bl - br).max(0), definite.map(|d| (d - bt - bb).max(0)));
         }
+        let deferred_from = self.deferred_abs.len();
+        let saved_open = self.cb_open;
+        if positioned { self.cb_open = definite.is_none() }
         // Paint the background BEFORE the children: reserve its slot now.
         let bg_slot = self.scene.order.len();
         let content_x = bx + bl + pl;
@@ -733,9 +748,17 @@ impl<'a> Cx<'a> {
             self.place_pending_abs(content_x, ly);
         }
         let content_h = cy - (by + bt + pt);
+        let hgt = definite.unwrap_or_else(|| clamp(content_h + pt + pb + bt + bb).max(vframe));
+        // The out-of-flow boxes that waited for this height, inside this
+        // box's clip like the rest of its content.
+        if positioned && self.deferred_abs.len() > deferred_from {
+            self.pos_cb.3 = Some((hgt - bt - bb).max(0));
+            self.cb_open = false;
+            for (d, sx, sy) in self.deferred_abs.split_off(deferred_from) { self.abs_box(d, sx, sy) }
+        }
+        self.cb_open = saved_open;
         // The box's own border and background are outside its own clip.
         self.scene.cur.0 = saved_attrs.0;
-        let hgt = definite.unwrap_or_else(|| clamp(content_h + pt + pb + bt + bb).max(vframe));
         // Paint: background over the border box, then borders — unless
         // visibility: hidden, which keeps the box and paints none of it.
         let hidden = kw(s, "visibility") == "hidden";
@@ -908,6 +931,11 @@ impl<'a> Cx<'a> {
         let v_off = |p: &str| -> Option<U> { match s.get(p) { V::Pct(_) => cbh.and_then(|b| len(s.get(p), b)), v => len(v, 0) } };
         let (left, right) = (h_off("left"), h_off("right"));
         let (top, bottom) = (v_off("top"), v_off("bottom"));
+        if cbh.is_none() && self.cb_open && kw(s, "position") != "fixed"
+            && (bottom.is_some() || matches!(s.get("top"), V::Pct(_)) || matches!(s.get("height"), V::Pct(_))) {
+            self.deferred_abs.push((h, static_x, static_y));
+            return;
+        }
         // `None` is `auto`; resolved below, once the box's size is known.
         let (mla, mra) = (h_off("margin-left"), h_off("margin-right"));
         let (mta, mba) = (h_off("margin-top"), h_off("margin-bottom"));
@@ -1284,8 +1312,10 @@ impl<'a> Cx<'a> {
         // then throws them away with the rest of the scene); it must not
         // consume the ones the real pass is still holding.
         let pend = std::mem::take(&mut self.pending_abs);
+        let dfr = self.deferred_abs.len();
         let hgt = self.block(h, 0, 0, cb_w, cb_h, force);
         self.pending_abs = pend;
+        self.deferred_abs.truncate(dfr);
         self.scene.order.truncate(o); self.scene.rects.truncate(r); self.scene.runs.truncate(n); self.scene.links.truncate(l);
         self.scene.rect_attrs.truncate(r); self.scene.run_attrs.truncate(n); self.scene.link_attrs.truncate(l);
         self.scene.shadows.truncate(sh); self.scene.shadow_attrs.truncate(sh);
@@ -2549,6 +2579,20 @@ mod tests {
     }
 
     #[test]
+    fn a_bottom_anchored_box_waits_for_an_auto_height_container() {
+        // Spiegel's teaser: a relative card of auto height, an image that
+        // gives it its height, an overlay pinned to its bottom edge.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .card { position: relative; width: 300px }
+            .pic { height: 200px; background-color: #0000ff }
+            .ov { position: absolute; bottom: 0px; left: 0px; width: 100px; height: 20px; background-color: #00ff00 }
+            .pct { position: absolute; top: 50%; left: 200px; width: 10px; height: 10px; background-color: #ff0000 }</style>
+            <div class="card"><div class="ov"></div><div class="pct"></div><div class="pic"></div></div><div class="pic"></div>"#);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(0, 180, 100, 20)]);
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(200, 100, 10, 10)]);
+    }
+
+    #[test]
     fn auto_margins_centre_a_sized_box() {
         let o = render(r#"<style>body { margin-left: 0px; margin-right: 0px } .c { width: 400px; margin-left: auto; margin-right: auto; height: 10px; background-color: #00ff00 }</style><div class="c"></div>"#);
         let g = rects(&o).into_iter().find(|r| r.rgba == 0x00ff00ff).expect("box");
@@ -3256,7 +3300,7 @@ mod tests {
                           report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None,
                           baseline_probe: None, indent: None, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]),
                           viewport: (0, None), pos_cb: (0, 0, 0, None), subs: &Subresources::new(),
-                          placing_abs: false, pending_abs: vec![], canvas_src: None, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
+                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
         cx.count_rows_outside(&held_out);
         // The non-initial value is counted once; the initial one is not.
         assert_eq!(cx.unimplemented.get("row text-align… (not implemented)"), Some(&1), "{:?}", cx.unimplemented);
