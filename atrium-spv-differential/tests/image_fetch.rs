@@ -161,6 +161,7 @@ fn image_fetch_const_offset_at_one_zero() {
         min_filter: FilterMode::Nearest as u32,
         wrap_s: WrapMode::ClampToEdge as u32,
         wrap_t: WrapMode::ClampToEdge as u32,
+        compare_enable: 0, compare_op: 0,
     };
     let mut uniforms = descriptor_table_buffer(1);
     unsafe {
@@ -172,7 +173,9 @@ fn image_fetch_const_offset_at_one_zero() {
             atrium_spv_runtime::atrium_tex_sample_cube,
             atrium_spv_runtime::atrium_tex_gather_2d,
             atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
-            atrium_spv_runtime::atrium_tex_sample_cube_lod);
+            atrium_spv_runtime::atrium_tex_sample_cube_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_dref,
+            atrium_spv_runtime::atrium_deriv);
         write_descriptor_slot(&mut uniforms, 0,
             &tex_desc as *const _, &samp_desc as *const _);
     }
@@ -230,6 +233,7 @@ fn image_fetch_at_one_zero() {
         min_filter: FilterMode::Nearest as u32,
         wrap_s: WrapMode::ClampToEdge as u32,
         wrap_t: WrapMode::ClampToEdge as u32,
+        compare_enable: 0, compare_op: 0,
     };
     let mut uniforms = descriptor_table_buffer(1);
     assert_eq!(uniforms.len(), UNIFORMS_DESC_BASE + DESC_SLOT_BYTES);
@@ -242,7 +246,9 @@ fn image_fetch_at_one_zero() {
             atrium_spv_runtime::atrium_tex_sample_cube,
             atrium_spv_runtime::atrium_tex_gather_2d,
             atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
-            atrium_spv_runtime::atrium_tex_sample_cube_lod);
+            atrium_spv_runtime::atrium_tex_sample_cube_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_dref,
+            atrium_spv_runtime::atrium_deriv);
         write_descriptor_slot(&mut uniforms, 0,
             &tex_desc as *const _, &samp_desc as *const _);
     }

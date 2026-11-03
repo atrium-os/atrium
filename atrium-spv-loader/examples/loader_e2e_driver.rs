@@ -163,6 +163,8 @@ fn main() {
             0,                // samples_mask
             out.as_mut_ptr(),
             &mut depth as *mut f32,
+            1,                // front_facing
+            0,                // primitive_id
         );
     }
 

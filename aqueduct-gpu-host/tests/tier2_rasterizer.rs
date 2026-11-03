@@ -27,9 +27,10 @@ use tempfile::TempDir;
 /// workspace-built `atrium-spv-compile` binary so the
 /// loader can spawn it from the test process.
 fn locate_compile_binary() -> PathBuf {
-    let here = std::env::current_exe().expect("current_exe");
-    let mut p = here;
-    p.pop(); p.pop(); p.pop(); p.pop(); p.pop();   // deps → debug → target → aqueduct-gpu-host → bsd
+    // Sibling crate's own target dir, found from this crate's
+    // manifest dir (robust to cargo's build-dir layout).
+    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.pop();
     p.push("atrium-spv-compile");
     p.push("target");
     p.push("debug");

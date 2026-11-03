@@ -59,6 +59,13 @@ impl ShaderRunner for BespokeRunner {
         inputs: &ShaderInputs,
     ) -> Result<ShaderOutputs, BackendError> {
         use atrium_spv_backend_bespoke::{compile, Target};
+        // The bespoke backend emits AArch64 only; on any other
+        // host its code can't run here, so it sits the
+        // comparison out (interpreter ↔ Cranelift remains).
+        if !cfg!(target_arch = "aarch64") {
+            return Err(BackendError::Unsupported(
+                "bespoke backend is aarch64-only".into()));
+        }
         let module = atrium_spv_frontend::translate(spirv)
             .map_err(|e| map_unsupported_or_compile(format!("{e:?}")))?;
         let out = compile(&module, Target::host())
@@ -71,6 +78,21 @@ impl ShaderRunner for BespokeRunner {
         run_via_dlopen(&out.object, inputs)
     }
 }
+
+/// The host's production Tier-2 backend: bespoke on
+/// aarch64, Cranelift elsewhere (bespoke is aarch64-only).
+/// Tests use it to pin absolute values on any host.
+pub fn native_runner() -> Box<dyn ShaderRunner> {
+    if cfg!(target_arch = "aarch64") {
+        Box::new(BespokeRunner)
+    } else {
+        Box::new(CraneliftRunner)
+    }
+}
+
+/// True when this host can run both compiled backends, so a
+/// Cranelift ↔ bespoke comparison is meaningful.
+pub const HOST_HAS_BESPOKE: bool = cfg!(target_arch = "aarch64");
 
 /// Heuristic frontend-error mapping: any `Unsupported(_)`
 /// in the error string downgrades to harness-Unsupported

@@ -134,8 +134,13 @@ fn three_way_vertex_uniform_position() {
     let inputs = ShaderInputs { uniforms: uniforms.clone(), ..ShaderInputs::default() };
     let interp_pos = interp.run_vertex(&inputs).unwrap().positions[0];
 
-    // Both backends agree.
-    for backend in ["cranelift", "bespoke"] {
+    // Both backends agree (bespoke only where it can run: aarch64).
+    let backends: &[&str] = if cfg!(target_arch = "aarch64") {
+        &["cranelift", "bespoke"]
+    } else {
+        &["cranelift"]
+    };
+    for &backend in backends {
         let p = run_vertex_with_uniforms(&spirv, backend, &uniforms);
         for k in 0..4 {
             assert!((p[k] - pos[k]).abs() < 1e-6,

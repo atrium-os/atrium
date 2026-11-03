@@ -78,8 +78,10 @@ pub enum Target {
     Aarch64FreeBSD,
     /// macOS on Apple Silicon (dev iteration).
     Aarch64Darwin,
-    /// FreeBSD on x86_64 (future; phase 4).
+    /// FreeBSD on x86_64 (native Atrium on x86 hardware).
     X86_64FreeBSD,
+    /// Linux on x86_64 (the R9700 oracle box, cloud CI).
+    X86_64Linux,
 }
 
 impl Target {
@@ -89,28 +91,126 @@ impl Target {
             Target::Aarch64FreeBSD => "aarch64-unknown-freebsd",
             Target::Aarch64Darwin  => "aarch64-apple-darwin",
             Target::X86_64FreeBSD  => "x86_64-unknown-freebsd",
+            Target::X86_64Linux    => "x86_64-unknown-linux-gnu",
         }
     }
 
-    /// The host's target (best-guess from cargo's
-    /// configured target-triple at compile time).
+    /// True for the x86_64 targets.
+    pub fn is_x86_64(self) -> bool {
+        matches!(self, Target::X86_64FreeBSD | Target::X86_64Linux)
+    }
+
+    /// The `atrium-spv-blob` `arch` tag for this target.
+    pub fn blob_arch(self) -> u32 {
+        if self.is_x86_64() {
+            atrium_spv_blob::ARCH_X86_64
+        } else {
+            atrium_spv_blob::ARCH_AARCH64
+        }
+    }
+
+    /// The host's target (from cargo's target triple at
+    /// compile time).
     pub fn host() -> Self {
-        // cfg!() resolves at build time.
         #[cfg(all(target_arch = "aarch64", target_os = "freebsd"))]
         { return Target::Aarch64FreeBSD; }
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         { return Target::Aarch64Darwin; }
         #[cfg(all(target_arch = "x86_64",  target_os = "freebsd"))]
         { return Target::X86_64FreeBSD; }
+        #[cfg(all(target_arch = "x86_64",  target_os = "linux"))]
+        { return Target::X86_64Linux; }
         // Fallback for other dev platforms — Darwin's the
         // most useful for "does it build at all".
         #[cfg(not(any(
             all(target_arch = "aarch64", target_os = "freebsd"),
             all(target_arch = "aarch64", target_os = "macos"),
             all(target_arch = "x86_64",  target_os = "freebsd"),
+            all(target_arch = "x86_64",  target_os = "linux"),
         )))]
         { return Target::Aarch64Darwin; }
     }
+}
+
+/// x86-64 ISA features the emitted code may use.
+///
+/// The flat-blob path forbids relocations, and without these
+/// Cranelift lowers `floor`/`ceil`/`trunc`/`nearest` (SSE4.1)
+/// and `fma` (FMA3) to libcalls, which are relocations. The
+/// baseline is x86-64-v3 (Haswell / Zen 1 and later), which
+/// every machine Atrium targets meets, including the R9700
+/// box. `ATRIUM_SPV_X86_BASELINE` is not consulted: shaders
+/// are cached per machine, and a CPU without these features
+/// is not a supported Tier-2 host.
+const X86_64_ISA_FLAGS: &[&str] = &[
+    "has_sse3", "has_ssse3", "has_sse41", "has_sse42",
+    "has_popcnt", "has_avx", "has_avx2", "has_fma",
+    "has_bmi1", "has_bmi2", "has_lzcnt",
+];
+
+/// f32 -> IEEE half bits (in the low 16 of an i32), round to
+/// nearest even, branch-free integer IR. Overflow goes to
+/// ±inf, NaN to the quiet NaN 0x7e00, and results below the
+/// half normal range become half denormals (via an f32 add
+/// that lets the FPU do the rounding).
+#[doc(hidden)]
+pub fn f32_to_f16_bits(b: &mut FunctionBuilder, x: ClifValue) -> ClifValue {
+    use clif_types::{F32, I32};
+    let f = b.ins().bitcast(I32, MemFlags::new(), x);
+    let sign = b.ins().ushr_imm(f, 16);
+    let sign = b.ins().band_imm(sign, 0x8000);
+    let a = b.ins().band_imm(f, 0x7fff_ffff);
+    // Overflow / inf / NaN.
+    let is_nan = b.ins().icmp_imm(IntCC::UnsignedGreaterThan, a, 0x7f80_0000);
+    let qnan = b.ins().iconst(I32, 0x7e00);
+    let inf = b.ins().iconst(I32, 0x7c00);
+    let big = b.ins().select(is_nan, qnan, inf);
+    // Denormal / zero: abs(x) + 0.5 puts the half mantissa in
+    // the low bits, rounded by the FPU.
+    let af = b.ins().bitcast(F32, MemFlags::new(), a);
+    let half = b.ins().f32const(0.5);
+    let sum = b.ins().fadd(af, half);
+    let sum = b.ins().bitcast(I32, MemFlags::new(), sum);
+    let den = b.ins().iadd_imm(sum, -0x3f00_0000);
+    // Normal: rebias the exponent, add 0xfff plus the parity
+    // bit of the kept mantissa (ties to even), shift down.
+    let odd = b.ins().ushr_imm(a, 13);
+    let odd = b.ins().band_imm(odd, 1);
+    let n = b.ins().iadd_imm(a, 0xc800_0fff_u32 as i32 as i64);
+    let n = b.ins().iadd(n, odd);
+    let n = b.ins().ushr_imm(n, 13);
+    let is_big = b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, a, 0x4780_0000);
+    let is_den = b.ins().icmp_imm(IntCC::UnsignedLessThan, a, 0x3880_0000);
+    let r = b.ins().select(is_den, den, n);
+    let r = b.ins().select(is_big, big, r);
+    b.ins().bor(r, sign)
+}
+
+/// IEEE half bits (low 16 of an i32) -> f32, exact,
+/// branch-free integer IR.
+#[doc(hidden)]
+pub fn f16_bits_to_f32(b: &mut FunctionBuilder, h: ClifValue) -> ClifValue {
+    use clif_types::{F32, I32};
+    let m = b.ins().band_imm(h, 0x7fff);
+    let o = b.ins().ishl_imm(m, 13);
+    let exp = b.ins().band_imm(o, 0x0f80_0000);
+    let o = b.ins().iadd_imm(o, (127 - 15) << 23);
+    // Inf / NaN: exponent all ones -> push it to 255.
+    let o_inf = b.ins().iadd_imm(o, (128 - 16) << 23);
+    // Zero / denormal: renormalise by subtracting 2^-14.
+    let o_den = b.ins().iadd_imm(o, 1 << 23);
+    let o_den = b.ins().bitcast(F32, MemFlags::new(), o_den);
+    let magic = b.ins().f32const(f32::from_bits(113 << 23));
+    let o_den = b.ins().fsub(o_den, magic);
+    let o_den = b.ins().bitcast(I32, MemFlags::new(), o_den);
+    let is_inf = b.ins().icmp_imm(IntCC::Equal, exp, 0x0f80_0000);
+    let is_den = b.ins().icmp_imm(IntCC::Equal, exp, 0);
+    let r = b.ins().select(is_den, o_den, o);
+    let r = b.ins().select(is_inf, o_inf, r);
+    let sign = b.ins().band_imm(h, 0x8000);
+    let sign = b.ins().ishl_imm(sign, 16);
+    let r = b.ins().bor(r, sign);
+    b.ins().bitcast(F32, MemFlags::new(), r)
 }
 
 /// Result of compiling a module.
@@ -171,8 +271,15 @@ pub fn compile(module: &Module, target: Target) -> Result<CompileOutput, Backend
     let triple: Triple = target.triple().parse()
         .map_err(|e| BackendError::Internal(format!("triple parse: {e}")))?;
     let flag_builder = settings::builder();
-    let isa_builder = cranelift_codegen::isa::lookup(triple)
+    let mut isa_builder = cranelift_codegen::isa::lookup(triple)
         .map_err(|e| BackendError::Internal(format!("ISA lookup: {e}")))?;
+    if target.is_x86_64() {
+        use cranelift_codegen::settings::Configurable;
+        for flag in X86_64_ISA_FLAGS {
+            isa_builder.enable(flag).map_err(|e| BackendError::Internal(
+                format!("x86-64 ISA flag {flag}: {e}")))?;
+        }
+    }
     let isa = isa_builder.finish(settings::Flags::new(flag_builder))
         .map_err(|e| BackendError::Internal(format!("ISA finish: {e}")))?;
 
@@ -321,7 +428,7 @@ pub fn compile_blob(module: &Module, target: Target)
     }
 
     let blob = atrium_spv_blob::ShaderBlob {
-        arch: atrium_spv_blob::ARCH_AARCH64,
+        arch: target.blob_arch(),
         code,
         entries,
     };
@@ -1843,13 +1950,43 @@ impl FnTranslator {
                 self.scalars.insert(result.id, v);
                 Ok(())
             }
-            // PackHalf2x16 / UnpackHalf2x16 are bespoke-only:
-            // they need f32<->f16 conversion, and Cranelift's
-            // aarch64 backend doesn't ISLE-lower fdemote.f16 /
-            // fpromote.f16.  The bespoke backend uses the
-            // hardware FCVT instructions; a shader using these
-            // ops therefore runs on the bespoke path only.
-            // (Falls through to the Unsupported catch-all.)
+            // PackHalf2x16 / UnpackHalf2x16: Cranelift doesn't
+            // lower fdemote.f16 / fpromote.f16 on every ISA, so
+            // the f32<->f16 conversions are done in integer IR
+            // (see f32_to_f16_bits / f16_bits_to_f32). Same
+            // results as hardware FCVT (round-to-nearest-even)
+            // for every non-NaN input; NaNs become the quiet
+            // NaN 0x7e00 with the sign kept.
+            Op::PackHalf2x16(v) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("PackHalf2x16 without result".into()))?;
+                let lanes = self.vectors.get(&v.id).cloned().ok_or_else(||
+                    BackendError::Internal(format!(
+                        "PackHalf2x16 operand {:?} not a vector", v.id)))?;
+                if lanes.len() < 2 {
+                    return Err(BackendError::Unsupported(format!(
+                        "PackHalf2x16 needs a vec2, got {} lanes", lanes.len())));
+                }
+                let lo = f32_to_f16_bits(builder, lanes[0]);
+                let hi = f32_to_f16_bits(builder, lanes[1]);
+                let hi = builder.ins().ishl_imm(hi, 16);
+                let v = builder.ins().bor(lo, hi);
+                self.scalars.insert(result.id, v);
+                Ok(())
+            }
+            Op::UnpackHalf2x16(v) => {
+                let result = inst.result.as_ref().ok_or_else(||
+                    BackendError::Internal("UnpackHalf2x16 without result".into()))?;
+                let w = self.scalars.get(&v.id).copied().ok_or_else(||
+                    BackendError::Internal(format!(
+                        "UnpackHalf2x16 operand {:?} not in scalars", v.id)))?;
+                let lo = builder.ins().band_imm(w, 0xffff);
+                let hi = builder.ins().ushr_imm(w, 16);
+                let l0 = f16_bits_to_f32(builder, lo);
+                let l1 = f16_bits_to_f32(builder, hi);
+                self.vectors.insert(result.id, vec![l0, l1]);
+                Ok(())
+            }
             Op::Shl(a, b) => self.emit_int_binop(
                 builder, &inst.result, a, b, |b, x, y| b.ins().ishl(x, y)),
             Op::LShr(a, b) => self.emit_int_binop(

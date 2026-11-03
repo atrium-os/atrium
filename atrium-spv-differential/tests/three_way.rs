@@ -1179,12 +1179,18 @@ fn build_if_else_shader() -> Vec<u8> {
     bytes
 }
 
-fn runners() -> [Box<dyn ShaderRunner>; 3] {
-    [
+/// Every runner this host can execute. Strict mode demands
+/// all of them compile; bespoke (aarch64-only) joins on
+/// aarch64 hosts, so x86_64 checks interpreter ↔ Cranelift.
+fn runners() -> Vec<Box<dyn ShaderRunner>> {
+    let mut rs: Vec<Box<dyn ShaderRunner>> = vec![
         Box::new(InterpreterRunner::default()),
         Box::new(CraneliftRunner::default()),
-        Box::new(BespokeRunner::default()),
-    ]
+    ];
+    if atrium_spv_differential::HOST_HAS_BESPOKE {
+        rs.push(Box::new(BespokeRunner::default()));
+    }
+    rs
 }
 
 #[test]

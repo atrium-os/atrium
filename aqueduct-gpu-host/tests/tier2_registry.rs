@@ -16,19 +16,13 @@ use aqueduct_gpu_host::{Tier2Registry, Tier2ShaderId};
 use atrium_spv_loader::LoaderConfig;
 use tempfile::TempDir;
 
-/// Locate the workspace-built `atrium-spv-compile` binary
-/// the same way atrium-spv-loader's own tests do —
-/// sideways from this test's `current_exe` location into
-/// the sibling crate's debug build.
+/// Locate the `atrium-spv-compile` binary in the sibling
+/// crate's debug build.
 fn locate_compile_binary() -> PathBuf {
-    // current_exe = .../aqueduct-gpu-host/target/debug/deps/tier2_registry-<hash>
-    let here = std::env::current_exe().expect("current_exe");
-    let mut p = here;
-    p.pop(); // deps
-    p.pop(); // debug
-    p.pop(); // target
-    p.pop(); // aqueduct-gpu-host
-    p.pop(); // bsd
+    // Sibling crate's own target dir, found from this crate's
+    // manifest dir (robust to cargo's build-dir layout).
+    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.pop();
     p.push("atrium-spv-compile");
     p.push("target");
     p.push("debug");

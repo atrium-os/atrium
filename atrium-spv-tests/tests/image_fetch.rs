@@ -92,6 +92,7 @@ fn interpreter_image_fetch_at_one_zero() {
             min_filter: FilterMode::Nearest as u32,
             wrap_s: WrapMode::ClampToEdge as u32,
             wrap_t: WrapMode::ClampToEdge as u32,
+            compare_enable: 0, compare_op: 0,
         },
     };
     let inputs = ShaderInputs {

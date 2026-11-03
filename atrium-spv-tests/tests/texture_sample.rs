@@ -98,6 +98,7 @@ fn interpreter_bilinear_centre_of_rgbw_checker() {
             min_filter: FilterMode::Linear as u32,
             wrap_s: WrapMode::ClampToEdge as u32,
             wrap_t: WrapMode::ClampToEdge as u32,
+            compare_enable: 0, compare_op: 0,
         },
     };
     let inputs = ShaderInputs {

@@ -248,6 +248,7 @@ fn parse_target(s: &str) -> Result<Target, String> {
         "aarch64-unknown-freebsd" => Ok(Target::Aarch64FreeBSD),
         "aarch64-apple-darwin"    => Ok(Target::Aarch64Darwin),
         "x86_64-unknown-freebsd"  => Ok(Target::X86_64FreeBSD),
+        "x86_64-unknown-linux-gnu" => Ok(Target::X86_64Linux),
         other => Err(format!("unknown --target {other}")),
     }
 }
@@ -257,7 +258,7 @@ fn print_usage() {
         "Usage: atrium-spv-compile \\\n  \
            --input <SPIR-V file> \\\n  \
            --output-dir <cache dir> \\\n  \
-           [--target <aarch64-unknown-freebsd|aarch64-apple-darwin|x86_64-unknown-freebsd>] \\\n  \
+           [--target <aarch64-unknown-freebsd|aarch64-apple-darwin|x86_64-unknown-freebsd|x86_64-unknown-linux-gnu>] \\\n  \
            [--hash <override sha256 hex>] \\\n  \
            [--spec-const SPECID=VALUE]... \\\n  \
            [--force-backend bespoke|cranelift]\n\
@@ -365,7 +366,7 @@ fn run(args: &Args) -> Result<CompileReport, CompileError> {
     let bespoke_target: Option<BespokeTarget> = match args.target {
         Target::Aarch64FreeBSD => Some(BespokeTarget::Aarch64FreeBSD),
         Target::Aarch64Darwin  => Some(BespokeTarget::Aarch64Darwin),
-        Target::X86_64FreeBSD  => None,
+        Target::X86_64FreeBSD | Target::X86_64Linux => None,
     };
 
     // Both backends now emit a flat `atrium-spv-blob`

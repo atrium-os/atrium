@@ -5,6 +5,9 @@
 //! output pointer. First proof that the bespoke perf-path
 //! produces runnable code.
 
+// Executes the emitted AArch64 code, so only on aarch64 hosts.
+#![cfg(target_arch = "aarch64")]
+
 use std::process::Command;
 
 use atrium_spv_backend_bespoke::{compile, Target};
@@ -360,6 +363,7 @@ fn bespoke_shader_runs_two_block_branch() {
             input_varying_byte_offset: std::collections::HashMap::new(),
             frag_depth_output: None,
             varying_output_bytes: 0,
+            scratch_bytes: 0,
         }],
         entry_points: vec![EntryPoint {
             stage: ShaderStage::Fragment,

@@ -57,6 +57,7 @@ fn build_minimal_fragment_module() -> Module {
             input_varying_byte_offset: std::collections::HashMap::new(),
             frag_depth_output: None,
             varying_output_bytes: 0,
+            scratch_bytes: 0,
     };
     Module {
         functions: vec![func],

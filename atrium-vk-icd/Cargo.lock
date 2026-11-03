@@ -110,9 +110,13 @@ dependencies = [
  "aqueduct",
  "aqueduct-gpu",
  "ash",
+ "atrium-spv-frontend",
+ "atrium-spv-ir",
  "atrium-spv-loader",
  "atrium-spv-runtime",
+ "carillon-transport",
  "env_logger",
+ "libc",
  "log",
  "postcard",
  "rayon",
@@ -156,6 +160,14 @@ dependencies = [
 [[package]]
 name = "atrium-spv-blob"
 version = "0.1.0"
+
+[[package]]
+name = "atrium-spv-frontend"
+version = "0.1.0"
+dependencies = [
+ "atrium-spv-ir",
+ "rspirv",
+]
 
 [[package]]
 name = "atrium-spv-ir"
@@ -232,6 +244,13 @@ name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+
+[[package]]
+name = "carillon-transport"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "cfg-if"

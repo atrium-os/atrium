@@ -29,7 +29,7 @@
 //! +-----------+-----------------------------------------+
 //! | 0..8      | "ATRMBLOB" (magic; 8 ASCII bytes)       |
 //! | 8..12     | version  (u32 LE) — currently 1         |
-//! | 12..16    | arch     (u32 LE) — 0 = aarch64         |
+//! | 12..16    | arch     (u32 LE) — 0 = aarch64, 1 = x86_64 |
 //! | 16..20    | flags    (u32 LE) — reserved, 0         |
 //! | 20..24    | code_len (u32 LE)                       |
 //! | 24..28    | vs_off   (u32 LE; u32::MAX = absent)    |
@@ -43,7 +43,7 @@
 //!
 //! `HEADER_SIZE` is 48 so the code starts 16-byte aligned.
 //! Each present entry offset is a byte offset into `code`
-//! and is 4-byte aligned (ARM64 instruction width). A flat
+//! and, on aarch64, is 4-byte aligned (instruction width). A flat
 //! AAPCS64 code blob is **OS-agnostic** — only `arch`
 //! distinguishes targets, not FreeBSD-vs-Darwin.
 //!
@@ -85,6 +85,24 @@ pub const HEADER_SIZE: usize = 48;
 /// only architecture the bespoke backend targets.
 pub const ARCH_AARCH64: u32 = 0;
 
+/// `arch` value for x86-64 (System V AMD64 ABI). Emitted by
+/// the Cranelift backend's x86_64 targets. x86 instructions
+/// are variable-length, so entry offsets carry no alignment
+/// requirement.
+pub const ARCH_X86_64: u32 = 1;
+
+/// The `arch` tag of code this process can execute, or
+/// `None` on an architecture tier-2 doesn't generate for.
+pub const fn host_arch() -> Option<u32> {
+    if cfg!(target_arch = "aarch64") {
+        Some(ARCH_AARCH64)
+    } else if cfg!(target_arch = "x86_64") {
+        Some(ARCH_X86_64)
+    } else {
+        None
+    }
+}
+
 /// Sentinel in an entry-offset slot meaning "this stage's
 /// entry point is not present in this blob".
 const ENTRY_ABSENT: u32 = u32::MAX;
@@ -118,8 +136,8 @@ impl EntryOffsets {
 /// A parsed (or about-to-be-serialised) shader blob.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShaderBlob {
-    /// Target architecture — currently always
-    /// [`ARCH_AARCH64`].
+    /// Target architecture: [`ARCH_AARCH64`] or
+    /// [`ARCH_X86_64`].
     pub arch: u32,
     /// Position-independent native code. Branches are
     /// already PC-relative and patched; there are no
@@ -177,16 +195,17 @@ impl ShaderBlob {
             });
         }
         // Resolve an entry slot: ENTRY_ABSENT → None;
-        // otherwise it must be a 4-aligned offset strictly
-        // inside the code (an entry points *at* an
-        // instruction).
+        // otherwise it must be an offset strictly inside the
+        // code (an entry points *at* an instruction), and
+        // 4-aligned on AArch64 (fixed-width instructions).
         let entry = |slot: u32, stage: Stage|
             -> Result<Option<u32>, ParseError>
         {
             if slot == ENTRY_ABSENT {
                 return Ok(None);
             }
-            if slot % 4 != 0 || (slot as usize) >= code_len {
+            let misaligned = arch == ARCH_AARCH64 && slot % 4 != 0;
+            if misaligned || (slot as usize) >= code_len {
                 return Err(ParseError::EntryOutOfRange {
                     stage, offset: slot, code_len: code_len as u32,
                 });
@@ -368,5 +387,15 @@ mod tests {
             EntryOffsets { fs: Some(2), ..Default::default() });
         assert!(matches!(ShaderBlob::from_bytes(&blob.to_bytes()),
                          Err(ParseError::EntryOutOfRange { .. })));
+    }
+
+    #[test]
+    fn x86_64_entries_need_no_alignment() {
+        let blob = ShaderBlob {
+            arch: ARCH_X86_64,
+            code: vec![0u8; 16],
+            entries: EntryOffsets { fs: Some(3), ..Default::default() },
+        };
+        assert_eq!(ShaderBlob::from_bytes(&blob.to_bytes()).unwrap(), blob);
     }
 }

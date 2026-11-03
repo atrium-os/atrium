@@ -11,9 +11,10 @@ use atrium_spv_loader::LoaderConfig;
 use tempfile::TempDir;
 
 fn locate_compile_binary() -> PathBuf {
-    let here = std::env::current_exe().expect("current_exe");
-    let mut p = here;
-    p.pop(); p.pop(); p.pop(); p.pop(); p.pop();
+    // Sibling crate's own target dir, found from this crate's
+    // manifest dir (robust to cargo's build-dir layout).
+    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.pop();
     p.push("atrium-spv-compile");
     p.push("target");
     p.push("debug");

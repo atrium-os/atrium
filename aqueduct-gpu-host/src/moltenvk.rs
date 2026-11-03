@@ -230,6 +230,12 @@ type SetWorkgroupSizeMvk = extern "C" fn(vk::ShaderModule, u32, u32, u32);
 /// A symbol of the libMoltenVK image this process has loaded (the Vulkan
 /// loader opens the ICD privately, so it is not in the global namespace):
 /// the image found by name among the loaded ones, reopened NOLOAD.
+#[cfg(not(target_os = "macos"))]
+fn moltenvk_symbol(_name: &std::ffi::CStr) -> Option<*mut std::ffi::c_void> {
+    None // MoltenVK exists only on macOS.
+}
+
+#[cfg(target_os = "macos")]
 fn moltenvk_symbol(name: &std::ffi::CStr) -> Option<*mut std::ffi::c_void> {
     extern "C" {
         fn _dyld_image_count() -> u32;
@@ -2856,11 +2862,21 @@ impl MoltenVkBackend {
 
     /// Now on the host clock the present times use (mach_absolute_time in
     /// ns — CACurrentMediaTime's, MTLDrawable.presentedTime's).
+    #[cfg(target_os = "macos")]
     pub fn host_time_ns() -> u64 {
         extern "C" { fn mach_absolute_time() -> u64; fn mach_timebase_info(info: *mut [u32; 2]) -> i32; }
         static TB: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
         let (n, d) = *TB.get_or_init(|| { let mut i = [0u32; 2]; unsafe { mach_timebase_info(&mut i) }; (i[0].max(1), i[1].max(1)) });
         (unsafe { mach_absolute_time() } as u128 * n as u128 / d as u128) as u64
+    }
+
+    /// Now on the host's monotonic clock (non-macOS hosts, where
+    /// Vulkan present timing is also CLOCK_MONOTONIC-based).
+    #[cfg(not(target_os = "macos"))]
+    pub fn host_time_ns() -> u64 {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
     }
 
     /// The `id<MTLDevice>` and the frame queue's `id<MTLCommandQueue>`

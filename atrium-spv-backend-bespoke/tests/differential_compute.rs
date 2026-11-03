@@ -34,6 +34,12 @@ fn link_to_shared_library(obj: &Path, out: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Bespoke emits AArch64 only. On other hosts the "bespoke"
+/// side of every diff runs Cranelift for the host instead, so
+/// the pairwise diff is vacuous there and only each test's
+/// pinned expected values check the x86_64 code.
+const HOST_HAS_BESPOKE: bool = cfg!(target_arch = "aarch64");
+
 type CsMain = unsafe extern "C" fn(
     *const u8, *const u8, *mut u8,
     u32, u32, u32, u32, u32, u32, *mut u8);
@@ -59,7 +65,7 @@ fn invoke_with_gids(spv: &[u8], use_bespoke: bool, dir: &Path, name: &str,
     // that declare no Workgroup-storage variables).
     let wg_bytes = module.functions.first()
         .map(|f| f.workgroup_size as usize).unwrap_or(0);
-    let obj = if use_bespoke {
+    let obj = if use_bespoke && HOST_HAS_BESPOKE {
         let t = if cfg!(target_os = "macos") {
             BespokeTarget::Aarch64Darwin
         } else { BespokeTarget::Aarch64FreeBSD };
@@ -2741,10 +2747,17 @@ fn lse_atomics_are_race_safe_under_concurrent_threads() {
 
     let dir = TempDir::new().unwrap();
     let module = translate(&spv).expect("frontend");
-    let target = if cfg!(target_os = "macos") {
-        BespokeTarget::Aarch64Darwin
-    } else { BespokeTarget::Aarch64FreeBSD };
-    let obj = bespoke_compile(&module, target).expect("compile").object;
+    // aarch64: bespoke's LSE atomics. x86_64: Cranelift's
+    // LOCK-prefixed atomics, same race-safety bar.
+    let obj = if HOST_HAS_BESPOKE {
+        let target = if cfg!(target_os = "macos") {
+            BespokeTarget::Aarch64Darwin
+        } else { BespokeTarget::Aarch64FreeBSD };
+        bespoke_compile(&module, target).expect("compile").object
+    } else {
+        cranelift_compile(&module, CraneliftTarget::host())
+            .expect("cranelift compile").object
+    };
     let obj_path = dir.path().join("atomic_race.o");
     std::fs::write(&obj_path, &obj).unwrap();
     let ext = if cfg!(target_os = "macos") { "dylib" } else { "so" };
@@ -5069,7 +5082,7 @@ fn invoke_compute_image(
         atrium_img_read_3d_lod, atrium_img_write_3d_lod,
     };
     let module = translate(spv).expect("frontend");
-    let obj = if use_bespoke {
+    let obj = if use_bespoke && HOST_HAS_BESPOKE {
         let t = if cfg!(target_os = "macos") {
             BespokeTarget::Aarch64Darwin
         } else { BespokeTarget::Aarch64FreeBSD };
@@ -5789,7 +5802,7 @@ fn differential_storage_image_mip_lod_read_write() {
     let run_one = |use_bespoke: bool, name: &str| -> [f32; 2] {
         let dir = TempDir::new().unwrap();
         let module = translate(&spv).expect("frontend");
-        let obj = if use_bespoke {
+        let obj = if use_bespoke && HOST_HAS_BESPOKE {
             let t = if cfg!(target_os = "macos") {
                 BespokeTarget::Aarch64Darwin
             } else { BespokeTarget::Aarch64FreeBSD };
@@ -6691,7 +6704,7 @@ fn differential_spec_constant_op() {
         let dir = TempDir::new().unwrap();
         let module = atrium_spv_frontend::translate_with_spec_overrides(
             &spv, &overrides).expect("frontend");
-        let obj = if use_bespoke {
+        let obj = if use_bespoke && HOST_HAS_BESPOKE {
             let t = if cfg!(target_os = "macos") {
                 BespokeTarget::Aarch64Darwin
             } else { BespokeTarget::Aarch64FreeBSD };
@@ -6811,7 +6824,7 @@ fn differential_spec_constants_host_overrides() {
         let dir = TempDir::new().unwrap();
         let module = atrium_spv_frontend::translate_with_spec_overrides(
             &spv, &overrides).expect("frontend");
-        let obj = if use_bespoke {
+        let obj = if use_bespoke && HOST_HAS_BESPOKE {
             let t = if cfg!(target_os = "macos") {
                 BespokeTarget::Aarch64Darwin
             } else { BespokeTarget::Aarch64FreeBSD };
@@ -8188,7 +8201,7 @@ fn differential_local_invocation_index_linearises() {
 fn invoke_cs_main_with_lids(spv: &[u8], use_bespoke: bool, dir: &Path, name: &str,
                             out_ptr: *mut u8, lids: &[(u32, u32, u32)]) {
     let module = translate(spv).expect("frontend");
-    let obj = if use_bespoke {
+    let obj = if use_bespoke && HOST_HAS_BESPOKE {
         let t = if cfg!(target_os = "macos") {
             BespokeTarget::Aarch64Darwin
         } else { BespokeTarget::Aarch64FreeBSD };

@@ -112,6 +112,7 @@ fn texture_sample_centre_rgbw() {
         min_filter: FilterMode::Linear as u32,
         wrap_s: WrapMode::ClampToEdge as u32,
         wrap_t: WrapMode::ClampToEdge as u32,
+        compare_enable: 0, compare_op: 0,
     };
 
     // Build the uniforms buffer per the v1 ABI: helper
@@ -128,7 +129,9 @@ fn texture_sample_centre_rgbw() {
             atrium_spv_runtime::atrium_tex_sample_cube,
             atrium_spv_runtime::atrium_tex_gather_2d,
             atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
-            atrium_spv_runtime::atrium_tex_sample_cube_lod);
+            atrium_spv_runtime::atrium_tex_sample_cube_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_dref,
+            atrium_spv_runtime::atrium_deriv);
         write_descriptor_slot(&mut uniforms, 0,
             &tex_desc as *const _, &samp_desc as *const _);
     }
@@ -213,6 +216,7 @@ fn texture_sample_rgba32f_exact_roundtrip() {
         min_filter: FilterMode::Linear as u32,
         wrap_s: WrapMode::ClampToEdge as u32,
         wrap_t: WrapMode::ClampToEdge as u32,
+        compare_enable: 0, compare_op: 0,
     };
     let mut uniforms = descriptor_table_buffer(1);
     unsafe {
@@ -224,7 +228,9 @@ fn texture_sample_rgba32f_exact_roundtrip() {
             atrium_spv_runtime::atrium_tex_sample_cube,
             atrium_spv_runtime::atrium_tex_gather_2d,
             atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
-            atrium_spv_runtime::atrium_tex_sample_cube_lod);
+            atrium_spv_runtime::atrium_tex_sample_cube_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_dref,
+            atrium_spv_runtime::atrium_deriv);
         write_descriptor_slot(&mut uniforms, 0,
             &tex_desc as *const _, &samp_desc as *const _);
     }
@@ -254,7 +260,7 @@ fn texture_sample_rgba32f_exact_roundtrip() {
 
     // Pin the absolute values: must match the input exactly
     // (single texel, no filtering blend).
-    let out = BespokeRunner::default().run(&spirv, &inputs).unwrap();
+    let out = atrium_spv_differential::native_runner().run(&spirv, &inputs).unwrap();
     let p = &out.pixels[0];
     assert_eq!(p[0], -3.14);
     assert_eq!(p[1],  0.0);
@@ -283,6 +289,7 @@ fn texture_sample_r8unorm_replicates_red_alpha_one() {
         min_filter: FilterMode::Linear as u32,
         wrap_s: WrapMode::ClampToEdge as u32,
         wrap_t: WrapMode::ClampToEdge as u32,
+        compare_enable: 0, compare_op: 0,
     };
     let mut uniforms = descriptor_table_buffer(1);
     unsafe {
@@ -294,7 +301,9 @@ fn texture_sample_r8unorm_replicates_red_alpha_one() {
             atrium_spv_runtime::atrium_tex_sample_cube,
             atrium_spv_runtime::atrium_tex_gather_2d,
             atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
-            atrium_spv_runtime::atrium_tex_sample_cube_lod);
+            atrium_spv_runtime::atrium_tex_sample_cube_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_dref,
+            atrium_spv_runtime::atrium_deriv);
         write_descriptor_slot(&mut uniforms, 0,
             &tex_desc as *const _, &samp_desc as *const _);
     }
@@ -322,7 +331,7 @@ fn texture_sample_r8unorm_replicates_red_alpha_one() {
     let tol = atrium_spv_tests::pixels::ColorTolerance::AbsEpsilon { eps: 1e-6 };
     assert_shader_agrees(&spirv, &inputs, tol, &refs);
 
-    let out = BespokeRunner::default().run(&spirv, &inputs).unwrap();
+    let out = atrium_spv_differential::native_runner().run(&spirv, &inputs).unwrap();
     let p = &out.pixels[0];
     assert!((p[0] - 200.0 / 255.0).abs() < 1e-6,
         "R: expected 200/255, got {}", p[0]);
@@ -351,6 +360,7 @@ fn texture_sample_rgba8srgb_exact_roundtrip() {
         min_filter: FilterMode::Linear as u32,
         wrap_s: WrapMode::ClampToEdge as u32,
         wrap_t: WrapMode::ClampToEdge as u32,
+        compare_enable: 0, compare_op: 0,
     };
     let mut uniforms = descriptor_table_buffer(1);
     unsafe {
@@ -362,7 +372,9 @@ fn texture_sample_rgba8srgb_exact_roundtrip() {
             atrium_spv_runtime::atrium_tex_sample_cube,
             atrium_spv_runtime::atrium_tex_gather_2d,
             atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
-            atrium_spv_runtime::atrium_tex_sample_cube_lod);
+            atrium_spv_runtime::atrium_tex_sample_cube_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_dref,
+            atrium_spv_runtime::atrium_deriv);
         write_descriptor_slot(&mut uniforms, 0,
             &tex_desc as *const _, &samp_desc as *const _);
     }
@@ -392,7 +404,7 @@ fn texture_sample_rgba8srgb_exact_roundtrip() {
     assert_shader_agrees(&spirv, &inputs, tol, &refs);
 
     // Pin the linear values: R/G/B de-gamma'd, A linear.
-    let out = BespokeRunner::default().run(&spirv, &inputs).unwrap();
+    let out = atrium_spv_differential::native_runner().run(&spirv, &inputs).unwrap();
     let p = &out.pixels[0];
     for k in 0..3 {
         assert!((p[k] - 0.21586).abs() < 1e-4,
@@ -431,6 +443,7 @@ fn texture_sample_rgba16f_exact_roundtrip() {
         min_filter: FilterMode::Linear as u32,
         wrap_s: WrapMode::ClampToEdge as u32,
         wrap_t: WrapMode::ClampToEdge as u32,
+        compare_enable: 0, compare_op: 0,
     };
     let mut uniforms = descriptor_table_buffer(1);
     unsafe {
@@ -442,7 +455,9 @@ fn texture_sample_rgba16f_exact_roundtrip() {
             atrium_spv_runtime::atrium_tex_sample_cube,
             atrium_spv_runtime::atrium_tex_gather_2d,
             atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
-            atrium_spv_runtime::atrium_tex_sample_cube_lod);
+            atrium_spv_runtime::atrium_tex_sample_cube_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_dref,
+            atrium_spv_runtime::atrium_deriv);
         write_descriptor_slot(&mut uniforms, 0,
             &tex_desc as *const _, &samp_desc as *const _);
     }
@@ -473,7 +488,7 @@ fn texture_sample_rgba16f_exact_roundtrip() {
     // Pin via bespoke (the f16 decoder ran via real
     // function call); values are exactly f16-representable
     // so no rounding error.
-    let out = BespokeRunner::default().run(&spirv, &inputs).unwrap();
+    let out = atrium_spv_differential::native_runner().run(&spirv, &inputs).unwrap();
     let p = &out.pixels[0];
     assert_eq!(p[0],  1.0);
     assert_eq!(p[1], -1.0);
@@ -590,6 +605,7 @@ fn texture_sample_tinted() {
         min_filter: FilterMode::Nearest as u32,
         wrap_s: WrapMode::ClampToEdge as u32,
         wrap_t: WrapMode::ClampToEdge as u32,
+        compare_enable: 0, compare_op: 0,
     };
     let mut uniforms = descriptor_table_buffer(1);
     unsafe {
@@ -601,7 +617,9 @@ fn texture_sample_tinted() {
             atrium_spv_runtime::atrium_tex_sample_cube,
             atrium_spv_runtime::atrium_tex_gather_2d,
             atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
-            atrium_spv_runtime::atrium_tex_sample_cube_lod);
+            atrium_spv_runtime::atrium_tex_sample_cube_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_dref,
+            atrium_spv_runtime::atrium_deriv);
         write_descriptor_slot(&mut uniforms, 0,
             &tex_desc as *const _, &samp_desc as *const _);
     }
@@ -731,6 +749,7 @@ fn run_dref_shader(dref_val: f32, expected: f32) {
         min_filter: FilterMode::Nearest as u32,
         wrap_s: WrapMode::ClampToEdge as u32,
         wrap_t: WrapMode::ClampToEdge as u32,
+        compare_enable: 0, compare_op: 0,
     };
     let mut uniforms = descriptor_table_buffer(1);
     unsafe {
@@ -742,7 +761,9 @@ fn run_dref_shader(dref_val: f32, expected: f32) {
             atrium_spv_runtime::atrium_tex_sample_cube,
             atrium_spv_runtime::atrium_tex_gather_2d,
             atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
-            atrium_spv_runtime::atrium_tex_sample_cube_lod);
+            atrium_spv_runtime::atrium_tex_sample_cube_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_dref,
+            atrium_spv_runtime::atrium_deriv);
         write_descriptor_slot(&mut uniforms, 0,
             &tex_desc as *const _, &samp_desc as *const _);
     }
@@ -775,7 +796,7 @@ fn run_dref_shader(dref_val: f32, expected: f32) {
     assert_shader_agrees(&spirv, &inputs, tol, &refs);
 
     // Pin against the bespoke runner directly (skip interp).
-    let out = BespokeRunner::default().run(&spirv, &inputs).unwrap();
+    let out = atrium_spv_differential::native_runner().run(&spirv, &inputs).unwrap();
     let p = &out.pixels[0];
     assert!((p[0] - expected).abs() < 1e-6,
         "dref={dref_val} expected {expected}, got {} (full {:?})",
@@ -863,6 +884,7 @@ fn run_proj_dref_shader(dref_val: f32, expected: f32) {
         min_filter: FilterMode::Nearest as u32,
         wrap_s: WrapMode::ClampToEdge as u32,
         wrap_t: WrapMode::ClampToEdge as u32,
+        compare_enable: 0, compare_op: 0,
     };
     let mut uniforms = descriptor_table_buffer(1);
     unsafe {
@@ -874,7 +896,9 @@ fn run_proj_dref_shader(dref_val: f32, expected: f32) {
             atrium_spv_runtime::atrium_tex_sample_cube,
             atrium_spv_runtime::atrium_tex_gather_2d,
             atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
-            atrium_spv_runtime::atrium_tex_sample_cube_lod);
+            atrium_spv_runtime::atrium_tex_sample_cube_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_dref,
+            atrium_spv_runtime::atrium_deriv);
         write_descriptor_slot(&mut uniforms, 0,
             &tex_desc as *const _, &samp_desc as *const _);
     }
@@ -902,7 +926,7 @@ fn run_proj_dref_shader(dref_val: f32, expected: f32) {
     let tol = atrium_spv_tests::pixels::ColorTolerance::AbsEpsilon { eps: 1e-6 };
     assert_shader_agrees(&spirv, &inputs, tol, &refs);
 
-    let out = BespokeRunner::default().run(&spirv, &inputs).unwrap();
+    let out = atrium_spv_differential::native_runner().run(&spirv, &inputs).unwrap();
     let p = &out.pixels[0];
     assert!((p[0] - expected).abs() < 1e-6,
         "dref={dref_val} expected {expected}, got {} (full {:?})",
@@ -1002,6 +1026,7 @@ fn texture_dref_gather_counts_match() {
         min_filter: FilterMode::Nearest as u32,
         wrap_s: WrapMode::ClampToEdge as u32,
         wrap_t: WrapMode::ClampToEdge as u32,
+        compare_enable: 0, compare_op: 0,
     };
     let mut uniforms = descriptor_table_buffer(1);
     unsafe {
@@ -1013,7 +1038,9 @@ fn texture_dref_gather_counts_match() {
             atrium_spv_runtime::atrium_tex_sample_cube,
             atrium_spv_runtime::atrium_tex_gather_2d,
             atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
-            atrium_spv_runtime::atrium_tex_sample_cube_lod);
+            atrium_spv_runtime::atrium_tex_sample_cube_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_dref,
+            atrium_spv_runtime::atrium_deriv);
         write_descriptor_slot(&mut uniforms, 0,
             &tex_desc as *const _, &samp_desc as *const _);
     }
@@ -1038,7 +1065,12 @@ fn texture_dref_gather_counts_match() {
     let refs: Vec<&dyn ShaderRunner> =
         runners.iter().map(|b| b.as_ref()).collect();
     let tol = atrium_spv_tests::pixels::ColorTolerance::AbsEpsilon { eps: 1e-6 };
-    assert_shader_agrees(&spirv, &inputs, tol, &refs);
+    // The interpreter doesn't do gather-dref, so the
+    // comparison needs bespoke; on other hosts the pin below
+    // still checks Cranelift's answer.
+    if atrium_spv_differential::HOST_HAS_BESPOKE {
+        assert_shader_agrees(&spirv, &inputs, tol, &refs);
+    }
 
     // Pin via cranelift: must be exactly 2 lanes == 1.0 (the
     // texels 0.2 and 0.5 satisfy ≤ 0.6).
@@ -1153,6 +1185,7 @@ fn texture_sample_proj_explicit_lod() {
         min_filter: FilterMode::Linear as u32,
         wrap_s: WrapMode::ClampToEdge as u32,
         wrap_t: WrapMode::ClampToEdge as u32,
+        compare_enable: 0, compare_op: 0,
     };
     let mut uniforms = descriptor_table_buffer(1);
     unsafe {
@@ -1164,7 +1197,9 @@ fn texture_sample_proj_explicit_lod() {
             atrium_spv_runtime::atrium_tex_sample_cube,
             atrium_spv_runtime::atrium_tex_gather_2d,
             atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
-            atrium_spv_runtime::atrium_tex_sample_cube_lod);
+            atrium_spv_runtime::atrium_tex_sample_cube_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_dref,
+            atrium_spv_runtime::atrium_deriv);
         write_descriptor_slot(&mut uniforms, 0,
             &tex_desc as *const _, &samp_desc as *const _);
     }
@@ -1282,6 +1317,7 @@ fn texture_query_lod_returns_zero_vec2() {
         min_filter: FilterMode::Linear as u32,
         wrap_s: WrapMode::ClampToEdge as u32,
         wrap_t: WrapMode::ClampToEdge as u32,
+        compare_enable: 0, compare_op: 0,
     };
     let mut uniforms = descriptor_table_buffer(1);
     unsafe {
@@ -1293,7 +1329,9 @@ fn texture_query_lod_returns_zero_vec2() {
             atrium_spv_runtime::atrium_tex_sample_cube,
             atrium_spv_runtime::atrium_tex_gather_2d,
             atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
-            atrium_spv_runtime::atrium_tex_sample_cube_lod);
+            atrium_spv_runtime::atrium_tex_sample_cube_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_dref,
+            atrium_spv_runtime::atrium_deriv);
         write_descriptor_slot(&mut uniforms, 0,
             &tex_desc as *const _, &samp_desc as *const _);
     }
@@ -1414,6 +1452,7 @@ fn texture_sample_proj_implicit_lod() {
         min_filter: FilterMode::Linear as u32,
         wrap_s: WrapMode::ClampToEdge as u32,
         wrap_t: WrapMode::ClampToEdge as u32,
+        compare_enable: 0, compare_op: 0,
     };
     let mut uniforms = descriptor_table_buffer(1);
     unsafe {
@@ -1425,7 +1464,9 @@ fn texture_sample_proj_implicit_lod() {
             atrium_spv_runtime::atrium_tex_sample_cube,
             atrium_spv_runtime::atrium_tex_gather_2d,
             atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
-            atrium_spv_runtime::atrium_tex_sample_cube_lod);
+            atrium_spv_runtime::atrium_tex_sample_cube_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_dref,
+            atrium_spv_runtime::atrium_deriv);
         write_descriptor_slot(&mut uniforms, 0,
             &tex_desc as *const _, &samp_desc as *const _);
     }
@@ -1550,6 +1591,7 @@ fn texture_sample_implicit_lod_with_bias() {
         min_filter: FilterMode::Linear as u32,
         wrap_s: WrapMode::ClampToEdge as u32,
         wrap_t: WrapMode::ClampToEdge as u32,
+        compare_enable: 0, compare_op: 0,
     };
     let mut uniforms = descriptor_table_buffer(1);
     unsafe {
@@ -1561,7 +1603,9 @@ fn texture_sample_implicit_lod_with_bias() {
             atrium_spv_runtime::atrium_tex_sample_cube,
             atrium_spv_runtime::atrium_tex_gather_2d,
             atrium_spv_runtime::atrium_tex_sample_2d_array_lod,
-            atrium_spv_runtime::atrium_tex_sample_cube_lod);
+            atrium_spv_runtime::atrium_tex_sample_cube_lod,
+            atrium_spv_runtime::atrium_tex_sample_2d_dref,
+            atrium_spv_runtime::atrium_deriv);
         write_descriptor_slot(&mut uniforms, 0,
             &tex_desc as *const _, &samp_desc as *const _);
     }

@@ -6,6 +6,9 @@
 //! W^X dance the loader's jitmap uses) and calls both entries
 //! directly.
 
+// Executes the emitted AArch64 code, so only on aarch64 hosts.
+#![cfg(target_arch = "aarch64")]
+
 use atrium_spv_backend_bespoke::{compile_blob, Target};
 use atrium_spv_frontend::translate;
 use atrium_spv_blob::ShaderBlob;

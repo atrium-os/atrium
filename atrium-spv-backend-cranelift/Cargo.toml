@@ -17,7 +17,9 @@ atrium-spv-blob     = { path = "../atrium-spv-blob" }
 # compute-side image-table layout constants Op::Barrier and
 # the storage-image ops dereference against (Arc 150).
 atrium-spv-runtime  = { path = "../atrium-spv-runtime" }
-cranelift-codegen   = { version = "0.131", features = ["std"] }
+# Both ISAs, whatever the host: tier-2 compiles for aarch64 and
+# x86_64, and the differential tests cross-check them.
+cranelift-codegen   = { version = "0.131", features = ["std", "arm64", "x86"] }
 cranelift-module    = { version = "0.131", features = ["std"] }
 cranelift-object    = "0.131"
 cranelift-frontend  = "0.131"
@@ -32,4 +34,5 @@ atrium-spv-pcmap    = { path = "../atrium-spv-pcmap" }
 atrium-spv-tests    = { path = "../atrium-spv-tests" }
 rspirv              = "0.13"
 libloading          = "0.8"
+cranelift-native    = "0.131"
 tempfile            = "3"

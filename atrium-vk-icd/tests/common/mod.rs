@@ -66,9 +66,10 @@ pub fn tmp_socket(name: &str) -> PathBuf {
 /// spawns to lower SPIR-V.  Located next to our own test
 /// binary's target/debug/ tree.
 pub fn locate_compile_binary() -> PathBuf {
-    let here = std::env::current_exe().expect("current_exe");
-    let mut p = here;
-    p.pop(); p.pop(); p.pop(); p.pop(); p.pop();
+    // Sibling crate's own target dir, found from this crate's
+    // manifest dir (robust to cargo's build-dir layout).
+    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.pop();
     p.push("atrium-spv-compile");
     p.push("target");
     p.push("debug");

@@ -59,15 +59,10 @@ fn build_constant_color_spirv(rgba: [f32; 4]) -> Vec<u8> {
 }
 
 fn binary_path() -> std::path::PathBuf {
-    // Cargo gives us the workspace target dir via env at
-    // test-build time. Cross-platform: the binary lives
-    // next to the test executable in target/<profile>/.
-    let mut p = std::env::current_exe().unwrap();
-    // current_exe points to .../target/debug/deps/<name>-<hash>
-    // pop the hash, the `deps`, leaving target/debug
-    p.pop(); p.pop();
-    p.push("atrium-spv-compile");
-    p
+    // Cargo builds the crate's binary for integration tests
+    // and names its path here, whatever the target/build-dir
+    // layout.
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_atrium-spv-compile"))
 }
 
 #[test]
@@ -281,9 +276,11 @@ fn binary_emits_metrics_json_on_stderr() {
     // ARM64 backend's opcode surface, and atrium-spv-compile
     // tries bespoke first (spec §2 production order), so the
     // metrics line must report the bespoke backend — not the
-    // Cranelift fallback.
-    assert!(stderr.contains("\"backend\":\"bespoke\""),
-            "expected bespoke backend, got: {stderr}");
+    // Cranelift fallback. On x86_64 hosts there is no
+    // bespoke port, so Cranelift is the only backend.
+    let want = if cfg!(target_arch = "aarch64") { "bespoke" } else { "cranelift" };
+    assert!(stderr.contains(&format!("\"backend\":\"{want}\"")),
+            "expected {want} backend, got: {stderr}");
     // Microsecond resolution: with `cc` gone the whole
     // compile is sub-millisecond, so `compile_ms` would
     // truncate to a near-useless integer.

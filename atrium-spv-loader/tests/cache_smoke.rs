@@ -69,19 +69,10 @@ fn build_constant_color_spirv(rgba: [f32; 4]) -> Vec<u8> {
 /// "binary missing" error rather than a confusing dlopen
 /// failure later.
 fn locate_compile_binary() -> PathBuf {
-    // current_exe is at
-    //   .../atrium-spv-loader/target/debug/deps/cache_smoke-<hash>
-    // We need
-    //   .../atrium-spv-compile/target/debug/atrium-spv-compile
-    let here = std::env::current_exe().expect("current_exe");
-    let mut p = here;
-    // current_exe = .../atrium-spv-loader/target/debug/deps/cache_smoke-<hash>
-    p.pop();   // .../target/debug/deps
-    p.pop();   // .../target/debug
-    p.pop();   // .../target
-    p.pop();   // .../atrium-spv-loader
-    p.pop();   // .../bsd
-    // sideways into sibling crate
+    // Sibling crate's own target dir, located from this
+    // crate's manifest dir (robust to cargo's build-dir layout).
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.pop();
     p.push("atrium-spv-compile");
     p.push("target");
     p.push("debug");
@@ -137,7 +128,7 @@ fn cache_miss_compiles_then_hit_returns_same_handle() {
             std::ptr::null(), std::ptr::null(), std::ptr::null(),
             0.0, 0.0, 0.0, 0.0,
             0,
-            out_color.as_mut_ptr(), &mut out_depth,
+            out_color.as_mut_ptr(), &mut out_depth, 1, 0,
         );
     }
     assert_eq!(out_color, rgba);

@@ -88,6 +88,14 @@ impl Drop for JitMapping {
 pub(crate) fn map_blob(blob: &ShaderBlob)
     -> Result<(JitMapping, ShaderEntryPoints), LoadError>
 {
+    // A blob is native code for one architecture; mapping
+    // another architecture's bytes executable would jump
+    // into garbage.
+    if atrium_spv_blob::host_arch() != Some(blob.arch) {
+        return Err(LoadError::Internal(format!(
+            "shader blob is for arch {} but this host runs {:?}",
+            blob.arch, atrium_spv_blob::host_arch())));
+    }
     let code = &blob.code;
     if code.is_empty() {
         return Err(LoadError::Internal(
@@ -112,8 +120,8 @@ pub(crate) fn map_blob(blob: &ShaderBlob)
 
     // Entry points: just `base + offset`, transmuted to the
     // stage's ABI function-pointer type. SAFETY: the blob
-    // parser already validated each offset is 4-aligned and
-    // `< code.len()`, and the bytes there are the backend's
+    // parser already validated each offset is in range
+    // (`< code.len()`, 4-aligned on aarch64), and the bytes there are the backend's
     // emitted machine code for that stage's entry function.
     let entry_points = unsafe {
         ShaderEntryPoints {
@@ -176,11 +184,13 @@ pub(crate) fn open(
 /// `len` must be a whole number of pages and `>= code.len()`.
 #[cfg(not(target_os = "macos"))]
 unsafe fn map_exec(code: &[u8], len: usize) -> Result<*mut u8, LoadError> {
+    #[cfg(target_arch = "aarch64")]
     extern "C" {
         // Provided by the compiler runtime (compiler-rt /
         // libgcc) that every Rust binary links. The
         // canonical ARM64 dc-cvau / ic-ivau / dsb / isb
-        // instruction-cache sync sequence.
+        // instruction-cache sync sequence. x86-64 keeps the
+        // I-cache coherent in hardware, so it needs none.
         fn __clear_cache(start: *mut libc::c_void, end: *mut libc::c_void);
     }
 
@@ -198,6 +208,7 @@ unsafe fn map_exec(code: &[u8], len: usize) -> Result<*mut u8, LoadError> {
     ptr::copy_nonoverlapping(code.as_ptr(), base, code.len());
     // Sync I-cache with the freshly-written D-cache *before*
     // the pages can be executed.
+    #[cfg(target_arch = "aarch64")]
     __clear_cache(base as *mut libc::c_void,
                   base.add(code.len()) as *mut libc::c_void);
     if libc::mprotect(raw, len, libc::PROT_READ | libc::PROT_EXEC) != 0 {
@@ -296,10 +307,16 @@ mod tests {
         let spirv = const_color_spirv(rgba);
         let module = atrium_spv_frontend::translate(&spirv)
             .expect("frontend translate");
+        // Bespoke is aarch64-only; x86_64 hosts use Cranelift.
+        #[cfg(target_arch = "aarch64")]
         let out = atrium_spv_backend_bespoke::compile_blob(
             &module, atrium_spv_backend_bespoke::Target::host())
-            .expect("compile_blob");
-        let blob = ShaderBlob::from_bytes(&out.blob).expect("blob parses");
+            .expect("compile_blob").blob;
+        #[cfg(not(target_arch = "aarch64"))]
+        let out = atrium_spv_backend_cranelift::compile_blob(
+            &module, atrium_spv_backend_cranelift::Target::host())
+            .expect("compile_blob").blob;
+        let blob = ShaderBlob::from_bytes(&out).expect("blob parses");
 
         let (_mapping, entry_points) = map_blob(&blob)
             .expect("map_blob");
@@ -308,18 +325,33 @@ mod tests {
 
         let mut color = [0f32; 4];
         let mut depth = 0f32;
-        // SAFETY: fs_main is the AAPCS64 fragment entry of a
-        // shader the bespoke backend just produced; the
+        // SAFETY: fs_main is the C-ABI fragment entry of a
+        // shader the backend just produced; the
         // argument shapes match docs/spec §4.1.
         unsafe {
             fs_main(
                 ptr::null(), ptr::null(), ptr::null(),
                 0.0, 0.0, 0.0, 0.0, 0,
-                color.as_mut_ptr(), &mut depth,
+                color.as_mut_ptr(), &mut depth, 1, 0,
             );
         }
         assert_eq!(color, rgba,
             "mmap'd shader produced {color:?}, expected {rgba:?}");
+    }
+
+    #[test]
+    fn rejects_foreign_arch() {
+        let foreign = if atrium_spv_blob::host_arch()
+            == Some(atrium_spv_blob::ARCH_AARCH64)
+        { atrium_spv_blob::ARCH_X86_64 } else { atrium_spv_blob::ARCH_AARCH64 };
+        let blob = ShaderBlob {
+            arch: foreign,
+            code: vec![0xC3; 16],
+            entries: atrium_spv_blob::EntryOffsets {
+                fs: Some(0), ..Default::default()
+            },
+        };
+        assert!(map_blob(&blob).is_err());
     }
 
     #[test]

@@ -22,4 +22,6 @@ rspirv   = "0.13"
 tempfile = "3"
 # The jitmap unit test compiles a real blob to mmap + run.
 atrium-spv-frontend        = { path = "../atrium-spv-frontend" }
-atrium-spv-backend-bespoke = { path = "../atrium-spv-backend-bespoke" }
+atrium-spv-backend-bespoke   = { path = "../atrium-spv-backend-bespoke" }
+# x86_64 hosts: bespoke is aarch64-only.
+atrium-spv-backend-cranelift = { path = "../atrium-spv-backend-cranelift" }

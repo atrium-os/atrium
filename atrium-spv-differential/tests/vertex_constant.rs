@@ -245,5 +245,8 @@ fn assert_passthrough(backend: Backend) {
 
 #[test] fn cranelift_constant_position_vertex() { assert_constant_position(Backend::Cranelift); }
 #[test] fn cranelift_passthrough_vertex()       { assert_passthrough(Backend::Cranelift); }
+// Bespoke emits AArch64 only.
+#[cfg(target_arch = "aarch64")]
 #[test] fn bespoke_constant_position_vertex()   { assert_constant_position(Backend::Bespoke); }
+#[cfg(target_arch = "aarch64")]
 #[test] fn bespoke_passthrough_vertex()         { assert_passthrough(Backend::Bespoke); }
