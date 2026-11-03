@@ -278,6 +278,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     }
 
     clip_pass(&mut resolved, &mut report);
+    icon_font_pass(&mut resolved, &mut report);
 
     // A masked element paints neither its background colour nor its image:
     // without the mask both are the wrong shape.
@@ -623,6 +624,24 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     if placed > 0 { report.drop_n("named grid areas resolved to numbered lines", placed) }
     for (_, props) in resolved.iter_mut() { props.remove("grid-template-areas"); }
     named_line_pass(&mut resolved, &dom, &mut report);
+
+    // ★ A conditional slot (a state, a media context) is emitted as a rule
+    // that comes LATER in the output and is at least as specific, so it
+    // always wins there. In the source it only wins if it outranks what the
+    // element's unconditional declarations already say. MIT's promo
+    // heading had `.promo h3 { font-size: 1rem }` beating Bootstrap's
+    // `@media (max-width:1200px) { h3 { font-size: calc(…) } }`; emitted as
+    // is, the media rule won, and 26px type sat on a 16px line.
+    let outranked: Vec<((Handle, String, String), String)> = resolved.iter()
+        .filter(|((_, st, me), _)| !st.is_empty() || !me.is_empty())
+        .flat_map(|((h, st, me), props)| {
+            let under: Vec<(Handle, String, String)> = [(*h, String::new(), String::new()), (*h, st.clone(), String::new()), (*h, String::new(), me.clone())]
+                .into_iter().filter(|k| k.1 != *st || k.2 != *me).collect();
+            props.iter().filter(|(p, (pri, _))| under.iter().any(|k| resolved.get(k).and_then(|x| x.get(*p)).is_some_and(|(q, _)| q > pri)))
+                .map(|(p, _)| ((*h, st.clone(), me.clone()), p.clone())).collect::<Vec<_>>()
+        }).collect();
+    if !outranked.is_empty() { report.drop_n("conditional declaration outranked by an unconditional one", outranked.len()) }
+    for (k, p) in outranked { if let Some(x) = resolved.get_mut(&k) { x.remove(&p); } }
 
     // 5. Emit: one class per distinct block, so elements that resolved to the
     //    same declarations share a rule instead of each getting their own.
@@ -1027,6 +1046,14 @@ fn resolve_var(value: &[Token], custom: &Customs, depth: usize) -> Option<Vec<To
 
 /// A declaration as longhands the profile admits, or nothing.
 fn to_longhands(name: &str, value: &[Token], inputs: &Inputs, report: &mut Report) -> Vec<(String, String)> {
+    to_longhands_inner(name, value, inputs, report, true)
+}
+
+fn to_longhands_plain(name: &str, value: &[Token], inputs: &Inputs, report: &mut Report) -> Vec<(String, String)> {
+    to_longhands_inner(name, value, inputs, report, false)
+}
+
+fn to_longhands_inner(name: &str, value: &[Token], inputs: &Inputs, report: &mut Report, markers: bool) -> Vec<(String, String)> {
     if name.starts_with("--") { return vec![] }
     // ★ The pre-standard grid gap names are ALIASES in every engine (CSS
     // Box Alignment §8.3): `grid-gap: 24px` is `gap: 24px`, and dropping it
@@ -1082,6 +1109,20 @@ fn to_longhands(name: &str, value: &[Token], inputs: &Inputs, report: &mut Repor
     // Carried as a marker and decided once the cascade is known, because
     // `clip` only clips a positioned box (see the clip pass). Any other clip
     // is still a shape the profile cannot draw, and is still dropped.
+    // ★ LIGATURE ICON FONTS. `<span class="material-icons">keyboard_arrow_left
+    // </span>` is an icon only in its own font, which turns the WORD into a
+    // glyph. The profile ships no such font, so the word itself was drawn,
+    // at icon size: MIT's carousel arrows read "keyboard_arrow_left" in
+    // 60px type across the page. Carried as a marker, so a later rule that
+    // names an ordinary family still wins, and compiled in the icon pass to
+    // an empty icon-sized box.
+    if markers && name == "font-family" {
+        let first = text.split(',').next().unwrap_or("").trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+        let icon = first.starts_with("material icons") || first.starts_with("material symbols");
+        let mut v = to_longhands_plain(name, value, inputs, report);
+        v.push(("icon-font-marker".to_string(), if icon { "icon" } else { "text" }.to_string()));
+        return v;
+    }
     if name == "clip" {
         match clip_rect_is_empty(&text) {
             Some(true) => return vec![("clip-marker".to_string(), "empty".to_string())],
@@ -1133,7 +1174,7 @@ fn to_longhands(name: &str, value: &[Token], inputs: &Inputs, report: &mut Repor
         // the same cell: rustdoc's breadcrumb rendered on top of its search
         // box.
         if p == "grid-template-areas" || p == "grid-area-name" || p == "float-marker" || p == "box-sizing-marker"
-            || p == "clip-marker" || p == "clip-path-marker" || p.ends_with("-lines-marker") { return Some((p, v)) }
+            || p == "clip-marker" || p == "clip-path-marker" || p.ends_with("-lines-marker") || p == "icon-font-marker" { return Some((p, v)) }
         // ★ An image the input has not measured cannot be painted (§3.13),
         // and the renderer says so. The normalizer must decide it HERE, the
         // same way it decides for an `<img>`, or it ships a document that
@@ -1687,4 +1728,27 @@ fn clip_pass(resolved: &mut BTreeMap<(Handle, String, String), BTreeMap<String, 
     }
     for (_, props) in resolved.iter_mut() { props.remove("clip-marker"); props.remove("clip-path-marker"); }
     if hidden > 0 { report.drop_n("empty clip compiled to `visibility: hidden`", hidden) }
+}
+
+/// Compile the icon-font marker: an element whose own winning family is a
+/// ligature icon font paints nothing and takes an icon's room, a 1em square
+/// (inline boxes become inline-block so the size applies). Its text is the
+/// icon's NAME, not content, so hiding it loses nothing a reader would see.
+fn icon_font_pass(resolved: &mut BTreeMap<(Handle, String, String), BTreeMap<String, (Priority, String)>>, report: &mut Report) {
+    let mut n = 0usize;
+    for (_, props) in resolved.iter_mut() {
+        let Some((pri, v)) = props.remove("icon-font-marker") else { continue };
+        if v != "icon" { continue }
+        let mut set = |k: &str, val: &str| {
+            if props.get(k).is_none_or(|(o, _)| *o <= pri) { props.insert(k.to_string(), (pri, val.to_string())); }
+        };
+        set("visibility", "hidden");
+        set("width", "1em");
+        set("height", "1em");
+        set("overflow-x", "hidden");
+        set("overflow-y", "hidden");
+        if props.get("display").is_none_or(|(_, d)| d == "inline") { props.insert("display".into(), (pri, "inline-block".into())); }
+        n += 1;
+    }
+    if n > 0 { report.drop_n("ligature icon font compiled to an empty icon box", n) }
 }

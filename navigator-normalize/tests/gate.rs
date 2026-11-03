@@ -908,3 +908,43 @@ fn a_minified_compound_media_query_is_admitted() {
     assert!(!report.dropped.keys().any(|k| k.contains("not admitted")), "{:?}", report.dropped);
     assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
 }
+
+/// A ligature icon font draws a WORD as a glyph; without the font the word
+/// is drawn. It becomes an empty icon-sized box, unless a later rule names
+/// an ordinary family.
+#[test]
+fn a_ligature_icon_is_an_empty_icon_box() {
+    let src = r#"<html><head><style>
+      .material-icons { font-family: 'Material Icons'; font-size: 24px }
+      .material-icons.plain { font-family: Arial, sans-serif }
+    </style></head><body>
+      <p>Back <span class="material-icons">keyboard_arrow_left</span></p>
+      <p><span class="material-icons plain">ordinary words</span></p>
+    </body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    assert_eq!(out.matches("visibility: hidden").count(), 1, "only the icon hides: {out}");
+    assert!(out.contains("width: 1em") && out.contains("display: inline-block"), "{out}");
+    assert!(report.dropped.keys().any(|k| k.contains("icon font")), "{:?}", report.dropped);
+    assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+}
+
+/// A media or state rule only wins where it outranks the base rule, as in
+/// the source cascade: the output puts it later, so it must not be emitted
+/// when it lost.
+#[test]
+fn a_conditional_rule_that_lost_is_not_emitted() {
+    let src = r#"<html><head><style>
+      .promo h3 { font-size: 16px; line-height: 16px }
+      @media (max-width: 1200px) { h3 { font-size: 26px } }
+      @media (max-width: 1200px) { .promo h3 { color: #ff0000 } }
+      #x { color: #00ff00 }
+      a:hover { color: #0000ff }
+      #x:hover { text-decoration: underline }
+    </style></head><body><div class="promo"><h3>t</h3></div><a id="x" href="/">l</a></body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    assert!(!out.contains("font-size: 26px"), "the lower-specificity media rule lost: {out}");
+    assert!(out.contains("#ff0000"), "a media rule that wins stays: {out}");
+    assert!(!out.contains("#0000ff"), "the weaker :hover colour lost to the id rule: {out}");
+    assert!(out.contains(":hover"), "the winning :hover declaration stays: {out}");
+    assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+}
