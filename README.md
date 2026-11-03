@@ -51,6 +51,7 @@ atrium/
 ├── stoa/                    persistent session service
 ├── lyra*/, choragus/        audio subsystem and audio policy
 ├── memoryd/, memfed/        memory-pressure daemon and per-jail memory federation
+├── memprobe/                measures how real process memory compresses (evidence for atrium-zram v2)
 │
 ├── pergola/                 native UI toolkit
 ├── vestibulum*/             login screen (+ macOS dev host)

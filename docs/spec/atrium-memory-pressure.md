@@ -427,6 +427,12 @@ the two ideas unify.
      - Refinements (own efforts): per-CPU contexts (vs the single mutex'd one);
        dynamic device sizing; writeback of incompressible pages to real swap; wire the
        tier into the federation (memoryd/memfed) so reclaim *prefers* compress.
+     - **v2 hardening — spec'd 2026-11-03: [`atrium-zram-v2.md`](atrium-zram-v2.md).**
+       ★ The ~175× above is a zero-page artefact of the hog, not a workload ratio:
+       `memprobe` on real processes measures ~2.6–2.9× (LZ4) / ~4–5× (zstd) for pages
+       that carry data, and shows v1's per-page `malloc(9)` wasting 27–35 % of the store.
+       v2: packed allocator, per-CPU contexts, memory limit, zram-owned writeback
+       (FreeBSD's swap striping otherwise defeats tiering), counters.
 4. **Pergola `trim_memory` cooperative channel.**
 5. **`memoryd` policy loop + posture wiring.** **FIRST CUT DONE + verified in-VM
    (#172).** `memoryd/` (cross-compiled `aarch64-unknown-freebsd`) reads the live

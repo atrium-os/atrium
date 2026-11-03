@@ -1,0 +1,24 @@
+[package]
+name = "memprobe"
+version = "0.1.0"
+edition = "2021"
+description = "Measure how well real process memory would compress (zero/same-filled, duplicate, LZ4, zstd, allocator overhead) and record memory pressure over a workload — the evidence for the atrium-zram hardening (docs/spec/atrium-zram-v2.md)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "memprobe"
+path = "src/main.rs"
+
+[features]
+# zstd is the codec atrium_zram.ko uses today (the kernel's in-tree copy), so it
+# is on by default. It builds C code (zstd-sys); turn it off for a pure-Rust
+# cross-build from macOS (`--no-default-features`), or build natively in the VM.
+default = ["zstd"]
+
+[dependencies]
+lz4_flex = { version = "0.14", default-features = false, features = ["safe-encode", "safe-decode", "std"] }
+zstd = { version = "0.14", optional = true }
+
+[target.'cfg(target_os = "freebsd")'.dependencies]
+libc = "0.2"
