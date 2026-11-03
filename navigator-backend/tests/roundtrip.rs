@@ -220,6 +220,42 @@ fn every_recorded_transition_reverses_exactly() {
         failures.join("\n  "));
 }
 
+/// Forward, at corpus scale and by byte equality: take each recorded step, go
+/// back, go forward, and the document must be exactly the one the step first
+/// produced — through `History`, the path a reader's session uses.
+#[test]
+fn every_recorded_transition_goes_forward_again_exactly() {
+    let Ok(dir) = std::env::var("NAVIGATOR_RECORDINGS") else {
+        eprintln!("SKIPPED: set NAVIGATOR_RECORDINGS to a directory of emitted recordings");
+        return;
+    };
+    use navigator_backend::document::Document;
+    use navigator_backend::reverse::{Back, Forward, History};
+    let (mut retraced, mut failures) = (0usize, vec![]);
+    for e in std::fs::read_dir(&dir).expect("readable directory").flatten() {
+        let p = e.path();
+        if p.extension().map(|x| x != "json").unwrap_or(true) { continue }
+        let bytes = std::fs::read(&p).expect("readable file");
+        let Ok(r) = ingest(&bytes, &Limits::default()) else { continue };
+        for t in r.transitions.iter().filter(|t| t.anchored) {
+            let mut h = History::new(Document::accept(&r.document).expect("inside the profile"));
+            if h.go(t).is_err() { continue }
+            let after = h.document().dom.serialize();
+            let ok = h.back().ok() == Some(Back::Stepped)
+                && h.forward().ok() == Some(Forward::Stepped)
+                && h.document().dom.serialize() == after;
+            if ok { retraced += 1 } else {
+                failures.push(format!("{}: {} did not retrace", p.display(), t.trigger))
+            }
+        }
+    }
+    assert!(retraced + failures.len() > 0, "no transitions examined — this checked nothing");
+    eprintln!("{retraced}/{} recorded transitions go forward again exactly",
+              retraced + failures.len());
+    assert!(failures.is_empty(), "forward did not reach the same document:\n  {}",
+        failures.join("\n  "));
+}
+
 /// ★★ THE DEFAULT SESSION BOUND AGAINST REAL DOCUMENTS.
 ///
 /// The bound was derived from the corpus's document sizes, so the corpus is

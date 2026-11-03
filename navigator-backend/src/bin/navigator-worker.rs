@@ -15,7 +15,7 @@
 //! the logic it dispatches to is tested directly in the crate.
 
 use navigator_backend::document::Document;
-use navigator_backend::reverse::{Back, History};
+use navigator_backend::reverse::{Back, Forward, History};
 use navigator_backend::wire::*;
 use navigator_backend::{ingest, Limits, Transition};
 use std::io::{BufReader, Write};
@@ -65,6 +65,14 @@ impl Worker {
         }.to_string())
     }
 
+    fn forward(&mut self) -> Result<String, String> {
+        let h = self.history.as_mut().ok_or("no document")?;
+        Ok(match h.forward().map_err(|e| e.to_string())? {
+            Forward::Stepped => "stepped",
+            Forward::AtEnd => "at-end",
+        }.to_string())
+    }
+
     /// What this worker holds. ★ The host does NOT trust this for its budget
     /// — a compromised worker would simply report zero — it charges what it
     /// measured locally before sending. This is for reporting to a person.
@@ -98,6 +106,7 @@ fn main() {
             REQ_OPEN => w.open(&f.payload),
             REQ_NAVIGATE => w.navigate(&f.text()),
             REQ_BACK => w.back(),
+            REQ_FORWARD => w.forward(),
             REQ_TRIGGERS => Ok(w.triggers()),
             REQ_BYTES => Ok(w.size()),
             other => Err(format!("unknown request {other:?}")),

@@ -21,7 +21,7 @@
 
 use navigator_backend::jailed::{Confinement, JailedHost, WorkerConfig};
 use navigator_backend::navigatord::{DocumentHost, Event, Navigatord, Request};
-use navigator_backend::reverse::Back;
+use navigator_backend::reverse::{Back, Forward};
 use navigator_backend::session::{SessionId, SessionLimits, Status};
 use std::time::Duration;
 
@@ -58,7 +58,8 @@ fn open(n: &mut Navigatord<JailedHost>) -> SessionId {
     }
 }
 
-/// The whole cycle across a process boundary: open, navigate, back, close.
+/// The whole cycle across a process boundary: open, navigate, back, forward,
+/// close.
 #[test]
 fn a_worker_process_serves_a_whole_session() {
     let mut n = broker();
@@ -80,6 +81,12 @@ fn a_worker_process_serves_a_whole_session() {
     assert!(matches!(
         n.handle(Request::Back { session }).as_slice(),
         [Event::Rewound { how: Back::AtStart, .. }]));
+    assert!(matches!(
+        n.handle(Request::Forward { session }).as_slice(),
+        [Event::Advanced { how: Forward::Stepped, .. }]));
+    assert!(matches!(
+        n.handle(Request::Forward { session }).as_slice(),
+        [Event::Advanced { how: Forward::AtEnd, .. }]));
     assert!(matches!(
         n.handle(Request::Close { session }).as_slice(), [Event::Closed { .. }]));
     assert_eq!(n.open_sessions(), 0);

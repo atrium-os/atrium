@@ -22,7 +22,7 @@
 
 use crate::apply::ApplyError;
 use crate::document::Document;
-use crate::reverse::{Back, History, HistoryLimits};
+use crate::reverse::{Back, Forward, History, HistoryLimits};
 use crate::{Recording, Transition};
 use std::collections::HashMap;
 
@@ -218,6 +218,15 @@ impl Session {
         if r == Back::Stepped { self.remeasure() }
         Ok(r)
     }
+
+    pub fn forward(&mut self) -> Result<Forward, ApplyError> {
+        let r = self.history.forward()?;
+        if r == Forward::Stepped { self.remeasure() }
+        Ok(r)
+    }
+
+    /// How many states the reader can go forward to.
+    pub fn ahead(&self) -> usize { self.history.ahead() }
 
     fn remeasure(&mut self) {
         self.current_bytes = self.history.document().dom.serialize().len();

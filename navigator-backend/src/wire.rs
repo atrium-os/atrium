@@ -101,6 +101,7 @@ pub fn read_frame(r: &mut BufReader<impl Read>) -> Result<Frame, WireError> {
 pub const REQ_OPEN: &str = "OPEN";
 pub const REQ_NAVIGATE: &str = "NAV";
 pub const REQ_BACK: &str = "BACK";
+pub const REQ_FORWARD: &str = "FWD";
 pub const REQ_TRIGGERS: &str = "TRIG";
 pub const REQ_BYTES: &str = "SIZE";
 pub const RSP_OK: &str = "OK";

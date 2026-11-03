@@ -78,10 +78,32 @@ pub enum Back {
     Forgotten,
 }
 
-/// A document plus the states it came from.
+/// The result of asking to go forward again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Forward {
+    /// Went forward one state, to where the reader had been before going back.
+    Stepped,
+    /// Nothing to go forward to: the reader has not gone back, or took a new
+    /// step after going back, which replaces the states they had left.
+    AtEnd,
+}
+
+/// A document plus the states it came from, and the states the reader backed
+/// out of.
 pub struct History {
     current: Document,
-    past: std::collections::VecDeque<Transition>,
+    /// Each step as (the transition taken, the undo derived when it was taken).
+    past: std::collections::VecDeque<(Transition, Transition)>,
+    /// ★ FORWARD RE-TAKES THE STEP THE READER BACKED OUT OF, through the
+    /// ordinary path. It stores the transition, not the document it led to:
+    /// after a back the document is byte-identical to the one the step was
+    /// first taken from (that is what the corpus test of `back` asserts), so
+    /// the same transition applies to it with the same preconditions, and the
+    /// result is checked exactly as the first time. A stored document would
+    /// be a second copy of a derivable fact.
+    ///
+    /// Bounded by `past`: an entry arrives here only by leaving it.
+    future: Vec<Transition>,
     limits: HistoryLimits,
     /// Steps dropped to stay inside the bound. Never reset: it is the reason
     /// `back` answers `Forgotten` rather than `AtStart`.
@@ -116,13 +138,15 @@ impl History {
 
     pub fn with_limits(document: Document, limits: HistoryLimits) -> Self {
         History {
-            current: document, past: Default::default(),
+            current: document, past: Default::default(), future: vec![],
             limits, forgotten: 0, undo_bytes: 0,
         }
     }
 
     pub fn document(&self) -> &Document { &self.current }
     pub fn depth(&self) -> usize { self.past.len() }
+    /// How many states the reader can go forward to.
+    pub fn ahead(&self) -> usize { self.future.len() }
     /// How many reachable states the bound has discarded, in total.
     pub fn forgotten(&self) -> usize { self.forgotten }
 
@@ -140,7 +164,7 @@ impl History {
         while self.past.len() > self.limits.max_steps
             || self.undo_bytes > self.limits.max_undo_bytes
         {
-            let Some(dropped) = self.past.pop_front() else { break };
+            let Some((_, dropped)) = self.past.pop_front() else { break };
             self.undo_bytes -= weight(&dropped).min(self.undo_bytes);
             self.forgotten += 1;
         }
@@ -152,29 +176,53 @@ impl History {
     /// same all-or-nothing rule `apply` follows, and for the same reason: a
     /// history holding a step that did not happen would send the reader back
     /// to a state they were never in.
+    ///
+    /// A new step replaces whatever the reader had backed out of, as in every
+    /// browser: the states ahead were reached by a different path, and going
+    /// "forward" into them from here would land somewhere never visited.
     pub fn go(&mut self, t: &Transition) -> Result<(), ApplyError> {
+        self.step(t)?;
+        self.future.clear();
+        Ok(())
+    }
+
+    fn step(&mut self, t: &Transition) -> Result<(), ApplyError> {
         let (next, undo) = self.current.applied_with_undo(t)?;
         self.current = next;
         self.undo_bytes += weight(&undo);
-        self.past.push_back(undo);
+        self.past.push_back((t.clone(), undo));
         self.trim();
         Ok(())
     }
 
+    /// Go forward one step, to the state the last `back` left.
+    ///
+    /// ★ A refused forward keeps its place, as a refused back does: the
+    /// reader can still go forward once whatever refused it is resolved, and
+    /// the history never claims a state it did not reach.
+    pub fn forward(&mut self) -> Result<Forward, ApplyError> {
+        let Some(t) = self.future.pop() else { return Ok(Forward::AtEnd) };
+        match self.step(&t) {
+            Ok(()) => Ok(Forward::Stepped),
+            Err(e) => { self.future.push(t); Err(e) }
+        }
+    }
+
     /// Go back one step, saying which of the three things happened.
     pub fn back(&mut self) -> Result<Back, ApplyError> {
-        let Some(undo) = self.past.pop_back() else {
+        let Some((taken, undo)) = self.past.pop_back() else {
             return Ok(if self.forgotten > 0 { Back::Forgotten } else { Back::AtStart });
         };
         match self.current.undone(&undo) {
             Ok(prev) => {
                 self.current = prev;
                 self.undo_bytes -= weight(&undo).min(self.undo_bytes);
+                self.future.push(taken);
                 Ok(Back::Stepped)
             }
             Err(e) => {
                 // A failed undo must not consume the step.
-                self.past.push_back(undo);
+                self.past.push_back((taken, undo));
                 Err(e)
             }
         }

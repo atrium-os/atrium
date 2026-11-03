@@ -825,8 +825,8 @@ Everything here runs headless, in CI, with no display server.
 | **M0** | Markdown → NSG, hermetic | byte-identical output, 3 runs × 2 machines |
 | **M1** | jailed fetcher | fetcher's filesystem access refused **at the syscall**, asserted by test |
 | **M2** | Document Profile v1 (HTML + CSS) | curated corpus with a reported conformance **number** — rows **64/64**, corpus **29/29 after the normalizer** (§8.4 measured 1/29 raw, §8.5 closed it). Converter must still carry stylesheets and image sizes |
-| **M3** | per-document jail + graph validator | worker capabilities == none; validator fuzzed with reached-coverage reported; **per-document jail launch cost measured**, not assumed |
-| **M4** | navigation state machine + history in Tessera | back/forward/session-restore driven headlessly |
+| **M3** | per-document jail + graph validator | worker capabilities == none; validator fuzzed with reached-coverage reported; **per-document jail launch cost measured**, not assumed — **PASSED** (§8.6) |
+| **M4** | navigation state machine + history in Tessera | back/forward/session-restore driven headlessly — back and forward done (§4.4, §8.7); session restore and the Tessera store open |
 | **M5** | UI attach (Pergola chrome + Limen document surface) | **UI deleted ⇒ suite still green** |
 | **M6** | app-launch path (`atrium-app://` → Nomenclator → Opifex → jail) | trial-launch consent gesture; signature verified before launch |
 
@@ -1841,6 +1841,42 @@ documents. The fix to the zero-width cell exposed renderer bugs: an auto-width t
 filled its line instead of shrink-wrapping (CSS 2.1 §17.5.2.2), a specified table width
 went unshared when every column was empty, and a definite-width block's border was counted
 twice in its container's intrinsic width.
+
+### 8.6 M3 — PASSED (recorded 2026-11-03)
+
+Every leg of the gate was met by work already described above; this entry records it.
+
+- **Worker capabilities == none.** The corpus ran through real FreeBSD jails with
+  `Confinement::Launcher` → `portcullis exec`, the worker an installed, signed app whose
+  manifest declares no capabilities at all: 98 sessions, 259 navigations, 259 rewinds,
+  0 failures, and no jails, mounts or roots left behind (§4.7a).
+- **Validator fuzzed with reached-coverage reported.** `tests/fuzz.rs` fails unless every
+  rejection and every note the validator can emit was produced by a generated input (§4.7b).
+- **Per-document jail launch cost measured.** About 25 ms to open and 26 ms to close a
+  document's jail, navigation unaffected; one jail per document stays the default (§4.7c,
+  §10 q1).
+
+### 8.7 M4 — forward (2026-11-03)
+
+`History::forward` re-takes the step the reader last backed out of. It stores the
+**transition**, not the document it led to: after a back, the document is byte-identical
+to the one the step was first taken from, so the same transition applies with the same
+preconditions and its result is checked exactly as the first time. A stored document would
+be a second copy of a derivable fact. A new step after a back clears what was ahead, as in
+every browser, and `Forward::AtEnd` answers when nothing is. A refused forward keeps its
+place, as a refused back does.
+
+It runs through every layer: `Session`, `DocumentHost` (in-process and jailed — the worker
+answers `FWD`), and the broker's `Request::Forward` / `Event::Advanced`. Tests: byte equality
+through three mixed steps and back, a new step replacing what was ahead, forward at the end,
+the broker driven through its control plane only, a vanished session, and the full cycle
+across a worker process. `roundtrip.rs` gains a corpus check (go, back, forward, byte-equal)
+that runs with `NAVIGATOR_RECORDINGS` set, like the others.
+
+**Still open for M4:** session restore and history in Tessera. A session's restorable state
+is small and mostly derivable (the recording's address and the transitions taken), but the
+store and its integrity checks are not built, and the jailed and Tessera-backed runs need
+the VM.
 
 ## 9. What this reuses
 

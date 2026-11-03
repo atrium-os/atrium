@@ -12,7 +12,7 @@
 //! drop the rest; here a refusal travels the same channel as a success.
 
 use navigator_backend::navigatord::{DocumentHost, Event, InProcessHost, Navigatord, Request};
-use navigator_backend::reverse::Back;
+use navigator_backend::reverse::{Back, Forward};
 use navigator_backend::session::{Expiry, SessionLimits, SessionId, Status};
 
 const MIN: u64 = 60 * 1000;
@@ -119,6 +119,48 @@ fn going_back_reports_which_kind_of_back_it_was() {
         [Event::Rewound { how: Back::AtStart, .. }] => {}
         other => panic!("{other:?}"),
     }
+}
+
+/// Forward re-takes the step the reader backed out of, and a new step
+/// replaces what was ahead — the browser's rule, driven through the control
+/// plane only.
+#[test]
+fn going_forward_returns_to_where_the_reader_backed_out_of() {
+    let mut n = broker();
+    let s = open(&mut n);
+    match n.handle(Request::Forward { session: s }).as_slice() {
+        [Event::Advanced { how: Forward::AtEnd, .. }] => {}
+        other => panic!("nothing is ahead of a fresh session: {other:?}"),
+    }
+    n.handle(Request::Navigate { session: s, trigger: "#menu".into() });
+    n.handle(Request::Back { session: s });
+    match n.handle(Request::Forward { session: s }).as_slice() {
+        [Event::Advanced { how: Forward::Stepped, .. }] => {}
+        other => panic!("{other:?}"),
+    }
+    match n.handle(Request::Forward { session: s }).as_slice() {
+        [Event::Advanced { how: Forward::AtEnd, .. }] => {}
+        other => panic!("{other:?}"),
+    }
+    // Back once more: the state the forward reached is the state the first
+    // navigation reached, so going back from it lands at the start.
+    match n.handle(Request::Back { session: s }).as_slice() {
+        [Event::Rewound { how: Back::Stepped, .. }] => {}
+        other => panic!("{other:?}"),
+    }
+    match n.handle(Request::Back { session: s }).as_slice() {
+        [Event::Rewound { how: Back::AtStart, .. }] => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn forward_on_a_vanished_session_says_why() {
+    let mut n = broker();
+    let s = open(&mut n);
+    n.handle(Request::Close { session: s });
+    assert!(matches!(n.handle(Request::Forward { session: s }).as_slice(),
+        [Event::NoSuchSession { .. }]));
 }
 
 #[test]
@@ -253,6 +295,7 @@ impl DocumentHost for NullHost {
     }
     fn navigate(&mut self, _id: SessionId, _t: &str, _now: u64) -> Result<(), String> { Ok(()) }
     fn back(&mut self, _id: SessionId, _now: u64) -> Result<Back, String> { Ok(Back::AtStart) }
+    fn forward(&mut self, _id: SessionId, _now: u64) -> Result<Forward, String> { Ok(Forward::AtEnd) }
     fn close(&mut self, id: SessionId) -> bool {
         let had = self.open.contains(&id);
         self.open.retain(|&x| x != id);

@@ -15,7 +15,7 @@
 
 use navigator_backend::apply::ApplyError;
 use navigator_backend::document::Document;
-use navigator_backend::reverse::{Back, History, HistoryLimits};
+use navigator_backend::reverse::{Back, Forward, History, HistoryLimits};
 use navigator_backend::{Effect, Transition};
 
 fn doc() -> Document {
@@ -224,6 +224,52 @@ fn a_step_that_removes_its_trigger_can_still_be_undone() {
 fn back_at_the_beginning_says_so_and_is_not_an_error() {
     let mut h = History::new(doc());
     assert_eq!(h.back().expect("must not be an error"), Back::AtStart);
+}
+
+// ---- forward ----------------------------------------------------------
+
+fn three_steps() -> (History, Vec<String>) {
+    let mut h = History::new(doc());
+    let mut states = vec![h.document().dom.serialize()];
+    h.go(&t(vec![attr("aria-expanded", Some("false"), Some("true"))])).expect("1");
+    states.push(h.document().dom.serialize());
+    h.go(&t(vec![Effect::Remove { target: "#b".into() }])).expect("2");
+    states.push(h.document().dom.serialize());
+    h.go(&t(vec![Effect::Insert { parent: "#m".into(), index: Some(0), html: "<i>x</i>".into() }])).expect("3");
+    states.push(h.document().dom.serialize());
+    (h, states)
+}
+
+/// ★ Byte equality again: forward must reach the state the reader was in,
+/// not a state that merely has the right attribute.
+#[test]
+fn forward_retraces_every_state_back_left() {
+    let (mut h, states) = three_steps();
+    while h.back().expect("unwinds") == Back::Stepped {}
+    assert_eq!(h.ahead(), 3);
+    for want in &states[1..] {
+        assert_eq!(h.forward().expect("forward"), Forward::Stepped);
+        assert_eq!(&h.document().dom.serialize(), want, "forward reached a different state");
+    }
+    assert_eq!(h.forward().expect("at the end"), Forward::AtEnd);
+    assert_eq!(h.depth(), 3, "forward steps are ordinary steps: back works from them");
+}
+
+#[test]
+fn a_new_step_after_back_replaces_what_was_ahead() {
+    let (mut h, _) = three_steps();
+    h.back().expect("1");
+    h.back().expect("2");
+    assert_eq!(h.ahead(), 2);
+    h.go(&t(vec![attr("class", Some("shut"), None)])).expect("a different step");
+    assert_eq!(h.ahead(), 0, "the states ahead were reached by another path");
+    assert_eq!(h.forward().expect("nothing ahead"), Forward::AtEnd);
+}
+
+#[test]
+fn forward_with_nothing_ahead_says_so_and_is_not_an_error() {
+    let mut h = History::new(doc());
+    assert_eq!(h.forward().expect("must not be an error"), Forward::AtEnd);
 }
 
 // ---- bounds -----------------------------------------------------------

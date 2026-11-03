@@ -27,7 +27,7 @@
 //! broker logic, and that the test suite below is already written against the
 //! boundary rather than against the internals.
 
-use crate::reverse::Back;
+use crate::reverse::{Back, Forward};
 use crate::session::{Expiry, Millis, SessionId, SessionLimits, Sessions, Status};
 
 /// Everything the broker is not allowed to do itself.
@@ -41,6 +41,7 @@ pub trait DocumentHost {
     fn open(&mut self, recording: &[u8], now: Millis) -> Result<SessionId, String>;
     fn navigate(&mut self, id: SessionId, trigger: &str, now: Millis) -> Result<(), String>;
     fn back(&mut self, id: SessionId, now: Millis) -> Result<Back, String>;
+    fn forward(&mut self, id: SessionId, now: Millis) -> Result<Forward, String>;
     fn close(&mut self, id: SessionId) -> bool;
     fn expire(&mut self, now: Millis) -> Vec<(SessionId, Expiry)>;
     fn status(&self, id: SessionId) -> Status;
@@ -61,6 +62,7 @@ pub enum Request {
     OpenSession { recording: Vec<u8> },
     Navigate { session: SessionId, trigger: String },
     Back { session: SessionId },
+    Forward { session: SessionId },
     Close { session: SessionId },
     /// What is open and what it costs — a UI showing a session list, or a
     /// caller deciding what to evict under §4.4a.
@@ -81,6 +83,8 @@ pub enum Event {
     /// distinctly, because a reader who ran out of remembered history has not
     /// arrived at the beginning (§4.4).
     Rewound { session: SessionId, how: Back, triggers: Vec<String> },
+    /// Went forward again, or there was nothing ahead.
+    Advanced { session: SessionId, how: Forward, triggers: Vec<String> },
     Closed { session: SessionId },
     /// A session ended on its own. Unsolicited: the UI did not ask, and needs
     /// to know before a reader clicks into a session that is gone.
@@ -167,6 +171,16 @@ impl<H: DocumentHost> Navigatord<H> {
                     Err(why) => out.push(Event::Blocked { session: Some(session), why }),
                 }
             }
+            Request::Forward { session } => {
+                if let Some(e) = self.absent(session) { out.push(e); return out }
+                match self.host.forward(session, self.now) {
+                    Ok(how) => {
+                        let triggers = self.host.triggers(session);
+                        out.push(Event::Advanced { session, how, triggers });
+                    }
+                    Err(why) => out.push(Event::Blocked { session: Some(session), why }),
+                }
+            }
             Request::Close { session } => {
                 if self.host.close(session) {
                     out.push(Event::Closed { session });
@@ -231,6 +245,11 @@ impl DocumentHost for InProcessHost {
     fn back(&mut self, id: SessionId, now: Millis) -> Result<Back, String> {
         let s = self.sessions.get_mut(id, now).ok_or_else(|| "no such session".to_string())?;
         s.back().map_err(|e| e.to_string())
+    }
+
+    fn forward(&mut self, id: SessionId, now: Millis) -> Result<Forward, String> {
+        let s = self.sessions.get_mut(id, now).ok_or_else(|| "no such session".to_string())?;
+        s.forward().map_err(|e| e.to_string())
     }
 
     fn close(&mut self, id: SessionId) -> bool { self.sessions.close(id) }

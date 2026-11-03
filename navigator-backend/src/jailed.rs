@@ -35,7 +35,7 @@
 //! exists for a caller that must not start without one.
 
 use crate::navigatord::DocumentHost;
-use crate::reverse::Back;
+use crate::reverse::{Back, Forward};
 use crate::session::{Expiry, Millis, SessionId, Status};
 use crate::wire::*;
 use std::collections::HashMap;
@@ -332,6 +332,18 @@ impl DocumentHost for JailedHost {
 
     fn navigate(&mut self, id: SessionId, trigger: &str, now: Millis) -> Result<(), String> {
         self.ask(id, Frame::new(REQ_NAVIGATE, trigger.as_bytes()), now).map(|_| ())
+    }
+
+    fn forward(&mut self, id: SessionId, now: Millis) -> Result<Forward, String> {
+        match self.ask(id, Frame::new(REQ_FORWARD, ""), now)?.as_str() {
+            "stepped" => Ok(Forward::Stepped),
+            "at-end" => Ok(Forward::AtEnd),
+            other => {
+                let why = format!("worker sent an unknown forward result {other:?}");
+                self.retire(id, Status::Failed);
+                Err(why)
+            }
+        }
     }
 
     fn back(&mut self, id: SessionId, now: Millis) -> Result<Back, String> {
