@@ -197,7 +197,7 @@ The loop:
 
 | # | Milestone | Exit criterion |
 |---|---|---|
-| M0 | **Ground work.** Inventory the Vulkan subset from fresco-vulkan, Navigator and the ICD examples; generate `atrium-rdna4-isa` from the ISA XML with an assembler/disassembler round-trip test; oracle harness skeleton on gpusim and Tier-2; R9700 transport working | Subset list committed; a hand-assembled shader runs on gpusim and the R9700 with matching output |
+| M0 | **Ground work.** Inventory the Vulkan subset ([done: `rdna4-vulkan-subset.md`](rdna4-vulkan-subset.md)) from fresco-vulkan, Navigator and the ICD examples; generate `atrium-rdna4-isa` from the ISA XML with an assembler/disassembler round-trip test; oracle harness skeleton on gpusim and Tier-2; R9700 transport working | Subset list committed; a hand-assembled shader runs on gpusim and the R9700 with matching output |
 | M1 | **First compute.** Storage-buffer compute shaders (fill, saxpy, reductions) compiled from SPIR-V and dispatched through `tier3_rdna4` | Matches Tier-2 and R9700 goldens |
 | M2 | **Compiler breadth.** Divergent control flow, loops, LDS, atomics, subgroup ops, spilling; the `atrium-spv-tests` corpus as cases | Corpus green on all three oracles |
 | M3 | **Images and samplers** in compute | Texture fetch and sample cases green |
