@@ -162,10 +162,41 @@ pub fn flag(scene: &Scene, fonts: &FontSet, doc_text_chars: usize) -> Flags {
 
 /// Non-whitespace characters in a document's visible text: the denominator
 /// of `text_ratio`.
+///
+/// ★ "Visible" means what the page's OWN CSS shows. Text under
+/// `display: none`, or whose element computes `visibility: hidden`, is not
+/// on the page in any browser, so counting it made TEXTLOSS a measure of how
+/// much a site hides rather than of what the renderer lost: 13 of the 19
+/// TEXTLOSS pages in the 85-document corpus were closed menus and dialogs
+/// (MIT OCW hides 97% of its text, Apple's store 96%), and the real losses
+/// were buried among them.
 pub fn doc_text_chars(html: &str) -> usize {
+    use navigator_dom::Kind;
+    use navigator_style::{cascade::{cascade, Env, Style}, sheet::parse_sheet, values::V};
     let dom = navigator_dom::parse(html);
+    let sheets: Vec<_> = dom.by_tag_anywhere("style").into_iter()
+        .filter_map(|h| { let p = parse_sheet(&dom.text_content(h)); p.refused.is_none().then_some(p.sheet) }).collect();
+    let styled = cascade(&dom, &sheets, &Env::default());
     let body = dom.by_tag_anywhere("body").into_iter().next().unwrap_or(dom.root());
-    dom.visible_text(body).chars().filter(|c| !c.is_whitespace()).count()
+    fn walk(dom: &navigator_dom::Dom, st: &[Option<Style>], h: navigator_dom::Handle, shown: bool, n: &mut usize) {
+        match &dom.nodes[h as usize].kind {
+            Kind::Text(t) => if shown { *n += t.chars().filter(|c| !c.is_whitespace()).count() },
+            Kind::Element(tag) if matches!(tag.to_ascii_lowercase().as_str(),
+                "script" | "style" | "noscript" | "template" | "title") => {}
+            Kind::Element(_) => {
+                let s = st.get(h as usize).and_then(|s| s.as_ref());
+                if s.is_some_and(|s| matches!(s.get("display"), V::Kw("none"))) { return }
+                // `visibility` inherits and a descendant may set it back to
+                // `visible`, so it decides this element's own text only.
+                let shown = s.map_or(shown, |s| !matches!(s.get("visibility"), V::Kw("hidden" | "collapse")));
+                for &c in &dom.nodes[h as usize].children { walk(dom, st, c, shown, n) }
+            }
+            _ => for &c in &dom.nodes[h as usize].children { walk(dom, st, c, shown, n) },
+        }
+    }
+    let mut n = 0;
+    walk(&dom, &styled.styles, body, true, &mut n);
+    n
 }
 
 #[cfg(test)]
@@ -258,11 +289,22 @@ mod tests {
 
     #[test]
     fn textloss_fires_when_little_of_the_text_is_painted() {
-        let bad = run(&format!(r#"<style>.h {{ display: none }}</style><div class="h">{}</div><p>tiny</p>"#, "hidden ".repeat(100)));
-        // display:none text is not in the painted scene…
-        assert!(bad.text_ratio < 0.5);
-        // …which is why TEXTLOSS is a hint to look, not a verdict.
+        // Shown by the page's CSS, painted as nothing: the text counts and
+        // is missing (Vanguard's `body { opacity: 0 }` left by a snapshot).
+        let bad = run(&format!(r#"<style>.h {{ opacity: 0 }}</style><div class="h">{}</div><p>tiny</p>"#, "hidden ".repeat(100)));
+        assert!(bad.text_ratio < 0.5, "{}", bad.text_ratio);
         let good = run("<p>all of it painted</p>");
         assert!(good.text_ratio > 0.9, "{}", good.text_ratio);
+    }
+
+    #[test]
+    fn text_the_page_hides_is_not_text_lost() {
+        // A closed menu is not on the page in any browser.
+        let menu = run(&format!(r#"<style>.h {{ display: none }}</style><div class="h">{}</div><p>tiny</p>"#, "hidden ".repeat(100)));
+        assert!(menu.text_ratio > 0.9, "{}", menu.text_ratio);
+        // `visibility: hidden` hides the element's own text, and a child may
+        // show itself again.
+        let vis = run(&format!(r#"<style>.h {{ visibility: hidden }} .v {{ visibility: visible }}</style><div class="h">{}<p class="v">shown again</p></div>"#, "hidden ".repeat(100)));
+        assert!(vis.text_ratio > 0.9, "{}", vis.text_ratio);
     }
 }
