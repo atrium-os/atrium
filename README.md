@@ -13,43 +13,57 @@ For the full thesis see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). For canoni
 
 ## Status
 
-D0 (native virtio-gpu kmod through scanout), D1 (atrium-edit running interactively on FreeBSD-native via the full Fresco protocol over Unix socket), D1.5 (Tessera CAS-FS in-kernel; mmap/exec; snapshots; perf matching ZFS on fsync), D1.6 (aqueduct IPC substrate), and the D2.5 Portcullis core (privsep jaild + atrium-volumes + portcullisd-daemon + supervisor; capability-mediated runtime mounts via aqueduct; rc.d scripts) are all working as of 2026-05-08. Per-jail rootfs trees (D5) and the capability prompt UI (D3) are the two architectural pieces still ahead before the platform can host real third-party apps.
+As of 2026-10-02 (the last commit), these pieces work:
+
+- **D0 / D1**: a native virtio-gpu kmod through scanout, and `frescod` running Fresco on FreeBSD with atrium-edit interactive over the full protocol on a Unix socket.
+- **D1.5 Tessera**: the in-kernel CAS filesystem (`tessera_fs.ko`), with POSIX behaviour checked by pjdfstest, mmap/exec, snapshots, and fsync performance matching ZFS. July to September went into hardening it: crash recovery, GC correctness, metadata-reserve exhaustion returning ENOSPC cleanly, snapshot pinning, quota and dedup domains, `tessera-fsck` / `tessera-repack`, and a namespace verifier that runs after every commit (on by default).
+- **D1.6 Aqueduct**: the IPC substrate (envelope, CAS payloads, class registry).
+- **D2.5 Portcullis core**: privsep jaild + atrium-volumes + portcullisd + supervisor, rc.d scripts, and capability-mediated runtime mounts. Every jail has its own root, user apps get per-app overlay volumes, and each app runs on its own vnet stack (point-to-point epair, NAT out, pf-isolated) with a synthetic host identity. jaild creates one-shot jails directly.
+- **Tier-2 software Vulkan**: the `atrium-spv-*` SPIR-V compiler (bespoke ARM64 and Cranelift backends) behind `atrium-vk-icd`, held to byte-identical output by a differential test suite.
+- **D6 Navigator (the JS-free document lane)**: M0 (Markdown to NSG, byte-identical across machines) and M1 (a jailed fetcher that can reach the network but cannot name a file) have passed. In M2 the strict profile renderer matches all 64 property rows, the normalizer brings the real-document corpus to 29/29, images paint from the CAS store, and WPT reftests serve as an oracle.
+- **Started, not finished**: Stoa (persistent sessions), Lyra + Choragus (audio on the Laminar deadline scheduler), memoryd / memfed (memory pressure), atrium-gpu-amd (RDNA2), Pergola (the native toolkit) with first apps including the Vestibulum login screen, and the Forum shell pieces (`forum-wm`, `forum-bar`, `forum-dock`).
+
+Still ahead: D2 Vestibulum login and session handoff end to end, the D3 Forum shell with the capability prompt UI (Portcullis phase 5), Fresco onto the Aqueduct envelope (`docs/spec/fresco-production-rollout.md`), D4.5 declarative animation, the D5 atrium-mesa fork and CLASS_AX accessibility, and Navigator's semantic tree.
 
 See [RUNBOOK.md](RUNBOOK.md) for the bring-up procedure (`--virtio-gpu --display` QEMU flags, the `vtgpu` disable hint, host cross-compile setup) and [docs/ROADMAP.md](docs/ROADMAP.md) for per-phase scope and remaining work.
 
 ## Layout
 
+The tree is a flat set of crates and kmods, grouped by prefix:
+
 ```
 atrium/
-├── docs/                    architecture, roadmap, specs (wire-format, gpu-abi)
-│   ├── ARCHITECTURE.md
-│   ├── ROADMAP.md           phases D0..D7
-│   ├── NAMING.md            canonical vocabulary
-│   ├── LANGUAGE-POLICY.md   kernel = C, userspace = Rust, public APIs = C ABI
-│   ├── ORGANIZATION.md      proposed multi-repo layout under atrium-os/
-│   └── spec/
-│       ├── wire-format.md   normative Fresco protocol spec (v0.1.0)
-│       └── gpu-abi.md       Atrium GPU ABI spec (v0.1.0)
+├── docs/                    architecture, roadmaps (ROADMAP.md D0..D7, ROADMAP-INSULA.md), specs in docs/spec/
 │
 ├── atrium-kmod/             native FreeBSD virtio-gpu driver (C, no linuxkpi)
 ├── atrium-gpu-rs/           safe Rust binding for the Atrium GPU ABI
-├── fresco-rs/               Fresco protocol Rust binding (libfresco-backed; ivshmem path)
-├── fresco-socket-rs/        Fresco protocol Rust client over Unix socket
-├── fresco-text/             rustybuzz + swash glyph atlas builder
-├── libfresco/               C client library (ivshmem transport)
-├── fresco-kmod/             kmod for the ivshmem transport (development)
+├── atrium-gpu-amd/          native AMD (RDNA2) GPU module
+├── atrium-vk-icd/           Vulkan ICD over the Tier-2 software renderer
+├── atrium-spv-*/            SPIR-V frontend, IR, backends (bespoke ARM64, Cranelift), runtime, tests
 │
-├── frescod/       FreeBSD-native server (TinySkiaBackend + socket)
-├── atrium-edit/             text editor (libfresco / fresco-rs path)
-├── atrium-edit-socket/      text editor on the FreeBSD-native socket path
-├── atrium-term/             terminal emulator (libfresco path)
-├── atrium-clock/            analog clock (libfresco path)
-├── atrium-find/             two-pane file browser (libfresco path)
-├── atrium-test-client/      bring-up demos + wire-protocol harnesses
+├── fresco-*/, frescod/      Fresco protocol, scene server, text, Vulkan backend, the FreeBSD-native server
+├── libfresco/               C client library
+├── aqueduct*/               IPC substrate, conformance, paravirt GPU (guest, client, macOS host)
+├── carillon-*/              doorbell-driven GPU VM transport
 │
-├── scripts/                 run-vm.sh, vssh, vshutdown
+├── atrium-tessera/          Tessera content-addressed filesystem (kmod + tools)
+├── portcullis/              jaild, portcullisd, atrium-volumes, launcher
+├── stoa/                    persistent session service
+├── lyra*/, choragus/        audio subsystem and audio policy
+├── memoryd/, memfed/        memory-pressure daemon and per-jail memory federation
+│
+├── pergola/                 native UI toolkit
+├── vestibulum*/             login screen (+ macOS dev host)
+├── forum-*/                 shell: window manager, bar, dock, overview, control
+├── praeco-macos/, tabellarius-*/   notifications and push relay
+├── navigator-*/             Navigator: fetch, normalize, style, render, prerender, fonts, backend
+├── libatrium/               Insula platform library (C ABI for third-party apps)
+├── atrium-*-socket/         sample apps on the socket path (edit, term, clock, find)
+│
+├── scripts/                 run-vm.sh, vssh, vshutdown, bootstrap-atrium.sh, test harnesses
+├── etc/                     service manifests, devfs rules, pf, jail and volume policy
 ├── vm/                      QEMU EFI flash files (qcow2 disk excluded; see RUNBOOK)
-└── test-assets/             sample files used by demos
+└── test-assets/             sample files used by demos and tests
 ```
 
 The companion [`atrium-os/fresco`](https://github.com/atrium-os/fresco) repo holds the Fresco protocol server (and `fresco-server` Rust crate, kept as the historical crate name). This tree's `frescod` and the socket-side libraries link it as a path dependency at `../../fresco`. Clone both at the same parent directory:

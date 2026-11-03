@@ -43,9 +43,9 @@ See [ARCHITECTURE.md § What's done](ARCHITECTURE.md#whats-done-2026-04-28) and 
 
 ## What's next (immediate)
 
-The active fronts as of 2026-05-08:
+As of 2026-10-02. Since the May list, Tessera has been hardened (July to September), per-jail roots and per-app overlays landed (2026-09-13), every app got its own network stack (2026-09-22), and Navigator reached M2 (2026-09-23). The open fronts now:
 
-- **Fresco-on-aqueduct** — migrate Fresco from the legacy 128-byte fixed-frame format onto the unified envelope. The substrate is ready; the cutover plan is `spec/fresco-production-rollout.md` M2.
-- **D5 atrium-rootfs** — per-jail rootfs trees so manifests stop using `path = "/"`. Unblocks proper jail isolation testing and obsoletes the host-namespace mount workarounds.
-- **D2 vestibulum** (login screen) and **D3 forum** (dock) — both build on the jail runtime that now exists.
-- **atrium-mesa fork** (D5) — long-tail dependency for production-grade rendering.
+- **Fresco-on-aqueduct**: migrate Fresco from the legacy 128-byte fixed-frame format onto the unified envelope. The cutover plan is `spec/fresco-production-rollout.md` M2.
+- **D2 Vestibulum** (login and session handoff end to end) and **D3 Forum** (shell + capability prompt UI, Portcullis phase 5). Both have Pergola-based crates in the tree.
+- **Navigator**: the semantic tree (`spec/atrium-navigator-backend.md` §4), then M3 and beyond.
+- **atrium-mesa fork** (D5): the long-tail dependency for production-grade rendering.
