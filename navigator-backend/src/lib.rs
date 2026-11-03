@@ -20,6 +20,7 @@ pub mod limits;
 pub mod navigatord;
 pub mod reverse;
 pub mod session;
+pub mod store;
 pub mod wire;
 pub use ingest::ingest;
 pub use limits::Limits;

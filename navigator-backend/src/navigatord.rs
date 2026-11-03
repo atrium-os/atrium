@@ -42,6 +42,15 @@ pub trait DocumentHost {
     fn navigate(&mut self, id: SessionId, trigger: &str, now: Millis) -> Result<(), String>;
     fn back(&mut self, id: SessionId, now: Millis) -> Result<Back, String>;
     fn forward(&mut self, id: SessionId, now: Millis) -> Result<Forward, String>;
+    /// Save a session to the host's store, returning the saved record's
+    /// address. A host with no store says so.
+    fn save(&mut self, _id: SessionId) -> Result<String, String> {
+        Err("this host has no store to save sessions to".into())
+    }
+    /// Reopen a saved session by its record's address.
+    fn restore(&mut self, _saved: &str, _now: Millis) -> Result<SessionId, String> {
+        Err("this host has no store to restore sessions from".into())
+    }
     fn close(&mut self, id: SessionId) -> bool;
     fn expire(&mut self, now: Millis) -> Vec<(SessionId, Expiry)>;
     fn status(&self, id: SessionId) -> Status;
@@ -63,6 +72,11 @@ pub enum Request {
     Navigate { session: SessionId, trigger: String },
     Back { session: SessionId },
     Forward { session: SessionId },
+    /// Keep a session so it can be reopened later: after a restart, on
+    /// another day, after it expired.
+    Save { session: SessionId },
+    /// Reopen a saved session by the address `Saved` answered with.
+    Restore { saved: String },
     Close { session: SessionId },
     /// What is open and what it costs — a UI showing a session list, or a
     /// caller deciding what to evict under §4.4a.
@@ -85,6 +99,8 @@ pub enum Event {
     Rewound { session: SessionId, how: Back, triggers: Vec<String> },
     /// Went forward again, or there was nothing ahead.
     Advanced { session: SessionId, how: Forward, triggers: Vec<String> },
+    /// The session was saved; `saved` is the address to restore it by.
+    Saved { session: SessionId, saved: String },
     Closed { session: SessionId },
     /// A session ended on its own. Unsolicited: the UI did not ask, and needs
     /// to know before a reader clicks into a session that is gone.
@@ -181,6 +197,26 @@ impl<H: DocumentHost> Navigatord<H> {
                     Err(why) => out.push(Event::Blocked { session: Some(session), why }),
                 }
             }
+            Request::Save { session } => {
+                if let Some(e) = self.absent(session) { out.push(e); return out }
+                match self.host.save(session) {
+                    Ok(saved) => out.push(Event::Saved { session, saved }),
+                    Err(why) => out.push(Event::Blocked { session: Some(session), why }),
+                }
+            }
+            // ★ A restored session is announced exactly like an opened one:
+            // to the UI it is a session it can read, with the triggers it
+            // can take. Where the reader is inside it is the document's
+            // business, delivered with the scene.
+            Request::Restore { saved } => {
+                match self.host.restore(&saved, self.now) {
+                    Ok(session) => {
+                        let triggers = self.host.triggers(session);
+                        out.push(Event::SessionOpened { session, triggers });
+                    }
+                    Err(why) => out.push(Event::Blocked { session: None, why }),
+                }
+            }
             Request::Close { session } => {
                 if self.host.close(session) {
                     out.push(Event::Closed { session });
@@ -218,6 +254,10 @@ impl<H: DocumentHost> Navigatord<H> {
 pub struct InProcessHost {
     sessions: Sessions,
     limits: crate::Limits,
+    /// Where recordings and saved sessions go, if anywhere.
+    store: Option<Box<dyn crate::store::Store>>,
+    /// Each open session's recording address, in `store`.
+    recordings: std::collections::HashMap<SessionId, String>,
 }
 
 impl Default for InProcessHost {
@@ -226,7 +266,13 @@ impl Default for InProcessHost {
 
 impl InProcessHost {
     pub fn new(sessions: SessionLimits, limits: crate::Limits) -> Self {
-        InProcessHost { sessions: Sessions::new(sessions), limits }
+        InProcessHost { sessions: Sessions::new(sessions), limits, store: None, recordings: Default::default() }
+    }
+
+    /// With a store, so sessions can be saved and restored.
+    pub fn with_store(mut self, store: Box<dyn crate::store::Store>) -> Self {
+        self.store = Some(store);
+        self
     }
     pub fn sessions(&self) -> &Sessions { &self.sessions }
 }
@@ -234,7 +280,35 @@ impl InProcessHost {
 impl DocumentHost for InProcessHost {
     fn open(&mut self, recording: &[u8], now: Millis) -> Result<SessionId, String> {
         let r = crate::ingest(recording, &self.limits).map_err(|e| e.to_string())?;
-        self.sessions.open(&r, now).map_err(|e| e.to_string())
+        let id = self.sessions.open(&r, now).map_err(|e| e.to_string())?;
+        // ★ The recording goes into the store when it is OPENED, not when a
+        // session is saved: by then the bytes are gone, and a saved session
+        // that names a recording nobody kept cannot be restored.
+        if let Some(store) = &mut self.store {
+            match store.put(recording) {
+                Ok(a) => { self.recordings.insert(id, a); }
+                Err(why) => { self.sessions.close(id); return Err(format!("could not store the recording: {why}")) }
+            }
+        }
+        Ok(id)
+    }
+
+    fn save(&mut self, id: SessionId) -> Result<String, String> {
+        let store = self.store.as_mut().ok_or("this host has no store to save sessions to")?;
+        let s = self.sessions.get(id).ok_or("no such session")?;
+        let recording = self.recordings.get(&id).ok_or("this session's recording was not stored")?;
+        let saved = s.saved(recording).map_err(|e| format!("cannot save: {e}"))?;
+        store.put(&saved.to_json())
+    }
+
+    fn restore(&mut self, saved: &str, now: Millis) -> Result<SessionId, String> {
+        let store = self.store.as_ref().ok_or("this host has no store to restore sessions from")?;
+        let record = crate::session::Saved::from_json(&store.get(saved)?)?;
+        let bytes = store.get(&record.recording)?;
+        let r = crate::ingest(&bytes, &self.limits).map_err(|e| e.to_string())?;
+        let id = self.sessions.restore(&r, &record, now).map_err(|e| e.to_string())?;
+        self.recordings.insert(id, record.recording);
+        Ok(id)
     }
 
     fn navigate(&mut self, id: SessionId, trigger: &str, now: Millis) -> Result<(), String> {
@@ -252,8 +326,15 @@ impl DocumentHost for InProcessHost {
         s.forward().map_err(|e| e.to_string())
     }
 
-    fn close(&mut self, id: SessionId) -> bool { self.sessions.close(id) }
-    fn expire(&mut self, now: Millis) -> Vec<(SessionId, Expiry)> { self.sessions.expire(now) }
+    fn close(&mut self, id: SessionId) -> bool {
+        self.recordings.remove(&id);
+        self.sessions.close(id)
+    }
+    fn expire(&mut self, now: Millis) -> Vec<(SessionId, Expiry)> {
+        let gone = self.sessions.expire(now);
+        for (id, _) in &gone { self.recordings.remove(id); }
+        gone
+    }
     fn status(&self, id: SessionId) -> Status { self.sessions.status(id) }
     fn bytes(&self) -> usize { self.sessions.bytes() }
     fn open_count(&self) -> usize { self.sessions.len() }

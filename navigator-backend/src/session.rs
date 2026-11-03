@@ -165,6 +165,32 @@ impl std::fmt::Display for OpenError {
     }
 }
 
+/// Why a saved session could not be brought back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreError {
+    /// The recording itself would not open now (bounds, profile).
+    Open(OpenError),
+    /// The record names a transition the recording does not have.
+    NoSuchStep { index: usize },
+    /// A step that applied when it was taken does not apply on replay.
+    Replay { at: usize, why: ApplyError },
+    /// The replay reached a different document than the one saved.
+    Diverged,
+    TrailTooLong,
+}
+
+impl std::fmt::Display for RestoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RestoreError::Open(e) => write!(f, "{e}"),
+            RestoreError::NoSuchStep { index } => write!(f, "the saved session names step {index}, which its recording does not have"),
+            RestoreError::Replay { at, why } => write!(f, "step {at} of the saved session no longer applies: {why}"),
+            RestoreError::Diverged => write!(f, "replaying the saved session reached a different document than was saved"),
+            RestoreError::TrailTooLong => write!(f, "more than {MAX_TRAIL} saved steps"),
+        }
+    }
+}
+
 pub type SessionId = u64;
 
 fn effect_bytes(e: &crate::Effect) -> usize {
@@ -202,27 +228,111 @@ pub struct Session {
     /// recorded for it. Dropping the table at open time made a session able
     /// to hold a document and unable to do anything with it.
     transitions: Vec<Transition>,
+    /// ★ HOW TO GET BACK HERE: the steps taken from the published document,
+    /// as indexes into `transitions`. A session's restorable state is this
+    /// and the recording; the document is derived by replaying it, and
+    /// checked against a digest (see `restore`). An error once a step was taken
+    /// that is not in the table, or the trail outgrew `MAX_TRAIL` — such a
+    /// session still works, it just cannot be saved, and says so.
+    trail: Result<Vec<usize>, NotRestorable>,
+    /// The steps backed out of, as indexes; the top is the next forward.
+    ahead: Vec<usize>,
 }
+
+/// The longest trail a session will save. 4,096 steps is 64 times the
+/// default history and a few tens of KB encoded; past it, saving is refused
+/// rather than the record growing with every click for the life of a tab.
+pub const MAX_TRAIL: usize = 4096;
+
+/// Why a session cannot be saved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotRestorable {
+    /// A step was taken that is not in the recording's transition table, so
+    /// replaying the recording cannot reproduce it.
+    UnrecordedStep,
+    /// More than `MAX_TRAIL` steps from the published document.
+    TrailTooLong,
+}
+
+impl std::fmt::Display for NotRestorable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotRestorable::UnrecordedStep => write!(f, "a step this session took is not in its recording"),
+            NotRestorable::TrailTooLong => write!(f, "more than {MAX_TRAIL} steps from the published document"),
+        }
+    }
+}
+
+/// What a session needs to be restored, beside its recording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Saved {
+    pub url: String,
+    /// The recording's content address, filled in by whoever holds its bytes.
+    pub recording: String,
+    pub steps: Vec<usize>,
+    pub ahead: Vec<usize>,
+    /// BLAKE3 of the reader's document as serialized when saved.
+    pub document: String,
+}
+
+/// The digest a saved session is checked against.
+pub fn digest(bytes: &[u8]) -> String { blake3::hash(bytes).to_hex().to_string() }
 
 impl Session {
     pub fn document(&self) -> &Document { self.history.document() }
 
     pub fn go(&mut self, t: &Transition) -> Result<(), ApplyError> {
+        let index = self.transitions.iter().position(|x| x == t);
         self.history.go(t)?;
+        self.ahead.clear();
+        match index { Some(i) => self.push_trail(i), None => self.trail = Err(NotRestorable::UnrecordedStep) }
         self.remeasure();
         Ok(())
     }
 
+    fn go_index(&mut self, i: usize) -> Result<(), ApplyError> {
+        let t = self.transitions[i].clone();
+        self.history.go(&t)?;
+        self.ahead.clear();
+        self.push_trail(i);
+        self.remeasure();
+        Ok(())
+    }
+
+    fn push_trail(&mut self, i: usize) {
+        if let Ok(trail) = &mut self.trail {
+            trail.push(i);
+            if trail.len() > MAX_TRAIL { self.trail = Err(NotRestorable::TrailTooLong) }
+        }
+    }
+
     pub fn back(&mut self) -> Result<Back, ApplyError> {
         let r = self.history.back()?;
-        if r == Back::Stepped { self.remeasure() }
+        if r == Back::Stepped {
+            if let Some(i) = self.trail.as_mut().ok().and_then(Vec::pop) { self.ahead.push(i) }
+            self.remeasure()
+        }
         Ok(r)
     }
 
     pub fn forward(&mut self) -> Result<Forward, ApplyError> {
         let r = self.history.forward()?;
-        if r == Forward::Stepped { self.remeasure() }
+        if r == Forward::Stepped {
+            if let Some(i) = self.ahead.pop() { self.push_trail(i) }
+            self.remeasure()
+        }
         Ok(r)
+    }
+
+    /// What it takes to bring this session back, given its recording's
+    /// address.
+    pub fn saved(&self, recording: &str) -> Result<Saved, NotRestorable> {
+        let steps = self.trail.clone()?;
+        Ok(Saved {
+            url: self.url.clone(), recording: recording.to_string(), steps,
+            ahead: self.ahead.clone(),
+            document: digest(self.history.document().dom.serialize().as_bytes()),
+        })
     }
 
     /// How many states the reader can go forward to.
@@ -260,10 +370,9 @@ impl Session {
 
     /// Take the transition a trigger names.
     pub fn navigate(&mut self, trigger: &str) -> Result<(), NavigateError> {
-        let t = self.transition_for(trigger)
-            .ok_or_else(|| NavigateError::NoSuchTrigger { trigger: trigger.to_string() })?
-            .clone();
-        self.go(&t).map_err(NavigateError::Refused)
+        let i = self.transitions.iter().position(|t| t.anchored && t.trigger == trigger)
+            .ok_or_else(|| NavigateError::NoSuchTrigger { trigger: trigger.to_string() })?;
+        self.go_index(i).map_err(NavigateError::Refused)
     }
 
     pub fn opened_at(&self) -> Millis { self.opened_at }
@@ -400,8 +509,57 @@ impl Sessions {
             history: History::with_limits(doc, self.limits.history),
             opened_at: now,
             last_seen: now,
+            trail: Ok(vec![]),
+            ahead: vec![],
         });
         Ok(id)
+    }
+
+    /// ★ RESTORE BY REPLAY, CHECKED BY DIGEST. The saved record is untrusted
+    /// — it comes back from a store, and the store does not vouch for it — so
+    /// nothing in it is believed: the recording is opened through `open`
+    /// (profile and budget checks included), every step goes through the
+    /// ordinary apply path with its preconditions, and the document the
+    /// replay reaches must hash to the one saved. A record that names a step
+    /// out of range, a step that no longer applies, or a different end state
+    /// is refused, and the half-built session is closed rather than handed
+    /// to a reader as if it were theirs.
+    ///
+    /// Forward is rebuilt the way it was made: the steps backed out of are
+    /// taken and then backed out of again, so `ahead` holds the same states.
+    /// What is NOT reproduced exactly is how many early states a bounded
+    /// history had forgotten; a replay under the same limits forgets by the
+    /// same rule, which can differ from a session whose backs and steps were
+    /// interleaved.
+    pub fn restore(&mut self, r: &Recording, saved: &Saved, now: Millis) -> Result<SessionId, RestoreError> {
+        if saved.steps.len() + saved.ahead.len() > MAX_TRAIL {
+            return Err(RestoreError::TrailTooLong);
+        }
+        let n = r.transitions.len();
+        if let Some(&bad) = saved.steps.iter().chain(&saved.ahead)
+            .find(|&&i| i >= n || !r.transitions[i].anchored) {
+            return Err(RestoreError::NoSuchStep { index: bad });
+        }
+        let id = self.open(r, now).map_err(RestoreError::Open)?;
+        let result = (|| {
+            let s = self.open.get_mut(&id).expect("just opened");
+            for (at, &i) in saved.steps.iter().chain(saved.ahead.iter().rev()).enumerate() {
+                s.go_index(i).map_err(|why| RestoreError::Replay { at, why })?;
+            }
+            for _ in 0..saved.ahead.len() {
+                match s.back() {
+                    Ok(Back::Stepped) => {}
+                    _ => return Err(RestoreError::Diverged),
+                }
+            }
+            let got = digest(s.document().dom.serialize().as_bytes());
+            if got != saved.document { return Err(RestoreError::Diverged) }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(id),
+            Err(e) => { self.close(id); Err(e) }
+        }
     }
 
     /// Close a session. Returns whether there was one — closing twice is not
@@ -430,5 +588,47 @@ impl Sessions {
             .collect();
         v.sort_by_key(|(id, _, _)| *id);
         v
+    }
+}
+
+/// The saved-session record's format name. Versioned like the recording's.
+pub const SAVED_FORMAT: &str = "atrium-navigator-session/1";
+
+/// A record past this size is refused before it is parsed. `MAX_TRAIL`
+/// indexes of up to 20 digits plus the fixed fields fit with room to spare.
+pub const MAX_SAVED_BYTES: usize = 128 * 1024;
+
+impl Saved {
+    pub fn to_json(&self) -> Vec<u8> {
+        serde_json::json!({
+            "format": SAVED_FORMAT, "url": self.url, "recording": self.recording,
+            "steps": self.steps, "ahead": self.ahead, "document": self.document,
+        }).to_string().into_bytes()
+    }
+
+    /// ★ UNTRUSTED, like a recording: bounded before parsing, every field
+    /// typed, nothing defaulted. A missing field is a refusal, not a zero.
+    pub fn from_json(bytes: &[u8]) -> Result<Saved, String> {
+        if bytes.len() > MAX_SAVED_BYTES {
+            return Err(format!("saved session is {} bytes, over the {MAX_SAVED_BYTES} limit", bytes.len()));
+        }
+        let v: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| format!("not a saved session: {e}"))?;
+        let o = v.as_object().ok_or("a saved session is a JSON object")?;
+        let text = |k: &str| o.get(k).and_then(|x| x.as_str()).map(str::to_string)
+            .ok_or_else(|| format!("saved session has no {k:?}"));
+        if text("format")? != SAVED_FORMAT { return Err(format!("not {SAVED_FORMAT}")) }
+        let list = |k: &str| -> Result<Vec<usize>, String> {
+            let a = o.get(k).and_then(|x| x.as_array()).ok_or_else(|| format!("saved session has no {k:?}"))?;
+            if a.len() > MAX_TRAIL { return Err(format!("{k:?} has more than {MAX_TRAIL} entries")) }
+            a.iter().map(|x| x.as_u64().map(|n| n as usize).ok_or_else(|| format!("{k:?} holds a non-index")))
+                .collect()
+        };
+        let hex64 = |s: String, k: &str| if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) { Ok(s) }
+            else { Err(format!("{k:?} is not a BLAKE3 hex digest")) };
+        Ok(Saved {
+            url: text("url")?, recording: hex64(text("recording")?, "recording")?,
+            steps: list("steps")?, ahead: list("ahead")?,
+            document: hex64(text("document")?, "document")?,
+        })
     }
 }

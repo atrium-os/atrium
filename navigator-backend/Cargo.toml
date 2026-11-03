@@ -17,3 +17,7 @@ serde_json = "1"
 # would eventually disagree about the same bytes, and a disagreement between
 # the producer of an artifact and its renderer is not found by testing either.
 navigator-dom = { path = "../navigator-dom" }
+# The content address a saved session and its recording travel by — the same
+# hash, and the same pure-Rust build, as navigator-prerender's subresources
+# (spec §5: the store is Tessera, and Tessera is content-addressed).
+blake3 = { version = "1", features = ["pure"] }

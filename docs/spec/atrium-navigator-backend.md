@@ -826,7 +826,7 @@ Everything here runs headless, in CI, with no display server.
 | **M1** | jailed fetcher | fetcher's filesystem access refused **at the syscall**, asserted by test |
 | **M2** | Document Profile v1 (HTML + CSS) | curated corpus with a reported conformance **number** — rows **64/64**, corpus **29/29 after the normalizer** (§8.4 measured 1/29 raw, §8.5 closed it). Converter must still carry stylesheets and image sizes |
 | **M3** | per-document jail + graph validator | worker capabilities == none; validator fuzzed with reached-coverage reported; **per-document jail launch cost measured**, not assumed — **PASSED** (§8.6) |
-| **M4** | navigation state machine + history in Tessera | back/forward/session-restore driven headlessly — back and forward done (§4.4, §8.7); session restore and the Tessera store open |
+| **M4** | navigation state machine + history in Tessera | back/forward/session-restore driven headlessly — done in-process (§4.4, §8.7, §8.8); the jailed host and a store on a Tessera volume are open |
 | **M5** | UI attach (Pergola chrome + Limen document surface) | **UI deleted ⇒ suite still green** |
 | **M6** | app-launch path (`atrium-app://` → Nomenclator → Opifex → jail) | trial-launch consent gesture; signature verified before launch |
 
@@ -1873,10 +1873,43 @@ the broker driven through its control plane only, a vanished session, and the fu
 across a worker process. `roundtrip.rs` gains a corpus check (go, back, forward, byte-equal)
 that runs with `NAVIGATOR_RECORDINGS` set, like the others.
 
-**Still open for M4:** session restore and history in Tessera. A session's restorable state
-is small and mostly derivable (the recording's address and the transitions taken), but the
-store and its integrity checks are not built, and the jailed and Tessera-backed runs need
-the VM.
+### 8.8 M4 — session restore (2026-11-03)
+
+**A saved session is its recording's address and the steps taken, nothing else.** The
+document is derived by replaying the steps through the ordinary apply path, so a saved
+record holds no second copy of anything derivable. `Session` keeps the trail as indexes
+into the recording's transition table (and the steps backed out of, for forward); a step
+that is not in the table makes the session unsaveable, and saving says why rather than
+writing a record that cannot be replayed. The trail is capped at 4,096 steps.
+
+**The record is untrusted, like a recording.** `Saved::from_json` bounds the bytes before
+parsing (128 KiB), types every field and defaults none. `Sessions::restore` opens the
+recording through `open` (profile and budget checks included), refuses an index out of
+range or unanchored, replays every step with its preconditions, rebuilds forward by taking
+the steps backed out of and backing out of them again, and then requires the document to
+hash (BLAKE3) to the one saved. Any refusal closes the half-built session.
+
+**The store is content-addressed** (`store.rs`): `MemoryStore`, and `DirStore`, one file per
+object named by its address, the shape of the converter's `PRERENDER_BLOB_DIR`. A `get`
+re-hashes and refuses a mismatch, and an address is validated before it becomes a path. The
+broker gains `Request::Save` / `Event::Saved` and `Request::Restore`, which answers
+`SessionOpened` like an open. `InProcessHost::with_store` puts each recording into the
+store when it is **opened**, because by the time a session is saved the bytes are gone. A
+host without a store, including the jailed one for now, answers `Blocked` with the reason.
+
+Tests (`tests/restore.rs`, 11): a restored session matches byte for byte and walks the same
+back and forward path; the record round-trips its encoding; a step out of range, a step that
+no longer applies, and an end state not reached are each refused with nothing left open; a
+step outside the recording makes a session unsaveable; malformed and oversized records are
+refused; a store refuses a replaced object and a path-shaped address; and through the broker
+a saved session outlives its expiry and comes back with forward and back intact.
+
+**What a restore does not reproduce exactly:** how many early states a bounded history had
+forgotten. A replay under the same limits forgets by the same rule, which can differ from a
+session whose steps and backs were interleaved.
+
+**Still open for M4:** restore through the jailed host (a worker request to replay a trail),
+and `DirStore` pointed at a directory on a Tessera volume. Both need the VM.
 
 ## 9. What this reuses
 
