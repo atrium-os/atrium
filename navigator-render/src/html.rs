@@ -1528,6 +1528,21 @@ impl<'a> Cx<'a> {
                       line(cs.get("grid-row-start")), line(cs.get("grid-row-end")),
                       pick("justify-self", "justify-items"), pick("align-self", "align-items")));
         }
+        // ★ A NEGATIVE line counts from the END of the explicit grid: -1 is
+        // the last line of the template. It was read as "no end", so
+        // `grid-column: 1 / -1` (the full-width idiom) spanned ONE column:
+        // Notion's footer menus came out in a 24px strip, one word wide.
+        // Lines before the first one clamp to it (the profile has no
+        // implicit tracks before the explicit grid).
+        let (ncols, nrows) = (cols_tpl.len() as i32, rows_tpl.len() as i32);
+        let resolve = |l: GridLine, n: i32| match l {
+            GridLine::Line(v) if v < 0 => GridLine::Line((n + 2 + v).max(1)),
+            other => other,
+        };
+        for r in raw.iter_mut() {
+            r.1 = resolve(r.1, ncols); r.2 = resolve(r.2, ncols);
+            r.3 = resolve(r.3, nrows); r.4 = resolve(r.4, nrows);
+        }
         // Placement. A definite line is 1-based; `span n` sizes the area.
         let span_of = |a: GridLine, b: GridLine| -> (Option<usize>, usize) {
             match (a, b) {
@@ -1536,6 +1551,15 @@ impl<'a> Cx<'a> {
                 (GridLine::Line(s0), _) => (Some((s0 - 1).max(0) as usize), 1),
                 (GridLine::Auto, GridLine::Line(e)) if e > 1 => (Some((e - 2).max(0) as usize), 1),
                 (GridLine::Auto, GridLine::Span(n)) => (None, n.max(1) as usize),
+                // ★ The span can sit on EITHER side: `span 4 / auto` is four
+                // auto-placed tracks, and `span 2 / 5` ends at line 5. Both
+                // used to fall through to one track, and Goodreads' 4-of-6
+                // book column came out one sixth wide.
+                (GridLine::Span(n), GridLine::Line(e)) => {
+                    let n = n.max(1);
+                    (Some((e - n - 1).max(0) as usize), n as usize)
+                }
+                (GridLine::Span(n), _) => (None, n.max(1) as usize),
                 _ => (None, 1),
             }
         };
@@ -3229,6 +3253,31 @@ mod tests {
         assert_eq!(boxes(&o, 0x0000ffff), vec![(370, 0, 250, 20)]);
         // Second row, spanning both fr columns and the gap between them.
         assert_eq!(boxes(&o, 0xffff00ff), vec![(110, 25, 510, 20)]);
+    }
+
+    #[test]
+    fn a_negative_grid_line_counts_from_the_end() {
+        // `1 / -1` is the full-width idiom: every column, whatever the count.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 320px; grid-template-columns: 100px 100px 100px; column-gap: 10px }
+            .g > div { height: 10px }
+            .a { background-color: #ff0000; grid-column-start: 1; grid-column-end: -1 }
+            .b { background-color: #00ff00; grid-column-start: -2; grid-column-end: -1 }</style>
+            <div class="g"><div class="a"></div><div class="b"></div></div>"#);
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 320, 10)]);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(220, 10, 100, 10)]);
+    }
+
+    #[test]
+    fn a_span_on_the_start_side_spans() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 300px; grid-template-columns: 100px 100px 100px }
+            .g > div { height: 10px }
+            .a { background-color: #ff0000; grid-column-start: span 2; grid-column-end: auto }
+            .b { background-color: #00ff00; grid-column-start: span 2; grid-column-end: 4 }</style>
+            <div class="g"><div class="a"></div><div class="b"></div></div>"#);
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 200, 10)]);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(100, 10, 200, 10)]);
     }
 
     #[test]

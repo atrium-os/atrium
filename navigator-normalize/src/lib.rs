@@ -622,6 +622,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     for u in unplaced { report.drop(u) }
     if placed > 0 { report.drop_n("named grid areas resolved to numbered lines", placed) }
     for (_, props) in resolved.iter_mut() { props.remove("grid-template-areas"); }
+    named_line_pass(&mut resolved, &dom, &mut report);
 
     // 5. Emit: one class per distinct block, so elements that resolved to the
     //    same declarations share a rule instead of each getting their own.
@@ -1027,6 +1028,15 @@ fn resolve_var(value: &[Token], custom: &Customs, depth: usize) -> Option<Vec<To
 /// A declaration as longhands the profile admits, or nothing.
 fn to_longhands(name: &str, value: &[Token], inputs: &Inputs, report: &mut Report) -> Vec<(String, String)> {
     if name.starts_with("--") { return vec![] }
+    // ★ The pre-standard grid gap names are ALIASES in every engine (CSS
+    // Box Alignment §8.3): `grid-gap: 24px` is `gap: 24px`, and dropping it
+    // set every such grid's items edge to edge.
+    let name = match name {
+        "grid-gap" => "gap",
+        "grid-column-gap" => "column-gap",
+        "grid-row-gap" => "row-gap",
+        n => n,
+    };
     let text = css::write_tokens(value).trim().to_string();
     if text.is_empty() { return vec![] }
     // Already a longhand the profile knows?
@@ -1036,6 +1046,15 @@ fn to_longhands(name: &str, value: &[Token], inputs: &Inputs, report: &mut Repor
         return vec![("grid-area-name".to_string(), text)];
     }
     if name == "grid-template-areas" { return vec![(name.to_string(), text)] }
+    // ★ NAMED GRID LINES, half one: the template's names, as a map from
+    // name to line number, carried beside the stripped track list (see the
+    // named-line pass). Half two is below, on the items.
+    let mut line_names = vec![];
+    if (name == "grid-template-columns" || name == "grid-template-rows") && text.contains('[') {
+        if let Some(map) = grid_line_names(&text) {
+            line_names.push((format!("{name}-lines-marker"), map));
+        }
+    }
     // ★ `float` is not in the profile, but a ROW of same-direction floats is
     // the pre-flexbox idiom for a horizontal strip, and block-stacking it is
     // simply wrong: GitHub's Watch/Fork/Star buttons came out one per line.
@@ -1088,7 +1107,17 @@ fn to_longhands(name: &str, value: &[Token], inputs: &Inputs, report: &mut Repor
     // ★ Check the output against the profile's own grammar, repair what has
     // an honest mapping, and drop the rest WITH ITS VALUE. Nothing the
     // renderer can refuse leaves this function.
-    pairs.into_iter().filter_map(|(p, v)| {
+    let mut out: Vec<(String, String)> = line_names;
+    out.extend(pairs.into_iter().filter_map(|(p, v)| {
+        // ★ NAMED GRID LINES, half two: `grid-column: content-start /
+        // content-end` names lines of the PARENT's template, so it is
+        // carried as a marker and numbered once the cascade knows that
+        // template. Notion's whole page sits in such a column; dropping the
+        // names put it in the 16px gutter.
+        if matches!(p.as_str(), "grid-column-start" | "grid-column-end" | "grid-row-start" | "grid-row-end")
+            && is_line_name(&v) {
+            return Some((format!("{p}-name-marker"), v));
+        }
         // ★ `display: contents` is not a value the profile has — it is a
         // STRUCTURAL instruction: generate no box, and let the children take
         // this element's place in its parent. The normalizer can carry that
@@ -1104,7 +1133,7 @@ fn to_longhands(name: &str, value: &[Token], inputs: &Inputs, report: &mut Repor
         // the same cell: rustdoc's breadcrumb rendered on top of its search
         // box.
         if p == "grid-template-areas" || p == "grid-area-name" || p == "float-marker" || p == "box-sizing-marker"
-            || p == "clip-marker" || p == "clip-path-marker" { return Some((p, v)) }
+            || p == "clip-marker" || p == "clip-path-marker" || p.ends_with("-lines-marker") { return Some((p, v)) }
         // ★ An image the input has not measured cannot be painted (§3.13),
         // and the renderer says so. The normalizer must decide it HERE, the
         // same way it decides for an `<img>`, or it ships a document that
@@ -1128,13 +1157,114 @@ fn to_longhands(name: &str, value: &[Token], inputs: &Inputs, report: &mut Repor
             Some(fixed) => Some((p, fixed)),
             None => { report.drop(format!("value `{p}: {v}`")); None }
         }
-    }).collect()
+    }));
+    out
+}
+
+/// A grid line given by NAME: one custom identifier, not `auto`, `span …`
+/// or a number.
+fn is_line_name(v: &str) -> bool {
+    let v = v.trim();
+    !v.is_empty() && !v.contains(' ') && v != "auto" && !matches!(v, "inherit" | "initial" | "unset" | "revert")
+        && v.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '-' || c == '_')
+        && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// `[a b] 1fr [c] minmax(0, 2fr) [d]` -> `a=1 b=1 c=2 d=3`: each name and
+/// the 1-based line it labels. `None` when a `repeat()` makes the count
+/// depend on the box (`auto-fill`, `auto-fit`) or carries names inside it.
+pub(crate) fn grid_line_names(v: &str) -> Option<String> {
+    let mut line = 1usize;
+    let mut names: Vec<(String, usize)> = vec![];
+    let mut i = 0usize;
+    let b: Vec<char> = v.chars().collect();
+    while i < b.len() {
+        let c = b[i];
+        if c.is_whitespace() { i += 1; continue }
+        if c == '[' {
+            let j = b[i..].iter().position(|x| *x == ']')? + i;
+            for n in b[i + 1..j].iter().collect::<String>().split_whitespace() { names.push((n.to_string(), line)) }
+            i = j + 1;
+            continue;
+        }
+        // One track: up to the next whitespace at paren depth 0.
+        let start = i;
+        let mut depth = 0i32;
+        while i < b.len() && !(depth == 0 && (b[i].is_whitespace() || b[i] == '[')) {
+            match b[i] { '(' => depth += 1, ')' => depth -= 1, _ => {} }
+            i += 1;
+        }
+        let track: String = b[start..i].iter().collect();
+        if let Some(inner) = track.strip_prefix("repeat(").and_then(|x| x.strip_suffix(')')) {
+            let (n, body) = inner.split_once(',')?;
+            let n: usize = n.trim().parse().ok()?;
+            if body.contains('[') { return None }
+            line += n * count_tracks(body);
+        } else {
+            line += 1;
+        }
+    }
+    if names.is_empty() { return None }
+    Some(names.into_iter().map(|(n, l)| format!("{n}={l}")).collect::<Vec<_>>().join(" "))
+}
+
+fn count_tracks(body: &str) -> usize {
+    let (mut n, mut depth, mut in_track) = (0usize, 0i32, false);
+    for c in body.chars() {
+        match c {
+            '(' => { depth += 1; if !in_track { in_track = true; n += 1 } }
+            ')' => depth -= 1,
+            c if c.is_whitespace() && depth == 0 => in_track = false,
+            _ => if !in_track { in_track = true; n += 1 },
+        }
+    }
+    n
+}
+
+/// Number the named lines (see `grid_line_names`). An item's name is looked
+/// up in its PARENT's template, in the same media context or else the base
+/// one. `foo` alone means `foo-start` for a start and `foo-end` for an end,
+/// as CSS Grid §8.3 has it. A name no template has is dropped, and said so.
+fn named_line_pass(resolved: &mut BTreeMap<(Handle, String, String), BTreeMap<String, (Priority, String)>>, dom: &Dom, report: &mut Report) {
+    let maps: BTreeMap<(Handle, String, String), BTreeMap<String, usize>> = resolved.iter()
+        .filter(|((_, st, _), _)| st.is_empty())
+        .flat_map(|((h, _, media), props)| ["grid-template-columns", "grid-template-rows"].into_iter().filter_map(|axis| {
+            let (_, v) = props.get(&format!("{axis}-lines-marker"))?;
+            let m = v.split_whitespace().filter_map(|kv| { let (k, l) = kv.split_once('=')?; Some((k.to_string(), l.parse().ok()?)) }).collect();
+            Some(((*h, media.clone(), axis.to_string()), m))
+        }).collect::<Vec<_>>())
+        .collect();
+    let (mut placed, mut lost) = (0usize, 0usize);
+    for ((h, _, media), props) in resolved.iter_mut() {
+        for p in ["grid-column-start", "grid-column-end", "grid-row-start", "grid-row-end"] {
+            let Some((pri, name)) = props.remove(&format!("{p}-name-marker")) else { continue };
+            let axis = if p.starts_with("grid-column") { "grid-template-columns" } else { "grid-template-rows" };
+            let parent = dom.get(*h).and_then(|n| n.parent);
+            let map = parent.and_then(|q| maps.get(&(q, media.clone(), axis.to_string())).or_else(|| maps.get(&(q, String::new(), axis.to_string()))));
+            let side = if p.ends_with("start") { "-start" } else { "-end" };
+            let n = map.and_then(|m| m.get(&name).or_else(|| m.get(&format!("{name}{side}"))));
+            match n {
+                Some(n) => {
+                    if props.get(p).is_none_or(|(o, _)| *o <= pri) { props.insert(p.to_string(), (pri, n.to_string())); }
+                    placed += 1;
+                }
+                None => lost += 1,
+            }
+        }
+    }
+    for (_, props) in resolved.iter_mut() { props.remove("grid-template-columns-lines-marker"); props.remove("grid-template-rows-lines-marker"); }
+    if placed > 0 { report.drop_n("named grid lines resolved to numbers", placed) }
+    if lost > 0 { report.drop_n("grid line name no parent template has", lost) }
 }
 
 /// A media query the profile admits, normalized to its own spelling — or
 /// `None`, in which case the rules inside it are dropped.
 fn admitted_media(q: &str) -> Option<String> {
-    let q = q.trim().to_ascii_lowercase();
+    // ★ Minifiers drop the space after a `)`: `(min-width:768px)and
+    // (max-width:1023px)` is the same query, and the browser reads it so.
+    // Splitting on " and " alone refused 442 rules in the corpus, among
+    // them Which?'s whole medium-width grid.
+    let q = q.trim().to_ascii_lowercase().replace(")and", ") and").replace(" and(", " and (");
     // ★ A comma LIST is an OR, and the renderer evaluates lists. Each member
     // is admitted on its own: one that can never match on a screen (`print`)
     // simply leaves the OR, and one that always matches makes the whole

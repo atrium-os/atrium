@@ -300,7 +300,16 @@ pub fn expand(name: &str, value: &[Token]) -> Option<Vec<(String, String)>> {
         "grid-column" | "grid-row" => {
             let axis = name.rsplit('-').next()?;
             let joined = p.join(" ");
-            let (a, b) = match joined.split_once('/') { Some((a, b)) => (a.trim().to_string(), b.trim().to_string()), None => (joined.trim().to_string(), "auto".to_string()) };
+            let (a, b) = match joined.split_once('/') { Some((a, b)) => (a.trim().to_string(), b.trim().to_string()), None => {
+                // A lone NAME is that name at both ends (Grid §8.4): `grid-column:
+                // full` spans full-start to full-end. A lone number or span
+                // ends at `auto`.
+                let a = joined.trim().to_string();
+                let named = a.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && !a.contains(' ')
+                    && !matches!(a.as_str(), "auto" | "inherit" | "initial" | "unset" | "revert");
+                let b = if named { a.clone() } else { "auto".to_string() };
+                (a, b)
+            } };
             Some(vec![(format!("grid-{axis}-start"), a), (format!("grid-{axis}-end"), b)])
         }
         "grid-area" => {

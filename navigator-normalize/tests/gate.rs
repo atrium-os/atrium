@@ -874,3 +874,37 @@ fn an_empty_clip_hides_and_a_real_one_is_dropped() {
     assert!(report.dropped.keys().any(|k| k.contains("clip-path")), "the circle is still dropped: {:?}", report.dropped);
     assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
 }
+
+/// Named grid LINES become numbers, from the parent's template; the old
+/// gap aliases are the gaps. Notion's page column (`content-start /
+/// content-end`) landed in its 16px gutter without this.
+#[test]
+fn named_grid_lines_are_numbered_and_gap_aliases_hold() {
+    let src = r#"<html><head><style>
+      .layout { display: grid; grid-template-columns: [full-start] 16px [content-start] minmax(0, 1fr) [content-end] 16px [full-end]; grid-gap: 24px }
+      .layout > * { grid-column: content-start / content-end }
+      .wide { grid-column: full }
+      .bad { grid-column: nowhere-start / nowhere-end }
+    </style></head><body><div class="layout">
+      <p>in the content column</p><p class="wide">full bleed</p><p class="bad">unplaced</p>
+    </div></body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    assert!(out.contains("grid-column-start: 2") && out.contains("grid-column-end: 3"), "content-start/end -> 2/3: {out}");
+    assert!(out.contains("grid-column-start: 1") && out.contains("grid-column-end: 4"), "`full` alone -> 1/4: {out}");
+    assert!(out.contains("column-gap: 24px") && out.contains("row-gap: 24px"), "grid-gap is gap: {out}");
+    assert!(!out.contains("[full-start]"), "the names themselves are gone: {out}");
+    assert!(report.dropped.keys().any(|k| k.contains("no parent template")), "{:?}", report.dropped);
+    assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+}
+
+/// A minified compound query (`)and (`) is the same query.
+#[test]
+fn a_minified_compound_media_query_is_admitted() {
+    let src = r#"<html><head><style>
+      @media only screen and (min-width: 768px)and (max-width: 1023px) { p { margin-left: 33px } }
+    </style></head><body><p>x</p></body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    assert!(out.contains("margin-left: 33px"), "{out}");
+    assert!(!report.dropped.keys().any(|k| k.contains("not admitted")), "{:?}", report.dropped);
+    assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+}
