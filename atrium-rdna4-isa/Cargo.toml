@@ -1,0 +1,12 @@
+[package]
+name        = "atrium-rdna4-isa"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "RDNA4 (GFX12) instruction encodings, generated from AMD's machine-readable ISA. Encoder and decoder for the native Tier-3 backend. See docs/spec/atrium-rdna4-vulkan-backend.md."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

@@ -59,7 +59,7 @@ New crates:
 
 | Crate | Job |
 |---|---|
-| `atrium-rdna4-isa` | Instruction encodings, operand classes and wait-counter effects for GFX12, **generated** from AMD's machine-readable RDNA4 ISA (XML) at build time. Assembler and disassembler. No hand-written encoding tables |
+| `atrium-rdna4-isa` | Instruction encodings and operand classes for GFX12, **generated** from AMD's machine-readable RDNA4 ISA (XML) at build time. Assembler and disassembler. No hand-written encoding tables |
 | `atrium-rdna4-compiler` | atrium-spv IR → RDNA4 machine code (§3) |
 | `atrium-rdna4-cmd` | Command-blob builder: PM4 packets, register state, resource descriptors, barriers (§4) |
 | `aqueduct-gpu-host::tier3_rdna4` | The `Backend` impl: resources to BOs, `FrameOp`s to blobs, submit, fences, present (§5) |
@@ -94,10 +94,16 @@ Pipeline:
    builder.
 7. **Wait insertion.** Memory and scalar-load results arrive asynchronously and
    need explicit waits before use. GFX12 splits these into separate counters
-   (loads, stores, samples, scalar/constant loads, LDS); the pass computes
-   minimal waits from the per-instruction counter effects in the ISA tables,
-   never from hand-coded rules.
-8. **Hazard pass.** Required NOPs and ordering from the ISA tables.
+   (loads, stores, samples, BVH, scalar/constant loads, LDS). AMD's XML gives
+   every instruction's functional group (`VMEM`/`BUFFER`/`SAMPLE`/`SMEM`/
+   `DATA_SHARE`/...) but **not** its counter effects, so the counter model is a
+   small, reviewed table keyed by functional group and memory direction, written
+   from the RDNA4 ISA guide and checked instruction class by instruction class
+   with R9700 microtests (§6). The pass computes minimal waits from that table,
+   never from rules scattered through the compiler.
+8. **Hazard pass.** Required NOPs and ordering from the ISA guide's hazard
+   section, kept as one table next to the counter model (the XML does not carry
+   hazards either).
 9. **Encode** with `atrium-rdna4-isa`, emitting a shader binary plus metadata
    (register counts, scratch, LDS, user-SGPR layout).
 
@@ -197,7 +203,7 @@ The loop:
 
 | # | Milestone | Exit criterion |
 |---|---|---|
-| M0 | **Ground work.** Inventory the Vulkan subset ([done: `rdna4-vulkan-subset.md`](rdna4-vulkan-subset.md)) from fresco-vulkan, Navigator and the ICD examples; generate `atrium-rdna4-isa` from the ISA XML with an assembler/disassembler round-trip test; oracle harness skeleton on gpusim and Tier-2; R9700 transport working | Subset list committed; a hand-assembled shader runs on gpusim and the R9700 with matching output |
+| M0 | **Ground work.** Inventory the Vulkan subset ([done: `rdna4-vulkan-subset.md`](rdna4-vulkan-subset.md)); ISA tables generated from AMD's XML ([done: `atrium-rdna4-isa`](../../atrium-rdna4-isa), encoder/decoder round-trip over 6,128 base forms) from fresco-vulkan, Navigator and the ICD examples; generate `atrium-rdna4-isa` from the ISA XML with an assembler/disassembler round-trip test; oracle harness skeleton on gpusim and Tier-2; R9700 transport working | Subset list committed; a hand-assembled shader runs on gpusim and the R9700 with matching output |
 | M1 | **First compute.** Storage-buffer compute shaders (fill, saxpy, reductions) compiled from SPIR-V and dispatched through `tier3_rdna4` | Matches Tier-2 and R9700 goldens |
 | M2 | **Compiler breadth.** Divergent control flow, loops, LDS, atomics, subgroup ops, spilling; the `atrium-spv-tests` corpus as cases | Corpus green on all three oracles |
 | M3 | **Images and samplers** in compute | Texture fetch and sample cases green |
