@@ -69,7 +69,9 @@ w(f'// Source: {doc.findtext("Copyright")} License: {doc.findtext("License")}.')
 w(f'// Release date {doc.findtext("ReleaseDate")}, schema {doc.findtext("SchemaVersion")}.')
 w('#![allow(clippy::all)]')
 w('use crate::{EncodingDef, FieldDef, InstDef, InstEncodingDef, OperandDef};')
+w('/// Release date of the AMD XML these tables were generated from.')
 w(f'pub const ISA_RELEASE: &str = {rs(doc.findtext("ReleaseDate"))};')
+w('/// Every encoding (microcode format).')
 w('pub static ENCODINGS: &[EncodingDef] = &[')
 for e in encs:
     fields = ', '.join(f'FieldDef {{ name: {rs(n)}, ranges: &[{", ".join(f"({o}, {c})" for o, c in r)}] }}' for n, r in e['fields'])
@@ -77,6 +79,7 @@ for e in encs:
     w(f'    EncodingDef {{ name: {rs(e["name"])}, order: {e["order"]}, bits: {e["bits"]}, '
       f'id_mask: 0x{e["mask"]:x}, ids: &[{ids}], fields: &[{fields}] }},')
 w('];')
+w('/// Every instruction.')
 w('pub static INSTRUCTIONS: &[InstDef] = &[')
 for i in insts:
     encs_s = []

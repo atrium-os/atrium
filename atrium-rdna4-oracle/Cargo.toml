@@ -1,0 +1,11 @@
+[package]
+name        = "atrium-rdna4-oracle"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Oracle cases for the native RDNA4 backend: builds job directories for the R9700 runner (runner/amdgpu_runner.c) and checks results. See docs/spec/atrium-rdna4-vulkan-backend.md §6."
+
+[dependencies]
+atrium-rdna4-isa = { path = "../atrium-rdna4-isa" }
+atrium-rdna4-cmd = { path = "../atrium-rdna4-cmd" }
