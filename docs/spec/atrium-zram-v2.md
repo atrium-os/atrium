@@ -3,8 +3,9 @@
 > **Status (2026-11-03):** increment 1 (counters, §4.6) is **built and
 > verified in the FreeBSD VM**, together with BIO_DELETE support and a selftest
 > fix. The first FreeBSD run (§3.1) found a v1 problem bigger than any in the
-> original list: **pages freed by the VM stay in the store** (§1 item 7, fixed
-> by §4.0, which needs a kernel change). The §3 numbers come from a Linux host
+> original list: **pages freed by the VM stay in the store** (§1 item 7).
+> **Increment 0 (§4.0) fixes it in the kernel** (atrium-os/freebsd-src
+> `da0b30649`), verified in-VM the same day. The §3 numbers come from a Linux host
 > used as a stand-in. §3.1 covers what has been confirmed on FreeBSD so far.
 >
 > **Decision context (Shankar, 2026-11-03).** Atrium gets macOS-style compressed
@@ -61,6 +62,7 @@ the parent spec).
    use while the store still held 1.7 GB logical in **0.96 GB of kernel
    memory**. On a long-running desktop this is the dominant cost of the tier.
    `swapon -E` does not help: it trims the whole device once, at swapon.
+   *(Fixed by increment 0, §4.0.)*
 8. **The selftest used live slots 0–2.** With the device swapped on, slot 2 can
    hold a real swapped-out page (the swap pager reserves only the first
    `BBSIZE`), so running the selftest could corrupt a process's memory. *(Fixed:
@@ -167,7 +169,7 @@ recorded with `memprobe watch`.
 
 ## 4. Design
 
-### 4.0 Swap-free notification (fixes §1 item 7; needs the kernel)
+### 4.0 Swap-free notification (fixes §1 item 7; kernel) — DONE
 
 A leaf module cannot see a swap block being freed, so this is the one piece that
 needs a kernel change, on the atrium-os `freebsd-src` branch alongside
@@ -183,6 +185,26 @@ TRIM, which FreeBSD lacks today.
 The kmod side is done: `BIO_DELETE` frees every slot the range covers and
 counts it in `kern.zram.deletes`. Verify with `deletes` rising and `orig_bytes`
 falling back to `swapinfo`'s figure after a workload exits.
+
+**As built** (atrium-os/freebsd-src `da0b30649`, `sys/vm/swap_pager.c`): the
+queue is a **per-device bitmap** (`sw_delmap`, one bit per swap block,
+allocated at swapon), not a ring. The first version used a 4096-entry ring.
+When the 1.9 GB fill exited it dropped 8914 ranges and left 775 MB behind,
+because a process exit frees thousands of scattered ranges at once. Marking a
+bit cannot overflow, and neighbouring frees coalesce into one delete. The task
+sends runs of up to 1024 pages. `swapoff` waits for marked and in-flight
+pages to drain. Knobs: `vm.swap_free_notify` (default 1), with
+`vm.swap_free_notify_{sent,pages}` as counters.
+
+**Verified in-VM** (ATRIUM kernel cross-built on the Linux host with
+`tools/build/make.py`, 2 GB, zram the only swap). The workload was
+`atrium-zram/test/fill.c`: 1.9 GB of real file data, random pages dirtied
+throughout so blocks are freed and reused mid-run, and every page checksummed.
+Peak swap was 1.9 GB and PSI `some` reached 37.5 %. **0 of 486,400 pages were
+corrupt**, 750,819 pages were deleted in 18,023 `BIO_DELETE`s, and after exit
+the store held **8.1 MiB, matching `swapinfo`** (it was 1.7 GB before the
+fix). Memory returned to the 13 MB slot table. The notification also turned on
+for the virtio disk swap partition, which gives SSD-backed swap online TRIM.
 
 ### 4.1–4.8: inside the module
 
@@ -293,7 +315,7 @@ Two small consumers:
 
 | # | increment | verify (in the VM) |
 |---|---|---|
-| 0 | §4.0 swap-free notification (kernel, atrium-os branch) | After a workload exits, `orig_bytes` returns to within 1 % of `swapinfo`, and `deletes` rises. |
+| 0 | §4.0 swap-free notification (kernel, atrium-os branch) | **DONE, verified in-VM 2026-11-03**: after exit, `orig_bytes` matches `swapinfo` (8.1 MiB), and there was 0 corruption across 486k checksummed pages with blocks freed and reused mid-run. |
 | 1 | §4.6 counters + `BIO_DELETE` + selftest on private slots | **DONE, verified in-VM 2026-11-03** (§3.1): `orig_bytes` matches `swapinfo` to 0.1 %, `trim(8)` frees exact slot counts, and the selftest is safe with swap live. |
 | 2 | §4.2 packed allocator + §4.4 limit | Selftest extended with 10k random-size objects, alloc/free, and a bitmap audit. `dd` round-trip. A build under a RAM cap: `pool_bytes / orig_bytes` within 5 % of memprobe's *packed* prediction. |
 | 3 | §4.3 per-CPU contexts + §4.1 hashed locks | 4 parallel `dd` streams scale. Under a 4-job build with zram, lower PSI `full` than v1 at the same cap. |
