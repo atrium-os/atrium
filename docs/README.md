@@ -14,6 +14,7 @@ Architecture and design docs for an integrated FreeBSD desktop platform built ar
 3. [ROADMAP.md](ROADMAP.md) — phased deliverables D0..D7, dependencies, honest scope.
 4. Subsystem deep-dives:
    - [subsystems/graphics.md](subsystems/graphics.md) — Fresco protocol + Atrium GPU ABI.
+   - [GRAPHICS-STACK.md](GRAPHICS-STACK.md) — the graphics stack as built (2026-11-03): drivers, ABIs, renderers, 2D/3D app paths, Mesa status, doc/code gaps.
    - [subsystems/storage.md](subsystems/storage.md) — Tessera + per-jail mosaics + distribution.
    - [subsystems/sandbox.md](subsystems/sandbox.md) — Portcullis: jails + capability manifest + IPC channels.
    - [subsystems/transport.md](subsystems/transport.md) — protocol over ivshmem / cdev / TCP / future hardware.
