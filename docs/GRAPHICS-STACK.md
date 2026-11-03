@@ -249,8 +249,12 @@ The design says only at build time. At runtime it is used anyway:
   mounts `/usr/local/share/vulkan` and `/usr/local/llvm19/lib` into frescod's
   jail specifically "for the lavapipe/radeon vulkan ICDs frescod loads." The
   RUNBOOK calls lavapipe "kept for comparison" with `atrium-vk-icd` "the
-  eventual swap-in," but nothing in the tree runs frescod's HeadlessRenderer
-  on `atrium-vk-icd` yet.
+  eventual swap-in." The swap has been proven only partway:
+  `fresco-vulkan/examples/headless_icd.rs` runs HeadlessRenderer through
+  `atrium-vk-icd` + Tier-2 and renders the atrium-core rect ("level 2", on
+  macOS). frescod itself still loads lavapipe in the VM. *(Corrected
+  2026-11-03; the first version of this doc said nothing in the tree did this.
+  See `reviews/2026-11-03-gpu-kernel-and-tier2-review.md` §B.)*
 - **atrium-mesa fork: it exists, but only for venus, which is superseded.**
   `github.com/atrium-os/mesa` (cloned at `external/mesa`, built in-VM at
   `/root/mesa`) carries a venus ICD with a `vn_renderer_atrium.c` backend.

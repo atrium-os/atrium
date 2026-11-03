@@ -15,6 +15,7 @@ Architecture and design docs for an integrated FreeBSD desktop platform built ar
 4. Subsystem deep-dives:
    - [subsystems/graphics.md](subsystems/graphics.md) — Fresco protocol + Atrium GPU ABI.
    - [GRAPHICS-STACK.md](GRAPHICS-STACK.md) — the graphics stack as built (2026-11-03): drivers, ABIs, renderers, 2D/3D app paths, Mesa status, doc/code gaps.
+   - [reviews/2026-11-03-gpu-kernel-and-tier2-review.md](reviews/2026-11-03-gpu-kernel-and-tier2-review.md) — review of the DRM-free kernel GPU architecture vs atrium-gpu-amd, and Tier-2 maturity.
    - [subsystems/storage.md](subsystems/storage.md) — Tessera + per-jail mosaics + distribution.
    - [subsystems/sandbox.md](subsystems/sandbox.md) — Portcullis: jails + capability manifest + IPC channels.
    - [subsystems/transport.md](subsystems/transport.md) — protocol over ivshmem / cdev / TCP / future hardware.
