@@ -646,6 +646,29 @@ Mesa needs this for laptops with discrete + integrated GPUs (render on discrete,
 
 Display cdev is treated as a "vendor" for this purpose: a BO produced by `atrium-amdgpu` and imported by `atrium-display` is a scanout buffer; the display cdev's `IMPORT_SHARE` accepts vendor-tagged buffers it can DMA from.
 
+
+### 6.3 Virtualization (plan, not V1)
+
+Two mechanisms, chosen by who is on each side:
+
+- **Foreign host or foreign guest: API forwarding.** The guest sends Vulkan or aqueduct-gpu commands and the host executes them on its own stack. This is Carillon and aqueduct-gpu today (Atrium on macOS), and it is the only option for a Linux guest running its own DRM driver, since translating DRM uAPI into this ABI is out of scope.
+- **Atrium guest on an Atrium host: native context.** The guest runs the real vendor userspace and only this ABI crosses a virtio-gpu channel. bhyve's virtio-gpu backend asks the broker for one client context per guest (§4.1), with that guest's quota and scheduler weight, so a guest is isolated and recovered exactly like an app. This works because the ABI is transport-clean (principle 5, and rule 2 of §6.4).
+
+Two gaps must be closed before native context ships: importing guest RAM as a system-heap BO (a `BO_IMPORT_MEMORY` from a bhyve memory-segment fd; there is no userptr in this ABI), and reflecting a host device reset into the guest as its own lost-generation change (§10).
+
+Hardware partitioning (SR-IOV, MIG, Mali AE partitions) and whole-GPU passthrough are not planned. If a partitioning GPU is targeted, a partition is selected at `CLIENT_OPEN` through a trailing field (§8), so no existing struct changes.
+
+### 6.4 Mixed-criticality readiness (design rules, not a feature)
+
+Atrium does not target safety-certified use. These rules keep the architecture *capable* of it (automotive-style separation of a safety-rated display from untrusted rendering) without building it now. Every future change to this ABI must keep them true:
+
+1. **The control plane is liftable.** Everything at the Control level (§4.1), the validation duties (§5.12) and the recovery ladder (§10.1) depend only on the control/client boundary, never on sharing kernel state with clients. That is what lets the control plane move into a small separately verifiable component (an EL2 hypervisor or separation kernel) with FreeBSD becoming one client through native context (§6.3), without changing the client ABI.
+2. **Every client call is transport-clean.** Ioctl structs are flat POD; every pointer field addresses a flat array of POD with an explicit count; submit blobs contain no pointers. Any client call can be marshalled across a hypervisor channel unchanged.
+3. **No device-global state is client-visible.** Deadlines, priorities, resets and telemetry are per context or per queue (§5.7, §5.10, §10). A client can never change another's timing except through scheduler policy the control plane sets.
+4. **Timing is reported, not assumed.** `QUERY_CAPS` will carry the device's preemption granularity and, where the vendor can state one, a worst-case preemption latency (a trailing cap record, §8). `SCHED` supports a highest-priority class reserved for the control plane's own contexts.
+5. **Display planes can have separate owners.** The display lease (§7) is granted per plane. A plane can be leased to a different owner from the main compositor, with its own fences, and survives the main owner's crash (§10.2). Display output CRC readback, where the hardware has it, is exposed as a display capability so a monitor can check that what is on screen matches what was committed.
+6. **The safe path does not need the GPU.** Content that must always be visible can be rendered on the CPU (Tier-2) into a dedicated plane, so a GPU fault, reset or detach (§10.1) cannot hide it.
+
 ---
 
 ## 7. Display ABI summary
@@ -653,7 +676,7 @@ Display cdev is treated as a "vendor" for this purpose: a BO produced by `atrium
 Display is on a separate cdev (`/dev/atrium/display<N>`) specified in [`atrium-display-architecture.md`](atrium-display-architecture.md). 2.1 fixes the parts of the interface that belong to this ABI:
 
 - **Scanout by object, never by address.** The atomic commit takes a `bo_fd` or a `share_fd` per plane. The display module resolves it, checks size, pitch, format and tiling against the plane (§5.12) and pins the backing for as long as it is on screen; the BO's free is deferred until it has been flipped away (§5.11). The `atrium-gpu-amd` path that writes a userspace-supplied `{vram_offset, size}` into the scanout registers, and the `BO_EXPORT_SCANOUT` ioctl that feeds it, are retired.
-- **Ownership is a lease.** One process holds the display at a time: the broker (frescod) opens `/dev/atrium/display<N>` exclusively, and a second open fails with `EBUSY`. A test harness or a VT-switch takes it only through the broker. There is no DRM-master-style ambient grant. When the holder's fd closes the last frame stays on screen until the next holder commits (§10.2).
+- **Ownership is a lease.** One process holds the display at a time: the broker (frescod) opens `/dev/atrium/display<N>` exclusively, and a second open fails with `EBUSY`. A test harness or a VT-switch takes it only through the broker. There is no DRM-master-style ambient grant. When the holder's fd closes the last frame stays on screen until the next holder commits (§10.2). The lease is granted per plane: normally the broker holds every plane, but a plane can be leased to a separate owner (§6.4 rule 5).
 - **Fences.** A commit takes an optional in-fence (`syncobj_fd`, value) that the display module waits on before latching, and an out-fence (`syncobj_fd`, value) it signals when the previous buffer is released.
 - **vblank and hotplug** are kqueue events on the display fd (vblank-wait ioctl retired).
 
@@ -845,7 +868,8 @@ Total to Mesa-ready first vendor: 6-12 engineer-months *of upstream-ready Mesa w
 - **Hot-add/hot-remove.** The cdev disappears on device removal. fds opened against it return errors on subsequent ops. No special protocol.
 - **Display ABI** — see separate document.
 - **Capability protocols** (HDCP, content protection). Not a v2 concern.
-- **Virtual GPU partitioning** (SR-IOV, MIG). Possibly enabled by extending QUEUE_CREATE later. Not v2.
+- **Virtual GPU partitioning** (SR-IOV, MIG) and passthrough. Not planned; see §6.3 for the virtualization plan and how a partition would be selected if ever needed.
+- **Safety certification.** Not a goal; §6.4 lists the rules that keep the architecture capable of it.
 
 ---
 
