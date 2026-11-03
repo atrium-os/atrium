@@ -86,13 +86,25 @@ for c in navigator-dom navigator-backend; do
     (cd "$ROOT/$c" && cargo test --quiet >/dev/null 2>&1) || die "$c tests failed"
     echo "  $c ok"
 done
-(cd "$ROOT/portcullis" && cargo test --workspace --quiet >/dev/null 2>&1) \
-    || die "portcullis workspace tests failed"
-echo "  portcullis ok"
+# ★ The portcullis workspace needs a BSD-family host (sockmux is kqueue,
+# portcullis-identity calls arc4random_buf), so on a Linux host (the cloud
+# container, scripts/cloud-vm.sh) it cannot build at all. Skipped there, and
+# said so, rather than reported as a test failure.
+if [ "$(uname -s)" = Linux ]; then
+    echo "  portcullis SKIPPED (needs kqueue/arc4random; Linux host)"
+else
+    (cd "$ROOT/portcullis" && cargo test --workspace --quiet >/dev/null 2>&1) \
+        || die "portcullis workspace tests failed"
+    echo "  portcullis ok"
+fi
 
 # ---- stage 2: cross-build --------------------------------------------------
 STAGE="cross-build"
 say "$STAGE  (host only — the VM is for RUNNING)"
+# ★ CROSS_RUSTFLAGS replaces .cargo/config.toml's link args, whose sysroot
+# paths are the Mac's. Set ONLY for the cross-build: as plain RUSTFLAGS it
+# would also link the host test binaries against FreeBSD's crt objects.
+[ -n "${CROSS_RUSTFLAGS:-}" ] && export RUSTFLAGS="$CROSS_RUSTFLAGS"
 (cd "$ROOT/portcullis" && cargo +nightly build --quiet --target "$TARGET" \
     -Z build-std=std,panic_abort -p portcullis-cli -p portcullisd -p opifex) \
     || die "portcullis cross-build"
@@ -100,6 +112,7 @@ say "$STAGE  (host only — the VM is for RUNNING)"
     -Z build-std=std,panic_abort --bin navigator-worker --example jailed_corpus) \
     || die "navigator cross-build"
 echo "  built"
+unset RUSTFLAGS
 
 # ---- stage 3: is the VM even there? ---------------------------------------
 STAGE="vm reachable"

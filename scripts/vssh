@@ -9,7 +9,7 @@
 # VSSH_CONNECT_TIMEOUT overrides the 3 s: a busy guest (mid-flush, under
 # load) can take longer to accept, and ssh keeps the FIRST value of an
 # option, so passing `-o ConnectTimeout=30` after this one does nothing.
-exec ssh -i /Users/girivs/.ssh/fresco_bsd_ed25519 \
+exec ssh -i "$HOME/.ssh/fresco_bsd_ed25519" \
     -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null \
     -o LogLevel=ERROR \
