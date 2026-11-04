@@ -252,6 +252,31 @@ the same thing by another route, and admitting them while excluding `order` woul
 incoherent. G5 makes the resulting defect visible rather than ignorable, so the profile
 declines to create it.
 
+**`row-reverse` and `column-reverse` are COMPILED by the normalizer (§6), not admitted.**
+A reversed flex container is the same picture as a forward one holding its children in
+the opposite order, so the normalizer reverses the children *in the document* and emits
+`row` or `column`. The reading order then follows the reversed document — the order the
+reader sees — which is what G5 asks for; the renderer still refuses `*-reverse`. Laying
+the container out forwards moves main-start, so the packing keywords that name it swap:
+`flex-start` ⇄ `flex-end`, and `normal` (or no `justify-content`), which packs at
+main-start, becomes `flex-end`. `start` / `end` name the writing mode's sides and `left` /
+`right` physical ones, neither of which reversal moves; auto margins are physical and gaps
+symmetric. In `rtl` the forward row starts at the right, so an rtl `row-reverse` still
+starts at the left. Out-of-flow children are not flex items and keep their places; text
+runs are anonymous items and are reversed with the elements.
+
+The compile is sound only where one document order can stand for every rendering:
+
+- **unconditional** — the container is reversed in its base context and in every state and
+  media context that sets `display` or `flex-direction`;
+- **single-line** — a wrapping container breaks its lines in the reversed order (`1 2 | 3 4`
+  read from the right is `2 1 | 4 3`), and where the lines fall is known only after layout.
+
+Anywhere else the container is laid out on the same axis, unreversed, and the normalizer
+counts it by reason. `wrap-reverse` and `order` stay excluded: `wrap-reverse` reverses
+LINES, which no document order can express, and `order` is the general case of which
+reversal is the one instance with a static compile.
+
 ### 3.5 Grid
 
 | property | admitted values | initial | inh. |
@@ -1001,8 +1026,11 @@ name, level, reading order, and the relationship to the boxes that present it.
 
 Consequences worth naming:
 
-- Reading order and visual order cannot diverge, because `order` and the descendant-based
-  restyling tricks that separate them are not in the profile.
+- Reading order and visual order cannot diverge, because `order`, the `*-reverse` values
+  and the descendant-based restyling tricks that separate them are not in the profile. A
+  page written with `row-reverse` or `column-reverse` reaches the renderer already
+  reversed in the document (§3.4), so its semantic tree reads in the reversed order —
+  the order on screen, not the order of the original source.
 - The semantic tree is **testable headlessly** — a golden file like any other (§7), so
   "did this change break the semantics" is a CI failure rather than an audit finding.
 - Assistive technology consumes a first-class artifact rather than reverse-engineering
@@ -1080,7 +1108,7 @@ forums): the normalizer's count of declarations it had to drop, unless noted.
 | `@import` beyond a bounded depth | G3 | |
 | `<base>` | G4 | ambient rewriting of every link |
 | animations and transitions (71,275 drops) | G1 | a static reading renders the initial state; nothing is lost |
-| `order`, `*-reverse`, `grid-auto-flow: dense` (289) | G5 | visual order diverging from reading order; the one exclusion here worth re-arguing |
+| `order`, `wrap-reverse`, `grid-auto-flow: dense` | G5 | visual order diverging from reading order. Re-argued 2026-11-04: `row-reverse` / `column-reverse` moved to B (compiled); these three have no static compile. Drops then, 85-document corpus + 48-document second batch: `order` 223 + 440, `wrap-reverse` 5 + 0, `dense` 0 + 85 |
 | unbounded measurement (tables, images) | G2, G3 | not excluded — moved offline (§3.13) |
 
 ### B. Outside the profile but COMPILED by the producer — nothing is lost
@@ -1089,6 +1117,9 @@ Shorthands, `!important`, the descendant combinator, cascade layers, `var()`, lo
 properties (resolved against each element's own `direction` — from 2026-11-04, with
 `text-align: left | right`, `justify-content: left | right` and the UA's start-side
 indents), the `dir` attribute, named grid lines/areas, media-query range syntax, `display: contents`,
+`row-reverse` / `column-reverse` (from 2026-11-04: reversed in the document, §3.4 — 116 + 105
+container contexts compiled in the two corpora; 38 + 47 that reverse only in some media or
+state and 6 + 6 that wrap are laid out on the same axis unreversed, and counted),
 float ROWS (as inline-block), and — from 2026-09-24 — `box-sizing` (§3.3; 1,725 sizes in
 28 documents). The renderer stays small; the normalizer carries the cascade.
 `unset` (646 drops) and font-size keywords belong here and are **not yet compiled**.
