@@ -1,0 +1,70 @@
+# Navigator corpus batch 2 (2026-11-04): pages the first 85 are thin on.
+# News with heavy CSS grid
+300_bbc_news	https://www.bbc.com/news
+301_guardian	https://www.theguardian.com/international
+302_apnews	https://apnews.com/
+303_lemonde	https://www.lemonde.fr/
+304_elpais	https://elpais.com/
+305_theverge	https://www.theverge.com/
+306_arstechnica	https://arstechnica.com/
+307_lwn	https://lwn.net/
+308_corriere	https://www.corriere.it/
+309_thehindu	https://www.thehindu.com/
+# Non-Latin scripts and right-to-left
+310_ar_wikipedia	https://ar.wikipedia.org/wiki/%D8%A7%D9%84%D9%82%D8%A7%D9%87%D8%B1%D8%A9
+311_he_wikipedia	https://he.wikipedia.org/wiki/%D7%99%D7%A8%D7%95%D7%A9%D7%9C%D7%99%D7%9D
+312_hi_wikipedia	https://hi.wikipedia.org/wiki/%E0%A4%AD%E0%A4%BE%E0%A4%B0%E0%A4%A4
+313_zh_wikipedia	https://zh.wikipedia.org/wiki/%E5%8C%97%E4%BA%AC%E5%B8%82
+314_ja_wikipedia	https://ja.wikipedia.org/wiki/%E6%9D%B1%E4%BA%AC
+315_ko_wikipedia	https://ko.wikipedia.org/wiki/%EC%84%9C%EC%9A%B8%ED%8A%B9%EB%B3%84%EC%8B%9C
+316_th_wikipedia	https://th.wikipedia.org/wiki/%E0%B8%81%E0%B8%A3%E0%B8%B8%E0%B8%87%E0%B9%80%E0%B8%97%E0%B8%9E%E0%B8%A1%E0%B8%AB%E0%B8%B2%E0%B8%99%E0%B8%84%E0%B8%A3
+317_ru_wikipedia	https://ru.wikipedia.org/wiki/%D0%9C%D0%BE%D1%81%D0%BA%D0%B2%D0%B0
+318_bbc_arabic	https://www.bbc.com/arabic
+319_bbc_hindi	https://www.bbc.com/hindi
+320_ynet	https://www.ynet.co.il/
+321_yahoo_jp_news	https://news.yahoo.co.jp/
+322_aljazeera_ar	https://www.aljazeera.net/
+323_chinadaily	https://www.chinadaily.com.cn/
+# Documentation
+330_python_asyncio	https://docs.python.org/3/library/asyncio.html
+331_go_effective	https://go.dev/doc/effective_go
+332_k8s_overview	https://kubernetes.io/docs/concepts/overview/
+333_react_learn	https://react.dev/learn
+334_django_tutorial	https://docs.djangoproject.com/en/5.1/intro/tutorial01/
+335_postgres_select	https://www.postgresql.org/docs/current/sql-select.html
+336_node_fs	https://nodejs.org/docs/latest/api/fs.html
+337_github_docs	https://docs.github.com/en/get-started/start-your-journey/about-github-and-git
+338_ms_learn	https://learn.microsoft.com/en-us/dotnet/csharp/tour-of-csharp/
+339_archwiki_systemd	https://wiki.archlinux.org/title/Systemd
+340_freebsd_handbook	https://docs.freebsd.org/en/books/handbook/jails/
+# Forums and discussion
+350_old_reddit	https://old.reddit.com/r/programming/
+351_freebsd_forums	https://forums.freebsd.org/
+352_phpbb	https://www.phpbb.com/community/
+353_slashdot	https://slashdot.org/
+354_tildes	https://tildes.net/
+355_metafilter	https://www.metafilter.com/
+# Shops that do not front a bot check
+360_lego	https://www.lego.com/en-us
+361_uniqlo	https://www.uniqlo.com/us/en/
+362_patagonia	https://www.patagonia.com/home/
+363_thomann	https://www.thomann.de/intl/index.html
+364_muji	https://www.muji.com/us/
+365_decathlon	https://www.decathlon.com/
+# Government and public services
+370_canada	https://www.canada.ca/en.html
+371_europa	https://european-union.europa.eu/index_en
+372_cdc_flu	https://www.cdc.gov/flu/
+373_weather_gov	https://www.weather.gov/
+374_nasa	https://www.nasa.gov/
+# Personal sites and blogs
+380_paulgraham	https://paulgraham.com/articles.html
+381_jvns	https://jvns.ca/
+382_simonwillison	https://simonwillison.net/
+383_xkcd	https://xkcd.com/
+384_gwern	https://gwern.net/
+# Re-records of pages whose 2026-09-24 recording is incomplete
+268_www_vanguard_com_	https://www.vanguard.com/
+242_trello_com_	https://trello.com/
+269_www_citibank_com_	https://www.citibank.com/
+217_www_wikihow_com_Tie_a_Tie	https://www.wikihow.com/Tie-a-Tie
