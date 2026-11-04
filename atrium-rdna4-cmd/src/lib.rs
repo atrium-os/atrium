@@ -102,8 +102,9 @@ pub struct Dispatch {
     pub shader_va: u64,
     /// VGPRs used per thread.
     pub vgprs: u32,
-    /// User SGPR values (s0..), at most 16. The workgroup id x, y, z follow
-    /// in the next three SGPRs.
+    /// User SGPR values (s0..), at most 16. The workgroup id is not placed
+    /// after them: GFX12 loads it into TTMP9 (X) and TTMP7 ({Z, Y}), per the
+    /// RDNA4 ISA guide §3.5.3.4 ("CS SGPR Load").
     pub user_sgprs: Vec<u32>,
     /// Threads per workgroup.
     pub threads: [u32; 3],
@@ -128,7 +129,8 @@ pub fn emit_dispatch(b: &mut Blob, d: &Dispatch) {
         | (1 << compute_pgm_rsrc1::MEM_ORDERED_SHIFT);
     let rsrc2 = ((d.user_sgprs.len() as u32) << compute_pgm_rsrc2::USER_SGPR_SHIFT)
         | (0 << compute_pgm_rsrc2::TIDIG_COMP_CNT_SHIFT) // local id in v0
-        // Workgroup id x, y, z arrive in the three SGPRs after the user SGPRs.
+        // Workgroup ids: X in TTMP9 always; TGID_Y/Z_EN make the CP load
+        // TTMP7 = {Z, Y} too (RDNA4 ISA guide §3.5.3.4).
         | compute_pgm_rsrc2::TGID_X_EN_MASK
         | compute_pgm_rsrc2::TGID_Y_EN_MASK
         | compute_pgm_rsrc2::TGID_Z_EN_MASK;
