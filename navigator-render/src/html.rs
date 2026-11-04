@@ -2116,6 +2116,12 @@ impl<'a> Cx<'a> {
             let ih = clamp_by(ih, "min-height", "max-height", ah);
             // Offsets of the margin box; `block` adds the start margins.
             let (fw, fh) = (aw - ml - mr - iw, ah - mt - mb - ih);
+            // ★ Auto margins take POSITIVE free space only (Grid §11.2):
+            // with an item larger than its area they are 0 and the
+            // alignment properties decide, so the overflow stays safe on
+            // the end side instead of centring off the start edge.
+            let (al, ar) = if fw < 0 { (false, false) } else { (al, ar) };
+            let (at, ab) = if fh < 0 { (false, false) } else { (at, ab) };
             let dx = match (al, ar) {
                 (true, true) => fw / 2, (true, false) => fw, (false, true) => 0,
                 _ => match (it.justify.as_str(), rtl) { ("end", false) => fw, ("center", _) => fw / 2, ("end", true) => 0, (_, true) => fw, _ => 0 },
@@ -4892,6 +4898,21 @@ mod tests {
             <div class="g"><div></div><div class="s"></div></div>"#);
         assert_eq!(boxes(&o, 0xff0000ff), vec![(110, 20, 40, 20)], "end + centre inside a 150×60 area");
         assert_eq!(boxes(&o, 0x00ff00ff), vec![(150, 0, 150, 60)], "stretch fills its area");
+    }
+
+    /// Auto margins absorb only POSITIVE free space (Grid §11.2): an item
+    /// larger than its area starts at the area's start (WPT
+    /// grid-item-auto-margins-001: a 100px item in a 0px track).
+    #[test]
+    fn grid_auto_margins_with_negative_free_space_are_zero() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 100px; height: 100px; grid-template-columns: 0px; grid-template-rows: 0px }
+            .g > div { width: 100px; height: 100px; margin-left: auto; margin-right: auto; margin-top: auto; margin-bottom: auto; background-color: #00ff00 }
+            .h { display: grid; width: 100px; grid-template-columns: 60px }
+            .h > div { width: 20px; height: 10px; margin-left: auto; margin-right: auto; background-color: #0000ff }</style>
+            <div class="g"><div></div></div><div class="h"><div></div></div>"#);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(0, 0, 100, 100)], "no room: the margins are 0");
+        assert_eq!(boxes(&o, 0x0000ffff), vec![(20, 100, 20, 10)], "room: the margins centre it");
     }
 
     /// A non-stretched auto-sized grid item is FIT-CONTENT in its area
