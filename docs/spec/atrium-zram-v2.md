@@ -631,6 +631,34 @@ The guest and the patched kernel are stock FreeBSD plus §4.0, not the full
 Atrium kernel; the §6 question is about `swap_pager` and GEOM, which Atrium
 does not change apart from §4.0.
 
+**Native result (R9700 box, KVM guest, 4 vCPU / 2 GiB, 2026-11-04 13:52–14:03Z).**
+Self-test OK; both 1.9 GB fills 0 corrupt.
+
+| | zstd-3 | LZ4 |
+|---|---|---|
+| compress / decompress, µs per page (in-kernel counters) | 26 / 10 | 8 / 6 |
+| same, from `kern.zram.bench` on held pages | 18 / 7 | n/a |
+| compression ratio | 3.3× | not reported |
+| zram share of busy kernel CPU | 20 % | 8 % |
+| **§6 share: swap + GEOM over (zram + swap + GEOM)** | **46.5 %** | **68.6 %** |
+| `fail_nomem` at peak (no backing store) | 0 | 4,456 |
+
+The largest "other" costs were TLB shootdowns (`smp_targeted_tlb_shootdown`)
+and `lock_delay`, worst under LZ4. Some other work (an ocean model and two
+small GPU solves, low CPU) was running on the host at the time. Raw results:
+`zram_kvm_bench_r9700_run2.log`, `zram_kvm_bench_r9700_results.tgz` (in the
+Orbis project).
+
+**Reading.** The threshold is crossed natively for both codecs: with zstd,
+FreeBSD's swap and GEOM layers cost almost as much CPU per page as zram's own
+compression; with LZ4 more than twice as much. A faster codec makes the
+leaf-module design *worse* by this measure, because the fixed cost of
+pretending to be a disk stays. Two caveats: the "swap" bucket includes swap
+slot bookkeeping (`swp_pager_meta`, `blist`), part of which any design that
+keeps swap slots also pays; and TLB shootdowns come from unmapping pages for
+page-out, which a VM-integrated compressor still does unless it batches them,
+as macOS does.
+
 ## 7. Measuring in the VM (the real numbers)
 
 Build memprobe natively in the VM (`cargo build --release`). The default `zstd`
