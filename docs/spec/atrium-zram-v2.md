@@ -716,7 +716,7 @@ four fills 0 of 486,400 pages corrupt.
 | | zstd off | zstd **on** | LZ4 off | LZ4 **on** |
 |---|---|---|---|---|
 | **§6 share: swap + GEOM over (zram + swap + GEOM)** | 41.0 % | **18.3 %** | 70.8 % | **29.8 %** |
-| fast-path pages read / written | n/a | 4.53M / 2.75M | n/a | 3.10M / (most) |
+| fast-path pages read / written | n/a | 4.53M / 2.75M | n/a | 3.10M / 1.36M |
 | `fast_fallback` (requests) | n/a | 18 | n/a | 635 |
 | `fail_nomem` (no backing store) | 0 | 56 | 4,054 | 5,987 |
 | compress / decompress, µs per page | ~20 / ~8 | ~20 / ~8 | 6–7 / 4.4 | 6–7 / 6.9 |
