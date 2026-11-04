@@ -98,6 +98,12 @@ struct Cx<'a> {
     baseline_probe: Option<Option<U>>,
     /// text-indent for the next first line of a block container.
     indent: Option<U>,
+    /// ★ Directional isolates (UAX #9 LRI/RLI…PDI): each inline item
+    /// carries the index of its PATH here — the isolates it sits in, outer
+    /// first, as (id, rtl). Index 0 is no isolate. `iso_cur` is the path
+    /// `collect_inline` is inside.
+    iso_paths: Vec<Vec<(u32, bool)>>,
+    iso_cur: u32,
     /// Extra offset of the next block's content inside its box (table cells,
     /// where vertical-align positions the content within the row's height).
     content_dy: U,
@@ -194,7 +200,7 @@ pub fn render_html_with(html: &str, fonts: &FontSet, env: &Env, subs: &Subresour
     let styled = cascade(&dom, &sheets, env);
     diagnostics.extend(styled.diagnostics);
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
-                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]),
+                      report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]),
                       viewport: (u(env.width_px), Some(u(env.height_px))), pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))),
                       subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
     cx.promoted = promote_block_in_inline(&dom, &styled.styles);
@@ -259,7 +265,7 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
     let styled = cascade(&dom, &sheets, env);
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None,
-                      indent: None, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), viewport: (u(env.width_px), Some(u(env.height_px))),
+                      indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), viewport: (u(env.width_px), Some(u(env.height_px))),
                       pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))), subs: &Subresources::new(),
                       placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
     // (table, per-column (min, max), its first row's cells) for every table.
@@ -432,7 +438,9 @@ struct Line { lh: U, underline: Option<u32>, strike: Option<u32>,
                /// tab-size, in spaces.
                tab: i64,
                /// white-space: pre or nowrap — no soft wrap here.
-               nowrap: bool }
+               nowrap: bool,
+               /// The directional isolates this item sits in (`Cx::iso_paths`).
+               iso: u32 }
 
 impl<'a> Cx<'a> {
     fn st(&self, h: Handle) -> Option<&'a Style> { self.styles.get(h as usize).and_then(|s| s.as_ref()) }
@@ -2233,7 +2241,7 @@ impl<'a> Cx<'a> {
                           // line, vertically, down the page.
                           break_word: kw(s, "overflow-wrap") == "break-word" && kw(s, "white-space") != "nowrap",
                           tab: match s.get("tab-size") { V::Int(n) => (*n).clamp(0, 64), _ => 8 },
-                          nowrap: matches!(kw(s, "white-space"), "pre" | "nowrap") };
+                          nowrap: matches!(kw(s, "white-space"), "pre" | "nowrap"), iso: self.iso_cur };
         let sp = |p: &str| match s.get(p) { V::Len(l) => u(l.v), V::Calc(c) => calc_eval(c, 0).map(u).unwrap_or(0), _ => 0 };
         (FontStyle { family, bold: weight >= 600, em, size, rgba: color, link: None,
                      ls: sp("letter-spacing"), ws: sp("word-spacing"), tnum: kw(s, "font-variant-numeric") == "tabular-nums" }, line)
@@ -2269,7 +2277,22 @@ impl<'a> Cx<'a> {
                 if tag == "br" { out.push(Item::Break); return }
                 let link = (tag == "a").then(|| self.dom.attr(h, "href")).flatten().map(|href| { self.links.push(href.to_string()); self.links.len() - 1 });
                 let before = out.len();
+                // ★ An inline box whose direction differs from its parent's is
+                // a directional ISOLATE (profile row 48: HTML gives every
+                // `dir` element `unicode-bidi: isolate`): its content is
+                // ordered on its own and moves as one unit in the line, so
+                // an English name inside Arabic text keeps its words in
+                // order and the punctuation after it stays outside.
+                let saved_iso = self.iso_cur;
+                let rtl = kw(s, "direction") == "rtl";
+                if rtl != (kw(parent, "direction") == "rtl") {
+                    let mut path = self.iso_paths[self.iso_cur as usize].clone();
+                    path.push((self.iso_paths.len() as u32, rtl));
+                    self.iso_cur = self.iso_paths.len() as u32;
+                    self.iso_paths.push(path);
+                }
                 for c in self.dom.children_of(h) { self.collect_inline(c, out, s) }
+                self.iso_cur = saved_iso;
                 if let Some(li) = link {
                     for it in &mut out[before..] {
                         if let Item::Word(_, st, _) | Item::Space(st, _) | Item::Atomic(_, st, _) = it { st.link = Some(li) }
@@ -2372,6 +2395,8 @@ impl<'a> Cx<'a> {
                         /// this item. Bidi needs it as an item of its own,
                         /// because reordering moves what is between words.
                         gap_w: U,
+                        /// The isolate path that space was in (`Line::iso`).
+                        gap_iso: u32,
                         /// Bidi embedding level (UAX#9); 0 until resolved.
                         level: u8,
                         /// How far this item advances the line: the shaped
@@ -2411,7 +2436,7 @@ impl<'a> Cx<'a> {
                     // ★ Preserved spaces HANG at a line end (pre-wrap): they
                     // never push the line past the edge, and never wrap.
                     if cx + ww > w && !lines.last().expect("line").is_empty() { pending = None; continue }
-                    lines.last_mut().expect("line").push(Placed { x: cx, st, line: l, pieces, gap: false, gap_w: 0, level: 0, adv: ww, atomic: None });
+                    lines.last_mut().expect("line").push(Placed { x: cx, st, line: l, pieces, gap: false, gap_w: 0, gap_iso: 0, level: 0, adv: ww, atomic: None });
                     cx += ww;
                     pending = None;
                 }
@@ -2433,7 +2458,7 @@ impl<'a> Cx<'a> {
                     let asc = self.baseline(ah, w, (Some(bw), None));
                     let outer_h = self.measure(ah, w, None, (Some(bw), None));
                     lines.last_mut().expect("line").push(Placed { x: cx, st, line: l, pieces: vec![], gap: !wrap && sw > 0,
-                                                                  gap_w: if wrap { 0 } else { sw }, level: 0,
+                                                                  gap_w: if wrap { 0 } else { sw }, gap_iso: pending.as_ref().map(|p| p.1.iso).unwrap_or(0), level: 0,
                                                                   adv, atomic: Some((ah, bw, asc, outer_h)) });
                     cx += adv;
                     pending = None;
@@ -2492,7 +2517,7 @@ impl<'a> Cx<'a> {
                             let chunk: String = chars[i..j].iter().collect();
                             let pieces = self.sh.shape(&chunk, &st, &mut self.report);
                             let cw: U = pieces.iter().map(|p| p.width).sum();
-                            lines.last_mut().expect("line").push(Placed { x: cx, st: st.clone(), line: l, pieces, gap: false, gap_w: 0, level: 0, adv: cw, atomic: None });
+                            lines.last_mut().expect("line").push(Placed { x: cx, st: st.clone(), line: l, pieces, gap: false, gap_w: 0, gap_iso: 0, level: 0, adv: cw, atomic: None });
                             cx += cw;
                             i = j;
                             if i < chars.len() { lines.push(vec![]); forced.push(false); cx = 0 }
@@ -2501,7 +2526,7 @@ impl<'a> Cx<'a> {
                         continue;
                     }
                     if ww > w { self.report.overflow_lines += 1 }
-                    lines.last_mut().expect("line").push(Placed { x: cx, st, line: l, pieces, gap: !wrap && sw > 0, gap_w: if wrap { 0 } else { sw }, level: 0, adv: ww, atomic: None });
+                    lines.last_mut().expect("line").push(Placed { x: cx, st, line: l, pieces, gap: !wrap && sw > 0, gap_w: if wrap { 0 } else { sw }, gap_iso: pending.as_ref().map(|p| p.1.iso).unwrap_or(0), level: 0, adv: ww, atomic: None });
                     cx += ww;
                     pending = None;
                 }
@@ -2536,18 +2561,33 @@ impl<'a> Cx<'a> {
             // ★ Bidi (UAX#9). Only a line that needs it is touched, so an
             // LTR document's goldens cannot move — and that is the control:
             // every existing golden must stay byte-identical.
-            if base_rtl || line.iter().any(|p| p.pieces.iter().any(|pc| pc.text.chars().any(is_rtl))) {
+            if base_rtl || line.iter().any(|p| p.line.iso != 0 || p.pieces.iter().any(|pc| pc.text.chars().any(is_rtl))) {
                 // The line's text in logical order, with each folded space
                 // made an item of its own: reordering moves what is BETWEEN
-                // words, so a space cannot stay glued to one of them.
+                // words, so a space cannot stay glued to one of them. Where
+                // the isolate path changes between two pieces, the isolates
+                // left are closed (PDI) and those entered opened (LRI/RLI);
+                // a line starts by opening every isolate its first piece is
+                // in, so an isolate broken across lines is one on each.
                 let mut logical = String::new();
-                let mut spans: Vec<(bool, usize, usize)> = vec![]; // (is the space, start, end)
+                let mut path: &[(u32, bool)] = &[];
+                let paths = &self.iso_paths;
+                let mut enter = |logical: &mut String, to: u32| {
+                    let to: &[(u32, bool)] = &paths[to as usize];
+                    let k = path.iter().zip(to).take_while(|(a, b)| a.0 == b.0).count();
+                    for _ in k..path.len() { logical.push('\u{2069}') }
+                    for (_, r) in &to[k..] { logical.push(if *r { '\u{2067}' } else { '\u{2066}' }) }
+                    path = to;
+                };
+                let mut seq: Vec<(bool, usize)> = vec![]; // (is the space, start offset), one pair per placed
                 for p in &line {
-                    if p.gap_w > 0 { let st = logical.len(); logical.push(' '); spans.push((true, st, logical.len())) }
+                    let sp = if p.gap_w > 0 { enter(&mut logical, p.gap_iso); let st = logical.len(); logical.push(' '); st } else { usize::MAX };
+                    enter(&mut logical, p.line.iso);
+                    seq.push((true, sp));
                     let st = logical.len();
                     for pc in &p.pieces { logical.push_str(&pc.text) }
                     if p.atomic.is_some() { logical.push('\u{fffc}') } // object replacement: neutral, like an image
-                    spans.push((false, st, logical.len()));
+                    seq.push((false, st));
                 }
                 let info = unicode_bidi::BidiInfo::new(&logical, Some(if base_rtl { unicode_bidi::Level::rtl() } else { unicode_bidi::Level::ltr() }));
                 let level_at = |i: usize| info.levels.get(i).map(|l| l.number()).unwrap_or(0);
@@ -2556,17 +2596,12 @@ impl<'a> Cx<'a> {
                 // split and re-shaped at the boundary — itemization, which a
                 // real engine does before shaping.
                 let mut rebuilt: Vec<Placed> = vec![];
-                let mut src = line.into_iter();
-                let mut iter = spans.into_iter();
-                while let Some((is_space, st, en)) = iter.next() {
-                    // A space span is handled with the word it preceded,
-                    // which carries its width.
-                    if is_space { continue }
-                    let p = src.next().expect("one span per placed");
+                for (p, pair) in line.into_iter().zip(seq.chunks(2)) {
+                    let (sp, st) = (pair[0].1, pair[1].1);
                     if p.gap_w > 0 {
-                        let sp = self.sh.shape(" ", &p.st, &mut self.report);
-                        rebuilt.push(Placed { x: 0, st: p.st.clone(), line: p.line, pieces: sp, gap: p.gap, gap_w: 0,
-                                              level: level_at(st.saturating_sub(1)), adv: p.gap_w, atomic: None });
+                        let spc = self.sh.shape(" ", &p.st, &mut self.report);
+                        rebuilt.push(Placed { x: 0, st: p.st.clone(), line: p.line, pieces: spc, gap: p.gap, gap_w: 0, gap_iso: 0,
+                                              level: level_at(sp), adv: p.gap_w, atomic: None });
                     }
                     // Level runs inside this item's own text.
                     let text: String = p.pieces.iter().map(|pc| pc.text.clone()).collect();
@@ -2584,10 +2619,9 @@ impl<'a> Cx<'a> {
                         for (l, t) in runs {
                             let pieces = self.sh.shape(&t, &p.st, &mut self.report);
                             let adv = pieces.iter().map(|pc| pc.width).sum();
-                            rebuilt.push(Placed { x: 0, st: p.st.clone(), line: p.line, pieces, gap: false, gap_w: 0, level: l, adv, atomic: None });
+                            rebuilt.push(Placed { x: 0, st: p.st.clone(), line: p.line, pieces, gap: false, gap_w: 0, gap_iso: 0, level: l, adv, atomic: None });
                         }
                     }
-                    let _ = en;
                 }
                 // L2: from the highest level down to the lowest odd one,
                 // reverse every contiguous run at or above it.
@@ -2606,15 +2640,17 @@ impl<'a> Cx<'a> {
                     }
                     lvl -= 1;
                 }
-                // Visual order fixed: lay the advances out left to right.
-                let mut px = if li == 0 { first_indent } else { 0 };
+                // Visual order fixed: lay the advances out left to right. The
+                // first line's text-indent is at its START: on the left in an
+                // ltr line, on the right — after everything — in an rtl one.
+                let mut px = if li == 0 && !base_rtl { first_indent } else { 0 };
                 for p in &mut rebuilt { p.x = px; px += p.adv }
                 line = rebuilt;
             }
             let lh = line.iter().map(|p| if p.atomic.is_some() { 0 } else { p.line.lh }).max().unwrap_or(0)
                 .max(base + metrics.iter().map(|m| m.1).max().unwrap_or(0));
             let last = line.last().expect("non-empty");
-            let used = last.x + last.adv;
+            let used = last.x + last.adv + if li == 0 && base_rtl { first_indent } else { 0 };
             // ★ justify: the free space goes into the collapsible spaces of
             // every line except the block's last and those ended by <br>.
             // Integer division; the remainder goes one unit at a time to the
@@ -2633,9 +2669,14 @@ impl<'a> Cx<'a> {
             let shift = match align { "center" => (w - used) / 2, "end" => w - used, _ => 0 }.max(0);
             if let Some(None) = self.baseline_probe { self.baseline_probe = Some(Some(yy + base)) }
             if let Some((text, st)) = outside_marker.take() {
+                // ★ The marker hangs off the START side: right of an rtl
+                // line, where the list's indent is — and its text is ordered
+                // right-to-left too, so `1.` reads `.1` (its full stop is a
+                // neutral, and takes the rtl direction after the digits).
+                let text = match text.strip_suffix('.') { Some(n) if base_rtl => format!(".{n}"), _ => text };
                 let pieces = self.sh.shape(&text, &st, &mut self.report);
                 let mw: U = pieces.iter().map(|p| p.width).sum();
-                let mut mx = x - mw - st.size / 2;
+                let mut mx = if base_rtl { x + w + st.size / 2 } else { x - mw - st.size / 2 };
                 for piece in pieces {
                     self.scene.run(Run { face: piece.face, size: st.size, rgba: st.rgba, x: mx, y: yy + base, em: st.em, glyphs: piece.glyphs, text: piece.text });
                     mx += piece.width;
@@ -3042,6 +3083,60 @@ mod tests {
         assert_eq!((a.0, a.2), (800 - 100, 100), "column 1 is the RIGHTMOST, in a table shrink-wrapped to the right");
         assert_eq!((b.0, b.2), (800 - 150, 50), "column 2 is to its left");
         assert_eq!((wide.0, wide.2), (800 - 500, 500), "the overwide table overflows on the left, past the box's 400");
+    }
+
+    /// ★ An inline box whose direction differs from its parent's is an
+    /// ISOLATE: `C++` written `dir=ltr` inside Hebrew keeps its `++` after
+    /// the C. Unisolated, the two neutrals between an L and an R take the
+    /// paragraph's rtl direction and move to the LEFT of the C.
+    #[test]
+    fn a_differing_direction_inline_is_an_isolate() {
+        let o = render(r#"<style>p { direction: rtl } .l { direction: ltr }</style><p><span class="l">C++</span> שלום</p><p>C++ שלום</p>"#);
+        // Each line's text, left to right.
+        let mut lines: BTreeMap<U, Vec<(U, &str)>> = BTreeMap::new();
+        for r in &o.scene.runs { lines.entry(r.y).or_default().push((r.x, r.text.as_str())) }
+        let visual: Vec<String> = lines.into_values().map(|mut l| { l.sort(); l.iter().map(|x| x.1).collect::<String>() }).collect();
+        assert_eq!(visual[0], "שלום C++", "isolated: `C++` whole, at the start (right) of the rtl line");
+        assert_eq!(visual[1], "שלום ++C", "the control: unisolated, the neutrals take the rtl direction");
+    }
+
+    /// An isolate broken across lines is an isolate on each: its numbers
+    /// count up left to right on every line. Unisolated, digits separated
+    /// by spaces in an rtl paragraph run right to left.
+    #[test]
+    fn an_isolate_broken_across_lines_stays_in_order_on_each() {
+        let o = render(r#"<style>p { direction: rtl; width: 120px } .l { direction: ltr }</style><p>שלום <span class="l">10 20 30 40 50 60 70 80 90</span> עולם</p>"#);
+        let mut lines: BTreeMap<U, Vec<(U, &str)>> = BTreeMap::new();
+        for r in &o.scene.runs { lines.entry(r.y).or_default().push((r.x, r.text.as_str())) }
+        assert!(lines.len() >= 3, "it wraps: {lines:?}");
+        let order = ["10", "20", "30", "40", "50", "60", "70", "80", "90"];
+        for (_, mut l) in lines {
+            l.sort();
+            let latin: Vec<&str> = l.iter().map(|x| x.1).filter(|t| order.contains(t)).collect();
+            assert!(latin.len() != 1 || l.len() > 1, "{l:?}");
+            let pos: Vec<usize> = latin.iter().map(|t| order.iter().position(|o| o == t).unwrap()).collect();
+            assert!(pos.windows(2).all(|w| w[0] < w[1]), "left to right inside the isolate on every line: {l:?}");
+        }
+    }
+
+    /// ★ text-indent is at the START of the first line: the right in rtl.
+    #[test]
+    fn text_indent_is_on_the_right_in_rtl() {
+        let at = |css: &str| render(&format!("<style>body {{ margin-right: 0px }} p {{ direction: rtl; {css} }}</style><p>שלום</p>")).scene.runs[0].x;
+        assert_eq!(at("text-indent: 0px") - at("text-indent: 40px"), 40 * PX, "the indent pushes the first line LEFT, from the right edge");
+    }
+
+    /// ★ A list marker hangs off the start side: right of an rtl list item,
+    /// with `1.` read right to left as `.1`.
+    #[test]
+    fn list_markers_hang_on_the_right_in_rtl() {
+        let o = render(r#"<style>body { margin-right: 8px } ul, ol { direction: rtl; padding-left: 0px; padding-right: 40px }</style>
+            <ul><li>שלום</li></ul><ol><li>עולם</li></ol>"#);
+        let r = |t: &str| o.scene.runs.iter().find(|r| r.text == t).unwrap_or_else(|| panic!("no {t}: {:?}", o.scene.runs.iter().map(|r| &r.text).collect::<Vec<_>>()));
+        let content_right = (800 - 8 - 40) * PX;
+        assert!(r("\u{2022}").x > content_right, "the bullet is right of the content box: {}", r("\u{2022}").x / PX);
+        assert!(r(".1").x > content_right, "the number too, ordered rtl");
+        assert!(r("שלום").x < content_right);
     }
 
     /// ★ A NESTED table is not a wrapper. A `display: table` div around a
@@ -3750,7 +3845,7 @@ mod tests {
         let held_out: Vec<u8> = READ_ROWS.iter().copied().filter(|r| *r != 39).collect();
         let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(&fonts), scene: Scene::default(),
                           report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None,
-                          baseline_probe: None, indent: None, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]),
+                          baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]),
                           viewport: (0, None), pos_cb: (0, 0, 0, None), subs: &Subresources::new(),
                           placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
         cx.count_rows_outside(&held_out);

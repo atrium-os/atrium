@@ -151,7 +151,7 @@ like working without granting the document a channel.
 | margin collapsing | never |
 | floats | none |
 | colour space | sRGB; compositing defined in premultiplied linear, stated normatively so G1 is reproducible across implementations |
-| text direction | per-element, UAX #9 bidi |
+| text direction | per-element, UAX #9 bidi; an inline box whose `direction` differs from its parent's is a directional isolate (§3.7) |
 
 ### 3.2 How to read this section
 
@@ -333,6 +333,22 @@ and G1 together.
 **Excluded:** `hyphens` (deferred — see justification, below), `font-size-adjust`, `unicode-bidi` (UAX #9
 plus `direction` is the whole model), and font-size *keywords* (`medium`, `large`, …)
 which add a UA-defined table for no expressive gain.
+
+**`direction` is the whole bidi model** (2026-11-04). On a block container it is the
+paragraph's base direction (UAX #9 P3 is not applied: the direction is stated, never
+guessed from the text), and the inline axis runs from it everywhere the profile has one:
+`text-align: start | end`, `text-indent` and an outside list marker sit on the start side;
+a table's column 1, a grid's column line 1 and a flex row's main-start are on the right in
+`rtl`; an absolutely positioned box with both horizontal offsets `auto` puts its right edge
+at the static position, and an over-constrained one ignores `left` (CSS 2.1 §10.3.7).
+**An inline box whose `direction` differs from its parent's is a directional isolate**
+(RLI/LRI…PDI): that is what HTML's UA sheet makes of every `dir` element
+(`unicode-bidi: isolate`), and it is the only embedding the profile has. CSS
+`direction` on an inline with `unicode-bidi: normal` — a no-op in CSS — is therefore an
+isolate here; `embed`, `bidi-override` (`<bdo>`) and `plaintext` are not representable.
+The `dir` attribute is not a profile construct: a producer states `direction` in CSS (§6,
+the normalizer maps `dir`, `dir=auto` and `<bdi>` to it). The profile's UA sheet writes
+the list and `dd` indents on the LEFT; an rtl document states them on the right.
 
 #### Justification — total-fit, and why we can afford it
 
@@ -1070,7 +1086,9 @@ forums): the normalizer's count of declarations it had to drop, unless noted.
 ### B. Outside the profile but COMPILED by the producer — nothing is lost
 
 Shorthands, `!important`, the descendant combinator, cascade layers, `var()`, logical
-properties, named grid lines/areas, media-query range syntax, `display: contents`,
+properties (resolved against each element's own `direction` — from 2026-11-04, with
+`text-align: left | right`, `justify-content: left | right` and the UA's start-side
+indents), the `dir` attribute, named grid lines/areas, media-query range syntax, `display: contents`,
 float ROWS (as inline-block), and — from 2026-09-24 — `box-sizing` (§3.3; 1,725 sizes in
 28 documents). The renderer stays small; the normalizer carries the cascade.
 `unset` (646 drops) and font-size keywords belong here and are **not yet compiled**.
