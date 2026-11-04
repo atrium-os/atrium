@@ -140,7 +140,7 @@ fn exploration_is_bounded() {
     let c = explore(&html);
     assert_eq!(c.interactive_found, 300, "all are found");
     // One handler shared by all 300: probed PROBES_PER_HANDLER times.
-    assert_eq!(c.transitions.len(), 8,
+    assert_eq!(c.transitions.len(), 64,
         "but probing is bounded per handler: {}", c.transitions.len());
 }
 

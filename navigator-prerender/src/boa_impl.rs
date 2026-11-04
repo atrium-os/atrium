@@ -2266,16 +2266,21 @@ fn run_injected_scripts(ctx: &mut Context, errors: &mut Vec<String>) -> (u32, u3
 /// - MAX_PROBES = 256 per document: 3x the most handlers any document has,
 ///   so every handler gets its first probe everywhere measured, and the
 ///   worst case is 256 x 15 ms, about 4 s, inside the 30 s deadline.
-/// - PROBES_PER_HANDLER = 8: each doubling past 8 adds under half as many
-///   probes as the one before (2102 at 4, 3152 at 8, 4397 at 16) while the
-///   worst document stays at 1.8 s measured.
+/// - PROBES_PER_HANDLER = 64, the old flat cap, so a document dominated by
+///   one handler is probed at least as deeply as before. ★ 8 was tried
+///   first and was WRONG: the re-measurement found covered elements fell
+///   298 -> 178, because pages whose many elements share one handler (NASA,
+///   walgreens) went from up to 64 probes to 8. Round-robin already gives
+///   every handler its turn; the per-handler bound only has to stop one
+///   handler absorbing the whole document total. At 64/256 the worst
+///   document measured is 3.7 s; both corpora together 23 s.
 const MAX_PROBES: usize = 256;
 /// Loop iterations one call frame may run during a probe (see
 /// `explore_states`). A million is far past any handler in the corpus that
 /// ends, and stops a spin in well under a second.
 const PROBE_LOOP_LIMIT: u64 = 1_000_000;
 /// Probes per distinct handler. See `explore_states` for the budget.
-const PROBES_PER_HANDLER: usize = 8;
+const PROBES_PER_HANDLER: usize = 64;
 /// Caps on what one transition may carry. A recording is an ANNOTATION on the
 /// tier 1 document; a transition that shipped a whole page would quietly turn
 /// it back into a second artifact.

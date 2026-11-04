@@ -51,10 +51,10 @@ fn every_distinct_handler_is_probed_before_any_is_probed_twice() {
 /// recording does not name them, the coverage record says why.
 #[test]
 fn cut_elements_whose_handler_was_probed_are_represented() {
-    let c = explore_with(&shared_then_distinct(50, 0), None);
-    assert_eq!(c.transitions.len(), 8, "PROBES_PER_HANDLER");
+    let c = explore_with(&shared_then_distinct(100, 0), None);
+    assert_eq!(c.transitions.len(), 64, "PROBES_PER_HANDLER");
     let cut: Vec<_> = c.coverage.iter().filter(|k| k.over_cap).collect();
-    assert_eq!(cut.len(), 42);
+    assert_eq!(cut.len(), 36);
     assert!(cut.iter().all(|k| k.represented && !k.probed), "{:?}", cut.first());
     assert!(c.coverage.iter().filter(|k| k.probed).all(|k| !k.represented));
 }
@@ -86,9 +86,9 @@ fn delegated_candidates_share_their_roots_budget() {
     h.push_str("<p id=o></p><script>document.addEventListener('click', function (e) { \
         var b = e.target.closest('.t'); if (b) document.getElementById('o').setAttribute('data-b', b.id); });</script></body></html>");
     let c = explore_with(&h, None);
-    // The discovery probe at <body>, then 8 of the 500 targets.
-    assert_eq!(c.explore_stats.probes, 9, "{:?}", c.explore_stats);
-    assert_eq!(c.transitions.len(), 8);
+    // The discovery probe at <body>, then 64 of the 500 targets.
+    assert_eq!(c.explore_stats.probes, 65, "{:?}", c.explore_stats);
+    assert_eq!(c.transitions.len(), 64);
 }
 
 /// Bound (and native) functions are told apart by OBJECT, since their source
