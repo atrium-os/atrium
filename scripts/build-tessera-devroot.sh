@@ -96,6 +96,13 @@ vfs.root.mountfrom="tessera:/dev/vtbd0p2"
 kern.sched.name="Laminar"
 autoboot_delay="2"
 EOF
+# amd64 (QEMU q35): FreeBSD's MSI blacklist matches q35's emulated Intel host
+# bridge (8086:29c0), so pci_alloc_msix fails for gpusim and atrium-gpu-amd
+# falls back to polling (no IRQ, kqueue syncobjs never fire). The bridge is
+# virtual and its MSI works.
+if [ "$(uname -m)" = amd64 ]; then
+    echo 'hw.pci.honor_msi_blacklist="0"' >> $T/boot/loader.conf
+fi
 
 echo "=== /etc: fstab (tessera root + 9p host share), rc.conf (net+sshd) ==="
 cat > $T/etc/fstab <<'EOF'

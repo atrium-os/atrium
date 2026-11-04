@@ -106,12 +106,31 @@ boot() {
     else
         DISKS="$ZFSD -device virtio-blk-pci,drive=zfsd,bootindex=0"
     fi
+    # GPUSIM=1: the gpusim RDNA model as a PCI device (atrium-os/gpusim's
+    # gpusim-server + the atrium-os/qemu fork, whose hw/misc/gpusim.c the stock
+    # Ubuntu QEMU lacks). Set QEMU_BIN to the fork's build, e.g.
+    # ~/atrium-os/qemu/build/qemu-system-x86_64. GPUSIM_DIR: the gpusim checkout.
+    GPUSIM_ARGS=""
+    if [ "${GPUSIM:-0}" = 1 ]; then
+        GPUSIM_DIR="${GPUSIM_DIR:-$HOME/gpusim}"
+        GPUSIM_SOCK="${GPUSIM_SOCK:-$VMDIR/gpusim.sock}"
+        if [ ! -S "$GPUSIM_SOCK" ] || ! pgrep -f "gpusim-server $GPUSIM_SOCK" >/dev/null; then
+            rm -f "$GPUSIM_SOCK"
+            SRV="$GPUSIM_DIR/target/release/gpusim-server"
+            [ -x "$SRV" ] || (cd "$GPUSIM_DIR" && cargo build -q -p gpusim-server --release) || die "gpusim-server build"
+            "$SRV" "$GPUSIM_SOCK" "${GPUSIM_TOPO:-discrete}" > "$VMDIR/gpusim-server.log" 2>&1 &
+            i=0; while [ ! -S "$GPUSIM_SOCK" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+            [ -S "$GPUSIM_SOCK" ] || die "gpusim-server did not listen: $(cat "$VMDIR/gpusim-server.log")"
+        fi
+        GPUSIM_ARGS="-device gpusim,socket=$GPUSIM_SOCK,id=gpusim0"
+    fi
     # shellcheck disable=SC2086
-    $QEMU $MACH -smp "$SMP" -m "$MEM" \
+    ${QEMU_BIN:-$QEMU} $MACH -smp "$SMP" -m "$MEM" \
         -drive if=pflash,format=raw,unit=0,file="$VMDIR/code.fd",readonly=on \
         -drive if=pflash,format=raw,unit=1,file="$VMDIR/vars.fd" \
         $DISKS \
         -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-net-pci,netdev=net0 \
+        $GPUSIM_ARGS \
         -display none \
         -serial unix:"$VMDIR/serial.sock",server,nowait \
         -monitor unix:"$VMDIR/mon.sock",server,nowait \

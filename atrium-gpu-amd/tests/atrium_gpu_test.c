@@ -1569,6 +1569,17 @@ test_display(int fd, int dfd)
 	uint64_t off, sz, off2, sz2, soff, ssz, before;
 	int fb_fd, fb2_fd, small_fd;
 
+	/* 0. Plug the VGA monitor this test exercises. gpusim's power-on
+	 * monitor is 1080p since gpusim 162781f; callers say which mode they
+	 * test instead of inheriting the default. */
+	{
+		struct atrium_display_config cfg;
+		memset(&cfg, 0, sizeof(cfg));
+		cfg.connector_type = 2;	/* HDMI 2.1, the baseline */
+		cfg.plug_mode = 0;	/* VGA 640x480 */
+		ioctl(dfd, ATRIUM_DISPLAY_IOC_CONFIG, &cfg);
+	}
+
 	/* 1. ENUM: connector attached, EDID readable with a valid header. */
 	memset(&q, 0, sizeof(q));
 	if (ioctl(dfd, ATRIUM_DISPLAY_IOC_ENUM, &q) != 0) {
@@ -1942,21 +1953,28 @@ test_sched(int fd)
 
 	/* queue 0: VRAM kernel (fast, power-dense); queue 1: host (slow). */
 	memset(&s, 0, sizeof(s));
+	/* The model's sched queues outlive a test run (no remove op, and FLR
+	 * keeps them), so index this run's two queues relative to the count
+	 * instead of assuming a fresh model: a re-run must not fail. */
+	uint32_t q0, q1;
 	s.op = 0; s.arg = 1; s.ops = 1; s.bytes = 1000000000u; s.level = 3;
 	ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
+	q0 = s.count - 1;
 	s.op = 0; s.arg = 1; s.ops = 1; s.bytes = 1000000000u; s.level = 4;
 	ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
-	if (s.count != 2) {
-		printf("sched FAILED: count=%u (want 2)\n", s.count);
+	q1 = s.count - 1;
+	if (s.count < 2 || q1 != q0 + 1) {
+		printf("sched FAILED: count=%u after two adds (q0=%u)\n",
+		    s.count, q0);
 		rc = 1;
 	}
 
 	s.op = 1; s.arg = 2000; /* run 2000 progress-fair rounds */
 	ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
 
-	s.op = 2; s.arg = 0; ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
+	s.op = 2; s.arg = q0; ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
 	t0 = s.busy_us; e0 = s.energy_uj; r0 = s.runs;
-	s.op = 2; s.arg = 1; ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
+	s.op = 2; s.arg = q1; ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
 	t1 = s.busy_us; e1 = s.energy_uj; r1 = s.runs;
 
 	/* progress-fair: the two queues got ~equal engine time (within 10%). */

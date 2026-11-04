@@ -370,6 +370,11 @@ amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
 
 	if (bo->n_bindings >= ATRIUM_AMD_BO_MAX_BIND)
 		return (ENOSPC);	/* shared into too many VMs */
+	/* A BO maps at most once per VM: a second bind into the same VM would
+	 * alias it at two VAs and leak the first binding's vm_fp reference. */
+	for (i = 0; i < bo->n_bindings; i++)
+		if (bo->bindings[i].vm == vm)
+			return (EBUSY);
 
 	mtx_lock(&sc->lock);
 	if (*va != 0) {

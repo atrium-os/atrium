@@ -160,8 +160,23 @@ Working in the cloud amd64 VM (`ARCH=amd64 sh scripts/cloud-vm.sh up`):
   109 MB tarball. Once it's installed on the Tessera root, the fork's pfctl loads the Atrium pf
   rules at boot (the stock pfctl failed with `DIOCOSFPGET`), and the jail e2e still passes.
   The guest survived a hard kill (host OOM): Tessera remounted with a clean journal replay.
-- Still to do: kmod selftests on amd64, navigator e2e on amd64, and gpusim in
-  `qemu-system-x86_64` (atrium-gpu-amd has no device to attach to until then).
+- **gpusim on amd64**:
+  - Build the atrium-os/qemu fork (QEMU 10.2 with `hw/misc/gpusim.c`) with
+    `--target-list=x86_64-softmmu`, then boot with
+    `GPUSIM=1 QEMU_BIN=~/atrium-os/qemu/build/qemu-system-x86_64 GPUSIM_DIR=~/gpusim`.
+    gpusim's rdna4 crate expects the atrium checkout at `../bsd`.
+  - atrium-gpu-amd binds when preloaded (`atrium_gpu_amd_pci_load="YES"`), or with
+    `devctl set driver -f vgapci1 atrium_gpu_amd_pci`. MES comes up.
+  - **`hw.pci.honor_msi_blacklist=0` is required** on q35. FreeBSD blacklists MSI behind the
+    emulated 8086:29c0 bridge, so without the tunable the driver polls, kqueue syncobjs never
+    fire, and cross-queue waits hang.
+  - `tests/atrium_gpu_test.c`: **27/27 OK**, and it stays green across reruns. Getting there
+    took three arch-neutral fixes:
+    - The driver let a BO bind twice into the same VM (`amd_bo_bind`), so a second bind now
+      returns EBUSY.
+    - The display test had been inheriting gpusim's old VGA power-on monitor (1080p since
+      gpusim 162781f), so it now plugs VGA explicitly.
+    - The sched test assumed a fresh model, so it now indexes its queues relative to the count.
 
 ## 4. Phase D — `atrium-gpu-amd` on the real R9700
 
