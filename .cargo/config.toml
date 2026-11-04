@@ -30,3 +30,23 @@ rustflags = [
 
 [unstable]
 build-std = ["std", "panic_abort"]
+
+# x86_64 FreeBSD (the x86_64 port, docs/spec/x86_64-port.md). A Rust Tier-2
+# target with prebuilt std; the [unstable] build-std above rebuilds it anyway,
+# which is harmless. Same linker strategy as aarch64; the sysroot is a
+# separate tree pulled from an amd64 guest. In the cloud, cloud-vm.sh's
+# CROSS_RUSTFLAGS (ARCH=amd64) replaces these Mac paths.
+[target.x86_64-unknown-freebsd]
+linker = "rust-lld"
+rustflags = [
+    "-C", "link-arg=--sysroot=/Users/girivs/src/bsd/sysroot-amd64",
+    "-C", "link-arg=-L/Users/girivs/src/bsd/sysroot-amd64/lib",
+    "-C", "link-arg=-L/Users/girivs/src/bsd/sysroot-amd64/usr/lib",
+    "-C", "link-arg=--dynamic-linker=/libexec/ld-elf.so.1",
+    "-C", "link-arg=/Users/girivs/src/bsd/sysroot-amd64/usr/lib/Scrt1.o",
+    "-C", "link-arg=/Users/girivs/src/bsd/sysroot-amd64/usr/lib/crti.o",
+    "-C", "link-arg=/Users/girivs/src/bsd/sysroot-amd64/usr/lib/crtbeginS.o",
+    "-C", "link-arg=-lc",
+    "-C", "link-arg=/Users/girivs/src/bsd/sysroot-amd64/usr/lib/crtendS.o",
+    "-C", "link-arg=/Users/girivs/src/bsd/sysroot-amd64/usr/lib/crtn.o",
+]

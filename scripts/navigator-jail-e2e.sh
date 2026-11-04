@@ -34,7 +34,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VSSH="$ROOT/scripts/vssh"
 KEY="$HOME/.ssh/fresco_bsd_ed25519"
 SCP_OPTS="-i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=30 -P 2222"
-TARGET="aarch64-unknown-freebsd"
+TARGET="${TARGET:-aarch64-unknown-freebsd}"
 APP_ID="org.atrium.navigator.worker"
 SOCK="/tmp/pd-e2e.sock"
 # ★★ The broker runs UNPRIVILEGED. One-shot workers never run as root inside

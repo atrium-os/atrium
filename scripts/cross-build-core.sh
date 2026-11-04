@@ -1,5 +1,6 @@
 #!/bin/sh
-# Cross-build libtessera_core.a for aarch64-freebsd ON THE HOST.
+# Cross-build libtessera_core.a for FreeBSD (aarch64 by default; TRIPLE=
+# x86_64-unknown-freebsd16.0 OUT=... for amd64) ON THE HOST.
 #
 # The tree used to say this had to happen inside the VM. The reason given was
 # that macOS `ar` mangles ELF objects — but that indicts the ARCHIVER, not the
@@ -21,7 +22,7 @@ SYSROOT="${TESSERA_CROSS_SYSROOT:-$BSD_DIR/.bootstrap-state/freebsd-sysroot}"
 CC_BIN="${CC_BIN:-/opt/homebrew/opt/llvm/bin/clang}"
 AR_BIN="${AR_BIN:-/opt/homebrew/opt/llvm/bin/llvm-ar}"
 TRIPLE="${TRIPLE:-aarch64-unknown-freebsd16.0}"
-OUT="$CORE/libtessera_core.a"
+OUT="${OUT:-$CORE/libtessera_core.a}"
 
 [ -f "$SYSROOT/usr/include/stdlib.h" ] || {
     echo "no cross sysroot at $SYSROOT — run scripts/sync-freebsd-sysroot.sh first" >&2

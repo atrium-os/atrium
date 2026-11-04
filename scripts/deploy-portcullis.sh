@@ -23,7 +23,8 @@
 #   START=0 sh scripts/deploy-portcullis.sh      # install only
 set -u
 BSD="$(cd "$(dirname "$0")/.." && pwd)"
-T="$BSD/portcullis/target/aarch64-unknown-freebsd/release"
+TARGET="${TARGET:-aarch64-unknown-freebsd}"
+T="$BSD/portcullis/target/$TARGET/release"
 KEY="$HOME/.ssh/fresco_bsd_ed25519"
 START=${START:-1}
 SSHOPT="-i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
@@ -34,7 +35,7 @@ g() { ssh $SSHOPT -p 2222 root@localhost "$@"; }
 if [ ! -x "$T/atrium-jaild" ] || [ ! -x "$T/atrium-volumes" ]; then
     echo "=== building missing daemons (cross) ==="
     ( cd "$BSD/portcullis" && TESSERA_CORE_LIB="$BSD/atrium-tessera/core" \
-        cargo build --release --target aarch64-unknown-freebsd \
+        cargo build --release --target "$TARGET" \
         -p jaild -p atrium-volumes -p portcullisd ) || {
         echo "ABORT: cross-build failed"; exit 1; }
 fi

@@ -116,6 +116,33 @@ All of them build with the stock FreeBSD kmod framework, `TARGET=amd64`. Known i
   the cache key does not. One machine runs one arch, so that's fine, but a shared cache
   across arches would mix them.
 
+### 3.5 Status (2026-11-04)
+Working in the cloud amd64 VM (`ARCH=amd64 sh scripts/cloud-vm.sh up`):
+- **Guest CPU**: under TCG use `-cpu Nehalem`. With `-cpu max` the stock kernel panics in
+  `zfs_sha256_transform_avx2`.
+- **Atrium kernel**: the fork's amd64 GENERIC (it already has `SCHED_LAMINAR`) cross-builds on
+  Linux with `tools/build/make.py TARGET=amd64`. It boots, and `kern.sched.name="Laminar"` is
+  the default. It needed two amd64 build fixes in the fork, carried in
+  `patches/freebsd-src/0001-amd64-build-fixes.patch` (not pushed to the fork yet):
+  - `thread_va_ok` uses `VIRT_IN_DMAP`, because amd64 has no `DMAP_{MIN,MAX}_ADDRESS`.
+  - `sched_laminar.c` includes `<vm/pmap.h>` for `kva_layout`.
+- **Modules from the host cross-build need LLVM 19** (`--cross-bindir=/usr/lib/llvm-19/bin`).
+  With clang 18, `__stack_chk_guard` is reached through GOTPCRELX relocations (type 42), which
+  the kernel linker rejects. zfs.ko then fails to load and root mount fails.
+- **Tessera EFI loader**: build it on the host, not in the TCG guest, where it takes 30+ minutes
+  and still hadn't finished. On the host it takes about 2 minutes: inside `make.py buildenv`,
+  build `stand/{libsa,liblua,efi/libefi,efi/loader_lua}` with
+  `LOADER_TESSERA_SUPPORT=yes TESSERA_SRCTOP=... WITHOUT_LOADER_IA32=yes`.
+- **Tessera root on amd64 works**:
+  - Build the disk with `scripts/build-tessera-devroot.sh` (D=vtbd1, EXCLUDE_OBJ=1).
+    tessera-fsck reports CLEAN.
+  - Boot it with `TESSERA_ROOT=1 ARCH=amd64 sh scripts/cloud-vm.sh up`. / mounts as tessera,
+    the BLAKE3 self-test passes on the portable path, and the scheduler is Laminar.
+  - A 64 MiB write and sync works, with no WITNESS lock-order reports.
+- Portcullis cross-builds (`TARGET=x86_64-unknown-freebsd`). All 6 kmod trees build in the guest.
+- Still to do: kmod selftests on amd64, navigator e2e on amd64, and gpusim in
+  `qemu-system-x86_64` (atrium-gpu-amd has no device to attach to until then).
+
 ## 4. Phase D — `atrium-gpu-amd` on the real R9700
 
 **Recommended path: PCI passthrough (VFIO) into a FreeBSD amd64 VM on the Ubuntu box,

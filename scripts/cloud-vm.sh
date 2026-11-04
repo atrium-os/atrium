@@ -4,7 +4,7 @@
 # The Mac dev loop (run-vm.sh, HVF, 9p, ~/src/bsd paths) does not exist here,
 # so this is the same loop rebuilt from what a fresh Ubuntu container has:
 # QEMU under TCG (no /dev/kvm, so ~50-100x slower than HVF), FreeBSD's own
-# published arm64 snapshot image, ssh set up over the serial console, and a
+# published snapshot image (arm64, or amd64 with ARCH=amd64), ssh set up over the serial console, and a
 # cross sysroot pulled from the guest itself (the sync-freebsd-sysroot.sh idea:
 # no version skew by construction).
 #
@@ -12,16 +12,29 @@
 #
 #   sh scripts/cloud-vm.sh setup     # packages, image, first boot, ssh, sysroot, portcullis stack
 #   sh scripts/cloud-vm.sh up        # boot an existing image, wait for ssh
+#   TESSERA_ROOT=1 sh scripts/cloud-vm.sh up   # boot from $VMDIR/devroot.img
 #   sh scripts/cloud-vm.sh down      # clean poweroff
 #   sh scripts/cloud-vm.sh e2e       # navigator-jail-e2e.sh --quick on a synthetic page
 #   . scripts/cloud-vm.sh env        # (sourced) export CROSS_RUSTFLAGS for cross-builds
 #
-# State lives in $VMDIR (default ~/atrium-vm), never in the tree.
+# ARCH=aarch64 (default) or ARCH=amd64 picks the guest. amd64 is the x86_64
+# port's VM (docs/spec/x86_64-port.md): q35 + OVMF, still TCG here; on a host
+# with /dev/kvm (the R9700 box) it uses KVM automatically.
+#
+# State lives in $VMDIR (default ~/atrium-vm, ~/atrium-vm-amd64 for amd64),
+# never in the tree.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VMDIR="${VMDIR:-$HOME/atrium-vm}"
+ARCH="${ARCH:-aarch64}"
+case "$ARCH" in
+    aarch64|arm64) ARCH=aarch64; VMDIR="${VMDIR:-$HOME/atrium-vm}"
+                   QEMU=qemu-system-aarch64; RUST_TRIPLE=aarch64-unknown-freebsd ;;
+    amd64|x86_64)  ARCH=amd64;   VMDIR="${VMDIR:-$HOME/atrium-vm-amd64}"
+                   QEMU=qemu-system-x86_64;  RUST_TRIPLE=x86_64-unknown-freebsd ;;
+    *) echo "ARCH must be aarch64 or amd64" >&2; exit 2 ;;
+esac
 KEY="$HOME/.ssh/fresco_bsd_ed25519"
-SNAPS="https://download.freebsd.org/snapshots/VM-IMAGES/16.0-CURRENT/aarch64"
+SNAPS="https://download.freebsd.org/snapshots/VM-IMAGES/16.0-CURRENT/$ARCH"
 SMP="${SMP:-$(nproc)}"
 MEM="${MEM:-8G}"
 SYSROOT="$VMDIR/sysroot"
@@ -36,6 +49,7 @@ cross_env() {
     # plain RUSTFLAGS it would also link HOST test binaries against FreeBSD's crt.
     export CROSS_RUSTFLAGS="-C link-arg=--sysroot=$S -C link-arg=-L$S/lib -C link-arg=-L$S/usr/lib -C link-arg=--dynamic-linker=/libexec/ld-elf.so.1 -C link-arg=$S/usr/lib/Scrt1.o -C link-arg=$S/usr/lib/crti.o -C link-arg=$S/usr/lib/crtbeginS.o -C link-arg=-lc -C link-arg=$S/usr/lib/crtendS.o -C link-arg=$S/usr/lib/crtn.o"
     export VSSH_CONNECT_TIMEOUT="${VSSH_CONNECT_TIMEOUT:-30}"
+    export TARGET="$RUST_TRIPLE"   # deploy-portcullis.sh / navigator-jail-e2e.sh
 }
 
 # A tiny serial-console driver: send each argument as a command, wait for the
@@ -68,11 +82,35 @@ EOF
 
 boot() {
     pgrep -f "file=$VMDIR/vm.qcow2" >/dev/null && { echo "  already running"; return; }
-    qemu-system-aarch64 -machine virt,gic-version=3 -accel tcg,thread=multi \
-        -cpu max,pauth-impdef=on -smp "$SMP" -m "$MEM" \
+    if [ "$ARCH" = amd64 ]; then
+        if [ -w /dev/kvm ]; then ACCEL="-accel kvm -cpu host"
+        # ★ Not -cpu max under TCG: the kernel panics at boot in ZFS's
+        # zfs_sha256_transform_avx2 (trap 0xc) — QEMU 8.2's TCG AVX2/XSAVE
+        # emulation isn't good enough. Nehalem (SSE4.2, no AVX) boots.
+        else ACCEL="-accel tcg,thread=multi -cpu Nehalem"; fi
+        MACH="-machine q35 $ACCEL"
+    else
+        MACH="-machine virt,gic-version=3 -accel tcg,thread=multi -cpu max,pauth-impdef=on"
+    fi
+    # Disks. vm.qcow2 is the ZFS root. A Tessera devroot ($VMDIR/devroot.img,
+    # built by scripts/build-tessera-devroot.sh) rides along as the second
+    # disk; TESSERA_ROOT=1 puts it FIRST (vtbd0, bootindex 0) so its loader
+    # and vfs.root.mountfrom=tessera:/dev/vtbd0p2 take over, with ZFS
+    # attached behind it as the fallback.
+    ZFSD="-drive file=$VMDIR/vm.qcow2,format=qcow2,cache=writeback,if=none,id=zfsd"
+    DEVD="-drive file=$VMDIR/devroot.img,format=raw,cache=writeback,if=none,id=devd"
+    if [ -f "$VMDIR/devroot.img" ] && [ "${TESSERA_ROOT:-0}" = 1 ]; then
+        DISKS="$DEVD -device virtio-blk-pci,drive=devd,bootindex=0 $ZFSD -device virtio-blk-pci,drive=zfsd"
+    elif [ -f "$VMDIR/devroot.img" ]; then
+        DISKS="$ZFSD -device virtio-blk-pci,drive=zfsd,bootindex=0 $DEVD -device virtio-blk-pci,drive=devd"
+    else
+        DISKS="$ZFSD -device virtio-blk-pci,drive=zfsd,bootindex=0"
+    fi
+    # shellcheck disable=SC2086
+    $QEMU $MACH -smp "$SMP" -m "$MEM" \
         -drive if=pflash,format=raw,unit=0,file="$VMDIR/code.fd",readonly=on \
         -drive if=pflash,format=raw,unit=1,file="$VMDIR/vars.fd" \
-        -drive if=virtio,file="$VMDIR/vm.qcow2",format=qcow2,cache=writeback \
+        $DISKS \
         -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-net-pci,netdev=net0 \
         -display none \
         -serial unix:"$VMDIR/serial.sock",server,nowait \
@@ -93,9 +131,11 @@ wait_ssh() {
 setup() {
     mkdir -p "$VMDIR"
     say "packages"
-    if ! command -v qemu-system-aarch64 >/dev/null || ! command -v ssh >/dev/null; then
+    if [ "$ARCH" = amd64 ]; then PKGS="qemu-system-x86 ovmf"; else PKGS="qemu-system-arm qemu-efi-aarch64"; fi
+    if ! command -v $QEMU >/dev/null || ! command -v ssh >/dev/null; then
+        # shellcheck disable=SC2086
         sudo apt-get update -qq && sudo apt-get install -y -qq \
-            qemu-system-arm qemu-efi-aarch64 qemu-utils openssh-client >/dev/null \
+            $PKGS qemu-utils openssh-client >/dev/null \
             || die "apt-get install"
     fi
     [ -f "$KEY" ] || ssh-keygen -q -t ed25519 -N '' -f "$KEY"
@@ -115,9 +155,14 @@ setup() {
         [ -n "$want" ] && [ "$want" = "$got" ] || die "checksum mismatch: $IMG"
         xz -dT0 "$VMDIR/$IMG" && mv "$VMDIR/${IMG%.xz}" "$VMDIR/vm.qcow2"
         qemu-img resize -q "$VMDIR/vm.qcow2" +20G     # ZFS root grows on first boot
-        cp /usr/share/AAVMF/AAVMF_CODE.no-secboot.fd "$VMDIR/code.fd"
-        cp /usr/share/AAVMF/AAVMF_VARS.fd "$VMDIR/vars.fd"
-        truncate -s 64M "$VMDIR/code.fd" "$VMDIR/vars.fd"
+        if [ "$ARCH" = amd64 ]; then
+            cp /usr/share/OVMF/OVMF_CODE_4M.fd "$VMDIR/code.fd"
+            cp /usr/share/OVMF/OVMF_VARS_4M.fd "$VMDIR/vars.fd"
+        else
+            cp /usr/share/AAVMF/AAVMF_CODE.no-secboot.fd "$VMDIR/code.fd"
+            cp /usr/share/AAVMF/AAVMF_VARS.fd "$VMDIR/vars.fd"
+            truncate -s 64M "$VMDIR/code.fd" "$VMDIR/vars.fd"
+        fi
     else
         echo "  $VMDIR/vm.qcow2 exists, kept"
     fi
