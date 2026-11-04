@@ -2741,7 +2741,13 @@ impl<'a> Cx<'a> {
                     self.block(ah, px, yy + base - asc, w, None, (Some(bw), None));
                     px += p.adv;
                 }
-                for piece in &p.pieces {
+                // ★ An item at an ODD level runs right to left, and so do its
+                // pieces: a word whose glyphs come from two faces — Arabic
+                // from one, the full stop after it from another — is two
+                // pieces, and laid out in logical order the stop landed
+                // between the word and the one before it ("العام" "." "الرأي").
+                let order: Vec<&crate::Piece> = if p.level % 2 == 1 { p.pieces.iter().rev().collect() } else { p.pieces.iter().collect() };
+                for piece in order {
                     self.scene.run(Run { face: piece.face, size: p.st.size, rgba: p.st.rgba, x: px, y: yy + base, em: p.st.em,
                                          glyphs: piece.glyphs.clone(), text: piece.text.clone() });
                     px += piece.width;
@@ -3222,6 +3228,16 @@ mod tests {
         assert_eq!(boxes(&o, 0xff0000ff)[0].0, 400 - 50, "a block-level static position, from the right");
         assert_eq!(boxes(&o, 0x0000ffff)[0].0, 400 - 30 - 50, "over-constrained: right wins in rtl");
         assert_eq!(boxes(&o, 0x00ff00ff)[0].0, 400 - 20, "an inline one's line starts at the right too");
+    }
+
+    /// ★ The pieces of a right-to-left item are laid out right to left: the
+    /// full stop after an Arabic word (a different face, so another piece)
+    /// is at the word's LEFT, the end of an rtl sentence.
+    #[test]
+    fn the_pieces_of_an_rtl_word_run_right_to_left() {
+        let o = render(r#"<style>p { direction: rtl }</style><p>الرأي العام.</p>"#);
+        let x = |t: &str| o.scene.runs.iter().find(|r| r.text == t).map(|r| r.x).unwrap_or_else(|| panic!("no {t}: {:?}", o.scene.runs.iter().map(|r| &r.text).collect::<Vec<_>>()));
+        assert!(x(".") < x("العام") && x("العام") < x("الرأي"), "visual order . العام الرأي: {} {} {}", x("."), x("العام"), x("الرأي"));
     }
 
     /// ★ A NESTED table is not a wrapper. A `display: table` div around a
