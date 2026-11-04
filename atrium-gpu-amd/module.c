@@ -42,8 +42,8 @@
  *       only; VM_BIND maps a BO into a VM at a VA. A BO is unbound until then
  *       and can be bound once. Completes the v2 memory model's shape.
  *   M9e user-mode queues (ABI-v2 §5.9): QUEUE_MAP programs a queue (the
- *       privileged part); userspace mmap()s the BAR2 doorbell (d_mmap) and
- *       rings it directly, off the syscall path. The doorbell page is the
+ *       privileged part); userspace mmap()s the BAR2 doorbell (d_mmap_single,
+ *       owner-only, revocable; queue.c) and rings it directly, off the syscall path. The doorbell page is the
  *       capability — the current AMD/MES direction, expressed BSD-natively.
  *   M9f device discovery (ABI-v2 §5.1): QUERY_CAPS returns a TLV of caps
  *       (ABI version, vendor, feature bits) userspace walks, skipping any it
@@ -55,9 +55,8 @@
  * memory/command/bring-up blocks — each is now a coherent unit worth its own
  * file. (The split earned its keep; through M4 one file read better.)
  */
-#include <sys/energy_budget.h>
-
 #include "atrium_gpu_amd.h"
+#include "energy_compat.h"	/* <sys/energy_budget.h> on Atrium kernels */
 #include "atrium_gpu_amd_abi.h"
 
 #include <sys/module.h>
@@ -97,6 +96,18 @@ amd_gpu_reset_restore(struct atrium_amd_softc *sc)
 	(void)amd_gmc_init(sc);
 	amd_firmware_load(sc);
 	amd_mes_init(sc);
+	amd_hwq_reset_restore(sc);	/* lets submits through again */
+}
+
+/*
+ * Before the FLR: hold every queue (no submit, map or doorbell mmap starts
+ * until restore) and drop the queue state the FLR is about to drop, revoking
+ * user-mode doorbells.
+ */
+static void
+amd_gpu_reset_prepare(struct atrium_amd_softc *sc)
+{
+	amd_hwq_reset_prepare(sc);
 }
 
 /*
@@ -112,6 +123,14 @@ amd_gpu_reset(struct atrium_amd_softc *sc)
 	return (amd_device_reset(sc));
 }
 
+#ifndef ATRIUM_BUILD_ID
+#define ATRIUM_BUILD_ID "unknown"
+#endif
+static const char amd_build_id[] = ATRIUM_BUILD_ID;
+/* Bumped when the client-visible rules change: 2 = isolation (control node,
+ * exclusive queue ownership, owner-only doorbell mmap). */
+#define ATRIUM_AMD_ABI_REV	2
+
 static const struct atrium_gpu_backend_ops amd_backend = {
 	.name = "amd",
 	.vm_setup = amd_vm_setup,
@@ -120,14 +139,14 @@ static const struct atrium_gpu_backend_ops amd_backend = {
 	.bo_free = amd_bo_backing_free,
 	.map_page = amd_vm_map,
 	.unmap_page = amd_vm_unmap,
-	.submit = amd_submit,
+	.submit = amd_hwq_submit,
 	.export_scanout = amd_export_scanout,
 	.bo_fget = amd_bo_fget,
 	.syncobj_fget = amd_syncobj_fget,
 	.syncobj_signal = amd_syncobj_signal,
-	.mmap = amd_doorbell_mmap,
+	.mmap_single = amd_hwq_mmap_single,
 	.get_caps = amd_get_caps,
-	.queue_program = amd_queue_program,
+	.queue_map = amd_hwq_map,
 	.gpu_reset = amd_gpu_reset,
 	.sched = amd_sched,
 	.powergate = amd_powergate,
@@ -150,10 +169,16 @@ amd_teardown(struct atrium_amd_softc *sc)
 	 */
 	amd_ih_set_handler(sc, ATRIUM_AMD_IH_CAUSE_EOP, NULL);
 	amd_reset_register(sc, ATRIUM_AMD_IP_GPU, NULL, NULL);
+	if (sc->ctl_cdev != NULL) {
+		destroy_dev(sc->ctl_cdev);
+		sc->ctl_cdev = NULL;
+	}
 	if (sc->cdev != NULL) {
 		destroy_dev(sc->cdev);
 		sc->cdev = NULL;
 	}
+	/* After destroy_dev: no ioctl, mmap or cdevpriv dtor is still running. */
+	amd_hwq_fini(sc);
 	/*
 	 * Reset this module's footprint in the SHARED softc back to the pristine
 	 * state the base left it in, so a re-attach (driver hot-swap,
@@ -256,6 +281,23 @@ atrium_amd_attach(device_t dev)
 	amd_firmware_load(sc);
 	amd_mes_init(sc);
 
+	/* Build identity for the isolation attestation gate: jaild compares
+	 * build_id with the attested commit before granting `gpu`. */
+	SYSCTL_ADD_STRING(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "build_id",
+	    CTLFLAG_RD, __DECONST(char *, amd_build_id), 0,
+	    "driver build (git describe; -dirty = untested tree)");
+	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "abi_rev",
+	    CTLFLAG_RD, NULL, ATRIUM_AMD_ABI_REV, "client ABI revision");
+
+	/* Queue locks, ownership, doorbell grants and deferred frees (queue.c). */
+	if ((err = amd_hwq_init(sc, dev)) != 0) {
+		device_printf(dev, "queue isolation init failed: %d\n", err);
+		amd_teardown(sc);
+		return (err);
+	}
+
 	/*
 	 * Register this module's IH cause handler: the base ISR routes every
 	 * end-of-pipe completion (IH_CAUSE_EOP, raised on a RELEASE_MEM fence) to
@@ -268,7 +310,8 @@ atrium_amd_attach(device_t dev)
 	 * Register the GFX block's reset hooks so a coordinated device reset re-inits
 	 * it (no prepare; restore reloads firmware/MES after the FLR).
 	 */
-	amd_reset_register(sc, ATRIUM_AMD_IP_GPU, NULL, amd_gpu_reset_restore);
+	amd_reset_register(sc, ATRIUM_AMD_IP_GPU, amd_gpu_reset_prepare,
+	    amd_gpu_reset_restore);
 
 	/*
 	 * Publish the userspace interface. From here a user-mode driver (or the
@@ -290,6 +333,19 @@ atrium_amd_attach(device_t dev)
 		return (err);
 	}
 	sc->cdev->si_drv1 = sc;
+
+	/* The control node: device-wide reset, scheduler and power gating.
+	 * Root-only, and no jail ruleset unhides it (isolation break 5). */
+	err = make_dev_p(MAKEDEV_CHECKNAME, &sc->ctl_cdev,
+	    &atrium_amd_ctl_cdevsw, NULL, UID_ROOT, GID_WHEEL, 0600,
+	    "atrium-gpu%dctl", device_get_unit(dev));
+	if (err != 0) {
+		device_printf(dev, "failed to create /dev/atrium-gpu%dctl: %d\n",
+		    device_get_unit(dev), err);
+		amd_teardown(sc);
+		return (err);
+	}
+	sc->ctl_cdev->si_drv1 = sc;
 
 	/*
 	 * Energy-budget federation member (P6): the kernel water_fills
@@ -323,6 +379,10 @@ atrium_amd_detach(device_t dev)
 	 * can replace this with a device refcount the BOs hold.)
 	 */
 	if (sc->bo_count > 0 || sc->vm_count > 0)
+		return (EBUSY);
+	/* A doorbell grant's pager object, or a deferred BO free, still points
+	 * into this module's code. */
+	if (amd_hwq_busy_refs(sc) > 0)
 		return (EBUSY);
 
 	if (sc->energy_member >= 0) {

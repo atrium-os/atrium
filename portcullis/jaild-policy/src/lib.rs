@@ -189,6 +189,9 @@ pub struct GpuDriverAttestation {
     pub isolation_test_commit: String,
     #[serde(default)]
     pub notes:                 String,
+    /// The driver's client ABI revision at test time (`dev.<driver>.0.abi_rev`).
+    #[serde(default)]
+    pub abi_rev:               Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -197,6 +200,59 @@ pub enum GpuDriverStatus {
     Production,
     Experimental,
     Broken,
+}
+
+/// Why the `gpu` capability may not be granted for a driver
+/// (docs/spec/gpu-isolation.md, "Capability gate").
+#[derive(Debug, PartialEq, Eq)]
+pub enum GpuGrantRefusal {
+    /// No `[gpu_drivers.attested.<driver>]` stanza.
+    NotAttested,
+    /// `isolation_test_passed = false`.
+    TestNotPassed,
+    /// `status` is not `production`.
+    NotProduction,
+    /// The stanza records no commit, so it can't be bound to a build.
+    NoAttestedCommit,
+    /// The running driver reports a build from an uncommitted tree.
+    DirtyBuild { live: String },
+    /// The running driver is not the build that was tested.
+    StaleAttestation { attested: String, live: String },
+}
+
+impl GpuDrivers {
+    /// The capability gate. `live_build_id` is what the bound driver reports
+    /// (`dev.<driver>.0.build_id`, a `git describe` of the kmod tree). Every
+    /// condition must hold; anything unknown refuses, the safe direction.
+    pub fn grant_check(&self, driver: &str, live_build_id: &str)
+        -> Result<(), GpuGrantRefusal>
+    {
+        let a = self.attested.get(driver).ok_or(GpuGrantRefusal::NotAttested)?;
+        if !a.isolation_test_passed {
+            return Err(GpuGrantRefusal::TestNotPassed);
+        }
+        if a.status != GpuDriverStatus::Production {
+            return Err(GpuGrantRefusal::NotProduction);
+        }
+        let attested = a.isolation_test_commit.trim();
+        if attested.is_empty() || attested.chars().all(|c| c == '0') {
+            return Err(GpuGrantRefusal::NoAttestedCommit);
+        }
+        let live = live_build_id.trim();
+        if live.is_empty() || live == "unknown" || live.ends_with("-dirty") {
+            return Err(GpuGrantRefusal::DirtyBuild { live: live.to_string() });
+        }
+        // Either side may be an abbreviated hash: match on the common prefix,
+        // but never on fewer than 7 hex digits.
+        let n = attested.len().min(live.len());
+        if n < 7 || attested[..n] != live[..n] {
+            return Err(GpuGrantRefusal::StaleAttestation {
+                attested: attested.to_string(),
+                live: live.to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -360,5 +416,49 @@ max_simultaneous_per_user = 1
             other => panic!("wrong error: {other}"),
         }
         let _ = std::fs::remove_file(&p);
+    }
+
+    fn drivers(toml_src: &str) -> GpuDrivers {
+        toml::from_str(toml_src).expect("gpu_drivers parses")
+    }
+
+    #[test]
+    fn gpu_grant_gate_binds_attestation_to_the_live_build() {
+        let d = drivers(r#"
+            [attested.atrium-gpu-amd]
+            status = "production"
+            isolation_test_passed = true
+            isolation_test_commit = "4c9f6b2c1a2b"
+            abi_rev = 2
+
+            [attested.exp]
+            status = "experimental"
+            isolation_test_passed = true
+            isolation_test_commit = "4c9f6b2c1a2b"
+
+            [attested.failed]
+            status = "production"
+            isolation_test_passed = false
+            isolation_test_commit = "4c9f6b2c1a2b"
+
+            [attested.placeholder]
+            status = "production"
+            isolation_test_passed = true
+            isolation_test_commit = "0000000"
+        "#);
+        assert_eq!(d.grant_check("atrium-gpu-amd", "4c9f6b2c1a2b"), Ok(()));
+        assert_eq!(d.grant_check("atrium-gpu-amd", "4c9f6b2c"), Ok(()));
+        assert_eq!(d.grant_check("nope", "4c9f6b2c1a2b"), Err(GpuGrantRefusal::NotAttested));
+        assert_eq!(d.grant_check("exp", "4c9f6b2c1a2b"), Err(GpuGrantRefusal::NotProduction));
+        assert_eq!(d.grant_check("failed", "4c9f6b2c1a2b"), Err(GpuGrantRefusal::TestNotPassed));
+        assert_eq!(d.grant_check("placeholder", "0000000"), Err(GpuGrantRefusal::NoAttestedCommit));
+        assert!(matches!(d.grant_check("atrium-gpu-amd", "4c9f6b2c1a2b-dirty"),
+            Err(GpuGrantRefusal::DirtyBuild { .. })));
+        assert!(matches!(d.grant_check("atrium-gpu-amd", "unknown"),
+            Err(GpuGrantRefusal::DirtyBuild { .. })));
+        assert!(matches!(d.grant_check("atrium-gpu-amd", "deadbeef0000"),
+            Err(GpuGrantRefusal::StaleAttestation { .. })));
+        assert!(matches!(d.grant_check("atrium-gpu-amd", "4c9f6"),
+            Err(GpuGrantRefusal::StaleAttestation { .. })));
     }
 }

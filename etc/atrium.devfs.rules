@@ -30,7 +30,8 @@ add path pressure mode 0644
 # HID input nodes, made openable (0666) inside frescod's own devfs instance so
 # the non-root _frescod uid can use them. The atrium-gpu-amd kmod gates only on
 # node permissions (no priv_check), so this grant alone lets frescod run without
-# root. The host's nodes stay 0600 root:wheel — these rules change only this
+# root. atrium-gpu0ctl (device reset, scheduler, power gating) is deliberately
+# NOT unhidden here or in any jail ruleset: it is the host broker's alone. The host's nodes stay 0600 root:wheel — these rules change only this
 # jail's devfs mount.
 [atrium_gpu=21]
 add include $devfsrules_hide_all

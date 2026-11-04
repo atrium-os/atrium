@@ -83,13 +83,19 @@ amd_vm_teardown(struct atrium_amd_vm *vm)
 	struct atrium_amd_softc *sc = vm->sc;
 	int i;
 
+	/*
+	 * Stop every queue still programmed under this VMID and point the VMID
+	 * at the all-invalid page directory first (queue.c, isolation break 2):
+	 * only then can the page tables be freed and the VMID reused.
+	 */
+	amd_hwq_vm_gone(sc, vm->vmid);
+	for (i = 0; i < ATRIUM_AMD_VM_NUM_PT; i++)
+		amd_dma_page_free(&vm->pt[i]);
+	amd_dma_page_free(&vm->pdb);
 	mtx_lock(&sc->lock);
 	sc->vmid_bitmap &= ~(1u << vm->vmid);
 	sc->vm_count--;
 	mtx_unlock(&sc->lock);
-	for (i = 0; i < ATRIUM_AMD_VM_NUM_PT; i++)
-		amd_dma_page_free(&vm->pt[i]);
-	amd_dma_page_free(&vm->pdb);
 }
 
 /* Front-end: tear down the hardware (via the backend) and free the struct. */

@@ -106,18 +106,32 @@ static void
 amd_bo_destroy(struct atrium_amd_bo *bo, struct thread *td)
 {
 	struct atrium_amd_softc *sc = bo->sc;
-	int b, i;
+	uint16_t vmids[ATRIUM_AMD_BO_MAX_BIND];
+	uint64_t gen[ATRIUM_AMD_NHWQ];
+	uint32_t busy;
+	int b, i, n = 0;
 
-	/* Tear down every VM this BO is bound into: clear its PTEs there (so no VM
-	 * is left with a translation to about-to-be-freed pages) and drop the held
-	 * reference that kept that VM alive. */
+	/* Clear the BO's PTEs in every VM it is bound into (each unmap flushes
+	 * the TLB), so no new access can reach its pages. */
 	for (b = 0; b < bo->n_bindings; b++) {
 		struct atrium_amd_bo_binding *bd = &bo->bindings[b];
 
 		for (i = 0; i < bo->npages; i++)
 			sc->backend->unmap_page(bd->vm,
 			    bd->gpu_va + (uint64_t)i * PAGE_SIZE);
-		fdrop(bd->vm_fp, td);
+		vmids[n++] = bd->vm->vmid;
+	}
+	/* Work already queued under one of those VMs may still be using the
+	 * pages (isolation break 2): note which queues are busy now, before
+	 * dropping the VM references (the last one tears the VM down, which
+	 * stops its queues). */
+	busy = amd_hwq_busy_snapshot(sc, vmids, n, gen);
+	for (b = 0; b < bo->n_bindings; b++)
+		fdrop(bo->bindings[b].vm_fp, td);
+	bo->n_bindings = 0;
+	if (busy != 0) {
+		amd_hwq_defer_bo(sc, bo, busy, gen);	/* freed once drained */
+		return;
 	}
 	sc->backend->bo_free(bo);	/* backing store + bo_count-- */
 	free(bo, M_DEVBUF);

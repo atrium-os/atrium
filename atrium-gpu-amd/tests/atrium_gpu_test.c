@@ -41,6 +41,9 @@
 
 static uint32_t type3(uint32_t opcode, uint32_t body_dwords);	/* defined below */
 
+/* /dev/atrium-gpu0ctl: reset, scheduler and power gating live only there. */
+static int ctlfd = -1;
+
 /* Vertex the rasterizer consumes: NDC position + texcoord + RGBA color = 24B. */
 struct vtx {
 	float		x, y, z, u, v;
@@ -634,6 +637,7 @@ test_umq(int fd, int vm)
 	uint64_t ring_va, fence_va, fence = 0;
 	volatile uint32_t *doorbell;
 	void *map;
+	int qfd;
 
 	if (bo_alloc(fd, vm, 4096, &ring_h, &ring_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &fence_h, &fence_va) != 0) {
@@ -658,12 +662,15 @@ test_umq(int fd, int vm)
 	m.vm_fd = vm;
 	m.ring_fd = ring_h;
 	m.engine = ATRIUM_GPU_ENGINE_GFX;
-	if (ioctl(fd, ATRIUM_GPU_IOC_QUEUE_MAP, &m) != 0) {
+	/* Queue ownership belongs to an open of the device: use a client of
+	 * our own and close it at the end, which gives the queue back. */
+	qfd = open("/dev/atrium-gpu0", O_RDWR);
+	if (qfd < 0 || ioctl(qfd, ATRIUM_GPU_IOC_QUEUE_MAP, &m) != 0) {
 		printf("umq: QUEUE_MAP failed\n");
 		return (1);
 	}
 	map = mmap(NULL, m.doorbell_size, PROT_READ | PROT_WRITE, MAP_SHARED,
-	    fd, m.doorbell_mmap_offset);
+	    qfd, m.doorbell_mmap_offset);
 	if (map == MAP_FAILED) {
 		perror("umq: mmap doorbell");
 		return (1);
@@ -678,6 +685,7 @@ test_umq(int fd, int vm)
 		return (1);
 	}
 	munmap(map, m.doorbell_size);
+	close(qfd);
 	if (fence != FENCE_MAGIC) {
 		printf("umq FAILED: fence = 0x%016llx\n",
 		    (unsigned long long)fence);
@@ -942,7 +950,7 @@ test_fault_reset(int fd, int vm)
 	}
 
 	/* Recover the engine. */
-	if (ioctl(fd, ATRIUM_GPU_IOC_GPU_RESET, NULL) != 0) {
+	if (ioctl(ctlfd, ATRIUM_GPU_IOC_GPU_RESET, NULL) != 0) {
 		printf("fault_reset FAILED: GPU_RESET ioctl\n");
 		return (1);
 	}
@@ -1333,7 +1341,7 @@ test_doorbell_pages(int fd, int vm)
 	uint64_t src_va, dst_va, ring_va;
 	volatile uint32_t *doorbell;
 	void *map;
-	int n, i;
+	int n, i, qfd;
 
 	if (bo_alloc(fd, vm, 4096, &src_h, &src_va) != 0 ||
 	    bo_alloc(fd, vm, 4096, &dst_h, &dst_va) != 0 ||
@@ -1359,8 +1367,9 @@ test_doorbell_pages(int fd, int vm)
 	mc.vm_fd = vm;
 	mc.ring_fd = ring_h;
 	mc.engine = ATRIUM_GPU_ENGINE_COMPUTE;
-	if (ioctl(fd, ATRIUM_GPU_IOC_QUEUE_MAP, &mg) != 0 ||
-	    ioctl(fd, ATRIUM_GPU_IOC_QUEUE_MAP, &mc) != 0) {
+	qfd = open("/dev/atrium-gpu0", O_RDWR);	/* own client, see umq */
+	if (qfd < 0 || ioctl(qfd, ATRIUM_GPU_IOC_QUEUE_MAP, &mg) != 0 ||
+	    ioctl(qfd, ATRIUM_GPU_IOC_QUEUE_MAP, &mc) != 0) {
 		printf("doorbell_pages: QUEUE_MAP failed\n");
 		return (1);
 	}
@@ -1371,7 +1380,7 @@ test_doorbell_pages(int fd, int vm)
 	}
 	/* Map ONLY the compute queue's page and ring it directly. */
 	map = mmap(NULL, mc.doorbell_size, PROT_READ | PROT_WRITE, MAP_SHARED,
-	    fd, mc.doorbell_mmap_offset);
+	    qfd, mc.doorbell_mmap_offset);
 	if (map == MAP_FAILED) {
 		perror("doorbell_pages: mmap");
 		return (1);
@@ -1379,6 +1388,7 @@ test_doorbell_pages(int fd, int vm)
 	doorbell = (volatile uint32_t *)((char *)map + mc.doorbell_word_offset);
 	*doorbell = n;
 	munmap(map, mc.doorbell_size);
+	close(qfd);
 
 	if (bo_read(fd, dst_h, out, sizeof(out)) != 0) {
 		printf("doorbell_pages: read failed\n");
@@ -1489,7 +1499,7 @@ test_vram(int fd, int vm)
 		return (1);
 	}
 	/* A full GPU reset loses VRAM — the BO now reads back zero. */
-	if (ioctl(fd, ATRIUM_GPU_IOC_GPU_RESET, NULL) != 0) {
+	if (ioctl(ctlfd, ATRIUM_GPU_IOC_GPU_RESET, NULL) != 0) {
 		printf("vram: GPU_RESET failed\n");
 		return (1);
 	}
@@ -1676,19 +1686,21 @@ test_display(int fd, int dfd)
 		return (1);
 	}
 
-	/* 6. Referee: a too-small FB faults FbTooSmall (code 4), and the
-	 * screen keeps FB2. */
+	/* 6. A too-small FB is refused by the kernel itself (EINVAL), before
+	 * the referee could see it (isolation break 4), and the screen keeps
+	 * FB2. */
 	small_fd = vram_bo(fd, 4096);
 	if (small_fd < 0 || display_wait_idle(dfd) != 0)
 		return (1);
 	fault = display_commit(dfd, small_fd, ATRIUM_DISPLAY_COMMIT_ASYNC);
-	if (fault != 4) {
-		printf("display FAILED: too-small FB fault=%#x (want 4)\n", fault);
+	if (fault != (0x100u | EINVAL)) {
+		printf("display FAILED: too-small FB gave %#x (want EINVAL)\n",
+		    fault);
 		return (1);
 	}
 
 	printf("display OK: connector+EDID, MODES %ux%u@%umHz, MODESET, vsync "
-	    "FLIP, vblank advanced %llu, too-small FB refereed\n",
+	    "FLIP, vblank advanced %llu, too-small FB refused by the kernel\n",
 	    md.modes[0].width, md.modes[0].height, md.modes[0].refresh_mhz,
 	    (unsigned long long)(st1.vblank_count - before));
 	close(small_fd);
@@ -1710,8 +1722,9 @@ test_display_link(int fd, int dfd)
 	uint32_t fault;
 	int fb_fd, rc = 0;
 
-	/* a small VRAM FB suffices: the link check precedes the FB-size check. */
-	fb_fd = vram_bo(fd, 640 * 480 * 4);
+	/* A 4K-sized FB: the kernel refuses an FB smaller than the mode before
+	 * the referee's link check runs (isolation break 4). */
+	fb_fd = vram_bo(fd, 3840u * 2160u * 4u);
 	if (fb_fd < 0)
 		return (1);
 
@@ -1730,13 +1743,12 @@ test_display_link(int fd, int dfd)
 		rc = 1;
 	}
 
-	/* re-cable to DisplayPort 1.4: the link now fits, so MODESET gets past it
-	 * to the FB-size check (the 640x480 FB is too small for 4K → fault 4). */
+	/* re-cable to DisplayPort 1.4: the link now fits, so the MODESET lands. */
 	cfg.connector_type = 3; /* DP 1.4 */
 	ioctl(dfd, ATRIUM_DISPLAY_IOC_CONFIG, &cfg);
 	fault = display_commit(dfd, fb_fd, ATRIUM_DISPLAY_COMMIT_MODESET);
-	if (fault != 4) { /* FbTooSmall — i.e. the link check passed */
-		printf("display_link FAILED: 4K/DP1.4 fault=%u (want 4, link OK)\n", fault);
+	if (fault != 0) { /* the link check passed */
+		printf("display_link FAILED: 4K/DP1.4 fault=%u (want 0, link OK)\n", fault);
 		rc = 1;
 	}
 
@@ -1766,7 +1778,7 @@ test_display_usbc(int fd, int dfd)
 	uint32_t fault;
 	int fb_fd, rc = 0;
 
-	fb_fd = vram_bo(fd, 640 * 480 * 4);
+	fb_fd = vram_bo(fd, 3840u * 2160u * 4u);	/* fits the 4K mode below */
 	if (fb_fd < 0)
 		return (1);
 
@@ -1803,14 +1815,14 @@ test_display_usbc(int fd, int dfd)
 		rc = 1;
 	}
 
-	/* a 4K monitor fits 4 lanes (link OK -> FB too small) but not 2. */
+	/* a 4K monitor fits 4 lanes but not 2. */
 	cfg.plug_mode = 2; /* 4K */
 	ioctl(dfd, ATRIUM_DISPLAY_IOC_CONFIG, &cfg);
 	uc.lanes = 4;
 	ioctl(dfd, ATRIUM_DISPLAY_IOC_USBC, &uc);
 	fault = display_commit(dfd, fb_fd, ATRIUM_DISPLAY_COMMIT_MODESET);
-	if (fault != 4 /* FbTooSmall: link passed at 4 lanes */) {
-		printf("display_usbc FAILED: 4K/4-lane fault=%u (want 4)\n", fault);
+	if (fault != 0 /* link passed at 4 lanes */) {
+		printf("display_usbc FAILED: 4K/4-lane fault=%u (want 0)\n", fault);
 		rc = 1;
 	}
 	uc.lanes = 2;
@@ -1957,10 +1969,10 @@ test_sched(int fd)
 	 * instead of assuming a fresh model: a re-run must not fail. */
 	uint32_t q0, q1;
 	s.op = 0; s.arg = 1; s.ops = 1; s.bytes = 1000000000u; s.level = 3;
-	ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
+	ioctl(ctlfd, ATRIUM_GPU_IOC_SCHED, &s);
 	q0 = s.count - 1;
 	s.op = 0; s.arg = 1; s.ops = 1; s.bytes = 1000000000u; s.level = 4;
-	ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
+	ioctl(ctlfd, ATRIUM_GPU_IOC_SCHED, &s);
 	q1 = s.count - 1;
 	if (s.count < 2 || q1 != q0 + 1) {
 		printf("sched FAILED: count=%u after two adds (q0=%u)\n",
@@ -1969,11 +1981,11 @@ test_sched(int fd)
 	}
 
 	s.op = 1; s.arg = 2000; /* run 2000 progress-fair rounds */
-	ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
+	ioctl(ctlfd, ATRIUM_GPU_IOC_SCHED, &s);
 
-	s.op = 2; s.arg = q0; ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
+	s.op = 2; s.arg = q0; ioctl(ctlfd, ATRIUM_GPU_IOC_SCHED, &s);
 	t0 = s.busy_us; e0 = s.energy_uj; r0 = s.runs;
-	s.op = 2; s.arg = q1; ioctl(fd, ATRIUM_GPU_IOC_SCHED, &s);
+	s.op = 2; s.arg = q1; ioctl(ctlfd, ATRIUM_GPU_IOC_SCHED, &s);
 	t1 = s.busy_us; e1 = s.energy_uj; r1 = s.runs;
 
 	/* progress-fair: the two queues got ~equal engine time (within 10%). */
@@ -2015,6 +2027,11 @@ main(void)
 	if (dfd < 0) {
 		perror("open /dev/atrium-display0");
 		close(fd);
+		return (1);
+	}
+	ctlfd = open("/dev/atrium-gpu0ctl", O_RDWR);
+	if (ctlfd < 0) {
+		perror("open /dev/atrium-gpu0ctl");
 		return (1);
 	}
 	vm = vm_create(fd);

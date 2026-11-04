@@ -257,6 +257,12 @@ The model's synchronous drain hides 1, 2 and the A2.2 mis-signalling,
 because the work completes inside the doorbell write. Every one of them
 appears on real asynchronous hardware.
 
+*Status 2026-11-04:* all five are fixed in `atrium-gpu-amd` and covered by
+`tests/test_gpu_isolation.c`, which uses rings parked on a WAIT to keep work
+in flight on gpusim. See `atrium-gpu-amd/ISOLATION.md`. A2.2 (completions
+by queue and seqno), A2.6 (hang model) and per-VM MES queues (A2.3) are
+still open.
+
 ### A4. The display side
 
 The direction (decoupled engine, scanline-accurate model, atomic commit as

@@ -17,7 +17,7 @@ struct atrium_gpu_sched {
 };
 #define ATRIUM_GPU_IOC_SCHED _IOWR('A', 25, struct atrium_gpu_sched)
 int main(void) {
-	int fd = open("/dev/atrium-gpu0", O_RDWR);
+	int fd = open("/dev/atrium-gpu0ctl", O_RDWR);
 	if (fd < 0) err(1, "open");
 	struct atrium_gpu_sched s = { .op = 0, .arg = 1, .ops = 1,
 	    .bytes = 1000000000U, .level = 3 };

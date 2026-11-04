@@ -59,37 +59,22 @@ amd_queue_program(struct atrium_amd_softc *sc, uint64_t ring_va,
 }
 
 /*
- * amd backend: map a doorbell page into userspace. The doorbell BAR is the
- * per-queue submit aperture — mapping `offset` into a process is the capability
- * grant that lets it kick exactly that queue (ABI-v2 user-mode queues).
+ * Stop a queue: halt the gfx ME, or deactivate the compute HQD, and clear its
+ * VMID. Work still queued on it is dropped. The caller holds the queue's lock
+ * (queue.c). On gpusim the stop takes effect at the register write; real
+ * silicon needs the HQD dequeue request and a wait for CP_HQD_ACTIVE to clear
+ * (MES REMOVE_QUEUE once queues move to the MES, review §A2.3).
  */
-int
-amd_doorbell_mmap(struct atrium_amd_softc *sc, vm_ooffset_t offset,
-    vm_paddr_t *paddr, vm_memattr_t *memattr)
+void
+amd_queue_stop(struct atrium_amd_softc *sc, uint32_t qid)
 {
-	if (offset < 0 || offset >= rman_get_size(sc->doorbell))
-		return (EINVAL);
-	*paddr = rman_get_start(sc->doorbell) + offset;
-	*memattr = VM_MEMATTR_DEVICE;
-	return (0);
-}
-
-int
-amd_submit(struct atrium_amd_softc *sc, struct atrium_amd_bo *ring,
-    uint32_t n_dwords, uint32_t engine, struct atrium_amd_vm *vm)
-{
-	uint32_t doorbell_off;
-	uint64_t ring_va;
-	int err;
-
-	ring_va = amd_bo_gpu_va(ring, vm);	/* the ring's VA in the submit VM */
-	if (ring_va == 0)
-		return (EINVAL);		/* ring not bound in this VM */
-	err = amd_queue_program(sc, ring_va, engine, vm->vmid, &doorbell_off);
-	if (err != 0)
-		return (err);
-	bus_write_4(sc->doorbell, doorbell_off, n_dwords);
-	return (0);
+	if (qid == ATRIUM_AMD_GFX_QID) {
+		amd_mmio_write32(sc, regCP_ME_CNTL, 1);	/* halt */
+	} else {
+		amd_mmio_write32(sc, regHQD_SELECT, qid);
+		amd_mmio_write32(sc, regCP_HQD_ACTIVE, 0);
+	}
+	amd_queue_set_vmid(sc, qid, 0);
 }
 
 /*

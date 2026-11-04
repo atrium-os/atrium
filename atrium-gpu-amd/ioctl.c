@@ -9,28 +9,66 @@
 #include "atrium_gpu_amd.h"
 #include "atrium_gpu_amd_abi.h"
 
+/*
+ * Each open is a client (cdevpriv). Queue ownership and doorbell grants hang
+ * off it, and are given back when its last fd closes.
+ */
+static void
+atrium_amd_client_dtor(void *arg)
+{
+	struct atrium_amd_client *c = arg;
+
+	amd_hwq_client_close(c->sc, c);
+	free(c, M_DEVBUF);
+}
+
 static int
 atrium_amd_open(struct cdev *cdev, int oflags, int devtype, struct thread *td)
 {
+	struct atrium_amd_softc *sc = cdev->si_drv1;
+	struct atrium_amd_client *c;
+	int err;
+
+	c = malloc(sizeof(*c), M_DEVBUF, M_WAITOK | M_ZERO);
+	c->sc = sc;
+	err = devfs_set_cdevpriv(c, atrium_amd_client_dtor);
+	if (err != 0)
+		free(c, M_DEVBUF);
+	return (err);
+}
+
+static int
+amd_client(struct atrium_amd_client **out)
+{
+	void *p;
+	int err;
+
+	err = devfs_get_cdevpriv(&p);
+	if (err != 0)
+		return (err);
+	*out = p;
 	return (0);
 }
 
 /*
- * Map one doorbell page of BAR2 into userspace for user-mode-queue submission.
- * The doorbell BAR is divided into per-queue pages: QUEUE_MAP hands a queue's
- * page offset to its owner, who mmap()s just that page. Mapping one queue's
- * doorbell therefore does not expose any other queue's — the page is the
- * capability (so it can be SCM_RIGHTS-granted to a single jailed client). The
- * page is device MMIO (VM_MEMATTR_DEVICE), so a store to it traps straight to
- * the device. Offsets past the BAR are refused.
+ * Map one queue's doorbell page into userspace for user-mode submission. Only
+ * the client that owns the queue (QUEUE_MAP) can map it, and what it gets is a
+ * managed pager object the kernel empties when it takes the queue back, so the
+ * page is a real, revocable capability (it can still be passed to a single
+ * jailed process with the device fd). Offsets that are not a doorbell of a
+ * queue this client owns are refused.
  */
 static int
-atrium_amd_mmap(struct cdev *cdev, vm_ooffset_t offset, vm_paddr_t *paddr,
-    int nprot, vm_memattr_t *memattr)
+atrium_amd_mmap_single(struct cdev *cdev, vm_ooffset_t *offset, vm_size_t size,
+    vm_object_t *object, int nprot)
 {
 	struct atrium_amd_softc *sc = cdev->si_drv1;
+	struct atrium_amd_client *c;
+	int err;
 
-	return (sc->backend->mmap(sc, offset, paddr, memattr));
+	if ((err = amd_client(&c)) != 0)
+		return (err);
+	return (sc->backend->mmap_single(sc, c, offset, size, object, nprot));
 }
 
 /* Append a TLV cap record (header + data, padded to 4 bytes) to a buffer. */
@@ -69,8 +107,12 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
     struct thread *td)
 {
 	struct atrium_amd_softc *sc = cdev->si_drv1;
+	struct atrium_amd_client *client;
 	struct atrium_amd_bo *bo;
 	int err;
+
+	if ((err = amd_client(&client)) != 0)
+		return (err);
 
 	switch (cmd) {
 	case ATRIUM_GPU_IOC_VM_CREATE: {
@@ -138,13 +180,13 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		}
 		uint64_t ring_va = amd_bo_gpu_va(bo, vm);
 
-		if (sc->backend->queue_program == NULL)
+		if (sc->backend->queue_map == NULL)
 			err = EOPNOTSUPP;	/* no user-mode queues on this backend */
 		else if (ring_va == 0)	/* ring must be bound in THIS vm for a GPU-VA */
 			err = EINVAL;
-		else
-			err = sc->backend->queue_program(sc, ring_va, m->engine,
-			    vm->vmid, &doorbell_off);
+		else	/* exclusive: EBUSY if another client owns the queue */
+			err = sc->backend->queue_map(sc, client, vm, ring_va,
+			    m->engine, &doorbell_off);
 		fdrop(bofp, td);
 		fdrop(vmfp, td);
 		if (err != 0)
@@ -152,7 +194,8 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		/*
 		 * doorbell_off is page-aligned (one page per queue), so it IS the
 		 * mmap offset of this queue's own doorbell page; the doorbell word
-		 * is at the start of that page. mmap()ing it exposes only this queue.
+		 * is at the start of that page. Only this client can mmap it, and
+		 * only while it owns the queue.
 		 */
 		m->doorbell_mmap_offset = doorbell_off;
 		m->doorbell_size = PAGE_SIZE;
@@ -302,15 +345,12 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 					    s->signal_value);
 			}
 			if (err == 0) {
-				/* Stage this submit's frame deadline before the
-				 * doorbell (frame-pacing): the firmware scheduler
-				 * drains queues earliest-deadline-first. */
-				if (sc->regs != NULL)
-					amd_mmio_write32(sc,
-					    regCP_SUBMIT_DEADLINE_NS,
-					    s->deadline_ns);
-				err = sc->backend->submit(sc, bo, s->n_dwords,
-				    s->engine, vm);
+				/* The backend stages the frame deadline,
+				 * programs the queue and rings it under the
+				 * queue's lock (frame pacing: the firmware
+				 * scheduler drains earliest-deadline-first). */
+				err = sc->backend->submit(sc, client, bo,
+				    s->n_dwords, s->engine, vm, s->deadline_ns);
 			}
 			/* Submit never reached the GPU -> reclaim the entry. */
 			if (err != 0 && so != NULL)
@@ -367,6 +407,47 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		return (err);
 	}
 
+	case ATRIUM_GPU_IOC_GPU_RESET:
+	case ATRIUM_GPU_IOC_SCHED:
+	case ATRIUM_GPU_IOC_POWERGATE:
+		/* Device-wide authority lives on the control node only
+		 * (/dev/atrium-gpuNctl, isolation break 5). */
+		return (EPERM);
+
+	/*
+	 * Display ioctls moved to /dev/atrium-display0 (atrium_gpu_amd_display.ko,
+	 * §4.1): the display engine is a separate driver. A display commit names
+	 * the scanout BO by its fd and the display module resolves it through
+	 * sc->backend, so nothing here hands out VRAM addresses.
+	 */
+
+	default:
+		return (ENOTTY);
+	}
+}
+
+struct cdevsw atrium_amd_cdevsw = {
+	.d_version =	D_VERSION,
+	.d_name =	"atrium-gpu",
+	.d_open =	atrium_amd_open,
+	.d_ioctl =	atrium_amd_ioctl,
+	.d_mmap_single = atrium_amd_mmap_single,	/* no d_mmap fallback */
+};
+
+/*
+ * /dev/atrium-gpuNctl — device-wide control (isolation break 5, review §A2.4).
+ * Reset, scheduler weights and power gating affect every client, so they are
+ * not on the client node at all: the control node is root-only and no jail's
+ * devfs ruleset unhides it. Only the compositor's broker holds it.
+ */
+static int
+atrium_amd_ctl_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
+    struct thread *td)
+{
+	struct atrium_amd_softc *sc = cdev->si_drv1;
+	int err;
+
+	switch (cmd) {
 	case ATRIUM_GPU_IOC_GPU_RESET: {
 		/*
 		 * Recover a wedged engine. A full GPU reset tears down the rings
@@ -410,22 +491,13 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		return (sc->backend->powergate(sc, p));
 	}
 
-	/*
-	 * Display ioctls moved to /dev/atrium-display0 (atrium_gpu_amd_display.ko,
-	 * §4.1): the display engine is a separate driver. A display commit names
-	 * the scanout BO by its fd and the display module resolves it through
-	 * sc->backend, so nothing here hands out VRAM addresses.
-	 */
-
 	default:
 		return (ENOTTY);
 	}
 }
 
-struct cdevsw atrium_amd_cdevsw = {
+struct cdevsw atrium_amd_ctl_cdevsw = {
 	.d_version =	D_VERSION,
-	.d_name =	"atrium-gpu",
-	.d_open =	atrium_amd_open,
-	.d_ioctl =	atrium_amd_ioctl,
-	.d_mmap =	atrium_amd_mmap,
+	.d_name =	"atrium-gpuctl",
+	.d_ioctl =	atrium_amd_ctl_ioctl,
 };

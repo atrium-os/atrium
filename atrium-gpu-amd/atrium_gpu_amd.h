@@ -37,6 +37,11 @@
 #include <machine/bus.h>
 #include <machine/resource.h>
 
+#include <sys/sx.h>
+#include <sys/sysctl.h>
+#include <sys/taskqueue.h>
+#include <sys/queue.h>
+
 #include <vm/vm.h>
 #include <vm/pmap.h>
 
@@ -118,6 +123,9 @@
 #define ATRIUM_AMD_Q_BASE	0x20100	/* SIM: per-queue config block base */
 #define ATRIUM_AMD_Q_STRIDE	0x20	/* bytes per queue */
 #define ATRIUM_AMD_QF_VMID	0x14	/* offset of the VMID field within a queue */
+#define ATRIUM_AMD_QF_RPTR	0x1c	/* r: the queue's read pointer, in the same
+					 * dword units as the doorbell wptr (gpusim
+					 * 1ea93e5). rptr < wptr = work in flight. */
 
 /*
  * Display block (APER_DISP = 0x3_0000; model: engine/src/display.rs `regs`).
@@ -278,6 +286,7 @@ struct atrium_amd_dma_page {
 struct atrium_amd_softc;
 struct atrium_amd_vm;
 struct atrium_amd_bo;
+struct atrium_amd_client;
 struct atrium_gpu_sched;	/* 'A' ABI structs (defined in atrium_gpu_amd_abi.h) */
 struct atrium_gpu_powergate;
 
@@ -323,9 +332,13 @@ struct atrium_gpu_backend_ops {
 	int	(*map_page)(struct atrium_amd_vm *vm, uint64_t va,
 		    vm_paddr_t phys, int vram);
 	void	(*unmap_page)(struct atrium_amd_vm *vm, uint64_t va);
-	/* Submit a prepared ring on an engine in a VM (amd: PM4 ring + doorbell). */
-	int	(*submit)(struct atrium_amd_softc *sc, struct atrium_amd_bo *ring,
-		    uint32_t n_dwords, uint32_t engine, struct atrium_amd_vm *vm);
+	/* Submit a prepared ring on an engine in a VM (amd: PM4 ring + doorbell,
+	 * under the queue's lock; EBUSY if another client owns the queue or
+	 * another VM's work on it does not drain). */
+	int	(*submit)(struct atrium_amd_softc *sc,
+		    struct atrium_amd_client *client, struct atrium_amd_bo *ring,
+		    uint32_t n_dwords, uint32_t engine, struct atrium_amd_vm *vm,
+		    uint32_t deadline_ns);
 	/* Export a BO as a scanout handle (amd: absolute VRAM offset + size; only
 	 * VRAM is scannable). EINVAL if the BO can't be scanned out. */
 	int	(*export_scanout)(struct atrium_amd_bo *bo, uint64_t *vram_offset,
@@ -343,10 +356,11 @@ struct atrium_gpu_backend_ops {
 	int	(*syncobj_fget)(struct thread *td, int fd, struct file **out_fp,
 		    struct atrium_amd_syncobj **out_so);
 	void	(*syncobj_signal)(struct atrium_amd_syncobj *so, uint64_t value);
-	/* mmap a device aperture into userspace (amd: the per-queue doorbell page
-	 * = a capability grant). Returns the physical addr + memattr for `offset`. */
-	int	(*mmap)(struct atrium_amd_softc *sc, vm_ooffset_t offset,
-		    vm_paddr_t *paddr, vm_memattr_t *memattr);
+	/* mmap a device aperture into userspace (amd: the doorbell page of a queue
+	 * this client owns, as a revocable managed-pager object). */
+	int	(*mmap_single)(struct atrium_amd_softc *sc,
+		    struct atrium_amd_client *client, vm_ooffset_t *offset,
+		    vm_size_t size, vm_object_t *object, int nprot);
 	/* Fill in the backend's device capability values (vendor, heaps, VA window). */
 	void	(*get_caps)(struct atrium_amd_softc *sc,
 		    struct atrium_gpu_backend_caps *caps);
@@ -358,8 +372,9 @@ struct atrium_gpu_backend_ops {
 	 */
 	/* Map a queue's doorbell for user-mode submission (amd: program the MEC/CP
 	 * queue at ring_va, return the doorbell page offset). */
-	int	(*queue_program)(struct atrium_amd_softc *sc, uint64_t ring_va,
-		    uint32_t engine, uint16_t vmid, uint32_t *doorbell_off);
+	int	(*queue_map)(struct atrium_amd_softc *sc,
+		    struct atrium_amd_client *client, struct atrium_amd_vm *vm,
+		    uint64_t ring_va, uint32_t engine, uint32_t *doorbell_off);
 	/* Recover a wedged engine (amd: reset + reload firmware + re-init MES). */
 	int	(*gpu_reset)(struct atrium_amd_softc *sc);
 	/* Energy-aware scheduler hint (amd: SCHED registers). */
@@ -503,6 +518,74 @@ struct atrium_amd_reset_hooks {
 	void (*restore)(struct atrium_amd_softc *sc);	/* re-init after FLR */
 };
 
+/*
+ * GPU isolation (docs/spec/gpu-isolation.md; review 2026-11-03 §A3).
+ *
+ * A client is one open of /dev/atrium-gpuN (cdevpriv). A hardware queue is one
+ * of the device's two shared rings (gfx qid 0, compute qid 1). Each has its own
+ * sleepable lock around program + doorbell, so two clients can never interleave
+ * those register writes (break 1). A queue is never switched to another VMID
+ * while the queue's read pointer trails what was rung (work in flight); the
+ * submitter waits, then gets EBUSY. A client that maps a queue for user-mode
+ * submission owns it exclusively until it closes the device or the VM goes away
+ * (break 3); only the owner can mmap that queue's doorbell page, through a
+ * per-grant managed pager object the kernel revokes on release.
+ *
+ * The real fix for the shared queues is per-VM MES queues (review §A2.3); this
+ * keeps the two shared queues safe until that lands.
+ */
+#define ATRIUM_AMD_NHWQ		2
+#define ATRIUM_AMD_QUEUE_WAIT_MS 2000	/* wait for another VM's work to drain */
+
+struct atrium_amd_client {
+	struct atrium_amd_softc *sc;
+};
+
+/* One doorbell mapping grant: the pager handle of one owner's mapping. */
+struct atrium_amd_db_grant {
+	struct atrium_amd_softc *sc;
+	vm_paddr_t	 pa;		/* the doorbell page */
+	int		 revoked;	/* set under the pager object's lock */
+};
+
+struct atrium_amd_hwq {
+	struct sx	 lock;		/* program + doorbell + ownership */
+	uint32_t	 qid;
+	uint32_t	 engine;
+	uint32_t	 doorbell_off;
+	uint16_t	 vmid;		/* VMID programmed now, 0 = none */
+	uint32_t	 wptr;		/* last wptr the kernel rang, 0 = none */
+	uint64_t	 gen;		/* bumped by every program and dequeue */
+	struct atrium_amd_client *owner; /* user-mode owner, NULL = kernel */
+	struct atrium_amd_vm *owner_vm;
+	struct atrium_amd_db_grant *grant;
+	vm_object_t	 grant_obj;	/* our reference on the grant's object */
+};
+
+/*
+ * A BO whose pages could still be in use by queued GPU work when its last fd
+ * closed (break 2). Its PTEs are already gone; the pages are freed once every
+ * queue that was busy at close time has drained or been dequeued.
+ */
+struct atrium_amd_deferred {
+	TAILQ_ENTRY(atrium_amd_deferred) link;
+	uint32_t	 busy_mask;
+	uint64_t	 gen[ATRIUM_AMD_NHWQ];
+	struct atrium_amd_bo *bo;
+};
+
+struct atrium_amd_isolation_stats {
+	uint64_t	 queue_waits;	/* submits that waited for another VM */
+	uint64_t	 queue_refused;	/* EBUSY: owned, or did not drain */
+	uint64_t	 dequeues;	/* queues stopped with work dropped */
+	uint64_t	 grants;	/* doorbell grants created */
+	uint64_t	 revokes;	/* doorbell grants revoked */
+	uint64_t	 deferred;	/* BO frees deferred */
+	uint64_t	 reaped;	/* deferred BO frees completed */
+	int		 deferred_now;	/* deferred BO frees outstanding */
+	int		 grants_live;	/* grant pager objects alive */
+};
+
 struct atrium_amd_softc {
 	device_t	 dev;
 	const struct atrium_gpu_backend_ops *backend; /* hardware seam (gpu module) */
@@ -571,6 +654,8 @@ struct atrium_amd_softc {
 	int		 display_opened;	/* exclusive open held */
 	int		 display_mode_set;	/* CRTC lit by a MODESET commit */
 	uint32_t	 display_refresh_mhz;	/* refresh of the mode in use */
+	uint32_t	 display_mode_width;	/* the mode in use, for the kernel's */
+	uint32_t	 display_mode_height;	/* own scanout bounds check */
 	uint32_t	 display_last_fault;	/* fault of the last deferred flip */
 
 	/*
@@ -594,6 +679,17 @@ struct atrium_amd_softc {
 	int		 vm_count;	/* live vm_fds */
 
 	int		 bo_count;	/* live bo_fds; detach refuses if > 0 */
+
+	/* GPU isolation state (queue.c). */
+	struct cdev	*ctl_cdev;	/* /dev/atrium-gpuNctl: reset/sched/powergate */
+	struct atrium_amd_hwq hwq[ATRIUM_AMD_NHWQ];
+	int		 hwq_inited;
+	struct atrium_amd_dma_page null_pd; /* all-invalid page directory */
+	int		 db_fict_registered;
+	struct mtx	 defer_lock;
+	TAILQ_HEAD(, atrium_amd_deferred) deferred;
+	struct timeout_task defer_task;
+	struct atrium_amd_isolation_stats iso;
 	uint64_t	 vram_next;	/* VRAM bump allocator cursor (base-managed) */
 };
 
@@ -673,8 +769,6 @@ void	 amd_bo_backing_free(struct atrium_amd_bo *bo);
 int	 amd_export_scanout(struct atrium_amd_bo *bo, uint64_t *vram_offset,
 	    uint64_t *size);
 /* amd backend: mmap the per-queue doorbell page (the capability grant). */
-int	 amd_doorbell_mmap(struct atrium_amd_softc *sc, vm_ooffset_t offset,
-	    vm_paddr_t *paddr, vm_memattr_t *memattr);
 extern const struct fileops atrium_amd_bo_fileops;
 
 /* vm.c — per-process GPU address spaces (fd-backed) + GPUVM page tables */
@@ -737,10 +831,34 @@ amd_reset_register(struct atrium_amd_softc *sc, int ip,
 }
 
 /* cp.c — submission (under a VM's VMID) */
-int	 amd_submit(struct atrium_amd_softc *sc, struct atrium_amd_bo *ring,
-	    uint32_t n_dwords, uint32_t engine, struct atrium_amd_vm *vm);
 int	 amd_queue_program(struct atrium_amd_softc *sc, uint64_t ring_va,
 	    uint32_t engine, uint16_t vmid, uint32_t *doorbell_off);
+void	 amd_queue_stop(struct atrium_amd_softc *sc, uint32_t qid);
+
+/* queue.c — queue ownership, in-flight tracking, doorbell grants, deferred
+ * frees (GPU isolation, review §A3 breaks 1-3) */
+int	 amd_hwq_init(struct atrium_amd_softc *sc, device_t dev);
+void	 amd_hwq_fini(struct atrium_amd_softc *sc);
+int	 amd_hwq_busy_refs(struct atrium_amd_softc *sc);
+int	 amd_hwq_submit(struct atrium_amd_softc *sc,
+	    struct atrium_amd_client *client, struct atrium_amd_bo *ring,
+	    uint32_t n_dwords, uint32_t engine, struct atrium_amd_vm *vm,
+	    uint32_t deadline_ns);
+int	 amd_hwq_map(struct atrium_amd_softc *sc,
+	    struct atrium_amd_client *client, struct atrium_amd_vm *vm,
+	    uint64_t ring_va, uint32_t engine, uint32_t *doorbell_off);
+int	 amd_hwq_mmap_single(struct atrium_amd_softc *sc,
+	    struct atrium_amd_client *client, vm_ooffset_t *offset,
+	    vm_size_t size, vm_object_t *object, int nprot);
+void	 amd_hwq_client_close(struct atrium_amd_softc *sc,
+	    struct atrium_amd_client *client);
+void	 amd_hwq_vm_gone(struct atrium_amd_softc *sc, uint16_t vmid);
+uint32_t amd_hwq_busy_snapshot(struct atrium_amd_softc *sc,
+	    const uint16_t *vmids, int nvmids, uint64_t *gen);
+void	 amd_hwq_defer_bo(struct atrium_amd_softc *sc, struct atrium_amd_bo *bo,
+	    uint32_t busy_mask, const uint64_t *gen);
+void	 amd_hwq_reset_prepare(struct atrium_amd_softc *sc);
+void	 amd_hwq_reset_restore(struct atrium_amd_softc *sc);
 
 /* cp.c — firmware energy-fair scheduler (the kernel programs weights) */
 struct atrium_gpu_sched;
@@ -790,7 +908,8 @@ void	 amd_pending_push(struct atrium_amd_softc *sc,
 void	 amd_pending_scrub(struct atrium_amd_softc *sc,
 	    struct atrium_amd_syncobj *so);
 
-/* ioctl.c — the cdev character-device switch */
+/* ioctl.c — the client and control character-device switches */
 extern struct cdevsw atrium_amd_cdevsw;
+extern struct cdevsw atrium_amd_ctl_cdevsw;
 
 #endif /* _ATRIUM_GPU_AMD_H_ */

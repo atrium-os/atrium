@@ -8,7 +8,7 @@
 //!
 //! Run on a fresh boot (the firmware scheduler accumulates queues across runs).
 
-use atrium_gpu::amd::Gpu;
+use atrium_gpu::amd::GpuCtl;
 use std::io;
 
 fn main() {
@@ -22,7 +22,7 @@ fn main() {
 }
 
 fn run() -> io::Result<()> {
-    let gpu = Gpu::open()?;
+    let gpu = GpuCtl::open()?; // the scheduler is device-wide: control node only
 
     // Two identical ~1 ms VRAM queues (weight 1; 640 MB at 640 GB/s ≈ 1 ms/round):
     // queue indices are count-1 as they're appended.

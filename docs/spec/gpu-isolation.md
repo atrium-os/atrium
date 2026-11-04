@@ -110,7 +110,7 @@ property of the driver + hardware.
 | Driver | Isolation provider | Status |
 |--------|-------------------|--------|
 | **`atrium-virtio-gpu`** (D0, current) | layered: kmod per-fd handle table + virtio-gpu spec context ownership + host venus per-VkInstance + Metal/Apple IOMMU on M4 Max | **Verified by smoke test** (see below) |
-| **`atrium-gpu-amd`** (RDNA4, from scratch, against gpusim; the ABI v2.1 reference) | per-VM page tables in the GPU MMU, enforced today partly by the gpusim referee | **Not attested.** Five isolation breaks found 2026-11-03 (`docs/reviews/2026-11-03-gpu-kernel-and-tier2-review.md` §A3); `test_gpu_isolation.c` does not exist yet. Must not appear in `[gpu_drivers.attested]`. |
+| **`atrium-gpu-amd`** (RDNA4, from scratch, against gpusim; the ABI v2.1 reference) | per-VM page tables in the GPU MMU; per-queue locks and in-flight tracking; exclusive queue ownership with revocable doorbell grants; root-only control node; kernel-checked scanout bounds (`atrium-gpu-amd/ISOLATION.md`) | **Experimental.** The five breaks from 2026-11-03 (review §A3) are fixed and `atrium-gpu-amd/tests/test_gpu_isolation.c` passes on gpusim (amd64 VM, 2026-11-04). Not yet run on silicon, so `status = "experimental"` and the gate refuses `gpu`. |
 | **`atrium-asahi`** (D5+ Apple Silicon native) | Apple GPU per-context page tables + AGX MMU; kernel driver manages page tables; user shaders go through the AGX user command ring | **Spec-only; gated on D5 driver landing** |
 | **`atrium-amdgpu`** (D5+ AMD discrete) | AMDGPU MMU per-VMID; kernel driver manages VMIDs and page tables; user shaders go through MEC (Micro Engine Compute) user queues | **Spec-only; gated on D5+ driver landing** |
 | **`atrium-i915`** (D5+ Intel) | Intel PPGTT (per-process graphics translation tables); kernel manages PPGTT; user shaders go through user-mode command rings | **Spec-only; gated on D5+ driver landing** |
@@ -193,6 +193,9 @@ the driver build**, and the binding is enforced, not advisory:
 
 - The kmod exposes its build identity — `dev.atrium_gpu.0.build_id`
   (git commit baked in at compile time) and an `abi_rev` integer.
+  For `atrium-gpu-amd` these are `dev.atrium_gpu_amd.0.build_id` (the last
+  commit that touched `atrium-gpu-amd/`, `-dirty` for an uncommitted tree)
+  and `dev.atrium_gpu_amd.0.abi_rev`.
 - `isolation_test_commit` in the policy stanza is the commit the
   test was run against. Before honoring `isolation_test_passed`,
   jaild compares the bound driver's live `build_id` to
@@ -211,6 +214,12 @@ the driver build**, and the binding is enforced, not advisory:
 The reconciliation gap closes to one question jaild asks at grant
 time: "does the running driver's build match a green attestation?"
 A changed driver answers "no" until re-tested.
+
+The check is `GpuDrivers::grant_check(driver, live_build_id)` in
+`portcullis/jaild-policy` (2026-11-04). It refuses when the stanza is
+missing, not passed, not `production`, has no real commit, when the live
+build is `-dirty` or `unknown`, or when the commits differ. No path grants
+`gpu` to an app yet; whatever grants it must call this first.
 
 Reaching `status = "production"` (as opposed to merely passing the
 hand-written `test_gpu_isolation` cases) additionally requires the

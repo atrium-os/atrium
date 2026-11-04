@@ -27,7 +27,7 @@
 
 #include <sys/module.h>
 #include <sys/kernel.h>
-#include <sys/energy_budget.h>		/* the display's energy-federation member */
+#include "energy_compat.h"	/* the display's energy-federation member */
 
 /*
  * The display block hangs off the shared softc (the base module's). Reach it the
@@ -120,6 +120,11 @@ display_modes(struct atrium_amd_softc *sc, struct atrium_display_modes *out)
 
 	out->count = 0;
 	out->pad = 0;
+	/* No sink (DDC reads 0xff) or a bad header: no modes. Decoding 0xff
+	 * bytes as timings would invent a huge mode. */
+	if (edid[0] != 0x00 || edid[1] != 0xff || edid[6] != 0xff ||
+	    edid[7] != 0x00)
+		return;
 	for (off = 54; off + 18 <= ATRIUM_DISPLAY_EDID_LEN; off += 18) {
 		if (!display_decode_dtd(&edid[off], &m))
 			continue;
@@ -321,6 +326,23 @@ amd_display_flip_handler(struct atrium_amd_softc *sc, int count __unused)
 	display_reap(sc);
 }
 
+/*
+ * Does a scanout buffer cover a width x height XRGB8888 mode? The pitch must
+ * hold a full row and pitch x height must fit in the BO, or the display engine
+ * would read past the BO into whatever VRAM follows it (isolation break 4).
+ */
+static int
+display_fb_fits(const struct atrium_amd_display_fb *fb, uint32_t width,
+    uint32_t height)
+{
+	uint64_t pitch = fb->pitch != 0 ? fb->pitch : (uint64_t)width * 4;
+
+	/* pitch 0 means packed (width * 4), as the ABI defines it. */
+	if (pitch < (uint64_t)width * 4)
+		return (0);
+	return (pitch * height <= fb->size);
+}
+
 static int
 display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
     struct thread *td)
@@ -372,8 +394,17 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 	fb.size = size;
 	fb.pitch = c->pitch;
 	fb.format = c->format;
-	if (c->flags & ATRIUM_DISPLAY_COMMIT_MODESET)
+	if (c->flags & ATRIUM_DISPLAY_COMMIT_MODESET) {
 		display_modes(sc, &modes);	/* reads the EDID; not under the lock */
+		/* The kernel checks the buffer covers the mode it will scan out;
+		 * gpusim's referee is the second line, not the first (review
+		 * §A2.5, isolation break 4). */
+		if (modes.count > 0 && !display_fb_fits(&fb,
+		    modes.modes[0].width, modes.modes[0].height)) {
+			err = EINVAL;
+			goto out;
+		}
+	}
 
 	mtx_lock(&sc->lock);
 	display_reap(sc);
@@ -412,6 +443,10 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 		sc->display_mode_set = 1;
 		sc->display_refresh_mhz = modes.count > 0 ?
 		    modes.modes[0].refresh_mhz : 0;
+		sc->display_mode_width = modes.count > 0 ?
+		    modes.modes[0].width : 0;
+		sc->display_mode_height = modes.count > 0 ?
+		    modes.modes[0].height : 0;
 		/* A modeset scans the new buffer out from its first frame. */
 		display_park(sc, sc->display_on_screen.bo_fp);
 		sc->display_on_screen = fb;
@@ -424,6 +459,13 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 		return (0);
 	}
 
+	if (sc->display_mode_set && sc->display_mode_width != 0 &&
+	    !display_fb_fits(&fb, sc->display_mode_width,
+	    sc->display_mode_height)) {
+		mtx_unlock(&sc->lock);
+		err = EINVAL;	/* would scan out past the end of the BO */
+		goto out;
+	}
 	if (!sc->display_mode_set) {
 		mtx_unlock(&sc->lock);
 		c->out_fault = ATRIUM_DISPLAY_FAULT_NO_MODE;
@@ -866,6 +908,8 @@ atrium_display_detach(device_t dev)
 	display_park(sc, sc->display_on_screen.bo_fp);
 	memset(&sc->display_on_screen, 0, sizeof(sc->display_on_screen));
 	sc->display_mode_set = 0;
+	sc->display_mode_width = 0;
+	sc->display_mode_height = 0;
 	sc->display_opened = 0;
 	mtx_unlock(&sc->lock);
 	display_drain(sc, curthread);

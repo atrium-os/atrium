@@ -19,7 +19,7 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::ptr;
 
-use atrium_gpu::amd::{gpu_reset, Display, Gpu, Scanout};
+use atrium_gpu::amd::{gpu_reset, Display, Gpu, GpuCtl, Scanout};
 
 fn main() {
     match run() {
@@ -80,7 +80,7 @@ fn run() -> io::Result<()> {
     // Device-wide GPU reset (FLR), routed through the base coordinator: the
     // display's prepare disarms vblank, the FLR runs, the display's restore
     // re-arms it (and the gpu's restore reloads firmware + MES).
-    gpu_reset(&gpu)?;
+    gpu_reset(&GpuCtl::open()?)?;
     eprintln!("coordinated GPU reset done (device FLR + per-IP prepare/restore)");
 
     // Vblanks must STILL flow — the display was re-armed, not left for dead.

@@ -33,7 +33,7 @@ struct atrium_gpu_powergate {
 int
 main(void)
 {
-	int fd = open("/dev/atrium-gpu0", O_RDWR);
+	int fd = open("/dev/atrium-gpu0ctl", O_RDWR);
 	if (fd < 0)
 		err(1, "open");
 

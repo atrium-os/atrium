@@ -302,6 +302,24 @@ impl Gpu {
         Ok(q.count)
     }
 
+}
+
+impl AsRawFd for Gpu { fn as_raw_fd(&self) -> RawFd { self.fd } }
+impl Drop for Gpu { fn drop(&mut self) { unsafe { libc::close(self.fd) }; } }
+
+// ---------------------------------------------------------------------------
+// GpuCtl — /dev/atrium-gpu0ctl: device-wide control (reset, firmware scheduler,
+// power gating). Root-only and never in a jail; the client node refuses these
+// ioctls with EPERM (GPU isolation, review 2026-11-03 §A2.4).
+// ---------------------------------------------------------------------------
+
+pub struct GpuCtl { fd: RawFd }
+
+impl GpuCtl {
+    pub fn open() -> io::Result<Self> {
+        Ok(Self { fd: open_rdwr("/dev/atrium-gpu0ctl")? })
+    }
+
     // --- firmware scheduler (regSCHED via the 'A' SCHED ioctl) ---
 
     fn sched(&self, mut s: Sched) -> io::Result<Sched> {
@@ -332,8 +350,8 @@ impl Gpu {
     }
 }
 
-impl AsRawFd for Gpu { fn as_raw_fd(&self) -> RawFd { self.fd } }
-impl Drop for Gpu { fn drop(&mut self) { unsafe { libc::close(self.fd) }; } }
+impl AsRawFd for GpuCtl { fn as_raw_fd(&self) -> RawFd { self.fd } }
+impl Drop for GpuCtl { fn drop(&mut self) { unsafe { libc::close(self.fd) }; } }
 
 // ---------------------------------------------------------------------------
 // Vm — a per-process GPU address space
@@ -711,7 +729,7 @@ impl AsRawFd for Display { fn as_raw_fd(&self) -> RawFd { self.fd } }
 impl Drop for Display { fn drop(&mut self) { unsafe { libc::close(self.fd) }; } }
 
 /// GPU reset (`_IO('A',16)`) — exposed for harness/recovery paths.
-pub fn gpu_reset(gpu: &Gpu) -> io::Result<()> {
-    let r = unsafe { ioctl(gpu.fd, io(G, 16) as _, 0 as c_int) };
+pub fn gpu_reset(ctl: &GpuCtl) -> io::Result<()> {
+    let r = unsafe { ioctl(ctl.fd, io(G, 16) as _, 0 as c_int) };
     if r != 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
