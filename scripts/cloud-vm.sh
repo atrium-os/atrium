@@ -21,6 +21,10 @@
 # port's VM (docs/spec/x86_64-port.md): q35 + OVMF, still TCG here; on a host
 # with /dev/kvm (the R9700 box) it uses KVM automatically.
 #
+# NETDEV_EXTRA=<opts> is appended to the slirp -netdev (e.g. net=, guestfwd=).
+# scripts/navigator-fetch-vm-check.sh uses it to put a hermetic "public"
+# server on the guest's network: this container has no direct route out.
+#
 # State lives in $VMDIR (default ~/atrium-vm, ~/atrium-vm-amd64 for amd64),
 # never in the tree.
 set -u
@@ -132,7 +136,7 @@ boot() {
         -drive if=pflash,format=raw,unit=0,file="$VMDIR/code.fd",readonly=on \
         -drive if=pflash,format=raw,unit=1,file="$VMDIR/vars.fd" \
         $DISKS \
-        -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-net-pci,netdev=net0 \
+        -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22${NETDEV_EXTRA:+,$NETDEV_EXTRA} -device virtio-net-pci,netdev=net0 \
         $GPUSIM_ARGS \
         -display none \
         -serial unix:"$VMDIR/serial.sock",server,nowait \

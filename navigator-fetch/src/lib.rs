@@ -283,8 +283,16 @@ mod policy_tests {
         std::thread::spawn(move || {
             for r in responses {
                 let Ok((mut s, _)) = l.accept() else { return };
+                // ★ Read the WHOLE request head before answering. `write!`
+                // on a bare TcpStream is several write(2)s, so one read()
+                // could see only the first; replying and closing then made
+                // the client's next write fail with EPIPE — a flake that
+                // looked like a policy failure (~1 run in 2 on Linux).
+                let mut head = Vec::new();
                 let mut buf = [0u8; 4096];
-                let _ = s.read(&mut buf);
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut buf) { Ok(0) | Err(_) => break, Ok(n) => head.extend_from_slice(&buf[..n]) }
+                }
                 let _ = s.write_all(r.as_bytes());
             }
         });
