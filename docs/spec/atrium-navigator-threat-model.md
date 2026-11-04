@@ -562,7 +562,7 @@ These belong in the model because they are *wins*, not because they need work:
 | P1 | Per-user dedup domain by default; reproduce-to-share | A5 poisoning | design now, code with sharing | §2.6 |
 | P2 | `rctl` memory/CPU limits on converter and worker jails; per-conversion byte budget | A6 | small | §2.2 |
 | **P0 (graphics)** | Fix the five GPU driver isolation breaks and pass the attestation gate (F1) | everything in §2.5 rests on it | medium–large | §2.5.4 |
-| P1 | Split frescod: jailed compositor with **no GPU fd** writes a shared scene buffer; the broker runs only our `bin`/`raster` kernels; secure-input path | A1 against the shared compositor and the driver | medium | §2.5.1 | Conditions F2–F5 in §2.5.4.
+| P1 | Split frescod: jailed compositor with **no GPU fd** writes a shared scene buffer; the broker runs only our `bin`/`raster` kernels; secure-input path | A1 against the shared compositor and the driver | medium | §2.5.1, conditions F2–F5 in §2.5.4 |
 | P2 | One jailed renderer per window, one GPU VM per window, fixed `compose` kernel; input routed by layer list (§2.5.2) | cross-window exposure | medium | §2.5.2 |
 | P2 | Fuzz Fresco scene ingest and the GPU ioctl surface; Fresco takes outlines, not fonts | A1 against the shared compositor | medium | §2.5 |
 | P2 | Broker rules for replayed request templates | A3, CSRF | design-time, with §5.4.5 | §2.7 |
