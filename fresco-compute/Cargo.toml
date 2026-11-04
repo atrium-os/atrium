@@ -23,3 +23,6 @@ atrium-spv-frontend = { path = "../atrium-spv-frontend" }
 fresco-compute = { path = ".", features = ["cranelift"] }
 atrium-gir          = { path = "../atrium-gir" }
 tempfile = "3"
+# The lavapipe golden (tests/golden.rs): the Vulkan renderer it replaces.
+fresco-vulkan = { path = "../fresco-vulkan" }
+ash = "0.38"

@@ -1288,6 +1288,7 @@ mod tests {
                 position: [10.0 + i as f32 * 40.0, 100.0],
                 size:     [30.0, 30.0],
                 color:    [1.0, 1.0, 1.0, 1.0],
+                ..Default::default()
             });
         }
         r.set_rect_nodes(nodes);
