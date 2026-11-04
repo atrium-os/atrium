@@ -606,7 +606,14 @@ impl<'a> Cx<'a> {
             let v = match vpct("max-height") { Some(mx) if !matches!(s.get("max-height"), V::Kw(_)) => v.min(mx), _ => v };
             match vpct("min-height") { Some(mn) if !matches!(s.get("min-height"), V::Kw(_)) => v.max(mn), _ => v }
         };
-        let definite = force.1.or(repl_used.map(|(_, hh)| hh)).or_else(|| match s.get("height") { V::Kw(_) => None, V::Pct(_) => cb_h.and_then(|b| len(s.get("height"), b)), v => len(v, 0) }.map(clamp))
+        let mut spec_h = match s.get("height") { V::Kw(_) => None, V::Pct(_) => cb_h.and_then(|b| len(s.get("height"), b)), v => len(v, 0) }.map(clamp);
+        // ★ A table cell's own `height` is a FLOOR, never exact (CSS 2.1
+        // §17.5.3: the row is as tall as its tallest cell's content).
+        // Taken as exact, Wikipedia's weather boxes — `th { height: calc(16px
+        // + …) }` — held a three-line row header to one line, and
+        // "(≥ 0.1 mm)" painted over the next row.
+        let cell_floor = if part && kw(s, "display") == "table-cell" { spec_h.take() } else { None };
+        let definite = force.1.or(repl_used.map(|(_, hh)| hh)).or(spec_h)
             // aspect-ratio: with a definite width and an auto height, the
             // height follows the ratio (CSS Sizing 4).
             .or_else(|| match s.get("aspect-ratio") {
@@ -748,7 +755,7 @@ impl<'a> Cx<'a> {
             self.place_pending_abs(content_x, ly);
         }
         let content_h = cy - (by + bt + pt);
-        let hgt = definite.unwrap_or_else(|| clamp(content_h + pt + pb + bt + bb).max(vframe));
+        let hgt = definite.unwrap_or_else(|| clamp(content_h + pt + pb + bt + bb).max(vframe).max(cell_floor.unwrap_or(0)));
         // The out-of-flow boxes that waited for this height, inside this
         // box's clip like the rest of its content.
         if positioned && self.deferred_abs.len() > deferred_from {
@@ -2751,6 +2758,25 @@ mod tests {
 
     /// ★ Bare text inside a flex container is an anonymous flex item and
     /// counts toward the container's intrinsic width.
+    /// ★ A cell's `height` is a floor. The row header wraps to several
+    /// lines in a 60 px column; its `height: 40px` must not hold the row to
+    /// one line, or the text paints over the row below.
+    #[test]
+    fn a_cell_height_is_a_floor_not_exact() {
+        let src = r#"<style>body { margin-left: 0px; margin-top: 0px }
+            table { border-spacing: 0px 0px } .c0 { width: 60px } .c1 { width: 60px }
+            th { height: 40px } .a { background-color: #ff0000 } .b { background-color: #0000ff }</style>
+            <table><colgroup><col class="c0"><col class="c1"></colgroup>
+            <tr><th class="a">Mean days of rain over a tenth of a millimetre</th><td>1</td></tr>
+            <tr><th class="b">x</th><td>2</td></tr></table>"#;
+        let o = render(src);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let (a, b) = (boxes(&o, 0xff0000ff), boxes(&o, 0x0000ffff));
+        assert!(a[0].3 > 80, "the wrapped header grows its row past `height: 40px`: {:?}", a[0]);
+        assert_eq!(b[0].1, a[0].1 + a[0].3, "the next row starts below the grown one");
+        assert_eq!(b[0].3, 40, "a row whose content is shorter keeps the floor");
+    }
+
     #[test]
     fn text_in_a_flex_item_counts_toward_its_width() {
         let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
