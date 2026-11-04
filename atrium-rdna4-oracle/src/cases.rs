@@ -66,14 +66,14 @@ fn data_va(i: usize) -> u64 {
     DATA_VA + (i as u64) * 0x10_0000
 }
 
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 impl Rng {
-    fn next(&mut self) -> u32 {
+    pub(crate) fn next(&mut self) -> u32 {
         self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         (self.0 >> 33) as u32
     }
     /// An exact float in [1, 251), never zero.
-    fn f(&mut self) -> f32 {
+    pub(crate) fn f(&mut self) -> f32 {
         1.0 + (self.next() % 2000) as f32 / 8.0
     }
 }

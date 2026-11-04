@@ -62,3 +62,15 @@ fn bench_tool_generates_the_desktop_inputs() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn glyph_total_matches_the_generator() {
+    for (name, spv, rec) in cases::DESKTOP {
+        if !spv.contains("glyph") {
+            continue;
+        }
+        let Some(c) = cases::desktop(name, spv, 100, rec) else { return };
+        let glyphs = c.buffers.iter().find(|b| b.name == "glyphs").unwrap();
+        assert_eq!(glyphs.init.len() as u32, 48 * atrium_rdna4_oracle::bench::glyph_total(100));
+    }
+}

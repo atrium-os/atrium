@@ -31,6 +31,7 @@ uname -srm
 echo "render node: $DEV"
 cat /sys/class/drm/card*/device/product_name 2>/dev/null | head -1 || true
 cat /sys/class/drm/card*/device/power_dpm_force_performance_level 2>/dev/null | head -1 || true
+for f in mem_info_vram_total mem_info_vis_vram_total mem_info_gtt_total; do echo "$f=$(cat /sys/class/drm/card*/device/$f 2>/dev/null | head -1)"; done
 dpkg-query -W -f='mesa-vulkan-drivers ${Version}\n' mesa-vulkan-drivers 2>/dev/null || true
 "#;
     let benches = bench::all();

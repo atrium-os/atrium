@@ -41,6 +41,16 @@ pub struct Bench {
     pub stats: (usize, u32, u32),
 }
 
+/// The glyph total `bench_tool gen glyph <nodes>` produces (same generator
+/// and draw order as `cases::desktop`).
+pub fn glyph_total(nodes: u32) -> u32 {
+    let mut r = crate::cases::Rng(0x5eed ^ nodes as u64);
+    for _ in 0..4 + 16 * nodes as usize {
+        r.next();
+    }
+    (0..nodes).map(|_| r.next() % 4).sum()
+}
+
 fn entry_name(spv: &[u8]) -> String {
     let w: Vec<u32> = spv.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
     let mut i = 5;
@@ -67,8 +77,7 @@ pub fn desktop(shader: &str, spv_path: &str, nodes: u32, record: u32, repeat: u3
     let bin = atrium_rdna4_compiler::compile(&g).expect("rdna4 compile");
     let glyph = spv_path.contains("glyph");
     let n = nodes as u64;
-    // Upper bounds: glyph runs have at most 3 glyphs per node.
-    let max_inst = if glyph { 3 * n } else { n };
+    let max_inst = if glyph { glyph_total(nodes) as u64 } else { n };
     let (names, sizes): (Vec<&'static str>, Vec<u64>) = if glyph {
         (vec!["scene", "glyphs", "instances", "counter"], vec![16 + 64 * n, 48 * max_inst, record as u64 * max_inst, 4])
     } else {
@@ -126,6 +135,12 @@ pub fn all() -> Vec<Bench> {
         for (n, p, rec) in crate::cases::DESKTOP {
             v.extend(desktop(n, p, nodes, rec, repeat));
         }
+    }
+    // glyph_run scaling: 1M took ~20 ms on both drivers, far above its
+    // memory traffic; intermediate sizes show where it stops scaling.
+    let (n, p, rec) = crate::cases::DESKTOP[3];
+    for nodes in [1u32 << 16, 1 << 18] {
+        v.extend(desktop(n, p, nodes, rec, 20));
     }
     v
 }
