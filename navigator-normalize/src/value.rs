@@ -47,10 +47,12 @@ pub fn repair(prop: &str, value: &str) -> Option<String> {
         // direction by the normalizer's direction pass, not here.
         "text-align" => match lv.as_str() { "justify-all" => "justify", _ => return None }.to_string(),
         // ★ Box Alignment's `start` / `end` are the flex container's
-        // flex-start / flex-end whenever its direction is not reversed —
-        // and the profile's is never reversed. `normal` is flex-start in a
-        // flex container. (`left` / `right` are physical and resolved by the
-        // direction pass.) 275 declarations in the two corpora were dropped.
+        // flex-start / flex-end whenever its direction is not reversed, and
+        // `normal` is flex-start in a flex container. (The normalizer itself
+        // carries these to its reverse pass, which knows whether the
+        // container ends up reversed; `left` / `right` are physical and
+        // resolved by the direction pass.) 275 declarations in the two
+        // corpora were dropped.
         "justify-content" => match lv.as_str() { "start" | "normal" => "flex-start", "end" => "flex-end", _ => return None }.to_string(),
         "font-weight" => match lv.as_str() {
             "normal" => "400".into(), "bold" => "700".into(),

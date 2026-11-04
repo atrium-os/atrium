@@ -1127,7 +1127,7 @@ fn inline_border_shorthands_and_logical_corners_expand() {
 }
 
 /// ★ Box Alignment's `start` / `end` / `normal` are flex-start / flex-end in
-/// a flex container that is never reversed (the profile's never is); `left`
+/// a flex container that is not reversed (for one that is, see below); `left`
 /// and `right` are physical in a row and resolve against its direction.
 #[test]
 fn justify_content_keywords_resolve_to_the_flex_ones() {
@@ -1145,4 +1145,91 @@ fn justify_content_keywords_resolve_to_the_flex_ones() {
     assert_eq!([jc("rl"), jc("rr")], ["flex-end", "flex-start"], "rtl row: left is the END");
     assert_eq!(jc("c"), "flex-start", "in a column, left and right behave as start");
     assert!(refusals(&out).is_empty());
+}
+
+/// The ids of an element's children, in output order.
+fn child_ids(out: &str, id: &str) -> Vec<String> {
+    let dom = navigator_dom::parse(out);
+    let h = dom.by_tag_anywhere("*").into_iter().chain((0..dom.nodes.len() as u32).filter(|h| dom.attr(*h, "id").is_some()))
+        .find(|h| dom.attr(*h, "id") == Some(id)).unwrap_or_else(|| panic!("no #{id}"));
+    dom.children_of(h).into_iter().map(|c| dom.attr(c, "id").map(str::to_string)
+        .unwrap_or_else(|| dom.text_content(c).trim().to_string())).filter(|s| !s.is_empty()).collect()
+}
+
+/// ★ `row-reverse` / `column-reverse` are COMPILED: the children are
+/// reversed in the document and the container laid out forwards, so the
+/// reading order is the visual one (G5). Laying out forwards moves
+/// main-start, so `flex-start` ⇄ `flex-end` and `normal` (or nothing)
+/// packs at the end; `start` / `end` / `left` / `right` name sides that
+/// reversal does not move.
+#[test]
+fn a_reversed_flex_container_is_reversed_in_the_document() {
+    let src = r#"<html><head><style>
+      .r { display: flex; flex-direction: row-reverse }
+      #c { display: flex; flex-flow: column-reverse }
+      #fs { justify-content: flex-start } #fe { justify-content: flex-end } #st { justify-content: start }
+      #en { justify-content: end } #nm { justify-content: normal } #ce { justify-content: center } #lf { justify-content: left }
+    </style></head><body>
+      <div id="r" class="r"><i id="a">a</i><i id="b">b</i>text<i id="d">d</i></div>
+      <div id="c"><p id="c1">1</p><p id="c2">2</p></div>
+      <div id="fs" class="r"></div><div id="fe" class="r"></div><div id="st" class="r"></div><div id="en" class="r"></div>
+      <div id="nm" class="r"></div><div id="ce" class="r"></div><div id="lf" class="r"></div>
+    </body></html>"#;
+    let before = refusals(src);
+    assert!(before.iter().any(|r| r.contains("flex-direction")), "control: the renderer refuses row-reverse: {before:?}");
+    let (out, report) = normalize(src, &Inputs::default());
+    assert_eq!(child_ids(&out, "r"), ["d", "text", "b", "a"], "children and text runs reversed: {out}");
+    assert_eq!(child_ids(&out, "c"), ["c2", "c1"], "{out}");
+    assert_eq!(base_props(&out, "r").get("flex-direction").map(String::as_str), Some("row"), "{out}");
+    assert_eq!(base_props(&out, "c").get("flex-direction").map(String::as_str), Some("column"), "{out}");
+    let jc = |id: &str| base_props(&out, id).get("justify-content").cloned().unwrap_or_default();
+    assert_eq!(jc("r"), "flex-end", "no justify-content packs at main-start, now the END: {out}");
+    assert_eq!([jc("fs"), jc("fe"), jc("st"), jc("en"), jc("nm"), jc("ce"), jc("lf")],
+               ["flex-end", "flex-start", "flex-start", "flex-end", "flex-end", "center", "flex-start"], "{out}");
+    assert_eq!(report.dropped.get("flex-direction reverse compiled into document order"), Some(&9), "{:?}", report.dropped);
+    assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+}
+
+/// A reversal that is not the same in every context, or whose lines break
+/// in layout, cannot be one document order: it is laid out on the same
+/// axis, unreversed, and counted. Out-of-flow children are not flex items
+/// and keep their place; an rtl row-reverse starts at the left, which is
+/// an rtl row's END.
+#[test]
+fn only_an_unconditional_single_line_reverse_is_compiled() {
+    let src = r#"<html><head><style>
+      div { display: flex }
+      #w { flex-direction: column-reverse; flex-wrap: wrap }
+      #m { flex-direction: row-reverse } @media (min-width: 600px) { #m { flex-direction: column } }
+      #q { flex-direction: row } @media (max-width: 100px) { #q { flex-direction: row-reverse } }
+      #h:hover { flex-direction: column-reverse }
+      #k { flex-direction: row-reverse } @media (min-width: 600px) { #k { flex-direction: column-reverse } }
+      #b { display: block; flex-direction: row-reverse }
+      #ab { flex-direction: row-reverse } #ab > .x { position: absolute }
+      #rt { flex-direction: row-reverse }
+    </style></head><body>
+      <div id="w"><i id="w1">1</i><i id="w2">2</i></div>
+      <div id="m"><i id="m1">1</i><i id="m2">2</i></div>
+      <div id="q"><i id="q1">1</i><i id="q2">2</i></div>
+      <div id="h"><i id="h1">1</i><i id="h2">2</i></div>
+      <div id="k"><i id="k1">1</i><i id="k2">2</i></div>
+      <div id="b"><i id="b1">1</i><i id="b2">2</i></div>
+      <div id="ab"><i id="a1">1</i><i id="a2" class="x">2</i><i id="a3">3</i><i id="a4">4</i></div>
+      <section dir="rtl"><div id="rt"><i id="r1">1</i><i id="r2">2</i></div></section>
+    </body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    for id in ["w", "m", "q", "h", "b"] {
+        assert_eq!(child_ids(&out, id), [format!("{id}1"), format!("{id}2")], "#{id} keeps its order: {out}");
+    }
+    assert_eq!(base_props(&out, "w").get("flex-direction").map(String::as_str), Some("column"), "same axis, unreversed: {out}");
+    assert!(!out.contains("-reverse"), "{out}");
+    assert_eq!(child_ids(&out, "k"), ["k2", "k1"], "reversed in every context: {out}");
+    assert_eq!(child_ids(&out, "ab"), ["a4", "a2", "a3", "a1"], "the absolute child keeps its slot: {out}");
+    assert_eq!(child_ids(&out, "rt"), ["r2", "r1"], "{out}");
+    assert_eq!(base_props(&out, "rt").get("justify-content").map(String::as_str), Some("flex-end"), "{out}");
+    let d = |k: &str| report.dropped.get(k).copied().unwrap_or(0);
+    assert_eq!(d("flex-direction reverse in a wrapping container (laid out unreversed)"), 1, "{:?}", report.dropped);
+    assert_eq!(d("flex-direction reverse only in some states or media (laid out unreversed)"), 3, "{:?}", report.dropped);
+    assert_eq!(d("flex-direction reverse on a box that is not flex (no effect)"), 1, "{:?}", report.dropped);
+    assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
 }

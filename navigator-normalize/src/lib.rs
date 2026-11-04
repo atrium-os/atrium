@@ -514,6 +514,10 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         if n > 0 { report.drop_n("presentational attribute translated to CSS", n) }
     }
 
+    // ★ FLEX REVERSAL, compiled into the DOM (before the direction pass,
+    // which must see `left` / `right` as written).
+    reverse_pass(&mut resolved, &mut dom, &mut report);
+
     // ★ DIRECTION: logical sides, physical alignment, the UA's start-side
     // indents — all resolved against each element's own direction.
     let rtl = direction_pass(&mut resolved, &dom, &els, &mut report);
@@ -1340,6 +1344,12 @@ fn to_longhands_inner(name: &str, value: &[Token], inputs: &Inputs, report: &mut
         // `left` — on the direction of every descendant that inherits it.
         // Kept as written and resolved in the direction pass.
         if matches!(p.as_str(), "text-align" | "justify-content") && matches!(v.to_ascii_lowercase().as_str(), "left" | "right") { return Some((p, v.to_ascii_lowercase())) }
+        // ★ `*-reverse` and Box Alignment's `start` / `end` / `normal`: what
+        // they come out as depends on whether the flex container ends up
+        // REVERSED, which is decided once the cascade is known (see the
+        // reverse pass). Kept as written until then.
+        if p == "flex-direction" && matches!(v.to_ascii_lowercase().as_str(), "row-reverse" | "column-reverse") { return Some((p, v.to_ascii_lowercase())) }
+        if p == "justify-content" && matches!(v.to_ascii_lowercase().as_str(), "start" | "end" | "normal") { return Some((p, v.to_ascii_lowercase())) }
         // An inline-side property (`margin-@start`) is checked as the
         // physical property it will become; both sides take the same values.
         let phys = expand::physical(&p, false);
@@ -1961,6 +1971,93 @@ fn direction_pass(resolved: &mut BTreeMap<(Handle, String, String), BTreeMap<Str
     }
     if moved > 0 { report.drop_n("UA start-side indent moved to the right (rtl)", moved) }
     rtl
+}
+
+/// ★ THE REVERSE PASS. The profile has no `row-reverse` or `column-reverse`
+/// (§3.4, G5: visual order is reading order), but a reversed flex container
+/// can be COMPILED: reverse its children in the document and lay it out
+/// forwards. The visual result is the same, and the reading order now
+/// follows what the reader sees — which is what G5 asks for.
+///
+/// Laying the reversed children out forwards also moves the main-start
+/// side, so the packing keywords that name it swap: `flex-start` ⇄
+/// `flex-end`, and `normal` (and no `justify-content` at all), which pack
+/// at main-start, become `flex-end`. `start` / `end` name the WRITING
+/// mode's sides, which reversal does not move, so they become `flex-start`
+/// / `flex-end` exactly as they do in a forward container; `left` / `right`
+/// are physical and go to the direction pass as written. Auto margins and
+/// gaps are physical or symmetric and need nothing.
+///
+/// It is compiled only when it is sound:
+///
+/// - **unconditionally** — the element is a reversed flex container in its
+///   base context and in every state and media context that says anything
+///   about `display` or `flex-direction`. One DOM cannot hold two orders.
+/// - **single-line** — a wrapping container breaks lines in the reversed
+///   order (`1 2 | 3 4` read from the right is `2 1 | 4 3`), and a reversed
+///   document would break them from the other end (`4 3 | 2 1`). Where the
+///   lines fall is only known after layout. `wrap-reverse` is excluded
+///   outright for the same reason: it reverses LINES.
+///
+/// Otherwise the container is laid out on the same axis, unreversed, and
+/// counted by reason — which keeps a `column-reverse` a column, where
+/// dropping the value made it a row.
+///
+/// Out-of-flow (absolute, fixed) children are not flex items, and their
+/// static position does not depend on their place among the items (Flexbox
+/// §4.1), so they keep their positions in the child list. Text runs are
+/// anonymous flex items and are reversed with the elements.
+fn reverse_pass(resolved: &mut BTreeMap<(Handle, String, String), BTreeMap<String, (Priority, String)>>, dom: &mut Dom, report: &mut Report) {
+    type Key = (Handle, String, String);
+    let mut slots: BTreeMap<Handle, Vec<Key>> = BTreeMap::new();
+    for k in resolved.keys() { slots.entry(k.0).or_default().push(k.clone()) }
+    let val = |r: &BTreeMap<Key, BTreeMap<String, (Priority, String)>>, k: &Key, p: &str| r.get(k).and_then(|x| x.get(p)).map(|(_, v)| v.clone());
+    let is_rev = |v: &str| v.ends_with("-reverse");
+    let wraps = |v: &str| v != "nowrap" && v != "initial";
+    let mut reversed: std::collections::BTreeSet<Handle> = Default::default();
+    for (h, keys) in &slots {
+        let n = keys.iter().filter(|k| val(resolved, k, "flex-direction").is_some_and(|v| is_rev(&v))).count();
+        if n == 0 { continue }
+        let base: Key = (*h, String::new(), String::new());
+        let conditional = || keys.iter().filter(|k| **k != base);
+        let base_flex = val(resolved, &base, "display").is_some_and(|d| d == "flex");
+        let any_flex = keys.iter().any(|k| val(resolved, k, "display").is_some_and(|d| d == "flex"));
+        let wrapping = keys.iter().any(|k| val(resolved, k, "flex-wrap").is_some_and(|w| wraps(&w)));
+        let uniform = base_flex && val(resolved, &base, "flex-direction").is_some_and(|v| is_rev(&v))
+            && conditional().all(|k| val(resolved, k, "flex-direction").is_none_or(|v| is_rev(&v))
+                && val(resolved, k, "display").is_none_or(|d| d == "flex"));
+        let why = if !any_flex { "flex-direction reverse on a box that is not flex (no effect)" }
+            else if wrapping { "flex-direction reverse in a wrapping container (laid out unreversed)" }
+            else if !uniform { "flex-direction reverse only in some states or media (laid out unreversed)" }
+            else { reversed.insert(*h); report.drop_n("flex-direction reverse compiled into document order", n); continue };
+        report.drop_n(why, n);
+    }
+    for (k, props) in resolved.iter_mut() {
+        if let Some((_, v)) = props.get_mut("flex-direction") {
+            if let Some(axis) = v.strip_suffix("-reverse") { *v = axis.to_string() }
+        }
+        let rev = reversed.contains(&k.0);
+        if let Some((_, v)) = props.get_mut("justify-content") {
+            let to = match (v.as_str(), rev) {
+                ("start", _) | ("normal", false) | ("flex-end", true) => "flex-start",
+                ("end", _) | ("normal", true) | ("flex-start", true) => "flex-end",
+                _ => continue,
+            };
+            *v = to.to_string();
+        }
+    }
+    for h in reversed {
+        // No `justify-content` packs at main-start, which is now the end.
+        resolved.entry((h, String::new(), String::new())).or_default()
+            .entry("justify-content".to_string()).or_insert(((false, 0, (0, 0, 0), 0), "flex-end".to_string()));
+        let kids = dom.children_of(h);
+        let out_of_flow = |c: Handle| resolved.get(&(c, String::new(), String::new())).and_then(|p| p.get("position"))
+            .is_some_and(|(_, v)| v == "absolute" || v == "fixed");
+        let at: Vec<usize> = (0..kids.len()).filter(|i| !out_of_flow(kids[*i])).collect();
+        let mut new = kids.clone();
+        for (i, j) in at.iter().zip(at.iter().rev()) { new[*i] = kids[*j] }
+        if let Some(n) = dom.get_mut(h) { n.children = new }
+    }
 }
 
 fn clip_pass(resolved: &mut BTreeMap<(Handle, String, String), BTreeMap<String, (Priority, String)>>, report: &mut Report) {
