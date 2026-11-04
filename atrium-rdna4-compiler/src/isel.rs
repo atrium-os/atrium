@@ -568,8 +568,11 @@ impl<'a> Isel<'a> {
                 };
                 let r = res.unwrap();
                 let used = self.uses.get(&r).copied().unwrap_or(0) > 0;
-                if *o == AtomicOp::Add && self.u.is_uniform(*off) && self.u.is_uniform(*v) {
-                    return self.wave_atomic_add(name, saddr, vaddr, ioff, *v, r, used);
+                if *o == AtomicOp::Add && self.u.is_uniform(*off) {
+                    if self.u.is_uniform(*v) {
+                        return self.wave_atomic_add(name, saddr, vaddr, ioff, *v, r, used);
+                    }
+                    return self.wave_atomic_add_scan(name, saddr, vaddr, ioff, *v, r, used);
                 }
                 let data = self.vgroup(*v)?;
                 let vdst = if used { Some(O::R(self.def_v(r), 0)) } else { None };
@@ -693,6 +696,60 @@ impl<'a> Isel<'a> {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Atomic add of a per-lane value to a uniform address, one atomic per
+    /// wave: a scalar loop over the active lanes builds each lane's
+    /// exclusive prefix sum (in lane order) and the total; the first active
+    /// lane adds the total; each lane's result is old + its prefix.
+    #[allow(clippy::too_many_arguments)]
+    fn wave_atomic_add_scan(&mut self, name: &'static str, saddr: u8, vaddr: O, ioff: i32, v: ValueId, r: ValueId, used: bool) -> Result<(), Error> {
+        let s = |me: &mut Self| O::R(me.vreg(Class::S, 1), 0);
+        let val = self.src(v, 0)?;
+        let val = if let O::Imm(_) = val {
+            let t = O::R(self.vreg(Class::V, 1), 0);
+            self.valu("V_MOV_B32", t, vec![val], 0);
+            t
+        } else {
+            val
+        };
+        let (rem, sum, lane, x, bit) = (s(self), s(self), s(self), s(self), s(self));
+        let pre = O::R(self.vreg(Class::V, 1), 0);
+        let (top, end) = (self.label(), self.label());
+        self.salu("S_MOV_B32", rem, vec![O::Exec]);
+        self.salu("S_MOV_B32", sum, vec![O::Imm(0)]);
+        self.valu("V_MOV_B32", pre, vec![O::Imm(0)], 0);
+        self.mi.push(MI::Branch { name: "S_CBRANCH_EXECZ", target: end });
+        self.mi.push(MI::LoopBegin);
+        self.mi.push(MI::Label(top));
+        self.salu("S_CTZ_I32_B32", lane, vec![rem]);
+        self.mi.push(MI::Valu { name: "V_READLANE_B32", dst: x, sdst: None, src: vec![val, lane], neg: 0 });
+        // writelane keeps the other lanes of `pre`; `pre` is live across the
+        // whole loop (defined before it), so allocation keeps it intact.
+        self.mi.push(MI::Valu { name: "V_WRITELANE_B32", dst: pre, sdst: None, src: vec![sum, lane], neg: 0 });
+        self.salu("S_ADD_CO_U32", sum, vec![sum, x]);
+        self.salu("S_LSHL_B32", bit, vec![O::Imm(1), lane]);
+        // SCC = (rem != 0) after the and-not.
+        self.salu("S_AND_NOT1_B32", rem, vec![rem, bit]);
+        self.mi.push(MI::Branch { name: "S_CBRANCH_SCC1", target: top });
+        self.mi.push(MI::LoopEnd);
+        let data = O::R(self.vreg(Class::V, 1), 0);
+        self.valu("V_MOV_B32", data, vec![sum], 0);
+        let (first, one, save) = (s(self), s(self), s(self));
+        self.salu("S_CTZ_I32_B32", first, vec![O::Exec]);
+        self.salu("S_LSHL_B32", one, vec![O::Imm(1), first]);
+        self.salu("S_AND_SAVEEXEC_B32", save, vec![one]);
+        let old = if used { Some(O::R(self.vreg(Class::V, 1), 0)) } else { None };
+        self.mi.push(MI::Global { name, vdst: old, vaddr, saddr, data: Some(data), ioff, th: used as u8, scope: 2 });
+        self.salu("S_MOV_B32", O::Exec, vec![save]);
+        if let Some(old) = old {
+            let base = s(self);
+            self.valu("V_READFIRSTLANE_B32", base, vec![old], 0);
+            let d = O::R(self.def_v(r), 0);
+            self.valu("V_ADD_NC_U32", d, vec![base, pre], 0);
+        }
+        self.mi.push(MI::Label(end));
         Ok(())
     }
 

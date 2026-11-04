@@ -84,6 +84,9 @@ pub fn desktop(shader: &str, spv_path: &str, nodes: u32, record: u32, repeat: u3
         (vec!["scene", "instances", "counter"], vec![16 + 64 * n, record as u64 * max_inst, 4])
     };
     assert_eq!(bin.abi.buffers.len(), names.len());
+    // The R9700 box has no resizable BAR: CPU-visible VRAM is 256 MiB, and
+    // buffers beyond it spill (the first glyph_run runs took ~20 ms).
+    assert!(sizes.iter().sum::<u64>() < 240 << 20, "{shader} at {nodes} nodes exceeds visible VRAM");
     let va = |i: usize| BENCH_VA + (i as u64) * 0x1000_0000;
     let groups = (nodes + 63) / 64 + 1;
 

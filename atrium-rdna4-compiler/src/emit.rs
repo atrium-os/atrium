@@ -13,7 +13,9 @@
 //! * an SGPR read by a VALU as a lane mask or operand is then written by a
 //!   SALU → `s_wait_alu` with `sa_sdst = 0` first;
 //! * a transcendental result (`v_rcp`) is read by a VALU → `s_wait_alu`
-//!   with `va_vdst = 0` first.
+//!   with `va_vdst = 0` first;
+//! * before every branch all of the above are resolved, since the tracking
+//!   is linear and a loop's back edge would otherwise skip it.
 
 use crate::asm::{inline_const, Asm, EXEC_LO, LITERAL};
 use crate::mir::*;
@@ -87,6 +89,27 @@ impl<'a> E<'a> {
             self.a.sopp("S_WAIT_ALU", WAIT_VA_SDST);
             self.valu_wrote_s.clear();
         }
+    }
+
+    /// Resolve every tracked ALU hazard. Tracking is linear, so before a
+    /// branch (a loop's back edge in particular) nothing may stay pending.
+    fn flush_alu(&mut self) {
+        let mut w = 0xffffu16;
+        if !self.valu_wrote_s.is_empty() {
+            w &= WAIT_VA_SDST;
+        }
+        if !self.valu_read_s.is_empty() {
+            w &= WAIT_SA_SDST;
+        }
+        if !self.trans.is_empty() {
+            w &= WAIT_VA_VDST;
+        }
+        if w != 0xffff {
+            self.a.sopp("S_WAIT_ALU", w);
+        }
+        self.valu_wrote_s.clear();
+        self.valu_read_s.clear();
+        self.trans.clear();
     }
 
     fn emit(&mut self, m: &MI) {
@@ -201,6 +224,7 @@ impl<'a> E<'a> {
             }
             MI::Branch { name, target } => {
                 self.drain();
+                self.flush_alu();
                 let p = self.a.branch(name);
                 self.fixups.push((p, *target));
             }
