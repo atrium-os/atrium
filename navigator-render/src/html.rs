@@ -2020,7 +2020,14 @@ impl<'a> Cx<'a> {
                         _ if definite.is_some() => a,
                         V::Kw("auto") if scroller => frame + margins,
                         V::Kw("auto") => a,
-                        v => len(v, w).unwrap_or(0).max(frame) + margins,
+                        // ★ A percentage here is of the grid AREA, which
+                        // is what is being sized: cyclic, so it resolves
+                        // against zero for the contribution (CSS Sizing
+                        // §5.2.1). Taken against the grid's width, BBC
+                        // Arabic's `min-width: 50%` footer item claimed
+                        // half the grid, and its `repeat(3, 1fr)` came out
+                        // 384 / 176 / 176 where Chrome has three of 245.
+                        v => len(v, 0).unwrap_or(0).max(frame) + margins,
                     };
                     (a, b, m)
                 }
@@ -4517,6 +4524,20 @@ mod tests {
             <div class="g"><div class="a"></div><div class="b"></div></div>"#);
         assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 25, 10)]);
         assert_eq!(boxes(&o, 0x00ff00ff), vec![(25, 0, 25, 10)]);
+    }
+
+    #[test]
+    fn a_percentage_min_width_does_not_widen_a_grid_track() {
+        // The item's `min-width: 50%` is of its grid area, which is what is
+        // being sized: it resolves against zero, so all four `1fr` columns
+        // stay 50 px (as in Chrome) instead of the first claiming 100.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 200px; grid-template-columns: 1fr 1fr 1fr 1fr }
+            .a { min-width: 50%; width: 100%; height: 10px; background-color: #ff0000 }
+            .b { height: 10px } .c { min-width: calc(10px + 50%); height: 10px; background-color: #00ff00 }</style>
+            <div class="g"><div class="a"></div><div class="b"></div><div class="c"></div><div class="b"></div></div>"#);
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 50, 10)]);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(100, 0, 50, 10)]);
     }
 
     #[test]
