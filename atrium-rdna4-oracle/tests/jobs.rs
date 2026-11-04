@@ -32,3 +32,33 @@ fn job_directory_round_trips_through_the_checker() {
     assert!(c.check(&dir).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// `runner/bench_tool.c gen` must produce the same inputs as
+/// `cases::desktop`, so the large benchmarks generated on the GPU box match
+/// what the small cases check against the interpreter.
+#[test]
+fn bench_tool_generates_the_desktop_inputs() {
+    let dir = std::env::temp_dir().join(format!("rdna4-bench-tool-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exe = dir.join("bench_tool");
+    let src = concat!(env!("CARGO_MANIFEST_DIR"), "/runner/bench_tool.c");
+    match std::process::Command::new("cc").args(["-O2", "-o"]).arg(&exe).arg(src).status() {
+        Ok(s) if s.success() => {}
+        _ => {
+            eprintln!("no C compiler; skipped");
+            return;
+        }
+    }
+    for (name, spv, rec) in cases::DESKTOP {
+        let Some(c) = cases::desktop(name, spv, 100, rec) else { continue };
+        let kind = if spv.contains("glyph") { "glyph" } else { "plain" };
+        let out = std::process::Command::new(&exe).args(["gen", kind, "100"]).arg(&dir).output().unwrap();
+        assert!(out.status.success());
+        for b in ["scene", "glyphs"] {
+            let Some(buf) = c.buffers.iter().find(|x| x.name == b) else { continue };
+            let got = std::fs::read(dir.join(format!("{b}.in"))).unwrap();
+            assert_eq!(got, buf.init, "{name}: {b}.in differs");
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}

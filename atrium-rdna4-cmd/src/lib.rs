@@ -5,7 +5,8 @@
 //! Register offsets and fields come from `regs.rs`, generated from Linux's
 //! MIT-licensed GFX12 headers (`spec/`). This crate never hard-codes an offset.
 //!
-//! Scope today: PM4 type-3 packets and a single compute dispatch.
+//! Scope today: PM4 type-3 packets, a single compute dispatch, and GPU
+//! timestamps.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -29,6 +30,8 @@ pub mod op {
     pub const DISPATCH_DIRECT: u32 = 0x15;
     /// Write SH registers.
     pub const SET_SH_REG: u32 = 0x76;
+    /// End-of-pipe event with a memory write.
+    pub const RELEASE_MEM: u32 = 0x49;
 }
 
 /// Absolute dword address of a GC register.
@@ -87,6 +90,18 @@ impl Blob {
             }
         }
         self
+    }
+
+    /// Write the 64-bit GPU timestamp to `va` once all earlier work in the
+    /// queue has finished (RELEASE_MEM, BOTTOM_OF_PIPE_TS, data = timestamp,
+    /// sent after write confirm). Ticks run at the device's counter
+    /// frequency (amdgpu `gpu_counter_freq`).
+    pub fn timestamp(&mut self, va: u64) -> &mut Self {
+        assert_eq!(va & 7, 0, "timestamp VA must be 8-byte aligned");
+        const BOTTOM_OF_PIPE_TS: u32 = 0x28;
+        let event = BOTTOM_OF_PIPE_TS | (5 << 8); // EVENT_INDEX 5: end-of-pipe
+        let sel = (3 << 29) | (3 << 24); // DATA_SEL timestamp, INT_SEL after write confirm, DST_SEL memory
+        self.packet(op::RELEASE_MEM, &[event, sel, va as u32, (va >> 32) as u32, 0, 0, 0])
     }
 
     /// Little-endian bytes.

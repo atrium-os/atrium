@@ -5,18 +5,7 @@
 use std::fmt::Write as _;
 use std::fs;
 
-fn b64(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut s = String::new();
-    for c in data.chunks(3) {
-        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
-        for i in 0..4 {
-            if i <= c.len() { s.push(T[(n >> (18 - 6 * i) & 63) as usize] as char) } else { s.push('=') }
-        }
-        if s.len() % 77 == 76 { s.push('\n') }
-    }
-    s
-}
+use atrium_rdna4_oracle::b64;
 
 fn main() {
     let tmp = std::env::temp_dir().join(format!("rdna4-bundle-{}", std::process::id()));

@@ -196,16 +196,19 @@ pub const TIERB: [&str; 16] = [
     "bit_chain", "bit_count", "loop_mul", "sum_loop", "atomic_add", "per_thread_triangle", "spec_scale", "float_sqrt",
 ];
 
+/// The desktop compute shaders: name, SPIR-V path under `bundles/`, bytes
+/// per instance record.
+pub const DESKTOP: [(&str, &str, u32); 4] = [
+    ("op_texture", "atrium-core/compute/op_texture.comp.spv", 16),
+    ("op_rectangle", "atrium-core/compute/op_rectangle.comp.spv", 48),
+    ("op_path", "atrium-core/compute/op_path.comp.spv", 48),
+    ("op_glyph_run", "atrium-text/compute/op_glyph_run.comp.spv", 48),
+];
+
 /// Every case, by name.
 pub fn all() -> Vec<Case> {
     let mut v = vec![write_42()];
-    let desk = [
-        ("op_texture", "atrium-core/compute/op_texture.comp.spv", 16),
-        ("op_rectangle", "atrium-core/compute/op_rectangle.comp.spv", 48),
-        ("op_path", "atrium-core/compute/op_path.comp.spv", 48),
-        ("op_glyph_run", "atrium-text/compute/op_glyph_run.comp.spv", 48),
-    ];
-    for (n, p, rec) in desk {
+    for (n, p, rec) in DESKTOP {
         v.extend(desktop(n, p, 100, rec));
     }
     for t in TIERB {

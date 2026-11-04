@@ -15,10 +15,19 @@
  *                  ib <bo-name> <byte-offset> <dwords>
  *                  ip compute|gfx
  *                  timeout_ms <n>
+ *                  domain vram|gtt        (optional, default gtt; vram is
+ *                                          CPU-visible VRAM, for timing)
+ *                  repeat <n>             (optional: submit n times, reloading
+ *                                          every BO's init contents first)
+ *                  timestamps <bo-name>   (optional: the IB writes 64-bit GPU
+ *                                          timestamps at offsets 0 and 8; the
+ *                                          runner reports their difference)
  *   <init-file>  raw bytes copied to the start of the BO (rest zero)
  * Outputs (written into the job directory):
  *   <name>.out   BO contents after completion, for readback BOs
- *   result.txt   key=value: status, wait_status, elapsed_ns, gc_base, device
+ *   result.txt   key=value: status, wait_status, elapsed_ns, gc_base, device;
+ *                with timestamps also gpu_ns (one per repeat), gpu_ns_min,
+ *                gpu_ns_median and counter_khz
  *
  * SPDX-License-Identifier: MIT OR Apache-2.0
  */
@@ -45,6 +54,7 @@ struct bo {
 	int		readback;
 	uint32_t	handle;
 	void		*cpu;
+	uint64_t	mapped;
 };
 
 static struct bo bos[MAX_BOS];
@@ -88,6 +98,30 @@ now_ns(void)
 }
 
 static void
+load_inits(const char *dir)
+{
+	char path[4096];
+	for (int i = 0; i < nbos; i++) {
+		struct bo *o = &bos[i];
+		memset(o->cpu, 0, o->mapped);
+		if (strcmp(o->init, "-") == 0) continue;
+		snprintf(path, sizeof path, "%s/%s", dir, o->init);
+		FILE *f = fopen(path, "rb");
+		if (!f) die(path);
+		size_t n = fread(o->cpu, 1, o->size, f);
+		(void)n;
+		fclose(f);
+	}
+}
+
+static int
+cmp_u64(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+	return x < y ? -1 : x > y;
+}
+
+static void
 read_gc_base(char *out, size_t n)
 {
 	/* IP discovery: GC instance 0 base addresses, one per line. */
@@ -105,6 +139,9 @@ main(int argc, char **argv)
 	char path[4096], line[512], ibname[64] = "";
 	uint64_t ib_off = 0, ib_dw = 0, timeout_ms = 5000;
 	uint32_t ip = AMDGPU_HW_IP_COMPUTE;
+	uint64_t repeat = 1;
+	int vram = 0;
+	char tsname[64] = "";
 	const char *dev = argc > 2 ? argv[2] : "/dev/dri/renderD128";
 
 	if (argc < 2) {
@@ -133,6 +170,12 @@ main(int argc, char **argv)
 			ip = strcmp(a, "gfx") == 0 ? AMDGPU_HW_IP_GFX : AMDGPU_HW_IP_COMPUTE;
 		} else if (sscanf(line, "timeout_ms %" SCNu64, &x) == 1) {
 			timeout_ms = x;
+		} else if (sscanf(line, "domain %63s", a) == 1) {
+			vram = strcmp(a, "vram") == 0;
+		} else if (sscanf(line, "repeat %" SCNu64, &x) == 1) {
+			repeat = x ? x : 1;
+		} else if (sscanf(line, "timestamps %63s", a) == 1) {
+			snprintf(tsname, sizeof tsname, "%s", a);
 		} else {
 			errno = EINVAL; die(line);
 		}
@@ -151,7 +194,7 @@ main(int argc, char **argv)
 		uint64_t sz = (o->size + 4095) & ~4095ull;
 		union drm_amdgpu_gem_create gc = { .in = {
 			.bo_size = sz, .alignment = 4096,
-			.domains = AMDGPU_GEM_DOMAIN_GTT,
+			.domains = vram ? AMDGPU_GEM_DOMAIN_VRAM : AMDGPU_GEM_DOMAIN_GTT,
 			.domain_flags = AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED } };
 		if (xioctl(fd, DRM_IOCTL_AMDGPU_GEM_CREATE, &gc)) die("gem create");
 		o->handle = gc.out.handle;
@@ -159,15 +202,7 @@ main(int argc, char **argv)
 		if (xioctl(fd, DRM_IOCTL_AMDGPU_GEM_MMAP, &gm)) die("gem mmap");
 		o->cpu = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, gm.out.addr_ptr);
 		if (o->cpu == MAP_FAILED) die("mmap");
-		memset(o->cpu, 0, sz);
-		if (strcmp(o->init, "-") != 0) {
-			snprintf(path, sizeof path, "%s/%s", argv[1], o->init);
-			FILE *f = fopen(path, "rb");
-			if (!f) die(path);
-			size_t n = fread(o->cpu, 1, o->size, f);
-			(void)n;
-			fclose(f);
-		}
+		o->mapped = sz;
 		struct drm_amdgpu_gem_va va = {
 			.handle = o->handle, .operation = AMDGPU_VA_OP_MAP,
 			.flags = AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE,
@@ -195,14 +230,27 @@ main(int argc, char **argv)
 	union drm_amdgpu_cs cs = { .in = { .ctx_id = ctx_id, .bo_list_handle = 0,
 		.num_chunks = 2, .chunks = (uintptr_t)chunk_ptrs } };
 
-	uint64_t t0 = now_ns();
-	if (xioctl(fd, DRM_IOCTL_AMDGPU_CS, &cs)) die("cs submit");
-	union drm_amdgpu_wait_cs w = { .in = { .handle = cs.out.handle, .ip_type = ip,
-		.ip_instance = 0, .ring = 0, .ctx_id = ctx_id } };
-	/* AMDGPU wait timeouts are absolute CLOCK_MONOTONIC nanoseconds. */
-	w.in.timeout = now_ns() + timeout_ms * 1000000ull;
-	if (xioctl(fd, DRM_IOCTL_AMDGPU_WAIT_CS, &w)) die("wait cs");
-	uint64_t t1 = now_ns();
+	struct bo *tsb = tsname[0] ? find_bo(tsname) : NULL;
+	if (tsname[0] && !tsb) { errno = ENOENT; die("timestamps bo"); }
+	uint64_t *gpu = calloc(repeat, sizeof *gpu);
+	union drm_amdgpu_wait_cs w;
+	uint64_t t0 = 0, t1 = 0;
+	for (uint64_t k = 0; k < repeat; k++) {
+		load_inits(argv[1]);
+		t0 = now_ns();
+		if (xioctl(fd, DRM_IOCTL_AMDGPU_CS, &cs)) die("cs submit");
+		memset(&w, 0, sizeof w);
+		w.in.handle = cs.out.handle; w.in.ip_type = ip; w.in.ctx_id = ctx_id;
+		/* AMDGPU wait timeouts are absolute CLOCK_MONOTONIC nanoseconds. */
+		w.in.timeout = now_ns() + timeout_ms * 1000000ull;
+		if (xioctl(fd, DRM_IOCTL_AMDGPU_WAIT_CS, &w)) die("wait cs");
+		t1 = now_ns();
+		if (w.out.status) break;
+		if (tsb) {
+			volatile uint64_t *t = tsb->cpu;
+			gpu[k] = t[1] - t[0];
+		}
+	}
 
 	for (int i = 0; i < nbos; i++) {
 		if (!bos[i].readback) continue;
@@ -217,6 +265,20 @@ main(int argc, char **argv)
 	read_gc_base(gcb, sizeof gcb);
 	fprintf(result, "status=%s\nwait_status=%" PRIu64 "\nelapsed_ns=%" PRIu64 "\ngc_base=%s\ndevice=%s\n",
 	    w.out.status ? "timeout" : "ok", (uint64_t)w.out.status, t1 - t0, gcb, dev);
+	if (tsb && !w.out.status) {
+		struct drm_amdgpu_info_device di;
+		memset(&di, 0, sizeof di);
+		struct drm_amdgpu_info q = { .return_pointer = (uintptr_t)&di,
+			.return_size = sizeof di, .query = AMDGPU_INFO_DEV_INFO };
+		uint64_t khz = xioctl(fd, DRM_IOCTL_AMDGPU_INFO, &q) == 0 ? di.gpu_counter_freq : 0;
+		fprintf(result, "counter_khz=%" PRIu64 "\ngpu_ns=", khz);
+		for (uint64_t k = 0; k < repeat; k++) {
+			gpu[k] = khz ? gpu[k] * 1000000ull / khz : gpu[k];
+			fprintf(result, "%s%" PRIu64, k ? "," : "", gpu[k]);
+		}
+		qsort(gpu, repeat, sizeof *gpu, cmp_u64);
+		fprintf(result, "\ngpu_ns_min=%" PRIu64 "\ngpu_ns_median=%" PRIu64 "\n", gpu[0], gpu[repeat / 2]);
+	}
 	fclose(result);
 	return w.out.status ? 3 : 0;
 }
