@@ -216,6 +216,7 @@ pub fn pixel(f: &Frame, mask: &[u32], x: u32, y: u32) -> u32 {
     let pc = [x as f32 + 0.5, y as f32 + 0.5];
     let tile = (y / TILE) * h.tiles_x + x / TILE;
     let mut dst = [h.clear[0], h.clear[1], h.clear[2]];
+    let mut da = h.clear[3];
     for w in 0..h.wpt {
         let mut bits = mask[(tile * h.wpt + w) as usize];
         while bits != 0 {
@@ -229,10 +230,12 @@ pub fn pixel(f: &Frame, mask: &[u32], x: u32, y: u32) -> u32 {
             for c in 0..3 {
                 dst[c] = s[c] * s[3] + dst[c] * (1.0 - s[3]);
             }
+            da = s[3] + da * (1.0 - s[3]);
         }
     }
     let (r, g, b) = (encode(&f.lut, dst[0]), encode(&f.lut, dst[1]), encode(&f.lut, dst[2]));
-    b | (g << 8) | (r << 16) | (255 << 24)
+    let a = (clamp_(da, 0.0, 1.0) * 255.0 + 0.5) as u32;
+    b | (g << 8) | (r << 16) | (a << 24)
 }
 
 /// Both kernels: the target, `pitch * height` BGRA8 words (padding 0).

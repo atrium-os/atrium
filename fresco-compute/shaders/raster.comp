@@ -135,7 +135,10 @@ void main() {
     }
     vec2 pc = vec2(float(x), float(y)) + 0.5;
     uint tile = (y / TILE) * F.tiles_x + (x / TILE);
+    // Premultiplied linear RGB and alpha: a surface's clear may be
+    // transparent (compose blends it), the screen's is opaque.
     vec3 dst = F.clear.rgb;
+    float da = F.clear.a;
     for (uint w = 0u; w < F.wpt; w++) {
         uint bits = mask[tile * F.wpt + w];
         while (bits != 0u) {
@@ -147,10 +150,12 @@ void main() {
             }
             vec4 src = shade(oi, pc);
             dst = src.rgb * src.a + dst * (1.0 - src.a);
+            da = src.a + da * (1.0 - src.a);
         }
     }
     uint r = encode(dst.r);
     uint g = encode(dst.g);
     uint b = encode(dst.b);
-    target[y * F.pitch + x] = b | (g << 8) | (r << 16) | (255u << 24);
+    uint a = uint(clamp_(da, 0.0, 1.0) * 255.0 + 0.5);
+    target[y * F.pitch + x] = b | (g << 8) | (r << 16) | (a << 24);
 }

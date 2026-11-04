@@ -324,7 +324,7 @@ fn main() -> std::io::Result<()> {
         &sock_path,
         None,
     )?;
-    socket_server::spawn_event_fanout(ev_rx, event_subs, redraw);
+    socket_server::spawn_event_fanout(ev_rx, event_subs, redraw, comp.clone());
 
     // Input readers (same as the standalone frescod).
     input_reader::spawn(ev_tx.clone(), comp.clone());

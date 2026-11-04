@@ -30,7 +30,7 @@ use aqueduct::envelope::flag;
 use fresco_scene_server::command::envelope_frontend::{
     DispatchError, EnvelopeFrontend, Outbound,
 };
-use fresco_scene_server::window::{DisplayEvent, encode_event};
+use fresco_scene_server::window::{Compositor, DisplayEvent, encode_event};
 
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -45,7 +45,15 @@ use crate::laminar::LaneBroker;
 /// this can broadcast an `Outbound` to every connected client. Senders
 /// disconnect when their writer thread exits; the broadcaster prunes
 /// failed sends on each pass.
-pub type EventSubs = Arc<Mutex<Vec<Sender<Outbound>>>>;
+pub type EventSubs = Arc<Mutex<Vec<Sub>>>;
+
+/// One connection's async-event channel.
+pub struct Sub {
+    pub client_id: u8,
+    /// Arrived on the window-management socket (the WM, which is TCB).
+    pub wm: bool,
+    pub tx: Sender<Outbound>,
+}
 
 #[derive(Clone)]
 pub struct Shared {
@@ -119,6 +127,7 @@ pub fn spawn_event_fanout(
     rx: Receiver<DisplayEvent>,
     subs: EventSubs,
     redraw: crate::redraw::Redraw,
+    comp: Arc<Mutex<Compositor>>,
 ) {
     std::thread::Builder::new()
         .name("frescod-event-fanout".into())
@@ -140,11 +149,61 @@ pub fn spawn_event_fanout(
                     flags:   flag::ASYNC_EVENT,
                     payload,
                 };
+                let to = route(&ev, &comp);
                 let mut s = subs.lock().unwrap();
-                s.retain(|tx| tx.send(out_clone(&out)).is_ok());
+                s.retain(|sub| !to.reaches(sub) || sub.tx.send(out_clone(&out)).is_ok());
             }
         })
         .expect("spawn event fan-out");
+}
+
+/// Who an event goes to (threat model §2.5.2 "input splits the same way").
+/// Every event names a window. It reaches that window's owner and the WM
+/// (TCB) only: a client never sees another client's keystrokes, pointer
+/// or window events. Keys with no focused window (window 0) go to the WM
+/// alone. Pointer events over window 0, the shared desktop background,
+/// still reach every client, as before, until the background has an owner.
+enum Route {
+    OwnerAndWm(Option<u8>),
+    WmOnly,
+    All,
+}
+
+impl Route {
+    fn reaches(&self, sub: &Sub) -> bool {
+        match self {
+            Route::All => true,
+            Route::WmOnly => sub.wm,
+            Route::OwnerAndWm(owner) => sub.wm || *owner == Some(sub.client_id),
+        }
+    }
+}
+
+fn route(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Route {
+    use DisplayEvent as E;
+    let window_id = match *ev {
+        E::WindowResized { window_id, .. }
+        | E::WindowFocusChanged { window_id, .. }
+        | E::WindowCloseRequested { window_id }
+        | E::WindowDpiChanged { window_id, .. }
+        | E::WindowCreated { window_id }
+        | E::WindowDestroyed { window_id }
+        | E::InputKey { window_id, .. }
+        | E::InputPointerMotion { window_id, .. }
+        | E::InputPointerButton { window_id, .. }
+        | E::InputPointerScroll { window_id, .. } => window_id,
+    };
+    if window_id == 0 {
+        return match ev {
+            E::InputKey { .. } => Route::WmOnly,
+            E::InputPointerMotion { .. } | E::InputPointerButton { .. } | E::InputPointerScroll { .. } => Route::All,
+            _ => Route::WmOnly,
+        };
+    }
+    let owner = u16::try_from(window_id).ok()
+        .and_then(|id| comp.lock().unwrap().windows.get(&id).map(|w| w.owner))
+        .and_then(|o| u8::try_from(o).ok());
+    Route::OwnerAndWm(owner)
 }
 
 fn out_clone(o: &Outbound) -> Outbound {
@@ -167,16 +226,40 @@ fn error_reply(op: u16, e: &DispatchError) -> Outbound {
     Outbound { op, flags: flag::IS_RESPONSE | flag::IS_ERROR, payload }
 }
 
+/// Client ids in use. Ids are a `u8` on the wire and in the window table,
+/// so a new connection takes a free one; a wrapping counter would hand a
+/// new client the id (and so the windows) of a live one.
+static LIVE_CLIENTS: Mutex<[bool; 256]> = Mutex::new([false; 256]);
+static NEXT_CLIENT_ID: AtomicU8 = AtomicU8::new(1);
+
+fn alloc_client_id() -> Option<u8> {
+    let mut live = LIVE_CLIENTS.lock().unwrap();
+    for _ in 0..255 {
+        let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed).max(1);
+        if !live[id as usize] {
+            live[id as usize] = true;
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn free_client_id(id: u8) {
+    LIVE_CLIENTS.lock().unwrap()[id as usize] = false;
+}
+
 fn accept_loop(listener: UnixListener, shared: Shared, event_subs: EventSubs, wm_grant: bool) {
-    static NEXT_CLIENT_ID: AtomicU8 = AtomicU8::new(1);
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
-                let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed).max(1);
+                let Some(client_id) = alloc_client_id() else {
+                    eprintln!("frescod: 255 clients connected; refusing another");
+                    continue;
+                };
                 let (tx, rx) = mpsc::channel::<Outbound>();
 
                 /* Register writer's tx for async-event broadcast. */
-                event_subs.lock().unwrap().push(tx.clone());
+                event_subs.lock().unwrap().push(Sub { client_id, wm: wm_grant, tx: tx.clone() });
 
                 let writer_stream = match stream.try_clone() {
                     Ok(s) => s,
@@ -213,6 +296,7 @@ fn accept_loop(listener: UnixListener, shared: Shared, event_subs: EventSubs, wm
                             l.client_gone(client_id);
                         }
                         cleanup_client(&frontend, client_id);
+                        free_client_id(client_id);
                     })
                     .ok();
             }

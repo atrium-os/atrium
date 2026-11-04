@@ -58,6 +58,10 @@ path = "src/multiwindow_stress.rs"
 # frescod-aqueduct's skip-hierarchy level 3 (partial redraw via
 # SetScissor + no-clear renderpass) fires.
 [[bin]]
+name = "atrium-surfaces-demo"
+path = "src/surfaces_demo.rs"
+
+[[bin]]
 name = "atrium-partial-stress"
 path = "src/partial_stress.rs"
 

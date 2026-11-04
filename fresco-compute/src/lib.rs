@@ -70,6 +70,9 @@ pub const KIND_GLYPH: u32 = 3;
 /// The default clear colour, linear RGB (encodes to `#0A808C`), the same as
 /// `fresco_vulkan::HeadlessRenderer`.
 pub const CLEAR_COLOR: [f32; 4] = [0.00304, 0.2158, 0.2603, 1.0];
+/// The clear for a window surface: transparent, so compose shows what is
+/// under the window wherever the window draws nothing.
+pub const TRANSPARENT: [f32; 4] = [0.0; 4];
 
 // ---------------------------------------------------------------------------
 // Scene input (mirrors fresco-vulkan's node types)

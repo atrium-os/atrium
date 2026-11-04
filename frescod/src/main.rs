@@ -50,7 +50,7 @@ use fresco_vulkan::{
     HeadlessRenderer, PathNode, SceneNode, TextureBatch, TextureNode,
 };
 
-use render_backend::{Backend, FrameInput};
+use render_backend::{Backend, ScreenInput, WindowFrame};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -158,7 +158,7 @@ fn main() -> std::io::Result<()> {
         &sock_path,
         wm_sock.as_deref(),
     )?;
-    socket_server::spawn_event_fanout(ev_rx, event_subs, redraw.clone());
+    socket_server::spawn_event_fanout(ev_rx, event_subs, redraw.clone(), comp.clone());
 
     /* Native FreeBSD keyboard + pointer input. Both read /dev/hidraw*
      * directly (boot-protocol HID), update server cursor / focus state,
@@ -310,7 +310,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
             redraw: redraw2.clone(),
         },
         &sock, wm_sock.as_deref())?;
-    socket_server::spawn_event_fanout(ev_rx, subs, redraw2.clone());
+    socket_server::spawn_event_fanout(ev_rx, subs, redraw2.clone(), comp.clone());
     eprintln!("frescod-headless: {W}x{H} on {} → {png}.png", sock.display());
 
     /* Damage-driven, like the display path — this loop used to render
@@ -362,23 +362,26 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     }
 }
 
-/// Snapshot the current per-window scene states, merge into a single
-/// rect/texture set with per-window position offsets applied, then
-/// render one frame with the selected backend.
+/// Snapshot the current per-window scene states, one [`WindowFrame`] per
+/// visible window bottom to top, each in its own coordinates, and render
+/// the screen with the selected backend. The compute and gpu backends draw
+/// each window into its own surface and compose them (threat model
+/// §2.5.2); Vulkan merges them into one scene.
 fn render_one_frame(
     renderer: &mut Backend<'_>,
     frontend: &Arc<Mutex<EnvelopeFrontend>>,
     comp:     &Arc<Mutex<Compositor>>,
-    _screen_w: u32, _screen_h: u32,
+    screen_w: u32, screen_h: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    /* Snapshot WM state to (id, pos) pairs, in z-order bottom→top. The
-     * implicit screen window (id 0) has pos (0,0); content windows
-     * carry their drag-set position. */
-    let layers: Vec<(u32, (f32, f32))> = {
+    /* Snapshot WM state to (id, pos, size), in z-order bottom→top. The
+     * implicit screen window (id 0) is the whole screen; a content
+     * window with no size yet gets the screen's, as before surfaces. */
+    let full = (screen_w as f32, screen_h as f32);
+    let layers: Vec<(u32, (f32, f32), (f32, f32))> = {
         let g = comp.lock().unwrap();
         let mut out = Vec::with_capacity(g.windows.len());
         /* Always include window 0 first (background scene). */
-        out.push((0u32, (0.0, 0.0)));
+        out.push((0u32, (0.0, 0.0), full));
         for &id in &g.z_order {
             if id == 0 { continue; }
             if let Some(w) = g.windows.get(&id) {
@@ -386,26 +389,24 @@ fn render_one_frame(
                  * fully-occluded surface contributes nothing, so don't
                  * compose it — its GPU work for this frame is elided. */
                 if !w.rendering { continue; }
-                out.push((id as u32, (w.pos.0, w.pos.1)));
+                let size = if w.size.0 >= 1.0 && w.size.1 >= 1.0 { w.size } else { full };
+                out.push((id as u32, (w.pos.0, w.pos.1), size));
             }
         }
         out
     };
 
-    let mut rects: Vec<SceneNode> = Vec::new();
-    let mut paths: Vec<PathNode>  = Vec::new();
-    let mut tex_by_slot: std::collections::HashMap<u32, Vec<TextureNode>> =
-        std::collections::HashMap::new();
-    /* glyph_run nodes get translated by window position and grouped
-     * by atlas slot. Each batch's `glyphs` vector concatenates all
-     * runs in slot, with each node's meta[1] (glyph_offset) pointing
-     * at this batch's slice. */
-    let mut glyph_by_slot: std::collections::HashMap<u32, GlyphRunBatch> =
-        std::collections::HashMap::new();
+    let mut windows: Vec<WindowFrame> = Vec::with_capacity(layers.len());
     {
         let fe = frontend.lock().unwrap();
-        for (win_id, (ox, oy)) in &layers {
+        for (win_id, pos, size) in &layers {
             let Some(state) = fe.window_state(*win_id) else { continue; };
+            let mut w = WindowFrame {
+                id: *win_id,
+                pos: *pos,
+                size: (size.0.ceil() as u32, size.1.ceil() as u32),
+                ..Default::default()
+            };
             /* Paint in node_id order (lower id → drawn first → bottom).
              * The per-window node maps are HashMaps, whose iteration
              * order is seeded per-process; iterating `.values()` directly
@@ -416,20 +417,30 @@ fn render_one_frame(
             let mut rect_ids: Vec<&u32> = state.rect_nodes.keys().collect();
             rect_ids.sort_unstable();
             for id in rect_ids {
-                rects.push(translate_rect(&state.rect_nodes[id], *ox, *oy));
+                w.rects.push(translate_rect(&state.rect_nodes[id], 0.0, 0.0));
             }
             let mut path_ids: Vec<&u32> = state.path_nodes.keys().collect();
             path_ids.sort_unstable();
             for id in path_ids {
-                paths.push(translate_path(&state.path_nodes[id], *ox, *oy));
+                w.paths.push(translate_path(&state.path_nodes[id], 0.0, 0.0));
             }
+            let mut tex_by_slot: std::collections::BTreeMap<u32, Vec<TextureNode>> =
+                std::collections::BTreeMap::new();
             let mut tex_ids: Vec<&u32> = state.texture_nodes.keys().collect();
             tex_ids.sort_unstable();
             for id in tex_ids {
                 let p = &state.texture_nodes[id];
                 tex_by_slot.entry(p.slot_id).or_default()
-                    .push(translate_texture(p, *ox, *oy));
+                    .push(translate_texture(p, 0.0, 0.0));
             }
+            w.batches = tex_by_slot.into_iter()
+                .map(|(slot_id, nodes)| TextureBatch { slot_id, nodes })
+                .collect();
+            /* glyph_run nodes grouped by atlas slot. Each batch's `glyphs`
+             * vector concatenates all runs in slot, with each node's
+             * meta[1] (glyph_offset) pointing at this batch's slice. */
+            let mut glyph_by_slot: std::collections::BTreeMap<u32, GlyphRunBatch> =
+                std::collections::BTreeMap::new();
             let mut glyph_ids: Vec<&u32> = state.glyph_run_nodes.keys().collect();
             glyph_ids.sort_unstable();
             for id in glyph_ids {
@@ -443,7 +454,7 @@ fn render_one_frame(
                     });
                 let glyph_offset = entry.glyphs.len() as i32;
                 entry.nodes.push(GlyphRunNode {
-                    origin: [p.x + ox, p.y + oy, 0.0, 0.0],
+                    origin: [p.x, p.y, 0.0, 0.0],
                     atlas_dim: [p.atlas_width as f32,
                                 p.atlas_height as f32, 0.0, 0.0],
                     color: [p.r, p.g, p.b, p.a],
@@ -459,19 +470,16 @@ fn render_one_frame(
                     });
                 }
             }
+            w.glyph_batches = glyph_by_slot.into_values().collect();
+            windows.push(w);
         }
     }
-    let batches: Vec<TextureBatch> = tex_by_slot.into_iter()
-        .map(|(slot_id, nodes)| TextureBatch { slot_id, nodes })
-        .collect();
-    let glyph_batches: Vec<GlyphRunBatch> =
-        glyph_by_slot.into_values().collect();
 
     let (uploads, clears) = {
         let mut fe = frontend.lock().unwrap();
         fe.take_pending_uploads()
     };
-    renderer.render(FrameInput { rects, paths, batches, glyph_batches, uploads, clears })?;
+    renderer.render(ScreenInput { windows, uploads, clears })?;
     Ok(())
 }
 

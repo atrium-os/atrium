@@ -3,8 +3,9 @@
 // sRGB, as raster.comp writes them) into the target from a layer list the
 // window manager decided (threat model §2.5.2, F4). The layer list is
 // trusted broker state; the surface pixels are whatever each window's
-// raster wrote. Opaque layers pass their pixel through; translucent ones
-// blend in linear RGB. src/compose.rs packs these buffers and models the
+// raster wrote: premultiplied linear RGB sRGB-encoded, linear alpha in the
+// top byte. A layer blends src-over at its opacity; the topmost opaque
+// pixel (alpha 255, opacity 1) hides what is under it. src/compose.rs packs these buffers and models the
 // kernel statement for statement.
 
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -83,7 +84,8 @@ void main() {
     uint top = n;
     while (top > 0u) {
         top = top - 1u;
-        if (opacity(top) >= 1.0 && sample_at(top, ix, iy) != 0xffffffffu) {
+        uint ti = sample_at(top, ix, iy);
+        if (opacity(top) >= 1.0 && ti != 0xffffffffu && (heap[ti] >> 24) == 255u) {
             base = top;
             break;
         }
@@ -97,7 +99,8 @@ void main() {
         uint w = heap[i];
         vec3 s = vec3(lut[(w >> 16) & 255u], lut[(w >> 8) & 255u], lut[w & 255u]);
         float o = opacity(l);
-        dst = dst + o * (s - dst);
+        float sa = float(w >> 24) * (1.0 / 255.0);
+        dst = s * o + dst * (1.0 - sa * o);
     }
     uint r = encode(dst.r);
     uint g = encode(dst.g);

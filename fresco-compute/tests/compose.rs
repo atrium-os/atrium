@@ -78,7 +78,8 @@ fn per_window_surfaces_compose_into_the_screen() {
     };
     let (aw, ah, bw, bh) = (20u32, 14u32, 16u32, 12u32);
     let fa = Frame::pack(&scene([0.9, 0.1, 0.1, 1.0]), aw, ah, aw);
-    let fb = Frame::pack(&scene([0.1, 0.1, 0.9, 1.0]), bw, bh, bw);
+    let mut fb = Frame::pack(&scene([0.1, 0.1, 0.9, 1.0]), bw, bh, bw);
+    fb.header.clear = TRANSPARENT; // B draws only its rect
     let mut heap = vec![0u32; (aw * ah + bw * bh) as usize];
     let (sa, sb) = heap.split_at_mut((aw * ah) as usize);
     t2.render(&fa, sa).unwrap();
@@ -98,4 +99,6 @@ fn per_window_surfaces_compose_into_the_screen() {
     let (under, over) = (heap[(8 * aw + 12) as usize], heap[(aw * ah + 2 * bw + 2) as usize]);
     let blended = at(16, 11);
     assert!(blended != under && blended != over, "B at 50% blends over A");
+    assert_eq!(at(14 + 15, 9 + 11), clear, "B's undrawn pixels are transparent");
+    assert_eq!(at(14 + 1, 9 + 1), heap[(7 * aw + 11) as usize], "...also over A");
 }

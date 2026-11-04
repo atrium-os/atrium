@@ -6,6 +6,10 @@
 //! the window manager decided. The layer list is trusted state, the
 //! surfaces are pixels: compose never reads a hostile scene.
 //!
+//! Surfaces hold premultiplied linear RGB (sRGB-encoded) and linear alpha
+//! in the top byte, as `raster.comp` writes them over a transparent clear
+//! ([`crate::TRANSPARENT`]); each layer blends src-over at its opacity.
+//!
 //! All surfaces live in one heap binding (on the GPU, surface BOs mapped
 //! back to back in the compose pass's VM), each found by its first word
 //! and pitch.
@@ -182,7 +186,8 @@ pub fn pixel(c: &Compose, heap: &[u32], x: u32, y: u32) -> u32 {
     let n = c.header.layer_count as usize;
     let mut base = 0;
     for top in (0..n).rev() {
-        if opacity(c, top) >= 1.0 && sample_at(c, top, ix, iy) != NONE {
+        let ti = sample_at(c, top, ix, iy);
+        if opacity(c, top) >= 1.0 && ti != NONE && heap[ti as usize] >> 24 == 255 {
             base = top;
             break;
         }
@@ -198,8 +203,9 @@ pub fn pixel(c: &Compose, heap: &[u32], x: u32, y: u32) -> u32 {
         let w = heap[i as usize];
         let s = [dec[((w >> 16) & 255) as usize], dec[((w >> 8) & 255) as usize], dec[(w & 255) as usize]];
         let o = opacity(c, l);
+        let sa = (w >> 24) as f32 * (1.0 / 255.0);
         for k in 0..3 {
-            dst[k] += o * (s[k] - dst[k]);
+            dst[k] = s[k] * o + dst[k] * (1.0 - sa * o);
         }
     }
     let lut = &c.lut;
