@@ -1095,3 +1095,24 @@ fn inline_border_shorthands_and_logical_corners_expand() {
     assert_eq!((get(&e, "border-left-width"), get(&e, "border-left-style")), ("2px".into(), "dashed".into()), "rtl inline-end is the left: {out}");
     assert!(refusals(&out).is_empty());
 }
+
+/// ★ Box Alignment's `start` / `end` / `normal` are flex-start / flex-end in
+/// a flex container that is never reversed (the profile's never is); `left`
+/// and `right` are physical in a row and resolve against its direction.
+#[test]
+fn justify_content_keywords_resolve_to_the_flex_ones() {
+    let src = r#"<html><head><style>
+      div { display: flex } #s { justify-content: start } #e { justify-content: end } #n { justify-content: normal }
+      #l, #rl { justify-content: left } #r, #rr { justify-content: right } #c { flex-direction: column; justify-content: right }
+    </style></head><body>
+      <div id="s">a</div><div id="e">b</div><div id="n">c</div><div id="l">d</div><div id="r">e</div><div id="c">f</div>
+      <section dir="rtl"><div id="rl">g</div><div id="rr">h</div></section>
+    </body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    let jc = |id: &str| base_props(&out, id).get("justify-content").cloned().unwrap_or_default();
+    assert_eq!([jc("s"), jc("e"), jc("n")], ["flex-start", "flex-end", "flex-start"], "{out}");
+    assert_eq!([jc("l"), jc("r")], ["flex-start", "flex-end"], "ltr row: left is the start");
+    assert_eq!([jc("rl"), jc("rr")], ["flex-end", "flex-start"], "rtl row: left is the END");
+    assert_eq!(jc("c"), "flex-start", "in a column, left and right behave as start");
+    assert!(refusals(&out).is_empty());
+}

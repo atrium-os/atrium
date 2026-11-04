@@ -1418,6 +1418,10 @@ impl<'a> Cx<'a> {
     /// fixed lengths (`auto` margins are treated as 0 and counted).
     fn flex(&mut self, h: Handle, s: &Style, x: U, y: U, w: U, cb_h: Option<U>) -> U {
         let row = kw(s, "flex-direction") != "column";
+        // ★ The inline axis runs right to left in an rtl container: a ROW's
+        // main-start is its right edge (flex-start, flex-end and the item
+        // margins with it), and a COLUMN's cross-start is.
+        let rtl = kw(s, "direction") == "rtl";
         let wrap = kw(s, "flex-wrap") == "wrap";
         let main_gap = len(s.get(if row { "column-gap" } else { "row-gap" }), if row { w } else { cb_h.unwrap_or(0) }).unwrap_or(0);
         let cross_gap = len(s.get(if row { "row-gap" } else { "column-gap" }), if row { cb_h.unwrap_or(0) } else { w }).unwrap_or(0);
@@ -1449,7 +1453,7 @@ impl<'a> Cx<'a> {
             // Out of flow: not an item, placed against its containing block.
             if matches!(kw(cs, "position"), "absolute" | "fixed") { self.abs_box(c, x, y); continue }
             let px = |p: &str, basis: U| len(cs.get(p), basis);
-            let (mw, mh) = (["margin-left", "margin-right"], ["margin-top", "margin-bottom"]);
+            let (mw, mh) = (if rtl { ["margin-right", "margin-left"] } else { ["margin-left", "margin-right"] }, ["margin-top", "margin-bottom"]);
             let (mm, cm) = if row { (mw, mh) } else { (mh, mw) };
             for p in mw.iter().chain(mh.iter()) { if matches!(cs.get(p), V::Kw("auto")) { self.count("flex: auto margins (as 0)") } }
             let m = |p: &str| px(p, w).unwrap_or(0);
@@ -1591,7 +1595,12 @@ impl<'a> Cx<'a> {
                 };
                 let m0 = mpos + i.m_start;
                 let c0 = cpos + i.c_start + coff;
-                let (ix, iy, fw, fh) = if row { (x + m0, y + c0, i.main, cross) } else { (x + c0, y + m0, cross, i.main) };
+                let (ix, iy, fw, fh) = match (row, rtl) {
+                    (true, false) => (x + m0, y + c0, i.main, cross),
+                    (true, true) => (x + w - m0 - i.main, y + c0, i.main, cross),
+                    (false, false) => (x + c0, y + m0, cross, i.main),
+                    (false, true) => (x + w - c0 - cross, y + m0, cross, i.main),
+                };
                 // The item's own margins are applied here, so it is placed
                 // with them zeroed: lay out at the margin box's corner minus
                 // the margin the block would add.
@@ -3137,6 +3146,28 @@ mod tests {
         assert!(r("\u{2022}").x > content_right, "the bullet is right of the content box: {}", r("\u{2022}").x / PX);
         assert!(r(".1").x > content_right, "the number too, ordered rtl");
         assert!(r("שלום").x < content_right);
+    }
+
+    /// ★ An rtl flex ROW starts at the right: items run right to left,
+    /// `flex-start` packs them right and `flex-end` left, and the margin on
+    /// an item's start side is its right one. A COLUMN's cross-start is the
+    /// right too.
+    #[test]
+    fn an_rtl_flex_row_runs_from_the_right() {
+        let src = r#"<style>body { margin-left: 0px; margin-right: 0px; margin-top: 0px }
+            .f { display: flex; direction: rtl; width: 400px } .e { justify-content: flex-end } .c { flex-direction: column; align-items: flex-start }
+            .a { width: 100px; height: 10px; background-color: #ff0000; margin-right: 20px } .b { width: 50px; height: 10px; background-color: #0000ff }
+            .x { width: 60px; height: 10px; background-color: #00ff00 }</style>
+            <div class="f"><div class="a"></div><div class="b"></div></div>
+            <div class="f e"><div class="b"></div></div>
+            <div class="f c"><div class="x"></div></div>"#;
+        let o = render(src);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let (a, b, x) = (boxes(&o, 0xff0000ff)[0], boxes(&o, 0x0000ffff), boxes(&o, 0x00ff00ff)[0]);
+        assert_eq!(a.0, 400 - 20 - 100, "the first item at the right, after its start (right) margin");
+        assert_eq!(b[0].0, 400 - 20 - 100 - 50, "the second to its left");
+        assert_eq!(b[1].0, 0, "flex-end packs to the LEFT in rtl");
+        assert_eq!(x.0, 400 - 60, "a column's cross-start is the right edge");
     }
 
     /// ★ A NESTED table is not a wrapper. A `display: table` div around a

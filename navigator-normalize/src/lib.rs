@@ -1320,7 +1320,7 @@ fn to_longhands_inner(name: &str, value: &[Token], inputs: &Inputs, report: &mut
         // element's direction, and — because the computed value inherits AS
         // `left` — on the direction of every descendant that inherits it.
         // Kept as written and resolved in the direction pass.
-        if p == "text-align" && matches!(v.to_ascii_lowercase().as_str(), "left" | "right") { return Some((p, v.to_ascii_lowercase())) }
+        if matches!(p.as_str(), "text-align" | "justify-content") && matches!(v.to_ascii_lowercase().as_str(), "left" | "right") { return Some((p, v.to_ascii_lowercase())) }
         // An inline-side property (`margin-@start`) is checked as the
         // physical property it will become; both sides take the same values.
         let phys = expand::physical(&p, false);
@@ -1858,6 +1858,7 @@ fn first_strong_rtl(dom: &Dom, h: Handle) -> Option<bool> {
 /// - `text-align: left | right` become `start` or `end`. The computed value
 ///   inherits AS `left`, so an element whose direction differs from its
 ///   parent's and that inherits a physical alignment gets it written out;
+/// - `justify-content: left | right`, the same way, in a row container;
 /// - the UA sheet's list and `dd` indents are on the START side (HTML §15:
 ///   `padding-inline-start: 40px`), which the profile's UA writes as left —
 ///   in rtl they move to the right.
@@ -1907,9 +1908,15 @@ fn direction_pass(resolved: &mut BTreeMap<(Handle, String, String), BTreeMap<Str
     let mut logical = 0usize;
     for ((h, ..), props) in resolved.iter_mut() {
         let r = is_rtl(*h);
-        if let Some((pri, v)) = props.get_mut("text-align") {
-            let _ = pri;
+        if let Some((_, v)) = props.get_mut("text-align") {
             if matches!(v.as_str(), "left" | "right") { *v = if (v == "left") != r { "start" } else { "end" }.to_string() }
+        }
+        // `justify-content: left | right` (Box Alignment §5.1): physical in a
+        // ROW container; in a column the main axis is not the inline one,
+        // and they behave as `start`.
+        let column = props.get("flex-direction").is_some_and(|(_, d)| d.starts_with("column"));
+        if let Some((_, v)) = props.get_mut("justify-content") {
+            if matches!(v.as_str(), "left" | "right") { *v = if column || (v == "left") != r { "flex-start" } else { "flex-end" }.to_string() }
         }
         let carried: Vec<String> = props.keys().filter(|k| k.contains('@')).cloned().collect();
         for k in carried {
