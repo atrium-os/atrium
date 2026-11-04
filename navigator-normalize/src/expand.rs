@@ -128,6 +128,25 @@ pub fn expand(name: &str, value: &[Token]) -> Option<Vec<(String, String)>> {
         });
     }
     let one = |n: &str, v: &str| Some(vec![(n.to_string(), v.to_string())]);
+    // The inline-side border shorthands are the physical ones on `@start` /
+    // `@end` sides, and the logical corners are physical corners on them.
+    let inline_side = |n: &str| match n { "border-inline-start" => Some(vec![("border-left", "@start")]),
+        "border-inline-end" => Some(vec![("border-right", "@end")]),
+        "border-inline" => Some(vec![("border-left", "@start"), ("border-right", "@end")]), _ => None };
+    if let Some(sides) = inline_side(name) {
+        let mut out = vec![];
+        for (phys, side) in sides {
+            let side_name = phys.trim_start_matches("border-");
+            out.extend(expand(phys, value)?.into_iter().map(|(p, v)| (p.replace(&format!("-{side_name}-"), &format!("-{side}-")), v)));
+        }
+        return Some(out);
+    }
+    let corner = match name {
+        "border-start-start-radius" => Some("border-top-@start-radius"), "border-start-end-radius" => Some("border-top-@end-radius"),
+        "border-end-start-radius" => Some("border-bottom-@start-radius"), "border-end-end-radius" => Some("border-bottom-@end-radius"),
+        _ => None,
+    };
+    if let Some(c) = corner { return one(c, &whole) }
     match name {
         "margin" | "padding" => {
             let s = box_sides(&p)?;

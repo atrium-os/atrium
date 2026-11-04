@@ -1076,3 +1076,22 @@ fn a_row_of_right_floats_in_rtl_is_a_strip() {
     assert_eq!(base_props(&out, "c").get("display").map(String::as_str), Some("inline-block"), "inline-start in rtl is right");
 }
 
+/// The inline-side border shorthands and the logical corners were dropped
+/// as unknown — 314 and 2,054 declarations in the corpus: a blockquote's
+/// `border-inline-start` rule simply vanished.
+#[test]
+fn inline_border_shorthands_and_logical_corners_expand() {
+    let src = r#"<html><head><style>
+      p { border-inline-start: 4px solid #ff0000; border-inline: 1px dotted; border-start-end-radius: 5px; border-end-start-radius: 6px }
+      .e { border-inline-end: 2px dashed #00ff00 }
+    </style></head><body><p id="l">x</p><div dir="rtl"><p id="r">y</p><p id="e" class="e">z</p></div></body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    let (l, r, e) = (base_props(&out, "l"), base_props(&out, "r"), base_props(&out, "e"));
+    let get = |m: &std::collections::BTreeMap<String, String>, k: &str| m.get(k).cloned().unwrap_or_default();
+    assert_eq!((get(&l, "border-left-width"), get(&l, "border-left-style")), ("1px".into(), "dotted".into()), "the later `border-inline` wins: {out}");
+    assert_eq!(get(&l, "border-top-right-radius"), "5px", "start-end is top-right in ltr: {out}");
+    assert_eq!(get(&r, "border-top-left-radius"), "5px", "…and top-left in rtl");
+    assert_eq!(get(&r, "border-bottom-right-radius"), "6px");
+    assert_eq!((get(&e, "border-left-width"), get(&e, "border-left-style")), ("2px".into(), "dashed".into()), "rtl inline-end is the left: {out}");
+    assert!(refusals(&out).is_empty());
+}
