@@ -31,7 +31,7 @@ pub enum Error {
 /// How resources reach the shader (the interim compute ABI).
 ///
 /// User SGPRs `s[2i:2i+1]` hold the 64-bit address of `buffers[i]`; the
-/// workgroup id x, y, z follow in the next three SGPRs; `v0` holds the
+/// workgroup id is architected (X in `ttmp9`, Y/Z in `ttmp7` halves); `v0` holds the
 /// packed local invocation id.
 #[derive(Debug, Clone)]
 pub struct Abi {
@@ -47,10 +47,6 @@ impl Abi {
     /// Number of user SGPRs.
     pub fn user_sgprs(&self) -> u8 {
         2 * self.buffers.len() as u8
-    }
-    /// First SGPR of the workgroup id.
-    pub fn tgid_sgpr(&self) -> u8 {
-        self.user_sgprs()
     }
 }
 
@@ -84,7 +80,7 @@ pub fn compile(f: &Function) -> Result<Binary, Error> {
     let u = atrium_gir::passes::uniformity::analyse(f);
     let mut is = isel::Isel::new(f, &u, &abi);
     is.run()?;
-    let asg = regalloc::allocate(&is.mi, &is.vregs, 1, abi.tgid_sgpr() + 3)?;
+    let asg = regalloc::allocate(&is.mi, &is.vregs, 1, abi.user_sgprs())?;
     let code = emit::emit(&is.mi, &is.vregs, &asg);
     Ok(Binary { code, vgprs: asg.vgprs, sgprs: asg.sgprs, abi, local_size: f.local_size })
 }

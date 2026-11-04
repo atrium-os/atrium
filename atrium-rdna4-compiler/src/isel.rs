@@ -542,8 +542,21 @@ impl<'a> Isel<'a> {
         push(self, "V_DIV_FIXUP_F32", d, None, vec![q3, b, a], 0);
     }
 
+    /// Workgroup id component `k`. GFX12 has architected workgroup-id
+    /// registers (ISA guide 3.5.3.4, CS SGPR load): X in TTMP9, Y in
+    /// TTMP7[15:0], Z in TTMP7[31:16]; nothing is loaded after the user SGPRs.
+    fn tgid(&mut self, k: u8) -> O {
+        const TTMP7: u8 = 115;
+        const TTMP9: u8 = 117;
+        if k == 0 {
+            return O::PS(TTMP9);
+        }
+        let t = self.vreg(Class::V, 1);
+        self.valu("V_BFE_U32", O::R(t, 0), vec![O::PS(TTMP7), O::Imm(16 * (k as u32 - 1)), O::Imm(16)], 0);
+        O::R(t, 0)
+    }
+
     fn builtin(&mut self, b: Builtin, r: ValueId) -> Result<(), Error> {
-        let tgid = self.abi.tgid_sgpr();
         let ls = self.f.local_size;
         match b {
             Builtin::LocalId | Builtin::GlobalId => {
@@ -552,14 +565,16 @@ impl<'a> Isel<'a> {
                     // Packed local id: x [9:0], y [19:10], z [29:20] in v0.
                     self.valu("V_BFE_U32", O::R(d, k), vec![O::PV(0), O::Imm(10 * k as u32), O::Imm(10)], 0);
                     if b == Builtin::GlobalId {
-                        self.valu("V_MAD_U32_U24", O::R(d, k), vec![O::PS(tgid + k), O::Imm(ls[k as usize]), O::R(d, k)], 0);
+                        let g = self.tgid(k);
+                        self.valu("V_MAD_U32_U24", O::R(d, k), vec![g, O::Imm(ls[k as usize]), O::R(d, k)], 0);
                     }
                 }
             }
             Builtin::WorkgroupId => {
                 let d = self.def_v(r);
                 for k in 0..3u8 {
-                    self.valu("V_MOV_B32", O::R(d, k), vec![O::PS(tgid + k)], 0);
+                    let g = self.tgid(k);
+                    self.valu("V_MOV_B32", O::R(d, k), vec![g], 0);
                 }
             }
             Builtin::LocalIndex => {
