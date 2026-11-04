@@ -2714,20 +2714,31 @@ fn run_module(ctx: &mut Context, text: &str, path: Option<&std::path::Path>) -> 
         None => Source::from_bytes(text.as_bytes()),
     };
     let module = boa_engine::Module::parse(src, None, ctx).map_err(|e| e.to_string())?;
-    let promise = module.load_link_evaluate(ctx);
-    ctx.run_jobs().map_err(|e| e.to_string())?;
-    match promise.state() {
-        boa_engine::builtins::promise::PromiseState::Fulfilled(_) => Ok(()),
-        boa_engine::builtins::promise::PromiseState::Rejected(v) => {
-            Err(v.to_string(ctx).map(|s| s.to_std_string_escaped())
-                .unwrap_or_else(|_| "module rejected".into()))
+    // ★ Load, link and evaluate ONE STEP AT A TIME, never through
+    // `load_link_evaluate`: that chains `JsPromise::then`, which looks up
+    // the promise's species through `Promise` — and a page that replaced
+    // `Promise` (a polyfill, BBC News) made the result a non-native object,
+    // which Boa `expect`s away: a panic that killed the whole conversion.
+    let settled = |ctx: &mut Context, p: boa_engine::object::builtins::JsPromise| -> Result<(), String> {
+        ctx.run_jobs().map_err(|e| e.to_string())?;
+        match p.state() {
+            boa_engine::builtins::promise::PromiseState::Fulfilled(_) => Ok(()),
+            boa_engine::builtins::promise::PromiseState::Rejected(v) => {
+                Err(v.to_string(ctx).map(|s| s.to_std_string_escaped())
+                    .unwrap_or_else(|_| "module rejected".into()))
+            }
+            // Pending after the queue drained means an import never resolved —
+            // this build has no module loader, so a bundle with real imports is
+            // reported rather than silently half-run.
+            boa_engine::builtins::promise::PromiseState::Pending =>
+                Err("module pending: unresolved import (no module loader)".into()),
         }
-        // Pending after the queue drained means an import never resolved —
-        // this build has no module loader, so a bundle with real imports is
-        // reported rather than silently half-run.
-        boa_engine::builtins::promise::PromiseState::Pending =>
-            Err("module pending: unresolved import (no module loader)".into()),
-    }
+    };
+    let loaded = module.load(ctx);
+    settled(ctx, loaded)?;
+    module.link(ctx).map_err(|e| e.to_string())?;
+    let evaluated = module.evaluate(ctx).map_err(|e| e.to_string())?;
+    settled(ctx, evaluated)
 }
 
 

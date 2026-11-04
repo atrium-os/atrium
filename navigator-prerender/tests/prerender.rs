@@ -343,6 +343,28 @@ fn classic_script_with_export_is_retried_as_module() {
     assert!(c.html.contains("retried"), "got {}", c.html);
 }
 
+/// ★ A page that replaces `Promise`'s species must not take the converter
+/// down with it. Boa's `load_link_evaluate` chains `JsPromise::then`, which
+/// builds its result through `promise.constructor` and `expect`s a native
+/// promise back: a polyfill there (BBC News) was a panic in the child.
+#[test]
+fn a_replaced_promise_species_does_not_stop_modules() {
+    let html = r#"<html><body><div id=r></div>
+      <script>
+        function Fake(ex) { ex(function () {}, function () {}); return {}; }
+        Fake[Symbol.species] = Fake;
+        Promise.prototype.constructor = Fake;
+      </script>
+      <script type="module">
+        const el = document.createElement('p');
+        el.textContent = 'module ran';
+        document.getElementById('r').appendChild(el);
+      </script></body></html>"#;
+    let c = convert(html, &mut BoaEngine::default());
+    assert_eq!(c.scripts_failed, 0, "{:?}", c.errors);
+    assert!(c.html.contains("module ran"), "got {}", c.html);
+}
+
 /// A module whose import cannot be resolved is REPORTED, not silently
 /// treated as having run.
 #[test]
