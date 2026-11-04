@@ -173,6 +173,21 @@ fn defs_in(r: &[Node], out: &mut HashSet<ValueId>) {
     }
 }
 
+/// The value lists of the `break`s that leave the loop whose body is `r`
+/// (not those of nested loops).
+fn breaks<'r>(r: &'r [Node], out: &mut Vec<&'r Vec<ValueId>>) {
+    for n in r {
+        match n {
+            Node::Inst(Inst { op: Op::Break(v), .. }) => out.push(v),
+            Node::Inst(_) | Node::Loop { .. } => {}
+            Node::If { then, els, .. } => {
+                breaks(then, out);
+                breaks(els, out);
+            }
+        }
+    }
+}
+
 /// The `k`-th value a region's final `yield` passes, if it ends in one.
 fn yielded(r: &Region, k: usize) -> Option<ValueId> {
     match r.last() {
@@ -1448,8 +1463,28 @@ impl<'a> Isel<'a> {
                             self.def_slot(*p);
                         }
                     }
-                    for v in results {
-                        self.def_slot(*v);
+                    // A result takes over the parameter every break passes
+                    // for it: after the loop the parameter is gone, and
+                    // lanes still iterating write it only for themselves.
+                    let mut brks = vec![];
+                    breaks(body, &mut brks);
+                    let mut used_params = HashSet::new();
+                    for (k, v) in results.iter().enumerate() {
+                        let same = brks.first().and_then(|b| b.get(k).copied()).filter(|q| {
+                            params.contains(q)
+                                && brks.iter().all(|b| b.get(k) == Some(q))
+                                && self.ty(*q) == self.ty(*v)
+                                && self.ty(*q) != Ty::BOOL
+                                && !used_params.contains(q)
+                        });
+                        match same {
+                            Some(q) => {
+                                used_params.insert(q);
+                                let m = self.map[&q];
+                                self.map.insert(*v, m);
+                            }
+                            None => self.def_slot(*v),
+                        }
                     }
                     let pairs: Vec<(ValueId, ValueId)> = params.iter().copied().zip(inits.iter().copied()).collect();
                     self.parallel_copy(&pairs)?;

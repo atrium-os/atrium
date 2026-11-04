@@ -5,6 +5,7 @@ pub mod cse;
 pub mod dce;
 pub mod fold;
 pub mod mem2reg;
+pub mod sink;
 pub mod uniformity;
 
 use crate::Function;
@@ -24,4 +25,5 @@ pub fn optimize(f: &mut Function) {
             break;
         }
     }
+    sink::sink(f);
 }
