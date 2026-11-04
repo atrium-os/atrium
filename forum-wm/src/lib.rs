@@ -788,6 +788,19 @@ mod tests {
         assert_eq!(s.rect.y, 24); // below the bar
     }
 
+    /// frescod's trusted strip (F4d) holds the top rows: main.rs starts the
+    /// screen below it, and nothing the WM places reaches into it.
+    #[test]
+    fn nothing_is_placed_in_frescods_reserved_strip() {
+        let s = Screen { rect: WmRect { x: 0, y: 24, w: 1920, h: 1056 }, bar_h: 24, dock_h: 48 };
+        for role in [WmRole::Background, WmRole::Document, WmRole::Panel, WmRole::Dialog, WmRole::Chrome] {
+            let r = rect_for(&s, role);
+            assert!(r.y >= 24 && r.y + r.h <= 1080, "{role:?} at {r:?}");
+        }
+        assert_eq!(rect_for(&s, WmRole::Chrome).y, 24, "the bar sits just below the strip");
+        assert_eq!(rect_for(&s, WmRole::Document), WmRect { x: 0, y: 48, w: 1920, h: 1080 - 48 - 48 });
+    }
+
     #[test]
     fn a_dialog_grabs_focus_and_sits_on_top() {
         let l = arrange(&screen(), &[surf(1, WmRole::Document), surf(2, WmRole::Dialog)], None);

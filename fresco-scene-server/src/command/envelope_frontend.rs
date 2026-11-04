@@ -294,6 +294,7 @@ pub struct EnvelopeFrontend {
     /// scene server has no display of its own to ask. Zero until set, which is
     /// what a headless/test frontend reports.
     display_mode: (u32, u32, u32),
+    reserved_top: u32,
 }
 
 impl EnvelopeFrontend {
@@ -319,12 +320,19 @@ impl EnvelopeFrontend {
             wm_capable: std::collections::HashSet::new(),
             client_uids: HashMap::new(),
             display_mode: (0, 0, 0),
+            reserved_top: 0,
         }
     }
 
     /// Tell the frontend what the display is running at, so clients can ask
     /// (`OP_DISPLAY_INFO`) instead of assuming. Called by frescod once it has
     /// read the connector; call it again on a mode change.
+    /// Rows at the top of the screen frescod's own chrome holds (F4d),
+    /// reported over OP_DISPLAY_INFO so the WM lays out below them.
+    pub fn set_reserved_top(&mut self, rows: u32) {
+        self.reserved_top = rows;
+    }
+
     pub fn set_display_mode(&mut self, width: u32, height: u32, refresh_mhz: u32) {
         self.display_mode = (width, height, refresh_mhz);
     }
@@ -783,7 +791,7 @@ impl EnvelopeFrontend {
     /// apps is what left each of them guessing a different size.
     fn handle_display_info(&mut self) -> Result<Vec<Outbound>, DispatchError> {
         let (width, height, refresh_mhz) = self.display_mode;
-        let payload = encode(&DisplayInfoResponse { width, height, refresh_mhz })
+        let payload = encode(&DisplayInfoResponse { width, height, refresh_mhz, reserved_top: self.reserved_top })
             .map_err(|_| DispatchError::BadPayload)?;
         Ok(vec![Outbound {
             op:      control::OP_DISPLAY_INFO,

@@ -98,8 +98,9 @@ Still to do, with F4f: an "obscured" mark on input when another app's visible co
 - **The chrome channel** (`FRESCOD_CHROME_SOCK`, `fresco_split::chrome`). Reaching the socket is the grant, as for the WM socket. The Navigator asks it to open a document's fresco connection (`OPEN_CLIENT`); frescod answers `OPENED` with a handle and the client end as an fd, and serves the connection with a renderer like any other. `SET_ORIGIN(handle, window, origin)` then names a window without trusting anything the document said; only the connection that opened a handle may set its origins, and handles are never reused.
 - Verified in the amd64 VM with both renderers jailed, using `atrium-chrome-demo`, which plays the Navigator with two documents. Document 2 paints a fake badge in its own window. The strip named `https://bank.example` while document 1 had focus and `https://evil.example:8443` while document 2 had focus, and the ring moved with it (screenshots `frescod-f4d-chrome-*.png`). A click on the strip went to the WM.
 
+- **The WM lays out below the strip.** `DISPLAY_INFO` carries `reserved_top`, the rows frescod's chrome holds (24 in split mode, 0 otherwise). forum-wm starts its screen there, so the bar sits just under the strip and documents under the bar. Verified in the VM: a document under forum-wm on a 1280x720 screen got 1280x624 (strip 24, bar 24, dock 48).
+
 Still to do:
-- Tell the WM about the strip, so it places windows below it (forum-wm maximizes into the full screen today, and the strip covers the windows' top 24 px).
 - The chrome is drawn only in split mode, where the chrome channel exists.
 - Secure-input affordances come with F4f.
 

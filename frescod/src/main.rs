@@ -160,6 +160,7 @@ fn main() -> std::io::Result<()> {
         wm_sock.as_deref(),
     )?;
     if let Some(b) = &split {
+        frontend.lock().unwrap().set_reserved_top(chrome::STRIP_H as u32);
         b.set_subs(event_subs.clone());
         if let Ok(p) = std::env::var("FRESCOD_CHROME_SOCK") {
             b.serve_chrome(Path::new(&p))?;
@@ -320,6 +321,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
         },
         &sock, wm_sock.as_deref())?;
     if let Some(b) = &split {
+        frontend.lock().unwrap().set_reserved_top(chrome::STRIP_H as u32);
         b.set_subs(subs.clone());
         if let Ok(p) = std::env::var("FRESCOD_CHROME_SOCK") {
             b.serve_chrome(Path::new(&p))?;

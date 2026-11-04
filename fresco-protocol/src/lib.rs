@@ -630,10 +630,11 @@ pub struct TextMeasureResponse {
 /// through jail(8), which does not carry the environment in, so the apps that
 /// most need the answer are exactly the ones that cannot be told out-of-band.
 ///
-/// Deliberately just the mode. Chrome reservations (what a bar or dock has
-/// claimed) belong to the WM, which frescod does not track — a client that
-/// needs its usable area rather than the raw screen asks forum-ctl. Reporting
-/// a field frescod cannot populate would be worse than not having it.
+/// The mode, plus the one reservation frescod itself makes: the trusted
+/// strip at the top of the screen (F4d), which no app pixel ever covers. The
+/// WM lays everything out below it. Chrome reservations a bar or dock has
+/// claimed belong to the WM, which frescod does not track: a client that
+/// needs its usable area rather than the raw screen asks forum-ctl.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct DisplayInfoResponse {
     /// Scanout dimensions in pixels — what the connector is driving.
@@ -641,6 +642,9 @@ pub struct DisplayInfoResponse {
     pub height: u32,
     /// Refresh in milli-Hz (60000 = 60.000 Hz), matching the connector's mode.
     pub refresh_mhz: u32,
+    /// Rows at the top of the screen that frescod's trusted chrome holds
+    /// (0 when it draws none): anything placed there is covered.
+    pub reserved_top: u32,
 }
 
 // ── Window event payloads (server → client, ASYNC_EVENT flag) ────────

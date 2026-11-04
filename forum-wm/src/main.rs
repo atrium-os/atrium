@@ -89,23 +89,27 @@ impl FrescoConn for ClientConn {
 /// The chrome reservations (bar/dock) stay the shell's own: frescod reports the
 /// mode, not what the session has reserved from it.
 fn screen(conn: &mut Connection) -> Screen {
-    let (w, h) = std::env::var("FORUM_SCREEN")
+    let (w, h, top) = std::env::var("FORUM_SCREEN")
         .ok()
         .and_then(|s| {
             let (a, b) = s.split_once('x')?;
             Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
         })
+        .map(|(w, h)| (w, h, 0))
         .or_else(|| match conn.display_info() {
             Ok(d) if d.width > 0 && d.height > 0 => {
-                eprintln!("forum-wm: screen {}x{} @ {} mHz (from frescod)",
-                          d.width, d.height, d.refresh_mhz);
-                Some((d.width as i32, d.height as i32))
+                eprintln!("forum-wm: screen {}x{} @ {} mHz, top {} rows frescod's (from frescod)",
+                          d.width, d.height, d.refresh_mhz, d.reserved_top);
+                let top = (d.reserved_top as i32).min(d.height as i32 / 2);
+                Some((d.width as i32, d.height as i32, top))
             }
             Ok(_)  => { eprintln!("forum-wm: frescod reports no mode"); None }
             Err(e) => { eprintln!("forum-wm: display_info failed: {e}"); None }
         })
-        .unwrap_or((1920, 1080));
-    Screen { rect: WmRect { x: 0, y: 0, w, h }, bar_h: 24, dock_h: 48 }
+        .unwrap_or((1920, 1080, 0));
+    /* frescod's trusted strip (F4d) covers the top `top` rows: the session's
+     * screen, bar included, starts below it. */
+    Screen { rect: WmRect { x: 0, y: top, w, h: h - top }, bar_h: 24, dock_h: 48 }
 }
 
 fn main() -> io::Result<()> {
