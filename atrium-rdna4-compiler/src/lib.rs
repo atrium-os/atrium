@@ -12,6 +12,7 @@
 #![warn(missing_docs)]
 
 pub mod asm;
+pub mod coalesce;
 pub mod emit;
 pub mod isel;
 pub mod mir;
@@ -88,6 +89,7 @@ pub fn compile(f: &Function) -> Result<Binary, Error> {
     let u = atrium_gir::passes::uniformity::analyse(f);
     let mut is = isel::Isel::new(f, &u, &abi);
     is.run()?;
+    coalesce::run(&mut is.mi, &is.vregs);
     let asg = regalloc::allocate(&is.mi, &is.vregs, 1, abi.user_sgprs())?;
     let code = emit::emit(&is.mi, &is.vregs, &asg);
     Ok(Binary { code, vgprs: asg.vgprs, sgprs: asg.sgprs, abi, local_size: f.local_size, lds_bytes: f.workgroup_bytes })
