@@ -1910,16 +1910,46 @@ impl<'a> Cx<'a> {
         let coltracks = need(&cols_tpl, &auto_col, ncols);
         let rowtracks = need(&rows_tpl, &auto_row, nrows);
         // Column sizes: intrinsic contributions come from single-track items.
+        // ★ Three of them (Grid §12.5): the min- and max-content
+        // contributions, and the MINIMUM contribution an `auto` minimum
+        // takes — the item's used min-width, so `min-width: 0` (or a scroll
+        // container) contributes nothing and only an `auto` min-width is
+        // content-based (§6.6). Taking the min-content contribution for all
+        // of them laid react.dev's article, `<main class="min-w-0">` around a
+        // wide code block, 992 px wide in an 800 px grid.
         let mut cmin = vec![0 as U; coltracks.len()];
         let mut cmax = vec![0 as U; coltracks.len()];
+        let mut cauto = vec![0 as U; coltracks.len()];
         for it in &items {
             if it.col.1 != 1 { continue }
             let (mn, mx) = self.intrinsic(it.h);
-            let frame = self.st(it.h).map(|cs| len(cs.get("padding-left"), w).unwrap_or(0) + len(cs.get("padding-right"), w).unwrap_or(0)).unwrap_or(0);
-            cmin[it.col.0] = cmin[it.col.0].max(mn + frame);
-            cmax[it.col.0] = cmax[it.col.0].max(mx + frame);
+            let (a, b, m) = match self.st(it.h) {
+                // Anonymous text: no box, no minimum of its own.
+                None => (mn, mx, mn),
+                Some(cs) => {
+                    let px = |p: &str| len(cs.get(p), w).unwrap_or(0);
+                    let bd = |side: &str| if kw(cs, &format!("border-{side}-style")) == "none" { 0 } else { px(&format!("border-{side}-width")) };
+                    let frame = px("padding-left") + px("padding-right") + bd("left") + bd("right");
+                    let margins = px("margin-left") + px("margin-right");
+                    // A percentage width is cyclic here and behaves as auto.
+                    let definite = match cs.get("width") { V::Len(l) => Some(u(l.v)), _ => None };
+                    let (a, b) = definite.map_or((mn + frame, mx + frame), |d| (d, d));
+                    let (a, b) = (contribution(cs, a).max(frame) + margins, contribution(cs, b).max(frame) + margins);
+                    let scroller = ["overflow-x", "overflow-y"].iter().any(|p| !matches!(kw(cs, p), "visible" | "clip" | ""));
+                    let m = match cs.get("min-width") {
+                        _ if definite.is_some() => a,
+                        V::Kw("auto") if scroller => frame + margins,
+                        V::Kw("auto") => a,
+                        v => len(v, w).unwrap_or(0).max(frame) + margins,
+                    };
+                    (a, b, m)
+                }
+            };
+            cmin[it.col.0] = cmin[it.col.0].max(a);
+            cmax[it.col.0] = cmax[it.col.0].max(b);
+            cauto[it.col.0] = cauto[it.col.0].max(m);
         }
-        let cols = size_tracks(&coltracks, Some(w), cgap, &cmin, &cmax);
+        let cols = size_tracks(&coltracks, Some(w), cgap, &cmin, &cmax, &cauto);
         // Row sizes: content heights measured at the item's column width.
         let mut rmin = vec![0 as U; rowtracks.len()];
         for it in &items {
@@ -1951,7 +1981,7 @@ impl<'a> Cx<'a> {
                 }
             }
         }
-        let rows = size_tracks(&rowtracks, cb_h, rgap, &rmin, &rmin);
+        let rows = size_tracks(&rowtracks, cb_h, rgap, &rmin, &rmin, &rmin);
         // Place.
         let pos = |sizes: &[U], gap: U, i: usize| -> U { sizes[..i.min(sizes.len())].iter().sum::<U>() + gap * i as U };
         for it in &items {
@@ -2047,7 +2077,7 @@ impl<'a> Cx<'a> {
             }
         }
         if tracks.is_empty() { return 0 }
-        let mut cols: Vec<U> = size_tracks(&tracks, Some(avail), sx, &mins, &maxs);
+        let mut cols: Vec<U> = size_tracks(&tracks, Some(avail), sx, &mins, &maxs, &mins);
         // Share what is left over among the columns that can still grow,
         // so a measured table fills its box instead of hugging its text.
         // ★ Leftover space is only taken when the TABLE's own width says so.
@@ -4401,6 +4431,36 @@ mod tests {
         assert_eq!(boxes(&o, 0x00ff00ff), vec![(100, 10, 200, 10)]);
     }
 
+    /// ★ An `auto` minimum takes the item's MINIMUM contribution (Grid
+    /// §12.5, §6.6): `min-width: 0` or a scroll container contributes
+    /// nothing, a length contributes itself, and only an `auto` min-width
+    /// is the content's min-content size. A `min-content` minimum still
+    /// takes the min-content contribution. Widths are headless Chrome's.
+    #[test]
+    fn an_auto_grid_track_takes_the_items_minimum_contribution() {
+        let cases: &[(&str, &str, &str, &[(U, U)])] = &[
+            ("auto", "min-width: 0px", "", &[(0, 400)]),
+            ("auto", "", "", &[(0, 600)]),
+            ("auto", "overflow-x: hidden; overflow-y: hidden", "", &[(0, 400)]),
+            ("auto", "min-width: 100px", "", &[(0, 400)]),
+            ("auto auto", "min-width: 0px", r#"<div class="i"><div class="n"></div></div>"#, &[(0, 300), (300, 100)]),
+            ("min-content auto", "min-width: 0px", r#"<div class="i"></div>"#, &[(0, 600), (600, 0)]),
+            ("auto", "min-width: 0px; padding-left: 10px", "", &[(0, 400)]),
+            ("auto", "width: 500px", "", &[(0, 500)]),
+        ];
+        for (cols, a, b, want) in cases {
+            let src = format!(r#"<style>body {{ margin-left: 0px; margin-right: 0px; margin-top: 0px }}
+                .g {{ display: grid; width: 400px; grid-template-columns: {cols} }}
+                .i {{ height: 5px; background-color: #ff0000 }} .f {{ {a} }}
+                .w {{ width: 600px; height: 5px }} .n {{ width: 100px; height: 5px }}</style>
+                <div class="g"><div class="i f"><div class="w"></div></div>{b}</div>"#);
+            let o = render(&src);
+            assert!(o.diagnostics.is_empty(), "{cols} {a}: {:?}", o.diagnostics);
+            let got: Vec<(U, U)> = boxes(&o, 0xff0000ff).iter().map(|b| (b.0, b.2)).collect();
+            assert_eq!(got, want.to_vec(), "{cols} / {a}");
+        }
+    }
+
     #[test]
     fn grid_stretches_auto_tracks() {
         // `none` template: one implicit `auto` column, which must grow to the
@@ -4703,7 +4763,9 @@ fn is_rtl(c: char) -> bool {
     matches!(unicode_bidi::bidi_class(c), unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL)
 }
 
-fn size_tracks(tracks: &[navigator_style::values::Track], avail: Option<U>, gap: U, mins: &[U], maxs: &[U]) -> Vec<U> {
+/// `mins`/`maxs` are the tracks' min- and max-content contributions, `autos`
+/// the minimum contributions an `auto` minimum takes (§12.5).
+fn size_tracks(tracks: &[navigator_style::values::Track], avail: Option<U>, gap: U, mins: &[U], maxs: &[U], autos: &[U]) -> Vec<U> {
     use navigator_style::values::Track;
     // ★ A track has TWO sizing functions, and they are not interchangeable:
     // the minimum gives its BASE size, the maximum gives a GROWTH LIMIT it
@@ -4718,8 +4780,8 @@ fn size_tracks(tracks: &[navigator_style::values::Track], avail: Option<U>, gap:
             Track::Len(l) => u(l.v),
             Track::Pct(p) => pct(*p),
             Track::MinContent => get(mins, i),
-            // `auto` as a MINIMUM is the min-content size.
-            Track::Auto => get(mins, i),
+            // `auto` as a MINIMUM is the items' minimum contribution.
+            Track::Auto => get(autos, i),
             Track::MaxContent => get(maxs, i),
             // With indefinite free space a flexible track sizes to its
             // content (§12.7.1); with definite space it starts at zero and
@@ -4729,7 +4791,8 @@ fn size_tracks(tracks: &[navigator_style::values::Track], avail: Option<U>, gap:
                 let floor = match &**a {
                     Track::Len(l) => u(l.v),
                     Track::Pct(p) => pct(*p),
-                    Track::MinContent | Track::Auto => get(mins, i),
+                    Track::MinContent => get(mins, i),
+                    Track::Auto => get(autos, i),
                     Track::MaxContent => get(maxs, i),
                     _ => 0,
                 };
