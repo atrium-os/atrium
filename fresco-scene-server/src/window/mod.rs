@@ -239,6 +239,12 @@ impl Window {
 /// global UI state (focus, cursor position, z-order).
 pub struct Compositor {
     pub windows:  std::collections::HashMap<WindowId, Window>,
+    /// The layers frescod last put on screen, bottom to top: each window's
+    /// id and its screen rect (x0, y0, x1, y1, exclusive end), as compose
+    /// placed it. Pointer input hits these, so the window a pixel shows is
+    /// the window that gets the click (threat model §2.5.2, F4c). None
+    /// until the first frame.
+    pub shown:    Option<Vec<(WindowId, [i32; 4])>>,
     pub z_order:  Vec<WindowId>,
     pub focus:    Option<WindowId>,
     pub cursor:   (f32, f32),
@@ -386,6 +392,7 @@ impl Compositor {
         windows.insert(0, win0);
         Self {
             windows,
+            shown:    None,
             z_order:  vec![0],
             focus:    Some(0),
             cursor:   (0.0, 0.0),
@@ -946,6 +953,26 @@ impl Compositor {
             });
             Some(FocusChange { prev, new: id })
         }
+    }
+
+    /// The window the pointer at screen (`x`, `y`) is over, and the point
+    /// in that window's coordinates. Hits the layers last composed
+    /// ([`Compositor::shown`]): a window the WM stopped rendering, or one
+    /// with no frame yet, is not on screen and gets nothing. Over no
+    /// window it is window 0, the background, whose events go to the WM
+    /// alone.
+    pub fn pointer_target(&self, x: f32, y: f32) -> (WindowId, (f32, f32)) {
+        let Some(shown) = &self.shown else {
+            let id = self.hit_test(x, y).unwrap_or(0);
+            let pos = if id == 0 { (0.0, 0.0) } else { self.windows.get(&id).map(|w| w.pos).unwrap_or((0.0, 0.0)) };
+            return (id, (x - pos.0, y - pos.1));
+        };
+        for &(id, [x0, y0, x1, y1]) in shown.iter().rev() {
+            if id != 0 && x >= x0 as f32 && x < x1 as f32 && y >= y0 as f32 && y < y1 as f32 && self.windows.contains_key(&id) {
+                return (id, (x - x0 as f32, y - y0 as f32));
+            }
+        }
+        (0, (x, y))
     }
 
     /// Phase-B1c entry point: which window contains (x, y) at the top

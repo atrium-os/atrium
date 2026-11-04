@@ -114,7 +114,7 @@ impl Surfaces {
 }
 
 /// A window's surface size, kept within what the kernels accept.
-fn surface_size(w: &WindowFrame) -> (u32, u32) {
+pub fn surface_size(w: &WindowFrame) -> (u32, u32) {
     if let Some(f) = &w.frame {
         return (f.header.width, f.header.height);
     }

@@ -111,13 +111,8 @@ fn cursor_here(comp: &Arc<Mutex<Compositor>>) -> (f32, f32, u32) {
 }
 
 fn hit(g: &Compositor, x: f32, y: f32) -> (f32, f32, u32) {
-    let target = g.hit_test(x, y).unwrap_or(0);
-    let win_pos = if target == 0 {
-        (0.0, 0.0)
-    } else {
-        g.windows.get(&target).map(|w| w.pos).unwrap_or((0.0, 0.0))
-    };
-    (x - win_pos.0, y - win_pos.1, target as u32)
+    let (target, (lx, ly)) = g.pointer_target(x, y);
+    (lx, ly, target as u32)
 }
 
 /// The focused window (or the topmost non-screen window), mirroring `input_reader`.

@@ -35,7 +35,7 @@ Before this change, frescod's event fan-out sent every event to every connection
 
 - An event reaches the owner of the window it names, plus the WM.
 - Keys with no focused window reach the WM alone.
-- Pointer events over window 0, the shared background, still reach every client, until the background gets an owner (F4c).
+- Pointer events over window 0, the shared background, still reached every client until F4c gave the background to the WM.
 
 ### F4b. The process split
 
@@ -54,7 +54,7 @@ How it works:
 
 Known gaps:
 - Fonts: the renderer's server-side text looks in `/usr/local/share/fonts`, which a jail does not have. The bundle must carry the fonts (not done yet).
-- Window 0 events do not reach renderers (F4c). A client drawing on window 0 draws only in its renderer's own window 0, which the broker does not show.
+- A client drawing on window 0 draws only in its renderer's own window 0, which the broker does not show. Clients that want a desktop draw in a window of role Background, as forum-dock does.
 - `FRESCOD_SPLIT` is off by default, and the Vulkan backend does not take pre-packed frames.
 
 Plan as written:
@@ -70,11 +70,13 @@ Plan as written:
    - `WM_ENUMERATE` answers from the broker's table, using the title the renderer declared.
 5. **Fallback.** `FRESCOD_SPLIT=0` keeps today's single process until the split is proven in the VM.
 
-### F4c. Input routed by the layer list
+### F4c. Input routed by the layer list. Done.
 
-- The broker hit-tests the pointer against the layer list it composes, so what is on top really is what gets the click.
-- The renderer receives events already in window coordinates and forwards them to its client.
-- Window 0 gets an owner, the desktop shell, so the broadcast exception above ends.
+- frescod records the layers it last put on screen (`Compositor::shown`: each window's id and screen rect, rounded as compose rounds them, at its surface's size). Pointer input hits those, top first, so the window a pixel shows is the window that gets the click. A window the WM stopped rendering, or a split-mode window with no frame yet, is not on screen and gets nothing.
+- Events carry window coordinates, measured from that rect's corner. A renderer forwards them to its client as they come.
+- Window 0, the background under every window, belongs to the WM. Pointer events over no window and keys with no focused window go to the WM alone, so the broadcast exception of F4a′ is gone. The desktop shell draws in a window of its own (role Background, as forum-dock does), and gets its input there.
+- Verified in the amd64 VM, split mode with the renderer jailed, using the injector (`FRESCOD_INPUT_SOCK`) on `atrium-surfaces-demo` (`SURFACES_STILL=1`, which prints the input each connection gets). A click on the background reached only the WM. Clicks on A, on an undrawn (transparent) part of B, and on C each reached that window's client and the WM, in that window's coordinates. A key went to the focused window C.
+- Hit-testing is by rect: an undrawn part of a window still takes its clicks, as above. Input regions are not implemented.
 
 ### F4d. Trusted chrome
 

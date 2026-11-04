@@ -147,24 +147,16 @@ fn run(
 
         /* Update cursor + resolve hit-target window in one critical
          * section so the resulting event is internally consistent. */
-        let (cur_x, cur_y, target, win_pos) = {
+        let (target, (local_x, local_y)) = {
             let mut g = wm.lock().unwrap();
             let (mut x, mut y) = g.cursor;
             x = (x + dx).clamp(0.0, sw - 1.0);
             y = (y + dy).clamp(0.0, sh - 1.0);
             g.cursor = (x, y);
 
-            let target = g.hit_test(x, y).unwrap_or(0);
-            let win_pos = if target == 0 {
-                (0.0, 0.0)
-            } else {
-                g.windows.get(&target).map(|w| w.pos).unwrap_or((0.0, 0.0))
-            };
-            (x, y, target as u32, win_pos)
+            let (target, local) = g.pointer_target(x, y);
+            (target as u32, local)
         };
-
-        let local_x = cur_x - win_pos.0;
-        let local_y = cur_y - win_pos.1;
 
         if dx != 0.0 || dy != 0.0 {
             let _ = event_sink.send(DisplayEvent::InputPointerMotion {

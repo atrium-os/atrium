@@ -179,19 +179,18 @@ pub fn spawn_event_fanout(
 /// Who an event goes to (threat model §2.5.2 "input splits the same way").
 /// Every event names a window. It reaches that window's owner and the WM
 /// (TCB) only: a client never sees another client's keystrokes, pointer
-/// or window events. Keys with no focused window (window 0) go to the WM
-/// alone. Pointer events over window 0, the shared desktop background,
-/// still reach every client, as before, until the background has an owner.
+/// or window events. Window 0, the background under every window, belongs
+/// to the WM: keys with no focused window and pointer events over no
+/// window go to the WM alone (F4c; the desktop shell draws in a window of
+/// its own, role Background).
 enum Route {
     OwnerAndWm(Option<u8>),
     WmOnly,
-    All,
 }
 
 impl Route {
     fn reaches(&self, sub: &Sub) -> bool {
         match self {
-            Route::All => true,
             Route::WmOnly => sub.wm,
             Route::OwnerAndWm(owner) => sub.wm || *owner == Some(sub.client_id),
         }
@@ -213,11 +212,7 @@ fn route(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Route {
         | E::InputPointerScroll { window_id, .. } => window_id,
     };
     if window_id == 0 {
-        return match ev {
-            E::InputKey { .. } => Route::WmOnly,
-            E::InputPointerMotion { .. } | E::InputPointerButton { .. } | E::InputPointerScroll { .. } => Route::All,
-            _ => Route::WmOnly,
-        };
+        return Route::WmOnly;
     }
     let owner = u16::try_from(window_id).ok()
         .and_then(|id| comp.lock().unwrap().windows.get(&id).map(|w| w.owner))

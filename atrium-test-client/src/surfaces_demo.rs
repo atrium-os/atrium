@@ -9,6 +9,10 @@
 //!   pixels must show A and the desktop under it;
 //! - window C: a half-transparent background and a solid bar, moving.
 //!
+//! Pointer and key events are printed as they arrive, on the app's
+//! connection (`app:`) and on the WM's (`wm:`), so input routing can be
+//! checked with frescod's injector. `SURFACES_STILL=1` keeps C in place.
+//!
 //! Usage: atrium-surfaces-demo [client-sock] [wm-sock]
 
 use fresco_client::Connection;
@@ -53,8 +57,9 @@ fn main() -> std::io::Result<()> {
         rect: WmRect { x, y, w: w as i32, h: h as i32 },
         layer,
     };
+    let still = std::env::var("SURFACES_STILL").is_ok();
     for step in 0.. {
-        let cx = 700 + (step % 8) * 40;
+        let cx = if still { 700 } else { 700 + (step % 8) * 40 };
         wm.wm_declare_layout(&WmDeclareLayoutPayload {
             slots: vec![
                 slot(a, 200, 150, aw, ah, 2),
@@ -65,8 +70,14 @@ fn main() -> std::io::Result<()> {
         })?;
         eprintln!("step {step}: C at x={cx}");
         // Drain events so the server's writer never blocks on us.
-        while conn.poll_event()?.is_some() {}
-        while wm.poll_event()?.is_some() {}
+        for (who, c) in [("app", &mut conn), ("wm", &mut wm)] {
+            while let Some(e) = c.poll_event()? {
+                use fresco_client::Event as E;
+                if matches!(e, E::PointerButton { .. } | E::Key { .. } | E::PointerScroll { .. }) {
+                    println!("{who}: {e:?}");
+                }
+            }
+        }
         std::thread::sleep(Duration::from_secs(1));
     }
     Ok(())

@@ -426,7 +426,15 @@ fn render_one_frame(
         let mut fe = frontend.lock().unwrap();
         fe.take_pending_uploads()
     };
+    /* What compose puts on screen, for pointer hit-testing (F4c): each
+     * window at its rounded position, at its surface's size. */
+    let shown: Vec<(u16, [i32; 4])> = windows.iter().map(|w| {
+        let (x, y) = (w.pos.0.round() as i32, w.pos.1.round() as i32);
+        let (sw, sh) = render_backend::surface_size(w);
+        (w.id as u16, [x, y, x.saturating_add(sw as i32), y.saturating_add(sh as i32)])
+    }).collect();
     renderer.render(ScreenInput { windows, uploads, clears })?;
+    comp.lock().unwrap().shown = Some(shown);
     Ok(())
 }
 
