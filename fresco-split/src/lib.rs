@@ -19,6 +19,7 @@
 //! renderer's ids.
 
 pub mod chan;
+pub mod chrome;
 pub mod slot;
 
 /// Bytes in every record.
@@ -123,22 +124,22 @@ mod kind {
 
 /// Layout: word 0 kind, word 1 window, words 2..8 arguments, bytes 32..96
 /// the title (WINDOW_CREATE, WINDOW_TITLE) or zero.
-struct Rec([u8; MSG_BYTES]);
+pub(crate) struct Rec(pub(crate) [u8; MSG_BYTES]);
 
 impl Rec {
-    fn new(kind: u32, window: u32) -> Rec {
+    pub(crate) fn new(kind: u32, window: u32) -> Rec {
         let mut r = Rec([0; MSG_BYTES]);
         r.put(0, kind);
         r.put(1, window);
         r
     }
-    fn put(&mut self, i: usize, v: u32) {
+    pub(crate) fn put(&mut self, i: usize, v: u32) {
         self.0[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
     }
-    fn get(&self, i: usize) -> u32 {
+    pub(crate) fn get(&self, i: usize) -> u32 {
         u32::from_le_bytes(self.0[i * 4..i * 4 + 4].try_into().unwrap())
     }
-    fn title(&mut self, t: &str) {
+    pub(crate) fn title(&mut self, t: &str) {
         let mut n = t.len().min(TITLE_BYTES);
         while !t.is_char_boundary(n) {
             n -= 1;

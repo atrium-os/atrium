@@ -88,10 +88,20 @@ The risk is clickjacking: a window that is mostly transparent, placed over anoth
 
 Still to do, with F4f: an "obscured" mark on input when another app's visible content overlaps the target window, so sensitive UI (password fields, Navigator permission prompts) can refuse a click that may have been steered. It needs a field in the input events, so it waits for the wire change F4f makes anyway.
 
-### F4d. Trusted chrome
+### F4d. Trusted chrome. Done (split mode).
 
-- The broker draws its own scene: the origin indicator, the focus ring, and secure-input affordances. It runs the same `bin` and `raster` on a scene the broker builds itself, into a chrome surface that is always the top layer.
-- The Navigator gives the origin to the broker over its own channel, never through the renderer.
+- frescod builds its own scene from its own state, packs it like any window and composes it as the top layer (`frescod/src/chrome.rs`). No client or renderer contributes to it.
+- **The strip.** The top 24 pixels of the screen are frescod's alone: an opaque layer above everything, so no app pixel ever shows there. It names the focused window's origin. An app can paint a look-alike badge anywhere in its own window, but never in the strip, so the strip is the one place a user can trust. An in-window badge was tried first and dropped for exactly that reason: an unfocused window could paint an identical one.
+- **The focus ring.** A 2 px ring just inside the focused window's edge, in the same colour as the mark before the origin in the strip, ties the strip's claim to a window on screen.
+- **Text.** A built-in 5x9 font holding exactly the characters an origin may contain (lowercase ASCII letters, digits and `.:/-[]_`). frescod parses no font file, and a look-alike letter has no glyph to be drawn with: the chrome channel refuses an origin with any other character, so the Navigator must send hosts in punycode.
+- **Clicks** on chrome pixels go to the WM, never to a window under them; transparent chrome pixels pass through (F4c′).
+- **The chrome channel** (`FRESCOD_CHROME_SOCK`, `fresco_split::chrome`). Reaching the socket is the grant, as for the WM socket. The Navigator asks it to open a document's fresco connection (`OPEN_CLIENT`); frescod answers `OPENED` with a handle and the client end as an fd, and serves the connection with a renderer like any other. `SET_ORIGIN(handle, window, origin)` then names a window without trusting anything the document said; only the connection that opened a handle may set its origins, and handles are never reused.
+- Verified in the amd64 VM with both renderers jailed, using `atrium-chrome-demo`, which plays the Navigator with two documents. Document 2 paints a fake badge in its own window. The strip named `https://bank.example` while document 1 had focus and `https://evil.example:8443` while document 2 had focus, and the ring moved with it (screenshots `frescod-f4d-chrome-*.png`). A click on the strip went to the WM.
+
+Still to do:
+- Tell the WM about the strip, so it places windows below it (forum-wm maximizes into the full screen today, and the strip covers the windows' top 24 px).
+- The chrome is drawn only in split mode, where the chrome channel exists.
+- Secure-input affordances come with F4f.
 
 ### F4e. One GPU VM per window (waits on F1)
 

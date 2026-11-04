@@ -23,6 +23,13 @@ pub enum Recv {
     Eof,
 }
 
+/// What [`Chan::recv_raw`] got.
+pub enum Raw {
+    Rec([u8; MSG_BYTES], Vec<OwnedFd>),
+    Refused(Refused),
+    Eof,
+}
+
 fn cvt(r: libc::c_int) -> io::Result<libc::c_int> {
     if r < 0 { Err(io::Error::last_os_error()) } else { Ok(r) }
 }
@@ -60,8 +67,11 @@ impl Chan {
 
     /// Send one record, with `fds` attached.
     pub fn send(&self, m: &Msg, fds: &[RawFd]) -> io::Result<()> {
+        self.send_bytes(&m.encode(), fds)
+    }
+
+    fn send_bytes(&self, rec: &[u8; MSG_BYTES], fds: &[RawFd]) -> io::Result<()> {
         assert!(fds.len() <= MAX_FDS);
-        let rec = m.encode();
         let mut iov = libc::iovec { iov_base: rec.as_ptr() as *mut _, iov_len: rec.len() };
         let mut cbuf = [0u64; 8];
         // SAFETY: msghdr is plain data; every pointer in it outlives the call.
@@ -90,8 +100,26 @@ impl Chan {
         Ok(())
     }
 
-    /// Wait for one record.
+    /// Wait for one record and parse it as a [`Msg`].
     pub fn recv(&self) -> io::Result<Recv> {
+        Ok(match self.recv_raw()? {
+            Raw::Rec(rec, fds) => match Msg::decode(&rec) {
+                Ok(m) => Recv::Msg(m, fds),
+                Err(e) => Recv::Refused(e),
+            },
+            Raw::Refused(e) => Recv::Refused(e),
+            Raw::Eof => Recv::Eof,
+        })
+    }
+
+    /// Send a record's bytes as they are (another protocol over the same
+    /// framing, such as [`crate::chrome`]).
+    pub fn send_raw(&self, rec: &[u8; MSG_BYTES], fds: &[RawFd]) -> io::Result<()> {
+        self.send_bytes(rec, fds)
+    }
+
+    /// Wait for one record, unparsed.
+    pub fn recv_raw(&self) -> io::Result<Raw> {
         let mut rec = [0u8; MSG_BYTES];
         let mut iov = libc::iovec { iov_base: rec.as_mut_ptr() as *mut _, iov_len: rec.len() };
         let mut cbuf = [0u64; 8];
@@ -128,18 +156,87 @@ impl Chan {
             (n as usize, h.msg_flags)
         };
         if n == 0 && fds.is_empty() {
-            return Ok(Recv::Eof);
+            return Ok(Raw::Eof);
         }
         if flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 || n != MSG_BYTES {
-            return Ok(Recv::Refused(Refused("record truncated or wrong size")));
+            return Ok(Raw::Refused(Refused("record truncated or wrong size")));
         }
         if fds.len() > MAX_FDS {
-            return Ok(Recv::Refused(Refused("too many fds")));
+            return Ok(Raw::Refused(Refused("too many fds")));
         }
-        Ok(match Msg::decode(&rec) {
-            Ok(m) => Recv::Msg(m, fds),
-            Err(e) => Recv::Refused(e),
-        })
+        Ok(Raw::Rec(rec, fds))
+    }
+}
+
+fn sockaddr(path: &std::path::Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: sockaddr_un is plain data.
+    let mut a: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    a.sun_family = libc::AF_UNIX as _;
+    let b = path.as_os_str().as_bytes();
+    if b.len() >= a.sun_path.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "socket path too long"));
+    }
+    for (d, &c) in a.sun_path.iter_mut().zip(b) {
+        *d = c as libc::c_char;
+    }
+    Ok((a, std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t))
+}
+
+/// A listening `SOCK_SEQPACKET` socket at `path` (replacing what is there).
+pub fn listen(path: &std::path::Path) -> io::Result<OwnedFd> {
+    let _ = std::fs::remove_file(path);
+    let (a, len) = sockaddr(path)?;
+    // SAFETY: plain socket calls; the fd is owned from creation.
+    unsafe {
+        let fd = OwnedFd::from_raw_fd(cvt(libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0))?);
+        cvt(libc::bind(fd.as_raw_fd(), &a as *const _ as *const libc::sockaddr, len))?;
+        cvt(libc::listen(fd.as_raw_fd(), 16))?;
+        Ok(fd)
+    }
+}
+
+/// The next connection on a [`listen`] socket, and the peer's uid.
+pub fn accept(listener: &OwnedFd) -> io::Result<(Chan, u32)> {
+    // SAFETY: accept and getpeereid on our own fds.
+    unsafe {
+        let fd = loop {
+            let fd = libc::accept(listener.as_raw_fd(), std::ptr::null_mut(), std::ptr::null_mut());
+            if fd < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break cvt(fd)?;
+        };
+        let fd = OwnedFd::from_raw_fd(fd);
+        libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+        let uid = peer_uid(fd.as_raw_fd())?;
+        Ok((Chan(fd), uid))
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn peer_uid(fd: RawFd) -> io::Result<u32> {
+    let mut c: libc::ucred = std::mem::zeroed();
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    cvt(libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_PEERCRED, &mut c as *mut _ as *mut _, &mut len))?;
+    Ok(c.uid)
+}
+
+#[cfg(not(target_os = "linux"))]
+unsafe fn peer_uid(fd: RawFd) -> io::Result<u32> {
+    let (mut uid, mut gid) = (0, 0);
+    cvt(libc::getpeereid(fd, &mut uid, &mut gid))?;
+    Ok(uid)
+}
+
+/// Connect to a [`listen`] socket.
+pub fn connect(path: &std::path::Path) -> io::Result<Chan> {
+    let (a, len) = sockaddr(path)?;
+    // SAFETY: as in `listen`.
+    unsafe {
+        let fd = OwnedFd::from_raw_fd(cvt(libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0))?);
+        cvt(libc::connect(fd.as_raw_fd(), &a as *const _ as *const libc::sockaddr, len))?;
+        Ok(Chan(fd))
     }
 }
 

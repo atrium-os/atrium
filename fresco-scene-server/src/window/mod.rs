@@ -254,6 +254,11 @@ pub struct ShownLayer {
 /// window cannot catch clicks with a veil too faint to notice.
 pub const MIN_HIT_ALPHA: u8 = 16;
 
+/// The id of frescod's own chrome layer (F4d), drawn above every window.
+/// Never a window's: `create` skips it. A click on a chrome pixel goes to
+/// the WM alone.
+pub const CHROME_LAYER: WindowId = WindowId::MAX;
+
 /// Server-side compositor state. Holds the windows owned by all
 /// clients, dispatches commands to the right window, and tracks
 /// global UI state (focus, cursor position, z-order).
@@ -635,7 +640,7 @@ impl Compositor {
          * after the 65535th, replacing a live window (another client's)
          * in the table. Ids in use are bounded far below u16::MAX. */
         let mut id = self.next_id.max(1);
-        while self.windows.contains_key(&id) {
+        while self.windows.contains_key(&id) || id == CHROME_LAYER {
             id = id.checked_add(1).unwrap_or(1);
         }
         self.next_id = id.checked_add(1).unwrap_or(1);
@@ -991,7 +996,8 @@ impl Compositor {
         for l in shown.iter().rev() {
             let [x0, y0, x1, y1] = l.rect;
             let inside = x >= x0 as f32 && x < x1 as f32 && y >= y0 as f32 && y < y1 as f32;
-            if l.id == 0 || !inside || !self.windows.contains_key(&l.id) {
+            let chrome = l.id == CHROME_LAYER;
+            if l.id == 0 || !inside || (!chrome && !self.windows.contains_key(&l.id)) {
                 continue;
             }
             let local = (x - x0 as f32, y - y0 as f32);
@@ -999,6 +1005,9 @@ impl Compositor {
                 if a(local.0 as u32, local.1 as u32) < MIN_HIT_ALPHA {
                     continue; // nothing visible of this window here
                 }
+            }
+            if chrome {
+                return (0, (x, y)); // the WM's, like the background
             }
             return (l.id, local);
         }

@@ -52,3 +52,17 @@ fn slots_cannot_be_resized_by_their_holder() {
     unsafe { libc::ftruncate(fd.as_raw_fd(), 4096) };
     assert!(Shm::open(fd, 4096).is_err());
 }
+
+#[test]
+fn a_listening_socket_accepts_and_names_its_peer() {
+    let dir = std::env::temp_dir().join(format!("fresco-split-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("chrome.sock");
+    let l = fresco_split::chan::listen(&path).unwrap();
+    let c = fresco_split::chan::connect(&path).unwrap();
+    let (s, uid) = fresco_split::chan::accept(&l).unwrap();
+    assert_eq!(uid, unsafe { libc::getuid() });
+    c.send(&Msg::WindowDestroy { window: 9 }, &[]).unwrap();
+    assert!(matches!(s.recv().unwrap(), Recv::Msg(Msg::WindowDestroy { window: 9 }, _)));
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -38,6 +38,7 @@ mod redraw;
 mod render_backend;
 mod socket_server;
 mod split;
+mod chrome;
 
 use atrium_gpu::amd::{Display, Gpu, Scanout, COMMIT_MODESET};
 
@@ -158,6 +159,12 @@ fn main() -> std::io::Result<()> {
         &sock_path,
         wm_sock.as_deref(),
     )?;
+    if let Some(b) = &split {
+        b.set_subs(event_subs.clone());
+        if let Ok(p) = std::env::var("FRESCOD_CHROME_SOCK") {
+            b.serve_chrome(Path::new(&p))?;
+        }
+    }
     socket_server::spawn_event_fanout(ev_rx, event_subs, redraw.clone(), comp.clone());
 
     /* Native FreeBSD keyboard + pointer input. Both read /dev/hidraw*
@@ -312,6 +319,12 @@ fn run_headless(png: &str) -> std::io::Result<()> {
             hand_off: split.as_ref().map(|b| b.hand_off()),
         },
         &sock, wm_sock.as_deref())?;
+    if let Some(b) = &split {
+        b.set_subs(subs.clone());
+        if let Ok(p) = std::env::var("FRESCOD_CHROME_SOCK") {
+            b.serve_chrome(Path::new(&p))?;
+        }
+    }
     socket_server::spawn_event_fanout(ev_rx, subs, redraw2.clone(), comp.clone());
     eprintln!("frescod-headless: {W}x{H} on {} → {png}.png", sock.display());
 
@@ -428,11 +441,21 @@ fn render_one_frame(
     };
     /* What compose puts on screen, for pointer hit-testing (F4c): each
      * window at its rounded position, at its surface's size. */
-    let rects: Vec<(u32, [i32; 4])> = windows.iter().map(|w| {
+    let mut rects: Vec<(u32, [i32; 4])> = windows.iter().map(|w| {
         let (x, y) = (w.pos.0.round() as i32, w.pos.1.round() as i32);
         let (sw, sh) = render_backend::surface_size(w);
         (w.id, [x, y, x.saturating_add(sw as i32), y.saturating_add(sh as i32)])
     }).collect();
+    /* Trusted chrome (F4d), split mode: frescod's own layer, on top. */
+    if let Some(b) = split {
+        /* The focus read and released first: origin() takes the broker's
+         * window locks, which a renderer's thread takes before comp. */
+        let focus = comp.lock().unwrap().focus;
+        let mut c = chrome::build(screen_w, focus, |id| b.origin(id), &rects);
+        c.size.1 = c.size.1.min(screen_h);
+        rects.push((c.id, [0, 0, c.size.0 as i32, c.size.1 as i32]));
+        windows.push(c);
+    }
     renderer.render(ScreenInput { windows, uploads, clears })?;
     /* Each layer's alpha comes from the frame it was drawn from, so a
      * pixel a window left transparent passes the click on (F4c′). */

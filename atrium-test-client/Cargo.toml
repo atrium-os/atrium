@@ -61,6 +61,11 @@ path = "src/multiwindow_stress.rs"
 name = "atrium-surfaces-demo"
 path = "src/surfaces_demo.rs"
 
+# The trusted chrome (F4d): plays the Navigator over frescod's chrome channel.
+[[bin]]
+name = "atrium-chrome-demo"
+path = "src/chrome_demo.rs"
+
 [[bin]]
 name = "atrium-partial-stress"
 path = "src/partial_stress.rs"
@@ -68,4 +73,5 @@ path = "src/partial_stress.rs"
 [dependencies]
 fresco-client   = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }
+fresco-split    = { path = "../fresco-split" }
 fresco-text     = { path = "../fresco-text" }

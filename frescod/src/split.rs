@@ -41,6 +41,15 @@ struct Win {
 /// One renderer process.
 struct Renderer {
     client_id: u8,
+    /// Names this connection on the chrome channel: unique for frescod's
+    /// lifetime, so a stale handle never names a later client.
+    handle: u32,
+    /// The chrome connection that opened this client, if one did; only it
+    /// may set the client's origins.
+    opener: Option<u64>,
+    /// Origins the opener set, by local window id (set before or after the
+    /// renderer declares the window).
+    origins: Mutex<HashMap<u32, String>>,
     chan: Chan,
     /// Its windows, by its own (local) ids.
     wins: Mutex<HashMap<u32, Win>>,
@@ -62,7 +71,12 @@ pub struct Broker {
     /// The last good frame of every renderer-drawn window, by global id.
     frames: Mutex<HashMap<u32, Arc<fresco_compute::Frame>>>,
     renderers: Mutex<HashMap<u8, Arc<Renderer>>>,
+    subs: Mutex<Option<EventSubs>>,
+    next_handle: std::sync::atomic::AtomicU32,
 }
+
+/// Most connections one chrome peer may open at once.
+const MAX_OPENED: usize = 64;
 
 impl Broker {
     /// `FRESCOD_SPLIT=1` turns split mode on. `FRESCOD_RENDERER_BIN` names
@@ -91,6 +105,8 @@ impl Broker {
             launcher,
             frames: Mutex::new(HashMap::new()),
             renderers: Mutex::new(HashMap::new()),
+            subs: Mutex::new(None),
+            next_handle: std::sync::atomic::AtomicU32::new(1),
         }))
     }
 
@@ -98,11 +114,120 @@ impl Broker {
     pub fn hand_off(self: &Arc<Self>) -> socket_server::HandOff {
         let me = self.clone();
         Arc::new(move |stream, client_id, uid, subs| {
-            if let Err(e) = me.clone().start(stream, client_id, uid, subs) {
+            if let Err(e) = me.clone().start(stream, client_id, uid, subs, None) {
                 eprintln!("frescod: client {client_id}: renderer: {e}");
                 socket_server::free_client_id(client_id);
             }
         })
+    }
+
+    /// The subscriber list connections opened over the chrome channel join.
+    pub fn set_subs(&self, subs: EventSubs) {
+        *self.subs.lock().unwrap() = Some(subs);
+    }
+
+    /// The origin the Navigator set for window `global`, if any.
+    pub fn origin(&self, global: u16) -> Option<String> {
+        let rs: Vec<Arc<Renderer>> = self.renderers.lock().unwrap().values().cloned().collect();
+        for r in rs {
+            let local = r.wins.lock().unwrap().iter().find(|(_, w)| w.global == global).map(|(&l, _)| l);
+            if let Some(l) = local {
+                return r.origins.lock().unwrap().get(&l).cloned();
+            }
+        }
+        None
+    }
+
+    /// Serve the chrome socket at `path` (F4d). Like the WM socket, reaching
+    /// it is the grant: the TCB mounts it only for the Navigator.
+    pub fn serve_chrome(self: &Arc<Self>, path: &std::path::Path) -> io::Result<()> {
+        let l = fresco_split::chan::listen(path)?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666));
+        }
+        eprintln!("frescod: chrome channel on {}", path.display());
+        let me = self.clone();
+        std::thread::Builder::new().name("frescod-chrome-accept".into()).spawn(move || {
+            let mut next = 0u64;
+            loop {
+                match fresco_split::chan::accept(&l) {
+                    Ok((c, uid)) => {
+                        next += 1;
+                        let (me, conn) = (me.clone(), next);
+                        let _ = std::thread::Builder::new().name(format!("frescod-chrome-{conn}")).spawn(move || {
+                            let why = me.chrome(&c, conn, uid);
+                            log::info!("frescod: chrome connection {conn}: {why}");
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("frescod: chrome accept: {e}");
+                        return;
+                    }
+                }
+            }
+        })?;
+        Ok(())
+    }
+
+    /// One chrome connection; returns why it ended.
+    fn chrome(self: &Arc<Self>, c: &Chan, conn: u64, uid: u32) -> String {
+        use fresco_split::chan::Raw;
+        use fresco_split::chrome::ChromeMsg;
+        loop {
+            let m = match c.recv_raw() {
+                Ok(Raw::Rec(rec, fds)) if fds.is_empty() => match ChromeMsg::decode(&rec) {
+                    Ok(m) => m,
+                    Err(e) => return format!("refused a record: {}", e.0),
+                },
+                Ok(Raw::Rec(..)) => return "a record with fds".into(),
+                Ok(Raw::Refused(e)) => return format!("refused a record: {}", e.0),
+                Ok(Raw::Eof) => return "closed".into(),
+                Err(e) => return e.to_string(),
+            };
+            match m {
+                ChromeMsg::OpenClient => {
+                    let opened = self.renderers.lock().unwrap().values().filter(|r| r.opener == Some(conn)).count();
+                    if opened >= MAX_OPENED {
+                        return format!("more than {MAX_OPENED} connections open");
+                    }
+                    let Some(subs) = self.subs.lock().unwrap().clone() else { return "not ready".into() };
+                    let Some(client_id) = socket_server::alloc_client_id() else { return "no client id free".into() };
+                    let (ours, theirs) = match UnixStream::pair() {
+                        Ok(p) => p,
+                        Err(e) => return e.to_string(),
+                    };
+                    let handle = match self.clone().start(ours, client_id, Some(uid), subs, Some(conn)) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            socket_server::free_client_id(client_id);
+                            return format!("renderer: {e}");
+                        }
+                    };
+                    if let Err(e) = c.send_raw(&ChromeMsg::Opened { handle }.encode(), &[theirs.as_raw_fd()]) {
+                        return e.to_string();
+                    }
+                }
+                ChromeMsg::SetOrigin { handle, window, origin } => {
+                    let r = self.renderers.lock().unwrap().values().find(|r| r.handle == handle).cloned();
+                    match r {
+                        Some(r) if r.opener == Some(conn) => {
+                            let mut o = r.origins.lock().unwrap();
+                            if origin.is_empty() {
+                                o.remove(&window);
+                            } else if o.len() < MAX_WINDOWS as usize || o.contains_key(&window) {
+                                o.insert(window, origin);
+                            }
+                            self.redraw.wake();
+                        }
+                        // A connection that has gone, or one this peer did
+                        // not open: nothing to set.
+                        _ => log::debug!("frescod: chrome {conn}: origin for handle {handle} ignored"),
+                    }
+                }
+                ChromeMsg::Opened { .. } => return "sent a broker's record".into(),
+            }
+        }
     }
 
     /// The frame to compose for window `id`, if a renderer draws it.
@@ -138,7 +263,7 @@ impl Broker {
         if v >= 1.0 { (v as u32).clamp(1, MAX_WINDOW_DIM) } else { screen }
     }
 
-    fn start(self: Arc<Self>, stream: UnixStream, client_id: u8, uid: Option<u32>, subs: EventSubs) -> io::Result<()> {
+    fn start(self: Arc<Self>, stream: UnixStream, client_id: u8, uid: Option<u32>, subs: EventSubs, opener: Option<u64>) -> io::Result<u32> {
         let (ours, theirs) = Chan::pair()?;
         let mut cmd = match &self.launcher {
             Some(l) => {
@@ -158,7 +283,16 @@ impl Broker {
         drop(stream);
         log::info!("frescod: client {client_id} (uid {uid:?}) -> renderer pid {}", child.id());
 
-        let r = Arc::new(Renderer { client_id, chan: ours, wins: Mutex::new(HashMap::new()), child: Mutex::new(child) });
+        let handle = self.next_handle.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let r = Arc::new(Renderer {
+            client_id,
+            handle,
+            opener,
+            origins: Mutex::new(HashMap::new()),
+            chan: ours,
+            wins: Mutex::new(HashMap::new()),
+            child: Mutex::new(child),
+        });
         self.renderers.lock().unwrap().insert(client_id, r.clone());
 
         // Its windows' events, as records.
@@ -183,7 +317,7 @@ impl Broker {
             log::info!("frescod: client {client_id}: renderer gone: {why}");
             self.reap(&r, &subs);
         })?;
-        Ok(())
+        Ok(handle)
     }
 
     /// Serve one renderer's records until it goes or misbehaves; returns why.
