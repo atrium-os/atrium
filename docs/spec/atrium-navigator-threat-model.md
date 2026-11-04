@@ -323,6 +323,26 @@ saves a jail and a copy. Keeping them apart keeps the worker's output passing th
 validator, which semantics and accessibility still need. *Recommend: separate at first,
 because the validator is already built. Merge only if the measured cost says so.*
 
+**It stays a scene-graph compositor, not a Wayland-style one.** *(User question, 2026-11-04.)*
+In Wayland the client renders its own pixels and the compositor only stacks buffers. Here:
+- **The app never renders.** It sends a scene graph, as Fresco was designed for. The
+  per-window renderer is *system* code (today's Fresco scene renderer, instantiated per
+  window), not app code, and the pixels come from our kernels.
+- **The surface is a cache, not the app's output.** The system can re-render a window from
+  its retained scene at any scale, theme or text size, for example for zoom or an overview,
+  without asking the app.
+- **Semantics survive.** Each renderer exports its window's semantic tree (accessibility,
+  text selection, search) to the services that consume it, over a validated channel. It is
+  the same data as before, now one tree per window instead of one global tree.
+- **What changes is that no global scene exists in one address space.** System features
+  that need several windows' *content* (cross-window search, a full accessibility view) go
+  through those per-window exports rather than reading a shared scene. Glyph atlases and
+  other caches are per window, which costs some memory. A shared cache would be §7.3's
+  side channel anyway.
+- **The Wayland-like exception is deliberate.** GPU-heavy apps (§2.5.3) do render their
+  own buffers, because their shaders are their content. They are the exception, and
+  ordinary apps and the Navigator stay scene-graph clients.
+
 **Costs and limits, stated.**
 - **Memory.** One surface BO per window. Every modern compositor already keeps a backing
   store per window (macOS, Wayland), so this is the normal cost, not a new one.
