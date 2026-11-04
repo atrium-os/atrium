@@ -3740,6 +3740,28 @@ mod tests {
     }
 
     #[test]
+    fn a_minmax_fr_row_in_an_auto_height_grid_holds_its_content() {
+        // BBC News: `grid-template-rows: min-content minmax(0, 1fr)` on a
+        // grid with no height. With indefinite free space a flexible track
+        // sizes to its content (Grid §12.7.1) — the 0 minimum is only its
+        // floor. Taken as 0, the second row's card hung below the grid and
+        // the next section painted over it.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 100px; grid-template-rows: min-content minmax(0, 1fr) }
+            .a { height: 10px; background-color: #ff0000 } .b { height: 30px; background-color: #00ff00 }
+            .after { height: 5px; background-color: #0000ff }</style>
+            <div class="g"><div class="a"></div><div class="b"></div></div><div class="after"></div>"#);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(0, 10, 100, 30)]);
+        assert_eq!(boxes(&o, 0x0000ffff), vec![(0, 40, 792, 5)], "the next block starts below the fr row");
+        // Control: with a definite height the fr row takes the leftover.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 100px; height: 100px; grid-template-rows: min-content minmax(0, 1fr) }
+            .a { height: 10px; background-color: #ff0000 } .b { background-color: #00ff00 }</style>
+            <div class="g"><div class="a"></div><div class="b"></div></div>"#);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(0, 10, 100, 90)]);
+    }
+
+    #[test]
     fn a_negative_grid_line_counts_from_the_end() {
         // `1 / -1` is the full-width idiom: every column, whatever the count.
         let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
@@ -4084,13 +4106,20 @@ fn size_tracks(tracks: &[navigator_style::values::Track], avail: Option<U>, gap:
             // content (§12.7.1); with definite space it starts at zero and
             // takes its share below.
             Track::Fr(_) => if avail.is_none() { get(maxs, i) } else { 0 },
-            Track::MinMax(a, _) => match &**a {
-                Track::Len(l) => u(l.v),
-                Track::Pct(p) => pct(*p),
-                Track::MinContent | Track::Auto => get(mins, i),
-                Track::MaxContent => get(maxs, i),
-                _ => 0,
-            },
+            Track::MinMax(a, b) => {
+                let floor = match &**a {
+                    Track::Len(l) => u(l.v),
+                    Track::Pct(p) => pct(*p),
+                    Track::MinContent | Track::Auto => get(mins, i),
+                    Track::MaxContent => get(maxs, i),
+                    _ => 0,
+                };
+                // ★ The same holds for `minmax(x, 1fr)`: the minimum is only
+                // a floor. Taking it alone sized BBC News's
+                // `minmax(0, 1fr)` row at 0 in an auto-height grid, and the
+                // card in it painted over the next section.
+                if matches!(**b, Track::Fr(_)) && avail.is_none() { floor.max(get(maxs, i)) } else { floor }
+            }
         }
     };
     let limit = |t: &Track, i: usize| -> U {
