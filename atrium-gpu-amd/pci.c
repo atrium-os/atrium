@@ -193,10 +193,25 @@ atrium_amd_pci_detach(device_t dev)
 	return (0);
 }
 
+/*
+ * Shutdown or reboot: the device must stop writing guest memory before the
+ * next kernel reuses it. The IH ring keeps receiving cookies (vblank at
+ * 60 Hz, late EOPs) at the page this kernel gave it, and on a warm reboot that
+ * page belongs to someone else. Clearing Bus Master is what stops a PCI
+ * device's DMA; the next attach FLRs and enables it again.
+ */
+static int
+atrium_amd_pci_shutdown(device_t dev)
+{
+	pci_disable_busmaster(dev);
+	return (0);
+}
+
 static device_method_t atrium_amd_pci_methods[] = {
 	DEVMETHOD(device_probe,		atrium_amd_pci_probe),
 	DEVMETHOD(device_attach,	atrium_amd_pci_attach),
 	DEVMETHOD(device_detach,	atrium_amd_pci_detach),
+	DEVMETHOD(device_shutdown,	atrium_amd_pci_shutdown),
 
 	/* Bus passthrough so children can route resource/interrupt requests
 	 * (e.g. the GPU child's MSI-X) up to the real PCI bus. */

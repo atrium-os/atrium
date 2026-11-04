@@ -280,20 +280,32 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		    (struct atrium_gpu_syncobj_wait *)data;
 		struct atrium_amd_syncobj *so;
 		struct file *fp;
-		int deadline, slice;
+		sbintime_t end;
+		int serr = 0;
 
 		err = amd_syncobj_fget(td, w->syncobj_fd, &fp, &so);
 		if (err != 0)
 			return (err);
-		deadline = ticks + (int)(((uint64_t)w->timeout_ms * hz) / 1000);
+		/* An absolute deadline in sbintime: no int-ticks overflow on
+		 * long timeouts (review §A2.6), and a signal interrupts it. */
+		end = sbinuptime() + (sbintime_t)w->timeout_ms * SBT_1MS;
 		mtx_lock(&so->lock);
-		while (so->value < w->value) {
-			slice = deadline - ticks;
-			if (slice <= 0)
+		while (so->value < w->value && so->error == 0 &&
+		    w->timeout_ms != 0) {
+			serr = msleep_sbt(&so->value, &so->lock, PCATCH,
+			    "amdsyncw", end, 0, C_ABSOLUTE);
+			if (serr != 0)
 				break;
-			msleep(&so->value, &so->lock, 0, "amdsyncw", slice);
 		}
-		err = (so->value >= w->value) ? 0 : EWOULDBLOCK;
+		/* The work that would signal it was lost: its error (EIO). */
+		if (so->value >= w->value)
+			err = 0;
+		else if (so->error != 0)
+			err = so->error;
+		else if (serr == EINTR || serr == ERESTART)
+			err = serr;
+		else
+			err = EWOULDBLOCK;
 		mtx_unlock(&so->lock);
 		fdrop(fp, td);
 		return (err);
@@ -337,24 +349,19 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 			 * so the ISR still finds it. Pushing first is what makes
 			 * both cases correct.
 			 */
-			if (s->signal_syncobj_fd >= 0) {
+			if (s->signal_syncobj_fd >= 0)
 				err = amd_syncobj_fget(td,
 				    s->signal_syncobj_fd, &sfp, &so);
-				if (err == 0)
-					amd_pending_push(sc, so,
-					    s->signal_value);
-			}
 			if (err == 0) {
 				/* The backend stages the frame deadline,
-				 * programs the queue and rings it under the
-				 * queue's lock (frame pacing: the firmware
+				 * programs the queue, registers the completion
+				 * on that queue's list and rings it, all under
+				 * the queue's lock (frame pacing: the firmware
 				 * scheduler drains earliest-deadline-first). */
 				err = sc->backend->submit(sc, client, bo,
-				    s->n_dwords, s->engine, vm, s->deadline_ns);
+				    s->n_dwords, s->engine, vm, s->deadline_ns,
+				    so, s->signal_value);
 			}
-			/* Submit never reached the GPU -> reclaim the entry. */
-			if (err != 0 && so != NULL)
-				amd_pending_scrub(sc, so);
 			if (sfp != NULL)
 				fdrop(sfp, td);
 		}
@@ -445,7 +452,6 @@ atrium_amd_ctl_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
     struct thread *td)
 {
 	struct atrium_amd_softc *sc = cdev->si_drv1;
-	int err;
 
 	switch (cmd) {
 	case ATRIUM_GPU_IOC_GPU_RESET: {
@@ -456,21 +462,15 @@ atrium_amd_ctl_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		 * runs when a submission is lost (a forever-unsatisfied cross-queue
 		 * WAIT, a hang). GPUVM page tables survive the reset, so open VMs
 		 * and their BOs stay valid; the next submit re-maps its queue onto
-		 * the clean engine. Drop any pending completions — the reset
-		 * abandoned the work that would have signalled them, so they must
-		 * not be mis-attributed to a later interrupt.
+		 * the clean engine. Completions still owed fail with EIO — the
+		 * reset abandoned the work that would have signalled them, so
+		 * they must not be mis-attributed to a later interrupt.
 		 */
 		if (sc->backend->gpu_reset == NULL)
 			return (EOPNOTSUPP);
-		err = sc->backend->gpu_reset(sc);
-		if (err == 0) {
-			/* The reset abandoned in-flight work; drop the completions
-			 * the ISR still owed so a later interrupt isn't misattributed. */
-			mtx_lock(&sc->lock);
-			sc->n_pending = 0;
-			mtx_unlock(&sc->lock);
-		}
-		return (err);
+		/* The reset's prepare hook stops every queue, which fails the
+		 * completions they owed (waiters get EIO, not a timeout). */
+		return (sc->backend->gpu_reset(sc));
 	}
 
 	case ATRIUM_GPU_IOC_SCHED: {

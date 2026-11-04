@@ -339,7 +339,8 @@ struct atrium_gpu_backend_ops {
 	int	(*submit)(struct atrium_amd_softc *sc,
 		    struct atrium_amd_client *client, struct atrium_amd_bo *ring,
 		    uint32_t n_dwords, uint32_t engine, struct atrium_amd_vm *vm,
-		    uint32_t deadline_ns);
+		    uint32_t deadline_ns, struct atrium_amd_syncobj *so,
+		    uint64_t signal_value);
 	/* Export a BO as a scanout handle (amd: absolute VRAM offset + size; only
 	 * VRAM is scannable). EINVAL if the BO can't be scanned out. */
 	int	(*export_scanout)(struct atrium_amd_bo *bo, uint64_t *vram_offset,
@@ -464,6 +465,7 @@ struct atrium_amd_syncobj {
 	struct mtx	 lock;	/* guards value + the knote list */
 	struct selinfo	 sel;	/* sel.si_note = the kqueue knlist */
 	uint64_t	 value;
+	int		 error;	/* sticky: a completion owed here was lost (EIO) */
 };
 
 /*
@@ -474,11 +476,25 @@ struct atrium_amd_syncobj {
  * doorbell unblocks it, not inline. The syncobj's fo_close scrubs its entries
  * under sc->lock, which serializes against the ISR (no refcount / no ISR free).
  */
+#define ATRIUM_AMD_MAX_PENDING	16	/* signalled submits in flight per queue */
 struct atrium_amd_pending {
 	struct atrium_amd_syncobj *so;
 	uint64_t	 value;
 };
-#define ATRIUM_AMD_MAX_PENDING	16
+
+/*
+ * The completions one hardware queue owes, in submission order (review
+ * §A2.2). An EOP cookie names its queue (ring_id), so it retires the head of
+ * that queue's list only. Guarded by sc->lock (the ISR walks it).
+ * `progress` is the tick of the queue's last sign of life (a submit, an EOP,
+ * or the watchdog seeing its read pointer move), for the hang watchdog.
+ */
+struct atrium_amd_qpend {
+	struct atrium_amd_pending e[ATRIUM_AMD_MAX_PENDING];
+	int		 head, n;
+	int		 progress;
+	uint32_t	 last_rptr;
+};
 #define ATRIUM_AMD_IH_CAUSE_EOP	1	/* IH cookie cause: end-of-pipe (device.rs) */
 #define ATRIUM_AMD_IH_CAUSE_VBLANK 2	/* IH cookie cause: DCN vertical blank */
 #define ATRIUM_AMD_IH_CAUSE_FLIP 3	/* IH cookie cause: DCN flip landed on screen */
@@ -537,6 +553,7 @@ struct atrium_amd_reset_hooks {
  */
 #define ATRIUM_AMD_NHWQ		2
 #define ATRIUM_AMD_QUEUE_WAIT_MS 2000	/* wait for another VM's work to drain */
+#define ATRIUM_AMD_HANG_MS	5000	/* default watchdog limit (sysctl hang_ms) */
 
 struct atrium_amd_client {
 	struct atrium_amd_softc *sc;
@@ -583,6 +600,8 @@ struct atrium_amd_isolation_stats {
 	uint64_t	 revokes;	/* doorbell grants revoked */
 	uint64_t	 deferred;	/* BO frees deferred */
 	uint64_t	 reaped;	/* deferred BO frees completed */
+	uint64_t	 hangs;		/* queues the watchdog stopped */
+	uint64_t	 fences_failed;	/* completions failed with EIO */
 	int		 deferred_now;	/* deferred BO frees outstanding */
 	int		 grants_live;	/* grant pager objects alive */
 };
@@ -673,8 +692,8 @@ struct atrium_amd_softc {
 	u_int		 irq_count;	/* interrupts serviced (atomic vs reader) */
 	struct mtx	 lock;		/* guards fence-wait sleep/wakeup + pending */
 	int		 lock_inited;
-	struct atrium_amd_pending pending[ATRIUM_AMD_MAX_PENDING];
-	int		 n_pending;	/* completions the ISR owes (FIFO) */
+	struct atrium_amd_qpend qpend[ATRIUM_AMD_NHWQ]; /* owed, per queue */
+	uint32_t	 ih_eop_ring[ATRIUM_AMD_NHWQ]; /* this ISR pass's EOPs */
 
 	uint32_t	 vmid_bitmap;	/* allocated VMIDs (bit N = VMID N in use) */
 	int		 vm_count;	/* live vm_fds */
@@ -691,6 +710,9 @@ struct atrium_amd_softc {
 	TAILQ_HEAD(, atrium_amd_deferred) deferred;
 	struct timeout_task defer_task;
 	struct atrium_amd_isolation_stats iso;
+	struct timeout_task watchdog_task;
+	int		 hang_ms;	/* no progress this long = hung */
+	int		 watchdog_armed; /* watchdog_task scheduled (sc->lock) */
 	uint64_t	 vram_next;	/* VRAM bump allocator cursor (base-managed) */
 };
 
@@ -844,7 +866,8 @@ int	 amd_hwq_busy_refs(struct atrium_amd_softc *sc);
 int	 amd_hwq_submit(struct atrium_amd_softc *sc,
 	    struct atrium_amd_client *client, struct atrium_amd_bo *ring,
 	    uint32_t n_dwords, uint32_t engine, struct atrium_amd_vm *vm,
-	    uint32_t deadline_ns);
+	    uint32_t deadline_ns, struct atrium_amd_syncobj *so,
+	    uint64_t signal_value);
 int	 amd_hwq_map(struct atrium_amd_softc *sc,
 	    struct atrium_amd_client *client, struct atrium_amd_vm *vm,
 	    uint64_t ring_va, uint32_t engine, uint32_t *doorbell_off);
@@ -890,6 +913,7 @@ int	 amd_syncobj_create_fd(struct atrium_amd_softc *sc, struct thread *td,
 int	 amd_syncobj_fget(struct thread *td, int fd, struct file **out_fp,
 	    struct atrium_amd_syncobj **out_so);
 void	 amd_syncobj_signal(struct atrium_amd_syncobj *so, uint64_t value);
+void	 amd_syncobj_fail(struct atrium_amd_syncobj *so, int error);
 extern const struct fileops atrium_amd_syncobj_fileops;
 
 /* ih.c (BASE module) — MSI-X interrupt setup + the device-global IH ring ISR */
@@ -897,15 +921,18 @@ int	 amd_irq_setup(struct atrium_amd_softc *sc);
 void	 amd_irq_teardown(struct atrium_amd_softc *sc);
 
 /*
- * irq.c (GPU module) — the EOP cause handler + its pending-completion list. The
- * base ISR routes IH_CAUSE_EOP here (registered via amd_ih_set_handler). Called
- * with sc->lock HELD: retires `count` end-of-pipe completions onto their
- * syncobjs and wakes fence waiters. The pending FIFO is pushed before a submit's
- * doorbell and scrubbed by a syncobj's fo_close.
+ * irq.c (GPU module) — the EOP cause handler + the per-queue pending lists. The
+ * base ISR routes IH_CAUSE_EOP here (registered via amd_ih_set_handler), with
+ * sc->ih_eop_ring[] holding this pass's EOPs per queue. Called with sc->lock
+ * HELD: retires each queue's completions onto their syncobjs in order. An entry
+ * is pushed (sc->lock held) before its submit's doorbell, failed with EIO when
+ * its queue is stopped or hangs, and scrubbed by a syncobj's fo_close.
  */
 void	 amd_eop_handler(struct atrium_amd_softc *sc, int count);
-void	 amd_pending_push(struct atrium_amd_softc *sc,
+int	 amd_pending_push_locked(struct atrium_amd_softc *sc, uint32_t qid,
 	    struct atrium_amd_syncobj *so, uint64_t value);
+int	 amd_pending_fail_locked(struct atrium_amd_softc *sc, uint32_t qid,
+	    int error);
 void	 amd_pending_scrub(struct atrium_amd_softc *sc,
 	    struct atrium_amd_syncobj *so);
 

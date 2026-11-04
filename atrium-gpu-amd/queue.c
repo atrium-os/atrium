@@ -27,6 +27,12 @@
  *            grant, and the kernel removes the page from every mapping when it
  *            releases the queue.
  *
+ *   A2.2/A2.6  Completions are owed per queue (irq.c), and a watchdog stops
+ *            a kernel-rung queue that shows no progress for hang_ms (default
+ *            ATRIUM_AMD_HANG_MS): no read-pointer movement and no EOP. Stopping
+ *            a queue, for any reason, fails what it owed with EIO, so a waiter
+ *            learns its work is gone and the next VM gets the queue.
+ *
  * Lock order: hwq->lock (sx), then a pager object's lock or sc->defer_lock,
  * then sc->lock. Nothing here sleeps holding sc->lock or defer_lock.
  */
@@ -42,6 +48,7 @@
 #include <vm/vm_phys.h>
 
 #define AMD_REAP_TICKS	MAX(1, hz / 100)	/* poll deferred frees every ~10 ms */
+#define AMD_WATCHDOG_TICKS MAX(1, hz / 10)	/* look for hangs every ~100 ms */
 
 static uint32_t
 amd_hwq_rptr(struct atrium_amd_softc *sc, struct atrium_amd_hwq *q)
@@ -50,11 +57,35 @@ amd_hwq_rptr(struct atrium_amd_softc *sc, struct atrium_amd_hwq *q)
 	    q->qid * ATRIUM_AMD_Q_STRIDE + ATRIUM_AMD_QF_RPTR));
 }
 
+/* Does the queue still owe a completion (an EOP not yet seen)? */
+static bool
+amd_hwq_owes(struct atrium_amd_softc *sc, struct atrium_amd_hwq *q)
+{
+	bool owes;
+
+	mtx_lock(&sc->lock);
+	owes = sc->qpend[q->qid].n > 0;
+	mtx_unlock(&sc->lock);
+	return (owes);
+}
+
+/* Has the CP not yet fetched everything the kernel rang? Lock held. */
+static bool
+amd_hwq_fetching(struct atrium_amd_softc *sc, struct atrium_amd_hwq *q)
+{
+	sx_assert(&q->lock, SA_LOCKED);
+	if (q->vmid == 0 || q->wptr == 0)
+		return (false);
+	return (amd_hwq_rptr(sc, q) < q->wptr);
+}
+
 /*
  * Could the queue still be executing (or about to execute) work? A queue a
  * client owns is always busy: userspace rings it directly, so the kernel does
  * not know its write pointer. A kernel-rung queue is busy while its read
- * pointer trails the last write pointer the kernel rang. Lock held.
+ * pointer trails the last write pointer the kernel rang, or while it owes an
+ * end-of-pipe: the CP can be past the last packet with shaders still running
+ * (and gpusim's shaping mode defers the EOP on purpose). Lock held.
  */
 static bool
 amd_hwq_busy(struct atrium_amd_softc *sc, struct atrium_amd_hwq *q)
@@ -62,9 +93,37 @@ amd_hwq_busy(struct atrium_amd_softc *sc, struct atrium_amd_hwq *q)
 	sx_assert(&q->lock, SA_LOCKED);
 	if (q->owner != NULL)
 		return (true);
-	if (q->vmid == 0 || q->wptr == 0)
-		return (false);
-	return (amd_hwq_rptr(sc, q) < q->wptr);
+	return (amd_hwq_fetching(sc, q) || amd_hwq_owes(sc, q));
+}
+
+/*
+ * May the queue be reprogrammed for `vmid` now? Never while the CP is still
+ * fetching (reprogramming drops the rest of the ring). Work the same VM still
+ * owes an EOP for may be followed by more of its own work, which retires in
+ * order behind it; another VM must wait for the queue to be fully idle.
+ */
+static bool
+amd_hwq_blocks(struct atrium_amd_softc *sc, struct atrium_amd_hwq *q,
+    uint16_t vmid)
+{
+	if (amd_hwq_fetching(sc, q))
+		return (true);
+	return (q->vmid != vmid && amd_hwq_owes(sc, q));
+}
+
+/* Make sure the hang watchdog is running (there is kernel-rung work). */
+static void
+amd_hwq_arm_watchdog(struct atrium_amd_softc *sc)
+{
+	bool arm;
+
+	mtx_lock(&sc->lock);
+	arm = !sc->watchdog_armed;
+	sc->watchdog_armed = 1;
+	mtx_unlock(&sc->lock);
+	if (arm)
+		taskqueue_enqueue_timeout(taskqueue_thread, &sc->watchdog_task,
+		    AMD_WATCHDOG_TICKS);
 }
 
 static struct atrium_amd_hwq *
@@ -187,11 +246,50 @@ amd_hwq_dequeue(struct atrium_amd_softc *sc, struct atrium_amd_hwq *q)
 	q->vmid = 0;
 	q->wptr = 0;
 	q->gen++;
-	if (busy) {
-		mtx_lock(&sc->lock);
+	mtx_lock(&sc->lock);
+	/* The stopped work will raise no EOP: fail what it owed. */
+	amd_pending_fail_locked(sc, q->qid, EIO);
+	if (busy)
 		sc->iso.dequeues++;
-		mtx_unlock(&sc->lock);
+	mtx_unlock(&sc->lock);
+}
+
+static int amd_hwq_hang_limit(struct atrium_amd_softc *sc);
+
+/*
+ * The hang check (review §A2.6): has this busy kernel-rung queue shown no
+ * progress (read pointer movement or an EOP) for hang_ms? If so stop it,
+ * which fails what it owed. Run by the watchdog and by a submitter waiting
+ * for the queue, since the waiter holds the lock the watchdog would need.
+ * Returns true if the queue was stopped. Lock held exclusive.
+ */
+static bool
+amd_hwq_check_hang(struct atrium_amd_softc *sc, struct atrium_amd_hwq *q)
+{
+	struct atrium_amd_qpend *qp = &sc->qpend[q->qid];
+	int limit = amd_hwq_hang_limit(sc);
+	bool hung = false;
+	uint32_t rptr;
+
+	sx_assert(&q->lock, SA_XLOCKED);
+	if (q->owner != NULL || !amd_hwq_busy(sc, q))
+		return (false);
+	rptr = q->vmid != 0 ? amd_hwq_rptr(sc, q) : 0;
+	mtx_lock(&sc->lock);
+	if (rptr != qp->last_rptr) {
+		qp->last_rptr = rptr;
+		qp->progress = ticks;
+	} else if (ticks - qp->progress >= limit) {
+		hung = true;
+		sc->iso.hangs++;
 	}
+	mtx_unlock(&sc->lock);
+	if (hung) {
+		device_printf(sc->dev, "queue %u (VMID %u) made no progress "
+		    "for %d ms: stopped\n", q->qid, q->vmid, sc->hang_ms);
+		amd_hwq_dequeue(sc, q);
+	}
+	return (hung);
 }
 
 /*
@@ -199,12 +297,15 @@ amd_hwq_dequeue(struct atrium_amd_softc *sc, struct atrium_amd_hwq *q)
  * sleep is the point: no one else may program or ring it meanwhile.
  */
 static int
-amd_hwq_wait_idle(struct atrium_amd_softc *sc, struct atrium_amd_hwq *q)
+amd_hwq_wait_idle(struct atrium_amd_softc *sc, struct atrium_amd_hwq *q,
+    uint16_t vmid)
 {
 	int waited = 0, ms;
 
 	sx_assert(&q->lock, SA_XLOCKED);
-	for (ms = 0; amd_hwq_busy(sc, q); ms++) {
+	for (ms = 0; amd_hwq_blocks(sc, q, vmid); ms++) {
+		if (ms % 10 == 0 && amd_hwq_check_hang(sc, q))
+			break;
 		if (ms >= ATRIUM_AMD_QUEUE_WAIT_MS)
 			return (EBUSY);
 		if (!waited) {
@@ -343,13 +444,70 @@ amd_hwq_reap_task(void *arg, int pending __unused)
 }
 
 /* ---------------------------------------------------------------------------
+ * The hang watchdog (review §A2.6).
+ *
+ * Runs every ~100 ms while any kernel-rung queue is busy. A queue makes
+ * progress when its read pointer moves or it raises an EOP; one that has made
+ * none for hang_ms is hung (a ring parked on a wait nobody satisfies, a
+ * faulted ring, or work whose EOP never comes). It is stopped like any other
+ * dequeue: what it owed fails with EIO and the next VM can have the queue.
+ * A queue a client owns is left alone: userspace rings it, so the kernel
+ * cannot tell idle from stuck, and the owner can only stall itself.
+ */
+static int
+amd_hwq_hang_limit(struct atrium_amd_softc *sc)
+{
+	int ms;
+
+	mtx_lock(&sc->lock);
+	ms = sc->hang_ms;
+	mtx_unlock(&sc->lock);
+	return (MAX(1, (int)(((int64_t)ms * hz) / 1000)));
+}
+
+static void
+amd_hwq_watchdog(struct atrium_amd_softc *sc)
+{
+	int i, active = 0;
+
+	for (i = 0; i < ATRIUM_AMD_NHWQ; i++) {
+		struct atrium_amd_hwq *q = &sc->hwq[i];
+
+		/* A submitter holding the queue runs the same check while it
+		 * waits (amd_hwq_wait_idle); look again next round. */
+		if (!sx_try_xlock(&q->lock)) {
+			active = 1;
+			continue;
+		}
+		if (!amd_hwq_check_hang(sc, q) && q->owner == NULL &&
+		    amd_hwq_busy(sc, q))
+			active = 1;
+		sx_xunlock(&q->lock);
+	}
+	mtx_lock(&sc->lock);
+	sc->watchdog_armed = active;
+	mtx_unlock(&sc->lock);
+	if (active)
+		taskqueue_enqueue_timeout(taskqueue_thread, &sc->watchdog_task,
+		    AMD_WATCHDOG_TICKS);
+	amd_hwq_reap(sc);
+}
+
+static void
+amd_hwq_watchdog_task(void *arg, int pending __unused)
+{
+	amd_hwq_watchdog(arg);
+}
+
+/* ---------------------------------------------------------------------------
  * The entry points.
  */
 
 int
 amd_hwq_submit(struct atrium_amd_softc *sc, struct atrium_amd_client *client,
     struct atrium_amd_bo *ring, uint32_t n_dwords, uint32_t engine,
-    struct atrium_amd_vm *vm, uint32_t deadline_ns)
+    struct atrium_amd_vm *vm, uint32_t deadline_ns,
+    struct atrium_amd_syncobj *so, uint64_t signal_value)
 {
 	struct atrium_amd_hwq *q;
 	uint32_t doorbell_off;
@@ -374,12 +532,23 @@ amd_hwq_submit(struct atrium_amd_softc *sc, struct atrium_amd_client *client,
 			amd_hwq_count_refused(sc);
 			return (EBUSY);
 		}
-	} else if ((err = amd_hwq_wait_idle(sc, q)) != 0) {
+	} else if ((err = amd_hwq_wait_idle(sc, q, vm->vmid)) != 0) {
 		sx_xunlock(&q->lock);
 		amd_hwq_count_refused(sc);
 		return (err);
 	}
-	/* Stage the frame deadline, program, ring: one atomic sequence. */
+	/* Room for the completion? Only the ISR changes the list while we
+	 * hold the queue, and it only shortens it. */
+	if (so != NULL) {
+		mtx_lock(&sc->lock);
+		err = sc->qpend[q->qid].n >= ATRIUM_AMD_MAX_PENDING ? EBUSY : 0;
+		mtx_unlock(&sc->lock);
+		if (err != 0) {
+			sx_xunlock(&q->lock);
+			return (err);
+		}
+	}
+	/* Stage the frame deadline, program, register, ring: one sequence. */
 	if (sc->regs != NULL)
 		amd_mmio_write32(sc, regCP_SUBMIT_DEADLINE_NS, deadline_ns);
 	err = amd_queue_program(sc, ring_va, engine, vm->vmid, &doorbell_off);
@@ -387,9 +556,18 @@ amd_hwq_submit(struct atrium_amd_softc *sc, struct atrium_amd_client *client,
 		q->vmid = vm->vmid;
 		q->wptr = n_dwords;
 		q->gen++;
+		mtx_lock(&sc->lock);
+		if (so != NULL)
+			(void)amd_pending_push_locked(sc, q->qid, so,
+			    signal_value);
+		sc->qpend[q->qid].progress = ticks;
+		sc->qpend[q->qid].last_rptr = 0;
+		mtx_unlock(&sc->lock);
 		bus_write_4(sc->doorbell, doorbell_off, n_dwords);
 	}
 	sx_xunlock(&q->lock);
+	if (err == 0)
+		amd_hwq_arm_watchdog(sc);
 	return (err);
 }
 
@@ -410,7 +588,8 @@ amd_hwq_map(struct atrium_amd_softc *sc, struct atrium_amd_client *client,
 		amd_hwq_count_refused(sc);
 		return (EBUSY);
 	}
-	if (q->owner == NULL && (err = amd_hwq_wait_idle(sc, q)) != 0) {
+	if (q->owner == NULL &&
+	    (err = amd_hwq_wait_idle(sc, q, vm->vmid)) != 0) {
 		sx_xunlock(&q->lock);
 		amd_hwq_count_refused(sc);
 		return (err);
@@ -591,6 +770,26 @@ amd_iso_sysctl_int(SYSCTL_HANDLER_ARGS)
 	return (sysctl_handle_int(oidp, &v, 0, req));
 }
 
+static int
+amd_iso_sysctl_hang_ms(SYSCTL_HANDLER_ARGS)
+{
+	struct atrium_amd_softc *sc = arg1;
+	int v, err;
+
+	mtx_lock(&sc->lock);
+	v = sc->hang_ms;
+	mtx_unlock(&sc->lock);
+	err = sysctl_handle_int(oidp, &v, 0, req);
+	if (err != 0 || req->newptr == NULL)
+		return (err);
+	if (v < 100 || v > 600000)
+		return (EINVAL);
+	mtx_lock(&sc->lock);
+	sc->hang_ms = v;
+	mtx_unlock(&sc->lock);
+	return (0);
+}
+
 int
 amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 {
@@ -615,6 +814,11 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 	TAILQ_INIT(&sc->deferred);
 	TIMEOUT_TASK_INIT(taskqueue_thread, &sc->defer_task, 0,
 	    amd_hwq_reap_task, sc);
+	TIMEOUT_TASK_INIT(taskqueue_thread, &sc->watchdog_task, 0,
+	    amd_hwq_watchdog_task, sc);
+	bzero(sc->qpend, sizeof(sc->qpend));
+	sc->watchdog_armed = 0;
+	sc->hang_ms = ATRIUM_AMD_HANG_MS;
 	sc->hwq_inited = 1;
 
 	err = amd_dma_page_alloc(sc, &sc->null_pd);	/* zeroed: all invalid */
@@ -654,10 +858,17 @@ amd_hwq_init(struct atrium_amd_softc *sc, device_t dev)
 	AMD_ISO_U64("revokes", revokes, "doorbell grants revoked");
 	AMD_ISO_U64("deferred", deferred, "BO frees deferred");
 	AMD_ISO_U64("reaped", reaped, "deferred BO frees completed");
+	AMD_ISO_U64("hangs", hangs, "queues the hang watchdog stopped");
+	AMD_ISO_U64("fences_failed", fences_failed,
+	    "owed completions failed with EIO (queue stopped or reset)");
 	AMD_ISO_INT("deferred_now", deferred_now, "deferred BO frees pending");
 	AMD_ISO_INT("grants_live", grants_live, "doorbell grant objects alive");
 #undef AMD_ISO_U64
 #undef AMD_ISO_INT
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "hang_ms",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    amd_iso_sysctl_hang_ms, "I",
+	    "stop a kernel-rung queue after this long without progress");
 	return (0);
 }
 
@@ -678,6 +889,9 @@ amd_hwq_fini(struct atrium_amd_softc *sc)
 		amd_hwq_dequeue(sc, &sc->hwq[i]);
 		sx_xunlock(&sc->hwq[i].lock);
 	}
+	while (taskqueue_cancel_timeout(taskqueue_thread, &sc->watchdog_task,
+	    NULL) != 0)
+		taskqueue_drain_timeout(taskqueue_thread, &sc->watchdog_task);
 	while (taskqueue_cancel_timeout(taskqueue_thread, &sc->defer_task,
 	    NULL) != 0)
 		taskqueue_drain_timeout(taskqueue_thread, &sc->defer_task);

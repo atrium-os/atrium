@@ -185,7 +185,7 @@ amd_teardown(struct atrium_amd_softc *sc)
 	 * docs/spec/gpu-driver-hotswap.md Protocol A) starts clean: forget any
 	 * completions the ISR still owed (their syncobjs are gone with the fds).
 	 */
-	sc->n_pending = 0;
+	bzero(sc->qpend, sizeof(sc->qpend));
 	sc->backend = NULL;	/* points into this module; gone after kldunload */
 	/*
 	 * The IH ring + ISR, the BAR resources, and the softc mutex all belong to

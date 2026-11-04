@@ -19,6 +19,7 @@
 #include "../../include/atrium/display_abi_v2.h"
 
 #include <sys/types.h>
+#include <sys/event.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -40,6 +41,7 @@
 #define IT_WRITE_DATA		0x37u
 #define IT_WAIT_REG_MEM		0x3cu
 #define IT_DMA_DATA		0x50u
+#define IT_RELEASE_MEM		0x49u
 #define WAIT_FN_GE		5u
 
 #define GPU		"/dev/atrium-gpu0"
@@ -656,6 +658,187 @@ break5(void)
 	close(fd);
 }
 
+/* ---------------------------------------------------------------------------
+ * Part C: completion attribution and the hang watchdog (review §A2.2, §A2.6).
+ */
+static int
+syncobj_new(int fd)
+{
+	struct atrium_gpu_syncobj_create c;
+
+	memset(&c, 0, sizeof(c));
+	if (ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_CREATE, &c) != 0) {
+		perror("SYNCOBJ_CREATE");
+		exit(2);
+	}
+	return ((int)c.out_fd);
+}
+
+static uint64_t
+syncobj_value(int fd, int so)
+{
+	struct atrium_gpu_syncobj_op o;
+
+	memset(&o, 0, sizeof(o));
+	o.syncobj_fd = so;
+	if (ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_QUERY, &o) != 0)
+		return (~0ull);
+	return (o.value);
+}
+
+static int
+syncobj_wait(int fd, int so, uint64_t value, uint32_t ms)
+{
+	struct atrium_gpu_syncobj_wait w;
+
+	memset(&w, 0, sizeof(w));
+	w.syncobj_fd = so;
+	w.value = value;
+	w.timeout_ms = ms;
+	return (ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_WAIT, &w) == 0 ? 0 : errno);
+}
+
+/* RELEASE_MEM(fence_va) = value, with an end-of-pipe interrupt. */
+static int
+emit_eop(uint32_t *r, uint64_t fence_va, uint32_t value)
+{
+	r[0] = type3(IT_RELEASE_MEM, 6);
+	r[1] = (5u << 8);
+	r[2] = (2u << 29) | (2u << 24);
+	r[3] = (uint32_t)(fence_va & 0xffffffff);
+	r[4] = (uint32_t)(fence_va >> 32);
+	r[5] = value;
+	r[6] = 0;
+	return (7);
+}
+
+static int
+hang_ms(int v)
+{
+	int old = 0;
+	size_t len = sizeof(old);
+
+	if (sysctlbyname("dev.atrium_gpu_amd.0.isolation.hang_ms", &old, &len,
+	    v > 0 ? &v : NULL, v > 0 ? sizeof(v) : 0) != 0) {
+		perror("sysctl hang_ms");
+		exit(2);
+	}
+	return (old);
+}
+
+static void
+part_c(void)
+{
+	struct atrium_gpu_submit s;
+	struct kevent kev;
+	struct timespec ts = { 1, 0 };
+	uint64_t hangs0, failed0, word_va, ring_va, fence_va, va;
+	uint32_t r[32], zero = 0;
+	int fda, fdb, vma, vmb, word, ring, fence, so, ringb, fenceb, resb;
+	int kq, n, err, old;
+	double t0, dt;
+
+	printf("Part C: completion attribution and the hang watchdog\n");
+	old = hang_ms(500);
+	hangs0 = iso("hangs");
+	failed0 = iso("fences_failed");
+
+	/* A: a compute ring parked on a word nobody writes, owing syncobj 1. */
+	fda = xopen(GPU);
+	vma = vm_create(fda);
+	so = syncobj_new(fda);
+	word = bo_new(fda, vma, 4096, 0, &word_va);
+	fence = bo_new(fda, vma, 4096, 0, &fence_va);
+	ring = bo_new(fda, vma, 4096, 0, &ring_va);
+	bo_write(fda, word, &zero, sizeof(zero));
+	n = emit_wait(r, word_va);
+	n += emit_eop(r + n, fence_va, 0xa);
+	bo_write(fda, ring, r, n * 4);
+	memset(&s, 0, sizeof(s));
+	s.vm_fd = vma;
+	s.ring_fd = ring;
+	s.n_dwords = n;
+	s.engine = ATRIUM_GPU_ENGINE_COMPUTE;
+	s.signal_syncobj_fd = so;
+	s.signal_value = 1;
+	CHECK(ioctl(fda, ATRIUM_GPU_IOC_SUBMIT, &s) == 0,
+	    "A's compute ring parked, owing its syncobj value 1");
+
+	/* B: an end-of-pipe on gfx must not retire A's compute completion. */
+	fdb = xopen(GPU);
+	vmb = vm_create(fdb);
+	ringb = bo_new(fdb, vmb, 4096, 0, &va);
+	fenceb = bo_new(fdb, vmb, 4096, 0, &fence_va);
+	n = emit_eop(r, fence_va, 0xb);
+	bo_write(fdb, ringb, r, n * 4);
+	err = submit(fdb, vmb, ringb, n, ATRIUM_GPU_ENGINE_GFX);
+	CHECK(err == 0 && bo_read32(fdb, fenceb) == 0xb,
+	    "B's gfx ring raised its end-of-pipe");
+	CHECK(syncobj_value(fda, so) == 0,
+	    "A2.2: B's gfx EOP did not signal A's compute syncobj");
+
+	/* B wants compute: the watchdog stops A's hung ring, B gets in. */
+	resb = bo_new(fdb, vmb, 4096, 0, &va);
+	n = emit_write(r, va, 0xb0b);
+	bo_write(fdb, ringb, r, n * 4);
+	t0 = now_s();
+	err = submit(fdb, vmb, ringb, n, ATRIUM_GPU_ENGINE_COMPUTE);
+	dt = now_s() - t0;
+	CHECK(err == 0 && bo_read32(fdb, resb) == 0xb0b,
+	    "B's compute submit ran after %.2f s (hang_ms 500; %s)", dt,
+	    strerror(err));
+	CHECK(iso("hangs") == hangs0 + 1, "counted as one hang");
+
+	/* A's waiter learns its work is gone instead of timing out. */
+	t0 = now_s();
+	err = syncobj_wait(fda, so, 1, 3000);
+	dt = now_s() - t0;
+	CHECK(err == EIO && dt < 0.5,
+	    "A's SYNCOBJ_WAIT returns EIO at once (%s, %.2f s)",
+	    strerror(err), dt);
+	CHECK(iso("fences_failed") == failed0 + 1,
+	    "counted as one failed completion");
+	kq = kqueue();
+	EV_SET(&kev, so, EVFILT_READ, EV_ADD, 0, 1, NULL);
+	n = kevent(kq, &kev, 1, &kev, 1, &ts);
+	CHECK(n == 1 && (kev.flags & EV_EOF) != 0 && kev.fflags == EIO,
+	    "kqueue reports EV_EOF with EIO on A's syncobj");
+	close(kq);
+	CHECK(bo_read32(fda, fence) == 0, "A's stopped ring never ran its EOP");
+
+	/* A's own next submit runs normally. */
+	close(so);
+	so = syncobj_new(fda);
+	{
+		uint64_t fva;
+		int f2 = bo_new(fda, vma, 4096, 0, &fva);
+
+		n = emit_eop(r, fva, 0xc);
+		bo_write(fda, ring, r, n * 4);
+		s.n_dwords = n;
+		s.signal_syncobj_fd = so;
+		s.signal_value = 7;
+		err = ioctl(fda, ATRIUM_GPU_IOC_SUBMIT, &s) == 0 ? 0 : errno;
+		CHECK(err == 0 && syncobj_wait(fda, so, 7, 1000) == 0 &&
+		    bo_read32(fda, f2) == 0xc,
+		    "A's next compute submit signals its new syncobj");
+		close(f2);
+	}
+
+	close(so);
+	close(word);
+	close(fence);
+	close(ring);
+	close(vma);
+	close(fda);
+	close(ringb);
+	close(fenceb);
+	close(resb);
+	close(vmb);
+	close(fdb);
+	hang_ms(old);
+}
+
 static void
 attest(void)
 {
@@ -691,6 +874,7 @@ main(int argc, char **argv)
 	break1();
 	break2();
 	break4();
+	part_c();
 	if (argc > 1 && strcmp(argv[1], "--attest") == 0)
 		attest();
 	printf(failures == 0 ? "ALL OK\n" : "%d FAILURES\n", failures);

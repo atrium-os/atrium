@@ -39,6 +39,35 @@ mechanism in this driver, and records how the five breaks from the
    `EPERM` on `/dev/atrium-gpu0`. They live on `/dev/atrium-gpu0ctl`, root
    0600, which no jail devfs ruleset unhides.
 
+## Completions and hangs (review §A2.2, §A2.6)
+
+- **Per-queue completions.** A submit that signals a syncobj registers the
+  completion on its own queue's list, under the queue's lock, just before
+  the doorbell. Each EOP cookie names the queue that raised it (`ring_id`,
+  gpusim 1ea93e5), and the ISR retires the head of that queue's list only.
+  An end-of-pipe on gfx can no longer signal a compute submit, or another
+  VM's. A queue that owes a completion counts as busy: another VM waits for
+  it before reprogramming the queue, and deferred BO frees wait for it too.
+  The same VM may keep submitting behind its own outstanding work. A full
+  list (16 per queue) fails the submit with `EBUSY` instead of silently
+  dropping the completion.
+- **Hang watchdog.** While a kernel-rung queue is busy, a watchdog task
+  (every ~100 ms, and also a submitter waiting for the queue) checks for
+  progress: read-pointer movement or an EOP. After `hang_ms` with none
+  (sysctl `dev.atrium_gpu_amd.0.isolation.hang_ms`, default 5000, longer
+  than the 2 s queue wait) the queue is stopped like any other dequeue.
+- **Error state.** Stopping a queue, for any reason (hang, VM teardown,
+  `GPU_RESET`), fails what it owed: the syncobj keeps its value and gets a
+  sticky error. `SYNCOBJ_WAIT` returns `EIO` for a value not yet reached,
+  and kqueue reports `EV_EOF` with `EIO` in `fflags`. `SYNCOBJ_WAIT` also
+  sleeps interruptibly now, with an absolute `sbintime` deadline.
+  Counters: `isolation.hangs`, `isolation.fences_failed`.
+- **Contract.** A ring submitted with a syncobj should raise exactly one
+  interrupting EOP. Fewer, and its completion is failed by the watchdog
+  (after holding the queue for up to `hang_ms`); more, and the extra EOP
+  can only retire the same VM's next completion early, since another VM
+  never shares the queue's list.
+
 ## Address space
 
 Each VM's GPU-VA window is a `vmem(9)` arena. Binding allocates next-fit, so
@@ -53,10 +82,17 @@ It can never receive another VM's writes.
 ## Known limits (not isolation breaks, but worth knowing)
 
 - The device still has only two shared queues (gfx and compute). A client
-  whose ring parks forever, or faults, holds its queue until its VM closes
-  or the control node resets the GPU, so other clients get `EBUSY` on that
-  engine meanwhile. That is a denial of service, not a leak. Per-VM MES
-  queues (review §A2.3) remove it.
+  whose ring parks forever, or faults, holds its queue until the watchdog
+  stops it (`hang_ms`, 5 s by default), its VM closes, or the control node
+  resets the GPU. Other clients get `EBUSY` on that engine meanwhile, for at
+  most that long. Per-VM MES queues (review §A2.3) remove the wait.
+- A queue a client owns through `QUEUE_MAP` is not watched: userspace rings
+  it, so the kernel cannot tell idle from stuck. The owner can only stall
+  its own exclusive queue, and gives it back when it closes the device.
+- Retirement counts EOPs per queue rather than reading a kernel-owned
+  `(queue, seqno)` fence word (review §A2.2's full design). The seqno form
+  would drop the one-EOP-per-signalled-submit contract above. There is no
+  device-lost generation counter yet either.
 - On gpusim a queue stop and a TLB invalidate take effect at the register
   write. Real silicon needs the HQD dequeue handshake and the invalidate
   acknowledgement before pages are freed. Both are marked in `cp.c` and

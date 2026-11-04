@@ -66,7 +66,15 @@ amd_syncobj_filt_event(struct knote *kn, long hint)
 	mtx_assert(&so->lock, MA_OWNED);
 	kn->kn_data = (int64_t)so->value;
 	/* kn_sdata is the threshold from the kevent `data` field. */
-	return (so->value >= (uint64_t)kn->kn_sdata);
+	if (so->value >= (uint64_t)kn->kn_sdata)
+		return (1);
+	if (so->error != 0) {
+		/* The work that would have reached the threshold is gone. */
+		kn->kn_flags |= EV_EOF;
+		kn->kn_fflags = so->error;
+		return (1);
+	}
+	return (0);
 }
 
 static const struct filterops amd_syncobj_filtops = {
@@ -127,6 +135,24 @@ amd_syncobj_signal(struct atrium_amd_syncobj *so, uint64_t value)
 	mtx_lock(&so->lock);
 	if (value > so->value)
 		so->value = value;
+	wakeup(&so->value);
+	KNOTE_LOCKED(&so->sel.si_note, 0);
+	mtx_unlock(&so->lock);
+}
+
+/*
+ * A completion this syncobj was owed will never come: its queue was stopped
+ * (VM torn down, hang watchdog, GPU reset). The value stays where it is; the
+ * error is sticky, so every waiter for a value not yet reached gets `error`
+ * (SYNCOBJ_WAIT returns it; kqueue reports EV_EOF with it in fflags) rather
+ * than sleeping until its timeout. Values already reached still succeed.
+ */
+void
+amd_syncobj_fail(struct atrium_amd_syncobj *so, int error)
+{
+	mtx_lock(&so->lock);
+	if (so->error == 0)
+		so->error = error;
 	wakeup(&so->value);
 	KNOTE_LOCKED(&so->sel.si_note, 0);
 	mtx_unlock(&so->lock);

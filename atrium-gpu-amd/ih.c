@@ -113,6 +113,8 @@ amd_intr(void *arg)
 		counts[c] = 0;
 
 	mtx_lock(&sc->lock);
+	for (c = 0; c < ATRIUM_AMD_NHWQ; c++)
+		sc->ih_eop_ring[c] = 0;
 	wptr = amd_mmio_read32(sc, regIH_WPTR);
 	while (sc->ih_rptr != wptr) {
 		idx = sc->ih_rptr % ATRIUM_AMD_IH_ENTRIES;
@@ -121,6 +123,11 @@ amd_intr(void *arg)
 		cause = cookie[0];
 		if (cause < ATRIUM_AMD_IH_NCAUSE)
 			counts[cause]++;
+		/* An EOP names the queue whose RELEASE_MEM raised it (ring_id,
+		 * dword 1), so the EOP handler retires that queue's completion. */
+		if (cause == ATRIUM_AMD_IH_CAUSE_EOP &&
+		    cookie[1] < ATRIUM_AMD_NHWQ)
+			sc->ih_eop_ring[cookie[1]]++;
 		sc->ih_rptr++;
 	}
 	for (c = 0; c < ATRIUM_AMD_IH_NCAUSE; c++) {

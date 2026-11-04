@@ -259,9 +259,17 @@ appears on real asynchronous hardware.
 
 *Status 2026-11-04:* all five are fixed in `atrium-gpu-amd` and covered by
 `tests/test_gpu_isolation.c`, which uses rings parked on a WAIT to keep work
-in flight on gpusim. See `atrium-gpu-amd/ISOLATION.md`. A2.2 (completions
-by queue and seqno), A2.6 (hang model) and per-VM MES queues (A2.3) are
-still open.
+in flight on gpusim. See `atrium-gpu-amd/ISOLATION.md`. Per-VM MES queues
+(A2.3) are still open.
+
+*Status 2026-11-04 (later):* A2.2 and A2.6 are fixed, without the seqno
+fence word or the device-lost counter. Completions are per queue, retired by
+the EOP cookie's queue id, and a full list fails the submit with `EBUSY`. A
+watchdog stops a queue with no progress for `hang_ms` (5 s). A stopped
+queue's completions fail with `EIO` (`SYNCOBJ_WAIT`, and kqueue `EV_EOF`),
+including on `GPU_RESET`. `SYNCOBJ_WAIT` uses `PCATCH` and an `sbintime`
+deadline. Covered by Part C of `tests/test_gpu_isolation.c` and the EIO check
+in `fault_reset`.
 
 ### A4. The display side
 

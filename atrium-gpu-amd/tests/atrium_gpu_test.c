@@ -1012,6 +1012,14 @@ test_fault_reset(int fd, int vm)
 		return (1);
 	}
 
+	/* The reset abandoned the lost submit: its waiter now gets EIO. */
+	wt.timeout_ms = 1000;
+	if (ioctl(fd, ATRIUM_GPU_IOC_SYNCOBJ_WAIT, &wt) == 0 || errno != EIO) {
+		printf("fault_reset FAILED: wait after reset = %s (want EIO)\n",
+		    strerror(errno));
+		return (1);
+	}
+
 	/* A normal submit now runs on the clean engine. */
 	gring[0] = type3(IT_NOP, 1);
 	gring[1] = 0;
