@@ -4480,6 +4480,38 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_fr_track_keeps_its_items_minimum_and_goes_inflexible() {
+        // The Guardian's "most viewed" list: `1fr 1fr` in a 241 px grid whose
+        // items' min-content is 233. `1fr` is `minmax(auto, 1fr)`, so each
+        // column is at least that — the grid overflows, as in Chrome — and
+        // a column already wider than its share drops out of the sharing
+        // (Grid §12.7.1), leaving the rest to the other one.
+        let doc = |cols: &str, a: &str| format!(r#"<style>body {{ margin-left: 0px; margin-top: 0px }}
+            .g {{ display: grid; width: 100px; grid-template-columns: {cols} }}
+            .a {{ background-color: #ff0000; height: 10px }} .b {{ background-color: #00ff00; height: 10px }}
+            .w {{ width: 80px; height: 10px }} .z {{ min-width: 0px }}</style>
+            <div class="g"><div class="{a}"><div class="w"></div></div><div class="b"></div></div>"#);
+        let o = render(&doc("1fr 1fr", "a"));
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 80, 10)]);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(80, 0, 20, 10)]);
+        let o = render(&doc("1fr 3fr", "a"));
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 80, 10)]);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(80, 0, 20, 10)]);
+        // Control: with `min-width: 0` the item has no minimum, so the
+        // columns share the space evenly.
+        let o = render(&doc("1fr 1fr", "a z"));
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 50, 10)]);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(50, 0, 50, 10)]);
+        // A flex sum below 1 shares only that fraction of the space.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 100px; grid-template-columns: 0.25fr 0.25fr }
+            .a { background-color: #ff0000; height: 10px } .b { background-color: #00ff00; height: 10px }</style>
+            <div class="g"><div class="a"></div><div class="b"></div></div>"#);
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 25, 10)]);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(25, 0, 25, 10)]);
+    }
+
+    #[test]
     fn a_minmax_fr_row_in_an_auto_height_grid_holds_its_content() {
         // BBC News: `grid-template-rows: min-content minmax(0, 1fr)` on a
         // grid with no height. With indefinite free space a flexible track
@@ -5087,9 +5119,13 @@ fn size_tracks(tracks: &[navigator_style::values::Track], avail: Option<U>, gap:
             Track::Auto => get(autos, i),
             Track::MaxContent => get(maxs, i),
             // With indefinite free space a flexible track sizes to its
-            // content (§12.7.1); with definite space it starts at zero and
-            // takes its share below.
-            Track::Fr(_) => if avail.is_none() { get(maxs, i) } else { 0 },
+            // content (§12.7.1). With definite space it takes its share
+            // below — but a bare `1fr` is `minmax(auto, 1fr)` (§7.2.4), so
+            // its base is still the items' minimum contribution. Starting
+            // it at zero split the Guardian's `1fr 1fr` list in half,
+            // 120 px a column, where Chrome keeps each at its content's
+            // min-content (233) and lets the grid overflow.
+            Track::Fr(_) => if avail.is_none() { get(maxs, i) } else { get(autos, i) },
             Track::MinMax(a, b) => {
                 let floor = match &**a {
                     Track::Len(l) => u(l.v),
@@ -5164,17 +5200,23 @@ fn size_tracks(tracks: &[navigator_style::values::Track], avail: Option<U>, gap:
         free -= spent;
     }
 
-    // §12.6 expand flexible tracks: what is left goes to the `fr` tracks, in
-    // proportion, and never below the base each already has.
-    let fr: f64 = tracks.iter().filter_map(flex_of).sum();
-    if fr > 0.0 {
-        let fixed: U = (0..tracks.len()).filter(|i| flex_of(&tracks[*i]).is_none()).map(|i| sizes[i]).sum();
-        let for_flex = (a - fixed - gaps).max(0);
-        for (i, t) in tracks.iter().enumerate() {
-            if let Some(f) = flex_of(t) {
-                sizes[i] = sizes[i].max(u(for_flex as f64 / PX as f64 * f / fr));
-            }
-        }
+    // §12.7 expand flexible tracks: what is left goes to the `fr` tracks, in
+    // proportion. ★ §12.7.1 "find the size of an fr": a track whose base is
+    // already MORE than its share is treated as inflexible — it keeps its
+    // base, and the space it took is no longer shared by the others — and
+    // the share is found again; a flex sum below 1 counts as 1.
+    if tracks.iter().any(|t| flex_of(t).is_some()) {
+        let mut flex: Vec<usize> = (0..tracks.len()).filter(|i| flex_of(&tracks[*i]).is_some()).collect();
+        let hyp = loop {
+            let fixed: U = (0..tracks.len()).filter(|i| !flex.contains(i)).map(|i| sizes[i]).sum();
+            let leftover = (a - fixed - gaps).max(0) as f64 / PX as f64;
+            let sum: f64 = flex.iter().map(|&i| flex_of(&tracks[i]).unwrap_or(0.0)).sum::<f64>().max(1.0);
+            let hyp = leftover / sum;
+            let n = flex.len();
+            flex.retain(|&i| u(hyp * flex_of(&tracks[i]).unwrap_or(0.0)) >= sizes[i]);
+            if flex.len() == n { break hyp }
+        };
+        for &i in &flex { sizes[i] = sizes[i].max(u(hyp * flex_of(&tracks[i]).unwrap_or(0.0))) }
     } else {
         // §12.8 stretch auto tracks: with no flexible track to absorb it,
         // whatever is left is shared by the `auto` ones. The profile admits
