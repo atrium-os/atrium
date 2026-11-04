@@ -25,11 +25,14 @@
 #include <sys/malloc.h>
 #include <sys/module.h>
 #include <sys/mutex.h>
+#include <sys/pcpu.h>
+#include <sys/smp.h>
 #include <sys/sbuf.h>
 #include <sys/sysctl.h>
 #include <sys/queue.h>
 #include <sys/taskqueue.h>
 #include <geom/geom_disk.h>
+#include <machine/atomic.h>
 
 #include "zram_pool.h"
 
@@ -65,15 +68,59 @@ struct zram_slot {
 };
 
 static struct zram_slot	*zram_slots;
-static ZSTD_CCtx	*zram_cctx;	/* pre-allocated — no malloc on the hot path */
-static ZSTD_DCtx	*zram_dctx;
-static struct mtx	 zram_mtx;	/* serializes the shared contexts (per-CPU = refinement) */
+/*
+ * Concurrency (atrium-zram-v2.md §4.1/§4.3, increment 3). v1 ran every
+ * page-in and page-out on every CPU under one mutex. Now:
+ *
+ *   - a page's slot is guarded by one of ZRAM_NSLOTLOCKS hashed mutexes, so
+ *     I/O on different pages proceeds in parallel;
+ *   - each CPU has its own pre-allocated zstd contexts and compression
+ *     buffer, each behind its own mutex (a thread that migrates after picking
+ *     curcpu's context is still correct, just briefly sharing it);
+ *   - the packed pool keeps one mutex (zram_pool_mtx), held only for the
+ *     alloc/free bookkeeping, never across the codec.
+ *
+ * Lock order: slot -> codec context -> pool. A load decompresses straight
+ * from pool memory under only the slot (and context) lock: an object is
+ * freed only by a holder of its slot lock, and spans never move.
+ * Counters are atomics.
+ */
+#define	ZRAM_NSLOTLOCKS	256
+struct zram_ctx {
+	struct mtx	mtx;
+	ZSTD_CCtx	*cctx;	/* pre-allocated — no malloc on the hot path */
+	ZSTD_DCtx	*dctx;
+	char		comp[ZRAM_PAGE + 512]; /* >= ZSTD_compressBound(4096)=4174 */
+} __aligned(CACHE_LINE_SIZE);
+static struct zram_ctx	*zram_ctxs;
+static int		 zram_nctx;
+static struct mtx_padalign zram_slot_mtx[ZRAM_NSLOTLOCKS];
+static struct mtx	 zram_pool_mtx;
 static uint64_t		 zram_phys_bytes;	/* total physical bytes the store holds */
+
+/* Hash on the slot's address, so private (selftest) slots work too. */
+static inline struct mtx *
+zram_slot_lock(const struct zram_slot *s)
+{
+	return ((struct mtx *)&zram_slot_mtx[((uintptr_t)s / sizeof(*s)) % ZRAM_NSLOTLOCKS]);
+}
+
+static struct zram_ctx *
+zram_ctx_get(void)
+{
+	struct zram_ctx *c;
+
+	c = &zram_ctxs[curcpu % zram_nctx];
+	mtx_lock(&c->mtx);
+	return (c);
+}
+
+#define	ZRAM_ADD(var, n)	atomic_add_64(&(var), (uint64_t)(int64_t)(n))
 static struct disk	*zram_disk;	/* /dev/zram0 — the swap block device */
 
 /*
  * The packed pool (atrium-zram-v2.md §4.2/§4.4, increment 2). Serialized by
- * zram_mtx like everything else here. kern.zram.mem_limit bounds what it may
+ * zram_pool_mtx. kern.zram.mem_limit bounds what it may
  * hold; the reserve of 4-page chunks (kern.zram.reserve_chunks at load)
  * backs swap-outs when the page allocator says no, and a task refills it.
  */
@@ -83,7 +130,7 @@ static int		zram_reserve_chunks = 256;	/* 4 MiB */
 TUNABLE_INT("kern.zram.reserve_chunks", &zram_reserve_chunks);
 
 /*
- * Counters (atrium-zram-v2.md §4.6, increment 1). All updated under zram_mtx.
+ * Counters (atrium-zram-v2.md §4.6, increment 1). Atomics (ZRAM_ADD).
  * Gauges describe what the store holds NOW (they fall when a slot is freed or
  * overwritten); event counters only grow.
  *
@@ -107,15 +154,15 @@ zram_count(const struct zram_slot *s, int dir)
 {
 	switch (s->state) {
 	case ZRAM_SAME:
-		zram_pages_same += dir;
+		ZRAM_ADD(zram_pages_same, dir);
 		break;
 	case ZRAM_COMP:
-		zram_pages_comp += dir;
-		zram_hist[s->len / ZRAM_HIST_BUCKET] += dir;
+		ZRAM_ADD(zram_pages_comp, dir);
+		ZRAM_ADD(zram_hist[s->len / ZRAM_HIST_BUCKET], dir);
 		break;
 	case ZRAM_RAW:
-		zram_pages_raw += dir;
-		zram_hist[ZRAM_HIST_LEN - 1] += dir;
+		ZRAM_ADD(zram_pages_raw, dir);
+		ZRAM_ADD(zram_hist[ZRAM_HIST_LEN - 1], dir);
 		break;
 	default:
 		break;
@@ -136,30 +183,34 @@ zram_same_filled(const uint8_t *p, uint8_t *fill)
 	return (true);
 }
 
+/* Caller holds the slot's lock (or owns the slot outright). */
 static void
 zram_free_slot(struct zram_slot *s)
 {
 	zram_count(s, -1);
 	if (s->span != NULL) {
-		zram_phys_bytes -= s->len;
+		ZRAM_ADD(zram_phys_bytes, -(int64_t)s->len);
+		mtx_lock(&zram_pool_mtx);
 		zpool_free(&zram_pool, s->span, s->idx);
+		mtx_unlock(&zram_pool_mtx);
 		s->span = NULL;
 	}
 	s->state = ZRAM_EMPTY;
 	s->len = 0;
 }
 
-/* Store `page` at slot `idx`. Same-filled -> tag (0 bytes); else compress; if it
- * doesn't shrink, store raw. Returns 0, or ENOMEM. Caller holds nothing. */
+/* Store `page` in slot `s`. Same-filled -> tag (0 bytes); else compress; if it
+ * doesn't shrink enough, store raw. Returns 0, ENOMEM or ENOSPC (at the limit). */
 static int
 zram_store(struct zram_slot *s, const void *page)
 {
-	static char comp[ZRAM_PAGE + 512]; /* >= ZSTD_compressBound(4096)=4174; guarded by mtx */
+	struct mtx *lk = zram_slot_lock(s);
+	struct zram_ctx *c = NULL;
 	uint8_t fill;
 	size_t clen;
-	int err = 0;
+	int err = 0, refill;
 
-	mtx_lock(&zram_mtx);
+	mtx_lock(lk);
 	zram_free_slot(s);
 
 	if (zram_same_filled(page, &fill)) {
@@ -167,41 +218,38 @@ zram_store(struct zram_slot *s, const void *page)
 		s->fill = fill;
 		goto out; /* 0 physical bytes — the zero/same-page win */
 	}
-	clen = ZSTD_compressCCtx(zram_cctx, comp, sizeof(comp), page, ZRAM_PAGE, ZRAM_LEVEL);
-	if (!ZSTD_isError(clen) && clen <= ZP_MAXOBJ) {
-		err = zpool_alloc(&zram_pool, clen, &s->span, &s->idx);
-		if (err != 0)
-			goto fail;
-		memcpy(zpool_ptr(s->span, s->idx, zpool_objsize(&zram_pool, s->span)),
-		    comp, clen);
-		s->state = ZRAM_COMP;
-		s->len = clen;
-	} else {
-		/*
-		 * Incompressible, compressed to over ZP_MAXOBJ (a packed object
-		 * that size costs a page anyway), or a codec error: verbatim.
-		 */
-		err = zpool_alloc(&zram_pool, ZRAM_PAGE, &s->span, &s->idx);
-		if (err != 0)
-			goto fail;
+	c = zram_ctx_get();
+	clen = ZSTD_compressCCtx(c->cctx, c->comp, sizeof(c->comp), page, ZRAM_PAGE,
+	    ZRAM_LEVEL);
+	if (ZSTD_isError(clen) || clen > ZP_MAXOBJ)
+		clen = ZRAM_PAGE;	/* RAW: incompressible, too big to pack, or error */
+	mtx_lock(&zram_pool_mtx);
+	err = zpool_alloc(&zram_pool, clen, &s->span, &s->idx);
+	refill = zpool_wants_refill(&zram_pool);
+	mtx_unlock(&zram_pool_mtx);
+	if (refill)
+		taskqueue_enqueue(taskqueue_thread, &zram_refill_task);
+	if (err != 0) {
+		s->span = NULL;
+		ZRAM_ADD(*(err == ENOSPC ? &zram_fail_limit : &zram_fail_nomem), 1);
+		goto out;
+	}
+	if (clen == ZRAM_PAGE) {
 		memcpy(zpool_ptr(s->span, s->idx, ZRAM_PAGE), page, ZRAM_PAGE);
 		s->state = ZRAM_RAW;
-		s->len = ZRAM_PAGE;
+	} else {
+		memcpy(zpool_ptr(s->span, s->idx, zpool_objsize(&zram_pool, s->span)),
+		    c->comp, clen);
+		s->state = ZRAM_COMP;
 	}
-	zram_phys_bytes += s->len;
-	goto out;
-fail:
-	s->span = NULL;
-	if (err == ENOSPC)
-		zram_fail_limit++;
-	else
-		zram_fail_nomem++;
+	s->len = clen;
+	ZRAM_ADD(zram_phys_bytes, s->len);
 out:
-	if (zpool_wants_refill(&zram_pool))
-		taskqueue_enqueue(taskqueue_thread, &zram_refill_task);
+	if (c != NULL)
+		mtx_unlock(&c->mtx);
 	zram_count(s, +1);	/* SAME, COMP or RAW; a failed store left it EMPTY */
-	zram_writes++;
-	mtx_unlock(&zram_mtx);
+	ZRAM_ADD(zram_writes, 1);
+	mtx_unlock(lk);
 	return (err);
 }
 
@@ -209,10 +257,12 @@ out:
 static int
 zram_load(struct zram_slot *s, void *page)
 {
+	struct mtx *lk = zram_slot_lock(s);
+	struct zram_ctx *c;
 	size_t r;
 	int err = 0;
 
-	mtx_lock(&zram_mtx);
+	mtx_lock(lk);
 	switch (s->state) {
 	case ZRAM_SAME:
 		memset(page, s->fill, ZRAM_PAGE);
@@ -221,11 +271,13 @@ zram_load(struct zram_slot *s, void *page)
 		memcpy(page, zpool_ptr(s->span, s->idx, ZRAM_PAGE), ZRAM_PAGE);
 		break;
 	case ZRAM_COMP:
-		r = ZSTD_decompressDCtx(zram_dctx, page, ZRAM_PAGE,
+		c = zram_ctx_get();
+		r = ZSTD_decompressDCtx(c->dctx, page, ZRAM_PAGE,
 		    zpool_ptr(s->span, s->idx, zpool_objsize(&zram_pool, s->span)),
 		    s->len);
+		mtx_unlock(&c->mtx);
 		if (ZSTD_isError(r) || r != ZRAM_PAGE) {
-			zram_fail_io++;
+			ZRAM_ADD(zram_fail_io, 1);
 			err = EIO;
 		}
 		break;
@@ -233,8 +285,8 @@ zram_load(struct zram_slot *s, void *page)
 		/* never-written block reads as zeros (standard block-device / swap). */
 		memset(page, 0, ZRAM_PAGE);
 	}
-	zram_reads++;
-	mtx_unlock(&zram_mtx);
+	ZRAM_ADD(zram_reads, 1);
+	mtx_unlock(lk);
 	return (err);
 }
 
@@ -253,14 +305,20 @@ zram_delete(struct bio *bp)
 	end = (bp->bio_offset + bp->bio_length) / ZRAM_PAGE;
 	if (end > ZRAM_NSLOTS)
 		end = ZRAM_NSLOTS;
-	mtx_lock(&zram_mtx);
 	for (idx = first; idx < end; idx++) {
-		if (zram_slots[idx].state != ZRAM_EMPTY) {
-			zram_free_slot(&zram_slots[idx]);
-			zram_deletes++;
+		struct zram_slot *sl = &zram_slots[idx];
+		struct mtx *lk;
+
+		if (sl->state == ZRAM_EMPTY)	/* unlocked peek; rechecked below */
+			continue;
+		lk = zram_slot_lock(sl);
+		mtx_lock(lk);
+		if (sl->state != ZRAM_EMPTY) {
+			zram_free_slot(sl);
+			ZRAM_ADD(zram_deletes, 1);
 		}
+		mtx_unlock(lk);
 	}
-	mtx_unlock(&zram_mtx);
 	bp->bio_resid = 0;
 	biofinish(bp, NULL, 0);
 }
@@ -348,12 +406,10 @@ zram_selftest(SYSCTL_HANDLER_ARGS)
 	    "SAME", t[1].state == ZRAM_COMP ? "COMP" : "?", t[1].len,
 	    t[2].state == ZRAM_RAW ? "RAW" : "?", t[2].len);
 
-	/* leave the store clean for repeat reads. */
-	mtx_lock(&zram_mtx);
+	/* leave the store clean for repeat reads (private slots: no lock). */
 	zram_free_slot(&t[0]);
 	zram_free_slot(&t[1]);
 	zram_free_slot(&t[2]);
-	mtx_unlock(&zram_mtx);
 	free(p, M_ZRAM);
 	free(back, M_ZRAM);
 	return (sysctl_handle_string(oidp, res, sizeof(res), req));
@@ -373,9 +429,8 @@ zram_orig_bytes(SYSCTL_HANDLER_ARGS)
 {
 	uint64_t v;
 
-	mtx_lock(&zram_mtx);
-	v = (zram_pages_same + zram_pages_comp + zram_pages_raw) * ZRAM_PAGE;
-	mtx_unlock(&zram_mtx);
+	v = (atomic_load_64(&zram_pages_same) + atomic_load_64(&zram_pages_comp) +
+	    atomic_load_64(&zram_pages_raw)) * ZRAM_PAGE;
 	return (sysctl_handle_64(oidp, &v, 0, req));
 }
 SYSCTL_PROC(_kern_zram, OID_AUTO, orig_bytes,
@@ -413,6 +468,11 @@ SYSCTL_INT(_kern_zram, OID_AUTO, reserve_avail, CTLFLAG_RD, &zram_pool.reserve_n
     "Reserve chunks (4 pages each) on hand");
 SYSCTL_U64(_kern_zram, OID_AUTO, reserve_used, CTLFLAG_RD, &zram_pool.reserve_used, 0,
     "Spans built from the reserve because the page allocator refused, since load");
+SYSCTL_INT(_kern_zram, OID_AUTO, hdr_reserve_avail, CTLFLAG_RD, &zram_pool.hdr_n, 0,
+    "Spare span headers on hand");
+SYSCTL_U64(_kern_zram, OID_AUTO, hdr_reserve_used, CTLFLAG_RD,
+    &zram_pool.hdr_reserve_used, 0,
+    "Span headers taken from the spare list because UMA refused, since load");
 
 /* "<bucket upper bound>:<pages> ..." for COMP pages, then RAW:<pages>. */
 static int
@@ -422,9 +482,8 @@ zram_hist_sysctl(SYSCTL_HANDLER_ARGS)
 	struct sbuf sb;
 	int i, error;
 
-	mtx_lock(&zram_mtx);
-	memcpy(h, zram_hist, sizeof(h));
-	mtx_unlock(&zram_mtx);
+	for (i = 0; i < ZRAM_HIST_LEN; i++)
+		h[i] = atomic_load_64(&zram_hist[i]);
 	sbuf_new_for_sysctl(&sb, NULL, 256, req);
 	for (i = 0; i < ZRAM_HIST_LEN - 1; i++)
 		sbuf_printf(&sb, "%d:%ju ", (i + 1) * ZRAM_HIST_BUCKET, (uintmax_t)h[i]);
@@ -445,6 +504,23 @@ zram_refill(void *arg __unused, int pending __unused)
 	zpool_refill(&zram_pool);
 }
 
+static void
+zram_ctx_free(void)
+{
+	int i;
+
+	for (i = 0; i < zram_nctx; i++) {
+		if (zram_ctxs[i].cctx != NULL)
+			ZSTD_freeCCtx(zram_ctxs[i].cctx);
+		if (zram_ctxs[i].dctx != NULL)
+			ZSTD_freeDCtx(zram_ctxs[i].dctx);
+		mtx_destroy(&zram_ctxs[i].mtx);
+	}
+	free(zram_ctxs, M_ZRAM);
+	zram_ctxs = NULL;
+	zram_nctx = 0;
+}
+
 static int
 zram_modevent(module_t mod __unused, int type, void *data __unused)
 {
@@ -452,15 +528,27 @@ zram_modevent(module_t mod __unused, int type, void *data __unused)
 
 	switch (type) {
 	case MOD_LOAD:
-		zram_cctx = ZSTD_createCCtx();
-		zram_dctx = ZSTD_createDCtx();
-		if (zram_cctx == NULL || zram_dctx == NULL)
-			return (ENOMEM);
+		/* One codec context per CPU, all allocated up front. */
+		zram_nctx = mp_ncpus;
+		zram_ctxs = malloc(sizeof(struct zram_ctx) * zram_nctx, M_ZRAM,
+		    M_WAITOK | M_ZERO);
+		for (i = 0; i < (uint32_t)zram_nctx; i++) {
+			mtx_init(&zram_ctxs[i].mtx, "zram ctx", NULL, MTX_DEF);
+			zram_ctxs[i].cctx = ZSTD_createCCtx();
+			zram_ctxs[i].dctx = ZSTD_createDCtx();
+			if (zram_ctxs[i].cctx == NULL || zram_ctxs[i].dctx == NULL) {
+				zram_nctx = i + 1;	/* free only what was set up */
+				zram_ctx_free();
+				return (ENOMEM);
+			}
+		}
+		for (i = 0; i < ZRAM_NSLOTLOCKS; i++)
+			mtx_init((struct mtx *)&zram_slot_mtx[i], "zram slot", NULL, MTX_DEF);
+		mtx_init(&zram_pool_mtx, "zram pool", NULL, MTX_DEF);
 		zram_slots = malloc(sizeof(struct zram_slot) * ZRAM_NSLOTS, M_ZRAM,
 		    M_WAITOK | M_ZERO);
-		mtx_init(&zram_mtx, "zram", NULL, MTX_DEF);
 		TASK_INIT(&zram_refill_task, 0, zram_refill, NULL);
-		if (zpool_init(&zram_pool, zram_reserve_chunks, &zram_mtx) != 0)
+		if (zpool_init(&zram_pool, zram_reserve_chunks, &zram_pool_mtx) != 0)
 			printf("atrium_zram: reserve short (%d of %d chunks)\n",
 			    zram_pool.reserve_n, zram_reserve_chunks);
 		/* Default limit: 25 % of RAM, unless a tunable set one. */
@@ -490,9 +578,10 @@ zram_modevent(module_t mod __unused, int type, void *data __unused)
 			zram_free_slot(&zram_slots[i]);
 		free(zram_slots, M_ZRAM);
 		zpool_fini(&zram_pool);
-		ZSTD_freeCCtx(zram_cctx);
-		ZSTD_freeDCtx(zram_dctx);
-		mtx_destroy(&zram_mtx);
+		zram_ctx_free();
+		for (i = 0; i < ZRAM_NSLOTLOCKS; i++)
+			mtx_destroy((struct mtx *)&zram_slot_mtx[i]);
+		mtx_destroy(&zram_pool_mtx);
 		return (0);
 	default:
 		return (EOPNOTSUPP);

@@ -12,7 +12,15 @@
 > §4.4) is **built and verified in-VM**. On the same 1.9 GB workload the
 > store's memory overhead over the compressed data fell from **40 % to 3.9 %**,
 > failed page-outs fell from 356 to 0, and no pages were corrupted. The limit
-> holds exactly (§4.4). Next: increment 3 (per-CPU codecs, hashed locks).
+> holds exactly (§4.4).
+>
+> **2026-11-04 (later):** increment 3 (per-CPU codec contexts, hashed slot
+> locks; §4.1, §4.3) is **built and verified in-VM**. Four parallel `dd` writers
+> run 2.2× faster than on increment 2 (3.96 s vs 8.84 s for 128 MiB), and the
+> 1.9 GB fill still has 0 corrupt pages. The extra concurrency exposed a weak
+> spot in increment 2's span-header reserve, now replaced by the pool's own
+> spare-header list (§4.3 "As built"). Next: increment 4 (dynamic sizing, lazy
+> slot table).
 >
 > **Decision context (Shankar, 2026-11-03).** Atrium gets macOS-style compressed
 > main memory, and it must work in the Mac VM, which has no GPU. Using spare GPU
@@ -294,6 +302,45 @@ correct because the context is locked, not pinned. There is no `malloc` on the
 path, as in v1. The compression scratch buffer becomes per-context too (in v1 it
 is a static guarded by the global mutex).
 
+**As built (increment 3, 2026-11-04).**
+
+- `struct zram_ctx` per CPU: a mutex, a `ZSTD_CCtx`, a `ZSTD_DCtx` and a
+  4.5 KiB compression buffer, cache-line aligned, all allocated at load.
+- 256 hashed slot mutexes (`mtx_padalign`), indexed by the slot's address so
+  the selftest's private slots work the same way. This is the §4.1 locking
+  item; the rest of §4.1 (sizing, lazy table, 8-byte slot) is increment 4.
+- The pool keeps one mutex, held only for `zpool_alloc` / `zpool_free`, never
+  across the codec. Lock order is slot → codec context → pool. A load
+  decompresses straight from pool memory under the slot lock, which is safe
+  because only a holder of the slot lock frees its object and spans never move.
+- Counters are `atomic_add_64`; the sysctl readers take no lock.
+- Measured in the VM (QEMU TCG, 4 vCPUs, 32 MiB of mostly-incompressible
+  `/usr/share` + `/usr/include` text per stream, 64 KiB `dd`):
+
+  | | increment 2 | increment 3 |
+  |---|---|---|
+  | 1 writer, 32 MiB | 2.88 s | 2.83 s |
+  | 4 writers, 128 MiB | 8.84 s | **3.96 s** |
+  | 1 reader | 0.82 s | 0.91 s |
+  | 4 readers | 2.00 s | 1.71 s |
+
+  All streams read back byte-identical. Under TCG the 4 vCPUs are host
+  threads, so the absolute times mean little; the ratio is the point. Reads
+  gain less because most of this data is RAW (a `memcpy`, not a decompress).
+- **Span-header fix.** The first 1.9 GB fill on increment 3 had 0 corruption,
+  but it also had 40 `fail_nomem` (silent ENOMEM page-outs; the pager keeps
+  the page and retries), where increment 2 had 0. The chunk reserve was barely
+  touched (69 of 256 used), so the failures were span headers. UMA's zone
+  reserve does not work as a reserve when every allocation passes
+  `M_USE_RESERVE`: steady churn drains it, and the zone then needs a new slab
+  `M_NOWAIT` under pressure. The pool now keeps its own list of spare headers
+  (`2 × reserve_chunks + 64`), taken only when UMA refuses, topped up by the
+  same refill task. New sysctls: `hdr_reserve_avail`, `hdr_reserve_used`. The
+  userspace test injects header failures to cover it. Re-run of the fill:
+  **0 corrupt, `fail_nomem` 0**, with 181 spare headers and 218 reserve chunks
+  used at the peak (PSI `some` 56 %, min free 21 MB), and an 8 MiB store after
+  exit matching `swapinfo`.
+
 ### 4.4 Memory limit
 
 `kern.zram.mem_limit` (bytes; default 25 % of physical RAM; 0 = unlimited) caps
@@ -367,7 +414,7 @@ Two small consumers:
 | 0 | §4.0 swap-free notification (kernel, atrium-os branch) | **DONE, verified in-VM 2026-11-03**: after exit, `orig_bytes` matches `swapinfo` (8.1 MiB), and there was 0 corruption across 486k checksummed pages with blocks freed and reused mid-run. |
 | 1 | §4.6 counters + `BIO_DELETE` + selftest on private slots | **DONE, verified in-VM 2026-11-03** (§3.1): `orig_bytes` matches `swapinfo` to 0.1 %, `trim(8)` frees exact slot counts, and the selftest is safe with swap live. |
 | 2 | §4.2 packed allocator + §4.4 limit | **DONE, verified 2026-11-04**: the userspace churn test passes, a 550-page `dd` round-trip matches, the 1.9 GB fill has 0 corruption with pool overhead 3.9 % over the data, and the limit holds exactly (its feedback path waits for increment 5). |
-| 3 | §4.3 per-CPU contexts + §4.1 hashed locks | 4 parallel `dd` streams scale. Under a 4-job build with zram, lower PSI `full` than v1 at the same cap. |
+| 3 | §4.3 per-CPU contexts + §4.1 hashed locks | **DONE, verified in-VM 2026-11-04**: 4 parallel `dd` writers 2.2× faster than increment 2, all streams byte-identical; the 1.9 GB fill has 0 corruption and 0 `fail_nomem` (after the span-header fix, §4.3). The 4-job-build PSI comparison is not run yet: a build under TCG takes hours, so it waits for a faster host. |
 | 4 | §4.1 dynamic sizing, lazy table | Wired memory at load drops by the table size. A disksize tunable over RAM works. |
 | 5 | §4.5 backing store and writeback | With a disk partition as backing: RAW pages land on disk, idle pages are written back after the period, and reads of written-back pages match. `swapinfo` shows only zram0. |
 | 6 | §4.7 LZ4 option | Selftest under both codecs. In-kernel timing of codec vs whole `zram_strategy` per page (dtrace `fbt`). |

@@ -15,8 +15,8 @@
  *     class to minimise the tail waste;
  *   - span memory is page-granular (kmem_malloc in the kernel) and
  *     contiguous in KVA, so an object may straddle a page boundary;
- *   - span headers are separate and come from a reserved UMA zone, so no
- *     header ever eats into a span;
+ *   - span headers are separate (a UMA zone, backed by the pool's own list
+ *     of spare headers), so no header ever eats into a span;
  *   - a reserve of pre-allocated 4-page chunks backs allocations when the
  *     page allocator says no (v1 failed 356 swap-outs that way under
  *     pressure), refilled outside the I/O path;
@@ -69,6 +69,9 @@ struct zpool {
 	int			reserve_n;
 	int			reserve_target;
 	void			*lock;		/* struct mtx * in the kernel */
+	LIST_HEAD(, zspan)	hdr_free;	/* spare span headers */
+	int			hdr_n;
+	int			hdr_target;
 
 	uint64_t		limit;		/* max pool_bytes, 0 = none */
 	/* gauges */
@@ -77,6 +80,7 @@ struct zpool {
 	uint64_t		nspans;
 	/* events */
 	uint64_t		reserve_used;	/* spans built from the reserve */
+	uint64_t		hdr_reserve_used; /* headers from the spare list */
 	uint64_t		fail_nomem;
 	uint64_t		fail_limit;
 };
@@ -95,7 +99,7 @@ int	zpool_alloc(struct zpool *zp, size_t len, struct zspan **spanp,
 void	zpool_free(struct zpool *zp, struct zspan *sp, uint16_t idx);
 /* Top the reserve back up to its target (may sleep; takes zp->lock). */
 void	zpool_refill(struct zpool *zp);
-/* True when the reserve is below half its target. */
+/* True when the chunk or header reserve is below half its target. */
 int	zpool_wants_refill(const struct zpool *zp);
 
 static inline void *

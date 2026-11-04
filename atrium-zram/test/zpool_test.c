@@ -94,6 +94,26 @@ int main(void) {
 	audit(&zp, "after-fail");
 	zpool_refill(&zp);
 	assert(zp.reserve_n == zp.reserve_target);
+	assert(zp.hdr_n == zp.hdr_target);
+	/* header allocator failure: the spare-header list must absorb it */
+	for (int i = 0; i < N; i += 2)
+		if (objs[i].live) { if (!check(&zp, &objs[i])) bad++; zpool_free(&zp, objs[i].sp, objs[i].idx); objs[i].live = 0; }
+	zpt_fail_hdrs = 1 << 30;
+	got = 0; enomem = 0;
+	for (int i = 0; i < N; i++) {
+		struct obj *o = &objs[i];
+		if (o->live) continue;
+		o->len = rlen(); o->seed = rnd();
+		int e = zpool_alloc(&zp, o->len, &o->sp, &o->idx);
+		if (e == 0) { o->live = 1; fill(&zp, o); got++; } else { assert(e == ENOMEM); enomem++; }
+	}
+	zpt_fail_hdrs = 0;
+	printf("under header-alloc failure: %d allocs ok, %d ENOMEM, spare headers used %llu of %d\n",
+	    got, enomem, (unsigned long long)zp.hdr_reserve_used, zp.hdr_target);
+	assert(zp.hdr_reserve_used > 0);
+	audit(&zp, "after-hdr-fail");
+	zpool_refill(&zp);
+	assert(zp.hdr_n == zp.hdr_target);
 	/* limit: refuses with ENOSPC, never exceeds */
 	zp.limit = zp.pool_bytes + 64 * 1024;
 	int enospc = 0;

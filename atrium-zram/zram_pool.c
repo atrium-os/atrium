@@ -23,19 +23,21 @@ static uma_zone_t zp_hdr_zone;
 #define	ZP_PAGES_ALLOC(bytes)	kmem_malloc((bytes), M_NOWAIT | M_USE_RESERVE)
 #define	ZP_PAGES_ALLOC_WAIT(bytes) kmem_malloc((bytes), M_WAITOK)
 #define	ZP_PAGES_FREE(p, bytes)	kmem_free((p), (bytes))
-#define	ZP_HDR_ALLOC()		uma_zalloc(zp_hdr_zone, M_NOWAIT | M_USE_RESERVE)
+#define	ZP_HDR_ALLOC()		uma_zalloc(zp_hdr_zone, M_NOWAIT)
+#define	ZP_HDR_ALLOC_WAIT()	uma_zalloc(zp_hdr_zone, M_WAITOK)
 #define	ZP_HDR_FREE(h)		uma_zfree(zp_hdr_zone, (h))
 #define	ZP_ARRAY_ALLOC(bytes)	malloc((bytes), M_ZRAM, M_WAITOK | M_ZERO)
 #define	ZP_ARRAY_FREE(p)	free((p), M_ZRAM)
 #define	ZP_LOCK(zp)		mtx_lock((struct mtx *)(zp)->lock)
 #define	ZP_UNLOCK(zp)		mtx_unlock((struct mtx *)(zp)->lock)
-/* Span headers in reserve: enough for every reserve chunk plus slack. */
-#define	ZP_HDR_RESERVE(n)	((n) * 2 + 64)
 #else
 #include "zpool_test_shim.h"
 #endif
 
 #include "zram_pool.h"
+
+/* Span headers in reserve: enough for every reserve chunk plus slack. */
+#define	ZP_HDR_RESERVE(n)	((n) * 2 + 64)
 
 static inline int
 zp_bit_test(const uint64_t *m, int i)
@@ -92,12 +94,12 @@ zpool_init(struct zpool *zp, int reserve, void *lock)
 #ifdef _KERNEL
 	zp_hdr_zone = uma_zcreate("zram_span", sizeof(struct zspan), NULL,
 	    NULL, NULL, NULL, UMA_ALIGN_PTR, 0);
-	uma_zone_reserve(zp_hdr_zone, ZP_HDR_RESERVE(reserve));
-	uma_prealloc(zp_hdr_zone, ZP_HDR_RESERVE(reserve));
 #endif
 	memset(zp, 0, sizeof(*zp));
 	zp->lock = lock;
 	LIST_INIT(&zp->spans);
+	LIST_INIT(&zp->hdr_free);
+	zp->hdr_target = ZP_HDR_RESERVE(reserve);
 	for (i = 0; i <= ZP_NCLASS; i++) {
 		c = &zp->cls[i];
 		TAILQ_INIT(&c->partial);
@@ -128,7 +130,39 @@ zpool_init(struct zpool *zp, int reserve, void *lock)
 	zp->reserve = ZP_ARRAY_ALLOC(sizeof(void *) * (reserve > 0 ? reserve : 1));
 	zp->reserve_n = 0;
 	zpool_refill(zp);
-	return (zp->reserve_n == reserve ? 0 : ENOMEM);
+	return (zp->reserve_n == reserve && zp->hdr_n == zp->hdr_target ?
+	    0 : ENOMEM);
+}
+
+/*
+ * Span headers. UMA's own zone reserve did not hold up: every header
+ * allocation is a reserve allocation, so steady churn drains it and the zone
+ * then needs a fresh slab, M_NOWAIT, at the worst moment (40 failed swap-outs
+ * in-VM once stores ran on 4 CPUs at once). So the pool keeps its own list of
+ * spare headers, used when UMA says no and refilled with zpool_refill().
+ */
+static struct zspan *
+zp_hdr_get(struct zpool *zp)
+{
+	struct zspan *sp;
+
+	sp = ZP_HDR_ALLOC();
+	if (sp == NULL && (sp = LIST_FIRST(&zp->hdr_free)) != NULL) {
+		LIST_REMOVE(sp, all);
+		zp->hdr_n--;
+		zp->hdr_reserve_used++;
+	}
+	return (sp);
+}
+
+static void
+zp_hdr_put(struct zpool *zp, struct zspan *sp)
+{
+	if (zp->hdr_n < zp->hdr_target) {
+		LIST_INSERT_HEAD(&zp->hdr_free, sp, all);
+		zp->hdr_n++;
+	} else
+		ZP_HDR_FREE(sp);
 }
 
 static void
@@ -141,7 +175,7 @@ zp_span_release(struct zpool *zp, struct zspan *sp)
 		zp->reserve[zp->reserve_n++] = sp->base;
 	else
 		ZP_PAGES_FREE(sp->base, sp->bytes);
-	ZP_HDR_FREE(sp);
+	zp_hdr_put(zp, sp);
 }
 
 void
@@ -155,6 +189,11 @@ zpool_fini(struct zpool *zp)
 		ZP_PAGES_FREE(sp->base, sp->bytes);
 		ZP_HDR_FREE(sp);
 	}
+	while ((sp = LIST_FIRST(&zp->hdr_free)) != NULL) {
+		LIST_REMOVE(sp, all);
+		ZP_HDR_FREE(sp);
+	}
+	zp->hdr_n = 0;
 	for (i = 0; i < zp->reserve_n; i++)
 		ZP_PAGES_FREE(zp->reserve[i], ZP_CHUNK);
 	zp->reserve_n = 0;
@@ -178,7 +217,7 @@ zp_span_new(struct zpool *zp, int ci)
 		zp->fail_limit++;
 		return (NULL);
 	}
-	sp = ZP_HDR_ALLOC();
+	sp = zp_hdr_get(zp);
 	if (sp == NULL) {
 		zp->fail_nomem++;
 		return (NULL);
@@ -192,7 +231,7 @@ zp_span_new(struct zpool *zp, int ci)
 		zp->reserve_used++;
 	}
 	if (base == NULL) {
-		ZP_HDR_FREE(sp);
+		zp_hdr_put(zp, sp);
 		zp->fail_nomem++;
 		return (NULL);
 	}
@@ -260,13 +299,42 @@ zpool_free(struct zpool *zp, struct zspan *sp, uint16_t idx)
 int
 zpool_wants_refill(const struct zpool *zp)
 {
-	return (zp->reserve_n * 2 < zp->reserve_target);
+	return (zp->reserve_n * 2 < zp->reserve_target ||
+	    zp->hdr_n * 2 < zp->hdr_target);
 }
 
 void
 zpool_refill(struct zpool *zp)
 {
+	struct zspan *sp;
 	void *p;
+
+	/* Headers first: they are small, and a span needs one either way. */
+	for (;;) {
+		if (zp->lock != NULL)
+			ZP_LOCK(zp);
+		if (zp->hdr_n >= zp->hdr_target) {
+			if (zp->lock != NULL)
+				ZP_UNLOCK(zp);
+			break;
+		}
+		if (zp->lock != NULL)
+			ZP_UNLOCK(zp);
+		sp = ZP_HDR_ALLOC_WAIT();
+		if (sp == NULL)
+			break;
+		if (zp->lock != NULL)
+			ZP_LOCK(zp);
+		if (zp->hdr_n < zp->hdr_target) {
+			LIST_INSERT_HEAD(&zp->hdr_free, sp, all);
+			zp->hdr_n++;
+			sp = NULL;
+		}
+		if (zp->lock != NULL)
+			ZP_UNLOCK(zp);
+		if (sp != NULL)
+			ZP_HDR_FREE(sp);
+	}
 
 	for (;;) {
 		if (zp->lock != NULL)
