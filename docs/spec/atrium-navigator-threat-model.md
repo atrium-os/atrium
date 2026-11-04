@@ -1,7 +1,7 @@
 # Atrium Navigator — threat model: browsing a malicious site
 
-*Brainstorm, 2026-11-04. Status: proposed. It names gaps and ranks fixes; none of the fixes
-below is settled until the user decides it.*
+*Brainstorm, 2026-11-04. The user accepted all recommendations the same day (§3, §5), asked
+whether Fresco can be jailed (§2.5.1), and asked for the credential design (§6).*
 
 The question: a user opens a URL whose owner is hostile. What can the owner make happen,
 how far does it reach, and what still has to be built so the answer is "not much"?
@@ -166,22 +166,74 @@ What sits behind it:
 - the custom GPU kernel driver;
 - with `FRESCOD_RENDERER=gpu`, the RDNA4 kernels.
 
-A Fresco compromise is cross-site, because it sees every window. It is also one ioctl away
-from kernel code.
+#### 2.5.1 Proposed: Fresco runs jailed, split from the GPU authority
 
-**Mitigations, mostly existing.**
-- Apps never get direct GPU fds in production (GPU ABI decision).
-- Crash and stall recovery exists (GPU ABI §10.1–10.3), so a scene that hangs the GPU costs
-  a reset, not the machine.
+*Proposed 2026-11-04, answering the user's question.*
 
-**To add (P2).**
+The user asked whether Fresco can run in a jail, since it "just needs a shared memory
+aperture to the driver". **Yes.** It needs a little more than an aperture, and the ABI
+already has the right shape for it.
+
+**What a GPU renderer actually holds.** It submits command buffers the GPU executes, so it
+needs a client `device_fd` (GPU ABI v2.1 §4.1). That gives it:
+- `BO_CREATE`;
+- `VM_BIND` into its own GPU VM;
+- `SUBMIT`;
+- syncobjs;
+- `BO_EXPORT_SHARE`.
+
+Mapping shared memory alone would not let it draw. That client authority is separate from
+**control** authority:
+- `CLIENT_OPEN`, quotas and reset;
+- the exclusive display node: modeset, scanout commit, vblank.
+
+Today frescod's broker holds both, so the process that parses scene graphs also holds the
+device. That is §2's rule broken: authority and hostile input in one process.
+
+**The split.**
+
+| process | holds | parses hostile input |
+|---|---|---|
+| **GPU/display broker** (tiny, unjailed or minimally jailed) | `control_fd`, the display node, `CLIENT_OPEN` | **nothing**: it receives only `share_fd` + syncobj + timeline value for each frame, and commits it |
+| **Fresco compositor** (jailed, zero filesystem, zero network) | one client `device_fd` narrowed by `cap_ioctls_limit()` to the render subset; its client sockets; the shipped font set mapped read-only | scene graphs, glyph outlines, pixel buffers |
+
+The compositor renders into its own BOs and hands each finished frame to the broker by
+`share_fd` and syncobj. That is exactly GPU ABI §6.1's compositor flow, run in the other
+direction. The broker checks the buffer against the plane (§5.12 already lists that check)
+and flips. A crash costs a compositor restart, and the broker holds the last frame on
+screen (display ABI v2's hold-last-frame).
+
+**What the jail buys.** A compromised compositor gets none of these:
+- the user's files;
+- the network;
+- `execve` of a tool;
+- control ioctls: no device reset, no quota changes, no minting fds for others.
+
+Its GPU DMA is confined to its own VM. That is `gpu-isolation.md`'s invariant, and it holds
+only once the driver passes that spec's attestation gate.
+
+**What the jail does NOT buy, so it must be stated.**
+1. **The kernel ioctl surface is still reachable.** The client subset of §5.12 is exactly
+   what a compromised compositor can call. The jail removes everything around it, not the
+   ioctls themselves. So that subset is fuzzed with reached-coverage, as §4.7b does for the
+   validator (P2 below).
+2. **It still sees every window's pixels and routes input.** A compositor is cross-client
+   by job description. Two things follow.
+   - **Secure input** stays out of the compositor's reach, or at least has its own path:
+     password fields and the origin indicator (§2.11). The UI process sends keystrokes for
+     a password field directly to the broker's request builder (§6.4), never through a
+     surface the compositor could log.
+   - **Trusted chrome** is drawn by a separate surface that the broker composes on top,
+     so a compromised compositor cannot paint a fake origin.
+
+**Rating:** medium today (one process holds both authorities). With the split, low to
+medium, bounded by the client ioctl surface.
+
+**Also P2.**
 - Fuzz Fresco's own scene ingest, not only the broker's validator.
-- Assert scene limits inside Fresco as well, as defence in depth.
-- Have Fresco take glyph *outlines* or pre-shaped runs from the jailed side rather than
-  parsing fonts.
-- Fuzz the GPU driver's ioctl surface with the same reached-coverage discipline as §4.7b.
-
-**Rating:** medium. Few bugs are likely, but the blast radius is the whole system.
+- Fresco takes outlines for web fonts (§5, question 4).
+- The GPU stall recovery of GPU ABI §10.1–10.3 means a scene that hangs the GPU costs a
+  reset, not the machine.
 
 ### 2.6 The shared store — conversions in Tessera CAS (A5)
 
@@ -219,15 +271,12 @@ time to refresh a binding. A hostile page can declare whatever it likes.
 - The request goes through the per-origin fetcher of §7.7.
 - It is reported to the monitor (§10.5) if it ever names another origin.
 
-### 2.8 Credentials and logins (§7.7)
+### 2.8 Credentials and logins
 
-There are none today, which is why A1 currently yields no account takeover. The day a
-cookie jar exists:
-- it lives in a per-origin fetcher, never in the converter (§5.4.3 invariant 1);
-- an authenticated conversion is never shareable;
-- password autofill is bound to the exact origin, so a lookalike gets nothing.
-
-This is a **gate**, not a feature: no login support ships before per-origin partitioning.
+There are none today, which is why A1 currently yields no account takeover. Once logins
+exist, credentials are the asset an attacker most wants, so they get their own section:
+**§6**. The short version: no login support ships before §6's vault and per-origin fetcher
+exist.
 
 ### 2.9 Tier 4 and islands — Servo, SpiderMonkey, the CDM (§8.1, §11.9)
 
@@ -307,12 +356,13 @@ These belong in the model because they are *wins*, not because they need work:
 | P1 | Decide where images decode: per-document jail, memory-safe decoders, never in Fresco | A1 via decoders | design and medium code | §2.4 |
 | P1 | Per-user dedup domain by default; reproduce-to-share | A5 poisoning | design now, code with sharing | §2.6 |
 | P2 | `rctl` memory/CPU limits on converter and worker jails; per-conversion byte budget | A6 | small | §2.2 |
+| P1 | Split frescod: jailed compositor with a client `device_fd`, tiny broker holding control and display; secure-input path | A1 against the shared compositor | medium | §2.5.1 |
 | P2 | Fuzz Fresco scene ingest and the GPU ioctl surface; Fresco takes outlines, not fonts | A1 against the shared compositor | medium | §2.5 |
 | P2 | Broker rules for replayed request templates | A3, CSRF | design-time, with §5.4.5 | §2.7 |
 | P2 | Unobscured-input rule for islands; bhyve for the CDM | A2 clickjacking, kernel surface | medium, with §8.1 | §2.9 |
 | P2 | Scheme allowlist on link activation; download marking | A1/A2 | small | §2.10 |
 | P3 | Origin chrome, punycode for confusables, form warnings | A2 | product work | §2.11 |
-| gate | No login support before per-origin credential partitioning (§7.7) | account takeover | — | §2.8 |
+| gate | No login support before §6's vault and per-origin fetcher (C0) | account takeover | — | §6 |
 
 ## 4. The one-paragraph answer
 
@@ -331,7 +381,7 @@ one element that needs it.
 
 ## 5. Open questions, with recommendations
 
-*Recommendations, 2026-11-04; the user has not decided them yet.*
+*Recommendations accepted by the user, 2026-11-04.*
 
 1. **Is the converter jail's cost acceptable?** *Recommend: jail unconditionally, and
    measure the cost to report it, not to decide whether to jail.* A conversion already takes
@@ -357,3 +407,176 @@ one element that needs it.
    Web fonts reach it as glyph outlines, produced in the jail from the sanitised sfnt. The
    validator bounds them like any other path: points per glyph, glyphs per run. That
    removes the one place Fresco parses a hostile binary format.
+
+## 6. Credentials: cookies, sessions, tokens, SSO
+
+*Proposed 2026-11-04 at the user's request ("these are the ones we need to pay particular
+attention to"). None of it is built: the Navigator has no login support today.*
+
+A stolen session cookie or token is worth more to an attacker than code execution on most
+machines. It works from anywhere, for as long as the session lives, and it never trips a
+jail monitor. So the design goal is not only "a compromise cannot steal credentials". It is
+stronger: **no process that parses hostile input ever holds a credential in readable form.**
+
+### 6.1 What counts as a credential
+
+| kind | where it lives on the web | what an attacker does with it |
+|---|---|---|
+| session cookies (often `HttpOnly`) | cookie jar | replays the session from their own machine |
+| persistent "remember me" cookies | cookie jar | the same, for weeks |
+| bearer tokens, OAuth access and refresh tokens | page JS memory, `localStorage`, `sessionStorage` | calls the site's API as the user; a refresh token mints new ones indefinitely |
+| CSRF tokens | in the page's HTML or JS | forges a state-changing request |
+| passwords | typed into forms; the password manager | everything above, on every site that reuses it |
+| SSO / IdP sessions (Google, Microsoft, Okta) | the IdP's own cookies | logs in as the user to *every* relying party |
+| passkeys / WebAuthn private keys | an authenticator | nothing, if the key never leaves the authenticator |
+| client certificates | key store | impersonation at the TLS layer |
+
+The SSO row is the reason this is the highest-value asset class. One IdP cookie can be
+equivalent to all of the user's work accounts.
+
+### 6.2 The rule: credentials are attached, never handed over
+
+> **A credential is attached to a request by the fetcher, at send time, for exactly the
+> origin that owns it. No parser, converter, document worker, island engine or compositor
+> ever receives one.**
+
+Today's code already points this way. The fetcher strips Cookie, Referer and Authorization
+by construction (§2.1), and conversions are anonymous (§5.4.3 invariant 1). The rule turns
+"anonymous" into "credentialed, but with the credentials held where hostile code cannot
+read them".
+
+**The components** (extending backend §2):
+
+| component | holds | never holds |
+|---|---|---|
+| **credential vault** (new; no network, no parser) | the cookie jars, token store and password store, encrypted at rest, partitioned by origin | page content |
+| **per-origin fetcher** (§7.7, made concrete) | for the life of one request: the jar slice for that one origin, handed over by the vault | any other origin's credentials; any file |
+| converter, document worker, island engine | response bodies | `Set-Cookie` values, `Authorization` headers, the jar |
+| broker (`navigatord`) | which origins have a session (policy) | credential values |
+
+**How a request flows.**
+1. The worker or engine asks the fetcher for `GET https://mail.example/inbox`.
+2. The fetcher asks the vault for `mail.example`'s cookies matching that request: path,
+   `Secure`, `SameSite`, expiry.
+3. The vault answers, and the fetcher sends the request.
+4. On response, the fetcher **strips `Set-Cookie`** before passing the body on, and hands
+   the new cookies to the vault.
+5. The body reaches the parser. The cookies never do.
+
+**This is stronger than browsers.** In a mainstream browser, the renderer of an origin is
+trusted with that origin's non-`HttpOnly` cookies, and a renderer exploit commonly reaches
+the network stack's cookie store. Here even a compromised tier-4 engine **cannot read** the
+session cookie. It can only *ride* the session through the fetcher while it is alive, and
+§6.6 bounds that.
+
+### 6.3 Partitioning
+
+- **The partition key is (top-level site, origin).** An origin embedded under a different
+  top-level site gets a separate jar. That is CHIPS-style partitioning, applied to all
+  cookies.
+- **No third-party cookies, ever.** Partitioning makes them useless for tracking (A3), and
+  this project has no compatibility debt that would require them (§7.6's argument).
+- **`SameSite` defaults to `Lax`** when a site sets none, as current browsers do.
+- **`Secure` and `__Host-` prefixes are enforced.** A cookie from an `http:` origin can
+  never shadow an `https:` one.
+- **IdP cookies are first-party at the IdP.** A top-level navigation to
+  `accounts.google.com` uses that origin's own jar, so ordinary redirect-based SSO works
+  (§6.5).
+
+### 6.4 Logging in: passwords never enter a parser
+
+A login form is rendered by the document worker, but the **values typed into a password
+field must never reach it**.
+
+- The UI recognises a password field from the scene graph's semantic tree. The field is
+  marked by the worker, but the broker validates the mark: the field must sit inside a
+  form whose action is same-origin and `https`.
+- Keystrokes for that field go from the UI **to the broker's request builder**, not to the
+  worker. That is the secure-input path of §2.5.1. The worker sees only bullets.
+- Submission is a **user-initiated navigation**: a POST built by the broker from the form's
+  declared fields and sent through the per-origin fetcher. It is not the page network,
+  which stays GET-only (§5.4.1c).
+- **Password manager.** Autofill matches the exact origin, never the registrable domain
+  alone, and fills only on a user gesture. It refuses on `http:`, on a confusable domain
+  (§2.11) and inside a tier-4 island unless the user confirms.
+- **Passkeys first.** WebAuthn is the one credential that phishing cannot steal, because
+  the authenticator checks the origin itself. The broker implements the WebAuthn client:
+  - the RP ID check happens in trusted code, against the origin the fetcher actually
+    connected to;
+  - the private key stays in a platform authenticator, a separate process with no network
+    and no parser, or a hardware key;
+  - pages can request a credential, never read one.
+
+### 6.5 SSO, OAuth and OIDC
+
+The common flows, and what each needs:
+
+| flow | how it works | what the Navigator needs |
+|---|---|---|
+| redirect (OAuth code, SAML redirect, OIDC) | app → IdP → app with a `code` | top-level navigations across origins, each using its own jar: **works under §6.3** |
+| `form_post` / SAML POST | IdP returns an auto-submitting form | a self-submitting form with no JS. Recognise the pattern (a single form, hidden fields, an `onload` submit) and ask the user to continue, or allow it once the user has initiated login on that IdP |
+| popup login | `window.open` to the IdP, `postMessage` back | tier 4 only. In the document lane, rewrite it as a redirect where the IdP supports one (most do) |
+| silent renew in a hidden iframe (`prompt=none`) | the IdP iframe reads its own cookie under the app | **broken by partitioning**, as it already is under Safari ITP and Firefox TCP. Apps fall back to refresh tokens or a redirect. FedCM is the designed replacement; implement FedCM in the broker when tier 4 needs it |
+| device-bound sessions (DBSC) | the server binds a session to a key the device holds | **support it**: the key lives in the vault's keystore (or the TPM), so a stolen cookie is useless off this machine |
+
+**Tokens held in JS** (SPAs keeping an access token in memory or `localStorage`) are where
+the §6.2 rule bends. The page's own code reads the token and attaches it, so the engine
+sees it.
+- **Document lane with data bindings (§5.4.5).** A binding's request template carries a
+  credential *slot*, not a value: `Authorization: Bearer {vault:mail.example/api}`. The
+  fetcher fills the slot. The converter records the token's *shape and source* (which
+  response set it, which header used it), never the value. Where that works, the token
+  never sits in a document.
+- **Tier 4.** The engine holds the token. That is the honest exposure of the legacy lane
+  (§7.4). It is bounded by §6.6: one origin, a short-lived jail, and storage that persists
+  only through the vault, encrypted.
+
+### 6.6 Bounding what a compromise can do with a session
+
+A compromised engine for `mail.example` cannot read `HttpOnly` cookies, but it can make
+requests that carry them.
+
+- **Origin-locked fetcher.** A request outside the jail's own origin never carries any
+  credential, and is reported to the monitor (§10.5). That rule is exact, so it can
+  terminate rather than just warn.
+- **Session recycling (§11.9.1)** shortens the window in which a compromised engine can
+  ride the session.
+- **Rate and shape limits per origin.** For example, at most N state-changing requests a
+  minute without a user gesture. Mass deletion or exfiltration through the session then
+  becomes slow and visible.
+- **Step-up on sensitive actions** is the site's job, but passkeys (§6.4) make it cheap
+  for sites to ask.
+
+### 6.7 Storage, lifetime and clearing
+
+- The vault store is **encrypted at rest** with a key from the user's login keychain. It
+  is never in the CAS, never deduplicated and never shared (§2.6).
+- **Session cookies** (no `Expires`) die when the user closes the origin's last view, not
+  at process restart. Restoring sessions is an explicit setting.
+- **Per-origin clearing** is one action. "Log out everywhere" clears all jars and revokes
+  DBSC keys.
+- **Credentialed conversions are private.** A page fetched with credentials produces a
+  conversion that is per-user, tagged as credentialed, and never shareable. It is deleted
+  when that origin's jar is cleared. This closes the gap where a logged-in inbox ends up in
+  a deduplicated store.
+- **No sync** of jars or tokens without an explicit, per-destination user decision. The
+  same rule as the monitor's history (§10.6).
+
+### 6.8 Ranked work for credentials
+
+| # | work | gate for |
+|---|---|---|
+| C0 | Credential vault process plus per-origin fetcher; the fetcher strips `Set-Cookie` and attaches from the vault | **any** login support |
+| C0 | Credentialed conversions are private and unshareable | any login support |
+| C1 | Secure-input path for password fields; broker-built form POST | password login |
+| C1 | `(top-level site, origin)` partitioning; no third-party cookies; `Secure`, `SameSite=Lax` and prefix enforcement | any login support |
+| C1 | WebAuthn client in the broker plus a platform authenticator | phishing-resistant login |
+| C2 | Credential slots in §5.4.5 request templates | SPA data bindings with auth |
+| C2 | Origin-locked fetcher with monitor termination; per-origin request-rate limits | tier-4 login |
+| C2 | DBSC support | stolen-cookie resistance |
+| C3 | FedCM; `form_post` continuation | the remaining SSO flows |
+
+**Open question.** Is the vault its own process, or a mode of `navigatord`? *Recommend: its
+own process.* `navigatord` holds the store and jail-spawn authority. Adding credentials
+would make it the single highest-value process on the machine. Two small processes with
+one job each are easier to reason about, and to fuzz, than one that holds everything.
