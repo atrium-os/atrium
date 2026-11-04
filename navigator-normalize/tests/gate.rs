@@ -1269,3 +1269,18 @@ fn grid_shorthands_become_templates() {
     assert!(!report.dropped.keys().any(|k| k == "property `grid`" || k == "property `grid-template`"), "{:?}", report.dropped);
     assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
 }
+
+/// ★ A negative grid line is a number counted from the end, not a NAME:
+/// `grid-column: 1 / -1` is the full-width idiom, and reading `-1` as an
+/// ident dropped it as a name no template has.
+#[test]
+fn negative_grid_lines_are_numbers() {
+    let src = r#"<html><head><style>
+      .g { display: grid; grid-template-columns: 10px 10px 10px }
+      .a { grid-column: 1 / -1 } .b { grid-row-start: -2 }
+    </style></head><body><div class="g"><div class="a">a</div><div class="b">b</div></div></body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    assert!(out.contains("grid-column-end: -1") && out.contains("grid-row-start: -2"), "{out}");
+    assert!(!report.dropped.keys().any(|k| k.contains("grid line name")), "{:?}", report.dropped);
+    assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+}

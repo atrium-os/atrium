@@ -1379,6 +1379,10 @@ fn is_line_name(v: &str) -> bool {
     !v.is_empty() && !v.contains(' ') && v != "auto" && !matches!(v, "inherit" | "initial" | "unset" | "revert")
         && v.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '-' || c == '_')
         && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        // ★ `-3` is a NUMBER, the third line from the end — an ident never
+        // starts with `-` and a digit. Read as a name, every negative line
+        // was dropped as "no parent template has it".
+        && !(v.starts_with('-') && v[1..].starts_with(|c: char| c.is_ascii_digit()))
 }
 
 /// `[a b] 1fr [c] minmax(0, 2fr) [d]` -> `a=1 b=1 c=2 d=3`: each name and
