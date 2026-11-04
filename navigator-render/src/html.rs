@@ -969,10 +969,14 @@ impl<'a> Cx<'a> {
             V::Kw(_) => match (left, right) {
                 // Both offsets definite: the width is what is left between them.
                 (Some(l), Some(r)) => (cbw - l - r - ml - mr).max(frame),
-                // Otherwise shrink-to-fit against what is available.
+                // Otherwise shrink-to-fit against what is available:
+                // min(max(min-content, available), max-content). ★ The
+                // min-content floor is NOT clamped by the available width —
+                // an offset like `right: calc(100% + 2px)` leaves none, and
+                // a box 0 wide spilled its content over its neighbour.
                 _ => {
                     let avail = (cbw - left.or(right).unwrap_or(0) - ml - mr - frame).max(0);
-                    frame + mx.min(avail).max(mn.min(avail))
+                    frame + mx.min(avail.max(mn))
                 }
             },
             v => len(v, cbw).unwrap_or(0),
@@ -3462,6 +3466,23 @@ mod tests {
         assert_eq!(p.len(), 1);
         assert_eq!((p[0].0, p[0].1), (0, 10));
         assert!(p[0].2 > 0 && p[0].2 < 100, "shrink-to-fit, not 800: {}", p[0].2);
+    }
+
+    #[test]
+    fn an_absolute_box_pushed_past_its_containing_block_keeps_its_min_content_width() {
+        // BBC News's seat-change badge: `right: calc(100% + 2px)` against a
+        // 40 px containing block leaves NO room, and shrink-to-fit is
+        // min(max(min-content, available), max-content) (CSS 2.1 §10.3.7) —
+        // the min-content floor is not clamped by the available width. At 0
+        // wide the badge's content spilled rightwards over the number it
+        // sits beside.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .cb { position: relative; margin-left: 100px; width: 40px; height: 10px }
+            .p { position: absolute; right: calc(100% + 2px); top: 0px; height: 10px; background-color: #0000ff }
+            .i { width: 20px; height: 10px }</style>
+            <div class="cb"><div class="p"><div class="i"></div></div></div>"#);
+        // 20 wide, its right edge 2 px left of the containing block's left.
+        assert_eq!(boxes(&o, 0x0000ffff), vec![(78, 0, 20, 10)]);
     }
 
     /// The case that says whether `z-index: auto` was treated as a stacking
