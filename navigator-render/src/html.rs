@@ -2110,7 +2110,8 @@ impl<'a> Cx<'a> {
             let ih = match it.align.as_str() {
                 "stretch" if !(at || ab) => specified_h.unwrap_or(room_h),
                 // `measure` answers with the margins; the box is without them.
-                _ => specified_h.unwrap_or_else(|| self.measure(it.h, iw, None, (Some(iw), None)) - mt - mb).min(ah),
+                // An auto height is the content's, and may overflow the area.
+                _ => specified_h.unwrap_or_else(|| self.measure(it.h, iw, None, (Some(iw), None)) - mt - mb),
             };
             let ih = clamp_by(ih, "min-height", "max-height", ah);
             // Offsets of the margin box; `block` adds the start margins.
@@ -2391,7 +2392,18 @@ impl<'a> Cx<'a> {
         let specified_w = cs.and_then(|cs| len(cs.get("width"), aw));
         let iw = match justify {
             "stretch" if !(auto("margin-left") || auto("margin-right")) => specified_w.unwrap_or(room_w),
-            _ => specified_w.unwrap_or_else(|| self.intrinsic_outer_w(h, room_w)).min(aw),
+            // A SPECIFIED width is the width, larger than the area or not;
+            // an auto one is FIT-CONTENT (Grid §11.1): the area caps the
+            // max-content width but never below min-content, so an item
+            // too wide for a 10px track overflows it.
+            _ => specified_w.unwrap_or_else(|| {
+                let fit = self.intrinsic_outer_w(h, room_w);
+                let min = cs.map_or(0, |cs| {
+                    let b = |side: &str| if kw(cs, &format!("border-{side}-style")) == "none" { 0 } else { len(cs.get(&format!("border-{side}-width")), 0).unwrap_or(0) };
+                    len(cs.get("padding-left"), aw).unwrap_or(0) + len(cs.get("padding-right"), aw).unwrap_or(0) + b("left") + b("right")
+                }) + self.intrinsic(h).0;
+                fit.max(min)
+            }),
         };
         let iw = cs.and_then(|cs| len(cs.get("max-width"), aw)).map_or(iw, |m| iw.min(m));
         cs.and_then(|cs| len(cs.get("min-width"), aw)).map_or(iw, |m| iw.max(m))
@@ -4880,6 +4892,19 @@ mod tests {
             <div class="g"><div></div><div class="s"></div></div>"#);
         assert_eq!(boxes(&o, 0xff0000ff), vec![(110, 20, 40, 20)], "end + centre inside a 150×60 area");
         assert_eq!(boxes(&o, 0x00ff00ff), vec![(150, 0, 150, 60)], "stretch fills its area");
+    }
+
+    /// A non-stretched auto-sized grid item is FIT-CONTENT in its area
+    /// (Grid §11.1): never narrower than its min-content, never shorter
+    /// than its content (WPT grid-minimum-size-grid-items-014).
+    #[test]
+    fn a_start_aligned_grid_item_overflows_a_small_area() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; grid-template-columns: 10px; grid-template-rows: 10px }
+            .i { justify-self: start; align-self: start; background-color: #00ff00 }
+            .c { width: 100px; height: 100px }</style>
+            <div class="g"><div class="i"><div class="c"></div></div></div>"#);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(0, 0, 100, 100)]);
     }
 
     #[test]
