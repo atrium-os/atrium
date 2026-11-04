@@ -139,6 +139,15 @@ Working in the cloud amd64 VM (`ARCH=amd64 sh scripts/cloud-vm.sh up`):
     the BLAKE3 self-test passes on the portable path, and the scheduler is Laminar.
   - A 64 MiB write and sync works, with no WITNESS lock-order reports.
 - Portcullis cross-builds (`TARGET=x86_64-unknown-freebsd`). All 6 kmod trees build in the guest.
+- **Navigator jail e2e passes on amd64 on the Tessera root**: 1 document, 1 jail, no leaks, all
+  refusals intact. It took two fixes, both now in `build-tessera-devroot.sh`:
+  - Filesystem modules (nullfs, unionfs, p9fs, ...) must come from the fork tree. Stock
+    modules fail with "version mismatch" and jails die at mount_nullfs.
+  - The devroot keeps the source rc.conf's Portcullis settings (jaild enables, devfs_rulesets,
+    pf). Without them, jaild is down and devfs ruleset 22 is empty.
+- Open: `pfctl -s rules` prints `DIOCOSFPGET: Operation not supported`. This looks like an
+  ioctl mismatch between the stock 16-CURRENT userland and the fork kernel. Building world
+  from the fork would settle it.
 - Still to do: kmod selftests on amd64, navigator e2e on amd64, and gpusim in
   `qemu-system-x86_64` (atrium-gpu-amd has no device to attach to until then).
 

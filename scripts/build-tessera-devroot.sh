@@ -69,10 +69,16 @@ mkdir -p $T/boot/kernel
 cp /boot/laminar/kernel $T/boot/kernel/kernel
 # Modules built alongside the Atrium kernel (zfs, pf, ...) come too.
 cp /boot/laminar/*.ko $T/boot/kernel/ 2>/dev/null || true
-# loader.conf below preloads p9fs + nullfs; take them from the running
-# module dir when the Atrium kernel dir doesn't carry them.
-for m in p9fs nullfs; do
-    [ -e $T/boot/kernel/$m.ko ] || cp /boot/kernel/$m.ko $T/boot/kernel/ 2>/dev/null || true
+# loader.conf preloads p9fs; portcullis jails need nullfs + unionfs. All must be
+# built from the SAME tree as the kernel: a stock /boot/kernel copy fails
+# with "depends on kernel - version mismatch", and jails then die at
+# mount_nullfs. If /boot/laminar lacks them, build them from /usr/src (the
+# fork tree).
+for m in p9fs nullfs unionfs tmpfs fdescfs; do
+    [ -e $T/boot/kernel/$m.ko ] && continue
+    o=$(cd /usr/src/sys/modules/$m && make -V .OBJDIR)
+    [ -f $o/$m.ko ] || (cd /usr/src/sys/modules/$m && make SYSDIR=/usr/src/sys >/dev/null)
+    cp $o/$m.ko $T/boot/kernel/
 done
 cp "$KMOD" $T/boot/kernel/tessera_fs.ko
 cp -a /boot/lua $T/boot/lua
@@ -96,7 +102,13 @@ cat > $T/etc/fstab <<'EOF'
 /dev/vtbd0p2	/		tessera	rw		0	0
 bsd_share	/mnt/host	p9fs	trans=virtio,rw,late,failok	0	0
 EOF
-cat > $T/etc/rc.conf <<'EOF'
+# Keep the source root's service settings (the Portcullis stack's
+# atrium_*_enable, devfs_rulesets, pf_*, gateway_enable written by
+# deploy-portcullis.sh). Dropping them leaves jaild down and devfs ruleset 22
+# empty, so every jail is refused. ZFS-only and identity lines are dropped;
+# the devroot lines below come last and win.
+grep -vE '^(zfs_enable|zfsd_enable|zpool_[a-z]*|growfs_enable|hostname|ifconfig_[A-Za-z0-9_]*|kld_list)=' /etc/rc.conf > $T/etc/rc.conf 2>/dev/null || true
+cat >> $T/etc/rc.conf <<'EOF'
 hostname="atrium-devroot"
 ifconfig_vtnet0="DHCP"
 sshd_enable="YES"
