@@ -204,6 +204,14 @@ pub const LDS_SIZE_UNIT: u32 = 512;
 
 /// Append the state and launch for `d` to `b`.
 pub fn emit_dispatch(b: &mut Blob, d: &Dispatch) {
+    emit_dispatch_at(b, d, [0; 3]);
+}
+
+/// Like [`emit_dispatch`], with the workgroup ids starting at `start`
+/// (COMPUTE_START_X/Y/Z, FORCE_START_AT_000 clear): `d.groups` workgroups
+/// with ids `start .. start + groups`. Lets a kernel run on a sub-rectangle
+/// of its grid without knowing it.
+pub fn emit_dispatch_at(b: &mut Blob, d: &Dispatch, start: [u32; 3]) {
     use regs::*;
     assert_eq!(d.shader_va & 0xff, 0, "shader VA must be 256-byte aligned");
     assert!(d.user_sgprs.len() <= 16);
@@ -251,13 +259,13 @@ pub fn emit_dispatch(b: &mut Blob, d: &Dispatch) {
                COMPUTE_STATIC_THREAD_MGMT_SE2, COMPUTE_STATIC_THREAD_MGMT_SE3] {
         b.set_sh(se, &[0xffff_ffff]);
     }
-    b.set_sh(COMPUTE_START_X, &[0, 0, 0]);
+    b.set_sh(COMPUTE_START_X, &start);
     b.set_sh(COMPUTE_NUM_THREAD_X, &d.threads);
     if !d.user_sgprs.is_empty() {
         b.set_sh(COMPUTE_USER_DATA_0, &d.user_sgprs);
     }
     let initiator = (1 << compute_dispatch_initiator::COMPUTE_SHADER_EN_SHIFT)
-        | (1 << compute_dispatch_initiator::FORCE_START_AT_000_SHIFT)
+        | if start == [0; 3] { 1 << compute_dispatch_initiator::FORCE_START_AT_000_SHIFT } else { 0 }
         | if d.wave32 { 1 << compute_dispatch_initiator::CS_W32_EN_SHIFT } else { 0 };
     b.packet(op::DISPATCH_DIRECT, &[d.groups[0], d.groups[1], d.groups[2], initiator]);
 }

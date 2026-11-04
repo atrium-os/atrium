@@ -115,3 +115,32 @@ fn tier2_matches_reference() {
     let (n, worst) = diff(&got, &reference::render(&f));
     assert_eq!(n, 0, "{n} pixels differ, worst channel delta {worst}");
 }
+
+/// Re-rastering only the tiles whose signature changed, over the previous
+/// image, gives the full render of the new scene; unchanged tiles are skipped.
+#[test]
+fn damage_redraw_matches_full_render() {
+    use fresco_compute::damage;
+    let before = scene();
+    let mut after = scene();
+    after.rects[1].position[0] += 9.0;
+    after.paths[1].color = [0.2, 0.2, 0.9, 1.0];
+    let (fa, fb) = (Frame::pack(&after, 72, 40, 80), Frame::pack(&before, 72, 40, 80));
+    let d = damage::dirty(&damage::tile_signatures(&fa), Some(&damage::tile_signatures(&fb)));
+    let h = fa.header;
+    assert!(d.iter().any(|&x| !x) && d.iter().any(|&x| x), "{d:?}");
+    let rects = damage::rects(&d, h.tiles_x, h.tiles_y, 16);
+    let mut img = reference::render(&fb);
+    let mask = reference::bin(&fa);
+    for r in &rects {
+        for y in r[1] * TILE..(r[3] * TILE).min(h.height) {
+            for x in r[0] * TILE..(r[2] * TILE).min(h.width) {
+                img[(y * h.pitch + x) as usize] = reference::pixel(&fa, &mask, x, y);
+            }
+        }
+    }
+    assert_eq!(img, reference::render(&fa));
+    // A frame identical to what the buffer holds needs no raster at all.
+    let same = damage::dirty(&damage::tile_signatures(&fa), Some(&damage::tile_signatures(&fa)));
+    assert!(damage::rects(&same, h.tiles_x, h.tiles_y, 16).is_empty());
+}

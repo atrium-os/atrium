@@ -153,8 +153,14 @@ impl Kernel {
     /// Append the state and launch for a dispatch (see [`Kernel::dispatch`])
     /// to `ib`.
     pub fn record(&self, ib: &mut Blob, code_va: u64, buffers: &[((u32, u32), u64)], push_va: Option<u64>, groups: [u32; 3]) -> Result<(), Error> {
+        self.record_at(ib, code_va, buffers, push_va, [0; 3], groups)
+    }
+
+    /// Like [`Kernel::record`], for workgroup ids `start .. start + groups`
+    /// of a larger grid (COMPUTE_START_X/Y/Z).
+    pub fn record_at(&self, ib: &mut Blob, code_va: u64, buffers: &[((u32, u32), u64)], push_va: Option<u64>, start: [u32; 3], groups: [u32; 3]) -> Result<(), Error> {
         let d = self.dispatch(code_va, buffers, push_va, groups)?;
-        atrium_rdna4_cmd::emit_dispatch(ib, &d);
+        atrium_rdna4_cmd::emit_dispatch_at(ib, &d, start);
         Ok(())
     }
 }

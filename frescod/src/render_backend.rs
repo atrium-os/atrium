@@ -300,7 +300,13 @@ pub struct GpuCompute<'a> {
     /// VRAM BO per binding (none for the target, which is the scanout).
     bufs: Vec<Option<Bo<'a>>>,
     ring: Bo<'a>,
+    /// Tile signatures of the frame each scanout buffer (by GPU address)
+    /// holds: the next frame into that buffer rasters only tiles that differ.
+    held: HashMap<u64, Vec<u64>>,
 }
+
+/// More dirty rectangles than this raster their bounding box instead.
+const MAX_DAMAGE_RECTS: usize = 32;
 
 fn grow<'a>(vm: &'a Vm<'a>, bo: Option<Bo<'a>>, need: u64, flags: u32) -> std::io::Result<Bo<'a>> {
     match bo {
@@ -325,6 +331,7 @@ impl<'a> GpuCompute<'a> {
             k,
             scene: SceneState::default(),
             frame: None,
+            held: HashMap::new(),
         })
     }
 
@@ -379,7 +386,14 @@ impl<'a> GpuCompute<'a> {
             code: [self.code.gpu_va(), self.code.gpu_va() + raster_off],
             buffers: va,
         };
-        self.k.record(&mut ib, &addrs, &f).map_err(|e| format!("rdna4 record: {e}"))?;
+        // Damage: raster only the tiles that differ from what this buffer holds.
+        let sig = fresco_compute::damage::tile_signatures(&f);
+        let dirty = fresco_compute::damage::dirty(&sig, self.held.get(&target.gpu_va()).map(|v| v.as_slice()));
+        let (tx, ty) = (f.header.tiles_x, f.header.tiles_y);
+        let rects = fresco_compute::damage::rects(&dirty, tx, ty, MAX_DAMAGE_RECTS);
+        log::debug!("gpu: {} of {} tiles dirty, {} raster dispatches", dirty.iter().filter(|&&d| d).count(), dirty.len(), rects.len());
+        self.k.record_tiles(&mut ib, &addrs, &f, &rects).map_err(|e| format!("rdna4 record: {e}"))?;
+        self.held.insert(target.gpu_va(), sig);
         // End of pipe: write the fence, then interrupt (signals `signal`).
         let fence = self.ring.gpu_va() + FENCE_OFFSET;
         ib.packet(IT_RELEASE_MEM, &[5 << 8, (2 << 29) | (2 << 24), fence as u32, (fence >> 32) as u32, 1, 0]);

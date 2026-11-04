@@ -300,6 +300,7 @@ pub fn all() -> Vec<Case> {
     v.extend(crate::fresco::bin());
     v.extend(crate::fresco::raster());
     v.extend(crate::fresco::frame());
+    v.extend(crate::fresco::damage());
     v.extend(spilled());
     v
 }

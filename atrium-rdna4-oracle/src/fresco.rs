@@ -153,13 +153,41 @@ pub fn frame() -> Option<Case> {
 
 /// [`frame`] for any scene and target.
 pub fn frame_of(name: &str, scene: &Scene, w: u32, h: u32, pitch: u32) -> Option<Case> {
+    damaged_frame_of(name, None, scene, w, h, pitch)
+}
+
+/// A damage-limited redraw as frescod records it: the target starts with
+/// `before` rendered, only the tiles whose signature changed are rastered
+/// (one dispatch per rectangle, at a nonzero COMPUTE_START), and the result
+/// must equal a full render of `scene`. Checks the tile signatures and the
+/// workgroup-id offset of COMPUTE_START_X/Y on the device.
+pub fn damage() -> Option<Case> {
+    let before = scene();
+    let mut after = scene();
+    after.rects[1].position[0] += 9.0; // moves into the 3rd and 4th tile columns
+    after.paths[1].color = [0.2, 0.2, 0.9, 1.0];
+    damaged_frame_of("fresco_damage", Some(&before), &after, W, H, PITCH)
+}
+
+fn damaged_frame_of(name: &str, before: Option<&Scene>, scene: &Scene, w: u32, h: u32, pitch: u32) -> Option<Case> {
+    use fresco_compute::damage;
     use fresco_compute::rdna4::{Addrs, Rdna4};
     let k = Rdna4::new().ok()?;
     let f = Frame::pack(scene, w, h, pitch);
     let (raster_off, code_end) = k.code_layout();
     // Buffers back to back from the first data address, each page aligned
     // (a 1080p target is larger than data_va's 1 MiB slots).
-    let init = f.buffers();
+    let mut init = f.buffers();
+    let (hx, hy) = (f.header.tiles_x, f.header.tiles_y);
+    let rects = match before {
+        Some(b) => {
+            let fb = Frame::pack(b, w, h, pitch);
+            init[binding::TARGET as usize] = bytes(&reference::render(&fb));
+            let d = damage::dirty(&damage::tile_signatures(&f), Some(&damage::tile_signatures(&fb)));
+            damage::rects(&d, hx, hy, 16)
+        }
+        None => vec![[0, 0, hx, hy]],
+    };
     let mut next = data_va(0);
     let va: [u64; binding::COUNT] = std::array::from_fn(|b| {
         let v = next;
@@ -168,7 +196,7 @@ pub fn frame_of(name: &str, scene: &Scene, w: u32, h: u32, pitch: u32) -> Option
     });
     let a = Addrs { code: [CODE_VA, CODE_VA + raster_off], buffers: va };
     let mut ib = Blob::compute();
-    k.record(&mut ib, &a, &f).ok()?;
+    k.record_tiles(&mut ib, &a, &f, &rects).ok()?;
     ib.pad(8);
     let [bin, raster] = k.code();
     let mut code = bin;

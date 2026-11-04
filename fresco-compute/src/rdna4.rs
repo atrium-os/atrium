@@ -9,7 +9,7 @@
 
 use atrium_rdna4::{Blob, Error, Kernel, Options, CODE_ALIGN};
 
-use crate::{binding, Frame, BIN_SPV, RASTER_SPV};
+use crate::{binding, Frame, BIN_SPV, RASTER_LOCAL, RASTER_SPV, TILE};
 
 /// The two compiled kernels.
 pub struct Rdna4 {
@@ -59,13 +59,33 @@ impl Rdna4 {
     /// wait for it and make the masks visible, raster. The mask must be
     /// zero when the IB starts.
     pub fn record(&self, ib: &mut Blob, a: &Addrs, f: &Frame) -> Result<(), Error> {
+        let h = &f.header;
+        self.record_tiles(ib, a, f, &[[0, 0, h.tiles_x, h.tiles_y]])
+    }
+
+    /// Like [`Rdna4::record`], rastering only the tile rectangles `rects`
+    /// (`[tx0, ty0, tx1, ty1)`, see [`crate::damage::rects`]); the rest of
+    /// the target keeps what it held. Each rectangle is one raster dispatch
+    /// over its workgroups (COMPUTE_START), so the kernel is unchanged.
+    pub fn record_tiles(&self, ib: &mut Blob, a: &Addrs, f: &Frame, rects: &[[u32; 4]]) -> Result<(), Error> {
+        if rects.is_empty() {
+            return Ok(());
+        }
         let bind: Vec<((u32, u32), u64)> =
             a.buffers.iter().enumerate().map(|(b, &va)| ((0, b as u32), va)).collect();
         ib.acquire_all();
         self.bin.record(ib, a.code[0], &bind, None, f.bin_groups())?;
         ib.cs_partial_flush();
         ib.acquire_all();
-        self.raster.record(ib, a.code[1], &bind, None, f.raster_groups())?;
+        let per = TILE / RASTER_LOCAL; // raster workgroups per tile edge
+        let [gx, gy, _] = f.raster_groups();
+        for r in rects {
+            let (x0, y0) = (r[0] * per, r[1] * per);
+            let (x1, y1) = ((r[2] * per).min(gx), (r[3] * per).min(gy));
+            if x1 > x0 && y1 > y0 {
+                self.raster.record_at(ib, a.code[1], &bind, None, [x0, y0, 0], [x1 - x0, y1 - y0, 1])?;
+            }
+        }
         ib.cs_partial_flush();
         Ok(())
     }
