@@ -53,6 +53,8 @@ pub struct Conversion {
     pub interactive_found: u32,
     /// Per-element exploration coverage (legacy-web §5.4.5.6).
     pub coverage: Vec<engine::Interactive>,
+    /// What exploration spent: handlers, probes, cuts, time.
+    pub explore_stats: engine::ExploreStats,
     pub elements_after: usize,
     pub depth_after: usize,
     pub scripts_total: usize,
@@ -254,6 +256,7 @@ pub fn convert_with_opts(
         transitions: rep.transitions,
         interactive_found: rep.interactive_found,
         coverage: rep.coverage,
+        explore_stats: rep.explore_stats,
         elements_after: dom.element_count(),
         depth_after: dom.max_depth(),
         scripts_total: scripts.len(),

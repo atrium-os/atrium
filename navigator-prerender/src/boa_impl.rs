@@ -2258,7 +2258,20 @@ fn run_injected_scripts(ctx: &mut Context, errors: &mut Vec<String>) -> (u32, u3
 /// data-dependent states by definition. Conversions carry no credentials
 /// either — they are shared through a content-addressed store, so there is
 /// no session to damage.
-const MAX_PROBES: usize = 64;
+///
+/// ★ The two bounds, chosen from an UNBOUNDED run of both corpora (122
+/// documents with exploration, `scripts/navigator-corpus/budget.py`,
+/// legacy-web §5.4.5.6b): 943 distinct handlers, median 1 per document, p90
+/// 22, max 85 (walgreens); a probe costs at most 14.6 ms (a recipe page).
+/// - MAX_PROBES = 256 per document: 3x the most handlers any document has,
+///   so every handler gets its first probe everywhere measured, and the
+///   worst case is 256 x 15 ms, about 4 s, inside the 30 s deadline.
+/// - PROBES_PER_HANDLER = 8: each doubling past 8 adds under half as many
+///   probes as the one before (2102 at 4, 3152 at 8, 4397 at 16) while the
+///   worst document stays at 1.8 s measured.
+const MAX_PROBES: usize = 256;
+/// Probes per distinct handler. See `explore_states` for the budget.
+const PROBES_PER_HANDLER: usize = 8;
 /// Caps on what one transition may carry. A recording is an ANNOTATION on the
 /// tier 1 document; a transition that shipped a whole page would quietly turn
 /// it back into a second artifact.
@@ -2755,8 +2768,10 @@ fn credit(c: &mut crate::engine::Interactive, r: &ProbeResult) {
     c.timers_left += k.4; c.intervals_left += k.5;
 }
 
-fn explore_states(ctx: &mut Context, parser_nodes: Handle) -> (Vec<crate::engine::Transition>, u32, Vec<crate::engine::Interactive>) {
-    use crate::engine::Interactive;
+fn explore_states(ctx: &mut Context, parser_nodes: Handle, bounds: (usize, usize))
+    -> (Vec<crate::engine::Transition>, u32, Vec<crate::engine::Interactive>, crate::engine::ExploreStats)
+{
+    let (per_handler, total) = bounds;
     // Elements the page itself wired for interaction. Nothing is guessed:
     // these are the handlers it actually registered.
     let listeners = element_listeners(ctx);
@@ -2775,7 +2790,7 @@ fn explore_states(ctx: &mut Context, parser_nodes: Handle) -> (Vec<crate::engine
         }
     }
     let found = direct.len() as u32;
-    let mut direct_set: std::collections::HashSet<(Handle, Gesture)> =
+    let direct_set: std::collections::HashSet<(Handle, Gesture)> =
         direct.iter().map(|p| (p.target, p.gesture.clone())).collect();
     // Document- and window-level listeners: discovered by a probe at <body>,
     // which is also what a click on the page's background does.
@@ -2796,89 +2811,157 @@ fn explore_states(ctx: &mut Context, parser_nodes: Handle) -> (Vec<crate::engine
     let saved_net = PAGE_NET.with(|n| n.borrow_mut().take());
     EXPLORING.with(|e| *e.borrow_mut() = true);
 
+    // ★★ THE BUDGET IS PER HANDLER, NOT FIRST-COME.
+    //
+    // A flat cap of 64 probes in handle order spent the whole budget on the
+    // first 64 of 255 near-identical spec <dfn>s and never reached the rest
+    // of the page (§5.4.5.6a: 584 elements cut, in 5 documents). Candidates
+    // are grouped by handler key and served ROUND-ROBIN: round r gives every
+    // handler that still has a candidate its (r+1)th probe, so every
+    // distinct handler is probed once before any is probed twice. A handler
+    // stops at `per_handler` probes and the document at `total`, so the
+    // worst case is bounded whatever the page registers. Delegated
+    // candidates join under their own keys as discovery probes find them,
+    // and are served from the round that is running.
+    struct KeyQ { cands: std::collections::VecDeque<Probe>, taken: usize }
+    fn enqueue(keys: &mut Vec<KeyQ>, ix: &mut HashMap<u64, usize>, p: Probe) {
+        let i = *ix.entry(p.key).or_insert_with(|| {
+            keys.push(KeyQ { cands: Default::default(), taken: 0 });
+            keys.len() - 1
+        });
+        keys[i].cands.push_back(p);
+    }
+    let mut keys: Vec<KeyQ> = vec![];
+    let mut key_ix: HashMap<u64, usize> = HashMap::new();
+    for p in direct { enqueue(&mut keys, &mut key_ix, p) }
+
     let mut out = vec![];
-    let mut queue: std::collections::VecDeque<Probe> = direct.into();
+    let mut stats = crate::engine::ExploreStats::default();
     let mut ran = 0usize;
     let mut delegated_seen: std::collections::HashSet<(Handle, Gesture)> = Default::default();
-    while let Some(p) = queue.pop_front() {
-        if ran >= MAX_PROBES {
-            // Cut: the element keeps `over_cap`, which `probed` clears.
-            continue;
-        }
-        ran += 1;
-        let r = run_probe(ctx, &p, parser_nodes);
-        let recorded = r.transition.is_some();
-        let truncated = r.transition.as_ref().is_some_and(|t| t.effects.iter()
-            .any(|e| matches!(e, crate::engine::Effect::Truncated { .. })));
-        let targets: Vec<String> = r.transition.as_ref().map(|t| t.effects.iter().filter_map(|e| match e {
-            crate::engine::Effect::Attribute { target, .. } | crate::engine::Effect::Remove { target } => Some(target.clone()),
-            crate::engine::Effect::Insert { parent, .. } => Some(parent.clone()),
-            _ => None,
-        }).collect()).unwrap_or_default();
-
-        // The target's own entry; a delegated target outside the universe
-        // (a <li>, an <a>) gets one marked `outside`.
-        let tgt_key = if p.root == Some(Root::Doc) && p.discover.is_some() { DOC_ENTRY } else { p.target };
-        let entry = cov.entry(tgt_key).or_insert_with(|| {
-            let mut e = Interactive { outside: true, ..Default::default() };
-            describe(p.target, &mut e);
-            e
-        });
-        entry.probed = true;
-        entry.over_cap = false;
-        if p.root.is_some() && tgt_key != DOC_ENTRY { entry.delegated = true }
-        let g = p.gesture.name();
-        if !entry.gestures.contains(&g) { entry.gestures.push(g) }
-        credit(entry, &r);
-        if recorded {
-            entry.recorded = true;
-            entry.truncated |= truncated;
-            for t in &targets { if !entry.effect_targets.contains(t) { entry.effect_targets.push(t.clone()) } }
-        }
-        // ★ Credit the delegating root too: its handler is what ran.
-        if let Some(root) = p.root {
-            let rk = match root { Root::El(a) => a, Root::Doc => DOC_ENTRY };
-            if rk != tgt_key {
-                if let Some(re) = cov.get_mut(&rk) {
-                    credit(re, &r);
-                    if recorded {
-                        re.via = true;
-                        for t in &targets { if !re.effect_targets.contains(t) { re.effect_targets.push(t.clone()) } }
-                    }
-                }
+    'rounds: for round in 0..per_handler {
+        let mut progressed = false;
+        let mut i = 0;
+        while i < keys.len() {
+            if ran >= total { break 'rounds }
+            if keys[i].taken > round { i += 1; continue }
+            let Some(p) = keys[i].cands.pop_front() else { i += 1; continue };
+            if !progressed { stats.rounds += 1; progressed = true }
+            keys[i].taken += 1;
+            i += 1;
+            ran += 1;
+            for d in probe_and_record(ctx, &p, parser_nodes, &mut cov, &mut out,
+                                      &direct_set, &mut delegated_seen) {
+                enqueue(&mut keys, &mut key_ix, d);
             }
         }
-        if let Some(t) = r.transition { out.push(t) }
+        if !progressed { break }
+    }
 
-        // ★★ DELEGATION. A listener on an ancestor (a list, <body>, the
-        // document) that dispatches on `event.target` reaches no component
-        // when probed on itself: React-style roots and jQuery `.on(sel)`
-        // both work this way, and the §5.4.5.6a measurement found the
-        // buttons they serve listed as native controls with no handler.
-        // Probe the descendants it tested for, or failing that, the
-        // interactive ones.
-        if p.discover.is_some() {
-            let root_h = match p.root { Some(Root::Doc) => 0, _ => p.target };
-            let root = p.root.unwrap_or(Root::El(p.target));
-            let mut extra = vec![];
-            for (t, by) in delegated_targets(root_h, &r.selectors) {
-                if t == p.target { continue }
-                let Some(g) = delegated_gesture(&p.gesture, t) else { continue };
-                // A descendant with its own listener for this gesture is
-                // probed directly, and its probe bubbles here anyway.
-                if direct_set.contains(&(t, g.clone())) { continue }
-                if !delegated_seen.insert((t, g.clone())) { continue }
-                let key = fnv(&format!("{}\u{1}{by}", p.key));
-                extra.push(Probe { target: t, gesture: g, key, root: Some(root), discover: None });
-            }
-            queue.extend(extra);
+    // What the bounds left. An element cut under a handler that WAS probed
+    // elsewhere is `represented`: its behaviour is that handler's, learned
+    // on a sibling, though no transition names it (a recording does not
+    // generalise across elements; §5.4.5.6b says so).
+    stats.handlers = keys.len() as u32;
+    stats.per_handler = keys.iter().map(|k| k.taken as u32).collect();
+    stats.probes = ran as u32;
+    let mut unrepresented: std::collections::HashSet<Handle> = Default::default();
+    let mut cut_direct: Vec<Handle> = vec![];
+    for k in &keys {
+        stats.cut += k.cands.len() as u32;
+        for p in &k.cands {
+            if p.root.is_some() { continue }
+            cut_direct.push(p.target);
+            if k.taken == 0 { unrepresented.insert(p.target); }
         }
     }
-    direct_set.clear();
+    for h in cut_direct {
+        if let Some(e) = cov.get_mut(&h) {
+            if !e.probed && !unrepresented.contains(&h) { e.represented = true }
+        }
+    }
 
     EXPLORING.with(|e| *e.borrow_mut() = false);
     PAGE_NET.with(|n| *n.borrow_mut() = saved_net);
-    (out, found, cov.into_values().collect())
+    (out, found, cov.into_values().collect(), stats)
+}
+
+/// Run one probe, credit the coverage entries, keep its transition, and
+/// return the delegated candidates a discovery probe found.
+#[allow(clippy::too_many_arguments)]
+fn probe_and_record(ctx: &mut Context, p: &Probe, parser_nodes: Handle,
+    cov: &mut std::collections::BTreeMap<Handle, crate::engine::Interactive>,
+    out: &mut Vec<crate::engine::Transition>,
+    direct_set: &std::collections::HashSet<(Handle, Gesture)>,
+    delegated_seen: &mut std::collections::HashSet<(Handle, Gesture)>) -> Vec<Probe>
+{
+    use crate::engine::Interactive;
+    let r = run_probe(ctx, p, parser_nodes);
+    let recorded = r.transition.is_some();
+    let truncated = r.transition.as_ref().is_some_and(|t| t.effects.iter()
+        .any(|e| matches!(e, crate::engine::Effect::Truncated { .. })));
+    let targets: Vec<String> = r.transition.as_ref().map(|t| t.effects.iter().filter_map(|e| match e {
+        crate::engine::Effect::Attribute { target, .. } | crate::engine::Effect::Remove { target } => Some(target.clone()),
+        crate::engine::Effect::Insert { parent, .. } => Some(parent.clone()),
+        _ => None,
+    }).collect()).unwrap_or_default();
+
+    // The target's own entry; a delegated target outside the universe (a
+    // <li>, an <a>) gets one marked `outside`.
+    let tgt_key = if p.root == Some(Root::Doc) && p.discover.is_some() { DOC_ENTRY } else { p.target };
+    let entry = cov.entry(tgt_key).or_insert_with(|| {
+        let mut e = Interactive { outside: true, ..Default::default() };
+        describe(p.target, &mut e);
+        e
+    });
+    entry.probed = true;
+    entry.over_cap = false;
+    entry.represented = false;
+    if p.root.is_some() && tgt_key != DOC_ENTRY { entry.delegated = true }
+    let g = p.gesture.name();
+    if !entry.gestures.contains(&g) { entry.gestures.push(g) }
+    credit(entry, &r);
+    if recorded {
+        entry.recorded = true;
+        entry.truncated |= truncated;
+        for t in &targets { if !entry.effect_targets.contains(t) { entry.effect_targets.push(t.clone()) } }
+    }
+    // ★ Credit the delegating root too: its handler is what ran.
+    if let Some(root) = p.root {
+        let rk = match root { Root::El(a) => a, Root::Doc => DOC_ENTRY };
+        if rk != tgt_key {
+            if let Some(re) = cov.get_mut(&rk) {
+                credit(re, &r);
+                if recorded {
+                    re.via = true;
+                    for t in &targets { if !re.effect_targets.contains(t) { re.effect_targets.push(t.clone()) } }
+                }
+            }
+        }
+    }
+    let mut extra = vec![];
+    // ★★ DELEGATION. A listener on an ancestor (a list, <body>, the
+    // document) that dispatches on `event.target` reaches no component when
+    // probed on itself: React-style roots and jQuery `.on(sel)` both work
+    // this way, and the §5.4.5.6a measurement found the buttons they serve
+    // listed as native controls with no handler. Probe the descendants it
+    // tested for, or failing that, the interactive ones.
+    if p.discover.is_some() {
+        let root_h = match p.root { Some(Root::Doc) => 0, _ => p.target };
+        let root = p.root.unwrap_or(Root::El(p.target));
+        for (t, by) in delegated_targets(root_h, &r.selectors) {
+            if t == p.target { continue }
+            let Some(g) = delegated_gesture(&p.gesture, t) else { continue };
+            // A descendant with its own listener for this gesture is probed
+            // directly, and its probe bubbles here anyway.
+            if direct_set.contains(&(t, g.clone())) { continue }
+            if !delegated_seen.insert((t, g.clone())) { continue }
+            let key = fnv(&format!("{}\u{1}{by}", p.key));
+            extra.push(Probe { target: t, gesture: g, key, root: Some(root), discover: None });
+        }
+    }
+    if let Some(t) = r.transition { out.push(t) }
+    extra
 }
 
 fn describe(h: Handle, e: &mut crate::engine::Interactive) {
@@ -3243,6 +3326,9 @@ pub struct BoaEngine {
     /// revert every probe. Off by default — exploration simulates a user,
     /// which prerendering does not, and that deserves an explicit opt-in.
     pub explore: bool,
+    /// Exploration bounds (probes per handler, probes per document); None
+    /// is PROBES_PER_HANDLER and MAX_PROBES. See `explore_states`.
+    pub probe_bounds: Option<(usize, usize)>,
     /// Root of the mirrored module graph; Boa's loader resolves against it.
     pub module_root: Option<std::path::PathBuf>,
     /// The document's own URL.
@@ -4843,6 +4929,7 @@ impl ScriptEngine for BoaEngine {
         BASE.with(|b| *b.borrow_mut() = self.base_url.clone());
         CURRENT.with(|c| *c.borrow_mut() = None);
         let mut rep = RunReport { transitions: vec![], interactive_found: 0, coverage: vec![],
+            explore_stats: Default::default(),
             scripts_run: 0, scripts_failed: 0, errors: vec![],
             missing: vec![], nulls: vec![], first_error: None, cause: None, listeners_fired: 0,
             module_retries: 0, observers_registered: 0, mutation_records: 0,
@@ -5002,7 +5089,11 @@ impl ScriptEngine for BoaEngine {
         // elements on pages full of them.
         if self.explore {
             let parser_nodes = DOM.with(|d| d.borrow().parser_nodes);
-            let (t, found, cov) = explore_states(&mut ctx, parser_nodes);
+            let bounds = self.probe_bounds.unwrap_or((PROBES_PER_HANDLER, MAX_PROBES));
+            let t0 = std::time::Instant::now();
+            let (t, found, cov, mut stats) = explore_states(&mut ctx, parser_nodes, bounds);
+            stats.micros = t0.elapsed().as_micros() as u64;
+            rep.explore_stats = stats;
             rep.transitions = t;
             rep.interactive_found = found;
             rep.coverage = cov;

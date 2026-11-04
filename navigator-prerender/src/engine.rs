@@ -79,7 +79,28 @@ pub struct Interactive {
     pub gestures: Vec<String>,
 }
 
+/// What exploration spent, per document (legacy-web §5.4.5.6a step 2).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ExploreStats {
+    /// Distinct handler keys that had a candidate.
+    pub handlers: u32,
+    /// Probes run (direct, discovery and delegated).
+    pub probes: u32,
+    /// Candidates left unprobed by the bounds.
+    pub cut: u32,
+    /// Budget rounds started (round r gives each handler its (r+1)th probe).
+    pub rounds: u32,
+    /// Wall time spent exploring, for choosing the bounds. Report only;
+    /// never in an artifact.
+    pub micros: u64,
+    /// Probes each handler got, in key order (an unbounded run gives the
+    /// candidates per handler, which is what the bounds are chosen from).
+    pub per_handler: Vec<u32>,
+}
+
 pub struct RunReport {
+    /// Exploration's budget accounting (only when exploring).
+    pub explore_stats: ExploreStats,
     /// Per-element exploration coverage (only when exploring).
     pub coverage: Vec<Interactive>,
     pub scripts_run: usize,

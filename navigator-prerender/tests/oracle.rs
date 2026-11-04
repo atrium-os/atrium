@@ -139,8 +139,9 @@ fn exploration_is_bounded() {
     </script></body></html>"#);
     let c = explore(&html);
     assert_eq!(c.interactive_found, 300, "all are found");
-    assert!(c.transitions.len() <= 64,
-        "but probing is capped: {}", c.transitions.len());
+    // One handler shared by all 300: probed PROBES_PER_HANDLER times.
+    assert_eq!(c.transitions.len(), 8,
+        "but probing is bounded per handler: {}", c.transitions.len());
 }
 
 /// Recording must be DETERMINISTIC, or a content-addressed store sees churn

@@ -114,6 +114,11 @@ fn report(c: &navigator_prerender::Conversion, fetchd: Option<(u64, u64)>) -> St
     // t truncated, d probed as a delegated target, D a delegating root whose
     // delegated probe recorded, x outside the interactive universe, h cut but
     // its handlers probed elsewhere. The 14th column lists the gestures probed.
+    {
+        let s = &c.explore_stats;
+        let per: Vec<String> = s.per_handler.iter().map(|n| n.to_string()).collect();
+        let _ = writeln!(o, "U\t{}\t{}\t{}\t{}\t{}\t{}", s.handlers, s.probes, s.cut, s.rounds, s.micros, per.join(","));
+    }
     for k in &c.coverage {
         let flags: String = [(k.native, 'n'), (k.explorable, 'e'), (k.probed, 'p'), (k.over_cap, 'c'),
                              (k.recorded, 'r'), (k.truncated, 't'), (k.delegated, 'd'), (k.via, 'D'),
@@ -126,6 +131,15 @@ fn report(c: &navigator_prerender::Conversion, fetchd: Option<(u64, u64)>) -> St
             clean(&k.effect_targets.join("|")), clean(&k.gestures.join(",")));
     }
     o
+}
+
+/// PRERENDER_PROBES=<per handler>,<per document>: override the exploration
+/// bounds, for MEASURING them (legacy-web §5.4.5.6b). Not part of the job
+/// protocol: a deployment always runs the compiled defaults.
+fn probe_bounds_env() -> Option<(usize, usize)> {
+    let v = std::env::var("PRERENDER_PROBES").ok()?;
+    let (a, b) = v.split_once(',')?;
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
 }
 
 /// Convert exactly one document and print one machine-readable line. The
@@ -163,6 +177,9 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
     // and is only wired when the run is networked at all.
     let mut eng = BoaEngine {
         explore: std::env::var("PRERENDER_EXPLORE").ok().as_deref() == Some("1"),
+        // PRERENDER_PROBES=<per handler>,<per document>: override the
+        // exploration bounds, for measuring them (§5.4.5.6a step 2).
+        probe_bounds: probe_bounds_env(),
         same_site_network: std::env::var("PRERENDER_SAME_SITE").ok().as_deref() == Some("1"),
         page_fetcher: match (&fetchd, net) {
             (Some(f), _) => Some(Box::new(f.clone()) as Box<dyn Fetcher>),
@@ -842,6 +859,12 @@ fn convert_in_child(
         let mut lines = String::new();
         for l in o.report.lines().filter(|l| l.starts_with("K\t")) { lines.push_str(&format!("{name}\t{}\n", &l[2..])) }
         if lines.is_empty() { lines = format!("{name}\t-\n") }
+        // Budget accounting: handlers, probes, cut, rounds, microseconds,
+        // probes per handler.
+        for l in o.report.lines().filter(|l| l.starts_with("U\t")) { lines.push_str(&format!("{name}\t#stats\t{}\n", &l[2..])) }
+        // Relayed fetches (requests, bytes): what a per-conversion byte
+        // budget is chosen from (threat model §2.2, P2).
+        for l in o.report.lines().filter(|l| l.starts_with("G\t")) { lines.push_str(&format!("{name}\t#fetch\t{}\n", &l[2..])) }
         use std::io::Write;
         if let Err(e) = fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut f| f.write_all(lines.as_bytes())) {
             eprintln!("coverage: cannot write {}: {e}", std::path::Path::new(&path).display());
@@ -895,6 +918,7 @@ fn serve() -> ! {
     let fetcher: &mut dyn Fetcher = match &mut shared { Some(f) => f, None => &mut nonet };
     let mut eng = BoaEngine {
         explore: job.explore,
+        probe_bounds: probe_bounds_env(),
         same_site_network: job.same_site,
         page_fetcher: relay.clone().map(|f| Box::new(f) as Box<dyn Fetcher>),
         ..Default::default()
