@@ -99,6 +99,34 @@ leave the user's dedup domain.
   fetchd (§2.2), so curl is never on a real conversion's path. See the comment on
   `HttpFetcher`.
 
+**Verified on FreeBSD (2026-11-04, 16-CURRENT arm64 in the cloud VM, QEMU TCG).**
+`scripts/navigator-fetch-vm-check.sh` and stages 5 and 9 of
+`scripts/navigator-converter-jail-e2e.sh`:
+- The library's 23 tests, cross-built and run on FreeBSD: all pass. A test-harness race
+  (the scripted server replied after one `read()`) failed about 6 runs in 7 on Linux; it
+  was fixed in 9880f2b and then failed 0 runs in 30.
+- `navigator-fetchd --gate` reports **M1 GATE: PASS** (23 rows) unjailed, as `navtest`
+  under `cap_enter` + casper, and again **inside its jail**
+  (`org.atrium.navigator.fetcher`, signed, `network = "full"`, system grant, daemon lane,
+  own vnet). That includes `http://localhost/` resolved by casper (to `127.0.0.1`
+  unjailed and `::1` in the jail), the grant control arm, and metadata refused even
+  under the grant.
+- **In serve mode, inside the jail:**
+  - Admitted: a public literal, a casper-resolved name, plain http, and `example.com`.
+  - Refused, with the range named: `127.0.0.1`, `localhost`, `10.0.0.5`,
+    `169.254.169.254`, `100.64.0.1` (the jail's own epair gateway) and `[::1]`.
+  - Refused at the hop: redirects from a public page to `10.0.0.5`, `localhost` and
+    the metadata endpoint. Each probe keeps the scheme. The harness's first version
+    redirected https→http, so it only proved the downgrade refusal.
+- **Control.** With `--grant-private-network`, the same fetchd reaches a real listener
+  on the guest's `127.0.0.1:80`. So the refusals come from the policy, not from an
+  empty port.
+- **Caveat: the "public" server is a stand-in.** The cloud container has no direct route
+  out, so slirp's network was moved to a public range. A host-side server answers at
+  `1.2.3.100` with a throwaway CA, and `/etc/hosts` names it `example.com`. The fetcher
+  is unchanged. Rebinding on a live resolver was not exercised in the VM; the pinning
+  tests cover it, and they pass on FreeBSD.
+
 ### 2.2 Conversion — `navigator-prerender` (Boa, the state recorder)
 
 This is the stage where **attacker-written code runs**. Boa executes the page's scripts;
@@ -138,7 +166,8 @@ never the live network.
 **Rating:** today **high** (A1). With the jail, medium: the converter can then only lie
 in its output, which §2.3 and §2.6 handle.
 
-**Built (2026-11-05); FreeBSD numbers pending.** Backend §4.7d has the details.
+**Built (2026-11-05); verified on FreeBSD (2026-11-04, cloud VM).** Backend §4.7d has the
+details and the numbers.
 - **The mechanism.** The converter runs as a one-shot jail entry,
   `org.atrium.navigator.converter`, under `portcullis exec --daemon`, with a signed
   manifest that declares no capabilities. It takes no arguments and reads no
@@ -153,8 +182,17 @@ in its output, which §2.3 and §2.6 handle.
 - **Verified on macOS, unconfined.** Serve mode reproduces the old in-child conversions
   byte for byte: 50/50 recordings offline, and 8/8 recordings plus 393 blobs with the
   network on.
-- **Not yet run.** The jailed corpus run, the jail cost and the leak checks are
-  `scripts/navigator-converter-jail-e2e.sh`, still to run in the FreeBSD VM.
+- **Verified on FreeBSD** with `scripts/navigator-converter-jail-e2e.sh --rounds 2`:
+  - Pages: 50, offline, with exploration on.
+  - Jailed and unconfined conversions are **byte-identical**: 50/50 recordings and the
+    reports, in both rounds.
+  - An unconfined run with the require switch on is refused.
+  - A networked page went through a jailed converter *and* a jailed fetchd. Its
+    script was fetched and ran, and the recording is identical to the unconfined
+    one.
+  - No jails (live or dying), jaild zombies, mounts or upper dirs were left behind.
+  - Jail cost per conversion, under TCG, is **about 3.06 s**. The numbers and why
+    that is not the real figure are in §4.7d.
 - **P2 limits.** `portcullis exec --memory` sets an rctl `memoryuse` cap, but only on
   the root (non-daemon) lane, and the daemon lane does not forward it. No CPU rctl
   exists anywhere (portcullis.md §6.5.2e). As an interim measure the converter lowers
@@ -162,6 +200,17 @@ in its output, which §2.3 and §2.6 handle.
   (`PRERENDER_MEM_MB`, default 4096) before parsing a byte. It reads them back and
   refuses on a mismatch. An unprivileged process cannot raise a hard limit again. A
   per-conversion total byte budget is still open.
+  **Verified on FreeBSD (in the jail).**
+  - `procstat -l` on the jailed `prerender` (uid `navtest`) shows hard and soft
+    `cputime` 45 s (deadline 40 + 5) and `vmemoryuse` 1 048 576 KB
+    (`PRERENDER_MEM_MB=1024`).
+  - The memory limit is enforced. A page that grows a 2^27-character string fails
+    at `PRERENDER_MEM_MB=256` ("memory allocation of 134217792 bytes failed", no
+    recording). It converts at 1024.
+  - A broker whose hard limit is already below the ask makes the child refuse:
+    `RLIMIT_AS` and `RLIMIT_CPU` each fail with EPERM, exit 3.
+  - The CPU limit is a backstop behind the wall-clock deadline, which fires first.
+    It was not tripped on its own.
 
 ### 2.3 Normalize and render — the document worker
 
@@ -172,6 +221,8 @@ in its output, which §2.3 and §2.6 handle.
 - The validator is fuzzed with reached-coverage asserted (§4.7b).
 - Under `Confinement::Launcher` the worker runs in a signed, zero-capability jail (measured
   in §4.7a).
+  `navigator-jail-e2e.sh --quick` passed again on FreeBSD on 2026-11-04 (the cloud VM),
+  covering refusals and leak checks, alongside the §2.2 run.
 
 **Gap — confinement is opt-in.** `JailedHost` jails only when built with a launcher.
 `unconfined_for_testing` is honestly named and `require_confinement()` exists, but nothing
@@ -588,8 +639,8 @@ These belong in the model because they are *wins*, not because they need work:
 
 | # | fix | stops | cost | where |
 |---|---|---|---|---|
-| **P0** ✔ built, VM run pending | Jail the converter process (Boa) with zero capabilities via `portcullis exec` | A1 → code execution as the user | small: the launcher exists and was measured (§4.7a) | §2.2 |
-| P1 ✔ built, VM gate pending | Refuse non-global addresses after resolution; pin the address per conversion; intranet as an explicit grant | A4: LAN and localhost, DNS rebinding | small | §2.1 |
+| **P0** ✔ built, verified on FreeBSD | Jail the converter process (Boa) with zero capabilities via `portcullis exec` | A1 → code execution as the user | small: the launcher exists and was measured (§4.7a) | §2.2 |
+| P1 ✔ built, verified on FreeBSD | Refuse non-global addresses after resolution; pin the address per conversion; intranet as an explicit grant | A4: LAN and localhost, DNS rebinding | small | §2.1 |
 | P1 ✔ built | `navigatord` refuses to start unconfined outside test builds | A1 against the worker | trivial | §2.3 |
 | P1 | Decide where images decode: per-document jail, memory-safe decoders, never in Fresco | A1 via decoders | design and medium code | §2.4 |
 | P1 | Per-user dedup domain by default; reproduce-to-share | A5 poisoning | design now, code with sharing | §2.6 |

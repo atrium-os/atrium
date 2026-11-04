@@ -638,15 +638,61 @@ The first networked run differed on one Trello image: the new relay cache was co
 one fetch failed transiently. The URL fetched fine afterwards, and a rerun was
 identical.
 
-**FreeBSD: pending.** `scripts/navigator-converter-jail-e2e.sh` covers:
-- the fetchd gate with the §2.1 rows, both unjailed and inside its jail;
-- the require switch;
-- interleaved unconfined (A) and jailed (B) rounds over batch 2, compared byte for byte
-  (recordings, blobs, reports);
-- a networked subset with both the converter and fetchd jailed;
-- leak assertions.
+**FreeBSD (2026-11-04).** This is `scripts/navigator-converter-jail-e2e.sh --rounds 2 --net 1`
+run in the cloud VM: 16-CURRENT arm64 under QEMU **TCG**, the broker `navtest` (uid 1001),
+one jail per conversion created by portcullisd. **PASS.**
 
-Its numbers belong here once it has run.
+The input is a stand-in for batch 2. This environment's proxy refuses 59 of batch 2's 60
+hosts, and the Mac's copy could not be uploaded. So the run used 50 fixed pages:
+- `336_node_fs`, the one batch-2 page that fetched;
+- 48 of `navigator-render/conformance/`;
+- one networked fixture page.
+
+The A/B comparison needs only fixed inputs, which these are.
+
+| stage | result |
+|---|---|
+| 5 fetchd gate, unjailed | M1 GATE: PASS, all §2.1 rows |
+| 9 fetchd gate, in its jail | M1 GATE: PASS |
+| 10 require switch, unconfined | refused (`PRERENDER_LAUNCHER`) |
+| 11 A/B, 2 rounds × 50 pages, offline, exploration on | recordings 50/50 and reports **byte-identical** in every round (`fails=0`) |
+| 12 networked, converter and fetchd both jailed | 1 page: its external script fetched through the jailed fetchd (`fetched=1 failed=0`) and ran; recording identical to the unconfined arm |
+| 13 leaks | no jails (live or dying), jaild zombies, mounts or upper dirs |
+
+**Conversion wall time (driver's view, ms):**
+
+| arm | round | p50 | p90 | mean |
+|---|---|---|---|---|
+| A unconfined | 1 | 787 | 886 | 848 |
+| A unconfined | 2 | 786 | 875 | 835 |
+| B jailed | 1 | 3799 | 4351 | 3907 |
+| B jailed | 2 | 3825 | 4253 | 3906 |
+
+**Jail cost per conversion = B mean − A mean = 3059 ms and 3071 ms, about 3.06 s.**
+
+This is a TCG number, not a product number. The guest is emulated, about 70× slower
+than HVF (memory `cloud-freebsd-vm-feasibility`), and jail setup is all kernel work:
+nullfs + tmpfs + unionfs mounts, `jail -c`, the exec, and teardown. That work pays the
+emulation cost in full. §4.7a's HVF figure, about 25 ms to open and 26 ms to close, is
+what to plan with. The TCG number does confirm the cost is per conversion and stable
+(two rounds within 12 ms).
+
+**Hard limits, checked in the jail.**
+- `procstat -l` on the jailed child shows `cputime` = deadline + 5 s and `vmemoryuse`
+  = `PRERENDER_MEM_MB`, both soft and hard.
+- `PRERENDER_MEM_MB=256` stops a page that grows a 256 MiB string ("memory
+  allocation … failed"). At 1024 the same page converts.
+- A broker whose hard limit is already lower makes the child refuse, with EPERM from
+  `setrlimit` and exit 3.
+
+**Three harness bugs, fixed in the same commit as these numbers:**
+1. The A/B and networked output directories were made by root and written by the
+   broker. Every report redirect failed, and the arms "produced no recordings".
+2. A corpus with no images has no blob directory, and `diff -r` of two absent
+   directories reported "blobs differ".
+3. Under TCG, a large `scp` sometimes landed full-size with a ~30 KB run of zeros in
+   the middle. The destination hash caught it in 3 of 6 runs. Staging now copies
+   again, up to three times, and never runs a binary whose hash does not match.
 
 ### 4.7b Fuzzing the hostile-input boundary
 

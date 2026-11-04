@@ -124,11 +124,21 @@ stage() {
     src="$1"; name="$2"
     [ -f "$src" ] || die "missing build output: $src"
     h=$(shasum -a 256 "$src" 2>/dev/null | cut -d' ' -f1); [ -n "$h" ] || h=$(sha256sum "$src" | cut -d' ' -f1)
-    "$VSSH" "mkdir -p $BIN && rm -f $BIN/$name" >/dev/null 2>&1
-    # shellcheck disable=SC2086
-    scp $SCP_OPTS "$src" "root@localhost:$BIN/$name" >/dev/null 2>&1 || die "scp $name"
-    g=$("$VSSH" "sha256 -q $BIN/$name" 2>/dev/null)
-    [ "$h" = "$g" ] || die "$name hash mismatch: host=$h guest=$g"
+    # ★ Up to three copies. In the cloud VM (QEMU TCG) a large scp now and
+    # then lands with a ~30 KB run of ZEROS in the middle, at full size: the
+    # hash below catches it every time, and a fresh copy is clean. Retrying
+    # never weakens the gate; a binary is used only once its hash matches.
+    try=1
+    while :; do
+        "$VSSH" "mkdir -p $BIN && rm -f $BIN/$name" >/dev/null 2>&1
+        # shellcheck disable=SC2086
+        scp $SCP_OPTS "$src" "root@localhost:$BIN/$name" >/dev/null 2>&1 || die "scp $name"
+        g=$("$VSSH" "sha256 -q $BIN/$name" 2>/dev/null)
+        [ "$h" = "$g" ] && break
+        [ $try -ge 3 ] && die "$name hash mismatch: host=$h guest=$g"
+        echo "  $name hash mismatch on copy $try (guest=$g); copying again"
+        try=$((try + 1))
+    done
     "$VSSH" "chmod +x $BIN/$name" >/dev/null 2>&1
     echo "  $name ok"
 }
@@ -226,8 +236,11 @@ case "$R" in *REFUSED*PRERENDER_LAUNCHER*) echo "  unconfined run refused" ;; *)
 # ---- stage 11: A (unconfined) vs B (jailed), interleaved, offline ----------------------
 STAGE="corpus A/B"
 say "$STAGE  ($ROUNDS rounds, $GUESTN pages, offline, exploration on)"
+# ★ The output directory is made by root (ssh) but written by the broker:
+# without the chown every redirect failed, and the arms "produced no
+# recordings" because the report file could not even be created.
 run_arm() { # $1 = arm name, $2 = round, $3 = extra env
-    "$VSSH" "export PORTCULLIS_SOCKET=$SOCK; cd $BW && rm -rf out-$1-$2 && mkdir out-$1-$2 &&
+    "$VSSH" "export PORTCULLIS_SOCKET=$SOCK; cd $BW && rm -rf out-$1-$2 && mkdir out-$1-$2 && chown $BROKER_USER out-$1-$2 &&
         $AS_BROKER 'env $3 PRERENDER_EXPLORE=1 PRERENDER_DEADLINE=120 PRERENDER_EMIT_DIR=$BW/out-$1-$2/rec \
                     PRERENDER_BLOB_DIR=$BW/out-$1-$2/blobs ./prerender html > out-$1-$2/report.txt 2> out-$1-$2/err.txt'
         jls -d name | grep -cE 'navigator[-_]converter' || true" >/dev/null 2>&1
@@ -247,7 +260,11 @@ done
 CMP=$("$VSSH" "cd $BW && fails=0; r=1; while [ \$r -le $ROUNDS ]; do
         for arm in A B; do
             diff -r out-A-1/rec out-\$arm-\$r/rec >/dev/null || { echo \"recordings differ: \$arm-\$r\"; fails=1; }
-            diff -r out-A-1/blobs out-\$arm-\$r/blobs >/dev/null 2>&1 || { echo \"blobs differ: \$arm-\$r\"; fails=1; }
+            # ★ A corpus with no images writes no blob dir at all; two absent
+            # dirs are equal, one absent and one present are not.
+            if [ -d out-A-1/blobs ] || [ -d out-\$arm-\$r/blobs ]; then
+                diff -r out-A-1/blobs out-\$arm-\$r/blobs >/dev/null 2>&1 || { echo \"blobs differ: \$arm-\$r\"; fails=1; }
+            fi
             grep -v -e '^confinement:' -e 'conversion wall' out-A-1/report.txt > /tmp/ra.\$\$
             grep -v -e '^confinement:' -e 'conversion wall' out-\$arm-\$r/report.txt > /tmp/rb.\$\$
             cmp -s /tmp/ra.\$\$ /tmp/rb.\$\$ || { echo \"reports differ: \$arm-\$r\"; fails=1; }
@@ -267,7 +284,7 @@ if [ "$NETN" -gt 0 ]; then
              grep -F \"\$(basename \$f)\" html/manifest.tsv >> neth/manifest.tsv; done; chown -R $BROKER_USER neth" >/dev/null 2>&1
     for arm in A B; do
         extra=""; [ $arm = B ] && extra="PRERENDER_REQUIRE_CONFINEMENT=1 PRERENDER_LAUNCHER=\"$LAUNCH\""
-        "$VSSH" "export PORTCULLIS_SOCKET=$SOCK; cd $BW && rm -rf net-$arm && mkdir net-$arm &&
+        "$VSSH" "export PORTCULLIS_SOCKET=$SOCK; cd $BW && rm -rf net-$arm && mkdir net-$arm && chown $BROKER_USER net-$arm &&
             $AS_BROKER 'env $extra PRERENDER_NET=1 PRERENDER_FETCHD=\"$FETCHD\" PRERENDER_EXPLORE=1 PRERENDER_DEADLINE=180 \
                 PRERENDER_EMIT_DIR=$BW/net-$arm/rec PRERENDER_BLOB_DIR=$BW/net-$arm/blobs ./prerender neth > net-$arm/report.txt 2> net-$arm/err.txt'" \
             >/dev/null 2>&1
