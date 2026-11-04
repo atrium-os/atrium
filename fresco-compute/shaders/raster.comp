@@ -22,27 +22,42 @@ vec4 texel(uvec4 t, int x, int y) {
     x = clamp(x, 0, int(t.y) - 1);
     y = clamp(y, 0, int(t.z) - 1);
     uint idx = uint(y) * t.y + uint(x);
-    if (t.w == 0u) {
-        uint w = texels[t.x + idx];
-        return vec4(lut[w & 255u], lut[(w >> 8) & 255u], lut[(w >> 16) & 255u],
-                    float(w >> 24) / 255.0);
+    uint wi = t.x + (t.w == 0u ? idx : idx / 4u);
+    if (wi >= F.texel_words) {
+        return vec4(0.0);
     }
-    uint w = texels[t.x + idx / 4u];
-    float v = float((w >> (8u * (idx % 4u))) & 255u) / 255.0;
+    if (t.w == 0u) {
+        uint w = texels[wi];
+        return vec4(lut[w & 255u], lut[(w >> 8) & 255u], lut[(w >> 16) & 255u],
+                    float(w >> 24) * (1.0 / 255.0)); // glslang folds "/ 255.0" to this anyway
+    }
+    uint w = texels[wi];
+    float v = float((w >> (8u * (idx % 4u))) & 255u) * (1.0 / 255.0);
     return vec4(v, 0.0, 0.0, 1.0);
 }
 
+// GLSL leaves mix's formula to the implementation; this is the one every
+// executor and src/reference.rs use.
+vec4 mix_(vec4 a, vec4 b, float t) { return a + t * (b - a); }
+
 // Bilinear, clamp to edge, uv in [0, 1].
 vec4 sample_bilinear(uint ti, vec2 uv) {
+    if (ti >= F.tex_count) {
+        return vec4(0.0);
+    }
     uvec4 t = uvec4(texw[ti * 4u], texw[ti * 4u + 1u], texw[ti * 4u + 2u], texw[ti * 4u + 3u]);
+    // An empty or over-wide texture samples as zero.
+    if (t.y == 0u || t.z == 0u || t.y > MAX_TEX_DIM || t.z > MAX_TEX_DIM) {
+        return vec4(0.0);
+    }
     vec2 tc = uv * vec2(float(t.y), float(t.z)) - 0.5;
     vec2 fl = floor(tc);
     vec2 f = tc - fl;
-    int x = int(fl.x);
-    int y = int(fl.y);
-    vec4 a = mix(texel(t, x, y), texel(t, x + 1, y), f.x);
-    vec4 b = mix(texel(t, x, y + 1), texel(t, x + 1, y + 1), f.x);
-    return mix(a, b, f.y);
+    int x = int(clamp_(fl.x, -1.0, float(t.y)));
+    int y = int(clamp_(fl.y, -1.0, float(t.z)));
+    vec4 a = mix_(texel(t, x, y), texel(t, x + 1, y), f.x);
+    vec4 b = mix_(texel(t, x, y + 1), texel(t, x + 1, y + 1), f.x);
+    return mix_(a, b, f.y);
 }
 
 bool inside(vec4 r, vec2 pc) {
@@ -76,19 +91,19 @@ vec4 shade(uint oi, vec2 pc) {
             return p1;
         }
         vec2 half_ext = p0.zw * 0.5;
-        float r = min(radius, min(half_ext.x, half_ext.y));
+        float r = min_(radius, min_(half_ext.x, half_ext.y));
         vec2 p = (pc - p0.xy) - half_ext;
         vec2 q = abs(p) - half_ext + r;
-        vec2 qp = max(q, vec2(0.0));
+        vec2 qp = vec2(max_(q.x, 0.0), max_(q.y, 0.0));
         float lq = length(qp);
-        float d = min(max(q.x, q.y), 0.0) + lq - r;
+        float d = min_(max_(q.x, q.y), 0.0) + lq - r;
         // fwidth(d): the SDF's gradient is a unit vector, so |dx| + |dy| is
         // 1 along the straight edges and |nx| + |ny| around a corner.
         float aa = 1.0;
         if (q.x > 0.0 && q.y > 0.0) {
             aa = (q.x + q.y) / lq;
         }
-        float alpha = clamp(0.5 - d / aa, 0.0, 1.0);
+        float alpha = clamp_(0.5 - d / aa, 0.0, 1.0);
         return vec4(p1.rgb, p1.a * alpha);
     }
     vec2 t = (pc - p0.xy) / p0.zw;
@@ -96,7 +111,7 @@ vec4 shade(uint oi, vec2 pc) {
         return sample_bilinear(meta.y, t);
     }
     // KIND_GLYPH
-    vec2 uv = mix(p2.xy, p2.zw, t);
+    vec2 uv = p2.xy + t * (p2.zw - p2.xy); // mix_, per component
     float cov = sample_bilinear(meta.y, uv).r;
     return vec4(p1.rgb, p1.a * cov);
 }
@@ -126,7 +141,11 @@ void main() {
         while (bits != 0u) {
             int i = findLSB(bits);
             bits = bits & (bits - 1u);
-            vec4 src = shade(w * 32u + uint(i), pc);
+            uint oi = w * 32u + uint(i);
+            if (oi >= F.op_count) {
+                break;
+            }
+            vec4 src = shade(oi, pc);
             dst = src.rgb * src.a + dst * (1.0 - src.a);
         }
     }

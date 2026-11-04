@@ -20,12 +20,16 @@ atrium-rdna4 = { path = "../atrium-rdna4", optional = true }
 [features]
 cranelift = ["dep:atrium-spv-frontend", "dep:atrium-spv-backend-cranelift"]
 rdna4 = ["dep:atrium-rdna4"]
+# `coverage`: count which branches of the reference a run reached (the
+# fuzzer asserts every one was hit).
+coverage = []
 
 [dev-dependencies]
 atrium-spv-frontend = { path = "../atrium-spv-frontend" }
-fresco-compute = { path = ".", features = ["cranelift"] }
+fresco-compute = { path = ".", features = ["cranelift", "coverage"] }
 atrium-gir          = { path = "../atrium-gir" }
 tempfile = "3"
+libc = "0.2"
 # The lavapipe golden (tests/golden.rs): the Vulkan renderer it replaces.
 fresco-vulkan = { path = "../fresco-vulkan" }
 ash = "0.38"

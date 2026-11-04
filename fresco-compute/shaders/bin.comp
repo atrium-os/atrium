@@ -16,10 +16,12 @@ void main() {
         return;
     }
     vec4 b = opv[i * OP_VEC4S + 3u];
-    int x0 = max(int(b.x), 0);
-    int y0 = max(int(b.y), 0);
-    int x1 = min(int(b.z), int(F.width));
-    int y1 = min(int(b.w), int(F.height));
+    float fw = float(F.width);
+    float fh = float(F.height);
+    int x0 = int(clamp_(b.x, 0.0, fw));
+    int y0 = int(clamp_(b.y, 0.0, fh));
+    int x1 = int(clamp_(b.z, 0.0, fw));
+    int y1 = int(clamp_(b.w, 0.0, fh));
     if (x1 <= x0 || y1 <= y0) {
         return;
     }

@@ -1,21 +1,66 @@
 //! A Rust model of `bin.comp` + `raster.comp`, statement for statement. It is
 //! the oracle the executors are checked against, and a plain CPU fallback.
 
-use crate::{Frame, Op, KIND_GLYPH, KIND_PATH, KIND_RECT, KIND_TEXTURE, TILE};
+use crate::{Frame, Op, KIND_PATH, KIND_RECT, KIND_TEXTURE, TILE};
+
+/// Branch counters (feature `coverage`): what a corpus actually exercised.
+pub mod coverage {
+    /// The branches counted, by index.
+    pub const NAMES: [&str; 16] = [
+        "bin: empty bbox",
+        "bin: bbox clipped to the target",
+        "bin: bbox inside the target",
+        "path: hit",
+        "path: miss",
+        "outside p0",
+        "rect: sharp",
+        "rect: rounded",
+        "texture",
+        "glyph",
+        "unknown kind (drawn as a glyph)",
+        "texture index past tex_count",
+        "texture of zero or > MAX_TEX_DIM size",
+        "texel past texel_words",
+        "texel: rgba8",
+        "texel: r8",
+    ];
+    #[cfg(feature = "coverage")]
+    static HITS: [std::sync::atomic::AtomicU64; NAMES.len()] =
+        [const { std::sync::atomic::AtomicU64::new(0) }; NAMES.len()];
+
+    #[inline(always)]
+    pub(crate) fn hit(_i: usize) {
+        #[cfg(feature = "coverage")]
+        HITS[_i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The counts so far (all zero without the feature).
+    pub fn counts() -> [u64; NAMES.len()] {
+        #[cfg(feature = "coverage")]
+        return std::array::from_fn(|i| HITS[i].load(std::sync::atomic::Ordering::Relaxed));
+        #[cfg(not(feature = "coverage"))]
+        [0; NAMES.len()]
+    }
+}
+use coverage::hit;
 
 /// `bin.comp`: the tile masks.
 pub fn bin(f: &Frame) -> Vec<u32> {
     let h = &f.header;
     let mut mask = vec![0u32; f.mask_words()];
+    let (fw, fh) = (h.width as f32, h.height as f32);
     for i in 0..h.op_count as usize {
         let b = f.ops[i].p3;
-        let x0 = (b[0] as i32).max(0);
-        let y0 = (b[1] as i32).max(0);
-        let x1 = (b[2] as i32).min(h.width as i32);
-        let y1 = (b[3] as i32).min(h.height as i32);
+        let x0 = clamp_(b[0], 0.0, fw) as i32;
+        let y0 = clamp_(b[1], 0.0, fh) as i32;
+        let x1 = clamp_(b[2], 0.0, fw) as i32;
+        let y1 = clamp_(b[3], 0.0, fh) as i32;
         if x1 <= x0 || y1 <= y0 {
+            hit(0);
             continue;
         }
+        let clipped = !(b[0] >= 0.0 && b[1] >= 0.0 && b[2] <= fw && b[3] <= fh);
+        hit(if clipped { 1 } else { 2 });
         let (tx0, ty0) = (x0 as u32 / TILE, y0 as u32 / TILE);
         let (tx1, ty1) = ((x1 - 1) as u32 / TILE, (y1 - 1) as u32 / TILE);
         let (word, bit) = (i / 32, 1u32 << (i % 32));
@@ -28,8 +73,20 @@ pub fn bin(f: &Frame) -> Vec<u32> {
     mask
 }
 
+// The kernels' NaN-defined min/max/clamp (common.glsl), not f32's.
+fn min_(a: f32, b: f32) -> f32 {
+    if a < b { a } else { b }
+}
+fn max_(a: f32, b: f32) -> f32 {
+    if a > b { a } else { b }
+}
+fn clamp_(v: f32, lo: f32, hi: f32) -> f32 {
+    if v >= lo { if v <= hi { v } else { hi } } else { lo }
+}
+
+/// raster.comp's `mix_`: a + t * (b - a).
 fn mix(a: f32, b: f32, t: f32) -> f32 {
-    a * (1.0 - t) + b * t
+    a + t * (b - a)
 }
 
 fn mix4(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
@@ -37,30 +94,47 @@ fn mix4(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
 }
 
 fn texel(f: &Frame, t: [u32; 4], x: i32, y: i32) -> [f32; 4] {
-    let x = x.clamp(0, t[1] as i32 - 1);
-    let y = y.clamp(0, t[2] as i32 - 1);
-    let idx = y as u32 * t[1] + x as u32;
+    // GLSL clamp(x, lo, hi) is min(max(x, lo), hi): no panic when hi < lo.
+    let x = x.max(0).min(t[1] as i32 - 1);
+    let y = y.max(0).min(t[2] as i32 - 1);
+    let idx = (y as u32).wrapping_mul(t[1]).wrapping_add(x as u32);
     let dec = &f.lut[..256];
+    let wi = t[0].wrapping_add(if t[3] == 0 { idx } else { idx / 4 });
+    if wi >= f.header.texel_words {
+        hit(13);
+        return [0.0; 4];
+    }
     if t[3] == 0 {
-        let w = f.texels[(t[0] + idx) as usize];
+        hit(14);
+        let w = f.texels[wi as usize];
         return [
             dec[(w & 255) as usize],
             dec[((w >> 8) & 255) as usize],
             dec[((w >> 16) & 255) as usize],
-            (w >> 24) as f32 / 255.0,
+            (w >> 24) as f32 * (1.0 / 255.0),
         ];
     }
-    let w = f.texels[(t[0] + idx / 4) as usize];
-    let v = ((w >> (8 * (idx % 4))) & 255) as f32 / 255.0;
+    hit(15);
+    let w = f.texels[wi as usize];
+    let v = ((w >> (8 * (idx % 4))) & 255) as f32 * (1.0 / 255.0);
     [v, 0.0, 0.0, 1.0]
 }
 
 fn sample_bilinear(f: &Frame, ti: u32, uv: [f32; 2]) -> [f32; 4] {
+    if ti >= f.header.tex_count {
+        hit(11);
+        return [0.0; 4];
+    }
     let t = f.tex[ti as usize];
+    if t[1] == 0 || t[2] == 0 || t[1] > crate::MAX_TEX_DIM || t[2] > crate::MAX_TEX_DIM {
+        hit(12);
+        return [0.0; 4];
+    }
     let tc = [uv[0] * t[1] as f32 - 0.5, uv[1] * t[2] as f32 - 0.5];
     let fl = [tc[0].floor(), tc[1].floor()];
     let fr = [tc[0] - fl[0], tc[1] - fl[1]];
-    let (x, y) = (fl[0] as i32, fl[1] as i32);
+    let x = clamp_(fl[0], -1.0, t[1] as f32) as i32;
+    let y = clamp_(fl[1], -1.0, t[2] as f32) as i32;
     let a = mix4(texel(f, t, x, y), texel(f, t, x + 1, y), fr[0]);
     let b = mix4(texel(f, t, x, y + 1), texel(f, t, x + 1, y + 1), fr[0]);
     mix4(a, b, fr[1])
@@ -79,37 +153,44 @@ pub fn shade(f: &Frame, o: &Op, pc: [f32; 2]) -> [f32; 4] {
         let ly = o.p2[0] * v[1] - o.p2[1] * v[0];
         let (hl, hw) = (o.p0[2] * 0.5, o.p0[3] * 0.5);
         if lx >= -hl && lx < hl && ly >= -hw && ly < hw {
+            hit(3);
             return o.p1;
         }
+        hit(4);
         return [0.0; 4];
     }
     if !inside(o.p0, pc) {
+        hit(5);
         return [0.0; 4];
     }
     if kind == KIND_RECT {
         let radius = o.p2[0];
         if radius <= 0.0 {
+            hit(6);
             return o.p1;
         }
+        hit(7);
         let half = [o.p0[2] * 0.5, o.p0[3] * 0.5];
-        let r = radius.min(half[0].min(half[1]));
+        let r = min_(radius, min_(half[0], half[1]));
         let p = [(pc[0] - o.p0[0]) - half[0], (pc[1] - o.p0[1]) - half[1]];
         let q = [p[0].abs() - half[0] + r, p[1].abs() - half[1] + r];
-        let qp = [q[0].max(0.0), q[1].max(0.0)];
+        let qp = [max_(q[0], 0.0), max_(q[1], 0.0)];
         let lq = (qp[0] * qp[0] + qp[1] * qp[1]).sqrt();
-        let d = q[0].max(q[1]).min(0.0) + lq - r;
+        let d = min_(max_(q[0], q[1]), 0.0) + lq - r;
         let mut aa = 1.0;
         if q[0] > 0.0 && q[1] > 0.0 {
             aa = (q[0] + q[1]) / lq;
         }
-        let alpha = (0.5 - d / aa).clamp(0.0, 1.0);
+        let alpha = clamp_(0.5 - d / aa, 0.0, 1.0);
         return [o.p1[0], o.p1[1], o.p1[2], o.p1[3] * alpha];
     }
     let t = [(pc[0] - o.p0[0]) / o.p0[2], (pc[1] - o.p0[1]) / o.p0[3]];
     if kind == KIND_TEXTURE {
+        hit(8);
         return sample_bilinear(f, o.meta[1], t);
     }
-    debug_assert_eq!(kind, KIND_GLYPH);
+    // KIND_GLYPH, and as the kernel does, any other kind.
+    hit(if kind == crate::KIND_GLYPH { 9 } else { 10 });
     let uv = [mix(o.p2[0], o.p2[2], t[0]), mix(o.p2[1], o.p2[3], t[1])];
     let cov = sample_bilinear(f, o.meta[1], uv)[0];
     [o.p1[0], o.p1[1], o.p1[2], o.p1[3] * cov]
@@ -140,7 +221,11 @@ pub fn pixel(f: &Frame, mask: &[u32], x: u32, y: u32) -> u32 {
         while bits != 0 {
             let i = bits.trailing_zeros();
             bits &= bits - 1;
-            let s = shade(f, &f.ops[(w * 32 + i) as usize], pc);
+            let oi = w * 32 + i;
+            if oi >= h.op_count {
+                break;
+            }
+            let s = shade(f, &f.ops[oi as usize], pc);
             for c in 0..3 {
                 dst[c] = s[c] * s[3] + dst[c] * (1.0 - s[3]);
             }

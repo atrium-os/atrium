@@ -25,6 +25,7 @@
 //! paths, then texture batches, then glyph batches, each in list order.
 
 pub mod damage;
+pub mod fuzz;
 #[cfg(feature = "rdna4")]
 pub mod rdna4;
 pub mod reference;
@@ -48,6 +49,15 @@ pub mod binding {
 }
 
 pub const TILE: u32 = 16;
+/// Largest target edge [`Frame::validate`] accepts.
+pub const MAX_DIM: u32 = 16384;
+/// Most ops per frame [`Frame::validate`] accepts (bounds the work).
+pub const MAX_OPS: u32 = 1 << 16;
+/// The widest texture edge the kernels sample (common.glsl); wider
+/// textures sample as zero.
+pub const MAX_TEX_DIM: u32 = 65536;
+/// Most entries of the texture table a frame may declare.
+pub const MAX_TEXTURES: u32 = 1 << 16;
 pub const BIN_LOCAL: u32 = 64;
 pub const RASTER_LOCAL: u32 = 8;
 
@@ -185,8 +195,24 @@ pub struct Header {
     pub tiles_y: u32,
     pub op_count: u32,
     pub wpt: u32,
-    pub _pad: u32,
+    /// Entries of the texture table the kernels may read.
+    pub tex_count: u32,
+    /// Words of `texels` the kernels may read.
+    pub texel_words: u32,
+    pub _pad: [u32; 3],
     pub clear: [f32; 4],
+}
+
+impl Header {
+    /// Workgroups for the bin dispatch.
+    pub fn bin_groups(&self) -> [u32; 3] {
+        [self.op_count.div_ceil(BIN_LOCAL).max(1), 1, 1]
+    }
+
+    /// Workgroups for the raster dispatch.
+    pub fn raster_groups(&self) -> [u32; 3] {
+        [self.width.div_ceil(RASTER_LOCAL), self.height.div_ceil(RASTER_LOCAL), 1]
+    }
 }
 
 /// The packed inputs of one frame. The mask and target are the executor's.
@@ -317,13 +343,44 @@ impl Frame {
             tiles_y,
             op_count: ops.len() as u32,
             wpt: (ops.len() as u32).div_ceil(32),
-            _pad: 0,
+            tex_count: scene.textures.len() as u32,
+            texel_words: texels.len() as u32,
+            _pad: [0; 3],
             clear: CLEAR_COLOR,
         };
         if ops.is_empty() {
             ops.push(Op::default()); // a binding may not be empty
         }
         Frame { header, ops, tex, texels, lut: lut() }
+    }
+
+    /// Check the header against the buffers, as the broker must before it
+    /// submits a frame it did not pack itself (threat model §2.5.1, F2/F3):
+    /// derived fields consistent, every count within its buffer, the target
+    /// within `target_words`, and the work bounded. The kernels then need
+    /// only the per-element checks they make on data-derived indices.
+    pub fn validate(&self, target_words: usize) -> Result<(), String> {
+        let h = &self.header;
+        let bad = |m: &str| Err(format!("frame header: {m}"));
+        if h.width == 0 || h.height == 0 || h.width > MAX_DIM || h.height > MAX_DIM {
+            return bad("size out of range");
+        }
+        if h.pitch < h.width || (h.pitch as u64) * (h.height as u64) > target_words as u64 {
+            return bad("pitch or target too small");
+        }
+        if h.tiles_x != h.width.div_ceil(TILE) || h.tiles_y != h.height.div_ceil(TILE) {
+            return bad("tile grid does not match the size");
+        }
+        if h.op_count > MAX_OPS || h.op_count as usize > self.ops.len() || h.wpt != h.op_count.div_ceil(32) {
+            return bad("op count");
+        }
+        if h.tex_count > MAX_TEXTURES || h.tex_count as usize > self.tex.len() || h.texel_words as usize > self.texels.len() {
+            return bad("texture table or texels past their buffers");
+        }
+        if self.lut.len() != 512 {
+            return bad("lut");
+        }
+        Ok(())
     }
 
     /// Words in the tile-mask buffer (at least 1).
@@ -338,12 +395,12 @@ impl Frame {
 
     /// Workgroups for the bin dispatch.
     pub fn bin_groups(&self) -> [u32; 3] {
-        [self.header.op_count.div_ceil(BIN_LOCAL).max(1), 1, 1]
+        self.header.bin_groups()
     }
 
     /// Workgroups for the raster dispatch.
     pub fn raster_groups(&self) -> [u32; 3] {
-        [self.header.width.div_ceil(RASTER_LOCAL), self.header.height.div_ceil(RASTER_LOCAL), 1]
+        self.header.raster_groups()
     }
 
     /// The buffers by binding as bytes, with a zeroed mask and target.
@@ -382,7 +439,7 @@ mod tests {
     #[test]
     fn layout_matches_std430() {
         assert_eq!(std::mem::size_of::<Op>(), 80);
-        assert_eq!(std::mem::size_of::<Header>(), 48);
+        assert_eq!(std::mem::size_of::<Header>(), 64);
     }
 
     #[test]

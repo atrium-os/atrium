@@ -171,12 +171,7 @@ pub fn damage() -> Option<Case> {
 
 fn damaged_frame_of(name: &str, before: Option<&Scene>, scene: &Scene, w: u32, h: u32, pitch: u32) -> Option<Case> {
     use fresco_compute::damage;
-    use fresco_compute::rdna4::{Addrs, Rdna4};
-    let k = Rdna4::new().ok()?;
     let f = Frame::pack(scene, w, h, pitch);
-    let (raster_off, code_end) = k.code_layout();
-    // Buffers back to back from the first data address, each page aligned
-    // (a 1080p target is larger than data_va's 1 MiB slots).
     let mut init = f.buffers();
     let (hx, hy) = (f.header.tiles_x, f.header.tiles_y);
     let rects = match before {
@@ -188,12 +183,37 @@ fn damaged_frame_of(name: &str, before: Option<&Scene>, scene: &Scene, w: u32, h
         }
         None => vec![[0, 0, hx, hy]],
     };
+    frame_case(name, &f, init, &rects, false)
+}
+
+/// A hostile frame (F2): any frame [`Frame::validate`] accepts, e.g. from
+/// [`fresco_compute::fuzz`]. Each buffer's bytes END at a page boundary
+/// with an unmapped page after it, so a read or write one word past what
+/// the header declares faults on the device. Checks the target against
+/// the reference.
+pub fn hostile(name: &str, f: &Frame) -> Option<Case> {
+    f.validate(f.target_words()).ok()?;
+    let (hx, hy) = (f.header.tiles_x, f.header.tiles_y);
+    frame_case(name, f, f.buffers(), &[[0, 0, hx, hy]], true)
+}
+
+fn frame_case(name: &str, f: &Frame, init: Vec<Vec<u8>>, rects: &[[u32; 4]], guard: bool) -> Option<Case> {
+    use fresco_compute::rdna4::{Addrs, Rdna4};
+    let k = Rdna4::new().ok()?;
+    let (raster_off, code_end) = k.code_layout();
+    // Buffers back to back from the first data address, each page aligned
+    // (a 1080p target is larger than data_va's 1 MiB slots). With `guard`
+    // each is end-aligned in its pages and an unmapped page follows it.
     let mut next = data_va(0);
-    let va: [u64; binding::COUNT] = std::array::from_fn(|b| {
+    let pages = |n: usize| (n as u64).next_multiple_of(0x1000).max(0x1000);
+    let base: [u64; binding::COUNT] = std::array::from_fn(|b| {
         let v = next;
-        next += (init[b].len() as u64).next_multiple_of(0x1000).max(0x1000);
+        next += pages(init[b].len()) + if guard { 0x1000 } else { 0 };
         v
     });
+    let lead: [u64; binding::COUNT] =
+        std::array::from_fn(|b| if guard { pages(init[b].len()) - init[b].len() as u64 } else { 0 });
+    let va: [u64; binding::COUNT] = std::array::from_fn(|b| base[b] + lead[b]);
     let a = Addrs { code: [CODE_VA, CODE_VA + raster_off], buffers: va };
     let mut ib = Blob::compute();
     k.record_tiles(&mut ib, &a, &f, &rects).ok()?;
@@ -207,11 +227,21 @@ fn damaged_frame_of(name: &str, before: Option<&Scene>, scene: &Scene, w: u32, h
     code.extend(ib.bytes());
     let size = (code.len() as u64).next_multiple_of(0x1000);
     let mut buffers = vec![Buffer { name: "code".into(), va: CODE_VA, size, init: code, expect: None, unordered: None }];
-    let target = bytes(&reference::render(&f));
+    let target = bytes(&reference::render(f));
     for (b, init) in init.into_iter().enumerate() {
-        let expect = (b as u32 == binding::TARGET).then(|| target.clone());
-        let size = (init.len() as u64).next_multiple_of(0x1000).max(0x1000);
-        buffers.push(Buffer { name: format!("b0_{b}"), va: va[b], size, init, expect, unordered: None });
+        let pad = vec![0u8; lead[b] as usize];
+        let expect = (b as u32 == binding::TARGET).then(|| [&pad[..], &target].concat());
+        let size = pages(init.len());
+        let init = [pad, init].concat();
+        buffers.push(Buffer { name: format!("b0_{b}"), va: base[b], size, init, expect, unordered: None });
     }
     Some(Case { name: name.into(), buffers, ib: ("code".into(), ib_off, ib.dw.len() as u64), ip: "compute" })
+}
+
+/// `n` [`hostile`] cases from the F2 fuzz corpus ([`fresco_compute::fuzz`]).
+pub fn hostile_corpus(seed: u64, n: usize) -> Vec<Case> {
+    let mut r = fresco_compute::fuzz::Rng(seed);
+    (0..n)
+        .filter_map(|i| hostile(&format!("fresco_hostile_{seed:x}_{i}"), &fresco_compute::fuzz::frame(&mut r)))
+        .collect()
 }

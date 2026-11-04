@@ -88,11 +88,10 @@ impl Tier2 {
         self.threads = n.max(1);
     }
 
-    /// Render `frame` into `target` (`pitch * height` BGRA8 words).
+    /// Render `frame` into `target` (`pitch * height` BGRA8 words). The
+    /// frame may come from an untrusted renderer: it is validated first.
     pub fn render(&self, frame: &Frame, target: &mut [u32]) -> io::Result<()> {
-        if target.len() < frame.target_words() {
-            return Err(err(format!("target has {} words, need {}", target.len(), frame.target_words())));
-        }
+        frame.validate(target.len()).map_err(err)?;
         let mut mask = vec![0u32; frame.mask_words()];
         let header = [frame.header];
         let mut table = [0u64; binding::COUNT];
@@ -104,13 +103,22 @@ impl Tier2 {
         table[binding::TARGET as usize] = target.as_mut_ptr() as u64;
         table[binding::LUT as usize] = frame.lut.as_ptr() as u64;
         // SAFETY: every pointer in `table` stays valid until both dispatches
-        // return; the kernels read only within their buffers' sizes, which
-        // `Frame` sized from the same header the kernels read.
-        unsafe {
-            self.dispatch(self.bin.1, &table, frame.bin_groups(), [BIN_LOCAL, 1, 1]);
-            self.dispatch(self.raster.1, &table, frame.raster_groups(), [RASTER_LOCAL, RASTER_LOCAL, 1]);
-        }
+        // return, and `validate` checked the header against the buffers, so
+        // the kernels stay within them.
+        unsafe { self.render_table(&table, &frame.header) };
         Ok(())
+    }
+
+    /// Both dispatches over a caller-built binding table (one pointer per
+    /// binding), e.g. buffers placed against guard pages by the fuzzer.
+    ///
+    /// # Safety
+    /// Each pointer must address a live buffer the size [`Frame::validate`]
+    /// accepted for `header`, which must be the header `table` points to;
+    /// the mask (zeroed, [`Frame::mask_words`] words) and target writable.
+    pub unsafe fn render_table(&self, table: &[u64; binding::COUNT], header: &crate::Header) {
+        self.dispatch(self.bin.1, table, header.bin_groups(), [BIN_LOCAL, 1, 1]);
+        self.dispatch(self.raster.1, table, header.raster_groups(), [RASTER_LOCAL, RASTER_LOCAL, 1]);
     }
 
     unsafe fn dispatch(&self, cs: CsMain, table: &[u64], groups: [u32; 3], local: [u32; 3]) {
