@@ -104,6 +104,25 @@ Still to do:
 - The chrome is drawn only in split mode, where the chrome channel exists.
 - Secure-input affordances come with F4f.
 
+### F3. The broker, fuzzed through its own sockets. Done (split mode).
+
+The broker reads only fixed formats: 96-byte records from renderers and from the chrome channel, and frame slots, which it copies out and checks against the size it decided. Both record decoders are fuzzed for canonical decoding (`fresco-split/tests/protocol.rs`, `tests/chrome.rs`: whatever decodes re-encodes to the same bytes; only origins of the allowed characters get through). Slots are fuzzed in `protocol.rs` and the frames in them by F2.
+
+`atrium-split-fuzz` fuzzes the live broker. frescod runs it in place of every renderer, and it speaks the record protocol badly on purpose: mutated and random records, fds attached, the broker's own kinds, windows it does not have, corrupt or wrong-size slots. Two personas push on cost rather than parsing. A *staller* stops reading and keeps opening and closing windows. A *flooder* sends valid full-size frames as fast as the broker answers. The same binary plays a hostile Navigator on the chrome socket. `scripts/fresco-split-fuzz.sh` runs it all in the guest with forum-wm and an animated well-behaved client as the probe. It passes when frescod lives, nothing panics, the frame loop is never quiet for more than 15 s, and a well-behaved client is served at the end.
+
+What it found, all fixed:
+- **A renderer that stops reading froze the whole display.** Every send to a renderer was blocking, and the one in `WINDOW_CREATE` held that renderer's window lock, which the frame loop also takes. A staller filled its channel, its thread blocked under the lock, and the frame loop waited on the lock forever. Measured with stallers only: the display froze within seconds and never recovered, and no renderer was ever retired. Now the broker sends to renderers only with `Chan::send_now` (`MSG_DONTWAIT`) over a 256 KiB channel, and a renderer whose channel is full is retired. FreeBSD reports a full SEQPACKET socket as a short write, not `EAGAIN`, so both count.
+- **Churn was unbounded.** A window open costs two slots, the compositor lock and a WM relayout. Fifty churning renderers kept the frame loop quiet for 40 s or more. Each renderer now has a budget of 480 records/s, and 2 window opens/s after a burst of 16. Past the budget its serving thread waits, so a flooder slows only itself.
+- **A renderer outlived its client.** Renderers that ignore their client's hang-up kept their client id, so after a few minutes all 255 were taken and a new client was refused. The broker now keeps an unread copy of the client's socket, sees the hang-up itself, and retires the renderer.
+
+Measured in the amd64 VM (TCG), 150 s mixed run with the Navigator: 261 hostile renderers and 2,527 Navigator-opened documents. Frame gap at most 4 s, at most 8 renderers alive at once, frescod's fds back to their baseline, no panic, and the client at the end was served.
+
+Still open:
+- **Connections are not limited per peer.** Anyone who can reach `fresco.sock` can hold all 255 client ids by holding 255 connections. It needs a per-uid cap, which needs to know how Portcullis assigns uids to apps.
+- **Slot memory is the renderer jail's to bound.** Each window has two 24 MiB slots the broker creates, so a renderer can make the broker hold up to 3 GiB of virtual memory. The pages it touches are charged to its own RSS, so the jail's `memoryuse` limit (memfed) bounds them, but the renderer bundle does not declare one yet. The fuzz runs unconfined.
+- frescod's RSS rose from 23 to 48 MiB over the 150 s run. That is not yet known to be a leak; a longer run will tell.
+- The WM socket still speaks the full envelope protocol. The WM is trusted (F3 allows it as "equally trusted"), so it is not fuzzed here.
+
 ### F4e. One GPU VM per window (waits on F1)
 
 - Each window's `bin` and `raster` run in a VM that maps only that window's data and surface BOs.

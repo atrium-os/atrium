@@ -66,6 +66,11 @@ path = "src/surfaces_demo.rs"
 name = "atrium-chrome-demo"
 path = "src/chrome_demo.rs"
 
+# F3: a hostile renderer and Navigator against frescod's broker.
+[[bin]]
+name = "atrium-split-fuzz"
+path = "src/split_fuzz.rs"
+
 [[bin]]
 name = "atrium-partial-stress"
 path = "src/partial_stress.rs"
@@ -74,4 +79,5 @@ path = "src/partial_stress.rs"
 fresco-client   = { path = "../fresco-client" }
 fresco-protocol = { path = "../fresco-protocol" }
 fresco-split    = { path = "../fresco-split" }
+fresco-compute  = { path = "../fresco-compute" }
 fresco-text     = { path = "../fresco-text" }

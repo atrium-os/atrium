@@ -52,6 +52,7 @@ name = "atrium-test-client"
 version = "0.1.0"
 dependencies = [
  "fresco-client",
+ "fresco-compute",
  "fresco-protocol",
  "fresco-split",
  "fresco-text",

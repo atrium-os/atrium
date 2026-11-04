@@ -51,12 +51,32 @@ struct Renderer {
     /// renderer declares the window).
     origins: Mutex<HashMap<u32, String>>,
     chan: Chan,
+    /// Set when the broker has let it go.
+    gone: std::sync::atomic::AtomicBool,
     /// Its windows, by its own (local) ids.
     wins: Mutex<HashMap<u32, Win>>,
     child: Mutex<Child>,
 }
 
 impl Renderer {
+    /// Send without waiting. A renderer whose channel is full has stopped
+    /// reading: it is retired (its channel shut, so its serving thread
+    /// reaps it) rather than waited on, because whoever is sending (the
+    /// frame loop, an input event) must not wait on a renderer (F3).
+    fn tell(&self, m: &Msg, fds: &[std::os::fd::RawFd]) -> Result<(), String> {
+        self.chan.send_now(m, fds).map_err(|e| {
+            self.chan.shutdown();
+            // A full channel: EAGAIN, or on FreeBSD a short write (the
+            // partial record goes nowhere, the channel is shut).
+            if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::WriteZero) {
+                log::info!("frescod: client {}: renderer stopped reading; retiring it", self.client_id);
+                "stopped reading".to_string()
+            } else {
+                e.to_string()
+            }
+        })
+    }
+
     fn local_of(&self, global: u32) -> Option<u32> {
         self.wins.lock().unwrap().iter().find(|(_, w)| w.global as u32 == global).map(|(&l, _)| l)
     }
@@ -254,7 +274,9 @@ impl Broker {
                 }
             }
             for m in changed {
-                let _ = r.chan.send(&m, &[]);
+                if r.tell(&m, &[]).is_err() {
+                    break;
+                }
             }
         }
     }
@@ -265,6 +287,10 @@ impl Broker {
 
     fn start(self: Arc<Self>, stream: UnixStream, client_id: u8, uid: Option<u32>, subs: EventSubs, opener: Option<u64>) -> io::Result<u32> {
         let (ours, theirs) = Chan::pair()?;
+        // About 2700 records each way: input bursts fit, a renderer that
+        // has stopped reading fills it and is retired (`Renderer::tell`).
+        ours.set_buffer(256 << 10)?;
+        theirs.set_buffer(256 << 10)?;
         let mut cmd = match &self.launcher {
             Some(l) => {
                 let l = l.replace("{client}", &client_id.to_string());
@@ -280,7 +306,10 @@ impl Broker {
         cmd.stdin(Stdio::from(theirs.into_fd())).stdout(Stdio::null());
         let child = cmd.spawn()?;
         ours.send(&Msg::Client { width: self.screen.0, height: self.screen.1, refresh_mhz: self.screen.2 }, &[stream.as_raw_fd()])?;
-        drop(stream);
+        // The broker keeps a copy of the client's socket, never read, only
+        // to see the client hang up: a renderer that ignores its client's
+        // hang-up must not keep its client id and windows forever.
+        let hangup = stream;
         log::info!("frescod: client {client_id} (uid {uid:?}) -> renderer pid {}", child.id());
 
         let handle = self.next_handle.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -290,6 +319,7 @@ impl Broker {
             opener,
             origins: Mutex::new(HashMap::new()),
             chan: ours,
+            gone: std::sync::atomic::AtomicBool::new(false),
             wins: Mutex::new(HashMap::new()),
             child: Mutex::new(child),
         });
@@ -303,11 +333,29 @@ impl Broker {
             std::thread::Builder::new().name(format!("frescod-split-ev-{client_id}")).spawn(move || {
                 for ev in ev_rx.iter() {
                     if let Some(m) = event_record(&r, &ev) {
-                        if r.chan.send(&m, &[]).is_err() {
+                        if r.tell(&m, &[]).is_err() {
                             break;
                         }
                     }
                 }
+            })?;
+        }
+
+        // Its client's hang-up.
+        {
+            let r = r.clone();
+            std::thread::Builder::new().name(format!("frescod-split-hup-{client_id}")).spawn(move || {
+                let mut p = libc::pollfd { fd: hangup.as_raw_fd(), events: 0, revents: 0 };
+                while !r.gone.load(std::sync::atomic::Ordering::Relaxed) {
+                    // SAFETY: one pollfd, ours, for the duration of the call.
+                    let n = unsafe { libc::poll(&mut p, 1, 1000) };
+                    if n > 0 && p.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                        log::info!("frescod: client {client_id}: hung up; retiring its renderer");
+                        r.chan.shutdown();
+                        break;
+                    }
+                }
+                drop(hangup);
             })?;
         }
 
@@ -321,8 +369,17 @@ impl Broker {
     }
 
     /// Serve one renderer's records until it goes or misbehaves; returns why.
+    ///
+    /// Each record costs the broker something (a frame copy and check, two
+    /// slots and the compositor lock for a window), so a renderer gets a
+    /// budget: [`RECORDS_PER_S`] records, of which [`CREATES_PER_S`] window
+    /// opens. Past it this thread just waits, so a renderer that floods
+    /// slows only itself: its channel fills and its own sends block.
     fn serve(&self, r: &Renderer, uid: u32) -> String {
+        let mut records = Bucket::new(RECORDS_PER_S, RECORDS_PER_S);
+        let mut creates = Bucket::new(CREATES_PER_S, CREATE_BURST);
         loop {
+            records.take();
             let m = match r.chan.recv() {
                 Ok(Recv::Msg(m, fds)) if m.from_renderer() && fds.is_empty() => m,
                 Ok(Recv::Msg(m, _)) => return format!("refused {m:?} (not a renderer's record, or fds attached)"),
@@ -330,6 +387,9 @@ impl Broker {
                 Ok(Recv::Eof) => return "closed".into(),
                 Err(e) => return e.to_string(),
             };
+            if matches!(m, Msg::WindowCreate { .. }) {
+                creates.take();
+            }
             if let Err(e) = self.record(r, uid, m) {
                 return e;
             }
@@ -359,10 +419,8 @@ impl Broker {
                     }
                     g
                 };
-                r.chan
-                    .send(&Msg::Slots { window: local, bytes: DEFAULT_SLOT_BYTES }, &[a.fd(), b.fd()])
-                    .and_then(|_| r.chan.send(&Msg::Geometry { window: local, width, height }, &[]))
-                    .map_err(|e| e.to_string())?;
+                r.tell(&Msg::Slots { window: local, bytes: DEFAULT_SLOT_BYTES }, &[a.fd(), b.fd()])
+                    .and_then(|_| r.tell(&Msg::Geometry { window: local, width, height }, &[]))?;
                 wins.insert(local, Win { global, slots: [a, b], told: (width, height) });
             }
             Msg::WindowDestroy { .. } => {
@@ -390,7 +448,7 @@ impl Broker {
                     // old size: dropped, the renderer draws again.
                     (_, Err(e)) => log::debug!("frescod: client {} window {local}: {e}", r.client_id),
                 }
-                r.chan.send(&Msg::FrameDone { window: local, slot: s }, &[]).map_err(|e| e.to_string())?;
+                r.tell(&Msg::FrameDone { window: local, slot: s }, &[])?;
             }
             _ => unreachable!("serve() admits only a renderer's records"),
         }
@@ -405,6 +463,7 @@ impl Broker {
 
     /// The renderer is gone or misbehaved: end it and everything it had.
     fn reap(&self, r: &Arc<Renderer>, subs: &EventSubs) {
+        r.gone.store(true, std::sync::atomic::Ordering::Relaxed);
         {
             // End the channel first: the renderer exits on end-of-file, and a
             // launcher (portcullis exec) then tears its jail down. Killing the
@@ -429,6 +488,43 @@ impl Broker {
         }
         self.renderers.lock().unwrap().remove(&r.client_id);
         socket_server::free_client_id(r.client_id);
+    }
+}
+
+/// Records per second one renderer may send: two frames a window at 60 Hz
+/// for a handful of busy windows, with room for titles and the rest.
+const RECORDS_PER_S: f64 = 480.0;
+/// Window opens per second one renderer may make, after a first burst of
+/// [`CREATE_BURST`]: a menu or a dialog at the speed a person opens them.
+/// Each open makes the WM lay the session out again, so this is what bounds
+/// the work a hundred churning renderers can make for the WM and the
+/// compositor lock.
+const CREATES_PER_S: f64 = 2.0;
+const CREATE_BURST: f64 = 16.0;
+
+/// A token bucket that waits when empty.
+struct Bucket {
+    rate: f64,
+    cap: f64,
+    tokens: f64,
+    at: std::time::Instant,
+}
+
+impl Bucket {
+    fn new(rate: f64, cap: f64) -> Bucket {
+        Bucket { rate, cap, tokens: cap, at: std::time::Instant::now() }
+    }
+
+    fn take(&mut self) {
+        let now = std::time::Instant::now();
+        self.tokens = (self.tokens + now.duration_since(self.at).as_secs_f64() * self.rate).min(self.cap);
+        self.at = now;
+        if self.tokens < 1.0 {
+            std::thread::sleep(std::time::Duration::from_secs_f64((1.0 - self.tokens) / self.rate));
+            self.at = std::time::Instant::now();
+            self.tokens = 1.0;
+        }
+        self.tokens -= 1.0;
     }
 }
 

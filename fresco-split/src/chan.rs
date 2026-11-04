@@ -67,10 +67,31 @@ impl Chan {
 
     /// Send one record, with `fds` attached.
     pub fn send(&self, m: &Msg, fds: &[RawFd]) -> io::Result<()> {
-        self.send_bytes(&m.encode(), fds)
+        self.send_bytes(&m.encode(), fds, 0)
     }
 
-    fn send_bytes(&self, rec: &[u8; MSG_BYTES], fds: &[RawFd]) -> io::Result<()> {
+    /// Send one record without waiting: if the other side has let its
+    /// channel fill, fail with `WouldBlock` instead. The broker sends to
+    /// renderers only this way, so a renderer that stops reading can never
+    /// hold up the frame loop or any other window (F3).
+    pub fn send_now(&self, m: &Msg, fds: &[RawFd]) -> io::Result<()> {
+        self.send_bytes(&m.encode(), fds, libc::MSG_DONTWAIT)
+    }
+
+    /// Room for `bytes` of records queued in each direction, so a burst
+    /// (input while a renderer is busy drawing) does not fill the channel.
+    pub fn set_buffer(&self, bytes: usize) -> io::Result<()> {
+        let v = bytes as libc::c_int;
+        for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+            // SAFETY: setsockopt on our own socket with an int option.
+            cvt(unsafe {
+                libc::setsockopt(self.0.as_raw_fd(), libc::SOL_SOCKET, opt, &v as *const _ as *const _, std::mem::size_of_val(&v) as _)
+            })?;
+        }
+        Ok(())
+    }
+
+    fn send_bytes(&self, rec: &[u8; MSG_BYTES], fds: &[RawFd], flags: libc::c_int) -> io::Result<()> {
         assert!(fds.len() <= MAX_FDS);
         let mut iov = libc::iovec { iov_base: rec.as_ptr() as *mut _, iov_len: rec.len() };
         let mut cbuf = [0u64; 8];
@@ -89,7 +110,7 @@ impl Chan {
                 (*c).cmsg_len = libc::CMSG_LEN((fds.len() * 4) as u32) as _;
                 std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(c) as *mut RawFd, fds.len());
             }
-            libc::sendmsg(self.0.as_raw_fd(), &h, libc::MSG_NOSIGNAL)
+            libc::sendmsg(self.0.as_raw_fd(), &h, libc::MSG_NOSIGNAL | flags)
         };
         if n < 0 {
             return Err(io::Error::last_os_error());
@@ -115,7 +136,7 @@ impl Chan {
     /// Send a record's bytes as they are (another protocol over the same
     /// framing, such as [`crate::chrome`]).
     pub fn send_raw(&self, rec: &[u8; MSG_BYTES], fds: &[RawFd]) -> io::Result<()> {
-        self.send_bytes(rec, fds)
+        self.send_bytes(rec, fds, 0)
     }
 
     /// Wait for one record, unparsed.
