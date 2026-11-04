@@ -17,7 +17,7 @@ FreeBSD KPIs (`bus_dma`, `bus_setup_intr`, `BUS_DMA_COHERENT`). Most of the port
 The big job is not an architecture problem. It is **`atrium-gpu-amd` on real silicon.**
 The driver has only ever run against gpusim, which models the PSP loading CP microcode
 rather than doing it. A real R9700 needs PSP/SMU firmware bring-up, IP discovery, real
-MES firmware, DCN display init, MSI-X, the AMD IOMMU and resizable BAR. That work is the
+MES firmware, DCN display init, MSI-X, the IOMMU (Intel VT-d on this box) and resizable BAR. That work is the
 same on any CPU. x86_64 is just where the card is.
 
 | Phase | What | State |
@@ -133,7 +133,7 @@ What the driver has to grow, roughly in bring-up order (the gpusim model abstrac
    against silicon.
 5. MES with real firmware (`cp.c`'s queue model), interrupts through the IH ring on MSI-X.
 6. DCN display. Once IPMI's BMC VGA isn't the console, DCN bring-up gives scanout on 'D'.
-7. AMD-Vi IOMMU. ABI v2.1 relies on the GPU MMU plus the IOMMU for DMA isolation, and the
+7. IOMMU: the box is Intel (Xeon E-2288G), so VT-d, which FreeBSD drives with `dmar(4)` (`hw.dmar.enable=1`). ABI v2.1 relies on the GPU MMU plus the IOMMU for DMA isolation, and the
    review's five isolation breaks have to be fixed before this runs on shared hardware.
 
 Each step feeds back into gpusim: whatever silicon does differently from the model becomes
@@ -141,14 +141,19 @@ a gpusim fix and a regression test. The RDNA4 backend spec already plans this lo
 
 ## 5. Phase E — native boot over IPMI
 
-Install FreeBSD amd64 on its own disk or partition. Use IPMI virtual media for the installer
-and SOL for the console. Keep Ubuntu as the default boot, with a one-shot boot into FreeBSD,
-so a bad kernel always falls back without anyone at the box. Then run M5: frescod
-compositing on the R9700 through `tier3_rdna4`.
+The box has a single disk that Ubuntu owns, so the native boot never touches it:
+**netboot FreeBSD amd64 over PXE (iPXE) with an in-memory root** (`mfsroot`, or root on
+NFS). Scratch data goes to the project's S3 storage. Power-cycling over IPMI, or a
+one-shot PXE boot flag in the BMC, returns the box to Ubuntu from its disk. That beats
+copying the disk off to S3 and restoring it: there's nothing to restore, and no
+failure mode where the box is left without Ubuntu. Console over IPMI SOL. Then run M5:
+frescod compositing on the R9700 through `tier3_rdna4`.
 
-## 6. Open questions for the user
+## 6. Box facts and open questions
 
-1. The box's CPU model: Phase A assumes x86-64-v3 (AVX2/FMA). Anything Zen 1 or newer, or
-   Haswell or newer, qualifies. `lscpu` on the box settles it.
-2. Can IOMMU and VFIO be enabled on the shared Ubuntu box (Phase D's recommended path)?
-3. A spare disk or partition for native FreeBSD (Phase E)?
+- CPU: Xeon E-2288G (Coffee Lake, 8 cores). AVX2, FMA, BMI and LZCNT are present, so
+  Phase A's x86-64-v3 baseline holds. No AVX-512, which nothing assumes.
+- Disk: one, Ubuntu's. Native boot is PXE plus an in-memory root (§5); scratch data goes to S3.
+- IOMMU/VFIO (Phase D): open. Check on the box with `dmesg | grep -i -e DMAR -e IOMMU`
+  and `ls /sys/kernel/iommu_groups`. VT-d may need turning on in the BIOS (reachable through
+  the IPMI remote console) and `intel_iommu=on iommu=pt` on the kernel command line.
