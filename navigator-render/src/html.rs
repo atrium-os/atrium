@@ -2005,8 +2005,12 @@ impl<'a> Cx<'a> {
         let mut cmin = vec![0 as U; coltracks.len()];
         let mut cmax = vec![0 as U; coltracks.len()];
         let mut cauto = vec![0 as U; coltracks.len()];
+        // Items spanning several columns, one of them flexible: their
+        // contributions go to the flex fraction (§12.7.1), not the tracks.
+        let mut cspans: Vec<(usize, usize, U)> = vec![];
         for it in &items {
-            if it.col.1 != 1 { continue }
+            let crosses_flex = it.col.1 > 1 && (it.col.0..it.col.0 + it.col.1).any(|i| coltracks.get(i).and_then(flex_of).is_some());
+            if it.col.1 != 1 && !crosses_flex { continue }
             let (mn, mx) = self.intrinsic(it.h);
             let (a, b, m) = match self.st(it.h) {
                 // Anonymous text: no box, no minimum of its own.
@@ -2037,11 +2041,12 @@ impl<'a> Cx<'a> {
                     (a, b, m)
                 }
             };
+            if it.col.1 != 1 { cspans.push((it.col.0, it.col.1, b)); continue }
             cmin[it.col.0] = cmin[it.col.0].max(a);
             cmax[it.col.0] = cmax[it.col.0].max(b);
             cauto[it.col.0] = cauto[it.col.0].max(m);
         }
-        GridPlan { items, abs, coltracks, rowtracks, cmin, cmax, cauto, cgap }
+        GridPlan { items, abs, coltracks, rowtracks, cmin, cmax, cauto, cgap, cspans }
     }
 
     fn grid(&mut self, h: Handle, s: &Style, x: U, y: U, w: U, cb_h: Option<U>) -> U {
@@ -2050,12 +2055,12 @@ impl<'a> Cx<'a> {
         // column axis is the inline axis), and an item's start is its right.
         let rtl = kw(s, "direction") == "rtl";
         let rgap = len(s.get("row-gap"), cb_h.unwrap_or(0)).unwrap_or(0);
-        let GridPlan { items, abs, coltracks, rowtracks, cmin, cmax, cauto, cgap } = self.grid_plan(h, s, w);
+        let GridPlan { items, abs, coltracks, rowtracks, cmin, cmax, cauto, cgap, .. } = self.grid_plan(h, s, w);
         // Out of flow: not items, placed against their containing block —
         // which, when this grid is that block, is the item's GRID AREA (see
         // below, once the tracks are sized).
         let grid_is_cb = kw(s, "position") != "static" && !kw(s, "position").is_empty();
-        let cols = size_tracks(&coltracks, Some(w), cgap, &cmin, &cmax, &cauto);
+        let cols = size_tracks(&coltracks, Some(w), cgap, &cmin, &cmax, &cauto, &[]);
         // Row sizes: content heights measured at the item's column width.
         let mut rmin = vec![0 as U; rowtracks.len()];
         for it in &items {
@@ -2074,8 +2079,17 @@ impl<'a> Cx<'a> {
             && !matches!(t, Track::MinMax(a, b) if matches!(**a, Track::Len(_) | Track::Pct(_)) && matches!(**b, Track::Len(_) | Track::Pct(_)));
         let mut spanning: Vec<&GItem> = items.iter().filter(|it| it.row.1 > 1).collect();
         spanning.sort_by_key(|it| it.row.1);
+        // With an indefinite height, an item crossing a FLEXIBLE row is not
+        // shared out here: it sets the rows' flex fraction (§12.7.1).
+        let mut rspans: Vec<(usize, usize, U)> = vec![];
         for it in spanning {
             let rs = it.row.0..(it.row.0 + it.row.1).min(rowtracks.len());
+            if cb_h.is_none() && rs.clone().any(|i| flex_of(&rowtracks[i]).is_some()) {
+                let cw: U = (it.col.0..it.col.0 + it.col.1).map(|i| cols.get(i).copied().unwrap_or(0)).sum::<U>() + cgap * (it.col.1 as U - 1);
+                let iw = self.grid_item_w(it.h, cw, &it.justify);
+                rspans.push((rs.start, rs.len(), self.measure(it.h, cw, None, (Some(iw), None))));
+                continue;
+            }
             let grow: Vec<usize> = rs.clone().filter(|i| intrinsic_track(&rowtracks[*i])).collect();
             if grow.is_empty() { continue }
             let cw: U = (it.col.0..it.col.0 + it.col.1).map(|i| cols.get(i).copied().unwrap_or(0)).sum::<U>() + cgap * (it.col.1 as U - 1);
@@ -2089,7 +2103,7 @@ impl<'a> Cx<'a> {
                 }
             }
         }
-        let rows = size_tracks(&rowtracks, cb_h, rgap, &rmin, &rmin, &rmin);
+        let rows = size_tracks(&rowtracks, cb_h, rgap, &rmin, &rmin, &rmin, &rspans);
         let total_h = rows.iter().sum::<U>() + rgap * (rows.len() as U).saturating_sub(1);
         // ★ The STATIC position of an absolutely positioned child (CSS
         // Position 3 §4.2, Box Alignment §5.1): its own justify-self /
@@ -2303,7 +2317,7 @@ impl<'a> Cx<'a> {
             }
         }
         if tracks.is_empty() { return 0 }
-        let mut cols: Vec<U> = size_tracks(&tracks, Some(avail), sx, &mins, &maxs, &mins);
+        let mut cols: Vec<U> = size_tracks(&tracks, Some(avail), sx, &mins, &maxs, &mins, &[]);
         // Share what is left over among the columns that can still grow,
         // so a measured table fills its box instead of hugging its text.
         // ★ Leftover space is only taken when the TABLE's own width says so.
@@ -2601,8 +2615,10 @@ impl<'a> Cx<'a> {
         if !anon && kw(s, "display") == "grid" {
             let p = self.grid_plan(h, s, 0);
             let gaps = p.cgap * (p.coltracks.len() as U).saturating_sub(1);
-            let mn = size_tracks(&p.coltracks, None, p.cgap, &p.cmin, &p.cmin, &p.cmin).iter().sum::<U>() + gaps;
-            let mx = size_tracks(&p.coltracks, None, p.cgap, &p.cmin, &p.cmax, &p.cmin).iter().sum::<U>() + gaps;
+            // Under a MIN-content constraint the flex fraction is zero
+            // (§12.7.1), so spanning items count toward the max only.
+            let mn = size_tracks(&p.coltracks, None, p.cgap, &p.cmin, &p.cmin, &p.cmin, &[]).iter().sum::<U>() + gaps;
+            let mx = size_tracks(&p.coltracks, None, p.cgap, &p.cmin, &p.cmax, &p.cmin, &p.cspans).iter().sum::<U>() + gaps;
             self.links.truncate(links);
             self.unimplemented = counts;
             self.pending_abs.truncate(pend);
@@ -4684,6 +4700,30 @@ mod tests {
     }
 
     #[test]
+    fn a_spanning_item_sets_the_flex_fraction_in_indefinite_space() {
+        // Rows `1fr 3fr` in an auto-height grid, one 100px item over both:
+        // the fraction that fills it is 100 / 4, so 25 and 75 (§12.7.1).
+        // Shared out evenly first, it made 50 / 50, and then 50 / 150.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 100px; grid-template-columns: 50px 50px; grid-template-rows: 1fr 3fr }
+            .s { grid-row-start: 1; grid-row-end: 3; height: 100px }
+            .a { background-color: #ff0000 } .b { grid-column-start: 2; grid-row-start: 2; background-color: #00ff00 }</style>
+            <div class="g"><div class="s"></div><div class="a"></div><div class="b"></div></div>"#);
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(50, 0, 50, 25)]);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(50, 25, 50, 75)]);
+        // Columns of a shrink-wrapped grid: a `span 2` 100px item over two
+        // `1fr` columns makes each 45 (with a 10px gap), not its 10px items'.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .o { display: inline-block } .g { display: grid; grid-template-columns: 1fr 1fr; column-gap: 10px }
+            .w { grid-column-start: 1; grid-column-end: 3; width: 100px; height: 10px }
+            .a { width: 10px; height: 10px; background-color: #ff0000 } .b { width: 10px; height: 10px; background-color: #00ff00 }
+            .x { background-color: #0000ff }</style>
+            <div class="o"><div class="g"><div class="w"></div><div class="x"><div class="a"></div></div><div><div class="b"></div></div></div></div>"#);
+        assert_eq!(boxes(&o, 0x0000ffff), vec![(0, 10, 45, 10)]);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(55, 10, 10, 10)]);
+    }
+
+    #[test]
     fn a_minmax_fr_row_in_an_auto_height_grid_holds_its_content() {
         // BBC News: `grid-template-rows: min-content minmax(0, 1fr)` on a
         // grid with no height. With indefinite free space a flexible track
@@ -5344,16 +5384,34 @@ struct GItem { h: Handle, col: (usize, usize), row: (usize, usize), justify: Str
 
 /// What `grid_plan` works out before any track is sized.
 struct GridPlan { items: Vec<GItem>, abs: Vec<Handle>, coltracks: Vec<navigator_style::values::Track>,
-                  rowtracks: Vec<navigator_style::values::Track>, cmin: Vec<U>, cmax: Vec<U>, cauto: Vec<U>, cgap: U }
+                  rowtracks: Vec<navigator_style::values::Track>, cmin: Vec<U>, cmax: Vec<U>, cauto: Vec<U>, cgap: U,
+                  /// Items spanning several columns, at least one flexible:
+                  /// (first, count, max-content contribution).
+                  cspans: Vec<(usize, usize, U)> }
 
 /// An absolutely positioned grid child, ready to lay out: the handle, the
 /// containing block it takes (its grid area) if not the inherited one, its
 /// static-position rectangle and alignment, and the static x / right / y.
 type AbsJob = (Handle, Option<(U, U, U, Option<U>)>, FlexStatic, U, U, U);
 
+/// A track's flex factor, if its maximum is `fr` (a flexible track, §7.2.4).
+fn flex_of(t: &navigator_style::values::Track) -> Option<f64> {
+    use navigator_style::values::Track;
+    match t {
+        Track::Fr(f) => Some(*f),
+        Track::MinMax(_, b) => match **b { Track::Fr(f) => Some(f), _ => None },
+        _ => None,
+    }
+}
+
 /// `mins`/`maxs` are the tracks' min- and max-content contributions, `autos`
 /// the minimum contributions an `auto` minimum takes (§12.5).
-fn size_tracks(tracks: &[navigator_style::values::Track], avail: Option<U>, gap: U, mins: &[U], maxs: &[U], autos: &[U]) -> Vec<U> {
+///
+/// `spans` are the items crossing a flexible track and more than one track:
+/// (first track, count, contribution). They count only with INDEFINITE
+/// space, where they help find the flex fraction (§12.7.1).
+fn size_tracks(tracks: &[navigator_style::values::Track], avail: Option<U>, gap: U, mins: &[U], maxs: &[U], autos: &[U],
+               spans: &[(usize, usize, U)]) -> Vec<U> {
     use navigator_style::values::Track;
     // ★ A track has TWO sizing functions, and they are not interchangeable:
     // the minimum gives its BASE size, the maximum gives a GROWTH LIMIT it
@@ -5413,14 +5471,6 @@ fn size_tracks(tracks: &[navigator_style::values::Track], avail: Option<U>, gap:
             },
         }
     };
-    let flex_of = |t: &Track| -> Option<f64> {
-        match t {
-            Track::Fr(f) => Some(*f),
-            Track::MinMax(_, b) => match **b { Track::Fr(f) => Some(f), _ => None },
-            _ => None,
-        }
-    };
-
     let mut sizes: Vec<U> = tracks.iter().enumerate().map(|(i, t)| base(t, i)).collect();
     let limits: Vec<U> = tracks.iter().enumerate().map(|(i, t)| limit(t, i).max(sizes[i])).collect();
     // ★ With INDEFINITE free space (an auto-height grid's rows) every track
@@ -5435,9 +5485,29 @@ fn size_tracks(tracks: &[navigator_style::values::Track], avail: Option<U>, gap:
         // in an auto-height grid are all as tall as the tallest. Sized one
         // by one, Le Monde's "most read" rows came out 109 / 130 / 129
         // where Chrome has three of 130.
-        let frac = tracks.iter().enumerate()
+        let mut frac = tracks.iter().enumerate()
             .filter_map(|(i, t)| flex_of(t).map(|f| get(maxs, i) as f64 / f.max(1.0)))
             .fold(0.0, f64::max);
+        // ★ An item crossing flexible tracks needs an fr large enough to
+        // fill its contribution over all the tracks it crosses (§12.7.1,
+        // "find the size of an fr"): what the inflexible ones and the gaps
+        // leave, over the flex factors (a sum below 1 counts as 1). A
+        // flexible track whose base already exceeds its share is treated as
+        // inflexible and the share found again. Ignored, a `span 2` item
+        // over two `1fr` columns of a shrink-wrapped grid overflowed them.
+        for &(first, n, contrib) in spans {
+            let crossed: Vec<usize> = (first..(first + n).min(tracks.len())).collect();
+            let mut flex: Vec<usize> = crossed.iter().copied().filter(|&i| flex_of(&tracks[i]).is_some()).collect();
+            loop {
+                let fixed: U = crossed.iter().filter(|i| !flex.contains(i)).map(|&i| sizes[i]).sum();
+                let left = (contrib - fixed - gap * (crossed.len() as U - 1)).max(0) as f64;
+                let sum: f64 = flex.iter().map(|&i| flex_of(&tracks[i]).unwrap_or(0.0)).sum();
+                let hyp = left / sum.max(1.0);
+                let before = flex.len();
+                flex.retain(|&i| sizes[i] as f64 <= hyp * flex_of(&tracks[i]).unwrap_or(0.0));
+                if flex.len() == before || flex.is_empty() { if !flex.is_empty() { frac = frac.max(hyp) } break }
+            }
+        }
         for (i, t) in tracks.iter().enumerate() {
             if let Some(f) = flex_of(t) { sizes[i] = sizes[i].max((frac * f) as U) }
         }
