@@ -158,7 +158,7 @@ struct Cx<'a> {
     /// overlay (`bottom: 0` in an auto-height card) fell below the card and
     /// over the carousel. Queued with their static position; the positioned
     /// ancestor drains its share when its own height is final.
-    deferred_abs: Vec<(Handle, U, U, U)>,
+    deferred_abs: Vec<(Handle, U, U, U, Option<FlexStatic>)>,
     /// A positioned ancestor with an auto height is open: it will drain
     /// `deferred_abs` when it finishes.
     cb_open: bool,
@@ -169,6 +169,9 @@ struct Cx<'a> {
     /// Set by `abs_box`: the border-box origin `block()` must use instead of
     /// the one normal flow would give it.
     abs_origin: Option<(U, U)>,
+    /// Set by `flex` for the one `abs_box` call it makes: the static position
+    /// of an absolutely positioned child of a flex container.
+    flex_static: Option<FlexStatic>,
     /// Stacking contexts, as ranges of `scene.order`, pushed when the box
     /// that opened one finishes painting (so: post-order).
     contexts: Vec<(i64, usize, usize, usize)>,
@@ -216,7 +219,7 @@ pub fn render_html_with(html: &str, fonts: &FontSet, env: &Env, subs: &Subresour
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]),
                       viewport: (u(env.width_px), Some(u(env.height_px))), pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))),
-                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
+                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
     cx.promoted = promote_block_in_inline(&dom, &styled.styles);
     cx.count_unread_rows();
     // The root element is the initial containing block's only child.
@@ -281,7 +284,7 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None,
                       indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), viewport: (u(env.width_px), Some(u(env.height_px))),
                       pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))), subs: &Subresources::new(),
-                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
+                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
     // (table, per-column (min, max), its first row's cells) for every table.
     let mut tables: Vec<(Handle, Vec<(U, U)>, Vec<Handle>)> = vec![];
     for t in 0..dom.nodes.len() as Handle {
@@ -409,6 +412,17 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
     dom2.append(head, style);
     (dom2.serialize(), n)
 }
+
+/// ★ The static position of an absolutely positioned child of a flex
+/// container (CSS Flexbox §4.1) is where it would be as the container's SOLE
+/// flex item: the container's content box, with justify-content placing it
+/// on the main axis and align-self on the cross axis. Held in physical terms
+/// — the axes and an rtl main- or cross-start are resolved by `flex`.
+#[derive(Clone, Copy)]
+struct FlexStatic { x: U, y: U, w: U, h: U, horiz: Align, vert: Align }
+
+#[derive(Clone, Copy, PartialEq)]
+enum Align { Start, Center, End }
 
 /// An image's natural sizing (CSS Images 3 §5.1): each part optional.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -771,7 +785,8 @@ impl<'a> Cx<'a> {
         } else if kw(s, "display") == "table" && !self.table_rows(h).0.is_empty() {
             cy += self.table(h, s, content_x, cy, content_w);
         } else if kw(s, "display") == "flex" {
-            cy += self.flex(h, s, content_x, cy, content_w, child_cb_h);
+            let auto_h = (clamp(0).max(vframe) - vframe, clamp(U::MAX / 4).max(vframe) - vframe);
+            cy += self.flex(h, s, content_x, cy, content_w, child_cb_h, auto_h);
         } else {
             let mut inline: Vec<Item> = vec![];
             for c in self.dom.children_of(h) {
@@ -795,7 +810,7 @@ impl<'a> Cx<'a> {
         if positioned && self.deferred_abs.len() > deferred_from {
             self.pos_cb.3 = Some((hgt - bt - bb).max(0));
             self.cb_open = false;
-            for (d, sx, sr, sy) in self.deferred_abs.split_off(deferred_from) { self.abs_box(d, sx, sr, sy) }
+            for (d, sx, sr, sy, fs) in self.deferred_abs.split_off(deferred_from) { self.flex_static = fs; self.abs_box(d, sx, sr, sy) }
         }
         self.cb_open = saved_open;
         // The box's own border and background are outside its own clip.
@@ -967,6 +982,7 @@ impl<'a> Cx<'a> {
     /// been placed in: its static position is the left end of it, or in an
     /// rtl containing block the RIGHT end (CSS 2.1 §10.3.7).
     fn abs_box(&mut self, h: Handle, static_x: U, static_r: U, static_y: U) {
+        let fs = self.flex_static.take();
         let Some(s) = self.st(h) else { return };
         let rtl = self.dom.get(h).and_then(|n| n.parent).and_then(|p| self.st(p)).is_some_and(|ps| kw(ps, "direction") == "rtl");
         let (cbx, cby, cbw, cbh) = if kw(s, "position") == "fixed" {
@@ -978,7 +994,7 @@ impl<'a> Cx<'a> {
         let (top, bottom) = (v_off("top"), v_off("bottom"));
         if cbh.is_none() && self.cb_open && kw(s, "position") != "fixed"
             && (bottom.is_some() || matches!(s.get("top"), V::Pct(_)) || matches!(s.get("height"), V::Pct(_))) {
-            self.deferred_abs.push((h, static_x, static_r, static_y));
+            self.deferred_abs.push((h, static_x, static_r, static_y, fs));
             return;
         }
         // `None` is `auto`; resolved below, once the box's size is known.
@@ -1056,8 +1072,15 @@ impl<'a> Cx<'a> {
             (Some(_), Some(r)) if rtl => cbx + cbw - r - mr - w,
             (Some(l), _) => cbx + l + ml,
             (None, Some(r)) => cbx + cbw - r - mr - w,
-            _ if rtl => static_r - mr - w,
-            _ => static_x + ml,
+            _ => match fs {
+                Some(f) => match f.horiz {
+                    Align::Start => f.x + ml,
+                    Align::End => f.x + f.w - mr - w,
+                    Align::Center => f.x + (f.w - ml - w - mr) / 2 + ml,
+                },
+                None if rtl => static_r - mr - w,
+                None => static_x + ml,
+            },
         };
         let y = match (top, bottom) {
             (Some(t), _) => cby + t + mt,
@@ -1071,7 +1094,18 @@ impl<'a> Cx<'a> {
                 }
                 None => static_y + mt,
             },
-            _ => static_y + mt,
+            // ★ Flex end or centre: the box is measured first, like a
+            // `bottom` one. Unsafe, as in CSS — an oversized box centred in
+            // a smaller container starts above it.
+            _ => match fs {
+                Some(f) if f.vert != Align::Start => {
+                    self.placing_abs = true;
+                    let outer = self.measure(h, cbw, cbh, (Some(w), forced_h));
+                    if f.vert == Align::End { f.y + f.h - outer + mt } else { f.y + (f.h - outer) / 2 + mt }
+                }
+                Some(f) => f.y + mt,
+                None => static_y + mt,
+            },
         };
         self.abs_origin = Some((x, y));
         self.placing_abs = true;
@@ -1441,7 +1475,11 @@ impl<'a> Cx<'a> {
     /// Items are the element children and anonymous items around loose
     /// text. `auto` margins count as 0 while lines are built and lengths
     /// flexed, then take the free space (§9.5 step 12, §9.6 step 13).
-    fn flex(&mut self, h: Handle, s: &Style, x: U, y: U, w: U, cb_h: Option<U>) -> U {
+    ///
+    /// `auto_h` bounds the content height when the container's own height is
+    /// auto (its min-/max-height, less padding and border): the final size,
+    /// which an absolutely positioned child's static position needs.
+    fn flex(&mut self, h: Handle, s: &Style, x: U, y: U, w: U, cb_h: Option<U>, auto_h: (U, U)) -> U {
         let row = kw(s, "flex-direction") != "column";
         // ★ The inline axis runs right to left in an rtl container: a ROW's
         // main-start is its right edge (flex-start, flex-end and the item
@@ -1456,6 +1494,10 @@ impl<'a> Cx<'a> {
                     // Which margins are `auto`, in the same flow-relative order.
                     auto: [bool; 4] }
         let mut items: Vec<It> = vec![];
+        // Absolutely positioned children, each with the number of items
+        // before it: placed in document order among them, once the
+        // container's size is known.
+        let mut abs: Vec<(Handle, usize)> = vec![];
         for c in self.dom.children_of(h) {
             match self.dom.get(c).map(|n| &n.kind) {
                 // ★ CSS wraps a run of loose text in an ANONYMOUS item. It
@@ -1478,7 +1520,7 @@ impl<'a> Cx<'a> {
             let Some(cs) = self.st(c) else { continue };
             if kw(cs, "display") == "none" { continue }
             // Out of flow: not an item, placed against its containing block.
-            if matches!(kw(cs, "position"), "absolute" | "fixed") { self.abs_box(c, x, x + w, y); continue }
+            if matches!(kw(cs, "position"), "absolute" | "fixed") { abs.push((c, items.len())); continue }
             let px = |p: &str, basis: U| len(cs.get(p), basis);
             let (mw, mh) = (if rtl { ["margin-right", "margin-left"] } else { ["margin-left", "margin-right"] }, ["margin-top", "margin-bottom"]);
             let (mm, cm) = if row { (mw, mh) } else { (mh, mw) };
@@ -1627,6 +1669,29 @@ impl<'a> Cx<'a> {
         // a baseline-sharing group falls back to `start` (CSS Box Alignment):
         // laying it out as flex-start IS the specified behaviour.
         let jc = kw(s, "justify-content");
+        // ★ The static position of an absolutely positioned child (§4.1):
+        // as the SOLE item of this container — justify-content on the main
+        // axis (space-between is start, space-around/-evenly centre, as for
+        // one item), its own align-self on the cross axis (stretch and
+        // baseline are start). Not align-content, even when wrapping: that
+        // is what Chrome does. Placed at the content box's start whatever
+        // the alignment, The Hindu's 3D carousel — `justify-content:
+        // center` around absolutely positioned cards — sat at the left edge.
+        let main_extent: U = lines.iter().map(|r| items[r.clone()].iter().map(|i| i.main + i.m_start + i.m_end).sum::<U>()
+            + main_gap * (r.len() as U).saturating_sub(1)).max().unwrap_or(0);
+        let (box_w, box_h) = if row { (w, cb_h.unwrap_or(total.max(0).min(auto_h.1).max(auto_h.0))) }
+                             else { (w, cb_h.unwrap_or(main_extent.min(auto_h.1).max(auto_h.0))) };
+        let place_abs = |this: &mut Self, c: Handle| {
+            let main = match jc { "flex-end" | "end" => Align::End, "center" | "space-around" | "space-evenly" => Align::Center,
+                                  "right" if row => Align::End, _ => Align::Start };
+            let al = this.st(c).map(|cs| match kw(cs, "align-self") { "auto" | "" => kw(s, "align-items"), a => a }).unwrap_or("");
+            let cross = match al { "flex-end" | "end" | "self-end" => Align::End, "center" => Align::Center, _ => Align::Start };
+            let flip = |a: Align| match a { Align::Start => Align::End, Align::End => Align::Start, c => c };
+            let (horiz, vert) = if row { (if rtl { flip(main) } else { main }, cross) } else { (if rtl { flip(cross) } else { cross }, main) };
+            this.flex_static = Some(FlexStatic { x, y, w: box_w, h: box_h, horiz, vert });
+            this.abs_box(c, x, x + w, y);
+        };
+        let mut next_abs = 0;
         for (li, r) in lines.iter().enumerate() {
             let lc = line_cross[li] + cstretch;
             let used: U = items[r.clone()].iter().map(|i| i.main + i.m_start + i.m_end).sum::<U>() + main_gap * (r.len() as U).saturating_sub(1);
@@ -1660,6 +1725,7 @@ impl<'a> Cx<'a> {
                 _ => (0, 0),
             } };
             for idx in r.clone() {
+                while next_abs < abs.len() && abs[next_abs].1 <= idx { place_abs(self, abs[next_abs].0); next_abs += 1 }
                 let i = &items[idx];
                 let slot = lc - i.c_start - i.c_end;
                 // ★ AUTO MARGINS on the cross axis (§8.1, §9.6 step 13) beat
@@ -1694,12 +1760,10 @@ impl<'a> Cx<'a> {
             cpos += lc + cross_gap + cstep;
         }
         let _ = cstep;
+        for &(c, _) in &abs[next_abs..] { place_abs(self, c) }
         // Content height: a row container is as tall as its lines stacked in
         // the cross axis; a column container as its longest line's main extent.
-        if row { total.max(0) } else {
-            lines.iter().map(|r| items[r.clone()].iter().map(|i| i.main + i.m_start + i.m_end).sum::<U>()
-                + main_gap * (r.len() as U).saturating_sub(1)).max().unwrap_or(0)
-        }
+        if row { total.max(0) } else { main_extent }
     }
 
     /// Grid layout (profile §3.5; CSS Grid without named lines, `subgrid` or
@@ -3383,6 +3447,40 @@ mod tests {
         assert_eq!(one(0x00ffffff).0, 0, "-2 / -1 is the last column, on the left");
     }
 
+    /// ★ CSS Flexbox §4.1: an absolutely positioned child of a flex
+    /// container takes its static position as the container's SOLE item —
+    /// justify-content on the main axis, align-self on the cross axis, rtl
+    /// flipping the inline start. Every expected offset is headless Chrome's.
+    #[test]
+    fn an_absolute_flex_child_is_placed_as_the_sole_flex_item() {
+        let cases: &[(&str, &str, (U, U))] = &[
+            ("justify-content: center; align-items: center", "", (175, 40)),
+            ("justify-content: flex-end; align-items: flex-end", "", (345, 80)),
+            ("justify-content: space-around", "", (175, 0)),
+            ("justify-content: space-between; align-items: stretch", "", (5, 0)),
+            ("flex-direction: column; justify-content: center; align-items: flex-end", "", (345, 40)),
+            ("direction: rtl; justify-content: flex-start; align-items: center", "align-self: flex-start", (345, 0)),
+            // align-content does not move it, even in a wrapping container.
+            ("flex-wrap: wrap; align-content: center; align-items: flex-end", "", (5, 80)),
+            ("flex-direction: column; direction: rtl; align-items: flex-start; justify-content: flex-end", "", (345, 80)),
+            // The FINAL height: auto, raised to min-height.
+            ("height: auto; min-height: 60px; align-items: flex-end; justify-content: center", "", (175, 40)),
+            // Oversized and centred: unsafe, so it starts before the box.
+            ("justify-content: center; align-items: center", "width: 500px; height: 150px", (-50, -25)),
+        ];
+        for (k, (c, a, want)) in cases.iter().enumerate() {
+            let src = format!(r#"<style>body {{ margin-left: 0px; margin-right: 0px; margin-top: 0px }}
+                .c {{ display: flex; position: relative; width: 400px; height: 100px; {c} }}
+                .a {{ position: absolute; width: 50px; height: 20px; margin-left: 5px; margin-right: 5px; background-color: #ff0000; {a} }}
+                .k {{ width: 10px; height: 30px }}</style>
+                <div class="c"><div class="a"></div>{}</div>"#, if k == 8 { r#"<div class="k"></div>"# } else { "" });
+            let o = render(&src);
+            assert!(o.diagnostics.is_empty(), "{c}: {:?}", o.diagnostics);
+            let b = boxes(&o, 0xff0000ff)[0];
+            assert_eq!((b.0, b.1), *want, "{c} / {a}");
+        }
+    }
+
     /// ★ With both offsets auto, an absolutely positioned box in an rtl
     /// containing block puts its RIGHT edge at the static position; with
     /// both given and a width, `left` is the one ignored (CSS 2.1 §10.3.7).
@@ -4119,7 +4217,7 @@ mod tests {
                           report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None,
                           baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]),
                           viewport: (0, None), pos_cb: (0, 0, 0, None), subs: &Subresources::new(),
-                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
+                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
         cx.count_rows_outside(&held_out);
         // The non-initial value is counted once; the initial one is not.
         assert_eq!(cx.unimplemented.get("row text-align… (not implemented)"), Some(&1), "{:?}", cx.unimplemented);
