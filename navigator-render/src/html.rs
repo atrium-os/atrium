@@ -430,7 +430,9 @@ struct Line { lh: U, underline: Option<u32>, strike: Option<u32>,
                /// overflow-wrap: break-word.
                break_word: bool,
                /// tab-size, in spaces.
-               tab: i64 }
+               tab: i64,
+               /// white-space: pre or nowrap — no soft wrap here.
+               nowrap: bool }
 
 impl<'a> Cx<'a> {
     fn st(&self, h: Handle) -> Option<&'a Style> { self.styles.get(h as usize).and_then(|s| s.as_ref()) }
@@ -2120,15 +2122,24 @@ impl<'a> Cx<'a> {
             }
         }
         let mut line = 0;
+        // Under `pre`/`nowrap` nothing between items is a break: the run of
+        // them is ONE min-content unit, as `lines` will lay it out.
+        let mut chain: Option<U> = None;
         for it in &items {
             match it {
-                Item::Break => { mx = mx.max(line); line = 0 }
-                Item::Word(t, st, _) | Item::PreSpace(t, st, _) => {
+                Item::Break => { mx = mx.max(line); line = 0; chain = None }
+                Item::Word(t, st, l) | Item::PreSpace(t, st, l) => {
                     let w: U = self.sh.shape(t, st, &mut self.report).iter().map(|p| p.width).sum();
-                    if matches!(it, Item::Word(..)) { mn = mn.max(w) }
+                    let c = match chain { Some(c) if l.nowrap => c + w, _ => w };
+                    if matches!(it, Item::Word(..)) { mn = mn.max(c) }
+                    chain = Some(c);
                     line += w;
                 }
-                Item::Space(st, _) => line += self.sh.shape(" ", st, &mut self.report).iter().map(|p| p.width).sum::<U>(),
+                Item::Space(st, l) => {
+                    let w = self.sh.shape(" ", st, &mut self.report).iter().map(|p| p.width).sum::<U>();
+                    chain = chain.filter(|_| l.nowrap).map(|c| c + w);
+                    line += w;
+                }
                 Item::Atomic(ah, ..) => {
                     let w = self.atomic_outer_w(*ah, 0);
                     // ★ A shrink-to-fit inline-block wraps INSIDE itself, so
@@ -2139,8 +2150,10 @@ impl<'a> Cx<'a> {
                     // column's minimum at 234 px, 26 more than it had.
                     mn = mn.max(self.atomic_min_outer_w(*ah).unwrap_or(w));
                     line += w;
+                    chain = None;
                 }
                 Item::Tab(st, l) => {
+                    chain = None;
                     let sp: U = self.sh.shape(" ", st, &mut self.report).iter().map(|p| p.width).sum();
                     let stop = (sp * l.tab as U).max(1);
                     line = (line / stop + 1) * stop;
@@ -2184,7 +2197,8 @@ impl<'a> Cx<'a> {
                           // box, and breaking them rendered one character per
                           // line, vertically, down the page.
                           break_word: kw(s, "overflow-wrap") == "break-word" && kw(s, "white-space") != "nowrap",
-                          tab: match s.get("tab-size") { V::Int(n) => (*n).clamp(0, 64), _ => 8 } };
+                          tab: match s.get("tab-size") { V::Int(n) => (*n).clamp(0, 64), _ => 8 },
+                          nowrap: matches!(kw(s, "white-space"), "pre" | "nowrap") };
         let sp = |p: &str| match s.get(p) { V::Len(l) => u(l.v), V::Calc(c) => calc_eval(c, 0).map(u).unwrap_or(0), _ => 0 };
         (FontStyle { family, bold: weight >= 600, em, size, rgba: color, link: None,
                      ls: sp("letter-spacing"), ws: sp("word-spacing"), tnum: kw(s, "font-variant-numeric") == "tabular-nums" }, line)
@@ -2371,7 +2385,7 @@ impl<'a> Cx<'a> {
                         (Some((ps, _)), Some(false)) => self.sh.shape(" ", ps, &mut self.report).iter().map(|p| p.width).sum(),
                         _ => 0,
                     };
-                    let wrap = cx + sw + adv > w && !lines.last().expect("line").is_empty();
+                    let wrap = cx + sw + adv > w && !lines.last().expect("line").is_empty() && !no_soft_wrap(&l, &pending);
                     if wrap { lines.push(vec![]); forced.push(false); cx = 0 } else { cx += sw }
                     let asc = self.baseline(ah, w, (Some(bw), None));
                     let outer_h = self.measure(ah, w, None, (Some(bw), None));
@@ -2388,7 +2402,7 @@ impl<'a> Cx<'a> {
                         (Some((ps, _)), Some(false)) => self.sh.shape(" ", ps, &mut self.report).iter().map(|p| p.width).sum(),
                         _ => 0,
                     };
-                    let wrap = cx + sw + ww > w && !lines.last().expect("line").is_empty();
+                    let wrap = cx + sw + ww > w && !lines.last().expect("line").is_empty() && !no_soft_wrap(&l, &pending);
                     if wrap { lines.push(vec![]); forced.push(false); cx = 0 } else { cx += sw }
                     if ww > w && l.break_word {
                         // overflow-wrap: break-word — a word wider than a whole
@@ -2986,6 +3000,26 @@ mod tests {
         // A short table still takes its height.
         let o = render(&src.replace("<div>two</div><div>three</div><div>four</div>", ""));
         assert_eq!(boxes(&o, 0xff0000ff)[0].1, 36);
+    }
+
+    /// ★ `pre` never soft-wraps: a code line made of several elements
+    /// overflows its box (and its clip) instead of breaking between them.
+    #[test]
+    fn pre_does_not_wrap_between_elements() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px } pre { width: 120px }</style>
+            <pre>    <span>let</span> s = <span>"hello"</span>;   <span>// s is valid from this point forward</span>
+}</pre>"#);
+        let y = |t: &str| o.scene.runs.iter().find(|r| r.text.contains(t)).map(|r| r.y).unwrap_or_else(|| panic!("{t}"));
+        assert_eq!((y("let"), y("hello")), (y("valid"), y("valid")), "one source line, one line box");
+        assert!(y("}") > y("let"));
+        // And a shrink-to-fit box holds a `nowrap` line made of elements.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px } .b { display: inline-block; white-space: nowrap; background-color: #ff0000 }</style>
+            <div style="width: 1px"><span class="b"><a>Home</a> <a>Docs</a> <a>Blog</a></span></div>"#);
+        let ys: std::collections::BTreeSet<U> = o.scene.runs.iter().map(|r| r.y).collect();
+        assert_eq!(ys.len(), 1, "one line");
+        let b = boxes(&o, 0xff0000ff);
+        let right = o.scene.runs.iter().map(|r| r.x).max().unwrap() / PX;
+        assert!(b[0].2 > right, "the box ({} px) reaches past its last word ({right} px)", b[0].2);
     }
 
     /// ★ UAX #14. CJK breaks between ideographs (punctuation stays with
@@ -3899,6 +3933,14 @@ fn uax14_segments(word: &str) -> Vec<&str> {
     }
     if last < word.len() { out.push(&word[last..]) }
     out
+}
+
+/// ★ No soft wrap before an item under `white-space: pre` or `nowrap`:
+/// the space before it (if any) and the item itself must both allow one.
+/// `pre` text arrives as one word per element, and wrapping between them
+/// split a code line in two — `let s =` / `"hello";` — inside its block.
+fn no_soft_wrap(l: &Line, pending: &Option<(FontStyle, Line)>) -> bool {
+    l.nowrap && pending.as_ref().is_none_or(|(_, pl)| pl.nowrap)
 }
 
 fn is_rtl(c: char) -> bool {
