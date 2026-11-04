@@ -102,7 +102,6 @@ pub fn raster() -> Option<Case> {
     case("fresco_raster", RASTER_SPV, init, f.raster_groups(), (binding::TARGET, target))
 }
 
-<<<<<<< Updated upstream
 /// A 1920x1080 desktop-like scene for timing: overlapping rounded windows,
 /// translucent panels, strokes, image quads and text runs (deterministic).
 pub fn desktop_scene() -> Scene {
@@ -140,7 +139,8 @@ pub fn desktop_scene() -> Scene {
         s.glyph_batches[0].runs.push(GlyphRun { origin, color: [0.05, 0.05, 0.1, 1.0], glyphs });
     }
     s
-=======
+}
+
 /// A whole frame as frescod records it ([`fresco_compute::rdna4::Rdna4`]):
 /// bin, CS_PARTIAL_FLUSH and cache sync, raster, in one IB, from a zero
 /// mask. Checks the target.
@@ -183,5 +183,4 @@ pub fn frame_of(name: &str, scene: &Scene, w: u32, h: u32, pitch: u32) -> Option
         buffers.push(Buffer { name: format!("b0_{b}"), va: va[b], size, init, expect, unordered: None });
     }
     Some(Case { name: name.into(), buffers, ib: ("code".into(), ib_off, ib.dw.len() as u64), ip: "compute" })
->>>>>>> Stashed changes
 }

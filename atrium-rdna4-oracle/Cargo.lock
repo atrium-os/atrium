@@ -138,6 +138,7 @@ dependencies = [
 name = "fresco-compute"
 version = "0.1.0"
 dependencies = [
+ "atrium-rdna4",
  "atrium-spv-ir",
  "atrium-spv-loader",
  "atrium-spv-runtime",
