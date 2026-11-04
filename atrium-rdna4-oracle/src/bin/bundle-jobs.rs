@@ -41,7 +41,9 @@ fn main() {
     for c in &cases {
         writeln!(sh, "echo \"--- {n}\"; ./amdgpu_runner {n} $DEV || true; cat {n}/result.txt", n = c.name).unwrap();
         writeln!(sh, "for f in {n}/*.out; do [ -f \"$f\" ] || continue; echo \"$f sha256=$(sha256sum < $f | cut -c1-16)\"; od -An -tx4 -N64 \"$f\"; \
-if [ -f \"${{f%.out}}.expect\" ]; then cmp -s \"$f\" \"${{f%.out}}.expect\" && echo MATCH || echo MISMATCH; fi; done", n = c.name).unwrap();
+b=${{f%.out}}; if [ -f \"$b.unordered\" ]; then r=$(cat \"$b.unordered\"); \
+if [ \"$(od -An -v -tx1 -w$r \"$f\" | sort)\" = \"$(od -An -v -tx1 -w$r \"$b.expect\" | sort)\" ]; then echo MATCH unordered; else echo MISMATCH unordered; od -An -tx4 -N256 \"$f\"; fi; \
+elif [ -f \"$b.expect\" ]; then if cmp -s \"$f\" \"$b.expect\"; then echo MATCH; else echo MISMATCH; cmp \"$f\" \"$b.expect\" | head -1; od -An -tx4 -N256 \"$f\"; fi; fi; done", n = c.name).unwrap();
     }
     sh += "echo '=== end ==='\n";
     print!("{sh}");

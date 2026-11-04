@@ -10,6 +10,7 @@ description = "atrium-spv IR -> RDNA4 (GFX12) machine code for the native Tier-3
 path = "src/lib.rs"
 
 [dependencies]
+atrium-gir = { path = "../atrium-gir" }
 atrium-rdna4-isa = { path = "../atrium-rdna4-isa" }
 
 [dev-dependencies]

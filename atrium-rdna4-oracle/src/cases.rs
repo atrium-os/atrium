@@ -54,14 +54,162 @@ pub fn write_42() -> Case {
         name: "write_42".into(),
         ip: "compute",
         buffers: vec![
-            Buffer { name: "code".into(), va: CODE_VA, size: 0x2000, init: code, expect: None },
-            Buffer { name: "out".into(), va: DATA_VA, size: 64 * 4, init: vec![], expect: Some(words_to_bytes(&[42; 64])) },
+            Buffer { name: "code".into(), va: CODE_VA, size: 0x2000, init: code, expect: None, unordered: None },
+            Buffer { name: "out".into(), va: DATA_VA, size: 64 * 4, init: vec![], expect: Some(words_to_bytes(&[42; 64])), unordered: None },
         ],
         ib: ("code".into(), IB_OFFSET, ib_dw),
     }
 }
 
+/// GPU address of data buffer `i` (1 MiB apart).
+fn data_va(i: usize) -> u64 {
+    DATA_VA + (i as u64) * 0x10_0000
+}
+
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u32 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (self.0 >> 33) as u32
+    }
+    /// An exact float in [1, 251), never zero.
+    fn f(&mut self) -> f32 {
+        1.0 + (self.next() % 2000) as f32 / 8.0
+    }
+}
+
+/// A desktop compute shader compiled by our backend: SPIR-V → GIR →
+/// optimise → RDNA4. Expected buffers come from the GIR interpreter run on
+/// the same inputs. `None` when the shader's SPIR-V is not built
+/// (`bundles/*/build.sh`).
+pub fn desktop(name: &str, spv: &str, nodes: u32, record: u32) -> Option<Case> {
+    use atrium_gir::interp;
+    let path = format!("{}/../bundles/{spv}", env!("CARGO_MANIFEST_DIR"));
+    let bytes = std::fs::read(path).ok()?;
+    let m = atrium_spv_frontend::translate(&bytes).expect("frontend");
+    let mut g = atrium_gir::build::build(&m, 0).expect("gir");
+    atrium_gir::passes::optimize(&mut g);
+    let bin = atrium_rdna4_compiler::compile(&g).expect("rdna4 compile");
+
+    // Inputs: scene = node count + 64 bytes per node of floats; glyph runs
+    // get small glyph counts and offsets into a glyph buffer.
+    let mut r = Rng(0x5eed ^ nodes as u64);
+    let fl = |n: usize, r: &mut Rng| -> Vec<u8> { (0..n).flat_map(|_| r.f().to_le_bytes()).collect() };
+    let mut scene = fl(4 + 16 * nodes as usize, &mut r);
+    scene[0..4].copy_from_slice(&nodes.to_le_bytes());
+    let mut bufs: Vec<Vec<u8>> = vec![];
+    let glyph = spv.contains("glyph");
+    if glyph {
+        let mut total = 0u32;
+        for i in 0..nodes as usize {
+            let count = r.next() % 4;
+            let meta = 16 + 64 * i + 48;
+            scene[meta..meta + 4].copy_from_slice(&count.to_le_bytes());
+            scene[meta + 4..meta + 8].copy_from_slice(&total.to_le_bytes());
+            total += count;
+        }
+        let glyphs = fl(12 * total as usize, &mut r);
+        bufs.extend([scene, glyphs, vec![0; (record * total) as usize], vec![0; 4]]);
+    } else {
+        bufs.extend([scene, vec![0; (record * nodes) as usize], vec![0; 4]]);
+    }
+    let groups = (nodes + 63) / 64 + 1;
+    let mut ib_bufs: interp::Buffers = bufs.iter().enumerate().map(|(i, b)| ((0, i as u32), b.clone())).collect();
+    interp::run(&g, [groups, 1, 1], &mut ib_bufs).expect("interpreter");
+
+    let mut user = vec![];
+    for (set, binding) in &bin.abi.buffers {
+        assert_eq!(*set, 0);
+        let va = data_va(*binding as usize);
+        user.extend([va as u32, (va >> 32) as u32]);
+    }
+    let mut ib = Blob::compute();
+    emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs: bin.vgprs, user_sgprs: user, threads: bin.local_size, groups: [groups, 1, 1], wave32: true });
+    ib.pad(8);
+    let mut code = words_to_bytes(&bin.code);
+    assert!(code.len() <= IB_OFFSET as usize, "shader larger than the code slot");
+    code.resize(IB_OFFSET as usize, 0);
+    code.extend(ib.bytes());
+    let ib_dw = ib.dw.len() as u64;
+
+    let names = if glyph { vec!["scene", "glyphs", "instances", "counter"] } else { vec!["scene", "instances", "counter"] };
+    let mut buffers = vec![Buffer { name: "code".into(), va: CODE_VA, size: 0x2000, init: code, expect: None, unordered: None }];
+    for (i, b) in bufs.iter().enumerate() {
+        let out = ib_bufs.remove(&(0, i as u32)).unwrap();
+        let size = ((b.len().max(4) as u64) + 4095) & !4095;
+        buffers.push(Buffer {
+            name: names[i].into(),
+            va: data_va(i),
+            size,
+            init: b.clone(),
+            unordered: (names[i] == "instances").then_some(record),
+            expect: Some(out),
+        });
+    }
+    Some(Case { name: name.into(), buffers, ib: ("code".into(), IB_OFFSET, ib_dw), ip: "compute" })
+}
+
+/// A Tier-B example (atrium-vk-icd/examples/shaders) compiled by our
+/// backend: every binding gets 1 KiB of small integers, one workgroup.
+/// `None` when the SPIR-V is missing or the backend does not support the
+/// shader yet.
+pub fn tierb(name: &str) -> Option<Case> {
+    use atrium_gir::interp;
+    let path = format!("{}/../atrium-vk-icd/examples/shaders/{name}.comp.spv", env!("CARGO_MANIFEST_DIR"));
+    let bytes = std::fs::read(path).ok()?;
+    let m = atrium_spv_frontend::translate(&bytes).ok()?;
+    let mut g = atrium_gir::build::build(&m, 0).ok()?;
+    atrium_gir::passes::optimize(&mut g);
+    let bin = atrium_rdna4_compiler::compile(&g).ok()?;
+    let fill = |k: u32| -> Vec<u8> { (0..256u32).flat_map(|i| (i % 7 + k).to_le_bytes()).collect() };
+    let mut ib_bufs: interp::Buffers = g.buffers.iter().map(|&(s, b)| ((s, b), fill(b + 1))).collect();
+    let inputs = ib_bufs.clone();
+    interp::run(&g, [1, 1, 1], &mut ib_bufs).ok()?;
+    let mut user = vec![];
+    let mut buffers = vec![];
+    for (i, (set, binding)) in bin.abi.buffers.iter().enumerate() {
+        let va = data_va(i);
+        user.extend([va as u32, (va >> 32) as u32]);
+        buffers.push(Buffer {
+            name: format!("b{set}_{binding}"),
+            va,
+            size: 4096,
+            init: inputs[&(*set, *binding)].clone(),
+            expect: Some(ib_bufs.remove(&(*set, *binding)).unwrap()),
+            unordered: None,
+        });
+    }
+    let mut ib = Blob::compute();
+    emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs: bin.vgprs, user_sgprs: user, threads: bin.local_size, groups: [1, 1, 1], wave32: true });
+    ib.pad(8);
+    let mut code = words_to_bytes(&bin.code);
+    code.resize(IB_OFFSET as usize, 0);
+    code.extend(ib.bytes());
+    let ib_dw = ib.dw.len() as u64;
+    buffers.insert(0, Buffer { name: "code".into(), va: CODE_VA, size: 0x2000, init: code, expect: None, unordered: None });
+    Some(Case { name: format!("tierb_{name}"), buffers, ib: ("code".into(), IB_OFFSET, ib_dw), ip: "compute" })
+}
+
+/// Tier-B examples tried as compiled cases, simplest first.
+pub const TIERB: [&str; 16] = [
+    "write_42", "per_thread", "multi_binding", "max_const", "ternary", "branch", "rmw", "rotate",
+    "bit_chain", "bit_count", "loop_mul", "sum_loop", "atomic_add", "per_thread_triangle", "spec_scale", "float_sqrt",
+];
+
 /// Every case, by name.
 pub fn all() -> Vec<Case> {
-    vec![write_42()]
+    let mut v = vec![write_42()];
+    let desk = [
+        ("op_texture", "atrium-core/compute/op_texture.comp.spv", 16),
+        ("op_rectangle", "atrium-core/compute/op_rectangle.comp.spv", 48),
+        ("op_path", "atrium-core/compute/op_path.comp.spv", 48),
+        ("op_glyph_run", "atrium-text/compute/op_glyph_run.comp.spv", 48),
+    ];
+    for (n, p, rec) in desk {
+        v.extend(desktop(n, p, 100, rec));
+    }
+    for t in TIERB {
+        v.extend(tierb(t));
+    }
+    v
 }

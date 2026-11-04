@@ -28,6 +28,9 @@ pub struct Buffer {
     pub init: Vec<u8>,
     /// Expected contents after the run, if this buffer is checked.
     pub expect: Option<Vec<u8>>,
+    /// Compare as a multiset of records of this many bytes (for buffers
+    /// filled in atomic-counter order, which differs between GPU runs).
+    pub unordered: Option<u32>,
 }
 
 /// One oracle case.
@@ -60,6 +63,9 @@ impl Case {
             if let Some(e) = &b.expect {
                 fs::write(dir.join(format!("{}.expect", b.name)), e)?;
             }
+            if let Some(r) = b.unordered {
+                fs::write(dir.join(format!("{}.unordered", b.name)), format!("{r}\n"))?;
+            }
         }
         job += &format!("ib {} {} {}\n", self.ib.0, self.ib.1, self.ib.2);
         fs::write(dir.join("job.txt"), job)
@@ -74,6 +80,18 @@ impl Case {
         for b in &self.buffers {
             let Some(e) = &b.expect else { continue };
             let got = fs::read(dir.join(format!("{}.out", b.name))).map_err(|x| format!("{}.out: {x}", b.name))?;
+            if let Some(r) = b.unordered {
+                let recs = |v: &[u8]| {
+                    let mut c: Vec<Vec<u8>> = v.chunks(r as usize).map(|x| x.to_vec()).collect();
+                    c.sort();
+                    c
+                };
+                let n = e.len().min(got.len());
+                if recs(&got[..n]) != recs(&e[..n]) {
+                    return Err(format!("{}: records differ (unordered compare)", b.name));
+                }
+                continue;
+            }
             if let Some(i) = (0..e.len()).find(|&i| got.get(i) != e.get(i)) {
                 return Err(format!("{}: first difference at byte {i}", b.name));
             }

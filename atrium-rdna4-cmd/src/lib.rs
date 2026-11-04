@@ -121,7 +121,10 @@ pub fn emit_dispatch(b: &mut Blob, d: &Dispatch) {
     let granule = if d.wave32 { 8 } else { 4 };
     let vgpr_field = (d.vgprs.max(1) + granule - 1) / granule - 1;
     let rsrc1 = (vgpr_field << compute_pgm_rsrc1::VGPRS_SHIFT)
-        | (0xc0 << compute_pgm_rsrc1::FLOAT_MODE_SHIFT) // f32/f64 denormals preserved
+        // FLOAT_MODE: round to nearest even; denormals preserved for f32 (0x30)
+        // and f16/f64 (0xc0). GIR and its interpreter are IEEE with denormals,
+        // and the exact f32 division sequence needs them on.
+        | (0xf0 << compute_pgm_rsrc1::FLOAT_MODE_SHIFT)
         | (1 << compute_pgm_rsrc1::MEM_ORDERED_SHIFT);
     let rsrc2 = ((d.user_sgprs.len() as u32) << compute_pgm_rsrc2::USER_SGPR_SHIFT)
         | (0 << compute_pgm_rsrc2::TIDIG_COMP_CNT_SHIFT) // local id in v0

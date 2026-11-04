@@ -3,9 +3,17 @@
 version = 4
 
 [[package]]
+name = "atrium-gir"
+version = "0.1.0"
+dependencies = [
+ "atrium-spv-ir",
+]
+
+[[package]]
 name = "atrium-rdna4-compiler"
 version = "0.1.0"
 dependencies = [
+ "atrium-gir",
  "atrium-rdna4-isa",
  "atrium-spv-frontend",
  "atrium-spv-ir",
