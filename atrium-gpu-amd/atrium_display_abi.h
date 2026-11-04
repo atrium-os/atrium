@@ -7,12 +7,11 @@
  * the GPU ABI — a compositor talks to the display to discover connectors, set a
  * mode, and page-flip, independent of how (or whether) the GPU is rendering.
  *
- * Scanout-buffer handoff is dma-buf-style: the compositor allocates a VRAM BO
- * through /dev/atrium-gpu0, exports it (ATRIUM_GPU_IOC_BO_EXPORT_SCANOUT) to a
- * plain {vram_offset, size}, and hands THAT to SET_MODE/PAGE_FLIP here. The
- * display imports the VRAM range by offset and never touches the GPU's BO table
- * — the offset is absolute against the shared VRAM aperture, so no cross-module
- * bind is needed. This mirrors importing a dma-buf fd into a DRM KMS plane.
+ * This is the interim header. Modeset and flip moved to display ABI v2
+ * (include/atrium/display_abi_v2.h: COMMIT names the scanout BO by its fd, with
+ * in/out fences); the interim SET_MODE ('D',3) and PAGE_FLIP ('D',4), which
+ * took a raw VRAM offset, are retired. What remains here is connector and mode
+ * discovery, legacy STATUS, and the simulated-monitor test knobs.
  *
  * Struct layout rule (same as the GPU ABI): 64-bit fields first, then 32-bit,
  * explicit pad to a multiple of 8 — identical for 32- and 64-bit userspace.
@@ -65,32 +64,6 @@ struct atrium_display_modes {
 	uint32_t count;		/* out: total modes decoded from the EDID */
 	uint32_t pad;
 	struct atrium_display_mode modes[ATRIUM_DISPLAY_MAX_MODES]; /* out */
-};
-
-/*
- * SET_MODE: program the connector's mode and install `vram_offset`/`size` as the
- * initial scanout framebuffer (the exported VRAM BO). `fault` returns the
- * model's DisplayFault code (0 = ok; e.g. FB-not-resident, FB-too-small,
- * mode-exceeds-link) so a failed modeset is observable without a separate errno.
- */
-struct atrium_display_setmode {
-	uint64_t vram_offset;	/* in:  scanout FB VRAM offset (from BO_EXPORT) */
-	uint64_t size;		/* in:  FB size in bytes */
-	uint32_t fault;		/* out: DisplayFault code (0 = ok) */
-	uint32_t pad;
-};
-
-/*
- * PAGE_FLIP: scan out a new framebuffer. vsync = 1 latches it at the next vblank
- * (no tear); vsync = 0 takes effect immediately (tears at the current beam
- * line). The depth-1 flip queue drops-and-counts a flip issued while one is
- * already pending (see STATUS.dropped_flips).
- */
-struct atrium_display_flip {
-	uint64_t vram_offset;	/* in:  new scanout FB VRAM offset */
-	uint64_t size;		/* in:  FB size in bytes */
-	uint32_t vsync;		/* in:  1 = latch at vblank (no tear) */
-	uint32_t fault;		/* out: DisplayFault code (0 = ok) */
 };
 
 /* STATUS: refresh + flip telemetry the compositor uses for frame pacing. */
@@ -147,8 +120,7 @@ struct atrium_display_dptrain {
 /* 'D' = the display device; distinct from the GPU's 'A' namespace. */
 #define ATRIUM_DISPLAY_IOC_ENUM		_IOR('D', 1, struct atrium_display_connector)
 #define ATRIUM_DISPLAY_IOC_MODES	_IOR('D', 2, struct atrium_display_modes)
-#define ATRIUM_DISPLAY_IOC_SET_MODE	_IOWR('D', 3, struct atrium_display_setmode)
-#define ATRIUM_DISPLAY_IOC_PAGE_FLIP	_IOWR('D', 4, struct atrium_display_flip)
+/* 'D',3 (SET_MODE) and 'D',4 (PAGE_FLIP) retired: see display_abi_v2.h. */
 #define ATRIUM_DISPLAY_IOC_STATUS	_IOR('D', 5, struct atrium_display_status)
 #define ATRIUM_DISPLAY_IOC_CONFIG	_IOW('D', 6, struct atrium_display_config)
 #define ATRIUM_DISPLAY_IOC_USBC		_IOW('D', 7, struct atrium_display_usbc)

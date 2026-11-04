@@ -15,9 +15,9 @@
 //!   * **Timeline syncobjs are themselves kqueue-able**: the fd is
 //!     `EVFILT_READ`-able once the counter reaches the registered threshold —
 //!     no separate eventfd (a v2 amendment from the working implementation).
-//!   * **Display is decoupled** (`/dev/atrium-display0`): a scanout buffer
-//!     crosses GPU→display as a plain `{vram_offset, size}` from
-//!     [`Bo::export_scanout`] (dma-buf-style), never a handle.
+//!   * **Display is decoupled** (`/dev/atrium-display0`, display ABI v2): a
+//!     scanout buffer crosses GPU→display as its BO fd in a [`Display::commit`],
+//!     with optional in/out fences. Userspace never sees a VRAM address.
 //!
 //! All ioctls are issued on the device fd; `vm`/`bo`/`syncobj` fds travel as
 //! integers inside the request structs (and own their lifetime via the fd).
@@ -74,9 +74,6 @@ struct BoAlloc { size: u64, bo_fd: u32, flags: u32 }
 #[repr(C)]
 #[derive(Default)]
 struct BoXfer { offset: u64, len: u64, user_ptr: u64, bo_fd: u32, pad: u32 }
-#[repr(C)]
-#[derive(Default)]
-struct BoExportScanout { bo_fd: u32, pad: u32, vram_offset: u64, size: u64 }
 #[repr(C)]
 #[derive(Default)]
 struct VmCreate { out_fd: u32, pad: u32 }
@@ -138,13 +135,54 @@ impl Default for DModes {
 }
 #[repr(C)]
 #[derive(Default)]
-struct DSetMode { vram_offset: u64, size: u64, fault: u32, pad: u32 }
-#[repr(C)]
-#[derive(Default)]
-struct DFlip { vram_offset: u64, size: u64, vsync: u32, fault: u32 }
-#[repr(C)]
-#[derive(Default)]
 struct DStatus { vblank_count: u64, dropped_flips: u32, tear_line: u32 }
+
+// display ABI v2 (include/atrium/display_abi_v2.h)
+#[repr(C)]
+#[derive(Default)]
+struct DCommit {
+    struct_size: u32,
+    flags: u32,
+    mode_index: u32,
+    format: u32,
+    bo_fd: i32,
+    pitch: u32,
+    bo_offset: u64,
+    modifier: u64,
+    in_fence_fd: i32,
+    out_fence_fd: i32,
+    in_fence_value: u64,
+    out_fence_value: u64,
+    out_fault: u32,
+    pad: u32,
+}
+#[repr(C)]
+#[derive(Default)]
+struct DStatusV2 {
+    struct_size: u32,
+    out_flags: u32,
+    out_vblank_count: u64,
+    out_flips_done: u64,
+    out_dropped_flips: u32,
+    out_tear_line: u32,
+    out_refresh_mhz: u32,
+    out_last_fault: u32,
+}
+
+/// Commit flags (`ATRIUM_DISPLAY_COMMIT_*`).
+pub const COMMIT_MODESET: u32 = 0x1;
+pub const COMMIT_ASYNC: u32 = 0x2;
+pub const COMMIT_TEST_ONLY: u32 = 0x4;
+/// `ATRIUM_DISPLAY_FORMAT_XRGB8888`: B,G,R,X in memory.
+pub const FORMAT_XRGB8888: u32 = 0;
+/// Display referee faults (`ATRIUM_DISPLAY_FAULT_*`).
+pub const FAULT_NO_MODE: u32 = 1;
+pub const FAULT_NOT_RESIDENT: u32 = 3;
+pub const FAULT_TOO_SMALL: u32 = 4;
+pub const FAULT_BAD_PITCH: u32 = 6;
+/// STATUS flags.
+pub const STATUS_COMMIT_PENDING: u32 = 0x1;
+pub const STATUS_MODE_SET: u32 = 0x2;
 
 fn open_rdwr(path: &str) -> io::Result<RawFd> {
     let c = CString::new(path).unwrap();
@@ -402,14 +440,6 @@ impl<'a> Bo<'a> {
         };
         unsafe { call(self.gpu.fd, iow(G, 2, std::mem::size_of::<BoXfer>()), &mut x) }
     }
-
-    /// Export a VRAM BO as a dma-buf-style scanout handle `{vram_offset, size}`
-    /// for the display engine (`/dev/atrium-display0`).
-    pub fn export_scanout(&self) -> io::Result<(u64, u64)> {
-        let mut e = BoExportScanout { bo_fd: self.fd as u32, ..Default::default() };
-        unsafe { call(self.gpu.fd, iowr(G, 27, std::mem::size_of::<BoExportScanout>()), &mut e)? };
-        Ok((e.vram_offset, e.size))
-    }
 }
 
 impl Drop for Bo<'_> { fn drop(&mut self) { unsafe { libc::close(self.fd) }; } }
@@ -418,52 +448,68 @@ impl Drop for Bo<'_> { fn drop(&mut self) { unsafe { libc::close(self.fd) }; } }
 // Scanout — the offset-model "CPU pixels -> onscreen" surface
 // ---------------------------------------------------------------------------
 
-/// A presentable framebuffer for the offset-model display (`'D'`).
+/// A set of presentable framebuffers for the display.
 ///
-/// CPU-rendered pixels can't be written into the scannable VRAM BO directly
-/// (VRAM is GPU-only), so a `Scanout` owns three BOs: a System **staging** BO
-/// (CPU-writable via `BO_WRITE`), a VRAM **scanout** BO (the only kind the
-/// display can scan), and a small **ring** BO. [`Scanout::update`] copies
-/// pixels into staging then issues a CP `DMA_DATA` blit into VRAM; the display
-/// is then driven by the exported `{vram_offset, size}` from [`Scanout::export`]
-/// — a dma-buf-style handle, never a BO handle.
+/// CPU-rendered pixels can't be written into a scannable VRAM BO directly
+/// (VRAM is GPU-only), so a `Scanout` owns a System **staging** BO
+/// (CPU-writable via `BO_WRITE`), one or more VRAM **scanout** BOs (the only
+/// kind the display can scan) and a small **ring** BO. [`Scanout::upload`]
+/// copies pixels into staging, then a CP `DMA_DATA` blit moves them into one of
+/// the VRAM buffers. The display is then given that buffer's BO
+/// ([`Scanout::buffer`]) in a [`Display::commit`].
+///
+/// With two or more buffers, render into one that is not on screen: the
+/// display scans one out while the next frame is copied into another.
 pub struct Scanout<'a> {
     vm: &'a Vm<'a>,
     staging: Bo<'a>,
-    vram: Bo<'a>,
+    buffers: Vec<Bo<'a>>,
     ring: Bo<'a>,
-    vram_offset: u64,
     size: u64,
 }
 
 impl<'a> Scanout<'a> {
-    /// Allocate the staging/VRAM/ring BOs for a `size`-byte framebuffer and
-    /// export the VRAM BO's scanout offset (stable for the surface's life).
+    /// One VRAM buffer of `size` bytes.
     pub fn new(vm: &'a Vm<'a>, size: u64) -> io::Result<Self> {
+        Self::with_buffers(vm, size, 1)
+    }
+
+    /// `n` VRAM buffers of `size` bytes each, sharing one staging BO.
+    pub fn with_buffers(vm: &'a Vm<'a>, size: u64, n: usize) -> io::Result<Self> {
         let staging = vm.alloc(size, 0)?; // System: CPU-writable
-        let vram = vm.alloc(size, BO_VRAM)?; // VRAM: scannable
+        let mut buffers = Vec::with_capacity(n);
+        for _ in 0..n.max(1) {
+            buffers.push(vm.alloc(size, BO_VRAM)?); // VRAM: scannable
+        }
         let ring = vm.alloc(4096, 0)?;
-        let (vram_offset, exported) = vram.export_scanout()?;
-        Ok(Self { vm, staging, vram, ring, vram_offset, size: exported })
+        Ok(Self { vm, staging, buffers, ring, size })
     }
 
-    /// The `{vram_offset, size}` to hand to [`Display::set_mode`] / [`Display::page_flip`].
-    pub fn export(&self) -> (u64, u64) { (self.vram_offset, self.size) }
+    /// Buffer `i`, to name in a [`Display::commit`].
+    pub fn buffer(&self, i: usize) -> &Bo<'a> { &self.buffers[i] }
+    pub fn len(&self) -> usize { self.buffers.len() }
+    pub fn is_empty(&self) -> bool { self.buffers.is_empty() }
+    pub fn size(&self) -> u64 { self.size }
 
-    /// Upload CPU `pixels` (full framebuffer) into the VRAM scanout BO via a CP
-    /// DMA copy. `submit` runs the ring synchronously, so on return VRAM holds
-    /// the new frame and a subsequent `page_flip` is safe.
+    /// Upload CPU `pixels` (a full frame) into buffer 0.
     pub fn update(&self, pixels: &[u8]) -> io::Result<()> {
-        self.update_deadline(pixels, 0)
+        self.upload(0, pixels, 0, None)
     }
 
-    /// Like [`Scanout::update`], but stamps the copy with a frame `deadline_ns`
-    /// (the compositor's target vblank) so the firmware scheduler prioritizes it
-    /// over background GPU work — the compositor's frame-pacing path.
-    pub fn update_deadline(&self, pixels: &[u8], deadline_ns: u32) -> io::Result<()> {
+    /// Upload CPU `pixels` into buffer `i` with a CP DMA copy, stamped with a
+    /// frame `deadline_ns` (0 = none) so the firmware scheduler serves it ahead
+    /// of background GPU work. With `signal`, that syncobj reaches the value
+    /// when the copy is done: pass it as the commit's in-fence.
+    pub fn upload(
+        &self,
+        i: usize,
+        pixels: &[u8],
+        deadline_ns: u32,
+        signal: Option<(&Syncobj<'_>, u64)>,
+    ) -> io::Result<()> {
         self.staging.write(0, pixels)?;
         let src = self.staging.gpu_va();
-        let dst = self.vram.gpu_va();
+        let dst = self.buffers[i].gpu_va();
         let words: [u32; 7] = [
             pm4_type3(IT_DMA_DATA, 6),
             0,
@@ -478,7 +524,12 @@ impl<'a> Scanout<'a> {
             bytes.extend_from_slice(&w.to_le_bytes());
         }
         self.ring.write(0, &bytes)?;
-        self.vm.submit_deadline(&self.ring, words.len() as u32, ENGINE_GFX, None, deadline_ns)
+        self.vm.submit_deadline(&self.ring, words.len() as u32, ENGINE_GFX, signal, deadline_ns)
+    }
+
+    /// Like [`Scanout::update`], with a frame deadline.
+    pub fn update_deadline(&self, pixels: &[u8], deadline_ns: u32) -> io::Result<()> {
+        self.upload(0, pixels, deadline_ns, None)
     }
 }
 
@@ -515,6 +566,18 @@ impl Drop for Syncobj<'_> { fn drop(&mut self) { unsafe { libc::close(self.fd) }
 
 pub struct Display { fd: RawFd }
 
+/// [`Display::status_v2`] result.
+#[derive(Debug, Clone, Copy)]
+pub struct StatusV2 {
+    pub flags: u32,
+    pub vblank_count: u64,
+    pub flips_done: u64,
+    pub dropped_flips: u32,
+    pub tear_line: u32,
+    pub refresh_mhz: u32,
+    pub last_fault: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Connector {
     pub connected: bool,
@@ -545,19 +608,84 @@ impl Display {
         Ok(m.modes[..(m.count as usize).min(8)].to_vec())
     }
 
-    /// Program the mode with `{vram_offset, size}` (from [`Bo::export_scanout`])
-    /// as the scanout FB. Returns the DisplayFault code (0 = ok).
-    pub fn set_mode(&self, vram_offset: u64, size: u64) -> io::Result<u32> {
-        let mut s = DSetMode { vram_offset, size, ..Default::default() };
-        unsafe { call(self.fd, iowr(D, 3, std::mem::size_of::<DSetMode>()), &mut s)? };
-        Ok(s.fault)
+    /// Put `bo` on the primary plane (display ABI v2 `COMMIT`).
+    ///
+    /// `flags` is a mix of [`COMMIT_MODESET`], [`COMMIT_ASYNC`] and
+    /// [`COMMIT_TEST_ONLY`]; `pitch` 0 means packed. The flip waits for
+    /// `in_fence` and signals `out_fence` once `bo` is on screen (which is
+    /// when the previous buffer is free again). Returns the referee fault
+    /// (0 = ok); an outstanding commit gives `EBUSY`.
+    pub fn commit(
+        &self,
+        bo: &Bo<'_>,
+        flags: u32,
+        pitch: u32,
+        in_fence: Option<(&Syncobj<'_>, u64)>,
+        out_fence: Option<(&Syncobj<'_>, u64)>,
+    ) -> io::Result<u32> {
+        let (in_fd, in_v) = in_fence.map_or((-1, 0), |(s, v)| (s.fd, v));
+        let (out_fd, out_v) = out_fence.map_or((-1, 0), |(s, v)| (s.fd, v));
+        let mut c = DCommit {
+            struct_size: std::mem::size_of::<DCommit>() as u32,
+            flags,
+            format: FORMAT_XRGB8888,
+            bo_fd: bo.fd,
+            pitch,
+            in_fence_fd: in_fd,
+            out_fence_fd: out_fd,
+            in_fence_value: in_v,
+            out_fence_value: out_v,
+            ..Default::default()
+        };
+        match unsafe { call(self.fd, iowr(D, 64, std::mem::size_of::<DCommit>()), &mut c) } {
+            Ok(()) => Ok(0),
+            Err(e) if c.out_fault != 0 && e.raw_os_error() == Some(libc::EINVAL) => Ok(c.out_fault),
+            Err(e) => Err(e),
+        }
     }
 
-    /// Page-flip to a new scanout FB (vsync = latch at vblank). Fault code out.
-    pub fn page_flip(&self, vram_offset: u64, size: u64, vsync: bool) -> io::Result<u32> {
-        let mut f = DFlip { vram_offset, size, vsync: vsync as u32, fault: 0 };
-        unsafe { call(self.fd, iowr(D, 4, std::mem::size_of::<DFlip>()), &mut f)? };
-        Ok(f.fault)
+    /// Light the CRTC with `bo` on screen from the first frame.
+    pub fn modeset(&self, bo: &Bo<'_>) -> io::Result<u32> {
+        self.commit(bo, COMMIT_MODESET, 0, None, None)
+    }
+
+    /// Flip to `bo` (vsync = latch at the next vblank, else at once).
+    pub fn flip(&self, bo: &Bo<'_>, vsync: bool) -> io::Result<u32> {
+        self.commit(bo, if vsync { 0 } else { COMMIT_ASYNC }, 0, None, None)
+    }
+
+    /// Wait until no commit is outstanding (the last one reached the screen),
+    /// polling STATUS. For tests and simple tools; a compositor waits on the
+    /// commit's out-fence instead.
+    pub fn wait_idle(&self, timeout_ms: u64) -> io::Result<()> {
+        let t0 = std::time::Instant::now();
+        loop {
+            if self.status_v2()?.flags & STATUS_COMMIT_PENDING == 0 {
+                return Ok(());
+            }
+            if t0.elapsed().as_millis() as u64 > timeout_ms {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "display commit still pending"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Display ABI v2 status.
+    pub fn status_v2(&self) -> io::Result<StatusV2> {
+        let mut st = DStatusV2 {
+            struct_size: std::mem::size_of::<DStatusV2>() as u32,
+            ..Default::default()
+        };
+        unsafe { call(self.fd, iowr(D, 65, std::mem::size_of::<DStatusV2>()), &mut st)? };
+        Ok(StatusV2 {
+            flags: st.out_flags,
+            vblank_count: st.out_vblank_count,
+            flips_done: st.out_flips_done,
+            dropped_flips: st.out_dropped_flips,
+            tear_line: st.out_tear_line,
+            refresh_mhz: st.out_refresh_mhz,
+            last_fault: st.out_last_fault,
+        })
     }
 
     /// (vblank_count, dropped_flips, tear_line).

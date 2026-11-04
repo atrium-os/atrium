@@ -154,6 +154,13 @@
 #define regDISP_DROPPED_FLIPS	0x30024	/* r: flips dropped by the depth-1 queue */
 #define regDISP_FAULT		0x30028	/* r: last DisplayFault code (0 = none) */
 #define regDISP_TEAR_LINE	0x3002c	/* r: first tear scanline (0xffffffff = none) */
+#define regDISP_FB_PITCH	0x30080	/* w/r: FB line pitch, bytes (0 = packed) */
+#define regDISP_FB_FORMAT	0x30084	/* w/r: FB pixel format code (0 = XRGB8888) */
+#define regDISP_FLIP_PENDING	0x30088	/* r: 1 = a vsync'd flip is queued, not on screen */
+#define regDISP_FLIP_IRQ_EN	0x3008c	/* w/r: 1 = IH interrupt (cause FLIP) when a flip lands */
+#define regDISP_FLIP_DONE_COUNT	0x30090	/* r: flips that reached the screen */
+#define regDISP_SCANOUT_BASE_LO	0x30094	/* r: VRAM base of the FB on screen now (lo/hi) */
+#define regDISP_SCANOUT_BASE_HI	0x30098
 #define ATRIUM_AMD_EDID_LEN	128
 
 /*
@@ -296,6 +303,7 @@ struct atrium_gpu_backend_caps {
  * supplies the hardware. The submit blob is opaque and the GPU-VA is backend-
  * assigned, which is what keeps the front-end neutral.
  */
+struct atrium_amd_syncobj;
 struct atrium_gpu_backend_ops {
 	const char *name;
 	/* Stand up / tear down a VM's hardware address space (amd: VMID + GPUVM
@@ -322,6 +330,19 @@ struct atrium_gpu_backend_ops {
 	 * VRAM is scannable). EINVAL if the BO can't be scanned out. */
 	int	(*export_scanout)(struct atrium_amd_bo *bo, uint64_t *vram_offset,
 		    uint64_t *size);
+	/*
+	 * Front-end exports for the display module, which has no BO or syncobj
+	 * code of its own and links against nothing in this module: it resolves
+	 * a commit's bo_fd and fence fds through these. They live in the gpu
+	 * module, so they are NULL (with the rest of the vtable) while it isn't
+	 * loaded. syncobj_signal may be called with sc->lock held (the order is
+	 * sc->lock, then the syncobj's own lock, as in the EOP handler).
+	 */
+	int	(*bo_fget)(struct thread *td, int fd, struct file **out_fp,
+		    struct atrium_amd_bo **out_bo);
+	int	(*syncobj_fget)(struct thread *td, int fd, struct file **out_fp,
+		    struct atrium_amd_syncobj **out_so);
+	void	(*syncobj_signal)(struct atrium_amd_syncobj *so, uint64_t value);
 	/* mmap a device aperture into userspace (amd: the per-queue doorbell page
 	 * = a capability grant). Returns the physical addr + memattr for `offset`. */
 	int	(*mmap)(struct atrium_amd_softc *sc, vm_ooffset_t offset,
@@ -444,6 +465,7 @@ struct atrium_amd_pending {
 #define ATRIUM_AMD_MAX_PENDING	16
 #define ATRIUM_AMD_IH_CAUSE_EOP	1	/* IH cookie cause: end-of-pipe (device.rs) */
 #define ATRIUM_AMD_IH_CAUSE_VBLANK 2	/* IH cookie cause: DCN vertical blank */
+#define ATRIUM_AMD_IH_CAUSE_FLIP 3	/* IH cookie cause: DCN flip landed on screen */
 #define ATRIUM_AMD_IH_NCAUSE	4	/* dispatch-table size (causes 0..N-1) */
 
 /*
@@ -515,6 +537,41 @@ struct atrium_amd_softc {
 	 */
 	struct atrium_amd_reset_hooks reset_hooks[ATRIUM_AMD_IP_COUNT];
 	int		 display_vblank_armed;	/* display module: mode set + vblank IRQ on */
+
+	/*
+	 * Display commit state (display module; guarded by sc->lock). The display
+	 * holds a file reference on every BO it may be scanning out, so a client
+	 * closing its bo_fd can't free a buffer that is still on screen:
+	 *   on_screen  the BO the pipe reads now (kept across close: hold-last-frame)
+	 *   next       a committed BO that hasn't landed yet (waiting on its
+	 *              in-fence, or on vblank), with its fences
+	 * References are only dropped in process context, so the interrupt path
+	 * parks the ones it releases in display_release[] for the next ioctl,
+	 * close or detach to fdrop.
+	 */
+	struct atrium_amd_display_fb {
+		struct file	*bo_fp;		/* held ref, NULL = none */
+		uint64_t	 vram_offset;
+		uint64_t	 size;
+		uint32_t	 pitch;
+		uint32_t	 format;
+	} display_on_screen, display_next;
+	int		 display_next_state;	/* 0 none, 1 waiting on in-fence, 2 flipped */
+	int		 display_next_vsync;
+	uint64_t	 display_next_flips;	/* FLIP_DONE_COUNT that means "landed" */
+	struct file	*display_in_fp;		/* in-fence syncobj (held ref) */
+	struct atrium_amd_syncobj *display_in_so;
+	uint64_t	 display_in_value;
+	struct file	*display_out_fp;	/* out-fence syncobj (held ref) */
+	struct atrium_amd_syncobj *display_out_so;
+	uint64_t	 display_out_value;
+#define ATRIUM_AMD_DISPLAY_NRELEASE 8
+	struct file	*display_release[ATRIUM_AMD_DISPLAY_NRELEASE];
+	int		 display_nrelease;
+	int		 display_opened;	/* exclusive open held */
+	int		 display_mode_set;	/* CRTC lit by a MODESET commit */
+	uint32_t	 display_refresh_mhz;	/* refresh of the mode in use */
+	uint32_t	 display_last_fault;	/* fault of the last deferred flip */
 
 	/*
 	 * Device-global IH (interrupt-handler) ring + dispatch, owned by the BASE

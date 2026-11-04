@@ -94,20 +94,11 @@ struct atrium_gpu_bo_alloc {
 					 * GPU reset (reset loses VRAM). */
 
 /*
- * Export a VRAM BO as a scanout handle: returns the BO's absolute VRAM offset
- * and size — the dma-buf-equivalent the display engine imports. The display
- * module (atrium_gpu_amd_display.ko) is a SEPARATE driver with no access to the
- * GPU module's BO table; it scans out VRAM by offset, so the compositor hands it
- * this plain (offset,size) rather than a BO fd. The offset is absolute against
- * the shared VRAM aperture, so it is meaningful to the display without any
- * cross-module bind. Rejects non-VRAM (System/GTT) BOs — only VRAM is scannable.
+ * 'A',27 (BO_EXPORT_SCANOUT) is retired (GPU ABI v2.1 §7): it turned a BO into a
+ * raw {vram_offset, size} that any display opener could then scan out. A
+ * display commit now names the BO by its fd (include/atrium/display_abi_v2.h)
+ * and the display module resolves it itself.
  */
-struct atrium_gpu_bo_export_scanout {
-	uint32_t	bo_fd;		/* in:  VRAM BO to export */
-	uint32_t	pad;
-	uint64_t	vram_offset;	/* out: absolute VRAM offset (scanout base) */
-	uint64_t	size;		/* out: BO size in bytes */
-};
 
 /* Map a BO into a VM at a GPU virtual address (0 = let the kernel pick one). */
 struct atrium_gpu_vm_bind {
@@ -187,8 +178,6 @@ struct atrium_gpu_syncobj_wait {
 #define ATRIUM_GPU_IOC_BO_ALLOC		_IOWR('A', 0, struct atrium_gpu_bo_alloc)
 #define ATRIUM_GPU_IOC_BO_WRITE		_IOW('A', 1, struct atrium_gpu_bo_xfer)
 #define ATRIUM_GPU_IOC_BO_READ		_IOW('A', 2, struct atrium_gpu_bo_xfer)
-#define ATRIUM_GPU_IOC_BO_EXPORT_SCANOUT \
-	_IOWR('A', 27, struct atrium_gpu_bo_export_scanout)
 /* 'A',3 (SET_COMPUTE) and 'A',5 (SET_DRAW) retired: compute/draw state now
  * travels in the ring as SET_SH_REG packets (opaque-blob submit, ABI-v2). */
 #define ATRIUM_GPU_IOC_SUBMIT		_IOW('A', 4, struct atrium_gpu_submit)
@@ -243,9 +232,9 @@ struct atrium_gpu_sched {
 /*
  * The display engine (connector discovery, modeset, page-flip, the §8 output
  * topology) is a SEPARATE driver — /dev/atrium-display0 (atrium_gpu_amd_display.ko),
- * with its own ABI in atrium_display_abi.h. The scanout buffer crosses from the
- * GPU to the display as a plain {vram_offset,size} via BO_EXPORT_SCANOUT above
- * (dma-buf-style), so the two devices share no handle namespace. The display
+ * with its own ABI (include/atrium/display_abi_v2.h). The scanout buffer
+ * crosses from the GPU to the display as its BO fd, like a dma-buf fd into a
+ * KMS plane; the display module resolves it through the gpu module. The display
  * 'A',17-24 ioctls that used to live here were retired in the §4.1 split.
  */
 

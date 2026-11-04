@@ -190,25 +190,6 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 		return (err);
 	}
 
-	case ATRIUM_GPU_IOC_BO_EXPORT_SCANOUT: {
-		struct atrium_gpu_bo_export_scanout *e =
-		    (struct atrium_gpu_bo_export_scanout *)data;
-		struct file *fp;
-
-		/*
-		 * Export a VRAM BO as a scanout handle for the display module
-		 * (a separate driver with no BO table): the absolute VRAM offset
-		 * + size, the dma-buf-equivalent it imports. Only VRAM is
-		 * scannable — System/GTT BOs have no contiguous VRAM offset.
-		 */
-		err = amd_bo_fget(td, e->bo_fd, &fp, &bo);
-		if (err != 0)
-			return (err);
-		err = sc->backend->export_scanout(bo, &e->vram_offset, &e->size);
-		fdrop(fp, td);
-		return (err);
-	}
-
 	case ATRIUM_GPU_IOC_SYNCOBJ_CREATE: {
 		struct atrium_gpu_syncobj_create *c =
 		    (struct atrium_gpu_syncobj_create *)data;
@@ -431,9 +412,9 @@ atrium_amd_ioctl(struct cdev *cdev, u_long cmd, caddr_t data, int fflag,
 
 	/*
 	 * Display ioctls moved to /dev/atrium-display0 (atrium_gpu_amd_display.ko,
-	 * §4.1): the display engine is a separate driver, and the scanout FB is
-	 * handed across by the dma-buf-style BO_EXPORT_SCANOUT above rather than a
-	 * BO fd consumed here.
+	 * §4.1): the display engine is a separate driver. A display commit names
+	 * the scanout BO by its fd and the display module resolves it through
+	 * sc->backend, so nothing here hands out VRAM addresses.
 	 */
 
 	default:

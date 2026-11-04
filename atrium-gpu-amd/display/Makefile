@@ -8,6 +8,6 @@ SRCS=	display_dev.c
 SRCS+=	device_if.h bus_if.h pci_if.h
 
 .PATH:	${.CURDIR}/..
-CFLAGS+= -I${.CURDIR}/..
+CFLAGS+= -I${.CURDIR}/.. -I${.CURDIR}/../../include
 
 .include <bsd.kmod.mk>

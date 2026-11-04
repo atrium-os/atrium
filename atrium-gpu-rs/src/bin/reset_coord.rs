@@ -51,8 +51,7 @@ fn run() -> io::Result<()> {
     let m = *dpy.modes()?.first().ok_or_else(|| io::Error::other("no modes"))?;
     let bytes = u64::from(m.width) * u64::from(m.height) * 4;
     let scan = Scanout::new(&vm, bytes)?;
-    let (off, size) = scan.export();
-    if dpy.set_mode(off, size)? != 0 {
+    if dpy.modeset(scan.buffer(0))? != 0 {
         return Err(io::Error::other("set_mode fault"));
     }
 

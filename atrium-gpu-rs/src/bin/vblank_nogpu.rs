@@ -1,20 +1,20 @@
-//! vblank_nogpu — prove vblank is delivered with the GPU (render) module UNLOADED.
+//! vblank_nogpu — vblank reaches a process that holds no GPU objects.
 //!
-//! This is the structural payoff of moving the IH ring + ISR into the base module
-//! (and giving the display its own IH cause handler): vblank is a display signal,
-//! and the GPU module plays no part in it. The §4.1 split promises the display
-//! attaches independently of the gpu module — this proves the INTERRUPT path does
-//! too.
+//! The IH ring + ISR live in the base module and the display has its own IH
+//! cause handler: vblank is a display signal, and the GPU module plays no part
+//! in delivering it.
 //!
-//! It opens ONLY /dev/atrium-display0 (no /dev/atrium-gpu0, no VM, no BO). It arms
-//! the vblank IRQ with a dummy framebuffer: set_mode faults on residency (there is
-//! no VRAM BO without the gpu), but the driver arms regDISP_VBLANK_IRQ_EN anyway,
-//! so the device raises a vblank interrupt each refresh. The base ISR drains it and
-//! routes the VBLANK cause to the display module's handler → the EVFILT_READ knote.
+//! It opens ONLY /dev/atrium-display0 (no /dev/atrium-gpu0, no VM, no BO).
+//! Since display ABI v2 the display can't be lit without a BO, and only the gpu
+//! module makes BOs; so the CRTC must already be lit (hold-last-frame: run
+//! display_flip first). Unloading the gpu module also needs the display to let
+//! go of its on-screen BO, which it holds while it scans it out, so the gpu
+//! module refuses to unload while a frame is up. This therefore checks the
+//! half that can be checked: with the CRTC lit and this process holding no GPU
+//! objects, vblanks arrive through the base ISR and the display's own IH cause
+//! handler, and a commit without the gpu module's exports fails cleanly.
 //!
-//! Run (guest):  kldunload atrium_gpu_amd   # drop the render module
-//!               /tmp/vblank_nogpu          # vblanks still arrive via kqueue
-//!               kldload  atrium_gpu_amd     # restore it
+//! Run (guest):  /tmp/display_flip && /tmp/vblank_nogpu
 
 use std::io;
 use std::os::unix::io::AsRawFd;
@@ -36,11 +36,10 @@ fn main() {
 fn run() -> io::Result<()> {
     let dpy = Display::open()?;
 
-    // Arm the vblank IRQ with a dummy FB. Without the gpu module there is no VRAM
-    // BO, so the referee faults residency — but the driver arms the vblank IRQ
-    // regardless, which is all we need to make the device raise it each refresh.
-    let fault = dpy.set_mode(0, 0x10_0000)?;
-    eprintln!("set_mode fault={fault} (nonzero expected with no VRAM BO — vblank still armed)");
+    let st = dpy.status_v2()?;
+    if st.flags & atrium_gpu::amd::STATUS_MODE_SET == 0 {
+        return Err(io::Error::other("CRTC not lit: run display_flip first (hold-last-frame)"));
+    }
 
     let kq = unsafe { libc::kqueue() };
     if kq < 0 {
@@ -79,10 +78,10 @@ fn run() -> io::Result<()> {
     unsafe { libc::close(kq) };
 
     let hz = vblanks as f64 / secs;
-    eprintln!("{vblanks} vblanks over {N} kqueue waits in {secs:.3}s = {hz:.0} Hz — GPU module not loaded");
+    eprintln!("{vblanks} vblanks over {N} kqueue waits in {secs:.3}s = {hz:.0} Hz");
     if hz < 20.0 || hz > 200.0 {
         return Err(io::Error::other(format!("vblank rate {hz:.0} Hz far from ~60 Hz")));
     }
-    eprintln!("vblank delivered with the GPU module UNLOADED — it has no part in the vblank path");
+    eprintln!("vblank delivered to a process holding no GPU objects");
     Ok(())
 }

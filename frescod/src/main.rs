@@ -8,13 +8,17 @@
 //!   ↓ (extract_rect_nodes / extract_texture_batches, merged in z-order)
 //!   fresco_vulkan::HeadlessRenderer (compute + indirect draw)
 //!   ↓ (read_pixels, BGRA8)
-//!   atrium_gpu::amd::Scanout (CPU staging BO -> CP DMA -> VRAM scanout BO)
-//!   ↓ ({vram_offset, size})
-//!   atrium_gpu::amd::Display::page_flip
+//!   atrium_gpu::amd::Scanout (CPU staging BO -> CP DMA -> one of two VRAM BOs)
+//!   ↓ (the copy signals a syncobj)
+//!   atrium_gpu::amd::Display::commit (BO fd, in-fence = the copy, out-fence = flip done)
+//!
+//! Double-buffered: each frame goes into the buffer that is not on screen,
+//! the flip waits for the copy (in-fence) and latches at vblank, and the next
+//! frame doesn't start until the previous flip landed (out-fence). That paces
+//! presents to the display's refresh, never faster, without a timer.
 //!
 //! The legacy tiny-skia / 128-byte / CommandFrontend path was removed
-//! at the M2.7 cutover. Today this binary is single-display, runs at
-//! a fixed ~30 fps cadence (no vblank events on virtio-gpu yet).
+//! at the M2.7 cutover. Today this binary is single-display.
 //!
 //! Multi-window composition: per frame, walk WM z-order; for each
 //! window, take its `WindowSceneState` rect/texture nodes, translate
@@ -30,7 +34,7 @@ mod pointer_reader;
 mod redraw;
 mod socket_server;
 
-use atrium_gpu::amd::{Display, Gpu, Scanout};
+use atrium_gpu::amd::{Display, Gpu, Scanout, COMMIT_MODESET};
 
 use fresco_protocol::{PathParams, RectParams, TextureParams};
 use fresco_scene_server::cas::store::CasStore;
@@ -48,8 +52,10 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-const TARGET_FPS: u64 = 30;
-const FRAME_NS:   u64 = 1_000_000_000 / TARGET_FPS;
+/// Scanout buffers: one on screen, one being filled.
+const SCANOUT_BUFFERS: usize = 2;
+/// How long to wait for a flip to land before giving up on the display.
+const FLIP_TIMEOUT_MS: u32 = 2000;
 
 fn main() -> std::io::Result<()> {
     let _ = env_logger::try_init();
@@ -61,10 +67,10 @@ fn main() -> std::io::Result<()> {
         return run_headless(&png);
     }
 
-    /* ── Display + scanout (canonical v2 'A'/'D', offset model) ──────
-     * No bind: the GPU and display are decoupled. The compositor renders
-     * into a Scanout (System staging BO -> CP DMA copy -> VRAM scanout BO),
-     * then drives the display by the exported {vram_offset, size}. */
+    /* ── Display + scanout (GPU ABI 'A' + display ABI v2) ────────────
+     * The GPU and display are decoupled and share only fds: the compositor
+     * renders into a Scanout (System staging BO -> CP DMA copy -> VRAM BO)
+     * and commits the VRAM BO to the display by its fd. */
     let gpu = Gpu::open()?;
     let vm = gpu.create_vm()?;
     let dpy = Display::open()?;
@@ -73,13 +79,16 @@ fn main() -> std::io::Result<()> {
     let modes = dpy.modes()?;
     let mode = *modes.first().expect("at least one mode");
     eprintln!(
-        "frescod: connector type {} {}x{} @ {} mHz, target {} fps",
-        conn.connector_type, mode.width, mode.height, mode.refresh_mhz, TARGET_FPS,
+        "frescod: connector type {} {}x{} @ {} mHz, {} scanout buffers",
+        conn.connector_type, mode.width, mode.height, mode.refresh_mhz, SCANOUT_BUFFERS,
     );
 
     let bytes = u64::from(mode.width) * u64::from(mode.height) * 4;
-    let scan = Scanout::new(&vm, bytes)?;
-    let (scan_off, scan_size) = scan.export();
+    let scan = Scanout::with_buffers(&vm, bytes, SCANOUT_BUFFERS)?;
+    /* copy_done reaches N when frame N's pixels are in VRAM; flip_done
+     * reaches N when frame N is on screen (and frame N-1's buffer is free). */
+    let copy_done = gpu.create_syncobj()?;
+    let flip_done = gpu.create_syncobj()?;
 
     /* Frame deadline = one vblank interval (refresh is milli-Hz, so the period in
      * ns is 1e12 / refresh_mHz). The compositor stamps its scanout copy with this
@@ -162,15 +171,26 @@ fn main() -> std::io::Result<()> {
     }
 
     /* ── Frame loop ─────────────────────────────────────────────── */
-    let mut frame: u64 = 0;
-    /* First frame: render once + SET_MODE before flipping. */
+    /* Frame 1 lights the CRTC with buffer 0 (MODESET is immediate). */
+    let mut frame: u64 = 1;
+    let mut on_screen: usize = 0;
     render_one_frame(&mut renderer, &frontend, &comp, mode.width, mode.height)
         .map_err(io_other)?;
     fill_framebuffer(&renderer, &mut framebuffer).map_err(io_other)?;
-    scan.update_deadline(&framebuffer, frame_deadline_ns).map_err(io_other)?;
-    check_fault("set_mode", dpy.set_mode(scan_off, scan_size)?)?;
-    check_fault("page_flip", dpy.page_flip(scan_off, scan_size, true)?)?;
-    frame += 1;
+    scan.upload(on_screen, &framebuffer, frame_deadline_ns, Some((&copy_done, frame)))?;
+    check_fault("modeset", dpy.commit(
+        scan.buffer(on_screen), COMMIT_MODESET, 0,
+        Some((&copy_done, frame)), Some((&flip_done, frame)),
+    ).or_else(|e| {
+        /* MODESET doesn't wait for its in-fence: if the copy is still
+         * running, wait for it and retry once. */
+        if e.raw_os_error() == Some(libc::EAGAIN) {
+            copy_done.wait(frame, FLIP_TIMEOUT_MS)?;
+            dpy.commit(scan.buffer(on_screen), COMMIT_MODESET, 0, None, Some((&flip_done, frame)))
+        } else {
+            Err(e)
+        }
+    })?)?;
 
     /* ── Damage-driven present (task #25) ────────────────────────────
      * Recompose + flip only when a producer signalled `redraw`; otherwise
@@ -195,7 +215,6 @@ fn main() -> std::io::Result<()> {
     let mut last_render = Instant::now()
         .checked_sub(IDLE_HEARTBEAT)
         .unwrap_or_else(Instant::now);
-    let mut next = Instant::now();
     loop {
         let cur = redraw.current();
         let heartbeat_due = last_render.elapsed() >= heartbeat;
@@ -211,25 +230,27 @@ fn main() -> std::io::Result<()> {
             continue;
         }
 
-        /* Rate-limit to the frame interval: coalesce any further damage
-         * that lands while we wait for the boundary. */
-        let now = Instant::now();
-        if next > now {
-            std::thread::sleep(next - now);
-        }
+        /* Pace on the display: the previous frame must be on screen before
+         * this one starts, both because its flip released the buffer we are
+         * about to fill and because nothing presents faster than the
+         * refresh. Damage that lands meanwhile coalesces into this frame. */
+        flip_done.wait(frame, FLIP_TIMEOUT_MS)?;
 
-        /* Snapshot the generation AFTER the pacing sleep so damage during
-         * the sleep is folded into this present rather than triggering an
-         * immediate extra one. */
+        /* Snapshot the generation AFTER the wait so damage during it is
+         * folded into this present rather than triggering an extra one. */
         last_gen = redraw.current();
         let t_render = Instant::now();
         render_one_frame(&mut renderer, &frontend, &comp, mode.width, mode.height)
             .map_err(io_other)?;
         fill_framebuffer(&renderer, &mut framebuffer).map_err(io_other)?;
-        scan.update_deadline(&framebuffer, frame_deadline_ns).map_err(io_other)?;
-        check_fault("page_flip", dpy.page_flip(scan_off, scan_size, true)?)?;
-        frame = frame.wrapping_add(1);
-        let _ = frame;
+        frame += 1;
+        let back = (on_screen + 1) % scan.len();
+        scan.upload(back, &framebuffer, frame_deadline_ns, Some((&copy_done, frame)))?;
+        check_fault("flip", dpy.commit(
+            scan.buffer(back), 0, 0,
+            Some((&copy_done, frame)), Some((&flip_done, frame)),
+        )?)?;
+        on_screen = back;
 
         let cost = t_render.elapsed();
         heartbeat = IDLE_HEARTBEAT.max(cost * HEARTBEAT_COST_FACTOR);
@@ -242,7 +263,6 @@ fn main() -> std::io::Result<()> {
         }
 
         last_render = Instant::now();
-        next = last_render + Duration::from_nanos(FRAME_NS);
     }
 }
 
@@ -495,7 +515,7 @@ fn fill_framebuffer(
     Ok(())
 }
 
-/// A non-zero display fault code (from SET_MODE / PAGE_FLIP) is an error.
+/// A non-zero display fault code (from a commit) is an error.
 fn check_fault(op: &str, fault: u32) -> std::io::Result<()> {
     if fault != 0 {
         Err(io_other(format!("display {op} fault={fault}")))
