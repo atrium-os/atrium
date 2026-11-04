@@ -1,0 +1,16 @@
+[package]
+name        = "atrium-gir"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Atrium GPU IR (GIR): the target-independent level of the shader compiler, shared by every GPU backend. See docs/spec/atrium-gpu-ir.md."
+
+[dependencies]
+atrium-spv-ir = { path = "../atrium-spv-ir" }
+
+[dev-dependencies]
+atrium-spv-frontend = { path = "../atrium-spv-frontend" }
+atrium-spv-backend-cranelift = { path = "../atrium-spv-backend-cranelift" }
+libloading = "0.8"
+tempfile = "3"
