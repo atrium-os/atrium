@@ -156,6 +156,19 @@ fn probe_get(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<J
     if target.has_property(key.clone(), ctx)? {
         return target.get(key, ctx);
     }
+    if EXPLORING.with(|e| *e.borrow()) {
+        let n = key.to_string();
+        let f: Option<fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>> = match n.as_str() {
+            "matches" | "webkitMatchesSelector" | "msMatchesSelector" => Some(el_matches),
+            "closest" => Some(el_closest),
+            _ => None,
+        };
+        if let Some(f) = f {
+            if target.has_property(js_string!("__h"), ctx)? {
+                return Ok(NativeFunction::from_fn_ptr(f).to_js_function(ctx.realm()).into());
+            }
+        }
+    }
     let kind = target.get(js_string!("__kind"), ctx)
         .ok()
         .and_then(|v| v.as_string().map(|s| s.to_std_string_escaped()))
@@ -1491,6 +1504,7 @@ fn cl_remove(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<Js
 }
 fn cl_contains(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let n = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    if !n.is_empty() && !n.contains(char::is_whitespace) { note_selector(format!(".{n}")) }
     Ok(JsValue::from(match handle_of(this, ctx) {
         Some(h) => with(|d| d.class_list(h).iter().any(|c| *c == n)),
         None => false,
@@ -2316,57 +2330,384 @@ fn diff_effects(before: &Dom, after: &Dom) -> Vec<crate::engine::Effect> {
     out
 }
 
-fn explore_states(ctx: &mut Context, parser_nodes: Handle) -> (Vec<crate::engine::Transition>, u32, Vec<crate::engine::Interactive>) {
-    use crate::engine::Transition;
-    // Elements the page itself wired for interaction. Nothing is guessed:
-    // these are the handlers it actually registered.
-    let mut candidates: Vec<(Handle, String)> = vec![];
-    ELISTENERS.with(|m| {
-        for (h, v) in m.borrow().iter() {
-            for (ty, _) in v {
-                if matches!(ty.as_str(), "click" | "change" | "input" | "submit" | "toggle") {
-                    candidates.push((*h, ty.clone()));
-                }
-            }
-        }
-    });
-    ONHANDLERS.with(|m| {
-        for ((h, name), _) in m.borrow().iter() {
-            if let Some(ty) = name.strip_prefix("on") {
-                if matches!(ty, "click" | "change" | "input" | "submit" | "toggle") {
-                    candidates.push((*h, ty.to_string()));
-                }
-            }
-        }
-    });
-    candidates.retain(|(h, _)| with(|d| d.connected(*h)));
-    // Deterministic order: the same document must explore the same way, or
-    // the recording is not reproducible and the CAS store sees churn.
-    candidates.sort();
-    candidates.dedup();
-    let found = candidates.len() as u32;
-    let mut cov = coverage_universe(&candidates);
-    candidates.truncate(MAX_PROBES);
-    for (h, _) in &candidates { if let Some(c) = cov.get_mut(h) { c.probed = true; c.over_cap = false } }
+/// ★★ A PROBE PERFORMS A USER GESTURE, NOT AN EVENT NAME.
+///
+/// The first recorder dispatched one bare `Event` of the registered type, and
+/// only for click, change, input, submit and toggle. The §5.4.5.6a coverage
+/// measurement showed what that cost: hover, focus, touch and key handlers
+/// were never run, handlers that read `e.button`, `e.key` or `e.clientX` saw
+/// `undefined` and did nothing, and a checkbox's change handler ran against
+/// a checkbox nobody had checked. A gesture is the sequence a browser
+/// actually delivers for one thing a reader does, with the fields a real
+/// `MouseEvent`/`KeyboardEvent`/`TouchEvent` carries, after the state change
+/// the reader made (the box is checked BEFORE `change` fires).
+///
+/// The recorded event name is the GESTURE (`click`, `hover`, `tap`, `swipe`,
+/// `key:Enter`, `focus`, `change`, `toggle`), because that is what the
+/// reader does to trigger the transition; `Plain` keeps the old bare-event
+/// probe for the types that have no richer form here (`input` on a text
+/// field, `submit`).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Gesture { Click, Dblclick, Hover, Drag, Tap, Swipe, Key, Focus, Change, Toggle, Plain(String) }
 
-    // Close the page network for the whole exploration.
-    let saved_net = PAGE_NET.with(|n| n.borrow_mut().take());
+impl Gesture {
+    fn name(&self) -> String {
+        match self {
+            Gesture::Click => "click", Gesture::Dblclick => "dblclick", Gesture::Hover => "hover",
+            Gesture::Drag => "drag", Gesture::Tap => "tap", Gesture::Swipe => "swipe",
+            Gesture::Key => "key:Enter", Gesture::Focus => "focus", Gesture::Change => "change",
+            Gesture::Toggle => "toggle", Gesture::Plain(t) => t,
+        }.to_string()
+    }
+    /// The id `__probe` dispatches on.
+    fn js(&self) -> String {
+        match self { Gesture::Plain(t) => format!("plain:{t}"), g => g.name() }
+    }
+}
 
+/// Event types that do not bubble, so a listener on an ANCESTOR never sees
+/// them in this DOM's dispatch (it models the bubble phase, not capture):
+/// they make an element a candidate, never a delegating root.
+const NON_BUBBLING: &[&str] = &["mouseenter", "mouseleave", "pointerenter", "pointerleave",
+    "focus", "blur", "toggle", "load", "error", "scroll"];
+
+fn text_entry(h: Handle) -> bool {
+    with(|d| match d.tag(h) {
+        Some("textarea") => true,
+        Some("input") => matches!(d.attr(h, "type").map(|t| t.to_ascii_lowercase()).as_deref(),
+            None | Some("" | "text" | "search" | "email" | "url" | "tel" | "password" | "number")),
+        _ => d.attr(h, "contenteditable").is_some_and(|v| !v.eq_ignore_ascii_case("false")),
+    })
+}
+
+/// A control whose `change` a reader causes by picking a value from a finite
+/// set, which the probe can therefore make: checkbox, radio, select.
+fn finite_control(h: Handle) -> bool {
+    with(|d| match d.tag(h) {
+        Some("select") => true,
+        Some("input") => matches!(d.attr(h, "type").map(|t| t.to_ascii_lowercase()).as_deref(),
+            Some("checkbox" | "radio")),
+        _ => false,
+    })
+}
+
+/// The gesture a registered event type on `h` asks for, if any.
+///
+/// ★ Keyboard handlers on a TEXT field are not probed: what they react to is
+/// what was typed, which is §5.4.5.2's free-form input, not one key. On any
+/// other element a key handler is an activation (Enter on a menu item, a
+/// custom button), and Enter is what a keyboard user presses.
+fn gesture_for(ty: &str, h: Handle, all: &std::collections::BTreeSet<String>) -> Vec<Gesture> {
+    let has = |t: &str| all.contains(t);
+    let down = has("mousedown") || has("pointerdown");
+    match ty {
+        "click" | "mousedown" | "mouseup" | "pointerdown" | "pointerup" | "auxclick" => {
+            let mut v = vec![Gesture::Click];
+            if matches!(ty, "mousedown" | "pointerdown") && (has("mousemove") || has("pointermove")) {
+                v.push(Gesture::Drag);
+            }
+            v
+        }
+        "dblclick" => vec![Gesture::Dblclick],
+        "mouseover" | "mouseenter" | "pointerover" | "pointerenter" => vec![Gesture::Hover],
+        "mousemove" | "pointermove" => if down { vec![Gesture::Drag] } else { vec![Gesture::Hover] },
+        "touchstart" | "touchend" | "touchmove" => vec![Gesture::Tap, Gesture::Swipe],
+        "keydown" | "keyup" | "keypress" => if text_entry(h) { vec![] } else { vec![Gesture::Key] },
+        "focus" | "focusin" => vec![Gesture::Focus],
+        "change" | "input" => if finite_control(h) { vec![Gesture::Change] }
+                              else { vec![Gesture::Plain(ty.to_string())] },
+        "toggle" => if with(|d| d.tag(h) == Some("details")) { vec![Gesture::Toggle] }
+                    else { vec![Gesture::Plain("toggle".into())] },
+        "submit" => vec![Gesture::Plain("submit".into())],
+        _ => vec![],
+    }
+}
+
+/// Where a delegated probe's handler lives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Root { El(Handle), Doc }
+
+/// The coverage key for document- and window-level listeners, which belong
+/// to no element.
+const DOC_ENTRY: Handle = Handle::MAX;
+
+#[derive(Clone, Debug)]
+struct Probe {
+    target: Handle,
+    gesture: Gesture,
+    /// The handler this probe exercises: a hash of the source of every
+    /// listener the gesture reaches on its own element (direct), or of the
+    /// delegating root's listeners plus what the target was chosen by.
+    key: u64,
+    /// Set for a probe dispatched at a descendant on behalf of an ancestor's
+    /// (or the document's) listener.
+    root: Option<Root>,
+    /// The root types this probe can reach, when it should also discover
+    /// what a delegating handler tests (`closest`, `matches`, `classList`).
+    discover: Option<Vec<String>>,
+}
+
+fn fnv(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+    h
+}
+
+/// The identity of a handler FUNCTION, for the per-handler budget: its
+/// source text, so the 255 closures one loop made for 255 `<dfn>`s are one
+/// handler; a native or bound function, whose source says nothing, is
+/// identified by object instead (`__handlerKey`).
+fn handler_key(f: &JsValue, ctx: &mut Context) -> String {
+    let g = ctx.global_object();
+    let Ok(k) = g.get(js_string!("__handlerKey"), ctx) else { return String::new() };
+    let Some(c) = k.as_callable() else { return String::new() };
+    c.call(&JsValue::undefined(), &[f.clone()], ctx).ok()
+        .and_then(|v| v.as_string().map(|s| s.to_std_string_escaped())).unwrap_or_default()
+}
+
+/// Every listener the page registered, per element: (type, handler key).
+fn element_listeners(ctx: &mut Context) -> std::collections::BTreeMap<Handle, Vec<(String, String)>> {
+    let mut raw: Vec<(Handle, String, JsValue)> = vec![];
+    ELISTENERS.with(|m| for (h, v) in m.borrow().iter() {
+        for (ty, f) in v { raw.push((*h, ty.clone(), f.clone())) }
+    });
+    ONHANDLERS.with(|m| for ((h, name), f) in m.borrow().iter() {
+        raw.push((*h, name.strip_prefix("on").unwrap_or(name).to_string(), f.clone()))
+    });
+    let mut out: std::collections::BTreeMap<Handle, Vec<(String, String)>> = Default::default();
+    for (h, ty, f) in raw {
+        let k = handler_key(&f, ctx);
+        out.entry(h).or_default().push((ty, k));
+    }
+    for v in out.values_mut() { v.sort(); v.dedup() }
+    out.retain(|h, _| with(|d| d.connected(*h)));
+    out
+}
+
+/// Document- and window-level listeners: (type, handler key).
+fn document_listeners(ctx: &mut Context) -> Vec<(String, String)> {
     let mut out = vec![];
-    for (h, ty) in candidates {
-        let before = DOM.with(|d| d.borrow().clone());
-        let (els0, txt0) = (before.element_count() as i64,
-            before.visible_text(before.root()).split_whitespace().map(str::len).sum::<usize>() as i64);
-        let attrs0 = before.nodes.iter().map(|n| n.attrs.len()).sum::<usize>();
-        let path = before.node_path(h);
-        let anchored = h < parser_nodes;
+    if let Ok(v) = ctx.eval(Source::from_bytes(b"__docListeners()")) {
+        if let Some(o) = v.as_object() {
+            let n = o.get(js_string!("length"), ctx).ok().and_then(|x| x.as_number()).unwrap_or(0.0) as u32;
+            for i in 0..n {
+                let Ok(p) = o.get(i, ctx) else { continue };
+                let Some(p) = p.as_object() else { continue };
+                let s = |j: u32, ctx: &mut Context| p.get(j, ctx).ok()
+                    .and_then(|x| x.as_string().map(|s| s.to_std_string_escaped())).unwrap_or_default();
+                let (t, k) = (s(0, ctx), s(1, ctx));
+                out.push((t, k));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
 
-        let probe0 = probe_counters(ctx);
-        // The timer clock at the START of this probe, before its handler runs.
-        let (t_fired0, t_now0, t_seq0) = timer_clock(ctx);
+/// The gestures an element's registered types ask for, each with the key of
+/// the handlers it reaches.
+fn gestures_of(h: Handle, ls: &[(String, String)]) -> Vec<(Gesture, u64, Vec<String>)> {
+    let all: std::collections::BTreeSet<String> = ls.iter().map(|(t, _)| t.clone()).collect();
+    let mut m: std::collections::BTreeMap<Gesture, (Vec<String>, Vec<String>)> = Default::default();
+    for (ty, k) in ls {
+        for g in gesture_for(ty, h, &all) {
+            let e = m.entry(g).or_default();
+            e.0.push(format!("{ty}\u{1}{k}"));
+            if !NON_BUBBLING.contains(&ty.as_str()) && !e.1.contains(ty) { e.1.push(ty.clone()) }
+        }
+    }
+    m.into_iter().map(|(g, (mut ks, bub))| {
+        ks.sort();
+        (g, fnv(&ks.join("\u{2}")), bub)
+    }).collect()
+}
+
+/// Elements a delegating handler plausibly stands for when it tested nothing
+/// observable: what a reader can activate.
+fn interactive_descendant(d: &Dom, h: Handle) -> bool {
+    match d.tag(h) {
+        Some("a") => d.attr(h, "href").is_some(),
+        Some("button" | "select" | "textarea" | "summary" | "label") => true,
+        Some("input") => !d.attr(h, "type").is_some_and(|t| t.eq_ignore_ascii_case("hidden")),
+        Some(_) => d.attr(h, "tabindex").is_some()
+            || d.attr(h, "role").is_some_and(|r| matches!(r, "button" | "link" | "tab" | "menuitem"
+                | "option" | "checkbox" | "switch" | "radio" | "treeitem")),
+        None => false,
+    }
+}
+
+/// The gesture a delegated probe performs on a descendant, from the root's.
+/// A form listening for `change` stands for its controls, which change by
+/// their own kind.
+fn delegated_gesture(g: &Gesture, t: Handle) -> Option<Gesture> {
+    match g {
+        Gesture::Change | Gesture::Plain(_) => {
+            let p = if let Gesture::Plain(p) = g { p.as_str() } else { "change" };
+            if p == "submit" || p == "toggle" { return None }
+            let control = with(|d| matches!(d.tag(t), Some("input" | "select" | "textarea")));
+            if !control { return None }
+            Some(if finite_control(t) { Gesture::Change }
+                 else if text_entry(t) { Gesture::Plain(if p == "change" { "change" } else { "input" }.into()) }
+                 else { return None })
+        }
+        Gesture::Key if text_entry(t) => None,
+        Gesture::Toggle => None,
+        g => Some(g.clone()),
+    }
+}
+
+/// Selectors a delegating handler tested during discovery, in call order.
+const MAX_DISCOVERED_SELECTORS: usize = 16;
+
+/// The descendants a delegating root's handler is probed on: those matching
+/// what it tested, or, if it tested nothing observable, the interactive
+/// ones. Each comes with what it was chosen by, which is part of its key.
+fn delegated_targets(root: Handle, selectors: &[String]) -> Vec<(Handle, String)> {
+    let mut out: Vec<(Handle, String)> = vec![];
+    let mut seen = std::collections::HashSet::new();
+    let parsed: Vec<(String, crate::selector::SelectorList)> = selectors.iter()
+        .filter_map(|s| crate::selector::parse(s).map(|q| (s.clone(), q))).collect();
+    with(|d| {
+        if !parsed.is_empty() {
+            for (s, q) in &parsed {
+                for h in crate::selector::select(d, root, q) {
+                    if d.connected(h) && seen.insert(h) { out.push((h, format!("sel:{s}"))) }
+                }
+            }
+        } else {
+            let n = d.nodes.len() as Handle;
+            for h in 0..n {
+                if h == root || !d.connected(h) || !d.contains(root, h) || !interactive_descendant(d, h) { continue }
+                let ty = d.attr(h, "type").unwrap_or("").to_ascii_lowercase();
+                let tag = d.tag(h).unwrap_or("");
+                if seen.insert(h) { out.push((h, format!("tag:{tag}[{ty}]"))) }
+            }
+        }
+    });
+    out
+}
+
+/// Apply the reader's own state change a gesture implies, before dispatch:
+/// the box is checked before `change` fires, the next option is selected,
+/// the details element is open before `toggle`. Returns false when the
+/// gesture cannot change anything (an already-checked radio, a one-option
+/// select), and the probe then dispatches nothing, as a browser would.
+fn apply_user_action(g: &Gesture, h: Handle) -> bool {
+    match g {
+        Gesture::Change => with(|d| match d.tag(h) {
+            Some("select") => {
+                let opts: Vec<Handle> = d.by_tag("option").into_iter().filter(|&o| d.contains(h, o)).collect();
+                if opts.len() < 2 { return false }
+                let cur = opts.iter().position(|&o| d.attr(o, "selected").is_some()).unwrap_or(0);
+                for &o in &opts { d.remove_attr(o, "selected") }
+                d.set_attr(opts[(cur + 1) % opts.len()], "selected", "");
+                true
+            }
+            _ => {
+                let radio = d.attr(h, "type").is_some_and(|t| t.eq_ignore_ascii_case("radio"));
+                let on = d.attr(h, "checked").is_some();
+                if radio {
+                    if on { return false }
+                    if let Some(name) = d.attr(h, "name").map(str::to_string) {
+                        for r in d.by_tag("input") {
+                            if r != h && d.attr(r, "name") == Some(name.as_str())
+                                && d.attr(r, "type").is_some_and(|t| t.eq_ignore_ascii_case("radio")) {
+                                d.remove_attr(r, "checked");
+                            }
+                        }
+                    }
+                    d.set_attr(h, "checked", "");
+                } else if on { d.remove_attr(h, "checked") } else { d.set_attr(h, "checked", "") }
+                true
+            }
+        }),
+        Gesture::Toggle => with(|d| {
+            if d.attr(h, "open").is_some() { d.remove_attr(h, "open") } else { d.set_attr(h, "open", "") }
+            true
+        }),
+        _ => true,
+    }
+}
+
+thread_local! {
+    /// ★ What a delegating handler tested during its discovery probe:
+    /// selectors passed to `closest`/`matches`, and `.class` for
+    /// `classList.contains`. Some only while a discovery probe runs.
+    static PROBE_SELECTORS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    /// Exploration is running: element wrappers answer `closest`/`matches`.
+    static EXPLORING: RefCell<bool> = const { RefCell::new(false) };
+}
+
+fn note_selector(s: String) {
+    PROBE_SELECTORS.with(|p| if let Some(v) = p.borrow_mut().as_mut() {
+        if v.len() < MAX_DISCOVERED_SELECTORS && !v.contains(&s) { v.push(s) }
+    });
+}
+
+/// `el.matches(sel)` / `el.closest(sel)`, answered ONLY while exploring.
+///
+/// ★ Scoped on purpose. The load pass has never had them (the missing-API
+/// report names `element.closest` in 7 documents), and adding them there
+/// changes what pages build at load — a separate change with its own corpus
+/// diff. Exploration needs them now, because delegating handlers are written
+/// `e.target.closest('[data-toggle]')`, and without the method the handler
+/// throws before it reveals what it tests. Keeping the load pass unchanged
+/// keeps every artifact byte-identical to the non-exploring control arm.
+fn el_matches(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let s = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    note_selector(s.clone());
+    let Some(h) = handle_of(this, ctx) else { return Ok(JsValue::from(false)) };
+    let Some(q) = crate::selector::parse(&s) else { return Ok(JsValue::from(false)) };
+    Ok(JsValue::from(with(|d| crate::selector::matches(d, h, &q))))
+}
+fn el_closest(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let s = args.get_or_undefined(0).to_string(ctx)?.to_std_string_escaped();
+    note_selector(s.clone());
+    let Some(h) = handle_of(this, ctx) else { return Ok(JsValue::null()) };
+    let Some(q) = crate::selector::parse(&s) else { return Ok(JsValue::null()) };
+    let hit = with(|d| {
+        let mut cur = Some(h);
+        while let Some(c) = cur {
+            if d.tag(c).is_some() && crate::selector::matches(d, c, &q) { return Some(c) }
+            cur = d.get(c).and_then(|n| n.parent);
+        }
+        None
+    });
+    Ok(match hit { Some(c) => node_obj(c, ctx), None => JsValue::null() })
+}
+
+/// One probe: perform the gesture at the target, drain what it scheduled,
+/// diff, restore. Returns the transition (if anything changed), whether it
+/// truncated, the nodes it wrote, the counters it moved, and the selectors
+/// a discovery probe saw tested.
+struct ProbeResult {
+    transition: Option<crate::engine::Transition>,
+    counters: (u32, u32, u32, u32, i64, i64),
+    selectors: Vec<String>,
+}
+
+fn run_probe(ctx: &mut Context, p: &Probe, parser_nodes: Handle) -> ProbeResult {
+    use crate::engine::Transition;
+    let h = p.target;
+    let before = DOM.with(|d| d.borrow().clone());
+    let path = before.node_path(h);
+    let anchored = h < parser_nodes;
+    let probe0 = probe_counters(ctx);
+    let (t_fired0, t_now0, t_seq0) = timer_clock(ctx);
+    let mut effects = vec![];
+    let (mut els0, mut txt0, mut attrs0) = (0i64, 0i64, 0usize);
+    let (mut els1, mut txt1, mut attrs1) = (0i64, 0i64, 0usize);
+    if p.discover.is_some() { PROBE_SELECTORS.with(|s| *s.borrow_mut() = Some(vec![])) }
+    if apply_user_action(&p.gesture, h) {
+        // The reader's own change is not the page's effect: diff against the
+        // document AFTER it. Handles are untouched, so paths are unchanged.
+        let mid = DOM.with(|d| d.borrow().clone());
+        els0 = mid.element_count() as i64;
+        txt0 = mid.visible_text(mid.root()).split_whitespace().map(str::len).sum::<usize>() as i64;
+        attrs0 = mid.nodes.iter().map(|n| n.attrs.len()).sum::<usize>();
         let target = node_obj(h, ctx);
-        let script = format!("(function(t){{ try {{ t.dispatchEvent(new Event({ty:?}, \
-            {{ bubbles: true, cancelable: true }})); }} catch (e) {{}} }})", ty = ty);
+        let script = format!("(function(t){{ __probe(t, {:?}); }})", p.gesture.js());
         if let Ok(f) = ctx.eval(Source::from_bytes(script.as_bytes())) {
             if let Some(c) = f.as_callable() { let _ = c.call(&JsValue::undefined(), &[target], ctx); }
         }
@@ -2381,58 +2722,171 @@ fn explore_states(ctx: &mut Context, parser_nodes: Handle) -> (Vec<crate::engine
                             t_fired0 + 50, t_now0 + 500, t_seq0);
         let _ = ctx.eval(Source::from_bytes(drain.as_bytes()));
         let _ = ctx.run_jobs();
-
-        let (els1, txt1, attrs1, effects) = DOM.with(|d| {
+        DOM.with(|d| {
             let d = d.borrow();
-            (d.element_count() as i64,
-             d.visible_text(d.root()).split_whitespace().map(str::len).sum::<usize>() as i64,
-             d.nodes.iter().map(|n| n.attrs.len()).sum::<usize>(),
-             diff_effects(&before, &d))
+            els1 = d.element_count() as i64;
+            txt1 = d.visible_text(d.root()).split_whitespace().map(str::len).sum::<usize>() as i64;
+            attrs1 = d.nodes.iter().map(|n| n.attrs.len()).sum::<usize>();
+            effects = diff_effects(&mid, &d);
         });
-        // Restore. The probe is an observation, not an edit.
-        DOM.with(|d| *d.borrow_mut() = before);
-        let probe1 = probe_counters(ctx);
-        if let Some(c) = cov.get_mut(&h) {
-            c.net_get += probe1.0.saturating_sub(probe0.0);
-            c.net_blocked += probe1.1.saturating_sub(probe0.1);
-            c.beacons += probe1.2.saturating_sub(probe0.2);
-            c.timers_scheduled += probe1.3.saturating_sub(probe0.3);
-            c.timers_left += probe1.4 - probe0.4;
-            c.intervals_left += probe1.5 - probe0.5;
-            if !effects.is_empty() {
-                c.recorded = true;
-                c.truncated |= effects.iter().any(|e| matches!(e, crate::engine::Effect::Truncated { .. }));
-                for e in &effects {
-                    let t = match e {
-                        crate::engine::Effect::Attribute { target, .. } | crate::engine::Effect::Remove { target } => target.clone(),
-                        crate::engine::Effect::Insert { parent, .. } => parent.clone(),
-                        _ => continue,
-                    };
-                    if !c.effect_targets.contains(&t) { c.effect_targets.push(t) }
-                }
-            }
-        }
+    }
+    let selectors = PROBE_SELECTORS.with(|s| s.borrow_mut().take()).unwrap_or_default();
+    // Restore. The probe is an observation, not an edit.
+    DOM.with(|d| *d.borrow_mut() = before);
+    let probe1 = probe_counters(ctx);
+    let counters = (probe1.0.saturating_sub(probe0.0), probe1.1.saturating_sub(probe0.1),
+        probe1.2.saturating_sub(probe0.2), probe1.3.saturating_sub(probe0.3),
+        probe1.4 - probe0.4, probe1.5 - probe0.5);
+    // ★ The EFFECTS decide, not the counters. A class toggle leaves element
+    // and text counts identical while being exactly the transition worth
+    // recording — counting alone would have discarded the commonest kind of
+    // menu on the web.
+    let transition = (!effects.is_empty()).then(|| Transition {
+        trigger: path, event: p.gesture.name(), anchored,
+        elements_added: els1 - els0, text_delta: txt1 - txt0,
+        attributes_changed: attrs1.abs_diff(attrs0) as u32, effects,
+    });
+    ProbeResult { transition, counters, selectors }
+}
 
-        // ★ The EFFECTS decide, not the counters. A class toggle leaves
-        // element and text counts identical while being exactly the
-        // transition worth recording — counting alone would have discarded
-        // the commonest kind of menu on the web.
-        let changed = !effects.is_empty();
-        if changed {
-            out.push(Transition {
-                trigger: path,
-                event: ty,
-                anchored,
-                elements_added: els1 - els0,
-                text_delta: txt1 - txt0,
-                attributes_changed: attrs1.abs_diff(attrs0) as u32,
-                effects,
-            });
+fn credit(c: &mut crate::engine::Interactive, r: &ProbeResult) {
+    let k = r.counters;
+    c.net_get += k.0; c.net_blocked += k.1; c.beacons += k.2; c.timers_scheduled += k.3;
+    c.timers_left += k.4; c.intervals_left += k.5;
+}
+
+fn explore_states(ctx: &mut Context, parser_nodes: Handle) -> (Vec<crate::engine::Transition>, u32, Vec<crate::engine::Interactive>) {
+    use crate::engine::Interactive;
+    // Elements the page itself wired for interaction. Nothing is guessed:
+    // these are the handlers it actually registered.
+    let listeners = element_listeners(ctx);
+    let doc_listeners = document_listeners(ctx);
+    let mut cov = coverage_universe(&listeners);
+
+    // Direct probes: one per (element, gesture), in handle order so the same
+    // document explores the same way — otherwise the recording is not
+    // reproducible and the CAS store sees churn.
+    let mut direct: Vec<Probe> = vec![];
+    for (&h, ls) in &listeners {
+        let has_el_child = with(|d| !d.element_children(h).is_empty());
+        for (g, key, bubbling) in gestures_of(h, ls) {
+            let discover = (has_el_child && !bubbling.is_empty()).then_some(bubbling);
+            direct.push(Probe { target: h, gesture: g, key, root: None, discover });
+        }
+    }
+    let found = direct.len() as u32;
+    let mut direct_set: std::collections::HashSet<(Handle, Gesture)> =
+        direct.iter().map(|p| (p.target, p.gesture.clone())).collect();
+    // Document- and window-level listeners: discovered by a probe at <body>,
+    // which is also what a click on the page's background does.
+    let body = with(|d| d.by_tag("body").first().copied().or_else(|| d.by_tag("html").first().copied()));
+    if let (Some(b), false) = (body, doc_listeners.is_empty()) {
+        let e = cov.entry(DOC_ENTRY).or_default();
+        e.path = "#document".into(); e.tag = "#document".into(); e.outside = true;
+        e.events = doc_listeners.iter().map(|(t, _)| t.clone()).collect();
+        e.events.dedup();
+        for (g, key, bubbling) in gestures_of(b, &doc_listeners) {
+            if bubbling.is_empty() { continue }
+            let key = fnv(&format!("doc\u{1}{key}"));
+            direct.push(Probe { target: b, gesture: g, key, root: Some(Root::Doc), discover: Some(bubbling) });
         }
     }
 
+    // Close the page network for the whole exploration.
+    let saved_net = PAGE_NET.with(|n| n.borrow_mut().take());
+    EXPLORING.with(|e| *e.borrow_mut() = true);
+
+    let mut out = vec![];
+    let mut queue: std::collections::VecDeque<Probe> = direct.into();
+    let mut ran = 0usize;
+    let mut delegated_seen: std::collections::HashSet<(Handle, Gesture)> = Default::default();
+    while let Some(p) = queue.pop_front() {
+        if ran >= MAX_PROBES {
+            // Cut: the element keeps `over_cap`, which `probed` clears.
+            continue;
+        }
+        ran += 1;
+        let r = run_probe(ctx, &p, parser_nodes);
+        let recorded = r.transition.is_some();
+        let truncated = r.transition.as_ref().is_some_and(|t| t.effects.iter()
+            .any(|e| matches!(e, crate::engine::Effect::Truncated { .. })));
+        let targets: Vec<String> = r.transition.as_ref().map(|t| t.effects.iter().filter_map(|e| match e {
+            crate::engine::Effect::Attribute { target, .. } | crate::engine::Effect::Remove { target } => Some(target.clone()),
+            crate::engine::Effect::Insert { parent, .. } => Some(parent.clone()),
+            _ => None,
+        }).collect()).unwrap_or_default();
+
+        // The target's own entry; a delegated target outside the universe
+        // (a <li>, an <a>) gets one marked `outside`.
+        let tgt_key = if p.root == Some(Root::Doc) && p.discover.is_some() { DOC_ENTRY } else { p.target };
+        let entry = cov.entry(tgt_key).or_insert_with(|| {
+            let mut e = Interactive { outside: true, ..Default::default() };
+            describe(p.target, &mut e);
+            e
+        });
+        entry.probed = true;
+        entry.over_cap = false;
+        if p.root.is_some() && tgt_key != DOC_ENTRY { entry.delegated = true }
+        let g = p.gesture.name();
+        if !entry.gestures.contains(&g) { entry.gestures.push(g) }
+        credit(entry, &r);
+        if recorded {
+            entry.recorded = true;
+            entry.truncated |= truncated;
+            for t in &targets { if !entry.effect_targets.contains(t) { entry.effect_targets.push(t.clone()) } }
+        }
+        // ★ Credit the delegating root too: its handler is what ran.
+        if let Some(root) = p.root {
+            let rk = match root { Root::El(a) => a, Root::Doc => DOC_ENTRY };
+            if rk != tgt_key {
+                if let Some(re) = cov.get_mut(&rk) {
+                    credit(re, &r);
+                    if recorded {
+                        re.via = true;
+                        for t in &targets { if !re.effect_targets.contains(t) { re.effect_targets.push(t.clone()) } }
+                    }
+                }
+            }
+        }
+        if let Some(t) = r.transition { out.push(t) }
+
+        // ★★ DELEGATION. A listener on an ancestor (a list, <body>, the
+        // document) that dispatches on `event.target` reaches no component
+        // when probed on itself: React-style roots and jQuery `.on(sel)`
+        // both work this way, and the §5.4.5.6a measurement found the
+        // buttons they serve listed as native controls with no handler.
+        // Probe the descendants it tested for, or failing that, the
+        // interactive ones.
+        if p.discover.is_some() {
+            let root_h = match p.root { Some(Root::Doc) => 0, _ => p.target };
+            let root = p.root.unwrap_or(Root::El(p.target));
+            let mut extra = vec![];
+            for (t, by) in delegated_targets(root_h, &r.selectors) {
+                if t == p.target { continue }
+                let Some(g) = delegated_gesture(&p.gesture, t) else { continue };
+                // A descendant with its own listener for this gesture is
+                // probed directly, and its probe bubbles here anyway.
+                if direct_set.contains(&(t, g.clone())) { continue }
+                if !delegated_seen.insert((t, g.clone())) { continue }
+                let key = fnv(&format!("{}\u{1}{by}", p.key));
+                extra.push(Probe { target: t, gesture: g, key, root: Some(root), discover: None });
+            }
+            queue.extend(extra);
+        }
+    }
+    direct_set.clear();
+
+    EXPLORING.with(|e| *e.borrow_mut() = false);
     PAGE_NET.with(|n| *n.borrow_mut() = saved_net);
     (out, found, cov.into_values().collect())
+}
+
+fn describe(h: Handle, e: &mut crate::engine::Interactive) {
+    let (path, tag, ty, ce) = with(|d| (d.node_path(h), d.tag(h).unwrap_or("").to_string(),
+        d.attr(h, "type").unwrap_or("").to_ascii_lowercase(), d.attr(h, "contenteditable").is_some()));
+    e.path = path;
+    e.input_type = if tag == "input" || tag == "button" { ty } else { String::new() };
+    e.tag = if ce && tag != "input" && tag != "textarea" { format!("{tag}[contenteditable]") } else { tag };
 }
 
 /// (callbacks fired, virtual now, last timer id) — the virtual timer clock.
@@ -2467,17 +2921,16 @@ fn probe_counters(ctx: &mut Context) -> (u32, u32, u32, u32, i64, i64) {
 
 /// Every element the page wired (any event type) plus every native control,
 /// keyed by handle. Ordered, so the report is deterministic.
-fn coverage_universe(candidates: &[(Handle, String)]) -> std::collections::BTreeMap<Handle, crate::engine::Interactive> {
+fn coverage_universe(listeners: &std::collections::BTreeMap<Handle, Vec<(String, String)>>)
+    -> std::collections::BTreeMap<Handle, crate::engine::Interactive>
+{
     use crate::engine::Interactive;
     let mut m: std::collections::BTreeMap<Handle, Interactive> = Default::default();
-    let mut add = |h: Handle, ev: Option<String>| {
-        let e = m.entry(h).or_default();
-        if let Some(ev) = ev { if !e.events.contains(&ev) { e.events.push(ev) } }
-    };
-    ELISTENERS.with(|l| for (h, v) in l.borrow().iter() { for (ty, _) in v { add(*h, Some(ty.clone())) } });
-    ONHANDLERS.with(|l| for ((h, name), _) in l.borrow().iter() {
-        add(*h, Some(name.strip_prefix("on").unwrap_or(name).to_string()))
-    });
+    for (h, ls) in listeners {
+        let e = m.entry(*h).or_default();
+        for (ty, _) in ls { if !e.events.contains(ty) { e.events.push(ty.clone()) } }
+        e.explorable = !gestures_of(*h, ls).is_empty();
+    }
     let natives: Vec<Handle> = with(|d| (0..d.nodes.len() as Handle).filter(|&h| d.connected(h) && {
         match d.tag(h) {
             Some("form" | "textarea" | "select" | "details" | "button") => true,
@@ -2485,19 +2938,12 @@ fn coverage_universe(candidates: &[(Handle, String)]) -> std::collections::BTree
             _ => d.attr(h, "contenteditable").is_some_and(|v| !v.eq_ignore_ascii_case("false")),
         }
     }).collect());
-    for &h in &natives { add(h, None) }
-    for h in natives { m.get_mut(&h).unwrap().native = true }
-    let explorable: std::collections::HashSet<Handle> = candidates.iter().map(|(h, _)| *h).collect();
+    for h in natives { m.entry(h).or_default().native = true }
     m.retain(|h, _| with(|d| d.connected(*h)));
     for (h, e) in m.iter_mut() {
         e.events.sort();
-        e.explorable = explorable.contains(h);
         e.over_cap = e.explorable;          // cleared for the probed ones
-        let (path, tag, ty, ce) = with(|d| (d.node_path(*h), d.tag(*h).unwrap_or("").to_string(),
-            d.attr(*h, "type").unwrap_or("").to_ascii_lowercase(), d.attr(*h, "contenteditable").is_some()));
-        e.path = path;
-        e.input_type = if tag == "input" || tag == "button" { ty } else { String::new() };
-        e.tag = if ce && tag != "input" && tag != "textarea" { format!("{tag}[contenteditable]") } else { tag };
+        describe(*h, e);
         if !e.native && e.tag.ends_with("[contenteditable]") { e.native = true }
     }
     m
@@ -3573,6 +4019,7 @@ const GLOBALS: &str = r#"
       this.initEvent(t, b, c); this.detail = d;
     };
   }
+  var __probeCtors = {};
   function Event(type, init) { __mkEvent.call(this, type, init); }
   function CustomEvent(type, init) { __mkEvent.call(this, type, init); }
   __defIfaceLike('Event', Event);
@@ -3586,7 +4033,119 @@ const GLOBALS: &str = r#"
   ].forEach(function (n) {
     function E(type, init) { __mkEvent.call(this, type, init); }
     __defIfaceLike(n, E);
+    __probeCtors[n] = E;
   });
+  __probeCtors.Event = Event;
+
+  // ── Exploration gestures (legacy-web §5.4.5.6a, item 1) ────────────
+  //
+  // ★ What a browser delivers for ONE thing a reader does, with the fields
+  // the real event carries. The first recorder dispatched a bare Event of
+  // the registered type, so a handler reading e.key, e.button or e.clientX
+  // saw undefined and did nothing. Exploration only: no page code can
+  // reach a user gesture through this (it is sealed below, and the load
+  // pass never calls it). The constructors are OURS, captured here, so a
+  // page that replaced MouseEvent cannot change what a probe dispatches.
+  globalThis.__probe = function (t, g) {
+    function touches(x) {
+      var tl = [{ identifier: 0, target: t, clientX: x, clientY: 10, pageX: x, pageY: 10,
+                  screenX: x, screenY: 10, radiusX: 1, radiusY: 1, rotationAngle: 0, force: 1 }];
+      tl.item = function (i) { return this[i] || null; };
+      return tl;
+    }
+    function none() { var tl = []; tl.item = function () { return null; }; return tl; }
+    function fire(C, type, bubbles, f) {
+      var Ctor = __probeCtors[C] || Event, e;
+      try { e = new Ctor(type, { bubbles: bubbles, cancelable: true, composed: true }); }
+      catch (x) { return true; }
+      // A real user event is trusted; that is what this simulates.
+      e.isTrusted = true;
+      e.view = globalThis;
+      e.ctrlKey = false; e.shiftKey = false; e.altKey = false; e.metaKey = false;
+      e.getModifierState = function () { return false; };
+      if (f) for (var k in f) { try { e[k] = f[k]; } catch (x) {} }
+      try { return t.dispatchEvent(e); } catch (x) { return true; }
+    }
+    function mouse(C, type, bubbles, x, f) {
+      var m = { screenX: x, screenY: 10, clientX: x, clientY: 10, pageX: x, pageY: 10,
+                x: x, y: 10, offsetX: 0, offsetY: 0, movementX: 0, movementY: 0,
+                button: 0, buttons: 0, which: 1, detail: 0, relatedTarget: null };
+      if (C === 'PointerEvent') {
+        m.pointerId = 1; m.pointerType = 'mouse'; m.isPrimary = true; m.width = 1;
+        m.height = 1; m.pressure = 0; m.tangentialPressure = 0; m.tiltX = 0; m.tiltY = 0;
+        m.twist = 0;
+      }
+      if (f) for (var k in f) m[k] = f[k];
+      return fire(C, type, bubbles, m);
+    }
+    function click(detail) {
+      mouse('PointerEvent', 'pointerdown', true, 10, { buttons: 1, pressure: 0.5 });
+      mouse('MouseEvent', 'mousedown', true, 10, { buttons: 1, detail: detail });
+      mouse('PointerEvent', 'pointerup', true, 10, {});
+      mouse('MouseEvent', 'mouseup', true, 10, { detail: detail });
+      mouse('MouseEvent', 'click', true, 10, { detail: detail });
+    }
+    function touch(type, x, live) {
+      var a = live ? touches(x) : none();
+      return fire('TouchEvent', type, true,
+        { touches: a, targetTouches: a, changedTouches: touches(x), detail: 0, which: 0 });
+    }
+    function key(type) {
+      return fire('KeyboardEvent', type, true, { key: 'Enter', code: 'Enter', keyCode: 13,
+        which: 13, charCode: type === 'keypress' ? 13 : 0, location: 0, repeat: false,
+        isComposing: false, detail: 0 });
+    }
+    var plain = /^plain:/.test(g) ? g.slice(6) : null;
+    if (plain !== null) {
+      try { t.dispatchEvent(new Event(plain, { bubbles: true, cancelable: true })); } catch (x) {}
+      return;
+    }
+    switch (g) {
+      case 'click': click(1); break;
+      case 'dblclick': click(1); click(2); mouse('MouseEvent', 'dblclick', true, 10, { detail: 2 }); break;
+      case 'hover':
+        mouse('PointerEvent', 'pointerover', true, 10, {});
+        mouse('PointerEvent', 'pointerenter', false, 10, {});
+        mouse('MouseEvent', 'mouseover', true, 10, {});
+        mouse('MouseEvent', 'mouseenter', false, 10, {});
+        mouse('PointerEvent', 'pointermove', true, 10, {});
+        mouse('MouseEvent', 'mousemove', true, 10, {});
+        break;
+      case 'drag':
+        // A leftward drag: what a pointer-driven carousel or slider reads.
+        mouse('PointerEvent', 'pointerdown', true, 200, { buttons: 1, pressure: 0.5 });
+        mouse('MouseEvent', 'mousedown', true, 200, { buttons: 1, detail: 1 });
+        [120, 40].forEach(function (x) {
+          mouse('PointerEvent', 'pointermove', true, x, { buttons: 1, pressure: 0.5, movementX: -80 });
+          mouse('MouseEvent', 'mousemove', true, x, { buttons: 1, movementX: -80 });
+        });
+        mouse('PointerEvent', 'pointerup', true, 40, {});
+        mouse('MouseEvent', 'mouseup', true, 40, { detail: 1 });
+        break;
+      case 'tap': touch('touchstart', 10, true); touch('touchend', 10, false); break;
+      case 'swipe':
+        // Leftward, 160 px: past every swipe threshold the corpus uses.
+        touch('touchstart', 200, true); touch('touchmove', 120, true);
+        touch('touchmove', 40, true); touch('touchend', 40, false);
+        break;
+      case 'key:Enter': key('keydown'); key('keypress'); key('keyup'); break;
+      case 'focus':
+        fire('FocusEvent', 'focus', false, { relatedTarget: null, detail: 0 });
+        fire('FocusEvent', 'focusin', true, { relatedTarget: null, detail: 0 });
+        break;
+      case 'change':
+        fire('Event', 'input', true, {}); fire('Event', 'change', true, {});
+        break;
+      case 'toggle': {
+        var open = false;
+        try { open = !!t.open; } catch (x) {}
+        fire('Event', 'toggle', false,
+          { newState: open ? 'open' : 'closed', oldState: open ? 'closed' : 'open' });
+        break;
+      }
+    }
+  };
+
   // The legacy path: createEvent + initEvent, 91 and 29 references.
   document.createEvent = function (kind) {
     var e = new Event('', {});
@@ -3898,7 +4457,8 @@ const GLOBALS: &str = r#"
   // them, and a page corrupting one costs a metric rather than a conversion.
   ['__deliverMutations', '__upgradePending', '__drainTimers', '__timerStats',
    '__fire', '__fireExisting', '__rand_u32', '__take_mutations', '__is_ancestor',
-   '__parse_url', '__fetch_sync', '__rtf', '__docLocale'
+   '__parse_url', '__fetch_sync', '__rtf', '__docLocale', '__probe', '__handlerKey',
+   '__docListeners'
   ].forEach(function (n) {
     var v = globalThis[n];
     if (v === undefined) return;
@@ -4062,6 +4622,31 @@ const BOOTSTRAP: &str = r#"
       try { on.call(document, ev); globalThis.__fired++;
             globalThis.__dispatchRan++; } catch (e) {}
     }
+  };
+  // ★ A handler's identity for the exploration budget: its SOURCE, so the
+  // closures one loop made for many elements are one handler. A native or
+  // bound function's source says nothing ("[native code]"), so those are
+  // told apart by object, numbered in first-seen order (deterministic).
+  var hk = (typeof WeakMap === 'function') ? new WeakMap() : null, hkN = 0;
+  globalThis.__handlerKey = function (f) {
+    var s = '';
+    try { s = Function.prototype.toString.call(f); } catch (e) {}
+    if (s && s.indexOf('[native code]') < 0) return 's:' + s;
+    if (!hk) return 'o';
+    if (!hk.has(f)) hk.set(f, 'o' + (++hkN));
+    return hk.get(f);
+  };
+  /// Document- and window-level listeners, as [type, handler key].
+  globalThis.__docListeners = function () {
+    var out = [];
+    for (var i = 0; i < L.length; i++) out.push([L[i][0], __handlerKey(L[i][1])]);
+    ['click', 'mousedown', 'mouseup', 'pointerdown', 'pointerup', 'dblclick', 'mouseover',
+     'pointerover', 'touchstart', 'touchend', 'keydown', 'keyup', 'keypress', 'focusin',
+     'change', 'input', 'submit'].forEach(function (t) {
+      var on = globalThis['on' + t];
+      if (typeof on === 'function') out.push([t, __handlerKey(on)]);
+    });
+    return out;
   };
   document.addEventListener = add;
   document.removeEventListener = remove;

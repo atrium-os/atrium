@@ -110,16 +110,20 @@ fn report(c: &navigator_prerender::Conversion, fetchd: Option<(u64, u64)>) -> St
         let _ = writeln!(o, "N\t{n}\t{}", name.replace('\t', " "));
     }
     // Per-element exploration coverage (legacy-web §5.4.5.6): flags are
-    // n native, e explorable, p probed, c cut by the probe cap, r recorded,
-    // t truncated.
+    // n native, e explorable, p probed, c cut by the probe bound, r recorded,
+    // t truncated, d probed as a delegated target, D a delegating root whose
+    // delegated probe recorded, x outside the interactive universe, h cut but
+    // its handlers probed elsewhere. The 14th column lists the gestures probed.
     for k in &c.coverage {
         let flags: String = [(k.native, 'n'), (k.explorable, 'e'), (k.probed, 'p'), (k.over_cap, 'c'),
-                             (k.recorded, 'r'), (k.truncated, 't')].iter().filter(|(on, _)| *on).map(|(_, ch)| *ch).collect();
+                             (k.recorded, 'r'), (k.truncated, 't'), (k.delegated, 'd'), (k.via, 'D'),
+                             (k.outside, 'x'), (k.represented, 'h')]
+            .iter().filter(|(on, _)| *on).map(|(_, ch)| *ch).collect();
         let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
-        let _ = writeln!(o, "K\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        let _ = writeln!(o, "K\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             clean(&k.path), clean(&k.tag), clean(&k.input_type), clean(&k.events.join(",")), flags,
             k.net_get, k.net_blocked, k.beacons, k.timers_scheduled, k.timers_left, k.intervals_left,
-            clean(&k.effect_targets.join("|")));
+            clean(&k.effect_targets.join("|")), clean(&k.gestures.join(",")));
     }
     o
 }

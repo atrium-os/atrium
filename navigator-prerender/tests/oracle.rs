@@ -354,6 +354,9 @@ fn coverage_records_every_interactive_element() {
     assert!(by("form").native && by("details").native);
     let h = by("div");
     assert_eq!(h.events, vec!["mouseover"]);
-    assert!(!h.native && !h.explorable);
+    // A hover handler is probed with the hover gesture now (§5.4.5.6a item 1);
+    // a key handler on a TEXT field still is not — that is free-form input.
+    assert!(!h.native && h.explorable && h.probed, "{h:?}");
+    assert_eq!(h.gestures, vec!["hover"]);
     assert_eq!(explore(html).html, plain(html).html, "exploring still leaves the artifact unchanged");
 }

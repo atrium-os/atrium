@@ -7,10 +7,18 @@ Each cov.tsv is what `PRERENDER_COVERAGE=<file> PRERENDER_EXPLORE=1 prerender <d
 appends: one line per interactive element,
 
     doc  path  tag  type  events  flags  net_get  net_blocked  beacons
-         timers_scheduled  timers_left  intervals_left  effect_targets
+         timers_scheduled  timers_left  intervals_left  effect_targets  [gestures]
 
-(flags: n native, e explorable, p probed, c cut by the probe cap, r recorded,
-t truncated), or `doc  -` for a document with none.
+(flags: n native, e explorable, p probed, c cut by the probe bound, r recorded,
+t truncated, d probed as a delegated target, D a delegating root whose
+delegated probe recorded, x outside the interactive universe, h cut but its
+handlers probed on another element), or `doc  -` for a document with none.
+Tables from before 2026-11-05's probe-fidelity change have 13 columns and none
+of d/D/x/h; they classify unchanged.
+
+Rows flagged x are NOT interactive elements: delegated targets with no
+handler that are not native controls (a <li> under a listening <ul>), and the
+document/window pseudo-entry. They are reported on their own line.
 
 An INTERACTIVE ELEMENT is one the page registered a handler on (any event
 type), plus every native control (form, input other than hidden, textarea,
@@ -20,13 +28,20 @@ because they answer different questions:
   handlers  elements with a registered handler: what the page's code wired
   all       handlers plus native controls that have none
 
+LIFECYCLE handlers (load, error, abort, readystatechange) are registered but
+no reader triggers them: an element whose only handlers are these is counted
+separately and is in neither denominator (a native control keeps its place
+as native, without them).
+
 Each element is classified once, first rule that applies (in this order):
 
   1 server-fed     its probe tried the page network (refused: exploration
                    closes it), other than beacons — FIRST, even when the probe
                    also recorded a transition, which is then partial
-  covered          a probe recorded a transition (truncated ones are noted)
-  3 large state    an explorable candidate cut by the probe cap (64)
+  covered          a probe recorded a transition (truncated ones are noted),
+                   on it or, for a delegating root, through its targets
+  3 large state    an explorable candidate cut by the probe bound, split by
+                   whether its handler was probed on another element
   2 free-form      a text-entry control, a form, or only typing events
   4 time-driven    its probe left timers or intervals pending past the drain
   native-only      a native control with no handler and no submission
@@ -42,6 +57,7 @@ is case 1 (a data binding whose parameter is the field, §5.4.5.2), not case 2.
 import collections
 import sys
 
+LIFECYCLE = {"load", "error", "abort", "readystatechange", "DOMContentLoaded"}
 TEXT_TYPES = {"", "text", "search", "email", "url", "tel", "password", "number"}
 TYPING = {"input", "keydown", "keyup", "keypress", "paste", "cut", "beforeinput",
           "compositionstart", "compositionend", "compositionupdate"}
@@ -50,7 +66,8 @@ CASES = ["covered", "1 server-fed", "2 free-form", "3 large state", "4 time-driv
 
 
 def parse(path):
-    rows, docs = [], set()
+    """(universe rows, outside rows, documents)."""
+    rows, outside, docs = [], [], set()
     for line in open(path, encoding="utf-8", errors="replace"):
         f = line.rstrip("\n").split("\t")
         docs.add(f[0])
@@ -60,8 +77,11 @@ def parse(path):
                          events=[e for e in f[4].split(",") if e], flags=f[5],
                          net_get=int(f[6]), net_blocked=int(f[7]), beacons=int(f[8]),
                          tsched=int(f[9]), tleft=int(f[10]), ileft=int(f[11]),
-                         targets=[t for t in f[12].split("|") if t]))
-    return rows, docs
+                         targets=[t for t in f[12].split("|") if t],
+                         gestures=[g for g in (f[13] if len(f) > 13 else "").split(",") if g]))
+        if "x" in rows[-1]["flags"]:
+            outside.append(rows.pop())
+    return rows, outside, docs
 
 
 def text_entry(r):
@@ -71,6 +91,10 @@ def text_entry(r):
 
 def classify(r):
     fl = r["flags"]
+    if r["events"] and set(r["events"]) <= LIFECYCLE:
+        if "n" not in fl:
+            return "lifecycle", "load/error only"
+        r = dict(r, events=[])
     # ★ THE NETWORK DECIDES FIRST, even over a recorded transition. A probe
     # that changed the DOM AND asked for data recorded only the part that did
     # not need the data (a spinner, a toggled panel): its transition is
@@ -83,10 +107,14 @@ def classify(r):
         return "1 server-fed", "cross-origin or non-GET (refused)" + part
     if "r" in fl:
         return "covered", "truncated" if "t" in fl else ""
+    if "D" in fl:
+        return "covered", "via delegated targets"
     handlers = bool(r["events"])
     if handlers:
         if "c" in fl:
-            return "3 large state", "beyond the probe cap"
+            if "h" in fl:
+                return "3 large state", "budget: its handler was probed on another element"
+            return "3 large state", "beyond the probe bound"
         if text_entry(r) or r["tag"] == "form" or set(r["events"]) <= TYPING:
             return "2 free-form", "text entry" if text_entry(r) else ("form" if r["tag"] == "form" else "typing events")
         if r["tleft"] > 0 or r["ileft"] > 0:
@@ -112,7 +140,11 @@ def classify(r):
 def kind(e):
     if e.startswith(("mouse", "pointer")) or e in ("hover", "contextmenu", "dblclick", "wheel"):
         return "pointer/hover"
-    if e.startswith("touch") or e.startswith("drag") or e == "drop":
+    if e.startswith("drag") or e == "drop":
+        # HTML drag and drop; on <img> almost always `dragstart` cancelled
+        # to stop an image being dragged. Not a gesture the probe makes.
+        return "html drag-and-drop"
+    if e.startswith("touch"):
         return "touch/drag"
     if e in ("focus", "blur", "focusin", "focusout"):
         return "focus"
@@ -137,10 +169,25 @@ def interference(rows):
     return out
 
 
-def report(name, rows, docs, examples):
-    print(f"\n## {name}: {len(docs)} documents, {len(rows)} interactive elements")
+def report(name, rows, docs, examples, outside=()):
     for r in rows:
         r["case"], r["why"] = classify(r)
+    life = [r for r in rows if r["case"] == "lifecycle"]
+    rows = [r for r in rows if r["case"] != "lifecycle"]
+    print(f"\n## {name}: {len(docs)} documents, {len(rows)} interactive elements")
+    print(f"lifecycle-only (load/error) elements, excluded from both denominators: {len(life)}")
+    tgt = [r for r in outside if r["tag"] != "#document"]
+    dd = [r for r in outside if r["tag"] == "#document"]
+    print(f"outside the universe: {len(tgt)} delegated targets probed, "
+          f"{sum(1 for r in tgt if 'r' in r['flags'])} recorded, in {len({r['doc'] for r in tgt})} documents; "
+          f"document/window listeners in {len(dd)} documents, "
+          f"{sum(1 for r in dd if 'r' in r['flags'] or 'D' in r['flags'])} recorded through")
+    deleg = [r for r in rows if "d" in r["flags"]]
+    print(f"delegated targets inside the universe: {len(deleg)} probed, "
+          f"{sum(1 for r in deleg if 'r' in r['flags'])} recorded")
+    g = collections.Counter(x for r in list(rows) + list(outside) for x in r.get("gestures", []))
+    if g:
+        print("gestures probed (elements): " + ", ".join(f"{k} {n}" for k, n in g.most_common()))
     h = [r for r in rows if r["events"]]
     for label, sub in (("handlers", h), ("all (handlers + native controls)", rows)):
         c = collections.Counter(r["case"] for r in sub)
@@ -182,8 +229,9 @@ def report(name, rows, docs, examples):
             if shown >= examples:
                 break
     capped = collections.Counter(r["doc"] for r in rows if "c" in r["flags"])
-    print(f"\nprobe cap (64 per document): hit in {len(capped)} documents, "
-          f"{sum(capped.values())} explorable elements never probed")
+    rep_ = sum(1 for r in rows if "c" in r["flags"] and "h" in r["flags"])
+    print(f"\nprobe bound: hit in {len(capped)} documents, "
+          f"{sum(capped.values())} explorable elements never probed ({rep_} with their handler probed elsewhere)")
     inter = interference(rows)
     rec = sum(a for a, _ in inter.values())
     pairs = sum(b for _, b in inter.values())
@@ -203,24 +251,25 @@ def main():
         i = args.index("--docs"); docs_out = args[i + 1]; del args[i:i + 2]
     if "--examples" in args:
         i = args.index("--examples"); examples = int(args[i + 1]); del args[i:i + 2]
-    allrows, alldocs = [], set()
+    allrows, alldocs, allout = [], set(), []
     per = []
     for a in args:
         name, path = a.split("=", 1)
-        rows, docs = parse(path)
-        report(name, rows, docs, examples)
-        for r in rows:
+        rows, outside, docs = parse(path)
+        report(name, rows, docs, examples, outside)
+        for r in rows + outside:
             r["corpus"] = name
         allrows += rows
+        allout += outside
         alldocs |= {(name, d) for d in docs}
         per.append((name, rows, docs))
     if len(per) > 1:
-        for r in allrows:
+        for r in allrows + allout:
             r["doc"] = r["corpus"] + "/" + r["doc"]
-        report("overall", allrows, {f"{n}/{d}" for n, d in alldocs}, examples)
+        report("overall", allrows, {f"{n}/{d}" for n, d in alldocs}, examples, allout)
     if docs_out:
         with open(docs_out, "w") as o:
-            o.write("corpus\tdocument\telements\thandlers\t" + "\t".join(CASES) + "\n")
+            o.write("corpus\tdocument\telements\thandlers\t" + "\t".join(CASES) + "\tlifecycle\n")
             for name, rows, docs in per:
                 by = collections.defaultdict(list)
                 for r in rows:
@@ -228,8 +277,9 @@ def main():
                 for d in sorted(docs):
                     rs = by.get(d, [])
                     c = collections.Counter(r["case"] for r in rs)
-                    o.write(f"{name}\t{d}\t{len(rs)}\t{sum(1 for r in rs if r['events'])}\t"
-                            + "\t".join(str(c[k]) for k in CASES) + "\n")
+                    live = [r for r in rs if r["case"] != "lifecycle"]
+                    o.write(f"{name}\t{d}\t{len(live)}\t{sum(1 for r in live if r['events'])}\t"
+                            + "\t".join(str(c[k]) for k in CASES) + f"\t{c['lifecycle']}\n")
 
 
 if __name__ == "__main__":

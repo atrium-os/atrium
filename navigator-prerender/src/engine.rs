@@ -41,11 +41,11 @@ pub struct Interactive {
     /// A native control: form, input (not hidden), textarea, select,
     /// details, button, or contenteditable.
     pub native: bool,
-    /// Has a listener of a type exploration dispatches.
+    /// Has a listener exploration has a gesture for.
     pub explorable: bool,
-    /// Probed (an explorable candidate within MAX_PROBES).
+    /// At least one probe ran on it.
     pub probed: bool,
-    /// An explorable candidate cut by MAX_PROBES.
+    /// An explorable candidate no probe reached (cut by the bound).
     pub over_cap: bool,
     /// A probe produced a recorded transition.
     pub recorded: bool,
@@ -63,6 +63,20 @@ pub struct Interactive {
     pub intervals_left: i64,
     /// What the recorded transitions wrote, for the interference count.
     pub effect_targets: Vec<String>,
+    /// Probed as a delegated TARGET: a descendant the probe dispatched at
+    /// on behalf of an ancestor's or the document's listener.
+    pub delegated: bool,
+    /// A delegating root: a probe dispatched at one of its descendants on
+    /// its behalf recorded a transition.
+    pub via: bool,
+    /// Not in the interactive universe: a delegated target with no handler
+    /// that is not a native control, or the document/window pseudo-entry.
+    pub outside: bool,
+    /// Cut by the budget, but every handler it would have exercised was
+    /// probed on another element (step 2's per-handler budget).
+    pub represented: bool,
+    /// The gestures probed on it (click, hover, tap, swipe, key:Enter, …).
+    pub gestures: Vec<String>,
 }
 
 pub struct RunReport {
