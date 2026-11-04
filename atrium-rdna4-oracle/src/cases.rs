@@ -219,7 +219,7 @@ pub fn all() -> Vec<Case> {
 // Cases that measure an allocation unit the RDNA4 ISA guide does not pin down
 // for COMPUTE_PGM_RSRC1/2. They run after the corpus (one may trap on the
 // card if an assumption is wrong) and their outputs are read, not just
-// matched: the expectation is what the guide predicts.
+// matched. Expectations are what the R9700 measured (report v3, 2026-11-04).
 
 fn lit(mut w: Vec<u32>, v: u32) -> Vec<u32> {
     w.push(v);
@@ -277,8 +277,10 @@ pub const VGPR_PROBES: u32 = 64;
 /// v2..v63, then stores each to `out[k]`. A write to a VGPR past the
 /// allocation is a NOP and a store from one reads v0 (= 0 for work-item 0),
 /// ISA §3.3.2.2, so `out` holds markers up to the allocation and zeros after:
-/// no fault either way. Expectation: the guide's blocks of 16 (wave32) or 8
-/// (wave64) VGPRs per field step, §3.3.2.1 (24/12 on 1536-VGPR parts).
+/// no fault either way. Expectation, measured on the R9700 (2026-11-04
+/// report v3): each field step is 8 VGPRs for wave32 and 4 for wave64, the
+/// encoding `emit_dispatch` uses. (The §3.3.2.1 blocks of 16/8 do not
+/// describe this field's unit.)
 pub fn vgpr_alloc(wave32: bool, field: u32) -> Case {
     let mut sh = mov_lit(1, 0);
     for k in 2..VGPR_PROBES {
@@ -291,18 +293,25 @@ pub fn vgpr_alloc(wave32: bool, field: u32) -> Case {
     // emit_dispatch encodes VGPRS = ceil(vgprs / g) - 1 with g = 8 (wave32)
     // or 4 (wave64); pick vgprs so the field is exactly `field`.
     let g = if wave32 { 8 } else { 4 };
-    let guide = if wave32 { 16 } else { 8 } * (field + 1);
-    let expect = (0..VGPR_PROBES).map(|k| if (2..guide).contains(&k) { 0xa000_0000 | k } else { 0 }).collect();
+    let alloc = g * (field + 1);
+    let expect = (0..VGPR_PROBES).map(|k| if (2..alloc).contains(&k) { 0xa000_0000 | k } else { 0 }).collect();
     let w = if wave32 { 32 } else { 64 };
     one_lane_case(format!("vgpr_alloc_w{w}_f{field}"), sh, g * (field + 1), wave32, 0, VGPR_PROBES as usize, expect)
 }
 
+/// Bytes per COMPUTE_PGM_RSRC2.LDS_SIZE step. Not the 1024-byte LDS block
+/// of ISA §3.3.5: on the R9700 (2026-11-04 report v3) LDS_SIZE=1 kept byte
+/// 508 but not 1020, and LDS_SIZE=64 did not reach 65532. 512 fits both; the
+/// f2/f128 cases below pin it.
+pub const LDS_SIZE_UNIT: u32 = 512;
+
 /// `lds_alloc_f{field}_at_{addr}`: with COMPUTE_PGM_RSRC2.LDS_SIZE = `field`,
 /// store a marker at LDS byte `addr`, load it back and write it to `out[0]`.
-/// Expectation: LDS_SIZE counts the 1024-byte blocks of ISA §3.3.5, so the
-/// marker survives when `addr + 4 <= field * 1024`. If the unit is smaller the
-/// access is out of range: MEMVIOL, which traps (§3.3.5.1, §11.3). These cases
-/// therefore run last.
+/// Past the allocation a load returns 0 (§3.3.5.1); the guide also says
+/// MEMVIOL traps, but on the R9700 these jobs finished with status=ok.
+/// Expectation: LDS_SIZE counts [`LDS_SIZE_UNIT`] bytes, so the marker
+/// survives when `addr + 4 <= field * LDS_SIZE_UNIT`, else `out[0]` is 0.
+/// These cases still run last.
 pub fn lds_alloc(field: u32, addr: u32) -> Case {
     use atrium_rdna4_cmd::regs::compute_pgm_rsrc2 as r2;
     let marker = 0x1d50_0000 | addr;
@@ -316,7 +325,8 @@ pub fn lds_alloc(field: u32, addr: u32) -> Case {
     sh.extend(store(4, 3, 0));
     sh.extend(encode("S_ENDPGM", "ENC_SOPP", "default", &[]).unwrap());
     assert!(field << r2::LDS_SIZE_SHIFT & !r2::LDS_SIZE_MASK == 0);
-    one_lane_case(format!("lds_alloc_f{field}_at_{addr}"), sh, 8, true, field << r2::LDS_SIZE_SHIFT, 1, vec![marker])
+    let expect = if addr + 4 <= field * LDS_SIZE_UNIT { marker } else { 0 };
+    one_lane_case(format!("lds_alloc_f{field}_at_{addr}"), sh, 8, true, field << r2::LDS_SIZE_SHIFT, 1, vec![expect])
 }
 
 /// The calibration cases, in run order (the trap-capable LDS ones last).
@@ -329,5 +339,10 @@ pub fn calibration() -> Vec<Case> {
         lds_alloc(1, 508),
         lds_alloc(1, 1020),
         lds_alloc(64, 65532),
+        // Pin the 512-byte unit: inside and just past two units, and the
+        // full 64 KiB at LDS_SIZE = 128.
+        lds_alloc(2, 1020),
+        lds_alloc(2, 1024),
+        lds_alloc(128, 65532),
     ]
 }
