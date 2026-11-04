@@ -144,7 +144,7 @@ struct Cx<'a> {
     /// overlay (`bottom: 0` in an auto-height card) fell below the card and
     /// over the carousel. Queued with their static position; the positioned
     /// ancestor drains its share when its own height is final.
-    deferred_abs: Vec<(Handle, U, U)>,
+    deferred_abs: Vec<(Handle, U, U, U)>,
     /// A positioned ancestor with an auto height is open: it will drain
     /// `deferred_abs` when it finishes.
     cb_open: bool,
@@ -518,7 +518,7 @@ impl<'a> Cx<'a> {
         let positioned = kw(s, "position") != "static";
         if matches!(kw(s, "position"), "absolute" | "fixed") && !std::mem::take(&mut self.placing_abs) {
             // Out of flow: it takes no room where it was written.
-            self.abs_box(h, x, y);
+            self.abs_box(h, x, x + cb_w, y);
             return 0;
         }
         // ★ Painting order. The profile admits `position`, `z-index` and
@@ -764,7 +764,7 @@ impl<'a> Cx<'a> {
                 if self.is_block_level(c) {
                     let ly = cy;
                     cy += self.lines(std::mem::take(&mut inline), content_x, cy, content_w, s);
-                    self.place_pending_abs(content_x, ly);
+                    self.place_pending_abs(content_x, content_x + content_w, ly);
                     cy += self.block(c, content_x, cy, content_w, child_cb_h, (None, None));
                 } else {
                     self.collect_inline(c, &mut inline, s);
@@ -772,7 +772,7 @@ impl<'a> Cx<'a> {
             }
             let ly = cy;
             cy += self.lines(inline, content_x, cy, content_w, s);
-            self.place_pending_abs(content_x, ly);
+            self.place_pending_abs(content_x, content_x + content_w, ly);
         }
         let content_h = cy - (by + bt + pt);
         let hgt = definite.unwrap_or_else(|| clamp(content_h + pt + pb + bt + bb).max(vframe).max(cell_floor.unwrap_or(0)));
@@ -781,7 +781,7 @@ impl<'a> Cx<'a> {
         if positioned && self.deferred_abs.len() > deferred_from {
             self.pos_cb.3 = Some((hgt - bt - bb).max(0));
             self.cb_open = false;
-            for (d, sx, sy) in self.deferred_abs.split_off(deferred_from) { self.abs_box(d, sx, sy) }
+            for (d, sx, sr, sy) in self.deferred_abs.split_off(deferred_from) { self.abs_box(d, sx, sr, sy) }
         }
         self.cb_open = saved_open;
         // The box's own border and background are outside its own clip.
@@ -949,8 +949,12 @@ impl<'a> Cx<'a> {
     ///
     /// `static_x`/`static_y` are where normal flow would have put it, which
     /// is what an `auto` offset resolves to (CSS 2 §10.3.7).
-    fn abs_box(&mut self, h: Handle, static_x: U, static_y: U) {
+    /// `static_x`..`static_r` is the line or content box the box would have
+    /// been placed in: its static position is the left end of it, or in an
+    /// rtl containing block the RIGHT end (CSS 2.1 §10.3.7).
+    fn abs_box(&mut self, h: Handle, static_x: U, static_r: U, static_y: U) {
         let Some(s) = self.st(h) else { return };
+        let rtl = self.dom.get(h).and_then(|n| n.parent).and_then(|p| self.st(p)).is_some_and(|ps| kw(ps, "direction") == "rtl");
         let (cbx, cby, cbw, cbh) = if kw(s, "position") == "fixed" {
             (0, 0, self.viewport.0, self.viewport.1)
         } else { self.pos_cb };
@@ -960,7 +964,7 @@ impl<'a> Cx<'a> {
         let (top, bottom) = (v_off("top"), v_off("bottom"));
         if cbh.is_none() && self.cb_open && kw(s, "position") != "fixed"
             && (bottom.is_some() || matches!(s.get("top"), V::Pct(_)) || matches!(s.get("height"), V::Pct(_))) {
-            self.deferred_abs.push((h, static_x, static_y));
+            self.deferred_abs.push((h, static_x, static_r, static_y));
             return;
         }
         // `None` is `auto`; resolved below, once the box's size is known.
@@ -1002,7 +1006,10 @@ impl<'a> Cx<'a> {
             let free = cbw - l - r - w - ml - mr;
             match (mla.is_none(), mra.is_none()) {
                 (true, true) if free >= 0 => { ml = free / 2; mr = free - free / 2 }
-                (true, true) => mr = free, // negative: the start margin stays 0
+                // Negative: the START margin stays 0 — the left one, or in
+                // rtl the right one.
+                (true, true) if rtl => ml = free,
+                (true, true) => mr = free,
                 (true, false) => ml = free,
                 (false, true) => mr = free,
                 _ => {}
@@ -1029,9 +1036,13 @@ impl<'a> Cx<'a> {
         if (bottom.is_some() && top.is_none() || right.is_some() && left.is_none()) && cbh.is_none() && bottom.is_some() {
             self.count("bottom against an indefinite containing block (treated as auto)");
         }
+        // In rtl an over-constrained box ignores `left` (§10.3.7), and with
+        // both offsets auto its RIGHT edge is at the static position.
         let x = match (left, right) {
+            (Some(_), Some(r)) if rtl => cbx + cbw - r - mr - w,
             (Some(l), _) => cbx + l + ml,
             (None, Some(r)) => cbx + cbw - r - mr - w,
+            _ if rtl => static_r - mr - w,
             _ => static_x + ml,
         };
         let y = match (top, bottom) {
@@ -1451,7 +1462,7 @@ impl<'a> Cx<'a> {
             let Some(cs) = self.st(c) else { continue };
             if kw(cs, "display") == "none" { continue }
             // Out of flow: not an item, placed against its containing block.
-            if matches!(kw(cs, "position"), "absolute" | "fixed") { self.abs_box(c, x, y); continue }
+            if matches!(kw(cs, "position"), "absolute" | "fixed") { self.abs_box(c, x, x + w, y); continue }
             let px = |p: &str, basis: U| len(cs.get(p), basis);
             let (mw, mh) = (if rtl { ["margin-right", "margin-left"] } else { ["margin-left", "margin-right"] }, ["margin-top", "margin-bottom"]);
             let (mm, cm) = if row { (mw, mh) } else { (mh, mw) };
@@ -1655,7 +1666,7 @@ impl<'a> Cx<'a> {
             let Some(cs) = self.st(c) else { continue };
             if kw(cs, "display") == "none" { continue }
             // Out of flow: not an item, placed against its containing block.
-            if matches!(kw(cs, "position"), "absolute" | "fixed") { self.abs_box(c, x, y); continue }
+            if matches!(kw(cs, "position"), "absolute" | "fixed") { self.abs_box(c, x, x + w, y); continue }
             let pick = |own: &str, parent: &str| -> String {
                 match kw(cs, own) { "auto" | "" => match kw(s, parent) { "" => "stretch", a => a }, a => a }.to_string()
             };
@@ -2262,8 +2273,8 @@ impl<'a> Cx<'a> {
     /// Turn an inline-level node (and its inline descendants) into items.
     /// Lay out the out-of-flow boxes `collect_inline` set aside, at the
     /// static position of the line box they were written in.
-    fn place_pending_abs(&mut self, x: U, y: U) {
-        while let Some(h) = self.pending_abs.pop() { self.abs_box(h, x, y) }
+    fn place_pending_abs(&mut self, x: U, right: U, y: U) {
+        while let Some(h) = self.pending_abs.pop() { self.abs_box(h, x, right, y) }
     }
 
     fn collect_inline(&mut self, h: Handle, out: &mut Vec<Item>, parent: &Style) {
@@ -3193,6 +3204,24 @@ mod tests {
         assert_eq!(one(0x00ff00ff).0, 300 - 40, "justify-self: start is the cell's right edge");
         assert_eq!(one(0xffff00ff).0, 100, "end is its left edge (cell 2 spans 100..200)");
         assert_eq!(one(0x00ffffff).0, 0, "-2 / -1 is the last column, on the left");
+    }
+
+    /// ★ With both offsets auto, an absolutely positioned box in an rtl
+    /// containing block puts its RIGHT edge at the static position; with
+    /// both given and a width, `left` is the one ignored (CSS 2.1 §10.3.7).
+    #[test]
+    fn an_rtl_absolute_box_takes_its_static_position_from_the_right() {
+        let src = r#"<style>body { margin-left: 0px; margin-right: 0px; margin-top: 0px }
+            .p { position: relative; direction: rtl; width: 400px; height: 100px }
+            .a { position: absolute; width: 50px; height: 10px; background-color: #ff0000 }
+            .o { position: absolute; left: 10px; right: 30px; width: 50px; height: 10px; background-color: #0000ff }
+            .i { position: absolute; width: 20px; height: 10px; background-color: #00ff00 }</style>
+            <div class="p"><div class="a"></div><div class="o"></div><p>שלום<span class="i"></span></p></div>"#;
+        let o = render(src);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        assert_eq!(boxes(&o, 0xff0000ff)[0].0, 400 - 50, "a block-level static position, from the right");
+        assert_eq!(boxes(&o, 0x0000ffff)[0].0, 400 - 30 - 50, "over-constrained: right wins in rtl");
+        assert_eq!(boxes(&o, 0x00ff00ff)[0].0, 400 - 20, "an inline one's line starts at the right too");
     }
 
     /// ★ A NESTED table is not a wrapper. A `display: table` div around a
