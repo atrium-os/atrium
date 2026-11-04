@@ -1435,9 +1435,9 @@ impl<'a> Cx<'a> {
     /// order). Lays the items out inside the container's content box at
     /// (x, y), `w` wide, and returns the content height used.
     ///
-    /// Items are the element children; a run of loose text between them is
-    /// not an item here and is counted. Margins of items are honoured as
-    /// fixed lengths (`auto` margins are treated as 0 and counted).
+    /// Items are the element children and anonymous items around loose
+    /// text. `auto` margins count as 0 while lines are built and lengths
+    /// flexed, then take the free space (§9.5 step 12, §9.6 step 13).
     fn flex(&mut self, h: Handle, s: &Style, x: U, y: U, w: U, cb_h: Option<U>) -> U {
         let row = kw(s, "flex-direction") != "column";
         // ★ The inline axis runs right to left in an rtl container: a ROW's
@@ -1449,7 +1449,9 @@ impl<'a> Cx<'a> {
         let cross_gap = len(s.get(if row { "row-gap" } else { "column-gap" }), if row { cb_h.unwrap_or(0) } else { w }).unwrap_or(0);
         let main_avail = if row { Some(w) } else { cb_h };
         struct It { h: Handle, base: U, hypo: U, grow: f64, shrink: f64, min: U, max: U, main: U, cross: U,
-                    m_start: U, m_end: U, c_start: U, c_end: U, align: &'static str, cross_auto: bool }
+                    m_start: U, m_end: U, c_start: U, c_end: U, align: &'static str, cross_auto: bool,
+                    // Which margins are `auto`, in the same flow-relative order.
+                    auto: [bool; 4] }
         let mut items: Vec<It> = vec![];
         for c in self.dom.children_of(h) {
             match self.dom.get(c).map(|n| &n.kind) {
@@ -1464,7 +1466,7 @@ impl<'a> Cx<'a> {
                                     main: base.max(min), cross: 0, m_start: 0, m_end: 0, c_start: 0, c_end: 0,
                                     align: match kw(s, "align-items") { "flex-start" | "start" => "start", "flex-end" | "end" => "end",
                                                                         "center" => "center", "baseline" => "baseline", _ => "stretch" },
-                                    cross_auto: true });
+                                    cross_auto: true, auto: [false; 4] });
                     continue;
                 }
                 Some(Kind::Element(_)) => {}
@@ -1477,7 +1479,6 @@ impl<'a> Cx<'a> {
             let px = |p: &str, basis: U| len(cs.get(p), basis);
             let (mw, mh) = (if rtl { ["margin-right", "margin-left"] } else { ["margin-left", "margin-right"] }, ["margin-top", "margin-bottom"]);
             let (mm, cm) = if row { (mw, mh) } else { (mh, mw) };
-            for p in mw.iter().chain(mh.iter()) { if matches!(cs.get(p), V::Kw("auto")) { self.count("flex: auto margins (as 0)") } }
             let m = |p: &str| px(p, w).unwrap_or(0);
             let main_prop = if row { "width" } else { "height" };
             let basis_of = |this: &mut Self| -> U {
@@ -1530,7 +1531,8 @@ impl<'a> Cx<'a> {
                             main: hypo, cross: 0, m_start: m(mm[0]), m_end: m(mm[1]), c_start: m(cm[0]), c_end: m(cm[1]),
                             align: match align { "flex-start" | "start" => "start", "flex-end" | "end" => "end", "center" => "center",
                                                  "baseline" => "baseline", _ => "stretch" },
-                            cross_auto: matches!(cs.get(cross_prop), V::Kw("auto")) });
+                            cross_auto: matches!(cs.get(cross_prop), V::Kw("auto")),
+                            auto: [mm[0], mm[1], cm[0], cm[1]].map(|p| matches!(cs.get(p), V::Kw("auto"))) });
         }
         // Lines.
         let limit = main_avail.unwrap_or(U::MAX);
@@ -1587,7 +1589,17 @@ impl<'a> Cx<'a> {
         // Cross sizes: measured at the resolved main size.
         for i in &mut items {
             i.cross = if row { self.measure(i.h, i.main, None, (Some(i.main), None)) - i.c_start - i.c_end }
-                      else { self.intrinsic_outer_w(i.h, w) };
+                      else {
+                          // ★ Fit-content in the room the margins leave, and
+                          // min/max-width still hold: `max-width: 60rem;
+                          // margin: 0 auto` in a column is the centred page
+                          // column, and unclamped it was as wide as its text.
+                          let fit = self.intrinsic_outer_w(i.h, w).min((w - i.c_start - i.c_end).max(0));
+                          let cs = self.st(i.h);
+                          let mx = cs.and_then(|cs| len(cs.get("max-width"), w)).unwrap_or(U::MAX);
+                          let mn = cs.and_then(|cs| len(cs.get("min-width"), w)).unwrap_or(0);
+                          fit.min(mx).max(mn)
+                      };
         }
         let container_cross = if row { cb_h } else { Some(w) };
         let line_cross: Vec<U> = lines.iter().map(|r| {
@@ -1627,24 +1639,38 @@ impl<'a> Cx<'a> {
                 }
             }
             let max_b = bl.iter().map(|x| x.1).max().unwrap_or(0);
-            let (mut mpos, between) = match jc {
+            // ★ AUTO MARGINS on the main axis take the free space first,
+            // shared equally (§9.5 step 12): `margin-left: auto` on the last
+            // nav item pushes it to the far end, and justify-content then
+            // has nothing left to distribute. On an overflowing line `free`
+            // is 0 and so are they.
+            let autos: U = items[r.clone()].iter().map(|i| i.auto[0] as U + i.auto[1] as U).sum();
+            let per_auto = if autos > 0 { free / autos } else { 0 };
+            let (mut mpos, between) = if autos > 0 { (0, 0) } else { match jc {
                 "flex-end" => (free, 0), "center" => (free / 2, 0),
                 "space-between" if n > 1 => (0, free / (n - 1)),
                 "space-around" if n > 0 => (free / n / 2, free / n),
                 "space-evenly" if n > 0 => (free / (n + 1), free / (n + 1)),
                 _ => (0, 0),
-            };
+            } };
             for idx in r.clone() {
                 let i = &items[idx];
                 let slot = lc - i.c_start - i.c_end;
-                let (cross, coff) = match i.align {
+                // ★ AUTO MARGINS on the cross axis (§8.1, §9.6 step 13) beat
+                // align-self and stop the item stretching: both auto centre
+                // it, one pushes it to the other side. With no room the
+                // start one is 0.
+                let (cross, coff) = if i.auto[2] || i.auto[3] {
+                    let room = (slot - i.cross).max(0);
+                    (i.cross, match (i.auto[2], i.auto[3]) { (true, true) => room / 2, (true, false) => room, _ => 0 })
+                } else { match i.align {
                     "stretch" if i.cross_auto => (slot, 0),
                     "end" => (i.cross, slot - i.cross),
                     "center" => (i.cross, (slot - i.cross) / 2),
                     "baseline" => (i.cross, bl.iter().find(|x| x.0 == idx).map(|x| max_b - x.1).unwrap_or(0)),
                     _ => (i.cross, 0),
-                };
-                let m0 = mpos + i.m_start;
+                } };
+                let m0 = mpos + i.m_start + if i.auto[0] { per_auto } else { 0 };
                 let c0 = cpos + i.c_start + coff;
                 let (ix, iy, fw, fh) = match (row, rtl) {
                     (true, false) => (x + m0, y + c0, i.main, cross),
@@ -1657,7 +1683,7 @@ impl<'a> Cx<'a> {
                 // the margin the block would add.
                 let (ml, mt) = self.st(i.h).map(|cs| (len(cs.get("margin-left"), w).unwrap_or(0), len(cs.get("margin-top"), w).unwrap_or(0))).unwrap_or((0, 0));
                 self.block(i.h, ix - ml, iy - mt, fw + ml, None, (Some(fw), Some(fh)));
-                mpos = m0 + i.main + i.m_end + main_gap + between;
+                mpos = m0 + i.main + i.m_end + (if i.auto[1] { per_auto } else { 0 }) + main_gap + between;
             }
             cpos += lc + cross_gap + cstep;
         }
@@ -3276,6 +3302,50 @@ mod tests {
         assert_eq!(red[0].2, 300, "min-width raises the contribution");
         assert_eq!(red[1].2, 100, "max-width caps it");
         assert_eq!(boxes(&o, 0x0000ffff)[0].2, 600, "a row flex container sums the clamped contributions");
+    }
+
+    /// ★ Flex AUTO MARGINS (Flexbox §8.1). On the main axis they take the
+    /// line's free space before `justify-content` sees any — `margin-left:
+    /// auto` is THE idiom for pushing the last nav item to the right — and
+    /// in an rtl row the auto margin on the start (right) side pushes the
+    /// item left. On the cross axis they centre or push the item, beat
+    /// `align-self` and stop it stretching. When the line overflows they are
+    /// zero.
+    #[test]
+    fn flex_auto_margins_take_the_free_space() {
+        let src = r#"<style>body { margin-left: 0px; margin-right: 0px; margin-top: 0px }
+            .f { display: flex; width: 400px; justify-content: center } .r { direction: rtl } .t { height: 100px; align-items: stretch }
+            .c { flex-direction: column; justify-content: flex-start } .o { width: 100px; justify-content: flex-start }
+            .a { width: 50px; height: 10px; background-color: #ff0000 }
+            .b { width: 50px; height: 10px; background-color: #0000ff; margin-left: auto }
+            .m { width: 60px; height: 10px; background-color: #00ff00; margin-left: auto; margin-right: auto }
+            .s { width: 50px; height: 10px; background-color: #ffff00; margin-right: auto }
+            .v { width: 20px; margin-top: auto; margin-bottom: auto } .e { margin-top: auto }
+            .k { height: 10px; background-color: #ff00ff }
+            .w { max-width: 200px; height: 10px; background-color: #00ffff; margin-left: auto; margin-right: auto }
+            .q { width: 300px; height: 10px }
+            .n { width: 80px; flex-shrink: 0; height: 10px; background-color: #808080 }
+            .n2 { width: 80px; flex-shrink: 0; height: 10px; background-color: #800000; margin-left: auto }</style>
+            <div class="f"><div class="a"></div><div class="b"></div></div>
+            <div class="f"><div class="m"></div></div>
+            <div class="f r"><div class="s"></div></div>
+            <div class="f t"><div class="v"><div class="k"></div></div><div class="e"><div class="k"></div></div></div>
+            <div class="f c"><div class="w"><div class="q"></div></div></div>
+            <div class="f o"><div class="n"></div><div class="n2"></div></div>"#;
+        let o = render(src);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let (a, b) = (boxes(&o, 0xff0000ff)[0], boxes(&o, 0x0000ffff)[0]);
+        assert_eq!((a.0, b.0), (0, 350), "the auto margin takes all the free space; justify-content: center sees none");
+        assert_eq!(boxes(&o, 0x00ff00ff)[0].0, 170, "two auto margins share it: centred");
+        assert_eq!(boxes(&o, 0xffff00ff)[0].0, 0, "rtl: margin-right is the start side, and its auto pushes the item left");
+        let k = boxes(&o, 0xff00ffff);
+        assert_eq!(k[0].3, 10, "a cross-auto item is not stretched");
+        let top = 10 + 10 + 10;
+        assert_eq!(k[0].1, top + 45, "auto top and bottom centre it in the 100px line");
+        assert_eq!(k[1].1, top + 90, "auto top alone pushes it to the bottom");
+        let w = boxes(&o, 0x00ffffff)[0];
+        assert_eq!((w.0, w.2), (100, 200), "the max-width + margin: auto idiom centres a column item");
+        assert_eq!(boxes(&o, 0x800000ff)[0].0, 80, "an overflowing line gives its auto margins nothing");
     }
 
     /// ★ In an rtl grid column line 1 is on the right, and an item's
