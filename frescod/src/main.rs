@@ -8,7 +8,9 @@
 //!   ↓ (extract_rect_nodes / extract_texture_batches, merged in z-order)
 //!   fresco_vulkan::HeadlessRenderer (compute + indirect draw)
 //!   ↓ (read_pixels, BGRA8)
-//!   atrium_gpu::amd::Scanout (CPU staging BO -> CP DMA -> one of two VRAM BOs)
+//!   atrium_gpu::amd::Scanout (CPU staging BO -> CP DMA -> one of two VRAM BOs;
+//!   with FRESCOD_RENDERER=gpu the RDNA4 compute kernels write the VRAM BO
+//!   directly, see render_backend.rs)
 //!   ↓ (the copy signals a syncobj)
 //!   atrium_gpu::amd::Display::commit (BO fd, in-fence = the copy, out-fence = flip done)
 //!
@@ -57,7 +59,13 @@ use std::time::{Duration, Instant};
 /// Scanout buffers: one on screen, one being filled.
 const SCANOUT_BUFFERS: usize = 2;
 /// How long to wait for a flip to land before giving up on the display.
+/// FRESCOD_FLIP_TIMEOUT_MS overrides it: a GPU renderer on gpusim takes
+/// tens of seconds per 1080p frame.
 const FLIP_TIMEOUT_MS: u32 = 2000;
+
+fn flip_timeout_ms() -> u32 {
+    std::env::var("FRESCOD_FLIP_TIMEOUT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(FLIP_TIMEOUT_MS)
+}
 
 fn main() -> std::io::Result<()> {
     let _ = env_logger::try_init();
@@ -107,7 +115,7 @@ fn main() -> std::io::Result<()> {
     let mut framebuffer = vec![0u8; bytes as usize];
 
     /* ── Renderer (FRESCOD_RENDERER: vulkan | compute) ───────────── */
-    let mut renderer = Backend::from_env(mode.width, mode.height, load_bundles)
+    let mut renderer = Backend::from_env(mode.width, mode.height, Some(&vm), load_bundles)
         .map_err(io_other)?;
     eprintln!("frescod: renderer {}", renderer.name());
 
@@ -171,8 +179,8 @@ fn main() -> std::io::Result<()> {
     let mut on_screen: usize = 0;
     render_one_frame(&mut renderer, &frontend, &comp, mode.width, mode.height)
         .map_err(io_other)?;
-    fill_framebuffer(&renderer, &mut framebuffer).map_err(io_other)?;
-    scan.upload(on_screen, &framebuffer, frame_deadline_ns, Some((&copy_done, frame)))?;
+    renderer.present(&scan, on_screen, &mut framebuffer, frame_deadline_ns, (&copy_done, frame))
+        .map_err(io_other)?;
     check_fault("modeset", dpy.commit(
         scan.buffer(on_screen), COMMIT_MODESET, 0,
         Some((&copy_done, frame)), Some((&flip_done, frame)),
@@ -180,7 +188,7 @@ fn main() -> std::io::Result<()> {
         /* MODESET doesn't wait for its in-fence: if the copy is still
          * running, wait for it and retry once. */
         if e.raw_os_error() == Some(libc::EAGAIN) {
-            copy_done.wait(frame, FLIP_TIMEOUT_MS)?;
+            copy_done.wait(frame, flip_timeout_ms())?;
             dpy.commit(scan.buffer(on_screen), COMMIT_MODESET, 0, None, Some((&flip_done, frame)))
         } else {
             Err(e)
@@ -229,7 +237,7 @@ fn main() -> std::io::Result<()> {
          * this one starts, both because its flip released the buffer we are
          * about to fill and because nothing presents faster than the
          * refresh. Damage that lands meanwhile coalesces into this frame. */
-        flip_done.wait(frame, FLIP_TIMEOUT_MS)?;
+        flip_done.wait(frame, flip_timeout_ms())?;
 
         /* Snapshot the generation AFTER the wait so damage during it is
          * folded into this present rather than triggering an extra one. */
@@ -237,10 +245,10 @@ fn main() -> std::io::Result<()> {
         let t_render = Instant::now();
         render_one_frame(&mut renderer, &frontend, &comp, mode.width, mode.height)
             .map_err(io_other)?;
-        fill_framebuffer(&renderer, &mut framebuffer).map_err(io_other)?;
         frame += 1;
         let back = (on_screen + 1) % scan.len();
-        scan.upload(back, &framebuffer, frame_deadline_ns, Some((&copy_done, frame)))?;
+        renderer.present(&scan, back, &mut framebuffer, frame_deadline_ns, (&copy_done, frame))
+            .map_err(io_other)?;
         check_fault("flip", dpy.commit(
             scan.buffer(back), 0, 0,
             Some((&copy_done, frame)), Some((&flip_done, frame)),
@@ -269,7 +277,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     const W: u32 = 1280;
     const H: u32 = 720;
 
-    let mut renderer = Backend::from_env(W, H, load_bundles).map_err(io_other)?;
+    let mut renderer = Backend::from_env(W, H, None, load_bundles).map_err(io_other)?;
     eprintln!("frescod-headless: renderer {}", renderer.name());
 
     let cas   = Arc::new(Mutex::new(CasStore::new()));
@@ -358,7 +366,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
 /// rect/texture set with per-window position offsets applied, then
 /// render one frame with the selected backend.
 fn render_one_frame(
-    renderer: &mut Backend,
+    renderer: &mut Backend<'_>,
     frontend: &Arc<Mutex<EnvelopeFrontend>>,
     comp:     &Arc<Mutex<Compositor>>,
     _screen_w: u32, _screen_h: u32,
@@ -487,18 +495,6 @@ fn translate_path(p: &PathParams, ox: f32, oy: f32) -> PathNode {
         extra: [p.angle, 0.0, 0.0, 0.0],
         color: [p.r, p.g, p.b, p.a],
     }
-}
-
-/// Pull the rendered framebuffer out of `renderer` (BGRA8) into the CPU
-/// staging buffer. The display's scanout format is BGRA8 — matching
-/// HeadlessRenderer's color attachment — so this is a straight read. The
-/// buffer is then DMA-copied into the VRAM scanout BO by `Scanout::update`.
-fn fill_framebuffer(
-    renderer: &Backend,
-    dst:      &mut [u8],
-) -> Result<(), Box<dyn std::error::Error>> {
-    renderer.read_pixels(dst)?;
-    Ok(())
 }
 
 /// A non-zero display fault code (from a commit) is an error.

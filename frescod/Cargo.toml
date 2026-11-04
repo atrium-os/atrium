@@ -50,7 +50,8 @@ atrium-gpu-rs       = { path = "../atrium-gpu-rs" }
 atrium-devevents    = { path = "../atrium-devevents" }
 fresco-scene-server = { path = "../fresco-scene-server" }
 fresco-vulkan       = { path = "../fresco-vulkan" }
-fresco-compute      = { path = "../fresco-compute" }
+fresco-compute      = { path = "../fresco-compute", features = ["rdna4"] }
+atrium-rdna4        = { path = "../atrium-rdna4" }
 atrium-spv-loader   = { path = "../atrium-spv-loader" }
 fresco-protocol     = { path = "../fresco-protocol" }
 aqueduct            = { path = "../aqueduct" }

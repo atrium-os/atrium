@@ -102,6 +102,7 @@ pub fn raster() -> Option<Case> {
     case("fresco_raster", RASTER_SPV, init, f.raster_groups(), (binding::TARGET, target))
 }
 
+<<<<<<< Updated upstream
 /// A 1920x1080 desktop-like scene for timing: overlapping rounded windows,
 /// translucent panels, strokes, image quads and text runs (deterministic).
 pub fn desktop_scene() -> Scene {
@@ -139,4 +140,48 @@ pub fn desktop_scene() -> Scene {
         s.glyph_batches[0].runs.push(GlyphRun { origin, color: [0.05, 0.05, 0.1, 1.0], glyphs });
     }
     s
+=======
+/// A whole frame as frescod records it ([`fresco_compute::rdna4::Rdna4`]):
+/// bin, CS_PARTIAL_FLUSH and cache sync, raster, in one IB, from a zero
+/// mask. Checks the target.
+pub fn frame() -> Option<Case> {
+    frame_of("fresco_frame", &scene(), W, H, PITCH)
+}
+
+/// [`frame`] for any scene and target.
+pub fn frame_of(name: &str, scene: &Scene, w: u32, h: u32, pitch: u32) -> Option<Case> {
+    use fresco_compute::rdna4::{Addrs, Rdna4};
+    let k = Rdna4::new().ok()?;
+    let f = Frame::pack(scene, w, h, pitch);
+    let (raster_off, code_end) = k.code_layout();
+    // Buffers back to back from the first data address, each page aligned
+    // (a 1080p target is larger than data_va's 1 MiB slots).
+    let init = f.buffers();
+    let mut next = data_va(0);
+    let va: [u64; binding::COUNT] = std::array::from_fn(|b| {
+        let v = next;
+        next += (init[b].len() as u64).next_multiple_of(0x1000).max(0x1000);
+        v
+    });
+    let a = Addrs { code: [CODE_VA, CODE_VA + raster_off], buffers: va };
+    let mut ib = Blob::compute();
+    k.record(&mut ib, &a, &f).ok()?;
+    ib.pad(8);
+    let [bin, raster] = k.code();
+    let mut code = bin;
+    code.resize(raster_off as usize, 0);
+    code.extend(raster);
+    let ib_off = code_end.next_multiple_of(0x1000);
+    code.resize(ib_off as usize, 0);
+    code.extend(ib.bytes());
+    let size = (code.len() as u64).next_multiple_of(0x1000);
+    let mut buffers = vec![Buffer { name: "code".into(), va: CODE_VA, size, init: code, expect: None, unordered: None }];
+    let target = bytes(&reference::render(&f));
+    for (b, init) in init.into_iter().enumerate() {
+        let expect = (b as u32 == binding::TARGET).then(|| target.clone());
+        let size = (init.len() as u64).next_multiple_of(0x1000).max(0x1000);
+        buffers.push(Buffer { name: format!("b0_{b}"), va: va[b], size, init, expect, unordered: None });
+    }
+    Some(Case { name: name.into(), buffers, ib: ("code".into(), ib_off, ib.dw.len() as u64), ip: "compute" })
+>>>>>>> Stashed changes
 }

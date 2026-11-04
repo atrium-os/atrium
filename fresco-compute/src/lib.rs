@@ -18,11 +18,14 @@
 //!
 //! [`Frame::pack`] turns a [`Scene`] into the kernels' buffers;
 //! [`reference::render`] is a Rust model of the two kernels, the oracle the
-//! executors are tested against; [`tier2::Tier2`] runs the SPIR-V on the CPU.
+//! executors are tested against; [`tier2::Tier2`] runs the SPIR-V on the CPU;
+//! `rdna4::Rdna4` (feature `rdna4`) records it for an RDNA4 GPU.
 //!
 //! Draw order matches `fresco_vulkan::HeadlessRenderer`: all rects, then all
 //! paths, then texture batches, then glyph batches, each in list order.
 
+#[cfg(feature = "rdna4")]
+pub mod rdna4;
 pub mod reference;
 pub mod tier2;
 

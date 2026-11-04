@@ -189,11 +189,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-gir"
+version = "0.1.0"
+dependencies = [
+ "atrium-spv-ir",
+]
+
+[[package]]
 name = "atrium-gpu-rs"
 version = "0.1.0"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "atrium-rdna4"
+version = "0.1.0"
+dependencies = [
+ "atrium-gir",
+ "atrium-rdna4-cmd",
+ "atrium-rdna4-compiler",
+ "atrium-spv-frontend",
+]
+
+[[package]]
+name = "atrium-rdna4-cmd"
+version = "0.1.0"
+
+[[package]]
+name = "atrium-rdna4-compiler"
+version = "0.1.0"
+dependencies = [
+ "atrium-gir",
+ "atrium-rdna4-isa",
+]
+
+[[package]]
+name = "atrium-rdna4-isa"
+version = "0.1.0"
 
 [[package]]
 name = "atrium-spv-backend-cranelift"
@@ -788,6 +821,7 @@ dependencies = [
 name = "fresco-compute"
 version = "0.1.0"
 dependencies = [
+ "atrium-rdna4",
  "atrium-spv-backend-cranelift",
  "atrium-spv-frontend",
  "atrium-spv-ir",
@@ -857,6 +891,7 @@ dependencies = [
  "aqueduct-gpu-host",
  "atrium-devevents",
  "atrium-gpu-rs",
+ "atrium-rdna4",
  "atrium-spv-loader",
  "atrium-trace",
  "env_logger",

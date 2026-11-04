@@ -30,6 +30,8 @@ pub mod op {
     pub const DISPATCH_DIRECT: u32 = 0x15;
     /// Write SH registers.
     pub const SET_SH_REG: u32 = 0x76;
+    /// A pipeline event without a memory write.
+    pub const EVENT_WRITE: u32 = 0x46;
     /// End-of-pipe event with a memory write.
     pub const RELEASE_MEM: u32 = 0x49;
     /// Wait for and invalidate / write back caches.
@@ -104,6 +106,15 @@ impl Blob {
         let event = BOTTOM_OF_PIPE_TS | (5 << 8); // EVENT_INDEX 5: end-of-pipe
         let sel = (3 << 29) | (3 << 24); // DATA_SEL timestamp, INT_SEL after write confirm, DST_SEL memory
         self.packet(op::RELEASE_MEM, &[event, sel, va as u32, (va >> 32) as u32, 0, 0, 0])
+    }
+
+    /// Wait for every earlier compute dispatch to finish before later
+    /// packets run (EVENT_WRITE CS_PARTIAL_FLUSH, EVENT_INDEX 4, as Linux's
+    /// soc15d.h encodes it). Follow it with [`Blob::acquire_all`] when the
+    /// next dispatch reads what the earlier one wrote.
+    pub fn cs_partial_flush(&mut self) -> &mut Self {
+        const CS_PARTIAL_FLUSH: u32 = 0x07;
+        self.packet(op::EVENT_WRITE, &[CS_PARTIAL_FLUSH | (4 << 8)])
     }
 
     /// Make memory written before this IB (by the CPU or by earlier work)

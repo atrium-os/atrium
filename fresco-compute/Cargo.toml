@@ -14,9 +14,12 @@ atrium-spv-ir      = { path = "../atrium-spv-ir" }
 # hosts without atrium-spv-compile (it needs the bespoke backend's pptk).
 atrium-spv-frontend          = { path = "../atrium-spv-frontend", optional = true }
 atrium-spv-backend-cranelift = { path = "../atrium-spv-backend-cranelift", optional = true }
+# `rdna4`: compile the kernels for RDNA4 and record their dispatches.
+atrium-rdna4 = { path = "../atrium-rdna4", optional = true }
 
 [features]
 cranelift = ["dep:atrium-spv-frontend", "dep:atrium-spv-backend-cranelift"]
+rdna4 = ["dep:atrium-rdna4"]
 
 [dev-dependencies]
 atrium-spv-frontend = { path = "../atrium-spv-frontend" }
