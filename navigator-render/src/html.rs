@@ -2016,7 +2016,8 @@ impl<'a> Cx<'a> {
         for it in &items {
             if it.row.1 != 1 { continue }
             let cw: U = (it.col.0..it.col.0 + it.col.1).map(|i| cols.get(i).copied().unwrap_or(0)).sum::<U>() + cgap * (it.col.1 as U - 1);
-            let hgt = self.measure(it.h, cw, None, (Some(cw), None));
+            let iw = self.grid_item_w(it.h, cw, &it.justify);
+            let hgt = self.measure(it.h, cw, None, (Some(iw), None));
             rmin[it.row.0] = rmin[it.row.0].max(hgt);
         }
         // ★ Then items spanning several rows, fewest rows first (Grid
@@ -2033,7 +2034,8 @@ impl<'a> Cx<'a> {
             let grow: Vec<usize> = rs.clone().filter(|i| intrinsic_track(&rowtracks[*i])).collect();
             if grow.is_empty() { continue }
             let cw: U = (it.col.0..it.col.0 + it.col.1).map(|i| cols.get(i).copied().unwrap_or(0)).sum::<U>() + cgap * (it.col.1 as U - 1);
-            let hgt = self.measure(it.h, cw, None, (Some(cw), None));
+            let iw = self.grid_item_w(it.h, cw, &it.justify);
+            let hgt = self.measure(it.h, cw, None, (Some(iw), None));
             let have: U = rmin[rs.clone()].iter().sum::<U>() + rgap * (rs.len() as U - 1);
             if hgt > have {
                 let short = hgt - have;
@@ -2050,21 +2052,40 @@ impl<'a> Cx<'a> {
             let ax = if rtl { x + w - pos(&cols, cgap, it.col.0) - aw } else { x + pos(&cols, cgap, it.col.0) };
             let ay = y + pos(&rows, rgap, it.row.0);
             let ah = (it.row.0..it.row.0 + it.row.1).map(|i| rows.get(i).copied().unwrap_or(0)).sum::<U>() + rgap * (it.row.1 as U - 1);
-            // A definite specified size wins over the intrinsic one: an empty
-            // box with `width: 40px` is 40 wide, not 0.
-            let specified_w = self.st(it.h).and_then(|cs| len(cs.get("width"), aw));
-            let iw = match it.justify.as_str() {
-                "stretch" => specified_w.unwrap_or(aw),
-                _ => specified_w.unwrap_or_else(|| self.intrinsic_outer_w(it.h, aw)).min(aw),
+            // ★ The item's MARGIN box goes in the area (Grid §11): stretch
+            // fills what the margins leave, and end/centre align the margin
+            // box. `auto` margins take the free space first and stop the
+            // stretch (§11.2), the `margin: 0 auto` idiom. Ignored, a
+            // stretched item with margins overflowed its area by them.
+            let cs = self.st(it.h);
+            let mg = |p: &str| cs.and_then(|cs| len(cs.get(p), aw)).unwrap_or(0);
+            let auto = |p: &str| cs.is_some_and(|cs| matches!(cs.get(p), V::Kw("auto")));
+            let (ml, mr, mt, mb) = (mg("margin-left"), mg("margin-right"), mg("margin-top"), mg("margin-bottom"));
+            let (al, ar, at, ab) = (auto("margin-left"), auto("margin-right"), auto("margin-top"), auto("margin-bottom"));
+            let room_h = (ah - mt - mb).max(0);
+            let iw = self.grid_item_w(it.h, aw, &it.justify);
+            let clamp_by = |v: U, lo: &str, hi: &str, basis: U| {
+                let v = cs.and_then(|cs| len(cs.get(hi), basis)).map_or(v, |m| v.min(m));
+                cs.and_then(|cs| len(cs.get(lo), basis)).map_or(v, |m| v.max(m))
             };
-            let specified_h = self.st(it.h).and_then(|cs| match cs.get("height") { V::Kw(_) => None, V::Pct(_) => len(cs.get("height"), ah), v => len(v, 0) });
+            let specified_h = cs.and_then(|cs| match cs.get("height") { V::Kw(_) => None, V::Pct(_) => len(cs.get("height"), ah), v => len(v, 0) });
             let ih = match it.align.as_str() {
-                "stretch" => specified_h.unwrap_or(ah),
-                _ => specified_h.unwrap_or_else(|| self.measure(it.h, iw, None, (Some(iw), None))).min(ah),
+                "stretch" if !(at || ab) => specified_h.unwrap_or(room_h),
+                // `measure` answers with the margins; the box is without them.
+                _ => specified_h.unwrap_or_else(|| self.measure(it.h, iw, None, (Some(iw), None)) - mt - mb).min(ah),
             };
-            let dx = match (it.justify.as_str(), rtl) { ("end", false) => aw - iw, ("center", _) => (aw - iw) / 2, ("end", true) => 0, (_, true) => aw - iw, _ => 0 };
-            let dy = match it.align.as_str() { "end" => ah - ih, "center" => (ah - ih) / 2, _ => 0 };
-            let forced_h = (it.align == "stretch" || specified_h.is_some()).then_some(ih);
+            let ih = clamp_by(ih, "min-height", "max-height", ah);
+            // Offsets of the margin box; `block` adds the start margins.
+            let (fw, fh) = (aw - ml - mr - iw, ah - mt - mb - ih);
+            let dx = match (al, ar) {
+                (true, true) => fw / 2, (true, false) => fw, (false, true) => 0,
+                _ => match (it.justify.as_str(), rtl) { ("end", false) => fw, ("center", _) => fw / 2, ("end", true) => 0, (_, true) => fw, _ => 0 },
+            };
+            let dy = match (at, ab) {
+                (true, true) => fh / 2, (true, false) => fh, (false, true) => 0,
+                _ => match it.align.as_str() { "end" => fh, "center" => fh / 2, _ => 0 },
+            };
+            let forced_h = ((it.align == "stretch" && !(at || ab)) || specified_h.is_some()).then_some(ih);
             self.block(it.h, ax + dx, ay + dy, iw, Some(ah), (Some(iw), forced_h));
         }
         rows.iter().sum::<U>() + rgap * (rows.len() as U).saturating_sub(1)
@@ -2312,6 +2333,30 @@ impl<'a> Cx<'a> {
         if let Some(m) = len(cs.get("max-width"), cb_w) { bw = bw.min(m) }
         if let Some(m) = len(cs.get("min-width"), cb_w) { bw = bw.max(m) }
         bw.max(frame) + ml + mr
+    }
+
+    /// The border-box width a grid item is laid out at in an area `aw`
+    /// wide: its margin box goes in the area, so stretch fills what the
+    /// margins leave and anything else is fit-content in it; an `auto`
+    /// margin stops the stretch (Grid §11). A definite specified width wins
+    /// over the intrinsic one (an empty `width: 40px` box is 40 wide, not
+    /// 0), and min-/max-width hold either way — BBC News's `width: 100%;
+    /// max-width: calc(100% - 32px); margin: 0 16px` grid, centred in its
+    /// area, was 800 wide at x = 0, not 768 at 16. The rows are measured at
+    /// this width too, or content that wraps more than it was measured
+    /// for runs into the next row (Which?'s article list).
+    fn grid_item_w(&mut self, h: Handle, aw: U, justify: &str) -> U {
+        let cs = self.st(h);
+        let mg = |p: &str| cs.and_then(|cs| len(cs.get(p), aw)).unwrap_or(0);
+        let auto = |p: &str| cs.is_some_and(|cs| matches!(cs.get(p), V::Kw("auto")));
+        let room_w = (aw - mg("margin-left") - mg("margin-right")).max(0);
+        let specified_w = cs.and_then(|cs| len(cs.get("width"), aw));
+        let iw = match justify {
+            "stretch" if !(auto("margin-left") || auto("margin-right")) => specified_w.unwrap_or(room_w),
+            _ => specified_w.unwrap_or_else(|| self.intrinsic_outer_w(h, room_w)).min(aw),
+        };
+        let iw = cs.and_then(|cs| len(cs.get("max-width"), aw)).map_or(iw, |m| iw.min(m));
+        cs.and_then(|cs| len(cs.get("min-width"), aw)).map_or(iw, |m| iw.max(m))
     }
 
     fn intrinsic_outer_w(&mut self, h: Handle, cb_w: U) -> U {
@@ -4569,6 +4614,45 @@ mod tests {
             assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
             assert_eq!(boxes(&o, 0x0000ffff)[0].2, 170, "{wrap}");
         }
+    }
+
+    /// ★ A grid item's MARGIN box is what goes in its area: stretch fills
+    /// what the margins leave, end and centre align the margin box, and
+    /// `auto` margins take the free space and stop the stretch; min- and
+    /// max-width clamp the box. Areas of 200×100, margins 5/10/15/20;
+    /// headless Chrome's numbers.
+    #[test]
+    fn a_grid_items_margins_are_inside_its_area() {
+        let cases: &[(&str, &str, (U, U, U, U))] = &[
+            ("", "", (20, 5, 170, 80)),
+            ("justify-items: end; align-items: end", "w", (140, 55, 50, 30)),
+            ("justify-items: center; align-items: center", "w", (80, 30, 50, 30)),
+            ("", "w ax", (75, 5, 50, 30)),
+            ("", "w al at", (140, 55, 50, 30)),
+            // min/max-width clamp the stretched or specified size.
+            ("justify-items: center", "x", (55, 5, 100, 80)),
+        ];
+        for (g, i, want) in cases {
+            let src = format!(r#"<style>body {{ margin-left: 0px; margin-top: 0px }}
+                .g {{ display: grid; grid-template-columns: 200px 200px; grid-template-rows: 100px; width: 400px; {g} }}
+                .i {{ background-color: #ff0000; margin-top: 5px; margin-right: 10px; margin-bottom: 15px; margin-left: 20px }}
+                .w {{ width: 50px; height: 30px }} .ax {{ margin-left: auto; margin-right: auto }}
+                .al {{ margin-left: auto }} .at {{ margin-top: auto }} .x {{ width: 100%; max-width: calc(100% - 100px) }}</style>
+                <div class="g"><div class="i {i}"></div></div>"#);
+            let o = render(&src);
+            assert!(o.diagnostics.is_empty(), "{g} {i}: {:?}", o.diagnostics);
+            assert_eq!(boxes(&o, 0xff0000ff)[0], *want, "{g} / {i}");
+        }
+        // The ROW is measured at the width the item gets: four 40 px boxes
+        // fit one line of 200 but wrap in the 150 a 50 px margin leaves,
+        // so the next row starts at 20.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; grid-template-columns: 200px; width: 200px }
+            .i { margin-left: 50px } .s { display: inline-block; width: 40px; height: 10px; background-color: #0000ff }
+            .n { height: 10px; background-color: #ff0000 }</style>
+            <div class="g"><div class="i"><span class="s"></span><span class="s"></span><span class="s"></span><span class="s"></span></div><div class="n"></div></div>"#);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        assert_eq!(boxes(&o, 0xff0000ff)[0].1, 20, "the next row");
     }
 
     /// ★ An `auto` minimum takes the item's MINIMUM contribution (Grid
