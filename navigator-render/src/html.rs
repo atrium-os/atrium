@@ -2663,7 +2663,12 @@ impl<'a> Cx<'a> {
                 // hidden "Copy item path" into the scene, and a consumer
                 // scaling glyphs by zero drew them at the font's own units:
                 // a grey blob 450 px across.
-                if p.st.size <= 0 { continue }
+                // ★ An ATOMIC inline is exempt: its own font-size is only the
+                // strut's, and its content sets its own. `ul { font-size: 0 }`
+                // around inline-block items — the idiom that removes the gaps
+                // between them — skipped every item, and Samsung's footer
+                // links vanished.
+                if p.st.size <= 0 && p.atomic.is_none() { continue }
                 if let Some((ah, bw, asc, _)) = p.atomic {
                     // Its margin-box origin: the baseline of this line, minus
                     // the box's own baseline.
@@ -3849,6 +3854,28 @@ mod tests {
             <div><span><a class="f">Privacy</a></span><span><a class="f">Legal</a></span></div>"#);
         let b = boxes(&o, 0xff0000ff);
         assert_eq!((b[0].1 < b[1].1, b[0].2), (true, 792), "stacked blocks: {b:?}");
+    }
+
+    #[test]
+    fn an_inline_block_in_a_zero_font_size_line_still_lays_out() {
+        // Samsung's footer: `font-size: 0` on the list removes the spaces
+        // between its inline-block items, and each item's link sets its own
+        // size. The zero-size skip for TEXT also skipped the atomic items,
+        // so none of the links was laid out at all.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            ul { font-size: 0; padding-left: 0px; margin-top: 0px; list-style-type: none }
+            li { display: inline-block; background-color: #ff0000 } a { font-size: 12px }
+            .f { display: flex }</style>
+            <ul><li><a>Privacy</a></li> <li><a class="f">Legal</a></li></ul>"#);
+        let words: Vec<&str> = o.scene.runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(words, vec!["Privacy", "Legal"]);
+        let b = boxes(&o, 0xff0000ff);
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0].1, b[1].1, "one row: {b:?}");
+        assert_eq!(b[1].0, b[0].0 + b[0].2, "no gap: the space between them is 0 px: {b:?}");
+        // Control: text that is itself 0 px still paints nothing.
+        let o = render(r#"<style>span { font-size: 0 }</style><p>Seen <span>hidden</span></p>"#);
+        assert_eq!(o.scene.runs.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), vec!["Seen"]);
     }
 
     #[test]
