@@ -709,6 +709,32 @@ codec with the fast path off and on and prints both §6 shares. Success for
 A: the swap + GEOM share under ~25 % with zstd, and LZ4 no worse than zstd,
 with 0 corrupt pages. Otherwise do B.
 
+**Native A/B result (R9700 box, KVM guest, 4 vCPU / 2 GiB, GENERIC-NODEBUG,
+2026-11-04 15:41–15:58Z, quiet host).** Self-test and dd round trips OK; all
+four fills 0 of 486,400 pages corrupt.
+
+| | zstd off | zstd **on** | LZ4 off | LZ4 **on** |
+|---|---|---|---|---|
+| **§6 share: swap + GEOM over (zram + swap + GEOM)** | 41.0 % | **18.3 %** | 70.8 % | **29.8 %** |
+| fast-path pages read / written | n/a | 4.53M / 2.75M | n/a | 3.10M / (most) |
+| `fast_fallback` (requests) | n/a | 18 | n/a | 635 |
+| `fail_nomem` (no backing store) | 0 | 56 | 4,054 | 5,987 |
+| compress / decompress, µs per page | ~20 / ~8 | ~20 / ~8 | 6–7 / 4.4 | 6–7 / 6.9 |
+
+With the fast path on, GEOM falls to 0.4 % of busy kernel CPU. All fills ran
+about 199 s; the zstd runs did the same work (11.1e9 / 11.0e9 bytes), but LZ4
+with the fast path on did less (2.89e9 vs 5.25e9) with the most user time and
+84k TLB-shootdown samples.
+
+**Reading.** A meets the threshold for zstd, the default codec: the
+swap + GEOM share is under 25 % (down from 41 %). It misses the stated LZ4
+condition (29.8 %, above zstd). The LZ4 runs are not a clean comparison:
+the pool hits its limit (thousands of `fail_nomem`, no backing store
+attached), which is a capacity problem, not a swap-path one. What remains
+in "other" is TLB shootdowns from `vm_pageout` unmapping pages, which design B
+would address by batching. Raw results: `zram-bench/zram_designA_*` in
+project files.
+
 ## 7. Measuring in the VM (the real numbers)
 
 Build memprobe natively in the VM (`cargo build --release`). The default `zstd`
