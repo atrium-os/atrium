@@ -345,11 +345,22 @@ pub fn expand(name: &str, value: &[Token]) -> Option<Vec<(String, String)>> {
         }
         "grid-area" => {
             let joined = p.join(" ");
-            let f: Vec<String> = joined.split('/').map(|x| x.trim().to_string()).collect();
-            if f.len() != 4 { return None }
+            let mut f: Vec<String> = joined.split('/').map(|x| x.trim().to_string()).collect();
+            if f.is_empty() || f.len() > 4 { return None }
+            // An omitted slot copies its START when that is a name, else is
+            // `auto` (Grid §8.4): `grid-area: 2 / 1` is rows 2-auto, columns 1-auto.
+            let named = |s: &str| s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && !s.contains(' ') && s != "auto";
+            while f.len() < 4 {
+                let from = if f.len() == 1 { 0 } else { f.len() - 2 };
+                let v = if named(&f[from]) { f[from].clone() } else { "auto".to_string() };
+                f.push(v);
+            }
             Some(vec![("grid-row-start".into(), f[0].clone()), ("grid-column-start".into(), f[1].clone()),
                       ("grid-row-end".into(), f[2].clone()), ("grid-column-end".into(), f[3].clone())])
         }
+        "grid-template" => grid_template(value),
+        "grid" => grid(value),
         "place-items" | "place-content" | "place-self" => {
             let what = name.strip_prefix("place-")?;
             let s = if p.len() == 1 { [p[0].clone(), p[0].clone()] } else if p.len() == 2 { [p[0].clone(), p[1].clone()] } else { return None };
@@ -375,4 +386,95 @@ pub fn expand(name: &str, value: &[Token]) -> Option<Vec<(String, String)>> {
         }
         _ => one(name, &whole).filter(|_| false),
     }
+}
+
+/// Split a value at its top-level `/`s.
+fn slash_split(v: &[Token]) -> Vec<Vec<Token>> {
+    let (mut out, mut cur, mut d) = (vec![], vec![], 0usize);
+    for t in v {
+        match &t.tok {
+            Tok::LParen | Tok::Function(_) => { d += 1; cur.push(t.clone()) }
+            Tok::RParen => { d = d.saturating_sub(1); cur.push(t.clone()) }
+            Tok::Delim('/') if d == 0 => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(t.clone()),
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// `grid-template` (Grid §7.4): `none`, `<rows> / <columns>`, or the ASCII
+/// art form — each string a row of `grid-template-areas`, followed by that
+/// row's size (`auto` when absent) and its line names.
+fn grid_template(value: &[Token]) -> Option<Vec<(String, String)>> {
+    let halves = slash_split(value);
+    let text = |v: &[Token]| write_tokens(v).trim().to_string();
+    let out = |r: String, c: String, a: String| Some(vec![
+        ("grid-template-rows".to_string(), r), ("grid-template-columns".to_string(), c),
+        ("grid-template-areas".to_string(), a)]);
+    if halves.len() == 1 && text(value).eq_ignore_ascii_case("none") {
+        return out("none".into(), "none".into(), "none".into());
+    }
+    if halves.len() > 2 { return None }
+    let has_str = halves[0].iter().any(|t| matches!(t.tok, Tok::Str(_)));
+    let cols = halves.get(1).map(|h| text(h)).unwrap_or_else(|| "none".into());
+    if !has_str {
+        if halves.len() != 2 || text(&halves[0]).is_empty() || cols.is_empty() { return None }
+        return out(text(&halves[0]), cols, "none".into());
+    }
+    // ASCII art: [names]? "row" size? [names]? … A row whose string has no
+    // size is `auto`; names between two rows name ONE line, so they merge.
+    let (mut rows, mut areas, mut open): (Vec<String>, Vec<String>, bool) = (vec![], vec![], false);
+    for piece in parts(&halves[0]) {
+        if piece.starts_with('"') || piece.starts_with('\'') {
+            if open { rows.push("auto".into()) }
+            areas.push(format!("\"{}\"", &piece[1..piece.len().saturating_sub(1)]));
+            open = true;
+        } else if piece.starts_with('[') {
+            if open { rows.push("auto".into()); open = false }
+            match rows.last_mut() {
+                Some(last) if last.starts_with('[') =>
+                    *last = format!("[{} {}]", last.trim_matches(['[', ']']).trim(), piece.trim_matches(['[', ']']).trim()),
+                _ => rows.push(piece),
+            }
+        } else {
+            if !open { return None }
+            rows.push(piece); open = false;
+        }
+    }
+    if open { rows.push("auto".into()) }
+    if areas.is_empty() { return None }
+    out(rows.join(" "), cols, areas.join(" "))
+}
+
+/// `grid` (Grid §7.8): a `grid-template`, or one axis's template with the
+/// other axis `auto-flow` (+ its implicit track size). Every sub-property
+/// the shorthand does not set is reset to its initial value.
+fn grid(value: &[Token]) -> Option<Vec<(String, String)>> {
+    let halves = slash_split(value);
+    let flow_side = halves.iter().position(|h| parts(h).iter().any(|x| x.eq_ignore_ascii_case("auto-flow")));
+    let Some(side) = flow_side else {
+        let mut v = grid_template(value)?;
+        v.extend([("grid-auto-flow".to_string(), "row".to_string()), ("grid-auto-rows".to_string(), "auto".to_string()),
+                  ("grid-auto-columns".to_string(), "auto".to_string())]);
+        return Some(v);
+    };
+    if halves.len() != 2 { return None }
+    let mut dense = false;
+    let mut size = vec![];
+    for x in parts(&halves[side]) {
+        if x.eq_ignore_ascii_case("auto-flow") { continue }
+        if x.eq_ignore_ascii_case("dense") { dense = true; continue }
+        size.push(x);
+    }
+    let size = if size.is_empty() { "auto".to_string() } else { size.join(" ") };
+    let other = write_tokens(&halves[1 - side]).trim().to_string();
+    if other.is_empty() { return None }
+    let flow = |a: &str| if dense { format!("{a} dense") } else { a.to_string() };
+    // auto-flow on the ROW side (before the slash): rows are implicit.
+    let (rows, cols, f, ar, ac) = if side == 0 { ("none".to_string(), other, flow("row"), size, "auto".to_string()) }
+        else { (other, "none".to_string(), flow("column"), "auto".to_string(), size) };
+    Some(vec![("grid-template-rows".into(), rows), ("grid-template-columns".into(), cols),
+              ("grid-template-areas".into(), "none".into()), ("grid-auto-flow".into(), f),
+              ("grid-auto-rows".into(), ar), ("grid-auto-columns".into(), ac)])
 }

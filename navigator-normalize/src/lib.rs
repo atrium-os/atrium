@@ -1211,6 +1211,16 @@ fn to_longhands_inner(name: &str, value: &[Token], inputs: &Inputs, report: &mut
     };
     let text = css::write_tokens(value).trim().to_string();
     if text.is_empty() { return vec![] }
+    // ★ `grid` and `grid-template` set the TEMPLATES, whose longhands need
+    // this function's own handling (line names, areas), so each longhand
+    // comes back through it. Dropping them left 72 css-grid WPT tests'
+    // grids with no tracks at all — every item in one cell.
+    if name == "grid" || name == "grid-template" {
+        return match expand::expand(name, value) {
+            Some(p) => p.into_iter().flat_map(|(k, v)| to_longhands_inner(&k, &tokenize(&v), inputs, report, markers)).collect(),
+            None => { report.drop(format!("value `{name}: {text}`")); vec![] }
+        };
+    }
     // Already a longhand the profile knows?
     // `grid-area: <name>` is a name, not four lines; keep it whole.
     if name == "grid-area" && text.split(['/', ' ']).filter(|x| !x.trim().is_empty()).count() == 1

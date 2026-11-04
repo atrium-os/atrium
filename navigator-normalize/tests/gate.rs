@@ -1233,3 +1233,39 @@ fn only_an_unconditional_single_line_reverse_is_compiled() {
     assert_eq!(d("flex-direction reverse on a box that is not flex (no effect)"), 1, "{:?}", report.dropped);
     assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
 }
+
+/// ★ `grid` and `grid-template` are shorthands for the TEMPLATES. Dropping
+/// them left every grid with no tracks — 72 css-grid WPT tests write
+/// `grid: 150px 100px / 200px 300px` and nothing else.
+#[test]
+fn grid_shorthands_become_templates() {
+    let src = r#"<html><head><style>
+      .a { display: grid; grid: 150px 100px / 200px 300px }
+      .b { display: grid; grid-template: [top] "x y" 40px [mid] "z z" [bot] / 1fr 2fr }
+      .bx { grid-area: z }
+      .c { display: grid; grid: auto-flow 30px / 10px 20px }
+      .d { display: grid; grid: 50px / auto-flow dense 25px }
+      .e { grid-area: 2 / 3 }
+    </style></head><body>
+      <div class="a"><div>1</div></div>
+      <div class="b"><div>x</div><div class="bx">z</div></div>
+      <div class="c"><div>c</div></div><div class="d"><div>d</div></div>
+      <div class="a"><div class="e">e</div></div>
+    </body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    assert!(out.contains("grid-template-rows: 150px 100px") && out.contains("grid-template-columns: 200px 300px"), "{out}");
+    // The art form: one row per string, `auto` where no size follows, and
+    // the names numbered; the area resolves against the shorthand's strings.
+    assert!(out.contains("grid-template-rows: 40px auto") && out.contains("grid-template-columns: 1fr 2fr"), "{out}");
+    assert!(out.contains("grid-row-start: 2") && out.contains("grid-row-end: 3") && out.contains("grid-column-end: 3"), "z spans row 2: {out}");
+    // auto-flow before the slash: rows implicit at 30px.
+    assert!(out.contains("grid-auto-rows: 30px") && out.contains("grid-template-columns: 10px 20px"), "{out}");
+    // After the slash: columns implicit, and `dense` is reported, never emitted.
+    assert!(out.contains("grid-auto-columns: 25px") && out.contains("grid-template-rows: 50px"), "{out}");
+    assert!(out.contains("grid-auto-flow: column") || report.dropped.keys().any(|k| k.contains("dense")), "{:?}", report.dropped);
+    assert!(!out.contains("dense"), "{out}");
+    // `grid-area: 2 / 3` leaves both ends auto.
+    assert!(out.contains("grid-column-start: 3"), "{out}");
+    assert!(!report.dropped.keys().any(|k| k == "property `grid`" || k == "property `grid-template`"), "{:?}", report.dropped);
+    assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+}
