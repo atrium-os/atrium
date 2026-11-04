@@ -414,6 +414,32 @@ the residual risk to three places, each with an owner:
 The difference between them is only which kernels the broker is willing to run in that
 VM: ours alone, or the app's validated ones.
 
+#### 2.5.4 What must be true before §2.5.1–2.5.3 secure anything
+
+*Recorded 2026-11-04 at the user's request. The architecture is sound on paper, but none of
+it is built: today frescod is still one process holding the device, the display and every
+window's scene. The design is only as strong as these conditions, each of which has an
+owner.*
+
+| # | condition | why the design depends on it | owner |
+|---|---|---|---|
+| **F1** | **The kernel GPU driver enforces per-VM isolation** and passes `gpu-isolation.md`'s attestation gate | Per-window and per-app GPU VMs (§2.5.2, §2.5.3) are only real if the driver enforces them. The 2026-11-03 review (`docs/reviews/2026-11-03-gpu-kernel-and-tier2-review.md` §A3) lists five breaks in `atrium-gpu-amd`: (1) unlocked shared-queue reprogramming runs one ring under another VMID; (2) BO and VM teardown while in flight; (3) doorbell mmap and `QUEUE_MAP` hijack; (4) scanout by a forgeable VRAM offset (display ABI v2's commit-by-BO-fd, b3d298e, may already close this; to be confirmed); (5) unprivileged reset, scheduler and power control. **This is the largest item and blocks everything else.** gpusim's synchronous drain hides 1 and 2, so they need asynchronous tests. | GPU driver |
+| **F2** | **`bin`, `raster` and `compose` never read or write outside their bound buffers**, for any input | They are the only code that reads hostile scene data on the GPU. Every count and offset is checked against the buffer's size, and per-frame work is bounded from the header. Verified by **differential fuzzing** against `fresco-compute`'s CPU reference (random and mutated scene buffers; GPU output must match, and gpusim must report no out-of-bounds access), with reached-coverage asserted, as in backend §4.7b. | Fresco, with the RDNA4 compiler for gpusim OOB detection |
+| **F3** | **The broker stays small, parses only fixed formats, and is fuzzed** | It holds the control fd, the display and every surface. It reads: the scene-buffer header, the per-window wake-up message, and the layer list. The window-manager policy that *writes* the layer list (stacking, focus, placement) must live in the broker or be equally trusted, because a forged layer list is a cross-window attack. | Fresco |
+| **F4** | **The split is built**: per-window jailed renderers with no GPU fd; per-window shm and GPU VM; the broker's `compose` pass; input routed by the layer list; trusted chrome as a broker overlay; the password secure-input path (§6.4) | This is §2.5.1–2.5.2 itself. Until it exists, a frescod compromise is a whole-desktop compromise. | Fresco |
+| **F5** | **New channels are validated like the scene graph** | Each renderer's semantic-tree export (accessibility, selection, search) is renderer output that other services parse. It gets bounded frames, hard limits and fuzzing, as backend §4.2/§4.7b require for scene graphs. | Fresco, plus each consuming service |
+| **F6** | **The app GPU path (§2.5.3) stays gated** on F1 and on the aqueduct-gpu §11 validation, with the shader compiler running in the app's jail | Apps run their own machine code. Only the GPU MMU confines it. | GPU driver, aqueduct-gpu |
+
+**Open by nature, not by omission.** Windows and apps share the GPU's time and caches, so
+contention timing between them remains a low-bandwidth side channel. Per-window scheduling
+weights (GPU ABI §4.2) are the lever, as on every GPU operating system.
+
+**Order.**
+1. F1, starting with breaks 1–3, which matter as soon as two contexts exist.
+2. F4 and F2 together: the split is only safe once the kernels are fuzzed.
+3. F3 and F5 alongside F4.
+4. F6 last, because nothing uses it until apps bring their own shaders.
+
 ### 2.6 The shared store — conversions in Tessera CAS (A5)
 
 A conversion is keyed by its source bytes and served to every later reader of those bytes
@@ -535,7 +561,8 @@ These belong in the model because they are *wins*, not because they need work:
 | P1 | Decide where images decode: per-document jail, memory-safe decoders, never in Fresco | A1 via decoders | design and medium code | §2.4 |
 | P1 | Per-user dedup domain by default; reproduce-to-share | A5 poisoning | design now, code with sharing | §2.6 |
 | P2 | `rctl` memory/CPU limits on converter and worker jails; per-conversion byte budget | A6 | small | §2.2 |
-| P1 | Split frescod: jailed compositor with **no GPU fd** writes a shared scene buffer; the broker runs only our `bin`/`raster` kernels; secure-input path | A1 against the shared compositor and the driver | medium | §2.5.1 |
+| **P0 (graphics)** | Fix the five GPU driver isolation breaks and pass the attestation gate (F1) | everything in §2.5 rests on it | medium–large | §2.5.4 |
+| P1 | Split frescod: jailed compositor with **no GPU fd** writes a shared scene buffer; the broker runs only our `bin`/`raster` kernels; secure-input path | A1 against the shared compositor and the driver | medium | §2.5.1 | Conditions F2–F5 in §2.5.4.
 | P2 | One jailed renderer per window, one GPU VM per window, fixed `compose` kernel; input routed by layer list (§2.5.2) | cross-window exposure | medium | §2.5.2 |
 | P2 | Fuzz Fresco scene ingest and the GPU ioctl surface; Fresco takes outlines, not fonts | A1 against the shared compositor | medium | §2.5 |
 | P2 | Broker rules for replayed request templates | A3, CSRF | design-time, with §5.4.5 | §2.7 |
