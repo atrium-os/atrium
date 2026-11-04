@@ -111,3 +111,41 @@ fn the_budgeted_recording_is_reproducible() {
     let (a, b) = (explore_with(&html, Some((3, 20))), explore_with(&html, Some((3, 20))));
     assert_eq!(format!("{:?}", a.transitions), format!("{:?}", b.transitions));
 }
+
+/// ★★ A handler that busy-waits on the clock never returns here, because
+/// the converter's clock is FIXED (chase.com's link handler did, and timed
+/// the document out). During exploration the engine's loop limit ends the
+/// probe; the handler gets no second probe, the others are still probed,
+/// and the artifact is untouched.
+#[test]
+fn a_spinning_handler_ends_its_probe_not_the_conversion() {
+    let html = r#"<html><body><a id=s href=/x>spin</a><a id=s2 href=/y>spin2</a><button id=b>b</button><p id=o></p><script>
+      function spin() { var t = Date.now() + 50; while (Date.now() < t) {} }
+      document.getElementById('s').addEventListener('click', spin);
+      document.getElementById('s2').addEventListener('click', spin);
+      document.getElementById('b').addEventListener('click', function () {
+        document.getElementById('o').setAttribute('class', 'on'); });
+    </script></body></html>"#;
+    let t = std::time::Instant::now();
+    let c = explore_with(html, None);
+    assert!(t.elapsed() < std::time::Duration::from_secs(20), "{:?}", t.elapsed());
+    assert_eq!(c.explore_stats.aborted, 1, "{:?}", c.explore_stats);
+    let s = c.coverage.iter().find(|k| k.path == "#s").unwrap();
+    assert!(s.aborted, "{s:?}");
+    let s2 = c.coverage.iter().find(|k| k.path == "#s2").unwrap();
+    assert!(!s2.probed && !s2.represented, "a spinning handler gets no second probe: {s2:?}");
+    assert_eq!(c.transitions.len(), 1, "{:?}", c.transitions);
+    assert_eq!(c.html, plain(html).html);
+}
+
+/// The limit is exploration's alone: a long loop at LOAD still runs to the
+/// end, so what the page builds is unchanged.
+#[test]
+fn the_load_pass_has_no_loop_limit() {
+    let html = r#"<html><body><p id=o></p><script>
+      var n = 0; for (var i = 0; i < 3000000; i++) n++;
+      document.getElementById('o').textContent = 'n=' + n;
+    </script></body></html>"#;
+    let c = explore_with(html, None);
+    assert!(c.html.contains("n=3000000"), "{}", c.html);
+}

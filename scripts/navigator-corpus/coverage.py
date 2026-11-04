@@ -12,7 +12,8 @@ appends: one line per interactive element,
 (flags: n native, e explorable, p probed, c cut by the probe bound, r recorded,
 t truncated, d probed as a delegated target, D a delegating root whose
 delegated probe recorded, x outside the interactive universe, h cut but its
-handlers probed on another element), or `doc  -` for a document with none.
+handlers probed on another element, a a probe on it hit the loop-iteration
+limit), or `doc  -` for a document with none.
 Tables from before 2026-11-05's probe-fidelity change have 13 columns and none
 of d/D/x/h; they classify unchanged.
 
@@ -127,6 +128,8 @@ def classify(r):
         # which then show up as native-only buttons with "no handler".
         if len(r["events"]) >= 20 or (r["tag"] in ("html", "body") and "click" in r["events"]):
             return "other", "delegating root (handlers dispatched internally)"
+        if "a" in fl:
+            return "other", "spinning handler (probe ended by the loop limit)"
         if "e" not in fl:
             kinds = sorted({kind(e) for e in r["events"]})
             return "other", "unsimulated: " + "+".join(kinds)

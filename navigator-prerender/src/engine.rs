@@ -77,6 +77,8 @@ pub struct Interactive {
     pub represented: bool,
     /// The gestures probed on it (click, hover, tap, swipe, key:Enter, …).
     pub gestures: Vec<String>,
+    /// A probe on it hit the loop-iteration limit (a handler that spins).
+    pub aborted: bool,
 }
 
 /// What exploration spent, per document (legacy-web §5.4.5.6a step 2).
@@ -93,6 +95,8 @@ pub struct ExploreStats {
     /// Wall time spent exploring, for choosing the bounds. Report only;
     /// never in an artifact.
     pub micros: u64,
+    /// Probes ended by the loop-iteration limit.
+    pub aborted: u32,
     /// Probes each handler got, in key order (an unbounded run gives the
     /// candidates per handler, which is what the bounds are chosen from).
     pub per_handler: Vec<u32>,

@@ -2270,6 +2270,10 @@ fn run_injected_scripts(ctx: &mut Context, errors: &mut Vec<String>) -> (u32, u3
 ///   probes as the one before (2102 at 4, 3152 at 8, 4397 at 16) while the
 ///   worst document stays at 1.8 s measured.
 const MAX_PROBES: usize = 256;
+/// Loop iterations one call frame may run during a probe (see
+/// `explore_states`). A million is far past any handler in the corpus that
+/// ends, and stops a spin in well under a second.
+const PROBE_LOOP_LIMIT: u64 = 1_000_000;
 /// Probes per distinct handler. See `explore_states` for the budget.
 const PROBES_PER_HANDLER: usize = 8;
 /// Caps on what one transition may carry. A recording is an ANNOTATION on the
@@ -2650,6 +2654,8 @@ thread_local! {
     static PROBE_SELECTORS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
     /// Exploration is running: element wrappers answer `closest`/`matches`.
     static EXPLORING: RefCell<bool> = const { RefCell::new(false) };
+    /// A listener hit the engine's loop-iteration limit during this probe.
+    static LIMIT_HIT: RefCell<bool> = const { RefCell::new(false) };
 }
 
 fn note_selector(s: String) {
@@ -2705,6 +2711,15 @@ fn run_probe(ctx: &mut Context, p: &Probe, parser_nodes: Handle) -> ProbeResult 
     let h = p.target;
     let before = DOM.with(|d| d.borrow().clone());
     let path = before.node_path(h);
+    // PRERENDER_TRACE_PROBES=<file>: append each probe before it runs, so
+    // the one that never returns is the last line (a timed-out child's
+    // stderr is lost).
+    if let Some(f) = std::env::var_os("PRERENDER_TRACE_PROBES") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(f) {
+            let _ = writeln!(f, "probe {} {} root={:?}", path, p.gesture.name(), p.root);
+        }
+    }
     let anchored = h < parser_nodes;
     let probe0 = probe_counters(ctx);
     let (t_fired0, t_now0, t_seq0) = timer_clock(ctx);
@@ -2810,6 +2825,16 @@ fn explore_states(ctx: &mut Context, parser_nodes: Handle, bounds: (usize, usize
     // Close the page network for the whole exploration.
     let saved_net = PAGE_NET.with(|n| n.borrow_mut().take());
     EXPLORING.with(|e| *e.borrow_mut() = true);
+    // ★★ A PROBE MUST BE ABLE TO END. The converter's clock is FIXED, so a
+    // handler that busy-waits (`while (Date.now() < t) {}`) never returns:
+    // chase.com's link handler did, and took the whole document to its
+    // deadline once the probe could reach it through delegation. The load
+    // pass has no such limit (and keeps none, so artifacts are unchanged);
+    // during exploration a loop that runs past PROBE_LOOP_LIMIT iterations
+    // in one call frame raises Boa's UNCATCHABLE runtime-limit error, the
+    // probe ends there, and its handler gets no further probes.
+    let saved_loop_limit = ctx.runtime_limits().loop_iteration_limit();
+    ctx.runtime_limits_mut().set_loop_iteration_limit(PROBE_LOOP_LIMIT);
 
     // ★★ THE BUDGET IS PER HANDLER, NOT FIRST-COME.
     //
@@ -2823,10 +2848,10 @@ fn explore_states(ctx: &mut Context, parser_nodes: Handle, bounds: (usize, usize
     // worst case is bounded whatever the page registers. Delegated
     // candidates join under their own keys as discovery probes find them,
     // and are served from the round that is running.
-    struct KeyQ { cands: std::collections::VecDeque<Probe>, taken: usize }
+    struct KeyQ { cands: std::collections::VecDeque<Probe>, taken: usize, spinning: bool }
     fn enqueue(keys: &mut Vec<KeyQ>, ix: &mut HashMap<u64, usize>, p: Probe) {
         let i = *ix.entry(p.key).or_insert_with(|| {
-            keys.push(KeyQ { cands: Default::default(), taken: 0 });
+            keys.push(KeyQ { cands: Default::default(), taken: 0, spinning: false });
             keys.len() - 1
         });
         keys[i].cands.push_back(p);
@@ -2844,15 +2869,25 @@ fn explore_states(ctx: &mut Context, parser_nodes: Handle, bounds: (usize, usize
         let mut i = 0;
         while i < keys.len() {
             if ran >= total { break 'rounds }
-            if keys[i].taken > round { i += 1; continue }
+            if keys[i].taken > round || keys[i].spinning { i += 1; continue }
             let Some(p) = keys[i].cands.pop_front() else { i += 1; continue };
             if !progressed { stats.rounds += 1; progressed = true }
             keys[i].taken += 1;
+            let ki = i;
             i += 1;
             ran += 1;
+            LIMIT_HIT.with(|h| *h.borrow_mut() = false);
             for d in probe_and_record(ctx, &p, parser_nodes, &mut cov, &mut out,
                                       &direct_set, &mut delegated_seen) {
                 enqueue(&mut keys, &mut key_ix, d);
+            }
+            if LIMIT_HIT.with(|h| *h.borrow()) {
+                stats.aborted += 1;
+                let e = cov.entry(if p.root == Some(Root::Doc) && p.discover.is_some() { DOC_ENTRY } else { p.target }).or_default();
+                e.aborted = true;
+                // The rest of this handler's candidates would spin the same
+                // way: they stay cut, and are not `represented`.
+                keys[ki].spinning = true;
             }
         }
         if !progressed { break }
@@ -2872,7 +2907,7 @@ fn explore_states(ctx: &mut Context, parser_nodes: Handle, bounds: (usize, usize
         for p in &k.cands {
             if p.root.is_some() { continue }
             cut_direct.push(p.target);
-            if k.taken == 0 { unrepresented.insert(p.target); }
+            if k.taken == 0 || k.spinning { unrepresented.insert(p.target); }
         }
     }
     for h in cut_direct {
@@ -2881,6 +2916,7 @@ fn explore_states(ctx: &mut Context, parser_nodes: Handle, bounds: (usize, usize
         }
     }
 
+    ctx.runtime_limits_mut().set_loop_iteration_limit(saved_loop_limit);
     EXPLORING.with(|e| *e.borrow_mut() = false);
     PAGE_NET.with(|n| *n.borrow_mut() = saved_net);
     (out, found, cov.into_values().collect(), stats)
@@ -3123,7 +3159,9 @@ fn el_dispatch(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<
                 // A listener that throws must not take the dispatch, or the
                 // page, with it — a browser reports and continues.
                 DISPATCH.with(|c| c.borrow_mut().1 += 1);
-                let _ = c.call(&node_obj(node, ctx), &[ev.clone()], ctx);
+                if let Err(e) = c.call(&node_obj(node, ctx), &[ev.clone()], ctx) {
+                    if e.to_string().contains("RuntimeLimit") { LIMIT_HIT.with(|h| *h.borrow_mut() = true) }
+                }
             }
         }
     }

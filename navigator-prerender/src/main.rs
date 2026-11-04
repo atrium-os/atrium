@@ -113,16 +113,17 @@ fn report(c: &navigator_prerender::Conversion, fetchd: Option<(u64, u64)>) -> St
     // n native, e explorable, p probed, c cut by the probe bound, r recorded,
     // t truncated, d probed as a delegated target, D a delegating root whose
     // delegated probe recorded, x outside the interactive universe, h cut but
-    // its handlers probed elsewhere. The 14th column lists the gestures probed.
+    // its handlers probed elsewhere, a a probe on it hit the loop limit. The
+    // 14th column lists the gestures probed.
     {
         let s = &c.explore_stats;
         let per: Vec<String> = s.per_handler.iter().map(|n| n.to_string()).collect();
-        let _ = writeln!(o, "U\t{}\t{}\t{}\t{}\t{}\t{}", s.handlers, s.probes, s.cut, s.rounds, s.micros, per.join(","));
+        let _ = writeln!(o, "U\t{}\t{}\t{}\t{}\t{}\t{}\t{}", s.handlers, s.probes, s.cut, s.rounds, s.micros, per.join(","), s.aborted);
     }
     for k in &c.coverage {
         let flags: String = [(k.native, 'n'), (k.explorable, 'e'), (k.probed, 'p'), (k.over_cap, 'c'),
                              (k.recorded, 'r'), (k.truncated, 't'), (k.delegated, 'd'), (k.via, 'D'),
-                             (k.outside, 'x'), (k.represented, 'h')]
+                             (k.outside, 'x'), (k.represented, 'h'), (k.aborted, 'a')]
             .iter().filter(|(on, _)| *on).map(|(_, ch)| *ch).collect();
         let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
         let _ = writeln!(o, "K\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
