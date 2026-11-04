@@ -38,6 +38,7 @@
 #include <machine/resource.h>
 
 #include <sys/sx.h>
+#include <sys/vmem.h>
 #include <sys/sysctl.h>
 #include <sys/taskqueue.h>
 #include <sys/queue.h>
@@ -397,7 +398,7 @@ struct atrium_amd_vm {
 	uint16_t	 vmid;		/* 1..15 */
 	struct atrium_amd_dma_page pdb;	/* page-directory page */
 	struct atrium_amd_dma_page pt[ATRIUM_AMD_VM_NUM_PT]; /* page-table pages */
-	uint64_t	 next_va;	/* bump allocator within this VM */
+	vmem_t		*va_arena;	/* this VM's GPU-VA window (vmem(9)) */
 };
 
 /*

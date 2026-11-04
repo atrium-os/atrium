@@ -624,6 +624,63 @@ test_vm_bind(int fd)
 }
 
 /*
+ * GPU-VA reuse: each VM's window is a vmem arena, so binding and closing a BO
+ * over and over never runs out of VA (a bump pointer did, after one window's
+ * worth of binds). A caller-chosen VA that overlaps a live binding, or is not
+ * page-aligned, is refused.
+ */
+static int
+test_va_reuse(int fd)
+{
+	struct atrium_gpu_bo_alloc a;
+	struct atrium_gpu_vm_bind b;
+	uint32_t h;
+	uint64_t va, first = 0;
+	int vm, i, keep;
+
+	vm = vm_create(fd);
+	if (vm < 0)
+		return (1);
+	/* 10000 4 KiB binds > the 8192-page window. */
+	for (i = 0; i < 10000; i++) {
+		if (bo_alloc(fd, vm, 4096, &h, &va) != 0) {
+			printf("va_reuse FAILED: bind %d ran out of VA\n", i);
+			return (1);
+		}
+		if (i == 0)
+			first = va;
+		close((int)h);
+	}
+	if (bo_alloc(fd, vm, 4096, &h, &va) != 0)
+		return (1);
+	keep = (int)h;
+	memset(&a, 0, sizeof(a));
+	a.size = 4096;
+	if (ioctl(fd, ATRIUM_GPU_IOC_BO_ALLOC, &a) != 0)
+		return (1);
+	memset(&b, 0, sizeof(b));
+	b.vm_fd = vm;
+	b.bo_fd = a.bo_fd;
+	b.va = va;			/* overlaps `keep` */
+	if (ioctl(fd, ATRIUM_GPU_IOC_VM_BIND, &b) == 0 || errno != EEXIST) {
+		printf("va_reuse FAILED: overlapping bind not refused\n");
+		return (1);
+	}
+	b.va = va + 4096 + 16;		/* not page-aligned */
+	if (ioctl(fd, ATRIUM_GPU_IOC_VM_BIND, &b) == 0 || errno != EINVAL) {
+		printf("va_reuse FAILED: misaligned bind not refused\n");
+		return (1);
+	}
+	close((int)a.bo_fd);
+	close(keep);
+	close(vm);
+	printf("va_reuse OK: 10000 bind/close cycles in an 8192-page window "
+	    "(first va 0x%llx), overlap and misaligned binds refused\n",
+	    (unsigned long long)first);
+	return (0);
+}
+
+/*
  * M9e: user-mode queue. The kernel programs the queue (QUEUE_MAP) and hands
  * back the doorbell; userspace mmap()s it and rings it DIRECTLY — no submit
  * ioctl on the hot path. The doorbell page is the (capability-scoped) MMIO the
@@ -2048,6 +2105,7 @@ main(void)
 	rc |= test_irq(fd, vm);
 	rc |= test_syncobj(fd, vm);
 	rc |= test_vm_bind(fd);
+	rc |= test_va_reuse(fd);
 	rc |= test_isolation(fd);
 	rc |= test_umq(fd, vm);
 	rc |= test_cross_queue(fd, vm);

@@ -120,6 +120,10 @@ amd_bo_destroy(struct atrium_amd_bo *bo, struct thread *td)
 			sc->backend->unmap_page(bd->vm,
 			    bd->gpu_va + (uint64_t)i * PAGE_SIZE);
 		vmids[n++] = bd->vm->vmid;
+		/* The PTEs are gone, so the range can go back to the VM's arena
+		 * now (next-fit hands it out again only after a full lap). */
+		vmem_free(bd->vm->va_arena, bd->gpu_va,
+		    (vmem_size_t)bo->npages * PAGE_SIZE);
 	}
 	/* Work already queued under one of those VMs may still be using the
 	 * pages (isolation break 2): note which queues are busy now, before
@@ -376,10 +380,8 @@ amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
     struct file *vm_fp, uint64_t *va)
 {
 	struct atrium_amd_softc *sc = bo->sc;
-	const uint64_t va_limit = ATRIUM_AMD_BO_VA_BASE +
-	    (uint64_t)ATRIUM_AMD_VM_MAX_BO * PAGE_SIZE;
 	const uint64_t span = (uint64_t)bo->npages * PAGE_SIZE;
-	uint64_t addr;
+	vmem_addr_t addr;
 	int i, err;
 
 	if (bo->n_bindings >= ATRIUM_AMD_BO_MAX_BIND)
@@ -390,17 +392,25 @@ amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
 		if (bo->bindings[i].vm == vm)
 			return (EBUSY);
 
-	mtx_lock(&sc->lock);
+	/*
+	 * Reserve the range in the VM's arena. A caller-chosen VA must be
+	 * page-aligned, inside the window and clear of every other binding
+	 * (review §A2.5); otherwise next-fit picks one, reusing freed ranges.
+	 */
 	if (*va != 0) {
-		addr = *va;
-	} else if (vm->next_va + span <= va_limit) {
-		addr = vm->next_va;
-		vm->next_va += span;
-	} else {
-		mtx_unlock(&sc->lock);
+		if ((*va & PAGE_MASK) != 0 || *va + span < *va)
+			return (EINVAL);
+		if (vmem_xalloc(vm->va_arena, span, 0, 0, 0, *va, *va + span,
+		    M_BESTFIT | M_NOWAIT, &addr) != 0)
+			return (EEXIST);	/* overlaps a binding or off-window */
+		if (addr != *va) {
+			vmem_free(vm->va_arena, addr, span);
+			return (EEXIST);
+		}
+	} else if (vmem_alloc(vm->va_arena, span, M_NEXTFIT | M_NOWAIT,
+	    &addr) != 0) {
 		return (ENOSPC);
 	}
-	mtx_unlock(&sc->lock);
 
 	/* One PTE per page — the GPUVM gathers the BO's (possibly scattered) pages
 	 * into a contiguous GPU-VA range. Each VM has its own page tables, so the
@@ -412,6 +422,7 @@ amd_bo_bind(struct atrium_amd_bo *bo, struct atrium_amd_vm *vm,
 			while (i-- > 0)
 				sc->backend->unmap_page(vm,
 				    addr + (uint64_t)i * PAGE_SIZE);
+			vmem_free(vm->va_arena, addr, span);
 			return (err);
 		}
 	}

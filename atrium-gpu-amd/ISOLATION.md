@@ -39,6 +39,17 @@ mechanism in this driver, and records how the five breaks from the
    `EPERM` on `/dev/atrium-gpu0`. They live on `/dev/atrium-gpu0ctl`, root
    0600, which no jail devfs ruleset unhides.
 
+## Address space
+
+Each VM's GPU-VA window is a `vmem(9)` arena. Binding allocates next-fit, so
+a freed range is reused only after a full lap of the window, and a
+caller-chosen VA must be page-aligned and clear of every live binding
+(`EINVAL` / `EEXIST`, review §A2.5). A range goes back to the arena when its
+BO's PTEs are cleared; the pages themselves may still be on the deferred
+list. So in the rare case of a lap completing while old work is in flight,
+the reused VA can only receive writes from that same VM's own earlier work.
+It can never receive another VM's writes.
+
 ## Known limits (not isolation breaks, but worth knowing)
 
 - The device still has only two shared queues (gfx and compute). A client

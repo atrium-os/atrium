@@ -89,6 +89,10 @@ amd_vm_teardown(struct atrium_amd_vm *vm)
 	 * only then can the page tables be freed and the VMID reused.
 	 */
 	amd_hwq_vm_gone(sc, vm->vmid);
+	if (vm->va_arena != NULL) {
+		vmem_destroy(vm->va_arena);	/* every BO bound here is gone */
+		vm->va_arena = NULL;
+	}
 	for (i = 0; i < ATRIUM_AMD_VM_NUM_PT; i++)
 		amd_dma_page_free(&vm->pt[i]);
 	amd_dma_page_free(&vm->pdb);
@@ -139,7 +143,18 @@ amd_vm_setup(struct atrium_amd_softc *sc, struct atrium_amd_vm *vm)
 		    (AMD_VM_PD_INDEX + i) * 8);
 		*pde = (vm->pt[i].gpa & ~0xfffULL) | ATRIUM_AMD_PTE_VALID;
 	}
-	vm->next_va = ATRIUM_AMD_BO_VA_BASE;
+	/*
+	 * The VM's GPU-VA window as a vmem arena, so a freed BO's range is
+	 * reused (a bump pointer ran a long-lived client out of VA). Bind
+	 * allocates next-fit, so a just-freed range is handed out last.
+	 */
+	vm->va_arena = vmem_create("atrium_amd_va", ATRIUM_AMD_BO_VA_BASE,
+	    (vmem_size_t)ATRIUM_AMD_VM_MAX_BO * PAGE_SIZE, PAGE_SIZE, 0,
+	    M_WAITOK);
+	if (vm->va_arena == NULL) {
+		amd_vm_teardown(vm);
+		return (ENOMEM);
+	}
 
 	/* Program this VMID's page-directory base into the device. */
 	mtx_lock(&sc->lock);
