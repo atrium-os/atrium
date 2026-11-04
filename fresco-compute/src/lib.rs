@@ -24,6 +24,7 @@
 //! Draw order matches `fresco_vulkan::HeadlessRenderer`: all rects, then all
 //! paths, then texture batches, then glyph batches, each in list order.
 
+pub mod compose;
 pub mod damage;
 pub mod fuzz;
 #[cfg(feature = "rdna4")]

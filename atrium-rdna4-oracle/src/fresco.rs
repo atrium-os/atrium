@@ -245,3 +245,70 @@ pub fn hostile_corpus(seed: u64, n: usize) -> Vec<Case> {
         .filter_map(|i| hostile(&format!("fresco_hostile_{seed:x}_{i}"), &fresco_compute::fuzz::frame(&mut r)))
         .collect()
 }
+
+/// compose.comp (F4) over a layer list and heap: the target against the
+/// reference. With `guard`, each buffer ends at a page with an unmapped
+/// page after it.
+pub fn compose_case(name: &str, c: &fresco_compute::compose::Compose, heap: &[u32], guard: bool) -> Option<Case> {
+    use fresco_compute::compose::{binding as cb, render};
+    c.validate(c.target_words(), heap.len()).ok()?;
+    let k = fresco_compute::rdna4::Compose::new().ok()?;
+    let [hdr, layers, lut] = c.buffers();
+    let mut init = vec![Vec::new(); cb::COUNT];
+    init[cb::HEADER as usize] = hdr;
+    init[cb::LAYERS as usize] = layers;
+    init[cb::HEAP as usize] = bytes(heap);
+    init[cb::TARGET as usize] = vec![0; c.target_words() * 4];
+    init[cb::LUT as usize] = lut;
+    let pages = |n: usize| (n as u64).next_multiple_of(0x1000).max(0x1000);
+    let mut next = data_va(0);
+    let base: [u64; cb::COUNT] = std::array::from_fn(|b| {
+        let v = next;
+        next += pages(init[b].len()) + if guard { 0x1000 } else { 0 };
+        v
+    });
+    let lead: [u64; cb::COUNT] = std::array::from_fn(|b| if guard { pages(init[b].len()) - init[b].len() as u64 } else { 0 });
+    let va: [u64; cb::COUNT] = std::array::from_fn(|b| base[b] + lead[b]);
+    let mut ib = Blob::compute();
+    k.record(&mut ib, CODE_VA, &va, c, &[]).ok()?;
+    ib.pad(8);
+    let mut code = k.code();
+    let ib_off = (code.len() as u64).next_multiple_of(0x1000);
+    code.resize(ib_off as usize, 0);
+    code.extend(ib.bytes());
+    let size = (code.len() as u64).next_multiple_of(0x1000);
+    let mut buffers = vec![Buffer { name: "code".into(), va: CODE_VA, size, init: code, expect: None, unordered: None }];
+    let target = bytes(&render(c, heap));
+    for (b, init) in init.into_iter().enumerate() {
+        let pad = vec![0u8; lead[b] as usize];
+        let expect = (b as u32 == cb::TARGET).then(|| [&pad[..], &target].concat());
+        let size = pages(init.len());
+        buffers.push(Buffer { name: format!("c0_{b}"), va: base[b], size, init: [pad, init].concat(), expect, unordered: None });
+    }
+    Some(Case { name: name.into(), buffers, ib: ("code".into(), ib_off, ib.dw.len() as u64), ip: "compute" })
+}
+
+/// The compose oracle case: one fixed fuzz layer list (translucent,
+/// clipped and scrolled layers) for the R9700 corpus.
+pub fn compose() -> Option<Case> {
+    let mut r = fresco_compute::fuzz::Rng(0xc0_4e);
+    loop {
+        let (c, heap) = fresco_compute::fuzz::compose_case(&mut r);
+        let n = c.header.layer_count as usize;
+        let ls = &c.layers[..n];
+        if n >= 4 && ls.iter().any(|l| l.opacity > 0.0 && l.opacity < 1.0) && ls.iter().any(|l| l.origin != [l.rect[0], l.rect[1]]) {
+            return compose_case("fresco_compose", &c, &heap, false);
+        }
+    }
+}
+
+/// `n` guarded compose cases from the fuzz corpus.
+pub fn compose_corpus(seed: u64, n: usize) -> Vec<Case> {
+    let mut r = fresco_compute::fuzz::Rng(seed);
+    (0..n)
+        .filter_map(|i| {
+            let (c, heap) = fresco_compute::fuzz::compose_case(&mut r);
+            compose_case(&format!("fresco_compose_{seed:x}_{i}"), &c, &heap, true)
+        })
+        .collect()
+}

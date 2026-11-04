@@ -21,6 +21,7 @@ pub struct Tier2 {
     _cache: ShaderCache,
     bin: (Arc<LoadedShader>, CsMain),
     raster: (Arc<LoadedShader>, CsMain),
+    compose: (Arc<LoadedShader>, CsMain),
     threads: usize,
 }
 
@@ -47,8 +48,9 @@ impl Tier2 {
         });
         let bin = load(&cache, BIN_SPV, "bin")?;
         let raster = load(&cache, RASTER_SPV, "raster")?;
+        let compose = load(&cache, crate::compose::COMPOSE_SPV, "compose")?;
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-        Ok(Self { _cache: cache, bin, raster, threads })
+        Ok(Self { _cache: cache, bin, raster, compose, threads })
     }
 
     /// Like [`Tier2::new`], from `FRESCO_COMPUTE_CACHE` (default
@@ -69,7 +71,7 @@ impl Tier2 {
         use atrium_spv_backend_cranelift::{compile_blob, Target};
         let dir = cache_root.join(format!("v{}", atrium_spv_ir::TIER2_SHADER_ABI_VERSION));
         std::fs::create_dir_all(&dir)?;
-        for (name, spv) in [("bin", BIN_SPV), ("raster", RASTER_SPV)] {
+        for (name, spv) in [("bin", BIN_SPV), ("raster", RASTER_SPV), ("compose", crate::compose::COMPOSE_SPV)] {
             let hash = ShaderCache::hash(spv);
             let blob = dir.join(format!("{hash}.afblob"));
             if blob.exists() {
@@ -119,6 +121,23 @@ impl Tier2 {
     pub unsafe fn render_table(&self, table: &[u64; binding::COUNT], header: &crate::Header) {
         self.dispatch(self.bin.1, table, header.bin_groups(), [BIN_LOCAL, 1, 1]);
         self.dispatch(self.raster.1, table, header.raster_groups(), [RASTER_LOCAL, RASTER_LOCAL, 1]);
+    }
+
+    /// Stack the surfaces in `heap` into `target` by `c`'s layer list.
+    pub fn compose(&self, c: &crate::compose::Compose, heap: &[u32], target: &mut [u32]) -> io::Result<()> {
+        use crate::compose::{binding as cb, COMPOSE_LOCAL};
+        c.validate(target.len(), heap.len()).map_err(err)?;
+        let header = [c.header];
+        let mut table = [0u64; cb::COUNT];
+        table[cb::HEADER as usize] = header.as_ptr() as u64;
+        table[cb::LAYERS as usize] = c.layers.as_ptr() as u64;
+        table[cb::HEAP as usize] = heap.as_ptr() as u64;
+        table[cb::TARGET as usize] = target.as_mut_ptr() as u64;
+        table[cb::LUT as usize] = c.lut.as_ptr() as u64;
+        // SAFETY: the pointers outlive the dispatch, and `validate` checked
+        // the header and every layer's surface against these buffers.
+        unsafe { self.dispatch(self.compose.1, &table, c.groups(), [COMPOSE_LOCAL, COMPOSE_LOCAL, 1]) };
+        Ok(())
     }
 
     unsafe fn dispatch(&self, cs: CsMain, table: &[u64], groups: [u32; 3], local: [u32; 3]) {

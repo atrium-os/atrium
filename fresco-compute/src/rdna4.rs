@@ -90,3 +90,55 @@ impl Rdna4 {
         Ok(())
     }
 }
+
+/// `compose.comp` for RDNA4: the broker's pass that stacks window surfaces
+/// into the scanout buffer ([`crate::compose`]).
+pub struct Compose {
+    pub kernel: Kernel,
+}
+
+impl Compose {
+    pub fn new() -> Result<Self, Error> {
+        let kernel = Kernel::from_spirv(crate::compose::COMPOSE_SPV, &Options::default())?;
+        if kernel.uses_push_constants() {
+            return Err(Error::Binding("compose: unexpected push constants".into()));
+        }
+        Ok(Compose { kernel })
+    }
+
+    /// The code, to upload at a [`CODE_ALIGN`]-aligned address.
+    pub fn code(&self) -> Vec<u8> {
+        self.kernel.code()
+    }
+
+    /// Append the pass to `ib`, over the screen rects `rects` in pixels
+    /// (`[x0, y0, x1, y1)`, widened to whole workgroups), or the whole
+    /// target if `rects` is empty: make earlier writes (the surfaces'
+    /// rasters) visible, compose, wait. `buffers` is each binding's address
+    /// by [`crate::compose::binding`] number.
+    pub fn record(
+        &self,
+        ib: &mut Blob,
+        code_va: u64,
+        buffers: &[u64; crate::compose::binding::COUNT],
+        c: &crate::compose::Compose,
+        rects: &[[u32; 4]],
+    ) -> Result<(), Error> {
+        use crate::compose::COMPOSE_LOCAL as L;
+        let bind: Vec<((u32, u32), u64)> = buffers.iter().enumerate().map(|(b, &va)| ((0, b as u32), va)).collect();
+        let [gx, gy, _] = c.groups();
+        ib.acquire_all();
+        if rects.is_empty() {
+            self.kernel.record_at(ib, code_va, &bind, None, [0, 0, 0], [gx, gy, 1])?;
+        }
+        for r in rects {
+            let (x0, y0) = (r[0] / L, r[1] / L);
+            let (x1, y1) = (r[2].div_ceil(L).min(gx), r[3].div_ceil(L).min(gy));
+            if x1 > x0 && y1 > y0 {
+                self.kernel.record_at(ib, code_va, &bind, None, [x0, y0, 0], [x1 - x0, y1 - y0, 1])?;
+            }
+        }
+        ib.cs_partial_flush();
+        Ok(())
+    }
+}

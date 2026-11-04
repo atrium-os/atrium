@@ -171,3 +171,54 @@ pub fn frame(r: &mut Rng) -> Frame {
     f
 }
 
+
+/// One fuzz compose pass and its heap: surfaces of random sizes and
+/// pixels, layers placed anywhere (partly or wholly off screen, scrolled,
+/// clipped, empty), random opacities including NaN and out of range. The
+/// layer list is trusted in production; this checks the kernel is exact and
+/// in bounds for any list `Compose::validate` accepts.
+pub fn compose_case(r: &mut Rng) -> (compose::Compose, Vec<u32>) {
+    use compose::{Compose, Layer};
+    let w = 1 + r.below(48);
+    let h = 1 + r.below(40);
+    let pitch = w + if r.chance(50) { 0 } else { r.below(5) };
+    let mut heap: Vec<u32> = Vec::new();
+    let mut surfaces = Vec::new();
+    for _ in 0..1 + r.below(5) {
+        let (sw, sh) = (r.below(30), r.below(30));
+        let sp = sw + if r.chance(50) { 0 } else { r.below(4) };
+        let off = heap.len() as u32;
+        heap.extend((0..sp * sh).map(|_| r.next() as u32));
+        surfaces.push([off, sp, sw, sh]);
+    }
+    if heap.is_empty() {
+        heap.push(0);
+    }
+    let mut layers = Vec::new();
+    for _ in 0..r.below(9) {
+        let s = surfaces[r.below(surfaces.len() as u32) as usize];
+        let (x, y) = (r.below(w + 20) as i32 - 10, r.below(h + 20) as i32 - 10);
+        let opacity = match r.below(6) {
+            0 => r.wild(0.0, 1.0),
+            1 | 2 => r.f(0.0, 1.0),
+            _ => 1.0,
+        };
+        let mut l = Layer::at(s, x, y, opacity);
+        if r.chance(40) {
+            // Clip to a random rect, possibly inverted or empty.
+            l.rect = [l.rect[0] + r.below(8) as i32, l.rect[1] + r.below(8) as i32, l.rect[2] - r.below(8) as i32, l.rect[3] - r.below(8) as i32];
+        }
+        if r.chance(30) {
+            // Scrolled: the surface's origin up/left of the rect.
+            l.origin = [l.origin[0] - r.below(10) as i32, l.origin[1] - r.below(10) as i32];
+        }
+        layers.push(l);
+    }
+    let heap_words = if r.chance(80) { heap.len() as u32 } else { r.below(heap.len() as u32 + 1) };
+    let mut c = Compose::new(&layers, w, h, pitch, heap_words);
+    if c.validate(c.target_words(), heap.len()).is_err() {
+        // heap_words cut a surface short: the whole heap, as the broker would.
+        c.header.heap_words = heap.len() as u32;
+    }
+    (c, heap)
+}

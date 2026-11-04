@@ -1,0 +1,106 @@
+#version 450
+// compose: one invocation per screen pixel. Stacks window surfaces (BGRA8
+// sRGB, as raster.comp writes them) into the target from a layer list the
+// window manager decided (threat model §2.5.2, F4). The layer list is
+// trusted broker state; the surface pixels are whatever each window's
+// raster wrote. Opaque layers pass their pixel through; translucent ones
+// blend in linear RGB. src/compose.rs packs these buffers and models the
+// kernel statement for statement.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer ComposeB {
+    uint width;
+    uint height;
+    uint pitch;        // target pitch in pixels
+    uint layer_count;
+    uint heap_words;   // words of heap[] that may be read
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+    vec4 clear;        // linear RGB under every layer
+} C;
+
+// Per layer, 16 words, bottom to top:
+//   0-3   x0, y0, x1, y1 (int): the screen rect it shows in (exclusive end)
+//   4-5   ox, oy (int): the screen position of surface pixel (0, 0)
+//   6-9   surface: first word in heap, pitch, width, height
+//   10    opacity (float bits), 0..1
+//   11-15 zero
+layout(std430, set = 0, binding = 1) readonly buffer LayerB { uint layer[]; };
+layout(std430, set = 0, binding = 2) readonly buffer HeapB { uint heap[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer TargetB { uint target[]; };
+layout(std430, set = 0, binding = 4) readonly buffer LutB { float lut[]; };
+#define ENC 256u
+#define LAYER_WORDS 16u
+
+// The surface word layer `l` shows at (x, y), or ~0 if none.
+uint sample_at(uint l, int x, int y) {
+    uint b = l * LAYER_WORDS;
+    if (x < int(layer[b]) || y < int(layer[b + 1u]) || x >= int(layer[b + 2u]) || y >= int(layer[b + 3u])) {
+        return 0xffffffffu;
+    }
+    int sx = x - int(layer[b + 4u]);
+    int sy = y - int(layer[b + 5u]);
+    if (sx < 0 || sy < 0 || uint(sx) >= layer[b + 8u] || uint(sy) >= layer[b + 9u]) {
+        return 0xffffffffu;
+    }
+    uint i = layer[b + 6u] + uint(sy) * layer[b + 7u] + uint(sx);
+    if (i >= C.heap_words) {
+        return 0xffffffffu;
+    }
+    return i;
+}
+
+// Opacity, clamped with an ordered compare (NaN: 0).
+float opacity(uint l) {
+    float o = uintBitsToFloat(layer[l * LAYER_WORDS + 10u]);
+    return o >= 0.0 ? (o <= 1.0 ? o : 1.0) : 0.0;
+}
+
+uint encode(float v) {
+    uint lo = 0u;
+    for (uint step = 128u; step > 0u; step = step / 2u) {
+        if (lo + step <= 255u && v >= lut[ENC + lo + step - 1u]) {
+            lo = lo + step;
+        }
+    }
+    return lo;
+}
+
+void main() {
+    uvec3 gid = gl_GlobalInvocationID; // whole-vector load: GIR takes no access chain into a builtin
+    uint x = gid.x;
+    uint y = gid.y;
+    if (x >= C.width || y >= C.height) {
+        return;
+    }
+    int ix = int(x);
+    int iy = int(y);
+    uint n = C.layer_count;
+    // The topmost opaque layer here hides everything under it.
+    uint base = 0u;
+    uint top = n;
+    while (top > 0u) {
+        top = top - 1u;
+        if (opacity(top) >= 1.0 && sample_at(top, ix, iy) != 0xffffffffu) {
+            base = top;
+            break;
+        }
+    }
+    vec3 dst = C.clear.rgb;
+    for (uint l = base; l < n; l++) {
+        uint i = sample_at(l, ix, iy);
+        if (i == 0xffffffffu) {
+            continue;
+        }
+        uint w = heap[i];
+        vec3 s = vec3(lut[(w >> 16) & 255u], lut[(w >> 8) & 255u], lut[w & 255u]);
+        float o = opacity(l);
+        dst = dst + o * (s - dst);
+    }
+    uint r = encode(dst.r);
+    uint g = encode(dst.g);
+    uint b = encode(dst.b);
+    target[y * C.pitch + x] = b | (g << 8) | (r << 16) | (255u << 24);
+}
