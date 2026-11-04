@@ -24,7 +24,7 @@ use atrium_gpu::amd::{Bo, Scanout, Syncobj, Vm, BO_VRAM, ENGINE_GFX};
 use fresco_compute::compose::{Compose, Layer, Surface};
 pub use crate::pack::{SceneState, ScreenInput, WindowFrame};
 use fresco_vulkan::{
-    GlyphRunBatch, HeadlessRenderer, PathNode, SceneNode, TextureBatch, UploadRequest,
+    GlyphRunBatch, HeadlessRenderer, PathNode, SceneNode, TextureBatch,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;

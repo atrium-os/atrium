@@ -2,8 +2,9 @@
 //! threat model §2.5.1–2.5.2).
 //!
 //! In split mode frescod never reads a byte a client wrote. Each connection
-//! on the client socket goes to a fresh `fresco-renderer` process (fd 3 the
-//! client, fd 4 a record channel); the broker keeps the window table, the WM
+//! on the client socket goes to a fresh `fresco-renderer` process, whose
+//! stdin is a record channel; the client's socket follows over it in the
+//! first record (`CLIENT`). The broker keeps the window table, the WM
 //! socket, input and the GPU, and takes from a renderer only fixed records
 //! and frames it copies out of slots it created and checks against the size
 //! it decided ([`fresco_split::slot::read`]).
@@ -13,9 +14,8 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -58,14 +58,18 @@ pub struct Broker {
     redraw: Redraw,
     screen: (u32, u32, u32),
     bin: PathBuf,
+    launcher: Option<String>,
     /// The last good frame of every renderer-drawn window, by global id.
     frames: Mutex<HashMap<u32, fresco_compute::Frame>>,
     renderers: Mutex<HashMap<u8, Arc<Renderer>>>,
 }
 
 impl Broker {
-    /// `FRESCOD_SPLIT=1` turns split mode on; `FRESCOD_RENDERER_BIN` names
-    /// the renderer (default: `fresco-renderer` beside frescod).
+    /// `FRESCOD_SPLIT=1` turns split mode on. `FRESCOD_RENDERER_BIN` names
+    /// the renderer (default: `fresco-renderer` beside frescod), and
+    /// `FRESCOD_RENDERER_LAUNCHER`, if set, is a command line that runs it
+    /// confined, with `{client}` replaced by the client id, e.g.
+    /// `portcullis exec --daemon --instance fresco{client} org.atrium.fresco.renderer`.
     pub fn from_env(comp: Arc<Mutex<Compositor>>, redraw: Redraw, screen: (u32, u32, u32)) -> Option<Arc<Broker>> {
         if std::env::var("FRESCOD_SPLIT").ok().as_deref() != Some("1") {
             return None;
@@ -74,12 +78,17 @@ impl Broker {
             let me = std::env::current_exe().unwrap_or_default();
             me.with_file_name("fresco-renderer")
         });
-        eprintln!("frescod: split mode, renderer {}", bin.display());
+        let launcher = std::env::var("FRESCOD_RENDERER_LAUNCHER").ok().filter(|s| !s.trim().is_empty());
+        match &launcher {
+            Some(l) => eprintln!("frescod: split mode, renderer launched by: {l}"),
+            None => eprintln!("frescod: split mode, renderer {} (not confined)", bin.display()),
+        }
         Some(Arc::new(Broker {
             comp,
             redraw,
             screen,
             bin,
+            launcher,
             frames: Mutex::new(HashMap::new()),
             renderers: Mutex::new(HashMap::new()),
         }))
@@ -131,17 +140,22 @@ impl Broker {
 
     fn start(self: Arc<Self>, stream: UnixStream, client_id: u8, uid: Option<u32>, subs: EventSubs) -> io::Result<()> {
         let (ours, theirs) = Chan::pair()?;
-        let (cfd, rfd) = (stream.as_raw_fd(), theirs.as_raw_fd());
-        let mut cmd = Command::new(&self.bin);
-        cmd.env("FRESCO_SCREEN", format!("{},{},{}", self.screen.0, self.screen.1, self.screen.2))
-            .stdin(Stdio::null());
-        // SAFETY: only async-signal-safe calls between fork and exec.
-        unsafe {
-            cmd.pre_exec(move || place_fds(&[(cfd, 3), (rfd, 4)]));
-        }
+        let mut cmd = match &self.launcher {
+            Some(l) => {
+                let l = l.replace("{client}", &client_id.to_string());
+                let mut words = l.split_whitespace();
+                let mut c = Command::new(words.next().unwrap_or_default());
+                c.args(words);
+                c
+            }
+            None => Command::new(&self.bin),
+        };
+        // stdout carries nothing (a launcher's chatter must not reach the
+        // channel); stderr is inherited so a failing renderer is heard.
+        cmd.stdin(Stdio::from(theirs.into_fd())).stdout(Stdio::null());
         let child = cmd.spawn()?;
+        ours.send(&Msg::Client { width: self.screen.0, height: self.screen.1, refresh_mhz: self.screen.2 }, &[stream.as_raw_fd()])?;
         drop(stream);
-        drop(theirs);
         log::info!("frescod: client {client_id} (uid {uid:?}) -> renderer pid {}", child.id());
 
         let r = Arc::new(Renderer { client_id, chan: ours, wins: Mutex::new(HashMap::new()), child: Mutex::new(child) });
@@ -258,8 +272,20 @@ impl Broker {
     /// The renderer is gone or misbehaved: end it and everything it had.
     fn reap(&self, r: &Arc<Renderer>, subs: &EventSubs) {
         {
+            // End the channel first: the renderer exits on end-of-file, and a
+            // launcher (portcullis exec) then tears its jail down. Killing the
+            // launcher outright would leave the jail behind; the kill is
+            // only the backstop for one that does not go.
+            r.chan.shutdown();
             let mut c = r.child.lock().unwrap();
-            let _ = c.kill();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while matches!(c.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if matches!(c.try_wait(), Ok(None)) {
+                log::warn!("frescod: client {}: renderer did not exit; killing it", r.client_id);
+                let _ = c.kill();
+            }
             let _ = c.wait();
         }
         subs.lock().unwrap().retain(|s| s.wm || s.client_id != r.client_id);
@@ -306,25 +332,4 @@ fn wm_role(r: Role) -> WmRole {
         Role::Background => WmRole::Background,
         Role::Chrome => WmRole::Chrome,
     }
-}
-
-/// In the child, between fork and exec: put each `(fd, at)` at `at`, with
-/// close-on-exec off. Moves every fd above the targets first so that one
-/// target cannot overwrite another source.
-fn place_fds(map: &[(RawFd, RawFd)]) -> io::Result<()> {
-    let mut high = [0; 2];
-    for (i, &(fd, _)) in map.iter().enumerate() {
-        // SAFETY: async-signal-safe fcntl on an fd of ours.
-        high[i] = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10) };
-        if high[i] < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    for (i, &(_, at)) in map.iter().enumerate() {
-        // SAFETY: as above; dup2 leaves close-on-exec clear on `at`.
-        if unsafe { libc::dup2(high[i], at) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
 }

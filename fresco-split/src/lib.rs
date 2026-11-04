@@ -80,6 +80,12 @@ pub enum Msg {
     FrameReady { window: u32, slot: u32, seq: u32 },
 
     // ── broker → renderer ─────────────────────────────────────────
+    /// The first record a renderer gets, with the client's socket as its
+    /// one fd, and the display mode clients may ask for. The only record
+    /// with window 0. A renderer under `portcullis exec` holds only
+    /// stdin/stdout/stderr, so the channel is its stdin and the client
+    /// arrives this way.
+    Client { width: u32, height: u32, refresh_mhz: u32 },
     /// Two frame slots of `bytes` each for `window` follow as fds.
     Slots { window: u32, bytes: u32 },
     /// The broker is done with `slot`; the renderer may reuse it.
@@ -103,6 +109,7 @@ mod kind {
     pub const WINDOW_DESTROY: u32 = 2;
     pub const WINDOW_TITLE: u32 = 3;
     pub const FRAME_READY: u32 = 4;
+    pub const CLIENT: u32 = 0x100;
     pub const SLOTS: u32 = 0x101;
     pub const FRAME_DONE: u32 = 0x102;
     pub const GEOMETRY: u32 = 0x103;
@@ -166,6 +173,7 @@ impl Msg {
             | Msg::Focus { window, .. }
             | Msg::CloseRequested { window }
             | Msg::Input { window, .. } => window,
+            Msg::Client { .. } => 0,
         }
     }
 
@@ -196,6 +204,13 @@ impl Msg {
                 let mut r = Rec::new(FRAME_READY, *window);
                 r.put(2, *slot);
                 r.put(3, *seq);
+                r
+            }
+            Msg::Client { width, height, refresh_mhz } => {
+                let mut r = Rec::new(CLIENT, 0);
+                r.put(2, *width);
+                r.put(3, *height);
+                r.put(4, *refresh_mhz);
                 r
             }
             Msg::Slots { window, bytes } => {
@@ -262,7 +277,7 @@ impl Msg {
         let b: [u8; MSG_BYTES] = bytes.try_into().map_err(|_| Refused("record size"))?;
         let r = Rec(b);
         let (k, window) = (r.get(0), r.get(1));
-        if window == 0 || window > u16::MAX as u32 {
+        if (k == CLIENT) != (window == 0) || window > u16::MAX as u32 {
             return Err(Refused("window id out of range"));
         }
         // Words 2.. this kind uses, and whether it carries a title.
@@ -272,7 +287,7 @@ impl Msg {
             WINDOW_DESTROY | CLOSE => (0, false),
             FRAME_READY | GEOMETRY | MOTION | SCROLL => (2, false),
             SLOTS | FRAME_DONE | FOCUS => (1, false),
-            KEY => (3, false),
+            KEY | CLIENT => (3, false),
             BUTTON => (5, false),
             _ => return Err(Refused("unknown kind")),
         };
@@ -314,6 +329,7 @@ impl Msg {
             WINDOW_DESTROY => Msg::WindowDestroy { window },
             WINDOW_TITLE => Msg::WindowTitle { window, title },
             FRAME_READY => Msg::FrameReady { window, slot: slot(r.get(2))?, seq: r.get(3) },
+            CLIENT => Msg::Client { width: dim(r.get(2))?, height: dim(r.get(3))?, refresh_mhz: r.get(4) },
             SLOTS => Msg::Slots { window, bytes: r.get(2) },
             FRAME_DONE => Msg::FrameDone { window, slot: slot(r.get(2))? },
             GEOMETRY => Msg::Geometry { window, width: dim(r.get(2))?, height: dim(r.get(3))? },

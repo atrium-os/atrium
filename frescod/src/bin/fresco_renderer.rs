@@ -8,15 +8,17 @@
 //! client's own state: no GPU, no display, no input devices, no other
 //! client. It speaks to the broker only in fixed records (`fresco_split`):
 //!
-//! - fd 3 is the client's socket, served with the same reader/writer and
-//!   scene server frescod runs in-process;
-//! - fd 4 is the broker channel. The renderer declares the client's
-//!   windows, the broker answers with two frame slots per window and the
-//!   size it decided; the renderer packs each window's scene into a free
-//!   slot and says `FRAME_READY`.
+//! - stdin is the broker channel. Its first record, `CLIENT`, brings the
+//!   client's socket and the display mode; the renderer serves the client
+//!   with the same reader/writer and scene server frescod runs in-process.
+//!   (Under `portcullis exec` a jail gets only its three stdio fds, so
+//!   everything else arrives over the channel.)
+//! - The renderer declares the client's windows; the broker answers with
+//!   two frame slots per window and the size it decided; the renderer packs
+//!   each window's scene into a free slot and says `FRAME_READY`.
 //!
-//! `FRESCO_SCREEN=W,H,REFRESH_MHZ` gives the display mode clients may ask
-//! for. The renderer exits when either the client or the broker goes.
+//! It reads no arguments or environment beyond `RUST_LOG`, writes only
+//! stderr, and exits when either the client or the broker goes.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -46,8 +48,7 @@ mod socket_server;
 
 /// The client's id inside this renderer: it is the only one.
 const CLIENT: u8 = 1;
-const CLIENT_FD: i32 = 3;
-const BROKER_FD: i32 = 4;
+const BROKER_FD: i32 = 0;
 
 /// One of the client's windows, as the broker knows it.
 #[derive(Default)]
@@ -71,13 +72,17 @@ struct State {
 
 fn main() {
     let _ = env_logger::try_init();
-    let (sw, sh, refresh) = screen();
-
-    // SAFETY: frescod passed these two fds and nothing else owns them.
-    let (client, broker) = unsafe {
-        (UnixStream::from_raw_fd(CLIENT_FD), Chan::from_fd(OwnedFd::from_raw_fd(BROKER_FD)))
+    // SAFETY: stdin is the broker channel; nothing else here owns it.
+    let broker = Arc::new(Chan::from_fd(unsafe { OwnedFd::from_raw_fd(BROKER_FD) }));
+    let (client, (sw, sh, refresh)) = match broker.recv() {
+        Ok(Recv::Msg(Msg::Client { width, height, refresh_mhz }, fds)) if fds.len() == 1 => {
+            (UnixStream::from(fds.into_iter().next().unwrap()), (width, height, refresh_mhz))
+        }
+        _ => {
+            log::warn!("fresco-renderer: the first record was not CLIENT with one fd");
+            std::process::exit(1);
+        }
     };
-    let broker = Arc::new(broker);
 
     let cas = Arc::new(Mutex::new(CasStore::new()));
     let scene = Arc::new(Mutex::new(SceneGraph::new()));
@@ -132,18 +137,6 @@ fn main() {
         }
         declare(&broker, &state, &comp, (sw, sh));
         draw(&broker, &state, &frontend, &scene_state, tex_gen);
-    }
-}
-
-fn screen() -> (u32, u32, u32) {
-    let v: Vec<u32> = std::env::var("FRESCO_SCREEN")
-        .unwrap_or_default()
-        .split(',')
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    match v[..] {
-        [w, h, r] if w > 0 && h > 0 => (w, h, r),
-        _ => (1280, 720, 0),
     }
 }
 

@@ -11,6 +11,7 @@ fn samples() -> Vec<Msg> {
         Msg::WindowDestroy { window: 3 },
         Msg::WindowTitle { window: 9, title: "x".repeat(64) },
         Msg::FrameReady { window: 1, slot: 1, seq: 77 },
+        Msg::Client { width: 1920, height: 1080, refresh_mhz: 60000 },
         Msg::Slots { window: 1, bytes: slot::DEFAULT_SLOT_BYTES },
         Msg::FrameDone { window: 1, slot: 0 },
         Msg::Geometry { window: 2, width: 1920, height: 1080 },

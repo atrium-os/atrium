@@ -45,6 +45,15 @@ impl Chan {
         self.0
     }
 
+    /// End both directions: the other side reads end-of-file, and a
+    /// thread blocked in [`Chan::recv`] here returns `Eof`.
+    pub fn shutdown(&self) {
+        // SAFETY: shutdown on our own socket.
+        unsafe {
+            libc::shutdown(self.0.as_raw_fd(), libc::SHUT_RDWR);
+        }
+    }
+
     pub fn try_clone(&self) -> io::Result<Chan> {
         Ok(Chan(self.0.try_clone()?))
     }

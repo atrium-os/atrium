@@ -39,13 +39,23 @@ Before this change, frescod's event fan-out sent every event to every connection
 
 ### F4b. The process split
 
-Working, not yet jailed (atrium, this commit). `FRESCOD_SPLIT=1` hands every connection on `fresco.sock` to its own `fresco-renderer` (fd 3 the client, fd 4 the record channel); the WM socket stays in the broker. Verified in the amd64 VM: headless on Tier-2, and on gpusim with the GPU renderer (screenshot `frescod-f4b-split-gpu.png`), with `atrium-surfaces-demo`'s three windows drawn by a renderer process. A renderer that exits takes its client's connection and windows with it.
+Done, renderer jailed (atrium a46ec90 and the commit after it). `FRESCOD_SPLIT=1` hands every connection on `fresco.sock` to its own `fresco-renderer`; the WM socket stays in the broker. The renderer's stdin is the record channel, and the client's socket arrives over it in the first record (`CLIENT`), because a jail from `portcullis exec` gets only its three stdio fds. `FRESCOD_RENDERER_LAUNCHER` runs it confined, e.g. `portcullis exec --user <unprivileged> --instance fresco{client} org.atrium.fresco.renderer` (a signed bundle with no capabilities).
 
+Verified in the amd64 VM with `atrium-surfaces-demo`:
+- Unconfined: headless on Tier-2, and on gpusim with the GPU renderer (screenshot `frescod-f4b-split-gpu.png`).
+- Jailed: the renderer ran in its own jail as an unprivileged user, and drew all three windows (`frescod-f4b-jailed-renderer.png`). A probe bundle in the same jail configuration saw only its own tree, a /dev of null, zero, random, urandom, stdio and fd, no /etc, no GPU, display or HID node, and no network (connections to the host and to loopback refused).
+- When the client quits, or frescod is killed, the renderer exits and its jail and mounts are gone.
+
+How it works:
 - Records and fds go over `fresco_split::chan` (SOCK_SEQPACKET; a record of the wrong size, a truncated one, or one with too many fds is refused).
 - Slots are memfds the broker creates sealed against shrinking and growing, so a renderer cannot truncate one under the broker's mapping; a renderer refuses slots that are not sealed.
 - The broker sends `GEOMETRY` whenever the WM's size for a window differs from the last one it sent, and accepts only frames of that size. A frame drawn at the old size is dropped and the renderer draws again.
-- Window 0 events do not reach renderers yet (F4c). A client drawing on window 0 draws only in its renderer's own window 0, which the broker does not show.
-- Still to do: run the renderer under `portcullis exec` with no filesystem, network or GPU node.
+- Retiring a renderer closes its channel first, so `portcullis exec` can tear its jail down; a kill after 5 s is only the backstop.
+
+Known gaps:
+- Fonts: the renderer's server-side text looks in `/usr/local/share/fonts`, which a jail does not have. The bundle must carry the fonts (not done yet).
+- Window 0 events do not reach renderers (F4c). A client drawing on window 0 draws only in its renderer's own window 0, which the broker does not show.
+- `FRESCOD_SPLIT` is off by default, and the Vulkan backend does not take pre-packed frames.
 
 Plan as written:
 
