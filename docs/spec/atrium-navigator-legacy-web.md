@@ -752,7 +752,8 @@ handler of its own that does something is handled by a delegating root. So some 
 these 2,048 buttons are uncovered interactions that this method cannot attribute.
 
 **What it says to build, in order.** These replace the earlier assumption that case 1
-leads.
+leads. *Items 1 and 2 are built and re-measured in §5.4.5.6b, which also says what
+comes next: generalising a transition across elements that share a handler.*
 1. **Make the probe faithful before making it clever.** Dispatch the event kinds pages
    use (pointer, mouse, key and focus, with real `MouseEvent`/`KeyboardEvent` fields), and
    dispatch at the *target* through delegating roots: probe each native control and link
@@ -780,6 +781,169 @@ leads.
   and so did a 19–179 KB URL a page asked to fetch (tripadvisor, walgreens, old.reddit).
   A child that had exited also turned into a protocol error instead of a timeout
   (theverge, corriere). Those five documents were converted again with the fixed relay.
+
+#### 5.4.5.6b Re-measured after items 1 and 2: gestures, delegation, a per-handler budget (2026-11-05)
+
+Items 1 and 2 of "what it says to build" above, built and measured with the same
+instrument. **Covered handler elements rose from 298 to 324 (17.9% → 19.4%), and
+probes now reach 3,858 delegated targets, 339 of which recorded a transition.**
+What decides the next step is case 3. It is now entirely elements whose handler *was*
+probed, on a sibling: 775. The recording does not yet carry what was learned there
+over to them.
+
+**What changed in the recorder** (`navigator-prerender`, commits c57631b0, 37c1de60,
+4e653a6e, c4bbf2ee).
+- *Gestures, not event names.* A probe performs what a reader does, as the sequence a
+  browser delivers, with real fields (`button`, `clientX`, `key`, `touches`, …). It
+  records the gesture as the transition's `event`:
+  - `click`: pointer and mouse down/up, then click. This also reaches handlers that
+    listen only for down or up.
+  - `dblclick`, `hover`, `drag`, `tap`, `swipe`.
+  - `key:Enter`, on non-text elements only. On a text field, keys are §5.4.5.2 input.
+  - `focus`.
+  - `change` on checkbox, radio and select. The box is checked first, and that
+    state change is not counted as the page's effect.
+  - `toggle` on an opened `<details>`.
+- *Load and error handlers* are never probed. They are now outside both denominators
+  (376 elements), in both the before and the after column.
+- *Delegation.*
+  - A probe on an element with element children is a discovery probe. So is a probe at
+    `<body>` for document and window listeners.
+  - It records the selectors the handler tests (`closest`, `matches`,
+    `classList.contains`), then probes the descendants that match.
+  - If the handler tested nothing observable, it probes the interactive descendants.
+  - `closest` and `matches` are answered only while exploring. The load pass never had
+    them, so adding them there would change artifacts.
+- *Budget.* Candidates are grouped by handler source, and native or bound functions by
+  object. They are served round-robin: no handler gets a second probe before every
+  handler has had a first. The bounds are 64 probes per handler and 256 per document.
+- *A probe that spins ends itself.* Found by this measurement: chase.com timed out at
+  180 s once delegation reached a link handler that busy-waits on `Date.now()`. The
+  converter's clock is fixed, so that loop never ends. While exploring, Boa's loop limit
+  (1M iterations per call frame) ends the probe, and that handler gets no further
+  probes. 3 probes in the corpora hit it. The load pass has no limit.
+
+**How the bounds were chosen.**
+- *Data.* An unbounded run of both corpora. `scripts/navigator-corpus/budget.py`
+  replays any pair of bounds from it.
+  - 122 documents explore.
+  - 943 distinct handlers: median 1 per document, p90 22, max 85 (walgreens).
+  - 45,640 candidates.
+  - The costliest probe is 14.6 ms.
+- *256 per document* is 3× the largest handler count, so every handler in every
+  document gets its first probe.
+- *Per handler, 8 was tried first and was wrong.*
+  - Covered handler elements fell from 298 to 178. Pages whose many elements share one
+    handler (NASA, walgreens) dropped from up to 64 probes to 8.
+  - Round-robin already gives every handler its turn. The per-handler bound only has to
+    stop one handler absorbing the document's total, and it must not be shallower than
+    the cap it replaced.
+  - So it is 64.
+- *Cost at 64/256.*
+  - 7,422 probes, 29 s over both corpora.
+  - The worst document is 8.3 s (bbcgoodfood). The replay estimated 3.7 s; delegated
+    probes on that page cost more than its average.
+  - Nothing timed out.
+
+**The numbers.** Handler elements, with load/error-only elements excluded. The
+"before" column is the §5.4.5.6a tables, reclassified by today's `coverage.py`. Only
+that exclusion changes them, which is why it reads 1,669 rather than 2,045.
+
+| | batch 1 before → after | batch 2 before → after | **overall before → after** |
+|---|---|---|---|
+| elements with a handler | 1,191 | 478 | **1,669** |
+| **covered** | 200 → 214 | 98 → 110 | **298 (17.9%) → 324 (19.4%)** |
+| 1 server-fed | 30 → 30 | 1 → 9 | **31 → 39** |
+| 2 free-form input | 161 → 13 | 14 → 6 | **175 → 19** |
+| 3 large state (budget) | 443 → 583 | 141 → 192 | **584 → 775**, all with their handler probed elsewhere |
+| 4 time-driven | 4 → 4 | 1 → 2 | **5 → 6** |
+| other | 353 → 347 | 223 → 159 | **576 → 506** |
+
+Over all 5,813 interactive elements (handlers plus native controls), covered went from
+298 to 351 (5.1% → 6.0%), and native-only from 4,032 to 3,983.
+
+- **Inside the universe:** 786 native controls were probed as delegated targets and
+  127 recorded.
+- **Outside it:** delegated targets with no handler that are not controls (`<li>`,
+  `<a>`, spans): 3,072 probed, 212 recorded, in 50 documents.
+- **Document and window listeners:** found in 85 documents. 12 recorded through
+  `<body>` discovery.
+
+Gestures probed, in elements: click 3,297, key:Enter 2,176, tap 607, hover 421, drag
+365, focus 216, swipe 209.
+
+**What moved, element by element.** Same 6,185 elements in both runs.
+- **Free-form → 3, 145 elements:** walgreens' keydown/keyup handlers. They sit on listing
+  controls, not text fields, so they are probed as `key:Enter` now. Walgreens hits the
+  per-document bound, so they show up as budget.
+- **Other → 3, 75 elements:** hover, focus and touch handlers, now explorable and cut by
+  the bound.
+- **Native-only → covered, 27 elements:** buttons reached through delegation.
+- **Native-only → server-fed, 22 elements.**
+- **Other → covered, 17 elements;** **3 → covered, 9 elements.**
+- **Covered → not covered, 5 elements:** 3 walgreens elements cut under a handler probed
+  elsewhere, 1 ikea now classified server-fed, and 1 walgreens element that recorded
+  nothing.
+
+Newly covered, by document: doc13 11, yahoo.jp 7, El País 7, doc24 6, The Hindu 4.
+
+**Case by case, what it says.**
+1. **Server-fed: 31 → 39, and delegation did not uncover a hidden population.** The new
+   ones are mostly the Guardian: 26 elements whose hover and focus probes ping
+   `ophan.theguardian.com`. That is analytics, not data: its refused requests rise from
+   989 to 2,889 with exploration on. arXiv's 14 are unchanged. **Case 1 still waits.**
+2. **Free-form: 175 → 19.** Most of the old count was key-only handlers on non-text
+   elements, which a single Enter now probes. What is left is 11 handlers that react
+   only to typing events, 4 forms and 4 text fields (112 more forms have no handler at
+   all). §5.4.5.2 is smaller than 5.4.5.6a measured.
+3. **Large state: 775, and every one is "represented."** Its handler ran on a sibling,
+   and no transition names it. Where they are:
+   - doc11 252 and doc10 167: spec `<dfn>`s;
+   - walgreens 164;
+   - theverge 104;
+   - ynet 88.
+
+   Probing deeper buys little: these are near-identical elements. **What converts them
+   is generalisation.** One handler's transition, learned on a sibling, would be
+   recorded as a template over the elements sharing that handler, with the per-element
+   differences (which panel, which id) found by differential probing as in §5.4.5.1.
+   That is the next build. It is verified like everything else, by replaying one
+   unprobed sibling through the page's own code (§5.4.5.5).
+4. **Time-driven: 6.** Negligible, as before.
+
+**Other, 506:**
+- 276 were probed and changed nothing observable;
+- 184 are `<img>` with only `dragstart`, cancelled to stop image dragging (OCW). That is
+  not a gesture;
+- 15 delegating roots whose handlers reached no target that changed anything;
+- 13 `mouseout`-only handlers: un-hover, with no hover to undo.
+
+**Safety and regressions, checked:**
+- **Artifacts:** with exploration on and off, all 123 recordings are identical apart
+  from `transitions` and `interactive_found`.
+- **Pipeline:** normalize + `nsg-flag` outputs, drop reports and flag reports are
+  byte-identical between the arms, on both corpora.
+- **Baseline binary:** the pre-change converter (9ae14a09), run now, writes
+  byte-identical non-exploring recordings (0 of 123 differ).
+- **The previous run:** against §5.4.5.6a's recordings, 10 documents' normalized output
+  differs. That is drift between runs: the pages were fetched live a day apart, and
+  doc13 is the known flaky one. The converter code agrees with itself (above).
+
+**Limits, stated.**
+- Batch 1 is still today's pages, fetched live.
+- The DOM models bubbling, not capture. A listener that only sees non-bubbling events
+  through capture (focus on an ancestor) is not delegated.
+- "Represented" is not "recorded": the backend can replay only named triggers.
+- The worst exploration cost (8.3 s) was measured on this machine, not under a jail.
+
+Raw tables are outside the repo, at `~/src/navigator-corpus/coverage-2026-11-05-r2/`:
+- per element: `batch{1,2}-cov.tsv`, with `#stats` and `#fetch` lines;
+- `analysis.txt`, and `analysis-before-reclassified.txt`;
+- `moves.txt`;
+- the unbounded run and `budget-grid.txt`;
+- the two superseded runs (8 per handler, and before the loop limit);
+- the pipeline outputs;
+- the binaries' hashes.
 
 ### 5.5 WebAssembly is a better cage, not a translation
 
