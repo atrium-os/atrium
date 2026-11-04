@@ -3892,6 +3892,26 @@ mod tests {
     }
 
     #[test]
+    fn a_minmax_auto_row_in_an_auto_height_grid_grows_to_its_content() {
+        // Tildes: `grid-template-rows: repeat(3, minmax(22px, auto))` on a
+        // grid with no height. 22px is only the BASE; with indefinite free
+        // space a track grows to its growth limit, here its content. Left at
+        // the base, a title that wrapped to two lines ran under the metadata
+        // row below it.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 100px; grid-template-rows: minmax(22px, auto) minmax(22px, auto) }
+            .a { height: 50px; background-color: #ff0000 } .b { height: 10px; background-color: #00ff00 }</style>
+            <div class="g"><div class="a"></div><div class="b"></div></div>"#);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(0, 50, 100, 10)], "row 1 holds the 50 px item");
+        // Control: a row with less content keeps its 22 px floor.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 100px; grid-template-rows: minmax(22px, auto) minmax(22px, auto) }
+            .a { height: 5px; background-color: #ff0000 } .b { height: 10px; background-color: #00ff00 }</style>
+            <div class="g"><div class="a"></div><div class="b"></div></div>"#);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(0, 22, 100, 10)]);
+    }
+
+    #[test]
     fn a_negative_grid_line_counts_from_the_end() {
         // `1 / -1` is the full-width idiom: every column, whatever the count.
         let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
@@ -4283,7 +4303,14 @@ fn size_tracks(tracks: &[navigator_style::values::Track], avail: Option<U>, gap:
 
     let mut sizes: Vec<U> = tracks.iter().enumerate().map(|(i, t)| base(t, i)).collect();
     let limits: Vec<U> = tracks.iter().enumerate().map(|(i, t)| limit(t, i).max(sizes[i])).collect();
-    let Some(a) = avail else { return sizes };
+    // ★ With INDEFINITE free space (an auto-height grid's rows) every track
+    // with a finite growth limit grows to it (§12.5: the free space is
+    // infinite). Returning the bases left Tildes's `minmax(22px, auto)` rows
+    // at 22 px, and a title wrapped to two lines ran under the row below.
+    let Some(a) = avail else {
+        for (i, t) in tracks.iter().enumerate() { if flex_of(t).is_none() { sizes[i] = limits[i] } }
+        return sizes;
+    };
     let gaps = gap * (tracks.len() as U).saturating_sub(1);
 
     // §12.5 maximize tracks: grow bases toward their growth limits, equally,
