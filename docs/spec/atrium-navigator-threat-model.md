@@ -201,7 +201,7 @@ details and the numbers.
   exceeding that ceiling. As defence in depth, the converter still lowers its own
   **hard** `RLIMIT_CPU` (deadline + 5 s) and, on FreeBSD, `RLIMIT_AS`
   (`PRERENDER_MEM_MB`, default 4096) before parsing a byte. It reads them back and
-  refuses on a mismatch. A per-conversion total byte budget is still open.
+  refuses on a mismatch. The per-conversion total byte budget is built (below).
   **The rlimit half, verified on FreeBSD (in the jail):**
   - `procstat -l` on the jailed `prerender` (uid `navtest`) shows hard and soft
     `cputime` 45 s (deadline 40 + 5) and `vmemoryuse` 1 048 576 KB
@@ -223,6 +223,32 @@ details and the numbers.
   - memfed tightens and loosens the pool members, clamped at the 4 GiB ceiling. The
     loosening needed a fix: `SetRctl` had been stacking rules.
   - The CPU limit is a backstop behind the wall-clock deadline, which fires first.
+- **Per-conversion fetched-bytes budget, built 2026-11-05.**
+  - *Where.* The budget is enforced in the driver's fetch relay
+    (`FetchBudget`, navigator-prerender `fetch.rs`, used by `convert_in_child`). That
+    is the trusted side of the jail: the converter only asks, so a compromised
+    converter cannot spend past it.
+  - *What counts.* Every byte pulled from upstream, delivered or not.
+  - *When it is spent.* Each later request gets an `err` frame without reaching
+    upstream. The response that crosses the limit is pulled (fetchd already bounds it
+    to 8 MiB) and refused, not delivered.
+  - *Bound.* The converter receives at most the budget. Upstream is asked for at most
+    the budget plus one response.
+  - *Reporting.* The batch report prints the relayed-bytes distribution and names
+    each document the budget refused, with bytes pulled, the limit, the number of
+    requests refused and the first refused URL.
+  - *Default: 128 MiB* (`PRERENDER_FETCH_BUDGET` overrides it, in bytes). Chosen from
+    the relayed bytes of both corpora's 123 conversions, 2026-11-05: p50 1.5 MiB, p90
+    8.4 MiB, p99 26.7 MiB, max 75.6 MiB (theverge, 295 requests). It admits every
+    conversion measured, with 1.7x headroom over the largest; 64 MiB would have
+    refused theverge.
+  - *Checked on theverge.* The default admits it (75.6 MiB). At 32 MiB the report
+    reads "fetch budget exhausted: 33577647 bytes pulled of a 33554432-byte limit;
+    112 request(s) refused". The fetchd per-response limit is unchanged.
+  - *Tests.* Unit tests: delivered up to the limit, the crossing response refused,
+    upstream not asked afterwards, errors cost nothing. End to end through the driver
+    with a fake fetchd (`tests/confine.rs`): five 100 KB scripts against 250 KB
+    deliver two, and upstream sees three requests.
     It was not tripped on its own.
 
 ### 2.3 Normalize and render — the document worker
@@ -657,7 +683,7 @@ These belong in the model because they are *wins*, not because they need work:
 | P1 ✔ built | `navigatord` refuses to start unconfined outside test builds | A1 against the worker | trivial | §2.3 |
 | P1 | Decide where images decode: per-document jail, memory-safe decoders, never in Fresco | A1 via decoders | design and medium code | §2.4 |
 | P1 | Per-user dedup domain by default; reproduce-to-share | A5 poisoning | design now, code with sharing | §2.6 |
-| P2 ✔ rctl built and verified on FreeBSD; byte budget open | `rctl` memory/CPU limits on converter and worker jails; per-conversion byte budget | A6 | small | §2.2 |
+| P2 ✔ rctl built and verified on FreeBSD; ✔ byte budget built (128 MiB per conversion, in the relay) | `rctl` memory/CPU limits on converter and worker jails; per-conversion byte budget | A6 | small | §2.2 |
 | **P0 (graphics)** | Fix the five GPU driver isolation breaks and pass the attestation gate (F1) | everything in §2.5 rests on it | medium–large | §2.5.4 |
 | P1 | Split frescod: jailed compositor with **no GPU fd** writes a shared scene buffer; the broker runs only our `bin`/`raster` kernels; secure-input path | A1 against the shared compositor and the driver | medium | §2.5.1, conditions F2–F5 in §2.5.4 |
 | P2 | One jailed renderer per window, one GPU VM per window, fixed `compose` kernel; input routed by layer list (§2.5.2) | cross-window exposure | medium | §2.5.2 |

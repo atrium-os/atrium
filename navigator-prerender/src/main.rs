@@ -273,6 +273,8 @@ fn main() {
     let (mut with_js, mut js_ok, mut js_fail, mut mutated) = (0usize, 0usize, 0usize, 0usize);
     let (mut ext_total, mut ext_ok, mut ext_fail) = (0usize, 0usize, 0usize);
     let mut timed_out_names: Vec<String> = vec![];
+    let mut budget_refusals: Vec<String> = vec![];
+    let mut pulled: Vec<u64> = vec![];
     let deadline = std::env::var("PRERENDER_DEADLINE").ok().and_then(|v| v.parse().ok())
         .map(std::time::Duration::from_secs).unwrap_or(DEADLINE);
     let mut mod_retries = 0u32;
@@ -337,7 +339,12 @@ fn main() {
         let name = f.file_name().unwrap().to_string_lossy().to_string();
         let b = base.get(&name).cloned().unwrap_or_default();
         let c = match convert_in_child(&exe, f, &b, net, deadline, &driver) {
-            Ok(c) => { walls.push(c.wall_ms); c }
+            Ok(c) => {
+                walls.push(c.wall_ms);
+                if net { pulled.push(c.fetch_pulled) }
+                if let Some(r) = &c.fetch_budget_refusal { budget_refusals.push(format!("{name}  ({r})")) }
+                c
+            }
             Err(why) => {
                 // ★ NAMED, not just counted. Four documents produced no recording
                 // in one run and the count alone could not say which — the answer
@@ -474,6 +481,19 @@ fn main() {
         // recovered by diffing the manifest against the recordings.
         println!("  TIMED OUT / crashed {}  (child killed at {deadline:?}; PRERENDER_DEADLINE=<secs> to change)", timed_out_names.len());
         for n in &timed_out_names { println!("      {n}"); }
+    }
+    if !pulled.is_empty() {
+        let mut p = pulled.clone();
+        p.sort();
+        let q = |x: f64| p[((p.len() as f64 - 1.0) * x).round() as usize];
+        println!("  fetched through the relay per conversion (bytes): p50 {}  p90 {}  p99 {}  max {}  (budget {})",
+            q(0.5), q(0.9), q(0.99), p[p.len() - 1], driver.fetch_budget);
+    }
+    if !budget_refusals.is_empty() {
+        // ★ Named, with the reason: a budget refusal changes what the page
+        // could load, so the conversion is not comparable to an unbounded one.
+        println!("  FETCH BUDGET refused requests in {} documents:", budget_refusals.len());
+        for n in &budget_refusals { println!("      {n}"); }
     }
     println!("  with inline script {with_js}");
     println!("  scripts all ran    {js_ok}");
@@ -683,6 +703,9 @@ struct Driver {
     emit_dir: Option<PathBuf>,
     blob_dir: Option<PathBuf>,
     mem_mb: u64,
+    /// Total bytes one conversion may pull through the relay
+    /// (`PRERENDER_FETCH_BUDGET`, bytes; default FetchBudget::DEFAULT).
+    fetch_budget: u64,
 }
 
 impl Driver {
@@ -703,6 +726,8 @@ impl Driver {
             emit_dir: std::env::var_os("PRERENDER_EMIT_DIR").map(PathBuf::from),
             blob_dir: std::env::var_os("PRERENDER_BLOB_DIR").map(PathBuf::from),
             mem_mb: std::env::var("PRERENDER_MEM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(4096),
+            fetch_budget: std::env::var("PRERENDER_FETCH_BUDGET").ok().and_then(|v| v.parse().ok())
+                .unwrap_or(navigator_prerender::fetch::FetchBudget::DEFAULT),
         }
     }
 
@@ -731,15 +756,15 @@ enum Upstream {
 }
 
 impl Upstream {
-    fn frame(&mut self, url: &str) -> Vec<u8> {
+    fn reply(&mut self, url: &str) -> navigator_prerender::fetch::Reply {
         use navigator_prerender::fetch::Reply;
         match self {
-            Upstream::Fetchd(f) => f.exchange(url).unwrap_or_else(Reply::Err).to_frame(),
+            Upstream::Fetchd(f) => f.exchange(url).unwrap_or_else(Reply::Err),
             Upstream::Curl(h) => match h.get_bytes(url) {
-                Ok(b) => Reply::Ok { status: 200, rest: format!("0 {} {url}", b.len()), body: b }.to_frame(),
-                Err(e) => Reply::Err(e).to_frame(),
+                Ok(b) => Reply::Ok { status: 200, rest: format!("0 {} {url}", b.len()), body: b },
+                Err(e) => Reply::Err(e),
             },
-            Upstream::None => Reply::Err("no network".into()).to_frame(),
+            Upstream::None => Reply::Err("no network".into()),
         }
     }
 }
@@ -787,6 +812,9 @@ fn convert_in_child(
 
     let (fetchd, blob_dir, stdin_d, emit) = (d.fetchd.clone(), d.blob_dir.clone(), stdin.clone(), d.emit_dir.is_some());
     let fetch_instance = instance.clone();
+    let budget_limit = d.fetch_budget;
+    let budget = Arc::new(Mutex::new(navigator_prerender::fetch::FetchBudget::new(budget_limit)));
+    let budget_d = budget.clone();
     let drive_t = std::thread::spawn(move || -> Result<serve::Outcome, String> {
         {
             let mut g = stdin_d.lock().unwrap();
@@ -806,7 +834,11 @@ fn convert_in_child(
             (true, None) => Upstream::Curl(HttpFetcher::new(std::env::temp_dir().join("prerender-relaycache"))),
         };
         let mut out = std::io::BufReader::new(stdout);
-        let r = serve::drive(&mut out, &stdin_d, &mut |u| up.frame(u), &mut |addr, bytes| {
+        // ★ The per-conversion byte budget is applied HERE, in the relay,
+        // where the converter cannot reach it.
+        let r = serve::drive(&mut out, &stdin_d, &mut |u| {
+            budget_d.lock().unwrap().admit(u, |u| up.reply(u)).to_frame()
+        }, &mut |addr, bytes| {
             let (Some(dir), Some(hex)) = (&blob_dir, addr.strip_prefix("blake3:")) else { return };
             let _ = fs::create_dir_all(dir);
             let p = dir.join(hex);
@@ -873,6 +905,11 @@ fn convert_in_child(
     }
     let mut c = parse_child(&o.report).ok_or_else(|| crash_reason(start.elapsed().as_secs_f64(), &status.to_string(), &stderr))?;
     c.wall_ms = start.elapsed().as_secs_f64() * 1000.0;
+    {
+        let b = budget.lock().unwrap();
+        c.fetch_pulled = b.pulled;
+        c.fetch_budget_refusal = b.reason();
+    }
     Ok(c)
 }
 
@@ -978,6 +1015,10 @@ mod tests {
 
 /// What the parent needs back from a child run.
 pub struct Child {
+    /// Bytes the relay pulled for this conversion, and the budget's refusal
+    /// if it refused anything (threat model §2.2, P2).
+    pub fetch_pulled: u64,
+    pub fetch_budget_refusal: Option<String>,
     /// Wall time of the whole conversion as the DRIVER saw it: spawn,
     /// launcher, jail, convert, teardown. What a jail costs shows up here.
     pub wall_ms: f64,
@@ -1038,7 +1079,7 @@ fn parse_child(s: &str) -> Option<Child> {
         doc_writes: 0, doc_writes_refused: 0,
         injected_scripts_run: 0, injected_scripts_refused: 0,
         text_before: 0, text_after: 0,
-        removals_refused: 0, wall_ms: 0.0,
+        removals_refused: 0, wall_ms: 0.0, fetch_pulled: 0, fetch_budget_refusal: None,
         interactive_found: 0, transitions: 0, transitions_anchored: 0,
         transitions_attr_only: 0, transitions_truncated: 0,
         origin_refusal: String::new(), violations: vec![],

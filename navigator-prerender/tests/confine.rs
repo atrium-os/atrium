@@ -24,7 +24,8 @@ fn driver(dir: &std::path::Path, env: &[(&str, &str)]) -> (i32, String, String) 
     let mut c = Command::new(EXE);
     c.arg(dir);
     for k in ["PRERENDER_LAUNCHER", "PRERENDER_FETCHD", "PRERENDER_REQUIRE_CONFINEMENT", "PRERENDER_NET",
-              "PRERENDER_EMIT_DIR", "PRERENDER_BLOB_DIR", "PRERENDER_DEADLINE"] { c.env_remove(k); }
+              "PRERENDER_EMIT_DIR", "PRERENDER_BLOB_DIR", "PRERENDER_DEADLINE", "PRERENDER_FETCH_BUDGET",
+              "PRERENDER_EXPLORE", "PRERENDER_COVERAGE"] { c.env_remove(k); }
     for (k, v) in env { c.env(k, v); }
     let o = c.output().unwrap();
     (o.status.code().unwrap_or(-1), String::from_utf8_lossy(&o.stdout).into(), String::from_utf8_lossy(&o.stderr).into())
@@ -140,4 +141,38 @@ fn an_inherited_hard_limit_below_the_ask_is_kept_not_refused() {
     let out = String::from_utf8_lossy(&o.stdout);
     assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
     assert!(!out.contains("TIMED OUT / crashed"), "{out}");
+}
+
+/// ★ The per-conversion byte budget (threat model §2.2, P2) is enforced by
+/// the DRIVER's relay, not the converter: five 100 KB scripts against a
+/// 250 KB budget deliver two, refuse the third after pulling it, and refuse
+/// the last two without asking upstream at all. The report names the
+/// document and the reason.
+#[test]
+fn the_relay_enforces_a_per_conversion_byte_budget() {
+    let d = scratch("budget");
+    let log = d.join("upstream.log");
+    let fake = d.join("fetchd.sh");
+    std::fs::write(&fake, format!(
+        "while read u; do echo \"$u\" >> {log}; printf 'ok 200 0 100000 %s\\n' \"$u\"; \
+         head -c 100000 /dev/zero | tr '\\0' ' '; done\n", log = log.display())).unwrap();
+    let docs = d.join("docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    let mut page = String::from("<!doctype html><title>t</title><p>x</p>");
+    for i in 0..5 { page.push_str(&format!("<script src=\"https://a.example/s{i}.js\"></script>")); }
+    std::fs::write(docs.join("doc.html"), page).unwrap();
+    let fetchd = format!("sh {}", fake.display());
+    let (code, out, err) = driver(&docs, &[("PRERENDER_NET", "1"), ("PRERENDER_FETCHD", &fetchd),
+                                          ("PRERENDER_FETCH_BUDGET", "250000")]);
+    assert_eq!(code, 0, "{out}{err}");
+    assert!(out.contains("FETCH BUDGET refused requests in 1 documents"), "{out}");
+    assert!(out.contains("doc.html  (fetch budget exhausted: 300000 bytes pulled of a 250000-byte limit; \
+                          3 request(s) refused, first https://a.example/s2.js)"), "{out}");
+    let asked = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(asked.lines().count(), 3, "upstream is not asked once the budget is spent: {asked}");
+    // Unbounded by a large budget, nothing is refused.
+    let _ = std::fs::remove_file(&log);
+    let (_, out, _) = driver(&docs, &[("PRERENDER_NET", "1"), ("PRERENDER_FETCHD", &fetchd)]);
+    assert!(!out.contains("FETCH BUDGET"), "{out}");
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 5);
 }

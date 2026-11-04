@@ -297,6 +297,74 @@ impl Drop for FetchdFetcher {
     }
 }
 
+/// ★ A TOTAL fetched-bytes budget for ONE conversion (threat model §2.2, P2).
+///
+/// fetchd bounds each response (8 MiB), and nothing bounded their sum: a page
+/// naming hundreds of subresources could pull gigabytes through one
+/// conversion, a disk-fill through the relay cache and a bandwidth cost the
+/// reader never chose. This is enforced in the DRIVER's relay, on the
+/// trusted side of the jail: the converter only asks, so it cannot spend
+/// past it however it is compromised.
+///
+/// Every byte pulled from upstream counts, delivered or not. Once the budget
+/// is spent, a request is refused WITHOUT reaching upstream; the response
+/// that crosses it is pulled (fetchd already bounds it to 8 MiB) but refused
+/// rather than delivered. So the converter receives at most `limit` bytes,
+/// and upstream is asked for at most `limit` plus one response.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FetchBudget {
+    pub limit: u64,
+    /// Bytes pulled from upstream, delivered or not.
+    pub pulled: u64,
+    /// Bytes handed to the converter.
+    pub delivered: u64,
+    /// Requests refused by the budget.
+    pub refused: u32,
+    /// The first URL refused, for the report.
+    pub first_refused: Option<String>,
+}
+
+impl FetchBudget {
+    /// 128 MiB, chosen from what the corpus actually pulls (both corpora,
+    /// 123 conversions, relayed bytes from the 2026-11-05 run): p50 1.5 MiB,
+    /// p90 8.4 MiB, p99 26.7 MiB, max 75.6 MiB (theverge, 295 requests). It
+    /// admits every conversion measured with 1.7x headroom over the largest
+    /// (64 MiB would have refused theverge), and bounds the worst case at
+    /// 128 MiB delivered, 136 MiB pulled, where nothing bounded it before.
+    pub const DEFAULT: u64 = 128 * 1024 * 1024;
+
+    pub fn new(limit: u64) -> Self {
+        FetchBudget { limit, pulled: 0, delivered: 0, refused: 0, first_refused: None }
+    }
+
+    /// Answer one relayed request, asking `upstream` only while the budget
+    /// lasts.
+    pub fn admit(&mut self, url: &str, upstream: impl FnOnce(&str) -> Reply) -> Reply {
+        if self.pulled >= self.limit { return self.refuse(url) }
+        let r = upstream(url);
+        if let Reply::Ok { body, .. } = &r {
+            self.pulled += body.len() as u64;
+            if self.pulled > self.limit { return self.refuse(url) }
+            self.delivered += body.len() as u64;
+        }
+        r
+    }
+
+    fn refuse(&mut self, url: &str) -> Reply {
+        self.refused += 1;
+        if self.first_refused.is_none() { self.first_refused = Some(url.to_string()) }
+        Reply::Err(format!("refused: per-conversion fetch budget exhausted ({} bytes pulled, limit {})",
+                           self.pulled, self.limit))
+    }
+
+    /// The report's refusal line, when the budget refused anything.
+    pub fn reason(&self) -> Option<String> {
+        (self.refused > 0).then(|| format!(
+            "fetch budget exhausted: {} bytes pulled of a {}-byte limit; {} request(s) refused, first {}",
+            self.pulled, self.limit, self.refused, self.first_refused.as_deref().unwrap_or("?")))
+    }
+}
+
 /// One fetcher process shared by the script loader and the page network.
 #[derive(Clone)]
 pub struct SharedFetcher(pub std::rc::Rc<std::cell::RefCell<FetchdFetcher>>);
@@ -368,6 +436,34 @@ mod fetchd_tests {
         let took = t.elapsed();
         assert!(took < std::time::Duration::from_secs(10), "drop waited {took:?}");
         assert!(took >= std::time::Duration::from_secs(4), "it must wait the grace first: {took:?}");
+    }
+
+    fn ok(n: usize) -> Reply { Reply::Ok { status: 200, rest: format!("0 {n} u"), body: vec![b'x'; n] } }
+
+    #[test]
+    fn the_budget_delivers_up_to_its_limit_then_refuses_without_asking() {
+        let mut b = FetchBudget::new(250);
+        assert!(matches!(b.admit("a", |_| ok(100)), Reply::Ok { .. }));
+        assert!(matches!(b.admit("b", |_| ok(100)), Reply::Ok { .. }));
+        // Crosses the limit: pulled, refused, not delivered.
+        let r = b.admit("c", |_| ok(100));
+        assert!(matches!(&r, Reply::Err(e) if e.contains("fetch budget exhausted")), "{r:?}");
+        assert_eq!((b.pulled, b.delivered), (300, 200));
+        // Spent: refused without reaching upstream at all.
+        let r = b.admit("d", |_| panic!("upstream must not be asked once the budget is spent"));
+        assert!(matches!(r, Reply::Err(_)));
+        assert_eq!(b.refused, 2);
+        assert_eq!(b.first_refused.as_deref(), Some("c"));
+        assert!(b.reason().unwrap().contains("2 request(s) refused, first c"));
+    }
+
+    #[test]
+    fn errors_cost_nothing_and_an_unspent_budget_reports_nothing() {
+        let mut b = FetchBudget::new(10);
+        assert!(matches!(b.admit("a", |_| Reply::Err("nope".into())), Reply::Err(_)));
+        assert!(matches!(b.admit("b", |_| ok(10)), Reply::Ok { .. }), "exactly the limit is within it");
+        assert_eq!(b.refused, 0);
+        assert!(b.reason().is_none());
     }
 
     #[test]
