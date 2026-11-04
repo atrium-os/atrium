@@ -1759,6 +1759,29 @@ impl<'a> Cx<'a> {
             let hgt = self.measure(it.h, cw, None, (Some(cw), None));
             rmin[it.row.0] = rmin[it.row.0].max(hgt);
         }
+        // ★ Then items spanning several rows, fewest rows first (Grid
+        // §12.5): what their rows and the gaps between them fall short of
+        // the item's height is shared among the INTRINSIC rows it spans. Left
+        // out, BBC Arabic's `span 2` cards gave their auto rows nothing and
+        // the next row of cards drew over them.
+        let intrinsic_track = |t: &Track| !matches!(t, Track::Len(_) | Track::Pct(_))
+            && !matches!(t, Track::MinMax(a, b) if matches!(**a, Track::Len(_) | Track::Pct(_)) && matches!(**b, Track::Len(_) | Track::Pct(_)));
+        let mut spanning: Vec<&GItem> = items.iter().filter(|it| it.row.1 > 1).collect();
+        spanning.sort_by_key(|it| it.row.1);
+        for it in spanning {
+            let rs = it.row.0..(it.row.0 + it.row.1).min(rowtracks.len());
+            let grow: Vec<usize> = rs.clone().filter(|i| intrinsic_track(&rowtracks[*i])).collect();
+            if grow.is_empty() { continue }
+            let cw: U = (it.col.0..it.col.0 + it.col.1).map(|i| cols.get(i).copied().unwrap_or(0)).sum::<U>() + cgap * (it.col.1 as U - 1);
+            let hgt = self.measure(it.h, cw, None, (Some(cw), None));
+            let have: U = rmin[rs.clone()].iter().sum::<U>() + rgap * (rs.len() as U - 1);
+            if hgt > have {
+                let short = hgt - have;
+                for (j, i) in grow.iter().enumerate() {
+                    rmin[*i] += short / grow.len() as U + if j + 1 == grow.len() { short % grow.len() as U } else { 0 };
+                }
+            }
+        }
         let rows = size_tracks(&rowtracks, cb_h, rgap, &rmin, &rmin);
         // Place.
         let pos = |sizes: &[U], gap: U, i: usize| -> U { sizes[..i.min(sizes.len())].iter().sum::<U>() + gap * i as U };
@@ -3780,6 +3803,30 @@ mod tests {
             .a { height: 10px; background-color: #ff0000 } .b { background-color: #00ff00 }</style>
             <div class="g"><div class="a"></div><div class="b"></div></div>"#);
         assert_eq!(boxes(&o, 0x00ff00ff), vec![(0, 10, 100, 90)]);
+    }
+
+    #[test]
+    fn an_item_spanning_auto_rows_gives_them_its_height() {
+        // BBC Arabic: each first-row card has `grid-row: span 2`. Only
+        // one-row items fed the row sizes, so both auto rows came out 0, the
+        // cards 16 px (the gap), and the next row drew over them. A spanning
+        // item's size goes to the intrinsic rows it covers (Grid §12.5).
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 200px; grid-template-columns: 100px 100px }
+            .a { grid-row-start: span 2; height: 100px; background-color: #ff0000 }
+            .b { height: 10px; background-color: #00ff00 }
+            .after { height: 5px; background-color: #0000ff }</style>
+            <div class="g"><div class="a"></div><div class="b"></div><div class="b"></div></div><div class="after"></div>"#);
+        // Rows of 10 + 10 fall 80 short; the shortfall is shared, 50 + 50.
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(100, 0, 100, 10), (100, 50, 100, 10)]);
+        assert_eq!(boxes(&o, 0x0000ffff), vec![(0, 100, 792, 5)]);
+        // Control: rows that already hold it are not grown.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 200px; grid-template-columns: 100px 100px }
+            .a { grid-row-start: span 2; height: 20px; background-color: #ff0000 }
+            .b { height: 30px; background-color: #00ff00 }</style>
+            <div class="g"><div class="a"></div><div class="b"></div><div class="b"></div></div>"#);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(100, 0, 100, 30), (100, 30, 100, 30)]);
     }
 
     #[test]
