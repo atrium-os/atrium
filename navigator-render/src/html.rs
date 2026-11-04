@@ -2271,6 +2271,29 @@ impl<'a> Cx<'a> {
                 _ => specified_h.unwrap_or_else(|| self.measure(it.h, iw, None, (Some(iw), None)) - mt - mb),
             };
             let ih = clamp_by(ih, "min-height", "max-height", ah);
+            // ★ A replaced item whose HEIGHT is settled — stretched in the
+            // block axis alone, or a height that resolves against the area —
+            // takes its auto width from that height through its ratio (Grid
+            // §6.2, csswg #5713): a 50×50 image with `align-self: stretch`
+            // in a 100 px area is 100 wide, not its natural 50, and a 200×200
+            // one at `height: 100%` is 100 wide, not 200.
+            // So does any box with an `aspect-ratio`, whose ratio is the
+            // BORDER box's here (the profile is border-box, CSS Sizing 4 §2).
+            let ratio = self.natural(it.h).and_then(|(_, n)| n.ratio);
+            let settled_h = (it.align == "stretch" && !(at || ab)) || specified_h.is_some();
+            let box_ratio = match cs.map(|cs| cs.get("aspect-ratio")) { Some(V::Num(r)) if *r > 0.0 && ratio.is_none() => Some(*r), _ => None };
+            let iw = match (ratio, cs) {
+                (None, Some(cs)) if box_ratio.is_some() && settled_h && it.justify != "stretch" && matches!(cs.get("width"), V::Kw(_)) =>
+                    clamp_by(u(ih as f64 / PX as f64 * box_ratio.unwrap_or(1.0)), "min-width", "max-width", aw),
+                (Some((rw, rh)), Some(cs)) if settled_h && it.justify != "stretch" && matches!(cs.get("width"), V::Kw(_)) => {
+                    let px = |p: &str| len(cs.get(p), aw).unwrap_or(0);
+                    let b = |side: &str| if kw(cs, &format!("border-{side}-style")) == "none" { 0 } else { px(&format!("border-{side}-width")) };
+                    let (fh_, fv_) = (px("padding-left") + px("padding-right") + b("left") + b("right"), px("padding-top") + px("padding-bottom") + b("top") + b("bottom"));
+                    let w = ((ih - fv_).max(0) as i128 * rw as i128 / rh.max(1) as i128) as U + fh_;
+                    clamp_by(w, "min-width", "max-width", aw)
+                }
+                _ => iw,
+            };
             // Offsets of the margin box; `block` adds the start margins.
             let (fw, fh) = (aw - ml - mr - iw, ah - mt - mb - ih);
             // ★ Auto margins take POSITIVE free space only (Grid §11.2):
@@ -3895,6 +3918,28 @@ mod tests {
             img { background-color: #00ff00; justify-self: stretch; align-self: start }</style>
             <div class="g"><img src="a.png" width="50" height="50"></div>"#);
         assert_eq!(boxes(&o, 0x00ff00ff).first().map(|r| (r.2, r.3)), Some((100, 100)));
+    }
+
+    /// ★ A grid item whose HEIGHT is settled — stretched in the block axis
+    /// alone, or given as a height that resolves against its area — takes
+    /// its auto width from it through its ratio: an image's, or an
+    /// `aspect-ratio` (WPT replaced-alignment-with-aspect-ratio-009,
+    /// grid-in-table-cell-with-img). Sizes are headless Chrome's.
+    #[test]
+    fn a_settled_height_gives_a_grid_item_its_ratio_width() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; grid-template-columns: 100px; grid-template-rows: 100px; width: 100px; height: 100px }
+            .s { background-color: #00ff00; justify-self: start; align-self: stretch }
+            .p { background-color: #0000ff; justify-self: start; align-self: start; height: 100% }
+            .r { background-color: #ff0000; justify-self: start; align-self: start; height: 50px; aspect-ratio: 1 }</style>
+            <div class="g"><img class="s" src="a.png" width="50" height="50"></div>
+            <div class="g"><img class="p" src="b.png" width="200" height="200"></div>
+            <div class="g"><div class="r"></div></div>"#);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let wh = |c: u32| boxes(&o, c).first().map(|r| (r.2, r.3));
+        assert_eq!(wh(0x00ff00ff), Some((100, 100)), "stretched height, width through the ratio");
+        assert_eq!(wh(0x0000ffff), Some((100, 100)), "height: 100% of the area, not the natural 200 wide");
+        assert_eq!(wh(0xff0000ff), Some((50, 50)), "aspect-ratio from a definite height");
     }
 
     /// ★ `align-content: center | flex-end` are UNSAFE (Flexbox §8.4): lines
