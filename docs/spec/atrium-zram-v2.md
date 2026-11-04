@@ -608,6 +608,29 @@ own backing store proves unworkable. Otherwise the leaf-module design stays. It
 needs no fork of `vm_pageout` or `swap_pager`, a bug in it can't corrupt the VM,
 and it survives upstream merges.
 
+**Measuring it natively (prepared 2026-11-04).** Our VM runs under TCG, so its
+absolute times are meaningless. `atrium-zram/bench/kvm/` measures on any
+Linux x86_64 box with `/dev/kvm` (the R9700 machine), leaving the host OS
+alone. `bundle.sh` packs everything into one script, `zram-kvm-bench.sh`, which:
+
+1. downloads a FreeBSD 16-CURRENT amd64 BASIC-CLOUDINIT image and the
+   `src.txz` of the same build (checksums checked), and boots the image under
+   KVM with a NoCloud seed for ssh;
+2. in the guest, applies the swap-free patch (§4.0) to that source, builds
+   and installs a GENERIC-NODEBUG kernel (no WITNESS, unlike our ATRIUM VM
+   runs), and builds `atrium_zram.ko` and the fill workload;
+3. for zstd and LZ4: 1× and 4× `dd` throughput, then the 1.9 GB checksummed
+   fill with a dtrace `profile-997` kernel-stack profile, `timing_stats` and
+   `bench`;
+4. classifies every kernel sample by the first layer it names, leaf outward
+   (`classify.awk`: zram including the kernel zstd it calls, swap_pager,
+   GEOM, VM, other), and prints the §6 number: the swap + GEOM share of
+   zram + swap + GEOM CPU, against the 25 % threshold.
+
+The guest and the patched kernel are stock FreeBSD plus §4.0, not the full
+Atrium kernel; the §6 question is about `swap_pager` and GEOM, which Atrium
+does not change apart from §4.0.
+
 ## 7. Measuring in the VM (the real numbers)
 
 Build memprobe natively in the VM (`cargo build --release`). The default `zstd`

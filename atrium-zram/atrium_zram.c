@@ -660,7 +660,7 @@ zram_io_done(struct bio *cbp)
 }
 
 static int
-zram_io_start(struct bio *parent, int cmd, uint64_t blk, char *data,
+zram_io_start(struct bio *parent, int cmd, uint64_t blk, void *data,
     struct zram_io *io)
 {
 	struct bio *cbp;
@@ -683,7 +683,7 @@ zram_io_start(struct bio *parent, int cmd, uint64_t blk, char *data,
 
 /* Read a written-back page. */
 static int
-zram_bk_read(struct bio *parent, char *dst, uint64_t blk, uint16_t len, bool lz4)
+zram_bk_read(struct bio *parent, void *dst, uint64_t blk, uint16_t len, bool lz4)
 {
 	struct zram_io *io;
 	int err;
@@ -707,7 +707,7 @@ zram_bk_read(struct bio *parent, char *dst, uint64_t blk, uint16_t len, bool lz4
 
 /* The pool refused this page: write it straight to disk, uncompressed. */
 static int
-zram_bk_write_through(struct bio *parent, struct zram_slot *s, char *page)
+zram_bk_write_through(struct bio *parent, struct zram_slot *s, void *page)
 {
 	struct zram_io *io;
 	struct mtx *lk = zram_slot_lock(s);
@@ -1206,6 +1206,13 @@ zram_bench_sysctl(SYSCTL_HANDLER_ARGS)
 	sbuf_new_for_sysctl(&sb, NULL, 512, req);
 	sbuf_printf(&sb, "%d pages sampled", n);
 	for (k = 0; k < (int)nitems(cfg) && n > 0; k++) {
+		/*
+		 * Warm up: a zstd context sizes its workspace on first use at a
+		 * level, which must not be charged to that level's timing.
+		 */
+		if (cfg[k].codec == ZRAM_ZSTD)
+			(void)ZSTD_compressCCtx(bc->cctx, out, sizeof(bc->comp), pages,
+			    ZRAM_PAGE, cfg[k].level);
 		sz = cns = dns = raw = 0;
 		for (i = 0; i < n; i++) {
 			const char *pg = pages + (size_t)i * ZRAM_PAGE;
