@@ -173,7 +173,10 @@ pub fn emit_dispatch(b: &mut Blob, d: &Dispatch) {
         | (0xf0 << compute_pgm_rsrc1::FLOAT_MODE_SHIFT)
         | (1 << compute_pgm_rsrc1::MEM_ORDERED_SHIFT);
     let rsrc2 = ((d.user_sgprs.len() as u32) << compute_pgm_rsrc2::USER_SGPR_SHIFT)
-        | (0 << compute_pgm_rsrc2::TIDIG_COMP_CNT_SHIFT) // local id in v0
+        // Local id packed in v0 (X 9:0, Y 19:10, Z 29:20). TIDIG_COMP_CNT = 2
+        // makes the SPI write all three; at 0, Y and Z read as 0 (R9700,
+        // atrium13: an 8x8 workgroup wrote only its first row).
+        | (2 << compute_pgm_rsrc2::TIDIG_COMP_CNT_SHIFT)
         // Workgroup ids: X in TTMP9 always; TGID_Y/Z_EN make the CP load
         // TTMP7 = {Z, Y} too (RDNA4 ISA guide §3.5.3.4).
         | compute_pgm_rsrc2::TGID_X_EN_MASK
