@@ -124,17 +124,57 @@ struct Loaded {
     missing: Vec<String>,
 }
 
+/// ★ WPT serves `.xht` as XHTML; the lane has no XHTML mode (a converter
+/// gap), so for the oracle the two XHTML spellings HTML parses differently
+/// are rewritten. `<![CDATA[ … ]]>` inside <style> is plain text — parsed
+/// as HTML the markers corrupt the first rule, and a reference's only rule
+/// vanished. And `<div/>` is an EMPTY element — parsed as HTML it opens a
+/// div that never closes, so 17 flexbox tests nested every following
+/// container inside it, 27 deep, and compared a document nobody wrote.
+/// Void elements keep their spelling: `<br></br>` is two breaks in HTML.
+fn xhtml_as_html(src: &str) -> String {
+    const VOID: [&str; 14] = ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"];
+    let src = src.replace("<![CDATA[", "").replace("]]>", "");
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src.as_str();
+    while let Some(i) = rest.find('<') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let name_len = rest[1..].find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == ':')).unwrap_or(rest.len() - 1);
+        let Some(end) = rest.find('>') else { break };
+        let tag = &rest[..=end];
+        let name = &rest[1..1 + name_len];
+        if name_len > 0 && tag.ends_with("/>") && !VOID.contains(&name.to_ascii_lowercase().as_str()) {
+            out.push_str(tag[..tag.len() - 2].trim_end());
+            out.push_str(&format!("></{name}>"));
+        } else {
+            out.push_str(tag);
+        }
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::xhtml_as_html;
+    #[test]
+    fn xhtml_empty_elements_close_and_void_ones_keep_their_spelling() {
+        let x = r#"<style><![CDATA[ p { color: red } ]]></style><div class="flexbox"><div class="a"/><div class="b"/></div><br/><img src="x.png"/>"#;
+        assert_eq!(xhtml_as_html(x), r#"<style> p { color: red } </style><div class="flexbox"><div class="a"></div><div class="b"></div></div><br/><img src="x.png"/>"#);
+        // As HTML parses it: both items are children of the container.
+        let dom = navigator_dom::parse(&xhtml_as_html(x));
+        let fb = dom.by_tag_anywhere("div")[0];
+        assert_eq!(dom.element_children(fb).len(), 2);
+    }
+}
+
 /// A document and everything it references, as a recording would carry it.
 fn load(root: &Path, file: &Path) -> Option<Loaded> {
     let mut html = std::fs::read_to_string(file).ok()?;
     let mut missing: Vec<String> = vec![];
-    // ★ WPT serves `.xht` as XHTML, where `<![CDATA[ … ]]>` inside <style> is
-    // plain text; parsed as HTML the markers corrupt the first rule, and a
-    // reference's only rule vanished. The lane has no XHTML mode (a
-    // converter gap); for the oracle the markers are unwrapped.
-    if file.extension().is_some_and(|e| e == "xht" || e == "xhtml") {
-        html = html.replace("<![CDATA[", "").replace("]]>", "");
-    }
+    if file.extension().is_some_and(|e| e == "xht" || e == "xhtml") { html = xhtml_as_html(&html) }
     let dom = navigator_dom::parse(&html);
     let mut inputs = Inputs::default();
     let mut css = String::new();
