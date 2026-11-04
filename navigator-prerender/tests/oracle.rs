@@ -139,9 +139,13 @@ fn exploration_is_bounded() {
     </script></body></html>"#);
     let c = explore(&html);
     assert_eq!(c.interactive_found, 300, "all are found");
-    // One handler shared by all 300: probed PROBES_PER_HANDLER times.
-    assert_eq!(c.transitions.len(), 64,
-        "but probing is bounded per handler: {}", c.transitions.len());
+    // One handler shared by all 300: probed PROBES_PER_HANDLER times, then
+    // three verification samples; the other 233 are predicted by the
+    // template those probes agree on (§5.4.5.6c).
+    assert_eq!(c.explore_stats.probes, 64, "probing is bounded per handler");
+    assert_eq!(c.explore_stats.verify_probes, 3);
+    assert_eq!(c.explore_stats.predicted, 233);
+    assert_eq!(c.expanded_transitions().len(), 300);
 }
 
 /// Recording must be DETERMINISTIC, or a content-addressed store sees churn
@@ -160,7 +164,8 @@ fn the_recording_is_reproducible() {
     let a = explore(html);
     let b = explore(html);
     assert_eq!(a.transitions, b.transitions);
-    assert!(a.transitions.len() == 2, "{:?}", a.transitions);
+    assert_eq!(a.templates, b.templates);
+    assert!(a.expanded_transitions().len() == 2, "{:?}", a.transitions);
 }
 
 use navigator_prerender::Effect;

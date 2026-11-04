@@ -2,18 +2,28 @@
 """Exploration coverage, sorted into legacy-web §5.4.5's cases (§5.4.5.6 item 1).
 
     coverage.py <name>=<cov.tsv> [<name>=<cov.tsv> …] [--docs <out.tsv>] [--examples N]
+                [--without-templates]
 
 Each cov.tsv is what `PRERENDER_COVERAGE=<file> PRERENDER_EXPLORE=1 prerender <dir>`
 appends: one line per interactive element,
 
     doc  path  tag  type  events  flags  net_get  net_blocked  beacons
-         timers_scheduled  timers_left  intervals_left  effect_targets  [gestures]
+         timers_scheduled  timers_left  intervals_left  effect_targets  [gestures]  [nav]
+         [refused requests, `<reason> <host>|…`]
 
 (flags: n native, e explorable, p probed, c cut by the probe bound, r recorded,
 t truncated, d probed as a delegated target, D a delegating root whose
 delegated probe recorded, x outside the interactive universe, h cut but its
 handlers probed on another element, a a probe on it hit the loop-iteration
-limit), or `doc  -` for a document with none.
+limit, T not probed but an instance of a verified template (§5.4.5.6c), v
+probed as a template's verification sample, I not probed but its handler
+group verified to do nothing observable), or `doc  -` for a document
+with none.
+
+--without-templates reads the same table as the recorder before §5.4.5.6c
+would have: a T element, and a v element (probed only to verify), is cut
+with its handler probed elsewhere. That is the before column measured in
+the SAME run, so live-network drift between runs cannot enter it.
 Tables from before 2026-11-05's probe-fidelity change have 13 columns and none
 of d/D/x/h; they classify unchanged.
 
@@ -72,14 +82,18 @@ def parse(path):
     for line in open(path, encoding="utf-8", errors="replace"):
         f = line.rstrip("\n").split("\t")
         docs.add(f[0])
-        if len(f) < 13:
+        # `#stats` and `#fetch` lines are per document, not elements (and
+        # `#stats` grew to 13 columns with §5.4.5.6c's template counts).
+        if len(f) < 13 or f[1] in ("#stats", "#fetch"):
             continue
         rows.append(dict(doc=f[0], path=f[1], tag=f[2], type=f[3],
                          events=[e for e in f[4].split(",") if e], flags=f[5],
                          net_get=int(f[6]), net_blocked=int(f[7]), beacons=int(f[8]),
                          tsched=int(f[9]), tleft=int(f[10]), ileft=int(f[11]),
                          targets=[t for t in f[12].split("|") if t],
-                         gestures=[g for g in (f[13] if len(f) > 13 else "").split(",") if g]))
+                         gestures=[g for g in (f[13] if len(f) > 13 else "").split(",") if g],
+                         nav=int(f[14]) if len(f) > 14 and f[14] else 0,
+                         hosts=[h for h in (f[15] if len(f) > 15 else "").split("|") if h]))
         if "x" in rows[-1]["flags"]:
             outside.append(rows.pop())
     return rows, outside, docs
@@ -108,10 +122,14 @@ def classify(r):
         return "1 server-fed", "cross-origin or non-GET (refused)" + part
     if "r" in fl:
         return "covered", "truncated" if "t" in fl else ""
+    if "T" in fl:
+        return "covered", "template instance (predicted, verified on a sample)"
     if "D" in fl:
         return "covered", "via delegated targets"
     handlers = bool(r["events"])
     if handlers:
+        if "I" in fl and "h" not in fl:
+            return "other", "no observable effect (its handler's siblings probed, a sample verified)"
         if "c" in fl:
             if "h" in fl:
                 return "3 large state", "budget: its handler was probed on another element"
@@ -163,7 +181,7 @@ def interference(rows):
     same node — what §5.4.5.3 must explore jointly."""
     by_doc = collections.defaultdict(list)
     for r in rows:
-        if "r" in r["flags"]:
+        if "r" in r["flags"] or "T" in r["flags"]:
             by_doc[r["doc"]].append(set(r["targets"]))
     out = {}
     for d, sets in by_doc.items():
@@ -179,13 +197,19 @@ def report(name, rows, docs, examples, outside=()):
     rows = [r for r in rows if r["case"] != "lifecycle"]
     print(f"\n## {name}: {len(docs)} documents, {len(rows)} interactive elements")
     print(f"lifecycle-only (load/error) elements, excluded from both denominators: {len(life)}")
-    tgt = [r for r in outside if r["tag"] != "#document"]
+    # Probed ones only: a template or inert instance (T, I) is a delegated
+    # target accounted for WITHOUT a probe, and is counted on its own.
+    tgt = [r for r in outside if r["tag"] != "#document" and "p" in r["flags"]]
+    unprobed = [r for r in outside if r["tag"] != "#document" and "p" not in r["flags"]]
     dd = [r for r in outside if r["tag"] == "#document"]
     print(f"outside the universe: {len(tgt)} delegated targets probed, "
           f"{sum(1 for r in tgt if 'r' in r['flags'])} recorded, in {len({r['doc'] for r in tgt})} documents; "
           f"document/window listeners in {len(dd)} documents, "
           f"{sum(1 for r in dd if 'r' in r['flags'] or 'D' in r['flags'])} recorded through")
-    deleg = [r for r in rows if "d" in r["flags"]]
+    if unprobed:
+        print(f"outside the universe, not probed: {sum(1 for r in unprobed if 'T' in r['flags'])} template "
+              f"instances, {sum(1 for r in unprobed if 'I' in r['flags'])} verified inert")
+    deleg = [r for r in rows if "d" in r["flags"] and "p" in r["flags"]]
     print(f"delegated targets inside the universe: {len(deleg)} probed, "
           f"{sum(1 for r in deleg if 'r' in r['flags'])} recorded")
     g = collections.Counter(x for r in list(rows) + list(outside) for x in r.get("gestures", []))
@@ -231,8 +255,54 @@ def report(name, rows, docs, examples, outside=()):
             shown += 1
             if shown >= examples:
                 break
-    capped = collections.Counter(r["doc"] for r in rows if "c" in r["flags"])
-    rep_ = sum(1 for r in rows if "c" in r["flags"] and "h" in r["flags"])
+    # ★ "No observable effect", split by what the probe DID see (§5.4.5.6c
+    # step 2): the counters say whether it was analytics, and the element
+    # says whether its real effect is a default action exploration refuses.
+    quiet = [r for r in rows if r["case"] == "other" and "no observable effect" in r["why"]]
+    if quiet:
+        def cause(r):
+            if r["nav"] > 0:
+                return "a navigation (location.assign/replace/reload), refused"
+            if r["beacons"] > 0:
+                return "beacon only (analytics)"
+            if r["tag"] == "a":
+                return "a link: its effect is the navigation exploration refuses"
+            if r["tag"] in ("button", "input") and r["type"] in ("submit", "image", ""):
+                return "a submit control: its effect is the form submission"
+            if r["tsched"] > 0:
+                return "scheduled timers that changed nothing"
+            if "I" in r["flags"]:
+                return "nothing observable (inert group: " + r["tag"] + ")"
+            return "nothing observable (" + r["tag"] + ")"
+        c = collections.Counter(cause(r) for r in quiet)
+        print(f"\nno observable effect, {len(quiet)}, by what the probe saw:")
+        for k, n in c.most_common(12):
+            print(f"  {n:>5}  {k}")
+    # Case 1, by WHERE the refused requests went (§5.4.5.6c step 2): data
+    # the element would show, or a ping nobody sees.
+    sf = [r for r in rows if r["case"] == "1 server-fed"]
+    if sf:
+        hc = collections.Counter()
+        for r in sf:
+            hs = sorted({h.split(" ", 1)[-1] for h in r.get("hosts", [])}) or (["same-origin GET"] if r["net_get"] else ["(predicted: its siblings' requests)"])
+            hc[", ".join(hs)] += 1
+        print(f"\nserver-fed, {len(sf)}, by where the refused requests went:")
+        for k, n in hc.most_common(12):
+            print(f"  {n:>5}  {k}")
+    tm = [r for r in rows if "T" in r["flags"]]
+    sm = [r for r in rows if "v" in r["flags"]]
+    im = [r for r in rows if "I" in r["flags"]]
+    print(f"\ntemplates (§5.4.5.6c): {len(tm)} elements covered as predicted instances, in "
+          f"{len({r['doc'] for r in tm})} documents; {len(sm)} probed as verification samples; "
+          f"{len(im)} verified inert (handler does nothing observable), in {len({r['doc'] for r in im})} documents")
+    if tm:
+        print("  by document: " + ", ".join(f"{d.rsplit('.', 1)[0]} {n}" for d, n in
+                                          collections.Counter(r["doc"] for r in tm).most_common(8)))
+    # A template instance or an inert one was cut and then accounted for.
+    capped = collections.Counter(r["doc"] for r in rows if "c" in r["flags"]
+                                 and "T" not in r["flags"] and "I" not in r["flags"])
+    rep_ = sum(1 for r in rows if "c" in r["flags"] and "h" in r["flags"]
+               and "T" not in r["flags"] and "I" not in r["flags"])
     print(f"\nprobe bound: hit in {len(capped)} documents, "
           f"{sum(capped.values())} explorable elements never probed ({rep_} with their handler probed elsewhere)")
     inter = interference(rows)
@@ -247,9 +317,27 @@ def report(name, rows, docs, examples, outside=()):
     return rows
 
 
+def without_templates(rows):
+    """The table as the recorder before templates would have written it."""
+    for r in rows:
+        fl = r["flags"]
+        if "T" in fl or "I" in fl or "v" in fl:
+            fl = fl.replace("T", "").replace("I", "").replace("v", "").replace("p", "").replace("r", "")
+            r["flags"] = fl + ("c" if "c" not in fl else "") + "h"
+            # Never probed without the template: a predicted instance's
+            # network counts are its siblings', a sample's its own probe's.
+            for k in ("net_get", "net_blocked", "beacons", "tsched", "tleft", "ileft", "nav"):
+                r[k] = 0
+            r["targets"], r["gestures"] = [], []
+    return rows
+
+
 def main():
     args = sys.argv[1:]
     docs_out, examples = None, 4
+    bare = "--without-templates" in args
+    if bare:
+        args.remove("--without-templates")
     if "--docs" in args:
         i = args.index("--docs"); docs_out = args[i + 1]; del args[i:i + 2]
     if "--examples" in args:
@@ -259,6 +347,9 @@ def main():
     for a in args:
         name, path = a.split("=", 1)
         rows, outside, docs = parse(path)
+        if bare:
+            rows = without_templates(rows)
+            outside = without_templates(outside)
         report(name, rows, docs, examples, outside)
         for r in rows + outside:
             r["corpus"] = name

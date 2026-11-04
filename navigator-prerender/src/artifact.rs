@@ -26,6 +26,15 @@ use crate::{Conversion, Effect, Tier, TierPolicy};
 /// unknown fields still reads a v3 recording; the bump is so a reader can
 /// TELL, rather than infer it from a field's absence.
 pub const FORMAT: &str = "atrium-navigator-recording/3";
+/// ★ v4 adds `templates` (legacy-web §5.4.5.6c): one handler's transition
+/// recorded ONCE over the elements that share it, each instance binding its
+/// trigger and the addresses (`$t`, `$N`) its effects name. It is written
+/// ONLY when a recording has a template, and a recording without one stays
+/// `/3`, byte for byte: a `/3` reader loses nothing from it. A recording
+/// that has templates must not be read by a `/3` reader, which would ignore
+/// the field and replay a subset with nothing to say so; the version is how
+/// it can tell.
+pub const FORMAT_V4: &str = "atrium-navigator-recording/4";
 
 /// ★ WHICH TRANSITIONS SURVIVE DEPENDS ON WHICH DOCUMENT IS PUBLISHED.
 ///
@@ -41,9 +50,14 @@ pub const FORMAT: &str = "atrium-navigator-recording/3";
 /// COUNTED — a recording that silently lost half its entries would be
 /// indistinguishable from a page with little to do.
 fn usable(t: &crate::Transition, tier: Tier) -> bool {
+    usable_trigger(&t.trigger, t.anchored, tier)
+}
+
+/// The same rule for a template's instances, which are transitions.
+fn usable_trigger(trigger: &str, anchored: bool, tier: Tier) -> bool {
     match tier {
         Tier::Two => true,
-        Tier::One => t.anchored && t.trigger.starts_with('#'),
+        Tier::One => anchored && trigger.starts_with('#'),
     }
 }
 
@@ -51,11 +65,17 @@ pub fn emit(url: Option<&str>, c: &Conversion, policy: &TierPolicy) -> String {
     let (document, decision) = policy.artifact(c);
     let kept: Vec<&crate::Transition> =
         c.transitions.iter().filter(|t| usable(t, decision.tier)).collect();
-    let dropped = c.transitions.len() - kept.len();
+    let mut dropped = c.transitions.len() - kept.len();
+    let templates: Vec<(&crate::Template, Vec<&crate::Instance>)> = c.templates.iter().filter_map(|t| {
+        let inst: Vec<&crate::Instance> = t.instances.iter()
+            .filter(|i| usable_trigger(&i.trigger, i.anchored, decision.tier)).collect();
+        dropped += t.instances.len() - inst.len();
+        (!inst.is_empty()).then_some((t, inst))
+    }).collect();
 
     let mut s = String::new();
     s.push_str("{\n");
-    field(&mut s, "format", FORMAT, false);
+    field(&mut s, "format", if templates.is_empty() { FORMAT } else { FORMAT_V4 }, false);
     field(&mut s, "url", url.unwrap_or(""), false);
     s.push_str(&format!("  \"tier\": {},\n",
         match decision.tier { Tier::One => 1, Tier::Two => 2 }));
@@ -91,6 +111,32 @@ pub fn emit(url: Option<&str>, c: &Conversion, policy: &TierPolicy) -> String {
         s.push_str("    }");
     }
     s.push_str(if kept.is_empty() { "],\n" } else { "\n  ],\n" });
+    if !templates.is_empty() {
+        s.push_str("  \"templates\": [");
+        for (i, (t, inst)) in templates.iter().enumerate() {
+            s.push_str(if i == 0 { "\n" } else { ",\n" });
+            s.push_str("    {\n");
+            s.push_str(&format!("      \"event\": {},\n", json_str(&t.event)));
+            s.push_str(&format!("      \"attribute_only\": {},\n", t.is_attribute_only()));
+            s.push_str("      \"effects\": [");
+            for (j, e) in t.effects.iter().enumerate() {
+                s.push_str(if j == 0 { "\n" } else { ",\n" });
+                s.push_str("        ");
+                s.push_str(&effect_json(e));
+            }
+            s.push_str(if t.effects.is_empty() { "],\n" } else { "\n      ],\n" });
+            s.push_str("      \"instances\": [");
+            for (j, n) in inst.iter().enumerate() {
+                s.push_str(if j == 0 { "\n" } else { ",\n" });
+                let slots: Vec<String> = n.slots.iter().map(|v| json_str(v)).collect();
+                s.push_str(&format!("        {{ \"trigger\": {}, \"anchored\": {}, \"slots\": [{}] }}",
+                    json_str(&n.trigger), n.anchored, slots.join(", ")));
+            }
+            s.push_str("\n      ]\n");
+            s.push_str("    }");
+        }
+        s.push_str("\n  ],\n");
+    }
 
     // The subresources, in the order they were found.
     s.push_str("  \"stylesheets\": [");

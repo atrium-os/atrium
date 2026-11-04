@@ -158,6 +158,20 @@ fn probe_get(_this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<J
     }
     if EXPLORING.with(|e| *e.borrow()) {
         let n = key.to_string();
+        // ★ `el.id`, READ while exploring (§5.4.5.6c step 2). The load pass
+        // has never reflected it: the missing-API report counts
+        // `element.id` 4,690 times in 24 documents. A handler written
+        // `panel = byId(this.id + '-panel')` or `state[e.target.id]` then
+        // computed with "undefined" — and every element of a group did the
+        // SAME wrong thing, which a template would faithfully generalise.
+        // Scoped like `closest`: answering it at load changes what pages
+        // build, a separate change with its own corpus diff.
+        if n == "id" && target.has_property(js_string!("__h"), ctx)? {
+            if let Some(h) = handle_of(&target.clone().into(), ctx) {
+                let v = with(|d| d.attr(h, "id").unwrap_or("").to_string());
+                return Ok(JsValue::from(js_string!(v)));
+            }
+        }
         let f: Option<fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>> = match n.as_str() {
             "matches" | "webkitMatchesSelector" | "msMatchesSelector" => Some(el_matches),
             "closest" => Some(el_closest),
@@ -2294,9 +2308,12 @@ const MAX_INSERT_BYTES: usize = 16 * 1024;
 /// old arena's length, and existing ones keep theirs — so the diff is a
 /// direct comparison rather than a tree match. That is a property of the
 /// arena, and it is why this is cheap.
-fn diff_effects(before: &Dom, after: &Dom) -> Vec<crate::engine::Effect> {
+fn diff_effects(before: &Dom, after: &Dom) -> (Vec<crate::engine::Effect>, Vec<Handle>) {
     use crate::engine::Effect;
     let mut out = vec![];
+    // The node each effect addresses (target, or an insert's parent), in
+    // step with `out`: what a template generalises over (§5.4.5.6c).
+    let mut at: Vec<Handle> = vec![];
     let mut dropped = 0usize;
     let old_len = before.nodes.len() as Handle;
 
@@ -2315,6 +2332,7 @@ fn diff_effects(before: &Dom, after: &Dom) -> Vec<crate::engine::Effect> {
             out.push(Effect::Attribute {
                 target: before.node_path(h), name: name.clone(), from, to,
             });
+            at.push(h);
         }
     }
 
@@ -2328,6 +2346,7 @@ fn diff_effects(before: &Dom, after: &Dom) -> Vec<crate::engine::Effect> {
             if parent_gone { continue }
             if out.len() >= MAX_EFFECTS { dropped += 1; continue }
             out.push(Effect::Remove { target: before.node_path(h) });
+            at.push(h);
         }
     }
 
@@ -2346,10 +2365,11 @@ fn diff_effects(before: &Dom, after: &Dom) -> Vec<crate::engine::Effect> {
         }
         let index = after.children_of(p).iter().position(|&c| c == h).unwrap_or(0);
         out.push(Effect::Insert { parent: before.node_path(p), index, html });
+        at.push(p);
     }
 
-    if dropped > 0 { out.push(Effect::Truncated { dropped }) }
-    out
+    if dropped > 0 { out.push(Effect::Truncated { dropped }); at.push(Handle::MAX) }
+    (out, at)
 }
 
 /// ★★ A PROBE PERFORMS A USER GESTURE, NOT AN EVENT NAME.
@@ -2707,6 +2727,12 @@ fn el_closest(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<J
 /// a discovery probe saw tested.
 struct ProbeResult {
     transition: Option<crate::engine::Transition>,
+    /// location.assign/replace/reload calls the probe made (all refused).
+    nav: u32,
+    /// What its refused requests were (`<reason> <host>`), for the report.
+    hosts: Vec<String>,
+    /// The node each effect addresses, in step with the transition's effects.
+    at: Vec<Handle>,
     counters: (u32, u32, u32, u32, i64, i64),
     selectors: Vec<String>,
 }
@@ -2727,8 +2753,13 @@ fn run_probe(ctx: &mut Context, p: &Probe, parser_nodes: Handle) -> ProbeResult 
     }
     let anchored = h < parser_nodes;
     let probe0 = probe_counters(ctx);
+    let nav_count = |ctx: &mut Context| ctx.eval(Source::from_bytes(b"globalThis.__navAttempts || 0"))
+        .ok().and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
+    let nav0 = nav_count(ctx);
+    let hosts0 = PAGE_BLOCKED.with(|b| b.borrow().1.clone());
     let (t_fired0, t_now0, t_seq0) = timer_clock(ctx);
     let mut effects = vec![];
+    let mut at = vec![];
     let (mut els0, mut txt0, mut attrs0) = (0i64, 0i64, 0usize);
     let (mut els1, mut txt1, mut attrs1) = (0i64, 0i64, 0usize);
     if p.discover.is_some() { PROBE_SELECTORS.with(|s| *s.borrow_mut() = Some(vec![])) }
@@ -2760,7 +2791,7 @@ fn run_probe(ctx: &mut Context, p: &Probe, parser_nodes: Handle) -> ProbeResult 
             els1 = d.element_count() as i64;
             txt1 = d.visible_text(d.root()).split_whitespace().map(str::len).sum::<usize>() as i64;
             attrs1 = d.nodes.iter().map(|n| n.attrs.len()).sum::<usize>();
-            effects = diff_effects(&mid, &d);
+            (effects, at) = diff_effects(&mid, &d);
         });
     }
     let selectors = PROBE_SELECTORS.with(|s| s.borrow_mut().take()).unwrap_or_default();
@@ -2779,17 +2810,34 @@ fn run_probe(ctx: &mut Context, p: &Probe, parser_nodes: Handle) -> ProbeResult 
         elements_added: els1 - els0, text_delta: txt1 - txt0,
         attributes_changed: attrs1.abs_diff(attrs0) as u32, effects,
     });
-    ProbeResult { transition, counters, selectors }
+    let nav = nav_count(ctx).saturating_sub(nav0);
+    let hosts = PAGE_BLOCKED.with(|b| b.borrow().1.iter()
+        .filter(|(k, n)| hosts0.get(*k) != Some(*n)).map(|(k, _)| k.clone()).collect());
+    ProbeResult { transition, nav, hosts, at, counters, selectors }
 }
 
 fn credit(c: &mut crate::engine::Interactive, r: &ProbeResult) {
     let k = r.counters;
     c.net_get += k.0; c.net_blocked += k.1; c.beacons += k.2; c.timers_scheduled += k.3;
     c.timers_left += k.4; c.intervals_left += k.5;
+    c.nav_refused += r.nav;
+    for h in &r.hosts { if !c.blocked_hosts.contains(h) { c.blocked_hosts.push(h.clone()) } }
+}
+
+struct KeyQ { cands: std::collections::VecDeque<Probe>, taken: usize, spinning: bool }
+
+/// One probe a handler group ran: where, and what it recorded (the index
+/// into the transitions, and the node each effect addressed).
+struct Example {
+    target: Handle,
+    gesture: Gesture,
+    recorded: Option<(usize, Vec<Handle>)>,
+    net: (u32, u32, u32),
 }
 
 fn explore_states(ctx: &mut Context, parser_nodes: Handle, bounds: (usize, usize))
-    -> (Vec<crate::engine::Transition>, u32, Vec<crate::engine::Interactive>, crate::engine::ExploreStats)
+    -> (Vec<crate::engine::Transition>, Vec<crate::engine::Template>, u32,
+        Vec<crate::engine::Interactive>, crate::engine::ExploreStats)
 {
     let (per_handler, total) = bounds;
     // Elements the page itself wired for interaction. Nothing is guessed:
@@ -2853,7 +2901,6 @@ fn explore_states(ctx: &mut Context, parser_nodes: Handle, bounds: (usize, usize
     // worst case is bounded whatever the page registers. Delegated
     // candidates join under their own keys as discovery probes find them,
     // and are served from the round that is running.
-    struct KeyQ { cands: std::collections::VecDeque<Probe>, taken: usize, spinning: bool }
     fn enqueue(keys: &mut Vec<KeyQ>, ix: &mut HashMap<u64, usize>, p: Probe) {
         let i = *ix.entry(p.key).or_insert_with(|| {
             keys.push(KeyQ { cands: Default::default(), taken: 0, spinning: false });
@@ -2869,6 +2916,7 @@ fn explore_states(ctx: &mut Context, parser_nodes: Handle, bounds: (usize, usize
     let mut stats = crate::engine::ExploreStats::default();
     let mut ran = 0usize;
     let mut delegated_seen: std::collections::HashSet<(Handle, Gesture)> = Default::default();
+    let mut examples: Vec<Vec<Example>> = vec![];
     'rounds: for round in 0..per_handler {
         let mut progressed = false;
         let mut i = 0;
@@ -2882,8 +2930,12 @@ fn explore_states(ctx: &mut Context, parser_nodes: Handle, bounds: (usize, usize
             i += 1;
             ran += 1;
             LIMIT_HIT.with(|h| *h.borrow_mut() = false);
-            for d in probe_and_record(ctx, &p, parser_nodes, &mut cov, &mut out,
-                                      &direct_set, &mut delegated_seen) {
+            let o = probe_and_record(ctx, &p, parser_nodes, &mut cov, &mut out,
+                                     &direct_set, &mut delegated_seen);
+            if examples.len() <= ki { examples.resize_with(ki + 1, Vec::new) }
+            examples[ki].push(Example { target: p.target, gesture: p.gesture.clone(),
+                                        recorded: o.recorded, net: o.net });
+            for d in o.extra {
                 enqueue(&mut keys, &mut key_ix, d);
             }
             if LIMIT_HIT.with(|h| *h.borrow()) {
@@ -2897,6 +2949,13 @@ fn explore_states(ctx: &mut Context, parser_nodes: Handle, bounds: (usize, usize
         }
         if !progressed { break }
     }
+
+    // ★★ Generalise across siblings (§5.4.5.6c): a handler's transition,
+    // learned on the elements it was probed on, recorded ONCE as a template
+    // over every element that shares it, the unprobed ones included when a
+    // sample of them reproduces the prediction exactly.
+    examples.resize_with(keys.len(), Vec::new);
+    let templates = build_templates(ctx, parser_nodes, &mut keys, &examples, &mut out, &mut cov, &mut stats);
 
     // What the bounds left. An element cut under a handler that WAS probed
     // elsewhere is `represented`: its behaviour is that handler's, learned
@@ -2917,14 +2976,14 @@ fn explore_states(ctx: &mut Context, parser_nodes: Handle, bounds: (usize, usize
     }
     for h in cut_direct {
         if let Some(e) = cov.get_mut(&h) {
-            if !e.probed && !unrepresented.contains(&h) { e.represented = true }
+            if !e.probed && !e.templated && !e.inert && !unrepresented.contains(&h) { e.represented = true }
         }
     }
 
     ctx.runtime_limits_mut().set_loop_iteration_limit(saved_loop_limit);
     EXPLORING.with(|e| *e.borrow_mut() = false);
     PAGE_NET.with(|n| *n.borrow_mut() = saved_net);
-    (out, found, cov.into_values().collect(), stats)
+    (out, templates, found, cov.into_values().collect(), stats)
 }
 
 /// Run one probe, credit the coverage entries, keep its transition, and
@@ -2934,7 +2993,7 @@ fn probe_and_record(ctx: &mut Context, p: &Probe, parser_nodes: Handle,
     cov: &mut std::collections::BTreeMap<Handle, crate::engine::Interactive>,
     out: &mut Vec<crate::engine::Transition>,
     direct_set: &std::collections::HashSet<(Handle, Gesture)>,
-    delegated_seen: &mut std::collections::HashSet<(Handle, Gesture)>) -> Vec<Probe>
+    delegated_seen: &mut std::collections::HashSet<(Handle, Gesture)>) -> Outcome
 {
     use crate::engine::Interactive;
     let r = run_probe(ctx, p, parser_nodes);
@@ -3001,8 +3060,436 @@ fn probe_and_record(ctx: &mut Context, p: &Probe, parser_nodes: Handle,
             extra.push(Probe { target: t, gesture: g, key, root: Some(root), discover: None });
         }
     }
-    if let Some(t) = r.transition { out.push(t) }
-    extra
+    let k = r.counters;
+    let net = (k.0, k.1, k.2);
+    let recorded = r.transition.map(|t| { out.push(t); (out.len() - 1, r.at) });
+    Outcome { extra, recorded, net }
+}
+
+struct Outcome {
+    /// Delegated candidates a discovery probe found.
+    extra: Vec<Probe>,
+    /// The transition recorded (its index in `out`) and the node each of its
+    /// effects addressed.
+    recorded: Option<(usize, Vec<Handle>)>,
+    /// (refused same-origin GETs, blocked requests, beacons).
+    net: (u32, u32, u32),
+}
+
+/// Bounds on generalisation (§5.4.5.6c). A template's verification costs up
+/// to three probes (first, middle, last); the document's verification probes
+/// stop at MAX_VERIFY_PROBES, and the instances it may PREDICT (not probe) at
+/// MAX_PREDICTED, so a recording stays bounded whatever the page has.
+const MAX_VERIFY_PROBES: usize = 96;
+const MAX_PREDICTED: usize = 2048;
+
+/// One step down from an ancestor: the child with this tag (None for a
+/// non-element) at this position among its same-tag siblings, either fixed
+/// or equal to the trigger's own position at some level plus an offset.
+#[derive(Clone, Debug, PartialEq)]
+enum Step { Const(Option<String>, usize), Var(Option<String>, usize, i64) }
+
+/// Where an effect lands, as a function of the trigger.
+/// - `Fixed`: the same node for every instance (a shared overlay).
+/// - `Rel(k, steps)`: up `k` ancestors from the trigger, then down `steps`.
+///   `Rel(0, [])` is the trigger itself; `Rel(1, [div:Var(0, 0)])` under a
+///   tab list is "the panel with the tab's own index".
+#[derive(Clone, Debug, PartialEq)]
+enum Addr { Fixed(Handle), Rel(usize, Vec<Step>) }
+
+/// Position among the parent's children with the same tag — node_path's `n`.
+fn nth_same_tag(d: &Dom, h: Handle) -> usize {
+    let Some(p) = d.get(h).and_then(|n| n.parent) else { return 0 };
+    d.nodes[p as usize].children.iter().filter(|&&c| d.tag(c) == d.tag(h))
+        .position(|&c| c == h).unwrap_or(0)
+}
+
+fn ancestors(d: &Dom, h: Handle) -> Vec<Handle> {
+    let mut v = vec![h];
+    let mut cur = h;
+    while let Some(p) = d.get(cur).and_then(|n| n.parent) { v.push(p); cur = p; }
+    v
+}
+
+/// (k, the steps down from the common ancestor as (tag, n), the trigger's
+/// own positions at levels 0..k).
+type Shape = (usize, Vec<(Option<String>, usize)>, Vec<usize>);
+fn shape(d: &Dom, t: Handle, x: Handle) -> Option<Shape> {
+    let ta = ancestors(d, t);
+    let xa = ancestors(d, x);
+    let (xi, k) = xa.iter().enumerate().find_map(|(i, a)| ta.iter().position(|b| b == a).map(|k| (i, k)))?;
+    let chain = xa[..xi].iter().rev().map(|&h| (d.tag(h).map(str::to_string), nth_same_tag(d, h))).collect();
+    let u = ta[..k].iter().map(|&h| nth_same_tag(d, h)).collect();
+    Some((k, chain, u))
+}
+
+/// The one address rule every (trigger, target) pair fits, if there is one.
+/// A structural rule is preferred to a fixed node: it is what carries over
+/// to a sibling elsewhere in the tree.
+fn infer_addr(d: &Dom, pairs: &[(Handle, Handle)]) -> Option<Addr> {
+    let rel = (|| {
+        let shapes: Vec<Shape> = pairs.iter().map(|&(t, x)| shape(d, t, x)).collect::<Option<_>>()?;
+        let (k, c0, _) = &shapes[0];
+        if shapes.iter().any(|(k2, c, _)| k2 != k || c.len() != c0.len()
+            || c.iter().zip(c0).any(|(a, b)| a.0 != b.0)) { return None }
+        let mut steps = vec![];
+        for (s, (tag, n0)) in c0.iter().enumerate() {
+            if shapes.iter().all(|(_, c, _)| c[s].1 == *n0) { steps.push(Step::Const(tag.clone(), *n0)); continue }
+            let m = (0..*k).find(|&m| {
+                let off = *n0 as i64 - shapes[0].2[m] as i64;
+                shapes.iter().all(|(_, c, u)| c[s].1 as i64 - u[m] as i64 == off)
+            })?;
+            steps.push(Step::Var(tag.clone(), m, *n0 as i64 - shapes[0].2[m] as i64));
+        }
+        Some(Addr::Rel(*k, steps))
+    })();
+    rel.or_else(|| pairs.iter().all(|p| p.1 == pairs[0].1).then(|| Addr::Fixed(pairs[0].1)))
+}
+
+fn apply_addr(d: &Dom, a: &Addr, t: Handle) -> Option<Handle> {
+    match a {
+        Addr::Fixed(x) => d.connected(*x).then_some(*x),
+        Addr::Rel(k, steps) => {
+            let ta = ancestors(d, t);
+            let mut cur = *ta.get(*k)?;
+            for st in steps {
+                let (tag, n) = match st {
+                    Step::Const(tag, n) => (tag, *n as i64),
+                    Step::Var(tag, m, off) => (tag, nth_same_tag(d, ta[*m]) as i64 + off),
+                };
+                if n < 0 { return None }
+                cur = *d.nodes[cur as usize].children.iter()
+                    .filter(|&&c| d.tag(c).map(str::to_string) == *tag).nth(n as usize)?;
+            }
+            Some(cur)
+        }
+    }
+}
+
+/// A handler group's transition with each address abstracted.
+struct Rule { effects: Vec<crate::engine::Effect>, addrs: Vec<Addr> }
+
+/// The effects with the address of each one's node replaced (values kept).
+fn readdress(effects: &[crate::engine::Effect], paths: &[String]) -> Vec<crate::engine::Effect> {
+    use crate::engine::Effect;
+    effects.iter().zip(paths).map(|(e, p)| match e {
+        Effect::Attribute { name, from, to, .. } =>
+            Effect::Attribute { target: p.clone(), name: name.clone(), from: from.clone(), to: to.clone() },
+        Effect::Insert { index, html, .. } => Effect::Insert { parent: p.clone(), index: *index, html: html.clone() },
+        Effect::Remove { .. } => Effect::Remove { target: p.clone() },
+        e => e.clone(),
+    }).collect()
+}
+
+/// The rule every recorded example fits: same effects in the same order,
+/// identical apart from their addresses, and one address rule per effect.
+fn infer_rule(d: &Dom, ex: &[(Handle, &crate::engine::Transition, &[Handle])]) -> Option<Rule> {
+    use crate::engine::Effect;
+    let (_, t0, _) = ex[0];
+    if t0.effects.is_empty() || t0.effects.iter().any(|e| matches!(e, Effect::Truncated { .. })) { return None }
+    let blank = |t: &crate::engine::Transition| readdress(&t.effects, &vec![String::new(); t.effects.len()]);
+    let shape0 = blank(t0);
+    if ex.iter().any(|(_, t, at)| t.event != t0.event || at.len() != t.effects.len() || blank(t) != shape0) { return None }
+    let addrs = (0..shape0.len()).map(|i| {
+        let pairs: Vec<(Handle, Handle)> = ex.iter().map(|(t, _, at)| (*t, at[i])).collect();
+        infer_addr(d, &pairs)
+    }).collect::<Option<Vec<_>>>()?;
+    Some(Rule { effects: shape0, addrs })
+}
+
+/// Why `infer_rule` found nothing, for the trace: which part of the
+/// examples disagrees first.
+fn why_no_rule(d: &Dom, ex: &[(Handle, &crate::engine::Transition, &[Handle])]) -> String {
+    use crate::engine::Effect;
+    let (_, t0, _) = ex[0];
+    if t0.effects.iter().any(|e| matches!(e, Effect::Truncated { .. })) { return "truncated".into() }
+    let blank = |t: &crate::engine::Transition| readdress(&t.effects, &vec![String::new(); t.effects.len()]);
+    let s0 = blank(t0);
+    for (_, t, _) in ex {
+        if t.effects.len() != s0.len() { return format!("effect count {} vs {}", t.effects.len(), s0.len()) }
+        let b = blank(t);
+        if let Some((a, c)) = s0.iter().zip(&b).find(|(a, c)| a != c) {
+            let k = |e: &Effect| match e {
+                Effect::Attribute { name, .. } => format!("attribute {name}"),
+                Effect::Insert { .. } => "insert".into(), Effect::Remove { .. } => "remove".into(),
+                Effect::Truncated { .. } => "truncated".into(),
+            };
+            return if std::mem::discriminant(a) != std::mem::discriminant(c) { "effect kinds differ".into() }
+                   else { format!("values differ ({})", k(a)) };
+        }
+    }
+    for i in 0..s0.len() {
+        let pairs: Vec<(Handle, Handle)> = ex.iter().map(|(t, _, at)| (*t, at[i])).collect();
+        if infer_addr(d, &pairs).is_none() { return format!("no address rule for effect {i}") }
+    }
+    "unknown".into()
+}
+
+/// What the rule predicts a probe on `t` records, and the nodes it names;
+/// None if an address does not resolve, or the prediction could not be what
+/// the diff writes (effect order, or an attribute not currently holding the
+/// value the effect starts from).
+fn predict(d: &Dom, r: &Rule, t: Handle) -> Option<(Vec<crate::engine::Effect>, Vec<Handle>)> {
+    use crate::engine::Effect;
+    let at: Vec<Handle> = r.addrs.iter().map(|a| apply_addr(d, a, t)).collect::<Option<_>>()?;
+    let paths: Vec<String> = at.iter().map(|&h| d.node_path(h)).collect();
+    let effects = readdress(&r.effects, &paths);
+    let mut last_attr: Option<(Handle, &str)> = None;
+    let mut last_rm: Option<Handle> = None;
+    for (e, &h) in effects.iter().zip(&at) {
+        match e {
+            Effect::Attribute { name, from, .. } => {
+                if last_attr.is_some_and(|(lh, ln)| (lh, ln) >= (h, name.as_str())) { return None }
+                last_attr = Some((h, name));
+                if d.attr(h, name) != from.as_deref() { return None }
+            }
+            Effect::Remove { .. } => {
+                if last_rm.is_some_and(|l| l >= h) { return None }
+                last_rm = Some(h);
+            }
+            _ => {}
+        }
+    }
+    Some((effects, at))
+}
+
+/// Same transition, as far as a recording can tell (the counters are not
+/// part of it).
+fn same_recording(a: &crate::engine::Transition, b: &crate::engine::Transition) -> bool {
+    a.trigger == b.trigger && a.event == b.event && a.anchored == b.anchored && a.effects == b.effects
+}
+
+/// ★★ GENERALISE A HANDLER'S TRANSITION ACROSS THE ELEMENTS THAT SHARE IT
+/// (legacy-web §5.4.5.6c).
+///
+/// For each handler group (key, gesture) whose every probe recorded a
+/// transition: infer one rule from all of them (same effects, values equal,
+/// each address a fixed node or a structural function of the trigger) and
+/// check it reproduces every example EXACTLY. Then predict the group's cut
+/// siblings, and probe a sample of them (first, middle, last): if any sample
+/// records anything but its prediction, the template is REFUSED, the samples'
+/// own transitions stay as ordinary ones, and the rest stay cut. A kept
+/// template replaces its examples' transitions in the recording.
+///
+/// A gesture whose user action changes state first (`change`, `toggle`) is
+/// folded from its examples but never predicted: the prediction would have
+/// to model the reader's own change.
+fn build_templates(ctx: &mut Context, parser_nodes: Handle, keys: &mut [KeyQ], examples: &[Vec<Example>],
+    out: &mut Vec<crate::engine::Transition>,
+    cov: &mut std::collections::BTreeMap<Handle, crate::engine::Interactive>,
+    stats: &mut crate::engine::ExploreStats) -> Vec<crate::engine::Template>
+{
+    use crate::engine::{Instance, Template};
+    let mut templates = vec![];
+    let mut folded: std::collections::HashSet<usize> = Default::default();
+    let mut verify_left = MAX_VERIFY_PROBES;
+    let mut predict_left = MAX_PREDICTED;
+    // PRERENDER_TRACE_TEMPLATES=<file>: one line per handler group with cut
+    // siblings, saying what became of it. Report only.
+    let trace_path = std::env::var_os("PRERENDER_TRACE_TEMPLATES");
+    let trace = |why: &str, g: &Gesture, ex: usize, cut: usize, first: Option<Handle>| {
+        let Some(f) = &trace_path else { return };
+        use std::io::Write;
+        let path = first.map(|h| with(|d| d.node_path(h))).unwrap_or_default();
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(f) {
+            let _ = writeln!(f, "{}\t{ex}\t{cut}\t{why}\t{path}", g.name());
+        }
+    };
+    for ki in 0..keys.len() {
+        if keys[ki].spinning { continue }
+        let mut gestures: Vec<Gesture> = examples[ki].iter().map(|e| e.gesture.clone()).collect();
+        gestures.sort();
+        gestures.dedup();
+        for g in gestures {
+            let ex: Vec<&Example> = examples[ki].iter().filter(|e| e.gesture == g).collect();
+            let ncut = keys[ki].cands.iter().filter(|p| p.gesture == g).count();
+            let first = ex.first().map(|e| e.target);
+            let unrec = ex.iter().filter(|e| e.recorded.is_none()).count();
+            // Every probe of the group must have recorded: one that did not
+            // says the handler does not behave alike on its elements.
+            if unrec > 0 {
+                // ★ A group whose EVERY probe recorded nothing is not a large
+                // state space: it is a handler with no observable effect here.
+                // Verified like a template, on a sample of the cut siblings,
+                // and then said (`inert`) rather than left as "cut".
+                let inert = unrec == ex.len() && ex.len() >= 2 && ncut > 0
+                    && !matches!(g, Gesture::Change | Gesture::Toggle);
+                if !inert {
+                    if ncut > 0 { trace(&format!("unrecorded {unrec}"), &g, ex.len(), ncut, first) }
+                    continue
+                }
+                let cut: Vec<Probe> = keys[ki].cands.iter().filter(|p| p.gesture == g).cloned().collect();
+                let mut s = vec![0, cut.len() / 2, cut.len() - 1];
+                s.dedup();
+                if s.len() > verify_left { trace("unrecorded: no verification budget", &g, ex.len(), ncut, first); continue }
+                let mut quiet = true;
+                for &si in &s {
+                    let p = &cut[si];
+                    verify_left -= 1;
+                    stats.verify_probes += 1;
+                    let mut no_delegation = Default::default();
+                    let o = probe_and_record(ctx, p, parser_nodes, cov, out, &Default::default(), &mut no_delegation);
+                    if let Some(e) = cov.get_mut(&p.target) { e.sampled = true }
+                    keys[ki].cands.retain(|c| !(c.target == p.target && c.gesture == p.gesture));
+                    if o.recorded.is_some() { quiet = false }
+                }
+                if !quiet {
+                    stats.refused += 1;
+                    trace("unrecorded, but a sample recorded: refused", &g, ex.len(), ncut, first);
+                    continue
+                }
+                let rest: Vec<Probe> = cut.iter().enumerate().filter(|(i, _)| !s.contains(i)).map(|(_, p)| p.clone()).collect();
+                for p in &rest {
+                    keys[ki].cands.retain(|c| !(c.target == p.target && c.gesture == p.gesture));
+                    stats.inert += 1;
+                    let e = cov.entry(p.target).or_insert_with(|| {
+                        let mut e = crate::engine::Interactive { outside: true, ..Default::default() };
+                        describe(p.target, &mut e);
+                        e
+                    });
+                    e.inert = true;
+                    if p.root.is_some() { e.delegated = true }
+                    for x in &ex {
+                        e.net_get = e.net_get.max(x.net.0);
+                        e.net_blocked = e.net_blocked.max(x.net.1);
+                        e.beacons = e.beacons.max(x.net.2);
+                    }
+                }
+                trace(&format!("inert: {} verified quiet", rest.len()), &g, ex.len(), ncut, first);
+                continue
+            }
+            let rows: Vec<(Handle, &crate::engine::Transition, &[Handle])> = ex.iter()
+                .map(|e| { let (i, at) = e.recorded.as_ref().unwrap(); (e.target, &out[*i], at.as_slice()) }).collect();
+            let Some(rule) = with(|d| infer_rule(d, &rows)) else {
+                if ncut > 0 {
+                    let why = with(|d| why_no_rule(d, &rows));
+                    trace(&format!("no rule: {why}"), &g, ex.len(), ncut, first)
+                }
+                continue
+            };
+            // The rule must reproduce every example exactly.
+            let fits = with(|d| rows.iter().all(|(t, tr, _)|
+                predict(d, &rule, *t).is_some_and(|(e, _)| e == tr.effects)));
+            if !fits { if ncut > 0 { trace("rule misfits an example", &g, ex.len(), ncut, first) } continue }
+
+            // Predict the cut siblings.
+            let predictable = !matches!(g, Gesture::Change | Gesture::Toggle);
+            let mut predicted: Vec<(Probe, crate::engine::Transition, Vec<Handle>)> = vec![];
+            if predictable {
+                for p in keys[ki].cands.iter().filter(|p| p.gesture == g) {
+                    if predicted.len() >= predict_left { break }
+                    let Some((effects, at)) = with(|d| predict(d, &rule, p.target)) else { continue };
+                    let trigger = with(|d| d.node_path(p.target));
+                    predicted.push((p.clone(), crate::engine::Transition { trigger, event: g.name(),
+                        anchored: p.target < parser_nodes, elements_added: 0, text_delta: 0,
+                        attributes_changed: 0, effects }, at));
+                }
+            }
+            if ex.len() + predicted.len() < 2 { continue }
+
+            let mut instances: Vec<(Handle, Instance, Vec<Handle>)> = ex.iter().zip(&rows)
+                .map(|(e, (_, tr, at))| (e.target, Instance { trigger: tr.trigger.clone(), anchored: tr.anchored,
+                    slots: vec![], probed: true }, at.to_vec())).collect();
+            let mut sample_ix: Vec<usize> = vec![];
+            if !predicted.is_empty() {
+                let n = predicted.len();
+                let mut s = vec![0, n / 2, n - 1];
+                s.dedup();
+                if s.len() > verify_left { predicted.clear() } else { sample_ix = s }
+            }
+            // Verify: probe the samples through the page's own code.
+            let mut refused = false;
+            let mut sample_tix = vec![];
+            for &si in &sample_ix {
+                let (p, want, _) = &predicted[si];
+                verify_left -= 1;
+                stats.verify_probes += 1;
+                let mut no_delegation = Default::default();
+                let o = probe_and_record(ctx, p, parser_nodes, cov, out, &Default::default(), &mut no_delegation);
+                if let Some(e) = cov.get_mut(&p.target) { e.sampled = true }
+                keys[ki].cands.retain(|c| !(c.target == p.target && c.gesture == p.gesture));
+                match &o.recorded {
+                    Some((i, _)) if same_recording(&out[*i], want) => sample_tix.push(*i),
+                    _ => { refused = true }
+                }
+            }
+            if refused {
+                // Fall back to per-element: the samples' own transitions (if
+                // any) are real probes and stay; the rest stay cut.
+                stats.refused += 1;
+                trace("refused: a sample disagreed", &g, ex.len(), ncut, first);
+                continue;
+            }
+            if ncut > 0 { trace(&format!("kept: {} predicted", predicted.len()), &g, ex.len(), ncut, first) }
+            for &i in &sample_tix { folded.insert(i); }
+            for e in &ex { folded.insert(e.recorded.as_ref().unwrap().0); }
+            for (j, (p, tr, at)) in predicted.into_iter().enumerate() {
+                let probed = sample_ix.contains(&j);
+                if !probed {
+                    keys[ki].cands.retain(|c| !(c.target == p.target && c.gesture == p.gesture));
+                    predict_left -= 1;
+                    stats.predicted += 1;
+                    let e = cov.entry(p.target).or_insert_with(|| {
+                        let mut e = crate::engine::Interactive { outside: true, ..Default::default() };
+                        describe(p.target, &mut e);
+                        e
+                    });
+                    e.templated = true;
+                    if p.root.is_some() { e.delegated = true }
+                    // ★ Classified as its siblings were: a handler that asked
+                    // the network on them would have asked it here.
+                    for x in &ex {
+                        e.net_get = e.net_get.max(x.net.0);
+                        e.net_blocked = e.net_blocked.max(x.net.1);
+                        e.beacons = e.beacons.max(x.net.2);
+                    }
+                    for eff in &tr.effects {
+                        let t = match eff {
+                            crate::engine::Effect::Attribute { target, .. } | crate::engine::Effect::Remove { target } => target,
+                            crate::engine::Effect::Insert { parent, .. } => parent,
+                            _ => continue,
+                        };
+                        if !e.effect_targets.contains(t) { e.effect_targets.push(t.clone()) }
+                    }
+                }
+                instances.push((p.target, Instance { trigger: tr.trigger, anchored: tr.anchored, slots: vec![], probed }, at));
+            }
+            instances.sort_by_key(|(h, _, _)| *h);
+
+            // The template's addresses: a fixed node by its path, the trigger
+            // itself as `$t`, any other structural address as a slot.
+            let mut slot_of: Vec<Option<usize>> = vec![];
+            let mut addrs_txt: Vec<String> = vec![];
+            let mut nslots = 0;
+            for a in &rule.addrs {
+                match a {
+                    Addr::Fixed(x) => { slot_of.push(None); addrs_txt.push(with(|d| d.node_path(*x))) }
+                    Addr::Rel(0, s) if s.is_empty() => { slot_of.push(None); addrs_txt.push("$t".into()) }
+                    Addr::Rel(..) => {
+                        // Two effects on the same structural address share a slot.
+                        let prev = rule.addrs.iter().position(|b| b == a).unwrap();
+                        let n = if prev < slot_of.len() { slot_of[prev].unwrap() } else { nslots += 1; nslots - 1 };
+                        slot_of.push(Some(n));
+                        addrs_txt.push(format!("${n}"));
+                    }
+                }
+            }
+            for (_, inst, at) in instances.iter_mut() {
+                let mut slots = vec![String::new(); nslots];
+                for (i, s) in slot_of.iter().enumerate() {
+                    if let Some(n) = s { slots[*n] = with(|d| d.node_path(at[i])) }
+                }
+                inst.slots = slots;
+            }
+            let t = Template { event: g.name(), effects: readdress(&rule.effects, &addrs_txt),
+                instances: instances.into_iter().map(|(_, i, _)| i).collect() };
+            stats.templates += 1;
+            templates.push(t);
+        }
+    }
+    let mut i = 0;
+    out.retain(|_| { let keep = !folded.contains(&i); i += 1; keep });
+    templates
 }
 
 fn describe(h: Handle, e: &mut crate::engine::Interactive) {
@@ -3725,12 +4212,16 @@ const GLOBALS: &str = r#"
     return mkurl(p);
   };
 
+  globalThis.__navAttempts = 0;
+  function __navNoop() { globalThis.__navAttempts++; }
   if (typeof __doc_url === 'string' && __doc_url) {
     var loc = mkurl(__parse_url(__doc_url));
     if (loc) {
       // Read-only: assigning location.href is navigation, which a converter
       // must never perform.
-      loc.assign = function () {}; loc.replace = function () {}; loc.reload = function () {};
+      // Counted (report only): a probe whose effect is a navigation is
+      // otherwise indistinguishable from one with no effect (§5.4.5.6c).
+      loc.assign = __navNoop; loc.replace = __navNoop; loc.reload = __navNoop;
       globalThis.location = loc;
       if (typeof window !== 'undefined') { window.location = loc; }
       // ★ Reads the CURRENT location, not the one captured here. history
@@ -3779,7 +4270,7 @@ const GLOBALS: &str = r#"
       var p = __parse_url(entries[idx].url);
       if (!p) return;
       var nu = mkurl(p);
-      nu.assign = function () {}; nu.replace = function () {}; nu.reload = function () {};
+      nu.assign = __navNoop; nu.replace = __navNoop; nu.reload = __navNoop;
       globalThis.location = nu;
     }
     function resolve(url) {
@@ -4971,7 +5462,7 @@ impl ScriptEngine for BoaEngine {
         LAYOUT_READS.with(|n| *n.borrow_mut() = 0);
         BASE.with(|b| *b.borrow_mut() = self.base_url.clone());
         CURRENT.with(|c| *c.borrow_mut() = None);
-        let mut rep = RunReport { transitions: vec![], interactive_found: 0, coverage: vec![],
+        let mut rep = RunReport { transitions: vec![], templates: vec![], interactive_found: 0, coverage: vec![],
             explore_stats: Default::default(),
             scripts_run: 0, scripts_failed: 0, errors: vec![],
             missing: vec![], nulls: vec![], first_error: None, cause: None, listeners_fired: 0,
@@ -5134,10 +5625,11 @@ impl ScriptEngine for BoaEngine {
             let parser_nodes = DOM.with(|d| d.borrow().parser_nodes);
             let bounds = self.probe_bounds.unwrap_or((PROBES_PER_HANDLER, MAX_PROBES));
             let t0 = std::time::Instant::now();
-            let (t, found, cov, mut stats) = explore_states(&mut ctx, parser_nodes, bounds);
+            let (t, tm, found, cov, mut stats) = explore_states(&mut ctx, parser_nodes, bounds);
             stats.micros = t0.elapsed().as_micros() as u64;
             rep.explore_stats = stats;
             rep.transitions = t;
+            rep.templates = tm;
             rep.interactive_found = found;
             rep.coverage = cov;
         }

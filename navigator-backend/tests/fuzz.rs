@@ -73,7 +73,33 @@ fn seed_corpus() -> Vec<String> {
              "transitions":[{"trigger":"#t","event":"click","anchored":true,
                "effects":[{"kind":"attribute","target":"#m","name":"class","from":"a","to":"b"}]}],
              "document":"<html><body><button id=\"t\">t</button><nav id=\"m\" class=\"a\"></nav></body></html>"}"##.into(),
+        // ★ A /4 recording with a template that cleanly applies: `$t` and a
+        // slot, two instances (legacy-web §5.4.5.6c). The expansion is
+        // hostile input like everything else.
+        r##"{"format":"atrium-navigator-recording/4","url":"https://e.test/","tier":2,
+             "tier_reason":"","measurements":{},"transitions":[],
+             "templates":[{"event":"click","attribute_only":true,
+               "effects":[{"kind":"attribute","target":"$t","name":"class","from":"a","to":"b"},
+                          {"kind":"attribute","target":"$0","name":"class","from":"p","to":"p on"}],
+               "instances":[{"trigger":"#t","anchored":true,"slots":["#m"]},
+                            {"trigger":"#u","anchored":true,"slots":["#n"]}]}],
+             "document":"<html><body><a id=\"t\" class=\"a\">t</a><a id=\"u\" class=\"a\">u</a><p id=\"m\" class=\"p\"></p><p id=\"n\" class=\"p\"></p></body></html>"}"##.into(),
     ]
+}
+
+/// A template whose instances exceed `max_transitions` once expanded:
+/// built, for the same reason as the table below.
+fn oversized_template() -> Vec<u8> {
+    let i = r##"{"trigger":"#t","anchored":true,"slots":[]}"##;
+    let many: Vec<&str> = std::iter::repeat(i).take(5000).collect();
+    format!(
+        r##"{{"format":"atrium-navigator-recording/4","url":"https://f.test/","tier":2,
+             "tier_reason":"","measurements":{{}},"transitions":[],
+             "templates":[{{"event":"click","effects":[{{"kind":"attribute","target":"$t","name":"class","from":null,"to":"x"}}],
+               "instances":[{}]}}],
+             "document":"<html><body><button id=\"t\">t</button></body></html>"}}"##,
+        many.join(","))
+        .into_bytes()
 }
 
 /// A recording whose transition table exceeds `max_transitions`.
@@ -145,6 +171,7 @@ fn note_name(n: &Note) -> &'static str {
         Note::DerivedFieldDisagreed { .. } => "DerivedFieldDisagreed",
         Note::UnknownEffectKind { .. } => "UnknownEffectKind",
         Note::TransitionsTruncated { .. } => "TransitionsTruncated",
+        Note::TemplateInstancesTruncated { .. } => "TemplateInstancesTruncated",
     }
 }
 
@@ -166,6 +193,7 @@ fn ingesting_mutated_recordings_never_panics_and_reaches_every_refusal() {
         // still contains the nodes its transitions name — and a fuzzer that
         // only ever sends garbage tests the front door and nothing behind it.
         let input = if round % 101 == 0 { oversized_transition_table() }
+                    else if round % 103 == 0 { oversized_template() }
                     else if round % 7 == 0 { src.as_bytes().to_vec() }
                     else { mutate(&mut rng, src) };
 
@@ -234,7 +262,8 @@ fn ingesting_mutated_recordings_never_panics_and_reaches_every_refusal() {
     // ★ EVERY note, not just the ones that were easy to reach. Asking only
     // for what the generator already produced would make this assertion a
     // description of the fuzzer rather than a requirement on it.
-    for w in ["UnknownEffectKind", "DerivedFieldDisagreed", "TransitionsTruncated"] {
+    for w in ["UnknownEffectKind", "DerivedFieldDisagreed", "TransitionsTruncated",
+              "TemplateInstancesTruncated"] {
         assert!(notes.contains(w),
             "the fuzzer never raised {w}: unreachable, or the generator cannot \
              build an input that reaches it. Reached: {notes:?}");

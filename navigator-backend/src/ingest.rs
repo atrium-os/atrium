@@ -19,8 +19,9 @@ pub fn ingest(bytes: &[u8], limits: &Limits) -> Result<Recording, Reject> {
         .map_err(|e| Reject::NotJson(e.to_string()))?;
     let obj = v.as_object().ok_or(Reject::NotAnObject)?;
 
+    let v4 = obj.get("format").and_then(Value::as_str) == Some(crate::FORMAT_V4);
     match obj.get("format").and_then(Value::as_str) {
-        Some(FORMAT) | Some(crate::FORMAT_V1) | Some(crate::FORMAT_V3) => {}
+        Some(FORMAT) | Some(crate::FORMAT_V1) | Some(crate::FORMAT_V3) | Some(crate::FORMAT_V4) => {}
         Some(other) => return Err(Reject::WrongFormat { found: other.to_string() }),
         None => return Err(Reject::MissingField("format")),
     }
@@ -81,7 +82,127 @@ pub fn ingest(bytes: &[u8], limits: &Limits) -> Result<Recording, Reject> {
         }
     }
 
+    match (obj.get("templates"), v4) {
+        (None, _) => {}
+        (Some(_), false) => return Err(Reject::BadField {
+            field: "templates", why: "only a /4 recording carries templates",
+        }),
+        (Some(list), true) => expand_templates(list, limits, &mut transitions, &mut notes)?,
+    }
+
     Ok(Recording { url, tier, tier_reason, measurements, transitions, document, notes })
+}
+
+/// ★★ A TEMPLATE IS EXPANDED HERE, NOT CARRIED. Each instance becomes the
+/// ordinary transition it stands for: its trigger, the template's event and
+/// effects, every `$t` replaced by the trigger and every `$N` by the
+/// instance's slot N. Anything after ingest therefore sees one vocabulary.
+///
+/// Refused: a malformed template, a `$` address that is not `$t` or a slot
+/// number, an instance whose slot count is not the template's. Truncated,
+/// with a note: instances past `max_transitions`, or past `max_total_bytes`
+/// of expanded effects (a few bytes of template must not stand for more
+/// than a flat recording could have said).
+fn expand_templates(list: &Value, limits: &Limits, transitions: &mut Vec<Transition>,
+    notes: &mut Vec<Note>) -> Result<(), Reject>
+{
+    let arr = list.as_array().ok_or(Reject::BadField { field: "templates", why: "not an array" })?;
+    if arr.len() > limits.max_templates {
+        return Err(Reject::TooLarge { what: "templates", measured: arr.len(), allowed: limits.max_templates });
+    }
+    let mut bytes: usize = transitions.iter().map(transition_bytes).sum();
+    let (mut kept, mut discarded) = (0usize, 0usize);
+    for t in arr {
+        let o = t.as_object().ok_or(Reject::BadField { field: "templates", why: "entry is not an object" })?;
+        let event = bounded_str(o.get("event"), "event", limits)?.ok_or(Reject::MissingField("event"))?;
+        let effs = o.get("effects").and_then(Value::as_array)
+            .ok_or(Reject::BadField { field: "effects", why: "not an array" })?;
+        if effs.len() > limits.max_effects_per_transition {
+            return Err(Reject::TooLarge { what: "effects", measured: effs.len(),
+                allowed: limits.max_effects_per_transition });
+        }
+        let mut effects = vec![];
+        for e in effs { if let Some(eff) = effect(e, limits, notes)? { effects.push(eff) } }
+        // The slots the effects name: every `$` address must be `$t` or `$N`.
+        let mut nslots = 0usize;
+        for e in &effects {
+            if let Some(a) = address(e) {
+                if let Some(rest) = a.strip_prefix('$') {
+                    if rest != "t" {
+                        let n: usize = rest.parse().map_err(|_| Reject::BadField {
+                            field: "effects", why: "a $ address is neither $t nor a slot number" })?;
+                        if n >= limits.max_effects_per_transition {
+                            return Err(Reject::BadField { field: "effects", why: "slot number out of range" });
+                        }
+                        nslots = nslots.max(n + 1);
+                    }
+                }
+            }
+        }
+        let insts = o.get("instances").and_then(Value::as_array)
+            .ok_or(Reject::BadField { field: "instances", why: "not an array" })?;
+        for i in insts {
+            let io = i.as_object().ok_or(Reject::BadField { field: "instances", why: "entry is not an object" })?;
+            let trigger = bounded_str(io.get("trigger"), "trigger", limits)?.ok_or(Reject::MissingField("trigger"))?;
+            let anchored = io.get("anchored").and_then(Value::as_bool).unwrap_or(false);
+            let slots = io.get("slots").and_then(Value::as_array)
+                .ok_or(Reject::BadField { field: "slots", why: "not an array" })?;
+            if slots.len() != nslots {
+                return Err(Reject::BadField { field: "slots", why: "not the number of slots the template names" });
+            }
+            let slots: Vec<String> = slots.iter()
+                .map(|v| bounded_str(Some(v), "slots", limits)?.ok_or(Reject::BadField { field: "slots", why: "null slot" }))
+                .collect::<Result<_, _>>()?;
+            let resolve = |a: &str| -> String {
+                match a.strip_prefix('$') {
+                    Some("t") => trigger.clone(),
+                    Some(n) => slots[n.parse::<usize>().unwrap()].clone(),
+                    None => a.to_string(),
+                }
+            };
+            let effects: Vec<Effect> = effects.iter().map(|e| match e {
+                Effect::Attribute { target, name, from, to } => Effect::Attribute {
+                    target: resolve(target), name: name.clone(), from: from.clone(), to: to.clone() },
+                Effect::Insert { parent, index, html } => Effect::Insert {
+                    parent: resolve(parent), index: *index, html: html.clone() },
+                Effect::RemoveRange { parent, index, count } => Effect::RemoveRange {
+                    parent: resolve(parent), index: *index, count: *count },
+                Effect::Remove { target } => Effect::Remove { target: resolve(target) },
+                Effect::Truncated { dropped } => Effect::Truncated { dropped: *dropped },
+            }).collect();
+            let t = Transition { trigger, event: event.clone(), anchored, effects };
+            let b = transition_bytes(&t);
+            if transitions.len() >= limits.max_transitions || bytes + b > limits.max_total_bytes {
+                discarded += 1;
+                continue;
+            }
+            bytes += b;
+            kept += 1;
+            transitions.push(t);
+        }
+    }
+    if discarded > 0 { notes.push(Note::TemplateInstancesTruncated { kept, discarded }) }
+    Ok(())
+}
+
+/// The address an effect names (target, or parent).
+fn address(e: &Effect) -> Option<&str> {
+    match e {
+        Effect::Attribute { target, .. } | Effect::Remove { target } => Some(target),
+        Effect::Insert { parent, .. } | Effect::RemoveRange { parent, .. } => Some(parent),
+        Effect::Truncated { .. } => None,
+    }
+}
+
+fn transition_bytes(t: &Transition) -> usize {
+    t.trigger.len() + t.event.len() + t.effects.iter().map(|e| match e {
+        Effect::Attribute { target, name, from, to } =>
+            target.len() + name.len() + from.as_ref().map_or(0, String::len) + to.as_ref().map_or(0, String::len),
+        Effect::Insert { parent, html, .. } => parent.len() + html.len(),
+        Effect::RemoveRange { parent, .. } => parent.len() + 16,
+        Effect::Remove { target } => target.len(),
+        Effect::Truncated { .. } => 8,
+    }).sum::<usize>()
 }
 
 fn bounded_str(v: Option<&Value>, field: &'static str, limits: &Limits)

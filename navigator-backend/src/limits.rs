@@ -21,6 +21,11 @@ pub struct Limits {
     pub max_string_bytes: usize,
     /// Inserted markup, which the converter already bounds at 16 KiB.
     pub max_insert_bytes: usize,
+    /// Templates in one recording (§5.4.5.6c). Their instances count against
+    /// `max_transitions` once expanded, and the expansion against
+    /// `max_total_bytes`: a template expands to nothing a flat recording
+    /// could not have carried.
+    pub max_templates: usize,
 }
 
 impl Default for Limits {
@@ -32,6 +37,9 @@ impl Default for Limits {
             max_effects_per_transition: 64,
             max_string_bytes: 64 * 1024,
             max_insert_bytes: 64 * 1024,
+            // The converter keeps at most one per handler group and a
+            // document has at most 256 probes' worth of handlers.
+            max_templates: 256,
         }
     }
 }

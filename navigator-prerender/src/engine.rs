@@ -79,6 +79,21 @@ pub struct Interactive {
     pub gestures: Vec<String>,
     /// A probe on it hit the loop-iteration limit (a handler that spins).
     pub aborted: bool,
+    /// Not probed, but an instance of a verified template (§5.4.5.6c): its
+    /// transition is its siblings', predicted and checked on a sample.
+    pub templated: bool,
+    /// Probed as a template's verification sample.
+    pub sampled: bool,
+    /// Navigations its probes attempted (location.assign/replace/reload),
+    /// every one refused: an effect exploration cannot record.
+    pub nav_refused: u32,
+    /// The refused requests' `<reason> <host>`, for telling data from
+    /// analytics in case 1.
+    pub blocked_hosts: Vec<String>,
+    /// Not probed, but every sibling sharing its handler was probed and
+    /// changed nothing observable, and so did a sample of the unprobed ones:
+    /// the handler is known to do nothing visible here (§5.4.5.6c).
+    pub inert: bool,
 }
 
 /// What exploration spent, per document (legacy-web §5.4.5.6a step 2).
@@ -100,6 +115,16 @@ pub struct ExploreStats {
     /// Probes each handler got, in key order (an unbounded run gives the
     /// candidates per handler, which is what the bounds are chosen from).
     pub per_handler: Vec<u32>,
+    /// Templates kept, the instances they PREDICTED (not probed), the
+    /// verification probes run, and templates refused because a sample
+    /// disagreed with its prediction.
+    pub templates: u32,
+    pub predicted: u32,
+    pub verify_probes: u32,
+    pub refused: u32,
+    /// Cut candidates whose handler group is verified to do nothing
+    /// observable (every probe of the group, and a sample, recorded nothing).
+    pub inert: u32,
 }
 
 pub struct RunReport {
@@ -154,6 +179,8 @@ pub struct RunReport {
     /// ★ What the page DOES when a reader acts on it — recorded by running
     /// its JS as an ORACLE rather than as a producer. See `explore`.
     pub transitions: Vec<Transition>,
+    /// Transitions shared by sibling elements, recorded once (§5.4.5.6c).
+    pub templates: Vec<Template>,
     /// Interactive elements found, whether or not probing them changed
     /// anything: the denominator for the transitions above.
     pub interactive_found: u32,
@@ -235,6 +262,75 @@ pub struct Transition {
     pub attributes_changed: u32,
     /// What actually happened, replayable against the tier 1 document.
     pub effects: Vec<Effect>,
+}
+
+/// ★★ ONE HANDLER'S TRANSITION, RECORDED ONCE, OVER THE ELEMENTS THAT SHARE IT
+/// (legacy-web §5.4.5.6c).
+///
+/// The effects are stored once. An effect's address is a literal path (the
+/// same node for every instance: a shared overlay), `$t` (the instance's own
+/// trigger: a class toggle on itself), or `$N` (the instance's slot N: tab i
+/// shows panel i, item i toggles its own body). Each instance binds a trigger
+/// and its slots; expanding it gives exactly the `Transition` a probe on that
+/// element would have recorded.
+///
+/// ★ A template is a COMPRESSION OF THE RECORDING, not a new behaviour: it
+/// expands into the existing §5 vocabulary (attribute, insert, remove), so
+/// the profile is unchanged and a consumer that expands at ingest replays it
+/// down the ordinary path. Instances the converter did not probe are
+/// PREDICTED from the structure the probed ones share, and the template is
+/// kept only if probing a sample of them (first, middle, last) reproduced the
+/// prediction exactly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Template {
+    pub event: String,
+    pub effects: Vec<Effect>,
+    pub instances: Vec<Instance>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Instance {
+    pub trigger: String,
+    pub anchored: bool,
+    pub slots: Vec<String>,
+    /// Probed (an example or a verification sample) rather than predicted.
+    /// Report only; never in an artifact.
+    pub probed: bool,
+}
+
+impl Template {
+    /// The address an effect names for one instance, or None for a slot the
+    /// instance does not bind.
+    pub fn resolve<'a>(addr: &'a str, i: &'a Instance) -> Option<&'a str> {
+        if addr == "$t" { return Some(&i.trigger) }
+        match addr.strip_prefix('$') {
+            Some(n) => n.parse::<usize>().ok().and_then(|n| i.slots.get(n)).map(String::as_str),
+            None => Some(addr),
+        }
+    }
+
+    /// The transition one instance stands for.
+    pub fn expand(&self, i: &Instance) -> Option<Transition> {
+        let r = |a: &String| Self::resolve(a, i).map(str::to_string);
+        let mut effects = vec![];
+        for e in &self.effects {
+            effects.push(match e {
+                Effect::Attribute { target, name, from, to } =>
+                    Effect::Attribute { target: r(target)?, name: name.clone(), from: from.clone(), to: to.clone() },
+                Effect::Insert { parent, index, html } =>
+                    Effect::Insert { parent: r(parent)?, index: *index, html: html.clone() },
+                Effect::Remove { target } => Effect::Remove { target: r(target)? },
+                Effect::Truncated { dropped } => Effect::Truncated { dropped: *dropped },
+            });
+        }
+        Some(Transition { trigger: i.trigger.clone(), event: self.event.clone(), anchored: i.anchored,
+            elements_added: 0, text_delta: 0, attributes_changed: 0, effects })
+    }
+
+    pub fn is_attribute_only(&self) -> bool {
+        !self.effects.is_empty()
+            && self.effects.iter().all(|e| matches!(e, Effect::Attribute { .. }))
+    }
 }
 
 impl Transition {

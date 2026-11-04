@@ -104,6 +104,9 @@ pub enum Note {
     UnknownEffectKind { kind: String },
     /// Transitions beyond the limit were discarded at ingest.
     TransitionsTruncated { kept: usize, discarded: usize },
+    /// Template instances not expanded: past `max_transitions`, or past the
+    /// bytes a flat recording could have carried (`max_total_bytes`).
+    TemplateInstancesTruncated { kept: usize, discarded: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,3 +148,12 @@ pub const FORMAT_V1: &str = "atrium-navigator-recording/1";
 /// against `max_total_bytes`). Refusing it meant every fresh recording was
 /// "unknown format" the moment it reached the jailed lane.
 pub const FORMAT_V3: &str = "atrium-navigator-recording/3";
+/// ★ `/3` plus `templates` (legacy-web §5.4.5.6c): one transition recorded
+/// once over the sibling elements that share it. They are EXPANDED AT INGEST
+/// into ordinary transitions, so everything after this stage (apply,
+/// inversion, sessions, restore) sees the same vocabulary it always has and
+/// a template is never a second, less examined path. The converter writes
+/// `/4` only when a recording has templates; a `/3` recording that carries
+/// a `templates` field is refused, since a `/3` reader would have replayed a
+/// subset of it with nothing to say so.
+pub const FORMAT_V4: &str = "atrium-navigator-recording/4";

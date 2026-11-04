@@ -851,6 +851,45 @@ differing from the recorded one, with nothing to signal it.
 back to `insert`. That is what lets an undo be an ordinary transition, validated and applied
 by the ordinary path, rather than a second and less examined mechanism.
 
+### 4.5a Recording format version 4: templates (2026-11-05)
+
+`atrium-navigator-recording/4` adds `templates`: one transition recorded once over the
+sibling elements whose handler it is (legacy-web §5.4.5.6c). Version 3 added only what
+the normalizer reads (`stylesheets`, `images`), so it needed no section here.
+
+```
+"templates": [
+  { "event": "click", "attribute_only": true,
+    "effects": [ { "kind": "attribute", "target": "$t", "name": "aria-selected", "from": null, "to": "true" },
+                 { "kind": "attribute", "target": "$0", "name": "class", "from": "panel", "to": "panel shown" } ],
+    "instances": [ { "trigger": "html:0>body:0>ul:0>li:0>a:0", "anchored": true, "slots": ["html:0>body:0>div:0>div:0"] },
+                   { "trigger": "html:0>body:0>ul:0>li:1>a:0", "anchored": true, "slots": ["html:0>body:0>div:0>div:1"] } ] } ]
+```
+
+An effect's address is a literal path (the same node for every instance), `$t` (the
+instance's trigger) or `$N` (the instance's slot N). Values (`from`, `to`, `html`,
+`index`) are the same for every instance. That is what makes it one transition.
+
+- **Expanded at ingest, never carried.** Each instance becomes the ordinary `Transition`
+  it stands for, so apply, inversion, sessions and restore see the vocabulary they
+  always have. A template is a compression of the recording, not a new behaviour, and
+  there is no second replay path to examine.
+- **Refused:** a `$` address that is neither `$t` nor a slot number below
+  `max_effects_per_transition`, and an instance whose slot count differs from the number
+  the effects name. So is a `/3` recording that carries `templates`: a `/3` reader would
+  have ignored the field and replayed a subset, with nothing to say so.
+- **Bounded:** at most `max_templates` (256), and the instances count against
+  `max_transitions` once expanded. The expanded effects count against `max_total_bytes`:
+  a few bytes of template must not stand for more than a flat recording could say.
+  Instances past either bound are dropped, and `Note::TemplateInstancesTruncated` says how
+  many.
+- **Written only when there is one.** A recording with no template is `/3`, byte for byte
+  what it was. So the non-exploring control arm, and every recording without siblings to
+  generalise, is unchanged.
+
+Tests: `tests/templates.rs` (expansion, replay and back, refusals, bounds) and the
+fuzzer, which has a `/4` seed and must reach `TemplateInstancesTruncated`.
+
 ---
 
 ## 5. The store is Tessera

@@ -68,10 +68,13 @@ fn report(c: &navigator_prerender::Conversion, fetchd: Option<(u64, u64)>) -> St
     let _ = writeln!(o, "J\t{}\t{}", c.injected_scripts_run, c.injected_scripts_refused);
     let _ = writeln!(o, "X\t{}\t{}", c.text_before, c.text_after);
     let _ = writeln!(o, "Z\t{}", c.removals_refused);
-    let _ = writeln!(o, "S\t{}\t{}\t{}\t{}\t{}", c.interactive_found, c.transitions.len(),
-        c.transitions.iter().filter(|t| t.anchored).count(),
-        c.transitions.iter().filter(|t| t.is_attribute_only()).count(),
-        c.transitions.iter().filter(|t| t.effects.iter()
+    // Counted EXPANDED: a template's instances are transitions, and the
+    // report must stay comparable with recordings made before templates.
+    let all = c.expanded_transitions();
+    let _ = writeln!(o, "S\t{}\t{}\t{}\t{}\t{}", c.interactive_found, all.len(),
+        all.iter().filter(|t| t.anchored).count(),
+        all.iter().filter(|t| t.is_attribute_only()).count(),
+        all.iter().filter(|t| t.effects.iter()
             .any(|e| matches!(e, navigator_prerender::Effect::Truncated { .. }))).count());
     // The POLICY's verdict travels with the measurements, so the parent can
     // report what would be published without re-deriving it.
@@ -113,23 +116,31 @@ fn report(c: &navigator_prerender::Conversion, fetchd: Option<(u64, u64)>) -> St
     // n native, e explorable, p probed, c cut by the probe bound, r recorded,
     // t truncated, d probed as a delegated target, D a delegating root whose
     // delegated probe recorded, x outside the interactive universe, h cut but
-    // its handlers probed elsewhere, a a probe on it hit the loop limit. The
-    // 14th column lists the gestures probed.
+    // its handlers probed elsewhere, a a probe on it hit the loop limit, T
+    // not probed but an instance of a verified template (§5.4.5.6c), v
+    // probed as a template's verification sample, I not probed but its
+    // handler group verified to do nothing observable. The 14th column lists
+    // the gestures probed, the 15th the navigations its probes attempted,
+    // the 16th the `<reason> <host>` of each request they were refused. The U line's last five columns: templates kept,
+    // instances predicted, verification probes, templates refused, inert.
     {
         let s = &c.explore_stats;
         let per: Vec<String> = s.per_handler.iter().map(|n| n.to_string()).collect();
-        let _ = writeln!(o, "U\t{}\t{}\t{}\t{}\t{}\t{}\t{}", s.handlers, s.probes, s.cut, s.rounds, s.micros, per.join(","), s.aborted);
+        let _ = writeln!(o, "U\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", s.handlers, s.probes, s.cut, s.rounds,
+            s.micros, per.join(","), s.aborted, s.templates, s.predicted, s.verify_probes, s.refused, s.inert);
     }
     for k in &c.coverage {
         let flags: String = [(k.native, 'n'), (k.explorable, 'e'), (k.probed, 'p'), (k.over_cap, 'c'),
                              (k.recorded, 'r'), (k.truncated, 't'), (k.delegated, 'd'), (k.via, 'D'),
-                             (k.outside, 'x'), (k.represented, 'h'), (k.aborted, 'a')]
+                             (k.outside, 'x'), (k.represented, 'h'), (k.aborted, 'a'),
+                             (k.templated, 'T'), (k.sampled, 'v'), (k.inert, 'I')]
             .iter().filter(|(on, _)| *on).map(|(_, ch)| *ch).collect();
         let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
-        let _ = writeln!(o, "K\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        let _ = writeln!(o, "K\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             clean(&k.path), clean(&k.tag), clean(&k.input_type), clean(&k.events.join(",")), flags,
             k.net_get, k.net_blocked, k.beacons, k.timers_scheduled, k.timers_left, k.intervals_left,
-            clean(&k.effect_targets.join("|")), clean(&k.gestures.join(",")));
+            clean(&k.effect_targets.join("|")), clean(&k.gestures.join(",")), k.nav_refused,
+            clean(&k.blocked_hosts.join("|")));
     }
     o
 }

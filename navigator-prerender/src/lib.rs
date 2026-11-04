@@ -49,6 +49,10 @@ pub struct Conversion {
     /// oracle and discarding the result. Empty unless the engine was asked
     /// to explore.
     pub transitions: Vec<engine::Transition>,
+    /// ★ Transitions that sibling elements share, recorded ONCE
+    /// (legacy-web §5.4.5.6c). `transitions` holds only what no template
+    /// covers; `expanded_transitions` gives the flat list.
+    pub templates: Vec<engine::Template>,
     /// Interactive elements found — the denominator for `transitions`.
     pub interactive_found: u32,
     /// Per-element exploration coverage (legacy-web §5.4.5.6).
@@ -254,6 +258,7 @@ pub fn convert_with_opts(
             .map(str::len).sum::<usize>(),
         removals_refused: dom.removals_refused,
         transitions: rep.transitions,
+        templates: rep.templates,
         interactive_found: rep.interactive_found,
         coverage: rep.coverage,
         explore_stats: rep.explore_stats,
@@ -376,6 +381,18 @@ fn classify(first: Option<&str>, cause: Option<&(String, String)>) -> Verdict {
 // and untestable on its own.
 
 impl Conversion {
+    /// Every transition the recording stands for: the plain ones, then each
+    /// template's instances in order. What a consumer replays, and what a
+    /// recorder without templates would have written (plus the predicted
+    /// instances it could not reach).
+    pub fn expanded_transitions(&self) -> Vec<engine::Transition> {
+        let mut v = self.transitions.clone();
+        for t in &self.templates {
+            v.extend(t.instances.iter().filter_map(|i| t.expand(i)));
+        }
+        v
+    }
+
     /// Fraction of the document's visible text that survived its scripts.
     /// 1.0 is unchanged, above 1.0 means content was added, below means lost.
     /// A document with no text to begin with returns 1.0: nothing was lost.
@@ -465,7 +482,7 @@ impl TierPolicy {
     }
 }
 
-pub use engine::{Effect, Transition};
+pub use engine::{Effect, Instance, Template, Transition};
 
 /// ★ A CHALLENGE PAGE IS NOT THE SITE, and converting one produces an
 /// artifact that looks like a successful conversion of a document reading

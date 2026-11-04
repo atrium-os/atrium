@@ -88,7 +88,10 @@ fn delegated_candidates_share_their_roots_budget() {
     let c = explore_with(&h, None);
     // The discovery probe at <body>, then 64 of the 500 targets.
     assert_eq!(c.explore_stats.probes, 65, "{:?}", c.explore_stats);
-    assert_eq!(c.transitions.len(), 64);
+    let probed = c.transitions.len()
+        + c.templates.iter().flat_map(|t| &t.instances).filter(|i| i.probed).count()
+        - c.explore_stats.verify_probes as usize;
+    assert_eq!(probed, 64, "64 budgeted probes recorded, whether or not a template folds them");
 }
 
 /// Bound (and native) functions are told apart by OBJECT, since their source

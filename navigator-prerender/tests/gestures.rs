@@ -22,7 +22,8 @@ fn probe(html: &str) -> Conversion {
 }
 
 fn events(c: &Conversion) -> Vec<(String, String)> {
-    c.transitions.iter().map(|t| (t.trigger.clone(), t.event.clone())).collect()
+    // Expanded: sibling elements that share a transition are one template.
+    c.expanded_transitions().iter().map(|t| (t.trigger.clone(), t.event.clone())).collect()
 }
 
 fn page(body: &str, script: &str) -> String {
@@ -250,5 +251,6 @@ fn gesture_and_delegated_recordings_are_reproducible() {
          document.getElementById('c').addEventListener('change', function () { P.className = 'c' + this.checked; });");
     let (a, b) = (probe(&html), probe(&html));
     assert_eq!(format!("{:?}", a.transitions), format!("{:?}", b.transitions));
-    assert_eq!(a.transitions.len(), 4, "{:?}", events(&a));
+    assert_eq!(format!("{:?}", a.templates), format!("{:?}", b.templates));
+    assert_eq!(a.expanded_transitions().len(), 4, "{:?}", events(&a));
 }
