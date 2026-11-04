@@ -2360,10 +2360,12 @@ impl<'a> Cx<'a> {
         // The texts of the words placed since the last space, atomic or
         // break: the chain a word with no break before it is glued to.
         let mut run_texts: Vec<String> = vec![];
+        // Whether each of them is glued to the one before it.
+        let mut run_glue: Vec<bool> = vec![];
         for it in items {
             match it {
                 Item::Tab(st, l) => {
-                    run_texts.clear();
+                    run_texts.clear(); run_glue.clear();
                     // Tab stops: multiples of tab-size × the space's advance,
                     // measured from the line's start (exact for any font).
                     let sp: U = self.sh.shape(" ", &st, &mut self.report).iter().map(|p| p.width).sum();
@@ -2371,10 +2373,10 @@ impl<'a> Cx<'a> {
                     cx = (cx / stop + 1) * stop;
                     pending = None;
                 }
-                Item::Break => { *forced.last_mut().expect("line") = true; lines.push(vec![]); forced.push(false); cx = 0; pending = None; run_texts.clear() }
-                Item::Space(st, l) => { pending = Some((st, l)); run_texts.clear() }
+                Item::Break => { *forced.last_mut().expect("line") = true; lines.push(vec![]); forced.push(false); cx = 0; pending = None; run_texts.clear(); run_glue.clear() }
+                Item::Space(st, l) => { pending = Some((st, l)); run_texts.clear(); run_glue.clear() }
                 Item::PreSpace(text, st, l) => {
-                    run_texts.clear();
+                    run_texts.clear(); run_glue.clear();
                     let pieces = self.sh.shape(&text, &st, &mut self.report);
                     let ww: U = pieces.iter().map(|p| p.width).sum();
                     // ★ Preserved spaces HANG at a line end (pre-wrap): they
@@ -2385,7 +2387,7 @@ impl<'a> Cx<'a> {
                     pending = None;
                 }
                 Item::Atomic(ah, st, l) => {
-                    run_texts.clear();
+                    run_texts.clear(); run_glue.clear();
                     // An atomic inline wraps as ONE unbreakable unit; it is
                     // sized against the line, then laid out for real only
                     // once alignment has fixed where the line starts.
@@ -2414,14 +2416,18 @@ impl<'a> Cx<'a> {
                         (Some((ps, _)), Some(false)) => self.sh.shape(" ", ps, &mut self.report).iter().map(|p| p.width).sum(),
                         _ => 0,
                     };
-                    let mut wrap = cx + sw + ww > w && !lines.last().expect("line").is_empty() && !no_soft_wrap(&l, &pending);
+                    let over = cx + sw + ww > w && !lines.last().expect("line").is_empty();
+                    let mut wrap = over && !no_soft_wrap(&l, &pending);
                     // ★ A word touching the one before it wraps only where
-                    // UAX #14 allows; otherwise the glued chain goes to the
-                    // next line WITH it — or, if the chain is the whole
-                    // line, overflows rather than splitting a word.
-                    if wrap && pending.is_none() && run_texts.last().is_some_and(|p| !uax14_break_between(p, &text)) {
+                    // UAX #14 allows (and never inside `nowrap`); otherwise
+                    // the glued chain goes to the next line WITH it — or, if
+                    // the chain is the whole line, overflows rather than
+                    // splitting a word. Wikipedia's nowrap "[timeframe?]"
+                    // ran off the line instead of moving down whole.
+                    let glued = pending.is_none() && run_texts.last().is_some_and(|p| l.nowrap || !uax14_break_between(p, &text));
+                    if over && glued {
                         let mut k = 1;
-                        while k < run_texts.len() && !uax14_break_between(&run_texts[run_texts.len() - k - 1], &run_texts[run_texts.len() - k]) { k += 1 }
+                        while k < run_texts.len() && run_glue[run_texts.len() - k] { k += 1 }
                         let line = lines.last_mut().expect("line");
                         if k < line.len() {
                             let mut moved = line.split_off(line.len() - k);
@@ -2433,10 +2439,12 @@ impl<'a> Cx<'a> {
                             lines.push(moved);
                             forced.push(false);
                             run_texts.drain(..run_texts.len() - k);
+                            run_glue.drain(..run_glue.len() - k);
                         }
                         wrap = false;
                     }
-                    if wrap { run_texts.clear() }
+                    if wrap { run_texts.clear(); run_glue.clear() }
+                    run_glue.push(glued && !run_texts.is_empty());
                     run_texts.push(text.clone());
                     if wrap { lines.push(vec![]); forced.push(false); cx = 0 } else { cx += sw }
                     if ww > w && l.break_word {
@@ -3075,6 +3083,22 @@ mod tests {
         // Spaced words and CJK segments still break.
         let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px } div { width: 40px }</style><div>北京四季分明</div>"#);
         assert!(o.scene.runs.iter().map(|r| r.y).collect::<std::collections::BTreeSet<_>>().len() > 1);
+    }
+
+    /// ★ A `nowrap` span of several words moves to the next line whole
+    /// when it does not fit, like a glued word — Wikipedia's
+    /// "[timeframe?]" ran off the end of its line.
+    #[test]
+    fn a_nowrap_span_moves_down_whole() {
+        // UAX #14 would break after the hyphen; `nowrap` does not.
+        let src = |w: &str| format!(r#"<style>body {{ margin-left: 0px; margin-top: 0px }} .n {{ white-space: nowrap }} div {{ width: {w} }}</style>
+            <div>This is ongoing <span class="n"><b>well-</b>known</span></div>"#);
+        let probe = render(&src("auto"));
+        let k = probe.scene.runs.iter().find(|r| r.text == "known").expect("run").x;
+        let o = render(&src(&format!("{}px", k / PX + 4)));
+        let y = |s: &str| o.scene.runs.iter().find(|r| r.text == s).map(|r| r.y).unwrap_or_else(|| panic!("{s}"));
+        assert_eq!(y("well-"), y("known"), "the span stays together");
+        assert!(y("well-") > y("This"), "on the next line");
     }
 
     /// ★ UAX #14. CJK breaks between ideographs (punctuation stays with
