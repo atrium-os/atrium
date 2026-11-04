@@ -1741,6 +1741,27 @@ jaild suite (71 tests) passes on FreeBSD.
 - Under TCG a large `scp` sometimes lands with a run of zeros. Both e2e scripts now copy
   again on a hash mismatch, and still never run a mismatched binary.
 
+**The three fixes, verified on FreeBSD (2026-11-04, cloud VM, 13ed962).** The jaild and
+portcullisd hashes were checked at the destination.
+- **Deploy keeps the section.** `deploy-portcullis.sh` printed `policies ok
+  ([resource_control] from the target: allow_rctl = true)`, and the file still holds it.
+  The converter e2e (`--rounds 1 --net 3`) then PASSED:
+  - `memoryuse:sigkill=4294967296` and `pcpu:deny=100` were present while it ran and gone
+    after;
+  - A/B was byte-identical;
+  - no rctl rules were leaked.
+- **A target without the section.** A plain deploy printed `no [resource_control] on the
+  target or in the repository; defaults (off)` and left it off. `ALLOW_RCTL=true`
+  printed `from the repository + allow_rctl=true` and wrote `allow_rctl = true`.
+- **UNCAPPED reaches the caller.** Booted with `kern.racct.enable=0`, `navtest` ran
+  `portcullis exec --daemon --memory 512` on the converter with stderr sent to a file.
+  The file holds `running UNCAPPED (asked for memoryuse 512 MiB pcpu 100%)`, and so
+  does portcullisd's log.
+- **One log per app.** That e2e run and the UNCAPPED check added no per-instance files.
+  The count of `--` names stayed at 338, all from before the fix and left in place.
+  New runs wrote `app-org-atrium-navigator-converter.log` and
+  `app-org-atrium-navigator-fetcher.log`, both empty because no failure happened.
+
 ### 6.5.3 The trust gate: `require_signatures`
 
 Two findings surfaced while designing the worker lane. Neither was caused by it; both were
