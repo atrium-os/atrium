@@ -3078,13 +3078,17 @@ mod tests {
     }
 
     /// ★ UAX #14. CJK breaks between ideographs (punctuation stays with
-    /// what it closes), Thai between dictionary words, and a Latin run is
-    /// left alone.
+    /// what it closes), Thai between dictionary words, and a Latin run
+    /// after its hyphens and slashes — never inside a word or a number.
     #[test]
     fn unspaced_scripts_break_between_words() {
         assert_eq!(uax14_segments("北京四季分明，春秋"), ["北", "京", "四", "季", "分", "明，", "春", "秋"]);
         assert_eq!(uax14_segments("สวัสดีครับ"), ["สวัสดี", "ครับ"]);
-        assert_eq!(uax14_segments("well-known/path"), ["well-known/path"]);
+        assert_eq!(uax14_segments("well-known/path"), ["well-", "known/", "path"]);
+        assert_eq!(uax14_segments("don't"), ["don't"]);
+        assert_eq!(uax14_segments("1,234.56"), ["1,234.56"]);
+        assert_eq!(uax14_segments("(-5)"), ["(-5)"]);
+        assert_eq!(uax14_segments("Com\u{ad}puted"), ["Com\u{ad}puted"]);
         assert_eq!(uax14_segments("2019年PM2.5"), ["2019", "年", "PM2.5"]);
         // And in layout: a paragraph with no spaces wraps INSIDE its box.
         let o = render(&format!(r#"<style>body {{ margin-left: 0px; margin-top: 0px }} div {{ width: 200px }}</style><div>{}</div>"#, "北京四季分明".repeat(10)));
@@ -3093,6 +3097,15 @@ mod tests {
         ys.dedup();
         assert!(ys.len() >= 3, "sixty ideographs in 200 px take several lines: {}", ys.len());
         assert!(o.scene.runs.iter().all(|r| r.x < 200 * PX), "nothing starts past the box");
+        // A long URL wraps at its slashes instead of running off the line.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px } div { width: 200px }</style><div>https://www.example.edu/Documents/ADMINISTRATION/CENTERS/handouts/how-to-tie-a-tie.pdf</div>"#);
+        assert!(o.scene.runs.len() >= 3, "{}", o.scene.runs.len());
+        let fonts = FontSet::load().expect("pinned font set");
+        let right = o.scene.runs.iter().map(|r| {
+            let ff = fonts.faces[r.face].parse();
+            r.x + r.glyphs.iter().map(|&(g, dx, _)| dx + ff.glyph_hor_advance(ttf_parser::GlyphId(g)).unwrap_or(0) as U * r.size / fonts.faces[r.face].upem).max().unwrap_or(0)
+        }).max().unwrap();
+        assert!(right <= 200 * PX, "every line ends inside the box: {}", right / PX);
         assert_eq!(o.report.overflow_lines, 0, "no line overflows");
     }
 
@@ -3129,7 +3142,7 @@ mod tests {
         let text: Vec<&str> = o.scene.runs.iter().map(|r| r.text.as_str()).collect();
         assert!(text.contains(&"shown") && text.contains(&"opened"), "{text:?}");
         assert!(!text.contains(&"modal") && !text.contains(&"closed"), "{text:?}");
-        assert!(text.contains(&"author-wins"), "author display beats the UA [hidden] rule: {text:?}");
+        assert!(text.concat().contains("author-wins"), "author display beats the UA [hidden] rule: {text:?}");
     }
 
     /// ★ An item placed past the explicit grid GROWS the grid (CSS Grid
@@ -3964,24 +3977,29 @@ fn resolve_stops(stops: &[navigator_style::values::Stop], s: &Style) -> Vec<(u32
 }
 
 /// Right-to-left by Unicode bidi class: what makes a line need reordering.
-/// A space-free run split at its UAX #14 break opportunities. Only a run
-/// with a character from a script that breaks WITHOUT spaces is segmented —
-/// CJK ideographs and symbols, kana, Hangul, and the Southeast Asian scripts
-/// (whose word boundaries come from ICU4X's dictionaries, integer data, so a
-/// render stays byte-identical across ISAs). Latin runs keep breaking at
-/// spaces only, as before.
+/// A space-free run split at its UAX #14 break opportunities: between CJK
+/// ideographs, kana and Hangul; between the words of the Southeast Asian
+/// scripts (from ICU4X's dictionaries, integer data, so a render stays
+/// byte-identical across ISAs); and in spaced scripts after a hyphen, a
+/// slash or a dash before a letter — a long URL or `well-known/path` wraps
+/// there instead of running off the line.
 fn uax14_segments(word: &str) -> Vec<&str> {
     let unspaced = |c: char| matches!(c as u32,
         0x0E00..=0x0EFF | 0x1000..=0x109F | 0x1100..=0x11FF | 0x1780..=0x17FF
         | 0x2E80..=0x2FFF | 0x3000..=0x303F | 0x3040..=0x30FF | 0x3130..=0x318F | 0x31F0..=0x31FF
         | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF
         | 0x20000..=0x3FFFF);
-    if !word.chars().any(unspaced) { return vec![word] }
+    // Letters and digits alone never break inside a word (LB28-LB30): skip
+    // the segmenter for the common case.
+    if !word.chars().any(unspaced) && word.chars().all(|c| c.is_alphanumeric() || c == '\'' || c == '\u{2019}') { return vec![word] }
     let seg = line_segmenter();
     let mut out = vec![];
     let mut last = 0;
     for b in seg.segment_str(word) {
-        if b > last { out.push(&word[last..b]); last = b }
+        // ★ Not after a SOFT HYPHEN: a break there must paint a hyphen,
+        // which this layout does not do — broken silently, MDN's
+        // "Com\u{ad}puted value" read "Com" / "puted value".
+        if b > last && !word[..b].ends_with('\u{ad}') { out.push(&word[last..b]); last = b }
     }
     if last < word.len() { out.push(&word[last..]) }
     out
