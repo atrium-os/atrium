@@ -4,7 +4,7 @@ use std::path::PathBuf;
 fn main() {
     let out = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| "rdna4-jobs".into()));
     let mut failed = 0;
-    for c in atrium_rdna4_oracle::cases::all() {
+    for c in atrium_rdna4_oracle::cases::all().into_iter().chain(atrium_rdna4_oracle::cases::calibration()) {
         match c.check(&out.join(&c.name)) {
             Ok(()) => println!("PASS {}", c.name),
             Err(e) => { failed += 1; println!("FAIL {}: {e}", c.name) }

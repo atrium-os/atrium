@@ -213,3 +213,121 @@ pub fn all() -> Vec<Case> {
     }
     v
 }
+
+// ------------------------------------------------------------ calibration ---
+//
+// Cases that measure an allocation unit the RDNA4 ISA guide does not pin down
+// for COMPUTE_PGM_RSRC1/2. They run after the corpus (one may trap on the
+// card if an assumption is wrong) and their outputs are read, not just
+// matched: the expectation is what the guide predicts.
+
+fn lit(mut w: Vec<u32>, v: u32) -> Vec<u32> {
+    w.push(v);
+    w
+}
+
+/// `v[dst] = value` (32-bit literal).
+fn mov_lit(dst: u64, value: u32) -> Vec<u32> {
+    lit(encode("V_MOV_B32", "ENC_VOP1", "default", &[("VDST", dst), ("SRC0", 255)]).unwrap(), value)
+}
+
+/// `global_store_b32 v[vaddr], v[data], s[0:1] offset:ioffset`.
+fn store(vaddr: u64, data: u64, ioffset: u64) -> Vec<u32> {
+    encode("GLOBAL_STORE_B32", "ENC_VGLOBAL", "default", &[("SADDR", 0), ("VADDR", vaddr), ("VSRC", data), ("IOFFSET", ioffset)]).unwrap()
+}
+
+/// One wave of one work-item, output buffer at s[0:1]. `rsrc2_extra` is ORed
+/// into COMPUTE_PGM_RSRC2.
+fn one_lane_case(name: String, sh: Vec<u32>, vgprs: u32, wave32: bool, rsrc2_extra: u32, out_dw: usize, expect: Vec<u32>) -> Case {
+    use atrium_rdna4_cmd::regs::{self, compute_pgm_rsrc2 as r2};
+    let user = vec![DATA_VA as u32, (DATA_VA >> 32) as u32];
+    let mut ib = Blob::compute();
+    emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs, user_sgprs: user.clone(), threads: [1, 1, 1], groups: [1, 1, 1], wave32 });
+    if rsrc2_extra != 0 {
+        // Re-issue RSRC2 just before the DISPATCH_DIRECT (header + 4 dwords).
+        let n = ib.dw.len();
+        let dispatch: Vec<u32> = ib.dw.drain(n - 5..).collect();
+        assert_eq!(dispatch[0], ib.header(atrium_rdna4_cmd::op::DISPATCH_DIRECT, 4));
+        let rsrc2 = ((user.len() as u32) << r2::USER_SGPR_SHIFT) | r2::TGID_X_EN_MASK | r2::TGID_Y_EN_MASK | r2::TGID_Z_EN_MASK | rsrc2_extra;
+        ib.set_sh(regs::COMPUTE_PGM_RSRC2, &[rsrc2]);
+        ib.dw.extend(dispatch);
+    }
+    ib.pad(8);
+    let mut code = words_to_bytes(&sh);
+    assert!(code.len() <= IB_OFFSET as usize, "shader larger than the code slot");
+    code.resize(IB_OFFSET as usize, 0);
+    code.extend(ib.bytes());
+    let ib_dw = ib.dw.len() as u64;
+    Case {
+        name,
+        ip: "compute",
+        buffers: vec![
+            Buffer { name: "code".into(), va: CODE_VA, size: 0x2000, init: code, expect: None, unordered: None },
+            Buffer { name: "out".into(), va: DATA_VA, size: (out_dw * 4) as u64, init: vec![], expect: Some(words_to_bytes(&expect)), unordered: None },
+        ],
+        ib: ("code".into(), IB_OFFSET, ib_dw),
+    }
+}
+
+/// Number of VGPRs probed by [`vgpr_alloc`].
+pub const VGPR_PROBES: u32 = 64;
+
+/// `vgpr_alloc_w{32,64}_f{field}`: how many VGPRs COMPUTE_PGM_RSRC1.VGPRS =
+/// `field` allocates. The single lane writes `0xa000_0000 | k` to every
+/// v2..v63, then stores each to `out[k]`. A write to a VGPR past the
+/// allocation is a NOP and a store from one reads v0 (= 0 for work-item 0),
+/// ISA §3.3.2.2, so `out` holds markers up to the allocation and zeros after:
+/// no fault either way. Expectation: the guide's blocks of 16 (wave32) or 8
+/// (wave64) VGPRs per field step, §3.3.2.1 (24/12 on 1536-VGPR parts).
+pub fn vgpr_alloc(wave32: bool, field: u32) -> Case {
+    let mut sh = mov_lit(1, 0);
+    for k in 2..VGPR_PROBES {
+        sh.extend(mov_lit(k as u64, 0xa000_0000 | k));
+    }
+    for k in 2..VGPR_PROBES {
+        sh.extend(store(1, k as u64, 4 * k as u64));
+    }
+    sh.extend(encode("S_ENDPGM", "ENC_SOPP", "default", &[]).unwrap());
+    // emit_dispatch encodes VGPRS = ceil(vgprs / g) - 1 with g = 8 (wave32)
+    // or 4 (wave64); pick vgprs so the field is exactly `field`.
+    let g = if wave32 { 8 } else { 4 };
+    let guide = if wave32 { 16 } else { 8 } * (field + 1);
+    let expect = (0..VGPR_PROBES).map(|k| if (2..guide).contains(&k) { 0xa000_0000 | k } else { 0 }).collect();
+    let w = if wave32 { 32 } else { 64 };
+    one_lane_case(format!("vgpr_alloc_w{w}_f{field}"), sh, g * (field + 1), wave32, 0, VGPR_PROBES as usize, expect)
+}
+
+/// `lds_alloc_f{field}_at_{addr}`: with COMPUTE_PGM_RSRC2.LDS_SIZE = `field`,
+/// store a marker at LDS byte `addr`, load it back and write it to `out[0]`.
+/// Expectation: LDS_SIZE counts the 1024-byte blocks of ISA §3.3.5, so the
+/// marker survives when `addr + 4 <= field * 1024`. If the unit is smaller the
+/// access is out of range: MEMVIOL, which traps (§3.3.5.1, §11.3). These cases
+/// therefore run last.
+pub fn lds_alloc(field: u32, addr: u32) -> Case {
+    use atrium_rdna4_cmd::regs::compute_pgm_rsrc2 as r2;
+    let marker = 0x1d50_0000 | addr;
+    let mut sh = mov_lit(1, addr);
+    sh.extend(mov_lit(2, marker));
+    sh.extend(encode("DS_STORE_B32", "ENC_VDS", "default", &[("ADDR", 1), ("DATA0", 2)]).unwrap());
+    sh.extend(encode("S_WAIT_DSCNT", "ENC_SOPP", "default", &[("SIMM16", 0)]).unwrap());
+    sh.extend(encode("DS_LOAD_B32", "ENC_VDS", "default", &[("ADDR", 1), ("VDST", 3)]).unwrap());
+    sh.extend(encode("S_WAIT_DSCNT", "ENC_SOPP", "default", &[("SIMM16", 0)]).unwrap());
+    sh.extend(mov_lit(4, 0));
+    sh.extend(store(4, 3, 0));
+    sh.extend(encode("S_ENDPGM", "ENC_SOPP", "default", &[]).unwrap());
+    assert!(field << r2::LDS_SIZE_SHIFT & !r2::LDS_SIZE_MASK == 0);
+    one_lane_case(format!("lds_alloc_f{field}_at_{addr}"), sh, 8, true, field << r2::LDS_SIZE_SHIFT, 1, vec![marker])
+}
+
+/// The calibration cases, in run order (the trap-capable LDS ones last).
+pub fn calibration() -> Vec<Case> {
+    vec![
+        vgpr_alloc(true, 0),
+        vgpr_alloc(true, 1),
+        vgpr_alloc(false, 0),
+        vgpr_alloc(false, 1),
+        lds_alloc(1, 508),
+        lds_alloc(1, 1020),
+        lds_alloc(64, 65532),
+    ]
+}
