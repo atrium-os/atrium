@@ -2122,22 +2122,26 @@ impl<'a> Cx<'a> {
             }
         }
         let mut line = 0;
-        // Under `pre`/`nowrap` nothing between items is a break: the run of
-        // them is ONE min-content unit, as `lines` will lay it out.
+        // Under `pre`/`nowrap` nothing between items is a break, and words
+        // touching with no UAX #14 break between them are glued: either way
+        // the run is ONE min-content unit, as `lines` will lay it out.
         let mut chain: Option<U> = None;
+        let mut prev: Option<&str> = None;
         for it in &items {
             match it {
-                Item::Break => { mx = mx.max(line); line = 0; chain = None }
+                Item::Break => { mx = mx.max(line); line = 0; chain = None; prev = None }
                 Item::Word(t, st, l) | Item::PreSpace(t, st, l) => {
                     let w: U = self.sh.shape(t, st, &mut self.report).iter().map(|p| p.width).sum();
-                    let c = match chain { Some(c) if l.nowrap => c + w, _ => w };
-                    if matches!(it, Item::Word(..)) { mn = mn.max(c) }
+                    let glued = l.nowrap || prev.is_some_and(|p| !uax14_break_between(p, t));
+                    let c = match chain { Some(c) if glued => c + w, _ => w };
+                    if matches!(it, Item::Word(..)) { mn = mn.max(c); prev = Some(t) } else { prev = None }
                     chain = Some(c);
                     line += w;
                 }
                 Item::Space(st, l) => {
                     let w = self.sh.shape(" ", st, &mut self.report).iter().map(|p| p.width).sum::<U>();
                     chain = chain.filter(|_| l.nowrap).map(|c| c + w);
+                    prev = None;
                     line += w;
                 }
                 Item::Atomic(ah, ..) => {
@@ -2151,9 +2155,11 @@ impl<'a> Cx<'a> {
                     mn = mn.max(self.atomic_min_outer_w(*ah).unwrap_or(w));
                     line += w;
                     chain = None;
+                    prev = None;
                 }
                 Item::Tab(st, l) => {
                     chain = None;
+                    prev = None;
                     let sp: U = self.sh.shape(" ", st, &mut self.report).iter().map(|p| p.width).sum();
                     let stop = (sp * l.tab as U).max(1);
                     line = (line / stop + 1) * stop;
@@ -2351,9 +2357,13 @@ impl<'a> Cx<'a> {
         // text-indent: the first line of the block container starts in.
         let first_indent = self.indent.take().unwrap_or(0);
         let (mut cx, mut pending): (U, Option<(FontStyle, Line)>) = (first_indent, None);
+        // The texts of the words placed since the last space, atomic or
+        // break: the chain a word with no break before it is glued to.
+        let mut run_texts: Vec<String> = vec![];
         for it in items {
             match it {
                 Item::Tab(st, l) => {
+                    run_texts.clear();
                     // Tab stops: multiples of tab-size × the space's advance,
                     // measured from the line's start (exact for any font).
                     let sp: U = self.sh.shape(" ", &st, &mut self.report).iter().map(|p| p.width).sum();
@@ -2361,9 +2371,10 @@ impl<'a> Cx<'a> {
                     cx = (cx / stop + 1) * stop;
                     pending = None;
                 }
-                Item::Break => { *forced.last_mut().expect("line") = true; lines.push(vec![]); forced.push(false); cx = 0; pending = None }
-                Item::Space(st, l) => pending = Some((st, l)),
+                Item::Break => { *forced.last_mut().expect("line") = true; lines.push(vec![]); forced.push(false); cx = 0; pending = None; run_texts.clear() }
+                Item::Space(st, l) => { pending = Some((st, l)); run_texts.clear() }
                 Item::PreSpace(text, st, l) => {
+                    run_texts.clear();
                     let pieces = self.sh.shape(&text, &st, &mut self.report);
                     let ww: U = pieces.iter().map(|p| p.width).sum();
                     // ★ Preserved spaces HANG at a line end (pre-wrap): they
@@ -2374,6 +2385,7 @@ impl<'a> Cx<'a> {
                     pending = None;
                 }
                 Item::Atomic(ah, st, l) => {
+                    run_texts.clear();
                     // An atomic inline wraps as ONE unbreakable unit; it is
                     // sized against the line, then laid out for real only
                     // once alignment has fixed where the line starts.
@@ -2402,7 +2414,30 @@ impl<'a> Cx<'a> {
                         (Some((ps, _)), Some(false)) => self.sh.shape(" ", ps, &mut self.report).iter().map(|p| p.width).sum(),
                         _ => 0,
                     };
-                    let wrap = cx + sw + ww > w && !lines.last().expect("line").is_empty() && !no_soft_wrap(&l, &pending);
+                    let mut wrap = cx + sw + ww > w && !lines.last().expect("line").is_empty() && !no_soft_wrap(&l, &pending);
+                    // ★ A word touching the one before it wraps only where
+                    // UAX #14 allows; otherwise the glued chain goes to the
+                    // next line WITH it — or, if the chain is the whole
+                    // line, overflows rather than splitting a word.
+                    if wrap && pending.is_none() && run_texts.last().is_some_and(|p| !uax14_break_between(p, &text)) {
+                        let mut k = 1;
+                        while k < run_texts.len() && !uax14_break_between(&run_texts[run_texts.len() - k - 1], &run_texts[run_texts.len() - k]) { k += 1 }
+                        let line = lines.last_mut().expect("line");
+                        if k < line.len() {
+                            let mut moved = line.split_off(line.len() - k);
+                            let x0 = moved[0].x;
+                            for p in &mut moved { p.x -= x0 }
+                            moved[0].gap = false;
+                            moved[0].gap_w = 0;
+                            cx = moved.last().map(|p| p.x + p.adv).unwrap_or(0);
+                            lines.push(moved);
+                            forced.push(false);
+                            run_texts.drain(..run_texts.len() - k);
+                        }
+                        wrap = false;
+                    }
+                    if wrap { run_texts.clear() }
+                    run_texts.push(text.clone());
                     if wrap { lines.push(vec![]); forced.push(false); cx = 0 } else { cx += sw }
                     if ww > w && l.break_word {
                         // overflow-wrap: break-word — a word wider than a whole
@@ -3020,6 +3055,26 @@ mod tests {
         let b = boxes(&o, 0xff0000ff);
         let right = o.scene.runs.iter().map(|r| r.x).max().unwrap() / PX;
         assert!(b[0].2 > right, "the box ({} px) reaches past its last word ({right} px)", b[0].2);
+    }
+
+    /// ★ Words that touch across elements wrap only where UAX #14 allows:
+    /// IKEA's price is `<span>399</span><span>.</span>00`, and a line that
+    /// broke between them put ".00" on a line of its own. The glued chain
+    /// moves to the next line together.
+    #[test]
+    fn touching_words_wrap_together() {
+        // A box just wide enough for "Price 399", not for its ".00".
+        let probe = render(r#"<style>body { margin-left: 0px; margin-top: 0px } div { font-size: 16px }</style>
+            <div>Price <span>399</span><span>.</span>00</div>"#);
+        let dot = probe.scene.runs.iter().find(|r| r.text == ".").expect("dot").x;
+        let o = render(&format!(r#"<style>body {{ margin-left: 0px; margin-top: 0px }} div {{ width: {}px; font-size: 16px }}</style>
+            <div>Price <span>399</span><span>.</span>00</div>"#, dot / PX + 2));
+        let y = |t: &str| o.scene.runs.iter().find(|r| r.text == t).map(|r| r.y).unwrap_or_else(|| panic!("{t}: {:?}", o.scene.runs.iter().map(|r| &r.text).collect::<Vec<_>>()));
+        assert_eq!((y("399"), y(".")), (y("00"), y("00")), "399.00 stays on one line");
+        assert!(y("Price") < y("399"), "and goes to the next line together");
+        // Spaced words and CJK segments still break.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px } div { width: 40px }</style><div>北京四季分明</div>"#);
+        assert!(o.scene.runs.iter().map(|r| r.y).collect::<std::collections::BTreeSet<_>>().len() > 1);
     }
 
     /// ★ UAX #14. CJK breaks between ideographs (punctuation stays with
@@ -3922,10 +3977,7 @@ fn uax14_segments(word: &str) -> Vec<&str> {
         | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF
         | 0x20000..=0x3FFFF);
     if !word.chars().any(unspaced) { return vec![word] }
-    let mut opts = icu_segmenter::options::LineBreakOptions::default();
-    // CSS `line-break: auto` is the normal rule set, not ICU's strict default.
-    opts.strictness = Some(icu_segmenter::options::LineBreakStrictness::Normal);
-    let seg = icu_segmenter::LineSegmenter::new_dictionary(opts);
+    let seg = line_segmenter();
     let mut out = vec![];
     let mut last = 0;
     for b in seg.segment_str(word) {
@@ -3941,6 +3993,27 @@ fn uax14_segments(word: &str) -> Vec<&str> {
 /// split a code line in two — `let s =` / `"hello";` — inside its block.
 fn no_soft_wrap(l: &Line, pending: &Option<(FontStyle, Line)>) -> bool {
     l.nowrap && pending.as_ref().is_none_or(|(_, pl)| pl.nowrap)
+}
+
+fn line_segmenter() -> icu_segmenter::LineSegmenterBorrowed<'static> {
+    let mut opts = icu_segmenter::options::LineBreakOptions::default();
+    // CSS `line-break: auto` is the normal rule set, not ICU's strict default.
+    opts.strictness = Some(icu_segmenter::options::LineBreakStrictness::Normal);
+    icu_segmenter::LineSegmenter::new_dictionary(opts)
+}
+
+/// Whether a line may break between two words that touch with no space —
+/// the end of one element's text and the start of the next, or two
+/// segments of one run. UAX #14 decides on the joined text: `<span>399</span>
+/// <span>.</span>00` is ONE word to a reader, and breaking it put ".00" on
+/// a line of its own.
+fn uax14_break_between(a: &str, b: &str) -> bool {
+    let (Some(x), Some(y)) = (a.chars().last(), b.chars().next()) else { return true };
+    let letter = |c: char| c.is_alphanumeric() && c < '\u{0e00}';
+    if letter(x) && letter(y) { return false }
+    if x == '\u{ad}' { return false }
+    let joined = format!("{a}{b}");
+    line_segmenter().segment_str(&joined).any(|i| i == a.len())
 }
 
 fn is_rtl(c: char) -> bool {
