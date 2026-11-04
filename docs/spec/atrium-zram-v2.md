@@ -771,9 +771,9 @@ stores fall back to write-through.
 
 **Decision input (2026-11-04).** A brings zstd under the threshold (18 %),
 and for LZ4 it removes two thirds of the swap + GEOM cost. B would remove at
-most the remaining slot bookkeeping plus batch TLB shootdowns. Recommendation:
-keep A; reopen B only if a real workload shows TLB shootdowns from page-out
-dominating.
+most the remaining slot bookkeeping plus batch TLB shootdowns. Decided
+(Shankar, 2026-11-04): keep A. Reopen B only if a real workload shows TLB
+shootdowns from page-out dominating.
 
 ## 7. Measuring in the VM (the real numbers)
 
