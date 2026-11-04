@@ -214,6 +214,8 @@ fn main() {
     let (mut with_js, mut js_ok, mut js_fail, mut mutated) = (0usize, 0usize, 0usize, 0usize);
     let (mut ext_total, mut ext_ok, mut ext_fail) = (0usize, 0usize, 0usize);
     let mut timed_out_names: Vec<String> = vec![];
+    let deadline = std::env::var("PRERENDER_DEADLINE").ok().and_then(|v| v.parse().ok())
+        .map(std::time::Duration::from_secs).unwrap_or(DEADLINE);
     let mut mod_retries = 0u32;
     let mut observers = 0u32;
     let mut layout_reads = 0u32;
@@ -275,13 +277,16 @@ fn main() {
         let _ = &src;
         let name = f.file_name().unwrap().to_string_lossy().to_string();
         let b = base.get(&name).cloned().unwrap_or_default();
-        let Some(c) = convert_in_child(&exe, f, &b, net, DEADLINE) else {
-            // ★ NAMED, not just counted. Four documents produced no recording
-            // in one run and the count alone could not say which — the answer
-            // took a single-document re-run to get back. A tally that makes
-            // you reproduce the run to identify its members is half a report.
-            timed_out_names.push(name.clone());
-            continue;
+        let c = match convert_in_child(&exe, f, &b, net, deadline) {
+            Ok(c) => c,
+            Err(why) => {
+                // ★ NAMED, not just counted. Four documents produced no recording
+                // in one run and the count alone could not say which — the answer
+                // took a single-document re-run to get back. A tally that makes
+                // you reproduce the run to identify its members is half a report.
+                timed_out_names.push(format!("{name}  ({why})"));
+                continue;
+            }
         };
         if c.scripts_total > 0 && !c.verdict.is_empty() {
             *verdicts.entry(c.verdict.clone()).or_default() += 1;
@@ -399,8 +404,10 @@ fn main() {
         for n in lossy.iter().take(3) { println!("      {n}"); }
     }
     if !timed_out_names.is_empty() {
-        println!("  TIMED OUT / crashed {}  (child killed at {DEADLINE:?})", timed_out_names.len());
-        for n in timed_out_names.iter().take(6) { println!("      {n}"); }
+        // ★ EVERY name. Six of 27 were printed once, and the rest had to be
+        // recovered by diffing the manifest against the recordings.
+        println!("  TIMED OUT / crashed {}  (child killed at {deadline:?}; PRERENDER_DEADLINE=<secs> to change)", timed_out_names.len());
+        for n in &timed_out_names { println!("      {n}"); }
     }
     println!("  with inline script {with_js}");
     println!("  scripts all ran    {js_ok}");
@@ -584,26 +591,32 @@ fn main() {
 
 const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Run one document in a child process, killing it at the deadline.
+/// Run one document in a child process, killing it at the deadline. The
+/// error says which of the ways a child can fail to answer this was: a
+/// timeout and a crash need different next steps.
 fn convert_in_child(
     exe: &Path, file: &Path, base: &str, net: bool, deadline: std::time::Duration,
-) -> Option<Child> {
+) -> Result<Child, String> {
     use std::process::{Command, Stdio};
     let mut cmd = Command::new(exe);
     cmd.arg("--one").arg(file).arg(base).stdout(Stdio::piped()).stderr(Stdio::null());
     if net { cmd.env("PRERENDER_NET", "1"); }
-    let mut ch = cmd.spawn().ok()?;
+    let mut ch = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
     let start = std::time::Instant::now();
-    loop {
+    let status = loop {
         match ch.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if start.elapsed() > deadline => { let _ = ch.kill(); let _ = ch.wait(); return None; }
+            Ok(Some(st)) => break st,
+            Ok(None) if start.elapsed() > deadline => {
+                let _ = ch.kill(); let _ = ch.wait();
+                return Err(format!("timed out at {}s", deadline.as_secs()));
+            }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
-            Err(_) => return None,
+            Err(e) => return Err(format!("wait failed: {e}")),
         }
-    }
-    let out = ch.wait_with_output().ok()?;
+    };
+    let out = ch.wait_with_output().map_err(|e| format!("no output: {e}"))?;
     parse_child(&String::from_utf8_lossy(&out.stdout))
+        .ok_or_else(|| format!("crashed after {:.1}s ({status})", start.elapsed().as_secs_f64()))
 }
 
 /// What the parent needs back from a child run.

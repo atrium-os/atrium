@@ -13,6 +13,9 @@
 #   <out-dir>/fetch.txt    HTTP status per URL
 #   <out-dir>/report.txt   the converter's batch report
 #
+# Each page gets PRERENDER_DEADLINE seconds (default here 180): fetching a
+# news front page's scripts one by one easily outruns the converter's 30.
+#
 # ★ The output is OTHER SITES' CONTENT. Point <out-dir> outside the repo
 # (~/src/navigator-corpus/...) and never commit it.
 set -eu
@@ -41,6 +44,6 @@ while IFS="$tab" read -r stem url; do
     fi
 done < "$list"
 (cd "$root/navigator-prerender" && cargo build --release --quiet)
-PRERENDER_NET=1 PRERENDER_EXPLORE=1 PRERENDER_EMIT_DIR="$out/recordings" PRERENDER_BLOB_DIR="$out/blobs" \
+PRERENDER_DEADLINE="${PRERENDER_DEADLINE:-180}" PRERENDER_NET=1 PRERENDER_EXPLORE=1 PRERENDER_EMIT_DIR="$out/recordings" PRERENDER_BLOB_DIR="$out/blobs" \
     "$root/navigator-prerender/target/release/prerender" "$out/html" > "$out/report.txt" 2>&1 || true
 echo "fetched $(grep -c '^200' "$out/fetch.txt") of $(wc -l < "$out/fetch.txt" | tr -d ' '); recorded $(ls "$out/recordings" | wc -l | tr -d ' ')"
