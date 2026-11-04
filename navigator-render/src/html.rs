@@ -1630,6 +1630,9 @@ impl<'a> Cx<'a> {
         let auto_col = match s.get("grid-auto-columns") { V::Track(t) => t.clone(), _ => Track::Auto };
         let auto_row = match s.get("grid-auto-rows") { V::Track(t) => t.clone(), _ => Track::Auto };
         let flow_row = kw(s, "grid-auto-flow") != "column";
+        // ★ In an rtl grid column line 1 is on the RIGHT (CSS Grid §7.1: the
+        // column axis is the inline axis), and an item's start is its right.
+        let rtl = kw(s, "direction") == "rtl";
         let cgap = len(s.get("column-gap"), w).unwrap_or(0);
         let rgap = len(s.get("row-gap"), cb_h.unwrap_or(0)).unwrap_or(0);
 
@@ -1805,9 +1808,9 @@ impl<'a> Cx<'a> {
         // Place.
         let pos = |sizes: &[U], gap: U, i: usize| -> U { sizes[..i.min(sizes.len())].iter().sum::<U>() + gap * i as U };
         for it in &items {
-            let ax = x + pos(&cols, cgap, it.col.0);
-            let ay = y + pos(&rows, rgap, it.row.0);
             let aw = (it.col.0..it.col.0 + it.col.1).map(|i| cols.get(i).copied().unwrap_or(0)).sum::<U>() + cgap * (it.col.1 as U - 1);
+            let ax = if rtl { x + w - pos(&cols, cgap, it.col.0) - aw } else { x + pos(&cols, cgap, it.col.0) };
+            let ay = y + pos(&rows, rgap, it.row.0);
             let ah = (it.row.0..it.row.0 + it.row.1).map(|i| rows.get(i).copied().unwrap_or(0)).sum::<U>() + rgap * (it.row.1 as U - 1);
             // A definite specified size wins over the intrinsic one: an empty
             // box with `width: 40px` is 40 wide, not 0.
@@ -1821,7 +1824,7 @@ impl<'a> Cx<'a> {
                 "stretch" => specified_h.unwrap_or(ah),
                 _ => specified_h.unwrap_or_else(|| self.measure(it.h, iw, None, (Some(iw), None))).min(ah),
             };
-            let dx = match it.justify.as_str() { "end" => aw - iw, "center" => (aw - iw) / 2, _ => 0 };
+            let dx = match (it.justify.as_str(), rtl) { ("end", false) => aw - iw, ("center", _) => (aw - iw) / 2, ("end", true) => 0, (_, true) => aw - iw, _ => 0 };
             let dy = match it.align.as_str() { "end" => ah - ih, "center" => (ah - ih) / 2, _ => 0 };
             let forced_h = (it.align == "stretch" || specified_h.is_some()).then_some(ih);
             self.block(it.h, ax + dx, ay + dy, iw, Some(ah), (Some(iw), forced_h));
@@ -3168,6 +3171,28 @@ mod tests {
         assert_eq!(b[0].0, 400 - 20 - 100 - 50, "the second to its left");
         assert_eq!(b[1].0, 0, "flex-end packs to the LEFT in rtl");
         assert_eq!(x.0, 400 - 60, "a column's cross-start is the right edge");
+    }
+
+    /// ★ In an rtl grid column line 1 is on the right, and an item's
+    /// `start` alignment is its right edge; negative lines still count from
+    /// the end (now the left).
+    #[test]
+    fn an_rtl_grid_numbers_its_columns_from_the_right() {
+        let src = r#"<style>body { margin-left: 0px; margin-right: 0px; margin-top: 0px }
+            .g { display: grid; direction: rtl; width: 300px; grid-template-columns: 100px 100px 100px; column-gap: 0px }
+            .a { background-color: #ff0000; height: 10px } .b { background-color: #0000ff; height: 10px; grid-column-start: 3 }
+            .s { background-color: #00ff00; height: 10px; width: 40px; justify-self: start } .e { background-color: #ffff00; height: 10px; width: 40px; justify-self: end }
+            .n { background-color: #00ffff; height: 10px; grid-column-start: -2; grid-column-end: -1 }</style>
+            <div class="g"><div class="a"></div><div class="b"></div></div>
+            <div class="g"><div class="s"></div><div class="e"></div><div class="n"></div></div>"#;
+        let o = render(src);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let one = |c: u32| boxes(&o, c)[0];
+        assert_eq!((one(0xff0000ff).0, one(0xff0000ff).2), (200, 100), "auto-placed into column 1: the RIGHTMOST");
+        assert_eq!(one(0x0000ffff).0, 0, "column 3 is the leftmost");
+        assert_eq!(one(0x00ff00ff).0, 300 - 40, "justify-self: start is the cell's right edge");
+        assert_eq!(one(0xffff00ff).0, 100, "end is its left edge (cell 2 spans 100..200)");
+        assert_eq!(one(0x00ffffff).0, 0, "-2 / -1 is the last column, on the left");
     }
 
     /// ★ A NESTED table is not a wrapper. A `display: table` div around a
