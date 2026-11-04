@@ -24,7 +24,7 @@ pub struct Assignment {
 pub fn allocate(mi: &[MI], vregs: &[VRegInfo], v_first: u8, s_first: u8) -> Result<Assignment, Error> {
     let n = vregs.len();
     let (start, end) = intervals(mi, n);
-    assign(vregs, &start, &end, v_first, s_first, 256).map_err(|f| f.error())
+    assign(vregs, &start, &end, v_first, s_first, 256, 106).map_err(|f| f.error())
 }
 
 /// Why assignment failed: register `reg` found no room while `active`
@@ -89,8 +89,9 @@ pub fn intervals(mi: &[MI], n: usize) -> (Vec<usize>, Vec<usize>) {
     (start, end)
 }
 
-/// First-fit assignment over the intervals, with at most `v_limit` VGPRs.
-pub fn assign(vregs: &[VRegInfo], start: &[usize], end: &[usize], v_first: u8, s_first: u8, v_limit: u32) -> Result<Assignment, Failure> {
+/// First-fit assignment over the intervals, with at most `v_limit` VGPRs
+/// and `s_limit` SGPRs.
+pub fn assign(vregs: &[VRegInfo], start: &[usize], end: &[usize], v_first: u8, s_first: u8, v_limit: u32, s_limit: u32) -> Result<Assignment, Failure> {
     let n = vregs.len();
     let mut order: Vec<usize> = (0..n).filter(|r| start[*r] != usize::MAX).collect();
     order.sort_by_key(|r| (start[*r], *r));
@@ -102,7 +103,7 @@ pub fn assign(vregs: &[VRegInfo], start: &[usize], end: &[usize], v_first: u8, s
         let info = vregs[r];
         let (first, limit) = match info.class {
             Class::V => (v_first as u32, v_limit),
-            Class::S => (s_first as u32, 106u32),
+            Class::S => (s_first as u32, s_limit),
         };
         let busy = |base: u32| {
             active.iter().any(|a| {

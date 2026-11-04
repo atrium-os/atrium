@@ -54,6 +54,8 @@ pub struct Options {
     pub spec_overrides: std::collections::HashMap<u32, u32>,
     /// VGPR budget (default 256); values beyond it spill to scratch.
     pub max_vgprs: Option<u32>,
+    /// SGPR budget (default 106); values beyond it spill into VGPR lanes.
+    pub max_sgprs: Option<u32>,
 }
 
 /// A compiled compute kernel.
@@ -76,7 +78,7 @@ impl Kernel {
         let mut g = atrium_gir::build::build(&m, opts.entry).map_err(|e| Error::Gir(format!("{e:?}")))?;
         atrium_gir::passes::optimize(&mut g);
         atrium_gir::verify::verify(&g).map_err(|e| Error::Gir(format!("{e:?}")))?;
-        let co = atrium_rdna4_compiler::Options { max_vgprs: opts.max_vgprs.unwrap_or(256) };
+        let co = atrium_rdna4_compiler::Options { max_vgprs: opts.max_vgprs.unwrap_or(256), max_sgprs: opts.max_sgprs.unwrap_or(106) };
         let bin = atrium_rdna4_compiler::compile_with(&g, &co).map_err(|e| Error::Compile(format!("{e:?}")))?;
         Ok(Kernel { name: g.name.clone(), bin })
     }

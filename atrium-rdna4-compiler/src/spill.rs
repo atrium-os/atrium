@@ -12,6 +12,10 @@
 //! register would. A reload fills the lanes the use reads, except for
 //! cross-lane reads, which reload with EXEC set to all lanes.
 //!
+//! SGPRs spill into lanes of a VGPR (`v_writelane_b32` /
+//! `v_readlane_b32`, which ignore EXEC): one VGPR holds 32 spilled SGPRs.
+//! That VGPR is never itself spilled.
+//!
 //! Scratch accesses use ST mode (no address registers). The RDNA4 ISA guide
 //! §5.7.1.2 says stores need no wait before their source is overwritten and
 //! same-address store/load pairs from one wave stay in order, so the only
@@ -31,14 +35,15 @@ pub fn allocate(
     v_first: u8,
     s_first: u8,
     v_limit: u32,
+    s_limit: u32,
 ) -> Result<(Assignment, u32), Error> {
     let (mi0, vregs0) = (mi.clone(), vregs.clone());
-    match allocate_with(mi, vregs, v_first, s_first, v_limit, true) {
+    match allocate_with(mi, vregs, v_first, s_first, v_limit, s_limit, true) {
         Ok(r) => Ok(r),
         Err(_) => {
             *mi = mi0;
             *vregs = vregs0;
-            allocate_with(mi, vregs, v_first, s_first, v_limit, false)
+            allocate_with(mi, vregs, v_first, s_first, v_limit, s_limit, false)
         }
     }
 }
@@ -49,19 +54,19 @@ fn allocate_with(
     v_first: u8,
     s_first: u8,
     v_limit: u32,
+    s_limit: u32,
     reuse: bool,
 ) -> Result<(Assignment, u32), Error> {
     let mut temps: HashSet<usize> = HashSet::new();
     let mut slots = 0u32;
+    // SGPR spill VGPRs and how many of their lanes are taken.
+    let mut lanes: Vec<(VR, u32)> = vec![];
     loop {
         let (start, end) = intervals(mi, vregs.len());
-        let f = match assign(vregs, &start, &end, v_first, s_first, v_limit) {
+        let f = match assign(vregs, &start, &end, v_first, s_first, v_limit, s_limit) {
             Ok(a) => return Ok((a, slots)),
             Err(f) => f,
         };
-        if f.class != Class::V {
-            return Err(f.error());
-        }
         let depth = loop_depth(mi);
         let cost = |r: usize| -> f64 {
             let mut c = 0f64;
@@ -79,11 +84,28 @@ fn allocate_with(
             .iter()
             .copied()
             .chain([f.reg])
-            .filter(|r| vregs[*r].class == Class::V && !temps.contains(r))
+            .filter(|r| vregs[*r].class == f.class && !temps.contains(r))
             .map(|r| (cost(r), r))
             .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
             .map(|(_, r)| r)
             .ok_or_else(|| f.error())?;
+        if f.class == Class::S {
+            let n = vregs[victim].size as u32;
+            let at = match lanes.last() {
+                Some(&(_, used)) if used + n <= 32 => lanes.len() - 1,
+                _ => {
+                    let l = vregs.len() as VR;
+                    vregs.push(VRegInfo { class: Class::V, size: 1 });
+                    temps.insert(l as usize);
+                    lanes.push((l, 0));
+                    lanes.len() - 1
+                }
+            };
+            let (l, first) = lanes[at];
+            lanes[at].1 += n;
+            rewrite_s(mi, vregs, &mut temps, victim as VR, l, first);
+            continue;
+        }
         if let Some(def) = remat_def(mi, victim as VR) {
             remat(mi, vregs, &mut temps, victim as VR, def);
             continue;
@@ -162,6 +184,55 @@ fn remat(mi: &mut Vec<MI>, vregs: &mut Vec<VRegInfo>, temps: &mut HashSet<usize>
         }
         mi.push(again);
         mi.push(m);
+    }
+}
+
+/// Spill SGPR group `x` into lanes `first..` of VGPR `l`: a writelane
+/// after each def, a readlane into a fresh SGPR before each use.
+fn rewrite_s(mi: &mut Vec<MI>, vregs: &mut Vec<VRegInfo>, temps: &mut HashSet<usize>, x: VR, l: VR, first: u32) {
+    let old = std::mem::take(mi);
+    for mut m in old {
+        let (mut ulo, mut uhi, mut dlo, mut dhi) = (u32::MAX, 0u32, u32::MAX, 0u32);
+        for (o, def, w) in m.operands_mut() {
+            if let O::R(r, k) = *o {
+                if r == x {
+                    let (lo, hi) = (k as u32, k as u32 + w as u32);
+                    if def {
+                        dlo = dlo.min(lo);
+                        dhi = dhi.max(hi);
+                    } else {
+                        ulo = ulo.min(lo);
+                        uhi = uhi.max(hi);
+                    }
+                }
+            }
+        }
+        if ulo == u32::MAX && dlo == u32::MAX {
+            mi.push(m);
+            continue;
+        }
+        let (lo, hi) = (ulo.min(dlo), uhi.max(dhi));
+        let t = vregs.len() as VR;
+        vregs.push(VRegInfo { class: Class::S, size: (hi - lo) as u8 });
+        temps.insert(t as usize);
+        for (o, _, _) in m.operands_mut() {
+            if let O::R(r, k) = *o {
+                if r == x {
+                    *o = O::R(t, k - lo as u8);
+                }
+            }
+        }
+        if ulo != u32::MAX {
+            for k in ulo..uhi {
+                mi.push(MI::Valu { name: "V_READLANE_B32", dst: O::R(t, (k - lo) as u8), sdst: None, src: vec![O::R(l, 0), O::Imm(first + k)], neg: 0 });
+            }
+        }
+        mi.push(m);
+        if dlo != u32::MAX {
+            for k in dlo..dhi {
+                mi.push(MI::Valu { name: "V_WRITELANE_B32", dst: O::R(l, 0), sdst: None, src: vec![O::R(t, (k - lo) as u8), O::Imm(first + k)], neg: 0 });
+            }
+        }
     }
 }
 

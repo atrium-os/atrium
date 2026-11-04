@@ -8,6 +8,6 @@ fn main() {
     let m = atrium_spv_frontend::translate_with_options(&bytes, &atrium_spv_frontend::Options { native_subgroups: true, ..Default::default() }).unwrap();
     let mut g = atrium_gir::build::build(&m, 0).unwrap();
     atrium_gir::passes::optimize(&mut g);
-    let b = atrium_rdna4_compiler::compile_with(&g, &atrium_rdna4_compiler::Options { max_vgprs: cap }).unwrap();
+    let b = atrium_rdna4_compiler::compile_with(&g, &atrium_rdna4_compiler::Options { max_vgprs: cap, ..Default::default() }).unwrap();
     print!("{}", atrium_rdna4_compiler::listing(&b.code));
 }

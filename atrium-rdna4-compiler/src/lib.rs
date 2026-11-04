@@ -86,11 +86,14 @@ pub struct Options {
     /// VGPR budget per lane (at most 256). Values that do not fit are
     /// spilled to scratch.
     pub max_vgprs: u32,
+    /// SGPR budget (at most 106). Values that do not fit spill into
+    /// VGPR lanes.
+    pub max_sgprs: u32,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { max_vgprs: 256 }
+        Options { max_vgprs: 256, max_sgprs: 106 }
     }
 }
 
@@ -114,7 +117,7 @@ pub fn compile_with(f: &Function, o: &Options) -> Result<Binary, Error> {
     is.run()?;
     coalesce::run(&mut is.mi, &is.vregs);
     coalesce::merge(&mut is.mi, &is.vregs);
-    let (asg, scratch_dwords) = spill::allocate(&mut is.mi, &mut is.vregs, 1, abi.user_sgprs(), o.max_vgprs.min(256))?;
+    let (asg, scratch_dwords) = spill::allocate(&mut is.mi, &mut is.vregs, 1, abi.user_sgprs(), o.max_vgprs.min(256), o.max_sgprs.min(106))?;
     let code = emit::emit(&is.mi, &is.vregs, &asg);
     Ok(Binary { code, vgprs: asg.vgprs, sgprs: asg.sgprs, abi, local_size: f.local_size, lds_bytes: f.workgroup_bytes, scratch_dwords })
 }

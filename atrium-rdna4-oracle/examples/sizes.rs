@@ -1,12 +1,13 @@
 //! sizes: compiled size and register use of the desktop and Fresco
-//! compute shaders. MAX_VGPRS=n caps the VGPR budget (forces spills).
+//! compute shaders. MAX_VGPRS / MAX_SGPRS cap the register budgets (force spills).
 fn report(n: &str, bytes: &[u8]) {
     let m = atrium_spv_frontend::translate_with_options(bytes, &atrium_spv_frontend::Options { native_subgroups: true, ..Default::default() }).unwrap();
     let mut g = atrium_gir::build::build(&m, 0).unwrap();
     atrium_gir::passes::optimize(&mut g);
     let cap = std::env::var("MAX_VGPRS").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
-    match atrium_rdna4_compiler::compile_with(&g, &atrium_rdna4_compiler::Options { max_vgprs: cap }) {
-        Ok(b) => println!("{n:<14} {:4} dwords {:3} vgprs {:3} scratch dwords", b.code.len(), b.vgprs, b.scratch_dwords),
+    let scap = std::env::var("MAX_SGPRS").ok().and_then(|v| v.parse().ok()).unwrap_or(106);
+    match atrium_rdna4_compiler::compile_with(&g, &atrium_rdna4_compiler::Options { max_vgprs: cap, max_sgprs: scap }) {
+        Ok(b) => println!("{n:<14} {:4} dwords {:3} vgprs {:3} sgprs {:3} scratch dwords", b.code.len(), b.vgprs, b.sgprs, b.scratch_dwords),
         Err(e) => println!("{n:<14} {e:?}"),
     }
 }

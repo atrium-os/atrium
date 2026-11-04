@@ -84,6 +84,23 @@ pub(crate) fn code_buffer(shader: &[u32], ib: &Blob) -> (Buffer, u64, u64) {
 
 thread_local! {
     static CAP: std::cell::Cell<u32> = const { std::cell::Cell::new(256) };
+    static SCAP: std::cell::Cell<u32> = const { std::cell::Cell::new(106) };
+}
+
+/// SGPR cap of the spill variants.
+pub const SPILL_SCAP: u32 = 24;
+
+/// Run `f` with the SGPR compile cap at `cap`.
+pub fn with_scap<T>(cap: u32, f: impl FnOnce() -> T) -> T {
+    let old = SCAP.with(|c| c.replace(cap));
+    let r = f();
+    SCAP.with(|c| c.set(old));
+    r
+}
+
+/// The current SGPR compile cap.
+pub(crate) fn scap() -> u32 {
+    SCAP.with(|c| c.get())
 }
 
 /// VGPR cap of the spill variants.
@@ -104,7 +121,7 @@ pub(crate) fn cap() -> u32 {
 
 /// Compile under the current cap.
 pub(crate) fn compile(g: &atrium_gir::Function) -> Result<atrium_rdna4_compiler::Binary, atrium_rdna4_compiler::Error> {
-    atrium_rdna4_compiler::compile_with(g, &atrium_rdna4_compiler::Options { max_vgprs: cap() })
+    atrium_rdna4_compiler::compile_with(g, &atrium_rdna4_compiler::Options { max_vgprs: cap(), max_sgprs: scap() })
 }
 
 /// GPU address of the scratch ring (above every data slot).
@@ -324,8 +341,25 @@ pub fn spilled() -> Vec<Case> {
                 c.name = format!("spill_{}", c.name);
                 c
             })
+            .chain(sgpr_spilled())
             .collect()
     })
+}
+
+/// SGPR spilling (into VGPR lanes): glyph_run and Fresco bin/raster with
+/// a few SGPRs below their need, and raster with both caps at once (this
+/// runs inside [`spilled`], under the VGPR cap, for that last one).
+fn sgpr_spilled() -> Vec<Case> {
+    let rename = |c: Option<Case>, p: &str| c.map(|mut c| { c.name = format!("{p}_{}", c.name); c });
+    let mut v = vec![];
+    with_cap(256, || {
+        let (n, p, rec) = DESKTOP[3];
+        v.extend(rename(with_scap(10, || desktop(n, p, 100, rec)), "sspill"));
+        v.extend(rename(with_scap(15, crate::fresco::bin), "sspill"));
+        v.extend(rename(with_scap(SPILL_SCAP, crate::fresco::raster), "sspill"));
+    });
+    v.extend(rename(with_scap(SPILL_SCAP, crate::fresco::raster), "vsspill"));
+    v
 }
 
 // ------------------------------------------------------------ calibration ---

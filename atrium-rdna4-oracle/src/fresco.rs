@@ -58,7 +58,7 @@ fn bytes(w: &[u32]) -> Vec<u8> {
 /// One kernel over the frame's buffers, `expect` naming the checked
 /// binding and its expected contents.
 fn case(name: &str, spv: &[u8], init: Vec<Vec<u8>>, groups: [u32; 3], expect: (u32, Vec<u8>)) -> Option<Case> {
-    let opts = atrium_rdna4::Options { max_vgprs: Some(crate::cases::cap()), ..Default::default() };
+    let opts = atrium_rdna4::Options { max_vgprs: Some(crate::cases::cap()), max_sgprs: Some(crate::cases::scap()), ..Default::default() };
     let k = atrium_rdna4::Kernel::from_spirv(spv, &opts).ok()?;
     let (ring, ring_buf) = crate::cases::scratch_ring(k.bin.scratch_dwords);
     let mut buffers = vec![];
