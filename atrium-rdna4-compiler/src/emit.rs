@@ -153,6 +153,26 @@ impl<'a> E<'a> {
                     self.valu_read_s.insert(*s);
                 }
                 let vdst_field = if d >= 256 { d - 256 } else { d };
+                // Compact VOP1 / VOP2 (one dword) when the operands allow it.
+                if sdst.is_none() && *neg == 0 && d >= 256 {
+                    if let Some((op, enc, c0, c1)) = compact(name, &codes) {
+                        let mut f: Vec<(&str, u64)> = vec![("VDST", vdst_field as u64), ("SRC0", c0 as u64)];
+                        if let Some(c1) = c1 {
+                            f.push(("VSRC1", (c1 - 256) as u64));
+                        }
+                        self.a.emit(op, enc, &f);
+                        if let Some(l) = src.iter().find_map(|s| match s {
+                            O::Imm(b) if inline_const(*b).is_none() => Some(*b),
+                            _ => None,
+                        }) {
+                            self.a.words.push(l);
+                        }
+                        if *name == "V_RCP_F32" || *name == "V_RCP_IFLAG_F32" || *name == "V_SQRT_F32" {
+                            self.trans.insert(d);
+                        }
+                        return;
+                    }
+                }
                 let names = ["SRC0", "SRC1", "SRC2"];
                 let mut f: Vec<(&str, u64)> = vec![("VDST", vdst_field as u64)];
                 for (i, c) in codes.iter().enumerate() {
@@ -301,4 +321,47 @@ pub fn emit(mi: &[MI], vregs: &[VRegInfo], asg: &Assignment) -> Vec<u32> {
         e.a.patch_branch(at, target);
     }
     e.a.words
+}
+
+/// The VOP1 / VOP2 form of a VOP3 op, if it has one and its sources fit:
+/// (opcode, encoding, src0, VGPR src1). VOP2 needs a VGPR in src1, so
+/// commutative ops (and sub, through its reversed opcode) may swap.
+/// Opcodes with implicit VCC operands or accumulators are left in VOP3.
+fn compact(name: &'static str, codes: &[u16]) -> Option<(&'static str, &'static str, u16, Option<u16>)> {
+    use atrium_rdna4_isa::instruction;
+    let has = |op: &str, enc: &str| {
+        instruction(op).map_or(false, |d| d.encodings.iter().any(|e| atrium_rdna4_isa::ENCODINGS[e.encoding].name == enc))
+    };
+    if ["CNDMASK", "_CO_", "FMAC", "FMAMK", "FMAAK", "DOT2", "READ", "WRITELANE"].iter().any(|x| name.contains(x)) {
+        return None;
+    }
+    match codes {
+        [c0] if has(name, "ENC_VOP1") => Some((name, "ENC_VOP1", *c0, None)),
+        [c0, c1] if has(name, "ENC_VOP2") => {
+            if *c1 >= 256 {
+                return Some((name, "ENC_VOP2", *c0, Some(*c1)));
+            }
+            if *c0 < 256 {
+                return None;
+            }
+            const COMMUTATIVE: [&str; 14] = [
+                "V_ADD_F32", "V_MUL_F32", "V_ADD_NC_U32", "V_AND_B32", "V_OR_B32", "V_XOR_B32",
+                "V_MIN_NUM_F32", "V_MAX_NUM_F32", "V_MIN_U32", "V_MAX_U32", "V_MIN_I32", "V_MAX_I32",
+                "V_MUL_U32_U24", "V_MUL_I32_I24",
+            ];
+            let swapped = if COMMUTATIVE.contains(&name) {
+                name
+            } else {
+                match name {
+                    "V_SUB_F32" => "V_SUBREV_F32",
+                    "V_SUBREV_F32" => "V_SUB_F32",
+                    "V_SUB_NC_U32" => "V_SUBREV_NC_U32",
+                    "V_SUBREV_NC_U32" => "V_SUB_NC_U32",
+                    _ => return None,
+                }
+            };
+            has(swapped, "ENC_VOP2").then_some((swapped, "ENC_VOP2", *c1, Some(*c0)))
+        }
+        _ => None,
+    }
 }
