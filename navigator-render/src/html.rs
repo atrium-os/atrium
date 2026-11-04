@@ -1719,11 +1719,14 @@ impl<'a> Cx<'a> {
         }).collect();
         // align-content: distribute the lines in the cross axis.
         let total: U = line_cross.iter().sum::<U>() + cross_gap * (lines.len() as U).saturating_sub(1);
+        // ★ `center` and `flex-end` are UNSAFE by default (Box Alignment
+        // §4.3): lines taller than the container overflow it on both sides,
+        // or on the start side, as the keyword says. Only stretch needs room.
         let (mut cpos, cstep, cstretch) = match (container_cross, lines.len() > 1 || wrap) {
-            (Some(cc), true) if cc > total => {
+            (Some(cc), true) if cc != total => {
                 let free = cc - total;
                 match kw(s, "align-content") { "flex-end" => (free, 0, 0), "center" => (free / 2, 0, 0),
-                    "stretch" => (0, 0, free / lines.len() as U), _ => (0, 0, 0) }
+                    "stretch" if free > 0 => (0, 0, free / lines.len() as U), _ => (0, 0, 0) }
             }
             _ => (0, 0, 0),
         };
@@ -3805,6 +3808,26 @@ mod tests {
         assert_eq!(one(0x00ff00ff).0, 300 - 40, "justify-self: start is the cell's right edge");
         assert_eq!(one(0xffff00ff).0, 100, "end is its left edge (cell 2 spans 100..200)");
         assert_eq!(one(0x00ffffff).0, 0, "-2 / -1 is the last column, on the left");
+    }
+
+    /// ★ `align-content: center | flex-end` are UNSAFE (Flexbox §8.4): lines
+    /// taller than their container overflow it equally on both sides, or on
+    /// the start side. With no positive free space they were left at the
+    /// start. Expected offsets are headless Chrome's.
+    #[test]
+    fn align_content_overflows_unsafely() {
+        let src = r#"<style>body { margin-left: 0px; margin-top: 0px; margin-right: 0px }
+            .f { display: flex; flex-wrap: wrap; width: 100px; height: 40px; margin-top: 100px } .i { width: 100px; height: 40px }
+            .c { align-content: center } .e { align-content: flex-end }
+            .a { background-color: #ff0000 } .b { background-color: #0000ff } .g { background-color: #00ff00 }</style>
+            <div class="f c"><div class="i a"></div><div class="i b"></div></div>
+            <div class="f e"><div class="i g"></div><div class="i b"></div></div>"#;
+        let o = render(src);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let one = |c: u32| boxes(&o, c)[0];
+        assert_eq!(one(0xff0000ff).1, 80, "centred: 20 px above the container");
+        assert_eq!(one(0x00ff00ff).1, 200, "flex-end: the overflow is at the start");
+        assert_eq!(boxes(&o, 0x0000ffff).iter().map(|b| b.1).collect::<Vec<_>>(), [120, 240]);
     }
 
     /// ★ Out-of-flow boxes written inside a line wait for that line box —
