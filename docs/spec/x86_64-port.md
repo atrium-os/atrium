@@ -155,9 +155,11 @@ Working in the cloud amd64 VM (`ARCH=amd64 sh scripts/cloud-vm.sh up`):
   then tmpfs -> tessera at unionfs_nodeget -> null_lock on exec. This is the generic cross-mount
   unionfs pattern (tmpfs upper over nullfs-of-root lower). On a ZFS root it would read
   zfs -> tmpfs, so it isn't Tessera-specific. Worth confirming against an arm64 WITNESS run.
-- Open: `pfctl -s rules` prints `DIOCOSFPGET: Operation not supported`. This looks like an
-  ioctl mismatch between the stock 16-CURRENT userland and the fork kernel. Building world
-  from the fork would settle it.
+- **Fork userland**: `scripts/cross-build-world.sh` cross-builds a lite world (no toolchain or
+  tests, `etc/src.conf.world-lite`) in about 62 minutes with no source fixes, and stages a
+  109 MB tarball. Once it's installed on the Tessera root, the fork's pfctl loads the Atrium pf
+  rules at boot (the stock pfctl failed with `DIOCOSFPGET`), and the jail e2e still passes.
+  The guest survived a hard kill (host OOM): Tessera remounted with a clean journal replay.
 - Still to do: kmod selftests on amd64, navigator e2e on amd64, and gpusim in
   `qemu-system-x86_64` (atrium-gpu-amd has no device to attach to until then).
 
