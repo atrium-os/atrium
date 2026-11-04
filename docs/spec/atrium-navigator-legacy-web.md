@@ -480,6 +480,151 @@ which one had a problem. It does not prevent the failure, it exchanges missing c
 duplicated content. The tier 1 fallback of §5.4.2 is strictly better for the case it was
 built to rescue.
 
+### 5.4.5 Proposed: recording what the state recorder cannot — data, input, time
+
+*Status: proposal (2026-11-04), not settled. Nothing here is built; §5.4.5.6 says what
+would have to be measured before any of it is.*
+
+§5.4.3 records a page's **finite, data-free** behaviour: each handler's effect, expressed
+against the tier 1 document. §5.3 names what that leaves out. Four cases, in order of how
+much of the web they decide:
+
+1. **Server-fed content** — search results, infinite scroll, "load more", live prices,
+   anything behind a login.
+2. **Free-form input** — typing, validation-as-you-type, search-as-you-type, form submit.
+3. **Large state spaces** — many toggles whose combinations multiply.
+4. **Time** — carousels on a timer, rotating banners, clocks and countdowns.
+
+The proposal extends the same move to each: **run the page's code as an oracle at
+conversion time, observe what it does, and record the behaviour as a declarative
+description in §5's vocabulary — never the code.** §5.2's objection does not apply,
+because nothing is translated: the converter does not read the JS, it watches it, and
+what it records is checked by re-running (§5.4.5.5) rather than trusted.
+
+#### 5.4.5.1 Server-fed content: record the binding, not the data
+
+The page's code for this population is nearly always the same shape: *build a request,
+fetch it, pour the response into a template.* Exploration sees both halves — the request
+the page made, and the DOM it produced from the response — so the converter can record a
+**data binding**:
+
+- a **request template**: method (GET only, §5.4.1c), same-origin URL with named
+  parameters (`/search?q={query}&page={cursor}`), and where each parameter comes from — a
+  form field, a recorded constant, or the previous response's cursor;
+- a **response mapping**: which response fields fill which template slots, and the
+  repeated block a list response is stamped into.
+
+**Inference without opening the network.** §5.4.3's invariant 2 (page network closed
+during exploration) stays. The responses the binding is learned from are the ones the
+prerender already fetched under §5.4.1c, replayed from the conversion's cache. To attribute
+DOM text to response fields unambiguously, the converter replays **perturbed copies**:
+each string field replaced with a unique marker, each array lengthened and shortened. A
+marker that surfaces in the DOM names its slot; a block that repeats with the array names
+the template. Fields that never surface are not part of the binding. This is differential
+observation, not static analysis, and it needs no request the prerender did not already
+make.
+
+**At view time** the Navigator — not the page — issues the request through the brokered
+fetcher (backend §2) under the same rules as any page fetch, and fills the template. Three
+properties keep this inside the document lane:
+
+- **Data is inserted as text, never as markup.** A response cannot add elements, styles or
+  handlers the binding did not declare, so a hostile or compromised endpoint can return
+  wrong text and nothing else.
+- **The binding is shareable; the data is not.** The artifact holds the template and
+  mapping only, so it dedups like any conversion. Responses are per-reader. Where the
+  origin needs the reader's session (a logged-in feed), the request goes out with that
+  origin's own partitioned credentials (§7.7). The page's code never sees them, because the
+  page's code is not running.
+- **The request is declared, not computed.** No script runs at view time, so the request
+  carries what the template says and nothing else: no fingerprinting, no beacons riding
+  along.
+
+Infinite scroll and "load more" are the same binding with a cursor parameter, driven by a
+declared trigger (end of list reached, or the button) instead of a scroll listener.
+
+*Where it fails, stated now:* GraphQL and other POST-for-reads APIs (refused by the GET
+rule; a separate decision, not a quiet exception); responses the page decrypts, decodes or
+heavily transforms before display (the markers do not surface verbatim); signed or
+nonce-bearing request URLs that cannot be templated; WebSocket and server-sent streams.
+Each is counted, not silently dropped.
+
+#### 5.4.5.2 Free-form input: classify the handler, do not enumerate the input
+
+Typed input cannot be explored exhaustively, but the handlers bound to it fall into a few
+shapes, and each has a declarative target:
+
+| what the handler does | recorded as |
+|---|---|
+| shows or hides a message depending on the value | HTML constraint validation (`required`, `pattern`, `minlength`, `type=email`, …) where the observed accept/reject behaviour matches one, checked on generated probes |
+| fetches suggestions as you type | a data binding (§5.4.5.1) whose parameter is the field |
+| filters or sorts a list already in the page | the vocabulary's filter/sort over the existing nodes |
+| submits the form | a request template, issued only on the reader's explicit submit, like a native `<form>` |
+
+**Finite inputs are explored, not classified:** a `<select>`'s options, checkboxes and
+radio groups have enumerable values, and their effects record like any §5.4.3 transition.
+
+**Never executed during conversion:** anything that would send a mutating request. Form
+submission is recorded as a template and only ever issued by the reader, at view time,
+through the same fetcher, so conversion can never act on anyone's behalf (§5.4.3
+invariant 1).
+
+*Where it fails:* rich-text editors, drag and drop, canvas drawing, anything whose effect
+depends on the full history of input rather than its current value. Those are application
+behaviour (population 3), not document behaviour.
+
+#### 5.4.5.3 Large state spaces: record independent transitions independently
+
+The blow-up §5.3 warns about comes from exploring *combinations*. Most combinations need
+not be explored. Two transitions whose effects touch disjoint subtrees and whose
+preconditions do not read each other's writes **commute**, so each is recorded once, alone,
+and the reader's sequence is replayed in any order with the same result. Only transitions
+that interfere — one's effect is the other's precondition, or both write the same node —
+need joint exploration, and that set is small because 93% of transitions are a single
+attribute write on their own subtree (§5.4.3). This is partial-order reduction applied to
+a page; the existing caps (effects and bytes per transition) remain the backstop, with
+overflow counted.
+
+#### 5.4.5.4 Time: record the cycle, drive it natively
+
+A timer-driven carousel is a cycle of states with a period. Exploration already sees the
+states (as transitions fired by `setTimeout`/`setInterval` rather than by a handler); the
+proposal records the cycle and its period, and the Navigator drives it — which also makes
+`prefers-reduced-motion` and pause-on-focus the platform's job rather than each site's.
+Clocks, countdowns and "posted 3 minutes ago" are better **recognised** (tier 3 style)
+than recorded, since their content is a function of the reader's clock; unrecognised ones
+show their converted value and are marked stale.
+
+#### 5.4.5.5 Verification: re-run, do not trust
+
+Every recorded binding is checked before it is published: the converter replays the
+recorded responses through the **binding** and through the **page's own code**, and
+compares the two DOMs over the bound subtree. A mismatch drops the binding and keeps the
+static conversion (§5.4.2's floor: never publish something worse than what was in hand).
+This is what makes the approach safe to be wrong: a wrong inference is caught at conversion
+time, where it costs a fallback, not at view time, where it would cost a misbehaving page.
+
+#### 5.4.5.6 Totality, and what is measured first
+
+The vocabulary additions are a request template, a field-to-slot mapping, and "stamp this
+block once per element of a response array". The last is bounded iteration over data that
+is already in hand — it terminates in the length of the response, which the fetcher caps —
+so §5's totality discipline holds: no loops over computed conditions, no recursion, no
+expression that can run unboundedly. Anything a page does that would need more is
+population 3, by definition.
+
+**Before building:**
+
+1. **Coverage, measured on both corpora:** of the interactive elements a page registers,
+   how many §5.4.3 already records, and which of the four cases above the rest fall into.
+   This decides the order, and whether case 1 is as dominant as assumed.
+2. **One prototype, case 1, on one search page** whose results are server-fed: infer the
+   binding from the prerender's own responses with perturbation, verify by re-running
+   (§5.4.5.5), and report whether it survives a second, independently fetched response.
+
+If (2) cannot infer a binding that survives (1)'s typical page, the proposal is wrong and
+should be recorded as refuted here, like §5.4.4.
+
 ### 5.5 WebAssembly is a better cage, not a translation
 
 A recurring hope is that WASM offers a way out. It does not, for a simple factual reason:
@@ -1305,3 +1450,8 @@ Not because the risk is small, but because of where it sits:
    buys one marginal document, rescues none from demotion, and admits 12x the traffic —
    989 requests of which come from one document to one first-party host and produce no
    content at all.
+8. **Whether conversion can record data, input and time as well as states** — proposed in
+   §5.4.5 (data bindings inferred by replaying perturbed copies of the prerender's own
+   responses, input handlers classified onto constraint validation and request templates,
+   commuting transitions recorded alone, timer cycles driven natively). Open until the
+   coverage measurement and the one-page prototype of §5.4.5.6 report.
