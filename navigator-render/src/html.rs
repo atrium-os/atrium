@@ -4541,6 +4541,32 @@ mod tests {
     }
 
     #[test]
+    fn fr_tracks_in_indefinite_space_share_one_flex_fraction() {
+        // Le Monde: `repeat(3, 1fr)` rows in an auto-height grid. With
+        // indefinite space every flexible track takes the SAME fraction —
+        // the largest its content needs per unit of flex (Grid §12.7.1) —
+        // so all three rows are as tall as the tallest, as in Chrome.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 200px; grid-template-rows: repeat(3, 1fr); row-gap: 5px }
+            .a { height: 10px; background-color: #ff0000 } .b { height: 30px; background-color: #00ff00 }
+            .c { height: 20px; background-color: #0000ff }</style>
+            <div class="g"><div class="a"></div><div class="b"></div><div class="c"></div></div>"#);
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 200, 10)]);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(0, 35, 200, 30)]);
+        assert_eq!(boxes(&o, 0x0000ffff), vec![(0, 70, 200, 20)]);
+        // Columns of a shrink-wrapped grid, in proportion to their flex: the
+        // 60 px item sets 1fr = 60, so 2fr = 120; a 0.5fr track keeps its
+        // content's 40 (a factor below 1 counts as 1).
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .o { display: inline-block } .g { display: grid; grid-template-columns: 1fr 2fr 0.5fr }
+            .a { width: 60px; height: 10px; background-color: #ff0000 } .b { width: 30px; height: 10px }
+            .c { width: 40px; height: 10px } .i2 { background-color: #00ff00 } .i3 { background-color: #0000ff }</style>
+            <div class="o"><div class="g"><div><div class="a"></div></div><div class="i2"><div class="b"></div></div><div class="i3"><div class="c"></div></div></div></div>"#);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(60, 0, 120, 10)]);
+        assert_eq!(boxes(&o, 0x0000ffff), vec![(180, 0, 40, 10)]);
+    }
+
+    #[test]
     fn a_minmax_fr_row_in_an_auto_height_grid_holds_its_content() {
         // BBC News: `grid-template-rows: min-content minmax(0, 1fr)` on a
         // grid with no height. With indefinite free space a flexible track
@@ -5205,6 +5231,18 @@ fn size_tracks(tracks: &[navigator_style::values::Track], avail: Option<U>, gap:
     // at 22 px, and a title wrapped to two lines ran under the row below.
     let Some(a) = avail else {
         for (i, t) in tracks.iter().enumerate() { if flex_of(t).is_none() { sizes[i] = limits[i] } }
+        // ★ §12.7.1 with indefinite space: ONE flex fraction for every
+        // flexible track — the largest any track's content needs, per unit
+        // of flex (a factor below 1 counts as 1) — so `repeat(3, 1fr)` rows
+        // in an auto-height grid are all as tall as the tallest. Sized one
+        // by one, Le Monde's "most read" rows came out 109 / 130 / 129
+        // where Chrome has three of 130.
+        let frac = tracks.iter().enumerate()
+            .filter_map(|(i, t)| flex_of(t).map(|f| get(maxs, i) as f64 / f.max(1.0)))
+            .fold(0.0, f64::max);
+        for (i, t) in tracks.iter().enumerate() {
+            if let Some(f) = flex_of(t) { sizes[i] = sizes[i].max((frac * f) as U) }
+        }
         return sizes;
     };
     let gaps = gap * (tracks.len() as U).saturating_sub(1);
