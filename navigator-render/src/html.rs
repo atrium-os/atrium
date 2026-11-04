@@ -2051,8 +2051,10 @@ impl<'a> Cx<'a> {
         let rtl = kw(s, "direction") == "rtl";
         let rgap = len(s.get("row-gap"), cb_h.unwrap_or(0)).unwrap_or(0);
         let GridPlan { items, abs, coltracks, rowtracks, cmin, cmax, cauto, cgap } = self.grid_plan(h, s, w);
-        // Out of flow: not items, placed against their containing block.
-        for c in abs { self.abs_box(c, x, x + w, y) }
+        // Out of flow: not items, placed against their containing block —
+        // which, when this grid is that block, is the item's GRID AREA (see
+        // below, once the tracks are sized).
+        let grid_is_cb = kw(s, "position") != "static" && !kw(s, "position").is_empty();
         let cols = size_tracks(&coltracks, Some(w), cgap, &cmin, &cmax, &cauto);
         // Row sizes: content heights measured at the item's column width.
         let mut rmin = vec![0 as U; rowtracks.len()];
@@ -2088,9 +2090,100 @@ impl<'a> Cx<'a> {
             }
         }
         let rows = size_tracks(&rowtracks, cb_h, rgap, &rmin, &rmin, &rmin);
+        let total_h = rows.iter().sum::<U>() + rgap * (rows.len() as U).saturating_sub(1);
+        // ★ The STATIC position of an absolutely positioned child (CSS
+        // Position 3 §4.2, Box Alignment §5.1): its own justify-self /
+        // align-self within the static-position rectangle — the grid's
+        // content box, or its grid area when the grid is its containing
+        // block. stretch and normal are start; in rtl start is the right.
+        let static_align = |this: &Self, c: Handle| -> (Align, Align) {
+            let pick = |own: &str, parent: &str| this.st(c).map(|cs| match kw(cs, own) { "auto" | "" => kw(s, parent), a => a }).unwrap_or("").to_string();
+            let logical = |v: &str| match v { "end" | "flex-end" | "self-end" => Align::End, "center" => Align::Center, _ => Align::Start };
+            let j = pick("justify-self", "justify-items");
+            let horiz = match j.as_str() { "left" => Align::Start, "right" => Align::End,
+                v => match (logical(v), rtl) { (Align::Start, true) => Align::End, (Align::End, true) => Align::Start, (a, _) => a } };
+            (horiz, logical(&pick("align-self", "align-items")))
+        };
+        let content_h = cb_h.unwrap_or(total_h);
+        let mut abs_jobs: Vec<AbsJob> = vec![];
+        // ★ An absolutely positioned child of a grid that is its containing
+        // block takes its GRID AREA as that block (Grid §9.1): the
+        // placement properties name lines, and `auto` (or a line the grid
+        // does not have) is the container's padding edge. A START line is
+        // its track's start; an END line, the end of the track before it,
+        // so the gutter is outside. Abspos children create no tracks.
+        {
+            use navigator_style::values::GridLine;
+            let (pcx, pcy, pcw, pch) = self.pos_cb;
+            // An auto height is not known to the caller yet: it is the rows,
+            // plus the frame, clamped by min-/max-height (border-box, §3.1).
+            let pch = pch.unwrap_or_else(|| {
+                let bw = |side: &str| if kw(s, &format!("border-{side}-style")) == "none" { 0 } else { len(s.get(&format!("border-{side}-width")), 0).unwrap_or(0) };
+                let (pt, pb) = (len(s.get("padding-top"), w).unwrap_or(0), len(s.get("padding-bottom"), w).unwrap_or(0));
+                let mut bh = total_h + pt + pb + bw("top") + bw("bottom");
+                if let Some(m) = len(s.get("max-height"), 0) { bh = bh.min(m) }
+                if let Some(m) = len(s.get("min-height"), 0) { bh = bh.max(m) }
+                (bh - bw("top") - bw("bottom")).max(0)
+            });
+            let ntpl = |p: &str| match s.get(p) { V::Tracks(t) => t.len() as i32, _ => 0 };
+            let (ncol_tpl, nrow_tpl) = (ntpl("grid-template-columns"), ntpl("grid-template-rows"));
+            // Line k (0-based) as an offset from the content edge.
+            let start_at = |sz: &[U], gap: U, k: usize| sz[..k].iter().sum::<U>() + gap * k as U;
+            let end_at = |sz: &[U], gap: U, k: usize| sz[..k].iter().sum::<U>() + gap * (k as U).saturating_sub(1).max(0);
+            // (start, end) in content-edge offsets; None = the padding edge.
+            let span = |a: GridLine, b: GridLine, sz: &[U], gap: U, ntpl: i32| -> (Option<U>, Option<U>) {
+                let n = sz.len() as i32;
+                let k = |l: i32| { let l = if l < 0 { ntpl + 2 + l } else { l }; (l >= 1 && l <= n + 1).then_some((l - 1) as usize) };
+                let (sa, eb) = match (a, b) {
+                    (GridLine::Line(i), GridLine::Line(j)) => (k(i), k(j)),
+                    (GridLine::Line(i), GridLine::Span(m)) => (k(i), k(i).map(|v| v + m.max(1) as usize).filter(|v| *v as i32 <= n)),
+                    (GridLine::Span(m), GridLine::Line(j)) => (k(j).and_then(|v| v.checked_sub(m.max(1) as usize)), k(j)),
+                    (GridLine::Line(i), _) => (k(i), None),
+                    (_, GridLine::Line(j)) => (None, k(j)),
+                    _ => (None, None),
+                };
+                (sa.map(|v| start_at(sz, gap, v)), eb.map(|v| end_at(sz, gap, v)))
+            };
+            for c in abs {
+                if !(grid_is_cb && self.st(c).is_some_and(|cs| kw(cs, "position") == "absolute")) {
+                    let (horiz, vert) = static_align(self, c);
+                    abs_jobs.push((c, None, FlexStatic { x, y, w, h: content_h, horiz, vert }, x, x + w, y));
+                    continue;
+                }
+                let Some(cs) = self.st(c) else { continue };
+                let line = |p: &str| match cs.get(p) { V::Line(l) => *l, _ => GridLine::Auto };
+                let (c0, c1) = span(line("grid-column-start"), line("grid-column-end"), &cols, cgap, ncol_tpl);
+                let (r0, r1) = span(line("grid-row-start"), line("grid-row-end"), &rows, rgap, nrow_tpl);
+                let (mut ax0, mut ax1) = (c0.map_or(pcx, |v| x + v), c1.map_or(pcx + pcw, |v| x + v));
+                if rtl {
+                    // Mirrored: line 1 is the content box's RIGHT edge.
+                    ax0 = c1.map_or(pcx, |v| x + w - v);
+                    ax1 = c0.map_or(pcx + pcw, |v| x + w - v);
+                }
+                let (ay0, ay1) = (r0.map_or(pcy, |v| y + v), r1.map_or(pcy + pch, |v| y + v));
+                let (aw, ah) = ((ax1 - ax0).max(0), (ay1 - ay0).max(0));
+                let (horiz, vert) = static_align(self, c);
+                abs_jobs.push((c, Some((ax0, ay0, aw, Some(ah))), FlexStatic { x: ax0, y: ay0, w: aw, h: ah, horiz, vert }, ax0, ax1.max(ax0), ay0));
+            }
+        }
+        // ★ Positioned boxes paint in TREE order (CSS 2.1 Appendix E, layer
+        // 6, which `restack` hoists above the in-flow content), so each is
+        // laid out where it stands among the items: placed first, a later
+        // positioned grid item's abspos child drew under an earlier one.
+        let dom_at: HashMap<Handle, usize> = self.dom.children_of(h).into_iter().enumerate().map(|(i, c)| (c, i)).collect();
+        let at = |c: &Handle| dom_at.get(c).copied().unwrap_or(usize::MAX);
+        let mut abs_jobs = abs_jobs.into_iter().peekable();
+        let run_abs = |this: &mut Self, (c, cb, fs, sx, sr, sy): AbsJob| {
+            let saved = this.pos_cb;
+            if let Some(cb) = cb { this.pos_cb = cb }
+            this.flex_static = Some(fs);
+            this.abs_box(c, sx, sr, sy);
+            this.pos_cb = saved;
+        };
         // Place.
         let pos = |sizes: &[U], gap: U, i: usize| -> U { sizes[..i.min(sizes.len())].iter().sum::<U>() + gap * i as U };
         for it in &items {
+            while abs_jobs.peek().is_some_and(|j| at(&j.0) < at(&it.h)) { let j = abs_jobs.next().expect("peeked"); run_abs(self, j) }
             let aw = (it.col.0..it.col.0 + it.col.1).map(|i| cols.get(i).copied().unwrap_or(0)).sum::<U>() + cgap * (it.col.1 as U - 1);
             let ax = if rtl { x + w - pos(&cols, cgap, it.col.0) - aw } else { x + pos(&cols, cgap, it.col.0) };
             let ay = y + pos(&rows, rgap, it.row.0);
@@ -2138,7 +2231,8 @@ impl<'a> Cx<'a> {
             let forced_h = ((it.align == "stretch" && !(at || ab)) || specified_h.is_some()).then_some(ih);
             self.block(it.h, ax + dx, ay + dy, iw, Some(ah), (Some(iw), forced_h));
         }
-        rows.iter().sum::<U>() + rgap * (rows.len() as U).saturating_sub(1)
+        for j in abs_jobs { run_abs(self, j) }
+        total_h
     }
 
     /// Table layout, separate borders (profile §3.9: `border-collapse` is
@@ -4933,6 +5027,44 @@ mod tests {
         assert_eq!(boxes(&o, 0x00ff00ff), vec![(0, 0, 100, 100)]);
     }
 
+    /// An abspos child of a grid that is its containing block takes its
+    /// GRID AREA as that block (Grid §9.1); `auto` lines are the padding
+    /// edges, and an auto-height container's are clamped by max-height.
+    #[test]
+    fn an_abspos_grid_child_is_contained_by_its_grid_area() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; position: relative; padding-left: 10px; padding-top: 10px; padding-right: 10px; padding-bottom: 10px;
+                 grid-template-columns: 100px 50px; grid-template-rows: 40px 60px; column-gap: 5px; max-height: 90px }
+            .g > div { position: absolute; width: 100%; height: 100% }
+            .a { grid-column-start: 2; grid-column-end: 3; grid-row-start: 2; grid-row-end: 3; background-color: #00ff00 }
+            .b { grid-column-start: 1; grid-column-end: 2; background-color: #0000ff }
+            .c { grid-column-end: -1; grid-row-start: 1; grid-row-end: 2; background-color: #ff0000 }</style>
+            <div class="g"><div class="a"></div><div class="b"></div><div class="c"></div></div>"#);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(115, 50, 50, 60)], "column 2, row 2");
+        // Rows auto: the padding box, top to bottom — 90px tall by max-height.
+        assert_eq!(boxes(&o, 0x0000ffff), vec![(10, 0, 100, 90)], "column 1, all rows");
+        // Start auto = the left padding edge; end = the last line.
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 10, 165, 40)], "padding edge to line -1");
+    }
+
+    /// An abspos child's STATIC position in a grid: its own self-alignment
+    /// in the grid's content box (CSS Position 3 §4.2) — and positioned
+    /// boxes paint in tree order among the grid's items.
+    #[test]
+    fn an_abspos_grid_child_aligns_at_its_static_position_in_tree_order() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 100px; height: 100px; grid-template-columns: 100px; grid-template-rows: 100px }
+            .a { position: absolute; width: 50px; height: 20px; align-self: end; justify-self: center; background-color: #00ff00 }
+            .p { position: relative; grid-column-start: 1; grid-row-start: 1 }
+            .r { position: absolute; width: 10px; height: 10px; background-color: #ff0000 }
+            .b { position: absolute; width: 10px; height: 10px; background-color: #0000ff }</style>
+            <div class="g"><div class="a"></div><div class="p"><div class="r"></div></div><div class="b"></div></div>"#);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(25, 80, 50, 20)], "end / centre in the content box");
+        // The red box is inside the item before the blue one: blue on top.
+        let order: Vec<u32> = o.scene.order.iter().filter(|(k, _)| *k == 0).map(|(_, i)| o.scene.rects[*i].rgba).collect();
+        assert_eq!(order, vec![0x00ff00ff, 0xff0000ff, 0x0000ffff]);
+    }
+
     /// Outside flex, `flex-end` is `end` (Box Alignment §6.1).
     #[test]
     fn grid_items_read_flex_end_as_end() {
@@ -5213,6 +5345,11 @@ struct GItem { h: Handle, col: (usize, usize), row: (usize, usize), justify: Str
 /// What `grid_plan` works out before any track is sized.
 struct GridPlan { items: Vec<GItem>, abs: Vec<Handle>, coltracks: Vec<navigator_style::values::Track>,
                   rowtracks: Vec<navigator_style::values::Track>, cmin: Vec<U>, cmax: Vec<U>, cauto: Vec<U>, cgap: U }
+
+/// An absolutely positioned grid child, ready to lay out: the handle, the
+/// containing block it takes (its grid area) if not the inherited one, its
+/// static-position rectangle and alignment, and the static x / right / y.
+type AbsJob = (Handle, Option<(U, U, U, Option<U>)>, FlexStatic, U, U, U);
 
 /// `mins`/`maxs` are the tracks' min- and max-content contributions, `autos`
 /// the minimum contributions an `auto` minimum takes (§12.5).
