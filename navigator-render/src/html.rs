@@ -558,6 +558,20 @@ impl<'a> Cx<'a> {
     /// `force` = (border-box width, border-box height) imposed by a flex
     /// container on its item; `None` lets the box size itself.
     fn block(&mut self, h: Handle, x: U, y: U, cb_w: U, cb_h: Option<U>, force: (Option<U>, Option<U>)) -> U {
+        // ★ The out-of-flow boxes still WAITING for the enclosing line box
+        // belong to it, not to this box. An inline-block on the same line —
+        // or the first of two absolutely positioned siblings, laid out
+        // while the second is still pending — placed them at ITS content
+        // origin: WPT's align-content references put "one" on the line of
+        // "three", 16 px right of its own `left`.
+        let outer = std::mem::take(&mut self.pending_abs);
+        let r = self.block_box(h, x, y, cb_w, cb_h, force);
+        debug_assert!(self.pending_abs.is_empty(), "a block places its own out-of-flow boxes");
+        self.pending_abs = outer;
+        r
+    }
+
+    fn block_box(&mut self, h: Handle, x: U, y: U, cb_w: U, cb_h: Option<U>, force: (Option<U>, Option<U>)) -> U {
         // ★ A TEXT handle here is an anonymous block box: a run of loose text
         // inside a flex or grid container, which CSS wraps in an anonymous
         // item. It has no style of its own — it inherits, and since it paints
@@ -3788,6 +3802,30 @@ mod tests {
         assert_eq!(one(0x00ff00ff).0, 300 - 40, "justify-self: start is the cell's right edge");
         assert_eq!(one(0xffff00ff).0, 100, "end is its left edge (cell 2 spans 100..200)");
         assert_eq!(one(0x00ffffff).0, 0, "-2 / -1 is the last column, on the left");
+    }
+
+    /// ★ Out-of-flow boxes written inside a line wait for that line box —
+    /// and belong to IT. Laid out while a sibling was still waiting, the
+    /// first of two `position: absolute` spans placed the second at its own
+    /// content origin (and itself on the second's line); an inline-block
+    /// laid out on the same line did the same. Expected offsets are
+    /// headless Chrome's.
+    #[test]
+    fn waiting_absolute_boxes_belong_to_their_own_line() {
+        let src = r#"<style>body { margin-left: 0px; margin-top: 0px; margin-right: 0px }
+            .d { position: relative; width: 320px; height: 96px }
+            .s { position: absolute; display: inline-block; width: 128px; height: 48px }
+            .a { top: 0px; left: 16px; background-color: #ff0000 } .b { top: 48px; left: 176px; background-color: #0000ff }
+            .i { display: inline-block; width: 30px; height: 10px; background-color: #00ff00 }
+            .c { top: 4px; left: 200px; background-color: #ffff00 } .e { top: 4px; left: 200px; background-color: #00ffff }</style>
+            <div class="d"><span class="s a">one</span> <span class="s b">two</span></div>
+            <div class="d">x <span class="s c">c</span><span class="i">i</span><span class="s e">e</span></div>"#;
+        let o = render(src);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let one = |c: u32| boxes(&o, c)[0];
+        assert_eq!((one(0xff0000ff).0, one(0xff0000ff).1), (16, 0), "its own offsets, not the next box's");
+        assert_eq!((one(0x0000ffff).0, one(0x0000ffff).1), (176, 48));
+        assert_eq!((one(0xffff00ff).0, one(0xffff00ff).1), (200, 96 + 4), "not moved into the inline-block");
     }
 
     /// ★ CSS Flexbox §4.1: an absolutely positioned child of a flex
