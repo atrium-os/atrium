@@ -79,6 +79,18 @@ fn group_alpha(scene: &Scene, mut g: Option<u32>) -> u32 {
     a
 }
 
+/// A character that paints no ink box of its own: zero-width and format
+/// characters (ZWSP, ZWNJ, ZWJ, word joiner, BOM, soft hyphen — bidi class
+/// BN), the bidi marks and embedding/isolate controls, and the non-spacing
+/// marks (bidi class NSM: combining diacritics, variation selectors), whose
+/// ink sits on the base character they follow. A run holding only these
+/// lands on its neighbour by design.
+fn has_no_box(c: char) -> bool {
+    use unicode_bidi::BidiClass::*;
+    matches!(c, '\u{200e}' | '\u{200f}' | '\u{61c}')
+        || matches!(unicode_bidi::bidi_class(c), BN | NSM | LRE | RLE | PDF | LRO | RLO | LRI | RLI | FSI | PDI)
+}
+
 /// Flag one scene. `doc_text_chars` is the number of non-whitespace
 /// characters in the document's visible text (0 skips that check).
 pub fn flag(scene: &Scene, fonts: &FontSet, doc_text_chars: usize) -> Flags {
@@ -87,18 +99,24 @@ pub fn flag(scene: &Scene, fonts: &FontSet, doc_text_chars: usize) -> Flags {
         let (clip, group, xform) = scene.run_attrs.get(i).copied().unwrap_or((None, None, None));
         if xform.is_some() { f.transformed += 1; continue }
         if r.rgba & 0xff == 0 || group_alpha(scene, group) == 0 || r.size <= 0 || r.glyphs.is_empty() { continue }
-        // Nothing to see: whitespace, or only ZERO-WIDTH characters (ZWSP,
-        // ZWNJ, ZWJ, word joiner, BOM), which shape to no ink — Coursera's
-        // `\u{200b}` and Goodreads' `\u{200c}` were reported as overlaps.
-        if r.text.chars().all(|c| c.is_whitespace() || matches!(c, '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}')) { continue }
+        // Nothing to see: whitespace, or only characters with no box of
+        // their own (see `has_no_box`) — Coursera's `\u{200b}`, Goodreads'
+        // `\u{200c}`, Hebrew Wikipedia's `\u{200e}`, a `\u{fe0f}` after an
+        // emoji and a combining `\u{32a}` under a Latin letter were all
+        // reported as overlaps with the text they belong to.
+        if r.text.chars().all(|c| c.is_whitespace() || has_no_box(c)) { continue }
         let Some(face) = fonts.faces.get(r.face) else { continue };
         let ff = face.parse();
         let upem = face.upem.max(1);
-        let &(gid, dx, _) = r.glyphs.last().unwrap();
-        let adv = ff.glyph_hor_advance(ttf_parser::GlyphId(gid)).unwrap_or(0) as i64;
-        let first_dx = r.glyphs.first().map(|g| g.1).unwrap_or(0);
-        let x0 = r.x + first_dx;
-        let x1 = r.x + dx + adv * r.size / upem;
+        // The box spans the BASE glyphs: a mark's (niqqud, harakat) offset
+        // and font advance are not where the line's next character starts,
+        // and counting them made pointed Hebrew words reach into the
+        // punctuation beside them. A right-to-left run also ends on its
+        // leftmost glyph, so take the extent over every glyph.
+        let base = |&&(gid, _, _): &&(u16, U, U)| ff.tables().gdef.and_then(|t| t.glyph_class(ttf_parser::GlyphId(gid))) != Some(ttf_parser::gdef::GlyphClass::Mark);
+        let x0 = r.x + r.glyphs.iter().filter(base).map(|g| g.1).min().unwrap_or(0);
+        let x1 = r.x + r.glyphs.iter().filter(base).map(|&(gid, dx, _)|
+            dx + ff.glyph_hor_advance(ttf_parser::GlyphId(gid)).unwrap_or(0) as i64 * r.size / upem).max().unwrap_or(0);
         let asc = face.ascent.abs() * r.size / upem;
         let desc = face.descent.abs() * r.size / upem;
         let (mut y0, mut y1) = (r.y - asc, r.y + desc);
@@ -230,6 +248,32 @@ mod tests {
         let f = run("<style>.a { position: absolute; left: 10px; top: 10px }</style>\
             <div class=\"a\">\u{200b}</div><div class=\"a\">Level: Beginner</div>");
         assert!(f.overlaps.is_empty(), "{:?}", f.overlaps);
+    }
+
+    /// Bidi marks, variation selectors and combining marks shape to
+    /// separate runs that sit on (or beside) their base text.
+    #[test]
+    fn bidi_marks_selectors_and_combining_marks_are_not_text_for_overlap() {
+        for mark in ["\u{200e}", "\u{200f}", "\u{2067}", "\u{fe0f}", "\u{32a}", "\u{301}"] {
+            let f = run(&format!("<style>.a {{ position: absolute; left: 10px; top: 10px }}</style>\
+                <div class=\"a\">{mark}</div><div class=\"a\">Level: Beginner</div>"));
+            assert!(f.overlaps.is_empty(), "{:?}: {:?}", mark.escape_unicode().to_string(), f.overlaps);
+        }
+        // A mark with its base is still text.
+        let f = run("<style>.a { position: absolute; left: 10px; top: 10px }</style>\
+            <div class=\"a\">e\u{301}te\u{301}</div><div class=\"a\">Level: Beginner</div>");
+        assert!(!f.overlaps.is_empty());
+    }
+
+    /// A pointed Hebrew word's box ends at its base letters: the niqqud
+    /// under its leftmost letter is not where the punctuation after it
+    /// starts.
+    #[test]
+    fn marks_do_not_widen_a_run_into_the_punctuation_beside_it() {
+        let f = run("<p dir=\"rtl\">תחילית \"\u{5d9}\u{5b0}\u{5e8}\u{5d5}\u{5bc}\" לקוחה. \
+            \u{5dc}\u{5b4}\u{5e9}\u{5c1}\u{5b0}\u{5de}\u{5b6}\u{5da}\u{5b8}. \u{5d5}\u{5bc}'</p>");
+        assert!(f.overlaps.is_empty(), "{:?}", f.overlaps.iter().map(|o| (
+            &f.vis.iter().find(|v| v.run == o.0).unwrap().text, &f.vis.iter().find(|v| v.run == o.1).unwrap().text)).collect::<Vec<_>>());
     }
 
     #[test]
