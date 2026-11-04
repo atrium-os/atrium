@@ -2,7 +2,7 @@
 //! before and after each pass, and the verifier passes after each one.
 
 use atrium_gir::interp::{self, Buffers};
-use atrium_gir::passes::{cse, dce, fold, mem2reg, uniformity};
+use atrium_gir::passes::{combine, cse, dce, fold, mem2reg, uniformity};
 use atrium_gir::{verify::verify, Function, Node, Op, Space};
 
 struct Rng(u64);
@@ -71,10 +71,11 @@ fn private_loads(r: &[Node]) -> usize {
 fn check(name: &str, mut g: Function, inputs: &Buffers, groups: u32) -> (usize, usize, Function) {
     let before = count(&g.body);
     let want = run(&g, inputs, groups);
-    let steps: [(&str, fn(&mut Function)); 4] = [
+    let steps: [(&str, fn(&mut Function)); 5] = [
         ("mem2reg", |f| { mem2reg::mem2reg(f); }),
         ("fold", |f| { fold::fold(f); }),
         ("cse", |f| { cse::cse(f); }),
+        ("combine", |f| { combine::combine_loads(f); }),
         ("dce", |f| { dce::dce(f); }),
     ];
     for round in 0..3 {

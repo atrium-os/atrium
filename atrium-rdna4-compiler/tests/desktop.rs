@@ -14,8 +14,9 @@ fn compile(path: &str) -> Option<(atrium_gir::Function, atrium_rdna4_compiler::B
 fn desktop_shaders_compile() {
     for p in ["atrium-core/compute/op_rectangle.comp.spv", "atrium-core/compute/op_path.comp.spv",
               "atrium-core/compute/op_texture.comp.spv", "atrium-text/compute/op_glyph_run.comp.spv"] {
-        let Some((_, b)) = compile(p) else { continue };
+        let Some((g, b)) = compile(p) else { continue };
         let l = atrium_rdna4_compiler::listing(&b.code);
+        if std::env::var("RDNA4_GIR").is_ok() { println!("== {p}\n{g}"); }
         if std::env::var("RDNA4_LIST").is_ok() { println!("== {p}: {} dwords, {} VGPRs, {} SGPRs\n{l}", b.code.len(), b.vgprs, b.sgprs); }
         assert!(!l.contains('<'), "{p}: undecodable words\n{l}");
         eprintln!("{p}: {} dwords, {} VGPRs, {} SGPRs", b.code.len(), b.vgprs, b.sgprs);

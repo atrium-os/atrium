@@ -1,6 +1,6 @@
 //! Dead code elimination.
 //!
-//! Removes pure instructions whose results are unused, unused `if` and loop
+//! Removes pure instructions and loads whose results are unused, unused `if` and loop
 //! results (with their `yield`/`break` operands), loop parameters that only
 //! feed themselves, empty `if`s, and code after a node that never falls
 //! through.
@@ -90,7 +90,7 @@ fn sweep(r: &mut Region, uses: &HashMap<ValueId, usize>) -> bool {
     for mut node in std::mem::take(r) {
         match &mut node {
             Node::Inst(i) => {
-                if i.op.is_pure() && i.result.map_or(false, |v| !used(&v)) {
+                if (i.op.is_pure() || matches!(i.op, Op::Load(..))) && i.result.map_or(false, |v| !used(&v)) {
                     changed = true;
                     continue;
                 }

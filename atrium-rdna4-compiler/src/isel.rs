@@ -17,7 +17,7 @@ use crate::mir::*;
 use crate::{Abi, Error};
 use atrium_gir::passes::uniformity::Uniformity;
 use atrium_gir::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 struct LoopRegs {
     brk: VR,
@@ -36,6 +36,12 @@ pub(crate) struct Isel<'a> {
     map: HashMap<ValueId, (VR, u8)>,
     consts: HashMap<ValueId, u32>,
     uses: HashMap<ValueId, usize>,
+    /// `IAdd(x, k)` values used only as memory offsets: folded into the
+    /// instruction's immediate offset, never computed.
+    addr_only: HashSet<ValueId>,
+    /// Components of each vector builtin that something extracts (builtins
+    /// used only through extracts compute nothing else).
+    builtin_comps: HashMap<ValueId, u8>,
     labels: u32,
     ret: VR,
     loops: Vec<LoopRegs>,
@@ -69,6 +75,42 @@ fn count_uses(r: &Region, uses: &mut HashMap<ValueId, usize>) {
     }
 }
 
+/// Per value: uses as a Load/Store/Atomic offset, and extracts of
+/// component k (bit mask).
+fn scan_special(r: &Region, off_uses: &mut HashMap<ValueId, usize>, extracts: &mut HashMap<ValueId, (usize, u8)>) {
+    for n in r {
+        match n {
+            Node::Inst(i) => match &i.op {
+                Op::Load(_, o) | Op::Store(_, o, _) | Op::Atomic(_, _, o, _) => *off_uses.entry(*o).or_default() += 1,
+                Op::Extract(a, k) => {
+                    let e = extracts.entry(*a).or_default();
+                    e.0 += 1;
+                    e.1 |= 1 << k;
+                }
+                _ => {}
+            },
+            Node::If { then, els, .. } => {
+                scan_special(then, off_uses, extracts);
+                scan_special(els, off_uses, extracts);
+            }
+            Node::Loop { body, .. } => scan_special(body, off_uses, extracts),
+        }
+    }
+}
+
+fn collect_defs<'r>(r: &'r Region, out: &mut Vec<&'r Inst>) {
+    for n in r {
+        match n {
+            Node::Inst(i) => out.push(i),
+            Node::If { then, els, .. } => {
+                collect_defs(then, out);
+                collect_defs(els, out);
+            }
+            Node::Loop { body, .. } => collect_defs(body, out),
+        }
+    }
+}
+
 /// True if `r` contains a `return`, or a `break`/`continue` of the loop it
 /// sits in (not of a nested loop).
 fn leaves(r: &Region) -> bool {
@@ -96,7 +138,43 @@ impl<'a> Isel<'a> {
     pub fn new(f: &'a Function, u: &'a Uniformity, abi: &'a Abi) -> Self {
         let mut uses = HashMap::new();
         count_uses(&f.body, &mut uses);
+        let (mut off_uses, mut extracts) = (HashMap::new(), HashMap::new());
+        scan_special(&f.body, &mut off_uses, &mut extracts);
+        let mut consts = HashSet::new();
+        let mut defs = vec![];
+        collect_defs(&f.body, &mut defs);
+        for i in &defs {
+            if let (Op::Const(_), Some(r)) = (&i.op, i.result) {
+                consts.insert(r);
+            }
+        }
+        let mut addr_only = HashSet::new();
+        let mut builtin_comps = HashMap::new();
+        for i in &defs {
+            let Some(r) = i.result else { continue };
+            let n = uses.get(&r).copied().unwrap_or(0);
+            match &i.op {
+                Op::Bin(BinOp::IAdd, a, b) if n > 0 && off_uses.get(&r) == Some(&n) => {
+                    let fits = |c: &ValueId| {
+                        defs.iter().any(|d| d.result == Some(*c) && matches!(d.op, Op::Const(k) if (k as i32).abs() < (1 << 23)))
+                    };
+                    if (fits(b) && !consts.contains(a)) || (fits(a) && !consts.contains(b)) {
+                        addr_only.insert(r);
+                    }
+                }
+                Op::Builtin(_) => {
+                    if let Some((k, mask)) = extracts.get(&r) {
+                        if *k == n {
+                            builtin_comps.insert(r, *mask);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         Isel {
+            addr_only,
+            builtin_comps,
             f,
             u,
             abi,
@@ -289,6 +367,9 @@ impl<'a> Isel<'a> {
 
     fn inst(&mut self, i: &Inst) -> Result<(), Error> {
         let res = i.result;
+        if res.map_or(false, |r| self.addr_only.contains(&r)) {
+            return Ok(());
+        }
         let rty = res.map(|r| self.ty(r));
         match &i.op {
             Op::Const(b) => {
@@ -617,10 +698,11 @@ impl<'a> Isel<'a> {
 
     fn builtin(&mut self, b: Builtin, r: ValueId) -> Result<(), Error> {
         let ls = self.f.local_size;
+        let want = self.builtin_comps.get(&r).copied().unwrap_or(7);
         match b {
             Builtin::LocalId | Builtin::GlobalId => {
                 let d = self.def_v(r);
-                for k in 0..3u8 {
+                for k in (0..3u8).filter(|k| want & (1 << k) != 0) {
                     // Packed local id: x [9:0], y [19:10], z [29:20] in v0.
                     self.valu("V_BFE_U32", O::R(d, k), vec![O::PV(0), O::Imm(10 * k as u32), O::Imm(10)], 0);
                     if b == Builtin::GlobalId {
@@ -631,7 +713,7 @@ impl<'a> Isel<'a> {
             }
             Builtin::WorkgroupId => {
                 let d = self.def_v(r);
-                for k in 0..3u8 {
+                for k in (0..3u8).filter(|k| want & (1 << k) != 0) {
                     let g = self.tgid(k);
                     self.valu("V_MOV_B32", O::R(d, k), vec![g], 0);
                 }
@@ -672,6 +754,23 @@ impl<'a> Isel<'a> {
                     }
                     let c = self.src(*cond, 0)?;
                     let save = self.vreg(Class::S, 1);
+                    if then.is_empty() && results.is_empty() {
+                        // Only an else arm: run it under exec & !cond.
+                        let l_end = self.label();
+                        self.salu("S_MOV_B32", O::R(save, 0), vec![O::Exec]);
+                        self.salu("S_AND_NOT1_B32", O::Exec, vec![O::Exec, c]);
+                        self.mi.push(MI::Branch { name: "S_CBRANCH_EXECZ", target: l_end });
+                        self.yields.push(vec![]);
+                        self.region(els)?;
+                        self.yields.pop();
+                        self.mi.push(MI::Label(l_end));
+                        if leaves(els) {
+                            self.restore(save);
+                        } else {
+                            self.salu("S_MOV_B32", O::Exec, vec![O::R(save, 0)]);
+                        }
+                        continue;
+                    }
                     let (l_else, l_end) = (self.label(), self.label());
                     self.salu("S_AND_SAVEEXEC_B32", O::R(save, 0), vec![c]);
                     self.mi.push(MI::Branch { name: "S_CBRANCH_EXECZ", target: l_else });
