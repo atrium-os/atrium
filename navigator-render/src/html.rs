@@ -70,11 +70,14 @@ fn len(v: &V, basis: U) -> Option<U> {
 /// A box's border-box size `size` as an INTRINSIC CONTRIBUTION: clamped by
 /// its own `min-width`/`max-width` (CSS Sizing §5.2). A percentage is
 /// against the indefinite size being measured, so it does not clamp.
+/// A TABLE is never narrower than its content (CSS 2.1 §17.5.2), so its
+/// max-width does not cap it.
 /// ★ Unclamped, an ad slot's `min-width: 300px` measured its column at the
 /// width of the word "Ad", and a fit-content box centred 35 px of it.
 fn contribution(cs: &Style, size: U) -> U {
     let lim = |p: &str| match cs.get(p) { V::Len(l) => Some(u(l.v)), _ => None };
-    let size = lim("max-width").map_or(size, |mx| size.min(mx));
+    let table = matches!(cs.get("display"), V::Kw("table"));
+    let size = if table { size } else { lim("max-width").map_or(size, |mx| size.min(mx)) };
     lim("min-width").map_or(size, |mn| size.max(mn))
 }
 
@@ -3302,6 +3305,10 @@ mod tests {
         assert_eq!(red[0].2, 300, "min-width raises the contribution");
         assert_eq!(red[1].2, 100, "max-width caps it");
         assert_eq!(boxes(&o, 0x0000ffff)[0].2, 600, "a row flex container sums the clamped contributions");
+        let t = render(r#"<style>body { margin-left: 0px; margin-top: 0px } .ib { display: inline-block; background-color: #ff0000; height: 10px }
+            .t { display: table; max-width: 30px } .c { width: 60px; height: 10px }</style>
+            <div><div class="ib"><div class="t"><div class="c"></div></div></div></div>"#);
+        assert_eq!(boxes(&t, 0xff0000ff)[0].2, 60, "a table's max-width never caps it below its content (CSS 2.1 §17.5.2)");
     }
 
     /// ★ Flex AUTO MARGINS (Flexbox §8.1). On the main axis they take the
