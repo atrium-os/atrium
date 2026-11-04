@@ -44,6 +44,18 @@ dpkg-query -W -f='mesa-vulkan-drivers ${Version}\n' mesa-vulkan-drivers 2>/dev/n
         writeln!(sh, "cat > {n}/job.txt <<'ATRIUM_EOF'\n{}ATRIUM_EOF", b.job).unwrap();
         writeln!(sh, "cat > {n}/bench.txt <<'ATRIUM_EOF'\n{}ATRIUM_EOF", b.vk).unwrap();
         writeln!(sh, "echo \"--- {n} (ours: {} dwords, {} VGPRs, {} SGPRs)\"", b.stats.0, b.stats.1, b.stats.2).unwrap();
+        if b.kind == "files" {
+            for (file, data) in &b.inputs {
+                writeln!(sh, "base64 -d > {n}/{file} <<'ATRIUM_EOF'\n{}\nATRIUM_EOF", b64(data)).unwrap();
+            }
+            let out = b.compare.unwrap();
+            writeln!(sh, "./amdgpu_runner {n} $DEV >/dev/null 2>&1 || true; echo '[atrium]'; grep -v '^gpu_ns=\\|^gc_base\\|^device' {n}/result.txt || true").unwrap();
+            writeln!(sh, "if [ $HAVE_VK = 1 ]; then ./vk_bench {n} >/dev/null 2>&1 || true; echo '[radv]'; grep -v '^gpu_ns=' {n}/vk_result.txt || true").unwrap();
+            writeln!(sh, "  if cmp -s {n}/{out}.out {n}/{out}.vk; then echo '{out}: identical'; else echo \"{out}: DIFFER ($(cmp -l {n}/{out}.out {n}/{out}.vk 2>/dev/null | wc -l) bytes)\"; fi").unwrap();
+            writeln!(sh, "fi; true").unwrap();
+            writeln!(sh, "rm -f {n}/*.out {n}/*.vk {n}/*.in").unwrap();
+            continue;
+        }
         writeln!(sh, "echo \"glyphs=$(./bench_tool gen {} {} {n})\"", b.kind, b.nodes).unwrap();
         writeln!(sh, "./amdgpu_runner {n} $DEV >/dev/null 2>&1 || true; echo '[atrium]'; grep -v '^gpu_ns=\\|^gc_base\\|^device' {n}/result.txt || true").unwrap();
         writeln!(sh, "if [ $HAVE_VK = 1 ]; then ./vk_bench {n} >/dev/null 2>&1 || true; echo '[radv]'; grep -v '^gpu_ns=' {n}/vk_result.txt || true").unwrap();
@@ -58,7 +70,7 @@ dpkg-query -W -f='mesa-vulkan-drivers ${Version}\n' mesa-vulkan-drivers 2>/dev/n
         }
     }
     sh += "echo '=== RADV shader dumps (RADV_DEBUG=shaders,shaderstats) ==='\n";
-    for b in benches.iter().filter(|b| b.nodes <= 1 << 14) {
+    for b in benches.iter().filter(|b| b.nodes <= 1 << 14 && b.kind != "files") {
         let n = &b.name;
         writeln!(sh, "if [ $HAVE_VK = 1 ]; then echo '--- aco {n}'; sed -i 's/^repeat .*/repeat 1/' {n}/bench.txt; RADV_DEBUG=shaders,shaderstats,nocache MESA_SHADER_CACHE_DISABLE=1 ./vk_bench {n} 2>&1 | grep -v '^$' | head -3000; fi").unwrap();
     }

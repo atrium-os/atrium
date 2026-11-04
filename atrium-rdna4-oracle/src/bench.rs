@@ -39,6 +39,10 @@ pub struct Bench {
     pub buffers: Vec<&'static str>,
     /// Our code size (dwords), VGPRs and SGPRs, for the report.
     pub stats: (usize, u32, u32),
+    /// Input files carried in the script (`kind == "files"`): name, bytes.
+    pub inputs: Vec<(String, Vec<u8>)>,
+    /// Output buffer both drivers must agree on (`kind == "files"`).
+    pub compare: Option<&'static str>,
 }
 
 /// The glyph total `bench_tool gen glyph <nodes>` produces (same generator
@@ -129,6 +133,8 @@ pub fn desktop(shader: &str, spv_path: &str, nodes: u32, record: u32, repeat: u3
         vk,
         buffers: names,
         stats: (bin.code.len(), bin.vgprs, bin.sgprs),
+        inputs: vec![],
+        compare: None,
     })
 }
 
@@ -147,5 +153,80 @@ pub fn all() -> Vec<Bench> {
     for nodes in [1u32 << 16, 1 << 18] {
         v.extend(desktop(n, p, nodes, rec, 20));
     }
+    v.extend(fresco(false, 20));
+    v.extend(fresco(true, 20));
     v
+}
+
+/// The Fresco compute renderer on a 1920x1080 desktop-like scene: bin.comp
+/// (`raster == false`) or raster.comp from the reference tile masks. The
+/// frame's buffers travel in the script; both drivers must produce the same
+/// mask / target.
+pub fn fresco(raster: bool, repeat: u32) -> Option<Bench> {
+    use fresco_compute::{binding, reference, Frame, BIN_SPV, RASTER_SPV};
+    let (w, h, pitch) = (1920u32, 1080u32, 1920u32);
+    let f = Frame::pack(&crate::fresco::desktop_scene(), w, h, pitch);
+    let mut init = f.buffers();
+    if raster {
+        init[binding::MASK as usize] = reference::bin(&f).iter().flat_map(|x| x.to_le_bytes()).collect();
+    }
+    let spv = if raster { RASTER_SPV } else { BIN_SPV };
+    let k = atrium_rdna4::Kernel::from_spirv(spv, &atrium_rdna4::Options::default()).ok()?;
+    let groups = if raster { f.raster_groups() } else { f.bin_groups() };
+    let names = ["frame", "ops", "tex", "texels", "mask", "target", "lut"];
+    let sizes: Vec<u64> = (0..binding::COUNT)
+        .map(|b| match b as u32 {
+            binding::MASK => 4 * f.mask_words() as u64,
+            binding::TARGET => 4 * f.target_words() as u64,
+            _ => init[b].len() as u64,
+        })
+        .map(|n| n.max(16))
+        .collect();
+    assert!(sizes.iter().sum::<u64>() < 240 << 20);
+    let va = |i: usize| BENCH_VA + (i as u64) * 0x1000_0000;
+    let bind: Vec<((u32, u32), u64)> = k.buffers().iter().map(|&(s, b)| ((s, b), va(b as usize))).collect();
+    let mut ib = Blob::compute();
+    ib.acquire_all();
+    ib.timestamp(TS_VA);
+    emit_dispatch(&mut ib, &k.dispatch(CODE_VA, &bind, None, groups).ok()?);
+    ib.timestamp(TS_VA + 8);
+    ib.pad(8);
+    let mut code = k.code();
+    let ib_off = (IB_OFFSET as usize).max(code.len().next_multiple_of(0x1000));
+    code.resize(ib_off, 0);
+    code.extend(ib.bytes());
+    let code_size = code.len().next_multiple_of(0x1000);
+    let name = if raster { "fresco_raster_1080p" } else { "fresco_bin_1080p" }.to_string();
+    let has_input = |b: usize| (b as u32 != binding::TARGET) && (raster || b as u32 != binding::MASK);
+    let mut job = format!("# atrium-rdna4-oracle bench {name}\nip compute\ntimeout_ms 10000\ndomain vram\nrepeat {repeat}\ntimestamps ts\n");
+    job += &format!("bo code {CODE_VA:x} {code_size} code.in 0\nbo ts {TS_VA:x} 4096 - 0\n");
+    let mut vk = format!("spv shader.spv\nentry {}\ngroups {} {} {}\nrepeat {repeat}\n", entry_name(spv), groups[0], groups[1], groups[2]);
+    let mut inputs = vec![];
+    for (b, n) in names.iter().enumerate() {
+        if !k.buffers().contains(&(0, b as u32)) {
+            continue;
+        }
+        let input = if has_input(b) { format!("{n}.in") } else { "-".into() };
+        if has_input(b) {
+            inputs.push((format!("{n}.in"), init[b].clone()));
+        }
+        job += &format!("bo {n} {:x} {} {input} 1\n", va(b), sizes[b]);
+        vk += &format!("buf {b} {} {input} {n}\n", sizes[b]);
+    }
+    job += &format!("ib code {ib_off} {}\n", ib.dw.len());
+    let stats = (k.bin.code.len(), k.bin.vgprs, k.bin.sgprs);
+    Some(Bench {
+        name,
+        kind: "files",
+        nodes: f.ops.len() as u32,
+        record: 0,
+        code,
+        spv: spv.to_vec(),
+        job,
+        vk,
+        buffers: names.to_vec(),
+        stats,
+        inputs,
+        compare: Some(if raster { "target" } else { "mask" }),
+    })
 }

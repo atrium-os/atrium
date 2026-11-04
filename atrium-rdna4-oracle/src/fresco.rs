@@ -101,3 +101,42 @@ pub fn raster() -> Option<Case> {
     let target = bytes(&reference::render(&f));
     case("fresco_raster", RASTER_SPV, init, f.raster_groups(), (binding::TARGET, target))
 }
+
+/// A 1920x1080 desktop-like scene for timing: overlapping rounded windows,
+/// translucent panels, strokes, image quads and text runs (deterministic).
+pub fn desktop_scene() -> Scene {
+    let mut r = crate::cases::Rng(0xf2e5c0);
+    let mut f = |lo: f32, hi: f32| lo + (r.next() % 10_000) as f32 / 10_000.0 * (hi - lo);
+    let mut s = scene();
+    s.rects.clear();
+    s.paths.clear();
+    s.texture_batches[0].quads.clear();
+    s.glyph_batches[0].runs.clear();
+    for i in 0..96 {
+        let (w, h) = (f(120.0, 900.0), f(80.0, 640.0));
+        s.rects.push(Rect {
+            position: [f(-60.0, 1920.0 - w * 0.5), f(-40.0, 1080.0 - h * 0.5)],
+            size: [w, h],
+            color: [f(0.0, 1.0), f(0.0, 1.0), f(0.0, 1.0), if i % 3 == 0 { f(0.3, 0.9) } else { 1.0 }],
+            radius: if i % 2 == 0 { f(0.0, 24.0) } else { 0.0 },
+        });
+    }
+    for _ in 0..256 {
+        s.paths.push(Path {
+            model: [f(0.0, 1920.0), f(0.0, 1080.0), f(10.0, 400.0), f(1.0, 6.0)],
+            angle: f(0.0, 3.14),
+            color: [f(0.0, 1.0), f(0.0, 1.0), f(0.0, 1.0), f(0.5, 1.0)],
+        });
+    }
+    for _ in 0..48 {
+        s.texture_batches[0].quads.push([f(0.0, 1800.0), f(0.0, 1000.0), f(16.0, 256.0), f(16.0, 256.0)]);
+    }
+    for _ in 0..60 {
+        let origin = [f(0.0, 1700.0), f(12.0, 1080.0)];
+        let glyphs = (0..24)
+            .map(|g| Glyph { d_offset: [g as f32 * 9.0, 0.0], atlas_uv: [(g % 2) as f32 * 4.0, 0.0, 4.0, 8.0], bearing: [0.0, 7.0] })
+            .collect();
+        s.glyph_batches[0].runs.push(GlyphRun { origin, color: [0.05, 0.05, 0.1, 1.0], glyphs });
+    }
+    s
+}
