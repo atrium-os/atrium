@@ -62,6 +62,19 @@ pub fn write_42() -> Case {
     }
 }
 
+/// The `code` buffer for a compiled shader: the shader at 0, then the IB at
+/// [`IB_OFFSET`] or, for a shader longer than that, at the next page after
+/// it (so a large shader is never cut off and run into the IB).
+fn code_buffer(shader: &[u32], ib: &Blob) -> (Buffer, u64, u64) {
+    let mut code = words_to_bytes(shader);
+    let ib_off = (IB_OFFSET as usize).max(code.len().next_multiple_of(0x1000));
+    assert!(((ib_off + 4 * ib.dw.len()) as u64) < DATA_VA - CODE_VA, "shader larger than the code region");
+    code.resize(ib_off, 0);
+    code.extend(ib.bytes());
+    let size = code.len().next_multiple_of(0x1000).max(0x2000) as u64;
+    (Buffer { name: "code".into(), va: CODE_VA, size, init: code, expect: None, unordered: None }, ib_off as u64, ib.dw.len() as u64)
+}
+
 /// GPU address of data buffer `i` (1 MiB apart).
 fn data_va(i: usize) -> u64 {
     DATA_VA + (i as u64) * 0x10_0000
@@ -128,14 +141,10 @@ pub fn desktop(name: &str, spv: &str, nodes: u32, record: u32) -> Option<Case> {
     let mut ib = Blob::compute();
     emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs: bin.vgprs, user_sgprs: user, threads: bin.local_size, groups: [groups, 1, 1], wave32: true, lds_bytes: bin.lds_bytes });
     ib.pad(8);
-    let mut code = words_to_bytes(&bin.code);
-    assert!(code.len() <= IB_OFFSET as usize, "shader larger than the code slot");
-    code.resize(IB_OFFSET as usize, 0);
-    code.extend(ib.bytes());
-    let ib_dw = ib.dw.len() as u64;
+    let (code, ib_off, ib_dw) = code_buffer(&bin.code, &ib);
 
     let names = if glyph { vec!["scene", "glyphs", "instances", "counter"] } else { vec!["scene", "instances", "counter"] };
-    let mut buffers = vec![Buffer { name: "code".into(), va: CODE_VA, size: 0x2000, init: code, expect: None, unordered: None }];
+    let mut buffers = vec![code];
     for (i, b) in bufs.iter().enumerate() {
         let out = ib_bufs.remove(&(0, i as u32)).unwrap();
         let size = ((b.len().max(4) as u64) + 4095) & !4095;
@@ -148,7 +157,7 @@ pub fn desktop(name: &str, spv: &str, nodes: u32, record: u32) -> Option<Case> {
             expect: Some(out),
         });
     }
-    Some(Case { name: name.into(), buffers, ib: ("code".into(), IB_OFFSET, ib_dw), ip: "compute" })
+    Some(Case { name: name.into(), buffers, ib: ("code".into(), ib_off, ib_dw), ip: "compute" })
 }
 
 /// A Tier-B example (atrium-vk-icd/examples/shaders) compiled by our
@@ -202,12 +211,9 @@ pub fn tierb(name: &str) -> Option<Case> {
     let mut ib = Blob::compute();
     emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs: bin.vgprs, user_sgprs: user, threads: bin.local_size, groups: [1, 1, 1], wave32: true, lds_bytes: bin.lds_bytes });
     ib.pad(8);
-    let mut code = words_to_bytes(&bin.code);
-    code.resize(IB_OFFSET as usize, 0);
-    code.extend(ib.bytes());
-    let ib_dw = ib.dw.len() as u64;
-    buffers.insert(0, Buffer { name: "code".into(), va: CODE_VA, size: 0x2000, init: code, expect: None, unordered: None });
-    Some(Case { name: format!("tierb_{name}"), buffers, ib: ("code".into(), IB_OFFSET, ib_dw), ip: "compute" })
+    let (code, ib_off, ib_dw) = code_buffer(&bin.code, &ib);
+    buffers.insert(0, code);
+    Some(Case { name: format!("tierb_{name}"), buffers, ib: ("code".into(), ib_off, ib_dw), ip: "compute" })
 }
 
 /// Tier-B examples tried as compiled cases, simplest first.
