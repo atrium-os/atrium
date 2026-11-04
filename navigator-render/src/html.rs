@@ -1624,6 +1624,11 @@ impl<'a> Cx<'a> {
                         let b = |side: &str| if kw(cs, &format!("border-{side}-style")) == "none" { 0 } else { len(cs.get(&format!("border-{side}-width")), 0).unwrap_or(0) };
                         self.intrinsic(c).0 + len(cs.get("padding-left"), w).unwrap_or(0) + len(cs.get("padding-right"), w).unwrap_or(0) + b("left") + b("right")
                     } else { self.content_main(c, false, w) };
+                    // The content size suggestion is clamped by a definite
+                    // MAX main size (§4.5): an image's natural 1536 px is no
+                    // minimum for an item that says `max-width: 100%`.
+                    let content_min = px(maxp, main_avail.unwrap_or(0)).filter(|_| main_avail.is_some() || !matches!(cs.get(maxp), V::Pct(_)))
+                        .map_or(content_min, |mx| content_min.min(mx));
                     let specified = if row { len(cs.get("width"), w) } else { match cs.get("height") { V::Pct(_) => None, v => len(v, 0) } };
                     specified.map(|sp| sp.min(content_min)).unwrap_or(content_min)
                 }
@@ -2582,6 +2587,21 @@ impl<'a> Cx<'a> {
             Some(s) => s, None => return (0, 0),
         };
         if anon { self.collect_inline(h, &mut items, s) }
+        // ★ A REPLACED box's intrinsic sizes are its own size (CSS Sizing 3
+        // §5.1) — it has no content to measure. Measured as an empty block
+        // it was 0 wide, so an `<img>` flex item's content basis was 0: NASA's
+        // image of the day laid out 0 px wide inside its 750 px figure.
+        // ★ …except that one sized by a PERCENTAGE `width` or `max-width` is
+        // COMPRESSIBLE (§5.2.2): the percentage resolves against zero for
+        // its min-content contribution. Counted at its natural width, every
+        // `max-width: 100%` photo made its column as wide as the photo —
+        // El País ran 81 words off the page.
+        if !anon {
+            if let Some((w, _)) = self.replaced_size(h) {
+                let pct = |p: &str| matches!(s.get(p), V::Pct(_));
+                return (if pct("width") || pct("max-width") { 0 } else { w }, w);
+            }
+        }
         // ★ A ROW FLEX CONTAINER is as wide as its items TOGETHER, not as
         // wide as its widest one: they sit side by side. Taking the max —
         // which is right for stacked blocks — measured MDN's breadcrumb as
@@ -3814,6 +3834,29 @@ mod tests {
         assert_eq!(one(0x00ff00ff).0, 300 - 40, "justify-self: start is the cell's right edge");
         assert_eq!(one(0xffff00ff).0, 100, "end is its left edge (cell 2 spans 100..200)");
         assert_eq!(one(0x00ffffff).0, 0, "-2 / -1 is the last column, on the left");
+    }
+
+    /// ★ A replaced box's intrinsic sizes are its OWN size: an `<img>` flex
+    /// item's content basis is its natural width (clamped by `max-width`,
+    /// as is its automatic minimum), and a block-level image makes a
+    /// `min-content` box as wide as itself — unless a percentage sizes it,
+    /// which makes it COMPRESSIBLE (CSS Sizing 3 §5.2.2). Sizes are
+    /// headless Chrome's.
+    #[test]
+    fn a_replaced_box_measures_as_its_own_size() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .f { display: flex; width: 750px; justify-content: center }
+            .i { max-height: 557px; max-width: 100%; background-color: #00ff00 }
+            .m { width: min-content; background-color: #0000ff } .b { display: block }
+            .c { width: min-content; height: 5px; background-color: #ff0000 } .p { max-width: 100% }</style>
+            <div class="f"><img class="i" src="a.png" width="1536" height="1024"></div>
+            <div class="m"><img class="b" src="b.png" width="300" height="100"></div>
+            <div class="c"><img class="b p" src="b.png" width="300" height="100"></div>"#);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let wh = |c: u32| boxes(&o, c).first().map(|r| (r.2, r.3));
+        assert_eq!(wh(0x00ff00ff), Some((750, 500)), "natural width, clamped by max-width; height by the ratio");
+        assert_eq!(wh(0x0000ffff), Some((300, 100)), "a min-content box around a block image");
+        assert_eq!(wh(0xff0000ff).map(|w| w.0), Some(0), "…but a `max-width: 100%` image is compressible: it contributes 0");
     }
 
     /// ★ `align-content: center | flex-end` are UNSAFE (Flexbox §8.4): lines
