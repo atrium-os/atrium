@@ -40,6 +40,12 @@ path = "src/bin/lane_client.rs"
 name = "frescod-wm-harness"
 path = "src/bin/frescod_wm_harness.rs"
 
+# One client connection's window renderer, spawned by frescod in split
+# mode (F4b, docs/spec/fresco-f4-split.md).
+[[bin]]
+name = "fresco-renderer"
+path = "src/bin/fresco_renderer.rs"
+
 [features]
 # Compile the compute renderer's kernels in-process (Cranelift) when
 # atrium-spv-compile is not installed.
@@ -60,6 +66,7 @@ aqueduct-gpu-client = { path = "../aqueduct-gpu-client" }
 aqueduct-gpu-host   = { path = "../aqueduct-gpu-host" }
 fresco-aqueduct-bridge = { path = "../fresco-aqueduct-bridge" }
 fresco-text         = { path = "../fresco-text" }
+fresco-split        = { path = "../fresco-split" }
 atrium-trace        = { path = "../atrium-trace/rust" }
 # Note: frescod no longer depends on portcullis-peer/policy. window-management is
 # granted by REACHABILITY of the dedicated wm socket (the TCB mounts it only for

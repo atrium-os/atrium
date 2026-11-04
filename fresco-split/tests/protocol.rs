@@ -7,7 +7,7 @@ use fresco_split::{slot, Input, Msg, Role, MSG_BYTES};
 
 fn samples() -> Vec<Msg> {
     vec![
-        Msg::WindowCreate { window: 3, width: 640, height: 480, role: Role::Dialog, title: "Ünïcode tïtle".into() },
+        Msg::WindowCreate { window: 3, width: 640, height: 480, role: Role::Dialog, pos: Some((-20, 30)), title: "Ünïcode tïtle".into() },
         Msg::WindowDestroy { window: 3 },
         Msg::WindowTitle { window: 9, title: "x".repeat(64) },
         Msg::FrameReady { window: 1, slot: 1, seq: 77 },

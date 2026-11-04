@@ -859,6 +859,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fresco-split"
+version = "0.1.0"
+dependencies = [
+ "fresco-compute",
+ "libc",
+]
+
+[[package]]
 name = "fresco-text"
 version = "0.1.0"
 dependencies = [
@@ -899,6 +907,7 @@ dependencies = [
  "fresco-compute",
  "fresco-protocol",
  "fresco-scene-server",
+ "fresco-split",
  "fresco-text",
  "fresco-vulkan",
  "image",

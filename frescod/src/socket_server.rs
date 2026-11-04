@@ -52,8 +52,21 @@ pub struct Sub {
     pub client_id: u8,
     /// Arrived on the window-management socket (the WM, which is TCB).
     pub wm: bool,
-    pub tx: Sender<Outbound>,
+    pub tx: SubTx,
 }
+
+/// Where a connection's events go: encoded onto its own socket, or, for a
+/// client whose renderer is a separate process (F4b), as events the broker
+/// translates into records for that renderer.
+pub enum SubTx {
+    Wire(Sender<Outbound>),
+    Split(Sender<DisplayEvent>),
+}
+
+/// Takes over a client connection instead of serving it in-process (the
+/// split broker, F4b): the stream, its client id, its peer uid, and the
+/// subscriber list. It frees the client id when the client is gone.
+pub type HandOff = Arc<dyn Fn(UnixStream, u8, Option<u32>, EventSubs) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Shared {
@@ -64,6 +77,9 @@ pub struct Shared {
     /// Damage signal (task #25): woken after every client op so the
     /// display loop recomposes only when the scene actually changed.
     pub redraw: crate::redraw::Redraw,
+    /// Set in split mode: connections on the client socket (never the WM
+    /// socket) go here.
+    pub hand_off: Option<HandOff>,
 }
 
 /// Bring up frescod's connection acceptor(s).
@@ -151,7 +167,10 @@ pub fn spawn_event_fanout(
                 };
                 let to = route(&ev, &comp);
                 let mut s = subs.lock().unwrap();
-                s.retain(|sub| !to.reaches(sub) || sub.tx.send(out_clone(&out)).is_ok());
+                s.retain(|sub| !to.reaches(sub) || match &sub.tx {
+                    SubTx::Wire(tx) => tx.send(out_clone(&out)).is_ok(),
+                    SubTx::Split(tx) => tx.send(ev.clone()).is_ok(),
+                });
             }
         })
         .expect("spawn event fan-out");
@@ -232,7 +251,7 @@ fn error_reply(op: u16, e: &DispatchError) -> Outbound {
 static LIVE_CLIENTS: Mutex<[bool; 256]> = Mutex::new([false; 256]);
 static NEXT_CLIENT_ID: AtomicU8 = AtomicU8::new(1);
 
-fn alloc_client_id() -> Option<u8> {
+pub fn alloc_client_id() -> Option<u8> {
     let mut live = LIVE_CLIENTS.lock().unwrap();
     for _ in 0..255 {
         let id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed).max(1);
@@ -244,7 +263,7 @@ fn alloc_client_id() -> Option<u8> {
     None
 }
 
-fn free_client_id(id: u8) {
+pub fn free_client_id(id: u8) {
     LIVE_CLIENTS.lock().unwrap()[id as usize] = false;
 }
 
@@ -256,10 +275,15 @@ fn accept_loop(listener: UnixListener, shared: Shared, event_subs: EventSubs, wm
                     eprintln!("frescod: 255 clients connected; refusing another");
                     continue;
                 };
+                if let (false, Some(h)) = (wm_grant, &shared.hand_off) {
+                    let uid = peer_xucred(&stream).map(|(_, uid)| uid);
+                    h(stream, client_id, uid, event_subs.clone());
+                    continue;
+                }
                 let (tx, rx) = mpsc::channel::<Outbound>();
 
                 /* Register writer's tx for async-event broadcast. */
-                event_subs.lock().unwrap().push(Sub { client_id, wm: wm_grant, tx: tx.clone() });
+                event_subs.lock().unwrap().push(Sub { client_id, wm: wm_grant, tx: SubTx::Wire(tx.clone()) });
 
                 let writer_stream = match stream.try_clone() {
                     Ok(s) => s,
@@ -308,7 +332,7 @@ fn accept_loop(listener: UnixListener, shared: Shared, event_subs: EventSubs, wm
     }
 }
 
-fn reader_loop(
+pub fn reader_loop(
     stream: UnixStream,
     frontend: Arc<Mutex<EnvelopeFrontend>>,
     client_id: u8,
@@ -438,7 +462,7 @@ fn reader_loop(
     }
 }
 
-fn writer_loop(
+pub fn writer_loop(
     stream: UnixStream,
     rx: Receiver<Outbound>,
     client_id: u8,
@@ -477,7 +501,7 @@ fn writer_loop(
 /// On client disconnect, drop every window the client owned and forget
 /// per-window scene state. Without this the renderer would keep
 /// pointing at the dead client's last frame indefinitely.
-fn cleanup_client(frontend: &Arc<Mutex<EnvelopeFrontend>>, client_id: u8) {
+pub fn cleanup_client(frontend: &Arc<Mutex<EnvelopeFrontend>>, client_id: u8) {
     let mut fe = frontend.lock().unwrap();
     fe.revoke_client_caps(client_id);
     let comp_arc = fe.compositor_arc().clone();
@@ -507,7 +531,7 @@ fn peer_cred_pid(stream: &UnixStream) -> Option<i32> {
     peer_xucred(stream).map(|(pid, _uid)| pid)
 }
 
-fn peer_xucred(stream: &UnixStream) -> Option<(i32, u32)> {
+pub fn peer_xucred(stream: &UnixStream) -> Option<(i32, u32)> {
     use std::os::fd::AsRawFd;
 
     const XU_NGROUPS: usize = 16;

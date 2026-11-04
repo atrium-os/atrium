@@ -603,8 +603,15 @@ impl Compositor {
     }
 
     pub fn create(&mut self, owner: ClientId, size: (u32, u32)) -> WindowId {
-        let id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
+        /* Take the next free id, wrapping past u16::MAX and skipping the
+         * screen (0). A saturating counter handed id 65535 to every window
+         * after the 65535th, replacing a live window (another client's)
+         * in the table. Ids in use are bounded far below u16::MAX. */
+        let mut id = self.next_id.max(1);
+        while self.windows.contains_key(&id) {
+            id = id.checked_add(1).unwrap_or(1);
+        }
+        self.next_id = id.checked_add(1).unwrap_or(1);
         let mut w = Window::new(id, owner, (size.0 as f32, size.1 as f32));
         w.z = self.z_order.len() as u32;
         self.windows.insert(id, w);

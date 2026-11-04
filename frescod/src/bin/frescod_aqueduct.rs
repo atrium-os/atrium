@@ -320,6 +320,7 @@ fn main() -> std::io::Result<()> {
             frontend: frontend.clone(),
             lane: lane.clone(),
             redraw: redraw.clone(),
+            hand_off: None,
         },
         &sock_path,
         None,

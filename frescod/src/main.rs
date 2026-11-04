@@ -37,19 +37,16 @@ mod pointer_reader;
 mod redraw;
 mod render_backend;
 mod socket_server;
+mod split;
 
 use atrium_gpu::amd::{Display, Gpu, Scanout, COMMIT_MODESET};
 
-use fresco_protocol::{PathParams, RectParams, TextureParams};
 use fresco_scene_server::cas::store::CasStore;
 use fresco_scene_server::command::envelope_frontend::EnvelopeFrontend;
 use fresco_scene_server::scene::graph::SceneGraph;
 use fresco_scene_server::scene::slots::SlotTable;
 use fresco_scene_server::window::Compositor;
-use fresco_vulkan::{
-    GlyphInstance, GlyphRunBatch, GlyphRunNode,
-    HeadlessRenderer, PathNode, SceneNode, TextureBatch, TextureNode,
-};
+use fresco_vulkan::HeadlessRenderer;
 
 use render_backend::{Backend, ScreenInput, WindowFrame};
 use std::path::{Path, PathBuf};
@@ -149,12 +146,14 @@ fn main() -> std::io::Result<()> {
      * input, compositor events) and consumed by the display loop so it
      * recomposes on change instead of spinning at TARGET_FPS. */
     let redraw = redraw::RedrawSignal::new();
+    let split = split::Broker::from_env(comp.clone(), redraw.clone(), (mode.width, mode.height, mode.refresh_mhz));
 
     let event_subs = socket_server::spawn(
         socket_server::Shared {
             frontend: frontend.clone(),
             lane: None,
             redraw: redraw.clone(),
+            hand_off: split.as_ref().map(|b| b.hand_off()),
         },
         &sock_path,
         wm_sock.as_deref(),
@@ -178,7 +177,7 @@ fn main() -> std::io::Result<()> {
     /* Frame 1 lights the CRTC with buffer 0 (MODESET is immediate). */
     let mut frame: u64 = 1;
     let mut on_screen: usize = 0;
-    render_one_frame(&mut renderer, &frontend, &comp, mode.width, mode.height)
+    render_one_frame(&mut renderer, &frontend, &comp, split.as_deref(), mode.width, mode.height)
         .map_err(io_other)?;
     renderer.present(&scan, on_screen, &mut framebuffer, frame_deadline_ns, (&copy_done, frame))
         .map_err(io_other)?;
@@ -244,7 +243,7 @@ fn main() -> std::io::Result<()> {
          * folded into this present rather than triggering an extra one. */
         last_gen = redraw.current();
         let t_render = Instant::now();
-        render_one_frame(&mut renderer, &frontend, &comp, mode.width, mode.height)
+        render_one_frame(&mut renderer, &frontend, &comp, split.as_deref(), mode.width, mode.height)
             .map_err(io_other)?;
         frame += 1;
         let back = (on_screen + 1) % scan.len();
@@ -304,11 +303,13 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     let wm_sock = Some(std::env::var("FRESCOD_WM_SOCK").map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/atrium/sockets/fresco-wm/fresco-wm.sock")));
     let redraw2 = redraw::RedrawSignal::new();
+    let split = split::Broker::from_env(comp.clone(), redraw2.clone(), (W, H, 0));
     let subs = socket_server::spawn(
         socket_server::Shared {
             frontend: frontend.clone(),
             lane: None,
             redraw: redraw2.clone(),
+            hand_off: split.as_ref().map(|b| b.hand_off()),
         },
         &sock, wm_sock.as_deref())?;
     socket_server::spawn_event_fanout(ev_rx, subs, redraw2.clone(), comp.clone());
@@ -348,7 +349,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
 
         last_gen = redraw2.current();
         let t_render = Instant::now();
-        render_one_frame(&mut renderer, &frontend, &comp, W, H).map_err(io_other)?;
+        render_one_frame(&mut renderer, &frontend, &comp, split.as_deref(), W, H).map_err(io_other)?;
         let mut rgba = vec![0u8; (W * H * 4) as usize];
         renderer.read_pixels(&mut rgba).map_err(io_other)?;
         for px in rgba.chunks_exact_mut(4) { px.swap(0, 2); } // BGRA → RGBA
@@ -372,8 +373,12 @@ fn render_one_frame(
     renderer: &mut Backend<'_>,
     frontend: &Arc<Mutex<EnvelopeFrontend>>,
     comp:     &Arc<Mutex<Compositor>>,
+    split:    Option<&split::Broker>,
     screen_w: u32, screen_h: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(b) = split {
+        b.sync();
+    }
     /* Snapshot WM state to (id, pos, size), in z-order bottom→top. The
      * implicit screen window (id 0) is the whole screen; a content
      * window with no size yet gets the screen's, as before surfaces. */
@@ -401,78 +406,19 @@ fn render_one_frame(
     {
         let fe = frontend.lock().unwrap();
         for (win_id, pos, size) in &layers {
-            let Some(state) = fe.window_state(*win_id) else { continue; };
-            let mut w = WindowFrame {
-                id: *win_id,
-                pos: *pos,
-                size: (size.0.ceil() as u32, size.1.ceil() as u32),
-                ..Default::default()
-            };
-            /* Paint in node_id order (lower id → drawn first → bottom).
-             * The per-window node maps are HashMaps, whose iteration
-             * order is seeded per-process; iterating `.values()` directly
-             * would make the painter's-algorithm z-order nondeterministic
-             * across runs (e.g. a full-screen background Rect sometimes
-             * painting over the widgets on top of it). Sort by node_id to
-             * match the within-type z-order the `extract_*` helpers use. */
-            let mut rect_ids: Vec<&u32> = state.rect_nodes.keys().collect();
-            rect_ids.sort_unstable();
-            for id in rect_ids {
-                w.rects.push(translate_rect(&state.rect_nodes[id], 0.0, 0.0));
-            }
-            let mut path_ids: Vec<&u32> = state.path_nodes.keys().collect();
-            path_ids.sort_unstable();
-            for id in path_ids {
-                w.paths.push(translate_path(&state.path_nodes[id], 0.0, 0.0));
-            }
-            let mut tex_by_slot: std::collections::BTreeMap<u32, Vec<TextureNode>> =
-                std::collections::BTreeMap::new();
-            let mut tex_ids: Vec<&u32> = state.texture_nodes.keys().collect();
-            tex_ids.sort_unstable();
-            for id in tex_ids {
-                let p = &state.texture_nodes[id];
-                tex_by_slot.entry(p.slot_id).or_default()
-                    .push(translate_texture(p, 0.0, 0.0));
-            }
-            w.batches = tex_by_slot.into_iter()
-                .map(|(slot_id, nodes)| TextureBatch { slot_id, nodes })
-                .collect();
-            /* glyph_run nodes grouped by atlas slot. Each batch's `glyphs`
-             * vector concatenates all runs in slot, with each node's
-             * meta[1] (glyph_offset) pointing at this batch's slice. */
-            let mut glyph_by_slot: std::collections::BTreeMap<u32, GlyphRunBatch> =
-                std::collections::BTreeMap::new();
-            let mut glyph_ids: Vec<&u32> = state.glyph_run_nodes.keys().collect();
-            glyph_ids.sort_unstable();
-            for id in glyph_ids {
-                let p = &state.glyph_run_nodes[id];
-                let entry = glyph_by_slot
-                    .entry(p.atlas_slot_id)
-                    .or_insert_with(|| GlyphRunBatch {
-                        atlas_slot_id: p.atlas_slot_id,
-                        nodes:  Vec::new(),
-                        glyphs: Vec::new(),
-                    });
-                let glyph_offset = entry.glyphs.len() as i32;
-                entry.nodes.push(GlyphRunNode {
-                    origin: [p.x, p.y, 0.0, 0.0],
-                    atlas_dim: [p.atlas_width as f32,
-                                p.atlas_height as f32, 0.0, 0.0],
-                    color: [p.r, p.g, p.b, p.a],
-                    meta: [p.glyphs.len() as i32, glyph_offset, 0, 0],
+            /* A window a renderer draws (split mode) comes as its last
+             * checked frame, at the size the broker gave it. */
+            if let Some(f) = split.and_then(|b| b.frame(*win_id)) {
+                windows.push(WindowFrame {
+                    id: *win_id,
+                    pos: *pos,
+                    size: (f.header.width, f.header.height),
+                    frame: Some(f),
+                    ..Default::default()
                 });
-                for g in &p.glyphs {
-                    entry.glyphs.push(GlyphInstance {
-                        d_offset: [g.dx, g.dy],
-                        atlas_uv: [g.atlas_u as f32, g.atlas_v as f32,
-                                   g.atlas_w as f32, g.atlas_h as f32],
-                        bearing:  [g.bearing_x, g.bearing_y],
-                        ..Default::default()
-                    });
-                }
+            } else if let Some(w) = pack::window_frame(&fe, *win_id, *pos, *size) {
+                windows.push(w);
             }
-            w.glyph_batches = glyph_by_slot.into_values().collect();
-            windows.push(w);
         }
     }
 
@@ -482,28 +428,6 @@ fn render_one_frame(
     };
     renderer.render(ScreenInput { windows, uploads, clears })?;
     Ok(())
-}
-
-fn translate_rect(p: &RectParams, ox: f32, oy: f32) -> SceneNode {
-    SceneNode {
-        position: [p.x + ox, p.y + oy],
-        size:     [p.w, p.h],
-        color:    [p.r, p.g, p.b, p.a],
-        radius:   p.radius,
-        _pad:     [0.0; 3],
-    }
-}
-
-fn translate_texture(p: &TextureParams, ox: f32, oy: f32) -> TextureNode {
-    TextureNode { model: [p.x + ox, p.y + oy, p.w, p.h] }
-}
-
-fn translate_path(p: &PathParams, ox: f32, oy: f32) -> PathNode {
-    PathNode {
-        model: [p.cx + ox, p.cy + oy, p.length, p.width],
-        extra: [p.angle, 0.0, 0.0, 0.0],
-        color: [p.r, p.g, p.b, p.a],
-    }
 }
 
 /// A non-zero display fault code (from a commit) is an error.

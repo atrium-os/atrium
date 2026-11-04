@@ -18,6 +18,7 @@
 //! maps them to the global ids the WM sees. A renderer never learns another
 //! renderer's ids.
 
+pub mod chan;
 pub mod slot;
 
 /// Bytes in every record.
@@ -35,7 +36,22 @@ pub const MAX_WINDOWS: u32 = 64;
 pub enum Role {
     Document = 0,
     Dialog = 1,
-    Utility = 2,
+    Panel = 2,
+    Background = 3,
+    Chrome = 4,
+}
+
+impl Role {
+    fn from_u32(v: u32) -> Option<Role> {
+        Some(match v {
+            0 => Role::Document,
+            1 => Role::Dialog,
+            2 => Role::Panel,
+            3 => Role::Background,
+            4 => Role::Chrome,
+            _ => return None,
+        })
+    }
 }
 
 /// A pointer or key event, in the receiving window's coordinates.
@@ -52,8 +68,10 @@ pub enum Input {
 pub enum Msg {
     // ── renderer → broker ─────────────────────────────────────────
     /// A client created a window: its local id, requested size, role and
-    /// title. The broker answers with [`Msg::Slots`] (and the slot fds).
-    WindowCreate { window: u32, width: u32, height: u32, role: Role, title: String },
+    /// title, and where the client asked to be placed. The broker answers
+    /// with [`Msg::Slots`] (and the slot fds). There is no `Hud` role: no
+    /// app may claim the WM's own layer.
+    WindowCreate { window: u32, width: u32, height: u32, role: Role, pos: Option<(i32, i32)>, title: String },
     /// A client destroyed a window.
     WindowDestroy { window: u32 },
     /// A window's title changed.
@@ -155,11 +173,16 @@ impl Msg {
     pub fn encode(&self) -> [u8; MSG_BYTES] {
         use kind::*;
         let r = match self {
-            Msg::WindowCreate { window, width, height, role, title } => {
+            Msg::WindowCreate { window, width, height, role, pos, title } => {
                 let mut r = Rec::new(WINDOW_CREATE, *window);
                 r.put(2, *width);
                 r.put(3, *height);
                 r.put(4, *role as u32);
+                if let Some((x, y)) = *pos {
+                    r.put(5, 1);
+                    r.put(6, x as u32);
+                    r.put(7, y as u32);
+                }
                 r.title(title);
                 r
             }
@@ -244,7 +267,7 @@ impl Msg {
         }
         // Words 2.. this kind uses, and whether it carries a title.
         let (args, titled) = match k {
-            WINDOW_CREATE => (3, true),
+            WINDOW_CREATE => (6, true),
             WINDOW_TITLE => (0, true),
             WINDOW_DESTROY | CLOSE => (0, false),
             FRAME_READY | GEOMETRY | MOTION | SCROLL => (2, false),
@@ -280,11 +303,11 @@ impl Msg {
                 window,
                 width: dim(r.get(2))?,
                 height: dim(r.get(3))?,
-                role: match r.get(4) {
-                    0 => Role::Document,
-                    1 => Role::Dialog,
-                    2 => Role::Utility,
-                    _ => return Err(Refused("unknown role")),
+                role: Role::from_u32(r.get(4)).ok_or(Refused("unknown role"))?,
+                pos: match flag(r.get(5))? {
+                    true => Some((r.get(6) as i32, r.get(7) as i32)),
+                    false if r.get(6) == 0 && r.get(7) == 0 => None,
+                    false => return Err(Refused("position without its flag")),
                 },
                 title,
             },

@@ -43,7 +43,7 @@ fn main() -> std::io::Result<()> {
 
     // No deadline lane here — the WM path doesn't use it.
     let _subs = socket_server::spawn(
-        socket_server::Shared { frontend, lane: None, redraw: redraw::RedrawSignal::new() },
+        socket_server::Shared { frontend, lane: None, redraw: redraw::RedrawSignal::new(), hand_off: None },
         &sock,
         None,
     )?;

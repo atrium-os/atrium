@@ -39,6 +39,16 @@ Before this change, frescod's event fan-out sent every event to every connection
 
 ### F4b. The process split
 
+Working, not yet jailed (atrium, this commit). `FRESCOD_SPLIT=1` hands every connection on `fresco.sock` to its own `fresco-renderer` (fd 3 the client, fd 4 the record channel); the WM socket stays in the broker. Verified in the amd64 VM: headless on Tier-2, and on gpusim with the GPU renderer (screenshot `frescod-f4b-split-gpu.png`), with `atrium-surfaces-demo`'s three windows drawn by a renderer process. A renderer that exits takes its client's connection and windows with it.
+
+- Records and fds go over `fresco_split::chan` (SOCK_SEQPACKET; a record of the wrong size, a truncated one, or one with too many fds is refused).
+- Slots are memfds the broker creates sealed against shrinking and growing, so a renderer cannot truncate one under the broker's mapping; a renderer refuses slots that are not sealed.
+- The broker sends `GEOMETRY` whenever the WM's size for a window differs from the last one it sent, and accepts only frames of that size. A frame drawn at the old size is dropped and the renderer draws again.
+- Window 0 events do not reach renderers yet (F4c). A client drawing on window 0 draws only in its renderer's own window 0, which the broker does not show.
+- Still to do: run the renderer under `portcullis exec` with no filesystem, network or GPU node.
+
+Plan as written:
+
 1. **Hand-off, not parsing.** The broker accepts on `fresco.sock` and reads the peer's credentials (`getpeereid`, as today). It then spawns a renderer for the connection through `portcullis exec`, with no filesystem, no network, and no GPU node in its devfs ruleset. It passes the client fd and one broker channel over `SCM_RIGHTS`. The broker never reads a client byte.
 2. **Broker ⇄ renderer protocol.** Fixed-size records only, so it can be fuzzed (F3).
    - Renderer to broker: `WINDOW_CREATE(w, h, role, title[64])`, `WINDOW_RESIZE`, `WINDOW_DESTROY`, `FRAME_READY(window, slot)`.

@@ -8,6 +8,7 @@ description = "The broker <-> window-renderer protocol of Fresco's process split
 
 [dependencies]
 fresco-compute = { path = "../fresco-compute" }
+libc = "0.2"
 
 [dev-dependencies]
 fresco-compute = { path = "../fresco-compute", features = ["cranelift"] }

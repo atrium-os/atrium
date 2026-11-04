@@ -342,6 +342,7 @@ name = "fresco-split"
 version = "0.1.0"
 dependencies = [
  "fresco-compute",
+ "libc",
 ]
 
 [[package]]

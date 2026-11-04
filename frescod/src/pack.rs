@@ -5,7 +5,11 @@
 
 use std::collections::HashMap;
 
-use fresco_vulkan::{GlyphRunBatch, PathNode, SceneNode, TextureBatch, UploadRequest};
+use fresco_protocol::{PathParams, RectParams, TextureParams};
+use fresco_scene_server::command::envelope_frontend::EnvelopeFrontend;
+use fresco_vulkan::{
+    GlyphInstance, GlyphRunBatch, GlyphRunNode, PathNode, SceneNode, TextureBatch, TextureNode, UploadRequest,
+};
 
 /// One window's scene for a frame, in the window's own coordinates.
 #[derive(Default)]
@@ -146,3 +150,102 @@ impl SceneState {
     }
 }
 
+
+/// Window `id`'s scene as the frontend holds it, for a surface of `size`
+/// whose (0, 0) is at `pos` on the screen. None if it has drawn nothing.
+pub fn window_frame(fe: &EnvelopeFrontend, id: u32, pos: (f32, f32), size: (f32, f32)) -> Option<WindowFrame> {
+    let state = fe.window_state(id)?;
+    let mut w = WindowFrame {
+        id,
+        pos,
+        size: (size.0.ceil() as u32, size.1.ceil() as u32),
+        ..Default::default()
+    };
+    /* Paint in node_id order (lower id → drawn first → bottom).
+     * The per-window node maps are HashMaps, whose iteration
+     * order is seeded per-process; iterating `.values()` directly
+     * would make the painter's-algorithm z-order nondeterministic
+     * across runs (e.g. a full-screen background Rect sometimes
+     * painting over the widgets on top of it). Sort by node_id to
+     * match the within-type z-order the `extract_*` helpers use. */
+    let mut rect_ids: Vec<&u32> = state.rect_nodes.keys().collect();
+    rect_ids.sort_unstable();
+    for id in rect_ids {
+        w.rects.push(translate_rect(&state.rect_nodes[id], 0.0, 0.0));
+    }
+    let mut path_ids: Vec<&u32> = state.path_nodes.keys().collect();
+    path_ids.sort_unstable();
+    for id in path_ids {
+        w.paths.push(translate_path(&state.path_nodes[id], 0.0, 0.0));
+    }
+    let mut tex_by_slot: std::collections::BTreeMap<u32, Vec<TextureNode>> =
+        std::collections::BTreeMap::new();
+    let mut tex_ids: Vec<&u32> = state.texture_nodes.keys().collect();
+    tex_ids.sort_unstable();
+    for id in tex_ids {
+        let p = &state.texture_nodes[id];
+        tex_by_slot.entry(p.slot_id).or_default()
+            .push(translate_texture(p, 0.0, 0.0));
+    }
+    w.batches = tex_by_slot.into_iter()
+        .map(|(slot_id, nodes)| TextureBatch { slot_id, nodes })
+        .collect();
+    /* glyph_run nodes grouped by atlas slot. Each batch's `glyphs`
+     * vector concatenates all runs in slot, with each node's
+     * meta[1] (glyph_offset) pointing at this batch's slice. */
+    let mut glyph_by_slot: std::collections::BTreeMap<u32, GlyphRunBatch> =
+        std::collections::BTreeMap::new();
+    let mut glyph_ids: Vec<&u32> = state.glyph_run_nodes.keys().collect();
+    glyph_ids.sort_unstable();
+    for id in glyph_ids {
+        let p = &state.glyph_run_nodes[id];
+        let entry = glyph_by_slot
+            .entry(p.atlas_slot_id)
+            .or_insert_with(|| GlyphRunBatch {
+                atlas_slot_id: p.atlas_slot_id,
+                nodes:  Vec::new(),
+                glyphs: Vec::new(),
+            });
+        let glyph_offset = entry.glyphs.len() as i32;
+        entry.nodes.push(GlyphRunNode {
+            origin: [p.x, p.y, 0.0, 0.0],
+            atlas_dim: [p.atlas_width as f32,
+                        p.atlas_height as f32, 0.0, 0.0],
+            color: [p.r, p.g, p.b, p.a],
+            meta: [p.glyphs.len() as i32, glyph_offset, 0, 0],
+        });
+        for g in &p.glyphs {
+            entry.glyphs.push(GlyphInstance {
+                d_offset: [g.dx, g.dy],
+                atlas_uv: [g.atlas_u as f32, g.atlas_v as f32,
+                           g.atlas_w as f32, g.atlas_h as f32],
+                bearing:  [g.bearing_x, g.bearing_y],
+                ..Default::default()
+            });
+        }
+    }
+    w.glyph_batches = glyph_by_slot.into_values().collect();
+    Some(w)
+}
+
+fn translate_rect(p: &RectParams, ox: f32, oy: f32) -> SceneNode {
+    SceneNode {
+        position: [p.x + ox, p.y + oy],
+        size:     [p.w, p.h],
+        color:    [p.r, p.g, p.b, p.a],
+        radius:   p.radius,
+        _pad:     [0.0; 3],
+    }
+}
+
+fn translate_texture(p: &TextureParams, ox: f32, oy: f32) -> TextureNode {
+    TextureNode { model: [p.x + ox, p.y + oy, p.w, p.h] }
+}
+
+fn translate_path(p: &PathParams, ox: f32, oy: f32) -> PathNode {
+    PathNode {
+        model: [p.cx + ox, p.cy + oy, p.length, p.width],
+        extra: [p.angle, 0.0, 0.0, 0.0],
+        color: [p.r, p.g, p.b, p.a],
+    }
+}
