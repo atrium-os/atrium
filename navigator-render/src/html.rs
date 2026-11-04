@@ -3830,6 +3830,28 @@ mod tests {
     }
 
     #[test]
+    fn an_inline_block_holding_a_flex_box_stays_inline() {
+        // Samsung's footer: `li { display: inline-block }` around
+        // `a { display: flex }`. An inline-block is an ATOMIC inline with a
+        // formatting context of its own, so a block-level child does not
+        // make it block-in-inline. Promoted, every link became a full-width
+        // block and the row stacked one per line.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .i { display: inline-block } .f { display: flex; padding-right: 12px; background-color: #ff0000 }</style>
+            <div><span class="i"><a class="f">Privacy</a></span><span class="i"><a class="f">Legal</a></span></div>"#);
+        let b = boxes(&o, 0xff0000ff);
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0].1, b[1].1, "one line: {b:?}");
+        assert!(b[0].2 < 200 && b[1].0 >= b[0].0 + b[0].2, "shrink-to-fit, side by side: {b:?}");
+        // Control: a plain INLINE around a block IS block-in-inline.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .f { display: flex; background-color: #ff0000 }</style>
+            <div><span><a class="f">Privacy</a></span><span><a class="f">Legal</a></span></div>"#);
+        let b = boxes(&o, 0xff0000ff);
+        assert_eq!((b[0].1 < b[1].1, b[0].2), (true, 792), "stacked blocks: {b:?}");
+    }
+
+    #[test]
     fn a_negative_grid_line_counts_from_the_end() {
         // `1 / -1` is the full-width idiom: every column, whatever the count.
         let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
@@ -3975,10 +3997,10 @@ fn edge(t: U, sx: U, sy: U, length: U, horiz: bool, style: &str, rgba: u32) -> V
 /// Every entry gets a key — the chain of enclosing context z values, then
 /// 1 if a `hoist` range holds it — and the sort is stable, so ties keep
 /// tree order.
-/// One bottom-up pass: an element is promoted when its own `display` is not
-/// block-level but a child is (or was itself promoted). Doing this once is
-/// what keeps it O(n) — asking the question per element while laying out
-/// would walk the same subtrees again and again.
+/// One bottom-up pass: an element is promoted when its own `display` is
+/// `inline` but a child is block-level (or was itself promoted). Doing this
+/// once is what keeps it O(n) — asking the question per element while
+/// laying out would walk the same subtrees again and again.
 fn promote_block_in_inline(dom: &Dom, styles: &[Option<Style>]) -> Vec<bool> {
     let n = dom.nodes.len();
     let mut promoted = vec![false; n];
@@ -3991,8 +4013,12 @@ fn promote_block_in_inline(dom: &Dom, styles: &[Option<Style>]) -> Vec<bool> {
     for h in (0..n as Handle).rev() {
         let Some(node) = dom.get(h) else { continue };
         if !matches!(node.kind, Kind::Element(_)) { continue }
-        let display_none = styles.get(h as usize).and_then(|s| s.as_ref()).is_some_and(|s| kw(s, "display") == "none");
-        if display_none || blockish(h) { continue }
+        // ★ Only a plain INLINE is split. An inline-block is an atomic
+        // inline with its own formatting context: its block children stay
+        // inside it. Promoting it made Samsung's footer links — inline-block
+        // items around `display: flex` anchors — one full-width block each.
+        let display = styles.get(h as usize).and_then(|s| s.as_ref()).map(|s| kw(s, "display"));
+        if matches!(display, Some("none" | "inline-block")) || blockish(h) { continue }
         if dom.element_children(h).into_iter().any(|c| blockish(c) || promoted[c as usize]) {
             promoted[h as usize] = true;
         }
