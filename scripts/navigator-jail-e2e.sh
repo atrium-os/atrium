@@ -129,13 +129,22 @@ stage() {
     src="$1"; name="$2"
     [ -f "$src" ] || die "missing build output: $src"
     h=$(shasum -a 256 "$src" | cut -d' ' -f1)
-    # Remove first: a running binary is ETXTBSY and scp fails half-way.
-    "$VSSH" "mkdir -p $BIN && rm -f $BIN/$name" >/dev/null 2>&1
-    # shellcheck disable=SC2086
-    scp $SCP_OPTS "$src" "root@localhost:$BIN/$name" >/dev/null 2>&1 \
-        || die "scp $name (a binary held open elsewhere reports as 'lost connection')"
-    g=$("$VSSH" "sha256 -q $BIN/$name" 2>/dev/null)
-    [ "$h" = "$g" ] || die "$name hash mismatch: host=$h guest=$g (a stale binary would have been measured)"
+    # ★ Up to three copies: under QEMU TCG (the cloud VM) a large scp now and
+    # then lands full-size with a ~30 KB run of zeros. The hash catches it; a
+    # fresh copy is clean. Nothing runs until the hash matches.
+    try=1
+    while :; do
+        # Remove first: a running binary is ETXTBSY and scp fails half-way.
+        "$VSSH" "mkdir -p $BIN && rm -f $BIN/$name" >/dev/null 2>&1
+        # shellcheck disable=SC2086
+        scp $SCP_OPTS "$src" "root@localhost:$BIN/$name" >/dev/null 2>&1 \
+            || die "scp $name (a binary held open elsewhere reports as 'lost connection')"
+        g=$("$VSSH" "sha256 -q $BIN/$name" 2>/dev/null)
+        [ "$h" = "$g" ] && break
+        [ $try -ge 3 ] && die "$name hash mismatch: host=$h guest=$g (a stale binary would have been measured)"
+        echo "  $name hash mismatch on copy $try; copying again"
+        try=$((try + 1))
+    done
     "$VSSH" "chmod +x $BIN/$name" >/dev/null 2>&1
     echo "  $name ok"
 }

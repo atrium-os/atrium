@@ -1659,9 +1659,68 @@ as defence in depth.
 - run `memfed --pools-from /var/lib/atrium/apps`.
 
 **Verified:** unit tests on macOS: rule strings, refusals, wire compatibility, limit
-resolution, pool discovery and override. **FreeBSD: pending.** The steps are
-`scripts/navigator-converter-jail-e2e.sh` stage "limits": rules present while the jail
-runs, gone after, and none leaked.
+resolution, pool discovery and override.
+
+**Verified on FreeBSD (2026-11-04).** The cloud VM is 16-CURRENT arm64 under QEMU TCG.
+jaild and portcullisd are from f26f8ad, with destination hashes checked.
+
+*With `kern.racct.enable=0`:*
+- `navigator-converter-jail-e2e.sh --rounds 1 --net 3` PASSES. The limits stage is
+  skipped as designed, and no rctl rules exist.
+- `--memory 512 --require-memory-limit` is refused, names `kern.racct.enable`, and
+  exits 1.
+- Without `--require-memory-limit` the instance runs. ★ On the `--daemon` lane the
+  "running UNCAPPED" line goes to **portcullisd's** stderr (its log), not the caller's.
+  A caller that wants to know must pass `--require-memory-limit`.
+- `--require-memory-limit` on the fetcher (no `[resources].memory`) is refused with
+  "none was given". That check comes before the RACCT check.
+
+*Rebooted with `kern.racct.enable=1` and `allow_rctl = true`:*
+- **Converter e2e PASSES** (`--rounds 1 --net 3`, 50 pages). While a spinning page ran:
+  `jail:app-org-atrium-navigator-converter--conv…:memoryuse:sigkill=4294967296` and
+  `…:pcpu:deny=100`. The page timed out at 8 s, and the rules were gone after it.
+  Jailed and unconfined runs stay byte-identical, and the leaks stage finds no rctl
+  rules.
+- **Worker e2e PASSES** (`navigator-jail-e2e.sh`). During the run: `memoryuse:sigkill=2147483648`
+  and `pcpu:deny=100`. Afterwards: 0 rules.
+- **The tighter wins.** `--memory 8192 --cpu 50` gives memoryuse 4 GiB (the manifest)
+  and `pcpu:deny=50`. `--memory 512` gives 512 MiB.
+- **memoryuse is enforced.** With `--memory 256`, a page that grows a 256 MiB string is
+  killed (exit status 128, no recording). With `--memory 2048` it converts.
+- **memfed pools.**
+  - `memfed --budget 6000 --pools-from /var/lib/atrium/apps` prints
+    `pool [pool app-org-atrium-navigator-converter--*×3]` with one line per member,
+    plus an empty worker pool.
+  - Armed through a portcullisd broker:
+    - lowering to the 256 MiB floor took effect;
+    - raising to 4085 MiB took effect;
+    - an explicit 6512 MiB ask was logged by jaild as `memoryuse=4096M (sigkill)
+      [clamped to its creation ceiling]`.
+  - After the jails exited: 0 rules, 0 jails.
+
+**Bug found and fixed (this run).** `SetRctl` *added* a rule beside the old ones.
+Measured: `rctl -a` with a new amount keeps one rule per amount, and the kernel enforces
+all of them. A memfed-tightened jail held 4096M, 256M and 4085M at once, so the
+federation could lower a cap but **never raise it again**. `ffi::set_jail_rctl` now adds
+the new rule first, then removes the superseded amounts (`superseded_rules`, unit-tested).
+So the jail is never uncapped in between, and it holds exactly one memoryuse rule. The
+jaild suite (71 tests) passes on FreeBSD.
+
+**Snags for the next run:**
+- The governor gate holds. As root, memfed's `GovernSetRctl` is refused
+  (`cap.memory_govern.denied: uid 0`). As an unprivileged governor uid on the host
+  fallback, memfed sees **no** pool members: `rctl -u` is EPERM, so every RSS reads 0
+  and the zero-RSS filter drops them all. The arming check here therefore used a
+  disabled, test-only services.d manifest granting `memory_govern` to uid 0. It was
+  removed afterwards. The production governor reads `/dev/pressure`, which this stock
+  kernel lacks.
+- `scripts/deploy-portcullis.sh` rewrites `/etc/atrium/jaild.policy.toml`, which drops
+  `allow_rctl`. jaild then **refuses** every limited one-shot (`rctl.disabled`). That
+  is the right failure, but re-add the section after each deploy.
+- `/var/log/atrium/` keeps one log file per one-shot instance name: 339 files after
+  this session's runs. They are small, but nothing rotates them.
+- Under TCG a large `scp` sometimes lands with a run of zeros. Both e2e scripts now copy
+  again on a hash mismatch, and still never run a mismatched binary.
 
 ### 6.5.3 The trust gate: `require_signatures`
 

@@ -1113,8 +1113,11 @@ pub fn racct_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Add (or replace — rctl keys a rule by subject, resource and action) each
-/// rule. A shellout in the audited ifconfig style: rctl(8) is stable and the
+/// Add each rule. ★ `rctl -a` does NOT replace a rule with the same subject,
+/// resource and action but another amount: measured on 16-CURRENT, adding
+/// memoryuse 4096M then 256M leaves BOTH, and the kernel enforces both. A
+/// cap that must move goes through `set_jail_rctl`, which drops the
+/// superseded rules. A shellout in the audited ifconfig style: rctl(8) is stable and the
 /// rate is about one call per jail per federation tick.
 pub fn add_rctl_rules(rules: &[String]) -> io::Result<()> {
     for rule in rules {
@@ -1147,9 +1150,46 @@ pub fn remove_jail_rctl(name: &str) -> io::Result<()> {
 
 /// Set jail `name`'s RCTL `memoryuse` cap (and, if given, its `pcpu` cap).
 /// Requires `kern.racct.enable=1`.
+///
+/// ★★ REPLACES, not adds. memfed moves a jail's cap every tick, up as well as
+/// down. Before this, each SetRctl added a rule beside the old ones (rctl
+/// keeps one rule per AMOUNT), so a jail collected 4096M, 256M and 4085M and
+/// the kernel enforced the smallest: once the federation tightened a jail it
+/// could never loosen it again. Measured in the VM, 2026-11-04.
+///
+/// The new rule goes in FIRST and the superseded ones come out after it, so
+/// the jail is never uncapped in between.
 pub fn set_jail_rctl(name: &str, mb: u64, pcpu: Option<u32>) -> io::Result<()> {
     let rules = rctl_rules(name, &crate::protocol::RctlLimits { memoryuse_mb: Some(mb), pcpu })?;
-    add_rctl_rules(&rules)
+    add_rctl_rules(&rules)?;
+    let out = std::process::Command::new("rctl").arg(format!("jail:{name}")).output()?;
+    if !out.status.success() {
+        return Err(io::Error::new(io::ErrorKind::Other,
+            format!("rctl jail:{name}: {}", String::from_utf8_lossy(&out.stderr).trim())));
+    }
+    for old in superseded_rules(&String::from_utf8_lossy(&out.stdout), name, mb, pcpu) {
+        let o = std::process::Command::new("rctl").arg("-r").arg(&old).output()?;
+        if !o.status.success() {
+            return Err(io::Error::new(io::ErrorKind::Other,
+                format!("rctl -r {old}: {}", String::from_utf8_lossy(&o.stderr).trim())));
+        }
+    }
+    Ok(())
+}
+
+/// The rules in `listing` (`rctl jail:<name>` output, amounts in bytes or
+/// percent) that a new memoryuse `mb` / pcpu `pcpu` supersedes: same jail,
+/// resource and action, another amount. Pure, so it is tested without a kernel.
+pub fn superseded_rules(listing: &str, name: &str, mb: u64, pcpu: Option<u32>) -> Vec<String> {
+    let mem = format!("jail:{name}:memoryuse:sigkill=");
+    let cpu = format!("jail:{name}:pcpu:deny=");
+    listing.lines().map(str::trim).filter_map(|l| {
+        if let Some(amt) = l.strip_prefix(&mem) {
+            (amt != (mb * 1024 * 1024).to_string()).then(|| l.to_string())
+        } else if let (Some(amt), Some(p)) = (l.strip_prefix(&cpu), pcpu) {
+            (amt != p.to_string()).then(|| l.to_string())
+        } else { None }
+    }).collect()
 }
 
 // ====================================================================
@@ -1231,6 +1271,23 @@ fn is_safe_cidr(s: &str) -> bool {
 
 #[cfg(test)]
 mod privilege_drop_tests {
+    #[test]
+    fn a_moved_cap_supersedes_every_other_amount_and_nothing_else() {
+        let listing = "jail:app-x--1:memoryuse:sigkill=4294967296\n\
+                       jail:app-x--1:memoryuse:sigkill=268435456\n\
+                       jail:app-x--1:pcpu:deny=100\n\
+                       jail:app-x--10:memoryuse:sigkill=1048576\n";
+        // Raising to 4085M drops both older memory rules, keeps pcpu (not asked)
+        // and never touches app-x--10, whose name merely starts the same.
+        assert_eq!(super::superseded_rules(listing, "app-x--1", 4085, None),
+                   vec!["jail:app-x--1:memoryuse:sigkill=4294967296".to_string(),
+                        "jail:app-x--1:memoryuse:sigkill=268435456".to_string()]);
+        // Setting the amount already present keeps it; a new pcpu drops the old.
+        assert_eq!(super::superseded_rules(listing, "app-x--1", 256, Some(50)),
+                   vec!["jail:app-x--1:memoryuse:sigkill=4294967296".to_string(),
+                        "jail:app-x--1:pcpu:deny=100".to_string()]);
+    }
+
     #[test]
     fn rctl_rules_are_exactly_these_strings() {
         use crate::protocol::RctlLimits;
