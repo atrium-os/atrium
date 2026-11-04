@@ -297,6 +297,26 @@ repeat count and total track count bounded by §3.12.
 `subgrid`, and `grid-auto-flow: dense` — dense packing reorders items relative to document
 order, the same objection as `order`.
 
+**Box Alignment's other self-alignment keywords are COMPILED by the normalizer (§6)**
+wherever they name an admitted one. On the inline axis `flex-start` / `flex-end` are
+`start` / `end` outside a flex container (and `justify-self` does nothing inside one);
+`left` / `right` are `start` or `end` by the alignment container's direction.
+`self-start` / `self-end` are the item's own start side: the container's `start` while the
+two directions agree, `end` where they differ — on the block axis every box starts at the
+top, so they are `start` / `end` there, except on a column flex container's cross axis,
+which is the inline one. `first baseline` is `baseline`. `normal` is `stretch`, except for
+an image with a ratio or a natural size in the axis, for which it is `start` (Grid §6.2; a
+flex item's `normal` is always `stretch`). A non-replaced box with an `aspect-ratio` reads
+`normal` as `start` in the block axis once its width is settled — specified, or stretched by
+an explicit `stretch` — since the ratio then decides its height; with an auto width browsers
+stretch its block axis instead, and it keeps `stretch`. That reading is also what CSS does
+when nothing is said — `auto` takes the container's `normal` — while this profile's
+initial is `stretch`, so the normalizer writes `start` on every image whose grid container
+leaves its alignment `normal`, in each media context where the container is a grid. Still dropped: `self-*` on an `-items` value whose children differ
+in direction, or on a column flex item whose direction differs from its container's (one
+class cannot say `start` to one item and `end` to the next); `legacy`, which inherits into
+descendants that set no `justify-items`; `last baseline`; and `safe` / `unsafe`.
+
 ### 3.6 Values
 
 **Units.** `px`, `em`, `rem`, `ch`, `vw`, `vh`, `%`, and `fr` (grid tracks only).
@@ -1120,7 +1140,8 @@ indents), the `dir` attribute, named grid lines/areas, media-query range syntax,
 `row-reverse` / `column-reverse` (from 2026-11-04: reversed in the document, §3.4 — 116 + 105
 container contexts compiled in the two corpora; 38 + 47 that reverse only in some media or
 state and 6 + 6 that wrap are laid out on the same axis unreversed, and counted),
-float ROWS (as inline-block), and — from 2026-09-24 — `box-sizing` (§3.3; 1,725 sizes in
+float ROWS (as inline-block), Box Alignment's self-alignment keywords (§3.5, from 2026-11-04: `flex-*`,
+`self-*`, `left` / `right`, `normal`, and an image's initial `normal` in a grid), and — from 2026-09-24 — `box-sizing` (§3.3; 1,725 sizes in
 28 documents). The renderer stays small; the normalizer carries the cascade.
 `unset` (646 drops) and font-size keywords belong here and are **not yet compiled**.
 

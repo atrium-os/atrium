@@ -522,6 +522,10 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     // indents — all resolved against each element's own direction.
     let rtl = direction_pass(&mut resolved, &dom, &els, &mut report);
 
+    // ★ SELF-ALIGNMENT: `flex-*`, `self-*`, `left` / `right` and `normal`
+    // compiled to the keywords the grammar admits (needs the directions).
+    alignment_pass(&mut resolved, &dom, &els, &rtl, inputs, &mut report);
+
     // ★ FLOAT ROWS. The profile has no floats, and dropping `float` left
     // GitHub's three repository-action buttons stacked one per line: they are
     // `<li float:left>` inside a `<ul>`. When EVERY in-flow element child of a
@@ -1360,6 +1364,10 @@ fn to_longhands_inner(name: &str, value: &[Token], inputs: &Inputs, report: &mut
         // reverse pass). Kept as written until then.
         if p == "flex-direction" && matches!(v.to_ascii_lowercase().as_str(), "row-reverse" | "column-reverse") { return Some((p, v.to_ascii_lowercase())) }
         if p == "justify-content" && matches!(v.to_ascii_lowercase().as_str(), "start" | "end" | "normal") { return Some((p, v.to_ascii_lowercase())) }
+        // ★ Self-alignment keywords the grammar lacks but that name an
+        // admitted one EXACTLY once the element's direction, its container
+        // and its box type are known — decided in the alignment pass.
+        if alignment_carried(&p, &v.trim().to_ascii_lowercase()) { return Some((p, v.trim().to_ascii_lowercase())) }
         // An inline-side property (`margin-@start`) is checked as the
         // physical property it will become; both sides take the same values.
         let phys = expand::physical(&p, false);
@@ -2159,4 +2167,217 @@ fn icon_font_pass(resolved: &mut BTreeMap<(Handle, String, String), BTreeMap<Str
         n += 1;
     }
     if n > 0 { report.drop_n("ligature icon font compiled to an empty icon box", n) }
+}
+
+/// The self-alignment keywords carried, as written, to the alignment pass.
+fn alignment_carried(p: &str, v: &str) -> bool {
+    match p {
+        "justify-self" | "justify-items" => matches!(v, "normal" | "self-start" | "self-end" | "flex-start" | "flex-end" | "left" | "right"),
+        "align-self" | "align-items" => matches!(v, "normal" | "self-start" | "self-end"),
+        _ => false,
+    }
+}
+
+type Slots = BTreeMap<(Handle, String, String), BTreeMap<String, (Priority, String)>>;
+
+/// ★ THE ALIGNMENT PASS. The grammar's self-alignment keywords are `start`
+/// / `end` / `center` / `stretch` (and `flex-*` / `baseline` on the block
+/// axis). CSS Box Alignment has more, and most of them NAME one of those
+/// once three things are known — which the cascade alone does not say:
+///
+/// - `flex-start` / `flex-end` on the inline axis: outside a flex container
+///   they ARE `start` / `end` (§5.3), and `justify-self` does nothing inside
+///   one;
+/// - `left` / `right` (inline axis only): the alignment container's
+///   line-left / line-right edge — `start` or `end` by the CONTAINER's
+///   direction (the parent for `justify-self`, the element for
+///   `justify-items`);
+/// - `self-start` / `self-end`: the edge on the ITEM's own start side — the
+///   container's `start` while the two directions agree, `end` where they
+///   differ. On the block axis (horizontal writing only, §3.6) every box's
+///   start is the top, so they are `start` / `end` — unless the axis is the
+///   inline one, which is the cross axis of a COLUMN flex container. An
+///   item whose direction differs from such a container's, and an `-items`
+///   value over children whose directions differ from it, stay dropped:
+///   one class cannot be `start` for one item and `end` for the next;
+/// - `normal`: as `stretch` for a box with no preferred aspect ratio and no
+///   natural size in the axis, and otherwise as `start` (Grid §6.2), or
+///   `stretch` for any flex item (Flexbox §8.3). An `<img>` takes the
+///   `start` reading; a NON-replaced box with an `aspect-ratio` takes it in
+///   the block axis only, and only once its width is settled (see
+///   `decide`).
+///
+/// That last rule is also CSS's INITIAL behaviour — `auto` takes the
+/// container's `normal` — while the profile's initial is `stretch`. So an
+/// image placed in a grid by a page that says nothing about alignment
+/// stretched to fill its area in the profile, and kept its own size in a
+/// browser. Each such image gets `start` written on it, in every media
+/// context where its container is a grid (or it is absolutely positioned),
+/// and `auto` back where the container is something else.
+///
+/// The `legacy` keywords stay dropped: `justify-items: legacy left` is
+/// inherited by every descendant whose `justify-items` is not set, which a
+/// non-inherited profile property cannot express.
+fn alignment_pass(resolved: &mut Slots, dom: &Dom, els: &[Handle], rtl: &BTreeMap<Handle, bool>, inputs: &Inputs, report: &mut Report) {
+    let is_rtl = |h: Handle| rtl.get(&h).copied().unwrap_or(false);
+    let parent_el = |h: Handle| dom.get(h).and_then(|n| n.parent).filter(|p| matches!(dom.get(*p).map(|n| &n.kind), Some(Kind::Element(_))));
+    let get = |r: &Slots, h: Handle, ctx: &str, p: &str| -> Option<String> {
+        r.get(&(h, String::new(), ctx.to_string())).and_then(|x| x.get(p))
+            .or_else(|| r.get(&(h, String::new(), String::new())).and_then(|x| x.get(p)))
+            .map(|(_, v)| v.clone())
+    };
+    let mut ctxs: BTreeMap<Handle, std::collections::BTreeSet<String>> = BTreeMap::new();
+    for (h, st, me) in resolved.keys() { if st.is_empty() { ctxs.entry(*h).or_default().insert(me.clone()); } }
+    let ctxs_of = |h: Handle| -> std::collections::BTreeSet<String> {
+        let mut s = ctxs.get(&h).cloned().unwrap_or_default();
+        s.insert(String::new());
+        s
+    };
+    let column_flex = |r: &Slots, h: Handle| ctxs_of(h).iter().any(|c|
+        get(r, h, c, "display").as_deref() == Some("flex") && get(r, h, c, "flex-direction").is_some_and(|d| d.starts_with("column")));
+
+    // 1. The keywords that need only directions.
+    let mut mapped = 0usize;
+    let mut dropped: Vec<((Handle, String, String), String, String, &'static str)> = vec![];
+    let keys: Vec<(Handle, String, String)> = resolved.keys().cloned().collect();
+    for k in keys {
+        let h = k.0;
+        for p in ["justify-self", "justify-items", "align-self", "align-items"] {
+            let Some(v) = resolved.get(&k).and_then(|x| x.get(p)).map(|(_, v)| v.clone()) else { continue };
+            let items = p.ends_with("-items");
+            let inline = p.starts_with("justify");
+            let to: Result<&str, &'static str> = match v.as_str() {
+                "flex-start" if inline => Ok("start"),
+                "flex-end" if inline => Ok("end"),
+                "left" | "right" if inline => {
+                    let container = if items { h } else { parent_el(h).unwrap_or(h) };
+                    Ok(if (v == "left") != is_rtl(container) { "start" } else { "end" })
+                }
+                "self-start" | "self-end" => {
+                    let (s, e) = if v == "self-start" { ("start", "end") } else { ("end", "start") };
+                    if items {
+                        let differ = dom.element_children(h).into_iter().any(|c| is_rtl(c) != is_rtl(h));
+                        if !differ || (!inline && !column_flex(resolved, h)) { Ok(s) }
+                        else { Err("an item's direction differs from its container's") }
+                    } else {
+                        let container = parent_el(h).unwrap_or(h);
+                        let same = is_rtl(h) == is_rtl(container);
+                        if same { Ok(s) }
+                        else if inline { Ok(e) }
+                        else if !column_flex(resolved, container) { Ok(s) }
+                        else { Err("the item's direction differs from its column flex container's") }
+                    }
+                }
+                _ => continue,
+            };
+            match to {
+                Ok(t) => { if let Some((_, x)) = resolved.get_mut(&k).and_then(|x| x.get_mut(p)) { *x = t.to_string() } mapped += 1 }
+                Err(why) => dropped.push((k.clone(), p.to_string(), v.clone(), why)),
+            }
+        }
+    }
+    for (k, p, v, why) in dropped {
+        if let Some(x) = resolved.get_mut(&k) { x.remove(&p); }
+        report.drop(format!("value `{p}: {v}` ({why})"));
+    }
+
+    // 2. `normal`, and the initial behaviour it shares, by box type.
+    // ★ Only a REPLACED box. A non-replaced one with an `aspect-ratio` is
+    // not laid out as `start` by browsers: Chrome stretches it in the block
+    // axis against a definite row and derives the width from that, and
+    // stretches the width where the row is indefinite — neither is `start`,
+    // and the profile's `stretch` is the nearer of the two.
+    let ratio_box = |_r: &Slots, h: Handle, _ctx: &str, inline: bool| -> bool {
+        if dom.tag(h) != Some("img") { return false }
+        let Some(n) = dom.attr(h, "src").and_then(|s| inputs.images.get(s)) else { return false };
+        n.ratio.is_some() || (n.width.is_some() && n.height.is_some()) || if inline { n.width.is_some() } else { n.height.is_some() }
+    };
+    let auto_ish = |v: &Option<String>| v.as_deref().is_none_or(|v| matches!(v, "auto" | "initial"));
+    let normal_ish = |v: &Option<String>| v.as_deref().is_none_or(|v| matches!(v, "normal" | "initial"));
+    let low: Priority = (false, 0, (0, 0, 0), 0);
+    let mut writes: Vec<((Handle, String, String), &'static str, &'static str)> = vec![];
+    let mut compiled = 0usize;
+    for h in els {
+        let h = *h;
+        let parent = parent_el(h);
+        for (own_p, items_p) in [("justify-self", "justify-items"), ("align-self", "align-items")] {
+            let inline = own_p == "justify-self";
+            // What `h` must say in one context (None: what the profile does
+            // with nothing said is already right).
+            let decide = |r: &Slots, ctx: &str, own: &Option<String>| -> Option<&'static str> {
+                let eff_normal = own.as_deref() == Some("normal")
+                    || (auto_ish(own) && normal_ish(&parent.and_then(|p| get(r, p, ctx, items_p))));
+                if !eff_normal { return None }
+                let is_normal = own.as_deref() == Some("normal");
+                let display = parent.and_then(|p| get(r, p, ctx, "display"));
+                // ★ A NON-replaced box with an `aspect-ratio` whose WIDTH is
+                // settled — specified, or stretched by an explicit `stretch`
+                // — takes its height from the ratio: its block axis is the
+                // ratio-dependent one, and `normal` does not stretch it
+                // (Sizing 4 §5.1; WPT grid-aspect-ratio-007, -030; Chrome
+                // agrees). With an auto, unstretched width Chrome stretches
+                // the block axis instead, so it stays `stretch`.
+                if !inline && display.as_deref() == Some("grid") && dom.tag(h) != Some("img")
+                    && get(r, h, ctx, "aspect-ratio").is_some_and(|v| !matches!(v.as_str(), "auto" | "initial")) {
+                    let w_settled = get(r, h, ctx, "width").is_some_and(|v| !matches!(v.as_str(), "auto" | "initial" | "min-content" | "max-content" | "fit-content"));
+                    let j_stretch = match get(r, h, ctx, "justify-self").as_deref() {
+                        Some("stretch") => true,
+                        None | Some("auto" | "initial") => parent.and_then(|p| get(r, p, ctx, "justify-items")).as_deref() == Some("stretch"),
+                        _ => false,
+                    };
+                    if w_settled || j_stretch { return Some("start") }
+                }
+                if !ratio_box(r, h, ctx, inline) { return is_normal.then_some("stretch") }
+                // Only a grid's items need it written: a flex item's
+                // `normal` is `stretch` like the profile's initial, and a
+                // block's child or an out-of-flow box outside a grid is not
+                // aligned by these properties at all.
+                if display.as_deref() == Some("grid") { return Some("start") }
+                let abs = get(r, h, ctx, "position").is_some_and(|v| v == "absolute" || v == "fixed");
+                let flex_item = !abs && display.as_deref() == Some("flex");
+                is_normal.then_some(if !inline && flex_item { "stretch" } else { "start" })
+            };
+            let mut all = ctxs_of(h);
+            if let Some(p) = parent { all.extend(ctxs_of(p)) }
+            let base_own = get(resolved, h, "", own_p);
+            let base = decide(resolved, "", &base_own);
+            if let Some(v) = base { writes.push(((h, String::new(), String::new()), own_p, v)) }
+            for ctx in all.iter().filter(|c| !c.is_empty()) {
+                let own = get(resolved, h, ctx, own_p);
+                match (decide(resolved, ctx, &own), base) {
+                    (Some(v), _) => if Some(v) != base || resolved.get(&(h, String::new(), ctx.clone())).is_some_and(|x| x.contains_key(own_p)) {
+                        writes.push(((h, String::new(), ctx.clone()), own_p, v))
+                    },
+                    (None, Some(_)) if auto_ish(&own) => writes.push(((h, String::new(), ctx.clone()), own_p, "auto")),
+                    _ => {}
+                }
+            }
+            // A state slot that says `normal` itself.
+            let states: Vec<(Handle, String, String)> = resolved.keys().filter(|k| k.0 == h && !k.1.is_empty()).cloned().collect();
+            for k in states {
+                if resolved.get(&k).and_then(|x| x.get(own_p)).is_some_and(|(_, v)| v == "normal") {
+                    let v = decide(resolved, &k.2, &Some("normal".into())).unwrap_or("stretch");
+                    writes.push((k, own_p, v));
+                }
+            }
+        }
+    }
+    for (k, p, v) in writes {
+        let base_pri = resolved.get(&(k.0, String::new(), String::new())).and_then(|x| x.get(p)).map(|(q, _)| *q);
+        let slot = resolved.entry(k.clone()).or_default();
+        let was = slot.get(p).map(|(q, v)| (*q, v.clone()));
+        if was.as_ref().is_none_or(|(_, w)| w != "normal") && v == "start" { compiled += 1 }
+        let pri = [was.map(|(q, _)| q), base_pri, Some(low)].into_iter().flatten().max().expect("low");
+        slot.insert(p.to_string(), (pri, v.to_string()));
+    }
+
+    // 3. A container's own `normal`: what its auto items do with it is now
+    // written on the ones that differ, so for the rest it is `stretch`.
+    for props in resolved.values_mut() {
+        for p in ["justify-items", "align-items", "justify-self", "align-self"] {
+            if let Some((_, v)) = props.get_mut(p) { if v == "normal" { *v = "stretch".into(); mapped += 1 } }
+        }
+    }
+    if mapped > 0 { report.drop_n("self-alignment keyword mapped to the admitted one it names", mapped) }
+    if compiled > 0 { report.drop_n("image / aspect-ratio grid item's `normal` alignment compiled to `start`", compiled) }
 }

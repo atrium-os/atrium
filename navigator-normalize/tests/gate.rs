@@ -1304,3 +1304,90 @@ fn named_lines_are_numbered_in_every_media_context() {
     assert!(!report.dropped.keys().any(|k| k.contains("no parent template")), "{:?}", report.dropped);
     assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
 }
+
+/// ★ Self-alignment keywords outside the grammar that NAME an admitted one
+/// (Box Alignment): `flex-*` on the inline axis are `start` / `end`; `left` /
+/// `right` are the CONTAINER's line-left / line-right, so `start` or `end` by
+/// its direction; `self-*` are the item's own start side — the container's
+/// `start` while their directions agree; `normal` is `stretch` for a box with
+/// no aspect ratio. Where the answer would differ item by item, or the value
+/// is inherited into descendants (`legacy`), it stays dropped.
+#[test]
+fn self_alignment_keywords_map_to_the_ones_they_name() {
+    let src = r#"<html><head><style>
+      .g { display: grid } #fs { justify-self: flex-start } #fe { justify-self: flex-end }
+      #l, #rl { justify-self: left } #r, #rr { justify-self: right }
+      #ss, #rss, #xss { justify-self: self-start } #se { justify-self: self-end }
+      #as { align-self: self-start } #ae { align-self: self-end } #n { justify-self: normal; align-self: normal }
+      #fb { align-self: first baseline } #il { justify-items: left } #ir { justify-items: right }
+      #ji { justify-items: self-end } #mix { justify-items: self-start }
+      .col { display: flex; flex-direction: column } #cx { align-self: self-start } #lg { justify-items: legacy left }
+    </style></head><body>
+      <div class="g"><p id="fs">a</p><p id="fe">a</p><p id="l">a</p><p id="r">a</p><p id="ss">a</p><p id="se">a</p>
+        <p id="as">a</p><p id="ae">a</p><p id="n">a</p><p id="fb">a</p><p id="xss" dir="rtl">a</p></div>
+      <div class="g" dir="rtl"><p id="rl">a</p><p id="rr">a</p><p id="rss">a</p></div>
+      <div class="g" id="il"><p>a</p></div><div class="g" id="ir" dir="rtl"><p>a</p></div>
+      <div class="g" id="ji"><p>a</p></div><div class="g" id="mix"><p>a</p><p dir="rtl">b</p></div>
+      <div class="col"><p id="cx" dir="rtl">a</p></div><div class="g" id="lg"><p>a</p></div>
+    </body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    let p = |id: &str, prop: &str| base_props(&out, id).get(prop).cloned().unwrap_or_default();
+    assert_eq!([p("fs", "justify-self"), p("fe", "justify-self")], ["start", "end"], "flex-* outside flex: {out}");
+    assert_eq!([p("l", "justify-self"), p("r", "justify-self")], ["start", "end"], "ltr container: left is the start");
+    assert_eq!([p("rl", "justify-self"), p("rr", "justify-self")], ["end", "start"], "rtl container: left is the END");
+    assert_eq!([p("il", "justify-items"), p("ir", "justify-items")], ["start", "start"], "justify-items: left in ltr, right in rtl");
+    assert_eq!([p("ss", "justify-self"), p("se", "justify-self"), p("rss", "justify-self")], ["start", "end", "start"], "same direction");
+    assert_eq!(p("xss", "justify-self"), "end", "an rtl item in an ltr grid: its own start is the container's end");
+    assert_eq!([p("as", "align-self"), p("ae", "align-self")], ["start", "end"], "block axis: every start is the top");
+    assert_eq!([p("n", "justify-self"), p("n", "align-self")], ["stretch", "stretch"], "normal on a box with no ratio");
+    assert_eq!(p("fb", "align-self"), "baseline");
+    assert_eq!(p("ji", "justify-items"), "end");
+    // Not exact: one class cannot be `start` for one item and `end` for the next.
+    assert_eq!(p("mix", "justify-items"), "", "children of differing directions: dropped");
+    assert_eq!(p("cx", "align-self"), "", "inline cross axis, item direction differs: dropped");
+    assert_eq!(p("lg", "justify-items"), "", "legacy inherits into descendants: dropped");
+    let said = |what: &str| report.dropped.keys().any(|k| k.contains(what));
+    assert!(said("justify-items: self-start") && said("align-self: self-start") && said("legacy left"), "{:?}", report.dropped);
+    assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+}
+
+/// ★ An image's `normal` self-alignment is `start` in a grid (Grid §6.2: a
+/// replaced box with a ratio or a natural size is not stretched) — and so is
+/// a non-replaced `aspect-ratio` box's in the block axis once its width is
+/// settled (Sizing 4: the block axis is the ratio-dependent one) — and that is
+/// also what a page that says NOTHING gets — `auto` takes the container's
+/// `normal`. The profile's initial is `stretch`, so it is written out, in
+/// every media context where the container is a grid, and taken back
+/// (`auto`) where it is a flex container, whose `normal` IS stretch. Boxes
+/// without a ratio, and an explicit container alignment, are left alone.
+#[test]
+fn an_image_in_a_grid_keeps_its_size_as_in_css() {
+    let src = r#"<html><head><style>
+      .g { display: grid; grid-template-columns: 200px 200px } .f { display: flex }
+      #m { display: grid } @media (min-width: 600px) { #m { display: flex } }
+      #c { align-items: center } #n { justify-self: normal; align-self: normal }
+    </style></head><body>
+      <div class="g"><img id="a" src="cat.png"><p id="p">text</p><img id="n" src="cat.png"><p id="r" style="aspect-ratio: 2">r</p>
+        <p id="w" style="aspect-ratio: 2; width: 100px">w</p><p id="j" style="aspect-ratio: 2; justify-self: stretch">j</p></div>
+      <div class="f"><img id="b" src="cat.png"></div>
+      <div id="m"><img id="d" src="cat.png"></div>
+      <div class="g" id="c"><img id="e" src="cat.png"></div>
+    </body></html>"#;
+    let mut inputs = Inputs::default();
+    inputs.images.insert("cat.png".into(), (40, 20).into());
+    let (out, report) = normalize(src, &inputs);
+    let p = |id: &str, prop: &str| base_props(&out, id).get(prop).cloned().unwrap_or_default();
+    assert_eq!([p("a", "justify-self"), p("a", "align-self")], ["start", "start"], "{out}");
+    assert_eq!([p("n", "justify-self"), p("n", "align-self")], ["start", "start"], "explicit normal, same answer");
+    assert_eq!([p("p", "justify-self"), p("p", "align-self")], ["", ""], "a box with no ratio stretches already");
+    assert_eq!([p("r", "justify-self"), p("r", "align-self")], ["", ""], "a NON-replaced aspect-ratio box with an auto width stretches");
+    assert_eq!(p("w", "align-self"), "start", "…but with its width settled, its height comes from the ratio");
+    assert_eq!([p("j", "justify-self"), p("j", "align-self")], ["stretch", "start"], "an explicit stretch settles it too");
+    assert_eq!([p("b", "justify-self"), p("b", "align-self")], ["", ""], "a flex item's normal is stretch");
+    assert_eq!([p("e", "justify-self"), p("e", "align-self")], ["start".to_string(), String::new()], "the container's center stands");
+    assert_eq!(p("d", "align-self"), "start", "grid in the base context");
+    let media = out.split("@media").skip(1).collect::<String>();
+    assert!(media.contains("align-self: auto") && media.contains("justify-self: auto"), "and auto again where it is flex: {out}");
+    assert!(report.dropped.keys().any(|k| k.contains("compiled to `start`")), "{:?}", report.dropped);
+    assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+}
