@@ -222,8 +222,8 @@ routes input, because that is its job.
 do. For a 2D compositor that is the whole job, and it is already the compute route chosen
 for the display pipeline. Fonts follow §5 question 4: web fonts arrive as outlines.
 
-**Apps that need their own GPU work are out of scope here.** The user will design a
-separate architecture for them. Until then, today's rule stands: apps hold no `device_fd` in
+**Apps that need their own GPU work were out of scope here.** §2.5.3 now proposes how they
+fit the same per-window shape. Until then, today's rule stands: apps hold no `device_fd` in
 production, and they reach the GPU only through the broker's aqueduct-gpu protocol.
 
 **Rating:** low, bounded by two fuzzable kernels and a fixed-size header.
@@ -304,6 +304,59 @@ because the validator is already built. Merge only if the measured cost says so.
   §4.2) are the lever if it ever matters.
 
 **Rating:** with §2.5.1 alone, low but cross-window. With this, low and per-window.
+
+#### 2.5.3 Proposed: apps with their own GPU work use the same per-window shape
+
+*Proposed 2026-11-04, from the user's question: "this can also solve the gpu work for apps
+if each app gets its own jailed renderer right?"*
+
+**Mostly yes.** §2.5.2's structure is exactly the isolation an app's own GPU work needs:
+- one GPU VM per app, holding only that app's buffers;
+- one surface it alone can write;
+- composition by a trusted layer list;
+- input routed by the broker.
+
+The one thing that changes is **whose code runs on the GPU**. A Navigator window runs only
+our `bin`/`raster`. A 3D app, a game, an ML job or Orbis runs *its own* shaders. That moves
+the residual risk to three places, each with an owner:
+
+1. **The shader compiler is a hostile-input parser.** It translates SPIR-V into RDNA4
+   machine code (`atrium-spv-*`, the GIR pipeline).
+   - **It runs in the app's own jail**, never in the broker.
+   - The broker receives machine code plus the aqueduct-gpu §11 validation record:
+     bounded loops, descriptor coverage, interface checks.
+   - The broker never compiles.
+2. **Arbitrary machine code on the GPU is confined by the GPU MMU, not by inspection.**
+   An app's dispatches run under its own VMID with page tables the kernel built. That is
+   `gpu-isolation.md`'s invariant, and the app GPU path stays gated on its attestation.
+   - Machine code cannot program page tables or privileged registers.
+   - Proving the driver never lets a command-buffer packet do so is the kernel's job
+     (GPU ABI §5.12).
+3. **Submission stays in the broker.** The app builds a command stream in its own shared
+   buffer, using aqueduct-gpu's closed frame vocabulary (§3). The broker submits it into the
+   app's VM, with:
+   - the app's quota and scheduling weight (GPU ABI §4.2);
+   - a per-dispatch timeout, so a hang costs that app a queue reset (§10.1).
+
+   The app holds **no `device_fd`**, so the production rule "apps hold no GPU fds" survives
+   unchanged.
+
+**What this does not solve, stated.**
+- **Shared-hardware side channels between apps:** cache and timing contention. Mitigated
+  by scheduling, not eliminated. The same holds on every GPU OS.
+- **Performance-sensitive apps** may want user-mode queues (GPU ABI §5.9). A doorbell
+  mapped into an app jail is a direct path to the GPU. Under this design it stays test-only
+  until a separate review says otherwise.
+- **The broker's frame-vocabulary parser** grows with app needs. It must stay closed and
+  fuzzed, because it is the one place the broker reads app-written data.
+
+**Net effect.** The Navigator, native 2D apps and GPU-heavy apps all share one shape:
+- a renderer per window or app, in its own jail and its own GPU VM;
+- a broker that parses no content;
+- a compose pass over a trusted layer list.
+
+The difference between them is only which kernels the broker is willing to run in that
+VM: ours alone, or the app's validated ones.
 
 ### 2.6 The shared store — conversions in Tessera CAS (A5)
 
