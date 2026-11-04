@@ -67,6 +67,17 @@ fn len(v: &V, basis: U) -> Option<U> {
     }
 }
 
+/// A box's border-box size `size` as an INTRINSIC CONTRIBUTION: clamped by
+/// its own `min-width`/`max-width` (CSS Sizing §5.2). A percentage is
+/// against the indefinite size being measured, so it does not clamp.
+/// ★ Unclamped, an ad slot's `min-width: 300px` measured its column at the
+/// width of the word "Ad", and a fit-content box centred 35 px of it.
+fn contribution(cs: &Style, size: U) -> U {
+    let lim = |p: &str| match cs.get(p) { V::Len(l) => Some(u(l.v)), _ => None };
+    let size = lim("max-width").map_or(size, |mx| size.min(mx));
+    lim("min-width").map_or(size, |mn| size.max(mn))
+}
+
 fn rgba(c: &Color, current: u32) -> u32 {
     match c {
         Color::Rgba(Rgba { r, g, b, a }) => (*r as u32) << 24 | (*g as u32) << 16 | (*b as u32) << 8 | *a as u32,
@@ -2177,9 +2188,14 @@ impl<'a> Cx<'a> {
                             + if kw(cs, "border-right-style") == "none" { 0 } else { px("border-right-width") }
                     }
                 }).unwrap_or(0);
-                smn += a + frame;
-                smx += b + frame;
-                mins.push(a + frame);
+                let margins = self.st(*c).map(|cs| len(cs.get("margin-left"), 0).unwrap_or(0) + len(cs.get("margin-right"), 0).unwrap_or(0)).unwrap_or(0);
+                let (a, b) = match self.st(*c) {
+                    Some(cs) => (contribution(cs, a + frame - margins) + margins, contribution(cs, b + frame - margins) + margins),
+                    None => (a + frame, b + frame),
+                };
+                smn += a;
+                smx += b;
+                mins.push(a);
             }
             let total_gap = gap * (kids.len() as U).saturating_sub(1);
             // Wrapping lets the line break, so the minimum is one item.
@@ -2204,8 +2220,10 @@ impl<'a> Cx<'a> {
                     + if kw(cs, "border-left-style") == "none" { 0 } else { px("border-left-width") }
                     + if kw(cs, "border-right-style") == "none" { 0 } else { px("border-right-width") } };
                 let (a, b) = match cs.get("width") { V::Len(l) => { let w = u(l.v); (w, w) } _ => self.intrinsic(c) };
-                mn = mn.max(a + frame);
-                mx = mx.max(b + frame);
+                let margins = px("margin-left") + px("margin-right");
+                let (a, b) = (contribution(cs, a + frame - margins) + margins, contribution(cs, b + frame - margins) + margins);
+                mn = mn.max(a);
+                mx = mx.max(b);
             } else {
                 self.collect_inline(c, &mut items, s);
             }
@@ -3238,6 +3256,26 @@ mod tests {
         assert_eq!((a.2, b.0, b.2), (300, 300, 100), "the min-clamped item is frozen and the other takes the rest");
         let (c, d) = (boxes(&o, 0x00ff00ff)[0], boxes(&o, 0xffff00ff)[0]);
         assert_eq!((c.2, d.2), (50, 350), "the max-clamped item is frozen and its excess goes to the other");
+    }
+
+    /// ★ A child's `min-width`/`max-width` clamp its INTRINSIC contribution
+    /// (CSS Sizing §5.2): a shrink-to-fit box around a `min-width: 300px`
+    /// child is 300 wide, and around a long line capped at `max-width:
+    /// 100px` it is 100. Both in block and in row-flex measurement.
+    #[test]
+    fn min_and_max_width_clamp_an_intrinsic_contribution() {
+        let src = r#"<style>body { margin-left: 0px; margin-right: 0px; margin-top: 0px }
+            .ib { display: inline-block; background-color: #ff0000; height: 10px } .fx { display: inline-block; background-color: #0000ff; height: 10px }
+            .row { display: flex } .lo { min-width: 300px; height: 10px } .hi { max-width: 100px; height: 10px }</style>
+            <div><div class="ib"><div class="lo"></div></div></div>
+            <div><div class="ib"><div class="hi">a long run of words that would be far wider than one hundred pixels</div></div></div>
+            <div><div class="fx"><div class="row"><div class="lo"></div><div class="lo"></div></div></div></div>"#;
+        let o = render(src);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let red = boxes(&o, 0xff0000ff);
+        assert_eq!(red[0].2, 300, "min-width raises the contribution");
+        assert_eq!(red[1].2, 100, "max-width caps it");
+        assert_eq!(boxes(&o, 0x0000ffff)[0].2, 600, "a row flex container sums the clamped contributions");
     }
 
     /// ★ In an rtl grid column line 1 is on the right, and an item's
