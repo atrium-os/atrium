@@ -1531,18 +1531,47 @@ impl<'a> Cx<'a> {
             if wrap && i > start && used.saturating_add(add) > limit { lines.push(start..i); start = i; used = outer } else { used += add }
         }
         if start < items.len() || items.is_empty() { lines.push(start..items.len()) }
-        // Resolve flexible lengths per line (one pass, then clamp).
+        // Resolve flexible lengths per line (§9.7): share the free space by
+        // the flex factors, clamp, FREEZE the items that violated their
+        // min/max, and share again among the rest until nothing moves.
+        // ★ One pass and a clamp left a `min-width: 500px` video at 500
+        // while its neighbour kept the share computed as if the video had
+        // shrunk: LinkedIn's line overflowed the page by 116 px.
         for r in &lines {
-            let outer: U = items[r.clone()].iter().map(|i| i.hypo + i.m_start + i.m_end).sum::<U>() + main_gap * (r.len() as U).saturating_sub(1);
             let Some(avail) = main_avail else { continue };
-            let free = avail - outer;
-            if free > 0 {
-                let g: f64 = items[r.clone()].iter().map(|i| i.grow).sum();
-                if g > 0.0 { for i in &mut items[r.clone()] { i.main = (i.hypo + u(free as f64 / PX as f64 * i.grow / g.max(1.0))).clamp(i.min, i.max.max(i.min)) } }
-            } else if free < 0 {
-                let sb: f64 = items[r.clone()].iter().map(|i| i.shrink * i.base as f64).sum();
-                if sb > 0.0 { for i in &mut items[r.clone()] { i.main = (i.hypo + u(free as f64 / PX as f64 * (i.shrink * i.base as f64) / sb)).clamp(i.min, i.max.max(i.min)) } }
+            let line = &mut items[r.clone()];
+            let fixed = (line.iter().map(|i| i.m_start + i.m_end).sum::<U>() + main_gap * (line.len() as U).saturating_sub(1)) as f64;
+            let growing = line.iter().map(|i| i.hypo).sum::<U>() as f64 + fixed < avail as f64;
+            let factor = |i: &It| if growing { i.grow } else { i.shrink };
+            let mut frozen: Vec<bool> = line.iter().map(|i| factor(i) == 0.0
+                || (growing && i.base > i.hypo) || (!growing && i.base < i.hypo)).collect();
+            let mut target: Vec<f64> = line.iter().zip(&frozen).map(|(i, f)| if *f { i.hypo } else { i.base } as f64).collect();
+            let free_of = |target: &[f64]| avail as f64 - fixed - target.iter().sum::<f64>();
+            let initial = free_of(&target);
+            for _ in 0..=line.len() {
+                if frozen.iter().all(|f| *f) { break }
+                for (k, i) in line.iter().enumerate() { if !frozen[k] { target[k] = i.base as f64 } }
+                let mut free = free_of(&target);
+                let sum_f: f64 = line.iter().zip(&frozen).filter(|(_, f)| !**f).map(|(i, _)| factor(i)).sum();
+                if sum_f < 1.0 && (initial * sum_f).abs() < free.abs() { free = initial * sum_f }
+                let scaled: f64 = line.iter().zip(&frozen).filter(|(_, f)| !**f).map(|(i, _)| i.shrink * i.base as f64).sum();
+                let mut violation = vec![0.0; line.len()];
+                for (k, i) in line.iter().enumerate() {
+                    if frozen[k] { continue }
+                    let t = if growing { i.base as f64 + free * i.grow / sum_f }
+                            else if scaled > 0.0 { i.base as f64 + free * i.shrink * i.base as f64 / scaled }
+                            else { i.base as f64 };
+                    let c = t.clamp(i.min as f64, i.max.max(i.min) as f64);
+                    violation[k] = c - t;
+                    target[k] = c;
+                }
+                let total: f64 = violation.iter().sum();
+                for k in 0..line.len() {
+                    if frozen[k] { continue }
+                    if total == 0.0 || (total > 0.0 && violation[k] > 0.0) || (total < 0.0 && violation[k] < 0.0) { frozen[k] = true }
+                }
             }
+            for (i, t) in line.iter_mut().zip(&target) { i.main = t.round() as U }
         }
         // Cross sizes: measured at the resolved main size.
         for i in &mut items {
@@ -3188,6 +3217,27 @@ mod tests {
         assert_eq!(b[0].0, 400 - 20 - 100 - 50, "the second to its left");
         assert_eq!(b[1].0, 0, "flex-end packs to the LEFT in rtl");
         assert_eq!(x.0, 400 - 60, "a column's cross-start is the right edge");
+    }
+
+    /// ★ Flexible lengths FREEZE (Flexbox §9.7): an item clamped by its
+    /// min or max size is frozen and the free space is shared again among
+    /// the rest. Here the first item cannot shrink below 300 px, so the
+    /// second gets what is left (100), not the half it would have had.
+    /// Growing, an item capped by max-width gives its excess to the other.
+    #[test]
+    fn flexible_lengths_freeze_items_at_their_limits() {
+        let src = r#"<style>body { margin-left: 0px; margin-right: 0px; margin-top: 0px }
+            .f { display: flex; width: 400px } .s > * { width: 100%; height: 10px }
+            .a { min-width: 300px; background-color: #ff0000 } .b { background-color: #0000ff }
+            .g > * { flex-grow: 1; height: 10px; width: 0px } .c { max-width: 50px; background-color: #00ff00 } .d { background-color: #ffff00 }</style>
+            <div class="f s"><div class="a"></div><div class="b"></div></div>
+            <div class="f g"><div class="c"></div><div class="d"></div></div>"#;
+        let o = render(src);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let (a, b) = (boxes(&o, 0xff0000ff)[0], boxes(&o, 0x0000ffff)[0]);
+        assert_eq!((a.2, b.0, b.2), (300, 300, 100), "the min-clamped item is frozen and the other takes the rest");
+        let (c, d) = (boxes(&o, 0x00ff00ff)[0], boxes(&o, 0xffff00ff)[0]);
+        assert_eq!((c.2, d.2), (50, 350), "the max-clamped item is frozen and its excess goes to the other");
     }
 
     /// ★ In an rtl grid column line 1 is on the right, and an item's
