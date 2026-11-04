@@ -16,6 +16,10 @@
 #   atrium_zram_swap="YES"                          # swapon after load
 #   atrium_zram_module="/boot/modules/atrium_zram.ko"
 #   atrium_zram_dev="/dev/zram0"
+#   atrium_zram_backing="gpt/swapfs"    # disk partition for cold/incompressible
+#                                       # pages (atrium-zram-v2.md §4.5). It is
+#                                       # taken off swap and given to zram, so
+#                                       # only zram0 is swapped on.
 
 # PROVIDE: atrium_zram
 # REQUIRE: sshd
@@ -33,6 +37,7 @@ load_rc_config "$name"
 : ${atrium_zram_swap:="YES"}
 : ${atrium_zram_module:="/boot/modules/atrium_zram.ko"}
 : ${atrium_zram_dev:="/dev/zram0"}
+: ${atrium_zram_backing:=""}
 
 start_cmd="atrium_zram_start"
 stop_cmd="atrium_zram_stop"
@@ -55,6 +60,18 @@ atrium_zram_start()
 	if [ ! -c "${atrium_zram_dev}" ]; then
 		echo "atrium_zram: WARNING ${atrium_zram_dev} not present after load"
 		return 1
+	fi
+	if [ -n "${atrium_zram_backing}" ] && \
+	    [ -z "$(sysctl -n kern.zram.backing_dev)" ]; then
+		# FreeBSD stripes swap across every device with no priorities, so
+		# the partition must not stay a swap device next to zram0.
+		bdev="/dev/${atrium_zram_backing#/dev/}"
+		if swapinfo | grep -q "^${bdev} "; then
+			echo "atrium_zram: swapoff ${bdev} (becomes zram backing)"
+			swapoff "${bdev}" || echo "atrium_zram: swapoff ${bdev} failed"
+		fi
+		sysctl kern.zram.backing_dev="${atrium_zram_backing}" >/dev/null ||
+		    echo "atrium_zram: backing store ${atrium_zram_backing} not attached"
 	fi
 	if checkyesno atrium_zram_swap; then
 		# Idempotent — only swapon if it is not already a swap device.

@@ -25,7 +25,13 @@
 > allocated slot table; §4.1) is **built and verified in-VM**. The module's
 > memory at load fell from 12.0 MiB to 99 KiB, a 4 GiB device works on a 2 GiB
 > VM, and the 1.9 GB fill still has 0 corrupt pages and 0 failed stores.
-> Next: increment 5 (backing store and writeback).
+>
+> **2026-11-04 (evening):** increment 5 (backing store and writeback; §4.5) is
+> **built and verified in-VM**. With the old swap partition as zram's backing
+> store, and only `/dev/zram0` swapped on, the 300 MiB-limit run that
+> increment 2 lost to the OOM killer now completes: 0 corrupt pages, 0
+> page-out errors, and 27k pages moved to disk to keep the pool under the
+> limit. Next: increment 6 (LZ4 option and in-kernel timing).
 >
 > **Decision context (Shankar, 2026-11-03).** Atrium gets macOS-style compressed
 > main memory, and it must work in the Mac VM, which has no GPU. Using spare GPU
@@ -398,6 +404,7 @@ while `swapinfo` still showed free space. PSI `some` reached 51.7 %, which
 `memoryd` would act on first in a real system. Increment 5's writeback turns
 "at the limit" into "move cold pages to disk" instead of failing. Until then,
 the default (25 % of RAM) is a safety bound, not a tuning knob.
+*(Increment 5 fixed this when a backing store is configured; see §4.5.)*
 
 ### 4.5 Backing store and writeback (fixes v1 limit 5)
 
@@ -415,7 +422,77 @@ longer put fresh pages on disk.
 - The backing store is block-addressed by its own bitmap allocator. A written-back
   slot records the block. A read from a written-back slot reads it
   synchronously, then frees the block, since the page is now resident again in
-  the VM.
+  the VM. *(Wrong, corrected in "As built": the block must be kept.)*
+
+**As built (increment 5, 2026-11-04).**
+
+- `kern.zram.backing_dev` names a GEOM provider (`gpt/swapfs`, `/dev/ada0p3`).
+  It is set once, by sysctl or as a loader tunable, and opened exclusively
+  (r1w1e1) through a small GEOM class of zram's own. The rc.d script should
+  stop swapping on that partition (see the rc.d note below).
+- **A read does not free the block.** After a swap-in the VM keeps the swap
+  block assigned while the page is clean, and may drop the page and read the
+  block again. Freeing it on read would return zeros the second time. A WB
+  slot keeps its block until it is overwritten or deleted, like a COMP slot
+  keeps its object.
+- One object per 4 KiB block, written as stored (zstd bytes or the raw page).
+  The disk holds pages, not packed compressed bytes; packing would save disk
+  space but not I/O, and disk space is not the constraint here.
+- **Writeback task**, on its own taskqueue thread, doing synchronous I/O in
+  batches of up to 256 pages with consecutive blocks merged into writes of up
+  to 128 KiB. It copies each chosen object out under the slot lock, writes the
+  batch, then switches each slot to WB only if its generation (a 16-bit
+  counter in the slot, bumped on every change) is unchanged; otherwise the
+  block is freed. A slot keeps serving reads from RAM while its write is in
+  flight. It runs:
+  - every 5 s if there are RAW pages (RAW goes to disk almost at once);
+  - every `kern.zram.idle_secs` (default 300) for the idle scan: a COMP slot
+    marked idle at the previous scan and not read since is written back;
+    every other COMP slot is marked;
+  - whenever a store pushes the pool past 90 % of `mem_limit`, writing back
+    COMP slots in table order until the pool is under 80 %.
+- **Write-through.** A store the pool refuses (at the limit, or no pages) is
+  written to disk uncompressed, straight from the swap-out bio, as an
+  asynchronous child bio. The slot becomes WB before the write completes,
+  which is safe because the VM does not read a block it is still writing; a
+  failed write rolls the slot back.
+- **Reads of WB slots** are asynchronous child bios of the strategy bio, so
+  `zram_strategy` never sleeps. A raw block is read straight into the page;
+  a compressed one into a bounce buffer and decompressed on completion, in
+  the GEOM up thread. The strategy bio completes when its last part does.
+  Child state comes from a small UMA zone with a reserve (short-lived, so its
+  reserve refills itself, unlike the span headers of §4.3).
+- If the provider goes away, writeback stops and reads of WB slots fail with
+  EIO; the consumer is detached at unload.
+- New sysctls: `backing_dev`, `backing_blocks`, `backing_used`, `idle_secs`,
+  `pages_wb` (gauge), `wb_pages`, `wb_through`, `wb_reads`, `wb_fail`,
+  `wb_scans`. `orig_bytes` now includes WB pages.
+- **rc.d.** `atrium_zram_backing="gpt/swapfs"` in rc.conf makes
+  `etc/atrium-zram` take that partition off swap and give it to zram, so only
+  zram0 is swapped on. (The VM runs below set this up by hand.)
+- Measured in the VM (backing store = the 1 GiB `gpt/swapfs` partition, only
+  `/dev/zram0` swapped on):
+  - **Functional** (`idle_secs` 20): 32 MiB of mostly incompressible data:
+    all 7,162 RAW pages were on disk by the time `dd` returned, and the
+    1,030 COMP pages stayed in RAM. 16 MiB of compressible text stayed in RAM
+    for one period and was written back after the second (pool 8 MiB → 0).
+    Every read-back from disk matched, overwriting part of an on-disk region
+    left the rest intact, and `trim` freed every block.
+  - **Limit at 300 MiB, 1.7 GB fill** (increment 2: 1,331 page-out errors,
+    then the OOM killer): completed in 293 s; 0 of 435,200 pages corrupt;
+    0 page-out errors; `fail_limit` 0 and write-through never needed, because
+    writeback kept the pool at or under ~256 MB by moving 27,445 pages to disk;
+    32,312 swap-ins were served from disk.
+  - **The 1.9 GB fill with the default limit** (25 % of RAM = 503 MiB; the
+    earlier fills ran unlimited): 0 of 486,400 pages corrupt, 0 page-out
+    errors, no OOM. The limit binds here, so 154,803 pages went to disk and
+    101,707 swap-ins came back from it; the run took 734 s against ~596 s
+    unlimited, and PSI `some` peaked at 92 % against 53–61 %. That is the
+    honest price of a limit at a quarter of RAM on a workload this far over
+    RAM, and is what `memoryd` would see and act on. The page allocator also ran
+    dry (min free 24 MB, the whole 256-chunk reserve used once): 97 stores
+    were refused, 85 of them written through to disk, and 12 failed with a
+    silent ENOMEM that the pager retries.
 
 ### 4.6 Observability
 
@@ -456,7 +533,7 @@ Two small consumers:
 | 2 | §4.2 packed allocator + §4.4 limit | **DONE, verified 2026-11-04**: the userspace churn test passes, a 550-page `dd` round-trip matches, the 1.9 GB fill has 0 corruption with pool overhead 3.9 % over the data, and the limit holds exactly (its feedback path waits for increment 5). |
 | 3 | §4.3 per-CPU contexts + §4.1 hashed locks | **DONE, verified in-VM 2026-11-04**: 4 parallel `dd` writers 2.2× faster than increment 2, all streams byte-identical; the 1.9 GB fill has 0 corruption and 0 `fail_nomem` (after the span-header fix, §4.3). The 4-job-build PSI comparison is not run yet: a build under TCG takes hours, so it waits for a faster host. |
 | 4 | §4.1 dynamic sizing, lazy table | **DONE, verified in-VM 2026-11-04**: module memory at load fell from 12.0 MiB to 99 KiB, a 4 GiB device works on a 2 GiB VM, and the 1.9 GB fill has 0 corruption and 0 failures. The slot is 16 bytes, not 8 (the 8-byte handle moves to increment 5). |
-| 5 | §4.5 backing store and writeback | With a disk partition as backing: RAW pages land on disk, idle pages are written back after the period, and reads of written-back pages match. `swapinfo` shows only zram0. |
+| 5 | §4.5 backing store and writeback | **DONE, verified in-VM 2026-11-04**: with the swap partition as backing and only zram0 in `swapinfo`, RAW pages go to disk at once, idle pages after two periods, and every read from disk matches. The 300 MiB-limit run that increment 2 lost to the OOM killer completes with 0 corruption and 0 page-out errors, and so does the 1.9 GB fill at the default limit. |
 | 6 | §4.7 LZ4 option | Selftest under both codecs. In-kernel timing of codec vs whole `zram_strategy` per page (dtrace `fbt`). |
 
 ## 6. The VM-native decision (macOS shape), and what would trigger it
