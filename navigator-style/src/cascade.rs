@@ -126,6 +126,13 @@ dd { margin-left: 40px }
 pre { white-space: pre; margin-top: 1em; margin-bottom: 1em }
 pre, code, kbd, samp { font-family: mono }
 strong, b { font-weight: 700 }
+/* ★ HTML's rendering section: `small { font-size: smaller }` and
+   `big { font-size: larger }`, which Chrome computes as the parent's size
+   divided or multiplied by 1.2. Without them a spec's 1,455 `<small>(live
+   test)</small>` links set at full size, and a grid column sized to them
+   wrapped where Chrome's fit. */
+small { font-size: 83.3333% }
+big { font-size: 120% }
 em, i, cite, dfn, var { font-style: italic }
 a:link { color: #0969da; text-decoration-line: underline }
 hr { border-top-width: 1px; border-top-style: solid; margin-top: 0.5em; margin-bottom: 0.5em }

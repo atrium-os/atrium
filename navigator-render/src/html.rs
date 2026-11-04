@@ -3189,6 +3189,14 @@ mod tests {
     }
 
     #[test]
+    fn small_and_big_scale_the_parent_font_size_by_1_2() {
+        let o = render(r#"<style>p { font-size: 18px }</style><p>a<small>b</small><big>c</big></p>"#);
+        let size = |t: &str| o.scene.runs.iter().find(|r| r.text == t).map(|r| r.size).expect(t);
+        assert_eq!(size("a"), 18 * PX);
+        assert_eq!(size("b"), 15 * PX, "smaller: 18 / 1.2");
+        assert_eq!(size("c"), u(21.6), "larger: 18 × 1.2");
+    }
+
     /// ★ `font-size: 0` is how a page hides text from sight while keeping it
     /// for a screen reader. It paints nothing and takes no space.
     #[test]
