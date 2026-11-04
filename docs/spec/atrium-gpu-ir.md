@@ -109,6 +109,14 @@ its input registers.
 5. **Scalarise** arithmetic, **map** SSBO pointers to `Buffer(b)` + offset
    expressions, **map** builtins.
 
+**Known gap (found 2026-11-04).** The frontend lowers every
+`OpGroupNonUniform*` as if the subgroup had one invocation (Tier-2's model:
+`WaveActiveSum(x)` becomes `x`). That is wrong on a GPU, so before G4 the
+frontend IR gets real subgroup ops (the CPU backends lower them to the
+size-1 identity themselves) and GIR maps them to its subgroup ops. Until
+then `subgroup_sum` builds into GIR with size-1 meaning and is excluded from
+oracle comparisons.
+
 ## 5. Passes (target-independent)
 
 In order, each one small and testable on its own:
