@@ -1,7 +1,7 @@
 # Atrium Navigator — threat model: browsing a malicious site
 
-*Brainstorm, 2026-11-04. The user accepted all recommendations the same day (§3, §5), asked
-whether Fresco can be jailed (§2.5.1), and asked for the credential design (§6).*
+*Brainstorm, 2026-11-04. The user accepted all recommendations the same day (§3, §5), settled
+how Fresco is jailed (§2.5.1), and asked for the credential design (§6).*
 
 The question: a user opens a URL whose owner is hostile. What can the owner make happen,
 how far does it reach, and what still has to be built so the answer is "not much"?
@@ -166,74 +166,73 @@ What sits behind it:
 - the custom GPU kernel driver;
 - with `FRESCOD_RENDERER=gpu`, the RDNA4 kernels.
 
-#### 2.5.1 Proposed: Fresco runs jailed, split from the GPU authority
+#### 2.5.1 Settled: the compositor writes data, the broker runs only our kernels
 
-*Proposed 2026-11-04, answering the user's question.*
+*Settled (user, 2026-11-04). This replaces an earlier draft in which the jailed compositor
+held a narrowed client `device_fd`. That draft left the driver's client ioctls reachable
+from the process that parses hostile scene graphs, so the user asked why and we redesigned.*
 
-The user asked whether Fresco can run in a jail, since it "just needs a shared memory
-aperture to the driver". **Yes.** It needs a little more than an aperture, and the ABI
-already has the right shape for it.
+**Why a GPU-submitting compositor can't be fully jailed.** A process that submits GPU work
+has to create buffers, bind them into a GPU VM and submit command buffers. Every one of
+those is an ioctl into our kernel driver (GPU ABI v2.1 §4.1, §5.12). A jail removes
+everything *around* that, but not the one thing the process exists to do.
 
-**What a GPU renderer actually holds.** It submits command buffers the GPU executes, so it
-needs a client `device_fd` (GPU ABI v2.1 §4.1). That gives it:
-- `BO_CREATE`;
-- `VM_BIND` into its own GPU VM;
-- `SUBMIT`;
-- syncobjs;
-- `BO_EXPORT_SHARE`.
-
-Mapping shared memory alone would not let it draw. That client authority is separate from
-**control** authority:
-- `CLIENT_OPEN`, quotas and reset;
-- the exclusive display node: modeset, scanout commit, vblank.
-
-Today frescod's broker holds both, so the process that parses scene graphs also holds the
-device. That is §2's rule broken: authority and hostile input in one process.
-
-**The split.**
+**The shape that removes it.** frescod's GPU path doesn't run arbitrary shaders. It runs
+two fixed kernels of our own, `bin` and `raster` (`fresco-compute`), over buffers staged in
+one System BO. So the compositor never needs to submit anything:
 
 | process | holds | parses hostile input |
 |---|---|---|
-| **GPU/display broker** (tiny, unjailed or minimally jailed) | `control_fd`, the display node, `CLIENT_OPEN` | **nothing**: it receives only `share_fd` + syncobj + timeline value for each frame, and commits it |
-| **Fresco compositor** (jailed, zero filesystem, zero network) | one client `device_fd` narrowed by `cap_ioctls_limit()` to the render subset; its client sockets; the shipped font set mapped read-only | scene graphs, glyph outlines, pixel buffers |
+| **GPU/display broker** (small, no parser) | `control_fd`, its own client context, the display node; our signed `bin`/`raster` kernels | **nothing**: it checks only the size and header of the shared scene buffer |
+| **Fresco compositor** (jailed: zero filesystem, zero network, **no GPU fd**) | a pre-mapped shared scene buffer per frame slot, from the broker; its client sockets; the shipped font set mapped read-only | scene graphs, glyph outlines, pixel buffers |
 
-The compositor renders into its own BOs and hands each finished frame to the broker by
-`share_fd` and syncobj. That is exactly GPU ABI §6.1's compositor flow, run in the other
-direction. The broker checks the buffer against the plane (§5.12 already lists that check)
-and flips. A crash costs a compositor restart, and the broker holds the last frame on
-screen (display ABI v2's hold-last-frame).
+Per frame:
+1. The compositor writes the frame's scene into a shared buffer: rects, paths, glyph
+   outlines and image pixels.
+2. It signals the broker over its socket.
+3. The broker submits `bin`, then `raster`, with that buffer bound read-only and the
+   scanout BO as the target.
+4. The broker flips the result.
 
-**What the jail buys.** A compromised compositor gets none of these:
-- the user's files;
-- the network;
-- `execve` of a tool;
-- control ioctls: no device reset, no quota changes, no minting fds for others.
+The compositor makes **zero driver ioctls**.
 
-Its GPU DMA is confined to its own VM. That is `gpu-isolation.md`'s invariant, and it holds
-only once the driver passes that spec's attestation gate.
+**What remains to attack, and why it is small.**
+- **Our two kernels reading hostile data.** Every load and store is bounds-checked against
+  the bound buffer's size. A count or offset in the scene is never trusted as an address.
+  The GPU's page tables confine the kernels to the BOs the broker bound, which is
+  `gpu-isolation.md`'s invariant, attested.
+  - The kernels are code we wrote, and they have a CPU reference (`fresco-compute`'s Rust
+    reference, already pixel-exact against Tier-2 and the R9700).
+  - So they can be fuzzed differentially: random scene buffers, GPU output against the
+    reference, plus out-of-bounds detection under gpusim.
+- **A GPU hang from a pathological scene** (huge path counts, degenerate geometry) costs a
+  queue reset, not the machine (GPU ABI §10.1–10.3). The broker also bounds per-frame work
+  from the buffer header before it submits.
+- **The broker's small input.** It reads a fixed header (sizes, counts) and a doorbell
+  message from the socket, and nothing else.
 
-**What the jail does NOT buy, so it must be stated.**
-1. **The kernel ioctl surface is still reachable.** The client subset of §5.12 is exactly
-   what a compromised compositor can call. The jail removes everything around it, not the
-   ioctls themselves. So that subset is fuzzed with reached-coverage, as §4.7b does for the
-   validator (P2 below).
-2. **It still sees every window's pixels and routes input.** A compositor is cross-client
-   by job description. Two things follow.
-   - **Secure input** stays out of the compositor's reach, or at least has its own path:
-     password fields and the origin indicator (§2.11). The UI process sends keystrokes for
-     a password field directly to the broker's request builder (§6.4), never through a
-     surface the compositor could log.
-   - **Trusted chrome** is drawn by a separate surface that the broker composes on top,
-     so a compromised compositor cannot paint a fake origin.
+**What still holds from the earlier draft.** The compositor sees every window's pixels and
+routes input, because that is its job.
+- **Secure input:** keystrokes for password fields go from the UI to the broker's request
+  builder (§6.4), never through the compositor.
+- **Trusted chrome:** the origin indicator is drawn by the broker as a separate overlay
+  above the compositor's output, so a compromised compositor can't paint a fake origin.
 
-**Rating:** medium today (one process holds both authorities). With the split, low to
-medium, bounded by the client ioctl surface.
+**The cost, accepted.** The compositor can use the GPU only for what `bin` and `raster`
+do. For a 2D compositor that is the whole job, and it is already the compute route chosen
+for the display pipeline. Fonts follow §5 question 4: web fonts arrive as outlines.
+
+**Apps that need their own GPU work are out of scope here.** The user will design a
+separate architecture for them. Until then, today's rule stands: apps hold no `device_fd` in
+production, and they reach the GPU only through the broker's aqueduct-gpu protocol.
+
+**Rating:** low, bounded by two fuzzable kernels and a fixed-size header.
 
 **Also P2.**
-- Fuzz Fresco's own scene ingest, not only the broker's validator.
-- Fresco takes outlines for web fonts (§5, question 4).
-- The GPU stall recovery of GPU ABI §10.1–10.3 means a scene that hangs the GPU costs a
-  reset, not the machine.
+- Fuzz the compositor's scene ingest.
+- Differential-fuzz `bin`/`raster` against the CPU reference.
+- Remove the GPU device node from the compositor's jail entirely, through its devfs
+  ruleset.
 
 ### 2.6 The shared store — conversions in Tessera CAS (A5)
 
@@ -356,7 +355,7 @@ These belong in the model because they are *wins*, not because they need work:
 | P1 | Decide where images decode: per-document jail, memory-safe decoders, never in Fresco | A1 via decoders | design and medium code | §2.4 |
 | P1 | Per-user dedup domain by default; reproduce-to-share | A5 poisoning | design now, code with sharing | §2.6 |
 | P2 | `rctl` memory/CPU limits on converter and worker jails; per-conversion byte budget | A6 | small | §2.2 |
-| P1 | Split frescod: jailed compositor with a client `device_fd`, tiny broker holding control and display; secure-input path | A1 against the shared compositor | medium | §2.5.1 |
+| P1 | Split frescod: jailed compositor with **no GPU fd** writes a shared scene buffer; the broker runs only our `bin`/`raster` kernels; secure-input path | A1 against the shared compositor and the driver | medium | §2.5.1 |
 | P2 | Fuzz Fresco scene ingest and the GPU ioctl surface; Fresco takes outlines, not fonts | A1 against the shared compositor | medium | §2.5 |
 | P2 | Broker rules for replayed request templates | A3, CSRF | design-time, with §5.4.5 | §2.7 |
 | P2 | Unobscured-input rule for islands; bhyve for the CDM | A2 clickjacking, kernel surface | medium, with §8.1 | §2.9 |
