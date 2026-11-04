@@ -17,7 +17,7 @@ use navigator_style::cascade::{cascade, Env, Style};
 use navigator_style::sheet::{parse_sheet, Diagnostic, Stylesheet};
 use navigator_style::token::Pos;
 use navigator_style::values::{Calc, Color, Rgba, Tf, V};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Rows (profile §3.3–§3.9) the layout READS. A non-initial value in any
 /// other row is counted as unimplemented on every element that has one —
@@ -194,6 +194,17 @@ struct Cx<'a> {
     /// Set by `flex` for the one `abs_box` call it makes: the static position
     /// of an absolutely positioned child of a flex container.
     flex_static: Option<FlexStatic>,
+    /// ★ What `measure` has already worked out, keyed by everything its
+    /// answer depends on. A flex item is laid out twice — measured for its
+    /// cross size, then placed — and so is every item inside it: nested
+    /// flex containers cost 2^depth. Twenty of them (WPT's XHTML flexbox
+    /// tests, whose `<div/>`s nest when parsed as HTML) never finished.
+    /// The value is the height and the transient fields the trial left
+    /// behind, so a hit leaves the context exactly as a miss would.
+    /// A fresh baseline probe is part of the key and its result part of
+    /// the value: an atomic inline is probed for its baseline, measured and
+    /// placed, three layouts a level.
+    measured: HashMap<(Handle, U, Option<U>, Option<U>, Option<U>, Option<U>, u32, bool, bool), (U, Option<U>, bool, U, Option<Option<U>>)>,
     /// Stacking contexts, as ranges of `scene.order`, pushed when the box
     /// that opened one finishes painting (so: post-order).
     contexts: Vec<(i64, usize, usize, usize)>,
@@ -241,7 +252,7 @@ pub fn render_html_with(html: &str, fonts: &FontSet, env: &Env, subs: &Subresour
     let mut cx = Cx { dom: &dom, styles: &styled.styles, sh: Shaper::new(fonts), scene: Scene { width: u(env.width_px), ..Default::default() },
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]),
                       viewport: (u(env.width_px), Some(u(env.height_px))), pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))),
-                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
+                      subs, placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![] };
     cx.promoted = promote_block_in_inline(&dom, &styled.styles);
     cx.count_unread_rows();
     // The root element is the initial containing block's only child.
@@ -306,7 +317,7 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
                       report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None, baseline_probe: None,
                       indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]), viewport: (u(env.width_px), Some(u(env.height_px))),
                       pos_cb: (0, 0, u(env.width_px), Some(u(env.height_px))), subs: &Subresources::new(),
-                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
+                      placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![] };
     // (table, per-column (min, max), its first row's cells) for every table.
     let mut tables: Vec<(Handle, Vec<(U, U)>, Vec<Handle>)> = vec![];
     for t in 0..dom.nodes.len() as Handle {
@@ -1456,6 +1467,20 @@ impl<'a> Cx<'a> {
     }
 
     fn measure(&mut self, h: Handle, cb_w: U, cb_h: Option<U>, force: (Option<U>, Option<U>)) -> U {
+        // A trial with a side channel open — a list marker waiting for its
+        // line, an out-of-flow box being placed, a content offset, a static
+        // position — is not memoized; nor read from it.
+        let probing = self.baseline_probe == Some(None);
+        let key = (h, cb_w, cb_h, force.0, force.1, self.indent, self.iso_cur, self.table_part, probing);
+        let pure = self.marker.is_none() && !self.placing_abs
+            && self.abs_origin.is_none() && self.content_dy == 0 && self.flex_static.is_none();
+        if pure {
+            if let Some(&(v, indent, part, dy, probe)) = self.measured.get(&key) {
+                (self.indent, self.table_part, self.content_dy) = (indent, part, dy);
+                if probing { self.baseline_probe = probe }
+                return v;
+            }
+        }
         let (o, r, n, l) = (self.scene.order.len(), self.scene.rects.len(), self.scene.runs.len(), self.scene.links.len());
         // ★ Every node kind, not just the three that existed when this was
         // written. `order` alone being rolled back hides it — the scene
@@ -1486,6 +1511,7 @@ impl<'a> Cx<'a> {
         self.diagnostics.truncate(diags);
         self.links.truncate(links); self.unimplemented = counts; self.marker = marker; self.report = report;
         self.contexts.truncate(ctx); self.hoists.truncate(hoi);
+        if pure { self.measured.insert(key, (hgt, self.indent, self.table_part, self.content_dy, self.baseline_probe)); }
         hgt
     }
 
@@ -4297,7 +4323,7 @@ mod tests {
                           report: Report::default(), links: vec![], unimplemented: BTreeMap::new(), marker: None,
                           baseline_probe: None, indent: None, iso_paths: vec![vec![]], iso_cur: 0, content_dy: 0, table_part: false, promoted: vec![], boxes: std::env::var_os("NSG_DUMP_BOXES").map(|_| vec![]),
                           viewport: (0, None), pos_cb: (0, 0, 0, None), subs: &Subresources::new(),
-                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, contexts: vec![], hoists: vec![], diagnostics: vec![] };
+                          placing_abs: false, pending_abs: vec![], deferred_abs: vec![], cb_open: false, canvas_src: None, abs_origin: None, flex_static: None, measured: HashMap::new(), contexts: vec![], hoists: vec![], diagnostics: vec![] };
         cx.count_rows_outside(&held_out);
         // The non-initial value is counted once; the initial one is not.
         assert_eq!(cx.unimplemented.get("row text-align… (not implemented)"), Some(&1), "{:?}", cx.unimplemented);
@@ -4479,6 +4505,25 @@ mod tests {
             <div class="g"><div class="a"></div><div class="b"></div></div>"#);
         assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 200, 10)]);
         assert_eq!(boxes(&o, 0x00ff00ff), vec![(100, 10, 200, 10)]);
+    }
+
+    /// ★ A flex item is laid out twice — measured, then placed — so
+    /// without `measure` remembering its answers, flex items nested in flex
+    /// items cost 2^depth: 22 levels took 14 s, and WPT's XHTML flexbox
+    /// tests (27 levels once `<div/>` nests) never finished.
+    #[test]
+    fn nested_flex_items_are_not_laid_out_exponentially() {
+        let n = 24;
+        let src = format!(r#"<style>body {{ margin-left: 0px; margin-top: 0px }}
+            .f {{ display: flex; width: 200px }} .a {{ height: 10px; flex-basis: 10px; padding-left: 1px }}
+            .z {{ width: 5px; height: 5px; background-color: #ff0000 }}</style>{}<div class="z"></div>{}"#,
+            r#"<div class="f"><div class="a">"#.repeat(n), "</div></div>".repeat(n));
+        let t = std::time::Instant::now();
+        let o = render(&src);
+        let spent = t.elapsed();
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        assert_eq!(boxes(&o, 0xff0000ff)[0].0, n as U, "each level's padding moves it 1 px");
+        assert!(spent < std::time::Duration::from_secs(2), "{n} nested flex items took {spent:?}");
     }
 
     /// ★ A `calc()` with no percentage in it is a DEFINITE length to
