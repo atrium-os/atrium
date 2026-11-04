@@ -16,6 +16,9 @@ blake3 = { version = "1", features = ["pure"] }
 swash = { version = "0.1", optional = true }
 png = { version = "0.17", optional = true }
 unicode-bidi = "0.3.18"
+# UAX #14 line breaking. Dictionary data only (no `auto`/LSTM): the LSTM
+# runs in floating point, and a render must be byte-identical across ISAs.
+icu_segmenter = { version = "2.3", default-features = false, features = ["compiled_data"] }
 
 [features]
 raster = ["dep:swash", "dep:png"]

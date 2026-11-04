@@ -2280,17 +2280,25 @@ impl<'a> Cx<'a> {
                 if !run.is_empty() { out.push(Item::Word(run, st, line)) }
             }
             _ => {
+                // ★ A space is not the only break opportunity: CJK breaks
+                // between ideographs, and Thai, Lao, Khmer and Myanmar
+                // between words they do not space (UAX #14). Split only at
+                // spaces, a Chinese paragraph was ONE word and ran off the
+                // canvas. Each segment is its own Word; adjacent Words wrap.
+                let push = |out: &mut Vec<Item>, word: String| {
+                    for seg in uax14_segments(&word) { out.push(Item::Word(seg.to_string(), st.clone(), line)) }
+                };
                 let mut word = String::new();
                 for ch in t.chars() {
                     if ch.is_whitespace() {
-                        if !word.is_empty() { out.push(Item::Word(std::mem::take(&mut word), st.clone(), line)) }
+                        if !word.is_empty() { push(out, std::mem::take(&mut word)) }
                         // Collapse: at most one space, never at a line start.
                         if !matches!(out.last(), Some(Item::Space(..)) | Some(Item::Break) | None) {
                             out.push(Item::Space(st.clone(), line))
                         }
                     } else { word.push(ch) }
                 }
-                if !word.is_empty() { out.push(Item::Word(word, st, line)) }
+                if !word.is_empty() { push(out, word) }
             }
         }
     }
@@ -2957,6 +2965,25 @@ mod tests {
         let (t, l) = (boxes(&o, 0xff0000ff), boxes(&o, 0x00ff00ff));
         assert_eq!((t[0].0, t[0].2), (10, 100 + 10 + 300), "the inner title spans the inner table's columns");
         assert_eq!((l[0].0, l[0].2), (10, 100));
+    }
+
+    /// ★ UAX #14. CJK breaks between ideographs (punctuation stays with
+    /// what it closes), Thai between dictionary words, and a Latin run is
+    /// left alone.
+    #[test]
+    fn unspaced_scripts_break_between_words() {
+        assert_eq!(uax14_segments("北京四季分明，春秋"), ["北", "京", "四", "季", "分", "明，", "春", "秋"]);
+        assert_eq!(uax14_segments("สวัสดีครับ"), ["สวัสดี", "ครับ"]);
+        assert_eq!(uax14_segments("well-known/path"), ["well-known/path"]);
+        assert_eq!(uax14_segments("2019年PM2.5"), ["2019", "年", "PM2.5"]);
+        // And in layout: a paragraph with no spaces wraps INSIDE its box.
+        let o = render(&format!(r#"<style>body {{ margin-left: 0px; margin-top: 0px }} div {{ width: 200px }}</style><div>{}</div>"#, "北京四季分明".repeat(10)));
+        let mut ys: Vec<U> = o.scene.runs.iter().map(|r| r.y).collect();
+        ys.sort();
+        ys.dedup();
+        assert!(ys.len() >= 3, "sixty ideographs in 200 px take several lines: {}", ys.len());
+        assert!(o.scene.runs.iter().all(|r| r.x < 200 * PX), "nothing starts past the box");
+        assert_eq!(o.report.overflow_lines, 0, "no line overflows");
     }
 
     #[test]
@@ -3827,6 +3854,32 @@ fn resolve_stops(stops: &[navigator_style::values::Stop], s: &Style) -> Vec<(u32
 }
 
 /// Right-to-left by Unicode bidi class: what makes a line need reordering.
+/// A space-free run split at its UAX #14 break opportunities. Only a run
+/// with a character from a script that breaks WITHOUT spaces is segmented —
+/// CJK ideographs and symbols, kana, Hangul, and the Southeast Asian scripts
+/// (whose word boundaries come from ICU4X's dictionaries, integer data, so a
+/// render stays byte-identical across ISAs). Latin runs keep breaking at
+/// spaces only, as before.
+fn uax14_segments(word: &str) -> Vec<&str> {
+    let unspaced = |c: char| matches!(c as u32,
+        0x0E00..=0x0EFF | 0x1000..=0x109F | 0x1100..=0x11FF | 0x1780..=0x17FF
+        | 0x2E80..=0x2FFF | 0x3000..=0x303F | 0x3040..=0x30FF | 0x3130..=0x318F | 0x31F0..=0x31FF
+        | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF
+        | 0x20000..=0x3FFFF);
+    if !word.chars().any(unspaced) { return vec![word] }
+    let mut opts = icu_segmenter::options::LineBreakOptions::default();
+    // CSS `line-break: auto` is the normal rule set, not ICU's strict default.
+    opts.strictness = Some(icu_segmenter::options::LineBreakStrictness::Normal);
+    let seg = icu_segmenter::LineSegmenter::new_dictionary(opts);
+    let mut out = vec![];
+    let mut last = 0;
+    for b in seg.segment_str(word) {
+        if b > last { out.push(&word[last..b]); last = b }
+    }
+    if last < word.len() { out.push(&word[last..]) }
+    out
+}
+
 fn is_rtl(c: char) -> bool {
     matches!(unicode_bidi::bidi_class(c), unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL)
 }
