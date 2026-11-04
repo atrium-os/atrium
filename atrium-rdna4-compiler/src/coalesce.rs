@@ -172,6 +172,10 @@ pub fn merge(mi: &mut Vec<MI>, vregs: &[VRegInfo]) {
                     ren(sdst);
                     soff.iter_mut().for_each(ren);
                 }
+                MI::Scratch { vdst, data, .. } => {
+                    vdst.iter_mut().for_each(ren);
+                    data.iter_mut().for_each(ren);
+                }
                 _ => {}
             }
         }

@@ -58,7 +58,9 @@ fn bytes(w: &[u32]) -> Vec<u8> {
 /// One kernel over the frame's buffers, `expect` naming the checked
 /// binding and its expected contents.
 fn case(name: &str, spv: &[u8], init: Vec<Vec<u8>>, groups: [u32; 3], expect: (u32, Vec<u8>)) -> Option<Case> {
-    let k = atrium_rdna4::Kernel::from_spirv(spv, &atrium_rdna4::Options::default()).ok()?;
+    let opts = atrium_rdna4::Options { max_vgprs: Some(crate::cases::cap()), ..Default::default() };
+    let k = atrium_rdna4::Kernel::from_spirv(spv, &opts).ok()?;
+    let (ring, ring_buf) = crate::cases::scratch_ring(k.bin.scratch_dwords);
     let mut buffers = vec![];
     let mut bind = vec![];
     for (i, (set, b)) in k.buffers().iter().enumerate() {
@@ -78,11 +80,12 @@ fn case(name: &str, spv: &[u8], init: Vec<Vec<u8>>, groups: [u32; 3], expect: (u
     }
     let mut ib = Blob::compute();
     ib.acquire_all();
-    emit_dispatch(&mut ib, &k.dispatch(CODE_VA, &bind, None, groups).ok()?);
+    emit_dispatch(&mut ib, &k.dispatch_with(CODE_VA, &bind, None, groups, ring.map(|r| (r.va, r.waves))).ok()?);
     ib.pad(8);
     let code: Vec<u32> = k.code().chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
     let (code, ib_off, ib_dw) = code_buffer(&code, &ib);
     buffers.insert(0, code);
+    buffers.extend(ring_buf);
     Some(Case { name: name.into(), buffers, ib: ("code".into(), ib_off, ib_dw), ip: "compute" })
 }
 

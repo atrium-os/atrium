@@ -21,7 +21,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-pub use atrium_rdna4_cmd::{Blob, Dispatch};
+pub use atrium_rdna4_cmd::{Blob, Dispatch, Scratch};
 pub use atrium_rdna4_compiler::{Abi, Binary};
 
 /// Why a kernel could not be built or recorded.
@@ -52,6 +52,8 @@ pub struct Options {
     pub entry: usize,
     /// Spec-constant overrides (SpecId → value bits).
     pub spec_overrides: std::collections::HashMap<u32, u32>,
+    /// VGPR budget (default 256); values beyond it spill to scratch.
+    pub max_vgprs: Option<u32>,
 }
 
 /// A compiled compute kernel.
@@ -74,7 +76,8 @@ impl Kernel {
         let mut g = atrium_gir::build::build(&m, opts.entry).map_err(|e| Error::Gir(format!("{e:?}")))?;
         atrium_gir::passes::optimize(&mut g);
         atrium_gir::verify::verify(&g).map_err(|e| Error::Gir(format!("{e:?}")))?;
-        let bin = atrium_rdna4_compiler::compile(&g).map_err(|e| Error::Compile(format!("{e:?}")))?;
+        let co = atrium_rdna4_compiler::Options { max_vgprs: opts.max_vgprs.unwrap_or(256) };
+        let bin = atrium_rdna4_compiler::compile_with(&g, &co).map_err(|e| Error::Compile(format!("{e:?}")))?;
         Ok(Kernel { name: g.name.clone(), bin })
     }
 
@@ -99,10 +102,30 @@ impl Kernel {
         self.bin.local_size
     }
 
+    /// Scratch bytes per wave the kernel needs (0: none). A ring of
+    /// `waves` such slots is passed to [`Kernel::dispatch_with`].
+    pub fn scratch_wave_bytes(&self) -> u32 {
+        if self.bin.scratch_dwords == 0 { 0 } else { Scratch::wave_bytes(self.bin.scratch_dwords, 32) }
+    }
+
     /// The dispatch for `groups` workgroups, with `buffers` mapping each
     /// (set, binding) the kernel uses to its GPU address and `push_va` the
     /// address of the push-constant block. Extra buffers are ignored.
+    /// Kernels that spill need [`Kernel::dispatch_with`].
     pub fn dispatch(&self, code_va: u64, buffers: &[((u32, u32), u64)], push_va: Option<u64>, groups: [u32; 3]) -> Result<Dispatch, Error> {
+        self.dispatch_with(code_va, buffers, push_va, groups, None)
+    }
+
+    /// [`Kernel::dispatch`] with a scratch ring of `waves` slots at
+    /// `scratch_va` (256-byte aligned, [`Kernel::scratch_wave_bytes`] ×
+    /// `waves` bytes), required when the kernel spills.
+    pub fn dispatch_with(&self, code_va: u64, buffers: &[((u32, u32), u64)], push_va: Option<u64>, groups: [u32; 3], scratch: Option<(u64, u32)>) -> Result<Dispatch, Error> {
+        let wave_bytes = self.scratch_wave_bytes();
+        let scratch = match (wave_bytes, scratch) {
+            (0, _) => None,
+            (_, Some((va, waves))) => Some(Scratch { va, wave_bytes, waves }),
+            (_, None) => return Err(Error::Binding(format!("kernel spills ({} dwords per lane) but no scratch ring was given", self.bin.scratch_dwords))),
+        };
         if code_va % CODE_ALIGN != 0 {
             return Err(Error::Binding(format!("code address {code_va:#x} is not {CODE_ALIGN}-byte aligned")));
         }
@@ -123,6 +146,7 @@ impl Kernel {
             groups,
             wave32: true,
             lds_bytes: self.bin.lds_bytes,
+            scratch,
         })
     }
 

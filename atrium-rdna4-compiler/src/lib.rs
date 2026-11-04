@@ -17,6 +17,7 @@ pub mod emit;
 pub mod isel;
 pub mod mir;
 pub mod regalloc;
+pub mod spill;
 
 use atrium_gir::Function;
 
@@ -74,10 +75,32 @@ pub struct Binary {
     pub local_size: [u32; 3],
     /// Workgroup-shared memory (LDS) in bytes.
     pub lds_bytes: u32,
+    /// Scratch (spill) space per lane, in dwords; 0 = the dispatch needs
+    /// no scratch.
+    pub scratch_dwords: u32,
+}
+
+/// Compile options.
+#[derive(Debug, Clone)]
+pub struct Options {
+    /// VGPR budget per lane (at most 256). Values that do not fit are
+    /// spilled to scratch.
+    pub max_vgprs: u32,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options { max_vgprs: 256 }
+    }
 }
 
 /// Compile an optimised GIR kernel.
 pub fn compile(f: &Function) -> Result<Binary, Error> {
+    compile_with(f, &Options::default())
+}
+
+/// [`compile`] with options.
+pub fn compile_with(f: &Function, o: &Options) -> Result<Binary, Error> {
     atrium_gir::verify::verify(f).map_err(|e| Error::Internal(format!("invalid GIR: {e:?}")))?;
     if f.workgroup_bytes > 64 * 1024 {
         return Err(Error::Unsupported("more than 64 KiB of workgroup memory".into()));
@@ -91,9 +114,9 @@ pub fn compile(f: &Function) -> Result<Binary, Error> {
     is.run()?;
     coalesce::run(&mut is.mi, &is.vregs);
     coalesce::merge(&mut is.mi, &is.vregs);
-    let asg = regalloc::allocate(&is.mi, &is.vregs, 1, abi.user_sgprs())?;
+    let (asg, scratch_dwords) = spill::allocate(&mut is.mi, &mut is.vregs, 1, abi.user_sgprs(), o.max_vgprs.min(256))?;
     let code = emit::emit(&is.mi, &is.vregs, &asg);
-    Ok(Binary { code, vgprs: asg.vgprs, sgprs: asg.sgprs, abi, local_size: f.local_size, lds_bytes: f.workgroup_bytes })
+    Ok(Binary { code, vgprs: asg.vgprs, sgprs: asg.sgprs, abi, local_size: f.local_size, lds_bytes: f.workgroup_bytes, scratch_dwords })
 }
 
 /// Disassembly-style listing (instruction names per decoded word group).

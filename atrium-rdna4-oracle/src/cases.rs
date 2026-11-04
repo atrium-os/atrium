@@ -44,6 +44,7 @@ pub fn write_42() -> Case {
         groups: [1, 1, 1],
         wave32: true,
         lds_bytes: 0,
+        scratch: None,
     });
     ib.pad(8);
 
@@ -76,6 +77,53 @@ pub(crate) fn code_buffer(shader: &[u32], ib: &Blob) -> (Buffer, u64, u64) {
     (Buffer { name: "code".into(), va: CODE_VA, size, init: code, expect: None, unordered: None }, ib_off as u64, ib.dw.len() as u64)
 }
 
+// ------------------------------------------------------------ spilling ---
+//
+// Every compiled case can be rebuilt with a low VGPR cap, which forces the
+// compiler to spill to scratch; the expected outputs stay the same.
+
+thread_local! {
+    static CAP: std::cell::Cell<u32> = const { std::cell::Cell::new(256) };
+}
+
+/// VGPR cap of the spill variants.
+pub const SPILL_CAP: u32 = 16;
+
+/// Run `f` with the compile cap at `cap` VGPRs.
+pub fn with_cap<T>(cap: u32, f: impl FnOnce() -> T) -> T {
+    let old = CAP.with(|c| c.replace(cap));
+    let r = f();
+    CAP.with(|c| c.set(old));
+    r
+}
+
+/// The current compile cap.
+pub(crate) fn cap() -> u32 {
+    CAP.with(|c| c.get())
+}
+
+/// Compile under the current cap.
+pub(crate) fn compile(g: &atrium_gir::Function) -> Result<atrium_rdna4_compiler::Binary, atrium_rdna4_compiler::Error> {
+    atrium_rdna4_compiler::compile_with(g, &atrium_rdna4_compiler::Options { max_vgprs: cap() })
+}
+
+/// GPU address of the scratch ring (above every data slot).
+pub const SCRATCH_VA: u64 = 0x1_1000_0000;
+/// Wave slots in the scratch ring; the SPI holds back waves beyond them.
+pub const SCRATCH_WAVES: u32 = 64;
+
+/// The scratch ring for `dwords` per lane, if any: the dispatch field and
+/// its buffer. The buffer is 4x the ring in case WAVES counts per shader
+/// engine (not yet pinned on the R9700).
+pub(crate) fn scratch_ring(dwords: u32) -> (Option<atrium_rdna4_cmd::Scratch>, Option<Buffer>) {
+    if dwords == 0 {
+        return (None, None);
+    }
+    let s = atrium_rdna4_cmd::Scratch { va: SCRATCH_VA, wave_bytes: atrium_rdna4_cmd::Scratch::wave_bytes(dwords, 32), waves: SCRATCH_WAVES };
+    let b = Buffer { name: "scratch".into(), va: SCRATCH_VA, size: (4 * s.bytes()).next_multiple_of(0x1000), init: vec![], expect: None, unordered: None };
+    (Some(s), Some(b))
+}
+
 /// GPU address of data buffer `i` (1 MiB apart).
 pub(crate) fn data_va(i: usize) -> u64 {
     DATA_VA + (i as u64) * 0x10_0000
@@ -105,7 +153,8 @@ pub fn desktop(name: &str, spv: &str, nodes: u32, record: u32) -> Option<Case> {
     let mut g = atrium_gir::build::build(&m, 0).expect("gir");
     atrium_gir::passes::optimize(&mut g);
     atrium_gir::verify::verify(&g).expect("verify");
-    let bin = atrium_rdna4_compiler::compile(&g).expect("rdna4 compile");
+    let bin = compile(&g).expect("rdna4 compile");
+    let (ring, ring_buf) = scratch_ring(bin.scratch_dwords);
 
     // Inputs: scene = node count + 64 bytes per node of floats; glyph runs
     // get small glyph counts and offsets into a glyph buffer.
@@ -141,7 +190,7 @@ pub fn desktop(name: &str, spv: &str, nodes: u32, record: u32) -> Option<Case> {
     }
     let mut ib = Blob::compute();
     ib.acquire_all();
-    emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs: bin.vgprs, user_sgprs: user, threads: bin.local_size, groups: [groups, 1, 1], wave32: true, lds_bytes: bin.lds_bytes });
+    emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs: bin.vgprs, user_sgprs: user, threads: bin.local_size, groups: [groups, 1, 1], wave32: true, lds_bytes: bin.lds_bytes, scratch: ring });
     ib.pad(8);
     let (code, ib_off, ib_dw) = code_buffer(&bin.code, &ib);
 
@@ -159,6 +208,7 @@ pub fn desktop(name: &str, spv: &str, nodes: u32, record: u32) -> Option<Case> {
             expect: Some(out),
         });
     }
+    buffers.extend(ring_buf);
     Some(Case { name: name.into(), buffers, ib: ("code".into(), ib_off, ib_dw), ip: "compute" })
 }
 
@@ -181,7 +231,8 @@ pub fn tierb(name: &str) -> Option<Case> {
     atrium_gir::passes::optimize(&mut g);
     // A GIR type error is a compiler bug, not an unsupported example.
     atrium_gir::verify::verify(&g).unwrap_or_else(|e| panic!("{name}: {e:?}"));
-    let bin = atrium_rdna4_compiler::compile(&g).ok()?;
+    let bin = compile(&g).ok()?;
+    let (ring, ring_buf) = scratch_ring(bin.scratch_dwords);
     let fill = |k: u32| -> Vec<u8> { (0..words).flat_map(|i| (i % 7 + k).to_le_bytes()).collect() };
     let mut ib_bufs: interp::Buffers = g.buffers.iter().map(|&(s, b)| ((s, b), fill(b + 1))).collect();
     // Push constants: small distinct integers (3, 4, 5, ...).
@@ -212,10 +263,11 @@ pub fn tierb(name: &str) -> Option<Case> {
     }
     let mut ib = Blob::compute();
     ib.acquire_all();
-    emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs: bin.vgprs, user_sgprs: user, threads: bin.local_size, groups: [1, 1, 1], wave32: true, lds_bytes: bin.lds_bytes });
+    emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs: bin.vgprs, user_sgprs: user, threads: bin.local_size, groups: [1, 1, 1], wave32: true, lds_bytes: bin.lds_bytes, scratch: ring });
     ib.pad(8);
     let (code, ib_off, ib_dw) = code_buffer(&bin.code, &ib);
     buffers.insert(0, code);
+    buffers.extend(ring_buf);
     Some(Case { name: format!("tierb_{name}"), buffers, ib: ("code".into(), ib_off, ib_dw), ip: "compute" })
 }
 
@@ -248,7 +300,31 @@ pub fn all() -> Vec<Case> {
     v.extend(crate::fresco::bin());
     v.extend(crate::fresco::raster());
     v.extend(crate::fresco::frame());
+    v.extend(spilled());
     v
+}
+
+/// Every compiled case again at [`SPILL_CAP`] VGPRs, where that makes the
+/// compiler spill: named `spill_<case>`, same expected outputs.
+pub fn spilled() -> Vec<Case> {
+    with_cap(SPILL_CAP, || {
+        let mut v = vec![];
+        for (n, p, rec) in DESKTOP {
+            v.extend(desktop(n, p, 100, rec));
+        }
+        for t in TIERB {
+            v.extend(tierb(t));
+        }
+        v.extend(crate::fresco::bin());
+        v.extend(crate::fresco::raster());
+        v.into_iter()
+            .filter(|c| c.buffers.iter().any(|b| b.name == "scratch"))
+            .map(|mut c| {
+                c.name = format!("spill_{}", c.name);
+                c
+            })
+            .collect()
+    })
 }
 
 // ------------------------------------------------------------ calibration ---
@@ -280,7 +356,7 @@ fn one_lane_case(name: String, sh: Vec<u32>, vgprs: u32, wave32: bool, rsrc2_ext
     let user = vec![DATA_VA as u32, (DATA_VA >> 32) as u32];
     let mut ib = Blob::compute();
     ib.acquire_all();
-    emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs, user_sgprs: user.clone(), threads: [1, 1, 1], groups: [1, 1, 1], wave32, lds_bytes: 0 });
+    emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs, user_sgprs: user.clone(), threads: [1, 1, 1], groups: [1, 1, 1], wave32, lds_bytes: 0, scratch: None });
     if rsrc2_extra != 0 {
         // Re-issue RSRC2 just before the DISPATCH_DIRECT (header + 4 dwords).
         let n = ib.dw.len();

@@ -164,6 +164,38 @@ pub struct Dispatch {
     pub wave32: bool,
     /// Workgroup-shared memory (LDS) per workgroup, in bytes.
     pub lds_bytes: u32,
+    /// Scratch (register spill) memory, if the shader needs any.
+    pub scratch: Option<Scratch>,
+}
+
+/// A scratch ring: `waves` slots of `wave_bytes` each, from `va`. The SPI
+/// gives each launched wave a slot as its SCRATCH_BASE (RDNA4 ISA guide
+/// §3.4.8) and holds back waves while all slots are taken, so `waves`
+/// bounds concurrency, not the dispatch size.
+#[derive(Debug, Clone, Copy)]
+pub struct Scratch {
+    /// GPU VA of the ring; 256-byte aligned.
+    pub va: u64,
+    /// Bytes per wave: dwords per lane × 4 × lanes, rounded up to
+    /// [`SCRATCH_WAVE_UNIT`].
+    pub wave_bytes: u32,
+    /// Wave slots in the ring (at most 4095).
+    pub waves: u32,
+}
+
+/// Bytes per COMPUTE_TMPRING_SIZE.WAVESIZE step: the 64-dword scratch
+/// granularity of the RDNA4 ISA guide §3.3.6. To be pinned on the R9700.
+pub const SCRATCH_WAVE_UNIT: u32 = 256;
+
+impl Scratch {
+    /// Bytes per wave for `dwords_per_lane` of scratch at `lanes` per wave.
+    pub fn wave_bytes(dwords_per_lane: u32, lanes: u32) -> u32 {
+        (dwords_per_lane * 4 * lanes).next_multiple_of(SCRATCH_WAVE_UNIT)
+    }
+    /// Ring size in bytes.
+    pub fn bytes(&self) -> u64 {
+        self.wave_bytes as u64 * self.waves as u64
+    }
 }
 
 /// Bytes per COMPUTE_PGM_RSRC2.LDS_SIZE step, measured on the R9700
@@ -193,13 +225,27 @@ pub fn emit_dispatch(b: &mut Blob, d: &Dispatch) {
         | compute_pgm_rsrc2::TGID_X_EN_MASK
         | compute_pgm_rsrc2::TGID_Y_EN_MASK
         | compute_pgm_rsrc2::TGID_Z_EN_MASK
-        | (d.lds_bytes.div_ceil(LDS_SIZE_UNIT) << compute_pgm_rsrc2::LDS_SIZE_SHIFT);
+        | (d.lds_bytes.div_ceil(LDS_SIZE_UNIT) << compute_pgm_rsrc2::LDS_SIZE_SHIFT)
+        | if d.scratch.is_some() { compute_pgm_rsrc2::SCRATCH_EN_MASK } else { 0 };
     assert!(d.lds_bytes <= 64 * 1024, "LDS is 64 KiB per workgroup");
     b.set_sh(COMPUTE_PGM_LO, &[(d.shader_va >> 8) as u32, (d.shader_va >> 40) as u32]);
     b.set_sh(COMPUTE_PGM_RSRC1, &[rsrc1, rsrc2]);
     b.set_sh(COMPUTE_PGM_RSRC3, &[0]);
     b.set_sh(COMPUTE_RESOURCE_LIMITS, &[0]);
-    b.set_sh(COMPUTE_TMPRING_SIZE, &[0]);
+    match d.scratch {
+        Some(s) => {
+            assert_eq!(s.va & 0xff, 0, "scratch VA must be 256-byte aligned");
+            assert_eq!(s.wave_bytes % SCRATCH_WAVE_UNIT, 0);
+            assert!((1..=0xfff).contains(&s.waves));
+            let size = (s.waves << compute_tmpring_size::WAVES_SHIFT)
+                | ((s.wave_bytes / SCRATCH_WAVE_UNIT) << compute_tmpring_size::WAVESIZE_SHIFT);
+            b.set_sh(COMPUTE_TMPRING_SIZE, &[size]);
+            b.set_sh(COMPUTE_DISPATCH_SCRATCH_BASE_LO, &[(s.va >> 8) as u32, (s.va >> 40) as u32 & 0xff]);
+        }
+        None => {
+            b.set_sh(COMPUTE_TMPRING_SIZE, &[0]);
+        }
+    }
     // All CUs on every shader engine.
     for se in [COMPUTE_STATIC_THREAD_MGMT_SE0, COMPUTE_STATIC_THREAD_MGMT_SE1,
                COMPUTE_STATIC_THREAD_MGMT_SE2, COMPUTE_STATIC_THREAD_MGMT_SE3] {

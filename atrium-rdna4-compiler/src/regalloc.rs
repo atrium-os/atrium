@@ -24,7 +24,25 @@ pub struct Assignment {
 pub fn allocate(mi: &[MI], vregs: &[VRegInfo], v_first: u8, s_first: u8) -> Result<Assignment, Error> {
     let n = vregs.len();
     let (start, end) = intervals(mi, n);
-    assign(vregs, &start, &end, v_first, s_first)
+    assign(vregs, &start, &end, v_first, s_first, 256).map_err(|f| f.error())
+}
+
+/// Why assignment failed: register `reg` found no room while `active`
+/// were live.
+pub struct Failure {
+    /// The register that did not fit.
+    pub reg: usize,
+    /// Registers live at that point.
+    pub active: Vec<usize>,
+    /// Its class.
+    pub class: Class,
+}
+
+impl Failure {
+    /// As a compile error.
+    pub fn error(&self) -> Error {
+        Error::Unsupported(format!("out of {:?} registers", self.class))
+    }
 }
 
 /// Live interval `[start, end]` (instruction positions) of every virtual
@@ -71,7 +89,8 @@ pub fn intervals(mi: &[MI], n: usize) -> (Vec<usize>, Vec<usize>) {
     (start, end)
 }
 
-fn assign(vregs: &[VRegInfo], start: &[usize], end: &[usize], v_first: u8, s_first: u8) -> Result<Assignment, Error> {
+/// First-fit assignment over the intervals, with at most `v_limit` VGPRs.
+pub fn assign(vregs: &[VRegInfo], start: &[usize], end: &[usize], v_first: u8, s_first: u8, v_limit: u32) -> Result<Assignment, Failure> {
     let n = vregs.len();
     let mut order: Vec<usize> = (0..n).filter(|r| start[*r] != usize::MAX).collect();
     order.sort_by_key(|r| (start[*r], *r));
@@ -82,7 +101,7 @@ fn assign(vregs: &[VRegInfo], start: &[usize], end: &[usize], v_first: u8, s_fir
         active.retain(|a| end[*a] >= start[r]);
         let info = vregs[r];
         let (first, limit) = match info.class {
-            Class::V => (v_first as u32, 256u32),
+            Class::V => (v_first as u32, v_limit),
             Class::S => (s_first as u32, 106u32),
         };
         let busy = |base: u32| {
@@ -100,9 +119,9 @@ fn assign(vregs: &[VRegInfo], start: &[usize], end: &[usize], v_first: u8, s_fir
             (Class::S, n) if n > 2 => 4,
             _ => 1,
         };
-        let base = (first..=limit - info.size as u32).filter(|b| b % align == 0).find(|b| !busy(*b)).ok_or_else(|| {
-            Error::Unsupported(format!("out of {:?} registers (spilling not implemented)", info.class))
-        })?;
+        let Some(base) = (first..=limit.saturating_sub(info.size as u32)).filter(|b| b % align == 0).find(|b| !busy(*b)) else {
+            return Err(Failure { reg: r, active: active.clone(), class: info.class });
+        };
         phys[r] = base as u8;
         match info.class {
             Class::V => vmax = vmax.max(base + info.size as u32),

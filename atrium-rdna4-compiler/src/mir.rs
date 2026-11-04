@@ -111,6 +111,19 @@ pub enum MI {
         /// Immediate byte offset (0..=65535).
         off: u16,
     },
+    /// Scratch (per-lane private memory) access in ST mode: address =
+    /// the wave's SCRATCH_BASE + swizzle(`ioff`, lane) (RDNA4 ISA guide
+    /// §11.2). Register spills and reloads.
+    Scratch {
+        /// Instruction name.
+        name: &'static str,
+        /// Loaded data.
+        vdst: Option<O>,
+        /// Stored data.
+        data: Option<O>,
+        /// Byte offset into the lane's scratch space.
+        ioff: i32,
+    },
     /// Workgroup execution and LDS memory barrier.
     Barrier,
     /// Branch target.
@@ -179,8 +192,93 @@ impl MI {
                     r(x, &mut u);
                 }
             }
+            MI::Scratch { vdst, data, .. } => {
+                if let Some(x) = vdst {
+                    r(x, &mut d);
+                }
+                if let Some(x) = data {
+                    r(x, &mut u);
+                }
+            }
             _ => {}
         }
         (u, d)
+    }
+
+    /// Every register operand, mutably, each with whether it is a
+    /// definition and how many consecutive registers it covers.
+    pub fn operands_mut(&mut self) -> Vec<(&mut O, bool, u8)> {
+        fn width(name: &str) -> u8 {
+            if name.contains("ATOMIC") {
+                1
+            } else if name.ends_with("B128") {
+                4
+            } else if name.ends_with("B96") {
+                3
+            } else if name.ends_with("B64") {
+                2
+            } else {
+                1
+            }
+        }
+        let mut v: Vec<(&mut O, bool, u8)> = vec![];
+        match self {
+            MI::Valu { dst, sdst, src, .. } => {
+                v.push((dst, true, 1));
+                if let Some(s) = sdst {
+                    v.push((s, true, 1));
+                }
+                v.extend(src.iter_mut().map(|s| (s, false, 1)));
+            }
+            MI::Salu { dst, src, .. } => {
+                v.push((dst, true, 1));
+                v.extend(src.iter_mut().map(|s| (s, false, 1)));
+            }
+            MI::Global { name, vdst, vaddr, data, .. } => {
+                let w = width(name);
+                if let Some(x) = vdst {
+                    v.push((x, true, w));
+                }
+                v.push((vaddr, false, 1));
+                if let Some(x) = data {
+                    v.push((x, false, w));
+                }
+            }
+            MI::Ds { name, vdst, addr, data, .. } => {
+                let w = width(name);
+                if let Some(x) = vdst {
+                    v.push((x, true, w));
+                }
+                v.push((addr, false, 1));
+                if let Some(x) = data {
+                    v.push((x, false, w));
+                }
+            }
+            MI::Scratch { name, vdst, data, .. } => {
+                let w = width(name);
+                if let Some(x) = vdst {
+                    v.push((x, true, w));
+                }
+                if let Some(x) = data {
+                    v.push((x, false, w));
+                }
+            }
+            MI::Smem { name, sdst, soff, .. } => {
+                let w = match *name {
+                    "S_LOAD_B32" => 1,
+                    "S_LOAD_B64" => 2,
+                    "S_LOAD_B96" => 3,
+                    "S_LOAD_B128" => 4,
+                    "S_LOAD_B256" => 8,
+                    _ => 16,
+                };
+                v.push((sdst, true, w));
+                if let Some(x) = soff {
+                    v.push((x, false, 1));
+                }
+            }
+            _ => {}
+        }
+        v
     }
 }

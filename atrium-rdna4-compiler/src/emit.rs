@@ -331,6 +331,33 @@ impl<'a> E<'a> {
                 self.a.emit(name, "ENC_VDS", &f);
                 self.ds.push_back(dregs);
             }
+            MI::Scratch { name, vdst, data, ioff } => {
+                let w: u16 = if name.ends_with("B128") { 4 } else if name.ends_with("B96") { 3 } else if name.ends_with("B64") { 2 } else { 1 };
+                let mut touch = vec![];
+                if let Some(x) = data {
+                    touch.extend(self.regs(*x, w));
+                }
+                let dregs = vdst.map(|x| self.regs(x, w)).unwrap_or_default();
+                touch.extend(dregs.iter().copied());
+                self.wait_for(&touch);
+                // ST mode (RDNA4 ISA guide §11.2): SVE = 0, SADDR = NULL.
+                let mut f: Vec<(&str, u64)> = vec![
+                    ("SADDR", crate::asm::NULL as u64),
+                    ("SVE", 0),
+                    ("VADDR", 0),
+                    ("IOFFSET", (*ioff as u32 & 0xff_ffff) as u64),
+                ];
+                if let Some(x) = vdst {
+                    f.push(("VDST", (self.code(*x) - 256) as u64));
+                }
+                if let Some(x) = data {
+                    f.push(("VSRC", (self.code(*x) - 256) as u64));
+                }
+                self.a.emit(name, "ENC_VSCRATCH", &f);
+                if !dregs.is_empty() {
+                    self.loads.push_back(dregs);
+                }
+            }
             MI::Barrier => {
                 // LDS writes before the barrier are visible after it.
                 self.drain_ds();
