@@ -2657,6 +2657,12 @@ impl<'a> Cx<'a> {
         for c in if anon { vec![] } else { self.dom.children_of(h) } {
             if self.is_block_level(c) {
                 let Some(cs) = self.st(c) else { continue };
+                // ★ An out-of-flow box takes no part in its container's
+                // intrinsic sizes (CSS Sizing 3 §5). Counted, the Guardian's
+                // slideshow caption — `position: absolute; left: 0; right: 0`
+                // over the photo — set the carousel half's min-content at
+                // its one-line width, and a 50% flex half could not shrink.
+                if matches!(kw(cs, "position"), "absolute" | "fixed") { continue }
                 let px = |p: &str| len(cs.get(p), 0).unwrap_or(0);
                 // Border-box: a DEFINITE width already holds the padding and
                 // border; only the margins are outside it. Adding the frame
@@ -3828,6 +3834,23 @@ mod tests {
         assert_eq!(one(0xff0000ff).1, 80, "centred: 20 px above the container");
         assert_eq!(one(0x00ff00ff).1, 200, "flex-end: the overflow is at the start");
         assert_eq!(boxes(&o, 0x0000ffff).iter().map(|b| b.1).collect::<Vec<_>>(), [120, 240]);
+    }
+
+    /// ★ An absolutely positioned box is out of flow, and takes no part in
+    /// its container's min-content (CSS Sizing 3 §5): a caption laid over a
+    /// photo must not stop the photo's 50% flex half from shrinking to it.
+    #[test]
+    fn an_absolute_child_does_not_size_its_container() {
+        let src = r#"<style>body { margin-left: 0px; margin-top: 0px; margin-right: 0px }
+            .f { display: flex; width: 400px } .h { flex-basis: 50%; height: 10px; position: relative }
+            .a { background-color: #ff0000 } .b { background-color: #0000ff }
+            .c { position: absolute; left: 0px; right: 0px; bottom: 0px }</style>
+            <div class="f"><div class="h a"><div class="c">Pneumonoultramicroscopicsilicovolcanoconiosis-and-then-some-more</div></div><div class="h b">x</div></div>"#;
+        let o = render(src);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let one = |c: u32| boxes(&o, c)[0];
+        assert_eq!((one(0xff0000ff).0, one(0xff0000ff).2), (0, 200), "the half shrinks to its basis");
+        assert_eq!((one(0x0000ffff).0, one(0x0000ffff).2), (200, 200));
     }
 
     /// ★ Out-of-flow boxes written inside a line wait for that line box —
