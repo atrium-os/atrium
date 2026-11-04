@@ -1597,8 +1597,11 @@ impl<'a> Cx<'a> {
                           // min/max-width still hold: `max-width: 60rem;
                           // margin: 0 auto` in a column is the centred page
                           // column, and unclamped it was as wide as its text.
-                          let fit = self.intrinsic_outer_w(i.h, w).min((w - i.c_start - i.c_end).max(0));
+                          // A definite width is that width, room or not.
                           let cs = self.st(i.h);
+                          let definite = cs.is_some_and(|cs| len(cs.get("width"), w).is_some());
+                          let fit = self.intrinsic_outer_w(i.h, w);
+                          let fit = if definite { fit } else { fit.min((w - i.c_start - i.c_end).max(0)) };
                           let mx = cs.and_then(|cs| len(cs.get("max-width"), w)).unwrap_or(U::MAX);
                           let mn = cs.and_then(|cs| len(cs.get("min-width"), w)).unwrap_or(0);
                           fit.min(mx).max(mn)
@@ -3353,6 +3356,9 @@ mod tests {
         let w = boxes(&o, 0x00ffffff)[0];
         assert_eq!((w.0, w.2), (100, 200), "the max-width + margin: auto idiom centres a column item");
         assert_eq!(boxes(&o, 0x800000ff)[0].0, 80, "an overflowing line gives its auto margins nothing");
+        let d = render(r#"<style>body { margin-left: 0px; margin-top: 0px } .f { display: flex; flex-direction: column; width: 70px }
+            .b { width: 200px; height: 10px; background-color: #0000ff }</style><div class="f"><div class="b"></div></div>"#);
+        assert_eq!(boxes(&d, 0x0000ffff)[0].2, 200, "a definite width in a narrower column is that width, overflowing");
     }
 
     /// ★ In an rtl grid column line 1 is on the right, and an item's
