@@ -1284,3 +1284,23 @@ fn negative_grid_lines_are_numbers() {
     assert!(!report.dropped.keys().any(|k| k.contains("grid line name")), "{:?}", report.dropped);
     assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
 }
+
+/// ★ An item's grid line NAME is numbered against each media context's
+/// template, not only the base one: the Guardian's `grid-column: title`
+/// is lines 2-6 on a phone and 2-14 at 800px, and numbering it once put
+/// every section title in a third of the page.
+#[test]
+fn named_lines_are_numbered_in_every_media_context() {
+    let src = r#"<html><head><style>
+      .g { display: grid; grid-template-columns: [t-start] 10px [t-end] 10px 10px 10px }
+      @media (min-width: 500px) { .g { grid-template-columns: 10px [t-start] 10px 10px [t-end] 10px } }
+      .i { grid-column: t }
+    </style></head><body><div class="g"><div class="i">x</div></div></body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    let media = &out[out.find("@media").expect("a media rule")..];
+    let base = &out[..out.find("@media").unwrap()];
+    assert!(base.contains("grid-column-start: 1") && base.contains("grid-column-end: 2"), "{out}");
+    assert!(media.contains("grid-column-start: 2") && media.contains("grid-column-end: 4"), "the 500px template: {out}");
+    assert!(!report.dropped.keys().any(|k| k.contains("no parent template")), "{:?}", report.dropped);
+    assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+}

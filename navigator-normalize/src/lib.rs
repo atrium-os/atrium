@@ -1449,22 +1449,49 @@ fn named_line_pass(resolved: &mut BTreeMap<(Handle, String, String), BTreeMap<St
             Some(((*h, media.clone(), axis.to_string()), m))
         }).collect::<Vec<_>>())
         .collect();
-    let (mut placed, mut lost) = (0usize, 0usize);
-    for ((h, _, media), props) in resolved.iter_mut() {
+    // ★ A name set in the BASE context must also be numbered in every
+    // media context where the parent's template names its lines
+    // differently: the Guardian's `grid-column: title` is lines 2-6 of the
+    // phone template and 2-14 of the 800px one, and numbering it once put
+    // every section title in a third of the page.
+    let mut markers: Vec<(Handle, String, &'static str, Priority, String)> = vec![];
+    for ((h, st, media), props) in resolved.iter_mut() {
+        if !st.is_empty() { continue }
         for p in ["grid-column-start", "grid-column-end", "grid-row-start", "grid-row-end"] {
-            let Some((pri, name)) = props.remove(&format!("{p}-name-marker")) else { continue };
-            let axis = if p.starts_with("grid-column") { "grid-template-columns" } else { "grid-template-rows" };
-            let parent = dom.get(*h).and_then(|n| n.parent);
-            let map = parent.and_then(|q| maps.get(&(q, media.clone(), axis.to_string())).or_else(|| maps.get(&(q, String::new(), axis.to_string()))));
-            let side = if p.ends_with("start") { "-start" } else { "-end" };
-            let n = map.and_then(|m| m.get(&name).or_else(|| m.get(&format!("{name}{side}"))));
-            match n {
-                Some(n) => {
-                    if props.get(p).is_none_or(|(o, _)| *o <= pri) { props.insert(p.to_string(), (pri, n.to_string())); }
-                    placed += 1;
+            if let Some((pri, name)) = props.remove(&format!("{p}-name-marker")) { markers.push((*h, media.clone(), p, pri, name)) }
+        }
+    }
+    let own: std::collections::BTreeSet<(Handle, String, &'static str)> = markers.iter().map(|(h, m, p, _, _)| (*h, m.clone(), *p)).collect();
+    let mut want = vec![];
+    for (h, media, p, pri, name) in markers {
+        let axis = if p.starts_with("grid-column") { "grid-template-columns" } else { "grid-template-rows" };
+        let parent = dom.get(h).and_then(|n| n.parent);
+        if media.is_empty() {
+            if let Some(q) = parent {
+                for (qh, ctx, ax) in maps.keys() {
+                    if *qh == q && ax == axis && !ctx.is_empty() && !own.contains(&(h, ctx.clone(), p)) {
+                        want.push((h, ctx.clone(), p, pri, name.clone(), true));
+                    }
                 }
-                None => lost += 1,
             }
+        }
+        want.push((h, media, p, pri, name, false));
+    }
+    let (mut placed, mut lost) = (0usize, 0usize);
+    for (h, media, p, pri, name, extra) in want {
+        let axis = if p.starts_with("grid-column") { "grid-template-columns" } else { "grid-template-rows" };
+        let parent = dom.get(h).and_then(|n| n.parent);
+        let map = parent.and_then(|q| maps.get(&(q, media.clone(), axis.to_string())).or_else(|| maps.get(&(q, String::new(), axis.to_string()))));
+        let side = if p.ends_with("start") { "-start" } else { "-end" };
+        let n = map.and_then(|m| m.get(&name).or_else(|| m.get(&format!("{name}{side}"))));
+        match n {
+            Some(n) => {
+                let props = resolved.entry((h, String::new(), media)).or_default();
+                if props.get(p).is_none_or(|(o, _)| *o <= pri) { props.insert(p.to_string(), (pri, n.to_string())); }
+                if !extra { placed += 1 }
+            }
+            None if !extra => lost += 1,
+            None => {}
         }
     }
     for (_, props) in resolved.iter_mut() { props.remove("grid-template-columns-lines-marker"); props.remove("grid-template-rows-lines-marker"); }
