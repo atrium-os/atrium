@@ -76,7 +76,17 @@ Plan as written:
 - Events carry window coordinates, measured from that rect's corner. A renderer forwards them to its client as they come.
 - Window 0, the background under every window, belongs to the WM. Pointer events over no window and keys with no focused window go to the WM alone, so the broadcast exception of F4a′ is gone. The desktop shell draws in a window of its own (role Background, as forum-dock does), and gets its input there.
 - Verified in the amd64 VM, split mode with the renderer jailed, using the injector (`FRESCOD_INPUT_SOCK`) on `atrium-surfaces-demo` (`SURFACES_STILL=1`, which prints the input each connection gets). A click on the background reached only the WM. Clicks on A, on an undrawn (transparent) part of B, and on C each reached that window's client and the WM, in that window's coordinates. A key went to the focused window C.
-- Hit-testing is by rect: an undrawn part of a window still takes its clicks, as above. Input regions are not implemented.
+- Hit-testing was by rect at first, so an undrawn part of a window still took its clicks. F4c′ fixes that.
+
+### F4c′. Clicks go where the user sees. Done.
+
+The risk is clickjacking: a window that is mostly transparent, placed over another app, would take the clicks meant for the app showing through it. Input regions declared by the app would not help, because a hostile app declares its whole rect. So frescod decides from the pixels.
+
+- Each composed layer carries an alpha probe built from the frame it was drawn from (`reference::alpha_at`, which matches the kernels' alpha exactly; tested against `render` on fuzzed frames). A pointer over a pixel with alpha below `MIN_HIT_ALPHA` (16, about 6%) passes through to the window underneath, so a veil too faint to notice cannot catch clicks.
+- It works the same in split mode (the frame the broker checked) and in-process mode (the frame the backend packed). The Vulkan backend has no per-window frames, so its windows hit by rect.
+- Verified in the amd64 VM, split mode, renderer jailed: a click on B's undrawn part over A went to A at A's coordinates; one on B's undrawn part over the background went to the WM alone; clicks on B's drawn rect and on C's half-transparent background went to B and C.
+
+Still to do, with F4f: an "obscured" mark on input when another app's visible content overlaps the target window, so sensitive UI (password fields, Navigator permission prompts) can refuse a click that may have been steered. It needs a field in the input events, so it waits for the wire change F4f makes anyway.
 
 ### F4d. Trusted chrome
 
@@ -96,7 +106,7 @@ Plan as written:
 
 ## Order
 
-F4b, then F4c, then F4d. F4f follows once F5 and the vault exist. F4e follows F1.
+F4b, then F4c (and F4c′), then F4d. F4f follows once F5 and the vault exist. F4e follows F1.
 
 ## Decisions taken (recommended; say if you want otherwise)
 

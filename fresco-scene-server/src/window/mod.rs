@@ -234,6 +234,26 @@ impl Window {
     }
 }
 
+/// The alpha (0..=255) a layer's surface holds at a surface pixel.
+pub type AlphaProbe = std::sync::Arc<dyn Fn(u32, u32) -> u8 + Send + Sync>;
+
+/// One layer as frescod last composed it.
+#[derive(Clone)]
+pub struct ShownLayer {
+    pub id: WindowId,
+    /// Screen rect, x0, y0, x1, y1 (exclusive end).
+    pub rect: [i32; 4],
+    /// What the surface holds; None means opaque everywhere (a backend
+    /// that cannot tell).
+    pub alpha: Option<AlphaProbe>,
+}
+
+/// A pointer over a pixel whose alpha is below this passes through to the
+/// window under it: the user cannot see that window's pixel there, so it
+/// must not take the click (threat model §2.5.2, F4c′). About 6%: a
+/// window cannot catch clicks with a veil too faint to notice.
+pub const MIN_HIT_ALPHA: u8 = 16;
+
 /// Server-side compositor state. Holds the windows owned by all
 /// clients, dispatches commands to the right window, and tracks
 /// global UI state (focus, cursor position, z-order).
@@ -244,7 +264,7 @@ pub struct Compositor {
     /// placed it. Pointer input hits these, so the window a pixel shows is
     /// the window that gets the click (threat model §2.5.2, F4c). None
     /// until the first frame.
-    pub shown:    Option<Vec<(WindowId, [i32; 4])>>,
+    pub shown:    Option<Vec<ShownLayer>>,
     pub z_order:  Vec<WindowId>,
     pub focus:    Option<WindowId>,
     pub cursor:   (f32, f32),
@@ -958,7 +978,8 @@ impl Compositor {
     /// The window the pointer at screen (`x`, `y`) is over, and the point
     /// in that window's coordinates. Hits the layers last composed
     /// ([`Compositor::shown`]): a window the WM stopped rendering, or one
-    /// with no frame yet, is not on screen and gets nothing. Over no
+    /// with no frame yet, is not on screen and gets nothing, and a pixel a
+    /// window left (nearly) transparent goes to whatever shows through it. Over no
     /// window it is window 0, the background, whose events go to the WM
     /// alone.
     pub fn pointer_target(&self, x: f32, y: f32) -> (WindowId, (f32, f32)) {
@@ -967,10 +988,19 @@ impl Compositor {
             let pos = if id == 0 { (0.0, 0.0) } else { self.windows.get(&id).map(|w| w.pos).unwrap_or((0.0, 0.0)) };
             return (id, (x - pos.0, y - pos.1));
         };
-        for &(id, [x0, y0, x1, y1]) in shown.iter().rev() {
-            if id != 0 && x >= x0 as f32 && x < x1 as f32 && y >= y0 as f32 && y < y1 as f32 && self.windows.contains_key(&id) {
-                return (id, (x - x0 as f32, y - y0 as f32));
+        for l in shown.iter().rev() {
+            let [x0, y0, x1, y1] = l.rect;
+            let inside = x >= x0 as f32 && x < x1 as f32 && y >= y0 as f32 && y < y1 as f32;
+            if l.id == 0 || !inside || !self.windows.contains_key(&l.id) {
+                continue;
             }
+            let local = (x - x0 as f32, y - y0 as f32);
+            if let Some(a) = &l.alpha {
+                if a(local.0 as u32, local.1 as u32) < MIN_HIT_ALPHA {
+                    continue; // nothing visible of this window here
+                }
+            }
+            return (l.id, local);
         }
         (0, (x, y))
     }

@@ -18,6 +18,7 @@
 //! puts them in a scanout buffer.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::error::Error;
 
 use atrium_gpu::amd::{Bo, Scanout, Syncobj, Vm, BO_VRAM, ENGINE_GFX};
@@ -123,10 +124,10 @@ pub fn surface_size(w: &WindowFrame) -> (u32, u32) {
 }
 
 /// A window's frame: the renderer's, or packed here from its nodes.
-fn frame_of(scene: &SceneState, w: &WindowFrame, s: Surface) -> fresco_compute::Frame {
+fn frame_of(scene: &SceneState, w: &WindowFrame, s: Surface) -> Arc<fresco_compute::Frame> {
     match &w.frame {
         Some(f) => f.clone(),
-        None => scene.pack(w, s[2], s[3]),
+        None => Arc::new(scene.pack(w, s[2], s[3])),
     }
 }
 
@@ -209,6 +210,16 @@ impl<'a> Backend<'a> {
     }
 
     /// The last frame, BGRA8, `width * height * 4` bytes.
+    /// The frames of the last render, by window, for hit-testing; empty
+    /// for Vulkan, which merges the windows into one scene.
+    pub fn frames(&self) -> &[(u32, Arc<fresco_compute::Frame>)] {
+        match self {
+            Backend::Vulkan(_) => &[],
+            Backend::Compute(c) => &c.last,
+            Backend::Gpu(g) => &g.last,
+        }
+    }
+
     pub fn read_pixels(&self, dst: &mut [u8]) -> Result<()> {
         match self {
             Backend::Vulkan(r) => Ok(r.read_pixels(dst)?),
@@ -237,6 +248,8 @@ pub struct Compute {
     /// Tile signatures of what each window's surface holds.
     held: HashMap<u32, Vec<u64>>,
     target: Vec<u32>,
+    /// The frames last rendered, for hit-testing.
+    last: Vec<(u32, Arc<fresco_compute::Frame>)>,
 }
 
 impl Compute {
@@ -264,6 +277,7 @@ impl Compute {
             heap: Vec::new(),
             held: HashMap::new(),
             target: vec![0; (width * height) as usize],
+            last: Vec::new(),
         })
     }
 
@@ -277,9 +291,11 @@ impl Compute {
             self.heap = vec![0; self.surfaces.words as usize];
             self.held.clear();
         }
+        self.last.clear();
         for w in &f.windows {
             let s = self.surfaces.map[&w.id];
             let frame = frame_of(&self.scene, w, s);
+            self.last.push((w.id, frame.clone()));
             let sig = fresco_compute::damage::tile_signatures(&frame);
             if self.held.get(&w.id) == Some(&sig) {
                 continue;
@@ -326,6 +342,8 @@ pub struct GpuCompute<'a> {
     scene: SceneState,
     /// The frame `prepare` packed, for `submit`.
     pending: Option<Pending>,
+    /// The frames last rendered, for hit-testing.
+    last: Vec<(u32, Arc<fresco_compute::Frame>)>,
     code: Bo<'a>,
     code_loaded: bool,
     staging: Bo<'a>,
@@ -346,7 +364,7 @@ pub struct GpuCompute<'a> {
 
 struct Pending {
     /// Each window's id and packed frame.
-    frames: Vec<(u32, fresco_compute::Frame)>,
+    frames: Vec<(u32, Arc<fresco_compute::Frame>)>,
     layers: Vec<Layer>,
 }
 
@@ -393,6 +411,7 @@ impl<'a> GpuCompute<'a> {
             held: HashMap::new(),
             version: HashMap::new(),
             composed: HashMap::new(),
+            last: Vec::new(),
         })
     }
 
@@ -407,10 +426,11 @@ impl<'a> GpuCompute<'a> {
         if self.surfaces.layout(&sizes) {
             self.forget_surfaces();
         }
-        let frames = f.windows.iter().map(|w| {
+        let frames: Vec<(u32, Arc<fresco_compute::Frame>)> = f.windows.iter().map(|w| {
             let s = self.surfaces.map[&w.id];
             (w.id, frame_of(&self.scene, w, s))
         }).collect();
+        self.last = frames.clone();
         self.pending = Some(Pending { frames, layers: self.surfaces.layers(&f.windows) });
         Ok(())
     }

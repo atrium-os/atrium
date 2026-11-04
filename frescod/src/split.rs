@@ -60,7 +60,7 @@ pub struct Broker {
     bin: PathBuf,
     launcher: Option<String>,
     /// The last good frame of every renderer-drawn window, by global id.
-    frames: Mutex<HashMap<u32, fresco_compute::Frame>>,
+    frames: Mutex<HashMap<u32, Arc<fresco_compute::Frame>>>,
     renderers: Mutex<HashMap<u8, Arc<Renderer>>>,
 }
 
@@ -106,7 +106,7 @@ impl Broker {
     }
 
     /// The frame to compose for window `id`, if a renderer draws it.
-    pub fn frame(&self, id: u32) -> Option<fresco_compute::Frame> {
+    pub fn frame(&self, id: u32) -> Option<Arc<fresco_compute::Frame>> {
         self.frames.lock().unwrap().get(&id).cloned()
     }
 
@@ -249,7 +249,7 @@ impl Broker {
                 };
                 match got {
                     (global, Ok((_, frame))) => {
-                        self.frames.lock().unwrap().insert(global as u32, frame);
+                        self.frames.lock().unwrap().insert(global as u32, Arc::new(frame));
                         self.redraw.wake();
                     }
                     // A frame drawn before the latest GEOMETRY arrived has the

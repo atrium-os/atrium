@@ -221,3 +221,26 @@ fn validate_rejects_what_the_kernels_cannot_bound() {
     eprintln!("{accepted} accepted, {rejected} rejected");
     assert!(accepted > 0 && rejected > 0);
 }
+
+/// The hit-test probe agrees with the kernels' alpha at every pixel.
+#[test]
+fn alpha_at_matches_the_rendered_alpha() {
+    let mut r = fuzz::Rng(env("FRESCO_FUZZ_SEED", 0xa1fa));
+    let mut checked = 0;
+    for _ in 0..env("FRESCO_FUZZ_ITERS", 300) / 3 {
+        let f = fuzz::frame(&mut r);
+        if f.validate(f.target_words()).is_err() {
+            continue;
+        }
+        let out = reference::render(&f);
+        let h = &f.header;
+        for y in 0..h.height {
+            for x in 0..h.width {
+                let want = (out[(y * h.pitch + x) as usize] >> 24) as u8;
+                assert_eq!(reference::alpha_at(&f, x, y), want, "pixel ({x}, {y})");
+            }
+        }
+        checked += 1;
+    }
+    assert!(checked > 10, "only {checked} valid frames");
+}

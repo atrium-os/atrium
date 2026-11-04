@@ -238,6 +238,40 @@ pub fn pixel(f: &Frame, mask: &[u32], x: u32, y: u32) -> u32 {
     b | (g << 8) | (r << 16) | (a << 24)
 }
 
+/// The alpha byte `raster.comp` writes at pixel (`x`, `y`), from the ops
+/// whose box covers that pixel as `bin.comp` would bin them, without
+/// binning the whole frame. For hit-testing: a pixel a window drew nothing
+/// on has alpha 0 (on a transparent clear).
+pub fn alpha_at(f: &Frame, x: u32, y: u32) -> u8 {
+    let h = &f.header;
+    if x >= h.width || y >= h.height {
+        return 0;
+    }
+    let (fw, fh) = (h.width as f32, h.height as f32);
+    let pc = [x as f32 + 0.5, y as f32 + 0.5];
+    let mut da = h.clear[3];
+    for o in &f.ops[..(h.op_count as usize).min(f.ops.len())] {
+        let b = o.p3;
+        let x0 = clamp_(b[0], 0.0, fw) as i32;
+        let y0 = clamp_(b[1], 0.0, fh) as i32;
+        let x1 = clamp_(b[2], 0.0, fw) as i32;
+        let y1 = clamp_(b[3], 0.0, fh) as i32;
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
+        // bin.comp covers whole tiles; an op outside this pixel's tile is
+        // not shaded here, and one inside it shades to 0 off its shape.
+        let t = |v: u32| v / TILE;
+        let (tx, ty) = (t(x), t(y));
+        if tx < t(x0 as u32) || tx > t((x1 - 1) as u32) || ty < t(y0 as u32) || ty > t((y1 - 1) as u32) {
+            continue;
+        }
+        let s = shade(f, o, pc);
+        da = s[3] + da * (1.0 - s[3]);
+    }
+    (clamp_(da, 0.0, 1.0) * 255.0 + 0.5) as u8
+}
+
 /// Both kernels: the target, `pitch * height` BGRA8 words (padding 0).
 pub fn render(f: &Frame) -> Vec<u32> {
     let mask = bin(f);

@@ -428,12 +428,22 @@ fn render_one_frame(
     };
     /* What compose puts on screen, for pointer hit-testing (F4c): each
      * window at its rounded position, at its surface's size. */
-    let shown: Vec<(u16, [i32; 4])> = windows.iter().map(|w| {
+    let rects: Vec<(u32, [i32; 4])> = windows.iter().map(|w| {
         let (x, y) = (w.pos.0.round() as i32, w.pos.1.round() as i32);
         let (sw, sh) = render_backend::surface_size(w);
-        (w.id as u16, [x, y, x.saturating_add(sw as i32), y.saturating_add(sh as i32)])
+        (w.id, [x, y, x.saturating_add(sw as i32), y.saturating_add(sh as i32)])
     }).collect();
     renderer.render(ScreenInput { windows, uploads, clears })?;
+    /* Each layer's alpha comes from the frame it was drawn from, so a
+     * pixel a window left transparent passes the click on (F4c′). */
+    let frames: std::collections::HashMap<u32, Arc<fresco_compute::Frame>> =
+        renderer.frames().iter().cloned().collect();
+    let shown = rects.into_iter().map(|(id, rect)| {
+        let alpha = frames.get(&id).cloned().map(|f| -> fresco_scene_server::window::AlphaProbe {
+            Arc::new(move |x, y| fresco_compute::reference::alpha_at(&f, x, y))
+        });
+        fresco_scene_server::window::ShownLayer { id: id as u16, rect, alpha }
+    }).collect();
     comp.lock().unwrap().shown = Some(shown);
     Ok(())
 }

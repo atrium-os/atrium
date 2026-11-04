@@ -21,7 +21,7 @@ pub struct WindowFrame {
     pub size: (u32, u32),
     /// Already packed (by a window renderer, F4b): the nodes are empty and
     /// this frame, for a surface of its own size, is used as is.
-    pub frame: Option<fresco_compute::Frame>,
+    pub frame: Option<std::sync::Arc<fresco_compute::Frame>>,
     pub rects: Vec<SceneNode>,
     pub paths: Vec<PathNode>,
     pub batches: Vec<TextureBatch>,
