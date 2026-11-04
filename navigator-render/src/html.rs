@@ -591,6 +591,18 @@ impl<'a> Cx<'a> {
             (None, Some(_)) => ml = Some(free),
             _ => {}
         }
+        // ★ In a right-to-left containing block it is `margin-left` that
+        // gives way when the margins are over-constrained (CSS 2.1 §10.3.3):
+        // a sized box sits against the RIGHT edge, and a box wider than its
+        // containing block overflows on the LEFT — where an RTL page's
+        // scrolling does reach. Laid out left-to-right, an Arabic page's
+        // 25-column distance table ran off the right edge from its first
+        // column. Only for a box in normal flow: a flex or grid item, a
+        // table cell, is placed by its container.
+        let cb_rtl = self.dom.get(h).and_then(|n| n.parent).and_then(|p| self.st(p)).is_some_and(|ps| kw(ps, "direction") == "rtl");
+        if cb_rtl && force.0.is_none() && (matches!((ml, mr), (Some(_), Some(_))) || cb_w - w - ml.unwrap_or(0) - mr.unwrap_or(0) < 0) {
+            ml = Some(cb_w - w - mr.unwrap_or(0));
+        }
         let (bx, by) = (x + ml.unwrap_or(0), y + mt);
         let (rel_dx, rel_dy) = if kw(s, "position") == "relative" {
             (len(s.get("left"), cb_w).or_else(|| len(s.get("right"), cb_w).map(|r| -r)).unwrap_or(0),
@@ -1925,6 +1937,10 @@ impl<'a> Cx<'a> {
         for h in &row_h { row_y.push(cy); cy += h + sy }
         // Column i's left edge, so a cell starts where its first column does.
         let col_x = |i: usize| -> U { x + sx + cols[..i.min(cols.len())].iter().sum::<U>() + sx * i.min(cols.len()) as U };
+        // ★ A right-to-left table's columns run from its RIGHT edge (CSS 2.1
+        // §17.2: column 1 is on the right): each cell is mirrored in the
+        // table's box.
+        let rtl = kw(s, "direction") == "rtl";
         for (r, (cells, row_slots)) in rows_cells.iter().zip(&slots).enumerate() {
             for (i, c) in cells.iter().enumerate() {
                 let (k, _, rs) = row_slots[i];
@@ -1932,6 +1948,7 @@ impl<'a> Cx<'a> {
                 // The cell box fills every row it spans (separate-borders model).
                 let ch: U = row_h[r..r + rs].iter().sum::<U>() + sy * (rs as U - 1);
                 let cx = if k < cols.len() { col_x(k) } else { col_x(cols.len()) };
+                let cx = if rtl { x + w - (cx - x) - cw } else { cx };
                 let cs = self.st(*c).expect("styled");
                 // vertical-align positions the CONTENT inside that height.
                 self.content_dy = match kw(cs, "vertical-align") {
@@ -2901,6 +2918,29 @@ mod tests {
         assert_eq!(ys.len(), 2, "{ys:?}");
         assert!((35..70).contains(&ys[0]), "x is centred in its 100 px row: baseline {}", ys[0]);
         assert!(ys[1] < 100 + 30, "y sits at the TOP of row 2, from `tr {{ vertical-align: top }}`: baseline {}", ys[1]);
+    }
+
+    /// ★ RIGHT-TO-LEFT. Column 1 of an RTL table is on the right; a sized
+    /// box in an RTL block sits against the right edge; and a table too
+    /// wide for its RTL container overflows on the LEFT.
+    #[test]
+    fn rtl_tables_run_from_the_right_and_overflow_to_the_left() {
+        let src = r#"<style>body { margin-left: 0px; margin-top: 0px; margin-right: 0px; direction: rtl }
+            .box { width: 400px; margin-left: 0px; margin-right: 0px } .sized { width: 100px; background-color: #00ff00 }
+            table { border-spacing: 0px 0px; margin-left: 0px; margin-right: 0px } .c0 { width: 100px } .c1 { width: 50px } .w { width: 500px }
+            .a { background-color: #ff0000 } .b { background-color: #0000ff } .o { background-color: #ffff00 }</style>
+            <div class="box"><div class="sized">s</div>
+            <table><colgroup><col class="c0"><col class="c1"></colgroup><tr><td class="a">1</td><td class="b">2</td></tr></table>
+            <table><colgroup><col class="w"></colgroup><tr><td class="o">wide</td></tr></table></div>"#;
+        let o = render(src);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let (sized, a, b, wide) = (boxes(&o, 0x00ff00ff)[0], boxes(&o, 0xff0000ff)[0], boxes(&o, 0x0000ffff)[0], boxes(&o, 0xffff00ff)[0]);
+        // The 400 px box is itself sized, so it sits at the right of the
+        // 800 px body: its edges are 400 and 800.
+        assert_eq!((sized.0, sized.2), (800 - 100, 100), "the sized box sits against the right edge");
+        assert_eq!((a.0, a.2), (800 - 100, 100), "column 1 is the RIGHTMOST, in a table shrink-wrapped to the right");
+        assert_eq!((b.0, b.2), (800 - 150, 50), "column 2 is to its left");
+        assert_eq!((wide.0, wide.2), (800 - 500, 500), "the overwide table overflows on the left, past the box's 400");
     }
 
     #[test]
