@@ -23,12 +23,33 @@ use crate::Error;
 use std::collections::HashSet;
 
 /// Allocation with spilling: the assignment and the scratch dwords per lane.
+/// Reloads are reused through a straight run; if the longer reload
+/// intervals leave no room, it falls back to a reload at every use.
 pub fn allocate(
     mi: &mut Vec<MI>,
     vregs: &mut Vec<VRegInfo>,
     v_first: u8,
     s_first: u8,
     v_limit: u32,
+) -> Result<(Assignment, u32), Error> {
+    let (mi0, vregs0) = (mi.clone(), vregs.clone());
+    match allocate_with(mi, vregs, v_first, s_first, v_limit, true) {
+        Ok(r) => Ok(r),
+        Err(_) => {
+            *mi = mi0;
+            *vregs = vregs0;
+            allocate_with(mi, vregs, v_first, s_first, v_limit, false)
+        }
+    }
+}
+
+fn allocate_with(
+    mi: &mut Vec<MI>,
+    vregs: &mut Vec<VRegInfo>,
+    v_first: u8,
+    s_first: u8,
+    v_limit: u32,
+    reuse: bool,
 ) -> Result<(Assignment, u32), Error> {
     let mut temps: HashSet<usize> = HashSet::new();
     let mut slots = 0u32;
@@ -49,7 +70,9 @@ pub fn allocate(
                 let k = u.iter().chain(&d).filter(|x| **x as usize == r).count();
                 c += k as f64 * 10f64.powi(depth[p].min(6) as i32);
             }
-            c / (end[r] - start[r] + 1) as f64
+            let c = c / (end[r] - start[r] + 1) as f64;
+            // Recomputing costs one VALU op, a reload a memory round trip.
+            if remat_def(mi, r as VR).is_some() { c * 0.1 } else { c }
         };
         let victim = f
             .active
@@ -61,10 +84,14 @@ pub fn allocate(
             .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
             .map(|(_, r)| r)
             .ok_or_else(|| f.error())?;
+        if let Some(def) = remat_def(mi, victim as VR) {
+            remat(mi, vregs, &mut temps, victim as VR, def);
+            continue;
+        }
         let size = vregs[victim].size as u32;
         let base = if size > 1 { slots.next_multiple_of(4) } else { slots };
         slots = base + size;
-        rewrite(mi, vregs, &mut temps, victim as VR, base);
+        rewrite(mi, vregs, &mut temps, victim as VR, base, reuse);
     }
 }
 
@@ -80,6 +107,71 @@ fn loop_depth(mi: &[MI]) -> Vec<u32> {
             d
         })
         .collect()
+}
+
+/// The single definition of `x`, if it can be recomputed at each use
+/// instead of spilled: a one-register `v_mov_b32` of a constant or SGPR
+/// (registers no instruction writes). Recomputing under the use's EXEC
+/// gives the value in every lane the use reads.
+fn remat_def(mi: &[MI], x: VR) -> Option<MI> {
+    let mut def = None;
+    for m in mi {
+        let (_, d) = m.regs();
+        if d.contains(&x) {
+            if def.is_some() {
+                return None;
+            }
+            def = Some(m);
+        }
+    }
+    match def? {
+        m @ MI::Valu { name: "V_MOV_B32", dst: O::R(_, 0), sdst: None, src, neg: 0 }
+            if matches!(src[..], [O::Imm(_)]) =>
+        {
+            Some(m.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Replace `x` by a recomputation of `def` before each use.
+fn remat(mi: &mut Vec<MI>, vregs: &mut Vec<VRegInfo>, temps: &mut HashSet<usize>, x: VR, def: MI) {
+    let old = std::mem::take(mi);
+    for mut m in old {
+        let (u, d) = m.regs();
+        if d.contains(&x) {
+            continue; // the original definition goes
+        }
+        if !u.contains(&x) {
+            mi.push(m);
+            continue;
+        }
+        let t = vregs.len() as VR;
+        vregs.push(VRegInfo { class: Class::V, size: 1 });
+        temps.insert(t as usize);
+        let mut again = def.clone();
+        for (o, is_def, _) in again.operands_mut() {
+            if is_def {
+                *o = O::R(t, 0);
+            }
+        }
+        for (o, _, _) in m.operands_mut() {
+            if *o == O::R(x, 0) {
+                *o = O::R(t, 0);
+            }
+        }
+        mi.push(again);
+        mi.push(m);
+    }
+}
+
+/// Ends a straight run: a reloaded value cannot be reused past it (other
+/// lanes may be active, or control may arrive from elsewhere).
+fn run_end(m: &MI) -> bool {
+    matches!(m, MI::Label(_) | MI::Branch { .. } | MI::LoopBegin | MI::LoopEnd | MI::Endpgm | MI::Barrier)
+        || matches!(m, MI::Salu { dst: O::Exec, .. })
+        || matches!(m, MI::Salu { name, .. } if name.contains("EXEC"))
+        || matches!(m, MI::Valu { name, .. } if name.contains("CMPX"))
 }
 
 /// Reads other lanes' values, so a reload must fill every lane.
@@ -117,9 +209,15 @@ fn name(load: bool, w: u32) -> &'static str {
     }
 }
 
-fn rewrite(mi: &mut Vec<MI>, vregs: &mut Vec<VRegInfo>, temps: &mut HashSet<usize>, x: VR, base: u32) {
+fn rewrite(mi: &mut Vec<MI>, vregs: &mut Vec<VRegInfo>, temps: &mut HashSet<usize>, x: VR, base: u32, reuse: bool) {
     let old = std::mem::take(mi);
+    // The register holding components of `x` in this straight run: (temp,
+    // its first component, its size, mask of components it holds).
+    let mut cache: Option<(VR, u32, u32, u32)> = None;
     for mut m in old {
+        if run_end(&m) {
+            cache = None;
+        }
         // Component ranges this instruction reads and writes.
         let (mut ulo, mut uhi, mut dlo, mut dhi) = (u32::MAX, 0u32, u32::MAX, 0u32);
         for (o, def, w) in m.operands_mut() {
@@ -141,17 +239,35 @@ fn rewrite(mi: &mut Vec<MI>, vregs: &mut Vec<VRegInfo>, temps: &mut HashSet<usiz
             continue;
         }
         let (lo, hi) = (ulo.min(dlo), uhi.max(dhi));
-        let t = vregs.len() as VR;
-        vregs.push(VRegInfo { class: Class::V, size: (hi - lo) as u8 });
-        temps.insert(t as usize);
+        let range = |a: u32, b: u32| if a >= b { 0 } else { ((1u64 << b) - (1u64 << a)) as u32 };
+        let all = cross_lane(&m);
+        // Reuse the run's register if it covers this instruction and
+        // holds every component read.
+        let hit = cache.filter(|&(_, clo, csize, mask)| {
+            !all && clo <= lo && hi <= clo + csize && (ulo == u32::MAX || range(ulo, uhi) & !mask == 0)
+        });
+        let (t, tlo) = match hit {
+            Some((t, clo, _, _)) => (t, clo),
+            None => {
+                let t = vregs.len() as VR;
+                vregs.push(VRegInfo { class: Class::V, size: (hi - lo) as u8 });
+                temps.insert(t as usize);
+                (t, lo)
+            }
+        };
         for (o, _, _) in m.operands_mut() {
             if let O::R(r, k) = *o {
                 if r == x {
-                    *o = O::R(t, k - lo as u8);
+                    *o = O::R(t, k - tlo as u8);
                 }
             }
         }
-        if ulo != u32::MAX {
+        let mut mask = match hit {
+            Some((_, _, _, mask)) => mask,
+            None => 0,
+        };
+        if ulo != u32::MAX && hit.is_none() {
+            mask |= range(ulo, uhi);
             let all = cross_lane(&m);
             let saved = all.then(|| {
                 let s = vregs.len() as VR;
@@ -168,11 +284,19 @@ fn rewrite(mi: &mut Vec<MI>, vregs: &mut Vec<VRegInfo>, temps: &mut HashSet<usiz
                 mi.push(MI::Salu { name: "S_MOV_B32", dst: O::Exec, src: vec![O::R(s, 0)] });
             }
         }
+        let ends = run_end(&m);
         mi.push(m);
         if dlo != u32::MAX {
+            mask |= range(dlo, dhi);
             for (k, w) in accesses(base, dlo, dhi) {
-                mi.push(MI::Scratch { name: name(false, w), vdst: None, data: Some(O::R(t, (k - lo) as u8)), ioff: ((base + k) * 4) as i32 });
+                mi.push(MI::Scratch { name: name(false, w), vdst: None, data: Some(O::R(t, (k - tlo) as u8)), ioff: ((base + k) * 4) as i32 });
             }
         }
+        // A reload for a cross-lane read ran with all lanes; its register
+        // is fine to keep. An instruction that ends a run drops it.
+        cache = if ends || !reuse { None } else {
+            let size = vregs[t as usize].size as u32;
+            Some((t, tlo, size, mask))
+        };
     }
 }

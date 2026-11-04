@@ -15,6 +15,31 @@ use atrium_rdna4_cmd::{emit_dispatch, Blob, Dispatch};
 pub const TS_VA: u64 = 0x1_0001_0000;
 /// GPU address of the first benchmark data buffer; buffers are 256 MiB apart.
 pub const BENCH_VA: u64 = 0x2_0000_0000;
+/// GPU address of the scratch ring of spilling benchmarks.
+pub const BENCH_SCRATCH_VA: u64 = 0x3_0000_0000;
+/// Scratch ring slots: every wave the R9700 can hold (64 CUs x 2 SIMDs x
+/// 16), so spilling never limits occupancy.
+pub const BENCH_SCRATCH_WAVES: u32 = 2048;
+
+/// The scratch ring for `dwords` per lane: the dispatch field and its
+/// `job.txt` line (4x the ring, as in the oracle cases).
+fn bench_ring(dwords: u32) -> (Option<atrium_rdna4_cmd::Scratch>, String) {
+    if dwords == 0 {
+        return (None, String::new());
+    }
+    let s = atrium_rdna4_cmd::Scratch { va: BENCH_SCRATCH_VA, wave_bytes: atrium_rdna4_cmd::Scratch::wave_bytes(dwords, 32), waves: BENCH_SCRATCH_WAVES };
+    let size = 4 * s.bytes();
+    assert!(size < 128 << 20, "scratch ring of {dwords} dwords per lane is too large");
+    (Some(s), format!("bo scratch {BENCH_SCRATCH_VA:x} {size} - 0\n"))
+}
+
+/// The name suffix for the current compile cap (`""` at 256).
+fn cap_suffix() -> String {
+    match crate::cases::cap() {
+        256 => String::new(),
+        c => format!("_v{c}"),
+    }
+}
 
 /// One benchmark: everything the script needs for both drivers.
 #[derive(Debug, Clone)]
@@ -79,7 +104,8 @@ pub fn desktop(shader: &str, spv_path: &str, nodes: u32, record: u32, repeat: u3
     let mut g = atrium_gir::build::build(&m, 0).expect("gir");
     atrium_gir::passes::optimize(&mut g);
     atrium_gir::verify::verify(&g).expect("verify");
-    let bin = atrium_rdna4_compiler::compile(&g).expect("rdna4 compile");
+    let bin = crate::cases::compile(&g).expect("rdna4 compile");
+    let (ring, ring_line) = bench_ring(bin.scratch_dwords);
     let glyph = spv_path.contains("glyph");
     let n = nodes as u64;
     let max_inst = if glyph { glyph_total(nodes) as u64 } else { n };
@@ -104,7 +130,7 @@ pub fn desktop(shader: &str, spv_path: &str, nodes: u32, record: u32, repeat: u3
     let mut ib = Blob::compute();
     ib.acquire_all();
     ib.timestamp(TS_VA);
-    emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs: bin.vgprs, user_sgprs: user, threads: bin.local_size, groups: [groups, 1, 1], wave32: true, lds_bytes: bin.lds_bytes, scratch: None });
+    emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs: bin.vgprs, user_sgprs: user, threads: bin.local_size, groups: [groups, 1, 1], wave32: true, lds_bytes: bin.lds_bytes, scratch: ring });
     ib.timestamp(TS_VA + 8);
     ib.pad(8);
     let mut code: Vec<u8> = bin.code.iter().flat_map(|d| d.to_le_bytes()).collect();
@@ -112,10 +138,10 @@ pub fn desktop(shader: &str, spv_path: &str, nodes: u32, record: u32, repeat: u3
     code.resize(IB_OFFSET as usize, 0);
     code.extend(ib.bytes());
 
-    let name = format!("{shader}_{nodes}");
+    let name = format!("{shader}_{nodes}{}", cap_suffix());
     let input = |b: &str| if b == "scene" || b == "glyphs" { format!("{b}.in") } else { "-".into() };
     let mut job = format!("# atrium-rdna4-oracle bench {name}\nip compute\ntimeout_ms 10000\ndomain vram\nrepeat {repeat}\ntimestamps ts\n");
-    job += &format!("bo code {CODE_VA:x} {} code.in 0\nbo ts {TS_VA:x} 4096 - 0\n", 0x2000);
+    job += &format!("bo code {CODE_VA:x} {} code.in 0\nbo ts {TS_VA:x} 4096 - 0\n{ring_line}", 0x2000);
     let mut vk = format!("spv shader.spv\nentry {}\ngroups {groups} 1 1\nrepeat {repeat}\n", entry_name(&spv));
     for (i, b) in names.iter().enumerate() {
         job += &format!("bo {b} {:x} {} {} 1\n", va(i), sizes[i], input(b));
@@ -155,6 +181,18 @@ pub fn all() -> Vec<Bench> {
     }
     v.extend(fresco(false, 20));
     v.extend(fresco(true, 20));
+    // Spilling: raster at 96 VGPRs (16 waves per SIMD, a few spills) and 64
+    // against its unspilled 120 (12 waves); glyph_run and path forced to
+    // spill heavily, against their unspilled runs above.
+    for cap in [96, 64] {
+        v.extend(crate::cases::with_cap(cap, || fresco(true, 20)));
+    }
+    crate::cases::with_cap(16, || {
+        let (n, p, rec) = crate::cases::DESKTOP[3];
+        v.extend(desktop(n, p, 1 << 18, rec, 20));
+        let (n, p, rec) = crate::cases::DESKTOP[2];
+        v.extend(desktop(n, p, 1 << 20, rec, 20));
+    });
     v
 }
 
@@ -171,7 +209,9 @@ pub fn fresco(raster: bool, repeat: u32) -> Option<Bench> {
         init[binding::MASK as usize] = reference::bin(&f).iter().flat_map(|x| x.to_le_bytes()).collect();
     }
     let spv = if raster { RASTER_SPV } else { BIN_SPV };
-    let k = atrium_rdna4::Kernel::from_spirv(spv, &atrium_rdna4::Options::default()).ok()?;
+    let opts = atrium_rdna4::Options { max_vgprs: Some(crate::cases::cap()), ..Default::default() };
+    let k = atrium_rdna4::Kernel::from_spirv(spv, &opts).ok()?;
+    let (ring, ring_line) = bench_ring(k.bin.scratch_dwords);
     let groups = if raster { f.raster_groups() } else { f.bin_groups() };
     let names = ["frame", "ops", "tex", "texels", "mask", "target", "lut"];
     let sizes: Vec<u64> = (0..binding::COUNT)
@@ -188,7 +228,7 @@ pub fn fresco(raster: bool, repeat: u32) -> Option<Bench> {
     let mut ib = Blob::compute();
     ib.acquire_all();
     ib.timestamp(TS_VA);
-    emit_dispatch(&mut ib, &k.dispatch(CODE_VA, &bind, None, groups).ok()?);
+    emit_dispatch(&mut ib, &k.dispatch_with(CODE_VA, &bind, None, groups, ring.map(|r| (r.va, r.waves))).ok()?);
     ib.timestamp(TS_VA + 8);
     ib.pad(8);
     let mut code = k.code();
@@ -196,10 +236,10 @@ pub fn fresco(raster: bool, repeat: u32) -> Option<Bench> {
     code.resize(ib_off, 0);
     code.extend(ib.bytes());
     let code_size = code.len().next_multiple_of(0x1000);
-    let name = if raster { "fresco_raster_1080p" } else { "fresco_bin_1080p" }.to_string();
+    let name = format!("{}{}", if raster { "fresco_raster_1080p" } else { "fresco_bin_1080p" }, cap_suffix());
     let has_input = |b: usize| (b as u32 != binding::TARGET) && (raster || b as u32 != binding::MASK);
     let mut job = format!("# atrium-rdna4-oracle bench {name}\nip compute\ntimeout_ms 10000\ndomain vram\nrepeat {repeat}\ntimestamps ts\n");
-    job += &format!("bo code {CODE_VA:x} {code_size} code.in 0\nbo ts {TS_VA:x} 4096 - 0\n");
+    job += &format!("bo code {CODE_VA:x} {code_size} code.in 0\nbo ts {TS_VA:x} 4096 - 0\n{ring_line}");
     let mut vk = format!("spv shader.spv\nentry {}\ngroups {} {} {}\nrepeat {repeat}\n", entry_name(spv), groups[0], groups[1], groups[2]);
     let mut inputs = vec![];
     for (b, n) in names.iter().enumerate() {
