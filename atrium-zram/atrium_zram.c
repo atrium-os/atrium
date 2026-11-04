@@ -50,7 +50,17 @@ unsigned ZSTD_isError(size_t code);
 
 #define	ZRAM_PAGE	4096
 #define	ZRAM_LEVEL	3
-#define	ZRAM_NSLOTS	524288	/* store capacity in pages (524288 = 2 GiB device) */
+/*
+ * Device size and slot table (atrium-zram-v2.md §4.1, increment 4). The size
+ * is kern.zram.disksize (bytes, default = physical RAM), read at load. The
+ * table is a directory of fixed-size chunks, each allocated on the first
+ * write into its range, so an idle or lightly used device wires almost
+ * nothing.
+ */
+#define	ZRAM_CHUNK_SHIFT	12
+#define	ZRAM_CHUNK_SLOTS	(1u << ZRAM_CHUNK_SHIFT)	/* 4096 slots = 64 KiB */
+#define	ZRAM_MIN_SLOTS		(16u << (20 - 12))		/* 16 MiB device */
+#define	ZRAM_MAX_SLOTS		(1u << 28)			/* 1 TiB device */
 
 MALLOC_DEFINE(M_ZRAM, "zram", "atrium zram store");
 
@@ -59,15 +69,24 @@ MALLOC_DEFINE(M_ZRAM, "zram", "atrium zram store");
  * than ZP_MAXOBJ, where packing saves nothing), stored verbatim. COMP and RAW
  * live in the packed pool (zram_pool.c), not in per-page malloc buffers. */
 enum zram_state { ZRAM_EMPTY = 0, ZRAM_SAME, ZRAM_COMP, ZRAM_RAW };
-struct zram_slot {
-	enum zram_state	state;
-	uint32_t	len;	/* COMP/RAW byte length */
-	uint8_t		fill;	/* SAME fill byte */
-	uint16_t	idx;	/* object index in span */
+struct zram_slot {			/* 16 bytes (v1: 24) */
 	struct zspan	*span;	/* COMP/RAW pool span, NULL for SAME/EMPTY */
+	uint16_t	idx;	/* object index in span */
+	uint16_t	len;	/* COMP/RAW byte length (<= ZRAM_PAGE) */
+	uint8_t		state;	/* enum zram_state */
+	uint8_t		fill;	/* SAME fill byte */
+	uint16_t	pad;
 };
+_Static_assert(sizeof(struct zram_slot) == 16, "zram_slot is 16 bytes");
 
-static struct zram_slot	*zram_slots;
+static uint32_t		 zram_nslots;	/* device size in pages */
+static uint32_t		 zram_ndir;	/* chunks in the directory */
+static struct zram_slot	**zram_dir;	/* chunk pointers, NULL until first write */
+static struct zram_slot	*zram_spare_chunk; /* for when malloc(M_NOWAIT) says no */
+static uint64_t		 zram_table_bytes;	/* gauge: chunk memory */
+static uint64_t		 zram_chunk_spare_used;	/* event */
+static uint64_t		 zram_fail_table;	/* event: no memory for a chunk */
+static uint64_t		 zram_disksize_tun;
 /*
  * Concurrency (atrium-zram-v2.md §4.1/§4.3, increment 3). v1 ran every
  * page-in and page-out on every CPU under one mutex. Now:
@@ -199,6 +218,44 @@ zram_free_slot(struct zram_slot *s)
 	s->len = 0;
 }
 
+/*
+ * Slot `idx`, or NULL when its chunk has never been written. With `create`,
+ * allocate the chunk: M_NOWAIT (this is the swap-out path), then the spare
+ * chunk, which the refill task replaces. Chunks live until unload.
+ */
+static struct zram_slot *
+zram_slot(uint32_t idx, bool create)
+{
+	volatile uintptr_t *dp = (volatile uintptr_t *)&zram_dir[idx >> ZRAM_CHUNK_SHIFT];
+	struct zram_slot *ch;
+	const size_t bytes = sizeof(struct zram_slot) * ZRAM_CHUNK_SLOTS;
+
+	ch = (struct zram_slot *)atomic_load_acq_ptr(dp);
+	if (ch == NULL && create) {
+		ch = malloc(bytes, M_ZRAM, M_NOWAIT | M_ZERO);
+		if (ch == NULL) {
+			ch = (struct zram_slot *)atomic_swap_ptr(
+			    (volatile uintptr_t *)&zram_spare_chunk, 0);
+			if (ch != NULL) {
+				ZRAM_ADD(zram_chunk_spare_used, 1);
+				taskqueue_enqueue(taskqueue_thread, &zram_refill_task);
+			}
+		}
+		if (ch == NULL) {
+			ZRAM_ADD(zram_fail_table, 1);
+			return (NULL);
+		}
+		if (atomic_cmpset_rel_ptr(dp, 0, (uintptr_t)ch)) {
+			ZRAM_ADD(zram_table_bytes, bytes);
+		} else {
+			/* Another writer installed this chunk first. */
+			free(ch, M_ZRAM);
+			ch = (struct zram_slot *)atomic_load_acq_ptr(dp);
+		}
+	}
+	return (ch == NULL ? NULL : &ch[idx & (ZRAM_CHUNK_SLOTS - 1)]);
+}
+
 /* Store `page` in slot `s`. Same-filled -> tag (0 bytes); else compress; if it
  * doesn't shrink enough, store raw. Returns 0, ENOMEM or ENOSPC (at the limit). */
 static int
@@ -303,12 +360,16 @@ zram_delete(struct bio *bp)
 
 	first = howmany(bp->bio_offset, ZRAM_PAGE);
 	end = (bp->bio_offset + bp->bio_length) / ZRAM_PAGE;
-	if (end > ZRAM_NSLOTS)
-		end = ZRAM_NSLOTS;
+	if (end > zram_nslots)
+		end = zram_nslots;
 	for (idx = first; idx < end; idx++) {
-		struct zram_slot *sl = &zram_slots[idx];
+		struct zram_slot *sl = zram_slot(idx, false);
 		struct mtx *lk;
 
+		if (sl == NULL) {	/* chunk never written: skip the rest of it */
+			idx |= ZRAM_CHUNK_SLOTS - 1;
+			continue;
+		}
 		if (sl->state == ZRAM_EMPTY)	/* unlocked peek; rechecked below */
 			continue;
 		lk = zram_slot_lock(sl);
@@ -331,6 +392,7 @@ zram_delete(struct bio *bp)
 static void
 zram_strategy(struct bio *bp)
 {
+	struct zram_slot *sl;
 	uint8_t *data;
 	off_t off;
 	uint32_t idx;
@@ -351,10 +413,19 @@ zram_strategy(struct bio *bp)
 	data = bp->bio_data;
 	for (off = 0; off < bp->bio_length; off += ZRAM_PAGE) {
 		idx = (uint32_t)((bp->bio_offset + off) / ZRAM_PAGE);
-		if (idx >= ZRAM_NSLOTS) { err = EINVAL; break; }
+		if (idx >= zram_nslots) { err = EINVAL; break; }
+		sl = zram_slot(idx, bp->bio_cmd == BIO_WRITE);
+		if (sl == NULL && bp->bio_cmd == BIO_WRITE) {
+			err = ENOMEM;	/* no memory for the table chunk */
+			break;
+		}
+		if (sl == NULL) {	/* never written: reads as zeros */
+			memset(data + off, 0, ZRAM_PAGE);
+			ZRAM_ADD(zram_reads, 1);
+			continue;
+		}
 		err = (bp->bio_cmd == BIO_READ) ?
-		    zram_load(&zram_slots[idx], data + off) :
-		    zram_store(&zram_slots[idx], data + off);
+		    zram_load(sl, data + off) : zram_store(sl, data + off);
 		if (err != 0)
 			break;
 	}
@@ -468,6 +539,15 @@ SYSCTL_INT(_kern_zram, OID_AUTO, reserve_avail, CTLFLAG_RD, &zram_pool.reserve_n
     "Reserve chunks (4 pages each) on hand");
 SYSCTL_U64(_kern_zram, OID_AUTO, reserve_used, CTLFLAG_RD, &zram_pool.reserve_used, 0,
     "Spans built from the reserve because the page allocator refused, since load");
+SYSCTL_U64(_kern_zram, OID_AUTO, disksize, CTLFLAG_RD, &zram_disksize_tun, 0,
+    "Device size in bytes (tunable, read at load; default physical RAM)");
+SYSCTL_U64(_kern_zram, OID_AUTO, table_bytes, CTLFLAG_RD, &zram_table_bytes, 0,
+    "Slot-table memory allocated so far (chunks are allocated on first write)");
+SYSCTL_U64(_kern_zram, OID_AUTO, table_spare_used, CTLFLAG_RD,
+    &zram_chunk_spare_used, 0,
+    "Table chunks taken from the spare because malloc refused, since load");
+SYSCTL_U64(_kern_zram, OID_AUTO, fail_table, CTLFLAG_RD, &zram_fail_table, 0,
+    "Writes failed for lack of memory for a table chunk, since load");
 SYSCTL_INT(_kern_zram, OID_AUTO, hdr_reserve_avail, CTLFLAG_RD, &zram_pool.hdr_n, 0,
     "Spare span headers on hand");
 SYSCTL_U64(_kern_zram, OID_AUTO, hdr_reserve_used, CTLFLAG_RD,
@@ -501,7 +581,16 @@ static int64_t zram_mem_limit_tun = -1;
 static void
 zram_refill(void *arg __unused, int pending __unused)
 {
+	struct zram_slot *ch;
+
 	zpool_refill(&zram_pool);
+	if (atomic_load_ptr(&zram_spare_chunk) == NULL) {
+		ch = malloc(sizeof(struct zram_slot) * ZRAM_CHUNK_SLOTS, M_ZRAM,
+		    M_WAITOK | M_ZERO);
+		if (!atomic_cmpset_ptr((volatile uintptr_t *)&zram_spare_chunk, 0,
+		    (uintptr_t)ch))
+			free(ch, M_ZRAM);
+	}
 }
 
 static void
@@ -545,8 +634,18 @@ zram_modevent(module_t mod __unused, int type, void *data __unused)
 		for (i = 0; i < ZRAM_NSLOTLOCKS; i++)
 			mtx_init((struct mtx *)&zram_slot_mtx[i], "zram slot", NULL, MTX_DEF);
 		mtx_init(&zram_pool_mtx, "zram pool", NULL, MTX_DEF);
-		zram_slots = malloc(sizeof(struct zram_slot) * ZRAM_NSLOTS, M_ZRAM,
+		/* Device size: kern.zram.disksize, default physical RAM. */
+		zram_disksize_tun = ptoa((uint64_t)physmem);
+		TUNABLE_UINT64_FETCH("kern.zram.disksize", &zram_disksize_tun);
+		zram_nslots = (uint32_t)MIN(MAX(zram_disksize_tun / ZRAM_PAGE,
+		    ZRAM_MIN_SLOTS), ZRAM_MAX_SLOTS);
+		zram_nslots = roundup2(zram_nslots, ZRAM_CHUNK_SLOTS);
+		zram_disksize_tun = (uint64_t)zram_nslots * ZRAM_PAGE;
+		zram_ndir = zram_nslots >> ZRAM_CHUNK_SHIFT;
+		zram_dir = malloc(sizeof(*zram_dir) * zram_ndir, M_ZRAM,
 		    M_WAITOK | M_ZERO);
+		zram_spare_chunk = malloc(sizeof(struct zram_slot) * ZRAM_CHUNK_SLOTS,
+		    M_ZRAM, M_WAITOK | M_ZERO);
 		TASK_INIT(&zram_refill_task, 0, zram_refill, NULL);
 		if (zpool_init(&zram_pool, zram_reserve_chunks, &zram_pool_mtx) != 0)
 			printf("atrium_zram: reserve short (%d of %d chunks)\n",
@@ -561,22 +660,33 @@ zram_modevent(module_t mod __unused, int type, void *data __unused)
 		zram_disk->d_name = "zram";
 		zram_disk->d_unit = 0;
 		zram_disk->d_sectorsize = ZRAM_PAGE;
-		zram_disk->d_mediasize = (off_t)ZRAM_NSLOTS * ZRAM_PAGE;
+		zram_disk->d_mediasize = (off_t)zram_nslots * ZRAM_PAGE;
 		zram_disk->d_maxsize = ZRAM_PAGE * 16;
 		zram_disk->d_flags = DISKFLAG_CANDELETE;	/* swapon -E trims into us */
-		zram_disk->d_delmaxsize = (off_t)ZRAM_NSLOTS * ZRAM_PAGE;
+		zram_disk->d_delmaxsize = (off_t)zram_nslots * ZRAM_PAGE;
 		disk_create(zram_disk, DISK_VERSION);
-		printf("atrium_zram: /dev/zram0 ready (%d pages = %juMB, packed pool, "
+		printf("atrium_zram: /dev/zram0 ready (%u pages = %juMB, lazy table, "
 		    "limit %juMB, reserve %dKB)\n",
-		    ZRAM_NSLOTS, (uintmax_t)((off_t)ZRAM_NSLOTS * ZRAM_PAGE >> 20),
+		    zram_nslots, (uintmax_t)((off_t)zram_nslots * ZRAM_PAGE >> 20),
 		    (uintmax_t)(zram_pool.limit >> 20), zram_pool.reserve_n * ZP_CHUNK / 1024);
 		return (0);
 	case MOD_UNLOAD:
 		disk_destroy(zram_disk);
 		taskqueue_drain(taskqueue_thread, &zram_refill_task);
-		for (i = 0; i < ZRAM_NSLOTS; i++)
-			zram_free_slot(&zram_slots[i]);
-		free(zram_slots, M_ZRAM);
+		for (i = 0; i < zram_ndir; i++) {
+			uint32_t j;
+
+			if (zram_dir[i] == NULL)
+				continue;
+			for (j = 0; j < ZRAM_CHUNK_SLOTS; j++)
+				zram_free_slot(&zram_dir[i][j]);
+			free(zram_dir[i], M_ZRAM);
+		}
+		free(zram_dir, M_ZRAM);
+		free(zram_spare_chunk, M_ZRAM);
+		zram_dir = NULL;
+		zram_spare_chunk = NULL;
+		zram_table_bytes = 0;
 		zpool_fini(&zram_pool);
 		zram_ctx_free();
 		for (i = 0; i < ZRAM_NSLOTLOCKS; i++)

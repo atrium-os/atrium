@@ -19,8 +19,13 @@
 > run 2.2× faster than on increment 2 (3.96 s vs 8.84 s for 128 MiB), and the
 > 1.9 GB fill still has 0 corrupt pages. The extra concurrency exposed a weak
 > spot in increment 2's span-header reserve, now replaced by the pool's own
-> spare-header list (§4.3 "As built"). Next: increment 4 (dynamic sizing, lazy
-> slot table).
+> spare-header list (§4.3 "As built").
+>
+> **2026-11-04 (later still):** increment 4 (device size tunable, lazily
+> allocated slot table; §4.1) is **built and verified in-VM**. The module's
+> memory at load fell from 12.0 MiB to 99 KiB, a 4 GiB device works on a 2 GiB
+> VM, and the 1.9 GB fill still has 0 corrupt pages and 0 failed stores.
+> Next: increment 5 (backing store and writeback).
 >
 > **Decision context (Shankar, 2026-11-03).** Atrium gets macOS-style compressed
 > main memory, and it must work in the Mac VM, which has no GPU. Using spare GPU
@@ -58,7 +63,7 @@ the parent spec).
    `M_NOWAIT` allocation can fail exactly when the pageout daemon needs it to
    succeed. A failed store fails the swap write. *(Fixed by increment 2.)*
 3. **Fixed size.** It is 2 GiB of swap (`ZRAM_NSLOTS`), and the 12 MiB slot
-   table is wired at load whether or not it is used.
+   table is wired at load whether or not it is used. *(Fixed by increment 4.)*
 4. **No memory limit and no writeback.** Nothing bounds how much RAM the store
    takes, and incompressible or cold pages have nowhere to go but RAM.
 5. **Tiering through swap is wrong on FreeBSD.** The swap allocator has no
@@ -240,6 +245,41 @@ module stays a leaf (no edits to the kernel VM).
 - Locking: **hashed slot locks** (256 `mtx`, indexed by slot number) instead of
   one global lock. The bio for a page holds only that page's lock.
 
+**As built (increment 4, 2026-11-04).**
+
+- `kern.zram.disksize` (bytes, loader tunable; `4G` style suffixes work) is
+  read at load. The default is physical RAM. It is clamped to 16 MiB–1 TiB and
+  rounded up to a whole chunk. The read-only sysctl of the same name reports
+  the size in use.
+- The table is a directory of chunk pointers. A chunk is **4096 slots
+  (64 KiB)**, not 64 Ki: under pressure a 64 KiB `M_NOWAIT` allocation is far
+  likelier to succeed than a 1 MiB one, and the directory is still small (32 KiB
+  for 1 TiB). A write into an unallocated chunk allocates it `M_NOWAIT`; if
+  that fails it takes a **spare chunk** that the refill task replaces; if both
+  fail the write fails with ENOMEM (`fail_table`). Two writers racing for a
+  chunk publish with a compare-and-swap, and the loser frees its copy. A read of
+  a never-written chunk returns zeros, and a delete skips the chunk.
+- The slot is **16 bytes** (v1: 24): span pointer, object index, length,
+  state, fill byte. The 8-byte packed handle above needs a handle table in the
+  pool so a slot can name its span in under 64 bits. That is left for
+  increment 5, which has to add a "written back" state to the slot anyway.
+- Chunks are not freed when they empty again; they live until unload. Swap
+  stripes across the whole device, so a busy device touches most chunks
+  anyway (see below), and freeing would need a per-chunk live count on the hot
+  path. Deferred (§8).
+- New sysctls: `disksize`, `table_bytes`, `table_spare_used`, `fail_table`.
+- Measured in the VM (2 GiB RAM):
+  - Module malloc at load (`vmstat -m`, type `zram`): **12,617,728 bytes on
+    increment 3, 101,376 on increment 4.**
+  - Default device: 2,113,929,216 bytes (physical RAM, chunk-rounded).
+    Round-trips at the first and last 4 MiB match, and an unwritten region in
+    between reads as zeros. 128 KiB of table was allocated for the two writes.
+  - With `kern.zram.disksize=4G`: a 4 GiB device; a 4 MiB round-trip at
+    3.5 GiB matches with 64 KiB of table allocated.
+  - The 1.9 GB fill: 0 of 486,400 pages corrupt; `fail_nomem`, `fail_table`,
+    `reserve_used` and `hdr_reserve_used` all 0; the table grew to 7.4 MiB
+    (119 of 126 chunks) as swap spread across the device.
+
 ### 4.2 Packed allocator (`zpool`)
 
 zsmalloc-shaped, sized from §3:
@@ -415,7 +455,7 @@ Two small consumers:
 | 1 | §4.6 counters + `BIO_DELETE` + selftest on private slots | **DONE, verified in-VM 2026-11-03** (§3.1): `orig_bytes` matches `swapinfo` to 0.1 %, `trim(8)` frees exact slot counts, and the selftest is safe with swap live. |
 | 2 | §4.2 packed allocator + §4.4 limit | **DONE, verified 2026-11-04**: the userspace churn test passes, a 550-page `dd` round-trip matches, the 1.9 GB fill has 0 corruption with pool overhead 3.9 % over the data, and the limit holds exactly (its feedback path waits for increment 5). |
 | 3 | §4.3 per-CPU contexts + §4.1 hashed locks | **DONE, verified in-VM 2026-11-04**: 4 parallel `dd` writers 2.2× faster than increment 2, all streams byte-identical; the 1.9 GB fill has 0 corruption and 0 `fail_nomem` (after the span-header fix, §4.3). The 4-job-build PSI comparison is not run yet: a build under TCG takes hours, so it waits for a faster host. |
-| 4 | §4.1 dynamic sizing, lazy table | Wired memory at load drops by the table size. A disksize tunable over RAM works. |
+| 4 | §4.1 dynamic sizing, lazy table | **DONE, verified in-VM 2026-11-04**: module memory at load fell from 12.0 MiB to 99 KiB, a 4 GiB device works on a 2 GiB VM, and the 1.9 GB fill has 0 corruption and 0 failures. The slot is 16 bytes, not 8 (the 8-byte handle moves to increment 5). |
 | 5 | §4.5 backing store and writeback | With a disk partition as backing: RAW pages land on disk, idle pages are written back after the period, and reads of written-back pages match. `swapinfo` shows only zram0. |
 | 6 | §4.7 LZ4 option | Selftest under both codecs. In-kernel timing of codec vs whole `zram_strategy` per page (dtrace `fbt`). |
 
@@ -468,3 +508,6 @@ store.
 - **zstd recompression of idle LZ4 pages**: only if increment 6 shows LZ4 is
   wanted as the front codec.
 - **Hardware compression engines**: none on the target machines; out of scope.
+- **Freeing empty slot-table chunks**: chunks stay until unload (§4.1 "As
+  built"). Worth doing only if a large `disksize` with bursty use shows table
+  memory that matters.
