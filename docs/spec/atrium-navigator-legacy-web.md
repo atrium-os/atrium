@@ -1222,6 +1222,51 @@ percentage. The corpus number remains useful for a different question — whethe
 *document* lane covers ordinary reading — and should not be retired, only stopped from
 answering a question it cannot.
 
+### 11.8.3 The list, filled in for the corpus's applications (2026-11-04)
+
+§11.8.2 asks for an enumerated list. This is it for the application pages in the two
+corpora. **It comes from public knowledge of each product, not from measurement.** The
+corpus recordings are logged-out landing pages and cannot show the application behind the
+sign-in. "Thin" means the logic and data sit behind a server API and the client is
+presentation plus sync. "Fat" means the product's logic runs in the client.
+
+| application | client | what the client does | open protocol | path |
+|---|---|---|---|---|
+| Gmail | thin, large | UI, rich-text compose, IndexedDB cache, push sync, private JSON-RPC | IMAP / JMAP / SMTP | **native mail app** |
+| Google Calendar | thin | UI over events | CalDAV | **native** |
+| Mastodon | thin | UI over the REST API | ActivityPub + Mastodon API | **native** |
+| Bluesky | thin | UI over the API | AT Protocol | **native** |
+| Twitch | thin + video | HLS player, chat UI | HLS video; chat is IRC | **native** (watch and chat) |
+| WhatsApp Web | **fat** | end-to-end encryption runs in the client, paired to the phone | none (DMA interop pending) | **tier 4**, or nothing |
+| Spotify | thin + DRM | player, encrypted audio via EME/Widevine | none | **blocked by DRM**, even in tier 4 |
+| Figma | **fat** | C++ to WASM editor on WebGL: document model, layout, rendering | none | **tier 4** (WASM + WebGL), or nothing |
+| Notion | medium | block editor and local cache in the client; private sync API | none | reading: tier 1/2 · editing: **tier 4** |
+| Trello | thin | board UI, drag and drop, REST API | public REST API | reading: §5.4.5 · full UI: native client on the API, or tier 4 |
+| Instagram, Pinterest, TikTok | thin | infinite feed over private APIs; TikTok adds video | none | feeds: §5.4.5 at best (login, anti-bot) · posting: **tier 4** |
+| LinkedIn Jobs, Indeed | thin | search and listings | none | **§5.4.5** (search binding) · applying: form template |
+| Airbnb, Booking, TripAdvisor | thin + map | search, a WebGL map widget, booking forms | none | search: **§5.4.5** · map: **tier 4** · checkout: see payments |
+| Coursera, edX | thin + video | catalogue, HLS/DASH video, quizzes as form submits | none | **§5.4.5** + native video |
+| Khan Academy | medium | client-side exercise renderer that grades answers in the page | none | reading: tier 1/2 · exercises: **tier 4** |
+| weather.com | thin | forecast data into templates | none (public weather APIs exist) | **§5.4.5** |
+| Etsy, Apple Store | thin | catalogue and cart | none | browsing: tier 1/2 + §5.4.5 · checkout: see payments |
+| Chase, Vanguard, Citibank | thin, hardened | UI plus fraud and device-fingerprinting scripts | none in the US (Open Banking APIs in the UK and EU need a licensed third party) | **tier 4**, and fraud scoring may challenge it even there |
+
+**What the list says, beyond §11.8.2:**
+
+1. **Two-thirds of these are thin clients.** Their logic is on the server. The client
+   mostly turns API responses into a UI, which is §5.4.5's shape (and, where an open
+   protocol exists, a native app's). Tier 4 is not the only way in for most of them.
+2. **Payments are a cross-cutting tier-4 need.** Card fields are deliberately client-side,
+   in cross-origin iframes running the processor's tokenisation JS (Stripe, Adyen,
+   3-D Secure), so that the merchant never sees the card number. Every shop and travel
+   site meets this at checkout. It is one capability that recurs everywhere, so it is
+   worth a dedicated answer, perhaps a native payment sheet, rather than tier 4 per site.
+3. **DRM is a separate wall.** Spotify (and Netflix-class video) needs EME with a licensed
+   CDM. Tier 4 does not supply one, so these stay out of reach whatever the engine.
+4. **The genuinely fat clients are few and specific:** Figma, WhatsApp's client-side
+   cryptography, Notion's editor, Khan's exercises, map widgets. These, banking and
+   checkout are what tier 4 actually has to carry.
+
 ### 11.8.1 Why Boa for the instrument when Nova has the better architecture
 
 Both statements hold, because they answer different questions, and the apparent conflict
