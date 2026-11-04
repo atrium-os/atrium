@@ -269,15 +269,7 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
         if kw(ts, "display") != "table" { continue }
         let sx = match ts.get("border-spacing") { V::Pair(a, _) => len(a, 0).unwrap_or(0), _ => 0 };
         // Rows, flattening any wrapper — the same walk the layout does.
-        let mut rows = vec![];
-        let mut stack: Vec<Handle> = dom.element_children(t).into_iter().rev().collect();
-        while let Some(c) = stack.pop() {
-            match cx.st(c).map(|cs| kw(cs, "display")) {
-                Some("table-row") => rows.push(c),
-                Some("none") => {}
-                _ => for g in dom.element_children(c).into_iter().rev() { stack.push(g) },
-            }
-        }
+        let (rows, _) = cx.table_rows(t);
         // Collected up front: the measuring loop needs `cx` mutably.
         let rows_cells: Vec<Vec<Handle>> = rows.iter().map(|r| dom.element_children(*r).into_iter()
             .filter(|c| cx.st(*c).map(|cs| kw(cs, "display")) == Some("table-cell")).collect()).collect();
@@ -745,7 +737,7 @@ impl<'a> Cx<'a> {
         // between them form anonymous block boxes of line boxes.
         if kw(s, "display") == "grid" {
             cy += self.grid(h, s, content_x, cy, content_w, child_cb_h);
-        } else if kw(s, "display") == "table" {
+        } else if kw(s, "display") == "table" && !self.table_rows(h).0.is_empty() {
             cy += self.table(h, s, content_x, cy, content_w);
         } else if kw(s, "display") == "flex" {
             cy += self.flex(h, s, content_x, cy, content_w, child_cb_h);
@@ -1248,20 +1240,32 @@ impl<'a> Cx<'a> {
             }
         }
         if !cols.is_empty() { return Ok(cols) }
+        let Some(first) = self.table_rows(h).0.first().copied() else { return Ok(vec![]) };
+        let cells: Vec<Handle> = self.dom.element_children(first).into_iter()
+            .filter(|x| self.st(*x).map(|cs| kw(cs, "display")) == Some("table-cell")).collect();
+        if cells.iter().any(|x| self.colspan(*x) > 1) { return Err("spanning first row") }
+        Ok(cells)
+    }
+
+    /// A table's rows, flattening any wrapper (`tbody`, or whatever the
+    /// parser inserted), and the NESTED tables met on the way. ★ A nested
+    /// table is its own table, never a wrapper (CSS 2.1 §17.2.1: it sits in
+    /// an anonymous row and cell of the outer one). Walked into, its rows
+    /// became the outer table's: Wikipedia's `div.navbox { display: table }`
+    /// around a real navbox `<table>` adopted that table's spanning title
+    /// row, could not declare its columns, and was refused.
+    fn table_rows(&self, h: Handle) -> (Vec<Handle>, Vec<Handle>) {
+        let (mut rows, mut nested) = (vec![], vec![]);
         let mut stack: Vec<Handle> = self.dom.element_children(h).into_iter().rev().collect();
         while let Some(c) = stack.pop() {
             match self.st(c).map(|cs| kw(cs, "display")) {
-                Some("table-row") => {
-                    let cells: Vec<Handle> = self.dom.element_children(c).into_iter()
-                        .filter(|x| self.st(*x).map(|cs| kw(cs, "display")) == Some("table-cell")).collect();
-                    if cells.iter().any(|x| self.colspan(*x) > 1) { return Err("spanning first row") }
-                    return Ok(cells);
-                }
+                Some("table-row") => rows.push(c),
+                Some("table") => nested.push(c),
                 Some("none") => {}
                 _ => for g in self.dom.element_children(c).into_iter().rev() { stack.push(g) },
             }
         }
-        Ok(vec![])
+        (rows, nested)
     }
 
     /// The narrowest a table can be: its declared column minimums plus the
@@ -1790,15 +1794,8 @@ impl<'a> Cx<'a> {
             _ => (0, 0),
         };
         // Rows, flattening any wrapper the parser inserted.
-        let mut rows = vec![];
-        let mut stack: Vec<Handle> = self.dom.element_children(h).into_iter().rev().collect();
-        while let Some(c) = stack.pop() {
-            match self.st(c).map(|cs| kw(cs, "display")) {
-                Some("table-row") => rows.push(c),
-                Some("none") => {}
-                _ => for g in self.dom.element_children(c).into_iter().rev() { stack.push(g) },
-            }
-        }
+        let (rows, nested) = self.table_rows(h);
+        for _ in nested { self.count("a nested table beside table rows (not laid out)") }
         let cells_of = |this: &Self, r: Handle| -> Vec<Handle> {
             this.dom.element_children(r).into_iter()
                 .filter(|c| this.st(*c).map(|cs| kw(cs, "display")) == Some("table-cell")).collect()
@@ -2941,6 +2938,25 @@ mod tests {
         assert_eq!((a.0, a.2), (800 - 100, 100), "column 1 is the RIGHTMOST, in a table shrink-wrapped to the right");
         assert_eq!((b.0, b.2), (800 - 150, 50), "column 2 is to its left");
         assert_eq!((wide.0, wide.2), (800 - 500, 500), "the overwide table overflows on the left, past the box's 400");
+    }
+
+    /// ★ A NESTED table is not a wrapper. A `display: table` div around a
+    /// real table with a spanning title row must not adopt that row: the
+    /// outer box is one anonymous cell, and the inner table lays itself out
+    /// from its own `<col>`s.
+    #[test]
+    fn a_table_inside_a_css_table_keeps_its_own_rows() {
+        let src = r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .outer { display: table } table { border-spacing: 10px 0px } .c0 { width: 100px } .c1 { width: 300px }
+            .t { background-color: #ff0000 } .l { background-color: #00ff00 }</style>
+            <div class="outer"><table><colgroup><col class="c0"><col class="c1"></colgroup>
+            <tr><th class="t" colspan="2">Title</th></tr>
+            <tr><th class="l">People</th><td>Bob Fabry</td></tr></table></div>"#;
+        let o = render(src);
+        assert!(o.diagnostics.is_empty(), "the outer box is not refused: {:?}", o.diagnostics);
+        let (t, l) = (boxes(&o, 0xff0000ff), boxes(&o, 0x00ff00ff));
+        assert_eq!((t[0].0, t[0].2), (10, 100 + 10 + 300), "the inner title spans the inner table's columns");
+        assert_eq!((l[0].0, l[0].2), (10, 100));
     }
 
     #[test]
