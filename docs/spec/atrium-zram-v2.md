@@ -761,7 +761,10 @@ the fill's page contents differed (the `bench` sample compressed 2.5× off and
 Fix found by this run: a read touching a written-back slot decompressed the
 other pages and then fell back, so GEOM decompressed them again (283k
 fallbacks). `zram_fast()` now checks for WB slots before doing any work
-(`kern.zram.fast_wbskip`). The higher `fail_nomem` with the fast path on is
+(`kern.zram.fast_wbskip`). Checked in the arm64 VM with LZ4, a 64 MiB pool limit and a 3 GiB md
+backing store: `test/swaptouch.c 2300 2 rnd` (half the pages incompressible)
+wrote back 520k pages and read back 531k. 26,687 reads went straight to GEOM.
+0 bad pages over both verify passes, and `wb_fail` and `fail_io` stayed at 0. The higher `fail_nomem` with the fast path on is
 not yet explained. Chunk allocation is M_NOWAIT on both paths; with the fast
 path it runs in the page daemon's context. Not a correctness issue: failed
 stores fall back to write-through.
