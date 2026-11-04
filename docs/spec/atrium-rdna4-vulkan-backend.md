@@ -70,6 +70,11 @@ except for additions both backends need (for example subgroup ops).
 
 ## 3. Shader compiler
 
+> **2026-11-04:** the compiler core is now layered: frontend IR → a shared,
+> target-independent GPU IR (GIR) → one machine layer per GPU architecture.
+> See [`atrium-gpu-ir.md`](atrium-gpu-ir.md). Steps 2–4 below move into GIR;
+> steps 5–9 are the RDNA4 machine layer. GIR milestones G1–G3 replace M1.
+
 The compiler is about 70% of the work. The plan is to own it, built on the
 atrium-spv IR (structured CFG, SSA, per-invocation semantics), and to write the
 parts that are easy to get subtly wrong against the generated ISA tables from

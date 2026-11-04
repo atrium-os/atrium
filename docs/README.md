@@ -16,6 +16,7 @@ Architecture and design docs for an integrated FreeBSD desktop platform built ar
    - [subsystems/graphics.md](subsystems/graphics.md) — Fresco protocol + Atrium GPU ABI.
    - [GRAPHICS-STACK.md](GRAPHICS-STACK.md) — the graphics stack as built (2026-11-03): drivers, ABIs, renderers, 2D/3D app paths, Mesa status, doc/code gaps.
    - [spec/atrium-rdna4-vulkan-backend.md](spec/atrium-rdna4-vulkan-backend.md) — design for our own RDNA4 Vulkan backend (native Tier-3, no Mesa), tested against Tier-2, the R9700 and gpusim.
+   - [spec/atrium-gpu-ir.md](spec/atrium-gpu-ir.md) — the layered shader compiler core: frontend IR → shared GPU IR (GIR) → per-architecture machine layers (RDNA4 first).
    - [reviews/2026-11-03-gpu-kernel-and-tier2-review.md](reviews/2026-11-03-gpu-kernel-and-tier2-review.md) — review of the DRM-free kernel GPU architecture vs atrium-gpu-amd, and Tier-2 maturity.
    - [subsystems/storage.md](subsystems/storage.md) — Tessera + per-jail mosaics + distribution.
    - [subsystems/sandbox.md](subsystems/sandbox.md) — Portcullis: jails + capability manifest + IPC channels.

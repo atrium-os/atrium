@@ -102,7 +102,8 @@ pub struct Dispatch {
     pub shader_va: u64,
     /// VGPRs used per thread.
     pub vgprs: u32,
-    /// User SGPR values (s0..), at most 16.
+    /// User SGPR values (s0..), at most 16. The workgroup id x, y, z follow
+    /// in the next three SGPRs.
     pub user_sgprs: Vec<u32>,
     /// Threads per workgroup.
     pub threads: [u32; 3],
@@ -123,7 +124,11 @@ pub fn emit_dispatch(b: &mut Blob, d: &Dispatch) {
         | (0xc0 << compute_pgm_rsrc1::FLOAT_MODE_SHIFT) // f32/f64 denormals preserved
         | (1 << compute_pgm_rsrc1::MEM_ORDERED_SHIFT);
     let rsrc2 = ((d.user_sgprs.len() as u32) << compute_pgm_rsrc2::USER_SGPR_SHIFT)
-        | (0 << compute_pgm_rsrc2::TIDIG_COMP_CNT_SHIFT); // local id in v0
+        | (0 << compute_pgm_rsrc2::TIDIG_COMP_CNT_SHIFT) // local id in v0
+        // Workgroup id x, y, z arrive in the three SGPRs after the user SGPRs.
+        | compute_pgm_rsrc2::TGID_X_EN_MASK
+        | compute_pgm_rsrc2::TGID_Y_EN_MASK
+        | compute_pgm_rsrc2::TGID_Z_EN_MASK;
     b.set_sh(COMPUTE_PGM_LO, &[(d.shader_va >> 8) as u32, (d.shader_va >> 40) as u32]);
     b.set_sh(COMPUTE_PGM_RSRC1, &[rsrc1, rsrc2]);
     b.set_sh(COMPUTE_PGM_RSRC3, &[0]);
