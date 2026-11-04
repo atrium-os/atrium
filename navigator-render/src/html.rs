@@ -615,7 +615,12 @@ impl<'a> Cx<'a> {
         // Taken as exact, Wikipedia's weather boxes — `th { height: calc(16px
         // + …) }` — held a three-line row header to one line, and
         // "(≥ 0.1 mm)" painted over the next row.
-        let cell_floor = if part && kw(s, "display") == "table-cell" { spec_h.take() } else { None };
+        // ★ So is a TABLE's (§17.5.3: "the 'height' property … specifies
+        // a minimum"): taken as exact, Samsung's footer terms — a
+        // `display: table` of links with `height: 4.44vw` — kept its 36 px
+        // while its links wrapped to six lines, and the row after it
+        // painted over them.
+        let cell_floor = if (part && kw(s, "display") == "table-cell") || matches!(kw(s, "display"), "table" | "inline-table") { spec_h.take() } else { None };
         let definite = force.1.or(repl_used.map(|(_, hh)| hh)).or(spec_h)
             // aspect-ratio: with a definite width and an auto height, the
             // height follows the ratio (CSS Sizing 4).
@@ -2965,6 +2970,22 @@ mod tests {
         let (t, l) = (boxes(&o, 0xff0000ff), boxes(&o, 0x00ff00ff));
         assert_eq!((t[0].0, t[0].2), (10, 100 + 10 + 300), "the inner title spans the inner table's columns");
         assert_eq!((l[0].0, l[0].2), (10, 100));
+    }
+
+    /// ★ A table's `height` is a minimum (CSS 2.1 §17.5.3): a table whose
+    /// rows need more grows, and the box after it starts below them.
+    #[test]
+    fn a_table_grows_past_its_specified_height() {
+        let src = r#"<style>body { margin-left: 0px; margin-top: 0px; font-size: 12px; line-height: 20px }
+            .t { display: table; height: 36px } .c { display: table-cell } .after { background-color: #ff0000; height: 10px }</style>
+            <div class="t"><div class="c"><div>one</div><div>two</div><div>three</div><div>four</div></div></div>
+            <div class="after"></div>"#;
+        let o = render(src);
+        let after = boxes(&o, 0xff0000ff);
+        assert_eq!(after[0].1, 80, "four 20 px lines, not the 36 px the table asked for");
+        // A short table still takes its height.
+        let o = render(&src.replace("<div>two</div><div>three</div><div>four</div>", ""));
+        assert_eq!(boxes(&o, 0xff0000ff)[0].1, 36);
     }
 
     /// ★ UAX #14. CJK breaks between ideographs (punctuation stays with
