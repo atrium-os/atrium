@@ -8,6 +8,12 @@
 > `da0b30649`), verified in-VM the same day. The §3 numbers come from a Linux host
 > used as a stand-in. §3.1 covers what has been confirmed on FreeBSD so far.
 >
+> **2026-11-04:** increment 2 (packed allocator, memory limit, reserve; §4.2,
+> §4.4) is **built and verified in-VM**. On the same 1.9 GB workload the
+> store's memory overhead over the compressed data fell from **40 % to 3.9 %**,
+> failed page-outs fell from 356 to 0, and no pages were corrupted. The limit
+> holds exactly (§4.4). Next: increment 3 (per-CPU codecs, hashed locks).
+>
 > **Decision context (Shankar, 2026-11-03).** Atrium gets macOS-style compressed
 > main memory, and it must work in the Mac VM, which has no GPU. Using spare GPU
 > VRAM as RAM overflow was **rejected**: a GPU reset wipes VRAM, games reclaim it,
@@ -42,7 +48,7 @@ the parent spec).
    so every page-in and page-out on every CPU runs serially.
 2. **One `malloc(9)` per page.** This wastes bytes on rounding (§3), and the
    `M_NOWAIT` allocation can fail exactly when the pageout daemon needs it to
-   succeed. A failed store fails the swap write.
+   succeed. A failed store fails the swap write. *(Fixed by increment 2.)*
 3. **Fixed size.** It is 2 GiB of swap (`ZRAM_NSLOTS`), and the 12 MiB slot
    table is wired at load whether or not it is used.
 4. **No memory limit and no writeback.** Nothing bounds how much RAM the store
@@ -247,6 +253,39 @@ zsmalloc-shaped, sized from §3:
   pool's fragmentation passes a threshold. This is the macOS segment-compaction
   analog. It is not needed until the counters show fragmentation.
 
+**As built** (`atrium-zram/zram_pool.{c,h}`, 2026-11-04):
+
+- There are 96 classes, 32 to 3072 bytes, plus a one-page RAW class. Each
+  class uses the fewest pages (1–4) that come within 1 % of its best tail
+  waste. Compressed pages over 3072 bytes are stored RAW: with spans of at most
+  4 pages, a 3.1–4 KiB object costs a page anyway, and RAW skips the
+  decompress.
+- Span memory comes from `kmem_malloc(M_NOWAIT | M_USE_RESERVE)`. Span headers
+  come from a UMA zone with `uma_zone_reserve` and `uma_prealloc`, so a header
+  never eats into a span.
+- The reserve is 256 chunks of 4 pages (4 MiB; tunable
+  `kern.zram.reserve_chunks`). An empty 4-page span goes back to the reserve
+  while it is below target. A taskqueue refills it whenever it drops below
+  half.
+- Counters: `kern.zram.{pool_bytes, obj_bytes, spans, reserve_avail,
+  reserve_used, fail_limit}`. `pool_bytes` is the store's real footprint.
+  `pool_bytes - obj_bytes` is span fragmentation.
+- Userspace test (`atrium-zram/test/zpool_test.c`, the same source under a
+  shim): 120k random alloc/free operations on the measured size mix, with a
+  pattern written to every object and checked before it is freed. It audits
+  the accounting against a recount, injects page-allocator and header failures
+  (the reserve absorbs them, then `ENOMEM`), and checks that the limit refuses
+  rather than overshoots. Under pure random churn, span fragmentation settles
+  near 15 % with 20k live objects. That is the case compaction would address,
+  and the real workload below did far better.
+- **In-VM** (ATRIUM kernel, 2 GB, zram the only swap, limit off), on the same
+  1.9 GB checksummed fill as §4.0, at peak: 1854 MiB logical, 782 MiB of
+  compressed data, 788 MiB class-rounded, and a **813 MiB pool**. That is
+  **3.9 % overhead over the data, against v1's 40 %** (727 MiB of `malloc` for
+  518 MiB of data). `malloc(9)` now holds only the 12 MiB slot table. Results:
+  0 of 486,400 pages corrupt, `fail_nomem` = 0 (v1: 356 on the same kind of
+  run), the reserve never touched, and an empty pool after exit.
+
 ### 4.3 Per-CPU codec contexts
 
 One pre-allocated `ZSTD_CCtx` and `ZSTD_DCtx` per CPU (`mp_ncpus`), each behind
@@ -262,6 +301,16 @@ the physical bytes the store may hold. Over the limit, a write goes to writeback
 (§4.5) or fails with `ENOSPC`. That makes swap full, which is what PSI `full` and
 `memoryd` already react to. It keeps the compressed tier from consuming the
 memory it is meant to save.
+
+**As built and measured (2026-11-04).** In-VM, with the limit set to 300 MiB
+under a 1.7 GB fill, the pool peaked at exactly 314,572,800 bytes and refused
+17,798 stores (`fail_limit`). The feedback path is crude, though. FreeBSD's
+swap pager treats `ENOSPC` as an I/O error: 1,331 `pageout failed` lines went
+to the console, the pages stayed dirty, and the kernel OOM killer ended the fill
+while `swapinfo` still showed free space. PSI `some` reached 51.7 %, which
+`memoryd` would act on first in a real system. Increment 5's writeback turns
+"at the limit" into "move cold pages to disk" instead of failing. Until then,
+the default (25 % of RAM) is a safety bound, not a tuning knob.
 
 ### 4.5 Backing store and writeback (fixes v1 limit 5)
 
@@ -317,7 +366,7 @@ Two small consumers:
 |---|---|---|
 | 0 | §4.0 swap-free notification (kernel, atrium-os branch) | **DONE, verified in-VM 2026-11-03**: after exit, `orig_bytes` matches `swapinfo` (8.1 MiB), and there was 0 corruption across 486k checksummed pages with blocks freed and reused mid-run. |
 | 1 | §4.6 counters + `BIO_DELETE` + selftest on private slots | **DONE, verified in-VM 2026-11-03** (§3.1): `orig_bytes` matches `swapinfo` to 0.1 %, `trim(8)` frees exact slot counts, and the selftest is safe with swap live. |
-| 2 | §4.2 packed allocator + §4.4 limit | Selftest extended with 10k random-size objects, alloc/free, and a bitmap audit. `dd` round-trip. A build under a RAM cap: `pool_bytes / orig_bytes` within 5 % of memprobe's *packed* prediction. |
+| 2 | §4.2 packed allocator + §4.4 limit | **DONE, verified 2026-11-04**: the userspace churn test passes, a 550-page `dd` round-trip matches, the 1.9 GB fill has 0 corruption with pool overhead 3.9 % over the data, and the limit holds exactly (its feedback path waits for increment 5). |
 | 3 | §4.3 per-CPU contexts + §4.1 hashed locks | 4 parallel `dd` streams scale. Under a 4-job build with zram, lower PSI `full` than v1 at the same cap. |
 | 4 | §4.1 dynamic sizing, lazy table | Wired memory at load drops by the table size. A disksize tunable over RAM works. |
 | 5 | §4.5 backing store and writeback | With a disk partition as backing: RAW pages land on disk, idle pages are written back after the period, and reads of written-back pages match. `swapinfo` shows only zram0. |

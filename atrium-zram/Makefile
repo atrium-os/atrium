@@ -5,6 +5,6 @@
 #   sysctl kern.zram.selftest
 
 KMOD=	atrium_zram
-SRCS=	atrium_zram.c
+SRCS=	atrium_zram.c zram_pool.c
 
 .include <bsd.kmod.mk>

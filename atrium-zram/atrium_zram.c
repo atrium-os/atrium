@@ -27,7 +27,11 @@
 #include <sys/mutex.h>
 #include <sys/sbuf.h>
 #include <sys/sysctl.h>
+#include <sys/queue.h>
+#include <sys/taskqueue.h>
 #include <geom/geom_disk.h>
+
+#include "zram_pool.h"
 
 /* In-kernel zstd context API (resolved at load against the kernel's globals). */
 typedef struct ZSTD_CCtx_s ZSTD_CCtx;
@@ -45,16 +49,19 @@ unsigned ZSTD_isError(size_t code);
 #define	ZRAM_LEVEL	3
 #define	ZRAM_NSLOTS	524288	/* store capacity in pages (524288 = 2 GiB device) */
 
-static MALLOC_DEFINE(M_ZRAM, "zram", "atrium zram store");
+MALLOC_DEFINE(M_ZRAM, "zram", "atrium zram store");
 
 /* One stored page. SAME = a same-filled page (incl. all-zero) kept as a tag, no
- * buffer; COMP = zstd-compressed; RAW = incompressible, stored verbatim. */
+ * buffer; COMP = zstd-compressed; RAW = incompressible (or compressed to more
+ * than ZP_MAXOBJ, where packing saves nothing), stored verbatim. COMP and RAW
+ * live in the packed pool (zram_pool.c), not in per-page malloc buffers. */
 enum zram_state { ZRAM_EMPTY = 0, ZRAM_SAME, ZRAM_COMP, ZRAM_RAW };
 struct zram_slot {
 	enum zram_state	state;
 	uint32_t	len;	/* COMP/RAW byte length */
 	uint8_t		fill;	/* SAME fill byte */
-	void		*buf;	/* COMP/RAW buffer, NULL for SAME/EMPTY */
+	uint16_t	idx;	/* object index in span */
+	struct zspan	*span;	/* COMP/RAW pool span, NULL for SAME/EMPTY */
 };
 
 static struct zram_slot	*zram_slots;
@@ -63,6 +70,17 @@ static ZSTD_DCtx	*zram_dctx;
 static struct mtx	 zram_mtx;	/* serializes the shared contexts (per-CPU = refinement) */
 static uint64_t		 zram_phys_bytes;	/* total physical bytes the store holds */
 static struct disk	*zram_disk;	/* /dev/zram0 — the swap block device */
+
+/*
+ * The packed pool (atrium-zram-v2.md §4.2/§4.4, increment 2). Serialized by
+ * zram_mtx like everything else here. kern.zram.mem_limit bounds what it may
+ * hold; the reserve of 4-page chunks (kern.zram.reserve_chunks at load)
+ * backs swap-outs when the page allocator says no, and a task refills it.
+ */
+static struct zpool	zram_pool;
+static struct task	zram_refill_task;
+static int		zram_reserve_chunks = 256;	/* 4 MiB */
+TUNABLE_INT("kern.zram.reserve_chunks", &zram_reserve_chunks);
 
 /*
  * Counters (atrium-zram-v2.md §4.6, increment 1). All updated under zram_mtx.
@@ -82,7 +100,7 @@ static struct disk	*zram_disk;	/* /dev/zram0 — the swap block device */
 static uint64_t	zram_pages_same, zram_pages_comp, zram_pages_raw;	/* gauges */
 static uint64_t	zram_hist[ZRAM_HIST_LEN];				/* gauge */
 static uint64_t	zram_reads, zram_writes, zram_deletes;			/* events, pages */
-static uint64_t	zram_fail_nomem, zram_fail_io;				/* events */
+static uint64_t	zram_fail_nomem, zram_fail_limit, zram_fail_io;	/* events */
 
 static void
 zram_count(const struct zram_slot *s, int dir)
@@ -122,10 +140,10 @@ static void
 zram_free_slot(struct zram_slot *s)
 {
 	zram_count(s, -1);
-	if (s->buf != NULL) {
+	if (s->span != NULL) {
 		zram_phys_bytes -= s->len;
-		free(s->buf, M_ZRAM);
-		s->buf = NULL;
+		zpool_free(&zram_pool, s->span, s->idx);
+		s->span = NULL;
 	}
 	s->state = ZRAM_EMPTY;
 	s->len = 0;
@@ -150,22 +168,37 @@ zram_store(struct zram_slot *s, const void *page)
 		goto out; /* 0 physical bytes — the zero/same-page win */
 	}
 	clen = ZSTD_compressCCtx(zram_cctx, comp, sizeof(comp), page, ZRAM_PAGE, ZRAM_LEVEL);
-	if (!ZSTD_isError(clen) && clen < ZRAM_PAGE) {
-		s->buf = malloc(clen, M_ZRAM, M_NOWAIT);
-		if (s->buf == NULL) { zram_fail_nomem++; err = ENOMEM; goto out; }
-		memcpy(s->buf, comp, clen);
+	if (!ZSTD_isError(clen) && clen <= ZP_MAXOBJ) {
+		err = zpool_alloc(&zram_pool, clen, &s->span, &s->idx);
+		if (err != 0)
+			goto fail;
+		memcpy(zpool_ptr(s->span, s->idx, zpool_objsize(&zram_pool, s->span)),
+		    comp, clen);
 		s->state = ZRAM_COMP;
 		s->len = clen;
 	} else {
-		/* incompressible (or codec error) → store verbatim. */
-		s->buf = malloc(ZRAM_PAGE, M_ZRAM, M_NOWAIT);
-		if (s->buf == NULL) { zram_fail_nomem++; err = ENOMEM; goto out; }
-		memcpy(s->buf, page, ZRAM_PAGE);
+		/*
+		 * Incompressible, compressed to over ZP_MAXOBJ (a packed object
+		 * that size costs a page anyway), or a codec error: verbatim.
+		 */
+		err = zpool_alloc(&zram_pool, ZRAM_PAGE, &s->span, &s->idx);
+		if (err != 0)
+			goto fail;
+		memcpy(zpool_ptr(s->span, s->idx, ZRAM_PAGE), page, ZRAM_PAGE);
 		s->state = ZRAM_RAW;
 		s->len = ZRAM_PAGE;
 	}
 	zram_phys_bytes += s->len;
+	goto out;
+fail:
+	s->span = NULL;
+	if (err == ENOSPC)
+		zram_fail_limit++;
+	else
+		zram_fail_nomem++;
 out:
+	if (zpool_wants_refill(&zram_pool))
+		taskqueue_enqueue(taskqueue_thread, &zram_refill_task);
 	zram_count(s, +1);	/* SAME, COMP or RAW; a failed store left it EMPTY */
 	zram_writes++;
 	mtx_unlock(&zram_mtx);
@@ -185,10 +218,12 @@ zram_load(struct zram_slot *s, void *page)
 		memset(page, s->fill, ZRAM_PAGE);
 		break;
 	case ZRAM_RAW:
-		memcpy(page, s->buf, ZRAM_PAGE);
+		memcpy(page, zpool_ptr(s->span, s->idx, ZRAM_PAGE), ZRAM_PAGE);
 		break;
 	case ZRAM_COMP:
-		r = ZSTD_decompressDCtx(zram_dctx, page, ZRAM_PAGE, s->buf, s->len);
+		r = ZSTD_decompressDCtx(zram_dctx, page, ZRAM_PAGE,
+		    zpool_ptr(s->span, s->idx, zpool_objsize(&zram_pool, s->span)),
+		    s->len);
 		if (ZSTD_isError(r) || r != ZRAM_PAGE) {
 			zram_fail_io++;
 			err = EIO;
@@ -362,6 +397,22 @@ SYSCTL_U64(_kern_zram, OID_AUTO, fail_nomem, CTLFLAG_RD, &zram_fail_nomem, 0,
     "Stores that failed for lack of memory, since load");
 SYSCTL_U64(_kern_zram, OID_AUTO, fail_io, CTLFLAG_RD, &zram_fail_io, 0,
     "Loads that failed to decompress, since load");
+SYSCTL_U64(_kern_zram, OID_AUTO, fail_limit, CTLFLAG_RD, &zram_fail_limit, 0,
+    "Stores refused because the pool is at mem_limit, since load");
+
+/* The packed pool. pool_bytes is the store's real memory footprint. */
+SYSCTL_U64(_kern_zram, OID_AUTO, mem_limit, CTLFLAG_RW, &zram_pool.limit, 0,
+    "Max bytes the packed pool may hold (0 = unlimited)");
+SYSCTL_U64(_kern_zram, OID_AUTO, pool_bytes, CTLFLAG_RD, &zram_pool.pool_bytes, 0,
+    "Memory held by the packed pool's spans (the store's footprint)");
+SYSCTL_U64(_kern_zram, OID_AUTO, obj_bytes, CTLFLAG_RD, &zram_pool.obj_bytes, 0,
+    "Class-rounded bytes of live objects (pool_bytes - obj_bytes = fragmentation)");
+SYSCTL_U64(_kern_zram, OID_AUTO, spans, CTLFLAG_RD, &zram_pool.nspans, 0,
+    "Live pool spans");
+SYSCTL_INT(_kern_zram, OID_AUTO, reserve_avail, CTLFLAG_RD, &zram_pool.reserve_n, 0,
+    "Reserve chunks (4 pages each) on hand");
+SYSCTL_U64(_kern_zram, OID_AUTO, reserve_used, CTLFLAG_RD, &zram_pool.reserve_used, 0,
+    "Spans built from the reserve because the page allocator refused, since load");
 
 /* "<bucket upper bound>:<pages> ..." for COMP pages, then RAW:<pages>. */
 static int
@@ -386,6 +437,14 @@ SYSCTL_PROC(_kern_zram, OID_AUTO, hist,
     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0, zram_hist_sysctl, "A",
     "Compressed-size histogram of held pages (256-byte buckets, then RAW)");
 
+static int64_t zram_mem_limit_tun = -1;
+
+static void
+zram_refill(void *arg __unused, int pending __unused)
+{
+	zpool_refill(&zram_pool);
+}
+
 static int
 zram_modevent(module_t mod __unused, int type, void *data __unused)
 {
@@ -400,6 +459,14 @@ zram_modevent(module_t mod __unused, int type, void *data __unused)
 		zram_slots = malloc(sizeof(struct zram_slot) * ZRAM_NSLOTS, M_ZRAM,
 		    M_WAITOK | M_ZERO);
 		mtx_init(&zram_mtx, "zram", NULL, MTX_DEF);
+		TASK_INIT(&zram_refill_task, 0, zram_refill, NULL);
+		if (zpool_init(&zram_pool, zram_reserve_chunks, &zram_mtx) != 0)
+			printf("atrium_zram: reserve short (%d of %d chunks)\n",
+			    zram_pool.reserve_n, zram_reserve_chunks);
+		/* Default limit: 25 % of RAM, unless a tunable set one. */
+		TUNABLE_QUAD_FETCH("kern.zram.mem_limit", &zram_mem_limit_tun);
+		zram_pool.limit = zram_mem_limit_tun >= 0 ?
+		    (uint64_t)zram_mem_limit_tun : ptoa((uint64_t)physmem) / 4;
 		/* /dev/zram0 — a compressed RAM block device (page-sized sectors). */
 		zram_disk = disk_alloc();
 		zram_disk->d_strategy = zram_strategy;
@@ -411,14 +478,18 @@ zram_modevent(module_t mod __unused, int type, void *data __unused)
 		zram_disk->d_flags = DISKFLAG_CANDELETE;	/* swapon -E trims into us */
 		zram_disk->d_delmaxsize = (off_t)ZRAM_NSLOTS * ZRAM_PAGE;
 		disk_create(zram_disk, DISK_VERSION);
-		printf("atrium_zram: /dev/zram0 ready (%d pages = %juMB, pre-allocated zstd)\n",
-		    ZRAM_NSLOTS, (uintmax_t)((off_t)ZRAM_NSLOTS * ZRAM_PAGE >> 20));
+		printf("atrium_zram: /dev/zram0 ready (%d pages = %juMB, packed pool, "
+		    "limit %juMB, reserve %dKB)\n",
+		    ZRAM_NSLOTS, (uintmax_t)((off_t)ZRAM_NSLOTS * ZRAM_PAGE >> 20),
+		    (uintmax_t)(zram_pool.limit >> 20), zram_pool.reserve_n * ZP_CHUNK / 1024);
 		return (0);
 	case MOD_UNLOAD:
 		disk_destroy(zram_disk);
+		taskqueue_drain(taskqueue_thread, &zram_refill_task);
 		for (i = 0; i < ZRAM_NSLOTS; i++)
 			zram_free_slot(&zram_slots[i]);
 		free(zram_slots, M_ZRAM);
+		zpool_fini(&zram_pool);
 		ZSTD_freeCCtx(zram_cctx);
 		ZSTD_freeDCtx(zram_dctx);
 		mtx_destroy(&zram_mtx);
