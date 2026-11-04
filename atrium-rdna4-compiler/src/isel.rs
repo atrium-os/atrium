@@ -1241,6 +1241,14 @@ impl<'a> Isel<'a> {
         self.salu("S_MOV_B32", O::R(r, 0), vec![O::Imm(0)]);
         let body = &self.f.body;
         self.region(body)?;
+        // Mask bookkeeping at the very end is dead: nothing runs after it.
+        while let Some(MI::Salu { dst, .. }) = self.mi.last() {
+            if *dst == O::Exec || *dst == O::R(r, 0) {
+                self.mi.pop();
+            } else {
+                break;
+            }
+        }
         self.mi.push(MI::Endpgm);
         Ok(())
     }
