@@ -909,6 +909,7 @@ Newly covered, by document: doc13 11, yahoo.jp 7, El País 7, doc24 6, The Hindu
    differences (which panel, which id) found by differential probing as in §5.4.5.1.
    That is the next build. It is verified like everything else, by replaying one
    unprobed sibling through the page's own code (§5.4.5.5).
+   *Built and measured in §5.4.5.6c: case 3 is 55.*
 4. **Time-driven: 6.** Negligible, as before.
 
 **Other, 506:**
@@ -944,6 +945,209 @@ Raw tables are outside the repo, at `~/src/navigator-corpus/coverage-2026-11-05-
 - the two superseded runs (8 per handler, and before the loop limit);
 - the pipeline outputs;
 - the binaries' hashes.
+
+#### 5.4.5.6c Generalised across siblings: one transition per handler, verified on a sample (2026-11-05)
+
+§5.4.5.6b ended with 775 elements in case 3, every one cut under a handler that *had*
+been probed, on a sibling. This builds what it said comes next: the recording now
+carries what was learned on the siblings over to them.
+
+**The construct: a template.** One handler's transition, recorded once over the elements
+that share it (`atrium-navigator-recording/4`, backend §4.5a).
+- Its effects are stored once. Each effect's address is one of:
+  - a literal path: the same node for every instance (a shared overlay);
+  - `$t`: the instance's own trigger (a class toggle on itself, the commonest case);
+  - `$N`: the instance's slot N (tab i shows panel i; item i opens its own body).
+- Values (`from`, `to`, inserted markup, insert index) are the same for every instance.
+  That is what makes it *one* transition.
+- Each instance binds a trigger and its slots. Expanding it gives exactly the
+  transition a probe on that element records.
+- The backend expands templates **at ingest** into ordinary transitions. The §5
+  vocabulary and the profile are unchanged: a template is a compression of the
+  recording, not a new behaviour, and there is no second replay path.
+- A recording without templates stays `/3`, byte for byte.
+
+**How a template is inferred.** Probes are grouped by handler key and gesture, as the
+budget already groups them. A group becomes a template only if:
+1. **Every probe in it recorded a transition.** One that recorded nothing means the
+   handler does not act alike on its elements.
+2. **The transitions agree, apart from their addresses.** Same effects, in the same
+   order, with equal values.
+3. **Each effect's address fits one rule across all the examples.** The rule is
+   structural: up `k` ancestors from the trigger, then down a chain of steps. A step
+   is a fixed `tag:n`, or `tag:(the trigger's own position at level m) + offset`. If no
+   structural rule fits, the rule is a fixed node, provided every example names the
+   same one. A structural rule is preferred, because it carries over to a sibling
+   elsewhere in the tree.
+4. **The rule reproduces every example exactly.**
+
+**Predicting the cut siblings.** For each cut candidate in the group the rule gives the
+transition a probe would record. A candidate is not predicted when:
+- an address does not resolve;
+- an attribute does not currently hold the value its effect starts from (a box already
+  on);
+- the predicted order is not the order the diff writes.
+
+Gestures whose user action changes state first (`change`, `toggle`) are folded from
+their examples but never predicted.
+
+**Verification: probe a sample, and refuse on any disagreement.** The first, middle and
+last predicted siblings are probed through the page's own code (§5.4.5.5).
+- If any sample records anything but its prediction, **the template is refused**: the
+  samples keep their own transitions as ordinary ones, the examples stay per element,
+  and the rest stay cut, exactly as before.
+- If all three agree, the template replaces its examples' transitions, and the
+  predicted siblings are covered (`T` in the coverage table; samples are `v`).
+- Groups with no cut siblings are folded too, with no verification needed, since
+  every instance was probed.
+
+**A handler that does nothing is not a large state space.** A group whose every probe
+recorded *nothing* gets the same treatment. Three cut siblings are sampled, and if
+they are quiet too, the rest are `inert` (`I`): their handler is known to do nothing
+observable here. If a sample acts, the claim is refused and the sample's own transition
+is kept.
+
+**Bounds.**
+- At most 96 verification probes per document (32 templates' worth), and 2,048
+  predicted instances.
+- The backend caps templates at 256, counts instances against `max_transitions`, and
+  counts the expanded bytes against `max_total_bytes`, with a note for anything dropped.
+
+**Tests** (`navigator-prerender/tests/templates.rs`, `navigator-backend/tests/templates.rs`):
+- tab i → panel i, an accordion, and a self-toggle each become one template. Each
+  expands to exactly what probing every element (bounds off) records.
+- A disagreeing sample refuses the template.
+- Per-element content (a definition panel listing its own references) is not
+  templated.
+- A sibling already in the target state is not predicted.
+- Inert groups are verified, and a sample that acts refuses inertness.
+- `/4` only with templates. The recording is reproducible.
+- Backend: expansion, replay and going back, refusals, both bounds. The fuzzer gets a
+  `/4` seed and must reach the new note.
+
+**Two probe-fidelity fixes, found while breaking down what was left (step 2).**
+- **`el.id` was never answered.** The missing-API report counts `element.id` 4,690
+  times in 24 documents. A handler written `byId(this.id + '-panel')` computed with
+  `"undefined"`, and every element of a group did the *same* wrong thing, which a
+  template would have generalised faithfully. It is now answered while exploring.
+  Like `closest` and `matches`, the load pass still does not answer it: that changes
+  what pages build, and is a separate change with its own corpus diff (listed below).
+- **Two report-only counters per probe:** navigations it attempted
+  (`location.assign/replace/reload`, all refused), and the host of each request it
+  was refused. They separate "did nothing" from "did something exploration refuses",
+  and data from pings.
+
+**The numbers.** Handler elements, load/error-only excluded, as in §5.4.5.6b. The
+"before" column is §5.4.5.6b's tables. The pages are the same: the control arm
+written today is byte-identical to the r2 binary's, run today (0 of 123 differ).
+
+| | batch 1 before → after | batch 2 before → after | **overall before → after** |
+|---|---|---|---|
+| elements with a handler | 1,191 | 478 | **1,669** |
+| **covered** | 214 → 633 | 110 → 121 | **324 (19.4%) → 754 (45.2%)** |
+| 1 server-fed | 30 → 30 | 9 → 9 | **39 → 39** |
+| 2 free-form input | 13 → 15 | 6 → 6 | **19 → 21** |
+| 3 large state (budget) | 583 → 1 | 192 → 54 | **775 → 55** |
+| 4 time-driven | 4 → 4 | 2 → 2 | **6 → 6** |
+| other | 347 → 508 | 159 → 286 | **506 → 794** |
+
+Over all 5,813 interactive elements, covered went from 351 to 780 (6.0% → 13.4%).
+
+**What moved, element by element** (`moves.txt`; the same elements in both runs):
+- **3 → covered, 419:** doc11 252 and doc10 167, the spec `<dfn>`s. 413 of them are
+  predicted instances and 6 are samples. They come from 6 templates; none was refused.
+- **3 → other, 299:** walgreens 161, theverge 104, ynet 34. Every probe of their handler
+  recorded nothing, and so did a sample of the rest. They are inert, not a large state
+  space: 139 of walgreens' are `keyup` on navigation `<li>`s, which Enter does not
+  visibly change.
+- **3 → free-form, 2** (walgreens, sampled).
+- **other → covered, 12, and covered → other or native-only, 2:** El País, from the
+  `el.id` fix (below).
+- **native-only → server-fed, 25:** Guardian buttons, delegated targets whose root's
+  handler pings `ophan.theguardian.com`. A predicted or inert instance is classified as
+  its siblings were, so it takes their requests too.
+
+**Case 3 is 55, and none of it is the budget's fault now.** ynet 54 and walgreens 1 are
+groups whose probes disagreed: some recorded a transition and some did not, so neither
+a template nor inertness can be claimed. Probing deeper would find out which elements
+are which.
+
+**Server-fed, 39, by where the refused requests went** (the new host counter):
+- **data, 18:** arXiv 14 (same-origin GET, the §5.4.5.6 item 2 candidate), nhs.uk 2,
+  yahoo.jp 1, and IKEA's search API 1;
+- **remote execution, 13:** the Rust book's "run" buttons, a POST to play.rust-lang.org
+  (population 3);
+- **analytics, 8:** the Guardian 6 (`ophan`), Python docs 2 (`analytics.python.org`).
+
+So case 1 is 18 elements in 4 documents, and still waits.
+
+**Other, 794, by cause:**
+- **No observable effect, 564.** Of these, 356 are verified inert (above) and 208 were
+  probed. Split by what the probe saw:
+  - 188 links, whose effect is the navigation exploration does not perform;
+  - 89 submit controls, whose effect is the form submission;
+  - 34 that scheduled timers which changed nothing;
+  - 253 with nothing observable at all. Most are `<li>` (146), `<div>` (56) and
+    `<button>` (26).
+
+  No probe in either corpus called `location.assign`, `replace` or `reload`. Where a
+  handler navigates, it does so by the link's default action or by assigning `href`.
+- **184 `<img>` with only `dragstart`** (MIT OCW), cancelled to stop image dragging. Not
+  a gesture.
+- **15 delegating roots** whose targets changed nothing.
+- **31 unsimulated:** 13 `mouseout`-only, 7 `invalid`, the rest one-offs (custom events,
+  media events, `transitionend`).
+
+**Safety and regressions, checked:**
+- **Artifacts:** exploring and non-exploring recordings are identical apart from
+  `transitions`, `templates`, `format` and `interactive_found`, on 123/123. 14
+  recordings are `/4`, and every control recording is `/3`.
+- **Baseline binary:** the §5.4.5.6b converter (c4bbf2ee), run today, writes
+  byte-identical non-exploring recordings (0 of 123 differ).
+- **Pipeline:** normalize + `nsg-flag` outputs, drop reports and flag reports are
+  byte-identical between the arms. They are also identical to §5.4.5.6b's, on both
+  corpora.
+- **The oracle:** c4bbf2ee, exploring, run today.
+  - Every one of its 814 transitions is in this recording's expansion, except 19 in
+    doc09, doc24 and El País.
+  - A build with only the `el.id` read turned off reproduces the oracle exactly on those
+    three documents. So all 19 are the `id` fix: `data-id="undefined"` became the real
+    id, and `"js sidebar-visible undefined"` became the real theme.
+  - The expansion holds 2,362 transitions against the oracle's 814. The transition and
+    template tables together are 729 KB against 731 KB.
+- **Replay:** the backend's real-recording tests (`tests/roundtrip.rs`) ingest all 123.
+  Every expanded transition applies, reverses and goes forward exactly, except 6
+  failures: gov.uk 2, chinadaily 2, yahoo.jp 1 and ynet 1. The oracle's recordings
+  give the same 6, so they predate this change. They are listed for their own fix.
+
+**Cost.**
+- 7,422 budgeted probes (the same as before) and 469 verification probes.
+- 30.9 s of exploration over both corpora, against 29.3 s for the oracle run beside it.
+- The worst document is 8.8 s (bbcgoodfood, unchanged).
+- 29 templates were kept and none refused. 1,511 instances were predicted (605 of them
+  delegated targets outside the universe).
+- 31,832 cut candidates were verified inert, nearly all delegated targets.
+
+**Limits, stated.**
+- Batch 1 is still today's pages, fetched live.
+- Three samples verify a template; they do not prove it. A sibling that differs from
+  its neighbours in some way the structure does not show is predicted wrongly. The
+  static checks (address resolves, start value matches, diff order) catch only the
+  visible kinds.
+- `el.id` is answered while exploring only. **Next:** answer it at load too, with its
+  own corpus diff (24 documents read it).
+- Case 3's remaining 55 are mixed groups. A template per *behaviour class* within a
+  handler group (split the siblings by whether their probe recorded) would take them.
+  It needs a structural predicate for the split, and has not been tried.
+
+Raw tables are outside the repo, at `~/src/navigator-corpus/coverage-2026-11-05-r3/`:
+- `batch{1,2}-cov.tsv` (now with the navigation and refused-host columns);
+- `analysis.txt` and `analysis-r2-reclassified.txt`;
+- `moves.txt`;
+- the oracle run, `oracle-r2bin/`;
+- the pipeline outputs;
+- two superseded runs: `step1/`, before the step 2 fixes, and `second-742b96/`, before
+  the two counters.
 
 ### 5.5 WebAssembly is a better cage, not a translation
 

@@ -145,8 +145,12 @@ Measurement in legacy-web §5.4.5.6a (`3dd3fb7`); raw tables in
   itself `4e653a6`.
 - Re-measure (legacy-web §5.4.5.6b): covered handler elements 298 → 324 at
   64/handler, 256/document; 7,422 probes, 29 s over both corpora.
-- In progress: finish the before/after write-up with no flag
-  regressions.
+- Sibling templates (legacy-web §5.4.5.6c, recording format `/4`): covered handler
+  elements 324 → 754 (19.4% → 45.2%); case 3 775 → 55; server-fed 39 = 18 data,
+  13 remote execution, 8 analytics. No normalize/flag change; raw tables in
+  `coverage-2026-11-05-r3/`.
+- Next: answer `el.id` at load (24 documents read it; own corpus diff); the 6
+  pre-existing replay failures (gov.uk, chinadaily, yahoo.jp, ynet); case 1 on arXiv.
 
 ## 7. x86_64 port
 
