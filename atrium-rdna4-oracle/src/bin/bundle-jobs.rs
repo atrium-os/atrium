@@ -41,10 +41,13 @@ fn main() {
     sh += "cat /sys/class/drm/card*/device/product_name 2>/dev/null | head -1 || true\n";
     for c in &cases {
         writeln!(sh, "echo \"--- {n}\"; ./amdgpu_runner {n} $DEV || true; cat {n}/result.txt", n = c.name).unwrap();
+        // The readback BO can be larger than the expectation (page-rounded
+        // sizes); compare only the expected prefix, as `Case::check` does.
         writeln!(sh, "for f in {n}/*.out; do [ -f \"$f\" ] || continue; echo \"$f sha256=$(sha256sum < $f | cut -c1-16)\"; od -An -tx4 -N64 \"$f\"; \
-b=${{f%.out}}; if [ -f \"$b.unordered\" ]; then r=$(cat \"$b.unordered\"); \
-if [ \"$(od -An -v -tx1 -w$r \"$f\" | sort)\" = \"$(od -An -v -tx1 -w$r \"$b.expect\" | sort)\" ]; then echo MATCH unordered; else echo MISMATCH unordered; od -An -tx4 -N256 \"$f\"; fi; \
-elif [ -f \"$b.expect\" ]; then if cmp -s \"$f\" \"$b.expect\"; then echo MATCH; else echo MISMATCH; cmp \"$f\" \"$b.expect\" | head -1; od -An -tx4 -N256 \"$f\"; fi; fi; done", n = c.name).unwrap();
+b=${{f%.out}}; [ -f \"$b.expect\" ] || continue; head -c $(wc -c < \"$b.expect\") \"$f\" > \"$b.cut\"; \
+if [ -f \"$b.unordered\" ]; then r=$(cat \"$b.unordered\"); \
+if [ \"$(od -An -v -tx1 -w$r \"$b.cut\" | sort)\" = \"$(od -An -v -tx1 -w$r \"$b.expect\" | sort)\" ]; then echo MATCH unordered; else echo MISMATCH unordered; od -An -tx4 -N256 \"$f\"; fi; \
+elif cmp -s \"$b.cut\" \"$b.expect\"; then echo MATCH; else echo MISMATCH; cmp \"$b.cut\" \"$b.expect\" | head -1; od -An -tx4 -N256 \"$f\"; fi; done", n = c.name).unwrap();
     }
     sh += "echo '=== end ==='\n";
     print!("{sh}");
