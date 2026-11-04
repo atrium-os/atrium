@@ -329,13 +329,31 @@ What remains is the shared compositor and kernel driver, the shared-store policy
 tier 4. The last is weak by the spec's own admission, and §8.1's islands shrink it to the
 one element that needs it.
 
-## 5. Open questions
+## 5. Open questions, with recommendations
 
-1. Is the converter jail's cost acceptable per conversion? §4.7c measured the worker; the
-   converter is heavier (Boa plus ICU data). Measure it, don't assume it.
-2. The intranet grant: per network (by gateway MAC/SSID) or per host?
-3. Reproduce-to-share needs a deterministic converter. Boa's `Date`, `Math.random` and
-   timer order are already pinned for replay; is the whole conversion bit-reproducible
-   across machines?
-4. Should Fresco ever parse a font, or should every glyph arrive as outlines from a jailed
-   producer?
+*Recommendations, 2026-11-04; the user has not decided them yet.*
+
+1. **Is the converter jail's cost acceptable?** *Recommend: jail unconditionally, and
+   measure the cost to report it, not to decide whether to jail.* A conversion already takes
+   seconds of Boa time. §4.7a's worker jails added about 3 s over 98 documents, which is a
+   rounding error next to that. If the cost ever matters, the zygote (§7.5) is the fix; an
+   unjailed path is not.
+2. **The intranet grant: per network or per host?** *Recommend: per origin, and bound to
+   the network it was granted on.* The gateway's identity, not the SSID, which anyone can
+   copy. A per-network grant opens every device on the LAN to every page that rebinds to
+   it, which is the attack itself. A per-origin grant (`http://192.168.1.1`, on this
+   network) is least privilege and costs one prompt per device. Conversions under a grant
+   are never shareable.
+3. **Can conversions be bit-reproducible across machines?** *Recommend: don't assume it;
+   build for it and measure it.*
+   - Pin every input the converter reads: clock, `Math.random` seed, timer order, ICU
+     data, font set, the converter's own build hash.
+   - Then convert each corpus page twice, on two machines, and compare hashes.
+   - Reproduce-to-share admits only what matches. A page that doesn't reproduce stays in
+     the user's own domain, which is the safe failure.
+   - The match rate is the number that says whether sharing is worth building at all.
+4. **Should Fresco ever parse a font?** *Recommend: only the shipped, signed font set,
+   never a web font.* Fresco needs fonts for its own UI, and those are trusted data (§7.2).
+   Web fonts reach it as glyph outlines, produced in the jail from the sanitised sfnt. The
+   validator bounds them like any other path: points per glyph, glyphs per run. That
+   removes the one place Fresco parses a hostile binary format.
