@@ -215,7 +215,15 @@ pub fn ping() -> DaemonResult<()> {
 /// nothing and needs no root — it hands over three file descriptors and waits.
 /// That is the difference between `exec` and `exec --daemon`, and the reason
 /// the daemon variant is the one a broker should use.
-pub fn exec_instance(app_id: &str, instance: Option<&str>, tmpfs_mb: u32)
+/// The limits `--daemon` forwards (portcullis.md §6.5.2e).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExecLimits {
+    pub memory_mb: Option<u64>,
+    pub cpu_pct: Option<u32>,
+    pub require_memory_limit: bool,
+}
+
+pub fn exec_instance(app_id: &str, instance: Option<&str>, tmpfs_mb: u32, limits: ExecLimits)
     -> DaemonResult<Option<i32>>
 {
     let Some(mut s) = opened()? else { return Ok(None) };
@@ -223,6 +231,9 @@ pub fn exec_instance(app_id: &str, instance: Option<&str>, tmpfs_mb: u32)
         app_id: app_id.into(),
         instance: instance.map(str::to_string),
         tmpfs_mb,
+        memory_mb: limits.memory_mb,
+        cpu_pct: limits.cpu_pct,
+        require_memory_limit: limits.require_memory_limit,
     })?;
     match read_response(&mut s)? {
         Response::ReadyForFds => {}

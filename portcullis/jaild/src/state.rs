@@ -99,6 +99,11 @@ pub struct JailRecord {
     pub uid:             u32,
     #[serde(default)]
     pub gid:             u32,
+    /// The static `memoryuse` cap the jail was CREATED with, if any: the
+    /// ceiling every later SetRctl is clamped to, so the federation may
+    /// tighten a capped jail and never loosen it.
+    #[serde(default)]
+    pub memory_ceiling_mb: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -203,8 +208,14 @@ impl PersistentState {
             path: path.to_string(),
             uid,
             gid,
+            memory_ceiling_mb: None,
         });
         self.written_at_unix = now_unix();
+    }
+
+    /// Record the static memory ceiling of the most recent record named `name`.
+    pub fn set_memory_ceiling(&mut self, name: &str, mb: Option<u64>) {
+        if let Some(r) = self.jails.iter_mut().rev().find(|r| r.name == name) { r.memory_ceiling_mb = mb }
     }
 
     pub fn add_runtime_mount(

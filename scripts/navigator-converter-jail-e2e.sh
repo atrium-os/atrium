@@ -170,7 +170,7 @@ say "$STAGE"
     mkdir -p /etc/atrium/publishers && cp /root/e2e-pub.pem /etc/atrium/publishers/e2e.pem
     rm -rf /root/conv-bundle && mkdir -p /root/conv-bundle/bin
     cp $BIN/prerender /root/conv-bundle/bin/prerender
-    printf '[app]\nid = \"$CONV_ID\"\nname = \"Navigator converter\"\nversion = \"1\"\nentry = \"bin/prerender\"\n' > /root/conv-bundle/atrium.toml
+    printf '[app]\nid = \"$CONV_ID\"\nname = \"Navigator converter\"\nversion = \"1\"\nentry = \"bin/prerender\"\n\n[resources]\nmemory = \"4G\"\ncpu = 100\n\n[resources.pool]\nweight = 1.0\nfloor = \"256M\"\n' > /root/conv-bundle/atrium.toml
     openssl dgst -sha256 -sign /root/e2e-key.pem -out /root/conv-bundle/atrium.toml.sig /root/conv-bundle/atrium.toml
     $BIN/opifex install /root/conv-bundle
     rm -rf /root/fetch-bundle && mkdir -p /root/fetch-bundle/bin /root/fetch-bundle/etc/ssl
@@ -224,6 +224,35 @@ GJ=$("$VSSH" "export PORTCULLIS_SOCKET=$SOCK; echo --gate | $AS_BROKER \"$BW/por
     || true
 echo "$GJ" | sed 's/^/  /'
 echo "$GJ" | grep -q '^M1 GATE: PASS$' || die "the gate did not pass inside the jail"
+
+# ---- stage 9b: resource limits through jaild (portcullis.md §6.5.2e) -------------------
+STAGE="limits"
+say "$STAGE"
+RACCT=$("$VSSH" "sysctl -n kern.racct.enable 2>/dev/null" | tr -d '\r')
+ALLOW=$("$VSSH" "awk '/^\[resource_control\]/{s=1;next} /^\[/{s=0} s && /allow_rctl/ {print \$3}' /etc/atrium/jaild.policy.toml 2>/dev/null" | tr -d '\r')
+echo "  kern.racct.enable=${RACCT:-?}  jaild allow_rctl=${ALLOW:-false}"
+if [ "$RACCT" = 1 ] && [ "$ALLOW" != true ]; then
+    die "RACCT is on but jaild's policy refuses rctl: set allow_rctl = true under [resource_control] in /etc/atrium/jaild.policy.toml and restart jaild (the manifests declare limits, and jaild refuses rather than create them uncapped)"
+fi
+if [ "$RACCT" = 1 ]; then
+    # A page that spins for its whole deadline: long enough to read the rules
+    # jaild set on its jail while it runs.
+    "$VSSH" "mkdir -p $BW/spin && printf '<script>for(;;){}</script>' > $BW/spin/spin.html && chown -R $BROKER_USER $BW/spin" >/dev/null 2>&1
+    "$VSSH" "export PORTCULLIS_SOCKET=$SOCK; cd $BW && $AS_BROKER 'env PRERENDER_REQUIRE_CONFINEMENT=1 PRERENDER_LAUNCHER=\"$LAUNCH\" PRERENDER_DEADLINE=8 ./prerender spin > spin/report.txt 2>&1' &
+             sleep 4; rctl | grep -E 'navigator-converter' > /root/conv-e2e-rctl.txt; wait" >/dev/null 2>&1
+    RULES=$("$VSSH" "cat /root/conv-e2e-rctl.txt")
+    echo "$RULES" | sed 's/^/  during: /'
+    echo "$RULES" | grep -qE 'memoryuse:sigkill=(4096M|4294967296|4\.0G)' || die "no memoryuse rule on the converter jail while it ran"
+    echo "$RULES" | grep -q 'pcpu:deny=100' || die "no pcpu rule on the converter jail while it ran"
+    "$VSSH" "grep -q 'timed out' $BW/spin/report.txt" || die "the spinning page was not stopped: $("$VSSH" "tail -3 $BW/spin/report.txt")"
+    sleep 2
+    LEFT=$("$VSSH" "rctl | grep -cE 'navigator-(converter|fetcher|worker)'" | tr -d ' ')
+    [ "${LEFT:-0}" = 0 ] || die "$LEFT rctl rules outlived their jails: $("$VSSH" "rctl | grep -E 'navigator-'")"
+    echo "  rules present while the jail ran, gone after it"
+else
+    echo "  SKIPPED the rule checks: kern.racct.enable=0 (a loader tunable; the converter ran UNCAPPED"
+    echo "  and portcullis said so on stderr). Boot with kern.racct.enable=1 to verify §6.5.2e."
+fi
 
 # ---- stage 10: the refusal must refuse ------------------------------------------------
 STAGE="require-confinement"
@@ -311,6 +340,8 @@ LZ=$("$VSSH" "J=\$(pgrep -f 'atrium-jaild serve'); [ -z \"\$J\" ] && echo 0 || p
 [ "${LZ:-0}" = 0 ] || die "$LZ zombie children of jaild"
 [ "${LM:-0}" = 0 ] || die "$LM mounts leaked"
 [ "${LU:-0}" = 0 ] || die "$LU writable layers leaked"
-echo "  no jails (live or dying), no zombies, no mounts, no upper dirs"
+LR=$("$VSSH" "rctl 2>/dev/null | grep -cE '$PAT'" | tr -d ' ')
+[ "${LR:-0}" = 0 ] || die "$LR rctl rules leaked (they must go with their jails)"
+echo "  no jails (live or dying), no zombies, no mounts, no upper dirs, no rctl rules"
 
 say "PASS  ($GUESTN pages × $ROUNDS rounds, jailed = unconfined byte for byte, no leaks)"

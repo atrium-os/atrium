@@ -597,6 +597,7 @@ mod tests {
     fn create_request_full_validate() {
         let p = load_sample_policy();
         let req = CreateJailRequest {
+            rctl: None,
             name:          "atrium-test".into(),
             path:          "/var/lib/atrium/jails/atrium-test".into(),
             children_max:  0,
@@ -613,6 +614,7 @@ mod tests {
 
     fn instance_req(name: &str, path: &str, entry: &str, stdio: bool) -> CreateJailRequest {
         CreateJailRequest {
+            rctl: None,
             name:          name.into(),
             path:          path.into(),
             children_max:  0,
@@ -733,6 +735,7 @@ mod tests {
     fn create_request_bad_name_rejected() {
         let p = load_sample_policy();
         let req = CreateJailRequest {
+            rctl: None,
             name:          "evil-x".into(),
             path:          "/var/lib/atrium/jails/atrium-test".into(),
             children_max:  0,
@@ -753,6 +756,7 @@ mod tests {
 
     fn req_default() -> CreateJailRequest {
         CreateJailRequest {
+            rctl: None,
             name: "atrium-test".into(),
             path: "/var/lib/atrium/jails/atrium-test".into(),
             children_max:  0,

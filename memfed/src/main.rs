@@ -223,6 +223,70 @@ struct Pool {
     floor: u64,
 }
 
+/// Pools declared by installed apps: each `<dir>/<app>/atrium.toml` whose
+/// `[resources.pool]` is set becomes ONE pool over that app's one-shot jails
+/// (`app-<id>--<instance>`), with the manifest's weight and floor.
+///
+/// ★ The operator's `--pool` wins over a manifest for the same prefix: a
+/// publisher may say how its workers should be budgeted, the machine's owner
+/// decides. And a manifest that does not parse is skipped LOUDLY — a pool
+/// that silently vanished would put its jails back outside the federation.
+fn pools_from(dir: &std::path::Path) -> Vec<Pool> {
+    let mut out = vec![];
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        eprintln!("memfed: --pools-from {}: cannot read directory", dir.display());
+        return out;
+    };
+    let mut entries: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for app in entries {
+        let path = app.join("atrium.toml");
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let m = match portcullis_toml::Manifest::from_str(&text) {
+            Ok(m) => m,
+            Err(e) => { eprintln!("memfed: {}: {e} — no pool from it", path.display()); continue }
+        };
+        let Some(pool) = m.resources.as_ref().and_then(|r| r.pool.as_ref()) else { continue };
+        let Some(prefix) = portcullis_jail::jaild_instance_prefix(&m.app.id) else {
+            eprintln!("memfed: {}: app id too long to pool", path.display());
+            continue;
+        };
+        if !(pool.weight.is_finite() && pool.weight > 0.0) {
+            eprintln!("memfed: {}: [resources.pool].weight {} must be > 0 — no pool from it", path.display(), pool.weight);
+            continue;
+        }
+        let floor = match pool.floor.as_deref().map(size_mib) {
+            Some(Some(f)) => f,
+            Some(None) => { eprintln!("memfed: {}: bad [resources.pool].floor — no pool from it", path.display()); continue }
+            None => 0,
+        };
+        out.push(Pool { prefix, weight: pool.weight, floor });
+    }
+    out
+}
+
+/// "256M", "1G", "512K" or bytes → MiB, rounded up.
+fn size_mib(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (d, mult) = match s.chars().last()?.to_ascii_uppercase() {
+        'K' => (&s[..s.len() - 1], 1024u64), 'M' => (&s[..s.len() - 1], 1 << 20),
+        'G' => (&s[..s.len() - 1], 1 << 30), _ => (s, 1),
+    };
+    Some(d.trim().parse::<u64>().ok()?.checked_mul(mult)?.div_ceil(1 << 20))
+}
+
+/// Merge manifest pools into the operator's, the operator winning on a prefix.
+fn merge_pools(mut operator: Vec<Pool>, declared: Vec<Pool>) -> Vec<Pool> {
+    for p in declared {
+        if operator.iter().any(|o| o.prefix == p.prefix) {
+            eprintln!("memfed: pool {} from a manifest overridden by --pool", p.prefix);
+        } else {
+            operator.push(p);
+        }
+    }
+    operator
+}
+
 /// Split a pool's grant among its members in proportion to demand, never
 /// below each member's current RSS.
 ///
@@ -472,6 +536,11 @@ fn main() {
     let pool_args: std::collections::BTreeSet<&String> = argv.iter().enumerate()
         .filter(|(_, a)| a.as_str() == "--pool")
         .filter_map(|(i, _)| argv.get(i + 1)).collect();
+    // `--pools-from <apps dir>`: pools the installed apps declare.
+    let pools = match argv.iter().position(|a| a == "--pools-from").and_then(|i| argv.get(i + 1)) {
+        Some(d) => merge_pools(pools, pools_from(std::path::Path::new(d))),
+        None => pools,
+    };
 
     let jails: Vec<Jail> = std::env::args().skip(1).filter(|a| a.contains(':'))
         // ★ A --pool value also contains ':'; without this it would ALSO be
@@ -492,7 +561,7 @@ fn main() {
     if jails.is_empty() && pools.is_empty() {
         eprintln!("usage: memfed [--arm] [--broker <sock>] [--budget MB|--budget-pct N]");
         eprintln!("              [--headroom MB] [--interval S]");
-        eprintln!("              [--pool <prefix>:<weight>:<floor>] name:weight:floor ...");
+        eprintln!("              [--pool <prefix>:<weight>:<floor>] [--pools-from <apps dir>] name:weight:floor ...");
         eprintln!();
         eprintln!("  name:weight:floor   budget a jail by name (applications).");
         eprintln!("  --pool p:w:f        budget every live jail whose name starts with");
@@ -503,6 +572,9 @@ fn main() {
         eprintln!("                      share does NOT grow with its membership, so a");
         eprintln!("                      worker pool cannot claim more of the machine by");
         eprintln!("                      having more workers.");
+        eprintln!("  --pools-from dir    also pool each installed app whose manifest");
+        eprintln!("                      declares [resources.pool] (weight, floor), over");
+        eprintln!("                      its one-shot jails app-<id>--*; --pool wins.");
         std::process::exit(1);
     }
 
@@ -534,6 +606,43 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    fn apps(manifests: &[(&str, &str)]) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("memfed-pools-{}-{}", std::process::id(),
+            manifests.iter().map(|(a, _)| *a).collect::<Vec<_>>().join("_")));
+        for (app, extra) in manifests {
+            std::fs::create_dir_all(d.join(app)).unwrap();
+            std::fs::write(d.join(app).join("atrium.toml"), format!(
+                "[app]\nid = \"{app}\"\nname = \"x\"\nversion = \"1\"\nentry = \"bin/x\"\n{extra}")).unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn a_manifest_pool_becomes_a_pool_over_the_apps_one_shot_jails() {
+        let d = apps(&[("org.atrium.navigator.converter", "[resources.pool]\nweight = 2.0\nfloor = \"256M\"\n"),
+                       ("org.atrium.unpooled", "[resources]\ncpu = 100\n"),
+                       ("org.atrium.broken", "[resources.pool]\nweight = 0.0\n")]);
+        let p = pools_from(&d);
+        assert_eq!(p.len(), 1, "only the valid declared pool");
+        assert_eq!((p[0].prefix.as_str(), p[0].weight, p[0].floor), ("app-org-atrium-navigator-converter--", 2.0, 256));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_operators_pool_wins_over_a_manifests() {
+        let op = vec![Pool { prefix: "app-a--".into(), weight: 5.0, floor: 0 }];
+        let decl = vec![Pool { prefix: "app-a--".into(), weight: 1.0, floor: 0 },
+                        Pool { prefix: "app-b--".into(), weight: 1.0, floor: 64 }];
+        let m = merge_pools(op, decl);
+        assert_eq!(m.iter().map(|p| (p.prefix.as_str(), p.weight)).collect::<Vec<_>>(),
+                   vec![("app-a--", 5.0), ("app-b--", 1.0)]);
+    }
+
+    #[test]
+    fn floors_are_mib() {
+        assert_eq!((size_mib("256M"), size_mib("1G"), size_mib("512K"), size_mib("x")), (Some(256), Some(1024), Some(1), None));
+    }
+
     use super::*;
 
     #[test]

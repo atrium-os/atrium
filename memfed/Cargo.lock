@@ -108,6 +108,16 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "portcullis-ipc",
+ "portcullis-jail",
+ "portcullis-toml",
+]
+
+[[package]]
+name = "portcullis-identity"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "sha2",
 ]
 
 [[package]]
@@ -119,6 +129,15 @@ dependencies = [
  "portcullis-toml",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "portcullis-jail"
+version = "0.1.0"
+dependencies = [
+ "portcullis-identity",
+ "portcullis-toml",
+ "thiserror",
 ]
 
 [[package]]

@@ -154,7 +154,7 @@ say "$STAGE  (signed; opifex resolves the lib closure)"
     mkdir -p /etc/atrium/publishers && cp /root/e2e-pub.pem /etc/atrium/publishers/e2e.pem
     rm -rf /root/e2e-bundle && mkdir -p /root/e2e-bundle/bin
     cp $BIN/navigator-worker /root/e2e-bundle/bin/navigator-worker
-    printf '[app]\nid = \"$APP_ID\"\nname = \"Navigator document worker\"\nversion = \"1\"\nentry = \"bin/navigator-worker\"\n' > /root/e2e-bundle/atrium.toml
+    printf '[app]\nid = \"$APP_ID\"\nname = \"Navigator document worker\"\nversion = \"1\"\nentry = \"bin/navigator-worker\"\n\n[resources]\nmemory = \"2G\"\ncpu = 100\n\n[resources.pool]\nweight = 1.0\nfloor = \"256M\"\n' > /root/e2e-bundle/atrium.toml
     openssl dgst -sha256 -sign /root/e2e-key.pem -out /root/e2e-bundle/atrium.toml.sig /root/e2e-bundle/atrium.toml
     $BIN/opifex install /root/e2e-bundle" >/dev/null 2>&1 \
     || die "could not build/sign/install the worker bundle"

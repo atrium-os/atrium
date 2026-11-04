@@ -169,6 +169,20 @@ pub struct ResourcesSection {
     /// it. `memory`, `cpu` and `files` are still declarations that nothing
     /// reads yet.
     pub storage: Option<String>,
+    /// ★ How the memory federation budgets this app's ONE-SHOT jails
+    /// (portcullis.md §6.5.2e): as one pool whose share does not grow with
+    /// its membership. Read by `memfed --pools-from <apps dir>`; absent = the
+    /// app's ephemeral jails are not pooled from its manifest.
+    pub pool: Option<PoolSection>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolSection {
+    /// The pool's weight in the federation's water-fill (> 0).
+    pub weight: f64,
+    /// Protected minimum for the whole pool, a size string ("256M").
+    pub floor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -319,5 +333,44 @@ mod merge_tests {
         ovr.filesystem = Some(vec!["~/Downloads".into()]);
         let m = merge_capabilities(&base, &ovr);
         assert_eq!(m.filesystem, Some(vec!["~/Downloads".to_string()]));
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    const POOLED: &str = r#"
+[app]
+id = "org.atrium.navigator.converter"
+name = "Navigator converter"
+version = "1"
+entry = "bin/prerender"
+[resources]
+memory = "4G"
+cpu = 100
+[resources.pool]
+weight = 1.5
+floor = "256M"
+"#;
+
+    #[test]
+    fn a_pool_parses_and_validates() {
+        let m = crate::Manifest::from_str(POOLED).unwrap();
+        let r = m.resources.as_ref().unwrap();
+        let p = r.pool.as_ref().unwrap();
+        assert_eq!((p.weight, p.floor.as_deref(), r.cpu), (1.5, Some("256M"), Some(100)));
+        assert!(crate::validate(&m).errors.is_empty(), "{:?}", crate::validate(&m).errors);
+    }
+
+    #[test]
+    fn a_bad_pool_is_a_validation_error() {
+        for (bad, what) in [("weight = 0.0", "weight"), ("weight = -1.0", "weight"),
+                            ("weight = 1.0\nfloor = \"lots\"", "floor")] {
+            let t = POOLED.replace("weight = 1.5\nfloor = \"256M\"", bad);
+            let m = crate::Manifest::from_str(&t).unwrap();
+            let errs = crate::validate(&m).errors;
+            assert!(errs.iter().any(|e| e.contains("[resources.pool]") && e.contains(what)), "{bad}: {errs:?}");
+        }
+        // An unknown key is a parse error (deny_unknown_fields), not ignored.
+        assert!(crate::Manifest::from_str(&POOLED.replace("floor = \"256M\"", "flor = \"256M\"")).is_err());
     }
 }

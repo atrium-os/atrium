@@ -310,8 +310,9 @@ fn serve(stream: UnixStream, shared: Arc<Mutex<Tenants>>) -> std::io::Result<()>
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
-        if let Request::ExecInstance { app_id, instance, tmpfs_mb } = req {
-            handle_exec_instance(app_id, instance, tmpfs_mb, &owner, &shared,
+        if let Request::ExecInstance { app_id, instance, tmpfs_mb, memory_mb, cpu_pct, require_memory_limit } = req {
+            let limits = (memory_mb, cpu_pct, require_memory_limit);
+            handle_exec_instance(app_id, instance, tmpfs_mb, limits, &owner, &shared,
                                  &LIMITER, &mut writer, &reader)?;
             continue;
         }
@@ -454,6 +455,7 @@ fn handle_exec_instance(
     app_id:   String,
     instance: Option<String>,
     tmpfs_mb: u32,
+    limits:   (Option<u64>, Option<u32>, bool),
     user:     &str,
     shared:   &Mutex<Tenants>,
     limiter:  &Arc<Mutex<portcullisd::ratelimit::Limiter>>,
@@ -550,15 +552,15 @@ fn handle_exec_instance(
         target: app_id.clone(),
         instance,
         tmpfs_mb,
-        // ★ NO STATIC CAP. A constant here would fight `memfed`, which
-        // budgets jails dynamically and never sets a cap below current RSS so
-        // an over-budget jail is frozen rather than killed. `memoryuse` is
-        // RSS and RSS caps can only kill, so a number pinned here would kill
-        // a worker the federation would have spared. The gap that remains is
-        // that memfed budgets BY NAME and these jail names are ephemeral —
-        // portcullis.md §6.5.2e.
-        memory_mb: None,
-        require_memory_limit: false,
+        // ★ The CALLER's limits, forwarded (§6.5.2e), combined with the
+        // manifest's [resources] by portcullis_oneshot (tighter wins) and
+        // applied by jaild at create. No limit is invented here: a constant
+        // would fight memfed, which budgets the jail's pool dynamically and
+        // never below RSS; a memory figure that IS given is a ceiling memfed
+        // may lower and never raise (jaild clamps SetRctl to it).
+        memory_mb: limits.0,
+        cpu_pct: limits.1,
+        require_memory_limit: limits.2,
         // The home jail(8) chdirs into is resolved from this user's passwd
         // inside portcullis_oneshot — see Spec::user_name.
         user_name: user.to_string(),
@@ -755,6 +757,7 @@ fn handle_govern(uid: u32, req: Request) -> Response {
             }),
         Request::GovernSetRctl { jail_name, memoryuse_mb } =>
             jaild::protocol::Request::SetRctl(jaild::protocol::SetRctlRequest {
+                pcpu: None,
                 jail_name,
                 memoryuse_mb,
             }),

@@ -56,6 +56,7 @@ fn main() -> ExitCode {
         "create" => {
             if rest.len() < 2 { return usage(); }
             Request::CreateJail(CreateJailRequest {
+                rctl: None,
                 name:          rest[0].clone(),
                 path:          rest[1].clone(),
                 children_max:  rest.get(2).and_then(|s| s.parse().ok()).unwrap_or(0),
@@ -84,6 +85,7 @@ fn main() -> ExitCode {
             let bin  = rest[2].clone();
             let argv: Vec<String> = rest[2..].to_vec();
             Request::CreateJail(CreateJailRequest {
+                rctl: None,
                 name,
                 path,
                 children_max:  0,

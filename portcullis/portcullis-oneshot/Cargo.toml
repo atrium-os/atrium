@@ -18,3 +18,6 @@ portcullis-trust = { path = "../portcullis-trust" }
 portcullis-mounts = { path = "../portcullis-mounts" }
 jaild = { path = "../jaild" }
 libc = "0.2"
+
+[dev-dependencies]
+toml = "0.8"

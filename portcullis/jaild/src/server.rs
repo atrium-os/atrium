@@ -353,6 +353,34 @@ fn handle_reap(
     }
 }
 
+/// The bounds and gates on create-time rctl limits. Pure apart from the
+/// racct probe, so the refusals are unit-testable.
+pub(crate) fn check_rctl_limits(l: &crate::protocol::RctlLimits, policy: &Policy) -> Result<(), JaildError> {
+    if let Some(mb) = l.memoryuse_mb {
+        if !(16..=1 << 20).contains(&mb) {
+            return Err(JaildError::PolicyViolation { rule: "rctl.memoryuse.range",
+                detail: format!("memoryuse {mb} MiB is outside 16 MiB..1 TiB") });
+        }
+    }
+    if let Some(p) = l.pcpu {
+        if !(1..=6400).contains(&p) {
+            return Err(JaildError::PolicyViolation { rule: "rctl.pcpu.range",
+                detail: format!("pcpu {p}% is outside 1..6400") });
+        }
+    }
+    if !policy.resource_control.allow_rctl {
+        return Err(JaildError::PolicyViolation { rule: "rctl.disabled",
+            detail: "a limit was requested and policy.resource_control.allow_rctl = false".into() });
+    }
+    if !ffi::racct_enabled() {
+        return Err(JaildError::PolicyViolation { rule: "rctl.racct_disabled",
+            detail: "a limit was requested and kern.racct.enable is 0; RACCT is a loader \
+                     tunable, so this machine cannot enforce one until it reboots with \
+                     kern.racct.enable=1".into() });
+    }
+    Ok(())
+}
+
 /// Set a jaild-created jail's RCTL `memoryuse` cap — the memory federation
 /// budgeter. Same two gates as Reap (`allow_rctl`). State is not mutated.
 fn handle_set_rctl(
@@ -375,12 +403,17 @@ fn handle_set_rctl(
         },
     };
     if dry_run {
-        info!("[dry-run] set rctl jail {} memoryuse={}M", jail.name, req.memoryuse_mb);
+        info!("[dry-run] set rctl jail {} memoryuse={}M pcpu={:?}", jail.name, req.memoryuse_mb, req.pcpu);
         return Response::Ok;
     }
-    match ffi::set_jail_rctl(&jail.name, req.memoryuse_mb) {
+    // ★ A static ceiling from create time wins: the federation may tighten a
+    // capped jail, never loosen it past what its creator demanded.
+    let mb = match jail.memory_ceiling_mb { Some(c) => req.memoryuse_mb.min(c), None => req.memoryuse_mb };
+    match ffi::set_jail_rctl(&jail.name, mb, req.pcpu) {
         Ok(()) => {
-            info!("set rctl jail {} memoryuse={}M (sigkill)", jail.name, req.memoryuse_mb);
+            info!("set rctl jail {} memoryuse={}M (sigkill){}{}", jail.name, mb,
+                  if mb < req.memoryuse_mb { " [clamped to its creation ceiling]" } else { "" },
+                  req.pcpu.map(|p| format!(" pcpu={p}% (deny)")).unwrap_or_default());
             Response::Ok
         }
         Err(e) => Response::SyscallFailed {
@@ -626,6 +659,15 @@ fn handle_remove(
         return (Response::Ok, None);
     }
 
+    /* ★ rctl rules go with the jail, ALWAYS — by the record's name or the
+     * requested one, whether or not jaild set them (memfed's SetRctl rules
+     * live here too). They are keyed by name, so one left behind would cap
+     * the next jail to reuse it, and before this nothing removed them. */
+    let rule_name = record_idx.map(|i| state.jails[i].name.clone()).or_else(|| name.clone());
+    if let Some(n) = rule_name.as_deref() {
+        if let Err(e) = ffi::remove_jail_rctl(n) { warn!("jaild: RemoveJail rctl rules for {n}: {e}"); }
+    }
+
     /* Capture alias + path info before we drop the record. */
     let alias_addr = record_idx.and_then(|i| state.jails[i].lo0_alias.clone());
     let jail_path = record_idx.map(|i| state.jails[i].path.clone());
@@ -761,6 +803,16 @@ fn handle_create(
         });
     }
 
+    /* ★ rctl limits are checked BEFORE dry-run and applied before anything
+     * exists: rctl accepts a rule for a jail NAME ahead of the jail, so the
+     * entry is capped from its first instruction. A limit jaild cannot apply
+     * is a refusal — creating the jail uncapped would hand the caller a
+     * worker it believes is bounded and is not. */
+    let limits = req.rctl.clone().filter(|l| !l.is_empty());
+    if let Some(l) = &limits {
+        check_rctl_limits(l, policy)?;
+    }
+
     if dry_run {
         info!(
             "jaild: dry-run CreateJail name={} path={} mounts={} exec={}",
@@ -772,6 +824,19 @@ fn handle_create(
             },
             procdesc_fd: None,
         });
+    }
+
+    if let Some(l) = &limits {
+        let rules = ffi::rctl_rules(&req.name, l).map_err(|e| JaildError::PolicyViolation {
+            rule: "rctl.name", detail: e.to_string() })?;
+        /* A run that died may have left rules under this name: they would
+         * otherwise stack with ours or outlive them. */
+        let _ = ffi::remove_jail_rctl(&req.name);
+        if let Err(e) = ffi::add_rctl_rules(&rules) {
+            let _ = ffi::remove_jail_rctl(&req.name);
+            return Err(JaildError::Syscall { name: "rctl", errno: e.raw_os_error().unwrap_or(-1), msg: format!("{e}") });
+        }
+        info!("jaild: rctl for {}: {}", req.name, rules.join(", "));
     }
 
     /* Apply lo0 alias on the host BEFORE jail_set, so the
@@ -882,10 +947,19 @@ fn handle_create(
     };
 
     if let Some(exec) = &req.exec {
-        return handle_create_with_exec(
+        let r = handle_create_with_exec(
             req, exec, stdio, lo0_alias, ip4_addr_no_cidr, ip4_inherit, state, state_path,
             policy.mount_sources.max_tmpfs_mb, pre_created,
         );
+        match &r {
+            Ok(_) if limits.is_some() => {
+                state.set_memory_ceiling(&req.name, limits.as_ref().and_then(|l| l.memoryuse_mb));
+                if let Err(e) = state.save(state_path) { warn!("jaild: state save after rctl ceiling: {e}"); }
+            }
+            Err(_) if limits.is_some() => { let _ = ffi::remove_jail_rctl(&req.name); }
+            _ => {}
+        }
+        return r;
     }
     if let Some(jid) = pre_created {
         state.add(&req.name, jid, None, &req.path);
@@ -1417,4 +1491,42 @@ pub fn bind(socket_path: &Path) -> Result<UnixListener, JaildError> {
     let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(socket_path, perms)?;
     Ok(listener)
+}
+
+#[cfg(test)]
+mod rctl_tests {
+    use super::*;
+    use crate::protocol::RctlLimits;
+
+    fn policy(allow: bool) -> Policy {
+        let mut p: Policy = toml::from_str(&std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap()
+                .join("etc/jaild.policy.toml")).unwrap()).unwrap();
+        p.resource_control.allow_rctl = allow;
+        p
+    }
+
+    fn rule(r: Result<(), JaildError>) -> &'static str {
+        match r { Err(JaildError::PolicyViolation { rule, .. }) => rule, other => panic!("{other:?}") }
+    }
+
+    #[test]
+    fn out_of_range_limits_are_refused_before_anything_else() {
+        let p = policy(true);
+        assert_eq!(rule(check_rctl_limits(&RctlLimits { memoryuse_mb: Some(1), pcpu: None }, &p)), "rctl.memoryuse.range");
+        assert_eq!(rule(check_rctl_limits(&RctlLimits { memoryuse_mb: None, pcpu: Some(0) }, &p)), "rctl.pcpu.range");
+        assert_eq!(rule(check_rctl_limits(&RctlLimits { memoryuse_mb: None, pcpu: Some(6401) }, &p)), "rctl.pcpu.range");
+    }
+
+    #[test]
+    fn a_limit_jaild_may_not_apply_is_a_refusal_not_an_uncapped_jail() {
+        let l = RctlLimits { memoryuse_mb: Some(512), pcpu: Some(100) };
+        assert_eq!(rule(check_rctl_limits(&l, &policy(false))), "rctl.disabled");
+        // With the policy allowing it, a host whose kernel has no RACCT
+        // (this test host, unless it is a FreeBSD booted with it) refuses
+        // naming the loader tunable.
+        if !ffi::racct_enabled() {
+            assert_eq!(rule(check_rctl_limits(&l, &policy(true))), "rctl.racct_disabled");
+        }
+    }
 }

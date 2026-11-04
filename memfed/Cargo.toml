@@ -16,3 +16,7 @@ libc = "0.2"
 # portcullisd (which forwards to jaild) instead of running rctl(8) directly, so a
 # *jailed* memfed can set per-jail caps across jail boundaries. §9.5.
 portcullis-ipc = { path = "../portcullis/portcullis-ipc" }
+# `--pools-from <apps dir>`: pools declared in installed manifests' [resources.pool],
+# matched by the app's one-shot instance-name prefix (portcullis.md §6.5.2e).
+portcullis-toml = { path = "../portcullis/portcullis-toml" }
+portcullis-jail = { path = "../portcullis/portcullis-jail" }

@@ -142,6 +142,14 @@ pub enum Request {
         app_id:   String,
         instance: Option<String>,
         tmpfs_mb: u32,
+        /// Limits forwarded from `portcullis exec --daemon` (§6.5.2e). Absent
+        /// on the wire from an older client = none asked.
+        #[serde(default)]
+        memory_mb: Option<u64>,
+        #[serde(default)]
+        cpu_pct: Option<u32>,
+        #[serde(default)]
+        require_memory_limit: bool,
     },
 
     /// "What may I launch?" — the installed-app catalog, for the launcher UI
@@ -359,6 +367,21 @@ use std::io::Read;
 mod tests {
     use super::*;
     use portcullis_toml::NetworkCap;
+
+    #[test]
+    fn exec_instance_limits_are_optional_on_the_wire() {
+        // An older CLI sends no limits; it must still parse, as "none asked".
+        let r: Request = serde_json::from_str(
+            r#"{"op":"exec_instance","app_id":"a","instance":null,"tmpfs_mb":64}"#).unwrap();
+        match r {
+            Request::ExecInstance { memory_mb, cpu_pct, require_memory_limit, .. } =>
+                assert_eq!((memory_mb, cpu_pct, require_memory_limit), (None, None, false)),
+            other => panic!("{other:?}"),
+        }
+        let s = serde_json::to_string(&Request::ExecInstance { app_id: "a".into(), instance: None, tmpfs_mb: 64,
+            memory_mb: Some(512), cpu_pct: Some(100), require_memory_limit: true }).unwrap();
+        assert!(s.contains("\"memory_mb\":512") && s.contains("\"cpu_pct\":100") && s.contains("\"require_memory_limit\":true"), "{s}");
+    }
 
     #[test]
     fn roundtrip_authorize_request() {

@@ -439,6 +439,7 @@ impl ServiceManifest {
     /// Translate to the wire-protocol type.
     pub fn to_create_request(&self) -> CreateJailRequest {
         CreateJailRequest {
+            rctl: None,
             name:          self.name.clone(),
             path:          self.path.clone(),
             children_max:  self.children_max,

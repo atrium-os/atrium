@@ -93,6 +93,7 @@ pub fn run_init(
         .collect();
 
     let req = Request::CreateJail(CreateJailRequest {
+        rctl: None,
         name:          init_jail_name.clone(),
         path:          path.to_string(),
         children_max:  0,

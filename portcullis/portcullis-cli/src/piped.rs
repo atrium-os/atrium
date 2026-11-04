@@ -42,10 +42,19 @@ usage:
                                   so it freezes rather than kills). Use this
                                   only where the federation cannot see the
                                   jail.
-        --require-memory-limit    refuse to run UNCAPPED. Needs a machine
-                                  booted with kern.racct.enable=1; RACCT is a
-                                  loader tunable, so a machine without it
-                                  cannot be capped until it reboots.
+        --cpu <percent>           a CPU cap, percent of one CPU (200 = two
+                                  cores), as rctl pcpu:deny — a THROTTLE,
+                                  never a kill.
+        --require-memory-limit    refuse to run UNCAPPED: with no memory limit
+                                  (from --memory or the manifest's
+                                  [resources].memory), or on a machine not
+                                  booted with kern.racct.enable=1 (a loader
+                                  tunable: it cannot be capped until reboot).
+
+        Limits combine with the manifest's [resources] memory/cpu: the
+        tighter of each applies. jaild applies them when it creates the jail
+        and removes them with it; --daemon forwards them. The memory figure
+        is a ceiling memfed may lower but never raise.
 
         Exits with the jailed process's own code (jaild reaps it), 128 if it
         died on a signal, and 1 if it never ran (refused or failed).");
@@ -57,6 +66,7 @@ pub fn cmd_exec(args: &[String]) -> ExitCode {
         (None::<String>, 64u32, None::<String>, false);
     let mut memory_mb: Option<u64> = None;
     let mut require_memory_limit = false;
+    let mut cpu_pct: Option<u32> = None;
     let mut run_as: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
@@ -65,6 +75,12 @@ pub fn cmd_exec(args: &[String]) -> ExitCode {
             "--daemon" => via_daemon = true,
             "--user" => { i += 1; run_as = args.get(i).cloned(); if run_as.is_none() { usage() } }
             "--require-memory-limit" => require_memory_limit = true,
+            "--cpu" => {
+                i += 1;
+                cpu_pct = match args.get(i).and_then(|s| s.parse().ok()) {
+                    Some(n) if n > 0 => Some(n), _ => usage(),
+                };
+            }
             "--memory" => {
                 i += 1;
                 memory_mb = match args.get(i).and_then(|s| s.parse().ok()) {
@@ -91,7 +107,8 @@ pub fn cmd_exec(args: &[String]) -> ExitCode {
             eprintln!("portcullis: --user does not apply to --daemon: the worker runs as you");
             return ExitCode::from(2);
         }
-        return match crate::daemon::exec_instance(&target, instance.as_deref(), tmpfs_mb) {
+        let limits = crate::daemon::ExecLimits { memory_mb, cpu_pct, require_memory_limit };
+        return match crate::daemon::exec_instance(&target, instance.as_deref(), tmpfs_mb, limits) {
             Ok(Some(Some(c))) => ExitCode::from(c.clamp(0, 255) as u8),
             Ok(Some(None)) => ExitCode::from(128),
             // ★ REFUSED, not silently done here instead. `--daemon` is a
@@ -113,6 +130,7 @@ pub fn cmd_exec(args: &[String]) -> ExitCode {
         tmpfs_mb,
         memory_mb,
         require_memory_limit,
+        cpu_pct,
         // ★★ Never from the environment. This path needs root, and `$USER`
         // is whatever the caller's shell left behind — `su -m` keeps root's,
         // so it silently named root (and a sudo'd shell could name anyone).

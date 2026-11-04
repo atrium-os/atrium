@@ -68,6 +68,7 @@ fn main() {
     // 4. EXEC the app jailed at that uid (jaild jails + drops to it).
     let name = format!("app-{}", app_id.replace(['.', '/'], "-"));
     let req = Request::CreateJail(CreateJailRequest {
+        rctl: None,
         name,
         path: jail_path.clone(),
         children_max: 0,

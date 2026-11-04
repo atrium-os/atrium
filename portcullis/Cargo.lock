@@ -633,6 +633,7 @@ dependencies = [
  "portcullis-mounts",
  "portcullis-toml",
  "portcullis-trust",
+ "toml",
 ]
 
 [[package]]

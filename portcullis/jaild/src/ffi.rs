@@ -1085,21 +1085,71 @@ pub fn reap_jail(_jid: i32, _sig: i32) -> io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "reap_jail: FreeBSD only"))
 }
 
-/// Set jail `name`'s RCTL `memoryuse` cap to `mb` MiB with a sigkill action, via
-/// rctl(8) — a shellout in the audited ifconfig style (rctl(8) is stable and the
-/// call rate is ~1 per jail per federation tick). Requires `kern.racct.enable=1`.
-pub fn set_jail_rctl(name: &str, mb: u64) -> io::Result<()> {
+/// The rctl(8) rules for `limits` on jail `name`, in the order they are added.
+/// Pure, so the exact strings are pinned by tests rather than by a VM run.
+///
+/// - `memoryuse:sigkill=<n>M` — RSS can only be enforced by a kill (you cannot
+///   fail a page fault); memfed keeps it at or above current RSS.
+/// - `pcpu:deny=<n>` — `deny` on pcpu THROTTLES: racct deschedules the jail's
+///   threads while it is over its share, and they run again after.
+pub fn rctl_rules(name: &str, limits: &crate::protocol::RctlLimits) -> io::Result<Vec<String>> {
     if !is_safe_jail_name(name) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput,
             format!("jail name {name:?} contains unsafe characters")));
     }
-    let rule = format!("jail:{name}:memoryuse:sigkill={mb}M");
-    let out = std::process::Command::new("rctl").arg("-a").arg(&rule).output()?;
-    if out.status.success() {
-        return Ok(());
+    let mut v = vec![];
+    if let Some(mb) = limits.memoryuse_mb { v.push(format!("jail:{name}:memoryuse:sigkill={mb}M")) }
+    if let Some(p) = limits.pcpu { v.push(format!("jail:{name}:pcpu:deny={p}")) }
+    Ok(v)
+}
+
+/// Whether the kernel can enforce an rctl rule at all. ★ `kern.racct.enable`
+/// is a LOADER TUNABLE: a machine that booted without it cannot be capped
+/// until it reboots. Reported, never switched on underneath an operator.
+pub fn racct_enabled() -> bool {
+    std::process::Command::new("sysctl").arg("-n").arg("kern.racct.enable")
+        .output().ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Add (or replace — rctl keys a rule by subject, resource and action) each
+/// rule. A shellout in the audited ifconfig style: rctl(8) is stable and the
+/// rate is about one call per jail per federation tick.
+pub fn add_rctl_rules(rules: &[String]) -> io::Result<()> {
+    for rule in rules {
+        let out = std::process::Command::new("rctl").arg("-a").arg(rule).output()?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(io::Error::new(io::ErrorKind::Other, format!("rctl -a {rule}: {}", stderr.trim())));
+        }
     }
+    Ok(())
+}
+
+/// Remove EVERY rule whose subject is jail `name`. ★ Rules are keyed by NAME
+/// and a one-shot's name is reused by the next worker with that instance tag:
+/// a rule left behind applies a stranger's cap to it, and rules otherwise
+/// accumulate in the kernel with nothing to show for them. Idempotent: no
+/// rule to remove is success.
+pub fn remove_jail_rctl(name: &str) -> io::Result<()> {
+    if !is_safe_jail_name(name) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            format!("jail name {name:?} contains unsafe characters")));
+    }
+    let out = std::process::Command::new("rctl").arg("-r").arg(format!("jail:{name}")).output()?;
+    // rctl -r on a filter that matches nothing exits 0 on FreeBSD; a missing
+    // RACCT (no rule could exist) is not a failure to remove either.
+    if out.status.success() || !racct_enabled() { return Ok(()) }
     let stderr = String::from_utf8_lossy(&out.stderr);
-    Err(io::Error::new(io::ErrorKind::Other, format!("rctl -a {rule}: {stderr}")))
+    Err(io::Error::new(io::ErrorKind::Other, format!("rctl -r jail:{name}: {}", stderr.trim())))
+}
+
+/// Set jail `name`'s RCTL `memoryuse` cap (and, if given, its `pcpu` cap).
+/// Requires `kern.racct.enable=1`.
+pub fn set_jail_rctl(name: &str, mb: u64, pcpu: Option<u32>) -> io::Result<()> {
+    let rules = rctl_rules(name, &crate::protocol::RctlLimits { memoryuse_mb: Some(mb), pcpu })?;
+    add_rctl_rules(&rules)
 }
 
 // ====================================================================
@@ -1181,6 +1231,21 @@ fn is_safe_cidr(s: &str) -> bool {
 
 #[cfg(test)]
 mod privilege_drop_tests {
+    #[test]
+    fn rctl_rules_are_exactly_these_strings() {
+        use crate::protocol::RctlLimits;
+        let r = rctl_rules("app-org-x--7", &RctlLimits { memoryuse_mb: Some(512), pcpu: Some(150) }).unwrap();
+        assert_eq!(r, vec!["jail:app-org-x--7:memoryuse:sigkill=512M", "jail:app-org-x--7:pcpu:deny=150"]);
+        assert!(rctl_rules("app-x--7", &RctlLimits::default()).unwrap().is_empty());
+        assert_eq!(rctl_rules("a", &RctlLimits { memoryuse_mb: None, pcpu: Some(100) }).unwrap(),
+                   vec!["jail:a:pcpu:deny=100"]);
+        // The name is spliced into a rule, so a metacharacter is refused.
+        for bad in ["a;rm", "a:b", "a b", "", "a/b"] {
+            assert!(rctl_rules(bad, &RctlLimits { memoryuse_mb: Some(1), pcpu: None }).is_err(), "{bad}");
+            assert!(remove_jail_rctl(bad).is_err(), "{bad}");
+        }
+    }
+
     use super::*;
 
     /// ★ The self-check must DETECT leftover supplementary groups — the exact

@@ -75,6 +75,10 @@ pub struct Spec {
     /// cares must be able to demand it, and one that does not must not be
     /// broken by a release.
     pub require_memory_limit: bool,
+    /// ★ A CPU cap, percent of one CPU (200 = two cores), enforced as rctl
+    /// `pcpu:deny` — a THROTTLE, not a kill (see `jaild::protocol::RctlLimits`).
+    /// Combined with the manifest's `[resources].cpu`: the tighter wins.
+    pub cpu_pct: Option<u32>,
     /// The user the entry runs as — its uid, gid and HOME are RESOLVED from
     /// the host's passwd, never supplied by the caller. ★ Must not be root:
     /// a one-shot worker never runs as uid 0 inside its jail (refused).
@@ -88,34 +92,67 @@ pub struct Spec {
 /// reboot. So this is a fact to report, never something to "turn on" — and a
 /// caller that silently proceeded would be running a worker pool it believes
 /// is capped and is not.
-pub fn racct_enabled() -> bool {
-    std::process::Command::new("sysctl").arg("-n").arg("kern.racct.enable")
-        .output().ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
-        .unwrap_or(false)
+pub fn racct_enabled() -> bool { jaild::ffi::racct_enabled() }
+
+/// The limits a one-shot jail is created with: the manifest's `[resources]`
+/// (`memory`, `cpu`) and the caller's (`--memory`, `--cpu`), **the tighter of
+/// each** — a caller can demand more confinement than the publisher declared,
+/// never less (the same rule as the trust gate, §6.5.3).
+///
+/// ★ Applied by jaild at CreateJail, as rctl rules it removes with the jail
+/// (§6.5.2e) — no more `rctl(8)` from this lane. The memory figure is a
+/// CEILING: memfed, budgeting the jail's pool, may set it lower and never
+/// higher (jaild clamps).
+///
+/// `Ok(None)` means run uncapped (nothing asked, or nothing enforceable and
+/// nothing required — which is reported on stderr, not silent).
+pub fn resolve_limits(manifest: Option<&portcullis_toml::ResourcesSection>, memory_mb: Option<u64>,
+                      cpu_pct: Option<u32>, require_memory_limit: bool, racct: bool)
+    -> Result<Option<jaild::protocol::RctlLimits>, String>
+{
+    let tighter = |a: Option<u64>, b: Option<u64>| match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)), (x, None) => x, (None, y) => y };
+    let declared_mb = match manifest.and_then(|r| r.memory.as_deref()) {
+        Some(m) => Some(parse_mib(m).ok_or_else(|| format!("[resources].memory {m:?} is not a size"))?),
+        None => None,
+    };
+    let mem = tighter(declared_mb, memory_mb);
+    let cpu = tighter(manifest.and_then(|r| r.cpu).map(u64::from), cpu_pct.map(u64::from)).map(|c| c as u32);
+    if require_memory_limit && mem.is_none() {
+        return Err("a memory limit is required and none was given (neither --memory nor \
+                    the manifest's [resources].memory)".into());
+    }
+    let limits = jaild::protocol::RctlLimits { memoryuse_mb: mem, pcpu: cpu };
+    if limits.is_empty() { return Ok(None) }
+    if !racct {
+        if require_memory_limit {
+            return Err("a memory limit was required but kern.racct.enable is 0; \
+                        RACCT is a loader tunable, so this machine cannot enforce one \
+                        until it reboots with kern.racct.enable=1".into());
+        }
+        eprintln!("portcullis: kern.racct.enable is 0 — running UNCAPPED (asked for {}{}); \
+                   reboot with kern.racct.enable=1 to enforce, or pass --require-memory-limit \
+                   to refuse instead",
+                  mem.map(|m| format!("memoryuse {m} MiB")).unwrap_or_default(),
+                  cpu.map(|c| format!(" pcpu {c}%")).unwrap_or_default());
+        return Ok(None);
+    }
+    Ok(Some(limits))
 }
 
-/// Apply a memoryuse cap to a jail. Returns whether one is now in force.
-///
-/// ★ `sigkill`, matching jaild's own rule (`jaild/src/ffi.rs`): a worker that
-/// exceeds its cap is killed, not merely denied an allocation. A denied
-/// allocation inside a parser is an error path that hostile input chose, and
-/// the broker already survives a worker dying — it is the failure mode the
-/// whole design is built around.
-/// ★ NOTE THE LAYERING VIOLATION THIS ACCEPTS. Atrium's privsep design has
-/// jaild as the single actor for rctl — a jailed governor cannot rctl another
-/// jail, so `SetRctl` is brokered. This lane creates its jails with `jail -c`
-/// directly, and jaild refuses to set a rule on a jail it did not create
-/// ("rctl.unknown_jail"), so brokering is not available here yet. It becomes
-/// available when the lane moves to jaild's `CreateJail` (portcullis.md
-/// §6.5.4), which is the same change that removes the intervening `/bin/sh`.
-/// Recorded rather than quietly shelled out.
-fn apply_memory_cap(jail_name: &str, mb: u64) -> Result<(), String> {
-    let rule = format!("jail:{jail_name}:memoryuse:sigkill={mb}M");
-    let out = std::process::Command::new("rctl").arg("-a").arg(&rule)
-        .output().map_err(|e| format!("rctl: {e}"))?;
-    if out.status.success() { return Ok(()) }
-    Err(format!("rctl -a {rule}: {}", String::from_utf8_lossy(&out.stderr).trim()))
+/// `512M`, `2G`, `1024K`, or a bare byte count → MiB (rounded up).
+pub fn parse_mib(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() { return None }
+    let (digits, mult) = match s.as_bytes()[s.len() - 1].to_ascii_uppercase() {
+        b'K' => (&s[..s.len() - 1], 1024u64),
+        b'M' => (&s[..s.len() - 1], 1024 * 1024),
+        b'G' => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        b'T' => (&s[..s.len() - 1], 1024u64 * 1024 * 1024 * 1024),
+        _ => (s, 1),
+    };
+    let bytes = digits.trim().parse::<u64>().ok()?.checked_mul(mult)?;
+    Some(bytes.div_ceil(1024 * 1024))
 }
 
 /// Why a one-shot run did not happen. `Exit` is the jailed process's own
@@ -292,23 +329,16 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
         return OneShot::Failed(e);
     }
 
-    // ★ An opt-in static cap, by NAME, before the jail exists — rctl accepts
-    // a rule ahead of its jail, so the worker is capped from its first
-    // instruction. See Spec::memory_mb for why this is off by default.
-    if let Some(mb) = spec.memory_mb {
-        if racct_enabled() {
-            if let Err(e) = apply_memory_cap(&jail_name, mb) {
-                teardown(&jail_path, &jail_name);
-                return OneShot::Failed(format!("memory cap: {e}"));
-            }
-        } else if spec.require_memory_limit {
-            teardown(&jail_path, &jail_name);
-            return OneShot::Refused(
-                "a memory limit was required but kern.racct.enable is 0; \
-                 RACCT is a loader tunable, so this machine cannot enforce one \
-                 until it reboots with kern.racct.enable=1".into());
-        }
-    }
+    // ★ Limits are resolved here and APPLIED BY JAILD at CreateJail, before
+    // the jail exists, so the worker is capped from its first instruction —
+    // and jaild removes them with the jail (§6.5.2e). Resolved before
+    // anything is built would be tidier, but the refusal must come after the
+    // tree is known to be this app's.
+    let rctl = match resolve_limits(manifest.resources.as_ref(), spec.memory_mb, spec.cpu_pct,
+                                    spec.require_memory_limit, racct_enabled()) {
+        Ok(l) => l,
+        Err(why) => { teardown(&jail_path, &jail_name); return OneShot::Refused(why) }
+    };
 
     // ★★ jaild creates the jail and execs the entry itself (portcullis.md
     // §6.5.4): pdfork + jail_set(CREATE|ATTACH) + a real execve of the entry,
@@ -339,6 +369,7 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
             gid:   pw.gid,
             stdio: true,
         }),
+        rctl,
         hostname: Some(manifest.app.id.clone()),
         hostid:   Some(host_identity.hostid),
         hostuuid: Some(host_identity.hostuuid.clone()),
@@ -696,12 +727,7 @@ fn teardown(jail_path: &Path, jail_name: &str) {
     // pile (portcullis_mounts::wait_jail_gone).
     portcullis_mounts::wait_jail_gone(jail_name, portcullis_mounts::JAIL_GONE_TIMEOUT);
     let upper = upper_dir(jail_name);
-    // ★ Remove the rctl rule with the jail. Rules are keyed by NAME, and the
-    // name is reused by the next worker with that instance tag: a rule left
-    // behind would silently apply someone else's cap to it, and rules
-    // accumulate in the kernel with nothing to show for them.
-    let _ = Command::new("rctl").arg("-r").arg(format!("jail:{jail_name}:memoryuse:"))
-        .stderr(std::process::Stdio::null()).status();
+    // (rctl rules are jaild's now: RemoveJail removes every rule for the name.)
     let left = portcullis_mounts::converge(
         &[jail_path, upper.as_path()], portcullis_mounts::Force::Yes);
     portcullis_mounts::warn_survivors("portcullis", &left);
@@ -713,3 +739,51 @@ fn teardown(jail_path: &Path, jail_name: &str) {
     let _ = std::fs::remove_dir(jail_path);
 }
 
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    fn res(memory: Option<&str>, cpu: Option<u32>) -> portcullis_toml::ResourcesSection {
+        let mut t = String::new();
+        if let Some(m) = memory { t += &format!("memory = {m:?}\n") }
+        if let Some(c) = cpu { t += &format!("cpu = {c}\n") }
+        toml::from_str(&t).unwrap()
+    }
+
+    #[test]
+    fn the_tighter_of_manifest_and_caller_wins_each_limit() {
+        let m = res(Some("2G"), Some(200));
+        let l = resolve_limits(Some(&m), Some(512), Some(400), false, true).unwrap().unwrap();
+        assert_eq!((l.memoryuse_mb, l.pcpu), (Some(512), Some(200)));
+        let l = resolve_limits(Some(&m), Some(8192), None, false, true).unwrap().unwrap();
+        assert_eq!((l.memoryuse_mb, l.pcpu), (Some(2048), Some(200)), "a caller cannot loosen the manifest");
+        let l = resolve_limits(None, None, Some(50), false, true).unwrap().unwrap();
+        assert_eq!((l.memoryuse_mb, l.pcpu), (None, Some(50)));
+        assert_eq!(resolve_limits(None, None, None, false, true).unwrap(), None);
+    }
+
+    #[test]
+    fn require_memory_limit_refuses_rather_than_runs_uncapped() {
+        // Nothing to cap with.
+        assert!(resolve_limits(None, None, Some(100), true, true).unwrap_err().contains("none was given"));
+        // A cap, but a kernel that cannot enforce it: refused, naming the tunable.
+        let e = resolve_limits(None, Some(512), None, true, false).unwrap_err();
+        assert!(e.contains("kern.racct.enable"), "{e}");
+        // Not required: runs uncapped (and says so on stderr), never sends a
+        // limit jaild would have to refuse.
+        assert_eq!(resolve_limits(None, Some(512), None, false, false).unwrap(), None);
+        // Required and enforceable.
+        assert!(resolve_limits(Some(&res(Some("1G"), None)), None, None, true, true).unwrap().is_some());
+    }
+
+    #[test]
+    fn sizes_are_mib_rounded_up() {
+        assert_eq!(parse_mib("512M"), Some(512));
+        assert_eq!(parse_mib("2G"), Some(2048));
+        assert_eq!(parse_mib("1536K"), Some(2));
+        assert_eq!(parse_mib("1"), Some(1));
+        assert_eq!(parse_mib("lots"), None);
+        assert!(resolve_limits(Some(&res(Some("lots"), None)), None, None, false, true).is_err());
+    }
+}

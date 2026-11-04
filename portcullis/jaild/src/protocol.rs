@@ -196,8 +196,39 @@ pub struct ReapRequest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SetRctlRequest {
     pub jail_name:    String,
-    /// `memoryuse` cap in MiB; the enforced action is sigkill.
+    /// `memoryuse` cap in MiB; the enforced action is sigkill. ★ Clamped to
+    /// the jail's static ceiling (`RctlLimits::memoryuse_mb` at create), so
+    /// the federation can tighten a capped jail but never loosen it.
     pub memoryuse_mb: u64,
+    /// `pcpu` cap, percent of one CPU, action `deny` (throttle). `None`
+    /// leaves the jail's CPU rule as it is.
+    #[serde(default)]
+    pub pcpu: Option<u32>,
+}
+
+/// Resource limits a jail is CREATED with, applied by jaild before the jail
+/// exists (rctl accepts a rule for a jail name ahead of the jail), so the
+/// entry is capped from its first instruction. Removed with the jail.
+///
+/// ★ CPU is `pcpu` with action `deny`, not `cputime`: `deny` on pcpu
+/// THROTTLES — the jail is descheduled when it exceeds its share and resumes
+/// — which is the same freeze-not-kill posture memfed takes for memory, and
+/// it bounds what a spinning page costs everyone else while it runs. A total
+/// `cputime` budget can only be enforced by a signal; the per-process form
+/// of that (RLIMIT_CPU) is set by a worker itself where it wants one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RctlLimits {
+    /// `memoryuse` in MiB, action sigkill; also the jail's ceiling for later
+    /// SetRctl requests.
+    #[serde(default)]
+    pub memoryuse_mb: Option<u64>,
+    /// `pcpu` in percent of one CPU (200 = two cores), action deny.
+    #[serde(default)]
+    pub pcpu: Option<u32>,
+}
+
+impl RctlLimits {
+    pub fn is_empty(&self) -> bool { self.memoryuse_mb.is_none() && self.pcpu.is_none() }
 }
 
 /// Create-jail spec.
@@ -252,6 +283,13 @@ pub struct CreateJailRequest {
     /// is responsible for an eventual `RemoveJail`.
     #[serde(default)]
     pub exec: Option<ExecSpec>,
+
+    /// rctl limits applied before the jail exists, and removed with it.
+    /// Requires `policy.resource_control.allow_rctl` and a kernel booted
+    /// with `kern.racct.enable=1`; jaild refuses rather than create the
+    /// jail uncapped when either is missing.
+    #[serde(default)]
+    pub rctl: Option<RctlLimits>,
 
     /// ★★★ The HOST IDENTITY the jail reports (portcullis.md §9.1c): synthetic,
     /// per app, never the real machine's. Without these a jail reports an
@@ -496,6 +534,17 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    /// The rctl additions are optional on the wire (§6.5.2e).
+    #[test]
+    fn rctl_fields_are_optional_on_the_wire() {
+        // An older client sends neither; both must still parse.
+        let set: SetRctlRequest = serde_json::from_str(r#"{"jail_name":"a","memoryuse_mb":5}"#).unwrap();
+        assert_eq!((set.memoryuse_mb, set.pcpu), (5, None));
+        let l: RctlLimits = serde_json::from_str(r#"{"pcpu":200}"#).unwrap();
+        assert_eq!(l, RctlLimits { memoryuse_mb: None, pcpu: Some(200) });
+        assert!(RctlLimits::default().is_empty() && !l.is_empty());
+    }
+
     /// Lock the wire format of the governor-broker verbs (the portcullisd client
     /// depends on it): the bounded ReapSignal round-trips and tags are stable.
     #[test]
@@ -515,6 +564,7 @@ mod tests {
         }
 
         let s = Request::SetRctl(SetRctlRequest {
+            pcpu: None,
             jail_name: "app-org-atrium-web".into(),
             memoryuse_mb: 2048,
         });
@@ -562,6 +612,7 @@ mod tests {
     #[test]
     fn create_jail_request_serde() {
         let req = Request::CreateJail(CreateJailRequest {
+            rctl: None,
             name: "atrium-test".into(),
             path: "/usr/local/share/atrium".into(),
             children_max:  0,

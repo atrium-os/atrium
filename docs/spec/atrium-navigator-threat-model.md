@@ -193,22 +193,26 @@ details and the numbers.
   - No jails (live or dying), jaild zombies, mounts or upper dirs were left behind.
   - Jail cost per conversion, under TCG, is **about 3.06 s**. The numbers and why
     that is not the real figure are in §4.7d.
-- **P2 limits.** `portcullis exec --memory` sets an rctl `memoryuse` cap, but only on
-  the root (non-daemon) lane, and the daemon lane does not forward it. No CPU rctl
-  exists anywhere (portcullis.md §6.5.2e). As an interim measure the converter lowers
-  its own **hard** `RLIMIT_CPU` (deadline + 5 s) and, on FreeBSD, `RLIMIT_AS`
+- **P2 limits, built 2026-11-05 (portcullis.md §6.5.2e′); FreeBSD run of the rctl half
+  pending.** jaild creates the converter jail with rctl `memoryuse:sigkill=4096M` and
+  `pcpu:deny=100`, from the manifest's `[resources]`. The tighter of manifest and caller
+  wins, the limits are forwarded through `--daemon`, and the rules are removed with the
+  jail. memfed budgets the converter jails as one pool (`[resources.pool]`) without
+  exceeding that ceiling. As defence in depth, the converter still lowers its own
+  **hard** `RLIMIT_CPU` (deadline + 5 s) and, on FreeBSD, `RLIMIT_AS`
   (`PRERENDER_MEM_MB`, default 4096) before parsing a byte. It reads them back and
-  refuses on a mismatch. An unprivileged process cannot raise a hard limit again. A
-  per-conversion total byte budget is still open.
-  **Verified on FreeBSD (in the jail).**
+  refuses on a mismatch. A per-conversion total byte budget is still open.
+  **The rlimit half, verified on FreeBSD (in the jail):**
   - `procstat -l` on the jailed `prerender` (uid `navtest`) shows hard and soft
     `cputime` 45 s (deadline 40 + 5) and `vmemoryuse` 1 048 576 KB
     (`PRERENDER_MEM_MB=1024`).
   - The memory limit is enforced. A page that grows a 2^27-character string fails
     at `PRERENDER_MEM_MB=256` ("memory allocation of 134217792 bytes failed", no
     recording). It converts at 1024.
-  - A broker whose hard limit is already below the ask makes the child refuse:
-    `RLIMIT_AS` and `RLIMIT_CPU` each fail with EPERM, exit 3.
+  - A broker whose hard limit was already below the ask made the child refuse:
+    `RLIMIT_AS` and `RLIMIT_CPU` each failed with EPERM, exit 3. Fixed (2026-11-05):
+    the child now takes the **tighter** of the ask and the inherited hard limit, and
+    still reads the result back.
   - The CPU limit is a backstop behind the wall-clock deadline, which fires first.
     It was not tripped on its own.
 
@@ -644,7 +648,7 @@ These belong in the model because they are *wins*, not because they need work:
 | P1 ✔ built | `navigatord` refuses to start unconfined outside test builds | A1 against the worker | trivial | §2.3 |
 | P1 | Decide where images decode: per-document jail, memory-safe decoders, never in Fresco | A1 via decoders | design and medium code | §2.4 |
 | P1 | Per-user dedup domain by default; reproduce-to-share | A5 poisoning | design now, code with sharing | §2.6 |
-| P2 | `rctl` memory/CPU limits on converter and worker jails; per-conversion byte budget | A6 | small | §2.2 |
+| P2 ✔ rctl built (VM run pending); byte budget open | `rctl` memory/CPU limits on converter and worker jails; per-conversion byte budget | A6 | small | §2.2 |
 | **P0 (graphics)** | Fix the five GPU driver isolation breaks and pass the attestation gate (F1) | everything in §2.5 rests on it | medium–large | §2.5.4 |
 | P1 | Split frescod: jailed compositor with **no GPU fd** writes a shared scene buffer; the broker runs only our `bin`/`raster` kernels; secure-input path | A1 against the shared compositor and the driver | medium | §2.5.1, conditions F2–F5 in §2.5.4 |
 | P2 | One jailed renderer per window, one GPU VM per window, fixed `compose` kernel; input routed by layer list (§2.5.2) | cross-window exposure | medium | §2.5.2 |

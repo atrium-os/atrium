@@ -78,6 +78,17 @@ pub fn validate(m: &Manifest) -> Report {
                     "[resources].memory {:?}: must look like \"512M\", \"2G\"", mem));
             }
         }
+        if let Some(pool) = &res.pool {
+            if !(pool.weight.is_finite() && pool.weight > 0.0) {
+                r.errors.push(format!("[resources.pool].weight {}: must be > 0", pool.weight));
+            }
+            if let Some(f) = &pool.floor {
+                if !is_valid_size(f) {
+                    r.errors.push(format!(
+                        "[resources.pool].floor {:?}: must look like \"256M\", \"1G\"", f));
+                }
+            }
+        }
         if let Some(cpu) = res.cpu {
             if cpu == 0 {
                 r.errors.push("[resources].cpu: 0 is invalid (use absent or ≥ 1)".into());

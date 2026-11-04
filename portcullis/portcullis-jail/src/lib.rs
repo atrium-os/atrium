@@ -147,6 +147,15 @@ pub fn jaild_instance_name(app_id: &str, instance: Option<&str>) -> Option<Strin
     (name.len() <= 64).then_some(name)
 }
 
+/// The prefix every one-shot instance of `app_id` shares — what a memory
+/// federation pool for the app matches (`memfed --pools-from`). ★ `None`
+/// when the id is too long to name an instance at all — never an empty
+/// prefix, which would match every jail on the machine.
+pub fn jaild_instance_prefix(app_id: &str) -> Option<String> {
+    let n = jaild_instance_name(app_id, Some("x"))?;
+    n.strip_suffix('x').filter(|p| p.len() > "app---".len()).map(str::to_string)
+}
+
 /// FreeBSD jail names use dots as hierarchy separators. Atrium app
 /// IDs are reverse-DNS-style and contain dots. Sanitize by replacing
 /// dots with underscores. The hostname keeps the original id.
@@ -236,4 +245,18 @@ pub fn build(manifest: &Manifest, opts: &BuildOpts) -> Result<JailConfig, BuildE
     }
 
     Ok(jc)
+}
+
+#[cfg(test)]
+mod instance_prefix_tests {
+    use super::*;
+    #[test]
+    fn the_prefix_matches_every_instance_and_nothing_else() {
+        let p = jaild_instance_prefix("org.atrium.navigator.converter").unwrap();
+        assert_eq!(p, "app-org-atrium-navigator-converter--");
+        assert!(jaild_instance_name("org.atrium.navigator.converter", Some("conv123")).unwrap().starts_with(&p));
+        assert!(!jaild_instance_name("org.atrium.navigator.converterx", Some("1")).unwrap().starts_with(&p));
+        // Too long to name an instance: no prefix, never "" (which matches all).
+        assert_eq!(jaild_instance_prefix(&"a".repeat(80)), None);
+    }
 }

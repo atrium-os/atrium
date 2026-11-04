@@ -1601,6 +1601,68 @@ rather than pretending. Note that `kern.racct.enable` is a **loader tunable**: a
 did not boot with it cannot enforce any cap until it reboots, so this is a fact to report
 and never something to switch on underneath an operator.
 
+#### 6.5.2e′ Closed (2026-11-05): limits through jaild, pools from manifests
+
+Both routes above, built. The one-shot lane already created its jails through jaild
+(§6.5.4). What it still did was shell `rctl -a` itself, before `CreateJail`, and only on
+the root lane. Each piece now:
+
+- **jaild applies the limits.** `CreateJailRequest.rctl: Option<RctlLimits { memoryuse_mb,
+  pcpu }>` is checked first: range, then `policy.resource_control.allow_rctl`, then
+  `kern.racct.enable`. A limit jaild cannot apply is a **refusal**, never an uncapped
+  jail (`rctl.disabled`, `rctl.racct_disabled`, `rctl.*.range`). The rules go in
+  **before** the pdfork, because rctl accepts a rule for a name ahead of its jail, so the
+  entry is capped from its first instruction. Stale rules under the name are cleared
+  first. The one-shot lane no longer runs `rctl(8)`.
+- **The rules go with the jail.** `RemoveJail` removes every rule whose subject is that
+  jail's name (`rctl -r jail:<name>`). That covers the create-time rules **and** memfed's
+  `SetRctl` rules, which before this nothing ever removed. A failed create removes them
+  too.
+- **CPU is `pcpu:deny`, not `cputime`.** `deny` on `pcpu` throttles: racct deschedules
+  the jail while it is over its share, and it runs again afterwards. That is the same
+  freeze-not-kill posture memfed takes for memory, and it bounds what a spinning page
+  costs everyone else while it runs. A total `cputime` budget can only be enforced by a
+  signal. Its per-process form, `RLIMIT_CPU`, is something a worker sets on itself where
+  it wants one (the Navigator converter does, threat model §2.2).
+- **Who sets them.** The manifest's `[resources] memory` and `cpu` are now enforced, no
+  longer only declared. The caller adds `portcullis exec --memory <MiB> --cpu <pct>`.
+  **The tighter of each wins**: a caller can demand more confinement than the publisher
+  declared, never less.
+- **`--daemon` forwards** `memory_mb`, `cpu_pct` and `require_memory_limit` in
+  `ExecInstance`. The fields are optional on the wire, so an older CLI means "none
+  asked".
+- **`--require-memory-limit` keeps its meaning** and closes one hole. It refuses when no
+  memory limit was given at all, and on a kernel without RACCT. Without it, a limit the
+  kernel cannot enforce is reported on stderr ("running UNCAPPED") and the jail runs
+  without it, never with a limit jaild would have to refuse.
+- **The static memory figure is a ceiling, and memfed works below it.** jaild records it
+  in the jail's state (`memory_ceiling_mb`) and clamps every later `SetRctl` to it. The
+  federation can tighten a capped jail but never loosen it, and it still never caps
+  below RSS.
+- **Pools from manifests.** `[resources.pool] weight, floor` declares how an app's
+  one-shot jails are budgeted. `memfed --pools-from /var/lib/atrium/apps` turns each
+  such declaration into one pool over `app-<id>--*`. The prefix comes from
+  `portcullis_jail::jaild_instance_prefix`, which returns `None` rather than an empty
+  prefix for an id too long to name an instance. The operator's `--pool` wins on the
+  same prefix. A pool's share still does not grow with its membership.
+  **Not wired:** a lifecycle tier for memoryd's reap order. memoryd's tiers are not
+  keyed by pool yet.
+
+**Users.** The Navigator converter declares `memory = "4G"` and `cpu = 100`; the document
+worker declares `memory = "2G"` and `cpu = 100`. Both declare `[resources.pool] weight =
+1.0` and `floor = "256M"`. The converter keeps its own hard `RLIMIT_CPU` and `RLIMIT_AS`
+as defence in depth.
+
+**Operator steps** for a machine that should enforce them:
+- boot with `kern.racct.enable=1`;
+- set `[resource_control] allow_rctl = true` in `/etc/atrium/jaild.policy.toml`;
+- run `memfed --pools-from /var/lib/atrium/apps`.
+
+**Verified:** unit tests on macOS: rule strings, refusals, wire compatibility, limit
+resolution, pool discovery and override. **FreeBSD: pending.** The steps are
+`scripts/navigator-converter-jail-e2e.sh` stage "limits": rules present while the jail
+runs, gone after, and none leaked.
+
 ### 6.5.3 The trust gate: `require_signatures`
 
 Two findings surfaced while designing the worker lane. Neither was caused by it; both were
