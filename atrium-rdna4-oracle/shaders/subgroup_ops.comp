@@ -22,7 +22,11 @@ void main() {
     o[b + 4u] = subgroupBroadcastFirst(x * 3u);
     o[b + 5u] = subgroupBroadcast(x + i, 5u);
     o[b + 6u] = subgroupShuffle(x + i, (gl_SubgroupInvocationID * 7u) & 31u);
-    o[b + 7u] = subgroupShuffleXor(x + i, 1u) + subgroupShuffleUp(i, 1u) * 1000u + subgroupShuffleDown(i, 1u) * 100000u;
+    // Up/down past the subgroup edge is undefined (ds_bpermute wraps), so
+    // the edge lanes' results are masked off with arithmetic, not a branch.
+    uint up = subgroupShuffleUp(i, 1u) * uint(gl_SubgroupInvocationID >= 1u);
+    uint down = subgroupShuffleDown(i, 1u) * uint(gl_SubgroupInvocationID <= 30u);
+    o[b + 7u] = subgroupShuffleXor(x + i, 1u) + up * 1000u + down * 100000u;
     o[b + 8u] = (subgroupElect() ? 1u : 0u) + (subgroupAll(x < 7u) ? 2u : 0u) + (subgroupAny(x == 6u) ? 4u : 0u) + (subgroupAllEqual(x) ? 8u : 0u) + (subgroupAllEqual(i / 64u) ? 16u : 0u);
     o[b + 9u] = gl_SubgroupInvocationID + 100u * gl_SubgroupID + 10000u * gl_NumSubgroups + 1000000u * gl_SubgroupSize;
     o[b + 10u] = floatBitsToUint(subgroupAdd(float(x)) + subgroupMax(float(i)) * 0.5);

@@ -1,0 +1,40 @@
+#version 450
+// Correctly rounded sqrt and 32-bit integer division / remainder by
+// variable divisors, over hashed inputs that cover every finite exponent
+// (denormals included) and both signs. Division by zero is undefined, so
+// divisors are never zero. Compile: glslangValidator -V --target-env vulkan1.1
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) buffer In { uint data[]; };
+layout(set = 0, binding = 1) buffer Out { uint o[]; };
+// Inlined by hand: the frontend does not take function calls.
+#define HASH(x) x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    uint seed = data[i];
+    for (uint k = 0u;; k++) {
+        if (k >= 4u) break;
+        uint n = i * 4u + k;
+        uint h = n * 2654435761u + seed;
+        HASH(h)
+        uint g = h;
+        HASH(g)
+        // sqrt: any finite non-negative float, plus the special cases.
+        uint bits = (h & 0x007fffffu) | ((g % 255u) << 23);
+        if (n == 0u) bits = 0u;
+        if (n == 1u) bits = 0x80000000u;
+        if (n == 2u) bits = 0x7f800000u;
+        if (n == 3u) bits = 1u;
+        o[n * 4u + 0u] = floatBitsToUint(sqrt(uintBitsToFloat(bits)));
+        // Unsigned: divisor of 1..32 bits.
+        uint d = (g >> (g % 32u)) | 1u;
+        if ((n & 8u) != 0u) d = g >> 1;
+        if (d == 0u) d = 3u;
+        o[n * 4u + 1u] = h / d;
+        o[n * 4u + 2u] = h % d + (h / 7u) * 3u;
+        // Signed, all sign combinations; includes INT_MIN / -1.
+        int a = int(h);
+        int b = int(d) * (((n & 1u) == 0u) ? 1 : -1);
+        if (n == 5u) { a = int(0x80000000u); b = -1; }
+        o[n * 4u + 3u] = uint(a / b) ^ uint(a % b);
+    }
+}

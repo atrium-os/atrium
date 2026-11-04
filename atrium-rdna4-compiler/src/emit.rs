@@ -179,7 +179,7 @@ impl<'a> E<'a> {
                 if d < 256 {
                     self.valu_wrote_s.insert(d);
                 }
-                if d >= 256 && (*name == "V_RCP_F32" || *name == "V_SQRT_F32") {
+                if d >= 256 && (*name == "V_RCP_F32" || *name == "V_RCP_IFLAG_F32" || *name == "V_SQRT_F32") {
                     self.trans.insert(d);
                 }
             }

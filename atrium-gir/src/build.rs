@@ -338,6 +338,26 @@ impl<'a> Builder<'a> {
                 let (a, b) = (self.val(a)?, self.val(b)?);
                 Val::V(self.map_n(r, rt()?, &[a, b], &bin(o)))
             }
+            S::SMod(a, b) => {
+                // Floored remainder (sign of the divisor): the truncated
+                // remainder, plus the divisor when it is non-zero and its
+                // sign differs from the divisor's.
+                let (a, b) = (self.val(a)?, self.val(b)?);
+                let t = rt()?;
+                let z = self.konst(0, Ty::I32);
+                let mut parts = vec![];
+                for i in 0..t.comps() {
+                    let (x, y) = (self.comp(r, a, i), self.comp(r, b, i));
+                    let rem = self.emit(r, Ty::I32, Op::Bin(BinOp::SRem, x, y));
+                    let sx = self.emit(r, Ty::I32, Op::Bin(BinOp::Xor, rem, y));
+                    let neg = self.emit(r, Ty::BOOL, Op::Cmp(CmpOp::SLt, sx, z));
+                    let nz = self.emit(r, Ty::BOOL, Op::Cmp(CmpOp::INe, rem, z));
+                    let fix = self.emit(r, Ty::BOOL, Op::Bin(BinOp::And, neg, nz));
+                    let adj = self.emit(r, Ty::I32, Op::Bin(BinOp::IAdd, rem, y));
+                    parts.push(self.emit(r, Ty::I32, Op::Select(fix, adj, rem)));
+                }
+                Val::V(if parts.len() == 1 { parts[0] } else { self.emit(r, t, Op::Construct(parts)) })
+            }
             S::INeg(a) | S::FNeg(a) | S::FAbs(a) | S::FSqrt(a) | S::FFloor(a) | S::FCeil(a) | S::FTrunc(a)
             | S::BitNot(a) | S::Clz(a) | S::Rbit(a) => {
                 let o = match &inst.op {

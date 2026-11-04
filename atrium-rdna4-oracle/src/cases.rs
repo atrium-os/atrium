@@ -159,13 +159,15 @@ pub fn tierb(name: &str) -> Option<Case> {
     // The oracle's own shaders first, then the Vulkan ICD's examples.
     let own = format!("{}/shaders/{name}.comp.spv", env!("CARGO_MANIFEST_DIR"));
     let icd = format!("{}/../atrium-vk-icd/examples/shaders/{name}.comp.spv", env!("CARGO_MANIFEST_DIR"));
-    let bytes = std::fs::read(own).or_else(|_| std::fs::read(icd)).ok()?;
+    let (bytes, words) = match std::fs::read(own) {
+        // The oracle's shaders write up to 16 words per lane.
+        Ok(b) => (b, 1024u32),
+        Err(_) => (std::fs::read(icd).ok()?, 256),
+    };
     let m = atrium_spv_frontend::translate_with_options(&bytes, &atrium_spv_frontend::Options { native_subgroups: true, ..Default::default() }).ok()?;
     let mut g = atrium_gir::build::build(&m, 0).ok()?;
     atrium_gir::passes::optimize(&mut g);
     let bin = atrium_rdna4_compiler::compile(&g).ok()?;
-    // 256 words per buffer; the subgroup cases write 16 words per lane.
-    let words = if name.starts_with("subgroup_") && name != "subgroup_sum" { 1024u32 } else { 256 };
     let fill = |k: u32| -> Vec<u8> { (0..words).flat_map(|i| (i % 7 + k).to_le_bytes()).collect() };
     let mut ib_bufs: interp::Buffers = g.buffers.iter().map(|&(s, b)| ((s, b), fill(b + 1))).collect();
     // Push constants: small distinct integers (3, 4, 5, ...).
@@ -206,10 +208,10 @@ pub fn tierb(name: &str) -> Option<Case> {
 }
 
 /// Tier-B examples tried as compiled cases, simplest first.
-pub const TIERB: [&str; 21] = [
+pub const TIERB: [&str; 22] = [
     "write_42", "per_thread", "multi_binding", "max_const", "ternary", "branch", "rmw", "rotate",
     "bit_chain", "bit_count", "loop_mul", "sum_loop", "atomic_add", "per_thread_triangle", "spec_scale", "float_sqrt",
-    "push_scale", "groupshared_xor", "subgroup_sum", "subgroup_ops", "subgroup_partial",
+    "push_scale", "groupshared_xor", "subgroup_sum", "subgroup_ops", "subgroup_partial", "math_exact",
 ];
 
 /// The desktop compute shaders: name, SPIR-V path under `bundles/`, bytes

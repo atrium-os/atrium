@@ -401,7 +401,7 @@ impl<'a> Isel<'a> {
                     UnOp::Not => self.valu("V_NOT_B32", d, vec![s], 0),
                     UnOp::FNeg => self.valu("V_XOR_B32", d, vec![s, O::Imm(0x8000_0000)], 0),
                     UnOp::FAbs => self.valu("V_AND_B32", d, vec![s, O::Imm(0x7fff_ffff)], 0),
-                    UnOp::FSqrt => return unsup("fsqrt (needs a correctly rounded sequence)"),
+                    UnOp::FSqrt => self.fsqrt(d, s),
                     UnOp::FFloor => self.valu("V_FLOOR_F32", d, vec![s], 0),
                     UnOp::FCeil => self.valu("V_CEIL_F32", d, vec![s], 0),
                     UnOp::FTrunc => self.valu("V_TRUNC_F32", d, vec![s], 0),
@@ -442,7 +442,10 @@ impl<'a> Isel<'a> {
                         self.fdiv(d, x, y);
                         return Ok(());
                     }
-                    other => return unsup(format!("{other:?} with a variable divisor")),
+                    BinOp::UDiv | BinOp::UMod | BinOp::SDiv | BinOp::SRem => {
+                        self.idiv(*o, d, x, y);
+                        return Ok(());
+                    }
                 };
                 self.valu(name, d, if swap { vec![y, x] } else { vec![x, y] }, 0);
             }
@@ -687,6 +690,93 @@ impl<'a> Isel<'a> {
         push(self, "V_FMA_F32", e3, None, vec![den, q2, num], 1);
         push(self, "V_DIV_FMAS_F32", q3, None, vec![e3, r, q2], 0);
         push(self, "V_DIV_FIXUP_F32", d, None, vec![q3, b, a], 0);
+    }
+
+    /// Correctly rounded f32 square root (the LLVM AMDGPU sequence): scale
+    /// tiny inputs up by 2^32, take `v_sqrt_f32` (1 ulp), step one ulp down
+    /// or up when the residual says so, scale back by 2^-16, and pass ±0
+    /// and +inf through.
+    fn fsqrt(&mut self, d: O, x: O) {
+        let v = |me: &mut Self| O::R(me.vreg(Class::V, 1), 0);
+        let m = |me: &mut Self| O::R(me.vreg(Class::S, 1), 0);
+        let x = if let O::Imm(b) = x { let t = v(self); self.valu("V_MOV_B32", t, vec![O::Imm(b)], 0); t } else { x };
+        let (small, xs, r, rm, em, rp, ep, t) = (m(self), v(self), v(self), v(self), v(self), v(self), v(self), v(self));
+        self.valu("V_CMP_GT_F32", small, vec![O::Imm(0x0f80_0000), x], 0); // x < 2^-96
+        self.valu("V_MUL_F32", t, vec![x, O::Imm(0x4f80_0000)], 0); // x * 2^32
+        self.valu("V_CNDMASK_B32", xs, vec![x, t, small], 0);
+        self.mi.push(MI::Valu { name: "V_SQRT_F32", dst: r, sdst: None, src: vec![xs], neg: 0 });
+        self.valu("V_ADD_NC_U32", rm, vec![r, O::Imm(u32::MAX)], 0); // one ulp down
+        self.mi.push(MI::Valu { name: "V_FMA_F32", dst: em, sdst: None, src: vec![rm, r, xs], neg: 1 });
+        self.valu("V_ADD_NC_U32", rp, vec![r, O::Imm(1)], 0); // one ulp up
+        self.mi.push(MI::Valu { name: "V_FMA_F32", dst: ep, sdst: None, src: vec![rp, r, xs], neg: 1 });
+        let (c1, c2, c3) = (m(self), m(self), m(self));
+        self.valu("V_CMP_LE_F32", c1, vec![em, O::Imm(0)], 0);
+        self.valu("V_CNDMASK_B32", r, vec![r, rm, c1], 0);
+        self.valu("V_CMP_GT_F32", c2, vec![ep, O::Imm(0)], 0);
+        self.valu("V_CNDMASK_B32", r, vec![r, rp, c2], 0);
+        self.valu("V_MUL_F32", t, vec![r, O::Imm(0x3780_0000)], 0); // * 2^-16
+        self.valu("V_CNDMASK_B32", r, vec![r, t, small], 0);
+        // +0 (0x40), -0 (0x20), +inf (0x200) are their own square roots.
+        self.valu("V_CMP_CLASS_F32", c3, vec![xs, O::Imm(0x260)], 0);
+        self.valu("V_CNDMASK_B32", d, vec![r, xs, c3], 0);
+    }
+
+    /// 32-bit integer division and remainder (the LLVM AMDGPU expansion):
+    /// an f32 reciprocal estimate of the divisor, one Newton step in
+    /// integers, then two corrections. Signed forms divide magnitudes and
+    /// fix the sign (quotient: sign of x ^ y; remainder: sign of x).
+    /// Division by zero is undefined in SPIR-V.
+    fn idiv(&mut self, o: BinOp, d: O, x: O, y: O) {
+        let v = |me: &mut Self| O::R(me.vreg(Class::V, 1), 0);
+        let m = |me: &mut Self| O::R(me.vreg(Class::S, 1), 0);
+        let signed = matches!(o, BinOp::SDiv | BinOp::SRem);
+        let (x, y, sign) = if signed {
+            let (sx, sy, ax, ay) = (v(self), v(self), v(self), v(self));
+            self.valu("V_ASHRREV_I32", sx, vec![O::Imm(31), x], 0);
+            self.valu("V_ASHRREV_I32", sy, vec![O::Imm(31), y], 0);
+            self.valu("V_ADD_NC_U32", ax, vec![x, sx], 0);
+            self.valu("V_XOR_B32", ax, vec![ax, sx], 0);
+            self.valu("V_ADD_NC_U32", ay, vec![y, sy], 0);
+            self.valu("V_XOR_B32", ay, vec![ay, sy], 0);
+            let sign = if o == BinOp::SDiv {
+                let s = v(self);
+                self.valu("V_XOR_B32", s, vec![sx, sy], 0);
+                s
+            } else {
+                sx
+            };
+            (ax, ay, Some(sign))
+        } else {
+            (x, y, None)
+        };
+        let (f, z, ny, t, q, r) = (v(self), v(self), v(self), v(self), v(self), v(self));
+        self.valu("V_CVT_F32_U32", f, vec![y], 0);
+        self.mi.push(MI::Valu { name: "V_RCP_IFLAG_F32", dst: f, sdst: None, src: vec![f], neg: 0 });
+        self.valu("V_MUL_F32", f, vec![f, O::Imm(0x4f7f_fffe)], 0); // 2^32 - 512
+        self.valu("V_CVT_U32_F32", z, vec![f], 0);
+        self.valu("V_SUB_NC_U32", ny, vec![O::Imm(0), y], 0);
+        self.valu("V_MUL_LO_U32", t, vec![ny, z], 0);
+        self.valu("V_MUL_HI_U32", t, vec![z, t], 0);
+        self.valu("V_ADD_NC_U32", z, vec![z, t], 0);
+        self.valu("V_MUL_HI_U32", q, vec![x, z], 0);
+        self.valu("V_MUL_LO_U32", t, vec![q, y], 0);
+        self.valu("V_SUB_NC_U32", r, vec![x, t], 0);
+        for _ in 0..2 {
+            let c = m(self);
+            self.valu("V_CMP_GE_U32", c, vec![r, y], 0);
+            self.valu("V_ADD_NC_U32", t, vec![q, O::Imm(1)], 0);
+            self.valu("V_CNDMASK_B32", q, vec![q, t, c], 0);
+            self.valu("V_SUB_NC_U32", t, vec![r, y], 0);
+            self.valu("V_CNDMASK_B32", r, vec![r, t, c], 0);
+        }
+        let res = if matches!(o, BinOp::UDiv | BinOp::SDiv) { q } else { r };
+        match sign {
+            Some(s) => {
+                self.valu("V_XOR_B32", t, vec![res, s], 0);
+                self.valu("V_SUB_NC_U32", d, vec![t, s], 0);
+            }
+            None => self.valu("V_MOV_B32", d, vec![res], 0),
+        }
     }
 
     /// Workgroup id component `k`. GFX12 has architected workgroup-id
