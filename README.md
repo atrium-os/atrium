@@ -13,7 +13,9 @@ For the full thesis see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). For canoni
 
 ## Status
 
-As of 2026-10-02 (the last commit), these pieces work:
+Work since 2026-11-03 (native RDNA4 backend and gpusim, the Fresco display pipeline and its process split, compressed memory, Navigator security fixes, the x86_64 port) is tracked in [docs/STATUS.md](docs/STATUS.md); how to run it is in [RUNBOOK.md](RUNBOOK.md) §13.
+
+As of 2026-10-02, these pieces work:
 
 - **D0 / D1**: a native virtio-gpu kmod through scanout, and `frescod` running Fresco on FreeBSD with atrium-edit interactive over the full protocol on a Unix socket.
 - **D1.5 Tessera**: the in-kernel CAS filesystem (`tessera_fs.ko`), with POSIX behaviour checked by pjdfstest, mmap/exec, snapshots, and fsync performance matching ZFS. July to September went into hardening it: crash recovery, GC correctness, metadata-reserve exhaustion returning ENOSPC cleanly, snapshot pinning, quota and dedup domains, `tessera-fsck` / `tessera-repack`, and a namespace verifier that runs after every commit (on by default).

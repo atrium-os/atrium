@@ -6,6 +6,11 @@ Operational reference for the Fresco scenegraph FreeBSD POC. Update this file wh
 
 Project context lives in claude-memory (`~/.claude/projects/-Users-girivs-src-bsd/memory/`); architectural decisions live in commit messages and the gpu-server source. This file is for **how to do things** — recipes, paths, quirks.
 
+**Where to start.** Current state of every workstream: [docs/STATUS.md](docs/STATUS.md).
+Cloud sessions, the amd64/gpusim VM, frescod modes, R9700 runs, Navigator jail
+e2e and the zram bench: [§13](#13-cloud-and-remote-workflows-2026-11). Sections
+0–12 are the Mac (HVF) loop.
+
 ---
 
 ## 0. Quick start — build everything from scratch
@@ -5124,3 +5129,199 @@ file is 19.  Next steps belong to a different arc: tier-2 R
 deferred items (R.4 v2 side-plane clipping, R.6 v2 tile
 trivial reject, R.8 SIMD pixel quads), or atrium-vk-icd
 migration to consume this wire shape.
+
+---
+
+## 13. Cloud and remote workflows (2026-11)
+
+Everything above is the Mac loop (HVF, 9p, `~/src/bsd`). Since 2026-11-03 most
+work also runs in Linux cloud sessions and on a remote R9700 box. This section
+is how to do that. What each workstream has reached is in
+[docs/STATUS.md](docs/STATUS.md).
+
+### 13.1 FreeBSD VM in a cloud session (`scripts/cloud-vm.sh`)
+
+QEMU under **TCG** (no `/dev/kvm`: ~50–100× slower than HVF). Fine for jail,
+Portcullis and driver functional tests; never quote its timings as product
+numbers (a jail create+teardown is ~3 s here vs ~51 ms on the Mac). Needs
+`download.freebsd.org` in the environment's allowed domains.
+
+```sh
+sh scripts/cloud-vm.sh setup   # ~12 min: apt pkgs, 16-CURRENT snapshot image, ssh over serial,
+                               #   sysroot pulled from the guest, Portcullis stack deployed
+sh scripts/cloud-vm.sh up      # boot an existing image, wait for ssh
+sh scripts/cloud-vm.sh down    # clean poweroff
+sh scripts/cloud-vm.sh e2e     # navigator-jail-e2e.sh --quick on a synthetic page
+. scripts/cloud-vm.sh env      # exports CROSS_RUSTFLAGS + TARGET for cross-builds
+```
+
+| knob | meaning |
+|---|---|
+| `ARCH=amd64` | x86_64 guest (q35 + OVMF), state in `~/atrium-vm-amd64`; default arm64 in `~/atrium-vm` |
+| `MEM`, `SMP` | guest RAM (default 8G) and CPUs |
+| `TESSERA_ROOT=1` | boot from `$VMDIR/devroot.img` (built by `scripts/build-tessera-devroot.sh`) |
+| `GPUSIM=1` + `QEMU_BIN` + `GPUSIM_DIR` | attach the gpusim RDNA4 PCI device (needs the atrium-os/qemu fork) |
+| `TCG_CPU` | amd64 CPU model; default Nehalem. Tier-2 x86 code needs AVX2: `TCG_CPU=Haswell-noTSX` with the fork QEMU |
+| `NETDEV_EXTRA` | appended to the slirp netdev (fixture networks, see 13.6) |
+
+Cross-building for the guest: `. scripts/cloud-vm.sh env`, then
+`RUSTFLAGS="$CROSS_RUSTFLAGS" cargo build --target "$TARGET" ...`. Never set
+those RUSTFLAGS globally: host test binaries would link against FreeBSD's crt.
+
+Gotchas:
+- The container itself can restart; the image survives in `~/atrium-vm`, so just `up` again.
+- The guest has no TLS route through the proxy. Download on the host and pipe in via `scripts/vssh`.
+- A large scp under TCG occasionally lands with a run of zeros: always hash-check at the destination.
+- Never edit a script while `sh` is running it (dash reads incrementally).
+- QEMU dies when the session idles for long; `up` again, then redo `nextboot -k kernel.atrium` if you need the Atrium kernel (it is one-shot).
+- Run long guest jobs with `daemon -f`.
+- Portcullis host tests don't build on Linux (kqueue, arc4random); the e2e skips them there.
+
+### 13.2 Kernel and kmods from the Linux host
+
+```sh
+# atrium-os/freebsd-src, branch atrium-os; apt install time flex bison libarchive-dev
+CC=/usr/bin/clang-18 CXX=/usr/bin/clang++-18 CPP=/usr/bin/clang-cpp-18 \
+MAKEOBJDIRPREFIX=$HOME/obj tools/build/make.py --cross-bindir=/usr/lib/llvm-18/bin \
+  TARGET=arm64 TARGET_ARCH=aarch64 -j4 KERNCONF=ATRIUM kernel-toolchain buildkernel
+# first build ~25 min, then -DKERNFAST ~6 min
+make.py ... installkernel DESTDIR=$HOME/stage -DNO_ROOT KODIR=/boot/kernel.atrium
+# tar to the guest, then in the guest: nextboot -k kernel.atrium && reboot
+```
+
+- Kmods: `make.py ... buildenv BUILDENV_SHELL="sh -c 'cd DIR && make SYSDIR=...'"`.
+- **amd64 kmods need LLVM 19**: clang 18 emits GOTPCRELX (reloc 42), which kldload rejects.
+- Build the Tessera EFI loader on the host via buildenv (~2 min), not in the TCG guest (30+ min).
+- Fork userland for amd64: `scripts/cross-build-world.sh` (~62 min). Stop the VM during it (the guest got OOM-killed).
+- Never run two make.py builds on one objdir.
+- An ATRIUM (WITNESS) kernel takes ~10 min to boot under TCG; watch `serial.sock`.
+
+### 13.3 amd64 VM with gpusim (GPU driver + Fresco)
+
+```sh
+# once: build the atrium-os/qemu fork for x86_64 (apt libslirp-dev; configure --enable-slirp)
+# gpusim expects the atrium checkout at ../bsd:  ln -s ~/atrium ~/bsd
+ARCH=amd64 GPUSIM=1 QEMU_BIN=~/atrium-os/qemu/build/qemu-system-x86_64 \
+  GPUSIM_DIR=~/gpusim TCG_CPU=Haswell-noTSX sh scripts/cloud-vm.sh up
+```
+
+In the guest:
+- Load the GPU modules from `/boot/loader.conf`. After boot vgapci owns the
+  device: `devctl set driver -f vgapci1 atrium_gpu_amd_pci` (or
+  `pci0:0:4:0`). Re-attaching a module panics, so **reboot to reload**.
+- q35 needs `hw.pci.honor_msi_blacklist=0`, or the driver falls back to polling.
+- Pass `ATRIUM_BUILD_ID` from the host (`atrium-gpu-amd/build-id.sh`).
+- Kernel headers: download `src.txz` on the host and pipe in only `sys`, `share/mk`, `include`.
+  The Atrium-only `<sys/energy_budget.h>` is stubbed by `atrium-gpu-amd/energy_compat.h`.
+- Tests: `atrium-gpu-amd/tests/atrium_gpu_test.c` (suite) and
+  `test_gpu_isolation.c` (F1/F6 isolation). Expected as of 2026-11-04:
+  suite 28/28, isolation 50/50.
+- After changing gpusim: rebuild `gpusim-server`, then `cloud-vm.sh down`/`up`
+  (and the nextboot/kldload/devctl steps again).
+- gpusim runs dispatches synchronously inside the doorbell MMIO, so the
+  **whole guest freezes for each GPU frame** (ssh times out). If a demo is
+  hogging it, restart the VM rather than trying to ssh in.
+- `GPUSIM_RDNA4_BUDGET` (default 2^30 wave instructions) bounds a dispatch;
+  `GPUSIM_RDNA4_STATS=1` logs each dispatch's time to `gpusim-server.log`.
+  Screenshot the scanout: `screendump f.ppm gpusim0` on the QEMU monitor socket.
+
+### 13.4 Fresco: frescod modes
+
+| env | effect |
+|---|---|
+| `FRESCOD_RENDERER=compute` | CPU (Tier-2) compute renderer (`fresco-compute` bin + raster kernels) |
+| `FRESCOD_RENDERER=gpu` | same kernels compiled by atrium-rdna4, run on the GPU (gpusim or silicon); set `FRESCOD_FLIP_TIMEOUT_MS=900000` on gpusim |
+| `FRESCOD_HEADLESS_PNG=/tmp/x` | headless, writes PNGs; test here first |
+| `FRESCOD_SPLIT=1` | F4b: one renderer process per client |
+| `FRESCOD_RENDERER_LAUNCHER="portcullis exec --user navtest --instance fresco{client} org.atrium.fresco.renderer"` | run each renderer in a Portcullis jail |
+| `FRESCOD_INPUT_SOCK` | input injection socket (F4c routing) |
+| `FRESCOD_CHROME_SOCK` | trusted chrome: `OPEN_CLIENT` then `SET_ORIGIN` (F4d strip) |
+| `FRESCOD_DAMAGE_THRESHOLD` | damage tracking tuning (gpu backend rasters only dirty tiles) |
+
+Demos (crate `atrium-test-client`): `atrium-surfaces-demo <sock> <wm-sock>`
+(three windows; `SURFACES_STILL=1` prints which client got each input),
+`atrium-chrome-demo` (origin strip). Split-mode cross-build:
+`export ARCH=amd64; . scripts/cloud-vm.sh env; export RUSTFLAGS="$CROSS_RUSTFLAGS"`;
+build portcullis/opifex from `portcullis/`; sign the renderer bundle with
+`/root/e2e-key.pem` and install it with opifex. Known gaps: fonts are not in
+the renderer bundle; the Vulkan backend can't take pre-packed frames.
+
+Shader tools in cloud sessions (GitHub release downloads are blocked):
+- Slang: `sh scripts/slangc-lite/setup.sh`, then
+  `SLANGC=~/.cache/atrium-slangc-lite/slangc AQUEDUCT_SHADER_TOOL=true sh bundles/atrium-core/build.sh` (and `atrium-text`). `.spv` files are gitignored.
+- GLSL: `apt-get install -y glslang-tools spirv-tools`. Write loops break-first (`for (;k<n;)` merge-less blocks are rejected).
+- lavapipe (golden oracle only): `apt install mesa-vulkan-drivers`, `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.json`.
+
+### 13.5 RDNA4 oracle: gpusim locally, R9700 remotely
+
+The `atrium-rdna4-oracle` crate holds the cases. Its binaries:
+
+| bin | output |
+|---|---|
+| `make-jobs` / `check-jobs` | job directories and their checks |
+| `bundle-jobs > run-r9700.sh` | one self-contained script: recreates the jobs, builds the amdgpu runner, runs every case, prints a pasteable report |
+| `bench-script > bench-r9700.sh` | ours vs RADV GPU-timestamp timings |
+
+**gpusim:** `gpusim-rdna4-run <job-dir>` (in the gpusim repo) runs the same
+job directories; gpusim must match every case the card matches.
+
+**R9700:** reachable *only* from Shankar's Mac (`ssh -l ubuntu orbis-r9700`;
+plain `ssh orbis-r9700` logs in as the wrong user). Cloud threads can't reach it.
+1. Generate the script in a cloud session and put it in project files
+   (`graphics/rdna4/run-r9700.sh`). **Never regenerate on the Mac**: it has no
+   slangc and `bundle-jobs` silently drops cases whose `.spv` is missing.
+2. Ask (via the coordinator) the thread "Run R9700 jobs from the Mac". It
+   copies to `/orbis/out/atriumN/`, checks the sha, and launches with
+   `/orbis/atrium-launch.sh <run|bench> N` (detached, timeout, `relay.log`
+   lines). Each launch needs Shankar's typed OK while Remote Control is live.
+3. Reports come back as `graphics/rdna4/reports/atrium_r9700_report_vN.txt`
+   (+ `_kmsg.txt` from `sudo -n journalctl -k`).
+
+Box rules: the GPU is shared with Orbis CFD jobs; check
+`pgrep -af "gpucfd-rans|snappyHexMesh|gpucfd-mesh|examples/global"` first and
+wait for a quiet GPU for benches. At most two long + one short job. Only 256 MB
+of VRAM is CPU-visible (no resizable BAR). Never edit a running script; don't
+touch other threads' files under `/orbis`; ask before installing packages.
+
+### 13.6 Navigator jail and security e2e (in the cloud VM)
+
+| script | proves |
+|---|---|
+| `scripts/navigator-jail-e2e.sh [--quick] [--recordings DIR]` | corpus through one document-worker jail per document; leak assertions |
+| `scripts/navigator-converter-jail-e2e.sh --rounds N --net M --html DIR` | converter (page JS) in a one-shot jail: fetchd §2.1 gate unjailed/jailed, jailed vs unconfined byte-identical, require-confinement refusal, jail limits stage, no leaks |
+| `scripts/navigator-fetch-vm-check.sh` | fetchd address filter with a hermetic "public" fixture server (slirp `net=1.2.3.0/24`, guestfwd 1.2.3.100:80/443, throwaway CA) |
+
+- Create `navtest` in the guest first: `pw useradd navtest -m`.
+- The guest boots with `kern.racct.enable=1`. **`deploy-portcullis.sh` rewrites
+  `/etc/atrium/jaild.policy.toml` and drops `[resource_control] allow_rctl = true`**:
+  re-add it after every deploy, or jaild refuses limited one-shots (`rctl.disabled`).
+- Input pages: corpus HTML is third-party content; stage it via project files
+  (`navigator/batch2-html.tar.gz`), never commit it.
+- Expected outputs, step by step: `/mnt/project-files/navigator/converter-jail-freebsd-runplan.md`
+  and `jaild-limits-freebsd-runplan.md`.
+
+### 13.7 Navigator corpus (on the Mac, no VM)
+
+- Corpus: `~/src/navigator-corpus` (batch 1 + `batch2/`). Run recipe in its README.
+- Record new pages: `scripts/navigator-corpus/record.sh <urls.tsv> <out-dir>` (needs the network, so Mac only; `PRERENDER_DEADLINE=180`).
+- Coverage: `scripts/navigator-corpus/coverage.py` (legacy-web §5.4.5.6a); probe budget helper `budget.py`.
+- After any renderer change, re-run `navigator-normalize` before `nsg-flag`.
+
+### 13.8 zram KVM bench (R9700 box)
+
+- Kit: `sh atrium-zram/bench/kvm/bundle.sh [OUT]` builds one pasteable
+  `zram-kvm-bench.sh` (host script + guest scripts + kmod source + fill
+  workload + swap-free and fast-path patches). Options `RUNS="lz4:0 lz4:1"`,
+  `BACKING_MB=4096`.
+- Runs on the box under KVM (`sudo`, the ubuntu user isn't in the kvm group).
+  Work folder `/orbis/atrium-zram-bench` (keep it), log `/orbis/out/zram/relay.log`.
+- Mac-built bundles differ only in tar mtimes: compare payload hashes, not the bundle sha.
+- In the cloud VM instead: `MEM=2G sh scripts/cloud-vm.sh up`, `swapoff /dev/gpt/swapfs` before tests.
+- Results: `/mnt/project-files/zram-bench/`; decision record in `docs/spec/atrium-zram-v2.md` §6.
+
+### 13.9 Shared-checkout hygiene
+
+Several threads push to `main` from the cloud and from the Mac.
+- `git fetch` + rebase before every push.
+- Run `git grep '^<<<<<<< '` before pushing: an autostash once committed conflict markers (`7c1ec1b`, fixed in `7767693`).
+- Pull in `~/src/bsd` afterwards. Never delete through a symlink there (`rm`/`unlink` the link itself only).

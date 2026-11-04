@@ -9,6 +9,8 @@ Architecture and design docs for an integrated FreeBSD desktop platform built ar
 
 ## Read in this order
 
+0. [STATUS.md](STATUS.md) — where every active workstream stands right now, with commits and next steps. How to run things: [../RUNBOOK.md](../RUNBOOK.md) (§13 for cloud sessions, gpusim, the R9700 and the Navigator jail e2e).
+
 1. [NAMING.md](NAMING.md) — canonical vocabulary (Atrium, Fresco, Tessera, Portcullis, Castellum, Vestibulum, Lyra, Tabula, Praeco, Opifex, Curia, Scrinium, Forum). Read this first.
 2. [ARCHITECTURE.md](ARCHITECTURE.md) — the integrated platform thesis. Why now, what's different, what's done, what's planned.
 3. [ROADMAP.md](ROADMAP.md) — phased deliverables D0..D7, dependencies, honest scope.
