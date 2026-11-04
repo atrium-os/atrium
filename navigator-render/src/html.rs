@@ -61,7 +61,11 @@ fn calc_eval(c: &Calc, basis: U) -> Option<f64> {
 fn len(v: &V, basis: U) -> Option<U> {
     match v {
         V::Len(l) => Some(u(l.v)),
-        V::Pct(p) => Some(u(basis as f64 / PX as f64 * p / 100.0)),
+        // ★ TRUNCATED to the 1/64 px grid, as a browser's LayoutUnit does,
+        // not rounded: two `flex-basis: 50%` items in a 701.5 px wrapping row
+        // each rounded UP, summed to 1/64 px more than the row, and the
+        // second wrapped (PostgreSQL's search box under its version list).
+        V::Pct(p) => Some((basis as f64 * p / 100.0).trunc() as U),
         V::Calc(c) => calc_eval(c, basis).map(u),
         _ => None,
     }
@@ -3834,6 +3838,21 @@ mod tests {
         assert_eq!(one(0x00ff00ff).0, 300 - 40, "justify-self: start is the cell's right edge");
         assert_eq!(one(0xffff00ff).0, 100, "end is its left edge (cell 2 spans 100..200)");
         assert_eq!(one(0x00ffffff).0, 0, "-2 / -1 is the last column, on the left");
+    }
+
+    /// ★ A percentage resolves by TRUNCATION to the 1/64 px grid: two
+    /// `flex-basis: 50%` items in an odd-width wrapping row fit on one line,
+    /// as in a browser. Rounded, each was 1/64 px too wide together.
+    #[test]
+    fn percentages_truncate_so_halves_fit_one_line() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .f { display: flex; flex-wrap: wrap; width: calc(700px + 1px / 64) }
+            .h { flex-basis: 50%; flex-grow: 0; flex-shrink: 0; max-width: 50%; height: 10px }
+            .a { background-color: #ff0000 } .b { background-color: #0000ff }</style>
+            <div class="f"><div class="h a"></div><div class="h b"></div></div>"#);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        assert_eq!(boxes(&o, 0xff0000ff)[0].1, boxes(&o, 0x0000ffff)[0].1, "one line");
+        assert_eq!(boxes(&o, 0x0000ffff)[0].0, 350);
     }
 
     /// ★ A replaced box's intrinsic sizes are its OWN size: an `<img>` flex
