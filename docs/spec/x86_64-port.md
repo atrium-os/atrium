@@ -154,6 +154,10 @@ frescod compositing on the R9700 through `tier3_rdna4`.
 - CPU: Xeon E-2288G (Coffee Lake, 8 cores). AVX2, FMA, BMI and LZCNT are present, so
   Phase A's x86-64-v3 baseline holds. No AVX-512, which nothing assumes.
 - Disk: one, Ubuntu's. Native boot is PXE plus an in-memory root (§5); scratch data goes to S3.
-- IOMMU/VFIO (Phase D): open. Check on the box with `dmesg | grep -i -e DMAR -e IOMMU`
-  and `ls /sys/kernel/iommu_groups`. VT-d may need turning on in the BIOS (reachable through
-  the IPMI remote console) and `intel_iommu=on iommu=pt` on the kernel command line.
+- IOMMU/VFIO (Phase D): **ready** (checked 2026-11-04). DMAR is active with interrupt
+  remapping, `/dev/kvm` exists, and IOMMU group 1 holds exactly the R9700's own functions:
+  its internal switch ports `01:00.0`/`02:00.0`, the GPU `03:00.0` [1002:7551] and HDMI
+  audio `03:00.1` [1002:ab40]. The BMC's ASPEED VGA (`08:00.0`) stays Ubuntu's console.
+  Binding group 1 to `vfio-pci` takes the card from amdgpu, so Linux oracle runs and the
+  FreeBSD guest take turns (rebind through sysfs or `driverctl`, no reboot). Unknown:
+  whether RDNA4 resets cleanly between guest runs.
