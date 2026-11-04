@@ -147,9 +147,16 @@ if [ ! -f "$WORK/.built" ]; then
 	gssh 'test -f /usr/src/sys/vm/swap_pager.c' || gssh 'cat > /root/src.txz' < "$WORK/src.txz"
 	gssh 'sh /root/zb/guest-build.sh' || die "guest build"
 	touch "$WORK/.built"
+fi
+# Boot the patched kernel for this run only (nextboot is one-shot).
+if ! gssh 'sysctl -n vm.swap_free_notify' >/dev/null 2>&1; then
+	say "reboot once into /boot/kernel.zbench"
+	gssh 'nextboot -k kernel.zbench' || die "nextboot"
 	gssh 'shutdown -r now' >/dev/null 2>&1 || true
-	sleep 20
+	sleep 30
 	wait_ssh
+	gssh 'sysctl -n vm.swap_free_notify' >/dev/null 2>&1 ||
+		die "guest did not come up on kernel.zbench (serial console: $WORK/serial.sock)"
 fi
 [ "$STOP_AFTER" = build ] && { say "STOP_AFTER=build"; halt; exit 0; }
 
