@@ -1,0 +1,13 @@
+[package]
+name        = "fresco-split"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "The broker <-> window-renderer protocol of Fresco's process split (threat model §2.5.2, F4b): fixed-size records and the shared-memory frame slot."
+
+[dependencies]
+fresco-compute = { path = "../fresco-compute" }
+
+[dev-dependencies]
+fresco-compute = { path = "../fresco-compute", features = ["cranelift"] }
