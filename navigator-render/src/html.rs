@@ -1906,44 +1906,75 @@ impl<'a> Cx<'a> {
             let (start, span) = if flow_row { span_of(*cs0, *ce) } else { span_of(*rs, *re) };
             start.unwrap_or(0) + span
         }).max().unwrap_or(0).max(tpl_len).max(1);
+        // ★ Placement runs in the passes of CSS Grid §8.5, not in one sweep
+        // in document order: (1) items with a definite position on both
+        // axes, (2) items LOCKED to a row (definite major line, auto minor)
+        // — each placed past the ones this step already put in that row,
+        // (3) the implicit grid's minor extent, (4) everything else, behind
+        // one cursor. A locked item was simply given column 1, so Google's
+        // header row (every item `grid-row: 1`) stacked in one cell; and
+        // a later explicit item must still claim its cell before an
+        // earlier auto item can take it.
         let mut occupied: Vec<Vec<bool>> = vec![];
-        let mut items: Vec<GItem> = vec![];
-        let (mut cursor_major, mut cursor_minor) = (0usize, 0usize);
-        for (c, cs0, ce, rs, re, justify, align) in raw {
-            let (cstart, cspan) = span_of(cs0, ce);
-            let (rstart, rspan) = span_of(rs, re);
-            // Major axis = the flow axis; minor = the fixed one.
-            let (mut major, mut minor, mspan, nspan) = if flow_row {
-                (rstart, cstart, rspan, cspan)
-            } else {
-                (cstart, rstart, cspan, rspan)
-            };
-            // Auto placement: the first free slot at or after the cursor. A
-            // definite minor position (e.g. a column) still needs a free
-            // MAJOR position searched for it — that is a whole row of items
-            // landing on top of each other if it is skipped.
-            if major.is_none() {
-                let fixed_minor = minor;
-                let (mut mj, mut mn) = (cursor_major, fixed_minor.unwrap_or(cursor_minor));
-                loop {
-                    if mn + nspan > fixed_len {
-                        if fixed_minor.is_some() { mj += 1 } else { mj += 1; mn = 0 }
-                        continue;
-                    }
-                    let free = (0..mspan).all(|a| (0..nspan).all(|b| !*occupied.get(mj + a).and_then(|r: &Vec<bool>| r.get(mn + b)).unwrap_or(&false)));
-                    if free { break }
-                    match fixed_minor { Some(_) => mj += 1, None => mn += 1 }
-                }
-                major = Some(mj); minor = Some(mn);
-                cursor_major = mj; cursor_minor = mn + nspan;
-            }
-            let (mj, mn) = (major.unwrap_or(0), minor.unwrap_or(0));
-            while occupied.len() < mj + mspan { occupied.push(vec![false; fixed_len]) }
-            for a in 0..mspan { for b in 0..nspan {
-                let row = &mut occupied[mj + a];
+        let free = |occ: &Vec<Vec<bool>>, mj: usize, mn: usize, ms: usize, ns: usize| {
+            (0..ms).all(|a| (0..ns).all(|b| !*occ.get(mj + a).and_then(|r: &Vec<bool>| r.get(mn + b)).unwrap_or(&false)))
+        };
+        let claim = |occ: &mut Vec<Vec<bool>>, mj: usize, mn: usize, ms: usize, ns: usize| {
+            while occ.len() < mj + ms { occ.push(vec![]) }
+            for a in 0..ms { for b in 0..ns {
+                let row = &mut occ[mj + a];
                 while row.len() <= mn + b { row.push(false) }
                 row[mn + b] = true;
             } }
+        };
+        // Major axis = the flow axis; minor = the fixed one.
+        let axes: Vec<_> = raw.iter().map(|(_, cs0, ce, rs, re, ..)| {
+            let (cstart, cspan) = span_of(*cs0, *ce);
+            let (rstart, rspan) = span_of(*rs, *re);
+            if flow_row { (rstart, cstart, rspan, cspan) } else { (cstart, rstart, cspan, rspan) }
+        }).collect();
+        let mut at: Vec<Option<(usize, usize)>> = vec![None; raw.len()];
+        for (i, &(mj, mn, ms, ns)) in axes.iter().enumerate() {
+            if let (Some(mj), Some(mn)) = (mj, mn) { claim(&mut occupied, mj, mn, ms, ns); at[i] = Some((mj, mn)) }
+        }
+        let mut row_cursor: std::collections::HashMap<usize, usize> = Default::default();
+        for (i, &(mj, mn, ms, ns)) in axes.iter().enumerate() {
+            let (Some(mj), None) = (mj, mn) else { continue };
+            let mut c = *row_cursor.get(&mj).unwrap_or(&0);
+            while !free(&occupied, mj, c, ms, ns) { c += 1 }
+            claim(&mut occupied, mj, c, ms, ns);
+            row_cursor.insert(mj, c + ns);
+            at[i] = Some((mj, c));
+        }
+        // Step 2 may have reached past the template.
+        let fixed_len = at.iter().zip(&axes).filter_map(|(a, x)| a.map(|(_, mn)| mn + x.3)).max().unwrap_or(0).max(fixed_len);
+        let (mut cursor_major, mut cursor_minor) = (0usize, 0usize);
+        for (i, &(mj, mn, ms, ns)) in axes.iter().enumerate() {
+            if at[i].is_some() { continue }
+            debug_assert!(mj.is_none());
+            let (mut mj, mut c) = (cursor_major, cursor_minor);
+            match mn {
+                // A definite minor line: move on a row if it lies behind
+                // the cursor, then down until the area is free.
+                Some(m) => {
+                    if m < c { mj += 1 }
+                    while !free(&occupied, mj, m, ms, ns) { mj += 1 }
+                    c = m;
+                }
+                // Fully auto: along the row, wrapping to the next one.
+                None => loop {
+                    if c + ns > fixed_len { mj += 1; c = 0; continue }
+                    if free(&occupied, mj, c, ms, ns) { break }
+                    c += 1;
+                },
+            }
+            claim(&mut occupied, mj, c, ms, ns);
+            cursor_major = mj; cursor_minor = c + ns;
+            at[i] = Some((mj, c));
+        }
+        let mut items: Vec<GItem> = vec![];
+        for ((c, .., justify, align), (pos, &(_, _, mspan, nspan))) in raw.into_iter().zip(at.into_iter().zip(&axes)) {
+            let (mj, mn) = pos.unwrap_or((0, 0));
             let (col, row) = if flow_row { ((mn, nspan), (mj, mspan)) } else { ((mj, mspan), (mn, nspan)) };
             items.push(GItem { h: c, col, row, justify, align });
         }
@@ -4404,6 +4435,48 @@ mod tests {
         assert_eq!(boxes(&o, 0x0000ffff), vec![(370, 0, 250, 20)]);
         // Second row, spanning both fr columns and the gap between them.
         assert_eq!(boxes(&o, 0xffff00ff), vec![(110, 25, 510, 20)]);
+    }
+
+    #[test]
+    fn grid_auto_placement_follows_the_section_8_5_passes() {
+        let css = r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 300px; grid-template-columns: 100px 100px 100px; grid-auto-rows: 10px }
+            .a { background-color: #ff0000 } .b { background-color: #00ff00 } .c { background-color: #0000ff }
+            .d { background-color: #ffff00 }"#;
+        // Step 2: items locked to a row go along it, each past the last one
+        // this step put there — not all into column 1.
+        let o = render(&format!(r#"{css} .g > div {{ grid-row-start: 2 }} .g > .d {{ grid-row-start: 1 }}</style>
+            <div class="g"><div class="a"></div><div class="b"></div><div class="c"></div><div class="d"></div></div>"#));
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 10, 100, 10)]);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(100, 10, 100, 10)]);
+        assert_eq!(boxes(&o, 0x0000ffff), vec![(200, 10, 100, 10)]);
+        assert_eq!(boxes(&o, 0xffff00ff), vec![(0, 0, 100, 10)]);
+        // Step 1 before step 4: a LATER item with a definite cell claims it
+        // before an earlier auto item is placed.
+        let o = render(&format!(r#"{css} .b {{ grid-row-start: 1; grid-column-start: 1 }}</style>
+            <div class="g"><div class="a"></div><div class="b"></div></div>"#));
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(100, 0, 100, 10)]);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(0, 0, 100, 10)]);
+        // Step 4, sparse: a definite column BEHIND the cursor moves to the
+        // next row rather than back-filling the hole.
+        let o = render(&format!(r#"{css} .a {{ grid-column-start: 3 }} .b {{ grid-column-start: 1 }}</style>
+            <div class="g"><div class="a"></div><div class="b"></div></div>"#));
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(200, 0, 100, 10)]);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(0, 10, 100, 10)]);
+        // Spans: an auto item spanning two columns that does not fit in the
+        // rest of the row wraps whole; the hole it leaves stays empty.
+        let o = render(&format!(r#"{css} .b, .c {{ grid-column-end: span 2 }}</style>
+            <div class="g"><div class="a"></div><div class="b"></div><div class="c"></div><div class="d"></div></div>"#));
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(100, 0, 200, 10)]);
+        assert_eq!(boxes(&o, 0x0000ffff), vec![(0, 10, 200, 10)]);
+        assert_eq!(boxes(&o, 0xffff00ff), vec![(200, 10, 100, 10)]);
+        // Column flow: items locked to a COLUMN go down it.
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; grid-auto-flow: column; grid-template-rows: 10px 10px; grid-auto-columns: 50px }
+            .g > div { grid-column-start: 2 } .a { background-color: #ff0000 } .b { background-color: #00ff00 }</style>
+            <div class="g"><div class="a"></div><div class="b"></div></div>"#);
+        assert_eq!(boxes(&o, 0xff0000ff), vec![(50, 0, 50, 10)]);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(50, 10, 50, 10)]);
     }
 
     #[test]
