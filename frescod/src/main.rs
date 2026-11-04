@@ -32,6 +32,7 @@
 mod injector_reader;
 mod input_reader;
 mod laminar;
+mod pack;
 mod pointer_reader;
 mod redraw;
 mod render_backend;
