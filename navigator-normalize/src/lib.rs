@@ -431,6 +431,16 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
                 if let Some(v) = v { hints.push((*h, prop, v)); translated.insert((*h, attr)); }
             };
             let t = tag.as_str();
+            // ★ `dir` (HTML §15.3.1, the UA sheet's `[dir=rtl i] { direction:
+            // rtl }`): below every author rule, like the hints. `dir=auto`,
+            // and a `<bdi>` without one, take the direction of their first
+            // strong character (HTML's "auto directionality"), else ltr.
+            let dir = a("dir").map(|v| v.trim().to_ascii_lowercase()).or_else(|| (t == "bdi").then(|| "auto".to_string()));
+            match dir.as_deref() {
+                Some(d @ ("ltr" | "rtl")) => hint("dir", "direction", Some(d.to_string())),
+                Some("auto") => hint("dir", "direction", Some(if first_strong_rtl(&dom, *h).unwrap_or(false) { "rtl" } else { "ltr" }.to_string())),
+                _ => {}
+            }
             // An inline <svg>'s width/height are presentation attributes too:
             // the icon's box. Only the OUTER svg — shapes inside it keep their
             // own geometry, untouched (below).
@@ -504,6 +514,10 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         if n > 0 { report.drop_n("presentational attribute translated to CSS", n) }
     }
 
+    // ★ DIRECTION: logical sides, physical alignment, the UA's start-side
+    // indents — all resolved against each element's own direction.
+    let rtl = direction_pass(&mut resolved, &dom, &els, &mut report);
+
     // ★ FLOAT ROWS. The profile has no floats, and dropping `float` left
     // GitHub's three repository-action buttons stacked one per line: they are
     // `<li float:left>` inside a `<ul>`. When EVERY in-flow element child of a
@@ -515,7 +529,11 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     let mut float_of: BTreeMap<Handle, String> = BTreeMap::new();
     for ((h, st, media), props) in resolved.iter() {
         if !st.is_empty() || !media.is_empty() { continue }
-        if let Some((_, v)) = props.get("float-marker") { float_of.insert(*h, v.clone()); }
+        if let Some((_, v)) = props.get("float-marker") {
+            let r = rtl.get(h).copied().unwrap_or(false);
+            let v = match v.as_str() { "inline-start" => if r { "right" } else { "left" }, "inline-end" => if r { "left" } else { "right" }, v => v };
+            float_of.insert(*h, v.to_string());
+        }
     }
     let mut rows = 0usize;
     let mut lone = 0usize;
@@ -536,7 +554,10 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         const TABLE: [&str; 9] = ["td", "th", "tr", "thead", "tbody", "tfoot", "caption", "col", "colgroup"];
         if inflow.iter().any(|k| dom.tag(*k).is_some_and(|t| TABLE.contains(&t))) { continue }
         let dirs: Vec<&str> = inflow.iter().map(|k| float_of.get(k).map(String::as_str).unwrap_or("none")).collect();
-        let all_left = dirs.len() >= 2 && dirs.iter().all(|d| *d == "left");
+        // In a right-to-left parent the strip is the RIGHT floats: they run
+        // from the right edge, which is where an rtl inline-block row starts.
+        let start = if rtl.get(&p).copied().unwrap_or(false) { "right" } else { "left" };
+        let all_left = dirs.len() >= 2 && dirs.iter().all(|d| *d == start);
         let has_text = dom.children_of(p).iter().any(|c|
             dom.get(*c).is_some_and(|n| matches!(n.kind, Kind::Text(ref t) if !t.trim().is_empty())));
         if all_left && !has_text { rows += 1; strip.extend(inflow) } else { lone += dirs.iter().filter(|d| **d != "none").count() }
@@ -1199,7 +1220,7 @@ fn to_longhands_inner(name: &str, value: &[Token], inputs: &Inputs, report: &mut
     if (name == "box-sizing" || name == "-webkit-box-sizing") && matches!(text.as_str(), "content-box" | "border-box" | "inherit" | "initial" | "unset" | "revert") {
         return vec![("box-sizing-marker".to_string(), text)];
     }
-    if name == "float" && matches!(text.as_str(), "left" | "right" | "none") {
+    if name == "float" && matches!(text.as_str(), "left" | "right" | "none" | "inline-start" | "inline-end") {
         return vec![("float-marker".to_string(), text)];
     }
     // ★ The VISUALLY-HIDDEN idiom: a 1px box, `clip: rect(0 0 0 0)` and
@@ -1242,7 +1263,7 @@ fn to_longhands_inner(name: &str, value: &[Token], inputs: &Inputs, report: &mut
         vec![(name.to_string(), text)]
     } else {
         match expand::expand(name, value) {
-            Some(p) => p.into_iter().filter(|(p, _)| navigator_style::values::grammar(p).is_some()).collect(),
+            Some(p) => p.into_iter().filter(|(p, _)| navigator_style::values::grammar(&expand::physical(p, false)).is_some()).collect(),
             None => { report.drop(format!("property `{name}`")); return vec![] }
         }
     };
@@ -1294,10 +1315,19 @@ fn to_longhands_inner(name: &str, value: &[Token], inputs: &Inputs, report: &mut
             report.drop("unresolved custom property (a cycle, or deeper than the limit)");
             return None;
         }
-        if value::admits(&p, &v) { return Some((p, v)) }
-        match value::repair(&p, &v) {
+        // ★ `text-align: left | right` are PHYSICAL, and the profile's
+        // values are direction-relative: which one `left` is depends on the
+        // element's direction, and — because the computed value inherits AS
+        // `left` — on the direction of every descendant that inherits it.
+        // Kept as written and resolved in the direction pass.
+        if p == "text-align" && matches!(v.to_ascii_lowercase().as_str(), "left" | "right") { return Some((p, v.to_ascii_lowercase())) }
+        // An inline-side property (`margin-@start`) is checked as the
+        // physical property it will become; both sides take the same values.
+        let phys = expand::physical(&p, false);
+        if value::admits(&phys, &v) { return Some((p, v)) }
+        match value::repair(&phys, &v) {
             Some(fixed) => Some((p, fixed)),
-            None => { report.drop(format!("value `{p}: {v}`")); None }
+            None => { report.drop(format!("value `{}: {v}`", p.replace('@', "inline-"))); None }
         }
     }));
     out
@@ -1794,6 +1824,119 @@ pub(crate) fn clip_path_is_empty(v: &str) -> Option<bool> {
 /// `visibility: visible` would show, where the clip would still hide it; no
 /// visually-hidden helper does that.) A state or media slot that turns the
 /// clip back off (`:focus { clip: auto }`) turns visibility back on there.
+/// HTML's "auto directionality": the first character of bidi class L, R or
+/// AL in the element's text, skipping descendants that set their own `dir`
+/// (and `bdi`, script, style, textarea). `None` when there is none.
+fn first_strong_rtl(dom: &Dom, h: Handle) -> Option<bool> {
+    for c in dom.children_of(h) {
+        match dom.get(c).map(|n| &n.kind) {
+            Some(Kind::Text(t)) => {
+                for ch in t.chars() {
+                    match unicode_bidi::bidi_class(ch) {
+                        unicode_bidi::BidiClass::L => return Some(false),
+                        unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL => return Some(true),
+                        _ => {}
+                    }
+                }
+            }
+            Some(Kind::Element(_)) => {
+                if dom.attr(c, "dir").is_some() || matches!(dom.tag(c), Some("bdi" | "script" | "style" | "textarea")) { continue }
+                if let Some(r) = first_strong_rtl(dom, c) { return Some(r) }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// ★ THE DIRECTION PASS. `direction` inherits, and three things depend on
+/// the direction an element ends up with, so they wait for the cascade:
+///
+/// - the inline-side properties carried as `@start` / `@end` (see
+///   `expand::logical`) become left or right, and compete with the physical
+///   property there by cascade priority — CSS's logical property groups;
+/// - `text-align: left | right` become `start` or `end`. The computed value
+///   inherits AS `left`, so an element whose direction differs from its
+///   parent's and that inherits a physical alignment gets it written out;
+/// - the UA sheet's list and `dd` indents are on the START side (HTML §15:
+///   `padding-inline-start: 40px`), which the profile's UA writes as left —
+///   in rtl they move to the right.
+///
+/// A media-context slot resolves with the element's base-context direction:
+/// a page that changes `direction` inside a media query is not handled.
+/// Returns each element's direction (true = rtl).
+fn direction_pass(resolved: &mut BTreeMap<(Handle, String, String), BTreeMap<String, (Priority, String)>>, dom: &Dom, els: &[Handle],
+                  report: &mut Report) -> BTreeMap<Handle, bool> {
+    let base = |r: &BTreeMap<(Handle, String, String), BTreeMap<String, (Priority, String)>>, h: Handle, p: &str| -> Option<String> {
+        r.get(&(h, String::new(), String::new())).and_then(|x| x.get(p)).map(|(_, v)| v.to_ascii_lowercase())
+    };
+    let parent_el = |h: Handle| dom.get(h).and_then(|n| n.parent).filter(|p| matches!(dom.get(*p).map(|n| &n.kind), Some(Kind::Element(_))));
+    let mut rtl: BTreeMap<Handle, bool> = BTreeMap::new();
+    for h in els {
+        // Up to the nearest element whose direction is known or stated.
+        let mut chain = vec![];
+        let mut cur = Some(*h);
+        let mut known = false;
+        while let Some(x) = cur {
+            if let Some(r) = rtl.get(&x) { known = *r; break }
+            match base(resolved, x, "direction").as_deref() {
+                Some("rtl") => { known = true; chain.push(x); break }
+                Some("ltr") | Some("initial") => { known = false; chain.push(x); break }
+                _ => { chain.push(x); cur = parent_el(x) }
+            }
+        }
+        for x in chain { rtl.insert(x, known); }
+    }
+    let is_rtl = |h: Handle| rtl.get(&h).copied().unwrap_or(false);
+    // A physical alignment inherited across a change of direction.
+    let mut flips = vec![];
+    for h in els {
+        let Some(p) = parent_el(*h) else { continue };
+        if is_rtl(*h) == is_rtl(p) || base(resolved, *h, "text-align").is_some_and(|v| v != "inherit") { continue }
+        let mut cur = Some(p);
+        while let Some(x) = cur {
+            match base(resolved, x, "text-align").as_deref() {
+                Some("inherit") | None => cur = parent_el(x),
+                Some(v) => { if matches!(v, "left" | "right") { flips.push((*h, v.to_string())) } break }
+            }
+        }
+    }
+    for (h, v) in flips {
+        resolved.entry((h, String::new(), String::new())).or_default().insert("text-align".into(), ((false, 0, (0, 0, 0), 0), v));
+    }
+    let mut logical = 0usize;
+    for ((h, ..), props) in resolved.iter_mut() {
+        let r = is_rtl(*h);
+        if let Some((pri, v)) = props.get_mut("text-align") {
+            let _ = pri;
+            if matches!(v.as_str(), "left" | "right") { *v = if (v == "left") != r { "start" } else { "end" }.to_string() }
+        }
+        let carried: Vec<String> = props.keys().filter(|k| k.contains('@')).cloned().collect();
+        for k in carried {
+            let (pri, v) = props.remove(&k).expect("listed");
+            let phys = expand::physical(&k, r);
+            logical += 1;
+            match props.get(&phys) {
+                Some((old, _)) if *old > pri => {}
+                _ => { props.insert(phys, (pri, v)); }
+            }
+        }
+    }
+    if logical > 0 { report.drop_n("logical property resolved against the element's direction", logical) }
+    let mut moved = 0usize;
+    for h in els {
+        if !is_rtl(*h) { continue }
+        let (prop, by) = match dom.tag(*h) { Some("ul" | "ol") => ("padding", "40px"), Some("dd") => ("margin", "40px"), _ => continue };
+        let slot = resolved.entry((*h, String::new(), String::new())).or_default();
+        let (l, r) = (format!("{prop}-left"), format!("{prop}-right"));
+        if !slot.contains_key(&l) { slot.insert(l, ((false, 0, (0, 0, 0), 0), "0px".into())); }
+        if !slot.contains_key(&r) { slot.insert(r, ((false, 0, (0, 0, 0), 0), by.into())); }
+        moved += 1;
+    }
+    if moved > 0 { report.drop_n("UA start-side indent moved to the right (rtl)", moved) }
+    rtl
+}
+
 fn clip_pass(resolved: &mut BTreeMap<(Handle, String, String), BTreeMap<String, (Priority, String)>>, report: &mut Report) {
     let keys: Vec<(Handle, String, String)> = resolved.iter()
         .filter(|(_, p)| p.contains_key("clip-marker") || p.contains_key("clip-path-marker"))

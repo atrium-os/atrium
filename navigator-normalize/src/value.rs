@@ -43,11 +43,9 @@ pub fn repair(prop: &str, value: &str) -> Option<String> {
         }
     }
     let out = match prop {
-        // `left`/`right` are physical; the profile is direction-relative.
-        // ★ This assumes a left-to-right base direction, which is what the
-        // corpus is; an rtl document would need the inverse, and that is a
-        // real limitation rather than a subtlety to hide.
-        "text-align" => match lv.as_str() { "left" => "start", "right" => "end", "justify-all" => "justify", _ => return None }.to_string(),
+        // `left`/`right` are physical and resolved against the element's
+        // direction by the normalizer's direction pass, not here.
+        "text-align" => match lv.as_str() { "justify-all" => "justify", _ => return None }.to_string(),
         "font-weight" => match lv.as_str() {
             "normal" => "400".into(), "bold" => "700".into(),
             "lighter" => "400".into(), "bolder" => "700".into(),

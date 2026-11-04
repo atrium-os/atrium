@@ -1469,6 +1469,7 @@ dependencies = [
  "navigator-render",
  "navigator-style",
  "png",
+ "unicode-bidi",
 ]
 
 [[package]]

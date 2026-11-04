@@ -56,22 +56,26 @@ const BORDER_STYLES: &[&str] = &["none", "hidden", "solid", "dashed", "dotted", 
 /// layout hangs on one `margin-inline-start`. Dropping them as "unknown"
 /// silently removes the layout.
 ///
-/// The mapping assumes a horizontal, left-to-right writing mode — which is
-/// what the profile's `direction: ltr` default gives. A document that sets
-/// `direction: rtl` would need inline-start and inline-end swapped, and that
-/// is a real limitation rather than an oversight.
+/// ★ The INLINE sides depend on the element's own `direction`, which the
+/// cascade has not decided yet when a declaration is expanded. So an inline
+/// side is written `@start` / `@end` here (`margin-@start`), carried through
+/// the cascade beside the physical properties it competes with, and
+/// resolved per element once directions are known (`physical`, and the
+/// direction pass in lib.rs). Mapping inline-start to `left` outright laid
+/// every right-to-left page out as if it were left-to-right. The block
+/// sides are top and bottom: the profile is horizontal only.
 fn logical(name: &str) -> Option<Vec<&'static str>> {
     Some(match name {
-        "margin-inline-start" => vec!["margin-left"],
-        "margin-inline-end" => vec!["margin-right"],
+        "margin-inline-start" => vec!["margin-@start"],
+        "margin-inline-end" => vec!["margin-@end"],
         "margin-block-start" => vec!["margin-top"],
         "margin-block-end" => vec!["margin-bottom"],
-        "padding-inline-start" => vec!["padding-left"],
-        "padding-inline-end" => vec!["padding-right"],
+        "padding-inline-start" => vec!["padding-@start"],
+        "padding-inline-end" => vec!["padding-@end"],
         "padding-block-start" => vec!["padding-top"],
         "padding-block-end" => vec!["padding-bottom"],
-        "inset-inline-start" => vec!["left"],
-        "inset-inline-end" => vec!["right"],
+        "inset-inline-start" => vec!["@start"],
+        "inset-inline-end" => vec!["@end"],
         "inset-block-start" => vec!["top"],
         "inset-block-end" => vec!["bottom"],
         "inline-size" => vec!["width"],
@@ -80,27 +84,35 @@ fn logical(name: &str) -> Option<Vec<&'static str>> {
         "max-inline-size" => vec!["max-width"],
         "min-block-size" => vec!["min-height"],
         "max-block-size" => vec!["max-height"],
-        "border-inline-start-width" => vec!["border-left-width"],
-        "border-inline-end-width" => vec!["border-right-width"],
+        "border-inline-start-width" => vec!["border-@start-width"],
+        "border-inline-end-width" => vec!["border-@end-width"],
         "border-block-start-width" => vec!["border-top-width"],
         "border-block-end-width" => vec!["border-bottom-width"],
-        "border-inline-start-style" => vec!["border-left-style"],
-        "border-inline-end-style" => vec!["border-right-style"],
+        "border-inline-start-style" => vec!["border-@start-style"],
+        "border-inline-end-style" => vec!["border-@end-style"],
         "border-block-start-style" => vec!["border-top-style"],
         "border-block-end-style" => vec!["border-bottom-style"],
-        "border-inline-start-color" => vec!["border-left-color"],
-        "border-inline-end-color" => vec!["border-right-color"],
+        "border-inline-start-color" => vec!["border-@start-color"],
+        "border-inline-end-color" => vec!["border-@end-color"],
         "border-block-start-color" => vec!["border-top-color"],
         "border-block-end-color" => vec!["border-bottom-color"],
         // The two-value forms: one value for both sides, two for each.
-        "margin-inline" => vec!["margin-left", "margin-right"],
+        "margin-inline" => vec!["margin-@start", "margin-@end"],
         "margin-block" => vec!["margin-top", "margin-bottom"],
-        "padding-inline" => vec!["padding-left", "padding-right"],
+        "padding-inline" => vec!["padding-@start", "padding-@end"],
         "padding-block" => vec!["padding-top", "padding-bottom"],
-        "inset-inline" => vec!["left", "right"],
+        "inset-inline" => vec!["@start", "@end"],
         "inset-block" => vec!["top", "bottom"],
         _ => return None,
     })
+}
+
+/// A property as written for an element whose direction is `rtl` (or not):
+/// the inline `@start` / `@end` sides become physical ones.
+pub fn physical(p: &str, rtl: bool) -> String {
+    if !p.contains('@') { return p.to_string() }
+    let (s, e) = if rtl { ("right", "left") } else { ("left", "right") };
+    p.replace("@start", s).replace("@end", e)
 }
 
 /// Expand `name: value` into longhand pairs. An unknown shorthand returns

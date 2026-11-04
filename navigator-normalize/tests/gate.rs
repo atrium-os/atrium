@@ -951,3 +951,128 @@ fn a_conditional_rule_that_lost_is_not_emitted() {
     assert!(out.contains(":hover"), "the winning :hover declaration stays: {out}");
     assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
 }
+
+/// The declarations an element's generated classes carry in the base
+/// context (top-level rules; media rules are indented).
+fn base_props(out: &str, id: &str) -> std::collections::BTreeMap<String, String> {
+    let at = out.find(&format!("id=\"{id}\"")).unwrap_or_else(|| panic!("no element #{id} in {out}"));
+    let (open, close) = (out[..at].rfind('<').expect("tag"), at + out[at..].find('>').expect("tag"));
+    let tag = &out[open..close];
+    let classes = tag.split("class=\"").nth(1).and_then(|c| c.split('"').next()).unwrap_or("");
+    let mut m = std::collections::BTreeMap::new();
+    for c in classes.split_ascii_whitespace() {
+        for line in out.lines().filter(|l| l.starts_with(&format!(".{c} {{"))) {
+            let body = line.split('{').nth(1).and_then(|b| b.split('}').next()).unwrap_or("");
+            for d in body.split(';') {
+                if let Some((p, v)) = d.split_once(':') { m.insert(p.trim().to_string(), v.trim().to_string()); }
+            }
+        }
+    }
+    m
+}
+
+/// ★ `dir` is HTML's direction (the UA sheet's `[dir=rtl i] { direction:
+/// rtl }`), below every author rule; `dir=auto` and `<bdi>` take the first
+/// strong character's. Dropped, an Arabic page that says `<html dir="rtl">`
+/// and sets no `direction` in CSS laid out left-to-right.
+#[test]
+fn the_dir_attribute_gives_the_direction() {
+    let src = r#"<html dir="RTL" id="root"><head><style>.l { direction: ltr }</style></head><body>
+      <p id="a">x</p><p dir="ltr" id="b">y</p><p dir="rtl" class="l" id="c">z</p>
+      <p dir="auto" id="d">שלום world</p><p dir="auto" id="e">1. hello שלום</p><bdi id="f">עברית</bdi>
+    </body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    let dir = |id: &str| base_props(&out, id).get("direction").cloned();
+    assert_eq!(dir("root").as_deref(), Some("rtl"), "{out}");
+    assert_eq!(dir("a"), None, "a child inherits, it states nothing: {out}");
+    assert_eq!(dir("b").as_deref(), Some("ltr"));
+    assert_eq!(dir("c").as_deref(), Some("ltr"), "an author rule beats the attribute");
+    assert_eq!(dir("d").as_deref(), Some("rtl"), "auto: the first strong character is Hebrew");
+    assert_eq!(dir("e").as_deref(), Some("ltr"), "auto: digits are not strong; `h` is");
+    assert_eq!(dir("f").as_deref(), Some("rtl"), "bdi is auto");
+    assert!(refusals(&out).is_empty());
+}
+
+/// ★ An inline side is the element's OWN start or end: `margin-inline-start`
+/// is `margin-right` in a right-to-left element. And it competes with the
+/// physical property on that side by cascade priority, as CSS's logical
+/// property groups do.
+#[test]
+fn logical_properties_follow_the_elements_direction() {
+    let src = r#"<html><head><style>
+      p { margin-inline-start: 10px; padding-inline: 1px 2px; inset-inline-end: 3px }
+      #w { margin-left: 5px }
+      #v { margin-right: 6px }
+      #v { margin-inline-start: 7px }
+    </style></head><body>
+      <p id="l">x</p><div dir="rtl"><p id="r">y</p><p id="w">w</p><p id="v">v</p></div>
+    </body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    let (l, r, w, v) = (base_props(&out, "l"), base_props(&out, "r"), base_props(&out, "w"), base_props(&out, "v"));
+    assert_eq!(l.get("margin-left").map(String::as_str), Some("10px"), "{out}");
+    assert_eq!(r.get("margin-right").map(String::as_str), Some("10px"), "rtl start is the right: {out}");
+    assert_eq!(r.get("margin-left"), None, "{out}");
+    assert_eq!((r.get("padding-right").map(String::as_str), r.get("padding-left").map(String::as_str)), (Some("1px"), Some("2px")));
+    assert_eq!(r.get("left").map(String::as_str), Some("3px"), "rtl inline-end is the left");
+    assert_eq!((w.get("margin-left").map(String::as_str), w.get("margin-right").map(String::as_str)), (Some("5px"), Some("10px")),
+        "on different sides they do not compete");
+    assert_eq!(v.get("margin-right").map(String::as_str), Some("7px"), "the later, equally specific rule wins the right side: {out}");
+    assert!(refusals(&out).is_empty());
+}
+
+/// ★ `text-align: left | right` are physical, the profile's values are
+/// `start` / `end`; which one depends on the element's direction — and the
+/// computed value inherits AS `left`, so a right-to-left child of a
+/// `text-align: right` block is aligned to its START.
+#[test]
+fn physical_text_alignment_resolves_against_direction() {
+    let src = r#"<html><head><style>
+      #a { text-align: left } #b { text-align: right } #s { text-align: start }
+    </style></head><body>
+      <div id="a">x</div><div dir="rtl" id="ar"><div id="a2" style="text-align: left">y</div></div>
+      <div id="b"><p dir="rtl" id="q">z</p><p id="same">same</p></div>
+      <div id="s"><p dir="rtl" id="t">t</p></div>
+    </body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    let ta = |id: &str| base_props(&out, id).get("text-align").cloned();
+    assert_eq!(ta("a").as_deref(), Some("start"), "{out}");
+    assert_eq!(ta("a2").as_deref(), Some("end"), "left in rtl is the end: {out}");
+    assert_eq!(ta("b").as_deref(), Some("end"));
+    assert_eq!(ta("q").as_deref(), Some("start"), "an inherited `right` in an rtl child is its start: {out}");
+    assert_eq!(ta("same"), None, "no change of direction, nothing to restate");
+    assert_eq!(ta("t"), None, "`start` inherits as start");
+    assert!(refusals(&out).is_empty());
+}
+
+/// ★ The UA's list and `dd` indents are on the START side (HTML §15:
+/// `padding-inline-start: 40px`). In right-to-left content the bullets'
+/// room is on the right.
+#[test]
+fn ua_list_indents_are_on_the_start_side_in_rtl() {
+    let src = r#"<html dir="rtl"><head><style>ol { padding-inline-start: 20px }</style></head><body>
+      <ul id="u"><li>a</li></ul><ol id="o"><li>b</li></ol><dl><dd id="d">c</dd></dl>
+      <ul dir="ltr" id="l"><li>d</li></ul>
+    </body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    let (u, o, d, l) = (base_props(&out, "u"), base_props(&out, "o"), base_props(&out, "d"), base_props(&out, "l"));
+    assert_eq!((u.get("padding-left").map(String::as_str), u.get("padding-right").map(String::as_str)), (Some("0px"), Some("40px")), "{out}");
+    assert_eq!((o.get("padding-left").map(String::as_str), o.get("padding-right").map(String::as_str)), (Some("0px"), Some("20px")), "{out}");
+    assert_eq!((d.get("margin-left").map(String::as_str), d.get("margin-right").map(String::as_str)), (Some("0px"), Some("40px")));
+    assert_eq!(l.get("padding-right"), None, "an ltr list keeps the UA's left indent");
+    assert!(refusals(&out).is_empty());
+}
+
+/// In a right-to-left parent a row of RIGHT floats is the strip (it runs
+/// from the right edge, where an rtl inline-block row starts).
+#[test]
+fn a_row_of_right_floats_in_rtl_is_a_strip() {
+    let src = r#"<html><head><style>li { float: right } .s { float: inline-start }</style></head><body>
+      <ul dir="rtl"><li id="a">a</li><li>b</li></ul><ul><li id="b">c</li><li>d</li></ul>
+      <ul dir="rtl"><li class="s" id="c">e</li><li class="s">f</li></ul>
+    </body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    assert_eq!(base_props(&out, "a").get("display").map(String::as_str), Some("inline-block"), "{out}");
+    assert_eq!(base_props(&out, "b").get("display"), None, "right floats in ltr are not a strip");
+    assert_eq!(base_props(&out, "c").get("display").map(String::as_str), Some("inline-block"), "inline-start in rtl is right");
+}
+

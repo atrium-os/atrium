@@ -8,6 +8,7 @@ description = "The normalizer (Atrium Document Profile v1 §6): accepts real-wor
 navigator-dom = { path = "../navigator-dom" }
 navigator-style = { path = "../navigator-style" }
 navigator-render = { path = "../navigator-render" }
+unicode-bidi = "0.3.18"
 # Review tooling only (wpt-reftest): content addresses for test images.
 blake3 = { version = "1", features = ["pure"], optional = true }
 # …and the converter's own image sizing, so the oracle and the lane agree.
