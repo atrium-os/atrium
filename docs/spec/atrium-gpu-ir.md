@@ -172,6 +172,33 @@ LDS size and the input layout the command builder needs.
 5. **Hazard pass** from the hazard table (§3.8).
 6. **Encode** with `atrium-rdna4-isa`.
 
+## 7a. Performance: where we can beat Mesa, and how we measure
+
+The user's goal (2026-11-04): use the freedom from legacy and DRM shapes to
+do better than Mesa. Mesa's ACO is a strong compiler (close to AMD's own),
+so the plan does not rely on out-optimising it instruction for instruction.
+It relies on what Mesa must keep general and we need not:
+
+1. **Offline compilation of known shaders.** Bundle shaders are compiled
+   ahead of time, so the machine layer may spend seconds per shader:
+   exhaustive list scheduling, optimal register allocation for small
+   kernels, and occupancy-driven tuning. A fast mode remains for runtime
+   pipelines.
+2. **One ABI owner.** For Atrium's own shaders, buffer addresses and small
+   constants arrive in user SGPRs directly (no descriptor-set indirection,
+   no descriptor loads); layouts are chosen to suit scalar loads.
+3. **Submission without DRM.** GPU ABI v2.1 queues and doorbells replace the
+   ioctl-per-submit and buffer-list validation path.
+4. **A narrow subset** (`rdna4-vulkan-subset.md`): fewer generic paths and
+   pessimistic fallbacks.
+
+**Yardstick.** The R9700 box runs Ubuntu with Mesa, so every desktop shader
+is timed through RADV/ACO and through our backend on the same card (shader
+time from timestamps, plus instruction and register counts from both
+disassemblies). Targets, in order: correct (G3); match ACO on the four desktop
+compute shaders; then beat it where the four advantages apply. Results are
+checked in next to the goldens.
+
 ## 8. Testing
 
 * **GIR interpreter** (in `atrium-gir`): runs a GIR function for a whole
