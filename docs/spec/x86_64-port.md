@@ -122,8 +122,7 @@ Working in the cloud amd64 VM (`ARCH=amd64 sh scripts/cloud-vm.sh up`):
   `zfs_sha256_transform_avx2`.
 - **Atrium kernel**: the fork's amd64 GENERIC (it already has `SCHED_LAMINAR`) cross-builds on
   Linux with `tools/build/make.py TARGET=amd64`. It boots, and `kern.sched.name="Laminar"` is
-  the default. It needed two amd64 build fixes in the fork, carried in
-  `patches/freebsd-src/0001-amd64-build-fixes.patch` (not pushed to the fork yet):
+  the default. It needed two amd64 build fixes in the fork, now on the fork's atrium-os branch (204a080df):
   - `thread_va_ok` uses `VIRT_IN_DMAP`, because amd64 has no `DMAP_{MIN,MAX}_ADDRESS`.
   - `sched_laminar.c` includes `<vm/pmap.h>` for `kva_layout`.
 - **Modules from the host cross-build need LLVM 19** (`--cross-bindir=/usr/lib/llvm-19/bin`).
