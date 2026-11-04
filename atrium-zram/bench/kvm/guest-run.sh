@@ -18,6 +18,15 @@ t() { /usr/bin/time -p sh -c "$1" 2>&1 | awk '/real/ { print $2 }'; }
 [ -n "${SKIP_PATCH_CHECK:-}" ] || sysctl -n vm.stats.swap.fast_hits >/dev/null 2>&1 ||
 	{ echo "patched kernel (with the swap fast path) not running"; exit 1; }
 RUNS="${RUNS:-zstd:0 zstd:1 lz4:0 lz4:1}"	# codec:fastpath
+# BACKING_MB > 0: attach a file-backed md(4) disk of that size as zram's
+# backing store for the fills, so a full pool writes back instead of failing.
+BACKING_MB="${BACKING_MB:-0}"
+BK=
+if [ "$BACKING_MB" -gt 0 ]; then
+	truncate -s "${BACKING_MB}m" /root/zb/backing.img
+	BK=$(mdconfig -a -t vnode -f /root/zb/backing.img) || { echo "mdconfig failed"; exit 1; }
+	echo "backing store: $BK, $BACKING_MB MB" >> "$R/system.txt"
+fi
 FILL_MB="${FILL_MB:-1900}"; FILL_SECS="${FILL_SECS:-180}"
 swapoff -a >/dev/null 2>&1 || true
 kldload dtraceall 2>/dev/null || true
@@ -47,6 +56,7 @@ for RN in $RUNS; do
 	C=${RN%:*}; F=${RN#*:}; T=${C}_f$F
 	log "$T: fill $FILL_MB MB, $FILL_SECS s, fast path $F, with dtrace profile"
 	kldload "$KO"; sysctl -q kern.zram.mem_limit=0 kern.zram.codec=$C kern.zram.fastpath=$F
+	[ -z "$BK" ] || sysctl -q kern.zram.backing_dev=$BK || { echo "backing_dev $BK refused"; exit 1; }
 	swapon /dev/zram0
 	fh0=$(sysctl -n vm.stats.swap.fast_hits 2>/dev/null || echo 0)
 	out0=$(sysctl -n vm.stats.vm.v_swappgsout); in0=$(sysctl -n vm.stats.vm.v_swappgsin)
@@ -84,6 +94,7 @@ for RN in $RUNS; do
 	echo "timing: $(cat "$R/timing_$T.txt")"
 	echo "bench: $(cat "$R/bench_$T.txt" 2>/dev/null)"
 	cat "$R/classify_$T.txt"
-	grep -E 'fail_|fast_|orig_bytes' "$R/after_$T.txt" | tr '\n' ' '; echo
+	grep -E 'fail_|fast_|wb_|pages_wb|backing_used|orig_bytes' "$R/after_$T.txt" | tr '\n' ' '; echo
 done
 echo "===ZRAM-BENCH-REPORT END==="
+[ -z "$BK" ] || { mdconfig -d -u "$BK"; rm -f /root/zb/backing.img; }

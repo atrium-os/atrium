@@ -9,6 +9,8 @@
 # about an hour. Run it again to resume; delete $WORK to clean up.
 #
 #   bash zram-kvm-bench.sh            # SMP=4 MEM=2G by default
+#   RUNS="lz4:0 lz4:1" BACKING_MB=4096 bash zram-kvm-bench.sh
+#                                     # chosen codec:fastpath runs, with a 4 GB backing store
 #
 # Prints a report between ===ZRAM-BENCH-REPORT BEGIN/END=== lines; full
 # results are left in $WORK/results.tgz.
@@ -90,8 +92,8 @@ if [ ! -f "$WORK/src.txz" ] || [ "$(sha256sum "$WORK/src.txz" | cut -d' ' -f1)" 
 	curl -fsS -o "$WORK/src.txz" "$DIST/src.txz"
 	[ "$(sha256sum "$WORK/src.txz" | cut -d' ' -f1)" = "$SRCSUM" ] || die "src.txz checksum mismatch"
 fi
-printf 'SNAPDIST=%s\nREVISION=%s\nSRCSUM=%s\nBENCH_AT=%s\n' "$DIST" "$REVISION" "$SRCSUM" \
-	"${BENCH_AT:-120}" > "$WORK/payload/env"
+printf 'SNAPDIST=%s\nREVISION=%s\nSRCSUM=%s\nBENCH_AT=%s\nRUNS="%s"\nBACKING_MB=%s\n' "$DIST" "$REVISION" \
+	"$SRCSUM" "${BENCH_AT:-120}" "${RUNS:-zstd:0 zstd:1 lz4:0 lz4:1}" "${BACKING_MB:-0}" > "$WORK/payload/env"
 
 boot() {
 	pgrep -f "file=$WORK/vm.qcow2" >/dev/null && return
