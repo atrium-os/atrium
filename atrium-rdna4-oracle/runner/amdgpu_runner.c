@@ -227,8 +227,7 @@ main(int argc, char **argv)
 		{ .chunk_id = AMDGPU_CHUNK_ID_IB, .length_dw = sizeof ibc / 4, .chunk_data = (uintptr_t)&ibc },
 	};
 	uint64_t chunk_ptrs[2] = { (uintptr_t)&chunks[0], (uintptr_t)&chunks[1] };
-	union drm_amdgpu_cs cs = { .in = { .ctx_id = ctx_id, .bo_list_handle = 0,
-		.num_chunks = 2, .chunks = (uintptr_t)chunk_ptrs } };
+	union drm_amdgpu_cs cs;
 
 	struct bo *tsb = tsname[0] ? find_bo(tsname) : NULL;
 	if (tsname[0] && !tsb) { errno = ENOENT; die("timestamps bo"); }
@@ -238,6 +237,9 @@ main(int argc, char **argv)
 	for (uint64_t k = 0; k < repeat; k++) {
 		load_inits(argv[1]);
 		t0 = now_ns();
+		/* The ioctl overwrites the union with its output, so refill it. */
+		memset(&cs, 0, sizeof cs);
+		cs.in.ctx_id = ctx_id; cs.in.num_chunks = 2; cs.in.chunks = (uintptr_t)chunk_ptrs;
 		if (xioctl(fd, DRM_IOCTL_AMDGPU_CS, &cs)) die("cs submit");
 		memset(&w, 0, sizeof w);
 		w.in.handle = cs.out.handle; w.in.ip_type = ip; w.in.ctx_id = ctx_id;
