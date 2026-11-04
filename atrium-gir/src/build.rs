@@ -55,6 +55,11 @@ struct Builder<'a> {
     pred_stores: HashMap<B, Vec<(u32, spv::ValueId)>>,
     /// Phi result → its private variable.
     phi_var: HashMap<spv::ValueId, u32>,
+    /// Values defined inside a loop and used outside it (SPIR-V lets a
+    /// loop header's values reach the merge block; GIR regions don't):
+    /// stored to a private at the definition, reloaded after each loop
+    /// they leave. (value → (private, defining block))
+    escape: HashMap<spv::ValueId, (u32, B)>,
     translated: HashSet<B>,
     /// Blocks of a loop's continue construct: reached from every
     /// `continue` path, so they are duplicated per path.
@@ -645,6 +650,10 @@ impl<'a> Builder<'a> {
         };
         match &inst.result {
             Some(v) => {
+                if let (Some((var, _)), Val::V(x)) = (self.escape.get(&v.id).copied(), out) {
+                    let z = self.konst(0, Ty::I32);
+                    Self::emit_void(r, Op::Store(Space::Private(var), z, x));
+                }
                 self.vals.insert(v.id, out);
             }
             None => return malformed(format!("{:?} has no result", inst.op)),
@@ -796,6 +805,21 @@ impl<'a> Builder<'a> {
                 if let Some(inner) = self.loops.get(&cur).cloned() {
                     let body = self.region(cur, None, Some(&inner), true)?;
                     r.push(Node::Loop { inits: vec![], params: vec![], body, results: vec![] });
+                    let mut leaving: Vec<(spv::ValueId, u32)> = self
+                        .escape
+                        .iter()
+                        .filter(|(_, (_, b))| inner.body.contains(b))
+                        .map(|(v, (var, _))| (*v, *var))
+                        .collect();
+                    leaving.sort_by_key(|(v, _)| v.0);
+                    for (v, var) in leaving {
+                        if let Some(Val::V(x)) = self.vals.get(&v).copied() {
+                            let z = self.konst(0, Ty::I32);
+                            let t = self.out.ty(x);
+                            let y = self.emit(&mut r, t, Op::Load(Space::Private(var), z));
+                            self.vals.insert(v, Val::V(y));
+                        }
+                    }
                     match inner.exit {
                         Some(e) => {
                             cur = e;
@@ -882,6 +906,7 @@ pub fn build(m: &spv::Module, entry: usize) -> Result<Function, BuildError> {
         consts: HashMap::new(),
         pred_stores: HashMap::new(),
         phi_var: HashMap::new(),
+        escape: HashMap::new(),
         translated: HashSet::new(),
         dup_ok: HashSet::new(),
     };
@@ -913,6 +938,41 @@ pub fn build(m: &spv::Module, entry: usize) -> Result<Function, BuildError> {
                     b.pred_stores.entry(arm.from).or_default().push((var, arm.value.id));
                 }
             }
+        }
+    }
+    // Values that leave a loop.
+    let mut def_block: HashMap<spv::ValueId, (B, spv::Type)> = HashMap::new();
+    for (id, blk) in &f.blocks {
+        for inst in &blk.insts {
+            if let Some(res) = &inst.result {
+                def_block.insert(res.id, (*id, res.ty.clone()));
+            }
+        }
+    }
+    let mut uses: Vec<(spv::ValueId, B)> = vec![];
+    for (id, blk) in &f.blocks {
+        for inst in &blk.insts {
+            if let spv::Op::Phi(arms) = &inst.op {
+                uses.extend(arms.iter().map(|a| (a.value.id, a.from)));
+                continue;
+            }
+            let mut ops = vec![];
+            inst.op.referenced_value_ids(&mut ops);
+            uses.extend(ops.into_iter().map(|v| (v, *id)));
+        }
+    }
+    uses.sort_by_key(|(v, b)| (v.0, b.0));
+    uses.dedup();
+    let loops: Vec<LoopInfo> = b.loops.values().cloned().collect();
+    for (v, ub) in uses {
+        let Some((db, ty)) = def_block.get(&v).cloned() else { continue };
+        if matches!(ty, spv::Type::Pointer(..) | spv::Type::Void) || b.escape.contains_key(&v) {
+            continue;
+        }
+        if loops.iter().any(|l| l.body.contains(&db) && !l.body.contains(&ub)) {
+            let t = map_ty(&ty)?;
+            b.out.privates.push(t.bytes());
+            b.escape.insert(v, (b.out.privates.len() as u32 - 1, db));
         }
     }
     let body = b.region(f.entry_block, None, None, false)?;

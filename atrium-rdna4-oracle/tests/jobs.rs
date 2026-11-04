@@ -208,3 +208,14 @@ fn scalar_loads_match_a_reference_model() {
     assert!(l.matches("S_LOAD_B").count() >= 8, "{l}");
     assert!(l.contains("GLOBAL_LOAD_B32"), "the load after a divergent break stays on the vector path");
 }
+
+/// The Fresco compute kernels compile through atrium-rdna4 and become
+/// cases checked against the reference renderer.
+#[test]
+fn fresco_kernels_are_cases() {
+    let b = atrium_rdna4_oracle::fresco::bin().expect("bin.comp compiles");
+    let r = atrium_rdna4_oracle::fresco::raster().expect("raster.comp compiles");
+    assert!(b.buffers.iter().any(|x| x.expect.is_some()));
+    let t = r.buffers.iter().find(|x| x.expect.is_some()).unwrap();
+    assert_eq!(t.expect.as_ref().unwrap().len() as u32, 4 * atrium_rdna4_oracle::fresco::PITCH * atrium_rdna4_oracle::fresco::H);
+}

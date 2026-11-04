@@ -29,6 +29,7 @@ pub fn b64(data: &[u8]) -> String {
 
 pub mod bench;
 pub mod cases;
+pub mod fresco;
 
 /// One buffer of a case.
 #[derive(Debug, Clone)]

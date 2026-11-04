@@ -12,3 +12,6 @@ atrium-rdna4-compiler = { path = "../atrium-rdna4-compiler" }
 atrium-spv-frontend = { path = "../atrium-spv-frontend" }
 atrium-rdna4-isa = { path = "../atrium-rdna4-isa" }
 atrium-rdna4-cmd = { path = "../atrium-rdna4-cmd" }
+atrium-rdna4 = { path = "../atrium-rdna4" }
+# The Fresco compute kernels and their Rust reference renderer.
+fresco-compute = { path = "../fresco-compute", default-features = false }

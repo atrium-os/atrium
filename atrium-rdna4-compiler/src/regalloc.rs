@@ -23,6 +23,13 @@ pub struct Assignment {
 /// Allocate. VGPRs start at `v_first`, SGPRs at `s_first`.
 pub fn allocate(mi: &[MI], vregs: &[VRegInfo], v_first: u8, s_first: u8) -> Result<Assignment, Error> {
     let n = vregs.len();
+    let (start, end) = intervals(mi, n);
+    assign(vregs, &start, &end, v_first, s_first)
+}
+
+/// Live interval `[start, end]` (instruction positions) of every virtual
+/// register, extended across loops; `start == usize::MAX` if unused.
+pub fn intervals(mi: &[MI], n: usize) -> (Vec<usize>, Vec<usize>) {
     let mut start = vec![usize::MAX; n];
     let mut end = vec![0usize; n];
     let mut loops: Vec<(usize, usize)> = vec![];
@@ -61,6 +68,11 @@ pub fn allocate(mi: &[MI], vregs: &[VRegInfo], v_first: u8, s_first: u8) -> Resu
             break;
         }
     }
+    (start, end)
+}
+
+fn assign(vregs: &[VRegInfo], start: &[usize], end: &[usize], v_first: u8, s_first: u8) -> Result<Assignment, Error> {
+    let n = vregs.len();
     let mut order: Vec<usize> = (0..n).filter(|r| start[*r] != usize::MAX).collect();
     order.sort_by_key(|r| (start[*r], *r));
     let mut phys = vec![0u8; n];

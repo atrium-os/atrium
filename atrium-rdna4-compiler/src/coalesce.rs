@@ -75,3 +75,107 @@ pub fn run(mi: &mut Vec<MI>, vregs: &[VRegInfo]) {
     let mut it = dead.iter();
     mi.retain(|_| !*it.next().unwrap());
 }
+
+/// Merge copy-connected VGPR groups whose live ranges only touch at the
+/// copy: `p ← i` (component by component) where every reference to `p` or
+/// `i` inside the window from `p`'s first to `i`'s last reference is one of
+/// those copies. `i` is renamed to `p` and the copies go. Intervals are the
+/// allocator's (extended across loops), so a value still live around a
+/// loop is never merged. This removes the per-construct copies of loop
+/// parameters and `if` results.
+pub fn merge(mi: &mut Vec<MI>, vregs: &[VRegInfo]) {
+    loop {
+        let (start, end) = crate::regalloc::intervals(mi, vregs.len());
+        // Every instruction position that references each register.
+        let mut refs: Vec<Vec<usize>> = vec![vec![]; vregs.len()];
+        for (pos, m) in mi.iter().enumerate() {
+            let (u, d) = m.regs();
+            for r in u.into_iter().chain(d) {
+                let v = &mut refs[r as usize];
+                if v.last() != Some(&pos) {
+                    v.push(pos);
+                }
+            }
+        }
+        let mut done = None;
+        'scan: for (j, m) in mi.iter().enumerate() {
+            let MI::Valu { name: "V_MOV_B32", dst: O::R(p, _), sdst: None, src, neg: 0 } = m else { continue };
+            let [O::R(i, _)] = src[..] else { continue };
+            let (p, i) = (*p, i);
+            let (pi, ii) = (vregs[p as usize], vregs[i as usize]);
+            if p == i || pi.class != Class::V || ii.class != Class::V || pi.size != ii.size {
+                continue;
+            }
+            let (ps, ie) = (start[p as usize], end[i as usize]);
+            if ps > j || ie < j {
+                continue;
+            }
+            let mut comps = 0u32;
+            for pos in ps..=ie {
+                let in_p = refs[p as usize].binary_search(&pos).is_ok();
+                let in_i = refs[i as usize].binary_search(&pos).is_ok();
+                if !in_p && !in_i {
+                    continue;
+                }
+                match &mi[pos] {
+                    MI::Valu { name: "V_MOV_B32", dst: O::R(a, k), sdst: None, src, neg: 0 }
+                        if *a == p && src[..] == [O::R(i, *k)] =>
+                    {
+                        comps |= 1 << k;
+                    }
+                    _ => continue 'scan,
+                }
+            }
+            if comps != (1u32 << pi.size) - 1 {
+                continue;
+            }
+            done = Some((p, i, ps, ie));
+            break;
+        }
+        let Some((p, i, ps, ie)) = done else { return };
+        let ren = |o: &mut O| {
+            if let O::R(r, _) = o {
+                if *r == i {
+                    *r = p;
+                }
+            }
+        };
+        let mut keep = vec![true; mi.len()];
+        for (pos, m) in mi.iter_mut().enumerate() {
+            if (ps..=ie).contains(&pos) && matches!(m, MI::Valu { name: "V_MOV_B32", dst: O::R(a, _), .. } if *a == p) {
+                keep[pos] = false;
+                continue;
+            }
+            match m {
+                MI::Valu { dst, sdst, src, .. } => {
+                    ren(dst);
+                    if let Some(s) = sdst {
+                        ren(s);
+                    }
+                    src.iter_mut().for_each(ren);
+                }
+                MI::Salu { dst, src, .. } => {
+                    ren(dst);
+                    src.iter_mut().for_each(ren);
+                }
+                MI::Global { vdst, vaddr, data, .. } => {
+                    vdst.iter_mut().for_each(ren);
+                    ren(vaddr);
+                    data.iter_mut().for_each(ren);
+                }
+                MI::Ds { vdst, addr, data, .. } => {
+                    vdst.iter_mut().for_each(ren);
+                    ren(addr);
+                    data.iter_mut().for_each(ren);
+                }
+                MI::Smem { sdst, soff, .. } => {
+                    ren(sdst);
+                    soff.iter_mut().for_each(ren);
+                }
+                _ => {}
+            }
+        }
+        let mut it = keep.iter();
+        mi.retain(|_| *it.next().unwrap());
+    }
+}

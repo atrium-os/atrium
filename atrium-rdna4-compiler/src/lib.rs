@@ -90,6 +90,7 @@ pub fn compile(f: &Function) -> Result<Binary, Error> {
     let mut is = isel::Isel::new(f, &u, &abi);
     is.run()?;
     coalesce::run(&mut is.mi, &is.vregs);
+    coalesce::merge(&mut is.mi, &is.vregs);
     let asg = regalloc::allocate(&is.mi, &is.vregs, 1, abi.user_sgprs())?;
     let code = emit::emit(&is.mi, &is.vregs, &asg);
     Ok(Binary { code, vgprs: asg.vgprs, sgprs: asg.sgprs, abi, local_size: f.local_size, lds_bytes: f.workgroup_bytes })

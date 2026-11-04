@@ -91,7 +91,6 @@ fn gir_interpreter_bins_like_reference() {
 
 /// The RDNA4 path goes through GIR, so this is the gate for D3.
 #[test]
-#[ignore = "GIR can't structure raster.comp yet (\"used where it is not defined\"); the RDNA4 compiler is taking it"]
 fn gir_interpreter_rasters_like_reference() {
     let f = Frame::pack(&scene(), W, H, PITCH);
     let mut bufs: atrium_gir::interp::Buffers =

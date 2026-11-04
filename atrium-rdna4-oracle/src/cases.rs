@@ -66,7 +66,7 @@ pub fn write_42() -> Case {
 /// The `code` buffer for a compiled shader: the shader at 0, then the IB at
 /// [`IB_OFFSET`] or, for a shader longer than that, at the next page after
 /// it (so a large shader is never cut off and run into the IB).
-fn code_buffer(shader: &[u32], ib: &Blob) -> (Buffer, u64, u64) {
+pub(crate) fn code_buffer(shader: &[u32], ib: &Blob) -> (Buffer, u64, u64) {
     let mut code = words_to_bytes(shader);
     let ib_off = (IB_OFFSET as usize).max(code.len().next_multiple_of(0x1000));
     assert!(((ib_off + 4 * ib.dw.len()) as u64) < DATA_VA - CODE_VA, "shader larger than the code region");
@@ -77,7 +77,7 @@ fn code_buffer(shader: &[u32], ib: &Blob) -> (Buffer, u64, u64) {
 }
 
 /// GPU address of data buffer `i` (1 MiB apart).
-fn data_va(i: usize) -> u64 {
+pub(crate) fn data_va(i: usize) -> u64 {
     DATA_VA + (i as u64) * 0x10_0000
 }
 
@@ -245,6 +245,8 @@ pub fn all() -> Vec<Case> {
     for t in TIERB {
         v.extend(tierb(t));
     }
+    v.extend(crate::fresco::bin());
+    v.extend(crate::fresco::raster());
     v
 }
 

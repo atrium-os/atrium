@@ -51,6 +51,14 @@ pub(crate) struct Isel<'a> {
     /// ignore EXEC, are only issued where some lane would load the same
     /// address.
     exec_live: bool,
+    /// Types of the temporaries `parallel_copy` introduces.
+    tmp_ty: HashMap<ValueId, Ty>,
+    /// Values naming (part of) another value's registers (bitcasts,
+    /// extracts), by the value that owns the registers.
+    aliases: HashMap<ValueId, Vec<ValueId>>,
+    /// Where the node being selected sits (for `live_after`).
+    ctx: Vec<Ctx<'a>>,
+    alias_root: HashMap<ValueId, ValueId>,
     /// Spaces stored to or atomically updated somewhere in the kernel. The
     /// scalar cache is not coherent with vector writes, so loads from them
     /// stay on the vector path.
@@ -61,7 +69,7 @@ fn unsup<T>(s: impl Into<String>) -> Result<T, Error> {
     Err(Error::Unsupported(s.into()))
 }
 
-fn count_uses(r: &Region, uses: &mut HashMap<ValueId, usize>) {
+fn count_uses(r: &[Node], uses: &mut HashMap<ValueId, usize>) {
     for n in r {
         match n {
             Node::Inst(i) => {
@@ -138,6 +146,41 @@ fn contains_return(r: &Region) -> bool {
     })
 }
 
+/// Position of the node being selected: the nodes after it in an enclosing
+/// region, or an enclosing loop's body with the values defined in it.
+enum Ctx<'a> {
+    Rest(&'a [Node]),
+    Loop { body: &'a Region, defined: HashSet<ValueId> },
+}
+
+/// Values defined anywhere in `r` (instruction results, `if` results,
+/// loop parameters and results).
+fn defs_in(r: &[Node], out: &mut HashSet<ValueId>) {
+    for n in r {
+        match n {
+            Node::Inst(i) => out.extend(i.result),
+            Node::If { then, els, results, .. } => {
+                out.extend(results.iter().copied());
+                defs_in(then, out);
+                defs_in(els, out);
+            }
+            Node::Loop { params, body, results, .. } => {
+                out.extend(params.iter().copied());
+                out.extend(results.iter().copied());
+                defs_in(body, out);
+            }
+        }
+    }
+}
+
+/// The `k`-th value a region's final `yield` passes, if it ends in one.
+fn yielded(r: &Region, k: usize) -> Option<ValueId> {
+    match r.last() {
+        Some(Node::Inst(Inst { op: Op::Yield(vals), .. })) => vals.get(k).copied(),
+        _ => None,
+    }
+}
+
 /// Inline constant or not.
 fn inline(bits: u32) -> bool {
     crate::asm::inline_const(bits).is_some()
@@ -204,6 +247,10 @@ impl<'a> Isel<'a> {
             loops: vec![],
             yields: vec![],
             exec_live: true,
+            tmp_ty: HashMap::new(),
+            aliases: HashMap::new(),
+            ctx: vec![],
+            alias_root: HashMap::new(),
             written,
         }
     }
@@ -247,7 +294,10 @@ impl<'a> Isel<'a> {
     }
 
     fn ty(&self, v: ValueId) -> Ty {
-        self.f.ty(v)
+        match self.tmp_ty.get(&v) {
+            Some(t) => *t,
+            None => self.f.ty(v),
+        }
     }
 
     /// Operand for component `c` of value `v`.
@@ -301,6 +351,84 @@ impl<'a> Isel<'a> {
         }
     }
 
+    fn alias(&mut self, base: ValueId, a: ValueId) {
+        let root = self.alias_root.get(&base).copied().unwrap_or(base);
+        self.alias_root.insert(a, root);
+        self.aliases.entry(root).or_default().push(a);
+    }
+
+    /// `q`'s registers can be reused by a slot: its own VGPR group (not a
+    /// constant, a component of something else, or aliased by another
+    /// value), and every use of it is counted in `inside`.
+    fn shareable(&self, q: ValueId) -> bool {
+        if self.consts.contains_key(&q) || self.ty(q) == Ty::BOOL || self.alias_root.contains_key(&q) {
+            return false;
+        }
+        let Some(&(r, 0)) = self.map.get(&q) else { return false };
+        let info = self.vregs[r as usize];
+        if info.class != Class::V || info.size as usize != self.ty(q).comps() {
+            return false;
+        }
+        true
+    }
+
+    /// Whether `q` (or an alias of it) may be read after the current node by
+    /// the lanes running it: in the rest of each enclosing region, or (for a
+    /// value from outside an enclosing loop) anywhere in that loop's body,
+    /// which runs again. Sibling `if` arms run on other lanes and don't
+    /// count. `also` is one more region to search (a loop's own body).
+    fn live_after(&self, q: ValueId, also: Option<&Region>) -> bool {
+        let group: Vec<ValueId> = std::iter::once(q).chain(self.aliases.get(&q).cloned().unwrap_or_default()).collect();
+        let used = |r: &[Node]| {
+            let mut u = HashMap::new();
+            count_uses(r, &mut u);
+            group.iter().any(|v| u.contains_key(v))
+        };
+        if also.map_or(false, |b| used(b)) {
+            return true;
+        }
+        self.ctx.iter().any(|c| match c {
+            Ctx::Rest(r) => used(r),
+            Ctx::Loop { body, defined } => !defined.contains(&q) && used(body),
+        })
+    }
+
+    /// Copy `src` into `dst` for each pair, as one parallel copy: a source
+    /// whose registers an earlier copy of the batch overwrites is saved to
+    /// a temporary first; copies onto the same register are dropped.
+    fn parallel_copy(&mut self, pairs: &[(ValueId, ValueId)]) -> Result<(), Error> {
+        let regs_of = |s: &Self, v: ValueId| -> Vec<(VR, u8)> {
+            match (s.consts.get(&v), s.map.get(&v)) {
+                (None, Some(&(r, o))) => (0..s.ty(v).comps() as u8).map(|c| (r, o + c)).collect(),
+                _ => vec![],
+            }
+        };
+        let mut srcs: Vec<ValueId> = pairs.iter().map(|p| p.1).collect();
+        for (k, (_, src)) in pairs.iter().enumerate() {
+            let sr = regs_of(self, *src);
+            let clobbered = pairs[..k].iter().any(|(d, s2)| {
+                *s2 != *src && regs_of(self, *d).iter().any(|x| sr.contains(x))
+            });
+            if clobbered && self.ty(*src) != Ty::BOOL {
+                let n = self.ty(*src).comps() as u8;
+                let t = self.vreg(Class::V, n);
+                for c in 0..n {
+                    let s = self.src(*src, c)?;
+                    self.valu("V_MOV_B32", O::R(t, c), vec![s], 0);
+                }
+                // A fresh value standing for the saved copy.
+                let tv = ValueId(u32::MAX - k as u32);
+                self.map.insert(tv, (t, 0));
+                self.tmp_ty.insert(tv, self.ty(*src));
+                srcs[k] = tv;
+            }
+        }
+        for ((dst, _), src) in pairs.iter().zip(srcs) {
+            self.copy_into(*dst, src)?;
+        }
+        Ok(())
+    }
+
     /// Write `src` into `dst`'s register(s) for the active lanes only.
     fn copy_into(&mut self, dst: ValueId, src: ValueId) -> Result<(), Error> {
         let (d, o) = self.map[&dst];
@@ -321,7 +449,9 @@ impl<'a> Isel<'a> {
         }
         for c in 0..self.ty(dst).comps() as u8 {
             let s = self.src(src, c)?;
-            self.valu("V_MOV_B32", O::R(d, o + c), vec![s], 0);
+            if s != O::R(d, o + c) {
+                self.valu("V_MOV_B32", O::R(d, o + c), vec![s], 0);
+            }
         }
         Ok(())
     }
@@ -547,10 +677,12 @@ impl<'a> Isel<'a> {
             }
             Op::Bitcast(a) => {
                 let m = self.map[a];
+                self.alias(*a, res.unwrap());
                 self.map.insert(res.unwrap(), m);
             }
             Op::Extract(a, k) => {
                 let (r, o) = self.map[a];
+                self.alias(*a, res.unwrap());
                 self.map.insert(res.unwrap(), (r, o + k));
             }
             Op::Construct(parts) => {
@@ -688,18 +820,16 @@ impl<'a> Isel<'a> {
             Op::Subgroup(o, args) => self.subgroup(*o, args, res.unwrap())?,
             Op::Yield(vals) => {
                 let targets = self.yields.last().cloned().unwrap_or_default();
-                for (t, v) in targets.iter().zip(vals) {
-                    self.copy_into(*t, *v)?;
-                }
+                let pairs: Vec<(ValueId, ValueId)> = targets.iter().copied().zip(vals.iter().copied()).collect();
+                self.parallel_copy(&pairs)?;
             }
             Op::Continue(vals) | Op::Break(vals) => {
                 self.exec_live = false;
                 let is_break = matches!(i.op, Op::Break(_));
                 let l = self.loops.last().ok_or_else(|| Error::Internal("break outside loop".into()))?;
                 let (slots, mask) = if is_break { (l.results.clone(), l.brk) } else { (l.params.clone(), l.cont) };
-                for (t, v) in slots.iter().zip(vals) {
-                    self.copy_into(*t, *v)?;
-                }
+                let pairs: Vec<(ValueId, ValueId)> = slots.iter().copied().zip(vals.iter().copied()).collect();
+                self.parallel_copy(&pairs)?;
                 self.salu("S_OR_B32", O::R(mask, 0), vec![O::R(mask, 0), O::Exec]);
                 self.salu("S_MOV_B32", O::Exec, vec![O::Imm(0)]);
             }
@@ -1225,13 +1355,36 @@ impl<'a> Isel<'a> {
         }
     }
 
-    fn region(&mut self, r: &Region) -> Result<(), Error> {
-        for n in r {
+    fn region(&mut self, r: &'a [Node]) -> Result<(), Error> {
+        for (idx, n) in r.iter().enumerate() {
+            self.ctx.push(Ctx::Rest(&r[idx + 1..]));
+            let res = self.node(n);
+            self.ctx.pop();
+            res?;
+        }
+        Ok(())
+    }
+
+    fn node(&mut self, n: &'a Node) -> Result<(), Error> {
+        {
             match n {
                 Node::Inst(i) => self.inst(i)?,
                 Node::If { cond, then, els, results } => {
-                    for v in results {
-                        self.def_slot(*v);
+                    let mut taken = HashSet::new();
+                    for (k, v) in results.iter().enumerate() {
+                        // Share the slot with a value one arm yields that
+                        // nothing after the `if` reads (on these lanes).
+                        let cand = [yielded(then, k), yielded(els, k)].into_iter().flatten().find(|q| {
+                            !taken.contains(q) && self.ty(*q) == self.ty(*v) && self.shareable(*q) && !self.live_after(*q, None)
+                        });
+                        match cand {
+                            Some(q) => {
+                                taken.insert(q);
+                                let m = self.map[&q];
+                                self.map.insert(*v, m);
+                            }
+                            None => self.def_slot(*v),
+                        }
                     }
                     let c = self.src(*cond, 0)?;
                     let save = self.vreg(Class::S, 1);
@@ -1253,7 +1406,7 @@ impl<'a> Isel<'a> {
                         } else {
                             self.salu("S_MOV_B32", O::Exec, vec![O::R(save, 0)]);
                         }
-                        continue;
+                        return Ok(());
                     }
                     let (l_else, l_end) = (self.label(), self.label());
                     self.salu("S_AND_SAVEEXEC_B32", O::R(save, 0), vec![c]);
@@ -1279,12 +1432,27 @@ impl<'a> Isel<'a> {
                     }
                 }
                 Node::Loop { inits, params, body, results } => {
-                    for v in params.iter().chain(results) {
+                    let mut taken = HashSet::new();
+                    for (p, i) in params.iter().zip(inits) {
+                        // A parameter takes over an init that nothing reads
+                        // later: not the loop body, not after the loop.
+                        if self.ty(*p) == self.ty(*i)
+                            && inits.iter().filter(|x| *x == i).count() == 1
+                            && taken.insert(*i)
+                            && self.shareable(*i)
+                            && !self.live_after(*i, Some(body))
+                        {
+                            let m = self.map[i];
+                            self.map.insert(*p, m);
+                        } else {
+                            self.def_slot(*p);
+                        }
+                    }
+                    for v in results {
                         self.def_slot(*v);
                     }
-                    for (p, i) in params.iter().zip(inits) {
-                        self.copy_into(*p, *i)?;
-                    }
+                    let pairs: Vec<(ValueId, ValueId)> = params.iter().copied().zip(inits.iter().copied()).collect();
+                    self.parallel_copy(&pairs)?;
                     let (brk, cont) = (self.vreg(Class::S, 1), self.vreg(Class::S, 1));
                     self.salu("S_MOV_B32", O::R(brk, 0), vec![O::Imm(0)]);
                     let top = self.label();
@@ -1295,7 +1463,12 @@ impl<'a> Isel<'a> {
                     // Later iterations start with live lanes (the back edge
                     // is taken only then); the first has the entry mask.
                     let live = self.exec_live;
-                    self.region(body)?;
+                    let mut defined: HashSet<ValueId> = params.iter().copied().collect();
+                    defs_in(body, &mut defined);
+                    self.ctx.push(Ctx::Loop { body, defined });
+                    let res = self.region(body);
+                    self.ctx.pop();
+                    res?;
                     self.exec_live = live && !contains_return(body);
                     self.loops.pop();
                     self.salu("S_OR_B32", O::Exec, vec![O::Exec, O::R(cont, 0)]);
@@ -1312,8 +1485,8 @@ impl<'a> Isel<'a> {
         self.ret = self.vreg(Class::S, 1);
         let r = self.ret;
         self.salu("S_MOV_B32", O::R(r, 0), vec![O::Imm(0)]);
-        let body = &self.f.body;
-        self.region(body)?;
+        let f = self.f;
+        self.region(&f.body)?;
         // Mask bookkeeping at the very end is dead: nothing runs after it.
         while let Some(MI::Salu { dst, .. }) = self.mi.last() {
             if *dst == O::Exec || *dst == O::R(r, 0) {
