@@ -640,8 +640,10 @@ impl<'a> Cx<'a> {
         let child_cb_h = definite.map(|d| (d - pt - pb - bt - bb).max(0));
         // ★ List markers belong to `li` (the profile admits list-style-* but not
         // display: list-item): typed by the inherited list-style-type,
-        // numbered among its `li` siblings from `<ol start>`.
-        if self.dom.tag(h) == Some("li") {
+        // numbered among its `li` siblings from `<ol start>`. Only a BLOCK
+        // `li` stands in for a list item: `display: inline-block`, `flex` or
+        // `grid` replaces list-item, and the marker goes with it.
+        if self.dom.tag(h) == Some("li") && kw(s, "display") == "block" {
             let ty = kw(s, "list-style-type");
             let text = match ty {
                 "disc" => Some("\u{2022}".to_string()),
@@ -3876,6 +3878,17 @@ mod tests {
         // Control: text that is itself 0 px still paints nothing.
         let o = render(r#"<style>span { font-size: 0 }</style><p>Seen <span>hidden</span></p>"#);
         assert_eq!(o.scene.runs.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), vec!["Seen"]);
+    }
+
+    #[test]
+    fn only_a_block_li_has_a_marker() {
+        // `display: inline-block` (or flex, grid) on an `li` replaces
+        // list-item: no bullet. Navigation rows built from inline-block
+        // items grew a "•" before every link.
+        let o = render(r#"<style>.i { display: inline-block } .f { display: flex }</style>
+            <ul><li class="i">a</li><li class="f">b</li><li>c</li></ul>"#);
+        let words: Vec<&str> = o.scene.runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(words, vec!["a", "b", "\u{2022}", "c"]);
     }
 
     #[test]
