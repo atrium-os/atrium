@@ -61,6 +61,92 @@ fn b(x: f32) -> u32 {
     x.to_bits()
 }
 
+
+/// Evaluate a scalar arithmetic op (`Un`, `Bin`, `Fma`, `Cmp`, `Conv`) on
+/// operand bits `x`. `is_bool` says the result type is `bool`. Shared by the
+/// interpreter and constant folding so the two can never disagree.
+pub(crate) fn eval(op: &Op, x: &[u32], is_bool: bool) -> Option<u32> {
+    let r: Option<Lane> = match op {
+                Op::Un(o, _) => {
+                    let a = x[0];
+                    let r = match o {
+                        UnOp::INeg => a.wrapping_neg(),
+                        UnOp::Not => if is_bool { (a == 0) as u32 } else { !a },
+                        UnOp::FNeg => a ^ 0x8000_0000,
+                        UnOp::FAbs => a & 0x7fff_ffff,
+                        UnOp::FSqrt => b(f(a).sqrt()),
+                        UnOp::FFloor => b(f(a).floor()),
+                        UnOp::FCeil => b(f(a).ceil()),
+                        UnOp::FTrunc => b(f(a).trunc()),
+                        UnOp::Clz => a.leading_zeros(),
+                        UnOp::BitReverse => a.reverse_bits(),
+                    };
+                    Some([r, 0, 0, 0])
+                }
+                Op::Bin(o, _, _) => {
+                    let (a, c) = (x[0], x[1]);
+                    let r = match o {
+                        BinOp::IAdd => a.wrapping_add(c),
+                        BinOp::ISub => a.wrapping_sub(c),
+                        BinOp::IMul => a.wrapping_mul(c),
+                        BinOp::UDiv => if c == 0 { u32::MAX } else { a / c },
+                        BinOp::SDiv => if c == 0 { u32::MAX } else { (a as i32).wrapping_div(c as i32) as u32 },
+                        BinOp::UMod => if c == 0 { u32::MAX } else { a % c },
+                        BinOp::SRem => if c == 0 { u32::MAX } else { (a as i32).wrapping_rem(c as i32) as u32 },
+                        BinOp::And => a & c,
+                        BinOp::Or => a | c,
+                        BinOp::Xor => a ^ c,
+                        BinOp::Shl => a << (c & 31),
+                        BinOp::LShr => a >> (c & 31),
+                        BinOp::AShr => ((a as i32) >> (c & 31)) as u32,
+                        BinOp::FAdd => b(f(a) + f(c)),
+                        BinOp::FSub => b(f(a) - f(c)),
+                        BinOp::FMul => b(f(a) * f(c)),
+                        BinOp::FDiv => b(f(a) / f(c)),
+                        BinOp::FMin => b(f(a).min(f(c))),
+                        BinOp::FMax => b(f(a).max(f(c))),
+                    };
+                    Some([r, 0, 0, 0])
+                }
+                Op::Fma(..) => Some([b(f(x[0]).mul_add(f(x[1]), f(x[2]))), 0, 0, 0]),
+                Op::Cmp(o, _, _) => {
+                    let (a, c) = (x[0], x[1]);
+                    let (x, y) = (f(a), f(c));
+                    let un = x.is_nan() || y.is_nan();
+                    let r = match o {
+                        CmpOp::IEq => a == c,
+                        CmpOp::INe => a != c,
+                        CmpOp::ULt => a < c,
+                        CmpOp::ULe => a <= c,
+                        CmpOp::SLt => (a as i32) < (c as i32),
+                        CmpOp::SLe => (a as i32) <= (c as i32),
+                        CmpOp::FOEq => x == y,
+                        CmpOp::FONe => !un && x != y,
+                        CmpOp::FOLt => x < y,
+                        CmpOp::FOLe => x <= y,
+                        CmpOp::FUEq => un || x == y,
+                        CmpOp::FUNe => x != y,
+                        CmpOp::FULt => un || x < y,
+                        CmpOp::FULe => un || x <= y,
+                    };
+                    Some([r as u32, 0, 0, 0])
+                }
+                                Op::Conv(o, _) => {
+                    let a = x[0];
+                    let r = match o {
+                        ConvOp::SToF => b(a as i32 as f32),
+                        ConvOp::UToF => b(a as f32),
+                        ConvOp::FToS => f(a) as i32 as u32,
+                        ConvOp::FToU => f(a) as u32,
+                        ConvOp::BoolToI => (a != 0) as u32,
+                    };
+                    Some([r, 0, 0, 0])
+                }
+        _ => None,
+    };
+    r.map(|l| l[0])
+}
+
 impl<'a> Wg<'a> {
     fn get(&self, v: ValueId, l: usize) -> Lane {
         self.vals[v.0 as usize][l]
@@ -131,83 +217,12 @@ impl<'a> Wg<'a> {
             let s1 = |w: &Self, v: ValueId| w.s(v, l);
             let x: Option<Lane> = match &inst.op {
                 Op::Const(c) => Some([*c, 0, 0, 0]),
-                Op::Un(o, a) => {
-                    let a = s1(self, *a);
+                Op::Un(..) | Op::Bin(..) | Op::Fma(..) | Op::Cmp(..) | Op::Conv(..) => {
+                    let args: Vec<u32> = inst.op.operands().iter().map(|v| s1(self, *v)).collect();
                     let is_bool = fty.ty(inst.result.unwrap()) == Ty::BOOL;
-                    let r = match o {
-                        UnOp::INeg => a.wrapping_neg(),
-                        UnOp::Not => if is_bool { (a == 0) as u32 } else { !a },
-                        UnOp::FNeg => a ^ 0x8000_0000,
-                        UnOp::FAbs => a & 0x7fff_ffff,
-                        UnOp::FSqrt => b(f(a).sqrt()),
-                        UnOp::FFloor => b(f(a).floor()),
-                        UnOp::FCeil => b(f(a).ceil()),
-                        UnOp::FTrunc => b(f(a).trunc()),
-                        UnOp::Clz => a.leading_zeros(),
-                        UnOp::BitReverse => a.reverse_bits(),
-                    };
-                    Some([r, 0, 0, 0])
-                }
-                Op::Bin(o, a, c) => {
-                    let (a, c) = (s1(self, *a), s1(self, *c));
-                    let r = match o {
-                        BinOp::IAdd => a.wrapping_add(c),
-                        BinOp::ISub => a.wrapping_sub(c),
-                        BinOp::IMul => a.wrapping_mul(c),
-                        BinOp::UDiv => if c == 0 { u32::MAX } else { a / c },
-                        BinOp::SDiv => if c == 0 { u32::MAX } else { (a as i32).wrapping_div(c as i32) as u32 },
-                        BinOp::UMod => if c == 0 { u32::MAX } else { a % c },
-                        BinOp::SRem => if c == 0 { u32::MAX } else { (a as i32).wrapping_rem(c as i32) as u32 },
-                        BinOp::And => a & c,
-                        BinOp::Or => a | c,
-                        BinOp::Xor => a ^ c,
-                        BinOp::Shl => a << (c & 31),
-                        BinOp::LShr => a >> (c & 31),
-                        BinOp::AShr => ((a as i32) >> (c & 31)) as u32,
-                        BinOp::FAdd => b(f(a) + f(c)),
-                        BinOp::FSub => b(f(a) - f(c)),
-                        BinOp::FMul => b(f(a) * f(c)),
-                        BinOp::FDiv => b(f(a) / f(c)),
-                        BinOp::FMin => b(f(a).min(f(c))),
-                        BinOp::FMax => b(f(a).max(f(c))),
-                    };
-                    Some([r, 0, 0, 0])
-                }
-                Op::Fma(a, c, d) => Some([b(f(s1(self, *a)).mul_add(f(s1(self, *c)), f(s1(self, *d)))), 0, 0, 0]),
-                Op::Cmp(o, a, c) => {
-                    let (a, c) = (s1(self, *a), s1(self, *c));
-                    let (x, y) = (f(a), f(c));
-                    let un = x.is_nan() || y.is_nan();
-                    let r = match o {
-                        CmpOp::IEq => a == c,
-                        CmpOp::INe => a != c,
-                        CmpOp::ULt => a < c,
-                        CmpOp::ULe => a <= c,
-                        CmpOp::SLt => (a as i32) < (c as i32),
-                        CmpOp::SLe => (a as i32) <= (c as i32),
-                        CmpOp::FOEq => x == y,
-                        CmpOp::FONe => !un && x != y,
-                        CmpOp::FOLt => x < y,
-                        CmpOp::FOLe => x <= y,
-                        CmpOp::FUEq => un || x == y,
-                        CmpOp::FUNe => x != y,
-                        CmpOp::FULt => un || x < y,
-                        CmpOp::FULe => un || x <= y,
-                    };
-                    Some([r as u32, 0, 0, 0])
+                    Some([eval(&inst.op, &args, is_bool).unwrap(), 0, 0, 0])
                 }
                 Op::Select(c, t, e) => Some(if s1(self, *c) != 0 { self.get(*t, l) } else { self.get(*e, l) }),
-                Op::Conv(o, a) => {
-                    let a = s1(self, *a);
-                    let r = match o {
-                        ConvOp::SToF => b(a as i32 as f32),
-                        ConvOp::UToF => b(a as f32),
-                        ConvOp::FToS => f(a) as i32 as u32,
-                        ConvOp::FToU => f(a) as u32,
-                        ConvOp::BoolToI => (a != 0) as u32,
-                    };
-                    Some([r, 0, 0, 0])
-                }
                 Op::Bitcast(a) => Some(self.get(*a, l)),
                 Op::Construct(v) => {
                     let mut x = [0; 4];

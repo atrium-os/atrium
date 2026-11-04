@@ -28,6 +28,7 @@ use std::fmt;
 
 pub mod build;
 pub mod interp;
+pub mod passes;
 pub mod verify;
 
 /// An SSA value.
@@ -254,7 +255,7 @@ pub enum Builtin {
 }
 
 /// An instruction.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Op {
     /// A constant: raw bits of a scalar (`bool`: 0 or 1).
     Const(u32),
@@ -314,6 +315,26 @@ impl Op {
     }
 }
 
+impl Op {
+    /// Mutable references to the values this op reads.
+    pub fn operands_mut(&mut self) -> Vec<&mut ValueId> {
+        match self {
+            Op::Const(_) | Op::Builtin(_) | Op::Barrier | Op::Return => vec![],
+            Op::Un(_, a) | Op::Conv(_, a) | Op::Bitcast(a) | Op::Extract(a, _) | Op::Load(_, a) => vec![a],
+            Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(_, a, b) | Op::Atomic(_, _, a, b) => vec![a, b],
+            Op::Fma(a, b, c) | Op::Select(a, b, c) => vec![a, b, c],
+            Op::Construct(v) | Op::Yield(v) | Op::Continue(v) | Op::Break(v) => v.iter_mut().collect(),
+        }
+    }
+
+    /// True for ops without side effects, which may be removed when unused
+    /// or merged when identical.
+    pub fn is_pure(&self) -> bool {
+        matches!(self, Op::Const(_) | Op::Un(..) | Op::Bin(..) | Op::Fma(..) | Op::Cmp(..) | Op::Select(..)
+            | Op::Conv(..) | Op::Bitcast(_) | Op::Construct(_) | Op::Extract(..) | Op::Builtin(_))
+    }
+}
+
 /// One instruction and its result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Inst {
@@ -355,6 +376,17 @@ pub enum Node {
         /// Values defined after the node, fed by `Break`.
         results: Vec<ValueId>,
     },
+}
+
+/// True if control never leaves `r` by falling off its end: it ends in
+/// `continue`, `break` or `return`, or in an `if` whose arms both never fall.
+/// (`yield` falls through to the `if`'s merge.)
+pub fn never_falls(r: &Region) -> bool {
+    match r.last() {
+        Some(Node::Inst(i)) => matches!(i.op, Op::Continue(_) | Op::Break(_) | Op::Return),
+        Some(Node::If { then, els, .. }) => never_falls(then) && never_falls(els),
+        _ => false,
+    }
 }
 
 /// A compute kernel in GIR.

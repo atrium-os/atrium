@@ -116,7 +116,7 @@ impl<'a> V<'a> {
                         self.use_(*v)?;
                     }
                     self.same_types("loop inits", inits, params)?;
-                    if !params.is_empty() && !ends_with_terminator(body) {
+                    if !params.is_empty() && !ends_with_terminator(body) && !never_falls(body) {
                         return err("loop body with parameters must end in a terminator".into());
                     }
                     self.scopes.push(vec![]);
