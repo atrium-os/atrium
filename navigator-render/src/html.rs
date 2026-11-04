@@ -67,6 +67,28 @@ fn len(v: &V, basis: U) -> Option<U> {
     }
 }
 
+/// A length that needs no basis: a plain one, or a `calc()` / `min()` /
+/// `max()` / `clamp()` with no percentage in it. Measurement must treat
+/// both alike — taking only the plain one measured GitHub Docs' search
+/// box, `width: calc(8rem * 2 + 0.125rem)`, by its placeholder text, and
+/// the Menu button beside it was pushed 22 px off the page.
+fn abs_len(v: &V) -> Option<U> {
+    fn pct(c: &Calc) -> bool {
+        match c {
+            Calc::Pct(_) => true,
+            Calc::Num(_) | Calc::Len(_) => false,
+            Calc::Add(a, b) | Calc::Sub(a, b) | Calc::Mul(a, b) | Calc::Div(a, b) => pct(a) || pct(b),
+            Calc::Min(v) | Calc::Max(v) => v.iter().any(pct),
+            Calc::Clamp(a, b, c) => pct(a) || pct(b) || pct(c),
+        }
+    }
+    match v {
+        V::Len(l) => Some(u(l.v)),
+        V::Calc(c) if !pct(c) => calc_eval(c, 0).map(u),
+        _ => None,
+    }
+}
+
 /// A box's border-box size `size` as an INTRINSIC CONTRIBUTION: clamped by
 /// its own `min-width`/`max-width` (CSS Sizing §5.2). A percentage is
 /// against the indefinite size being measured, so it does not clamp.
@@ -75,7 +97,7 @@ fn len(v: &V, basis: U) -> Option<U> {
 /// ★ Unclamped, an ad slot's `min-width: 300px` measured its column at the
 /// width of the word "Ad", and a fit-content box centred 35 px of it.
 fn contribution(cs: &Style, size: U) -> U {
-    let lim = |p: &str| match cs.get(p) { V::Len(l) => Some(u(l.v)), _ => None };
+    let lim = |p: &str| abs_len(cs.get(p));
     let table = matches!(cs.get("display"), V::Kw("table"));
     let size = if table { size } else { lim("max-width").map_or(size, |mx| size.min(mx)) };
     lim("min-width").map_or(size, |mn| size.max(mn))
@@ -309,7 +331,7 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
         let author_cols = cx.column_decls(t).ok().unwrap_or_default().into_iter()
             .filter(|c| dom.tag(*c) == Some("col")).collect::<Vec<_>>();
         for (i, c) in author_cols.iter().enumerate().take(ncols) {
-            if let Some(cw) = cx.st(*c).and_then(|cs| match cs.get("width") { V::Len(_) => len(cs.get("width"), 0), _ => None }) {
+            if let Some(cw) = cx.st(*c).and_then(|cs| abs_len(cs.get("width"))) {
                 mins[i] = mins[i].max(cw); maxs[i] = maxs[i].max(cw);
             }
         }
@@ -329,7 +351,7 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
                 // content's min-content. Taken as exact, the W3C specs'
                 // `th { width: 3em }` held their property tables' header
                 // column to 48 px and "Initial:" painted over its value.
-                let floor = cx.st(c).and_then(|cs| match cs.get("width") { V::Len(_) => len(cs.get("width"), 0), _ => None }).unwrap_or(0);
+                let floor = cx.st(c).and_then(|cs| abs_len(cs.get("width"))).unwrap_or(0);
                 let (mn, mx) = ((mn + pad).max(floor), (mx + pad).max(floor));
                 if n == 1 {
                     mins[k] = mins[k].max(mn);
@@ -1933,7 +1955,7 @@ impl<'a> Cx<'a> {
                     let frame = px("padding-left") + px("padding-right") + bd("left") + bd("right");
                     let margins = px("margin-left") + px("margin-right");
                     // A percentage width is cyclic here and behaves as auto.
-                    let definite = match cs.get("width") { V::Len(l) => Some(u(l.v)), _ => None };
+                    let definite = abs_len(cs.get("width"));
                     let (a, b) = definite.map_or((mn + frame, mx + frame), |d| (d, d));
                     let (a, b) = (contribution(cs, a).max(frame) + margins, contribution(cs, b).max(frame) + margins);
                     let scroller = ["overflow-x", "overflow-y"].iter().any(|p| !matches!(kw(cs, p), "visible" | "clip" | ""));
@@ -2317,7 +2339,7 @@ impl<'a> Cx<'a> {
                 // max-content width of the tree inside: 446 px of empty
                 // space, and the README squeezed into 353 of the 800.
                 // The profile is border-box, so only the margins are outside.
-                let cw = self.st(*c).and_then(|cs| match cs.get("width") { V::Len(l) => Some(u(l.v)), _ => None });
+                let cw = self.st(*c).and_then(|cs| abs_len(cs.get("width")));
                 let (a, b) = match cw { Some(w) => (w, w), None => self.intrinsic(*c) };
                 let frame = self.st(*c).map(|cs| {
                     let px = |p: &str| len(cs.get(p), 0).unwrap_or(0);
@@ -2368,12 +2390,12 @@ impl<'a> Cx<'a> {
                 // border; only the margins are outside it. Adding the frame
                 // again measured a 220 px box as 240 once tables stopped
                 // filling the line and started wrapping their columns.
-                let definite = matches!(cs.get("width"), V::Len(_));
+                let definite = abs_len(cs.get("width")).is_some();
                 let frame = px("margin-left") + px("margin-right") + if definite { 0 } else {
                     px("padding-left") + px("padding-right")
                     + if kw(cs, "border-left-style") == "none" { 0 } else { px("border-left-width") }
                     + if kw(cs, "border-right-style") == "none" { 0 } else { px("border-right-width") } };
-                let (a, b) = match cs.get("width") { V::Len(l) => { let w = u(l.v); (w, w) } _ => self.intrinsic(c) };
+                let (a, b) = match abs_len(cs.get("width")) { Some(w) => (w, w), None => self.intrinsic(c) };
                 let margins = px("margin-left") + px("margin-right");
                 let (a, b) = (contribution(cs, a + frame - margins) + margins, contribution(cs, b + frame - margins) + margins);
                 mn = mn.max(a);
@@ -4457,6 +4479,26 @@ mod tests {
             <div class="g"><div class="a"></div><div class="b"></div></div>"#);
         assert_eq!(boxes(&o, 0xff0000ff), vec![(0, 0, 200, 10)]);
         assert_eq!(boxes(&o, 0x00ff00ff), vec![(100, 10, 200, 10)]);
+    }
+
+    /// ★ A `calc()` with no percentage in it is a DEFINITE length to
+    /// measurement, like a plain one: as a child's width in a row flex
+    /// container's max-content, and as the `min-width` that clamps a
+    /// contribution. GitHub Docs' search box and Menu button. Chrome's
+    /// numbers.
+    #[test]
+    fn a_percentage_free_calc_is_a_definite_length_when_measuring() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-right: 0px; margin-top: 0px }
+            .row { display: flex } .sp { margin-left: auto; display: flex; min-width: 0px }
+            .s { width: calc(8rem * 2 + 0.125rem); height: 10px; background-color: #00ff00 }
+            .b { width: 50px; height: 10px; background-color: #ff0000 }
+            .m { width: max-content; min-width: calc(4rem + 2rem); height: 10px; background-color: #0000ff }</style>
+            <div class="row"><div class="sp"><div class="s">x</div><div class="b"></div></div></div>
+            <div class="row"><div class="sp"><div class="m"></div></div></div>"#);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        assert_eq!(boxes(&o, 0x00ff00ff)[0].0, 492, "the calc() width is the box's, not its text's");
+        assert_eq!(boxes(&o, 0xff0000ff)[0].0, 750, "so its neighbour ends at the edge");
+        assert_eq!(boxes(&o, 0x0000ffff)[0].0, 800 - 96, "a calc() min-width clamps the contribution");
     }
 
     /// ★ A grid container's intrinsic width is its COLUMNS' — sized under
