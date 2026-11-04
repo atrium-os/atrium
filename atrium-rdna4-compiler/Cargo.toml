@@ -1,0 +1,18 @@
+[package]
+name        = "atrium-rdna4-compiler"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "atrium-spv IR -> RDNA4 (GFX12) machine code for the native Tier-3 backend. See docs/spec/atrium-rdna4-vulkan-backend.md §3."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+atrium-rdna4-isa = { path = "../atrium-rdna4-isa" }
+
+[dev-dependencies]
+atrium-spv-ir = { path = "../atrium-spv-ir" }
+atrium-spv-frontend = { path = "../atrium-spv-frontend" }
+rspirv = "0.13"
