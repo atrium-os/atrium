@@ -64,6 +64,9 @@ pub const ENGINE_COMPUTE: u32 = 1;
 // IT_DMA_DATA (CP DMA copy, memory<->memory) to blit a System staging BO into
 // the VRAM scanout BO (VRAM is GPU-only; only VRAM is scannable).
 const IT_DMA_DATA: u32 = 0x50;
+// RELEASE_MEM end-of-pipe with an interrupt: the kernel signals a submit's
+// syncobj from that interrupt, so a ring that should signal must end with one.
+const IT_RELEASE_MEM: u32 = 0x49;
 fn pm4_type3(opcode: u32, body_dwords: u32) -> u32 {
     (3 << 30) | (((body_dwords - 1) & 0x3fff) << 16) | (opcode << 8)
 }
@@ -510,7 +513,9 @@ impl<'a> Scanout<'a> {
         self.staging.write(0, pixels)?;
         let src = self.staging.gpu_va();
         let dst = self.buffers[i].gpu_va();
-        let words: [u32; 7] = [
+        // The EOP fence lands in the ring BO's second half (never executed).
+        let fence = self.ring.gpu_va() + 2048;
+        let words: [u32; 14] = [
             pm4_type3(IT_DMA_DATA, 6),
             0,
             (src & 0xffff_ffff) as u32,
@@ -518,6 +523,13 @@ impl<'a> Scanout<'a> {
             (dst & 0xffff_ffff) as u32,
             (dst >> 32) as u32,
             pixels.len() as u32,
+            pm4_type3(IT_RELEASE_MEM, 6),
+            5 << 8,                 // EOP event
+            (2 << 29) | (2 << 24),  // 64-bit data, interrupt after write
+            (fence & 0xffff_ffff) as u32,
+            (fence >> 32) as u32,
+            0x0000_0001,
+            0,
         ];
         let mut bytes = Vec::with_capacity(words.len() * 4);
         for w in words {
@@ -637,11 +649,9 @@ impl Display {
             out_fence_value: out_v,
             ..Default::default()
         };
-        match unsafe { call(self.fd, iowr(D, 64, std::mem::size_of::<DCommit>()), &mut c) } {
-            Ok(()) => Ok(0),
-            Err(e) if c.out_fault != 0 && e.raw_os_error() == Some(libc::EINVAL) => Ok(c.out_fault),
-            Err(e) => Err(e),
-        }
+        // A referee fault comes back as success with out_fault set.
+        unsafe { call(self.fd, iowr(D, 64, std::mem::size_of::<DCommit>()), &mut c) }?;
+        Ok(c.out_fault)
     }
 
     /// Light the CRTC with `bo` on screen from the first frame.

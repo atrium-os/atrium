@@ -1553,8 +1553,8 @@ display_commit(int dfd, int bo_fd, uint32_t flags)
 	c.in_fence_fd = -1;
 	c.out_fence_fd = -1;
 	if (ioctl(dfd, ATRIUM_DISPLAY_IOC_COMMIT, &c) != 0)
-		return (c.out_fault != 0 ? c.out_fault : 0x100u | (uint32_t)errno);
-	return (0);
+		return (0x100u | (uint32_t)errno);
+	return (c.out_fault);	/* a referee fault is a success with out_fault */
 }
 
 /* Wait (up to ~1 s) until no commit is outstanding. */

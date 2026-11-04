@@ -398,7 +398,7 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 		if (fault != 0) {
 			mtx_unlock(&sc->lock);
 			c->out_fault = fault;
-			err = EINVAL;
+			err = 0;	/* a referee fault: reported in out_fault */
 			goto out;
 		}
 		/*
@@ -427,7 +427,7 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 	if (!sc->display_mode_set) {
 		mtx_unlock(&sc->lock);
 		c->out_fault = ATRIUM_DISPLAY_FAULT_NO_MODE;
-		err = EINVAL;
+		err = 0;
 		goto out;
 	}
 	sc->display_next = fb;
@@ -452,7 +452,7 @@ display_commit(struct atrium_amd_softc *sc, struct atrium_display_commit *c,
 			sc->display_out_so = NULL;
 			mtx_unlock(&sc->lock);
 			c->out_fault = fault;
-			err = EINVAL;
+			err = 0;
 			goto out;
 		}
 	}

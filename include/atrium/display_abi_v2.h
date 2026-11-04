@@ -88,10 +88,15 @@
  * signalled (so nothing waits forever) and STATUS reports the fault in
  * out_last_fault.
  *
- * Errors: EINVAL for a bad struct, flag, format, modifier, bo_offset or fd type
- * (and for a referee fault, with out_fault set); EBADF for a closed fd; EBUSY as
- * above; EAGAIN for a MODESET whose in-fence isn't signalled; ENXIO if the GPU
- * module isn't loaded (no BO can be resolved).
+ * A referee fault (the hardware refused the buffer or the mode) is not an
+ * errno: COMMIT returns 0 with out_fault set and nothing changed on screen.
+ * The kernel copies an ioctl's struct back only when it returns 0, so a fault
+ * reported alongside an errno would never reach the caller.
+ *
+ * Errors: EINVAL for a bad struct, flag, format, modifier, pitch alignment,
+ * bo_offset or fd type; EBADF for a closed fd; EBUSY as above; EAGAIN for a
+ * MODESET whose in-fence isn't signalled; ENXIO if the GPU module isn't
+ * loaded (no BO can be resolved).
  */
 struct atrium_display_commit {
 	uint32_t struct_size;
