@@ -189,11 +189,7 @@ fn paint_one(cv: &mut Canvas, scene: &Scene, fonts: &FontSet, ctx: &mut swash::s
             let im = &scene.images[i];
             let a = &im.area;
             let Some(path) = assets.get(&im.address) else { return };
-            let Ok(file) = std::fs::File::open(path) else { return };
-            let Ok(mut reader) = png::Decoder::new(file).read_info() else { return };
-            let mut buf = vec![0; reader.output_buffer_size()];
-            let Ok(info) = reader.next_frame(&mut buf) else { return };
-            let (iw, ih, ch) = (info.width as i64, info.height as i64, info.color_type.samples());
+            let Some((iw, ih, ch, buf)) = decode_png(path) else { return };
             for py in (a.y / PX)..((a.y + a.h) / PX) {
                 for px in (a.x / PX)..((a.x + a.w) / PX) {
                     let (mut sx, mut sy) = ((px * PX - a.tx) as f64, (py * PX - a.ty) as f64);
@@ -204,14 +200,32 @@ fn paint_one(cv: &mut Canvas, scene: &Scene, fonts: &FontSet, ctx: &mut swash::s
                     if ux < 0 || uy < 0 || ux >= iw || uy >= ih { continue }
                     let o = ((uy * iw + ux) as usize) * ch;
                     if o + ch > buf.len() { continue }
-                    let (r, g, b) = (buf[o] as u32, buf[o + 1.min(ch - 1)] as u32, buf[o + 2.min(ch - 1)] as u32);
-                    let al = if ch == 4 { buf[o + 3] as f32 / 255.0 } else { 1.0 };
+                    // Grey (1-2 samples) repeats its one channel; the alpha
+                    // is the last sample when there is one.
+                    let (r, g, b) = if ch < 3 { (buf[o] as u32, buf[o] as u32, buf[o] as u32) }
+                                    else { (buf[o] as u32, buf[o + 1] as u32, buf[o + 2] as u32) };
+                    let al = if ch == 2 || ch == 4 { buf[o + ch - 1] as f32 / 255.0 } else { 1.0 };
                     cv.blend(px, py, r << 24 | g << 16 | b << 8 | 0xff, al);
                 }
             }
         }
         _ => {}
     }
+}
+
+/// A PNG as 8-bit samples: (width, height, samples per pixel, pixels).
+/// ★ EXPAND, because the raw frame of an indexed or sub-byte image is palette
+/// indices packed below a byte — read as RGB, BBC's one-colour grey
+/// placeholder (1-bit, palette #f6f6f6) painted as a black bar that stopped
+/// where the packed buffer ran out.
+fn decode_png(path: &std::path::Path) -> Option<(i64, i64, usize, Vec<u8>)> {
+    let mut dec = png::Decoder::new(std::fs::File::open(path).ok()?);
+    dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = dec.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let (ct, _) = reader.output_color_type();
+    Some((info.width as i64, info.height as i64, ct.samples(), buf))
 }
 
 /// One box-blur pass, horizontal then vertical, over the alpha channel.
@@ -312,5 +326,56 @@ impl Canvas {
     /// 8-bit RGB, row-major — what a PNG writer or a pixel comparison takes.
     pub fn rgb8(&self) -> Vec<u8> {
         self.px.iter().flat_map(|p| [0, 1, 2].map(|i| (p[i].clamp(0.0, 1.0) * 255.0 + 0.5) as u8)).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A one-image scene over a PNG file, painted at 1:1.
+    fn paint_png(bytes: &[u8], name: &str, w: i64, h: i64) -> Canvas {
+        let dir = std::env::temp_dir().join(format!("nsg-raster-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let mut scene = Scene { width: w * PX, height: h * PX, ..Default::default() };
+        let area = crate::Tiling { x: 0, y: 0, w: w * PX, h: h * PX, tx: 0, ty: 0, tw: w * PX, th: h * PX, repeat: 0 };
+        scene.order.push((5, 0));
+        scene.images.push(crate::Image { area, address: "blake3:test".into(), fit: "fill" });
+        scene.image_attrs.push(scene.cur);
+        let assets = [("blake3:test".to_string(), path)].into_iter().collect();
+        paint(&scene, &FontSet::load().unwrap(), &assets)
+    }
+
+    /// An encoded PNG of `w`×`h` in the given colour type and depth.
+    fn png_bytes(w: u32, h: u32, ct: png::ColorType, depth: png::BitDepth, palette: Option<&[u8]>, data: &[u8]) -> Vec<u8> {
+        let mut out = vec![];
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(ct);
+        enc.set_depth(depth);
+        if let Some(p) = palette { enc.set_palette(p.to_vec()) }
+        enc.write_header().unwrap().write_image_data(data).unwrap();
+        out
+    }
+
+    #[test]
+    fn indexed_one_bit_png_paints_its_palette_colour() {
+        // BBC's grey placeholder: 1-bit, one palette entry #f6f6f6. Read raw
+        // it painted black, and only as far as the packed buffer reached.
+        let (w, h) = (16u32, 8u32);
+        let data = vec![0u8; (w as usize).div_ceil(8) * h as usize];
+        let png = png_bytes(w, h, png::ColorType::Indexed, png::BitDepth::One, Some(&[0xf6, 0xf6, 0xf6]), &data);
+        let cv = paint_png(&png, "indexed.png", w as i64, h as i64);
+        let rgb = cv.rgb8();
+        for p in rgb.chunks(3) { assert_eq!(p, [0xf6, 0xf6, 0xf6]) }
+    }
+
+    #[test]
+    fn grey_alpha_png_reads_alpha_from_its_second_sample() {
+        // Grey 0 at alpha 0 over the white canvas: nothing shows.
+        let png = png_bytes(2, 2, png::ColorType::GrayscaleAlpha, png::BitDepth::Eight, None, &[0, 0, 0, 0, 0, 0, 0, 0]);
+        let cv = paint_png(&png, "ga.png", 2, 2);
+        for p in cv.rgb8().chunks(3) { assert_eq!(p, [255, 255, 255]) }
     }
 }
