@@ -792,6 +792,71 @@ Reader mode is the precedent — browsers already ship "strip the cruft and show
 content", and users like it. This architecture inverts the priority: **reader mode is the
 default and the fast path, and the full engine is the fallback.**
 
+### 8.1 Settled shape: a document with jailed islands
+
+*Settled (user, 2026-11-04). The YouTube prototype that tests it is not built yet.*
+
+The two lanes need not be chosen per page. **The default shape of the compatibility lane
+is an island:** the page is served by the document lane (tiers 1–3, including §5.4.5's
+bindings), and only the region that genuinely needs an engine runs in tier 4, in its own
+origin-scoped jail, composed into the document as a separate surface (§7.6: Limen composes
+jailed surfaces by construction). A whole page goes to tier 4 only when it is a fat client
+throughout (§11.8.3).
+
+**Why islands rather than whole pages:**
+
+- Everything outside the island keeps the document lane's guarantees: no script at view
+  time, our semantic tree, our layout, our scene.
+- The engine's attack surface and memory shrink to the island's code. YouTube's embed
+  player, for example, is a few hundred KB of JS, against the whole single-page app.
+- Navigation stays the document's. Following a link is a document navigation, not
+  something the island's code controls.
+
+**The island boundary is a typed channel, not shared state.** Where the document must
+drive the island, it does so through a narrow, declared message set, and nothing else
+crosses. For a video island the set is play, pause, seek and current time, which is what
+YouTube's own embed API already exposes over postMessage. The channel is part of the
+artifact, so it can be audited. The island never sees the document's DOM, and the
+document never runs the island's code.
+
+**Where islands recur** (from §11.8.3): video players, map widgets, payment fields (the
+processor's tokenisation iframe), embedded editors (Figma), and DRM playback.
+
+**Nesting: a CDM is an island inside an island.** Where DRM applies (§11.8.3: Spotify,
+paid video), the decryption module is the only part that must be a closed binary. Settled
+with the user: it runs in **its own jail under Linux ABI emulation**, inside the media
+island and below it.
+
+- The CDM is installed by the user, never shipped with Atrium (the licence forbids
+  redistribution; this is the route Raspberry Pi OS and Asahi Linux take).
+- The CDM jail has **no network**. Licence challenges and responses travel through the
+  island's engine, which owns the page network under §5.4.1c's rules.
+- The CDM receives only encrypted samples and licence messages, and returns only decrypted
+  frames. At Widevine's software level (L3) the frames come back for composition like any
+  other video. That is also why services cap resolution there, a cost stated rather than
+  hidden.
+- It is the most strongly jailed component in the system, because it is the one we can
+  neither read nor build. Firefox runs its CDM in a dedicated sandbox for the same reason.
+
+**What must be handled, not assumed:**
+
+- *Embedding refused.* Some content forbids embedding (YouTube's per-video setting,
+  age-restricted videos that need a session). The fallback is the whole page in tier 4,
+  and it is visible as such (§8).
+- *Mutating actions around the island* (like, subscribe, comment) are reader-issued request
+  templates (§5.4.5.2) in the document, or go through the island's own session with that
+  origin's partitioned credentials (§7.7). Never both for the same action.
+- *Accessibility.* An island is opaque to the semantic tree until open question 2 is
+  answered. The island's region is labelled as such, so a reader knows what is unreachable.
+- *Lane visibility* (§8) applies per region: an island carries the compatibility lane's
+  indicator, not the whole page.
+
+**First prototype: a YouTube watch page.** The document lane serves the title, description,
+chapters, comments and recommendations. A tier-4 island runs `youtube.com/embed/<id>`, with
+MSE in the engine and royalty-free decoders (dav1d for AV1, libvpx for VP9; OpenH264 for
+H.264, as Firefox does). Chapter links seek through the typed channel. No CDM is involved:
+ordinary YouTube videos are not DRM-encrypted.
+
 ## 9. Honest costs
 
 - A full engine port (Servo → Fresco scene graph, jailed, brokered network) is the largest
