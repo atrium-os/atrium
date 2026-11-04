@@ -1,0 +1,25 @@
+[package]
+name        = "fresco-compute"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Fresco's 2D renderer as two compute kernels (bin + raster) writing the scanout buffer; runs on Tier-2, the GIR interpreter and RDNA4."
+
+[dependencies]
+atrium-spv-loader  = { path = "../atrium-spv-loader" }
+atrium-spv-runtime = { path = "../atrium-spv-runtime" }
+atrium-spv-ir      = { path = "../atrium-spv-ir" }
+# `cranelift`: compile the kernels in-process into the loader's cache, for
+# hosts without atrium-spv-compile (it needs the bespoke backend's pptk).
+atrium-spv-frontend          = { path = "../atrium-spv-frontend", optional = true }
+atrium-spv-backend-cranelift = { path = "../atrium-spv-backend-cranelift", optional = true }
+
+[features]
+cranelift = ["dep:atrium-spv-frontend", "dep:atrium-spv-backend-cranelift"]
+
+[dev-dependencies]
+atrium-spv-frontend = { path = "../atrium-spv-frontend" }
+fresco-compute = { path = ".", features = ["cranelift"] }
+atrium-gir          = { path = "../atrium-gir" }
+tempfile = "3"

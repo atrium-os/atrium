@@ -70,6 +70,7 @@ fn main() -> std::io::Result<()> {
             g: 0.5 + 0.5 * (t * 4.0).sin(),
             b: 0.5 + 0.5 * (t * 5.0).sin(),
             a: 1.0,
+            radius: 0.0,
         })?;
         conn.scene_frame_end()?;
 

@@ -32,6 +32,7 @@ mod input_reader;
 mod laminar;
 mod pointer_reader;
 mod redraw;
+mod render_backend;
 mod socket_server;
 
 use atrium_gpu::amd::{Display, Gpu, Scanout, COMMIT_MODESET};
@@ -47,6 +48,7 @@ use fresco_vulkan::{
     HeadlessRenderer, PathNode, SceneNode, TextureBatch, TextureNode,
 };
 
+use render_backend::{Backend, FrameInput};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -104,17 +106,10 @@ fn main() -> std::io::Result<()> {
      * uploaded into the VRAM scanout via scan.update (DMA copy). */
     let mut framebuffer = vec![0u8; bytes as usize];
 
-    /* ── Vulkan renderer ─────────────────────────────────────────── */
-    let mut renderer = HeadlessRenderer::new(mode.width, mode.height)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other,
-            format!("HeadlessRenderer::new: {e}")))?;
-    for bp in bundle_paths()? {
-        renderer.load_bundle(&bp)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other,
-                format!("load_bundle({}): {e}", bp.display())))?;
-        eprintln!("frescod: bundle loaded {}", bp.display());
-    }
-    eprintln!("frescod: total ops registered: {}", renderer.op_count());
+    /* ── Renderer (FRESCOD_RENDERER: vulkan | compute) ───────────── */
+    let mut renderer = Backend::from_env(mode.width, mode.height, load_bundles)
+        .map_err(io_other)?;
+    eprintln!("frescod: renderer {}", renderer.name());
 
     /* ── Shared scene-server state ───────────────────────────────── */
     let cas   = Arc::new(Mutex::new(CasStore::new()));
@@ -274,13 +269,8 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     const W: u32 = 1280;
     const H: u32 = 720;
 
-    let mut renderer = HeadlessRenderer::new(W, H)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other,
-            format!("HeadlessRenderer::new: {e}")))?;
-    for bp in bundle_paths()? {
-        renderer.load_bundle(&bp).map_err(io_other)?;
-        eprintln!("frescod-headless: bundle {}", bp.display());
-    }
+    let mut renderer = Backend::from_env(W, H, load_bundles).map_err(io_other)?;
+    eprintln!("frescod-headless: renderer {}", renderer.name());
 
     let cas   = Arc::new(Mutex::new(CasStore::new()));
     let scene = Arc::new(Mutex::new(SceneGraph::new()));
@@ -350,7 +340,8 @@ fn run_headless(png: &str) -> std::io::Result<()> {
         last_gen = redraw2.current();
         let t_render = Instant::now();
         render_one_frame(&mut renderer, &frontend, &comp, W, H).map_err(io_other)?;
-        let mut rgba = renderer.read_pixels_vec().map_err(io_other)?;
+        let mut rgba = vec![0u8; (W * H * 4) as usize];
+        renderer.read_pixels(&mut rgba).map_err(io_other)?;
         for px in rgba.chunks_exact_mut(4) { px.swap(0, 2); } // BGRA → RGBA
         if let Some(img) = image::RgbaImage::from_raw(W, H, rgba) {
             let tmp = format!("{out}.new");
@@ -365,9 +356,9 @@ fn run_headless(png: &str) -> std::io::Result<()> {
 
 /// Snapshot the current per-window scene states, merge into a single
 /// rect/texture set with per-window position offsets applied, then
-/// drive one `HeadlessRenderer::render_to_buffer()` cycle.
+/// render one frame with the selected backend.
 fn render_one_frame(
-    renderer: &mut HeadlessRenderer,
+    renderer: &mut Backend,
     frontend: &Arc<Mutex<EnvelopeFrontend>>,
     comp:     &Arc<Mutex<Compositor>>,
     _screen_w: u32, _screen_h: u32,
@@ -472,12 +463,7 @@ fn render_one_frame(
         let mut fe = frontend.lock().unwrap();
         fe.take_pending_uploads()
     };
-    renderer.process_uploads(uploads, clears)?;
-    renderer.set_rect_nodes(rects);
-    renderer.set_path_nodes(paths);
-    renderer.set_texture_batches(batches);
-    renderer.set_glyph_run_batches(glyph_batches);
-    renderer.render_to_buffer()?;
+    renderer.render(FrameInput { rects, paths, batches, glyph_batches, uploads, clears })?;
     Ok(())
 }
 
@@ -508,7 +494,7 @@ fn translate_path(p: &PathParams, ox: f32, oy: f32) -> PathNode {
 /// HeadlessRenderer's color attachment — so this is a straight read. The
 /// buffer is then DMA-copied into the VRAM scanout BO by `Scanout::update`.
 fn fill_framebuffer(
-    renderer: &HeadlessRenderer,
+    renderer: &Backend,
     dst:      &mut [u8],
 ) -> Result<(), Box<dyn std::error::Error>> {
     renderer.read_pixels(dst)?;
@@ -568,6 +554,16 @@ fn bundle_paths() -> std::io::Result<Vec<PathBuf>> {
         }
     }
     Ok(out)
+}
+
+/// Load the op bundles into the Vulkan renderer.
+fn load_bundles(r: &mut HeadlessRenderer) -> Result<(), Box<dyn std::error::Error>> {
+    for bp in bundle_paths()? {
+        r.load_bundle(&bp).map_err(|e| format!("load_bundle({}): {e}", bp.display()))?;
+        eprintln!("frescod: bundle loaded {}", bp.display());
+    }
+    eprintln!("frescod: total ops registered: {}", r.op_count());
+    Ok(())
 }
 
 fn io_other<E: std::fmt::Display>(e: E) -> std::io::Error {

@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         c as char
     }).collect();
     let font = std::fs::read(FONT_PATH)?;
-    let atlas = shape_and_rasterize(&font, &template, SIZE_PX)?;
+    let atlas = shape_and_rasterize(&font, &template, SIZE_PX, 400.0)?;
     eprintln!(
         "atrium-glyph-stress: shaped {} glyphs / atlas {}×{} / advance {:.1}px",
         atlas.glyphs.len(), atlas.width, atlas.height, atlas.advance,

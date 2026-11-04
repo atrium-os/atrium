@@ -1,0 +1,137 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// raster: one invocation per pixel. Walks the ops binned to the pixel's tile
+// in draw order, evaluates each op's coverage and colour the way the Fresco
+// fragment shaders do, blends src-over in linear RGB, then writes the pixel
+// sRGB-encoded as BGRA8 (alpha 255) straight into the scanout buffer.
+#include "common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Per texture: first word in `texels`, width, height, format (0 RGBA8 sRGB,
+// 1 R8 unorm, four texels per word).
+layout(std430, set = 0, binding = 2) readonly buffer TexB { uint texw[]; };
+layout(std430, set = 0, binding = 3) readonly buffer TexelB { uint texels[]; };
+layout(std430, set = 0, binding = 4) readonly buffer MaskB { uint mask[]; };
+layout(std430, set = 0, binding = 5) writeonly buffer TargetB { uint target[]; };
+// srgb_to_linear[256], then encode thresholds: byte b+1 starts at lut[ENC + b].
+layout(std430, set = 0, binding = 6) readonly buffer LutB { float lut[]; };
+#define ENC 256u
+
+vec4 texel(uvec4 t, int x, int y) {
+    x = clamp(x, 0, int(t.y) - 1);
+    y = clamp(y, 0, int(t.z) - 1);
+    uint idx = uint(y) * t.y + uint(x);
+    if (t.w == 0u) {
+        uint w = texels[t.x + idx];
+        return vec4(lut[w & 255u], lut[(w >> 8) & 255u], lut[(w >> 16) & 255u],
+                    float(w >> 24) / 255.0);
+    }
+    uint w = texels[t.x + idx / 4u];
+    float v = float((w >> (8u * (idx % 4u))) & 255u) / 255.0;
+    return vec4(v, 0.0, 0.0, 1.0);
+}
+
+// Bilinear, clamp to edge, uv in [0, 1].
+vec4 sample_bilinear(uint ti, vec2 uv) {
+    uvec4 t = uvec4(texw[ti * 4u], texw[ti * 4u + 1u], texw[ti * 4u + 2u], texw[ti * 4u + 3u]);
+    vec2 tc = uv * vec2(float(t.y), float(t.z)) - 0.5;
+    vec2 fl = floor(tc);
+    vec2 f = tc - fl;
+    int x = int(fl.x);
+    int y = int(fl.y);
+    vec4 a = mix(texel(t, x, y), texel(t, x + 1, y), f.x);
+    vec4 b = mix(texel(t, x, y + 1), texel(t, x + 1, y + 1), f.x);
+    return mix(a, b, f.y);
+}
+
+bool inside(vec4 r, vec2 pc) {
+    return pc.x >= r.x && pc.x < r.x + r.z && pc.y >= r.y && pc.y < r.y + r.w;
+}
+
+vec4 shade(uint oi, vec2 pc) {
+    uint base = oi * OP_VEC4S;
+    vec4 p0 = opv[base];
+    vec4 p1 = opv[base + 1u];
+    vec4 p2 = opv[base + 2u];
+    uvec4 meta = floatBitsToUint(opv[base + 4u]);
+    uint kind = meta.x;
+    if (kind == KIND_PATH) {
+        vec2 v = pc - p0.xy;
+        float lx = p2.x * v.x + p2.y * v.y;
+        float ly = p2.x * v.y - p2.y * v.x;
+        float hl = p0.z * 0.5;
+        float hw = p0.w * 0.5;
+        if (lx >= -hl && lx < hl && ly >= -hw && ly < hw) {
+            return p1;
+        }
+        return vec4(0.0);
+    }
+    if (!inside(p0, pc)) {
+        return vec4(0.0);
+    }
+    if (kind == KIND_RECT) {
+        float radius = p2.x;
+        if (radius <= 0.0) {
+            return p1;
+        }
+        vec2 half_ext = p0.zw * 0.5;
+        float r = min(radius, min(half_ext.x, half_ext.y));
+        vec2 p = (pc - p0.xy) - half_ext;
+        vec2 q = abs(p) - half_ext + r;
+        vec2 qp = max(q, vec2(0.0));
+        float lq = length(qp);
+        float d = min(max(q.x, q.y), 0.0) + lq - r;
+        // fwidth(d): the SDF's gradient is a unit vector, so |dx| + |dy| is
+        // 1 along the straight edges and |nx| + |ny| around a corner.
+        float aa = 1.0;
+        if (q.x > 0.0 && q.y > 0.0) {
+            aa = (q.x + q.y) / lq;
+        }
+        float alpha = clamp(0.5 - d / aa, 0.0, 1.0);
+        return vec4(p1.rgb, p1.a * alpha);
+    }
+    vec2 t = (pc - p0.xy) / p0.zw;
+    if (kind == KIND_TEXTURE) {
+        return sample_bilinear(meta.y, t);
+    }
+    // KIND_GLYPH
+    vec2 uv = mix(p2.xy, p2.zw, t);
+    float cov = sample_bilinear(meta.y, uv).r;
+    return vec4(p1.rgb, p1.a * cov);
+}
+
+uint encode(float v) {
+    uint lo = 0u;
+    for (uint step = 128u; step > 0u; step = step / 2u) {
+        if (lo + step <= 255u && v >= lut[ENC + lo + step - 1u]) {
+            lo = lo + step;
+        }
+    }
+    return lo;
+}
+
+void main() {
+    uvec3 gid = gl_GlobalInvocationID; // whole-vector load: GIR takes no access chain into a builtin
+    uint x = gid.x;
+    uint y = gid.y;
+    if (x >= F.width || y >= F.height) {
+        return;
+    }
+    vec2 pc = vec2(float(x), float(y)) + 0.5;
+    uint tile = (y / TILE) * F.tiles_x + (x / TILE);
+    vec3 dst = F.clear.rgb;
+    for (uint w = 0u; w < F.wpt; w++) {
+        uint bits = mask[tile * F.wpt + w];
+        while (bits != 0u) {
+            int i = findLSB(bits);
+            bits = bits & (bits - 1u);
+            vec4 src = shade(w * 32u + uint(i), pc);
+            dst = src.rgb * src.a + dst * (1.0 - src.a);
+        }
+    }
+    uint r = encode(dst.r);
+    uint g = encode(dst.g);
+    uint b = encode(dst.b);
+    target[y * F.pitch + x] = b | (g << 8) | (r << 16) | (255u << 24);
+}

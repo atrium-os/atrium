@@ -87,7 +87,10 @@ boot() {
         # ★ Not -cpu max under TCG: the kernel panics at boot in ZFS's
         # zfs_sha256_transform_avx2 (trap 0xc) — QEMU 8.2's TCG AVX2/XSAVE
         # emulation isn't good enough. Nehalem (SSE4.2, no AVX) boots.
-        else ACCEL="-accel tcg,thread=multi -cpu Nehalem"; fi
+        # TCG_CPU overrides it: Tier-2's x86 code is x86-64-v3 (AVX2, FMA),
+        # so running it in the guest needs e.g. TCG_CPU=Haswell-noTSX with a
+        # newer QEMU (the atrium-os/qemu fork via QEMU_BIN).
+        else ACCEL="-accel tcg,thread=multi -cpu ${TCG_CPU:-Nehalem}"; fi
         MACH="-machine q35 $ACCEL"
     else
         MACH="-machine virt,gic-version=3 -accel tcg,thread=multi -cpu max,pauth-impdef=on"

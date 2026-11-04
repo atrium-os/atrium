@@ -1,0 +1,37 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// bin: one invocation per op. Sets the op's bit in the mask of every 16x16
+// tile its bounding box touches. The bit index is the op index, so a tile's
+// mask lists its ops in draw order with no sorting.
+#include "common.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 4) buffer MaskB { uint mask[]; };
+
+void main() {
+    uvec3 gid = gl_GlobalInvocationID; // whole-vector load: GIR takes no access chain into a builtin
+    uint i = gid.x;
+    if (i >= F.op_count) {
+        return;
+    }
+    vec4 b = opv[i * OP_VEC4S + 3u];
+    int x0 = max(int(b.x), 0);
+    int y0 = max(int(b.y), 0);
+    int x1 = min(int(b.z), int(F.width));
+    int y1 = min(int(b.w), int(F.height));
+    if (x1 <= x0 || y1 <= y0) {
+        return;
+    }
+    uint tx0 = uint(x0) / TILE;
+    uint ty0 = uint(y0) / TILE;
+    uint tx1 = uint(x1 - 1) / TILE;
+    uint ty1 = uint(y1 - 1) / TILE;
+    uint word = i / 32u;
+    uint bit = 1u << (i % 32u);
+    for (uint ty = ty0; ty <= ty1; ty++) {
+        for (uint tx = tx0; tx <= tx1; tx++) {
+            atomicOr(mask[(ty * F.tiles_x + tx) * F.wpt + word], bit);
+        }
+    }
+}

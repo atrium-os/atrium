@@ -62,6 +62,7 @@ fn main() -> std::io::Result<()> {
             conn.scene_node_rect(i, RectParams {
                 x, y, w: RECT_W, h: RECT_H,
                 r, g, b, a: 0.8,
+                radius: 0.0,
             })?;
         }
         conn.scene_frame_end()?;

@@ -33,6 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         /*x=*/ 80.0, /*y=*/ 400.0,
         /*color=*/ [1.0, 1.0, 1.0, 1.0],
         text,
+        /*weight=*/ 400,
     )?;
     conn.scene_frame_end()?;
     eprintln!("installed text run '{text}'");

@@ -24,7 +24,7 @@ const RUN_NODE:   u32 = 200;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let font = std::fs::read(FONT_PATH)?;
-    let atlas = shape_and_rasterize(&font, TEXT, SIZE_PX)?;
+    let atlas = shape_and_rasterize(&font, TEXT, SIZE_PX, 400.0)?;
     if std::env::var("DUMP_ATLAS").is_ok() {
         use std::io::Write;
         let r8 = atlas.r8_pixels();

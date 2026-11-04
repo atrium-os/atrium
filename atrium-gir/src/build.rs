@@ -452,6 +452,9 @@ impl<'a> Builder<'a> {
                     _ => (CmpOp::FULe, true),
                 };
                 let (a, b) = (self.val(a)?, self.val(b)?);
+                // The frontend lowers LogicalNot(b) to IEqual(b, 0): compare
+                // a bool operand as its 0/1 integer.
+                let (a, b) = (self.as_data(r, a), self.as_data(r, b));
                 let t = rt()?;
                 if t.scalar() == Scalar::Bool {
                     Val::V(self.map_n(r, t, &[a, b], &cmp(o, swap)))

@@ -68,19 +68,19 @@ fn main() -> std::io::Result<()> {
         // Four static corner rects (large, never change). Nodes 1..4.
         // These pin a big chunk of pixels as stable, so any change is
         // forced to be the cursor only.
-        conn.scene_node_rect(1, RectParams {
+        conn.scene_node_rect(1, RectParams { radius: 0.0,
             x:   0.0, y:   0.0, w: 200.0, h: 150.0,
             r: 0.20, g: 0.20, b: 0.40, a: 1.0,
         })?;
-        conn.scene_node_rect(2, RectParams {
+        conn.scene_node_rect(2, RectParams { radius: 0.0,
             x: 600.0, y:   0.0, w: 200.0, h: 150.0,
             r: 0.40, g: 0.20, b: 0.20, a: 1.0,
         })?;
-        conn.scene_node_rect(3, RectParams {
+        conn.scene_node_rect(3, RectParams { radius: 0.0,
             x:   0.0, y: 450.0, w: 200.0, h: 150.0,
             r: 0.20, g: 0.40, b: 0.20, a: 1.0,
         })?;
-        conn.scene_node_rect(4, RectParams {
+        conn.scene_node_rect(4, RectParams { radius: 0.0,
             x: 600.0, y: 450.0, w: 200.0, h: 150.0,
             r: 0.40, g: 0.40, b: 0.20, a: 1.0,
         })?;
@@ -91,7 +91,7 @@ fn main() -> std::io::Result<()> {
         let span_y = (WIN_H as f32) - CURSOR;
         let cx = (((t * 0.6).sin() * 0.5 + 0.5) * span_x).round();
         let cy = (((t * 0.43).cos() * 0.5 + 0.5) * span_y).round();
-        conn.scene_node_rect(0, RectParams {
+        conn.scene_node_rect(0, RectParams { radius: 0.0,
             x: cx, y: cy, w: CURSOR, h: CURSOR,
             r: 1.0, g: 1.0, b: 1.0, a: 1.0,
         })?;

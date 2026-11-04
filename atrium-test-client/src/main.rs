@@ -25,6 +25,7 @@ fn main() -> std::io::Result<()> {
         x: 200.0, y: 200.0,
         w: 400.0, h: 300.0,
         r: 1.0, g: 0.2, b: 0.6, a: 1.0,
+        radius: 0.0,
     })?;
     conn.scene_node_path(/*node_id=*/ 1, PathParams {
         cx: 400.0, cy: 150.0,
