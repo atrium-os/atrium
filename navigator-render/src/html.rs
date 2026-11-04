@@ -1769,7 +1769,12 @@ impl<'a> Cx<'a> {
     /// Grid layout (profile §3.5; CSS Grid without named lines, `subgrid` or
     /// dense packing — the profile excludes all three). Lays the items out in
     /// the container's content box at (x, y), `w` wide; returns the height.
-    fn grid(&mut self, h: Handle, s: &Style, x: U, y: U, w: U, cb_h: Option<U>) -> U {
+    /// A grid's items placed in its tracks, and each column's intrinsic
+    /// contributions — what layout sizes the columns from, and what
+    /// `intrinsic` sums to measure the grid itself. Percentages resolve
+    /// against `w` (0 when measuring). Out-of-flow children are returned,
+    /// not placed.
+    fn grid_plan(&mut self, h: Handle, s: &Style, w: U) -> GridPlan {
         use navigator_style::values::{GridLine, Track};
         let tracks_of = |v: &V| -> Vec<Track> { match v { V::Tracks(t) => t.clone(), _ => vec![] } };
         let cols_tpl = tracks_of(s.get("grid-template-columns"));
@@ -1777,15 +1782,11 @@ impl<'a> Cx<'a> {
         let auto_col = match s.get("grid-auto-columns") { V::Track(t) => t.clone(), _ => Track::Auto };
         let auto_row = match s.get("grid-auto-rows") { V::Track(t) => t.clone(), _ => Track::Auto };
         let flow_row = kw(s, "grid-auto-flow") != "column";
-        // ★ In an rtl grid column line 1 is on the RIGHT (CSS Grid §7.1: the
-        // column axis is the inline axis), and an item's start is its right.
-        let rtl = kw(s, "direction") == "rtl";
         let cgap = len(s.get("column-gap"), w).unwrap_or(0);
-        let rgap = len(s.get("row-gap"), cb_h.unwrap_or(0)).unwrap_or(0);
 
-        struct GItem { h: Handle, col: (usize, usize), row: (usize, usize), justify: String, align: String }
         let line = |v: &V| -> GridLine { match v { V::Line(l) => *l, _ => GridLine::Auto } };
         let mut raw = vec![];
+        let mut abs = vec![];
         for c in self.dom.children_of(h) {
             match self.dom.get(c).map(|n| &n.kind) {
                 // ★ CSS wraps a run of loose text in an ANONYMOUS item: no
@@ -1801,8 +1802,8 @@ impl<'a> Cx<'a> {
             }
             let Some(cs) = self.st(c) else { continue };
             if kw(cs, "display") == "none" { continue }
-            // Out of flow: not an item, placed against its containing block.
-            if matches!(kw(cs, "position"), "absolute" | "fixed") { self.abs_box(c, x, x + w, y); continue }
+            // Out of flow: not an item; `grid` places it.
+            if matches!(kw(cs, "position"), "absolute" | "fixed") { abs.push(c); continue }
             let pick = |own: &str, parent: &str| -> String {
                 match kw(cs, own) { "auto" | "" => match kw(s, parent) { "" => "stretch", a => a }, a => a }.to_string()
             };
@@ -1949,6 +1950,18 @@ impl<'a> Cx<'a> {
             cmax[it.col.0] = cmax[it.col.0].max(b);
             cauto[it.col.0] = cauto[it.col.0].max(m);
         }
+        GridPlan { items, abs, coltracks, rowtracks, cmin, cmax, cauto, cgap }
+    }
+
+    fn grid(&mut self, h: Handle, s: &Style, x: U, y: U, w: U, cb_h: Option<U>) -> U {
+        use navigator_style::values::Track;
+        // ★ In an rtl grid column line 1 is on the RIGHT (CSS Grid §7.1: the
+        // column axis is the inline axis), and an item's start is its right.
+        let rtl = kw(s, "direction") == "rtl";
+        let rgap = len(s.get("row-gap"), cb_h.unwrap_or(0)).unwrap_or(0);
+        let GridPlan { items, abs, coltracks, rowtracks, cmin, cmax, cauto, cgap } = self.grid_plan(h, s, w);
+        // Out of flow: not items, placed against their containing block.
+        for c in abs { self.abs_box(c, x, x + w, y) }
         let cols = size_tracks(&coltracks, Some(w), cgap, &cmin, &cmax, &cauto);
         // Row sizes: content heights measured at the item's column width.
         let mut rmin = vec![0 as U; rowtracks.len()];
@@ -2331,6 +2344,21 @@ impl<'a> Cx<'a> {
             self.unimplemented = counts;
             self.pending_abs.truncate(pend);
             return (mn_out, (smx + total_gap).max(mn_out));
+        }
+        // ★ A GRID container is as wide as its COLUMNS, each sized under the
+        // min- or max-content constraint, plus the gaps (CSS Grid §12).
+        // Measured like a block — as its widest item — rustdoc's toolbar,
+        // four auto columns in a `minmax(0, max-content)` track, was one
+        // button wide and its labels broke between letters.
+        if !anon && kw(s, "display") == "grid" {
+            let p = self.grid_plan(h, s, 0);
+            let gaps = p.cgap * (p.coltracks.len() as U).saturating_sub(1);
+            let mn = size_tracks(&p.coltracks, None, p.cgap, &p.cmin, &p.cmin, &p.cmin).iter().sum::<U>() + gaps;
+            let mx = size_tracks(&p.coltracks, None, p.cgap, &p.cmin, &p.cmax, &p.cmin).iter().sum::<U>() + gaps;
+            self.links.truncate(links);
+            self.unimplemented = counts;
+            self.pending_abs.truncate(pend);
+            return (mn, mx.max(mn));
         }
         for c in if anon { vec![] } else { self.dom.children_of(h) } {
             if self.is_block_level(c) {
@@ -4431,6 +4459,31 @@ mod tests {
         assert_eq!(boxes(&o, 0x00ff00ff), vec![(100, 10, 200, 10)]);
     }
 
+    /// ★ A grid container's intrinsic width is its COLUMNS' — sized under
+    /// the content constraint, plus the gaps — not its widest item's: a
+    /// toolbar grid in a `minmax(0, max-content)` column (rustdoc's), and
+    /// one in a `min-content` box and in a flex item. Headless Chrome's
+    /// numbers.
+    #[test]
+    fn a_grid_container_is_as_wide_as_its_columns() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-right: 0px; margin-top: 0px }
+            .o { display: grid; width: 540px; grid-template-columns: minmax(105px, 1fr) minmax(0, max-content) }
+            .t { display: grid; column-gap: 10px } .x { height: 10px }
+            .b { width: 80px; height: 10px; background-color: #ff0000 }
+            .c1 { grid-column-start: 1 } .c2 { grid-column-start: 2 } .c3 { grid-column-start: 3 }</style>
+            <div class="o"><div class="x"></div><div class="t"><div class="b c1"></div><div class="b c2"></div><div class="b c3"></div></div></div>"#);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        assert_eq!(boxes(&o, 0xff0000ff).iter().map(|b| b.0).collect::<Vec<_>>(), vec![280, 370, 460], "a max-content column");
+        for wrap in [r#"<div class="m">"#, r#"<div class="f"><div>"#] {
+            let o = render(&format!(r#"<style>body {{ margin-left: 0px; margin-top: 0px }} .m {{ width: min-content }} .f {{ display: flex }}
+                .t {{ display: grid; column-gap: 10px; grid-template-columns: auto auto; background-color: #0000ff; height: 10px }}
+                .b {{ width: 80px; height: 10px }}</style>
+                {wrap}<div class="t"><div class="b"></div><div class="b"></div></div></div></div>"#));
+            assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+            assert_eq!(boxes(&o, 0x0000ffff)[0].2, 170, "{wrap}");
+        }
+    }
+
     /// ★ An `auto` minimum takes the item's MINIMUM contribution (Grid
     /// §12.5, §6.6): `min-width: 0` or a scroll container contributes
     /// nothing, a length contributes itself, and only an `auto` min-width
@@ -4762,6 +4815,12 @@ fn uax14_break_between(a: &str, b: &str) -> bool {
 fn is_rtl(c: char) -> bool {
     matches!(unicode_bidi::bidi_class(c), unicode_bidi::BidiClass::R | unicode_bidi::BidiClass::AL)
 }
+
+struct GItem { h: Handle, col: (usize, usize), row: (usize, usize), justify: String, align: String }
+
+/// What `grid_plan` works out before any track is sized.
+struct GridPlan { items: Vec<GItem>, abs: Vec<Handle>, coltracks: Vec<navigator_style::values::Track>,
+                  rowtracks: Vec<navigator_style::values::Track>, cmin: Vec<U>, cmax: Vec<U>, cauto: Vec<U>, cgap: U }
 
 /// `mins`/`maxs` are the tracks' min- and max-content contributions, `autos`
 /// the minimum contributions an `auto` minimum takes (§12.5).
