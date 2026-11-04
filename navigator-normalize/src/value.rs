@@ -56,6 +56,12 @@ pub fn repair(prop: &str, value: &str) -> Option<String> {
         "justify-content" => match lv.as_str() { "start" | "normal" => "flex-start", "end" => "flex-end", _ => return None }.to_string(),
         // `first baseline` is `baseline` spelled out (Box Alignment §4.2).
         "align-items" | "align-self" => match lv.split_whitespace().collect::<Vec<_>>()[..] { ["first", "baseline"] => "baseline", _ => return None }.to_string(),
+        // `align-content`'s `normal` is `stretch` in a flex or grid container,
+        // and `start` / `end` are the flex ones while no `wrap-reverse` swaps
+        // the cross axis — which the profile excludes (§3.4).
+        "align-content" => match lv.split_whitespace().collect::<Vec<_>>()[..] {
+            ["first", "baseline"] => "baseline", ["normal"] => "stretch", ["start"] => "flex-start", ["end"] => "flex-end", _ => return None,
+        }.to_string(),
         "font-weight" => match lv.as_str() {
             "normal" => "400".into(), "bold" => "700".into(),
             "lighter" => "400".into(), "bolder" => "700".into(),

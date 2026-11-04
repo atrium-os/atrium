@@ -1391,3 +1391,17 @@ fn an_image_in_a_grid_keeps_its_size_as_in_css() {
     assert!(report.dropped.keys().any(|k| k.contains("compiled to `start`")), "{:?}", report.dropped);
     assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
 }
+
+/// `align-content: normal` is `stretch` in a flex container (Box Alignment
+/// §5.4), and `start` / `end` are `flex-start` / `flex-end` there while no
+/// `wrap-reverse` swaps the cross axis — which the profile excludes.
+#[test]
+fn align_content_keywords_resolve_to_the_flex_ones() {
+    let src = r#"<html><head><style>
+      div { display: flex; flex-wrap: wrap; height: 100px } #n { align-content: normal } #s { align-content: start } #e { align-content: end }
+    </style></head><body><div id="n">a</div><div id="s">b</div><div id="e">c</div></body></html>"#;
+    let (out, _) = normalize(src, &Inputs::default());
+    let ac = |id: &str| base_props(&out, id).get("align-content").cloned().unwrap_or_default();
+    assert_eq!([ac("n"), ac("s"), ac("e")], ["stretch", "flex-start", "flex-end"], "{out}");
+    assert!(refusals(&out).is_empty());
+}

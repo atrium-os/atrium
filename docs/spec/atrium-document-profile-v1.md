@@ -246,6 +246,12 @@ is admitted at all.
 | `flex-grow` `flex-shrink` | `<number>` (non-negative) | `0` / `1` | no |
 | `flex-basis` | `<length>` \| `<percentage>` \| `auto` \| `content` | `auto` | no |
 
+`align-content: normal` is `stretch` and its `start` / `end` are `flex-start` / `flex-end`
+(no `wrap-reverse` can swap the cross axis), so the normalizer writes them so. `center` and
+`flex-end` are unsafe, as in CSS: lines taller than the container overflow it on both
+sides, or on the start side. The distributed values (`space-between`, `-around`,
+`-evenly`) are not admitted for `align-content`.
+
 **Excluded: `order`, `row-reverse`, `column-reverse`, `wrap-reverse`** — all four decouple
 visual order from reading order. `order` is the well-known case; the `*-reverse` values do
 the same thing by another route, and admitting them while excluding `order` would be
