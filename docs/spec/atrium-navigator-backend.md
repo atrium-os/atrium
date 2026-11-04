@@ -580,6 +580,74 @@ jail configuration (`/etc`, `/usr`, `/var`, `/home` absent; writes land in tmpfs
 the app tree untouched) — not by probing from the Navigator's own worker, which speaks only
 the frame protocol and cannot be asked what it sees.
 
+### 4.7d The converter in a jail (threat model §2.2, built 2026-11-05)
+
+The process that runs page JavaScript is now a one-shot jail entry, the same way the
+document worker is (§4.7a). It is `org.atrium.navigator.converter`: a signed manifest
+with **no capabilities**, its entry being `prerender` with no arguments. The batch driver
+runs `PRERENDER_LAUNCHER="portcullis exec --daemon --instance conv{instance}
+org.atrium.navigator.converter"` once per document.
+
+**The protocol** (`navigator-prerender/src/serve.rs`). The child holds no filesystem and
+no network, and reads no arguments or environment. So:
+- stdin carries a strict header, `atrium-prerender/1` followed by tab-separated
+  `key=value` fields; unknown keys are refused. The document bytes follow it.
+- stdout carries `F <url>` fetch requests, the report lines `--one` always printed,
+  `BLOB <blake3:hex> <n>` and `RECORDING <n>` frames, `TIMEOUT` and `END`.
+
+**Why the fetcher is relayed rather than inherited.** `--daemon` hands the jail exactly
+three descriptors over `SCM_RIGHTS` (portcullis.md §6.5.2a), so a fourth one, to fetchd,
+does not survive the trip. Instead the unconfined driver starts the conversion's own
+jailed fetchd (`PRERENDER_FETCHD`, one per conversion, so its §2.1 pins are that
+conversion's alone). It forwards each `F` line to fetchd and each reply frame back,
+verbatim, through the same bounded reader `FetchdFetcher` always used. The driver holds
+nothing it did not hold before; the converter now holds nothing at all.
+
+**What the driver does not believe.**
+- Every stated length is bounded before allocation: blob ≤ 8 MiB, recording ≤ 128 MiB,
+  report ≤ 8 MiB, line ≤ 16 KiB.
+- A blob whose bytes do not hash to its claimed address fails the conversion. Storing it
+  would let a compromised converter poison CAS under a name readers trust.
+- A stdout line that is not one of the protocol's own is refused. That is what catches
+  launcher chatter (§4.7a, bug 1), and a test with a chatty fake launcher proves it.
+
+**The §4.7a gotchas, handled.**
+- **Shutdown.** The child runs its own watchdog at the deadline, so a jailed child exits
+  by itself and its launcher tears the jail down. The driver's backstop at deadline +
+  10 s closes stdin first, then kills after another 10 s.
+- **stderr** is drained on its own thread.
+
+**Require-confinement.** `PRERENDER_REQUIRE_CONFINEMENT=1` refuses three things: running
+without a launcher, running networked without fetchd, and a child that the kernel does
+not report as jailed. The child checks `security.jail.jailed` itself, so a launcher that
+ran it bare is caught. A test with the bare binary as its "launcher" proves the child
+refuses. Unconfined runs print `confinement: none — UNCONFINED, for testing`.
+
+**The curl measurement path** (`HttpFetcher`) now runs in the unconfined driver, for
+unconfined runs only. It does not apply §2.1's address rules, by design (see its
+comment), and the require switch rules it out.
+
+**Measured on macOS, unconfined, serve mode against the old in-child path.**
+
+| | documents | recordings identical | blobs identical |
+|---|---|---|---|
+| batch 2, offline, exploration on | 51 (50 recorded) | **50/50** | — (no network) |
+| batch 2 subset, live network, exploration on | 8 | **8/8** | **393/393** |
+
+The first networked run differed on one Trello image: the new relay cache was cold and
+one fetch failed transiently. The URL fetched fine afterwards, and a rerun was
+identical.
+
+**FreeBSD: pending.** `scripts/navigator-converter-jail-e2e.sh` covers:
+- the fetchd gate with the §2.1 rows, both unjailed and inside its jail;
+- the require switch;
+- interleaved unconfined (A) and jailed (B) rounds over batch 2, compared byte for byte
+  (recordings, blobs, reports);
+- a networked subset with both the converter and fetchd jailed;
+- leak assertions.
+
+Its numbers belong here once it has run.
+
 ### 4.7b Fuzzing the hostile-input boundary
 
 §7 requires the validator to be "small, total, and fuzzed with reached-coverage reported".

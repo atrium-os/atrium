@@ -1208,6 +1208,7 @@ dependencies = [
  "fixed_decimal",
  "icu_experimental",
  "icu_locale_core",
+ "libc",
  "navigator-dom",
  "url",
 ]

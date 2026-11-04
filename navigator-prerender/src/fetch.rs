@@ -43,6 +43,21 @@ impl Fetcher for MapFetcher {
 /// Cached by content address so a re-run costs nothing and third-party servers
 /// are hit once — the same amortisation the real conversion pipeline gets from
 /// Tessera, and simple politeness besides.
+///
+/// ★★ THE MEASUREMENT INSTRUMENT, NOT A CONVERSION PATH. This fetcher does
+/// NOT apply the threat model's §2.1 address rule — curl will connect to
+/// 127.0.0.1 or 192.168.1.1 if a page names it, and follows redirects with
+/// `-L` to wherever they lead. It is not patched to, on purpose:
+/// - curl has no "refuse private addresses" option, and the only way to bolt
+///   one on (resolve here, `--resolve` to pin, follow redirects by hand) is a
+///   second fetch implementation of the rule, the kind that drifts from the
+///   real one. The rule has ONE home: `navigator_fetch::Conversation`.
+/// - It cannot run in a real conversion. A confined converter
+///   (`PRERENDER_REQUIRE_CONFINEMENT=1`, which the jail entry sets) refuses
+///   to start without `PRERENDER_FETCHD`, and inside its jail there is no
+///   filesystem for the cache and no network for curl anyway. So this path
+///   exists only for unconfined corpus measurement on a developer's machine,
+///   fetching URLs the developer chose.
 pub struct HttpFetcher {
     cache: PathBuf,
     max_bytes: u64,
@@ -126,14 +141,40 @@ impl Fetcher for HttpFetcher {
 /// believed: the header line has a length limit, and a stated body length
 /// over `MAX_BODY` is a failure, not an allocation.
 pub struct FetchdFetcher {
-    child: std::process::Child,
-    stdin: Option<std::process::ChildStdin>,
-    stdout: std::io::BufReader<std::process::ChildStdout>,
+    /// The fetcher process, when this side spawned one. `None` for the
+    /// jailed converter's relay (`over`), whose peer is its own parent.
+    child: Option<std::process::Child>,
+    stdin: Option<Box<dyn std::io::Write>>,
+    stdout: std::io::BufReader<Box<dyn std::io::Read>>,
+    /// Written before each URL. Empty for fetchd itself; `"F "` for the
+    /// converter's relay, whose stdout also carries its report.
+    prefix: &'static str,
     bytes: u64,
     pub requests: u64,
     /// Set once the stream is out of step; every later request fails fast
     /// instead of reading another request's bytes as its own.
     broken: Option<String>,
+}
+
+/// One reply as fetchd frames it, read and bounded.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reply {
+    Ok { status: u16, rest: String, body: Vec<u8> },
+    Err(String),
+}
+
+impl Reply {
+    /// The frame, byte for byte as fetchd would write it.
+    pub fn to_frame(&self) -> Vec<u8> {
+        match self {
+            Reply::Ok { status, rest, body } => {
+                let mut v = format!("ok {status} {rest}\n").into_bytes();
+                v.extend_from_slice(body);
+                v
+            }
+            Reply::Err(why) => format!("err {}\n", why.replace(['\n', '\r'], " ")).into_bytes(),
+        }
+    }
 }
 
 impl FetchdFetcher {
@@ -147,9 +188,18 @@ impl FetchdFetcher {
         let mut child = Command::new(program).args(args)
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit())
             .spawn()?;
-        let stdin = child.stdin.take();
-        let stdout = std::io::BufReader::new(child.stdout.take().expect("piped"));
-        Ok(FetchdFetcher { child, stdin, stdout, bytes: 0, requests: 0, broken: None })
+        let stdin: Box<dyn std::io::Write> = Box::new(child.stdin.take().expect("piped"));
+        let stdout: Box<dyn std::io::Read> = Box::new(child.stdout.take().expect("piped"));
+        Ok(FetchdFetcher { child: Some(child), stdin: Some(stdin), stdout: std::io::BufReader::new(stdout),
+                           prefix: "", bytes: 0, requests: 0, broken: None })
+    }
+
+    /// The same protocol over descriptors this process already holds — the
+    /// jailed converter's stdout (requests, prefixed `F `) and stdin
+    /// (replies). Its parent relays each request to a real fetchd.
+    pub fn over(w: Box<dyn std::io::Write>, r: Box<dyn std::io::Read>, prefix: &'static str) -> Self {
+        FetchdFetcher { child: None, stdin: Some(w), stdout: std::io::BufReader::new(r),
+                        prefix, bytes: 0, requests: 0, broken: None }
     }
 
     fn fail<T>(&mut self, why: String) -> Result<T, String> {
@@ -157,39 +207,61 @@ impl FetchdFetcher {
         Err(why)
     }
 
-    /// The body as it came off the wire. `get` is this, decoded.
-    fn get_raw(&mut self, url: &str) -> Result<Vec<u8>, String> {
-        use std::io::{BufRead, Read, Write};
+    /// Send one URL and read one reply, bounded. `Err` means the STREAM is
+    /// unusable (and stays so); an `err` frame is `Ok(Reply::Err)`.
+    pub fn exchange(&mut self, url: &str) -> Result<Reply, String> {
+        use std::io::{Read, Write};
         if let Some(b) = &self.broken { return Err(format!("fetcher unusable: {b}")) }
         // ★ One request per line, so a URL that carries a line break would
         // smuggle a second request of the page's choosing. Refused here.
-        if url.contains(['\n', '\r']) { return Err(format!("refused: line break in URL {url:?}")) }
+        if url.contains(['\n', '\r']) { return Ok(Reply::Err(format!("refused: line break in URL {url:?}"))) }
         self.requests += 1;
+        let prefix = self.prefix;
         let Some(stdin) = self.stdin.as_mut() else { return Err("fetcher input closed".into()) };
-        if let Err(e) = writeln!(stdin, "{url}").and_then(|_| stdin.flush()) {
+        if let Err(e) = write!(stdin, "{prefix}{url}\n").and_then(|_| stdin.flush()) {
             return self.fail(format!("fetcher went away: {e}"));
         }
-        let mut line = Vec::new();
-        match (&mut self.stdout).take(Self::MAX_HEADER as u64).read_until(b'\n', &mut line) {
-            Ok(0) => return self.fail("fetcher exited".into()),
-            Ok(_) if line.last() != Some(&b'\n') => return self.fail("fetcher reply header too long".into()),
-            Ok(_) => {}
-            Err(e) => return self.fail(format!("fetcher read: {e}")),
-        }
-        let line = String::from_utf8_lossy(&line).trim_end().to_string();
-        if let Some(reason) = line.strip_prefix("err ") { return Err(format!("fetch {url}: {reason}")) }
-        let f: Vec<&str> = line.splitn(5, ' ').collect();
-        let (Some(&"ok"), Some(status), Some(len)) = (f.first(), f.get(1).and_then(|s| s.parse::<u16>().ok()),
-                                                     f.get(3).and_then(|s| s.parse::<usize>().ok())) else {
+        let line = match read_line_bounded(&mut self.stdout, Self::MAX_HEADER) {
+            Ok(Some(l)) => l,
+            Ok(None) => return self.fail("fetcher exited".into()),
+            Err(e) => return self.fail(e),
+        };
+        if let Some(reason) = line.strip_prefix("err ") { return Ok(Reply::Err(reason.to_string())) }
+        let f: Vec<&str> = line.splitn(3, ' ').collect();
+        let rest = f.get(2).copied().unwrap_or("");
+        let len = rest.split(' ').nth(1).and_then(|s| s.parse::<usize>().ok());
+        let (Some(&"ok"), Some(status), Some(len)) = (f.first(), f.get(1).and_then(|s| s.parse::<u16>().ok()), len) else {
             return self.fail(format!("unrecognised fetcher reply {line:?}"));
         };
         if len > Self::MAX_BODY { return self.fail(format!("fetcher claims a {len}-byte body")) }
         let mut body = vec![0u8; len];
         if let Err(e) = self.stdout.read_exact(&mut body) { return self.fail(format!("short body: {e}")) }
         self.bytes += len as u64;
-        // Same contract as HttpFetcher's `curl -f`: an HTTP error is a failure.
-        if !(200..300).contains(&status) { return Err(format!("fetch {url}: HTTP {status}")) }
-        Ok(body)
+        Ok(Reply::Ok { status, rest: rest.to_string(), body })
+    }
+
+    /// The body as it came off the wire. `get` is this, decoded.
+    fn get_raw(&mut self, url: &str) -> Result<Vec<u8>, String> {
+        match self.exchange(url)? {
+            Reply::Err(reason) => Err(format!("fetch {url}: {reason}")),
+            // Same contract as HttpFetcher's `curl -f`: an HTTP error is a failure.
+            Reply::Ok { status, .. } if !(200..300).contains(&status) => Err(format!("fetch {url}: HTTP {status}")),
+            Reply::Ok { body, .. } => Ok(body),
+        }
+    }
+}
+
+/// A line of at most `max` bytes, without its newline. `Ok(None)` at a clean
+/// end of stream. ★ Bounded before it is believed: a peer that never sends a
+/// newline is refused at `max`, not buffered forever.
+pub fn read_line_bounded(r: &mut impl std::io::BufRead, max: usize) -> Result<Option<String>, String> {
+    use std::io::Read;
+    let mut line = Vec::new();
+    match std::io::BufRead::read_until(&mut Read::take(&mut *r, max as u64), b'\n', &mut line) {
+        Ok(0) => Ok(None),
+        Ok(_) if line.last() != Some(&b'\n') => Err("reply header too long or truncated".into()),
+        Ok(_) => Ok(Some(String::from_utf8_lossy(&line).trim_end_matches(['\n', '\r']).to_string())),
+        Err(e) => Err(format!("read: {e}")),
     }
 }
 
@@ -212,15 +284,16 @@ impl Drop for FetchdFetcher {
     /// launcher leaks the jail: backend §4.7a); the kill is the backstop.
     fn drop(&mut self) {
         drop(self.stdin.take());
+        let Some(child) = self.child.as_mut() else { return };
         let start = std::time::Instant::now();
         let mut nap = std::time::Duration::from_millis(1);
         while start.elapsed() < Self::SHUTDOWN_GRACE {
-            if let Ok(Some(_)) = self.child.try_wait() { return }
+            if let Ok(Some(_)) = child.try_wait() { return }
             std::thread::sleep(nap);
             nap = (nap * 2).min(std::time::Duration::from_millis(20));
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 

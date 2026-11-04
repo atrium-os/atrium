@@ -134,7 +134,7 @@ fn a_store_refuses_bytes_that_do_not_match_their_name() {
 fn broker(store: bool) -> Navigatord<InProcessHost> {
     let host = InProcessHost::default();
     let host = if store { host.with_store(Box::new(MemoryStore::default())) } else { host };
-    let mut n = Navigatord::new(host);
+    let mut n = Navigatord::unconfined_for_testing(host);
     n.tick(NOW);
     n
 }

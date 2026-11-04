@@ -21,3 +21,14 @@ navigator-dom = { path = "../navigator-dom" }
 # hash, and the same pure-Rust build, as navigator-prerender's subresources
 # (spec §5: the store is Tessera, and Tessera is content-addressed).
 blake3 = { version = "1", features = ["pure"] }
+
+[features]
+# ★ Unconfined brokers (`Navigatord::unconfined_for_testing`) exist only in
+# test builds: this crate's tests, its examples, and anything that turns this
+# on deliberately. A shipped navigatord has `Navigatord::start` alone, which
+# refuses an unconfined host (threat model §2.3).
+unconfined-for-testing = []
+
+[dev-dependencies]
+# Tests and examples get the unconfined constructor; the library does not.
+navigator-backend = { path = ".", features = ["unconfined-for-testing"] }

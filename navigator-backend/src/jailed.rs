@@ -276,6 +276,8 @@ impl JailedHost {
 }
 
 impl DocumentHost for JailedHost {
+    fn is_confined(&self) -> bool { self.config.is_confined() }
+
     fn open(&mut self, recording: &[u8], now: Millis) -> Result<SessionId, String> {
         if self.workers.len() >= self.limits.max_sessions {
             return Err(format!("{} sessions open, at the limit of {}",

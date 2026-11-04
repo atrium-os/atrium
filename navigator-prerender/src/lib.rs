@@ -8,6 +8,7 @@ pub mod engine;
 pub mod boa_impl;
 pub mod fetch;
 pub mod selector;
+pub mod serve;
 pub mod modmirror;
 
 use dom::Script;

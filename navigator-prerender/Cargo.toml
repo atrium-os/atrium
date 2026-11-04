@@ -25,6 +25,8 @@ icu_locale_core = "2.3.0"
 url = "2"
 # The content address a subresource travels by (§3.13 + Tessera CAS).
 blake3 = { version = "1", features = ["pure"] }
+# setrlimit + sysctlbyname for the jailed converter's self-checks (src/serve.rs).
+libc = "0.2"
 
 [[bin]]
 name = "prerender"

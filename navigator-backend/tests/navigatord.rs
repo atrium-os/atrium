@@ -36,7 +36,7 @@ fn recording(url: &str) -> Vec<u8> {
 }
 
 fn broker() -> Navigatord<InProcessHost> {
-    let mut n = Navigatord::new(InProcessHost::default());
+    let mut n = Navigatord::unconfined_for_testing(InProcessHost::default());
     n.tick(NOW);
     n
 }
@@ -232,7 +232,7 @@ fn hitting_the_session_bound_blocks_with_a_reason() {
     let host = InProcessHost::new(
         SessionLimits { max_sessions: 1, ..Default::default() },
         navigator_backend::Limits::default());
-    let mut n = Navigatord::new(host);
+    let mut n = Navigatord::unconfined_for_testing(host);
     n.tick(NOW);
     open(&mut n);
     match n.handle(Request::OpenSession { recording: recording("https://b.test/") }).as_slice() {
@@ -313,7 +313,7 @@ impl DocumentHost for NullHost {
 
 #[test]
 fn the_broker_drives_a_host_that_owns_no_parser() {
-    let mut n = Navigatord::new(NullHost { open: vec![], next: 0 });
+    let mut n = Navigatord::unconfined_for_testing(NullHost { open: vec![], next: 0 });
     let s = match n.handle(Request::OpenSession { recording: b"anything".to_vec() }).pop() {
         Some(Event::SessionOpened { session, .. }) => session,
         other => panic!("{other:?}"),

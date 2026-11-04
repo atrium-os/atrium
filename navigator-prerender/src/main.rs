@@ -49,6 +49,69 @@ fn collect(p: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The report lines the parent aggregates; errors last, tab-separated.
+/// `fetchd` is (requests, bytes) when every fetch went through a fetchd.
+fn report(c: &navigator_prerender::Conversion, fetchd: Option<(u64, u64)>) -> String {
+    use std::fmt::Write;
+    let mut o = String::new();
+    // fields the parent aggregates; errors last, tab-separated
+    let _ = writeln!(o, "R\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        c.elements_before, c.elements_after, c.depth_after,
+        c.scripts_total, c.scripts_run, c.scripts_failed, c.script_mutations,
+        c.external_total, c.external_fetched, c.module_retries,
+        c.observers_registered);
+    let _ = writeln!(o, "L\t{}", c.layout_reads);
+    let _ = writeln!(o, "O\t{}\t{}\t{}", c.observers_registered, c.mutation_records, c.ce_upgrades);
+    let _ = writeln!(o, "H\t{}\t{}", c.history_writes, c.history_refused);
+    let _ = writeln!(o, "D\t{}\t{}", c.events_dispatched, c.event_listeners_run);
+    let _ = writeln!(o, "W\t{}\t{}", c.doc_writes, c.doc_writes_refused);
+    let _ = writeln!(o, "J\t{}\t{}", c.injected_scripts_run, c.injected_scripts_refused);
+    let _ = writeln!(o, "X\t{}\t{}", c.text_before, c.text_after);
+    let _ = writeln!(o, "Z\t{}", c.removals_refused);
+    let _ = writeln!(o, "S\t{}\t{}\t{}\t{}\t{}", c.interactive_found, c.transitions.len(),
+        c.transitions.iter().filter(|t| t.anchored).count(),
+        c.transitions.iter().filter(|t| t.is_attribute_only()).count(),
+        c.transitions.iter().filter(|t| t.effects.iter()
+            .any(|e| matches!(e, navigator_prerender::Effect::Truncated { .. }))).count());
+    // The POLICY's verdict travels with the measurements, so the parent can
+    // report what would be published without re-deriving it.
+    {
+        let (_, d) = navigator_prerender::TierPolicy::default().artifact(&c);
+        let _ = writeln!(o, "Y\t{:?}\t{}", d.tier, d.reason);
+        let _ = writeln!(o, "Q\t{}", c.origin_refusal.unwrap_or(""));
+        for v in &c.profile_violations {
+            let _ = writeln!(o, "V2\t{}\t{}\t{}", v.ceiling, v.measured, v.allowed);
+        }
+    }
+    let _ = writeln!(o, "T\t{}\t{}", c.timers_fired, c.timers_dropped);
+    if let Some((requests, bytes)) = fetchd {
+        let _ = writeln!(o, "G\t{requests}\t{bytes}");
+    }
+    let _ = writeln!(o, "P\t{}\t{}\t{}\t{}", c.page_fetches, c.page_fetch_failures,
+        c.page_blocked, c.beacons_suppressed);
+    for (k, n) in c.blocked_hosts.iter() { let _ = writeln!(o, "B\t{n}\t{k}"); }
+    let _ = writeln!(o, "V\t{:?}", c.verdict);
+    // The PROXIMATE CAUSE of the first failure: the last recorded event
+    // before the throw. A symptom bucket like "null or undefined" is useless
+    // without it — the message names what broke, this names why.
+    if let Some((kind, what)) = &c.cause {
+        let _ = writeln!(o, "C\t{kind}\t{}", what.replace('\t', " "));
+    }
+    if let Some(f) = &c.first_error {
+        let _ = writeln!(o, "F\t{}", f.replace('\t', " ").replace('\n', " "));
+    }
+    for e in c.errors.iter().take(8) {
+        let _ = writeln!(o, "E\t{}", e.replace('\t', " ").replace('\n', " "));
+    }
+    for (name, n) in c.missing.iter() {
+        let _ = writeln!(o, "M\t{n}\t{name}");
+    }
+    for (name, n) in c.nulls.iter() {
+        let _ = writeln!(o, "N\t{n}\t{}", name.replace('\t', " "));
+    }
+    o
+}
+
 /// Convert exactly one document and print one machine-readable line. The
 /// directory driver invokes this in a child process so a pathological
 /// document cannot take the corpus run with it.
@@ -122,62 +185,7 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
     if std::env::var("PRERENDER_DUMP").ok().as_deref() == Some("1") {
         eprintln!("{}", c.html);
     }
-    // fields the parent aggregates; errors last, tab-separated
-    println!("R\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        c.elements_before, c.elements_after, c.depth_after,
-        c.scripts_total, c.scripts_run, c.scripts_failed, c.script_mutations,
-        c.external_total, c.external_fetched, c.module_retries,
-        c.observers_registered);
-    println!("L\t{}", c.layout_reads);
-    println!("O\t{}\t{}\t{}", c.observers_registered, c.mutation_records, c.ce_upgrades);
-    println!("H\t{}\t{}", c.history_writes, c.history_refused);
-    println!("D\t{}\t{}", c.events_dispatched, c.event_listeners_run);
-    println!("W\t{}\t{}", c.doc_writes, c.doc_writes_refused);
-    println!("J\t{}\t{}", c.injected_scripts_run, c.injected_scripts_refused);
-    println!("X\t{}\t{}", c.text_before, c.text_after);
-    println!("Z\t{}", c.removals_refused);
-    println!("S\t{}\t{}\t{}\t{}\t{}", c.interactive_found, c.transitions.len(),
-        c.transitions.iter().filter(|t| t.anchored).count(),
-        c.transitions.iter().filter(|t| t.is_attribute_only()).count(),
-        c.transitions.iter().filter(|t| t.effects.iter()
-            .any(|e| matches!(e, navigator_prerender::Effect::Truncated { .. }))).count());
-    // The POLICY's verdict travels with the measurements, so the parent can
-    // report what would be published without re-deriving it.
-    {
-        let (_, d) = navigator_prerender::TierPolicy::default().artifact(&c);
-        println!("Y\t{:?}\t{}", d.tier, d.reason);
-        println!("Q\t{}", c.origin_refusal.unwrap_or(""));
-        for v in &c.profile_violations {
-            println!("V2\t{}\t{}\t{}", v.ceiling, v.measured, v.allowed);
-        }
-    }
-    println!("T\t{}\t{}", c.timers_fired, c.timers_dropped);
-    if let Some(f) = &fetchd {
-        let f = f.0.borrow();
-        println!("G\t{}\t{}", f.requests, f.bytes_fetched());
-    }
-    println!("P\t{}\t{}\t{}\t{}", c.page_fetches, c.page_fetch_failures,
-        c.page_blocked, c.beacons_suppressed);
-    for (k, n) in c.blocked_hosts.iter() { println!("B\t{n}\t{k}"); }
-    println!("V\t{:?}", c.verdict);
-    // The PROXIMATE CAUSE of the first failure: the last recorded event
-    // before the throw. A symptom bucket like "null or undefined" is useless
-    // without it — the message names what broke, this names why.
-    if let Some((kind, what)) = &c.cause {
-        println!("C\t{kind}\t{}", what.replace('\t', " "));
-    }
-    if let Some(f) = &c.first_error {
-        println!("F\t{}", f.replace('\t', " ").replace('\n', " "));
-    }
-    for e in c.errors.iter().take(8) {
-        println!("E\t{}", e.replace('\t', " ").replace('\n', " "));
-    }
-    for (name, n) in c.missing.iter() {
-        println!("M\t{n}\t{name}");
-    }
-    for (name, n) in c.nulls.iter() {
-        println!("N\t{n}\t{}", name.replace('\t', " "));
-    }
+    print!("{}", report(&c, fetchd.as_ref().map(|f| { let f = f.0.borrow(); (f.requests, f.bytes_fetched()) })));
     std::process::exit(0);
 }
 
@@ -189,7 +197,16 @@ fn main() {
         let net = std::env::var("PRERENDER_NET").ok().as_deref() == Some("1");
         run_one(&file, base.as_deref(), net);
     }
-    if args.is_empty() { eprintln!("usage: prerender <file-or-dir>..."); std::process::exit(2); }
+    // ★ No arguments is the JAIL ENTRY: a one-shot jail runs its entry bare,
+    // and everything else arrives on stdin. A person typing `prerender` at
+    // a terminal gets the usage instead of a silent wait.
+    if args.is_empty() {
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            eprintln!("usage: prerender <file-or-dir>...   (no arguments + a pipe on stdin = serve one conversion)");
+            std::process::exit(2);
+        }
+        serve();
+    }
     let mut files = vec![];
     for a in &args { collect(Path::new(a), &mut files); }
     files.sort();
@@ -211,6 +228,14 @@ fn main() {
     let net = std::env::var("PRERENDER_NET").ok().as_deref() == Some("1");
 
     let exe = std::env::current_exe().expect("exe");
+    let driver = Driver::from_env();
+    if let Err(e) = driver.check(net) { eprintln!("prerender: REFUSED — {e}"); std::process::exit(1) }
+    match &driver.launcher {
+        Some((p, a)) => println!("confinement: LAUNCHER {p} {}{}", a.join(" "),
+                                 if driver.require { "  (required; each child verifies it is jailed)" } else { "" }),
+        None => println!("confinement: none — UNCONFINED, for testing: process isolation only, NOT a jail"),
+    }
+    let mut walls: Vec<f64> = vec![];
     let (mut with_js, mut js_ok, mut js_fail, mut mutated) = (0usize, 0usize, 0usize, 0usize);
     let (mut ext_total, mut ext_ok, mut ext_fail) = (0usize, 0usize, 0usize);
     let mut timed_out_names: Vec<String> = vec![];
@@ -277,8 +302,8 @@ fn main() {
         let _ = &src;
         let name = f.file_name().unwrap().to_string_lossy().to_string();
         let b = base.get(&name).cloned().unwrap_or_default();
-        let c = match convert_in_child(&exe, f, &b, net, deadline) {
-            Ok(c) => c,
+        let c = match convert_in_child(&exe, f, &b, net, deadline, &driver) {
+            Ok(c) => { walls.push(c.wall_ms); c }
             Err(why) => {
                 // ★ NAMED, not just counted. Four documents produced no recording
                 // in one run and the count alone could not say which — the answer
@@ -402,6 +427,13 @@ fn main() {
     if !lossy.is_empty() {
         println!("  decoded LOSSILY     {} (not UTF-8; converted anyway)", lossy.len());
         for n in lossy.iter().take(3) { println!("      {n}"); }
+    }
+    if !walls.is_empty() {
+        let mut w = walls.clone();
+        w.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let q = |p: f64| w[((w.len() as f64 - 1.0) * p).round() as usize];
+        println!("  conversion wall (driver's view, ms): p50 {:.0}  p90 {:.0}  max {:.0}  mean {:.0}  total {:.1}s over {}",
+            q(0.5), q(0.9), w[w.len() - 1], w.iter().sum::<f64>() / w.len() as f64, w.iter().sum::<f64>() / 1000.0, w.len());
     }
     if !timed_out_names.is_empty() {
         // ★ EVERY name. Six of 27 were printed once, and the rest had to be
@@ -594,40 +626,275 @@ const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 /// Run one document in a child process, killing it at the deadline. The
 /// error says which of the ways a child can fail to answer this was: a
 /// timeout and a crash need different next steps.
+/// How the driver runs each conversion: read once, from the environment.
+struct Driver {
+    /// `PRERENDER_LAUNCHER="<program> <args…>"`, with `{instance}` replaced
+    /// per conversion — typically
+    ///   `portcullis exec --daemon --instance conv{instance} org.atrium.navigator.converter`
+    /// ★ `None` is UNCONFINED: the serve-mode child is this same binary as
+    /// an ordinary process. Process isolation only, NOT a jail — for tests
+    /// and for the byte-for-byte comparison against the jailed run.
+    launcher: Option<(String, Vec<String>)>,
+    /// `PRERENDER_FETCHD`, as before, but now started by THIS process and
+    /// relayed to the child: the child cannot start anything.
+    fetchd: Option<String>,
+    /// `PRERENDER_REQUIRE_CONFINEMENT=1`: refuse to run unconfined, refuse a
+    /// networked run without fetchd, and have each child verify with the
+    /// kernel that it is jailed.
+    require: bool,
+    explore: bool,
+    same_site: bool,
+    protect: bool,
+    dump: bool,
+    emit_dir: Option<PathBuf>,
+    blob_dir: Option<PathBuf>,
+    mem_mb: u64,
+}
+
+impl Driver {
+    fn from_env() -> Driver {
+        let on = |k: &str| std::env::var(k).ok().as_deref() == Some("1");
+        let words = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        Driver {
+            launcher: words("PRERENDER_LAUNCHER").map(|v| {
+                let w: Vec<String> = v.split_whitespace().map(String::from).collect();
+                (w[0].clone(), w[1..].to_vec())
+            }),
+            fetchd: words("PRERENDER_FETCHD"),
+            require: on("PRERENDER_REQUIRE_CONFINEMENT"),
+            explore: on("PRERENDER_EXPLORE"),
+            same_site: on("PRERENDER_SAME_SITE"),
+            protect: on("PRERENDER_PROTECT"),
+            dump: on("PRERENDER_DUMP"),
+            emit_dir: std::env::var_os("PRERENDER_EMIT_DIR").map(PathBuf::from),
+            blob_dir: std::env::var_os("PRERENDER_BLOB_DIR").map(PathBuf::from),
+            mem_mb: std::env::var("PRERENDER_MEM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(4096),
+        }
+    }
+
+    /// ★ The require-confinement switch. A production conversion refuses
+    /// to start rather than run hostile JavaScript as the user.
+    fn check(&self, net: bool) -> Result<(), String> {
+        if !self.require { return Ok(()) }
+        if self.launcher.is_none() {
+            return Err("PRERENDER_REQUIRE_CONFINEMENT=1 but no PRERENDER_LAUNCHER: refusing to run page \
+                        JavaScript unconfined".into());
+        }
+        if net && self.fetchd.is_none() {
+            return Err("PRERENDER_REQUIRE_CONFINEMENT=1 with PRERENDER_NET=1 but no PRERENDER_FETCHD: the \
+                        network would be curl in this process, without the address rules (threat model §2.1)".into());
+        }
+        Ok(())
+    }
+}
+
+/// Where a relayed fetch goes.
+enum Upstream {
+    Fetchd(navigator_prerender::fetch::FetchdFetcher),
+    /// The measurement instrument (unconfined runs only; see HttpFetcher).
+    Curl(HttpFetcher),
+    None,
+}
+
+impl Upstream {
+    fn frame(&mut self, url: &str) -> Vec<u8> {
+        use navigator_prerender::fetch::Reply;
+        match self {
+            Upstream::Fetchd(f) => f.exchange(url).unwrap_or_else(Reply::Err).to_frame(),
+            Upstream::Curl(h) => match h.get_bytes(url) {
+                Ok(b) => Reply::Ok { status: 200, rest: format!("0 {} {url}", b.len()), body: b }.to_frame(),
+                Err(e) => Reply::Err(e).to_frame(),
+            },
+            Upstream::None => Reply::Err("no network".into()).to_frame(),
+        }
+    }
+}
+
+static INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long a child gets past its own deadline before its input is closed,
+/// and then again before it is killed. A jailed child normally exits on its
+/// own watchdog; the kill is the backstop, because a killed launcher leaks
+/// its jail (backend §4.7a bug 2).
+const GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn convert_in_child(
-    exe: &Path, file: &Path, base: &str, net: bool, deadline: std::time::Duration,
+    exe: &Path, file: &Path, base: &str, net: bool, deadline: std::time::Duration, d: &Driver,
 ) -> Result<Child, String> {
+    use navigator_prerender::serve::{self, Job};
     use std::process::{Command, Stdio};
-    let mut cmd = Command::new(exe);
-    cmd.arg("--one").arg(file).arg(base).stdout(Stdio::piped()).stderr(Stdio::piped());
-    if net { cmd.env("PRERENDER_NET", "1"); }
+    use std::sync::{Arc, Mutex};
+    // ★ An unreadable file is an EMPTY document, counted, not a skip — as
+    // the child did before it lost the filesystem.
+    let doc = fs::read(file).unwrap_or_default();
+    let job = Job {
+        base: (!base.is_empty()).then(|| base.to_string()),
+        net, explore: d.explore, same_site: d.same_site, protect: d.protect,
+        emit: d.emit_dir.is_some(), blobs: d.blob_dir.is_some(), require_confined: d.require,
+        deadline_s: deadline.as_secs().max(1), mem_mb: d.mem_mb, len: doc.len(),
+    };
+    let header = job.header()?;
+    let instance = format!("{}{:05}", std::process::id(), INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let fill = |a: &String| a.replace("{instance}", &instance);
+    let mut cmd = match &d.launcher {
+        None => Command::new(exe),  // no arguments = serve mode
+        Some((p, args)) => { let mut c = Command::new(p); c.args(args.iter().map(fill)); c }
+    };
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut ch = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
-    // ★ Both pipes drain on their own threads WHILE the child runs: a child
-    // that fills either pipe would otherwise block on it, and the parent
-    // waiting on the child would turn a panic message into a timeout.
-    let drain = |mut r: Box<dyn std::io::Read + Send>| std::thread::spawn(move || {
-        let mut v = vec![];
-        let _ = r.read_to_end(&mut v);
-        v
-    });
-    let out_t = drain(Box::new(ch.stdout.take().expect("piped")));
-    let err_t = drain(Box::new(ch.stderr.take().expect("piped")));
+    let stdin: Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>> =
+        Arc::new(Mutex::new(Some(Box::new(ch.stdin.take().expect("piped")))));
+    let stdout = ch.stdout.take().expect("piped");
+    // ★ stderr is DRAINED, on its own thread, while the child runs: piped
+    // and unread, a chatty child blocks forever on a full pipe (§4.7a bug 3).
+    let mut stderr = ch.stderr.take().expect("piped");
+    let err_t = std::thread::spawn(move || { let mut v = vec![]; let _ = std::io::Read::read_to_end(&mut stderr, &mut v); v });
     let start = std::time::Instant::now();
+
+    let (fetchd, blob_dir, stdin_d, emit) = (d.fetchd.clone(), d.blob_dir.clone(), stdin.clone(), d.emit_dir.is_some());
+    let fetch_instance = instance.clone();
+    let drive_t = std::thread::spawn(move || -> Result<serve::Outcome, String> {
+        {
+            let mut g = stdin_d.lock().unwrap();
+            let w = g.as_mut().expect("open");
+            w.write_all(header.as_bytes()).and_then(|_| w.write_all(&doc)).and_then(|_| w.flush())
+                .map_err(|e| format!("could not hand the document to the converter: {e}"))?;
+        }
+        // The fetcher is started only for a networked run, per conversion,
+        // so its pins (threat model §2.1) are this conversion's alone.
+        let mut up = match (net, fetchd) {
+            (false, _) => Upstream::None,
+            (true, Some(cmd)) => {
+                let w: Vec<String> = cmd.split_whitespace().map(|x| x.replace("{instance}", &fetch_instance)).collect();
+                Upstream::Fetchd(navigator_prerender::fetch::FetchdFetcher::spawn(&w[0], &w[1..])
+                    .map_err(|e| format!("PRERENDER_FETCHD {cmd:?}: {e}"))?)
+            }
+            (true, None) => Upstream::Curl(HttpFetcher::new(std::env::temp_dir().join("prerender-relaycache"))),
+        };
+        let mut out = std::io::BufReader::new(stdout);
+        let r = serve::drive(&mut out, &stdin_d, &mut |u| up.frame(u), &mut |addr, bytes| {
+            let (Some(dir), Some(hex)) = (&blob_dir, addr.strip_prefix("blake3:")) else { return };
+            let _ = fs::create_dir_all(dir);
+            let p = dir.join(hex);
+            if !p.exists() { let _ = fs::write(p, bytes); }
+        });
+        // ★ End of input first: the child (and through it its launcher) is
+        // asked to exit, never killed while it still could.
+        drop(stdin_d.lock().unwrap().take());
+        let _ = emit;
+        r
+    });
+
     let status = loop {
         match ch.try_wait() {
-            Ok(Some(st)) => break st,
-            Ok(None) if start.elapsed() > deadline => {
-                let _ = ch.kill(); let _ = ch.wait();
-                return Err(format!("timed out at {}s", deadline.as_secs()));
+            Ok(Some(st)) => break Some(st),
+            Ok(None) if start.elapsed() > deadline + GRACE => {
+                drop(stdin.lock().unwrap().take());
+                let t = std::time::Instant::now();
+                let mut st = None;
+                while t.elapsed() < GRACE {
+                    if let Ok(Some(s)) = ch.try_wait() { st = Some(s); break }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                if st.is_none() { let _ = ch.kill(); let _ = ch.wait(); }
+                break None;
             }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
             Err(e) => return Err(format!("wait failed: {e}")),
         }
     };
-    let stdout = out_t.join().unwrap_or_default();
+    let outcome = drive_t.join().unwrap_or_else(|_| Err("driver thread panicked".into()));
     let stderr = err_t.join().unwrap_or_default();
-    parse_child(&String::from_utf8_lossy(&stdout))
-        .ok_or_else(|| crash_reason(start.elapsed().as_secs_f64(), &status.to_string(), &String::from_utf8_lossy(&stderr)))
+    let stderr = String::from_utf8_lossy(&stderr);
+    let Some(status) = status else { return Err(format!("timed out at {}s (child killed)", deadline.as_secs())) };
+    let o = outcome.map_err(|e| format!("converter protocol: {e}"))?;
+    if o.timed_out { return Err(format!("timed out at {}s", deadline.as_secs())) }
+    if !o.ended { return Err(crash_reason(start.elapsed().as_secs_f64(), &status.to_string(), &stderr)) }
+    if d.dump { eprint!("{stderr}") }
+    if let (Some(dir), Some(rec)) = (&d.emit_dir, &o.recording) {
+        let stem = file.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "doc".into());
+        let path = dir.join(format!("{stem}.json"));
+        if let Err(e) = fs::create_dir_all(dir).and_then(|_| fs::write(&path, rec)) {
+            eprintln!("emit: cannot write {}: {e}", path.display());
+        }
+    }
+    // A refusal the child reported (origin refusal) is on its stderr.
+    for l in stderr.lines().filter(|l| l.starts_with("emit: ")) { eprintln!("{l}") }
+    let mut c = parse_child(&o.report).ok_or_else(|| crash_reason(start.elapsed().as_secs_f64(), &status.to_string(), &stderr))?;
+    c.wall_ms = start.elapsed().as_secs_f64() * 1000.0;
+    Ok(c)
+}
+
+/// The jail entry: one conversion over stdin/stdout (src/serve.rs). No
+/// arguments, no environment, no filesystem.
+fn serve() -> ! {
+    use navigator_prerender::fetch::{FetchdFetcher, SharedFetcher};
+    use navigator_prerender::serve as sv;
+    use std::io::Write;
+    let (job, doc) = {
+        let stdin = std::io::stdin();
+        let mut l = stdin.lock();
+        match sv::read_job(&mut l) { Ok(x) => x, Err(e) => { eprintln!("prerender serve: {e}"); std::process::exit(2) } }
+    };
+    if job.require_confined {
+        match sv::kernel_says_jailed() {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("prerender serve: REFUSED — confinement is required and the kernel says this process is not in a jail");
+                std::process::exit(3)
+            }
+            Err(e) => { eprintln!("prerender serve: REFUSED — cannot ask the kernel whether this is a jail: {e}"); std::process::exit(3) }
+        }
+    }
+    // ★ Before a byte of the page is parsed.
+    if let Err(e) = sv::limit_self(job.deadline_s + 5, job.mem_mb) {
+        eprintln!("prerender serve: REFUSED — {e}");
+        std::process::exit(3)
+    }
+    let deadline = std::time::Duration::from_secs(job.deadline_s);
+    std::thread::spawn(move || {
+        std::thread::sleep(deadline);
+        let mut o = std::io::stdout().lock();
+        let _ = o.write_all(b"TIMEOUT\n");
+        let _ = o.flush();
+        std::process::exit(124);
+    });
+    navigator_prerender::subresource::install_blob_sink();
+    let src = String::from_utf8_lossy(&doc).into_owned();
+    let relay = job.net.then(|| SharedFetcher(std::rc::Rc::new(std::cell::RefCell::new(
+        FetchdFetcher::over(Box::new(std::io::stdout()), Box::new(std::io::stdin()), "F ")))));
+    let mut nonet = NoNetwork;
+    let mut shared = relay.clone();
+    let fetcher: &mut dyn Fetcher = match &mut shared { Some(f) => f, None => &mut nonet };
+    let mut eng = BoaEngine {
+        explore: job.explore,
+        same_site_network: job.same_site,
+        page_fetcher: relay.clone().map(|f| Box::new(f) as Box<dyn Fetcher>),
+        ..Default::default()
+    };
+    let c = navigator_prerender::convert_with_opts(&src, job.base.as_deref(), &mut eng, fetcher, job.protect);
+    let rep = report(&c, relay.as_ref().map(|f| { let f = f.0.borrow(); (f.requests, f.bytes_fetched()) }));
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(rep.as_bytes());
+    let blobs = navigator_prerender::subresource::take_blobs();
+    if job.blobs {
+        for (a, b) in &blobs {
+            let _ = write!(out, "BLOB {a} {}\n", b.len());
+            let _ = out.write_all(b);
+        }
+    }
+    if job.emit {
+        if let Some(why) = c.origin_refusal {
+            eprintln!("emit: refused by origin ({why}); no recording written");
+        } else {
+            let json = navigator_prerender::artifact::emit(job.base.as_deref(), &c, &navigator_prerender::TierPolicy::default());
+            let _ = write!(out, "RECORDING {}\n", json.len());
+            let _ = out.write_all(json.as_bytes());
+        }
+    }
+    let _ = out.write_all(b"END\n");
+    let _ = out.flush();
+    std::process::exit(0)
 }
 
 /// Why a child produced no result: how long it ran, how it exited, and the
@@ -659,6 +926,9 @@ mod tests {
 
 /// What the parent needs back from a child run.
 pub struct Child {
+    /// Wall time of the whole conversion as the DRIVER saw it: spawn,
+    /// launcher, jail, convert, teardown. What a jail costs shows up here.
+    pub wall_ms: f64,
     pub elements_before: usize,
     pub elements_after: usize,
     pub scripts_total: usize,
@@ -716,7 +986,7 @@ fn parse_child(s: &str) -> Option<Child> {
         doc_writes: 0, doc_writes_refused: 0,
         injected_scripts_run: 0, injected_scripts_refused: 0,
         text_before: 0, text_after: 0,
-        removals_refused: 0,
+        removals_refused: 0, wall_ms: 0.0,
         interactive_found: 0, transitions: 0, transitions_anchored: 0,
         transitions_attr_only: 0, transitions_truncated: 0,
         origin_refusal: String::new(), violations: vec![],

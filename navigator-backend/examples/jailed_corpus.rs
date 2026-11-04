@@ -43,7 +43,13 @@ fn main() {
     // A store, so every session is also saved and restored (M4, spec §8.8).
     let host = JailedHost::new(cfg, SessionLimits::default())
         .with_store(Box::new(navigator_backend::store::MemoryStore::default()));
-    let mut n = Navigatord::new(host);
+    // ★ The production constructor when a launcher is configured, so this
+    // harness exercises the same refusal a shipped navigatord makes.
+    let mut n = if confined {
+        Navigatord::start(host).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(1) })
+    } else {
+        Navigatord::unconfined_for_testing(host)
+    };
     n.tick(1_000);
 
     let mut files: Vec<_> = std::fs::read_dir(&dir).expect("readable directory")

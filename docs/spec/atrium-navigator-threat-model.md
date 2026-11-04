@@ -138,6 +138,31 @@ never the live network.
 **Rating:** today **high** (A1). With the jail, medium: the converter can then only lie
 in its output, which §2.3 and §2.6 handle.
 
+**Built (2026-11-05); FreeBSD numbers pending.** Backend §4.7d has the details.
+- **The mechanism.** The converter runs as a one-shot jail entry,
+  `org.atrium.navigator.converter`, under `portcullis exec --daemon`, with a signed
+  manifest that declares no capabilities. It takes no arguments and reads no
+  environment; the job arrives on stdin. The fetcher is relayed over stdin/stdout,
+  because the daemon lane passes exactly three descriptors. Blobs come back over the
+  pipe and are hash-checked by the parent, and so does the recording.
+- **The switch.** `PRERENDER_REQUIRE_CONFINEMENT=1` refuses three things: running
+  without `PRERENDER_LAUNCHER`, running networked without `PRERENDER_FETCHD`, and a
+  child the kernel does not report as jailed (`security.jail.jailed`). The child asks
+  the kernel itself, so a launcher that silently fails to jail is caught.
+- **Unconfined mode** prints `confinement: none — UNCONFINED, for testing`.
+- **Verified on macOS, unconfined.** Serve mode reproduces the old in-child conversions
+  byte for byte: 50/50 recordings offline, and 8/8 recordings plus 393 blobs with the
+  network on.
+- **Not yet run.** The jailed corpus run, the jail cost and the leak checks are
+  `scripts/navigator-converter-jail-e2e.sh`, still to run in the FreeBSD VM.
+- **P2 limits.** `portcullis exec --memory` sets an rctl `memoryuse` cap, but only on
+  the root (non-daemon) lane, and the daemon lane does not forward it. No CPU rctl
+  exists anywhere (portcullis.md §6.5.2e). As an interim measure the converter lowers
+  its own **hard** `RLIMIT_CPU` (deadline + 5 s) and, on FreeBSD, `RLIMIT_AS`
+  (`PRERENDER_MEM_MB`, default 4096) before parsing a byte. It reads them back and
+  refuses on a mismatch. An unprivileged process cannot raise a hard limit again. A
+  per-conversion total byte budget is still open.
+
 ### 2.3 Normalize and render — the document worker
 
 **Enforced today.**
@@ -159,6 +184,14 @@ valid scene graph is a steganographic channel. That channel leads only to the co
 and the screen, so it matters only when combined with a compositor bug (§2.5).
 
 **Rating:** today medium (an unjailed default), designed **low**.
+
+**Built (2026-11-05).** `Navigatord::start(host)` refuses a host that does not report
+`is_confined()`. `DocumentHost::is_confined` defaults to false, so a new host must claim
+confinement to get it. The unconfined constructor, `Navigatord::unconfined_for_testing`,
+is compiled only under `cfg(test)` or the `unconfined-for-testing` feature, which the
+crate's own dev-dependency turns on for its tests and examples. A probe crate that
+depends on `navigator-backend` without the feature fails to compile a call to it
+(`E0599`). `jailed_corpus` uses `start` whenever a launcher is configured.
 
 ### 2.4 Images and fonts
 
@@ -555,9 +588,9 @@ These belong in the model because they are *wins*, not because they need work:
 
 | # | fix | stops | cost | where |
 |---|---|---|---|---|
-| **P0** | Jail the converter process (Boa) with zero capabilities via `portcullis exec` | A1 → code execution as the user | small: the launcher exists and was measured (§4.7a) | §2.2 |
-| P1 | Refuse non-global addresses after resolution; pin the address per conversion; intranet as an explicit grant | A4: LAN and localhost, DNS rebinding | small | §2.1 |
-| P1 | `navigatord` refuses to start unconfined outside test builds | A1 against the worker | trivial | §2.3 |
+| **P0** ✔ built, VM run pending | Jail the converter process (Boa) with zero capabilities via `portcullis exec` | A1 → code execution as the user | small: the launcher exists and was measured (§4.7a) | §2.2 |
+| P1 ✔ built, VM gate pending | Refuse non-global addresses after resolution; pin the address per conversion; intranet as an explicit grant | A4: LAN and localhost, DNS rebinding | small | §2.1 |
+| P1 ✔ built | `navigatord` refuses to start unconfined outside test builds | A1 against the worker | trivial | §2.3 |
 | P1 | Decide where images decode: per-document jail, memory-safe decoders, never in Fresco | A1 via decoders | design and medium code | §2.4 |
 | P1 | Per-user dedup domain by default; reproduce-to-share | A5 poisoning | design now, code with sharing | §2.6 |
 | P2 | `rctl` memory/CPU limits on converter and worker jails; per-conversion byte budget | A6 | small | §2.2 |

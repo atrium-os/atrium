@@ -43,7 +43,26 @@ pub fn blob_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("PRERENDER_BLOB_DIR").map(std::path::PathBuf::from)
 }
 
+/// ★ The jailed converter has no filesystem, so its blobs go to its parent
+/// over stdout instead (src/serve.rs). When a sink is installed it takes
+/// EVERY blob and the environment is not consulted at all, so an unconfined
+/// serve-mode child behaves exactly like a jailed one.
+static SINK: std::sync::Mutex<Option<Vec<(String, Vec<u8>)>>> = std::sync::Mutex::new(None);
+
+pub fn install_blob_sink() { *SINK.lock().unwrap() = Some(vec![]) }
+
+/// Everything the sink collected, in first-seen order, each address once.
+pub fn take_blobs() -> Vec<(String, Vec<u8>)> {
+    SINK.lock().unwrap().as_mut().map(std::mem::take).unwrap_or_default()
+}
+
 fn store(address: &str, bytes: &[u8]) {
+    if let Some(sink) = SINK.lock().unwrap().as_mut() {
+        if address.starts_with("blake3:") && !sink.iter().any(|(a, _)| a == address) {
+            sink.push((address.to_string(), bytes.to_vec()));
+        }
+        return;
+    }
     let Some(dir) = blob_dir() else { return };
     let Some(hex) = address.strip_prefix("blake3:") else { return };
     let _ = std::fs::create_dir_all(&dir);

@@ -46,7 +46,7 @@ fn host() -> JailedHost {
 }
 
 fn broker() -> Navigatord<JailedHost> {
-    let mut n = Navigatord::new(host());
+    let mut n = Navigatord::unconfined_for_testing(host());
     n.tick(NOW);
     n
 }
@@ -407,7 +407,7 @@ fn three_steps() -> Vec<u8> {
 
 fn stored_broker() -> Navigatord<JailedHost> {
     let host = host().with_store(Box::new(navigator_backend::store::MemoryStore::default()));
-    let mut n = Navigatord::new(host);
+    let mut n = Navigatord::unconfined_for_testing(host);
     n.tick(NOW);
     n
 }
@@ -470,7 +470,7 @@ fn a_jailed_restore_that_diverges_is_refused_and_its_worker_closed() {
     let rec = store.put(&three_steps()).unwrap();
     let bad = Saved { url: "https://a.test/".into(), recording: rec, steps: vec![0], ahead: vec![], document: "0".repeat(64) };
     let addr = store.put(&bad.to_json()).unwrap();
-    let mut n = Navigatord::new(host().with_store(Box::new(store)));
+    let mut n = Navigatord::unconfined_for_testing(host().with_store(Box::new(store)));
     n.tick(NOW);
     match n.handle(Request::Restore { saved: addr }).as_slice() {
         [Event::Blocked { session: None, why }] => assert!(why.contains("different document"), "{why}"),
@@ -484,4 +484,22 @@ fn a_jailed_host_without_a_store_says_it_cannot_save() {
     let mut n = broker();
     let s = open(&mut n);
     assert!(matches!(n.handle(Request::Save { session: s }).as_slice(), [Event::Blocked { .. }]));
+}
+
+#[test]
+fn navigatord_refuses_to_start_over_an_unconfined_host() {
+    // Threat model §2.3: the production constructor refuses process
+    // isolation, and says why.
+    match Navigatord::start(host()) {
+        Err(e) => assert!(e.contains("not confined"), "{e}"),
+        Ok(_) => panic!("an unconfined host was accepted"),
+    }
+    match Navigatord::start(navigator_backend::navigatord::InProcessHost::default()) {
+        Err(e) => assert!(e.contains("not confined"), "{e}"),
+        Ok(_) => panic!("an in-process host was accepted"),
+    }
+    // …and accepts a host configured with a launcher. It is not asked to
+    // spawn anything here: starting the broker does not open a session.
+    let cfg = WorkerConfig::confined(WORKER, "/usr/bin/env", vec![]);
+    assert!(Navigatord::start(JailedHost::new(cfg, SessionLimits::default())).is_ok());
 }

@@ -316,7 +316,7 @@ fn the_broker_drives_real_recordings_end_to_end() {
     use navigator_backend::navigatord::{Event, InProcessHost, Navigatord, Request};
     use navigator_backend::reverse::Back;
 
-    let mut n = Navigatord::new(InProcessHost::default());
+    let mut n = Navigatord::unconfined_for_testing(InProcessHost::default());
     n.tick(1_000);
     let (mut opened, mut navigated, mut rewound, mut blocked) = (0, 0, 0, 0);
     for e in std::fs::read_dir(&dir).expect("readable directory").flatten() {

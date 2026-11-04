@@ -63,6 +63,10 @@ pub trait DocumentHost {
     /// Every open session and what it costs — what §4.4a's caller-chosen
     /// eviction decides from.
     fn report(&self) -> Vec<(SessionId, usize)>;
+    /// ★ Whether each document runs CONFINED, as the host itself states it.
+    /// Defaults to false: a host has to claim confinement to get it, so a new
+    /// host that forgets is refused by `Navigatord::start`, not trusted.
+    fn is_confined(&self) -> bool { false }
 }
 
 /// What a UI asks for. The vocabulary of spec §3.
@@ -122,7 +126,25 @@ pub struct Navigatord<H: DocumentHost> {
 }
 
 impl<H: DocumentHost> Navigatord<H> {
-    pub fn new(host: H) -> Self { Navigatord { host, now: 0 } }
+    /// ★★ THE PRODUCTION CONSTRUCTOR, and it refuses an unconfined host
+    /// (threat model §2.3). `require_confinement()` existed, but nothing on
+    /// the production path called it, so the shipped default was a worker
+    /// running hostile input with the user's authority. Now there is no way
+    /// to build a broker over an unconfined host outside a test build.
+    pub fn start(host: H) -> Result<Self, String> {
+        if !host.is_confined() {
+            return Err("navigatord refuses to start: the document host is not confined \
+                        (configure a launcher, e.g. `portcullis exec --daemon --instance {instance}`)".into());
+        }
+        Ok(Navigatord { host, now: 0 })
+    }
+
+    /// An unconfined broker, for tests: in-process hosts, bare worker
+    /// processes. ★ Compiled only into test builds — this crate's own tests,
+    /// or a dependent that enables the `unconfined-for-testing` feature —
+    /// so a shipped binary that calls it does not link.
+    #[cfg(any(test, feature = "unconfined-for-testing"))]
+    pub fn unconfined_for_testing(host: H) -> Self { Navigatord { host, now: 0 } }
 
     /// The host, for an operator (or a test) inspecting it.
     pub fn host(&self) -> &H { &self.host }
