@@ -406,7 +406,11 @@ impl<'a> Isel<'a> {
                     UnOp::FCeil => self.valu("V_CEIL_F32", d, vec![s], 0),
                     UnOp::FTrunc => self.valu("V_TRUNC_F32", d, vec![s], 0),
                     UnOp::BitReverse => self.valu("V_BFREV_B32", d, vec![s], 0),
-                    UnOp::Clz => return unsup("clz"),
+                    UnOp::Clz => {
+                        // v_clz gives -1 for 0; GIR's clz(0) is 32.
+                        self.valu("V_CLZ_I32_U32", d, vec![s], 0);
+                        self.valu("V_MIN_U32", d, vec![d, O::Imm(32)], 0);
+                    }
                 }
             }
             Op::Bin(o, a, b) if rty == Some(Ty::BOOL) => {

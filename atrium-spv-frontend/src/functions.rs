@@ -2179,6 +2179,25 @@ fn translate_inst(
                                 .saturating_add(idx_val.saturating_mul(stride));
                             current_pointee_id = elem_type_id;
                         }
+                        // A component of a vector (glslang addresses
+                        // `v.x` of a Function vector variable this way).
+                        rspirv::spirv::Op::TypeVector => {
+                            let elem_type_id = match raw.operands.first() {
+                                Some(Operand::IdRef(id)) => *id,
+                                other => return Err(FrontendError::Malformed(format!(
+                                    "Vector type missing component id: {other:?}",
+                                ))),
+                            };
+                            let size = crate::interface::ir_type_size_bytes_for(
+                                &types.types, elem_type_id);
+                            if size == 0 {
+                                return Err(FrontendError::Unsupported(format!(
+                                    "AccessChain into vector of unsized component {elem_type_id}",
+                                )));
+                            }
+                            byte_offset = byte_offset.saturating_add(idx_val.saturating_mul(size));
+                            current_pointee_id = elem_type_id;
+                        }
                         other => return Err(FrontendError::Unsupported(format!(
                             "AccessChain constant step through non-struct \
                              non-array pointee (opcode {other:?}) not supported",

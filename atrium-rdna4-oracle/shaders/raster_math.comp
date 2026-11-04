@@ -1,0 +1,49 @@
+#version 450
+// The math a compute 2D rasterizer uses: unorm pack/unpack, byte
+// extraction, the sRGB transfer curve, src-over blending, SDF coverage,
+// bilinear filtering from a buffer, and float/int conversions.
+// Compile: glslangValidator -V --target-env vulkan1.1
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) buffer In { uint data[]; };
+layout(set = 0, binding = 1) buffer Out { uint o[]; };
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    uint px = data[i] * 0x01010101u * (i + 3u) ^ (i * 0x9e3779b9u);
+    uint b = i * 16u;
+    vec4 c = unpackUnorm4x8(px);
+    o[b + 0u] = packUnorm4x8(c.wzyx);
+    o[b + 1u] = bitfieldExtract(px, 8, 8) + (bitfieldInsert(px, i, 4, 8) << 1);
+    // sRGB encode of a linear value (the exact piecewise curve).
+    float l = c.x;
+    float s = l <= 0.0031308 ? l * 12.92 : 1.055 * pow(l, 1.0 / 2.4) - 0.055;
+    o[b + 2u] = floatBitsToUint(s);
+    o[b + 3u] = uint(clamp(s, 0.0, 1.0) * 255.0 + 0.5);
+    // src-over, premultiplied.
+    vec4 dst = unpackUnorm4x8(px * 7u + 13u);
+    vec4 r = c + dst * (1.0 - c.a);
+    o[b + 4u] = packUnorm4x8(r);
+    // Rounded-rect SDF coverage.
+    vec2 p = vec2(float(i % 8u), float(i / 8u)) + 0.5 - vec2(4.0, 4.0);
+    vec2 q = abs(p) - vec2(2.5, 1.5) + 1.0;
+    float d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - 1.0;
+    o[b + 5u] = floatBitsToUint(clamp(0.5 - d, 0.0, 1.0));
+    o[b + 6u] = floatBitsToUint(smoothstep(-1.0, 1.0, d));
+    // Bilinear from an R8 "atlas" packed 4 texels per word in data[].
+    vec2 uv = vec2(float(i) * 0.37, float(i) * 0.21);
+    vec2 f = fract(uv);
+    ivec2 t = ivec2(floor(uv));
+    uint w0 = data[(t.y * 8 + t.x) & 255];
+    uint w1 = data[(t.y * 8 + t.x + 1) & 255];
+    float a00 = float(w0 & 0xffu) / 255.0, a10 = float((w0 >> 8) & 0xffu) / 255.0;
+    float a01 = float(w1 & 0xffu) / 255.0, a11 = float((w1 >> 8) & 0xffu) / 255.0;
+    float a = mix(mix(a00, a10, f.x), mix(a01, a11, f.x), f.y);
+    o[b + 7u] = floatBitsToUint(a);
+    o[b + 8u] = floatBitsToUint(exp2(c.y * 4.0 - 2.0)) ^ floatBitsToUint(log2(c.z + 0.5));
+    o[b + 9u] = floatBitsToUint(round(uv.x * 3.3)) ^ uint(int(-uv.y * 5.0));
+    o[b + 10u] = floatBitsToUint(sign(d) * abs(d) + fma(c.x, c.y, c.z));
+    o[b + 11u] = uint(max(int(i) - 30, -7)) + min(i, 40u) * 1000u + uint(abs(int(i) - 32)) * 100000u;
+    o[b + 12u] = floatBitsToUint(inversesqrt(c.w + 0.25)) ^ floatBitsToUint(sqrt(c.x));
+    o[b + 13u] = floatBitsToUint(step(0.5, c.x) + float(c.y > c.z) * 2.0);
+    o[b + 14u] = bitCount(px) + findMSB(px | 1u) * 100u + findLSB(px | 0x80000000u) * 10000u;
+    o[b + 15u] = floatBitsToUint(uintBitsToFloat(0x3f800000u | (px >> 9)) - 1.0);
+}

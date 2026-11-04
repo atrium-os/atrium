@@ -6,6 +6,11 @@
 //! flows forward; an `if` gets a result for every variable an arm changes;
 //! a loop gets a parameter and a result for every variable its body stores,
 //! fed by `continue` and `break`.
+//!
+//! First, component accesses of a vector variable (a scalar load or store
+//! at a constant offset inside it, as glslang emits for `v.x = …`) are
+//! rewritten as whole-variable accesses plus an extract or a construct, so
+//! the variable becomes promotable.
 
 use crate::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -261,8 +266,139 @@ fn renumber(r: &mut Region, map: &HashMap<u32, u32>) {
     }
 }
 
+/// Vector variables whose accesses are all whole-variable at offset 0 or
+/// scalar components at constant 4-byte-aligned offsets: index → (vector
+/// type, true if some access is partial).
+fn splittable(f: &Function, k: &HashMap<ValueId, u32>) -> BTreeMap<u32, Ty> {
+    let mut scal: BTreeMap<u32, Option<Scalar>> = BTreeMap::new();
+    let mut partial = BTreeSet::new();
+    let mut bad = BTreeSet::new();
+    fn walk(r: &Region, f: &Function, k: &HashMap<ValueId, u32>, scal: &mut BTreeMap<u32, Option<Scalar>>, partial: &mut BTreeSet<u32>, bad: &mut BTreeSet<u32>) {
+        for n in r {
+            match n {
+                Node::Inst(i) => {
+                    let (var, off, ty) = match &i.op {
+                        Op::Load(Space::Private(v), o) => (*v, *o, f.ty(i.result.unwrap())),
+                        Op::Store(Space::Private(v), o, x) => (*v, *o, f.ty(*x)),
+                        Op::Atomic(_, Space::Private(v), _, _) => {
+                            bad.insert(*v);
+                            continue;
+                        }
+                        _ => continue,
+                    };
+                    let size = f.privates[var as usize];
+                    let Some(&o) = k.get(&off) else {
+                        bad.insert(var);
+                        continue;
+                    };
+                    let whole = o == 0 && ty.bytes() == size;
+                    let comp = ty.comps() == 1 && o % 4 == 0 && o + 4 <= size;
+                    if !whole && !comp {
+                        bad.insert(var);
+                        continue;
+                    }
+                    if !whole {
+                        partial.insert(var);
+                    }
+                    let e = scal.entry(var).or_insert(None);
+                    match e {
+                        Some(s) if *s != ty.scalar() => {
+                            bad.insert(var);
+                        }
+                        _ => *e = Some(ty.scalar()),
+                    }
+                }
+                Node::If { then, els, .. } => {
+                    walk(then, f, k, scal, partial, bad);
+                    walk(els, f, k, scal, partial, bad);
+                }
+                Node::Loop { body, .. } => walk(body, f, k, scal, partial, bad),
+            }
+        }
+    }
+    walk(&f.body, f, k, &mut scal, &mut partial, &mut bad);
+    scal.into_iter()
+        .filter(|(v, s)| partial.contains(v) && !bad.contains(v) && s.is_some() && s.unwrap() != Scalar::Bool)
+        .filter_map(|(v, s)| {
+            let n = f.privates[v as usize] / 4;
+            (2..=4).contains(&n).then(|| (v, Ty::V(s.unwrap(), n as u8)))
+        })
+        .collect()
+}
+
+fn split_region(f: &mut Function, r: Region, vars: &BTreeMap<u32, Ty>, k: &HashMap<ValueId, u32>, zero: ValueId) -> Region {
+    let mut out = Region::new();
+    for n in r {
+        match n {
+            Node::Inst(i) => match &i.op {
+                Op::Load(Space::Private(v), o) if vars.contains_key(v) && f.ty(i.result.unwrap()).comps() == 1 => {
+                    let ty = vars[v];
+                    let w = f.new_value(ty);
+                    out.push(Node::Inst(Inst { result: Some(w), op: Op::Load(Space::Private(*v), zero) }));
+                    out.push(Node::Inst(Inst { result: i.result, op: Op::Extract(w, (k[o] / 4) as u8) }));
+                }
+                Op::Store(Space::Private(v), o, x) if vars.contains_key(v) && f.ty(*x).comps() == 1 => {
+                    let ty = vars[v];
+                    let (v, idx, x) = (*v, (k[o] / 4) as usize, *x);
+                    let w = f.new_value(ty);
+                    out.push(Node::Inst(Inst { result: Some(w), op: Op::Load(Space::Private(v), zero) }));
+                    let mut parts = vec![];
+                    for c in 0..ty.comps() {
+                        if c == idx {
+                            parts.push(x);
+                        } else {
+                            let e = f.new_value(Ty::S(ty.scalar()));
+                            out.push(Node::Inst(Inst { result: Some(e), op: Op::Extract(w, c as u8) }));
+                            parts.push(e);
+                        }
+                    }
+                    let nv = f.new_value(ty);
+                    out.push(Node::Inst(Inst { result: Some(nv), op: Op::Construct(parts) }));
+                    out.push(Node::Inst(Inst { result: None, op: Op::Store(Space::Private(v), zero, nv) }));
+                }
+                _ => out.push(Node::Inst(i)),
+            },
+            Node::If { cond, then, els, results } => {
+                let then = split_region(f, then, vars, k, zero);
+                let els = split_region(f, els, vars, k, zero);
+                out.push(Node::If { cond, then, els, results });
+            }
+            Node::Loop { inits, params, body, results } => {
+                let body = split_region(f, body, vars, k, zero);
+                out.push(Node::Loop { inits, params, body, results });
+            }
+        }
+    }
+    out
+}
+
+/// Rewrite component accesses of vector variables as whole accesses.
+fn split_partial(f: &mut Function) {
+    let mut k = HashMap::new();
+    consts(&f.body, &mut k);
+    let vars = splittable(f, &k);
+    if vars.is_empty() {
+        return;
+    }
+    // A zero offset defined at the top (an existing one if any).
+    let zero = match f.body.iter().find_map(|n| match n {
+        Node::Inst(Inst { result: Some(v), op: Op::Const(0) }) if f.ty(*v) == Ty::I32 => Some(*v),
+        _ => None,
+    }) {
+        Some(z) => z,
+        None => {
+            let z = f.new_value(Ty::I32);
+            f.body.insert(0, Node::Inst(Inst { result: Some(z), op: Op::Const(0) }));
+            z
+        }
+    };
+    let body = std::mem::take(&mut f.body);
+    f.body = split_region(f, body, &vars, &k, zero);
+}
+
 /// Run mem2reg. Returns the number of variables promoted.
 pub fn mem2reg(f: &mut Function) -> usize {
+    split_partial(f);
     let vars = candidates(f);
     if vars.is_empty() {
         return 0;

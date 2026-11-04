@@ -9,10 +9,11 @@ pub mod uniformity;
 
 use crate::Function;
 
-/// The standard pipeline: mem2reg, then folding, CSE, load combining and
-/// DCE until nothing
-/// changes (bounded).
+/// The standard pipeline: folding (so variable offsets are constants),
+/// mem2reg, then folding, CSE, load combining and DCE until nothing changes
+/// (bounded).
 pub fn optimize(f: &mut Function) {
+    fold::fold(f);
     mem2reg::mem2reg(f);
     for _ in 0..8 {
         let a = fold::fold(f);
