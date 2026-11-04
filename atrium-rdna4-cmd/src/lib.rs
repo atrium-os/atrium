@@ -211,6 +211,11 @@ pub fn emit_dispatch(b: &mut Blob, d: &Dispatch) {
 /// (COMPUTE_START_X/Y/Z, FORCE_START_AT_000 clear): `d.groups` workgroups
 /// with ids `start .. start + groups`. Lets a kernel run on a sub-rectangle
 /// of its grid without knowing it.
+///
+/// DISPATCH_DIRECT's dimensions are the end ids (exclusive), not counts, when
+/// the start is nonzero: R9700 atrium18 (2026-11-04) ran a start-X 2, 6-group
+/// dispatch sent as dim 6 and got only groups 2..5. So the packet carries
+/// `start + groups`.
 pub fn emit_dispatch_at(b: &mut Blob, d: &Dispatch, start: [u32; 3]) {
     use regs::*;
     assert_eq!(d.shader_va & 0xff, 0, "shader VA must be 256-byte aligned");
@@ -267,5 +272,6 @@ pub fn emit_dispatch_at(b: &mut Blob, d: &Dispatch, start: [u32; 3]) {
     let initiator = (1 << compute_dispatch_initiator::COMPUTE_SHADER_EN_SHIFT)
         | if start == [0; 3] { 1 << compute_dispatch_initiator::FORCE_START_AT_000_SHIFT } else { 0 }
         | if d.wave32 { 1 << compute_dispatch_initiator::CS_W32_EN_SHIFT } else { 0 };
-    b.packet(op::DISPATCH_DIRECT, &[d.groups[0], d.groups[1], d.groups[2], initiator]);
+    let end: [u32; 3] = std::array::from_fn(|i| start[i] + d.groups[i]);
+    b.packet(op::DISPATCH_DIRECT, &[end[0], end[1], end[2], initiator]);
 }
