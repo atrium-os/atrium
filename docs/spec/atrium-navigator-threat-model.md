@@ -234,6 +234,77 @@ production, and they reach the GPU only through the broker's aqueduct-gpu protoc
 - Remove the GPU device node from the compositor's jail entirely, through its devfs
   ruleset.
 
+#### 2.5.2 Proposed: one jailed renderer per window, no process that sees two
+
+*Proposed 2026-11-04, from the user's suggestion ("if each window had a separate jailed
+compositor which maps only the portion of the shared memory that it would show the
+window"). It removes §2.5.1's last limitation: a compositor that sees every window.*
+
+**The split goes one step further.** "Compositor" has been two jobs in one process.
+
+1. **Rendering a window's content.** This means consuming that window's scene graph,
+   which is hostile. It is per window by nature.
+2. **Composing windows into a screen.** This means stacking, positioning, clipping,
+   opacity and scrolling. Its input is a short layer list that the window manager decides,
+   not content.
+
+Job 1 needs a parser and job 2 needs to see everything. Neither needs the other.
+
+| process | maps | sees |
+|---|---|---|
+| **window renderer** (one jail per window, scoped to that window's origin) | **only its own** scene buffer, one shm object the broker passed it | its own window's content and input events. It never sees pixels, not even its own |
+| **broker** (no parser) | every window's surface BO, on the GPU side only | a layer list: surface, rect, z, clip, opacity. All of it is trusted window-manager state |
+
+**Per frame.**
+1. Each window renderer whose window changed writes its scene buffer and signals the
+   broker.
+2. For each such window, the broker dispatches `bin`/`raster` with **that window's** scene
+   buffer as input and **that window's** surface BO as the only writable target.
+3. The broker runs a fixed `compose` kernel of ours over the surfaces, using the layer
+   list.
+4. Trusted chrome (§2.5.1) goes on top, and the broker flips.
+
+**One GPU VM per window.** GPU ABI v2.1 already allows one VM per app inside the broker's
+context. Each window's dispatches run in a VM that contains only that window's scene buffer
+and surface. If a bounds check in `bin`/`raster` were ever wrong, the GPU's page tables still
+stop the write at the edge of that window's memory. Only the `compose` pass runs in a VM
+that can read every surface. Its input is the trusted layer list, and it never reads a
+hostile buffer.
+
+**Input splits the same way.** The broker routes each event by the layer list (which
+window is under the pointer, which has focus). A window's renderer receives only its own
+events, already translated to window coordinates. It can't observe keystrokes or pointer
+motion meant for another window.
+
+**What this buys.** A compromised renderer for window A reaches A's content and A's
+input, which origin A already had. Cross-window exposure is zero by construction, not by
+validation. This is the same argument as one jail per document (backend §2), carried all
+the way to the screen.
+
+**It can share a jail with the document worker.** A window's renderer and the document
+worker for that window are the same trust domain: one origin, one document. Merging them
+saves a jail and a copy. Keeping them apart keeps the worker's output passing the §4.2
+validator, which semantics and accessibility still need. *Recommend: separate at first,
+because the validator is already built. Merge only if the measured cost says so.*
+
+**Costs and limits, stated.**
+- **Memory.** One surface BO per window. Every modern compositor already keeps a backing
+  store per window (macOS, Wayland), so this is the normal cost, not a new one.
+- **GPU work.** One `bin`/`raster` pair per *damaged* window per frame, plus one `compose`.
+  Idle windows reuse their surface.
+- **Cross-window effects** (backdrop blur, a shadow over the window below) can only be
+  fixed effects inside `compose`, driven by the layer list. An app can't supply its own
+  cross-window shader. That is the point.
+- **Embedded surfaces** (Limen, §8.1 islands) are just more layers. An island's renderer is
+  its own jail, and the document around it never maps the island's buffer. That is the
+  structural answer to the island-overlay clickjacking of §2.9: the broker knows exactly
+  which layer is on top.
+- **Side channels.** Windows share the GPU's time and caches, so contention timing between
+  windows remains possible. It is low bandwidth, and per-window scheduling weights (GPU ABI
+  §4.2) are the lever if it ever matters.
+
+**Rating:** with §2.5.1 alone, low but cross-window. With this, low and per-window.
+
 ### 2.6 The shared store — conversions in Tessera CAS (A5)
 
 A conversion is keyed by its source bytes and served to every later reader of those bytes
@@ -356,6 +427,7 @@ These belong in the model because they are *wins*, not because they need work:
 | P1 | Per-user dedup domain by default; reproduce-to-share | A5 poisoning | design now, code with sharing | §2.6 |
 | P2 | `rctl` memory/CPU limits on converter and worker jails; per-conversion byte budget | A6 | small | §2.2 |
 | P1 | Split frescod: jailed compositor with **no GPU fd** writes a shared scene buffer; the broker runs only our `bin`/`raster` kernels; secure-input path | A1 against the shared compositor and the driver | medium | §2.5.1 |
+| P2 | One jailed renderer per window, one GPU VM per window, fixed `compose` kernel; input routed by layer list (§2.5.2) | cross-window exposure | medium | §2.5.2 |
 | P2 | Fuzz Fresco scene ingest and the GPU ioctl surface; Fresco takes outlines, not fonts | A1 against the shared compositor | medium | §2.5 |
 | P2 | Broker rules for replayed request templates | A3, CSRF | design-time, with §5.4.5 | §2.7 |
 | P2 | Unobscured-input rule for islands; bhyve for the CDM | A2 clickjacking, kernel surface | medium, with §8.1 | §2.9 |
