@@ -301,3 +301,59 @@ fn an_insert_records_the_position_it_landed_at() {
     assert_eq!(*inserts[0].0, 1,
         "the insert went between the first and second item, not at the end: {inserts:?}");
 }
+
+/// ★ A probe drains the timers ITS handler scheduled, on bounds relative to
+/// the probe. They were absolute (50 callbacks and 500 ms of virtual time
+/// since load), so one load-time timer past 500 ms made every delayed effect
+/// on the page unrecordable — found by the legacy-web §5.4.5.6 measurement.
+#[test]
+fn a_delayed_effect_is_recorded_even_after_load_used_timers() {
+    let page = |load_timer: &str| format!(r#"<html><body><button id=b>go</button><p id=p>x</p><script>
+        {load_timer}
+        document.getElementById('b').addEventListener('click', function () {{
+          setTimeout(function () {{ document.getElementById('p').setAttribute('class', 'open'); }}, 10);
+        }});
+      </script></body></html>"#);
+    for load in ["", "setTimeout(function () {}, 800);",
+                 "for (var i = 0; i < 80; i++) setTimeout(function () {}, i);"] {
+        let c = explore(&page(load));
+        assert_eq!(c.transitions.len(), 1, "load {load:?}: {:?}", c.transitions);
+    }
+}
+
+/// …and NOT the page's own leftovers: a load-time timer still pending (past
+/// the load horizon) must not fire inside a probe and be credited to it.
+#[test]
+fn a_probe_does_not_fire_the_pages_own_pending_timers() {
+    let c = explore(r#"<html><body><button id=b>go</button><p id=p>x</p><script>
+        setTimeout(function () { document.getElementById('p').setAttribute('class', 'late'); }, 5200);
+        document.getElementById('b').addEventListener('click', function () {});
+      </script></body></html>"#);
+    assert!(c.transitions.is_empty(), "{:?}", c.transitions);
+}
+
+/// The coverage record says what each interactive element is and what its
+/// probe did (legacy-web §5.4.5.6), without changing what is recorded.
+#[test]
+fn coverage_records_every_interactive_element() {
+    let html = r#"<html><body>
+        <button id=a>a</button><input id=q type=search><form id=f><input name=x></form>
+        <details><summary>s</summary>t</details><div id=h>hover</div><p id=p></p>
+        <script>
+          document.getElementById('a').addEventListener('click', function () { document.getElementById('p').className = 'on'; });
+          document.getElementById('q').addEventListener('keyup', function () {});
+          document.getElementById('h').addEventListener('mouseover', function () {});
+        </script></body></html>"#;
+    let c = explore(html);
+    let by = |tag: &str| c.coverage.iter().find(|k| k.tag == tag).unwrap_or_else(|| panic!("no {tag}: {:?}", c.coverage)).clone();
+    let a = c.coverage.iter().find(|k| k.path.contains('a') && k.tag == "button").unwrap();
+    assert!(a.recorded && a.probed && a.explorable && a.native, "{a:?}");
+    let q = c.coverage.iter().find(|k| k.input_type == "search").unwrap();
+    assert_eq!(q.events, vec!["keyup"]);
+    assert!(!q.explorable && !q.recorded);
+    assert!(by("form").native && by("details").native);
+    let h = by("div");
+    assert_eq!(h.events, vec!["mouseover"]);
+    assert!(!h.native && !h.explorable);
+    assert_eq!(explore(html).html, plain(html).html, "exploring still leaves the artifact unchanged");
+}

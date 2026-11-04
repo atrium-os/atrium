@@ -51,6 +51,8 @@ pub struct Conversion {
     pub transitions: Vec<engine::Transition>,
     /// Interactive elements found — the denominator for `transitions`.
     pub interactive_found: u32,
+    /// Per-element exploration coverage (legacy-web §5.4.5.6).
+    pub coverage: Vec<engine::Interactive>,
     pub elements_after: usize,
     pub depth_after: usize,
     pub scripts_total: usize,
@@ -251,6 +253,7 @@ pub fn convert_with_opts(
         removals_refused: dom.removals_refused,
         transitions: rep.transitions,
         interactive_found: rep.interactive_found,
+        coverage: rep.coverage,
         elements_after: dom.element_count(),
         depth_after: dom.max_depth(),
         scripts_total: scripts.len(),

@@ -625,6 +625,162 @@ population 3, by definition.
 If (2) cannot infer a binding that survives (1)'s typical page, the proposal is wrong and
 should be recorded as refuted here, like §5.4.4.
 
+#### 5.4.5.6a Measured: what exploration covers, and what the rest is (2026-11-05)
+
+Item 1 above, run on both corpora. **The answer reorders the proposal.** Case 1
+(server-fed content) was assumed to dominate. It is 1.5% of the elements a page wired:
+31 of 2,045, in 5 of 123 documents. The two largest uncovered groups are the recorder's
+own limits:
+- the 64-probe cap (case 3);
+- events it never simulates (part of "other").
+
+**Method.**
+- *Interactive element:* every element the page registered a handler on, any event type
+  (`addEventListener` or an `on*` slot), plus every native control: form, input other than
+  hidden, textarea, select, details, button, contenteditable.
+- *Covered:* a §5.4.3 probe recorded a transition for it.
+- *Instrumentation:* per element, `prerender` records its events, whether it was probed
+  or cut by the cap, and what each probe did. That is: same-origin GETs refused because
+  exploration closes the network, cross-origin or non-GET requests refused, beacons,
+  timers scheduled and still pending after the probe's drain, and the nodes its effects
+  wrote. It is enabled by `PRERENDER_COVERAGE=<file>`, which adds `K` report lines. It is
+  observation only: recordings were byte-identical with and without it over batch 2,
+  offline (50/50).
+- *Classification* (`scripts/navigator-corpus/coverage.py`). Each element gets the first
+  rule that applies:
+  - **1** the probe tried the network. This rule comes first, even when the probe also
+    recorded a transition: that transition is then partial. The first version of the
+    script put "covered" first, and that hid all 31 of these;
+  - covered;
+  - **3** cut by the probe cap;
+  - **2** text entry, a form, or only typing events;
+  - **4** the probe left timers pending past its drain;
+  - *native-only*: a native control with no handler and nothing to submit;
+  - *other*, with the reason.
+
+  A search box whose probe fetches therefore counts as case 1, because §5.4.5.2 makes it
+  a data binding.
+- *Runs:* `PRERENDER_NET=1 PRERENDER_EXPLORE=1 PRERENDER_DEADLINE=180`, as the corpora
+  were recorded.
+  - **Batch 1:** 85 recordings, but the original HTML was not kept. Their URLs were
+    re-fetched on 2026-11-05: 73 served, 12 refused (403, 202 or a network error). So
+    batch 1 here is *today's* version of those pages.
+  - **Batch 2:** the saved HTML, 50 pages.
+- *Raw tables* sit outside the repo, at
+  `~/src/navigator-corpus/coverage-2026-11-05/`: per element, per document, the analysis
+  output, and the hashes of the two binaries measured.
+
+**Found by measuring, fixed first: the recorder could not see time.** A probe drained the
+timers its handler scheduled with *absolute* bounds: 50 callbacks and 500 ms of virtual
+time since load. Load drains up to 1,000 callbacks and 5,000 ms. So on any page that used
+timers at load, a probe could fire nothing, and every effect behind a `setTimeout` (a
+delayed menu, a debounced toggle) went unrecorded. A two-element test page shows it: one
+800 ms timer at load turns 1 transition into 0. The fix:
+- bounds relative to the probe's start;
+- only the timers created during the probe are fired, so the page's own pending timers
+  are never credited to a click.
+
+Regression tests (`tests/oracle.rs`) cover both halves. The delayed-effect test fails
+against the old drain. Over the corpora the fix moved 39 elements out of case 4: 3
+became covered (samsung +1, k8s +2) and 36 drained to no visible effect. Everything below
+is **with the fix**. The as-built run is kept beside it (`analysis-asbuilt.txt`): 296
+covered, 30 server-fed, 44 time-driven, 915 other, out of 2,044.
+
+**The numbers.** The first three columns count elements with a registered handler. The
+last column counts every interactive element, handlers plus native controls.
+
+| | batch 1 (73 docs) | batch 2 (50 docs) | **overall (123)** | of all 6,189 |
+|---|---|---|---|---|
+| elements with a handler | 1,315 | 730 | **2,045** | |
+| **covered** (transition recorded) | 200 (15.2%) | 98 (13.4%) | **298 (14.6%)** | 4.8% |
+| 1 server-fed | 30 (2.3%) | 1 (0.1%) | **31 (1.5%)** | 0.5% |
+| 2 free-form input | 161 (12.2%) | 14 (1.9%) | **175 (8.6%)** | 287 (4.6%), incl. 112 forms with no handler |
+| 3 large state space (probe cap) | 443 (33.7%) | 141 (19.3%) | **584 (28.6%)** | 9.4% |
+| 4 time-driven | 4 | 1 | **5 (0.2%)** | 0.1% |
+| other | 477 (36.3%) | 475 (65.1%) | **952 (46.6%)** | 15.4% |
+| native-only (no handler) | | | | 4,032 (65.1%) |
+
+**Case by case.**
+
+1. **Server-fed: 31 elements (1.5%), in 5 documents.** All 31 probes also changed the DOM,
+   so each recorded a *partial* transition: the part that did not need the data.
+   - arXiv: 14 checkboxes that fetch;
+   - the Rust book: 13 "run" buttons, each a refused POST to play.rust-lang.org;
+   - nhs.uk: 2;
+   - walgreens and yahoo.jp: 1 each.
+   
+   Every other probe made no request (642 probes in all). So on these pages, server-fed
+   content arrives at **load** (the prerender admitted 1,082 page requests over corpus 1,
+   §5.4.1c), not on interaction. §5.4.5.1's binding inference is not where coverage is
+   lost. Two blind spots below mean this is a floor rather than a proof of absence:
+   delegation, and synthetic events. The 13 Rust-book buttons are not a binding at all;
+   they execute code on a server (population 3).
+2. **Free-form input: 8.6% of handler elements, and concentrated.** Walgreens alone has
+   149, `keydown`/`keyup` on its search and listing controls. Samsung has 11, the
+   Guardian 8, NASA 5. Typical shapes:
+   - gov.uk's `<form>` on `change,input` and `<input type=search>` on `focus,blur`;
+   - the Guardian's `<label>` on `keydown`;
+   - 112 forms with no handler at all, which are plain submissions (§5.4.5.2's request
+     template).
+3. **Large state spaces: 28.6%, and all of it is the probe cap.** The cap (64 probes per
+   document) cut 584 elements in only **5 documents**: doc11 255, doc10 170 (W3C specs,
+   one `<dfn>` panel each), theverge 79, ynet 62, walgreens 18. Combinations are the
+   smaller problem: 433 pairs of *recorded* transitions (counting the partial ones) write
+   a common node (§5.4.5.3's interference), in 17 of the 32 documents with transitions. Walgreens has 260 of those
+   pairs, NASA 112, El País 23.
+4. **Time-driven: 5 elements.** gov.uk's button arms an interval; walgreens and theverge
+   schedule timers past the 500 ms probe horizon. Timer carousels with no handler are not
+   elements, so this measures time *behind interaction*, not every animated page.
+
+**Other, 952, broken down.**
+- **377 load and error handlers** on `<script>`, `<img>` and `<link>`. Registered, but
+  not user-interactive.
+- **288 probed with no observable effect.** Analytics, `preventDefault`-only links, and
+  handlers that read event fields a bare `Event` lacks (`button`, `clientX`, `key`).
+- **190 touch and drag**, almost all of them MIT OCW's carousel (197 of its elements are
+  in *other*).
+- **27 focus and 36 hover or pointer** handlers. Never dispatched: §5.4.3 probes click,
+  change, input, submit and toggle only.
+- **15 delegating roots in 11 documents** (trello, walgreens, yahoo.jp, ikea, chase):
+  React-style roots that register up to 80 event types on one element, and html/body
+  click listeners. A probe on the root reaches no component.
+
+**native-only, 4,032.** 1,288 `<button>`, 760 `<button type=button>`, 1,032 checkboxes,
+684 `<details>`, and others. The document lane renders checkboxes and `<details>`
+natively. The buttons are the delegation blind spot made visible: a button with no
+handler of its own that does something is handled by a delegating root. So some of
+these 2,048 buttons are uncovered interactions that this method cannot attribute.
+
+**What it says to build, in order.** These replace the earlier assumption that case 1
+leads.
+1. **Make the probe faithful before making it clever.** Dispatch the event kinds pages
+   use (pointer, mouse, key and focus, with real `MouseEvent`/`KeyboardEvent` fields), and
+   dispatch at the *target* through delegating roots: probe each native control and link
+   *under* a root that listens. This is cheap and touches the two largest buckets
+   (other, and native-only buttons).
+2. **Replace the flat 64-probe cap with a budget per handler shape.** The cap's 584 come
+   from 5 documents of many near-identical elements (spec `<dfn>`s, story cards). One
+   probe per *distinct handler function* would cover them at a fraction of the cost.
+3. **Case 2 (free-form input), §5.4.5.2**, mostly search and filter fields: 8.6%, which
+   is the only §5.4.5 case with real weight here.
+4. **Case 1 waits.** Re-measure after (1). If delegation was hiding server-fed handlers,
+   they show up then. For the §5.4.5.6 item 2 prototype, arXiv's 14 fetching checkboxes
+   are the one same-origin-GET candidate in the corpora; nothing else here needs it.
+5. **Case 4 is negligible behind interaction** (5 elements). Timer carousels with no
+   handler need their own measurement before anyone builds for them.
+
+**Limits of the measurement, stated.**
+- Batch 1 is today's pages, not the recorded ones.
+- Live network: two documents differed between arms. Doc13 loaded 25 elements instead
+  of 70 in one run; four reruns gave 70 and 27 recorded every time, and the rerun was
+  used.
+- Window- and document-level listeners are outside the element universe.
+- The measurement also caught two bugs in the jailed converter's relay (backend §4.7d),
+  both fixed and covered by tests. A report line longer than 16 KiB failed the document,
+  and so did a 19–179 KB URL a page asked to fetch (tripadvisor, walgreens, old.reddit).
+  A child that had exited also turned into a protocol error instead of a timeout
+  (theverge, corriere). Those five documents were converted again with the fixed relay.
+
 ### 5.5 WebAssembly is a better cage, not a translation
 
 A recurring hope is that WASM offers a way out. It does not, for a simple factual reason:

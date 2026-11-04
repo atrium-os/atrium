@@ -42,6 +42,11 @@ pub const MAX_BLOB: usize = 8 * 1024 * 1024;
 pub const MAX_RECORDING: usize = 128 * 1024 * 1024;
 pub const MAX_REPORT: usize = 8 * 1024 * 1024;
 pub const MAX_URL: usize = 16 * 1024;
+/// One report line. ★ Report lines are not URLs: an error message or a
+/// coverage line naming many effect targets runs past 16 KiB on real pages
+/// (tripadvisor, walgreens, old.reddit in the corpus), and bounding every line
+/// at the URL limit failed those conversions as protocol errors.
+pub const MAX_LINE: usize = 1024 * 1024;
 
 /// One conversion, as the parent describes it to the child.
 #[derive(Debug, Clone, PartialEq)]
@@ -170,14 +175,27 @@ pub fn drive(
     blob: &mut dyn FnMut(&str, &[u8]),
 ) -> Result<Outcome, String> {
     let mut o = Outcome::default();
+    // Set once the child stops reading: it has exited (its own watchdog, a
+    // crash) or closed its input. Not a protocol error — what it says next on
+    // stdout (TIMEOUT, or nothing) decides how the conversion is reported.
+    let mut child_gone = false;
     loop {
-        let Some(line) = crate::fetch::read_line_bounded(out, MAX_URL + 64)? else { break };
+        let Some(line) = crate::fetch::read_line_bounded(out, MAX_LINE)? else { break };
         if let Some(url) = line.strip_prefix("F ") {
             o.fetches += 1;
-            let frame = fetch(url);
+            if child_gone { continue }
+            // ★ An oversized URL fails THAT FETCH, not the conversion. Real pages
+            // ask for them (19 KB to 179 KB in the corpus: tripadvisor,
+            // walgreens, old.reddit), and the old in-process path simply let
+            // the fetch fail; failing the whole document was this relay's bug.
+            let frame = if url.len() > MAX_URL {
+                crate::fetch::Reply::Err(format!("refused: a {}-byte URL, over the {MAX_URL}-byte limit", url.len())).to_frame()
+            } else {
+                fetch(url)
+            };
             let mut g = stdin.lock().map_err(|_| "stdin lock poisoned")?;
             let Some(w) = g.as_mut() else { return Err("fetch after the child's input was closed".into()) };
-            w.write_all(&frame).and_then(|_| w.flush()).map_err(|e| format!("reply to child: {e}"))?;
+            if w.write_all(&frame).and_then(|_| w.flush()).is_err() { child_gone = true }
         } else if let Some(rest) = line.strip_prefix("BLOB ") {
             let (addr, n) = rest.split_once(' ').ok_or("malformed BLOB line")?;
             let n = len_of(n, MAX_BLOB, "blob")?;
@@ -352,7 +370,9 @@ mod tests {
         for l in [format!("BLOB blake3:00 {}\n", MAX_BLOB + 1), format!("RECORDING {}\n", MAX_RECORDING + 1)] {
             assert!(run(l.as_bytes()).0.unwrap_err().contains("limit"), "{l}");
         }
-        let long = format!("F {}\n", "a".repeat(MAX_URL + 100));
+        // A LINE past MAX_LINE is still a protocol error (a peer that never
+        // ends a line is refused at the bound, not buffered forever).
+        let long = format!("F {}\n", "a".repeat(MAX_LINE + 100));
         assert!(run(long.as_bytes()).0.is_err());
     }
 
@@ -362,6 +382,37 @@ mod tests {
         assert!(!o.ended);
         let o = run(b"TIMEOUT\n").0.unwrap();
         assert!(o.timed_out && !o.ended);
+    }
+
+    #[test]
+    fn a_report_line_longer_than_a_url_is_a_report_line() {
+        let long = format!("E\t{}\nEND\n", "x".repeat(40 * 1024));
+        let o = run(long.as_bytes()).0.unwrap();
+        assert!(o.ended && o.report.len() > 40 * 1024);
+        // …and an oversized fetch REQUEST is refused as that fetch — without
+        // being made — while the conversion goes on.
+        let f = format!("F https://a.example/{}\nEND\n", "a".repeat(MAX_URL));
+        let (r, sent, urls, _) = run(f.as_bytes());
+        assert!(r.unwrap().ended);
+        assert!(urls.is_empty(), "the fetcher was never asked");
+        assert!(String::from_utf8_lossy(&sent).starts_with("err refused: a "), "{}", String::from_utf8_lossy(&sent));
+    }
+
+    #[test]
+    fn a_child_that_stops_reading_is_not_a_protocol_error() {
+        // Its stdin write fails (it exited on its own deadline); what it said
+        // on stdout still decides the outcome.
+        struct Gone;
+        impl Write for Gone {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> { Err(std::io::ErrorKind::BrokenPipe.into()) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let stdin: Mutex<Option<Box<dyn Write + Send>>> = Mutex::new(Some(Box::new(Gone)));
+        let mut asked = 0;
+        let o = drive(&mut &b"F https://a.example/1\nF https://a.example/2\nTIMEOUT\n"[..], &stdin,
+                      &mut |_| { asked += 1; b"err no\n".to_vec() }, &mut |_, _| {}).unwrap();
+        assert!(o.timed_out && !o.ended);
+        assert_eq!((o.fetches, asked), (2, 1), "no fetch is made for a child that is gone");
     }
 
     #[test]

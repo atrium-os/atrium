@@ -2316,7 +2316,7 @@ fn diff_effects(before: &Dom, after: &Dom) -> Vec<crate::engine::Effect> {
     out
 }
 
-fn explore_states(ctx: &mut Context, parser_nodes: Handle) -> (Vec<crate::engine::Transition>, u32) {
+fn explore_states(ctx: &mut Context, parser_nodes: Handle) -> (Vec<crate::engine::Transition>, u32, Vec<crate::engine::Interactive>) {
     use crate::engine::Transition;
     // Elements the page itself wired for interaction. Nothing is guessed:
     // these are the handlers it actually registered.
@@ -2345,7 +2345,9 @@ fn explore_states(ctx: &mut Context, parser_nodes: Handle) -> (Vec<crate::engine
     candidates.sort();
     candidates.dedup();
     let found = candidates.len() as u32;
+    let mut cov = coverage_universe(&candidates);
     candidates.truncate(MAX_PROBES);
+    for (h, _) in &candidates { if let Some(c) = cov.get_mut(h) { c.probed = true; c.over_cap = false } }
 
     // Close the page network for the whole exploration.
     let saved_net = PAGE_NET.with(|n| n.borrow_mut().take());
@@ -2359,6 +2361,9 @@ fn explore_states(ctx: &mut Context, parser_nodes: Handle) -> (Vec<crate::engine
         let path = before.node_path(h);
         let anchored = h < parser_nodes;
 
+        let probe0 = probe_counters(ctx);
+        // The timer clock at the START of this probe, before its handler runs.
+        let (t_fired0, t_now0, t_seq0) = timer_clock(ctx);
         let target = node_obj(h, ctx);
         let script = format!("(function(t){{ try {{ t.dispatchEvent(new Event({ty:?}, \
             {{ bubbles: true, cancelable: true }})); }} catch (e) {{}} }})", ty = ty);
@@ -2366,7 +2371,15 @@ fn explore_states(ctx: &mut Context, parser_nodes: Handle) -> (Vec<crate::engine
             if let Some(c) = f.as_callable() { let _ = c.call(&JsValue::undefined(), &[target], ctx); }
         }
         let _ = ctx.run_jobs();
-        let _ = ctx.eval(Source::from_bytes(b"__deliverMutations(4); __drainTimers(50, 500)"));
+        // ★ RELATIVE to the probe. The bounds used to be absolute — 50
+        // callbacks and 500 ms of virtual time SINCE LOAD — and load drains
+        // up to 1000 and 5000 ms, so on any page that used timers at load a
+        // probe could fire nothing: a click whose effect sits behind a
+        // setTimeout (a delayed menu, a debounced toggle) recorded no
+        // transition at all. Found by the §5.4.5.6 coverage measurement.
+        let drain = format!("__deliverMutations(4); __drainTimers({}, {}, {})",
+                            t_fired0 + 50, t_now0 + 500, t_seq0);
+        let _ = ctx.eval(Source::from_bytes(drain.as_bytes()));
         let _ = ctx.run_jobs();
 
         let (els1, txt1, attrs1, effects) = DOM.with(|d| {
@@ -2378,6 +2391,27 @@ fn explore_states(ctx: &mut Context, parser_nodes: Handle) -> (Vec<crate::engine
         });
         // Restore. The probe is an observation, not an edit.
         DOM.with(|d| *d.borrow_mut() = before);
+        let probe1 = probe_counters(ctx);
+        if let Some(c) = cov.get_mut(&h) {
+            c.net_get += probe1.0.saturating_sub(probe0.0);
+            c.net_blocked += probe1.1.saturating_sub(probe0.1);
+            c.beacons += probe1.2.saturating_sub(probe0.2);
+            c.timers_scheduled += probe1.3.saturating_sub(probe0.3);
+            c.timers_left += probe1.4 - probe0.4;
+            c.intervals_left += probe1.5 - probe0.5;
+            if !effects.is_empty() {
+                c.recorded = true;
+                c.truncated |= effects.iter().any(|e| matches!(e, crate::engine::Effect::Truncated { .. }));
+                for e in &effects {
+                    let t = match e {
+                        crate::engine::Effect::Attribute { target, .. } | crate::engine::Effect::Remove { target } => target.clone(),
+                        crate::engine::Effect::Insert { parent, .. } => parent.clone(),
+                        _ => continue,
+                    };
+                    if !c.effect_targets.contains(&t) { c.effect_targets.push(t) }
+                }
+            }
+        }
 
         // ★ The EFFECTS decide, not the counters. A class toggle leaves
         // element and text counts identical while being exactly the
@@ -2398,7 +2432,75 @@ fn explore_states(ctx: &mut Context, parser_nodes: Handle) -> (Vec<crate::engine
     }
 
     PAGE_NET.with(|n| *n.borrow_mut() = saved_net);
-    (out, found)
+    (out, found, cov.into_values().collect())
+}
+
+/// (callbacks fired, virtual now, last timer id) — the virtual timer clock.
+fn timer_clock(ctx: &mut Context) -> (i64, i64, i64) {
+    let mut t = [0i64; 5];
+    if let Ok(v) = ctx.eval(Source::from_bytes(b"__timerStats()")) {
+        if let Some(o) = v.as_object() {
+            for (i, slot) in t.iter_mut().enumerate() {
+                *slot = o.get(i as u32, ctx).ok().and_then(|x| x.as_number()).unwrap_or(0.0) as i64;
+            }
+        }
+    }
+    (t[0], t[4], t[2])
+}
+
+/// (refused same-origin GETs, blocked requests, beacons, timers scheduled,
+/// timers pending, intervals pending) — read around each probe.
+fn probe_counters(ctx: &mut Context) -> (u32, u32, u32, u32, i64, i64) {
+    let fails = PAGE_FETCHES.with(|c| c.borrow().1);
+    let blocked = PAGE_BLOCKED.with(|b| b.borrow().0);
+    let beacons = ctx.eval(Source::from_bytes(b"__beacons")).ok().and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
+    let mut t = [0i64; 4];
+    if let Ok(v) = ctx.eval(Source::from_bytes(b"__timerStats()")) {
+        if let Some(o) = v.as_object() {
+            for (i, slot) in t.iter_mut().enumerate() {
+                *slot = o.get(i as u32, ctx).ok().and_then(|x| x.as_number()).unwrap_or(0.0) as i64;
+            }
+        }
+    }
+    (fails, blocked, beacons, t[2] as u32, t[1], t[3])
+}
+
+/// Every element the page wired (any event type) plus every native control,
+/// keyed by handle. Ordered, so the report is deterministic.
+fn coverage_universe(candidates: &[(Handle, String)]) -> std::collections::BTreeMap<Handle, crate::engine::Interactive> {
+    use crate::engine::Interactive;
+    let mut m: std::collections::BTreeMap<Handle, Interactive> = Default::default();
+    let mut add = |h: Handle, ev: Option<String>| {
+        let e = m.entry(h).or_default();
+        if let Some(ev) = ev { if !e.events.contains(&ev) { e.events.push(ev) } }
+    };
+    ELISTENERS.with(|l| for (h, v) in l.borrow().iter() { for (ty, _) in v { add(*h, Some(ty.clone())) } });
+    ONHANDLERS.with(|l| for ((h, name), _) in l.borrow().iter() {
+        add(*h, Some(name.strip_prefix("on").unwrap_or(name).to_string()))
+    });
+    let natives: Vec<Handle> = with(|d| (0..d.nodes.len() as Handle).filter(|&h| d.connected(h) && {
+        match d.tag(h) {
+            Some("form" | "textarea" | "select" | "details" | "button") => true,
+            Some("input") => !d.attr(h, "type").is_some_and(|t| t.eq_ignore_ascii_case("hidden")),
+            _ => d.attr(h, "contenteditable").is_some_and(|v| !v.eq_ignore_ascii_case("false")),
+        }
+    }).collect());
+    for &h in &natives { add(h, None) }
+    for h in natives { m.get_mut(&h).unwrap().native = true }
+    let explorable: std::collections::HashSet<Handle> = candidates.iter().map(|(h, _)| *h).collect();
+    m.retain(|h, _| with(|d| d.connected(*h)));
+    for (h, e) in m.iter_mut() {
+        e.events.sort();
+        e.explorable = explorable.contains(h);
+        e.over_cap = e.explorable;          // cleared for the probed ones
+        let (path, tag, ty, ce) = with(|d| (d.node_path(*h), d.tag(*h).unwrap_or("").to_string(),
+            d.attr(*h, "type").unwrap_or("").to_ascii_lowercase(), d.attr(*h, "contenteditable").is_some()));
+        e.path = path;
+        e.input_type = if tag == "input" || tag == "button" { ty } else { String::new() };
+        e.tag = if ce && tag != "input" && tag != "textarea" { format!("{tag}[contenteditable]") } else { tag };
+        if !e.native && e.tag.ends_with("[contenteditable]") { e.native = true }
+    }
+    m
 }
 
 /// One step of xorshift64*, enough for the uses the corpus makes of
@@ -2798,13 +2900,21 @@ const GLOBALS: &str = r#"
   };
   globalThis.cancelIdleCallback = __clear;
 
-  globalThis.__drainTimers = function (maxCallbacks, horizonMs) {
+  // `sinceId`, when given, drains ONLY timers created after that id (an
+  // interval keeps its id when rescheduled). Exploration passes it so a
+  // probe fires the timers ITS handler scheduled — not the page's own
+  // leftovers from load, which would be misattributed to the click.
+  globalThis.__drainTimers = function (maxCallbacks, horizonMs, sinceId) {
+    var floor = (typeof sinceId === 'number') ? sinceId : -1;
     while (__timers.length) {
       if (__tfired >= maxCallbacks) break;
       __timers.sort(function (a, b) { return a.at - b.at || a.seq - b.seq; });
-      var t = __timers[0];
+      var k = 0;
+      while (k < __timers.length && __timers[k].id <= floor) k++;
+      if (k === __timers.length) break;
+      var t = __timers[k];
       if (t.at > horizonMs) break;          // beyond the snapshot horizon
-      __timers.shift();
+      __timers.splice(k, 1);
       if (__cleared[t.id]) continue;
       __now = t.at;
       __tfired++;
@@ -2818,7 +2928,10 @@ const GLOBALS: &str = r#"
     __tdropped = __timers.length;
     return __tfired;
   };
-  globalThis.__timerStats = function () { return [__tfired, __tdropped]; };
+  globalThis.__timerStats = function () {
+    var iv = 0; for (var i = 0; i < __timers.length; i++) if (__timers[i].every !== null) iv++;
+    return [__tfired, __timers.length, __tseq, iv, __now];
+  };
 
   // ★ THE ONE OBSERVER A CONVERTER CAN SERVE HONESTLY.
   //
@@ -4144,7 +4257,7 @@ impl ScriptEngine for BoaEngine {
         LAYOUT_READS.with(|n| *n.borrow_mut() = 0);
         BASE.with(|b| *b.borrow_mut() = self.base_url.clone());
         CURRENT.with(|c| *c.borrow_mut() = None);
-        let mut rep = RunReport { transitions: vec![], interactive_found: 0,
+        let mut rep = RunReport { transitions: vec![], interactive_found: 0, coverage: vec![],
             scripts_run: 0, scripts_failed: 0, errors: vec![],
             missing: vec![], nulls: vec![], first_error: None, cause: None, listeners_fired: 0,
             module_retries: 0, observers_registered: 0, mutation_records: 0,
@@ -4304,9 +4417,10 @@ impl ScriptEngine for BoaEngine {
         // elements on pages full of them.
         if self.explore {
             let parser_nodes = DOM.with(|d| d.borrow().parser_nodes);
-            let (t, found) = explore_states(&mut ctx, parser_nodes);
+            let (t, found, cov) = explore_states(&mut ctx, parser_nodes);
             rep.transitions = t;
             rep.interactive_found = found;
+            rep.coverage = cov;
         }
         NODE_CACHE.with(|c| c.borrow_mut().clear());
         ELISTENERS.with(|m| m.borrow_mut().clear());

@@ -638,6 +638,19 @@ The first networked run differed on one Trello image: the new relay cache was co
 one fetch failed transiently. The URL fetched fine afterwards, and a rerun was
 identical.
 
+**Two relay bugs, found by the coverage measurement** (legacy-web §5.4.5.6a), each now a
+test:
+- **The line bound.** Every child stdout line was held to the 16 KiB URL bound. A report
+  line can be longer, and pages ask to fetch 19–179 KB URLs (tripadvisor, walgreens,
+  old.reddit), so those documents failed as protocol errors. Now a line is bounded at
+  1 MiB, and an over-long URL fails *that fetch* with an `err` frame, without being
+  fetched, as the in-process path always let it fail.
+- **The exited child.** A child that had already exited (its own deadline) turned the
+  next fetch reply into "Broken pipe", a protocol error (theverge, corriere). Now the
+  relay stops writing to it, and what it said on stdout decides the outcome.
+The FreeBSD run below predates these two fixes: it used the relay as first committed
+(68adf2e5), on inputs that hit neither bug.
+
 **FreeBSD (2026-11-04).** This is `scripts/navigator-converter-jail-e2e.sh --rounds 2 --net 1`
 run in the cloud VM: 16-CURRENT arm64 under QEMU **TCG**, the broker `navtest` (uid 1001),
 one jail per conversion created by portcullisd. **PASS.**

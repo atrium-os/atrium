@@ -24,7 +24,50 @@ pub struct ScriptSource {
     pub element: Option<crate::dom::Handle>,
 }
 
+/// One interactive element and what exploration made of it — the
+/// measurement legacy-web §5.4.5.6 asks for before §5.4.5 is built.
+///
+/// ★ OBSERVATION ONLY. Collecting this changes neither which elements are
+/// probed nor what is recorded; the recording is byte-identical with or
+/// without it (checked against the corpus).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Interactive {
+    pub path: String,
+    pub tag: String,
+    /// `type` for an input/button, else empty.
+    pub input_type: String,
+    /// Every event type the page registered on this element, sorted.
+    pub events: Vec<String>,
+    /// A native control: form, input (not hidden), textarea, select,
+    /// details, button, or contenteditable.
+    pub native: bool,
+    /// Has a listener of a type exploration dispatches.
+    pub explorable: bool,
+    /// Probed (an explorable candidate within MAX_PROBES).
+    pub probed: bool,
+    /// An explorable candidate cut by MAX_PROBES.
+    pub over_cap: bool,
+    /// A probe produced a recorded transition.
+    pub recorded: bool,
+    pub truncated: bool,
+    /// Same-origin GETs the probe attempted while the network was closed.
+    pub net_get: u32,
+    /// Requests refused for being cross-origin or not GET.
+    pub net_blocked: u32,
+    pub beacons: u32,
+    /// Timers the probe scheduled, and how many more were still pending
+    /// after its drain than before (time the probe could not see).
+    pub timers_scheduled: u32,
+    pub timers_left: i64,
+    /// Repeating timers pending after the probe.
+    pub intervals_left: i64,
+    /// What the recorded transitions wrote, for the interference count.
+    pub effect_targets: Vec<String>,
+}
+
 pub struct RunReport {
+    /// Per-element exploration coverage (only when exploring).
+    pub coverage: Vec<Interactive>,
     pub scripts_run: usize,
     pub scripts_failed: usize,
     pub errors: Vec<String>,

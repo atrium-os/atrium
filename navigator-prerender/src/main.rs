@@ -109,6 +109,18 @@ fn report(c: &navigator_prerender::Conversion, fetchd: Option<(u64, u64)>) -> St
     for (name, n) in c.nulls.iter() {
         let _ = writeln!(o, "N\t{n}\t{}", name.replace('\t', " "));
     }
+    // Per-element exploration coverage (legacy-web §5.4.5.6): flags are
+    // n native, e explorable, p probed, c cut by the probe cap, r recorded,
+    // t truncated.
+    for k in &c.coverage {
+        let flags: String = [(k.native, 'n'), (k.explorable, 'e'), (k.probed, 'p'), (k.over_cap, 'c'),
+                             (k.recorded, 'r'), (k.truncated, 't')].iter().filter(|(on, _)| *on).map(|(_, ch)| *ch).collect();
+        let clean = |s: &str| s.replace(['\t', '\n', '\r'], " ");
+        let _ = writeln!(o, "K\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            clean(&k.path), clean(&k.tag), clean(&k.input_type), clean(&k.events.join(",")), flags,
+            k.net_get, k.net_blocked, k.beacons, k.timers_scheduled, k.timers_left, k.intervals_left,
+            clean(&k.effect_targets.join("|")));
+    }
     o
 }
 
@@ -820,6 +832,17 @@ fn convert_in_child(
     }
     // A refusal the child reported (origin refusal) is on its stderr.
     for l in stderr.lines().filter(|l| l.starts_with("emit: ")) { eprintln!("{l}") }
+    // PRERENDER_COVERAGE=<file>: append every K line, prefixed by the document.
+    if let Some(path) = std::env::var_os("PRERENDER_COVERAGE") {
+        let name = file.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let mut lines = String::new();
+        for l in o.report.lines().filter(|l| l.starts_with("K\t")) { lines.push_str(&format!("{name}\t{}\n", &l[2..])) }
+        if lines.is_empty() { lines = format!("{name}\t-\n") }
+        use std::io::Write;
+        if let Err(e) = fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut f| f.write_all(lines.as_bytes())) {
+            eprintln!("coverage: cannot write {}: {e}", std::path::Path::new(&path).display());
+        }
+    }
     let mut c = parse_child(&o.report).ok_or_else(|| crash_reason(start.elapsed().as_secs_f64(), &status.to_string(), &stderr))?;
     c.wall_ms = start.elapsed().as_secs_f64() * 1000.0;
     Ok(c)
