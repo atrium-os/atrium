@@ -1044,6 +1044,7 @@ zram_backing_sysctl(SYSCTL_HANDLER_ARGS)
 static int	zram_fast_on = 1;
 static int	zram_fast_reg;		/* 1 once registered with swap_pager */
 static uint64_t	zram_fast_pages, zram_fast_fallback;	/* events, pages / requests */
+static uint64_t	zram_fast_wbskip;	/* event: read sent to GEOM up front (WB slot) */
 
 #ifdef SWAP_FASTPATH_VERSION
 static int
@@ -1061,6 +1062,25 @@ zram_fast(void *arg __unused, int cmd, daddr_t blk, vm_page_t *ma, int npages)
 
 	if (!zram_fast_on || !PMAP_HAS_DMAP)
 		return (EOPNOTSUPP);
+	/*
+	 * A read that touches a written-back slot has to go to GEOM, which
+	 * redoes the whole request: find out before decompressing anything,
+	 * so its other pages are not decompressed twice.  Unlocked peek; a
+	 * slot that changes state meanwhile is caught by zram_load below.
+	 */
+	if (cmd == BIO_READ) {
+		for (i = 0; i < npages; i++) {
+			if (ma[i] == bogus_page || blk < 0 ||
+			    (uint64_t)blk + i >= zram_nslots)
+				continue;
+			sl = zram_slot((uint32_t)(blk + i), false);
+			if (sl != NULL && atomic_load_8(&sl->state) == ZRAM_WB) {
+				ZRAM_ADD(zram_fast_fallback, 1);
+				ZRAM_ADD(zram_fast_wbskip, 1);
+				return (EAGAIN);
+			}
+		}
+	}
 	t0 = zram_t0();
 	for (i = 0; i < npages; i++) {
 		if (ma[i] == bogus_page)
@@ -1454,6 +1474,8 @@ SYSCTL_U64(_kern_zram, OID_AUTO, fast_pages, CTLFLAG_RD, &zram_fast_pages, 0,
     "Pages served by the swap fast path");
 SYSCTL_U64(_kern_zram, OID_AUTO, fast_fallback, CTLFLAG_RD, &zram_fast_fallback, 0,
     "Fast-path requests handed back to GEOM");
+SYSCTL_U64(_kern_zram, OID_AUTO, fast_wbskip, CTLFLAG_RD, &zram_fast_wbskip, 0,
+    "Of those, reads handed back before any work because a page was written back");
 SYSCTL_U64(_kern_zram, OID_AUTO, phys_bytes, CTLFLAG_RD, &zram_phys_bytes, 0,
     "Physical bytes the compressed store currently holds");
 

@@ -735,6 +735,43 @@ in "other" is TLB shootdowns from `vm_pageout` unmapping pages, which design B
 would address by batching. Raw results: `zram-bench/zram_designA_*` in
 project files.
 
+**LZ4 rerun with a backing store (R9700, 2026-11-04 16:28–16:37Z; 4 GB
+file-backed md as `backing_dev`; a GPU CFD solve was running on the host).**
+Both fills 0 of 486,400 corrupt.
+
+| LZ4 | fast path off | fast path on |
+|---|---|---|
+| §6 share | 61.0 % | 31.0 % |
+| samples: zram / swap / GEOM | 84,472 / 28,105 / 104,134 | 88,483 / 28,922 / 10,917 |
+| busy kernel samples | 860,940 | 531,995 |
+| swap pages out / in | 2.49M / 4.18M | 2.17M / 3.81M |
+| swap + GEOM samples per 1k swapped pages | 19.8 | 6.7 |
+| `fast_fallback` / `wb_reads` | n/a / 508k | 283,523 / 463k |
+| `fail_nomem` | 181 | 2,102 |
+
+**Reading.** The share stays above 25 % for LZ4 because LZ4 itself is cheap:
+zram is only about 88k samples, so whatever is left looks large next to it.
+In absolute terms the fast path cuts swap + GEOM CPU per swapped page to a
+third, and GEOM to 2 % of busy kernel CPU. What remains is mostly the
+"swap" bucket (slot bookkeeping, `swp_pager_meta`), which design B pays too
+as long as it keeps swap slots. The two arms are not a controlled comparison:
+the fill's page contents differed (the `bench` sample compressed 2.5× off and
+6.4× on), and the host was busy.
+
+Fix found by this run: a read touching a written-back slot decompressed the
+other pages and then fell back, so GEOM decompressed them again (283k
+fallbacks). `zram_fast()` now checks for WB slots before doing any work
+(`kern.zram.fast_wbskip`). The higher `fail_nomem` with the fast path on is
+not yet explained. Chunk allocation is M_NOWAIT on both paths; with the fast
+path it runs in the page daemon's context. Not a correctness issue: failed
+stores fall back to write-through.
+
+**Decision input (2026-11-04).** A brings zstd under the threshold (18 %),
+and for LZ4 it removes two thirds of the swap + GEOM cost. B would remove at
+most the remaining slot bookkeeping plus batch TLB shootdowns. Recommendation:
+keep A; reopen B only if a real workload shows TLB shootdowns from page-out
+dominating.
+
 ## 7. Measuring in the VM (the real numbers)
 
 Build memprobe natively in the VM (`cargo build --release`). The default `zstd`
