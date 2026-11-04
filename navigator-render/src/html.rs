@@ -2103,7 +2103,20 @@ impl<'a> Cx<'a> {
                 }
             }
         }
-        let rows = size_tracks(&rowtracks, cb_h, rgap, &rmin, &rmin, &rmin, &rspans);
+        let mut rows = size_tracks(&rowtracks, cb_h, rgap, &rmin, &rmin, &rmin, &rspans);
+        // ★ An indefinite height with a definite MIN-height: the rows are
+        // stretched (auto) or expanded (fr) into the min-height's content
+        // box instead (Grid §12.7.1, §12.8). Asahi's tab box is
+        // `min-height: 216px` over `auto 176px` rows: without it the auto
+        // row was 0, and the list started under its own tab headers.
+        if cb_h.is_none() {
+            let bw = |side: &str| if kw(s, &format!("border-{side}-style")) == "none" { 0 } else { len(s.get(&format!("border-{side}-width")), 0).unwrap_or(0) };
+            let frame_v = len(s.get("padding-top"), w).unwrap_or(0) + len(s.get("padding-bottom"), w).unwrap_or(0) + bw("top") + bw("bottom");
+            let used = rows.iter().sum::<U>() + rgap * (rows.len() as U).saturating_sub(1);
+            if let Some(minh) = len(s.get("min-height"), 0).map(|m| (m - frame_v).max(0)).filter(|m| *m > used) {
+                rows = size_tracks(&rowtracks, Some(minh), rgap, &rmin, &rmin, &rmin, &[]);
+            }
+        }
         let total_h = rows.iter().sum::<U>() + rgap * (rows.len() as U).saturating_sub(1);
         // ★ The STATIC position of an absolutely positioned child (CSS
         // Position 3 §4.2, Box Alignment §5.1): its own justify-self /
@@ -5113,6 +5126,17 @@ mod tests {
             .g > div { width: 50px; height: 50px; background-color: #00ff00 }</style>
             <div class="g"><div></div></div>"#);
         assert_eq!(boxes(&o, 0x00ff00ff), vec![(0, 50, 50, 50)]);
+    }
+
+    /// With an auto height but a definite min-height, rows stretch into
+    /// the min-height (Grid §12.8): Asahi's `auto 176px` tab box.
+    #[test]
+    fn grid_rows_stretch_into_a_min_height() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 100px; min-height: 216px; grid-template-rows: auto 176px }
+            .b { grid-row-start: 2; height: 176px; background-color: #00ff00 }</style>
+            <div class="g"><div class="b"></div></div>"#);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(0, 40, 100, 176)]);
     }
 
     #[test]
