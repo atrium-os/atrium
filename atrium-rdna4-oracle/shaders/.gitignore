@@ -1,0 +1,2 @@
+# The SPIR-V is checked in: glslang is not part of the normal build.
+!*.spv
