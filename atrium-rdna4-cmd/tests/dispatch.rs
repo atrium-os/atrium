@@ -15,7 +15,7 @@ fn dispatch_packets_are_well_formed() {
     let mut b = Blob::compute();
     emit_dispatch(&mut b, &Dispatch {
         shader_va: 0x1_0000_0000, vgprs: 3, user_sgprs: vec![0x1000, 0x1],
-        threads: [64, 1, 1], groups: [1, 1, 1], wave32: true,
+        threads: [64, 1, 1], groups: [1, 1, 1], wave32: true, lds_bytes: 0,
     });
     b.pad(8);
     assert_eq!(b.dw.len() % 8, 0);

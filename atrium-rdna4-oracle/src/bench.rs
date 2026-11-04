@@ -98,7 +98,7 @@ pub fn desktop(shader: &str, spv_path: &str, nodes: u32, record: u32, repeat: u3
     }
     let mut ib = Blob::compute();
     ib.timestamp(TS_VA);
-    emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs: bin.vgprs, user_sgprs: user, threads: bin.local_size, groups: [groups, 1, 1], wave32: true });
+    emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs: bin.vgprs, user_sgprs: user, threads: bin.local_size, groups: [groups, 1, 1], wave32: true, lds_bytes: bin.lds_bytes });
     ib.timestamp(TS_VA + 8);
     ib.pad(8);
     let mut code: Vec<u8> = bin.code.iter().flat_map(|d| d.to_le_bytes()).collect();

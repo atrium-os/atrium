@@ -329,6 +329,17 @@ impl<'a> Isel<'a> {
         Ok((self.src(off, 0)?, 0))
     }
 
+    /// LDS address: (address VGPR, 16-bit immediate offset).
+    fn ds_address(&mut self, off: ValueId) -> Result<(O, u16), Error> {
+        let (a, k) = self.address(off)?;
+        if (0..1 << 16).contains(&k) {
+            return Ok((a, k as u16));
+        }
+        let t = O::R(self.vreg(Class::V, 1), 0);
+        self.valu("V_ADD_NC_U32", t, vec![a, O::Imm(k as u32)], 0);
+        Ok((t, 0))
+    }
+
     fn def_of(&self, v: ValueId) -> Option<Op> {
         fn find(r: &Region, v: ValueId) -> Option<Op> {
             for n in r {
@@ -361,6 +372,7 @@ impl<'a> Isel<'a> {
                 .position(|b| *b == (set, binding))
                 .map(|i| 2 * i as u8)
                 .ok_or_else(|| Error::Internal(format!("buffer ({set}, {binding}) not in the ABI"))),
+            Space::Push => self.abi.push_sgpr().ok_or_else(|| Error::Internal("push load without a push block".into())),
             other => unsup(format!("{other:?} memory in G3")),
         }
     }
@@ -524,6 +536,53 @@ impl<'a> Isel<'a> {
                 }
             }
             Op::Builtin(b) => self.builtin(*b, res.unwrap())?,
+            Op::Load(Space::Workgroup, off) => {
+                let r = res.unwrap();
+                if self.ty(r) == Ty::BOOL {
+                    return unsup("bool load");
+                }
+                let name = match self.ty(r).comps() {
+                    1 => "DS_LOAD_B32",
+                    2 => "DS_LOAD_B64",
+                    3 => "DS_LOAD_B96",
+                    _ => "DS_LOAD_B128",
+                };
+                let (addr, o) = self.ds_address(*off)?;
+                let d = self.def_v(r);
+                self.mi.push(MI::Ds { name, vdst: Some(O::R(d, 0)), addr, data: None, off: o });
+            }
+            Op::Store(Space::Workgroup, off, v) => {
+                let name = match self.ty(*v).comps() {
+                    1 => "DS_STORE_B32",
+                    2 => "DS_STORE_B64",
+                    3 => "DS_STORE_B96",
+                    _ => "DS_STORE_B128",
+                };
+                let (addr, o) = self.ds_address(*off)?;
+                let data = self.vgroup(*v)?;
+                self.mi.push(MI::Ds { name, vdst: None, addr, data: Some(data), off: o });
+            }
+            Op::Atomic(o, Space::Workgroup, off, v) => {
+                let r = res.unwrap();
+                let used = self.uses.get(&r).copied().unwrap_or(0) > 0;
+                let name = match (o, used) {
+                    (AtomicOp::Add, true) => "DS_ADD_RTN_U32",
+                    (AtomicOp::Add, false) => "DS_ADD_U32",
+                    (AtomicOp::And, _) => "DS_AND_RTN_B32",
+                    (AtomicOp::Or, _) => "DS_OR_RTN_B32",
+                    (AtomicOp::Xor, _) => "DS_XOR_RTN_B32",
+                    (AtomicOp::SMin, _) => "DS_MIN_RTN_I32",
+                    (AtomicOp::SMax, _) => "DS_MAX_RTN_I32",
+                    (AtomicOp::UMin, _) => "DS_MIN_RTN_U32",
+                    (AtomicOp::UMax, _) => "DS_MAX_RTN_U32",
+                    (AtomicOp::Exchange, _) => "DS_STOREXCHG_RTN_B32",
+                };
+                let (addr, off) = self.ds_address(*off)?;
+                let data = self.vgroup(*v)?;
+                // The RTN forms always write vdst; give it a register.
+                let vdst = if name.contains("RTN") { Some(O::R(self.def_v(r), 0)) } else { None };
+                self.mi.push(MI::Ds { name, vdst, addr, data: Some(data), off });
+            }
             Op::Load(space, off) => {
                 let saddr = self.saddr(*space)?;
                 let (vaddr, ioff) = self.address(*off)?;
@@ -579,7 +638,7 @@ impl<'a> Isel<'a> {
                 // Device scope: other workgroups see the result.
                 self.mi.push(MI::Global { name, vdst, vaddr, saddr, data: Some(data), ioff, th: used as u8, scope: 2 });
             }
-            Op::Barrier => return unsup("barrier (needs workgroup memory, G4)"),
+            Op::Barrier => self.mi.push(MI::Barrier),
             Op::Yield(vals) => {
                 let targets = self.yields.last().cloned().unwrap_or_default();
                 for (t, v) in targets.iter().zip(vals) {

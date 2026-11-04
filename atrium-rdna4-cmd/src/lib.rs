@@ -127,7 +127,13 @@ pub struct Dispatch {
     pub groups: [u32; 3],
     /// Wave32 (true) or wave64.
     pub wave32: bool,
+    /// Workgroup-shared memory (LDS) per workgroup, in bytes.
+    pub lds_bytes: u32,
 }
+
+/// Bytes per COMPUTE_PGM_RSRC2.LDS_SIZE step, measured on the R9700
+/// (2026-11-04): 512, not the 1 KiB LDS block of the ISA guide §3.3.5.
+pub const LDS_SIZE_UNIT: u32 = 512;
 
 /// Append the state and launch for `d` to `b`.
 pub fn emit_dispatch(b: &mut Blob, d: &Dispatch) {
@@ -148,7 +154,9 @@ pub fn emit_dispatch(b: &mut Blob, d: &Dispatch) {
         // TTMP7 = {Z, Y} too (RDNA4 ISA guide §3.5.3.4).
         | compute_pgm_rsrc2::TGID_X_EN_MASK
         | compute_pgm_rsrc2::TGID_Y_EN_MASK
-        | compute_pgm_rsrc2::TGID_Z_EN_MASK;
+        | compute_pgm_rsrc2::TGID_Z_EN_MASK
+        | (d.lds_bytes.div_ceil(LDS_SIZE_UNIT) << compute_pgm_rsrc2::LDS_SIZE_SHIFT);
+    assert!(d.lds_bytes <= 64 * 1024, "LDS is 64 KiB per workgroup");
     b.set_sh(COMPUTE_PGM_LO, &[(d.shader_va >> 8) as u32, (d.shader_va >> 40) as u32]);
     b.set_sh(COMPUTE_PGM_RSRC1, &[rsrc1, rsrc2]);
     b.set_sh(COMPUTE_PGM_RSRC3, &[0]);

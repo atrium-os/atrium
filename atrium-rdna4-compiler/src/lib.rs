@@ -30,23 +30,31 @@ pub enum Error {
 
 /// How resources reach the shader (the interim compute ABI).
 ///
-/// User SGPRs `s[2i:2i+1]` hold the 64-bit address of `buffers[i]`; the
+/// User SGPRs `s[2i:2i+1]` hold the 64-bit address of `buffers[i]`; if the
+/// kernel has push constants, the next pair holds the address of the
+/// push-constant block (read with uniform global loads); the
 /// workgroup id is architected (X in `ttmp9`, Y/Z in `ttmp7` halves); `v0` holds the
 /// packed local invocation id.
 #[derive(Debug, Clone)]
 pub struct Abi {
     /// Storage buffers in user-SGPR order, as (set, binding).
     pub buffers: Vec<(u32, u32)>,
+    /// The kernel reads push constants.
+    pub push: bool,
 }
 
 impl Abi {
     /// The ABI for `f`: its buffers in (set, binding) order.
     pub fn for_function(f: &Function) -> Abi {
-        Abi { buffers: f.buffers.clone() }
+        Abi { buffers: f.buffers.clone(), push: f.push_bytes > 0 }
     }
     /// Number of user SGPRs.
     pub fn user_sgprs(&self) -> u8 {
-        2 * self.buffers.len() as u8
+        2 * self.buffers.len() as u8 + if self.push { 2 } else { 0 }
+    }
+    /// First user SGPR of the push-constant block address.
+    pub fn push_sgpr(&self) -> Option<u8> {
+        self.push.then(|| 2 * self.buffers.len() as u8)
     }
 }
 
@@ -63,18 +71,17 @@ pub struct Binary {
     pub abi: Abi,
     /// Workgroup size.
     pub local_size: [u32; 3],
+    /// Workgroup-shared memory (LDS) in bytes.
+    pub lds_bytes: u32,
 }
 
 /// Compile an optimised GIR kernel.
 pub fn compile(f: &Function) -> Result<Binary, Error> {
-    if f.push_bytes > 0 {
-        return Err(Error::Unsupported("push constants (G4)".into()));
+    if f.workgroup_bytes > 64 * 1024 {
+        return Err(Error::Unsupported("more than 64 KiB of workgroup memory".into()));
     }
-    if f.workgroup_bytes > 0 {
-        return Err(Error::Unsupported("workgroup memory (G4)".into()));
-    }
-    if f.buffers.len() > 8 {
-        return Err(Error::Unsupported("more than 8 storage buffers".into()));
+    if 2 * f.buffers.len() + if f.push_bytes > 0 { 2 } else { 0 } > 16 {
+        return Err(Error::Unsupported("more than 16 user SGPRs (8 buffers, or 7 plus push constants)".into()));
     }
     let abi = Abi::for_function(f);
     let u = atrium_gir::passes::uniformity::analyse(f);
@@ -82,7 +89,7 @@ pub fn compile(f: &Function) -> Result<Binary, Error> {
     is.run()?;
     let asg = regalloc::allocate(&is.mi, &is.vregs, 1, abi.user_sgprs())?;
     let code = emit::emit(&is.mi, &is.vregs, &asg);
-    Ok(Binary { code, vgprs: asg.vgprs, sgprs: asg.sgprs, abi, local_size: f.local_size })
+    Ok(Binary { code, vgprs: asg.vgprs, sgprs: asg.sgprs, abi, local_size: f.local_size, lds_bytes: f.workgroup_bytes })
 }
 
 /// Disassembly-style listing (instruction names per decoded word group).

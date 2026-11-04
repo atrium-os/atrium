@@ -42,6 +42,7 @@ pub fn write_42() -> Case {
         threads: [64, 1, 1],
         groups: [1, 1, 1],
         wave32: true,
+        lds_bytes: 0,
     });
     ib.pad(8);
 
@@ -124,7 +125,7 @@ pub fn desktop(name: &str, spv: &str, nodes: u32, record: u32) -> Option<Case> {
         user.extend([va as u32, (va >> 32) as u32]);
     }
     let mut ib = Blob::compute();
-    emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs: bin.vgprs, user_sgprs: user, threads: bin.local_size, groups: [groups, 1, 1], wave32: true });
+    emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs: bin.vgprs, user_sgprs: user, threads: bin.local_size, groups: [groups, 1, 1], wave32: true, lds_bytes: bin.lds_bytes });
     ib.pad(8);
     let mut code = words_to_bytes(&bin.code);
     assert!(code.len() <= IB_OFFSET as usize, "shader larger than the code slot");
@@ -163,6 +164,11 @@ pub fn tierb(name: &str) -> Option<Case> {
     let bin = atrium_rdna4_compiler::compile(&g).ok()?;
     let fill = |k: u32| -> Vec<u8> { (0..256u32).flat_map(|i| (i % 7 + k).to_le_bytes()).collect() };
     let mut ib_bufs: interp::Buffers = g.buffers.iter().map(|&(s, b)| ((s, b), fill(b + 1))).collect();
+    // Push constants: small distinct integers (3, 4, 5, ...).
+    let push: Vec<u8> = (0..g.push_bytes / 4).flat_map(|i| (i + 3).to_le_bytes()).collect();
+    if g.push_bytes > 0 {
+        ib_bufs.insert(interp::PUSH, push.clone());
+    }
     let inputs = ib_bufs.clone();
     interp::run(&g, [1, 1, 1], &mut ib_bufs).ok()?;
     let mut user = vec![];
@@ -179,8 +185,13 @@ pub fn tierb(name: &str) -> Option<Case> {
             unordered: None,
         });
     }
+    if bin.abi.push {
+        let va = data_va(buffers.len());
+        user.extend([va as u32, (va >> 32) as u32]);
+        buffers.push(Buffer { name: "push".into(), va, size: 4096, init: push, expect: None, unordered: None });
+    }
     let mut ib = Blob::compute();
-    emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs: bin.vgprs, user_sgprs: user, threads: bin.local_size, groups: [1, 1, 1], wave32: true });
+    emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs: bin.vgprs, user_sgprs: user, threads: bin.local_size, groups: [1, 1, 1], wave32: true, lds_bytes: bin.lds_bytes });
     ib.pad(8);
     let mut code = words_to_bytes(&bin.code);
     code.resize(IB_OFFSET as usize, 0);
@@ -191,9 +202,10 @@ pub fn tierb(name: &str) -> Option<Case> {
 }
 
 /// Tier-B examples tried as compiled cases, simplest first.
-pub const TIERB: [&str; 16] = [
+pub const TIERB: [&str; 18] = [
     "write_42", "per_thread", "multi_binding", "max_const", "ternary", "branch", "rmw", "rotate",
     "bit_chain", "bit_count", "loop_mul", "sum_loop", "atomic_add", "per_thread_triangle", "spec_scale", "float_sqrt",
+    "push_scale", "groupshared_xor",
 ];
 
 /// The desktop compute shaders: name, SPIR-V path under `bundles/`, bytes
@@ -245,7 +257,7 @@ fn one_lane_case(name: String, sh: Vec<u32>, vgprs: u32, wave32: bool, rsrc2_ext
     use atrium_rdna4_cmd::regs::{self, compute_pgm_rsrc2 as r2};
     let user = vec![DATA_VA as u32, (DATA_VA >> 32) as u32];
     let mut ib = Blob::compute();
-    emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs, user_sgprs: user.clone(), threads: [1, 1, 1], groups: [1, 1, 1], wave32 });
+    emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs, user_sgprs: user.clone(), threads: [1, 1, 1], groups: [1, 1, 1], wave32, lds_bytes: 0 });
     if rsrc2_extra != 0 {
         // Re-issue RSRC2 just before the DISPATCH_DIRECT (header + 4 dwords).
         let n = ib.dw.len();
@@ -302,7 +314,7 @@ pub fn vgpr_alloc(wave32: bool, field: u32) -> Case {
     one_lane_case(format!("vgpr_alloc_w{w}_f{field}"), sh, g * (field + 1), wave32, 0, VGPR_PROBES as usize, expect)
 }
 
-/// Bytes per COMPUTE_PGM_RSRC2.LDS_SIZE step. Not the 1024-byte LDS block
+/// Bytes per COMPUTE_PGM_RSRC2.LDS_SIZE step (also atrium_rdna4_cmd::LDS_SIZE_UNIT). Not the 1024-byte LDS block
 /// of ISA §3.3.5: on the R9700 (2026-11-04 report v3) LDS_SIZE=1 kept byte
 /// 508 but not 1020, and LDS_SIZE=64 did not reach 65532. 512 fits both; the
 /// f2/f128 cases below pin it.

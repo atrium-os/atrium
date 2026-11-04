@@ -83,6 +83,21 @@ pub enum MI {
         /// Coherence scope.
         scope: u8,
     },
+    /// LDS (workgroup memory) op: address = `addr` + `off` bytes.
+    Ds {
+        /// Instruction name.
+        name: &'static str,
+        /// Loaded or returned data.
+        vdst: Option<O>,
+        /// Byte-address VGPR.
+        addr: O,
+        /// Stored data / atomic operand.
+        data: Option<O>,
+        /// Immediate byte offset (0..=65535).
+        off: u16,
+    },
+    /// Workgroup execution and LDS memory barrier.
+    Barrier,
     /// Branch target.
     Label(u32),
     /// SOPP branch to a label.
@@ -123,6 +138,15 @@ impl MI {
                 r(dst, &mut d);
                 for s in src {
                     r(s, &mut u);
+                }
+            }
+            MI::Ds { vdst, addr, data, .. } => {
+                if let Some(x) = vdst {
+                    r(x, &mut d);
+                }
+                r(addr, &mut u);
+                if let Some(x) = data {
+                    r(x, &mut u);
                 }
             }
             MI::Global { vdst, vaddr, data, .. } => {

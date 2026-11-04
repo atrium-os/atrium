@@ -33,6 +33,9 @@ struct E<'a> {
     asg: &'a Assignment,
     vregs: &'a [VRegInfo],
     loads: VecDeque<Vec<u16>>,
+    /// Outstanding LDS ops in issue order (returned registers; empty for
+    /// stores). DSCNT counts them all and LDS returns in order.
+    ds: VecDeque<Vec<u16>>,
     valu_wrote_s: HashSet<u16>,
     valu_read_s: HashSet<u16>,
     trans: HashSet<u16>,
@@ -75,12 +78,25 @@ impl<'a> E<'a> {
             self.a.sopp("S_WAIT_LOADCNT", left as u16);
             self.loads.drain(..=i);
         }
+        if let Some(i) = self.ds.iter().rposition(|l| l.iter().any(|r| regs.contains(r))) {
+            let left = self.ds.len() - 1 - i;
+            self.a.sopp("S_WAIT_DSCNT", left as u16);
+            self.ds.drain(..=i);
+        }
     }
 
     fn drain(&mut self) {
         if !self.loads.is_empty() {
             self.a.sopp("S_WAIT_LOADCNT", 0);
             self.loads.clear();
+        }
+        self.drain_ds();
+    }
+
+    fn drain_ds(&mut self) {
+        if !self.ds.is_empty() {
+            self.a.sopp("S_WAIT_DSCNT", 0);
+            self.ds.clear();
         }
     }
 
@@ -218,6 +234,35 @@ impl<'a> E<'a> {
                     self.loads.push_back(dregs);
                 }
             }
+            MI::Ds { name, vdst, addr, data, off } => {
+                let w: u16 = if name.ends_with("B128") { 4 } else if name.ends_with("B64") { 2 } else { 1 };
+                let mut touch = self.regs(*addr, 1);
+                if let Some(x) = data {
+                    touch.extend(self.regs(*x, w));
+                }
+                let dregs = vdst.map(|x| self.regs(x, w)).unwrap_or_default();
+                touch.extend(dregs.iter().copied());
+                self.wait_for(&touch);
+                let mut f: Vec<(&str, u64)> = vec![
+                    ("ADDR", (self.code(*addr) - 256) as u64),
+                    ("OFFSET0", (*off & 0xff) as u64),
+                    ("OFFSET1", (*off >> 8) as u64),
+                ];
+                if let Some(x) = vdst {
+                    f.push(("VDST", (self.code(*x) - 256) as u64));
+                }
+                if let Some(x) = data {
+                    f.push(("DATA0", (self.code(*x) - 256) as u64));
+                }
+                self.a.emit(name, "ENC_VDS", &f);
+                self.ds.push_back(dregs);
+            }
+            MI::Barrier => {
+                // LDS writes before the barrier are visible after it.
+                self.drain_ds();
+                self.a.emit("S_BARRIER_SIGNAL", "ENC_SOP1", &[("SSRC0", 193), ("SDST", 0)]); // -1: the workgroup barrier
+                self.a.sopp("S_BARRIER_WAIT", 0xffff);
+            }
             MI::Label(l) => {
                 self.drain();
                 self.labels.insert(*l, self.a.pos());
@@ -241,6 +286,7 @@ pub fn emit(mi: &[MI], vregs: &[VRegInfo], asg: &Assignment) -> Vec<u32> {
         asg,
         vregs,
         loads: VecDeque::new(),
+        ds: VecDeque::new(),
         valu_wrote_s: HashSet::new(),
         valu_read_s: HashSet::new(),
         trans: HashSet::new(),
