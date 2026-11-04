@@ -1714,11 +1714,30 @@ jaild suite (71 tests) passes on FreeBSD.
   disabled, test-only services.d manifest granting `memory_govern` to uid 0. It was
   removed afterwards. The production governor reads `/dev/pressure`, which this stock
   kernel lacks.
-- `scripts/deploy-portcullis.sh` rewrites `/etc/atrium/jaild.policy.toml`, which drops
-  `allow_rctl`. jaild then **refuses** every limited one-shot (`rctl.disabled`). That
-  is the right failure, but re-add the section after each deploy.
-- `/var/log/atrium/` keeps one log file per one-shot instance name: 339 files after
-  this session's runs. They are small, but nothing rotates them.
+- ~~`scripts/deploy-portcullis.sh` rewrites `/etc/atrium/jaild.policy.toml`, which drops
+  `allow_rctl`.~~ **Fixed 2026-11-05.** The deploy merges instead of copying:
+  `scripts/jaild-policy-merge.sh` writes the repository policy with the **target's**
+  `[resource_control]` section kept, every key in it (`allow_reap` too).
+  `ALLOW_RCTL=true|false` (and `ALLOW_REAP`) sets a key explicitly. A target with no
+  section gets the repository policy byte for byte, defaults off. The deploy prints
+  which it did (`policies ok ([resource_control] from the target: allow_rctl = true`).
+  Tests: `jaild-policy/tests/deploy_merge.rs` runs the script on the shipped policy and
+  parses each output with the real parser.
+- ~~On the `--daemon` lane the "running UNCAPPED" line reaches only portcullisd's log.~~
+  **Fixed 2026-11-05.** `resolve_limits_noted` returns the warning, and
+  `run_with_stdio` writes it to the **caller's** stderr descriptor (the one that arrived
+  over SCM_RIGHTS) as well as the daemon log (`tell_caller`). The CLI lane prints it
+  once, as before. Test: over a socketpair standing in for the caller's stderr.
+- ~~`/var/log/atrium/` keeps one log file per one-shot instance name: 339 files after
+  this session's runs.~~ **Fixed 2026-11-05.** A one-shot's own stdio is its caller's,
+  installed right after the log redirect, so its log only ever received the lines a
+  failure before that writes. Opening it per instance left one near-empty file per run.
+  jaild now opens one log per **app** for one-shot instances,
+  `/var/log/atrium/app-<id>.log` (the instance name up to its last `--`), and tags those
+  lines with the instance name (`jaild-child[<instance>]: …`). Services, and any name
+  not of the instance shape, keep `<name>.log`. Nothing to rotate: the per-app file grows
+  only by failure lines. The files from before stay until removed by hand.
+  Tests: `server::child_log_tests`.
 - Under TCG a large `scp` sometimes lands with a run of zeros. Both e2e scripts now copy
   again on a hash mismatch, and still never run a mismatched binary.
 

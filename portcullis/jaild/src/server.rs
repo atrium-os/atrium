@@ -1231,7 +1231,7 @@ fn handle_create_with_exec(
          * println!/eprintln! aborts with exit 101 on EBADF. Route
          * stdout+stderr to a per-service log (/dev/null fallback);
          * this also rescues the child's own diagnostics below. */
-        ffi::redirect_child_stdio(&format!("/var/log/atrium/{}.log", req.name));
+        ffi::redirect_child_stdio(&child_log_path(&req.name, stdio.is_some()));
         /* ★ A one-shot's stdio is its CALLER's (ExecSpec::stdio): replaces the
          * log redirect above — which stays first, so a failure here still has
          * somewhere to be reported. Before jail_attach, while the child is
@@ -1241,7 +1241,7 @@ fn handle_create_with_exec(
             if let Err(e) = ffi::install_child_stdio(
                 [fds[0].as_raw_fd(), fds[1].as_raw_fd(), fds[2].as_raw_fd()])
             {
-                eprintln!("jaild-child: install caller stdio: {e}");
+                eprintln!("jaild-child[{}]: install caller stdio: {e}", req.name);
                 ffi::child_exit(105);
             }
         }
@@ -1528,5 +1528,56 @@ mod rctl_tests {
         if !ffi::racct_enabled() {
             assert_eq!(rule(check_rctl_limits(&l, &policy(true))), "rctl.racct_disabled");
         }
+    }
+}
+
+/// Where a jailed child's stdout/stderr go before it runs.
+///
+/// ★ ONE LOG PER APP for one-shot instances, not one per instance. A one-shot
+/// gets its CALLER's stdio installed straight after this redirect, so its
+/// log only ever receives the few lines a failure before that writes (each
+/// tagged with the instance name), and opening it O_CREAT per instance left
+/// one near-empty file per run: 339 in /var/log/atrium after one FreeBSD
+/// session (portcullis.md §6.5.2e′ snags), with nothing to rotate them.
+/// Instance names are `app-<id>--<tag>` (`portcullis_jail::jaild_instance_name`);
+/// the app's log is named by everything before the last `--`. A service,
+/// or a name of any other shape, keeps its own `<name>.log`.
+pub fn child_log_path(name: &str, oneshot: bool) -> String {
+    let stem = match (oneshot, name.rsplit_once("--")) {
+        (true, Some((app, tag))) if name.starts_with("app-") && app.len() > "app-".len() && !tag.is_empty() => app,
+        _ => name,
+    };
+    format!("/var/log/atrium/{stem}.log")
+}
+
+#[cfg(test)]
+mod child_log_tests {
+    use super::child_log_path;
+
+    /// ★ §6.5.2e′ snag: one file per one-shot instance (339 after a session).
+    /// Every instance of an app now shares the app's log.
+    #[test]
+    fn one_shot_instances_share_their_apps_log() {
+        let a = child_log_path("app-org-atrium-navigator-converter--conv-1a2b", true);
+        let b = child_log_path("app-org-atrium-navigator-converter--conv-ffff", true);
+        assert_eq!(a, "/var/log/atrium/app-org-atrium-navigator-converter.log");
+        assert_eq!(a, b);
+        assert_ne!(a, child_log_path("app-org-atrium-navigator-worker--doc-7", true), "apps stay apart");
+        // The instance id `portcullis_jail::jaild_instance_name` gives a
+        // single-instance run.
+        assert_eq!(child_log_path("app-org-x--0", true), "/var/log/atrium/app-org-x.log");
+    }
+
+    /// The allowed case beside it: a service keeps its own log, and a name
+    /// that is not an instance name is never shortened (an empty stem or a
+    /// bare `app-` would merge unrelated jails into one file).
+    #[test]
+    fn services_and_other_names_keep_their_own_log() {
+        assert_eq!(child_log_path("frescod", false), "/var/log/atrium/frescod.log");
+        assert_eq!(child_log_path("app-org-x--0", false), "/var/log/atrium/app-org-x--0.log",
+            "not a one-shot: unchanged");
+        assert_eq!(child_log_path("svc--x", true), "/var/log/atrium/svc--x.log");
+        assert_eq!(child_log_path("app---x", true), "/var/log/atrium/app---x.log");
+        assert_eq!(child_log_path("app-org-x--", true), "/var/log/atrium/app-org-x--.log");
     }
 }

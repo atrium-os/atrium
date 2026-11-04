@@ -5292,9 +5292,10 @@ touch other threads' files under `/orbis`; ask before installing packages.
 | `scripts/navigator-fetch-vm-check.sh` | fetchd address filter with a hermetic "public" fixture server (slirp `net=1.2.3.0/24`, guestfwd 1.2.3.100:80/443, throwaway CA) |
 
 - Create `navtest` in the guest first: `pw useradd navtest -m`.
-- The guest boots with `kern.racct.enable=1`. **`deploy-portcullis.sh` rewrites
-  `/etc/atrium/jaild.policy.toml` and drops `[resource_control] allow_rctl = true`**:
-  re-add it after every deploy, or jaild refuses limited one-shots (`rctl.disabled`).
+- The guest boots with `kern.racct.enable=1`. `deploy-portcullis.sh` keeps the
+  target's `[resource_control]` (`allow_rctl = true`) when it rewrites
+  `/etc/atrium/jaild.policy.toml` (since 2026-11-05; `ALLOW_RCTL=true` sets it on a
+  fresh target). Without it jaild refuses limited one-shots (`rctl.disabled`).
 - Input pages: corpus HTML is third-party content; stage it via project files
   (`navigator/batch2-html.tar.gz`), never commit it.
 - Expected outputs, step by step: `/mnt/project-files/navigator/converter-jail-freebsd-runplan.md`

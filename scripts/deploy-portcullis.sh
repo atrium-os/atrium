@@ -128,8 +128,20 @@ pfctl -s info | grep -q "Status: Enabled" || exit 1' >/tmp/pfdeploy.log 2>&1 \
   || { echo "  pf isolation FAILED: $(tail -1 /tmp/pfdeploy.log)"; rc=1; }
 echo "=== config -> /etc/atrium ==="
 g 'mkdir -p /etc/atrium/services.d /var/db/atrium /var/log/atrium' >/dev/null 2>&1
-scp $SSHOPT -P 2222 "$BSD/etc/jaild.policy.toml" "$BSD/etc/volumes.policy.toml" \
-    root@localhost:/etc/atrium/ >/dev/null 2>&1 && echo "  policies ok" || { echo "  policies FAILED"; rc=1; }
+# ★ The TARGET's [resource_control] survives the deploy. Copying the repo
+# policy over it dropped `allow_rctl = true`, and jaild then refused every
+# limited one-shot (`rctl.disabled`) until it was re-added by hand
+# (portcullis.md §6.5.2e′ snags). ALLOW_RCTL=true|false sets it explicitly.
+tmpd=$(mktemp -d "${TMPDIR:-/tmp}/deploy-portcullis.XXXXXX")
+if g 'cat /etc/atrium/jaild.policy.toml' > "$tmpd/live.toml" 2>/dev/null; then live="$tmpd/live.toml"; else live=-; fi
+if sh "$BSD/scripts/jaild-policy-merge.sh" "$BSD/etc/jaild.policy.toml" "$live" \
+        > "$tmpd/jaild.policy.toml" 2> "$tmpd/merge.log" \
+   && scp $SSHOPT -P 2222 "$tmpd/jaild.policy.toml" "$BSD/etc/volumes.policy.toml" \
+        root@localhost:/etc/atrium/ >/dev/null 2>&1; then
+    echo "  policies ok ($(sed 's/^jaild-policy-merge: //' "$tmpd/merge.log"))"
+else
+    echo "  policies FAILED: $(cat "$tmpd/merge.log")"; rc=1
+fi
 scp $SSHOPT -P 2222 "$BSD"/etc/services.d/*.toml \
     root@localhost:/etc/atrium/services.d/ >/dev/null 2>&1 \
     && echo "  services.d ok ($(ls "$BSD"/etc/services.d/*.toml | wc -l | tr -d ' ') manifests)" \

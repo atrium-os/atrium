@@ -110,6 +110,20 @@ pub fn resolve_limits(manifest: Option<&portcullis_toml::ResourcesSection>, memo
                       cpu_pct: Option<u32>, require_memory_limit: bool, racct: bool)
     -> Result<Option<jaild::protocol::RctlLimits>, String>
 {
+    let (limits, warning) = resolve_limits_noted(manifest, memory_mb, cpu_pct, require_memory_limit, racct)?;
+    if let Some(w) = warning { eprintln!("{w}") }
+    Ok(limits)
+}
+
+/// As `resolve_limits`, but the "running UNCAPPED" warning is RETURNED, so
+/// the caller decides where it goes. ★ On the `--daemon` lane this process's
+/// stderr is portcullisd's log, and a warning printed there never reached
+/// the person who asked for the limit (portcullis.md §6.5.2e′ snags):
+/// `run_with_stdio` also writes it to the CALLER's stderr (`tell_caller`).
+pub fn resolve_limits_noted(manifest: Option<&portcullis_toml::ResourcesSection>, memory_mb: Option<u64>,
+                      cpu_pct: Option<u32>, require_memory_limit: bool, racct: bool)
+    -> Result<(Option<jaild::protocol::RctlLimits>, Option<String>), String>
+{
     let tighter = |a: Option<u64>, b: Option<u64>| match (a, b) {
         (Some(x), Some(y)) => Some(x.min(y)), (x, None) => x, (None, y) => y };
     let declared_mb = match manifest.and_then(|r| r.memory.as_deref()) {
@@ -123,21 +137,37 @@ pub fn resolve_limits(manifest: Option<&portcullis_toml::ResourcesSection>, memo
                     the manifest's [resources].memory)".into());
     }
     let limits = jaild::protocol::RctlLimits { memoryuse_mb: mem, pcpu: cpu };
-    if limits.is_empty() { return Ok(None) }
+    if limits.is_empty() { return Ok((None, None)) }
     if !racct {
         if require_memory_limit {
             return Err("a memory limit was required but kern.racct.enable is 0; \
                         RACCT is a loader tunable, so this machine cannot enforce one \
                         until it reboots with kern.racct.enable=1".into());
         }
-        eprintln!("portcullis: kern.racct.enable is 0 — running UNCAPPED (asked for {}{}); \
+        let w = format!("portcullis: kern.racct.enable is 0 — running UNCAPPED (asked for {}{}); \
                    reboot with kern.racct.enable=1 to enforce, or pass --require-memory-limit \
                    to refuse instead",
                   mem.map(|m| format!("memoryuse {m} MiB")).unwrap_or_default(),
                   cpu.map(|c| format!(" pcpu {c}%")).unwrap_or_default());
-        return Ok(None);
+        return Ok((None, Some(w)));
     }
-    Ok(Some(limits))
+    Ok((Some(limits), None))
+}
+
+/// Say `msg` where the person who asked will see it: this process's stderr
+/// always, and, when the caller's descriptors arrived over SCM_RIGHTS (the
+/// `--daemon` lane, where this process's stderr is portcullisd's log), the
+/// CALLER's stderr too. Best effort on the caller's side: a caller that
+/// closed its stderr does not stop the run.
+pub fn tell_caller(msg: &str, caller_stderr: Option<&std::os::fd::OwnedFd>) {
+    eprintln!("{msg}");
+    if let Some(fd) = caller_stderr {
+        use std::io::Write;
+        if let Ok(dup) = fd.try_clone() {
+            let mut f = std::fs::File::from(dup);
+            let _ = writeln!(f, "{msg}");
+        }
+    }
 }
 
 /// `512M`, `2G`, `1024K`, or a bare byte count → MiB (rounded up).
@@ -334,9 +364,12 @@ pub fn run_with_stdio(spec: &Spec, stdio: Option<[std::os::fd::OwnedFd; 3]>) -> 
     // and jaild removes them with the jail (§6.5.2e). Resolved before
     // anything is built would be tidier, but the refusal must come after the
     // tree is known to be this app's.
-    let rctl = match resolve_limits(manifest.resources.as_ref(), spec.memory_mb, spec.cpu_pct,
+    let rctl = match resolve_limits_noted(manifest.resources.as_ref(), spec.memory_mb, spec.cpu_pct,
                                     spec.require_memory_limit, racct_enabled()) {
-        Ok(l) => l,
+        Ok((l, warning)) => {
+            if let Some(w) = warning { tell_caller(&w, stdio.as_ref().map(|s| &s[2])) }
+            l
+        }
         Err(why) => { teardown(&jail_path, &jail_name); return OneShot::Refused(why) }
     };
 
@@ -775,6 +808,30 @@ mod limit_tests {
         assert_eq!(resolve_limits(None, Some(512), None, false, false).unwrap(), None);
         // Required and enforceable.
         assert!(resolve_limits(Some(&res(Some("1G"), None)), None, None, true, true).unwrap().is_some());
+    }
+
+    /// ★ The `--daemon` lane's snag (§6.5.2e′): the UNCAPPED warning went
+    /// only to portcullisd's log. It is returned now, and `tell_caller`
+    /// writes it to the caller's own stderr descriptor.
+    #[test]
+    fn the_uncapped_warning_reaches_the_callers_stderr() {
+        let (l, w) = resolve_limits_noted(None, Some(512), Some(50), false, false).unwrap();
+        assert_eq!(l, None);
+        let w = w.expect("a limit the kernel cannot enforce is reported");
+        assert!(w.contains("UNCAPPED") && w.contains("memoryuse 512 MiB") && w.contains("pcpu 50%"), "{w}");
+        // Nothing asked: nothing to warn about. Enforceable: no warning.
+        assert_eq!(resolve_limits_noted(None, None, None, false, false).unwrap(), (None, None));
+        assert!(resolve_limits_noted(None, Some(512), None, false, true).unwrap().1.is_none());
+
+        // The caller's stderr, as the daemon receives it: a descriptor.
+        use std::io::Read;
+        let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd: std::os::fd::OwnedFd = ours.into();
+        tell_caller(&w, Some(&fd));
+        drop(fd);
+        let mut got = String::new();
+        theirs.read_to_string(&mut got).unwrap();
+        assert_eq!(got, format!("{w}\n"));
     }
 
     #[test]
