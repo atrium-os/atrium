@@ -1,0 +1,10 @@
+# Golden: write_42 on the R9700 (Radeon AI PRO R9700, RDNA4), captured 2026-11-04
+# via the Orbis cloud-GPU relay, Ubuntu "Linux 7.0.0-42-generic x86_64", stock amdgpu.
+# Code: atrium-rdna4-oracle at dd685b49.
+status=ok
+wait_status=0
+elapsed_ns=402645
+gc_base=0x00001260
+out.out sha256[0:16]=a7c578abbe373f01
+out.out=0000002a x 64
+result=MATCH
