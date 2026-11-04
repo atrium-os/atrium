@@ -6,6 +6,6 @@ fn main() {
         .unwrap();
     let m = atrium_spv_frontend::translate_with_options(&bytes, &atrium_spv_frontend::Options { native_subgroups: true, ..Default::default() }).unwrap();
     let mut g = atrium_gir::build::build(&m, 0).unwrap();
-    atrium_gir::passes::optimize(&mut g);
+    if std::env::var("RAW").is_err() { atrium_gir::passes::optimize(&mut g); }
     println!("{g}");
 }

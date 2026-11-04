@@ -58,6 +58,7 @@ pub mod cfg;
 pub mod constants;
 pub mod error;
 pub mod functions;
+pub mod inline;
 pub mod interface;
 pub mod offsets;
 pub mod types;
@@ -130,7 +131,15 @@ pub fn translate_with_options(
     let mut loader = dr::Loader::new();
     rspirv::binary::parse_bytes(spirv, &mut loader)
         .map_err(|e| FrontendError::ParseFailed(format!("{e:?}")))?;
-    let rspirv_module = loader.module();
+    let mut rspirv_module = loader.module();
+    // Calls are inlined at the SPIR-V level, then the module is assembled
+    // and translated again so source offsets match the binary translated.
+    if inline::inline_calls(&mut rspirv_module)? {
+        use rspirv::binary::Assemble;
+        let words = rspirv_module.assemble();
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        return translate_with_options(&bytes, opts);
+    }
 
     // ── 2. Validate declared capabilities ───────────────────
     //

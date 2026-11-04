@@ -116,3 +116,62 @@ fn default_frontend_keeps_size_one_subgroups() {
     let n = atrium_spv_frontend::translate_with_options(&bytes, &atrium_spv_frontend::Options { native_subgroups: true, ..Default::default() }).unwrap();
     assert!(format!("{n:?}").contains("Subgroup {"));
 }
+
+/// glslang's loop shapes and inlined function calls (control_flow.comp,
+/// compiled without spirv-opt) agree with a Rust model of the shader.
+#[test]
+fn control_flow_matches_a_reference_model() {
+    let c = atrium_rdna4_oracle::cases::tierb("control_flow").expect("control_flow compiles");
+    let out = words(c.buffers.iter().find(|b| b.name == "b0_1").unwrap().expect.as_ref().unwrap());
+    let mixbits = |mut x: u32, k: u32| {
+        x ^= x >> 13;
+        x = x.wrapping_mul(0x5bd1e995u32.wrapping_add(k));
+        x ^ (x >> 15)
+    };
+    let coverage = |p: [f32; 2], h: [f32; 2], r: f32| {
+        let q = [p[0].abs() - h[0] + r, p[1].abs() - h[1] + r];
+        let len = (q[0].max(0.0).powi(2) + q[1].max(0.0).powi(2)).sqrt();
+        (0.5 - (len + q[0].max(q[1]).min(0.0) - r)).clamp(0.0, 1.0)
+    };
+    for i in 0..64u32 {
+        let x = i % 7 + 1;
+        let mut want = [0u32; 8];
+        want[0] = (0..x).map(|k| k * k).sum();
+        let (mut n, mut steps) = (i, 0);
+        while n != 1 && n != 0 {
+            n = if n & 1 == 1 { 3 * n + 1 } else { n / 2 };
+            steps += 1;
+        }
+        want[1] = steps;
+        let mut d = 0;
+        loop {
+            d += x;
+            if d >= 20 { break; }
+        }
+        want[2] = d;
+        let mut c = 0;
+        for k in 0..10 {
+            if k & 1 == 0 { continue; }
+            if k > i % 9 { break; }
+            c += k;
+        }
+        want[3] = c;
+        let mut found = 99;
+        let mut r = 0;
+        while r < 4 && found == 99 {
+            for q in 0..4 {
+                if r * 4 + q == i % 16 { found = r * 10 + q; break; }
+            }
+            r += 1;
+        }
+        want[4] = found;
+        want[5] = mixbits(x + i, 1) ^ mixbits(i, 2);
+        let cov = coverage([(i % 8) as f32 - 3.5, (i / 8) as f32 - 3.5], [2.0, 1.5], 0.75);
+        want[7] = (0..8).map(|k| k + x).filter(|v| v % 3 != 0).sum();
+        let got = &out[i as usize * 8..i as usize * 8 + 8];
+        assert_eq!([got[0], got[1], got[2], got[3], got[4], got[5], got[7]],
+                   [want[0], want[1], want[2], want[3], want[4], want[5], want[7]], "lane {i}");
+        let g6 = f32::from_bits(got[6]);
+        assert!((g6 - cov).abs() < 1e-5, "lane {i}: coverage {g6} vs {cov}");
+    }
+}

@@ -69,6 +69,26 @@ impl BlockClassification {
 pub fn classify(func: &Function) -> Result<BlockClassification, FrontendError> {
     let mut out = BlockClassification::default();
 
+    // Loop headers, merges and continue targets. A conditional branch
+    // without a merge marker is structured when it is a loop's break or
+    // continue edge (glslang's `for (; k < n; )` condition block, or a
+    // do-while's conditional back edge); it needs no merge of its own.
+    let mut loop_targets: std::collections::HashSet<Word> = std::collections::HashSet::new();
+    for block in &func.blocks {
+        let insts = &block.instructions;
+        if insts.len() >= 2 && insts[insts.len() - 2].class.opcode == SpvOp::LoopMerge {
+            let m = &insts[insts.len() - 2];
+            if let Some(h) = block.label.as_ref().and_then(|l| l.result_id) {
+                loop_targets.insert(h);
+            }
+            for k in 0..2 {
+                if let Ok(id) = read_id_ref(&m.operands, k) {
+                    loop_targets.insert(id);
+                }
+            }
+        }
+    }
+
     // First pass: walk every block; if its terminator is a
     // structured branch, the *previous* instruction
     // declares the merge (and optionally continue) targets.
@@ -116,6 +136,10 @@ pub fn classify(func: &Function) -> Result<BlockClassification, FrontendError> {
                         out.kinds.entry(merge_id)
                             .or_insert(BlockKind::Merge);
                     }
+                    _ if [1usize, 2].iter().any(|&k| read_id_ref(&term.operands, k)
+                        .map_or(false, |t| loop_targets.contains(&t))) => {
+                        out.kinds.entry(label_id).or_insert(BlockKind::Linear);
+                    }
                     _ => return Err(FrontendError::Unsupported(format!(
                         "block {label_id}: OpBranchConditional without a \
                          preceding OpSelectionMerge / OpLoopMerge \
@@ -142,6 +166,17 @@ pub fn classify(func: &Function) -> Result<BlockClassification, FrontendError> {
             }
             // Linear terminators: unconditional branch,
             // return, kill/terminate-invocation.
+            // glslang's loop header: OpLoopMerge + OpBranch.
+            SpvOp::Branch if merge_marker.map(|m| m.class.opcode) == Some(SpvOp::LoopMerge) => {
+                let m = merge_marker.unwrap();
+                let merge_id = read_id_ref(&m.operands, 0)?;
+                let continue_id = read_id_ref(&m.operands, 1)?;
+                out.kinds.insert(label_id, BlockKind::LoopHeader {
+                    merge: atrium_spv_ir::BlockId(merge_id),
+                    continue_: atrium_spv_ir::BlockId(continue_id),
+                });
+                out.kinds.entry(merge_id).or_insert(BlockKind::Merge);
+            }
             SpvOp::Branch | SpvOp::Return | SpvOp::ReturnValue
             | SpvOp::Kill | SpvOp::TerminateInvocation | SpvOp::Unreachable => {
                 out.kinds.entry(label_id).or_insert(BlockKind::Linear);

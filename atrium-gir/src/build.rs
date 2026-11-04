@@ -56,6 +56,9 @@ struct Builder<'a> {
     /// Phi result → its private variable.
     phi_var: HashMap<spv::ValueId, u32>,
     translated: HashSet<B>,
+    /// Blocks of a loop's continue construct: reached from every
+    /// `continue` path, so they are duplicated per path.
+    dup_ok: HashSet<B>,
 }
 
 fn terminator(b: &spv::Block) -> Option<&spv::Op> {
@@ -142,6 +145,38 @@ impl<'a> Builder<'a> {
             while let Some(b) = work.pop() {
                 if info.body.insert(b) {
                     work.extend(pred.get(&b).cloned().unwrap_or_default());
+                }
+            }
+        }
+        // A structured loop's body also holds blocks that leave it by
+        // `break` (they don't reach the back edge, so the natural loop
+        // misses them): take everything reachable from the header
+        // without passing the SPIR-V merge block.
+        for info in self.loops.values_mut() {
+            let merge = match self.f.blocks.get(&info.header).map(|b| &b.kind) {
+                Some(atrium_spv_ir::BlockKind::LoopHeader { merge, .. }) => *merge,
+                _ => continue,
+            };
+            let mut work = vec![info.header];
+            let mut seen = BTreeSet::from([info.header]);
+            while let Some(b) = work.pop() {
+                for s in &self.succ[&b] {
+                    if *s != merge && seen.insert(*s) {
+                        work.push(*s);
+                    }
+                }
+            }
+            info.body.extend(seen);
+        }
+        for info in self.loops.values() {
+            let cont = match self.f.blocks.get(&info.header).map(|b| &b.kind) {
+                Some(atrium_spv_ir::BlockKind::LoopHeader { continue_, .. }) if *continue_ != info.header => *continue_,
+                _ => continue,
+            };
+            let mut work = vec![cont];
+            while let Some(b) = work.pop() {
+                if b != info.header && info.body.contains(&b) && self.dup_ok.insert(b) {
+                    work.extend(self.succ[&b].iter().copied());
                 }
             }
         }
@@ -336,7 +371,16 @@ impl<'a> Builder<'a> {
                     _ => BinOp::AShr,
                 };
                 let (a, b) = (self.val(a)?, self.val(b)?);
-                Val::V(self.map_n(r, rt()?, &[a, b], &bin(o)))
+                if matches!(o, BinOp::And | BinOp::Or | BinOp::Xor)
+                    && self.out.ty(a) == Ty::BOOL && self.out.ty(b) == Ty::BOOL
+                {
+                    // LogicalAnd/Or arrive as a bit op on bools (then `!= 0`):
+                    // combine the masks, then widen.
+                    let m = self.emit(r, Ty::BOOL, Op::Bin(o, a, b));
+                    Val::V(self.as_data(r, m))
+                } else {
+                    Val::V(self.map_n(r, rt()?, &[a, b], &bin(o)))
+                }
             }
             S::SMod(a, b) => {
                 // Floored remainder (sign of the divisor): the truncated
@@ -446,6 +490,18 @@ impl<'a> Builder<'a> {
                     _ => ConvOp::FToU,
                 };
                 let a = self.val(a)?;
+                // `float(b)` on a bool: 0/1 as an integer first.
+                let a = if self.out.ty(a).scalar() == Scalar::Bool && matches!(o, ConvOp::SToF | ConvOp::UToF) {
+                    let t = self.out.ty(a);
+                    let mut parts = vec![];
+                    for i in 0..t.comps() {
+                        let c = self.comp(r, a, i);
+                        parts.push(self.emit(r, Ty::I32, Op::Conv(ConvOp::BoolToI, c)));
+                    }
+                    if parts.len() == 1 { parts[0] } else { self.emit(r, Ty::V(Scalar::I32, t.comps() as u8), Op::Construct(parts)) }
+                } else {
+                    a
+                };
                 Val::V(self.map_n(r, rt()?, &[a], &|x| Op::Conv(o, x[0])))
             }
             S::SConvert(a, k) | S::UConvert(a, k) => {
@@ -694,7 +750,7 @@ impl<'a> Builder<'a> {
     // ── Structurisation ─────────────────────────────────────────
 
     fn block_body(&mut self, r: &mut Region, b: B) -> Result<(), BuildError> {
-        if !self.translated.insert(b) {
+        if !self.translated.insert(b) && !self.dup_ok.contains(&b) {
             return unsup(format!("block {b:?} reached on two structured paths (unstructured control flow)"));
         }
         let block = &self.f.blocks[&b];
@@ -824,6 +880,7 @@ pub fn build(m: &spv::Module, entry: usize) -> Result<Function, BuildError> {
         pred_stores: HashMap::new(),
         phi_var: HashMap::new(),
         translated: HashSet::new(),
+        dup_ok: HashSet::new(),
     };
     b.analyse()?;
 

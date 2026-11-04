@@ -1,0 +1,51 @@
+#version 450
+// glslang's own loop shapes (counted for, while, do-while, continue,
+// nested loops with early exit) and function calls, compiled without
+// spirv-opt. Compile: glslangValidator -V --target-env vulkan1.1
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) buffer In { uint data[]; };
+layout(set = 0, binding = 1) buffer Out { uint o[]; };
+uint mixbits(uint x, uint k) {
+    x ^= x >> 13;
+    x *= 0x5bd1e995u + k;
+    return x ^ (x >> 15);
+}
+float coverage(vec2 p, vec2 half_size, float radius) {
+    vec2 q = abs(p) - half_size + radius;
+    return clamp(0.5 - (length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - radius), 0.0, 1.0);
+}
+void accumulate(inout uint acc, uint v) {
+    if (v % 3u == 0u) return;
+    acc += v;
+}
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    uint x = data[i];
+    uint b = i * 8u;
+    uint s = 0u;
+    for (uint k = 0u; k < x; k++) s += k * k;
+    o[b + 0u] = s;
+    uint n = i, steps = 0u;
+    while (n != 1u && n != 0u) { n = (n & 1u) == 1u ? 3u * n + 1u : n / 2u; steps++; }
+    o[b + 1u] = steps;
+    uint d = 0u;
+    do { d += x; } while (d < 20u);
+    o[b + 2u] = d;
+    uint c = 0u;
+    for (uint k = 0u; k < 10u; k++) {
+        if ((k & 1u) == 0u) continue;
+        if (k > i % 9u) break;
+        c += k;
+    }
+    o[b + 3u] = c;
+    uint found = 99u;
+    for (uint r = 0u; r < 4u && found == 99u; r++)
+        for (uint q = 0u; q < 4u; q++)
+            if (r * 4u + q == (i % 16u)) { found = r * 10u + q; break; }
+    o[b + 4u] = found;
+    o[b + 5u] = mixbits(x + i, 1u) ^ mixbits(i, 2u);
+    o[b + 6u] = floatBitsToUint(coverage(vec2(float(i % 8u), float(i / 8u)) - 3.5, vec2(2.0, 1.5), 0.75));
+    uint acc = 0u;
+    for (uint k = 0u; k < 8u; k++) accumulate(acc, k + x);
+    o[b + 7u] = acc;
+}

@@ -196,9 +196,16 @@ fn translate_one(
         } else {
             Vec::new()
         };
-        let block_kind = classification.get(label_id)
-            .cloned()
-            .unwrap_or(BlockKind::Linear);
+        // The classifier names merge / continue targets by SPIR-V
+        // label id; renumber them to IR block ids.
+        let remap = |b: BlockId| label_to_block_id.get(&b.0).copied().unwrap_or(b);
+        let block_kind = match classification.get(label_id).cloned().unwrap_or(BlockKind::Linear) {
+            BlockKind::IfHeader { merge } => BlockKind::IfHeader { merge: remap(merge) },
+            BlockKind::SwitchHeader { merge } => BlockKind::SwitchHeader { merge: remap(merge) },
+            BlockKind::LoopHeader { merge, continue_ } =>
+                BlockKind::LoopHeader { merge: remap(merge), continue_: remap(continue_) },
+            k => k,
+        };
 
         for spv_inst in &spv_block.instructions {
             let source_offset = offsets.get(spv_inst_index);

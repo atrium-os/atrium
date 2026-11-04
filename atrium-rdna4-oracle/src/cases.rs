@@ -217,10 +217,11 @@ pub fn tierb(name: &str) -> Option<Case> {
 }
 
 /// Tier-B examples tried as compiled cases, simplest first.
-pub const TIERB: [&str; 23] = [
+pub const TIERB: [&str; 24] = [
     "write_42", "per_thread", "multi_binding", "max_const", "ternary", "branch", "rmw", "rotate",
     "bit_chain", "bit_count", "loop_mul", "sum_loop", "atomic_add", "per_thread_triangle", "spec_scale", "float_sqrt",
     "push_scale", "groupshared_xor", "subgroup_sum", "subgroup_ops", "subgroup_partial", "math_exact", "raster_math",
+    "control_flow",
 ];
 
 /// The desktop compute shaders: name, SPIR-V path under `bundles/`, bytes
