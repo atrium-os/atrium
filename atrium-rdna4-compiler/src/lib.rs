@@ -77,6 +77,7 @@ pub struct Binary {
 
 /// Compile an optimised GIR kernel.
 pub fn compile(f: &Function) -> Result<Binary, Error> {
+    atrium_gir::verify::verify(f).map_err(|e| Error::Internal(format!("invalid GIR: {e:?}")))?;
     if f.workgroup_bytes > 64 * 1024 {
         return Err(Error::Unsupported("more than 64 KiB of workgroup memory".into()));
     }

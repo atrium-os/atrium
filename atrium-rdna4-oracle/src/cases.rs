@@ -90,6 +90,7 @@ pub fn desktop(name: &str, spv: &str, nodes: u32, record: u32) -> Option<Case> {
     let m = atrium_spv_frontend::translate_with_options(&bytes, &atrium_spv_frontend::Options { native_subgroups: true, ..Default::default() }).expect("frontend");
     let mut g = atrium_gir::build::build(&m, 0).expect("gir");
     atrium_gir::passes::optimize(&mut g);
+    atrium_gir::verify::verify(&g).expect("verify");
     let bin = atrium_rdna4_compiler::compile(&g).expect("rdna4 compile");
 
     // Inputs: scene = node count + 64 bytes per node of floats; glyph runs
@@ -167,6 +168,8 @@ pub fn tierb(name: &str) -> Option<Case> {
     let m = atrium_spv_frontend::translate_with_options(&bytes, &atrium_spv_frontend::Options { native_subgroups: true, ..Default::default() }).ok()?;
     let mut g = atrium_gir::build::build(&m, 0).ok()?;
     atrium_gir::passes::optimize(&mut g);
+    // A GIR type error is a compiler bug, not an unsupported example.
+    atrium_gir::verify::verify(&g).unwrap_or_else(|e| panic!("{name}: {e:?}"));
     let bin = atrium_rdna4_compiler::compile(&g).ok()?;
     let fill = |k: u32| -> Vec<u8> { (0..words).flat_map(|i| (i % 7 + k).to_le_bytes()).collect() };
     let mut ib_bufs: interp::Buffers = g.buffers.iter().map(|&(s, b)| ((s, b), fill(b + 1))).collect();

@@ -408,7 +408,21 @@ impl<'a> Builder<'a> {
                     _ => (CmpOp::FULe, true),
                 };
                 let (a, b) = (self.val(a)?, self.val(b)?);
-                Val::V(self.map_n(r, rt()?, &[a, b], &cmp(o, swap)))
+                let t = rt()?;
+                if t.scalar() == Scalar::Bool {
+                    Val::V(self.map_n(r, t, &[a, b], &cmp(o, swap)))
+                } else {
+                    // The frontend's own expansions (sign, step, …) type
+                    // some comparisons as 0/1 integers.
+                    let mut parts = vec![];
+                    for i in 0..t.comps() {
+                        let (ai, bi) = (self.comp(r, a, i), self.comp(r, b, i));
+                        let ci = self.emit(r, Ty::BOOL, cmp(o, swap)(&[ai, bi]));
+                        let x = self.emit(r, Ty::I32, Op::Conv(ConvOp::BoolToI, ci));
+                        parts.push(if t.scalar() == Scalar::F32 { self.emit(r, Ty::F32, Op::Conv(ConvOp::UToF, x)) } else { x });
+                    }
+                    Val::V(if parts.len() == 1 { parts[0] } else { self.emit(r, t, Op::Construct(parts)) })
+                }
             }
             S::Select { cond, t_val, f_val } => {
                 let (c, t, f) = (self.val(cond)?, self.val(t_val)?, self.val(f_val)?);

@@ -1,0 +1,16 @@
+[package]
+name        = "atrium-rdna4"
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+publish     = false
+description = "Compile SPIR-V compute kernels for RDNA4 and record their dispatches, without a Vulkan driver (for frescod and tests)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+atrium-spv-frontend = { path = "../atrium-spv-frontend" }
+atrium-gir = { path = "../atrium-gir" }
+atrium-rdna4-compiler = { path = "../atrium-rdna4-compiler" }
+atrium-rdna4-cmd = { path = "../atrium-rdna4-cmd" }

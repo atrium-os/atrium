@@ -74,6 +74,7 @@ pub fn desktop(shader: &str, spv_path: &str, nodes: u32, record: u32, repeat: u3
     let m = atrium_spv_frontend::translate_with_options(&spv, &atrium_spv_frontend::Options { native_subgroups: true, ..Default::default() }).expect("frontend");
     let mut g = atrium_gir::build::build(&m, 0).expect("gir");
     atrium_gir::passes::optimize(&mut g);
+    atrium_gir::verify::verify(&g).expect("verify");
     let bin = atrium_rdna4_compiler::compile(&g).expect("rdna4 compile");
     let glyph = spv_path.contains("glyph");
     let n = nodes as u64;

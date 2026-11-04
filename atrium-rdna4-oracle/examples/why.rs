@@ -16,6 +16,7 @@ fn main() {
             let m = atrium_spv_frontend::translate_with_options(&bytes, &atrium_spv_frontend::Options { native_subgroups: true, ..Default::default() }).map_err(|e| format!("frontend: {e:?}"))?;
             let mut g = atrium_gir::build::build(&m, 0).map_err(|e| format!("gir: {e:?}"))?;
             atrium_gir::passes::optimize(&mut g);
+            atrium_gir::verify::verify(&g).map_err(|e| format!("verify: {e:?}"))?;
             let b = atrium_rdna4_compiler::compile(&g).map_err(|e| format!("rdna4: {e:?}"))?;
             Ok(format!("ok {} dwords", b.code.len()))
         })();
