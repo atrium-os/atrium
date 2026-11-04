@@ -438,8 +438,11 @@ fn a_navbox_with_a_spanning_title_row_is_declared_and_fits() {
     assert_eq!(out.matches("<col class=").count(), 2, "{out}");
     let o = render_html(&out, &fonts, &Env::default());
     let run = |t: &str| o.scene.runs.iter().find(|r| r.text.starts_with(t)).expect(t).clone();
-    let (people, bob) = (run("People"), run("Bob"));
-    assert!(bob.x > people.x && bob.y == people.y, "the list sits BESIDE its label");
+    let (people, bob, companies) = (run("People"), run("Bob"), run("Companies"));
+    // Beside, in the same row: the label is middle-aligned against the
+    // wrapped list (HTML's UA `tr { vertical-align: middle }`), so its
+    // baseline is at or below the list's first line, above the next row.
+    assert!(bob.x > people.x && bob.y <= people.y && people.y < companies.y, "the list sits BESIDE its label");
     assert!(o.scene.runs.iter().all(|r| r.x < 800 * 64), "nothing starts past the canvas edge");
 
     // A spanning cell wider than its columns makes them grow to fit it.

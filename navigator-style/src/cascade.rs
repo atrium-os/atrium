@@ -101,6 +101,12 @@ table { display: table; border-spacing: 2px 2px }
 colgroup, col { display: none }
 tr { display: table-row }
 td, th { display: table-cell; padding-top: 1px; padding-right: 1px; padding-bottom: 1px; padding-left: 1px }
+/* ★ HTML's rendering section: rows and row groups are `middle`, and cells
+   INHERIT it, so an author `tr { vertical-align: top }` reaches its cells.
+   Without these, cells took the initial `baseline`: a navbox's image cell
+   set its row's baseline 100 px down and the label beside it hung there. */
+thead, tbody, tfoot, tr { vertical-align: middle }
+td, th { vertical-align: inherit }
 th { font-weight: 700 }
 img { display: inline-block }
 /* An inline <svg> is a replaced-like box: its width/height hints size it. */

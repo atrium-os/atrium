@@ -2884,6 +2884,25 @@ mod tests {
         assert!(next.1 * PX >= ys[3], "the next row starts below \"four\": next {} four {}", next.1, ys[3] / PX);
     }
 
+    /// ★ HTML's UA sheet: cells inherit `vertical-align: middle` from their
+    /// row, and an author rule on the ROW reaches them.
+    #[test]
+    fn cells_are_middle_aligned_by_default_and_inherit_their_rows() {
+        let src = r#"<style>body { margin-left: 0px; margin-top: 0px }
+            table { border-spacing: 0px 0px } .c0 { width: 50px } .c1 { width: 50px }
+            .tall { display: inline-block; width: 10px; height: 100px } .top { vertical-align: top }</style>
+            <table><colgroup><col class="c0"><col class="c1"></colgroup>
+            <tr><td><span class="tall"></span></td><td>x</td></tr>
+            <tr class="top"><td><span class="tall"></span></td><td>y</td></tr></table>"#;
+        let o = render(src);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let mut ys: Vec<U> = o.scene.runs.iter().filter(|r| r.x >= 50 * PX).map(|r| r.y / PX).collect();
+        ys.sort();
+        assert_eq!(ys.len(), 2, "{ys:?}");
+        assert!((35..70).contains(&ys[0]), "x is centred in its 100 px row: baseline {}", ys[0]);
+        assert!(ys[1] < 100 + 30, "y sits at the TOP of row 2, from `tr {{ vertical-align: top }}`: baseline {}", ys[1]);
+    }
+
     #[test]
     fn text_in_a_flex_item_counts_toward_its_width() {
         let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
