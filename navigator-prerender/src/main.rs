@@ -599,9 +599,19 @@ fn convert_in_child(
 ) -> Result<Child, String> {
     use std::process::{Command, Stdio};
     let mut cmd = Command::new(exe);
-    cmd.arg("--one").arg(file).arg(base).stdout(Stdio::piped()).stderr(Stdio::null());
+    cmd.arg("--one").arg(file).arg(base).stdout(Stdio::piped()).stderr(Stdio::piped());
     if net { cmd.env("PRERENDER_NET", "1"); }
     let mut ch = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+    // ★ Both pipes drain on their own threads WHILE the child runs: a child
+    // that fills either pipe would otherwise block on it, and the parent
+    // waiting on the child would turn a panic message into a timeout.
+    let drain = |mut r: Box<dyn std::io::Read + Send>| std::thread::spawn(move || {
+        let mut v = vec![];
+        let _ = r.read_to_end(&mut v);
+        v
+    });
+    let out_t = drain(Box::new(ch.stdout.take().expect("piped")));
+    let err_t = drain(Box::new(ch.stderr.take().expect("piped")));
     let start = std::time::Instant::now();
     let status = loop {
         match ch.try_wait() {
@@ -614,9 +624,37 @@ fn convert_in_child(
             Err(e) => return Err(format!("wait failed: {e}")),
         }
     };
-    let out = ch.wait_with_output().map_err(|e| format!("no output: {e}"))?;
-    parse_child(&String::from_utf8_lossy(&out.stdout))
-        .ok_or_else(|| format!("crashed after {:.1}s ({status})", start.elapsed().as_secs_f64()))
+    let stdout = out_t.join().unwrap_or_default();
+    let stderr = err_t.join().unwrap_or_default();
+    parse_child(&String::from_utf8_lossy(&stdout))
+        .ok_or_else(|| crash_reason(start.elapsed().as_secs_f64(), &status.to_string(), &String::from_utf8_lossy(&stderr)))
+}
+
+/// Why a child produced no result: how long it ran, how it exited, and the
+/// last lines it wrote to stderr — a panic's message and location, which
+/// is the whole diagnosis ("crashed after 4.2s (signal 6)" alone was not).
+fn crash_reason(secs: f64, status: &str, stderr: &str) -> String {
+    let tail: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()
+        && !l.starts_with("note: run with `RUST_BACKTRACE")).collect();
+    let tail = &tail[tail.len().saturating_sub(3)..];
+    if tail.is_empty() { format!("crashed after {secs:.1}s ({status})") }
+    else { format!("crashed after {secs:.1}s ({status}): {}", tail.join(" | ")) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::crash_reason;
+
+    #[test]
+    fn a_crash_reason_carries_the_last_stderr_lines() {
+        let err = "warning: one\n\nthread 'main' panicked at boa_engine/src/module/mod.rs:666:14:\n\
+            `then` cannot fail for a native `JsPromise`: object is not a Promise\n\
+            note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n";
+        assert_eq!(crash_reason(4.25, "signal: 6", err),
+            "crashed after 4.2s (signal: 6): warning: one | thread 'main' panicked at boa_engine/src/module/mod.rs:666:14: | \
+             `then` cannot fail for a native `JsPromise`: object is not a Promise");
+        assert_eq!(crash_reason(1.0, "exit status: 101", ""), "crashed after 1.0s (exit status: 101)");
+    }
 }
 
 /// What the parent needs back from a child run.
