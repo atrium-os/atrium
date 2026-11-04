@@ -485,9 +485,12 @@ impl<'a> Isel<'a> {
                     AtomicOp::UMax => "GLOBAL_ATOMIC_MAX_U32",
                     AtomicOp::Exchange => "GLOBAL_ATOMIC_SWAP_B32",
                 };
-                let data = self.vgroup(*v)?;
                 let r = res.unwrap();
                 let used = self.uses.get(&r).copied().unwrap_or(0) > 0;
+                if *o == AtomicOp::Add && self.u.is_uniform(*off) && self.u.is_uniform(*v) {
+                    return self.wave_atomic_add(name, saddr, vaddr, ioff, *v, r, used);
+                }
+                let data = self.vgroup(*v)?;
                 let vdst = if used { Some(O::R(self.def_v(r), 0)) } else { None };
                 // Device scope: other workgroups see the result.
                 self.mi.push(MI::Global { name, vdst, vaddr, saddr, data: Some(data), ioff, th: used as u8, scope: 2 });
@@ -554,6 +557,62 @@ impl<'a> Isel<'a> {
         let t = self.vreg(Class::V, 1);
         self.valu("V_BFE_U32", O::R(t, 0), vec![O::PS(TTMP7), O::Imm(16 * (k as u32 - 1)), O::Imm(16)], 0);
         O::R(t, 0)
+    }
+
+    /// Atomic add of a uniform value `v` to a uniform address: one atomic
+    /// per wave instead of one per lane. The first active lane adds
+    /// `v * popcount(exec)`; every lane's result is the old value plus `v`
+    /// times the number of active lanes below it (what the lanes would
+    /// have seen in lane order). Lanes contending on one counter is the
+    /// common append pattern, and per-lane atomics serialise at the L2.
+    #[allow(clippy::too_many_arguments)]
+    fn wave_atomic_add(&mut self, name: &'static str, saddr: u8, vaddr: O, ioff: i32, v: ValueId, r: ValueId, used: bool) -> Result<(), Error> {
+        let s = |me: &mut Self| O::R(me.vreg(Class::S, 1), 0);
+        // The per-lane addend as a scalar (constant, or read from lane 0 of
+        // the active lanes: it is the same in all of them).
+        let k = match self.src(v, 0)? {
+            O::Imm(b) => O::Imm(b),
+            x => {
+                let t = s(self);
+                self.valu("V_READFIRSTLANE_B32", t, vec![x], 0);
+                t
+            }
+        };
+        let n = s(self);
+        self.salu("S_BCNT1_I32_B32", n, vec![O::Exec]);
+        let total = if k == O::Imm(1) {
+            n
+        } else {
+            let t = s(self);
+            self.salu("S_MUL_I32", t, vec![n, k]);
+            t
+        };
+        let data = O::R(self.vreg(Class::V, 1), 0);
+        self.valu("V_MOV_B32", data, vec![total], 0);
+        let (first, one, save) = (s(self), s(self), s(self));
+        self.salu("S_CTZ_I32_B32", first, vec![O::Exec]);
+        self.salu("S_LSHL_B32", one, vec![O::Imm(1), first]);
+        // exec &= that lane (empty if no lane is active).
+        self.salu("S_AND_SAVEEXEC_B32", save, vec![one]);
+        let old = if used { Some(O::R(self.vreg(Class::V, 1), 0)) } else { None };
+        self.mi.push(MI::Global { name, vdst: old, vaddr, saddr, data: Some(data), ioff, th: used as u8, scope: 2 });
+        self.salu("S_MOV_B32", O::Exec, vec![save]);
+        if let Some(old) = old {
+            let base = s(self);
+            self.valu("V_READFIRSTLANE_B32", base, vec![old], 0);
+            let d = O::R(self.def_v(r), 0);
+            self.valu("V_MBCNT_LO_U32_B32", d, vec![O::Exec, O::Imm(0)], 0);
+            match k {
+                O::Imm(1) => self.valu("V_ADD_NC_U32", d, vec![base, d], 0),
+                // Lane index < 32, so a 24-bit multiply is exact for small k.
+                O::Imm(b) if b < 1 << 24 => self.valu("V_MAD_U32_U24", d, vec![d, k, base], 0),
+                _ => {
+                    self.valu("V_MUL_LO_U32", d, vec![d, k], 0);
+                    self.valu("V_ADD_NC_U32", d, vec![base, d], 0);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn builtin(&mut self, b: Builtin, r: ValueId) -> Result<(), Error> {
