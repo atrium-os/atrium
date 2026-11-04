@@ -13,6 +13,50 @@
 
 use std::ffi::{c_char, c_int, CString};
 use std::io;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+
+/// ★ casper compares the WHOLE sockaddr a connect names against the ones it
+/// handed out (port, padding and all), so the struct is rebuilt exactly as
+/// getaddrinfo fills it: zeroed, length set, flowinfo and scope carried.
+fn std_to_sockaddr(a: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t, c_int) {
+    let mut st: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    match a {
+        SocketAddr::V4(v) => {
+            let sin = unsafe { &mut *(&mut st as *mut _ as *mut libc::sockaddr_in) };
+            sin.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+            sin.sin_family = libc::AF_INET as u8;
+            sin.sin_port = v.port().to_be();
+            sin.sin_addr.s_addr = u32::from(*v.ip()).to_be();
+            (st, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t, libc::AF_INET)
+        }
+        SocketAddr::V6(v) => {
+            let sin6 = unsafe { &mut *(&mut st as *mut _ as *mut libc::sockaddr_in6) };
+            sin6.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+            sin6.sin6_family = libc::AF_INET6 as u8;
+            sin6.sin6_port = v.port().to_be();
+            sin6.sin6_flowinfo = v.flowinfo();
+            sin6.sin6_addr.s6_addr = v.ip().octets();
+            sin6.sin6_scope_id = v.scope_id();
+            (st, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t, libc::AF_INET6)
+        }
+    }
+}
+
+unsafe fn sockaddr_to_std(sa: *const libc::sockaddr, len: libc::socklen_t) -> Option<SocketAddr> {
+    if sa.is_null() { return None }
+    match (*sa).sa_family as c_int {
+        libc::AF_INET if len as usize >= std::mem::size_of::<libc::sockaddr_in>() => {
+            let s = &*(sa as *const libc::sockaddr_in);
+            Some(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(u32::from_be(s.sin_addr.s_addr)), u16::from_be(s.sin_port))))
+        }
+        libc::AF_INET6 if len as usize >= std::mem::size_of::<libc::sockaddr_in6>() => {
+            let s = &*(sa as *const libc::sockaddr_in6);
+            Some(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(s.sin6_addr.s6_addr), u16::from_be(s.sin6_port),
+                                                  s.sin6_flowinfo, s.sin6_scope_id)))
+        }
+        _ => None,
+    }
+}
 
 #[repr(C)] pub struct CapChannel { _p: [u8; 0] }
 #[repr(C)] struct CapNetLimit { _p: [u8; 0] }
@@ -88,9 +132,15 @@ pub fn in_capability_mode() -> bool {
 }
 
 impl Net {
-    /// A TCP connection to `host:port`, resolved AND connected by casper.
-    pub fn connect(&self, host: &str, port: u16) -> io::Result<std::net::TcpStream> {
-        use std::os::fd::FromRawFd;
+    /// Ask casper to resolve `host:port` (`CAPNET_NAME2ADDR`). The answers are
+    /// what `connect_addr` may then reach: casper records every address it
+    /// returns, and `CAPNET_CONNECTDNS` refuses a connect to anything else.
+    ///
+    /// ★ The caller checks these answers BEFORE connecting (threat model
+    /// §2.1). That keeps the property M1 was built on — this process connects
+    /// only where casper resolved — and adds the one it lacked: where casper
+    /// resolved must also be a public address.
+    pub fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
         let h = CString::new(host).map_err(|_| io::Error::other("NUL in host"))?;
         let p = CString::new(port.to_string()).unwrap();
         let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
@@ -102,25 +152,29 @@ impl Net {
             let msg = unsafe { std::ffi::CStr::from_ptr(libc::gai_strerror(rc)) }.to_string_lossy().into_owned();
             return Err(io::Error::other(format!("resolve {host}:{port}: {msg}")));
         }
-        let mut last = io::Error::other(format!("no address for {host}"));
+        let mut out = vec![];
         let mut ai = res;
         while !ai.is_null() {
             let a = unsafe { &*ai };
-            let s = unsafe { libc::socket(a.ai_family, a.ai_socktype | libc::SOCK_CLOEXEC, a.ai_protocol) };
-            if s >= 0 {
-                if unsafe { cap_connect(self.chan, s, a.ai_addr, a.ai_addrlen) } == 0 {
-                    unsafe { libc::freeaddrinfo(res) };
-                    return Ok(unsafe { std::net::TcpStream::from_raw_fd(s) });
-                }
-                last = err(&format!("connect {host}:{port}"));
-                unsafe { libc::close(s) };
-            } else {
-                last = err("socket");
-            }
+            if let Some(sa) = unsafe { sockaddr_to_std(a.ai_addr, a.ai_addrlen) } { out.push(sa) }
             ai = a.ai_next;
         }
         unsafe { libc::freeaddrinfo(res) };
-        Err(last)
+        Ok(out)
+    }
+
+    /// Connect to an address `resolve` returned, through casper.
+    pub fn connect_addr(&self, addr: SocketAddr) -> io::Result<std::net::TcpStream> {
+        use std::os::fd::FromRawFd;
+        let (storage, len, family) = std_to_sockaddr(addr);
+        let s = unsafe { libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        if s < 0 { return Err(err("socket")) }
+        if unsafe { cap_connect(self.chan, s, &storage as *const _ as *const libc::sockaddr, len) } == 0 {
+            return Ok(unsafe { std::net::TcpStream::from_raw_fd(s) });
+        }
+        let e = err(&format!("connect {addr}"));
+        unsafe { libc::close(s) };
+        Err(e)
     }
 
     /// Ask casper to connect to a literal address it did NOT resolve. Exists

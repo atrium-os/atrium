@@ -63,6 +63,42 @@ leave the user's dedup domain.
 
 **Rating:** today **high** for A4. Once fixed, low.
 
+**Built (2026-11-05).** `navigator_fetch::addr` + `Conversation`:
+- **The check is on the resolver's answer.** The `Connect` seam is split into `resolve`
+  and `connect_addr`. Every answer is checked before any connect. Under capability mode
+  that is casper `NAME2ADDR`, then the check, then `cap_connect` to that address, so
+  `CONNECTDNS` still guarantees the process connects only where casper resolved.
+- **Refused:** loopback, `0/8` and `::`, RFC 1918, link-local (`169.254/16`,
+  `fe80::/10`), CGNAT `100.64/10`, ULA `fc00::/7`, multicast, broadcast, the
+  documentation, benchmarking and reserved ranges, `169.254.169.254` and
+  `fd00:ec2::254`.
+- **IPv6 is an allowlist.** Only `2000::/3` minus its carve-outs is admitted. The
+  forms that embed IPv4 (mapped, NAT64 `64:ff9b::/96`, 6to4) are judged by the IPv4
+  address they reach.
+- **Literal-IP URLs and every redirect hop take the same path.** The URL parser has
+  already normalised `http://2130706433/` and `http://0x7f.1/` to `127.0.0.1`.
+- **A mixed answer (one public, one private) refuses the whole host.**
+- **Pinning.** One `navigator-fetchd` process is one conversion. Its `Conversation`
+  pins the first answer per host. The same host and port is never resolved again. The
+  other port must answer with an already-pinned address, and only those are used. A
+  rebinding answer is refused by its range, and under the grant by the pin
+  (`FetchError::Rebinding`).
+- **The grant.** `NAVIGATOR_FETCH_GRANT_PRIVATE_NETWORK=1` or `navigator-fetchd
+  --grant-private-network`, off by default. It admits loopback, RFC 1918, link-local,
+  CGNAT and ULA, and never the metadata endpoints. It is process-wide, a stand-in for
+  §5 q2's per-origin grant, and a jailed fetchd (launched with no arguments) cannot
+  receive it. That is the safe direction.
+- **Tests.** 11 tests cover every range at both edges, both families, the embedded
+  forms, a redirect to a private literal and to a privately resolving name, rebinding on
+  the same and the other port, and the grant. They were positive-controlled: an `admit`
+  that accepts everything fails 9 tests, and removing either half of the pin fails its
+  test. `navigator-fetchd --gate` gains seven refusal rows under capability mode,
+  including `http://localhost/` resolved *by casper*, plus a grant control arm.
+- **The prerender's curl `HttpFetcher` does not apply the rule, by design.** It is the
+  unconfined measurement instrument. A confined conversion refuses to run without
+  fetchd (§2.2), so curl is never on a real conversion's path. See the comment on
+  `HttpFetcher`.
+
 ### 2.2 Conversion — `navigator-prerender` (Boa, the state recorder)
 
 This is the stage where **attacker-written code runs**. Boa executes the page's scripts;
