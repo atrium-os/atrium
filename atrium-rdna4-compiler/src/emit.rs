@@ -39,6 +39,8 @@ struct E<'a> {
     valu_wrote_s: HashSet<u16>,
     valu_read_s: HashSet<u16>,
     trans: HashSet<u16>,
+    /// SGPRs an outstanding SMEM load will write (KMCNT; out of order).
+    smem: HashSet<u16>,
     labels: HashMap<u32, usize>,
     fixups: Vec<(usize, u32)>,
 }
@@ -85,7 +87,19 @@ impl<'a> E<'a> {
         }
     }
 
+    /// Wait for every SMEM load if any of `regs` is one of its destinations.
+    fn wait_k(&mut self, regs: &[u16]) {
+        if regs.iter().any(|r| self.smem.contains(r)) {
+            self.a.sopp("S_WAIT_KMCNT", 0);
+            self.smem.clear();
+        }
+    }
+
     fn drain(&mut self) {
+        if !self.smem.is_empty() {
+            self.a.sopp("S_WAIT_KMCNT", 0);
+            self.smem.clear();
+        }
         if !self.loads.is_empty() {
             self.a.sopp("S_WAIT_LOADCNT", 0);
             self.loads.clear();
@@ -144,6 +158,14 @@ impl<'a> E<'a> {
                     touch.push(d);
                 }
                 self.wait_for(&touch);
+                let mut kregs = sreads.clone();
+                if d < 256 {
+                    kregs.push(d);
+                }
+                if let Some(sd) = sdst {
+                    kregs.push(self.code(*sd));
+                }
+                self.wait_k(&kregs);
                 self.sgpr_reads(&sreads);
                 if vreads.iter().any(|r| self.trans.contains(r)) {
                     self.a.sopp("S_WAIT_ALU", WAIT_VA_VDST);
@@ -205,8 +227,11 @@ impl<'a> E<'a> {
             }
             MI::Salu { name, dst, src } => {
                 let codes: Vec<u16> = src.iter().map(|s| self.code(*s)).collect();
-                self.sgpr_reads(&codes);
                 let d = self.code(*dst);
+                let mut kregs = codes.clone();
+                kregs.push(d);
+                self.wait_k(&kregs);
+                self.sgpr_reads(&codes);
                 if self.valu_read_s.contains(&d) {
                     self.a.sopp("S_WAIT_ALU", WAIT_SA_SDST);
                     self.valu_read_s.clear();
@@ -253,6 +278,35 @@ impl<'a> E<'a> {
                 if !dregs.is_empty() {
                     self.loads.push_back(dregs);
                 }
+            }
+            MI::Smem { name, sdst, sbase, soff, ioff } => {
+                let n: u16 = match *name {
+                    "S_LOAD_B32" => 1,
+                    "S_LOAD_B64" => 2,
+                    "S_LOAD_B96" => 3,
+                    "S_LOAD_B128" => 4,
+                    "S_LOAD_B256" => 8,
+                    _ => 16,
+                };
+                let d = self.code(*sdst);
+                let so = soff.map(|o| self.code(o));
+                let mut reads = vec![*sbase as u16, *sbase as u16 + 1];
+                reads.extend(so);
+                let mut k = reads.clone();
+                k.extend(d..d + n);
+                self.wait_k(&k);
+                self.sgpr_reads(&reads);
+                if (d..d + n).any(|r| self.valu_read_s.contains(&r)) {
+                    self.a.sopp("S_WAIT_ALU", WAIT_SA_SDST);
+                    self.valu_read_s.clear();
+                }
+                self.a.emit(name, "ENC_SMEM", &[
+                    ("SDATA", d as u64),
+                    ("SBASE", (*sbase / 2) as u64),
+                    ("SOFFSET", so.unwrap_or(crate::asm::NULL) as u64),
+                    ("IOFFSET", (*ioff as u32 & 0xff_ffff) as u64),
+                ]);
+                self.smem.extend(d..d + n);
             }
             MI::Ds { name, vdst, addr, data, off } => {
                 let w: u16 = if name.ends_with("B128") { 4 } else if name.ends_with("B64") { 2 } else { 1 };
@@ -310,6 +364,7 @@ pub fn emit(mi: &[MI], vregs: &[VRegInfo], asg: &Assignment) -> Vec<u32> {
         valu_wrote_s: HashSet::new(),
         valu_read_s: HashSet::new(),
         trans: HashSet::new(),
+        smem: HashSet::new(),
         labels: HashMap::new(),
         fixups: vec![],
     };

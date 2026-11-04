@@ -14,6 +14,7 @@
 //! let k = Kernel::from_spirv(&spv, &Options::default())?;
 //! upload(code_va, &k.code());
 //! let mut ib = Blob::compute();
+//! ib.acquire_all(); // once per IB: invalidate shader caches after uploads
 //! k.record(&mut ib, code_va, &[((0, 0), scene_va), ((0, 1), tiles_va)], Some(push_va), [n, 1, 1])?;
 //! ```
 

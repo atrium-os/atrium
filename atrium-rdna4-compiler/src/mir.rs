@@ -83,6 +83,21 @@ pub enum MI {
         /// Coherence scope.
         scope: u8,
     },
+    /// Scalar memory load: `sdst` = the dwords at SGPR pair `sbase` +
+    /// `soff` (an SGPR, if any) + `ioff`. Ignores EXEC; returns out of
+    /// order (KMCNT).
+    Smem {
+        /// Instruction name.
+        name: &'static str,
+        /// Destination SGPR group.
+        sdst: O,
+        /// First SGPR of the 64-bit base address.
+        sbase: u8,
+        /// Dynamic byte offset SGPR.
+        soff: Option<O>,
+        /// Immediate byte offset (signed 24-bit).
+        ioff: i32,
+    },
     /// LDS (workgroup memory) op: address = `addr` + `off` bytes.
     Ds {
         /// Instruction name.
@@ -138,6 +153,12 @@ impl MI {
                 r(dst, &mut d);
                 for s in src {
                     r(s, &mut u);
+                }
+            }
+            MI::Smem { sdst, soff, .. } => {
+                r(sdst, &mut d);
+                if let Some(x) = soff {
+                    r(x, &mut u);
                 }
             }
             MI::Ds { vdst, addr, data, .. } => {

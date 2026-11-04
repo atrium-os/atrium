@@ -38,3 +38,12 @@ fn dispatch_packets_are_well_formed() {
     let pos = b.dw.windows(2).position(|w| w[0] >> 8 & 0xff == 0x76 && w[1] == abs(regs::COMPUTE_PGM_LO) - SH_REG_START).unwrap();
     assert_eq!(b.dw[pos + 2], 0x0100_0000);
 }
+
+#[test]
+fn acquire_all_matches_the_linux_mem_sync_packet() {
+    let mut b = atrium_rdna4_cmd::Blob::compute();
+    b.acquire_all();
+    // PACKET3(ACQUIRE_MEM, 6) with the compute shader-type bit.
+    assert_eq!(b.dw[0], (3 << 30) | (6 << 16) | (0x58 << 8) | 2);
+    assert_eq!(&b.dw[1..], &[0, 0xffff_ffff, 0x00ff_ffff, 0, 0, 0xa, 0xc3b1]);
+}

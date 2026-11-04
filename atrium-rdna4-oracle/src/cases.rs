@@ -35,6 +35,7 @@ pub fn write_42() -> Case {
     sh.extend(encode("S_ENDPGM", "ENC_SOPP", "default", &[]).unwrap());
 
     let mut ib = Blob::compute();
+    ib.acquire_all();
     emit_dispatch(&mut ib, &Dispatch {
         shader_va: CODE_VA,
         vgprs: 3,
@@ -139,6 +140,7 @@ pub fn desktop(name: &str, spv: &str, nodes: u32, record: u32) -> Option<Case> {
         user.extend([va as u32, (va >> 32) as u32]);
     }
     let mut ib = Blob::compute();
+    ib.acquire_all();
     emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs: bin.vgprs, user_sgprs: user, threads: bin.local_size, groups: [groups, 1, 1], wave32: true, lds_bytes: bin.lds_bytes });
     ib.pad(8);
     let (code, ib_off, ib_dw) = code_buffer(&bin.code, &ib);
@@ -209,6 +211,7 @@ pub fn tierb(name: &str) -> Option<Case> {
         buffers.push(Buffer { name: "push".into(), va, size: 4096, init: push, expect: None, unordered: None });
     }
     let mut ib = Blob::compute();
+    ib.acquire_all();
     emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs: bin.vgprs, user_sgprs: user, threads: bin.local_size, groups: [1, 1, 1], wave32: true, lds_bytes: bin.lds_bytes });
     ib.pad(8);
     let (code, ib_off, ib_dw) = code_buffer(&bin.code, &ib);
@@ -217,11 +220,11 @@ pub fn tierb(name: &str) -> Option<Case> {
 }
 
 /// Tier-B examples tried as compiled cases, simplest first.
-pub const TIERB: [&str; 24] = [
+pub const TIERB: [&str; 25] = [
     "write_42", "per_thread", "multi_binding", "max_const", "ternary", "branch", "rmw", "rotate",
     "bit_chain", "bit_count", "loop_mul", "sum_loop", "atomic_add", "per_thread_triangle", "spec_scale", "float_sqrt",
     "push_scale", "groupshared_xor", "subgroup_sum", "subgroup_ops", "subgroup_partial", "math_exact", "raster_math",
-    "control_flow",
+    "control_flow", "scalar_loads",
 ];
 
 /// The desktop compute shaders: name, SPIR-V path under `bundles/`, bytes
@@ -273,6 +276,7 @@ fn one_lane_case(name: String, sh: Vec<u32>, vgprs: u32, wave32: bool, rsrc2_ext
     use atrium_rdna4_cmd::regs::{self, compute_pgm_rsrc2 as r2};
     let user = vec![DATA_VA as u32, (DATA_VA >> 32) as u32];
     let mut ib = Blob::compute();
+    ib.acquire_all();
     emit_dispatch(&mut ib, &Dispatch { shader_va: CODE_VA, vgprs, user_sgprs: user.clone(), threads: [1, 1, 1], groups: [1, 1, 1], wave32, lds_bytes: 0 });
     if rsrc2_extra != 0 {
         // Re-issue RSRC2 just before the DISPATCH_DIRECT (header + 4 dwords).

@@ -2012,6 +2012,28 @@ fn translate_inst(
             let result_ty = types.get(result_type_id)?.clone();
 
             let base_id = expect_id(&spv_inst.operands, 0)?;
+            // A component of a vector builtin (`gl_WorkGroupID.x`): load
+            // the builtin, extract the lane, and let the pointer stand for
+            // that value (the Load below passes it through).
+            if let (Some(kind), 2) = (iface.builtin_vars.get(&base_id).copied(), spv_inst.operands.len()) {
+                let idx_id = expect_id(&spv_inst.operands, 1)?;
+                let lane = match constants.get(idx_id).map(|c| &c.kind) {
+                    Some(crate::constants::ConstantKind::Scalar(Op::ConstInt { value, .. })) => *value as u32,
+                    Some(crate::constants::ConstantKind::Null) => 0,
+                    _ => return Err(FrontendError::Unsupported(
+                        "dynamic index into a builtin vector".into())),
+                };
+                let mut load_ty = Type::Vec3(atrium_spv_ir::VecElement::U32);
+                if let Some((_, pointee)) = iface.variables.get(&base_id).copied() {
+                    load_ty = types.get(pointee)?.clone();
+                }
+                let vec = fresh_value(load_ty, next_value_id);
+                insts.push(Inst { op: Op::LoadBuiltin(kind), result: Some(vec.clone()), source_spirv_offset });
+                let x = push_extract_lane_i32(vec, lane, source_spirv_offset, insts, next_value_id)?;
+                id_map.insert(result_id, x);
+                let _ = result_ty;
+                return Ok(());
+            }
             // Two base shapes:
             //   (1) a Variable — pointee comes from
             //       iface.variables.
@@ -2391,6 +2413,13 @@ fn translate_inst(
                 return Ok(());
             }
 
+            // A builtin component the AccessChain already loaded.
+            if let Some(x) = id_map.get(&ptr_id).cloned().filter(|v| !matches!(v.ty, Type::Pointer(..))) {
+                let rt = types.get(spv_inst.result_type.ok_or_else(|| FrontendError::Malformed("Load without result type".into()))?)?.clone();
+                let result = alloc_or_get_result(result_id, rt.clone(), id_map, next_value_id);
+                insts.push(Inst { op: Op::Bitcast(x, rt), result: Some(result), source_spirv_offset });
+                return Ok(());
+            }
             // Try variable first; fall back to id_map (set
             // by a prior AccessChain).
             let ptr_value = match resolve_variable(

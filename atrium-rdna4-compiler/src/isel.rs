@@ -46,6 +46,15 @@ pub(crate) struct Isel<'a> {
     ret: VR,
     loops: Vec<LoopRegs>,
     yields: Vec<Vec<ValueId>>,
+    /// EXEC is known to be non-empty here (every region that can run with
+    /// no lanes is skipped or follows one that might): SMEM loads, which
+    /// ignore EXEC, are only issued where some lane would load the same
+    /// address.
+    exec_live: bool,
+    /// Spaces stored to or atomically updated somewhere in the kernel. The
+    /// scalar cache is not coherent with vector writes, so loads from them
+    /// stay on the vector path.
+    written: HashSet<Space>,
 }
 
 fn unsup<T>(s: impl Into<String>) -> Result<T, Error> {
@@ -148,6 +157,13 @@ impl<'a> Isel<'a> {
                 consts.insert(r);
             }
         }
+        let written = defs
+            .iter()
+            .filter_map(|i| match &i.op {
+                Op::Store(sp, ..) | Op::Atomic(_, sp, ..) => Some(*sp),
+                _ => None,
+            })
+            .collect();
         let mut addr_only = HashSet::new();
         let mut builtin_comps = HashMap::new();
         for i in &defs {
@@ -187,6 +203,8 @@ impl<'a> Isel<'a> {
             ret: 0,
             loops: vec![],
             yields: vec![],
+            exec_live: true,
+            written,
         }
     }
 
@@ -590,6 +608,27 @@ impl<'a> Isel<'a> {
                 let vdst = if name.contains("RTN") { Some(O::R(self.def_v(r), 0)) } else { None };
                 self.mi.push(MI::Ds { name, vdst, addr, data: Some(data), off });
             }
+            Op::Load(space, off) if self.smem_ok(*space, *off, res.unwrap()) => {
+                let sbase = self.saddr(*space)?;
+                let r = res.unwrap();
+                let n = self.ty(r).comps() as u8;
+                let name = ["S_LOAD_B32", "S_LOAD_B64", "S_LOAD_B96", "S_LOAD_B128"][n as usize - 1];
+                let (soff, ioff) = match self.consts.get(off).copied() {
+                    Some(k) => (None, k as i32),
+                    None => {
+                        let (a, k) = self.address(*off)?;
+                        let t = self.vreg(Class::S, 1);
+                        self.mi.push(MI::Valu { name: "V_READFIRSTLANE_B32", dst: O::R(t, 0), sdst: None, src: vec![a], neg: 0 });
+                        (Some(O::R(t, 0)), k)
+                    }
+                };
+                let sd = self.vreg(Class::S, n);
+                self.mi.push(MI::Smem { name, sdst: O::R(sd, 0), sbase, soff, ioff });
+                let d = self.def_v(r);
+                for k in 0..n {
+                    self.valu("V_MOV_B32", O::R(d, k), vec![O::R(sd, k)], 0);
+                }
+            }
             Op::Load(space, off) => {
                 let saddr = self.saddr(*space)?;
                 let (vaddr, ioff) = self.address(*off)?;
@@ -654,6 +693,7 @@ impl<'a> Isel<'a> {
                 }
             }
             Op::Continue(vals) | Op::Break(vals) => {
+                self.exec_live = false;
                 let is_break = matches!(i.op, Op::Break(_));
                 let l = self.loops.last().ok_or_else(|| Error::Internal("break outside loop".into()))?;
                 let (slots, mask) = if is_break { (l.results.clone(), l.brk) } else { (l.params.clone(), l.cont) };
@@ -664,6 +704,7 @@ impl<'a> Isel<'a> {
                 self.salu("S_MOV_B32", O::Exec, vec![O::Imm(0)]);
             }
             Op::Return => {
+                self.exec_live = false;
                 let r = self.ret;
                 self.salu("S_OR_B32", O::R(r, 0), vec![O::R(r, 0), O::Exec]);
                 self.salu("S_MOV_B32", O::Exec, vec![O::Imm(0)]);
@@ -1155,6 +1196,23 @@ impl<'a> Isel<'a> {
         Ok(())
     }
 
+    /// A buffer or push-constant load that can use SMEM: uniform offset,
+    /// space never written by this kernel, EXEC known non-empty, 32-bit
+    /// data, and a constant offset (if any) that is dword aligned and fits
+    /// the 24-bit immediate.
+    fn smem_ok(&self, space: Space, off: ValueId, r: ValueId) -> bool {
+        if !self.exec_live || self.written.contains(&space) || !self.u.is_uniform(off) {
+            return false;
+        }
+        if !matches!(space, Space::Buffer { .. } | Space::Push) || self.ty(r).scalar() == Scalar::Bool {
+            return false;
+        }
+        match self.consts.get(&off) {
+            Some(k) => k % 4 == 0 && (*k as i32) >= 0 && (*k as i32) < (1 << 23),
+            None => true,
+        }
+    }
+
     /// Restore EXEC after a region: `save` minus lanes that left.
     fn restore(&mut self, save: VR) {
         self.salu("S_MOV_B32", O::Exec, vec![O::R(save, 0)]);
@@ -1183,10 +1241,13 @@ impl<'a> Isel<'a> {
                         self.salu("S_MOV_B32", O::R(save, 0), vec![O::Exec]);
                         self.salu("S_AND_NOT1_B32", O::Exec, vec![O::Exec, c]);
                         self.mi.push(MI::Branch { name: "S_CBRANCH_EXECZ", target: l_end });
+                        let live = self.exec_live;
+                        self.exec_live = true;
                         self.yields.push(vec![]);
                         self.region(els)?;
                         self.yields.pop();
                         self.mi.push(MI::Label(l_end));
+                        self.exec_live = live && !leaves(els);
                         if leaves(els) {
                             self.restore(save);
                         } else {
@@ -1197,16 +1258,20 @@ impl<'a> Isel<'a> {
                     let (l_else, l_end) = (self.label(), self.label());
                     self.salu("S_AND_SAVEEXEC_B32", O::R(save, 0), vec![c]);
                     self.mi.push(MI::Branch { name: "S_CBRANCH_EXECZ", target: l_else });
+                    let live = self.exec_live;
+                    self.exec_live = true;
                     self.yields.push(results.clone());
                     self.region(then)?;
                     self.mi.push(MI::Label(l_else));
                     if !els.is_empty() {
                         self.salu("S_AND_NOT1_B32", O::Exec, vec![O::R(save, 0), c]);
                         self.mi.push(MI::Branch { name: "S_CBRANCH_EXECZ", target: l_end });
+                        self.exec_live = true;
                         self.region(els)?;
                     }
                     self.yields.pop();
                     self.mi.push(MI::Label(l_end));
+                    self.exec_live = live && !(leaves(then) || leaves(els));
                     if leaves(then) || leaves(els) {
                         self.restore(save);
                     } else {
@@ -1227,7 +1292,11 @@ impl<'a> Isel<'a> {
                     self.mi.push(MI::Label(top));
                     self.salu("S_MOV_B32", O::R(cont, 0), vec![O::Imm(0)]);
                     self.loops.push(LoopRegs { brk, cont, params: params.clone(), results: results.clone() });
+                    // Later iterations start with live lanes (the back edge
+                    // is taken only then); the first has the entry mask.
+                    let live = self.exec_live;
                     self.region(body)?;
+                    self.exec_live = live && !contains_return(body);
                     self.loops.pop();
                     self.salu("S_OR_B32", O::Exec, vec![O::Exec, O::R(cont, 0)]);
                     self.mi.push(MI::Branch { name: "S_CBRANCH_EXECNZ", target: top });

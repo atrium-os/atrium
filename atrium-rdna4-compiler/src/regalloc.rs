@@ -82,7 +82,13 @@ pub fn allocate(mi: &[MI], vregs: &[VRegInfo], v_first: u8, s_first: u8) -> Resu
                 }
             })
         };
-        let base = (first..=limit - info.size as u32).find(|b| !busy(*b)).ok_or_else(|| {
+        // SMEM destinations: 2 SGPRs even-aligned, 3+ aligned to 4.
+        let align = match (info.class, info.size) {
+            (Class::S, 2) => 2,
+            (Class::S, n) if n > 2 => 4,
+            _ => 1,
+        };
+        let base = (first..=limit - info.size as u32).filter(|b| b % align == 0).find(|b| !busy(*b)).ok_or_else(|| {
             Error::Unsupported(format!("out of {:?} registers (spilling not implemented)", info.class))
         })?;
         phys[r] = base as u8;

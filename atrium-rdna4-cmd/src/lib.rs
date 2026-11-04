@@ -32,6 +32,8 @@ pub mod op {
     pub const SET_SH_REG: u32 = 0x76;
     /// End-of-pipe event with a memory write.
     pub const RELEASE_MEM: u32 = 0x49;
+    /// Wait for and invalidate / write back caches.
+    pub const ACQUIRE_MEM: u32 = 0x58;
 }
 
 /// Absolute dword address of a GC register.
@@ -102,6 +104,28 @@ impl Blob {
         let event = BOTTOM_OF_PIPE_TS | (5 << 8); // EVENT_INDEX 5: end-of-pipe
         let sel = (3 << 29) | (3 << 24); // DATA_SEL timestamp, INT_SEL after write confirm, DST_SEL memory
         self.packet(op::RELEASE_MEM, &[event, sel, va as u32, (va >> 32) as u32, 0, 0, 0])
+    }
+
+    /// Make memory written before this IB (by the CPU or by earlier work)
+    /// visible to the shaders after it: ACQUIRE_MEM over the whole address
+    /// range, invalidating the instruction (GLI), scalar (GLK), vector
+    /// (GLV), GL1 and GL2 caches, with GL2 and GLM written back first. The
+    /// same GCR_CNTL as Linux's `gfx_v12_0_emit_mem_sync` (nvd.h bit
+    /// positions). Put it at the start of every IB: SMEM loads and the
+    /// instruction fetch go through caches the vector path does not flush.
+    pub fn acquire_all(&mut self) -> &mut Self {
+        const GLI_INV: u32 = 1 << 0;
+        const GLM_WB: u32 = 1 << 4;
+        const GLM_INV: u32 = 1 << 5;
+        const GLK_INV: u32 = 1 << 7;
+        const GLV_INV: u32 = 1 << 8;
+        const GL1_INV: u32 = 1 << 9;
+        const GL2_INV: u32 = 1 << 14;
+        const GL2_WB: u32 = 1 << 15;
+        let gcr = GLI_INV | GLM_WB | GLM_INV | GLK_INV | GLV_INV | GL1_INV | GL2_INV | GL2_WB;
+        // CP_COHER_CNTL, CP_COHER_SIZE (lo, hi: everything), CP_COHER_BASE
+        // (lo, hi), POLL_INTERVAL, GCR_CNTL.
+        self.packet(op::ACQUIRE_MEM, &[0, 0xffff_ffff, 0x00ff_ffff, 0, 0, 0xa, gcr])
     }
 
     /// Little-endian bytes.

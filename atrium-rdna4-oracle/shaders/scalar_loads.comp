@@ -1,0 +1,31 @@
+#version 450
+// Uniform loads the compiler turns into SMEM: constant, push-constant and
+// workgroup-derived offsets, vec2/vec4 widths, and loads after divergent
+// control flow (which must stay on the vector path when EXEC may be empty).
+// Compile: glslangValidator -V --target-env vulkan1.1
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) readonly buffer In { uint data[]; };
+layout(set = 0, binding = 1) readonly buffer In4 { uvec4 quads[]; };
+layout(set = 0, binding = 2) buffer Out { uint o[]; };
+layout(push_constant) uniform P { uint idx; uint scale; } pc;
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    uint b = i * 8u;
+    o[b + 0u] = data[3] + data[pc.idx] * pc.scale;
+    o[b + 1u] = data[gl_WorkGroupID.x * 4u + 5u];
+    uvec4 q = quads[pc.idx + 1u];
+    o[b + 2u] = q.x ^ (q.y << 3) ^ (q.z << 6) ^ (q.w << 9);
+    uvec2 p = uvec2(data[10], data[11]);
+    o[b + 3u] = p.x * 100u + p.y;
+    uint acc = 0u;
+    for (uint k = 0u; k < 4u; k++) {
+        if (k > i % 3u) break;
+        acc += data[20u + k];
+    }
+    o[b + 4u] = acc + data[30];
+    if (i % 2u == 0u) {
+        o[b + 5u] = data[40] + i;
+    } else {
+        o[b + 5u] = data[41];
+    }
+}

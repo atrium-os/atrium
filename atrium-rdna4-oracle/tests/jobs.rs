@@ -175,3 +175,36 @@ fn control_flow_matches_a_reference_model() {
         assert!((g6 - cov).abs() < 1e-5, "lane {i}: coverage {g6} vs {cov}");
     }
 }
+
+/// Uniform loads (SMEM where EXEC is known live, vector loads elsewhere)
+/// give the values a direct model of scalar_loads.comp computes.
+#[test]
+fn scalar_loads_match_a_reference_model() {
+    let c = atrium_rdna4_oracle::cases::tierb("scalar_loads").expect("scalar_loads compiles");
+    let out = words(c.buffers.iter().find(|b| b.name == "b0_2").unwrap().expect.as_ref().unwrap());
+    let data = |j: u32| j % 7 + 1;
+    let quad = |j: u32| j % 7 + 2;
+    let (idx, scale) = (3u32, 4u32);
+    for i in 0..64u32 {
+        let q: Vec<u32> = (0..4).map(|k| quad(4 * (idx + 1) + k)).collect();
+        let acc: u32 = (0..4).take_while(|k| *k <= i % 3).map(|k| data(20 + k)).sum();
+        let want = [
+            data(3) + data(idx) * scale,
+            data(5),
+            q[0] ^ (q[1] << 3) ^ (q[2] << 6) ^ (q[3] << 9),
+            data(10) * 100 + data(11),
+            acc + data(30),
+            if i % 2 == 0 { data(40) + i } else { data(41) },
+        ];
+        assert_eq!(&out[i as usize * 8..i as usize * 8 + 6], &want, "lane {i}");
+    }
+    // The compiled kernel really uses scalar loads.
+    let bytes = std::fs::read(format!("{}/shaders/scalar_loads.comp.spv", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let m = atrium_spv_frontend::translate_with_options(&bytes, &atrium_spv_frontend::Options { native_subgroups: true, ..Default::default() }).unwrap();
+    let mut g = atrium_gir::build::build(&m, 0).unwrap();
+    atrium_gir::passes::optimize(&mut g);
+    let b = atrium_rdna4_compiler::compile(&g).unwrap();
+    let l = atrium_rdna4_compiler::listing(&b.code);
+    assert!(l.matches("S_LOAD_B").count() >= 8, "{l}");
+    assert!(l.contains("GLOBAL_LOAD_B32"), "the load after a divergent break stays on the vector path");
+}
