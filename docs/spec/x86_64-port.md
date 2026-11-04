@@ -145,6 +145,16 @@ Working in the cloud amd64 VM (`ARCH=amd64 sh scripts/cloud-vm.sh up`):
     modules fail with "version mismatch" and jails die at mount_nullfs.
   - The devroot keeps the source rc.conf's Portcullis settings (jaild enables, devfs_rulesets,
     pf). Without them, jaild is down and devfs ruleset 22 is empty.
+- **kmods on amd64** (built in the guest against the fork tree):
+  - zram, fresco, carillon and gpu-amd (pci/gpu/display) all load and unload cleanly under
+    WITNESS.
+  - `kern.zram.selftest` is OK for both zstd and lz4.
+  - fresco and carillon need their ivshmem host endpoints, and gpu-amd needs a device (gpusim or
+    the R9700), so none of those attach yet.
+- WITNESS reported one LOR during the jail e2e: tessera -> tmpfs at tmpfs_unmount's vflush,
+  then tmpfs -> tessera at unionfs_nodeget -> null_lock on exec. This is the generic cross-mount
+  unionfs pattern (tmpfs upper over nullfs-of-root lower). On a ZFS root it would read
+  zfs -> tmpfs, so it isn't Tessera-specific. Worth confirming against an arm64 WITNESS run.
 - Open: `pfctl -s rules` prints `DIOCOSFPGET: Operation not supported`. This looks like an
   ioctl mismatch between the stock 16-CURRENT userland and the fork kernel. Building world
   from the fork would settle it.
