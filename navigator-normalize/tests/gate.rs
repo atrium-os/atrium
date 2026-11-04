@@ -900,6 +900,36 @@ fn named_grid_lines_are_numbered_and_gap_aliases_hold() {
     assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
 }
 
+/// The prefixed flexbox names are the standard properties: a page that
+/// wrote only `-webkit-justify-content` meant `justify-content`, and when
+/// both are written the later one wins, as for any one property. The
+/// 2009 `-webkit-box-*` model is not an alias and stays dropped.
+#[test]
+fn prefixed_flexbox_aliases_are_the_standard_properties() {
+    let src = r#"<html><head><style>
+      .a { display: flex; -webkit-justify-content: space-between; -webkit-align-items: center; -webkit-flex-direction: column; -webkit-flex-wrap: wrap }
+      .b { -webkit-flex: 1 1 0px; -webkit-order: 2; -webkit-align-self: flex-end }
+      .c { display: flex; justify-content: flex-start; -webkit-justify-content: flex-end }
+      .d { display: flex; -webkit-justify-content: flex-end; justify-content: center }
+      .e { -webkit-box-flex: 1 }
+    </style></head><body>
+      <div class="a"><p class="b">one</p><p class="e">two</p></div>
+      <div class="c"><p>three</p></div><div class="d"><p>four</p></div>
+    </body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    for want in ["justify-content: space-between", "align-items: center", "flex-direction: column", "flex-wrap: wrap",
+                 "flex-grow: 1", "flex-shrink: 1", "flex-basis: 0px", "align-self: flex-end",
+                 "justify-content: flex-end", "justify-content: center"] {
+        assert!(out.contains(want), "{want}: {out}");
+    }
+    assert!(!out.contains("justify-content: flex-start"), "the later -webkit- alias wins over the earlier standard name: {out}");
+    assert_eq!(out.matches("justify-content: flex-end").count(), 1, "the later standard name wins over the earlier alias: {out}");
+    assert!(!report.dropped.keys().any(|k| k.contains("-webkit-justify-content") || k.contains("-webkit-flex")), "{:?}", report.dropped);
+    assert!(report.dropped.keys().any(|k| k == "property `order`"), "`order` is outside the profile either way: {:?}", report.dropped);
+    assert!(report.dropped.keys().any(|k| k.contains("-webkit-box-flex")), "the old box model is not an alias: {:?}", report.dropped);
+    assert!(refusals(&out).is_empty(), "{:?}", refusals(&out));
+}
+
 /// A minified compound query (`)and (`) is the same query.
 #[test]
 fn a_minified_compound_media_query_is_admitted() {

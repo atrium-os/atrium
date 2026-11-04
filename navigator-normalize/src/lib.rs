@@ -1184,6 +1184,25 @@ fn to_longhands_inner(name: &str, value: &[Token], inputs: &Inputs, report: &mut
         "grid-gap" => "gap",
         "grid-column-gap" => "column-gap",
         "grid-row-gap" => "row-gap",
+        // ★ The prefixed FLEXBOX names are aliases too (CSS Compat §3: every
+        // engine maps them to the standard property at parse time), so a
+        // page that wrote only `-webkit-justify-content` meant it — 693
+        // corpus declarations were dropped and their rows packed at the
+        // start. Same property, so the unprefixed one wins only by the
+        // ordinary cascade. NOT the 2009 `-webkit-box-*` model: its names
+        // (`-webkit-box-flex`, `-webkit-box-pack`) are a different grammar.
+        "-webkit-justify-content" => "justify-content",
+        "-webkit-align-items" => "align-items",
+        "-webkit-align-self" => "align-self",
+        "-webkit-align-content" => "align-content",
+        "-webkit-flex" => "flex",
+        "-webkit-flex-direction" => "flex-direction",
+        "-webkit-flex-wrap" => "flex-wrap",
+        "-webkit-flex-flow" => "flex-flow",
+        "-webkit-flex-grow" => "flex-grow",
+        "-webkit-flex-shrink" => "flex-shrink",
+        "-webkit-flex-basis" => "flex-basis",
+        "-webkit-order" => "order",
         n => n,
     };
     let text = css::write_tokens(value).trim().to_string();
