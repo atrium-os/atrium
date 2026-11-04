@@ -639,7 +639,13 @@ impl<'a> Cx<'a> {
         // ★ A replaced box is sized JOINTLY — width, height, natural size,
         // ratio and min/max together (CSS 2.1 §10.3.2, §10.4, §10.6.2; CSS
         // Images 3 §5). One computation, used for both axes below.
-        let repl_used = repl.as_ref().map(|(_, nat)| Self::replaced_used(s, nat, cb_w, cb_h, frame, bt + bb + pt + pb));
+        // ★ A width IMPOSED by the container (a stretched grid item, a
+        // flexed flex item) is the replaced box's used width, and an auto
+        // height follows it through the ratio (CSS Sizing 4 §5.1): a 50×50
+        // image stretched across a 100 px grid area is 100 tall when its
+        // block axis is not stretched too — it stayed 50.
+        let imposed_w = force.0.filter(|_| force.1.is_none()).map(|fw| (fw - frame).max(0));
+        let repl_used = repl.as_ref().map(|(_, nat)| Self::replaced_used(s, nat, cb_w, cb_h, frame, bt + bb + pt + pb, imposed_w));
         let specified_w = if repl.is_some() && !matches!(s.get("width"), V::Kw("min-content") | V::Kw("max-content")) {
             repl_used.map(|(w, _)| w)
         } else { specified_w };
@@ -1183,7 +1189,7 @@ impl<'a> Cx<'a> {
         let bd = |side: &str| if kw(s, &format!("border-{side}-style")) == "none" { 0 } else { px(&format!("border-{side}-width")) };
         let fh = px("padding-left") + px("padding-right") + bd("left") + bd("right");
         let fv = px("padding-top") + px("padding-bottom") + bd("top") + bd("bottom");
-        let (w, hh) = Self::replaced_used(s, &nat, 0, None, fh, fv);
+        let (w, hh) = Self::replaced_used(s, &nat, 0, None, fh, fv, None);
         Some(((w - fh).max(0), (hh - fv).max(0)))
     }
 
@@ -1249,10 +1255,10 @@ impl<'a> Cx<'a> {
     /// ratio-preserving table when both sizes are auto and there is a ratio,
     /// and to each axis alone otherwise. All the profile's sizes are
     /// border-box, so the frame comes off first and goes back on last.
-    fn replaced_used(s: &Style, nat: &Natural, cb_w: U, cb_h: Option<U>, fh: U, fv: U) -> (U, U) {
+    fn replaced_used(s: &Style, nat: &Natural, cb_w: U, cb_h: Option<U>, fh: U, fv: U, imposed_w: Option<U>) -> (U, U) {
         let hv = |p: &str| -> Option<U> { match s.get(p) { V::Kw(_) => None, V::Pct(_) => cb_h.and_then(|b| len(s.get(p), b)), v => len(v, 0) } };
         let wv = |p: &str| -> Option<U> { match s.get(p) { V::Kw(_) => None, V::Pct(_) if cb_w <= 0 => None, v => len(v, cb_w) } };
-        let (sw, sh) = (wv("width").map(|v| (v - fh).max(0)), hv("height").map(|v| (v - fv).max(0)));
+        let (sw, sh) = (imposed_w.or_else(|| wv("width").map(|v| (v - fh).max(0))), hv("height").map(|v| (v - fv).max(0)));
         let mnw = wv("min-width").map(|v| (v - fh).max(0)).unwrap_or(0);
         let mxw = wv("max-width").map(|v| (v - fh).max(0)).unwrap_or(U::MAX / 4).max(mnw);
         let mnh = hv("min-height").map(|v| (v - fv).max(0)).unwrap_or(0);
@@ -3876,6 +3882,19 @@ mod tests {
         assert_eq!(wh(0x00ff00ff), Some((750, 500)), "natural width, clamped by max-width; height by the ratio");
         assert_eq!(wh(0x0000ffff), Some((300, 100)), "a min-content box around a block image");
         assert_eq!(wh(0xff0000ff).map(|w| w.0), Some(0), "…but a `max-width: 100%` image is compressible: it contributes 0");
+    }
+
+    /// ★ A width IMPOSED on a replaced box — stretched across its grid area
+    /// while its block axis is not — is its used width, and an auto height
+    /// follows it through the ratio (WPT replaced-alignment-with-aspect-
+    /// ratio-008; Chrome: 100 × 100). It kept the natural 50.
+    #[test]
+    fn an_imposed_width_gives_a_replaced_box_its_ratio_height() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; grid-template-columns: 100px; grid-template-rows: 100px; width: 100px; height: 100px }
+            img { background-color: #00ff00; justify-self: stretch; align-self: start }</style>
+            <div class="g"><img src="a.png" width="50" height="50"></div>"#);
+        assert_eq!(boxes(&o, 0x00ff00ff).first().map(|r| (r.2, r.3)), Some((100, 100)));
     }
 
     /// ★ `align-content: center | flex-end` are UNSAFE (Flexbox §8.4): lines
