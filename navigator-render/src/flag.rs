@@ -112,8 +112,13 @@ pub fn flag(scene: &Scene, fonts: &FontSet, doc_text_chars: usize) -> Flags {
         // and font advance are not where the line's next character starts,
         // and counting them made pointed Hebrew words reach into the
         // punctuation beside them. A right-to-left run also ends on its
-        // leftmost glyph, so take the extent over every glyph.
-        let base = |&&(gid, _, _): &&(u16, U, U)| ff.tables().gdef.and_then(|t| t.glyph_class(ttf_parser::GlyphId(gid))) != Some(ttf_parser::gdef::GlyphClass::Mark);
+        // leftmost glyph, so take the extent over every glyph. Nor does the
+        // SPACE glyph count: the shaper draws a default-ignorable character
+        // (a ZWSP after an em dash) as a zero-advance space, and its font
+        // advance pushed "boxes—\u{200b}" into the "in" after it.
+        let space = ff.glyph_index(' ').map(|g| g.0);
+        let base = |&&(gid, _, _): &&(u16, U, U)| Some(gid) != space
+            && ff.tables().gdef.and_then(|t| t.glyph_class(ttf_parser::GlyphId(gid))) != Some(ttf_parser::gdef::GlyphClass::Mark);
         let x0 = r.x + r.glyphs.iter().filter(base).map(|g| g.1).min().unwrap_or(0);
         let x1 = r.x + r.glyphs.iter().filter(base).map(|&(gid, dx, _)|
             dx + ff.glyph_hor_advance(ttf_parser::GlyphId(gid)).unwrap_or(0) as i64 * r.size / upem).max().unwrap_or(0);
@@ -274,6 +279,14 @@ mod tests {
             \u{5dc}\u{5b4}\u{5e9}\u{5c1}\u{5b0}\u{5de}\u{5b6}\u{5da}\u{5b8}. \u{5d5}\u{5bc}'</p>");
         assert!(f.overlaps.is_empty(), "{:?}", f.overlaps.iter().map(|o| (
             &f.vis.iter().find(|v| v.run == o.0).unwrap().text, &f.vis.iter().find(|v| v.run == o.1).unwrap().text)).collect::<Vec<_>>());
+    }
+
+    /// A zero-width space shapes to the space glyph at zero advance; its
+    /// font advance is not part of the run's box.
+    #[test]
+    fn a_trailing_zero_width_space_does_not_widen_a_run() {
+        let f = run("<p><span>column boxes\u{2014}\u{200b}</span><span>in order to ensure</span></p>");
+        assert!(f.overlaps.is_empty(), "{:?}", f.overlaps);
     }
 
     #[test]
