@@ -2765,8 +2765,11 @@ impl<'a> Cx<'a> {
     /// Turn an inline-level node (and its inline descendants) into items.
     /// Lay out the out-of-flow boxes `collect_inline` set aside, at the
     /// static position of the line box they were written in.
+    /// ★ In DOCUMENT order: the later of two overlapping positioned boxes
+    /// paints on top (CSS 2.1 Appendix E). Popped from the end, the first
+    /// of `<span abs red><span abs green>` covered the second.
     fn place_pending_abs(&mut self, x: U, right: U, y: U) {
-        while let Some(h) = self.pending_abs.pop() { self.abs_box(h, x, right, y) }
+        for h in std::mem::take(&mut self.pending_abs) { self.abs_box(h, x, right, y) }
     }
 
     fn collect_inline(&mut self, h: Handle, out: &mut Vec<Item>, parent: &Style) {
@@ -3826,6 +3829,21 @@ mod tests {
         assert_eq!((one(0xff0000ff).0, one(0xff0000ff).1), (16, 0), "its own offsets, not the next box's");
         assert_eq!((one(0x0000ffff).0, one(0x0000ffff).1), (176, 48));
         assert_eq!((one(0xffff00ff).0, one(0xffff00ff).1), (200, 96 + 4), "not moved into the inline-block");
+    }
+
+    /// ★ …and they paint in DOCUMENT order (CSS 2.1 Appendix E): the later
+    /// of two overlapping positioned boxes is on top. Taken from the end of
+    /// the waiting list, the first covered the second.
+    #[test]
+    fn waiting_absolute_boxes_paint_in_document_order() {
+        let src = r#"<style>.d { position: relative; width: 320px; height: 96px }
+            .s { position: absolute; top: 0px; left: 0px; width: 50px; height: 50px }
+            .a { background-color: #ff0000 } .b { background-color: #00ff00 }</style>
+            <div class="d">x<span class="s a"></span><span class="s b"></span></div>"#;
+        let o = render(src);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let order: Vec<u32> = rects(&o).iter().map(|r| r.rgba).filter(|c| [0xff0000ff, 0x00ff00ff].contains(c)).collect();
+        assert_eq!(order, [0xff0000ff, 0x00ff00ff], "the later box paints on top");
     }
 
     /// ★ CSS Flexbox §4.1: an absolutely positioned child of a flex
