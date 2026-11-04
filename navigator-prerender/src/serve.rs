@@ -258,7 +258,17 @@ pub fn kernel_says_jailed() -> Result<bool, String> {
 pub fn limit_self(cpu_s: u64, mem_mb: u64) -> Result<String, String> {
     #[cfg(unix)]
     {
-        let set = |res, n: u64, what: &str| -> Result<(), String> {
+        let set = |res, ask: u64, what: &str| -> Result<(), String> {
+            // ★ THE TIGHTER of the ask and what this process inherited. A
+            // broker already running under a lower hard limit made the child
+            // try to RAISE it — EPERM, and a refused conversion (found in the
+            // FreeBSD jail run). Lowering is all this is for; a stricter
+            // inherited ceiling is already the goal.
+            let mut cur = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            if unsafe { libc::getrlimit(res, &mut cur) } != 0 {
+                return Err(format!("getrlimit {what}: {}", std::io::Error::last_os_error()));
+            }
+            let n = if cur.rlim_max == libc::RLIM_INFINITY { ask } else { ask.min(cur.rlim_max as u64) };
             let lim = libc::rlimit { rlim_cur: n as libc::rlim_t, rlim_max: n as libc::rlim_t };
             if unsafe { libc::setrlimit(res, &lim) } != 0 {
                 return Err(format!("setrlimit {what}={n}: {}", std::io::Error::last_os_error()));

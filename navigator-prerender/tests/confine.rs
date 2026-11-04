@@ -128,3 +128,16 @@ fn the_serve_entry_reads_only_stdin() {
     assert!(out.starts_with("R\t"), "{out}");
     assert!(out.contains("\nRECORDING ") && out.ends_with("END\n"), "{out}");
 }
+
+#[test]
+fn an_inherited_hard_limit_below_the_ask_is_kept_not_refused() {
+    // The child is started under a CPU hard limit LOWER than the one it will
+    // ask for (deadline 30 + 5 = 35 s, inherited 20 s). It must convert, not
+    // fail trying to raise it. `ulimit -H -t` sets the inherited hard limit.
+    let d = corpus_of_one("lowhard", PAGE);
+    let o = Command::new("sh").arg("-c").arg(format!("ulimit -t 20 && exec {EXE} {}", d.display()))
+        .env_remove("PRERENDER_LAUNCHER").env_remove("PRERENDER_REQUIRE_CONFINEMENT").output().unwrap();
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(o.status.success(), "{out}{}", String::from_utf8_lossy(&o.stderr));
+    assert!(!out.contains("TIMED OUT / crashed"), "{out}");
+}
