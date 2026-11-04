@@ -283,7 +283,10 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
             .filter(|c| cx.st(*c).map(|cs| kw(cs, "display")) == Some("table-cell")).collect()).collect();
         // ★ COLSPAN: a row has as many columns as its cells' spans add up
         // to, and the table as many as its widest row.
-        let ncols = rows_cells.iter().map(|cells| cells.iter().map(|c| cx.colspan(*c)).sum::<usize>()).max().unwrap_or(0);
+        // ★ ROWSPAN: and a cell spanning down from above pushes the cells
+        // below it to the right, so the slots decide, not a running sum.
+        let slots = cx.slots(&rows_cells);
+        let ncols = slots.iter().flatten().map(|(k, n, _)| k + n).max().unwrap_or(0);
         if ncols == 0 { continue }
         let mut mins = vec![0 as U; ncols];
         let mut maxs = vec![0 as U; ncols];
@@ -298,11 +301,8 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
         // (first column, span, min, max) of every SPANNING cell, settled
         // after the single-column cells have set their columns.
         let mut spanning: Vec<(usize, usize, U, U)> = vec![];
-        for cells in &rows_cells {
-            let mut k = 0usize;
-            for c in cells.iter().copied() {
-                let n = cx.colspan(c).min(ncols.saturating_sub(k)).max(1);
-                if k >= ncols { break }
+        for (cells, row_slots) in rows_cells.iter().zip(&slots) {
+            for (c, &(k, n, _)) in cells.iter().copied().zip(row_slots) {
                 let (mn, mx) = cx.intrinsic(c);
                 let pad = cx.st(c).map(|cs| {
                     let p = |n: &str| len(cs.get(n), 0).unwrap_or(0);
@@ -322,7 +322,6 @@ pub fn premeasure_tables(html: &str, fonts: &FontSet, env: &Env) -> (String, usi
                 } else {
                     spanning.push((k, n, mn, mx));
                 }
-                k += n;
             }
         }
         // ★ A spanning cell that needs more than its columns give (with the
@@ -1188,6 +1187,40 @@ impl<'a> Cx<'a> {
             .filter(|n| *n >= 1).map(|n| n.min(1000)).unwrap_or(1)
     }
 
+    /// A cell's `rowspan`: HTML's rules (a non-negative integer, at most
+    /// 65534; 0 means "to the end of the table" here, since row groups are
+    /// flattened), 1 when absent or invalid.
+    fn rowspan(&self, c: Handle) -> usize {
+        if !matches!(self.dom.tag(c), Some("td") | Some("th")) { return 1 }
+        self.dom.attr(c, "rowspan").and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| if n == 0 { usize::MAX } else { n.min(65534) }).unwrap_or(1)
+    }
+
+    /// ★ ROWSPAN. Where each cell sits in the table's grid: (first column,
+    /// column span, row span), the HTML table-forming algorithm's slots. A
+    /// cell takes the first column not still covered by a cell spanning down
+    /// from a row above — without this, every cell after a `rowspan` slid one
+    /// column left and the row's last cell fell off the declared columns.
+    /// Row spans are clamped to the rows that exist.
+    fn slots(&self, rows_cells: &[Vec<Handle>]) -> Vec<Vec<(usize, usize, usize)>> {
+        let mut busy: Vec<usize> = vec![];
+        let nrows = rows_cells.len();
+        rows_cells.iter().enumerate().map(|(r, cells)| {
+            let mut k = 0usize;
+            let out = cells.iter().map(|c| {
+                while busy.get(k).is_some_and(|b| *b > 0) { k += 1 }
+                let (n, rs) = (self.colspan(*c), self.rowspan(*c).min(nrows - r));
+                if busy.len() < k + n { busy.resize(k + n, 0) }
+                for b in &mut busy[k..k + n] { *b = rs }
+                let slot = (k, n, rs);
+                k += n;
+                slot
+            }).collect();
+            for b in &mut busy { *b = b.saturating_sub(1) }
+            out
+        }).collect()
+    }
+
     /// ★ The elements that DECLARE a table's columns (§3.13): its `<col>`s,
     /// direct or inside a `<colgroup>`, one per column — or, when it has
     /// none, the cells of its first row. The second form cannot describe a
@@ -1825,65 +1858,92 @@ impl<'a> Cx<'a> {
                 given += add;
             }
         }
-        let mut cy = y + sy;
-        for r in rows {
-            let cells = cells_of(self, r);
-            // ★ Each cell takes the next `colspan` columns, and its width is
-            // theirs together with the spacing between them. A cell past the
-            // declared columns keeps the old fallback (the last column's
-            // width) and is counted, not silently squeezed.
-            let mut k = 0usize;
-            let mut widths: Vec<U> = vec![];
-            let mut starts: Vec<usize> = vec![];
-            for c in &cells {
-                if self.dom.attr(*c, "rowspan").and_then(|v| v.trim().parse::<usize>().ok()).is_some_and(|n| n > 1) {
-                    self.count("rowspan (the cell occupies one row)");
-                }
-                let n = self.colspan(*c);
-                starts.push(k);
-                if k >= cols.len() {
-                    self.count("table cell past the declared columns");
-                    widths.push(*cols.last().expect("non-empty"));
-                } else {
-                    let end = (k + n).min(cols.len());
-                    widths.push(cols[k..end].iter().sum::<U>() + sx * (end - k - 1) as U);
-                }
-                k += n;
+        // ★ Each cell takes the next `colspan` columns not covered by a
+        // `rowspan` from above, and its width is theirs together with the
+        // spacing between them. A cell past the declared columns keeps the
+        // old fallback (the last column's width) and is counted, not
+        // silently squeezed.
+        let rows_cells: Vec<Vec<Handle>> = rows.iter().map(|r| cells_of(self, *r)).collect();
+        let slots = self.slots(&rows_cells);
+        let width_of = |this: &mut Self, (k, n, _): (usize, usize, usize)| -> U {
+            if k >= cols.len() {
+                this.count("table cell past the declared columns");
+                *cols.last().expect("non-empty")
+            } else {
+                let end = (k + n).min(cols.len());
+                cols[k..end].iter().sum::<U>() + sx * (end - k - 1) as U
             }
-            // Natural heights first: the row is as tall as its tallest cell.
-            let nat: Vec<U> = cells.iter().enumerate()
-                .map(|(i, c)| { let cw = widths[i]; self.table_part = true; self.measure(*c, cw, None, (Some(cw), None)) })
-                .collect();
-            let row_h = nat.iter().copied().max().unwrap_or(0);
-            // Baselines, for cells aligned on one (the row's shared baseline).
+        };
+        // Natural heights first, every cell at its width.
+        let mut nat: Vec<Vec<U>> = vec![];
+        let mut widths: Vec<Vec<U>> = vec![];
+        for (cells, row_slots) in rows_cells.iter().zip(&slots) {
+            let ws: Vec<U> = row_slots.iter().map(|sl| width_of(self, *sl)).collect();
+            nat.push(cells.iter().zip(&ws).map(|(c, cw)| { self.table_part = true; self.measure(*c, *cw, None, (Some(*cw), None)) }).collect());
+            widths.push(ws);
+        }
+        // Baselines, for cells aligned on one: the row's shared baseline is
+        // the lowest of them (a cell spanning rows shares its FIRST row's),
+        // and each such cell is pushed down to it.
+        let mut shift: Vec<Vec<U>> = vec![];
+        for (r, cells) in rows_cells.iter().enumerate() {
             let bases: Vec<Option<U>> = cells.iter().enumerate().map(|(i, c)| {
                 let cs = self.st(*c).expect("styled");
                 (kw(cs, "vertical-align") == "baseline").then(|| {
-                    let cw = widths[i];
+                    let cw = widths[r][i];
                     self.table_part = true;
                     self.baseline(*c, cw, (Some(cw), None))
                 })
             }).collect();
             let max_b = bases.iter().flatten().copied().max().unwrap_or(0);
-            // Column i's left edge, so a cell starts where its first column does.
-            let col_x = |i: usize| -> U { x + sx + cols[..i.min(cols.len())].iter().sum::<U>() + sx * i.min(cols.len()) as U };
+            shift.push(bases.iter().map(|b| b.map_or(0, |b| max_b - b)).collect());
+        }
+        // A row is as tall as its tallest one-row cell — shifted down by its
+        // baseline, which the row must still hold (CSS 2.1 §17.5.3); then a
+        // cell spanning rows that needs more than those rows (and the
+        // spacing between them) give spreads the shortfall over them,
+        // shortest spans first.
+        let need = |r: usize, i: usize| nat[r][i] + shift[r][i];
+        let mut row_h: Vec<U> = slots.iter().enumerate()
+            .map(|(r, row_slots)| row_slots.iter().enumerate().filter(|(_, (_, _, rs))| *rs == 1).map(|(i, _)| need(r, i)).max().unwrap_or(0))
+            .collect();
+        let mut spans: Vec<(usize, usize, U)> = slots.iter().enumerate()
+            .flat_map(|(r, row_slots)| row_slots.iter().enumerate().filter(|(_, (_, _, rs))| *rs > 1).map(move |(i, (_, _, rs))| (r, *rs, need(r, i))))
+            .collect();
+        spans.sort_by_key(|x| x.1);
+        for (r, rs, want) in spans {
+            let have: U = row_h[r..r + rs].iter().sum::<U>() + sy * (rs as U - 1);
+            if want > have {
+                let short = want - have;
+                for (j, h) in row_h[r..r + rs].iter_mut().enumerate() {
+                    *h += short / rs as U + if j == rs - 1 { short % rs as U } else { 0 };
+                }
+            }
+        }
+        let mut row_y: Vec<U> = vec![];
+        let mut cy = y + sy;
+        for h in &row_h { row_y.push(cy); cy += h + sy }
+        // Column i's left edge, so a cell starts where its first column does.
+        let col_x = |i: usize| -> U { x + sx + cols[..i.min(cols.len())].iter().sum::<U>() + sx * i.min(cols.len()) as U };
+        for (r, (cells, row_slots)) in rows_cells.iter().zip(&slots).enumerate() {
             for (i, c) in cells.iter().enumerate() {
-                let cw = widths[i];
-                let cx = if starts[i] < cols.len() { col_x(starts[i]) } else { col_x(cols.len()) };
+                let (k, _, rs) = row_slots[i];
+                let cw = widths[r][i];
+                // The cell box fills every row it spans (separate-borders model).
+                let ch: U = row_h[r..r + rs].iter().sum::<U>() + sy * (rs as U - 1);
+                let cx = if k < cols.len() { col_x(k) } else { col_x(cols.len()) };
                 let cs = self.st(*c).expect("styled");
-                // vertical-align positions the CONTENT inside the row's height;
-                // the cell box itself fills the row (separate-borders model).
+                // vertical-align positions the CONTENT inside that height.
                 self.content_dy = match kw(cs, "vertical-align") {
-                    "middle" => (row_h - nat[i]) / 2,
-                    "bottom" => row_h - nat[i],
-                    "baseline" => max_b - bases[i].unwrap_or(0),
+                    "middle" => (ch - nat[r][i]) / 2,
+                    "bottom" => ch - nat[r][i],
+                    "baseline" => shift[r][i],
                     _ => 0,
                 };
                 self.table_part = true;
-                self.block(*c, cx, cy, cw, Some(row_h), (Some(cw), Some(row_h)));
+                self.block(*c, cx, row_y[r], cw, Some(ch), (Some(cw), Some(ch)));
                 self.content_dy = 0;
             }
-            cy += row_h + sy;
         }
         cy - y
     }
@@ -2777,6 +2837,53 @@ mod tests {
         assert_eq!(b[0].3, 40, "a row whose content is shorter keeps the floor");
     }
 
+    /// ★ ROWSPAN. A cell spanning two rows covers its column in both, so
+    /// the second row's cells start one column further right; and a tall
+    /// spanning cell grows the rows it spans, not just the first.
+    #[test]
+    fn a_rowspan_covers_its_column_and_grows_its_rows() {
+        let src = r#"<style>body { margin-left: 0px; margin-top: 0px }
+            table { border-spacing: 10px 10px } .c0 { width: 100px } .c1 { width: 50px } .c2 { width: 50px }
+            .s { background-color: #ff0000; height: 200px } .a { background-color: #00ff00 } .d { background-color: #0000ff }
+            .e { background-color: #ffff00 }</style>
+            <table><colgroup><col class="c0"><col class="c1"><col class="c2"></colgroup>
+            <tr><td class="s" rowspan="2">S</td><td class="a">a</td><td>b</td></tr>
+            <tr><td class="d">d</td><td class="e">e</td></tr>
+            <tr><td>f</td><td>g</td><td>h</td></tr></table>"#;
+        let o = render(src);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        assert!(!o.unimplemented.keys().any(|k| k.contains("past the declared")), "{:?}", o.unimplemented);
+        let (sp, a, d, e) = (boxes(&o, 0xff0000ff)[0], boxes(&o, 0x00ff00ff)[0], boxes(&o, 0x0000ffff)[0], boxes(&o, 0xffff00ff)[0]);
+        assert_eq!((d.0, e.0), (10 + 100 + 10, 10 + 100 + 10 + 50 + 10), "row 2 starts after the column the span covers");
+        assert_eq!(d.1, a.1 + a.3 + 10, "row 2 sits below row 1");
+        assert_eq!(sp.3, a.3 + 10 + d.3, "the spanning cell fills both rows and the spacing between");
+        assert_eq!(sp.3, 200, "and they grew to fit its 200 px floor");
+    }
+
+    /// ★ A baseline-aligned cell is pushed down to the row's baseline, and
+    /// the row must still HOLD it (CSS 2.1 §17.5.3). Sized before the shift,
+    /// the short cell's text hung below its row and over the next one.
+    #[test]
+    fn a_row_holds_its_baseline_shifted_cells() {
+        let src = r#"<style>body { margin-left: 0px; margin-top: 0px }
+            table { border-spacing: 0px 0px } .c0 { width: 50px } .c1 { width: 200px }
+            td { vertical-align: baseline } .tall { display: inline-block; width: 10px; height: 100px }
+            .n { background-color: #0000ff }</style>
+            <table><colgroup><col class="c0"><col class="c1"></colgroup>
+            <tr><td><span class="tall"></span></td><td>one<br>two<br>three<br>four</td></tr>
+            <tr><td class="n">x</td><td>y</td></tr></table>"#;
+        let o = render(src);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let next = boxes(&o, 0x0000ffff)[0];
+        // Column 2's baselines in order: one, two, three, four, then y.
+        let mut ys: Vec<U> = o.scene.runs.iter().filter(|r| r.x >= 50 * PX).map(|r| r.y).collect();
+        ys.sort();
+        ys.dedup();
+        assert_eq!(ys.len(), 5, "{ys:?}");
+        assert!(ys[0] / PX >= 100, "the text cell was shifted to the 100 px baseline: {}", ys[0] / PX);
+        assert!(next.1 * PX >= ys[3], "the next row starts below \"four\": next {} four {}", next.1, ys[3] / PX);
+    }
+
     #[test]
     fn text_in_a_flex_item_counts_toward_its_width() {
         let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
@@ -3293,6 +3400,25 @@ mod tests {
         let first_x = runs[0].x;
         let second_x = runs.iter().map(|r| r.x).filter(|x| *x > first_x).min().expect("second column");
         assert!(second_x - first_x < 200 * 64, "the narrow column stays narrow: {}", (second_x - first_x) / 64);
+    }
+
+    /// ★ Premeasurement places cells by the same slots as layout: the
+    /// second row's only cell sits in column 2, under the span's neighbour,
+    /// so ITS width is what column 2 must hold — not column 1's.
+    #[test]
+    fn premeasure_measures_a_cell_below_a_rowspan_in_its_own_column() {
+        let src = r#"<style>table { display: table } tr { display: table-row } td { display: table-cell }
+            .s { background-color: #ff0000 } .l { background-color: #0000ff }</style>
+            <table><tr><td class="s" rowspan="2">x</td><td>y</td></tr>
+            <tr><td class="l">a much longer cell than the first</td></tr></table>"#;
+        let fonts = FontSet::load().unwrap();
+        let (fixed, n) = premeasure_tables(src, &fonts, &Env::default());
+        assert_eq!(n, 2, "two columns measured");
+        let o = render_html(&fixed, &fonts, &Env::default());
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let (sp, l) = (boxes(&o, 0xff0000ff)[0], boxes(&o, 0x0000ffff)[0]);
+        assert!(l.0 >= sp.0 + sp.2, "the long cell is in column 2: {sp:?} {l:?}");
+        assert!(l.2 > 4 * sp.2, "and column 2 is the wide one: {sp:?} {l:?}");
     }
 
     #[test]
