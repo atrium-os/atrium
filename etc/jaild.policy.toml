@@ -245,6 +245,20 @@ per-VkInstance → MoltenVK MTLDevice context → Apple GPU IOMMU on
 M4 Max. See docs/spec/gpu-isolation.md.
 """
 
+# Not granted: status is experimental until test_gpu_isolation passes on the
+# R9700. The run below was gpusim in the amd64 cloud VM.
+[gpu_drivers.attested.atrium-gpu-amd]
+status                  = "experimental"
+isolation_test_passed   = true
+isolation_test_date     = "2026-11-04"
+isolation_test_commit   = "73a94ecfe4af"
+abi_rev                 = 2
+notes = """
+RDNA4 driver against gpusim 1ea93e5. The five 2026-11-03 isolation breaks
+are fixed (atrium-gpu-amd/ISOLATION.md). Shared gfx/compute queues until
+per-VM MES queues land.
+"""
+
 
 # ---------------------------------------------------------------
 # Named profiles for system services. portcullisd may only ask
