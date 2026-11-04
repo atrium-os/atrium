@@ -659,6 +659,56 @@ keeps swap slots also pays; and TLB shootdowns come from unmapping pages for
 page-out, which a VM-integrated compressor still does unless it batches them,
 as macOS does.
 
+### 6.1 Design A: a swap fast path (zswap-style hook) — built 2026-11-04
+
+Decision (2026-11-04): try the cheap VM-integrated option first, measure it,
+and build the full compressor pager (design B) only if A falls short.
+
+**Kernel (freebsd-src `atrium-os`, `sys/vm/swap_pager.[ch]`).** One provider
+may register `swap_fastpath_register(pp, fn, arg)`. In
+`swp_pager_strategy()`, after the device lookup and *before* the pbuf is
+mapped, a request for a GEOM swap device whose provider is `pp` goes to
+`fn(arg, cmd, blk, ma, npages)` with the page array. 0 means every page is
+done, and the buf is completed in place with `bufdone()`. Any error sends the
+whole request down the normal path (`pmap_qenter` + bio + GEOM), which redoes
+all of it, so partial work is harmless. `swap_fast_busy`, under `sw_dev_mtx`,
+lets `swap_fastpath_unregister()` wait for calls in progress. Counters:
+`vm.stats.swap.fast_hits`, `fast_miss`. Swap slots, `swp_pager_meta`,
+pageout clustering, swap-free notification (§4.0) and swapoff are unchanged:
+A removes only the "pretend to be a disk" part of the per-page cost.
+
+What it saves per request: the pbuf KVA mapping and its teardown
+(`pmap_qenter`/`pmap_qremove`; the teardown is a TLB shootdown to every CPU,
+the largest "other" cost in the §6 profile), the bio allocation, the GEOM
+queue hop to the `g_down` thread, and `biodone`. Not saved: unmapping the
+pages from user space for page-out (`vm_pageout`), and swap-slot bookkeeping.
+
+**Module.** `zram_fast()` reaches pages through the direct map
+(`PHYS_TO_DMAP`; returns EOPNOTSUPP where there is none) and calls the same
+`zram_store` / `zram_load` as the GEOM path, so locking and formats are
+shared. It hands back to GEOM a written-back slot (read async there) and a
+store the pool refuses (write-through applies there). `bogus_page` entries
+in reads are skipped. Registration is lazy, from the first `zram_strategy()`
+call, which is where the module first sees its provider (disk(9) creates it
+from the GEOM event thread). `kern.zram.fastpath` (RWTUN, default 1) turns it
+off and on for A/B runs. With it off, the module unregisters and the device
+behaves exactly as before. `fastpath_active`, `fast_pages`, `fast_fallback`
+and `timing_stats` lines `fast_read` and `fast_write` report it. The module
+builds against kernels without the hook (`#ifdef SWAP_FASTPATH_VERSION`).
+
+**VM check (arm64 ATRIUM kernel under TCG, 2 GiB, 2026-11-04).** 2.3 GB of
+anon memory written with a stamped pattern, then read back and verified,
+with zram as the only swap. Fast path on: 33,793 requests (938k pages) went
+through it, 0 handed back, 0 bad pages. Fast path off: everything went
+through GEOM as before, 0 bad pages. `fail_*` all 0. Times under TCG are not
+meaningful (and the two runs swapped different amounts), so the
+decision waits on the native run.
+
+**Measurement.** The KVM kit (`bench/kvm`, `fastpath.patch`) now runs each
+codec with the fast path off and on and prints both §6 shares. Success for
+A: the swap + GEOM share under ~25 % with zstd, and LZ4 no worse than zstd,
+with 0 corrupt pages. Otherwise do B.
+
 ## 7. Measuring in the VM (the real numbers)
 
 Build memprobe natively in the VM (`cargo build --release`). The default `zstd`

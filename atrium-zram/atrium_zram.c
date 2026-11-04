@@ -36,6 +36,10 @@
 #include <sys/taskqueue.h>
 #include <geom/geom.h>
 #include <geom/geom_disk.h>
+#include <vm/vm.h>
+#include <vm/vm_param.h>
+#include <vm/vm_page.h>
+#include <vm/swap_pager.h>
 #include <vm/uma.h>
 #include <machine/atomic.h>
 
@@ -353,9 +357,11 @@ zram_slot(uint32_t idx, bool create)
  * for each codec's compress and decompress and for the synchronous part of
  * zram_strategy per page, so codec cost can be set against the whole path.
  */
-enum { ZT_ZSTD_C, ZT_ZSTD_D, ZT_LZ4_C, ZT_LZ4_D, ZT_READ, ZT_WRITE, ZT_N };
+enum { ZT_ZSTD_C, ZT_ZSTD_D, ZT_LZ4_C, ZT_LZ4_D, ZT_READ, ZT_WRITE,
+    ZT_FREAD, ZT_FWRITE, ZT_N };
 static const char *zram_tname[ZT_N] = { "zstd_compress", "zstd_decompress",
-    "lz4_compress", "lz4_decompress", "strategy_read", "strategy_write" };
+    "lz4_compress", "lz4_decompress", "strategy_read", "strategy_write",
+    "fast_read", "fast_write" };
 static counter_u64_t	zram_tcalls[ZT_N], zram_tns[ZT_N];
 static int		zram_timing = 1;
 
@@ -1022,6 +1028,123 @@ zram_backing_sysctl(SYSCTL_HANDLER_ARGS)
 }
 
 /*
+ * Swap fast path (spec §6.1, design A).  With a kernel that has the
+ * swap_pager hook (SWAP_FASTPATH_VERSION), the pager hands page-in and
+ * page-out requests for zram0 straight to zram_fast(): pages are reached
+ * through the direct map, so there is no pbuf KVA mapping (and no TLB
+ * shootdown when it is torn down), no bio, and no GEOM queue.  Anything the
+ * fast path can't finish synchronously -- a written-back slot, a store the
+ * pool refuses -- goes back to the pager, which sends the whole request
+ * through GEOM as before, where write-through and async backing reads apply.
+ *
+ * The hook is registered lazily from zram_strategy(), which is the first
+ * place zram learns its provider pointer (disk(9) creates it from the GEOM
+ * event thread).  kern.zram.fastpath=0 unregisters it (for A/B runs).
+ */
+static int	zram_fast_on = 1;
+static int	zram_fast_reg;		/* 1 once registered with swap_pager */
+static uint64_t	zram_fast_pages, zram_fast_fallback;	/* events, pages / requests */
+
+#ifdef SWAP_FASTPATH_VERSION
+static int
+zram_fast(void *arg __unused, int cmd, daddr_t blk, vm_page_t *ma, int npages)
+{
+	struct zram_slot *sl;
+	sbintime_t t0;
+	vm_paddr_t pa;
+	uint64_t bblk;
+	uint16_t len;
+	uint32_t idx;
+	uint8_t *va;
+	bool lz4;
+	int err = 0, i;
+
+	if (!zram_fast_on || !PMAP_HAS_DMAP)
+		return (EOPNOTSUPP);
+	t0 = zram_t0();
+	for (i = 0; i < npages; i++) {
+		if (ma[i] == bogus_page)
+			continue;
+		if (blk < 0 || (uint64_t)blk + i >= zram_nslots) {
+			err = EINVAL;
+			break;
+		}
+		idx = (uint32_t)(blk + i);
+		pa = VM_PAGE_TO_PHYS(ma[i]);
+		if (!PHYS_IN_DMAP(pa)) {
+			err = EOPNOTSUPP;
+			break;
+		}
+		va = PHYS_TO_DMAP(pa);
+		sl = zram_slot(idx, cmd == BIO_WRITE);
+		if (cmd == BIO_READ) {
+			if (sl == NULL) {
+				memset(va, 0, ZRAM_PAGE);
+				ZRAM_ADD(zram_reads, 1);
+				continue;
+			}
+			err = zram_load(sl, va, &bblk, &len, &lz4);
+			if (err == EJUSTRETURN)
+				err = EAGAIN;	/* written back: GEOM reads it async */
+		} else {
+			err = sl == NULL ? ENOMEM : zram_store(sl, va);
+		}
+		if (err != 0)
+			break;
+	}
+	zram_t1(cmd == BIO_READ ? ZT_FREAD : ZT_FWRITE, t0, (uint64_t)i);
+	if (err != 0)
+		ZRAM_ADD(zram_fast_fallback, 1);
+	else
+		ZRAM_ADD(zram_fast_pages, npages);
+	return (err);
+}
+
+static void
+zram_fast_register(struct g_provider *pp)
+{
+
+	if (pp != NULL && zram_fast_on && atomic_cmpset_int(&zram_fast_reg, 0, 1) &&
+	    swap_fastpath_register(pp, zram_fast, NULL) != 0)
+		atomic_store_int(&zram_fast_reg, 0);
+}
+
+static void
+zram_fast_unregister(void)
+{
+	struct g_provider *pp;
+
+	if (atomic_load_int(&zram_fast_reg) == 0 || zram_disk == NULL)
+		return;
+	g_topology_lock();
+	pp = zram_disk->d_geom != NULL ?
+	    LIST_FIRST(&zram_disk->d_geom->provider) : NULL;
+	g_topology_unlock();
+	if (pp != NULL)
+		swap_fastpath_unregister(pp);
+	atomic_store_int(&zram_fast_reg, 0);
+}
+#else
+#define	zram_fast_register(pp)	do { } while (0)
+#define	zram_fast_unregister()	do { } while (0)
+#endif
+
+static int
+zram_fastpath_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	int error, v;
+
+	v = zram_fast_on;
+	error = sysctl_handle_int(oidp, &v, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	zram_fast_on = v != 0;
+	if (!zram_fast_on)
+		zram_fast_unregister();	/* re-registers on the next I/O when on */
+	return (0);
+}
+
+/*
  * Block-device strategy: map each page of a BIO to a store slot. Swap (and dd
  * bs=4096) do page-aligned I/O; reject anything else. This is /dev/zram0's hot
  * path: store on write, load on read. Pages on the backing store are read with
@@ -1053,6 +1176,9 @@ zram_strategy(struct bio *bp)
 		biofinish(bp, NULL, EINVAL);
 		return;
 	}
+	if (zram_fast_on && zram_fast_reg == 0)	/* disk(9) hands us a clone */
+		zram_fast_register(bp->bio_to != NULL ? bp->bio_to :
+		    bp->bio_parent != NULL ? bp->bio_parent->bio_to : NULL);
 	t0 = zram_t0();
 	bp->bio_children = 1;	/* this loop; child bios add to it */
 	bp->bio_error = 0;
@@ -1319,6 +1445,15 @@ SYSCTL_PROC(_kern_zram, OID_AUTO, timing_stats,
 SYSCTL_PROC(_kern_zram, OID_AUTO, bench,
     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0, zram_bench_sysctl, "A",
     "Re-compress up to 256 held pages with zstd-1, zstd-3 and lz4; sizes and ns");
+SYSCTL_PROC(_kern_zram, OID_AUTO, fastpath,
+    CTLTYPE_INT | CTLFLAG_RWTUN | CTLFLAG_MPSAFE, NULL, 0, zram_fastpath_sysctl, "I",
+    "Serve swap page-in/out straight from the pager (needs the swap_pager hook)");
+SYSCTL_INT(_kern_zram, OID_AUTO, fastpath_active, CTLFLAG_RD, &zram_fast_reg, 0,
+    "1 while the swap fast path is registered");
+SYSCTL_U64(_kern_zram, OID_AUTO, fast_pages, CTLFLAG_RD, &zram_fast_pages, 0,
+    "Pages served by the swap fast path");
+SYSCTL_U64(_kern_zram, OID_AUTO, fast_fallback, CTLFLAG_RD, &zram_fast_fallback, 0,
+    "Fast-path requests handed back to GEOM");
 SYSCTL_U64(_kern_zram, OID_AUTO, phys_bytes, CTLFLAG_RD, &zram_phys_bytes, 0,
     "Physical bytes the compressed store currently holds");
 
@@ -1556,6 +1691,7 @@ zram_modevent(module_t mod __unused, int type, void *data __unused)
 		    (uintmax_t)(zram_pool.limit >> 20), zram_pool.reserve_n * ZP_CHUNK / 1024);
 		return (0);
 	case MOD_UNLOAD:
+		zram_fast_unregister();
 		disk_destroy(zram_disk);
 		callout_drain(&zram_wb_callout);
 		taskqueue_drain(zram_wb_tq, &zram_wb_task);

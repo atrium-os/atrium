@@ -1,7 +1,7 @@
 #!/bin/sh
 # Runs in the guest on the stock kernel: take the snapshot's own src.txz,
-# add the swap-free notification patch, build and install a GENERIC-NODEBUG
-# kernel as /boot/kernel.zbench, and build atrium_zram.ko and the fill
+# add the swap-free notification and swap fast-path patches, build and
+# install a GENERIC-NODEBUG kernel as /boot/kernel.zbench, and build atrium_zram.ko and the fill
 # workload against it.
 set -eu
 . /root/zb/env
@@ -23,7 +23,11 @@ if ! grep -q swp_freenotify sys/vm/swap_pager.c; then
 	log "apply swap-free notification patch"
 	patch -s -p1 < /root/zb/swapfree.patch
 fi
-# A rerun after a finished build only relinks (KERNFAST).
+if ! grep -q swap_fastpath_register sys/vm/swap_pager.c; then
+	log "apply swap fast-path patch"
+	patch -s -p1 < /root/zb/fastpath.patch
+fi
+# A rerun after a finished build recompiles only what changed (KERNFAST).
 FAST=
 [ -f /usr/obj/usr/src/amd64.amd64/sys/GENERIC-NODEBUG/kernel ] && FAST=-DKERNFAST
 log "buildkernel GENERIC-NODEBUG -j$NCPU $FAST"

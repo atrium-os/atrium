@@ -6,7 +6,7 @@
 # under $WORK (default ~/atrium-zram-bench). The only host change is
 # installing qemu-system-x86, ovmf and qemu-utils if they are missing (sudo
 # apt-get). Does not touch the GPU. Needs ~35 GB of disk, 3 GB of free RAM, and
-# about 45 minutes. Run it again to resume; delete $WORK to clean up.
+# about an hour. Run it again to resume; delete $WORK to clean up.
 #
 #   bash zram-kvm-bench.sh            # SMP=4 MEM=2G by default
 #
@@ -81,7 +81,7 @@ if [ ! -f "$WORK/vm.qcow2" ]; then
 	mv "$WORK/${IMG%.xz}" "$WORK/vm.qcow2"
 	qemu-img resize -q "$WORK/vm.qcow2" +30G
 	cp "$CODE" "$WORK/code.fd"; cp "$VARS" "$WORK/vars.fd"
-	rm -f "$WORK/.provisioned" "$WORK/.built"
+	rm -f "$WORK/.provisioned" "$WORK/.built" "$WORK/.built-fastpath"
 fi
 # src.txz of the same build, fetched here so the guest needs no network.
 SRCSUM=$(curl -fsS "$DIST/MANIFEST" | awk '$1 == "src.txz" { print $2 }')
@@ -142,25 +142,27 @@ echo "  guest up: $(gssh 'uname -r; sysctl -n hw.ncpu' | tr '\n' ' ')"
 tar cf - -C "$WORK/payload" . | gssh 'mkdir -p /root/zb && tar xf - -C /root/zb'
 [ "$STOP_AFTER" = provision ] && { say "STOP_AFTER=provision"; halt; exit 0; }
 
-if [ ! -f "$WORK/.built" ]; then
-	say "build in the guest (kernel with the swap-free patch, atrium_zram.ko): ~10-20 min"
+# .built-fastpath: a guest built by the first kit (no fast path) rebuilds once.
+if [ ! -f "$WORK/.built-fastpath" ]; then
+	say "build in the guest (kernel with the swap patches, atrium_zram.ko): ~10-20 min"
 	gssh 'test -f /usr/src/sys/vm/swap_pager.c' || gssh 'cat > /root/src.txz' < "$WORK/src.txz"
 	gssh 'sh /root/zb/guest-build.sh' || die "guest build"
-	touch "$WORK/.built"
+	touch "$WORK/.built" "$WORK/.built-fastpath"
 fi
 # Boot the patched kernel for this run only (nextboot is one-shot).
-if ! gssh 'sysctl -n vm.swap_free_notify' >/dev/null 2>&1; then
+if ! gssh 'sysctl -n vm.stats.swap.fast_hits' >/dev/null 2>&1; then
 	say "reboot once into /boot/kernel.zbench"
 	gssh 'nextboot -k kernel.zbench' || die "nextboot"
 	gssh 'shutdown -r now' >/dev/null 2>&1 || true
 	sleep 30
 	wait_ssh
-	gssh 'sysctl -n vm.swap_free_notify' >/dev/null 2>&1 ||
+	gssh 'sysctl -n vm.stats.swap.fast_hits' >/dev/null 2>&1 ||
 		die "guest did not come up on kernel.zbench (serial console: $WORK/serial.sock)"
 fi
 [ "$STOP_AFTER" = build ] && { say "STOP_AFTER=build"; halt; exit 0; }
 
-say "measure (two 1.9 GB fills, zstd then lz4): ~15-25 min"
+say "measure (four 1.9 GB fills: zstd and lz4, swap fast path off and on): ~30-50 min"
+[ -f "$WORK/report.txt" ] && mv "$WORK/report.txt" "$WORK/report-$(date +%Y%m%d-%H%M%S).txt"
 gssh 'sh /root/zb/guest-run.sh' | tee "$WORK/report.txt"
 gssh 'tar czf - -C /root/zb results' > "$WORK/results.tgz" || true
 say "power off the guest"
