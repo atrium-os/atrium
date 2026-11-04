@@ -1405,3 +1405,34 @@ fn align_content_keywords_resolve_to_the_flex_ones() {
     assert_eq!([ac("n"), ac("s"), ac("e")], ["stretch", "flex-start", "flex-end"], "{out}");
     assert!(refusals(&out).is_empty());
 }
+
+/// ★ The white space between floats renders NOTHING (CSS 2.1 §9.5.1), but
+/// between the inline-blocks a float row compiles to it is a word space —
+/// two `width: 50%` floats wrapped onto two lines. A strip loses its
+/// whitespace-only text, unless the space is preserved (`white-space: pre`)
+/// or another context lays the children out inline, where it is real.
+#[test]
+fn white_space_between_floats_is_not_a_word_space() {
+    let src = r#"<html><head><style>
+      .s span { float: left; width: 50% } #p { white-space: pre } @media (max-width: 9000px) { #m span { display: inline } }
+    </style></head><body>
+      <div class="s" id="a">
+        <span>one</span>
+        <span>two</span>
+      </div>
+      <div class="s" id="p"> <span>one</span> <span>two</span> </div>
+      <div class="s" id="m"> <span>one</span> <span>two</span> </div>
+    </body></html>"#;
+    let (out, report) = normalize(src, &Inputs::default());
+    let inner = |id: &str| { let at = out.find(&format!("id=\"{id}\"")).expect("id"); let s = &out[at..]; s[s.find('>').unwrap() + 1..s.find("</div>").unwrap()].to_string() };
+    assert!(!inner("a").contains("</span> ") && !inner("a").starts_with(char::is_whitespace), "{}", inner("a"));
+    assert!(inner("p").contains("</span> <span"), "pre keeps its spaces: {}", inner("p"));
+    assert!(inner("m").contains("</span> <span"), "laid out inline in some context: {}", inner("m"));
+    assert_eq!(report.dropped.get("white space between floats removed (it renders nothing)"), Some(&3), "{:?}", report.dropped);
+    // …and the two halves now share one line.
+    let fonts = navigator_render::fontset::FontSet::load().expect("fonts");
+    let o = navigator_render::html::render_html(&out, &fonts, &Env::default());
+    let ys: Vec<i64> = o.scene.runs.iter().filter(|r| r.text == "one" || r.text == "two").take(2).map(|r| r.y as i64).collect();
+    assert_eq!(ys.len(), 2);
+    assert_eq!(ys[0], ys[1], "one line");
+}

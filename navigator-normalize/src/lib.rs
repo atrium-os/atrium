@@ -549,6 +549,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         .filter_map(|h| dom.get(*h).and_then(|n| n.parent))
         .collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     let mut strip: Vec<Handle> = vec![];
+    let mut strip_parents: Vec<(Handle, Vec<Handle>)> = vec![];
     for p in parents {
         let kids = dom.element_children(p);
         // Only the children that generate a box in flow count.
@@ -568,8 +569,36 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         let all_left = dirs.len() >= 2 && dirs.iter().all(|d| *d == start);
         let has_text = dom.children_of(p).iter().any(|c|
             dom.get(*c).is_some_and(|n| matches!(n.kind, Kind::Text(ref t) if !t.trim().is_empty())));
-        if all_left && !has_text { rows += 1; strip.extend(inflow) } else { lone += dirs.iter().filter(|d| **d != "none").count() }
+        if all_left && !has_text { rows += 1; strip_parents.push((p, inflow.clone())); strip.extend(inflow) } else { lone += dirs.iter().filter(|d| **d != "none").count() }
     }
+    // ★ The WHITE SPACE between floats generates nothing (CSS 2.1 §9.5.1:
+    // it collapses, and a line holding only collapsible space is not
+    // there), but between inline-blocks it is a space as wide as a word gap:
+    // two `width: 50%` floats became two lines, and every WPT reference
+    // drawing a grid of floated cells came out one column wide. So the
+    // strip loses its whitespace-only text — unless the space is preserved
+    // (`white-space: pre…`), or some context lays the children out inline
+    // anyway, where the space is real.
+    let mut stripped = 0usize;
+    for (p, kids) in strip_parents {
+        let mut cur = Some(p);
+        let mut preserved = false;
+        while let Some(x) = cur {
+            match resolved.get(&(x, String::new(), String::new())).and_then(|pr| pr.get("white-space")).map(|(_, v)| v.as_str()) {
+                Some("inherit") | None => {}
+                Some(v) => { preserved = v.starts_with("pre") || v == "break-spaces"; break }
+            }
+            if matches!(dom.tag(x), Some("pre" | "textarea" | "listing" | "xmp")) { preserved = true; break }
+            cur = dom.get(x).and_then(|n| n.parent).filter(|q| matches!(dom.get(*q).map(|n| &n.kind), Some(Kind::Element(_))));
+        }
+        let inline_elsewhere = resolved.iter().any(|((h, st, me), pr)| (!st.is_empty() || !me.is_empty()) && kids.contains(h)
+            && pr.get("display").is_some_and(|(_, d)| d.starts_with("inline")));
+        if preserved || inline_elsewhere { continue }
+        let blank: Vec<Handle> = dom.children_of(p).into_iter()
+            .filter(|c| matches!(dom.get(*c).map(|n| &n.kind), Some(Kind::Text(t)) if t.trim().is_empty())).collect();
+        for c in blank { detach(&mut dom, c); stripped += 1 }
+    }
+    if stripped > 0 { report.drop_n("white space between floats removed (it renders nothing)", stripped) }
     for h in strip {
         let slot = resolved.entry((h, String::new(), String::new())).or_default();
         let keep = slot.get("display").map(|(_, v)| matches!(v.as_str(), "flex" | "grid" | "inline-flex" | "inline-grid" | "table")).unwrap_or(false);

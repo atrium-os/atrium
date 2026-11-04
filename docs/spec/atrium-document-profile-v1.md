@@ -1146,7 +1146,8 @@ indents), the `dir` attribute, named grid lines/areas, media-query range syntax,
 `row-reverse` / `column-reverse` (from 2026-11-04: reversed in the document, §3.4 — 116 + 105
 container contexts compiled in the two corpora; 38 + 47 that reverse only in some media or
 state and 6 + 6 that wrap are laid out on the same axis unreversed, and counted),
-float ROWS (as inline-block), Box Alignment's self-alignment keywords (§3.5, from 2026-11-04: `flex-*`,
+float ROWS (as inline-block, with the white space between the floats — which renders
+nothing — removed), Box Alignment's self-alignment keywords (§3.5, from 2026-11-04: `flex-*`,
 `self-*`, `left` / `right`, `normal`, and an image's initial `normal` in a grid), and — from 2026-09-24 — `box-sizing` (§3.3; 1,725 sizes in
 28 documents). The renderer stays small; the normalizer carries the cascade.
 `unset` (646 drops) and font-size keywords belong here and are **not yet compiled**.
