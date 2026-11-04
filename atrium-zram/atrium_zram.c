@@ -21,6 +21,7 @@
 #include <sys/bio.h>
 #include <sys/bitstring.h>
 #include <sys/callout.h>
+#include <sys/counter.h>
 #include <sys/kernel.h>
 #include <sys/libkern.h>
 #include <sys/lock.h>
@@ -39,6 +40,7 @@
 #include <machine/atomic.h>
 
 #include "zram_pool.h"
+#include "zram_lz4.h"
 
 /* In-kernel zstd context API (resolved at load against the kernel's globals). */
 typedef struct ZSTD_CCtx_s ZSTD_CCtx;
@@ -53,7 +55,15 @@ size_t ZSTD_compressBound(size_t srcSize);
 unsigned ZSTD_isError(size_t code);
 
 #define	ZRAM_PAGE	4096
-#define	ZRAM_LEVEL	3
+/*
+ * Codec (atrium-zram-v2.md §4.7, increment 6): kern.zram.codec selects zstd
+ * (default) or lz4 for new stores, at any time; each COMP slot records which
+ * codec wrote it (ZRAM_F_LZ4), so both can be live at once.
+ */
+#define	ZRAM_ZSTD	0
+#define	ZRAM_LZ4	1
+static int	zram_codec = ZRAM_ZSTD;
+static int	zram_zstd_level = 3;
 /*
  * Device size and slot table (atrium-zram-v2.md §4.1, increment 4). The size
  * is kern.zram.disksize (bytes, default = physical RAM), read at load. The
@@ -85,6 +95,7 @@ struct zram_slot {			/* 16 bytes (v1: 24) */
 	uint16_t	gen;	/* bumped whenever the contents change */
 };
 #define	ZRAM_F_IDLE	0x01	/* not read since the last idle scan */
+#define	ZRAM_F_LZ4	0x02	/* COMP / compressed WB: written by LZ4, not zstd */
 _Static_assert(sizeof(struct zram_slot) == 16, "zram_slot is 16 bytes");
 
 static uint32_t		 zram_nslots;	/* device size in pages */
@@ -117,6 +128,7 @@ struct zram_ctx {
 	struct mtx	mtx;
 	ZSTD_CCtx	*cctx;	/* pre-allocated — no malloc on the hot path */
 	ZSTD_DCtx	*dctx;
+	void		*lz4;	/* LZ4 hash table, zram_lz4_ctxsize() bytes */
 	char		comp[ZRAM_PAGE + 512]; /* >= ZSTD_compressBound(4096)=4174 */
 } __aligned(CACHE_LINE_SIZE);
 static struct zram_ctx	*zram_ctxs;
@@ -336,10 +348,75 @@ zram_slot(uint32_t idx, bool create)
 	return (ch == NULL ? NULL : &ch[idx & (ZRAM_CHUNK_SLOTS - 1)]);
 }
 
+/*
+ * In-kernel timing (increment 6): per-CPU counters of calls and nanoseconds,
+ * for each codec's compress and decompress and for the synchronous part of
+ * zram_strategy per page, so codec cost can be set against the whole path.
+ */
+enum { ZT_ZSTD_C, ZT_ZSTD_D, ZT_LZ4_C, ZT_LZ4_D, ZT_READ, ZT_WRITE, ZT_N };
+static const char *zram_tname[ZT_N] = { "zstd_compress", "zstd_decompress",
+    "lz4_compress", "lz4_decompress", "strategy_read", "strategy_write" };
+static counter_u64_t	zram_tcalls[ZT_N], zram_tns[ZT_N];
+static int		zram_timing = 1;
+
+static inline sbintime_t
+zram_t0(void)
+{
+	return (zram_timing ? sbinuptime() : 0);
+}
+
+static inline void
+zram_t1(int which, sbintime_t t0, uint64_t n)
+{
+	if (t0 == 0 || zram_tcalls[which] == NULL)
+		return;
+	counter_u64_add(zram_tcalls[which], n);
+	counter_u64_add(zram_tns[which], sbttons(sbinuptime() - t0));
+}
+
+/* Compress a page with `codec` into c->comp. Compressed length, or 0. */
+static size_t
+zram_compress(struct zram_ctx *c, int codec, const void *page)
+{
+	sbintime_t t0 = zram_t0();
+	size_t clen;
+
+	if (codec == ZRAM_LZ4) {
+		clen = (size_t)zram_lz4_compress(c->lz4, page, c->comp, ZRAM_PAGE,
+		    ZP_MAXOBJ);
+	} else {
+		clen = ZSTD_compressCCtx(c->cctx, c->comp, sizeof(c->comp), page,
+		    ZRAM_PAGE, zram_zstd_level);
+		if (ZSTD_isError(clen))
+			clen = 0;
+	}
+	zram_t1(codec == ZRAM_LZ4 ? ZT_LZ4_C : ZT_ZSTD_C, t0, 1);
+	return (clen);
+}
+
+/* Decompress `len` bytes at `src` into a page. 0 or EIO. */
+static int
+zram_decompress(struct zram_ctx *c, bool lz4, const void *src, size_t len,
+    void *page)
+{
+	sbintime_t t0 = zram_t0();
+	size_t r;
+	int n;
+
+	if (lz4) {
+		n = zram_lz4_decompress(src, page, (int)len, ZRAM_PAGE);
+		zram_t1(ZT_LZ4_D, t0, 1);
+		return (n == ZRAM_PAGE ? 0 : EIO);
+	}
+	r = ZSTD_decompressDCtx(c->dctx, page, ZRAM_PAGE, src, len);
+	zram_t1(ZT_ZSTD_D, t0, 1);
+	return (ZSTD_isError(r) || r != ZRAM_PAGE ? EIO : 0);
+}
+
 /* Store `page` in slot `s`. Same-filled -> tag (0 bytes); else compress; if it
  * doesn't shrink enough, store raw. Returns 0, ENOMEM or ENOSPC (at the limit). */
 static int
-zram_store(struct zram_slot *s, const void *page)
+zram_store_codec(struct zram_slot *s, const void *page, int codec)
 {
 	struct mtx *lk = zram_slot_lock(s);
 	struct zram_ctx *c = NULL;
@@ -356,9 +433,8 @@ zram_store(struct zram_slot *s, const void *page)
 		goto out; /* 0 physical bytes — the zero/same-page win */
 	}
 	c = zram_ctx_get();
-	clen = ZSTD_compressCCtx(c->cctx, c->comp, sizeof(c->comp), page, ZRAM_PAGE,
-	    ZRAM_LEVEL);
-	if (ZSTD_isError(clen) || clen > ZP_MAXOBJ)
+	clen = zram_compress(c, codec, page);
+	if (clen == 0 || clen > ZP_MAXOBJ)
 		clen = ZRAM_PAGE;	/* RAW: incompressible, too big to pack, or error */
 	mtx_lock(&zram_pool_mtx);
 	err = zpool_alloc(&zram_pool, clen, &s->span, &s->idx);
@@ -383,6 +459,7 @@ zram_store(struct zram_slot *s, const void *page)
 		memcpy(zpool_ptr(s->span, s->idx, zpool_objsize(&zram_pool, s->span)),
 		    c->comp, clen);
 		s->state = ZRAM_COMP;
+		s->fill = codec == ZRAM_LZ4 ? ZRAM_F_LZ4 : 0;
 	}
 	s->len = clen;
 	ZRAM_ADD(zram_phys_bytes, s->len);
@@ -395,17 +472,23 @@ out:
 	return (err);
 }
 
+static int
+zram_store(struct zram_slot *s, const void *page)
+{
+	return (zram_store_codec(s, page, zram_codec));
+}
+
 /*
  * Load slot `s` into `page` (exactly ZRAM_PAGE bytes). 0 or EIO; or, for a
  * written-back slot, EJUSTRETURN with its block and length in *blkp / *lenp,
  * for the caller to read asynchronously.
  */
 static int
-zram_load(struct zram_slot *s, void *page, uint64_t *blkp, uint16_t *lenp)
+zram_load(struct zram_slot *s, void *page, uint64_t *blkp, uint16_t *lenp,
+    bool *lz4p)
 {
 	struct mtx *lk = zram_slot_lock(s);
 	struct zram_ctx *c;
-	size_t r;
 	int err = 0;
 
 	mtx_lock(lk);
@@ -420,19 +503,18 @@ zram_load(struct zram_slot *s, void *page, uint64_t *blkp, uint16_t *lenp)
 	case ZRAM_WB:
 		*blkp = s->blk;
 		*lenp = s->len;
+		*lz4p = (s->fill & ZRAM_F_LZ4) != 0;
 		err = EJUSTRETURN;
 		break;
 	case ZRAM_COMP:
 		s->fill &= ~ZRAM_F_IDLE;
 		c = zram_ctx_get();
-		r = ZSTD_decompressDCtx(c->dctx, page, ZRAM_PAGE,
+		err = zram_decompress(c, (s->fill & ZRAM_F_LZ4) != 0,
 		    zpool_ptr(s->span, s->idx, zpool_objsize(&zram_pool, s->span)),
-		    s->len);
+		    s->len, page);
 		mtx_unlock(&c->mtx);
-		if (ZSTD_isError(r) || r != ZRAM_PAGE) {
+		if (err != 0)
 			ZRAM_ADD(zram_fail_io, 1);
-			err = EIO;
-		}
 		break;
 	default:
 		/* never-written block reads as zeros (standard block-device / swap). */
@@ -542,6 +624,7 @@ struct zram_io {
 	uint64_t		 blk;
 	uint16_t		 len;
 	uint16_t		 gen;
+	bool			 lz4;
 	char			 buf[ZRAM_PAGE];	/* read of a compressed block */
 };
 
@@ -551,17 +634,13 @@ zram_io_done(struct bio *cbp)
 	struct zram_io *io = cbp->bio_caller1;
 	struct zram_ctx *c;
 	struct mtx *lk;
-	size_t r;
 	int err = cbp->bio_error;
 
 	if (cbp->bio_cmd == BIO_READ) {
 		if (err == 0 && io->len < ZRAM_PAGE) {
 			c = zram_ctx_get();
-			r = ZSTD_decompressDCtx(c->dctx, io->dst, ZRAM_PAGE, io->buf,
-			    io->len);
+			err = zram_decompress(c, io->lz4, io->buf, io->len, io->dst);
 			mtx_unlock(&c->mtx);
-			if (ZSTD_isError(r) || r != ZRAM_PAGE)
-				err = EIO;
 		}
 		if (err != 0)
 			ZRAM_ADD(zram_fail_io, 1);
@@ -604,7 +683,7 @@ zram_io_start(struct bio *parent, int cmd, uint64_t blk, char *data,
 
 /* Read a written-back page. */
 static int
-zram_bk_read(struct bio *parent, char *dst, uint64_t blk, uint16_t len)
+zram_bk_read(struct bio *parent, char *dst, uint64_t blk, uint16_t len, bool lz4)
 {
 	struct zram_io *io;
 	int err;
@@ -616,6 +695,7 @@ zram_bk_read(struct bio *parent, char *dst, uint64_t blk, uint16_t len)
 		return (ENOMEM);
 	io->dst = dst;
 	io->len = len;
+	io->lz4 = lz4;
 	io->slot = NULL;
 	err = zram_io_start(parent, BIO_READ, blk, len < ZRAM_PAGE ? io->buf : dst, io);
 	if (err != 0)
@@ -746,7 +826,7 @@ zram_wb_flush(int n)
 				zram_drop_obj(r->slot);
 				r->slot->state = ZRAM_WB;
 				r->slot->blk = r->blk;
-				r->slot->fill = 0;
+				r->slot->fill &= ZRAM_F_LZ4;	/* keep the codec */
 				zram_count(r->slot, +1);
 				r->ok = 2;	/* block now owned by the slot */
 			}
@@ -953,8 +1033,10 @@ zram_strategy(struct bio *bp)
 {
 	struct zram_slot *sl;
 	uint8_t *data;
+	sbintime_t t0;
 	uint64_t blk;
 	uint16_t len;
+	bool lz4;
 	off_t off;
 	uint32_t idx;
 	int err = 0;
@@ -971,6 +1053,7 @@ zram_strategy(struct bio *bp)
 		biofinish(bp, NULL, EINVAL);
 		return;
 	}
+	t0 = zram_t0();
 	bp->bio_children = 1;	/* this loop; child bios add to it */
 	bp->bio_error = 0;
 	data = bp->bio_data;
@@ -984,9 +1067,9 @@ zram_strategy(struct bio *bp)
 				ZRAM_ADD(zram_reads, 1);
 				continue;
 			}
-			err = zram_load(sl, data + off, &blk, &len);
+			err = zram_load(sl, data + off, &blk, &len, &lz4);
 			if (err == EJUSTRETURN)
-				err = zram_bk_read(bp, data + off, blk, len);
+				err = zram_bk_read(bp, data + off, blk, len, lz4);
 		} else {
 			if (sl == NULL) {
 				err = ENOMEM;	/* no memory for the table chunk */
@@ -999,11 +1082,15 @@ zram_strategy(struct bio *bp)
 		if (err != 0)
 			break;
 	}
+	zram_t1(bp->bio_cmd == BIO_READ ? ZT_READ : ZT_WRITE, t0,
+	    (uint64_t)off / ZRAM_PAGE);
 	zram_parent_drop(bp, err);
 }
 
-/* Self-test: store a zero page, a compressible page, and an incompressible
- * (random) page; load each back and verify; report the compression. */
+/*
+ * Self-test: under each codec, store a zero page, a compressible page and an
+ * incompressible (random) page; load each back and verify; report the sizes.
+ */
 static int
 zram_selftest(SYSCTL_HANDLER_ARGS)
 {
@@ -1013,46 +1100,198 @@ zram_selftest(SYSCTL_HANDLER_ARGS)
 	 * 0..2 here could overwrite one (the swap pager reserves only the
 	 * first BBSIZE of the device).
 	 */
+	static const char *cname[2] = { "zstd", "lz4" };
 	struct zram_slot t[3];
-	char *p, *back, res[160];
-	int i, fails = 0;
-	uint64_t before;
+	char *p, *back, res[320];
+	int i, k, codec, fails = 0, n = 0;
+	uint32_t bytes;
 
-	memset(t, 0, sizeof(t));
 	p = malloc(ZRAM_PAGE, M_ZRAM, M_WAITOK);
 	back = malloc(ZRAM_PAGE, M_ZRAM, M_WAITOK);
-	before = zram_phys_bytes;
-
-	/* slot 0: all-zero -> SAME, 0 physical bytes. */
-	memset(p, 0, ZRAM_PAGE);
-	zram_store(&t[0], p);
-	if (zram_load(&t[0], back, NULL, NULL) != 0 || memcmp(p, back, ZRAM_PAGE) != 0) fails++;
-
-	/* slot 1: half-zero + low-entropy -> COMP. */
-	memset(p, 0, ZRAM_PAGE);
-	for (i = ZRAM_PAGE / 2; i < ZRAM_PAGE; i++) p[i] = (char)(i & 0x1f);
-	zram_store(&t[1], p);
-	if (zram_load(&t[1], back, NULL, NULL) != 0 || memcmp(p, back, ZRAM_PAGE) != 0) fails++;
-
-	/* slot 2: random -> incompressible -> RAW fallback. */
-	arc4random_buf(p, ZRAM_PAGE);
-	zram_store(&t[2], p);
-	if (zram_load(&t[2], back, NULL, NULL) != 0 || memcmp(p, back, ZRAM_PAGE) != 0) fails++;
-
-	snprintf(res, sizeof(res),
-	    "%s | 3 pages (zero/compressible/random) = 12288 logical -> %ju physical bytes "
-	    "[slot0=%s slot1=%s(%u) slot2=%s(%u)]",
-	    fails ? "FAIL" : "OK round-trips", (uintmax_t)(zram_phys_bytes - before),
-	    "SAME", t[1].state == ZRAM_COMP ? "COMP" : "?", t[1].len,
-	    t[2].state == ZRAM_RAW ? "RAW" : "?", t[2].len);
-
-	/* leave the store clean for repeat reads (private slots: no lock). */
-	zram_free_slot(&t[0]);
-	zram_free_slot(&t[1]);
-	zram_free_slot(&t[2]);
+	res[0] = '\0';
+	for (codec = ZRAM_ZSTD; codec <= ZRAM_LZ4; codec++) {
+		memset(t, 0, sizeof(t));
+		for (k = 0; k < 3; k++) {
+			if (k == 0)		/* all-zero -> SAME, 0 bytes */
+				memset(p, 0, ZRAM_PAGE);
+			else if (k == 1) {	/* half-zero + low-entropy -> COMP */
+				memset(p, 0, ZRAM_PAGE);
+				for (i = ZRAM_PAGE / 2; i < ZRAM_PAGE; i++)
+					p[i] = (char)(i & 0x1f);
+			} else			/* random -> RAW */
+				arc4random_buf(p, ZRAM_PAGE);
+			zram_store_codec(&t[k], p, codec);
+			if (zram_load(&t[k], back, NULL, NULL, NULL) != 0 ||
+			    memcmp(p, back, ZRAM_PAGE) != 0)
+				fails++;
+		}
+		if (t[0].state != ZRAM_SAME || t[1].state != ZRAM_COMP ||
+		    t[2].state != ZRAM_RAW ||
+		    ((t[1].fill & ZRAM_F_LZ4) != 0) != (codec == ZRAM_LZ4))
+			fails++;
+		bytes = t[1].len + t[2].len;
+		n += snprintf(res + n, sizeof(res) - n,
+		    " | %s: 12288 logical -> %u physical bytes [slot0=SAME slot1=COMP(%u) "
+		    "slot2=RAW(%u)]", cname[codec], bytes, t[1].len, t[2].len);
+		/* leave the store clean (private slots: no lock). */
+		for (k = 0; k < 3; k++)
+			zram_free_slot(&t[k]);
+	}
 	free(p, M_ZRAM);
 	free(back, M_ZRAM);
-	return (sysctl_handle_string(oidp, res, sizeof(res), req));
+	{
+		char out[sizeof(res) + 32];
+
+		snprintf(out, sizeof(out), "%s%s", fails ? "FAIL" : "OK round-trips",
+		    res);
+		return (sysctl_handle_string(oidp, out, sizeof(out), req));
+	}
+}
+
+/*
+ * Codec benchmark on the store's own contents: decompress up to 256 COMP
+ * pages from the table, then compress and decompress each with zstd level
+ * 1, zstd level 3 and LZ4, and report the mean compressed size and the mean
+ * nanoseconds per page each way. Real swap data, not synthetic pages.
+ */
+#define	ZRAM_BENCH_N	256
+static int
+zram_bench_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	static const struct { const char *name; int codec, level; } cfg[] = {
+		{ "zstd-1", ZRAM_ZSTD, 1 }, { "zstd-3", ZRAM_ZSTD, 3 },
+		{ "lz4", ZRAM_LZ4, 0 },
+	};
+	struct zram_ctx *bc;
+	struct zram_slot *ch, *sl;
+	struct zram_ctx *c;
+	struct sbuf sb;
+	char *pages, *out, *back;
+	uint64_t sz, cns, dns, raw;
+	sbintime_t t0;
+	uint32_t ci, j;
+	int n = 0, k, i, error, r;
+	size_t clen;
+
+	pages = malloc((size_t)ZRAM_BENCH_N * ZRAM_PAGE, M_ZRAM, M_WAITOK);
+	back = malloc(ZRAM_PAGE, M_ZRAM, M_WAITOK);
+	bc = malloc(sizeof(*bc), M_ZRAM, M_WAITOK | M_ZERO);
+	bc->cctx = ZSTD_createCCtx();
+	bc->dctx = ZSTD_createDCtx();
+	bc->lz4 = malloc(zram_lz4_ctxsize(), M_ZRAM, M_WAITOK);
+	out = bc->comp;
+	/* Gather pages, spread over the table. */
+	for (ci = 0; ci < zram_ndir && n < ZRAM_BENCH_N; ci++) {
+		ch = (struct zram_slot *)atomic_load_acq_ptr(
+		    (volatile uintptr_t *)&zram_dir[ci]);
+		if (ch == NULL)
+			continue;
+		for (j = 0; j < ZRAM_CHUNK_SLOTS && n < ZRAM_BENCH_N; j += 7) {
+			sl = &ch[j];
+			if (sl->state != ZRAM_COMP)
+				continue;
+			mtx_lock(zram_slot_lock(sl));
+			if (sl->state == ZRAM_COMP) {
+				c = zram_ctx_get();
+				if (zram_decompress(c, (sl->fill & ZRAM_F_LZ4) != 0,
+				    zpool_ptr(sl->span, sl->idx,
+				    zpool_objsize(&zram_pool, sl->span)), sl->len,
+				    pages + (size_t)n * ZRAM_PAGE) == 0)
+					n++;
+				mtx_unlock(&c->mtx);
+			}
+			mtx_unlock(zram_slot_lock(sl));
+		}
+	}
+	sbuf_new_for_sysctl(&sb, NULL, 512, req);
+	sbuf_printf(&sb, "%d pages sampled", n);
+	for (k = 0; k < (int)nitems(cfg) && n > 0; k++) {
+		sz = cns = dns = raw = 0;
+		for (i = 0; i < n; i++) {
+			const char *pg = pages + (size_t)i * ZRAM_PAGE;
+
+			t0 = sbinuptime();
+			if (cfg[k].codec == ZRAM_LZ4)
+				clen = (size_t)zram_lz4_compress(bc->lz4, pg, out,
+				    ZRAM_PAGE, ZP_MAXOBJ);
+			else {
+				clen = ZSTD_compressCCtx(bc->cctx, out, sizeof(bc->comp),
+				    pg, ZRAM_PAGE, cfg[k].level);
+				if (ZSTD_isError(clen))
+					clen = 0;
+			}
+			cns += sbttons(sbinuptime() - t0);
+			if (clen == 0 || clen > ZP_MAXOBJ) {
+				raw++;
+				sz += ZRAM_PAGE;
+				continue;
+			}
+			sz += clen;
+			t0 = sbinuptime();
+			if (cfg[k].codec == ZRAM_LZ4)
+				r = zram_lz4_decompress(out, back, (int)clen, ZRAM_PAGE);
+			else
+				r = (int)ZSTD_decompressDCtx(bc->dctx, back, ZRAM_PAGE,
+				    out, clen);
+			dns += sbttons(sbinuptime() - t0);
+			if (r != ZRAM_PAGE || memcmp(back, pg, ZRAM_PAGE) != 0)
+				sbuf_printf(&sb, " [%s MISMATCH page %d]", cfg[k].name, i);
+		}
+		sbuf_printf(&sb, " | %s: %ju B/page (%ju.%02jux), compress %ju ns, "
+		    "decompress %ju ns, %ju RAW", cfg[k].name, (uintmax_t)(sz / n),
+		    (uintmax_t)((uint64_t)n * ZRAM_PAGE / sz),
+		    (uintmax_t)((uint64_t)n * ZRAM_PAGE * 100 / sz % 100),
+		    (uintmax_t)(cns / n),
+		    (uintmax_t)(n - raw > 0 ? dns / (n - raw) : 0), (uintmax_t)raw);
+	}
+	error = sbuf_finish(&sb);
+	sbuf_delete(&sb);
+	ZSTD_freeCCtx(bc->cctx);
+	ZSTD_freeDCtx(bc->dctx);
+	free(bc->lz4, M_ZRAM);
+	free(bc, M_ZRAM);
+	free(back, M_ZRAM);
+	free(pages, M_ZRAM);
+	return (error);
+}
+
+/* "<name> <calls> <mean ns>" for each timed operation. */
+static int
+zram_timing_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct sbuf sb;
+	uint64_t n, ns;
+	int i, error;
+
+	sbuf_new_for_sysctl(&sb, NULL, 256, req);
+	for (i = 0; i < ZT_N; i++) {
+		n = counter_u64_fetch(zram_tcalls[i]);
+		ns = counter_u64_fetch(zram_tns[i]);
+		sbuf_printf(&sb, "%s%s %ju calls, %ju ns/page", i ? " | " : "",
+		    zram_tname[i], (uintmax_t)n, (uintmax_t)(n ? ns / n : 0));
+	}
+	error = sbuf_finish(&sb);
+	sbuf_delete(&sb);
+	return (error);
+}
+
+static int
+zram_codec_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	char name[8];
+	int error;
+
+	strlcpy(name, zram_codec == ZRAM_LZ4 ? "lz4" : "zstd", sizeof(name));
+	error = sysctl_handle_string(oidp, name, sizeof(name), req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	if (strcmp(name, "zstd") == 0)
+		zram_codec = ZRAM_ZSTD;
+	else if (strcmp(name, "lz4") == 0)
+		zram_codec = ZRAM_LZ4;
+	else
+		return (EINVAL);
+	return (0);
 }
 
 static SYSCTL_NODE(_kern, OID_AUTO, zram, CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
@@ -1060,6 +1299,19 @@ static SYSCTL_NODE(_kern, OID_AUTO, zram, CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
 SYSCTL_PROC(_kern_zram, OID_AUTO, selftest,
     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
     zram_selftest, "A", "Store+load zero/compressible/random pages, verify + report");
+SYSCTL_PROC(_kern_zram, OID_AUTO, codec,
+    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0, zram_codec_sysctl, "A",
+    "Codec for new stores: zstd or lz4 (each page remembers its own)");
+SYSCTL_INT(_kern_zram, OID_AUTO, zstd_level, CTLFLAG_RWTUN, &zram_zstd_level, 0,
+    "zstd compression level for new stores");
+SYSCTL_INT(_kern_zram, OID_AUTO, timing, CTLFLAG_RWTUN, &zram_timing, 0,
+    "Time codec calls and strategy pages (kern.zram.timing_stats)");
+SYSCTL_PROC(_kern_zram, OID_AUTO, timing_stats,
+    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0, zram_timing_sysctl, "A",
+    "Calls and mean ns per page: codecs, and the synchronous strategy path");
+SYSCTL_PROC(_kern_zram, OID_AUTO, bench,
+    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0, zram_bench_sysctl, "A",
+    "Re-compress up to 256 held pages with zstd-1, zstd-3 and lz4; sizes and ns");
 SYSCTL_U64(_kern_zram, OID_AUTO, phys_bytes, CTLFLAG_RD, &zram_phys_bytes, 0,
     "Physical bytes the compressed store currently holds");
 
@@ -1195,6 +1447,7 @@ zram_ctx_free(void)
 			ZSTD_freeCCtx(zram_ctxs[i].cctx);
 		if (zram_ctxs[i].dctx != NULL)
 			ZSTD_freeDCtx(zram_ctxs[i].dctx);
+		free(zram_ctxs[i].lz4, M_ZRAM);
 		mtx_destroy(&zram_ctxs[i].mtx);
 	}
 	free(zram_ctxs, M_ZRAM);
@@ -1209,6 +1462,17 @@ zram_modevent(module_t mod __unused, int type, void *data __unused)
 
 	switch (type) {
 	case MOD_LOAD:
+		for (i = 0; i < ZT_N; i++) {
+			zram_tcalls[i] = counter_u64_alloc(M_WAITOK);
+			zram_tns[i] = counter_u64_alloc(M_WAITOK);
+		}
+		{
+			char cn[8];
+
+			if (TUNABLE_STR_FETCH("kern.zram.codec", cn, sizeof(cn)) &&
+			    strcmp(cn, "lz4") == 0)
+				zram_codec = ZRAM_LZ4;
+		}
 		/* One codec context per CPU, all allocated up front. */
 		zram_nctx = mp_ncpus;
 		zram_ctxs = malloc(sizeof(struct zram_ctx) * zram_nctx, M_ZRAM,
@@ -1217,6 +1481,8 @@ zram_modevent(module_t mod __unused, int type, void *data __unused)
 			mtx_init(&zram_ctxs[i].mtx, "zram ctx", NULL, MTX_DEF);
 			zram_ctxs[i].cctx = ZSTD_createCCtx();
 			zram_ctxs[i].dctx = ZSTD_createDCtx();
+			zram_ctxs[i].lz4 = malloc(zram_lz4_ctxsize(), M_ZRAM,
+			    M_WAITOK | M_ZERO);
 			if (zram_ctxs[i].cctx == NULL || zram_ctxs[i].dctx == NULL) {
 				zram_nctx = i + 1;	/* free only what was set up */
 				zram_ctx_free();
@@ -1316,6 +1582,11 @@ zram_modevent(module_t mod __unused, int type, void *data __unused)
 		for (i = 0; i < ZRAM_NSLOTLOCKS; i++)
 			mtx_destroy((struct mtx *)&zram_slot_mtx[i]);
 		mtx_destroy(&zram_pool_mtx);
+		for (i = 0; i < ZT_N; i++) {
+			counter_u64_free(zram_tcalls[i]);
+			counter_u64_free(zram_tns[i]);
+			zram_tcalls[i] = zram_tns[i] = NULL;
+		}
 		return (0);
 	default:
 		return (EOPNOTSUPP);

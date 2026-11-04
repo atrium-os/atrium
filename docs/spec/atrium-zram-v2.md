@@ -31,7 +31,14 @@
 > store, and only `/dev/zram0` swapped on, the 300 MiB-limit run that
 > increment 2 lost to the OOM killer now completes: 0 corrupt pages, 0
 > page-out errors, and 27k pages moved to disk to keep the pool under the
-> limit. Next: increment 6 (LZ4 option and in-kernel timing).
+> limit.
+>
+> **2026-11-04 (night):** increment 6 (LZ4 option, in-kernel timing; §4.7) is
+> **built and verified in-VM**, which completes the v2 increments. LZ4 costs
+> 3–4× less CPU per page than zstd, but holds 45 % more memory on the same
+> workload, so zstd stays the default (§4.7 "As built"). The codec is 74–91 %
+> of the synchronous swap-out path, so codec choice is what moves latency. The
+> §6 VM-native decision is next, with these numbers in hand.
 >
 > **Decision context (Shankar, 2026-11-03).** Atrium gets macOS-style compressed
 > main memory, and it must work in the Mac VM, which has no GPU. Using spare GPU
@@ -512,6 +519,60 @@ kmod, because the kernel's LZ4 lives in ZFS and is not a stable export. Pick the
 codec per device, so a future per-tier scheme (LZ4 in front, zstd recompression
 of idle pages, like Linux zram's `recompress`) stays possible.
 
+**As built (increment 6, 2026-11-04).**
+
+- `kern.zram.codec` (sysctl, also a loader tunable) is `zstd` or `lz4` and may
+  change at any time. It is per page, not per device: each COMP slot (and each
+  compressed WB block) carries a flag naming its codec, so both can be live
+  at once. That is already the shape the LZ4-front / zstd-recompress scheme
+  needs.
+- LZ4 is the reference BSD-2 block codec, copied into `zram_lz4.c` from
+  FreeBSD's `sys/cddl/contrib/opensolaris/common/lz4/lz4.c` with the hash
+  table passed in (one per CPU context, allocated at load). Output is capped
+  at `ZP_MAXOBJ`, so anything bigger is RAW, as with zstd. `test/lz4_test.c`
+  round-trips 20,000 pages and feeds corrupt input, ASan- and UBSan-clean.
+- `kern.zram.zstd_level` (default stays 3; see below).
+- `kern.zram.timing_stats`: per-CPU `counter(9)` calls and nanoseconds for
+  each codec's compress and decompress and for the synchronous part of
+  `zram_strategy` per page (`kern.zram.timing=0` turns it off). This replaces
+  the dtrace `fbt` plan: always available, no dtrace needed in the image.
+- `kern.zram.bench`: decompresses up to 256 COMP pages from the live store and
+  re-compresses each with zstd-1, zstd-3 and LZ4, reporting mean size and ns
+  each way: the codec question asked of real swap contents.
+- The selftest runs under both codecs.
+- **Measured in the VM** (1.9 GB fill, unlimited, no backing store; QEMU TCG,
+  so absolute times are ~2 orders of magnitude above native and only ratios
+  count):
+
+  | | zstd-3 run | LZ4 run |
+  |---|---|---|
+  | corrupt pages | 0 of 486,400 | 0 of 486,400 |
+  | peak store, logical → pool | 1.87 GB → 822 MB (2.27×) | 2.00 GB → 1,183 MB (1.69×) |
+  | RAW pages at peak (> 3 KiB compressed) | 54,309 | 122,306 |
+  | compress, ns/page | 392,672 | 119,227 |
+  | decompress, ns/page | 139,791 | 68,685 |
+  | strategy write (whole sync path), ns/page | 431,665 | 160,419 |
+  | codec share of the write path | 91 % | 74 % |
+  | strategy read, ns/page (incl. SAME pages) | 136,972 | 59,917 |
+  | workload time / peak PSI `some` | 612 s / 53 % | 516 s / 14 % |
+
+  `kern.zram.bench` on 256 held pages (the more compressible ones, being COMP
+  only) agrees: zstd-3 351 B/page and LZ4 588 B/page; LZ4 compresses 3.1× and
+  decompresses 1.7× faster. zstd-1 came out at 359 B/page, within 3 % of
+  level 3 as §3 predicted, but its timing is not usable: it runs first, and a
+  zstd context allocates its workspace on first use at a new level.
+- **Decision: zstd stays the default.** The whole point of the tier is
+  capacity, and on this workload LZ4 needs 361 MB more RAM to hold the same
+  pages (more than doubling the RAW count). LZ4 bought a faster, calmer run
+  here because TCG makes CPU artificially scarce; on native hardware zstd-3
+  is on the order of 10–20 µs per page, which the memoryd / PSI loop can
+  afford. Where latency matters more than capacity, `kern.zram.codec=lz4` is
+  one sysctl away, and LZ4-front with zstd recompression of idle pages (§8)
+  gets most of both. Revisit `zstd_level` 1 vs 3 with a native timing run.
+- Note: right after a run ends, `orig_bytes` can trail `swapinfo` for tens of
+  seconds while the swap-free notifications drain (seen once: 391 MB held 20 s
+  after exit, back to 7 MB matching `swapinfo` soon after).
+
 ### 4.8 Federation hooks
 
 No new wiring is needed for correctness, since tiers still couple through PSI.
@@ -534,7 +595,7 @@ Two small consumers:
 | 3 | §4.3 per-CPU contexts + §4.1 hashed locks | **DONE, verified in-VM 2026-11-04**: 4 parallel `dd` writers 2.2× faster than increment 2, all streams byte-identical; the 1.9 GB fill has 0 corruption and 0 `fail_nomem` (after the span-header fix, §4.3). The 4-job-build PSI comparison is not run yet: a build under TCG takes hours, so it waits for a faster host. |
 | 4 | §4.1 dynamic sizing, lazy table | **DONE, verified in-VM 2026-11-04**: module memory at load fell from 12.0 MiB to 99 KiB, a 4 GiB device works on a 2 GiB VM, and the 1.9 GB fill has 0 corruption and 0 failures. The slot is 16 bytes, not 8 (the 8-byte handle moves to increment 5). |
 | 5 | §4.5 backing store and writeback | **DONE, verified in-VM 2026-11-04**: with the swap partition as backing and only zram0 in `swapinfo`, RAW pages go to disk at once, idle pages after two periods, and every read from disk matches. The 300 MiB-limit run that increment 2 lost to the OOM killer completes with 0 corruption and 0 page-out errors, and so does the 1.9 GB fill at the default limit. |
-| 6 | §4.7 LZ4 option | Selftest under both codecs. In-kernel timing of codec vs whole `zram_strategy` per page (dtrace `fbt`). |
+| 6 | §4.7 LZ4 option | **DONE, verified in-VM 2026-11-04**: selftest passes under both codecs; 1.9 GB fill with 0 corruption under each; in-kernel timing shows the codec is 74–91 % of the synchronous write path; zstd stays default (LZ4: 3–4× less CPU, 45 % more memory). |
 
 ## 6. The VM-native decision (macOS shape), and what would trigger it
 
@@ -582,8 +643,10 @@ store.
 - **GPU VRAM as overflow**: rejected (see the header). Don't re-propose.
 - **Dedup of identical pages**: ~15 % for the browser and ~0 elsewhere (§3).
   Reconsider with real Navigator and browser numbers from the VM.
-- **zstd recompression of idle LZ4 pages**: only if increment 6 shows LZ4 is
-  wanted as the front codec.
+- **zstd recompression of idle LZ4 pages**: increment 6 measured LZ4 at 3–4×
+  less CPU but 45 % more memory (§4.7). Worth building if native timing shows
+  zstd's swap-out latency hurts; the per-page codec flag and the idle scan
+  (§4.5) are already in place for it.
 - **Hardware compression engines**: none on the target machines; out of scope.
 - **Freeing empty slot-table chunks**: chunks stay until unload (§4.1 "As
   built"). Worth doing only if a large `disksize` with bursty use shows table
