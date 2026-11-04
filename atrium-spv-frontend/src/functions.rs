@@ -2332,6 +2332,29 @@ fn translate_inst(
             // from stage-ABI parameters rather than a memory
             // load.
             if let Some(kind) = iface.builtin_vars.get(&ptr_id).copied() {
+                use atrium_spv_ir::BuiltinKind as BK;
+                let is_sg = matches!(kind, BK::SubgroupSize | BK::SubgroupLocalInvocationId
+                    | BK::SubgroupId | BK::NumSubgroups);
+                if is_sg && !iface.native_subgroups {
+                    // subgroupSize = 1: one invocation per subgroup.
+                    let op = match kind {
+                        BK::SubgroupSize => Op::ConstInt { value: 1, kind: atrium_spv_ir::IntKind::U32 },
+                        BK::SubgroupLocalInvocationId => Op::ConstInt { value: 0, kind: atrium_spv_ir::IntKind::U32 },
+                        BK::SubgroupId => Op::LoadBuiltin(BK::LocalInvocationIndex),
+                        _ => {
+                            let ws = fresh_value(Type::Vec3(atrium_spv_ir::VecElement::U32), next_value_id);
+                            insts.push(Inst { op: Op::LoadBuiltin(BK::WorkgroupSize), result: Some(ws.clone()), source_spirv_offset });
+                            let x = push_extract_lane_i32(ws.clone(), 0, source_spirv_offset, insts, next_value_id)?;
+                            let y = push_extract_lane_i32(ws.clone(), 1, source_spirv_offset, insts, next_value_id)?;
+                            let z = push_extract_lane_i32(ws, 2, source_spirv_offset, insts, next_value_id)?;
+                            let xy = push_u32(Op::IMul(x, y), source_spirv_offset, insts, next_value_id);
+                            Op::IMul(xy, z)
+                        }
+                    };
+                    let result = alloc_or_get_result(result_id, result_ty, id_map, next_value_id);
+                    insts.push(Inst { op, result: Some(result), source_spirv_offset });
+                    return Ok(());
+                }
                 let result = alloc_or_get_result(
                     result_id, result_ty, id_map, next_value_id);
                 insts.push(Inst {
@@ -2999,6 +3022,8 @@ fn translate_inst(
         // matches our subgroupSize=1 dispatch.  ClusteredReduce
         // is rejected (no cluster semantics with size 1).
 
+        op if iface.native_subgroups && is_group_non_uniform(op) => translate_native_subgroup(
+            spv_inst, types, constants, id_map, next_value_id, insts, source_spirv_offset),
         SpvOp::GroupNonUniformElect | SpvOp::GroupNonUniformAllEqual => {
             let result_id = spv_inst.result_id.ok_or_else(||
                 FrontendError::Malformed(
@@ -6214,6 +6239,103 @@ fn push_ci(
         source_spirv_offset,
     });
     v
+}
+
+fn is_group_non_uniform(op: SpvOp) -> bool {
+    format!("{op:?}").starts_with("GroupNonUniform")
+}
+
+/// `OpGroupNonUniform*` with real multi-lane semantics: one
+/// `Op::Subgroup` carrying the operands after the scope (and
+/// the group operation). The execution scope must be Subgroup.
+#[allow(clippy::too_many_arguments)]
+fn translate_native_subgroup(
+    spv_inst: &Instruction,
+    types: &TypeContext,
+    constants: &ConstantContext,
+    id_map: &mut HashMap<Word, Value>,
+    next_value_id: &mut u32,
+    insts: &mut Vec<Inst>,
+    source_spirv_offset: u32,
+) -> Result<(), FrontendError> {
+    use atrium_spv_ir::{GroupArith as A, SubgroupOp as G};
+    let name = format!("{:?}", spv_inst.class.opcode);
+    let result_id = spv_inst.result_id.ok_or_else(||
+        FrontendError::Malformed(format!("{name} without result id")))?;
+    let result_type_id = spv_inst.result_type.ok_or_else(||
+        FrontendError::Malformed(format!("{name} without result type")))?;
+    let result_ty = types.get(result_type_id)?.clone();
+    let arith = |o: SpvOp| -> Option<A> {
+        Some(match o {
+            SpvOp::GroupNonUniformIAdd => A::IAdd,
+            SpvOp::GroupNonUniformFAdd => A::FAdd,
+            SpvOp::GroupNonUniformIMul => A::IMul,
+            SpvOp::GroupNonUniformFMul => A::FMul,
+            SpvOp::GroupNonUniformSMin => A::SMin,
+            SpvOp::GroupNonUniformUMin => A::UMin,
+            SpvOp::GroupNonUniformFMin => A::FMin,
+            SpvOp::GroupNonUniformSMax => A::SMax,
+            SpvOp::GroupNonUniformUMax => A::UMax,
+            SpvOp::GroupNonUniformFMax => A::FMax,
+            SpvOp::GroupNonUniformBitwiseAnd | SpvOp::GroupNonUniformLogicalAnd => A::And,
+            SpvOp::GroupNonUniformBitwiseOr | SpvOp::GroupNonUniformLogicalOr => A::Or,
+            SpvOp::GroupNonUniformBitwiseXor | SpvOp::GroupNonUniformLogicalXor => A::Xor,
+            _ => return None,
+        })
+    };
+    let (op, first, nargs) = match spv_inst.class.opcode {
+        SpvOp::GroupNonUniformElect => (G::Elect, 1, 0),
+        SpvOp::GroupNonUniformAll => (G::All, 1, 1),
+        SpvOp::GroupNonUniformAny => (G::Any, 1, 1),
+        SpvOp::GroupNonUniformAllEqual => (G::AllEqual, 1, 1),
+        SpvOp::GroupNonUniformBallot => (G::Ballot, 1, 1),
+        SpvOp::GroupNonUniformBroadcast => (G::Broadcast, 1, 2),
+        SpvOp::GroupNonUniformBroadcastFirst => (G::BroadcastFirst, 1, 1),
+        SpvOp::GroupNonUniformShuffle => (G::Shuffle, 1, 2),
+        SpvOp::GroupNonUniformShuffleXor => (G::ShuffleXor, 1, 2),
+        SpvOp::GroupNonUniformShuffleUp => (G::ShuffleUp, 1, 2),
+        SpvOp::GroupNonUniformShuffleDown => (G::ShuffleDown, 1, 2),
+        o => match arith(o) {
+            Some(a) => {
+                let group_op = match spv_inst.operands.get(1) {
+                    Some(Operand::GroupOperation(op)) => *op as u32,
+                    Some(Operand::LiteralBit32(v)) => *v,
+                    other => return Err(FrontendError::Malformed(format!(
+                        "{name} operand[1] expected group-operation literal, got {other:?}"))),
+                };
+                let g = match group_op {
+                    0 => G::Reduce(a),
+                    1 => G::InclusiveScan(a),
+                    2 => G::ExclusiveScan(a),
+                    3 => return Err(FrontendError::Unsupported(format!("{name} ClusteredReduce"))),
+                    other => return Err(FrontendError::Unsupported(format!("{name} group operation {other}"))),
+                };
+                (g, 2, 1)
+            }
+            None => return Err(FrontendError::Unsupported(format!("{name} with native subgroups"))),
+        },
+    };
+    // Execution scope: must be Subgroup (3).
+    let scope_id = match spv_inst.operands.first() {
+        Some(Operand::IdScope(id)) | Some(Operand::IdRef(id)) => *id,
+        other => return Err(FrontendError::Malformed(format!("{name} scope operand {other:?}"))),
+    };
+    if let Some(v) = constants.get(scope_id).and_then(|c| match &c.kind {
+        crate::constants::ConstantKind::Scalar(Op::ConstInt { value, .. }) => Some(*value),
+        _ => None,
+    }) {
+        if v != 3 {
+            return Err(FrontendError::Unsupported(format!("{name} with execution scope {v} (only Subgroup)")));
+        }
+    }
+    let mut args = vec![];
+    for k in 0..nargs {
+        let id = expect_id(&spv_inst.operands, first + k)?;
+        args.push(resolve_value(id, types, constants, id_map, next_value_id, insts, source_spirv_offset)?);
+    }
+    let result = alloc_or_get_result(result_id, result_ty, id_map, next_value_id);
+    insts.push(Inst { op: Op::Subgroup { op, args }, result: Some(result), source_spirv_offset });
+    Ok(())
 }
 
 /// Identity element for an OpGroupNonUniform<Op> reduce

@@ -941,6 +941,86 @@ pub enum Op {
     /// future if we add device-shared memory paths that need
     /// cache fences without a barrier.
     Barrier,
+
+    // ── Subgroup ───────────────────────────────────────────────
+
+    /// A subgroup operation with real (multi-lane) semantics.
+    /// Only emitted when the frontend runs with
+    /// `native_subgroups` (GPU backends); the default lowering
+    /// collapses `OpGroupNonUniform*` to subgroupSize = 1 and
+    /// never produces this op, so the CPU backends never see it.
+    /// `args` are the SPIR-V operands after the execution scope
+    /// (and group operation), in SPIR-V order.
+    Subgroup {
+        /// Which operation.
+        op: SubgroupOp,
+        /// Operands.
+        args: Vec<Value>,
+    },
+}
+
+/// Arithmetic of a subgroup reduction or scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupArith {
+    /// Integer add.
+    IAdd,
+    /// Float add.
+    FAdd,
+    /// Integer multiply.
+    IMul,
+    /// Float multiply.
+    FMul,
+    /// Signed minimum.
+    SMin,
+    /// Unsigned minimum.
+    UMin,
+    /// Float minimum.
+    FMin,
+    /// Signed maximum.
+    SMax,
+    /// Unsigned maximum.
+    UMax,
+    /// Float maximum.
+    FMax,
+    /// Bitwise (or, on bool, logical) and.
+    And,
+    /// Bitwise (or, on bool, logical) or.
+    Or,
+    /// Bitwise (or, on bool, logical) xor.
+    Xor,
+}
+
+/// Subgroup operations (`OpGroupNonUniform*`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubgroupOp {
+    /// True in the lowest active invocation.
+    Elect,
+    /// `args[0]` (bool) true in every active invocation.
+    All,
+    /// `args[0]` (bool) true in some active invocation.
+    Any,
+    /// `args[0]` equal in every active invocation.
+    AllEqual,
+    /// uvec4 bit mask of active invocations where `args[0]` is true.
+    Ballot,
+    /// `args[0]` from invocation `args[1]` (dynamically uniform).
+    Broadcast,
+    /// `args[0]` from the lowest active invocation.
+    BroadcastFirst,
+    /// `args[0]` from invocation `args[1]`.
+    Shuffle,
+    /// `args[0]` from invocation `id ^ args[1]`.
+    ShuffleXor,
+    /// `args[0]` from invocation `id - args[1]`.
+    ShuffleUp,
+    /// `args[0]` from invocation `id + args[1]`.
+    ShuffleDown,
+    /// Reduction over the active invocations.
+    Reduce(GroupArith),
+    /// Inclusive prefix over the active invocations, in id order.
+    InclusiveScan(GroupArith),
+    /// Exclusive prefix (identity in the lowest active invocation).
+    ExclusiveScan(GroupArith),
 }
 
 impl Op {
@@ -956,6 +1036,8 @@ impl Op {
             ConstInt { .. } | ConstFloat { .. } | ConstNull
             | LoadBuiltin(_) | ImageHandle { .. } | LocalAlloc { .. }
             | Branch(_) | Return | Discard | Barrier => {}
+
+            Subgroup { args, .. } => out.extend(args.iter().map(|a| a.id)),
 
             INeg(a) | FNeg(a) | BitNot(a) | PackHalf2x16(a) | UnpackHalf2x16(a)
             | Clz(a) | Rbit(a) | Load(a) | FFloor(a) | FCeil(a) | FTrunc(a)
@@ -1373,6 +1455,18 @@ pub enum BuiltinKind {
     /// {x, y, z, w} parameters, and the backend materialises the
     /// load as a 4-lane vector straight from them.
     FragCoord,
+    /// `gl_SubgroupSize` (Compute).  uint.  Only produced with
+    /// `native_subgroups`; the default lowering folds it to 1.
+    SubgroupSize,
+    /// `gl_SubgroupInvocationID` (Compute).  uint.  Native only
+    /// (default lowering: 0).
+    SubgroupLocalInvocationId,
+    /// `gl_SubgroupID` (Compute).  uint.  Native only (default
+    /// lowering: `gl_LocalInvocationIndex`).
+    SubgroupId,
+    /// `gl_NumSubgroups` (Compute).  uint.  Native only (default
+    /// lowering: the workgroup's invocation count).
+    NumSubgroups,
 }
 
 // ── Module ──────────────────────────────────────────────────────

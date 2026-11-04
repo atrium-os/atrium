@@ -138,6 +138,11 @@ pub struct InterfaceContext {
     /// records its ValueId on `Function::frag_depth_output` so
     /// the backend routes the store to the `out_depth` pointer.
     pub frag_depth_var: Option<Word>,
+    /// Translate `OpGroupNonUniform*` and the subgroup builtins
+    /// with real multi-lane semantics (`Op::Subgroup`), for GPU
+    /// backends.  False (the default) lowers them to
+    /// subgroupSize = 1 for the serial CPU dispatcher.
+    pub native_subgroups: bool,
 }
 
 /// One member of an `OpTypeStruct` annotated with an
@@ -419,6 +424,14 @@ impl InterfaceContext {
                                 Some(atrium_spv_ir::BuiltinKind::PrimitiveId),
                             SpvBuiltIn::FragCoord =>
                                 Some(atrium_spv_ir::BuiltinKind::FragCoord),
+                            SpvBuiltIn::SubgroupSize =>
+                                Some(atrium_spv_ir::BuiltinKind::SubgroupSize),
+                            SpvBuiltIn::SubgroupLocalInvocationId =>
+                                Some(atrium_spv_ir::BuiltinKind::SubgroupLocalInvocationId),
+                            SpvBuiltIn::SubgroupId =>
+                                Some(atrium_spv_ir::BuiltinKind::SubgroupId),
+                            SpvBuiltIn::NumSubgroups =>
+                                Some(atrium_spv_ir::BuiltinKind::NumSubgroups),
                             // Remaining builtins (e.g. Position, the VS
                             // output) flow through the varying / output
                             // paths; skip.

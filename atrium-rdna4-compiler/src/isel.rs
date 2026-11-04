@@ -639,6 +639,7 @@ impl<'a> Isel<'a> {
                 self.mi.push(MI::Global { name, vdst, vaddr, saddr, data: Some(data), ioff, th: used as u8, scope: 2 });
             }
             Op::Barrier => self.mi.push(MI::Barrier),
+            Op::Subgroup(o, args) => self.subgroup(*o, args, res.unwrap())?,
             Op::Yield(vals) => {
                 let targets = self.yields.last().cloned().unwrap_or_default();
                 for (t, v) in targets.iter().zip(vals) {
@@ -812,6 +813,190 @@ impl<'a> Isel<'a> {
         Ok(())
     }
 
+    /// `v` in a VGPR (a constant is moved into one).
+    fn in_vgpr(&mut self, v: ValueId) -> Result<O, Error> {
+        match self.src(v, 0)? {
+            O::Imm(b) => {
+                let t = O::R(self.vreg(Class::V, 1), 0);
+                self.valu("V_MOV_B32", t, vec![O::Imm(b)], 0);
+                Ok(t)
+            }
+            x => Ok(x),
+        }
+    }
+
+    /// `v` as a scalar: constants stay immediates, a VGPR is read from the
+    /// first active lane (`v` must be uniform over the active lanes).
+    fn in_sgpr(&mut self, v: ValueId) -> Result<O, Error> {
+        match self.src(v, 0)? {
+            O::Imm(b) => Ok(O::Imm(b)),
+            x => {
+                let t = O::R(self.vreg(Class::S, 1), 0);
+                self.valu("V_READFIRSTLANE_B32", t, vec![x], 0);
+                Ok(t)
+            }
+        }
+    }
+
+    /// The lane's index in the wave.
+    fn lane_id(&mut self) -> O {
+        let t = O::R(self.vreg(Class::V, 1), 0);
+        self.valu("V_MBCNT_LO_U32_B32", t, vec![O::Imm(u32::MAX), O::Imm(0)], 0);
+        t
+    }
+
+    /// Subgroup ops (wave32: the subgroup is the wave, its active lanes are
+    /// EXEC). Lane masks (`bool`) have garbage in inactive lanes, so votes
+    /// and ballots mask with EXEC first.
+    fn subgroup(&mut self, o: SubgroupOp, args: &[ValueId], r: ValueId) -> Result<(), Error> {
+        let s = |me: &mut Self| O::R(me.vreg(Class::S, 1), 0);
+        match o {
+            SubgroupOp::Elect => {
+                let lane = s(self);
+                self.salu("S_CTZ_I32_B32", lane, vec![O::Exec]);
+                let d = O::R(self.def_s(r), 0);
+                self.salu("S_LSHL_B32", d, vec![O::Imm(1), lane]);
+            }
+            SubgroupOp::All | SubgroupOp::Any | SubgroupOp::AllEqual => {
+                let p = if o == SubgroupOp::AllEqual {
+                    let x = self.src(args[0], 0)?;
+                    if let O::Imm(_) = x {
+                        O::Imm(u32::MAX)
+                    } else {
+                        let f = self.in_sgpr(args[0])?;
+                        let m = s(self);
+                        self.valu("V_CMP_EQ_U32", m, vec![x, f], 0);
+                        m
+                    }
+                } else {
+                    self.src(args[0], 0)?
+                };
+                let t = s(self);
+                let d = O::R(self.def_s(r), 0);
+                if o == SubgroupOp::Any {
+                    // SCC = some active lane true.
+                    self.salu("S_AND_B32", t, vec![p, O::Exec]);
+                    self.salu("S_CSELECT_B32", d, vec![O::Imm(u32::MAX), O::Imm(0)]);
+                } else {
+                    // SCC = some active lane false.
+                    self.salu("S_AND_NOT1_B32", t, vec![O::Exec, p]);
+                    self.salu("S_CSELECT_B32", d, vec![O::Imm(0), O::Imm(u32::MAX)]);
+                }
+            }
+            SubgroupOp::Ballot => {
+                let p = self.src(args[0], 0)?;
+                let t = s(self);
+                self.salu("S_AND_B32", t, vec![p, O::Exec]);
+                let d = O::R(self.def_v(r), 0);
+                self.valu("V_MOV_B32", d, vec![t], 0);
+            }
+            SubgroupOp::BroadcastFirst | SubgroupOp::Broadcast => {
+                let x = self.src(args[0], 0)?;
+                let v = match x {
+                    O::Imm(_) => x,
+                    _ if o == SubgroupOp::BroadcastFirst => self.in_sgpr(args[0])?,
+                    _ => {
+                        let lane = self.in_sgpr(args[1])?;
+                        let t = s(self);
+                        self.mi.push(MI::Valu { name: "V_READLANE_B32", dst: t, sdst: None, src: vec![x, lane], neg: 0 });
+                        t
+                    }
+                };
+                let d = O::R(self.def_v(r), 0);
+                self.valu("V_MOV_B32", d, vec![v], 0);
+            }
+            SubgroupOp::Shuffle | SubgroupOp::ShuffleXor | SubgroupOp::ShuffleUp | SubgroupOp::ShuffleDown => {
+                let x = self.in_vgpr(args[0])?;
+                let k = self.src(args[1], 0)?;
+                let addr = O::R(self.vreg(Class::V, 1), 0);
+                match (o, k) {
+                    (SubgroupOp::Shuffle, O::Imm(b)) => self.valu("V_MOV_B32", addr, vec![O::Imm(b.wrapping_mul(4))], 0),
+                    (SubgroupOp::Shuffle, _) => self.valu("V_LSHLREV_B32", addr, vec![O::Imm(2), k], 0),
+                    _ => {
+                        let lane = self.lane_id();
+                        let name = match o {
+                            SubgroupOp::ShuffleXor => "V_XOR_B32",
+                            SubgroupOp::ShuffleUp => "V_SUB_NC_U32",
+                            _ => "V_ADD_NC_U32",
+                        };
+                        self.valu(name, lane, vec![lane, k], 0);
+                        self.valu("V_LSHLREV_B32", addr, vec![O::Imm(2), lane], 0);
+                    }
+                }
+                let d = O::R(self.def_v(r), 0);
+                self.mi.push(MI::Ds { name: "DS_BPERMUTE_B32", vdst: Some(d), addr, data: Some(x), off: 0 });
+            }
+            SubgroupOp::Reduce(g) | SubgroupOp::InclusiveScan(g) | SubgroupOp::ExclusiveScan(g) => {
+                self.wave_scan(o, g, args[0], r)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reduction or scan over the active lanes: a scalar loop visits them
+    /// in lane order, accumulating in an SGPR and (for scans) writing each
+    /// lane's prefix into its lane of the result.
+    fn wave_scan(&mut self, o: SubgroupOp, g: GroupArith, v: ValueId, r: ValueId) -> Result<(), Error> {
+        let s = |me: &mut Self| O::R(me.vreg(Class::S, 1), 0);
+        let op = match g {
+            GroupArith::IAdd => "S_ADD_CO_U32",
+            GroupArith::FAdd => "S_ADD_F32",
+            GroupArith::IMul => "S_MUL_I32",
+            GroupArith::FMul => "S_MUL_F32",
+            GroupArith::SMin => "S_MIN_I32",
+            GroupArith::UMin => "S_MIN_U32",
+            GroupArith::FMin => "S_MIN_NUM_F32",
+            GroupArith::SMax => "S_MAX_I32",
+            GroupArith::UMax => "S_MAX_U32",
+            GroupArith::FMax => "S_MAX_NUM_F32",
+            GroupArith::And => "S_AND_B32",
+            GroupArith::Or => "S_OR_B32",
+            GroupArith::Xor => "S_XOR_B32",
+        };
+        let scan = !matches!(o, SubgroupOp::Reduce(_));
+        let inclusive = matches!(o, SubgroupOp::InclusiveScan(_));
+        let val = self.in_vgpr(v)?;
+        let (rem, acc, lane, x, bit) = (s(self), s(self), s(self), s(self), s(self));
+        let pre = if scan {
+            let p = O::R(self.def_v(r), 0);
+            self.valu("V_MOV_B32", p, vec![O::Imm(0)], 0);
+            Some(p)
+        } else {
+            None
+        };
+        let (top, end) = (self.label(), self.label());
+        self.salu("S_MOV_B32", rem, vec![O::Exec]);
+        self.salu("S_MOV_B32", acc, vec![O::Imm(g.identity())]);
+        self.mi.push(MI::Branch { name: "S_CBRANCH_EXECZ", target: end });
+        self.mi.push(MI::LoopBegin);
+        self.mi.push(MI::Label(top));
+        self.salu("S_CTZ_I32_B32", lane, vec![rem]);
+        self.mi.push(MI::Valu { name: "V_READLANE_B32", dst: x, sdst: None, src: vec![val, lane], neg: 0 });
+        let write = |me: &mut Self| {
+            if let Some(p) = pre {
+                me.mi.push(MI::Valu { name: "V_WRITELANE_B32", dst: p, sdst: None, src: vec![acc, lane], neg: 0 });
+            }
+        };
+        if !inclusive {
+            write(self);
+        }
+        self.salu(op, acc, vec![acc, x]);
+        if inclusive {
+            write(self);
+        }
+        self.salu("S_LSHL_B32", bit, vec![O::Imm(1), lane]);
+        // SCC = (rem != 0) after the and-not.
+        self.salu("S_AND_NOT1_B32", rem, vec![rem, bit]);
+        self.mi.push(MI::Branch { name: "S_CBRANCH_SCC1", target: top });
+        self.mi.push(MI::LoopEnd);
+        self.mi.push(MI::Label(end));
+        if !scan {
+            let d = O::R(self.def_v(r), 0);
+            self.valu("V_MOV_B32", d, vec![acc], 0);
+        }
+        Ok(())
+    }
+
     fn builtin(&mut self, b: Builtin, r: ValueId) -> Result<(), Error> {
         let ls = self.f.local_size;
         let want = self.builtin_comps.get(&r).copied().unwrap_or(7);
@@ -843,6 +1028,34 @@ impl<'a> Isel<'a> {
                 self.valu("V_MAD_U32_U24", O::R(t, 0), vec![O::R(t, 0), O::Imm(ls[1]), d], 0);
                 self.valu("V_BFE_U32", d, vec![O::PV(0), O::Imm(0), O::Imm(10)], 0);
                 self.valu("V_MAD_U32_U24", d, vec![O::R(t, 0), O::Imm(ls[0]), d], 0);
+            }
+            Builtin::SubgroupSize => {
+                self.consts.insert(r, SUBGROUP_SIZE);
+            }
+            Builtin::NumSubgroups => {
+                self.consts.insert(r, (ls[0] * ls[1] * ls[2]).div_ceil(SUBGROUP_SIZE));
+            }
+            Builtin::SubgroupLocalId => {
+                let t = self.lane_id();
+                self.map.insert(r, match t {
+                    O::R(v, c) => (v, c),
+                    _ => unreachable!(),
+                });
+            }
+            Builtin::SubgroupId => {
+                if ls[0] * ls[1] * ls[2] <= SUBGROUP_SIZE {
+                    self.consts.insert(r, 0);
+                } else {
+                    // Waves are consecutive runs of 32 local indices.
+                    let t = self.vreg(Class::V, 1);
+                    let d = O::R(self.def_v(r), 0);
+                    self.valu("V_BFE_U32", O::R(t, 0), vec![O::PV(0), O::Imm(20), O::Imm(10)], 0);
+                    self.valu("V_BFE_U32", d, vec![O::PV(0), O::Imm(10), O::Imm(10)], 0);
+                    self.valu("V_MAD_U32_U24", O::R(t, 0), vec![O::R(t, 0), O::Imm(ls[1]), d], 0);
+                    self.valu("V_BFE_U32", d, vec![O::PV(0), O::Imm(0), O::Imm(10)], 0);
+                    self.valu("V_MAD_U32_U24", d, vec![O::R(t, 0), O::Imm(ls[0]), d], 0);
+                    self.valu("V_LSHRREV_B32", d, vec![O::Imm(5), d], 0);
+                }
             }
         }
         Ok(())

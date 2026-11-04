@@ -74,3 +74,45 @@ fn glyph_total_matches_the_generator() {
         assert_eq!(glyphs.init.len() as u32, 48 * atrium_rdna4_oracle::bench::glyph_total(100));
     }
 }
+
+fn words(b: &[u8]) -> Vec<u32> {
+    b.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()
+}
+
+/// The subgroup cases compile natively, and the interpreter gives them
+/// 32-lane subgroup semantics (values worked out by hand from the inputs
+/// `i % 7 + 1`).
+#[test]
+fn subgroup_cases_have_wave32_semantics() {
+    let c = atrium_rdna4_oracle::cases::tierb("subgroup_ops").expect("subgroup_ops compiles");
+    let out = words(c.buffers.iter().find(|b| b.name == "b0_1").unwrap().expect.as_ref().unwrap());
+    let o = |lane: usize, k: usize| out[lane * 16 + k];
+    assert_eq!(o(0, 0), 122); // add over lanes 0..32
+    assert_eq!(o(32, 0), 131); // add over lanes 32..64
+    assert_eq!(o(2, 1), 1 + 2 + 3); // inclusive add
+    assert_eq!(o(0, 2), 0); // exclusive max: identity in lane 0
+    assert_eq!(o(0, 4), 3); // broadcast first of x * 3
+    assert_eq!(o(0, 5), 6 + 5); // broadcast lane 5 of x + i
+    assert_eq!(o(1, 6), 1 + 7); // shuffle from lane 7
+    assert_eq!(o(0, 8), 1 + 4 + 16); // elect, any(x == 6), allEqual(i / 64)
+    assert_eq!(o(1, 8), 4 + 16);
+    assert_eq!(o(33, 9), 1 + 100 + 20000 + 32_000_000); // ids and sizes
+    let p = atrium_rdna4_oracle::cases::tierb("subgroup_partial").expect("subgroup_partial compiles");
+    let out = words(p.buffers.iter().find(|b| b.name == "b0_1").unwrap().expect.as_ref().unwrap());
+    // The second wave has 8 lanes (32..40): ballot 0xff, x = 5 6 7 1 2 3 4 5.
+    assert_eq!(out[32 * 8], 255 * 1000 + 33);
+    assert_eq!(out[33 * 8 + 2], 9); // not elected
+    assert_eq!(out[32 * 8 + 2], 7); // elected
+}
+
+/// Without `native_subgroups` the frontend keeps the CPU's subgroupSize = 1
+/// lowering: no subgroup op or subgroup builtin reaches the IR.
+#[test]
+fn default_frontend_keeps_size_one_subgroups() {
+    let bytes = std::fs::read(format!("{}/shaders/subgroup_ops.comp.spv", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let m = atrium_spv_frontend::translate(&bytes).expect("default translate");
+    let ir = format!("{m:?}");
+    assert!(!ir.contains("Subgroup"), "size-1 lowering leaked a subgroup op or builtin");
+    let n = atrium_spv_frontend::translate_with_options(&bytes, &atrium_spv_frontend::Options { native_subgroups: true, ..Default::default() }).unwrap();
+    assert!(format!("{n:?}").contains("Subgroup {"));
+}

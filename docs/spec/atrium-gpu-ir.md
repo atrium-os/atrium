@@ -90,8 +90,12 @@ SPIR-V scope and semantics. Builtins (`global_id`, `local_id`,
 its input registers.
 
 **Subgroup ops** are first-class (`ballot`, `broadcast`, `reduce(add|min|…)`,
-`elect`), with the subgroup size a property the target supplies (AMD 32 or
-64, Intel 8, 16 or 32).
+scans, shuffles, votes, `elect`; see §4), with the subgroup size a property
+the target supplies (AMD 32 or 64, Intel 8, 16 or 32; fixed at 32 for now).
+On RDNA4 votes and ballots are SALU ops on EXEC, broadcasts are
+`v_readlane`/`v_readfirstlane`, shuffles are `ds_bpermute`, and reductions
+and scans are a scalar loop over the active lanes (DPP is the planned
+faster form).
 
 ## 4. Building GIR from the frontend IR
 
@@ -109,13 +113,25 @@ its input registers.
 5. **Scalarise** arithmetic, **map** SSBO pointers to `Buffer(b)` + offset
    expressions, **map** builtins.
 
-**Known gap (found 2026-11-04).** The frontend lowers every
+**Subgroups (2026-11-04).** The frontend's default still lowers every
 `OpGroupNonUniform*` as if the subgroup had one invocation (Tier-2's model:
-`WaveActiveSum(x)` becomes `x`). That is wrong on a GPU, so before G4 the
-frontend IR gets real subgroup ops (the CPU backends lower them to the
-size-1 identity themselves) and GIR maps them to its subgroup ops. Until
-then `subgroup_sum` builds into GIR with size-1 meaning and is excluded from
-oracle comparisons.
+`WaveActiveSum(x)` becomes `x`). GPU users translate with
+`Options { native_subgroups: true }` instead: each op becomes one frontend
+`Op::Subgroup { op, args }` and the subgroup builtins (`SubgroupSize`,
+`SubgroupLocalInvocationId`, `SubgroupId`, `NumSubgroups`) stay builtins, so
+the CPU backends never see either. The builder maps them to GIR's
+`Op::Subgroup`, scalarising vectors and passing `bool` data as `i32` (votes
+and ballots keep `bool`). Supported: elect, all, any, all-equal, ballot,
+broadcast, broadcast-first, shuffle, shuffle-xor/up/down, and reduce,
+inclusive and exclusive scan over add, mul, min, max (signed, unsigned,
+float) and and/or/xor. Not yet: clustered reductions, quad ops, ballot bit
+queries, inverse ballot, the subgroup mask builtins. The subgroup size is
+fixed at 32 (`SUBGROUP_SIZE`) until a target needs another.
+
+Uniformity: votes, ballots, broadcasts and reductions are uniform whatever
+their operands; elect, shuffles, scans and the subgroup invocation id are
+divergent. Subgroup ops are not pure (they read the execution mask), so CSE
+never merges them; DCE removes unused ones.
 
 ## 5. Passes (target-independent)
 

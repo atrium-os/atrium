@@ -196,6 +196,23 @@ impl<'a> V<'a> {
             Op::Store(_, o, _) => ty(*o) == Ty::I32,
             Op::Atomic(_, _, o, v) => ty(*o) == Ty::I32 && ty(*v) == Ty::I32 && res == Some(Ty::I32),
             Op::Barrier | Op::Yield(_) | Op::Continue(_) | Op::Break(_) | Op::Return => true,
+            Op::Subgroup(o, v) => {
+                let data = |t: Ty| t == Ty::I32 || t == Ty::F32;
+                match (o, v.as_slice()) {
+                    (SubgroupOp::Elect, []) => res == Some(Ty::BOOL),
+                    (SubgroupOp::All | SubgroupOp::Any, [p]) => ty(*p) == Ty::BOOL && res == Some(Ty::BOOL),
+                    (SubgroupOp::AllEqual, [x]) => data(ty(*x)) && res == Some(Ty::BOOL),
+                    (SubgroupOp::Ballot, [p]) => ty(*p) == Ty::BOOL && res == Some(Ty::I32),
+                    (SubgroupOp::BroadcastFirst, [x]) => data(ty(*x)) && res == Some(ty(*x)),
+                    (SubgroupOp::Broadcast | SubgroupOp::Shuffle | SubgroupOp::ShuffleXor | SubgroupOp::ShuffleUp | SubgroupOp::ShuffleDown, [x, i]) => {
+                        data(ty(*x)) && ty(*i) == Ty::I32 && res == Some(ty(*x))
+                    }
+                    (SubgroupOp::Reduce(a) | SubgroupOp::InclusiveScan(a) | SubgroupOp::ExclusiveScan(a), [x]) => {
+                        ty(*x) == if a.is_float() { Ty::F32 } else { Ty::I32 } && res == Some(ty(*x))
+                    }
+                    _ => false,
+                }
+            }
         };
         if ok { Ok(()) } else { bad() }
     }

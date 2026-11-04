@@ -3,7 +3,7 @@
 
 fn compile(path: &str) -> Option<(atrium_gir::Function, atrium_rdna4_compiler::Binary)> {
     let bytes = std::fs::read(format!("{}/../bundles/{path}", env!("CARGO_MANIFEST_DIR"))).ok()?;
-    let m = atrium_spv_frontend::translate(&bytes).unwrap();
+    let m = atrium_spv_frontend::translate_with_options(&bytes, &atrium_spv_frontend::Options { native_subgroups: true, ..Default::default() }).unwrap();
     let mut g = atrium_gir::build::build(&m, 0).unwrap();
     atrium_gir::passes::optimize(&mut g);
     let b = atrium_rdna4_compiler::compile(&g).unwrap_or_else(|e| panic!("{path}: {e:?}"));

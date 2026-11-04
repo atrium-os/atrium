@@ -90,7 +90,7 @@ fn sweep(r: &mut Region, uses: &HashMap<ValueId, usize>) -> bool {
     for mut node in std::mem::take(r) {
         match &mut node {
             Node::Inst(i) => {
-                if (i.op.is_pure() || matches!(i.op, Op::Load(..))) && i.result.map_or(false, |v| !used(&v)) {
+                if (i.op.is_pure() || matches!(i.op, Op::Load(..) | Op::Subgroup(..))) && i.result.map_or(false, |v| !used(&v)) {
                     changed = true;
                     continue;
                 }

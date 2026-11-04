@@ -71,7 +71,7 @@ fn entry_name(spv: &[u8]) -> String {
 /// SPIR-V is not built.
 pub fn desktop(shader: &str, spv_path: &str, nodes: u32, record: u32, repeat: u32) -> Option<Bench> {
     let spv = std::fs::read(format!("{}/../bundles/{spv_path}", env!("CARGO_MANIFEST_DIR"))).ok()?;
-    let m = atrium_spv_frontend::translate(&spv).expect("frontend");
+    let m = atrium_spv_frontend::translate_with_options(&spv, &atrium_spv_frontend::Options { native_subgroups: true, ..Default::default() }).expect("frontend");
     let mut g = atrium_gir::build::build(&m, 0).expect("gir");
     atrium_gir::passes::optimize(&mut g);
     let bin = atrium_rdna4_compiler::compile(&g).expect("rdna4 compile");

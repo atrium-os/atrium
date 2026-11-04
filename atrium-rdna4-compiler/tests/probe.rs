@@ -2,7 +2,7 @@ mod common;
 #[test]
 fn dump_ir() {
     let spv = common::saxpy_like();
-    let m = atrium_spv_frontend::translate(&spv).expect("translate");
+    let m = atrium_spv_frontend::translate_with_options(&spv, &atrium_spv_frontend::Options { native_subgroups: true, ..Default::default() }).expect("translate");
     let f = &m.functions[m.entry_points[0].function_index];
     println!("ssbo {:?} local {:?}", f.ssbo_bindings, f.local_size);
     let mut ids: Vec<_> = f.blocks.keys().collect(); ids.sort();
@@ -13,7 +13,7 @@ fn dump_ir() {
 fn dump_desktop() {
     for p in ["../bundles/atrium-core/compute/op_rectangle.comp.spv", "../bundles/atrium-core/compute/op_path.comp.spv", "../bundles/atrium-core/compute/op_texture.comp.spv", "../bundles/atrium-text/compute/op_glyph_run.comp.spv"] {
         let Ok(spv) = std::fs::read(p) else { println!("skip {p}"); continue };
-        let m = atrium_spv_frontend::translate(&spv).expect(p);
+        let m = atrium_spv_frontend::translate_with_options(&spv, &atrium_spv_frontend::Options { native_subgroups: true, ..Default::default() }).expect(p);
         let f = &m.functions[m.entry_points[0].function_index];
         let mut ops = std::collections::BTreeMap::<String, usize>::new();
         let mut kinds = std::collections::BTreeMap::<String, usize>::new();

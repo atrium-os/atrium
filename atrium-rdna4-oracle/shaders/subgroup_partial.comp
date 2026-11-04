@@ -1,0 +1,36 @@
+#version 450
+// A 40-invocation workgroup: one full wave and one with 8 lanes. Loops
+// whose trip count differs per lane leave lanes inactive in later
+// iterations. Compile: glslangValidator -V --target-env vulkan1.1
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 40) in;
+layout(set = 0, binding = 0) buffer In { uint data[]; };
+layout(set = 0, binding = 1) buffer Out { uint o[]; };
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    uint x = data[i];
+    uint b = i * 8u;
+    o[b + 0u] = subgroupAdd(x) + 1000u * subgroupBallot(true).x;
+    o[b + 1u] = subgroupInclusiveAdd(x) + 1000u * gl_SubgroupID + 100000u * gl_NumSubgroups;
+    o[b + 2u] = subgroupElect() ? 7u : 9u;
+    uint acc = 0u;
+    // Loops are written break-first: the frontend does not take glslang's
+    // merge-less loop-condition blocks yet.
+    for (uint k = 0u;; k++) {
+        if (k >= x) break;
+        acc += subgroupAdd(k + 1u) * (k + 1u) + subgroupBallot(true).x;
+    }
+    o[b + 3u] = acc;
+    uint m = 0u;
+    for (uint k = 0u;; k++) {
+        if (k >= 3u) break;
+        if (((x + k) & 1u) == 1u) {
+            m = m * 31u + subgroupExclusiveAdd(x + k);
+        } else {
+            m = m * 7u + subgroupMax(x * k);
+        }
+    }
+    o[b + 4u] = m;
+}

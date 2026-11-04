@@ -87,7 +87,7 @@ pub fn desktop(name: &str, spv: &str, nodes: u32, record: u32) -> Option<Case> {
     use atrium_gir::interp;
     let path = format!("{}/../bundles/{spv}", env!("CARGO_MANIFEST_DIR"));
     let bytes = std::fs::read(path).ok()?;
-    let m = atrium_spv_frontend::translate(&bytes).expect("frontend");
+    let m = atrium_spv_frontend::translate_with_options(&bytes, &atrium_spv_frontend::Options { native_subgroups: true, ..Default::default() }).expect("frontend");
     let mut g = atrium_gir::build::build(&m, 0).expect("gir");
     atrium_gir::passes::optimize(&mut g);
     let bin = atrium_rdna4_compiler::compile(&g).expect("rdna4 compile");
@@ -156,13 +156,17 @@ pub fn desktop(name: &str, spv: &str, nodes: u32, record: u32) -> Option<Case> {
 /// shader yet.
 pub fn tierb(name: &str) -> Option<Case> {
     use atrium_gir::interp;
-    let path = format!("{}/../atrium-vk-icd/examples/shaders/{name}.comp.spv", env!("CARGO_MANIFEST_DIR"));
-    let bytes = std::fs::read(path).ok()?;
-    let m = atrium_spv_frontend::translate(&bytes).ok()?;
+    // The oracle's own shaders first, then the Vulkan ICD's examples.
+    let own = format!("{}/shaders/{name}.comp.spv", env!("CARGO_MANIFEST_DIR"));
+    let icd = format!("{}/../atrium-vk-icd/examples/shaders/{name}.comp.spv", env!("CARGO_MANIFEST_DIR"));
+    let bytes = std::fs::read(own).or_else(|_| std::fs::read(icd)).ok()?;
+    let m = atrium_spv_frontend::translate_with_options(&bytes, &atrium_spv_frontend::Options { native_subgroups: true, ..Default::default() }).ok()?;
     let mut g = atrium_gir::build::build(&m, 0).ok()?;
     atrium_gir::passes::optimize(&mut g);
     let bin = atrium_rdna4_compiler::compile(&g).ok()?;
-    let fill = |k: u32| -> Vec<u8> { (0..256u32).flat_map(|i| (i % 7 + k).to_le_bytes()).collect() };
+    // 256 words per buffer; the subgroup cases write 16 words per lane.
+    let words = if name.starts_with("subgroup_") && name != "subgroup_sum" { 1024u32 } else { 256 };
+    let fill = |k: u32| -> Vec<u8> { (0..words).flat_map(|i| (i % 7 + k).to_le_bytes()).collect() };
     let mut ib_bufs: interp::Buffers = g.buffers.iter().map(|&(s, b)| ((s, b), fill(b + 1))).collect();
     // Push constants: small distinct integers (3, 4, 5, ...).
     let push: Vec<u8> = (0..g.push_bytes / 4).flat_map(|i| (i + 3).to_le_bytes()).collect();
@@ -179,7 +183,7 @@ pub fn tierb(name: &str) -> Option<Case> {
         buffers.push(Buffer {
             name: format!("b{set}_{binding}"),
             va,
-            size: 4096,
+            size: 4096.max(4 * words as u64),
             init: inputs[&(*set, *binding)].clone(),
             expect: Some(ib_bufs.remove(&(*set, *binding)).unwrap()),
             unordered: None,
@@ -202,10 +206,10 @@ pub fn tierb(name: &str) -> Option<Case> {
 }
 
 /// Tier-B examples tried as compiled cases, simplest first.
-pub const TIERB: [&str; 18] = [
+pub const TIERB: [&str; 21] = [
     "write_42", "per_thread", "multi_binding", "max_const", "ternary", "branch", "rmw", "rotate",
     "bit_chain", "bit_count", "loop_mul", "sum_loop", "atomic_add", "per_thread_triangle", "spec_scale", "float_sqrt",
-    "push_scale", "groupshared_xor",
+    "push_scale", "groupshared_xor", "subgroup_sum", "subgroup_ops", "subgroup_partial",
 ];
 
 /// The desktop compute shaders: name, SPIR-V path under `bundles/`, bytes

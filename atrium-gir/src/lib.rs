@@ -252,6 +252,131 @@ pub enum Builtin {
     WorkgroupId,
     /// `gl_LocalInvocationIndex` (`i32`).
     LocalIndex,
+    /// `gl_SubgroupSize` (`i32`): [`SUBGROUP_SIZE`].
+    SubgroupSize,
+    /// `gl_SubgroupInvocationID` (`i32`): the local index modulo the
+    /// subgroup size.
+    SubgroupLocalId,
+    /// `gl_SubgroupID` (`i32`): the local index divided by the subgroup
+    /// size.
+    SubgroupId,
+    /// `gl_NumSubgroups` (`i32`).
+    NumSubgroups,
+}
+
+/// Subgroup size. Subgroups are consecutive runs of this many invocations
+/// in local-index order (the last one may be partial). Fixed at 32 for
+/// now: RDNA wave32. A per-target value comes with the first wave64 or
+/// SIMD16 target.
+pub const SUBGROUP_SIZE: u32 = 32;
+
+/// Arithmetic of a subgroup reduction or scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GroupArith {
+    /// Wrapping add (identity 0).
+    IAdd,
+    /// Float add (identity 0.0).
+    FAdd,
+    /// Wrapping multiply (identity 1).
+    IMul,
+    /// Float multiply (identity 1.0).
+    FMul,
+    /// Signed minimum (identity `i32::MAX`).
+    SMin,
+    /// Unsigned minimum (identity `u32::MAX`).
+    UMin,
+    /// Float minimum (identity +inf).
+    FMin,
+    /// Signed maximum (identity `i32::MIN`).
+    SMax,
+    /// Unsigned maximum (identity 0).
+    UMax,
+    /// Float maximum (identity -inf).
+    FMax,
+    /// Bitwise and (identity all ones).
+    And,
+    /// Bitwise or (identity 0).
+    Or,
+    /// Bitwise xor (identity 0).
+    Xor,
+}
+
+impl GroupArith {
+    /// The identity element's bits.
+    pub fn identity(self) -> u32 {
+        match self {
+            GroupArith::IAdd | GroupArith::UMax | GroupArith::Or | GroupArith::Xor => 0,
+            GroupArith::FAdd => 0.0f32.to_bits(),
+            GroupArith::IMul => 1,
+            GroupArith::FMul => 1.0f32.to_bits(),
+            GroupArith::SMin => i32::MAX as u32,
+            GroupArith::UMin | GroupArith::And => u32::MAX,
+            GroupArith::FMin => f32::INFINITY.to_bits(),
+            GroupArith::SMax => i32::MIN as u32,
+            GroupArith::FMax => f32::NEG_INFINITY.to_bits(),
+        }
+    }
+
+    /// True for the float ops.
+    pub fn is_float(self) -> bool {
+        matches!(self, GroupArith::FAdd | GroupArith::FMul | GroupArith::FMin | GroupArith::FMax)
+    }
+
+    /// `a op b` on raw bits.
+    pub fn apply(self, a: u32, b: u32) -> u32 {
+        let (x, y) = (f32::from_bits(a), f32::from_bits(b));
+        match self {
+            GroupArith::IAdd => a.wrapping_add(b),
+            GroupArith::FAdd => (x + y).to_bits(),
+            GroupArith::IMul => a.wrapping_mul(b),
+            GroupArith::FMul => (x * y).to_bits(),
+            GroupArith::SMin => (a as i32).min(b as i32) as u32,
+            GroupArith::UMin => a.min(b),
+            GroupArith::FMin => x.min(y).to_bits(),
+            GroupArith::SMax => (a as i32).max(b as i32) as u32,
+            GroupArith::UMax => a.max(b),
+            GroupArith::FMax => x.max(y).to_bits(),
+            GroupArith::And => a & b,
+            GroupArith::Or => a | b,
+            GroupArith::Xor => a ^ b,
+        }
+    }
+}
+
+/// Subgroup operations. Each acts on the *active* invocations of the
+/// executing invocation's subgroup (those in the current control-flow
+/// mask). Data operands are scalar `i32` or `f32` unless noted; the
+/// builder scalarises vectors and turns `bool` data into `i32`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SubgroupOp {
+    /// `() -> bool`: true in the lowest active invocation.
+    Elect,
+    /// `(bool) -> bool`: true in every active invocation.
+    All,
+    /// `(bool) -> bool`: true in some active invocation.
+    Any,
+    /// `(x) -> bool`: `x` has the same bits in every active invocation.
+    AllEqual,
+    /// `(bool) -> i32`: bit `i` set when invocation `i` is active and true.
+    Ballot,
+    /// `(x, id) -> x` from invocation `id` (dynamically uniform, active).
+    Broadcast,
+    /// `(x) -> x` from the lowest active invocation.
+    BroadcastFirst,
+    /// `(x, id) -> x` from invocation `id`.
+    Shuffle,
+    /// `(x, m) -> x` from invocation `self ^ m`.
+    ShuffleXor,
+    /// `(x, d) -> x` from invocation `self - d`.
+    ShuffleUp,
+    /// `(x, d) -> x` from invocation `self + d`.
+    ShuffleDown,
+    /// `(x) -> x`: reduction over the active invocations in id order.
+    Reduce(GroupArith),
+    /// `(x) -> x`: inclusive prefix in id order.
+    InclusiveScan(GroupArith),
+    /// `(x) -> x`: exclusive prefix in id order (identity in the lowest).
+    ExclusiveScan(GroupArith),
 }
 
 /// An instruction.
@@ -287,6 +412,10 @@ pub enum Op {
     Atomic(AtomicOp, Space, ValueId, ValueId),
     /// Workgroup execution and memory barrier.
     Barrier,
+    /// Subgroup operation. Depends on which invocations are active, so it
+    /// is never merged or moved across control flow; unused ones are
+    /// removed.
+    Subgroup(SubgroupOp, Vec<ValueId>),
     /// End an `if` arm, giving the arm's values for [`Node::If::results`].
     Yield(Vec<ValueId>),
     /// Next iteration of the innermost loop with these parameter values.
@@ -310,7 +439,7 @@ impl Op {
             Op::Un(_, a) | Op::Conv(_, a) | Op::Bitcast(a) | Op::Extract(a, _) | Op::Load(_, a) => vec![*a],
             Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(_, a, b) | Op::Atomic(_, _, a, b) => vec![*a, *b],
             Op::Fma(a, b, c) | Op::Select(a, b, c) => vec![*a, *b, *c],
-            Op::Construct(v) | Op::Yield(v) | Op::Continue(v) | Op::Break(v) => v.clone(),
+            Op::Construct(v) | Op::Yield(v) | Op::Continue(v) | Op::Break(v) | Op::Subgroup(_, v) => v.clone(),
         }
     }
 }
@@ -323,7 +452,7 @@ impl Op {
             Op::Un(_, a) | Op::Conv(_, a) | Op::Bitcast(a) | Op::Extract(a, _) | Op::Load(_, a) => vec![a],
             Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(_, a, b) | Op::Atomic(_, _, a, b) => vec![a, b],
             Op::Fma(a, b, c) | Op::Select(a, b, c) => vec![a, b, c],
-            Op::Construct(v) | Op::Yield(v) | Op::Continue(v) | Op::Break(v) => v.iter_mut().collect(),
+            Op::Construct(v) | Op::Yield(v) | Op::Continue(v) | Op::Break(v) | Op::Subgroup(_, v) => v.iter_mut().collect(),
         }
     }
 
@@ -478,6 +607,7 @@ impl Function {
                         Op::Store(s, o, v) => format!("store {s:?} + {o}, {v}"),
                         Op::Atomic(a, s, o, v) => format!("atomic.{a:?} {s:?} + {o}, {v}"),
                         Op::Barrier => "barrier".into(),
+                        Op::Subgroup(o, v) => format!("subgroup.{o:?} {}", list(v)),
                         Op::Yield(v) => format!("yield {}", list(v)),
                         Op::Continue(v) => format!("continue {}", list(v)),
                         Op::Break(v) => format!("break {}", list(v)),

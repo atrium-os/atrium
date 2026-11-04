@@ -101,6 +101,27 @@ pub fn translate_with_spec_overrides(
     spirv: &[u8],
     overrides: &SpecOverrides,
 ) -> Result<Module, FrontendError> {
+    translate_with_options(spirv, &Options { spec_overrides: overrides.clone(), ..Options::default() })
+}
+
+/// Translation options.
+#[derive(Debug, Clone, Default)]
+pub struct Options {
+    /// Spec-constant overrides (see [`translate_with_spec_overrides`]).
+    pub spec_overrides: SpecOverrides,
+    /// Give `OpGroupNonUniform*` and the subgroup builtins real
+    /// multi-lane semantics (`Op::Subgroup`, the `Subgroup*`
+    /// builtin kinds) instead of lowering them to subgroupSize = 1.
+    /// For GPU backends; the CPU backends need the default.
+    pub native_subgroups: bool,
+}
+
+/// Translate SPIR-V to the IR with `opts`.
+pub fn translate_with_options(
+    spirv: &[u8],
+    opts: &Options,
+) -> Result<Module, FrontendError> {
+    let overrides = &opts.spec_overrides;
     // ── 0. Build the byte-offset table for source-position
     //       preservation through the IR (constraint A2).
     let offsets = OffsetTable::build(spirv)?;
@@ -200,9 +221,10 @@ pub fn translate_with_spec_overrides(
     }
     let const_ctx = constants::ConstantContext::build_with_spec_overrides(
         &rspirv_module, &type_ctx, &spec_id_overrides)?;
-    let iface_ctx = interface::InterfaceContext::build_with_constants(
+    let mut iface_ctx = interface::InterfaceContext::build_with_constants(
         &rspirv_module, &type_ctx, Some(&const_ctx),
     )?;
+    iface_ctx.native_subgroups = opts.native_subgroups;
 
     // Compute the OffsetTable index of each function's
     // OpFunction instruction. Module instructions appear

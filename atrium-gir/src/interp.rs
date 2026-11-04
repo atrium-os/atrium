@@ -210,7 +210,81 @@ impl<'a> Wg<'a> {
         mask.iter().zip(&self.status).map(|(m, s)| *m && *s == Status::Running).collect()
     }
 
+    /// A subgroup op: all active invocations of each subgroup at once.
+    fn subgroup(&mut self, o: SubgroupOp, args: &[ValueId], r: ValueId, mask: &[bool]) {
+        let sz = SUBGROUP_SIZE as usize;
+        for base in (0..self.n).step_by(sz) {
+            let end = (base + sz).min(self.n);
+            let act: Vec<usize> = (base..end).filter(|&l| mask[l]).collect();
+            let Some(&first) = act.first() else { continue };
+            let a = |w: &Self, k: usize, l: usize| w.s(args[k], l);
+            // Value of args[0] at subgroup lane `src` (0 when that lane is
+            // inactive or out of range: undefined in SPIR-V).
+            let at = |w: &Self, src: i64| -> u32 {
+                if src < 0 || src >= sz as i64 {
+                    return 0;
+                }
+                let l = base + src as usize;
+                if l < end && mask[l] { w.s(args[0], l) } else { 0 }
+            };
+            let mut out: Vec<(usize, u32)> = vec![];
+            match o {
+                SubgroupOp::Elect => out.extend(act.iter().map(|&l| (l, (l == first) as u32))),
+                SubgroupOp::All | SubgroupOp::Any | SubgroupOp::AllEqual => {
+                    let v = match o {
+                        SubgroupOp::All => act.iter().all(|&l| a(self, 0, l) != 0),
+                        SubgroupOp::Any => act.iter().any(|&l| a(self, 0, l) != 0),
+                        _ => act.iter().all(|&l| a(self, 0, l) == a(self, 0, first)),
+                    };
+                    out.extend(act.iter().map(|&l| (l, v as u32)));
+                }
+                SubgroupOp::Ballot => {
+                    let m = act.iter().filter(|&&l| a(self, 0, l) != 0).fold(0u32, |m, &l| m | 1 << (l - base));
+                    out.extend(act.iter().map(|&l| (l, m)));
+                }
+                SubgroupOp::BroadcastFirst => {
+                    let v = a(self, 0, first);
+                    out.extend(act.iter().map(|&l| (l, v)));
+                }
+                SubgroupOp::Broadcast | SubgroupOp::Shuffle | SubgroupOp::ShuffleXor | SubgroupOp::ShuffleUp | SubgroupOp::ShuffleDown => {
+                    for &l in &act {
+                        let me = (l - base) as i64;
+                        let k = a(self, 1, l) as i64;
+                        let src = match o {
+                            SubgroupOp::Broadcast | SubgroupOp::Shuffle => k,
+                            SubgroupOp::ShuffleXor => me ^ k,
+                            SubgroupOp::ShuffleUp => me - k,
+                            _ => me + k,
+                        };
+                        out.push((l, at(self, src)));
+                    }
+                }
+                SubgroupOp::Reduce(g) | SubgroupOp::InclusiveScan(g) | SubgroupOp::ExclusiveScan(g) => {
+                    let mut acc = g.identity();
+                    let mut pre = vec![];
+                    for &l in &act {
+                        let before = acc;
+                        acc = g.apply(acc, a(self, 0, l));
+                        pre.push((l, if matches!(o, SubgroupOp::ExclusiveScan(_)) { before } else { acc }));
+                    }
+                    if matches!(o, SubgroupOp::Reduce(_)) {
+                        out.extend(act.iter().map(|&l| (l, acc)));
+                    } else {
+                        out = pre;
+                    }
+                }
+            }
+            for (l, v) in out {
+                self.set(r, l, [v, 0, 0, 0]);
+            }
+        }
+    }
+
     fn inst(&mut self, inst: &'a Inst, mask: &[bool]) -> Result<(), InterpError> {
+        if let (Op::Subgroup(o, args), Some(r)) = (&inst.op, inst.result) {
+            self.subgroup(*o, args, r, mask);
+            return Ok(());
+        }
         let lanes: Vec<usize> = (0..self.n).filter(|&l| mask[l]).collect();
         let fty = self.f;
         for &l in &lanes {
@@ -243,6 +317,10 @@ impl<'a> Wg<'a> {
                             [g(0), g(1), g(2), 0]
                         }
                         Builtin::LocalIndex => [l as u32, 0, 0, 0],
+                        Builtin::SubgroupSize => [SUBGROUP_SIZE, 0, 0, 0],
+                        Builtin::SubgroupLocalId => [l as u32 % SUBGROUP_SIZE, 0, 0, 0],
+                        Builtin::SubgroupId => [l as u32 / SUBGROUP_SIZE, 0, 0, 0],
+                        Builtin::NumSubgroups => [(self.n as u32).div_ceil(SUBGROUP_SIZE), 0, 0, 0],
                     })
                 }
                 Op::Load(s, o) => {
@@ -274,6 +352,7 @@ impl<'a> Wg<'a> {
                     Some([old, 0, 0, 0])
                 }
                 Op::Barrier => None,
+                Op::Subgroup(..) => unreachable!("handled above"),
                 Op::Yield(v) => {
                     let targets = *self.yields.last().unwrap();
                     for (t, s) in targets.iter().zip(v) {

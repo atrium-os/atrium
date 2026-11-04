@@ -472,6 +472,10 @@ impl<'a> Builder<'a> {
                     spv::BuiltinKind::LocalInvocationId => (Builtin::LocalId, Ty::V(Scalar::I32, 3)),
                     spv::BuiltinKind::WorkgroupId => (Builtin::WorkgroupId, Ty::V(Scalar::I32, 3)),
                     spv::BuiltinKind::LocalInvocationIndex => (Builtin::LocalIndex, Ty::I32),
+                    spv::BuiltinKind::SubgroupSize => (Builtin::SubgroupSize, Ty::I32),
+                    spv::BuiltinKind::SubgroupLocalInvocationId => (Builtin::SubgroupLocalId, Ty::I32),
+                    spv::BuiltinKind::SubgroupId => (Builtin::SubgroupId, Ty::I32),
+                    spv::BuiltinKind::NumSubgroups => (Builtin::NumSubgroups, Ty::I32),
                     other => return unsup(format!("builtin {other:?} in compute")),
                 };
                 Val::V(self.emit(r, t, Op::Builtin(b)))
@@ -537,6 +541,7 @@ impl<'a> Builder<'a> {
                 Self::emit_void(r, Op::Barrier);
                 return Ok(());
             }
+            S::Subgroup { op, args } => Val::V(self.subgroup(r, *op, args, rt()?)?),
             S::Phi(_) => {
                 let res = inst.result.as_ref().unwrap();
                 let var = self.phi_var[&res.id];
@@ -552,6 +557,104 @@ impl<'a> Builder<'a> {
             None => return malformed(format!("{:?} has no result", inst.op)),
         }
         Ok(())
+    }
+
+    /// A frontend subgroup op: vectors are done per component and `bool`
+    /// data goes through `i32` (GIR subgroup data is scalar `i32`/`f32`).
+    fn subgroup(&mut self, r: &mut Region, op: spv::SubgroupOp, args: &[spv::Value], res: Ty) -> Result<ValueId, BuildError> {
+        use spv::{GroupArith as A, SubgroupOp as S};
+        let a: Vec<ValueId> = args.iter().map(|v| self.val(v)).collect::<Result<_, _>>()?;
+        let g = |x: A, is_bool: bool, is_float: bool| -> Result<GroupArith, BuildError> {
+            Ok(match x {
+                A::IAdd => GroupArith::IAdd,
+                A::FAdd => GroupArith::FAdd,
+                A::IMul => GroupArith::IMul,
+                A::FMul => GroupArith::FMul,
+                A::SMin => GroupArith::SMin,
+                A::UMin => GroupArith::UMin,
+                A::FMin => GroupArith::FMin,
+                A::SMax => GroupArith::SMax,
+                A::UMax => GroupArith::UMax,
+                A::FMax => GroupArith::FMax,
+                // Logical ops on 0/1 values are the bitwise ones.
+                A::And => GroupArith::And,
+                A::Or => GroupArith::Or,
+                A::Xor => GroupArith::Xor,
+            })
+            .and_then(|o| if o.is_float() != is_float && !is_bool { unsup(format!("{x:?} on this type")) } else { Ok(o) })
+        };
+        let sop = |is_bool: bool, is_float: bool| -> Result<SubgroupOp, BuildError> {
+            Ok(match op {
+                S::Elect => SubgroupOp::Elect,
+                S::All => SubgroupOp::All,
+                S::Any => SubgroupOp::Any,
+                S::AllEqual => SubgroupOp::AllEqual,
+                S::Ballot => SubgroupOp::Ballot,
+                S::Broadcast => SubgroupOp::Broadcast,
+                S::BroadcastFirst => SubgroupOp::BroadcastFirst,
+                S::Shuffle => SubgroupOp::Shuffle,
+                S::ShuffleXor => SubgroupOp::ShuffleXor,
+                S::ShuffleUp => SubgroupOp::ShuffleUp,
+                S::ShuffleDown => SubgroupOp::ShuffleDown,
+                S::Reduce(x) => SubgroupOp::Reduce(g(x, is_bool, is_float)?),
+                S::InclusiveScan(x) => SubgroupOp::InclusiveScan(g(x, is_bool, is_float)?),
+                S::ExclusiveScan(x) => SubgroupOp::ExclusiveScan(g(x, is_bool, is_float)?),
+            })
+        };
+        match op {
+            S::Elect => Ok(self.emit(r, Ty::BOOL, Op::Subgroup(SubgroupOp::Elect, vec![]))),
+            S::All | S::Any => Ok(self.emit(r, Ty::BOOL, Op::Subgroup(sop(true, false)?, vec![a[0]]))),
+            S::Ballot => {
+                let m = self.emit(r, Ty::I32, Op::Subgroup(SubgroupOp::Ballot, vec![a[0]]));
+                let z = self.konst(0, Ty::I32);
+                Ok(self.emit(r, res, Op::Construct(vec![m, z, z, z])))
+            }
+            S::AllEqual => {
+                // All components equal.
+                let t = self.out.ty(a[0]);
+                let mut acc: Option<ValueId> = None;
+                for i in 0..t.comps() {
+                    let x = self.comp(r, a[0], i);
+                    let x = self.as_data(r, x);
+                    let e = self.emit(r, Ty::BOOL, Op::Subgroup(SubgroupOp::AllEqual, vec![x]));
+                    acc = Some(match acc {
+                        None => e,
+                        Some(p) => self.emit(r, Ty::BOOL, Op::Bin(BinOp::And, p, e)),
+                    });
+                }
+                Ok(acc.unwrap())
+            }
+            _ => {
+                // Data ops: (x [, i32 operand]) -> x, per component.
+                let is_bool = res.scalar() == Scalar::Bool;
+                let o = sop(is_bool, res.scalar() == Scalar::F32)?;
+                let extra = a.get(1).copied();
+                let mut parts = vec![];
+                for i in 0..res.comps() {
+                    let x = self.comp(r, a[0], i);
+                    let x = self.as_data(r, x);
+                    let mut ops = vec![x];
+                    ops.extend(extra);
+                    let y = self.emit(r, self.out.ty(x), Op::Subgroup(o, ops));
+                    parts.push(if is_bool {
+                        let z = self.konst(0, Ty::I32);
+                        self.emit(r, Ty::BOOL, Op::Cmp(CmpOp::INe, y, z))
+                    } else {
+                        y
+                    });
+                }
+                Ok(if parts.len() == 1 { parts[0] } else { self.emit(r, res, Op::Construct(parts)) })
+            }
+        }
+    }
+
+    /// `bool` as `i32` 0/1; other scalars unchanged.
+    fn as_data(&mut self, r: &mut Region, x: ValueId) -> ValueId {
+        if self.out.ty(x) == Ty::BOOL {
+            self.emit(r, Ty::I32, Op::Conv(ConvOp::BoolToI, x))
+        } else {
+            x
+        }
     }
 
     // ── Structurisation ─────────────────────────────────────────

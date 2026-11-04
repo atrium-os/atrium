@@ -5,15 +5,17 @@
 //! values in scalar registers (SGPRs on AMD) and branch on uniform
 //! conditions with scalar branches.
 //!
-//! Divergent sources: local/global invocation ids and the local index,
-//! atomic results, loads from private memory, loads at a divergent offset,
+//! Divergent sources: local/global invocation ids, the local index and
+//! the subgroup invocation id, atomic results, subgroup elect, shuffles
+//! and scans, loads from private memory, loads at a divergent offset,
 //! and loads from a storage buffer the kernel also writes (a scalar load of
 //! such a buffer may not see the kernel's own vector stores, so it must stay
 //! a per-lane load). Propagation: an op is divergent if an operand is; an
 //! `if`'s results are divergent if its condition or a yielded value is; a
 //! loop's parameters and results are divergent if an incoming value is or if
 //! any invocation can leave or skip an iteration under a divergent condition.
-//! Conservative: unknown means divergent.
+//! Votes, ballots, broadcasts and reductions are uniform whatever their
+//! operands. Conservative: unknown means divergent.
 
 use crate::*;
 use std::collections::HashSet;
@@ -99,8 +101,18 @@ impl<'a> U<'a> {
                         _ => {}
                     }
                     let Some(res) = i.result else { continue };
+                    // Subgroup results that are the same in every active
+                    // invocation are uniform whatever their operands.
+                    if let Op::Subgroup(o, _) = &i.op {
+                        let uniform = matches!(o, SubgroupOp::All | SubgroupOp::Any | SubgroupOp::AllEqual | SubgroupOp::Ballot
+                            | SubgroupOp::Broadcast | SubgroupOp::BroadcastFirst | SubgroupOp::Reduce(_));
+                        if !uniform {
+                            self.mark(res);
+                        }
+                        continue;
+                    }
                     let source = match &i.op {
-                        Op::Builtin(b) => !matches!(b, Builtin::WorkgroupId),
+                        Op::Builtin(b) => !matches!(b, Builtin::WorkgroupId | Builtin::SubgroupSize | Builtin::SubgroupId | Builtin::NumSubgroups),
                         Op::Atomic(..) => true,
                         Op::Load(Space::Private(_), _) => true,
                         Op::Load(s @ Space::Buffer { .. }, _) => self.written.contains(s),
