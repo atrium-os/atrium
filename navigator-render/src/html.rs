@@ -1852,8 +1852,13 @@ impl<'a> Cx<'a> {
             if kw(cs, "display") == "none" { continue }
             // Out of flow: not an item; `grid` places it.
             if matches!(kw(cs, "position"), "absolute" | "fixed") { abs.push(c); continue }
+            // ★ Outside a flex container `flex-start` / `flex-end` are
+            // `start` / `end` (Box Alignment §6.1), and so are `self-*` while
+            // an item's direction is its grid's.
             let pick = |own: &str, parent: &str| -> String {
-                match kw(cs, own) { "auto" | "" => match kw(s, parent) { "" => "stretch", a => a }, a => a }.to_string()
+                match match kw(cs, own) { "auto" | "" => match kw(s, parent) { "" => "stretch", a => a }, a => a } {
+                    "flex-start" | "self-start" => "start", "flex-end" | "self-end" => "end", a => a,
+                }.to_string()
             };
             raw.push((c, line(cs.get("grid-column-start")), line(cs.get("grid-column-end")),
                       line(cs.get("grid-row-start")), line(cs.get("grid-row-end")),
@@ -4926,6 +4931,16 @@ mod tests {
             .c { width: 100px; height: 100px }</style>
             <div class="g"><div class="i"><div class="c"></div></div></div>"#);
         assert_eq!(boxes(&o, 0x00ff00ff), vec![(0, 0, 100, 100)]);
+    }
+
+    /// Outside flex, `flex-end` is `end` (Box Alignment §6.1).
+    #[test]
+    fn grid_items_read_flex_end_as_end() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .g { display: grid; width: 100px; height: 100px; grid-template-columns: 100px; grid-template-rows: 100px; align-items: flex-end }
+            .g > div { width: 50px; height: 50px; background-color: #00ff00 }</style>
+            <div class="g"><div></div></div>"#);
+        assert_eq!(boxes(&o, 0x00ff00ff), vec![(0, 50, 50, 50)]);
     }
 
     #[test]
