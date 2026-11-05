@@ -5,7 +5,7 @@
 //! 3. 1080p120 with VRR: CONNECTOR says VRR is active, and with nothing to
 //!    show the monitor refreshes at its floor (~48 Hz), ~2.5x slower than
 //!    the same mode at a fixed 120 Hz.
-//! 4. Paced flips (a new frame every ~11 ms): with VRR each flip ends the
+//! 4. Paced flips (a new frame every ~9 ms, just over the 8.3 ms shortest frame): with VRR each flip ends the
 //!    frame it waits on (~1 refresh per flip); at a fixed 120 Hz a flip
 //!    waits for the next 8.3 ms slot (~2 refreshes per flip).
 //! 5. A MODESET without the flag turns VRR off.
@@ -52,33 +52,31 @@ fn vblank_rate(dpy: &Display, ms: u64) -> io::Result<f64> {
     Ok((v1 - v0) as f64 / t0.elapsed().as_secs_f64())
 }
 
-fn reached(so: &Syncobj<'_>, v: u64, ms: u64) -> io::Result<bool> {
-    let t0 = Instant::now();
-    while t0.elapsed() < Duration::from_millis(ms) {
-        if so.query()? >= v {
-            return Ok(true);
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    Ok(so.query()? >= v)
-}
 
 /// `n` vsync'd flips between two buffers, each committed `gap_ms` after the
-/// last one landed. Returns (refreshes per flip, mean commit->on-screen ms).
+/// last one landed (seen through a blocking wait on the out-fence). Returns (refreshes per flip, mean commit->on-screen ms).
 fn paced_flips(dpy: &Display, bufs: [&Bo<'_>; 2], done: &Syncobj<'_>, base: &mut u64, n: u32, gap_ms: u64)
     -> io::Result<(f64, f64)>
 {
     let v0 = dpy.status_v2()?.vblank_count;
     let mut wait = 0f64;
     for i in 0..n {
-        std::thread::sleep(Duration::from_millis(gap_ms));
+        // Spin, don't sleep: the guest's sleeps round up to its tick, which
+        // would push the commit past the 48 Hz frame's end.
+        let g = Instant::now();
+        while g.elapsed() < Duration::from_millis(gap_ms) {
+            std::hint::spin_loop();
+        }
         *base += 1;
         let t = Instant::now();
         let f = dpy.commit(bufs[(i % 2) as usize], 0, 0, None, Some((done, *base)))?;
-        if f != 0 || !reached(done, *base, 2000)? {
+        if f != 0 || done.wait(*base, 2000).is_err() {
             return Err(fail(format!("flip {i}: fault {f} or never on screen")));
         }
         wait += t.elapsed().as_secs_f64() * 1000.0;
+        if std::env::var_os("VRR_DEBUG").is_some() {
+            eprintln!("  flip {i}: {:.1} ms, vblank {}", t.elapsed().as_secs_f64() * 1000.0, dpy.status_v2()?.vblank_count);
+        }
     }
     let v1 = dpy.status_v2()?.vblank_count;
     Ok(((v1 - v0) as f64 / f64::from(n), wait / f64::from(n)))
@@ -122,7 +120,7 @@ fn run() -> io::Result<()> {
         return Err(fail(format!("fixed modeset: fault {f}")));
     }
     let fixed_rate = vblank_rate(&dpy, 2000)?;
-    let (fixed_per_flip, fixed_ms) = paced_flips(&dpy, bufs, &done, &mut seq, 30, 11)?;
+    let (fixed_per_flip, fixed_ms) = paced_flips(&dpy, bufs, &done, &mut seq, 30, 9)?;
     let f = dpy.modeset_vrr(bufs[0], i120 as u32, c.generation, 0, true, None, None)?;
     let c2 = dpy.connector_v2()?;
     if f != 0 || !c2.vrr_active || c2.current != Some(i120) {
@@ -136,9 +134,9 @@ fn run() -> io::Result<()> {
     }
 
     // 4. Paced flips.
-    let (vrr_per_flip, vrr_ms) = paced_flips(&dpy, bufs, &done, &mut seq, 30, 11)?;
+    let (vrr_per_flip, vrr_ms) = paced_flips(&dpy, bufs, &done, &mut seq, 30, 9)?;
     eprintln!(
-        "4 flips every ~11 ms: fixed 120 Hz {fixed_per_flip:.2} refreshes/flip ({fixed_ms:.1} ms to screen), \
+        "4 flips every ~9 ms: fixed 120 Hz {fixed_per_flip:.2} refreshes/flip ({fixed_ms:.1} ms to screen), \
          VRR {vrr_per_flip:.2} ({vrr_ms:.1} ms)"
     );
     if vrr_per_flip > 1.35 || fixed_per_flip < 1.5 || vrr_per_flip >= fixed_per_flip {
