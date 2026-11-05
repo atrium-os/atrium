@@ -1531,9 +1531,125 @@ impl<'f> Lower<'f> {
             | Op::ImageReadLod { .. }
             | Op::ImageWriteLod { .. } => self.image_op(inst)?,
 
+            Op::PackHalf2x16(v) => {
+                let res = Self::result(inst)?;
+                let l = self.lanes_class(v, Class::X, 2, "PackHalf2x16")?;
+                let d = self.define(res)?;
+                if d.len() != 1 || self.class_of(d[0]) != Class::G {
+                    return unsupported("PackHalf2x16 result");
+                }
+                let lo = self.f32_to_f16(l[0]);
+                let hi = self.f32_to_f16(l[1]);
+                let sixteen = self.gconst(16);
+                let hi = self.g2(|d| M::GShift { op: ShiftOp::Shl, d, a: hi, b: sixteen });
+                self.code.push(M::GBin { op: GOp::Or, d: d[0], a: lo, b: hi });
+            }
+            Op::UnpackHalf2x16(v) => {
+                let res = Self::result(inst)?;
+                let w = self.lanes_class(v, Class::G, 1, "UnpackHalf2x16")?;
+                let d = self.define(res)?;
+                if d.len() != 2 || d.iter().any(|&r| self.class_of(r) != Class::X) {
+                    return unsupported("UnpackHalf2x16 result");
+                }
+                let mask = self.gconst(0xffff);
+                let lo = self.g2(|d| M::GBin { op: GOp::And, d, a: w[0], b: mask });
+                let sixteen = self.gconst(16);
+                let hi = self.g2(|d| M::GShift { op: ShiftOp::LShr, d, a: w[0], b: sixteen });
+                self.f16_to_f32(lo, d[0]);
+                self.f16_to_f32(hi, d[1]);
+            }
+
             other => return unsupported(op_name(other)),
         }
         Ok(())
+    }
+
+    /// A fresh G vreg defined by `f(d)`.
+    fn g2(&mut self, f: impl FnOnce(VReg) -> MInst) -> VReg {
+        let d = self.vreg(Class::G);
+        self.code.push(f(d));
+        d
+    }
+
+    fn gbin_imm(&mut self, op: GOp, a: VReg, imm: i32) -> VReg {
+        let b = self.gconst(imm);
+        self.g2(|d| MInst::GBin { op, d, a, b })
+    }
+
+    fn gshift_imm(&mut self, op: ShiftOp, a: VReg, imm: i32) -> VReg {
+        let b = self.gconst(imm);
+        self.g2(|d| MInst::GShift { op, d, a, b })
+    }
+
+    fn gcmp_imm(&mut self, cc: ICond, a: VReg, imm: i32) -> VReg {
+        let b = self.gconst(imm);
+        self.g2(|d| MInst::GCmp { cc, d, a, b })
+    }
+
+    fn gsel(&mut self, c: VReg, t: VReg, f: VReg) -> VReg {
+        self.g2(|d| MInst::GSelect { d, c, t, f })
+    }
+
+    /// f32 → f16 bits, round to nearest even, NaN → 0x7e00: Cranelift's
+    /// `f32_to_f16_bits`, step for step, so both backends agree on every
+    /// input (F16C would keep NaN payloads).
+    fn f32_to_f16(&mut self, x: VReg) -> VReg {
+        use MInst as M;
+        let f = self.g2(|d| M::MovXToG { d, s: x });
+        let sign = self.gshift_imm(ShiftOp::LShr, f, 16);
+        let sign = self.gbin_imm(GOp::And, sign, 0x8000);
+        let a = self.gbin_imm(GOp::And, f, 0x7fff_ffff);
+        let is_nan = self.gcmp_imm(ICond::Ugt, a, 0x7f80_0000);
+        let qnan = self.gconst(0x7e00);
+        let inf = self.gconst(0x7c00);
+        let big = self.gsel(is_nan, qnan, inf);
+        // Subnormal results: let the float adder round.
+        let af = self.vreg(Class::X);
+        self.code.push(M::MovGToX { d: af, s: a });
+        let half = self.vreg(Class::X);
+        self.code.push(M::XConst { d: half, bits: 0.5f32.to_bits() });
+        let sum = self.vreg(Class::X);
+        self.code.push(M::XBin { op: XOp::Add, d: sum, a: af, b: half });
+        let sum = self.g2(|d| M::MovXToG { d, s: sum });
+        let den = self.gbin_imm(GOp::Add, sum, -0x3f00_0000);
+        // Normal results: rebias and round to nearest even.
+        let odd = self.gshift_imm(ShiftOp::LShr, a, 13);
+        let odd = self.gbin_imm(GOp::And, odd, 1);
+        let n = self.gbin_imm(GOp::Add, a, 0xc800_0fff_u32 as i32);
+        let n = self.g2(|d| M::GBin { op: GOp::Add, d, a: n, b: odd });
+        let n = self.gshift_imm(ShiftOp::LShr, n, 13);
+        let is_big = self.gcmp_imm(ICond::Uge, a, 0x4780_0000);
+        let is_den = self.gcmp_imm(ICond::Ult, a, 0x3880_0000);
+        let r = self.gsel(is_den, den, n);
+        let r = self.gsel(is_big, big, r);
+        self.g2(|d| M::GBin { op: GOp::Or, d, a: r, b: sign })
+    }
+
+    /// f16 bits (low 16 of `h`) → f32 into `out`: Cranelift's
+    /// `f16_bits_to_f32`, step for step.
+    fn f16_to_f32(&mut self, h: VReg, out: VReg) {
+        use MInst as M;
+        let m = self.gbin_imm(GOp::And, h, 0x7fff);
+        let o = self.gshift_imm(ShiftOp::Shl, m, 13);
+        let exp = self.gbin_imm(GOp::And, o, 0x0f80_0000);
+        let o = self.gbin_imm(GOp::Add, o, (127 - 15) << 23);
+        let o_inf = self.gbin_imm(GOp::Add, o, (128 - 16) << 23);
+        let o_den = self.gbin_imm(GOp::Add, o, 1 << 23);
+        let o_den_f = self.vreg(Class::X);
+        self.code.push(M::MovGToX { d: o_den_f, s: o_den });
+        let magic = self.vreg(Class::X);
+        self.code.push(M::XConst { d: magic, bits: 113 << 23 });
+        let diff = self.vreg(Class::X);
+        self.code.push(M::XBin { op: XOp::Sub, d: diff, a: o_den_f, b: magic });
+        let o_den = self.g2(|d| M::MovXToG { d, s: diff });
+        let is_inf = self.gcmp_imm(ICond::Eq, exp, 0x0f80_0000);
+        let is_den = self.gcmp_imm(ICond::Eq, exp, 0);
+        let r = self.gsel(is_den, o_den, o);
+        let r = self.gsel(is_inf, o_inf, r);
+        let sign = self.gbin_imm(GOp::And, h, 0x8000);
+        let sign = self.gshift_imm(ShiftOp::Shl, sign, 16);
+        let r = self.g2(|d| M::GBin { op: GOp::Or, d, a: r, b: sign });
+        self.code.push(M::MovGToX { d: out, s: r });
     }
 
     // ── images and derivatives (phase 7) ──────────────────────────────

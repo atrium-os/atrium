@@ -791,3 +791,86 @@ fn span_thunk_matches_per_lane_fs_main() {
         assert_eq!(span_d[l].to_bits(), d.to_bits(), "lane {l} depth");
     }
 }
+
+/// PackHalf2x16 / UnpackHalf2x16 over a wide sweep (rounding ties,
+/// subnormals, overflow, infinities, NaN payloads, most half patterns
+/// for unpack), bit for bit against Cranelift, through direct FsMain calls.
+#[test]
+fn pack_unpack_half_sweep() {
+    use rspirv::dr::Operand;
+    if !cfg!(target_arch = "x86_64") {
+        return;
+    }
+    let spirv = build(|b, c| {
+        let glsl = b.ext_inst_import("GLSL.std.450");
+        let u32_ty = b.type_int(32, 0);
+        let v2 = b.type_vector(c.f32_ty, 2);
+        let xy = b.composite_construct(v2, None, vec![c.x, c.y]).unwrap();
+        let p = b.ext_inst(u32_ty, None, glsl, 58, vec![Operand::IdRef(xy)]).unwrap();
+        let au = b.bitcast(u32_ty, None, c.a).unwrap();
+        let un = b.ext_inst(v2, None, glsl, 62, vec![Operand::IdRef(au)]).unwrap();
+        let u0 = b.composite_extract(c.f32_ty, None, un, vec![0]).unwrap();
+        let u1 = b.composite_extract(c.f32_ty, None, un, vec![1]).unwrap();
+        let bu = b.bitcast(u32_ty, None, c.b).unwrap();
+        let ub = b.ext_inst(v2, None, glsl, 62, vec![Operand::IdRef(bu)]).unwrap();
+        let rp = b.ext_inst(u32_ty, None, glsl, 58, vec![Operand::IdRef(ub)]).unwrap();
+        [c.bits(b, p), u0, u1, c.bits(b, rp)]
+    });
+    let module = atrium_spv_frontend::translate(&spirv).expect("frontend");
+    let objs = [
+        atrium_spv_backend_cranelift::compile(&module, atrium_spv_backend_cranelift::Target::host())
+            .expect("cranelift").object,
+        atrium_spv_backend_bespoke_x86::compile(&module, atrium_spv_backend_bespoke_x86::Target::host())
+            .expect("bespoke-x86").object,
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let libs: Vec<libloading::Library> = objs.iter().enumerate().map(|(k, obj)| {
+        let o = dir.path().join(format!("s{k}.o"));
+        let so = dir.path().join(format!("s{k}.so"));
+        std::fs::write(&o, obj).unwrap();
+        assert!(std::process::Command::new("cc").arg("-shared").arg("-o").arg(&so).arg(&o)
+            .status().unwrap().success());
+        unsafe { libloading::Library::new(&so) }.unwrap()
+    }).collect();
+    type FsMain = unsafe extern "C" fn(
+        *const u8, *const u8, *const u8, f32, f32, f32, f32, u32, *mut f32, *mut f32, u32, u32,
+    );
+    let fs: Vec<FsMain> = libs.iter().map(|l| unsafe { *l.get::<FsMain>(b"atrium_fs_main").unwrap() }).collect();
+    let run = |f: FsMain, a: u32, b: u32, x: u32, y: u32| -> [u32; 4] {
+        let pc: [u32; 4] = [a, b, x, y];
+        let mut c = [0f32; 4];
+        let mut d = 0f32;
+        unsafe {
+            f(std::ptr::null(), std::ptr::null(), pc.as_ptr() as *const u8, 0.0, 0.0, 0.0, 1.0, 1,
+              c.as_mut_ptr(), &mut d, 1, 0);
+        }
+        c.map(f32::to_bits)
+    };
+    // Floats: special values, the f16 boundaries (±1 ulp) and a stride
+    // through all of f32.
+    let mut fl: Vec<u32> = vec![
+        0, 0x8000_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_0000, 0x7f80_0001, 0xffc1_2345, 0x7fbf_ffff,
+        0x3f80_0000, 0x477f_e000, 0x477f_f000, 0x477f_efff, 0x4780_0000, 0x3880_0000, 0x387f_ffff,
+        0x3380_0000, 0x3300_0000, 0x3300_0001, 0x0000_0001, 0x3f80_1000, 0x3f80_3000,
+    ];
+    for b in [0x4780_0000u32, 0x3880_0000, 0x3380_0000, 0x3f80_1000] {
+        for d in 0..4u32 {
+            fl.extend([b.wrapping_add(d), b.wrapping_sub(d), b.wrapping_add(d) | 0x8000_0000]);
+        }
+    }
+    fl.extend((0..20_000u32).map(|i| i.wrapping_mul(214_749)));
+    for (i, &x) in fl.iter().enumerate() {
+        let y = fl[(i * 7 + 3) % fl.len()];
+        // Unpack sees about 40k half patterns, two per call.
+        let h = (i as u32 * 2) & 0xffff;
+        let a = h | ((h + 1) << 16);
+        let bb = (i as u32).wrapping_mul(2_654_435_761);
+        let want = run(fs[0], a, bb, x, y);
+        let got = run(fs[1], a, bb, x, y);
+        assert_eq!(got, want, "x={x:#x} y={y:#x} a={a:#x} b={bb:#x}");
+    }
+    // Spot values.
+    let r = run(fs[1], 0x3c00_c000, 0, 1.0f32.to_bits(), (-2.0f32).to_bits());
+    assert_eq!(r[0], 0xc000_3c00);
+    assert_eq!([f32::from_bits(r[1]), f32::from_bits(r[2])], [-2.0, 1.0]);
+}

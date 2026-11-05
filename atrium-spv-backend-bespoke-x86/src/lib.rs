@@ -45,8 +45,9 @@
 //! uniforms table, staged so arguments never clobber each other.
 //!
 //! Fragment shaders in the span subset also get `atrium_fs_main_span`
-//! ([`span`]). Not yet: PackHalf2x16 (Cranelift's NaN behaviour), f64, and
-//! packed vector forms (phase 9).
+//! ([`span`]). PackHalf2x16/UnpackHalf2x16 copy Cranelift's integer sequence
+//! rather than F16C, so NaN payloads agree. Not yet: f64, and packed vector
+//! forms (phase 9).
 
 mod emit;
 mod regalloc;
