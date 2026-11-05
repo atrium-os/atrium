@@ -119,10 +119,10 @@ gpusim answers ENOSPC once the pool is full), and folding the hostile run into
 Status 2026-11-05 on gpusim 354fffb: all of the above pass through frescod (`atrium-gpu-fuzz isa`:
 a self-branching kernel is lost with EIO while another app's dispatch completes in 5 s; stores
 at VA 0, a high VA and past the app's buffer are each lost with EIO; an honest app is served
-afterwards). The spinning kernel took about 20 s to be failed instead of `hang_ms` (5 s),
-because gpusim runs a dispatch inside the doorbell write, so the guest vCPU is held until the
-simulator's own per-dispatch budget runs out. Real hardware queues are asynchronous, so G5 has
-to measure the real time to fail.
+afterwards). On gpusim 354fffb the spinning kernel took about 20 s to fail, because the
+dispatch ran inside the doorbell write. Since gpusim 3d31e61 (async doorbell) it is lost after
+5.2 s, i.e. at `hang_ms` (5 s), and the other app finishes in 4.7 s. G5 still has to measure the
+real time to fail on silicon.
 
 ### G5. On silicon (needs Shankar's OK)
 `test_gpu_isolation` and the hostile-ISA test on the R9700. They deliberately cause VM faults
