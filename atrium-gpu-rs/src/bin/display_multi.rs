@@ -149,7 +149,8 @@ fn run() -> io::Result<()> {
     eprintln!("2 three monitors lit in one commit, {} MHz of {} OK", o.bandwidth_used_khz / 1000, o.bandwidth_khz / 1000);
 
     // 3. A fourth past the budget: named, with the reason, nothing changed.
-    sysctl("sim_bw_budget_khz", "1000000")?;
+    // 780 MHz lit + 594 MHz of 4K > 1200; 538.5 + 594 fits.
+    sysctl("sim_bw_budget_khz", "1200000")?;
     plug(3, PLUG_4K as i32)?;
     let (i3, g3) = mode(&dpy, 3, 3840, 2160, 60000)?;
     let four = [OutputCommit::modeset(3, s3.buffer(0), i3, g3)];

@@ -74,7 +74,7 @@ struct display_fb {
  * detach to fdrop.
  *
  * Connector state:
- *   conn_gen     this output's hotplug generation (never 0)
+ *   conn_gen     topo_gen at this output's last hotplug (never 0)
  *   sink         the monitor as last probed (raw EDID and its modes)
  *   sink_gen     conn_gen when it was probed (0 = never)
  *   sink_epoch   bumped by display_sink_invalidate: a probe that began
@@ -1952,10 +1952,14 @@ amd_display_hpd_handler(struct atrium_amd_softc *sc, int count __unused)
 			continue;
 		o = display_out(sc, n);
 		amd_display_hw_ops.hpd_rearm(o);
-		if (++o->conn_gen == 0)
-			o->conn_gen = 1;
+		/*
+		 * One counter for the whole display: an output's generation is
+		 * the topology generation of its last change, so the
+		 * NOTE_HOTPLUG data names the newest output generation.
+		 */
 		if (++ds->topo_gen == 0)
 			ds->topo_gen = 1;
+		o->conn_gen = ds->topo_gen;
 		KNOTE_LOCKED(&sc->display_sel.si_note, DISPLAY_HINT_HOTPLUG);
 	}
 }

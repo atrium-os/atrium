@@ -199,6 +199,8 @@ struct atrium_display_commit {
  * NOTE_RESET or NOTE_HOTPLUG the registration hears only those and the
  * output bits must be 0. NOTE_HOTPLUG's data is the topology generation
  * (OUTPUTS' out_topology_generation), bumped by a hotplug on any output.
+ * An output's generation is the topology generation of its last hotplug, so
+ * with one monitor the data still equals CONNECTOR's out_generation.
  */
 #define ATRIUM_DISPLAY_NOTE_OUTPUT(n)		(0x100u << (n))
 #define ATRIUM_DISPLAY_NOTE_OUTPUTS		0xff00u
