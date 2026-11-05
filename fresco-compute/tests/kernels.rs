@@ -116,6 +116,50 @@ fn tier2_matches_reference() {
     assert_eq!(n, 0, "{n} pixels differ, worst channel delta {worst}");
 }
 
+/// Tier-2 rastering only the dirty tiles over the old image, and composing
+/// only a changed screen rect over the old composite, give the full results.
+#[test]
+fn tier2_partial_raster_and_compose_match_full() {
+    use fresco_compute::compose::{Compose, Layer};
+    use fresco_compute::damage;
+    let dir = tempfile::tempdir().unwrap();
+    tier2::Tier2::seed_cache(dir.path()).expect("cranelift");
+    let t2 = tier2::Tier2::new(dir.path().to_path_buf(), "/nonexistent/atrium-spv-compile".into()).expect("tier2 load");
+    let before = scene();
+    let mut after = scene();
+    after.rects[1].position[0] += 9.0;
+    let (fa, fb) = (Frame::pack(&after, W, H, PITCH), Frame::pack(&before, W, H, PITCH));
+    let mut img = vec![0u32; fb.target_words()];
+    t2.render(&fb, &mut img).unwrap();
+    let d = damage::dirty(&damage::tile_signatures(&fa), Some(&damage::tile_signatures(&fb)));
+    let h = fa.header;
+    let tiles = damage::rects(&d, h.tiles_x, h.tiles_y, 16);
+    assert!(!tiles.is_empty() && d.iter().any(|&x| !x));
+    t2.render_tiles(&fa, &mut img, &tiles).unwrap();
+    let mut full = vec![0u32; fa.target_words()];
+    t2.render(&fa, &mut full).unwrap();
+    assert_eq!(img, full, "partial raster differs from the full one");
+
+    // Compose: two surfaces; the second changes, recompose only its rect.
+    let (sw, sh) = (PITCH, H);
+    let n = (sw * sh) as usize;
+    let mut heap = vec![0u32; 2 * n];
+    heap[..n].copy_from_slice(&full);
+    heap[n..].copy_from_slice(&full);
+    let layers = [Layer::at([0, sw, sw, sh], 0, 0, 1.0), Layer::at([n as u32, sw, sw, sh], 40, 30, 1.0)];
+    let (tw, th) = (sw + 60, sh + 50);
+    let c = Compose::new(&layers, tw, th, tw, heap.len() as u32);
+    let mut screen = vec![0u32; (tw * th) as usize];
+    t2.compose(&c, &heap, &mut screen).unwrap();
+    for p in heap[n..].iter_mut() {
+        *p ^= 0x00ff_00ff;
+    }
+    t2.compose_rects(&c, &heap, &mut screen, &[[40, 30, 40 + sw, 30 + sh]]).unwrap();
+    let mut want = vec![0u32; (tw * th) as usize];
+    t2.compose(&c, &heap, &mut want).unwrap();
+    assert_eq!(screen, want, "partial compose differs from the full one");
+}
+
 /// Re-rastering only the tiles whose signature changed, over the previous
 /// image, gives the full render of the new scene; unchanged tiles are skipped.
 #[test]

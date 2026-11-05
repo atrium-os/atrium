@@ -124,6 +124,44 @@ impl Tier2 {
         Ok(())
     }
 
+    /// Like [`Tier2::render`], but raster only the tiles in `tiles` (tile
+    /// rects `[tx0, ty0, tx1, ty1)`, as [`crate::damage::rects`] gives
+    /// them); the rest of `target` keeps what it holds. Binning still
+    /// covers the whole frame (it is per op, and cheap).
+    pub fn render_tiles(&self, frame: &Frame, target: &mut [u32], tiles: &[[u32; 4]]) -> io::Result<()> {
+        frame.validate(target.len()).map_err(err)?;
+        if tiles.is_empty() {
+            return Ok(());
+        }
+        let mut mask = vec![0u32; frame.mask_words()];
+        let header = [frame.header];
+        let mut table = [SsboDesc::default(); binding::COUNT];
+        table[binding::FRAME as usize] = desc(&header);
+        table[binding::OPS as usize] = desc(&frame.ops);
+        table[binding::TEX as usize] = desc(&frame.tex);
+        table[binding::TEXELS as usize] = desc(&frame.texels);
+        table[binding::MASK as usize] = desc(&mask);
+        table[binding::TARGET as usize] = desc(target);
+        table[binding::LUT as usize] = desc(&frame.lut);
+        let h = &frame.header;
+        let g = h.raster_groups();
+        let per = crate::TILE / RASTER_LOCAL;
+        let groups: Vec<[u32; 4]> = tiles
+            .iter()
+            .map(|t| [t[0] * per, t[1] * per, (t[2] * per).min(g[0]), (t[3] * per).min(g[1])])
+            .filter(|r| r[2] > r[0] && r[3] > r[1])
+            .collect();
+        let t = SsboTable::new(&table);
+        // SAFETY: as in `render`: the table's buffers outlive the
+        // dispatches and `validate` checked them against the header; the
+        // group rects are within the raster grid.
+        unsafe {
+            self.dispatch(self.bin.1, &t, h.bin_groups(), [BIN_LOCAL, 1, 1]);
+            self.dispatch_rects(self.raster.1, &t, &groups, [RASTER_LOCAL, RASTER_LOCAL, 1]);
+        }
+        Ok(())
+    }
+
     /// Both dispatches over a caller-built binding table (one `{ base,
     /// size }` per binding), e.g. buffers placed against guard pages by the
     /// fuzzer.
@@ -154,6 +192,70 @@ impl Tier2 {
         // the header and every layer's surface against these buffers.
         unsafe { self.dispatch(self.compose.1, &table, c.groups(), [COMPOSE_LOCAL, COMPOSE_LOCAL, 1]) };
         Ok(())
+    }
+
+    /// Like [`Tier2::compose`], but only over the screen rects `rects`
+    /// (pixels, `[x0, y0, x1, y1)`); the rest of `target` keeps what it
+    /// holds, so it must hold this compose's result there already.
+    pub fn compose_rects(&self, c: &crate::compose::Compose, heap: &[u32], target: &mut [u32], rects: &[[u32; 4]]) -> io::Result<()> {
+        use crate::compose::{binding as cb, COMPOSE_LOCAL};
+        c.validate(target.len(), heap.len()).map_err(err)?;
+        let g = c.groups();
+        let groups: Vec<[u32; 4]> = rects
+            .iter()
+            .map(|r| [r[0] / COMPOSE_LOCAL, r[1] / COMPOSE_LOCAL, r[2].div_ceil(COMPOSE_LOCAL).min(g[0]), r[3].div_ceil(COMPOSE_LOCAL).min(g[1])])
+            .filter(|r| r[2] > r[0] && r[3] > r[1])
+            .collect();
+        if groups.is_empty() {
+            return Ok(());
+        }
+        let header = [c.header];
+        let mut table = [SsboDesc::default(); cb::COUNT];
+        table[cb::HEADER as usize] = desc(&header);
+        table[cb::LAYERS as usize] = desc(&c.layers);
+        table[cb::HEAP as usize] = desc(heap);
+        table[cb::TARGET as usize] = desc(target);
+        table[cb::LUT as usize] = desc(&c.lut);
+        let table = SsboTable::new(&table);
+        // SAFETY: as in `compose`; the group rects are within its grid.
+        unsafe { self.dispatch_rects(self.compose.1, &table, &groups, [COMPOSE_LOCAL, COMPOSE_LOCAL, 1]) };
+        Ok(())
+    }
+
+    /// Run the workgroups in `rects` (`[gx0, gy0, gx1, gy1)`, z 0), each
+    /// once even where rects overlap, spread over the threads.
+    unsafe fn dispatch_rects(&self, cs: CsMain, table: &SsboTable, rects: &[[u32; 4]], local: [u32; 3]) {
+        let mut ids: Vec<(u32, u32)> = rects
+            .iter()
+            .flat_map(|r| (r[1]..r[3]).flat_map(move |y| (r[0]..r[2]).map(move |x| (x, y))))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return;
+        }
+        let n = self.threads.min(ids.len()).max(1);
+        let chunk = ids.len().div_ceil(n);
+        let table_addr = table.as_ptr() as usize;
+        let _ = table;
+        std::thread::scope(|s| {
+            for part in ids.chunks(chunk) {
+                s.spawn(move || {
+                    let mut img = atrium_spv_runtime::image_table_buffer(0);
+                    atrium_spv_runtime::write_barrier_helper_ptr(&mut img, atrium_spv_runtime::atrium_barrier);
+                    let out = table_addr as *mut u8;
+                    for &(gx, gy) in part {
+                        for lz in 0..local[2] {
+                            for ly in 0..local[1] {
+                                for lx in 0..local[0] {
+                                    cs(img.as_ptr(), std::ptr::null(), out, gx, gy, 0, lx, ly, lz, std::ptr::null_mut());
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
     }
 
     unsafe fn dispatch(&self, cs: CsMain, table: &SsboTable, groups: [u32; 3], local: [u32; 3]) {
