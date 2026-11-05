@@ -21,6 +21,7 @@ pub mod jailed;
 pub mod limits;
 pub mod links;
 pub mod navigatord;
+pub mod resample;
 pub mod reverse;
 pub mod session;
 pub mod store;

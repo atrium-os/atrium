@@ -129,8 +129,10 @@ pub const REQ_URL: &str = "URL";
 pub const REQ_SAVE: &str = "SAVE";
 /// Replay a `session::Trail` onto the document this worker just opened.
 pub const REQ_RESTORE: &str = "RSTR";
-/// Decode one image (src/image.rs). Payload: `<address> <budget>\n` and the
-/// encoded bytes; the answer is `<width> <height>\n` and RGBA8 pixels.
+/// Decode one image (src/image.rs). Payload: `<address> <budget> <tw> <th>\n`
+/// and the encoded bytes, where `tw th` is the painted size in device pixels
+/// (`0 0`: the natural size); the answer is `<width> <height>\n` and RGBA8
+/// pixels.
 pub const REQ_IMAGE: &str = "IMG";
 /// Whether the current document has an `<a>`/`<area>` with this href:
 /// answers `yes` or `no`.

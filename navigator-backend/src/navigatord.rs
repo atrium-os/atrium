@@ -122,7 +122,16 @@ pub enum Request {
     Activate { session: SessionId, href: String },
     /// Pixels for one image the session's scene names, by content address
     /// (`blake3:<hex>`). Decoded by the host, validated here (§2.4).
-    Image { session: SessionId, address: String },
+    ///
+    /// `painted` is the size the scene paints it at: the largest tile among
+    /// the scene's `image` nodes for this address, in NSG units (1/64 CSS
+    /// px). The broker multiplies it by the device scale and the image is
+    /// decoded to at most that (never larger than it is), and charged at
+    /// that. `None` asks for the natural size. ★ It is not a grant: it can
+    /// only make the reply smaller than the natural size, and the budget
+    /// binds either way. A request at a new size (zoom, a scale change)
+    /// decodes again and replaces the charge.
+    Image { session: SessionId, address: String, painted: Option<(u32, u32)> },
 }
 
 /// What the UI hears back.
@@ -181,13 +190,33 @@ pub struct Navigatord<H: DocumentHost> {
     /// profile's per-document total binds across requests. An address decoded
     /// again is not charged twice.
     decoded: std::collections::BTreeMap<SessionId, std::collections::BTreeMap<String, usize>>,
+    /// Device pixels per CSS px, in 1/64 (64 = 1x, 128 = 2x). The display's
+    /// property, so the broker's, not a page's.
+    device_scale: u32,
 }
+
+/// NSG's unit: 1/64 CSS px.
+const NSG_UNIT: u64 = 64;
 
 impl<H: DocumentHost> Navigatord<H> {
     /// Read image bytes from `blobs` (see the field).
     pub fn with_blobs(mut self, blobs: Box<dyn crate::store::Store>) -> Self {
         self.blobs = Some(blobs);
         self
+    }
+
+    /// Set the device scale (1/64: 128 is 2x). Images requested with a
+    /// painted size are decoded to that size times this.
+    pub fn with_device_scale(mut self, scale_64: u32) -> Self {
+        self.device_scale = scale_64.max(1);
+        self
+    }
+
+    /// Device pixels for a painted size in NSG units, rounded up so the box
+    /// is covered, at least 1 per axis.
+    pub fn device_size(&self, painted: (u32, u32)) -> (u32, u32) {
+        let d = |v: u32| (v as u64 * self.device_scale as u64).div_ceil(NSG_UNIT * NSG_UNIT).clamp(1, u32::MAX as u64) as u32;
+        (d(painted.0), d(painted.1))
     }
 
     /// Decoded image bytes charged to a session so far.
@@ -211,7 +240,7 @@ impl<H: DocumentHost> Navigatord<H> {
             return Err("navigatord refuses to start: the document host is not confined \
                         (configure a launcher, e.g. `portcullis exec --daemon --instance {instance}`)".into());
         }
-        Ok(Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default() })
+        Ok(Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default(), device_scale: NSG_UNIT as u32 })
     }
 
     /// An unconfined broker, for tests: in-process hosts, bare worker
@@ -220,7 +249,7 @@ impl<H: DocumentHost> Navigatord<H> {
     /// so a shipped binary that calls it does not link.
     #[cfg(any(test, feature = "unconfined-for-testing"))]
     pub fn unconfined_for_testing(host: H) -> Self {
-        Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default() }
+        Navigatord { host, now: 0, schemes: SchemeAllowlist::default(), blobs: None, decoded: Default::default(), device_scale: NSG_UNIT as u32 }
     }
 
     /// The host, for an operator (or a test) inspecting it.
@@ -354,9 +383,9 @@ impl<H: DocumentHost> Navigatord<H> {
                     Err(why) => out.push(Event::Blocked { session: Some(session), why: why.to_string() }),
                 }
             }
-            Request::Image { session, address } => {
+            Request::Image { session, address, painted } => {
                 if let Some(e) = self.absent(session) { out.push(e); return out }
-                match self.image(session, address) {
+                match self.image(session, address, painted) {
                     Ok(e) => out.push(e),
                     Err(why) => out.push(Event::Blocked { session: Some(session), why }),
                 }
@@ -399,9 +428,12 @@ impl<H: DocumentHost> Navigatord<H> {
     /// shared store), the bytes are read and hash-checked by the store, the
     /// remaining budget is sent with them, and the host's answer is validated
     /// for shape before it becomes an event.
-    fn image(&mut self, session: SessionId, address: String) -> Result<Event, String> {
+    fn image(&mut self, session: SessionId, address: String, painted: Option<(u32, u32)>) -> Result<Event, String> {
         if crate::image::address_hex(&address).is_none() {
             return Err(format!("{address:?} is not an image address (blake3:<64 hex>)"));
+        }
+        if painted.is_some_and(|(w, h)| w == 0 || h == 0) {
+            return Err("an image painted with a zero dimension is not painted".into());
         }
         let carried = self.host.carried(session).ok_or("no such session")?;
         if !carried.image(&address) {
@@ -418,6 +450,8 @@ impl<H: DocumentHost> Navigatord<H> {
         let mine = charged.and_then(|m| m.get(&address)).copied().unwrap_or(0);
         let c = Ceilings {
             budget: navigator_dom::profile::MAX_DECODED_IMAGE_BYTES.saturating_sub(used - mine),
+            // ★ Charged at what is kept: the painted size, not the source's.
+            target: painted.map(|p| self.device_size(p)),
             ..Ceilings::default()
         };
         let pixels = self.host.decode_image(session, &address, &bytes, c, self.now)?;

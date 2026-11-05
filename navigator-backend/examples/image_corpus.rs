@@ -16,6 +16,12 @@
 //! format png`), and reports per-image max and mean channel difference:
 //! "decoded" has to mean decoded RIGHT, not merely without an error.
 //!
+//! `--painted TSV [--scale S64]` (before the dirs) decodes only the blobs a
+//! scene PAINTS, each to its largest painted tile times the device scale
+//! (1/64; default 128 = 2x) — what a renderer asks for (threat model §2.4,
+//! decode to the painted size). TSV rows are `doc hex path w h uses tw64
+//! th64`, the tile in NSG units; the largest over all documents is used.
+//!
 //! Decoding is in-process here: it measures the decoder, not the pipe or the
 //! jail around it (whose costs are measured in the backend spec §4.7a).
 
@@ -58,11 +64,27 @@ fn main() {
     let reference = if dirs.first().map(String::as_str) == Some("--reference") {
         dirs.remove(0); Some(dirs.remove(0))
     } else { None };
+    let mut opt = |name: &str| dirs.iter().position(|x| x == name).map(|i| { let v = dirs.remove(i + 1); dirs.remove(i); v });
+    let painted_tsv = opt("--painted");
+    let scale: u64 = opt("--scale").map(|v| v.parse().unwrap()).unwrap_or(128);
+    // hex -> device-pixel target
+    let painted: Option<BTreeMap<String, (u32, u32)>> = painted_tsv.map(|p| {
+        let mut m: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+        for line in std::fs::read_to_string(p).unwrap().lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            let (tw, th): (u64, u64) = (f[6].parse().unwrap(), f[7].parse().unwrap());
+            let d = |v: u64| (v * scale).div_ceil(64 * 64).max(1) as u32;
+            let e = m.entry(f[1].to_string()).or_default();
+            *e = (e.0.max(d(tw)), e.1.max(d(th)));
+        }
+        m
+    });
     assert!(!dirs.is_empty(), "usage: image_corpus DIR [DIR...]");
     for dir in dirs {
         let mut names: Vec<_> = std::fs::read_dir(&dir).expect("dir").flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.len() == 64).collect();
+            .filter(|n| n.len() == 64)
+            .filter(|n| painted.as_ref().is_none_or(|m| m.contains_key(n))).collect();
         names.sort();
         let mut by_format: BTreeMap<String, (usize, usize)> = BTreeMap::new();
         let mut causes: BTreeMap<String, usize> = BTreeMap::new();
@@ -70,20 +92,25 @@ fn main() {
         let (mut ms, mut mpx, mut peaks, mut ratio) = (vec![], vec![], vec![], vec![]);
         let (mut ok, mut max_peak, mut max_peak_name) = (0usize, 0usize, String::new());
         let mut diffs: Vec<(f64, u8, String)> = vec![];
+        let (mut kept, mut reduced) = (vec![], 0usize);
         for n in &names {
             let bytes = std::fs::read(format!("{dir}/{n}")).expect("read");
             let kind = match sniff(&bytes) { Ok(f) => f.name(), Err(k) => k };
             let e = by_format.entry(kind.to_string()).or_default();
             e.0 += 1;
+            let target = painted.as_ref().and_then(|m| m.get(n).copied());
+            let natural = (painted.is_some()).then(|| decode(&format!("blake3:{n}"), &bytes, Ceilings::default()).ok().map(|p| (p.width, p.height))).flatten();
             let base = LIVE.load(Relaxed);
             PEAK.store(base, Relaxed);
             let t = Instant::now();
-            let r = decode(&format!("blake3:{n}"), &bytes, Ceilings::default());
+            let r = decode(&format!("blake3:{n}"), &bytes, Ceilings { target, ..Ceilings::default() });
             let dt = t.elapsed().as_secs_f64() * 1e3;
             let peak = PEAK.load(Relaxed).saturating_sub(base);
             match r {
                 Ok(px) => {
                     ok += 1;
+                    kept.push(px.rgba.len() as f64);
+                    if natural.is_some_and(|nat| nat != (px.width, px.height)) { reduced += 1 }
                     e.1 += 1;
                     ms.push(dt);
                     let mp = px.width as f64 * px.height as f64 / 1e6;
@@ -144,6 +171,9 @@ fn main() {
             }
             for d in diffs.iter().take(3) { println!("  worst: mean {:.2} max {} {}", d.0, d.1, d.2) }
         }
+        println!("kept (output) bytes per image: p50 {:.0} KiB p95 {:.0} KiB max {:.1} MiB, total {:.1} MiB; reduced {reduced} of {ok}",
+            pct(&mut kept.clone(), 0.5) / 1024.0, pct(&mut kept.clone(), 0.95) / 1024.0, pct(&mut kept.clone(), 1.0) / 1048576.0,
+            kept.iter().sum::<f64>() / 1048576.0);
         println!("peak / output frame: p50 {:.2} p95 {:.2} max {:.2}",
             pct(&mut ratio.clone(), 0.5), pct(&mut ratio.clone(), 0.95), pct(&mut ratio.clone(), 1.0));
     }

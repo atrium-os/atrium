@@ -399,12 +399,122 @@ source of browser RCE.
   Batch 2's p95 is 177 MiB. This is an upper bound, because a renderer decodes only what
   it paints. But the ceiling was reasoned, not measured, and real pages reach it.
   *Recommended:* decode to the painted size (most of these are thumbnails of large
-  sources) and charge that, rather than raising the ceiling. Not built.
+  sources) and charge that, rather than raising the ceiling. Built, below.
 - Run: `cargo run --release --example image_corpus -- [--reference REF] BLOBS...` and
   `examples/image_documents WORKER BLOBS RECORDINGS`.
 
-**Rating now: low.** What stays open: SVG; decode-to-painted-size; and the third-party
-image residual above.
+**Built (2026-11-05): images decode to their painted size.** `src/image.rs`,
+`src/resample.rs`.
+
+- *Who says what size.* `Request::Image` carries `painted`: the largest tile among the
+  scene's `image` nodes for that address, in NSG units (1/64 CSS px). The tile is the
+  drawn size after `object-fit` and `background-size`, so a `cover` crop asks for the
+  overflowing size, not the box. The broker owns the device scale
+  (`with_device_scale`, 1/64; 128 = 2x) and turns `painted` into device pixels,
+  rounded up. The request goes to the worker as `<address> <budget> <tw> <th>`
+  (`0 0`: natural size). ★ The painted size is not a grant. It comes from the scene,
+  which a worker produced, and it can only make the reply smaller than the image: it
+  is capped at the natural size, and the budget binds whatever it says. So it needs
+  no more trust than the scene itself.
+- *The size rule* (`resample::fit`). One scale for both axes, taken from the axis that
+  asks for more, so neither is under-sampled whatever the fit does with the aspect.
+  Each axis is rounded up. **Never upscales**: if either axis needs the whole image,
+  the image is decoded at its natural size, untouched.
+- *Two ceilings, both on the header, before any allocation.* The NATURAL frame is
+  checked against `Ceilings::frame`, the transient ceiling: 256 MiB, the profile's
+  whole-document total. It is held only while that one image decodes. A progressive
+  JPEG's coefficient planes count toward it, and each decoder gets it as its own
+  memory limit. The OUTPUT is checked against the document's remaining budget, and
+  that is what is charged. A new refusal, `FrameTooLarge`, is separate from
+  `OverBudget`. A 16,384² header is refused as a 1 GiB frame however small it is
+  painted.
+- *No decoder-native scaling.* zune-jpeg has no DCT scaling, and PNG, GIF and WebP
+  cannot decode reduced. So every reduction is a decode at natural size and then a
+  resample, and the natural frame is dropped as soon as the reduction exists. A
+  JPEG decoder with DCT scaling, or PNG row streaming into the resampler (the
+  resampler already holds only a ring of rows), would remove the transient. Neither
+  is built.
+- *The filter: the exact area average*, measured (`examples/resample_compare.rs`).
+  The sample is 444 painted reductions from both corpora (every 3rd painted image
+  that is reduced by 1.25x or more). Each filter's output is compared with headless
+  Chrome drawing the same decoded frame at the same CSS size, at device scale 1, and
+  with `sips -z`. Both references are given our own decoded frame as a lossless PNG,
+  so the comparison measures the resampler and not three JPEG decoders. The harness
+  floor was measured with 47 natural-size controls through Chrome: 0.000.
+
+  | filter | vs Chrome: mean / median / p90 abs diff | PSNR | closest to Chrome | vs sips: mean | closest to sips |
+  |---|---|---|---|---|---|
+  | **area** | **2.46** / 1.90 / 4.81 | **36.9 dB** | **305 / 444** | 3.58 | 11 |
+  | triangle | 3.22 / 2.57 / 5.89 | 34.5 | 101 | 3.74 | 2 |
+  | Catmull-Rom | 2.88 / 2.31 / 5.32 | 35.5 | 20 | 3.18 | 420 |
+  | Mitchell | 3.17 / 2.51 / 5.80 | 34.7 | 15 | 3.50 | 10 |
+  | Lanczos 3 | 3.41 / 2.82 / 6.12 | 34.2 | 3 | 3.60 | 1 |
+
+  By reduction factor, area is best below 2x (2.60 against 3.06 for the next) and from
+  2x to 4x (2.05 against 2.53). At 4x and over, area, triangle and Mitchell are within
+  0.1 of each other. sips is sharper than Chrome: Catmull-Rom matches it, and sips
+  itself is 4.47 from Chrome. The reference a reader compares Atrium with is the
+  browser, so area wins. It also has no overshoot to clamp and no ringing at hard
+  edges, and its weights are exact integers. Channels are filtered premultiplied, so
+  an invisible pixel's colour does not fringe a visible one (a test checks it), and
+  come back as straight alpha like every decode. The arithmetic is integer: weights
+  are quantised to 1/2^14 and sum to exactly 2^14, and no transcendental function is
+  used. So the output is the same on every machine. A test pins each deterministic
+  filter's output digest.
+- *The broker's check grows one clause.* With a target, an honest reply is at or under
+  it on at least one axis. That is a property of `fit`, so a reply over the target on
+  both axes ignored it and the worker is retired (a test covers it).
+- *Tests.* `tests/resample.rs` (5): the size rule, flat fields under every filter,
+  transparent stays transparent, partial-coverage weights, pinned digests.
+  `tests/image.rs` adds 8: a reduction equals independently computed 2×2 means (PNG
+  and WebP exact; both JPEG kinds and GIF in shape), never up and aspect kept, no
+  colour bleed, the budget charged at the painted size on the header, `FrameTooLarge`
+  however small the target, both hosts charging five 4096² images painted at 256 CSS
+  px at 2x as 5 × 1 MiB, a new size replacing the charge, the device-pixel rounding,
+  and the lying worker. `tests/image_fuzz.rs`: every other round asks for a painted
+  size (half of them below every seed's size), with an 8 MiB budget and a 16 MiB
+  frame. The run fails unless every format reaches `frame-too-large` and a successful
+  **reduction** as well as the earlier causes. So the resampler is fuzzed on every
+  decoder's output. Measured: header refusals allocated at most 1,488 B first, and
+  peak live heap was 19.1 MiB (frame + output + 4 MiB slack).
+- *Measured, both corpora* (`image_documents` through the worker pipe, scenes from
+  `nsg-render` at the 800 px conversion viewport, one machine, release build).
+  "Before" is every named image at natural size, the run above.
+
+  | | corpus 1 (85 docs) before | after, 2x | after, 1x | batch 2 (48 docs) before | after, 2x | after, 1x |
+  |---|---|---|---|---|---|---|
+  | images requested | 1,101 named | 809 painted | 809 | 2,277 named | 1,879 painted | 1,879 |
+  | decoded / refused SVG+HTML | 873 / 209 | 632 / 177 | 632 / 177 | 2,124 / 105 | 1,789 / 90 | 1,789 / 90 |
+  | refused over budget | 19 (2 docs) | **0** | 0 | 48 (2 docs) | **0** | 0 |
+  | decoded MiB per doc, p50 / p95 / max | 0.0 / 56.8 / 255.2 | 0.0 / 21.5 / **36.6** | 0.0 / 9.7 / 30.1 | 6.8 / 177.3 / 255.9 | 2.8 / 56.3 / **68.4** | 1.1 / 21.4 / 30.5 |
+  | all images of a doc, ms p50 / p95 / max | 0 / 70 / 309 | 0 / 67 / 436 | 0 / 72 / 385 | 8 / 322 / 501 | 6 / 327 / 604 | 8 / 292 / 539 |
+
+  **All 133 documents are within budget, with 3.7x headroom at 2x** (the largest is
+  68.4 of 256 MiB). The four that were over: ocw.mit.edu 255.2 → 5.2 MiB, which.co.uk
+  255.0 → 18.5, nasa 255.9 → 35.7, The Hindu 255.9 → 0.0. Two effects are mixed in
+  that drop, so they are separated. Asking for only the images the scene paints, at
+  natural size, still puts which.co.uk at 255.0 MiB with 16 refused, and batch 2's
+  maximum at 176.3. The reduction is what brings them in. The Hindu's scene paints 4
+  of its 96 named images: its lazy-loaded images do not reach the scene, which is
+  legacy-web §5.4.5.6e's problem, not this one.
+- *Per decode* (`image_corpus --painted`, the painted blobs only: 628 and 1,724
+  decoded). Reduced: 257 of 628 and 409 of 1,724. What is kept: corpus 1 drops from
+  914 to 270 MiB in total and batch 2 from 1,087 to 604 MiB, with the largest single
+  image going from 125.4 to 7.2 MiB and from 22.9 to 9.7 MiB. **The cost is time.**
+  Per image p50 / p95 / max goes from 0.45 / 5.3 / 66 to 0.62 / 9.5 / 94 ms, and the
+  corpus total from 741 to 1,305 ms. For batch 2 it goes from 0.26 / 2.6 / 29 to
+  0.29 / 5.3 / 36 ms, and from 1,582 to 2,439 ms. The resampler reads each source
+  pixel once and is not vectorised. **Peak heap per decode is unchanged** (max 125.8
+  MiB, an 8136×4040 JPEG): the natural frame is still transient. What fell is what
+  the document keeps.
+- *Later, written down.* **A zoom or a device-scale change needs a re-decode.** The
+  API supports it: a request at a new size decodes again and replaces the charge. But
+  nothing asks for it yet, and zooming in past the decoded size will be blurry until
+  something does. Transforms are not in the painted size: a `scale(2)` ancestor
+  under-samples by 2. SVG is still not decoded.
+
+**Rating now: low.** What stays open: SVG; the transient natural frame (DCT scaling or
+row streaming); re-decode on zoom; and the third-party image residual above.
 
 ### 2.5 Composition and GPU — Fresco, Limen, the RDNA4 driver
 
@@ -908,7 +1018,7 @@ These belong in the model because they are *wins*, not because they need work:
 | **P0** ✔ built, verified on FreeBSD | Jail the converter process (Boa) with zero capabilities via `portcullis exec` | A1 → code execution as the user | small: the launcher exists and was measured (§4.7a) | §2.2 |
 | P1 ✔ built, verified on FreeBSD | Refuse non-global addresses after resolution; pin the address per conversion; intranet as an explicit grant | A4: LAN and localhost, DNS rebinding | small | §2.1 |
 | P1 ✔ built | `navigatord` refuses to start unconfined outside test builds | A1 against the worker | trivial | §2.3 |
-| P1 ✔ built (2026-11-05): worker decodes, broker validates, fuzzed, measured on both corpora; Fresco's dead decoder removed | Decide where images decode: per-document jail, memory-safe decoders, never in Fresco | A1 via decoders | design and medium code | §2.4 |
+| P1 ✔ built (2026-11-05): worker decodes, broker validates, fuzzed, measured on both corpora; Fresco's dead decoder removed; decoded to the painted size, all 133 documents within budget | Decide where images decode: per-document jail, memory-safe decoders, never in Fresco | A1 via decoders | design and medium code | §2.4 |
 | P1 | Per-user dedup domain by default; reproduce-to-share | A5 poisoning | design now, code with sharing | §2.6 |
 | P2 ✔ rctl built and verified on FreeBSD; ✔ byte budget built (128 MiB per conversion, in the relay) | `rctl` memory/CPU limits on converter and worker jails; per-conversion byte budget | A6 | small | §2.2 |
 | **P0 (graphics)** | Fix the five GPU driver isolation breaks and pass the attestation gate (F1) | everything in §2.5 rests on it | medium–large | §2.5.4 |

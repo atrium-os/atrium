@@ -467,7 +467,8 @@ impl DocumentHost for JailedHost {
         let deadline = self.config.deadline;
         let w = self.workers.get_mut(&id).ok_or("no such session")?;
         w.last_seen = w.last_seen.max(now);
-        let mut payload = format!("{address} {}\n", c.budget).into_bytes();
+        let (tw, th) = c.target.unwrap_or((0, 0));
+        let mut payload = format!("{address} {} {tw} {th}\n", c.budget).into_bytes();
         payload.extend_from_slice(bytes);
         let header = 64;
         let reply = match w.request_limited(&Frame::new(REQ_IMAGE, payload), deadline, c.budget + header) {

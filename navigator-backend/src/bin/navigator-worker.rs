@@ -89,17 +89,29 @@ impl Worker {
     }
 
     /// ★ Decode one image of THIS document (threat model §2.4). The broker
-    /// sends the bytes it read from the store and the document's remaining
-    /// decoded-bytes budget; the worker checks the bytes against their
+    /// sends the bytes it read from the store, the document's remaining
+    /// decoded-bytes budget and the size the image is painted at; the worker
+    /// decodes and reduces to that size, checks the bytes against their
     /// address itself, and refuses on the header before allocating a frame.
     /// The answer is `<width> <height>\n` and the RGBA8 pixels, which the
     /// broker validates again before anything else sees them.
     fn image(&mut self, payload: &[u8]) -> Result<Vec<u8>, String> {
         let nl = payload.iter().position(|&b| b == b'\n').ok_or("image request has no header")?;
         let head = std::str::from_utf8(&payload[..nl]).map_err(|_| "image request header is not text")?;
-        let (address, budget) = head.split_once(' ').ok_or("image request header has no budget")?;
-        let budget: usize = budget.parse().map_err(|_| "image request budget is not a number")?;
-        let c = image::Ceilings { budget: budget.min(navigator_dom::profile::MAX_DECODED_IMAGE_BYTES), ..Default::default() };
+        let f: Vec<&str> = head.split(' ').collect();
+        let [address, budget, tw, th] = f[..] else { return Err("image request header is not `<address> <budget> <tw> <th>`".into()) };
+        // Digits only, one spelling, as the broker parses this worker's reply.
+        let num = |v: &str| -> Result<usize, String> {
+            if v.is_empty() || v.len() > 12 || !v.bytes().all(|b| b.is_ascii_digit()) { return Err(format!("image request field {v:?} is not a number")) }
+            v.parse().map_err(|_| format!("image request field {v:?} is not a number"))
+        };
+        let (budget, tw, th) = (num(budget)?, num(tw)?, num(th)?);
+        let target = match (tw, th) {
+            (0, 0) => None,
+            (w, h) if w >= 1 && h >= 1 && w <= u32::MAX as usize && h <= u32::MAX as usize => Some((w as u32, h as u32)),
+            _ => return Err("image request painted size has a zero axis".into()),
+        };
+        let c = image::Ceilings { budget: budget.min(navigator_dom::profile::MAX_DECODED_IMAGE_BYTES), target, ..Default::default() };
         let px = image::decode(address, &payload[nl + 1..], c).map_err(|e| e.to_string())?;
         let mut out = format!("{} {}\n", px.width, px.height).into_bytes();
         out.extend_from_slice(&px.rgba);

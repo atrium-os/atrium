@@ -17,14 +17,27 @@
 //! 3. the format is sniffed from the magic bytes, never from a name or a
 //!    MIME type, and anything not a raster format we decode is refused;
 //! 4. the HEADER's dimensions are read and checked against the profile
-//!    (`MAX_IMAGE_DIMENSION` per axis, and the document's remaining
-//!    decoded-bytes budget) BEFORE the frame is allocated — the
-//!    decompression bomb is refused on a dozen bytes of header;
+//!    (`MAX_IMAGE_DIMENSION` per axis, the natural frame against the
+//!    transient ceiling, and the output it reduces to against the
+//!    document's remaining decoded-bytes budget) BEFORE the frame is
+//!    allocated — the decompression bomb is refused on a dozen bytes of
+//!    header;
 //! 5. each decoder also gets its own memory limit, so a format whose
 //!    internals allocate beyond the frame (PNG text chunks, an ICC profile)
-//!    is bounded by the same budget;
-//! 6. the output is converted to one layout and its length checked against
-//!    the header before it is returned.
+//!    is bounded by the same transient ceiling;
+//! 6. the output is converted to one layout, reduced to the painted size,
+//!    and its length checked before it is returned.
+//!
+//! ★★ DECODED TO THE PAINTED SIZE. The broker sends the size the image is
+//! painted at (device pixels, `Ceilings::target`); the decoder decodes the
+//! natural frame, which it holds only for the length of the decode, and
+//! hands back a reduction to at most that size (`resample::fit`: one scale
+//! for both axes, never up). Two ceilings, then, both checked on the header
+//! before anything is allocated: the NATURAL frame against `frame` (the
+//! transient, one image at a time), and the OUTPUT against `budget` (what
+//! the document keeps, and what it is charged). None of the four decoders
+//! here can decode at a reduced scale itself (zune-jpeg has no DCT scaling),
+//! so the reduction is always a resample after the decode.
 //!
 //! ★ THE OUTPUT FORMAT, stated once: RGBA, 8 bits per channel, **straight
 //! (not premultiplied) alpha**, rows top to bottom, no padding (stride =
@@ -53,14 +66,25 @@ pub const BYTES_PER_PIXEL: usize = 4;
 pub struct Ceilings {
     /// Per axis, in pixels.
     pub max_dimension: u32,
-    /// What is left of the document's decoded-bytes budget. The frame must
-    /// fit in it, and each decoder's internal allocations are capped by it.
+    /// What is left of the document's decoded-bytes budget. The OUTPUT
+    /// (after any reduction to `target`) must fit in it: it is what the
+    /// document keeps and is charged for.
     pub budget: usize,
+    /// The largest NATURAL frame decoded on the way to the output, which
+    /// is held only while this one image decodes; each decoder's internal
+    /// allocations are capped by it too. The profile's per-document total:
+    /// a single image larger than a whole document's images is refused.
+    pub frame: usize,
+    /// The size the image is painted at, in device pixels (the largest of
+    /// its painted tiles, times the device scale); `None` decodes at the
+    /// natural size. The output is `resample::fit(natural, target)`.
+    pub target: Option<(u32, u32)>,
 }
 
 impl Default for Ceilings {
     fn default() -> Self {
-        Ceilings { max_dimension: MAX_IMAGE_DIMENSION, budget: MAX_DECODED_IMAGE_BYTES }
+        Ceilings { max_dimension: MAX_IMAGE_DIMENSION, budget: MAX_DECODED_IMAGE_BYTES,
+                   frame: MAX_DECODED_IMAGE_BYTES, target: None }
     }
 }
 
@@ -104,9 +128,13 @@ pub enum DecodeError {
     Empty { format: Format },
     /// An axis over the ceiling. Refused on the header, before allocating.
     TooLarge { format: Format, width: u32, height: u32 },
-    /// The frame would not fit in what is left of the document's budget.
+    /// The output would not fit in what is left of the document's budget.
     /// Refused on the header, before allocating.
     OverBudget { format: Format, needed: usize, left: usize },
+    /// The natural frame (and, for a progressive JPEG, its coefficients)
+    /// is over the transient ceiling `Ceilings::frame`, whatever it would
+    /// be reduced to. Refused on the header, before allocating.
+    FrameTooLarge { format: Format, needed: usize, limit: usize },
     /// The decoder refused the data after the header: truncated, corrupt, a
     /// feature it does not support, or its own memory limit.
     Corrupt { format: Format, why: String },
@@ -123,6 +151,7 @@ impl DecodeError {
             DecodeError::Empty { .. } => "empty",
             DecodeError::TooLarge { .. } => "too-large",
             DecodeError::OverBudget { .. } => "over-budget",
+            DecodeError::FrameTooLarge { .. } => "frame-too-large",
             DecodeError::Corrupt { .. } => "corrupt",
         }
     }
@@ -141,6 +170,8 @@ impl std::fmt::Display for DecodeError {
                 write!(f, "{} image is {width}x{height}, over {MAX_IMAGE_DIMENSION} on an axis", format.name()),
             DecodeError::OverBudget { format, needed, left } =>
                 write!(f, "{} image needs {needed} decoded bytes, {left} left in the document's budget", format.name()),
+            DecodeError::FrameTooLarge { format, needed, limit } =>
+                write!(f, "{} image needs a {needed}-byte frame to decode, over {limit}", format.name()),
             DecodeError::Corrupt { format, why } => write!(f, "{} image did not decode: {why}", format.name()),
         }
     }
@@ -195,23 +226,40 @@ pub fn decode_unaddressed(bytes: &[u8], c: Ceilings) -> Result<Pixels, DecodeErr
         Format::Gif => gif_decode(bytes, c),
         Format::Webp => webp_decode(bytes, c),
     }?;
+    // ★ To the painted size, the natural frame dropped as soon as the
+    // reduction exists. `admit` already checked the output's size.
+    let (ow, oh) = output_size((px.width, px.height), c);
+    let px = if (ow, oh) == (px.width, px.height) { px } else {
+        let rgba = crate::resample::resample(&px.rgba, px.width, px.height, ow, oh, crate::resample::Filter::DEFAULT);
+        drop(px);
+        Pixels { width: ow, height: oh, rgba }
+    };
     // ★ The decoders are trusted to be memory-safe, not to be right. The
     // shape is re-checked on the way out, as the broker will check it again.
     validate(px.width, px.height, px.rgba.len(), c).map_err(|why| DecodeError::Corrupt { format, why })?;
     Ok(px)
 }
 
+/// What a natural size decodes to under these ceilings.
+fn output_size(natural: (u32, u32), c: Ceilings) -> (u32, u32) {
+    match c.target { Some(t) => crate::resample::fit(natural, t), None => natural }
+}
+
 /// ★ THE ADMISSION CHECK, run on the header's dimensions before a frame is
-/// allocated. Returns the frame's size in bytes.
+/// allocated: the natural frame against the transient ceiling, the output
+/// against the budget. Returns the natural frame's size in bytes.
 fn admit(format: Format, width: u32, height: u32, c: Ceilings) -> Result<usize, DecodeError> {
     if width == 0 || height == 0 { return Err(DecodeError::Empty { format }) }
     if width > c.max_dimension || height > c.max_dimension {
         return Err(DecodeError::TooLarge { format, width, height });
     }
     // Cannot overflow: both axes are at most 16,384 here.
-    let needed = width as usize * height as usize * BYTES_PER_PIXEL;
+    let frame = width as usize * height as usize * BYTES_PER_PIXEL;
+    if frame > c.frame { return Err(DecodeError::FrameTooLarge { format, needed: frame, limit: c.frame }) }
+    let (ow, oh) = output_size((width, height), c);
+    let needed = ow as usize * oh as usize * BYTES_PER_PIXEL;
     if needed > c.budget { return Err(DecodeError::OverBudget { format, needed, left: c.budget }) }
-    Ok(needed)
+    Ok(frame)
 }
 
 /// ★★ THE BROKER'S CHECK on a buffer a worker hands back — and the worker's
@@ -226,6 +274,13 @@ pub fn validate(width: u32, height: u32, len: usize, c: Ceilings) -> Result<(), 
     let want = width as usize * height as usize * BYTES_PER_PIXEL;
     if len != want { return Err(format!("{width}x{height} RGBA8 is {want} bytes, the buffer is {len}")) }
     if want > c.budget { return Err(format!("{want} decoded bytes, {} left in the budget", c.budget)) }
+    // ★ With a target, an honest decode is at or under it on at least one
+    // axis: `resample::fit` takes one scale from the axis that asks for
+    // more, and returns the natural size only when that axis already fits.
+    // An image over the target on BOTH axes ignored it.
+    if let Some((tw, th)) = c.target {
+        if width > tw && height > th { return Err(format!("{width}x{height} is over the painted size {tw}x{th} on both axes")) }
+    }
     Ok(())
 }
 
@@ -244,10 +299,10 @@ fn png_decode(b: &[u8], c: Ceilings) -> Result<Pixels, DecodeError> {
         _ => return Err(DecodeError::Header { format: f, why: "truncated IHDR".into() }),
     };
     let frame = admit(f, w, h, c)?;
-    // ★ The decoder's own limit is the budget: a PNG can make the decoder
-    // allocate for text and ICC chunks and its row buffers as well as the
-    // frame, and none of that may exceed what the document has left.
-    let mut dec = png::Decoder::new_with_limits(Cursor::new(b), png::Limits { bytes: c.budget });
+    // ★ The decoder's own limit is the frame ceiling: a PNG can make the
+    // decoder allocate for text and ICC chunks and its row buffers as well
+    // as the frame, and none of that may exceed it.
+    let mut dec = png::Decoder::new_with_limits(Cursor::new(b), png::Limits { bytes: c.frame });
     dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     dec.set_ignore_text_chunk(true);
     dec.set_ignore_iccp_chunk(true);
@@ -312,14 +367,14 @@ fn jpeg_decode(b: &[u8], c: Ceilings) -> Result<Pixels, DecodeError> {
     // ★ A PROGRESSIVE JPEG keeps every coefficient until its last scan:
     // zune holds an i16 per sample per component, MCU-padded (at most 16 px
     // per axis). That scales with the frame, so it is charged against the
-    // budget with it, before decoding. A baseline JPEG decodes a row of
+    // transient ceiling with it, before decoding. A baseline JPEG decodes a row of
     // MCUs at a time and needs no such charge.
     let components = (info.components as usize).max(1);
     let scratch = if info.sof.is_progressive() {
         (w as usize + 16) * (h as usize + 16) * components * 2
     } else { 0 };
-    if frame + scratch > c.budget {
-        return Err(DecodeError::OverBudget { format: f, needed: frame + scratch, left: c.budget });
+    if frame + scratch > c.frame {
+        return Err(DecodeError::FrameTooLarge { format: f, needed: frame + scratch, limit: c.frame });
     }
     match dec.output_buffer_size() {
         Some(n) if n == frame => {}
@@ -361,7 +416,7 @@ fn webp_decode(b: &[u8], c: Ceilings) -> Result<Pixels, DecodeError> {
     if dec.dimensions() != (w, h) {
         return Err(DecodeError::Header { format: f, why: format!("header says {w}x{h}, the decoder {:?}", dec.dimensions()) });
     }
-    dec.set_memory_limit(c.budget);
+    dec.set_memory_limit(c.frame);
     let alpha = dec.has_alpha();
     let size = dec.output_buffer_size()
         .ok_or_else(|| DecodeError::Corrupt { format: f, why: "size overflows".into() })?;
@@ -404,7 +459,7 @@ fn gif_decode(b: &[u8], c: Ceilings) -> Result<Pixels, DecodeError> {
     // The first frame's buffer is held alongside the screen, so the
     // decoder gets what is left after the screen.
     opts.set_memory_limit(gif::MemoryLimit::Bytes(
-        std::num::NonZeroU64::new((c.budget - frame).max(1) as u64).expect("nonzero")));
+        std::num::NonZeroU64::new((c.frame - frame).max(1) as u64).expect("nonzero")));
     let mut dec = opts.read_info(Cursor::new(b)).map_err(|e| DecodeError::Header { format: f, why: e.to_string() })?;
     let mut screen = vec![0u8; frame];
     // ★ The first frame, composited onto a transparent screen at its own

@@ -146,9 +146,13 @@ fn header_dimensions_over_the_ceiling_are_refused_on_the_header() {
     let c = Ceilings::default();
     assert!(matches!(dec(&png_claiming(16_385, 1)), Err(DecodeError::TooLarge { format: Format::Png, width: 16_385, .. })));
     assert!(matches!(dec(&png_claiming(0, 5)), Err(DecodeError::Empty { format: Format::Png })));
-    // 16,384² is within the per-axis cap and 1 GiB decoded: the budget refuses it.
+    // 16,384² is within the per-axis cap and 1 GiB decoded: the frame
+    // ceiling refuses it, painted small or not.
     assert!(matches!(dec(&png_claiming(16_384, 16_384)),
-        Err(DecodeError::OverBudget { format: Format::Png, needed, left }) if needed == 1 << 30 && left == c.budget));
+        Err(DecodeError::FrameTooLarge { format: Format::Png, needed, limit }) if needed == 1 << 30 && limit == c.frame));
+    let b = png_claiming(16_384, 16_384);
+    assert!(matches!(decode(&address(&b), &b, Ceilings { target: Some((10, 10)), ..c }),
+        Err(DecodeError::FrameTooLarge { .. })));
     // And a document with only a little budget left refuses even a small one.
     let tiny = Ceilings { budget: 15, ..c };
     let b = png_rgba(2, 2, &pattern(2, 2));
@@ -164,6 +168,84 @@ fn a_header_that_lies_small_does_not_decode_more_than_it_claims() {
         Ok(p) => assert_eq!((p.width, p.height, p.rgba.len()), (1, 1, 4)),
         Err(e) => assert!(matches!(e, DecodeError::Header { .. } | DecodeError::Corrupt { .. }), "{e:?}"),
     }
+}
+
+// ── Decoded to the painted size ────────────────────────────────────────────
+
+fn dec_at(bytes: &[u8], target: (u32, u32)) -> Result<navigator_backend::image::Pixels, DecodeError> {
+    decode(&address(bytes), bytes, Ceilings { target: Some(target), ..Ceilings::default() })
+}
+
+/// The 2×2 block means of an opaque image, computed here independently of
+/// the resampler: what an exact area average at half size must produce.
+fn halved(px: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let mut out = vec![];
+    for y in 0..h / 2 {
+        for x in 0..w / 2 {
+            for c in 0..4 {
+                let at = |dx: u32, dy: u32| px[(((y * 2 + dy) * w + x * 2 + dx) * 4 + c as u32) as usize] as u32;
+                out.push(((at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1) + 2) / 4) as u8);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn an_image_decodes_to_its_painted_size_as_an_area_average() {
+    let mut px = pattern(8, 6);
+    for p in px.chunks_exact_mut(4) { p[3] = 255 }
+    let b = png_rgba(8, 6, &px);
+    let out = dec_at(&b, (4, 3)).unwrap();
+    assert_eq!((out.width, out.height), (4, 3));
+    assert_eq!(out.rgba, halved(&px, 8, 6), "the area average of each 2x2 block");
+    // ★ Every decoder's output goes through the same reduction. WebP is
+    // lossless, so its result is exact too; JPEG (baseline and progressive)
+    // and GIF are checked for shape.
+    let w = dec_at(&webp_lossless(8, 6, &px), (4, 3)).unwrap();
+    assert_eq!(w.rgba, halved(&px, 8, 6));
+    for b in [jpeg(16, 16, &pattern(16, 16), false), jpeg(16, 16, &pattern(16, 16), true), gif(16, 16, 0, 0, 16, 16)] {
+        assert_eq!(dec_at(&b, (4, 4)).map(|p| (p.width, p.height)), Ok((4, 4)));
+    }
+}
+
+#[test]
+fn a_painted_size_never_upscales_and_keeps_the_aspect() {
+    let b = png_rgba(8, 6, &pattern(8, 6));
+    // Larger than it is: the natural size, untouched.
+    let big = dec_at(&b, (100, 100)).unwrap();
+    assert_eq!((big.width, big.height, big.rgba.clone()), (8, 6, pattern(8, 6)));
+    // One axis larger: still the natural size, since that axis needs it all.
+    assert_eq!(dec_at(&b, (8, 1)).map(|p| (p.width, p.height)), Ok((8, 6)));
+    // ★ Painted 4x1 (a `cover` crop or a stretched fill): one scale, the
+    // LARGER the box asks for, so the wide axis is not under-sampled.
+    assert_eq!(dec_at(&b, (4, 1)).map(|p| (p.width, p.height)), Ok((4, 3)));
+    // Rounded up, so the box is covered: 8x6 at 3 wide is 3 x 2.25 -> 3x3.
+    assert_eq!(dec_at(&b, (3, 1)).map(|p| (p.width, p.height)), Ok((3, 3)));
+}
+
+/// ★ Straight alpha is filtered PREMULTIPLIED: an invisible pixel's colour
+/// must not bleed into a visible neighbour (the dark or coloured fringe).
+#[test]
+fn a_reduction_does_not_bleed_invisible_colour() {
+    // Left column: fully transparent RED; right: opaque blue.
+    let px = [255, 0, 0, 0, 0, 0, 255, 255, 255, 0, 0, 0, 0, 0, 255, 255];
+    let b = png_rgba(2, 2, &px);
+    let out = dec_at(&b, (1, 1)).unwrap();
+    assert_eq!(out.rgba, [0, 0, 255, 128], "half coverage, and the colour is all blue");
+}
+
+#[test]
+fn the_budget_is_charged_at_the_painted_size() {
+    let c = Ceilings { budget: 64 * 64 * 4, target: Some((64, 64)), ..Ceilings::default() };
+    let px = vec![7u8; 512 * 512 * 4];
+    let b = png_rgba(512, 512, &px);
+    // 1 MiB natural, 16 KiB painted: fits a 16 KiB budget at its painted size.
+    let p = decode(&address(&b), &b, c).unwrap();
+    assert_eq!((p.width, p.height, p.rgba.len()), (64, 64, 64 * 64 * 4));
+    // And one byte less refuses it — on the header, at the painted size.
+    assert!(matches!(decode(&address(&b), &b, Ceilings { budget: 64 * 64 * 4 - 1, ..c }),
+        Err(DecodeError::OverBudget { needed, .. }) if needed == 64 * 64 * 4));
 }
 
 // ── Through the broker ─────────────────────────────────────────────────────
@@ -190,7 +272,13 @@ fn open<H: DocumentHost>(n: &mut Navigatord<H>, rec: &[u8]) -> SessionId {
 }
 
 fn image<H: DocumentHost>(n: &mut Navigatord<H>, session: SessionId, address: &str) -> Event {
-    n.handle(Request::Image { session, address: address.into() }).pop().expect("an answer")
+    n.handle(Request::Image { session, address: address.into(), painted: None }).pop().expect("an answer")
+}
+
+/// An image requested at a painted size, in CSS px (NSG's 1/64 units are
+/// applied here).
+fn image_at<H: DocumentHost>(n: &mut Navigatord<H>, session: SessionId, address: &str, css: (u32, u32)) -> Event {
+    n.handle(Request::Image { session, address: address.into(), painted: Some((css.0 * 64, css.1 * 64)) }).pop().expect("an answer")
 }
 
 fn blocked(e: Event, has: &str) {
@@ -303,6 +391,53 @@ fn the_budget_binds_across_images() {
     assert!(matches!(image(&mut n, s, &addrs[0]), Event::Image { .. }));
 }
 
+/// ★ The four-and-a-fifth images that were over the budget at their
+/// natural size fit at their painted size, and the broker's device scale
+/// sets what "painted size" means in pixels — through both hosts.
+fn the_broker_decodes_to_the_painted_size<H: DocumentHost>(n: Navigatord<H>) {
+    let imgs: Vec<Vec<u8>> = (0..5u8).map(|i| {
+        let mut px = vec![0u8; 4096 * 4096 * 4];
+        px[0] = i;
+        png_rgba(4096, 4096, &px)
+    }).collect();
+    let addrs: Vec<String> = imgs.iter().map(|b| address(b)).collect();
+    let mut blobs = MemoryStore::default();
+    for b in &imgs { blobs.put(b).unwrap(); }
+    // 2x: a 256x256 CSS box is 512x512 device pixels.
+    let mut n = n.with_blobs(Box::new(blobs)).with_device_scale(128);
+    let s = open(&mut n, &recording_with_images(&addrs));
+    for a in &addrs {
+        match image_at(&mut n, s, a, (256, 256)) {
+            Event::Image { pixels, .. } => assert_eq!((pixels.width, pixels.height), (512, 512)),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(n.decoded_bytes(s), 5 * 512 * 512 * 4, "charged at the painted size, not 5 x 64 MiB");
+    // A new size (zoom) decodes again and REPLACES the charge.
+    assert!(matches!(image_at(&mut n, s, &addrs[0], (128, 128)), Event::Image { pixels, .. } if pixels.width == 256));
+    assert_eq!(n.decoded_bytes(s), 4 * 512 * 512 * 4 + 256 * 256 * 4);
+    // Not painted means not painted.
+    blocked(n.handle(Request::Image { session: s, address: addrs[1].clone(), painted: Some((0, 64)) }).pop().unwrap(), "zero dimension");
+}
+
+#[test]
+fn the_in_process_broker_decodes_to_the_painted_size() {
+    the_broker_decodes_to_the_painted_size(Navigatord::unconfined_for_testing(InProcessHost::default()));
+}
+
+#[test]
+fn the_jailed_broker_decodes_to_the_painted_size() {
+    let host = JailedHost::new(WorkerConfig::unconfined_for_testing(WORKER), SessionLimits::default());
+    the_broker_decodes_to_the_painted_size(Navigatord::unconfined_for_testing(host));
+}
+
+#[test]
+fn device_pixels_round_up_and_never_reach_zero() {
+    let n = Navigatord::unconfined_for_testing(InProcessHost::default()).with_device_scale(96); // 1.5x
+    assert_eq!(n.device_size((64 * 10, 64 * 3)), (15, 5)); // 4.5 rounds up
+    assert_eq!(n.device_size((1, 1)), (1, 1));               // 1/64 px still covers a pixel
+}
+
 // ── A worker that lies ─────────────────────────────────────────────────────
 
 /// A "worker" that answers OPEN with no triggers and then answers the image
@@ -341,6 +476,20 @@ fn a_worker_that_returns_a_bad_image_is_retired() {
         assert_eq!(n.host().status(s), Status::Failed, "{reply:?}: the lying worker was not retired");
         assert_eq!(n.host().open_count(), 0);
     }
+}
+
+/// ★ A worker asked for a painted size that sends back more than it on
+/// BOTH axes ignored it — a way to spend the document's budget the request
+/// did not grant. Retired like any other lie.
+#[test]
+fn a_worker_that_ignores_the_painted_size_is_retired() {
+    let payload = format!("2 2\n{}", "A".repeat(16));
+    let reply = format!("OK {}\\n{}", payload.len(), payload.replace('\n', "\\n"));
+    let f = fixture();
+    let mut n = Navigatord::unconfined_for_testing(liar(&reply)).with_blobs(Box::new(f.blobs));
+    let s = open(&mut n, &f.recording);
+    blocked(image_at(&mut n, s, &f.a, (1, 1)), "over the painted size 1x1 on both axes");
+    assert_eq!(n.host().status(s), Status::Failed);
 }
 
 /// And a worker cannot even be ASKED for a blob its recording does not

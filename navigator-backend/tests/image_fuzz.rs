@@ -13,11 +13,14 @@
 //! - a decode refused on its HEADER (too large, over budget, empty,
 //!   unreadable) never allocated more than 1 MiB — the bomb was refused
 //!   before the frame;
-//! - no decode, refused or not, ever held more than the budget it was given
-//!   plus a fixed 4 MiB of decoder state.
+//! - no decode, refused or not, ever held more than its transient frame
+//!   ceiling plus what it returned plus a fixed 4 MiB of decoder state.
 //!
-//! The budget here is 8 MiB, small on purpose, so header lies routinely land
-//! between "fits" and "does not" and both sides of the check are exercised.
+//! The budget here is 8 MiB and the frame ceiling 16 MiB, small on purpose,
+//! so header lies routinely land between "fits" and "does not" for both
+//! checks. Every other round asks for a painted size (decode-to-painted-size,
+//! threat model §2.4), and the run must show a REDUCTION succeed for every
+//! format, so the resampler is fuzzed on every decoder's output too.
 
 mod common;
 use common::images::*;
@@ -178,6 +181,7 @@ fn mutate(rng: &mut Rng, f: Format, src: &[u8]) -> Vec<u8> {
 
 const ROUNDS: usize = 20_000;
 const BUDGET: usize = 8 << 20;
+const FRAME: usize = 16 << 20;
 /// What a header refusal may allocate: the decoder objects, not a frame.
 const HEADER_REFUSAL_ALLOC: usize = 1 << 20;
 /// Decoder state beyond the budget (inflate windows, Huffman tables).
@@ -186,7 +190,6 @@ const DECODER_SLACK: usize = 4 << 20;
 #[test]
 fn mutated_images_never_panic_reach_every_refusal_and_stay_in_their_budget() {
     let seeds = seeds();
-    let c = Ceilings { budget: BUDGET, ..Ceilings::default() };
     let mut rng = Rng(0x1A6E_5EED_0000_0042);
     let mut reached: BTreeSet<(String, &'static str)> = BTreeSet::new();
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
@@ -194,6 +197,12 @@ fn mutated_images_never_panic_reach_every_refusal_and_stay_in_their_budget() {
     for round in 0..ROUNDS {
         let (f, src) = &seeds[rng.below(seeds.len())];
         let input = if round % 11 == 0 { src.clone() } else { mutate(&mut rng, *f, src) };
+        // Half the targets are below every seed (they are 2 to 17 px), so
+        // unmutated and lightly mutated seeds reduce; half are larger, so
+        // lying headers reduce too.
+        let side = if round % 4 == 1 { 3 } else { 48 };
+        let target = (round % 2 == 1).then(|| (1 + rng.below(side) as u32, 1 + rng.below(side) as u32));
+        let c = Ceilings { budget: BUDGET, frame: FRAME, target, ..Ceilings::default() };
         let probe = input.clone();
         let (r, largest, peak) = measured(|| std::panic::catch_unwind(|| decode_unaddressed(&probe, c)));
         let r = r.unwrap_or_else(|_| panic!("PANIC decoding round {round} ({}): {:?}", f.name(), input));
@@ -202,10 +211,18 @@ fn mutated_images_never_panic_reach_every_refusal_and_stay_in_their_budget() {
             Ok(_) => f.name().to_string(),
             Err(DecodeError::NotARaster { kind }) => format!("not:{kind}"),
             Err(DecodeError::Header { format, .. } | DecodeError::Empty { format } | DecodeError::TooLarge { format, .. }
-                | DecodeError::OverBudget { format, .. } | DecodeError::Corrupt { format, .. }) => format.name().to_string(),
+                | DecodeError::OverBudget { format, .. } | DecodeError::FrameTooLarge { format, .. }
+                | DecodeError::Corrupt { format, .. }) => format.name().to_string(),
             Err(e) => panic!("unexpected {e:?}"),
         };
         reached.insert((fmt.clone(), cause));
+        // A decode that came back smaller than its header: the resampler ran.
+        if let (Ok(p), Some((tw, th))) = (&r, target) {
+            assert!(p.width <= tw || p.height <= th, "round {round}: {}x{} ignores the target {tw}x{th}", p.width, p.height);
+            if (p.width, p.height) != natural_of(&probe) {
+                reached.insert((fmt.clone(), "reduced"));
+            }
+        }
         *counts.entry(cause).or_default() += 1;
         if let Ok(p) = &r {
             assert_eq!(p.rgba.len(), p.width as usize * p.height as usize * 4, "round {round}: shape");
@@ -215,17 +232,19 @@ fn mutated_images_never_panic_reach_every_refusal_and_stay_in_their_budget() {
                 "round {round}: the allocator counted {peak} live / {largest} largest for a {}-byte frame", p.rgba.len());
         }
         // ★★ The bomb is refused before the frame.
-        if matches!(r, Err(DecodeError::TooLarge { .. } | DecodeError::OverBudget { .. } | DecodeError::Empty { .. })) {
+        if matches!(r, Err(DecodeError::TooLarge { .. } | DecodeError::OverBudget { .. }
+                          | DecodeError::FrameTooLarge { .. } | DecodeError::Empty { .. })) {
             max_header_alloc = max_header_alloc.max(largest);
             assert!(largest <= HEADER_REFUSAL_ALLOC,
                 "round {round} ({fmt} {cause}): refused on its header but allocated {largest} bytes first: {:?}", &input[..input.len().min(64)]);
         }
         max_peak = max_peak.max(peak);
-        assert!(peak <= BUDGET + DECODER_SLACK,
-            "round {round} ({fmt} {cause}): held {peak} bytes on an {BUDGET}-byte budget: {:?}", &input[..input.len().min(64)]);
+        let kept = r.as_ref().map(|p| p.rgba.len()).unwrap_or(0);
+        assert!(peak <= FRAME + kept + DECODER_SLACK,
+            "round {round} ({fmt} {cause}): held {peak} bytes on a {FRAME}-byte frame ceiling: {:?}", &input[..input.len().min(64)]);
     }
     eprintln!("image fuzz: {counts:?}");
-    eprintln!("image fuzz: largest allocation before a header refusal {max_header_alloc} B; peak live {max_peak} B (budget {BUDGET})");
+    eprintln!("image fuzz: largest allocation before a header refusal {max_header_alloc} B; peak live {max_peak} B (budget {BUDGET}, frame {FRAME})");
     eprintln!("image fuzz: reached {reached:?}");
 
     // ★★ THE REACH ASSERTION. Every admission refusal, for every format —
@@ -235,8 +254,8 @@ fn mutated_images_never_panic_reach_every_refusal_and_stay_in_their_budget() {
         let causes: &[&str] = match f {
             // A VP8L size field cannot exceed 16,384, the per-axis ceiling,
             // so a lossless WebP can be over budget but not too large.
-            Format::Webp => &["ok", "corrupt", "header", "over-budget"],
-            _ => &["ok", "corrupt", "header", "too-large", "over-budget", "empty"],
+            Format::Webp => &["ok", "reduced", "corrupt", "header", "over-budget", "frame-too-large"],
+            _ => &["ok", "reduced", "corrupt", "header", "too-large", "over-budget", "frame-too-large", "empty"],
         };
         for &cause in causes {
             assert!(reached.contains(&(f.name().to_string(), cause)),
@@ -273,7 +292,13 @@ fn a_webp_canvas_that_lies_is_refused_on_its_header() {
         b
     };
     let (r, largest, _) = measured(|| decode_unaddressed(&vp8x(16_384), Ceilings::default()));
-    assert!(matches!(r, Err(DecodeError::OverBudget { format: Format::Webp, needed, .. }) if needed == 1 << 30), "{r:?}");
+    assert!(matches!(r, Err(DecodeError::FrameTooLarge { format: Format::Webp, needed, .. }) if needed == 1 << 30), "{r:?}");
+    // The same canvas painted at 16×16 is refused just the same: what it
+    // would be reduced to does not make its natural frame smaller.
+    let small = Ceilings { target: Some((16, 16)), ..Ceilings::default() };
+    let (r, largest2, _) = measured(|| decode_unaddressed(&vp8x(16_384), small));
+    assert!(matches!(r, Err(DecodeError::FrameTooLarge { format: Format::Webp, .. })), "{r:?}");
+    assert!(largest2 <= HEADER_REFUSAL_ALLOC, "allocated {largest2} before refusing");
     assert!(largest <= HEADER_REFUSAL_ALLOC, "allocated {largest} before refusing");
     let (r, largest, _) = measured(|| decode_unaddressed(&vp8x(1 << 24), Ceilings::default()));
     assert!(matches!(r, Err(DecodeError::TooLarge { format: Format::Webp, width: 16_777_216, .. })), "{r:?}");
@@ -286,4 +311,10 @@ fn every_seed_decodes() {
         let p = decode_unaddressed(s, Ceilings::default()).unwrap_or_else(|e| panic!("seed {i} ({}): {e}", f.name()));
         assert!(p.width > 0);
     }
+}
+
+/// The natural size of a decodable input, for telling a reduction from a
+/// decode that was already small enough.
+fn natural_of(b: &[u8]) -> (u32, u32) {
+    decode_unaddressed(b, Ceilings::default()).map(|p| (p.width, p.height)).unwrap_or((0, 0))
 }
