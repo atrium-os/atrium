@@ -71,13 +71,15 @@ pub struct HttpFetcher {
     /// goes back out to the live site, so two runs of one page can be fed
     /// different bytes and the difference looks like the converter's.
     cache_only: bool,
+    /// One entry per request, for the time-to-first-display measurement.
+    pub log: Vec<CurlTiming>,
 }
 
 impl HttpFetcher {
     pub fn new(cache: PathBuf) -> Self {
         let _ = fs::create_dir_all(&cache);
         let cache_only = std::env::var("PRERENDER_OFFLINE").ok().as_deref() == Some("1");
-        Self { cache, max_bytes: 8_000_000, timeout_s: 20, fetched: 0, from_cache: 0, bytes: 0, cache_only }
+        Self { cache, max_bytes: 8_000_000, timeout_s: 20, fetched: 0, from_cache: 0, bytes: 0, cache_only, log: vec![] }
     }
     fn key_ext(url: &str, ext: &str) -> String {
         let mut h: u64 = 0xcbf29ce484222325;
@@ -95,48 +97,97 @@ impl HttpFetcher {
 
 impl Fetcher for HttpFetcher {
     fn get(&mut self, url: &str) -> Result<String, String> {
+        crate::timing::fetch(|| self.get_text_inner(url), |s| s.len() as u64)
+    }
+    fn get_bytes(&mut self, url: &str) -> Result<Vec<u8>, String> {
+        crate::timing::fetch(|| self.get_bytes_inner(url), |b| b.len() as u64)
+    }
+    fn bytes_fetched(&self) -> u64 { self.bytes }
+}
+
+impl HttpFetcher {
+    fn get_text_inner(&mut self, url: &str) -> Result<String, String> {
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             return Err(format!("unsupported scheme: {url}"));
         }
         let path = self.cache.join(Self::key(url));
         if let Ok(s) = fs::read_to_string(&path) {
             self.from_cache += 1;
+            self.log.push(CurlTiming { url: url.to_string(), cached: true, ..CurlTiming::default() });
             return Ok(s);
         }
-        if self.cache_only { return Err(format!("offline, not cached: {url}")) }
-        let out = Command::new("curl")
-            .args(["-fsSL", "--max-time", &self.timeout_s.to_string(),
-                   "--max-filesize", &self.max_bytes.to_string(),
-                   "-A", "atrium-navigator-corpus/0.1 (measurement)", url])
-            .output()
-            .map_err(|e| format!("curl: {e}"))?;
-        if !out.status.success() { return Err(format!("fetch failed: {url}")); }
-        let body = String::from_utf8_lossy(&out.stdout).to_string();
-        self.fetched += 1;
-        self.bytes += body.len() as u64;
+        if self.cache_only {
+            self.log.push(CurlTiming { url: url.to_string(), cached: true, ..CurlTiming::default() });
+            return Err(format!("offline, not cached: {url}"))
+        }
+        let out = self.curl(url)?;
+        let body = String::from_utf8_lossy(&out).to_string();
         let _ = fs::write(&path, &body);
         Ok(body)
     }
-    fn get_bytes(&mut self, url: &str) -> Result<Vec<u8>, String> {
+    fn get_bytes_inner(&mut self, url: &str) -> Result<Vec<u8>, String> {
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             return Err(format!("unsupported scheme: {url}"));
         }
         let path = self.cache.join(Self::key_ext(url, "bin"));
-        if let Ok(b) = fs::read(&path) { self.from_cache += 1; return Ok(b) }
-        if self.cache_only { return Err(format!("offline, not cached: {url}")) }
+        if let Ok(b) = fs::read(&path) {
+            self.from_cache += 1;
+            self.log.push(CurlTiming { url: url.to_string(), cached: true, bytes: b.len() as u64, ..CurlTiming::default() });
+            return Ok(b)
+        }
+        if self.cache_only {
+            self.log.push(CurlTiming { url: url.to_string(), cached: true, ..CurlTiming::default() });
+            return Err(format!("offline, not cached: {url}"))
+        }
+        let out = self.curl(url)?;
+        let _ = fs::write(&path, &out);
+        Ok(out)
+    }
+
+    /// One curl, with its own timing (§5.4.5.7): DNS, TCP, TLS, first byte
+    /// and total, as curl measures them, written to stderr so the body on
+    /// stdout is untouched. ★ One process per URL, so one connection per
+    /// URL: nothing is reused, which is also what fetchd does today
+    /// (`Connection: close`).
+    fn curl(&mut self, url: &str) -> Result<Vec<u8>, String> {
         let out = Command::new("curl")
             .args(["-fsSL", "--max-time", &self.timeout_s.to_string(),
                    "--max-filesize", &self.max_bytes.to_string(),
+                   "-w", "%{stderr}\nCURLTIME %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total} %{num_connects}\n",
                    "-A", "atrium-navigator-corpus/0.1 (measurement)", url])
             .output()
             .map_err(|e| format!("curl: {e}"))?;
+        let err = String::from_utf8_lossy(&out.stderr);
+        let mut t = CurlTiming { url: url.to_string(), ok: out.status.success(), bytes: out.stdout.len() as u64, ..CurlTiming::default() };
+        if let Some(l) = err.lines().rev().find(|l| l.starts_with("CURLTIME ")) {
+            let v: Vec<f64> = l[9..].split_whitespace().filter_map(|x| x.parse().ok()).collect();
+            if v.len() == 6 {
+                (t.dns, t.connect, t.tls, t.ttfb, t.total) = (v[0], v[1], v[2], v[3], v[4]);
+                t.connects = v[5] as u32;
+            }
+        }
+        self.log.push(t);
         if !out.status.success() { return Err(format!("fetch failed: {url}")); }
         self.fetched += 1;
         self.bytes += out.stdout.len() as u64;
-        let _ = fs::write(&path, &out.stdout);
         Ok(out.stdout)
     }
-    fn bytes_fetched(&self) -> u64 { self.bytes }
+}
+
+/// What curl said one fetch cost, in seconds from the start of that fetch
+/// (curl's own cumulative times). All zero for a cache hit.
+#[derive(Debug, Clone, Default)]
+pub struct CurlTiming {
+    pub url: String,
+    pub cached: bool,
+    pub ok: bool,
+    pub bytes: u64,
+    pub dns: f64,
+    pub connect: f64,
+    pub tls: f64,
+    pub ttfb: f64,
+    pub total: f64,
+    pub connects: u32,
 }
 
 /// The brokered fetcher (backend spec §8.1, M1): `navigator-fetchd`, a
@@ -276,9 +327,11 @@ pub fn read_line_bounded(r: &mut impl std::io::BufRead, max: usize) -> Result<Op
 
 impl Fetcher for FetchdFetcher {
     fn get(&mut self, url: &str) -> Result<String, String> {
-        self.get_raw(url).map(|b| String::from_utf8_lossy(&b).into_owned())
+        crate::timing::fetch(|| self.get_raw(url), |b| b.len() as u64).map(|b| String::from_utf8_lossy(&b).into_owned())
     }
-    fn get_bytes(&mut self, url: &str) -> Result<Vec<u8>, String> { self.get_raw(url) }
+    fn get_bytes(&mut self, url: &str) -> Result<Vec<u8>, String> {
+        crate::timing::fetch(|| self.get_raw(url), |b| b.len() as u64)
+    }
     fn bytes_fetched(&self) -> u64 { self.bytes }
 }
 

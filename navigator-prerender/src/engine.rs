@@ -153,6 +153,7 @@ pub struct GeoStats {
     pub max_ms: f64,
 }
 
+#[derive(Default)]
 pub struct RunReport {
     /// Layout geometry: see `GeoStats`.
     pub geo: GeoStats,

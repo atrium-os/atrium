@@ -1522,6 +1522,7 @@ fn geometry() -> Option<std::rc::Rc<navigator_render::html::Geometry>> {
         _ => {}
     }
     let t = std::time::Instant::now();
+    let layout_span = crate::timing::span("layout");
     let r = GEO.with(|g| {
         let mut g = g.borrow_mut();
         let g = &mut *g;
@@ -1532,6 +1533,7 @@ fn geometry() -> Option<std::rc::Rc<navigator_render::html::Geometry>> {
             with(|d| crate::geometry::layout(d, base.as_deref(), f))
         })).unwrap_or_else(|_| Err("layout panicked".into()))
     });
+    drop(layout_span);
     let ms = t.elapsed().as_secs_f64() * 1e3;
     GEO.with(|g| {
         let mut g = g.borrow_mut();
@@ -2384,9 +2386,10 @@ fn fetch_sync(_t: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
         blocked("cross-origin", &host);
         return Ok(JsValue::null());
     }
-    let got = PAGE_NET.with(|n| {
-        n.borrow_mut().as_mut().map(|f| f.get(&abs))
-    });
+    let got = {
+        let _s = crate::timing::span("page");
+        PAGE_NET.with(|n| n.borrow_mut().as_mut().map(|f| f.get(&abs)))
+    };
     match got {
         Some(Ok(body)) => {
             PAGE_FETCHES.with(|c| c.borrow_mut().0 += 1);
@@ -5893,6 +5896,7 @@ impl ScriptEngine for BoaEngine {
             base: self.base_url.clone(),
             ..GeoState::default()
         });
+        let setup_span = crate::timing::span("js.setup");
         let hooks = std::rc::Rc::new(FixedHooks);
         let clock = std::rc::Rc::new(FixedClock(
             if self.clock_millis == 0 { CONVERSION_EPOCH_MS } else { self.clock_millis }));
@@ -6075,15 +6079,33 @@ impl ScriptEngine for BoaEngine {
             rep.errors.push(format!("globals: {e}"));
         }
         RECORDING.with(|r| *r.borrow_mut() = true);
+        drop(setup_span);
         for s in scripts {
             // Already run by the static pass: the sweep must not repeat it.
             if let Some(h) = s.element { EXECUTED.with(|e| { e.borrow_mut().insert(h); }); }
             // Per spec, currentScript is null while a MODULE evaluates.
             CURRENT.with(|c| *c.borrow_mut() = if s.module { None } else { s.element });
             let mut err = if s.module {
+                let _t = crate::timing::span("js.module");
                 run_module(&mut ctx, &s.text, s.path.as_deref()).err()
             } else {
-                ctx.eval(Source::from_bytes(s.text.as_bytes())).err().map(|e| e.to_string())
+                // `ctx.eval` in its three steps, each timed (§5.4.5.7):
+                // parse, compile to bytecode, execute. Same calls, same
+                // order, as `Context::eval` makes them.
+                let parsed = {
+                    let _t = crate::timing::span("js.parse");
+                    boa_engine::Script::parse(Source::from_bytes(s.text.as_bytes()), None, &mut ctx)
+                };
+                match parsed {
+                    Err(e) => Some(e.to_string()),
+                    Ok(script) => {
+                        let compiled = { let _t = crate::timing::span("js.compile"); script.codeblock(&mut ctx) };
+                        match compiled {
+                            Err(e) => Some(e.to_string()),
+                            Ok(_) => { let _t = crate::timing::span("js.exec"); script.evaluate(&mut ctx).err().map(|e| e.to_string()) }
+                        }
+                    }
+                }
             };
             // ★ A classic script that fails on module-only syntax is retried
             // as a module. The corpus showed bare `export` in files a page
@@ -6127,6 +6149,7 @@ impl ScriptEngine for BoaEngine {
         }
         // No script is executing during the lifecycle pass.
         CURRENT.with(|c| *c.borrow_mut() = None);
+        let events_span = crate::timing::span("js.events");
         // Lifecycle AFTER the scripts have registered their handlers. Page
         // handlers run inside this pass, so recording stays ON for them; the
         // FIRE script's own typeof probes are named below and filtered.
@@ -6173,7 +6196,8 @@ impl ScriptEngine for BoaEngine {
             // Settled once a full round adds nothing new.
             if ran == 0 && refused == 0 && round > 0 { break }
         }
-        if !self.nominal_geometry && !self.no_scroll_sweep { sweep(&mut ctx) }
+        drop(events_span);
+        if !self.nominal_geometry && !self.no_scroll_sweep { let _t = crate::timing::span("sweep"); sweep(&mut ctx) }
         if let Ok(v) = ctx.eval(Source::from_bytes(b"__timerStats()")) {
             if let Some(o) = v.as_object() {
                 rep.timers_fired = o.get(0, &mut ctx).ok()
@@ -6197,6 +6221,7 @@ impl ScriptEngine for BoaEngine {
             let parser_nodes = DOM.with(|d| d.borrow().parser_nodes);
             let bounds = self.probe_bounds.unwrap_or((PROBES_PER_HANDLER, MAX_PROBES));
             let t0 = std::time::Instant::now();
+            let _t = crate::timing::span("explore");
             let (t, tm, found, cov, mut stats) = explore_states(&mut ctx, parser_nodes, bounds);
             stats.micros = t0.elapsed().as_micros() as u64;
             rep.explore_stats = stats;

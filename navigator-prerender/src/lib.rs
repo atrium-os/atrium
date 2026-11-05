@@ -11,6 +11,7 @@ pub mod fetch;
 pub mod selector;
 pub mod serve;
 pub mod modmirror;
+pub mod timing;
 
 use dom::Script;
 use engine::{ScriptEngine, ScriptSource};
@@ -34,6 +35,11 @@ pub struct Conversion {
     /// Holding it is what lets a POLICY choose per document instead of the
     /// converter deciding for everyone.
     pub html_tier1: String,
+    /// ★ The scripts were deliberately NOT run (`convert_tier1`): this is
+    /// the first-display artifact (legacy-web §5.4.5.7), published at tier 1
+    /// whatever the document's scripts would have done, and replaced when the
+    /// scripted conversion arrives.
+    pub scripts_held: bool,
     pub engine: &'static str,
     pub elements_before: usize,
     /// Visible text (whitespace-collapsed) before and after scripts ran.
@@ -130,8 +136,29 @@ pub fn convert_with_opts(
     fetcher: &mut dyn Fetcher,
     protect_parser_nodes: bool,
 ) -> Conversion {
+    convert_impl(html, base, Some(engine), fetcher, protect_parser_nodes)
+}
+
+/// ★ TIER 1, FOR FIRST DISPLAY (legacy-web §5.4.5.7): parse, collect the
+/// stylesheets and image sizes the parsed document names, serialize. No
+/// script is fetched or run, so nothing here waits for the page's code;
+/// the scripted conversion follows and replaces it.
+pub fn convert_tier1(html: &str, base: Option<&str>, fetcher: &mut dyn Fetcher) -> Conversion {
+    convert_impl(html, base, None, fetcher, false)
+}
+
+fn convert_impl(
+    html: &str,
+    base: Option<&str>,
+    mut engine: Option<&mut dyn ScriptEngine>,
+    fetcher: &mut dyn Fetcher,
+    protect_parser_nodes: bool,
+) -> Conversion {
+    let scripts_held = engine.is_none();
     // A conversion's fetches are its own (see `subresource::forget_fetched`).
     subresource::forget_fetched();
+    timing::reset();
+    let parse_span = timing::span("html.parse");
     let mut dom = parse::parse(html);
     let before = dom.element_count();
     // ★ THE QUESTION TIER 2 ACTUALLY HAS TO ANSWER is not "did the scripts
@@ -152,6 +179,7 @@ pub fn convert_with_opts(
     // Protection is the separate, opt-in thing.
     dom.parser_nodes = dom.nodes.len() as dom::Handle;
     dom.protect_parser_nodes = protect_parser_nodes;
+    drop(parse_span);
 
     let (mut ext_total, mut ext_ok, mut ext_fail) = (0, 0, 0);
     let mut fetch_errors: Vec<String> = vec![];
@@ -169,7 +197,9 @@ pub fn convert_with_opts(
     let mirror_root = mirror_root.canonicalize().unwrap_or(mirror_root);
     let mut seen: HashSet<String> = HashSet::new();
     let mut scripts: Vec<ScriptSource> = vec![];
+    let mut held = 0usize;
     for s in dom::scripts_in_order(&dom) {
+        if scripts_held { held += 1; continue }
         match s {
             Script::Inline { text, module, element } => {
                 // An inline module is written into the document's own
@@ -215,6 +245,7 @@ pub fn convert_with_opts(
                     None => { ext_fail += 1; fetch_errors.push(format!("unresolved src: {href}")); }
                     Some(abs) => {
                         if module {
+                            let _s = timing::span("module");
                             // A module and everything it imports, mirrored so
                             // Boa's loader can resolve relative specifiers.
                             match modmirror::mirror(fetcher, &abs, &mirror_root,
@@ -227,6 +258,7 @@ pub fn convert_with_opts(
                                 None => ext_fail += 1,
                             }
                         } else {
+                            let _s = timing::span("script");
                             match fetcher.get(&abs) {
                                 Ok(body) => { ext_ok += 1; scripts.push(ScriptSource { text: body, module, path: None, element: Some(element) }); }
                                 Err(e) => { ext_fail += 1; fetch_errors.push(e); }
@@ -238,24 +270,35 @@ pub fn convert_with_opts(
         }
     }
 
-    engine.set_module_root(&mirror_root);
-    engine.set_base_url(base);
-    let mut rep = engine.run(&mut dom, &scripts);
+    let mut rep = match engine.as_deref_mut() {
+        Some(engine) => {
+            engine.set_module_root(&mirror_root);
+            engine.set_base_url(base);
+            let _s = timing::span("js");
+            engine.run(&mut dom, &scripts)
+        }
+        None => engine::RunReport::default(),
+    };
     // The fetch cache persists; the mirror is scratch for this conversion.
     let _ = std::fs::remove_dir_all(&mirror_root);
     rep.errors.extend(fetch_errors);
     // ★ Subresources are collected from the FINAL document — after scripts
     // ran — because that is the document the normalizer will be handed, and
     // a script may well have added the stylesheet or the image.
-    let subresources = subresource::collect(&dom, base, fetcher);
+    let subresources = {
+        let _s = timing::span("subresource");
+        subresource::collect(&dom, base, fetcher)
+    };
     subresource::forget_fetched();
+    let serialize_span = timing::span("serialize");
     // Computed before the struct consumes the fields it reads.
     let verdict = classify(rep.first_error.as_deref(), rep.cause.as_ref());
-    Conversion {
+    let c = Conversion {
         subresources,
         html: dom.serialize(),
         html_tier1,
-        engine: engine.name(),
+        scripts_held,
+        engine: engine.map(|e| e.name()).unwrap_or("none"),
         elements_before: before,
         text_before,
         origin_refusal,
@@ -270,7 +313,7 @@ pub fn convert_with_opts(
         explore_stats: rep.explore_stats,
         elements_after: dom.element_count(),
         depth_after: dom.max_depth(),
-        scripts_total: scripts.len(),
+        scripts_total: scripts.len() + held,
         external_total: ext_total,
         external_fetched: ext_ok,
         external_failed: ext_fail,
@@ -305,7 +348,9 @@ pub fn convert_with_opts(
         cause: rep.cause,
         nulls: rep.nulls,
         errors: rep.errors,
-    }
+    };
+    drop(serialize_span);
+    c
 }
 
 /// Resolve a `src` against the document base. Absolute URLs pass through;
@@ -462,6 +507,9 @@ impl Default for TierPolicy {
 
 impl TierPolicy {
     pub fn decide(&self, c: &Conversion) -> TierDecision {
+        if c.scripts_held {
+            return TierDecision { tier: Tier::One, reason: "first display: scripts not run yet" };
+        }
         if c.scripts_total == 0 {
             return TierDecision { tier: Tier::One, reason: "no scripts to run" };
         }

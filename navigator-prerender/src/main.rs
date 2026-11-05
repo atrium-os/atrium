@@ -248,6 +248,7 @@ fn run_one(file: &str, base: Option<&str>, net: bool) -> ! {
         eprintln!("{}", c.html);
     }
     print!("{}", report(&c, fetchd.as_ref().map(|f| { let f = f.0.borrow(); (f.requests, f.bytes_fetched()) })));
+    println!("{}", navigator_prerender::timing::report_line());
     std::process::exit(0);
 }
 
@@ -743,6 +744,9 @@ struct Driver {
     same_site: bool,
     protect: bool,
     dump: bool,
+    /// `PRERENDER_TIER1=1`: convert without running scripts (the tier-1,
+    /// first-display conversion; legacy-web §5.4.5.7).
+    tier1: bool,
     emit_dir: Option<PathBuf>,
     blob_dir: Option<PathBuf>,
     mem_mb: u64,
@@ -766,6 +770,7 @@ impl Driver {
             same_site: on("PRERENDER_SAME_SITE"),
             protect: on("PRERENDER_PROTECT"),
             dump: on("PRERENDER_DUMP"),
+            tier1: on("PRERENDER_TIER1"),
             emit_dir: std::env::var_os("PRERENDER_EMIT_DIR").map(PathBuf::from),
             blob_dir: std::env::var_os("PRERENDER_BLOB_DIR").map(PathBuf::from),
             mem_mb: std::env::var("PRERENDER_MEM_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(4096),
@@ -833,7 +838,7 @@ fn convert_in_child(
         base: (!base.is_empty()).then(|| base.to_string()),
         net, explore: d.explore, same_site: d.same_site, protect: d.protect,
         emit: d.emit_dir.is_some(), blobs: d.blob_dir.is_some(), require_confined: d.require,
-        deadline_s: deadline.as_secs().max(1), mem_mb: d.mem_mb, len: doc.len(),
+        deadline_s: deadline.as_secs().max(1), mem_mb: d.mem_mb, scripts: !d.tier1, len: doc.len(),
     };
     let header = job.header()?;
     let instance = format!("{}{:05}", std::process::id(), INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
@@ -858,7 +863,7 @@ fn convert_in_child(
     let budget_limit = d.fetch_budget;
     let budget = Arc::new(Mutex::new(navigator_prerender::fetch::FetchBudget::new(budget_limit)));
     let budget_d = budget.clone();
-    let drive_t = std::thread::spawn(move || -> Result<serve::Outcome, String> {
+    let drive_t = std::thread::spawn(move || -> Result<(serve::Outcome, Vec<navigator_prerender::fetch::CurlTiming>, std::time::Duration), String> {
         {
             let mut g = stdin_d.lock().unwrap();
             let w = g.as_mut().expect("open");
@@ -879,6 +884,7 @@ fn convert_in_child(
         let mut out = std::io::BufReader::new(stdout);
         // ★ The per-conversion byte budget is applied HERE, in the relay,
         // where the converter cannot reach it.
+        let relay_start = std::time::Instant::now();
         let r = serve::drive(&mut out, &stdin_d, &mut |u| {
             budget_d.lock().unwrap().admit(u, |u| up.reply(u)).to_frame()
         }, &mut |addr, bytes| {
@@ -891,7 +897,8 @@ fn convert_in_child(
         // asked to exit, never killed while it still could.
         drop(stdin_d.lock().unwrap().take());
         let _ = emit;
-        r
+        let log = match &up { Upstream::Curl(h) => h.log.clone(), _ => vec![] };
+        r.map(|o| (o, log, relay_start.elapsed()))
     });
 
     let status = loop {
@@ -916,7 +923,8 @@ fn convert_in_child(
     let stderr = err_t.join().unwrap_or_default();
     let stderr = String::from_utf8_lossy(&stderr);
     let Some(status) = status else { return Err(format!("timed out at {}s (child killed)", deadline.as_secs())) };
-    let o = outcome.map_err(|e| format!("converter protocol: {e}"))?;
+    let (o, curl_log, _relay_wall) = outcome.map_err(|e| format!("converter protocol: {e}"))?;
+    let child_wall = start.elapsed();
     if o.timed_out { return Err(format!("timed out at {}s", deadline.as_secs())) }
     if !o.ended { return Err(crash_reason(start.elapsed().as_secs_f64(), &status.to_string(), &stderr)) }
     if d.dump { eprint!("{stderr}") }
@@ -946,6 +954,22 @@ fn convert_in_child(
             eprintln!("coverage: cannot write {}: {e}", std::path::Path::new(&path).display());
         }
     }
+    // PRERENDER_TIMING=<file>: one line per document (legacy-web §5.4.5.7):
+    // the child's phase breakdown, the relay's view of each fetch, and the
+    // display path — normalize and render of the recording, as a reader's
+    // first frame needs them.
+    if let Some(path) = std::env::var_os("PRERENDER_TIMING") {
+        let name = file.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let mut line = format!("{name}\tchild_wall={:.1}", child_wall.as_secs_f64() * 1e3);
+        if let Some(tm) = o.report.lines().find(|l| l.starts_with("TM\t")) { line.push('\t'); line.push_str(&tm[3..]) }
+        line.push_str(&relay_summary(&curl_log));
+        if let Some(rec) = &o.recording { line.push_str(&display_cost(rec)) }
+        line.push('\n');
+        use std::io::Write;
+        if let Err(e) = fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut f| f.write_all(line.as_bytes())) {
+            eprintln!("timing: cannot write {}: {e}", std::path::Path::new(&path).display());
+        }
+    }
     let mut c = parse_child(&o.report).ok_or_else(|| crash_reason(start.elapsed().as_secs_f64(), &status.to_string(), &stderr))?;
     c.wall_ms = start.elapsed().as_secs_f64() * 1000.0;
     {
@@ -954,6 +978,56 @@ fn convert_in_child(
         c.fetch_budget_refusal = b.reason();
     }
     Ok(c)
+}
+
+/// The relay's view of one conversion's fetches (curl's own timings): how
+/// many went to the network, how many hosts they named, and what connection
+/// setup cost. ★ Every network fetch is its own connection today, so
+/// `setup_repeat` — DNS+TCP+TLS spent on a host already connected to in
+/// this conversion — is what connection reuse would save.
+fn relay_summary(log: &[navigator_prerender::fetch::CurlTiming]) -> String {
+    let net: Vec<_> = log.iter().filter(|t| !t.cached).collect();
+    let host = |u: &str| url::Url::parse(u).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+    let mut seen = std::collections::HashSet::new();
+    let (mut setup, mut repeat, mut tls, mut ttfb, mut total, mut bytes) = (0f64, 0f64, 0f64, 0f64, 0f64, 0u64);
+    for t in &net {
+        let s = if t.tls > 0.0 { t.tls } else { t.connect };
+        setup += s; tls += (t.tls - t.connect).max(0.0); ttfb += t.ttfb; total += t.total; bytes += t.bytes;
+        if !seen.insert(host(&t.url)) { repeat += s }
+    }
+    format!("\trelay_requests={}\trelay_cached={}\trelay_net={}\trelay_failed={}\trelay_hosts={}\trelay_bytes={bytes}\
+             \trelay_setup={:.1}\trelay_tls={:.1}\trelay_setup_repeat={:.1}\trelay_ttfb={:.1}\trelay_total={:.1}",
+        log.len(), log.len() - net.len(), net.len(), net.iter().filter(|t| !t.ok).count(), seen.len(),
+        setup * 1e3, tls * 1e3, repeat * 1e3, ttfb * 1e3, total * 1e3)
+}
+
+/// The display path for one recording, timed: parse it, normalize, render
+/// to a scene at the lane's reading width (800 px), as the document worker
+/// and renderer do before a first frame. Fonts are loaded once per process
+/// and that cost is reported separately (`fonts_load`).
+fn display_cost(rec: &[u8]) -> String {
+    thread_local! { static FONTS: std::cell::OnceCell<(Result<navigator_render::fontset::FontSet, String>, f64)> = const { std::cell::OnceCell::new() }; }
+    FONTS.with(|f| {
+        let (fonts, load_ms) = f.get_or_init(|| {
+            let t = std::time::Instant::now();
+            let r = navigator_render::fontset::FontSet::load();
+            (r, t.elapsed().as_secs_f64() * 1e3)
+        });
+        let Ok(fonts) = fonts else { return "\tdisplay=no-fonts".into() };
+        let json = String::from_utf8_lossy(rec);
+        let t0 = std::time::Instant::now();
+        let r = match navigator_normalize::recording::parse(&json) { Ok(r) => r, Err(_) => return "\tdisplay=unparsed".into() };
+        let t1 = std::time::Instant::now();
+        let env = navigator_style::cascade::Env::default();
+        let (normalized, _) = navigator_normalize::normalize_and_measure(&r.document, &r.inputs, fonts, &env);
+        let t2 = std::time::Instant::now();
+        let subs = navigator_render::conformance::subresources_from_recording_json(&json);
+        let o = navigator_render::html::render_html_with(&normalized, fonts, &env, &subs);
+        let t3 = std::time::Instant::now();
+        let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
+        format!("\tdisplay_ingest={:.1}\tdisplay_normalize={:.1}\tdisplay_render={:.1}\tdisplay_width={}\tdisplay_runs={}\tdisplay_height={}\tfonts_load={load_ms:.1}\trecording_bytes={}",
+            ms(t0, t1), ms(t1, t2), ms(t2, t3), env.width_px, o.scene.runs.len(), o.scene.height / 64, rec.len())
+    })
 }
 
 /// The jail entry: one conversion over stdin/stdout (src/serve.rs). No
@@ -1007,7 +1081,11 @@ fn serve() -> ! {
         no_scroll_sweep: std::env::var("PRERENDER_SCROLL").ok().as_deref() == Some("0"),
         ..Default::default()
     };
-    let c = navigator_prerender::convert_with_opts(&src, job.base.as_deref(), &mut eng, fetcher, job.protect);
+    let c = if job.scripts {
+        navigator_prerender::convert_with_opts(&src, job.base.as_deref(), &mut eng, fetcher, job.protect)
+    } else {
+        navigator_prerender::convert_tier1(&src, job.base.as_deref(), fetcher)
+    };
     let rep = report(&c, relay.as_ref().map(|f| { let f = f.0.borrow(); (f.requests, f.bytes_fetched()) }));
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(rep.as_bytes());
@@ -1022,11 +1100,16 @@ fn serve() -> ! {
         if let Some(why) = c.origin_refusal {
             eprintln!("emit: refused by origin ({why}); no recording written");
         } else {
-            let json = navigator_prerender::artifact::emit(job.base.as_deref(), &c, &navigator_prerender::TierPolicy::default());
+            let json = {
+                let _s = navigator_prerender::timing::span("emit");
+                navigator_prerender::artifact::emit(job.base.as_deref(), &c, &navigator_prerender::TierPolicy::default())
+            };
             let _ = write!(out, "RECORDING {}\n", json.len());
             let _ = out.write_all(json.as_bytes());
         }
     }
+    // Where this conversion's time went (§5.4.5.7): observation only.
+    let _ = writeln!(out, "{}", navigator_prerender::timing::report_line());
     let _ = out.write_all(b"END\n");
     let _ = out.flush();
     std::process::exit(0)

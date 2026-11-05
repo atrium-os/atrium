@@ -133,8 +133,13 @@ pub fn subresource_files(fixture: &Path) -> std::collections::BTreeMap<String, s
 /// the normalizer read, for the other half of the job: it needed the SIZE to
 /// lay out, this needs the ADDRESS to paint.
 pub fn subresources_from_recording(path: &std::path::Path) -> crate::Subresources {
+    let Ok(json) = std::fs::read_to_string(path) else { return crate::Subresources::new() };
+    subresources_from_recording_json(&json)
+}
+
+/// `subresources_from_recording`, from the recording's text.
+pub fn subresources_from_recording_json(json: &str) -> crate::Subresources {
     let mut out = crate::Subresources::new();
-    let Ok(json) = std::fs::read_to_string(path) else { return out };
     // One object per line-ish: the emitter writes them one per line.
     for line in json.lines() {
         let line = line.trim();
