@@ -38,7 +38,10 @@ fn locate_cdylib() -> Option<PathBuf> {
     };
     let mut dirs = Vec::new();
     let mut p = here.clone();
-    p.pop(); p.pop();
+    p.pop();
+    // A plain `cargo test` leaves the cdylib only in deps/, next to us.
+    dirs.push(p.clone());
+    p.pop();
     dirs.push(p);
     let target = std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
