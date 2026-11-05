@@ -76,8 +76,8 @@ pub(crate) struct Label(pub u32);
 pub(crate) enum Base {
     V(VReg),
     Locals,
-    /// The helper-call area: a 16-byte out buffer at offset 0 that
-    /// runtime helpers read or write, then the argument staging.
+    /// The helper-call area: a 16-byte out buffer that runtime helpers
+    /// read or write.
     Helper,
 }
 
@@ -220,10 +220,9 @@ pub(crate) enum CArg {
     OutBuf,
 }
 
-/// Bytes of helper area a call with `n` arguments needs: the out buffer,
-/// one staging qword per argument, and one for the function pointer.
-pub(crate) fn helper_area_bytes(n: usize) -> u32 {
-    16 + 8 * (n as u32 + 1)
+/// Bytes of helper area a call with `n` arguments needs: the out buffer.
+pub(crate) fn helper_area_bytes(_n: usize) -> u32 {
+    16
 }
 
 #[derive(Clone, Debug)]

@@ -992,61 +992,105 @@ impl<'a> Emit<'a> {
 
     /// d = old *addr; *addr = op(old, v). Add and exchange have single
     /// instructions; the rest are a `lock cmpxchg` loop.
-    /// A helper call. Every argument is first staged in the helper area,
-    /// using only scratch registers, and then loaded into its ABI
-    /// register, so no argument register is overwritten while another
-    /// argument still needs it. The function pointer goes last, in rax.
+    /// A helper call. The table pointer goes to rax and the function
+    /// pointer to r11 first (neither is an argument register); then the
+    /// register-held arguments move into their ABI registers as one
+    /// parallel move (cycles broken with xchg, or xmm14 for XMM); then the
+    /// rest load from memory or immediates, which read no argument
+    /// register; then `call r11`.
     fn call_helper(&mut self, table: VReg, fn_off: i32, args: &[CArg], ret: Option<VReg>) -> Result<(), BackendError> {
         const INT_ARGS: [u8; 6] = [gpr::RDI, gpr::RSI, gpr::RDX, gpr::RCX, gpr::R8, gpr::R9];
-        let helper = self.helper;
-        let stage = move |k: usize| qword_ptr(rsp + (helper + 16 + 8 * k as i32));
-        let fn_slot = stage(args.len());
-        for (k, a) in args.iter().enumerate() {
-            match *a {
-                CArg::V(v) => match self.loc(v) {
-                    Loc::Reg(PReg::G(r)) => self.a.mov(stage(k), G64[r as usize]).map_err(enc)?,
-                    Loc::Reg(PReg::X(r)) => self.a.vmovss(dword_ptr(rsp + (helper + 16 + 8 * k as i32)), XMM[r as usize]).map_err(enc)?,
-                    Loc::Slot(sl) => {
-                        // G values keep their upper half zero in the slot
-                        // too, so a 64-bit copy is right for every class.
-                        self.a.mov(rax, qword_ptr(rsp + 16 * sl as i32)).map_err(enc)?;
-                        self.a.mov(stage(k), rax).map_err(enc)?;
-                    }
-                },
-                CArg::TableLoad(off) => {
-                    let t = self.g64(table)?;
-                    self.a.mov(rax, qword_ptr(t + off)).map_err(enc)?;
-                    self.a.mov(stage(k), rax).map_err(enc)?;
-                }
-                CArg::Imm(_) | CArg::OutBuf => {}
-            }
-        }
-        let t = self.g64(table)?;
-        self.a.mov(rax, qword_ptr(t + fn_off)).map_err(enc)?;
-        self.a.mov(fn_slot, rax).map_err(enc)?;
+        // Destination of each argument: (is_xmm, register number).
         let (mut ni, mut nx) = (0usize, 0usize);
-        for (k, a) in args.iter().enumerate() {
+        let mut dst = Vec::with_capacity(args.len());
+        for a in args {
             if matches!(*a, CArg::V(v) if self.is_x_vreg(v)) {
                 if nx == 8 {
                     return Err(BackendError::Unsupported("helper call with more than 8 float arguments".into()));
                 }
-                self.a.vmovss(XMM[nx], dword_ptr(rsp + (helper + 16 + 8 * k as i32))).map_err(enc)?;
+                dst.push((true, nx as u8));
                 nx += 1;
-                continue;
-            }
-            let Some(&n) = INT_ARGS.get(ni) else {
-                return Err(BackendError::Unsupported("helper call with more than 6 integer arguments".into()));
-            };
-            ni += 1;
-            let r = G64[n as usize];
-            match *a {
-                CArg::Imm(imm) => self.a.mov(G32[n as usize], imm).map_err(enc)?,
-                CArg::OutBuf => self.a.lea(r, qword_ptr(rsp + self.helper)).map_err(enc)?,
-                _ => self.a.mov(r, stage(k)).map_err(enc)?,
+            } else {
+                let Some(&n) = INT_ARGS.get(ni) else {
+                    return Err(BackendError::Unsupported("helper call with more than 6 integer arguments".into()));
+                };
+                dst.push((false, n));
+                ni += 1;
             }
         }
-        self.a.mov(rax, fn_slot).map_err(enc)?;
-        self.a.call(rax).map_err(enc)?;
+        match self.loc(table) {
+            Loc::Reg(PReg::G(r)) => self.a.mov(rax, G64[r as usize]).map_err(enc)?,
+            Loc::Slot(k) => self.a.mov(rax, qword_ptr(rsp + 16 * k as i32)).map_err(enc)?,
+            Loc::Reg(PReg::X(_)) => unreachable!(),
+        }
+        self.a.mov(r11, qword_ptr(rax + fn_off)).map_err(enc)?;
+
+        // Register-to-register moves, per file.
+        let mut gmoves: Vec<(u8, u8)> = Vec::new();
+        let mut xmoves: Vec<(u8, u8)> = Vec::new();
+        for (a, &(is_x, d)) in args.iter().zip(&dst) {
+            if let CArg::V(v) = *a {
+                match self.loc(v) {
+                    Loc::Reg(PReg::G(r)) if r != d => gmoves.push((d, r)),
+                    Loc::Reg(PReg::X(r)) if r != d && is_x => xmoves.push((d, r)),
+                    _ => {}
+                }
+            }
+        }
+        while !gmoves.is_empty() {
+            match gmoves.iter().position(|&(d, _)| !gmoves.iter().any(|&(_, s)| s == d)) {
+                Some(k) => {
+                    let (d, s) = gmoves.remove(k);
+                    self.a.mov(G64[d as usize], G64[s as usize]).map_err(enc)?;
+                }
+                None => {
+                    // A cycle: swap, then d is done and d's old value
+                    // now lives in s.
+                    let (d, s) = gmoves.remove(0);
+                    self.a.xchg(G64[d as usize], G64[s as usize]).map_err(enc)?;
+                    for m in gmoves.iter_mut() {
+                        if m.1 == d {
+                            m.1 = s;
+                        }
+                    }
+                }
+            }
+        }
+        while !xmoves.is_empty() {
+            match xmoves.iter().position(|&(d, _)| !xmoves.iter().any(|&(_, s)| s == d)) {
+                Some(k) => {
+                    let (d, s) = xmoves.remove(k);
+                    self.a.vmovaps(XMM[d as usize], XMM[s as usize]).map_err(enc)?;
+                }
+                None => {
+                    // Break the cycle through xmm14: save d's old value.
+                    let d = xmoves[0].0;
+                    self.a.vmovaps(XS0, XMM[d as usize]).map_err(enc)?;
+                    for m in xmoves.iter_mut() {
+                        if m.1 == d {
+                            m.1 = 14;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Everything else reads memory, immediates or rax only.
+        for (a, &(is_x, d)) in args.iter().zip(&dst) {
+            match *a {
+                CArg::V(v) => match self.loc(v) {
+                    Loc::Slot(k) if is_x => self.a.vmovss(XMM[d as usize], self.slot_d(k)).map_err(enc)?,
+                    // G slots may hold stale upper bytes; int arguments
+                    // only define their low 32 bits anyway.
+                    Loc::Slot(k) => self.a.mov(G64[d as usize], qword_ptr(rsp + 16 * k as i32)).map_err(enc)?,
+                    _ => {}
+                },
+                CArg::TableLoad(off) => self.a.mov(G64[d as usize], qword_ptr(rax + off)).map_err(enc)?,
+                CArg::Imm(imm) => self.a.mov(G32[d as usize], imm).map_err(enc)?,
+                CArg::OutBuf => self.a.lea(G64[d as usize], qword_ptr(rsp + self.helper)).map_err(enc)?,
+            }
+        }
+        self.a.call(r11).map_err(enc)?;
         if let Some(d) = ret {
             if self.is_x_vreg(d) {
                 self.x_fin(d, xmm0)?;

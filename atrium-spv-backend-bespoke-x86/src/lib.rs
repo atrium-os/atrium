@@ -42,7 +42,8 @@
 //! (implicit/explicit lod, array, cube, dref), gather, fetch, size queries,
 //! storage-image read/write and texel pointers, and derivatives. Image ops
 //! and derivatives are calls to the runtime's helpers through the
-//! uniforms table, staged so arguments never clobber each other.
+//! uniforms table; arguments go straight to their ABI registers as one
+//! parallel move (cycles broken with xchg or a scratch XMM).
 //!
 //! Fragment shaders in the span subset also get `atrium_fs_main_span`
 //! ([`span`]). PackHalf2x16/UnpackHalf2x16 copy Cranelift's integer sequence
