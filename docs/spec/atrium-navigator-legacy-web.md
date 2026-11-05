@@ -450,24 +450,45 @@ measure before deciding.
   so a consent choice is asked again on the next visit. That cost is deliberate: a
   persistent per-site store is a tracking store, and it needs Arca's encryption and
   clearing rules.
-- **The fetcher holds the jar.** The view's `navigator-fetchd`, jailed and with no files,
-  keeps it across that view's conversions instead of exiting after each one. The broker,
-  converter and worker never see `HttpOnly` cookies. The converter's `document.cookie`
-  gets that origin's non-`HttpOnly` cookies, and its writes go back to the jar. That is the
-  web's own contract (Arca §12, decision 4).
+- **The jar lives in Arca, as its first slice** (*decided by the user, 2026-11-05*). This is
+  a minimal `arcad` with only the web compartment: cookie records, Set-Cookie validation
+  and RFC 6265bis matching (Arca §8.1). It has no app keys, passwords or passkeys yet. It
+  starts memory-only, so it holds nothing across a restart; persistence follows once
+  Vestibulum's unlock is wired (Arca §6). No jar ever lives inside a Navigator process, so
+  the rule "secrets live in Arca" holds from the first cookie.
+- **A per-origin fetcher sends cookies.** Today one `navigator-fetchd` serves every origin
+  of a conversion. Cookied requests go through a separate fetcher for one (partition,
+  origin), which is Arca's courier (Arca §5): it receives the `Cookie` value from Arca only
+  after TLS, hands back `Set-Cookie` as structured records, and never follows a redirect
+  to another origin. Anonymous fetches keep today's path.
+- **The broker issues tickets** (Arca §8.2) naming the reason, the SameSite context and the
+  gesture. Converters never hold one.
+- **Which fetches carry cookies:** the main document and the page's same-origin GETs in a
+  cookied view. Never §5.4.1d's cross-origin stylesheets and fonts, and no hints, prefetches
+  or image-header peeks until a ticket covers them.
+- **Credentialed conversions are keyed by URL plus a jar version.** A change in the jar,
+  such as a consent being accepted, makes a fresh conversion. Progressive delivery (first
+  display, images, the scripted version) works unchanged. Clearing a site deletes its
+  conversions.
+- **Script cookies.** The converter's `document.cookie` gets that origin's non-`HttpOnly`
+  cookies, which is the web's own contract (Arca §12, decision 4). Writes made during
+  exploration go to a scratch copy and are dropped. Only the transition the reader actually
+  takes writes to Arca, so exploration clicks never change the reader's real session.
+- **Expiry uses Arca's clock, never the converter's** (threat model §2.6). Limits and
+  eviction are Arca's.
+- **The reader sees it.** The trusted UI marks a cookied view and offers "forget this site".
 - **Cookies go only to the page's origin.** The page network is same-origin GET (§5.4.1c),
   and §5.4.1d's cross-origin stylesheets and fonts stay cookieless. In effect, the jar
   holds one origin per view.
 - **The rules are Arca's.** Parsing, the public suffix list, `__Host-` and `__Secure-`,
-  `Secure`, `SameSite=Lax` by default and the size limits are one crate,
-  `navigator-cookie`. Arca's web profile reuses it unchanged, so nothing here is throwaway.
+  `Secure`, `SameSite=Lax` by default and the size limits are one crate inside Arca.
 - **No logins.** Form POSTs stay refused. A GET that logs the reader in (a magic link)
   produces a cookie that dies with the view and is never stored. The trusted UI shows that
   a view is cookied.
 
 **What a compromise reaches.** A compromised converter reads that view's non-`HttpOnly`
-cookies, which the site's own scripts read anyway. A compromised fetcher reads that one
-view's jar, which holds no login. That is far below Arca's bar, which is why logins still
+cookies, which the site's own scripts read anyway. A compromised per-origin fetcher reads
+one origin's cookies for one request, and they hold no login. That is far below Arca's bar, which is why logins still
 wait for Arca.
 
 **The measurement to run first (both corpora, offline replay where possible):**
@@ -480,8 +501,17 @@ wait for Arca.
 | what sharing it costs | the share of views that turn cookied, and so become private |
 | what it must not change | documents with no cookie check stay byte-identical with the jar on; challenge pages stay REFUSED-BY-ORIGIN |
 
-If the jar rescues only a handful of documents, it waits for Arca, as same-site did in
-§5.4.1c.
+If the jar rescues only a handful of documents, the Navigator side waits, as same-site did
+in §5.4.1c. Arca's cookie slice is built either way, because logins need it.
+
+**Build order:**
+1. the measurement above;
+2. the per-origin fetcher;
+3. the minimal `arcad` jar;
+4. tickets from the broker;
+5. credentialed conversions;
+6. `document.cookie`;
+7. the reader-facing UI.
 
 ### 5.4.2 Never emit an artifact worse than the input
 
