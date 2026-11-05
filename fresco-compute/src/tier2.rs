@@ -69,7 +69,13 @@ impl Tier2 {
     #[cfg(feature = "cranelift")]
     pub fn seed_cache(cache_root: &std::path::Path) -> io::Result<()> {
         use atrium_spv_backend_cranelift::{compile_blob, Target};
-        let dir = cache_root.join(format!("v{}", atrium_spv_ir::TIER2_SHADER_ABI_VERSION));
+        // Where the loader looks: `<root>/v{N}/<arch>/` (ShaderCache::version_dir).
+        let dir = ShaderCache::new(LoaderConfig {
+            cache_root: cache_root.to_path_buf(),
+            abi_version: atrium_spv_ir::TIER2_SHADER_ABI_VERSION,
+            compile_binary: PathBuf::new(),
+        })
+        .version_dir();
         std::fs::create_dir_all(&dir)?;
         for (name, spv) in [("bin", BIN_SPV), ("raster", RASTER_SPV), ("compose", crate::compose::COMPOSE_SPV)] {
             let hash = ShaderCache::hash(spv);

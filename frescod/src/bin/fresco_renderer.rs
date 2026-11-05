@@ -17,8 +17,17 @@
 //!   two frame slots per window and the size it decided; the renderer packs
 //!   each window's scene into a free slot and says `FRAME_READY`.
 //!
-//! It reads no arguments or environment beyond `RUST_LOG`, writes only
-//! stderr, and exits when either the client or the broker goes.
+//! - In pixel mode (`CLIENT.pixels`, frescod's compute renderer) it also
+//!   rasters each window with the Tier-2 kernels and sends the pixels, so
+//!   a hostile scene is rastered here, in this client's jail, never in
+//!   frescod. The kernels come precompiled with the bundle
+//!   (`/usr/local/share/fresco-kernels`, made by `--seed-kernels`), or are
+//!   compiled into `/tmp` on start.
+//!
+//! It reads no environment beyond `RUST_LOG` and `FRESCO_COMPUTE_CACHE`,
+//! writes only stderr, and exits when either the client or the broker goes.
+//! `fresco-renderer --seed-kernels <dir>` compiles the kernels into `dir`
+//! and exits (bundle build time).
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -70,18 +79,68 @@ struct State {
     wins: HashMap<u32, Win>,
 }
 
+/// Where the bundle carries the precompiled kernels.
+const BUNDLED_KERNELS: &str = "/usr/local/share/fresco-kernels";
+
+/// The Tier-2 kernels, for pixel mode.
+fn kernels() -> Result<fresco_compute::tier2::Tier2, String> {
+    let dir = match std::env::var_os("FRESCO_COMPUTE_CACHE") {
+        Some(d) => std::path::PathBuf::from(d),
+        None if std::path::Path::new(BUNDLED_KERNELS).is_dir() => BUNDLED_KERNELS.into(),
+        None => {
+            let d = std::path::PathBuf::from("/tmp/fresco-kernels");
+            #[cfg(feature = "cranelift")]
+            fresco_compute::tier2::Tier2::seed_cache(&d).map_err(|e| format!("compile the kernels: {e}"))?;
+            d
+        }
+    };
+    let compiler = atrium_spv_loader::LoaderConfig::production().compile_binary;
+    fresco_compute::tier2::Tier2::new(dir.clone(), compiler).map_err(|e| format!("kernels in {}: {e}", dir.display()))
+}
+
 fn main() {
     let _ = env_logger::try_init();
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--seed-kernels") {
+        #[cfg(feature = "cranelift")]
+        {
+            let Some(d) = args.get(2) else { eprintln!("usage: fresco-renderer --seed-kernels <dir>"); std::process::exit(2) };
+            if let Err(e) = fresco_compute::tier2::Tier2::seed_cache(std::path::Path::new(d)) {
+                eprintln!("fresco-renderer: {e}");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
+        #[cfg(not(feature = "cranelift"))]
+        {
+            eprintln!("fresco-renderer: built without the cranelift feature");
+            std::process::exit(1);
+        }
+    }
     // SAFETY: stdin is the broker channel; nothing else here owns it.
     let broker = Arc::new(Chan::from_fd(unsafe { OwnedFd::from_raw_fd(BROKER_FD) }));
-    let (client, (sw, sh, refresh)) = match broker.recv() {
-        Ok(Recv::Msg(Msg::Client { width, height, refresh_mhz }, fds)) if fds.len() == 1 => {
-            (UnixStream::from(fds.into_iter().next().unwrap()), (width, height, refresh_mhz))
+    let (client, (sw, sh, refresh), pixels) = match broker.recv() {
+        Ok(Recv::Msg(Msg::Client { width, height, refresh_mhz, pixels }, fds)) if fds.len() == 1 => {
+            (UnixStream::from(fds.into_iter().next().unwrap()), (width, height, refresh_mhz), pixels)
         }
         _ => {
             log::warn!("fresco-renderer: the first record was not CLIENT with one fd");
             std::process::exit(1);
         }
+    };
+
+    // Pixel mode: no kernels, no service (frescod then has no window to
+    // show for this client, rather than one rastered outside the jail).
+    let t2 = if pixels {
+        match kernels() {
+            Ok(k) => Some(k),
+            Err(e) => {
+                log::error!("fresco-renderer: pixel mode: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
     };
 
     let cas = Arc::new(Mutex::new(CasStore::new()));
@@ -136,7 +195,7 @@ fn main() {
             tex_gen += 1;
         }
         declare(&broker, &state, &comp, (sw, sh));
-        draw(&broker, &state, &frontend, &scene_state, tex_gen);
+        draw(&broker, &state, &frontend, &scene_state, tex_gen, t2.as_ref());
     }
 }
 
@@ -199,7 +258,7 @@ fn declare(broker: &Chan, state: &Mutex<State>, comp: &Mutex<Compositor>, screen
 }
 
 /// Pack every window whose scene changed into a free slot.
-fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene: &pack::SceneState, tex_gen: u64) {
+fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene: &pack::SceneState, tex_gen: u64, t2: Option<&fresco_compute::tier2::Tier2>) {
     let mut s = state.lock().unwrap();
     for (&id, w) in s.wins.iter_mut() {
         let (Some(slots), Some((width, height))) = (&mut w.slots, w.size) else { continue };
@@ -219,8 +278,19 @@ fn draw(broker: &Chan, state: &Mutex<State>, fe: &Mutex<EnvelopeFrontend>, scene
             continue;
         }
         let Some(i) = (0..2).find(|&i| !w.busy[i]) else { continue }; // FRAME_DONE wakes us
+        log::debug!("fresco-renderer: window {id}: drawing {width}x{height} into slot {i}");
         w.seq = w.seq.wrapping_add(1);
-        if let Err(e) = slot::write(slots[i].as_mut_slice(), &frame, w.seq) {
+        let written = match t2 {
+            // Pixel mode: raster here, send the pixels.
+            Some(t2) => {
+                let mut px = vec![0u32; width as usize * height as usize];
+                t2.render(&frame, &mut px)
+                    .map_err(|e| e.to_string())
+                    .and_then(|_| slot::write_pixels(slots[i].as_mut_slice(), width, height, &px, w.seq).map_err(str::to_string))
+            }
+            None => slot::write(slots[i].as_mut_slice(), &frame, w.seq).map_err(str::to_string),
+        };
+        if let Err(e) = written {
             log::warn!("fresco-renderer: window {id}: {e}; not drawn");
             w.sig = Some(sig);
             continue;

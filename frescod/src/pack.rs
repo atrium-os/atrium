@@ -22,10 +22,32 @@ pub struct WindowFrame {
     /// Already packed (by a window renderer, F4b): the nodes are empty and
     /// this frame, for a surface of its own size, is used as is.
     pub frame: Option<std::sync::Arc<fresco_compute::Frame>>,
+    /// Already drawn (by a window renderer in pixel mode): `size` pixels,
+    /// composed as they are.
+    pub pixels: Option<std::sync::Arc<Pixels>>,
     pub rects: Vec<SceneNode>,
     pub paths: Vec<PathNode>,
     pub batches: Vec<TextureBatch>,
     pub glyph_batches: Vec<GlyphRunBatch>,
+}
+
+/// A window's finished pixels, BGRA8, `width * height` words.
+pub struct Pixels {
+    /// Unique per drawing, so a consumer can tell a new one from one it has.
+    pub gen: u64,
+    pub width: u32,
+    pub height: u32,
+    pub px: Vec<u32>,
+}
+
+impl Pixels {
+    /// The alpha of pixel (x, y), 0 outside.
+    pub fn alpha_at(&self, x: u32, y: u32) -> u8 {
+        if x >= self.width || y >= self.height {
+            return 0;
+        }
+        (self.px[(y * self.width + x) as usize] >> 24) as u8
+    }
 }
 
 /// One frame's input, as frescod's `render_one_frame` assembles it: the

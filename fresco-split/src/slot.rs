@@ -11,6 +11,12 @@
 //! The broker allocates the slots, so it knows their size; it copies the
 //! used bytes out first and only then parses that copy ([`read`]). The lut
 //! is never read from the slot: the broker uses its own.
+//!
+//! In pixel mode (`CLIENT.pixels`, the compute renderer) a slot holds the
+//! window's finished pixels instead: a 32-byte [`SlotHeader`]-sized header
+//! (magic `FRP1`, seq, width, height, zeros), then `width * height` BGRA8
+//! words ([`write_pixels`], [`read_pixels`]). Any bytes are valid pixels, so
+//! the broker checks only the header against the size it decided.
 
 use fresco_compute::{bytes_of, lut, Frame, Header, Op};
 
@@ -129,4 +135,50 @@ pub fn read(slot: &[u8], width: u32, height: u32) -> Result<(u32, Frame), String
     let frame = Frame { header, ops, tex, texels, lut: lut() };
     frame.validate((width * height) as usize).map_err(|e| format!("frame slot: {e}"))?;
     Ok((seq, frame))
+}
+
+pub const PIXELS_MAGIC: u32 = u32::from_le_bytes(*b"FRP1");
+
+/// Bytes a pixel slot for a `width` x `height` window needs.
+pub fn pixel_slot_bytes(width: u32, height: u32) -> usize {
+    SLOT_HDR + width as usize * height as usize * 4
+}
+
+/// Write a window's pixels (`width * height` words) into `slot`. Renderer side.
+pub fn write_pixels(slot: &mut [u8], width: u32, height: u32, px: &[u32], seq: u32) -> Result<(), &'static str> {
+    let n = width as usize * height as usize;
+    if px.len() != n || pixel_slot_bytes(width, height) > slot.len() {
+        return Err("pixels larger than the slot");
+    }
+    let hdr = [PIXELS_MAGIC, seq, width, height, 0, 0, 0, 0];
+    slot[..SLOT_HDR].copy_from_slice(&bytes_of(&hdr));
+    slot[SLOT_HDR..SLOT_HDR + n * 4].copy_from_slice(&bytes_of(px));
+    Ok(())
+}
+
+/// Copy a window's pixels out of `slot`. Broker side: read once, into broker
+/// memory; the header must name the size the broker decided.
+pub fn read_pixels(slot: &[u8], width: u32, height: u32) -> Result<(u32, Vec<u32>), String> {
+    let bad = |m: &str| Err(format!("pixel slot: {m}"));
+    let n = width as usize * height as usize;
+    if slot.len() < pixel_slot_bytes(width, height) {
+        return bad("slot smaller than the window");
+    }
+    let mut hdr = [0u8; SLOT_HDR];
+    hdr.copy_from_slice(&slot[..SLOT_HDR]);
+    let w: Vec<u32> = words(&hdr).collect();
+    if w[0] != PIXELS_MAGIC {
+        return bad("magic");
+    }
+    if w[2] != width || w[3] != height {
+        return bad("not the size the broker gave the window");
+    }
+    if w[4..].iter().any(|&x| x != 0) {
+        return bad("reserved words");
+    }
+    let mut px = vec![0u32; n];
+    for (d, c) in px.iter_mut().zip(slot[SLOT_HDR..SLOT_HDR + n * 4].chunks_exact(4)) {
+        *d = u32::from_le_bytes(c.try_into().unwrap());
+    }
+    Ok((w[1], px))
 }

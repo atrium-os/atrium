@@ -140,7 +140,20 @@ Still open:
 - Ordering: one submission per drawn window in its VM, each signalling that window's syncobj, then compose. The driver starts another VM's work on a queue only once the queue is idle, so compose sees every raster; if that wait times out (EBUSY), frescod waits on the windows' syncobjs and submits again.
 - A window that is resized or new gets a fresh VM and surface; a closed window's VM goes with it.
 - Verified on gpusim 354fffb with the ABI rev 4 driver: three windows draw (`frescod-f4e-per-window-vms.png`). With `FRESCOD_GPU_ISOLATION_PROBE=1`, windows 2 and 3 raster to the address window 1's surface has in frescod's VM: both fault (EIO, `isolation.vm_faults` 2), and window 1 is drawn intact (`frescod-f4e-isolation-probe.png`). In the one-VM design that write would have landed in window 1.
-- Not covered: the compute (Tier-2) renderer runs all windows in frescod's address space on the CPU; its protection is F2's bounds checks.
+- The compute (Tier-2) renderer gets the same protection another way: F4g.
+
+### F4g. Compute renderer: renderers raster their own windows. Done (2026-11-05)
+
+The CPU counterpart of F4e. With the compute renderer (the default), frescod never rasters a client's scene; each client's jailed renderer does.
+
+- frescod tells the renderer in `CLIENT` (`pixels`, a new word) to raster. The renderer packs its window as before, runs `bin` and `raster` with the Tier-2 kernels inside its jail, and writes the finished pixels to its slot (`FRP1`: magic, seq, width, height, reserved zeros, then `width * height` words).
+- frescod checks only the header (magic, the size it gave the window, the reserved words) and copies the pixels out once (`slot::read_pixels`). Any pixel value is fine to compose. Compose and hit-testing (F4c′, from the pixels' alpha) run in frescod, as do the background and the trusted chrome (F4d), which are frescod's own.
+- Slots are sized to the window (`pixel_slot_bytes`); when the WM makes a window bigger, frescod sends new slots before the new size.
+- The kernels come compiled with the bundle: `scripts/fresco-renderer-bundle.sh` runs `fresco-renderer --seed-kernels` into `usr/local/share/fresco-kernels`, so the jail neither compiles nor writes code. A renderer with no kernels in pixel mode exits, and the client gets no window, never one rastered in frescod.
+- So a frame that found a bug in the kernels (F2's bounds checks are the other line) would hit only its own renderer's memory, which holds only its own client's windows; the 512 MiB cap covers the extra raster memory.
+- `FRESCOD_SPLIT_PIXELS=0` sends frames to frescod again (as before F4g). The gpu renderer keeps taking frames: F4e confines its raster per window on the GPU.
+- Fixed on the way: `Tier2::seed_cache` wrote kernels where the loader no longer looked (`v4/` instead of `v4/<arch>/`, since `affaa3e`), and frescod as `_frescod` could not write the system shader cache. frescod now uses `FRESCO_COMPUTE_CACHE`, else the system cache if writable, else a private 0700 directory of its own in the temp dir.
+- Verified in the amd64 VM: frescod as `_frescod`, renderers jailed by portcullisd as `_fresco-render`, `atrium-surfaces-demo` drawn from the renderers' pixels (`frescod-f4g-pixel-mode.png`, the same picture as with frames). `fresco-split-fuzz.sh` passes in both modes (90 s each): hostile renderers write pixels of any value and size, frames where pixels belong, and bytes (`FUZZ_PIXELS=0` fuzzes the frame parser as before).
 
 ### F4f. Secure input for passwords (waits on F5 and Navigator C0)
 
@@ -149,7 +162,7 @@ Still open:
 
 ## Order
 
-F4b, then F4c (and F4c′), then F4d. F4f follows once F5 and the vault exist. F4e is done.
+F4b, then F4c (and F4c′), then F4d. F4f follows once F5 and the vault exist. F4e and F4g are done.
 
 ## Decisions taken (recommended; say if you want otherwise)
 

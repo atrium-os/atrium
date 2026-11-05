@@ -161,7 +161,7 @@ fn main() -> std::io::Result<()> {
      * input, compositor events) and consumed by the display loop so it
      * recomposes on change instead of spinning at TARGET_FPS. */
     let redraw = redraw::RedrawSignal::new();
-    let split = split::Broker::from_env(comp.clone(), redraw.clone(), (mode.width, mode.height, mode.refresh_mhz), renderer.takes_frames());
+    let split = split::Broker::from_env(comp.clone(), redraw.clone(), (mode.width, mode.height, mode.refresh_mhz), renderer.takes_frames(), renderer.wants_pixels());
 
     let event_subs = socket_server::spawn(
         socket_server::Shared {
@@ -328,7 +328,7 @@ fn run_headless(png: &str) -> std::io::Result<()> {
     let wm_sock = Some(std::env::var("FRESCOD_WM_SOCK").map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/atrium/sockets/fresco-wm/fresco-wm.sock")));
     let redraw2 = redraw::RedrawSignal::new();
-    let split = split::Broker::from_env(comp.clone(), redraw2.clone(), (W, H, 0), renderer.takes_frames());
+    let split = split::Broker::from_env(comp.clone(), redraw2.clone(), (W, H, 0), renderer.takes_frames(), renderer.wants_pixels());
     let subs = socket_server::spawn(
         socket_server::Shared {
             frontend: frontend.clone(),
@@ -443,7 +443,15 @@ fn render_one_frame(
         for (win_id, pos, size) in &layers {
             /* A window a renderer draws (split mode) comes as its last
              * checked frame, at the size the broker gave it. */
-            if let Some(f) = split.and_then(|b| b.frame(*win_id)) {
+            if let Some(p) = split.and_then(|b| b.pixels(*win_id)) {
+                windows.push(WindowFrame {
+                    id: *win_id,
+                    pos: *pos,
+                    size: (p.width, p.height),
+                    pixels: Some(p),
+                    ..Default::default()
+                });
+            } else if let Some(f) = split.and_then(|b| b.frame(*win_id)) {
                 windows.push(WindowFrame {
                     id: *win_id,
                     pos: *pos,
@@ -478,15 +486,22 @@ fn render_one_frame(
         rects.push((c.id, [0, 0, c.size.0 as i32, c.size.1 as i32]));
         windows.push(c);
     }
+    /* A window drawn as pixels (split pixel mode) answers from them. */
+    let drawn: std::collections::HashMap<u32, Arc<pack::Pixels>> =
+        windows.iter().filter_map(|w| w.pixels.clone().map(|p| (w.id, p))).collect();
     renderer.render(ScreenInput { windows, uploads, clears })?;
     /* Each layer's alpha comes from the frame it was drawn from, so a
      * pixel a window left transparent passes the click on (F4c′). */
     let frames: std::collections::HashMap<u32, Arc<fresco_compute::Frame>> =
         renderer.frames().iter().cloned().collect();
     let shown = rects.into_iter().map(|(id, rect)| {
-        let alpha = frames.get(&id).cloned().map(|f| -> fresco_scene_server::window::AlphaProbe {
-            Arc::new(move |x, y| fresco_compute::reference::alpha_at(&f, x, y))
-        });
+        let alpha = if let Some(p) = drawn.get(&id).cloned() {
+            Some(Arc::new(move |x, y| p.alpha_at(x, y)) as fresco_scene_server::window::AlphaProbe)
+        } else {
+            frames.get(&id).cloned().map(|f| -> fresco_scene_server::window::AlphaProbe {
+                Arc::new(move |x, y| fresco_compute::reference::alpha_at(&f, x, y))
+            })
+        };
         fresco_scene_server::window::ShownLayer { id: id as u16, rect, alpha }
     }).collect();
     comp.lock().unwrap().shown = Some(shown);

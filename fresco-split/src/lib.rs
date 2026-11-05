@@ -87,7 +87,11 @@ pub enum Msg {
     /// with window 0. A renderer under `portcullis exec` holds only
     /// stdin/stdout/stderr, so the channel is its stdin and the client
     /// arrives this way.
-    Client { width: u32, height: u32, refresh_mhz: u32 },
+    /// `pixels`: draw each window's pixels yourself and send those
+    /// ([`slot::write_pixels`]) instead of the packed frame, so the raster
+    /// runs in the renderer's jail rather than in the broker (the compute
+    /// renderer's counterpart of a GPU VM per window).
+    Client { width: u32, height: u32, refresh_mhz: u32, pixels: bool },
     /// Two frame slots of `bytes` each for `window` follow as fds.
     Slots { window: u32, bytes: u32 },
     /// The broker is done with `slot`; the renderer may reuse it.
@@ -208,11 +212,12 @@ impl Msg {
                 r.put(3, *seq);
                 r
             }
-            Msg::Client { width, height, refresh_mhz } => {
+            Msg::Client { width, height, refresh_mhz, pixels } => {
                 let mut r = Rec::new(CLIENT, 0);
                 r.put(2, *width);
                 r.put(3, *height);
                 r.put(4, *refresh_mhz);
+                r.put(5, *pixels as u32);
                 r
             }
             Msg::Slots { window, bytes } => {
@@ -289,7 +294,8 @@ impl Msg {
             WINDOW_DESTROY | CLOSE => (0, false),
             FRAME_READY | GEOMETRY | MOTION | SCROLL => (2, false),
             SLOTS | FRAME_DONE | FOCUS => (1, false),
-            KEY | CLIENT => (3, false),
+            KEY => (3, false),
+            CLIENT => (4, false),
             BUTTON => (5, false),
             _ => return Err(Refused("unknown kind")),
         };
@@ -331,7 +337,7 @@ impl Msg {
             WINDOW_DESTROY => Msg::WindowDestroy { window },
             WINDOW_TITLE => Msg::WindowTitle { window, title },
             FRAME_READY => Msg::FrameReady { window, slot: slot(r.get(2))?, seq: r.get(3) },
-            CLIENT => Msg::Client { width: dim(r.get(2))?, height: dim(r.get(3))?, refresh_mhz: r.get(4) },
+            CLIENT => Msg::Client { width: dim(r.get(2))?, height: dim(r.get(3))?, refresh_mhz: r.get(4), pixels: flag(r.get(5))? },
             SLOTS => Msg::Slots { window, bytes: r.get(2) },
             FRAME_DONE => Msg::FrameDone { window, slot: slot(r.get(2))? },
             GEOMETRY => Msg::Geometry { window, width: dim(r.get(2))?, height: dim(r.get(3))? },

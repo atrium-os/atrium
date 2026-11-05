@@ -90,6 +90,11 @@ pub struct Broker {
     launch: Launch,
     /// The last good frame of every renderer-drawn window, by global id.
     frames: Mutex<HashMap<u32, Arc<fresco_compute::Frame>>>,
+    /// Pixel mode: renderers raster their own windows (in their jails) and
+    /// send pixels; the last good pixels of each window, by global id.
+    pixels: bool,
+    drawn: Mutex<HashMap<u32, Arc<crate::pack::Pixels>>>,
+    drawings: std::sync::atomic::AtomicU64,
     renderers: Mutex<HashMap<u8, Arc<Renderer>>>,
     subs: Mutex<Option<EventSubs>>,
     next_handle: std::sync::atomic::AtomicU32,
@@ -116,7 +121,7 @@ impl Broker {
     /// - `FRESCOD_RENDERER_LAUNCHER=unconfined` runs `FRESCOD_RENDERER_BIN`
     ///   (default: `fresco-renderer` beside frescod) directly, for
     ///   development only.
-    pub fn from_env(comp: Arc<Mutex<Compositor>>, redraw: Redraw, screen: (u32, u32, u32), takes_frames: bool) -> Option<Arc<Broker>> {
+    pub fn from_env(comp: Arc<Mutex<Compositor>>, redraw: Redraw, screen: (u32, u32, u32), takes_frames: bool, pixels: bool) -> Option<Arc<Broker>> {
         match std::env::var("FRESCOD_SPLIT").ok().as_deref() {
             Some("0") => {
                 eprintln!("frescod: WARNING: split mode off (FRESCOD_SPLIT=0): clients are parsed inside frescod");
@@ -164,6 +169,9 @@ impl Broker {
             screen,
             launch,
             frames: Mutex::new(HashMap::new()),
+            pixels,
+            drawn: Mutex::new(HashMap::new()),
+            drawings: std::sync::atomic::AtomicU64::new(1),
             renderers: Mutex::new(HashMap::new()),
             subs: Mutex::new(None),
             next_handle: std::sync::atomic::AtomicU32::new(1),
@@ -295,6 +303,11 @@ impl Broker {
         self.frames.lock().unwrap().get(&id).cloned()
     }
 
+    /// The last pixels a renderer drew for window `id` (pixel mode).
+    pub fn pixels(&self, id: u32) -> Option<Arc<crate::pack::Pixels>> {
+        self.drawn.lock().unwrap().get(&id).cloned()
+    }
+
     /// Tell renderers the sizes the WM gave their windows since the last
     /// frame. Called once per frame, before the windows are snapshot.
     pub fn sync(&self) {
@@ -304,21 +317,39 @@ impl Broker {
         };
         let rs: Vec<Arc<Renderer>> = self.renderers.lock().unwrap().values().cloned().collect();
         for r in rs {
-            let mut changed = Vec::new();
+            let mut changed: Vec<(Msg, Vec<std::os::fd::RawFd>)> = Vec::new();
             for (&local, w) in r.wins.lock().unwrap().iter_mut() {
                 if let Some(&s) = sizes.get(&w.global) {
                     if s != w.told {
                         w.told = s;
-                        changed.push(Msg::Geometry { window: local, width: s.0, height: s.1 });
+                        // Pixel slots hold the window's size: a bigger window
+                        // gets new ones, before the size that needs them.
+                        let bytes = self.slot_bytes(s);
+                        if bytes > w.slots[0].len() {
+                            match (Shm::create(bytes), Shm::create(bytes)) {
+                                (Ok(a), Ok(b)) => {
+                                    changed.push((Msg::Slots { window: local, bytes: bytes as u32 }, vec![a.fd(), b.fd()]));
+                                    w.slots = [a, b];
+                                }
+                                _ => log::warn!("frescod: client {}: cannot create frame slots", r.client_id),
+                            }
+                        }
+                        changed.push((Msg::Geometry { window: local, width: s.0, height: s.1 }, Vec::new()));
                     }
                 }
             }
-            for m in changed {
-                if r.tell(&m, &[]).is_err() {
+            for (m, fds) in changed {
+                if r.tell(&m, &fds).is_err() {
                     break;
                 }
             }
         }
+    }
+
+    /// A window's slot size: a packed frame's fixed room, or, in pixel mode,
+    /// the window's pixels.
+    fn slot_bytes(&self, size: (u32, u32)) -> usize {
+        if self.pixels { slot::pixel_slot_bytes(size.0, size.1) } else { DEFAULT_SLOT_BYTES as usize }
     }
 
     fn dim(&self, v: f32, screen: u32) -> u32 {
@@ -360,7 +391,7 @@ impl Broker {
                 Proc::Child(cmd.spawn()?)
             }
         };
-        ours.send(&Msg::Client { width: self.screen.0, height: self.screen.1, refresh_mhz: self.screen.2 }, &[stream.as_raw_fd()])?;
+        ours.send(&Msg::Client { width: self.screen.0, height: self.screen.1, refresh_mhz: self.screen.2, pixels: self.pixels }, &[stream.as_raw_fd()])?;
         // The broker keeps a copy of the client's socket, never read, only
         // to see the client hang up: a renderer that ignores its client's
         // hang-up must not keep its client id and windows forever.
@@ -458,7 +489,8 @@ impl Broker {
                 if wins.contains_key(&local) || wins.len() >= MAX_WINDOWS as usize {
                     return Err(format!("window {local}: already open, or too many windows"));
                 }
-                let slots = [Shm::create(DEFAULT_SLOT_BYTES as usize), Shm::create(DEFAULT_SLOT_BYTES as usize)];
+                let bytes = self.slot_bytes((width, height));
+                let slots = [Shm::create(bytes), Shm::create(bytes)];
                 let [Ok(a), Ok(b)] = slots else { return Err("cannot create frame slots".into()) };
                 let global = {
                     let mut c = self.comp.lock().unwrap();
@@ -473,7 +505,7 @@ impl Broker {
                     }
                     g
                 };
-                r.tell(&Msg::Slots { window: local, bytes: DEFAULT_SLOT_BYTES }, &[a.fd(), b.fd()])
+                r.tell(&Msg::Slots { window: local, bytes: bytes as u32 }, &[a.fd(), b.fd()])
                     .and_then(|_| r.tell(&Msg::Geometry { window: local, width, height }, &[]))?;
                 wins.insert(local, Win { global, slots: [a, b], told: (width, height) });
             }
@@ -488,6 +520,23 @@ impl Broker {
                 }
             }
             Msg::FrameReady { slot: s, .. } => {
+                if self.pixels {
+                    let got = {
+                        let wins = r.wins.lock().unwrap();
+                        let w = wins.get(&local).ok_or_else(|| format!("frame for unknown window {local}"))?;
+                        (w.global, w.told, slot::read_pixels(w.slots[s as usize].as_slice(), w.told.0, w.told.1))
+                    };
+                    match got {
+                        (global, (width, height), Ok((_, px))) => {
+                            log::debug!("frescod: client {} window {local}: {width}x{height} pixels, {} opaque", r.client_id, px.iter().filter(|&&p| p >> 24 != 0).count());
+                            self.drawn.lock().unwrap().insert(global as u32, Arc::new(crate::pack::Pixels { gen: self.drawings.fetch_add(1, std::sync::atomic::Ordering::Relaxed), width, height, px }));
+                            self.redraw.wake();
+                        }
+                        (_, _, Err(e)) => log::debug!("frescod: client {} window {local}: {e}", r.client_id),
+                    }
+                    r.tell(&Msg::FrameDone { window: local, slot: s }, &[])?;
+                    return Ok(());
+                }
                 let got = {
                     let wins = r.wins.lock().unwrap();
                     let w = wins.get(&local).ok_or_else(|| format!("frame for unknown window {local}"))?;
@@ -512,6 +561,7 @@ impl Broker {
     fn drop_window(&self, r: &Renderer, global: u16) {
         self.comp.lock().unwrap().destroy_with_focus_shift(global, r.client_id as u32);
         self.frames.lock().unwrap().remove(&(global as u32));
+        self.drawn.lock().unwrap().remove(&(global as u32));
         self.redraw.wake();
     }
 

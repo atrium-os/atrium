@@ -5239,6 +5239,7 @@ In the guest:
 | `FRESCOD_HEADLESS_PNG=/tmp/x` | headless, writes PNGs; test here first |
 | (default) | F4b split mode with `compute`/`gpu`: one jailed renderer per client, started by portcullisd (needs the bundle and worker rule from `scripts/fresco-renderer-bundle.sh`; refuses clients if portcullisd is down) |
 | `FRESCOD_SPLIT=0` / `=1` | force split mode off / on (on is the default unless the renderer is Vulkan) |
+| `FRESCOD_SPLIT_PIXELS=0` | compute renderer: take frames from renderers and raster them in frescod, instead of their pixels (F4g) |
 | `FRESCOD_RENDERER_LAUNCHER=<cmd>` | start renderers with a command instead (`{client}` = client id); `unconfined` runs `FRESCOD_RENDERER_BIN` directly |
 | `FRESCOD_INPUT_SOCK` | input injection socket (F4c routing) |
 | `FRESCOD_CHROME_SOCK` | trusted chrome: `OPEN_CLIENT` then `SET_ORIGIN` (F4d strip) |

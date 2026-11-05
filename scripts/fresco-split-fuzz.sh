@@ -18,12 +18,16 @@
 # /dev/atrium-gpu0 and atrium-gpu-fuzz beside the rest. On gpusim every
 # dispatch freezes the guest, so raise GAP_MAX there; honest's VM-fault check
 # needs gpusim 354fffb or later.
+#
+# The compute renderer takes pixels from its renderers by default (F4g), so
+# hostile renderers write pixel slots; FUZZ_PIXELS=0 has frescod take frames
+# instead, which fuzzes the frame parser (Frame::validate) and frescod's raster.
 SECS=${1:-60} SEED=${2:-1} PERSONA=${3:-mixed} GAP_MAX=${GAP_MAX:-15}
 CHROME=-; [ "$4" = chrome ] && CHROME=/tmp/chrome.sock
 GPUSOCK=; [ "$FUZZ_GPU" = 1 ] && GPUSOCK=/tmp/fz-gpu.sock
 pkill -x frescod forum-wm atrium-rect-bouncer 2>/dev/null; pkill -f split-fuzz; sleep 1
 rm -f /tmp/fz.png /tmp/fz-*.sock /tmp/split-fuzz-benign
-env RUST_LOG=info SPLIT_FUZZ_PERSONA=$PERSONA FRESCOD_HEADLESS_PNG=/tmp/fz FRESCOD_RENDERER=compute \
+env RUST_LOG=info SPLIT_FUZZ_PERSONA=$PERSONA FRESCOD_HEADLESS_PNG=/tmp/fz FRESCOD_RENDERER=compute FRESCOD_SPLIT_PIXELS=${FUZZ_PIXELS:-1} \
   ${GPUSOCK:+FRESCOD_GPU_SOCK=$GPUSOCK} FRESCOD_SPLIT=1 FRESCOD_CHROME_SOCK=/tmp/fz-chrome.sock FRESCOD_SOCK=/tmp/fz-fresco.sock FRESCOD_WM_SOCK=/tmp/fz-wm.sock \
   FRESCOD_RENDERER_LAUNCHER="$PWD/atrium-split-fuzz renderer {client} $PWD/fresco-renderer" \
   ./frescod >/tmp/fz-frescod.log 2>&1 &

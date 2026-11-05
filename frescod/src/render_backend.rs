@@ -118,6 +118,9 @@ impl Surfaces {
 
 /// A window's surface size, kept within what the kernels accept.
 pub fn surface_size(w: &WindowFrame) -> (u32, u32) {
+    if let Some(p) = &w.pixels {
+        return (p.width, p.height);
+    }
     if let Some(f) = &w.frame {
         return (f.header.width, f.header.height);
     }
@@ -189,6 +192,16 @@ impl<'a> Backend<'a> {
             Backend::Compute(_) => "compute (Tier-2)",
             Backend::Gpu(_) => "gpu (compute kernels, a VM per window)",
         }
+    }
+
+    /// Whether split mode's renderers should raster their windows themselves
+    /// and send pixels: with the compute renderer, so a hostile frame is
+    /// rastered in its own renderer's jail, not in frescod (the CPU's
+    /// counterpart of the gpu renderer's VM per window). The gpu renderer
+    /// takes frames and rasters each in its window's VM.
+    /// `FRESCOD_SPLIT_PIXELS=0` sends frames to the compute renderer too.
+    pub fn wants_pixels(&self) -> bool {
+        matches!(self, Backend::Compute(_)) && std::env::var("FRESCOD_SPLIT_PIXELS").as_deref() != Ok("0")
     }
 
     /// Whether it can composite frames a split-mode renderer drew
@@ -279,21 +292,56 @@ pub struct Compute {
     last: Vec<(u32, Arc<fresco_compute::Frame>)>,
 }
 
+/// Where frescod keeps its compiled Tier-2 kernels: `FRESCO_COMPUTE_CACHE`,
+/// else the system shader cache if frescod may write it, else (frescod runs
+/// as `_frescod`, which may not) a directory of its own in the temp dir,
+/// created 0700 and refused if someone else made it first.
+#[cfg(feature = "cranelift")]
+fn kernel_dir() -> Result<std::path::PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    if let Some(d) = std::env::var_os("FRESCO_COMPUTE_CACHE") {
+        return Ok(d.into());
+    }
+    let sys = atrium_spv_loader::LoaderConfig::production().cache_root;
+    if std::fs::create_dir_all(&sys).is_ok() && tempfile_ok(&sys) {
+        return Ok(sys);
+    }
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let d = std::env::temp_dir().join(format!("frescod-kernels-{uid}"));
+    match std::fs::DirBuilder::new().mode(0o700).create(&d) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.into()),
+    }
+    let m = std::fs::symlink_metadata(&d)?;
+    if !m.is_dir() || m.uid() != uid || m.mode() & 0o077 != 0 {
+        return Err(format!("{} is not frescod's own private directory", d.display()).into());
+    }
+    Ok(d)
+}
+
+/// Whether frescod can create files in `d`.
+#[cfg(feature = "cranelift")]
+fn tempfile_ok(d: &std::path::Path) -> bool {
+    let p = d.join(format!(".frescod-probe-{}", std::process::id()));
+    let ok = std::fs::write(&p, b"").is_ok();
+    let _ = std::fs::remove_file(&p);
+    ok
+}
+
 impl Compute {
     pub fn new(width: u32, height: u32) -> Result<Self> {
         #[cfg(feature = "cranelift")]
-        {
-            let have_compiler = std::env::var_os("ATRIUM_SPV_COMPILE")
+        let t2 = {
+            let dir = kernel_dir()?;
+            fresco_compute::tier2::Tier2::seed_cache(&dir)?;
+            let compiler = std::env::var_os("ATRIUM_SPV_COMPILE")
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| atrium_spv_loader::LoaderConfig::production().compile_binary)
-                .exists();
-            if !have_compiler {
-                let cache = std::env::var_os("FRESCO_COMPUTE_CACHE")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| atrium_spv_loader::LoaderConfig::production().cache_root);
-                fresco_compute::tier2::Tier2::seed_cache(&cache)?;
-            }
-        }
+                .unwrap_or_else(|| atrium_spv_loader::LoaderConfig::production().compile_binary);
+            fresco_compute::tier2::Tier2::new(dir, compiler)?
+        };
+        #[cfg(not(feature = "cranelift"))]
         let t2 = fresco_compute::tier2::Tier2::from_env()?;
         Ok(Self {
             width,
@@ -321,6 +369,18 @@ impl Compute {
         self.last.clear();
         for w in &f.windows {
             let s = self.surfaces.map[&w.id];
+            if let Some(p) = &w.pixels {
+                // Drawn by the window's renderer, in its jail: copied in as is
+                // (the same drawing as last time means nothing changed).
+                let key = p.gen;
+                if self.held.get(&w.id).is_some_and(|h| h.as_slice() == [key]) {
+                    continue;
+                }
+                let off = s[0] as usize;
+                self.heap[off..off + p.px.len()].copy_from_slice(&p.px);
+                self.held.insert(w.id, vec![key]);
+                continue;
+            }
             let frame = frame_of(&self.scene, w, s);
             self.last.push((w.id, frame.clone()));
             let sig = fresco_compute::damage::tile_signatures(&frame);

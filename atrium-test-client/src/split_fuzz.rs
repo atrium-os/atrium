@@ -70,8 +70,8 @@ fn renderer(seed: u64) {
     let mut r = Rng(seed);
     // SAFETY: stdin is the broker channel.
     let broker = Chan::from_fd(unsafe { OwnedFd::from_raw_fd(0) });
-    let client = match broker.recv() {
-        Ok(chan::Recv::Msg(Msg::Client { .. }, mut fds)) if fds.len() == 1 => fds.pop().unwrap(),
+    let (client, pixels) = match broker.recv() {
+        Ok(chan::Recv::Msg(Msg::Client { pixels, .. }, mut fds)) if fds.len() == 1 => (fds.pop().unwrap(), pixels),
         _ => std::process::exit(1),
     };
     // SPLIT_FUZZ_PERSONA=staller|flooder runs only that one (an A/B test).
@@ -165,7 +165,7 @@ fn renderer(seed: u64) {
                 let s = r.below(2);
                 if let Some(w) = wins.get_mut(&window) {
                     if let Some(slots) = w.slots.as_mut() {
-                        write_slot(&mut r, slots[s as usize].as_mut_slice(), w.size);
+                        write_slot(&mut r, slots[s as usize].as_mut_slice(), w.size, pixels);
                     }
                 }
                 Msg::FrameReady { window, slot: s, seq: r.next() as u32 }.encode()
@@ -185,7 +185,7 @@ fn renderer(seed: u64) {
                     Msg::Geometry { window, width: 10, height: 10 },
                     Msg::FrameDone { window, slot: 0 },
                     Msg::Focus { window, gained: true },
-                    Msg::Client { width: 1, height: 1, refresh_mhz: 1 },
+                    Msg::Client { width: 1, height: 1, refresh_mhz: 1, pixels: false },
                 ][r.below(4) as usize]
                     .encode()
             }
@@ -275,8 +275,32 @@ fn flooder(r: &mut Rng, broker: &Chan, rx: &mpsc::Receiver<(Msg, Vec<OwnedFd>)>)
 }
 
 /// What a hostile renderer may leave in a slot: a good frame at the size
-/// the broker gave, a corrupt one, one of another size, or bytes.
-fn write_slot(r: &mut Rng, s: &mut [u8], (w, h): (u32, u32)) {
+/// the broker gave, a corrupt one, one of another size, or bytes. In pixel
+/// mode: pixels of any value (alpha below colour too) at the size given or
+/// another size, a frame where pixels belong, or bytes.
+fn write_slot(r: &mut Rng, s: &mut [u8], (w, h): (u32, u32), pixels: bool) {
+    if pixels {
+        return match r.below(10) {
+            0..=5 => {
+                let (pw, ph) = if r.chance(80) { (w, h) } else { (1 + r.below(64), 1 + r.below(64)) };
+                let n = pw as usize * ph as usize;
+                if slot::pixel_slot_bytes(pw, ph) <= s.len() {
+                    let px: Vec<u32> = (0..n).map(|_| r.next() as u32).collect();
+                    let _ = slot::write_pixels(s, pw, ph, &px, r.next() as u32);
+                }
+            }
+            6 => {
+                let _ = slot::write(s, &fuzz::frame(r), 1);
+            }
+            _ => {
+                let n = (r.below(4096) as usize).min(s.len());
+                let at = if r.chance(50) { 0 } else { r.below(s.len() as u32) as usize };
+                for x in s[at..].iter_mut().take(n) {
+                    *x = r.next() as u8;
+                }
+            }
+        };
+    }
     match r.below(10) {
         0..=3 if (w as u64) * (h as u64) <= 1 << 20 => {
             let f = Frame::pack(&fuzz::scene(r, w, h), w, h, w);
