@@ -1,0 +1,104 @@
+# F6: the app GPU path
+
+*Status 2026-11-05: proposed. Threat model §2.5.3 and §2.5.4 row F6. Owner: the GPU driver
+thread, with Fresco for the broker wiring.*
+
+## What F6 must end with
+
+An app that brings its own shaders (a 3D app, a game, an ML job, Orbis) runs them on the GPU
+with:
+- no GPU fd in the app's jail ("apps hold no GPU fds" stays true);
+- its own GPU VM, holding only its own buffers and code;
+- every PM4 packet written by the broker, never by the app;
+- a hang or fault that costs only that app: its work fails with EIO and the others carry on.
+
+## What is already true
+
+- **F1 is done** (`atrium-gpu-amd/ISOLATION.md`). Per-VM page tables, queue ownership, deferred
+  frees, revocable doorbells and a root-only control node are in place. The attestation gate
+  passes on gpusim (`etc/jaild.policy.toml`), but status stays `experimental` until the
+  isolation test has run on silicon.
+- **The hang model is done** (622693d1). Completions are tracked per queue. A watchdog stops a
+  queue that makes no progress for `hang_ms`, and the work it owed fails with EIO.
+- **The split is done** (Fresco F4b to F4d, F3). Each client has a jailed renderer with no GPU
+  node, the broker reads only fixed records, and the broker fuzzer exists.
+- **The broker already turns validated data into RDNA4 work.** frescod's gpu backend uploads our
+  own `bin`/`raster` ISA, builds PM4 with `atrium-rdna4-cmd`, and submits it. The app path
+  reuses that machinery, with the app's ISA in the app's VM.
+
+## The trust question (decision needed)
+
+§2.5.3 puts the shader compiler in the app's jail and has the broker receive "machine code plus
+the aqueduct-gpu §11 validation record". But anything the app's jail produces, the app controls.
+That includes the record. A malicious app can send any machine code with a record that says it
+is fine. So for a hostile app, only three things confine it:
+1. the GPU MMU: its VMID and the page tables the kernel built (F1);
+2. the broker writing every PM4 packet, so app data never reaches the CP as commands;
+3. the watchdog, so a hang costs only that app's queue time.
+
+That is also how amdgpu treats user ISA on Linux. Validation (§11's bounded loops and
+descriptor coverage) still catches buggy shaders early. But it is not a security boundary for
+code an app compiled itself.
+
+Options:
+- **A. Untrusted ISA (recommended).** Compile in the app's jail, as §2.5.3 says. The broker
+  checks only the code header against hardware limits (VGPR/SGPR counts, LDS size, workgroup
+  size, code size) and builds every packet itself. aqueduct-gpu §11 gets amended to say its
+  validation is advisory for app-compiled code. This is the smallest piece to build and is
+  honest about the boundary.
+- **B. A per-app compiler jail run by the broker.** The broker trusts the record from a compiler
+  jail it launched. This only helps until a hostile SPIR-V exploits the compiler, and then
+  it is the same as A. It also costs an extra process per app.
+- **C. Install-time code only.** The broker accepts only code that atrium-pkg's install hook
+  compiled and validated, looked up by hash in Tessera, and there is no runtime shader upload.
+  This matches §11's wording most closely, but it rules out runtime-generated shaders. It can
+  be added later on top of A as a cache.
+
+## Slices (written for option A)
+
+### G1. Driver: what a broker needs to host app VMs
+- The broker creates one VM per app on its own device fd. The ABI already supports this.
+- Code BOs: today a VM's PTEs are always writable. Add a read-only bind flag so app code and
+  constant buffers can't be overwritten by the app's own dispatches. This is hygiene, not
+  isolation, since the app can only damage itself.
+- Fault reporting: a VM fault should fail that VM's outstanding work with EIO at once, instead
+  of waiting `hang_ms` for the watchdog.
+- Per-app scheduling weight: with two shared hardware queues, the `SCHED` weights are per
+  queue, not per app. Real per-app weights wait for per-VM MES queues (review §A2.3), which is
+  also what removes the brief `EBUSY` one app's work can cause another.
+
+### G2. The broker protocol for app GPU work (with Fresco)
+Fixed-size records over the existing `fresco_split` channel, fuzzed with F3's harness:
+- `GPU_CODE(slot)`: one memfd slot holding a code header and ISA. The broker checks the header
+  against hardware limits and copies the code into a code BO in the app's VM.
+- `GPU_BUFFER(id, size)`: create a buffer in the app's VM, backed by a sealed memfd slot the
+  broker made. This starts as a staging copy and becomes a zero-copy import later (as F4e
+  plans).
+- `GPU_SUBMIT(slot, fence)`: an aqueduct-gpu frame body restricted to a closed set: bind code,
+  bind buffers, push constants, dispatch, barrier, copy buffer. Every id is resolved in that
+  app's own table, and dims and counts are bounded.
+- `GPU_DONE(fence)` / `GPU_LOST(fence, EIO)` back to the app.
+
+### G3. Broker PM4 builder
+- A library crate turns a validated frame into PM4 with `atrium-rdna4-cmd`, using the app's VAs
+  and the broker's own syncobj.
+- On EIO the app's GPU context is lost: the broker reports it, drops the app's VM, and the app
+  starts again with a fresh one.
+
+### G4. Tests on gpusim (hostile apps)
+- An honest app's compute shader fills a buffer that it then reads back.
+- Hostile ISA:
+  - an infinite loop: the watchdog fails it with EIO, and another app's dispatch runs within
+    `hang_ms`;
+  - loads and stores at another app's VAs: they fault in the hostile app's VM, and nothing leaks;
+  - huge dims and bad headers: the broker refuses them.
+- The broker records are fuzzed (an F3 extension).
+
+### G5. On silicon (needs Shankar's OK)
+`test_gpu_isolation` and the hostile-ISA test on the R9700. They deliberately cause VM faults
+and hangs on a shared GPU, so they run only when it is quiet and Shankar says so. Passing them
+is what lets the stanza go to `production`.
+
+## Order
+G1 (driver), then G3 (library, testable without the broker), then G2 (with Fresco), then G4,
+then G5.
