@@ -974,6 +974,11 @@ The ceilings can then rise to what we can measure, not what fits whole.
      is an estimate until layout finishes, and the scrollbar settles once.
    - Layout is kept as compact geometry: boxes and line runs. A display list is not kept
      for the whole page.
+   - **Checkpoints.** At each band boundary, which falls on a top-level block boundary, the
+     worker saves a small checkpoint: the y position, inherited state and counters. Any band
+     can then be laid out again from its checkpoint without redoing what lies above it.
+     Layout is deterministic, so a band laid out again is byte-identical, and a jump to page
+     700 lays out from the nearest checkpoint.
    - The scene is cut into **bands** of about one viewport height each. The worker emits a
      band's scene only when asked for it.
 2. **The UI keeps a window of bands.**
@@ -1028,13 +1033,18 @@ For each, measure:
 - time to reach the end with a single jump.
 
 **Decisions to settle:**
-1. Raise the profile ceilings once bands and the image working set are in? *Recommend yes,*
-   to levels measured on the set above, keeping a hard cap.
+1. Raise the profile ceilings once bands and the image working set are in, or split very
+   large documents into chapters at conversion? *Recommend raising them,* to levels
+   measured on the set above, keeping a hard cap; the resident window becomes the real
+   bound.
 2. Lay out the rest of the document in the background after the first screen, with a
    scroll extent that settles once? *Recommend yes;* the alternative is waiting for the
    whole layout before showing anything.
 3. Virtualise very long tables and feeds in the document lane? *Recommend yes,* only above
    a measured size, so small pages keep the simple path.
+4. The resident budget per document. *Recommend starting at 64 MiB of scene* plus the
+   image working set, and two screens of prefetch either side, then tuning by the frame-time
+   measurements.
 
 ## 5. The store is Tessera
 
