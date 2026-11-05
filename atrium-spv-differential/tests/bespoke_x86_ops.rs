@@ -986,7 +986,8 @@ fn packed_vector_ops() {
 
 /// Every component-wise GLSL.std.450 op that the frontend expands into
 /// several IR ops, on vec4 operands (Slang emits these for its built-ins):
-/// bespoke-x86 must compile each one and agree with Cranelift bit for bit.
+/// the host's bespoke backend (x86_64 or arm64) must compile each one and
+/// agree with Cranelift bit for bit.
 #[test]
 fn glsl_ext_ops_on_vectors() {
     use rspirv::dr::Operand::{self, LiteralBit32};
@@ -994,7 +995,8 @@ fn glsl_ext_ops_on_vectors() {
         AddressingModel, Capability, Decoration, ExecutionMode, ExecutionModel, FunctionControl,
         MemoryModel, StorageClass as SC,
     };
-    if !cfg!(target_arch = "x86_64") {
+    // Runs on both bespoke hosts: x86_64 and arm64.
+    if !atrium_spv_differential::HOST_HAS_ANY_BESPOKE {
         return;
     }
     // (enum, operand count, scalar result, name)
@@ -1059,9 +1061,10 @@ fn glsl_ext_ops_on_vectors() {
             Err(err) => { failures.push(format!("{name}: frontend {err}")); continue; }
         };
         let cl = atrium_spv_backend_cranelift::compile(&module, atrium_spv_backend_cranelift::Target::host());
-        let x86 = atrium_spv_backend_bespoke_x86::compile(&module, atrium_spv_backend_bespoke_x86::Target::host());
+        let x86 = std::panic::catch_unwind(|| atrium_spv_differential::bespoke_object(&spirv))
+            .map_err(|e| e.downcast_ref::<String>().cloned().unwrap_or_default());
         let (cl, x86) = match (cl, x86) {
-            (Ok(c), Ok(x)) => (c.object, x.object),
+            (Ok(c), Ok(x)) => (c.object, x),
             (c, x) => {
                 failures.push(format!("{name}: cranelift {:?} bespoke {:?}", c.err(), x.err()));
                 continue;
