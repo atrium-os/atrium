@@ -50,6 +50,8 @@ const struct fileops atrium_amd_vm_fileops = {
 /* The page-directory index every BO_VA_BASE-based VA falls under. */
 #define AMD_VM_PD_INDEX	\
 	(((ATRIUM_AMD_BO_VA_BASE) >> ATRIUM_AMD_PD_SHIFT) & ATRIUM_AMD_PT_MASK)
+/* The VA window's PDEs must all live in the one page directory. */
+CTASSERT(AMD_VM_PD_INDEX + ATRIUM_AMD_VM_NUM_PT <= 512);
 
 /* Allocate / free a VMID (1..15), tracking the live-VM count alongside. */
 static int

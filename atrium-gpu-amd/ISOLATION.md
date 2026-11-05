@@ -144,7 +144,7 @@ host while frescod holds the lease, stop frescod and clear it:
 ## Build identity
 
 `sysctl dev.atrium_gpu_amd.0.build_id` is the last commit that touched this
-directory (`build-id.sh`), with `-dirty` for uncommitted changes, and
+directory or the shared display code in `atrium-display/` (`build-id.sh`), with `-dirty` for uncommitted changes, and
 `dev.atrium_gpu_amd.0.abi_rev` is the client ABI revision (2 since the
 isolation fixes). `test_gpu_isolation --attest` prints the
 `jaild.policy.toml` stanza for the running build, and

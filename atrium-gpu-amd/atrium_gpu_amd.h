@@ -315,12 +315,16 @@
  * BO_VA_BASE+page, ... across a contiguous run of NUM_PT page-directory
  * entries (NUM_PT * 512 pages, NUM_PT pre-allocated page-table pages). Two VMs
  * both start at BO_VA_BASE, so the same VA in different VMs resolves to
- * different memory — isolation. NUM_PT is sized so a full-screen offset-model
- * scanout (System staging BO + VRAM scanout BO, both framebuffer-sized) fits:
- * 16 PT pages = 8192 pages = 32 MiB of VA, room for a 1080p staging/scanout pair.
+ * different memory — isolation. NUM_PT is sized for the display server's
+ * scanout set (a System staging BO + two VRAM scanout BOs, each
+ * framebuffer-sized) twice over, since a mode switch lights fresh buffers
+ * before it frees the old ones: 128 PT pages = 256 MiB of VA covers a 4K
+ * set (~100 MiB) next to another. Cost: 512 KiB of page tables per VM.
+ * (16 PT pages, 32 MiB, fit only one 1080p set: a switch to 1440p ran the
+ * VM out of VA.) PD indices AMD_VM_PD_INDEX .. +NUM_PT-1 must stay < 512.
  */
 #define ATRIUM_AMD_BO_VA_BASE	0x10000000ULL
-#define ATRIUM_AMD_VM_NUM_PT	16	/* page-table pages per VM */
+#define ATRIUM_AMD_VM_NUM_PT	128	/* page-table pages per VM */
 #define ATRIUM_AMD_VM_MAX_BO	(512 * ATRIUM_AMD_VM_NUM_PT) /* VA pages per VM */
 #define ATRIUM_AMD_MAX_VMID	16	/* hardware contexts; 1..15 for user VMs */
 
