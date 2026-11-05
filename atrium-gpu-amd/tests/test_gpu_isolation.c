@@ -839,6 +839,53 @@ part_c(void)
 	hang_ms(old);
 }
 
+/*
+ * Part D: one VM's page fault must not stop another VM's work (F6 G1). A
+ * hostile app's shader or packet stream will touch unmapped VAs; if that
+ * wedges the whole engine until a reset, any app can stall every other.
+ */
+static void
+part_d(void)
+{
+	uint64_t va, rva;
+	uint32_t r[16];
+	int fda, fdb, vma, vmb, ringa, ringb, resb, n, err;
+
+	printf("Part D: a fault in one VM leaves the others running\n");
+	fda = xopen(GPU);
+	vma = vm_create(fda);
+	ringa = bo_new(fda, vma, 4096, 0, &rva);
+	/* A: a store far outside anything bound in A's VM. */
+	n = emit_write(r, 0x7f0000000000ull, 0xbad);
+	bo_write(fda, ringa, r, n * 4);
+	err = submit(fda, vma, ringa, n, ATRIUM_GPU_ENGINE_COMPUTE);
+	printf("       (A's faulting submit returned %s)\n", strerror(err));
+
+	fdb = xopen(GPU);
+	vmb = vm_create(fdb);
+	ringb = bo_new(fdb, vmb, 4096, 0, &rva);
+	resb = bo_new(fdb, vmb, 4096, 0, &va);
+	n = emit_write(r, va, 0xd0d0);
+	bo_write(fdb, ringb, r, n * 4);
+	err = submit(fdb, vmb, ringb, n, ATRIUM_GPU_ENGINE_GFX);
+	CHECK(err == 0 && bo_read32(fdb, resb) == 0xd0d0,
+	    "B's gfx work runs after A faulted on compute (%s, 0x%x)",
+	    strerror(err), bo_read32(fdb, resb));
+	n = emit_write(r, va, 0xc0c0);
+	bo_write(fdb, ringb, r, n * 4);
+	err = submit(fdb, vmb, ringb, n, ATRIUM_GPU_ENGINE_COMPUTE);
+	CHECK(err == 0 && bo_read32(fdb, resb) == 0xc0c0,
+	    "B's compute work runs on the queue A faulted on (%s, 0x%x)",
+	    strerror(err), bo_read32(fdb, resb));
+	close(ringb);
+	close(resb);
+	close(vmb);
+	close(fdb);
+	close(ringa);
+	close(vma);
+	close(fda);
+}
+
 static void
 attest(void)
 {
@@ -875,6 +922,7 @@ main(int argc, char **argv)
 	break2();
 	break4();
 	part_c();
+	part_d();
 	if (argc > 1 && strcmp(argv[1], "--attest") == 0)
 		attest();
 	printf(failures == 0 ? "ALL OK\n" : "%d FAILURES\n", failures);
