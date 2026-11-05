@@ -2505,8 +2505,15 @@ impl<'a> Cx<'a> {
 
     /// An item's content size along the main axis (its max-content width in
     /// a row, its laid-out height in a column), as a border-box size.
+    ///
+    /// ★ UNCLAMPED in a row (Flexbox §9.2 C/E: the flex base size is the
+    /// max-content size, and fitting the line is the shrink step's job).
+    /// Clamped to the container, as `intrinsic_outer_w` is for its
+    /// shrink-to-fit callers, a `flex-shrink: 0` slide holding five 1000 px
+    /// images was 800 wide, and its images 152 px each (Thomann's teaser
+    /// carousel; Chrome 1008 each). It hid while images measured 0 wide.
     fn content_main(&mut self, h: Handle, row: bool, cb_w: U) -> U {
-        if row { self.intrinsic_outer_w(h, cb_w) } else {
+        if row { self.max_content_outer_w(h, cb_w) } else {
             let m = self.st(h).map(|cs| len(cs.get("margin-top"), cb_w).unwrap_or(0) + len(cs.get("margin-bottom"), cb_w).unwrap_or(0)).unwrap_or(0);
             self.measure(h, cb_w, None, (None, None)) - m
         }
@@ -2597,13 +2604,22 @@ impl<'a> Cx<'a> {
     }
 
     fn intrinsic_outer_w(&mut self, h: Handle, cb_w: U) -> U {
+        // A definite width is that width, room or not; only the content's
+        // max-content is fitted to the room.
+        if let Some(wd) = self.st(h).and_then(|cs| len(cs.get("width"), cb_w)) { return wd }
+        self.max_content_outer_w(h, cb_w).min(cb_w.max(0))
+    }
+
+    /// Max-content border-box width of `h` (its width if definite), NOT
+    /// clamped to `cb_w`, which only resolves percentages.
+    fn max_content_outer_w(&mut self, h: Handle, cb_w: U) -> U {
         // An anonymous block box around loose text has no style and no box
         // decoration: its outer width IS its content width.
-        let Some(cs) = self.st(h) else { return self.intrinsic(h).1.min(cb_w.max(0)) };
+        let Some(cs) = self.st(h) else { return self.intrinsic(h).1 };
         if let Some(wd) = len(cs.get("width"), cb_w) { return wd }
         let b = |side: &str| if kw(cs, &format!("border-{side}-style")) == "none" { 0 } else { len(cs.get(&format!("border-{side}-width")), 0).unwrap_or(0) };
         let frame = len(cs.get("padding-left"), cb_w).unwrap_or(0) + len(cs.get("padding-right"), cb_w).unwrap_or(0) + b("left") + b("right");
-        (self.intrinsic(h).1 + frame).min(cb_w.max(0))
+        self.intrinsic(h).1 + frame
     }
 
     /// (min-content, max-content) width of `h`'s CONTENT box: the widest
@@ -3940,6 +3956,35 @@ mod tests {
         assert_eq!(wh(0x00ff00ff), Some((100, 100)), "stretched height, width through the ratio");
         assert_eq!(wh(0x0000ffff), Some((100, 100)), "height: 100% of the area, not the natural 200 wide");
         assert_eq!(wh(0xff0000ff), Some((50, 50)), "aspect-ratio from a definite height");
+    }
+
+    /// ★ A flex item's content-based flex base size is its MAX-CONTENT
+    /// size, not that size fitted to the container (Flexbox §9.2): fitting
+    /// the line is the shrink step's job. Clamped, Thomann's teaser slide
+    /// (`flex-shrink: 0`, five `max-width: 100%` images) was 800 wide and its
+    /// images 152 px; and LinkedIn's photo, which may not shrink below its
+    /// 400 px automatic minimum, took a share sized by the CLAMPED text
+    /// base. Sizes are headless Chrome's.
+    #[test]
+    fn a_flex_base_size_is_the_unclamped_max_content() {
+        let o = render(r#"<style>body { margin-left: 0px; margin-top: 0px }
+            .t { display: flex; width: 800px } .v { display: flex; flex-shrink: 0 }
+            .a { display: inline-block; padding-left: 4px; padding-right: 4px }
+            .i { display: block; max-width: 100%; background-color: #00ff00 }
+            .l { display: flex; width: 700px; justify-content: space-between }
+            .x { width: 564px; margin-right: 64px; max-width: 400px; height: 10px; background-color: #0000ff }
+            .y { width: 450px; max-width: 400px; background-color: #ff0000 }
+            .s { display: flex; width: 100px } .n { flex-shrink: 0; height: 10px; background-color: #ffff00 }</style>
+            <div class="t"><div class="v"><a class="a"><img class="i" src="a.png" width="1000" height="406"></a><a class="a"><img class="i" src="a.png" width="1000" height="406"></a></div></div>
+            <div class="l"><div class="x">some words of text that wrap and wrap again over several lines</div><img class="y" src="b.png" width="926" height="926"></div>
+            <div class="s"><div class="n">unshrinkable words</div></div>"#);
+        assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+        let g = boxes(&o, 0x00ff00ff);
+        assert_eq!(g.iter().map(|r| (r.0, r.2)).collect::<Vec<_>>(), vec![(4, 1000), (1012, 1000)],
+            "a flex-shrink: 0 slide is as wide as its images together (Chrome 1008 each), not the 800 px container");
+        assert_eq!(boxes(&o, 0xff0000ff)[0].2, 400, "the photo holds its automatic minimum, 400");
+        assert_eq!(boxes(&o, 0x0000ffff)[0].2, 236, "and the text takes what is left (700 - 64 - 400)");
+        assert!(boxes(&o, 0xffff00ff)[0].2 > 100, "an unshrinkable item overflows a narrower container");
     }
 
     /// ★ `align-content: center | flex-end` are UNSAFE (Flexbox §8.4): lines
