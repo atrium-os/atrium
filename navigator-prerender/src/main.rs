@@ -1106,7 +1106,9 @@ fn display_cost(rec: &[u8]) -> String {
         let r = match navigator_normalize::recording::parse(&json) { Ok(r) => r, Err(_) => return "\tdisplay=unparsed".into() };
         let t1 = std::time::Instant::now();
         let env = navigator_style::cascade::Env::default();
+        navigator_normalize::phases::start();
         let (normalized, _) = navigator_normalize::normalize_and_measure(&r.document, &r.inputs, fonts, &env);
+        let laps = navigator_normalize::phases::take();
         let t2 = std::time::Instant::now();
         let subs = navigator_render::conformance::subresources_from_recording_json(&json);
         let o = navigator_render::html::render_html_with(&normalized, fonts, &env, &subs);
@@ -1114,6 +1116,8 @@ fn display_cost(rec: &[u8]) -> String {
         let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
         format!("\tdisplay_ingest={:.1}\tdisplay_normalize={:.1}\tdisplay_render={:.1}\tdisplay_width={}\tdisplay_runs={}\tdisplay_height={}\tfonts_load={load_ms:.1}\trecording_bytes={}",
             ms(t0, t1), ms(t1, t2), ms(t2, t3), env.width_px, o.scene.runs.len(), o.scene.height / 64, rec.len())
+            // Normalize's own phases (cut B): `display_n.<phase>`.
+            + &laps.iter().map(|(n, d)| format!("\tdisplay_n.{n}={:.1}", d.as_secs_f64() * 1e3)).collect::<String>()
     })
 }
 

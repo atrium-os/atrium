@@ -292,12 +292,72 @@ fn calc_eval_px(c: &Calc) -> Option<f64> {
     })
 }
 
+/// What a selector's SUBJECT compound requires of an element, if anything
+/// an index can look up: an id, a class or a tag (lowercased). `None`: it
+/// could match any element (universal, attributes, states, `:is()` alone).
+fn subject_key(c: &Complex) -> Option<(u8, String)> {
+    let comp = c.0.last()?;
+    if let Some(i) = comp.iter().find_map(|s| if let Simple::Id(i) = s { Some(i) } else { None }) { return Some((0, i.clone())) }
+    if let Some(k) = comp.iter().find_map(|s| if let Simple::Class(k) = s { Some(k) } else { None }) { return Some((1, k.clone())) }
+    if let Some(t) = comp.iter().find_map(|s| if let Simple::Type(t) = s { Some(t) } else { None }) { return Some((2, t.to_ascii_lowercase())) }
+    None
+}
+
+/// ★ THE RULES THAT COULD MATCH AN ELEMENT, per layer (legacy-web
+/// §5.4.5.7, cut B). Matching tried every rule on every element; a
+/// normalized document has one class per distinct block, so that was
+/// rules × elements selector matches — most of the renderer's cascade. A
+/// rule is listed under the key of each of its selectors' subject
+/// compounds (every simple selector of a compound must match, so the
+/// element must have that id, class or tag), or as `any` when a selector
+/// has no such key. The candidates are a superset of the matches, and are
+/// tried in the rules' own order, so the hits — and the cascade — are the
+/// same.
+struct RuleIndex { keyed: std::collections::HashMap<(u8, String), Vec<usize>>, any: Vec<usize>, active: Vec<bool> }
+
+impl RuleIndex {
+    fn new(sheet: &Stylesheet, env: &Env) -> Self {
+        let mut keyed: std::collections::HashMap<(u8, String), Vec<usize>> = Default::default();
+        let mut any = vec![];
+        let active: Vec<bool> = sheet.rules.iter().map(|r| r.media.as_ref().is_none_or(|m| media_holds(m, env))).collect();
+        for (i, rule) in sheet.rules.iter().enumerate() {
+            if !active[i] { continue }
+            let keys: Option<Vec<(u8, String)>> = rule.selectors.iter().map(subject_key).collect();
+            match keys {
+                None => any.push(i),
+                Some(ks) => for k in ks {
+                    let v = keyed.entry(k).or_default();
+                    if v.last() != Some(&i) { v.push(i) }
+                },
+            }
+        }
+        RuleIndex { keyed, any, active }
+    }
+
+    /// The candidate rules for `h`, ascending, each once.
+    fn candidates(&self, dom: &Dom, h: Handle, out: &mut Vec<usize>) {
+        out.clear();
+        out.extend_from_slice(&self.any);
+        let mut add = |k: (u8, String)| if let Some(v) = self.keyed.get(&k) { out.extend_from_slice(v) };
+        if let Some(i) = dom.attr(h, "id") { add((0, i.to_string())) }
+        if let Some(c) = dom.attr(h, "class") { for x in c.split_ascii_whitespace() { add((1, x.to_string())) } }
+        if let Some(t) = dom.tag(h) { add((2, t.to_ascii_lowercase())) }
+        out.sort_unstable();
+        out.dedup();
+    }
+}
+
 pub fn cascade(dom: &Dom, authors: &[Stylesheet], env: &Env) -> Styled {
     let ua = ua_sheet();
     let layers: Vec<&Stylesheet> = std::iter::once(&ua).chain(authors.iter()).collect();
     let props = longhands();
     let mut diagnostics = vec![];
     let mut styles: Vec<Option<Style>> = vec![None; dom.nodes.len()];
+    // Each longhand's row, once (it was looked up per element per property).
+    let gram: Vec<(&'static [values::A], &'static str, bool)> = props.iter().map(|p| values::grammar(p).expect("row")).collect();
+    let prop_index: std::collections::HashMap<&str, usize> = props.iter().enumerate().map(|(i, p)| (*p, i)).collect();
+    let indexes: Vec<RuleIndex> = layers.iter().map(|s| RuleIndex::new(s, env)).collect();
+    let mut cands: Vec<usize> = vec![];
     let initial: Vec<V> = props.iter().map(|p| {
         let (_, init, _) = values::grammar(p).expect("row");
         match values::parse_value(p, &crate::token::tokenize(init), &[]) { Ok(Specified::Value(v)) => v, other => panic!("initial {p}: {other:?}") }
@@ -320,8 +380,10 @@ pub fn cascade(dom: &Dom, authors: &[Stylesheet], env: &Env) -> Styled {
         // author wrote — never the order rules happen to be iterated in.
         let mut hits: Vec<((usize, (u32, u32, u32), Pos), &crate::sheet::Rule)> = vec![];
         for (li, sheet) in layers.iter().enumerate() {
-            for rule in sheet.rules.iter() {
-                if let Some(m) = &rule.media { if !media_holds(m, env) { continue } }
+            indexes[li].candidates(dom, h, &mut cands);
+            for &ri in cands.iter() {
+                let rule = &sheet.rules[ri];
+                debug_assert!(indexes[li].active[ri]);
                 let best = rule.selectors.iter().filter(|c| matches_complex(dom, h, c)).map(crate::selector::specificity).max();
                 if let Some(spec) = best { hits.push(((li, spec, rule.pos), rule)) }
             }
@@ -332,7 +394,7 @@ pub fn cascade(dom: &Dom, authors: &[Stylesheet], env: &Env) -> Styled {
         for (_, rule) in &hits {
             for (name, toks) in &rule.customs { customs.insert(name.clone(), toks.clone()); }
             for d in &rule.decls {
-                if let Some(i) = props.iter().position(|p| *p == d.prop) { specified[i] = Some((d.value.clone(), d.pos)) }
+                if let Some(&i) = prop_index.get(d.prop) { specified[i] = Some((d.value.clone(), d.pos)) }
             }
         }
         // font-size first: every other em resolves against it.
@@ -341,7 +403,7 @@ pub fn cascade(dom: &Dom, authors: &[Stylesheet], env: &Env) -> Styled {
         let fs_i = props.iter().position(|p| *p == "font-size").expect("row 34");
         let mut values = vec![V::Kw("unset"); props.len()];
         let resolve = |i: usize, spec: Option<&(Specified, Pos)>, diags: &mut Vec<Diagnostic>| -> Option<V> {
-            let (_, _, inherited) = values::grammar(props[i]).expect("row");
+            let (_, _, inherited) = gram[i];
             let from_parent = || parent.as_ref().map(|p| p.values[i].clone());
             match spec {
                 None => if inherited { from_parent() } else { None },
@@ -378,7 +440,7 @@ pub fn cascade(dom: &Dom, authors: &[Stylesheet], env: &Env) -> Styled {
         let base = Base { font_px, root_px, vw: env.width_px, vh: env.height_px };
         for i in 0..props.len() {
             values[i] = if i == fs_i { V::Len(Length { v: font_px, unit: Unit::Px }) } else {
-                let inherited_already = specified[i].is_none() && values::grammar(props[i]).expect("row").2;
+                let inherited_already = specified[i].is_none() && gram[i].2;
                 match resolve(i, specified[i].as_ref(), &mut diagnostics) {
                     // An inherited value is already computed (px) by the parent.
                     Some(v) if inherited_already || matches!(specified[i], Some((Specified::Inherit, _))) => v,

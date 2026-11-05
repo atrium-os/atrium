@@ -18,6 +18,7 @@
 //! background. Silence would be the only real failure.
 
 pub mod css;
+pub mod phases;
 mod collapse;
 pub mod expand;
 pub mod recording;
@@ -122,6 +123,12 @@ impl Report {
     fn drop_n(&mut self, why: impl Into<String>, n: usize) { *self.dropped.entry(why.into()).or_default() += n }
 }
 
+/// A declaration with no `var()`, expanded once per rule: its longhands
+/// (and the dark side of a `light-dark()`, in the base context), and what
+/// expanding it reported.
+#[derive(Clone)]
+struct Expanded { dark: Option<Vec<(String, String)>>, light: Vec<(String, String)>, drops: Vec<(String, usize)> }
+
 /// One element's resolved declarations, in cascade order.
 #[derive(Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Block(Vec<(String, String)>);
@@ -153,12 +160,15 @@ pub fn normalize_and_measure(html: &str, inputs: &Inputs, fonts: &navigator_rend
                              env: &navigator_style::cascade::Env) -> (String, Report) {
     let (doc, mut report) = normalize(html, inputs);
     let (measured, n) = navigator_render::html::premeasure_tables(&doc, fonts, env);
+    phases::lap("tables");
     if n > 0 { report.columns_measured = n }
     (measured, report)
 }
 
 pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
+    phases::lap("before");
     let mut dom = navigator_dom::parse(html);
+    phases::lap("parse");
     let mut report = Report::default();
     let budget = inputs.budget;
     VAR_BUDGET.with(|b| b.set((budget.var_steps, budget.var_tokens)));
@@ -203,12 +213,14 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     for (what, _) in &sheet.dropped { report.drop(format!("@{what} not representable")) }
     report.rules_in = sheet.rules.len();
 
+    phases::lap("css");
     // 2. The cascade, resolved by this program rather than by the renderer.
     let els: Vec<Handle> = (0..dom.nodes.len() as Handle)
         .filter(|h| matches!(dom.get(*h).map(|n| &n.kind), Some(Kind::Element(_)))).collect();
     let matcher_dom = navigator_dom::parse(html); // a stable copy to match against
     let m = sel::Matcher::new(&matcher_dom).with_budget(budget.match_steps);
     let index = sel::RuleIndex::new(&matcher_dom, &els);
+    phases::lap("index");
     // Past the element budget the cascade is not attempted: every rule
     // would be matched against every element. The text is kept.
     if els.len() > budget.elements {
@@ -223,6 +235,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     // page in its dark palette no matter the environment. That is what the
     // first version did, and the render is what showed it.
     let custom = resolve_customs(&sheet, &index, &m, &dom);
+    phases::lap("customs");
 
     // key: (element, state, media) -> property -> (priority, value)
     type Key = (Handle, String, String);
@@ -252,6 +265,12 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
                 None => { report.drop(format!("@media {q} not admitted")); continue }
             },
         };
+        // ★ A declaration with no `var()` expands to the same longhands on
+        // every element the rule matches, so it is expanded once per rule
+        // (cut B, legacy-web §5.4.5.7): `to_longhands` was run per element
+        // per declaration. Its report entries are kept with it and counted
+        // again on every use, so the report is what it was.
+        let mut expanded: Vec<Option<Expanded>> = vec![None; rule.decls.len()];
         for c in &list {
             if sel::has_pseudo_element(c) { report.drop("pseudo-element (no generated content in the profile)"); continue }
             let spec = sel::specificity(c);
@@ -286,7 +305,32 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
                         masked.insert(*h);
                     }
                 }
-                for d in &rule.decls {
+                for (di, d) in rule.decls.iter().enumerate() {
+                    if !uses_var(&d.value) {
+                        let e = expanded[di].get_or_insert_with(|| {
+                            let mut scratch = Report::default();
+                            let dark = (media.is_empty() && has_light_dark(&d.value))
+                                .then(|| to_longhands(&d.name, &pick_light_dark(&d.value, true), inputs, &mut scratch));
+                            let light = to_longhands(&d.name, &pick_light_dark(&d.value, false), inputs, &mut scratch);
+                            Expanded { dark, light, drops: scratch.dropped.into_iter().collect() }
+                        });
+                        for (why, n) in &e.drops { report.drop_n(why.clone(), *n) }
+                        if let Some(dark) = &e.dark {
+                            let mut block = BTreeMap::new();
+                            for (prop, v) in dark {
+                                block.insert(prop.clone(), ((d.important, layer_rank(rule.layer, sheet.layers.len(), d.important), spec, rule.order), v.clone()));
+                            }
+                            if !block.is_empty() { pending.push(("(prefers-color-scheme: dark)".to_string(), block)) }
+                        }
+                        let pri: Priority = (d.important, layer_rank(rule.layer, sheet.layers.len(), d.important), spec, rule.order);
+                        for (prop, v) in &e.light {
+                            match slot.get(prop) {
+                                Some((old, _)) if *old > pri => {}
+                                _ => { slot.insert(prop.clone(), (pri, v.clone())); }
+                            }
+                        }
+                        continue;
+                    }
                     let value = substitute(&d.value, scope, 0);
                     // ★ `light-dark(L, D)` (CSS Color 5): the LIGHT value here,
                     // and the dark one in a `prefers-color-scheme: dark`
@@ -337,6 +381,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         }
     }
 
+    phases::lap("cascade");
     // 4. Inline `style=` attributes: higher than any rule, as CSS says, and
     //    the single biggest refusal in the corpus (21 of 29 documents).
     for h in &els {
@@ -706,7 +751,9 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     }
 
     // ★ MARGIN COLLAPSING, compiled into literal margins (see `collapse`).
+    phases::lap("resolve");
     collapse::compile(&mut resolved, &dom, &ua_values(&index, &m), &mut report);
+    phases::lap("collapse");
 
     // ★ Resolve named areas into the numeric lines the profile admits —
     // PER MEDIA CONTEXT. A responsive page keeps its whole layout in the
@@ -779,6 +826,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     if !outranked.is_empty() { report.drop_n("conditional declaration outranked by an unconditional one", outranked.len()) }
     for (k, p) in outranked { if let Some(x) = resolved.get_mut(&k) { x.remove(&p); } }
 
+    phases::lap("layout-rules");
     // 5. Emit: one class per distinct block, so elements that resolved to the
     //    same declarations share a rule instead of each getting their own.
     let mut blocks: BTreeMap<(String, String, Block), String> = BTreeMap::new();
@@ -831,6 +879,7 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
     if VAR_EXHAUSTED.with(|b| b.get()) { report.drop("var() substitution past the document's budget (declarations dropped)") }
     report.elements_styled = per_element.len();
 
+    phases::lap("emit");
     // 6. Rewrite the document: generated classes on, `style=` off, `<link>`
     //    and the old `<style>` blocks gone, one new sheet in the head.
     for (h, names) in &per_element {
@@ -902,8 +951,10 @@ pub fn normalize(html: &str, inputs: &Inputs) -> (String, Report) {
         ["lang", "dir", "class", "id"].iter().filter_map(|a| dom.attr(*h, a).map(|v| format!(" {a}=\"{}\"", v.replace('"', "&quot;"))))
             .collect::<String>()
     }).unwrap_or_default();
+    phases::lap("rewrite");
     let body = dom.serialize();
     let doc = format!("<html{root_attrs}><head><style>\n{out}</style></head>{body}</html>\n");
+    phases::lap("serialize");
     (doc, report)
 }
 

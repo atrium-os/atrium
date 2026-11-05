@@ -26,26 +26,65 @@
 
 use crate::{Priority, Report};
 use navigator_dom::{Dom, Handle, Kind};
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 
 pub(crate) type Resolved = BTreeMap<(Handle, String, String), BTreeMap<String, (Priority, String)>>;
 
 /// Effective values in one media context: the context's own, then the
 /// base's, then the UA's.
+///
+/// ★ Everything a walk asks of an element is a function of `resolved`,
+/// `ua` and `dom`, which do not change while a context is solved — so it is
+/// remembered (cut B, legacy-web §5.4.5.7). `empty(h)` looks at h's whole
+/// subtree and was asked again at every level of every chain walk above
+/// it: 31% of normalize on the corpus's first displays, quadratic on deep
+/// pages. The answers are the same; they are computed once.
 struct Ctx<'a> {
-    resolved: &'a Resolved,
-    ua: &'a BTreeMap<Handle, BTreeMap<String, String>>,
-    dom: &'a Dom,
-    ctx: String,
     font: BTreeMap<Handle, Option<f64>>,
+    dom: &'a Dom,
+    /// Each element's declarations in this context, the base context and
+    /// the UA, looked up once instead of three keyed searches per question.
+    own: HashMap<Handle, &'a BTreeMap<String, (Priority, String)>>,
+    base: HashMap<Handle, &'a BTreeMap<String, (Priority, String)>>,
+    ua: &'a BTreeMap<Handle, BTreeMap<String, String>>,
+    memo_get: RefCell<HashMap<(Handle, &'static str), Option<String>>>,
+    memo_items: RefCell<HashMap<Handle, Rc<Vec<Item>>>>,
+    memo_empty: RefCell<HashMap<Handle, bool>>,
 }
 
+/// Every property a walk asks for, by name, so a question can be
+/// remembered under a `&'static str`.
+const ASKED: [&str; 26] = ["display", "position", "overflow-x", "overflow-y", "top", "bottom", "height", "min-height",
+    "max-height", "font-size", "margin-top", "margin-bottom", "padding-top", "padding-bottom",
+    "border-top-style", "border-bottom-style", "border-top-width", "border-bottom-width",
+    "border-left-style", "border-right-style", "border-left-width", "border-right-width",
+    "padding-left", "padding-right", "margin-left", "margin-right"];
+
 impl<'a> Ctx<'a> {
+    fn new(resolved: &'a Resolved, ua: &'a BTreeMap<Handle, BTreeMap<String, String>>, dom: &'a Dom, ctx: &str) -> Self {
+        let mut own = HashMap::new();
+        let mut base = HashMap::new();
+        for ((h, st, media), props) in resolved.iter() {
+            if !st.is_empty() { continue }
+            if media.is_empty() { base.insert(*h, props); }
+            if media == ctx { own.insert(*h, props); }
+        }
+        Ctx { font: BTreeMap::new(), dom, own, base, ua,
+              memo_get: RefCell::default(), memo_items: RefCell::default(), memo_empty: RefCell::default() }
+    }
     fn get(&self, h: Handle, p: &str) -> Option<String> {
-        self.resolved.get(&(h, String::new(), self.ctx.clone())).and_then(|x| x.get(p)).map(|(_, v)| v.clone())
-            .or_else(|| self.resolved.get(&(h, String::new(), String::new())).and_then(|x| x.get(p)).map(|(_, v)| v.clone()))
+        let key = ASKED.iter().find(|a| **a == p).copied();
+        if let Some(k) = key {
+            if let Some(v) = self.memo_get.borrow().get(&(h, k)) { return v.clone() }
+        }
+        let v = self.own.get(&h).and_then(|x| x.get(p)).map(|(_, v)| v.clone())
+            .or_else(|| self.base.get(&h).and_then(|x| x.get(p)).map(|(_, v)| v.clone()))
             .or_else(|| self.ua.get(&h).and_then(|x| x.get(p)).cloned())
-            .map(|v| v.trim().to_ascii_lowercase())
+            .map(|v| v.trim().to_ascii_lowercase());
+        if let Some(k) = key { self.memo_get.borrow_mut().insert((h, k), v.clone()); }
+        v
     }
     fn is_el(&self, h: Handle) -> bool { matches!(self.dom.get(h).map(|n| &n.kind), Some(Kind::Element(_))) }
     fn display(&self, h: Handle) -> String { self.get(h, "display").unwrap_or_else(|| "inline".into()) }
@@ -81,10 +120,13 @@ impl<'a> Ctx<'a> {
     /// Children, in flow order. A block inside an inline (`<span><div>`) is
     /// split out of it and joins this flow, so such an inline is looked
     /// through.
-    fn items(&self, g: Handle) -> Vec<Item> {
+    fn items(&self, g: Handle) -> Rc<Vec<Item>> {
+        if let Some(v) = self.memo_items.borrow().get(&g) { return v.clone() }
         let mut out = vec![];
         self.items_into(g, &mut out);
-        out
+        let v = Rc::new(out);
+        self.memo_items.borrow_mut().insert(g, v.clone());
+        v
     }
     fn items_into(&self, g: Handle, out: &mut Vec<Item>) {
         for c in self.dom.children_of(g) {
@@ -104,10 +146,13 @@ impl<'a> Ctx<'a> {
     }
     /// An empty box its chain passes straight through.
     fn empty(&self, h: Handle) -> bool {
-        self.display(h) == "block" && !self.bfc_root(h)
+        if let Some(v) = self.memo_empty.borrow().get(&h) { return *v }
+        let v = self.display(h) == "block" && !self.bfc_root(h)
             && !self.solid_edge(h, "top") && !self.solid_edge(h, "bottom")
             && self.zero(self.get(h, "height")) && self.zero(self.get(h, "min-height"))
-            && self.items(h).iter().all(|i| match i { Item::Block(c) => self.empty(*c), Item::Abs => true, Item::Line => false })
+            && self.items(h).iter().all(|i| match i { Item::Block(c) => self.empty(*c), Item::Abs => true, Item::Line => false });
+        self.memo_empty.borrow_mut().insert(h, v);
+        v
     }
     fn passes_top(&self, h: Handle) -> bool { self.display(h) == "block" && !self.bfc_root(h) && !self.solid_edge(h, "top") }
     fn passes_bottom(&self, h: Handle) -> bool {
@@ -202,7 +247,7 @@ impl<'a> Ctx<'a> {
     /// children collapse through it too, all of theirs.
     fn empty_slots(&self, h: Handle, out: &mut Vec<Slot>) {
         out.push((h, "top"));
-        for it in self.items(h) { if let Item::Block(c) = it { self.empty_slots(c, out) } }
+        for it in self.items(h).iter() { if let Item::Block(c) = *it { self.empty_slots(c, out) } }
         out.push((h, "bottom"));
     }
     /// The margins that adjoin at `h`'s top edge, outermost first.
@@ -210,7 +255,7 @@ impl<'a> Ctx<'a> {
         if self.empty(h) { self.empty_slots(h, out); return }
         out.push((h, "top"));
         if !self.passes_top(h) { return }
-        for it in self.items(h) {
+        for it in self.items(h).iter().copied() {
             match it {
                 Item::Line => return,
                 Item::Abs => {}
@@ -225,7 +270,7 @@ impl<'a> Ctx<'a> {
     fn bottom_chain(&self, h: Handle, out: &mut Vec<Slot>) {
         out.push((h, "bottom"));
         if !self.passes_bottom(h) || self.empty(h) { return }
-        for it in self.items(h).into_iter().rev() {
+        for it in self.items(h).iter().rev().copied() {
             match it {
                 Item::Line => return,
                 Item::Abs => {}
@@ -379,7 +424,7 @@ pub(crate) fn compile(resolved: &mut Resolved, dom: &Dom, ua: &BTreeMap<Handle, 
     let mut results: Vec<(String, BTreeMap<Slot, String>)> = vec![];
     let mut unresolved = 0usize;
     for ctx in &contexts {
-        let mut c = Ctx { resolved, ua, dom, ctx: ctx.clone(), font: BTreeMap::new() };
+        let mut c = Ctx::new(resolved, ua, dom, ctx);
         let r = solve(&mut c, &containers, &mut unresolved);
         results.push((ctx.clone(), r));
     }

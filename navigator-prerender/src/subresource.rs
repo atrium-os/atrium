@@ -258,6 +258,10 @@ impl Fetcher for Remembering<'_> {
         FETCHED.with(|f| f.borrow_mut().1.insert(url.to_string(), r.clone()));
         r.map(|b| (*b).clone())
     }
+    fn hint(&mut self, url: &str) {
+        if FETCHED.with(|f| f.borrow().0.contains_key(url)) { return }
+        self.inner.hint(url)
+    }
     /// From the whole body when this conversion has it; otherwise asked of
     /// the fetcher, and NOT remembered: a header is not the body, and the
     /// request for the body, when it comes, is the same request as before.
@@ -284,6 +288,33 @@ fn collect_inner(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher, mode:
             None => href.starts_with("http").then(|| href.to_string()),
         }
     };
+
+    // ★ IMPORTS EARLY (legacy-web §5.4.5.7, cut B). The sheets were hinted
+    // together, so they arrive in parallel; an `@import` was found only
+    // when the walk below reached its sheet, and fetched then, alone. So
+    // first take every sheet as it arrives, hinting its imports at once,
+    // then theirs, to the profile's depth; the walk below then finds them
+    // all fetched or in flight. It is the same walk over the same bytes
+    // (the conversion's memo), so what it collects is unchanged.
+    let mut level: Vec<String> = vec![];
+    for h in dom.by_tag_anywhere("link") {
+        let is_sheet = dom.attr(h, "rel").is_some_and(|r| r.split_ascii_whitespace().any(|x| x.eq_ignore_ascii_case("stylesheet")));
+        if let (true, Some(abs)) = (is_sheet, dom.attr(h, "href").and_then(|href| resolve(href))) {
+            if !level.contains(&abs) { level.push(abs) }
+        }
+    }
+    for _ in 0..MAX_IMPORT_DEPTH {
+        let mut next = vec![];
+        for abs in &level {
+            let Ok(text) = fetcher.get(abs) else { continue };
+            for t in import_targets(&text) {
+                let Ok(u) = url::Url::parse(abs).and_then(|b| b.join(&t)) else { continue };
+                let u = u.to_string();
+                if !next.contains(&u) { fetcher.hint(&u); next.push(u) }
+            }
+        }
+        level = next;
+    }
 
     for h in dom.by_tag_anywhere("link") {
         let is_sheet = dom.attr(h, "rel").is_some_and(|r| r.split_ascii_whitespace().any(|x| x.eq_ignore_ascii_case("stylesheet")));
@@ -382,14 +413,24 @@ fn collect_inner(dom: &Dom, base: Option<&str>, fetcher: &mut dyn Fetcher, mode:
 /// names it. ★ The two differ, and the import must be keyed the way the
 /// normalizer will resolve it — relative to the importing sheet's own key —
 /// or the lookup misses and the imported CSS is silently absent.
-fn imports(css: &str, abs: &str, key: &str, fetcher: &mut dyn Fetcher, depth: usize, out: &mut Subresources) {
-    if depth >= MAX_IMPORT_DEPTH || !css.contains("@import") { return }
-    for stmt in css.split("@import").skip(1) {
-        let head = &stmt[..stmt.find(';').unwrap_or(stmt.len().min(256))];
+/// The targets of a sheet's `@import`s, in order, as `imports` reads them.
+fn import_targets(css: &str) -> Vec<String> {
+    if !css.contains("@import") { return vec![] }
+    css.split("@import").skip(1).filter_map(|stmt| {
+        // ★ At most 256 bytes when there is no `;` — cut on a character
+        // boundary: a byte index inside a multi-byte character panicked.
+        let cut = stmt.find(';').unwrap_or_else(|| (0..=stmt.len().min(256)).rev().find(|&i| stmt.is_char_boundary(i)).unwrap_or(0));
+        let head = &stmt[..cut];
         let target = head.split_once('"').map(|(_, r)| r.split('"').next().unwrap_or("").to_string())
             .or_else(|| head.split_once("url(").map(|(_, r)| r.split(')').next().unwrap_or("").trim_matches(['"', '\'']).to_string()))
             .unwrap_or_default();
-        if target.is_empty() { continue }
+        (!target.is_empty()).then_some(target)
+    }).collect()
+}
+
+fn imports(css: &str, abs: &str, key: &str, fetcher: &mut dyn Fetcher, depth: usize, out: &mut Subresources) {
+    if depth >= MAX_IMPORT_DEPTH { return }
+    for target in import_targets(css) {
         let Ok(next_abs) = url::Url::parse(abs).and_then(|b| b.join(&target)) else { continue };
         let next_abs = next_abs.to_string();
         let next_key = match (target.starts_with("http"), key.rfind('/')) {
@@ -405,6 +446,48 @@ fn imports(css: &str, abs: &str, key: &str, fetcher: &mut dyn Fetcher, depth: us
             }
             Err(e) => out.failed.push((next_key, e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+
+    #[test]
+    fn import_targets_read_both_forms_and_a_hostile_tail_does_not_panic() {
+        assert_eq!(import_targets("@import \"a.css\"; @import url(b.css) screen; p{}"), vec!["a.css", "b.css"]);
+        // No `;`, and byte 256 falls inside a multi-byte character.
+        let hostile = format!("@import {}é{}", "x".repeat(248), "é".repeat(200));
+        let _ = import_targets(&hostile);
+        assert!(import_targets("p { color: red }").is_empty());
+    }
+
+    /// Sheets that arrive as asked; every request and hint logged in order.
+    struct Log(Vec<String>);
+    impl Fetcher for Log {
+        fn get(&mut self, url: &str) -> Result<String, String> {
+            self.0.push(format!("get {url}"));
+            Ok(if url.ends_with("/a.css") { "@import \"imp.css\"; a{}".into() } else if url.ends_with("/imp.css") { "@import \"deep.css\";".into() } else { "b{}".into() })
+        }
+        fn hint(&mut self, url: &str) { self.0.push(format!("hint {url}")) }
+    }
+
+    #[test]
+    fn imports_are_hinted_as_their_sheet_arrives_and_the_collection_is_unchanged() {
+        forget_fetched();
+        let dom = navigator_dom::parse(r#"<link rel=stylesheet href="/a.css"><link rel=stylesheet href="/b.css">"#);
+        let mut f = Log(vec![]);
+        let subs = collect_first(&dom, Some("https://s.example/p"), &mut f);
+        forget_fetched();
+        let at = |s: &str| f.0.iter().position(|l| l == s).unwrap_or_else(|| panic!("{s} not in {:?}", f.0));
+        // The import is hinted before the second sheet is asked for, and
+        // the nested one before the import is (the walk then asks for it).
+        assert!(at("hint https://s.example/imp.css") < at("get https://s.example/b.css"), "{:?}", f.0);
+        assert!(at("hint https://s.example/deep.css") < at("get https://s.example/deep.css"), "{:?}", f.0);
+        // Each fetched once, and collected as the walk always collected them.
+        assert_eq!(f.0.iter().filter(|l| l.starts_with("get ")).count(), 4, "{:?}", f.0);
+        let hrefs: Vec<&str> = subs.sheets.iter().map(|s| s.href.as_str()).collect();
+        assert_eq!(hrefs, vec!["/deep.css", "/imp.css", "/a.css", "/b.css"]);
     }
 }
 
