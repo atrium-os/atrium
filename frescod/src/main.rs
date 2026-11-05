@@ -41,8 +41,9 @@ mod socket_server;
 mod split;
 mod gpu_app;
 mod chrome;
+mod screen;
 
-use atrium_gpu::amd::{Display, Gpu, ResetWatch, Scanout, COMMIT_MODESET};
+use atrium_gpu::amd::{Display, EventWatch, Gpu, ModeV2, Scanout, MODE_PREFERRED, NOTE_HOTPLUG, NOTE_RESET};
 
 use fresco_scene_server::cas::store::CasStore;
 use fresco_scene_server::command::envelope_frontend::EnvelopeFrontend;
@@ -98,16 +99,26 @@ fn main() -> std::io::Result<()> {
     let vm = gpu.create_vm()?;
     let dpy = Display::open()?;
 
-    let conn = dpy.connector()?;
-    let modes = dpy.modes()?;
-    let mode = *modes.first().expect("at least one mode");
+    /* The mode: FRESCOD_MODE (WxH or WxH@Hz) if the monitor offers it,
+     * else its preferred one. A WM can switch later (OP_WM_SET_DISPLAY_MODE),
+     * and a hotplug re-picks. */
+    let conn = dpy.connector_v2()?;
+    let mut mode_index = find_mode(&conn.modes, wanted_mode())
+        .or_else(|| preferred_mode(&conn.modes))
+        .ok_or_else(|| io_other("display: no monitor, or its EDID lists no modes"))?;
+    let mut mode = conn.modes[mode_index];
+    /* Which monitor the mode was chosen for: a hotplug that brings the same
+     * one back keeps its mode, a different one starts at its own choice. */
+    let mut monitor_edid = conn.edid.clone();
     eprintln!(
-        "frescod: connector type {} {}x{} @ {} mHz, {} scanout buffers",
-        conn.connector_type, mode.width, mode.height, mode.refresh_mhz, SCANOUT_BUFFERS,
+        "frescod: connector type {} {}x{} @ {} mHz ({} of {} modes), {} scanout buffers",
+        conn.connector_type, mode.width, mode.height, mode.refresh_mhz, mode_index + 1,
+        conn.modes.len(), SCANOUT_BUFFERS,
     );
+    screen::set(mode.width, mode.height, mode.refresh_mhz);
 
     let bytes = u64::from(mode.width) * u64::from(mode.height) * 4;
-    let scan = Scanout::with_buffers(&vm, bytes, SCANOUT_BUFFERS)?;
+    let mut scan = Scanout::with_buffers(&vm, bytes, SCANOUT_BUFFERS)?;
     /* copy_done reaches N when frame N's pixels are in VRAM; flip_done
      * reaches N when frame N is on screen (and frame N-1's buffer is free). */
     let copy_done = gpu.create_syncobj()?;
@@ -118,11 +129,7 @@ fn main() -> std::io::Result<()> {
      * so the GPU scheduler serves it ahead of background work — it makes its
      * vblank under contention (the GPU side of the frame-pacing deadline, matching
      * the CPU-side vblank deadline frescod already sponsors). */
-    let frame_deadline_ns: u32 = if mode.refresh_mhz > 0 {
-        (1_000_000_000_000u64 / u64::from(mode.refresh_mhz)).min(u32::MAX as u64) as u32
-    } else {
-        16_000_000 // ~60 Hz fallback
-    };
+    let mut frame_deadline_ns = frame_deadline(mode.refresh_mhz);
     /* Reusable CPU framebuffer the renderer paints into each frame, then
      * uploaded into the VRAM scanout via scan.update (DMA copy). */
     let mut framebuffer = vec![0u8; bytes as usize];
@@ -150,6 +157,7 @@ fn main() -> std::io::Result<()> {
      * (OP_DISPLAY_INFO) rather than each assuming a screen size. */
     frontend.lock().unwrap()
         .set_display_mode(mode.width, mode.height, mode.refresh_mhz);
+    publish_modes(&frontend, &conn.modes, Some(mode_index));
 
     /* ── Socket server ───────────────────────────────────────────── */
     let sock_path = std::env::var("FRESCOD_SOCK")
@@ -189,6 +197,7 @@ fn main() -> std::io::Result<()> {
      * directly (boot-protocol HID), update server cursor / focus state,
      * and push DisplayEvents through the shared event sink. Fail-soft:
      * frescod runs without input if no matching /dev/hidraw* is found. */
+    let ev_main = ev_tx.clone();	/* EV_DISPLAY_CHANGED on a mode switch */
     input_reader::spawn(ev_tx.clone(), comp.clone());
     pointer_reader::spawn(ev_tx.clone(), comp.clone(), mode.width, mode.height);
     /* Synthetic input injection (dev/test harness): feeds the same event sink as
@@ -205,28 +214,38 @@ fn main() -> std::io::Result<()> {
      * next heartbeat. The gpu renderer falls back to Tier-2 for the
      * recovery, since its GPU state may be gone, and goes back to the GPU
      * once no reset has come for GPU_BACK_AFTER. */
+    /* Hotplug (display ABI 2.1): a monitor came, went or was swapped. The
+     * same thread counts those; the frame loop re-reads the connector and
+     * picks a mode the new monitor offers. */
     const GPU_BACK_AFTER: Duration = Duration::from_secs(5);
     let reset_gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    match ResetWatch::new(&dpy) {
+    let hotplugs = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    match EventWatch::new(&dpy, NOTE_RESET | NOTE_HOTPLUG) {
         Ok(watch) => {
-            let (gen, rd) = (reset_gen.clone(), redraw.clone());
-            std::thread::Builder::new().name("reset-watch".into()).spawn(move || loop {
+            let (gen, hp, rd) = (reset_gen.clone(), hotplugs.clone(), redraw.clone());
+            std::thread::Builder::new().name("display-events".into()).spawn(move || loop {
                 match watch.wait(None) {
-                    Ok(Some(g)) => {
-                        gen.store(g, std::sync::atomic::Ordering::SeqCst);
+                    Ok(Some(ev)) => {
+                        if ev.reset {
+                            gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        if ev.hotplug {
+                            hp.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
                         rd.wake();
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        eprintln!("frescod: reset watch stopped: {e}");
+                        eprintln!("frescod: display event watch stopped: {e}");
                         return;
                     }
                 }
             })?;
         }
-        Err(e) => eprintln!("frescod: no NOTE_RESET from the display ({e}); a reset repaints at the next heartbeat"),
+        Err(e) => eprintln!("frescod: no display events ({e}); a reset repaints at the next heartbeat, hotplug is not seen"),
     }
     let mut handled_gen: u64 = 0;
+    let mut handled_hotplugs: u64 = 0;
     let mut gpu_back_at: Option<Instant> = None;
 
     /* ── Frame loop ─────────────────────────────────────────────── */
@@ -237,15 +256,16 @@ fn main() -> std::io::Result<()> {
         .map_err(io_other)?;
     renderer.present(&scan, on_screen, &mut framebuffer, frame_deadline_ns, (&copy_done, frame))
         .map_err(io_other)?;
-    check_fault("modeset", dpy.commit(
-        scan.buffer(on_screen), COMMIT_MODESET, 0,
+    check_fault("modeset", dpy.modeset_fenced(
+        scan.buffer(on_screen), mode_index as u32, conn.generation, 0,
         Some((&copy_done, frame)), Some((&flip_done, frame)),
     ).or_else(|e| {
         /* MODESET doesn't wait for its in-fence: if the copy is still
          * running, wait for it and retry once. */
         if e.raw_os_error() == Some(libc::EAGAIN) {
             copy_done.wait(frame, flip_timeout_ms())?;
-            dpy.commit(scan.buffer(on_screen), COMMIT_MODESET, 0, None, Some((&flip_done, frame)))
+            dpy.modeset_fenced(scan.buffer(on_screen), mode_index as u32, conn.generation, 0,
+                None, Some((&flip_done, frame)))
         } else {
             Err(e)
         }
@@ -279,7 +299,7 @@ fn main() -> std::io::Result<()> {
         let reset_due = gen != handled_gen;
         if reset_due {
             handled_gen = gen;
-            eprintln!("frescod: device reset (generation {gen}): re-presenting the screen");
+            eprintln!("frescod: device reset ({gen} seen): re-presenting the screen");
             match renderer.fall_back_to_cpu(mode.width, mode.height) {
                 Ok(true) => {
                     eprintln!("frescod: renderer -> {} until the GPU stays up", renderer.name());
@@ -300,6 +320,101 @@ fn main() -> std::io::Result<()> {
                 Err(e) => eprintln!("frescod: GPU renderer not back ({e}); staying on Tier-2"),
             }
         }
+        /* A hotplug, or a WM asking for another mode: pick the mode and,
+         * if it is not the lit one, switch (see switch_mode). */
+        let hp = hotplugs.load(std::sync::atomic::Ordering::SeqCst);
+        let request = frontend.lock().unwrap().take_mode_request();
+        if hp != handled_hotplugs || request.is_some() {
+            let hotplug = hp != handled_hotplugs;
+            handled_hotplugs = hp;
+            let conn = dpy.connector_v2()?;
+            if !conn.connected {
+                eprintln!("frescod: monitor unplugged; the last mode stays programmed");
+                publish_modes(&frontend, &[], None);
+            } else {
+                let cur = (mode.width, mode.height, mode.refresh_mhz);
+                let same_monitor = conn.edid == monitor_edid;
+                monitor_edid = conn.edid.clone();
+                let pick = match request {
+                    Some(r) => find_mode(&conn.modes, Some(r)),
+                    /* The same monitor back: keep its mode. A new one gets
+                     * FRESCOD_MODE or its preferred mode, as at startup. */
+                    None if same_monitor => find_mode(&conn.modes, Some(cur))
+                        .or_else(|| find_mode(&conn.modes, wanted_mode()))
+                        .or_else(|| preferred_mode(&conn.modes)),
+                    None => find_mode(&conn.modes, wanted_mode())
+                        .or_else(|| preferred_mode(&conn.modes)),
+                };
+                match pick {
+                    None => eprintln!("frescod: no mode to switch to ({request:?}); staying"),
+                    Some(i) if conn.current == Some(i) => {
+                        if hotplug {
+                            eprintln!("frescod: monitor plugged in; {}x{}@{} mHz kept",
+                                mode.width, mode.height, mode.refresh_mhz);
+                        }
+                        mode_index = i;
+                        publish_modes(&frontend, &conn.modes, Some(i));
+                    }
+                    Some(i) => {
+                        /* The last flip must be on screen first. */
+                        let _ = flip_done.wait(frame, flip_timeout_ms());
+                        let m = conn.modes[i];
+                        let resized = (m.width, m.height) != (mode.width, mode.height);
+                        let fault = if resized {
+                            /* Light the new mode with fresh buffers, then
+                             * rebuild the renderer for them; on a refusal the
+                             * old ones stay, untouched. */
+                            let bytes = u64::from(m.width) * u64::from(m.height) * 4;
+                            /* No room for the new buffers (VRAM or GPU
+                             * VA): refuse the switch, keep the old mode. */
+                            match Scanout::with_buffers(&vm, bytes, SCANOUT_BUFFERS) {
+                                Err(e) => Err(e),
+                                Ok(fresh) => {
+                                    let r = dpy.modeset_at(fresh.buffer(0), i as u32, conn.generation, 0);
+                                    if matches!(r, Ok(0)) {
+                                        renderer.resize(&vm, m.width, m.height, load_bundles).map_err(io_other)?;
+                                        scan = fresh;
+                                        framebuffer = vec![0u8; bytes as usize];
+                                        on_screen = 0;
+                                    }
+                                    r
+                                }
+                            }
+                        } else {
+                            dpy.modeset_at(scan.buffer(on_screen), i as u32, conn.generation, 0)
+                        };
+                        match fault {
+                            Ok(0) => {
+                                eprintln!("frescod: mode {}x{} @ {} mHz -> {}x{} @ {} mHz{}",
+                                    mode.width, mode.height, mode.refresh_mhz,
+                                    m.width, m.height, m.refresh_mhz,
+                                    if hotplug { " (monitor changed)" } else { "" });
+                                mode = m;
+                                mode_index = i;
+                                frame_deadline_ns = frame_deadline(mode.refresh_mhz);
+                                screen::set(mode.width, mode.height, mode.refresh_mhz);
+                                let info = {
+                                    let mut f = frontend.lock().unwrap();
+                                    f.set_display_mode(mode.width, mode.height, mode.refresh_mhz);
+                                    f.display_info()
+                                };
+                                publish_modes(&frontend, &conn.modes, Some(i));
+                                let _ = ev_main.send(fresco_scene_server::window::DisplayEvent::DisplayChanged {
+                                    width: info.width, height: info.height,
+                                    refresh_mhz: info.refresh_mhz, reserved_top: info.reserved_top,
+                                });
+                                last_gen = 0; /* repaint at once */
+                            }
+                            Ok(f) => eprintln!("frescod: mode switch refused (fault {f}); staying"),
+                            Err(e) => eprintln!("frescod: mode switch failed ({e}); staying"),
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+        let _ = mode_index;
+
         let cur = redraw.current();
         let heartbeat_due = last_render.elapsed() >= heartbeat;
         if cur == last_gen && !heartbeat_due && !reset_due {
@@ -572,6 +687,68 @@ fn render_one_frame(
     }).collect();
     comp.lock().unwrap().shown = Some(shown);
     Ok(())
+}
+
+/// The frame deadline: one refresh interval, in ns (refresh is milli-Hz).
+fn frame_deadline(refresh_mhz: u32) -> u32 {
+    if refresh_mhz > 0 {
+        (1_000_000_000_000u64 / u64::from(refresh_mhz)).min(u32::MAX as u64) as u32
+    } else {
+        16_000_000 // ~60 Hz fallback
+    }
+}
+
+/// FRESCOD_MODE: `WxH` or `WxH@Hz` (Hz may have decimals: 59.94).
+fn wanted_mode() -> Option<(u32, u32, u32)> {
+    let v = std::env::var("FRESCOD_MODE").ok()?;
+    let parsed = parse_mode(&v);
+    if parsed.is_none() {
+        eprintln!("frescod: FRESCOD_MODE={v}: want WxH or WxH@Hz; ignored");
+    }
+    parsed
+}
+
+fn parse_mode(v: &str) -> Option<(u32, u32, u32)> {
+    let (size, hz) = match v.split_once('@') {
+        Some((s, h)) => (s, Some(h)),
+        None => (v, None),
+    };
+    let (w, h) = size.split_once('x')?;
+    let mhz = match hz {
+        Some(h) => (h.trim().parse::<f64>().ok()? * 1000.0).round() as u32,
+        None => 0,
+    };
+    Some((w.trim().parse().ok()?, h.trim().parse().ok()?, mhz))
+}
+
+/// The listed mode matching (width, height, refresh mHz): refresh 0 takes
+/// the first at that size, else the closest within 1 Hz.
+fn find_mode(modes: &[ModeV2], want: Option<(u32, u32, u32)>) -> Option<usize> {
+    let (w, h, r) = want?;
+    let mut sized = modes.iter().enumerate().filter(|(_, m)| m.width == w && m.height == h);
+    if r == 0 {
+        return sized.next().map(|(i, _)| i);
+    }
+    sized.filter(|(_, m)| m.refresh_mhz.abs_diff(r) <= 1000)
+        .min_by_key(|(_, m)| m.refresh_mhz.abs_diff(r))
+        .map(|(i, _)| i)
+}
+
+/// The monitor's preferred mode (flagged; the first listed otherwise).
+fn preferred_mode(modes: &[ModeV2]) -> Option<usize> {
+    modes.iter().position(|m| m.flags & MODE_PREFERRED != 0)
+        .or(if modes.is_empty() { None } else { Some(0) })
+}
+
+/// Tell the WM side what the monitor offers (`OP_WM_DISPLAY_MODES`).
+fn publish_modes(frontend: &Arc<Mutex<EnvelopeFrontend>>, modes: &[ModeV2], current: Option<usize>) {
+    let list = modes.iter().map(|m| fresco_protocol::WmDisplayMode {
+        width: m.width,
+        height: m.height,
+        refresh_mhz: m.refresh_mhz,
+        preferred: m.flags & MODE_PREFERRED != 0,
+    }).collect();
+    frontend.lock().unwrap().set_display_modes(list, current.map_or(u32::MAX, |i| i as u32));
 }
 
 /// A non-zero display fault code (from a commit) is an error.

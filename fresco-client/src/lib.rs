@@ -53,7 +53,7 @@ use fresco_protocol::{
     ErrorReply,
     scene_ops,
 };
-pub use fresco_protocol::{WmSurfaceInfo, WmRole, WmRect, WmSlot};
+pub use fresco_protocol::{WmSurfaceInfo, WmRole, WmRect, WmSlot, WmDisplayMode, WmDisplayModesReply};
 pub use fresco_protocol::DisplayInfoResponse as DisplayInfo;
 pub use fresco_protocol::DamageRect;
 pub use fresco_protocol::FontOpenResponse as RemoteFontMetrics;
@@ -76,6 +76,9 @@ pub enum Event {
     WindowCreated  { window_id: u32 },
     /// A surface was destroyed in this session.
     WindowDestroyed { window_id: u32 },
+    /// The display's mode changed (a switch, or a monitor plugged or
+    /// swapped): the new screen. Lay out again for it.
+    DisplayChanged(DisplayInfoResponse),
     /// Keyboard press/release. `window_id == 0` indicates broadcast
     /// (no focused window).
     Key {
@@ -476,6 +479,47 @@ impl Connection {
         self.send_window_managed(control::OP_WM_SET_RENDERING, decision)
     }
 
+    /// The modes the monitor offers and the lit one (window-management cap).
+    pub fn wm_display_modes(&mut self) -> io::Result<fresco_protocol::WmDisplayModesReply> {
+        self.send_window_managed(control::OP_WM_DISPLAY_MODES, &())?;
+        let m = self.wm_response(control::OP_WM_DISPLAY_MODES)?;
+        decode(&m.payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData,
+            format!("decode WM_DISPLAY_MODES reply: {e}")))
+    }
+
+    /// Switch the display to a mode it lists (`refresh_mhz` 0 = any refresh
+    /// at that size). Returns once frescod accepted it; the switch lands at
+    /// the next frame and is announced by [`Event::DisplayChanged`].
+    pub fn wm_set_display_mode(&mut self, width: u32, height: u32, refresh_mhz: u32) -> io::Result<()> {
+        let p = fresco_protocol::WmSetDisplayModePayload { width, height, refresh_mhz };
+        self.send_window_managed(control::OP_WM_SET_DISPLAY_MODE, &p)?;
+        self.wm_response(control::OP_WM_SET_DISPLAY_MODE).map(|_| ())
+    }
+
+    /// Wait for the IS_RESPONSE to WM op `op`, turning an IS_ERROR into an
+    /// error. Other messages in between are skipped, as `wm_enumerate` does.
+    fn wm_response(&mut self, op: u16) -> io::Result<Message> {
+        loop {
+            let m = self.inner.recv_message()?;
+            if m.opcode_class == CLASS_DISPLAY && m.op == op && m.flags & flag::IS_RESPONSE != 0 {
+                if m.flags & flag::IS_ERROR != 0 {
+                    let err: ErrorReply = decode(&m.payload).unwrap_or(ErrorReply {
+                        code: fresco_protocol::error_code::GENERIC,
+                        message: "refused".into(),
+                    });
+                    let kind = match err.code {
+                        fresco_protocol::error_code::FORBIDDEN => io::ErrorKind::PermissionDenied,
+                        fresco_protocol::error_code::BAD_PAYLOAD => io::ErrorKind::InvalidInput,
+                        _ => io::ErrorKind::Other,
+                    };
+                    return Err(io::Error::new(kind, format!("op {op:#x} refused: {} (code {})", err.message, err.code)));
+                }
+                return Ok(m);
+            }
+            log::debug!("wm op {op:#x}: skipping unrelated message op={:#x}", m.op);
+        }
+    }
+
     pub fn window_present(&mut self, window_id: u32) -> io::Result<()> {
         self.send_window_managed(control::OP_WINDOW_PRESENT,
             &WindowPresentPayload { window_id })
@@ -809,6 +853,10 @@ fn decode_event(op: u16, payload: &[u8]) -> Event {
         },
         EV_WINDOW_DESTROYED => match decode::<WindowDestroyedEvent>(payload) {
             Ok(p) => Event::WindowDestroyed { window_id: p.window_id },
+            Err(_) => Event::Unknown { op, payload: payload.to_vec() },
+        },
+        control::EV_DISPLAY_CHANGED => match decode::<DisplayInfoResponse>(payload) {
+            Ok(p) => Event::DisplayChanged(p),
             Err(_) => Event::Unknown { op, payload: payload.to_vec() },
         },
         EV_INPUT_KEY => match decode::<InputKeyEvent>(payload) {

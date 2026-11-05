@@ -186,12 +186,15 @@ pub fn spawn_event_fanout(
 enum Route {
     OwnerAndWm(Option<u8>),
     WmOnly,
+    /// Everyone: a change to the screen itself (EV_DISPLAY_CHANGED).
+    All,
 }
 
 impl Route {
     fn reaches(&self, sub: &Sub) -> bool {
         match self {
             Route::WmOnly => sub.wm,
+            Route::All => true,
             Route::OwnerAndWm(owner) => sub.wm || *owner == Some(sub.client_id),
         }
     }
@@ -210,6 +213,7 @@ fn route(ev: &DisplayEvent, comp: &Arc<Mutex<Compositor>>) -> Route {
         | E::InputPointerMotion { window_id, .. }
         | E::InputPointerButton { window_id, .. }
         | E::InputPointerScroll { window_id, .. } => window_id,
+        E::DisplayChanged { .. } => return Route::All,
     };
     if window_id == 0 {
         return Route::WmOnly;

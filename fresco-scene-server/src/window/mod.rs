@@ -47,6 +47,8 @@ pub enum DisplayEvent {
     WindowCreated        { window_id: u32 },
     /// A surface was destroyed. The WM reconciles to reclaim its slot.
     WindowDestroyed      { window_id: u32 },
+    /// The display's mode changed; every client lays out again.
+    DisplayChanged       { width: u32, height: u32, refresh_mhz: u32, reserved_top: u32 },
 
     /// Keyboard press/release routed to the focused window's owner.
     /// `window_id == 0` = no focus, broadcast to all clients. See
@@ -110,6 +112,12 @@ pub fn encode_event(ev: &DisplayEvent)
         DisplayEvent::WindowDestroyed { window_id } => {
             let p = WindowDestroyedEvent { window_id: *window_id };
             Ok((control::EV_WINDOW_DESTROYED, encode(&p)?))
+        }
+        DisplayEvent::DisplayChanged { width, height, refresh_mhz, reserved_top } => {
+            let p = fresco_protocol::DisplayInfoResponse {
+                width: *width, height: *height, refresh_mhz: *refresh_mhz, reserved_top: *reserved_top,
+            };
+            Ok((control::EV_DISPLAY_CHANGED, encode(&p)?))
         }
         DisplayEvent::InputKey { window_id, hid_usage, pressed, modifiers } => {
             let p = InputKeyEvent {

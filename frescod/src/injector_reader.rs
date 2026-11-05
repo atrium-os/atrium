@@ -50,6 +50,9 @@ fn serve(sink: Sender<DisplayEvent>, comp: Arc<Mutex<Compositor>>, sw: f32, sh: 
             let line = match line { Ok(l) => l, Err(_) => break };
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') { continue; }
+            /* The screen can change size (a mode switch). */
+            let (w, h, _) = crate::screen::get();
+            let (sw, sh) = if w > 0 { (w as f32, h as f32) } else { (sw, sh) };
             handle(&sink, &comp, sw, sh, line);
         }
     }

@@ -790,6 +790,22 @@ impl Display {
     /// `generation` it was read from (`ESTALE` if the monitor changed since;
     /// 0 skips the check). `pitch` 0 = packed.
     pub fn modeset_at(&self, bo: &Bo<'_>, index: u32, generation: u32, pitch: u32) -> io::Result<u32> {
+        self.modeset_fenced(bo, index, generation, pitch, None, None)
+    }
+
+    /// [`Self::modeset_at`] with fences: the in-fence must already be
+    /// signalled (`EAGAIN` otherwise); the out-fence fires with the mode lit.
+    pub fn modeset_fenced(
+        &self,
+        bo: &Bo<'_>,
+        index: u32,
+        generation: u32,
+        pitch: u32,
+        in_fence: Option<(&Syncobj<'_>, u64)>,
+        out_fence: Option<(&Syncobj<'_>, u64)>,
+    ) -> io::Result<u32> {
+        let (in_fd, in_v) = in_fence.map_or((-1, 0), |(s, v)| (s.fd, v));
+        let (out_fd, out_v) = out_fence.map_or((-1, 0), |(s, v)| (s.fd, v));
         let mut c = DCommit {
             struct_size: std::mem::size_of::<DCommit>() as u32,
             flags: COMMIT_MODESET,
@@ -797,8 +813,10 @@ impl Display {
             format: FORMAT_XRGB8888,
             bo_fd: bo.fd,
             pitch,
-            in_fence_fd: -1,
-            out_fence_fd: -1,
+            in_fence_fd: in_fd,
+            out_fence_fd: out_fd,
+            in_fence_value: in_v,
+            out_fence_value: out_v,
             mode_generation: generation,
             ..Default::default()
         };

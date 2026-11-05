@@ -130,8 +130,6 @@ fn run(
 
     let mut report = [0u8; 32];
     let mut prev_buttons: u8 = 0;
-    let sw = screen_w as f32;
-    let sh = screen_h as f32;
 
     loop {
         let n = match file.read(&mut report) {
@@ -147,6 +145,8 @@ fn run(
 
         /* Update cursor + resolve hit-target window in one critical
          * section so the resulting event is internally consistent. */
+        /* The screen can change size (a mode switch): clamp to it now. */
+        let (sw, sh) = { let (w, h, _) = crate::screen::get(); (w.max(1) as f32, h.max(1) as f32) };
         let (target, (local_x, local_y)) = {
             let mut g = wm.lock().unwrap();
             let (mut x, mut y) = g.cursor;

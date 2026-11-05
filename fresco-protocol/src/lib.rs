@@ -136,6 +136,11 @@ pub mod control {
     pub const OP_WM_ENUMERATE:          u16 = 0x0520; // → WmEnumerateReply
     pub const OP_WM_DECLARE_LAYOUT:     u16 = 0x0521; // atomic placement of all surfaces
     pub const OP_WM_SET_RENDERING:      u16 = 0x0522; // mark a surface (non-)rendering
+    // The display's modes (display ABI 2.1). Listing them and switching are
+    // the session's decision, so they sit with the WM ops: the shell (or
+    // forum-ctl through it) asks, frescod programs the display.
+    pub const OP_WM_DISPLAY_MODES:      u16 = 0x0523; // → WmDisplayModesReply
+    pub const OP_WM_SET_DISPLAY_MODE:   u16 = 0x0524; // WmSetDisplayModePayload
 
     // Async events (server → client). Sent with envelope flag
     // ASYNC_EVENT (aqueduct::envelope::flags::ASYNC_EVENT).
@@ -150,6 +155,10 @@ pub mod control {
     /// every event; the WM is the consumer that cares.
     pub const EV_WINDOW_CREATED:         u16 = 0x0584;
     pub const EV_WINDOW_DESTROYED:       u16 = 0x0585;
+    /// The display's mode changed (a mode switch, or a monitor plugged in
+    /// or swapped): payload `DisplayInfoResponse`. Every client gets it;
+    /// anything laid out for the screen lays itself out again.
+    pub const EV_DISPLAY_CHANGED:        u16 = 0x0586;
 
     // ── Input events (§3.8.x) ──
     // Server reads HID devices natively, fans events out to clients
@@ -247,6 +256,37 @@ pub struct WmSlot {
 pub struct WmDeclareLayoutPayload {
     pub slots: Vec<WmSlot>,
     pub focus: u32,
+}
+
+/// One mode the monitor offers, as `OP_WM_DISPLAY_MODES` lists it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WmDisplayMode {
+    pub width: u32,
+    pub height: u32,
+    /// Milli-Hz (59940 = 59.94 Hz).
+    pub refresh_mhz: u32,
+    /// The monitor's preferred (native) mode.
+    pub preferred: bool,
+}
+
+/// Reply to `OP_WM_DISPLAY_MODES`: every mode the connected monitor offers,
+/// and which one is lit (`current`, `u32::MAX` if none or no monitor).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WmDisplayModesReply {
+    pub modes: Vec<WmDisplayMode>,
+    pub current: u32,
+}
+
+/// `OP_WM_SET_DISPLAY_MODE` — switch the display to a mode it lists.
+/// `refresh_mhz` 0 takes the first listed refresh at that size; otherwise
+/// the listed refresh closest to it (within 1 Hz). Refused with
+/// `BAD_PAYLOAD` if the monitor offers no such mode. The switch happens at
+/// the next frame; `EV_DISPLAY_CHANGED` follows.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WmSetDisplayModePayload {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_mhz: u32,
 }
 
 /// `OP_WM_SET_RENDERING` — mark a fully-occluded surface non-rendering so its GPU
@@ -1173,6 +1213,9 @@ mod tests {
             control::OP_WM_ENUMERATE,
             control::OP_WM_DECLARE_LAYOUT,
             control::OP_WM_SET_RENDERING,
+            control::OP_WM_DISPLAY_MODES,
+            control::OP_WM_SET_DISPLAY_MODE,
+            control::EV_DISPLAY_CHANGED,
         ];
         let mut sorted = ops.to_vec();
         sorted.sort();

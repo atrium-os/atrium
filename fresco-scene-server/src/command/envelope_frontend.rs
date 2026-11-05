@@ -295,6 +295,12 @@ pub struct EnvelopeFrontend {
     /// what a headless/test frontend reports.
     display_mode: (u32, u32, u32),
     reserved_top: u32,
+
+    /// What `OP_WM_DISPLAY_MODES` reports (frescod sets it from the
+    /// connector), and a switch `OP_WM_SET_DISPLAY_MODE` asked for, which
+    /// frescod's frame loop takes and carries out.
+    display_modes: fresco_protocol::WmDisplayModesReply,
+    mode_request: Option<(u32, u32, u32)>,
 }
 
 impl EnvelopeFrontend {
@@ -321,6 +327,8 @@ impl EnvelopeFrontend {
             client_uids: HashMap::new(),
             display_mode: (0, 0, 0),
             reserved_top: 0,
+            display_modes: fresco_protocol::WmDisplayModesReply { modes: Vec::new(), current: u32::MAX },
+            mode_request: None,
         }
     }
 
@@ -335,6 +343,22 @@ impl EnvelopeFrontend {
 
     pub fn set_display_mode(&mut self, width: u32, height: u32, refresh_mhz: u32) {
         self.display_mode = (width, height, refresh_mhz);
+    }
+
+    /// The scanout mode and the reserved top rows (`OP_DISPLAY_INFO`).
+    pub fn display_info(&self) -> fresco_protocol::DisplayInfoResponse {
+        let (width, height, refresh_mhz) = self.display_mode;
+        fresco_protocol::DisplayInfoResponse { width, height, refresh_mhz, reserved_top: self.reserved_top }
+    }
+
+    /// The monitor's modes and the lit one, for `OP_WM_DISPLAY_MODES`.
+    pub fn set_display_modes(&mut self, modes: Vec<fresco_protocol::WmDisplayMode>, current: u32) {
+        self.display_modes = fresco_protocol::WmDisplayModesReply { modes, current };
+    }
+
+    /// A mode switch the WM asked for and nobody has carried out yet.
+    pub fn take_mode_request(&mut self) -> Option<(u32, u32, u32)> {
+        self.mode_request.take()
     }
 
     /// Grant a client the `window-management` capability. Called by the
@@ -484,6 +508,8 @@ impl EnvelopeFrontend {
             control::OP_WM_ENUMERATE         => self.handle_wm_enumerate(msg),
             control::OP_WM_DECLARE_LAYOUT    => self.handle_wm_declare_layout(msg),
             control::OP_WM_SET_RENDERING     => self.handle_wm_set_rendering(msg),
+            control::OP_WM_DISPLAY_MODES     => self.handle_wm_display_modes(),
+            control::OP_WM_SET_DISPLAY_MODE  => self.handle_wm_set_display_mode(msg),
 
             op => Err(DispatchError::UnknownOp(op)),
         }
@@ -783,6 +809,35 @@ impl EnvelopeFrontend {
             flags:   flag::IS_RESPONSE,
             payload,
         }])
+    }
+
+    /// `OP_WM_DISPLAY_MODES` — the modes the monitor offers (WM only).
+    fn handle_wm_display_modes(&mut self) -> Result<Vec<Outbound>, DispatchError> {
+        if !self.wm_capable.contains(&self.current_client) {
+            return Err(DispatchError::Forbidden);
+        }
+        let payload = encode(&self.display_modes).map_err(|_| DispatchError::BadPayload)?;
+        Ok(vec![Outbound { op: control::OP_WM_DISPLAY_MODES, flags: flag::IS_RESPONSE, payload }])
+    }
+
+    /// `OP_WM_SET_DISPLAY_MODE` — queue a switch to a listed mode (WM only).
+    /// The reply is an empty IS_RESPONSE once the request is accepted; the
+    /// switch itself lands at the next frame, announced by EV_DISPLAY_CHANGED.
+    fn handle_wm_set_display_mode(&mut self, msg: &Message) -> Result<Vec<Outbound>, DispatchError> {
+        if !self.wm_capable.contains(&self.current_client) {
+            return Err(DispatchError::Forbidden);
+        }
+        let p: fresco_protocol::WmSetDisplayModePayload =
+            decode(&msg.payload).map_err(|_| DispatchError::BadPayload)?;
+        let offered = self.display_modes.modes.iter().any(|m| {
+            m.width == p.width && m.height == p.height
+                && (p.refresh_mhz == 0 || m.refresh_mhz.abs_diff(p.refresh_mhz) <= 1000)
+        });
+        if !offered {
+            return Err(DispatchError::BadPayload);
+        }
+        self.mode_request = Some((p.width, p.height, p.refresh_mhz));
+        Ok(vec![Outbound { op: control::OP_WM_SET_DISPLAY_MODE, flags: flag::IS_RESPONSE, payload: Vec::new() }])
     }
 
     /// `OP_DISPLAY_INFO` — hand back the scanout mode. No payload in, no state

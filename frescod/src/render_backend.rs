@@ -207,6 +207,28 @@ impl<'a> Backend<'a> {
         Ok(())
     }
 
+    /// Rebuild the renderer for a new screen size (a mode switch), keeping
+    /// its kind. `vm` is needed for the gpu renderer, `load_bundles` for Vulkan.
+    pub fn resize(
+        &mut self,
+        vm: &'a Vm<'a>,
+        width: u32,
+        height: u32,
+        load_bundles: impl FnOnce(&mut HeadlessRenderer) -> Result<()>,
+    ) -> Result<()> {
+        match self {
+            Backend::Compute(_) => *self = Backend::Compute(Box::new(Compute::new(width, height)?)),
+            Backend::Gpu(_) => self.back_to_gpu(vm, width, height)?,
+            Backend::Vulkan(_) => {
+                let mut r = HeadlessRenderer::new(width, height)
+                    .map_err(|e| format!("HeadlessRenderer::new: {e}"))?;
+                load_bundles(&mut r)?;
+                *self = Backend::Vulkan(Box::new(r));
+            }
+        }
+        Ok(())
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Backend::Vulkan(_) => "vulkan",

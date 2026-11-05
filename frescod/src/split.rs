@@ -178,6 +178,13 @@ impl Broker {
         }))
     }
 
+    /// The screen now: the live mode once frescod has set one (it changes
+    /// with a mode switch), else the one the broker was made with.
+    fn screen(&self) -> (u32, u32, u32) {
+        let s = crate::screen::get();
+        if s.0 > 0 { s } else { self.screen }
+    }
+
     /// The hand-off for `socket_server::Shared`.
     pub fn hand_off(self: &Arc<Self>) -> socket_server::HandOff {
         let me = self.clone();
@@ -313,7 +320,8 @@ impl Broker {
     pub fn sync(&self) {
         let sizes: HashMap<u16, (u32, u32)> = {
             let c = self.comp.lock().unwrap();
-            c.windows.iter().map(|(&id, w)| (id, (self.dim(w.size.0, self.screen.0), self.dim(w.size.1, self.screen.1)))).collect()
+            let screen = self.screen();
+            c.windows.iter().map(|(&id, w)| (id, (self.dim(w.size.0, screen.0), self.dim(w.size.1, screen.1)))).collect()
         };
         let rs: Vec<Arc<Renderer>> = self.renderers.lock().unwrap().values().cloned().collect();
         for r in rs {
@@ -391,7 +399,8 @@ impl Broker {
                 Proc::Child(cmd.spawn()?)
             }
         };
-        ours.send(&Msg::Client { width: self.screen.0, height: self.screen.1, refresh_mhz: self.screen.2, pixels: self.pixels }, &[stream.as_raw_fd()])?;
+        let screen = self.screen();
+        ours.send(&Msg::Client { width: screen.0, height: screen.1, refresh_mhz: screen.2, pixels: self.pixels }, &[stream.as_raw_fd()])?;
         // The broker keeps a copy of the client's socket, never read, only
         // to see the client hang up: a renderer that ignores its client's
         // hang-up must not keep its client id and windows forever.
