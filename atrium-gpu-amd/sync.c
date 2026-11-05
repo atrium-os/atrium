@@ -119,6 +119,9 @@ amd_syncobj_close(struct file *fp, struct thread *td)
 	seldrain(&so->sel);
 	knlist_destroy(&so->sel.si_note);
 	mtx_destroy(&so->lock);
+	/* Last touch of the softc: detach waits for this count to reach 0. */
+	if (so->sc != NULL)
+		atomic_subtract_int(&so->sc->syncobj_count, 1);
 	free(so, M_DEVBUF);
 	return (0);
 }
@@ -196,6 +199,8 @@ amd_syncobj_create_fd(struct atrium_amd_softc *sc, struct thread *td,
 		free(so, M_DEVBUF);
 		return (err);
 	}
+	/* Counted from here: the fo_close that reclaims a failed install drops it. */
+	atomic_add_int(&sc->syncobj_count, 1);
 	finit(fp, FREAD, DTYPE_DEV, so, &atrium_amd_syncobj_fileops);
 	err = finstall(td, fp, &fd, 0, NULL);
 	fdrop(fp, td);

@@ -390,6 +390,10 @@ atrium_amd_detach(device_t dev)
 	 */
 	if (sc->bo_count > 0 || sc->vm_count > 0)
 		return (EBUSY);
+	/* The same for syncobj fds (submit/commit fences): their fo_close is
+	 * this module's code, so unloading under one panics at its close. */
+	if (atomic_load_int(&sc->syncobj_count) > 0)
+		return (EBUSY);
 	/* A doorbell grant's pager object, or a deferred BO free, still points
 	 * into this module's code. */
 	if (amd_hwq_busy_refs(sc) > 0)

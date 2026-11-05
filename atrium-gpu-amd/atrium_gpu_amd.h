@@ -806,6 +806,7 @@ struct atrium_amd_softc {
 	int		 vm_count;	/* live vm_fds */
 
 	int		 bo_count;	/* live bo_fds; detach refuses if > 0 */
+	u_int		 syncobj_count;	/* live syncobj fds; ditto (atomic) */
 
 	/* GPU isolation state (queue.c). */
 	struct cdev	*ctl_cdev;	/* /dev/atrium-gpuNctl: reset/sched/powergate */
