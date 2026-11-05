@@ -190,6 +190,51 @@ struct DConnectorV2 {
 }
 #[repr(C)]
 struct DConfig { connector_type: u32, plug_mode: u32 }
+
+// display ABI 3.0: several outputs
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct DOutputInfo {
+    identity: u64,
+    flags: u32,
+    connector_type: u32,
+    generation: u32,
+    width: u32,
+    height: u32,
+    refresh_mhz: u32,
+    pixel_clock_khz: u32,
+    _pad: u32,
+}
+#[repr(C)]
+#[derive(Default)]
+struct DOutputs {
+    struct_size: u32,
+    out_count: u32,
+    out_topology_generation: u32,
+    out_bandwidth_khz: u32,
+    out_bandwidth_used_khz: u32,
+    _pad: u32,
+    out: [DOutputInfo; 8],
+}
+#[repr(C)]
+struct DConnectorAt { struct_size: u32, output: u32, out_identity: u64, conn: DConnectorV2 }
+#[repr(C)]
+#[derive(Default)]
+struct DStatusAt { struct_size: u32, output: u32, status: DStatusV2 }
+#[repr(C)]
+#[derive(Default)]
+struct DOutputCommit { output: u32, _pad: u32, c: DCommit }
+#[repr(C)]
+#[derive(Default)]
+struct DCommitMulti {
+    struct_size: u32,
+    flags: u32,
+    count: u32,
+    out_failed: u32,
+    out_reason: u32,
+    _pad: u32,
+    commits: u64,
+}
 #[repr(C)]
 #[derive(Default)]
 struct DStatusV2 {
@@ -249,7 +294,7 @@ struct DHdr {
     out_max_nits: u32,
     out_max_fall_nits: u32,
     out_min_nits_x10000: u32,
-    _pad: u32,
+    output: u32,
 }
 
 /// What the stream is signalled with (display ABI 2.3 HDR): EOTF,
@@ -325,6 +370,20 @@ pub const PLUG_1080P: u32 = 1;
 pub const PLUG_4K: u32 = 2;
 pub const PLUG_DESKTOP: u32 = 3;
 pub const UNPLUG: u32 = 0xffff_ffff;
+/// (3.0) gpusim monitors for the other outputs: an office monitor (1440p60,
+/// SDR, product 2) and a twin of the desktop monitor (another serial).
+pub const PLUG_OFFICE: u32 = 4;
+pub const PLUG_DESKTOP_TWIN: u32 = 5;
+/// (3.0) COMMIT_MULTI: turn an output off.
+pub const COMMIT_OFF: u32 = 0x10;
+/// (3.0) OUTPUTS flag: the output scans out a mode.
+pub const OUTPUT_LIT: u32 = 0x100;
+/// (3.0) Faults: the lit outputs would need more pixel rate than the engine
+/// has; no such output (or named twice).
+pub const FAULT_BANDWIDTH: u32 = 9;
+pub const FAULT_NO_OUTPUT: u32 = 10;
+/// (3.0) kqueue fflags: count output `n`'s vblanks.
+pub const fn note_output(n: u32) -> u32 { 0x100 << n }
 /// Interim connector type code for HDMI 2.1 (the power-on cable).
 pub const CONN_HDMI21: u32 = 2;
 
@@ -836,6 +895,95 @@ pub struct ConnectorV2 {
     pub hdr_active: bool,
 }
 
+/// (3.0) One output in [`Display::outputs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputInfo {
+    /// The monitor's identity (0 = none): the same monitor reads the same on
+    /// any output and any boot.
+    pub identity: u64,
+    /// `CONNECTOR_*` | [`OUTPUT_LIT`].
+    pub flags: u32,
+    pub connector_type: u32,
+    pub generation: u32,
+    /// The lit mode (0 when off) and its pixel clock.
+    pub width: u32,
+    pub height: u32,
+    pub refresh_mhz: u32,
+    pub pixel_clock_khz: u32,
+}
+
+impl OutputInfo {
+    pub fn connected(&self) -> bool { self.flags & CONNECTOR_CONNECTED != 0 }
+    pub fn lit(&self) -> bool { self.flags & OUTPUT_LIT != 0 }
+}
+
+/// (3.0) [`Display::outputs`]: every output, one snapshot.
+#[derive(Debug, Clone)]
+pub struct Outputs {
+    pub topology_generation: u32,
+    pub bandwidth_khz: u32,
+    pub bandwidth_used_khz: u32,
+    pub out: Vec<OutputInfo>,
+}
+
+/// (3.0) One output's part of [`Display::commit_multi`].
+pub struct OutputCommit<'b, 'a> {
+    pub output: u32,
+    /// [`COMMIT_MODESET`] (with [`COMMIT_VRR`]), [`COMMIT_OFF`], or 0 /
+    /// [`COMMIT_ASYNC`] for a flip.
+    pub flags: u32,
+    pub mode_index: u32,
+    pub generation: u32,
+    pub bo: Option<&'b Bo<'a>>,
+    pub pitch: u32,
+    pub format: u32,
+    pub in_fence: Option<(&'b Syncobj<'a>, u64)>,
+    pub out_fence: Option<(&'b Syncobj<'a>, u64)>,
+}
+
+impl<'b, 'a> OutputCommit<'b, 'a> {
+    /// Light `output` at its connector's `modes[mode_index]` with `bo` up.
+    pub fn modeset(output: u32, bo: &'b Bo<'a>, mode_index: u32, generation: u32) -> Self {
+        OutputCommit {
+            output,
+            flags: COMMIT_MODESET,
+            mode_index,
+            generation,
+            bo: Some(bo),
+            pitch: 0,
+            format: FORMAT_XRGB8888,
+            in_fence: None,
+            out_fence: None,
+        }
+    }
+    /// Turn `output` off.
+    pub fn off(output: u32) -> Self {
+        OutputCommit { flags: COMMIT_OFF, bo: None, ..Self::flip(output, None, true) }
+    }
+    /// Flip `output` to `bo` (vsync or at once).
+    pub fn flip(output: u32, bo: Option<&'b Bo<'a>>, vsync: bool) -> Self {
+        OutputCommit {
+            output,
+            flags: if vsync { 0 } else { COMMIT_ASYNC },
+            mode_index: 0,
+            generation: 0,
+            bo,
+            pitch: 0,
+            format: FORMAT_XRGB8888,
+            in_fence: None,
+            out_fence: None,
+        }
+    }
+}
+
+/// (3.0) What [`Display::commit_multi`] made of a commit: the first output
+/// (index into the slice) that could not take its part, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultiResult {
+    pub failed: Option<usize>,
+    pub reason: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Connector {
     pub connected: bool,
@@ -871,8 +1019,106 @@ impl Display {
         let mut c: DConnectorV2 = unsafe { std::mem::zeroed() };
         c.struct_size = std::mem::size_of::<DConnectorV2>() as u32;
         unsafe { call(self.fd, iowr(D, 66, std::mem::size_of::<DConnectorV2>()), &mut c)? };
+        Ok(Self::conn_v2(&c))
+    }
+
+    /// (3.0) [`Self::connector_v2`] for any output, with the monitor's identity.
+    pub fn connector_at(&self, output: u32) -> io::Result<(ConnectorV2, u64)> {
+        let mut c: DConnectorAt = unsafe { std::mem::zeroed() };
+        c.struct_size = std::mem::size_of::<DConnectorAt>() as u32;
+        c.output = output;
+        c.conn.struct_size = std::mem::size_of::<DConnectorV2>() as u32;
+        unsafe { call(self.fd, iowr(D, 69, std::mem::size_of::<DConnectorAt>()), &mut c)? };
+        Ok((Self::conn_v2(&c.conn), c.out_identity))
+    }
+
+    /// (3.0) Every output at a glance.
+    pub fn outputs(&self) -> io::Result<Outputs> {
+        let mut v = DOutputs { struct_size: std::mem::size_of::<DOutputs>() as u32, ..Default::default() };
+        unsafe { call(self.fd, iowr(D, 68, std::mem::size_of::<DOutputs>()), &mut v)? };
+        let n = (v.out_count as usize).min(8);
+        Ok(Outputs {
+            topology_generation: v.out_topology_generation,
+            bandwidth_khz: v.out_bandwidth_khz,
+            bandwidth_used_khz: v.out_bandwidth_used_khz,
+            out: v.out[..n]
+                .iter()
+                .map(|o| OutputInfo {
+                    identity: o.identity,
+                    flags: o.flags,
+                    connector_type: o.connector_type,
+                    generation: o.generation,
+                    width: o.width,
+                    height: o.height,
+                    refresh_mhz: o.refresh_mhz,
+                    pixel_clock_khz: o.pixel_clock_khz,
+                })
+                .collect(),
+        })
+    }
+
+    /// (3.0) Change several outputs in one commit: atomic for mode sets and
+    /// turn-offs, per output for flips. `test` checks without applying.
+    pub fn commit_multi(&self, parts: &[OutputCommit<'_, '_>], test: bool) -> io::Result<MultiResult> {
+        let mut oc: Vec<DOutputCommit> = parts
+            .iter()
+            .map(|p| {
+                let (in_fd, in_v) = p.in_fence.map_or((-1, 0), |(s, v)| (s.fd, v));
+                let (out_fd, out_v) = p.out_fence.map_or((-1, 0), |(s, v)| (s.fd, v));
+                DOutputCommit {
+                    output: p.output,
+                    _pad: 0,
+                    c: DCommit {
+                        struct_size: std::mem::size_of::<DCommit>() as u32,
+                        flags: p.flags,
+                        mode_index: p.mode_index,
+                        format: p.format,
+                        bo_fd: p.bo.map_or(-1, |b| b.fd),
+                        pitch: p.pitch,
+                        in_fence_fd: in_fd,
+                        out_fence_fd: out_fd,
+                        in_fence_value: in_v,
+                        out_fence_value: out_v,
+                        mode_generation: p.generation,
+                        ..Default::default()
+                    },
+                }
+            })
+            .collect();
+        let mut m = DCommitMulti {
+            struct_size: std::mem::size_of::<DCommitMulti>() as u32,
+            flags: if test { COMMIT_TEST_ONLY } else { 0 },
+            count: oc.len() as u32,
+            commits: oc.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        unsafe { call(self.fd, iowr(D, 71, std::mem::size_of::<DCommitMulti>()), &mut m)? };
+        Ok(MultiResult {
+            failed: (m.out_failed != u32::MAX).then_some(m.out_failed as usize),
+            reason: m.out_reason,
+        })
+    }
+
+    /// (3.0) [`Self::status_v2`] for any output.
+    pub fn status_at(&self, output: u32) -> io::Result<StatusV2> {
+        let mut st = DStatusAt { struct_size: std::mem::size_of::<DStatusAt>() as u32, output, ..Default::default() };
+        st.status.struct_size = std::mem::size_of::<DStatusV2>() as u32;
+        unsafe { call(self.fd, iowr(D, 70, std::mem::size_of::<DStatusAt>()), &mut st)? };
+        let s = &st.status;
+        Ok(StatusV2 {
+            flags: s.out_flags,
+            vblank_count: s.out_vblank_count,
+            flips_done: s.out_flips_done,
+            dropped_flips: s.out_dropped_flips,
+            tear_line: s.out_tear_line,
+            refresh_mhz: s.out_refresh_mhz,
+            last_fault: s.out_last_fault,
+        })
+    }
+
+    fn conn_v2(c: &DConnectorV2) -> ConnectorV2 {
         let n = (c.out_mode_count as usize).min(16);
-        Ok(ConnectorV2 {
+        ConnectorV2 {
             connected: c.out_flags & 1 != 0,
             connector_type: c.out_connector_type,
             generation: c.out_generation,
@@ -884,7 +1130,7 @@ impl Display {
             vrr_active: c.out_flags & CONNECTOR_VRR_ACTIVE != 0,
             hdr: c.out_flags & CONNECTOR_HDR != 0,
             hdr_active: c.out_flags & CONNECTOR_HDR_ACTIVE != 0,
-        })
+        }
     }
 
     /// The pixel format of the buffers this display commits from now on
@@ -927,7 +1173,13 @@ impl Display {
     /// (2.3) Signal `h` from the next commit on (`EINVAL` if the monitor
     /// doesn't offer its EOTF or colorimetry). [`Hdr::default`] is SDR.
     pub fn set_hdr(&self, h: &Hdr) -> io::Result<HdrCaps> {
+        self.set_hdr_at(0, h)
+    }
+
+    /// (3.0) [`Self::set_hdr`] for any output.
+    pub fn set_hdr_at(&self, output: u32, h: &Hdr) -> io::Result<HdrCaps> {
         let mut d = DHdr {
+            output,
             flags: HDR_SET,
             eotf: h.eotf,
             colorimetry: h.colorimetry,
@@ -1165,6 +1417,57 @@ impl EventWatch {
 }
 
 impl Drop for EventWatch { fn drop(&mut self) { unsafe { libc::close(self.kq) }; } }
+
+/// (3.0) A kqueue counting the vblanks of the outputs in `outputs` (a mask
+/// of [`note_output`] bits). Borrows the display's fd.
+pub struct VblankWatch { kq: RawFd }
+
+impl VblankWatch {
+    pub fn new(dpy: &Display, outputs: u32) -> io::Result<Self> {
+        let kq = unsafe { libc::kqueue() };
+        if kq < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let chg = libc::kevent {
+            ident: dpy.fd as libc::uintptr_t,
+            filter: libc::EVFILT_READ,
+            flags: libc::EV_ADD | libc::EV_CLEAR,
+            fflags: outputs,
+            data: 0,
+            udata: std::ptr::null_mut(),
+            ext: [0; 4],
+        };
+        if unsafe { libc::kevent(kq, &chg, 1, std::ptr::null_mut(), 0, std::ptr::null()) } != 0 {
+            let e = io::Error::last_os_error();
+            unsafe { libc::close(kq) };
+            return Err(e);
+        }
+        Ok(Self { kq })
+    }
+
+    /// Block until a vblank (or `timeout`, then `None`): the vblanks since the
+    /// last wait, and the [`note_output`] bits of the outputs they came from.
+    pub fn wait(&self, timeout: Option<std::time::Duration>) -> io::Result<Option<(u64, u32)>> {
+        let ts = timeout.map(|t| libc::timespec {
+            tv_sec: t.as_secs() as libc::time_t,
+            tv_nsec: t.subsec_nanos() as libc::c_long,
+        });
+        let tsp = ts.as_ref().map_or(std::ptr::null(), |t| t as *const libc::timespec);
+        let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
+        loop {
+            let r = unsafe { libc::kevent(self.kq, std::ptr::null(), 0, &mut ev, 1, tsp) };
+            if r < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted { continue; }
+                return Err(e);
+            }
+            if r == 0 { return Ok(None); }
+            return Ok(Some((ev.data as u64, ev.fflags)));
+        }
+    }
+}
+
+impl Drop for VblankWatch { fn drop(&mut self) { unsafe { libc::close(self.kq) }; } }
 
 impl ResetWatch {
     pub fn new(dpy: &Display) -> io::Result<Self> {

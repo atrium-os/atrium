@@ -116,6 +116,23 @@ amd_ih_fini(struct atrium_amd_softc *sc)
  * serializes dispatch against amd_ih_set_handler so a detaching module can clear
  * its handler with no chance of the ISR calling into unloaded text.
  */
+static uint32_t
+amd_ih_disp_pipe(uint32_t cause, uint32_t id)
+{
+	uint32_t src = (id >> 8) & 0xff, ctx = (id >> 16) & 0xff;
+
+	switch (cause) {
+	case ATRIUM_AMD_IH_CAUSE_VBLANK:
+		src -= DCN_IH_SRC_VINT0;
+		return (src < DCN_PIPES ? src : 0);
+	case ATRIUM_AMD_IH_CAUSE_FLIP:
+		src -= DCN_IH_SRC_FLIP;
+		return (src < DCN_PIPES ? src : 0);
+	default:
+		return (ctx < DCN_PIPES ? ctx : 0);
+	}
+}
+
 static void
 amd_intr(void *arg)
 {
@@ -133,6 +150,7 @@ amd_intr(void *arg)
 		sc->ih_eop_ring[c] = 0;
 		sc->ih_fault_ring[c] = 0;
 	}
+	memset(sc->ih_disp_count, 0, sizeof(sc->ih_disp_count));
 	wptr = amd_mmio_read32(sc, regIH_WPTR);
 	/*
 	 * More cookies than the ring holds: the device lapped us, so the oldest
@@ -166,6 +184,14 @@ amd_intr(void *arg)
 			sc->ih_fault_vmid[cookie[1]] = cookie[2];
 			sc->ih_fault_page[cookie[1]] = cookie[3];
 		}
+		/* A display interrupt names its pipe by its IH source (or,
+		 * for HPD, its context): dword 2 is client 7:0, source 15:8,
+		 * context 23:16. Anything else counts as pipe 0's. */
+		if (cause == ATRIUM_AMD_IH_CAUSE_VBLANK ||
+		    cause == ATRIUM_AMD_IH_CAUSE_FLIP ||
+		    cause == ATRIUM_AMD_IH_CAUSE_HPD)
+			sc->ih_disp_count[cause][amd_ih_disp_pipe(cause,
+			    cookie[2])]++;
 		sc->ih_rptr++;
 	}
 	for (c = 0; c < ATRIUM_AMD_IH_NCAUSE; c++) {

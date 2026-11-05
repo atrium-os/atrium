@@ -1,5 +1,5 @@
 /*
- * Atrium display ABI v2.3 — /dev/atrium-display<N>. Normative header.
+ * Atrium display ABI 3.0 — /dev/atrium-display<N>. Normative header.
  *
  * Spec: docs/spec/atrium-display-architecture.md §7 and §7.1, and
  * docs/spec/atrium-gpu-abi-v2.md §7. This header follows the GPU header's
@@ -45,8 +45,8 @@
 #include <sys/ioctl.h>
 #endif
 
-#define ATRIUM_DISPLAY_ABI_MAJOR	2
-#define ATRIUM_DISPLAY_ABI_MINOR	3
+#define ATRIUM_DISPLAY_ABI_MAJOR	3
+#define ATRIUM_DISPLAY_ABI_MINOR	0
 
 /* Pixel formats a plane can scan out. */
 #define ATRIUM_DISPLAY_FORMAT_XRGB8888	0  /* 32 bpp, B,G,R,X in memory (Vulkan B8G8R8A8) */
@@ -70,6 +70,12 @@
 #define ATRIUM_DISPLAY_FAULT_BAD_FORMAT		7  /* format the plane can't scan out */
 #define ATRIUM_DISPLAY_FAULT_MODE_UNSUPPORTED	8  /* (2.1) the monitor doesn't offer the
 						    * timing that was programmed */
+#define ATRIUM_DISPLAY_FAULT_BANDWIDTH		9  /* (3.0) the lit outputs together would
+						    * need more pixel rate than the
+						    * display engine has (OUTPUTS'
+						    * out_bandwidth_khz) */
+#define ATRIUM_DISPLAY_FAULT_NO_OUTPUT		10 /* (3.0) no such output, or named twice
+						    * in one commit */
 
 /* Commit flags. */
 #define ATRIUM_DISPLAY_COMMIT_MODESET	0x1u  /* (re)program the CRTC at mode_index; the
@@ -87,6 +93,10 @@
 					       * monitor without VRR, or a mode whose
 					       * refresh is outside the monitor's range.
 					       * A MODESET without it turns VRR off */
+#define ATRIUM_DISPLAY_COMMIT_OFF	0x10u /* (3.0) COMMIT_MULTI only: turn the output
+					       * off (no buffer: bo_fd -1). Its
+					       * buffer and pending flip are released;
+					       * the monitor stays attached */
 
 /*
  * COMMIT: put a buffer on the primary plane.
@@ -181,6 +191,19 @@ struct atrium_display_commit {
 #define ATRIUM_DISPLAY_NOTE_HOTPLUG		0x2u
 
 /*
+ * (3.0) Which outputs' vblanks a vblank registration counts: fflags bit
+ * NOTE_OUTPUT(n) for output n. Without any, output 0 (the 2.x behaviour). A
+ * delivery's fflags carries NOTE_OUTPUT(n) for each output that had a
+ * vblank since the last one, and data counts them all. (A file has one
+ * EVFILT_READ knote, so one registration covers every output.) With
+ * NOTE_RESET or NOTE_HOTPLUG the registration hears only those and the
+ * output bits must be 0. NOTE_HOTPLUG's data is the topology generation
+ * (OUTPUTS' out_topology_generation), bumped by a hotplug on any output.
+ */
+#define ATRIUM_DISPLAY_NOTE_OUTPUT(n)		(0x100u << (n))
+#define ATRIUM_DISPLAY_NOTE_OUTPUTS		0xff00u
+
+/*
  * (2.3) HDR: what the monitor can show, and which EOTF and colorimetry the
  * stream is signalled with (CTA-861.3 / CTA-861-G infoframes).
  *
@@ -234,7 +257,9 @@ struct atrium_display_hdr {
 	uint32_t out_max_nits;		/* desired content max luminance, cd/m^2 */
 	uint32_t out_max_fall_nits;	/* desired content max frame average */
 	uint32_t out_min_nits_x10000;	/* desired content min, 0.0001 cd/m^2 */
-	uint32_t _pad;
+	uint32_t output;		/* (3.0) the output; 0 for 2.x callers. A SET
+					 * applies with the next commit that
+					 * succeeds on that output */
 };
 
 /* STATUS: refresh and flip telemetry for frame pacing and tests. */
@@ -297,5 +322,128 @@ struct atrium_display_connector_v2 {
 #define ATRIUM_DISPLAY_IOC_STATUS_V2	_IOWR('D', 65, struct atrium_display_status_v2)
 #define ATRIUM_DISPLAY_IOC_CONNECTOR	_IOWR('D', 66, struct atrium_display_connector_v2)
 #define ATRIUM_DISPLAY_IOC_HDR		_IOWR('D', 67, struct atrium_display_hdr)
+
+/*
+ * --- 3.0: several outputs on one node --------------------------------------
+ *
+ * A GPU drives up to ATRIUM_DISPLAY_MAX_OUTPUTS outputs, each a scanout pipe
+ * with its own connector. The 2.x ioctls (COMMIT, STATUS_V2, CONNECTOR) act
+ * on output 0, so a single-monitor caller works unchanged; HDR names its
+ * output in `output`.
+ *
+ * Topology changes (lighting, re-moding or turning off outputs) go through
+ * COMMIT_MULTI as one transaction: every output it names changes, or none
+ * does. TEST_ONLY runs every check without touching the hardware and says
+ * which output would fail and why, so a caller can pick another
+ * configuration first instead of discovering a black screen.
+ */
+#define ATRIUM_DISPLAY_MAX_OUTPUTS		8
+
+/* Per-output flags in OUTPUTS (the CONNECTOR_* flags, plus these). */
+#define ATRIUM_DISPLAY_OUTPUT_LIT		0x100u /* scanning out a mode */
+
+/*
+ * A monitor's identity: a 64-bit hash of its EDID's manufacturer, product
+ * and serial number (the serial-number descriptor too). A monitor that gives
+ * no serial also hashes in the output it is on, so two of them still differ
+ * (but that one changes identity when moved). 0 = no monitor. The same
+ * monitor has the same identity on every boot, every port and every GPU
+ * running this ABI; compositors key remembered layouts by the set of them.
+ */
+struct atrium_display_output_info {
+	uint64_t identity;
+	uint32_t flags;			/* ATRIUM_DISPLAY_CONNECTOR_* | OUTPUT_LIT */
+	uint32_t connector_type;	/* ATRIUM_DISPLAY_CONN_* (interim header) */
+	uint32_t generation;		/* this output's hotplug generation (CONNECTOR_AT's
+					 * out_generation) */
+	uint32_t width;			/* the lit mode; 0 when off */
+	uint32_t height;
+	uint32_t refresh_mhz;
+	uint32_t pixel_clock_khz;	/* its share of out_bandwidth_khz */
+	uint32_t _pad;
+};
+
+/* OUTPUTS: every output at a glance, one consistent snapshot. */
+struct atrium_display_outputs {
+	uint32_t struct_size;
+	uint32_t out_count;		/* outputs this GPU has */
+	uint32_t out_topology_generation; /* bumped by a hotplug on any output */
+	uint32_t out_bandwidth_khz;	/* pixel rate the lit outputs may share */
+	uint32_t out_bandwidth_used_khz; /* what they draw now */
+	uint32_t _pad;
+	struct atrium_display_output_info out[ATRIUM_DISPLAY_MAX_OUTPUTS];
+};
+
+/* CONNECTOR_AT: CONNECTOR for any output (set conn.struct_size too). */
+struct atrium_display_connector_at {
+	uint32_t struct_size;
+	uint32_t output;
+	uint64_t out_identity;
+	struct atrium_display_connector_v2 conn;
+};
+
+/* STATUS_AT: STATUS_V2 for any output (set status.struct_size too). */
+struct atrium_display_status_at {
+	uint32_t struct_size;
+	uint32_t output;
+	struct atrium_display_status_v2 status;
+};
+
+/*
+ * One output's part of a COMMIT_MULTI: COMMIT's fields (TEST_ONLY is the
+ * whole commit's flag, not an output's) plus the output. c.out_fault is set
+ * for the output that failed.
+ */
+struct atrium_display_output_commit {
+	uint32_t output;
+	uint32_t _pad;
+	struct atrium_display_commit c;
+};
+
+/*
+ * COMMIT_MULTI: change several outputs at once.
+ *
+ * A topology commit has every element MODESET or OFF. It is atomic: the
+ * whole new configuration is checked first (modes, buffers, the shared
+ * bandwidth across every output that will be lit, in-fences signalled),
+ * then applied; if the hardware still refuses one output, the outputs
+ * already changed are put back as they were and nothing has changed. The
+ * outputs it names go dark for the mode set and come back together; the
+ * outputs it does not name keep running untouched.
+ *
+ * A flip commit has no MODESET or OFF element. Each output's flip waits on
+ * its own in-fence and lands at its own vblank (monitors at different rates
+ * never wait on each other), with its own out-fence. All outputs must be
+ * free (EBUSY, nothing queued, if any still has a commit outstanding).
+ *
+ * Mixing the two kinds is EINVAL.
+ *
+ * Infeasibility is not an errno: the call returns 0 with out_failed = the
+ * index (into the array) of the first output that cannot take its part and
+ * out_reason = why (ATRIUM_DISPLAY_FAULT_*, also in that element's
+ * c.out_fault); the array is copied back. With TEST_ONLY nothing changes
+ * either way. For a flip commit a refusal stops at that output: the
+ * outputs before it in the array stay queued.
+ *
+ * Errors: EINVAL for a bad struct, count (0 or over MAX_OUTPUTS), flag or
+ * element (as COMMIT); EFAULT for a bad `commits` pointer; plus COMMIT's.
+ */
+#define ATRIUM_DISPLAY_MULTI_NONE		0xffffffffu
+
+struct atrium_display_commit_multi {
+	uint32_t struct_size;
+	uint32_t flags;			/* ATRIUM_DISPLAY_COMMIT_TEST_ONLY */
+	uint32_t count;			/* elements in commits */
+	uint32_t out_failed;		/* index of the first refused element, or
+					 * ATRIUM_DISPLAY_MULTI_NONE */
+	uint32_t out_reason;		/* ATRIUM_DISPLAY_FAULT_* for it */
+	uint32_t _pad;
+	uint64_t commits;		/* user pointer: struct atrium_display_output_commit[count] */
+};
+
+#define ATRIUM_DISPLAY_IOC_OUTPUTS	_IOWR('D', 68, struct atrium_display_outputs)
+#define ATRIUM_DISPLAY_IOC_CONNECTOR_AT	_IOWR('D', 69, struct atrium_display_connector_at)
+#define ATRIUM_DISPLAY_IOC_STATUS_AT	_IOWR('D', 70, struct atrium_display_status_at)
+#define ATRIUM_DISPLAY_IOC_COMMIT_MULTI	_IOWR('D', 71, struct atrium_display_commit_multi)
 
 #endif /* _ATRIUM_DISPLAY_ABI_V2_H_ */

@@ -131,6 +131,17 @@ uint32_t atrium_hdr_cv_nits(uint8_t cv);
 uint32_t atrium_hdr_min_cv_ten_thousandths(uint8_t max_cv, uint8_t min_cv);
 
 /*
+ * (display ABI 3.0) A monitor's identity: what it is, not where it is
+ * plugged. FNV-1a (64-bit) over the manufacturer id and product code
+ * (base block bytes 8-11), the serial number (12-15) and the text of a
+ * serial-number descriptor (tag 0xff), if there is one. A monitor that gives
+ * no serial at all (number 0, no descriptor) also mixes in `path`, the
+ * connector it is on, so two such identical monitors still differ. 0 for an
+ * invalid base block; never 0 otherwise.
+ */
+uint64_t atrium_edid_identity(const uint8_t *e, uint32_t len, uint32_t path);
+
+/*
  * Infoframes (CTA-861-G) a driver sends to put the monitor in an HDR mode,
  * built here so every driver sends the same bytes. Each fills 36 bytes in
  * the generic-packet layout DCN and most encoders take: HB0..HB2, a zero

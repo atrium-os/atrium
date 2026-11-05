@@ -50,6 +50,16 @@ fake_read(void *hw, uint32_t n, uint8_t *out)
 	return (0);
 }
 
+static uint32_t
+atrium_edid_sum(const uint8_t *b)
+{
+	uint32_t i, s = 0;
+
+	for (i = 0; i < ATRIUM_EDID_BLOCK; i++)
+		s += b[i];
+	return (s);
+}
+
 static const struct atrium_display_hw_ops fake_ops = {
 	.sense = fake_sense,
 	.read_edid_block = fake_read,
@@ -180,6 +190,33 @@ main(void)
 		for (i = 0; i <= 13; i++)
 			sum += fr[4 + i];
 		assert(sum == 0);
+	}
+
+	/* Identity: by maker, product and serial; the connector only for a
+	 * monitor without a serial. */
+	{
+		uint8_t a[256], b2[256];
+		uint64_t ia, ib;
+
+		memcpy(a, desktop_monitor_edid, 256);
+		a[12] = a[13] = a[14] = a[15] = 0;
+		a[127] = 0;
+		a[127] = (uint8_t)(0x100 - (atrium_edid_sum(a) & 0xff));
+		assert(atrium_edid_block_ok(a));
+		ia = atrium_edid_identity(a, 256, 0);
+		assert(ia != 0 && ia != atrium_edid_identity(a, 256, 1));
+		memcpy(b2, a, 256);
+		b2[12] = 7;
+		b2[127] = 0;
+		b2[127] = (uint8_t)(0x100 - (atrium_edid_sum(b2) & 0xff));
+		ib = atrium_edid_identity(b2, 256, 0);
+		assert(ib != ia && ib == atrium_edid_identity(b2, 256, 3));
+		b2[10] ^= 1;	/* another product: another identity */
+		b2[127] = 0;
+		b2[127] = (uint8_t)(0x100 - (atrium_edid_sum(b2) & 0xff));
+		assert(atrium_edid_identity(b2, 256, 0) != ib);
+		memset(b2, 0xff, sizeof(b2));
+		assert(atrium_edid_identity(b2, 256, 0) == 0);
 	}
 
 	/* Known VICs decode; unknown ones don't. */

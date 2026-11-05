@@ -390,3 +390,48 @@ atrium_infoframe_avi(int bt2020, uint8_t vic, uint8_t *out)
 	pb[4] = vic & 0x7f;
 	infoframe_finish(out, 0x82, 0x02, 13);
 }
+
+/* --- identity (display ABI 3.0) ------------------------------------------ */
+
+static uint64_t
+fnv1a(uint64_t h, const uint8_t *p, uint32_t n)
+{
+	uint32_t i;
+
+	for (i = 0; i < n; i++) {
+		h ^= p[i];
+		h *= 0x100000001b3ull;
+	}
+	return (h);
+}
+
+uint64_t
+atrium_edid_identity(const uint8_t *e, uint32_t len, uint32_t path)
+{
+	uint64_t h = 0xcbf29ce484222325ull;
+	const uint8_t *d;
+	uint8_t pb[4];
+	int serial = 0;
+	uint32_t k;
+
+	if (!atrium_edid_base_ok(e, len))
+		return (0);
+	h = fnv1a(h, &e[8], 8);		/* maker, product, serial number */
+	if (e[12] | e[13] | e[14] | e[15])
+		serial = 1;
+	for (k = 0; k < 4; k++) {
+		d = &e[54 + 18 * k];
+		if (d[0] == 0 && d[1] == 0 && d[3] == 0xff) {
+			h = fnv1a(h, &d[5], 13);
+			serial = 1;
+		}
+	}
+	if (!serial) {
+		pb[0] = (uint8_t)path;
+		pb[1] = (uint8_t)(path >> 8);
+		pb[2] = (uint8_t)(path >> 16);
+		pb[3] = (uint8_t)(path >> 24);
+		h = fnv1a(h, pb, 4);
+	}
+	return (h != 0 ? h : 1);
+}

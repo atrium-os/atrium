@@ -179,6 +179,15 @@
 #define regDISP_SINK_COLORIMETRY 0x300b0 /* r: test: 1 = BT.2020 */
 #define regDISP_SINK_CONTENT_LIGHT 0x300b4 /* r: test: MaxCLL 15:0, MaxFALL 31:16 */
 #define regDISP_SINK_BPC	0x300b8	/* r: test: bits per colour of the surface on screen */
+#define regDISP_BW_BUDGET_KHZ	0x300bc	/* w/r: pixel rate the lit pipes share, kHz (device-wide;
+					 * silicon: the DISPCLK/DCFCLK clock tables) */
+#define regDISP_BW_USED_KHZ	0x300c0	/* r: pixel rate the lit pipes draw now */
+/*
+ * Several pipes (display 3.0): pipe n's SIM registers are its bank at
+ * + n x 0x100 (pipe 0 above); BW_* read the same in every bank.
+ */
+#define DISP_SIM_PIPE_STRIDE	0x100u
+#define regDISP_PIPE(reg, n)	((reg) + (n) * DISP_SIM_PIPE_STRIDE)
 
 /*
  * The real DCN 4 (DCN 4.0.1, RDNA4) display registers the scanout path uses,
@@ -211,6 +220,7 @@
 #define regOTG0_OTG_V_BLANK_START_END		regDCN2(0x1b38)
 #define regOTG0_OTG_V_SYNC_A			regDCN2(0x1b39)
 #define regOTG0_OTG_STATUS_FRAME_COUNT		regDCN2(0x1b4d)
+#define regOTG0_OTG_CONTROL			regDCN2(0x1b43)
 #define regHPD0_DC_HPD_INT_STATUS		regDCN2(0x175a)
 #define regHPD0_DC_HPD_INT_CONTROL		regDCN2(0x175b)
 #define regHPD0_DC_HPD_CONTROL			regDCN2(0x175c)
@@ -220,6 +230,25 @@
 #define regVPG0_VPG_GENERIC_PACKET_DATA		regDCN2(0x2069)
 #define regVPG0_VPG_GSP_FRAME_UPDATE_CTRL	regDCN2(0x206a)
 #define regDIG0_HDMI_GENERIC_PACKET_CONTROL0	regDCN2(0x20a5)
+
+/*
+ * DCN 4 has four pipes. The registers above are pipe 0's; pipe n's are the
+ * same block's instance n, `stride` dwords on (dcn_4_1_0_offset.h): HUBP /
+ * HUBPREQ 0xdc, OTG 0x80, HPD 0x8, VPG / DIG 0x124. Pipe n drives
+ * connector n (the OTG-to-DIG crossbar is not modelled). Interrupt sources
+ * (irqsrcs_dcn_1_0.h): OTGn vertical interrupt 0 is source 0x1e + n, HUBPn
+ * flip 0x4f + n, HPDn+1 source 9 with context n.
+ */
+#define DCN_PIPES			4u
+#define DCN_STRIDE_HUBP			0xdcu
+#define DCN_STRIDE_OTG			0x80u
+#define DCN_STRIDE_HPD			0x8u
+#define DCN_STRIDE_DIG			0x124u
+#define DCN_PIPE_REG(reg, stride, n)	((reg) + (n) * (stride) * 4u)
+#define DCN_IH_SRC_VINT0		0x1eu
+#define DCN_IH_SRC_FLIP			0x4fu
+#define DCN_IH_SRC_HPD			0x9u
+#define DCN_OTG_MASTER_EN		(1u << 0)	/* OTG_CONTROL */
 
 #define DCN_PIXEL_FORMAT_ARGB8888	8u	/* SURFACE_CONFIG.SURFACE_PIXEL_FORMAT */
 #define DCN_PIXEL_FORMAT_ARGB2101010	10u
@@ -745,44 +774,12 @@ struct atrium_amd_softc {
 	 */
 	uint64_t	 reset_gen;	/* device resets (FLRs) since attach; base reset.c */
 	struct atrium_amd_reset_hooks reset_hooks[ATRIUM_AMD_IP_COUNT];
-	int		 display_vblank_armed;	/* display module: mode set + vblank IRQ on */
 
 	/*
-	 * Display commit state (display module; guarded by sc->lock). The display
-	 * holds a file reference on every BO it may be scanning out, so a client
-	 * closing its bo_fd can't free a buffer that is still on screen:
-	 *   on_screen  the BO the pipe reads now (kept across close: hold-last-frame)
-	 *   next       a committed BO that hasn't landed yet (waiting on its
-	 *              in-fence, or on vblank), with its fences
-	 * References are only dropped in process context, so the interrupt path
-	 * parks the ones it releases in display_release[] for the next ioctl,
-	 * close or detach to fdrop.
+	 * The display module's state (display_dev.c), per output: what is on
+	 * screen and committed, the monitor and the mode. Guarded by sc->lock.
 	 */
-	struct atrium_amd_display_fb {
-		struct file	*bo_fp;		/* held ref, NULL = none */
-		uint64_t	 vram_offset;
-		uint64_t	 size;
-		uint32_t	 pitch;
-		uint32_t	 format;
-		uint64_t	 reset_gen;	/* sc->reset_gen when committed */
-	} display_on_screen, display_next;
-	int		 display_content_lost;	/* STATUS_CONTENT_LOST */
-	struct task	 display_fence_task;	/* in-fence signalled: try to flip */
-	int		 display_next_state;	/* 0 none, 1 waiting on in-fence, 2 flipped */
-	int		 display_next_vsync;
-	uint64_t	 display_flips_landed;	/* commits that reached the screen */
-	uint32_t	 display_width;		/* the mode's width, for a packed pitch */
-	uint32_t	 display_frame_raw;	/* last OTG_STATUS_FRAME_COUNT read */
-	uint64_t	 display_frames;	/* frames, widened past the 24-bit counter */
-	struct file	*display_in_fp;		/* in-fence syncobj (held ref) */
-	struct atrium_amd_syncobj *display_in_so;
-	uint64_t	 display_in_value;
-	struct file	*display_out_fp;	/* out-fence syncobj (held ref) */
-	struct atrium_amd_syncobj *display_out_so;
-	uint64_t	 display_out_value;
-#define ATRIUM_AMD_DISPLAY_NRELEASE 8
-	struct file	*display_release[ATRIUM_AMD_DISPLAY_NRELEASE];
-	int		 display_nrelease;
+	struct atrium_amd_display_state *display_state;
 	int		 display_opened;	/* exclusive open held */
 	/*
 	 * The display lease (ISOLATION.md "Display lease"): who may open
@@ -793,18 +790,6 @@ struct atrium_amd_softc {
 	int		 display_lease_set;
 	uid_t		 display_lease_uid;
 	char		 display_lease_jail[MAXHOSTNAMELEN];
-	int		 display_mode_set;	/* CRTC lit by a MODESET commit */
-	uint32_t	 display_refresh_mhz;	/* refresh of the mode in use */
-	uint32_t	 display_mode_width;	/* the mode in use, for the kernel's */
-	uint32_t	 display_mode_height;	/* own scanout bounds check */
-	uint32_t	 display_last_fault;	/* fault of the last deferred flip */
-	/*
-	 * Connector (display ABI 2.1): the hotplug generation (never 0; bumped by
-	 * every HPD interrupt) and the display module's own state: the monitor
-	 * as last probed and the timing in use (display_dev.c).
-	 */
-	uint32_t	 display_conn_gen;
-	struct atrium_amd_display_state *display_state;
 
 	/*
 	 * Device-global IH (interrupt-handler) ring + dispatch, owned by the BASE
@@ -819,6 +804,9 @@ struct atrium_amd_softc {
 	uint64_t	 ih_overflows;	/* passes where the device lapped the ring */
 	bus_addr_t	 ih_gpa;	/* the ring's bus address (re-armed on reset) */
 	atrium_amd_ih_handler ih_handler[ATRIUM_AMD_IH_NCAUSE]; /* cause -> handler */
+	/* This ISR pass's display interrupts per pipe (VBLANK, FLIP, HPD), from
+	 * the cookie's IH source and context (DCN_IH_SRC_*). */
+	uint32_t	 ih_disp_count[ATRIUM_AMD_IH_NCAUSE][DCN_PIPES];
 	u_int		 irq_count;	/* interrupts serviced (atomic vs reader) */
 	struct mtx	 lock;		/* guards fence-wait sleep/wakeup + pending */
 	int		 lock_inited;
