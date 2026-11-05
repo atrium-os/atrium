@@ -5274,7 +5274,8 @@ monitor declares HDR, the others don't. `sysctl -n
 dev.atrium_gpu_amd_display.0.sim_sink` shows what the simulated monitor
 decodes (EOTF, BT.2020, MaxCLL/MaxFALL, bits per colour). Kernel checks:
 `display_modes`, `display_vrr`, `display_hdr` and `display_multi` (need the
-display free, so stop frescod first: `pkill -x atrium-frescod`, then
+display free, so stop frescod first: `service atrium-jaild stop` (its
+supervisor starts a killed frescod again), `pkill -x atrium-frescod`, then
 `sysctl dev.atrium_gpu_amd_display.0.lease=""`). Several monitors: `sysctl
 dev.atrium_gpu_amd_display.0.sim_plug_at=N:MODE` plugs output N (0–3; MODE
 as above plus 4 a 1440p office monitor, 5 a twin of the desktop monitor; -1
